@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-alpine:
+    runs-on: ubuntu-latest
+    container: alpine:latest
+    steps:
+      - name: Install Build Dependencies
+        run: apk add --no-cache gcc musl-dev make git
+
+      - uses: actions/checkout@v4
+
+      - name: Bootstrap Prism
+        run: |
+          echo "Bootstrapping prism..."
+          gcc -o /tmp/prism prism.c
+          
+      - name: Self-Install
+        run: |
+          echo "Running self-install..."
+          /tmp/prism install
+          
+          # Verify the temporary binary is gone (optional cleanup check)
+          if [ -f /tmp/prism ]; then
+            echo "Note: /tmp/prism still exists (installer copies, doesn't move)"
+            rm /tmp/prism
+          fi
+
+      - name: Verify Installation
+        run: |
+          echo "Verifying installation on PATH..."
+          which prism
+          
+          # Run it without args to check usage output
+          prism || true
+
+      - name: Test Build Functionality
+        run: |
+          echo "Creating test C file..."
+          cat <<EOF > test_hello.c
+          #include <stdio.h>
+          int main() { printf("Hello from CI!\n"); return 0; }
+          EOF
+          
+          echo "Building and running with installed prism..."
+          prism test_hello.c
