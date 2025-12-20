@@ -1,300 +1,165 @@
-// cc -o /tmp/prism prism.c && /tmp/prism install && rm /tmp/prism
+// 1: cc -o /tmp/prism prism.c && /tmp/prism install && rm /tmp/prism
+// 2: prism prism.c install
+
 #define PRISM_FLAGS "-O3 -flto -s"
+#define VERSION "0.2.0"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
+#include <ctype.h>
 #include <errno.h>
 #include <sys/stat.h>
-#include <ctype.h>
-
-#define VERSION "0.1.1"
+#include <unistd.h>
 
 #ifdef _WIN32
-#define INSTALL_PATH "C:\\Windows\\System32\\prism.exe"
-#define TMP_DIR "C:\\Windows\\Temp\\"
-#define DIR_SEP '\\'
+#define INSTALL "prism.exe"
+#define TMP ""
 #else
-#define INSTALL_PATH "/usr/local/bin/prism"
-#define TMP_DIR "/tmp/"
-#define DIR_SEP '/'
+#define INSTALL "/usr/local/bin/prism"
+#define TMP "/tmp/"
 #endif
 
-// --- Build Modes ---
 typedef enum
 {
   MODE_DEFAULT,
   MODE_DEBUG,
   MODE_RELEASE,
   MODE_SMALL
-} BuildMode;
+} Mode;
 
-void die(const char *fmt, ...)
+void die(char *message)
 {
-  va_list args;
-  va_start(args, fmt);
-  vfprintf(stderr, fmt, args);
-  va_end(args);
-  fprintf(stderr, "\n");
+  fprintf(stderr, "%s\n", message);
   exit(1);
 }
 
-int copy_file(const char *src, const char *dst)
+int install(char *self_path)
 {
-  FILE *in = fopen(src, "rb");
-  if (!in)
+  printf("[prism] Installing to %s...\n", INSTALL);
+  remove(INSTALL);
+
+  FILE *input = fopen(self_path, "rb"), *output = fopen(INSTALL, "wb");
+
+  if (!input || !output)
+  {
+    char command[512];
+    snprintf(command, 512, "sudo rm -f \"%s\" && sudo cp \"%s\" \"%s\" && sudo chmod +x \"%s\"", INSTALL, self_path, INSTALL, INSTALL);
+    return system(command) == 0 ? 0 : 1;
+  }
+
+  char buffer[4096];
+  size_t bytes_read;
+  while ((bytes_read = fread(buffer, 1, 4096, input)) > 0)
+  {
+    if (fwrite(buffer, 1, bytes_read, output) != bytes_read)
+    {
+      fclose(input);
+      fclose(output);
+      return 1;
+    }
+  }
+
+  fclose(input);
+  fclose(output);
+
+#ifndef _WIN32
+  chmod(INSTALL, 0755);
+#endif
+
+  printf("[prism] Installed!\n");
+  return 0;
+}
+
+int transpile(char *input_file, char *output_file)
+{
+  FILE *input = fopen(input_file, "r");
+  if (!input)
     return 0;
 
-  FILE *out = fopen(dst, "wb");
-  if (!out)
+  FILE *output = fopen(output_file, "w");
+  if (!output)
   {
-    fclose(in);
+    fclose(input);
     return 0;
   }
 
-  char buf[4096];
-  size_t n;
-  while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
-    fwrite(buf, 1, n, out);
+  char line[4096];
+  while (fgets(line, sizeof(line), input))
+  {
+    fputs(line, output);
+  }
 
-  fclose(in);
-  fclose(out);
-
-#ifndef _WIN32
-  chmod(dst, 0755);
-#endif
+  fclose(input);
+  fclose(output);
   return 1;
 }
 
-void trim_whitespace(char *str)
+void get_flags(char *source_file, char *buffer, Mode mode)
 {
-  char *end;
-  while (isspace((unsigned char)*str))
-    str++;
-  if (*str == 0)
-    return;
-  end = str + strlen(str) - 1;
-  while (end > str && isspace((unsigned char)*end))
-    end--;
-  end[1] = '\0';
-}
-
-void append_flags(char *buffer, size_t size, const char *new_flags)
-{
-  if (!new_flags || strlen(new_flags) == 0)
-    return;
-  size_t cur = strlen(buffer);
-  if (cur + strlen(new_flags) + 2 < size)
-  {
-    strcat(buffer, " ");
-    strcat(buffer, new_flags);
-  }
-}
-
-void get_build_flags(const char *src_path, char *buffer, size_t size, BuildMode mode)
-{
-  buffer[0] = '\0';
+  buffer[0] = 0;
 
   if (mode == MODE_DEBUG)
-    append_flags(buffer, size, "-g -O0");
+    strcat(buffer, " -g -O0");
   if (mode == MODE_RELEASE)
-    append_flags(buffer, size, "-O3");
+    strcat(buffer, " -O3");
   if (mode == MODE_SMALL)
-    append_flags(buffer, size, "-Os");
+    strcat(buffer, " -Os");
 
-  FILE *f = fopen(src_path, "r");
-  if (!f)
+  FILE *file = fopen(source_file, "r");
+
+  if (!file)
     return;
 
-  char line[1024];
-  while (fgets(line, sizeof(line), f))
+  char line[1024], *ptr, *quote_start, *quote_end;
+  while (fgets(line, 1024, file))
   {
-    char *p = line;
-    while (isspace((unsigned char)*p))
-      p++;
+    ptr = line;
+    while (isspace(*ptr))
+      ptr++;
 
-    if (strncmp(p, "#define", 7) != 0)
-      continue;
-    p += 7;
-    if (!isspace((unsigned char)*p))
-      continue;
-    while (isspace((unsigned char)*p))
-      p++;
-
-    if (strncmp(p, "PRISM_", 6) != 0)
+    if (strncmp(ptr, "#define PRISM_", 14))
       continue;
 
-    int is_base = (strncmp(p, "PRISM_FLAGS ", 12) == 0) || (strncmp(p, "PRISM_FLAGS\"", 11) == 0);
-    int is_libs = (strncmp(p, "PRISM_LIBS", 10) == 0);
-    int is_debug = (strncmp(p, "PRISM_FLAGS_DEBUG", 17) == 0);
-    int is_release = (strncmp(p, "PRISM_FLAGS_RELEASE", 19) == 0);
-    int is_small = (strncmp(p, "PRISM_FLAGS_SMALL", 17) == 0);
+    ptr += 14;
+    int match = ((!strncmp(ptr, "FLAGS ", 6) || !strncmp(ptr, "LIBS ", 5)) ||
+                 (mode == MODE_DEBUG && !strncmp(ptr, "FLAGS_DEBUG ", 12)) ||
+                 (mode == MODE_RELEASE && !strncmp(ptr, "FLAGS_RELEASE ", 14)) ||
+                 (mode == MODE_SMALL && !strncmp(ptr, "FLAGS_SMALL ", 12)));
 
-    int include = 0;
-    if (is_base || is_libs)
-      include = 1;
-    else if (mode == MODE_DEBUG && is_debug)
-      include = 1;
-    else if (mode == MODE_RELEASE && is_release)
-      include = 1;
-    else if (mode == MODE_SMALL && is_small)
-      include = 1;
-
-    if (!include)
+    if (!match)
       continue;
 
-    char *quote = strchr(p, '"');
-    if (!quote)
-      continue;
-
-    char *end_quote = strchr(quote + 1, '"');
-    if (!end_quote)
-      continue;
-
-    *end_quote = '\0';
-    char *flags = quote + 1;
-
-    append_flags(buffer, size, flags);
-  }
-  fclose(f);
-}
-
-void build_and_run(const char *src, int is_build_only, BuildMode mode, int argc, char **argv)
-{
-  char flags[4096];
-  get_build_flags(src, flags, sizeof(flags), mode);
-
-  if (strlen(flags) > 0)
-  {
-    const char *mstr = "DEFAULT";
-    if (mode == MODE_DEBUG)
-      mstr = "DEBUG";
-    if (mode == MODE_RELEASE)
-      mstr = "RELEASE";
-    if (mode == MODE_SMALL)
-      mstr = "SMALL";
-  }
-
-  char out_bin[1024];
-  if (is_build_only)
-  {
-    strncpy(out_bin, src, sizeof(out_bin) - 1);
-    char *ext = strrchr(out_bin, '.');
-    if (ext)
-      *ext = '\0';
-  }
-  else
-  {
-    snprintf(out_bin, sizeof(out_bin), "%sprism_out", TMP_DIR);
-  }
-
-  char cmd[8192];
-  snprintf(cmd, sizeof(cmd), "cc \"%s\" -o \"%s\"%s", src, out_bin, flags);
-
-  if (is_build_only)
-    printf("[prism] Building %s...\n", out_bin);
-
-  if (system(cmd) != 0)
-    die("Compilation failed.");
-
-  if (!is_build_only)
-  {
-    char run_cmd[8192];
-    snprintf(run_cmd, sizeof(run_cmd), "\"%s\"", out_bin);
-
-    int arg_start = -1;
-    for (int i = 0; i < argc; i++)
+    if ((quote_start = strchr(ptr, '"')) && (quote_end = strchr(quote_start + 1, '"')))
     {
-      if (argv[i] == src)
-      {
-        arg_start = i + 1;
-        break;
-      }
-    }
-
-    if (arg_start != -1)
-    {
-      for (int i = arg_start; i < argc; i++)
-      {
-        size_t len = strlen(run_cmd);
-        if (len + strlen(argv[i]) + 4 < sizeof(run_cmd))
-          snprintf(run_cmd + len, sizeof(run_cmd) - len, " \"%s\"", argv[i]);
-      }
-    }
-
-    int status = system(run_cmd);
-    remove(out_bin);
-    if (status != 0)
-    {
-#ifdef _WIN32
-      exit(status);
-#else
-      if (status > 255)
-        exit(status >> 8);
-      else
-        exit(status);
-#endif
+      *quote_end = 0;
+      strcat(buffer, " ");
+      strcat(buffer, quote_start + 1);
     }
   }
-}
 
-void install_self(const char *self_path)
-{
-  printf("[prism] Installing %s to %s...\n", self_path, INSTALL_PATH);
-
-  if (copy_file(self_path, INSTALL_PATH))
-  {
-    printf("[prism] Successfully installed!\n");
-    return;
-  }
-
-  if (errno == EACCES || errno == EPERM)
-  {
-    printf("[prism] Permission denied. Attempting with sudo...\n");
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd),
-             "sudo rm -f \"%s\" && sudo cp \"%s\" \"%s\" && sudo chmod +x \"%s\"",
-             INSTALL_PATH, self_path, INSTALL_PATH, INSTALL_PATH);
-
-    if (system(cmd) == 0)
-    {
-      printf("[prism] Successfully installed via sudo!\n");
-    }
-    else
-    {
-      die("Installation failed.");
-    }
-  }
-  else
-  {
-    die("Failed to copy file. (Error: %s)", strerror(errno));
-  }
+  fclose(file);
 }
 
 int main(int argc, char **argv)
 {
   if (argc < 2)
   {
-    printf("Prism v%s\n", VERSION);
-    printf("Usage:\n");
-    printf("  prism [mode] source.c [args]   Compile & Run (Mode: debug, release, small)\n");
-    printf("  prism build [mode] source.c    Compile only\n");
-    printf("  prism install                  Install to system\n");
-    return 1;
-  }
-
-  if (strcmp(argv[1], "install") == 0)
-  {
-    install_self(argv[0]);
+    printf("Prism v%s\n\
+Usage:  prism [mode] src.c [args]   (mode: debug,release,small)\n\
+        build [mode] src.c\n\
+        install\n",
+           VERSION);
     return 0;
   }
 
-  int arg_idx = 1;
-  int is_build_only = 0;
-  BuildMode mode = MODE_DEFAULT;
+  if (!strcmp(argv[1], "install"))
+    return install(argv[0]);
 
-  if (strcmp(argv[arg_idx], "build") == 0)
+  int arg_idx = 1, is_build_only = 0;
+  Mode mode = MODE_DEFAULT;
+
+  if (!strcmp(argv[arg_idx], "build"))
   {
     is_build_only = 1;
     arg_idx++;
@@ -302,27 +167,71 @@ int main(int argc, char **argv)
 
   if (arg_idx < argc)
   {
-    if (strcmp(argv[arg_idx], "debug") == 0)
-    {
-      mode = MODE_DEBUG;
-      arg_idx++;
-    }
-    else if (strcmp(argv[arg_idx], "release") == 0)
-    {
-      mode = MODE_RELEASE;
-      arg_idx++;
-    }
-    else if (strcmp(argv[arg_idx], "small") == 0)
-    {
-      mode = MODE_SMALL;
-      arg_idx++;
-    }
+    if (!strcmp(argv[arg_idx], "debug"))
+      mode = MODE_DEBUG, arg_idx++;
+    else if (!strcmp(argv[arg_idx], "release"))
+      mode = MODE_RELEASE, arg_idx++;
+    else if (!strcmp(argv[arg_idx], "small"))
+      mode = MODE_SMALL, arg_idx++;
   }
 
   if (arg_idx >= argc)
     die("Missing source file.");
 
-  const char *src = argv[arg_idx];
-  build_and_run(src, is_build_only, mode, argc, argv);
+  char *source = argv[arg_idx], flags[2048], output[512], command[4096];
+  char transpiled[512];
+
+  char *basename = strrchr(source, '/');
+#ifdef _WIN32
+  char *win_basename = strrchr(source, '\\');
+  if (!basename || (win_basename && win_basename > basename))
+    basename = win_basename;
+#endif
+  if (!basename)
+    basename = source;
+  else
+    basename++;
+
+  snprintf(transpiled, sizeof(transpiled), "%s%s.%d.transpiled.c", TMP, basename, getpid());
+
+  if (!transpile(source, transpiled))
+    die("Transpilation failed.");
+
+  get_flags(source, flags, mode);
+
+  if (is_build_only)
+  {
+    strncpy(output, source, 511);
+    char *extension = strrchr(output, '.');
+    if (extension)
+      *extension = 0;
+    printf("[prism] Building %s...\n", output);
+  }
+  else
+    snprintf(output, sizeof(output), "%sprism_out.%d", TMP, getpid());
+
+  snprintf(command, 4096, "cc \"%s\" -o \"%s\"%s", transpiled, output, flags);
+
+  if (system(command))
+    die("Compilation failed.");
+
+  if (!is_build_only)
+  {
+    snprintf(command, 4096, "\"%s\"", output);
+
+    for (int j = arg_idx + 1; j < argc; j++)
+    {
+      size_t len = strlen(command);
+      if (len + strlen(argv[j]) + 4 < 4096)
+        snprintf(command + len, 4096 - len, " \"%s\"", argv[j]);
+    }
+
+    int status = system(command);
+    remove(output);
+    remove(transpiled);
+    exit(status > 255 ? status >> 8 : status);
+  }
+
+  remove(transpiled);
   return 0;
 }
