@@ -2,7 +2,7 @@
 // 2: prism prism.c install
 
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.3.0"
+#define VERSION "0.4.0"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,6 +71,16 @@ int install(char *self_path)
   return 0;
 }
 
+#define MAX_DEFERS 64
+#define MAX_DEFER_LEN 512
+#define MAX_DEPTH 32
+
+typedef struct
+{
+  char items[MAX_DEFERS][MAX_DEFER_LEN];
+  int count;
+} DeferStack;
+
 typedef enum
 {
   STATE_CODE,
@@ -79,6 +89,8 @@ typedef enum
   STATE_LINE_COMMENT,
   STATE_BLOCK_COMMENT
 } ParseState;
+
+int is_word_char(char c) { return isalnum(c) || c == '_'; }
 
 int transpile(char *input_file, char *output_file)
 {
@@ -89,99 +101,187 @@ int transpile(char *input_file, char *output_file)
     return 0;
   }
 
-  FILE *output = fopen(output_file, "w");
-  if (!output)
+  fseek(input, 0, SEEK_END);
+  long size = ftell(input);
+  fseek(input, 0, SEEK_SET);
+
+  char *src = malloc(size + 1);
+  if (!src)
   {
     fclose(input);
     return 0;
   }
+  fread(src, 1, size, input);
+  src[size] = 0;
+  fclose(input);
 
-  char line[4096];
-  ParseState state = STATE_CODE;
-  int escape_next = 0;
-
-  while (fgets(line, sizeof(line), input))
+  FILE *output = fopen(output_file, "w");
+  if (!output)
   {
-    for (int i = 0; line[i]; i++)
-    {
-      char c = line[i];
-      char next = line[i + 1];
-
-      if (escape_next)
-      {
-        escape_next = 0;
-        fputc(c, output);
-        continue;
-      }
-
-      switch (state)
-      {
-
-      case STATE_CODE:
-        if (c == '"')
-          state = STATE_STRING;
-
-        else if (c == '\'')
-          state = STATE_CHAR;
-
-        else if (c == '/' && next == '/')
-        {
-          state = STATE_LINE_COMMENT;
-          fputc(c, output);
-          fputc(next, output);
-          i++;
-          continue;
-        }
-
-        else if (c == '/' && next == '*')
-        {
-          state = STATE_BLOCK_COMMENT;
-          fputc(c, output);
-          fputc(next, output);
-          i++;
-          continue;
-        }
-
-        break;
-
-      case STATE_STRING:
-        if (c == '\\')
-          escape_next = 1;
-        else if (c == '"')
-          state = STATE_CODE;
-        break;
-
-      case STATE_CHAR:
-        if (c == '\\')
-          escape_next = 1;
-        else if (c == '\'')
-          state = STATE_CODE;
-        break;
-      case STATE_LINE_COMMENT:
-        if (c == '\n')
-          state = STATE_CODE;
-        break;
-      case STATE_BLOCK_COMMENT:
-        if (c == '*' && next == '/')
-        {
-          state = STATE_CODE;
-          fputc(c, output);
-          fputc(next, output);
-          i++;
-          continue;
-        }
-
-        break;
-      }
-
-      fputc(c, output);
-    }
-
-    if (state == STATE_LINE_COMMENT)
-      state = STATE_CODE;
+    free(src);
+    return 0;
   }
 
-  fclose(input);
+  ParseState state = STATE_CODE;
+  DeferStack stacks[MAX_DEPTH] = {0};
+  int depth = 0, escape_next = 0;
+
+  for (int i = 0; src[i]; i++)
+  {
+    char c = src[i], next = src[i + 1];
+
+    if (escape_next)
+    {
+      escape_next = 0;
+      fputc(c, output);
+      continue;
+    }
+
+    // State transitions for strings/comments
+    if (state == STATE_STRING)
+    {
+      if (c == '\\')
+        escape_next = 1;
+      else if (c == '"')
+        state = STATE_CODE;
+      fputc(c, output);
+      continue;
+    }
+    if (state == STATE_CHAR)
+    {
+      if (c == '\\')
+        escape_next = 1;
+      else if (c == '\'')
+        state = STATE_CODE;
+      fputc(c, output);
+      continue;
+    }
+    if (state == STATE_LINE_COMMENT)
+    {
+      if (c == '\n')
+        state = STATE_CODE;
+      fputc(c, output);
+      continue;
+    }
+    if (state == STATE_BLOCK_COMMENT)
+    {
+      if (c == '*' && next == '/')
+      {
+        fputs("*/", output);
+        i++;
+        state = STATE_CODE;
+        continue;
+      }
+      fputc(c, output);
+      continue;
+    }
+
+    // STATE_CODE handling
+    if (c == '"')
+    {
+      state = STATE_STRING;
+      fputc(c, output);
+      continue;
+    }
+    if (c == '\'')
+    {
+      state = STATE_CHAR;
+      fputc(c, output);
+      continue;
+    }
+    if (c == '/' && next == '/')
+    {
+      state = STATE_LINE_COMMENT;
+      fputs("//", output);
+      i++;
+      continue;
+    }
+    if (c == '/' && next == '*')
+    {
+      state = STATE_BLOCK_COMMENT;
+      fputs("/*", output);
+      i++;
+      continue;
+    }
+
+    // Check for 'defer' keyword
+    if (c == 'd' && !strncmp(&src[i], "defer ", 6) && (i == 0 || !is_word_char(src[i - 1])))
+    {
+      int j = i + 6;
+      while (isspace(src[j]))
+        j++;
+
+      int start = j, paren = 0;
+      while (src[j] && (src[j] != ';' || paren > 0))
+      {
+        if (src[j] == '(')
+          paren++;
+        if (src[j] == ')')
+          paren--;
+        j++;
+      }
+
+      int len = j - start;
+      if (depth > 0 && depth < MAX_DEPTH && stacks[depth].count < MAX_DEFERS && len < MAX_DEFER_LEN)
+      {
+        strncpy(stacks[depth].items[stacks[depth].count], &src[start], len);
+        stacks[depth].items[stacks[depth].count][len] = 0;
+        stacks[depth].count++;
+      }
+      i = j; // skip past ';'
+      continue;
+    }
+
+    // Check for 'return' keyword - emit defers before it
+    if (c == 'r' && !strncmp(&src[i], "return", 6) && !is_word_char(src[i + 6]) && (i == 0 || !is_word_char(src[i - 1])))
+    {
+      // Count total defers that need to run
+      int total_defers = 0;
+      for (int d = depth; d >= 1; d--)
+        total_defers += stacks[d].count;
+
+      if (total_defers > 0)
+      {
+        fputs("{ ", output);
+        for (int d = depth; d >= 1; d--)
+          for (int k = stacks[d].count - 1; k >= 0; k--)
+            fprintf(output, "%s; ", stacks[d].items[k]);
+
+        // Output 'return' and everything until ';', then close brace
+        while (src[i] && src[i] != ';')
+          fputc(src[i++], output);
+        if (src[i] == ';')
+          fputc(';', output);
+        fputs(" }", output);
+        continue;
+      }
+    }
+
+    // Track brace depth
+    if (c == '{')
+    {
+      fputc(c, output);
+      depth++;
+      if (depth < MAX_DEPTH)
+        stacks[depth].count = 0;
+      continue;
+    }
+
+    if (c == '}')
+    {
+      // Emit defers for this scope before closing brace
+      if (depth > 0 && depth < MAX_DEPTH)
+        for (int k = stacks[depth].count - 1; k >= 0; k--)
+          fprintf(output, "%s; ", stacks[depth].items[k]);
+      depth--;
+      fputc(c, output);
+      continue;
+    }
+
+    fputc(c, output);
+  }
+
+  free(src);
   fclose(output);
   return 1;
 }
