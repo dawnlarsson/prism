@@ -2,7 +2,7 @@
 // 2: prism prism.c install
 
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.2.0"
+#define VERSION "0.3.0"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,11 +71,23 @@ int install(char *self_path)
   return 0;
 }
 
+typedef enum
+{
+  STATE_CODE,
+  STATE_STRING,
+  STATE_CHAR,
+  STATE_LINE_COMMENT,
+  STATE_BLOCK_COMMENT
+} ParseState;
+
 int transpile(char *input_file, char *output_file)
 {
   FILE *input = fopen(input_file, "r");
   if (!input)
+  {
+    printf("Failed to open input file: %s\n", strerror(errno));
     return 0;
+  }
 
   FILE *output = fopen(output_file, "w");
   if (!output)
@@ -85,9 +97,88 @@ int transpile(char *input_file, char *output_file)
   }
 
   char line[4096];
+  ParseState state = STATE_CODE;
+  int escape_next = 0;
+
   while (fgets(line, sizeof(line), input))
   {
-    fputs(line, output);
+    for (int i = 0; line[i]; i++)
+    {
+      char c = line[i];
+      char next = line[i + 1];
+
+      if (escape_next)
+      {
+        escape_next = 0;
+        fputc(c, output);
+        continue;
+      }
+
+      switch (state)
+      {
+
+      case STATE_CODE:
+        if (c == '"')
+          state = STATE_STRING;
+
+        else if (c == '\'')
+          state = STATE_CHAR;
+
+        else if (c == '/' && next == '/')
+        {
+          state = STATE_LINE_COMMENT;
+          fputc(c, output);
+          fputc(next, output);
+          i++;
+          continue;
+        }
+
+        else if (c == '/' && next == '*')
+        {
+          state = STATE_BLOCK_COMMENT;
+          fputc(c, output);
+          fputc(next, output);
+          i++;
+          continue;
+        }
+
+        break;
+
+      case STATE_STRING:
+        if (c == '\\')
+          escape_next = 1;
+        else if (c == '"')
+          state = STATE_CODE;
+        break;
+
+      case STATE_CHAR:
+        if (c == '\\')
+          escape_next = 1;
+        else if (c == '\'')
+          state = STATE_CODE;
+        break;
+      case STATE_LINE_COMMENT:
+        if (c == '\n')
+          state = STATE_CODE;
+        break;
+      case STATE_BLOCK_COMMENT:
+        if (c == '*' && next == '/')
+        {
+          state = STATE_CODE;
+          fputc(c, output);
+          fputc(next, output);
+          i++;
+          continue;
+        }
+
+        break;
+      }
+
+      fputc(c, output);
+    }
+
+    if (state == STATE_LINE_COMMENT)
+      state = STATE_CODE;
   }
 
   fclose(input);
@@ -96,13 +187,16 @@ int transpile(char *input_file, char *output_file)
 }
 
 void get_flags(char *source_file, char *buffer, Mode mode)
+
 {
   buffer[0] = 0;
 
   if (mode == MODE_DEBUG)
     strcat(buffer, " -g -O0");
+
   if (mode == MODE_RELEASE)
     strcat(buffer, " -O3");
+
   if (mode == MODE_SMALL)
     strcat(buffer, " -Os");
 
@@ -112,6 +206,7 @@ void get_flags(char *source_file, char *buffer, Mode mode)
     return;
 
   char line[1024], *ptr, *quote_start, *quote_end;
+
   while (fgets(line, 1024, file))
   {
     ptr = line;
@@ -122,6 +217,7 @@ void get_flags(char *source_file, char *buffer, Mode mode)
       continue;
 
     ptr += 14;
+
     int match = ((!strncmp(ptr, "FLAGS ", 6) || !strncmp(ptr, "LIBS ", 5)) ||
                  (mode == MODE_DEBUG && !strncmp(ptr, "FLAGS_DEBUG ", 12)) ||
                  (mode == MODE_RELEASE && !strncmp(ptr, "FLAGS_RELEASE ", 14)) ||
@@ -145,11 +241,8 @@ int main(int argc, char **argv)
 {
   if (argc < 2)
   {
-    printf("Prism v%s\n\
-Usage:  prism [mode] src.c [args]   (mode: debug,release,small)\n\
-        build [mode] src.c\n\
-        install\n",
-           VERSION);
+    printf("Prism v%s\nUsage : prism[mode] src.c[args](mode : debug, release, small)\nbuild[mode] src.c\ninstall\n", VERSION);
+
     return 0;
   }
 
@@ -169,8 +262,10 @@ Usage:  prism [mode] src.c [args]   (mode: debug,release,small)\n\
   {
     if (!strcmp(argv[arg_idx], "debug"))
       mode = MODE_DEBUG, arg_idx++;
+
     else if (!strcmp(argv[arg_idx], "release"))
       mode = MODE_RELEASE, arg_idx++;
+
     else if (!strcmp(argv[arg_idx], "small"))
       mode = MODE_SMALL, arg_idx++;
   }
@@ -179,20 +274,27 @@ Usage:  prism [mode] src.c [args]   (mode: debug,release,small)\n\
     die("Missing source file.");
 
   char *source = argv[arg_idx], flags[2048], output[512], command[4096];
-  char transpiled[512];
-
+  char transpiled[512], source_dir[512];
   char *basename = strrchr(source, '/');
+
 #ifdef _WIN32
   char *win_basename = strrchr(source, '\\');
   if (!basename || (win_basename && win_basename > basename))
     basename = win_basename;
 #endif
-  if (!basename)
-    basename = source;
-  else
-    basename++;
 
-  snprintf(transpiled, sizeof(transpiled), "%s%s.%d.transpiled.c", TMP, basename, getpid());
+  if (!basename)
+  {
+    snprintf(transpiled, sizeof(transpiled), ".%s.%d.transpiled.c", source, getpid());
+  }
+  else
+  {
+    size_t dir_len = basename - source;
+    strncpy(source_dir, source, dir_len);
+    source_dir[dir_len] = 0;
+    basename++;
+    snprintf(transpiled, sizeof(transpiled), "%s.%s.%d.transpiled.c", source_dir, basename, getpid());
+  }
 
   if (!transpile(source, transpiled))
     die("Transpilation failed.");
@@ -203,8 +305,10 @@ Usage:  prism [mode] src.c [args]   (mode: debug,release,small)\n\
   {
     strncpy(output, source, 511);
     char *extension = strrchr(output, '.');
+
     if (extension)
       *extension = 0;
+
     printf("[prism] Building %s...\n", output);
   }
   else
