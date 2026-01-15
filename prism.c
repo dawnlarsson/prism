@@ -2,7 +2,7 @@
 // 2: prism prism.c install
 
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.4.0"
+#define VERSION "0.5.0"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +18,34 @@
 #else
 #define INSTALL "/usr/local/bin/prism"
 #define TMP "/tmp/"
+#endif
+
+// Native platform detection
+#if defined(__x86_64__) || defined(_M_X64)
+#define NATIVE_ARCH "x86"
+#define NATIVE_BITS 64
+#elif defined(__i386__) || defined(_M_IX86)
+#define NATIVE_ARCH "x86"
+#define NATIVE_BITS 32
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#define NATIVE_ARCH "arm"
+#define NATIVE_BITS 64
+#elif defined(__arm__) || defined(_M_ARM)
+#define NATIVE_ARCH "arm"
+#define NATIVE_BITS 32
+#else
+#define NATIVE_ARCH "x86"
+#define NATIVE_BITS 64
+#endif
+
+#if defined(__linux__)
+#define NATIVE_PLATFORM "linux"
+#elif defined(_WIN32)
+#define NATIVE_PLATFORM "windows"
+#elif defined(__APPLE__)
+#define NATIVE_PLATFORM "macos"
+#else
+#define NATIVE_PLATFORM "linux"
 #endif
 
 typedef enum
@@ -337,12 +365,59 @@ void get_flags(char *source_file, char *buffer, Mode mode)
   fclose(file);
 }
 
+char *get_compiler(char *arch, int bits, char *platform)
+{
+  int is_native = !strcmp(arch, NATIVE_ARCH) && bits == NATIVE_BITS && !strcmp(platform, NATIVE_PLATFORM);
+
+  if (is_native)
+    return "cc";
+
+  if (!strcmp(platform, "linux"))
+  {
+    if (!strcmp(arch, "arm"))
+      return bits == 64 ? "aarch64-linux-gnu-gcc" : "arm-linux-gnueabihf-gcc";
+    else
+      return bits == 64 ? "x86_64-linux-gnu-gcc" : "gcc -m32";
+  }
+
+  if (!strcmp(platform, "windows"))
+  {
+    if (!strcmp(arch, "arm"))
+      return bits == 64 ? "aarch64-w64-mingw32-gcc" : "armv7-w64-mingw32-gcc";
+    else
+      return bits == 64 ? "x86_64-w64-mingw32-gcc" : "i686-w64-mingw32-gcc";
+  }
+
+  if (!strcmp(platform, "macos"))
+  {
+    if (!strcmp(arch, "arm"))
+      return "oa64-clang";
+    else
+      return "o64-clang";
+  }
+
+  return "cc";
+}
+
 int main(int argc, char **argv)
 {
   if (argc < 2)
   {
-    printf("Prism v%s\nUsage : prism[mode] src.c[args](mode : debug, release, small)\nbuild[mode] src.c\ninstall\n", VERSION);
-
+    printf("Prism v%s\nUsage : prism [options] src.c [output] [args]\n\n"
+           "Options (any order before src.c):\n"
+           "  build          Build only, don't run\n"
+           "  debug/release/small  Optimization mode\n"
+           "  arm/x86        Architecture (default: native)\n"
+           "  32/64          Word size (default: 64)\n"
+           "  linux/windows/macos  Platform (default: native)\n\n"
+           "Examples:\n"
+           "  prism src.c              Run src.c\n"
+           "  prism build src.c        Build src\n"
+           "  prism build src.c out    Build to 'out'\n"
+           "  prism build arm src.c    Build for arm64 linux\n"
+           "  prism build windows src.c  Build for windows x64\n\n"
+           "install\n",
+           VERSION);
     return 0;
   }
 
@@ -351,23 +426,41 @@ int main(int argc, char **argv)
 
   int arg_idx = 1, is_build_only = 0;
   Mode mode = MODE_DEFAULT;
+  char *arch = NATIVE_ARCH;
+  int bits = NATIVE_BITS;
+  char *platform = NATIVE_PLATFORM;
 
-  if (!strcmp(argv[arg_idx], "build"))
+  // Parse options until we hit a .c file
+  while (arg_idx < argc && !strstr(argv[arg_idx], ".c"))
   {
-    is_build_only = 1;
+    char *arg = argv[arg_idx];
+
+    if (!strcmp(arg, "build"))
+      is_build_only = 1;
+    else if (!strcmp(arg, "debug"))
+      mode = MODE_DEBUG;
+    else if (!strcmp(arg, "release"))
+      mode = MODE_RELEASE;
+    else if (!strcmp(arg, "small"))
+      mode = MODE_SMALL;
+    else if (!strcmp(arg, "arm"))
+      arch = "arm";
+    else if (!strcmp(arg, "x86"))
+      arch = "x86";
+    else if (!strcmp(arg, "32"))
+      bits = 32;
+    else if (!strcmp(arg, "64"))
+      bits = 64;
+    else if (!strcmp(arg, "linux"))
+      platform = "linux";
+    else if (!strcmp(arg, "windows"))
+      platform = "windows";
+    else if (!strcmp(arg, "macos"))
+      platform = "macos";
+    else
+      break;
+
     arg_idx++;
-  }
-
-  if (arg_idx < argc)
-  {
-    if (!strcmp(argv[arg_idx], "debug"))
-      mode = MODE_DEBUG, arg_idx++;
-
-    else if (!strcmp(argv[arg_idx], "release"))
-      mode = MODE_RELEASE, arg_idx++;
-
-    else if (!strcmp(argv[arg_idx], "small"))
-      mode = MODE_SMALL, arg_idx++;
   }
 
   if (arg_idx >= argc)
@@ -401,20 +494,41 @@ int main(int argc, char **argv)
 
   get_flags(source, flags, mode);
 
+  char *compiler = get_compiler(arch, bits, platform);
+  int is_windows = !strcmp(platform, "windows");
+  char *custom_output = NULL;
+
+  // Check for output directive (next arg after source, not starting with -)
+  if (is_build_only && arg_idx + 1 < argc && argv[arg_idx + 1][0] != '-')
+  {
+    custom_output = argv[arg_idx + 1];
+    arg_idx++;
+  }
+
   if (is_build_only)
   {
-    strncpy(output, source, 511);
-    char *extension = strrchr(output, '.');
+    if (custom_output)
+    {
+      strncpy(output, custom_output, 511);
+    }
+    else
+    {
+      strncpy(output, source, 511);
+      char *extension = strrchr(output, '.');
 
-    if (extension)
-      *extension = 0;
+      if (extension)
+        *extension = 0;
 
-    printf("[prism] Building %s...\n", output);
+      if (is_windows)
+        strcat(output, ".exe");
+    }
+
+    printf("[prism] Building %s (%s %d-bit %s)...\n", output, arch, bits, platform);
   }
   else
     snprintf(output, sizeof(output), "%sprism_out.%d", TMP, getpid());
 
-  snprintf(command, 4096, "cc \"%s\" -o \"%s\"%s", transpiled, output, flags);
+  snprintf(command, 4096, "%s \"%s\" -o \"%s\"%s", compiler, transpiled, output, flags);
 
   if (system(command))
     die("Compilation failed.");
