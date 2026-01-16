@@ -1,16 +1,16 @@
+// prism.c - C with defer
 // 1: cc -o /tmp/prism prism.c && /tmp/prism install && rm /tmp/prism
 // 2: prism prism.c install
 
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.5.0"
+#define VERSION "0.6.0"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <ctype.h>
-#include <errno.h>
-#include <sys/stat.h>
-#include <unistd.h>
+// Include the tokenizer/preprocessor
+#include "parse.c"
+
+// =============================================================================
+// Platform detection
+// =============================================================================
 
 #ifdef _WIN32
 #define INSTALL "prism.exe"
@@ -20,7 +20,6 @@
 #define TMP "/tmp/"
 #endif
 
-// Native platform detection
 #if defined(__x86_64__) || defined(_M_X64)
 #define NATIVE_ARCH "x86"
 #define NATIVE_BITS 64
@@ -56,31 +55,292 @@ typedef enum
   MODE_SMALL
 } Mode;
 
-void die(char *message)
+// =============================================================================
+// Defer tracking
+// =============================================================================
+
+#define MAX_DEFER_DEPTH 64
+#define MAX_DEFERS_PER_SCOPE 32
+
+typedef struct
+{
+  Token *stmts[MAX_DEFERS_PER_SCOPE]; // Start token of each deferred statement
+  Token *ends[MAX_DEFERS_PER_SCOPE];  // End token (the semicolon)
+  int count;
+} DeferScope;
+
+static DeferScope defer_stack[MAX_DEFER_DEPTH];
+static int defer_depth = 0;
+
+static void defer_push_scope(void)
+{
+  if (defer_depth < MAX_DEFER_DEPTH)
+  {
+    defer_stack[defer_depth].count = 0;
+    defer_depth++;
+  }
+}
+
+static void defer_pop_scope(void)
+{
+  if (defer_depth > 0)
+    defer_depth--;
+}
+
+static void defer_add(Token *start, Token *end)
+{
+  if (defer_depth > 0)
+  {
+    DeferScope *scope = &defer_stack[defer_depth - 1];
+    if (scope->count < MAX_DEFERS_PER_SCOPE)
+    {
+      scope->stmts[scope->count] = start;
+      scope->ends[scope->count] = end;
+      scope->count++;
+    }
+  }
+}
+
+// =============================================================================
+// Token emission
+// =============================================================================
+
+static FILE *out;
+
+// Emit a single token with appropriate spacing
+static void emit_tok(Token *tok)
+{
+  if (tok->has_space)
+    fputc(' ', out);
+  fprintf(out, "%.*s", tok->len, tok->loc);
+}
+
+// Emit tokens from start up to (but not including) end
+static void emit_range(Token *start, Token *end)
+{
+  for (Token *t = start; t && t != end && t->kind != TK_EOF; t = t->next)
+    emit_tok(t);
+}
+
+// Emit all defers for current scope (LIFO order)
+static void emit_scope_defers(void)
+{
+  if (defer_depth <= 0)
+    return;
+  DeferScope *scope = &defer_stack[defer_depth - 1];
+  for (int i = scope->count - 1; i >= 0; i--)
+  {
+    fputc(' ', out);
+    emit_range(scope->stmts[i], scope->ends[i]);
+    fputc(';', out);
+  }
+}
+
+// Emit all defers from all scopes (for return statements)
+static void emit_all_defers(void)
+{
+  for (int d = defer_depth - 1; d >= 0; d--)
+  {
+    DeferScope *scope = &defer_stack[d];
+    for (int i = scope->count - 1; i >= 0; i--)
+    {
+      fputc(' ', out);
+      emit_range(scope->stmts[i], scope->ends[i]);
+      fputc(';', out);
+    }
+  }
+}
+
+// Check if there are any active defers
+static bool has_active_defers(void)
+{
+  for (int d = 0; d < defer_depth; d++)
+    if (defer_stack[d].count > 0)
+      return true;
+  return false;
+}
+
+// =============================================================================
+// Transpiler
+// =============================================================================
+
+static Token *skip_to_semicolon(Token *tok)
+{
+  int depth = 0;
+  while (tok->kind != TK_EOF)
+  {
+    if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
+      depth++;
+    else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
+      depth--;
+    else if (depth == 0 && equal(tok, ";"))
+      return tok;
+    tok = tok->next;
+  }
+  return tok;
+}
+
+static Token *skip_balanced(Token *tok, char *open, char *close)
+{
+  int depth = 1;
+  tok = tok->next; // skip opening
+  while (tok->kind != TK_EOF && depth > 0)
+  {
+    if (equal(tok, open))
+      depth++;
+    else if (equal(tok, close))
+      depth--;
+    tok = tok->next;
+  }
+  return tok;
+}
+
+static int transpile(char *input_file, char *output_file)
+{
+  // Initialize preprocessor
+  pp_init();
+  pp_add_default_include_paths();
+
+  // Add prism-specific predefined macro
+  pp_define_macro("__PRISM__", "1");
+
+  // Tokenize and preprocess
+  Token *tok = tokenize_file(input_file);
+  if (!tok)
+  {
+    fprintf(stderr, "Failed to open: %s\n", input_file);
+    return 0;
+  }
+
+  tok = preprocess(tok);
+
+  // Open output
+  out = fopen(output_file, "w");
+  if (!out)
+    return 0;
+
+  // Reset defer state
+  defer_depth = 0;
+
+  // Walk tokens and emit
+  while (tok->kind != TK_EOF)
+  {
+    // Handle 'defer' keyword
+    if (tok->kind == TK_KEYWORD && equal(tok, "defer"))
+    {
+      Token *defer_tok = tok;
+      tok = tok->next; // skip 'defer'
+
+      // Find the statement (up to semicolon)
+      Token *stmt_start = tok;
+      Token *stmt_end = skip_to_semicolon(tok);
+
+      // Record the defer
+      defer_add(stmt_start, stmt_end);
+
+      // Skip past the semicolon (don't emit the defer yet)
+      if (stmt_end->kind != TK_EOF)
+        tok = stmt_end->next;
+      else
+        tok = stmt_end;
+
+      // Emit a comment for debugging
+      fprintf(out, " /* defer recorded */");
+      continue;
+    }
+
+    // Handle 'return' - emit all defers first
+    if (tok->kind == TK_KEYWORD && equal(tok, "return"))
+    {
+      if (has_active_defers())
+      {
+        // Wrap in block: { defers; return expr; }
+        fprintf(out, " {");
+        emit_all_defers();
+
+        // Emit return and expression
+        emit_tok(tok); // 'return'
+        tok = tok->next;
+
+        // Emit until semicolon
+        while (tok->kind != TK_EOF && !equal(tok, ";"))
+        {
+          emit_tok(tok);
+          tok = tok->next;
+        }
+
+        if (equal(tok, ";"))
+        {
+          emit_tok(tok); // ';'
+          tok = tok->next;
+        }
+
+        fprintf(out, " }");
+        continue;
+      }
+      // No defers, emit normally
+    }
+
+    // Handle '{' - push scope
+    if (equal(tok, "{"))
+    {
+      emit_tok(tok);
+      tok = tok->next;
+      defer_push_scope();
+      continue;
+    }
+
+    // Handle '}' - emit scope defers, then pop
+    if (equal(tok, "}"))
+    {
+      emit_scope_defers();
+      defer_pop_scope();
+      emit_tok(tok);
+      tok = tok->next;
+      continue;
+    }
+
+    // Default: emit token as-is
+    emit_tok(tok);
+    tok = tok->next;
+  }
+
+  fclose(out);
+  return 1;
+}
+
+// =============================================================================
+// Build system
+// =============================================================================
+
+static void die(char *message)
 {
   fprintf(stderr, "%s\n", message);
   exit(1);
 }
 
-int install(char *self_path)
+static int install(char *self_path)
 {
   printf("[prism] Installing to %s...\n", INSTALL);
   remove(INSTALL);
 
-  FILE *input = fopen(self_path, "rb"), *output = fopen(INSTALL, "wb");
+  FILE *input = fopen(self_path, "rb");
+  FILE *output = fopen(INSTALL, "wb");
 
   if (!input || !output)
   {
     char command[512];
-    snprintf(command, 512, "sudo rm -f \"%s\" && sudo cp \"%s\" \"%s\" && sudo chmod +x \"%s\"", INSTALL, self_path, INSTALL, INSTALL);
+    snprintf(command, 512,
+             "sudo rm -f \"%s\" && sudo cp \"%s\" \"%s\" && sudo chmod +x \"%s\"",
+             INSTALL, self_path, INSTALL, INSTALL);
     return system(command) == 0 ? 0 : 1;
   }
 
   char buffer[4096];
-  size_t bytes_read;
-  while ((bytes_read = fread(buffer, 1, 4096, input)) > 0)
+  size_t bytes;
+  while ((bytes = fread(buffer, 1, 4096, input)) > 0)
   {
-    if (fwrite(buffer, 1, bytes_read, output) != bytes_read)
+    if (fwrite(buffer, 1, bytes, output) != bytes)
     {
       fclose(input);
       fclose(output);
@@ -99,251 +359,30 @@ int install(char *self_path)
   return 0;
 }
 
-#define MAX_DEFERS 64
-#define MAX_DEFER_LEN 512
-#define MAX_DEPTH 32
-
-typedef struct
-{
-  char items[MAX_DEFERS][MAX_DEFER_LEN];
-  int count;
-} DeferStack;
-
-typedef enum
-{
-  STATE_CODE,
-  STATE_STRING,
-  STATE_CHAR,
-  STATE_LINE_COMMENT,
-  STATE_BLOCK_COMMENT
-} ParseState;
-
-int is_word_char(char c) { return isalnum(c) || c == '_'; }
-
-int transpile(char *input_file, char *output_file)
-{
-  FILE *input = fopen(input_file, "r");
-  if (!input)
-  {
-    printf("Failed to open input file: %s\n", strerror(errno));
-    return 0;
-  }
-
-  fseek(input, 0, SEEK_END);
-  long size = ftell(input);
-  fseek(input, 0, SEEK_SET);
-
-  char *src = malloc(size + 1);
-  if (!src)
-  {
-    fclose(input);
-    return 0;
-  }
-  fread(src, 1, size, input);
-  src[size] = 0;
-  fclose(input);
-
-  FILE *output = fopen(output_file, "w");
-  if (!output)
-  {
-    free(src);
-    return 0;
-  }
-
-  ParseState state = STATE_CODE;
-  DeferStack stacks[MAX_DEPTH] = {0};
-  int depth = 0, escape_next = 0;
-
-  for (int i = 0; src[i]; i++)
-  {
-    char c = src[i], next = src[i + 1];
-
-    if (escape_next)
-    {
-      escape_next = 0;
-      fputc(c, output);
-      continue;
-    }
-
-    // State transitions for strings/comments
-    if (state == STATE_STRING)
-    {
-      if (c == '\\')
-        escape_next = 1;
-      else if (c == '"')
-        state = STATE_CODE;
-      fputc(c, output);
-      continue;
-    }
-    if (state == STATE_CHAR)
-    {
-      if (c == '\\')
-        escape_next = 1;
-      else if (c == '\'')
-        state = STATE_CODE;
-      fputc(c, output);
-      continue;
-    }
-    if (state == STATE_LINE_COMMENT)
-    {
-      if (c == '\n')
-        state = STATE_CODE;
-      fputc(c, output);
-      continue;
-    }
-    if (state == STATE_BLOCK_COMMENT)
-    {
-      if (c == '*' && next == '/')
-      {
-        fputs("*/", output);
-        i++;
-        state = STATE_CODE;
-        continue;
-      }
-      fputc(c, output);
-      continue;
-    }
-
-    // STATE_CODE handling
-    if (c == '"')
-    {
-      state = STATE_STRING;
-      fputc(c, output);
-      continue;
-    }
-    if (c == '\'')
-    {
-      state = STATE_CHAR;
-      fputc(c, output);
-      continue;
-    }
-    if (c == '/' && next == '/')
-    {
-      state = STATE_LINE_COMMENT;
-      fputs("//", output);
-      i++;
-      continue;
-    }
-    if (c == '/' && next == '*')
-    {
-      state = STATE_BLOCK_COMMENT;
-      fputs("/*", output);
-      i++;
-      continue;
-    }
-
-    // Check for 'defer' keyword
-    if (c == 'd' && !strncmp(&src[i], "defer ", 6) && (i == 0 || !is_word_char(src[i - 1])))
-    {
-      int j = i + 6;
-      while (isspace(src[j]))
-        j++;
-
-      int start = j, paren = 0;
-      while (src[j] && (src[j] != ';' || paren > 0))
-      {
-        if (src[j] == '(')
-          paren++;
-        if (src[j] == ')')
-          paren--;
-        j++;
-      }
-
-      int len = j - start;
-      if (depth > 0 && depth < MAX_DEPTH && stacks[depth].count < MAX_DEFERS && len < MAX_DEFER_LEN)
-      {
-        strncpy(stacks[depth].items[stacks[depth].count], &src[start], len);
-        stacks[depth].items[stacks[depth].count][len] = 0;
-        stacks[depth].count++;
-      }
-      i = j; // skip past ';'
-      continue;
-    }
-
-    // Check for 'return' keyword - emit defers before it
-    if (c == 'r' && !strncmp(&src[i], "return", 6) && !is_word_char(src[i + 6]) && (i == 0 || !is_word_char(src[i - 1])))
-    {
-      // Count total defers that need to run
-      int total_defers = 0;
-      for (int d = depth; d >= 1; d--)
-        total_defers += stacks[d].count;
-
-      if (total_defers > 0)
-      {
-        fputs("{ ", output);
-        for (int d = depth; d >= 1; d--)
-          for (int k = stacks[d].count - 1; k >= 0; k--)
-            fprintf(output, "%s; ", stacks[d].items[k]);
-
-        // Output 'return' and everything until ';', then close brace
-        while (src[i] && src[i] != ';')
-          fputc(src[i++], output);
-        if (src[i] == ';')
-          fputc(';', output);
-        fputs(" }", output);
-        continue;
-      }
-    }
-
-    // Track brace depth
-    if (c == '{')
-    {
-      fputc(c, output);
-      depth++;
-      if (depth < MAX_DEPTH)
-        stacks[depth].count = 0;
-      continue;
-    }
-
-    if (c == '}')
-    {
-      // Emit defers for this scope before closing brace
-      if (depth > 0 && depth < MAX_DEPTH)
-        for (int k = stacks[depth].count - 1; k >= 0; k--)
-          fprintf(output, "%s; ", stacks[depth].items[k]);
-      depth--;
-      fputc(c, output);
-      continue;
-    }
-
-    fputc(c, output);
-  }
-
-  free(src);
-  fclose(output);
-  return 1;
-}
-
-void get_flags(char *source_file, char *buffer, Mode mode)
-
+static void get_flags(char *source_file, char *buffer, Mode mode)
 {
   buffer[0] = 0;
 
   if (mode == MODE_DEBUG)
     strcat(buffer, " -g -O0");
-
   if (mode == MODE_RELEASE)
     strcat(buffer, " -O3");
-
   if (mode == MODE_SMALL)
     strcat(buffer, " -Os");
 
   FILE *file = fopen(source_file, "r");
-
   if (!file)
     return;
 
-  char line[1024], *ptr, *quote_start, *quote_end;
-
+  char line[1024];
   while (fgets(line, 1024, file))
   {
-    ptr = line;
+    char *ptr = line;
     while (isspace(*ptr))
       ptr++;
 
     if (strncmp(ptr, "#define PRISM_", 14))
       continue;
-
     ptr += 14;
 
     int match = ((!strncmp(ptr, "FLAGS ", 6) || !strncmp(ptr, "LIBS ", 5)) ||
@@ -354,7 +393,9 @@ void get_flags(char *source_file, char *buffer, Mode mode)
     if (!match)
       continue;
 
-    if ((quote_start = strchr(ptr, '"')) && (quote_end = strchr(quote_start + 1, '"')))
+    char *quote_start = strchr(ptr, '"');
+    char *quote_end = quote_start ? strchr(quote_start + 1, '"') : NULL;
+    if (quote_start && quote_end)
     {
       *quote_end = 0;
       strcat(buffer, " ");
@@ -365,10 +406,10 @@ void get_flags(char *source_file, char *buffer, Mode mode)
   fclose(file);
 }
 
-char *get_compiler(char *arch, int bits, char *platform)
+static char *get_compiler(char *arch, int bits, char *platform)
 {
-  int is_native = !strcmp(arch, NATIVE_ARCH) && bits == NATIVE_BITS && !strcmp(platform, NATIVE_PLATFORM);
-
+  int is_native = !strcmp(arch, NATIVE_ARCH) && bits == NATIVE_BITS &&
+                  !strcmp(platform, NATIVE_PLATFORM);
   if (is_native)
     return "cc";
 
@@ -390,10 +431,7 @@ char *get_compiler(char *arch, int bits, char *platform)
 
   if (!strcmp(platform, "macos"))
   {
-    if (!strcmp(arch, "arm"))
-      return "oa64-clang";
-    else
-      return "o64-clang";
+    return !strcmp(arch, "arm") ? "oa64-clang" : "o64-clang";
   }
 
   return "cc";
@@ -403,8 +441,9 @@ int main(int argc, char **argv)
 {
   if (argc < 2)
   {
-    printf("Prism v%s\nUsage : prism [options] src.c [output] [args]\n\n"
-           "Options (any order before src.c):\n"
+    printf("Prism v%s\n"
+           "Usage: prism [options] src.c [output] [args]\n\n"
+           "Options:\n"
            "  build          Build only, don't run\n"
            "  debug/release/small  Optimization mode\n"
            "  arm/x86        Architecture (default: native)\n"
@@ -414,8 +453,9 @@ int main(int argc, char **argv)
            "  prism src.c              Run src.c\n"
            "  prism build src.c        Build src\n"
            "  prism build src.c out    Build to 'out'\n"
-           "  prism build arm src.c    Build for arm64 linux\n"
-           "  prism build windows src.c  Build for windows x64\n\n"
+           "  prism build arm src.c    Build for arm64 linux\n\n"
+           "Prism extensions:\n"
+           "  defer stmt;    Execute stmt when scope exits\n\n"
            "install\n",
            VERSION);
     return 0;
@@ -434,7 +474,6 @@ int main(int argc, char **argv)
   while (arg_idx < argc && !strstr(argv[arg_idx], ".c"))
   {
     char *arg = argv[arg_idx];
-
     if (!strcmp(arg, "build"))
       is_build_only = 1;
     else if (!strcmp(arg, "debug"))
@@ -459,17 +498,17 @@ int main(int argc, char **argv)
       platform = "macos";
     else
       break;
-
     arg_idx++;
   }
 
   if (arg_idx >= argc)
     die("Missing source file.");
 
-  char *source = argv[arg_idx], flags[2048], output[512], command[4096];
-  char transpiled[512], source_dir[512];
-  char *basename = strrchr(source, '/');
+  char *source = argv[arg_idx];
+  char flags[2048], output_path[512], command[4096], transpiled[512];
 
+  // Generate transpiled filename
+  char *basename = strrchr(source, '/');
 #ifdef _WIN32
   char *win_basename = strrchr(source, '\\');
   if (!basename || (win_basename && win_basename > basename))
@@ -478,27 +517,30 @@ int main(int argc, char **argv)
 
   if (!basename)
   {
-    snprintf(transpiled, sizeof(transpiled), ".%s.%d.transpiled.c", source, getpid());
+    snprintf(transpiled, sizeof(transpiled), ".%s.%d.prism.c", source, getpid());
   }
   else
   {
+    char source_dir[512];
     size_t dir_len = basename - source;
     strncpy(source_dir, source, dir_len);
     source_dir[dir_len] = 0;
     basename++;
-    snprintf(transpiled, sizeof(transpiled), "%s.%s.%d.transpiled.c", source_dir, basename, getpid());
+    snprintf(transpiled, sizeof(transpiled), "%s/.%s.%d.prism.c",
+             source_dir, basename, getpid());
   }
 
+  // Transpile
+  printf("[prism] Transpiling %s...\n", source);
   if (!transpile(source, transpiled))
     die("Transpilation failed.");
 
+  // Get compiler flags
   get_flags(source, flags, mode);
-
   char *compiler = get_compiler(arch, bits, platform);
   int is_windows = !strcmp(platform, "windows");
   char *custom_output = NULL;
 
-  // Check for output directive (next arg after source, not starting with -)
   if (is_build_only && arg_idx + 1 < argc && argv[arg_idx + 1][0] != '-')
   {
     custom_output = argv[arg_idx + 1];
@@ -509,43 +551,43 @@ int main(int argc, char **argv)
   {
     if (custom_output)
     {
-      strncpy(output, custom_output, 511);
+      strncpy(output_path, custom_output, 511);
     }
     else
     {
-      strncpy(output, source, 511);
-      char *extension = strrchr(output, '.');
-
-      if (extension)
-        *extension = 0;
-
+      strncpy(output_path, source, 511);
+      char *ext = strrchr(output_path, '.');
+      if (ext)
+        *ext = 0;
       if (is_windows)
-        strcat(output, ".exe");
+        strcat(output_path, ".exe");
     }
-
-    printf("[prism] Building %s (%s %d-bit %s)...\n", output, arch, bits, platform);
+    printf("[prism] Building %s (%s %d-bit %s)...\n", output_path, arch, bits, platform);
   }
   else
-    snprintf(output, sizeof(output), "%sprism_out.%d", TMP, getpid());
+  {
+    snprintf(output_path, sizeof(output_path), "%sprism_out.%d", TMP, getpid());
+  }
 
-  snprintf(command, 4096, "%s \"%s\" -o \"%s\"%s", compiler, transpiled, output, flags);
+  snprintf(command, 4096, "%s \"%s\" -o \"%s\"%s", compiler, transpiled, output_path, flags);
 
   if (system(command))
+  {
+    remove(transpiled);
     die("Compilation failed.");
+  }
 
   if (!is_build_only)
   {
-    snprintf(command, 4096, "\"%s\"", output);
-
+    snprintf(command, 4096, "\"%s\"", output_path);
     for (int j = arg_idx + 1; j < argc; j++)
     {
       size_t len = strlen(command);
       if (len + strlen(argv[j]) + 4 < 4096)
         snprintf(command + len, 4096 - len, " \"%s\"", argv[j]);
     }
-
     int status = system(command);
-    remove(output);
+    remove(output_path);
     remove(transpiled);
     exit(status > 255 ? status >> 8 : status);
   }
