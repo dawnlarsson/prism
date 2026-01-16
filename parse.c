@@ -59,6 +59,8 @@ static void pp_add_default_include_paths(void)
     pp_add_include_path("/usr/local/include");
     pp_add_include_path("/usr/include/x86_64-linux-gnu");
     pp_add_include_path("/usr/include");
+    // GCC built-in headers (like stddef.h, stdarg.h, etc.)
+    pp_add_include_path("/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/include");
 }
 
 typedef struct Type Type;
@@ -1764,8 +1766,10 @@ static int64_t eval_bitor(Token **rest, Token *tok)
 static int64_t eval_logand(Token **rest, Token *tok)
 {
     int64_t val = eval_bitor(&tok, tok);
-    while (equal(tok, "&&"))
-        val = val && eval_bitor(&tok, tok->next);
+    while (equal(tok, "&&")) {
+        int64_t rhs = eval_bitor(&tok, tok->next);
+        val = val && rhs;
+    }
     *rest = tok;
     return val;
 }
@@ -1773,8 +1777,10 @@ static int64_t eval_logand(Token **rest, Token *tok)
 static int64_t eval_logor(Token **rest, Token *tok)
 {
     int64_t val = eval_logand(&tok, tok);
-    while (equal(tok, "||"))
-        val = val || eval_logand(&tok, tok->next);
+    while (equal(tok, "||")) {
+        int64_t rhs = eval_logand(&tok, tok->next);
+        val = val || rhs;
+    }
     *rest = tok;
     return val;
 }
@@ -2050,6 +2056,8 @@ static Token *preprocess2(Token *tok)
 void pp_define_macro(char *name, char *val)
 {
     Token *tok = tokenize(new_file("<built-in>", 0, format("%s %s\n", name, val)));
+    // Skip the macro name token - the body starts after it
+    tok = tok->next;
     add_macro(name, true, tok);
 }
 
