@@ -91,8 +91,8 @@ static char *find_gcc_include_path(const char *base_dir, const char *triple)
 
     if (best_version)
     {
-        static char result[PATH_MAX];
-        snprintf(result, sizeof(result), "%s/%s/include", dir_path, best_version);
+        char *result = malloc(PATH_MAX);
+        snprintf(result, PATH_MAX, "%s/%s/include", dir_path, best_version);
         free(best_version);
         return result;
     }
@@ -1294,6 +1294,7 @@ struct CondIncl
 static HashMap macros;
 static CondIncl *cond_incl;
 static HashMap included_files;
+static bool pp_eval_skip = false;
 
 static Token *preprocess2(Token *tok);
 
@@ -1902,17 +1903,33 @@ static int64_t eval_mul(Token **rest, Token *tok)
     {
         if (equal(tok, "*"))
         {
-            val *= eval_unary(&tok, tok->next);
+            int64_t rhs = eval_unary(&tok, tok->next);
+            if (!pp_eval_skip)
+                val *= rhs;
             continue;
         }
         if (equal(tok, "/"))
         {
-            val /= eval_unary(&tok, tok->next);
+            Token *op = tok;
+            int64_t rhs = eval_unary(&tok, tok->next);
+            if (!pp_eval_skip)
+            {
+                if (rhs == 0)
+                    error_tok(op, "division by zero in preprocessor expression");
+                val /= rhs;
+            }
             continue;
         }
         if (equal(tok, "%"))
         {
-            val %= eval_unary(&tok, tok->next);
+            Token *op = tok;
+            int64_t rhs = eval_unary(&tok, tok->next);
+            if (!pp_eval_skip)
+            {
+                if (rhs == 0)
+                    error_tok(op, "division by zero in preprocessor expression");
+                val %= rhs;
+            }
             continue;
         }
         *rest = tok;
@@ -2042,7 +2059,12 @@ static int64_t eval_logand(Token **rest, Token *tok)
     int64_t val = eval_bitor(&tok, tok);
     while (equal(tok, "&&"))
     {
-        int64_t rhs = eval_bitor(&tok, tok->next);
+        tok = tok->next;
+        bool was_skip = pp_eval_skip;
+        if (!val)
+            pp_eval_skip = true;
+        int64_t rhs = eval_bitor(&tok, tok);
+        pp_eval_skip = was_skip;
         val = val && rhs;
     }
     *rest = tok;
@@ -2054,7 +2076,12 @@ static int64_t eval_logor(Token **rest, Token *tok)
     int64_t val = eval_logand(&tok, tok);
     while (equal(tok, "||"))
     {
-        int64_t rhs = eval_logand(&tok, tok->next);
+        tok = tok->next;
+        bool was_skip = pp_eval_skip;
+        if (val)
+            pp_eval_skip = true;
+        int64_t rhs = eval_logand(&tok, tok);
+        pp_eval_skip = was_skip;
         val = val || rhs;
     }
     *rest = tok;
