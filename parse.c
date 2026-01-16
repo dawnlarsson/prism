@@ -24,9 +24,12 @@
 // iterate tok->next until tok->kind == TK_EOF
 
 #define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include <assert.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -54,13 +57,86 @@ static void pp_add_include_path(const char *path)
     pp_include_paths[pp_include_paths_count++] = strdup(path);
 }
 
+// Helper to find GCC include path by scanning directories
+static char *find_gcc_include_path(const char *base_dir, const char *triple)
+{
+    char dir_path[PATH_MAX];
+    snprintf(dir_path, sizeof(dir_path), "%s/%s", base_dir, triple);
+
+    DIR *dir = opendir(dir_path);
+    if (!dir)
+        return NULL;
+
+    char *best_version = NULL;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL)
+    {
+        if (ent->d_name[0] == '.')
+            continue;
+        // Check if it's a version directory with include subdir
+        char include_path[PATH_MAX];
+        snprintf(include_path, sizeof(include_path), "%s/%s/include", dir_path, ent->d_name);
+        struct stat st;
+        if (stat(include_path, &st) == 0 && S_ISDIR(st.st_mode))
+        {
+            // Keep the highest version (simple string compare works for version numbers)
+            if (!best_version || strcmp(ent->d_name, best_version) > 0)
+            {
+                free(best_version);
+                best_version = strdup(ent->d_name);
+            }
+        }
+    }
+    closedir(dir);
+
+    if (best_version)
+    {
+        static char result[PATH_MAX];
+        snprintf(result, sizeof(result), "%s/%s/include", dir_path, best_version);
+        free(best_version);
+        return result;
+    }
+    return NULL;
+}
+
 static void pp_add_default_include_paths(void)
 {
+    struct stat st;
+
+    // GCC built-in headers first - needed for include_next to work correctly
+    // Try to find GCC include path dynamically
+    static const char *gcc_base_dirs[] = {
+        "/usr/lib/gcc",
+        "/usr/lib64/gcc",
+        NULL};
+    static const char *gcc_triples[] = {
+        "x86_64-pc-linux-gnu",
+        "x86_64-linux-gnu",
+        "aarch64-linux-gnu",
+        "x86_64-suse-linux",
+        NULL};
+
+    bool found_gcc = false;
+    for (int i = 0; !found_gcc && gcc_base_dirs[i]; i++)
+    {
+        for (int j = 0; !found_gcc && gcc_triples[j]; j++)
+        {
+            char *path = find_gcc_include_path(gcc_base_dirs[i], gcc_triples[j]);
+            if (path && stat(path, &st) == 0)
+            {
+                pp_add_include_path(path);
+                found_gcc = true;
+            }
+        }
+    }
+
     pp_add_include_path("/usr/local/include");
+
+    // Try common multiarch paths
     pp_add_include_path("/usr/include/x86_64-linux-gnu");
+    pp_add_include_path("/usr/include/aarch64-linux-gnu");
+
     pp_add_include_path("/usr/include");
-    // GCC built-in headers (like stddef.h, stdarg.h, etc.)
-    pp_add_include_path("/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/include");
 }
 
 typedef struct Type Type;
@@ -224,11 +300,13 @@ static void hashmap_rehash(HashMap *map)
             nkeys++;
 
     int cap = map->capacity;
+    if (cap < 16)
+        cap = 16;
     while ((nkeys * 100) / cap >= 50)
         cap *= 2;
 
     HashMap map2 = {};
-    map2.buckets = calloc(cap, sizeof(HashEntry));
+    map2.buckets = calloc((size_t)cap, sizeof(HashEntry));
     map2.capacity = cap;
 
     for (int i = 0; i < map->capacity; i++)
@@ -1215,8 +1293,7 @@ struct CondIncl
 
 static HashMap macros;
 static CondIncl *cond_incl;
-static HashMap pragma_once;
-static int include_next_idx;
+static HashMap included_files;
 
 static Token *preprocess2(Token *tok);
 
@@ -1230,6 +1307,14 @@ static Token *skip_line(Token *tok)
     if (tok->at_bol)
         return tok;
     warn_tok(tok, "extra token");
+    while (!tok->at_bol)
+        tok = tok->next;
+    return tok;
+}
+
+// Skip to end of line without warning (for ignored directives like #pragma)
+static Token *skip_line_quiet(Token *tok)
+{
     while (!tok->at_bol)
         tok = tok->next;
     return tok;
@@ -1249,6 +1334,16 @@ static Token *new_eof(Token *tok)
     t->kind = TK_EOF;
     t->len = 0;
     return t;
+}
+
+static Token *copy_token_list(Token *tok)
+{
+    Token head = {};
+    Token *cur = &head;
+    for (; tok && tok->kind != TK_EOF; tok = tok->next)
+        cur = cur->next = copy_token(tok);
+    cur->next = new_eof(tok ? tok : cur);
+    return head.next;
 }
 
 static Hideset *new_hideset(char *name)
@@ -1361,38 +1456,77 @@ static void add_builtin(char *name, macro_handler_fn *fn)
     m->handler = fn;
 }
 
-static Token *read_macro_args(Token **rest, Token *tok, MacroParam *params, char *va_name)
+static MacroArg *read_macro_args(Token **rest, Token *tok, MacroParam *params, char *va_name)
 {
-    Token head = {};
-    Token *cur = &head;
+    MacroArg head = {};
+    MacroArg *cur = &head;
 
     MacroParam *pp = params;
-    for (; pp; pp = pp->next)
+
+    // Read positional arguments
+    while (pp)
     {
         if (cur != &head)
             tok = skip(tok, ",");
+
         MacroArg *arg = calloc(1, sizeof(MacroArg));
         arg->name = pp->name;
 
         Token arg_head = {};
         Token *arg_cur = &arg_head;
         int depth = 0;
-        while (true)
+
+        while (tok->kind != TK_EOF)
         {
             if (depth == 0 && equal(tok, ")"))
                 break;
-            if (depth == 0 && equal(tok, ",") && pp->next)
+            if (depth == 0 && equal(tok, ",") && (pp->next || va_name))
                 break;
             if (equal(tok, "("))
                 depth++;
-            if (equal(tok, ")"))
+            else if (equal(tok, ")"))
                 depth--;
             arg_cur = arg_cur->next = copy_token(tok);
             tok = tok->next;
         }
+
         arg_cur->next = new_eof(tok);
-        arg->tok = arg_head.next;
-        cur = cur->next = (Token *)arg;
+        arg->tok = arg_head.next ? arg_head.next : new_eof(tok);
+        cur->next = arg;
+        cur = arg;
+        pp = pp->next;
+    }
+
+    // Read variadic arguments if present
+    if (va_name)
+    {
+        MacroArg *arg = calloc(1, sizeof(MacroArg));
+        arg->name = va_name;
+        arg->is_va_args = true;
+
+        Token arg_head = {};
+        Token *arg_cur = &arg_head;
+
+        // Skip comma if we had positional args and there are more args
+        if (cur != &head && !equal(tok, ")"))
+            tok = skip(tok, ",");
+
+        int depth = 0;
+        while (tok->kind != TK_EOF)
+        {
+            if (depth == 0 && equal(tok, ")"))
+                break;
+            if (equal(tok, "("))
+                depth++;
+            else if (equal(tok, ")"))
+                depth--;
+            arg_cur = arg_cur->next = copy_token(tok);
+            tok = tok->next;
+        }
+
+        arg_cur->next = new_eof(tok);
+        arg->tok = arg_head.next ? arg_head.next : new_eof(tok);
+        cur->next = arg;
     }
 
     *rest = skip(tok, ")");
@@ -1407,6 +1541,69 @@ static Token *find_arg(MacroArg *args, Token *tok)
     return NULL;
 }
 
+// Stringify tokens
+static char *stringify_tokens(Token *tok)
+{
+    char *buf;
+    size_t buflen;
+    FILE *fp = open_memstream(&buf, &buflen);
+
+    for (Token *t = tok; t && t->kind != TK_EOF; t = t->next)
+    {
+        if (t != tok && t->has_space)
+            fputc(' ', fp);
+        // Escape quotes and backslashes in strings
+        if (t->kind == TK_STR)
+        {
+            fputc('"', fp);
+            for (int i = 0; i < t->len - 2; i++)
+            {
+                char c = t->loc[i + 1];
+                if (c == '"' || c == '\\')
+                    fputc('\\', fp);
+                fputc(c, fp);
+            }
+            fputc('"', fp);
+        }
+        else
+        {
+            fprintf(fp, "%.*s", t->len, t->loc);
+        }
+    }
+    fclose(fp);
+    return buf;
+}
+
+static Token *new_str_token_raw(char *str, Token *tmpl)
+{
+    // Create a properly escaped string token
+    char *buf;
+    size_t buflen;
+    FILE *fp = open_memstream(&buf, &buflen);
+    fputc('"', fp);
+    for (char *p = str; *p; p++)
+    {
+        if (*p == '"' || *p == '\\')
+            fputc('\\', fp);
+        fputc(*p, fp);
+    }
+    fputc('"', fp);
+    fputc('\n', fp);
+    fclose(fp);
+    return tokenize(new_file(tmpl->file->name, tmpl->file->file_no, buf));
+}
+
+// Paste two tokens together
+static Token *paste(Token *lhs, Token *rhs)
+{
+    char *buf = format("%.*s%.*s", lhs->len, lhs->loc, rhs->len, rhs->loc);
+    Token *tok = tokenize(new_file(lhs->file->name, lhs->file->file_no, format("%s\n", buf)));
+    if (tok->next->kind != TK_EOF)
+        error_tok(lhs, "pasting \"%.*s\" and \"%.*s\" does not produce a valid token",
+                  lhs->len, lhs->loc, rhs->len, rhs->loc);
+    return tok;
+}
+
 static Token *subst(Token *tok, MacroArg *args)
 {
     Token head = {};
@@ -1414,10 +1611,71 @@ static Token *subst(Token *tok, MacroArg *args)
 
     while (tok->kind != TK_EOF)
     {
+        // Handle # (stringification)
+        if (equal(tok, "#"))
+        {
+            Token *arg = find_arg(args, tok->next);
+            if (!arg)
+                error_tok(tok->next, "'#' is not followed by a macro parameter");
+            char *str = stringify_tokens(arg);
+            cur = cur->next = new_str_token_raw(str, tok);
+            tok = tok->next->next;
+            continue;
+        }
+
+        // Handle ## (token pasting)
+        if (equal(tok, "##"))
+        {
+            if (cur == &head)
+                error_tok(tok, "'##' cannot appear at start of macro expansion");
+            tok = tok->next;
+
+            // Get rhs - either arg tokens or literal token
+            Token *rhs = find_arg(args, tok);
+            if (rhs)
+            {
+                // If arg is empty, skip
+                if (rhs->kind == TK_EOF)
+                {
+                    tok = tok->next;
+                    continue;
+                }
+                // Paste cur with first token of arg
+                *cur = *paste(cur, rhs);
+                // Append rest of arg
+                for (Token *t = rhs->next; t && t->kind != TK_EOF; t = t->next)
+                    cur = cur->next = copy_token(t);
+            }
+            else
+            {
+                *cur = *paste(cur, tok);
+            }
+            tok = tok->next;
+            continue;
+        }
+
+        // Check if next is ## and current is an arg
         Token *arg = find_arg(args, tok);
+        if (equal(tok->next, "##") && arg)
+        {
+            // If arg is empty, skip both arg and ##
+            if (arg->kind == TK_EOF)
+            {
+                tok = tok->next->next;
+                continue;
+            }
+            // Add arg tokens; last one will be pasted by ## handling
+            for (Token *t = arg; t && t->kind != TK_EOF; t = t->next)
+                cur = cur->next = copy_token(t);
+            tok = tok->next;
+            continue;
+        }
+
         if (arg)
         {
-            for (Token *t = arg; t && t->kind != TK_EOF; t = t->next)
+            // Expand argument (without ##)
+            Token *expanded = preprocess2(copy_token_list(arg));
+            for (Token *t = expanded; t && t->kind != TK_EOF; t = t->next)
                 cur = cur->next = copy_token(t);
             tok = tok->next;
             continue;
@@ -1459,7 +1717,7 @@ static bool expand_macro(Token **rest, Token *tok)
         return false;
 
     Token *macro_tok = tok;
-    MacroArg *args = (MacroArg *)read_macro_args(&tok, tok->next->next, m->params, m->va_args_name);
+    MacroArg *args = read_macro_args(&tok, tok->next->next, m->params, m->va_args_name);
     Token *body = subst(m->body, args);
     Hideset *hs = hideset_intersection(macro_tok->hideset, tok->hideset);
     hs = hideset_union(hs, new_hideset(m->name));
@@ -1507,12 +1765,28 @@ static char *read_include_filename(Token **rest, Token *tok, bool *is_dquote)
     error_tok(tok, "expected a filename");
 }
 
-static Token *include_file(Token *tok, char *path)
+static Token *include_file(Token *tok, char *path, Token *cont)
 {
+    // Resolve to canonical path for deduplication
+    char *real = realpath(path, NULL);
+    char *key = real ? real : path;
+
+    // Check if already included (via #pragma once or prior include)
+    if (hashmap_get(&included_files, key))
+    {
+        if (real)
+            free(real);
+        return cont;
+    }
+
     Token *tok2 = tokenize_file(path);
     if (!tok2)
         error_tok(tok, "%s: cannot open file", path);
-    return append(tok2, tok);
+
+    if (real)
+        free(real);
+
+    return append(tok2, cont);
 }
 
 static MacroParam *read_macro_params(Token **rest, Token *tok, char **va_name)
@@ -1766,7 +2040,8 @@ static int64_t eval_bitor(Token **rest, Token *tok)
 static int64_t eval_logand(Token **rest, Token *tok)
 {
     int64_t val = eval_bitor(&tok, tok);
-    while (equal(tok, "&&")) {
+    while (equal(tok, "&&"))
+    {
         int64_t rhs = eval_bitor(&tok, tok->next);
         val = val && rhs;
     }
@@ -1777,7 +2052,8 @@ static int64_t eval_logand(Token **rest, Token *tok)
 static int64_t eval_logor(Token **rest, Token *tok)
 {
     int64_t val = eval_logand(&tok, tok);
-    while (equal(tok, "||")) {
+    while (equal(tok, "||"))
+    {
         int64_t rhs = eval_logand(&tok, tok->next);
         val = val || rhs;
     }
@@ -1928,7 +2204,48 @@ static Token *preprocess2(Token *tok)
                 error_tok(start, "%s: cannot open file", filename);
 
             tok = skip_line(tok);
-            tok = include_file(tok, path);
+            tok = include_file(start, path, tok);
+            continue;
+        }
+
+        if (equal(tok, "include_next"))
+        {
+            bool is_dquote;
+            char *filename = read_include_filename(&tok, tok->next, &is_dquote);
+
+            // Search from the next include path after where current file was found
+            char *path = NULL;
+            char *cur_file = start->file->name;
+
+            // Find which include path the current file is under
+            int start_idx = 0;
+            for (int i = 0; i < pp_include_paths_count; i++)
+            {
+                int len = strlen(pp_include_paths[i]);
+                if (strncmp(cur_file, pp_include_paths[i], len) == 0 &&
+                    (cur_file[len] == '/' || cur_file[len] == '\0'))
+                {
+                    start_idx = i + 1;
+                    break;
+                }
+            }
+
+            // Search from the next path onwards
+            for (int i = start_idx; i < pp_include_paths_count; i++)
+            {
+                char *try = format("%s/%s", pp_include_paths[i], filename);
+                struct stat st;
+                if (stat(try, &st) == 0)
+                {
+                    path = try;
+                    break;
+                }
+            }
+            if (!path)
+                error_tok(start, "%s: cannot open file", filename);
+
+            tok = skip_line(tok);
+            tok = include_file(start, path, tok);
             continue;
         }
 
@@ -2029,6 +2346,21 @@ static Token *preprocess2(Token *tok)
 
         if (equal(tok, "pragma"))
         {
+            if (equal(tok->next, "once"))
+            {
+                // Mark this file as included
+                char *real = realpath(start->file->name, NULL);
+                char *key = real ? real : strdup(start->file->name);
+                hashmap_put(&included_files, key, (void *)1);
+            }
+            // Silently skip all pragma directives (GCC diagnostic, etc.)
+            tok = skip_line_quiet(tok->next);
+            continue;
+        }
+
+        if (equal(tok, "warning"))
+        {
+            // Just skip #warning, optionally print it
             tok = skip_line(tok->next);
             continue;
         }
@@ -2069,25 +2401,83 @@ void pp_init(void)
     pp_define_macro("__STDC__", "1");
     pp_define_macro("__STDC_VERSION__", "201112L");
     pp_define_macro("__STDC_HOSTED__", "1");
+    pp_define_macro("__STDC_UTF_16__", "1");
+    pp_define_macro("__STDC_UTF_32__", "1");
 
     // Common predefined macros
     pp_define_macro("__LP64__", "1");
     pp_define_macro("__SIZEOF_POINTER__", "8");
     pp_define_macro("__SIZEOF_LONG__", "8");
     pp_define_macro("__SIZEOF_INT__", "4");
+    pp_define_macro("__SIZEOF_SHORT__", "2");
+    pp_define_macro("__SIZEOF_FLOAT__", "4");
+    pp_define_macro("__SIZEOF_DOUBLE__", "8");
+    pp_define_macro("__SIZEOF_LONG_DOUBLE__", "16");
+    pp_define_macro("__SIZEOF_LONG_LONG__", "8");
+    pp_define_macro("__SIZEOF_SIZE_T__", "8");
+    pp_define_macro("__SIZEOF_PTRDIFF_T__", "8");
+    pp_define_macro("__SIZEOF_WCHAR_T__", "4");
+    pp_define_macro("__SIZEOF_WINT_T__", "4");
+
+    // GCC compatibility - critical for glibc headers
+    // Use GCC 13+ to avoid _Float32 typedef conflicts (they're compiler built-ins in modern GCC)
+    pp_define_macro("__GNUC__", "13");
+    pp_define_macro("__GNUC_MINOR__", "0");
+    pp_define_macro("__GNUC_PATCHLEVEL__", "0");
+    pp_define_macro("__GNUC_STDC_INLINE__", "1");
+
+    // GNU C extensions - just make them empty/passthrough
+    pp_define_macro("__extension__", "");
+    pp_define_macro("__inline", "inline");
+    pp_define_macro("__inline__", "inline");
+    pp_define_macro("__signed__", "signed");
+    pp_define_macro("__const", "const");
+    pp_define_macro("__const__", "const");
+    pp_define_macro("__volatile__", "volatile");
+    pp_define_macro("__asm__", "asm");
+    pp_define_macro("__asm", "asm");
+    pp_define_macro("__typeof__", "typeof");
+
+    // Byte order
+    pp_define_macro("__BYTE_ORDER__", "1234");
+    pp_define_macro("__ORDER_LITTLE_ENDIAN__", "1234");
+    pp_define_macro("__ORDER_BIG_ENDIAN__", "4321");
+
+    // Char signedness
+    pp_define_macro("__CHAR_BIT__", "8");
+    pp_define_macro("__SCHAR_MAX__", "127");
+    pp_define_macro("__SHRT_MAX__", "32767");
+    pp_define_macro("__INT_MAX__", "2147483647");
+    pp_define_macro("__LONG_MAX__", "9223372036854775807L");
+    pp_define_macro("__LONG_LONG_MAX__", "9223372036854775807LL");
 
 #if defined(__linux__)
     pp_define_macro("__linux__", "1");
+    pp_define_macro("__linux", "1");
+    pp_define_macro("linux", "1");
     pp_define_macro("__unix__", "1");
+    pp_define_macro("__unix", "1");
+    pp_define_macro("unix", "1");
+    pp_define_macro("__gnu_linux__", "1");
+    pp_define_macro("__ELF__", "1");
 #elif defined(__APPLE__)
     pp_define_macro("__APPLE__", "1");
+    pp_define_macro("__MACH__", "1");
+#elif defined(_WIN32)
+    pp_define_macro("_WIN32", "1");
 #endif
 
 #if defined(__x86_64__)
     pp_define_macro("__x86_64__", "1");
+    pp_define_macro("__x86_64", "1");
     pp_define_macro("__amd64__", "1");
+    pp_define_macro("__amd64", "1");
 #elif defined(__aarch64__)
     pp_define_macro("__aarch64__", "1");
+#elif defined(__i386__)
+    pp_define_macro("__i386__", "1");
+    pp_define_macro("__i386", "1");
+    pp_define_macro("i386", "1");
 #endif
 }
 

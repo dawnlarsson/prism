@@ -106,13 +106,63 @@ static void defer_add(Token *start, Token *end)
 // =============================================================================
 
 static FILE *out;
+static Token *last_emitted = NULL;
+
+// Check if a space is needed between two tokens
+static bool needs_space(Token *prev, Token *tok)
+{
+  if (!prev)
+    return false;
+  if (tok->at_bol)
+    return false; // newline will be emitted
+  if (tok->has_space)
+    return true;
+
+  // Check if merging would create a different token
+  // e.g., "int" + "x" -> "intx", "+" + "+" -> "++"
+  char prev_last = prev->loc[prev->len - 1];
+  char tok_first = tok->loc[0];
+
+  // Identifier/keyword followed by identifier/keyword or number
+  if ((prev->kind == TK_IDENT || prev->kind == TK_KEYWORD || prev->kind == TK_NUM) &&
+      (tok->kind == TK_IDENT || tok->kind == TK_KEYWORD || tok->kind == TK_NUM))
+    return true;
+
+  // Punctuation that could merge
+  if (prev->kind == TK_PUNCT && tok->kind == TK_PUNCT)
+  {
+    // Check common cases: ++ -- << >> && || etc.
+    if ((prev_last == '+' && tok_first == '+') ||
+        (prev_last == '-' && tok_first == '-') ||
+        (prev_last == '<' && tok_first == '<') ||
+        (prev_last == '>' && tok_first == '>') ||
+        (prev_last == '&' && tok_first == '&') ||
+        (prev_last == '|' && tok_first == '|') ||
+        (prev_last == '=' && tok_first == '=') ||
+        (prev_last == '!' && tok_first == '=') ||
+        (prev_last == '<' && tok_first == '=') ||
+        (prev_last == '>' && tok_first == '=') ||
+        (prev_last == '+' && tok_first == '=') ||
+        (prev_last == '-' && tok_first == '=') ||
+        (prev_last == '*' && tok_first == '=') ||
+        (prev_last == '/' && tok_first == '=') ||
+        (prev_last == '-' && tok_first == '>') ||
+        (prev_last == '#' && tok_first == '#'))
+      return true;
+  }
+
+  return false;
+}
 
 // Emit a single token with appropriate spacing
 static void emit_tok(Token *tok)
 {
-  if (tok->has_space)
+  if (tok->at_bol)
+    fputc('\n', out);
+  else if (needs_space(last_emitted, tok))
     fputc(' ', out);
   fprintf(out, "%.*s", tok->len, tok->loc);
+  last_emitted = tok;
 }
 
 // Emit tokens from start up to (but not including) end
@@ -219,8 +269,9 @@ static int transpile(char *input_file, char *output_file)
   if (!out)
     return 0;
 
-  // Reset defer state
+  // Reset state
   defer_depth = 0;
+  last_emitted = NULL;
 
   // Walk tokens and emit
   while (tok->kind != TK_EOF)
