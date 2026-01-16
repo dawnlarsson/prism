@@ -3,7 +3,7 @@
 // 2: prism prism.c install
 
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.6.0"
+#define VERSION "0.7.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -67,18 +67,27 @@ typedef struct
   Token *stmts[MAX_DEFERS_PER_SCOPE]; // Start token of each deferred statement
   Token *ends[MAX_DEFERS_PER_SCOPE];  // End token (the semicolon)
   int count;
+  bool is_loop;   // true if this scope is a for/while/do loop
+  bool is_switch; // true if this scope is a switch statement
 } DeferScope;
 
 static DeferScope defer_stack[MAX_DEFER_DEPTH];
 static int defer_depth = 0;
 
+// Track pending loop/switch for next scope
+static bool next_scope_is_loop = false;
+static bool next_scope_is_switch = false;
+
 static void defer_push_scope(void)
 {
-  if (defer_depth < MAX_DEFER_DEPTH)
-  {
-    defer_stack[defer_depth].count = 0;
-    defer_depth++;
-  }
+  if (defer_depth >= MAX_DEFER_DEPTH)
+    error("defer: scope nesting too deep (max %d)", MAX_DEFER_DEPTH);
+  defer_stack[defer_depth].count = 0;
+  defer_stack[defer_depth].is_loop = next_scope_is_loop;
+  defer_stack[defer_depth].is_switch = next_scope_is_switch;
+  next_scope_is_loop = false;
+  next_scope_is_switch = false;
+  defer_depth++;
 }
 
 static void defer_pop_scope(void)
@@ -89,16 +98,14 @@ static void defer_pop_scope(void)
 
 static void defer_add(Token *start, Token *end)
 {
-  if (defer_depth > 0)
-  {
-    DeferScope *scope = &defer_stack[defer_depth - 1];
-    if (scope->count < MAX_DEFERS_PER_SCOPE)
-    {
-      scope->stmts[scope->count] = start;
-      scope->ends[scope->count] = end;
-      scope->count++;
-    }
-  }
+  if (defer_depth <= 0)
+    error_tok(start, "defer outside of any scope");
+  DeferScope *scope = &defer_stack[defer_depth - 1];
+  if (scope->count >= MAX_DEFERS_PER_SCOPE)
+    error_tok(start, "too many defers in scope (max %d)", MAX_DEFERS_PER_SCOPE);
+  scope->stmts[scope->count] = start;
+  scope->ends[scope->count] = end;
+  scope->count++;
 }
 
 // =============================================================================
@@ -201,12 +208,72 @@ static void emit_all_defers(void)
   }
 }
 
+// Emit defers for break - from current scope through innermost loop/switch
+static void emit_break_defers(void)
+{
+  for (int d = defer_depth - 1; d >= 0; d--)
+  {
+    DeferScope *scope = &defer_stack[d];
+    for (int i = scope->count - 1; i >= 0; i--)
+    {
+      fputc(' ', out);
+      emit_range(scope->stmts[i], scope->ends[i]);
+      fputc(';', out);
+    }
+    if (scope->is_loop || scope->is_switch)
+      break; // Stop after the loop/switch scope
+  }
+}
+
+// Emit defers for continue - from current scope through innermost loop scope
+static void emit_continue_defers(void)
+{
+  for (int d = defer_depth - 1; d >= 0; d--)
+  {
+    DeferScope *scope = &defer_stack[d];
+    for (int i = scope->count - 1; i >= 0; i--)
+    {
+      fputc(' ', out);
+      emit_range(scope->stmts[i], scope->ends[i]);
+      fputc(';', out);
+    }
+    if (scope->is_loop)
+      break; // Stop after emitting loop scope's defers
+  }
+}
+
 // Check if there are any active defers
 static bool has_active_defers(void)
 {
   for (int d = 0; d < defer_depth; d++)
     if (defer_stack[d].count > 0)
       return true;
+  return false;
+}
+
+// Check if break needs to emit defers
+static bool break_has_defers(void)
+{
+  for (int d = defer_depth - 1; d >= 0; d--)
+  {
+    if (defer_stack[d].count > 0)
+      return true;
+    if (defer_stack[d].is_loop || defer_stack[d].is_switch)
+      break;
+  }
+  return false;
+}
+
+// Check if continue needs to emit defers
+static bool continue_has_defers(void)
+{
+  for (int d = defer_depth - 1; d >= 0; d--)
+  {
+    if (defer_stack[d].count > 0)
+      return true;
+    if (defer_stack[d].is_loop)
+      break;
+  }
   return false;
 }
 
@@ -272,6 +339,8 @@ static int transpile(char *input_file, char *output_file)
   // Reset state
   defer_depth = 0;
   last_emitted = NULL;
+  next_scope_is_loop = false;
+  next_scope_is_switch = false;
 
   // Walk tokens and emit
   while (tok->kind != TK_EOF)
@@ -279,7 +348,6 @@ static int transpile(char *input_file, char *output_file)
     // Handle 'defer' keyword
     if (tok->kind == TK_KEYWORD && equal(tok, "defer"))
     {
-      Token *defer_tok = tok;
       tok = tok->next; // skip 'defer'
 
       // Find the statement (up to semicolon)
@@ -294,42 +362,97 @@ static int transpile(char *input_file, char *output_file)
         tok = stmt_end->next;
       else
         tok = stmt_end;
-
-      // Emit a comment for debugging
-      fprintf(out, " /* defer recorded */");
       continue;
     }
 
-    // Handle 'return' - emit all defers first
+    // Handle 'return' - evaluate expr, run defers, then return
     if (tok->kind == TK_KEYWORD && equal(tok, "return"))
     {
       if (has_active_defers())
       {
-        // Wrap in block: { defers; return expr; }
-        fprintf(out, " {");
-        emit_all_defers();
+        tok = tok->next; // skip 'return'
 
-        // Emit return and expression
-        emit_tok(tok); // 'return'
-        tok = tok->next;
-
-        // Emit until semicolon
-        while (tok->kind != TK_EOF && !equal(tok, ";"))
-        {
-          emit_tok(tok);
-          tok = tok->next;
-        }
-
+        // Check if there's an expression or just "return;"
         if (equal(tok, ";"))
         {
-          emit_tok(tok); // ';'
+          // void return: { defers; return; }
+          fprintf(out, " {");
+          emit_all_defers();
+          fprintf(out, " return;");
           tok = tok->next;
+          fprintf(out, " }");
         }
+        else
+        {
+          // return with expression: { __auto_type _ret = (expr); defers; return _ret; }
+          fprintf(out, " { __auto_type _prism_ret = (");
 
-        fprintf(out, " }");
+          // Emit expression until semicolon
+          while (tok->kind != TK_EOF && !equal(tok, ";"))
+          {
+            emit_tok(tok);
+            tok = tok->next;
+          }
+
+          fprintf(out, ");");
+          emit_all_defers();
+          fprintf(out, " return _prism_ret;");
+
+          if (equal(tok, ";"))
+            tok = tok->next;
+
+          fprintf(out, " }");
+        }
         continue;
       }
       // No defers, emit normally
+    }
+
+    // Handle 'break' - emit defers up through loop/switch
+    if (tok->kind == TK_KEYWORD && equal(tok, "break"))
+    {
+      if (break_has_defers())
+      {
+        fprintf(out, " {");
+        emit_break_defers();
+        fprintf(out, " break; }");
+        tok = tok->next;
+        // Skip the semicolon
+        if (equal(tok, ";"))
+          tok = tok->next;
+        continue;
+      }
+      // No defers, emit normally
+    }
+
+    // Handle 'continue' - emit defers up to (not including) loop
+    if (tok->kind == TK_KEYWORD && equal(tok, "continue"))
+    {
+      if (continue_has_defers())
+      {
+        fprintf(out, " {");
+        emit_continue_defers();
+        fprintf(out, " continue; }");
+        tok = tok->next;
+        // Skip the semicolon
+        if (equal(tok, ";"))
+          tok = tok->next;
+        continue;
+      }
+      // No defers, emit normally
+    }
+
+    // Mark loop keywords so next '{' knows it's a loop scope
+    if (tok->kind == TK_KEYWORD &&
+        (equal(tok, "for") || equal(tok, "while") || equal(tok, "do")))
+    {
+      next_scope_is_loop = true;
+    }
+
+    // Mark switch keyword
+    if (tok->kind == TK_KEYWORD && equal(tok, "switch"))
+    {
+      next_scope_is_switch = true;
     }
 
     // Handle '{' - push scope
