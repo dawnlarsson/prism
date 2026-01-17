@@ -21,10 +21,29 @@ void example() {
 }
 ```
 
+**Opt-out** `prism src.c no-defer`
+
+## Zero-Init
+Local variables are automatically zero-initialized.
+
+```c
+void example() {
+    int x;           // x = 0
+    char *ptr;       // ptr = NULL
+    int arr[10];     // all elements = 0
+    struct { int a; float b; } s;  // s = {0}
+}
+```
+
+Works with: primitives, pointers, arrays, structs, unions, enums.
+
+**Limitation:** Typedef'd types require explicit initialization.
+**Opt-out** `prism src.c no-zeroinit`
+
 ## CLI
 
 ```sh
-Prism v0.14.0
+Prism v0.21.0
 Usage: prism [options] src.c [output] [args]
 
 Options:
@@ -34,6 +53,8 @@ Options:
   arm/x86        Architecture (default: native)
   32/64          Word size (default: 64)
   linux/windows/macos  Platform (default: native)
+  no-defer       Disable defer feature
+  no-zeroinit    Disable zero-initialization
 
 Examples:
   prism src.c              Run src.c
@@ -42,9 +63,11 @@ Examples:
   prism build arm src.c    Build for arm64 linux
   prism transpile src.c    Transpile to stdout
   prism transpile src.c out.c  Transpile to out.c
+  prism no-defer src.c     Run without defer
 
 Prism extensions:
   defer stmt;    Execute stmt when scope exits
+  Zero-init      Local vars auto-initialized to 0
 
 install
 ```

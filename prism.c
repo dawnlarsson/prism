@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.20.0"
+#define VERSION "0.21.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -46,6 +46,14 @@ typedef enum
   MODE_RELEASE,
   MODE_SMALL
 } Mode;
+
+// Feature flags (all enabled by default)
+static bool feature_defer = true;
+static bool feature_zeroinit = true;
+
+// Track struct/union/enum depth (don't zero-init inside these)
+static int struct_depth = 0;
+
 // Defer tracking
 #define MAX_DEFER_DEPTH 64
 #define MAX_DEFERS_PER_SCOPE 32
@@ -551,6 +559,165 @@ static Token *skip_balanced(Token *tok, char *open, char *close)
   return tok;
 }
 
+// Zero-init helpers
+static bool is_type_keyword(Token *tok)
+{
+  if (tok->kind != TK_KEYWORD && tok->kind != TK_IDENT)
+    return false;
+  return equal(tok, "int") || equal(tok, "char") || equal(tok, "short") ||
+         equal(tok, "long") || equal(tok, "float") || equal(tok, "double") ||
+         equal(tok, "void") || equal(tok, "signed") || equal(tok, "unsigned") ||
+         equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum") ||
+         equal(tok, "_Bool") || equal(tok, "bool");
+}
+
+static bool is_type_qualifier(Token *tok)
+{
+  if (tok->kind != TK_KEYWORD)
+    return false;
+  return equal(tok, "const") || equal(tok, "volatile") || equal(tok, "restrict") ||
+         equal(tok, "static") || equal(tok, "auto") || equal(tok, "register") ||
+         equal(tok, "_Atomic");
+}
+
+static bool is_skip_decl_keyword(Token *tok)
+{
+  return equal(tok, "extern") || equal(tok, "typedef");
+}
+
+// Check if array size is a compile-time constant (not a VLA)
+static bool is_const_array_size(Token *open_bracket)
+{
+  Token *tok = open_bracket->next;
+  int depth = 1;
+  bool has_only_literals = true;
+  bool is_empty = true;
+
+  while (tok->kind != TK_EOF && depth > 0)
+  {
+    if (equal(tok, "["))
+      depth++;
+    else if (equal(tok, "]"))
+      depth--;
+    else
+    {
+      is_empty = false;
+      // Allow numeric literals, sizeof, and basic operators
+      if (tok->kind != TK_NUM && !equal(tok, "sizeof") &&
+          !equal(tok, "+") && !equal(tok, "-") && !equal(tok, "*") &&
+          !equal(tok, "/") && !equal(tok, "(") && !equal(tok, ")"))
+      {
+        // If it's an identifier, it might be a VLA
+        if (tok->kind == TK_IDENT)
+          has_only_literals = false;
+      }
+    }
+    tok = tok->next;
+  }
+  return is_empty || has_only_literals;
+}
+
+// Try to handle a declaration with zero-init
+// Returns the token after the declaration if handled, NULL otherwise
+static Token *try_zero_init_decl(Token *tok)
+{
+  if (!feature_zeroinit || defer_depth <= 0 || struct_depth > 0)
+    return NULL;
+
+  Token *start = tok;
+
+  // Skip extern/typedef - don't init these
+  if (is_skip_decl_keyword(tok))
+    return NULL;
+
+  // Must start with qualifier or type
+  bool saw_type = false;
+  bool is_struct_type = false;
+  while (is_type_qualifier(tok) || is_type_keyword(tok))
+  {
+    if (is_type_keyword(tok))
+      saw_type = true;
+    // Handle struct/union/enum followed by optional tag
+    if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum"))
+    {
+      is_struct_type = true;
+      tok = tok->next;
+      if (tok->kind == TK_IDENT)
+        tok = tok->next;
+      // Could have { body } - skip it
+      if (equal(tok, "{"))
+        tok = skip_balanced(tok, "{", "}");
+      saw_type = true;
+      continue;
+    }
+    tok = tok->next;
+  }
+
+  if (!saw_type)
+    return NULL;
+
+  // Skip pointers - if it's a pointer, it's not a struct anymore
+  bool is_pointer = false;
+  while (equal(tok, "*") || is_type_qualifier(tok))
+  {
+    if (equal(tok, "*"))
+      is_pointer = true;
+    tok = tok->next;
+  }
+
+  // Must have identifier
+  if (tok->kind != TK_IDENT)
+    return NULL;
+
+  Token *var_name = tok;
+  tok = tok->next;
+
+  // Check what follows the identifier
+  bool is_array = false;
+  bool is_vla = false;
+
+  // Function declaration? Skip
+  if (equal(tok, "("))
+    return NULL;
+
+  // Array?
+  if (equal(tok, "["))
+  {
+    is_array = true;
+    if (!is_const_array_size(tok))
+      is_vla = true;
+    // Skip all array dimensions
+    while (equal(tok, "["))
+      tok = skip_balanced(tok, "[", "]");
+  }
+
+  // Multiple declarators? Too complex for now
+  if (equal(tok, ","))
+    return NULL;
+
+  // Already has initializer?
+  if (equal(tok, "="))
+    return NULL;
+
+  // Must end with semicolon
+  if (!equal(tok, ";"))
+    return NULL;
+
+  // VLAs can't be initialized
+  if (is_vla)
+    return NULL;
+
+  // Emit the declaration with zero initializer
+  emit_range(start, tok); // everything up to semicolon
+  if (is_array || (is_struct_type && !is_pointer))
+    fprintf(out, " = {0}");
+  else
+    fprintf(out, " = 0");
+  emit_tok(tok); // semicolon
+
+  return tok->next;
+}
+
 static int transpile(char *input_file, char *output_file)
 {
   // Initialize preprocessor
@@ -559,6 +726,10 @@ static int transpile(char *input_file, char *output_file)
 
   // Add prism-specific predefined macro
   pp_define_macro("__PRISM__", "1");
+  if (feature_defer)
+    pp_define_macro("__PRISM_DEFER__", "1");
+  if (feature_zeroinit)
+    pp_define_macro("__PRISM_ZEROINIT__", "1");
 
   // Tokenize and preprocess
   Token *tok = tokenize_file(input_file);
@@ -577,17 +748,32 @@ static int transpile(char *input_file, char *output_file)
 
   // Reset state
   defer_depth = 0;
+  struct_depth = 0;
   last_emitted = NULL;
   next_scope_is_loop = false;
   next_scope_is_switch = false;
   pending_control_flow = false;
   control_paren_depth = 0;
+  bool at_stmt_start = false; // Track if we're at start of a statement
 
   // Walk tokens and emit
   while (tok->kind != TK_EOF)
   {
+    // Try zero-init for declarations at statement start
+    if (at_stmt_start && !pending_control_flow)
+    {
+      Token *next = try_zero_init_decl(tok);
+      if (next)
+      {
+        tok = next;
+        at_stmt_start = true; // Still at statement start after decl
+        continue;
+      }
+    }
+    at_stmt_start = false;
+
     // Handle 'defer' keyword
-    if (tok->kind == TK_KEYWORD && equal(tok, "defer"))
+    if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "defer"))
     {
       // Check for defer inside for/while/switch/if parentheses - this is invalid
       if (pending_control_flow && control_paren_depth > 0)
@@ -616,7 +802,7 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Handle 'return' - evaluate expr, run defers, then return
-    if (tok->kind == TK_KEYWORD && equal(tok, "return"))
+    if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "return"))
     {
       if (has_active_defers())
       {
@@ -661,7 +847,7 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Handle 'break' - emit defers up through loop/switch
-    if (tok->kind == TK_KEYWORD && equal(tok, "break"))
+    if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "break"))
     {
       if (break_has_defers())
       {
@@ -678,7 +864,7 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Handle 'continue' - emit defers up to (not including) loop
-    if (tok->kind == TK_KEYWORD && equal(tok, "continue"))
+    if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "continue"))
     {
       if (continue_has_defers())
       {
@@ -695,7 +881,7 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Handle 'goto' - emit defers for scopes being exited
-    if (tok->kind == TK_KEYWORD && equal(tok, "goto"))
+    if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "goto"))
     {
       Token *goto_tok = tok;
       tok = tok->next; // skip 'goto'
@@ -736,7 +922,7 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Mark loop keywords so next '{' knows it's a loop scope
-    if (tok->kind == TK_KEYWORD &&
+    if (feature_defer && tok->kind == TK_KEYWORD &&
         (equal(tok, "for") || equal(tok, "while") || equal(tok, "do")))
     {
       next_scope_is_loop = true;
@@ -744,7 +930,7 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Mark switch keyword
-    if (tok->kind == TK_KEYWORD && equal(tok, "switch"))
+    if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "switch"))
     {
       next_scope_is_switch = true;
       pending_control_flow = true;
@@ -758,7 +944,7 @@ static int transpile(char *input_file, char *output_file)
 
     // Handle case/default labels - clear defers from switch scope
     // This prevents defers registered in one case from leaking to other cases
-    if (tok->kind == TK_KEYWORD && (equal(tok, "case") || equal(tok, "default")))
+    if (feature_defer && tok->kind == TK_KEYWORD && (equal(tok, "case") || equal(tok, "default")))
     {
       clear_switch_scope_defers();
     }
@@ -766,10 +952,35 @@ static int transpile(char *input_file, char *output_file)
     // Detect function definition and scan for labels
     // Pattern: identifier '(' ... ')' '{'
     // We detect this when we see '{' after ')' at depth 0
-    if (equal(tok, "{") && defer_depth == 0)
+    if (feature_defer && equal(tok, "{") && defer_depth == 0)
     {
       // At top level, this is likely a function body - scan for labels
       scan_labels_in_function(tok);
+    }
+
+    // Track struct/union/enum to avoid zero-init inside them
+    if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum"))
+    {
+      // Look ahead to see if this has a body
+      Token *t = tok->next;
+      if (t && t->kind == TK_IDENT)
+        t = t->next;
+      if (t && equal(t, "{"))
+      {
+        // Emit tokens up to and including the {
+        while (tok != t)
+        {
+          emit_tok(tok);
+          tok = tok->next;
+        }
+        emit_tok(tok); // emit the {
+        tok = tok->next;
+        struct_depth++;
+        if (feature_defer)
+          defer_push_scope();
+        at_stmt_start = true;
+        continue;
+      }
     }
 
     // Handle '{' - push scope
@@ -778,15 +989,22 @@ static int transpile(char *input_file, char *output_file)
       pending_control_flow = false; // Proper braces found
       emit_tok(tok);
       tok = tok->next;
-      defer_push_scope();
+      if (feature_defer)
+        defer_push_scope();
+      at_stmt_start = true;
       continue;
     }
 
     // Handle '}' - emit scope defers, then pop
     if (equal(tok, "}"))
     {
-      emit_scope_defers();
-      defer_pop_scope();
+      if (struct_depth > 0)
+        struct_depth--;
+      if (feature_defer)
+      {
+        emit_scope_defers();
+        defer_pop_scope();
+      }
       emit_tok(tok);
       tok = tok->next;
       continue;
@@ -807,6 +1025,10 @@ static int transpile(char *input_file, char *output_file)
         next_scope_is_switch = false;
       }
     }
+
+    // Track statement boundaries for zero-init
+    if (equal(tok, ";") && !pending_control_flow)
+      at_stmt_start = true;
 
     // Default: emit token as-is
     emit_tok(tok);
@@ -953,16 +1175,20 @@ int main(int argc, char **argv)
            "  debug/release/small  Optimization mode\n"
            "  arm/x86        Architecture (default: native)\n"
            "  32/64          Word size (default: 64)\n"
-           "  linux/windows/macos  Platform (default: native)\n\n"
+           "  linux/windows/macos  Platform (default: native)\n"
+           "  no-defer       Disable defer feature\n"
+           "  no-zeroinit    Disable zero-initialization\n\n"
            "Examples:\n"
            "  prism src.c              Run src.c\n"
            "  prism build src.c        Build src\n"
            "  prism build src.c out    Build to 'out'\n"
            "  prism build arm src.c    Build for arm64 linux\n"
            "  prism transpile src.c    Transpile to stdout\n"
-           "  prism transpile src.c out.c  Transpile to out.c\n\n"
+           "  prism transpile src.c out.c  Transpile to out.c\n"
+           "  prism no-defer src.c     Run without defer\n\n"
            "Prism extensions:\n"
-           "  defer stmt;    Execute stmt when scope exits\n\n"
+           "  defer stmt;    Execute stmt when scope exits\n"
+           "  Zero-init      Local vars auto-initialized to 0\n\n"
            "install\n",
            VERSION);
     return 0;
@@ -1011,6 +1237,10 @@ int main(int argc, char **argv)
       platform = "windows";
     else if (!strcmp(arg, "macos"))
       platform = "macos";
+    else if (!strcmp(arg, "no-defer"))
+      feature_defer = false;
+    else if (!strcmp(arg, "no-zeroinit"))
+      feature_zeroinit = false;
     else
       break;
     arg_idx++;
