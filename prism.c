@@ -3,7 +3,7 @@
 // 2: prism prism.c install
 
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.10.0"
+#define VERSION "0.11.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -61,6 +61,7 @@ typedef enum
 
 #define MAX_DEFER_DEPTH 64
 #define MAX_DEFERS_PER_SCOPE 32
+#define MAX_LABELS 256
 
 typedef struct
 {
@@ -71,6 +72,20 @@ typedef struct
   bool is_switch; // true if this scope is a switch statement
 } DeferScope;
 
+// Label tracking for goto handling
+typedef struct
+{
+  char *name;
+  int name_len;
+  int scope_depth; // Defer scope depth where label resides
+} LabelInfo;
+
+typedef struct
+{
+  LabelInfo labels[MAX_LABELS];
+  int count;
+} LabelTable;
+
 static DeferScope defer_stack[MAX_DEFER_DEPTH];
 static int defer_depth = 0;
 
@@ -78,6 +93,10 @@ static int defer_depth = 0;
 static bool next_scope_is_loop = false;
 static bool next_scope_is_switch = false;
 static bool pending_control_flow = false; // True after if/else/for/while/do/switch until we see { or ;
+
+// Label table for current function (for goto handling)
+static LabelTable label_table;
+static int label_scan_depth = 0; // Used during label scanning
 
 static void defer_push_scope(void)
 {
@@ -279,6 +298,122 @@ static bool continue_has_defers(void)
 }
 
 // =============================================================================
+// Label tracking for goto
+// =============================================================================
+
+static void label_table_reset(void)
+{
+  label_table.count = 0;
+}
+
+static void label_table_add(char *name, int name_len, int scope_depth)
+{
+  if (label_table.count >= MAX_LABELS)
+    return; // Silently ignore overflow
+  LabelInfo *info = &label_table.labels[label_table.count++];
+  info->name = name;
+  info->name_len = name_len;
+  info->scope_depth = scope_depth;
+}
+
+static int label_table_lookup(char *name, int name_len)
+{
+  for (int i = 0; i < label_table.count; i++)
+  {
+    LabelInfo *info = &label_table.labels[i];
+    if (info->name_len == name_len && !memcmp(info->name, name, name_len))
+      return info->scope_depth;
+  }
+  return -1; // Not found
+}
+
+// Check if token is a label (identifier followed by ':')
+static bool is_label(Token *tok)
+{
+  if (tok->kind != TK_IDENT)
+    return false;
+  Token *next = tok->next;
+  if (!next || !equal(next, ":"))
+    return false;
+  // Make sure it's not part of ?: operator (check previous context)
+  // Labels appear at statement level, so this should be sufficient
+  return true;
+}
+
+// Scan a function body for labels and record their scope depths
+// tok should point to the opening '{' of the function body
+static void scan_labels_in_function(Token *tok)
+{
+  label_table_reset();
+  if (!tok || !equal(tok, "{"))
+    return;
+
+  int depth = 0;
+  tok = tok->next; // Skip opening brace
+
+  while (tok && tok->kind != TK_EOF)
+  {
+    if (equal(tok, "{"))
+    {
+      depth++;
+      tok = tok->next;
+      continue;
+    }
+    if (equal(tok, "}"))
+    {
+      if (depth == 0)
+        break; // End of function
+      depth--;
+      tok = tok->next;
+      continue;
+    }
+
+    // Check for label: identifier followed by ':' (but not ::)
+    if (is_label(tok))
+    {
+      Token *colon = tok->next;
+      // Make sure it's not :: (C++ scope resolution, though we're C)
+      if (colon->next && !equal(colon->next, ":"))
+      {
+        label_table_add(tok->loc, tok->len, depth);
+      }
+    }
+
+    tok = tok->next;
+  }
+}
+
+// Emit defers for goto - from current scope down to target scope (exclusive)
+// We emit defers for scopes we're EXITING, not the scope we're jumping TO
+static void emit_goto_defers(int target_depth)
+{
+  // Emit defers from current scope down to (but not including) target scope
+  // We only emit for scopes DEEPER than the target (scopes we're leaving)
+  for (int d = defer_depth - 1; d > target_depth; d--)
+  {
+    DeferScope *scope = &defer_stack[d];
+    for (int i = scope->count - 1; i >= 0; i--)
+    {
+      fputc(' ', out);
+      emit_range(scope->stmts[i], scope->ends[i]);
+      fputc(';', out);
+    }
+  }
+}
+
+// Check if goto needs defers (jumping out of scopes with defers)
+static bool goto_has_defers(int target_depth)
+{
+  // Check if any scope we're EXITING has defers
+  for (int d = defer_depth - 1; d > target_depth; d--)
+  {
+    if (defer_stack[d].count > 0)
+      return true;
+  }
+  return false;
+}
+
+// =============================================================================
 // Transpiler
 // =============================================================================
 
@@ -450,6 +585,41 @@ static int transpile(char *input_file, char *output_file)
       // No defers, emit normally
     }
 
+    // Handle 'goto' - emit defers for scopes being exited
+    if (tok->kind == TK_KEYWORD && equal(tok, "goto"))
+    {
+      Token *goto_tok = tok;
+      tok = tok->next; // skip 'goto'
+
+      // Get the label name
+      if (tok->kind == TK_IDENT)
+      {
+        int target_depth = label_table_lookup(tok->loc, tok->len);
+        // If label not found, assume same depth (forward reference within scope)
+        if (target_depth < 0)
+          target_depth = defer_depth;
+
+        if (goto_has_defers(target_depth))
+        {
+          fprintf(out, " {");
+          emit_goto_defers(target_depth);
+          fprintf(out, " goto");
+          emit_tok(tok); // label name
+          tok = tok->next;
+          if (equal(tok, ";"))
+          {
+            emit_tok(tok);
+            tok = tok->next;
+          }
+          fprintf(out, " }");
+          continue;
+        }
+      }
+      // No defers or couldn't parse, emit normally
+      emit_tok(goto_tok);
+      continue;
+    }
+
     // Mark loop keywords so next '{' knows it's a loop scope
     if (tok->kind == TK_KEYWORD &&
         (equal(tok, "for") || equal(tok, "while") || equal(tok, "do")))
@@ -469,6 +639,15 @@ static int transpile(char *input_file, char *output_file)
     if (tok->kind == TK_KEYWORD && (equal(tok, "if") || equal(tok, "else")))
     {
       pending_control_flow = true;
+    }
+
+    // Detect function definition and scan for labels
+    // Pattern: identifier '(' ... ')' '{'
+    // We detect this when we see '{' after ')' at depth 0
+    if (equal(tok, "{") && defer_depth == 0)
+    {
+      // At top level, this is likely a function body - scan for labels
+      scan_labels_in_function(tok);
     }
 
     // Handle '{' - push scope

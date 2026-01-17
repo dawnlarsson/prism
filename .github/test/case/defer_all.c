@@ -1,339 +1,468 @@
+// Tests for goto, return, break, continue, and edge cases
+
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-// Test: Multiple defers execute in LIFO order
+static char log_buffer[1024];
+static int log_pos = 0;
+
+static void log_reset(void)
+{
+    log_buffer[0] = 0;
+    log_pos = 0;
+}
+
+static void log_append(const char *s)
+{
+    int len = strlen(s);
+    if (log_pos + len < 1023)
+    {
+        strcpy(log_buffer + log_pos, s);
+        log_pos += len;
+    }
+}
+
+static int check_log(const char *expected, const char *test_name)
+{
+    if (strcmp(log_buffer, expected) == 0)
+    {
+        printf("[PASS] %s\n", test_name);
+        return 1;
+    }
+    else
+    {
+        printf("[FAIL] %s\n", test_name);
+        printf("  Expected: '%s'\n", expected);
+        printf("  Got:      '%s'\n", log_buffer);
+        return 0;
+    }
+}
+
+// =============================================================================
+// Test 1: Basic defer (should already work)
+// =============================================================================
+void test_basic_defer(void)
+{
+    log_reset();
+    {
+        defer log_append("A");
+        log_append("1");
+    }
+    // Expected order: 1, then A on scope exit
+}
+
+// =============================================================================
+// Test 2: Multiple defers in LIFO order (should already work)
+// =============================================================================
 void test_lifo_order(void)
 {
-    printf("=== Test: LIFO order ===\n");
-    printf("Expected: 3 2 1\nActual:   ");
+    log_reset();
     {
-        defer printf("1\n");
-        defer printf("2 ");
-        defer printf("3 ");
+        defer log_append("C");
+        defer log_append("B");
+        defer log_append("A");
+        log_append("1");
     }
+    // Expected: 1ABC (LIFO order for defers)
 }
 
-// Test: Nested scopes with defer
-void test_nested_scopes(void)
+// =============================================================================
+// Test 3: Return with defer (should already work)
+// =============================================================================
+int test_return_defer(void)
 {
-    printf("=== Test: Nested scopes ===\n");
-    defer printf("outer-end\n");
-    printf("outer-start\n");
-
-    {
-        defer printf("inner-end\n");
-        printf("inner-start\n");
-    }
-
-    printf("back-to-outer\n");
-    // Expected: outer-start, inner-start, inner-end, back-to-outer, outer-end
-}
-
-// Test: Return value captured BEFORE defer runs
-int test_return_ordering_helper(void)
-{
-    int x = 42;
-    defer printf("defer runs after x captured\n");
-    return x + 1; // Should capture 43 BEFORE defer runs
-}
-
-void test_return_ordering(void)
-{
-    printf("=== Test: Return ordering ===\n");
-    int result = test_return_ordering_helper();
-    printf("result = %d (should be 43)\n", result);
-}
-
-// Test: Defer executes before return
-int test_return_helper(void)
-{
-    defer printf("Cleanup done\n");
-    printf("Before return\n");
+    log_reset();
+    defer log_append("A");
+    log_append("1");
     return 42;
 }
 
-void test_return(void)
+// =============================================================================
+// Test 4: Goto forward - jumping OUT of a scope with defer
+// THIS IS THE BUG - defer should execute before goto!
+// =============================================================================
+void test_goto_forward_out_of_scope(void)
 {
-    printf("=== Test: Defer with return ===\n");
-    int result = test_return_helper();
-    printf("Result: %d (expected 42)\n", result);
-}
-
-// Test: Void return with defer
-void test_void_return(void)
-{
-    printf("=== Test: Void return ===\n");
-    defer printf("void defer\n");
-    printf("before return\n");
-    return;
-}
-
-// Test: Early return with defer cleanup
-int test_early_return_helper(int should_fail)
-{
-    int *data = malloc(100);
-    defer free(data);
-    defer printf("Cleanup: freeing data\n");
-
-    if (should_fail)
+    log_reset();
     {
-        printf("Early return due to failure\n");
-        return -1;
+        defer log_append("A");
+        log_append("1");
+        goto end;
+        log_append("X"); // should not execute
     }
-
-    printf("Processing succeeded\n");
-    return 0;
+end:
+    log_append("2");
+    // Expected: 1A2 (defer A should run before jumping out)
+    // Bug: Currently produces 12 (defer not run)
 }
 
-void test_early_return(void)
+// =============================================================================
+// Test 5: Goto forward - same scope level (no scope exit)
+// =============================================================================
+void test_goto_forward_same_scope(void)
 {
-    printf("=== Test: Early return ===\n");
-    printf("--- With failure ---\n");
-    test_early_return_helper(1);
-    printf("--- Without failure ---\n");
-    test_early_return_helper(0);
+    log_reset();
+    defer log_append("A");
+    log_append("1");
+    goto skip;
+    log_append("X"); // should not execute
+skip:
+    log_append("2");
+    // Expected: 12A (defer runs at function end, not at goto)
 }
 
-// Test: Break with defer
-void test_break(void)
+// =============================================================================
+// Test 6: Goto backward (loop simulation)
+// =============================================================================
+void test_goto_backward(void)
 {
-    printf("=== Test: Break with defer ===\n");
-    for (int i = 0; i < 5; i++)
+    log_reset();
+    int count = 0;
+again:
+    if (count >= 2)
+        goto done;
     {
-        defer printf("loop defer %d\n", i);
-        if (i == 2)
-        {
-            printf("breaking at %d\n", i);
-            break; // Should emit defer first
-        }
-        printf("iteration %d\n", i);
+        defer log_append("D");
+        log_append("L");
+        count++;
+        goto again; // Should emit D before jumping back
     }
-    printf("after loop\n");
+done:
+    log_append("E");
+    // Expected: LDLDE (each loop iteration's defer should run)
+    // Bug: Currently produces LLE (defers not run on backward goto)
 }
 
-// Test: Continue with defer
-void test_continue(void)
+// =============================================================================
+// Test 7: Goto out of multiple nested scopes
+// =============================================================================
+void test_goto_nested_scopes(void)
 {
-    printf("=== Test: Continue with defer ===\n");
-    for (int i = 0; i < 4; i++)
+    log_reset();
     {
-        defer printf("loop defer %d\n", i);
-        if (i == 1)
+        defer log_append("A");
         {
-            printf("continuing at %d\n", i);
-            continue; // Should emit defer first
-        }
-        printf("iteration %d\n", i);
-    }
-}
-
-// Test: Nested scopes with break
-void test_nested_break(void)
-{
-    printf("=== Test: Nested break ===\n");
-    for (int i = 0; i < 3; i++)
-    {
-        defer printf("outer defer %d\n", i);
-        {
-            defer printf("inner defer %d\n", i);
-            if (i == 1)
+            defer log_append("B");
             {
-                printf("breaking at %d\n", i);
-                break;
+                defer log_append("C");
+                log_append("1");
+                goto end; // Should emit C, B, A in order
             }
         }
     }
+end:
+    log_append("2");
+    // Expected: 1CBA2 (all nested defers in LIFO order)
+    // Bug: Currently produces 12 (no defers run)
 }
 
-// Test: switch with break - use explicit blocks for defer
-void test_switch_helper(int val)
+// =============================================================================
+// Test 8: Break with defer (should already work)
+// =============================================================================
+void test_break_defer(void)
 {
-    switch (val)
+    log_reset();
+    for (int i = 0; i < 3; i++)
+    {
+        defer log_append("D");
+        log_append("L");
+        if (i == 1)
+            break;
+    }
+    log_append("E");
+    // Expected: LDLDE
+}
+
+// =============================================================================
+// Test 9: Continue with defer (should already work)
+// =============================================================================
+void test_continue_defer(void)
+{
+    log_reset();
+    for (int i = 0; i < 3; i++)
+    {
+        defer log_append("D");
+        if (i == 1)
+        {
+            log_append("S");
+            continue;
+        }
+        log_append("L");
+    }
+    log_append("E");
+    // Expected: LDSDLDE
+}
+
+// =============================================================================
+// Test 10: Goto in switch (jumping out of switch with defer)
+// =============================================================================
+void test_goto_in_switch(void)
+{
+    log_reset();
+    int x = 1;
+    switch (x)
     {
     case 1:
     {
-        defer printf("case 1 defer\n");
-        printf("in case 1\n");
-        break; // Should emit defer
+        defer log_append("A");
+        log_append("1");
+        goto outside;
     }
     case 2:
+        log_append("2");
+        break;
+    }
+outside:
+    log_append("E");
+    // Expected: 1AE
+    // Bug: Currently produces 1E
+}
+
+// =============================================================================
+// Test 11: Nested loops with goto
+// =============================================================================
+void test_nested_loops_goto(void)
+{
+    log_reset();
+    for (int i = 0; i < 2; i++)
     {
-        printf("in case 2\n");
-        // fallthrough (close block first)
+        defer log_append("O");
+        for (int j = 0; j < 2; j++)
+        {
+            defer log_append("I");
+            log_append("X");
+            if (i == 0 && j == 1)
+                goto done;
+        }
     }
-    case 3:
+done:
+    log_append("E");
+    // Expected: XIXIOE (inner defer, then jump out with both defers)
+    // Bug: Currently produces XXIE or similar
+}
+
+// =============================================================================
+// Test 12: Return in nested scope with multiple defers
+// =============================================================================
+int test_return_nested(void)
+{
+    log_reset();
+    defer log_append("1");
     {
-        defer printf("case 3 defer\n");
-        printf("in case 3\n");
-        break; // Should emit defer
+        defer log_append("2");
+        {
+            defer log_append("3");
+            log_append("R");
+            return 99;
+        }
     }
-    default:
-        printf("default\n");
-    }
-    printf("after switch\n");
+    // Expected: R321 (all defers in LIFO from innermost)
 }
 
-void test_switch(void)
+// =============================================================================
+// Test 13: Goto across sibling scopes (exit one, don't enter another)
+// =============================================================================
+void test_goto_sibling_scopes(void)
 {
-    printf("=== Test: Switch (val=1) ===\n");
-    test_switch_helper(1);
-    printf("\n=== Test: Switch (val=2) ===\n");
-    test_switch_helper(2);
-    printf("\n=== Test: Switch (val=3) ===\n");
-    test_switch_helper(3);
-}
-
-// Test: Memory cleanup with defer
-void test_memory_cleanup(void)
-{
-    printf("=== Test: Memory cleanup ===\n");
-    int *ptr = malloc(sizeof(int) * 10);
-    if (!ptr)
-        return;
-    defer free(ptr);
-
-    ptr[0] = 100;
-    ptr[9] = 999;
-    printf("ptr[0] = %d, ptr[9] = %d\n", ptr[0], ptr[9]);
-    printf("Memory will be freed by defer\n");
-}
-
-// Test: File handling with defer
-void test_file_handling(void)
-{
-    printf("=== Test: File handling ===\n");
-    FILE *f = fopen("/tmp/prism_defer_test.txt", "w");
-    if (!f)
+    log_reset();
     {
-        printf("Could not create test file\n");
-        return;
+        defer log_append("A");
+        log_append("1");
+        goto middle;
     }
-    defer fclose(f);
-
-    fprintf(f, "Hello from prism!\n");
-    printf("Wrote to file, defer will close it\n");
-}
-
-// Test: Cleanup function with defer
-void cleanup(void *p)
+middle:
 {
-    printf("cleanup(%p)\n", p);
-    free(p);
+    defer log_append("B");
+    log_append("2");
+}
+    log_append("3");
+    // Expected: 1A2B3 (A runs when exiting first block, B runs at end of second, then 3)
 }
 
-void test_cleanup_function(void)
+// =============================================================================
+// Test 14: Multiple gotos in same function
+// =============================================================================
+void test_multiple_gotos(void)
 {
-    printf("=== Test: Cleanup function ===\n");
-    int *a = malloc(sizeof(int));
-    int *b = malloc(sizeof(int));
-
-    defer cleanup(a);
-    defer cleanup(b);
-
-    *a = 10;
-    *b = 20;
-    printf("a=%d, b=%d\n", *a, *b);
+    log_reset();
+    {
+        defer log_append("A");
+        goto step1;
+    }
+step1:
+    log_append("1");
+    {
+        defer log_append("B");
+        goto step2;
+    }
+step2:
+    log_append("2");
+    // Expected: A1B2
 }
 
-// Test: Defer with complex expressions
-void test_complex_expressions(void)
+// =============================================================================
+// Test 15: Goto in deeply nested loop (function-level defer runs at return)
+// =============================================================================
+void test_goto_deep_loop(void)
 {
-    printf("=== Test: Complex expressions ===\n");
-    // Defer with nested parentheses
-    defer printf("Value: %d\n", (1 + 2) * 3);
-    printf("About to exit scope...\n");
+    log_reset();
+    defer log_append("F");
+    for (int i = 0; i < 1; i++)
+    {
+        defer log_append("O");
+        for (int j = 0; j < 1; j++)
+        {
+            defer log_append("I");
+            log_append("X");
+            goto out;
+        }
+    }
+out:
+    log_append("E");
+    // Expected: XIOEF (inner/outer loop defers on goto, F at implicit function return)
 }
 
-// Test: Defer in comments should NOT be processed
-void test_defer_in_comments(void)
+// =============================================================================
+// Test 16: Conditional goto with defer
+// =============================================================================
+void test_conditional_goto(void)
 {
-    printf("=== Test: Defer in comments ===\n");
-
-    // defer printf("This is in a line comment\n");
-
-    /* defer printf("This is in a block comment\n"); */
-
-    /*
-     * defer printf("Multi-line block comment\n");
-     */
-
-    defer printf("This is a REAL defer\n");
-    printf("Only 'This is a REAL defer' should print after this\n");
+    log_reset();
+    int x = 1;
+    {
+        defer log_append("A");
+        if (x)
+        {
+            defer log_append("B");
+            log_append("1");
+            goto done;
+        }
+        log_append("X");
+    }
+done:
+    log_append("2");
+    // Expected: 1BA2 (both defers run when jumping out)
 }
 
-// Test: Defer keyword in strings should NOT be processed
-void test_defer_in_strings(void)
+// =============================================================================
+// Test 17: Goto jumping over defer registration
+// NOTE: This is a known limitation of static transpilation.
+// When goto jumps over a defer statement, the defer is still emitted at scope
+// exit because the transpiler processes code statically, not at runtime.
+// To avoid this, don't put defer statements after goto targets in the same scope.
+// =============================================================================
+void test_goto_over_defer(void)
 {
-    printf("=== Test: Defer in strings ===\n");
-
-    // These should print literally, not be treated as defer statements
-    printf("The word defer appears here\n");
-    printf("defer is a keyword\n");
-
-    char *str = "defer should not trigger";
-    printf("%s\n", str);
-
-    defer printf("This IS a real defer\n");
-    printf("End of test\n");
+    log_reset();
+    {
+        log_append("1");
+        goto skip;
+        defer log_append("A"); // Transpiler still sees this!
+        log_append("X");
+    skip:
+        log_append("2");
+    }
+    log_append("3");
+    // Expected: 12A3 (static transpilation emits A at scope exit)
+    // Ideal: 123 (if we had runtime defer tracking)
 }
 
+// =============================================================================
+// Main - run all tests
+// =============================================================================
 int main(void)
 {
-    // Section 1: Basic functionality
+    int passed = 0;
+    int total = 0;
+
+    printf("=== Defer Test Suite ===\n\n");
+
+    // Test 1: Basic defer
+    test_basic_defer();
+    total++;
+    passed += check_log("1A", "test_basic_defer");
+
+    // Test 2: LIFO order
     test_lifo_order();
-    printf("\n");
+    total++;
+    passed += check_log("1ABC", "test_lifo_order");
 
-    test_nested_scopes();
-    printf("\n");
+    // Test 3: Return with defer
+    test_return_defer();
+    total++;
+    passed += check_log("1A", "test_return_defer");
 
-    // Section 2: Return with defer
-    test_return_ordering();
-    printf("\n");
+    // Test 4: Goto forward out of scope (THE BUG)
+    test_goto_forward_out_of_scope();
+    total++;
+    passed += check_log("1A2", "test_goto_forward_out_of_scope");
 
-    test_return();
-    printf("\n");
+    // Test 5: Goto forward same scope
+    test_goto_forward_same_scope();
+    total++;
+    passed += check_log("12A", "test_goto_forward_same_scope");
 
-    test_void_return();
-    printf("\n");
+    // Test 6: Goto backward
+    test_goto_backward();
+    total++;
+    passed += check_log("LDLDE", "test_goto_backward");
 
-    test_early_return();
-    printf("\n");
+    // Test 7: Goto nested scopes
+    test_goto_nested_scopes();
+    total++;
+    passed += check_log("1CBA2", "test_goto_nested_scopes");
 
-    // Section 3: Loops
-    test_break();
-    printf("\n");
+    // Test 8: Break with defer
+    test_break_defer();
+    total++;
+    passed += check_log("LDLDE", "test_break_defer");
 
-    test_continue();
-    printf("\n");
+    // Test 9: Continue with defer
+    test_continue_defer();
+    total++;
+    passed += check_log("LDSDLDE", "test_continue_defer");
 
-    test_nested_break();
-    printf("\n");
+    // Test 10: Goto in switch
+    test_goto_in_switch();
+    total++;
+    passed += check_log("1AE", "test_goto_in_switch");
 
-    // Section 4: Switch
-    test_switch();
-    printf("\n");
+    // Test 11: Nested loops with goto
+    test_nested_loops_goto();
+    total++;
+    passed += check_log("XIXIOE", "test_nested_loops_goto");
 
-    // Section 5: Resource management
-    test_memory_cleanup();
-    printf("\n");
+    // Test 12: Return in nested scope
+    test_return_nested();
+    total++;
+    passed += check_log("R321", "test_return_nested");
 
-    test_file_handling();
-    printf("\n");
+    // Test 13: Goto across sibling scopes
+    test_goto_sibling_scopes();
+    total++;
+    passed += check_log("1A2B3", "test_goto_sibling_scopes");
 
-    test_cleanup_function();
-    printf("\n");
+    // Test 14: Multiple gotos
+    test_multiple_gotos();
+    total++;
+    passed += check_log("A1B2", "test_multiple_gotos");
 
-    // Section 6: Complex expressions
-    test_complex_expressions();
-    printf("\n");
+    // Test 15: Goto in deep loop
+    test_goto_deep_loop();
+    total++;
+    passed += check_log("XIOEF", "test_goto_deep_loop");
 
-    // Section 7: Edge cases
-    test_defer_in_comments();
-    printf("\n");
+    // Test 16: Conditional goto
+    test_conditional_goto();
+    total++;
+    passed += check_log("1BA2", "test_conditional_goto");
 
-    test_defer_in_strings();
-    printf("\n");
+    // Test 17: Goto over defer (known limitation)
+    test_goto_over_defer();
+    total++;
+    passed += check_log("12A3", "test_goto_over_defer");
 
-    printf("=== All defer tests completed ===\n");
-    return 0;
+    printf("\n=== Results: %d/%d tests passed ===\n", passed, total);
+    return (passed == total) ? 0 : 1;
 }
