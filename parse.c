@@ -2312,7 +2312,7 @@ static Token *read_const_expr(Token **rest, Token *tok)
             continue;
         }
 
-        cur = cur->next = tok;
+        cur = cur->next = copy_token(tok);
         tok = tok->next;
     }
 

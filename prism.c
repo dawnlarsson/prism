@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.18.0"
+#define VERSION "0.19.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -117,6 +117,20 @@ static void defer_add(Token *defer_keyword, Token *start, Token *end)
   scope->ends[scope->count] = end;
   scope->count++;
 }
+
+// Clear defers at innermost switch scope when hitting case/default
+// This prevents defers from one case leaking to another case
+static void clear_switch_scope_defers(void)
+{
+  for (int d = defer_depth - 1; d >= 0; d--)
+  {
+    if (defer_stack[d].is_switch)
+    {
+      defer_stack[d].count = 0;
+      return;
+    }
+  }
+}
 // Token emission
 static FILE *out;
 static Token *last_emitted = NULL;
@@ -231,7 +245,8 @@ static void emit_break_defers(void)
   }
 }
 
-// Emit defers for continue - from current scope through innermost loop scope
+// Emit defers for continue - from current scope through innermost loop scope (inclusive)
+// Continue jumps to loop update/condition, so all defers in the loop body must run
 static void emit_continue_defers(void)
 {
   for (int d = defer_depth - 1; d >= 0; d--)
@@ -453,8 +468,8 @@ static Token *goto_skips_defer(Token *goto_tok, char *label_name, int label_len)
     tok = tok->next;
 
   int depth = 0;
-  Token *active_defer = NULL; // Most recently seen defer that's still "in scope"
-  int defer_depth = -1;       // Depth at which active_defer was found
+  Token *active_defer = NULL;  // Most recently seen defer that's still "in scope"
+  int active_defer_depth = -1; // Depth at which active_defer was found
 
   while (tok && tok->kind != TK_EOF)
   {
@@ -468,10 +483,10 @@ static Token *goto_skips_defer(Token *goto_tok, char *label_name, int label_len)
     {
       // Exiting a scope - if we exit past where we found the defer, clear it
       // (means the goto is skipping the entire block, which is fine)
-      if (active_defer && depth <= defer_depth)
+      if (active_defer && depth <= active_defer_depth)
       {
         active_defer = NULL;
-        defer_depth = -1;
+        active_defer_depth = -1;
       }
       if (depth == 0)
         break; // End of containing scope, label not found here
@@ -484,10 +499,10 @@ static Token *goto_skips_defer(Token *goto_tok, char *label_name, int label_len)
     if (tok->kind == TK_KEYWORD && equal(tok, "defer"))
     {
       // Remember this defer (prefer shallowest depth if multiple)
-      if (!active_defer || depth <= defer_depth)
+      if (!active_defer || depth <= active_defer_depth)
       {
         active_defer = tok;
-        defer_depth = depth;
+        active_defer_depth = depth;
       }
     }
 
@@ -735,6 +750,13 @@ static int transpile(char *input_file, char *output_file)
     if (tok->kind == TK_KEYWORD && (equal(tok, "if") || equal(tok, "else")))
     {
       pending_control_flow = true;
+    }
+
+    // Handle case/default labels - clear defers from switch scope
+    // This prevents defers registered in one case from leaking to other cases
+    if (tok->kind == TK_KEYWORD && (equal(tok, "case") || equal(tok, "default")))
+    {
+      clear_switch_scope_defers();
     }
 
     // Detect function definition and scan for labels
