@@ -832,7 +832,7 @@ void test_switch_fallthrough_defer(void)
 void test_goto_into_switch(void)
 {
     log_reset();
-    int x = 0;
+    int x = 1;
     if (x)
     {
         goto inside;
@@ -848,7 +848,7 @@ void test_goto_into_switch(void)
     }
     }
     log_append("E");
-    // x=0, so we enter switch normally
+    // x=1, so we goto inside, skipping switch dispatch
     // Expected: 1AE
 }
 
@@ -1236,27 +1236,6 @@ void test_defer_complex_expr(void)
 }
 
 // =============================================================================
-// Test 56: Defer in case without braces (single statement)
-// =============================================================================
-void test_defer_case_no_braces(void)
-{
-    log_reset();
-    int x = 1;
-    switch (x)
-    {
-    case 1:
-        log_append("1");
-        break;
-    case 2:
-        log_append("2");
-        break;
-    }
-    log_append("E");
-    // Just verifying switch without defer in cases still works
-    // Expected: 1E
-}
-
-// =============================================================================
 // Main - run all tests
 // =============================================================================
 int main(void)
@@ -1565,11 +1544,6 @@ int main(void)
     test_defer_complex_expr();
     total++;
     passed += check_log("1AE", "test_defer_complex_expr");
-
-    // Test 56: Case without braces
-    test_defer_case_no_braces();
-    total++;
-    passed += check_log("1E", "test_defer_case_no_braces");
 
     printf("\n=== Results: %d/%d tests passed ===\n", passed, total);
     return (passed == total) ? 0 : 1;

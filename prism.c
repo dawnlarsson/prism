@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.15.0"
+#define VERSION "0.16.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -349,7 +349,8 @@ static void scan_labels_in_function(Token *tok)
   if (!tok || !equal(tok, "{"))
     return;
 
-  int depth = 0;
+  // Start at depth 1 to align with defer_depth (which is 1 inside function body)
+  int depth = 1;
   Token *prev = NULL;
   tok = tok->next; // Skip opening brace
 
@@ -364,7 +365,7 @@ static void scan_labels_in_function(Token *tok)
     }
     if (equal(tok, "}"))
     {
-      if (depth == 0)
+      if (depth == 1)
         break; // End of function
       depth--;
       prev = tok;
@@ -391,11 +392,11 @@ static void scan_labels_in_function(Token *tok)
   }
 }
 
-// Emit defers for goto - from current scope down to target scope (exclusive)
+// Emit defers for goto - from current scope down to target scope (inclusive)
 // We emit defers for scopes we're EXITING, not the scope we're jumping TO
 static void emit_goto_defers(int target_depth)
 {
-  for (int d = defer_depth - 1; d > target_depth; d--)
+  for (int d = defer_depth - 1; d >= target_depth; d--)
   {
     DeferScope *scope = &defer_stack[d];
     for (int i = scope->count - 1; i >= 0; i--)
@@ -410,7 +411,7 @@ static void emit_goto_defers(int target_depth)
 // Check if goto needs defers (jumping out of scopes with defers)
 static bool goto_has_defers(int target_depth)
 {
-  for (int d = defer_depth - 1; d > target_depth; d--)
+  for (int d = defer_depth - 1; d >= target_depth; d--)
   {
     if (defer_stack[d].count > 0)
       return true;
