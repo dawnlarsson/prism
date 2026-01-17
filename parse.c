@@ -2096,9 +2096,17 @@ static int64_t eval_ternary(Token **rest, Token *tok)
         *rest = tok;
         return cond;
     }
-    int64_t then = eval_ternary(&tok, tok->next);
+    tok = tok->next;
+    bool was_skip = pp_eval_skip;
+    if (!cond)
+        pp_eval_skip = true; // Skip 'then' branch
+    int64_t then = eval_ternary(&tok, tok);
+    pp_eval_skip = was_skip;
     tok = skip(tok, ":");
+    if (cond)
+        pp_eval_skip = true; // Skip 'else' branch
     int64_t els = eval_ternary(&tok, tok);
+    pp_eval_skip = was_skip;
     *rest = tok;
     return cond ? then : els;
 }
