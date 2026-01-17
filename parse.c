@@ -959,17 +959,38 @@ static Token *read_char_literal(char *start, char *quote, Type *ty)
     char *p = quote + 1;
     if (*p == '\0')
         error_at(start, "unclosed char literal");
-    int c;
-    if (*p == '\\')
-        c = read_escaped_char(&p, p + 1);
-    else
-        c = decode_utf8(&p, p);
-    char *end = p;
-    for (; *end != '\''; end++)
-        if (*end == '\n' || *end == '\0')
+
+    uint64_t val = 0;
+    int count = 0;
+    int first_c = 0;
+
+    for (;;)
+    {
+        if (*p == '\n' || *p == '\0')
             error_at(p, "unclosed char literal");
-    Token *tok = new_token(TK_NUM, start, end + 1);
-    tok->val = c;
+        if (*p == '\'')
+            break;
+
+        int c;
+        if (*p == '\\')
+            c = read_escaped_char(&p, p + 1);
+        else
+            c = decode_utf8(&p, p);
+
+        if (count == 0)
+            first_c = c;
+        if (count < ty->size)
+            val = (val << 8) | (c & 0xFF);
+        count++;
+        if (count > ty->size)
+            error_at(p, "character constant too long");
+    }
+
+    if (count == 0)
+        error_at(start, "empty char literal");
+
+    Token *tok = new_token(TK_NUM, start, p + 1);
+    tok->val = (count == 1) ? first_c : (int32_t)val;
     tok->ty = ty;
     return tok;
 }
@@ -992,48 +1013,111 @@ static int64_t read_int(char **p, int base)
 
 static void convert_pp_number(Token *tok)
 {
-    char *p = tok->loc;
+    char *start = tok->loc;
+    char *end = tok->loc + tok->len;
 
-    // Try integer
+    bool is_hex = (end - start >= 2 && start[0] == '0' &&
+                   (start[1] == 'x' || start[1] == 'X'));
+    bool is_bin = (end - start >= 2 && start[0] == '0' &&
+                   (start[1] == 'b' || start[1] == 'B'));
+    bool is_float = false;
+
+    if (is_hex)
+    {
+        for (char *q = start + 2; q < end; q++)
+        {
+            if (*q == '.' || *q == 'p' || *q == 'P')
+            {
+                is_float = true;
+                break;
+            }
+        }
+    }
+    else
+    {
+        for (char *q = start; q < end; q++)
+        {
+            if (*q == '.' || *q == 'e' || *q == 'E')
+            {
+                is_float = true;
+                break;
+            }
+        }
+    }
+
+    if (is_bin && is_float)
+        error_tok(tok, "invalid binary constant");
+
+    if (is_float)
+    {
+        char *buf = strndup(start, end - start);
+        char *p = buf;
+        char *endp;
+        tok->fval = strtold(buf, &endp);
+        if (endp == buf)
+            error_tok(tok, "invalid floating constant");
+        if (is_hex && !strpbrk(buf, "pP"))
+            error_tok(tok, "invalid hex floating constant");
+        if (!is_hex && strpbrk(buf, "pP"))
+            error_tok(tok, "invalid floating constant");
+
+        if (*endp && endp[1] == '\0' &&
+            (*endp == 'f' || *endp == 'F' || *endp == 'l' || *endp == 'L'))
+            endp++;
+        if (*endp)
+            error_tok(tok, "invalid floating constant");
+        tok->kind = TK_NUM;
+        free(buf);
+        return;
+    }
+
     int base = 10;
-    if (startswith(p, "0x") || startswith(p, "0X"))
+    char *p = start;
+    if (is_hex)
     {
         base = 16;
         p += 2;
     }
-    else if (startswith(p, "0b") || startswith(p, "0B"))
+    else if (is_bin)
     {
         base = 2;
         p += 2;
     }
     else if (*p == '0')
+    {
         base = 8;
+    }
 
+    char *digits_start = p;
     int64_t val = read_int(&p, base);
+    if (p == digits_start)
+        error_tok(tok, "invalid integer constant");
 
-    // Skip suffixes
-    bool is_unsigned = false;
-    for (;;)
+    bool seen_u = false;
+    int seen_l = 0;
+    while (p < end)
     {
         if (*p == 'u' || *p == 'U')
         {
-            is_unsigned = true;
+            if (seen_u)
+                error_tok(tok, "invalid integer constant");
+            seen_u = true;
             p++;
+            continue;
         }
-        else if (*p == 'l' || *p == 'L')
+        if (*p == 'l' || *p == 'L')
+        {
+            if (seen_l == 2)
+                error_tok(tok, "invalid integer constant");
+            seen_l++;
             p++;
-        else
-            break;
+            continue;
+        }
+        break;
     }
 
-    // Check for float
-    if (*p == '.' || *p == 'e' || *p == 'E' || *p == 'p' || *p == 'P')
-    {
-        char *end;
-        tok->fval = strtold(tok->loc, &end);
-        tok->kind = TK_NUM;
-        return;
-    }
+    if (p != end)
+        error_tok(tok, "invalid integer constant");
 
     tok->kind = TK_NUM;
     tok->val = val;
@@ -1149,7 +1233,6 @@ static Token *tokenize(File *file)
         if (*p == '\'')
         {
             cur = cur->next = read_char_literal(p, p, ty_int);
-            cur->val = (char)cur->val;
             p += cur->len;
             continue;
         }
@@ -1772,22 +1855,39 @@ static char *read_include_filename(Token **rest, Token *tok, bool *is_dquote)
 {
     if (tok->kind == TK_STR)
     {
+        if (tok->len < 2 || tok->loc[0] != '"' || tok->loc[tok->len - 1] != '"')
+            error_tok(tok, "expected a filename");
         *is_dquote = true;
         *rest = tok->next;
-        return strndup(tok->str, tok->ty->array_len - 1);
+        return strndup(tok->loc + 1, tok->len - 2);
     }
 
     if (equal(tok, "<"))
     {
-        Token *start = tok;
-        for (; !equal(tok, ">"); tok = tok->next)
+        Token *start = tok->next;
+        int len = 0;
+        for (tok = tok->next; !equal(tok, ">"); tok = tok->next)
+        {
             if (tok->at_bol || tok->kind == TK_EOF)
                 error_tok(tok, "expected '>'");
+            if (tok->has_space)
+                error_tok(tok, "invalid header name");
+            len += tok->len;
+        }
         *is_dquote = false;
         *rest = tok->next;
 
-        int len = tok->loc - start->next->loc;
-        return strndup(start->next->loc, len);
+        if (len == 0)
+            error_tok(tok, "expected a filename");
+
+        char *buf = calloc(1, len + 1);
+        char *p = buf;
+        for (Token *t = start; !equal(t, ">"); t = t->next)
+        {
+            memcpy(p, t->loc, t->len);
+            p += t->len;
+        }
+        return buf;
     }
 
     error_tok(tok, "expected a filename");
