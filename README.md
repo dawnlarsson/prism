@@ -6,6 +6,23 @@ build & install
 cc prism.c -flto -s -O3 -o /tmp/prism && /tmp/prism install && rm /tmp/prism
 ```
 
+## Defer
+Scope-based resource management. Statements execute in LIFO order upon scope exit, including `return`, `break`, `continue`, and `goto`.
+
+```c
+void example() {
+    FILE *f = fopen("file.txt", "r");
+    defer fclose(f);
+
+    void *mem = malloc(1024);
+    defer free(mem);
+
+    if (!f || !mem) return; // Cleanups run automatically
+}
+```
+
+## CLI
+
 ```sh
 Prism v0.14.0
 Usage: prism [options] src.c [output] [args]
