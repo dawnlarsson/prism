@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.19.0"
+#define VERSION "0.20.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -589,6 +589,10 @@ static int transpile(char *input_file, char *output_file)
     // Handle 'defer' keyword
     if (tok->kind == TK_KEYWORD && equal(tok, "defer"))
     {
+      // Check for defer inside for/while/switch/if parentheses - this is invalid
+      if (pending_control_flow && control_paren_depth > 0)
+        error_tok(tok, "defer cannot appear inside control statement parentheses");
+
       // Check for braceless control flow - defer needs a proper scope
       if (pending_control_flow)
         error_tok(tok, "defer cannot be the body of a braceless control statement - add braces");
