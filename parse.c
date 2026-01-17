@@ -338,6 +338,7 @@ static void hashmap_rehash(HashMap *map)
         if (ent->key && ent->key != TOMBSTONE)
             hashmap_put2(&map2, ent->key, ent->keylen, ent->val);
     }
+    free(map->buckets);
     *map = map2;
 }
 
@@ -1733,6 +1734,7 @@ static char *search_include_paths(char *filename)
         struct stat st;
         if (stat(path, &st) == 0)
             return path;
+        free(path);
     }
     return NULL;
 }
@@ -2271,6 +2273,7 @@ static Token *preprocess2(Token *tok)
                     path = try;
                     break;
                 }
+                free(try);
             }
             if (!path)
                 error_tok(start, "%s: cannot open file", filename);

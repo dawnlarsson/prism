@@ -3,7 +3,7 @@
 // 2: prism prism.c install
 
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.8.0"
+#define VERSION "0.9.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -77,6 +77,7 @@ static int defer_depth = 0;
 // Track pending loop/switch for next scope
 static bool next_scope_is_loop = false;
 static bool next_scope_is_switch = false;
+static bool pending_control_flow = false; // True after if/else/for/while/do/switch until we see { or ;
 
 static void defer_push_scope(void)
 {
@@ -341,6 +342,7 @@ static int transpile(char *input_file, char *output_file)
   last_emitted = NULL;
   next_scope_is_loop = false;
   next_scope_is_switch = false;
+  pending_control_flow = false;
 
   // Walk tokens and emit
   while (tok->kind != TK_EOF)
@@ -348,6 +350,10 @@ static int transpile(char *input_file, char *output_file)
     // Handle 'defer' keyword
     if (tok->kind == TK_KEYWORD && equal(tok, "defer"))
     {
+      // Check for braceless control flow - defer needs a proper scope
+      if (pending_control_flow)
+        error_tok(tok, "defer cannot be the body of a braceless control statement - add braces");
+
       tok = tok->next; // skip 'defer'
 
       // Find the statement (up to semicolon)
@@ -385,7 +391,9 @@ static int transpile(char *input_file, char *output_file)
         else
         {
           // return with expression: { __auto_type _ret = (expr); defers; return _ret; }
-          fprintf(out, " { __auto_type _prism_ret = (");
+          static int ret_counter = 0;
+          int my_ret = ret_counter++;
+          fprintf(out, " { __auto_type _prism_ret_%d = (", my_ret);
 
           // Emit expression until semicolon
           while (tok->kind != TK_EOF && !equal(tok, ";"))
@@ -396,7 +404,7 @@ static int transpile(char *input_file, char *output_file)
 
           fprintf(out, ");");
           emit_all_defers();
-          fprintf(out, " return _prism_ret;");
+          fprintf(out, " return _prism_ret_%d;", my_ret);
 
           if (equal(tok, ";"))
             tok = tok->next;
@@ -447,17 +455,26 @@ static int transpile(char *input_file, char *output_file)
         (equal(tok, "for") || equal(tok, "while") || equal(tok, "do")))
     {
       next_scope_is_loop = true;
+      pending_control_flow = true;
     }
 
     // Mark switch keyword
     if (tok->kind == TK_KEYWORD && equal(tok, "switch"))
     {
       next_scope_is_switch = true;
+      pending_control_flow = true;
+    }
+
+    // Mark if/else keywords
+    if (tok->kind == TK_KEYWORD && (equal(tok, "if") || equal(tok, "else")))
+    {
+      pending_control_flow = true;
     }
 
     // Handle '{' - push scope
     if (equal(tok, "{"))
     {
+      pending_control_flow = false; // Proper braces found
       emit_tok(tok);
       tok = tok->next;
       defer_push_scope();
