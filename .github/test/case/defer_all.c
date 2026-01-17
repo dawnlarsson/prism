@@ -347,25 +347,35 @@ done:
 
 // =============================================================================
 // Test 17: Goto jumping over defer registration
-// NOTE: This is a known limitation of static transpilation.
-// When goto jumps over a defer statement, the defer is still emitted at scope
-// exit because the transpiler processes code statically, not at runtime.
-// To avoid this, don't put defer statements after goto targets in the same scope.
+// NOTE: This pattern is now a compile-time error. Goto skipping over a defer
+// is a potential bug (resource leak) and prism rejects it.
 // =============================================================================
-void test_goto_over_defer(void)
+// void test_goto_over_defer(void) - REMOVED (compile error expected)
+
+// =============================================================================
+// Test 18: Multiple defers with only some skippable
+// NOTE: This pattern is now a compile-time error (same reason as test 17)
+// =============================================================================
+// void test_partial_skip(void) - REMOVED (compile error expected)
+
+// =============================================================================
+// Test 17: Goto backward doesn't skip forward defer
+// =============================================================================
+void test_goto_backward_no_skip(void)
 {
     log_reset();
+    int i = 0;
+again:
+    if (i >= 2) goto done;
     {
-        log_append("1");
-        goto skip;
-        defer log_append("A"); // Transpiler still sees this!
-        log_append("X");
-    skip:
-        log_append("2");
+        log_append("L");
+        defer log_append("D");  // Always runs (goto is after, not before)
+        i++;
+        goto again;
     }
-    log_append("3");
-    // Expected: 12A3 (static transpilation emits A at scope exit)
-    // Ideal: 123 (if we had runtime defer tracking)
+done:
+    log_append("E");
+    // Expected: LDLDE (defers always run because goto doesn't skip them)
 }
 
 // =============================================================================
@@ -458,10 +468,13 @@ int main(void)
     total++;
     passed += check_log("1BA2", "test_conditional_goto");
 
-    // Test 17: Goto over defer (known limitation)
-    test_goto_over_defer();
+    // Tests 17-18: Goto skipping over defer is now a compile-time error
+    // (removed - these patterns are rejected by prism)
+
+    // Test 17: Goto backward doesn't skip forward defer
+    test_goto_backward_no_skip();
     total++;
-    passed += check_log("12A3", "test_goto_over_defer");
+    passed += check_log("LDLDE", "test_goto_backward_no_skip");
 
     printf("\n=== Results: %d/%d tests passed ===\n", passed, total);
     return (passed == total) ? 0 : 1;

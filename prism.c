@@ -3,7 +3,7 @@
 // 2: prism prism.c install
 
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.11.0"
+#define VERSION "0.12.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -67,6 +67,7 @@ typedef struct
 {
   Token *stmts[MAX_DEFERS_PER_SCOPE]; // Start token of each deferred statement
   Token *ends[MAX_DEFERS_PER_SCOPE];  // End token (the semicolon)
+  Token *defer_tok[MAX_DEFERS_PER_SCOPE]; // The 'defer' keyword token (for error messages)
   int count;
   bool is_loop;   // true if this scope is a for/while/do loop
   bool is_switch; // true if this scope is a switch statement
@@ -96,7 +97,6 @@ static bool pending_control_flow = false; // True after if/else/for/while/do/swi
 
 // Label table for current function (for goto handling)
 static LabelTable label_table;
-static int label_scan_depth = 0; // Used during label scanning
 
 static void defer_push_scope(void)
 {
@@ -116,13 +116,14 @@ static void defer_pop_scope(void)
     defer_depth--;
 }
 
-static void defer_add(Token *start, Token *end)
+static void defer_add(Token *defer_keyword, Token *start, Token *end)
 {
   if (defer_depth <= 0)
     error_tok(start, "defer outside of any scope");
   DeferScope *scope = &defer_stack[defer_depth - 1];
   if (scope->count >= MAX_DEFERS_PER_SCOPE)
     error_tok(start, "too many defers in scope (max %d)", MAX_DEFERS_PER_SCOPE);
+  scope->defer_tok[scope->count] = defer_keyword;
   scope->stmts[scope->count] = start;
   scope->ends[scope->count] = end;
   scope->count++;
@@ -241,7 +242,7 @@ static void emit_break_defers(void)
       fputc(';', out);
     }
     if (scope->is_loop || scope->is_switch)
-      break; // Stop after the loop/switch scope
+      break;
   }
 }
 
@@ -258,7 +259,7 @@ static void emit_continue_defers(void)
       fputc(';', out);
     }
     if (scope->is_loop)
-      break; // Stop after emitting loop scope's defers
+      break;
   }
 }
 
@@ -387,8 +388,6 @@ static void scan_labels_in_function(Token *tok)
 // We emit defers for scopes we're EXITING, not the scope we're jumping TO
 static void emit_goto_defers(int target_depth)
 {
-  // Emit defers from current scope down to (but not including) target scope
-  // We only emit for scopes DEEPER than the target (scopes we're leaving)
   for (int d = defer_depth - 1; d > target_depth; d--)
   {
     DeferScope *scope = &defer_stack[d];
@@ -404,13 +403,62 @@ static void emit_goto_defers(int target_depth)
 // Check if goto needs defers (jumping out of scopes with defers)
 static bool goto_has_defers(int target_depth)
 {
-  // Check if any scope we're EXITING has defers
   for (int d = defer_depth - 1; d > target_depth; d--)
   {
     if (defer_stack[d].count > 0)
       return true;
   }
   return false;
+}
+
+// Check if a forward goto would skip over any defer statements in the same scope
+// This scans forward from goto_tok to find if any defer exists before the target label
+static Token *goto_skips_defer(Token *goto_tok, char *label_name, int label_len)
+{
+  // Scan forward from goto to find the label
+  Token *tok = goto_tok->next->next; // skip 'goto' and label name
+  if (tok && equal(tok, ";"))
+    tok = tok->next;
+
+  int depth = 0;
+  while (tok && tok->kind != TK_EOF)
+  {
+    if (equal(tok, "{"))
+    {
+      depth++;
+      tok = tok->next;
+      continue;
+    }
+    if (equal(tok, "}"))
+    {
+      if (depth == 0)
+        break; // End of current scope, label not found here
+      depth--;
+      tok = tok->next;
+      continue;
+    }
+
+    // Only check at depth 0 (same scope level)
+    if (depth == 0)
+    {
+      // Found a defer before the label
+      if (tok->kind == TK_KEYWORD && equal(tok, "defer"))
+      {
+        return tok; // Return the defer token for error message
+      }
+
+      // Found the label - no defer was skipped
+      if (is_label(tok) && tok->len == label_len &&
+          !memcmp(tok->loc, label_name, label_len))
+      {
+        return NULL; // Label found, no defer was skipped
+      }
+    }
+
+    tok = tok->next;
+  }
+
+  return NULL; // Label not found in same scope (must be in different scope)
 }
 
 // =============================================================================
@@ -489,6 +537,7 @@ static int transpile(char *input_file, char *output_file)
       if (pending_control_flow)
         error_tok(tok, "defer cannot be the body of a braceless control statement - add braces");
 
+      Token *defer_keyword = tok;
       tok = tok->next; // skip 'defer'
 
       // Find the statement (up to semicolon)
@@ -496,7 +545,7 @@ static int transpile(char *input_file, char *output_file)
       Token *stmt_end = skip_to_semicolon(tok);
 
       // Record the defer
-      defer_add(stmt_start, stmt_end);
+      defer_add(defer_keyword, stmt_start, stmt_end);
 
       // Skip past the semicolon (don't emit the defer yet)
       if (stmt_end->kind != TK_EOF)
@@ -594,6 +643,12 @@ static int transpile(char *input_file, char *output_file)
       // Get the label name
       if (tok->kind == TK_IDENT)
       {
+        // Check if this goto would skip over a defer statement
+        Token *skipped = goto_skips_defer(goto_tok, tok->loc, tok->len);
+        if (skipped)
+          error_tok(skipped, "goto '%.*s' would skip over this defer statement",
+                    tok->len, tok->loc);
+
         int target_depth = label_table_lookup(tok->loc, tok->len);
         // If label not found, assume same depth (forward reference within scope)
         if (target_depth < 0)
