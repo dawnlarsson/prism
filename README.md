@@ -1,6 +1,11 @@
 # Prism
 C transpiled with some sugar
 
+build & install
+```c
+cc prism.c -flto -s -O3 -o /tmp/prism && /tmp/prism install && rm /tmp/prism
+```
+
 ```sh
 Usage: prism [options] src.c [output] [args]
 

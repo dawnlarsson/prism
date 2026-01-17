@@ -230,10 +230,17 @@ static void pp_add_default_include_paths(void)
         for (int j = 0; !found_gcc && gcc_triples[j]; j++)
         {
             char *path = find_gcc_include_path(gcc_base_dirs[i], gcc_triples[j]);
-            if (path && stat(path, &st) == 0)
+            if (path)
             {
-                pp_add_include_path(path);
-                found_gcc = true;
+                if (stat(path, &st) == 0)
+                {
+                    pp_add_include_path(path);
+                    found_gcc = true;
+                }
+                else
+                {
+                    free(path);
+                }
             }
         }
     }

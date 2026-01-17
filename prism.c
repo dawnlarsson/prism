@@ -1,9 +1,5 @@
-// prism.c - C with defer
-// 1: cc -o /tmp/prism prism.c && /tmp/prism install && rm /tmp/prism
-// 2: prism prism.c install
-
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.12.0"
+#define VERSION "0.13.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -65,8 +61,8 @@ typedef enum
 
 typedef struct
 {
-  Token *stmts[MAX_DEFERS_PER_SCOPE]; // Start token of each deferred statement
-  Token *ends[MAX_DEFERS_PER_SCOPE];  // End token (the semicolon)
+  Token *stmts[MAX_DEFERS_PER_SCOPE];     // Start token of each deferred statement
+  Token *ends[MAX_DEFERS_PER_SCOPE];      // End token (the semicolon)
   Token *defer_tok[MAX_DEFERS_PER_SCOPE]; // The 'defer' keyword token (for error messages)
   int count;
   bool is_loop;   // true if this scope is a for/while/do loop
@@ -94,6 +90,7 @@ static int defer_depth = 0;
 static bool next_scope_is_loop = false;
 static bool next_scope_is_switch = false;
 static bool pending_control_flow = false; // True after if/else/for/while/do/switch until we see { or ;
+static int control_paren_depth = 0;       // Track parens to distinguish for(;;) from braceless body
 
 // Label table for current function (for goto handling)
 static LabelTable label_table;
@@ -526,6 +523,7 @@ static int transpile(char *input_file, char *output_file)
   next_scope_is_loop = false;
   next_scope_is_switch = false;
   pending_control_flow = false;
+  control_paren_depth = 0;
 
   // Walk tokens and emit
   while (tok->kind != TK_EOF)
@@ -723,6 +721,22 @@ static int transpile(char *input_file, char *output_file)
       emit_tok(tok);
       tok = tok->next;
       continue;
+    }
+
+    // Track parentheses during pending control flow (for distinguishing for(;;) from body)
+    if (pending_control_flow)
+    {
+      if (equal(tok, "("))
+        control_paren_depth++;
+      else if (equal(tok, ")"))
+        control_paren_depth--;
+      // Semicolon at depth 0 ends a braceless statement body
+      else if (equal(tok, ";") && control_paren_depth == 0)
+      {
+        pending_control_flow = false;
+        next_scope_is_loop = false;
+        next_scope_is_switch = false;
+      }
     }
 
     // Default: emit token as-is

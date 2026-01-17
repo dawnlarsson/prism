@@ -366,10 +366,11 @@ void test_goto_backward_no_skip(void)
     log_reset();
     int i = 0;
 again:
-    if (i >= 2) goto done;
+    if (i >= 2)
+        goto done;
     {
         log_append("L");
-        defer log_append("D");  // Always runs (goto is after, not before)
+        defer log_append("D"); // Always runs (goto is after, not before)
         i++;
         goto again;
     }
