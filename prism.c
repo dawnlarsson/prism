@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.14.0"
+#define VERSION "0.15.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -307,7 +307,10 @@ static void label_table_reset(void)
 static void label_table_add(char *name, int name_len, int scope_depth)
 {
   if (label_table.count >= MAX_LABELS)
-    return; // Silently ignore overflow
+  {
+    fprintf(stderr, "warning: too many labels in function (max %d), goto/defer tracking may be inaccurate\n", MAX_LABELS);
+    return;
+  }
   LabelInfo *info = &label_table.labels[label_table.count++];
   info->name = name;
   info->name_len = name_len;
@@ -325,7 +328,9 @@ static int label_table_lookup(char *name, int name_len)
   return -1; // Not found
 }
 
-// Check if token is a label (identifier followed by ':')
+// Check if token could be a label (identifier followed by ':')
+// Note: This can have false positives from ternary operator
+// The caller should filter using context (prev token shouldn't be '?')
 static bool is_label(Token *tok)
 {
   if (tok->kind != TK_IDENT)
@@ -333,8 +338,6 @@ static bool is_label(Token *tok)
   Token *next = tok->next;
   if (!next || !equal(next, ":"))
     return false;
-  // Make sure it's not part of ?: operator (check previous context)
-  // Labels appear at statement level, so this should be sufficient
   return true;
 }
 
@@ -347,6 +350,7 @@ static void scan_labels_in_function(Token *tok)
     return;
 
   int depth = 0;
+  Token *prev = NULL;
   tok = tok->next; // Skip opening brace
 
   while (tok && tok->kind != TK_EOF)
@@ -354,6 +358,7 @@ static void scan_labels_in_function(Token *tok)
     if (equal(tok, "{"))
     {
       depth++;
+      prev = tok;
       tok = tok->next;
       continue;
     }
@@ -362,21 +367,26 @@ static void scan_labels_in_function(Token *tok)
       if (depth == 0)
         break; // End of function
       depth--;
+      prev = tok;
       tok = tok->next;
       continue;
     }
 
     // Check for label: identifier followed by ':' (but not ::)
+    // Also exclude ternary operator: prev token shouldn't be '?'
     if (is_label(tok))
     {
       Token *colon = tok->next;
-      // Make sure it's not :: (C++ scope resolution, though we're C)
-      if (colon->next && !equal(colon->next, ":"))
+      // Make sure it's not :: (C++ scope resolution)
+      // And make sure prev isn't '?' (ternary operator)
+      bool is_ternary = prev && equal(prev, "?");
+      if (colon->next && !equal(colon->next, ":") && !is_ternary)
       {
         label_table_add(tok->loc, tok->len, depth);
       }
     }
 
+    prev = tok;
     tok = tok->next;
   }
 }
@@ -408,8 +418,16 @@ static bool goto_has_defers(int target_depth)
   return false;
 }
 
-// Check if a forward goto would skip over any defer statements in the same scope
-// This scans forward from goto_tok to find if any defer exists before the target label
+// Check if a forward goto would skip over any defer statements
+// This scans forward from goto_tok to find if any defer exists before the target label.
+//
+// Key distinction:
+// - INVALID: goto jumps INTO a block, landing AFTER a defer inside that block
+//   Example: goto inner; { defer X; inner: ... } -- X would run but wasn't registered
+// - VALID: goto jumps OVER an entire block containing a defer
+//   Example: goto done; { defer X; ... } done: -- we skip the whole block, defer never registered
+//
+// The rule: if we find the label BEFORE exiting the scope containing a defer, it's invalid.
 static Token *goto_skips_defer(Token *goto_tok, char *label_name, int label_len)
 {
   // Scan forward from goto to find the label
@@ -418,6 +436,9 @@ static Token *goto_skips_defer(Token *goto_tok, char *label_name, int label_len)
     tok = tok->next;
 
   int depth = 0;
+  Token *active_defer = NULL; // Most recently seen defer that's still "in scope"
+  int defer_depth = -1;       // Depth at which active_defer was found
+
   while (tok && tok->kind != TK_EOF)
   {
     if (equal(tok, "{"))
@@ -428,34 +449,43 @@ static Token *goto_skips_defer(Token *goto_tok, char *label_name, int label_len)
     }
     if (equal(tok, "}"))
     {
+      // Exiting a scope - if we exit past where we found the defer, clear it
+      // (means the goto is skipping the entire block, which is fine)
+      if (active_defer && depth <= defer_depth)
+      {
+        active_defer = NULL;
+        defer_depth = -1;
+      }
       if (depth == 0)
-        break; // End of current scope, label not found here
+        break; // End of containing scope, label not found here
       depth--;
       tok = tok->next;
       continue;
     }
 
-    // Only check at depth 0 (same scope level)
-    if (depth == 0)
+    // Track defers we pass over
+    if (tok->kind == TK_KEYWORD && equal(tok, "defer"))
     {
-      // Found a defer before the label
-      if (tok->kind == TK_KEYWORD && equal(tok, "defer"))
+      // Remember this defer (prefer shallowest depth if multiple)
+      if (!active_defer || depth <= defer_depth)
       {
-        return tok; // Return the defer token for error message
+        active_defer = tok;
+        defer_depth = depth;
       }
+    }
 
-      // Found the label - no defer was skipped
-      if (is_label(tok) && tok->len == label_len &&
-          !memcmp(tok->loc, label_name, label_len))
-      {
-        return NULL; // Label found, no defer was skipped
-      }
+    // Found the label?
+    if (is_label(tok) && tok->len == label_len &&
+        !memcmp(tok->loc, label_name, label_len))
+    {
+      // If we have an active defer, we're jumping past it into its scope = error
+      return active_defer;
     }
 
     tok = tok->next;
   }
 
-  return NULL; // Label not found in same scope (must be in different scope)
+  return NULL; // Label not found in forward scan, or all defers were in skipped blocks
 }
 
 // =============================================================================
@@ -912,8 +942,14 @@ int main(int argc, char **argv)
   int bits = NATIVE_BITS;
   char *platform = NATIVE_PLATFORM;
 
+// Helper to check if filename ends with .c
+#define ends_with_c(s) ({                                    \
+  int _len = strlen(s);                                      \
+  _len >= 2 && (s)[_len - 2] == '.' && (s)[_len - 1] == 'c'; \
+})
+
   // Parse options until we hit a .c file
-  while (arg_idx < argc && !strstr(argv[arg_idx], ".c"))
+  while (arg_idx < argc && !ends_with_c(argv[arg_idx]))
   {
     char *arg = argv[arg_idx];
     if (!strcmp(arg, "build"))
