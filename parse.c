@@ -270,6 +270,9 @@ static void strarray_push(StringArray *arr, char *s)
     arr->data[arr->len++] = s;
 }
 
+// Maximum size for format() output to prevent runaway allocations
+#define FORMAT_MAX_SIZE (16 * 1024 * 1024) // 16 MB
+
 __attribute__((format(printf, 1, 2))) static char *format(char *fmt, ...)
 {
     char *buf;
@@ -280,6 +283,11 @@ __attribute__((format(printf, 1, 2))) static char *format(char *fmt, ...)
     vfprintf(fp, fmt, ap);
     va_end(ap);
     fclose(fp);
+    if (buflen > FORMAT_MAX_SIZE)
+    {
+        fprintf(stderr, "formatted string too large (%zu bytes, max %d)\n", buflen, FORMAT_MAX_SIZE);
+        exit(1);
+    }
     return buf;
 }
 // Hashmap
@@ -417,6 +425,17 @@ static void hashmap_delete2(HashMap *map, char *key, int keylen)
 static void hashmap_delete(HashMap *map, char *key)
 {
     hashmap_delete2(map, key, strlen(key));
+}
+
+static void hashmap_clear(HashMap *map)
+{
+    if (map->buckets)
+    {
+        free(map->buckets);
+        map->buckets = NULL;
+    }
+    map->capacity = 0;
+    map->used = 0;
 }
 // Unicode
 static int encode_utf8(char *buf, uint32_t c)
@@ -980,9 +999,12 @@ static Token *read_char_literal(char *start, char *quote, Type *ty)
     return tok;
 }
 
-static int64_t read_int(char **p, int base)
+static int64_t read_int(char **p, int base, bool *overflow)
 {
-    int64_t val = 0;
+    uint64_t val = 0;
+    uint64_t max_before_mul = UINT64_MAX / base;
+    *overflow = false;
+
     while (isxdigit(**p))
     {
         int d = from_hex(**p);
@@ -990,10 +1012,23 @@ static int64_t read_int(char **p, int base)
             break;
         if (d >= base)
             break;
-        val = val * base + d;
+
+        // Check for overflow before multiplication
+        if (val > max_before_mul)
+        {
+            *overflow = true;
+        }
+        val *= base;
+
+        // Check for overflow before addition
+        if (val > UINT64_MAX - d)
+        {
+            *overflow = true;
+        }
+        val += d;
         (*p)++;
     }
-    return val;
+    return (int64_t)val;
 }
 
 static void convert_pp_number(Token *tok)
@@ -1074,9 +1109,12 @@ static void convert_pp_number(Token *tok)
     }
 
     char *digits_start = p;
-    int64_t val = read_int(&p, base);
+    bool overflow = false;
+    int64_t val = read_int(&p, base, &overflow);
     if (p == digits_start)
         error_tok(tok, "invalid integer constant");
+    if (overflow)
+        warn_tok(tok, "integer constant overflow");
 
     bool seen_u = false;
     int seen_l = 0;
@@ -1991,17 +2029,29 @@ static int64_t eval_primary(Token **rest, Token *tok)
     return 0;
 }
 
+// Maximum recursion depth for preprocessor expression evaluation
+#define PP_MAX_EVAL_DEPTH 1000
+static int pp_eval_depth = 0;
+
 static int64_t eval_unary(Token **rest, Token *tok)
 {
+    if (++pp_eval_depth > PP_MAX_EVAL_DEPTH)
+        error_tok(tok, "preprocessor expression too deeply nested (max %d)", PP_MAX_EVAL_DEPTH);
+
+    int64_t result;
     if (equal(tok, "+"))
-        return eval_unary(rest, tok->next);
-    if (equal(tok, "-"))
-        return -eval_unary(rest, tok->next);
-    if (equal(tok, "!"))
-        return !eval_unary(rest, tok->next);
-    if (equal(tok, "~"))
-        return ~eval_unary(rest, tok->next);
-    return eval_primary(rest, tok);
+        result = eval_unary(rest, tok->next);
+    else if (equal(tok, "-"))
+        result = -eval_unary(rest, tok->next);
+    else if (equal(tok, "!"))
+        result = !eval_unary(rest, tok->next);
+    else if (equal(tok, "~"))
+        result = ~eval_unary(rest, tok->next);
+    else
+        result = eval_primary(rest, tok);
+
+    pp_eval_depth--;
+    return result;
 }
 
 static int64_t eval_mul(Token **rest, Token *tok)
@@ -2072,12 +2122,26 @@ static int64_t eval_shift(Token **rest, Token *tok)
     {
         if (equal(tok, "<<"))
         {
-            val <<= eval_add(&tok, tok->next);
+            Token *op = tok;
+            int64_t rhs = eval_add(&tok, tok->next);
+            if (!pp_eval_skip)
+            {
+                if (rhs < 0 || rhs >= 64)
+                    error_tok(op, "shift amount %ld is out of range (0-63)", rhs);
+                val <<= rhs;
+            }
             continue;
         }
         if (equal(tok, ">>"))
         {
-            val >>= eval_add(&tok, tok->next);
+            Token *op = tok;
+            int64_t rhs = eval_add(&tok, tok->next);
+            if (!pp_eval_skip)
+            {
+                if (rhs < 0 || rhs >= 64)
+                    error_tok(op, "shift amount %ld is out of range (0-63)", rhs);
+                val >>= rhs;
+            }
             continue;
         }
         *rest = tok;
@@ -2540,8 +2604,20 @@ void pp_define_macro(char *name, char *val)
     add_macro(name, true, tok);
 }
 
+// Reset preprocessor state - call before processing a new file to avoid state leakage
+void pp_reset(void)
+{
+    hashmap_clear(&macros);
+    hashmap_clear(&included_files);
+    cond_incl = NULL;
+    pp_eval_skip = false;
+}
+
 void pp_init(void)
 {
+    // Reset any existing state first
+    pp_reset();
+
     add_builtin("__FILE__", file_macro);
     add_builtin("__LINE__", line_macro);
 
