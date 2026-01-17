@@ -51,6 +51,114 @@
 static char **pp_include_paths = NULL;
 static int pp_include_paths_count = 0;
 
+typedef struct Type Type;
+typedef struct Token Token;
+typedef struct Hideset Hideset;
+
+// String array utility
+typedef struct
+{
+    char **data;
+    int capacity;
+    int len;
+} StringArray;
+
+// File info
+typedef struct
+{
+    char *name;
+    int file_no;
+    char *contents;
+    char *display_name;
+    int line_delta;
+} File;
+
+// Token kinds
+typedef enum
+{
+    TK_IDENT,   // Identifiers
+    TK_PUNCT,   // Punctuators
+    TK_KEYWORD, // Keywords
+    TK_STR,     // String literals
+    TK_NUM,     // Numeric literals
+    TK_PP_NUM,  // Preprocessing numbers
+    TK_EOF,     // End-of-file markers
+} TokenKind;
+
+// Token
+struct Token
+{
+    TokenKind kind;
+    Token *next;
+    int64_t val;
+    long double fval;
+    char *loc;
+    int len;
+    Type *ty;
+    char *str;
+    File *file;
+    char *filename;
+    int line_no;
+    int line_delta;
+    bool at_bol;
+    bool has_space;
+    Hideset *hideset;
+    Token *origin;
+};
+
+// Minimal type info (only for string literals)
+typedef enum
+{
+    TY_VOID,
+    TY_BOOL,
+    TY_CHAR,
+    TY_SHORT,
+    TY_INT,
+    TY_LONG,
+    TY_FLOAT,
+    TY_DOUBLE,
+    TY_LDOUBLE,
+    TY_PTR,
+    TY_ARRAY,
+} TypeKind;
+
+struct Type
+{
+    TypeKind kind;
+    int size;
+    int align;
+    bool is_unsigned;
+    Type *base;
+    int array_len;
+};
+
+static Type ty_char_val = {TY_CHAR, 1, 1, false};
+static Type ty_int_val = {TY_INT, 4, 4, false};
+static Type ty_ushort_val = {TY_SHORT, 2, 2, true};
+static Type ty_uint_val = {TY_INT, 4, 4, true};
+
+static Type *ty_char = &ty_char_val;
+static Type *ty_int = &ty_int_val;
+static Type *ty_ushort = &ty_ushort_val;
+static Type *ty_uint = &ty_uint_val;
+
+static Type *array_of(Type *base, int len)
+{
+    Type *ty = calloc(1, sizeof(Type));
+    ty->kind = TY_ARRAY;
+    ty->base = base;
+    ty->size = base->size * len;
+    ty->array_len = len;
+    return ty;
+}
+
+// Hideset for macro expansion
+struct Hideset
+{
+    Hideset *next;
+    char *name;
+};
+
 static void pp_add_include_path(const char *path)
 {
     pp_include_paths = realloc(pp_include_paths, sizeof(char *) * (pp_include_paths_count + 1));
@@ -139,97 +247,12 @@ static void pp_add_default_include_paths(void)
     pp_add_include_path("/usr/include");
 }
 
-typedef struct Type Type;
-typedef struct Token Token;
-typedef struct Hideset Hideset;
-
-// String array utility
-typedef struct
-{
-    char **data;
-    int capacity;
-    int len;
-} StringArray;
-
-// File info
-typedef struct
-{
-    char *name;
-    int file_no;
-    char *contents;
-    char *display_name;
-    int line_delta;
-} File;
-
-// Token kinds
-typedef enum
-{
-    TK_IDENT,   // Identifiers
-    TK_PUNCT,   // Punctuators
-    TK_KEYWORD, // Keywords
-    TK_STR,     // String literals
-    TK_NUM,     // Numeric literals
-    TK_PP_NUM,  // Preprocessing numbers
-    TK_EOF,     // End-of-file markers
-} TokenKind;
-
-// Token
-struct Token
-{
-    TokenKind kind;
-    Token *next;
-    int64_t val;
-    long double fval;
-    char *loc;
-    int len;
-    Type *ty;
-    char *str;
-    File *file;
-    char *filename;
-    int line_no;
-    int line_delta;
-    bool at_bol;
-    bool has_space;
-    Hideset *hideset;
-    Token *origin;
-};
-
-// Minimal type info (only for string literals)
-typedef enum
-{
-    TY_VOID,
-    TY_BOOL,
-    TY_CHAR,
-    TY_SHORT,
-    TY_INT,
-    TY_LONG,
-    TY_FLOAT,
-    TY_DOUBLE,
-    TY_LDOUBLE,
-    TY_PTR,
-    TY_ARRAY,
-} TypeKind;
-
-struct Type
-{
-    TypeKind kind;
-    int size;
-    int align;
-    bool is_unsigned;
-    Type *base;
-    int array_len;
-};
-
-// Hideset for macro expansion
-struct Hideset
-{
-    Hideset *next;
-    char *name;
-};
-
 // =============================================================================
 // Utility functions
 // =============================================================================
+
+static bool is_hex(Token *tok) { return tok->len >= 3 && !memcmp(tok->loc, "0x", 2); }
+static bool is_bin(Token *tok) { return tok->len >= 3 && !memcmp(tok->loc, "0b", 2); }
 
 static void strarray_push(StringArray *arr, char *s)
 {
@@ -596,30 +619,6 @@ static int display_width(char *p, int len)
 }
 
 // =============================================================================
-// Minimal types for string literals
-// =============================================================================
-
-static Type ty_char_val = {TY_CHAR, 1, 1, false};
-static Type ty_int_val = {TY_INT, 4, 4, false};
-static Type ty_ushort_val = {TY_SHORT, 2, 2, true};
-static Type ty_uint_val = {TY_INT, 4, 4, true};
-
-static Type *ty_char = &ty_char_val;
-static Type *ty_int = &ty_int_val;
-static Type *ty_ushort = &ty_ushort_val;
-static Type *ty_uint = &ty_uint_val;
-
-static Type *array_of(Type *base, int len)
-{
-    Type *ty = calloc(1, sizeof(Type));
-    ty->kind = TY_ARRAY;
-    ty->base = base;
-    ty->size = base->size * len;
-    ty->array_len = len;
-    return ty;
-}
-
-// =============================================================================
 // Error handling
 // =============================================================================
 
@@ -945,16 +944,6 @@ static Token *read_char_literal(char *start, char *quote, Type *ty)
     tok->val = c;
     tok->ty = ty;
     return tok;
-}
-
-static bool is_hex(Token *tok)
-{
-    return tok->len >= 3 && !memcmp(tok->loc, "0x", 2);
-}
-
-static bool is_bin(Token *tok)
-{
-    return tok->len >= 3 && !memcmp(tok->loc, "0b", 2);
 }
 
 static int64_t read_int(char **p, int base)
@@ -1615,6 +1604,8 @@ static Token *subst(Token *tok, MacroArg *args)
         // Handle # (stringification)
         if (equal(tok, "#"))
         {
+            if (tok->next->kind == TK_EOF)
+                error_tok(tok, "'#' cannot appear at end of macro expansion");
             Token *arg = find_arg(args, tok->next);
             if (!arg)
                 error_tok(tok->next, "'#' is not followed by a macro parameter");
@@ -1629,7 +1620,12 @@ static Token *subst(Token *tok, MacroArg *args)
         {
             if (cur == &head)
                 error_tok(tok, "'##' cannot appear at start of macro expansion");
+            Token *hash_tok = tok; // Save for error message
             tok = tok->next;
+
+            // Check for ## at end of macro
+            if (tok->kind == TK_EOF)
+                error_tok(hash_tok, "'##' cannot appear at end of macro expansion");
 
             // Get rhs - either arg tokens or literal token
             Token *rhs = find_arg(args, tok);
@@ -2315,9 +2311,12 @@ static Token *preprocess2(Token *tok)
 
         if (equal(tok, "ifdef"))
         {
-            bool defined = find_macro(tok->next);
+            tok = tok->next;
+            if (tok->kind != TK_IDENT)
+                error_tok(tok, "expected identifier");
+            bool defined = find_macro(tok);
             push_cond_incl(tok, defined);
-            tok = skip_line(tok->next->next);
+            tok = skip_line(tok->next);
             if (!defined)
                 tok = skip_cond_incl(tok);
             continue;
@@ -2325,9 +2324,12 @@ static Token *preprocess2(Token *tok)
 
         if (equal(tok, "ifndef"))
         {
-            bool defined = find_macro(tok->next);
+            tok = tok->next;
+            if (tok->kind != TK_IDENT)
+                error_tok(tok, "expected identifier");
+            bool defined = find_macro(tok);
             push_cond_incl(tok, !defined);
-            tok = skip_line(tok->next->next);
+            tok = skip_line(tok->next);
             if (defined)
                 tok = skip_cond_incl(tok);
             continue;
@@ -2375,9 +2377,7 @@ static Token *preprocess2(Token *tok)
         }
 
         if (equal(tok, "error"))
-        {
             error_tok(tok, "#error");
-        }
 
         if (equal(tok, "pragma"))
         {
@@ -2388,7 +2388,6 @@ static Token *preprocess2(Token *tok)
                 char *key = real ? real : strdup(start->file->name);
                 hashmap_put(&included_files, key, (void *)1);
             }
-            // Silently skip all pragma directives (GCC diagnostic, etc.)
             tok = skip_line_quiet(tok->next);
             continue;
         }

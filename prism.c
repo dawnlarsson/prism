@@ -3,7 +3,7 @@
 // 2: prism prism.c install
 
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.7.0"
+#define VERSION "0.8.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
