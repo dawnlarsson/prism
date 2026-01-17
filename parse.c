@@ -455,7 +455,8 @@ static int encode_utf8(char *buf, uint32_t c)
 
 static uint32_t decode_utf8(char **new_pos, char *p)
 {
-    if ((unsigned char)*p < 128)
+    unsigned char c0 = (unsigned char)*p;
+    if (c0 < 128)
     {
         *new_pos = p + 1;
         return *p;
@@ -463,20 +464,20 @@ static uint32_t decode_utf8(char **new_pos, char *p)
 
     int len;
     uint32_t c;
-    if ((unsigned char)*p >= 0xF0)
+    if (c0 >= 0xF0)
     {
         len = 4;
-        c = *p & 0x7;
+        c = c0 & 0x7;
     }
-    else if ((unsigned char)*p >= 0xE0)
+    else if (c0 >= 0xE0)
     {
         len = 3;
-        c = *p & 0xF;
+        c = c0 & 0xF;
     }
-    else if ((unsigned char)*p >= 0xC0)
+    else if (c0 >= 0xC0)
     {
         len = 2;
-        c = *p & 0x1F;
+        c = c0 & 0x1F;
     }
     else
     {
@@ -485,7 +486,15 @@ static uint32_t decode_utf8(char **new_pos, char *p)
     } // Invalid, skip
 
     for (int i = 1; i < len; i++)
-        c = (c << 6) | (p[i] & 0x3F);
+    {
+        unsigned char ci = (unsigned char)p[i];
+        if (ci == 0 || (ci & 0xC0) != 0x80)
+        {
+            *new_pos = p + 1;
+            return c0;
+        }
+        c = (c << 6) | (ci & 0x3F);
+    }
     *new_pos = p + len;
     return c;
 }
@@ -753,7 +762,9 @@ static int from_hex(char c)
         return c - '0';
     if ('a' <= c && c <= 'f')
         return c - 'a' + 10;
-    return c - 'A' + 10;
+    if ('A' <= c && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
 }
 
 static int read_punct(char *p)
@@ -856,9 +867,17 @@ static int read_escaped_char(char **new_pos, char *p)
         if ('0' <= *p && *p <= '7')
         {
             c = (c << 3) + (*p++ - '0');
+            if (c > 0xFF)
+                error_at(p - 1, "octal escape sequence out of range");
             if ('0' <= *p && *p <= '7')
+            {
                 c = (c << 3) + (*p++ - '0');
+                if (c > 0xFF)
+                    error_at(p - 1, "octal escape sequence out of range");
+            }
         }
+        if (c > 0xFF)
+            error_at(p - 1, "octal escape sequence out of range");
         *new_pos = p;
         return c;
     }
@@ -869,7 +888,14 @@ static int read_escaped_char(char **new_pos, char *p)
             error_at(p, "invalid hex escape");
         int c = 0;
         for (; isxdigit(*p); p++)
-            c = (c << 4) + from_hex(*p);
+        {
+            int d = from_hex(*p);
+            if (d < 0)
+                error_at(p, "invalid hex escape");
+            c = (c << 4) + d;
+            if (c > 0xFF)
+                error_at(p, "hex escape sequence out of range");
+        }
         *new_pos = p;
         return c;
     }
@@ -938,9 +964,10 @@ static Token *read_char_literal(char *start, char *quote, Type *ty)
         c = read_escaped_char(&p, p + 1);
     else
         c = decode_utf8(&p, p);
-    char *end = strchr(p, '\'');
-    if (!end)
-        error_at(p, "unclosed char literal");
+    char *end = p;
+    for (; *end != '\''; end++)
+        if (*end == '\n' || *end == '\0')
+            error_at(p, "unclosed char literal");
     Token *tok = new_token(TK_NUM, start, end + 1);
     tok->val = c;
     tok->ty = ty;
@@ -953,6 +980,8 @@ static int64_t read_int(char **p, int base)
     while (isxdigit(**p))
     {
         int d = from_hex(**p);
+        if (d < 0)
+            break;
         if (d >= base)
             break;
         val = val * base + d;
