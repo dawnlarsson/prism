@@ -38,10 +38,8 @@ static int check_log(const char *expected, const char *test_name)
         return 0;
     }
 }
+// Test 1: Basic defer
 
-// =============================================================================
-// Test 1: Basic defer (should already work)
-// =============================================================================
 void test_basic_defer(void)
 {
     log_reset();
@@ -51,10 +49,8 @@ void test_basic_defer(void)
     }
     // Expected order: 1, then A on scope exit
 }
+// Test 2: Multiple defers in LIFO order
 
-// =============================================================================
-// Test 2: Multiple defers in LIFO order (should already work)
-// =============================================================================
 void test_lifo_order(void)
 {
     log_reset();
@@ -66,10 +62,8 @@ void test_lifo_order(void)
     }
     // Expected: 1ABC (LIFO order for defers)
 }
+// Test 3: Return with defer
 
-// =============================================================================
-// Test 3: Return with defer (should already work)
-// =============================================================================
 int test_return_defer(void)
 {
     log_reset();
@@ -77,11 +71,8 @@ int test_return_defer(void)
     log_append("1");
     return 42;
 }
-
-// =============================================================================
 // Test 4: Goto forward - jumping OUT of a scope with defer
-// THIS IS THE BUG - defer should execute before goto!
-// =============================================================================
+
 void test_goto_forward_out_of_scope(void)
 {
     log_reset();
@@ -94,12 +85,9 @@ void test_goto_forward_out_of_scope(void)
 end:
     log_append("2");
     // Expected: 1A2 (defer A should run before jumping out)
-    // Bug: Currently produces 12 (defer not run)
 }
-
-// =============================================================================
 // Test 5: Goto forward - same scope level (no scope exit)
-// =============================================================================
+
 void test_goto_forward_same_scope(void)
 {
     log_reset();
@@ -111,10 +99,8 @@ skip:
     log_append("2");
     // Expected: 12A (defer runs at function end, not at goto)
 }
-
-// =============================================================================
 // Test 6: Goto backward (loop simulation)
-// =============================================================================
+
 void test_goto_backward(void)
 {
     log_reset();
@@ -131,12 +117,9 @@ again:
 done:
     log_append("E");
     // Expected: LDLDE (each loop iteration's defer should run)
-    // Bug: Currently produces LLE (defers not run on backward goto)
 }
-
-// =============================================================================
 // Test 7: Goto out of multiple nested scopes
-// =============================================================================
+
 void test_goto_nested_scopes(void)
 {
     log_reset();
@@ -154,12 +137,9 @@ void test_goto_nested_scopes(void)
 end:
     log_append("2");
     // Expected: 1CBA2 (all nested defers in LIFO order)
-    // Bug: Currently produces 12 (no defers run)
 }
+// Test 8: Break with defer
 
-// =============================================================================
-// Test 8: Break with defer (should already work)
-// =============================================================================
 void test_break_defer(void)
 {
     log_reset();
@@ -173,10 +153,8 @@ void test_break_defer(void)
     log_append("E");
     // Expected: LDLDE
 }
+// Test 9: Continue with defer
 
-// =============================================================================
-// Test 9: Continue with defer (should already work)
-// =============================================================================
 void test_continue_defer(void)
 {
     log_reset();
@@ -193,10 +171,8 @@ void test_continue_defer(void)
     log_append("E");
     // Expected: LDSDLDE
 }
-
-// =============================================================================
 // Test 10: Goto in switch (jumping out of switch with defer)
-// =============================================================================
+
 void test_goto_in_switch(void)
 {
     log_reset();
@@ -216,12 +192,9 @@ void test_goto_in_switch(void)
 outside:
     log_append("E");
     // Expected: 1AE
-    // Bug: Currently produces 1E
 }
-
-// =============================================================================
 // Test 11: Nested loops with goto
-// =============================================================================
+
 void test_nested_loops_goto(void)
 {
     log_reset();
@@ -239,12 +212,9 @@ void test_nested_loops_goto(void)
 done:
     log_append("E");
     // Expected: XIXIOE (inner defer, then jump out with both defers)
-    // Bug: Currently produces XXIE or similar
 }
-
-// =============================================================================
 // Test 12: Return in nested scope with multiple defers
-// =============================================================================
+
 int test_return_nested(void)
 {
     log_reset();
@@ -259,10 +229,8 @@ int test_return_nested(void)
     }
     // Expected: R321 (all defers in LIFO from innermost)
 }
-
-// =============================================================================
 // Test 13: Goto across sibling scopes (exit one, don't enter another)
-// =============================================================================
+
 void test_goto_sibling_scopes(void)
 {
     log_reset();
@@ -279,10 +247,8 @@ middle:
     log_append("3");
     // Expected: 1A2B3 (A runs when exiting first block, B runs at end of second, then 3)
 }
-
-// =============================================================================
 // Test 14: Multiple gotos in same function
-// =============================================================================
+
 void test_multiple_gotos(void)
 {
     log_reset();
@@ -300,10 +266,8 @@ step2:
     log_append("2");
     // Expected: A1B2
 }
-
-// =============================================================================
 // Test 15: Goto in deeply nested loop (function-level defer runs at return)
-// =============================================================================
+
 void test_goto_deep_loop(void)
 {
     log_reset();
@@ -322,10 +286,8 @@ out:
     log_append("E");
     // Expected: XIOEF (inner/outer loop defers on goto, F at implicit function return)
 }
-
-// =============================================================================
 // Test 16: Conditional goto with defer
-// =============================================================================
+
 void test_conditional_goto(void)
 {
     log_reset();
@@ -344,23 +306,17 @@ done:
     log_append("2");
     // Expected: 1BA2 (both defers run when jumping out)
 }
-
-// =============================================================================
 // Test 17: Goto jumping over defer registration
 // NOTE: This pattern is now a compile-time error. Goto skipping over a defer
 // is a potential bug (resource leak) and prism rejects it.
-// =============================================================================
-// void test_goto_over_defer(void) - REMOVED (compile error expected)
 
-// =============================================================================
+// void test_goto_over_defer(void) - REMOVED (compile error expected)
 // Test 18: Multiple defers with only some skippable
 // NOTE: This pattern is now a compile-time error (same reason as test 17)
-// =============================================================================
-// void test_partial_skip(void) - REMOVED (compile error expected)
 
-// =============================================================================
+// void test_partial_skip(void) - REMOVED (compile error expected)
 // Test 17: Normal while loop with defer
-// =============================================================================
+
 void test_while_loop_defer(void)
 {
     log_reset();
@@ -374,10 +330,8 @@ void test_while_loop_defer(void)
     log_append("E");
     // Expected: LDLDLDE
 }
-
-// =============================================================================
 // Test 18: do-while loop with defer
-// =============================================================================
+
 void test_do_while_defer(void)
 {
     log_reset();
@@ -391,10 +345,8 @@ void test_do_while_defer(void)
     log_append("E");
     // Expected: LDLDLDE
 }
-
-// =============================================================================
 // Test 19: while(1) with break and defer
-// =============================================================================
+
 void test_while_break_defer(void)
 {
     log_reset();
@@ -410,10 +362,8 @@ void test_while_break_defer(void)
     log_append("E");
     // Expected: LDLDE
 }
-
-// =============================================================================
 // Test 20: Nested switch with defer
-// =============================================================================
+
 void test_nested_switch_defer(void)
 {
     log_reset();
@@ -439,10 +389,8 @@ void test_nested_switch_defer(void)
     log_append("E");
     // Expected: 1B2AE
 }
-
-// =============================================================================
 // Test 21: Return inside switch case with defer
-// =============================================================================
+
 int test_return_in_switch(void)
 {
     log_reset();
@@ -464,10 +412,8 @@ int test_return_in_switch(void)
     return 0;
     // Expected: 1AF (defer A then F, return 42)
 }
-
-// =============================================================================
 // Test 22: Break from nested switch inside loop
-// =============================================================================
+
 void test_break_nested_switch_in_loop(void)
 {
     log_reset();
@@ -492,15 +438,13 @@ void test_break_nested_switch_in_loop(void)
         log_append("X");
     }
     log_append("E");
-    // Expected: 0AXLB1XLE (note: B before 1X due to switch break, wait no...)
+    // Expected: 0AXLB1XLE
     // Actually: case 0: log "0", defer A, break switch -> "A", log "X", defer L -> "L"
     //          case 1: log "1", defer B, break switch -> "B", log "X", defer L -> "L"
     // Expected: 0AXL1BXLE
 }
-
-// =============================================================================
 // Test 23: Continue from inside switch inside loop
-// =============================================================================
+
 void test_continue_in_switch_in_loop(void)
 {
     log_reset();
@@ -525,16 +469,14 @@ void test_continue_in_switch_in_loop(void)
     // i=0: D, X, L
     // i=1: 1, S, L (continue skips X)
     // i=2: D, X, L
-    // Expected: DXLSL1DXLE - wait, order is wrong
+    // Expected: DXLSL1DXLE
     // Actually: i=0: "D", "X", defer "L" -> DXL
     //          i=1: "1", defer "S", continue triggers S then L -> 1SL
     //          i=2: "D", "X", defer "L" -> DXL
     // Expected: DXL1SLDXLE
 }
-
-// =============================================================================
 // Test 24: Defer in if without else
-// =============================================================================
+
 void test_defer_in_if_only(void)
 {
     log_reset();
@@ -551,10 +493,8 @@ void test_defer_in_if_only(void)
     log_append("E");
     // Expected: 1I2OE
 }
-
-// =============================================================================
 // Test 25: Defer in else only
-// =============================================================================
+
 void test_defer_in_else_only(void)
 {
     log_reset();
@@ -575,10 +515,8 @@ void test_defer_in_else_only(void)
     log_append("X");
     // Expected: FE2OX
 }
-
-// =============================================================================
 // Test 26: Chained gotos
-// =============================================================================
+
 void test_chained_gotos(void)
 {
     log_reset();
@@ -600,10 +538,8 @@ step3:
     log_append("E");
     // Expected: ABCE
 }
-
-// =============================================================================
 // Test 27: Goto to label immediately after (effectively no-op)
-// =============================================================================
+
 void test_goto_noop(void)
 {
     log_reset();
@@ -617,10 +553,8 @@ void test_goto_noop(void)
     log_append("E");
     // Expected: 12AE (goto doesn't exit scope, defer runs at block end)
 }
-
-// =============================================================================
 // Test 28: Label at very end of function
-// =============================================================================
+
 void test_label_at_end(void)
 {
     log_reset();
@@ -633,10 +567,8 @@ void test_label_at_end(void)
 end:;
     // Expected: 1AF (A runs on goto out, F runs at function end)
 }
-
-// =============================================================================
 // Test 29: Multiple returns with different defer states
-// =============================================================================
+
 int test_multiple_returns(int path)
 {
     log_reset();
@@ -657,10 +589,8 @@ int test_multiple_returns(int path)
     return 3;
     // path=1: 1AF, path=2: 2BF, path=3: 3F
 }
-
-// =============================================================================
 // Test 30: Deeply nested breaks
-// =============================================================================
+
 void test_deeply_nested_break(void)
 {
     log_reset();
@@ -686,10 +616,8 @@ void test_deeply_nested_break(void)
     // X, defer 3, Y, defer 2, Z, defer 1
     // Expected: X3Y2Z1E
 }
-
-// =============================================================================
 // Test 31: Mix of break and continue in same iteration
-// =============================================================================
+
 void test_break_continue_same_loop(void)
 {
     log_reset();
@@ -715,10 +643,8 @@ void test_break_continue_same_loop(void)
     // i=3: B, D (break)
     // Expected: LDCDLDBDE
 }
-
-// =============================================================================
 // Test 32: for(;;) infinite loop with break
-// =============================================================================
+
 void test_for_infinite_break(void)
 {
     log_reset();
@@ -734,10 +660,8 @@ void test_for_infinite_break(void)
     log_append("E");
     // Expected: LDLDE
 }
-
-// =============================================================================
 // Test 33: Defer with compound statement
-// =============================================================================
+
 void test_defer_compound(void)
 {
     log_reset();
@@ -752,10 +676,8 @@ void test_defer_compound(void)
     log_append("E");
     // Expected: 1ABE
 }
-
-// =============================================================================
 // Test 34: Empty scope with defer
-// =============================================================================
+
 void test_empty_scope_defer(void)
 {
     log_reset();
@@ -766,10 +688,8 @@ void test_empty_scope_defer(void)
     log_append("2");
     // Expected: 1A2
 }
-
-// =============================================================================
 // Test 35: Defer with break in nested loops (break inner, stay in outer)
-// =============================================================================
+
 void test_break_inner_stay_outer(void)
 {
     log_reset();
@@ -790,10 +710,8 @@ void test_break_inner_stay_outer(void)
     // i=1: X, I, X, I (break), Y, O
     // Expected: XIXIYOXIXIYOE
 }
-
-// =============================================================================
 // Test 36: Switch fallthrough with defer in each case
-// =============================================================================
+
 void test_switch_fallthrough_defer(void)
 {
     log_reset();
@@ -825,10 +743,8 @@ void test_switch_fallthrough_defer(void)
     // case 2 block ends -> C, then break
     // Expected: 0A1B2CE
 }
-
-// =============================================================================
 // Test 37: Goto into switch from outside (label in case)
-// =============================================================================
+
 void test_goto_into_switch(void)
 {
     log_reset();
@@ -851,10 +767,8 @@ void test_goto_into_switch(void)
     // x=1, so we goto inside, skipping switch dispatch
     // Expected: 1AE
 }
-
-// =============================================================================
 // Test 38: Nested defer with same cleanup action
-// =============================================================================
+
 void test_nested_same_defer(void)
 {
     log_reset();
@@ -871,10 +785,8 @@ void test_nested_same_defer(void)
     log_append("E");
     // Expected: 1XXXE
 }
-
-// =============================================================================
 // Test 39: Defer in loop condition scope
-// =============================================================================
+
 void test_defer_loop_body_only(void)
 {
     log_reset();
@@ -889,10 +801,8 @@ void test_defer_loop_body_only(void)
     log_append("E");
     // Expected: LIDLIDE
 }
-
-// =============================================================================
 // Test 40: Return value depends on deferred side effect
-// =============================================================================
+
 int global_val = 0;
 int test_return_side_effect(void)
 {
@@ -900,10 +810,8 @@ int test_return_side_effect(void)
     defer global_val = 100; // This runs AFTER return value is captured
     return global_val;      // Returns 0, but global_val becomes 100 after
 }
-
-// =============================================================================
 // Test 41: Goto out of deeply nested if/else
-// =============================================================================
+
 void test_goto_nested_if_else(void)
 {
     log_reset();
@@ -926,10 +834,8 @@ out:
     log_append("E");
     // Expected: 1CBAE
 }
-
-// =============================================================================
 // Test 42: Defer with ternary operator in statement
-// =============================================================================
+
 void test_defer_ternary(void)
 {
     log_reset();
@@ -941,10 +847,8 @@ void test_defer_ternary(void)
     log_append("E");
     // Expected: 1TE
 }
-
-// =============================================================================
 // Test 43: Break out of inner loop, continue outer
-// =============================================================================
+
 void test_break_inner_continue_outer(void)
 {
     log_reset();
@@ -966,10 +870,8 @@ void test_break_inner_continue_outer(void)
     // i=1: X, I (break inner), Y, O (loop ends)
     // Expected: XIOXIYOE
 }
-
-// =============================================================================
 // Test 44: Switch with no matching case (default case with defer)
-// =============================================================================
+
 void test_switch_no_match_default_defer(void)
 {
     log_reset();
@@ -998,10 +900,8 @@ void test_switch_no_match_default_defer(void)
     log_append("E");
     // Expected: XDE
 }
-
-// =============================================================================
 // Test 45: Nested function calls with defer (each has own scope)
-// =============================================================================
+
 void helper_with_defer(void)
 {
     defer log_append("H");
@@ -1017,10 +917,8 @@ void test_nested_function_defer(void)
     log_append("2");
     // Expected: 1hH2M
 }
-
-// =============================================================================
 // Test 46: Defer with function call
-// =============================================================================
+
 void log_X(void) { log_append("X"); }
 
 void test_defer_function_call(void)
@@ -1033,10 +931,8 @@ void test_defer_function_call(void)
     log_append("E");
     // Expected: 1XE
 }
-
-// =============================================================================
 // Test 47: Multiple scopes at same level
-// =============================================================================
+
 void test_multiple_scopes_same_level(void)
 {
     log_reset();
@@ -1055,10 +951,8 @@ void test_multiple_scopes_same_level(void)
     log_append("E");
     // Expected: 1A2B3CE
 }
-
-// =============================================================================
 // Test 48: Goto from one case to another in switch
-// =============================================================================
+
 void test_goto_between_cases(void)
 {
     log_reset();
@@ -1084,10 +978,8 @@ void test_goto_between_cases(void)
     // at case2: "2", break -> defer B runs
     // Expected: 1A2BE
 }
-
-// =============================================================================
 // Test 49: Very deep nesting (stress test)
-// =============================================================================
+
 void test_very_deep_nesting(void)
 {
     log_reset();
@@ -1119,10 +1011,8 @@ void test_very_deep_nesting(void)
     log_append("E");
     // Expected: X87654321E
 }
-
-// =============================================================================
 // Test 50: Return void function with defer
-// =============================================================================
+
 void test_return_void(void)
 {
     log_reset();
@@ -1136,10 +1026,8 @@ void test_return_void(void)
     }
     log_append("X");
 }
-
-// =============================================================================
 // Test 51: Defer in all branches of if/else if/else
-// =============================================================================
+
 void test_defer_all_branches(int path)
 {
     log_reset();
@@ -1161,10 +1049,8 @@ void test_defer_all_branches(int path)
     }
     log_append("E");
 }
-
-// =============================================================================
 // Test 52: Break vs goto out of loop (same behavior expected)
-// =============================================================================
+
 void test_break_vs_goto_out(void)
 {
     log_reset();
@@ -1188,10 +1074,8 @@ out:
     log_append("E");
     // Expected: 1A2BE
 }
-
-// =============================================================================
 // Test 53: Defer with pointer dereference
-// =============================================================================
+
 void test_defer_pointer(void)
 {
     log_reset();
@@ -1203,10 +1087,8 @@ void test_defer_pointer(void)
     log_append("E");
     // Expected: 1PE
 }
-
-// =============================================================================
 // Test 54: Defer with array index
-// =============================================================================
+
 void test_defer_array(void)
 {
     log_reset();
@@ -1218,10 +1100,8 @@ void test_defer_array(void)
     log_append("E");
     // Expected: 1BE
 }
-
-// =============================================================================
 // Test 55: Complex expression in defer
-// =============================================================================
+
 void test_defer_complex_expr(void)
 {
     log_reset();
@@ -1234,10 +1114,95 @@ void test_defer_complex_expr(void)
     // x=1, so x>0 is true, x>1 is false, result is "A"
     // Expected: 1AE
 }
+// Test 56: Bitfield false positive - label name collides with bitfield member
+// Scanner previously saw "done : 1" in bitfield and registers "done" as label at
+// depth 2 (inside struct braces). Real label "done" is at depth 1.
+// If goto uses wrong depth, it won't emit the defer.
 
-// =============================================================================
+void test_bitfield_label_collision(void)
+{
+    log_reset();
+    struct
+    {
+        unsigned int done : 1; // "done" falsely registered as label at depth 2
+        unsigned int flag : 1;
+    } bits;
+    bits.done = 0;
+    bits.flag = 1;
+
+    {
+        defer log_append("A");
+        log_append("1");
+        goto done; // Real label "done" is at depth 1 (function body)
+    }
+done:
+    log_append("2");
+    // Expected: 1A2 (defer A should run when exiting the block)
+    // Bug would produce: 12 (if wrong depth used, defer not emitted)
+}
+// Test 57: Enum case false positive - label name collides with enum in switch
+// Scanner previously saw "end:" after case and registers "end" at wrong depth.
+
+enum
+{
+    START = 0,
+    end = 1,
+    STOP = 2
+}; // "end" is an enum value
+
+void test_enum_case_label_collision(void)
+{
+    log_reset();
+    int val = 1;
+
+    switch (val)
+    {
+    case end: // "end" falsely registered as label here (inside switch braces)
+        log_append("C");
+        break;
+    }
+
+    {
+        defer log_append("A");
+        log_append("1");
+        goto end; // Real label "end" is at depth 1
+    }
+end:
+    log_append("2");
+    // Expected: C1A2
+    // Bug would produce: C12 (wrong depth, defer not emitted)
+}
+// Test 58: Multiple bitfield collision - worst case
+// Two bitfields with names that are also real labels
+
+void test_multiple_bitfield_collision(void)
+{
+    log_reset();
+    struct
+    {
+        unsigned int outer : 1; // falsely registered at depth 2
+        unsigned int inner : 1; // falsely registered at depth 2
+    } bits;
+    (void)bits;
+
+    {
+        defer log_append("A");
+        {
+            defer log_append("B");
+            log_append("1");
+            goto inner; // Real "inner" is at depth 1
+        }
+    }
+inner:
+    log_append("2");
+    goto outer;
+outer:
+    log_append("3");
+    // Expected: 1BA23 (both defers run when jumping out of nested blocks)
+    // Bug would produce: 123 or 1B23 (wrong depths)
+}
 // Main - run all tests
-// =============================================================================
+
 int main(void)
 {
     int passed = 0;
@@ -1544,6 +1509,21 @@ int main(void)
     test_defer_complex_expr();
     total++;
     passed += check_log("1AE", "test_defer_complex_expr");
+
+    // Test 56: Bitfield label collision
+    test_bitfield_label_collision();
+    total++;
+    passed += check_log("1A2", "test_bitfield_label_collision");
+
+    // Test 57: Enum case label collision
+    test_enum_case_label_collision();
+    total++;
+    passed += check_log("C1A2", "test_enum_case_label_collision");
+
+    // Test 58: Multiple bitfield collision
+    test_multiple_bitfield_collision();
+    total++;
+    passed += check_log("1BA23", "test_multiple_bitfield_collision");
 
     printf("\n=== Results: %d/%d tests passed ===\n", passed, total);
     return (passed == total) ? 0 : 1;

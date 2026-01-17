@@ -1,13 +1,9 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.16.0"
+#define VERSION "0.17.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
-
-// =============================================================================
 // Platform detection
-// =============================================================================
-
 #ifdef _WIN32
 #define INSTALL "prism.exe"
 #define TMP ""
@@ -50,11 +46,7 @@ typedef enum
   MODE_RELEASE,
   MODE_SMALL
 } Mode;
-
-// =============================================================================
 // Defer tracking
-// =============================================================================
-
 #define MAX_DEFER_DEPTH 64
 #define MAX_DEFERS_PER_SCOPE 32
 #define MAX_LABELS 256
@@ -125,11 +117,7 @@ static void defer_add(Token *defer_keyword, Token *start, Token *end)
   scope->ends[scope->count] = end;
   scope->count++;
 }
-
-// =============================================================================
 // Token emission
-// =============================================================================
-
 static FILE *out;
 static Token *last_emitted = NULL;
 
@@ -294,11 +282,7 @@ static bool continue_has_defers(void)
   }
   return false;
 }
-
-// =============================================================================
 // Label tracking for goto
-// =============================================================================
-
 static void label_table_reset(void)
 {
   label_table.count = 0;
@@ -351,11 +335,35 @@ static void scan_labels_in_function(Token *tok)
 
   // Start at depth 1 to align with defer_depth (which is 1 inside function body)
   int depth = 1;
+  int struct_depth = 0; // Track nesting inside struct/union/enum bodies
   Token *prev = NULL;
   tok = tok->next; // Skip opening brace
 
   while (tok && tok->kind != TK_EOF)
   {
+    // Track struct/union/enum bodies to skip bitfield declarations
+    if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum"))
+    {
+      // Look ahead for '{' - could be "struct {" or "struct name {"
+      Token *t = tok->next;
+      while (t && t->kind == TK_IDENT)
+        t = t->next;
+      if (t && equal(t, "{"))
+      {
+        // Skip to the opening brace
+        while (tok != t)
+        {
+          prev = tok;
+          tok = tok->next;
+        }
+        struct_depth++;
+        depth++;
+        prev = tok;
+        tok = tok->next;
+        continue;
+      }
+    }
+
     if (equal(tok, "{"))
     {
       depth++;
@@ -367,6 +375,8 @@ static void scan_labels_in_function(Token *tok)
     {
       if (depth == 1)
         break; // End of function
+      if (struct_depth > 0)
+        struct_depth--;
       depth--;
       prev = tok;
       tok = tok->next;
@@ -374,14 +384,20 @@ static void scan_labels_in_function(Token *tok)
     }
 
     // Check for label: identifier followed by ':' (but not ::)
-    // Also exclude ternary operator: prev token shouldn't be '?'
+    // Filter out: ternary operator, switch cases, bitfields
     if (is_label(tok))
     {
       Token *colon = tok->next;
       // Make sure it's not :: (C++ scope resolution)
-      // And make sure prev isn't '?' (ternary operator)
+      bool is_scope_resolution = colon->next && equal(colon->next, ":");
+      // Ternary operator: prev token is '?'
       bool is_ternary = prev && equal(prev, "?");
-      if (colon->next && !equal(colon->next, ":") && !is_ternary)
+      // Switch case: prev token is 'case' or 'default'
+      bool is_switch_case = prev && (equal(prev, "case") || equal(prev, "default"));
+      // Bitfield: we're inside a struct/union body
+      bool is_bitfield = struct_depth > 0;
+
+      if (!is_scope_resolution && !is_ternary && !is_switch_case && !is_bitfield)
       {
         label_table_add(tok->loc, tok->len, depth);
       }
@@ -488,11 +504,7 @@ static Token *goto_skips_defer(Token *goto_tok, char *label_name, int label_len)
 
   return NULL; // Label not found in forward scan, or all defers were in skipped blocks
 }
-
-// =============================================================================
 // Transpiler
-// =============================================================================
-
 static Token *skip_to_semicolon(Token *tok)
 {
   int depth = 0;
@@ -778,11 +790,7 @@ static int transpile(char *input_file, char *output_file)
   fclose(out);
   return 1;
 }
-
-// =============================================================================
 // Build system
-// =============================================================================
-
 static void die(char *message)
 {
   fprintf(stderr, "%s\n", message);

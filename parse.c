@@ -7,8 +7,6 @@
 //
 // Build: Include this file before your main code, or compile separately
 // Regen: This is a one-time extraction, modify as needed
-
-// =============================================================================
 // Public API Summary:
 //
 // Setup:
@@ -253,11 +251,7 @@ static void pp_add_default_include_paths(void)
 
     pp_add_include_path("/usr/include");
 }
-
-// =============================================================================
 // Utility functions
-// =============================================================================
-
 static bool is_hex(Token *tok) { return tok->len >= 3 && !memcmp(tok->loc, "0x", 2); }
 static bool is_bin(Token *tok) { return tok->len >= 3 && !memcmp(tok->loc, "0b", 2); }
 
@@ -288,11 +282,7 @@ __attribute__((format(printf, 1, 2))) static char *format(char *fmt, ...)
     fclose(fp);
     return buf;
 }
-
-// =============================================================================
 // Hashmap
-// =============================================================================
-
 typedef struct
 {
     char *key;
@@ -428,11 +418,7 @@ static void hashmap_delete(HashMap *map, char *key)
 {
     hashmap_delete2(map, key, strlen(key));
 }
-
-// =============================================================================
 // Unicode
-// =============================================================================
-
 static int encode_utf8(char *buf, uint32_t c)
 {
     if (c <= 0x7F)
@@ -634,11 +620,7 @@ static int display_width(char *p, int len)
     }
     return w;
 }
-
-// =============================================================================
 // Error handling
-// =============================================================================
-
 static File *current_file;
 
 noreturn void error(char *fmt, ...)
@@ -695,11 +677,7 @@ static void warn_tok(Token *tok, char *fmt, ...)
 }
 
 #define unreachable() error("internal error at %s:%d", __FILE__, __LINE__)
-
-// =============================================================================
 // Tokenizer
-// =============================================================================
-
 static File **input_files;
 static int input_file_count;
 static bool at_bol;
@@ -1352,11 +1330,7 @@ Token *tokenize_file(char *path)
 
     return tokenize(file);
 }
-
-// =============================================================================
 // Preprocessor
-// =============================================================================
-
 typedef struct MacroParam MacroParam;
 struct MacroParam
 {
