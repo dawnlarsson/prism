@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.13.0"
+#define VERSION "0.14.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -884,6 +884,7 @@ int main(int argc, char **argv)
            "Usage: prism [options] src.c [output] [args]\n\n"
            "Options:\n"
            "  build          Build only, don't run\n"
+           "  transpile      Transpile only, output to stdout or file\n"
            "  debug/release/small  Optimization mode\n"
            "  arm/x86        Architecture (default: native)\n"
            "  32/64          Word size (default: 64)\n"
@@ -892,7 +893,9 @@ int main(int argc, char **argv)
            "  prism src.c              Run src.c\n"
            "  prism build src.c        Build src\n"
            "  prism build src.c out    Build to 'out'\n"
-           "  prism build arm src.c    Build for arm64 linux\n\n"
+           "  prism build arm src.c    Build for arm64 linux\n"
+           "  prism transpile src.c    Transpile to stdout\n"
+           "  prism transpile src.c out.c  Transpile to out.c\n\n"
            "Prism extensions:\n"
            "  defer stmt;    Execute stmt when scope exits\n\n"
            "install\n",
@@ -903,7 +906,7 @@ int main(int argc, char **argv)
   if (!strcmp(argv[1], "install"))
     return install(argv[0]);
 
-  int arg_idx = 1, is_build_only = 0;
+  int arg_idx = 1, is_build_only = 0, is_transpile_only = 0;
   Mode mode = MODE_DEFAULT;
   char *arch = NATIVE_ARCH;
   int bits = NATIVE_BITS;
@@ -915,6 +918,8 @@ int main(int argc, char **argv)
     char *arg = argv[arg_idx];
     if (!strcmp(arg, "build"))
       is_build_only = 1;
+    else if (!strcmp(arg, "transpile"))
+      is_transpile_only = 1;
     else if (!strcmp(arg, "debug"))
       mode = MODE_DEBUG;
     else if (!strcmp(arg, "release"))
@@ -967,6 +972,36 @@ int main(int argc, char **argv)
     basename++;
     snprintf(transpiled, sizeof(transpiled), "%s/.%s.%d.prism.c",
              source_dir, basename, getpid());
+  }
+
+  // Handle transpile-only mode
+  if (is_transpile_only)
+  {
+    char *transpile_output = NULL;
+    if (arg_idx + 1 < argc && argv[arg_idx + 1][0] != '-')
+      transpile_output = argv[arg_idx + 1];
+
+    if (transpile_output)
+    {
+      printf("[prism] Transpiling %s -> %s\n", source, transpile_output);
+      if (!transpile(source, transpile_output))
+        die("Transpilation failed.");
+    }
+    else
+    {
+      // Transpile to temp file then output to stdout
+      if (!transpile(source, transpiled))
+        die("Transpilation failed.");
+      FILE *f = fopen(transpiled, "r");
+      if (!f)
+        die("Failed to read transpiled output.");
+      int c;
+      while ((c = fgetc(f)) != EOF)
+        putchar(c);
+      fclose(f);
+      remove(transpiled);
+    }
+    return 0;
   }
 
   // Transpile
