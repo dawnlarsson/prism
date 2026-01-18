@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.21.0"
+#define VERSION "0.22.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -182,7 +182,8 @@ static bool needs_space(Token *prev, Token *tok)
         (prev_last == '*' && tok_first == '=') ||
         (prev_last == '/' && tok_first == '=') ||
         (prev_last == '-' && tok_first == '>') ||
-        (prev_last == '#' && tok_first == '#'))
+        (prev_last == '#' && tok_first == '#') ||
+        (prev_last == '/' && tok_first == '*'))
       return true;
   }
 
@@ -564,11 +565,28 @@ static bool is_type_keyword(Token *tok)
 {
   if (tok->kind != TK_KEYWORD && tok->kind != TK_IDENT)
     return false;
-  return equal(tok, "int") || equal(tok, "char") || equal(tok, "short") ||
-         equal(tok, "long") || equal(tok, "float") || equal(tok, "double") ||
-         equal(tok, "void") || equal(tok, "signed") || equal(tok, "unsigned") ||
-         equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum") ||
-         equal(tok, "_Bool") || equal(tok, "bool");
+  // Standard C type keywords
+  if (equal(tok, "int") || equal(tok, "char") || equal(tok, "short") ||
+      equal(tok, "long") || equal(tok, "float") || equal(tok, "double") ||
+      equal(tok, "void") || equal(tok, "signed") || equal(tok, "unsigned") ||
+      equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum") ||
+      equal(tok, "_Bool") || equal(tok, "bool"))
+    return true;
+  // Common typedef types from stdint.h, stddef.h, etc.
+  if (equal(tok, "size_t") || equal(tok, "ssize_t") || equal(tok, "ptrdiff_t") ||
+      equal(tok, "intptr_t") || equal(tok, "uintptr_t") ||
+      equal(tok, "intmax_t") || equal(tok, "uintmax_t") ||
+      equal(tok, "int8_t") || equal(tok, "int16_t") || equal(tok, "int32_t") || equal(tok, "int64_t") ||
+      equal(tok, "uint8_t") || equal(tok, "uint16_t") || equal(tok, "uint32_t") || equal(tok, "uint64_t") ||
+      equal(tok, "int_fast8_t") || equal(tok, "int_fast16_t") || equal(tok, "int_fast32_t") || equal(tok, "int_fast64_t") ||
+      equal(tok, "uint_fast8_t") || equal(tok, "uint_fast16_t") || equal(tok, "uint_fast32_t") || equal(tok, "uint_fast64_t") ||
+      equal(tok, "int_least8_t") || equal(tok, "int_least16_t") || equal(tok, "int_least32_t") || equal(tok, "int_least64_t") ||
+      equal(tok, "uint_least8_t") || equal(tok, "uint_least16_t") || equal(tok, "uint_least32_t") || equal(tok, "uint_least64_t") ||
+      equal(tok, "time_t") || equal(tok, "off_t") || equal(tok, "pid_t") ||
+      equal(tok, "FILE") || equal(tok, "fpos_t") ||
+      equal(tok, "wchar_t") || equal(tok, "wint_t"))
+    return true;
+  return false;
 }
 
 static bool is_type_qualifier(Token *tok)
@@ -582,7 +600,7 @@ static bool is_type_qualifier(Token *tok)
 
 static bool is_skip_decl_keyword(Token *tok)
 {
-  return equal(tok, "extern") || equal(tok, "typedef");
+  return equal(tok, "extern") || equal(tok, "typedef") || equal(tok, "static");
 }
 
 // Check if array size is a compile-time constant (not a VLA)

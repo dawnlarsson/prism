@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <stddef.h>
 
 static char log_buffer[1024];
 static int log_pos = 0;
@@ -72,7 +74,6 @@ done:
     log_append("E");
     // Expected: EF
 }
-
 
 void test_switch_case_defer_leak_case1(void)
 {
@@ -176,11 +177,8 @@ void test_switch_fallthrough_no_defer_leak(void)
     // Expected: 12DE
 }
 
-//=============================================================================
 // BUG #10: emit_continue_defers comment vs behavior
 // Test to verify continue emits correct defers
-//=============================================================================
-
 void test_continue_defer_behavior(void)
 {
     log_reset();
@@ -197,10 +195,6 @@ void test_continue_defer_behavior(void)
     log_append("E");
     // Expected: CLNLE (first iter: C then L on continue, second: N then L on scope exit)
 }
-
-//=============================================================================
-// Additional edge case tests
-//=============================================================================
 
 // Test nested switch with defer
 void test_nested_switch_defer_leak(void)
@@ -309,11 +303,8 @@ int test_return_from_switch_defer(void)
     return 0;
 }
 
-//=============================================================================
 // Preprocessor test (Bug #2 - token chain corruption)
 // This needs to be tested via compilation, not runtime
-//=============================================================================
-
 // Complex #if expression that might trigger token chain issues
 #define COMPLEX_VAL 1
 #if defined(COMPLEX_VAL) && COMPLEX_VAL > 0 && (COMPLEX_VAL + 1) == 2
@@ -347,15 +338,80 @@ void test_preprocessor_expressions(void)
     }
 }
 
-//=============================================================================
-// Main test runner
-//=============================================================================
+// Bug Division by dereference via macro
+#define OP(x) x
+int test_div_deref(void)
+{
+    int val = 10;
+    int *b = &val;
+    int x = 100 OP(/) OP(*) b; // Should be 100 / *b = 10
+    return x;
+}
+
+// Bug Static should NOT get = 0 (wasteful)
+// We can't easily test this at runtime, but we verify static works correctly
+static int static_var;
+static char static_buf[10];
+
+int test_static(void)
+{
+    // C guarantees these are zero without explicit init
+    return static_var == 0 && static_buf[0] == 0;
+}
+
+// Bug Typedef types should be zero-initialized
+int test_typedef_init(void)
+{
+    size_t a;
+    uint8_t b;
+    int32_t c;
+    uint64_t d;
+
+    // These SHOULD all be zero if zero-init works
+    return (a == 0) && (b == 0) && (c == 0) && (d == 0);
+}
 
 int main(void)
 {
     int passed = 0, total = 0;
 
-    printf("--- Bug #6: Braceless loop label tracking ---\n");
+    printf("--- Bug #1: Division by dereference ---\n");
+    if (test_div_deref() == 10)
+    {
+        printf("[PASS] Bug #1: Division by dereference\n");
+        passed++;
+    }
+    else
+    {
+        printf("[FAIL] Bug #1: Division by dereference\n");
+    }
+    total++;
+
+    printf("\n--- Bug #2a: Static variables work ---\n");
+    if (test_static())
+    {
+        printf("[PASS] Bug #2a: Static variables work\n");
+        passed++;
+    }
+    else
+    {
+        printf("[FAIL] Bug #2a: Static variables work\n");
+    }
+    total++;
+
+    printf("\n--- Bug #2b: Typedef zero-init ---\n");
+    if (test_typedef_init())
+    {
+        printf("[PASS] Bug #2b: Typedef zero-init\n");
+        passed++;
+    }
+    else
+    {
+        printf("[FAIL] Bug #2b: Typedef zero-init\n");
+    }
+    total++;
+
+    printf("\n--- Bug #6: Braceless loop label tracking ---\n");
     test_bug6_braceless_for_label();
     total++;
     passed += check_log("EF", "bug6_braceless_for_label");
