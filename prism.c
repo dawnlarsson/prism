@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.22.0"
+#define VERSION "0.23.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -183,7 +183,8 @@ static bool needs_space(Token *prev, Token *tok)
         (prev_last == '/' && tok_first == '=') ||
         (prev_last == '-' && tok_first == '>') ||
         (prev_last == '#' && tok_first == '#') ||
-        (prev_last == '/' && tok_first == '*'))
+        (prev_last == '/' && tok_first == '*') ||
+        (prev_last == '*' && tok_first == '/'))
       return true;
   }
 
@@ -368,10 +369,39 @@ static void scan_labels_in_function(Token *tok)
     // Track struct/union/enum bodies to skip bitfield declarations
     if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum"))
     {
-      // Look ahead for '{' - could be "struct {" or "struct name {"
+      // Look ahead for '{' - could be:
+      //   "struct {"
+      //   "struct name {"
+      //   "struct __attribute__((packed)) {"
+      //   "struct __attribute__((packed)) name {"
       Token *t = tok->next;
-      while (t && t->kind == TK_IDENT)
-        t = t->next;
+      // Skip identifiers, struct names, and __attribute__((...))
+      while (t && (t->kind == TK_IDENT || equal(t, "__attribute__")))
+      {
+        // Handle __attribute__((...)) - skip the entire attribute
+        if (equal(t, "__attribute__"))
+        {
+          t = t->next;
+          // Skip (( ... ))
+          if (t && equal(t, "("))
+          {
+            int paren_depth = 1;
+            t = t->next;
+            while (t && paren_depth > 0)
+            {
+              if (equal(t, "("))
+                paren_depth++;
+              else if (equal(t, ")"))
+                paren_depth--;
+              t = t->next;
+            }
+          }
+        }
+        else
+        {
+          t = t->next;
+        }
+      }
       if (t && equal(t, "{"))
       {
         // Skip to the opening brace
@@ -1057,6 +1087,47 @@ static int transpile(char *input_file, char *output_file)
   return 1;
 }
 // Build system
+
+// Escape a string for safe use in shell commands (single-quote escaping)
+// Returns a newly allocated string that must be freed
+static char *shell_escape(const char *s)
+{
+  // Count how many single quotes we need to escape
+  size_t len = 0;
+  for (const char *p = s; *p; p++)
+  {
+    if (*p == '\'')
+      len += 4; // '\'' to escape a single quote
+    else
+      len += 1;
+  }
+  len += 3; // opening ', closing ', and null terminator
+
+  char *result = malloc(len);
+  if (!result)
+    return NULL;
+
+  char *out = result;
+  *out++ = '\'';
+  for (const char *p = s; *p; p++)
+  {
+    if (*p == '\'')
+    {
+      // End quote, escaped quote, start quote again: '\''
+      *out++ = '\'';
+      *out++ = '\\';
+      *out++ = '\'';
+      *out++ = '\'';
+    }
+    else
+    {
+      *out++ = *p;
+    }
+  }
+  *out++ = '\'';
+  *out = '\0';
+  return result;
+}
 static void die(char *message)
 {
   fprintf(stderr, "%s\n", message);
@@ -1362,7 +1433,15 @@ int main(int argc, char **argv)
     snprintf(output_path, sizeof(output_path), "%sprism_out.%d", TMP, getpid());
   }
 
-  snprintf(command, 4096, "%s \"%s\" -o \"%s\"%s", compiler, transpiled, output_path, flags);
+  // Use shell escaping for safe command execution
+  char *esc_transpiled = shell_escape(transpiled);
+  char *esc_output = shell_escape(output_path);
+  if (!esc_transpiled || !esc_output)
+    die("Memory allocation failed.");
+
+  snprintf(command, 4096, "%s %s -o %s%s", compiler, esc_transpiled, esc_output, flags);
+  free(esc_transpiled);
+  free(esc_output);
 
   if (system(command))
   {
@@ -1372,12 +1451,21 @@ int main(int argc, char **argv)
 
   if (!is_build_only)
   {
-    snprintf(command, 4096, "\"%s\"", output_path);
+    char *esc_exec = shell_escape(output_path);
+    if (!esc_exec)
+      die("Memory allocation failed.");
+    snprintf(command, 4096, "%s", esc_exec);
+    free(esc_exec);
+
     for (int j = arg_idx + 1; j < argc; j++)
     {
+      char *esc_arg = shell_escape(argv[j]);
+      if (!esc_arg)
+        die("Memory allocation failed.");
       size_t len = strlen(command);
-      if (len + strlen(argv[j]) + 4 < 4096)
-        snprintf(command + len, 4096 - len, " \"%s\"", argv[j]);
+      if (len + strlen(esc_arg) + 2 < 4096)
+        snprintf(command + len, 4096 - len, " %s", esc_arg);
+      free(esc_arg);
     }
     int status = system(command);
     remove(output_path);

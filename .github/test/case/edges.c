@@ -371,6 +371,44 @@ int test_typedef_init(void)
     return (a == 0) && (b == 0) && (c == 0) && (d == 0);
 }
 
+//=============================================================================
+// Bug #3: __attribute__ + bitfield label confusion
+//=============================================================================
+
+static char attr_log[64];
+static int attr_pos = 0;
+
+static void attr_log_D(void)
+{
+    attr_log[attr_pos++] = 'D';
+    attr_log[attr_pos] = 0;
+}
+
+void test_attr_bitfield(void)
+{
+    attr_pos = 0;
+    attr_log[0] = 0;
+
+    struct __attribute__((packed)) {
+        uint32_t done : 1; // "done" bitfield - NOT a label
+        uint32_t end : 1;
+    } flags;
+
+    {
+        defer attr_log_D();
+        attr_log[attr_pos++] = '1';
+        attr_log[attr_pos] = 0;
+        goto done; // This should jump to the label, not the bitfield!
+    }
+done:
+    attr_log[attr_pos++] = '2';
+    attr_log[attr_pos] = 0;
+}
+
+//=============================================================================
+// Main test runner
+//=============================================================================
+
 int main(void)
 {
     int passed = 0, total = 0;
@@ -408,6 +446,21 @@ int main(void)
     else
     {
         printf("[FAIL] Bug #2b: Typedef zero-init\n");
+    }
+    total++;
+
+    printf("\n--- Bug #3: Attribute + bitfield labels ---\n");
+    test_attr_bitfield();
+    if (strcmp(attr_log, "1D2") == 0)
+    {
+        printf("[PASS] Bug #3: Attribute + bitfield labels\n");
+        passed++;
+    }
+    else
+    {
+        printf("[FAIL] Bug #3: Attribute + bitfield labels\n");
+        printf("  Expected: '1D2'\n");
+        printf("  Got:      '%s'\n", attr_log);
     }
     total++;
 
