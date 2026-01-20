@@ -126,8 +126,13 @@ static void defer_add(Token *defer_keyword, Token *start, Token *end)
   scope->count++;
 }
 
+// Track if we're directly inside a switch (no braces after case)
+static bool in_switch_case_body = false;
+
 // Clear defers at innermost switch scope when hitting case/default
-// This prevents defers from one case leaking to another case
+// This is necessary because the transpiler can't track which case was entered at runtime.
+// Note: This means defer in case with fallthrough will NOT preserve defers from previous cases.
+// For reliable defer behavior in switch, wrap each case body in braces.
 static void clear_switch_scope_defers(void)
 {
   for (int d = defer_depth - 1; d >= 0; d--)
@@ -681,6 +686,8 @@ static Token *try_zero_init_decl(Token *tok)
   // Must start with qualifier or type
   bool saw_type = false;
   bool is_struct_type = false;
+  bool is_typedef_type = false;
+
   while (is_type_qualifier(tok) || is_type_keyword(tok))
   {
     if (is_type_keyword(tok))
@@ -699,6 +706,31 @@ static Token *try_zero_init_decl(Token *tok)
       continue;
     }
     tok = tok->next;
+  }
+
+  // Check for typedef'd type: identifier followed by [*...] identifier
+  // Pattern: my_type x; or my_type *x; or my_type **x;
+  if (!saw_type && tok->kind == TK_IDENT)
+  {
+    Token *maybe_type = tok;
+    Token *t = tok->next;
+
+    // Skip pointers and qualifiers
+    while (t && (equal(t, "*") || is_type_qualifier(t)))
+      t = t->next;
+
+    // If followed by identifier then ; or [ or , this looks like a declaration
+    if (t && t->kind == TK_IDENT)
+    {
+      Token *after_name = t->next;
+      if (after_name && (equal(after_name, ";") || equal(after_name, "[") ||
+                         equal(after_name, ",") || equal(after_name, "=")))
+      {
+        saw_type = true;
+        is_typedef_type = true;
+        tok = maybe_type->next; // Move past the type name
+      }
+    }
   }
 
   if (!saw_type)
@@ -757,7 +789,7 @@ static Token *try_zero_init_decl(Token *tok)
 
   // Emit the declaration with zero initializer
   emit_range(start, tok); // everything up to semicolon
-  if (is_array || (is_struct_type && !is_pointer))
+  if (is_array || ((is_struct_type || is_typedef_type) && !is_pointer))
     fprintf(out, " = {0}");
   else
     fprintf(out, " = 0");
@@ -991,9 +1023,24 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Handle case/default labels - clear defers from switch scope
-    // This prevents defers registered in one case from leaking to other cases
+    // This prevents defers from leaking across cases (which would cause incorrect behavior
+    // since the transpiler can't know which case is entered at runtime)
     if (feature_defer && tok->kind == TK_KEYWORD && (equal(tok, "case") || equal(tok, "default")))
     {
+      // Check if there are active defers that would be lost (fallthrough scenario)
+      for (int d = defer_depth - 1; d >= 0; d--)
+      {
+        if (defer_stack[d].is_switch)
+        {
+          if (defer_stack[d].count > 0)
+          {
+            // There are defers that will be cleared - warn about fallthrough
+            warn_tok(tok, "defer in switch case with fallthrough: defers from previous case will not run. "
+                          "Wrap case bodies in braces for reliable defer behavior.");
+          }
+          break;
+        }
+      }
       clear_switch_scope_defers();
     }
 
@@ -1010,9 +1057,34 @@ static int transpile(char *input_file, char *output_file)
     if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum"))
     {
       // Look ahead to see if this has a body
+      // Must handle: struct name {, struct {, struct __attribute__((...)) name {
       Token *t = tok->next;
-      if (t && t->kind == TK_IDENT)
-        t = t->next;
+      // Skip identifiers and __attribute__((...))
+      while (t && (t->kind == TK_IDENT || equal(t, "__attribute__")))
+      {
+        if (equal(t, "__attribute__"))
+        {
+          t = t->next;
+          // Skip (( ... ))
+          if (t && equal(t, "("))
+          {
+            int paren_depth = 1;
+            t = t->next;
+            while (t && paren_depth > 0)
+            {
+              if (equal(t, "("))
+                paren_depth++;
+              else if (equal(t, ")"))
+                paren_depth--;
+              t = t->next;
+            }
+          }
+        }
+        else
+        {
+          t = t->next;
+        }
+      }
       if (t && equal(t, "{"))
       {
         // Emit tokens up to and including the {
@@ -1213,8 +1285,14 @@ static void get_flags(char *source_file, char *buffer, Mode mode)
     if (quote_start && quote_end)
     {
       *quote_end = 0;
-      strcat(buffer, " ");
-      strcat(buffer, quote_start + 1);
+      size_t current_len = strlen(buffer);
+      size_t add_len = strlen(quote_start + 1);
+      // Bounds check: buffer is 2048 bytes, leave room for space and null
+      if (current_len + add_len + 2 < 2048)
+      {
+        strcat(buffer, " ");
+        strcat(buffer, quote_start + 1);
+      }
     }
   }
 

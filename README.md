@@ -37,7 +37,8 @@ void example() {
 
 Works with: primitives, pointers, arrays, structs, unions, enums.
 
-**Limitation:** Typedef'd types require explicit initialization.
+**Limitation:** Typedef'd types currently require explicit initialization.
+
 **Opt-out** `prism src.c no-zeroinit`
 
 ## CLI
