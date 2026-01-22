@@ -209,6 +209,31 @@ static void pp_add_default_include_paths(void)
 {
     struct stat st;
 
+#ifdef __APPLE__
+    // macOS: Get SDK path from xcrun
+    FILE *fp = popen("xcrun --show-sdk-path 2>/dev/null", "r");
+    if (fp)
+    {
+        char sdk_path[PATH_MAX];
+        if (fgets(sdk_path, sizeof(sdk_path), fp))
+        {
+            // Remove trailing newline
+            size_t len = strlen(sdk_path);
+            if (len > 0 && sdk_path[len - 1] == '\n')
+                sdk_path[len - 1] = '\0';
+
+            // Add SDK include path
+            char *include_path = malloc(PATH_MAX);
+            snprintf(include_path, PATH_MAX, "%s/usr/include", sdk_path);
+            if (stat(include_path, &st) == 0)
+                pp_add_include_path(include_path);
+            else
+                free(include_path);
+        }
+        pclose(fp);
+    }
+    pp_add_include_path("/usr/local/include");
+#else
     // GCC built-in headers first - needed for include_next to work correctly
     // Try to find GCC include path dynamically
     static const char *gcc_base_dirs[] = {
@@ -250,6 +275,7 @@ static void pp_add_default_include_paths(void)
     pp_add_include_path("/usr/include/aarch64-linux-gnu");
 
     pp_add_include_path("/usr/include");
+#endif
 }
 // Utility functions
 static bool is_hex(Token *tok) { return tok->len >= 3 && !memcmp(tok->loc, "0x", 2); }
