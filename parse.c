@@ -168,7 +168,13 @@ struct Hideset
 
 static void pp_add_include_path(const char *path)
 {
-    pp_include_paths = realloc(pp_include_paths, sizeof(char *) * (pp_include_paths_count + 1));
+    char **new_paths = realloc(pp_include_paths, sizeof(char *) * (pp_include_paths_count + 1));
+    if (!new_paths)
+    {
+        fprintf(stderr, "out of memory adding include path\n");
+        exit(1);
+    }
+    pp_include_paths = new_paths;
     pp_include_paths[pp_include_paths_count++] = strdup(path);
 }
 
@@ -1255,7 +1261,7 @@ static Token *tokenize(File *file)
         if (startswith(p, "//"))
         {
             p += 2;
-            while (*p != '\n')
+            while (*p && *p != '\n')
                 p++;
             has_space = true;
             continue;
@@ -1418,7 +1424,10 @@ Token *tokenize_file(char *path)
     remove_backslash_newline(p);
 
     File *file = new_file(path, input_file_count, p);
-    input_files = realloc(input_files, sizeof(File *) * (input_file_count + 2));
+    File **new_input_files = realloc(input_files, sizeof(File *) * (input_file_count + 2));
+    if (!new_input_files)
+        error("out of memory loading file");
+    input_files = new_input_files;
     input_files[input_file_count++] = file;
     input_files[input_file_count] = NULL;
 

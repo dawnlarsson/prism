@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.27.0"
+#define VERSION "0.28.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -65,8 +65,9 @@ typedef struct
   Token *ends[MAX_DEFERS_PER_SCOPE];      // End token (the semicolon)
   Token *defer_tok[MAX_DEFERS_PER_SCOPE]; // The 'defer' keyword token (for error messages)
   int count;
-  bool is_loop;   // true if this scope is a for/while/do loop
-  bool is_switch; // true if this scope is a switch statement
+  bool is_loop;          // true if this scope is a for/while/do loop
+  bool is_switch;        // true if this scope is a switch statement
+  bool had_control_exit; // true if break/return/goto/continue seen since last defer in switch
 } DeferScope;
 
 // Label tracking for goto handling
@@ -143,10 +144,26 @@ static void defer_add(Token *defer_keyword, Token *start, Token *end)
   scope->stmts[scope->count] = start;
   scope->ends[scope->count] = end;
   scope->count++;
+  // Reset control exit flag - new defer means we need a new control exit
+  scope->had_control_exit = false;
 }
 
 // Track if we're directly inside a switch (no braces after case)
 static bool in_switch_case_body = false;
+
+// Mark that control flow exited (break/return/goto) in the innermost switch scope
+// This tells us that defers were properly executed before the case ended
+static void mark_switch_control_exit(void)
+{
+  for (int d = defer_depth - 1; d >= 0; d--)
+  {
+    if (defer_stack[d].is_switch)
+    {
+      defer_stack[d].had_control_exit = true;
+      return;
+    }
+  }
+}
 
 // Clear defers at innermost switch scope when hitting case/default
 // This is necessary because the transpiler can't track which case was entered at runtime.
@@ -742,19 +759,21 @@ static Token *try_zero_init_decl(Token *tok)
     tok = tok->next;
   }
 
-  // Check for typedef'd type: identifier followed by [*...] identifier
-  // Pattern: my_type x; or my_type *x; or my_type **x;
+  // Check for typedef'd type: identifier followed by identifier (no pointer)
+  // Pattern: my_type x; - but NOT my_type *x; (ambiguous with multiplication)
+  // We only match "TypeName varname;" to avoid misidentifying "a * b;" as a declaration
   if (!saw_type && tok->kind == TK_IDENT)
   {
     Token *maybe_type = tok;
     Token *t = tok->next;
 
-    // Skip pointers and qualifiers
-    while (t && (equal(t, "*") || is_type_qualifier(t)))
+    // Only match direct "TypeName varname" pattern (no * which is ambiguous)
+    // Skip only qualifiers, NOT pointers
+    while (t && is_type_qualifier(t))
       t = t->next;
 
-    // If followed by identifier then ; or [ or , this looks like a declaration
-    if (t && t->kind == TK_IDENT)
+    // If directly followed by identifier (no *) then ; or [ or , this is likely a declaration
+    if (t && t->kind == TK_IDENT && !equal(maybe_type->next, "*"))
     {
       Token *after_name = t->next;
       if (after_name && (equal(after_name, ";") || equal(after_name, "[") ||
@@ -921,6 +940,7 @@ static int transpile(char *input_file, char *output_file)
     // Handle 'return' - evaluate expr, run defers, then return
     if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "return"))
     {
+      mark_switch_control_exit(); // Mark that we exited via return
       if (has_active_defers())
       {
         tok = tok->next; // skip 'return'
@@ -938,7 +958,12 @@ static int transpile(char *input_file, char *output_file)
         else
         {
           // return with expression
-          if (current_func_returns_void)
+          // Check if expression is a void cast: (void)expr - treat as void return
+          // This handles typedef void cases like: VoidType func() { return (void)expr; }
+          bool is_void_cast = equal(tok, "(") && tok->next && equal(tok->next, "void") &&
+                              tok->next->next && equal(tok->next->next, ")");
+
+          if (current_func_returns_void || is_void_cast)
           {
             // void function: { (expr); defers; return; }
             // The expression is executed for side effects, then we return void
@@ -988,6 +1013,7 @@ static int transpile(char *input_file, char *output_file)
     // Handle 'break' - emit defers up through loop/switch
     if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "break"))
     {
+      mark_switch_control_exit(); // Mark that we exited via break
       if (break_has_defers())
       {
         fprintf(out, " {");
@@ -1000,7 +1026,7 @@ static int transpile(char *input_file, char *output_file)
         end_statement_after_semicolon();
         continue;
       }
-      // No defers, emit normally
+      // No defers, emit normally (fall through to default emit)
     }
 
     // Handle 'continue' - emit defers up to (not including) loop
@@ -1094,11 +1120,15 @@ static int transpile(char *input_file, char *output_file)
       {
         if (defer_stack[d].is_switch)
         {
-          if (defer_stack[d].count > 0)
+          // Only error if: there are defers AND no control exit (break/return) since the last defer
+          if (defer_stack[d].count > 0 && !defer_stack[d].had_control_exit)
           {
-            // There are defers that will be cleared - warn about fallthrough
-            warn_tok(tok, "defer in switch case with fallthrough: defers from previous case will not run. "
-                          "Wrap case bodies in braces for reliable defer behavior.");
+            // There are defers that will be cleared - this is a resource leak!
+            // Make it an error to force the user to fix it.
+            error_tok(defer_stack[d].defer_tok[0],
+                      "defer would be skipped due to switch fallthrough at %s:%d. "
+                      "Add 'break;' before the next case, or wrap case body in braces.",
+                      tok->file->name, tok->line_no);
           }
           break;
         }
@@ -1350,11 +1380,79 @@ static int transpile(char *input_file, char *output_file)
 }
 // Build system
 
-// Escape a string for safe use in shell commands (single-quote escaping)
+// Escape a string for safe use in shell commands
 // Returns a newly allocated string that must be freed
 static char *shell_escape(const char *s)
 {
-  // Count how many single quotes we need to escape
+#ifdef _WIN32
+  // Windows: Use double quotes, escape internal double quotes and backslashes
+  // before quotes (cmd.exe uses \" for escaping, but backslashes before quotes
+  // need escaping too)
+  size_t len = 0;
+  for (const char *p = s; *p; p++)
+  {
+    if (*p == '"')
+      len += 2; // \"
+    else if (*p == '\\')
+    {
+      // Count consecutive backslashes
+      int bs = 0;
+      while (p[bs] == '\\')
+        bs++;
+      if (p[bs] == '"' || p[bs] == '\0')
+        len += bs * 2; // Double backslashes before quote or end
+      else
+        len += bs;
+      p += bs - 1;
+    }
+    else
+    {
+      len += 1;
+    }
+  }
+  len += 3; // opening ", closing ", and null terminator
+
+  char *result = malloc(len);
+  if (!result)
+    return NULL;
+
+  char *out = result;
+  *out++ = '"';
+  for (const char *p = s; *p; p++)
+  {
+    if (*p == '"')
+    {
+      *out++ = '\\';
+      *out++ = '"';
+    }
+    else if (*p == '\\')
+    {
+      int bs = 0;
+      while (p[bs] == '\\')
+        bs++;
+      if (p[bs] == '"' || p[bs] == '\0')
+      {
+        // Double the backslashes
+        for (int i = 0; i < bs * 2; i++)
+          *out++ = '\\';
+      }
+      else
+      {
+        for (int i = 0; i < bs; i++)
+          *out++ = '\\';
+      }
+      p += bs - 1;
+    }
+    else
+    {
+      *out++ = *p;
+    }
+  }
+  *out++ = '"';
+  *out = '\0';
+  return result;
+#else
+  // POSIX: Use single quotes, escape single quotes as '\''
   size_t len = 0;
   for (const char *p = s; *p; p++)
   {
@@ -1389,6 +1487,7 @@ static char *shell_escape(const char *s)
   *out++ = '\'';
   *out = '\0';
   return result;
+#endif
 }
 static void die(char *message)
 {
@@ -1683,11 +1782,11 @@ int main(int argc, char **argv)
   {
     if (custom_output)
     {
-      strncpy(output_path, custom_output, 511);
+      snprintf(output_path, sizeof(output_path), "%s", custom_output);
     }
     else
     {
-      strncpy(output_path, source, 511);
+      snprintf(output_path, sizeof(output_path), "%s", source);
       char *ext = strrchr(output_path, '.');
       if (ext)
         *ext = 0;
