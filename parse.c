@@ -2555,7 +2555,7 @@ static Token *preprocess2(Token *tok)
                     continue;
                 }
             }
-            tok = skip_cond_incl(tok->next);
+            tok = skip_cond_incl(tok); // Fixed: was tok->next
             continue;
         }
 
