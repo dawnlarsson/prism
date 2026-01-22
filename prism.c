@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.29.0"
+#define VERSION "0.30.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -1016,19 +1016,37 @@ static int transpile(char *input_file, char *output_file)
 
       // Validate defer statement doesn't contain control flow keywords
       // (which would indicate the semicolon came from a different statement)
+      // Track all grouping depths - content inside (), [], {} is allowed to span lines
       int brace_depth = 0;
+      int paren_depth = 0;
+      int bracket_depth = 0;
       for (Token *t = stmt_start; t != stmt_end && t->kind != TK_EOF; t = t->next)
       {
-        // Check at_bol BEFORE updating brace_depth, skip for { and } tokens themselves
-        // But allow multi-line when inside braces (compound statement)
-        if (t != stmt_start && t->at_bol && brace_depth == 0 && !equal(t, "{"))
+        // Check at_bol BEFORE updating depths, skip for grouping tokens themselves
+        // Allow multi-line when inside any grouping: (), [], {}
+        bool at_top_level = (brace_depth == 0 && paren_depth == 0 && bracket_depth == 0);
+        if (t != stmt_start && t->at_bol && at_top_level &&
+            !equal(t, "{") && !equal(t, "(") && !equal(t, "["))
         {
           error_tok(defer_keyword,
                     "defer statement spans multiple lines without ';' - add semicolon");
         }
-        if (equal(t, "{")) brace_depth++;
-        else if (equal(t, "}")) brace_depth--;
-        if (t->kind == TK_KEYWORD &&
+        // Update depths
+        if (equal(t, "{"))
+          brace_depth++;
+        else if (equal(t, "}"))
+          brace_depth--;
+        else if (equal(t, "("))
+          paren_depth++;
+        else if (equal(t, ")"))
+          paren_depth--;
+        else if (equal(t, "["))
+          bracket_depth++;
+        else if (equal(t, "]"))
+          bracket_depth--;
+        // Only flag control-flow keywords at top level (not inside compound defer block)
+        if (brace_depth == 0 && paren_depth == 0 && bracket_depth == 0 &&
+            t->kind == TK_KEYWORD &&
             (equal(t, "return") || equal(t, "break") || equal(t, "continue") ||
              equal(t, "goto") || equal(t, "if") || equal(t, "else") ||
              equal(t, "for") || equal(t, "while") || equal(t, "do") ||
@@ -1148,6 +1166,7 @@ static int transpile(char *input_file, char *output_file)
     // Handle 'continue' - emit defers up to (not including) loop
     if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "continue"))
     {
+      mark_switch_control_exit(); // Continue also exits the switch (like break/return/goto)
       if (continue_has_defers())
       {
         fprintf(out, " {");

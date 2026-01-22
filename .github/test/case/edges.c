@@ -177,26 +177,7 @@ void test_switch_fallthrough_no_defer_leak(void)
     // Expected: 12DE
 }
 
-// BUG #10: emit_continue_defers comment vs behavior
-// Test to verify continue emits correct defers
-void test_continue_defer_behavior(void)
-{
-    log_reset();
-    for (int i = 0; i < 2; i++)
-    {
-        defer log_append("L"); // Loop scope defer
-        if (i == 0)
-        {
-            log_append("C");
-            continue; // Should emit L before continuing
-        }
-        log_append("N");
-    }
-    log_append("E");
-    // Expected: CLNLE (first iter: C then L on continue, second: N then L on scope exit)
-}
-
-// Test nested switch with defer
+// Test nested switch with defer (unique: braceless cases)
 void test_nested_switch_defer_leak(void)
 {
     log_reset();
@@ -261,46 +242,6 @@ void test_switch_default_defer_leak(void)
     }
     log_append("E");
     // Expected: DE
-}
-
-// Test goto out of switch with defer
-void test_goto_out_of_switch_defer(void)
-{
-    log_reset();
-    int x = 1;
-    switch (x)
-    {
-    case 1:
-        defer log_append("A");
-        log_append("1");
-        goto outside;
-    case 2:
-        log_append("2");
-        break;
-    }
-outside:
-    log_append("E");
-    // Expected: 1AE (goto should emit the defer)
-}
-
-// Test return from switch with defer
-int test_return_from_switch_defer(void)
-{
-    log_reset();
-    int x = 1;
-    defer log_append("F");
-    switch (x)
-    {
-    case 1:
-        defer log_append("A");
-        log_append("1");
-        return 42;
-    case 2:
-        log_append("2");
-        break;
-    }
-    log_append("E");
-    return 0;
 }
 
 // Preprocessor test (Bug #2 - token chain corruption)
@@ -389,7 +330,8 @@ void test_attr_bitfield(void)
     attr_pos = 0;
     attr_log[0] = 0;
 
-    struct __attribute__((packed)) {
+    struct __attribute__((packed))
+    {
         uint32_t done : 1; // "done" bitfield - NOT a label
         uint32_t end : 1;
     } flags;
@@ -494,12 +436,7 @@ int main(void)
     total++;
     passed += check_log("12DE", "switch_fallthrough_no_defer_leak");
 
-    printf("\n--- Bug #10: Continue defer behavior ---\n");
-    test_continue_defer_behavior();
-    total++;
-    passed += check_log("CLNLE", "continue_defer_behavior");
-
-    printf("\n--- Additional edge cases ---\n");
+    printf("\n--- Additional edge cases (braceless switch) ---\n");
     test_nested_switch_defer_leak();
     total++;
     passed += check_log("21AE", "nested_switch_defer_leak");
@@ -511,14 +448,6 @@ int main(void)
     test_switch_default_defer_leak();
     total++;
     passed += check_log("DE", "switch_default_defer_leak");
-
-    test_goto_out_of_switch_defer();
-    total++;
-    passed += check_log("1AE", "goto_out_of_switch_defer");
-
-    test_return_from_switch_defer();
-    total++;
-    passed += check_log("1AF", "return_from_switch_defer");
 
     printf("\n--- Preprocessor tests ---\n");
     test_preprocessor_expressions();

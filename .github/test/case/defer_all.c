@@ -1201,6 +1201,289 @@ outer:
     // Expected: 1BA23 (both defers run when jumping out of nested blocks)
     // Bug would produce: 123 or 1B23 (wrong depths)
 }
+
+// Test 59: Conditional defer registration (defer only if condition true)
+// Note: Prism requires braces around defer in control statements
+void test_conditional_defer(int should_defer)
+{
+    log_reset();
+    if (should_defer)
+    {
+        defer log_append("D");
+    }
+    log_append("1");
+    // should_defer=1: D runs when if-block exits, then 1 -> D1
+    // should_defer=0: 1
+}
+
+// Test 60: Defer in macro expansion
+#define WITH_CLEANUP(code)     \
+    {                          \
+        defer log_append("M"); \
+        code;                  \
+    }
+
+void test_defer_in_macro(void)
+{
+    log_reset();
+    WITH_CLEANUP(log_append("1"));
+    log_append("E");
+    // Expected: 1ME
+}
+
+// Test 61: Multiple defers on same line
+void test_multiple_defers_same_line(void)
+{
+    log_reset();
+    {
+        defer log_append("A");
+        defer log_append("B");
+        log_append("1");
+    }
+    log_append("E");
+    // Expected: 1BAE (LIFO order)
+}
+
+// Test 62: Defer captures argument at execution time (not registration)
+void test_defer_capture_timing(void)
+{
+    log_reset();
+    const char *msg = "X";
+    defer log_append(msg); // What value does msg have when defer runs?
+    msg = "Y";
+    log_append("1");
+    // Expected: 1Y (msg evaluated when defer executes, not when registered)
+}
+
+// Test 63: Recursive function with defer - stack isolation
+int recursion_count = 0;
+void test_recursive_defer(int depth)
+{
+    if (depth <= 0)
+        return;
+    defer
+    {
+        recursion_count++;
+        log_append("R");
+    };
+    test_recursive_defer(depth - 1);
+}
+
+// Test 64: Defer with function pointer
+void ptr_cleanup(void) { log_append("P"); }
+void test_defer_function_pointer(void)
+{
+    log_reset();
+    void (*fp)(void) = ptr_cleanup;
+    {
+        defer fp();
+        log_append("1");
+    }
+    log_append("E");
+    // Expected: 1PE
+}
+
+// Test 65: Do-while with continue and defer
+void test_do_while_continue_defer(void)
+{
+    log_reset();
+    int i = 0;
+    do
+    {
+        defer log_append("D");
+        i++;
+        if (i == 2)
+        {
+            log_append("C");
+            continue;
+        }
+        log_append("L");
+    } while (i < 3);
+    log_append("E");
+    // i=1: L, D
+    // i=2: C, D (continue)
+    // i=3: L, D
+    // Expected: LDCDLDE
+}
+
+// Test 66: Anonymous struct bitfield label collision
+void test_anon_struct_bitfield(void)
+{
+    log_reset();
+    struct
+    {
+        unsigned done : 1;
+        unsigned cleanup : 1;
+    } status;
+    (void)status;
+
+    {
+        defer log_append("A");
+        log_append("1");
+        goto done;
+    }
+done:
+    log_append("2");
+    goto cleanup;
+cleanup:
+    log_append("3");
+    // Expected: 1A23
+}
+
+// Test 67: Union with bitfield label collision
+void test_union_bitfield_collision(void)
+{
+    log_reset();
+    union
+    {
+        struct
+        {
+            unsigned end : 8;
+            unsigned start : 8;
+        } bits;
+        unsigned short value;
+    } u;
+    (void)u;
+
+    {
+        defer log_append("A");
+        log_append("1");
+        goto end;
+    }
+end:
+    log_append("2");
+    // Expected: 1A2
+}
+
+// Test 68: Defer with compound literal
+void takes_arr(const int *arr) { log_append(arr[0] == 1 ? "Y" : "N"); }
+void test_defer_compound_literal(void)
+{
+    log_reset();
+    {
+        defer takes_arr((const int[]){1, 2, 3});
+        log_append("1");
+    }
+    log_append("E");
+    // Expected: 1YE
+}
+
+// Test 69: Early return skips later defers (verification)
+void test_early_return_skips_later(void)
+{
+    log_reset();
+    defer log_append("A");
+    log_append("1");
+    if (1)
+        return;
+    defer log_append("B"); // Never reached, never registered
+    log_append("X");
+    // Expected: 1A (B is never registered)
+}
+
+// Test 70: Defer with file/line macros
+void test_defer_with_macros(void)
+{
+    log_reset();
+    {
+        int line = __LINE__;
+        defer log_append(line > 0 ? "Y" : "N");
+        log_append("1");
+    }
+    log_append("E");
+    // Expected: 1YE
+}
+
+// Test 71: Multi-line defer with parenthesized expression
+void test_defer_multiline_parens(void)
+{
+    log_reset();
+    {
+        defer log_append(
+            "A");
+        log_append("1");
+    }
+    log_append("E");
+    // Expected: 1AE
+}
+
+// Test 72: Multi-line defer with brackets (array access)
+static const char *msgs[] = {"X", "Y", "Z"};
+void test_defer_multiline_brackets(void)
+{
+    log_reset();
+    {
+        defer log_append(msgs[1]);
+        log_append("1");
+    }
+    log_append("E");
+    // Expected: 1YE
+}
+
+// Test 73: Control flow inside compound defer block
+void test_defer_with_control_flow(void)
+{
+    log_reset();
+    int x = 1;
+    {
+        defer
+        {
+            if (x)
+                log_append("A");
+            else
+                log_append("B");
+        };
+        log_append("1");
+    }
+    log_append("E");
+    // x=1 so defer runs "A"
+    // Expected: 1AE
+}
+
+// Test 74: Defer with loop inside compound block
+void test_defer_with_loop_inside(void)
+{
+    log_reset();
+    {
+        defer
+        {
+            for (int i = 0; i < 3; i++)
+                log_append("X");
+        };
+        log_append("1");
+    }
+    log_append("E");
+    // Expected: 1XXXE
+}
+
+// Test 75: Continue in switch without braces (braceless case with defer)
+void test_continue_switch_braceless(void)
+{
+    log_reset();
+    for (int i = 0; i < 3; i++)
+    {
+        switch (i)
+        {
+        case 0:
+            defer log_append("A"); // No braces - defer in switch scope
+            log_append("0");
+            continue; // Should trigger A before continuing
+        case 1:
+            log_append("1");
+            break;
+        case 2:
+            log_append("2");
+            break;
+        }
+        log_append("X");
+    }
+    log_append("E");
+    // i=0: 0, A (continue), no X
+    // i=1: 1, X
+    // i=2: 2, X
+    // Expected: 0A1X2XE
+}
+
 // Main - run all tests
 
 int main(void)
@@ -1524,6 +1807,106 @@ int main(void)
     test_multiple_bitfield_collision();
     total++;
     passed += check_log("1BA23", "test_multiple_bitfield_collision");
+
+    // Test 59: Conditional defer registration
+    test_conditional_defer(1);
+    total++;
+    passed += check_log("D1", "test_conditional_defer(1)");
+    test_conditional_defer(0);
+    total++;
+    passed += check_log("1", "test_conditional_defer(0)");
+
+    // Test 60: Defer in macro
+    test_defer_in_macro();
+    total++;
+    passed += check_log("1ME", "test_defer_in_macro");
+
+    // Test 61: Multiple defers same line
+    test_multiple_defers_same_line();
+    total++;
+    passed += check_log("1BAE", "test_multiple_defers_same_line");
+
+    // Test 62: Defer capture timing
+    test_defer_capture_timing();
+    total++;
+    passed += check_log("1Y", "test_defer_capture_timing");
+
+    // Test 63: Recursive defer (stack isolation)
+    log_reset();
+    recursion_count = 0;
+    test_recursive_defer(3);
+    total++;
+    if (recursion_count == 3 && strcmp(log_buffer, "RRR") == 0)
+    {
+        printf("[PASS] test_recursive_defer\n");
+        passed++;
+    }
+    else
+    {
+        printf("[FAIL] test_recursive_defer\n");
+        printf("  Expected: count=3, log='RRR'\n");
+        printf("  Got:      count=%d, log='%s'\n", recursion_count, log_buffer);
+    }
+
+    // Test 64: Defer with function pointer
+    test_defer_function_pointer();
+    total++;
+    passed += check_log("1PE", "test_defer_function_pointer");
+
+    // Test 65: Do-while continue defer
+    test_do_while_continue_defer();
+    total++;
+    passed += check_log("LDCDLDE", "test_do_while_continue_defer");
+
+    // Test 66: Anonymous struct bitfield collision
+    test_anon_struct_bitfield();
+    total++;
+    passed += check_log("1A23", "test_anon_struct_bitfield");
+
+    // Test 67: Union bitfield collision
+    test_union_bitfield_collision();
+    total++;
+    passed += check_log("1A2", "test_union_bitfield_collision");
+
+    // Test 68: Defer with compound literal
+    test_defer_compound_literal();
+    total++;
+    passed += check_log("1YE", "test_defer_compound_literal");
+
+    // Test 69: Early return skips later defers
+    test_early_return_skips_later();
+    total++;
+    passed += check_log("1A", "test_early_return_skips_later");
+
+    // Test 70: Defer with __LINE__ macro
+    test_defer_with_macros();
+    total++;
+    passed += check_log("1YE", "test_defer_with_macros");
+
+    // Test 71: Multi-line defer with parentheses
+    test_defer_multiline_parens();
+    total++;
+    passed += check_log("1AE", "test_defer_multiline_parens");
+
+    // Test 72: Multi-line defer with brackets
+    test_defer_multiline_brackets();
+    total++;
+    passed += check_log("1YE", "test_defer_multiline_brackets");
+
+    // Test 73: Control flow inside compound defer
+    test_defer_with_control_flow();
+    total++;
+    passed += check_log("1AE", "test_defer_with_control_flow");
+
+    // Test 74: Loop inside compound defer
+    test_defer_with_loop_inside();
+    total++;
+    passed += check_log("1XXXE", "test_defer_with_loop_inside");
+
+    // Test 75: Continue in braceless switch with defer
+    test_continue_switch_braceless();
+    total++;
+    passed += check_log("0A1X2XE", "test_continue_switch_braceless");
 
     printf("\n=== Results: %d/%d tests passed ===\n", passed, total);
     return (passed == total) ? 0 : 1;
