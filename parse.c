@@ -41,6 +41,15 @@
 #include <unistd.h>
 #include <libgen.h>
 
+#ifdef __APPLE__
+#include <sys/syslimits.h>
+#endif
+
+// Fallback for PATH_MAX (should rarely be needed)
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
 #ifndef __GNUC__
 #define __attribute__(x)
 #endif
@@ -210,8 +219,29 @@ static void pp_add_default_include_paths(void)
     struct stat st;
 
 #ifdef __APPLE__
+    // macOS: Get Clang resource dir for built-in headers (stdarg.h, etc.)
+    FILE *fp = popen("clang -print-resource-dir 2>/dev/null", "r");
+    if (fp)
+    {
+        char clang_dir[PATH_MAX];
+        if (fgets(clang_dir, sizeof(clang_dir), fp))
+        {
+            size_t len = strlen(clang_dir);
+            if (len > 0 && clang_dir[len - 1] == '\n')
+                clang_dir[len - 1] = '\0';
+
+            char *include_path = malloc(PATH_MAX);
+            snprintf(include_path, PATH_MAX, "%s/include", clang_dir);
+            if (stat(include_path, &st) == 0)
+                pp_add_include_path(include_path);
+            else
+                free(include_path);
+        }
+        pclose(fp);
+    }
+
     // macOS: Get SDK path from xcrun
-    FILE *fp = popen("xcrun --show-sdk-path 2>/dev/null", "r");
+    fp = popen("xcrun --show-sdk-path 2>/dev/null", "r");
     if (fp)
     {
         char sdk_path[PATH_MAX];
@@ -2050,6 +2080,29 @@ static int64_t eval_primary(Token **rest, Token *tok)
         return tok->val;
     }
 
+    // Handle 'defined' operator (can appear after macro expansion)
+    if (tok->kind == TK_IDENT && equal(tok, "defined"))
+    {
+        tok = tok->next;
+        bool has_paren = equal(tok, "(");
+        if (has_paren)
+            tok = tok->next;
+        // If the argument was already macro-expanded to a non-identifier,
+        // this is technically undefined behavior per C standard.
+        // We treat it as "not defined" (return 0).
+        int64_t result = 0;
+        if (tok->kind == TK_IDENT)
+        {
+            Macro *m = find_macro(tok);
+            result = m ? 1 : 0;
+        }
+        tok = tok->next;
+        if (has_paren && equal(tok, ")"))
+            tok = tok->next;
+        *rest = tok;
+        return result;
+    }
+
     // Undefined identifier is zero
     *rest = tok->next;
     return 0;
@@ -2335,6 +2388,61 @@ static Token *read_const_expr(Token **rest, Token *tok)
                 tok = skip(tok, ")");
 
             cur = cur->next = new_num_token(m ? 1 : 0, def);
+            continue;
+        }
+
+        // Handle __has_include(<file>) or __has_include("file")
+        if (equal(tok, "__has_include") || equal(tok, "__has_include_next"))
+        {
+            Token *start_tok = tok;
+            tok = tok->next;
+            tok = skip(tok, "(");
+
+            // Read the filename - can be <...> or "..."
+            bool found = false;
+            if (equal(tok, "<"))
+            {
+                // Angle bracket include
+                char *filename = NULL;
+                Token *start_bracket = tok;
+                tok = tok->next;
+                // Collect tokens until >
+                while (!equal(tok, ">") && !tok->at_bol)
+                {
+                    if (!filename)
+                        filename = format("%.*s", tok->len, tok->loc);
+                    else
+                        filename = format("%s%.*s", filename, tok->len, tok->loc);
+                    tok = tok->next;
+                }
+                if (equal(tok, ">"))
+                    tok = tok->next;
+                if (filename)
+                {
+                    char *path = search_include_paths(filename);
+                    found = (path != NULL);
+                    if (path)
+                        free(path);
+                }
+            }
+            else if (tok->kind == TK_STR)
+            {
+                // Quoted include
+                char *filename = strndup(tok->loc + 1, tok->len - 2);
+                tok = tok->next;
+                struct stat st;
+                found = (stat(filename, &st) == 0);
+                if (!found)
+                {
+                    char *path = search_include_paths(filename);
+                    found = (path != NULL);
+                    if (path)
+                        free(path);
+                }
+                free(filename);
+            }
+            tok = skip(tok, ")");
+            cur = cur->next = new_num_token(found ? 1 : 0, start_tok);
             continue;
         }
 
@@ -2630,6 +2738,14 @@ void pp_define_macro(char *name, char *val)
     add_macro(name, true, tok);
 }
 
+// Define a full macro (supports function-like macros)
+// Usage: pp_define_full("__has_feature(x) 0")
+static void pp_define_full(char *def)
+{
+    Token *tok = tokenize(new_file("<built-in>", 0, format("%s\n", def)));
+    read_macro_definition(&tok, tok);
+}
+
 // Reset preprocessor state - call before processing a new file to avoid state leakage
 void pp_reset(void)
 {
@@ -2674,6 +2790,17 @@ void pp_init(void)
     pp_define_macro("__GNUC_MINOR__", "0");
     pp_define_macro("__GNUC_PATCHLEVEL__", "0");
     pp_define_macro("__GNUC_STDC_INLINE__", "1");
+    // GCC version checking macro (used by many headers)
+    pp_define_full("__GNUC_PREREQ(maj,min) ((__GNUC__ << 16) + __GNUC_MINOR__ >= ((maj) << 16) + (min))");
+
+#ifdef __APPLE__
+    // On Apple, also define clang macros since headers may check for them
+    pp_define_macro("__clang__", "1");
+    pp_define_macro("__clang_major__", "15");
+    pp_define_macro("__clang_minor__", "0");
+    pp_define_macro("__clang_patchlevel__", "0");
+    pp_define_macro("__apple_build_version__", "15000000");
+#endif
 
     // GNU C extensions - just make them empty/passthrough
     pp_define_macro("__extension__", "");
@@ -2686,6 +2813,17 @@ void pp_init(void)
     pp_define_macro("__asm__", "asm");
     pp_define_macro("__asm", "asm");
     pp_define_macro("__typeof__", "typeof");
+
+    // Clang/GCC feature detection macros (function-like)
+    // These return 0 to disable feature detection - safe fallback
+    pp_define_full("__has_feature(x) 0");
+    pp_define_full("__has_extension(x) 0");
+    pp_define_full("__has_builtin(x) 0");
+    pp_define_full("__has_attribute(x) 0");
+    pp_define_full("__has_warning(x) 0");
+    pp_define_full("__has_c_attribute(x) 0");
+    // __has_include is handled specially in read_const_expr - don't define it here
+    pp_define_full("__building_module(x) 0");
 
     // Byte order
     pp_define_macro("__BYTE_ORDER__", "1234");
@@ -2712,6 +2850,113 @@ void pp_init(void)
 #elif defined(__APPLE__)
     pp_define_macro("__APPLE__", "1");
     pp_define_macro("__MACH__", "1");
+    // Apple SDK version macros - needed for secure headers
+    // Use high values to enable modern features
+    pp_define_macro("__MAC_OS_X_VERSION_MIN_REQUIRED", "140000"); // macOS 14.0
+    pp_define_macro("__MAC_OS_X_VERSION_MAX_ALLOWED", "150000");
+    pp_define_macro("__IPHONE_OS_VERSION_MIN_REQUIRED", "0"); // Not iOS
+    pp_define_macro("__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__", "140000");
+    // Darwin feature level - set to FULL to get all definitions
+    pp_define_macro("__DARWIN_C_FULL", "900000L");
+    pp_define_macro("__DARWIN_C_LEVEL", "900000L"); // Must be >= __DARWIN_C_FULL
+    // BSD/POSIX compatibility
+    pp_define_macro("__DARWIN_UNIX03", "1");
+    pp_define_macro("__DARWIN_64_BIT_INO_T", "1");
+    pp_define_macro("__DARWIN_ONLY_64_BIT_INO_T", "1");
+    pp_define_macro("__DARWIN_ONLY_UNIX_CONFORMANCE", "1");
+    pp_define_macro("__DARWIN_ONLY_VERS_1050", "1");
+    pp_define_macro("_DARWIN_FEATURE_64_BIT_INODE", "1");
+    pp_define_macro("_DARWIN_FEATURE_ONLY_UNIX_CONFORMANCE", "1");
+    pp_define_macro("_DARWIN_FEATURE_UNIX_CONFORMANCE", "3");
+    // Standard C feature macros
+    pp_define_macro("__STDC_WANT_LIB_EXT1__", "1");
+    // Availability/deprecation macros
+    pp_define_macro("__API_TO_BE_DEPRECATED", "100000");
+    pp_define_macro("__API_TO_BE_DEPRECATED_MACOS", "100000");
+
+    // Apple availability attributes - make them expand to nothing
+    // These are used for API versioning and would break compilation otherwise
+    pp_define_full("__API_AVAILABLE(...) ");
+    pp_define_full("__API_UNAVAILABLE(...) ");
+    pp_define_full("__API_DEPRECATED(...) ");
+    pp_define_full("__API_DEPRECATED_WITH_REPLACEMENT(...) ");
+    pp_define_full("__OSX_AVAILABLE(...) ");
+    pp_define_full("__IOS_AVAILABLE(...) ");
+    pp_define_full("__TVOS_AVAILABLE(...) ");
+    pp_define_full("__WATCHOS_AVAILABLE(...) ");
+    pp_define_full("__OSX_AVAILABLE_STARTING(...) ");
+    pp_define_full("__OSX_AVAILABLE_BUT_DEPRECATED(...) ");
+    pp_define_full("__OSX_DEPRECATED(...) ");
+    pp_define_full("__IOS_PROHIBITED ");
+    pp_define_full("__TVOS_PROHIBITED ");
+    pp_define_full("__WATCHOS_PROHIBITED ");
+    pp_define_macro("__OSX_EXTENSION_UNAVAILABLE", "");
+    pp_define_macro("__IOS_EXTENSION_UNAVAILABLE", "");
+    // Older-style availability (single underscore prefix)
+    pp_define_full("_API_AVAILABLE(...) ");
+    // Swift-related
+    pp_define_full("__SWIFT_UNAVAILABLE_MSG(...) ");
+    pp_define_macro("__SWIFT_UNAVAILABLE", "");
+    // Disable the internal availability macro system entirely
+    pp_define_macro("__ENABLE_LEGACY_IPHONE_AVAILABILITY", "0");
+    pp_define_macro("__ENABLE_LEGACY_MAC_AVAILABILITY", "0");
+    // Define internal availability macros as empty (there are hundreds, so use common ones)
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_2_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_2_1", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_2_2", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_3_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_3_1", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_3_2", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_4_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_4_1", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_4_2", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_4_3", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_5_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_5_1", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_6_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_6_1", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_7_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_7_1", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_8_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_8_1", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_8_2", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_8_3", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_8_4", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_9_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_9_1", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_9_2", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_9_3", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_10_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_10_1", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_10_2", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_10_3", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_11_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_12_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_13_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_14_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_15_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_16_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_17_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_1", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_2", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_3", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_4", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_5", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_6", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_7", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_8", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_9", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_10", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_11", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_12", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_13", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_14", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_15", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_11_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_12_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_13_0", "");
+    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_14_0", "");
 #elif defined(_WIN32)
     pp_define_macro("_WIN32", "1");
 #endif
@@ -2721,8 +2966,11 @@ void pp_init(void)
     pp_define_macro("__x86_64", "1");
     pp_define_macro("__amd64__", "1");
     pp_define_macro("__amd64", "1");
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(__arm64__)
     pp_define_macro("__aarch64__", "1");
+    pp_define_macro("__arm64__", "1"); // Apple uses this name
+#elif defined(__arm__)
+    pp_define_macro("__arm__", "1");
 #elif defined(__i386__)
     pp_define_macro("__i386__", "1");
     pp_define_macro("__i386", "1");
