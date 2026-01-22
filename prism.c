@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.24.0"
+#define VERSION "0.25.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -94,6 +94,25 @@ static int control_paren_depth = 0;       // Track parens to distinguish for(;;)
 
 // Label table for current function (for goto handling)
 static LabelTable label_table;
+
+// Track if current function returns void (for return statement handling)
+static bool current_func_returns_void = false;
+
+// Track statement boundaries for zero-init (moved to static for helper access)
+static bool at_stmt_start = false;
+
+// Helper: call this when a handler consumes a semicolon and continues
+// This ensures state is consistent as if the main loop saw the ';'
+static void end_statement_after_semicolon(void)
+{
+  at_stmt_start = true;
+  if (pending_control_flow && control_paren_depth == 0)
+  {
+    pending_control_flow = false;
+    next_scope_is_loop = false;
+    next_scope_is_switch = false;
+  }
+}
 
 static void defer_push_scope(void)
 {
@@ -288,29 +307,44 @@ static bool has_active_defers(void)
 }
 
 // Check if break needs to emit defers
+// Only returns true if there are defers between current scope and the loop/switch
 static bool break_has_defers(void)
 {
+  bool found_loop_or_switch = false;
+  bool found_defers = false;
   for (int d = defer_depth - 1; d >= 0; d--)
   {
     if (defer_stack[d].count > 0)
-      return true;
+      found_defers = true;
     if (defer_stack[d].is_loop || defer_stack[d].is_switch)
+    {
+      found_loop_or_switch = true;
       break;
+    }
   }
-  return false;
+  // Only emit defers if we found the loop/switch boundary
+  // (braceless loops don't have a scope marked as loop, so we shouldn't emit)
+  return found_loop_or_switch && found_defers;
 }
 
 // Check if continue needs to emit defers
+// Only returns true if there are defers between current scope and the loop
 static bool continue_has_defers(void)
 {
+  bool found_loop = false;
+  bool found_defers = false;
   for (int d = defer_depth - 1; d >= 0; d--)
   {
     if (defer_stack[d].count > 0)
-      return true;
+      found_defers = true;
     if (defer_stack[d].is_loop)
+    {
+      found_loop = true;
       break;
+    }
   }
-  return false;
+  // Only emit defers if we found the loop boundary
+  return found_loop && found_defers;
 }
 // Label tracking for goto
 static void label_table_reset(void)
@@ -834,7 +868,9 @@ static int transpile(char *input_file, char *output_file)
   next_scope_is_switch = false;
   pending_control_flow = false;
   control_paren_depth = 0;
-  bool at_stmt_start = false; // Track if we're at start of a statement
+  current_func_returns_void = false;
+  at_stmt_start = false;               // Reset static - track if we're at start of a statement
+  bool next_func_returns_void = false; // Track void functions at top level
 
   // Walk tokens and emit
   while (tok->kind != TK_EOF)
@@ -878,6 +914,7 @@ static int transpile(char *input_file, char *output_file)
         tok = stmt_end->next;
       else
         tok = stmt_end;
+      end_statement_after_semicolon();
       continue;
     }
 
@@ -900,27 +937,49 @@ static int transpile(char *input_file, char *output_file)
         }
         else
         {
-          // return with expression: { __auto_type _ret = (expr); defers; return _ret; }
-          static int ret_counter = 0;
-          int my_ret = ret_counter++;
-          fprintf(out, " { __auto_type _prism_ret_%d = (", my_ret);
-
-          // Emit expression until semicolon
-          while (tok->kind != TK_EOF && !equal(tok, ";"))
+          // return with expression
+          if (current_func_returns_void)
           {
-            emit_tok(tok);
-            tok = tok->next;
+            // void function: { (expr); defers; return; }
+            // The expression is executed for side effects, then we return void
+            fprintf(out, " { (");
+            while (tok->kind != TK_EOF && !equal(tok, ";"))
+            {
+              emit_tok(tok);
+              tok = tok->next;
+            }
+            fprintf(out, ");");
+            emit_all_defers();
+            fprintf(out, " return;");
+            if (equal(tok, ";"))
+              tok = tok->next;
+            fprintf(out, " }");
           }
+          else
+          {
+            // non-void function: { __auto_type _ret = (expr); defers; return _ret; }
+            static int ret_counter = 0;
+            int my_ret = ret_counter++;
+            fprintf(out, " { __auto_type _prism_ret_%d = (", my_ret);
 
-          fprintf(out, ");");
-          emit_all_defers();
-          fprintf(out, " return _prism_ret_%d;", my_ret);
+            // Emit expression until semicolon
+            while (tok->kind != TK_EOF && !equal(tok, ";"))
+            {
+              emit_tok(tok);
+              tok = tok->next;
+            }
 
-          if (equal(tok, ";"))
-            tok = tok->next;
+            fprintf(out, ");");
+            emit_all_defers();
+            fprintf(out, " return _prism_ret_%d;", my_ret);
 
-          fprintf(out, " }");
+            if (equal(tok, ";"))
+              tok = tok->next;
+
+            fprintf(out, " }");
+          }
         }
+        end_statement_after_semicolon();
         continue;
       }
       // No defers, emit normally
@@ -938,6 +997,7 @@ static int transpile(char *input_file, char *output_file)
         // Skip the semicolon
         if (equal(tok, ";"))
           tok = tok->next;
+        end_statement_after_semicolon();
         continue;
       }
       // No defers, emit normally
@@ -955,6 +1015,7 @@ static int transpile(char *input_file, char *output_file)
         // Skip the semicolon
         if (equal(tok, ";"))
           tok = tok->next;
+        end_statement_after_semicolon();
         continue;
       }
       // No defers, emit normally
@@ -993,6 +1054,7 @@ static int transpile(char *input_file, char *output_file)
             tok = tok->next;
           }
           fprintf(out, " }");
+          end_statement_after_semicolon();
           continue;
         }
       }
@@ -1051,6 +1113,134 @@ static int transpile(char *input_file, char *output_file)
     {
       // At top level, this is likely a function body - scan for labels
       scan_labels_in_function(tok);
+      // Set the void return flag from what we detected
+      current_func_returns_void = next_func_returns_void;
+      next_func_returns_void = false;
+    }
+
+    // Detect void function definitions at top level
+    // Handles: void func(, static void func(, __attribute__((...)) void func(, etc.
+    // This sets next_func_returns_void for when we enter the function body
+    if (defer_depth == 0 && equal(tok, "void"))
+    {
+      Token *t = tok->next;
+      // Skip pointers (void *func is not void-returning)
+      if (t && equal(t, "*"))
+      {
+        // void* - not a void function
+      }
+      else
+      {
+        // Skip attributes and qualifiers after void
+        while (t && (equal(t, "__attribute__") || equal(t, "__declspec") ||
+                     equal(t, "const") || equal(t, "volatile") ||
+                     equal(t, "__restrict") || equal(t, "__restrict__")))
+        {
+          if (equal(t, "__attribute__") || equal(t, "__declspec"))
+          {
+            t = t->next;
+            // Skip ((...))
+            if (t && equal(t, "("))
+            {
+              int paren_depth = 1;
+              t = t->next;
+              while (t && paren_depth > 0)
+              {
+                if (equal(t, "("))
+                  paren_depth++;
+                else if (equal(t, ")"))
+                  paren_depth--;
+                t = t->next;
+              }
+            }
+          }
+          else
+          {
+            t = t->next;
+          }
+        }
+        // Now t should be at the function name
+        if (t && t->kind == TK_IDENT)
+        {
+          Token *after_name = t->next;
+          if (after_name && equal(after_name, "("))
+          {
+            // This looks like: void [attrs] func_name( - it's a void function
+            next_func_returns_void = true;
+          }
+        }
+      }
+    }
+
+    // Also detect void after specifiers: static void, inline void, extern void
+    if (defer_depth == 0 && (equal(tok, "static") || equal(tok, "inline") ||
+                             equal(tok, "extern") || equal(tok, "_Noreturn") ||
+                             equal(tok, "__inline") || equal(tok, "__inline__")))
+    {
+      // Look ahead for void
+      Token *t = tok->next;
+      // Skip more specifiers
+      while (t && (equal(t, "static") || equal(t, "inline") || equal(t, "extern") ||
+                   equal(t, "_Noreturn") || equal(t, "__inline") || equal(t, "__inline__") ||
+                   equal(t, "__attribute__") || equal(t, "__declspec")))
+      {
+        if (equal(t, "__attribute__") || equal(t, "__declspec"))
+        {
+          t = t->next;
+          if (t && equal(t, "("))
+          {
+            int paren_depth = 1;
+            t = t->next;
+            while (t && paren_depth > 0)
+            {
+              if (equal(t, "("))
+                paren_depth++;
+              else if (equal(t, ")"))
+                paren_depth--;
+              t = t->next;
+            }
+          }
+        }
+        else
+        {
+          t = t->next;
+        }
+      }
+      // Now check if we're at void
+      if (t && equal(t, "void"))
+      {
+        t = t->next;
+        // Skip pointers
+        if (t && !equal(t, "*"))
+        {
+          // Skip attributes after void
+          while (t && (equal(t, "__attribute__") || equal(t, "__declspec")))
+          {
+            t = t->next;
+            if (t && equal(t, "("))
+            {
+              int paren_depth = 1;
+              t = t->next;
+              while (t && paren_depth > 0)
+              {
+                if (equal(t, "("))
+                  paren_depth++;
+                else if (equal(t, ")"))
+                  paren_depth--;
+                t = t->next;
+              }
+            }
+          }
+          if (t && t->kind == TK_IDENT)
+          {
+            Token *after_name = t->next;
+            if (after_name && equal(after_name, "("))
+            {
+              next_func_returns_void = true;
+            }
+          }
+        }
+      }
     }
 
     // Track struct/union/enum to avoid zero-init inside them
