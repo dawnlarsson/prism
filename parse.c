@@ -41,6 +41,12 @@
 #include <unistd.h>
 #include <libgen.h>
 
+#ifndef _WIN32
+#include <sys/wait.h>
+#else
+#include <process.h>
+#endif
+
 #ifdef __APPLE__
 #include <sys/syslimits.h>
 #endif
@@ -152,8 +158,19 @@ static Type *ty_uint = &ty_uint_val;
 static Type *array_of(Type *base, int len)
 {
     Type *ty = calloc(1, sizeof(Type));
+    if (!ty)
+    {
+        fprintf(stderr, "out of memory in array_of\n");
+        exit(1);
+    }
     ty->kind = TY_ARRAY;
     ty->base = base;
+    // Check for integer overflow
+    if (len > 0 && base->size > INT_MAX / len)
+    {
+        fprintf(stderr, "array size overflow\n");
+        exit(1);
+    }
     ty->size = base->size * len;
     ty->array_len = len;
     return ty;
@@ -175,7 +192,13 @@ static void pp_add_include_path(const char *path)
         exit(1);
     }
     pp_include_paths = new_paths;
-    pp_include_paths[pp_include_paths_count++] = strdup(path);
+    char *dup = strdup(path);
+    if (!dup)
+    {
+        fprintf(stderr, "out of memory duplicating include path\n");
+        exit(1);
+    }
+    pp_include_paths[pp_include_paths_count++] = dup;
 }
 
 // Helper to find GCC include path by scanning directories
@@ -322,12 +345,30 @@ static void strarray_push(StringArray *arr, char *s)
     if (!arr->data)
     {
         arr->data = calloc(8, sizeof(char *));
+        if (!arr->data)
+        {
+            fprintf(stderr, "out of memory in strarray_push\n");
+            exit(1);
+        }
         arr->capacity = 8;
     }
     if (arr->capacity == arr->len)
     {
-        arr->data = realloc(arr->data, sizeof(char *) * arr->capacity * 2);
-        arr->capacity *= 2;
+        // Check for overflow before doubling
+        if (arr->capacity > SIZE_MAX / (sizeof(char *) * 2))
+        {
+            fprintf(stderr, "strarray capacity overflow\n");
+            exit(1);
+        }
+        size_t new_cap = arr->capacity * 2;
+        char **new_data = realloc(arr->data, sizeof(char *) * new_cap);
+        if (!new_data)
+        {
+            fprintf(stderr, "out of memory in strarray_push\n");
+            exit(1);
+        }
+        arr->data = new_data;
+        arr->capacity = new_cap;
     }
     arr->data[arr->len++] = s;
 }
@@ -2413,15 +2454,20 @@ static Token *read_const_expr(Token **rest, Token *tok)
             {
                 // Angle bracket include
                 char *filename = NULL;
-                Token *start_bracket = tok;
                 tok = tok->next;
                 // Collect tokens until >
-                while (!equal(tok, ">") && !tok->at_bol)
+                while (!equal(tok, ">") && !tok->at_bol && tok->kind != TK_EOF)
                 {
                     if (!filename)
+                    {
                         filename = format("%.*s", tok->len, tok->loc);
+                    }
                     else
+                    {
+                        char *old = filename;
                         filename = format("%s%.*s", filename, tok->len, tok->loc);
+                        free(old);
+                    }
                     tok = tok->next;
                 }
                 if (equal(tok, ">"))
@@ -2432,6 +2478,7 @@ static Token *read_const_expr(Token **rest, Token *tok)
                     found = (path != NULL);
                     if (path)
                         free(path);
+                    free(filename);
                 }
             }
             else if (tok->kind == TK_STR)

@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.28.0"
+#define VERSION "0.29.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -86,6 +86,18 @@ typedef struct
 
 static DeferScope defer_stack[MAX_DEFER_DEPTH];
 static int defer_depth = 0;
+
+// Temp file path for cleanup on error exit
+static char *pending_temp_file = NULL;
+
+static void cleanup_temp_file(void)
+{
+  if (pending_temp_file && pending_temp_file[0])
+  {
+    remove(pending_temp_file);
+    pending_temp_file = NULL;
+  }
+}
 
 // Track pending loop/switch for next scope
 static bool next_scope_is_loop = false;
@@ -563,14 +575,62 @@ static Token *goto_skips_defer(Token *goto_tok, char *label_name, int label_len)
     tok = tok->next;
 
   int depth = 0;
+  int local_struct_depth = 0;  // Track struct/union/enum bodies for bitfield filtering
   Token *active_defer = NULL;  // Most recently seen defer that's still "in scope"
   int active_defer_depth = -1; // Depth at which active_defer was found
+  Token *prev = NULL;
 
   while (tok && tok->kind != TK_EOF)
   {
+    // Track struct/union/enum bodies to skip bitfield declarations
+    if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum"))
+    {
+      // Look ahead for '{' to detect struct body
+      Token *t = tok->next;
+      while (t && (t->kind == TK_IDENT || equal(t, "__attribute__")))
+      {
+        if (equal(t, "__attribute__"))
+        {
+          t = t->next;
+          if (t && equal(t, "("))
+          {
+            int paren_depth = 1;
+            t = t->next;
+            while (t && paren_depth > 0)
+            {
+              if (equal(t, "("))
+                paren_depth++;
+              else if (equal(t, ")"))
+                paren_depth--;
+              t = t->next;
+            }
+          }
+        }
+        else
+        {
+          t = t->next;
+        }
+      }
+      if (t && equal(t, "{"))
+      {
+        // Skip to the opening brace
+        while (tok != t)
+        {
+          prev = tok;
+          tok = tok->next;
+        }
+        local_struct_depth++;
+        depth++;
+        prev = tok;
+        tok = tok->next;
+        continue;
+      }
+    }
+
     if (equal(tok, "{"))
     {
       depth++;
+      prev = tok;
       tok = tok->next;
       continue;
     }
@@ -583,9 +643,12 @@ static Token *goto_skips_defer(Token *goto_tok, char *label_name, int label_len)
         active_defer = NULL;
         active_defer_depth = -1;
       }
+      if (local_struct_depth > 0)
+        local_struct_depth--;
       if (depth == 0)
         break; // End of containing scope, label not found here
       depth--;
+      prev = tok;
       tok = tok->next;
       continue;
     }
@@ -601,14 +664,25 @@ static Token *goto_skips_defer(Token *goto_tok, char *label_name, int label_len)
       }
     }
 
-    // Found the label?
+    // Found the label? Apply same filtering as scan_labels_in_function
     if (is_label(tok) && tok->len == label_len &&
         !memcmp(tok->loc, label_name, label_len))
     {
-      // If we have an active defer, we're jumping past it into its scope = error
-      return active_defer;
+      Token *colon = tok->next;
+      // Filter out false positives:
+      bool is_scope_resolution = colon->next && equal(colon->next, ":");
+      bool is_ternary = prev && equal(prev, "?");
+      bool is_switch_case = prev && (equal(prev, "case") || equal(prev, "default"));
+      bool is_bitfield = local_struct_depth > 0;
+
+      if (!is_scope_resolution && !is_ternary && !is_switch_case && !is_bitfield)
+      {
+        // Real label found - if we have an active defer, we're jumping past it
+        return active_defer;
+      }
     }
 
+    prev = tok;
     tok = tok->next;
   }
 
@@ -824,9 +898,19 @@ static Token *try_zero_init_decl(Token *tok)
       tok = skip_balanced(tok, "[", "]");
   }
 
-  // Multiple declarators? Too complex for now
+  // Multiple declarators? Too complex - warn user once
   if (equal(tok, ","))
+  {
+    static bool warned_multi_decl = false;
+    if (!warned_multi_decl)
+    {
+      fprintf(stderr, "prism: note: multi-declarator '%.*s, ...' not zero-initialized "
+                      "(split into separate declarations for auto-init)\n",
+              var_name->len, var_name->loc);
+      warned_multi_decl = true;
+    }
     return NULL;
+  }
 
   // Already has initializer?
   if (equal(tok, "="))
@@ -890,6 +974,7 @@ static int transpile(char *input_file, char *output_file)
   current_func_returns_void = false;
   at_stmt_start = false;               // Reset static - track if we're at start of a statement
   bool next_func_returns_void = false; // Track void functions at top level
+  Token *prev_toplevel_tok = NULL;     // Track previous token at top level for function detection
 
   // Walk tokens and emit
   while (tok->kind != TK_EOF)
@@ -924,6 +1009,37 @@ static int transpile(char *input_file, char *output_file)
       // Find the statement (up to semicolon)
       Token *stmt_start = tok;
       Token *stmt_end = skip_to_semicolon(tok);
+
+      // Error if semicolon not found (ran to EOF or end of block)
+      if (stmt_end->kind == TK_EOF || !equal(stmt_end, ";"))
+        error_tok(defer_keyword, "unterminated defer statement; expected ';'");
+
+      // Validate defer statement doesn't contain control flow keywords
+      // (which would indicate the semicolon came from a different statement)
+      int brace_depth = 0;
+      for (Token *t = stmt_start; t != stmt_end && t->kind != TK_EOF; t = t->next)
+      {
+        // Check at_bol BEFORE updating brace_depth, skip for { and } tokens themselves
+        // But allow multi-line when inside braces (compound statement)
+        if (t != stmt_start && t->at_bol && brace_depth == 0 && !equal(t, "{"))
+        {
+          error_tok(defer_keyword,
+                    "defer statement spans multiple lines without ';' - add semicolon");
+        }
+        if (equal(t, "{")) brace_depth++;
+        else if (equal(t, "}")) brace_depth--;
+        if (t->kind == TK_KEYWORD &&
+            (equal(t, "return") || equal(t, "break") || equal(t, "continue") ||
+             equal(t, "goto") || equal(t, "if") || equal(t, "else") ||
+             equal(t, "for") || equal(t, "while") || equal(t, "do") ||
+             equal(t, "switch") || equal(t, "case") || equal(t, "default") ||
+             equal(t, "defer")))
+        {
+          error_tok(defer_keyword,
+                    "defer statement appears to be missing ';' (found '%.*s' keyword inside)",
+                    t->len, t->loc);
+        }
+      }
 
       // Record the defer
       defer_add(defer_keyword, stmt_start, stmt_end);
@@ -1050,6 +1166,7 @@ static int transpile(char *input_file, char *output_file)
     // Handle 'goto' - emit defers for scopes being exited
     if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "goto"))
     {
+      mark_switch_control_exit(); // Mark that we exited via goto (like break/return)
       Token *goto_tok = tok;
       tok = tok->next; // skip 'goto'
 
@@ -1138,13 +1255,17 @@ static int transpile(char *input_file, char *output_file)
 
     // Detect function definition and scan for labels
     // Pattern: identifier '(' ... ')' '{'
-    // We detect this when we see '{' after ')' at depth 0
+    // Only trigger when previous token at top level was ')' (end of parameter list)
     if (feature_defer && equal(tok, "{") && defer_depth == 0)
     {
-      // At top level, this is likely a function body - scan for labels
-      scan_labels_in_function(tok);
-      // Set the void return flag from what we detected
-      current_func_returns_void = next_func_returns_void;
+      // Only scan for labels if this looks like a function body (prev token is ')')
+      // This avoids false positives from: int arr[] = {1,2,3}; or compound literals
+      if (prev_toplevel_tok && equal(prev_toplevel_tok, ")"))
+      {
+        scan_labels_in_function(tok);
+        // Set the void return flag from what we detected
+        current_func_returns_void = next_func_returns_void;
+      }
       next_func_returns_void = false;
     }
 
@@ -1370,6 +1491,10 @@ static int transpile(char *input_file, char *output_file)
     if (equal(tok, ";") && !pending_control_flow)
       at_stmt_start = true;
 
+    // Track previous token at top level for function detection
+    if (defer_depth == 0)
+      prev_toplevel_tok = tok;
+
     // Default: emit token as-is
     emit_tok(tok);
     tok = tok->next;
@@ -1489,6 +1614,180 @@ static char *shell_escape(const char *s)
   return result;
 #endif
 }
+
+// Maximum arguments for run_command
+#define MAX_ARGS 128
+
+// Split a space-separated string into an argv array
+// Returns number of arguments, or -1 on error
+// Caller must free each element and the array itself
+static int split_args(const char *str, char ***argv_out)
+{
+  char **argv = calloc(MAX_ARGS, sizeof(char *));
+  if (!argv)
+    return -1;
+
+  int argc = 0;
+  const char *p = str;
+
+  while (*p && argc < MAX_ARGS - 1)
+  {
+    // Skip leading whitespace
+    while (*p && isspace(*p))
+      p++;
+    if (!*p)
+      break;
+
+    // Find end of this argument
+    const char *start = p;
+    while (*p && !isspace(*p))
+      p++;
+
+    // Copy argument
+    size_t len = p - start;
+    argv[argc] = malloc(len + 1);
+    if (!argv[argc])
+    {
+      // Cleanup on failure
+      for (int i = 0; i < argc; i++)
+        free(argv[i]);
+      free(argv);
+      return -1;
+    }
+    memcpy(argv[argc], start, len);
+    argv[argc][len] = '\0';
+    argc++;
+  }
+
+  argv[argc] = NULL;
+  *argv_out = argv;
+  return argc;
+}
+
+// Free an argv array allocated by split_args or build_argv
+static void free_argv(char **argv)
+{
+  if (!argv)
+    return;
+  for (int i = 0; argv[i]; i++)
+    free(argv[i]);
+  free(argv);
+}
+
+// Run a command without invoking a shell (secure execution)
+// Returns the exit status, or -1 on error
+static int run_command(char **argv)
+{
+#ifdef _WIN32
+  // Windows: use _spawnvp
+  intptr_t status = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
+  return (int)status;
+#else
+  // POSIX: fork + execvp
+  pid_t pid = fork();
+  if (pid == -1)
+  {
+    perror("fork");
+    return -1;
+  }
+  if (pid == 0)
+  {
+    // Child process
+    execvp(argv[0], argv);
+    // If execvp returns, it failed
+    perror("execvp");
+    _exit(127);
+  }
+  // Parent process
+  int status;
+  if (waitpid(pid, &status, 0) == -1)
+  {
+    perror("waitpid");
+    return -1;
+  }
+  if (WIFEXITED(status))
+    return WEXITSTATUS(status);
+  if (WIFSIGNALED(status))
+    return 128 + WTERMSIG(status);
+  return -1;
+#endif
+}
+
+// Build an argv array from individual components
+// Variable args must end with NULL
+// Returns argv array (caller must free with free_argv)
+static char **build_argv(const char *first, ...)
+{
+  char **argv = calloc(MAX_ARGS, sizeof(char *));
+  if (!argv)
+    return NULL;
+
+  int argc = 0;
+  va_list ap;
+
+  // Add first argument
+  if (first)
+  {
+    argv[argc] = strdup(first);
+    if (!argv[argc])
+    {
+      free(argv);
+      return NULL;
+    }
+    argc++;
+  }
+
+  // Add remaining arguments
+  va_start(ap, first);
+  const char *arg;
+  while ((arg = va_arg(ap, const char *)) != NULL && argc < MAX_ARGS - 1)
+  {
+    argv[argc] = strdup(arg);
+    if (!argv[argc])
+    {
+      va_end(ap);
+      free_argv(argv);
+      return NULL;
+    }
+    argc++;
+  }
+  va_end(ap);
+
+  argv[argc] = NULL;
+  return argv;
+}
+
+// Append arguments from flags string to existing argv
+// Returns new argc, or -1 on error
+static int append_flags_to_argv(char **argv, int argc, const char *flags)
+{
+  if (!flags || !*flags)
+    return argc;
+
+  const char *p = flags;
+  while (*p && argc < MAX_ARGS - 1)
+  {
+    while (*p && isspace(*p))
+      p++;
+    if (!*p)
+      break;
+
+    const char *start = p;
+    while (*p && !isspace(*p))
+      p++;
+
+    size_t len = p - start;
+    argv[argc] = malloc(len + 1);
+    if (!argv[argc])
+      return -1;
+    memcpy(argv[argc], start, len);
+    argv[argc][len] = '\0';
+    argc++;
+  }
+  argv[argc] = NULL;
+  return argc;
+}
+
 static void die(char *message)
 {
   fprintf(stderr, "%s\n", message);
@@ -1505,11 +1804,47 @@ static int install(char *self_path)
 
   if (!input || !output)
   {
-    char command[512];
-    snprintf(command, 512,
-             "sudo rm -f \"%s\" && sudo cp \"%s\" \"%s\" && sudo chmod +x \"%s\"",
-             INSTALL, self_path, INSTALL, INSTALL);
-    return system(command) == 0 ? 0 : 1;
+    // Fallback to sudo - use run_command for security
+    // First try to remove existing file
+    char **rm_argv = build_argv("sudo", "rm", "-f", INSTALL, NULL);
+    if (rm_argv)
+    {
+      run_command(rm_argv);
+      free_argv(rm_argv);
+    }
+
+    // Copy the file
+    char **cp_argv = build_argv("sudo", "cp", self_path, INSTALL, NULL);
+    if (!cp_argv)
+    {
+      fprintf(stderr, "Memory allocation failed\n");
+      return 1;
+    }
+    int cp_status = run_command(cp_argv);
+    free_argv(cp_argv);
+    if (cp_status != 0)
+    {
+      fprintf(stderr, "Failed to copy file\n");
+      return 1;
+    }
+
+    // Set executable permission
+    char **chmod_argv = build_argv("sudo", "chmod", "+x", INSTALL, NULL);
+    if (!chmod_argv)
+    {
+      fprintf(stderr, "Memory allocation failed\n");
+      return 1;
+    }
+    int chmod_status = run_command(chmod_argv);
+    free_argv(chmod_argv);
+    if (chmod_status != 0)
+    {
+      fprintf(stderr, "Failed to set permissions\n");
+      return 1;
+    }
+
+    printf("[prism] Installed!\n");
+    return 0;
   }
 
   char buffer[4096];
@@ -1538,20 +1873,34 @@ static int install(char *self_path)
 static void get_flags(char *source_file, char *buffer, Mode mode)
 {
   buffer[0] = 0;
+  size_t bufsize = 2048; // Known from caller
+  size_t len = 0;
+
+  // Safe append helper
+#define SAFE_APPEND(s)                   \
+  do                                     \
+  {                                      \
+    size_t slen = strlen(s);             \
+    if (len + slen < bufsize - 1)        \
+    {                                    \
+      memcpy(buffer + len, s, slen + 1); \
+      len += slen;                       \
+    }                                    \
+  } while (0)
 
   if (mode == MODE_DEBUG)
-    strcat(buffer, " -g -O0");
+    SAFE_APPEND(" -g -O0");
   if (mode == MODE_RELEASE)
-    strcat(buffer, " -O3");
+    SAFE_APPEND(" -O3");
   if (mode == MODE_SMALL)
-    strcat(buffer, " -Os");
+    SAFE_APPEND(" -Os");
 
   FILE *file = fopen(source_file, "r");
   if (!file)
     return;
 
   char line[1024];
-  while (fgets(line, 1024, file))
+  while (fgets(line, sizeof(line), file))
   {
     char *ptr = line;
     while (isspace(*ptr))
@@ -1574,17 +1923,18 @@ static void get_flags(char *source_file, char *buffer, Mode mode)
     if (quote_start && quote_end)
     {
       *quote_end = 0;
-      size_t current_len = strlen(buffer);
       size_t add_len = strlen(quote_start + 1);
-      // Bounds check: buffer is 2048 bytes, leave room for space and null
-      if (current_len + add_len + 2 < 2048)
+      // Bounds check: leave room for space and null
+      if (len + add_len + 2 < bufsize)
       {
-        strcat(buffer, " ");
-        strcat(buffer, quote_start + 1);
+        buffer[len++] = ' ';
+        memcpy(buffer + len, quote_start + 1, add_len + 1);
+        len += add_len;
       }
     }
   }
 
+#undef SAFE_APPEND
   fclose(file);
 }
 
@@ -1659,16 +2009,14 @@ int main(int argc, char **argv)
   int bits = NATIVE_BITS;
   char *platform = NATIVE_PLATFORM;
 
-// Helper to check if filename ends with .c
-#define ends_with_c(s) ({                                    \
-  int _len = strlen(s);                                      \
-  _len >= 2 && (s)[_len - 2] == '.' && (s)[_len - 1] == 'c'; \
-})
-
   // Parse options until we hit a .c file
-  while (arg_idx < argc && !ends_with_c(argv[arg_idx]))
+  while (arg_idx < argc)
   {
     char *arg = argv[arg_idx];
+    size_t len = strlen(arg);
+    // Check if filename ends with .c
+    if (len >= 2 && arg[len - 2] == '.' && arg[len - 1] == 'c')
+      break;
     if (!strcmp(arg, "build"))
       is_build_only = 1;
     else if (!strcmp(arg, "transpile"))
@@ -1706,30 +2054,73 @@ int main(int argc, char **argv)
     die("Missing source file.");
 
   char *source = argv[arg_idx];
-  char flags[2048], output_path[512], command[4096], transpiled[512];
+  char flags[2048], output_path[512], transpiled[512];
 
-  // Generate transpiled filename
-  char *basename = strrchr(source, '/');
+  // Generate secure transpiled filename using mkstemp()
+  char *basename_ptr = strrchr(source, '/');
 #ifdef _WIN32
   char *win_basename = strrchr(source, '\\');
-  if (!basename || (win_basename && win_basename > basename))
-    basename = win_basename;
+  if (!basename_ptr || (win_basename && win_basename > basename_ptr))
+    basename_ptr = win_basename;
 #endif
 
-  if (!basename)
+  if (!basename_ptr)
   {
-    snprintf(transpiled, sizeof(transpiled), ".%s.%d.prism.c", source, getpid());
+    snprintf(transpiled, sizeof(transpiled), ".%s.XXXXXX.c", source);
   }
   else
   {
     char source_dir[512];
-    size_t dir_len = basename - source;
+    size_t dir_len = basename_ptr - source;
+    if (dir_len >= sizeof(source_dir))
+      dir_len = sizeof(source_dir) - 1;
     strncpy(source_dir, source, dir_len);
     source_dir[dir_len] = 0;
-    basename++;
-    snprintf(transpiled, sizeof(transpiled), "%s/.%s.%d.prism.c",
-             source_dir, basename, getpid());
+    basename_ptr++;
+    snprintf(transpiled, sizeof(transpiled), "%s/.%s.XXXXXX.c",
+             source_dir, basename_ptr);
   }
+
+  // mkstemp requires template to end with XXXXXX, but we want .c extension
+  // So we use mkstemps() on systems that have it, or work around it
+#if defined(_WIN32)
+  // Windows: use _mktemp_s (less secure but portable)
+  if (_mktemp_s(transpiled, sizeof(transpiled)) != 0)
+    die("Failed to create temp filename.");
+#elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
+  // POSIX: use mkstemps() if available (suffix length = 2 for ".c")
+  {
+    int fd = mkstemps(transpiled, 2);
+    if (fd < 0)
+      die("Failed to create secure temp file.");
+    close(fd); // Close fd, we just need the unique filename
+  }
+#else
+  // Fallback for systems without mkstemps (rare - most POSIX systems have it)
+  // NOTE: This has a small TOCTOU window between unlink and when transpile()
+  // creates the file. For truly paranoid security on exotic systems, implement
+  // a custom mkstemps equivalent. In practice, this fallback is almost never used.
+  {
+    int fd = mkstemp(transpiled);
+    if (fd < 0)
+      die("Failed to create secure temp file.");
+    // Immediately close and unlink - we just needed the unique name
+    close(fd);
+    unlink(transpiled);
+    // Append .c extension to the unique name
+    size_t len = strlen(transpiled);
+    if (len + 2 < sizeof(transpiled))
+    {
+      transpiled[len] = '.';
+      transpiled[len + 1] = 'c';
+      transpiled[len + 2] = '\0';
+    }
+  }
+#endif
+
+  // Register cleanup handler and set pending temp file for cleanup on error
+  pending_temp_file = transpiled;
+  atexit(cleanup_temp_file);
 
   // Handle transpile-only mode
   if (is_transpile_only)
@@ -1757,6 +2148,7 @@ int main(int argc, char **argv)
         putchar(c);
       fclose(f);
       remove(transpiled);
+      pending_temp_file = NULL;
     }
     return 0;
   }
@@ -1791,55 +2183,108 @@ int main(int argc, char **argv)
       if (ext)
         *ext = 0;
       if (is_windows)
-        strcat(output_path, ".exe");
+      {
+        size_t len = strlen(output_path);
+        if (len + 5 < sizeof(output_path)) // ".exe" + null
+          memcpy(output_path + len, ".exe", 5);
+      }
     }
     printf("[prism] Building %s (%s %d-bit %s)...\n", output_path, arch, bits, platform);
   }
   else
   {
-    snprintf(output_path, sizeof(output_path), "%sprism_out.%d", TMP, getpid());
+    // Secure temp file for output binary
+    snprintf(output_path, sizeof(output_path), "%sprism_out.XXXXXX", TMP);
+#if defined(_WIN32)
+    if (_mktemp_s(output_path, sizeof(output_path)) != 0)
+      die("Failed to create temp output filename.");
+#else
+    {
+      int fd = mkstemp(output_path);
+      if (fd < 0)
+        die("Failed to create secure temp output file.");
+      close(fd);
+    }
+#endif
   }
 
-  // Use shell escaping for safe command execution
-  char *esc_transpiled = shell_escape(transpiled);
-  char *esc_output = shell_escape(output_path);
-  if (!esc_transpiled || !esc_output)
+  // Build argument array for compilation (no shell escaping needed with execvp!)
+  char **compile_argv = calloc(MAX_ARGS, sizeof(char *));
+  if (!compile_argv)
     die("Memory allocation failed.");
 
-  snprintf(command, 4096, "%s %s -o %s%s", compiler, esc_transpiled, esc_output, flags);
-  free(esc_transpiled);
-  free(esc_output);
+  int compile_argc = 0;
+  compile_argv[compile_argc++] = strdup(compiler);
+  compile_argv[compile_argc++] = strdup(transpiled);
+  compile_argv[compile_argc++] = strdup("-o");
+  compile_argv[compile_argc++] = strdup(output_path);
 
-  if (system(command))
+  // Check allocations
+  for (int i = 0; i < compile_argc; i++)
+  {
+    if (!compile_argv[i])
+    {
+      free_argv(compile_argv);
+      die("Memory allocation failed.");
+    }
+  }
+
+  // Append flags
+  compile_argc = append_flags_to_argv(compile_argv, compile_argc, flags);
+  if (compile_argc < 0)
+  {
+    free_argv(compile_argv);
+    die("Memory allocation failed.");
+  }
+
+  int compile_status = run_command(compile_argv);
+  free_argv(compile_argv);
+
+  if (compile_status != 0)
   {
     remove(transpiled);
+    pending_temp_file = NULL;
     die("Compilation failed.");
   }
 
   if (!is_build_only)
   {
-    char *esc_exec = shell_escape(output_path);
-    if (!esc_exec)
+    // Build argument array for execution
+    int run_argc = 0;
+    int max_run_args = argc - arg_idx + 1; // output + remaining args + NULL
+    char **run_argv = calloc(max_run_args + 1, sizeof(char *));
+    if (!run_argv)
       die("Memory allocation failed.");
-    snprintf(command, 4096, "%s", esc_exec);
-    free(esc_exec);
 
+    run_argv[run_argc++] = strdup(output_path);
+    if (!run_argv[0])
+    {
+      free(run_argv);
+      die("Memory allocation failed.");
+    }
+
+    // Add user arguments
     for (int j = arg_idx + 1; j < argc; j++)
     {
-      char *esc_arg = shell_escape(argv[j]);
-      if (!esc_arg)
+      run_argv[run_argc] = strdup(argv[j]);
+      if (!run_argv[run_argc])
+      {
+        free_argv(run_argv);
         die("Memory allocation failed.");
-      size_t len = strlen(command);
-      if (len + strlen(esc_arg) + 2 < 4096)
-        snprintf(command + len, 4096 - len, " %s", esc_arg);
-      free(esc_arg);
+      }
+      run_argc++;
     }
-    int status = system(command);
+    run_argv[run_argc] = NULL;
+
+    int run_status = run_command(run_argv);
+    free_argv(run_argv);
     remove(output_path);
     remove(transpiled);
-    exit(status > 255 ? status >> 8 : status);
+    pending_temp_file = NULL;
+    exit(run_status);
   }
 
   remove(transpiled);
+  pending_temp_file = NULL;
   return 0;
 }
