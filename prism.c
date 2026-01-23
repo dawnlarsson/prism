@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.31.0"
+#define VERSION "0.32.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -196,6 +196,11 @@ static void clear_switch_scope_defers(void)
 static FILE *out;
 static Token *last_emitted = NULL;
 
+// Line tracking for #line directives
+static int last_line_no = 0;
+static char *last_filename = NULL;
+static bool emit_line_directives = true; // Can be disabled with no-line-directives flag
+
 // Check if a space is needed between two tokens
 static bool needs_space(Token *prev, Token *tok)
 {
@@ -247,10 +252,51 @@ static bool needs_space(Token *prev, Token *tok)
 // Emit a single token with appropriate spacing
 static void emit_tok(Token *tok)
 {
+  // Check if we need a #line directive BEFORE emitting the token
+  bool need_line_directive = false;
+  char *current_file = NULL;
+
+  if (emit_line_directives && tok->file)
+  {
+    current_file = tok->file->display_name ? tok->file->display_name : tok->file->name;
+    bool file_changed = (last_filename != current_file &&
+                         (!last_filename || !current_file || strcmp(last_filename, current_file) != 0));
+    bool line_jumped = (tok->line_no != last_line_no && tok->line_no != last_line_no + 1);
+    need_line_directive = file_changed || line_jumped;
+  }
+
+  // Handle newlines and spacing
   if (tok->at_bol)
+  {
     fputc('\n', out);
-  else if (needs_space(last_emitted, tok))
-    fputc(' ', out);
+    // Emit #line directive on new line if needed
+    if (need_line_directive)
+    {
+      fprintf(out, "#line %d \"%s\"\n", tok->line_no, current_file ? current_file : "unknown");
+      last_line_no = tok->line_no;
+      last_filename = current_file;
+    }
+    else if (emit_line_directives && tok->file && tok->line_no > last_line_no)
+    {
+      last_line_no = tok->line_no;
+    }
+  }
+  else
+  {
+    // Not at beginning of line - emit #line before token if file/line changed significantly
+    if (need_line_directive)
+    {
+      fputc('\n', out);
+      fprintf(out, "#line %d \"%s\"\n", tok->line_no, current_file ? current_file : "unknown");
+      last_line_no = tok->line_no;
+      last_filename = current_file;
+    }
+    else if (needs_space(last_emitted, tok))
+    {
+      fputc(' ', out);
+    }
+  }
+
   fprintf(out, "%.*s", tok->len, tok->loc);
   last_emitted = tok;
 }
@@ -872,6 +918,34 @@ static Token *try_zero_init_decl(Token *tok)
     tok = tok->next;
   }
 
+  // Handle parenthesized declarators: (*name), (*name)[N], (*name)(args)
+  // Also handle: (*name[N])(args) - array of function pointers
+  // Pattern: type (* [qualifiers] name [array]) [array] (func_args)?
+  bool has_paren_declarator = false;
+  bool array_inside_paren = false;
+  if (equal(tok, "("))
+  {
+    Token *paren_start = tok;
+    tok = tok->next;
+
+    // Should be * for pointer declarator
+    if (!equal(tok, "*"))
+      return NULL; // Not a pointer declarator, bail
+
+    is_pointer = true;
+    tok = tok->next;
+
+    // Skip qualifiers inside parens
+    while (is_type_qualifier(tok))
+      tok = tok->next;
+
+    // Must be identifier now
+    if (tok->kind != TK_IDENT)
+      return NULL;
+
+    has_paren_declarator = true;
+  }
+
   // Must have identifier
   if (tok->kind != TK_IDENT)
     return NULL;
@@ -879,13 +953,35 @@ static Token *try_zero_init_decl(Token *tok)
   Token *var_name = tok;
   tok = tok->next;
 
-  // Check what follows the identifier
-  bool is_array = false;
-  bool is_vla = false;
+  // Array dimension INSIDE parentheses: (*name[N])
+  if (has_paren_declarator && equal(tok, "["))
+  {
+    array_inside_paren = true;
+    while (equal(tok, "["))
+      tok = skip_balanced(tok, "[", "]");
+  }
 
-  // Function declaration? Skip
+  // Close paren for parenthesized declarator
+  if (has_paren_declarator)
+  {
+    if (!equal(tok, ")"))
+      return NULL;
+    tok = tok->next;
+  }
+
+  // Check what follows the identifier (or closing paren)
+  bool is_array = array_inside_paren; // Array of function ptrs counts as array
+  bool is_vla = false;
+  bool is_func_ptr = false;
+
+  // Function pointer: (*name)(args) - the (args) part
   if (equal(tok, "("))
-    return NULL;
+  {
+    if (!has_paren_declarator)
+      return NULL; // Regular function declaration, not a variable
+    is_func_ptr = true;
+    tok = skip_balanced(tok, "(", ")");
+  }
 
   // Array?
   if (equal(tok, "["))
@@ -967,6 +1063,8 @@ static int transpile(char *input_file, char *output_file)
   defer_depth = 0;
   struct_depth = 0;
   last_emitted = NULL;
+  last_line_no = 0;
+  last_filename = NULL;
   next_scope_is_loop = false;
   next_scope_is_switch = false;
   pending_control_flow = false;
@@ -2070,6 +2168,8 @@ int main(int argc, char **argv)
       feature_defer = false;
     else if (!strcmp(arg, "no-zeroinit"))
       feature_zeroinit = false;
+    else if (!strcmp(arg, "no-line-directives"))
+      emit_line_directives = false;
     else
       break;
     arg_idx++;
