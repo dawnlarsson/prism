@@ -41,12 +41,13 @@ void example() {
     char *ptr;       // ptr = NULL
     int arr[10];     // all elements = 0
     struct { int a; float b; } s;  // s = {0}
+    
+    typedef struct { int x, y; } Point;
+    Point p;         // p = {0}
 }
 ```
 
-Works with: primitives, pointers, arrays, structs, unions, enums.
-
-**Limitation:** Typedef'd types currently require explicit initialization.
+Works with: primitives, pointers, arrays, structs, unions, enums, and user-defined typedefs (including from headers like `uint8_t`, `size_t`, `FILE*`, `pthread_mutex_t`, etc).
 
 **Opt-out** `prism src.c no-zeroinit`
 

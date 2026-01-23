@@ -402,13 +402,12 @@ void test_struct_with_array(void)
 }
 
 // Test 38: Typedef'd type zero-init
-// NOTE: typedef types are NOT zero-initialized (known limitation)
-// because the transpiler doesn't track typedef aliases
+// This now works! The transpiler tracks typedef aliases.
 void test_typedef_type(void)
 {
     typedef int MyInt;
-    MyInt mi = 0; // Explicit init required for typedef types
-    CHECK_EQ(mi, 0, "typedef type (explicit init)");
+    MyInt mi; // Auto zero-init now works for typedef types!
+    CHECK_EQ(mi, 0, "typedef type zero-init");
 }
 
 // Test 39: _Bool zero-init

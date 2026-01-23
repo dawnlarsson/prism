@@ -1,7 +1,5 @@
-// Apache 2.0 license (c) Dawn Larsson 2026
-
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.33.0"
+#define VERSION "0.34.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -85,6 +83,24 @@ typedef struct
   LabelInfo labels[MAX_LABELS];
   int count;
 } LabelTable;
+
+// Typedef tracking for zero-init (scoped like C)
+#define MAX_TYPEDEFS 4096
+
+typedef struct
+{
+  char *name; // Points into token stream (no alloc needed)
+  int len;
+  int scope_depth; // Scope where defined (aligns with defer_depth)
+} TypedefEntry;
+
+typedef struct
+{
+  TypedefEntry entries[MAX_TYPEDEFS];
+  int count;
+} TypedefTable;
+
+static TypedefTable typedef_table;
 
 static DeferScope defer_stack[MAX_DEFER_DEPTH];
 static int defer_depth = 0;
@@ -453,6 +469,56 @@ static int label_table_lookup(char *name, int name_len)
   return -1; // Not found
 }
 
+// Typedef tracking for zero-init
+static void typedef_table_reset(void)
+{
+  typedef_table.count = 0;
+}
+
+static void typedef_add(char *name, int len, int scope_depth)
+{
+  if (typedef_table.count >= MAX_TYPEDEFS)
+  {
+    static bool warned = false;
+    if (!warned)
+    {
+      fprintf(stderr, "prism: warning: typedef limit (%d) reached, "
+                      "some types may not be zero-initialized\n",
+              MAX_TYPEDEFS);
+      warned = true;
+    }
+    return;
+  }
+  TypedefEntry *e = &typedef_table.entries[typedef_table.count++];
+  e->name = name;
+  e->len = len;
+  e->scope_depth = scope_depth;
+}
+
+// Called when exiting a scope - removes typedefs defined at that depth
+static void typedef_pop_scope(int scope_depth)
+{
+  while (typedef_table.count > 0 &&
+         typedef_table.entries[typedef_table.count - 1].scope_depth == scope_depth)
+  {
+    typedef_table.count--;
+  }
+}
+
+// Check if token is a known typedef (search most recent first for shadowing)
+static bool is_known_typedef(Token *tok)
+{
+  if (tok->kind != TK_IDENT)
+    return false;
+  for (int i = typedef_table.count - 1; i >= 0; i--)
+  {
+    TypedefEntry *e = &typedef_table.entries[i];
+    if (e->len == tok->len && !memcmp(e->name, tok->loc, tok->len))
+      return true;
+  }
+  return false;
+}
+
 // Check if token could be a label (identifier followed by ':')
 // Note: This can have false positives from ternary operator
 // The caller should filter using context (prev token shouldn't be '?')
@@ -768,6 +834,189 @@ static Token *skip_balanced(Token *tok, char *open, char *close)
   return tok;
 }
 
+// Forward declaration for mutual recursion
+static bool is_type_keyword(Token *tok);
+
+// Skip attributes like __attribute__((...)) and __declspec(...)
+static Token *skip_attributes(Token *tok)
+{
+  while (tok && (equal(tok, "__attribute__") || equal(tok, "__attribute") ||
+                 equal(tok, "__declspec")))
+  {
+    tok = tok->next;
+    if (tok && equal(tok, "("))
+      tok = skip_balanced(tok, "(", ")");
+  }
+  return tok;
+}
+
+// Skip the base type in a typedef (everything before the declarator)
+static Token *scan_typedef_base_type(Token *tok)
+{
+  // Skip qualifiers: const, volatile, restrict, _Atomic
+  while (tok && (equal(tok, "const") || equal(tok, "volatile") ||
+                 equal(tok, "restrict") || equal(tok, "_Atomic") ||
+                 equal(tok, "__const") || equal(tok, "__const__") ||
+                 equal(tok, "__volatile") || equal(tok, "__volatile__") ||
+                 equal(tok, "__restrict") || equal(tok, "__restrict__")))
+    tok = tok->next;
+
+  // Skip attributes
+  tok = skip_attributes(tok);
+
+  // Handle struct/union/enum
+  if (tok && (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum")))
+  {
+    tok = tok->next;
+
+    // Skip attributes after keyword
+    tok = skip_attributes(tok);
+
+    // Skip optional tag name
+    if (tok && tok->kind == TK_IDENT)
+      tok = tok->next;
+
+    // Skip body { ... } if present
+    if (tok && equal(tok, "{"))
+      tok = skip_balanced(tok, "{", "}");
+
+    return tok;
+  }
+
+  // Skip type specifiers and existing typedef names
+  while (tok && tok->kind != TK_EOF &&
+         (is_type_keyword(tok) || is_known_typedef(tok) ||
+          equal(tok, "signed") || equal(tok, "unsigned") ||
+          equal(tok, "__signed__") || equal(tok, "__signed")))
+  {
+    tok = tok->next;
+    // Skip attributes between type keywords
+    tok = skip_attributes(tok);
+  }
+
+  return tok;
+}
+
+// Extract the typedef name from a declarator, advance *tokp past the declarator
+static Token *scan_typedef_name(Token **tokp)
+{
+  Token *tok = *tokp;
+
+  // Skip pointers and qualifiers
+  while (tok && (equal(tok, "*") || equal(tok, "const") || equal(tok, "volatile") ||
+                 equal(tok, "restrict") || equal(tok, "_Atomic") ||
+                 equal(tok, "__const") || equal(tok, "__const__") ||
+                 equal(tok, "__volatile") || equal(tok, "__volatile__") ||
+                 equal(tok, "__restrict") || equal(tok, "__restrict__")))
+    tok = tok->next;
+
+  // Skip attributes on pointer
+  tok = skip_attributes(tok);
+
+  // Case 1: Parenthesized declarator - (*name), (*name[N]), (*name)(args)
+  if (tok && equal(tok, "("))
+  {
+    tok = tok->next;
+
+    // Skip inner pointers and qualifiers
+    while (tok && (equal(tok, "*") || equal(tok, "const") || equal(tok, "volatile") ||
+                   equal(tok, "restrict") || equal(tok, "_Atomic")))
+      tok = tok->next;
+
+    tok = skip_attributes(tok);
+
+    if (tok && tok->kind == TK_IDENT)
+    {
+      Token *name = tok;
+      tok = tok->next;
+
+      // Skip array dims inside parens: (*name[N])
+      while (tok && equal(tok, "["))
+        tok = skip_balanced(tok, "[", "]");
+
+      // Skip closing paren
+      if (tok && equal(tok, ")"))
+        tok = tok->next;
+
+      // Skip trailing array dims or function params
+      while (tok && equal(tok, "["))
+        tok = skip_balanced(tok, "[", "]");
+      if (tok && equal(tok, "("))
+        tok = skip_balanced(tok, "(", ")");
+
+      *tokp = tok;
+      return name;
+    }
+
+    // Nested/complex - try to skip to matching ) and continue
+    int depth = 1;
+    while (tok && tok->kind != TK_EOF && depth > 0)
+    {
+      if (equal(tok, "("))
+        depth++;
+      else if (equal(tok, ")"))
+        depth--;
+      tok = tok->next;
+    }
+    *tokp = tok;
+    return NULL; // Couldn't extract - graceful failure
+  }
+
+  // Case 2: Direct declarator - name, name[N], name(args)
+  if (tok && tok->kind == TK_IDENT)
+  {
+    Token *name = tok;
+    tok = tok->next;
+
+    // Skip array dimensions
+    while (tok && equal(tok, "["))
+      tok = skip_balanced(tok, "[", "]");
+
+    // Skip function params (for func types without outer parens)
+    if (tok && equal(tok, "("))
+      tok = skip_balanced(tok, "(", ")");
+
+    *tokp = tok;
+    return name;
+  }
+
+  *tokp = tok;
+  return NULL;
+}
+
+// Parse a typedef declaration and add names to the typedef table
+static void parse_typedef_declaration(Token *tok, int scope_depth)
+{
+  tok = tok->next; // Skip 'typedef'
+
+  // Skip the base type
+  tok = scan_typedef_base_type(tok);
+
+  // Parse declarator(s) until semicolon
+  while (tok && !equal(tok, ";") && tok->kind != TK_EOF)
+  {
+    Token *name = scan_typedef_name(&tok);
+    if (name)
+    {
+      typedef_add(name->loc, name->len, scope_depth);
+    }
+
+    // Skip to comma or semicolon
+    while (tok && !equal(tok, ",") && !equal(tok, ";") && tok->kind != TK_EOF)
+    {
+      if (equal(tok, "("))
+        tok = skip_balanced(tok, "(", ")");
+      else if (equal(tok, "["))
+        tok = skip_balanced(tok, "[", "]");
+      else
+        tok = tok->next;
+    }
+
+    if (tok && equal(tok, ","))
+      tok = tok->next;
+  }
+}
+
 // Zero-init helpers
 static bool is_type_keyword(Token *tok)
 {
@@ -793,6 +1042,9 @@ static bool is_type_keyword(Token *tok)
       equal(tok, "time_t") || equal(tok, "off_t") || equal(tok, "pid_t") ||
       equal(tok, "FILE") || equal(tok, "fpos_t") ||
       equal(tok, "wchar_t") || equal(tok, "wint_t"))
+    return true;
+  // User-defined typedefs (tracked during transpilation)
+  if (is_known_typedef(tok))
     return true;
   return false;
 }
@@ -878,6 +1130,9 @@ static Token *try_zero_init_decl(Token *tok)
       saw_type = true;
       continue;
     }
+    // Check for user-defined typedef (needs {0} initialization for structs)
+    if (is_known_typedef(tok))
+      is_typedef_type = true;
     tok = tok->next;
   }
 
@@ -1072,13 +1327,22 @@ static int transpile(char *input_file, char *output_file)
   pending_control_flow = false;
   control_paren_depth = 0;
   current_func_returns_void = false;
-  at_stmt_start = false;               // Reset static - track if we're at start of a statement
+  at_stmt_start = true;                // Start of file is start of statement
+  typedef_table_reset();               // Reset typedef tracking
   bool next_func_returns_void = false; // Track void functions at top level
   Token *prev_toplevel_tok = NULL;     // Track previous token at top level for function detection
 
   // Walk tokens and emit
   while (tok->kind != TK_EOF)
   {
+    // Track typedefs for zero-init (must happen before zero-init check)
+    // Only at statement start and outside struct/union/enum bodies
+    if (at_stmt_start && struct_depth == 0 && equal(tok, "typedef"))
+    {
+      parse_typedef_declaration(tok, defer_depth);
+      // Fall through to emit the typedef normally
+    }
+
     // Try zero-init for declarations at statement start
     if (at_stmt_start && !pending_control_flow)
     {
@@ -1558,6 +1822,12 @@ static int transpile(char *input_file, char *output_file)
         struct_depth++;
         if (feature_defer)
           defer_push_scope();
+        else
+        {
+          // Still track scope depth for typedef scoping
+          if (defer_depth < MAX_DEFER_DEPTH)
+            defer_depth++;
+        }
         at_stmt_start = true;
         continue;
       }
@@ -1571,6 +1841,12 @@ static int transpile(char *input_file, char *output_file)
       tok = tok->next;
       if (feature_defer)
         defer_push_scope();
+      else
+      {
+        // Still need to track scope depth for typedef scoping even without defer
+        if (defer_depth < MAX_DEFER_DEPTH)
+          defer_depth++;
+      }
       at_stmt_start = true;
       continue;
     }
@@ -1580,13 +1856,23 @@ static int transpile(char *input_file, char *output_file)
     {
       if (struct_depth > 0)
         struct_depth--;
+      typedef_pop_scope(defer_depth); // Pop typedefs at current scope (before depth changes)
       if (feature_defer)
       {
         emit_scope_defers();
         defer_pop_scope();
       }
+      else
+      {
+        // Still need to track scope depth for typedef scoping even without defer
+        if (defer_depth > 0)
+          defer_depth--;
+      }
       emit_tok(tok);
       tok = tok->next;
+      // After closing brace, we're at the start of a new statement
+      // (especially important at file scope for tracking typedefs)
+      at_stmt_start = true;
       continue;
     }
 
