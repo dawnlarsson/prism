@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.36.0"
+#define VERSION "0.37.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -85,7 +85,7 @@ typedef struct
 } LabelTable;
 
 // Typedef tracking for zero-init (scoped like C)
-#define MAX_TYPEDEFS 4096
+// Dynamically allocated to handle any project size
 
 typedef struct
 {
@@ -96,8 +96,9 @@ typedef struct
 
 typedef struct
 {
-  TypedefEntry entries[MAX_TYPEDEFS];
+  TypedefEntry *entries;
   int count;
+  int capacity;
 } TypedefTable;
 
 static TypedefTable typedef_table;
@@ -122,6 +123,8 @@ static bool next_scope_is_loop = false;
 static bool next_scope_is_switch = false;
 static bool pending_control_flow = false; // True after if/else/for/while/do/switch until we see { or ;
 static int control_paren_depth = 0;       // Track parens to distinguish for(;;) from braceless body
+static bool in_for_init = false;          // True when inside the init clause of a for loop (before first ;)
+static bool pending_for_paren = false;    // True after seeing 'for', waiting for '(' to start init clause
 
 // Label table for current function (for goto handling)
 static LabelTable label_table;
@@ -129,8 +132,11 @@ static LabelTable label_table;
 // Track if current function returns void (for return statement handling)
 static bool current_func_returns_void = false;
 
-// Track if current function uses setjmp/longjmp (defer is unsafe with these)
+// Track if current function uses setjmp/longjmp/pthread_exit (defer is unsafe with these)
 static bool current_func_has_setjmp = false;
+
+// Track if current function uses inline asm (may have hidden control flow)
+static bool current_func_has_asm = false;
 
 // Track statement boundaries for zero-init (moved to static for helper access)
 static bool at_stmt_start = false;
@@ -140,6 +146,7 @@ static bool at_stmt_start = false;
 static void end_statement_after_semicolon(void)
 {
   at_stmt_start = true;
+  in_for_init = false; // Semicolon ends init clause
   if (pending_control_flow && control_paren_depth == 0)
   {
     pending_control_flow = false;
@@ -475,22 +482,26 @@ static int label_table_lookup(char *name, int name_len)
 // Typedef tracking for zero-init
 static void typedef_table_reset(void)
 {
+  if (typedef_table.entries)
+  {
+    free(typedef_table.entries);
+    typedef_table.entries = NULL;
+  }
   typedef_table.count = 0;
+  typedef_table.capacity = 0;
 }
 
 static void typedef_add(char *name, int len, int scope_depth)
 {
-  if (typedef_table.count >= MAX_TYPEDEFS)
+  // Grow if needed
+  if (typedef_table.count >= typedef_table.capacity)
   {
-    static bool warned = false;
-    if (!warned)
-    {
-      fprintf(stderr, "prism: warning: typedef limit (%d) reached, "
-                      "some types may not be zero-initialized\n",
-              MAX_TYPEDEFS);
-      warned = true;
-    }
-    return;
+    int new_cap = typedef_table.capacity == 0 ? 256 : typedef_table.capacity * 2;
+    TypedefEntry *new_entries = realloc(typedef_table.entries, sizeof(TypedefEntry) * new_cap);
+    if (!new_entries)
+      error("out of memory tracking typedefs");
+    typedef_table.entries = new_entries;
+    typedef_table.capacity = new_cap;
   }
   TypedefEntry *e = &typedef_table.entries[typedef_table.count++];
   e->name = name;
@@ -536,12 +547,13 @@ static bool is_label(Token *tok)
 }
 
 // Scan a function body for labels and record their scope depths
-// Also detects setjmp/longjmp usage which bypasses defer
+// Also detects setjmp/longjmp/pthread_exit and inline asm usage
 // tok should point to the opening '{' of the function body
 static void scan_labels_in_function(Token *tok)
 {
   label_table_reset();
   current_func_has_setjmp = false; // Reset for new function
+  current_func_has_asm = false;    // Reset for new function
   if (!tok || !equal(tok, "{"))
     return;
 
@@ -625,12 +637,21 @@ static void scan_labels_in_function(Token *tok)
     }
 
     // Detect setjmp/longjmp/sigsetjmp/siglongjmp usage
+    // Also detect pthread_exit which bypasses cleanup like longjmp
     if (tok->kind == TK_IDENT &&
         (equal(tok, "setjmp") || equal(tok, "longjmp") ||
          equal(tok, "_setjmp") || equal(tok, "_longjmp") ||
-         equal(tok, "sigsetjmp") || equal(tok, "siglongjmp")))
+         equal(tok, "sigsetjmp") || equal(tok, "siglongjmp") ||
+         equal(tok, "pthread_exit")))
     {
       current_func_has_setjmp = true;
+    }
+
+    // Detect inline asm which may contain hidden jumps
+    if (tok->kind == TK_KEYWORD &&
+        (equal(tok, "asm") || equal(tok, "__asm__") || equal(tok, "__asm")))
+    {
+      current_func_has_asm = true;
     }
 
     // Check for label: identifier followed by ':' (but not ::)
@@ -1372,17 +1393,15 @@ static Token *try_zero_init_decl(Token *tok)
     // Check if this declarator already has an initializer
     bool has_init = equal(tok, "=");
 
-    // VLAs can't be initialized - warn once
+    // VLAs cannot be initialized - this breaks the zero-init guarantee
+    // Make it a hard error so users know their code has uninitialized memory
     if (is_vla && !has_init)
     {
-      static bool warned_vla = false;
-      if (!warned_vla)
-      {
-        fprintf(stderr, "prism: warning: VLA '%.*s[...]' cannot be auto zero-initialized. "
-                        "Use fixed-size arrays or memset() for safety.\n",
+      error_tok(var_name, "VLA '%.*s' cannot be zero-initialized (C language limitation). "
+                          "Options: (1) Use a fixed-size array, (2) Use malloc()+memset(), "
+                          "(3) Add explicit memset() after declaration, or "
+                          "(4) Use 'prism no-zeroinit' if you accept uninitialized variables.",
                 var_name->len, var_name->loc);
-        warned_vla = true;
-      }
     }
 
     // Add zero initializer if no existing initializer and not a VLA
@@ -1472,6 +1491,8 @@ static int transpile(char *input_file, char *output_file)
   next_scope_is_switch = false;
   pending_control_flow = false;
   control_paren_depth = 0;
+  in_for_init = false;
+  pending_for_paren = false;
   current_func_returns_void = false;
   at_stmt_start = true;                // Start of file is start of statement
   typedef_table_reset();               // Reset typedef tracking
@@ -1490,7 +1511,8 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Try zero-init for declarations at statement start
-    if (at_stmt_start && !pending_control_flow)
+    // Also allow in the init clause of a for loop: for (int i; ...)
+    if (at_stmt_start && (!pending_control_flow || in_for_init))
     {
       Token *next = try_zero_init_decl(tok);
       if (next)
@@ -1513,17 +1535,20 @@ static int transpile(char *input_file, char *output_file)
       if (pending_control_flow)
         error_tok(tok, "defer cannot be the body of a braceless control statement - add braces");
 
-      // Warn about setjmp/longjmp - defer is unsafe with these
+      // setjmp/longjmp/pthread_exit bypasses defer cleanup - this MUST be an error
       if (current_func_has_setjmp)
       {
-        static bool warned_setjmp = false;
-        if (!warned_setjmp)
-        {
-          fprintf(stderr, "%s:%d: warning: defer in function using setjmp/longjmp is unsafe. "
-                          "longjmp() bypasses defer cleanup. Consider using explicit cleanup instead.\n",
-                  tok->file->name, tok->line_no);
-          warned_setjmp = true;
-        }
+        error_tok(tok, "defer cannot be used in functions that call setjmp/longjmp/pthread_exit. "
+                       "These functions bypass defer cleanup entirely, causing resource leaks. "
+                       "Use explicit cleanup patterns (goto cleanup, or manual RAII) instead.");
+      }
+
+      // Inline asm may contain hidden jumps that bypass defer
+      if (current_func_has_asm)
+      {
+        error_tok(tok, "defer cannot be used in functions containing inline assembly. "
+                       "Inline asm may contain jumps (jmp, call, etc.) that bypass defer cleanup. "
+                       "Move the asm to a separate function, or use explicit cleanup instead.");
       }
 
       Token *defer_keyword = tok;
@@ -1640,9 +1665,9 @@ static int transpile(char *input_file, char *output_file)
           else
           {
             // non-void function: { __auto_type _ret = (expr); defers; return _ret; }
-            static int ret_counter = 0;
-            int my_ret = ret_counter++;
-            fprintf(out, " { __auto_type _prism_ret_%d = (", my_ret);
+            static unsigned long long ret_counter = 0;
+            unsigned long long my_ret = ret_counter++;
+            fprintf(out, " { __auto_type _prism_ret_%llu = (", my_ret);
 
             // Emit expression until semicolon
             while (tok->kind != TK_EOF && !equal(tok, ";"))
@@ -1653,7 +1678,7 @@ static int transpile(char *input_file, char *output_file)
 
             fprintf(out, ");");
             emit_all_defers();
-            fprintf(out, " return _prism_ret_%d;", my_ret);
+            fprintf(out, " return _prism_ret_%llu;", my_ret);
 
             if (equal(tok, ";"))
               tok = tok->next;
@@ -1712,6 +1737,22 @@ static int transpile(char *input_file, char *output_file)
       Token *goto_tok = tok;
       tok = tok->next; // skip 'goto'
 
+      // Handle computed goto (goto *ptr) - GCC extension
+      if (equal(tok, "*"))
+      {
+        // Computed goto target is determined at runtime - can't emit defers safely
+        // This MUST be an error because we can't guarantee cleanup runs
+        if (has_active_defers())
+        {
+          error_tok(goto_tok, "computed goto (goto *) cannot be used with active defer statements. "
+                              "Defer cleanup cannot be guaranteed for runtime-determined jump targets. "
+                              "Restructure code to avoid computed goto or move defer outside this scope.");
+        }
+        // No defers active, emit normally
+        emit_tok(goto_tok);
+        continue;
+      }
+
       // Get the label name
       if (tok->kind == TK_IDENT)
       {
@@ -1754,6 +1795,15 @@ static int transpile(char *input_file, char *output_file)
     {
       next_scope_is_loop = true;
       pending_control_flow = true;
+      // For 'for' loops, we need to allow zero-init in the init clause
+      if (equal(tok, "for"))
+        pending_for_paren = true;
+    }
+    // Also track 'for' for zero-init even if defer is disabled
+    else if (feature_zeroinit && !feature_defer && tok->kind == TK_KEYWORD && equal(tok, "for"))
+    {
+      pending_control_flow = true;
+      pending_for_paren = true;
     }
 
     // Mark switch keyword
@@ -2039,15 +2089,41 @@ static int transpile(char *input_file, char *output_file)
     if (pending_control_flow)
     {
       if (equal(tok, "("))
+      {
         control_paren_depth++;
+        // If we just saw 'for' and this is the opening paren, we're entering the init clause
+        if (pending_for_paren)
+        {
+          in_for_init = true;
+          at_stmt_start = true; // Init clause is like start of a statement
+          pending_for_paren = false;
+        }
+      }
       else if (equal(tok, ")"))
+      {
         control_paren_depth--;
+        // Exiting the for() parens entirely clears init state
+        if (control_paren_depth == 0)
+          in_for_init = false;
+      }
+      // Semicolon inside for() parens ends the init clause (first ;) and condition (second ;)
+      else if (equal(tok, ";") && control_paren_depth == 1)
+      {
+        if (in_for_init)
+        {
+          in_for_init = false;
+          // After init clause semicolon, we're at start of condition
+          // (not a declaration context, so don't set at_stmt_start)
+        }
+      }
       // Semicolon at depth 0 ends a braceless statement body
       else if (equal(tok, ";") && control_paren_depth == 0)
       {
         pending_control_flow = false;
         next_scope_is_loop = false;
         next_scope_is_switch = false;
+        in_for_init = false;
+        pending_for_paren = false;
       }
     }
 
@@ -2077,7 +2153,9 @@ static int transpile(char *input_file, char *output_file)
 
 // Escape a string for safe use in shell commands
 // Returns a newly allocated string that must be freed
-static char *shell_escape(const char *s)
+// Note: Currently unused as run_command uses execvp directly,
+// but kept for potential future shell-based execution paths.
+__attribute__((unused)) static char *shell_escape(const char *s)
 {
 #ifdef _WIN32
   // Windows: Use double quotes, escape internal double quotes and backslashes

@@ -241,6 +241,11 @@ static char *find_gcc_include_path(const char *base_dir, const char *triple)
     if (best_version)
     {
         char *result = malloc(PATH_MAX);
+        if (!result)
+        {
+            free(best_version);
+            return NULL;
+        }
         snprintf(result, PATH_MAX, "%s/%s/include", dir_path, best_version);
         free(best_version);
         return result;
@@ -837,6 +842,11 @@ static bool consume(Token **rest, Token *tok, char *str)
 static Token *new_token(TokenKind kind, char *start, char *end)
 {
     Token *tok = calloc(1, sizeof(Token));
+    if (!tok)
+    {
+        fprintf(stderr, "out of memory in new_token\n");
+        exit(1);
+    }
     tok->kind = kind;
     tok->loc = start;
     tok->len = end - start;
@@ -1052,7 +1062,17 @@ static char *string_literal_end(char *p)
 static Token *read_string_literal(char *start, char *quote)
 {
     char *end = string_literal_end(quote + 1);
-    char *buf = calloc(1, end - quote);
+    // Allocate buffer for the unescaped string content + null terminator
+    // Size is (end - quote) which includes space for the closing quote we don't copy
+    size_t buf_size = (end - quote);
+    if (buf_size == 0)
+        buf_size = 1; // At minimum, space for null terminator
+    char *buf = calloc(1, buf_size);
+    if (!buf)
+    {
+        fprintf(stderr, "out of memory in read_string_literal\n");
+        exit(1);
+    }
     int len = 0;
     for (char *p = quote + 1; p < end;)
     {
@@ -1288,6 +1308,11 @@ static void add_line_numbers(Token *tok)
 static File *new_file(char *name, int file_no, char *contents)
 {
     File *file = calloc(1, sizeof(File));
+    if (!file)
+    {
+        fprintf(stderr, "out of memory in new_file\n");
+        exit(1);
+    }
     file->name = name;
     file->display_name = name;
     file->file_no = file_no;
@@ -1565,6 +1590,11 @@ static Token *skip_line_quiet(Token *tok)
 static Token *copy_token(Token *tok)
 {
     Token *t = calloc(1, sizeof(Token));
+    if (!t)
+    {
+        fprintf(stderr, "out of memory in copy_token\n");
+        exit(1);
+    }
     *t = *tok;
     t->next = NULL;
     return t;
@@ -1591,6 +1621,11 @@ static Token *copy_token_list(Token *tok)
 static Hideset *new_hideset(char *name)
 {
     Hideset *hs = calloc(1, sizeof(Hideset));
+    if (!hs)
+    {
+        fprintf(stderr, "out of memory in new_hideset\n");
+        exit(1);
+    }
     hs->name = name;
     return hs;
 }
@@ -1658,6 +1693,11 @@ static Macro *find_macro(Token *tok)
 static Macro *add_macro(char *name, bool is_objlike, Token *body)
 {
     Macro *m = calloc(1, sizeof(Macro));
+    if (!m)
+    {
+        fprintf(stderr, "out of memory in add_macro\n");
+        exit(1);
+    }
     m->name = name;
     m->is_objlike = is_objlike;
     m->body = body;
@@ -2528,6 +2568,11 @@ static Token *read_const_expr(Token **rest, Token *tok)
 static CondIncl *push_cond_incl(Token *tok, bool included)
 {
     CondIncl *ci = calloc(1, sizeof(CondIncl));
+    if (!ci)
+    {
+        fprintf(stderr, "out of memory in push_cond_incl\n");
+        exit(1);
+    }
     ci->next = cond_incl;
     ci->ctx = IN_THEN;
     ci->tok = tok;
