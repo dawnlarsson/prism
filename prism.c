@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.35.0"
+#define VERSION "0.36.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -1043,6 +1043,10 @@ static bool is_type_keyword(Token *tok)
       equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum") ||
       equal(tok, "_Bool") || equal(tok, "bool"))
     return true;
+  // typeof (GCC/C23 extension)
+  if (equal(tok, "typeof") || equal(tok, "__typeof__") || equal(tok, "__typeof") ||
+      equal(tok, "typeof_unqual"))
+    return true;
   // Common typedef types from stdint.h, stddef.h, etc.
   if (equal(tok, "size_t") || equal(tok, "ssize_t") || equal(tok, "ptrdiff_t") ||
       equal(tok, "intptr_t") || equal(tok, "uintptr_t") ||
@@ -1065,11 +1069,12 @@ static bool is_type_keyword(Token *tok)
 
 static bool is_type_qualifier(Token *tok)
 {
-  if (tok->kind != TK_KEYWORD)
+  if (tok->kind != TK_KEYWORD && tok->kind != TK_IDENT)
     return false;
   return equal(tok, "const") || equal(tok, "volatile") || equal(tok, "restrict") ||
          equal(tok, "static") || equal(tok, "auto") || equal(tok, "register") ||
-         equal(tok, "_Atomic");
+         equal(tok, "_Atomic") || equal(tok, "_Alignas") || equal(tok, "alignas") ||
+         equal(tok, "__attribute__") || equal(tok, "__attribute");
 }
 
 static bool is_skip_decl_keyword(Token *tok)
@@ -1144,6 +1149,27 @@ static Token *try_zero_init_decl(Token *tok)
       if (equal(tok, "{"))
         tok = skip_balanced(tok, "{", "}");
       saw_type = true;
+      type_end = tok;
+      continue;
+    }
+    // Handle typeof/typeof_unqual with parenthesized expression
+    if (equal(tok, "typeof") || equal(tok, "__typeof__") || equal(tok, "__typeof") ||
+        equal(tok, "typeof_unqual"))
+    {
+      saw_type = true;
+      tok = tok->next;
+      if (tok && equal(tok, "("))
+        tok = skip_balanced(tok, "(", ")");
+      type_end = tok;
+      continue;
+    }
+    // Handle _Alignas/alignas and __attribute__ with parenthesized arguments
+    if (equal(tok, "_Alignas") || equal(tok, "alignas") ||
+        equal(tok, "__attribute__") || equal(tok, "__attribute"))
+    {
+      tok = tok->next;
+      if (tok && equal(tok, "("))
+        tok = skip_balanced(tok, "(", ")");
       type_end = tok;
       continue;
     }
