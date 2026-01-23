@@ -1,10 +1,11 @@
 # Prism
 **Robust C by default.**
 
-Prism is a lightweight, self-contained transpiler that brings modern language features to standard C. It functions as a single-file build tool with zero dependencies, allowing you to write safer code without the overhead of complex build systems or heavy frameworks.
+Prism is a lightweight, self-contained transpiler that brings modern language features to standard C. It functions as a build tool with zero dependencies, allowing you to write safer code without the overhead of complex build systems or heavy frameworks, or macro hacks.
 
-**Stability First:** Focused on foundational correctness over feature creep.
-**Opt out dialect features** Disable parts of the transpiler, like zero-init
+* **Stability First:** Focused on foundational correctness, testing, and verification of edge cases.
+* **Opt out dialect features** Disable parts of the transpiler, like zero-init, with CLI flags.
+* **Build tool** Work-in-progress build tool features—no need for Makefiles for simpler C programs (with support for larger setups planned for the future).
  
 build & install
 ```c
