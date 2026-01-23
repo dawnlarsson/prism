@@ -1,12 +1,15 @@
-# Prism
-**Robust C by default.**
+![prism_banner](https://github.com/user-attachments/assets/97c303d0-0d85-4262-8fb3-663a33ce00cd)
+
+### **Robust C by default.**
 
 Prism is a lightweight, self-contained transpiler that brings modern language features to standard C. It functions as a build tool with zero dependencies, allowing you to write safer code without the overhead of complex build systems or heavy frameworks, or macro hacks.
 
 * **Stability First:** Focused on foundational correctness, testing, and verification of edge cases.
 * **Opt out dialect features** Disable parts of the transpiler, like zero-init, with CLI flags.
 * **Build tool** Work-in-progress build tool features—no need for Makefiles for simpler C programs (with support for larger setups planned for the future).
- 
+
+<br/>
+
 build & install
 ```c
 cc prism.c -flto -s -O3 -o /tmp/prism && /tmp/prism install && rm /tmp/prism
