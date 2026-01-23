@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.34.0"
+#define VERSION "0.35.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -128,6 +128,9 @@ static LabelTable label_table;
 
 // Track if current function returns void (for return statement handling)
 static bool current_func_returns_void = false;
+
+// Track if current function uses setjmp/longjmp (defer is unsafe with these)
+static bool current_func_has_setjmp = false;
 
 // Track statement boundaries for zero-init (moved to static for helper access)
 static bool at_stmt_start = false;
@@ -533,10 +536,12 @@ static bool is_label(Token *tok)
 }
 
 // Scan a function body for labels and record their scope depths
+// Also detects setjmp/longjmp usage which bypasses defer
 // tok should point to the opening '{' of the function body
 static void scan_labels_in_function(Token *tok)
 {
   label_table_reset();
+  current_func_has_setjmp = false; // Reset for new function
   if (!tok || !equal(tok, "{"))
     return;
 
@@ -617,6 +622,15 @@ static void scan_labels_in_function(Token *tok)
       prev = tok;
       tok = tok->next;
       continue;
+    }
+
+    // Detect setjmp/longjmp/sigsetjmp/siglongjmp usage
+    if (tok->kind == TK_IDENT &&
+        (equal(tok, "setjmp") || equal(tok, "longjmp") ||
+         equal(tok, "_setjmp") || equal(tok, "_longjmp") ||
+         equal(tok, "sigsetjmp") || equal(tok, "siglongjmp")))
+    {
+      current_func_has_setjmp = true;
     }
 
     // Check for label: identifier followed by ':' (but not ::)
@@ -1096,6 +1110,7 @@ static bool is_const_array_size(Token *open_bracket)
 }
 
 // Try to handle a declaration with zero-init
+// Supports multi-declarators like: int a, b, *c, d[10];
 // Returns the token after the declaration if handled, NULL otherwise
 static Token *try_zero_init_decl(Token *tok)
 {
@@ -1112,6 +1127,7 @@ static Token *try_zero_init_decl(Token *tok)
   bool saw_type = false;
   bool is_struct_type = false;
   bool is_typedef_type = false;
+  Token *type_end = tok; // Will point to first token after the base type
 
   while (is_type_qualifier(tok) || is_type_keyword(tok))
   {
@@ -1128,17 +1144,18 @@ static Token *try_zero_init_decl(Token *tok)
       if (equal(tok, "{"))
         tok = skip_balanced(tok, "{", "}");
       saw_type = true;
+      type_end = tok;
       continue;
     }
     // Check for user-defined typedef (needs {0} initialization for structs)
     if (is_known_typedef(tok))
       is_typedef_type = true;
     tok = tok->next;
+    type_end = tok;
   }
 
   // Check for typedef'd type: identifier followed by identifier (no pointer)
   // Pattern: my_type x; - but NOT my_type *x; (ambiguous with multiplication)
-  // We only match "TypeName varname;" to avoid misidentifying "a * b;" as a declaration
   if (!saw_type && tok->kind == TK_IDENT)
   {
     Token *maybe_type = tok;
@@ -1158,7 +1175,8 @@ static Token *try_zero_init_decl(Token *tok)
       {
         saw_type = true;
         is_typedef_type = true;
-        tok = maybe_type->next; // Move past the type name
+        tok = maybe_type->next;
+        type_end = tok;
       }
     }
   }
@@ -1166,126 +1184,228 @@ static Token *try_zero_init_decl(Token *tok)
   if (!saw_type)
     return NULL;
 
-  // Skip pointers - if it's a pointer, it's not a struct anymore
-  bool is_pointer = false;
-  while (equal(tok, "*") || is_type_qualifier(tok))
+  // Before emitting anything, verify there's at least one declarator
+  // Look for: pointers/qualifiers followed by identifier
+  Token *check = tok;
+  while (equal(check, "*") || is_type_qualifier(check))
+    check = check->next;
+
+  // Handle parenthesized declarators: (*name)
+  if (equal(check, "("))
   {
-    if (equal(tok, "*"))
-      is_pointer = true;
-    tok = tok->next;
+    check = check->next;
+    if (!equal(check, "*"))
+      return NULL; // Not a pointer declarator pattern
+    while (equal(check, "*") || is_type_qualifier(check))
+      check = check->next;
   }
 
-  // Handle parenthesized declarators: (*name), (*name)[N], (*name)(args)
-  // Also handle: (*name[N])(args) - array of function pointers
-  // Pattern: type (* [qualifiers] name [array]) [array] (func_args)?
-  bool has_paren_declarator = false;
-  bool array_inside_paren = false;
-  if (equal(tok, "("))
+  // Must have identifier - if not, this is just a type declaration (e.g., struct Foo {};)
+  if (check->kind != TK_IDENT)
+    return NULL;
+
+  // Now we've confirmed there's at least one declarator. Emit the base type.
+  emit_range(start, type_end);
+
+  // Process each declarator in the list
+  bool first_declarator = true;
+  while (tok && tok->kind != TK_EOF)
   {
-    Token *paren_start = tok;
-    tok = tok->next;
+    // For subsequent declarators, we already emitted the comma
+    Token *decl_start = tok;
 
-    // Should be * for pointer declarator
-    if (!equal(tok, "*"))
-      return NULL; // Not a pointer declarator, bail
-
-    is_pointer = true;
-    tok = tok->next;
-
-    // Skip qualifiers inside parens
-    while (is_type_qualifier(tok))
+    // Parse this declarator's pointer modifiers
+    bool is_pointer = false;
+    while (equal(tok, "*") || is_type_qualifier(tok))
+    {
+      if (equal(tok, "*"))
+        is_pointer = true;
+      emit_tok(tok);
       tok = tok->next;
+    }
 
-    // Must be identifier now
+    // Handle parenthesized declarators: (*name), (*name)[N], (*name)(args)
+    bool has_paren_declarator = false;
+    bool array_inside_paren = false;
+    if (equal(tok, "("))
+    {
+      Token *paren_start = tok;
+      Token *peek = tok->next;
+
+      // Should be * for pointer declarator
+      if (!equal(peek, "*"))
+        return NULL; // Not a pointer declarator, bail
+
+      emit_tok(tok); // emit '('
+      tok = tok->next;
+      is_pointer = true;
+
+      while (equal(tok, "*") || is_type_qualifier(tok))
+      {
+        if (equal(tok, "*"))
+          is_pointer = true;
+        emit_tok(tok);
+        tok = tok->next;
+      }
+
+      // Must be identifier now
+      if (tok->kind != TK_IDENT)
+        return NULL;
+
+      has_paren_declarator = true;
+    }
+
+    // Must have identifier
     if (tok->kind != TK_IDENT)
       return NULL;
 
-    has_paren_declarator = true;
-  }
-
-  // Must have identifier
-  if (tok->kind != TK_IDENT)
-    return NULL;
-
-  Token *var_name = tok;
-  tok = tok->next;
-
-  // Array dimension INSIDE parentheses: (*name[N])
-  if (has_paren_declarator && equal(tok, "["))
-  {
-    array_inside_paren = true;
-    while (equal(tok, "["))
-      tok = skip_balanced(tok, "[", "]");
-  }
-
-  // Close paren for parenthesized declarator
-  if (has_paren_declarator)
-  {
-    if (!equal(tok, ")"))
-      return NULL;
+    Token *var_name = tok;
+    emit_tok(tok);
     tok = tok->next;
-  }
 
-  // Check what follows the identifier (or closing paren)
-  bool is_array = array_inside_paren; // Array of function ptrs counts as array
-  bool is_vla = false;
-  bool is_func_ptr = false;
-
-  // Function pointer: (*name)(args) - the (args) part
-  if (equal(tok, "("))
-  {
-    if (!has_paren_declarator)
-      return NULL; // Regular function declaration, not a variable
-    is_func_ptr = true;
-    tok = skip_balanced(tok, "(", ")");
-  }
-
-  // Array?
-  if (equal(tok, "["))
-  {
-    is_array = true;
-    if (!is_const_array_size(tok))
-      is_vla = true;
-    // Skip all array dimensions
-    while (equal(tok, "["))
-      tok = skip_balanced(tok, "[", "]");
-  }
-
-  // Multiple declarators? Too complex - warn user once
-  if (equal(tok, ","))
-  {
-    static bool warned_multi_decl = false;
-    if (!warned_multi_decl)
+    // Array dimension INSIDE parentheses: (*name[N])
+    if (has_paren_declarator && equal(tok, "["))
     {
-      fprintf(stderr, "prism: note: multi-declarator '%.*s, ...' not zero-initialized "
-                      "(split into separate declarations for auto-init)\n",
-              var_name->len, var_name->loc);
-      warned_multi_decl = true;
+      array_inside_paren = true;
+      while (equal(tok, "["))
+      {
+        emit_tok(tok);
+        tok = tok->next;
+        while (!equal(tok, "]") && tok->kind != TK_EOF)
+        {
+          emit_tok(tok);
+          tok = tok->next;
+        }
+        if (equal(tok, "]"))
+        {
+          emit_tok(tok);
+          tok = tok->next;
+        }
+      }
     }
-    return NULL;
+
+    // Close paren for parenthesized declarator
+    if (has_paren_declarator)
+    {
+      if (!equal(tok, ")"))
+        return NULL;
+      emit_tok(tok);
+      tok = tok->next;
+    }
+
+    // Check what follows the identifier
+    bool is_array = array_inside_paren;
+    bool is_vla = false;
+    bool is_func_ptr = false;
+
+    // Function pointer: (*name)(args)
+    if (equal(tok, "("))
+    {
+      if (!has_paren_declarator)
+        return NULL; // Regular function declaration
+      is_func_ptr = true;
+      // Emit the function args
+      emit_tok(tok);
+      tok = tok->next;
+      int depth = 1;
+      while (tok->kind != TK_EOF && depth > 0)
+      {
+        if (equal(tok, "("))
+          depth++;
+        else if (equal(tok, ")"))
+          depth--;
+        emit_tok(tok);
+        tok = tok->next;
+      }
+    }
+
+    // Array dimensions
+    if (equal(tok, "["))
+    {
+      is_array = true;
+      while (equal(tok, "["))
+      {
+        // Check if VLA before emitting
+        if (!is_const_array_size(tok))
+          is_vla = true;
+        emit_tok(tok);
+        tok = tok->next;
+        while (!equal(tok, "]") && tok->kind != TK_EOF)
+        {
+          emit_tok(tok);
+          tok = tok->next;
+        }
+        if (equal(tok, "]"))
+        {
+          emit_tok(tok);
+          tok = tok->next;
+        }
+      }
+    }
+
+    // Check if this declarator already has an initializer
+    bool has_init = equal(tok, "=");
+
+    // VLAs can't be initialized - warn once
+    if (is_vla && !has_init)
+    {
+      static bool warned_vla = false;
+      if (!warned_vla)
+      {
+        fprintf(stderr, "prism: warning: VLA '%.*s[...]' cannot be auto zero-initialized. "
+                        "Use fixed-size arrays or memset() for safety.\n",
+                var_name->len, var_name->loc);
+        warned_vla = true;
+      }
+    }
+
+    // Add zero initializer if no existing initializer and not a VLA
+    if (!has_init && !is_vla)
+    {
+      if (is_array || ((is_struct_type || is_typedef_type) && !is_pointer))
+        fprintf(out, " = {0}");
+      else
+        fprintf(out, " = 0");
+    }
+
+    // If has initializer, emit it (= and everything up to , or ;)
+    if (has_init)
+    {
+      int depth = 0;
+      while (tok->kind != TK_EOF)
+      {
+        if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
+          depth++;
+        else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
+          depth--;
+        else if (depth == 0 && (equal(tok, ",") || equal(tok, ";")))
+          break;
+        emit_tok(tok);
+        tok = tok->next;
+      }
+    }
+
+    // Check what's next
+    if (equal(tok, ";"))
+    {
+      emit_tok(tok);
+      return tok->next;
+    }
+    else if (equal(tok, ","))
+    {
+      emit_tok(tok);
+      tok = tok->next;
+      first_declarator = false;
+      // Continue to next declarator
+    }
+    else
+    {
+      // Unexpected token - bail
+      return NULL;
+    }
   }
 
-  // Already has initializer?
-  if (equal(tok, "="))
-    return NULL;
-
-  // Must end with semicolon
-  if (!equal(tok, ";"))
-    return NULL;
-
-  // VLAs can't be initialized
-  if (is_vla)
-    return NULL;
-
-  // Emit the declaration with zero initializer
-  emit_range(start, tok); // everything up to semicolon
-  if (is_array || ((is_struct_type || is_typedef_type) && !is_pointer))
-    fprintf(out, " = {0}");
-  else
-    fprintf(out, " = 0");
-  emit_tok(tok); // semicolon
-
-  return tok->next;
+  return NULL;
 }
 
 static int transpile(char *input_file, char *output_file)
@@ -1366,6 +1486,19 @@ static int transpile(char *input_file, char *output_file)
       // Check for braceless control flow - defer needs a proper scope
       if (pending_control_flow)
         error_tok(tok, "defer cannot be the body of a braceless control statement - add braces");
+
+      // Warn about setjmp/longjmp - defer is unsafe with these
+      if (current_func_has_setjmp)
+      {
+        static bool warned_setjmp = false;
+        if (!warned_setjmp)
+        {
+          fprintf(stderr, "%s:%d: warning: defer in function using setjmp/longjmp is unsafe. "
+                          "longjmp() bypasses defer cleanup. Consider using explicit cleanup instead.\n",
+                  tok->file->name, tok->line_no);
+          warned_setjmp = true;
+        }
+      }
 
       Token *defer_keyword = tok;
       tok = tok->next; // skip 'defer'
