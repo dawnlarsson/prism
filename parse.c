@@ -228,6 +228,11 @@ static char *find_gcc_include_path(const char *base_dir, const char *triple)
             {
                 free(best_version);
                 best_version = strdup(ent->d_name);
+                if (!best_version)
+                {
+                    closedir(dir);
+                    return NULL;
+                }
             }
         }
     }
@@ -259,12 +264,10 @@ static void pp_add_default_include_paths(void)
             if (len > 0 && clang_dir[len - 1] == '\n')
                 clang_dir[len - 1] = '\0';
 
-            char *include_path = malloc(PATH_MAX);
+            char include_path[PATH_MAX];
             snprintf(include_path, PATH_MAX, "%s/include", clang_dir);
             if (stat(include_path, &st) == 0)
                 pp_add_include_path(include_path);
-            else
-                free(include_path);
         }
         pclose(fp);
     }
@@ -282,12 +285,10 @@ static void pp_add_default_include_paths(void)
                 sdk_path[len - 1] = '\0';
 
             // Add SDK include path
-            char *include_path = malloc(PATH_MAX);
+            char include_path[PATH_MAX];
             snprintf(include_path, PATH_MAX, "%s/usr/include", sdk_path);
             if (stat(include_path, &st) == 0)
                 pp_add_include_path(include_path);
-            else
-                free(include_path);
         }
         pclose(fp);
     }
@@ -438,6 +439,11 @@ static void hashmap_rehash(HashMap *map)
 
     HashMap map2 = {};
     map2.buckets = calloc((size_t)cap, sizeof(HashEntry));
+    if (!map2.buckets)
+    {
+        fprintf(stderr, "out of memory in hashmap_rehash\n");
+        exit(1);
+    }
     map2.capacity = cap;
 
     for (int i = 0; i < map->capacity; i++)
@@ -1174,6 +1180,8 @@ static void convert_pp_number(Token *tok)
     if (is_float)
     {
         char *buf = strndup(start, end - start);
+        if (!buf)
+            error_tok(tok, "out of memory");
         char *p = buf;
         char *endp;
         tok->fval = strtold(buf, &endp);
@@ -1393,6 +1401,12 @@ static char *read_file(char *path)
     char *buf;
     size_t buflen;
     FILE *out = open_memstream(&buf, &buflen);
+    if (!out)
+    {
+        if (fp != stdin)
+            fclose(fp);
+        return NULL;
+    }
     char buf2[4096];
     int n;
     while ((n = fread(buf2, 1, sizeof(buf2), fp)) > 0)
@@ -2589,11 +2603,18 @@ static Token *preprocess2(Token *tok)
             if (is_dquote)
             {
                 // Search relative to current file first
-                char *dir = dirname(strdup(start->file->name));
-                char *try = format("%s/%s", dir, filename);
-                struct stat st;
-                if (stat(try, &st) == 0)
-                    path = try;
+                char *name_copy = strdup(start->file->name);
+                if (name_copy)
+                {
+                    char *dir = dirname(name_copy);
+                    char *try = format("%s/%s", dir, filename);
+                    free(name_copy); // Safe to free after format() made its own copy
+                    struct stat st;
+                    if (stat(try, &st) == 0)
+                        path = try;
+                    else
+                        free(try);
+                }
             }
             if (!path)
                 path = search_include_paths(filename);

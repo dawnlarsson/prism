@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.30.0"
+#define VERSION "0.31.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -1509,6 +1509,12 @@ static int transpile(char *input_file, char *output_file)
     // Track statement boundaries for zero-init
     if (equal(tok, ";") && !pending_control_flow)
       at_stmt_start = true;
+
+    // Reset void function detection at top-level semicolons
+    // This prevents function declarations like "void foo(void);" from affecting
+    // subsequent function definitions
+    if (equal(tok, ";") && defer_depth == 0)
+      next_func_returns_void = false;
 
     // Track previous token at top level for function detection
     if (defer_depth == 0)
