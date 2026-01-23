@@ -1,5 +1,7 @@
+// Apache 2.0 license (c) Dawn Larsson 2026
+
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.32.0"
+#define VERSION "0.33.0"
 
 // Include the tokenizer/preprocessor
 #include "parse.c"
@@ -2096,29 +2098,27 @@ int main(int argc, char **argv)
 {
   if (argc < 2)
   {
-    printf("Prism v%s\n"
+    printf("Prism v%s\n\n"
            "Usage: prism [options] src.c [output] [args]\n\n"
            "Options:\n"
-           "  build          Build only, don't run\n"
-           "  transpile      Transpile only, output to stdout or file\n"
-           "  debug/release/small  Optimization mode\n"
-           "  arm/x86        Architecture (default: native)\n"
-           "  32/64          Word size (default: 64)\n"
-           "  linux/windows/macos  Platform (default: native)\n"
-           "  no-defer       Disable defer feature\n"
-           "  no-zeroinit    Disable zero-initialization\n\n"
+           "  install               Install prism as a global cli tool\n"
+           "  build                 Build only, don't run\n"
+           "  transpile             Transpile only, output to stdout or file\n"
+           "  debug/release/small   Optimization mode\n"
+           "  arm/x86               Architecture (default: native)\n"
+           "  32/64                 Word size (default: 64)\n"
+           "  linux/windows/macos   Platform (default: native)\n"
+           "  no-defer              Disable defer feature\n"
+           "  no-zeroinit           Disable zero-initialization\n\n"
            "Examples:\n"
-           "  prism src.c              Run src.c\n"
-           "  prism build src.c        Build src\n"
-           "  prism build src.c out    Build to 'out'\n"
-           "  prism build arm src.c    Build for arm64 linux\n"
-           "  prism transpile src.c    Transpile to stdout\n"
-           "  prism transpile src.c out.c  Transpile to out.c\n"
-           "  prism no-defer src.c     Run without defer\n\n"
-           "Prism extensions:\n"
-           "  defer stmt;    Execute stmt when scope exits\n"
-           "  Zero-init      Local vars auto-initialized to 0\n\n"
-           "install\n",
+           "  prism src.c                   Run src.c\n"
+           "  prism build src.c             Build src\n"
+           "  prism build src.c out         Build to 'out'\n"
+           "  prism build arm src.c         Build for arm64 linux\n"
+           "  prism transpile src.c         Transpile to stdout\n"
+           "  prism transpile src.c out.c   Transpile to out.c\n"
+           "  prism no-defer src.c          Run without defer\n\n"
+           "Apache 2.0 license (c) Dawn Larsson 2026\nhttps://github.com/dawnlarsson/prism \n\n",
            VERSION);
     return 0;
   }

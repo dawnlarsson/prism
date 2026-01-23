@@ -1,6 +1,11 @@
 # Prism
-C transpiled with some sugar
+**Robust C by default.**
 
+Prism is a lightweight, self-contained transpiler that brings modern language features to standard C. It functions as a single-file build tool with zero dependencies, allowing you to write safer code without the overhead of complex build systems or heavy frameworks.
+
+**Stability First:** Focused on foundational correctness over feature creep.
+**Opt out dialect features** Disable parts of the transpiler, like zero-init
+ 
 build & install
 ```c
 cc prism.c -flto -s -O3 -o /tmp/prism && /tmp/prism install && rm /tmp/prism
@@ -44,33 +49,33 @@ Works with: primitives, pointers, arrays, structs, unions, enums.
 ## CLI
 
 ```sh
-Prism v0.21.0
+Prism v0.33.0
+
 Usage: prism [options] src.c [output] [args]
 
 Options:
-  build          Build only, don't run
-  transpile      Transpile only, output to stdout or file
-  debug/release/small  Optimization mode
-  arm/x86        Architecture (default: native)
-  32/64          Word size (default: 64)
-  linux/windows/macos  Platform (default: native)
-  no-defer       Disable defer feature
-  no-zeroinit    Disable zero-initialization
+  install               Install prism as a global cli tool
+  build                 Build only, don't run
+  transpile             Transpile only, output to stdout or file
+  debug/release/small   Optimization mode
+  arm/x86               Architecture (default: native)
+  32/64                 Word size (default: 64)
+  linux/windows/macos   Platform (default: native)
+  no-defer              Disable defer feature
+  no-zeroinit           Disable zero-initialization
 
 Examples:
-  prism src.c              Run src.c
-  prism build src.c        Build src
-  prism build src.c out    Build to 'out'
-  prism build arm src.c    Build for arm64 linux
-  prism transpile src.c    Transpile to stdout
-  prism transpile src.c out.c  Transpile to out.c
-  prism no-defer src.c     Run without defer
+  prism src.c                   Run src.c
+  prism build src.c             Build src
+  prism build src.c out         Build to 'out'
+  prism build arm src.c         Build for arm64 linux
+  prism transpile src.c         Transpile to stdout
+  prism transpile src.c out.c   Transpile to out.c
+  prism no-defer src.c          Run without defer
 
-Prism extensions:
-  defer stmt;    Execute stmt when scope exits
-  Zero-init      Local vars auto-initialized to 0
+Apache 2.0 license (c) Dawn Larsson 2026
+https://github.com/dawnlarsson/prism 
 
-install
 ```
 
 # parse.c
@@ -78,4 +83,4 @@ C tokenizer and preprocessor based from chibicc (MIT),
 single file, few fixes/changes ect.
 
 # Repo
-Apache 2.0 license
+Apache 2.0 license (c) Dawn Larsson 2026
