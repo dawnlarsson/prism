@@ -1305,6 +1305,134 @@ void run_stress_tests(void)
 #endif
 }
 
+// SECTION 8: SAFETY HOLE TESTS
+// These tests verify that valid goto patterns still work correctly,
+// while invalid patterns (goto skipping declarations) are caught at compile time.
+
+// Test: goto jumping OVER an entire block is valid
+void test_goto_over_block(void)
+{
+    log_reset();
+    int before = 1;
+    log_append("A");
+    goto DONE;
+    {
+        // This entire block is skipped - no safety issue
+        int x = 42;
+        log_append("X"); // Should not run
+    }
+DONE:
+    log_append("B");
+    CHECK_EQ(before, 1, "goto over block - var before goto");
+    CHECK_LOG("AB", "goto over block - skips entire block");
+}
+
+// Test: goto backward (to earlier label) is valid
+void test_goto_backward_valid(void)
+{
+    log_reset();
+    int count = 0;
+    int x = 10; // Declared before label - always initialized
+AGAIN:
+    log_append("L");
+    count++;
+    x++;
+    if (count < 3)
+        goto AGAIN;
+    log_append("E");
+    CHECK_EQ(count, 3, "goto backward - loop count");
+    CHECK_EQ(x, 13, "goto backward - var incremented");
+    CHECK_LOG("LLLE", "goto backward - correct order");
+}
+
+// Test: goto forward to same scope level (no decls between) is valid
+void test_goto_forward_no_decl(void)
+{
+    log_reset();
+    int x = 5; // Before goto
+    log_append("A");
+    if (x > 0)
+        goto SKIP;
+    log_append("X"); // Skipped
+SKIP:
+    log_append("B");
+    CHECK_EQ(x, 5, "goto forward no decl - var preserved");
+    CHECK_LOG("AB", "goto forward no decl - correct order");
+}
+
+// Test: goto into nested scope where decl is AFTER label is valid
+void test_goto_into_scope_decl_after_label(void)
+{
+    log_reset();
+    goto INNER;
+    {
+    INNER:
+        log_append("I");
+        int x = 42; // Decl is AFTER label - this is fine
+        log_append("D");
+        CHECK_EQ(x, 42, "goto into scope - decl after label");
+    }
+    CHECK_LOG("ID", "goto into scope - correct order");
+}
+
+// Test: multiple gotos with proper structure
+void test_goto_complex_valid(void)
+{
+    log_reset();
+    int state = 0;
+
+START:
+    if (state == 0)
+    {
+        log_append("0");
+        state = 1;
+        goto MIDDLE;
+    }
+    log_append("X");
+    goto END;
+
+MIDDLE:
+    log_append("1");
+    state = 2;
+    goto START;
+
+END:
+    log_append("E");
+    CHECK_EQ(state, 2, "goto complex - final state");
+    CHECK_LOG("01XE", "goto complex - correct order");
+}
+
+// Test: goto with defer still works when not skipping decls
+void test_goto_with_defer_valid(void)
+{
+    log_reset();
+    int x = 1; // Before the scope with defer
+    {
+        defer log_append("D");
+        log_append("A");
+        if (x > 0)
+            goto OUT;
+        log_append("X");
+    OUT:
+        log_append("B");
+    }
+    log_append("E");
+    CHECK_LOG("ABDE", "goto with defer - defer runs on scope exit");
+}
+
+void run_safety_hole_tests(void)
+{
+    printf("\n=== SAFETY HOLE TESTS ===\n");
+    printf("(Verifying valid goto patterns work; invalid patterns are compile-time errors)\n");
+
+    test_goto_over_block();
+    test_goto_backward_valid();
+    test_goto_forward_no_decl();
+    test_goto_into_scope_decl_after_label();
+    test_goto_complex_valid();
+    test_goto_with_defer_valid();
+}
+
 // MAIN
 
 int main(void)
@@ -1320,6 +1448,7 @@ int main(void)
     run_bug_regression_tests();
     run_advanced_defer_tests();
     run_stress_tests();
+    run_safety_hole_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

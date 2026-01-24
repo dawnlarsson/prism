@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.42.0"
+#define VERSION "0.43.0"
 
 #include "parse.c"
 
@@ -791,6 +791,214 @@ static Token *goto_skips_defer(Token *goto_tok, char *label_name, int label_len)
 
   return NULL; // Label not found in forward scan, or all defers were in skipped blocks
 }
+
+// Check if a forward goto would skip over any variable declarations (with zero-init)
+// This is undefined behavior in C - the declaration executes but initialization is skipped.
+// We make this a hard error to maintain zero-init safety guarantees.
+//
+// Same logic as goto_skips_defer:
+// - INVALID: goto jumps INTO a block, landing AFTER a declaration inside that block
+// - VALID: goto jumps OVER an entire block containing a declaration
+static Token *goto_skips_decl(Token *goto_tok, char *label_name, int label_len)
+{
+  if (!feature_zeroinit)
+    return NULL; // Only check when zero-init is enabled
+
+  // Scan forward from goto to find the label
+  Token *tok = goto_tok->next->next; // skip 'goto' and label name
+  if (tok && equal(tok, ";"))
+    tok = tok->next;
+
+  int depth = 0;
+  int local_struct_depth = 0;
+  Token *active_decl = NULL; // Most recently seen declaration that's still "in scope"
+  int active_decl_depth = -1;
+  Token *prev = NULL;
+  bool at_stmt_start = true;
+
+  while (tok && tok->kind != TK_EOF)
+  {
+    // Track struct/union/enum bodies
+    if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum"))
+    {
+      Token *t = tok->next;
+      while (t && (t->kind == TK_IDENT || equal(t, "__attribute__")))
+      {
+        if (equal(t, "__attribute__"))
+        {
+          t = t->next;
+          if (t && equal(t, "("))
+          {
+            int paren_depth = 1;
+            t = t->next;
+            while (t && paren_depth > 0)
+            {
+              if (equal(t, "("))
+                paren_depth++;
+              else if (equal(t, ")"))
+                paren_depth--;
+              t = t->next;
+            }
+          }
+        }
+        else
+          t = t->next;
+      }
+      if (t && equal(t, "{"))
+      {
+        while (tok != t)
+        {
+          prev = tok;
+          tok = tok->next;
+        }
+        local_struct_depth++;
+        depth++;
+        prev = tok;
+        tok = tok->next;
+        at_stmt_start = false;
+        continue;
+      }
+    }
+
+    if (equal(tok, "{"))
+    {
+      depth++;
+      prev = tok;
+      tok = tok->next;
+      at_stmt_start = true;
+      continue;
+    }
+    if (equal(tok, "}"))
+    {
+      if (active_decl && depth <= active_decl_depth)
+      {
+        active_decl = NULL;
+        active_decl_depth = -1;
+      }
+      if (local_struct_depth > 0)
+        local_struct_depth--;
+      if (depth == 0)
+        break;
+      depth--;
+      prev = tok;
+      tok = tok->next;
+      at_stmt_start = true;
+      continue;
+    }
+    if (equal(tok, ";"))
+    {
+      at_stmt_start = true;
+      prev = tok;
+      tok = tok->next;
+      continue;
+    }
+
+    // Detect variable declarations at statement start (not inside struct bodies)
+    // Skip extern/typedef/static declarations
+    if (at_stmt_start && local_struct_depth == 0)
+    {
+      Token *decl_start = tok;
+
+      // Skip 'raw' keyword if present
+      if (equal(tok, "raw"))
+        tok = tok->next;
+
+      // Skip extern/typedef - these don't create initialized variables
+      if (!equal(tok, "extern") && !equal(tok, "typedef"))
+      {
+        // Check if this looks like a declaration
+        Token *t = tok;
+
+        // Skip qualifiers and type keywords
+        bool saw_type = false;
+        while (t && (equal(t, "const") || equal(t, "volatile") || equal(t, "static") ||
+                     equal(t, "auto") || equal(t, "register") || equal(t, "_Atomic") ||
+                     equal(t, "restrict") || equal(t, "__restrict") || equal(t, "__restrict__")))
+          t = t->next;
+
+        // Check for type keyword
+        if (t && (equal(t, "int") || equal(t, "char") || equal(t, "short") ||
+                  equal(t, "long") || equal(t, "float") || equal(t, "double") ||
+                  equal(t, "void") || equal(t, "signed") || equal(t, "unsigned") ||
+                  equal(t, "_Bool") || equal(t, "bool") ||
+                  equal(t, "struct") || equal(t, "union") || equal(t, "enum") ||
+                  is_known_typedef(t)))
+        {
+          saw_type = true;
+
+          // Skip past the type
+          if (equal(t, "struct") || equal(t, "union") || equal(t, "enum"))
+          {
+            t = t->next;
+            if (t && t->kind == TK_IDENT)
+              t = t->next;
+            if (t && equal(t, "{"))
+            {
+              int bd = 1;
+              t = t->next;
+              while (t && bd > 0)
+              {
+                if (equal(t, "{"))
+                  bd++;
+                else if (equal(t, "}"))
+                  bd--;
+                t = t->next;
+              }
+            }
+          }
+          else
+          {
+            while (t && (equal(t, "int") || equal(t, "char") || equal(t, "short") ||
+                         equal(t, "long") || equal(t, "float") || equal(t, "double") ||
+                         equal(t, "signed") || equal(t, "unsigned") ||
+                         is_known_typedef(t)))
+              t = t->next;
+          }
+
+          // Skip pointers and qualifiers
+          while (t && (equal(t, "*") || equal(t, "const") || equal(t, "volatile") ||
+                       equal(t, "restrict") || equal(t, "__restrict") || equal(t, "__restrict__")))
+            t = t->next;
+
+          // Should be at identifier now - and NOT followed by '(' (that's a function)
+          if (t && t->kind == TK_IDENT && t->next && !equal(t->next, "("))
+          {
+            // This is a variable declaration - remember it
+            if (!active_decl || depth <= active_decl_depth)
+            {
+              active_decl = decl_start;
+              active_decl_depth = depth;
+            }
+          }
+        }
+      }
+    }
+
+    // Found the label?
+    if (is_label(tok) && tok->len == label_len &&
+        !memcmp(tok->loc, label_name, label_len))
+    {
+      Token *colon = tok->next;
+      bool is_scope_resolution = colon->next && equal(colon->next, ":");
+      bool is_ternary = prev && equal(prev, "?");
+      bool is_switch_case = prev && (equal(prev, "case") || equal(prev, "default"));
+      bool is_bitfield = local_struct_depth > 0;
+
+      if (!is_scope_resolution && !is_ternary && !is_switch_case && !is_bitfield)
+      {
+        // Real label found - if we have an active decl, goto skips it
+        return active_decl;
+      }
+    }
+
+    at_stmt_start = false;
+    prev = tok;
+    tok = tok->next;
+  }
+
+  return NULL;
+}
+
 // Transpiler
 static Token *skip_to_semicolon(Token *tok)
 {
@@ -1830,6 +2038,14 @@ static int transpile(char *input_file, char *output_file)
           error_tok(skipped, "goto '%.*s' would skip over this defer statement",
                     tok->len, tok->loc);
 
+        // Check if this goto would skip over a variable declaration (zero-init safety)
+        Token *skipped_decl = goto_skips_decl(goto_tok, tok->loc, tok->len);
+        if (skipped_decl)
+          error_tok(skipped_decl, "goto '%.*s' would skip over this variable declaration, "
+                                  "bypassing zero-initialization (undefined behavior in C). "
+                                  "Move the declaration before the goto, or restructure the code.",
+                    tok->len, tok->loc);
+
         int target_depth = label_table_lookup(tok->loc, tok->len);
         // If label not found, assume same depth (forward reference within scope)
         if (target_depth < 0)
@@ -1853,6 +2069,24 @@ static int transpile(char *input_file, char *output_file)
         }
       }
       // No defers or couldn't parse, emit normally
+      emit_tok(goto_tok);
+      continue;
+    }
+
+    // Check goto for zeroinit safety even when defer is disabled
+    if (feature_zeroinit && !feature_defer && tok->kind == TK_KEYWORD && equal(tok, "goto"))
+    {
+      Token *goto_tok = tok;
+      tok = tok->next;
+      if (tok->kind == TK_IDENT)
+      {
+        Token *skipped_decl = goto_skips_decl(goto_tok, tok->loc, tok->len);
+        if (skipped_decl)
+          error_tok(skipped_decl, "goto '%.*s' would skip over this variable declaration, "
+                                  "bypassing zero-initialization (undefined behavior in C). "
+                                  "Move the declaration before the goto, or restructure the code.",
+                    tok->len, tok->loc);
+      }
       emit_tok(goto_tok);
       continue;
     }
@@ -2417,7 +2651,7 @@ int main(int argc, char **argv)
            "Usage: prism [options] src.c [output] [args]\n\n"
            "Options:\n"
            "  install               Install prism as a global cli tool\n"
-           "  build                 Build only, dont run\n"
+           "  build                 Build only, don't run\n"
            "  transpile             Transpile only, output to stdout or file\n"
            "  debug/release/small   Optimization mode\n"
            "  arm/x86               Architecture (default: native)\n"
