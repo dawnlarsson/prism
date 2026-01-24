@@ -1,6 +1,6 @@
 #define _DARWIN_C_SOURCE
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.45.0"
+#define VERSION "0.46.0"
 
 #include "parse.c"
 
@@ -52,17 +52,20 @@ static bool feature_zeroinit = true;
 
 static int struct_depth = 0;
 
-#define MAX_DEFER_DEPTH 64
-#define MAX_DEFERS_PER_SCOPE 32
-#define MAX_LABELS 256
-#define MAX_ARGS 128
+// Initial capacities for dynamic arrays (will grow as needed)
+#define INITIAL_DEFER_DEPTH 64
+#define INITIAL_DEFERS_PER_SCOPE 32
+#define INITIAL_LABELS 256
+#define INITIAL_ARGS 128
+#define INITIAL_STMT_EXPR_DEPTH 32
 
 typedef struct
 {
-  Token *stmts[MAX_DEFERS_PER_SCOPE];     // Start token of each deferred statement
-  Token *ends[MAX_DEFERS_PER_SCOPE];      // End token (the semicolon)
-  Token *defer_tok[MAX_DEFERS_PER_SCOPE]; // The 'defer' keyword token (for error messages)
+  Token **stmts;     // Start token of each deferred statement (dynamic)
+  Token **ends;      // End token (the semicolon) (dynamic)
+  Token **defer_tok; // The 'defer' keyword token (for error messages) (dynamic)
   int count;
+  int capacity;          // Current capacity of the arrays
   bool is_loop;          // true if this scope is a for/while/do loop
   bool is_switch;        // true if this scope is a switch statement
   bool had_control_exit; // true if break/return/goto/continue seen since last defer in switch
@@ -77,8 +80,9 @@ typedef struct
 
 typedef struct
 {
-  LabelInfo labels[MAX_LABELS];
+  LabelInfo *labels; // Dynamic array
   int count;
+  int capacity;
 } LabelTable;
 
 typedef struct
@@ -99,8 +103,9 @@ typedef struct
 
 static TypedefTable typedef_table;
 
-static DeferScope defer_stack[MAX_DEFER_DEPTH];
+static DeferScope *defer_stack = NULL;
 static int defer_depth = 0;
+static int defer_stack_capacity = 0;
 
 static char *pending_temp_file = NULL;
 
@@ -120,9 +125,9 @@ static bool current_func_has_asm = false;
 static bool at_stmt_start = false;
 static bool in_switch_case_body = false;
 // Track statement expression scopes - store the defer_depth at which each starts
-#define MAX_STMT_EXPR_DEPTH 32
-static int stmt_expr_levels[MAX_STMT_EXPR_DEPTH]; // defer_depth when stmt expr started
-static int stmt_expr_count = 0;                   // number of active statement expressions
+static int *stmt_expr_levels = NULL; // defer_depth when stmt expr started (dynamic)
+static int stmt_expr_count = 0;      // number of active statement expressions
+static int stmt_expr_capacity = 0;   // capacity of stmt_expr_levels array
 
 // Token emission
 static FILE *out;
@@ -154,13 +159,40 @@ static void end_statement_after_semicolon(void)
   }
 }
 
+// Ensure defer_stack has capacity for at least n scopes
+static void defer_stack_ensure_capacity(int n)
+{
+  if (n <= defer_stack_capacity)
+    return;
+  int new_cap = defer_stack_capacity == 0 ? INITIAL_DEFER_DEPTH : defer_stack_capacity * 2;
+  while (new_cap < n)
+    new_cap *= 2;
+  DeferScope *new_stack = realloc(defer_stack, sizeof(DeferScope) * new_cap);
+  if (!new_stack)
+    error("out of memory growing defer stack");
+  // Initialize new scopes
+  for (int i = defer_stack_capacity; i < new_cap; i++)
+  {
+    new_stack[i].stmts = NULL;
+    new_stack[i].ends = NULL;
+    new_stack[i].defer_tok = NULL;
+    new_stack[i].count = 0;
+    new_stack[i].capacity = 0;
+    new_stack[i].is_loop = false;
+    new_stack[i].is_switch = false;
+    new_stack[i].had_control_exit = false;
+  }
+  defer_stack = new_stack;
+  defer_stack_capacity = new_cap;
+}
+
 static void defer_push_scope(void)
 {
-  if (defer_depth >= MAX_DEFER_DEPTH)
-    error("defer: scope nesting too deep (max %d)", MAX_DEFER_DEPTH);
+  defer_stack_ensure_capacity(defer_depth + 1);
   defer_stack[defer_depth].count = 0;
   defer_stack[defer_depth].is_loop = next_scope_is_loop;
   defer_stack[defer_depth].is_switch = next_scope_is_switch;
+  defer_stack[defer_depth].had_control_exit = false;
   next_scope_is_loop = false;
   next_scope_is_switch = false;
   defer_depth++;
@@ -172,13 +204,31 @@ static void defer_pop_scope(void)
     defer_depth--;
 }
 
+// Ensure a DeferScope has capacity for at least n defers
+static void defer_scope_ensure_capacity(DeferScope *scope, int n)
+{
+  if (n <= scope->capacity)
+    return;
+  int new_cap = scope->capacity == 0 ? INITIAL_DEFERS_PER_SCOPE : scope->capacity * 2;
+  while (new_cap < n)
+    new_cap *= 2;
+  Token **new_stmts = realloc(scope->stmts, sizeof(Token *) * new_cap);
+  Token **new_ends = realloc(scope->ends, sizeof(Token *) * new_cap);
+  Token **new_defer_tok = realloc(scope->defer_tok, sizeof(Token *) * new_cap);
+  if (!new_stmts || !new_ends || !new_defer_tok)
+    error("out of memory growing defer scope");
+  scope->stmts = new_stmts;
+  scope->ends = new_ends;
+  scope->defer_tok = new_defer_tok;
+  scope->capacity = new_cap;
+}
+
 static void defer_add(Token *defer_keyword, Token *start, Token *end)
 {
   if (defer_depth <= 0)
     error_tok(start, "defer outside of any scope");
   DeferScope *scope = &defer_stack[defer_depth - 1];
-  if (scope->count >= MAX_DEFERS_PER_SCOPE)
-    error_tok(start, "too many defers in scope (max %d)", MAX_DEFERS_PER_SCOPE);
+  defer_scope_ensure_capacity(scope, scope->count + 1);
   scope->defer_tok[scope->count] = defer_keyword;
   scope->stmts[scope->count] = start;
   scope->ends[scope->count] = end;
@@ -416,13 +466,24 @@ static bool control_flow_has_defers(bool include_switch)
   return found_boundary && found_defers;
 }
 
+// Ensure label_table has capacity for at least n labels
+static void label_table_ensure_capacity(int n)
+{
+  if (n <= label_table.capacity)
+    return;
+  int new_cap = label_table.capacity == 0 ? INITIAL_LABELS : label_table.capacity * 2;
+  while (new_cap < n)
+    new_cap *= 2;
+  LabelInfo *new_labels = realloc(label_table.labels, sizeof(LabelInfo) * new_cap);
+  if (!new_labels)
+    error("out of memory growing label table");
+  label_table.labels = new_labels;
+  label_table.capacity = new_cap;
+}
+
 static void label_table_add(char *name, int name_len, int scope_depth)
 {
-  if (label_table.count >= MAX_LABELS)
-  {
-    fprintf(stderr, "warning: too many labels in function (max %d), goto/defer tracking may be inaccurate\n", MAX_LABELS);
-    return;
-  }
+  label_table_ensure_capacity(label_table.count + 1);
   LabelInfo *info = &label_table.labels[label_table.count++];
   info->name = name;
   info->name_len = name_len;
@@ -2332,8 +2393,8 @@ static int transpile(char *input_file, char *output_file)
         else
         {
           // Still track scope depth for typedef scoping
-          if (defer_depth < MAX_DEFER_DEPTH)
-            defer_depth++;
+          defer_stack_ensure_capacity(defer_depth + 1);
+          defer_depth++;
         }
         at_stmt_start = true;
         continue;
@@ -2350,8 +2411,17 @@ static int transpile(char *input_file, char *output_file)
       {
         // Remember the defer_depth BEFORE we push the new scope
         // This will be the scope level of the statement expression
-        if (stmt_expr_count < MAX_STMT_EXPR_DEPTH)
-          stmt_expr_levels[stmt_expr_count++] = defer_depth + 1; // +1 because we're about to push
+        // Grow stmt_expr_levels if needed
+        if (stmt_expr_count >= stmt_expr_capacity)
+        {
+          int new_cap = stmt_expr_capacity == 0 ? INITIAL_STMT_EXPR_DEPTH : stmt_expr_capacity * 2;
+          int *new_levels = realloc(stmt_expr_levels, sizeof(int) * new_cap);
+          if (!new_levels)
+            error("out of memory growing statement expression stack");
+          stmt_expr_levels = new_levels;
+          stmt_expr_capacity = new_cap;
+        }
+        stmt_expr_levels[stmt_expr_count++] = defer_depth + 1; // +1 because we're about to push
       }
       emit_tok(tok);
       tok = tok->next;
@@ -2360,8 +2430,8 @@ static int transpile(char *input_file, char *output_file)
       else
       {
         // Still need to track scope depth for typedef scoping even without defer
-        if (defer_depth < MAX_DEFER_DEPTH)
-          defer_depth++;
+        defer_stack_ensure_capacity(defer_depth + 1);
+        defer_depth++;
       }
       at_stmt_start = true;
       continue;
@@ -2508,56 +2578,86 @@ static int run_command(char **argv)
 #endif
 }
 
-// Build an argv array from individual components
+// Build an argv array from individual components (dynamic growth)
+typedef struct
+{
+  char **data;
+  int count;
+  int capacity;
+} ArgvBuilder;
+
+static void argv_builder_init(ArgvBuilder *ab)
+{
+  ab->data = NULL;
+  ab->count = 0;
+  ab->capacity = 0;
+}
+
+static bool argv_builder_add(ArgvBuilder *ab, const char *arg)
+{
+  if (ab->count + 1 >= ab->capacity) // +1 for NULL terminator
+  {
+    int new_cap = ab->capacity == 0 ? INITIAL_ARGS : ab->capacity * 2;
+    char **new_data = realloc(ab->data, sizeof(char *) * new_cap);
+    if (!new_data)
+      return false;
+    ab->data = new_data;
+    ab->capacity = new_cap;
+  }
+  ab->data[ab->count] = strdup(arg);
+  if (!ab->data[ab->count])
+    return false;
+  ab->count++;
+  ab->data[ab->count] = NULL; // Keep NULL terminated
+  return true;
+}
+
+static char **argv_builder_finish(ArgvBuilder *ab)
+{
+  return ab->data;
+}
+
 static char **build_argv(const char *first, ...)
 {
-  char **argv = calloc(MAX_ARGS, sizeof(char *));
-  if (!argv)
-    return NULL;
-
-  int argc = 0;
-  va_list ap;
+  ArgvBuilder ab;
+  argv_builder_init(&ab);
 
   if (first)
   {
-    argv[argc] = strdup(first);
-    if (!argv[argc])
+    if (!argv_builder_add(&ab, first))
     {
-      free(argv);
+      free_argv(ab.data);
       return NULL;
     }
-    argc++;
   }
 
   // Add remaining arguments
+  va_list ap;
   va_start(ap, first);
   const char *arg;
-  while ((arg = va_arg(ap, const char *)) != NULL && argc < MAX_ARGS - 1)
+  while ((arg = va_arg(ap, const char *)) != NULL)
   {
-    argv[argc] = strdup(arg);
-    if (!argv[argc])
+    if (!argv_builder_add(&ab, arg))
     {
       va_end(ap);
-      free_argv(argv);
+      free_argv(ab.data);
       return NULL;
     }
-    argc++;
   }
   va_end(ap);
 
-  argv[argc] = NULL;
-  return argv;
+  return argv_builder_finish(&ab);
 }
 
-// Append arguments from flags string to existing argv
-// Returns new argc, or -1 on error
-static int append_flags_to_argv(char **argv, int argc, const char *flags)
+// Append arguments from flags string to an ArgvBuilder
+// Returns true on success, false on allocation failure
+static bool argv_builder_append_flags(ArgvBuilder *ab, const char *flags)
 {
   if (!flags || !*flags)
-    return argc;
+    return true;
 
   const char *p = flags;
-  while (*p && argc < MAX_ARGS - 1)
+  while (*p)
   {
     while (*p && isspace(*p))
       p++;
@@ -2569,15 +2669,29 @@ static int append_flags_to_argv(char **argv, int argc, const char *flags)
       p++;
 
     size_t len = p - start;
-    argv[argc] = malloc(len + 1);
-    if (!argv[argc])
-      return -1;
-    memcpy(argv[argc], start, len);
-    argv[argc][len] = '\0';
-    argc++;
+    char *arg = malloc(len + 1);
+    if (!arg)
+      return false;
+    memcpy(arg, start, len);
+    arg[len] = '\0';
+
+    // Add to builder (takes ownership)
+    if (ab->count + 1 >= ab->capacity)
+    {
+      int new_cap = ab->capacity == 0 ? INITIAL_ARGS : ab->capacity * 2;
+      char **new_data = realloc(ab->data, sizeof(char *) * new_cap);
+      if (!new_data)
+      {
+        free(arg);
+        return false;
+      }
+      ab->data = new_data;
+      ab->capacity = new_cap;
+    }
+    ab->data[ab->count++] = arg;
+    ab->data[ab->count] = NULL;
   }
-  argv[argc] = NULL;
-  return argc;
+  return true;
 }
 
 static void die(char *message)
@@ -3001,34 +3115,26 @@ int main(int argc, char **argv)
   }
 
   // Build argument array for compilation (no shell escaping needed with execvp!)
-  char **compile_argv = calloc(MAX_ARGS, sizeof(char *));
-  if (!compile_argv)
-    die("Memory allocation failed.");
+  ArgvBuilder compile_ab;
+  argv_builder_init(&compile_ab);
 
-  int compile_argc = 0;
-  compile_argv[compile_argc++] = strdup(compiler);
-  compile_argv[compile_argc++] = strdup(transpiled);
-  compile_argv[compile_argc++] = strdup("-o");
-  compile_argv[compile_argc++] = strdup(output_path);
-
-  // Check allocations
-  for (int i = 0; i < compile_argc; i++)
+  if (!argv_builder_add(&compile_ab, compiler) ||
+      !argv_builder_add(&compile_ab, transpiled) ||
+      !argv_builder_add(&compile_ab, "-o") ||
+      !argv_builder_add(&compile_ab, output_path))
   {
-    if (!compile_argv[i])
-    {
-      free_argv(compile_argv);
-      die("Memory allocation failed.");
-    }
+    free_argv(compile_ab.data);
+    die("Memory allocation failed.");
   }
 
   // Append flags
-  compile_argc = append_flags_to_argv(compile_argv, compile_argc, flags);
-  if (compile_argc < 0)
+  if (!argv_builder_append_flags(&compile_ab, flags))
   {
-    free_argv(compile_argv);
+    free_argv(compile_ab.data);
     die("Memory allocation failed.");
   }
 
+  char **compile_argv = argv_builder_finish(&compile_ab);
   int compile_status = run_command(compile_argv);
   free_argv(compile_argv);
 
