@@ -863,13 +863,6 @@ void run_edge_case_tests(void)
 }
 
 // SECTION 6: BUG REGRESSION TESTS
-// Tests for specific bugs found and fixed
-
-// BUG #1: Statement expression with defer at top level
-// The fix: Prism now errors if defer is at top-level of statement expression
-// because it would become the result expression (void type) and break the code.
-// Nested blocks inside statement expressions work fine.
-
 #ifdef __GNUC__
 void test_stmt_expr_defer_nested_block(void)
 {
@@ -890,12 +883,6 @@ void test_stmt_expr_defer_nested_block(void)
 }
 #endif
 
-// BUG #2: VLA typedef causing invalid zero-init
-// When a VLA is hidden behind a typedef, Prism was adding = {0} which is invalid.
-// The fix: Prism now tracks whether a typedef refers to a VLA and errors appropriately.
-// (This test just verifies non-VLA typedefs still work; VLA typedef is tested separately
-// because it should produce an error with zeroinit enabled)
-
 void test_non_vla_typedef_still_works(void)
 {
     typedef int FixedArray[10]; // NOT a VLA - size is constant
@@ -914,9 +901,6 @@ void test_non_vla_typedef_still_works(void)
     PointType p;
     CHECK(p.x == 0 && p.y == 0, "non-VLA typedef struct zero-init");
 }
-
-// BUG #3: Switch statement defer scope leak concern (verified NOT a bug)
-// Defer in braced switch cases fires at the closing brace, not at switch exit.
 
 void test_switch_defer_no_leak(void)
 {
@@ -1101,6 +1085,226 @@ void run_advanced_defer_tests(void)
     test_defer_break_inner_stay_outer();
 }
 
+// SECTION 8: STRESS TESTS
+
+void test_defer_shadowing_vars(void)
+{
+    log_reset();
+    int x = 1;
+    {
+        int x = 2;
+        // Should capture inner x (2)
+        defer
+        {
+            if (x == 2)
+                log_append("I");
+            else
+                log_append("?");
+        };
+    }
+    // Should verify outer x (1) is untouched
+    if (x == 1)
+        log_append("O");
+    CHECK_LOG("IO", "variable shadowing with defer");
+}
+
+void test_typedef_hiding(void)
+{
+    // Test that a local variable can hide a global typedef
+    // without confusing the zero-init logic
+    typedef int T;
+    T a;
+    CHECK_EQ(a, 0, "global typedef zero-init");
+
+    {
+        float T; // T is now a variable name, not a type
+        T = 5.5f;
+        CHECK(T == 5.5f, "typedef name hidden by variable");
+
+        // This should be a syntax error if T was still seen as a type:
+        // T * x; -> float * x (valid ptr decl) vs float * x (multiplication)
+        // Prism shouldn't try to zero-init "T * x" as a pointer if it thinks T is a variable.
+        // However, standard C parsing rules apply here.
+    }
+
+    T b; // T should be restored to type 'int'
+    CHECK_EQ(b, 0, "typedef name restored after scope");
+}
+
+void test_static_local_init(void)
+{
+    // Prism skips adding "= 0" to static vars (as they are implicitly zero),
+    // but we must ensure it doesn't break them.
+    static int s;
+    CHECK_EQ(s, 0, "static local implicit zero-init");
+
+    static int *sp;
+    CHECK(sp == NULL, "static local ptr implicit zero-init");
+}
+
+void test_complex_func_ptr(void)
+{
+    // Test zero-init on complex declarators
+    // int *(*fp)(int, int) -> pointer to function(int, int) returning int*
+    int *(*fp)(int, int);
+    CHECK(fp == NULL, "complex function pointer zero-init");
+
+    // Array of function pointers
+    // void (*arr[2])(void)
+    void (*arr[2])(void);
+    CHECK(arr[0] == NULL && arr[1] == NULL, "array of func ptr zero-init");
+}
+
+void test_switch_default_first(void)
+{
+    // Verify defer cleanup works even if 'default' is the first label
+    log_reset();
+    int x = 10;
+    switch (x)
+    {
+    default:
+        defer log_append("D");
+        break;
+    case 1:
+        log_append("1");
+        break;
+    }
+    log_append("E");
+    CHECK_LOG("DE", "switch default first defer");
+}
+
+// Macro that expands to a defer
+#define CLEANUP defer log_append("C")
+
+void test_macro_hidden_defer(void)
+{
+    // Prism operates on preprocessed tokens, so this must work
+    log_reset();
+    {
+        CLEANUP;
+        log_append("1");
+    }
+    CHECK_LOG("1C", "macro hidden defer");
+}
+
+// Macro that expands to a declaration
+#define DECL_INT(x) int x
+
+void test_macro_hidden_decl(void)
+{
+    // Should still zero-init
+    DECL_INT(val);
+    CHECK_EQ(val, 0, "macro hidden declaration zero-init");
+}
+
+static void void_inner_func(void) { log_append("I"); }
+static void void_outer_func(void)
+{
+    defer log_append("O");
+    // This is valid C: returning a void expression from a void function
+    // Prism must handle the sequence: eval -> defer -> return
+    return void_inner_func();
+}
+
+void test_void_return_void_call(void)
+{
+    log_reset();
+    void_outer_func();
+    CHECK_LOG("IO", "void return void call execution order");
+}
+
+void test_raw_multi_decl(void)
+{
+    // "raw" should apply to all declarators in the statement
+    raw int a, b;
+    a = 1;
+    b = 2; // Initialize to avoid UB check failures if running with sanitizers
+    CHECK(a == 1 && b == 2, "raw multi-declaration compiles");
+}
+
+void test_switch_continue(void)
+{
+    log_reset();
+    int i = 0;
+    while (i < 1)
+    {
+        defer log_append("L"); // Loop cleanup
+
+        switch (i)
+        {
+        case 0:
+            defer log_append("S"); // Switch cleanup
+            // 'continue' must trigger 'S' (switch exit) AND 'L' (loop iteration end)
+            i++;
+            continue;
+        }
+        log_append("X"); // Should be skipped
+        i++;
+    }
+    log_append("E");
+
+    // Expected order:
+    // 1. Enter loop
+    // 2. Enter switch
+    // 3. Register 'L', register 'S'
+    // 4. Hit continue -> Run 'S' -> Run 'L' -> Re-check loop cond
+    // 5. Loop terminates -> 'E'
+    CHECK_LOG("SLE", "continue from inside switch");
+}
+
+void test_fam_struct_zeroinit(void)
+{
+    // C99 Flexible Array Member
+    struct Fam
+    {
+        int len;
+        char data[];
+    };
+
+    // Should zero-init the fixed part (len=0) and not crash parser
+    struct Fam f;
+
+    CHECK_EQ(f.len, 0, "struct with flexible array member zero-init");
+}
+
+#ifdef __GNUC__
+void test_stmt_expr_side_effects(void)
+{
+    log_reset();
+    int global = 0;
+    // ({ { defer global=1; } 5; }) -> result 5, then global=1
+    int y = ({
+        {
+            defer global = 1;
+        }
+        5;
+    });
+
+    CHECK_EQ(y, 5, "stmt expr result preserved");
+    CHECK_EQ(global, 1, "stmt expr defer executed");
+}
+#endif
+
+void run_stress_tests(void)
+{
+    printf("\n=== STRESS TESTS ===\n");
+    test_defer_shadowing_vars();
+    test_typedef_hiding();
+    test_static_local_init();
+    test_complex_func_ptr();
+    test_switch_default_first();
+    test_macro_hidden_defer();
+    test_macro_hidden_decl();
+    test_void_return_void_call();
+    test_raw_multi_decl();
+    test_switch_continue();
+    test_fam_struct_zeroinit();
+
+#ifdef __GNUC__
+    test_stmt_expr_side_effects();
+#endif
+}
+
 // MAIN
 
 int main(void)
@@ -1115,6 +1319,7 @@ int main(void)
     run_edge_case_tests();
     run_bug_regression_tests();
     run_advanced_defer_tests();
+    run_stress_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);
