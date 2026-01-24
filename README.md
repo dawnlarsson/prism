@@ -51,10 +51,22 @@ Works with: primitives, pointers, arrays, structs, unions, enums, and user-defin
 
 **Opt-out** `prism src.c no-zeroinit`
 
+## Raw
+Skip zero-initialization for a specific variable using the `raw` keyword.
+
+```c
+void example() {
+    raw int x;           // x is uninitialized
+    raw char buffer[4096]; // buffer is uninitialized (faster for large arrays)
+}
+```
+
+Useful when you need to avoid the overhead of zero-initialization for performance-critical code or large buffers that will be immediately overwritten.
+
 ## CLI
 
 ```sh
-Prism v0.39.0
+Prism v0.40.0
 
 Usage: prism [options] src.c [output] [args]
 

@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.40.0"
+#define VERSION "0.41.0"
 
 #include "parse.c"
 
@@ -1167,6 +1167,15 @@ static Token *try_zero_init_decl(Token *tok)
 
   Token *start = tok;
 
+  // Check for 'raw' keyword - skip zero-init for this declaration
+  bool is_raw = false;
+  if (equal(tok, "raw"))
+  {
+    is_raw = true;
+    tok = tok->next;
+    start = tok; // Don't emit 'raw'
+  }
+
   if (is_skip_decl_keyword(tok)) // Skip extern/typedef
     return NULL;
 
@@ -1449,17 +1458,19 @@ static Token *try_zero_init_decl(Token *tok)
 
     // VLAs cannot be initialized - this breaks the zero-init guarantee
     // Make it a hard error so users know their code has uninitialized memory
-    if (effective_vla && !has_init)
+    // (unless 'raw' was used to explicitly opt out)
+    if (effective_vla && !has_init && !is_raw)
     {
       error_tok(var_name, "VLA '%.*s' cannot be zero-initialized (C language limitation). "
                           "Options: (1) Use a fixed-size array, (2) Use malloc()+memset(), "
-                          "(3) Add explicit memset() after declaration, or "
-                          "(4) Use 'prism no-zeroinit' if you accept uninitialized variables.",
+                          "(3) Add explicit memset() after declaration, "
+                          "(4) Use 'raw' keyword to skip zero-init for this variable, or "
+                          "(5) Use 'prism no-zeroinit' if you accept uninitialized variables.",
                 var_name->len, var_name->loc);
     }
 
-    // Add zero initializer if no existing initializer and not a VLA
-    if (!has_init && !effective_vla)
+    // Add zero initializer if no existing initializer, not a VLA, and not raw
+    if (!has_init && !effective_vla && !is_raw)
     {
       if (is_array || ((is_struct_type || is_typedef_type) && !is_pointer))
         fprintf(out, " = {0}");

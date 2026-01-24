@@ -993,6 +993,7 @@ static bool is_keyword(Token *tok)
             "_Atomic",
             "__attribute__",
             "defer", // Prism extension
+            "raw",   // Prism extension: skip zero-init
         };
         for (int i = 0; i < sizeof(kw) / sizeof(*kw); i++)
             hashmap_put(&map, kw[i], (void *)1);

@@ -485,6 +485,69 @@ void run_zeroinit_tests(void)
     test_zeroinit_with_defer();
 }
 
+// SECTION 2.5: RAW KEYWORD TESTS
+
+void test_raw_basic(void)
+{
+    raw int x;
+    x = 42;
+    CHECK_EQ(x, 42, "raw int assignment");
+
+    raw char c;
+    c = 'A';
+    CHECK_EQ(c, 'A', "raw char assignment");
+}
+
+void test_raw_array(void)
+{
+    raw int arr[100];
+    arr[0] = 1;
+    arr[99] = 99;
+    CHECK(arr[0] == 1 && arr[99] == 99, "raw array assignment");
+}
+
+void test_raw_pointer(void)
+{
+    raw int *p;
+    int val = 123;
+    p = &val;
+    CHECK_EQ(*p, 123, "raw pointer assignment");
+}
+
+void test_raw_struct(void)
+{
+    raw struct
+    {
+        int a;
+        int b;
+    } s;
+    s.a = 10;
+    s.b = 20;
+    CHECK(s.a == 10 && s.b == 20, "raw struct assignment");
+}
+
+void test_raw_with_qualifiers(void)
+{
+    raw volatile int v;
+    v = 100;
+    CHECK_EQ(v, 100, "raw volatile int");
+
+    raw const int *cp;
+    int val = 50;
+    cp = &val;
+    CHECK_EQ(*cp, 50, "raw const pointer");
+}
+
+void run_raw_tests(void)
+{
+    printf("\n=== RAW KEYWORD TESTS ===\n");
+    test_raw_basic();
+    test_raw_array();
+    test_raw_pointer();
+    test_raw_struct();
+    test_raw_with_qualifiers();
+}
+
 // SECTION 3: MULTI-DECLARATOR TESTS
 
 void test_multi_decl_basic(void)
@@ -1046,6 +1109,7 @@ int main(void)
 
     run_defer_basic_tests();
     run_zeroinit_tests();
+    run_raw_tests();
     run_multi_decl_tests();
     run_typedef_tests();
     run_edge_case_tests();
