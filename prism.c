@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.44.0"
+#define VERSION "0.45.0"
 
 #include "parse.c"
 
@@ -498,6 +498,63 @@ static void typedef_pop_scope(int scope_depth)
 {
   while (typedef_table.count > 0 && typedef_table.entries[typedef_table.count - 1].scope_depth == scope_depth)
     typedef_table.count--;
+}
+
+// Forward declaration for parse_enum_constants
+static bool is_known_typedef(Token *tok);
+
+// Parse enum body and register constants as shadows for any matching typedefs.
+// Enum constants are visible in the enclosing scope, so they shadow typedefs.
+// tok should point to the opening '{' of the enum body.
+// scope_depth is the scope where the enum constants become visible.
+static void parse_enum_constants(Token *tok, int scope_depth)
+{
+  if (!tok || !equal(tok, "{"))
+    return;
+  tok = tok->next; // Skip '{'
+
+  while (tok && tok->kind != TK_EOF && !equal(tok, "}"))
+  {
+    // Each enum constant is: IDENTIFIER or IDENTIFIER = expr
+    if (tok->kind == TK_IDENT)
+    {
+      // Register this constant as a shadow if it matches any typedef
+      if (is_known_typedef(tok))
+        typedef_add_shadow(tok->loc, tok->len, scope_depth);
+      tok = tok->next;
+
+      // Skip = expr if present
+      if (tok && equal(tok, "="))
+      {
+        tok = tok->next;
+        // Skip expression until ',' or '}'
+        int depth = 0;
+        while (tok && tok->kind != TK_EOF)
+        {
+          if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
+            depth++;
+          else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
+          {
+            if (depth > 0)
+              depth--;
+            else if (equal(tok, "}"))
+              break;
+          }
+          else if (depth == 0 && equal(tok, ","))
+            break;
+          tok = tok->next;
+        }
+      }
+
+      // Skip comma
+      if (tok && equal(tok, ","))
+        tok = tok->next;
+    }
+    else
+    {
+      tok = tok->next;
+    }
+  }
 }
 
 // Check if token is a known typedef (search most recent first for shadowing)
@@ -2223,6 +2280,7 @@ static int transpile(char *input_file, char *output_file)
     // Track struct/union/enum to avoid zero-init inside them
     if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum"))
     {
+      bool is_enum = equal(tok, "enum");
       // Look ahead to see if this has a body
       // Must handle: struct name {, struct {, struct __attribute__((...)) name {
       Token *t = tok->next;
@@ -2254,6 +2312,11 @@ static int transpile(char *input_file, char *output_file)
       }
       if (t && equal(t, "{"))
       {
+        // For enums, parse constants to register shadows BEFORE emitting
+        // Enum constants are visible at the enclosing scope (defer_depth)
+        if (is_enum)
+          parse_enum_constants(t, defer_depth);
+
         // Emit tokens up to and including the {
         while (tok != t)
         {

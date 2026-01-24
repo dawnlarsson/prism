@@ -922,6 +922,72 @@ void test_switch_defer_no_leak(void)
     CHECK_LOG("12E", "switch defer fallthrough order");
 }
 
+typedef int EnumShadowT;
+
+void test_enum_constant_shadows_typedef(void)
+{
+    // First verify EnumShadowT works as a type
+    EnumShadowT before;
+    CHECK_EQ(before, 0, "typedef works before enum shadow");
+
+    // Define enum with constant that shadows the typedef name
+    enum
+    {
+        EnumShadowT = 42
+    };
+
+    // Now EnumShadowT is the enum constant (value 42), not a type
+    // This expression should be integer multiplication (42 * 2 = 84)
+    int product;
+    product = EnumShadowT * 2;
+    CHECK_EQ(product, 84, "enum constant shadows typedef - multiplication works");
+
+    // Directly use the enum constant value
+    CHECK_EQ(EnumShadowT, 42, "enum constant has correct value");
+}
+
+typedef int EnumPtrT;
+
+void test_enum_shadow_star_ambiguity(void)
+{
+    int x = 3;
+
+    // Shadow the typedef with an enum constant
+    enum
+    {
+        EnumPtrT = 7
+    };
+
+    // Now "EnumPtrT * x" is multiplication (7 * 3 = 21), not a pointer declaration
+    // Prism must NOT try to zero-init this as a declaration
+    int result = EnumPtrT * x; // 7 * 3 = 21
+    CHECK_EQ(result, 21, "enum shadow: T*x is multiplication not ptr decl");
+
+    // Verify the enum constant has the right value
+    CHECK_EQ(EnumPtrT, 7, "enum constant value correct");
+}
+
+typedef int EnumStmtT;
+
+void test_enum_shadow_statement_form(void)
+{
+    int y = 5;
+
+    // Shadow the typedef with enum constant
+    enum
+    {
+        EnumStmtT = 10
+    };
+
+    // This statement-level expression "EnumStmtT * y" is multiplication: 10 * 5 = 50
+    // If Prism tries to parse it as "EnumStmtT *y = 0;", the gcc compilation would fail
+    // because "10 * y = 0" is not a valid lvalue assignment.
+    EnumStmtT *y; // This is a statement: multiplication, discards result
+
+    // If we got here, the statement compiled correctly
+    CHECK(1, "enum shadow: statement T*x compiles as multiplication");
+}
+
 void run_bug_regression_tests(void)
 {
     printf("\n=== BUG REGRESSION TESTS ===\n");
@@ -934,6 +1000,9 @@ void run_bug_regression_tests(void)
 
     test_non_vla_typedef_still_works();
     test_switch_defer_no_leak();
+    test_enum_constant_shadows_typedef();
+    test_enum_shadow_star_ambiguity();
+    test_enum_shadow_statement_form();
 }
 
 // SECTION 7: ADVANCED DEFER TESTS
