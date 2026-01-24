@@ -903,9 +903,9 @@ int test_return_side_effect(void)
 void test_defer_capture_timing(void)
 {
     log_reset();
-    char c = 'X';
-    defer log_append(&c); // captures address, not value
-    c = 'Y';
+    char c[2] = "X";
+    defer log_append(c); // captures address, not value
+    c[0] = 'Y';
     log_append("1");
     // At scope exit, c is 'Y', so "Y" is appended
 }
