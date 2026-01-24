@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.41.0"
+#define VERSION "0.42.0"
 
 #include "parse.c"
 
@@ -1456,16 +1456,14 @@ static Token *try_zero_init_decl(Token *tok)
     // Combine direct VLA detection with typedef VLA detection
     bool effective_vla = is_vla || is_typedef_vla;
 
-    // VLAs cannot be initialized - this breaks the zero-init guarantee
-    // Make it a hard error so users know their code has uninitialized memory
-    // (unless 'raw' was used to explicitly opt out)
-    if (effective_vla && !has_init && !is_raw)
+    // VLAs cannot be initialized - this is a hard error, no bypass allowed
+    // C syntax doesn't allow `int arr[n] = {0};` so VLAs break safety guarantees
+    if (effective_vla && !has_init)
     {
       error_tok(var_name, "VLA '%.*s' cannot be zero-initialized (C language limitation). "
                           "Options: (1) Use a fixed-size array, (2) Use malloc()+memset(), "
-                          "(3) Add explicit memset() after declaration, "
-                          "(4) Use 'raw' keyword to skip zero-init for this variable, or "
-                          "(5) Use 'prism no-zeroinit' if you accept uninitialized variables.",
+                          "(3) Add explicit memset() after declaration, or "
+                          "(4) Use 'prism no-zeroinit' to disable zero-init globally.",
                 var_name->len, var_name->loc);
     }
 
@@ -2419,7 +2417,7 @@ int main(int argc, char **argv)
            "Usage: prism [options] src.c [output] [args]\n\n"
            "Options:\n"
            "  install               Install prism as a global cli tool\n"
-           "  build                 Build only, don't run\n"
+           "  build                 Build only, dont run\n"
            "  transpile             Transpile only, output to stdout or file\n"
            "  debug/release/small   Optimization mode\n"
            "  arm/x86               Architecture (default: native)\n"

@@ -66,13 +66,13 @@ Useful when you need to avoid the overhead of zero-initialization for performanc
 ## CLI
 
 ```sh
-Prism v0.40.0
+Prism v0.42.0
 
 Usage: prism [options] src.c [output] [args]
 
 Options:
   install               Install prism as a global cli tool
-  build                 Build only, don't run
+  build                 Build only, dont run
   transpile             Transpile only, output to stdout or file
   debug/release/small   Optimization mode
   arm/x86               Architecture (default: native)

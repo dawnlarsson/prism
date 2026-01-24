@@ -2610,6 +2610,64 @@ static Token *preprocess2(Token *tok)
             bool is_dquote;
             char *filename = read_include_filename(&tok, tok->next, &is_dquote);
 
+            // For system headers, preserve the #include directive as-is
+            // Only inline local includes
+            if (!is_dquote)
+            {
+                // Create tokens for: #include <filename>\n
+                Token *hash = copy_token(start);
+                hash->kind = TK_PUNCT;
+                hash->loc = "#";
+                hash->len = 1;
+                hash->at_bol = true; // # starts at beginning of line
+                hash->has_space = false;
+
+                Token *inc = copy_token(start);
+                inc->kind = TK_IDENT;
+                inc->loc = "include";
+                inc->len = 7;
+                inc->at_bol = false;
+                inc->has_space = false; // No space between # and include
+
+                Token *open = copy_token(start);
+                open->kind = TK_PUNCT;
+                open->loc = "<";
+                open->len = 1;
+                open->at_bol = false;
+                open->has_space = true; // Space before <
+
+                Token *name = copy_token(start);
+                name->kind = TK_IDENT;
+                name->loc = filename;
+                name->len = strlen(filename);
+                name->at_bol = false;
+                name->has_space = false;
+
+                Token *close = copy_token(start);
+                close->kind = TK_PUNCT;
+                close->loc = ">";
+                close->len = 1;
+                close->at_bol = false;
+                close->has_space = false;
+
+                // Link them together
+                hash->next = inc;
+                inc->next = open;
+                open->next = name;
+                name->next = close;
+
+                // Skip to end of line and continue
+                tok = skip_line(tok);
+                close->next = tok;
+
+                cur = cur->next = hash;
+                cur = cur->next = inc;
+                cur = cur->next = open;
+                cur = cur->next = name;
+                cur = cur->next = close;
+                continue;
+            }
+
             char *path = NULL;
             if (is_dquote)
             {
