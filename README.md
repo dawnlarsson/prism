@@ -8,6 +8,11 @@ Prism is a lightweight, self-contained transpiler that brings modern language fe
 * **Opt out dialect features** Disable parts of the transpiler, like zero-init, with CLI flags.
 * **Build tool** Work-in-progress build tool features—no need for Makefiles for simpler C programs (with support for larger setups planned for the future).
 
+Prism is a propper transpiler, not a preprocessor macro.
+* **Track Types:** It parses `typedef`s to distinguish pointer declarations from multiplication (the "lexer hack"), ensuring correct zero-initialization.
+* **Respect Scope:** It understands braces `{}`, statement expressions `({ ... })`, and switch-case fallthrough, ensuring `defer` fires exactly when it should.
+* **Detect Errors:** It catches unsafe patterns (like jumping into a scope with `goto`) before they become runtime bugs.
+
 <br/>
 
 build & install
@@ -62,6 +67,34 @@ void example() {
 ```
 
 Useful when you need to avoid the overhead of zero-initialization for performance-critical code or large buffers that will be immediately overwritten.
+
+## Safety Enforcement
+Prism acts as a static analysis tool, turning common C pitfalls into compile-time errors.
+
+**No Uninitialized Jumps**
+Standard C allows `goto` to skip variable initialization, leading to undefined behavior. Prism performs a single-pass dominator analysis to forbid this:
+
+```c
+// THIS WILL FAIL TO COMPILE
+void unsafe() {
+    goto skip;
+    int x; // Prism guarantees x is zero-initialized
+skip:
+    printf("%d", x);
+}
+// Error: goto 'skip' would skip over variable declaration 'x'
+```
+
+### Differentiate "Defer" from Macros
+Many C users assume `defer` is just a `for` loop macro hack (which breaks `break`/`continue`). You need to explicitly state that yours is robust against control flow.
+
+### Control Flow Integrity
+Prism's `defer` is robust against complex control flow. It correctly injects cleanup code before:
+* `return` (including void and value returns)
+* `break` / `continue` (handles loops and switches correctly)
+* `goto` (unwinds scopes properly)
+
+*Note: Defer is explicitly forbidden in functions using `setjmp`/`longjmp` or computed gotos to prevent resource leaks.*
 
 ## CLI
 
