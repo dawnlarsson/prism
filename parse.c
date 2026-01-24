@@ -60,9 +60,16 @@
 #define __attribute__(x)
 #endif
 
+// Maximum recursion depth for preprocessor expression evaluation
+#define FORMAT_MAX_SIZE (16 * 1024 * 1024) // 16 MB
+#define PP_MAX_EVAL_DEPTH 1000
+#define TOMBSTONE ((void *)-1)
+#define unreachable() error("internal error at %s:%d", __FILE__, __LINE__)
+
 // Include paths for preprocessor
 static char **pp_include_paths = NULL;
 static int pp_include_paths_count = 0;
+static int pp_eval_depth = 0;
 
 typedef struct Type Type;
 typedef struct Token Token;
@@ -154,6 +161,79 @@ static Type *ty_char = &ty_char_val;
 static Type *ty_int = &ty_int_val;
 static Type *ty_ushort = &ty_ushort_val;
 static Type *ty_uint = &ty_uint_val;
+
+// Hashmap
+typedef struct
+{
+    char *key;
+    int keylen;
+    void *val;
+} HashEntry;
+
+typedef struct
+{
+    HashEntry *buckets;
+    int capacity;
+    int used;
+} HashMap;
+
+// Error handling
+static File *current_file;
+
+// Tokenizer
+static File **input_files;
+static int input_file_count;
+static bool at_bol;
+static bool has_space;
+
+// Preprocessor
+typedef struct MacroParam MacroParam;
+struct MacroParam
+{
+    MacroParam *next;
+    char *name;
+};
+
+typedef struct MacroArg MacroArg;
+struct MacroArg
+{
+    MacroArg *next;
+    char *name;
+    bool is_va_args;
+    Token *tok;
+};
+
+typedef Token *macro_handler_fn(Token *);
+
+typedef struct Macro Macro;
+struct Macro
+{
+    char *name;
+    bool is_objlike;
+    MacroParam *params;
+    char *va_args_name;
+    Token *body;
+    macro_handler_fn *handler;
+};
+
+typedef struct CondIncl CondIncl;
+struct CondIncl
+{
+    CondIncl *next;
+    enum
+    {
+        IN_THEN,
+        IN_ELIF,
+        IN_ELSE
+    } ctx;
+    Token *tok;
+    bool included;
+};
+
+static HashMap macros;
+static CondIncl *cond_incl;
+static HashMap included_files;
+static bool pp_eval_skip = false;
 
 static Type *array_of(Type *base, int len)
 {
@@ -342,9 +422,6 @@ static void pp_add_default_include_paths(void)
     pp_add_include_path("/usr/include");
 #endif
 }
-// Utility functions
-static bool is_hex(Token *tok) { return tok->len >= 3 && !memcmp(tok->loc, "0x", 2); }
-static bool is_bin(Token *tok) { return tok->len >= 3 && !memcmp(tok->loc, "0b", 2); }
 
 static void strarray_push(StringArray *arr, char *s)
 {
@@ -379,9 +456,6 @@ static void strarray_push(StringArray *arr, char *s)
     arr->data[arr->len++] = s;
 }
 
-// Maximum size for format() output to prevent runaway allocations
-#define FORMAT_MAX_SIZE (16 * 1024 * 1024) // 16 MB
-
 __attribute__((format(printf, 1, 2))) static char *format(char *fmt, ...)
 {
     char *buf;
@@ -399,22 +473,6 @@ __attribute__((format(printf, 1, 2))) static char *format(char *fmt, ...)
     }
     return buf;
 }
-// Hashmap
-typedef struct
-{
-    char *key;
-    int keylen;
-    void *val;
-} HashEntry;
-
-typedef struct
-{
-    HashEntry *buckets;
-    int capacity;
-    int used;
-} HashMap;
-
-#define TOMBSTONE ((void *)-1)
 
 static uint64_t fnv_hash(char *s, int len)
 {
@@ -552,33 +610,6 @@ static void hashmap_clear(HashMap *map)
     map->used = 0;
 }
 // Unicode
-static int encode_utf8(char *buf, uint32_t c)
-{
-    if (c <= 0x7F)
-    {
-        buf[0] = c;
-        return 1;
-    }
-    if (c <= 0x7FF)
-    {
-        buf[0] = 0xC0 | (c >> 6);
-        buf[1] = 0x80 | (c & 0x3F);
-        return 2;
-    }
-    if (c <= 0xFFFF)
-    {
-        buf[0] = 0xE0 | (c >> 12);
-        buf[1] = 0x80 | ((c >> 6) & 0x3F);
-        buf[2] = 0x80 | (c & 0x3F);
-        return 3;
-    }
-    buf[0] = 0xF0 | (c >> 18);
-    buf[1] = 0x80 | ((c >> 12) & 0x3F);
-    buf[2] = 0x80 | ((c >> 6) & 0x3F);
-    buf[3] = 0x80 | (c & 0x3F);
-    return 4;
-}
-
 static uint32_t decode_utf8(char **new_pos, char *p)
 {
     unsigned char c0 = (unsigned char)*p;
@@ -753,8 +784,6 @@ static int display_width(char *p, int len)
     }
     return w;
 }
-// Error handling
-static File *current_file;
 
 noreturn void error(char *fmt, ...)
 {
@@ -808,13 +837,6 @@ static void warn_tok(Token *tok, char *fmt, ...)
     verror_at(tok->file->name, tok->file->contents, tok->line_no, tok->loc, fmt, ap);
     va_end(ap);
 }
-
-#define unreachable() error("internal error at %s:%d", __FILE__, __LINE__)
-// Tokenizer
-static File **input_files;
-static int input_file_count;
-static bool at_bol;
-static bool has_space;
 
 static bool equal(Token *tok, char *op)
 {
@@ -1202,7 +1224,6 @@ static void convert_pp_number(Token *tok)
         char *buf = strndup(start, end - start);
         if (!buf)
             error_tok(tok, "out of memory");
-        char *p = buf;
         char *endp;
         tok->fval = strtold(buf, &endp);
         if (endp == buf)
@@ -1513,54 +1534,6 @@ Token *tokenize_file(char *path)
 
     return tokenize(file);
 }
-// Preprocessor
-typedef struct MacroParam MacroParam;
-struct MacroParam
-{
-    MacroParam *next;
-    char *name;
-};
-
-typedef struct MacroArg MacroArg;
-struct MacroArg
-{
-    MacroArg *next;
-    char *name;
-    bool is_va_args;
-    Token *tok;
-};
-
-typedef Token *macro_handler_fn(Token *);
-
-typedef struct Macro Macro;
-struct Macro
-{
-    char *name;
-    bool is_objlike;
-    MacroParam *params;
-    char *va_args_name;
-    Token *body;
-    macro_handler_fn *handler;
-};
-
-typedef struct CondIncl CondIncl;
-struct CondIncl
-{
-    CondIncl *next;
-    enum
-    {
-        IN_THEN,
-        IN_ELIF,
-        IN_ELSE
-    } ctx;
-    Token *tok;
-    bool included;
-};
-
-static HashMap macros;
-static CondIncl *cond_incl;
-static HashMap included_files;
-static bool pp_eval_skip = false;
 
 static Token *preprocess2(Token *tok);
 
@@ -2211,10 +2184,6 @@ static int64_t eval_primary(Token **rest, Token *tok)
     *rest = tok->next;
     return 0;
 }
-
-// Maximum recursion depth for preprocessor expression evaluation
-#define PP_MAX_EVAL_DEPTH 1000
-static int pp_eval_depth = 0;
 
 static int64_t eval_unary(Token **rest, Token *tok)
 {

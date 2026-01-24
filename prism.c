@@ -1,9 +1,8 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.37.0"
+#define VERSION "0.38.0"
 
-// Include the tokenizer/preprocessor
 #include "parse.c"
-// Platform detection
+
 #ifdef _WIN32
 #define INSTALL "prism.exe"
 #define TMP ""
@@ -47,17 +46,15 @@ typedef enum
   MODE_SMALL
 } Mode;
 
-// Feature flags (all enabled by default)
 static bool feature_defer = true;
 static bool feature_zeroinit = true;
 
-// Track struct/union/enum depth (don't zero-init inside these)
 static int struct_depth = 0;
 
-// Defer tracking
 #define MAX_DEFER_DEPTH 64
 #define MAX_DEFERS_PER_SCOPE 32
 #define MAX_LABELS 256
+#define MAX_ARGS 128
 
 typedef struct
 {
@@ -70,12 +67,11 @@ typedef struct
   bool had_control_exit; // true if break/return/goto/continue seen since last defer in switch
 } DeferScope;
 
-// Label tracking for goto handling
 typedef struct
 {
   char *name;
   int name_len;
-  int scope_depth; // Defer scope depth where label resides
+  int scope_depth;
 } LabelInfo;
 
 typedef struct
@@ -83,9 +79,6 @@ typedef struct
   LabelInfo labels[MAX_LABELS];
   int count;
 } LabelTable;
-
-// Typedef tracking for zero-init (scoped like C)
-// Dynamically allocated to handle any project size
 
 typedef struct
 {
@@ -106,8 +99,32 @@ static TypedefTable typedef_table;
 static DeferScope defer_stack[MAX_DEFER_DEPTH];
 static int defer_depth = 0;
 
-// Temp file path for cleanup on error exit
 static char *pending_temp_file = NULL;
+
+// Track pending loop/switch for next scope
+static bool next_scope_is_loop = false;
+static bool next_scope_is_switch = false;
+static bool pending_control_flow = false; // True after if/else/for/while/do/switch until we see { or ;
+static int control_paren_depth = 0;       // Track parens to distinguish for(;;) from braceless body
+static bool in_for_init = false;          // True when inside the init clause of a for loop (before first ;)
+static bool pending_for_paren = false;    // True after seeing 'for', waiting for '(' to start init clause
+
+static LabelTable label_table;
+static bool current_func_returns_void = false;
+static bool current_func_has_setjmp = false;
+static bool current_func_has_asm = false;
+
+static bool at_stmt_start = false;
+static bool in_switch_case_body = false;
+
+// Token emission
+static FILE *out;
+static Token *last_emitted = NULL;
+
+// Line tracking for #line directives
+static int last_line_no = 0;
+static char *last_filename = NULL;
+static bool emit_line_directives = true; // Can be disabled with no-line-directives flag
 
 static void cleanup_temp_file(void)
 {
@@ -118,31 +135,6 @@ static void cleanup_temp_file(void)
   }
 }
 
-// Track pending loop/switch for next scope
-static bool next_scope_is_loop = false;
-static bool next_scope_is_switch = false;
-static bool pending_control_flow = false; // True after if/else/for/while/do/switch until we see { or ;
-static int control_paren_depth = 0;       // Track parens to distinguish for(;;) from braceless body
-static bool in_for_init = false;          // True when inside the init clause of a for loop (before first ;)
-static bool pending_for_paren = false;    // True after seeing 'for', waiting for '(' to start init clause
-
-// Label table for current function (for goto handling)
-static LabelTable label_table;
-
-// Track if current function returns void (for return statement handling)
-static bool current_func_returns_void = false;
-
-// Track if current function uses setjmp/longjmp/pthread_exit (defer is unsafe with these)
-static bool current_func_has_setjmp = false;
-
-// Track if current function uses inline asm (may have hidden control flow)
-static bool current_func_has_asm = false;
-
-// Track statement boundaries for zero-init (moved to static for helper access)
-static bool at_stmt_start = false;
-
-// Helper: call this when a handler consumes a semicolon and continues
-// This ensures state is consistent as if the main loop saw the ';'
 static void end_statement_after_semicolon(void)
 {
   at_stmt_start = true;
@@ -188,20 +180,17 @@ static void defer_add(Token *defer_keyword, Token *start, Token *end)
   scope->had_control_exit = false;
 }
 
-// Track if we're directly inside a switch (no braces after case)
-static bool in_switch_case_body = false;
-
 // Mark that control flow exited (break/return/goto) in the innermost switch scope
 // This tells us that defers were properly executed before the case ended
 static void mark_switch_control_exit(void)
 {
   for (int d = defer_depth - 1; d >= 0; d--)
   {
-    if (defer_stack[d].is_switch)
-    {
-      defer_stack[d].had_control_exit = true;
-      return;
-    }
+    if (!defer_stack[d].is_switch)
+      continue;
+
+    defer_stack[d].had_control_exit = true;
+    return;
   }
 }
 
@@ -213,21 +202,13 @@ static void clear_switch_scope_defers(void)
 {
   for (int d = defer_depth - 1; d >= 0; d--)
   {
-    if (defer_stack[d].is_switch)
-    {
-      defer_stack[d].count = 0;
-      return;
-    }
+    if (!defer_stack[d].is_switch)
+      continue;
+
+    defer_stack[d].count = 0;
+    return;
   }
 }
-// Token emission
-static FILE *out;
-static Token *last_emitted = NULL;
-
-// Line tracking for #line directives
-static int last_line_no = 0;
-static char *last_filename = NULL;
-static bool emit_line_directives = true; // Can be disabled with no-line-directives flag
 
 // Check if a space is needed between two tokens
 static bool needs_space(Token *prev, Token *tok)
@@ -409,50 +390,23 @@ static bool has_active_defers(void)
   return false;
 }
 
-// Check if break needs to emit defers
-// Only returns true if there are defers between current scope and the loop/switch
-static bool break_has_defers(void)
+// Check if break/continue needs to emit defers
+// include_switch: true for break (stops at loop OR switch), false for continue (stops at loop only)
+static bool control_flow_has_defers(bool include_switch)
 {
-  bool found_loop_or_switch = false;
+  bool found_boundary = false;
   bool found_defers = false;
   for (int d = defer_depth - 1; d >= 0; d--)
   {
     if (defer_stack[d].count > 0)
       found_defers = true;
-    if (defer_stack[d].is_loop || defer_stack[d].is_switch)
+    if (defer_stack[d].is_loop || (include_switch && defer_stack[d].is_switch))
     {
-      found_loop_or_switch = true;
+      found_boundary = true;
       break;
     }
   }
-  // Only emit defers if we found the loop/switch boundary
-  // (braceless loops don't have a scope marked as loop, so we shouldn't emit)
-  return found_loop_or_switch && found_defers;
-}
-
-// Check if continue needs to emit defers
-// Only returns true if there are defers between current scope and the loop
-static bool continue_has_defers(void)
-{
-  bool found_loop = false;
-  bool found_defers = false;
-  for (int d = defer_depth - 1; d >= 0; d--)
-  {
-    if (defer_stack[d].count > 0)
-      found_defers = true;
-    if (defer_stack[d].is_loop)
-    {
-      found_loop = true;
-      break;
-    }
-  }
-  // Only emit defers if we found the loop boundary
-  return found_loop && found_defers;
-}
-// Label tracking for goto
-static void label_table_reset(void)
-{
-  label_table.count = 0;
+  return found_boundary && found_defers;
 }
 
 static void label_table_add(char *name, int name_len, int scope_depth)
@@ -512,11 +466,8 @@ static void typedef_add(char *name, int len, int scope_depth)
 // Called when exiting a scope - removes typedefs defined at that depth
 static void typedef_pop_scope(int scope_depth)
 {
-  while (typedef_table.count > 0 &&
-         typedef_table.entries[typedef_table.count - 1].scope_depth == scope_depth)
-  {
+  while (typedef_table.count > 0 && typedef_table.entries[typedef_table.count - 1].scope_depth == scope_depth)
     typedef_table.count--;
-  }
 }
 
 // Check if token is a known typedef (search most recent first for shadowing)
@@ -538,12 +489,7 @@ static bool is_known_typedef(Token *tok)
 // The caller should filter using context (prev token shouldn't be '?')
 static bool is_label(Token *tok)
 {
-  if (tok->kind != TK_IDENT)
-    return false;
-  Token *next = tok->next;
-  if (!next || !equal(next, ":"))
-    return false;
-  return true;
+  return tok->kind == TK_IDENT && tok->next && equal(tok->next, ":");
 }
 
 // Scan a function body for labels and record their scope depths
@@ -551,7 +497,7 @@ static bool is_label(Token *tok)
 // tok should point to the opening '{' of the function body
 static void scan_labels_in_function(Token *tok)
 {
-  label_table_reset();
+  label_table.count = 0;
   current_func_has_setjmp = false; // Reset for new function
   current_func_has_asm = false;    // Reset for new function
   if (!tok || !equal(tok, "{"))
@@ -559,7 +505,7 @@ static void scan_labels_in_function(Token *tok)
 
   // Start at depth 1 to align with defer_depth (which is 1 inside function body)
   int depth = 1;
-  int struct_depth = 0; // Track nesting inside struct/union/enum bodies
+  int local_struct_depth = 0; // Track nesting inside struct/union/enum bodies
   Token *prev = NULL;
   tok = tok->next; // Skip opening brace
 
@@ -597,9 +543,7 @@ static void scan_labels_in_function(Token *tok)
           }
         }
         else
-        {
           t = t->next;
-        }
       }
       if (t && equal(t, "{"))
       {
@@ -609,7 +553,7 @@ static void scan_labels_in_function(Token *tok)
           prev = tok;
           tok = tok->next;
         }
-        struct_depth++;
+        local_struct_depth++;
         depth++;
         prev = tok;
         tok = tok->next;
@@ -628,8 +572,8 @@ static void scan_labels_in_function(Token *tok)
     {
       if (depth == 1)
         break; // End of function
-      if (struct_depth > 0)
-        struct_depth--;
+      if (local_struct_depth > 0)
+        local_struct_depth--;
       depth--;
       prev = tok;
       tok = tok->next;
@@ -643,16 +587,11 @@ static void scan_labels_in_function(Token *tok)
          equal(tok, "_setjmp") || equal(tok, "_longjmp") ||
          equal(tok, "sigsetjmp") || equal(tok, "siglongjmp") ||
          equal(tok, "pthread_exit")))
-    {
       current_func_has_setjmp = true;
-    }
 
     // Detect inline asm which may contain hidden jumps
-    if (tok->kind == TK_KEYWORD &&
-        (equal(tok, "asm") || equal(tok, "__asm__") || equal(tok, "__asm")))
-    {
+    if (tok->kind == TK_KEYWORD && (equal(tok, "asm") || equal(tok, "__asm__") || equal(tok, "__asm")))
       current_func_has_asm = true;
-    }
 
     // Check for label: identifier followed by ':' (but not ::)
     // Filter out: ternary operator, switch cases, bitfields
@@ -661,17 +600,12 @@ static void scan_labels_in_function(Token *tok)
       Token *colon = tok->next;
       // Make sure it's not :: (C++ scope resolution)
       bool is_scope_resolution = colon->next && equal(colon->next, ":");
-      // Ternary operator: prev token is '?'
       bool is_ternary = prev && equal(prev, "?");
-      // Switch case: prev token is 'case' or 'default'
       bool is_switch_case = prev && (equal(prev, "case") || equal(prev, "default"));
-      // Bitfield: we're inside a struct/union body
-      bool is_bitfield = struct_depth > 0;
+      bool is_bitfield = local_struct_depth > 0;
 
       if (!is_scope_resolution && !is_ternary && !is_switch_case && !is_bitfield)
-      {
         label_table_add(tok->loc, tok->len, depth);
-      }
     }
 
     prev = tok;
@@ -1022,19 +956,15 @@ static Token *scan_typedef_name(Token **tokp)
 // Parse a typedef declaration and add names to the typedef table
 static void parse_typedef_declaration(Token *tok, int scope_depth)
 {
-  tok = tok->next; // Skip 'typedef'
-
-  // Skip the base type
-  tok = scan_typedef_base_type(tok);
+  tok = tok->next;                   // Skip 'typedef'
+  tok = scan_typedef_base_type(tok); // Skip the base type
 
   // Parse declarator(s) until semicolon
   while (tok && !equal(tok, ";") && tok->kind != TK_EOF)
   {
     Token *name = scan_typedef_name(&tok);
     if (name)
-    {
       typedef_add(name->loc, name->len, scope_depth);
-    }
 
     // Skip to comma or semicolon
     while (tok && !equal(tok, ",") && !equal(tok, ";") && tok->kind != TK_EOF)
@@ -1125,8 +1055,7 @@ static bool is_const_array_size(Token *open_bracket)
           !equal(tok, "+") && !equal(tok, "-") && !equal(tok, "*") &&
           !equal(tok, "/") && !equal(tok, "(") && !equal(tok, ")"))
       {
-        // If it's an identifier, it might be a VLA
-        if (tok->kind == TK_IDENT)
+        if (tok->kind == TK_IDENT) // might be a VLA
           has_only_literals = false;
       }
     }
@@ -1145,8 +1074,7 @@ static Token *try_zero_init_decl(Token *tok)
 
   Token *start = tok;
 
-  // Skip extern/typedef - don't init these
-  if (is_skip_decl_keyword(tok))
+  if (is_skip_decl_keyword(tok)) // Skip extern/typedef
     return NULL;
 
   // Must start with qualifier or type
@@ -1444,10 +1372,7 @@ static Token *try_zero_init_decl(Token *tok)
       // Continue to next declarator
     }
     else
-    {
-      // Unexpected token - bail
       return NULL;
-    }
   }
 
   return NULL;
@@ -1455,18 +1380,15 @@ static Token *try_zero_init_decl(Token *tok)
 
 static int transpile(char *input_file, char *output_file)
 {
-  // Initialize preprocessor
   pp_init();
   pp_add_default_include_paths();
 
-  // Add prism-specific predefined macro
   pp_define_macro("__PRISM__", "1");
   if (feature_defer)
     pp_define_macro("__PRISM_DEFER__", "1");
   if (feature_zeroinit)
     pp_define_macro("__PRISM_ZEROINIT__", "1");
 
-  // Tokenize and preprocess
   Token *tok = tokenize_file(input_file);
   if (!tok)
   {
@@ -1476,7 +1398,6 @@ static int transpile(char *input_file, char *output_file)
 
   tok = preprocess(tok);
 
-  // Open output
   out = fopen(output_file, "w");
   if (!out)
     return 0;
@@ -1505,10 +1426,7 @@ static int transpile(char *input_file, char *output_file)
     // Track typedefs for zero-init (must happen before zero-init check)
     // Only at statement start and outside struct/union/enum bodies
     if (at_stmt_start && struct_depth == 0 && equal(tok, "typedef"))
-    {
-      parse_typedef_declaration(tok, defer_depth);
-      // Fall through to emit the typedef normally
-    }
+      parse_typedef_declaration(tok, defer_depth); // Fall through to emit the typedef normally
 
     // Try zero-init for declarations at statement start
     // Also allow in the init clause of a for loop: for (int i; ...)
@@ -1696,7 +1614,7 @@ static int transpile(char *input_file, char *output_file)
     if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "break"))
     {
       mark_switch_control_exit(); // Mark that we exited via break
-      if (break_has_defers())
+      if (control_flow_has_defers(true))
       {
         fprintf(out, " {");
         emit_break_defers();
@@ -1715,7 +1633,7 @@ static int transpile(char *input_file, char *output_file)
     if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "continue"))
     {
       mark_switch_control_exit(); // Continue also exits the switch (like break/return/goto)
-      if (continue_has_defers())
+      if (control_flow_has_defers(false))
       {
         fprintf(out, " {");
         emit_continue_defers();
@@ -1815,9 +1733,7 @@ static int transpile(char *input_file, char *output_file)
 
     // Mark if/else keywords
     if (tok->kind == TK_KEYWORD && (equal(tok, "if") || equal(tok, "else")))
-    {
       pending_control_flow = true;
-    }
 
     // Handle case/default labels - clear defers from switch scope
     // This prevents defers from leaking across cases (which would cause incorrect behavior
@@ -1978,9 +1894,7 @@ static int transpile(char *input_file, char *output_file)
           {
             Token *after_name = t->next;
             if (after_name && equal(after_name, "("))
-            {
               next_func_returns_void = true;
-            }
           }
         }
       }
@@ -2149,122 +2063,6 @@ static int transpile(char *input_file, char *output_file)
   fclose(out);
   return 1;
 }
-// Build system
-
-// Escape a string for safe use in shell commands
-// Returns a newly allocated string that must be freed
-// Note: Currently unused as run_command uses execvp directly,
-// but kept for potential future shell-based execution paths.
-__attribute__((unused)) static char *shell_escape(const char *s)
-{
-#ifdef _WIN32
-  // Windows: Use double quotes, escape internal double quotes and backslashes
-  // before quotes (cmd.exe uses \" for escaping, but backslashes before quotes
-  // need escaping too)
-  size_t len = 0;
-  for (const char *p = s; *p; p++)
-  {
-    if (*p == '"')
-      len += 2; // \"
-    else if (*p == '\\')
-    {
-      // Count consecutive backslashes
-      int bs = 0;
-      while (p[bs] == '\\')
-        bs++;
-      if (p[bs] == '"' || p[bs] == '\0')
-        len += bs * 2; // Double backslashes before quote or end
-      else
-        len += bs;
-      p += bs - 1;
-    }
-    else
-    {
-      len += 1;
-    }
-  }
-  len += 3; // opening ", closing ", and null terminator
-
-  char *result = malloc(len);
-  if (!result)
-    return NULL;
-
-  char *out = result;
-  *out++ = '"';
-  for (const char *p = s; *p; p++)
-  {
-    if (*p == '"')
-    {
-      *out++ = '\\';
-      *out++ = '"';
-    }
-    else if (*p == '\\')
-    {
-      int bs = 0;
-      while (p[bs] == '\\')
-        bs++;
-      if (p[bs] == '"' || p[bs] == '\0')
-      {
-        // Double the backslashes
-        for (int i = 0; i < bs * 2; i++)
-          *out++ = '\\';
-      }
-      else
-      {
-        for (int i = 0; i < bs; i++)
-          *out++ = '\\';
-      }
-      p += bs - 1;
-    }
-    else
-    {
-      *out++ = *p;
-    }
-  }
-  *out++ = '"';
-  *out = '\0';
-  return result;
-#else
-  // POSIX: Use single quotes, escape single quotes as '\''
-  size_t len = 0;
-  for (const char *p = s; *p; p++)
-  {
-    if (*p == '\'')
-      len += 4; // '\'' to escape a single quote
-    else
-      len += 1;
-  }
-  len += 3; // opening ', closing ', and null terminator
-
-  char *result = malloc(len);
-  if (!result)
-    return NULL;
-
-  char *out = result;
-  *out++ = '\'';
-  for (const char *p = s; *p; p++)
-  {
-    if (*p == '\'')
-    {
-      // End quote, escaped quote, start quote again: '\''
-      *out++ = '\'';
-      *out++ = '\\';
-      *out++ = '\'';
-      *out++ = '\'';
-    }
-    else
-    {
-      *out++ = *p;
-    }
-  }
-  *out++ = '\'';
-  *out = '\0';
-  return result;
-#endif
-}
-
-// Maximum arguments for run_command
-#define MAX_ARGS 128
 
 // Split a space-separated string into an argv array
 // Returns number of arguments, or -1 on error
@@ -2286,17 +2084,14 @@ static int split_args(const char *str, char ***argv_out)
     if (!*p)
       break;
 
-    // Find end of this argument
     const char *start = p;
     while (*p && !isspace(*p))
       p++;
 
-    // Copy argument
     size_t len = p - start;
     argv[argc] = malloc(len + 1);
     if (!argv[argc])
     {
-      // Cleanup on failure
       for (int i = 0; i < argc; i++)
         free(argv[i]);
       free(argv);
@@ -2312,7 +2107,6 @@ static int split_args(const char *str, char ***argv_out)
   return argc;
 }
 
-// Free an argv array allocated by split_args or build_argv
 static void free_argv(char **argv)
 {
   if (!argv)
@@ -2322,16 +2116,12 @@ static void free_argv(char **argv)
   free(argv);
 }
 
-// Run a command without invoking a shell (secure execution)
-// Returns the exit status, or -1 on error
 static int run_command(char **argv)
 {
 #ifdef _WIN32
-  // Windows: use _spawnvp
   intptr_t status = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
   return (int)status;
 #else
-  // POSIX: fork + execvp
   pid_t pid = fork();
   if (pid == -1)
   {
@@ -2340,13 +2130,10 @@ static int run_command(char **argv)
   }
   if (pid == 0)
   {
-    // Child process
     execvp(argv[0], argv);
-    // If execvp returns, it failed
     perror("execvp");
     _exit(127);
   }
-  // Parent process
   int status;
   if (waitpid(pid, &status, 0) == -1)
   {
@@ -2362,8 +2149,6 @@ static int run_command(char **argv)
 }
 
 // Build an argv array from individual components
-// Variable args must end with NULL
-// Returns argv array (caller must free with free_argv)
 static char **build_argv(const char *first, ...)
 {
   char **argv = calloc(MAX_ARGS, sizeof(char *));
@@ -2373,7 +2158,6 @@ static char **build_argv(const char *first, ...)
   int argc = 0;
   va_list ap;
 
-  // Add first argument
   if (first)
   {
     argv[argc] = strdup(first);
