@@ -1,3 +1,4 @@
+#define _DARWIN_C_SOURCE
 #define PRISM_FLAGS "-O3 -flto -s"
 #define VERSION "0.45.0"
 
