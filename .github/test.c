@@ -1131,6 +1131,86 @@ void test_typedef_hiding(void)
     CHECK_EQ(b, 0, "typedef name restored after scope");
 }
 
+// BUG REGRESSION: typedef shadowed by variable of same name
+void test_typedef_same_name_shadow(void)
+{
+    typedef int T;
+
+    // Verify T works as a type before shadowing
+    T before;
+    CHECK_EQ(before, 0, "typedef T works before shadow");
+
+    {
+        // THE BUG CASE: "T T;" - first T is type, second T is variable name
+        // Prism must:
+        // 1. Recognize first T as typedef -> zero-init the variable
+        // 2. Register that variable T now shadows typedef T
+        T T;
+        CHECK_EQ(T, 0, "T T declaration zero-inits variable");
+
+        T = 42;
+        CHECK_EQ(T, 42, "T is usable as variable after T T decl");
+
+        // At this point, "T" refers to the variable, not the type.
+        // Any attempt to use T as a type here would be a C syntax error.
+        // We can't test "T x;" here as it would fail to compile (correctly).
+        // But we verify that T is being used as a variable:
+        int result = T + 8;
+        CHECK_EQ(result, 50, "T used in expression as variable");
+    }
+
+    // After the block, typedef T should be visible again
+    T after;
+    CHECK_EQ(after, 0, "typedef T restored after shadow scope");
+}
+
+// Test nested shadowing: multiple levels of T T;
+void test_typedef_nested_same_name_shadow(void)
+{
+    typedef int T;
+
+    T outer;
+    CHECK_EQ(outer, 0, "outer T as typedef");
+
+    {
+        T T; // shadows typedef
+        T = 1;
+        CHECK_EQ(T, 1, "first shadow level");
+
+        {
+            // Can't do "T T;" again here because T is already a variable.
+            // But we can verify T is still the variable from outer scope:
+            T = 2;
+            CHECK_EQ(T, 2, "inner scope sees variable T");
+        }
+
+        CHECK_EQ(T, 2, "variable T preserved after inner scope");
+    }
+
+    // T is typedef again
+    T restored;
+    CHECK_EQ(restored, 0, "typedef restored after nested shadows");
+}
+
+// Test that pointer declarations work correctly after shadow ends
+void test_typedef_shadow_then_pointer(void)
+{
+    typedef int T;
+
+    {
+        T T; // shadow
+        T = 100;
+        (void)T; // use it
+    }
+
+    // Now T is a type again - pointer declaration should work
+    T *ptr;
+    CHECK(ptr == NULL, "pointer to typedef after shadow scope");
+
+    T arr[3];
+    CHECK(arr[0] == 0 && arr[1] == 0 && arr[2] == 0, "array of typedef after shadow scope");
+}
+
 void test_static_local_init(void)
 {
     // Prism skips adding "= 0" to static vars (as they are implicitly zero),
@@ -1290,6 +1370,9 @@ void run_stress_tests(void)
     printf("\n=== STRESS TESTS ===\n");
     test_defer_shadowing_vars();
     test_typedef_hiding();
+    test_typedef_same_name_shadow();
+    test_typedef_nested_same_name_shadow();
+    test_typedef_shadow_then_pointer();
     test_static_local_init();
     test_complex_func_ptr();
     test_switch_default_first();

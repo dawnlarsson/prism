@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.43.0"
+#define VERSION "0.44.0"
 
 #include "parse.c"
 
@@ -86,6 +86,7 @@ typedef struct
   int len;
   int scope_depth; // Scope where defined (aligns with defer_depth)
   bool is_vla;     // True if typedef refers to a VLA type
+  bool is_shadow;  // True if this entry shadows a typedef (variable with same name)
 } TypedefEntry;
 
 typedef struct
@@ -467,6 +468,29 @@ static void typedef_add(char *name, int len, int scope_depth, bool is_vla)
   e->len = len;
   e->scope_depth = scope_depth;
   e->is_vla = is_vla;
+  e->is_shadow = false;
+}
+
+// Add a shadow entry: marks that a variable with this name exists at this scope,
+// effectively hiding any typedef with the same name
+static void typedef_add_shadow(char *name, int len, int scope_depth)
+{
+  // Grow if needed
+  if (typedef_table.count >= typedef_table.capacity)
+  {
+    int new_cap = typedef_table.capacity == 0 ? 256 : typedef_table.capacity * 2;
+    TypedefEntry *new_entries = realloc(typedef_table.entries, sizeof(TypedefEntry) * new_cap);
+    if (!new_entries)
+      error("out of memory tracking typedefs");
+    typedef_table.entries = new_entries;
+    typedef_table.capacity = new_cap;
+  }
+  TypedefEntry *e = &typedef_table.entries[typedef_table.count++];
+  e->name = name;
+  e->len = len;
+  e->scope_depth = scope_depth;
+  e->is_vla = false;
+  e->is_shadow = true;
 }
 
 // Called when exiting a scope - removes typedefs defined at that depth
@@ -477,6 +501,7 @@ static void typedef_pop_scope(int scope_depth)
 }
 
 // Check if token is a known typedef (search most recent first for shadowing)
+// Returns false if the most recent entry with this name is a shadow (variable)
 static bool is_known_typedef(Token *tok)
 {
   if (tok->kind != TK_IDENT)
@@ -485,7 +510,7 @@ static bool is_known_typedef(Token *tok)
   {
     TypedefEntry *e = &typedef_table.entries[i];
     if (e->len == tok->len && !memcmp(e->name, tok->loc, tok->len))
-      return true;
+      return !e->is_shadow;
   }
   return false;
 }
@@ -499,7 +524,11 @@ static bool is_vla_typedef(Token *tok)
   {
     TypedefEntry *e = &typedef_table.entries[i];
     if (e->len == tok->len && !memcmp(e->name, tok->loc, tok->len))
+    {
+      if (e->is_shadow)
+        return false;
       return e->is_vla;
+    }
   }
   return false;
 }
@@ -1439,6 +1468,22 @@ static Token *try_zero_init_decl(Token *tok)
       is_typedef_type = true;
       if (is_vla_typedef(tok))
         is_typedef_vla = true;
+      // CRITICAL: If the next token looks like a declarator, stop here.
+      // This prevents "T T;" from consuming both Ts as the type.
+      Token *peek = tok->next;
+      while (peek && is_type_qualifier(peek))
+        peek = peek->next;
+      if (peek && peek->kind == TK_IDENT)
+      {
+        Token *after = peek->next;
+        if (after && (equal(after, ";") || equal(after, "[") ||
+                      equal(after, ",") || equal(after, "=")))
+        {
+          tok = tok->next;
+          type_end = tok;
+          break; // Exit loop - next token is variable name, not part of type
+        }
+      }
     }
     tok = tok->next;
     type_end = tok;
@@ -1446,7 +1491,8 @@ static Token *try_zero_init_decl(Token *tok)
 
   // Check for typedef'd type: identifier followed by identifier (no pointer)
   // Pattern: my_type x; - but NOT my_type *x; (ambiguous with multiplication)
-  if (!saw_type && tok->kind == TK_IDENT)
+  // Also ensure the identifier is actually a known typedef (not shadowed)
+  if (!saw_type && tok->kind == TK_IDENT && is_known_typedef(tok))
   {
     Token *maybe_type = tok;
     Token *t = tok->next;
@@ -1699,6 +1745,14 @@ static Token *try_zero_init_decl(Token *tok)
         emit_tok(tok);
         tok = tok->next;
       }
+    }
+
+    // Register shadow if this variable name matches a typedef
+    // This ensures subsequent uses of this name in the same scope
+    // are treated as variables, not types
+    if (is_known_typedef(var_name))
+    {
+      typedef_add_shadow(var_name->loc, var_name->len, defer_depth);
     }
 
     // Check what's next
