@@ -1,6 +1,6 @@
 #define _DARWIN_C_SOURCE
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.46.0"
+#define VERSION "0.47.0"
 
 #include "parse.c"
 
@@ -121,6 +121,7 @@ static LabelTable label_table;
 static bool current_func_returns_void = false;
 static bool current_func_has_setjmp = false;
 static bool current_func_has_asm = false;
+static bool current_func_has_vfork = false;
 
 static bool at_stmt_start = false;
 static bool in_switch_case_body = false;
@@ -661,13 +662,14 @@ static bool is_label(Token *tok)
 }
 
 // Scan a function body for labels and record their scope depths
-// Also detects setjmp/longjmp/pthread_exit and inline asm usage
+// Also detects setjmp/longjmp/pthread_exit/vfork and inline asm usage
 // tok should point to the opening '{' of the function body
 static void scan_labels_in_function(Token *tok)
 {
   label_table.count = 0;
   current_func_has_setjmp = false; // Reset for new function
   current_func_has_asm = false;    // Reset for new function
+  current_func_has_vfork = false;  // Reset for new function
   if (!tok || !equal(tok, "{"))
     return;
 
@@ -756,6 +758,10 @@ static void scan_labels_in_function(Token *tok)
          equal(tok, "sigsetjmp") || equal(tok, "siglongjmp") ||
          equal(tok, "pthread_exit")))
       current_func_has_setjmp = true;
+
+    // Detect vfork which has unpredictable control flow
+    if (tok->kind == TK_IDENT && equal(tok, "vfork"))
+      current_func_has_vfork = true;
 
     // Detect inline asm which may contain hidden jumps
     if (tok->kind == TK_KEYWORD && (equal(tok, "asm") || equal(tok, "__asm__") || equal(tok, "__asm")))
@@ -1959,6 +1965,22 @@ static int transpile(char *input_file, char *output_file)
     }
     at_stmt_start = false;
 
+    // Warn about noreturn functions that bypass defer cleanup
+    // These functions terminate the program without running defers - RAII violation
+    if (feature_defer && tok->kind == TK_IDENT && tok->next && equal(tok->next, "("))
+    {
+      if (has_active_defers() &&
+          (equal(tok, "exit") || equal(tok, "_Exit") || equal(tok, "_exit") ||
+           equal(tok, "abort") || equal(tok, "quick_exit") ||
+           equal(tok, "__builtin_trap") || equal(tok, "__builtin_unreachable") ||
+           equal(tok, "thrd_exit")))
+      {
+        fprintf(stderr, "%s:%d: warning: '%.*s' called with active defers - deferred statements will NOT run. "
+                        "Consider using return with cleanup, or restructure to avoid defer here.\n",
+                tok->file->name, tok->line_no, tok->len, tok->loc);
+      }
+    }
+
     // Handle 'defer' keyword
     if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "defer"))
     {
@@ -1990,6 +2012,14 @@ static int transpile(char *input_file, char *output_file)
         error_tok(tok, "defer cannot be used in functions that call setjmp/longjmp/pthread_exit. "
                        "These functions bypass defer cleanup entirely, causing resource leaks. "
                        "Use explicit cleanup patterns (goto cleanup, or manual RAII) instead.");
+      }
+
+      // vfork has unpredictable control flow that can bypass cleanup
+      if (current_func_has_vfork)
+      {
+        error_tok(tok, "defer cannot be used in functions that call vfork(). "
+                       "vfork shares address space with parent and has unpredictable control flow. "
+                       "Use fork() instead, or move defer to a wrapper function.");
       }
 
       // Inline asm may contain hidden jumps that bypass defer

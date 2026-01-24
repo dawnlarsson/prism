@@ -1585,6 +1585,379 @@ void run_safety_hole_tests(void)
     test_goto_with_defer_valid();
 }
 
+// SECTION 9: SWITCH FALLTHROUGH + DEFER EDGE CASES
+
+void test_switch_fallthrough_decl_defer(void)
+{
+    // Fallthrough with declarations and defers - defers fire at block end, not switch end
+    log_reset();
+    int x = 0;
+    switch (x)
+    {
+    case 0:
+    {
+        int a = 1;
+        defer log_append("A");
+        log_append("0");
+    } // A fires here
+    case 1:
+    {
+        int b = 2;
+        defer log_append("B");
+        log_append("1");
+    } // B fires here
+    case 2:
+    {
+        defer log_append("C");
+        log_append("2");
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("0A1B2CE", "switch fallthrough with decls and defers");
+}
+
+void test_switch_fallthrough_no_braces(void)
+{
+    // Fallthrough without braces - no defers possible (defer requires braces)
+    log_reset();
+    int result = 0;
+    int x = 0;
+    switch (x)
+    {
+    case 0:
+        result += 1;
+    case 1:
+        result += 10;
+    case 2:
+        result += 100;
+        break;
+    case 3:
+        result += 1000;
+    }
+    CHECK_EQ(result, 111, "switch fallthrough no braces");
+}
+
+void test_switch_break_from_nested_block(void)
+{
+    // Break from a nested block inside a case
+    log_reset();
+    int x = 1;
+    switch (x)
+    {
+    case 1:
+    {
+        defer log_append("O");
+        {
+            defer log_append("I");
+            log_append("1");
+            break; // Should trigger both I and O
+        }
+        log_append("X"); // Not reached
+    }
+    case 2:
+        log_append("2");
+        break;
+    }
+    log_append("E");
+    CHECK_LOG("1IOE", "switch break from nested block");
+}
+
+void test_switch_goto_out_of_case(void)
+{
+    // Goto out of a case - defers must run
+    log_reset();
+    int x = 1;
+    switch (x)
+    {
+    case 1:
+    {
+        defer log_append("D");
+        log_append("1");
+        goto done;
+    }
+    case 2:
+        log_append("2");
+        break;
+    }
+done:
+    log_append("E");
+    CHECK_LOG("1DE", "switch goto out of case");
+}
+
+void test_switch_multiple_defers_per_case(void)
+{
+    // Multiple defers in same case - LIFO order
+    log_reset();
+    int x = 1;
+    switch (x)
+    {
+    case 1:
+    {
+        defer log_append("C");
+        defer log_append("B");
+        defer log_append("A");
+        log_append("1");
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("1ABCE", "switch multiple defers per case");
+}
+
+void test_switch_nested_switch_defer(void)
+{
+    // Nested switches with defers
+    log_reset();
+    int x = 1, y = 1;
+    switch (x)
+    {
+    case 1:
+    {
+        defer log_append("O");
+        switch (y)
+        {
+        case 1:
+        {
+            defer log_append("I");
+            log_append("1");
+            break;
+        }
+        }
+        log_append("2");
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("1I2OE", "nested switch with defers");
+}
+
+void run_switch_fallthrough_tests(void)
+{
+    printf("\n=== SWITCH FALLTHROUGH + DEFER TESTS ===\n");
+    test_switch_fallthrough_decl_defer();
+    test_switch_fallthrough_no_braces();
+    test_switch_break_from_nested_block();
+    test_switch_goto_out_of_case();
+    test_switch_multiple_defers_per_case();
+    test_switch_nested_switch_defer();
+}
+
+// SECTION 10: COMPLEX BREAK/CONTINUE NESTING TESTS
+
+void test_break_continue_nested_3_levels(void)
+{
+    // 3 levels of loop nesting with defers at each level
+    log_reset();
+    for (int i = 0; i < 2; i++)
+    {
+        defer log_append("1");
+        for (int j = 0; j < 2; j++)
+        {
+            defer log_append("2");
+            for (int k = 0; k < 2; k++)
+            {
+                defer log_append("3");
+                log_append("X");
+                if (k == 0)
+                    continue; // triggers 3
+                if (j == 0 && k == 1)
+                    break; // triggers 3, exits inner loop
+            }
+            if (i == 0 && j == 1)
+                break; // triggers 2, exits middle loop
+        }
+    }
+    log_append("E");
+    // Trace: i=0,j=0: k=0 X3(cont) k=1 X3(break) 2; j=1: k=0 X3(cont) k=1 X3 2(break) 1
+    //        i=1,j=0: k=0 X3(cont) k=1 X3(break) 2; j=1: k=0 X3(cont) k=1 X3 2 1
+    CHECK_LOG("X3X32X3X321X3X32X3X321E", "break/continue nested 3 levels");
+}
+
+void test_continue_in_while_with_defer(void)
+{
+    // Continue in while loop - defer must run each iteration
+    log_reset();
+    int i = 0;
+    while (i < 3)
+    {
+        defer log_append("D");
+        i++;
+        if (i == 2)
+        {
+            log_append("S");
+            continue;
+        }
+        log_append("N");
+    }
+    log_append("E");
+    CHECK_LOG("NDSDNDE", "continue in while with defer");
+}
+
+void test_break_in_do_while_with_defer(void)
+{
+    // Break in do-while - defer must run
+    log_reset();
+    int i = 0;
+    do
+    {
+        defer log_append("D");
+        i++;
+        if (i == 2)
+        {
+            log_append("B");
+            break;
+        }
+        log_append("N");
+    } while (i < 5);
+    log_append("E");
+    CHECK_LOG("NDBDE", "break in do-while with defer");
+}
+
+void test_switch_inside_loop_continue(void)
+{
+    // Switch inside loop with continue - defers in switch case must run
+    log_reset();
+    for (int i = 0; i < 2; i++)
+    {
+        defer log_append("L");
+        switch (i)
+        {
+        case 0:
+        {
+            defer log_append("S");
+            log_append("0");
+            continue; // triggers S, then L, then next iteration
+        }
+        case 1:
+        {
+            defer log_append("T");
+            log_append("1");
+            break;
+        }
+        }
+        log_append("X");
+    }
+    log_append("E");
+    CHECK_LOG("0SL1TXLE", "switch inside loop with continue");
+}
+
+void test_loop_inside_switch_break(void)
+{
+    // Loop inside switch case - break from loop should not exit switch
+    log_reset();
+    int x = 1;
+    switch (x)
+    {
+    case 1:
+    {
+        defer log_append("S");
+        for (int i = 0; i < 3; i++)
+        {
+            defer log_append("L");
+            log_append("I");
+            if (i == 1)
+                break; // exits loop, not switch
+        }
+        log_append("A"); // Should be reached
+        break;           // exits switch
+    }
+    }
+    log_append("E");
+    CHECK_LOG("ILILASE", "loop inside switch - break loop not switch");
+}
+
+void run_complex_nesting_tests(void)
+{
+    printf("\n=== COMPLEX BREAK/CONTINUE NESTING TESTS ===\n");
+    test_break_continue_nested_3_levels();
+    test_continue_in_while_with_defer();
+    test_break_in_do_while_with_defer();
+    test_switch_inside_loop_continue();
+    test_loop_inside_switch_break();
+}
+
+// SECTION 11: CASE LABELS INSIDE BLOCKS
+
+void test_case_in_nested_block(void)
+{
+    // Case label inside a nested block (valid C, but weird)
+    log_reset();
+    int x = 1;
+    switch (x)
+    {
+        {
+            // This block is entered via fallthrough from case 0 or jumped to for case 1
+        case 1:
+            log_append("1");
+            break;
+        }
+    case 0:
+        log_append("0");
+        // falls through to block above
+    }
+    log_append("E");
+    CHECK_LOG("1E", "case label in nested block");
+}
+
+void test_case_after_defer_in_block(void)
+{
+    // Case label after defer in same block
+    // When jumping to case 1, we enter the block scope so the defer IS registered
+    // This is consistent C semantics - the block is entered, defer is in scope
+    log_reset();
+    int x = 1;
+    switch (x)
+    {
+    case 0:
+    {
+        defer log_append("D"); // This defer is registered when block is entered for case 1 too
+        log_append("0");
+    case 1: // Case 1 is inside case 0's braces - block is entered
+        log_append("1");
+        break;
+    } // D fires here since we're in the block scope
+    }
+    log_append("E");
+    // x=1: jump to case 1, block scope entered, D registered, "1", break, D fires, "E"
+    CHECK_LOG("1DE", "case after defer in block - defer registered on scope entry");
+}
+
+void test_duff_device_with_defer_at_top(void)
+{
+    // Duff's device pattern - defer at switch scope level
+    log_reset();
+    int count = 5;
+    int result = 0;
+    int n = (count + 3) / 4;
+    switch (count % 4)
+    {
+    case 0:
+        do
+        {
+            defer result++;
+            log_append("X");
+        case 3:
+            log_append("X");
+        case 2:
+            log_append("X");
+        case 1:
+            log_append("X");
+        } while (--n > 0);
+    }
+    log_append("E");
+    CHECK_LOG("XXXXXE", "duff device with defer");
+    CHECK_EQ(result, 2, "duff device defer count"); // defer fires at } of do-while each iteration
+}
+
+void run_case_label_tests(void)
+{
+    printf("\n=== CASE LABELS INSIDE BLOCKS TESTS ===\n");
+    test_case_in_nested_block();
+    test_case_after_defer_in_block();
+    test_duff_device_with_defer_at_top();
+}
+
 // MAIN
 
 int main(void)
@@ -1601,6 +1974,9 @@ int main(void)
     run_advanced_defer_tests();
     run_stress_tests();
     run_safety_hole_tests();
+    run_switch_fallthrough_tests();
+    run_complex_nesting_tests();
+    run_case_label_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);
