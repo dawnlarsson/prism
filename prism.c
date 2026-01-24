@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.38.0"
+#define VERSION "0.39.0"
 
 #include "parse.c"
 
@@ -116,6 +116,10 @@ static bool current_func_has_asm = false;
 
 static bool at_stmt_start = false;
 static bool in_switch_case_body = false;
+// Track statement expression scopes - store the defer_depth at which each starts
+#define MAX_STMT_EXPR_DEPTH 32
+static int stmt_expr_levels[MAX_STMT_EXPR_DEPTH]; // defer_depth when stmt expr started
+static int stmt_expr_count = 0;                   // number of active statement expressions
 
 // Token emission
 static FILE *out;
@@ -1224,6 +1228,28 @@ static Token *try_zero_init_decl(Token *tok)
   if (check->kind != TK_IDENT)
     return NULL;
 
+  // Before emitting anything, check if any declarator has a statement expression initializer
+  // Statement expressions like ({ ... }) can contain defer, so we need the main loop to handle them
+  {
+    Token *scan = tok;
+    int scan_depth = 0;
+    while (scan && scan->kind != TK_EOF)
+    {
+      if (equal(scan, "(") || equal(scan, "[") || equal(scan, "{"))
+      {
+        // Check for statement expression: '(' followed by '{'
+        if (equal(scan, "(") && scan->next && equal(scan->next, "{"))
+          return NULL; // Let main loop handle statement expressions
+        scan_depth++;
+      }
+      else if (equal(scan, ")") || equal(scan, "]") || equal(scan, "}"))
+        scan_depth--;
+      else if (scan_depth == 0 && equal(scan, ";"))
+        break; // End of declaration
+      scan = scan->next;
+    }
+  }
+
   // Now we've confirmed there's at least one declarator. Emit the base type.
   emit_range(start, type_end);
 
@@ -1460,6 +1486,7 @@ static int transpile(char *input_file, char *output_file)
   in_for_init = false;
   pending_for_paren = false;
   current_func_returns_void = false;
+  stmt_expr_count = 0;
   at_stmt_start = true;                // Start of file is start of statement
   typedef_table_reset();               // Reset typedef tracking
   bool next_func_returns_void = false; // Track void functions at top level
@@ -1497,6 +1524,20 @@ static int transpile(char *input_file, char *output_file)
       // Check for braceless control flow - defer needs a proper scope
       if (pending_control_flow)
         error_tok(tok, "defer cannot be the body of a braceless control statement - add braces");
+
+      // Check for defer at the top-level of a statement expression - semantics are problematic
+      // In ({ defer X; expr; }), the defer would execute after expr, making the result void
+      // But defer in nested blocks inside stmt expr is OK: ({ { defer X; } expr; })
+      for (int i = 0; i < stmt_expr_count; i++)
+      {
+        if (defer_depth == stmt_expr_levels[i])
+        {
+          error_tok(tok, "defer cannot be used at the top level of statement expressions ({ ... }). "
+                         "The defer would execute after the final expression, changing the return type to void. "
+                         "Wrap the defer in a block: ({ { defer X; ... } result; })");
+          break;
+        }
+      }
 
       // setjmp/longjmp/pthread_exit bypasses defer cleanup - this MUST be an error
       if (current_func_has_setjmp)
@@ -1887,6 +1928,15 @@ static int transpile(char *input_file, char *output_file)
     if (equal(tok, "{"))
     {
       pending_control_flow = false; // Proper braces found
+      // Check if this is a statement expression: ({ ... })
+      // The previous emitted token would be '('
+      if (last_emitted && equal(last_emitted, "("))
+      {
+        // Remember the defer_depth BEFORE we push the new scope
+        // This will be the scope level of the statement expression
+        if (stmt_expr_count < MAX_STMT_EXPR_DEPTH)
+          stmt_expr_levels[stmt_expr_count++] = defer_depth + 1; // +1 because we're about to push
+      }
       emit_tok(tok);
       tok = tok->next;
       if (feature_defer)
@@ -1920,6 +1970,13 @@ static int transpile(char *input_file, char *output_file)
       }
       emit_tok(tok);
       tok = tok->next;
+      // Check if we're exiting a statement expression: ... })
+      // Match if the next token is ')' and we're at a stmt_expr level
+      if (tok && equal(tok, ")") && stmt_expr_count > 0 &&
+          stmt_expr_levels[stmt_expr_count - 1] == defer_depth + 1)
+      {
+        stmt_expr_count--;
+      }
       // After closing brace, we're at the start of a new statement
       // (especially important at file scope for tracking typedefs)
       at_stmt_start = true;

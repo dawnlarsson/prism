@@ -54,7 +54,7 @@ Works with: primitives, pointers, arrays, structs, unions, enums, and user-defin
 ## CLI
 
 ```sh
-Prism v0.33.0
+Prism v0.39.0
 
 Usage: prism [options] src.c [output] [args]
 
