@@ -50,3 +50,8 @@ jobs:
           
           echo "Building and running with installed prism..."
           prism test_hello.c
+
+      - name: Run Test Suite
+        run: |
+          echo "Running all tests..."
+          prism .github/test.c
