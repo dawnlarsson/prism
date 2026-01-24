@@ -819,6 +819,51 @@ static Token *skip_attributes(Token *tok)
   return tok;
 }
 
+// Check if token starts a void function declaration
+// Handles: void func(, static void func(, __attribute__((...)) void func(, etc.
+static bool is_void_function_decl(Token *tok)
+{
+  // Skip storage class specifiers and attributes
+  while (tok && (equal(tok, "static") || equal(tok, "inline") || equal(tok, "extern") ||
+                 equal(tok, "_Noreturn") || equal(tok, "__inline") || equal(tok, "__inline__") ||
+                 equal(tok, "typedef") || equal(tok, "__attribute__") || equal(tok, "__attribute") ||
+                 equal(tok, "__declspec")))
+  {
+    if (equal(tok, "__attribute__") || equal(tok, "__attribute") || equal(tok, "__declspec"))
+      tok = skip_attributes(tok);
+    else
+      tok = tok->next;
+  }
+
+  // Must be at 'void' now
+  if (!tok || !equal(tok, "void"))
+    return false;
+
+  tok = tok->next;
+
+  // void* is not a void-returning function
+  if (tok && equal(tok, "*"))
+    return false;
+
+  // Skip attributes and qualifiers after void
+  while (tok && (equal(tok, "const") || equal(tok, "volatile") ||
+                 equal(tok, "__restrict") || equal(tok, "__restrict__") ||
+                 equal(tok, "__attribute__") || equal(tok, "__attribute") ||
+                 equal(tok, "__declspec")))
+  {
+    if (equal(tok, "__attribute__") || equal(tok, "__attribute") || equal(tok, "__declspec"))
+      tok = skip_attributes(tok);
+    else
+      tok = tok->next;
+  }
+
+  // Should be at function name followed by (
+  if (tok && tok->kind == TK_IDENT && tok->next && equal(tok->next, "("))
+    return true;
+
+  return false;
+}
+
 // Skip the base type in a typedef (everything before the declarator)
 static Token *scan_typedef_base_type(Token *tok)
 {
@@ -1778,127 +1823,9 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Detect void function definitions at top level
-    // Handles: void func(, static void func(, __attribute__((...)) void func(, etc.
     // This sets next_func_returns_void for when we enter the function body
-    if (defer_depth == 0 && equal(tok, "void"))
-    {
-      Token *t = tok->next;
-      // Skip pointers (void *func is not void-returning)
-      if (t && equal(t, "*"))
-      {
-        // void* - not a void function
-      }
-      else
-      {
-        // Skip attributes and qualifiers after void
-        while (t && (equal(t, "__attribute__") || equal(t, "__declspec") ||
-                     equal(t, "const") || equal(t, "volatile") ||
-                     equal(t, "__restrict") || equal(t, "__restrict__")))
-        {
-          if (equal(t, "__attribute__") || equal(t, "__declspec"))
-          {
-            t = t->next;
-            // Skip ((...))
-            if (t && equal(t, "("))
-            {
-              int paren_depth = 1;
-              t = t->next;
-              while (t && paren_depth > 0)
-              {
-                if (equal(t, "("))
-                  paren_depth++;
-                else if (equal(t, ")"))
-                  paren_depth--;
-                t = t->next;
-              }
-            }
-          }
-          else
-          {
-            t = t->next;
-          }
-        }
-        // Now t should be at the function name
-        if (t && t->kind == TK_IDENT)
-        {
-          Token *after_name = t->next;
-          if (after_name && equal(after_name, "("))
-          {
-            // This looks like: void [attrs] func_name( - it's a void function
-            next_func_returns_void = true;
-          }
-        }
-      }
-    }
-
-    // Also detect void after specifiers: static void, inline void, extern void
-    if (defer_depth == 0 && (equal(tok, "static") || equal(tok, "inline") ||
-                             equal(tok, "extern") || equal(tok, "_Noreturn") ||
-                             equal(tok, "__inline") || equal(tok, "__inline__")))
-    {
-      // Look ahead for void
-      Token *t = tok->next;
-      // Skip more specifiers
-      while (t && (equal(t, "static") || equal(t, "inline") || equal(t, "extern") ||
-                   equal(t, "_Noreturn") || equal(t, "__inline") || equal(t, "__inline__") ||
-                   equal(t, "__attribute__") || equal(t, "__declspec")))
-      {
-        if (equal(t, "__attribute__") || equal(t, "__declspec"))
-        {
-          t = t->next;
-          if (t && equal(t, "("))
-          {
-            int paren_depth = 1;
-            t = t->next;
-            while (t && paren_depth > 0)
-            {
-              if (equal(t, "("))
-                paren_depth++;
-              else if (equal(t, ")"))
-                paren_depth--;
-              t = t->next;
-            }
-          }
-        }
-        else
-        {
-          t = t->next;
-        }
-      }
-      // Now check if we're at void
-      if (t && equal(t, "void"))
-      {
-        t = t->next;
-        // Skip pointers
-        if (t && !equal(t, "*"))
-        {
-          // Skip attributes after void
-          while (t && (equal(t, "__attribute__") || equal(t, "__declspec")))
-          {
-            t = t->next;
-            if (t && equal(t, "("))
-            {
-              int paren_depth = 1;
-              t = t->next;
-              while (t && paren_depth > 0)
-              {
-                if (equal(t, "("))
-                  paren_depth++;
-                else if (equal(t, ")"))
-                  paren_depth--;
-                t = t->next;
-              }
-            }
-          }
-          if (t && t->kind == TK_IDENT)
-          {
-            Token *after_name = t->next;
-            if (after_name && equal(after_name, "("))
-              next_func_returns_void = true;
-          }
-        }
-      }
-    }
+    if (defer_depth == 0 && is_void_function_decl(tok))
+      next_func_returns_void = true;
 
     // Track struct/union/enum to avoid zero-init inside them
     if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum"))
@@ -2067,46 +1994,6 @@ static int transpile(char *input_file, char *output_file)
 // Split a space-separated string into an argv array
 // Returns number of arguments, or -1 on error
 // Caller must free each element and the array itself
-static int split_args(const char *str, char ***argv_out)
-{
-  char **argv = calloc(MAX_ARGS, sizeof(char *));
-  if (!argv)
-    return -1;
-
-  int argc = 0;
-  const char *p = str;
-
-  while (*p && argc < MAX_ARGS - 1)
-  {
-    // Skip leading whitespace
-    while (*p && isspace(*p))
-      p++;
-    if (!*p)
-      break;
-
-    const char *start = p;
-    while (*p && !isspace(*p))
-      p++;
-
-    size_t len = p - start;
-    argv[argc] = malloc(len + 1);
-    if (!argv[argc])
-    {
-      for (int i = 0; i < argc; i++)
-        free(argv[i]);
-      free(argv);
-      return -1;
-    }
-    memcpy(argv[argc], start, len);
-    argv[argc][len] = '\0';
-    argc++;
-  }
-
-  argv[argc] = NULL;
-  *argv_out = argv;
-  return argc;
-}
-
 static void free_argv(char **argv)
 {
   if (!argv)

@@ -154,13 +154,9 @@ struct Type
 
 static Type ty_char_val = {TY_CHAR, 1, 1, false};
 static Type ty_int_val = {TY_INT, 4, 4, false};
-static Type ty_ushort_val = {TY_SHORT, 2, 2, true};
-static Type ty_uint_val = {TY_INT, 4, 4, true};
 
 static Type *ty_char = &ty_char_val;
 static Type *ty_int = &ty_int_val;
-static Type *ty_ushort = &ty_ushort_val;
-static Type *ty_uint = &ty_uint_val;
 
 // Hashmap
 typedef struct
