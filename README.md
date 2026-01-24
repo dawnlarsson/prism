@@ -71,7 +71,7 @@ Useful when you need to avoid the overhead of zero-initialization for performanc
 ## Safety Enforcement
 Prism acts as a static analysis tool, turning common C pitfalls into compile-time errors.
 
-**No Uninitialized Jumps**
+### No Uninitialized Jumps
 Standard C allows `goto` to skip variable initialization, leading to undefined behavior. Prism performs a single-pass dominator analysis to forbid this:
 
 ```c
@@ -84,9 +84,6 @@ skip:
 }
 // Error: goto 'skip' would skip over variable declaration 'x'
 ```
-
-### Differentiate "Defer" from Macros
-Many C users assume `defer` is just a `for` loop macro hack (which breaks `break`/`continue`). You need to explicitly state that yours is robust against control flow.
 
 ### Control Flow Integrity
 Prism's `defer` is robust against complex control flow. It correctly injects cleanup code before:
