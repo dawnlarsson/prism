@@ -1,5 +1,5 @@
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.39.0"
+#define VERSION "0.40.0"
 
 #include "parse.c"
 
@@ -85,6 +85,7 @@ typedef struct
   char *name; // Points into token stream (no alloc needed)
   int len;
   int scope_depth; // Scope where defined (aligns with defer_depth)
+  bool is_vla;     // True if typedef refers to a VLA type
 } TypedefEntry;
 
 typedef struct
@@ -449,7 +450,7 @@ static void typedef_table_reset(void)
   typedef_table.capacity = 0;
 }
 
-static void typedef_add(char *name, int len, int scope_depth)
+static void typedef_add(char *name, int len, int scope_depth, bool is_vla)
 {
   // Grow if needed
   if (typedef_table.count >= typedef_table.capacity)
@@ -465,6 +466,7 @@ static void typedef_add(char *name, int len, int scope_depth)
   e->name = name;
   e->len = len;
   e->scope_depth = scope_depth;
+  e->is_vla = is_vla;
 }
 
 // Called when exiting a scope - removes typedefs defined at that depth
@@ -484,6 +486,20 @@ static bool is_known_typedef(Token *tok)
     TypedefEntry *e = &typedef_table.entries[i];
     if (e->len == tok->len && !memcmp(e->name, tok->loc, tok->len))
       return true;
+  }
+  return false;
+}
+
+// Check if token is a known VLA typedef (search most recent first for shadowing)
+static bool is_vla_typedef(Token *tok)
+{
+  if (tok->kind != TK_IDENT)
+    return false;
+  for (int i = typedef_table.count - 1; i >= 0; i--)
+  {
+    TypedefEntry *e = &typedef_table.entries[i];
+    if (e->len == tok->len && !memcmp(e->name, tok->loc, tok->len))
+      return e->is_vla;
   }
   return false;
 }
@@ -1002,18 +1018,46 @@ static Token *scan_typedef_name(Token **tokp)
   return NULL;
 }
 
+// Forward declaration for is_const_array_size (used by typedef_contains_vla)
+static bool is_const_array_size(Token *open_bracket);
+
 // Parse a typedef declaration and add names to the typedef table
+// Check if a typedef declaration contains a VLA (scan from current position to semicolon)
+static bool typedef_contains_vla(Token *tok)
+{
+  int depth = 0;
+  while (tok && !equal(tok, ";") && tok->kind != TK_EOF)
+  {
+    if (equal(tok, "(") || equal(tok, "{"))
+      depth++;
+    else if (equal(tok, ")") || equal(tok, "}"))
+      depth--;
+    else if (equal(tok, "[") && depth == 0)
+    {
+      // Found array dimension - check if it's a VLA
+      if (!is_const_array_size(tok))
+        return true;
+    }
+    tok = tok->next;
+  }
+  return false;
+}
+
 static void parse_typedef_declaration(Token *tok, int scope_depth)
 {
+  Token *typedef_start = tok;
   tok = tok->next;                   // Skip 'typedef'
   tok = scan_typedef_base_type(tok); // Skip the base type
+
+  // Check if this typedef contains a VLA anywhere
+  bool is_vla = typedef_contains_vla(typedef_start);
 
   // Parse declarator(s) until semicolon
   while (tok && !equal(tok, ";") && tok->kind != TK_EOF)
   {
     Token *name = scan_typedef_name(&tok);
     if (name)
-      typedef_add(name->loc, name->len, scope_depth);
+      typedef_add(name->loc, name->len, scope_depth, is_vla);
 
     // Skip to comma or semicolon
     while (tok && !equal(tok, ",") && !equal(tok, ";") && tok->kind != TK_EOF)
@@ -1130,7 +1174,8 @@ static Token *try_zero_init_decl(Token *tok)
   bool saw_type = false;
   bool is_struct_type = false;
   bool is_typedef_type = false;
-  Token *type_end = tok; // Will point to first token after the base type
+  bool is_typedef_vla = false; // True if the typedef refers to a VLA
+  Token *type_end = tok;       // Will point to first token after the base type
 
   while (is_type_qualifier(tok) || is_type_keyword(tok))
   {
@@ -1173,7 +1218,11 @@ static Token *try_zero_init_decl(Token *tok)
     }
     // Check for user-defined typedef (needs {0} initialization for structs)
     if (is_known_typedef(tok))
+    {
       is_typedef_type = true;
+      if (is_vla_typedef(tok))
+        is_typedef_vla = true;
+    }
     tok = tok->next;
     type_end = tok;
   }
@@ -1199,6 +1248,9 @@ static Token *try_zero_init_decl(Token *tok)
       {
         saw_type = true;
         is_typedef_type = true;
+        // Check if this is a VLA typedef
+        if (is_vla_typedef(maybe_type))
+          is_typedef_vla = true;
         tok = maybe_type->next;
         type_end = tok;
       }
@@ -1392,9 +1444,12 @@ static Token *try_zero_init_decl(Token *tok)
     // Check if this declarator already has an initializer
     bool has_init = equal(tok, "=");
 
+    // Combine direct VLA detection with typedef VLA detection
+    bool effective_vla = is_vla || is_typedef_vla;
+
     // VLAs cannot be initialized - this breaks the zero-init guarantee
     // Make it a hard error so users know their code has uninitialized memory
-    if (is_vla && !has_init)
+    if (effective_vla && !has_init)
     {
       error_tok(var_name, "VLA '%.*s' cannot be zero-initialized (C language limitation). "
                           "Options: (1) Use a fixed-size array, (2) Use malloc()+memset(), "
@@ -1404,7 +1459,7 @@ static Token *try_zero_init_decl(Token *tok)
     }
 
     // Add zero initializer if no existing initializer and not a VLA
-    if (!has_init && !is_vla)
+    if (!has_init && !effective_vla)
     {
       if (is_array || ((is_struct_type || is_typedef_type) && !is_pointer))
         fprintf(out, " = {0}");
