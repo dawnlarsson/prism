@@ -2012,7 +2012,7 @@ void test_duff_device_with_defer_at_top(void)
     int count = 5;
     int result = 0;
     {
-        defer result += 10;  // Wrapper scope - fires when we exit this block
+        defer result += 10; // Wrapper scope - fires when we exit this block
         int n = (count + 3) / 4;
         switch (count % 4)
         {
@@ -2469,6 +2469,49 @@ void test_defer_complex_comma(void)
     CHECK_LOG("1D", "defer comma with side effect - log order");
 }
 
+// Test that exit/abort in switch case doesn't false-positive as fallthrough
+void test_switch_noreturn_no_fallthrough(void)
+{
+    int x = 2; // Don't hit the exit case
+    int result = 0;
+
+    switch (x)
+    {
+    case 1:
+        exit(1); // noreturn - should NOT trigger fallthrough error
+    case 2:
+        result = 2;
+        break;
+    }
+
+    CHECK_EQ(result, 2, "switch noreturn: no false fallthrough error");
+}
+
+// Test that defer arguments are evaluated at scope exit (late binding)
+// This is by design - documenting expected behavior
+static int late_binding_captured = 0;
+void capture_value(int x) { late_binding_captured = x; }
+
+void test_defer_late_binding_semantic(void)
+{
+    int x = 10;
+    {
+        defer capture_value(x); // x is evaluated at scope exit
+        x = 20;                 // Modify x before scope exit
+    }
+    // Late binding: x was 20 at scope exit
+    CHECK_EQ(late_binding_captured, 20, "defer late binding: evaluates at exit");
+
+    // Workaround: capture value at defer site
+    x = 10;
+    {
+        int captured_x = x; // Capture value NOW
+        defer capture_value(captured_x);
+        x = 20;
+    }
+    CHECK_EQ(late_binding_captured, 10, "defer early capture workaround");
+}
+
 // Run all rigor tests
 void run_rigor_tests(void)
 {
@@ -2517,6 +2560,8 @@ void run_rigor_tests(void)
     test_attribute_positions();
     test_rigor_defer_comma_operator();
     test_defer_complex_comma();
+    test_switch_noreturn_no_fallthrough();
+    test_defer_late_binding_semantic();
 }
 
 // SECTION 13: SILENT FAILURE DETECTION TESTS

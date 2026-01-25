@@ -1,6 +1,6 @@
 #define _DARWIN_C_SOURCE
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.53.0"
+#define VERSION "0.54.0"
 
 #include "parse.c"
 
@@ -2221,17 +2221,23 @@ static int transpile(char *input_file, char *output_file)
 
     // Warn about noreturn functions that bypass defer cleanup
     // These functions terminate the program without running defers - RAII violation
+    // Also mark as control exit for switch fallthrough detection (they don't fall through)
     if (feature_defer && tok->kind == TK_IDENT && tok->next && equal(tok->next, "("))
     {
-      if (has_active_defers() &&
-          (equal(tok, "exit") || equal(tok, "_Exit") || equal(tok, "_exit") ||
-           equal(tok, "abort") || equal(tok, "quick_exit") ||
-           equal(tok, "__builtin_trap") || equal(tok, "__builtin_unreachable") ||
-           equal(tok, "thrd_exit")))
+      if (equal(tok, "exit") || equal(tok, "_Exit") || equal(tok, "_exit") ||
+          equal(tok, "abort") || equal(tok, "quick_exit") ||
+          equal(tok, "__builtin_trap") || equal(tok, "__builtin_unreachable") ||
+          equal(tok, "thrd_exit"))
       {
-        fprintf(stderr, "%s:%d: warning: '%.*s' called with active defers - deferred statements will NOT run. "
-                        "Consider using return with cleanup, or restructure to avoid defer here.\n",
-                tok->file->name, tok->line_no, tok->len, tok->loc);
+        // Mark as control exit - noreturn functions don't fall through to next case
+        mark_switch_control_exit();
+
+        if (has_active_defers())
+        {
+          fprintf(stderr, "%s:%d: warning: '%.*s' called with active defers - deferred statements will NOT run. "
+                          "Consider using return with cleanup, or restructure to avoid defer here.\n",
+                  tok->file->name, tok->line_no, tok->len, tok->loc);
+        }
       }
     }
 
