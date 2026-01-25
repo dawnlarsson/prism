@@ -1537,10 +1537,7 @@ void run_stress_tests(void)
 }
 
 // SECTION 8: SAFETY HOLE TESTS
-// These tests verify that valid goto patterns still work correctly,
-// while invalid patterns (goto skipping declarations) are caught at compile time.
 
-// Test: goto jumping OVER an entire block is valid
 void test_goto_over_block(void)
 {
     log_reset();
@@ -2039,8 +2036,6 @@ void run_case_label_tests(void)
 
 // SECTION 12: RIGOR TESTS - Testing identified concerns
 
-// ISSUE 3: Void Return Detection with typedef'd void
-// The is_void_function_decl() doesn't handle typedef'd void types
 typedef void VoidType;
 
 VoidType test_typedef_void_return_impl(void)
@@ -2075,9 +2070,6 @@ void test_typedef_voidptr_return(void)
     CHECK(result == NULL, "typedef void* return value preserved");
 }
 
-// ISSUE 6: Statement expression defer timing
-// defer at same scope as final expression - Prism correctly rejects this
-// Test the documented workaround: wrap defer in a block
 void test_stmt_expr_defer_timing(void)
 {
     log_reset();
@@ -2103,9 +2095,6 @@ void test_stmt_expr_defer_timing(void)
     CHECK_LOG("DE", "stmt expr defer - order");
 }
 
-// ISSUE 7: Nested statement expressions with defers
-// Both defers must be in nested blocks to avoid the top-level restriction
-// NOTE: defer in a block runs when THAT BLOCK exits, not when stmt expr exits
 void test_nested_stmt_expr_defer(void)
 {
     log_reset();
@@ -2130,7 +2119,6 @@ void test_nested_stmt_expr_defer(void)
     CHECK_LOG("OIME", "nested stmt expr - defer order (blocks exit immediately)");
 }
 
-// ISSUE 9: const after typename with typedef
 typedef struct
 {
     int x;
@@ -2148,7 +2136,6 @@ void test_const_after_typename(void)
     CHECK(p2.x == 0 && p2.y == 0, "const after typedef zero-init");
 }
 
-// ISSUE 11a: _Atomic qualified types zero-init
 #if !defined(_MSC_VER) && defined(__STDC_NO_ATOMICS__) == 0
 #include <stdatomic.h>
 void test_atomic_zeroinit(void)
@@ -2167,8 +2154,6 @@ void test_atomic_zeroinit(void)
 }
 #endif
 
-// ISSUE 11b: static local variables should NOT be re-zero-initialized
-// Static locals are initialized once at program start
 int test_static_local_helper(void)
 {
     static int counter; // Should be zero-init'd ONCE by C semantics
@@ -2208,9 +2193,6 @@ void test_inline_defer(void)
 }
 #endif
 
-// ISSUE: Complex declarator patterns for zero-init
-// These test the limits of the zero-init parser
-
 void test_complex_declarator_zeroinit(void)
 {
     // Simple function pointer - should work
@@ -2233,9 +2215,6 @@ void test_complex_declarator_zeroinit(void)
     int *(*fprp)(void);
     CHECK(fprp == NULL, "func ptr returning ptr zero-init");
 }
-
-// SAFETY HOLE TEST: Complex declarators that might fail silently
-// These are patterns that try_zero_init_decl might not parse correctly
 
 void test_complex_decl_safety(void)
 {
@@ -2299,7 +2278,6 @@ void test_typedef_not_initialized(void)
     total++;
 }
 
-// ISSUE: for loop init clause zero-init
 void test_for_init_zeroinit(void)
 {
     int sum = 0;
@@ -2323,8 +2301,6 @@ void test_for_init_zeroinit(void)
     total++;
 }
 
-// Test defer in for loop init/update (should error, but let's see)
-// This is commented out because it SHOULD fail to compile with prism
 /*
 void test_defer_in_for_parts(void)
 {
@@ -2333,6 +2309,34 @@ void test_defer_in_for_parts(void)
     // for (...; ...; defer foo()) { }
 }
 */
+
+void test_ptr_to_vla_typedef(int n)
+{
+    typedef int VlaType[n]; // VLA typedef
+    VlaType *p;             // Pointer to VLA - should be zero-init'd to NULL
+    CHECK(p == NULL, "pointer to VLA typedef zero-init");
+
+    // Also test pointer to pointer to VLA
+    VlaType **pp;
+    CHECK(pp == NULL, "double pointer to VLA typedef zero-init");
+}
+
+void test_atomic_specifier_form(void)
+{
+    // Qualifier form (already worked)
+    _Atomic int a;
+    CHECK(a == 0, "_Atomic int (qualifier form) zero-init");
+
+    // Specifier form (was broken)
+    _Atomic(int) b;
+    CHECK(b == 0, "_Atomic(int) (specifier form) zero-init");
+    // More complex specifier forms
+    _Atomic(long long) c;
+    CHECK(c == 0, "_Atomic(long long) zero-init");
+
+    _Atomic(int *) d; // atomic pointer
+    CHECK(d == NULL, "_Atomic(int*) zero-init");
+}
 
 // Run all rigor tests
 void run_rigor_tests(void)
@@ -2364,13 +2368,14 @@ void run_rigor_tests(void)
     test_extern_not_initialized();
     test_typedef_not_initialized();
     test_for_init_zeroinit();
+
+    printf("\n--- Extra ---\n");
+    test_ptr_to_vla_typedef(5);
+    test_atomic_specifier_form();
 }
 
 // SECTION 13: SILENT FAILURE DETECTION TESTS
-// These tests check for complex declarators that might silently fail zero-init
 
-// This function checks if a pointer is NULL (zero-initialized)
-// We use memcmp against a zero buffer to detect if memory is actually zeroed
 #define CHECK_ZEROED(var, size, name)                            \
     do                                                           \
     {                                                            \

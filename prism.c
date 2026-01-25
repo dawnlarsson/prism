@@ -1,6 +1,6 @@
 #define _DARWIN_C_SOURCE
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.49.0"
+#define VERSION "0.50.0"
 
 #include "parse.c"
 
@@ -1639,6 +1639,15 @@ static Token *try_zero_init_decl(Token *tok)
       type_end = tok;
       continue;
     }
+    // Handle _Atomic(type) specifier form (different from _Atomic as qualifier)
+    if (equal(tok, "_Atomic") && tok->next && equal(tok->next, "("))
+    {
+      saw_type = true;
+      tok = tok->next;                    // skip _Atomic
+      tok = skip_balanced(tok, "(", ")"); // skip (type)
+      type_end = tok;
+      continue;
+    }
     // Handle _Alignas/alignas and __attribute__ with parenthesized arguments
     if (equal(tok, "_Alignas") || equal(tok, "alignas") ||
         equal(tok, "__attribute__") || equal(tok, "__attribute"))
@@ -2006,7 +2015,8 @@ static Token *try_zero_init_decl(Token *tok)
     bool has_init = equal(tok, "=");
 
     // Combine direct VLA detection with typedef VLA detection
-    bool effective_vla = is_vla || is_typedef_vla;
+    // But pointers to VLAs are NOT VLAs - they can be zero-initialized to NULL
+    bool effective_vla = (is_vla || is_typedef_vla) && !is_pointer;
 
     // VLAs cannot be initialized - this is a hard error, no bypass allowed
     // C syntax doesn't allow `int arr[n] = {0};` so VLAs break safety guarantees
