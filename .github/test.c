@@ -2338,6 +2338,106 @@ void test_atomic_specifier_form(void)
     CHECK(d == NULL, "_Atomic(int*) zero-init");
 }
 
+// HOLE #1: Switch scope leak - variable before first case
+// The zero-init "= 0" is added but the switch jumps over it!
+void test_switch_scope_leak(void)
+{
+    int result = -1;
+    switch (1)
+    {
+        int y; // This declaration is jumped over by switch(1) -> case 1
+    case 1:
+        result = y; // y should be 0 if zero-init worked, but init is skipped!
+        break;
+    }
+    printf("[INFO] switch scope leak: y = %d (UB if not 0)\n", result);
+    // UB!
+}
+
+typedef int SizeofTestType;
+
+void test_sizeof_shadows_type(void)
+{
+    // At this point, SizeofTestType is the typedef (int)
+    int SizeofTestType = sizeof(SizeofTestType); // sizeof should use the TYPE
+    // sizeof(int) is typically 4
+    CHECK(SizeofTestType == sizeof(int), "sizeof(T) in initializer uses type not variable");
+}
+
+#if __STDC_VERSION__ >= 201112L
+void test_generic_colons(void)
+{
+    int x = 5;
+    // _Generic has "type: value" syntax that looks like labels
+    int type_id = _Generic(x,
+        int: 1,
+        long: 2,
+        default: 0);
+    CHECK(type_id == 1, "_Generic parsing doesn't break label detection");
+}
+#endif
+
+void test_for_braceless_label(void)
+{
+    int reached = 0;
+    for (int i = 0; i < 1; i++)
+    my_label:
+        reached = 1; // Label in braceless for body
+
+    CHECK(reached == 1, "label in braceless for body");
+}
+
+// Also test goto INTO a for loop (should be blocked if it skips declarations)
+void test_goto_into_for(void)
+{
+    int x = 0;
+    goto skip;
+    for (int i = 0; i < 10; i++)
+    {
+    skip:
+        x = 1;
+        break;
+    }
+    CHECK(x == 1, "goto into for loop body");
+}
+
+void test_attribute_positions(void)
+{
+    // Attribute after type, before variable name
+    int __attribute__((aligned(4))) x;
+    CHECK(x == 0, "attribute after type zero-init");
+
+    // Attribute after pointer star
+    int *__attribute__((aligned(8))) p;
+    CHECK(p == NULL, "attribute after pointer star zero-init");
+
+    // Multiple attributes
+    __attribute__((unused)) __attribute__((aligned(16))) int y;
+    CHECK(y == 0, "multiple attributes zero-init");
+}
+
+void test_rigor_defer_comma_operator(void)
+{
+    log_reset();
+    {
+        defer(log_append("A"), log_append("B")); // Comma expression
+        log_append("1");
+    }
+    CHECK_LOG("1AB", "defer comma operator");
+}
+
+void test_defer_complex_comma(void)
+{
+    log_reset();
+    int x = 0;
+    {
+        defer(x++, log_append("D"));
+        log_append("1");
+    }
+    CHECK(x == 1, "defer comma with side effect - x incremented");
+    CHECK_LOG("1D", "defer comma with side effect - log order");
+}
+
 // Run all rigor tests
 void run_rigor_tests(void)
 {
@@ -2372,6 +2472,19 @@ void run_rigor_tests(void)
     printf("\n--- Extra ---\n");
     test_ptr_to_vla_typedef(5);
     test_atomic_specifier_form();
+
+    test_switch_scope_leak();
+    test_sizeof_shadows_type();
+
+#if __STDC_VERSION__ >= 201112L
+    test_generic_colons();
+#endif
+
+    test_for_braceless_label();
+    test_goto_into_for();
+    test_attribute_positions();
+    test_rigor_defer_comma_operator();
+    test_defer_complex_comma();
 }
 
 // SECTION 13: SILENT FAILURE DETECTION TESTS

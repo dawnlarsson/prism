@@ -1,6 +1,6 @@
 #define _DARWIN_C_SOURCE
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.50.0"
+#define VERSION "0.51.0"
 
 #include "parse.c"
 
@@ -1723,7 +1723,28 @@ static Token *try_zero_init_decl(Token *tok)
   // Look for: pointers/qualifiers followed by identifier (possibly inside nested parens)
   Token *check = tok;
   while (equal(check, "*") || is_type_qualifier(check))
+  {
+    // Skip __attribute__((...)) entirely
+    if (equal(check, "__attribute__") || equal(check, "__attribute"))
+    {
+      check = check->next;
+      if (check && equal(check, "("))
+      {
+        int attr_depth = 1;
+        check = check->next;
+        while (check && check->kind != TK_EOF && attr_depth > 0)
+        {
+          if (equal(check, "("))
+            attr_depth++;
+          else if (equal(check, ")"))
+            attr_depth--;
+          check = check->next;
+        }
+      }
+      continue;
+    }
     check = check->next;
+  }
 
   // Handle parenthesized declarators - may be arbitrarily nested: (*name), (*(*name)(args))[N], etc.
   // We need to find an identifier somewhere inside the parentheses
@@ -1815,6 +1836,29 @@ static Token *try_zero_init_decl(Token *tok)
     {
       if (equal(tok, "*"))
         is_pointer = true;
+      // Handle __attribute__((...)) - skip the entire attribute including parens
+      if (equal(tok, "__attribute__") || equal(tok, "__attribute"))
+      {
+        emit_tok(tok);
+        tok = tok->next;
+        if (tok && equal(tok, "("))
+        {
+          // Skip the outer and inner parens: __attribute__((xxx))
+          emit_tok(tok); // (
+          tok = tok->next;
+          int attr_depth = 1;
+          while (tok && tok->kind != TK_EOF && attr_depth > 0)
+          {
+            if (equal(tok, "("))
+              attr_depth++;
+            else if (equal(tok, ")"))
+              attr_depth--;
+            emit_tok(tok);
+            tok = tok->next;
+          }
+        }
+        continue;
+      }
       emit_tok(tok);
       tok = tok->next;
     }
@@ -1852,6 +1896,28 @@ static Token *try_zero_init_decl(Token *tok)
           is_pointer = true;
         else if (equal(tok, "("))
           nested_paren_count++;
+        // Handle __attribute__((...)) inside parenthesized declarator
+        if (equal(tok, "__attribute__") || equal(tok, "__attribute"))
+        {
+          emit_tok(tok);
+          tok = tok->next;
+          if (tok && equal(tok, "("))
+          {
+            emit_tok(tok);
+            tok = tok->next;
+            int attr_depth = 1;
+            while (tok && tok->kind != TK_EOF && attr_depth > 0)
+            {
+              if (equal(tok, "("))
+                attr_depth++;
+              else if (equal(tok, ")"))
+                attr_depth--;
+              emit_tok(tok);
+              tok = tok->next;
+            }
+          }
+          continue;
+        }
         emit_tok(tok);
         tok = tok->next;
       }
