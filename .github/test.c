@@ -1978,52 +1978,60 @@ void test_case_in_nested_block(void)
 
 void test_case_after_defer_in_block(void)
 {
-    // Case label after defer in same block
-    // When jumping to case 1, we enter the block scope so the defer IS registered
-    // This is consistent C semantics - the block is entered, defer is in scope
+    // Case label after defer in same block - NOW AN ERROR
+    // Prism correctly detects that jumping to case 1 would skip the defer.
+    // This test verifies the safe pattern: each case has its own block with defers.
     log_reset();
     int x = 1;
     switch (x)
     {
     case 0:
     {
-        defer log_append("D"); // This defer is registered when block is entered for case 1 too
+        defer log_append("D0");
         log_append("0");
-    case 1: // Case 1 is inside case 0's braces - block is entered
+        break;
+    }
+    case 1:
+    {
+        defer log_append("D1");
         log_append("1");
         break;
-    } // D fires here since we're in the block scope
+    }
     }
     log_append("E");
-    // x=1: jump to case 1, block scope entered, D registered, "1", break, D fires, "E"
-    CHECK_LOG("1DE", "case after defer in block - defer registered on scope entry");
+    // x=1: jump to case 1, "1", break, D1 fires, "E"
+    CHECK_LOG("1D1E", "case with separate blocks - correct defer behavior");
 }
 
 void test_duff_device_with_defer_at_top(void)
 {
-    // Duff's device pattern - defer at switch scope level
+    // Duff's device pattern - defer works when used in a wrapper scope
+    // The interleaved case labels inside do-while are incompatible with defer
+    // in the same block, so we use a separate scope.
     log_reset();
     int count = 5;
     int result = 0;
-    int n = (count + 3) / 4;
-    switch (count % 4)
     {
-    case 0:
-        do
+        defer result += 10;  // Wrapper scope - fires when we exit this block
+        int n = (count + 3) / 4;
+        switch (count % 4)
         {
-            defer result++;
-            log_append("X");
-        case 3:
-            log_append("X");
-        case 2:
-            log_append("X");
-        case 1:
-            log_append("X");
-        } while (--n > 0);
+        case 0:
+            do
+            {
+                log_append("X");
+            case 3:
+                log_append("X");
+            case 2:
+                log_append("X");
+            case 1:
+                log_append("X");
+            } while (--n > 0);
+        }
     }
     log_append("E");
-    CHECK_LOG("XXXXXE", "duff device with defer");
-    CHECK_EQ(result, 2, "duff device defer count"); // defer fires at } of do-while each iteration
+    CHECK_LOG("XXXXXE", "duff device with defer in wrapper");
+    CHECK_EQ(result, 10, "duff device defer count"); // defer fires once at wrapper scope exit
 }
 
 void run_case_label_tests(void)
@@ -2321,6 +2329,29 @@ void test_ptr_to_vla_typedef(int n)
     CHECK(pp == NULL, "double pointer to VLA typedef zero-init");
 }
 
+// Test that VLA size side effects are not duplicated
+static int vla_size_counter = 0;
+int get_vla_size(void)
+{
+    vla_size_counter++;
+    return 10;
+}
+
+void test_vla_side_effect_once(void)
+{
+    // VLA typedef with side effect in size
+    int n = 5;
+    typedef int Arr[n++];
+    CHECK_EQ(n, 6, "VLA typedef side effect runs once");
+    (void)sizeof(Arr);
+
+    // VLA typedef with function call
+    vla_size_counter = 0;
+    typedef int Arr2[get_vla_size()];
+    CHECK_EQ(vla_size_counter, 1, "VLA size function called once");
+    (void)sizeof(Arr2);
+}
+
 void test_atomic_specifier_form(void)
 {
     // Qualifier form (already worked)
@@ -2471,6 +2502,7 @@ void run_rigor_tests(void)
 
     printf("\n--- Extra ---\n");
     test_ptr_to_vla_typedef(5);
+    test_vla_side_effect_once();
     test_atomic_specifier_form();
 
     test_switch_scope_leak();

@@ -1,6 +1,6 @@
 #define _DARWIN_C_SOURCE
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.52.0"
+#define VERSION "0.53.0"
 
 #include "parse.c"
 
@@ -267,15 +267,20 @@ static void mark_switch_control_exit(void)
 // This is necessary because the transpiler can't track which case was entered at runtime.
 // Note: This means defer in case with fallthrough will NOT preserve defers from previous cases.
 // For reliable defer behavior in switch, wrap each case body in braces.
+// Must clear defers at ALL scopes from current depth down to the switch scope,
+// because case labels can appear inside nested blocks (e.g., Duff's device pattern).
 static void clear_switch_scope_defers(void)
 {
+  // Find the switch scope and clear all scopes from current down to it
   for (int d = defer_depth - 1; d >= 0; d--)
   {
-    if (!defer_stack[d].is_switch)
-      continue;
-
+    // Clear defers at this scope
     defer_stack[d].count = 0;
-    return;
+    defer_stack[d].had_control_exit = false;
+
+    // Stop when we hit the switch scope
+    if (defer_stack[d].is_switch)
+      return;
   }
 }
 
@@ -2577,22 +2582,24 @@ static int transpile(char *input_file, char *output_file)
     if (feature_defer && tok->kind == TK_KEYWORD && (equal(tok, "case") || equal(tok, "default")))
     {
       // Check if there are active defers that would be lost (fallthrough scenario)
+      // Must check ALL scopes from current depth down to the switch scope,
+      // because case labels can appear inside nested blocks
       for (int d = defer_depth - 1; d >= 0; d--)
       {
-        if (defer_stack[d].is_switch)
+        // Check for defers at this scope that would be cleared
+        if (defer_stack[d].count > 0 && !defer_stack[d].had_control_exit)
         {
-          // Only error if: there are defers AND no control exit (break/return) since the last defer
-          if (defer_stack[d].count > 0 && !defer_stack[d].had_control_exit)
-          {
-            // There are defers that will be cleared - this is a resource leak!
-            // Make it an error to force the user to fix it.
-            error_tok(defer_stack[d].defer_tok[0],
-                      "defer would be skipped due to switch fallthrough at %s:%d. "
-                      "Add 'break;' before the next case, or wrap case body in braces.",
-                      tok->file->name, tok->line_no);
-          }
-          break;
+          // There are defers that will be cleared - this is a resource leak!
+          // Make it an error to force the user to fix it.
+          error_tok(defer_stack[d].defer_tok[0],
+                    "defer would be skipped due to switch fallthrough at %s:%d. "
+                    "Add 'break;' before the next case, or wrap case body in braces.",
+                    tok->file->name, tok->line_no);
         }
+
+        // Stop when we hit the switch scope
+        if (defer_stack[d].is_switch)
+          break;
       }
       clear_switch_scope_defers();
     }
