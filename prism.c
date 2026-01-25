@@ -1,6 +1,6 @@
 #define _DARWIN_C_SOURCE
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.47.0"
+#define VERSION "0.48.0"
 
 #include "parse.c"
 
@@ -89,9 +89,10 @@ typedef struct
 {
   char *name; // Points into token stream (no alloc needed)
   int len;
-  int scope_depth; // Scope where defined (aligns with defer_depth)
-  bool is_vla;     // True if typedef refers to a VLA type
-  bool is_shadow;  // True if this entry shadows a typedef (variable with same name)
+  int scope_depth;    // Scope where defined (aligns with defer_depth)
+  bool is_vla;        // True if typedef refers to a VLA type
+  bool is_shadow;     // True if this entry shadows a typedef (variable with same name)
+  bool is_enum_const; // True if this is an enum constant (compile-time constant)
 } TypedefEntry;
 
 typedef struct
@@ -107,6 +108,7 @@ static DeferScope *defer_stack = NULL;
 static int defer_depth = 0;
 static int defer_stack_capacity = 0;
 
+static char pending_temp_file_buf[512];
 static char *pending_temp_file = NULL;
 
 // Track pending loop/switch for next scope
@@ -213,14 +215,23 @@ static void defer_scope_ensure_capacity(DeferScope *scope, int n)
   int new_cap = scope->capacity == 0 ? INITIAL_DEFERS_PER_SCOPE : scope->capacity * 2;
   while (new_cap < n)
     new_cap *= 2;
+
+  // Allocate all three arrays, handling partial failures
   Token **new_stmts = realloc(scope->stmts, sizeof(Token *) * new_cap);
-  Token **new_ends = realloc(scope->ends, sizeof(Token *) * new_cap);
-  Token **new_defer_tok = realloc(scope->defer_tok, sizeof(Token *) * new_cap);
-  if (!new_stmts || !new_ends || !new_defer_tok)
+  if (!new_stmts)
     error("out of memory growing defer scope");
   scope->stmts = new_stmts;
+
+  Token **new_ends = realloc(scope->ends, sizeof(Token *) * new_cap);
+  if (!new_ends)
+    error("out of memory growing defer scope");
   scope->ends = new_ends;
+
+  Token **new_defer_tok = realloc(scope->defer_tok, sizeof(Token *) * new_cap);
+  if (!new_defer_tok)
+    error("out of memory growing defer scope");
   scope->defer_tok = new_defer_tok;
+
   scope->capacity = new_cap;
 }
 
@@ -532,6 +543,7 @@ static void typedef_add(char *name, int len, int scope_depth, bool is_vla)
   e->scope_depth = scope_depth;
   e->is_vla = is_vla;
   e->is_shadow = false;
+  e->is_enum_const = false;
 }
 
 // Add a shadow entry: marks that a variable with this name exists at this scope,
@@ -554,6 +566,29 @@ static void typedef_add_shadow(char *name, int len, int scope_depth)
   e->scope_depth = scope_depth;
   e->is_vla = false;
   e->is_shadow = true;
+  e->is_enum_const = false;
+}
+
+// Add an enum constant entry
+static void typedef_add_enum_const(char *name, int len, int scope_depth)
+{
+  // Grow if needed
+  if (typedef_table.count >= typedef_table.capacity)
+  {
+    int new_cap = typedef_table.capacity == 0 ? 256 : typedef_table.capacity * 2;
+    TypedefEntry *new_entries = realloc(typedef_table.entries, sizeof(TypedefEntry) * new_cap);
+    if (!new_entries)
+      error("out of memory tracking typedefs");
+    typedef_table.entries = new_entries;
+    typedef_table.capacity = new_cap;
+  }
+  TypedefEntry *e = &typedef_table.entries[typedef_table.count++];
+  e->name = name;
+  e->len = len;
+  e->scope_depth = scope_depth;
+  e->is_vla = false;
+  e->is_shadow = false;
+  e->is_enum_const = true;
 }
 
 // Called when exiting a scope - removes typedefs defined at that depth
@@ -568,6 +603,7 @@ static bool is_known_typedef(Token *tok);
 
 // Parse enum body and register constants as shadows for any matching typedefs.
 // Enum constants are visible in the enclosing scope, so they shadow typedefs.
+// Also register all enum constants for is_const_array_size detection.
 // tok should point to the opening '{' of the enum body.
 // scope_depth is the scope where the enum constants become visible.
 static void parse_enum_constants(Token *tok, int scope_depth)
@@ -584,6 +620,9 @@ static void parse_enum_constants(Token *tok, int scope_depth)
       // Register this constant as a shadow if it matches any typedef
       if (is_known_typedef(tok))
         typedef_add_shadow(tok->loc, tok->len, scope_depth);
+      else
+        // Register as enum constant for array size detection
+        typedef_add_enum_const(tok->loc, tok->len, scope_depth);
       tok = tok->next;
 
       // Skip = expr if present
@@ -649,6 +688,20 @@ static bool is_vla_typedef(Token *tok)
         return false;
       return e->is_vla;
     }
+  }
+  return false;
+}
+
+// Check if token is a known enum constant (compile-time constant)
+static bool is_known_enum_const(Token *tok)
+{
+  if (tok->kind != TK_IDENT)
+    return false;
+  for (int i = typedef_table.count - 1; i >= 0; i--)
+  {
+    TypedefEntry *e = &typedef_table.entries[i];
+    if (e->len == tok->len && !memcmp(e->name, tok->loc, tok->len))
+      return e->is_enum_const;
   }
   return false;
 }
@@ -1505,12 +1558,14 @@ static bool is_const_array_size(Token *open_bracket)
     else
     {
       is_empty = false;
-      // Allow numeric literals, sizeof, and basic operators
+      // Allow numeric literals, sizeof, _Alignof, and basic operators
       if (tok->kind != TK_NUM && !equal(tok, "sizeof") &&
+          !equal(tok, "_Alignof") && !equal(tok, "alignof") &&
           !equal(tok, "+") && !equal(tok, "-") && !equal(tok, "*") &&
           !equal(tok, "/") && !equal(tok, "(") && !equal(tok, ")"))
       {
-        if (tok->kind == TK_IDENT) // might be a VLA
+        // Identifiers are only allowed if they're known enum constants
+        if (tok->kind == TK_IDENT && !is_known_enum_const(tok))
           has_only_literals = false;
       }
     }
@@ -3055,7 +3110,10 @@ int main(int argc, char **argv)
 #endif
 
   // Register cleanup handler and set pending temp file for cleanup on error
-  pending_temp_file = transpiled;
+  // Copy to static buffer to avoid pointing to stack memory
+  strncpy(pending_temp_file_buf, transpiled, sizeof(pending_temp_file_buf) - 1);
+  pending_temp_file_buf[sizeof(pending_temp_file_buf) - 1] = '\0';
+  pending_temp_file = pending_temp_file_buf;
   atexit(cleanup_temp_file);
 
   // Handle transpile-only mode

@@ -473,6 +473,55 @@ void test_zeroinit_with_defer(void)
     CHECK_EQ(result, 0, "zero-init with defer");
 }
 
+#ifdef __GNUC__
+void test_zeroinit_typeof(void)
+{
+    int x = 42;
+    __typeof__(x) y;
+    CHECK_EQ(y, 0, "typeof zero-init");
+
+    __typeof__(x) *ptr;
+    CHECK(ptr == NULL, "typeof pointer zero-init");
+}
+#endif
+
+// Test that enum constants are recognized as compile-time constants (not VLAs)
+enum
+{
+    TEST_ARRAY_SIZE = 10
+};
+
+void test_zeroinit_enum_array_size(void)
+{
+    int arr[TEST_ARRAY_SIZE];
+    int all_zero = 1;
+    for (int i = 0; i < TEST_ARRAY_SIZE; i++)
+        if (arr[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "enum constant array size zero-init");
+}
+
+void test_zeroinit_alignas_array(void)
+{
+    _Alignas(32) int arr[8];
+    int all_zero = 1;
+    for (int i = 0; i < 8; i++)
+        if (arr[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "_Alignas array zero-init");
+}
+
+void test_zeroinit_union(void)
+{
+    union
+    {
+        int i;
+        float f;
+        char c[4];
+    } u;
+    CHECK_EQ(u.i, 0, "union zero-init");
+}
+
 void run_zeroinit_tests(void)
 {
     printf("\n=== ZERO-INIT TESTS ===\n");
@@ -483,6 +532,12 @@ void run_zeroinit_tests(void)
     test_zeroinit_qualifiers();
     test_zeroinit_in_scopes();
     test_zeroinit_with_defer();
+#ifdef __GNUC__
+    test_zeroinit_typeof();
+#endif
+    test_zeroinit_enum_array_size();
+    test_zeroinit_alignas_array();
+    test_zeroinit_union();
 }
 
 // SECTION 2.5: RAW KEYWORD TESTS
@@ -692,6 +747,17 @@ void test_typedef_shadowing(void)
     CHECK_EQ(after, 0, "typedef after shadow scope");
 }
 
+// Multi-declarator typedef: typedef int A, *B;
+typedef int TD_Int, *TD_IntPtr;
+
+void test_typedef_multi_declarator(void)
+{
+    TD_Int a;
+    TD_IntPtr p;
+    CHECK_EQ(a, 0, "multi-declarator typedef int zero-init");
+    CHECK(p == NULL, "multi-declarator typedef ptr zero-init");
+}
+
 void run_typedef_tests(void)
 {
     printf("\n=== TYPEDEF TRACKING TESTS ===\n");
@@ -704,6 +770,7 @@ void run_typedef_tests(void)
     test_typedef_multi_var();
     test_typedef_block_scoped();
     test_typedef_shadowing();
+    test_typedef_multi_declarator();
 }
 
 // SECTION 5: EDGE CASES
@@ -839,6 +906,16 @@ void test_do_while_0_defer(void)
     log_append("E");
 }
 
+void test_defer_comma_operator(void)
+{
+    log_reset();
+    {
+        defer(log_append("A"), log_append("B"));
+        log_append("1");
+    }
+    CHECK_LOG("1AB", "defer with comma operator");
+}
+
 void run_edge_case_tests(void)
 {
     printf("\n=== EDGE CASE TESTS ===\n");
@@ -860,6 +937,8 @@ void run_edge_case_tests(void)
 
     test_do_while_0_defer();
     CHECK_LOG("1DEF", "do-while(0) with defer");
+
+    test_defer_comma_operator();
 }
 
 // SECTION 6: BUG REGRESSION TESTS
