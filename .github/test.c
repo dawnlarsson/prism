@@ -2037,6 +2037,501 @@ void run_case_label_tests(void)
     test_duff_device_with_defer_at_top();
 }
 
+// SECTION 12: RIGOR TESTS - Testing identified concerns
+
+// ISSUE 3: Void Return Detection with typedef'd void
+// The is_void_function_decl() doesn't handle typedef'd void types
+typedef void VoidType;
+
+VoidType test_typedef_void_return_impl(void)
+{
+    log_reset();
+    defer log_append("D");
+    log_append("1");
+    return; // Should work correctly - defers should run
+}
+
+void test_typedef_void_return(void)
+{
+    test_typedef_void_return_impl();
+    CHECK_LOG("1D", "typedef void return with defer");
+}
+
+// ISSUE 3b: typedef void* should NOT be treated as void return
+typedef void *VoidPtr;
+
+VoidPtr test_typedef_voidptr_return_impl(void)
+{
+    log_reset();
+    defer log_append("D");
+    log_append("1");
+    return NULL; // Returns void*, should save return value properly
+}
+
+void test_typedef_voidptr_return(void)
+{
+    VoidPtr result = test_typedef_voidptr_return_impl();
+    CHECK_LOG("1D", "typedef void* return with defer");
+    CHECK(result == NULL, "typedef void* return value preserved");
+}
+
+// ISSUE 6: Statement expression defer timing
+// defer at same scope as final expression - Prism correctly rejects this
+// Test the documented workaround: wrap defer in a block
+void test_stmt_expr_defer_timing(void)
+{
+    log_reset();
+    int capture = 0;
+
+    // Workaround: wrap defer in a nested block
+    int x = ({
+        int y;
+        y = 42;
+        {
+            defer
+            {
+                log_append("D");
+                capture = y;
+            };
+        } // wrapped in block
+        y; // final expression
+    });
+
+    log_append("E");
+    CHECK_EQ(x, 42, "stmt expr defer - return value correct");
+    CHECK_EQ(capture, 42, "stmt expr defer - captured value");
+    CHECK_LOG("DE", "stmt expr defer - order");
+}
+
+// ISSUE 7: Nested statement expressions with defers
+// Both defers must be in nested blocks to avoid the top-level restriction
+// NOTE: defer in a block runs when THAT BLOCK exits, not when stmt expr exits
+void test_nested_stmt_expr_defer(void)
+{
+    log_reset();
+
+    int x = ({
+        {
+            defer log_append("O");
+        } // outer block exits immediately -> "O" runs here
+        int inner = ({
+            {
+                defer log_append("I");
+            } // inner block exits immediately -> "I" runs here
+            10;
+        });
+        log_append("M"); // middle - after inner completes
+        inner + 5;
+    });
+
+    log_append("E");
+    CHECK_EQ(x, 15, "nested stmt expr - return value");
+    // Order: O (outer block exit), I (inner block exit), M, E
+    CHECK_LOG("OIME", "nested stmt expr - defer order (blocks exit immediately)");
+}
+
+// ISSUE 9: const after typename with typedef
+typedef struct
+{
+    int x;
+    int y;
+} PointType;
+
+void test_const_after_typename(void)
+{
+    // const BEFORE typename - should work
+    const PointType p1;
+    CHECK(p1.x == 0 && p1.y == 0, "const before typedef zero-init");
+
+    // const AFTER typename - might fail
+    PointType const p2;
+    CHECK(p2.x == 0 && p2.y == 0, "const after typedef zero-init");
+}
+
+// ISSUE 11a: _Atomic qualified types zero-init
+#if !defined(_MSC_VER) && defined(__STDC_NO_ATOMICS__) == 0
+#include <stdatomic.h>
+void test_atomic_zeroinit(void)
+{
+    _Atomic int ai;
+    CHECK(atomic_load(&ai) == 0, "_Atomic int zero-init");
+
+    _Atomic int *ap;
+    CHECK(ap == NULL, "_Atomic pointer zero-init");
+}
+#else
+void test_atomic_zeroinit(void)
+{
+    // Skip on platforms without atomics
+    printf("[SKIP] _Atomic tests (not supported)\n");
+}
+#endif
+
+// ISSUE 11b: static local variables should NOT be re-zero-initialized
+// Static locals are initialized once at program start
+int test_static_local_helper(void)
+{
+    static int counter; // Should be zero-init'd ONCE by C semantics
+    return ++counter;
+}
+
+void test_static_local_zeroinit(void)
+{
+    // Call multiple times - if prism re-inits each call, this breaks
+    int a = test_static_local_helper();
+    int b = test_static_local_helper();
+    int c = test_static_local_helper();
+
+    CHECK(a == 1 && b == 2 && c == 3, "static local not re-initialized");
+}
+
+// ISSUE 11c: defer with inline function (if supported)
+#ifdef __GNUC__
+static inline int inline_with_defer(void)
+{
+    log_reset();
+    defer log_append("D");
+    log_append("1");
+    return 42;
+}
+
+void test_inline_defer(void)
+{
+    int r = inline_with_defer();
+    CHECK_EQ(r, 42, "inline function defer - return value");
+    CHECK_LOG("1D", "inline function defer - order");
+}
+#else
+void test_inline_defer(void)
+{
+    printf("[SKIP] inline defer tests (not GCC/Clang)\n");
+}
+#endif
+
+// ISSUE: Complex declarator patterns for zero-init
+// These test the limits of the zero-init parser
+
+void test_complex_declarator_zeroinit(void)
+{
+    // Simple function pointer - should work
+    int (*fp1)(void);
+    CHECK(fp1 == NULL, "function pointer zero-init");
+
+    // Pointer to array
+    int (*pa)[10];
+    CHECK(pa == NULL, "pointer to array zero-init");
+
+    // Array of function pointers
+    int (*afp[5])(void);
+    int all_null = 1;
+    for (int i = 0; i < 5; i++)
+        if (afp[i] != NULL)
+            all_null = 0;
+    CHECK(all_null, "array of function pointers zero-init");
+
+    // Function pointer returning pointer
+    int *(*fprp)(void);
+    CHECK(fprp == NULL, "func ptr returning ptr zero-init");
+}
+
+// SAFETY HOLE TEST: Complex declarators that might fail silently
+// These are patterns that try_zero_init_decl might not parse correctly
+
+void test_complex_decl_safety(void)
+{
+    // Function returning pointer to array
+    // int (*(*f1)(void))[10];
+    // This is extremely complex - let's test simpler variants first
+
+    // Pointer to function returning pointer to int
+    int *(*(*ppfp))(void);
+    CHECK(ppfp == NULL, "ptr to ptr to func returning ptr - zero-init");
+
+    // Double pointer to function
+    int (**ppf)(void);
+    CHECK(ppf == NULL, "double ptr to function zero-init");
+
+    // Pointer to array of pointers
+    int *(*pap)[5];
+    CHECK(pap == NULL, "ptr to array of ptrs zero-init");
+}
+
+// Test multi-level pointer with qualifiers
+void test_qualified_complex_decl(void)
+{
+    // const pointer to pointer
+    int *const *cpp;
+    CHECK(cpp == NULL, "const ptr to ptr zero-init");
+
+    // pointer to const pointer
+    int **const pcp;
+    CHECK(pcp == NULL, "ptr to const ptr zero-init");
+
+    // volatile pointer
+    int *volatile vp;
+    CHECK(vp == NULL, "volatile ptr zero-init");
+
+    // restrict pointer (C99)
+    int *restrict rp;
+    CHECK(rp == NULL, "restrict ptr zero-init");
+}
+
+// Test that extern declarations are NOT zero-initialized (would cause linker errors)
+extern int extern_var; // declaration only, no init
+
+void test_extern_not_initialized(void)
+{
+    // This test passes if it compiles - extern should not get = 0 added
+    // We can't actually test the value without defining it somewhere
+    printf("[PASS] extern declaration not initialized (compiled OK)\n");
+    passed++;
+    total++;
+}
+
+// Test that typedef declarations are NOT zero-initialized
+void test_typedef_not_initialized(void)
+{
+    typedef int MyInt; // This should not become "typedef int MyInt = 0;"
+    MyInt x;
+    CHECK_EQ(x, 0, "variable of typedef type zero-init");
+    printf("[PASS] typedef declaration not initialized (compiled OK)\n");
+    passed++;
+    total++;
+}
+
+// ISSUE: for loop init clause zero-init
+void test_for_init_zeroinit(void)
+{
+    int sum = 0;
+    // Test that variables declared in for init are zero-initialized
+    for (int i; i < 3; i++) // i should be 0-init'd
+    {
+        sum += i;
+    }
+    CHECK(sum == 0 + 1 + 2, "for init clause zero-init");
+
+    // Multiple declarations in for init
+    sum = 0;
+    for (int a, b; a < 2; a++, b++)
+    {
+        sum += a + b; // both should start at 0
+    }
+    CHECK(sum == (0 + 0) + (1 + 1), "for init multiple decls zero-init");
+
+    printf("[PASS] for init declaration (compiled OK)\n");
+    passed++;
+    total++;
+}
+
+// Test defer in for loop init/update (should error, but let's see)
+// This is commented out because it SHOULD fail to compile with prism
+/*
+void test_defer_in_for_parts(void)
+{
+    // These should all be errors:
+    // for (defer foo(); ...; ...) { }
+    // for (...; ...; defer foo()) { }
+}
+*/
+
+// Run all rigor tests
+void run_rigor_tests(void)
+{
+    printf("\n=== RIGOR TESTS ===\n");
+
+    printf("\n--- Issue 3: typedef void return ---\n");
+    test_typedef_void_return();
+    test_typedef_voidptr_return();
+
+    printf("\n--- Issue 6/7: Statement expression defer ---\n");
+    test_stmt_expr_defer_timing();
+    test_nested_stmt_expr_defer();
+
+    printf("\n--- Issue 9: const placement ---\n");
+    test_const_after_typename();
+
+    printf("\n--- Issue 11: Coverage gaps ---\n");
+    test_atomic_zeroinit();
+    test_static_local_zeroinit();
+    test_inline_defer();
+
+    printf("\n--- Complex declarator zero-init ---\n");
+    test_complex_declarator_zeroinit();
+    test_complex_decl_safety();
+    test_qualified_complex_decl();
+
+    printf("\n--- Declaration edge cases ---\n");
+    test_extern_not_initialized();
+    test_typedef_not_initialized();
+    test_for_init_zeroinit();
+}
+
+// SECTION 13: SILENT FAILURE DETECTION TESTS
+// These tests check for complex declarators that might silently fail zero-init
+
+// This function checks if a pointer is NULL (zero-initialized)
+// We use memcmp against a zero buffer to detect if memory is actually zeroed
+#define CHECK_ZEROED(var, size, name)                            \
+    do                                                           \
+    {                                                            \
+        char zero_buf[size];                                     \
+        memset(zero_buf, 0, size);                               \
+        if (memcmp(&(var), zero_buf, size) == 0)                 \
+        {                                                        \
+            printf("[PASS] %s\n", name);                         \
+            passed++;                                            \
+        }                                                        \
+        else                                                     \
+        {                                                        \
+            printf("[FAIL] %s - NOT ZERO-INITIALIZED!\n", name); \
+            failed++;                                            \
+        }                                                        \
+        total++;                                                 \
+    } while (0)
+
+void test_complex_func_ptr_array(void)
+{
+    // Function pointer that returns pointer to array of 10 ints
+    int (*(*fp_ret_arr)(void))[10];
+    CHECK(fp_ret_arr == NULL, "func ptr returning ptr to array - zero-init");
+}
+
+void test_array_of_complex_func_ptrs(void)
+{
+    int *(*arr_fp[3])(int, int);
+    int all_null = 1;
+    for (int i = 0; i < 3; i++)
+        if (arr_fp[i] != NULL)
+            all_null = 0;
+    CHECK(all_null, "array of func ptrs returning ptr - zero-init");
+}
+
+void test_func_ptr_taking_func_ptr(void)
+{
+    int (*fp_takes_fp)(int (*)(void));
+    CHECK(fp_takes_fp == NULL, "func ptr taking func ptr arg - zero-init");
+}
+
+void test_ptr_to_array_of_func_ptrs(void)
+{
+    int (*(*p_arr_fp)[5])(void);
+    CHECK(p_arr_fp == NULL, "ptr to array of func ptrs - zero-init");
+}
+
+void test_multi_level_ptr_chain(void)
+{
+    int ****pppp;
+    CHECK(pppp == NULL, "quad pointer - zero-init");
+
+    void *****vpppp;
+    CHECK(vpppp == NULL, "void quintuple pointer - zero-init");
+}
+
+typedef struct
+{
+    int x;
+    int y;
+} Coord;
+
+void test_complex_func_ptr_with_struct(void)
+{
+    Coord *(*fp_struct)(Coord *, int, Coord);
+    CHECK(fp_struct == NULL, "func ptr with struct params - zero-init");
+}
+
+void test_paren_grouped_declarator(void)
+{
+    // This is just a pointer to int, but uses parens
+    int(*grouped_ptr);
+    CHECK(grouped_ptr == NULL, "parenthesized pointer decl - zero-init");
+
+    // Pointer to pointer with parens
+    int *(*grouped_pp);
+    CHECK(grouped_pp == NULL, "paren grouped ptr to ptr - zero-init");
+}
+
+void test_multi_dim_array_ptrs(void)
+{
+    int (*p2d)[3][4];
+    CHECK(p2d == NULL, "ptr to 2d array - zero-init");
+
+    int (*p3d)[2][3][4];
+    CHECK(p3d == NULL, "ptr to 3d array - zero-init");
+}
+
+void test_sizeof_array_bounds(void)
+{
+    int arr_sizeof[sizeof(int)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(int); i++)
+        if (arr_sizeof[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "array with sizeof bound - zero-init");
+}
+
+void test_decl_after_label(void)
+{
+    int x;
+    x = 1;
+my_label:
+{
+    int y;
+    CHECK_EQ(y, 0, "decl in block after label - zero-init");
+}
+    (void)x; // suppress unused warning
+}
+
+void test_decl_in_else(void)
+{
+    if (0)
+    {
+        int x;
+        (void)x;
+    }
+    else
+    {
+        int y;
+        CHECK_EQ(y, 0, "decl in else branch - zero-init");
+    }
+}
+
+void test_volatile_func_ptr(void)
+{
+    int (*volatile vfp)(void);
+    CHECK(vfp == NULL, "volatile func ptr - zero-init");
+
+    volatile int (*fvp)(void);
+    CHECK(fvp == NULL, "func ptr to volatile - zero-init");
+}
+
+void test_extremely_complex_declarator(void)
+{
+    // Pointer to function returning pointer to array of 5 pointers to functions
+    // returning int
+    int (*(*(*super_complex)(void))[5])(void);
+    CHECK(super_complex == NULL, "extremely complex declarator - zero-init");
+}
+
+void run_silent_failure_tests(void)
+{
+    printf("\n=== SILENT FAILURE DETECTION TESTS ===\n");
+    printf("(Testing complex declarators that might silently skip zero-init)\n\n");
+
+    test_complex_func_ptr_array();
+    test_array_of_complex_func_ptrs();
+    test_func_ptr_taking_func_ptr();
+    test_ptr_to_array_of_func_ptrs();
+    test_multi_level_ptr_chain();
+    test_complex_func_ptr_with_struct();
+    test_paren_grouped_declarator();
+    test_multi_dim_array_ptrs();
+    test_sizeof_array_bounds();
+    test_decl_after_label();
+    test_decl_in_else();
+    test_volatile_func_ptr();
+    test_extremely_complex_declarator();
+}
+
 // MAIN
 
 int main(void)
@@ -2056,6 +2551,8 @@ int main(void)
     run_switch_fallthrough_tests();
     run_complex_nesting_tests();
     run_case_label_tests();
+    run_rigor_tests();
+    run_silent_failure_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

@@ -1,6 +1,6 @@
 #define _DARWIN_C_SOURCE
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.48.0"
+#define VERSION "0.49.0"
 
 #include "parse.c"
 
@@ -1577,12 +1577,18 @@ static bool is_const_array_size(Token *open_bracket)
 // Try to handle a declaration with zero-init
 // Supports multi-declarators like: int a, b, *c, d[10];
 // Returns the token after the declaration if handled, NULL otherwise
+//
+// SAFETY: If we see a type but fail to parse the declarator, we emit a warning
+// to alert the user that zero-init may have been skipped.
+//
+// Debug: Compile with -DPRISM_DEBUG_ZEROINIT to trace parsing
 static Token *try_zero_init_decl(Token *tok)
 {
   if (!feature_zeroinit || defer_depth <= 0 || struct_depth > 0)
     return NULL;
 
   Token *start = tok;
+  Token *decl_start_for_warning = tok; // Remember for potential warning
 
   // Check for 'raw' keyword - skip zero-init for this declaration
   bool is_raw = false;
@@ -1591,6 +1597,7 @@ static Token *try_zero_init_decl(Token *tok)
     is_raw = true;
     tok = tok->next;
     start = tok; // Don't emit 'raw'
+    decl_start_for_warning = tok;
   }
 
   if (is_skip_decl_keyword(tok)) // Skip extern/typedef
@@ -1704,23 +1711,61 @@ static Token *try_zero_init_decl(Token *tok)
     return NULL;
 
   // Before emitting anything, verify there's at least one declarator
-  // Look for: pointers/qualifiers followed by identifier
+  // Look for: pointers/qualifiers followed by identifier (possibly inside nested parens)
   Token *check = tok;
   while (equal(check, "*") || is_type_qualifier(check))
     check = check->next;
 
-  // Handle parenthesized declarators: (*name)
-  if (equal(check, "("))
+  // Handle parenthesized declarators - may be arbitrarily nested: (*name), (*(*name)(args))[N], etc.
+  // We need to find an identifier somewhere inside the parentheses
+  int paren_depth = 0;
+  bool found_ident = false;
+  Token *scan = check;
+
+  if (equal(scan, "("))
   {
-    check = check->next;
-    if (!equal(check, "*"))
-      return NULL; // Not a pointer declarator pattern
-    while (equal(check, "*") || is_type_qualifier(check))
-      check = check->next;
+    // Scan through nested parens to find an identifier
+    paren_depth = 1;
+    scan = scan->next;
+
+    while (scan && scan->kind != TK_EOF && paren_depth > 0)
+    {
+      if (equal(scan, "("))
+        paren_depth++;
+      else if (equal(scan, ")"))
+        paren_depth--;
+      else if (scan->kind == TK_IDENT && !found_ident)
+      {
+        // Found potential identifier - verify it's not a type keyword
+        // (could be a typedef or cast)
+        if (!is_type_keyword(scan) && !is_known_typedef(scan))
+          found_ident = true;
+      }
+      scan = scan->next;
+    }
+
+    if (!found_ident)
+    {
+      // Saw type but couldn't find declarator identifier in parens
+      // This might be a cast or complex pattern we don't support
+      // Emit warning for safety
+      fprintf(stderr, "%s:%d: warning: zero-init: complex parenthesized pattern not parsed, "
+                      "variable may be uninitialized. Consider adding explicit initializer.\n",
+              decl_start_for_warning->file->name, decl_start_for_warning->line_no);
+      return NULL;
+    }
+    check = scan; // Continue checking after the paren group
+  }
+  else
+  {
+    // No parens - must have identifier directly
+    if (check->kind != TK_IDENT)
+      return NULL;
   }
 
   // Must have identifier - if not, this is just a type declaration (e.g., struct Foo {};)
-  if (check->kind != TK_IDENT)
+  // (This check is now partially redundant but kept for clarity)
+  if (!found_ident && check->kind != TK_IDENT)
     return NULL;
 
   // Before emitting anything, check if any declarator has a statement expression initializer
@@ -1766,39 +1811,63 @@ static Token *try_zero_init_decl(Token *tok)
     }
 
     // Handle parenthesized declarators: (*name), (*name)[N], (*name)(args)
+    // Also handles nested patterns like (*(*name)(args))[N]
     bool has_paren_declarator = false;
     bool array_inside_paren = false;
+    int nested_paren_count = 0; // Track nesting level for complex declarators
+
     if (equal(tok, "("))
     {
       Token *paren_start = tok;
       Token *peek = tok->next;
 
-      // Should be * for pointer declarator
-      if (!equal(peek, "*"))
+      // Should be * for pointer declarator (or another ( for nested)
+      if (!equal(peek, "*") && !equal(peek, "("))
+      {
+        // Saw type, started declarator, but pattern not recognized
+        fprintf(stderr, "%s:%d: warning: zero-init: parenthesized declarator pattern not recognized, "
+                        "variable may be uninitialized. Consider adding explicit initializer.\n",
+                decl_start_for_warning->file->name, decl_start_for_warning->line_no);
         return NULL; // Not a pointer declarator, bail
+      }
 
       emit_tok(tok); // emit '('
       tok = tok->next;
+      nested_paren_count = 1;
       is_pointer = true;
 
-      while (equal(tok, "*") || is_type_qualifier(tok))
+      // Handle arbitrary nesting: (*(*(*name)...
+      while (equal(tok, "*") || is_type_qualifier(tok) || equal(tok, "("))
       {
         if (equal(tok, "*"))
           is_pointer = true;
+        else if (equal(tok, "("))
+          nested_paren_count++;
         emit_tok(tok);
         tok = tok->next;
       }
 
       // Must be identifier now
       if (tok->kind != TK_IDENT)
+      {
+        fprintf(stderr, "%s:%d: warning: zero-init: expected identifier in declarator, "
+                        "variable may be uninitialized. Consider adding explicit initializer.\n",
+                decl_start_for_warning->file->name, decl_start_for_warning->line_no);
         return NULL;
+      }
 
       has_paren_declarator = true;
     }
 
     // Must have identifier
     if (tok->kind != TK_IDENT)
+    {
+      // We've emitted type but no identifier - shouldn't happen if validation worked
+      fprintf(stderr, "%s:%d: warning: zero-init: expected identifier after type, "
+                      "variable may be uninitialized. Consider adding explicit initializer.\n",
+              decl_start_for_warning->file->name, decl_start_for_warning->line_no);
       return NULL;
+    }
 
     Token *var_name = tok;
     emit_tok(tok);
@@ -1825,13 +1894,62 @@ static Token *try_zero_init_decl(Token *tok)
       }
     }
 
-    // Close paren for parenthesized declarator
-    if (has_paren_declarator)
+    // Close all nested parens for parenthesized declarator
+    // Each paren level may be followed by function args or array dims
+    while (has_paren_declarator && nested_paren_count > 0)
     {
+      // Handle function args at this level: (*name)(args) or array dims
+      while (equal(tok, "(") || equal(tok, "["))
+      {
+        if (equal(tok, "("))
+        {
+          // Function parameter list
+          emit_tok(tok);
+          tok = tok->next;
+          int depth = 1;
+          while (tok->kind != TK_EOF && depth > 0)
+          {
+            if (equal(tok, "("))
+              depth++;
+            else if (equal(tok, ")"))
+              depth--;
+            emit_tok(tok);
+            tok = tok->next;
+          }
+        }
+        else if (equal(tok, "["))
+        {
+          // Array dimension
+          array_inside_paren = true;
+          while (equal(tok, "["))
+          {
+            emit_tok(tok);
+            tok = tok->next;
+            while (!equal(tok, "]") && tok->kind != TK_EOF)
+            {
+              emit_tok(tok);
+              tok = tok->next;
+            }
+            if (equal(tok, "]"))
+            {
+              emit_tok(tok);
+              tok = tok->next;
+            }
+          }
+        }
+      }
+
+      // Now close this paren level
       if (!equal(tok, ")"))
+      {
+        fprintf(stderr, "%s:%d: warning: zero-init: expected ')' in declarator, "
+                        "variable may be uninitialized. Consider adding explicit initializer.\n",
+                decl_start_for_warning->file->name, decl_start_for_warning->line_no);
         return NULL;
+      }
       emit_tok(tok);
       tok = tok->next;
+      nested_paren_count--;
     }
 
     // Check what follows the identifier
