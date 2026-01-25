@@ -2599,6 +2599,24 @@ my_label:
     (void)x; // suppress unused warning
 }
 
+// Test: declaration directly after label (no braces) gets zero-init
+// This tests backward goto where variable is re-initialized each iteration
+void test_decl_directly_after_label(void)
+{
+    int counter = 0;
+    int sum = 0;
+
+restart:
+    int x;    // Zero-initialized each time we jump here
+    sum += x; // x should be 0 each time
+    counter++;
+    if (counter < 3)
+        goto restart;
+
+    // x was 0 on each iteration, so sum should be 0
+    CHECK_EQ(sum, 0, "decl directly after label - zero-init on backward goto");
+}
+
 void test_decl_in_else(void)
 {
     if (0)
@@ -2645,6 +2663,7 @@ void run_silent_failure_tests(void)
     test_multi_dim_array_ptrs();
     test_sizeof_array_bounds();
     test_decl_after_label();
+    test_decl_directly_after_label();
     test_decl_in_else();
     test_volatile_func_ptr();
     test_extremely_complex_declarator();

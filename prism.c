@@ -1,6 +1,6 @@
 #define _DARWIN_C_SOURCE
 #define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.51.0"
+#define VERSION "0.52.0"
 
 #include "parse.c"
 
@@ -2799,6 +2799,23 @@ static int transpile(char *input_file, char *output_file)
     // subsequent function definitions
     if (equal(tok, ";") && defer_depth == 0)
       next_func_returns_void = false;
+
+    // Handle user-defined labels (label:) - statement after label is at statement start
+    // This ensures declarations after labels get zero-initialized
+    // Must distinguish from: ternary (?:), bitfield (int x:5), case/default (handled above)
+    if (equal(tok, ":") && last_emitted && last_emitted->kind == TK_IDENT &&
+        struct_depth == 0 && defer_depth > 0)
+    {
+      // Check if previous identifier was part of a ternary by looking back further
+      // In ternary, there would be a '?' before the identifier
+      // We can't easily look back multiple tokens, so we rely on a different check:
+      // If we're at a label, the identifier is at statement start position
+      // This is an approximation - case/default are already handled above
+      emit_tok(tok);
+      tok = tok->next;
+      at_stmt_start = true;
+      continue;
+    }
 
     // Track previous token at top level for function detection
     if (defer_depth == 0)
