@@ -1,6 +1,6 @@
 // Comprehensive test suite for Prism C transpiler
 // Tests: defer, zero-init, typedef tracking, multi-declarator, edge cases
-// Run with: ./prism prism_tests.c
+// Run with: $ prism run .github/test.c
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -2927,6 +2927,130 @@ void run_silent_failure_tests(void)
     test_extremely_complex_declarator();
 }
 
+// SECTION: MANUAL OFFSETOF VLA REGRESSION TESTS
+// These tests verify handling of custom offsetof macros that expand to
+// pointer arithmetic. GCC treats such patterns as VLAs even though they
+// are technically compile-time constants.
+
+// Custom offsetof macro using pointer arithmetic (common in legacy code)
+// This is different from __builtin_offsetof which GCC treats as constant
+#undef offsetof
+#define offsetof(TYPE, MEMBER) ((size_t)((char *)&((TYPE *)0)->MEMBER - (char *)0))
+
+typedef struct TestSrcItem_off
+{
+    char *name;
+    int type;
+} TestSrcItem_off;
+
+typedef struct TestSrcList_off
+{
+    int count;
+    TestSrcItem_off items[1]; // Flexible array member pattern
+} TestSrcList_off;
+
+// This struct contains a union with an array sized by offsetof
+// GCC treats this as a VLA, so prism must NOT add = {0}
+struct TestOp_off
+{
+    union
+    {
+        int i;
+        void *p;
+        char *z;
+        struct
+        {
+            int n;
+            // Array size uses offsetof - GCC sees this as VLA at file scope
+            TestSrcItem_off items[offsetof(TestSrcList_off, items) / sizeof(TestSrcItem_off)];
+        } srclist;
+    } u;
+};
+
+void test_manual_offsetof_in_union(void)
+{
+    // This tests that prism doesn't add = {0} to struct TestOp_off
+    // If it did, GCC would error: "variable-sized object may not be initialized"
+    struct TestOp_off op;
+    op.u.i = 42;
+    CHECK(op.u.i == 42, "manual offsetof in union - no zeroinit");
+}
+
+void test_manual_offsetof_local(void)
+{
+    // Test offsetof with local variable
+    struct TestOp_off op; // Should NOT get = {0} due to offsetof VLA pattern
+    op.u.p = NULL;
+    CHECK(op.u.p == NULL, "manual offsetof local struct - no zeroinit");
+}
+
+void test_union_offsetof_division(void)
+{
+    // The pattern offsetof(T,m)/sizeof(E) should be treated as VLA
+    union
+    {
+        int x;
+        struct
+        {
+            TestSrcItem_off data[offsetof(TestSrcList_off, items) / sizeof(TestSrcItem_off)];
+        } embedded;
+    } u;
+    u.x = 123;
+    CHECK(u.x == 123, "union offsetof division - no zeroinit");
+}
+
+void test_vla_basic(void)
+{
+    int n = 5;
+    int vla[n]; // VLA - prism should NOT add = {0}
+    // Just verify it compiles and we can use it
+    for (int i = 0; i < n; i++)
+    {
+        vla[i] = i;
+    }
+    CHECK(vla[0] == 0 && vla[4] == 4, "basic VLA - no zeroinit");
+}
+
+void test_vla_expression_size(void)
+{
+    int a = 3, b = 2;
+    int vla[a + b]; // VLA with expression - should NOT get zeroinit
+    for (int i = 0; i < a + b; i++)
+    {
+        vla[i] = i * 2;
+    }
+    CHECK(vla[0] == 0 && vla[4] == 8, "VLA expression size - no zeroinit");
+}
+
+void test_struct_with_vla_member(void)
+{
+    int n = 3;
+    struct
+    {
+        int count;
+        int data[n]; // VLA member - whole struct shouldn't get zeroinit
+    } s;
+    s.count = n;
+    for (int i = 0; i < n; i++)
+    {
+        s.data[i] = i + 1;
+    }
+    CHECK(s.count == 3 && s.data[0] == 1 && s.data[2] == 3, "struct with VLA member - no zeroinit");
+}
+
+void run_manual_offsetof_vla_tests(void)
+{
+    printf("\n=== MANUAL OFFSETOF VLA REGRESSION TESTS ===\n");
+    printf("(Tests for pointer-arithmetic offsetof patterns)\n\n");
+
+    test_manual_offsetof_in_union();
+    test_manual_offsetof_local();
+    test_union_offsetof_division();
+    test_vla_basic();
+    test_vla_expression_size();
+    test_struct_with_vla_member();
+}
+
 // MAIN
 
 int main(void)
@@ -2949,6 +3073,7 @@ int main(void)
     run_rigor_tests();
     run_silent_failure_tests();
     run_sizeof_constexpr_tests();
+    run_manual_offsetof_vla_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

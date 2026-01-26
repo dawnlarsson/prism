@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.65.0"
+#define PRISM_VERSION "0.66.0"
 
 #include "parse.c"
 
@@ -1486,8 +1486,35 @@ static Token *scan_typedef_name(Token **tokp)
   return NULL;
 }
 
-// Forward declaration for is_const_array_size (used by typedef_contains_vla)
+// Forward declaration for is_const_array_size (used by struct_body_contains_vla and typedef_contains_vla)
 static bool is_const_array_size(Token *open_bracket);
+
+// Check if a struct/union body contains any VLA arrays
+// Scans from the opening { to the closing }
+static bool struct_body_contains_vla(Token *open_brace)
+{
+  if (!open_brace || !equal(open_brace, "{"))
+    return false;
+
+  Token *tok = open_brace->next;
+  int depth = 1;
+
+  while (tok && tok->kind != TK_EOF && depth > 0)
+  {
+    if (equal(tok, "{"))
+      depth++;
+    else if (equal(tok, "}"))
+      depth--;
+    else if (equal(tok, "[") && depth > 0)
+    {
+      // Found an array dimension at any level within the struct/union
+      if (!is_const_array_size(tok))
+        return true;
+    }
+    tok = tok->next;
+  }
+  return false;
+}
 
 // Parse a typedef declaration and add names to the typedef table
 // Check if a typedef declaration contains a VLA (scan from current position to semicolon)
@@ -1621,6 +1648,43 @@ static bool looks_like_system_typedef(Token *tok)
   return false;
 }
 
+// Check if the array size contains manual offsetof pointer arithmetic pattern:
+// ((size_t)((char*)&((TYPE*)0)->MEMBER - (char*)0))
+// GCC treats this as a VLA even though it's technically a compile-time constant.
+static bool has_manual_offsetof_pattern(Token *start, Token *end)
+{
+  // Look for the pattern: (char*) followed eventually by -> and then - (char*)
+  // This matches the manual offsetof expansion that GCC doesn't treat as constant
+  for (Token *tok = start; tok && tok != end && tok->kind != TK_EOF; tok = tok->next)
+  {
+    // Look for (char*) pattern
+    if (equal(tok, "(") && tok->next && equal(tok->next, "char"))
+    {
+      Token *t = tok->next->next;
+      if (t && equal(t, "*") && t->next && equal(t->next, ")"))
+      {
+        // Found (char*), now look for -> followed by - (char*)
+        for (Token *t2 = t->next; t2 && t2 != end && t2->kind != TK_EOF; t2 = t2->next)
+        {
+          if (equal(t2, "->") || equal(t2, "."))
+          {
+            // Found member access, look for - (char*) pattern after it
+            for (Token *t3 = t2->next; t3 && t3 != end && t3->kind != TK_EOF; t3 = t3->next)
+            {
+              if (equal(t3, "-") && t3->next && equal(t3->next, "(") &&
+                  t3->next->next && equal(t3->next->next, "char"))
+              {
+                return true; // Found manual offsetof pattern
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
 // Check if array size is a compile-time constant (not a VLA)
 static bool is_const_array_size(Token *open_bracket)
 {
@@ -1628,6 +1692,32 @@ static bool is_const_array_size(Token *open_bracket)
   int depth = 1;
   bool has_only_literals = true;
   bool is_empty = true;
+  bool prev_was_member_access = false; // True if previous token was -> or .
+
+  // Find the closing bracket first
+  Token *close_bracket = NULL;
+  {
+    Token *t = open_bracket->next;
+    int d = 1;
+    while (t && t->kind != TK_EOF && d > 0)
+    {
+      if (equal(t, "["))
+        d++;
+      else if (equal(t, "]"))
+      {
+        d--;
+        if (d == 0)
+          close_bracket = t;
+      }
+      t = t->next;
+    }
+  }
+
+  // Check for manual offsetof pattern that GCC treats as VLA
+  if (close_bracket && has_manual_offsetof_pattern(open_bracket->next, close_bracket))
+  {
+    return false; // Treat as VLA for safety
+  }
 
   while (tok->kind != TK_EOF && depth > 0)
   {
@@ -1640,8 +1730,9 @@ static bool is_const_array_size(Token *open_bracket)
       is_empty = false;
       // sizeof and _Alignof/alignof always produce compile-time constants,
       // regardless of their argument (type name or expression).
+      // offsetof(type, member) also produces a compile-time constant.
       // Skip their parenthesized argument entirely.
-      if (equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof"))
+      if (equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof") || equal(tok, "offsetof"))
       {
         tok = tok->next;
         if (tok && equal(tok, "("))
@@ -1657,8 +1748,18 @@ static bool is_const_array_size(Token *open_bracket)
             tok = tok->next;
           }
         }
+        prev_was_member_access = false;
         continue;
       }
+
+      // Track -> and . operators for member access patterns (used in offsetof expansion)
+      if (equal(tok, "->") || equal(tok, "."))
+      {
+        prev_was_member_access = true;
+        tok = tok->next;
+        continue;
+      }
+
       // Allow numeric literals and basic operators
       if (tok->kind != TK_NUM &&
           !equal(tok, "+") && !equal(tok, "-") && !equal(tok, "*") &&
@@ -1675,13 +1776,15 @@ static bool is_const_array_size(Token *open_bracket)
         // - Known typedefs (used in casts like (MyType)0)
         // - Type keywords (used in casts like (int)0)
         // - System typedefs (names ending in _t, like rlim_t, size_t)
-        if (tok->kind == TK_IDENT && !is_known_enum_const(tok) &&
-            !is_known_typedef(tok) && !is_type_keyword(tok) &&
-            !looks_like_system_typedef(tok))
+        // - Member names following -> or . (compile-time in offsetof patterns)
+        if (tok->kind == TK_IDENT && !prev_was_member_access &&
+            !is_known_enum_const(tok) && !is_known_typedef(tok) &&
+            !is_type_keyword(tok) && !looks_like_system_typedef(tok))
         {
           has_only_literals = false;
         }
       }
+      prev_was_member_access = false;
     }
     tok = tok->next;
   }
@@ -1749,9 +1852,15 @@ static Token *try_zero_init_decl(Token *tok)
       tok = tok->next;
       if (tok->kind == TK_IDENT)
         tok = tok->next;
-      // Could have { body } - skip it
+      // Could have { body } - check for VLA members before skipping
       if (equal(tok, "{"))
+      {
+        if (struct_body_contains_vla(tok))
+        {
+          is_typedef_vla = true; // Treat struct/union with VLA member like VLA typedef
+        }
         tok = skip_balanced(tok, "{", "}");
+      }
       saw_type = true;
       type_end = tok;
       continue;
@@ -3211,6 +3320,9 @@ static int run_command(char **argv)
   }
   if (pid == 0)
   {
+    // Unset CC/PRISM_CC to prevent infinite recursion when prism is used as CC
+    unsetenv("CC");
+    unsetenv("PRISM_CC");
     execvp(argv[0], argv);
     perror("execvp");
     _exit(127);
@@ -3578,6 +3690,7 @@ typedef enum
 {
   CLI_MODE_COMPILE_AND_LINK, // default: prism foo.c → a.out (GCC-compatible)
   CLI_MODE_COMPILE_ONLY,     // -c: prism -c foo.c -o foo.o
+  CLI_MODE_PASSTHROUGH,      // -E/-S: pass sources directly to CC without transpiling
   CLI_MODE_RUN,              // run: prism run foo.c (transpile + compile + execute)
   CLI_MODE_EMIT,             // transpile: prism transpile foo.c (output C)
   CLI_MODE_INSTALL,          // prism install
@@ -3920,6 +4033,15 @@ static Cli cli_parse(int argc, char **argv)
       continue;
     }
 
+    // ─── GCC-compatible: preprocess only or compile to assembly ───
+    // These modes pass sources directly to CC without transpiling
+    if (!strcmp(arg, "-E") || !strcmp(arg, "-S"))
+    {
+      cli.mode = CLI_MODE_PASSTHROUGH;
+      cli_add_cc_arg(&cli, arg);
+      continue;
+    }
+
     if (!strcmp(arg, "-I"))
     {
       if (i + 1 < argc)
@@ -4071,7 +4193,10 @@ static char *create_temp_file(const char *source, char *buf, size_t bufsize)
   {
     int fd = mkstemps(buf, 2);
     if (fd < 0)
+    {
+      fprintf(stderr, "prism: mkstemps failed for '%s': %s\n", buf, strerror(errno));
       return NULL;
+    }
     close(fd);
   }
 #else
@@ -4276,6 +4401,48 @@ int main(int argc, char **argv)
     }
     cli_free(&cli);
     return 0;
+  }
+
+  case CLI_MODE_PASSTHROUGH:
+  {
+    // Pass sources directly to compiler without transpiling (-E, -S modes)
+    const char *compiler = cli.cc;
+    char *cross_cc = get_compiler_for_cross(cli.cross_arch, cli.cross_bits, cli.cross_platform);
+    if (cross_cc)
+      compiler = cross_cc;
+
+    ArgvBuilder ab;
+    argv_builder_init(&ab);
+    argv_builder_add(&ab, compiler);
+
+    // Add all CC args (includes -E or -S flag)
+    for (int i = 0; i < cli.cc_arg_count; i++)
+      argv_builder_add(&ab, cli.cc_args[i]);
+
+    // Add source files directly (no transpiling)
+    for (int i = 0; i < cli.source_count; i++)
+      argv_builder_add(&ab, cli.sources[i]);
+
+    if (cli.output)
+    {
+      argv_builder_add(&ab, "-o");
+      argv_builder_add(&ab, cli.output);
+    }
+
+    char **pass_argv = argv_builder_finish(&ab);
+
+    if (cli.verbose)
+    {
+      fprintf(stderr, "[prism] Passthrough: ");
+      for (int i = 0; pass_argv[i]; i++)
+        fprintf(stderr, "%s ", pass_argv[i]);
+      fprintf(stderr, "\n");
+    }
+
+    int status = run_command(pass_argv);
+    free_argv(pass_argv);
+    cli_free(&cli);
+    return status;
   }
 
   case CLI_MODE_COMPILE_ONLY:
