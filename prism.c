@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.58.0"
+#define PRISM_VERSION "0.59.0"
 
 #include "parse.c"
 
@@ -3534,6 +3534,9 @@ typedef struct
   char *cross_arch;
   int cross_bits;
   char *cross_platform;
+
+  // Link-only mode detection
+  bool has_objects; // true if .o, .a, or .so files were provided
 } Cli;
 
 static void cli_add_source(Cli *cli, const char *src)
@@ -3919,7 +3922,15 @@ static Cli cli_parse(int argc, char **argv)
     // ─── Object files and libraries (pass through) ───
     if (arg[0] != '-')
     {
-      // Could be .o file, .a file, etc. - pass to linker
+      // Could be .o file, .a file, .so file, etc. - pass to linker
+      size_t len = strlen(arg);
+      if ((len >= 2 && !strcmp(arg + len - 2, ".o")) ||
+          (len >= 2 && !strcmp(arg + len - 2, ".a")) ||
+          (len >= 3 && !strcmp(arg + len - 3, ".so")) ||
+          (len > 3 && strstr(arg, ".so.") != NULL))
+      {
+        cli.has_objects = true;
+      }
       cli_add_cc_arg(&cli, arg);
       continue;
     }
@@ -4186,6 +4197,43 @@ int main(int argc, char **argv)
   case CLI_MODE_COMPILE_AND_LINK:
   case CLI_MODE_RUN:
     break; // Continue below
+  }
+
+  // Link-only mode: if no sources but has object files, pass through to compiler
+  if (cli.source_count == 0 && cli.has_objects && cli.mode != CLI_MODE_RUN)
+  {
+    const char *compiler = cli.cc;
+    char *cross_cc = get_compiler_for_cross(cli.cross_arch, cli.cross_bits, cli.cross_platform);
+    if (cross_cc)
+      compiler = cross_cc;
+
+    ArgvBuilder ab;
+    argv_builder_init(&ab);
+    argv_builder_add(&ab, compiler);
+
+    for (int i = 0; i < cli.cc_arg_count; i++)
+      argv_builder_add(&ab, cli.cc_args[i]);
+
+    if (cli.output)
+    {
+      argv_builder_add(&ab, "-o");
+      argv_builder_add(&ab, cli.output);
+    }
+
+    char **link_argv = argv_builder_finish(&ab);
+
+    if (cli.verbose)
+    {
+      fprintf(stderr, "[prism] Link-only: ");
+      for (int i = 0; link_argv[i]; i++)
+        fprintf(stderr, "%s ", link_argv[i]);
+      fprintf(stderr, "\n");
+    }
+
+    int status = run_command(link_argv);
+    free_argv(link_argv);
+    cli_free(&cli);
+    return status;
   }
 
   // Need at least one source
