@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.55.0"
+#define PRISM_VERSION "0.56.0"
 
 #include "parse.c"
 
@@ -87,6 +87,12 @@ static void prism_free(PrismResult *r);
 // Internal feature flags (set from PrismFeatures before transpile)
 static bool feature_defer = true;
 static bool feature_zeroinit = true;
+
+// Extra preprocessor configuration (set by CLI before transpile)
+static const char **extra_include_paths = NULL;
+static int extra_include_count = 0;
+static const char **extra_defines = NULL;
+static int extra_define_count = 0;
 
 static int struct_depth = 0;
 
@@ -368,6 +374,13 @@ static bool needs_space(Token *prev, Token *tok)
   }
 
   return false;
+}
+
+// Check if token is a member access operator (. or ->)
+// Used to distinguish keyword usage from struct member names
+static bool is_member_access(Token *tok)
+{
+  return tok && tok->kind == TK_PUNCT && (equal(tok, ".") || equal(tok, "->"));
 }
 
 // Emit a single token with appropriate spacing
@@ -1007,7 +1020,8 @@ static Token *goto_skips_defer(Token *goto_tok, char *label_name, int label_len)
     }
 
     // Track defers we pass over
-    if (tok->kind == TK_KEYWORD && equal(tok, "defer"))
+    // Skip if preceded by member access (. or ->) - that's a struct field, not keyword
+    if (tok->kind == TK_KEYWORD && equal(tok, "defer") && !is_member_access(prev))
     {
       // Remember this defer (prefer shallowest depth if multiple)
       if (!active_defer || depth <= active_defer_depth)
@@ -2197,6 +2211,32 @@ static int transpile(char *input_file, char *output_file)
   pp_init();
   pp_add_default_include_paths();
 
+  // Add extra include paths from CLI (-I flags)
+  for (int i = 0; i < extra_include_count; i++)
+    pp_add_include_path(extra_include_paths[i]);
+
+  // Add extra defines from CLI (-D flags)
+  for (int i = 0; i < extra_define_count; i++)
+  {
+    const char *def = extra_defines[i];
+    char *eq = strchr(def, '=');
+    if (eq)
+    {
+      // -DNAME=VALUE
+      size_t name_len = eq - def;
+      char *name = malloc(name_len + 1);
+      memcpy(name, def, name_len);
+      name[name_len] = '\0';
+      // Note: pp_define_macro keeps pointer to name, so don't free it
+      pp_define_macro(name, (char *)(eq + 1));
+    }
+    else
+    {
+      // -DNAME (define as 1)
+      pp_define_macro((char *)def, "1");
+    }
+  }
+
   pp_define_macro("__PRISM__", "1");
   if (feature_defer)
     pp_define_macro("__PRISM_DEFER__", "1");
@@ -2280,7 +2320,10 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Handle 'defer' keyword
-    if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "defer"))
+    // Skip if: preceded by member access (. or ->) - that's a struct field, not keyword
+    //          inside struct/union/enum body - that's a field declaration, not keyword
+    if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "defer") &&
+        !is_member_access(last_emitted) && struct_depth == 0)
     {
       // Check for defer inside for/while/switch/if parentheses - this is invalid
       if (pending_control_flow && control_paren_depth > 0)
@@ -3177,6 +3220,41 @@ static void die(char *message)
 static int install(char *self_path)
 {
   printf("[prism] Installing to %s...\n", INSTALL_PATH);
+
+  // Resolve self_path to actual executable path only if the given path doesn't exist
+  // This allows installing from a temp binary (e.g., after compiling from sources)
+  char resolved_path[PATH_MAX];
+  bool use_resolved = false;
+
+  // First check if the given path exists as a file
+  struct stat st;
+  if (stat(self_path, &st) != 0)
+  {
+    // Path doesn't exist, try to resolve via /proc/self/exe or equivalent
+#if defined(__linux__)
+    ssize_t len = readlink("/proc/self/exe", resolved_path, sizeof(resolved_path) - 1);
+    if (len > 0)
+    {
+      resolved_path[len] = '\0';
+      use_resolved = true;
+    }
+#elif defined(__APPLE__)
+    uint32_t size = sizeof(resolved_path);
+    if (_NSGetExecutablePath(resolved_path, &size) == 0)
+      use_resolved = true;
+#endif
+  }
+
+  if (use_resolved)
+    self_path = resolved_path;
+
+  // Check if we're trying to install over ourselves
+  if (strcmp(self_path, INSTALL_PATH) == 0)
+  {
+    printf("[prism] Already installed at %s\n", INSTALL_PATH);
+    return 0;
+  }
+
   remove(INSTALL_PATH);
 
   FILE *input = fopen(self_path, "rb");
@@ -3391,6 +3469,14 @@ typedef struct
   int cc_arg_count;
   int cc_arg_capacity;
 
+  // Preprocessor flags (need to feed to prism's preprocessor AND pass to CC)
+  const char **include_paths; // -I paths
+  int include_count;
+  int include_capacity;
+  const char **defines; // -D macros (name or name=value)
+  int define_count;
+  int define_capacity;
+
   // Prism-specific
   const char *cc; // --prism-cc (default: $PRISM_CC or $CC or "cc")
   bool verbose;   // --prism-verbose
@@ -3413,6 +3499,34 @@ static void cli_add_source(Cli *cli, const char *src)
     cli->source_capacity = new_cap;
   }
   cli->sources[cli->source_count++] = src;
+}
+
+static void cli_add_include(Cli *cli, const char *path)
+{
+  if (cli->include_count >= cli->include_capacity)
+  {
+    int new_cap = cli->include_capacity == 0 ? 16 : cli->include_capacity * 2;
+    const char **new_paths = realloc(cli->include_paths, sizeof(char *) * new_cap);
+    if (!new_paths)
+      die("Out of memory");
+    cli->include_paths = new_paths;
+    cli->include_capacity = new_cap;
+  }
+  cli->include_paths[cli->include_count++] = path;
+}
+
+static void cli_add_define(Cli *cli, const char *def)
+{
+  if (cli->define_count >= cli->define_capacity)
+  {
+    int new_cap = cli->define_capacity == 0 ? 16 : cli->define_capacity * 2;
+    const char **new_defs = realloc(cli->defines, sizeof(char *) * new_cap);
+    if (!new_defs)
+      die("Out of memory");
+    cli->defines = new_defs;
+    cli->define_capacity = new_cap;
+  }
+  cli->defines[cli->define_count++] = def;
 }
 
 static void cli_add_cc_arg(Cli *cli, const char *arg)
@@ -3451,12 +3565,12 @@ static bool str_startswith(const char *s, const char *prefix)
   return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
-// Check if flag needs a separate argument (e.g., -I, -D, -L, -include)
+// Check if flag needs a separate argument (e.g., -L, -x)
+// Note: -I, -D, -U, -include, -isystem are handled explicitly above
 static bool flag_needs_arg(const char *arg)
 {
-  // These flags can be space-separated: -I dir, -D macro, -L dir, etc.
-  const char *flags[] = {"-I", "-D", "-U", "-L", "-l", "-include", "-isystem",
-                         "-idirafter", "-iprefix", "-iwithprefix", "-x", NULL};
+  // These flags can be space-separated: -L dir, -l lib, etc.
+  const char *flags[] = {"-L", "-l", "-idirafter", "-iprefix", "-iwithprefix", "-x", NULL};
   for (int i = 0; flags[i]; i++)
   {
     if (!strcmp(arg, flags[i]))
@@ -3468,7 +3582,7 @@ static bool flag_needs_arg(const char *arg)
 static void print_help(void)
 {
   printf(
-      "Prism v%s - C transpiler\n\n"
+      "Prism v%s - Robust C transpiler\n\n"
       "Usage: prism [options] source.c... [-o output]\n\n"
       "GCC-Compatible Options:\n"
       "  -c                    Compile only, don't link\n"
@@ -3669,6 +3783,83 @@ static Cli cli_parse(int argc, char **argv)
       continue;
     }
 
+    if (!strcmp(arg, "-I"))
+    {
+      if (i + 1 < argc)
+      {
+        const char *path = argv[++i];
+        cli_add_include(&cli, path);
+        cli_add_cc_arg(&cli, "-I");
+        cli_add_cc_arg(&cli, path);
+      }
+      continue;
+    }
+    if (str_startswith(arg, "-I"))
+    {
+      const char *path = arg + 2;
+      cli_add_include(&cli, path);
+      cli_add_cc_arg(&cli, arg);
+      continue;
+    }
+
+    // -D (define)
+    if (!strcmp(arg, "-D"))
+    {
+      if (i + 1 < argc)
+      {
+        const char *def = argv[++i];
+        cli_add_define(&cli, def);
+        cli_add_cc_arg(&cli, "-D");
+        cli_add_cc_arg(&cli, def);
+      }
+      continue;
+    }
+    if (str_startswith(arg, "-D"))
+    {
+      const char *def = arg + 2;
+      cli_add_define(&cli, def);
+      cli_add_cc_arg(&cli, arg);
+      continue;
+    }
+
+    // -U (undefine) - pass to CC, prism doesn't have pp_undef yet
+    if (!strcmp(arg, "-U") || str_startswith(arg, "-U"))
+    {
+      cli_add_cc_arg(&cli, arg);
+      if (!strcmp(arg, "-U") && i + 1 < argc)
+        cli_add_cc_arg(&cli, argv[++i]);
+      continue;
+    }
+
+    // -include (force include) - pass to CC
+    if (!strcmp(arg, "-include"))
+    {
+      cli_add_cc_arg(&cli, arg);
+      if (i + 1 < argc)
+        cli_add_cc_arg(&cli, argv[++i]);
+      continue;
+    }
+
+    // -isystem (system include path) - treat like -I for prism
+    if (!strcmp(arg, "-isystem"))
+    {
+      if (i + 1 < argc)
+      {
+        const char *path = argv[++i];
+        cli_add_include(&cli, path);
+        cli_add_cc_arg(&cli, "-isystem");
+        cli_add_cc_arg(&cli, path);
+      }
+      continue;
+    }
+    if (str_startswith(arg, "-isystem"))
+    {
+      const char *path = arg + 8;
+      cli_add_include(&cli, path);
+      cli_add_cc_arg(&cli, arg);
+      continue;
+    }
+
     // ─── Source files ───
     if (arg[0] != '-' && is_source_file(arg))
     {
@@ -3687,7 +3878,7 @@ static Cli cli_parse(int argc, char **argv)
     // ─── Everything else: pass through to CC ───
     cli_add_cc_arg(&cli, arg);
 
-    // Handle space-separated args like -I dir
+    // Handle space-separated args like -L dir
     if (flag_needs_arg(arg) && i + 1 < argc && argv[i + 1][0] != '-')
     {
       cli_add_cc_arg(&cli, argv[++i]);
@@ -3701,6 +3892,8 @@ static void cli_free(Cli *cli)
 {
   free(cli->sources);
   free(cli->cc_args);
+  free(cli->include_paths);
+  free(cli->defines);
 }
 
 static char *create_temp_file(const char *source, char *buf, size_t bufsize)
@@ -3769,6 +3962,12 @@ int main(int argc, char **argv)
   // Set feature flags from CLI
   feature_defer = cli.features.defer;
   feature_zeroinit = cli.features.zeroinit;
+
+  // Set preprocessor configuration from CLI
+  extra_include_paths = cli.include_paths;
+  extra_include_count = cli.include_count;
+  extra_defines = cli.defines;
+  extra_define_count = cli.define_count;
   emit_line_directives = cli.features.line_directives;
 
   // Handle special modes
@@ -3785,6 +3984,107 @@ int main(int argc, char **argv)
     return 0;
 
   case CLI_MODE_INSTALL:
+    // If source files provided, compile them first to produce the binary to install
+    if (cli.source_count > 0)
+    {
+      // Compile sources to a temp binary, then install that
+      char temp_bin[PATH_MAX];
+      snprintf(temp_bin, sizeof(temp_bin), "%sprism_install_%d", TMP_DIR, getpid());
+
+      // Build compile command
+      const char *cc = cli.cc ? cli.cc : getenv("PRISM_CC");
+      if (!cc)
+        cc = getenv("CC");
+      if (!cc)
+        cc = "cc";
+
+      // Transpile and compile each source
+      char **temp_files = malloc(cli.source_count * sizeof(char *));
+      if (!temp_files)
+        die("Memory allocation failed");
+
+      for (int i = 0; i < cli.source_count; i++)
+      {
+        temp_files[i] = malloc(PATH_MAX);
+        if (!temp_files[i])
+          die("Memory allocation failed");
+        snprintf(temp_files[i], PATH_MAX, "%sprism_install_%d_%d.c", TMP_DIR, getpid(), i);
+
+        PrismResult result = prism_transpile_file(cli.sources[i], cli.features);
+        if (result.status != PRISM_OK)
+        {
+          fprintf(stderr, "%s:%d:%d: error: %s\n",
+                  cli.sources[i], result.error_line, result.error_col,
+                  result.error_msg ? result.error_msg : "transpilation failed");
+          for (int j = 0; j <= i; j++)
+          {
+            remove(temp_files[j]);
+            free(temp_files[j]);
+          }
+          free(temp_files);
+          cli_free(&cli);
+          return 1;
+        }
+
+        FILE *f = fopen(temp_files[i], "w");
+        if (!f)
+        {
+          prism_free(&result);
+          die("Failed to create temp file");
+        }
+        fwrite(result.output, 1, result.output_len, f);
+        fclose(f);
+        prism_free(&result);
+      }
+
+      // Build argv for compiler: cc -O2 temp1.c temp2.c ... -o temp_bin
+      int argc_max = 4 + cli.source_count + cli.cc_arg_count;
+      char **argv_cc = malloc((argc_max + 1) * sizeof(char *));
+      if (!argv_cc)
+        die("Memory allocation failed");
+
+      int argc_cc = 0;
+      argv_cc[argc_cc++] = (char *)cc;
+      argv_cc[argc_cc++] = "-O2";
+      for (int i = 0; i < cli.source_count; i++)
+        argv_cc[argc_cc++] = temp_files[i];
+      for (int i = 0; i < cli.cc_arg_count; i++)
+        argv_cc[argc_cc++] = (char *)cli.cc_args[i];
+      argv_cc[argc_cc++] = "-o";
+      argv_cc[argc_cc++] = temp_bin;
+      argv_cc[argc_cc] = NULL;
+
+      if (cli.verbose)
+      {
+        fprintf(stderr, "[prism] Compiling:");
+        for (int i = 0; i < argc_cc; i++)
+          fprintf(stderr, " %s", argv_cc[i]);
+        fprintf(stderr, "\n");
+      }
+
+      int status = run_command(argv_cc);
+      free(argv_cc);
+
+      // Clean up temp source files
+      for (int i = 0; i < cli.source_count; i++)
+      {
+        remove(temp_files[i]);
+        free(temp_files[i]);
+      }
+      free(temp_files);
+
+      if (status != 0)
+      {
+        cli_free(&cli);
+        return 1;
+      }
+
+      // Install the compiled binary
+      int result = install(temp_bin);
+      remove(temp_bin);
+      cli_free(&cli);
+      return result;
+    }
     cli_free(&cli);
     return install(argv[0]);
 
@@ -3929,6 +4229,22 @@ int main(int argc, char **argv)
   {
     argv_builder_add(&ab, "-o");
     argv_builder_add(&ab, cli.output);
+  }
+  else if (cli.mode == CLI_MODE_COMPILE_ONLY && cli.source_count == 1)
+  {
+    // GCC-compatible: -c foo.c produces foo.o
+    static char default_obj[512];
+    const char *src = cli.sources[0];
+    const char *base = strrchr(src, '/');
+    base = base ? base + 1 : src;
+    snprintf(default_obj, sizeof(default_obj), "%s", base);
+    char *dot = strrchr(default_obj, '.');
+    if (dot)
+      strcpy(dot, ".o");
+    else
+      strcat(default_obj, ".o");
+    argv_builder_add(&ab, "-o");
+    argv_builder_add(&ab, default_obj);
   }
   // GCC-compatible: no -o means output to a.out (handled by CC)
 

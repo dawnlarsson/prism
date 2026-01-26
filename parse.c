@@ -1134,8 +1134,8 @@ static Token *read_char_literal(char *start, char *quote, Type *ty)
         if (count < ty->size)
             val = (val << 8) | (c & 0xFF);
         count++;
-        if (count > ty->size)
-            error_at(p, "character constant too long");
+        // Multi-character constants are implementation-defined but allowed
+        // Continue parsing but truncate value to ty->size bytes
     }
 
     if (count == 0)
