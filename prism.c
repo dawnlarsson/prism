@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.57.0"
+#define PRISM_VERSION "0.58.0"
 
 #include "parse.c"
 

@@ -69,6 +69,7 @@
 // Include paths for preprocessor
 static char **pp_include_paths = NULL;
 static int pp_include_paths_count = 0;
+static int pp_user_paths_start = 0; // Index where user-specified paths begin
 static int pp_eval_depth = 0;
 
 typedef struct Type Type;
@@ -417,6 +418,9 @@ static void pp_add_default_include_paths(void)
 
     pp_add_include_path("/usr/include");
 #endif
+
+    // Mark where system paths end; user paths will be added after this
+    pp_user_paths_start = pp_include_paths_count;
 }
 
 static void strarray_push(StringArray *arr, char *s)
@@ -2000,6 +2004,20 @@ static char *search_include_paths(char *filename)
     return NULL;
 }
 
+// Search only user-specified include paths (from -I flags)
+static char *search_user_include_paths(char *filename)
+{
+    for (int i = pp_user_paths_start; i < pp_include_paths_count; i++)
+    {
+        char *path = format("%s/%s", pp_include_paths[i], filename);
+        struct stat st;
+        if (stat(path, &st) == 0)
+            return path;
+        free(path);
+    }
+    return NULL;
+}
+
 static char *read_include_filename(Token **rest, Token *tok, bool *is_dquote)
 {
     if (tok->kind == TK_STR)
@@ -2610,11 +2628,20 @@ static Token *preprocess2(Token *tok)
             bool is_dquote;
             char *filename = read_include_filename(&tok, tok->next, &is_dquote);
 
-            // For system headers, preserve the #include directive as-is
-            // Only inline local includes
+            // For angle-bracket includes, check if file exists in user-specified paths first
+            // If found there, inline it; otherwise pass through to the backend compiler
             if (!is_dquote)
             {
-                // Create tokens for: #include <filename>\n
+                char *user_path = search_user_include_paths(filename);
+                if (user_path)
+                {
+                    // Found in user include paths - inline it
+                    tok = skip_line(tok);
+                    tok = include_file(start, user_path, tok);
+                    continue;
+                }
+
+                // Not in user paths - preserve #include directive as-is for backend compiler
                 Token *hash = copy_token(start);
                 hash->kind = TK_PUNCT;
                 hash->loc = "#";
