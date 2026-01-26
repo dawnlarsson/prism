@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.66.0"
+#define PRISM_VERSION "0.67.0"
 
 #include "parse.c"
 
@@ -89,6 +89,8 @@ static const char **extra_include_paths = NULL;
 static int extra_include_count = 0;
 static const char **extra_defines = NULL;
 static int extra_define_count = 0;
+static const char **extra_force_includes = NULL;
+static int extra_force_include_count = 0;
 
 static int struct_depth = 0;
 
@@ -2468,6 +2470,20 @@ static int transpile(char *input_file, char *output_file)
   if (feature_zeroinit)
     pp_define_macro("__PRISM_ZEROINIT__", "1");
 
+  // Process forced includes (-include files) first
+  // These define macros that the main file may depend on (e.g., config.h with HAVE_*)
+  for (int i = 0; i < extra_force_include_count; i++)
+  {
+    Token *inc_tok = tokenize_file((char *)extra_force_includes[i]);
+    if (!inc_tok)
+    {
+      fprintf(stderr, "Failed to open forced include: %s\n", extra_force_includes[i]);
+      return 0;
+    }
+    // Preprocess the forced include to extract macros (result is discarded)
+    preprocess(inc_tok);
+  }
+
   Token *tok = tokenize_file(input_file);
   if (!tok)
   {
@@ -2489,7 +2505,10 @@ static int transpile(char *input_file, char *output_file)
     int ftm_count = pp_get_feature_test_macros(&ftm_names, &ftm_values);
     for (int i = 0; i < ftm_count; i++)
     {
+      // Wrap in #ifndef to avoid redefinition if already defined (e.g., by -include config.h)
+      fprintf(out, "#ifndef %s\n", ftm_names[i]);
       fprintf(out, "#define %s %s\n", ftm_names[i], ftm_values[i]);
+      fprintf(out, "#endif\n");
     }
     // Always include errno.h for error constants like EINVAL, ENOENT, etc.
     // Many C programs use these constants without explicitly including errno.h,
@@ -3723,6 +3742,9 @@ typedef struct
   const char **defines; // -D macros (name or name=value)
   int define_count;
   int define_capacity;
+  const char **force_includes; // -include files
+  int force_include_count;
+  int force_include_capacity;
 
   // Prism-specific
   const char *cc; // --prism-cc (default: $PRISM_CC or $CC or "cc")
@@ -3777,6 +3799,20 @@ static void cli_add_define(Cli *cli, const char *def)
     cli->define_capacity = new_cap;
   }
   cli->defines[cli->define_count++] = def;
+}
+
+static void cli_add_force_include(Cli *cli, const char *path)
+{
+  if (cli->force_include_count >= cli->force_include_capacity)
+  {
+    int new_cap = cli->force_include_capacity == 0 ? 16 : cli->force_include_capacity * 2;
+    const char **new_paths = realloc(cli->force_includes, sizeof(char *) * new_cap);
+    if (!new_paths)
+      die("Out of memory");
+    cli->force_includes = new_paths;
+    cli->force_include_capacity = new_cap;
+  }
+  cli->force_includes[cli->force_include_count++] = path;
 }
 
 static void cli_add_cc_arg(Cli *cli, const char *arg)
@@ -4090,12 +4126,16 @@ static Cli cli_parse(int argc, char **argv)
       continue;
     }
 
-    // -include (force include) - pass to CC
+    // -include (force include) - process in prism AND pass to CC
     if (!strcmp(arg, "-include"))
     {
       cli_add_cc_arg(&cli, arg);
       if (i + 1 < argc)
-        cli_add_cc_arg(&cli, argv[++i]);
+      {
+        const char *path = argv[++i];
+        cli_add_cc_arg(&cli, path);
+        cli_add_force_include(&cli, path);
+      }
       continue;
     }
 
@@ -4161,6 +4201,7 @@ static void cli_free(Cli *cli)
   free(cli->cc_args);
   free(cli->include_paths);
   free(cli->defines);
+  free(cli->force_includes);
 }
 
 static char *create_temp_file(const char *source, char *buf, size_t bufsize)
@@ -4238,6 +4279,8 @@ int main(int argc, char **argv)
   extra_include_count = cli.include_count;
   extra_defines = cli.defines;
   extra_define_count = cli.define_count;
+  extra_force_includes = cli.force_includes;
+  extra_force_include_count = cli.force_include_count;
   emit_line_directives = cli.features.line_directives;
 
   // Handle special modes

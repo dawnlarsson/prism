@@ -2759,6 +2759,10 @@ static Token *preprocess2(Token *tok)
         Token *start = tok;
         tok = tok->next;
 
+        // Null directive: just # on a line by itself (or # followed by only whitespace)
+        if (tok->at_bol)
+            continue;
+
         if (equal(tok, "include"))
         {
             bool is_dquote;
@@ -3031,6 +3035,13 @@ static Token *preprocess2(Token *tok)
             continue;
         }
 
+        if (equal(tok, "ident") || equal(tok, "sccs"))
+        {
+            // #ident and #sccs are ignored (GCC extension)
+            tok = skip_line_quiet(tok->next);
+            continue;
+        }
+
         if (tok->kind == TK_PP_NUM)
         {
             // Line directive like: # 1 "filename" [flags]
@@ -3039,7 +3050,7 @@ static Token *preprocess2(Token *tok)
             continue;
         }
 
-        error_tok(tok, "invalid preprocessor directive");
+        error_tok(start, "invalid preprocessor directive");
     }
 
     cur->next = tok;
