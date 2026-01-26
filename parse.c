@@ -2847,6 +2847,10 @@ static Token *preprocess2(Token *tok)
                     else
                         free(try);
                 }
+                // For quoted includes, search user-specified paths (-I) first
+                // before falling back to system include paths
+                if (!path)
+                    path = search_user_include_paths(filename);
             }
             if (!path)
                 path = search_include_paths(filename);
@@ -3173,6 +3177,9 @@ void pp_init(void)
     pp_define_macro("LLONG_MAX", "9223372036854775807LL");
     pp_define_macro("ULLONG_MAX", "18446744073709551615ULL");
 
+    // glibc internal macros needed when system headers are passed through
+    // __getopt_argv_const is defined in getopt.h and used in bits/getopt_ext.h
+    pp_define_macro("__getopt_argv_const", "const");
 #if defined(__linux__)
     pp_define_macro("__linux__", "1");
     pp_define_macro("__linux", "1");

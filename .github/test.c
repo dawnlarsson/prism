@@ -2845,13 +2845,13 @@ void test_sizeof_array_element_in_bound(void)
     CHECK(all_zero, "sizeof(arr)/sizeof(arr[0]) array bound - zero-init");
     CHECK_EQ(expected_size, 5, "sizeof(arr)/sizeof(arr[0]) gives correct count");
 
-    // Just sizeof(arr[0]) 
+    // Just sizeof(arr[0])
     char buf2[sizeof(global_arr_for_sizeof[0])];
     CHECK(buf2[0] == 0, "sizeof(arr[0]) array bound - zero-init");
 
     // Nested brackets: sizeof of 2D array element
     int arr2d[3][4] = {{0}};
-    char buf3[sizeof(arr2d[0])];  // sizeof a row (4 ints)
+    char buf3[sizeof(arr2d[0])]; // sizeof a row (4 ints)
     int row_size = sizeof(arr2d[0]);
     all_zero = 1;
     for (int i = 0; i < row_size; i++)
@@ -2860,7 +2860,7 @@ void test_sizeof_array_element_in_bound(void)
     CHECK(all_zero, "sizeof(2d_arr[0]) array bound - zero-init");
 
     // Multiple nested brackets
-    char buf4[sizeof(arr2d[0][0])];  // sizeof single element
+    char buf4[sizeof(arr2d[0][0])]; // sizeof single element
     CHECK(buf4[0] == 0, "sizeof(2d_arr[0][0]) array bound - zero-init");
 
     // sizeof with expression involving array access

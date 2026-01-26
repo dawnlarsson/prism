@@ -1,11 +1,9 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.64.0"
+#define PRISM_VERSION "0.65.0"
 
 #include "parse.c"
 
-// ═══════════════════════════════════════════════════════════════════════════
 // LIBRARY API
-// ═══════════════════════════════════════════════════════════════════════════
 
 typedef struct
 {
@@ -41,9 +39,7 @@ static PrismFeatures prism_defaults(void)
 static PrismResult prism_transpile_file(const char *input_file, PrismFeatures features);
 static void prism_free(PrismResult *r);
 
-// ═══════════════════════════════════════════════════════════════════════════
 // CLI CONFIGURATION (excluded with -DPRISM_LIB_MODE)
-// ═══════════════════════════════════════════════════════════════════════════
 
 #ifndef PRISM_LIB_MODE
 
@@ -1692,6 +1688,20 @@ static bool is_const_array_size(Token *open_bracket)
   return is_empty || has_only_literals;
 }
 
+// Check if token can be used as a variable name in a declarator.
+// This includes identifiers and prism keywords (raw, defer) which
+// are only special at the start of a declaration, not as variable names.
+static bool is_valid_varname(Token *tok)
+{
+  if (tok->kind == TK_IDENT)
+    return true;
+  // 'raw' and 'defer' are prism keywords but can be used as variable names
+  // in user code (e.g., "int raw, x;" or "int defer;")
+  if (equal(tok, "raw") || equal(tok, "defer"))
+    return true;
+  return false;
+}
+
 // Try to handle a declaration with zero-init
 // Supports multi-declarators like: int a, b, *c, d[10];
 // Returns the token after the declaration if handled, NULL otherwise
@@ -2040,8 +2050,8 @@ static Token *try_zero_init_decl(Token *tok)
         tok = tok->next;
       }
 
-      // Must be identifier now
-      if (tok->kind != TK_IDENT)
+      // Must be identifier now (or a prism keyword usable as varname)
+      if (!is_valid_varname(tok))
       {
         fprintf(stderr, "%s:%d: warning: zero-init: expected identifier in declarator, "
                         "variable may be uninitialized. Consider adding explicit initializer.\n",
@@ -2052,8 +2062,8 @@ static Token *try_zero_init_decl(Token *tok)
       has_paren_declarator = true;
     }
 
-    // Must have identifier
-    if (tok->kind != TK_IDENT)
+    // Must have identifier (or a prism keyword usable as varname)
+    if (!is_valid_varname(tok))
     {
       // We've emitted type but no identifier - shouldn't happen if validation worked
       fprintf(stderr, "%s:%d: warning: zero-init: expected identifier after type, "
@@ -2376,6 +2386,12 @@ static int transpile(char *input_file, char *output_file)
     // Many C programs use these constants without explicitly including errno.h,
     // relying on transitive includes that prism's preprocessing may not preserve.
     fprintf(out, "#include <errno.h>\n");
+    // glibc's getopt.h defines __getopt_argv_const which is used by bits/getopt_ext.h.
+    // When prism partially processes headers and passes #include directives through,
+    // we need to ensure this macro is defined for the backend compiler.
+    fprintf(out, "#ifndef __getopt_argv_const\n");
+    fprintf(out, "#define __getopt_argv_const const\n");
+    fprintf(out, "#endif\n");
   }
 
   // Reset state
@@ -3046,9 +3062,7 @@ static int transpile(char *input_file, char *output_file)
   return 1;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
 // LIBRARY API IMPLEMENTATION
-// ═══════════════════════════════════════════════════════════════════════════
 
 #ifndef TMP_DIR
 #ifdef _WIN32
@@ -3167,9 +3181,7 @@ static void prism_free(PrismResult *r)
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
 // CLI IMPLEMENTATION (excluded with -DPRISM_LIB_MODE)
-// ═══════════════════════════════════════════════════════════════════════════
 
 #ifndef PRISM_LIB_MODE
 
