@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.59.0"
+#define PRISM_VERSION "0.60.0"
 
 #include "parse.c"
 
@@ -2304,6 +2304,18 @@ static int transpile(char *input_file, char *output_file)
   out = fopen(output_file, "w");
   if (!out)
     return 0;
+
+  // Emit feature test macros at the very start of the output
+  // These must come before any #include <...> directives for glibc to work correctly
+  {
+    const char **ftm_names;
+    const char **ftm_values;
+    int ftm_count = pp_get_feature_test_macros(&ftm_names, &ftm_values);
+    for (int i = 0; i < ftm_count; i++)
+    {
+      fprintf(out, "#define %s %s\n", ftm_names[i], ftm_values[i]);
+    }
+  }
 
   // Reset state
   defer_depth = 0;

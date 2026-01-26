@@ -232,6 +232,121 @@ static CondIncl *cond_incl;
 static HashMap included_files;
 static bool pp_eval_skip = false;
 
+// Feature test macros that need to be passed through to the backend compiler
+// These must be defined before system headers for glibc to expose certain functions
+static const char *feature_test_macro_names[] = {
+    "_GNU_SOURCE",
+    "_POSIX_SOURCE",
+    "_POSIX_C_SOURCE",
+    "_XOPEN_SOURCE",
+    "_XOPEN_SOURCE_EXTENDED",
+    "_ISOC99_SOURCE",
+    "_ISOC11_SOURCE",
+    "_ISOC2X_SOURCE",
+    "_LARGEFILE_SOURCE",
+    "_LARGEFILE64_SOURCE",
+    "_FILE_OFFSET_BITS",
+    "_BSD_SOURCE",
+    "_SVID_SOURCE",
+    "_DEFAULT_SOURCE",
+    "_ATFILE_SOURCE",
+    "_REENTRANT",
+    "_THREAD_SAFE",
+    "__STDC_WANT_LIB_EXT1__",
+    "__STDC_WANT_IEC_60559_BFP_EXT__",
+    "__STDC_WANT_IEC_60559_DFP_EXT__",
+    "__STDC_WANT_IEC_60559_FUNCS_EXT__",
+    "__STDC_WANT_IEC_60559_TYPES_EXT__",
+    NULL
+};
+
+// Storage for feature test macros found in user code
+typedef struct {
+    char *name;
+    char *value;  // The macro value (or "1" if no value)
+} FeatureTestMacro;
+
+#define MAX_FEATURE_TEST_MACROS 32
+static FeatureTestMacro feature_test_macros[MAX_FEATURE_TEST_MACROS];
+static int feature_test_macro_count = 0;
+
+static bool is_feature_test_macro(const char *name, int len)
+{
+    for (int i = 0; feature_test_macro_names[i]; i++)
+    {
+        if (strlen(feature_test_macro_names[i]) == (size_t)len &&
+            strncmp(feature_test_macro_names[i], name, len) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void record_feature_test_macro(const char *name, int name_len, Token *body)
+{
+    if (feature_test_macro_count >= MAX_FEATURE_TEST_MACROS)
+        return;
+
+    // Check if already recorded
+    for (int i = 0; i < feature_test_macro_count; i++)
+    {
+        if (strlen(feature_test_macros[i].name) == (size_t)name_len &&
+            strncmp(feature_test_macros[i].name, name, name_len) == 0)
+            return;  // Already recorded
+    }
+
+    // Get the value from the body tokens
+    char value_buf[256] = "";
+    int pos = 0;
+    for (Token *t = body; t && t->kind != TK_EOF && pos < 250; t = t->next)
+    {
+        if (t->has_space && pos > 0)
+            value_buf[pos++] = ' ';
+        int copy_len = t->len;
+        if (pos + copy_len >= 250)
+            copy_len = 250 - pos;
+        memcpy(value_buf + pos, t->loc, copy_len);
+        pos += copy_len;
+    }
+    value_buf[pos] = '\0';
+
+    // If empty, default to "1"
+    if (pos == 0)
+        strcpy(value_buf, "1");
+
+    feature_test_macros[feature_test_macro_count].name = strndup(name, name_len);
+    feature_test_macros[feature_test_macro_count].value = strdup(value_buf);
+    feature_test_macro_count++;
+}
+
+// Public API: get feature test macros for emission
+int pp_get_feature_test_macros(const char ***names, const char ***values)
+{
+    static const char *name_ptrs[MAX_FEATURE_TEST_MACROS];
+    static const char *value_ptrs[MAX_FEATURE_TEST_MACROS];
+
+    for (int i = 0; i < feature_test_macro_count; i++)
+    {
+        name_ptrs[i] = feature_test_macros[i].name;
+        value_ptrs[i] = feature_test_macros[i].value;
+    }
+
+    *names = name_ptrs;
+    *values = value_ptrs;
+    return feature_test_macro_count;
+}
+
+static void reset_feature_test_macros(void)
+{
+    for (int i = 0; i < feature_test_macro_count; i++)
+    {
+        free(feature_test_macros[i].name);
+        free(feature_test_macros[i].value);
+        feature_test_macros[i].name = NULL;
+        feature_test_macros[i].value = NULL;
+    }
+    feature_test_macro_count = 0;
+}
+
 static Type *array_of(Type *base, int len)
 {
     Type *ty = calloc(1, sizeof(Type));
@@ -1405,15 +1520,29 @@ static Token *tokenize(File *file)
             p += cur->len;
             continue;
         }
+        // Wide and unicode string literals: L"...", u"...", U"...", u8"..."
         if (startswith(p, "u8\""))
         {
             cur = cur->next = read_string_literal(p, p + 2);
             p += cur->len;
             continue;
         }
+        if ((*p == 'L' || *p == 'u' || *p == 'U') && p[1] == '"')
+        {
+            cur = cur->next = read_string_literal(p, p + 1);
+            p += cur->len;
+            continue;
+        }
         if (*p == '\'')
         {
             cur = cur->next = read_char_literal(p, p, ty_int);
+            p += cur->len;
+            continue;
+        }
+        // Wide and unicode character literals: L'...', u'...', U'...'
+        if ((*p == 'L' || *p == 'u' || *p == 'U') && p[1] == '\'')
+        {
+            cur = cur->next = read_char_literal(p, p + 1, ty_int);
             p += cur->len;
             continue;
         }
@@ -2138,6 +2267,7 @@ static void read_macro_definition(Token **rest, Token *tok)
         error_tok(tok, "expected identifier");
 
     char *name = strndup(tok->loc, tok->len);
+    int name_len = tok->len;
     tok = tok->next;
 
     if (!tok->has_space && equal(tok, "("))
@@ -2152,7 +2282,13 @@ static void read_macro_definition(Token **rest, Token *tok)
     }
 
     // Object-like macro
-    add_macro(name, true, copy_line(rest, tok));
+    Token *body = copy_line(rest, tok);
+
+    // Check if this is a feature test macro that needs to be passed to backend
+    if (is_feature_test_macro(name, name_len))
+        record_feature_test_macro(name, name_len, body);
+
+    add_macro(name, true, body);
 }
 
 static int64_t eval_const_expr(Token **rest, Token *tok);
@@ -2885,14 +3021,17 @@ static Token *preprocess2(Token *tok)
 
         if (equal(tok, "line"))
         {
-            tok = skip_line(tok->next);
+            // #line has format: #line linenum ["filename"]
+            // Skip the entire line quietly since the filename is optional
+            tok = skip_line_quiet(tok->next);
             continue;
         }
 
         if (tok->kind == TK_PP_NUM)
         {
-            // Line directive like: # 1 "filename"
-            tok = skip_line(tok);
+            // Line directive like: # 1 "filename" [flags]
+            // This is GCC's line marker format - skip quietly
+            tok = skip_line_quiet(tok);
             continue;
         }
 
@@ -2926,6 +3065,7 @@ void pp_reset(void)
     hashmap_clear(&included_files);
     cond_incl = NULL;
     pp_eval_skip = false;
+    reset_feature_test_macros();
 }
 
 void pp_init(void)
