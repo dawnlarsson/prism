@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.62.0"
+#define PRISM_VERSION "0.64.0"
 
 #include "parse.c"
 
@@ -2074,10 +2074,24 @@ static Token *try_zero_init_decl(Token *tok)
       {
         emit_tok(tok);
         tok = tok->next;
-        while (!equal(tok, "]") && tok->kind != TK_EOF)
+        // Track balanced brackets and parens (for sizeof(x[0]) etc.)
+        int bracket_depth = 1;
+        int paren_depth = 0;
+        while (tok->kind != TK_EOF && bracket_depth > 0)
         {
-          emit_tok(tok);
-          tok = tok->next;
+          if (equal(tok, "["))
+            bracket_depth++;
+          else if (equal(tok, "]"))
+            bracket_depth--;
+          else if (equal(tok, "("))
+            paren_depth++;
+          else if (equal(tok, ")"))
+            paren_depth--;
+          if (bracket_depth > 0)
+          {
+            emit_tok(tok);
+            tok = tok->next;
+          }
         }
         if (equal(tok, "]"))
         {
@@ -2118,10 +2132,24 @@ static Token *try_zero_init_decl(Token *tok)
           {
             emit_tok(tok);
             tok = tok->next;
-            while (!equal(tok, "]") && tok->kind != TK_EOF)
+            // Track balanced brackets and parens (for sizeof(x[0]) etc.)
+            int bracket_depth = 1;
+            int paren_depth = 0;
+            while (tok->kind != TK_EOF && bracket_depth > 0)
             {
-              emit_tok(tok);
-              tok = tok->next;
+              if (equal(tok, "["))
+                bracket_depth++;
+              else if (equal(tok, "]"))
+                bracket_depth--;
+              else if (equal(tok, "("))
+                paren_depth++;
+              else if (equal(tok, ")"))
+                paren_depth--;
+              if (bracket_depth > 0)
+              {
+                emit_tok(tok);
+                tok = tok->next;
+              }
             }
             if (equal(tok, "]"))
             {
@@ -2180,12 +2208,27 @@ static Token *try_zero_init_decl(Token *tok)
         // Check if VLA before emitting
         if (!is_const_array_size(tok))
           is_vla = true;
-        emit_tok(tok);
+        emit_tok(tok); // emit opening '['
         tok = tok->next;
-        while (!equal(tok, "]") && tok->kind != TK_EOF)
+        // Track balanced brackets and parens within the array dimension
+        // This handles cases like: buf[sizeof(arr[0])] or buf[(a+b)*c]
+        int bracket_depth = 1; // for [ ]
+        int paren_depth = 0;   // for ( )
+        while (tok->kind != TK_EOF && bracket_depth > 0)
         {
-          emit_tok(tok);
-          tok = tok->next;
+          if (equal(tok, "["))
+            bracket_depth++;
+          else if (equal(tok, "]"))
+            bracket_depth--;
+          else if (equal(tok, "("))
+            paren_depth++;
+          else if (equal(tok, ")"))
+            paren_depth--;
+          if (bracket_depth > 0)
+          {
+            emit_tok(tok);
+            tok = tok->next;
+          }
         }
         if (equal(tok, "]"))
         {
@@ -2329,6 +2372,10 @@ static int transpile(char *input_file, char *output_file)
     {
       fprintf(out, "#define %s %s\n", ftm_names[i], ftm_values[i]);
     }
+    // Always include errno.h for error constants like EINVAL, ENOENT, etc.
+    // Many C programs use these constants without explicitly including errno.h,
+    // relying on transitive includes that prism's preprocessing may not preserve.
+    fprintf(out, "#include <errno.h>\n");
   }
 
   // Reset state

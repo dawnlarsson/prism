@@ -3151,6 +3151,28 @@ void pp_init(void)
     pp_define_macro("__LONG_MAX__", "9223372036854775807L");
     pp_define_macro("__LONG_LONG_MAX__", "9223372036854775807LL");
 
+    // Standard C limits (needed for #if expressions in headers like typemax.h)
+    // These prevent headers from defining them with complex expressions that
+    // use casts, which preprocessor constant expressions can't handle.
+    pp_define_macro("CHAR_BIT", "8");
+    pp_define_macro("SCHAR_MIN", "(-128)");
+    pp_define_macro("SCHAR_MAX", "127");
+    pp_define_macro("UCHAR_MAX", "255");
+    pp_define_macro("CHAR_MIN", "(-128)");
+    pp_define_macro("CHAR_MAX", "127");
+    pp_define_macro("SHRT_MIN", "(-32768)");
+    pp_define_macro("SHRT_MAX", "32767");
+    pp_define_macro("USHRT_MAX", "65535");
+    pp_define_macro("INT_MIN", "(-2147483647-1)");
+    pp_define_macro("INT_MAX", "2147483647");
+    pp_define_macro("UINT_MAX", "4294967295U");
+    pp_define_macro("LONG_MIN", "(-9223372036854775807L-1L)");
+    pp_define_macro("LONG_MAX", "9223372036854775807L");
+    pp_define_macro("ULONG_MAX", "18446744073709551615UL");
+    pp_define_macro("LLONG_MIN", "(-9223372036854775807LL-1LL)");
+    pp_define_macro("LLONG_MAX", "9223372036854775807LL");
+    pp_define_macro("ULLONG_MAX", "18446744073709551615ULL");
+
 #if defined(__linux__)
     pp_define_macro("__linux__", "1");
     pp_define_macro("__linux", "1");

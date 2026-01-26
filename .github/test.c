@@ -2828,6 +2828,69 @@ void test_complex_operators_in_array_bound(void)
     CHECK(buf4[0] == 0, "logical && in array bound - zero-init");
 }
 
+// Test for sizeof with array element access in array bounds
+// This was a bug where sizeof(arr[0]) inside array bounds was incorrectly parsed
+static int global_arr_for_sizeof[] = {1, 2, 3, 4, 5};
+
+void test_sizeof_array_element_in_bound(void)
+{
+    // sizeof(arr[0]) pattern - common idiom for array element count
+    // Bug: prism was seeing arr[0] as a declaration inside the array bound
+    char buf1[sizeof(global_arr_for_sizeof) / sizeof(global_arr_for_sizeof[0])];
+    int expected_size = sizeof(global_arr_for_sizeof) / sizeof(global_arr_for_sizeof[0]);
+    int all_zero = 1;
+    for (int i = 0; i < expected_size; i++)
+        if (buf1[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(arr)/sizeof(arr[0]) array bound - zero-init");
+    CHECK_EQ(expected_size, 5, "sizeof(arr)/sizeof(arr[0]) gives correct count");
+
+    // Just sizeof(arr[0]) 
+    char buf2[sizeof(global_arr_for_sizeof[0])];
+    CHECK(buf2[0] == 0, "sizeof(arr[0]) array bound - zero-init");
+
+    // Nested brackets: sizeof of 2D array element
+    int arr2d[3][4] = {{0}};
+    char buf3[sizeof(arr2d[0])];  // sizeof a row (4 ints)
+    int row_size = sizeof(arr2d[0]);
+    all_zero = 1;
+    for (int i = 0; i < row_size; i++)
+        if (buf3[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(2d_arr[0]) array bound - zero-init");
+
+    // Multiple nested brackets
+    char buf4[sizeof(arr2d[0][0])];  // sizeof single element
+    CHECK(buf4[0] == 0, "sizeof(2d_arr[0][0]) array bound - zero-init");
+
+    // sizeof with expression involving array access
+    char buf5[sizeof(global_arr_for_sizeof[0]) * 2];
+    CHECK(buf5[0] == 0, "sizeof(arr[0])*2 array bound - zero-init");
+}
+
+void test_sizeof_with_parens_in_bound(void)
+{
+    // Parenthesized sizeof expressions
+    char buf1[(sizeof(int))];
+    CHECK(buf1[0] == 0, "(sizeof(int)) array bound - zero-init");
+
+    // Double parens
+    char buf2[((sizeof(int)))];
+    CHECK(buf2[0] == 0, "((sizeof(int))) array bound - zero-init");
+
+    // sizeof of parenthesized expression
+    char buf3[sizeof((int)0) + 1];
+    CHECK(buf3[0] == 0, "sizeof((int)0) array bound - zero-init");
+
+    // Complex parenthesized expression with sizeof
+    char buf4[(sizeof(int) + sizeof(char)) * 2];
+    int all_zero = 1;
+    for (size_t i = 0; i < (sizeof(int) + sizeof(char)) * 2; i++)
+        if (buf4[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "(sizeof+sizeof)*2 array bound - zero-init");
+}
+
 void run_sizeof_constexpr_tests(void)
 {
     printf("\n=== SIZEOF AND CONSTANT EXPRESSION TESTS ===\n");
@@ -2839,6 +2902,8 @@ void run_sizeof_constexpr_tests(void)
     test_system_typedef_pattern();
     test_alignof_in_array_bound();
     test_complex_operators_in_array_bound();
+    test_sizeof_array_element_in_bound();
+    test_sizeof_with_parens_in_bound();
 }
 
 void run_silent_failure_tests(void)
