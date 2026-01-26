@@ -1,16 +1,61 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_FLAGS "-O3 -flto -s"
-#define VERSION "0.54.0"
+#define PRISM_VERSION "0.55.0"
 
 #include "parse.c"
 
+// ═══════════════════════════════════════════════════════════════════════════
+// LIBRARY API
+// ═══════════════════════════════════════════════════════════════════════════
+
+typedef struct
+{
+  bool defer;
+  bool zeroinit;
+  bool line_directives;
+} PrismFeatures;
+
+typedef enum
+{
+  PRISM_OK = 0,
+  PRISM_ERR_SYNTAX,
+  PRISM_ERR_SEMANTIC,
+  PRISM_ERR_IO,
+} PrismStatus;
+
+typedef struct
+{
+  PrismStatus status;
+  char *output; // transpiled C (caller frees with prism_free)
+  size_t output_len;
+  char *error_msg; // error message (NULL on success)
+  int error_line;
+  int error_col;
+} PrismResult;
+
+static PrismFeatures prism_defaults(void)
+{
+  return (PrismFeatures){.defer = true, .zeroinit = true, .line_directives = true};
+}
+
+// Forward declarations for library API
+static PrismResult prism_transpile_file(const char *input_file, PrismFeatures features);
+static void prism_free(PrismResult *r);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CLI CONFIGURATION (excluded with -DPRISM_LIB_MODE)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#ifndef PRISM_LIB_MODE
+
 #ifdef _WIN32
-#define INSTALL "prism.exe"
-#define TMP ""
+#define INSTALL_PATH "prism.exe"
+#define TMP_DIR ""
 #else
-#define INSTALL "/usr/local/bin/prism"
-#define TMP "/tmp/"
+#define INSTALL_PATH "/usr/local/bin/prism"
+#define TMP_DIR "/tmp/"
 #endif
+
+#endif // PRISM_LIB_MODE
 
 #if defined(__x86_64__) || defined(_M_X64)
 #define NATIVE_ARCH "x86"
@@ -39,14 +84,7 @@
 #define NATIVE_PLATFORM "linux"
 #endif
 
-typedef enum
-{
-  MODE_DEFAULT,
-  MODE_DEBUG,
-  MODE_RELEASE,
-  MODE_SMALL
-} Mode;
-
+// Internal feature flags (set from PrismFeatures before transpile)
 static bool feature_defer = true;
 static bool feature_zeroinit = true;
 
@@ -2843,6 +2881,133 @@ static int transpile(char *input_file, char *output_file)
   return 1;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// LIBRARY API IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+#ifndef TMP_DIR
+#ifdef _WIN32
+#define TMP_DIR ""
+#else
+#define TMP_DIR "/tmp/"
+#endif
+#endif
+
+static PrismResult prism_transpile_file(const char *input_file, PrismFeatures features)
+{
+  PrismResult result = {0};
+
+  // Set global feature flags from PrismFeatures
+  feature_defer = features.defer;
+  feature_zeroinit = features.zeroinit;
+  emit_line_directives = features.line_directives;
+
+  // Create temp file for output
+  char temp_path[512];
+  snprintf(temp_path, sizeof(temp_path), "%sprism_out.XXXXXX.c", TMP_DIR);
+
+#if defined(_WIN32)
+  if (_mktemp_s(temp_path, sizeof(temp_path)) != 0)
+  {
+    result.status = PRISM_ERR_IO;
+    result.error_msg = strdup("Failed to create temp file");
+    return result;
+  }
+#elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
+  {
+    int fd = mkstemps(temp_path, 2);
+    if (fd < 0)
+    {
+      result.status = PRISM_ERR_IO;
+      result.error_msg = strdup("Failed to create temp file");
+      return result;
+    }
+    close(fd);
+  }
+#else
+  {
+    int fd = mkstemp(temp_path);
+    if (fd < 0)
+    {
+      result.status = PRISM_ERR_IO;
+      result.error_msg = strdup("Failed to create temp file");
+      return result;
+    }
+    close(fd);
+    unlink(temp_path);
+    size_t len = strlen(temp_path);
+    if (len + 2 < sizeof(temp_path))
+    {
+      temp_path[len] = '.';
+      temp_path[len + 1] = 'c';
+      temp_path[len + 2] = '\0';
+    }
+  }
+#endif
+
+  // Transpile
+  if (!transpile((char *)input_file, temp_path))
+  {
+    result.status = PRISM_ERR_SYNTAX;
+    result.error_msg = strdup("Transpilation failed");
+    remove(temp_path);
+    return result;
+  }
+
+  // Read result into memory
+  FILE *f = fopen(temp_path, "rb");
+  if (!f)
+  {
+    result.status = PRISM_ERR_IO;
+    result.error_msg = strdup("Failed to read transpiled output");
+    remove(temp_path);
+    return result;
+  }
+
+  fseek(f, 0, SEEK_END);
+  long size = ftell(f);
+  fseek(f, 0, SEEK_SET);
+
+  result.output = malloc(size + 1);
+  if (!result.output)
+  {
+    result.status = PRISM_ERR_IO;
+    result.error_msg = strdup("Out of memory");
+    fclose(f);
+    remove(temp_path);
+    return result;
+  }
+
+  size_t read = fread(result.output, 1, size, f);
+  result.output[read] = '\0';
+  result.output_len = read;
+  result.status = PRISM_OK;
+
+  fclose(f);
+  remove(temp_path);
+  return result;
+}
+
+static void prism_free(PrismResult *r)
+{
+  if (r->output)
+  {
+    free(r->output);
+    r->output = NULL;
+  }
+  if (r->error_msg)
+  {
+    free(r->error_msg);
+    r->error_msg = NULL;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CLI IMPLEMENTATION (excluded with -DPRISM_LIB_MODE)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#ifndef PRISM_LIB_MODE
+
 // Split a space-separated string into an argv array
 // Returns number of arguments, or -1 on error
 // Caller must free each element and the array itself
@@ -3011,17 +3176,17 @@ static void die(char *message)
 
 static int install(char *self_path)
 {
-  printf("[prism] Installing to %s...\n", INSTALL);
-  remove(INSTALL);
+  printf("[prism] Installing to %s...\n", INSTALL_PATH);
+  remove(INSTALL_PATH);
 
   FILE *input = fopen(self_path, "rb");
-  FILE *output = fopen(INSTALL, "wb");
+  FILE *output = fopen(INSTALL_PATH, "wb");
 
   if (!input || !output)
   {
     // Fallback to sudo - use run_command for security
     // First try to remove existing file
-    char **rm_argv = build_argv("sudo", "rm", "-f", INSTALL, NULL);
+    char **rm_argv = build_argv("sudo", "rm", "-f", INSTALL_PATH, NULL);
     if (rm_argv)
     {
       run_command(rm_argv);
@@ -3029,7 +3194,7 @@ static int install(char *self_path)
     }
 
     // Copy the file
-    char **cp_argv = build_argv("sudo", "cp", self_path, INSTALL, NULL);
+    char **cp_argv = build_argv("sudo", "cp", self_path, INSTALL_PATH, NULL);
     if (!cp_argv)
     {
       fprintf(stderr, "Memory allocation failed\n");
@@ -3044,7 +3209,7 @@ static int install(char *self_path)
     }
 
     // Set executable permission
-    char **chmod_argv = build_argv("sudo", "chmod", "+x", INSTALL, NULL);
+    char **chmod_argv = build_argv("sudo", "chmod", "+x", INSTALL_PATH, NULL);
     if (!chmod_argv)
     {
       fprintf(stderr, "Memory allocation failed\n");
@@ -3078,12 +3243,21 @@ static int install(char *self_path)
   fclose(output);
 
 #ifndef _WIN32
-  chmod(INSTALL, 0755);
+  chmod(INSTALL_PATH, 0755);
 #endif
 
   printf("[prism] Installed!\n");
   return 0;
 }
+
+// Legacy Mode enum for get_flags compatibility
+typedef enum
+{
+  MODE_DEFAULT,
+  MODE_DEBUG,
+  MODE_RELEASE,
+  MODE_SMALL
+} Mode;
 
 static void get_flags(char *source_file, char *buffer, Mode mode)
 {
@@ -3153,19 +3327,19 @@ static void get_flags(char *source_file, char *buffer, Mode mode)
   fclose(file);
 }
 
-static char *get_compiler(char *arch, int bits, char *platform)
+static char *get_compiler_for_cross(char *arch, int bits, char *platform)
 {
   int is_native = !strcmp(arch, NATIVE_ARCH) && bits == NATIVE_BITS &&
                   !strcmp(platform, NATIVE_PLATFORM);
   if (is_native)
-    return "cc";
+    return NULL; // Use default CC
 
   if (!strcmp(platform, "linux"))
   {
     if (!strcmp(arch, "arm"))
       return bits == 64 ? "aarch64-linux-gnu-gcc" : "arm-linux-gnueabihf-gcc";
     else
-      return bits == 64 ? "x86_64-linux-gnu-gcc" : "gcc -m32";
+      return bits == 64 ? "x86_64-linux-gnu-gcc" : "i686-linux-gnu-gcc";
   }
 
   if (!strcmp(platform, "windows"))
@@ -3181,97 +3355,356 @@ static char *get_compiler(char *arch, int bits, char *platform)
     return !strcmp(arch, "arm") ? "oa64-clang" : "o64-clang";
   }
 
-  return "cc";
+  return NULL;
 }
 
-int main(int argc, char **argv)
+// ─────────────────────────────────────────────────────────────────────────────
+// CLI Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+typedef enum
 {
-  if (argc < 2)
+  CLI_MODE_COMPILE_AND_LINK, // default: prism foo.c → a.out (GCC-compatible)
+  CLI_MODE_COMPILE_ONLY,     // -c: prism -c foo.c -o foo.o
+  CLI_MODE_RUN,              // run: prism run foo.c (transpile + compile + execute)
+  CLI_MODE_EMIT,             // transpile: prism transpile foo.c (output C)
+  CLI_MODE_INSTALL,          // prism install
+  CLI_MODE_HELP,             // --help / -h
+  CLI_MODE_VERSION,          // --version / -v
+} CliMode;
+
+typedef struct
+{
+  CliMode mode;
+  PrismFeatures features;
+
+  // Sources
+  const char **sources;
+  int source_count;
+  int source_capacity;
+
+  // Output
+  const char *output; // -o target
+
+  // Pass-through to CC
+  const char **cc_args;
+  int cc_arg_count;
+  int cc_arg_capacity;
+
+  // Prism-specific
+  const char *cc; // --prism-cc (default: $PRISM_CC or $CC or "cc")
+  bool verbose;   // --prism-verbose
+
+  // Cross-compilation (legacy support)
+  char *cross_arch;
+  int cross_bits;
+  char *cross_platform;
+} Cli;
+
+static void cli_add_source(Cli *cli, const char *src)
+{
+  if (cli->source_count >= cli->source_capacity)
   {
-    printf("Prism v%s\n\n"
-           "Usage: prism [options] src.c [output] [args]\n\n"
-           "Options:\n"
-           "  install               Install prism as a global cli tool\n"
-           "  build                 Build only, don't run\n"
-           "  transpile             Transpile only, output to stdout or file\n"
-           "  debug/release/small   Optimization mode\n"
-           "  arm/x86               Architecture (default: native)\n"
-           "  32/64                 Word size (default: 64)\n"
-           "  linux/windows/macos   Platform (default: native)\n"
-           "  no-defer              Disable defer feature\n"
-           "  no-zeroinit           Disable zero-initialization\n\n"
-           "Examples:\n"
-           "  prism src.c                   Run src.c\n"
-           "  prism build src.c             Build src\n"
-           "  prism build src.c out         Build to 'out'\n"
-           "  prism build arm src.c         Build for arm64 linux\n"
-           "  prism transpile src.c         Transpile to stdout\n"
-           "  prism transpile src.c out.c   Transpile to out.c\n"
-           "  prism no-defer src.c          Run without defer\n\n"
-           "Apache 2.0 license (c) Dawn Larsson 2026\nhttps://github.com/dawnlarsson/prism \n\n",
-           VERSION);
-    return 0;
+    int new_cap = cli->source_capacity == 0 ? 16 : cli->source_capacity * 2;
+    const char **new_sources = realloc(cli->sources, sizeof(char *) * new_cap);
+    if (!new_sources)
+      die("Out of memory");
+    cli->sources = new_sources;
+    cli->source_capacity = new_cap;
   }
+  cli->sources[cli->source_count++] = src;
+}
 
-  if (!strcmp(argv[1], "install"))
-    return install(argv[0]);
-
-  int arg_idx = 1, is_build_only = 0, is_transpile_only = 0;
-  Mode mode = MODE_DEFAULT;
-  char *arch = NATIVE_ARCH;
-  int bits = NATIVE_BITS;
-  char *platform = NATIVE_PLATFORM;
-
-  // Parse options until we hit a .c file
-  while (arg_idx < argc)
+static void cli_add_cc_arg(Cli *cli, const char *arg)
+{
+  if (cli->cc_arg_count >= cli->cc_arg_capacity)
   {
-    char *arg = argv[arg_idx];
-    size_t len = strlen(arg);
-    // Check if filename ends with .c
-    if (len >= 2 && arg[len - 2] == '.' && arg[len - 1] == 'c')
-      break;
+    int new_cap = cli->cc_arg_capacity == 0 ? 64 : cli->cc_arg_capacity * 2;
+    const char **new_args = realloc(cli->cc_args, sizeof(char *) * new_cap);
+    if (!new_args)
+      die("Out of memory");
+    cli->cc_args = new_args;
+    cli->cc_arg_capacity = new_cap;
+  }
+  cli->cc_args[cli->cc_arg_count++] = arg;
+}
+
+static bool is_source_file(const char *arg)
+{
+  size_t len = strlen(arg);
+  if (len < 2)
+    return false;
+  // .c files
+  if (len >= 2 && !strcmp(arg + len - 2, ".c"))
+    return true;
+  // .i files (preprocessed)
+  if (len >= 2 && !strcmp(arg + len - 2, ".i"))
+    return true;
+  // .s/.S files (assembly)
+  if (len >= 2 && (!strcmp(arg + len - 2, ".s") || !strcmp(arg + len - 2, ".S")))
+    return true;
+  return false;
+}
+
+static bool str_startswith(const char *s, const char *prefix)
+{
+  return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+// Check if flag needs a separate argument (e.g., -I, -D, -L, -include)
+static bool flag_needs_arg(const char *arg)
+{
+  // These flags can be space-separated: -I dir, -D macro, -L dir, etc.
+  const char *flags[] = {"-I", "-D", "-U", "-L", "-l", "-include", "-isystem",
+                         "-idirafter", "-iprefix", "-iwithprefix", "-x", NULL};
+  for (int i = 0; flags[i]; i++)
+  {
+    if (!strcmp(arg, flags[i]))
+      return true;
+  }
+  return false;
+}
+
+static void print_help(void)
+{
+  printf(
+      "Prism v%s - C transpiler\n\n"
+      "Usage: prism [options] source.c... [-o output]\n\n"
+      "GCC-Compatible Options:\n"
+      "  -c                    Compile only, don't link\n"
+      "  -o <file>             Output file\n"
+      "  -O0/-O1/-O2/-O3/-Os   Optimization level (passed to CC)\n"
+      "  -g                    Debug info (passed to CC)\n"
+      "  -W...                 Warnings (passed to CC)\n"
+      "  -I/-D/-U/-L/-l        Include/define/lib flags (passed to CC)\n"
+      "  -std=...              Language standard (passed to CC)\n\n"
+      "Prism Options:\n"
+      "  -fno-defer            Disable defer feature\n"
+      "  -fno-zeroinit         Disable zero-initialization\n"
+      "  --prism-cc=<compiler> Use specific compiler (default: $CC or cc)\n"
+      "  --prism-verbose       Show transpile and compile commands\n\n"
+      "Commands:\n"
+      "  run <src.c>           Transpile, compile, and execute\n"
+      "  transpile <src.c>     Output transpiled C to stdout\n"
+      "  install               Install prism to %s\n"
+      "  --help, -h            Show this help\n"
+      "  --version, -v         Show version\n\n"
+      "Environment:\n"
+      "  CC                    C compiler to use (default: cc)\n"
+      "  PRISM_CC              Override CC for prism specifically\n\n"
+      "Examples:\n"
+      "  prism foo.c                      Compile to a.out (GCC-compatible)\n"
+      "  prism foo.c -o foo               Compile to 'foo'\n"
+      "  prism run foo.c                  Compile and run immediately\n"
+      "  prism transpile foo.c            Output transpiled C\n"
+      "  prism transpile foo.c -o out.c   Transpile to file\n"
+      "  prism -c foo.c -o foo.o          Compile to object file\n"
+      "  prism -O2 -Wall foo.c -o foo     With optimization and warnings\n"
+      "  CC=clang prism foo.c             Use clang as backend\n\n"
+      "Apache 2.0 license (c) Dawn Larsson 2026\n"
+      "https://github.com/dawnlarsson/prism\n",
+      PRISM_VERSION, INSTALL_PATH);
+}
+
+static Cli cli_parse(int argc, char **argv)
+{
+  Cli cli = {
+      .mode = CLI_MODE_COMPILE_AND_LINK,
+      .features = prism_defaults(),
+      .cross_arch = NATIVE_ARCH,
+      .cross_bits = NATIVE_BITS,
+      .cross_platform = NATIVE_PLATFORM,
+  };
+
+  // Get compiler from environment
+  char *env_cc = getenv("PRISM_CC");
+  if (!env_cc)
+    env_cc = getenv("CC");
+  cli.cc = env_cc ? env_cc : "cc";
+
+  for (int i = 1; i < argc; i++)
+  {
+    char *arg = argv[i];
+
+    // ─── Prism commands ───
+    if (!strcmp(arg, "run"))
+    {
+      cli.mode = CLI_MODE_RUN;
+      continue;
+    }
+    if (!strcmp(arg, "transpile"))
+    {
+      cli.mode = CLI_MODE_EMIT;
+      continue;
+    }
+    if (!strcmp(arg, "install"))
+    {
+      cli.mode = CLI_MODE_INSTALL;
+      continue;
+    }
+    if (!strcmp(arg, "--help") || !strcmp(arg, "-h"))
+    {
+      cli.mode = CLI_MODE_HELP;
+      continue;
+    }
+    if (!strcmp(arg, "--version") || !strcmp(arg, "-v"))
+    {
+      cli.mode = CLI_MODE_VERSION;
+      continue;
+    }
+
+    // ─── Prism feature flags (gcc-style) ───
+    if (!strcmp(arg, "-fno-defer"))
+    {
+      cli.features.defer = false;
+      continue;
+    }
+    if (!strcmp(arg, "-fno-zeroinit"))
+    {
+      cli.features.zeroinit = false;
+      continue;
+    }
+    if (!strcmp(arg, "-fno-line-directives"))
+    {
+      cli.features.line_directives = false;
+      continue;
+    }
+
+    // ─── Legacy prism flags (still supported) ───
+    if (!strcmp(arg, "no-defer"))
+    {
+      cli.features.defer = false;
+      continue;
+    }
+    if (!strcmp(arg, "no-zeroinit"))
+    {
+      cli.features.zeroinit = false;
+      continue;
+    }
+
+    // ─── Legacy cross-compilation (still supported) ───
+    if (!strcmp(arg, "arm"))
+    {
+      cli.cross_arch = "arm";
+      continue;
+    }
+    if (!strcmp(arg, "x86"))
+    {
+      cli.cross_arch = "x86";
+      continue;
+    }
+    if (!strcmp(arg, "32"))
+    {
+      cli.cross_bits = 32;
+      continue;
+    }
+    if (!strcmp(arg, "64"))
+    {
+      cli.cross_bits = 64;
+      continue;
+    }
+    if (!strcmp(arg, "linux"))
+    {
+      cli.cross_platform = "linux";
+      continue;
+    }
+    if (!strcmp(arg, "windows"))
+    {
+      cli.cross_platform = "windows";
+      continue;
+    }
+    if (!strcmp(arg, "macos"))
+    {
+      cli.cross_platform = "macos";
+      continue;
+    }
+
+    // ─── Legacy modes (backward compatibility) ───
     if (!strcmp(arg, "build"))
-      is_build_only = 1;
-    else if (!strcmp(arg, "transpile"))
-      is_transpile_only = 1;
-    else if (!strcmp(arg, "debug"))
-      mode = MODE_DEBUG;
-    else if (!strcmp(arg, "release"))
-      mode = MODE_RELEASE;
-    else if (!strcmp(arg, "small"))
-      mode = MODE_SMALL;
-    else if (!strcmp(arg, "arm"))
-      arch = "arm";
-    else if (!strcmp(arg, "x86"))
-      arch = "x86";
-    else if (!strcmp(arg, "32"))
-      bits = 32;
-    else if (!strcmp(arg, "64"))
-      bits = 64;
-    else if (!strcmp(arg, "linux"))
-      platform = "linux";
-    else if (!strcmp(arg, "windows"))
-      platform = "windows";
-    else if (!strcmp(arg, "macos"))
-      platform = "macos";
-    else if (!strcmp(arg, "no-defer"))
-      feature_defer = false;
-    else if (!strcmp(arg, "no-zeroinit"))
-      feature_zeroinit = false;
-    else if (!strcmp(arg, "no-line-directives"))
-      emit_line_directives = false;
-    else
-      break;
-    arg_idx++;
+    {
+      // 'build' is now the default behavior, ignore for compat
+      continue;
+    }
+
+    // ─── Prism-specific options ───
+    if (!strcmp(arg, "--prism-emit"))
+    {
+      cli.mode = CLI_MODE_EMIT;
+      continue;
+    }
+    if (str_startswith(arg, "--prism-emit="))
+    {
+      cli.mode = CLI_MODE_EMIT;
+      cli.output = arg + 13;
+      continue;
+    }
+    if (str_startswith(arg, "--prism-cc="))
+    {
+      cli.cc = arg + 11;
+      continue;
+    }
+    if (!strcmp(arg, "--prism-verbose"))
+    {
+      cli.verbose = true;
+      continue;
+    }
+
+    // ─── GCC-compatible: output ───
+    if (!strcmp(arg, "-o"))
+    {
+      if (i + 1 < argc)
+        cli.output = argv[++i];
+      continue;
+    }
+    if (str_startswith(arg, "-o"))
+    {
+      cli.output = arg + 2;
+      continue;
+    }
+
+    // ─── GCC-compatible: compile only ───
+    if (!strcmp(arg, "-c"))
+    {
+      cli.mode = CLI_MODE_COMPILE_ONLY;
+      continue;
+    }
+
+    // ─── Source files ───
+    if (arg[0] != '-' && is_source_file(arg))
+    {
+      cli_add_source(&cli, arg);
+      continue;
+    }
+
+    // ─── Object files and libraries (pass through) ───
+    if (arg[0] != '-')
+    {
+      // Could be .o file, .a file, etc. - pass to linker
+      cli_add_cc_arg(&cli, arg);
+      continue;
+    }
+
+    // ─── Everything else: pass through to CC ───
+    cli_add_cc_arg(&cli, arg);
+
+    // Handle space-separated args like -I dir
+    if (flag_needs_arg(arg) && i + 1 < argc && argv[i + 1][0] != '-')
+    {
+      cli_add_cc_arg(&cli, argv[++i]);
+    }
   }
 
-  if (arg_idx >= argc)
-    die("Missing source file.");
+  return cli;
+}
 
-  char *source = argv[arg_idx];
-  char flags[2048], output_path[512], transpiled[512];
+static void cli_free(Cli *cli)
+{
+  free(cli->sources);
+  free(cli->cc_args);
+}
 
-  // Generate secure transpiled filename using mkstemp()
+static char *create_temp_file(const char *source, char *buf, size_t bufsize)
+{
   char *basename_ptr = strrchr(source, '/');
 #ifdef _WIN32
   char *win_basename = strrchr(source, '\\');
@@ -3280,9 +3713,7 @@ int main(int argc, char **argv)
 #endif
 
   if (!basename_ptr)
-  {
-    snprintf(transpiled, sizeof(transpiled), ".%s.XXXXXX.c", source);
-  }
+    snprintf(buf, bufsize, ".%s.XXXXXX.c", source);
   else
   {
     char source_dir[512];
@@ -3292,209 +3723,257 @@ int main(int argc, char **argv)
     strncpy(source_dir, source, dir_len);
     source_dir[dir_len] = 0;
     basename_ptr++;
-    snprintf(transpiled, sizeof(transpiled), "%s/.%s.XXXXXX.c",
-             source_dir, basename_ptr);
+    snprintf(buf, bufsize, "%s/.%s.XXXXXX.c", source_dir, basename_ptr);
   }
 
-  // mkstemp requires template to end with XXXXXX, but we want .c extension
-  // So we use mkstemps() on systems that have it, or work around it
 #if defined(_WIN32)
-  // Windows: use _mktemp_s (less secure but portable)
-  if (_mktemp_s(transpiled, sizeof(transpiled)) != 0)
-    die("Failed to create temp filename.");
+  if (_mktemp_s(buf, bufsize) != 0)
+    return NULL;
 #elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
-  // POSIX: use mkstemps() if available (suffix length = 2 for ".c")
   {
-    int fd = mkstemps(transpiled, 2);
+    int fd = mkstemps(buf, 2);
     if (fd < 0)
-      die("Failed to create secure temp file.");
-    close(fd); // Close fd, we just need the unique filename
+      return NULL;
+    close(fd);
   }
 #else
-  // Fallback for systems without mkstemps (rare - most POSIX systems have it)
-  // NOTE: This has a small TOCTOU window between unlink and when transpile()
-  // creates the file. For truly paranoid security on exotic systems, implement
-  // a custom mkstemps equivalent. In practice, this fallback is almost never used.
   {
-    int fd = mkstemp(transpiled);
+    int fd = mkstemp(buf);
     if (fd < 0)
-      die("Failed to create secure temp file.");
-    // Immediately close and unlink - we just needed the unique name
+      return NULL;
     close(fd);
-    unlink(transpiled);
-    // Append .c extension to the unique name
-    size_t len = strlen(transpiled);
-    if (len + 2 < sizeof(transpiled))
+    unlink(buf);
+    size_t len = strlen(buf);
+    if (len + 2 < bufsize)
     {
-      transpiled[len] = '.';
-      transpiled[len + 1] = 'c';
-      transpiled[len + 2] = '\0';
+      buf[len] = '.';
+      buf[len + 1] = 'c';
+      buf[len + 2] = '\0';
     }
   }
 #endif
 
-  // Register cleanup handler and set pending temp file for cleanup on error
-  // Copy to static buffer to avoid pointing to stack memory
-  strncpy(pending_temp_file_buf, transpiled, sizeof(pending_temp_file_buf) - 1);
-  pending_temp_file_buf[sizeof(pending_temp_file_buf) - 1] = '\0';
-  pending_temp_file = pending_temp_file_buf;
-  atexit(cleanup_temp_file);
+  return buf;
+}
 
-  // Handle transpile-only mode
-  if (is_transpile_only)
+int main(int argc, char **argv)
+{
+  if (argc < 2)
   {
-    char *transpile_output = NULL;
-    if (arg_idx + 1 < argc && argv[arg_idx + 1][0] != '-')
-      transpile_output = argv[arg_idx + 1];
-
-    if (transpile_output)
-    {
-      printf("[prism] Transpiling %s -> %s\n", source, transpile_output);
-      if (!transpile(source, transpile_output))
-        die("Transpilation failed.");
-    }
-    else
-    {
-      // Transpile to temp file then output to stdout
-      if (!transpile(source, transpiled))
-        die("Transpilation failed.");
-      FILE *f = fopen(transpiled, "r");
-      if (!f)
-        die("Failed to read transpiled output.");
-      int c;
-      while ((c = fgetc(f)) != EOF)
-        putchar(c);
-      fclose(f);
-      remove(transpiled);
-      pending_temp_file = NULL;
-    }
+    print_help();
     return 0;
   }
 
-  // Transpile
-  printf("[prism] Transpiling %s...\n", source);
-  if (!transpile(source, transpiled))
-    die("Transpilation failed.");
+  Cli cli = cli_parse(argc, argv);
 
-  // Get compiler flags
-  get_flags(source, flags, mode);
-  char *compiler = get_compiler(arch, bits, platform);
-  int is_windows = !strcmp(platform, "windows");
-  char *custom_output = NULL;
+  // Set feature flags from CLI
+  feature_defer = cli.features.defer;
+  feature_zeroinit = cli.features.zeroinit;
+  emit_line_directives = cli.features.line_directives;
 
-  if (is_build_only && arg_idx + 1 < argc && argv[arg_idx + 1][0] != '-')
+  // Handle special modes
+  switch (cli.mode)
   {
-    custom_output = argv[arg_idx + 1];
-    arg_idx++;
-  }
+  case CLI_MODE_HELP:
+    print_help();
+    cli_free(&cli);
+    return 0;
 
-  if (is_build_only)
+  case CLI_MODE_VERSION:
+    printf("prism %s\n", PRISM_VERSION);
+    cli_free(&cli);
+    return 0;
+
+  case CLI_MODE_INSTALL:
+    cli_free(&cli);
+    return install(argv[0]);
+
+  case CLI_MODE_EMIT:
   {
-    if (custom_output)
+    if (cli.source_count == 0)
+      die("No source files specified");
+
+    for (int i = 0; i < cli.source_count; i++)
     {
-      snprintf(output_path, sizeof(output_path), "%s", custom_output);
-    }
-    else
-    {
-      snprintf(output_path, sizeof(output_path), "%s", source);
-      char *ext = strrchr(output_path, '.');
-      if (ext)
-        *ext = 0;
-      if (is_windows)
+      const char *source = cli.sources[i];
+
+      if (cli.output)
       {
-        size_t len = strlen(output_path);
-        if (len + 5 < sizeof(output_path)) // ".exe" + null
-          memcpy(output_path + len, ".exe", 5);
+        // Transpile to file
+        if (cli.verbose)
+          fprintf(stderr, "[prism] %s -> %s\n", source, cli.output);
+        if (!transpile((char *)source, (char *)cli.output))
+          die("Transpilation failed");
+      }
+      else
+      {
+        // Transpile to stdout
+        char temp[512];
+        if (!create_temp_file(source, temp, sizeof(temp)))
+          die("Failed to create temp file");
+
+        if (!transpile((char *)source, temp))
+        {
+          remove(temp);
+          die("Transpilation failed");
+        }
+
+        FILE *f = fopen(temp, "r");
+        if (f)
+        {
+          int c;
+          while ((c = fgetc(f)) != EOF)
+            putchar(c);
+          fclose(f);
+        }
+        remove(temp);
       }
     }
-    printf("[prism] Building %s (%s %d-bit %s)...\n", output_path, arch, bits, platform);
+    cli_free(&cli);
+    return 0;
   }
-  else
+
+  case CLI_MODE_COMPILE_ONLY:
+  case CLI_MODE_COMPILE_AND_LINK:
+  case CLI_MODE_RUN:
+    break; // Continue below
+  }
+
+  // Need at least one source
+  if (cli.source_count == 0)
+    die("No source files specified");
+
+  // Determine compiler
+  const char *compiler = cli.cc;
+  char *cross_cc = get_compiler_for_cross(cli.cross_arch, cli.cross_bits, cli.cross_platform);
+  if (cross_cc)
+    compiler = cross_cc;
+
+  // Transpile all sources to temp files
+  char **temp_files = calloc(cli.source_count, sizeof(char *));
+  if (!temp_files)
+    die("Out of memory");
+
+  for (int i = 0; i < cli.source_count; i++)
   {
-    // Secure temp file for output binary
-    snprintf(output_path, sizeof(output_path), "%sprism_out.XXXXXX", TMP);
-#if defined(_WIN32)
-    if (_mktemp_s(output_path, sizeof(output_path)) != 0)
-      die("Failed to create temp output filename.");
-#else
+    temp_files[i] = malloc(512);
+    if (!temp_files[i])
+      die("Out of memory");
+
+    if (!create_temp_file(cli.sources[i], temp_files[i], 512))
     {
-      int fd = mkstemp(output_path);
-      if (fd < 0)
-        die("Failed to create secure temp output file.");
-      close(fd);
+      for (int j = 0; j < i; j++)
+      {
+        remove(temp_files[j]);
+        free(temp_files[j]);
+      }
+      free(temp_files);
+      die("Failed to create temp file");
     }
+
+    if (cli.verbose)
+      fprintf(stderr, "[prism] Transpiling %s -> %s\n", cli.sources[i], temp_files[i]);
+
+    if (!transpile((char *)cli.sources[i], temp_files[i]))
+    {
+      for (int j = 0; j <= i; j++)
+      {
+        remove(temp_files[j]);
+        free(temp_files[j]);
+      }
+      free(temp_files);
+      die("Transpilation failed");
+    }
+  }
+
+  // For RUN mode, compile to temp executable
+  char temp_exe[512] = {0};
+  if (cli.mode == CLI_MODE_RUN)
+  {
+    snprintf(temp_exe, sizeof(temp_exe), "%sprism_run.XXXXXX", TMP_DIR);
+#if defined(_WIN32)
+    _mktemp_s(temp_exe, sizeof(temp_exe));
+    strcat(temp_exe, ".exe");
+#else
+    int fd = mkstemp(temp_exe);
+    if (fd >= 0)
+      close(fd);
 #endif
   }
 
-  // Build argument array for compilation (no shell escaping needed with execvp!)
-  ArgvBuilder compile_ab;
-  argv_builder_init(&compile_ab);
+  // Build compiler command
+  ArgvBuilder ab;
+  argv_builder_init(&ab);
 
-  if (!argv_builder_add(&compile_ab, compiler) ||
-      !argv_builder_add(&compile_ab, transpiled) ||
-      !argv_builder_add(&compile_ab, "-o") ||
-      !argv_builder_add(&compile_ab, output_path))
+  argv_builder_add(&ab, compiler);
+
+  // Add transpiled sources
+  for (int i = 0; i < cli.source_count; i++)
+    argv_builder_add(&ab, temp_files[i]);
+
+  // Add pass-through args
+  for (int i = 0; i < cli.cc_arg_count; i++)
+    argv_builder_add(&ab, cli.cc_args[i]);
+
+  // Add -c for compile-only mode
+  if (cli.mode == CLI_MODE_COMPILE_ONLY)
+    argv_builder_add(&ab, "-c");
+
+  // Add output
+  if (cli.mode == CLI_MODE_RUN)
   {
-    free_argv(compile_ab.data);
-    die("Memory allocation failed.");
+    argv_builder_add(&ab, "-o");
+    argv_builder_add(&ab, temp_exe);
+  }
+  else if (cli.output)
+  {
+    argv_builder_add(&ab, "-o");
+    argv_builder_add(&ab, cli.output);
+  }
+  // GCC-compatible: no -o means output to a.out (handled by CC)
+
+  char **compile_argv = argv_builder_finish(&ab);
+
+  if (cli.verbose)
+  {
+    fprintf(stderr, "[prism] ");
+    for (int i = 0; compile_argv[i]; i++)
+      fprintf(stderr, "%s ", compile_argv[i]);
+    fprintf(stderr, "\n");
   }
 
-  // Append flags
-  if (!argv_builder_append_flags(&compile_ab, flags))
-  {
-    free_argv(compile_ab.data);
-    die("Memory allocation failed.");
-  }
-
-  char **compile_argv = argv_builder_finish(&compile_ab);
-  int compile_status = run_command(compile_argv);
+  int status = run_command(compile_argv);
   free_argv(compile_argv);
 
-  if (compile_status != 0)
+  // Cleanup temp source files
+  for (int i = 0; i < cli.source_count; i++)
   {
-    remove(transpiled);
-    pending_temp_file = NULL;
-    die("Compilation failed.");
+    remove(temp_files[i]);
+    free(temp_files[i]);
+  }
+  free(temp_files);
+
+  if (status != 0)
+  {
+    if (cli.mode == CLI_MODE_RUN && temp_exe[0])
+      remove(temp_exe);
+    cli_free(&cli);
+    return status;
   }
 
-  if (!is_build_only)
+  // RUN mode: execute the compiled binary
+  if (cli.mode == CLI_MODE_RUN)
   {
-    // Build argument array for execution
-    int run_argc = 0;
-    int max_run_args = argc - arg_idx + 1; // output + remaining args + NULL
-    char **run_argv = calloc(max_run_args + 1, sizeof(char *));
-    if (!run_argv)
-      die("Memory allocation failed.");
-
-    run_argv[run_argc++] = strdup(output_path);
-    if (!run_argv[0])
-    {
-      free(run_argv);
-      die("Memory allocation failed.");
-    }
-
-    // Add user arguments
-    for (int j = arg_idx + 1; j < argc; j++)
-    {
-      run_argv[run_argc] = strdup(argv[j]);
-      if (!run_argv[run_argc])
-      {
-        free_argv(run_argv);
-        die("Memory allocation failed.");
-      }
-      run_argc++;
-    }
-    run_argv[run_argc] = NULL;
-
-    int run_status = run_command(run_argv);
+    char **run_argv = build_argv(temp_exe, NULL);
+    if (cli.verbose)
+      fprintf(stderr, "[prism] Running %s\n", temp_exe);
+    status = run_command(run_argv);
     free_argv(run_argv);
-    remove(output_path);
-    remove(transpiled);
-    pending_temp_file = NULL;
-    exit(run_status);
+    remove(temp_exe);
   }
 
-  remove(transpiled);
-  pending_temp_file = NULL;
-  return 0;
+  cli_free(&cli);
+  return status;
 }
+
+#endif // PRISM_LIB_MODE

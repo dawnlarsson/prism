@@ -6,7 +6,7 @@ Prism is a lightweight, self-contained transpiler that brings modern language fe
 
 * **Stability First:** Focused on foundational correctness, testing, and verification of edge cases.
 * **Opt out dialect features** Disable parts of the transpiler, like zero-init, with CLI flags.
-* **Build tool** Work-in-progress build tool features—no need for Makefiles for simpler C programs (with support for larger setups planned for the future).
+* **Drop-in overlay:** Use `CC=prism` in any build system — GCC-compatible flags pass through automatically.
 
 Prism is a propper transpiler, not a preprocessor macro.
 * **Track Types:** It parses `typedef`s to distinguish pointer declarations from multiplication (the "lexer hack"), ensuring correct zero-initialization.
@@ -23,6 +23,11 @@ cc prism.c -flto -s -O3 -o /tmp/prism && /tmp/prism install && rm /tmp/prism
 ## Defer
 Scope-based resource management. Statements execute in LIFO order upon scope exit, including `return`, `break`, `continue`, and `goto`.
 
+`defer` is robust against complex control flow. It correctly injects cleanup code before:
+* `return` (including void and value returns)
+* `break` / `continue` (handles loops and switches correctly)
+* `goto` (unwinds scopes properly)
+
 ```c
 void example() {
     FILE *f = fopen("file.txt", "r");
@@ -35,7 +40,9 @@ void example() {
 }
 ```
 
-**Opt-out** `prism src.c no-defer`
+*Note: Defer is explicitly forbidden in functions using `setjmp`/`longjmp` or computed gotos to prevent resource leaks.*
+
+**Opt-out:** `prism -fno-defer src.c`
 
 ## Zero-Init
 Local variables are automatically zero-initialized.
@@ -54,7 +61,7 @@ void example() {
 
 Works with: primitives, pointers, arrays, structs, unions, enums, and user-defined typedefs (including from headers like `uint8_t`, `size_t`, `FILE*`, `pthread_mutex_t`, etc).
 
-**Opt-out** `prism src.c no-zeroinit`
+**Opt-out:** `prism -fno-zeroinit src.c`
 
 ## Raw
 Skip zero-initialization for a specific variable using the `raw` keyword.
@@ -85,44 +92,84 @@ skip:
 // Error: goto 'skip' would skip over variable declaration 'x'
 ```
 
-### Control Flow Integrity
-Prism's `defer` is robust against complex control flow. It correctly injects cleanup code before:
-* `return` (including void and value returns)
-* `break` / `continue` (handles loops and switches correctly)
-* `goto` (unwinds scopes properly)
-
-*Note: Defer is explicitly forbidden in functions using `setjmp`/`longjmp` or computed gotos to prevent resource leaks.*
 
 ## CLI
 
+Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
+
 ```sh
-Prism v0.42.0
+Prism v0.55.0 - C transpiler
 
-Usage: prism [options] src.c [output] [args]
+Usage: prism [options] source.c... [-o output]
 
-Options:
-  install               Install prism as a global cli tool
-  build                 Build only, dont run
-  transpile             Transpile only, output to stdout or file
-  debug/release/small   Optimization mode
-  arm/x86               Architecture (default: native)
-  32/64                 Word size (default: 64)
-  linux/windows/macos   Platform (default: native)
-  no-defer              Disable defer feature
-  no-zeroinit           Disable zero-initialization
+GCC-Compatible Options:
+  -c                    Compile only, don't link
+  -o <file>             Output file
+  -O0/-O1/-O2/-O3/-Os   Optimization level (passed to CC)
+  -g                    Debug info (passed to CC)
+  -W...                 Warnings (passed to CC)
+  -I/-D/-U/-L/-l        Include/define/lib flags (passed to CC)
+  -std=...              Language standard (passed to CC)
+
+Prism Options:
+  -fno-defer            Disable defer feature
+  -fno-zeroinit         Disable zero-initialization
+  --prism-cc=<compiler> Use specific compiler (default: $CC or cc)
+  --prism-verbose       Show transpile and compile commands
+
+Commands:
+  run <src.c>           Transpile, compile, and execute
+  transpile <src.c>     Output transpiled C to stdout
+  install               Install prism to /usr/local/bin/prism
+  --help, -h            Show this help
+  --version, -v         Show version
+
+Environment:
+  CC                    C compiler to use (default: cc)
+  PRISM_CC              Override CC for prism specifically
 
 Examples:
-  prism src.c                   Run src.c
-  prism build src.c             Build src
-  prism build src.c out         Build to 'out'
-  prism build arm src.c         Build for arm64 linux
-  prism transpile src.c         Transpile to stdout
-  prism transpile src.c out.c   Transpile to out.c
-  prism no-defer src.c          Run without defer
+  prism foo.c                      Compile to a.out (GCC-compatible)
+  prism foo.c -o foo               Compile to 'foo'
+  prism run foo.c                  Compile and run immediately
+  prism transpile foo.c            Output transpiled C
+  prism transpile foo.c -o out.c   Transpile to file
+  prism -c foo.c -o foo.o          Compile to object file
+  prism -O2 -Wall foo.c -o foo     With optimization and warnings
+  CC=clang prism foo.c             Use clang as backend
 
 Apache 2.0 license (c) Dawn Larsson 2026
-https://github.com/dawnlarsson/prism 
+https://github.com/dawnlarsson/prism
+```
 
+### Drop-in Compiler Overlay
+
+Prism can replace `gcc` or `clang` in any build system:
+
+```sh
+# Instead of:
+CC=gcc make
+
+# Use:
+CC=prism make
+```
+
+All standard compiler flags (`-O2`, `-Wall`, `-I`, `-L`, `-l`, etc.) pass through automatically to the backend compiler.
+
+## Library Mode
+
+Prism can be compiled as a library for embedding in other tools:
+
+```sh
+# Compile as library (excludes CLI)
+cc -DPRISM_LIB_MODE -c prism.c -o prism.o
+```
+
+API:
+```c
+PrismFeatures prism_defaults(void);
+PrismResult   prism_transpile_file(const char *path, PrismFeatures features);
+void          prism_free(PrismResult *r);
 ```
 
 # parse.c
