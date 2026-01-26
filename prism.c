@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.56.0"
+#define PRISM_VERSION "0.57.0"
 
 #include "parse.c"
 
@@ -1598,6 +1598,21 @@ static bool is_skip_decl_keyword(Token *tok)
   return equal(tok, "extern") || equal(tok, "typedef") || equal(tok, "static");
 }
 
+// Check if an identifier looks like a system/standard typedef name
+// These are commonly used in constant expressions (sizeof, casts)
+static bool looks_like_system_typedef(Token *tok)
+{
+  if (tok->kind != TK_IDENT)
+    return false;
+  // Common pattern: ends with _t (size_t, time_t, rlim_t, etc.)
+  if (tok->len >= 3 && tok->loc[tok->len - 2] == '_' && tok->loc[tok->len - 1] == 't')
+    return true;
+  // Common pattern: starts with __ (glibc internal types like __rlim_t)
+  if (tok->len >= 2 && tok->loc[0] == '_' && tok->loc[1] == '_')
+    return true;
+  return false;
+}
+
 // Check if array size is a compile-time constant (not a VLA)
 static bool is_const_array_size(Token *open_bracket)
 {
@@ -1615,15 +1630,49 @@ static bool is_const_array_size(Token *open_bracket)
     else
     {
       is_empty = false;
-      // Allow numeric literals, sizeof, _Alignof, and basic operators
-      if (tok->kind != TK_NUM && !equal(tok, "sizeof") &&
-          !equal(tok, "_Alignof") && !equal(tok, "alignof") &&
-          !equal(tok, "+") && !equal(tok, "-") && !equal(tok, "*") &&
-          !equal(tok, "/") && !equal(tok, "(") && !equal(tok, ")"))
+      // sizeof and _Alignof/alignof always produce compile-time constants,
+      // regardless of their argument (type name or expression).
+      // Skip their parenthesized argument entirely.
+      if (equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof"))
       {
-        // Identifiers are only allowed if they're known enum constants
-        if (tok->kind == TK_IDENT && !is_known_enum_const(tok))
+        tok = tok->next;
+        if (tok && equal(tok, "("))
+        {
+          int paren_depth = 1;
+          tok = tok->next;
+          while (tok->kind != TK_EOF && paren_depth > 0)
+          {
+            if (equal(tok, "("))
+              paren_depth++;
+            else if (equal(tok, ")"))
+              paren_depth--;
+            tok = tok->next;
+          }
+        }
+        continue;
+      }
+      // Allow numeric literals and basic operators
+      if (tok->kind != TK_NUM &&
+          !equal(tok, "+") && !equal(tok, "-") && !equal(tok, "*") &&
+          !equal(tok, "/") && !equal(tok, "%") && !equal(tok, "(") && !equal(tok, ")") &&
+          !equal(tok, "<<") && !equal(tok, ">>") && !equal(tok, "&") &&
+          !equal(tok, "|") && !equal(tok, "^") && !equal(tok, "~") &&
+          !equal(tok, "!") && !equal(tok, "<") && !equal(tok, ">") &&
+          !equal(tok, "<=") && !equal(tok, ">=") && !equal(tok, "==") &&
+          !equal(tok, "!=") && !equal(tok, "&&") && !equal(tok, "||") &&
+          !equal(tok, "?") && !equal(tok, ":"))
+      {
+        // Identifiers are only allowed if they're:
+        // - Known enum constants (compile-time constants)
+        // - Known typedefs (used in casts like (MyType)0)
+        // - Type keywords (used in casts like (int)0)
+        // - System typedefs (names ending in _t, like rlim_t, size_t)
+        if (tok->kind == TK_IDENT && !is_known_enum_const(tok) &&
+            !is_known_typedef(tok) && !is_type_keyword(tok) &&
+            !looks_like_system_typedef(tok))
+        {
           has_only_literals = false;
+        }
       }
     }
     tok = tok->next;

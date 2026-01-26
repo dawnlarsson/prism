@@ -2725,6 +2725,122 @@ void test_extremely_complex_declarator(void)
     CHECK(super_complex == NULL, "extremely complex declarator - zero-init");
 }
 
+// SECTION: SIZEOF AND COMPLEX CONSTANT EXPRESSION TESTS
+
+// Simulate the INT_STRLEN_BOUND macro
+#define TYPE_SIGNED_TEST(t) (!((t)0 < (t) - 1))
+#define TYPE_WIDTH_TEST(t) (sizeof(t) * 8)
+#define INT_STRLEN_BOUND_TEST(t) \
+    ((TYPE_WIDTH_TEST(t) - TYPE_SIGNED_TEST(t)) * 302 / 1000 + 1 + TYPE_SIGNED_TEST(t))
+
+typedef long long test_rlim_t;
+typedef unsigned long test_size_t;
+
+void test_sizeof_in_array_bound(void)
+{
+    // Basic sizeof - should not be detected as VLA
+    char buf1[sizeof(int)];
+    CHECK(buf1[0] == 0, "sizeof(int) array bound - zero-init");
+
+    // sizeof with typedef - should not be detected as VLA
+    char buf2[sizeof(test_rlim_t)];
+    CHECK(buf2[0] == 0, "sizeof(typedef) array bound - zero-init");
+
+    // sizeof expression with multiplication
+    char buf3[sizeof(int) * 8];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(int) * 8; i++)
+        if (buf3[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof*8 array bound - zero-init");
+}
+
+void test_cast_expression_in_array_bound(void)
+{
+    // Cast with built-in type - constant expression
+    char buf1[(int)4 + 1];
+    CHECK(buf1[0] == 0, "cast with int array bound - zero-init");
+
+    // TYPE_SIGNED pattern: (! ((type) 0 < (type) -1))
+    // This expands to a constant expression using casts
+    char buf2[TYPE_SIGNED_TEST(int) + 1];
+    CHECK(buf2[0] == 0, "TYPE_SIGNED(int) array bound - zero-init");
+
+    // TYPE_SIGNED with typedef - the key regression case
+    char buf3[TYPE_SIGNED_TEST(test_rlim_t) + 1];
+    CHECK(buf3[0] == 0, "TYPE_SIGNED(typedef) array bound - zero-init");
+}
+
+void test_complex_macro_array_bound(void)
+{
+    // Full INT_STRLEN_BOUND pattern - the original failing case
+    char buf1[INT_STRLEN_BOUND_TEST(int) + 1];
+    CHECK(buf1[0] == 0, "INT_STRLEN_BOUND(int) array bound - zero-init");
+
+    // With typedef - this was the exact pattern that failed in bash
+    char buf2[INT_STRLEN_BOUND_TEST(test_rlim_t) + 1];
+    CHECK(buf2[0] == 0, "INT_STRLEN_BOUND(typedef) array bound - zero-init");
+
+    // With system-like typedef name (ends in _t)
+    char buf3[INT_STRLEN_BOUND_TEST(test_size_t) + 1];
+    CHECK(buf3[0] == 0, "INT_STRLEN_BOUND(size_t-like) array bound - zero-init");
+}
+
+void test_system_typedef_pattern(void)
+{
+    // Names ending in _t should be recognized as likely system typedefs
+    // and allowed in constant expressions (for casts)
+    typedef int my_custom_t;
+    char buf1[(my_custom_t)10];
+    int all_zero = 1;
+    for (int i = 0; i < 10; i++)
+        if (buf1[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "custom _t typedef in cast - zero-init");
+}
+
+void test_alignof_in_array_bound(void)
+{
+    // _Alignof should also be recognized as constant
+    char buf1[_Alignof(int) + 1];
+    CHECK(buf1[0] == 0, "_Alignof array bound - zero-init");
+
+    char buf2[_Alignof(test_rlim_t)];
+    CHECK(buf2[0] == 0, "_Alignof(typedef) array bound - zero-init");
+}
+
+void test_complex_operators_in_array_bound(void)
+{
+    // Bitwise operators in constant expressions
+    char buf1[(sizeof(int) << 1)];
+    CHECK(buf1[0] == 0, "sizeof << 1 array bound - zero-init");
+
+    // Comparison operators (result is 0 or 1)
+    char buf2[(sizeof(int) >= 4) + 1];
+    CHECK(buf2[0] == 0, "comparison in array bound - zero-init");
+
+    // Ternary operator
+    char buf3[(sizeof(int) > 2 ? 8 : 4)];
+    CHECK(buf3[0] == 0, "ternary in array bound - zero-init");
+
+    // Logical operators
+    char buf4[(sizeof(int) && sizeof(char)) + 1];
+    CHECK(buf4[0] == 0, "logical && in array bound - zero-init");
+}
+
+void run_sizeof_constexpr_tests(void)
+{
+    printf("\n=== SIZEOF AND CONSTANT EXPRESSION TESTS ===\n");
+    printf("(Regression tests for VLA false-positive detection)\n\n");
+
+    test_sizeof_in_array_bound();
+    test_cast_expression_in_array_bound();
+    test_complex_macro_array_bound();
+    test_system_typedef_pattern();
+    test_alignof_in_array_bound();
+    test_complex_operators_in_array_bound();
+}
+
 void run_silent_failure_tests(void)
 {
     printf("\n=== SILENT FAILURE DETECTION TESTS ===\n");
@@ -2767,6 +2883,7 @@ int main(void)
     run_case_label_tests();
     run_rigor_tests();
     run_silent_failure_tests();
+    run_sizeof_constexpr_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);
