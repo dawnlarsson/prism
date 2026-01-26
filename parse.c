@@ -257,13 +257,13 @@ static const char *feature_test_macro_names[] = {
     "__STDC_WANT_IEC_60559_DFP_EXT__",
     "__STDC_WANT_IEC_60559_FUNCS_EXT__",
     "__STDC_WANT_IEC_60559_TYPES_EXT__",
-    NULL
-};
+    NULL};
 
 // Storage for feature test macros found in user code
-typedef struct {
+typedef struct
+{
     char *name;
-    char *value;  // The macro value (or "1" if no value)
+    char *value; // The macro value (or "1" if no value)
 } FeatureTestMacro;
 
 #define MAX_FEATURE_TEST_MACROS 32
@@ -291,7 +291,7 @@ static void record_feature_test_macro(const char *name, int name_len, Token *bod
     {
         if (strlen(feature_test_macros[i].name) == (size_t)name_len &&
             strncmp(feature_test_macros[i].name, name, name_len) == 0)
-            return;  // Already recorded
+            return; // Already recorded
     }
 
     // Get the value from the body tokens
@@ -3160,6 +3160,11 @@ void pp_init(void)
     pp_define_macro("unix", "1");
     pp_define_macro("__gnu_linux__", "1");
     pp_define_macro("__ELF__", "1");
+    // POSIX version - needed for headers that check _POSIX_VERSION
+    // 200809L = POSIX.1-2008, which is what modern Linux/glibc provides
+    pp_define_macro("_POSIX_VERSION", "200809L");
+    pp_define_macro("_POSIX_C_SOURCE", "200809L");
+    pp_define_macro("_XOPEN_SOURCE", "700");
 #elif defined(__APPLE__)
     pp_define_macro("__APPLE__", "1");
     pp_define_macro("__MACH__", "1");

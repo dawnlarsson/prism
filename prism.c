@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.60.0"
+#define PRISM_VERSION "0.62.0"
 
 #include "parse.c"
 
@@ -1595,7 +1595,19 @@ static bool is_type_qualifier(Token *tok)
 
 static bool is_skip_decl_keyword(Token *tok)
 {
-  return equal(tok, "extern") || equal(tok, "typedef") || equal(tok, "static");
+  // Storage class specifiers that prism shouldn't zero-init
+  if (equal(tok, "extern") || equal(tok, "typedef") || equal(tok, "static"))
+    return true;
+  // Expression keywords that cannot start a declaration
+  if (equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof") ||
+      equal(tok, "_Generic") || equal(tok, "return") || equal(tok, "if") ||
+      equal(tok, "else") || equal(tok, "while") || equal(tok, "for") ||
+      equal(tok, "do") || equal(tok, "switch") || equal(tok, "case") ||
+      equal(tok, "default") || equal(tok, "break") || equal(tok, "continue") ||
+      equal(tok, "goto") || equal(tok, "asm") || equal(tok, "__asm__") ||
+      equal(tok, "__asm"))
+    return true;
+  return false;
 }
 
 // Check if an identifier looks like a system/standard typedef name
@@ -2192,6 +2204,7 @@ static Token *try_zero_init_decl(Token *tok)
 
     // VLAs cannot be initialized - this is a hard error, no bypass allowed
     // C syntax doesn't allow `int arr[n] = {0};` so VLAs break safety guarantees
+    /* // todo make this "strict" mode, intended for prism only codebases
     if (effective_vla && !has_init)
     {
       error_tok(var_name, "VLA '%.*s' cannot be zero-initialized (C language limitation). "
@@ -2200,6 +2213,7 @@ static Token *try_zero_init_decl(Token *tok)
                           "(4) Use 'prism no-zeroinit' to disable zero-init globally.",
                 var_name->len, var_name->loc);
     }
+    */
 
     // Add zero initializer if no existing initializer, not a VLA, and not raw
     if (!has_init && !effective_vla && !is_raw)
