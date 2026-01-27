@@ -98,12 +98,12 @@ skip:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v0.55.0 - C transpiler
+Prism v0.68.0 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 
 GCC-Compatible Options:
-  -c                    Compile only, don't link
+  -c                    Compile only, dont link
   -o <file>             Output file
   -O0/-O1/-O2/-O3/-Os   Optimization level (passed to CC)
   -g                    Debug info (passed to CC)

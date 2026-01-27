@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.67.0"
+#define PRISM_VERSION "0.68.0"
 
 #include "parse.c"
 
@@ -2472,6 +2472,12 @@ static int transpile(char *input_file, char *output_file)
 
   // Process forced includes (-include files) first
   // These define macros that the main file may depend on (e.g., config.h with HAVE_*)
+  // We must preserve the preprocessed tokens (not just macros) because force-includes
+  // may contain declarations (e.g., extern int optreset;) that are protected by include
+  // guards. If we discard them, and the main file later #includes the same file,
+  // the include guard macro is already defined so the declarations are skipped.
+  Token *force_include_tokens = NULL;
+  Token *force_include_tail = NULL;
   for (int i = 0; i < extra_force_include_count; i++)
   {
     Token *inc_tok = tokenize_file((char *)extra_force_includes[i]);
@@ -2480,8 +2486,24 @@ static int transpile(char *input_file, char *output_file)
       fprintf(stderr, "Failed to open forced include: %s\n", extra_force_includes[i]);
       return 0;
     }
-    // Preprocess the forced include to extract macros (result is discarded)
-    preprocess(inc_tok);
+    // Preprocess the forced include
+    Token *pp_tok = preprocess(inc_tok);
+    // Append to our list (skip the final EOF token)
+    for (Token *t = pp_tok; t && t->kind != TK_EOF; t = t->next)
+    {
+      Token *copy = copy_token(t);
+      copy->next = NULL;
+      if (!force_include_tokens)
+      {
+        force_include_tokens = copy;
+        force_include_tail = copy;
+      }
+      else
+      {
+        force_include_tail->next = copy;
+        force_include_tail = copy;
+      }
+    }
   }
 
   Token *tok = tokenize_file(input_file);
@@ -2520,6 +2542,19 @@ static int transpile(char *input_file, char *output_file)
     fprintf(out, "#ifndef __getopt_argv_const\n");
     fprintf(out, "#define __getopt_argv_const const\n");
     fprintf(out, "#endif\n");
+  }
+
+  // Emit force-include tokens before the main file
+  // These contain declarations (extern, typedef, etc.) that the main file may depend on
+  if (force_include_tokens)
+  {
+    for (Token *t = force_include_tokens; t; t = t->next)
+    {
+      emit_tok(t);
+    }
+    // Ensure we start on a new line after force-includes
+    fprintf(out, "\n");
+    last_emitted = NULL; // Reset so main file starts fresh
   }
 
   // Reset state
@@ -3871,7 +3906,7 @@ static void print_help(void)
       "Prism v%s - Robust C transpiler\n\n"
       "Usage: prism [options] source.c... [-o output]\n\n"
       "GCC-Compatible Options:\n"
-      "  -c                    Compile only, don't link\n"
+      "  -c                    Compile only, dont link\n"
       "  -o <file>             Output file\n"
       "  -O0/-O1/-O2/-O3/-Os   Optimization level (passed to CC)\n"
       "  -g                    Debug info (passed to CC)\n"

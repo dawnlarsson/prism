@@ -3073,6 +3073,103 @@ static void pp_define_full(char *def)
     read_macro_definition(&tok, tok);
 }
 
+// Extract predefined macros from the system compiler
+static int pp_import_system_macros(void)
+{
+    // Run the system compiler to get predefined macros
+    // Include features.h to get library-defined macros like __GLIBC__
+#if defined(__linux__)
+    FILE *fp = popen("echo '#include <features.h>' | cc -dM -E - 2>/dev/null", "r");
+#elif defined(__APPLE__)
+    FILE *fp = popen("echo '#include <sys/cdefs.h>' | cc -dM -E - 2>/dev/null", "r");
+#else
+    FILE *fp = popen("cc -dM -E - < /dev/null 2>/dev/null", "r");
+#endif
+    if (!fp)
+        return -1;
+
+    char line[4096];
+    int count = 0;
+
+    while (fgets(line, sizeof(line), fp))
+    {
+        // Each line is: #define NAME VALUE
+        // or: #define NAME(args) VALUE
+        if (strncmp(line, "#define ", 8) != 0)
+            continue;
+
+        char *start = line + 8; // Skip "#define "
+
+        // Find end of macro name (space, '(', or newline)
+        char *end = start;
+        while (*end && *end != ' ' && *end != '(' && *end != '\n' && *end != '\r')
+            end++;
+
+        if (end == start)
+            continue; // Empty name
+
+        int name_len = end - start;
+
+        // Skip certain problematic macros that we handle specially
+        // or that would cause issues
+        if ((name_len == 8 && strncmp(start, "__FILE__", 8) == 0) ||
+            (name_len == 8 && strncmp(start, "__LINE__", 8) == 0) ||
+            (name_len == 11 && strncmp(start, "__COUNTER__", 11) == 0) ||
+            (name_len == 8 && strncmp(start, "__DATE__", 8) == 0) ||
+            (name_len == 8 && strncmp(start, "__TIME__", 8) == 0) ||
+            (name_len == 13 && strncmp(start, "__TIMESTAMP__", 13) == 0) ||
+            (name_len == 13 && strncmp(start, "__BASE_FILE__", 13) == 0))
+            continue;
+
+        // For function-like macros (has '('), use pp_define_full
+        // For object-like macros, use pp_define_macro
+        if (*end == '(')
+        {
+            // Find the full definition (remove trailing newline)
+            char *nl = strchr(start, '\n');
+            if (nl)
+                *nl = '\0';
+            nl = strchr(start, '\r');
+            if (nl)
+                *nl = '\0';
+
+            pp_define_full(start);
+        }
+        else
+        {
+            // Object-like macro
+            char name[256];
+            if (name_len >= (int)sizeof(name))
+                continue;
+            memcpy(name, start, name_len);
+            name[name_len] = '\0';
+
+            // Get value (skip space after name)
+            char *value = end;
+            while (*value == ' ' || *value == '\t')
+                value++;
+
+            // Remove trailing newline
+            char *nl = strchr(value, '\n');
+            if (nl)
+                *nl = '\0';
+            nl = strchr(value, '\r');
+            if (nl)
+                *nl = '\0';
+
+            // Empty value means define as empty string
+            if (*value == '\0')
+                pp_define_macro(strdup(name), "");
+            else
+                pp_define_macro(strdup(name), strdup(value));
+        }
+        count++;
+    }
+
+    pclose(fp);
+    return count;
+}
+
 // Reset preprocessor state - call before processing a new file to avoid state leakage
 void pp_reset(void)
 {
@@ -3088,150 +3185,56 @@ void pp_init(void)
     // Reset any existing state first
     pp_reset();
 
+    int imported = pp_import_system_macros();
+    (void)imported; // May be -1 if compiler not found, we'll use fallbacks
+
     add_builtin("__FILE__", file_macro);
     add_builtin("__LINE__", line_macro);
 
-    pp_define_macro("__STDC__", "1");
-    pp_define_macro("__STDC_VERSION__", "201112L");
-    pp_define_macro("__STDC_HOSTED__", "1");
-    pp_define_macro("__STDC_UTF_16__", "1");
-    pp_define_macro("__STDC_UTF_32__", "1");
+    if (!hashmap_get(&macros, "__STDC__"))
+        pp_define_macro("__STDC__", "1");
+    if (!hashmap_get(&macros, "__STDC_VERSION__"))
+        pp_define_macro("__STDC_VERSION__", "201112L");
+    if (!hashmap_get(&macros, "__STDC_HOSTED__"))
+        pp_define_macro("__STDC_HOSTED__", "1");
 
-    // Common predefined macros
-    pp_define_macro("__LP64__", "1");
-    pp_define_macro("__SIZEOF_POINTER__", "8");
-    pp_define_macro("__SIZEOF_LONG__", "8");
-    pp_define_macro("__SIZEOF_INT__", "4");
-    pp_define_macro("__SIZEOF_SHORT__", "2");
-    pp_define_macro("__SIZEOF_FLOAT__", "4");
-    pp_define_macro("__SIZEOF_DOUBLE__", "8");
-    pp_define_macro("__SIZEOF_LONG_DOUBLE__", "16");
-    pp_define_macro("__SIZEOF_LONG_LONG__", "8");
-    pp_define_macro("__SIZEOF_SIZE_T__", "8");
-    pp_define_macro("__SIZEOF_PTRDIFF_T__", "8");
-    pp_define_macro("__SIZEOF_WCHAR_T__", "4");
-    pp_define_macro("__SIZEOF_WINT_T__", "4");
-
-    // GCC compatibility - critical for glibc headers
-    // Use GCC 13+ to avoid _Float32 typedef conflicts (they're compiler built-ins in modern GCC)
-    pp_define_macro("__GNUC__", "13");
-    pp_define_macro("__GNUC_MINOR__", "0");
-    pp_define_macro("__GNUC_PATCHLEVEL__", "0");
-    pp_define_macro("__GNUC_STDC_INLINE__", "1");
-    // GCC version checking macro (used by many headers)
-    pp_define_full("__GNUC_PREREQ(maj,min) ((__GNUC__ << 16) + __GNUC_MINOR__ >= ((maj) << 16) + (min))");
-
-#ifdef __APPLE__
-    // On Apple, also define clang macros since headers may check for them
-    pp_define_macro("__clang__", "1");
-    pp_define_macro("__clang_major__", "15");
-    pp_define_macro("__clang_minor__", "0");
-    pp_define_macro("__clang_patchlevel__", "0");
-    pp_define_macro("__apple_build_version__", "15000000");
-#endif
-
-    // GNU C extensions - just make them empty/passthrough
     pp_define_macro("__extension__", "");
-    pp_define_macro("__inline", "inline");
-    pp_define_macro("__inline__", "inline");
-    pp_define_macro("__signed__", "signed");
-    pp_define_macro("__const", "const");
-    pp_define_macro("__const__", "const");
-    pp_define_macro("__volatile__", "volatile");
-    pp_define_macro("__asm__", "asm");
-    pp_define_macro("__asm", "asm");
-    pp_define_macro("__typeof__", "typeof");
 
-    // Clang/GCC feature detection macros (function-like)
-    // These return 0 to disable feature detection - safe fallback
     pp_define_full("__has_feature(x) 0");
     pp_define_full("__has_extension(x) 0");
     pp_define_full("__has_builtin(x) 0");
     pp_define_full("__has_attribute(x) 0");
     pp_define_full("__has_warning(x) 0");
     pp_define_full("__has_c_attribute(x) 0");
-    // __has_include is handled specially in read_const_expr - don't define it here
     pp_define_full("__building_module(x) 0");
 
-    // Byte order
-    pp_define_macro("__BYTE_ORDER__", "1234");
-    pp_define_macro("__ORDER_LITTLE_ENDIAN__", "1234");
-    pp_define_macro("__ORDER_BIG_ENDIAN__", "4321");
-
-    // Char signedness
-    pp_define_macro("__CHAR_BIT__", "8");
-    pp_define_macro("__SCHAR_MAX__", "127");
-    pp_define_macro("__SHRT_MAX__", "32767");
-    pp_define_macro("__INT_MAX__", "2147483647");
-    pp_define_macro("__LONG_MAX__", "9223372036854775807L");
-    pp_define_macro("__LONG_LONG_MAX__", "9223372036854775807LL");
-
-    // Standard C limits (needed for #if expressions in headers like typemax.h)
-    // These prevent headers from defining them with complex expressions that
-    // use casts, which preprocessor constant expressions can't handle.
-    pp_define_macro("CHAR_BIT", "8");
-    pp_define_macro("SCHAR_MIN", "(-128)");
-    pp_define_macro("SCHAR_MAX", "127");
-    pp_define_macro("UCHAR_MAX", "255");
-    pp_define_macro("CHAR_MIN", "(-128)");
-    pp_define_macro("CHAR_MAX", "127");
-    pp_define_macro("SHRT_MIN", "(-32768)");
-    pp_define_macro("SHRT_MAX", "32767");
-    pp_define_macro("USHRT_MAX", "65535");
-    pp_define_macro("INT_MIN", "(-2147483647-1)");
-    pp_define_macro("INT_MAX", "2147483647");
-    pp_define_macro("UINT_MAX", "4294967295U");
-    pp_define_macro("LONG_MIN", "(-9223372036854775807L-1L)");
-    pp_define_macro("LONG_MAX", "9223372036854775807L");
-    pp_define_macro("ULONG_MAX", "18446744073709551615UL");
-    pp_define_macro("LLONG_MIN", "(-9223372036854775807LL-1LL)");
-    pp_define_macro("LLONG_MAX", "9223372036854775807LL");
-    pp_define_macro("ULLONG_MAX", "18446744073709551615ULL");
+    if (!hashmap_get(&macros, "CHAR_BIT"))
+    {
+        pp_define_macro("CHAR_BIT", "8");
+        pp_define_macro("SCHAR_MIN", "(-128)");
+        pp_define_macro("SCHAR_MAX", "127");
+        pp_define_macro("UCHAR_MAX", "255");
+        pp_define_macro("CHAR_MIN", "(-128)");
+        pp_define_macro("CHAR_MAX", "127");
+        pp_define_macro("SHRT_MIN", "(-32768)");
+        pp_define_macro("SHRT_MAX", "32767");
+        pp_define_macro("USHRT_MAX", "65535");
+        pp_define_macro("INT_MIN", "(-2147483647-1)");
+        pp_define_macro("INT_MAX", "2147483647");
+        pp_define_macro("UINT_MAX", "4294967295U");
+        pp_define_macro("LONG_MIN", "(-9223372036854775807L-1L)");
+        pp_define_macro("LONG_MAX", "9223372036854775807L");
+        pp_define_macro("ULONG_MAX", "18446744073709551615UL");
+        pp_define_macro("LLONG_MIN", "(-9223372036854775807LL-1LL)");
+        pp_define_macro("LLONG_MAX", "9223372036854775807LL");
+        pp_define_macro("ULLONG_MAX", "18446744073709551615ULL");
+    }
 
     // glibc internal macros needed when system headers are passed through
-    // __getopt_argv_const is defined in getopt.h and used in bits/getopt_ext.h
-    pp_define_macro("__getopt_argv_const", "const");
-#if defined(__linux__)
-    pp_define_macro("__linux__", "1");
-    pp_define_macro("__linux", "1");
-    pp_define_macro("linux", "1");
-    pp_define_macro("__unix__", "1");
-    pp_define_macro("__unix", "1");
-    pp_define_macro("unix", "1");
-    pp_define_macro("__gnu_linux__", "1");
-    pp_define_macro("__ELF__", "1");
-    // POSIX version - needed for headers that check _POSIX_VERSION
-    // 200809L = POSIX.1-2008, which is what modern Linux/glibc provides
-    pp_define_macro("_POSIX_VERSION", "200809L");
-    pp_define_macro("_POSIX_C_SOURCE", "200809L");
-    pp_define_macro("_XOPEN_SOURCE", "700");
-#elif defined(__APPLE__)
-    pp_define_macro("__APPLE__", "1");
-    pp_define_macro("__MACH__", "1");
-    // Apple SDK version macros - needed for secure headers
-    // Use high values to enable modern features
-    pp_define_macro("__MAC_OS_X_VERSION_MIN_REQUIRED", "140000"); // macOS 14.0
-    pp_define_macro("__MAC_OS_X_VERSION_MAX_ALLOWED", "150000");
-    pp_define_macro("__IPHONE_OS_VERSION_MIN_REQUIRED", "0"); // Not iOS
-    pp_define_macro("__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__", "140000");
-    // Darwin feature level - set to FULL to get all definitions
-    pp_define_macro("__DARWIN_C_FULL", "900000L");
-    pp_define_macro("__DARWIN_C_LEVEL", "900000L"); // Must be >= __DARWIN_C_FULL
-    // BSD/POSIX compatibility
-    pp_define_macro("__DARWIN_UNIX03", "1");
-    pp_define_macro("__DARWIN_64_BIT_INO_T", "1");
-    pp_define_macro("__DARWIN_ONLY_64_BIT_INO_T", "1");
-    pp_define_macro("__DARWIN_ONLY_UNIX_CONFORMANCE", "1");
-    pp_define_macro("__DARWIN_ONLY_VERS_1050", "1");
-    pp_define_macro("_DARWIN_FEATURE_64_BIT_INODE", "1");
-    pp_define_macro("_DARWIN_FEATURE_ONLY_UNIX_CONFORMANCE", "1");
-    pp_define_macro("_DARWIN_FEATURE_UNIX_CONFORMANCE", "3");
-    // Standard C feature macros
-    pp_define_macro("__STDC_WANT_LIB_EXT1__", "1");
-    // Availability/deprecation macros
-    pp_define_macro("__API_TO_BE_DEPRECATED", "100000");
-    pp_define_macro("__API_TO_BE_DEPRECATED_MACOS", "100000");
+    if (!hashmap_get(&macros, "__getopt_argv_const"))
+        pp_define_macro("__getopt_argv_const", "const");
 
+#ifdef __APPLE__
     // Apple availability attributes - make them expand to nothing
     // These are used for API versioning and would break compilation otherwise
     pp_define_full("__API_AVAILABLE(...) ");
@@ -3250,89 +3253,9 @@ void pp_init(void)
     pp_define_full("__WATCHOS_PROHIBITED ");
     pp_define_macro("__OSX_EXTENSION_UNAVAILABLE", "");
     pp_define_macro("__IOS_EXTENSION_UNAVAILABLE", "");
-    // Older-style availability (single underscore prefix)
     pp_define_full("_API_AVAILABLE(...) ");
-    // Swift-related
     pp_define_full("__SWIFT_UNAVAILABLE_MSG(...) ");
     pp_define_macro("__SWIFT_UNAVAILABLE", "");
-    // Disable the internal availability macro system entirely
-    pp_define_macro("__ENABLE_LEGACY_IPHONE_AVAILABILITY", "0");
-    pp_define_macro("__ENABLE_LEGACY_MAC_AVAILABILITY", "0");
-    // Define internal availability macros as empty (there are hundreds, so use common ones)
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_2_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_2_1", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_2_2", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_3_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_3_1", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_3_2", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_4_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_4_1", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_4_2", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_4_3", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_5_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_5_1", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_6_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_6_1", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_7_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_7_1", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_8_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_8_1", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_8_2", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_8_3", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_8_4", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_9_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_9_1", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_9_2", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_9_3", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_10_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_10_1", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_10_2", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_10_3", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_11_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_12_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_13_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_14_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_15_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_16_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__IPHONE_17_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_1", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_2", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_3", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_4", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_5", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_6", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_7", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_8", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_9", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_10", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_11", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_12", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_13", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_14", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_10_15", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_11_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_12_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_13_0", "");
-    pp_define_macro("__AVAILABILITY_INTERNAL__MAC_14_0", "");
-#elif defined(_WIN32)
-    pp_define_macro("_WIN32", "1");
-#endif
-
-#if defined(__x86_64__)
-    pp_define_macro("__x86_64__", "1");
-    pp_define_macro("__x86_64", "1");
-    pp_define_macro("__amd64__", "1");
-    pp_define_macro("__amd64", "1");
-#elif defined(__aarch64__) || defined(__arm64__)
-    pp_define_macro("__aarch64__", "1");
-    pp_define_macro("__arm64__", "1"); // Apple uses this name
-#elif defined(__arm__)
-    pp_define_macro("__arm__", "1");
-#elif defined(__i386__)
-    pp_define_macro("__i386__", "1");
-    pp_define_macro("__i386", "1");
-    pp_define_macro("i386", "1");
 #endif
 }
 
