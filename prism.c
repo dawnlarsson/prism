@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.70.0"
+#define PRISM_VERSION "0.71.0"
 
 #include "parse.c"
 
@@ -333,9 +333,9 @@ static bool needs_space(Token *prev, Token *tok)
 {
   if (!prev)
     return false;
-  if (tok->at_bol)
+  if (tok_at_bol(tok))
     return false; // newline will be emitted
-  if (tok->has_space)
+  if (tok_has_space(tok))
     return true;
 
   // Check if merging would create a different token
@@ -389,30 +389,32 @@ static void emit_tok(Token *tok)
   // Check if we need a #line directive BEFORE emitting the token
   bool need_line_directive = false;
   char *current_file = NULL;
+  File *f = tok_file(tok);
+  int line_no = tok_line_no(tok);
 
-  if (emit_line_directives && tok->file)
+  if (emit_line_directives && f)
   {
-    current_file = tok->file->display_name ? tok->file->display_name : tok->file->name;
+    current_file = f->display_name ? f->display_name : f->name;
     bool file_changed = (last_filename != current_file &&
                          (!last_filename || !current_file || strcmp(last_filename, current_file) != 0));
-    bool line_jumped = (tok->line_no != last_line_no && tok->line_no != last_line_no + 1);
+    bool line_jumped = (line_no != last_line_no && line_no != last_line_no + 1);
     need_line_directive = file_changed || line_jumped;
   }
 
   // Handle newlines and spacing
-  if (tok->at_bol)
+  if (tok_at_bol(tok))
   {
     fputc('\n', out);
     // Emit #line directive on new line if needed
     if (need_line_directive)
     {
-      fprintf(out, "#line %d \"%s\"\n", tok->line_no, current_file ? current_file : "unknown");
-      last_line_no = tok->line_no;
+      fprintf(out, "#line %d \"%s\"\n", line_no, current_file ? current_file : "unknown");
+      last_line_no = line_no;
       last_filename = current_file;
     }
-    else if (emit_line_directives && tok->file && tok->line_no > last_line_no)
+    else if (emit_line_directives && f && line_no > last_line_no)
     {
-      last_line_no = tok->line_no;
+      last_line_no = line_no;
     }
   }
   else
@@ -421,8 +423,8 @@ static void emit_tok(Token *tok)
     if (need_line_directive)
     {
       fputc('\n', out);
-      fprintf(out, "#line %d \"%s\"\n", tok->line_no, current_file ? current_file : "unknown");
-      last_line_no = tok->line_no;
+      fprintf(out, "#line %d \"%s\"\n", line_no, current_file ? current_file : "unknown");
+      last_line_no = line_no;
       last_filename = current_file;
     }
     else if (needs_space(last_emitted, tok))
@@ -2045,7 +2047,7 @@ static Token *try_zero_init_decl(Token *tok)
       // Emit warning for safety
       fprintf(stderr, "%s:%d: warning: zero-init: complex parenthesized pattern not parsed, "
                       "variable may be uninitialized. Consider adding explicit initializer.\n",
-              decl_start_for_warning->file->name, decl_start_for_warning->line_no);
+              tok_file(decl_start_for_warning)->name, tok_line_no(decl_start_for_warning));
       return NULL;
     }
     check = scan; // Continue checking after the paren group
@@ -2144,7 +2146,7 @@ static Token *try_zero_init_decl(Token *tok)
         // Saw type, started declarator, but pattern not recognized
         fprintf(stderr, "%s:%d: warning: zero-init: parenthesized declarator pattern not recognized, "
                         "variable may be uninitialized. Consider adding explicit initializer.\n",
-                decl_start_for_warning->file->name, decl_start_for_warning->line_no);
+                tok_file(decl_start_for_warning)->name, tok_line_no(decl_start_for_warning));
         return NULL; // Not a pointer declarator, bail
       }
 
@@ -2191,7 +2193,7 @@ static Token *try_zero_init_decl(Token *tok)
       {
         fprintf(stderr, "%s:%d: warning: zero-init: expected identifier in declarator, "
                         "variable may be uninitialized. Consider adding explicit initializer.\n",
-                decl_start_for_warning->file->name, decl_start_for_warning->line_no);
+                tok_file(decl_start_for_warning)->name, tok_line_no(decl_start_for_warning));
         return NULL;
       }
 
@@ -2204,7 +2206,7 @@ static Token *try_zero_init_decl(Token *tok)
       // We've emitted type but no identifier - shouldn't happen if validation worked
       fprintf(stderr, "%s:%d: warning: zero-init: expected identifier after type, "
                       "variable may be uninitialized. Consider adding explicit initializer.\n",
-              decl_start_for_warning->file->name, decl_start_for_warning->line_no);
+              tok_file(decl_start_for_warning)->name, tok_line_no(decl_start_for_warning));
       return NULL;
     }
 
@@ -2311,7 +2313,7 @@ static Token *try_zero_init_decl(Token *tok)
       {
         fprintf(stderr, "%s:%d: warning: zero-init: expected ')' in declarator, "
                         "variable may be uninitialized. Consider adding explicit initializer.\n",
-                decl_start_for_warning->file->name, decl_start_for_warning->line_no);
+                tok_file(decl_start_for_warning)->name, tok_line_no(decl_start_for_warning));
         return NULL;
       }
       emit_tok(tok);
@@ -2640,7 +2642,7 @@ static int transpile(char *input_file, char *output_file)
         {
           fprintf(stderr, "%s:%d: warning: '%.*s' called with active defers - deferred statements will NOT run. "
                           "Consider using return with cleanup, or restructure to avoid defer here.\n",
-                  tok->file->name, tok->line_no, tok->len, tok->loc);
+                  tok_file(tok)->name, tok_line_no(tok), tok->len, tok->loc);
         }
       }
     }
@@ -2719,7 +2721,7 @@ static int transpile(char *input_file, char *output_file)
         // Check at_bol BEFORE updating depths, skip for grouping tokens themselves
         // Allow multi-line when inside any grouping: (), [], {}
         bool at_top_level = (brace_depth == 0 && paren_depth == 0 && bracket_depth == 0);
-        if (t != stmt_start && t->at_bol && at_top_level &&
+        if (t != stmt_start && tok_at_bol(t) && at_top_level &&
             !equal(t, "{") && !equal(t, "(") && !equal(t, "["))
         {
           error_tok(defer_keyword,
@@ -3007,7 +3009,7 @@ static int transpile(char *input_file, char *output_file)
           error_tok(defer_stack[d].defer_tok[0],
                     "defer would be skipped due to switch fallthrough at %s:%d. "
                     "Add 'break;' before the next case, or wrap case body in braces.",
-                    tok->file->name, tok->line_no);
+                    tok_file(tok)->name, tok_line_no(tok));
         }
 
         // Stop when we hit the switch scope

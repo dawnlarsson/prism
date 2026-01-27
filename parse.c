@@ -94,7 +94,7 @@ typedef struct
     int line_delta;
 } File;
 
-// Token kinds
+// Token kinds (fits in 4 bits, but we use 8 for alignment)
 typedef enum
 {
     TK_IDENT,   // Identifiers
@@ -106,26 +106,34 @@ typedef enum
     TK_EOF,     // End-of-file markers
 } TokenKind;
 
-// Token
+// Token flags (packed into 8 bits)
+enum
+{
+    TF_AT_BOL = 1 << 0,    // Token is at beginning of line
+    TF_HAS_SPACE = 1 << 1, // Token preceded by whitespace
+    TF_IS_FLOAT = 1 << 2,  // For TK_NUM: value is floating point (use fval side table)
+};
+
 struct Token
 {
-    TokenKind kind;
-    Token *next;
-    int64_t val;
-    long double fval;
-    char *loc;
-    int len;
-    Type *ty;
-    char *str;
-    File *file;
-    char *filename;
-    int line_no;
-    int line_delta;
-    bool at_bol;
-    bool has_space;
-    Hideset *hideset;
-    Token *origin;
+    char *loc;   // 8 bytes: pointer into source buffer
+    Token *next; // 8 bytes: next token in list (kept for compatibility)
+    union
+    {
+        int64_t i64;   // Integer value for TK_NUM
+        char *str;     // String content for TK_STR (heap allocated)
+    } val;             // 8 bytes: payload
+    uint32_t len;      // 4 bytes: token length
+    uint8_t kind;      // 1 byte: TokenKind
+    uint8_t flags;     // 1 byte: TF_* flags
+    uint16_t file_idx; // 2 bytes: index into input_files array
 };
+// Total: 32 bytes (with alignment), but much smaller than 128+ bytes before
+
+static inline bool tok_at_bol(Token *tok);
+static inline bool tok_has_space(Token *tok);
+static inline void tok_set_at_bol(Token *tok, bool v);
+static inline void tok_set_has_space(Token *tok, bool v);
 
 // Minimal type info (only for string literals)
 typedef enum
@@ -153,8 +161,8 @@ struct Type
     int array_len;
 };
 
-static Type ty_char_val = {TY_CHAR, 1, 1, false};
-static Type ty_int_val = {TY_INT, 4, 4, false};
+static Type ty_char_val = {TY_CHAR, 1, 1, false, NULL, 0};
+static Type ty_int_val = {TY_INT, 4, 4, false, NULL, 0};
 
 static Type *ty_char = &ty_char_val;
 static Type *ty_int = &ty_int_val;
@@ -173,6 +181,12 @@ typedef struct
     int capacity;
     int used;
 } HashMap;
+
+// Side tables for rarely-used token data (indexed by token pointer)
+static HashMap token_hidesets;
+static HashMap token_origins;
+static HashMap token_fvals;
+static HashMap token_types;
 
 // Error handling
 static File *current_file;
@@ -299,7 +313,7 @@ static void record_feature_test_macro(const char *name, int name_len, Token *bod
     int pos = 0;
     for (Token *t = body; t && t->kind != TK_EOF && pos < 250; t = t->next)
     {
-        if (t->has_space && pos > 0)
+        if (tok_has_space(t) && pos > 0)
             value_buf[pos++] = ' ';
         int copy_len = t->len;
         if (pos + copy_len >= 250)
@@ -724,6 +738,106 @@ static void hashmap_clear(HashMap *map)
     map->capacity = 0;
     map->used = 0;
 }
+
+// Token accessor functions
+
+// Get the File* for a token (via file_idx into input_files array)
+static inline File *tok_file(Token *tok)
+{
+    if (!tok || tok->file_idx >= input_file_count)
+        return current_file;
+    return input_files[tok->file_idx];
+}
+
+// Get line number for a token by scanning from file start
+// This is called only for error messages, so O(n) is acceptable
+static int tok_line_no(Token *tok)
+{
+    File *f = tok_file(tok);
+    if (!f || !f->contents || !tok->loc)
+        return 1;
+    int line = 1;
+    for (char *p = f->contents; p < tok->loc && *p; p++)
+        if (*p == '\n')
+            line++;
+    return line;
+}
+
+// Flag accessors
+static inline bool tok_at_bol(Token *tok) { return tok->flags & TF_AT_BOL; }
+static inline bool tok_has_space(Token *tok) { return tok->flags & TF_HAS_SPACE; }
+static inline void tok_set_at_bol(Token *tok, bool v)
+{
+    if (v)
+        tok->flags |= TF_AT_BOL;
+    else
+        tok->flags &= ~TF_AT_BOL;
+}
+static inline void tok_set_has_space(Token *tok, bool v)
+{
+    if (v)
+        tok->flags |= TF_HAS_SPACE;
+    else
+        tok->flags &= ~TF_HAS_SPACE;
+}
+
+// Hideset side table accessors
+static inline Hideset *tok_hideset(Token *tok)
+{
+    return (Hideset *)hashmap_get2(&token_hidesets, (char *)&tok, sizeof(tok));
+}
+
+static inline void tok_set_hideset(Token *tok, Hideset *hs)
+{
+    if (hs)
+        hashmap_put2(&token_hidesets, (char *)&tok, sizeof(tok), hs);
+    else
+        hashmap_delete2(&token_hidesets, (char *)&tok, sizeof(tok));
+}
+
+// Origin side table accessors (for __LINE__ in macro expansions)
+static inline Token *tok_origin(Token *tok)
+{
+    return (Token *)hashmap_get2(&token_origins, (char *)&tok, sizeof(tok));
+}
+
+static inline void tok_set_origin(Token *tok, Token *origin)
+{
+    if (origin)
+        hashmap_put2(&token_origins, (char *)&tok, sizeof(tok), origin);
+    else
+        hashmap_delete2(&token_origins, (char *)&tok, sizeof(tok));
+}
+
+// Float value side table accessors
+static inline long double tok_fval(Token *tok)
+{
+    long double *p = (long double *)hashmap_get2(&token_fvals, (char *)&tok, sizeof(tok));
+    return p ? *p : 0.0L;
+}
+
+static inline void tok_set_fval(Token *tok, long double fval)
+{
+    long double *p = malloc(sizeof(long double));
+    *p = fval;
+    hashmap_put2(&token_fvals, (char *)&tok, sizeof(tok), p);
+    tok->flags |= TF_IS_FLOAT;
+}
+
+// Type side table accessors (for string literals)
+static inline Type *tok_type(Token *tok)
+{
+    return (Type *)hashmap_get2(&token_types, (char *)&tok, sizeof(tok));
+}
+
+static inline void tok_set_type(Token *tok, Type *ty)
+{
+    if (ty)
+        hashmap_put2(&token_types, (char *)&tok, sizeof(tok), ty);
+}
+
+// =============================================================================
+
 // Unicode
 static uint32_t decode_utf8(char **new_pos, char *p)
 {
@@ -941,7 +1055,8 @@ noreturn void error_tok(Token *tok, char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    verror_at(tok->file->name, tok->file->contents, tok->line_no, tok->loc, fmt, ap);
+    File *f = tok_file(tok);
+    verror_at(f->name, f->contents, tok_line_no(tok), tok->loc, fmt, ap);
     exit(1);
 }
 
@@ -949,7 +1064,8 @@ static void warn_tok(Token *tok, char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    verror_at(tok->file->name, tok->file->contents, tok->line_no, tok->loc, fmt, ap);
+    File *f = tok_file(tok);
+    verror_at(f->name, f->contents, tok_line_no(tok), tok->loc, fmt, ap);
     va_end(ap);
 }
 
@@ -987,10 +1103,9 @@ static Token *new_token(TokenKind kind, char *start, char *end)
     tok->kind = kind;
     tok->loc = start;
     tok->len = end - start;
-    tok->file = current_file;
-    tok->filename = current_file->display_name;
-    tok->at_bol = at_bol;
-    tok->has_space = has_space;
+    tok->file_idx = current_file ? current_file->file_no : 0;
+    tok_set_at_bol(tok, at_bol);
+    tok_set_has_space(tok, has_space);
     at_bol = has_space = false;
     return tok;
 }
@@ -1220,8 +1335,8 @@ static Token *read_string_literal(char *start, char *quote)
             buf[len++] = *p++;
     }
     Token *tok = new_token(TK_STR, start, end + 1);
-    tok->ty = array_of(ty_char, len + 1);
-    tok->str = buf;
+    tok_set_type(tok, array_of(ty_char, len + 1));
+    tok->val.str = buf;
     return tok;
 }
 
@@ -1261,8 +1376,8 @@ static Token *read_char_literal(char *start, char *quote, Type *ty)
         error_at(start, "empty char literal");
 
     Token *tok = new_token(TK_NUM, start, p + 1);
-    tok->val = (count == 1) ? first_c : (int32_t)val;
-    tok->ty = ty;
+    tok->val.i64 = (count == 1) ? first_c : (int32_t)val;
+    tok_set_type(tok, ty);
     return tok;
 }
 
@@ -1341,7 +1456,7 @@ static void convert_pp_number(Token *tok)
         if (!buf)
             error_tok(tok, "out of memory");
         char *endp;
-        tok->fval = strtold(buf, &endp);
+        long double fval = strtold(buf, &endp);
         if (endp == buf)
             error_tok(tok, "invalid floating constant");
         if (is_hex && !strpbrk(buf, "pP"))
@@ -1355,6 +1470,7 @@ static void convert_pp_number(Token *tok)
         if (*endp)
             error_tok(tok, "invalid floating constant");
         tok->kind = TK_NUM;
+        tok_set_fval(tok, fval);
         free(buf);
         return;
     }
@@ -1411,7 +1527,7 @@ static void convert_pp_number(Token *tok)
         error_tok(tok, "invalid integer constant");
 
     tok->kind = TK_NUM;
-    tok->val = val;
+    tok->val.i64 = val;
 }
 
 static void convert_pp_tokens(Token *tok)
@@ -1425,21 +1541,11 @@ static void convert_pp_tokens(Token *tok)
     }
 }
 
+// Line numbers are now computed on demand via tok_line_no()
+// This function is kept as a stub for compatibility
 static void add_line_numbers(Token *tok)
 {
-    int n = 1;
-    for (char *p = current_file->contents; *p; p++)
-    {
-        if (p == tok->loc)
-        {
-            tok->line_no = n;
-            tok = tok->next;
-            if (!tok)
-                return;
-        }
-        if (*p == '\n')
-            n++;
-    }
+    (void)tok; // No-op: line numbers computed via tok_line_no()
 }
 
 static File *new_file(char *name, int file_no, char *contents)
@@ -1669,15 +1775,15 @@ static Token *preprocess2(Token *tok);
 
 static bool is_hash(Token *tok)
 {
-    return tok->at_bol && equal(tok, "#");
+    return tok_at_bol(tok) && equal(tok, "#");
 }
 
 static Token *skip_line(Token *tok)
 {
-    if (tok->at_bol)
+    if (tok_at_bol(tok))
         return tok;
     warn_tok(tok, "extra token");
-    while (!tok->at_bol)
+    while (!tok_at_bol(tok))
         tok = tok->next;
     return tok;
 }
@@ -1685,7 +1791,7 @@ static Token *skip_line(Token *tok)
 // Skip to end of line without warning (for ignored directives like #pragma)
 static Token *skip_line_quiet(Token *tok)
 {
-    while (!tok->at_bol)
+    while (!tok_at_bol(tok))
         tok = tok->next;
     return tok;
 }
@@ -1768,7 +1874,7 @@ static Token *add_hideset(Token *tok, Hideset *hs)
     for (; tok; tok = tok->next)
     {
         Token *t = copy_token(tok);
-        t->hideset = hideset_union(t->hideset, hs);
+        tok_set_hideset(t, hideset_union(tok_hideset(t), hs));
         cur = cur->next = t;
     }
     return head.next;
@@ -1811,28 +1917,31 @@ static Macro *add_macro(char *name, bool is_objlike, Token *body)
 static Token *new_str_token(char *str, Token *tmpl)
 {
     char *buf = format("\"%s\"", str);
-    return tokenize(new_file(tmpl->file->name, tmpl->file->file_no, buf));
+    File *f = tok_file(tmpl);
+    return tokenize(new_file(f->name, f->file_no, buf));
 }
 
 static Token *new_num_token(int val, Token *tmpl)
 {
     char *buf = format("%d", val);
-    return tokenize(new_file(tmpl->file->name, tmpl->file->file_no, buf));
+    File *f = tok_file(tmpl);
+    return tokenize(new_file(f->name, f->file_no, buf));
 }
 
 // Built-in macros
 static Token *file_macro(Token *tmpl)
 {
-    while (tmpl->origin)
-        tmpl = tmpl->origin;
-    return new_str_token(tmpl->file->display_name, tmpl);
+    while (tok_origin(tmpl))
+        tmpl = tok_origin(tmpl);
+    return new_str_token(tok_file(tmpl)->display_name, tmpl);
 }
 
 static Token *line_macro(Token *tmpl)
 {
-    while (tmpl->origin)
-        tmpl = tmpl->origin;
-    return new_num_token(tmpl->line_no + tmpl->file->line_delta, tmpl);
+    while (tok_origin(tmpl))
+        tmpl = tok_origin(tmpl);
+    File *f = tok_file(tmpl);
+    return new_num_token(tok_line_no(tmpl) + f->line_delta, tmpl);
 }
 
 static void add_builtin(char *name, macro_handler_fn *fn)
@@ -1935,13 +2044,13 @@ static char *stringify_tokens(Token *tok)
 
     for (Token *t = tok; t && t->kind != TK_EOF; t = t->next)
     {
-        if (t != tok && t->has_space)
+        if (t != tok && tok_has_space(t))
             fputc(' ', fp);
         // Escape quotes and backslashes in strings
         if (t->kind == TK_STR)
         {
             fputc('"', fp);
-            for (int i = 0; i < t->len - 2; i++)
+            for (int i = 0; i < (int)t->len - 2; i++)
             {
                 char c = t->loc[i + 1];
                 if (c == '"' || c == '\\')
@@ -1975,14 +2084,16 @@ static Token *new_str_token_raw(char *str, Token *tmpl)
     fputc('"', fp);
     fputc('\n', fp);
     fclose(fp);
-    return tokenize(new_file(tmpl->file->name, tmpl->file->file_no, buf));
+    File *f = tok_file(tmpl);
+    return tokenize(new_file(f->name, f->file_no, buf));
 }
 
 // Paste two tokens together
 static Token *paste(Token *lhs, Token *rhs)
 {
     char *buf = format("%.*s%.*s", lhs->len, lhs->loc, rhs->len, rhs->loc);
-    Token *tok = tokenize(new_file(lhs->file->name, lhs->file->file_no, format("%s\n", buf)));
+    File *f = tok_file(lhs);
+    Token *tok = tokenize(new_file(f->name, f->file_no, format("%s\n", buf)));
     if (tok->next->kind != TK_EOF)
         error_tok(lhs, "pasting \"%.*s\" and \"%.*s\" does not produce a valid token",
                   lhs->len, lhs->loc, rhs->len, rhs->loc);
@@ -2082,7 +2193,7 @@ static Token *subst(Token *tok, MacroArg *args)
 
 static bool expand_macro(Token **rest, Token *tok)
 {
-    if (hideset_contains(tok->hideset, tok->loc, tok->len))
+    if (hideset_contains(tok_hideset(tok), tok->loc, tok->len))
         return false;
 
     Macro *m = find_macro(tok);
@@ -2097,10 +2208,10 @@ static bool expand_macro(Token **rest, Token *tok)
 
     if (m->is_objlike)
     {
-        Hideset *hs = hideset_union(tok->hideset, new_hideset(m->name));
+        Hideset *hs = hideset_union(tok_hideset(tok), new_hideset(m->name));
         Token *body = add_hideset(m->body, hs);
         for (Token *t = body; t && t->kind != TK_EOF; t = t->next)
-            t->origin = tok;
+            tok_set_origin(t, tok);
         *rest = append(body, tok->next);
         return true;
     }
@@ -2111,11 +2222,11 @@ static bool expand_macro(Token **rest, Token *tok)
     Token *macro_tok = tok;
     MacroArg *args = read_macro_args(&tok, tok->next->next, m->params, m->va_args_name);
     Token *body = subst(m->body, args);
-    Hideset *hs = hideset_intersection(macro_tok->hideset, tok->hideset);
+    Hideset *hs = hideset_intersection(tok_hideset(macro_tok), tok_hideset(tok));
     hs = hideset_union(hs, new_hideset(m->name));
     body = add_hideset(body, hs);
     for (Token *t = body; t && t->kind != TK_EOF; t = t->next)
-        t->origin = macro_tok;
+        tok_set_origin(t, macro_tok);
     *rest = append(body, tok);
     return true;
 }
@@ -2164,9 +2275,9 @@ static char *read_include_filename(Token **rest, Token *tok, bool *is_dquote)
         int len = 0;
         for (tok = tok->next; !equal(tok, ">"); tok = tok->next)
         {
-            if (tok->at_bol || tok->kind == TK_EOF)
+            if (tok_at_bol(tok) || tok->kind == TK_EOF)
                 error_tok(tok, "expected '>'");
-            if (tok->has_space)
+            if (tok_has_space(tok))
                 error_tok(tok, "invalid header name");
             len += tok->len;
         }
@@ -2254,7 +2365,7 @@ static Token *copy_line(Token **rest, Token *tok)
 {
     Token head = {};
     Token *cur = &head;
-    for (; !tok->at_bol; tok = tok->next)
+    for (; !tok_at_bol(tok); tok = tok->next)
         cur = cur->next = copy_token(tok);
     cur->next = new_eof(tok);
     *rest = tok;
@@ -2270,7 +2381,7 @@ static void read_macro_definition(Token **rest, Token *tok)
     int name_len = tok->len;
     tok = tok->next;
 
-    if (!tok->has_space && equal(tok, "("))
+    if (!tok_has_space(tok) && equal(tok, "("))
     {
         // Function-like macro
         char *va_name = NULL;
@@ -2305,7 +2416,7 @@ static int64_t eval_primary(Token **rest, Token *tok)
     if (tok->kind == TK_NUM)
     {
         *rest = tok->next;
-        return tok->val;
+        return tok->val.i64;
     }
 
     // Handle 'defined' operator (can appear after macro expansion)
@@ -2597,7 +2708,7 @@ static Token *read_const_expr(Token **rest, Token *tok)
     Token head = {};
     Token *cur = &head;
 
-    while (!tok->at_bol)
+    while (!tok_at_bol(tok))
     {
         if (equal(tok, "defined"))
         {
@@ -2630,7 +2741,7 @@ static Token *read_const_expr(Token **rest, Token *tok)
                 char *filename = NULL;
                 tok = tok->next;
                 // Collect tokens until >
-                while (!equal(tok, ">") && !tok->at_bol && tok->kind != TK_EOF)
+                while (!equal(tok, ">") && !tok_at_bol(tok) && tok->kind != TK_EOF)
                 {
                     if (!filename)
                     {
@@ -2760,7 +2871,7 @@ static Token *preprocess2(Token *tok)
         tok = tok->next;
 
         // Null directive: just # on a line by itself (or # followed by only whitespace)
-        if (tok->at_bol)
+        if (tok_at_bol(tok))
             continue;
 
         if (equal(tok, "include"))
@@ -2781,57 +2892,24 @@ static Token *preprocess2(Token *tok)
                     continue;
                 }
 
-                // Not in user paths - preserve #include directive as-is for backend compiler
-                Token *hash = copy_token(start);
-                hash->kind = TK_PUNCT;
-                hash->loc = "#";
-                hash->len = 1;
-                hash->at_bol = true; // # starts at beginning of line
-                hash->has_space = false;
+                // Build the entire directive as one string to avoid #line insertion between tokens
+                char *include_str = malloc(strlen(filename) + 16); // "#include <" + filename + ">"
+                if (!include_str)
+                    error_tok(start, "out of memory");
+                sprintf(include_str, "#include <%s>", filename);
 
-                Token *inc = copy_token(start);
-                inc->kind = TK_IDENT;
-                inc->loc = "include";
-                inc->len = 7;
-                inc->at_bol = false;
-                inc->has_space = false; // No space between # and include
-
-                Token *open = copy_token(start);
-                open->kind = TK_PUNCT;
-                open->loc = "<";
-                open->len = 1;
-                open->at_bol = false;
-                open->has_space = true; // Space before <
-
-                Token *name = copy_token(start);
-                name->kind = TK_IDENT;
-                name->loc = filename;
-                name->len = strlen(filename);
-                name->at_bol = false;
-                name->has_space = false;
-
-                Token *close = copy_token(start);
-                close->kind = TK_PUNCT;
-                close->loc = ">";
-                close->len = 1;
-                close->at_bol = false;
-                close->has_space = false;
-
-                // Link them together
-                hash->next = inc;
-                inc->next = open;
-                open->next = name;
-                name->next = close;
+                Token *directive = copy_token(start);
+                directive->kind = TK_IDENT; // Treat as identifier-like for emission purposes
+                directive->loc = include_str;
+                directive->len = strlen(include_str);
+                tok_set_at_bol(directive, true); // Starts at beginning of line
+                tok_set_has_space(directive, false);
 
                 // Skip to end of line and continue
                 tok = skip_line(tok);
-                close->next = tok;
+                directive->next = tok;
 
-                cur = cur->next = hash;
-                cur = cur->next = inc;
-                cur = cur->next = open;
-                cur = cur->next = name;
-                cur = cur->next = close;
+                cur = cur->next = directive;
                 continue;
             }
 
@@ -2839,7 +2917,8 @@ static Token *preprocess2(Token *tok)
             if (is_dquote)
             {
                 // Search relative to current file first
-                char *name_copy = strdup(start->file->name);
+                File *start_file = tok_file(start);
+                char *name_copy = strdup(start_file->name);
                 if (name_copy)
                 {
                     char *dir = dirname(name_copy);
@@ -2873,7 +2952,8 @@ static Token *preprocess2(Token *tok)
 
             // Search from the next include path after where current file was found
             char *path = NULL;
-            char *cur_file = start->file->name;
+            File *start_file = tok_file(start);
+            char *cur_file = start_file->name;
 
             // Find which include path the current file is under
             int start_idx = 0;
@@ -3012,8 +3092,9 @@ static Token *preprocess2(Token *tok)
             if (equal(tok->next, "once"))
             {
                 // Mark this file as included
-                char *real = realpath(start->file->name, NULL);
-                char *key = real ? real : strdup(start->file->name);
+                File *start_file = tok_file(start);
+                char *real = realpath(start_file->name, NULL);
+                char *key = real ? real : strdup(start_file->name);
                 hashmap_put(&included_files, key, (void *)1);
             }
             tok = skip_line_quiet(tok->next);
