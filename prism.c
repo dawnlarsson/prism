@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.69.0"
+#define PRISM_VERSION "0.70.0"
 
 #include "parse.c"
 
@@ -135,6 +135,7 @@ typedef struct
   bool is_vla;        // True if typedef refers to a VLA type
   bool is_shadow;     // True if this entry shadows a typedef (variable with same name)
   bool is_enum_const; // True if this is an enum constant (compile-time constant)
+  int prev_index;     // Index of previous entry with same name (-1 if none), for hash map chaining
 } TypedefEntry;
 
 typedef struct
@@ -142,6 +143,7 @@ typedef struct
   TypedefEntry *entries;
   int count;
   int capacity;
+  HashMap name_map; // Maps name -> index+1 of most recent entry (0 means not found)
 } TypedefTable;
 
 static TypedefTable typedef_table;
@@ -577,6 +579,21 @@ static void typedef_table_reset(void)
   }
   typedef_table.count = 0;
   typedef_table.capacity = 0;
+  hashmap_clear(&typedef_table.name_map);
+}
+
+// Helper to get current index for a name from the hash map (-1 if not found)
+static int typedef_get_index(char *name, int len)
+{
+  void *val = hashmap_get2(&typedef_table.name_map, name, len);
+  return val ? (int)(intptr_t)val - 1 : -1;
+}
+
+// Helper to update hash map with new index for a name
+static void typedef_set_index(char *name, int len, int index)
+{
+  // Store index+1 so that 0 (NULL) means "not found"
+  hashmap_put2(&typedef_table.name_map, name, len, (void *)(intptr_t)(index + 1));
 }
 
 static void typedef_add(char *name, int len, int scope_depth, bool is_vla)
@@ -591,13 +608,16 @@ static void typedef_add(char *name, int len, int scope_depth, bool is_vla)
     typedef_table.entries = new_entries;
     typedef_table.capacity = new_cap;
   }
-  TypedefEntry *e = &typedef_table.entries[typedef_table.count++];
+  int new_index = typedef_table.count++;
+  TypedefEntry *e = &typedef_table.entries[new_index];
   e->name = name;
   e->len = len;
   e->scope_depth = scope_depth;
   e->is_vla = is_vla;
   e->is_shadow = false;
   e->is_enum_const = false;
+  e->prev_index = typedef_get_index(name, len);
+  typedef_set_index(name, len, new_index);
 }
 
 // Add a shadow entry: marks that a variable with this name exists at this scope,
@@ -614,13 +634,16 @@ static void typedef_add_shadow(char *name, int len, int scope_depth)
     typedef_table.entries = new_entries;
     typedef_table.capacity = new_cap;
   }
-  TypedefEntry *e = &typedef_table.entries[typedef_table.count++];
+  int new_index = typedef_table.count++;
+  TypedefEntry *e = &typedef_table.entries[new_index];
   e->name = name;
   e->len = len;
   e->scope_depth = scope_depth;
   e->is_vla = false;
   e->is_shadow = true;
   e->is_enum_const = false;
+  e->prev_index = typedef_get_index(name, len);
+  typedef_set_index(name, len, new_index);
 }
 
 // Add an enum constant entry
@@ -636,20 +659,31 @@ static void typedef_add_enum_const(char *name, int len, int scope_depth)
     typedef_table.entries = new_entries;
     typedef_table.capacity = new_cap;
   }
-  TypedefEntry *e = &typedef_table.entries[typedef_table.count++];
+  int new_index = typedef_table.count++;
+  TypedefEntry *e = &typedef_table.entries[new_index];
   e->name = name;
   e->len = len;
   e->scope_depth = scope_depth;
   e->is_vla = false;
   e->is_shadow = false;
   e->is_enum_const = true;
+  e->prev_index = typedef_get_index(name, len);
+  typedef_set_index(name, len, new_index);
 }
 
 // Called when exiting a scope - removes typedefs defined at that depth
 static void typedef_pop_scope(int scope_depth)
 {
   while (typedef_table.count > 0 && typedef_table.entries[typedef_table.count - 1].scope_depth == scope_depth)
+  {
+    TypedefEntry *e = &typedef_table.entries[typedef_table.count - 1];
+    // Restore hash map to point to previous entry (or remove if none)
+    if (e->prev_index >= 0)
+      typedef_set_index(e->name, e->len, e->prev_index);
+    else
+      hashmap_delete2(&typedef_table.name_map, e->name, e->len);
     typedef_table.count--;
+  }
 }
 
 // Forward declaration for parse_enum_constants
@@ -719,13 +753,11 @@ static bool is_known_typedef(Token *tok)
 {
   if (tok->kind != TK_IDENT)
     return false;
-  for (int i = typedef_table.count - 1; i >= 0; i--)
-  {
-    TypedefEntry *e = &typedef_table.entries[i];
-    if (e->len == tok->len && !memcmp(e->name, tok->loc, tok->len))
-      return !e->is_shadow;
-  }
-  return false;
+  int idx = typedef_get_index(tok->loc, tok->len);
+  if (idx < 0)
+    return false;
+  TypedefEntry *e = &typedef_table.entries[idx];
+  return !e->is_shadow && !e->is_enum_const;
 }
 
 // Check if token is a known VLA typedef (search most recent first for shadowing)
@@ -733,17 +765,13 @@ static bool is_vla_typedef(Token *tok)
 {
   if (tok->kind != TK_IDENT)
     return false;
-  for (int i = typedef_table.count - 1; i >= 0; i--)
-  {
-    TypedefEntry *e = &typedef_table.entries[i];
-    if (e->len == tok->len && !memcmp(e->name, tok->loc, tok->len))
-    {
-      if (e->is_shadow)
-        return false;
-      return e->is_vla;
-    }
-  }
-  return false;
+  int idx = typedef_get_index(tok->loc, tok->len);
+  if (idx < 0)
+    return false;
+  TypedefEntry *e = &typedef_table.entries[idx];
+  if (e->is_shadow)
+    return false;
+  return e->is_vla;
 }
 
 // Check if token is a known enum constant (compile-time constant)
@@ -751,13 +779,10 @@ static bool is_known_enum_const(Token *tok)
 {
   if (tok->kind != TK_IDENT)
     return false;
-  for (int i = typedef_table.count - 1; i >= 0; i--)
-  {
-    TypedefEntry *e = &typedef_table.entries[i];
-    if (e->len == tok->len && !memcmp(e->name, tok->loc, tok->len))
-      return e->is_enum_const;
-  }
-  return false;
+  int idx = typedef_get_index(tok->loc, tok->len);
+  if (idx < 0)
+    return false;
+  return typedef_table.entries[idx].is_enum_const;
 }
 
 // Check if token could be a label (identifier followed by ':')
