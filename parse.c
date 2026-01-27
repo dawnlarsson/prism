@@ -3077,14 +3077,10 @@ static void pp_define_full(char *def)
 static int pp_import_system_macros(void)
 {
     // Run the system compiler to get predefined macros
-    // Include features.h to get library-defined macros like __GLIBC__
-#if defined(__linux__)
-    FILE *fp = popen("echo '#include <features.h>' | cc -dM -E - 2>/dev/null", "r");
-#elif defined(__APPLE__)
-    FILE *fp = popen("echo '#include <sys/cdefs.h>' | cc -dM -E - 2>/dev/null", "r");
-#else
+    // We use plain "cc -dM -E -" to get only compiler-intrinsic macros
+    // NOT including features.h because that brings in internal glibc macros
+    // like __USE_POSIX, __USE_MISC that affect header behavior
     FILE *fp = popen("cc -dM -E - < /dev/null 2>/dev/null", "r");
-#endif
     if (!fp)
         return -1;
 
@@ -3119,6 +3115,11 @@ static int pp_import_system_macros(void)
             (name_len == 8 && strncmp(start, "__TIME__", 8) == 0) ||
             (name_len == 13 && strncmp(start, "__TIMESTAMP__", 13) == 0) ||
             (name_len == 13 && strncmp(start, "__BASE_FILE__", 13) == 0))
+            continue;
+
+        // Skip internal glibc __USE_* macros that affect header behavior
+        // These should be determined by the user's feature test macros, not hardcoded
+        if (name_len >= 6 && strncmp(start, "__USE_", 6) == 0)
             continue;
 
         // For function-like macros (has '('), use pp_define_full
@@ -3190,6 +3191,99 @@ void pp_init(void)
 
     add_builtin("__FILE__", file_macro);
     add_builtin("__LINE__", line_macro);
+
+    // __GLIBC__ comes from <features.h>, not from the compiler itself.
+    // We need to add it manually for Linux systems to ensure code that
+    // uses #ifdef __GLIBC__ (like dash, bash) works correctly.
+#if defined(__linux__)
+    if (!hashmap_get(&macros, "__GLIBC__"))
+    {
+        // Try to extract __GLIBC__ from the system by including features.h
+        FILE *fp = popen("echo '#include <features.h>' | cc -dM -E - 2>/dev/null | grep -E '^#define __GLIBC__' | head -1", "r");
+        if (fp)
+        {
+            char line[256];
+            if (fgets(line, sizeof(line), fp))
+            {
+                // Line is: #define __GLIBC__ <value>
+                char *val = strstr(line, "__GLIBC__");
+                if (val)
+                {
+                    val += 9; // Skip "__GLIBC__"
+                    while (*val == ' ' || *val == '\t')
+                        val++;
+                    char *end = val;
+                    while (*end && *end != '\n' && *end != '\r' && *end != ' ')
+                        end++;
+                    *end = '\0';
+                    if (*val)
+                        pp_define_macro("__GLIBC__", strdup(val));
+                }
+            }
+            pclose(fp);
+        }
+        // Fallback if extraction failed
+        if (!hashmap_get(&macros, "__GLIBC__"))
+            pp_define_macro("__GLIBC__", "2");
+    }
+    if (!hashmap_get(&macros, "__GLIBC_MINOR__"))
+    {
+        FILE *fp = popen("echo '#include <features.h>' | cc -dM -E - 2>/dev/null | grep -E '^#define __GLIBC_MINOR__' | head -1", "r");
+        if (fp)
+        {
+            char line[256];
+            if (fgets(line, sizeof(line), fp))
+            {
+                char *val = strstr(line, "__GLIBC_MINOR__");
+                if (val)
+                {
+                    val += 15; // Skip "__GLIBC_MINOR__"
+                    while (*val == ' ' || *val == '\t')
+                        val++;
+                    char *end = val;
+                    while (*end && *end != '\n' && *end != '\r' && *end != ' ')
+                        end++;
+                    *end = '\0';
+                    if (*val)
+                        pp_define_macro("__GLIBC_MINOR__", strdup(val));
+                }
+            }
+            pclose(fp);
+        }
+        if (!hashmap_get(&macros, "__GLIBC_MINOR__"))
+            pp_define_macro("__GLIBC_MINOR__", "17");
+    }
+    // _POSIX_VERSION comes from <unistd.h>, not the compiler.
+    // We need it for code like bash's jobs.h that checks #if !defined(_POSIX_VERSION)
+    // to decide whether to use union wait (BSD) or int (POSIX) for WAIT type.
+    if (!hashmap_get(&macros, "_POSIX_VERSION"))
+    {
+        FILE *fp = popen("echo '#include <unistd.h>' | cc -dM -E - 2>/dev/null | grep -E '^#define _POSIX_VERSION' | head -1", "r");
+        if (fp)
+        {
+            char line[256];
+            if (fgets(line, sizeof(line), fp))
+            {
+                char *val = strstr(line, "_POSIX_VERSION");
+                if (val)
+                {
+                    val += 14; // Skip "_POSIX_VERSION"
+                    while (*val == ' ' || *val == '\t')
+                        val++;
+                    char *end = val;
+                    while (*end && *end != '\n' && *end != '\r' && *end != ' ')
+                        end++;
+                    *end = '\0';
+                    if (*val)
+                        pp_define_macro("_POSIX_VERSION", strdup(val));
+                }
+            }
+            pclose(fp);
+        }
+        if (!hashmap_get(&macros, "_POSIX_VERSION"))
+            pp_define_macro("_POSIX_VERSION", "200809L");
+    }
+#endif
 
     if (!hashmap_get(&macros, "__STDC__"))
         pp_define_macro("__STDC__", "1");

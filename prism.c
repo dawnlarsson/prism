@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.68.0"
+#define PRISM_VERSION "0.69.0"
 
 #include "parse.c"
 
@@ -3881,6 +3881,15 @@ static bool is_source_file(const char *arg)
   return false;
 }
 
+static bool is_assembly_file(const char *arg)
+{
+  size_t len = strlen(arg);
+  if (len < 2)
+    return false;
+  // .s/.S files (assembly) - should pass through without transpilation
+  return (!strcmp(arg + len - 2, ".s") || !strcmp(arg + len - 2, ".S"));
+}
+
 static bool str_startswith(const char *s, const char *prefix)
 {
   return strncmp(s, prefix, strlen(prefix)) == 0;
@@ -4576,13 +4585,22 @@ int main(int argc, char **argv)
   if (cross_cc)
     compiler = cross_cc;
 
-  // Transpile all sources to temp files
+  // Transpile all sources to temp files (skip assembly files - pass through directly)
   char **temp_files = calloc(cli.source_count, sizeof(char *));
   if (!temp_files)
     die("Out of memory");
 
   for (int i = 0; i < cli.source_count; i++)
   {
+    // Assembly files (.s, .S) don't need transpilation - pass through directly
+    if (is_assembly_file(cli.sources[i]))
+    {
+      temp_files[i] = strdup(cli.sources[i]);
+      if (!temp_files[i])
+        die("Out of memory");
+      continue;
+    }
+
     temp_files[i] = malloc(512);
     if (!temp_files[i])
       die("Out of memory");
@@ -4591,7 +4609,8 @@ int main(int argc, char **argv)
     {
       for (int j = 0; j < i; j++)
       {
-        remove(temp_files[j]);
+        if (!is_assembly_file(cli.sources[j]))
+          remove(temp_files[j]);
         free(temp_files[j]);
       }
       free(temp_files);
@@ -4605,7 +4624,8 @@ int main(int argc, char **argv)
     {
       for (int j = 0; j <= i; j++)
       {
-        remove(temp_files[j]);
+        if (!is_assembly_file(cli.sources[j]))
+          remove(temp_files[j]);
         free(temp_files[j]);
       }
       free(temp_files);
@@ -4688,10 +4708,11 @@ int main(int argc, char **argv)
   int status = run_command(compile_argv);
   free_argv(compile_argv);
 
-  // Cleanup temp source files
+  // Cleanup temp source files (but not assembly files - those are originals)
   for (int i = 0; i < cli.source_count; i++)
   {
-    remove(temp_files[i]);
+    if (!is_assembly_file(cli.sources[i]))
+      remove(temp_files[i]);
     free(temp_files[i]);
   }
   free(temp_files);
