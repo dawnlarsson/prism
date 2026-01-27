@@ -1089,6 +1089,25 @@ void test_ppnum_underscore_paste(void)
     CHECK(1, "pp-number underscore paste: 1024_160 is single token");
 }
 
+// BUG REGRESSION: function declarations inside function bodies
+// Issue: zeroinit code was emitting function declarations twice
+// Pattern: "void func_name(...)" inside an #ifdef block in a function body
+// The zeroinit parser would emit "void func_name" then bail, causing duplicate output
+void test_local_function_decl(void)
+{
+    // These are local extern function declarations (valid C)
+    // The zeroinit code should recognize these as function declarations
+    // and skip them, NOT try to add "= 0" or duplicate them
+    void local_func(int a, int b);
+    void multi_line_func(int *rp, const int *ap,
+                         const void *table, const int *np,
+                         const int *n0, int num, int power);
+    int return_func(const int *ap, int off);
+    
+    // If we got here, the function declarations were handled correctly
+    CHECK(1, "local function declarations: no duplicate output");
+}
+
 void run_bug_regression_tests(void)
 {
     printf("\n=== BUG REGRESSION TESTS ===\n");
@@ -1105,6 +1124,7 @@ void run_bug_regression_tests(void)
     test_enum_shadow_star_ambiguity();
     test_enum_shadow_statement_form();
     test_ppnum_underscore_paste();
+    test_local_function_decl();
 }
 
 // SECTION 7: ADVANCED DEFER TESTS

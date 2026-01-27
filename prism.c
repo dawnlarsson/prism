@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.72.0"
+#define PRISM_VERSION "0.73.0"
 
 #include "parse.c"
 
@@ -2066,9 +2066,11 @@ static Token *try_zero_init_decl(Token *tok)
 
   // Before emitting anything, check if any declarator has a statement expression initializer
   // Statement expressions like ({ ... }) can contain defer, so we need the main loop to handle them
+  // Also check for function declarations: "type name(...)" which we don't handle
   {
     Token *scan = tok;
     int scan_depth = 0;
+    bool seen_ident_at_top = false; // Track if we've seen an identifier at depth 0
     while (scan && scan->kind != TK_EOF)
     {
       if (equal(scan, "(") || equal(scan, "[") || equal(scan, "{"))
@@ -2076,12 +2078,33 @@ static Token *try_zero_init_decl(Token *tok)
         // Check for statement expression: '(' followed by '{'
         if (equal(scan, "(") && scan->next && equal(scan->next, "{"))
           return NULL; // Let main loop handle statement expressions
+        // Check for function declaration: identifier immediately followed by '(' at top level
+        // But NOT if the identifier is after a '*' (pointer declarator)
+        if (equal(scan, "(") && scan_depth == 0 && seen_ident_at_top)
+        {
+          // This looks like a function declaration, not a variable
+          // Check if there's a '*' between type_end and the identifier
+          Token *t = tok;
+          bool has_star = false;
+          while (t && t != scan)
+          {
+            if (equal(t, "*"))
+              has_star = true;
+            if (equal(t, "("))
+              break; // Stop if we hit the paren we're checking
+            t = t->next;
+          }
+          if (!has_star)
+            return NULL; // Function declaration without pointer, bail
+        }
         scan_depth++;
       }
       else if (equal(scan, ")") || equal(scan, "]") || equal(scan, "}"))
         scan_depth--;
       else if (scan_depth == 0 && equal(scan, ";"))
         break; // End of declaration
+      else if (scan_depth == 0 && scan->kind == TK_IDENT)
+        seen_ident_at_top = true;
       scan = scan->next;
     }
   }

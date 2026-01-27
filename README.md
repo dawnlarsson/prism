@@ -13,6 +13,12 @@ Prism is a propper transpiler, not a preprocessor macro.
 * **Respect Scope:** It understands braces `{}`, statement expressions `({ ... })`, and switch-case fallthrough, ensuring `defer` fires exactly when it should.
 * **Detect Errors:** It catches unsafe patterns (like jumping into a scope with `goto`) before they become runtime bugs.
 
+### Status
+Prism can parse & preprocess **large complex C projects** like `Bash`, `Dash`.
+
+All validation & edge tests pass, but,
+There is some edge cases still to be caught in the parsing, **huge speedups** and runtime memory savings to be had.
+
 <br/>
 
 build & install
@@ -92,13 +98,12 @@ skip:
 // Error: goto 'skip' would skip over variable declaration 'x'
 ```
 
-
 ## CLI
 
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v0.68.0 - Robust C transpiler
+Prism v0.73.0 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 
