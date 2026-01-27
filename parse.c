@@ -1612,7 +1612,7 @@ static Token *tokenize(File *file)
             {
                 if (p[0] && p[1] && strchr("eEpP", p[0]) && strchr("+-", p[1]))
                     p += 2;
-                else if (isalnum(*p) || *p == '.')
+                else if (isalnum(*p) || *p == '.' || *p == '_')
                     p++;
                 else
                     break;

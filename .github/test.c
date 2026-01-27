@@ -1067,6 +1067,28 @@ void test_enum_shadow_statement_form(void)
     CHECK(1, "enum shadow: statement T*x compiles as multiplication");
 }
 
+// BUG REGRESSION: pp-number with underscore (1024_160) should be single token
+// Issue: tokenizer treated "1024_160" as two tokens: "1024" and "_160"
+// This broke token pasting macros like: prefix##1024_160##_suffix
+#define PP_PASTE_TEST(x) \
+    extern int test_prefix_##x##_suffix;
+
+PP_PASTE_TEST(1024_160)
+PP_PASTE_TEST(2048_224)
+PP_PASTE_TEST(2048_256)
+
+// Verify the pasted tokens are valid by using them
+extern int test_prefix_1024_160_suffix;
+extern int test_prefix_2048_224_suffix;
+extern int test_prefix_2048_256_suffix;
+
+void test_ppnum_underscore_paste(void)
+{
+    // If we got here, the token pasting compiled correctly
+    // The declarations above would fail if 1024_160 was tokenized as two tokens
+    CHECK(1, "pp-number underscore paste: 1024_160 is single token");
+}
+
 void run_bug_regression_tests(void)
 {
     printf("\n=== BUG REGRESSION TESTS ===\n");
@@ -1082,6 +1104,7 @@ void run_bug_regression_tests(void)
     test_enum_constant_shadows_typedef();
     test_enum_shadow_star_ambiguity();
     test_enum_shadow_statement_form();
+    test_ppnum_underscore_paste();
 }
 
 // SECTION 7: ADVANCED DEFER TESTS
