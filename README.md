@@ -14,7 +14,7 @@ Prism is a propper transpiler, not a preprocessor macro.
 * **Detect Errors:** It catches unsafe patterns (like jumping into a scope with `goto`) before they become runtime bugs.
 
 ### Status
-Prism can parse & preprocess **large complex C projects** like `OpenSSL`, `Bash`, `Dash`.
+Prism can parse & preprocess large complex C projects like `OpenSSL`, `SQlite`, `Bash`, `Dash`.
 
 All validation & edge tests pass, but,
 There is some edge cases still to be caught in the parsing, **huge speedups** and runtime memory savings to be had.

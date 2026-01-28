@@ -589,9 +589,30 @@ static char *build_compiler_cmd(const char *base_cmd)
 
 static void pp_add_include_path(const char *path)
 {
+    char *real = realpath(path, NULL);
+    const char *canonical = real ? real : path;
+
+    // Check if this path is already in the list
+    for (int i = 0; i < pp_include_paths_count; i++)
+    {
+        char *existing_real = realpath(pp_include_paths[i], NULL);
+        const char *existing = existing_real ? existing_real : pp_include_paths[i];
+        bool same = (strcmp(canonical, existing) == 0);
+        if (existing_real)
+            free(existing_real);
+        if (same)
+        {
+            if (real)
+                free(real);
+            return; // Path already exists, skip adding
+        }
+    }
+
     char **new_paths = realloc(pp_include_paths, sizeof(char *) * (pp_include_paths_count + 1));
     if (!new_paths)
     {
+        if (real)
+            free(real);
         fprintf(stderr, "out of memory adding include path\n");
         exit(1);
     }
@@ -599,10 +620,14 @@ static void pp_add_include_path(const char *path)
     char *dup = strdup(path);
     if (!dup)
     {
+        if (real)
+            free(real);
         fprintf(stderr, "out of memory duplicating include path\n");
         exit(1);
     }
     pp_include_paths[pp_include_paths_count++] = dup;
+    if (real)
+        free(real);
 }
 
 // Helper to find GCC include path by scanning directories

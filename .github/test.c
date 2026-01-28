@@ -3149,10 +3149,8 @@ void run_preprocessor_numeric_tests(void)
     test_bf16_suffix();
 }
 
-// PREPROCESSOR MACRO CACHE TESTS
+// PREPROCESSOR SYSTEM MACRO TESTS
 
-// Regression tests for: Cache corruption causing missing linux/__linux__ macros
-// which broke OpenSSL KTLS detection and signal handling
 
 #include <signal.h>
 
@@ -3252,10 +3250,10 @@ void test_posix_macros(void)
 #endif
 }
 
-void run_preprocessor_cache_tests(void)
+void run_preprocessor_system_macro_tests(void)
 {
-    printf("\n=== PREPROCESSOR CACHE TESTS ===\n");
-    printf("(Tests for macro cache integrity)\n\n");
+    printf("\n=== PREPROCESSOR SYSTEM MACRO TESTS ===\n");
+    printf("(Tests for system macro import integrity)\n\n");
 
     test_linux_macros();
     test_signal_macros();
@@ -3287,7 +3285,7 @@ int main(void)
     run_sizeof_constexpr_tests();
     run_manual_offsetof_vla_tests();
     run_preprocessor_numeric_tests();
-    run_preprocessor_cache_tests();
+    run_preprocessor_system_macro_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);
