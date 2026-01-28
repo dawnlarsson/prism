@@ -92,6 +92,8 @@ typedef struct
     char *contents;
     char *display_name;
     int line_delta;
+    int *line_offsets; // Array of byte offsets where each line starts
+    int line_count;    // Number of lines (size of line_offsets array)
 } File;
 
 // Token kinds (fits in 4 bits, but we use 8 for alignment)
@@ -134,6 +136,81 @@ static inline bool tok_at_bol(Token *tok);
 static inline bool tok_has_space(Token *tok);
 static inline void tok_set_at_bol(Token *tok, bool v);
 static inline void tok_set_has_space(Token *tok, bool v);
+
+// Arena Allocator for Tokens
+// Allocates tokens in large blocks to avoid per-token malloc overhead
+
+#define ARENA_BLOCK_SIZE 4096 // Tokens per block
+
+typedef struct ArenaBlock ArenaBlock;
+struct ArenaBlock
+{
+    ArenaBlock *next;
+    int used;
+    Token tokens[ARENA_BLOCK_SIZE];
+};
+
+typedef struct
+{
+    ArenaBlock *head;    // First block (for freeing)
+    ArenaBlock *current; // Current block for allocation
+} TokenArena;
+
+static TokenArena token_arena = {0};
+
+static Token *arena_alloc_token(void)
+{
+    if (!token_arena.current || token_arena.current->used >= ARENA_BLOCK_SIZE)
+    {
+        // Allocate new block
+        ArenaBlock *block = malloc(sizeof(ArenaBlock));
+        if (!block)
+        {
+            fprintf(stderr, "out of memory allocating token arena block\n");
+            exit(1);
+        }
+        block->next = NULL;
+        block->used = 0;
+
+        if (token_arena.current)
+        {
+            token_arena.current->next = block;
+        }
+        else
+        {
+            token_arena.head = block;
+        }
+        token_arena.current = block;
+    }
+
+    Token *tok = &token_arena.current->tokens[token_arena.current->used++];
+    memset(tok, 0, sizeof(Token));
+    return tok;
+}
+
+// Reset arena for reuse (keeps memory allocated)
+static void arena_reset(void)
+{
+    for (ArenaBlock *b = token_arena.head; b; b = b->next)
+    {
+        b->used = 0;
+    }
+    token_arena.current = token_arena.head;
+}
+
+// Free all arena memory
+static void arena_free(void)
+{
+    ArenaBlock *b = token_arena.head;
+    while (b)
+    {
+        ArenaBlock *next = b->next;
+        free(b);
+        b = next;
+    }
+    token_arena.head = NULL;
+    token_arena.current = NULL;
+}
 
 // Minimal type info (only for string literals)
 typedef enum
@@ -210,6 +287,8 @@ struct MacroArg
 {
     MacroArg *next;
     char *name;
+    int name_len;       // Cached length for fast comparison
+    uint32_t name_hash; // Cached hash for fast comparison
     bool is_va_args;
     Token *tok;
 };
@@ -245,6 +324,15 @@ static HashMap macros;
 static CondIncl *cond_incl;
 static HashMap included_files;
 static bool pp_eval_skip = false;
+
+// Hash set for fast feature test macro lookup
+static HashMap feature_test_macro_set;
+
+// Include path negative cache: tracks (dir, filename) pairs known to not exist
+static HashMap include_path_cache;
+
+// Forward declaration for hashmap_get2 (needed before is_feature_test_macro)
+static void *hashmap_get2(HashMap *map, char *key, int keylen);
 
 // Feature test macros that need to be passed through to the backend compiler
 // These must be defined before system headers for glibc to expose certain functions
@@ -286,13 +374,7 @@ static int feature_test_macro_count = 0;
 
 static bool is_feature_test_macro(const char *name, int len)
 {
-    for (int i = 0; feature_test_macro_names[i]; i++)
-    {
-        if (strlen(feature_test_macro_names[i]) == (size_t)len &&
-            strncmp(feature_test_macro_names[i], name, len) == 0)
-            return true;
-    }
-    return false;
+    return hashmap_get2(&feature_test_macro_set, (char *)name, len) != NULL;
 }
 
 static void record_feature_test_macro(const char *name, int name_len, Token *body)
@@ -382,11 +464,13 @@ static Type *array_of(Type *base, int len)
     return ty;
 }
 
-// Hideset for macro expansion
+// Hideset for macro expansion (with pre-computed hash for fast lookup)
 struct Hideset
 {
     Hideset *next;
     char *name;
+    int len;       // Length of name (avoid strlen)
+    uint32_t hash; // Pre-computed hash for fast comparison
 };
 
 static void pp_add_include_path(const char *path)
@@ -587,19 +671,41 @@ static void strarray_push(StringArray *arr, char *s)
 
 __attribute__((format(printf, 1, 2))) static char *format(char *fmt, ...)
 {
-    char *buf;
-    size_t buflen;
-    FILE *fp = open_memstream(&buf, &buflen);
+    // Fast path: use stack buffer for small strings
+    char stack_buf[512];
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(fp, fmt, ap);
+    int len = vsnprintf(stack_buf, sizeof(stack_buf), fmt, ap);
     va_end(ap);
-    fclose(fp);
-    if (buflen > FORMAT_MAX_SIZE)
+
+    if (len < 0)
     {
-        fprintf(stderr, "formatted string too large (%zu bytes, max %d)\n", buflen, FORMAT_MAX_SIZE);
+        fprintf(stderr, "format error\n");
         exit(1);
     }
+
+    if ((size_t)len < sizeof(stack_buf))
+    {
+        // Fits in stack buffer, just duplicate it
+        return strndup(stack_buf, len);
+    }
+
+    // Large string: allocate exact size and format again
+    if (len > FORMAT_MAX_SIZE)
+    {
+        fprintf(stderr, "formatted string too large (%d bytes, max %d)\n", len, FORMAT_MAX_SIZE);
+        exit(1);
+    }
+
+    char *buf = malloc(len + 1);
+    if (!buf)
+    {
+        fprintf(stderr, "out of memory in format\n");
+        exit(1);
+    }
+    va_start(ap, fmt);
+    vsnprintf(buf, len + 1, fmt, ap);
+    va_end(ap);
     return buf;
 }
 
@@ -749,18 +855,27 @@ static inline File *tok_file(Token *tok)
     return input_files[tok->file_idx];
 }
 
-// Get line number for a token by scanning from file start
-// This is called only for error messages, so O(n) is acceptable
+// Get line number for a token using binary search on line offset table
+// O(log n) instead of O(n) scanning
 static int tok_line_no(Token *tok)
 {
     File *f = tok_file(tok);
     if (!f || !f->contents || !tok->loc)
         return 1;
-    int line = 1;
-    for (char *p = f->contents; p < tok->loc && *p; p++)
-        if (*p == '\n')
-            line++;
-    return line;
+
+    int offset = (int)(tok->loc - f->contents);
+
+    // Binary search for the line containing this offset
+    int lo = 0, hi = f->line_count - 1;
+    while (lo < hi)
+    {
+        int mid = lo + (hi - lo + 1) / 2;
+        if (f->line_offsets[mid] <= offset)
+            lo = mid;
+        else
+            hi = mid - 1;
+    }
+    return lo + 1; // Lines are 1-indexed
 }
 
 // Flag accessors
@@ -835,8 +950,6 @@ static inline void tok_set_type(Token *tok, Type *ty)
     if (ty)
         hashmap_put2(&token_types, (char *)&tok, sizeof(tok), ty);
 }
-
-// =============================================================================
 
 // Unicode
 static uint32_t decode_utf8(char **new_pos, char *p)
@@ -1069,9 +1182,11 @@ static void warn_tok(Token *tok, char *fmt, ...)
     va_end(ap);
 }
 
-static bool equal(Token *tok, char *op)
+// Use inline function with __builtin_constant_p for compile-time strlen when possible
+static inline bool equal(Token *tok, const char *op)
 {
-    return tok->len == strlen(op) && !memcmp(tok->loc, op, tok->len);
+    size_t len = __builtin_constant_p(*op) ? __builtin_strlen(op) : strlen(op);
+    return tok->len == len && !memcmp(tok->loc, op, len);
 }
 
 static Token *skip(Token *tok, char *op)
@@ -1094,12 +1209,7 @@ static bool consume(Token **rest, Token *tok, char *str)
 
 static Token *new_token(TokenKind kind, char *start, char *end)
 {
-    Token *tok = calloc(1, sizeof(Token));
-    if (!tok)
-    {
-        fprintf(stderr, "out of memory in new_token\n");
-        exit(1);
-    }
+    Token *tok = arena_alloc_token();
     tok->kind = kind;
     tok->loc = start;
     tok->len = end - start;
@@ -1144,95 +1254,138 @@ static int from_hex(char c)
 
 static int read_punct(char *p)
 {
+    // Fast path: check 3-char punctuators first
+    if (p[0] && p[1] && p[2])
+    {
+        if (p[0] == '<' && p[1] == '<' && p[2] == '=')
+            return 3;
+        if (p[0] == '>' && p[1] == '>' && p[2] == '=')
+            return 3;
+        if (p[0] == '.' && p[1] == '.' && p[2] == '.')
+            return 3;
+    }
+    // Check 2-char punctuators using first character as index
+    if (p[0] && p[1])
+    {
+        switch (p[0])
+        {
+        case '=':
+            if (p[1] == '=')
+                return 2;
+            break;
+        case '!':
+            if (p[1] == '=')
+                return 2;
+            break;
+        case '<':
+            if (p[1] == '=' || p[1] == '<')
+                return 2;
+            break;
+        case '>':
+            if (p[1] == '=' || p[1] == '>')
+                return 2;
+            break;
+        case '-':
+            if (p[1] == '>' || p[1] == '=' || p[1] == '-')
+                return 2;
+            break;
+        case '+':
+            if (p[1] == '=' || p[1] == '+')
+                return 2;
+            break;
+        case '*':
+            if (p[1] == '=')
+                return 2;
+            break;
+        case '/':
+            if (p[1] == '=')
+                return 2;
+            break;
+        case '%':
+            if (p[1] == '=')
+                return 2;
+            break;
+        case '&':
+            if (p[1] == '=' || p[1] == '&')
+                return 2;
+            break;
+        case '|':
+            if (p[1] == '=' || p[1] == '|')
+                return 2;
+            break;
+        case '^':
+            if (p[1] == '=')
+                return 2;
+            break;
+        case '#':
+            if (p[1] == '#')
+                return 2;
+            break;
+        }
+    }
+    return ispunct((unsigned char)*p) ? 1 : 0;
+}
+
+static HashMap keyword_map;
+
+static void init_keyword_map(void)
+{
     static char *kw[] = {
-        "<<=",
-        ">>=",
-        "...",
-        "==",
-        "!=",
-        "<=",
-        ">=",
-        "->",
-        "+=",
-        "-=",
-        "*=",
-        "/=",
-        "++",
-        "--",
-        "%=",
-        "&=",
-        "|=",
-        "^=",
-        "&&",
-        "||",
-        "<<",
-        ">>",
-        "##",
+        "return",
+        "if",
+        "else",
+        "for",
+        "while",
+        "int",
+        "sizeof",
+        "char",
+        "struct",
+        "union",
+        "short",
+        "long",
+        "void",
+        "typedef",
+        "_Bool",
+        "enum",
+        "static",
+        "goto",
+        "break",
+        "continue",
+        "switch",
+        "case",
+        "default",
+        "extern",
+        "_Alignof",
+        "_Alignas",
+        "do",
+        "signed",
+        "unsigned",
+        "const",
+        "volatile",
+        "auto",
+        "register",
+        "restrict",
+        "__restrict",
+        "__restrict__",
+        "_Noreturn",
+        "float",
+        "double",
+        "typeof",
+        "asm",
+        "_Thread_local",
+        "__thread",
+        "_Atomic",
+        "__attribute__",
+        "defer", // Prism extension
+        "raw",   // Prism extension: skip zero-init
     };
     for (int i = 0; i < sizeof(kw) / sizeof(*kw); i++)
-        if (startswith(p, kw[i]))
-            return strlen(kw[i]);
-    return ispunct(*p) ? 1 : 0;
+        hashmap_put(&keyword_map, kw[i], (void *)1);
 }
 
 static bool is_keyword(Token *tok)
 {
-    static HashMap map;
-    if (!map.capacity)
-    {
-        static char *kw[] = {
-            "return",
-            "if",
-            "else",
-            "for",
-            "while",
-            "int",
-            "sizeof",
-            "char",
-            "struct",
-            "union",
-            "short",
-            "long",
-            "void",
-            "typedef",
-            "_Bool",
-            "enum",
-            "static",
-            "goto",
-            "break",
-            "continue",
-            "switch",
-            "case",
-            "default",
-            "extern",
-            "_Alignof",
-            "_Alignas",
-            "do",
-            "signed",
-            "unsigned",
-            "const",
-            "volatile",
-            "auto",
-            "register",
-            "restrict",
-            "__restrict",
-            "__restrict__",
-            "_Noreturn",
-            "float",
-            "double",
-            "typeof",
-            "asm",
-            "_Thread_local",
-            "__thread",
-            "_Atomic",
-            "__attribute__",
-            "defer", // Prism extension
-            "raw",   // Prism extension: skip zero-init
-        };
-        for (int i = 0; i < sizeof(kw) / sizeof(*kw); i++)
-            hashmap_put(&map, kw[i], (void *)1);
-    }
-    return hashmap_get2(&map, tok->loc, tok->len);
+    return hashmap_get2(&keyword_map, tok->loc, tok->len) != NULL;
 }
 
 static int read_escaped_char(char **new_pos, char *p)
@@ -1560,6 +1713,31 @@ static File *new_file(char *name, int file_no, char *contents)
     file->display_name = name;
     file->file_no = file_no;
     file->contents = contents;
+
+    // Build line offset table for O(log n) line number lookups
+    // First pass: count lines
+    int line_count = 1;
+    for (char *p = contents; *p; p++)
+        if (*p == '\n')
+            line_count++;
+
+    // Allocate and fill line offset table
+    file->line_offsets = malloc(sizeof(int) * line_count);
+    if (!file->line_offsets)
+    {
+        fprintf(stderr, "out of memory allocating line table\n");
+        exit(1);
+    }
+    file->line_count = line_count;
+
+    int line = 0;
+    file->line_offsets[line++] = 0; // Line 1 starts at offset 0
+    for (char *p = contents; *p; p++)
+    {
+        if (*p == '\n' && *(p + 1))
+            file->line_offsets[line++] = (int)(p + 1 - contents);
+    }
+
     return file;
 }
 
@@ -1798,12 +1976,7 @@ static Token *skip_line_quiet(Token *tok)
 
 static Token *copy_token(Token *tok)
 {
-    Token *t = calloc(1, sizeof(Token));
-    if (!t)
-    {
-        fprintf(stderr, "out of memory in copy_token\n");
-        exit(1);
-    }
+    Token *t = arena_alloc_token();
     *t = *tok;
     t->next = NULL;
     return t;
@@ -1836,6 +2009,8 @@ static Hideset *new_hideset(char *name)
         exit(1);
     }
     hs->name = name;
+    hs->len = strlen(name);
+    hs->hash = fnv_hash(name, hs->len);
     return hs;
 }
 
@@ -1851,8 +2026,9 @@ static Hideset *hideset_union(Hideset *hs1, Hideset *hs2)
 
 static bool hideset_contains(Hideset *hs, char *s, int len)
 {
+    uint32_t h = fnv_hash(s, len);
     for (; hs; hs = hs->next)
-        if (strlen(hs->name) == len && !memcmp(hs->name, s, len))
+        if (hs->hash == h && hs->len == len && !memcmp(hs->name, s, len))
             return true;
     return false;
 }
@@ -1862,7 +2038,7 @@ static Hideset *hideset_intersection(Hideset *hs1, Hideset *hs2)
     Hideset head = {};
     Hideset *cur = &head;
     for (; hs1; hs1 = hs1->next)
-        if (hideset_contains(hs2, hs1->name, strlen(hs1->name)))
+        if (hideset_contains(hs2, hs1->name, hs1->len))
             cur = cur->next = new_hideset(hs1->name);
     return head.next;
 }
@@ -1965,6 +2141,8 @@ static MacroArg *read_macro_args(Token **rest, Token *tok, MacroParam *params, c
 
         MacroArg *arg = calloc(1, sizeof(MacroArg));
         arg->name = pp->name;
+        arg->name_len = strlen(pp->name);
+        arg->name_hash = fnv_hash(pp->name, arg->name_len);
 
         Token arg_head = {};
         Token *arg_cur = &arg_head;
@@ -1996,6 +2174,8 @@ static MacroArg *read_macro_args(Token **rest, Token *tok, MacroParam *params, c
     {
         MacroArg *arg = calloc(1, sizeof(MacroArg));
         arg->name = va_name;
+        arg->name_len = strlen(va_name);
+        arg->name_hash = fnv_hash(va_name, arg->name_len);
         arg->is_va_args = true;
 
         Token arg_head = {};
@@ -2029,8 +2209,9 @@ static MacroArg *read_macro_args(Token **rest, Token *tok, MacroParam *params, c
 
 static Token *find_arg(MacroArg *args, Token *tok)
 {
+    uint32_t h = fnv_hash(tok->loc, tok->len);
     for (MacroArg *ap = args; ap; ap = ap->next)
-        if (tok->len == strlen(ap->name) && !memcmp(tok->loc, ap->name, tok->len))
+        if (ap->name_hash == h && tok->len == ap->name_len && !memcmp(tok->loc, ap->name, tok->len))
             return ap->tok;
     return NULL;
 }
@@ -2233,12 +2414,24 @@ static bool expand_macro(Token **rest, Token *tok)
 
 static char *search_include_paths(char *filename)
 {
+    int filename_len = strlen(filename);
     for (int i = 0; i < pp_include_paths_count; i++)
     {
+        // Build cache key: "dir_index:filename"
+        char cache_key[PATH_MAX + 16];
+        int key_len = snprintf(cache_key, sizeof(cache_key), "%d:%s", i, filename);
+
+        // Check negative cache
+        if (hashmap_get2(&include_path_cache, cache_key, key_len) != NULL)
+            continue; // Known not to exist in this path
+
         char *path = format("%s/%s", pp_include_paths[i], filename);
         struct stat st;
         if (stat(path, &st) == 0)
             return path;
+
+        // Add to negative cache
+        hashmap_put2(&include_path_cache, strndup(cache_key, key_len), key_len, (void *)1);
         free(path);
     }
     return NULL;
@@ -3257,15 +3450,29 @@ void pp_reset(void)
 {
     hashmap_clear(&macros);
     hashmap_clear(&included_files);
+    hashmap_clear(&token_hidesets);
+    hashmap_clear(&token_origins);
+    hashmap_clear(&token_fvals);
+    hashmap_clear(&token_types);
+    hashmap_clear(&include_path_cache);
     cond_incl = NULL;
     pp_eval_skip = false;
     reset_feature_test_macros();
+    arena_reset(); // Reset token arena for reuse
 }
 
 void pp_init(void)
 {
-    // Reset any existing state first
     pp_reset();
+
+    if (!keyword_map.capacity)
+        init_keyword_map();
+
+    if (!feature_test_macro_set.capacity)
+    {
+        for (int i = 0; feature_test_macro_names[i]; i++)
+            hashmap_put(&feature_test_macro_set, (char *)feature_test_macro_names[i], (void *)1);
+    }
 
     int imported = pp_import_system_macros();
     (void)imported; // May be -1 if compiler not found, we'll use fallbacks

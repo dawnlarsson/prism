@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.73.0"
+#define PRISM_VERSION "0.74.0"
 
 #include "parse.c"
 
@@ -84,6 +84,9 @@ static void prism_free(PrismResult *r);
 static bool feature_defer = true;
 static bool feature_zeroinit = true;
 
+// Hash set for type keywords (initialized once)
+static HashMap type_keyword_map;
+
 // Extra preprocessor configuration (set by CLI before transpile)
 static const char **extra_include_paths = NULL;
 static int extra_include_count = 0;
@@ -125,6 +128,7 @@ typedef struct
   LabelInfo *labels; // Dynamic array
   int count;
   int capacity;
+  HashMap name_map; // For O(1) lookups by name
 } LabelTable;
 
 typedef struct
@@ -176,9 +180,127 @@ static int *stmt_expr_levels = NULL; // defer_depth when stmt expr started (dyna
 static int stmt_expr_count = 0;      // number of active statement expressions
 static int stmt_expr_capacity = 0;   // capacity of stmt_expr_levels array
 
-// Token emission
-static FILE *out;
+// Token emission - Buffered Output Writer
+// Uses a memory buffer to batch small writes, significantly faster than per-token fprintf
+#define OUT_BUF_SIZE (64 * 1024) // 64KB buffer
+
+typedef struct
+{
+  FILE *fp;
+  char *buf;
+  size_t pos;
+  size_t cap;
+} OutputBuffer;
+
+static OutputBuffer out_buf = {0};
 static Token *last_emitted = NULL;
+
+static void out_init(FILE *fp)
+{
+  out_buf.fp = fp;
+  if (!out_buf.buf)
+  {
+    out_buf.buf = malloc(OUT_BUF_SIZE);
+    if (!out_buf.buf)
+    {
+      fprintf(stderr, "out of memory allocating output buffer\n");
+      exit(1);
+    }
+    out_buf.cap = OUT_BUF_SIZE;
+  }
+  out_buf.pos = 0;
+}
+
+static void out_flush(void)
+{
+  if (out_buf.pos > 0 && out_buf.fp)
+  {
+    fwrite(out_buf.buf, 1, out_buf.pos, out_buf.fp);
+    out_buf.pos = 0;
+  }
+}
+
+static void out_close(void)
+{
+  out_flush();
+  if (out_buf.fp)
+  {
+    fclose(out_buf.fp);
+    out_buf.fp = NULL;
+  }
+}
+
+static inline void out_char(char c)
+{
+  if (out_buf.pos >= out_buf.cap)
+  {
+    out_flush();
+  }
+  out_buf.buf[out_buf.pos++] = c;
+}
+
+static void out_str(const char *s, size_t len)
+{
+  // If it fits in buffer, copy directly
+  if (out_buf.pos + len <= out_buf.cap)
+  {
+    memcpy(out_buf.buf + out_buf.pos, s, len);
+    out_buf.pos += len;
+    return;
+  }
+  // Flush and handle large writes
+  out_flush();
+  if (len >= out_buf.cap)
+  {
+    // Write directly for very large strings
+    fwrite(s, 1, len, out_buf.fp);
+  }
+  else
+  {
+    memcpy(out_buf.buf, s, len);
+    out_buf.pos = len;
+  }
+}
+
+__attribute__((format(printf, 1, 2))) static void out_printf(const char *fmt, ...)
+{
+  // Use remaining buffer space for formatting
+  size_t remaining = out_buf.cap - out_buf.pos;
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(out_buf.buf + out_buf.pos, remaining, fmt, ap);
+  va_end(ap);
+
+  if (n >= 0 && (size_t)n < remaining)
+  {
+    out_buf.pos += n;
+    return;
+  }
+
+  // Didn't fit - flush and retry with full buffer
+  out_flush();
+  va_start(ap, fmt);
+  n = vsnprintf(out_buf.buf, out_buf.cap, fmt, ap);
+  va_end(ap);
+
+  if (n >= 0 && (size_t)n < out_buf.cap)
+  {
+    out_buf.pos = n;
+  }
+  else if (n >= 0)
+  {
+    // Still too large - allocate temporary and write directly
+    char *tmp = malloc(n + 1);
+    if (tmp)
+    {
+      va_start(ap, fmt);
+      vsnprintf(tmp, n + 1, fmt, ap);
+      va_end(ap);
+      fwrite(tmp, 1, n, out_buf.fp);
+      free(tmp);
+    }
+  }
+}
 
 // Line tracking for #line directives
 static int last_line_no = 0;
@@ -404,11 +526,11 @@ static void emit_tok(Token *tok)
   // Handle newlines and spacing
   if (tok_at_bol(tok))
   {
-    fputc('\n', out);
+    out_char('\n');
     // Emit #line directive on new line if needed
     if (need_line_directive)
     {
-      fprintf(out, "#line %d \"%s\"\n", line_no, current_file ? current_file : "unknown");
+      out_printf("#line %d \"%s\"\n", line_no, current_file ? current_file : "unknown");
       last_line_no = line_no;
       last_filename = current_file;
     }
@@ -422,18 +544,18 @@ static void emit_tok(Token *tok)
     // Not at beginning of line - emit #line before token if file/line changed significantly
     if (need_line_directive)
     {
-      fputc('\n', out);
-      fprintf(out, "#line %d \"%s\"\n", line_no, current_file ? current_file : "unknown");
+      out_char('\n');
+      out_printf("#line %d \"%s\"\n", line_no, current_file ? current_file : "unknown");
       last_line_no = line_no;
       last_filename = current_file;
     }
     else if (needs_space(last_emitted, tok))
     {
-      fputc(' ', out);
+      out_char(' ');
     }
   }
 
-  fprintf(out, "%.*s", tok->len, tok->loc);
+  out_str(tok->loc, tok->len);
   last_emitted = tok;
 }
 
@@ -452,9 +574,9 @@ static void emit_scope_defers(void)
   DeferScope *scope = &defer_stack[defer_depth - 1];
   for (int i = scope->count - 1; i >= 0; i--)
   {
-    fputc(' ', out);
+    out_char(' ');
     emit_range(scope->stmts[i], scope->ends[i]);
-    fputc(';', out);
+    out_char(';');
   }
 }
 
@@ -466,9 +588,9 @@ static void emit_all_defers(void)
     DeferScope *scope = &defer_stack[d];
     for (int i = scope->count - 1; i >= 0; i--)
     {
-      fputc(' ', out);
+      out_char(' ');
       emit_range(scope->stmts[i], scope->ends[i]);
-      fputc(';', out);
+      out_char(';');
     }
   }
 }
@@ -481,9 +603,9 @@ static void emit_break_defers(void)
     DeferScope *scope = &defer_stack[d];
     for (int i = scope->count - 1; i >= 0; i--)
     {
-      fputc(' ', out);
+      out_char(' ');
       emit_range(scope->stmts[i], scope->ends[i]);
-      fputc(';', out);
+      out_char(';');
     }
     if (scope->is_loop || scope->is_switch)
       break;
@@ -499,9 +621,9 @@ static void emit_continue_defers(void)
     DeferScope *scope = &defer_stack[d];
     for (int i = scope->count - 1; i >= 0; i--)
     {
-      fputc(' ', out);
+      out_char(' ');
       emit_range(scope->stmts[i], scope->ends[i]);
-      fputc(';', out);
+      out_char(';');
     }
     if (scope->is_loop)
       break;
@@ -558,17 +680,14 @@ static void label_table_add(char *name, int name_len, int scope_depth)
   info->name = name;
   info->name_len = name_len;
   info->scope_depth = scope_depth;
+  // Store scope_depth + 1 so 0 (NULL) means "not found"
+  hashmap_put2(&label_table.name_map, name, name_len, (void *)(intptr_t)(scope_depth + 1));
 }
 
 static int label_table_lookup(char *name, int name_len)
 {
-  for (int i = 0; i < label_table.count; i++)
-  {
-    LabelInfo *info = &label_table.labels[i];
-    if (info->name_len == name_len && !memcmp(info->name, name, name_len))
-      return info->scope_depth;
-  }
-  return -1; // Not found
+  void *val = hashmap_get2(&label_table.name_map, name, name_len);
+  return val ? (int)(intptr_t)val - 1 : -1;
 }
 
 // Typedef tracking for zero-init
@@ -801,9 +920,10 @@ static bool is_label(Token *tok)
 static void scan_labels_in_function(Token *tok)
 {
   label_table.count = 0;
-  current_func_has_setjmp = false; // Reset for new function
-  current_func_has_asm = false;    // Reset for new function
-  current_func_has_vfork = false;  // Reset for new function
+  hashmap_clear(&label_table.name_map); // Clear for O(1) lookups
+  current_func_has_setjmp = false;      // Reset for new function
+  current_func_has_asm = false;         // Reset for new function
+  current_func_has_vfork = false;       // Reset for new function
   if (!tok || !equal(tok, "{"))
     return;
 
@@ -930,9 +1050,9 @@ static void emit_goto_defers(int target_depth)
     DeferScope *scope = &defer_stack[d];
     for (int i = scope->count - 1; i >= 0; i--)
     {
-      fputc(' ', out);
+      out_char(' ');
       emit_range(scope->stmts[i], scope->ends[i]);
-      fputc(';', out);
+      out_char(';');
     }
   }
 }
@@ -1600,34 +1720,79 @@ static void parse_typedef_declaration(Token *tok, int scope_depth)
 }
 
 // Zero-init helpers
+static void init_type_keyword_map(void)
+{
+  static char *type_kw[] = {
+      // Standard C type keywords
+      "int",
+      "char",
+      "short",
+      "long",
+      "float",
+      "double",
+      "void",
+      "signed",
+      "unsigned",
+      "struct",
+      "union",
+      "enum",
+      "_Bool",
+      "bool",
+      // typeof extensions
+      "typeof",
+      "__typeof__",
+      "__typeof",
+      "typeof_unqual",
+      // Common typedefs from stdint.h, stddef.h
+      "size_t",
+      "ssize_t",
+      "ptrdiff_t",
+      "intptr_t",
+      "uintptr_t",
+      "intmax_t",
+      "uintmax_t",
+      "int8_t",
+      "int16_t",
+      "int32_t",
+      "int64_t",
+      "uint8_t",
+      "uint16_t",
+      "uint32_t",
+      "uint64_t",
+      "int_fast8_t",
+      "int_fast16_t",
+      "int_fast32_t",
+      "int_fast64_t",
+      "uint_fast8_t",
+      "uint_fast16_t",
+      "uint_fast32_t",
+      "uint_fast64_t",
+      "int_least8_t",
+      "int_least16_t",
+      "int_least32_t",
+      "int_least64_t",
+      "uint_least8_t",
+      "uint_least16_t",
+      "uint_least32_t",
+      "uint_least64_t",
+      "time_t",
+      "off_t",
+      "pid_t",
+      "FILE",
+      "fpos_t",
+      "wchar_t",
+      "wint_t",
+  };
+  for (int i = 0; i < (int)(sizeof(type_kw) / sizeof(*type_kw)); i++)
+    hashmap_put(&type_keyword_map, type_kw[i], (void *)1);
+}
+
 static bool is_type_keyword(Token *tok)
 {
   if (tok->kind != TK_KEYWORD && tok->kind != TK_IDENT)
     return false;
-  // Standard C type keywords
-  if (equal(tok, "int") || equal(tok, "char") || equal(tok, "short") ||
-      equal(tok, "long") || equal(tok, "float") || equal(tok, "double") ||
-      equal(tok, "void") || equal(tok, "signed") || equal(tok, "unsigned") ||
-      equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum") ||
-      equal(tok, "_Bool") || equal(tok, "bool"))
-    return true;
-  // typeof (GCC/C23 extension)
-  if (equal(tok, "typeof") || equal(tok, "__typeof__") || equal(tok, "__typeof") ||
-      equal(tok, "typeof_unqual"))
-    return true;
-  // Common typedef types from stdint.h, stddef.h, etc.
-  if (equal(tok, "size_t") || equal(tok, "ssize_t") || equal(tok, "ptrdiff_t") ||
-      equal(tok, "intptr_t") || equal(tok, "uintptr_t") ||
-      equal(tok, "intmax_t") || equal(tok, "uintmax_t") ||
-      equal(tok, "int8_t") || equal(tok, "int16_t") || equal(tok, "int32_t") || equal(tok, "int64_t") ||
-      equal(tok, "uint8_t") || equal(tok, "uint16_t") || equal(tok, "uint32_t") || equal(tok, "uint64_t") ||
-      equal(tok, "int_fast8_t") || equal(tok, "int_fast16_t") || equal(tok, "int_fast32_t") || equal(tok, "int_fast64_t") ||
-      equal(tok, "uint_fast8_t") || equal(tok, "uint_fast16_t") || equal(tok, "uint_fast32_t") || equal(tok, "uint_fast64_t") ||
-      equal(tok, "int_least8_t") || equal(tok, "int_least16_t") || equal(tok, "int_least32_t") || equal(tok, "int_least64_t") ||
-      equal(tok, "uint_least8_t") || equal(tok, "uint_least16_t") || equal(tok, "uint_least32_t") || equal(tok, "uint_least64_t") ||
-      equal(tok, "time_t") || equal(tok, "off_t") || equal(tok, "pid_t") ||
-      equal(tok, "FILE") || equal(tok, "fpos_t") ||
-      equal(tok, "wchar_t") || equal(tok, "wint_t"))
+  // Check hash set first
+  if (hashmap_get2(&type_keyword_map, tok->loc, tok->len))
     return true;
   // User-defined typedefs (tracked during transpilation)
   if (is_known_typedef(tok))
@@ -2433,9 +2598,9 @@ static Token *try_zero_init_decl(Token *tok)
     if (!has_init && !effective_vla && !is_raw)
     {
       if (is_array || ((is_struct_type || is_typedef_type) && !is_pointer))
-        fprintf(out, " = {0}");
+        out_str(" = {0}", 6);
       else
-        fprintf(out, " = 0");
+        out_str(" = 0", 4);
     }
 
     // If has initializer, emit it (= and everything up to , or ;)
@@ -2485,6 +2650,10 @@ static Token *try_zero_init_decl(Token *tok)
 
 static int transpile(char *input_file, char *output_file)
 {
+  // Initialize type keyword map (only done once)
+  if (!type_keyword_map.capacity)
+    init_type_keyword_map();
+
   pp_init();
   pp_add_default_include_paths();
 
@@ -2565,9 +2734,10 @@ static int transpile(char *input_file, char *output_file)
 
   tok = preprocess(tok);
 
-  out = fopen(output_file, "w");
-  if (!out)
+  FILE *out_fp = fopen(output_file, "w");
+  if (!out_fp)
     return 0;
+  out_init(out_fp);
 
   // Emit feature test macros at the very start of the output
   // These must come before any #include <...> directives for glibc to work correctly
@@ -2578,20 +2748,20 @@ static int transpile(char *input_file, char *output_file)
     for (int i = 0; i < ftm_count; i++)
     {
       // Wrap in #ifndef to avoid redefinition if already defined (e.g., by -include config.h)
-      fprintf(out, "#ifndef %s\n", ftm_names[i]);
-      fprintf(out, "#define %s %s\n", ftm_names[i], ftm_values[i]);
-      fprintf(out, "#endif\n");
+      out_printf("#ifndef %s\n", ftm_names[i]);
+      out_printf("#define %s %s\n", ftm_names[i], ftm_values[i]);
+      out_str("#endif\n", 7);
     }
     // Always include errno.h for error constants like EINVAL, ENOENT, etc.
     // Many C programs use these constants without explicitly including errno.h,
     // relying on transitive includes that prism's preprocessing may not preserve.
-    fprintf(out, "#include <errno.h>\n");
+    out_str("#include <errno.h>\n", 19);
     // glibc's getopt.h defines __getopt_argv_const which is used by bits/getopt_ext.h.
     // When prism partially processes headers and passes #include directives through,
     // we need to ensure this macro is defined for the backend compiler.
-    fprintf(out, "#ifndef __getopt_argv_const\n");
-    fprintf(out, "#define __getopt_argv_const const\n");
-    fprintf(out, "#endif\n");
+    out_str("#ifndef __getopt_argv_const\n", 28);
+    out_str("#define __getopt_argv_const const\n", 34);
+    out_str("#endif\n", 7);
   }
 
   // Emit force-include tokens before the main file
@@ -2603,7 +2773,7 @@ static int transpile(char *input_file, char *output_file)
       emit_tok(t);
     }
     // Ensure we start on a new line after force-includes
-    fprintf(out, "\n");
+    out_char('\n');
     last_emitted = NULL; // Reset so main file starts fresh
   }
 
@@ -2802,11 +2972,11 @@ static int transpile(char *input_file, char *output_file)
         if (equal(tok, ";"))
         {
           // void return: { defers; return; }
-          fprintf(out, " {");
+          out_str(" {", 2);
           emit_all_defers();
-          fprintf(out, " return;");
+          out_str(" return;", 8);
           tok = tok->next;
-          fprintf(out, " }");
+          out_str(" }", 2);
         }
         else
         {
@@ -2820,25 +2990,25 @@ static int transpile(char *input_file, char *output_file)
           {
             // void function: { (expr); defers; return; }
             // The expression is executed for side effects, then we return void
-            fprintf(out, " { (");
+            out_str(" { (", 4);
             while (tok->kind != TK_EOF && !equal(tok, ";"))
             {
               emit_tok(tok);
               tok = tok->next;
             }
-            fprintf(out, ");");
+            out_str(");", 2);
             emit_all_defers();
-            fprintf(out, " return;");
+            out_str(" return;", 8);
             if (equal(tok, ";"))
               tok = tok->next;
-            fprintf(out, " }");
+            out_str(" }", 2);
           }
           else
           {
             // non-void function: { __auto_type _ret = (expr); defers; return _ret; }
             static unsigned long long ret_counter = 0;
             unsigned long long my_ret = ret_counter++;
-            fprintf(out, " { __auto_type _prism_ret_%llu = (", my_ret);
+            out_printf(" { __auto_type _prism_ret_%llu = (", my_ret);
 
             // Emit expression until semicolon
             while (tok->kind != TK_EOF && !equal(tok, ";"))
@@ -2847,14 +3017,14 @@ static int transpile(char *input_file, char *output_file)
               tok = tok->next;
             }
 
-            fprintf(out, ");");
+            out_str(");", 2);
             emit_all_defers();
-            fprintf(out, " return _prism_ret_%llu;", my_ret);
+            out_printf(" return _prism_ret_%llu;", my_ret);
 
             if (equal(tok, ";"))
               tok = tok->next;
 
-            fprintf(out, " }");
+            out_str(" }", 2);
           }
         }
         end_statement_after_semicolon();
@@ -2869,9 +3039,9 @@ static int transpile(char *input_file, char *output_file)
       mark_switch_control_exit(); // Mark that we exited via break
       if (control_flow_has_defers(true))
       {
-        fprintf(out, " {");
+        out_str(" {", 2);
         emit_break_defers();
-        fprintf(out, " break; }");
+        out_str(" break; }", 9);
         tok = tok->next;
         // Skip the semicolon
         if (equal(tok, ";"))
@@ -2888,9 +3058,9 @@ static int transpile(char *input_file, char *output_file)
       mark_switch_control_exit(); // Continue also exits the switch (like break/return/goto)
       if (control_flow_has_defers(false))
       {
-        fprintf(out, " {");
+        out_str(" {", 2);
         emit_continue_defers();
-        fprintf(out, " continue; }");
+        out_str(" continue; }", 12);
         tok = tok->next;
         // Skip the semicolon
         if (equal(tok, ";"))
@@ -2948,9 +3118,9 @@ static int transpile(char *input_file, char *output_file)
 
         if (goto_has_defers(target_depth))
         {
-          fprintf(out, " {");
+          out_str(" {", 2);
           emit_goto_defers(target_depth);
-          fprintf(out, " goto");
+          out_str(" goto", 5);
           emit_tok(tok); // label name
           tok = tok->next;
           if (equal(tok, ";"))
@@ -2958,7 +3128,7 @@ static int transpile(char *input_file, char *output_file)
             emit_tok(tok);
             tok = tok->next;
           }
-          fprintf(out, " }");
+          out_str(" }", 2);
           end_statement_after_semicolon();
           continue;
         }
@@ -3271,7 +3441,7 @@ static int transpile(char *input_file, char *output_file)
     tok = tok->next;
   }
 
-  fclose(out);
+  out_close();
   return 1;
 }
 
@@ -3288,6 +3458,10 @@ static int transpile(char *input_file, char *output_file)
 static PrismResult prism_transpile_file(const char *input_file, PrismFeatures features)
 {
   PrismResult result = {0};
+
+  // Initialize type keyword map (only done once)
+  if (!type_keyword_map.capacity)
+    init_type_keyword_map();
 
   // Set global feature flags from PrismFeatures
   feature_defer = features.defer;

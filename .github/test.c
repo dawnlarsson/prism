@@ -1103,7 +1103,7 @@ void test_local_function_decl(void)
                          const void *table, const int *np,
                          const int *n0, int num, int power);
     int return_func(const int *ap, int off);
-    
+
     // If we got here, the function declarations were handled correctly
     CHECK(1, "local function declarations: no duplicate output");
 }
