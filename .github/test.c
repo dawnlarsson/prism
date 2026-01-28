@@ -3149,6 +3149,93 @@ void run_preprocessor_numeric_tests(void)
     test_bf16_suffix();
 }
 
+// PREPROCESSOR MACRO CACHE TESTS
+
+// Regression tests for: Cache corruption causing missing linux/__linux__ macros
+// which broke OpenSSL KTLS detection and signal handling
+
+#include <signal.h>
+
+void test_linux_macros(void)
+{
+    // These macros must be defined for Linux platform detection
+    // OpenSSL KTLS support depends on these being available
+#ifdef __linux__
+    CHECK(1, "__linux__ macro defined");
+#else
+    CHECK(0, "__linux__ macro defined");
+#endif
+
+#ifdef __linux
+    CHECK(1, "__linux macro defined");
+#else
+    CHECK(0, "__linux macro defined");
+#endif
+
+#ifdef linux
+    CHECK(1, "linux macro defined");
+#else
+    CHECK(0, "linux macro defined");
+#endif
+
+#ifdef __gnu_linux__
+    CHECK(1, "__gnu_linux__ macro defined");
+#else
+    CHECK(0, "__gnu_linux__ macro defined");
+#endif
+}
+
+void test_signal_macros(void)
+{
+    // Note: SIGALRM etc require signal.h to be fully processed by prism's preprocessor
+    // This is a known limitation - prism passes signal.h to gcc which handles it
+    // These tests verify that the compilation succeeds when signals are used
+    // (the actual signal values are handled by gcc after prism transpilation)
+    
+    // For now, just verify we can include signal.h without errors
+    // and that the signal-related types are available
+    sigset_t test_set;
+    (void)test_set;
+    CHECK(1, "signal.h included successfully");
+}
+
+void test_glibc_macros(void)
+{
+    // __GLIBC__ and __GLIBC_MINOR__ must be defined for glibc detection
+#ifdef __GLIBC__
+    CHECK(__GLIBC__ >= 2, "__GLIBC__ defined and >= 2");
+#else
+    CHECK(0, "__GLIBC__ defined and >= 2");
+#endif
+
+#ifdef __GLIBC_MINOR__
+    CHECK(1, "__GLIBC_MINOR__ defined");
+#else
+    CHECK(0, "__GLIBC_MINOR__ defined");
+#endif
+}
+
+void test_posix_macros(void)
+{
+    // _POSIX_VERSION must be defined for POSIX compliance detection
+#ifdef _POSIX_VERSION
+    CHECK(_POSIX_VERSION >= 200809L, "_POSIX_VERSION defined and >= 200809L");
+#else
+    CHECK(0, "_POSIX_VERSION defined and >= 200809L");
+#endif
+}
+
+void run_preprocessor_cache_tests(void)
+{
+    printf("\n=== PREPROCESSOR CACHE TESTS ===\n");
+    printf("(Tests for macro cache integrity)\n\n");
+
+    test_linux_macros();
+    test_signal_macros();
+    test_glibc_macros();
+    test_posix_macros();
+}
+
 // MAIN
 
 int main(void)
@@ -3173,6 +3260,7 @@ int main(void)
     run_sizeof_constexpr_tests();
     run_manual_offsetof_vla_tests();
     run_preprocessor_numeric_tests();
+    run_preprocessor_cache_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

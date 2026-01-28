@@ -3478,11 +3478,28 @@ static bool load_macro_cache(void)
         system_macro_cache.lines[system_macro_cache.count++] = strdup(line);
     }
     fclose(f);
+    
+    // Sanity check: a valid cache should have at least 100 macros
+    // (typical GCC has ~350). If fewer, cache may be truncated/corrupted.
+    if (system_macro_cache.count < 100)
+    {
+        // Clear the corrupted cache and return false to regenerate
+        for (int i = 0; i < system_macro_cache.count; i++)
+            free(system_macro_cache.lines[i]);
+        system_macro_cache.count = 0;
+        system_macro_cache.initialized = false;
+        extracted_values_cache.initialized = false;
+        memset(extracted_values_cache.glibc, 0, sizeof(extracted_values_cache.glibc));
+        memset(extracted_values_cache.glibc_minor, 0, sizeof(extracted_values_cache.glibc_minor));
+        memset(extracted_values_cache.posix_version, 0, sizeof(extracted_values_cache.posix_version));
+        return false;
+    }
+    
     system_macro_cache.initialized = true;
     return system_macro_cache.count > 0;
 }
 
-// Save macros to disk cache
+// Save macros to disk cache (atomic write via temp file + rename)
 static void save_macro_cache(void)
 {
     const char *path = get_macro_cache_path();
@@ -3497,7 +3514,11 @@ static void save_macro_cache(void)
         mkdir(dir, 0755);
     }
 
-    FILE *f = fopen(path, "w");
+    // Write to temp file first, then rename atomically
+    char temp_path[PATH_MAX];
+    snprintf(temp_path, sizeof(temp_path), "%s.tmp.%d", path, getpid());
+
+    FILE *f = fopen(temp_path, "w");
     if (!f)
         return;
 
@@ -3512,6 +3533,9 @@ static void save_macro_cache(void)
         fprintf(f, "%s\n", system_macro_cache.lines[i]);
     }
     fclose(f);
+
+    // Atomic rename - only succeeds if complete write finished
+    rename(temp_path, path);
 }
 
 static void cache_add_line(const char *line)
