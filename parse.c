@@ -3716,7 +3716,10 @@ void pp_init(void)
         }
         // Fallback if extraction failed
         if (!hashmap_get(&macros, "__GLIBC__"))
+        {
+            strncpy(extracted_values_cache.glibc, "2", sizeof(extracted_values_cache.glibc) - 1);
             pp_define_macro("__GLIBC__", "2");
+        }
     }
     if (!hashmap_get(&macros, "__GLIBC_MINOR__"))
     {
@@ -3754,7 +3757,10 @@ void pp_init(void)
             }
         }
         if (!hashmap_get(&macros, "__GLIBC_MINOR__"))
+        {
+            strncpy(extracted_values_cache.glibc_minor, "17", sizeof(extracted_values_cache.glibc_minor) - 1);
             pp_define_macro("__GLIBC_MINOR__", "17");
+        }
     }
     // _POSIX_VERSION comes from <unistd.h>, not the compiler.
     // We need it for code like bash's jobs.h that checks #if !defined(_POSIX_VERSION)
@@ -3796,7 +3802,10 @@ void pp_init(void)
             extracted_values_cache.initialized = true;
         }
         if (!hashmap_get(&macros, "_POSIX_VERSION"))
+        {
+            strncpy(extracted_values_cache.posix_version, "200809L", sizeof(extracted_values_cache.posix_version) - 1);
             pp_define_macro("_POSIX_VERSION", "200809L");
+        }
     }
 #endif
 
