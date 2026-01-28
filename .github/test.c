@@ -3094,6 +3094,61 @@ void run_manual_offsetof_vla_tests(void)
     test_struct_with_vla_member();
 }
 
+// SECTION: PREPROCESSOR NUMERIC LITERAL TESTS
+
+// Test C23/GCC extended float suffixes (F128, f64, etc.)
+// Regression test for: F128 suffix causing "expected identifier" error
+#define TEST_FLT128_MAX 1.18973149535723176508575932662800702e+4932F128
+#define TEST_FLT128_MIN 3.36210314311209350626267781732175260e-4932F128
+#define TEST_FLT64_VAL 1.7976931348623157e+308F64
+#define TEST_FLT32_VAL 3.40282347e+38F32
+#define TEST_FLT16_VAL 6.5504e+4F16
+#define TEST_BF16_VAL 3.38953139e+38BF16
+
+void test_float128_suffix(void)
+{
+    // Just verify these compile - the preprocessor must parse F128 suffix
+    (void)TEST_FLT128_MAX;
+    (void)TEST_FLT128_MIN;
+    CHECK(1, "F128 float suffix parses");
+}
+
+void test_float64_suffix(void)
+{
+    (void)TEST_FLT64_VAL;
+    CHECK(1, "F64 float suffix parses");
+}
+
+void test_float32_suffix(void)
+{
+    (void)TEST_FLT32_VAL;
+    CHECK(1, "F32 float suffix parses");
+}
+
+void test_float16_suffix(void)
+{
+    (void)TEST_FLT16_VAL;
+    CHECK(1, "F16 float suffix parses");
+}
+
+void test_bf16_suffix(void)
+{
+    (void)TEST_BF16_VAL;
+    CHECK(1, "BF16 float suffix parses");
+}
+
+void run_preprocessor_numeric_tests(void)
+{
+    printf("\n=== PREPROCESSOR NUMERIC LITERAL TESTS ===\n");
+    printf("(Tests for C23/GCC extended float suffixes)\n\n");
+
+    test_float128_suffix();
+    test_float64_suffix();
+    test_float32_suffix();
+    test_float16_suffix();
+    test_bf16_suffix();
+}
+
 // MAIN
 
 int main(void)
@@ -3117,6 +3172,7 @@ int main(void)
     run_silent_failure_tests();
     run_sizeof_constexpr_tests();
     run_manual_offsetof_vla_tests();
+    run_preprocessor_numeric_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

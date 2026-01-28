@@ -1646,6 +1646,25 @@ static void convert_pp_number(Token *tok)
         if (*endp && endp[1] == '\0' &&
             (*endp == 'f' || *endp == 'F' || *endp == 'l' || *endp == 'L'))
             endp++;
+        // Handle C23/GCC extended float suffixes: f16, f32, f64, f128, bf16, F16, F32, F64, F128, BF16
+        if (*endp == 'f' || *endp == 'F' || *endp == 'b' || *endp == 'B')
+        {
+            char *suffix_start = endp;
+            // Check for bf16/BF16
+            if ((*endp == 'b' || *endp == 'B') && (endp[1] == 'f' || endp[1] == 'F'))
+                endp += 2;
+            else if (*endp == 'f' || *endp == 'F')
+                endp++;
+            // Check for numeric part: 16, 32, 64, 128
+            if (isdigit(*endp))
+            {
+                while (isdigit(*endp))
+                    endp++;
+            }
+        }
+        // Also handle 'l'/'L' suffix
+        if (*endp == 'l' || *endp == 'L')
+            endp++;
         if (*endp)
             error_tok(tok, "invalid floating constant");
         tok->kind = TK_NUM;
