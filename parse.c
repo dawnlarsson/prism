@@ -543,49 +543,75 @@ static char *find_gcc_include_path(const char *base_dir, const char *triple)
     return NULL;
 }
 
+// Cache for include paths (populated once)
+static struct
+{
+    bool initialized;
+    char clang_include[PATH_MAX];
+    char sdk_include[PATH_MAX];
+} include_path_cache_static = {0};
+
 static void pp_add_default_include_paths(void)
 {
     struct stat st;
 
 #ifdef __APPLE__
-    // macOS: Get Clang resource dir for built-in headers (stdarg.h, etc.)
-    FILE *fp = popen("clang -print-resource-dir 2>/dev/null", "r");
-    if (fp)
+    // Use cached paths if available
+    if (include_path_cache_static.initialized)
     {
-        char clang_dir[PATH_MAX];
-        if (fgets(clang_dir, sizeof(clang_dir), fp))
-        {
-            size_t len = strlen(clang_dir);
-            if (len > 0 && clang_dir[len - 1] == '\n')
-                clang_dir[len - 1] = '\0';
-
-            char include_path[PATH_MAX];
-            snprintf(include_path, PATH_MAX, "%s/include", clang_dir);
-            if (stat(include_path, &st) == 0)
-                pp_add_include_path(include_path);
-        }
-        pclose(fp);
+        if (include_path_cache_static.clang_include[0])
+            pp_add_include_path(include_path_cache_static.clang_include);
+        if (include_path_cache_static.sdk_include[0])
+            pp_add_include_path(include_path_cache_static.sdk_include);
     }
-
-    // macOS: Get SDK path from xcrun
-    fp = popen("xcrun --show-sdk-path 2>/dev/null", "r");
-    if (fp)
+    else
     {
-        char sdk_path[PATH_MAX];
-        if (fgets(sdk_path, sizeof(sdk_path), fp))
+        // macOS: Get Clang resource dir for built-in headers (stdarg.h, etc.)
+        FILE *fp = popen("clang -print-resource-dir 2>/dev/null", "r");
+        if (fp)
         {
-            // Remove trailing newline
-            size_t len = strlen(sdk_path);
-            if (len > 0 && sdk_path[len - 1] == '\n')
-                sdk_path[len - 1] = '\0';
+            char clang_dir[PATH_MAX];
+            if (fgets(clang_dir, sizeof(clang_dir), fp))
+            {
+                size_t len = strlen(clang_dir);
+                if (len > 0 && clang_dir[len - 1] == '\n')
+                    clang_dir[len - 1] = '\0';
 
-            // Add SDK include path
-            char include_path[PATH_MAX];
-            snprintf(include_path, PATH_MAX, "%s/usr/include", sdk_path);
-            if (stat(include_path, &st) == 0)
-                pp_add_include_path(include_path);
+                char include_path[PATH_MAX];
+                snprintf(include_path, PATH_MAX, "%s/include", clang_dir);
+                if (stat(include_path, &st) == 0)
+                {
+                    strncpy(include_path_cache_static.clang_include, include_path, PATH_MAX - 1);
+                    pp_add_include_path(include_path);
+                }
+            }
+            pclose(fp);
         }
-        pclose(fp);
+
+        // macOS: Get SDK path from xcrun
+        fp = popen("xcrun --show-sdk-path 2>/dev/null", "r");
+        if (fp)
+        {
+            char sdk_path[PATH_MAX];
+            if (fgets(sdk_path, sizeof(sdk_path), fp))
+            {
+                // Remove trailing newline
+                size_t len = strlen(sdk_path);
+                if (len > 0 && sdk_path[len - 1] == '\n')
+                    sdk_path[len - 1] = '\0';
+
+                // Add SDK include path
+                char include_path[PATH_MAX];
+                snprintf(include_path, PATH_MAX, "%s/usr/include", sdk_path);
+                if (stat(include_path, &st) == 0)
+                {
+                    strncpy(include_path_cache_static.sdk_include, include_path, PATH_MAX - 1);
+                    pp_add_include_path(include_path);
+                }
+            }
+            pclose(fp);
+        }
+        include_path_cache_static.initialized = true;
     }
     pp_add_include_path("/usr/local/include");
 #else
@@ -3347,9 +3373,163 @@ static void pp_define_full(char *def)
     read_macro_definition(&tok, tok);
 }
 
+// Cache for system macros (populated once, reused across files)
+typedef struct
+{
+    char **lines;     // Array of macro definition lines
+    int count;        // Number of cached lines
+    int capacity;     // Capacity of lines array
+    bool initialized; // True if cache has been populated
+} SystemMacroCache;
+
+static SystemMacroCache system_macro_cache = {0};
+
+// Cache for extracted values (__GLIBC__, etc.)
+static struct
+{
+    bool initialized;
+    char glibc[32];
+    char glibc_minor[32];
+    char posix_version[32];
+} extracted_values_cache = {0};
+
+// Disk cache path for system macros
+static const char *get_macro_cache_path(void)
+{
+    static char path[PATH_MAX] = {0};
+    if (!path[0])
+    {
+        const char *home = getenv("HOME");
+        if (home)
+            snprintf(path, sizeof(path), "%s/.cache/prism/macros.cache", home);
+        else
+            snprintf(path, sizeof(path), "/tmp/prism_macros.cache");
+    }
+    return path;
+}
+
+// Try to load macros from disk cache
+static bool load_macro_cache(void)
+{
+    const char *path = get_macro_cache_path();
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return false;
+
+    char line[4096];
+    while (fgets(line, sizeof(line), f))
+    {
+        // Remove trailing newline
+        size_t len = strlen(line);
+        if (len > 0 && line[len - 1] == '\n')
+            line[len - 1] = '\0';
+        if (len > 1 && line[len - 2] == '\r')
+            line[len - 2] = '\0';
+        if (line[0] == '\0')
+            continue;
+
+        // First 3 lines are special: glibc, glibc_minor, posix_version
+        if (!extracted_values_cache.initialized)
+        {
+            if (line[0] == 'G' && line[1] == ':')
+            {
+                strncpy(extracted_values_cache.glibc, line + 2, sizeof(extracted_values_cache.glibc) - 1);
+                continue;
+            }
+            if (line[0] == 'M' && line[1] == ':')
+            {
+                strncpy(extracted_values_cache.glibc_minor, line + 2, sizeof(extracted_values_cache.glibc_minor) - 1);
+                continue;
+            }
+            if (line[0] == 'P' && line[1] == ':')
+            {
+                strncpy(extracted_values_cache.posix_version, line + 2, sizeof(extracted_values_cache.posix_version) - 1);
+                extracted_values_cache.initialized = true;
+                continue;
+            }
+        }
+
+        // Regular macro line
+        if (system_macro_cache.count >= system_macro_cache.capacity)
+        {
+            int new_cap = system_macro_cache.capacity == 0 ? 256 : system_macro_cache.capacity * 2;
+            system_macro_cache.lines = realloc(system_macro_cache.lines, new_cap * sizeof(char *));
+            system_macro_cache.capacity = new_cap;
+        }
+        system_macro_cache.lines[system_macro_cache.count++] = strdup(line);
+    }
+    fclose(f);
+    system_macro_cache.initialized = true;
+    return system_macro_cache.count > 0;
+}
+
+// Save macros to disk cache
+static void save_macro_cache(void)
+{
+    const char *path = get_macro_cache_path();
+
+    // Create directory if needed
+    char dir[PATH_MAX];
+    strncpy(dir, path, sizeof(dir));
+    char *slash = strrchr(dir, '/');
+    if (slash)
+    {
+        *slash = '\0';
+        mkdir(dir, 0755);
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+
+    // Write extracted values first
+    fprintf(f, "G:%s\n", extracted_values_cache.glibc);
+    fprintf(f, "M:%s\n", extracted_values_cache.glibc_minor);
+    fprintf(f, "P:%s\n", extracted_values_cache.posix_version);
+
+    // Write macro lines
+    for (int i = 0; i < system_macro_cache.count; i++)
+    {
+        fprintf(f, "%s\n", system_macro_cache.lines[i]);
+    }
+    fclose(f);
+}
+
+static void cache_add_line(const char *line)
+{
+    if (system_macro_cache.count >= system_macro_cache.capacity)
+    {
+        int new_cap = system_macro_cache.capacity == 0 ? 256 : system_macro_cache.capacity * 2;
+        system_macro_cache.lines = realloc(system_macro_cache.lines, new_cap * sizeof(char *));
+        system_macro_cache.capacity = new_cap;
+    }
+    system_macro_cache.lines[system_macro_cache.count++] = strdup(line);
+}
+
 // Extract predefined macros from the system compiler
 static int pp_import_system_macros(void)
 {
+    // If in-memory cached, replay from cache
+    if (system_macro_cache.initialized)
+    {
+        for (int i = 0; i < system_macro_cache.count; i++)
+        {
+            pp_define_full(system_macro_cache.lines[i]);
+        }
+        return system_macro_cache.count;
+    }
+
+    // Try loading from disk cache first
+    if (load_macro_cache())
+    {
+        system_macro_cache.initialized = true;
+        for (int i = 0; i < system_macro_cache.count; i++)
+        {
+            pp_define_full(system_macro_cache.lines[i]);
+        }
+        return system_macro_cache.count;
+    }
+
     // Run the system compiler to get predefined macros
     // We use plain "cc -dM -E -" to get only compiler-intrinsic macros
     // NOT including features.h because that brings in internal glibc macros
@@ -3408,6 +3588,7 @@ static int pp_import_system_macros(void)
             if (nl)
                 *nl = '\0';
 
+            cache_add_line(start); // Cache for reuse
             pp_define_full(start);
         }
         else
@@ -3432,6 +3613,14 @@ static int pp_import_system_macros(void)
             if (nl)
                 *nl = '\0';
 
+            // Cache as "NAME VALUE" format for replay
+            char cache_line[512];
+            if (*value == '\0')
+                snprintf(cache_line, sizeof(cache_line), "%s", name);
+            else
+                snprintf(cache_line, sizeof(cache_line), "%s %s", name, value);
+            cache_add_line(cache_line);
+
             // Empty value means define as empty string
             if (*value == '\0')
                 pp_define_macro(strdup(name), "");
@@ -3442,6 +3631,7 @@ static int pp_import_system_macros(void)
     }
 
     pclose(fp);
+    system_macro_cache.initialized = true;
     return count;
 }
 
@@ -3474,6 +3664,9 @@ void pp_init(void)
             hashmap_put(&feature_test_macro_set, (char *)feature_test_macro_names[i], (void *)1);
     }
 
+    // Track if we loaded from disk cache (don't need to resave)
+    bool loaded_from_disk = extracted_values_cache.initialized;
+
     int imported = pp_import_system_macros();
     (void)imported; // May be -1 if compiler not found, we'll use fallbacks
 
@@ -3486,29 +3679,40 @@ void pp_init(void)
 #if defined(__linux__)
     if (!hashmap_get(&macros, "__GLIBC__"))
     {
-        // Try to extract __GLIBC__ from the system by including features.h
-        FILE *fp = popen("echo '#include <features.h>' | cc -dM -E - 2>/dev/null | grep -E '^#define __GLIBC__' | head -1", "r");
-        if (fp)
+        // Use cached value if available
+        if (extracted_values_cache.initialized && extracted_values_cache.glibc[0])
         {
-            char line[256];
-            if (fgets(line, sizeof(line), fp))
+            pp_define_macro("__GLIBC__", extracted_values_cache.glibc);
+        }
+        else
+        {
+            // Try to extract __GLIBC__ from the system by including features.h
+            FILE *fp = popen("echo '#include <features.h>' | cc -dM -E - 2>/dev/null | grep -E '^#define __GLIBC__' | head -1", "r");
+            if (fp)
             {
-                // Line is: #define __GLIBC__ <value>
-                char *val = strstr(line, "__GLIBC__");
-                if (val)
+                char line[256];
+                if (fgets(line, sizeof(line), fp))
                 {
-                    val += 9; // Skip "__GLIBC__"
-                    while (*val == ' ' || *val == '\t')
-                        val++;
-                    char *end = val;
-                    while (*end && *end != '\n' && *end != '\r' && *end != ' ')
-                        end++;
-                    *end = '\0';
-                    if (*val)
-                        pp_define_macro("__GLIBC__", strdup(val));
+                    // Line is: #define __GLIBC__ <value>
+                    char *val = strstr(line, "__GLIBC__");
+                    if (val)
+                    {
+                        val += 9; // Skip "__GLIBC__"
+                        while (*val == ' ' || *val == '\t')
+                            val++;
+                        char *end = val;
+                        while (*end && *end != '\n' && *end != '\r' && *end != ' ')
+                            end++;
+                        *end = '\0';
+                        if (*val)
+                        {
+                            strncpy(extracted_values_cache.glibc, val, sizeof(extracted_values_cache.glibc) - 1);
+                            pp_define_macro("__GLIBC__", extracted_values_cache.glibc);
+                        }
+                    }
                 }
+                pclose(fp);
             }
-            pclose(fp);
         }
         // Fallback if extraction failed
         if (!hashmap_get(&macros, "__GLIBC__"))
@@ -3516,27 +3720,38 @@ void pp_init(void)
     }
     if (!hashmap_get(&macros, "__GLIBC_MINOR__"))
     {
-        FILE *fp = popen("echo '#include <features.h>' | cc -dM -E - 2>/dev/null | grep -E '^#define __GLIBC_MINOR__' | head -1", "r");
-        if (fp)
+        // Use cached value if available
+        if (extracted_values_cache.initialized && extracted_values_cache.glibc_minor[0])
         {
-            char line[256];
-            if (fgets(line, sizeof(line), fp))
+            pp_define_macro("__GLIBC_MINOR__", extracted_values_cache.glibc_minor);
+        }
+        else
+        {
+            FILE *fp = popen("echo '#include <features.h>' | cc -dM -E - 2>/dev/null | grep -E '^#define __GLIBC_MINOR__' | head -1", "r");
+            if (fp)
             {
-                char *val = strstr(line, "__GLIBC_MINOR__");
-                if (val)
+                char line[256];
+                if (fgets(line, sizeof(line), fp))
                 {
-                    val += 15; // Skip "__GLIBC_MINOR__"
-                    while (*val == ' ' || *val == '\t')
-                        val++;
-                    char *end = val;
-                    while (*end && *end != '\n' && *end != '\r' && *end != ' ')
-                        end++;
-                    *end = '\0';
-                    if (*val)
-                        pp_define_macro("__GLIBC_MINOR__", strdup(val));
+                    char *val = strstr(line, "__GLIBC_MINOR__");
+                    if (val)
+                    {
+                        val += 15; // Skip "__GLIBC_MINOR__"
+                        while (*val == ' ' || *val == '\t')
+                            val++;
+                        char *end = val;
+                        while (*end && *end != '\n' && *end != '\r' && *end != ' ')
+                            end++;
+                        *end = '\0';
+                        if (*val)
+                        {
+                            strncpy(extracted_values_cache.glibc_minor, val, sizeof(extracted_values_cache.glibc_minor) - 1);
+                            pp_define_macro("__GLIBC_MINOR__", extracted_values_cache.glibc_minor);
+                        }
+                    }
                 }
+                pclose(fp);
             }
-            pclose(fp);
         }
         if (!hashmap_get(&macros, "__GLIBC_MINOR__"))
             pp_define_macro("__GLIBC_MINOR__", "17");
@@ -3546,27 +3761,39 @@ void pp_init(void)
     // to decide whether to use union wait (BSD) or int (POSIX) for WAIT type.
     if (!hashmap_get(&macros, "_POSIX_VERSION"))
     {
-        FILE *fp = popen("echo '#include <unistd.h>' | cc -dM -E - 2>/dev/null | grep -E '^#define _POSIX_VERSION' | head -1", "r");
-        if (fp)
+        // Use cached value if available
+        if (extracted_values_cache.initialized && extracted_values_cache.posix_version[0])
         {
-            char line[256];
-            if (fgets(line, sizeof(line), fp))
+            pp_define_macro("_POSIX_VERSION", extracted_values_cache.posix_version);
+        }
+        else
+        {
+            FILE *fp = popen("echo '#include <unistd.h>' | cc -dM -E - 2>/dev/null | grep -E '^#define _POSIX_VERSION' | head -1", "r");
+            if (fp)
             {
-                char *val = strstr(line, "_POSIX_VERSION");
-                if (val)
+                char line[256];
+                if (fgets(line, sizeof(line), fp))
                 {
-                    val += 14; // Skip "_POSIX_VERSION"
-                    while (*val == ' ' || *val == '\t')
-                        val++;
-                    char *end = val;
-                    while (*end && *end != '\n' && *end != '\r' && *end != ' ')
-                        end++;
-                    *end = '\0';
-                    if (*val)
-                        pp_define_macro("_POSIX_VERSION", strdup(val));
+                    char *val = strstr(line, "_POSIX_VERSION");
+                    if (val)
+                    {
+                        val += 14; // Skip "_POSIX_VERSION"
+                        while (*val == ' ' || *val == '\t')
+                            val++;
+                        char *end = val;
+                        while (*end && *end != '\n' && *end != '\r' && *end != ' ')
+                            end++;
+                        *end = '\0';
+                        if (*val)
+                        {
+                            strncpy(extracted_values_cache.posix_version, val, sizeof(extracted_values_cache.posix_version) - 1);
+                            pp_define_macro("_POSIX_VERSION", extracted_values_cache.posix_version);
+                        }
+                    }
                 }
+                pclose(fp);
             }
-            pclose(fp);
+            extracted_values_cache.initialized = true;
         }
         if (!hashmap_get(&macros, "_POSIX_VERSION"))
             pp_define_macro("_POSIX_VERSION", "200809L");
@@ -3615,6 +3842,12 @@ void pp_init(void)
     // glibc internal macros needed when system headers are passed through
     if (!hashmap_get(&macros, "__getopt_argv_const"))
         pp_define_macro("__getopt_argv_const", "const");
+
+    // Save disk cache if we populated it fresh (not loaded from disk)
+    if (!loaded_from_disk && system_macro_cache.initialized)
+    {
+        save_macro_cache();
+    }
 
 #ifdef __APPLE__
     // Apple availability attributes - make them expand to nothing
