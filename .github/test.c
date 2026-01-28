@@ -3187,16 +3187,43 @@ void test_linux_macros(void)
 
 void test_signal_macros(void)
 {
-    // Note: SIGALRM etc require signal.h to be fully processed by prism's preprocessor
-    // This is a known limitation - prism passes signal.h to gcc which handles it
-    // These tests verify that the compilation succeeds when signals are used
-    // (the actual signal values are handled by gcc after prism transpilation)
-    
-    // For now, just verify we can include signal.h without errors
-    // and that the signal-related types are available
+    // Signal macros must be defined for code using #ifdef SIGALRM etc.
+    // OpenSSL speed.c and many other programs depend on this.
+    // prism now pre-defines standard Linux signal values.
+#ifdef SIGALRM
+    CHECK(SIGALRM == 14, "SIGALRM defined as 14");
+#else
+    CHECK(0, "SIGALRM defined as 14");
+#endif
+
+#ifdef SIGINT
+    CHECK(SIGINT == 2, "SIGINT defined as 2");
+#else
+    CHECK(0, "SIGINT defined as 2");
+#endif
+
+#ifdef SIGTERM
+    CHECK(SIGTERM == 15, "SIGTERM defined as 15");
+#else
+    CHECK(0, "SIGTERM defined as 15");
+#endif
+
+#ifdef SIGKILL
+    CHECK(SIGKILL == 9, "SIGKILL defined as 9");
+#else
+    CHECK(0, "SIGKILL defined as 9");
+#endif
+
+#ifdef SIGCHLD
+    CHECK(SIGCHLD == 17, "SIGCHLD defined as 17");
+#else
+    CHECK(0, "SIGCHLD defined as 17");
+#endif
+
+    // Also verify we can use sigset_t from signal.h
     sigset_t test_set;
     (void)test_set;
-    CHECK(1, "signal.h included successfully");
+    CHECK(1, "signal.h types available");
 }
 
 void test_glibc_macros(void)

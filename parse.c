@@ -72,6 +72,11 @@ static int pp_include_paths_count = 0;
 static int pp_user_paths_start = 0; // Index where user-specified paths begin
 static int pp_eval_depth = 0;
 
+// Compiler flags that affect macro/path discovery (set before pp_init)
+static const char *pp_compiler = NULL;  // Compiler to use (default: "cc")
+static char **pp_compiler_flags = NULL; // Flags like -std=c99, -m32, etc.
+static int pp_compiler_flags_count = 0;
+
 typedef struct Type Type;
 typedef struct Token Token;
 typedef struct Hideset Hideset;
@@ -322,14 +327,12 @@ struct CondIncl
 
 static HashMap macros;
 static CondIncl *cond_incl;
-static HashMap included_files;
+static HashMap pragma_once_files; // Files with #pragma once
+static HashMap guarded_files;     // Files we've fully included (guard macro now defined)
 static bool pp_eval_skip = false;
 
 // Hash set for fast feature test macro lookup
 static HashMap feature_test_macro_set;
-
-// Include path negative cache: tracks (dir, filename) pairs known to not exist
-static HashMap include_path_cache;
 
 // Forward declaration for hashmap_get2 (needed before is_feature_test_macro)
 static void *hashmap_get2(HashMap *map, char *key, int keylen);
@@ -473,6 +476,117 @@ struct Hideset
     uint32_t hash; // Pre-computed hash for fast comparison
 };
 
+// Set compiler and flags for system macro/path discovery
+// Call this before pp_init() to affect how system macros are queried
+void pp_set_compiler(const char *compiler)
+{
+    pp_compiler = compiler;
+}
+
+void pp_add_compiler_flag(const char *flag)
+{
+    char **new_flags = realloc(pp_compiler_flags, sizeof(char *) * (pp_compiler_flags_count + 1));
+    if (!new_flags)
+    {
+        fprintf(stderr, "out of memory adding compiler flag\n");
+        exit(1);
+    }
+    pp_compiler_flags = new_flags;
+    pp_compiler_flags[pp_compiler_flags_count++] = strdup(flag);
+}
+
+// Build a command string with the configured compiler and flags
+// Note: We detect if the compiler is "prism" and use "cc" instead to avoid
+// infinite recursion when prism itself is used as CC
+// Find a real C compiler that isn't prism
+static const char *find_real_cc(void)
+{
+    static const char *candidates[] = {
+        "/usr/bin/gcc",
+        "/usr/bin/clang",
+        "/usr/bin/cc",
+        "/bin/gcc",
+        "/bin/clang",
+        "/bin/cc",
+        "gcc",
+        "clang",
+        NULL};
+
+    struct stat st;
+    for (int i = 0; candidates[i]; i++)
+    {
+        if (candidates[i][0] == '/')
+        {
+            // Absolute path - check it exists and isn't prism
+            if (stat(candidates[i], &st) == 0)
+            {
+                // Read symlink to make sure it's not prism
+                char resolved[PATH_MAX];
+                if (realpath(candidates[i], resolved))
+                {
+                    const char *base = strrchr(resolved, '/');
+                    base = base ? base + 1 : resolved;
+                    if (strcmp(base, "prism") != 0 && strcmp(base, "prism.exe") != 0)
+                        return candidates[i];
+                }
+                else
+                {
+                    return candidates[i]; // Can't resolve, assume it's fine
+                }
+            }
+        }
+        else
+        {
+            // Relative - just return it, will be found in PATH
+            return candidates[i];
+        }
+    }
+    return "cc"; // Fallback
+}
+
+static char *build_compiler_cmd(const char *base_cmd)
+{
+    const char *cc = pp_compiler ? pp_compiler : "cc";
+
+    // Avoid infinite recursion: if compiler is prism or CC env is prism, use a real compiler
+    const char *base = strrchr(cc, '/');
+    base = base ? base + 1 : cc;
+    int is_prism = (strcmp(base, "prism") == 0 || strcmp(base, "prism.exe") == 0);
+
+    const char *env_cc = getenv("CC");
+    if (env_cc)
+    {
+        const char *env_base = strrchr(env_cc, '/');
+        env_base = env_base ? env_base + 1 : env_cc;
+        if (strcmp(env_base, "prism") == 0 || strcmp(env_base, "prism.exe") == 0)
+            is_prism = 1;
+    }
+
+    if (is_prism)
+        cc = find_real_cc();
+
+    // Calculate total length needed
+    size_t len = strlen(cc) + 1 + strlen(base_cmd) + 1;
+    // Always prepend CC= to override any env variable
+    len += 4;
+    for (int i = 0; i < pp_compiler_flags_count; i++)
+        len += strlen(pp_compiler_flags[i]) + 1;
+
+    char *cmd = malloc(len + 64); // Extra space for safety
+    if (!cmd)
+        return NULL;
+
+    // Build: "CC= cc [flags...] base_cmd"
+    // Always prepend CC= to ensure we don't pick up prism from environment
+    char *p = cmd;
+    p += sprintf(p, "CC= %s", cc);
+    for (int i = 0; i < pp_compiler_flags_count; i++)
+        p += sprintf(p, " %s", pp_compiler_flags[i]);
+    sprintf(p, " %s", base_cmd);
+
+    return cmd;
+}
+
 static void pp_add_include_path(const char *path)
 {
     char **new_paths = realloc(pp_include_paths, sizeof(char *) * (pp_include_paths_count + 1));
@@ -543,75 +657,69 @@ static char *find_gcc_include_path(const char *base_dir, const char *triple)
     return NULL;
 }
 
-// Cache for include paths (populated once)
-static struct
-{
-    bool initialized;
-    char clang_include[PATH_MAX];
-    char sdk_include[PATH_MAX];
-} include_path_cache_static = {0};
-
 static void pp_add_default_include_paths(void)
 {
     struct stat st;
+    const char *cc = pp_compiler ? pp_compiler : "cc";
+
+    // Avoid infinite recursion: if compiler is prism or CC env is prism, use a real compiler
+    const char *base = strrchr(cc, '/');
+    base = base ? base + 1 : cc;
+    int is_prism = (strcmp(base, "prism") == 0 || strcmp(base, "prism.exe") == 0);
+
+    const char *env_cc = getenv("CC");
+    if (env_cc)
+    {
+        const char *env_base = strrchr(env_cc, '/');
+        env_base = env_base ? env_base + 1 : env_cc;
+        if (strcmp(env_base, "prism") == 0 || strcmp(env_base, "prism.exe") == 0)
+            is_prism = 1;
+    }
+
+    if (is_prism)
+        cc = find_real_cc();
 
 #ifdef __APPLE__
-    // Use cached paths if available
-    if (include_path_cache_static.initialized)
+    // macOS: Get Clang resource dir for built-in headers (stdarg.h, etc.)
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "CC= %s -print-resource-dir 2>/dev/null", cc);
+    FILE *fp = popen(cmd, "r");
+    if (fp)
     {
-        if (include_path_cache_static.clang_include[0])
-            pp_add_include_path(include_path_cache_static.clang_include);
-        if (include_path_cache_static.sdk_include[0])
-            pp_add_include_path(include_path_cache_static.sdk_include);
+        char clang_dir[PATH_MAX];
+        if (fgets(clang_dir, sizeof(clang_dir), fp))
+        {
+            size_t len = strlen(clang_dir);
+            if (len > 0 && clang_dir[len - 1] == '\n')
+                clang_dir[len - 1] = '\0';
+
+            char include_path[PATH_MAX];
+            snprintf(include_path, PATH_MAX, "%s/include", clang_dir);
+            if (stat(include_path, &st) == 0)
+                pp_add_include_path(include_path);
+        }
+        pclose(fp);
     }
-    else
+
+    // macOS: Get SDK path from xcrun
+    fp = popen("xcrun --show-sdk-path 2>/dev/null", "r");
+    if (fp)
     {
-        // macOS: Get Clang resource dir for built-in headers (stdarg.h, etc.)
-        FILE *fp = popen("clang -print-resource-dir 2>/dev/null", "r");
-        if (fp)
+        char sdk_path[PATH_MAX];
+        if (fgets(sdk_path, sizeof(sdk_path), fp))
         {
-            char clang_dir[PATH_MAX];
-            if (fgets(clang_dir, sizeof(clang_dir), fp))
-            {
-                size_t len = strlen(clang_dir);
-                if (len > 0 && clang_dir[len - 1] == '\n')
-                    clang_dir[len - 1] = '\0';
+            // Remove trailing newline
+            size_t len = strlen(sdk_path);
+            if (len > 0 && sdk_path[len - 1] == '\n')
+                sdk_path[len - 1] = '\0';
 
-                char include_path[PATH_MAX];
-                snprintf(include_path, PATH_MAX, "%s/include", clang_dir);
-                if (stat(include_path, &st) == 0)
-                {
-                    strncpy(include_path_cache_static.clang_include, include_path, PATH_MAX - 1);
-                    pp_add_include_path(include_path);
-                }
-            }
-            pclose(fp);
+            // Add SDK include path
+            char include_path[PATH_MAX];
+            snprintf(include_path, PATH_MAX, "%s/usr/include", sdk_path);
+            if (stat(include_path, &st) == 0)
+                pp_add_include_path(include_path);
         }
-
-        // macOS: Get SDK path from xcrun
-        fp = popen("xcrun --show-sdk-path 2>/dev/null", "r");
-        if (fp)
-        {
-            char sdk_path[PATH_MAX];
-            if (fgets(sdk_path, sizeof(sdk_path), fp))
-            {
-                // Remove trailing newline
-                size_t len = strlen(sdk_path);
-                if (len > 0 && sdk_path[len - 1] == '\n')
-                    sdk_path[len - 1] = '\0';
-
-                // Add SDK include path
-                char include_path[PATH_MAX];
-                snprintf(include_path, PATH_MAX, "%s/usr/include", sdk_path);
-                if (stat(include_path, &st) == 0)
-                {
-                    strncpy(include_path_cache_static.sdk_include, include_path, PATH_MAX - 1);
-                    pp_add_include_path(include_path);
-                }
-            }
-            pclose(fp);
-        }
-        include_path_cache_static.initialized = true;
+        pclose(fp);
     }
     pp_add_include_path("/usr/local/include");
 #else
@@ -776,6 +884,12 @@ static void hashmap_rehash(HashMap *map)
         if (ent->key && ent->key != TOMBSTONE)
             hashmap_put2(&map2, ent->key, ent->keylen, ent->val);
     }
+    // Free old keys and buckets
+    for (int i = 0; i < map->capacity; i++)
+    {
+        if (map->buckets[i].key && map->buckets[i].key != TOMBSTONE)
+            free(map->buckets[i].key);
+    }
     free(map->buckets);
     *map = map2;
 }
@@ -833,7 +947,10 @@ static void hashmap_put2(HashMap *map, char *key, int keylen, void *val)
         if (!ent->key || ent->key == TOMBSTONE)
         {
             bool was_empty = !ent->key;
-            ent->key = key;
+            // Copy the key to heap memory to avoid dangling stack references
+            char *key_copy = malloc(keylen);
+            memcpy(key_copy, key, keylen);
+            ent->key = key_copy;
             ent->keylen = keylen;
             ent->val = val;
             if (was_empty)
@@ -864,6 +981,12 @@ static void hashmap_clear(HashMap *map)
 {
     if (map->buckets)
     {
+        // Free keys that were allocated by hashmap_put2
+        for (int i = 0; i < map->capacity; i++)
+        {
+            if (map->buckets[i].key && map->buckets[i].key != TOMBSTONE)
+                free(map->buckets[i].key);
+        }
         free(map->buckets);
         map->buckets = NULL;
     }
@@ -1972,11 +2095,84 @@ static void remove_backslash_newline(char *p)
     p[j] = '\0';
 }
 
+// Forward declarations
+static bool is_hash(Token *tok);
+static Macro *find_macro_by_name(char *name);
+static Token *new_eof(Token *tok);
+static Token *copy_token_list(Token *tok);
+
+// Detect if file has include guard pattern: #ifndef X / #define X ... #endif
+// Returns the guard macro name if detected, NULL otherwise
+static char *detect_include_guard(Token *tok)
+{
+    // Skip any leading whitespace/comments - look for #ifndef at start
+    while (tok && tok->kind != TK_EOF && !is_hash(tok))
+        tok = tok->next;
+
+    if (!tok || tok->kind == TK_EOF || !is_hash(tok))
+        return NULL;
+
+    tok = tok->next; // skip #
+    if (!equal(tok, "ifndef"))
+        return NULL;
+
+    tok = tok->next;
+    if (tok->kind != TK_IDENT)
+        return NULL;
+
+    char *guard_name = strndup(tok->loc, tok->len);
+
+    // Next non-whitespace should be #define with same name
+    tok = tok->next;
+    while (tok && tok->kind != TK_EOF && !is_hash(tok))
+        tok = tok->next;
+
+    if (!tok || tok->kind == TK_EOF || !is_hash(tok))
+    {
+        free(guard_name);
+        return NULL;
+    }
+
+    tok = tok->next; // skip #
+    if (!equal(tok, "define"))
+    {
+        free(guard_name);
+        return NULL;
+    }
+
+    tok = tok->next;
+    if (tok->kind != TK_IDENT || tok->len != (int)strlen(guard_name) ||
+        strncmp(tok->loc, guard_name, tok->len) != 0)
+    {
+        free(guard_name);
+        return NULL;
+    }
+
+    return guard_name;
+}
+
 Token *tokenize_file(char *path)
 {
+    // Resolve to canonical path
+    char *real = realpath(path, NULL);
+    char *key = real ? real : path;
+
+    // Check if we've already fully included this file (pragma once or guard-protected)
+    if (hashmap_get(&pragma_once_files, key) || hashmap_get(&guarded_files, key))
+    {
+        if (real)
+            free(real);
+        return new_eof(NULL);
+    }
+
+    // Read file from disk
     char *p = read_file(path);
     if (!p)
+    {
+        if (real)
+            free(real);
         return NULL;
+    }
 
     if (!memcmp(p, "\xef\xbb\xbf", 3))
         p += 3; // Skip BOM
@@ -1991,7 +2187,20 @@ Token *tokenize_file(char *path)
     input_files[input_file_count++] = file;
     input_files[input_file_count] = NULL;
 
-    return tokenize(file);
+    Token *toks = tokenize(file);
+
+    // Detect include guard pattern: #ifndef X / #define X
+    // If found, mark file as guarded so we skip on subsequent includes
+    char *detected_guard = detect_include_guard(toks);
+    if (detected_guard)
+    {
+        hashmap_put(&guarded_files, real ? strdup(real) : strdup(path), detected_guard);
+        free(detected_guard);
+    }
+
+    if (real)
+        free(real);
+    return toks;
 }
 
 static Token *preprocess2(Token *tok);
@@ -2024,12 +2233,26 @@ static Token *copy_token(Token *tok)
     Token *t = arena_alloc_token();
     *t = *tok;
     t->next = NULL;
+    // Copy hideset from the source token
+    Hideset *hs = tok_hideset(tok);
+    if (hs)
+        tok_set_hideset(t, hs);
     return t;
 }
 
 static Token *new_eof(Token *tok)
 {
-    Token *t = copy_token(tok);
+    Token *t;
+    if (tok)
+    {
+        t = copy_token(tok);
+    }
+    else
+    {
+        t = arena_alloc_token();
+        t->loc = "";
+        t->next = NULL;
+    }
     t->kind = TK_EOF;
     t->len = 0;
     return t;
@@ -2111,6 +2334,13 @@ static Token *append(Token *tok1, Token *tok2)
         cur = cur->next = copy_token(tok1);
     cur->next = tok2;
     return head.next;
+}
+
+static Macro *find_macro_by_name(char *name)
+{
+    if (!name)
+        return NULL;
+    return hashmap_get(&macros, name);
 }
 
 static Macro *find_macro(Token *tok)
@@ -2417,6 +2647,25 @@ static Token *subst(Token *tok, MacroArg *args)
     return head.next;
 }
 
+// Check if a macro body is a struct member access pattern: identifier.identifier
+// These macros (like sa_handler -> __sigaction_handler.sa_handler) should not be
+// expanded because they are transparent struct accessors that depend on platform-
+// specific struct layouts.
+static bool is_member_access_macro(Token *body)
+{
+    // Pattern: identifier . identifier [EOF or end]
+    if (!body || body->kind != TK_IDENT)
+        return false;
+    Token *dot = body->next;
+    if (!dot || dot->kind != TK_PUNCT || !equal(dot, "."))
+        return false;
+    Token *member = dot->next;
+    if (!member || member->kind != TK_IDENT)
+        return false;
+    Token *end = member->next;
+    return !end || end->kind == TK_EOF;
+}
+
 static bool expand_macro(Token **rest, Token *tok)
 {
     if (hideset_contains(tok_hideset(tok), tok->loc, tok->len))
@@ -2434,6 +2683,10 @@ static bool expand_macro(Token **rest, Token *tok)
 
     if (m->is_objlike)
     {
+        // Don't expand struct member access macros like sa_handler
+        if (is_member_access_macro(m->body))
+            return false;
+
         Hideset *hs = hideset_union(tok_hideset(tok), new_hideset(m->name));
         Token *body = add_hideset(m->body, hs);
         for (Token *t = body; t && t->kind != TK_EOF; t = t->next)
@@ -2459,24 +2712,12 @@ static bool expand_macro(Token **rest, Token *tok)
 
 static char *search_include_paths(char *filename)
 {
-    int filename_len = strlen(filename);
     for (int i = 0; i < pp_include_paths_count; i++)
     {
-        // Build cache key: "dir_index:filename"
-        char cache_key[PATH_MAX + 16];
-        int key_len = snprintf(cache_key, sizeof(cache_key), "%d:%s", i, filename);
-
-        // Check negative cache
-        if (hashmap_get2(&include_path_cache, cache_key, key_len) != NULL)
-            continue; // Known not to exist in this path
-
         char *path = format("%s/%s", pp_include_paths[i], filename);
         struct stat st;
         if (stat(path, &st) == 0)
             return path;
-
-        // Add to negative cache
-        hashmap_put2(&include_path_cache, strndup(cache_key, key_len), key_len, (void *)1);
         free(path);
     }
     return NULL;
@@ -2540,24 +2781,9 @@ static char *read_include_filename(Token **rest, Token *tok, bool *is_dquote)
 
 static Token *include_file(Token *tok, char *path, Token *cont)
 {
-    // Resolve to canonical path for deduplication
-    char *real = realpath(path, NULL);
-    char *key = real ? real : path;
-
-    // Check if already included (via #pragma once or prior include)
-    if (hashmap_get(&included_files, key))
-    {
-        if (real)
-            free(real);
-        return cont;
-    }
-
     Token *tok2 = tokenize_file(path);
     if (!tok2)
         error_tok(tok, "%s: cannot open file", path);
-
-    if (real)
-        free(real);
 
     return append(tok2, cont);
 }
@@ -3329,11 +3555,11 @@ static Token *preprocess2(Token *tok)
         {
             if (equal(tok->next, "once"))
             {
-                // Mark this file as included
+                // Mark this file as pragma once
                 File *start_file = tok_file(start);
                 char *real = realpath(start_file->name, NULL);
                 char *key = real ? real : strdup(start_file->name);
-                hashmap_put(&included_files, key, (void *)1);
+                hashmap_put(&pragma_once_files, key, (void *)1);
             }
             tok = skip_line_quiet(tok->next);
             continue;
@@ -3392,192 +3618,23 @@ static void pp_define_full(char *def)
     read_macro_definition(&tok, tok);
 }
 
-// Cache for system macros (populated once, reused across files)
-typedef struct
-{
-    char **lines;     // Array of macro definition lines
-    int count;        // Number of cached lines
-    int capacity;     // Capacity of lines array
-    bool initialized; // True if cache has been populated
-} SystemMacroCache;
-
-static SystemMacroCache system_macro_cache = {0};
-
-// Cache for extracted values (__GLIBC__, etc.)
-static struct
-{
-    bool initialized;
-    char glibc[32];
-    char glibc_minor[32];
-    char posix_version[32];
-} extracted_values_cache = {0};
-
-// Disk cache path for system macros
-static const char *get_macro_cache_path(void)
-{
-    static char path[PATH_MAX] = {0};
-    if (!path[0])
-    {
-        const char *home = getenv("HOME");
-        if (home)
-            snprintf(path, sizeof(path), "%s/.cache/prism/macros.cache", home);
-        else
-            snprintf(path, sizeof(path), "/tmp/prism_macros.cache");
-    }
-    return path;
-}
-
-// Try to load macros from disk cache
-static bool load_macro_cache(void)
-{
-    const char *path = get_macro_cache_path();
-    FILE *f = fopen(path, "r");
-    if (!f)
-        return false;
-
-    char line[4096];
-    while (fgets(line, sizeof(line), f))
-    {
-        // Remove trailing newline
-        size_t len = strlen(line);
-        if (len > 0 && line[len - 1] == '\n')
-            line[len - 1] = '\0';
-        if (len > 1 && line[len - 2] == '\r')
-            line[len - 2] = '\0';
-        if (line[0] == '\0')
-            continue;
-
-        // First 3 lines are special: glibc, glibc_minor, posix_version
-        if (!extracted_values_cache.initialized)
-        {
-            if (line[0] == 'G' && line[1] == ':')
-            {
-                strncpy(extracted_values_cache.glibc, line + 2, sizeof(extracted_values_cache.glibc) - 1);
-                continue;
-            }
-            if (line[0] == 'M' && line[1] == ':')
-            {
-                strncpy(extracted_values_cache.glibc_minor, line + 2, sizeof(extracted_values_cache.glibc_minor) - 1);
-                continue;
-            }
-            if (line[0] == 'P' && line[1] == ':')
-            {
-                strncpy(extracted_values_cache.posix_version, line + 2, sizeof(extracted_values_cache.posix_version) - 1);
-                extracted_values_cache.initialized = true;
-                continue;
-            }
-        }
-
-        // Regular macro line
-        if (system_macro_cache.count >= system_macro_cache.capacity)
-        {
-            int new_cap = system_macro_cache.capacity == 0 ? 256 : system_macro_cache.capacity * 2;
-            system_macro_cache.lines = realloc(system_macro_cache.lines, new_cap * sizeof(char *));
-            system_macro_cache.capacity = new_cap;
-        }
-        system_macro_cache.lines[system_macro_cache.count++] = strdup(line);
-    }
-    fclose(f);
-    
-    // Sanity check: a valid cache should have at least 100 macros
-    // (typical GCC has ~350). If fewer, cache may be truncated/corrupted.
-    if (system_macro_cache.count < 100)
-    {
-        // Clear the corrupted cache and return false to regenerate
-        for (int i = 0; i < system_macro_cache.count; i++)
-            free(system_macro_cache.lines[i]);
-        system_macro_cache.count = 0;
-        system_macro_cache.initialized = false;
-        extracted_values_cache.initialized = false;
-        memset(extracted_values_cache.glibc, 0, sizeof(extracted_values_cache.glibc));
-        memset(extracted_values_cache.glibc_minor, 0, sizeof(extracted_values_cache.glibc_minor));
-        memset(extracted_values_cache.posix_version, 0, sizeof(extracted_values_cache.posix_version));
-        return false;
-    }
-    
-    system_macro_cache.initialized = true;
-    return system_macro_cache.count > 0;
-}
-
-// Save macros to disk cache (atomic write via temp file + rename)
-static void save_macro_cache(void)
-{
-    const char *path = get_macro_cache_path();
-
-    // Create directory if needed
-    char dir[PATH_MAX];
-    strncpy(dir, path, sizeof(dir));
-    char *slash = strrchr(dir, '/');
-    if (slash)
-    {
-        *slash = '\0';
-        mkdir(dir, 0755);
-    }
-
-    // Write to temp file first, then rename atomically
-    char temp_path[PATH_MAX];
-    snprintf(temp_path, sizeof(temp_path), "%s.tmp.%d", path, getpid());
-
-    FILE *f = fopen(temp_path, "w");
-    if (!f)
-        return;
-
-    // Write extracted values first
-    fprintf(f, "G:%s\n", extracted_values_cache.glibc);
-    fprintf(f, "M:%s\n", extracted_values_cache.glibc_minor);
-    fprintf(f, "P:%s\n", extracted_values_cache.posix_version);
-
-    // Write macro lines
-    for (int i = 0; i < system_macro_cache.count; i++)
-    {
-        fprintf(f, "%s\n", system_macro_cache.lines[i]);
-    }
-    fclose(f);
-
-    // Atomic rename - only succeeds if complete write finished
-    rename(temp_path, path);
-}
-
-static void cache_add_line(const char *line)
-{
-    if (system_macro_cache.count >= system_macro_cache.capacity)
-    {
-        int new_cap = system_macro_cache.capacity == 0 ? 256 : system_macro_cache.capacity * 2;
-        system_macro_cache.lines = realloc(system_macro_cache.lines, new_cap * sizeof(char *));
-        system_macro_cache.capacity = new_cap;
-    }
-    system_macro_cache.lines[system_macro_cache.count++] = strdup(line);
-}
-
 // Extract predefined macros from the system compiler
 static int pp_import_system_macros(void)
 {
-    // If in-memory cached, replay from cache
-    if (system_macro_cache.initialized)
-    {
-        for (int i = 0; i < system_macro_cache.count; i++)
-        {
-            pp_define_full(system_macro_cache.lines[i]);
-        }
-        return system_macro_cache.count;
-    }
+    // Build command with user-specified compiler and flags
+    // This ensures flags like -std=c99, -m32, -D_GNU_SOURCE affect macro definitions
+    char *cmd = build_compiler_cmd("-dM -E - 2>/dev/null");
+    if (!cmd)
+        return -1;
 
-    // Try loading from disk cache first
-    if (load_macro_cache())
-    {
-        system_macro_cache.initialized = true;
-        for (int i = 0; i < system_macro_cache.count; i++)
-        {
-            pp_define_full(system_macro_cache.lines[i]);
-        }
-        return system_macro_cache.count;
-    }
+    // Prepend echo with headers and pipe to compiler
+    char full_cmd[4096];
+    snprintf(full_cmd, sizeof(full_cmd),
+             "echo '#include <features.h>\n#include <signal.h>\n#include <limits.h>\n#include <unistd.h>' | %s",
+             cmd);
+    free(cmd);
 
-    // Run the system compiler to get predefined macros
-    // We use plain "cc -dM -E -" to get only compiler-intrinsic macros
-    // NOT including features.h because that brings in internal glibc macros
-    // like __USE_POSIX, __USE_MISC that affect header behavior
-    FILE *fp = popen("cc -dM -E - < /dev/null 2>/dev/null", "r");
+    FILE *fp = popen(full_cmd, "r");
     if (!fp)
         return -1;
 
@@ -3603,8 +3660,7 @@ static int pp_import_system_macros(void)
 
         int name_len = end - start;
 
-        // Skip certain problematic macros that we handle specially
-        // or that would cause issues
+        // Skip macros that we handle specially (dynamic values)
         if ((name_len == 8 && strncmp(start, "__FILE__", 8) == 0) ||
             (name_len == 8 && strncmp(start, "__LINE__", 8) == 0) ||
             (name_len == 11 && strncmp(start, "__COUNTER__", 11) == 0) ||
@@ -3612,11 +3668,6 @@ static int pp_import_system_macros(void)
             (name_len == 8 && strncmp(start, "__TIME__", 8) == 0) ||
             (name_len == 13 && strncmp(start, "__TIMESTAMP__", 13) == 0) ||
             (name_len == 13 && strncmp(start, "__BASE_FILE__", 13) == 0))
-            continue;
-
-        // Skip internal glibc __USE_* macros that affect header behavior
-        // These should be determined by the user's feature test macros, not hardcoded
-        if (name_len >= 6 && strncmp(start, "__USE_", 6) == 0)
             continue;
 
         // For function-like macros (has '('), use pp_define_full
@@ -3631,7 +3682,6 @@ static int pp_import_system_macros(void)
             if (nl)
                 *nl = '\0';
 
-            cache_add_line(start); // Cache for reuse
             pp_define_full(start);
         }
         else
@@ -3656,14 +3706,6 @@ static int pp_import_system_macros(void)
             if (nl)
                 *nl = '\0';
 
-            // Cache as "NAME VALUE" format for replay
-            char cache_line[512];
-            if (*value == '\0')
-                snprintf(cache_line, sizeof(cache_line), "%s", name);
-            else
-                snprintf(cache_line, sizeof(cache_line), "%s %s", name, value);
-            cache_add_line(cache_line);
-
             // Empty value means define as empty string
             if (*value == '\0')
                 pp_define_macro(strdup(name), "");
@@ -3674,7 +3716,6 @@ static int pp_import_system_macros(void)
     }
 
     pclose(fp);
-    system_macro_cache.initialized = true;
     return count;
 }
 
@@ -3682,12 +3723,12 @@ static int pp_import_system_macros(void)
 void pp_reset(void)
 {
     hashmap_clear(&macros);
-    hashmap_clear(&included_files);
+    hashmap_clear(&pragma_once_files);
+    hashmap_clear(&guarded_files);
     hashmap_clear(&token_hidesets);
     hashmap_clear(&token_origins);
     hashmap_clear(&token_fvals);
     hashmap_clear(&token_types);
-    hashmap_clear(&include_path_cache);
     cond_incl = NULL;
     pp_eval_skip = false;
     reset_feature_test_macros();
@@ -3707,222 +3748,73 @@ void pp_init(void)
             hashmap_put(&feature_test_macro_set, (char *)feature_test_macro_names[i], (void *)1);
     }
 
-    // Track if we loaded from disk cache (don't need to resave)
-    bool loaded_from_disk = extracted_values_cache.initialized;
+    // Import all macros from the system compiler (includes features.h, signal.h, limits.h, unistd.h)
+    pp_import_system_macros();
 
-    int imported = pp_import_system_macros();
-    (void)imported; // May be -1 if compiler not found, we'll use fallbacks
-
+    // Dynamic builtins that depend on current file/line
     add_builtin("__FILE__", file_macro);
     add_builtin("__LINE__", line_macro);
 
-    // __GLIBC__ comes from <features.h>, not from the compiler itself.
-    // We need to add it manually for Linux systems to ensure code that
-    // uses #ifdef __GLIBC__ (like dash, bash) works correctly.
-#if defined(__linux__)
-    if (!hashmap_get(&macros, "__GLIBC__"))
-    {
-        // Use cached value if available
-        if (extracted_values_cache.initialized && extracted_values_cache.glibc[0])
-        {
-            pp_define_macro("__GLIBC__", extracted_values_cache.glibc);
-        }
-        else
-        {
-            // Try to extract __GLIBC__ from the system by including features.h
-            FILE *fp = popen("echo '#include <features.h>' | cc -dM -E - 2>/dev/null | grep -E '^#define __GLIBC__' | head -1", "r");
-            if (fp)
-            {
-                char line[256];
-                if (fgets(line, sizeof(line), fp))
-                {
-                    // Line is: #define __GLIBC__ <value>
-                    char *val = strstr(line, "__GLIBC__");
-                    if (val)
-                    {
-                        val += 9; // Skip "__GLIBC__"
-                        while (*val == ' ' || *val == '\t')
-                            val++;
-                        char *end = val;
-                        while (*end && *end != '\n' && *end != '\r' && *end != ' ')
-                            end++;
-                        *end = '\0';
-                        if (*val)
-                        {
-                            strncpy(extracted_values_cache.glibc, val, sizeof(extracted_values_cache.glibc) - 1);
-                            pp_define_macro("__GLIBC__", extracted_values_cache.glibc);
-                        }
-                    }
-                }
-                pclose(fp);
-            }
-        }
-        // Fallback if extraction failed
-        if (!hashmap_get(&macros, "__GLIBC__"))
-        {
-            strncpy(extracted_values_cache.glibc, "2", sizeof(extracted_values_cache.glibc) - 1);
-            pp_define_macro("__GLIBC__", "2");
-        }
-    }
-    if (!hashmap_get(&macros, "__GLIBC_MINOR__"))
-    {
-        // Use cached value if available
-        if (extracted_values_cache.initialized && extracted_values_cache.glibc_minor[0])
-        {
-            pp_define_macro("__GLIBC_MINOR__", extracted_values_cache.glibc_minor);
-        }
-        else
-        {
-            FILE *fp = popen("echo '#include <features.h>' | cc -dM -E - 2>/dev/null | grep -E '^#define __GLIBC_MINOR__' | head -1", "r");
-            if (fp)
-            {
-                char line[256];
-                if (fgets(line, sizeof(line), fp))
-                {
-                    char *val = strstr(line, "__GLIBC_MINOR__");
-                    if (val)
-                    {
-                        val += 15; // Skip "__GLIBC_MINOR__"
-                        while (*val == ' ' || *val == '\t')
-                            val++;
-                        char *end = val;
-                        while (*end && *end != '\n' && *end != '\r' && *end != ' ')
-                            end++;
-                        *end = '\0';
-                        if (*val)
-                        {
-                            strncpy(extracted_values_cache.glibc_minor, val, sizeof(extracted_values_cache.glibc_minor) - 1);
-                            pp_define_macro("__GLIBC_MINOR__", extracted_values_cache.glibc_minor);
-                        }
-                    }
-                }
-                pclose(fp);
-            }
-        }
-        if (!hashmap_get(&macros, "__GLIBC_MINOR__"))
-        {
-            strncpy(extracted_values_cache.glibc_minor, "17", sizeof(extracted_values_cache.glibc_minor) - 1);
-            pp_define_macro("__GLIBC_MINOR__", "17");
-        }
-    }
-    // _POSIX_VERSION comes from <unistd.h>, not the compiler.
-    // We need it for code like bash's jobs.h that checks #if !defined(_POSIX_VERSION)
-    // to decide whether to use union wait (BSD) or int (POSIX) for WAIT type.
-    if (!hashmap_get(&macros, "_POSIX_VERSION"))
-    {
-        // Use cached value if available
-        if (extracted_values_cache.initialized && extracted_values_cache.posix_version[0])
-        {
-            pp_define_macro("_POSIX_VERSION", extracted_values_cache.posix_version);
-        }
-        else
-        {
-            FILE *fp = popen("echo '#include <unistd.h>' | cc -dM -E - 2>/dev/null | grep -E '^#define _POSIX_VERSION' | head -1", "r");
-            if (fp)
-            {
-                char line[256];
-                if (fgets(line, sizeof(line), fp))
-                {
-                    char *val = strstr(line, "_POSIX_VERSION");
-                    if (val)
-                    {
-                        val += 14; // Skip "_POSIX_VERSION"
-                        while (*val == ' ' || *val == '\t')
-                            val++;
-                        char *end = val;
-                        while (*end && *end != '\n' && *end != '\r' && *end != ' ')
-                            end++;
-                        *end = '\0';
-                        if (*val)
-                        {
-                            strncpy(extracted_values_cache.posix_version, val, sizeof(extracted_values_cache.posix_version) - 1);
-                            pp_define_macro("_POSIX_VERSION", extracted_values_cache.posix_version);
-                        }
-                    }
-                }
-                pclose(fp);
-            }
-            extracted_values_cache.initialized = true;
-        }
-        if (!hashmap_get(&macros, "_POSIX_VERSION"))
-        {
-            strncpy(extracted_values_cache.posix_version, "200809L", sizeof(extracted_values_cache.posix_version) - 1);
-            pp_define_macro("_POSIX_VERSION", "200809L");
-        }
-    }
-#endif
+    // GCC extension - make it expand to nothing
+    if (!hashmap_get(&macros, "__extension__"))
+        pp_define_macro("__extension__", "");
 
-    if (!hashmap_get(&macros, "__STDC__"))
-        pp_define_macro("__STDC__", "1");
-    if (!hashmap_get(&macros, "__STDC_VERSION__"))
-        pp_define_macro("__STDC_VERSION__", "201112L");
-    if (!hashmap_get(&macros, "__STDC_HOSTED__"))
-        pp_define_macro("__STDC_HOSTED__", "1");
-
-    pp_define_macro("__extension__", "");
-
-    pp_define_full("__has_feature(x) 0");
-    pp_define_full("__has_extension(x) 0");
-    pp_define_full("__has_builtin(x) 0");
-    pp_define_full("__has_attribute(x) 0");
-    pp_define_full("__has_warning(x) 0");
-    pp_define_full("__has_c_attribute(x) 0");
-    pp_define_full("__building_module(x) 0");
-
-    if (!hashmap_get(&macros, "CHAR_BIT"))
-    {
-        pp_define_macro("CHAR_BIT", "8");
-        pp_define_macro("SCHAR_MIN", "(-128)");
-        pp_define_macro("SCHAR_MAX", "127");
-        pp_define_macro("UCHAR_MAX", "255");
-        pp_define_macro("CHAR_MIN", "(-128)");
-        pp_define_macro("CHAR_MAX", "127");
-        pp_define_macro("SHRT_MIN", "(-32768)");
-        pp_define_macro("SHRT_MAX", "32767");
-        pp_define_macro("USHRT_MAX", "65535");
-        pp_define_macro("INT_MIN", "(-2147483647-1)");
-        pp_define_macro("INT_MAX", "2147483647");
-        pp_define_macro("UINT_MAX", "4294967295U");
-        pp_define_macro("LONG_MIN", "(-9223372036854775807L-1L)");
-        pp_define_macro("LONG_MAX", "9223372036854775807L");
-        pp_define_macro("ULONG_MAX", "18446744073709551615UL");
-        pp_define_macro("LLONG_MIN", "(-9223372036854775807LL-1LL)");
-        pp_define_macro("LLONG_MAX", "9223372036854775807LL");
-        pp_define_macro("ULLONG_MAX", "18446744073709551615ULL");
-    }
-
-    // glibc internal macros needed when system headers are passed through
-    if (!hashmap_get(&macros, "__getopt_argv_const"))
-        pp_define_macro("__getopt_argv_const", "const");
-
-    // Save disk cache if we populated it fresh (not loaded from disk)
-    if (!loaded_from_disk && system_macro_cache.initialized)
-    {
-        save_macro_cache();
-    }
+    // Clang feature-check macros - need defaults if not provided by system compiler
+    if (!hashmap_get(&macros, "__has_feature"))
+        pp_define_full("__has_feature(x) 0");
+    if (!hashmap_get(&macros, "__has_extension"))
+        pp_define_full("__has_extension(x) 0");
+    if (!hashmap_get(&macros, "__has_builtin"))
+        pp_define_full("__has_builtin(x) 0");
+    if (!hashmap_get(&macros, "__has_attribute"))
+        pp_define_full("__has_attribute(x) 0");
+    if (!hashmap_get(&macros, "__has_warning"))
+        pp_define_full("__has_warning(x) 0");
+    if (!hashmap_get(&macros, "__has_c_attribute"))
+        pp_define_full("__has_c_attribute(x) 0");
+    if (!hashmap_get(&macros, "__building_module"))
+        pp_define_full("__building_module(x) 0");
 
 #ifdef __APPLE__
-    // Apple availability attributes - make them expand to nothing
-    // These are used for API versioning and would break compilation otherwise
-    pp_define_full("__API_AVAILABLE(...) ");
-    pp_define_full("__API_UNAVAILABLE(...) ");
-    pp_define_full("__API_DEPRECATED(...) ");
-    pp_define_full("__API_DEPRECATED_WITH_REPLACEMENT(...) ");
-    pp_define_full("__OSX_AVAILABLE(...) ");
-    pp_define_full("__IOS_AVAILABLE(...) ");
-    pp_define_full("__TVOS_AVAILABLE(...) ");
-    pp_define_full("__WATCHOS_AVAILABLE(...) ");
-    pp_define_full("__OSX_AVAILABLE_STARTING(...) ");
-    pp_define_full("__OSX_AVAILABLE_BUT_DEPRECATED(...) ");
-    pp_define_full("__OSX_DEPRECATED(...) ");
-    pp_define_full("__IOS_PROHIBITED ");
-    pp_define_full("__TVOS_PROHIBITED ");
-    pp_define_full("__WATCHOS_PROHIBITED ");
-    pp_define_macro("__OSX_EXTENSION_UNAVAILABLE", "");
-    pp_define_macro("__IOS_EXTENSION_UNAVAILABLE", "");
-    pp_define_full("_API_AVAILABLE(...) ");
-    pp_define_full("__SWIFT_UNAVAILABLE_MSG(...) ");
-    pp_define_macro("__SWIFT_UNAVAILABLE", "");
+    // Apple availability attributes - make them expand to nothing if not already defined
+    if (!hashmap_get(&macros, "__API_AVAILABLE"))
+        pp_define_full("__API_AVAILABLE(...) ");
+    if (!hashmap_get(&macros, "__API_UNAVAILABLE"))
+        pp_define_full("__API_UNAVAILABLE(...) ");
+    if (!hashmap_get(&macros, "__API_DEPRECATED"))
+        pp_define_full("__API_DEPRECATED(...) ");
+    if (!hashmap_get(&macros, "__API_DEPRECATED_WITH_REPLACEMENT"))
+        pp_define_full("__API_DEPRECATED_WITH_REPLACEMENT(...) ");
+    if (!hashmap_get(&macros, "__OSX_AVAILABLE"))
+        pp_define_full("__OSX_AVAILABLE(...) ");
+    if (!hashmap_get(&macros, "__IOS_AVAILABLE"))
+        pp_define_full("__IOS_AVAILABLE(...) ");
+    if (!hashmap_get(&macros, "__TVOS_AVAILABLE"))
+        pp_define_full("__TVOS_AVAILABLE(...) ");
+    if (!hashmap_get(&macros, "__WATCHOS_AVAILABLE"))
+        pp_define_full("__WATCHOS_AVAILABLE(...) ");
+    if (!hashmap_get(&macros, "__OSX_AVAILABLE_STARTING"))
+        pp_define_full("__OSX_AVAILABLE_STARTING(...) ");
+    if (!hashmap_get(&macros, "__OSX_AVAILABLE_BUT_DEPRECATED"))
+        pp_define_full("__OSX_AVAILABLE_BUT_DEPRECATED(...) ");
+    if (!hashmap_get(&macros, "__OSX_DEPRECATED"))
+        pp_define_full("__OSX_DEPRECATED(...) ");
+    if (!hashmap_get(&macros, "__IOS_PROHIBITED"))
+        pp_define_full("__IOS_PROHIBITED ");
+    if (!hashmap_get(&macros, "__TVOS_PROHIBITED"))
+        pp_define_full("__TVOS_PROHIBITED ");
+    if (!hashmap_get(&macros, "__WATCHOS_PROHIBITED"))
+        pp_define_full("__WATCHOS_PROHIBITED ");
+    if (!hashmap_get(&macros, "__OSX_EXTENSION_UNAVAILABLE"))
+        pp_define_macro("__OSX_EXTENSION_UNAVAILABLE", "");
+    if (!hashmap_get(&macros, "__IOS_EXTENSION_UNAVAILABLE"))
+        pp_define_macro("__IOS_EXTENSION_UNAVAILABLE", "");
+    if (!hashmap_get(&macros, "_API_AVAILABLE"))
+        pp_define_full("_API_AVAILABLE(...) ");
+    if (!hashmap_get(&macros, "__SWIFT_UNAVAILABLE_MSG"))
+        pp_define_full("__SWIFT_UNAVAILABLE_MSG(...) ");
+    if (!hashmap_get(&macros, "__SWIFT_UNAVAILABLE"))
+        pp_define_macro("__SWIFT_UNAVAILABLE", "");
 #endif
 }
 

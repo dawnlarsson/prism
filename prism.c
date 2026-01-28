@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.76.0"
+#define PRISM_VERSION "0.77.0"
 
 #include "parse.c"
 
@@ -88,6 +88,9 @@ static bool feature_zeroinit = true;
 static HashMap type_keyword_map;
 
 // Extra preprocessor configuration (set by CLI before transpile)
+static const char *extra_compiler = NULL;        // Compiler name (cc, gcc, clang, etc.)
+static const char **extra_compiler_flags = NULL; // Flags that affect macros (-std=, -m32, etc.)
+static int extra_compiler_flags_count = 0;
 static const char **extra_include_paths = NULL;
 static int extra_include_count = 0;
 static const char **extra_defines = NULL;
@@ -2654,6 +2657,12 @@ static int transpile(char *input_file, char *output_file)
   if (!type_keyword_map.capacity)
     init_type_keyword_map();
 
+  // Set compiler and flags BEFORE pp_init so system macro query uses them
+  if (extra_compiler)
+    pp_set_compiler(extra_compiler);
+  for (int i = 0; i < extra_compiler_flags_count; i++)
+    pp_add_compiler_flag(extra_compiler_flags[i]);
+
   pp_init();
   pp_add_default_include_paths();
 
@@ -4005,6 +4014,12 @@ typedef struct
   int force_include_count;
   int force_include_capacity;
 
+  // Compiler flags that affect macro/include path discovery
+  // (e.g., -std=c99, -m32, -march=x86_64)
+  const char **pp_flags;
+  int pp_flags_count;
+  int pp_flags_capacity;
+
   // Prism-specific
   const char *cc; // --prism-cc (default: $PRISM_CC or $CC or "cc")
   bool verbose;   // --prism-verbose
@@ -4017,6 +4032,18 @@ typedef struct
   // Link-only mode detection
   bool has_objects; // true if .o, .a, or .so files were provided
 } Cli;
+
+// Get the actual C compiler to use, avoiding infinite recursion if CC=prism
+static const char *get_real_cc(const char *cc)
+{
+  if (!cc || !*cc)
+    return "cc"; // NULL or empty string
+  const char *base = strrchr(cc, '/');
+  base = base ? base + 1 : cc;
+  if (strcmp(base, "prism") == 0 || strcmp(base, "prism.exe") == 0)
+    return "cc";
+  return cc;
+}
 
 static void cli_add_source(Cli *cli, const char *src)
 {
@@ -4072,6 +4099,20 @@ static void cli_add_force_include(Cli *cli, const char *path)
     cli->force_include_capacity = new_cap;
   }
   cli->force_includes[cli->force_include_count++] = path;
+}
+
+static void cli_add_pp_flag(Cli *cli, const char *flag)
+{
+  if (cli->pp_flags_count >= cli->pp_flags_capacity)
+  {
+    int new_cap = cli->pp_flags_capacity == 0 ? 16 : cli->pp_flags_capacity * 2;
+    const char **new_flags = realloc(cli->pp_flags, sizeof(char *) * new_cap);
+    if (!new_flags)
+      die("Out of memory");
+    cli->pp_flags = new_flags;
+    cli->pp_flags_capacity = new_cap;
+  }
+  cli->pp_flags[cli->pp_flags_count++] = flag;
 }
 
 static void cli_add_cc_arg(Cli *cli, const char *arg)
@@ -4186,8 +4227,10 @@ static Cli cli_parse(int argc, char **argv)
 
   // Get compiler from environment
   char *env_cc = getenv("PRISM_CC");
-  if (!env_cc)
+  if (!env_cc || !*env_cc)
     env_cc = getenv("CC");
+  if (!env_cc || !*env_cc)
+    env_cc = NULL;
   cli.cc = env_cc ? env_cc : "cc";
 
   for (int i = 1; i < argc; i++)
@@ -4451,6 +4494,13 @@ static Cli cli_parse(int argc, char **argv)
     }
 
     // ─── Everything else: pass through to CC ───
+    // Also track flags that affect macro/include path discovery
+    if (strncmp(arg, "-std=", 5) == 0 ||
+        strncmp(arg, "-m", 2) == 0 ||      // -m32, -m64, -march=, -mtune=, etc.
+        strncmp(arg, "--target=", 9) == 0) // Cross-compile target
+    {
+      cli_add_pp_flag(&cli, arg);
+    }
     cli_add_cc_arg(&cli, arg);
 
     // Handle space-separated args like -L dir
@@ -4470,6 +4520,7 @@ static void cli_free(Cli *cli)
   free(cli->include_paths);
   free(cli->defines);
   free(cli->force_includes);
+  free(cli->pp_flags);
 }
 
 static char *create_temp_file(const char *source, char *buf, size_t bufsize)
@@ -4543,6 +4594,9 @@ int main(int argc, char **argv)
   feature_zeroinit = cli.features.zeroinit;
 
   // Set preprocessor configuration from CLI
+  extra_compiler = cli.cc;
+  extra_compiler_flags = cli.pp_flags;
+  extra_compiler_flags_count = cli.pp_flags_count;
   extra_include_paths = cli.include_paths;
   extra_include_count = cli.include_count;
   extra_defines = cli.defines;
@@ -4573,9 +4627,13 @@ int main(int argc, char **argv)
       snprintf(temp_bin, sizeof(temp_bin), "%sprism_install_%d", TMP_DIR, getpid());
 
       // Build compile command
-      const char *cc = cli.cc ? cli.cc : getenv("PRISM_CC");
-      if (!cc)
+      const char *cc = get_real_cc(cli.cc ? cli.cc : getenv("PRISM_CC"));
+      if (!cc || (strcmp(cc, "cc") == 0 && !cli.cc))
+      {
         cc = getenv("CC");
+        if (cc)
+          cc = get_real_cc(cc);
+      }
       if (!cc)
         cc = "cc";
 
@@ -4717,7 +4775,7 @@ int main(int argc, char **argv)
   case CLI_MODE_PASSTHROUGH:
   {
     // Pass sources directly to compiler without transpiling (-E, -S modes)
-    const char *compiler = cli.cc;
+    const char *compiler = get_real_cc(cli.cc);
     char *cross_cc = get_compiler_for_cross(cli.cross_arch, cli.cross_bits, cli.cross_platform);
     if (cross_cc)
       compiler = cross_cc;
@@ -4765,7 +4823,7 @@ int main(int argc, char **argv)
   // Link-only mode: if no sources but has object files, pass through to compiler
   if (cli.source_count == 0 && cli.has_objects && cli.mode != CLI_MODE_RUN)
   {
-    const char *compiler = cli.cc;
+    const char *compiler = get_real_cc(cli.cc);
     char *cross_cc = get_compiler_for_cross(cli.cross_arch, cli.cross_bits, cli.cross_platform);
     if (cross_cc)
       compiler = cross_cc;
@@ -4804,7 +4862,7 @@ int main(int argc, char **argv)
     die("No source files specified");
 
   // Determine compiler
-  const char *compiler = cli.cc;
+  const char *compiler = get_real_cc(cli.cc);
   char *cross_cc = get_compiler_for_cross(cli.cross_arch, cli.cross_bits, cli.cross_platform);
   if (cross_cc)
     compiler = cross_cc;
