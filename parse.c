@@ -621,12 +621,6 @@ static char *build_compiler_cmd(const char *base_cmd)
 
 static void pp_add_include_path(const char *path)
 {
-<<<<<<< Updated upstream
-    char *real = realpath(path, NULL);
-    const char *canonical = real ? real : path;
-
-    // Check if this path is already in the list
-=======
     // Resolve to canonical path for comparison
     char *real = realpath(path, NULL);
     const char *canonical = real ? real : path;
@@ -634,7 +628,6 @@ static void pp_add_include_path(const char *path)
     // Check if this path is already in the list (avoid duplicates)
     // This is important because if -I/usr/include is passed, we don't want
     // to add it again as a "user" path - it should remain a system path
->>>>>>> Stashed changes
     for (int i = 0; i < pp_include_paths_count; i++)
     {
         char *existing_real = realpath(pp_include_paths[i], NULL);
