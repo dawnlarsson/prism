@@ -119,6 +119,7 @@ enum
     TF_AT_BOL = 1 << 0,    // Token is at beginning of line
     TF_HAS_SPACE = 1 << 1, // Token preceded by whitespace
     TF_IS_FLOAT = 1 << 2,  // For TK_NUM: value is floating point (use fval side table)
+    TF_FOREIGN_LOC = 1 << 3, // Token loc doesn't belong to tok_file() contents
 };
 
 struct Token
@@ -337,6 +338,7 @@ struct Macro
 {
     char *name;
     bool is_objlike;
+    bool is_virtual; // Defined in a virtual include - tokens should inherit expansion site location
     MacroParam *params;
     char *va_args_name;
     Token *body;
@@ -359,8 +361,11 @@ struct CondIncl
 
 static HashMap macros;
 static CondIncl *cond_incl;
-static HashMap pragma_once_files; // Files with #pragma once
-static HashMap guarded_files;     // Files we've fully included (guard macro now defined)
+static HashMap pragma_once_files;       // Files with #pragma once
+static HashMap guarded_files;           // Files we've fully included (guard macro now defined)
+static HashMap virtual_includes;        // Files processed in virtual mode (macros learned, not inlined)
+static bool in_virtual_include = false; // true when processing a virtual include file
+static bool in_pp_const_expr = false;   // true when evaluating #if/#elif constant expressions
 static bool pp_eval_skip = false;
 
 // Hash set for fast feature test macro lookup
@@ -1029,7 +1034,10 @@ static void hashmap_delete2(HashMap *map, char *key, int keylen)
 {
     HashEntry *ent = hashmap_get_entry(map, key, keylen);
     if (ent)
+    {
+        free(ent->key); // Free the allocated key copy
         ent->key = TOMBSTONE;
+    }
 }
 
 static void hashmap_delete(HashMap *map, char *key)
@@ -1071,6 +1079,8 @@ static int tok_line_no(Token *tok)
 {
     File *f = tok_file(tok);
     if (!f || !f->contents || !tok->loc)
+        return -1;
+    if (tok->flags & TF_FOREIGN_LOC)
         return -1;
 
     // Check if tok->loc points into the file contents
@@ -1354,6 +1364,13 @@ noreturn void error(char *fmt, ...)
 
 static void verror_at(char *filename, char *input, int line_no, char *loc, char *fmt, va_list ap)
 {
+    if (!input || !loc || line_no <= 0)
+    {
+        fprintf(stderr, "%s:?: ", filename ? filename : "<unknown>");
+        vfprintf(stderr, fmt, ap);
+        fprintf(stderr, "\n");
+        return;
+    }
     char *line = loc;
     while (input < line && line[-1] != '\n')
         line--;
@@ -1384,8 +1401,13 @@ noreturn void error_tok(Token *tok, char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    File *f = tok_file(tok);
-    verror_at(f->name, f->contents, tok_line_no(tok), tok->loc, fmt, ap);
+    Token *t = tok;
+    for (; t && tok_line_no(t) <= 0; t = tok_origin(t))
+        ;
+    if (!t)
+        t = tok;
+    File *f = tok_file(t);
+    verror_at(f->name, f->contents, tok_line_no(t), t->loc, fmt, ap);
     exit(1);
 }
 
@@ -1393,8 +1415,13 @@ static void warn_tok(Token *tok, char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    File *f = tok_file(tok);
-    verror_at(f->name, f->contents, tok_line_no(tok), tok->loc, fmt, ap);
+    Token *t = tok;
+    for (; t && tok_line_no(t) <= 0; t = tok_origin(t))
+        ;
+    if (!t)
+        t = tok;
+    File *f = tok_file(t);
+    verror_at(f->name, f->contents, tok_line_no(t), t->loc, fmt, ap);
     va_end(ap);
 }
 
@@ -2242,10 +2269,18 @@ Token *tokenize_file(char *path)
         return NULL;
     }
 
+    // Skip UTF-8 BOM if present, but keep original pointer for proper freeing
+    char *contents_start = p;
     if (!memcmp(p, "\xef\xbb\xbf", 3))
-        p += 3; // Skip BOM
-    canonicalize_newline(p);
-    remove_backslash_newline(p);
+        contents_start = p + 3;
+    canonicalize_newline(contents_start);
+    remove_backslash_newline(contents_start);
+
+    // If BOM was skipped, shift contents to start of buffer so free() works correctly
+    if (contents_start != p)
+    {
+        memmove(p, contents_start, strlen(contents_start) + 1);
+    }
 
     File *file = new_file(path, input_file_count, p);
     File **new_input_files = realloc(input_files, sizeof(File *) * (input_file_count + 2));
@@ -2262,7 +2297,8 @@ Token *tokenize_file(char *path)
     char *detected_guard = detect_include_guard(toks);
     if (detected_guard)
     {
-        hashmap_put(&guarded_files, real ? strdup(real) : strdup(path), detected_guard);
+        // Store marker value (1) instead of guard name - we only check presence
+        hashmap_put(&guarded_files, real ? real : path, (void *)1);
         free(detected_guard);
     }
 
@@ -2426,7 +2462,7 @@ static void free_macro(Macro *m)
     // Free macro name (strdup'd in add_macro)
     if (m->name)
         free(m->name);
-    // Free va_args_name if present (allocated by strndup)
+    // Free va_args_name if present (allocated by strndup/strdup)
     if (m->va_args_name)
         free(m->va_args_name);
     // Free params linked list (each param->name allocated by strndup)
@@ -2454,6 +2490,7 @@ static void free_all_macros(void)
         if (macros.buckets[i].key && macros.buckets[i].key != TOMBSTONE)
         {
             Macro *m = (Macro *)macros.buckets[i].val;
+            macros.buckets[i].val = NULL; // Null out before freeing to prevent double-free
             free_macro(m);
         }
     }
@@ -2461,6 +2498,16 @@ static void free_all_macros(void)
 
 static Macro *add_macro(char *name, bool is_objlike, Token *body)
 {
+    // Check if macro already exists - if so, free it first to avoid memory leaks
+    // and corrupted state on subsequent pp_reset() calls
+    Macro *existing = hashmap_get(&macros, name);
+    if (existing)
+    {
+        // Remove from hashmap first (don't free key - hashmap_delete2 handles that)
+        hashmap_delete2(&macros, name, strlen(name));
+        free_macro(existing);
+    }
+
     Macro *m = calloc(1, sizeof(Macro));
     if (!m)
     {
@@ -2475,6 +2522,7 @@ static Macro *add_macro(char *name, bool is_objlike, Token *body)
         exit(1);
     }
     m->is_objlike = is_objlike;
+    m->is_virtual = in_virtual_include; // Mark if defined in virtual include
     m->body = body;
     hashmap_put(&macros, m->name, m);
     return m;
@@ -2662,9 +2710,9 @@ static Token *new_str_token_raw(char *str, Token *tmpl)
 // Paste two tokens together
 static Token *paste(Token *lhs, Token *rhs)
 {
-    char *buf = format("%.*s%.*s", lhs->len, lhs->loc, rhs->len, rhs->loc);
+    char *buf = format("%.*s%.*s\n", lhs->len, lhs->loc, rhs->len, rhs->loc);
     File *f = tok_file(lhs);
-    Token *tok = tokenize(new_file(f->name, f->file_no, format("%s\n", buf)));
+    Token *tok = tokenize(new_file(f->name, f->file_no, buf));
     if (tok->next->kind != TK_EOF)
         error_tok(lhs, "pasting \"%.*s\" and \"%.*s\" does not produce a valid token",
                   lhs->len, lhs->loc, rhs->len, rhs->loc);
@@ -2747,8 +2795,11 @@ static Token *subst(Token *tok, MacroArg *args)
 
         if (arg)
         {
-            // Expand argument (without ##)
+            // Expand argument (without ##) - not affected by virtual include mode
+            bool save_virtual = in_virtual_include;
+            in_virtual_include = false;
             Token *expanded = preprocess2(copy_token_list(arg));
+            in_virtual_include = save_virtual;
             for (Token *t = expanded; t && t->kind != TK_EOF; t = t->next)
                 cur = cur->next = copy_token(t);
             tok = tok->next;
@@ -2781,6 +2832,17 @@ static bool is_member_access_macro(Token *body)
     return !end || end->kind == TK_EOF;
 }
 
+// Transfer file_idx from source token to all tokens in a list
+// Used when expanding virtual macros so #line directives don't jump to system headers
+static void transfer_file_location(Token *body, Token *source)
+{
+    for (Token *t = body; t && t->kind != TK_EOF; t = t->next)
+    {
+        t->file_idx = source->file_idx;
+        t->flags |= TF_FOREIGN_LOC;
+    }
+}
+
 static bool expand_macro(Token **rest, Token *tok)
 {
     if (hideset_contains(tok_hideset(tok), tok->loc, tok->len))
@@ -2806,9 +2868,19 @@ static bool expand_macro(Token **rest, Token *tok)
         Token *body = add_hideset(m->body, hs);
         for (Token *t = body; t && t->kind != TK_EOF; t = t->next)
             tok_set_origin(t, tok);
+        // For virtual macros, transfer file location so #line doesn't jump to system headers
+        if (m->is_virtual)
+            transfer_file_location(body, tok);
         *rest = append(body, tok->next);
         return true;
     }
+
+    // Don't expand function-like macros from virtual includes in regular code
+    // They may reference platform-specific struct members (e.g., FD_ZERO uses __fds_bits)
+    // But DO expand them in preprocessor constant expressions (e.g., #if UINT64_MAX > X)
+    // where unexpanded macros would cause parse errors like "0(...)"
+    if (m->is_virtual && !in_pp_const_expr)
+        return false;
 
     if (!equal(tok->next, "("))
         return false;
@@ -2821,6 +2893,9 @@ static bool expand_macro(Token **rest, Token *tok)
     body = add_hideset(body, hs);
     for (Token *t = body; t && t->kind != TK_EOF; t = t->next)
         tok_set_origin(t, macro_tok);
+    // For virtual macros, transfer file location so #line doesn't jump to system headers
+    if (m->is_virtual)
+        transfer_file_location(body, macro_tok);
     *rest = append(body, tok);
     return true;
 }
@@ -2915,7 +2990,12 @@ static MacroParam *read_macro_params(Token **rest, Token *tok, char **va_name)
 
         if (equal(tok, "..."))
         {
-            *va_name = "__VA_ARGS__";
+            *va_name = strdup("__VA_ARGS__");
+            if (!*va_name)
+            {
+                fprintf(stderr, "out of memory in read_macro_params\n");
+                exit(1);
+            }
             tok = tok->next;
             break;
         }
@@ -3443,7 +3523,9 @@ static Token *preprocess2(Token *tok)
 
         if (!is_hash(tok))
         {
-            cur = cur->next = tok;
+            // Only add tokens to output if not inside a virtual include
+            if (!in_virtual_include)
+                cur = cur->next = tok;
             tok = tok->next;
             continue;
         }
@@ -3461,7 +3543,7 @@ static Token *preprocess2(Token *tok)
             char *filename = read_include_filename(&tok, tok->next, &is_dquote);
 
             // For angle-bracket includes, check if file exists in user-specified paths first
-            // If found there, inline it; otherwise pass through to the backend compiler
+            // If found there, inline it; otherwise process virtually and pass through
             if (!is_dquote)
             {
                 char *user_path = search_user_include_paths(filename);
@@ -3471,6 +3553,28 @@ static Token *preprocess2(Token *tok)
                     tok = skip_line(tok);
                     tok = include_file(start, user_path, tok);
                     continue;
+                }
+
+                // System header: find in system paths, process virtually for macros
+                char *sys_path = search_include_paths(filename);
+                if (sys_path)
+                {
+                    if (!hashmap_get(&virtual_includes, sys_path))
+                    {
+                        // Mark as virtually included to prevent reprocessing
+                        hashmap_put(&virtual_includes, sys_path, (void *)1);
+
+                        // Process the header to learn macros, but discard output
+                        Token *sys_tok = tokenize_file(sys_path);
+                        if (sys_tok)
+                        {
+                            bool was_virtual = in_virtual_include;
+                            in_virtual_include = true;
+                            preprocess2(sys_tok); // Process for macros, output discarded
+                            in_virtual_include = was_virtual;
+                        }
+                    }
+                    free(sys_path);
                 }
 
                 // Build the entire directive as one string to avoid #line insertion between tokens
@@ -3490,7 +3594,9 @@ static Token *preprocess2(Token *tok)
                 tok = skip_line(tok);
                 directive->next = tok;
 
-                cur = cur->next = directive;
+                // Only emit if not inside a virtual include
+                if (!in_virtual_include)
+                    cur = cur->next = directive;
                 continue;
             }
 
@@ -3511,13 +3617,58 @@ static Token *preprocess2(Token *tok)
                     else
                         free(try);
                 }
-                // For quoted includes, search user-specified paths (-I) first
-                // before falling back to system include paths
+                // For quoted includes, search user-specified paths (-I) only
+                // Don't fall back to system paths - if not found locally, pass through
                 if (!path)
                     path = search_user_include_paths(filename);
+
+                // If quoted include not found in current dir or user paths,
+                // process virtually and pass through to backend compiler
+                if (!path)
+                {
+                    // Try to find in system paths for virtual processing
+                    char *sys_path = search_include_paths(filename);
+                    if (sys_path)
+                    {
+                        if (!hashmap_get(&virtual_includes, sys_path))
+                        {
+                            hashmap_put(&virtual_includes, sys_path, (void *)1);
+                            Token *sys_tok = tokenize_file(sys_path);
+                            if (sys_tok)
+                            {
+                                bool was_virtual = in_virtual_include;
+                                in_virtual_include = true;
+                                preprocess2(sys_tok);
+                                in_virtual_include = was_virtual;
+                            }
+                        }
+                        free(sys_path);
+                    }
+
+                    char *include_str = malloc(strlen(filename) + 16);
+                    if (!include_str)
+                        error_tok(start, "out of memory");
+                    sprintf(include_str, "#include <%s>", filename);
+
+                    Token *directive = copy_token(start);
+                    directive->kind = TK_IDENT;
+                    directive->loc = include_str;
+                    directive->len = strlen(include_str);
+                    tok_set_at_bol(directive, true);
+                    tok_set_has_space(directive, false);
+
+                    tok = skip_line(tok);
+                    directive->next = tok;
+                    if (!in_virtual_include)
+                        cur = cur->next = directive;
+                    continue;
+                }
             }
-            if (!path)
+            else
+            {
+                // Angle-bracket include: search all paths (user + system)
                 path = search_include_paths(filename);
+            }
             if (!path)
                 error_tok(start, "%s: cannot open file", filename);
 
@@ -3536,17 +3687,39 @@ static Token *preprocess2(Token *tok)
             File *start_file = tok_file(start);
             char *cur_file = start_file->name;
 
+            // Resolve current file to realpath for accurate comparison
+            char *cur_real = realpath(cur_file, NULL);
+
             // Find which include path the current file is under
-            int start_idx = 0;
+            int start_idx = -1;
             for (int i = 0; i < pp_include_paths_count; i++)
             {
-                int len = strlen(pp_include_paths[i]);
-                if (strncmp(cur_file, pp_include_paths[i], len) == 0 &&
-                    (cur_file[len] == '/' || cur_file[len] == '\0'))
+                // Compare using realpath for accurate matching
+                char *inc_real = realpath(pp_include_paths[i], NULL);
+                if (!inc_real)
+                    continue;
+
+                int len = strlen(inc_real);
+
+                // Check if cur_real starts with inc_real
+                if (cur_real && strncmp(cur_real, inc_real, len) == 0 &&
+                    (cur_real[len] == '/' || cur_real[len] == '\0'))
                 {
                     start_idx = i + 1;
+                    free(inc_real);
                     break;
                 }
+                free(inc_real);
+            }
+
+            if (cur_real)
+                free(cur_real);
+
+            if (start_idx == -1)
+            {
+                // Fallback: Assume we are in a user header wrapping a system header.
+                // Jump to where system paths begin (after user -I paths).
+                start_idx = pp_user_paths_start > 0 ? pp_user_paths_start : 0;
             }
 
             // Search from the next path onwards
@@ -3562,7 +3735,7 @@ static Token *preprocess2(Token *tok)
                 free(try);
             }
             if (!path)
-                error_tok(start, "%s: cannot open file", filename);
+                error_tok(start, "%s: cannot find next file (include_next)", filename);
 
             tok = skip_line(tok);
             tok = include_file(start, path, tok);
@@ -3580,6 +3753,10 @@ static Token *preprocess2(Token *tok)
             tok = tok->next;
             if (tok->kind != TK_IDENT)
                 error_tok(tok, "expected identifier");
+            // Free the macro struct before removing from hashmap
+            Macro *m = hashmap_get2(&macros, tok->loc, tok->len);
+            if (m)
+                free_macro(m);
             hashmap_delete2(&macros, tok->loc, tok->len);
             tok = skip_line(tok->next);
             continue;
@@ -3588,7 +3765,15 @@ static Token *preprocess2(Token *tok)
         if (equal(tok, "if"))
         {
             Token *expr = read_const_expr(&tok, tok->next);
+            // Expression preprocessing should not be affected by virtual include mode
+            // BUT should allow virtual function-like macros to expand (for UINT64_MAX etc.)
+            bool save_virtual = in_virtual_include;
+            bool save_pp_const = in_pp_const_expr;
+            in_virtual_include = false;
+            in_pp_const_expr = true;
             expr = preprocess2(expr);
+            in_virtual_include = save_virtual;
+            in_pp_const_expr = save_pp_const;
             convert_pp_tokens(expr);
             int64_t val = eval_const_expr(&expr, expr);
 
@@ -3633,7 +3818,13 @@ static Token *preprocess2(Token *tok)
             if (!cond_incl->included)
             {
                 Token *expr = read_const_expr(&tok, tok->next);
+                bool save_virtual = in_virtual_include;
+                bool save_pp_const = in_pp_const_expr;
+                in_virtual_include = false;
+                in_pp_const_expr = true;
                 expr = preprocess2(expr);
+                in_virtual_include = save_virtual;
+                in_pp_const_expr = save_pp_const;
                 convert_pp_tokens(expr);
                 if (eval_const_expr(&expr, expr))
                 {
@@ -3675,8 +3866,10 @@ static Token *preprocess2(Token *tok)
                 // Mark this file as pragma once
                 File *start_file = tok_file(start);
                 char *real = realpath(start_file->name, NULL);
-                char *key = real ? real : strdup(start_file->name);
+                char *key = real ? real : start_file->name;
                 hashmap_put(&pragma_once_files, key, (void *)1);
+                if (real)
+                    free(real);
             }
             tok = skip_line_quiet(tok->next);
             continue;
@@ -3842,9 +4035,9 @@ static int pp_import_system_macros(void)
 
             // Empty value means define as empty string
             if (*value == '\0')
-                pp_define_macro(strdup(name), "");
+                pp_define_macro(name, "");
             else
-                pp_define_macro(strdup(name), strdup(value));
+                pp_define_macro(name, value);
         }
         count++;
     }
@@ -3861,12 +4054,15 @@ void pp_reset(void)
     hashmap_clear(&macros);
     hashmap_clear(&pragma_once_files);
     hashmap_clear(&guarded_files);
+    hashmap_clear(&virtual_includes);
     hashmap_clear(&token_hidesets);
     hashmap_clear(&token_origins);
     hashmap_clear(&token_fvals);
     hashmap_clear(&token_types);
     cond_incl = NULL;
     pp_eval_skip = false;
+    in_virtual_include = false;
+    in_pp_const_expr = false;
     reset_feature_test_macros();
     // Free input files (file contents, line tables, etc.)
     free_input_files();

@@ -1841,8 +1841,14 @@ static bool looks_like_system_typedef(Token *tok)
   if (tok->len >= 3 && tok->loc[tok->len - 2] == '_' && tok->loc[tok->len - 1] == 't')
     return true;
   // Common pattern: starts with __ (glibc internal types like __rlim_t)
+  // But NOT if followed by ( which indicates a function call like __ctype_get_mb_cur_max()
   if (tok->len >= 2 && tok->loc[0] == '_' && tok->loc[1] == '_')
+  {
+    Token *next = tok->next;
+    if (next && equal(next, "("))
+      return false; // Function call, not a typedef
     return true;
+  }
   return false;
 }
 
@@ -2772,10 +2778,6 @@ static int transpile(char *input_file, char *output_file)
       out_printf("#define NDEBUG %s\n", ndebug_val);
       out_str("#endif\n", 7);
     }
-    // Always include errno.h for error constants like EINVAL, ENOENT, etc.
-    // Many C programs use these constants without explicitly including errno.h,
-    // relying on transitive includes that prism's preprocessing may not preserve.
-    out_str("#include <errno.h>\n", 19);
     // glibc's getopt.h defines __getopt_argv_const which is used by bits/getopt_ext.h.
     // When prism partially processes headers and passes #include directives through,
     // we need to ensure this macro is defined for the backend compiler.
@@ -3319,6 +3321,7 @@ static int transpile(char *input_file, char *output_file)
     if (equal(tok, "{"))
     {
       pending_control_flow = false; // Proper braces found
+      control_paren_depth = 0;      // Reset paren tracking (no longer in control expression)
       // Check if this is a statement expression: ({ ... })
       // The previous emitted token would be '('
       if (last_emitted && equal(last_emitted, "("))
