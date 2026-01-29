@@ -279,6 +279,38 @@ static int input_file_count;
 static bool at_bol;
 static bool has_space;
 
+// Free a File structure and all its allocated memory
+static void free_file(File *f)
+{
+    if (!f)
+        return;
+    // f->contents is allocated by open_memstream in read_file()
+    if (f->contents)
+        free(f->contents);
+    // f->line_offsets is allocated by new_file()
+    if (f->line_offsets)
+        free(f->line_offsets);
+    // f->name is strdup'd in new_file() - we own it
+    // f->display_name points to same memory as f->name
+    if (f->name)
+        free(f->name);
+    free(f);
+}
+
+// Free all input files
+static void free_input_files(void)
+{
+    if (!input_files)
+        return;
+    for (int i = 0; i < input_file_count; i++)
+    {
+        free_file(input_files[i]);
+    }
+    free(input_files);
+    input_files = NULL;
+    input_file_count = 0;
+}
+
 // Preprocessor
 typedef struct MacroParam MacroParam;
 struct MacroParam
@@ -589,10 +621,20 @@ static char *build_compiler_cmd(const char *base_cmd)
 
 static void pp_add_include_path(const char *path)
 {
+<<<<<<< Updated upstream
     char *real = realpath(path, NULL);
     const char *canonical = real ? real : path;
 
     // Check if this path is already in the list
+=======
+    // Resolve to canonical path for comparison
+    char *real = realpath(path, NULL);
+    const char *canonical = real ? real : path;
+
+    // Check if this path is already in the list (avoid duplicates)
+    // This is important because if -I/usr/include is passed, we don't want
+    // to add it again as a "user" path - it should remain a system path
+>>>>>>> Stashed changes
     for (int i = 0; i < pp_include_paths_count; i++)
     {
         char *existing_real = realpath(pp_include_paths[i], NULL);
@@ -1031,11 +1073,18 @@ static inline File *tok_file(Token *tok)
 
 // Get line number for a token using binary search on line offset table
 // O(log n) instead of O(n) scanning
+// Returns -1 for synthetic tokens where loc doesn't point into file contents
 static int tok_line_no(Token *tok)
 {
     File *f = tok_file(tok);
     if (!f || !f->contents || !tok->loc)
-        return 1;
+        return -1;
+
+    // Check if tok->loc points into the file contents
+    char *file_start = f->contents;
+    char *file_end = f->contents + strlen(f->contents);
+    if (tok->loc < file_start || tok->loc >= file_end)
+        return -1; // Synthetic token - loc doesn't point into file
 
     int offset = (int)(tok->loc - f->contents);
 
@@ -1902,8 +1951,9 @@ static File *new_file(char *name, int file_no, char *contents)
         fprintf(stderr, "out of memory in new_file\n");
         exit(1);
     }
-    file->name = name;
-    file->display_name = name;
+    // Always duplicate the name so we own it and can free it
+    file->name = strdup(name);
+    file->display_name = file->name;
     file->file_no = file_no;
     file->contents = contents;
 
@@ -2375,6 +2425,47 @@ static Macro *find_macro(Token *tok)
     return hashmap_get2(&macros, tok->loc, tok->len);
 }
 
+// Free a Macro structure and all its allocated memory
+static void free_macro(Macro *m)
+{
+    if (!m)
+        return;
+    // Free macro name (strdup'd in add_macro)
+    if (m->name)
+        free(m->name);
+    // Free va_args_name if present (allocated by strndup)
+    if (m->va_args_name)
+        free(m->va_args_name);
+    // Free params linked list (each param->name allocated by strndup)
+    MacroParam *p = m->params;
+    while (p)
+    {
+        MacroParam *next = p->next;
+        if (p->name)
+            free(p->name);
+        free(p);
+        p = next;
+    }
+    // m->body tokens are in the arena, don't free individually
+    // m->handler is a function pointer, not allocated
+    free(m);
+}
+
+// Free all macros in the hashmap
+static void free_all_macros(void)
+{
+    if (!macros.buckets)
+        return;
+    for (int i = 0; i < macros.capacity; i++)
+    {
+        if (macros.buckets[i].key && macros.buckets[i].key != TOMBSTONE)
+        {
+            Macro *m = (Macro *)macros.buckets[i].val;
+            free_macro(m);
+        }
+    }
+}
+
 static Macro *add_macro(char *name, bool is_objlike, Token *body)
 {
     Macro *m = calloc(1, sizeof(Macro));
@@ -2383,10 +2474,16 @@ static Macro *add_macro(char *name, bool is_objlike, Token *body)
         fprintf(stderr, "out of memory in add_macro\n");
         exit(1);
     }
-    m->name = name;
+    // Always strdup the name so we own it and can free it in free_macro
+    m->name = strdup(name);
+    if (!m->name)
+    {
+        fprintf(stderr, "out of memory in add_macro\n");
+        exit(1);
+    }
     m->is_objlike = is_objlike;
     m->body = body;
-    hashmap_put(&macros, name, m);
+    hashmap_put(&macros, m->name, m);
     return m;
 }
 
@@ -2876,6 +2973,7 @@ static void read_macro_definition(Token **rest, Token *tok)
         char *va_name = NULL;
         MacroParam *params = read_macro_params(&tok, tok->next, &va_name);
         Macro *m = add_macro(name, false, copy_line(rest, tok));
+        free(name); // add_macro strdup's the name, so we can free our copy
         m->params = params;
         m->va_args_name = va_name;
         return;
@@ -2889,6 +2987,7 @@ static void read_macro_definition(Token **rest, Token *tok)
         record_feature_test_macro(name, name_len, body);
 
     add_macro(name, true, body);
+    free(name); // add_macro strdup's the name, so we can free our copy
 }
 
 static int64_t eval_const_expr(Token **rest, Token *tok);
@@ -3635,6 +3734,23 @@ void pp_define_macro(char *name, char *val)
     add_macro(name, true, tok);
 }
 
+// Check if a macro is defined and return its value (or "1" for macros without value)
+// Returns NULL if macro is not defined
+// Note: For simple macros, returns pointer into source buffer (valid during transpile).
+// The returned string may not be null-terminated at the value boundary.
+// Caller should use the returned length if precision is needed.
+const char *pp_get_macro_value(const char *name)
+{
+    Macro *m = find_macro_by_name((char *)name);
+    if (!m)
+        return NULL;
+
+    // If macro has a body with a simple value, return "1"
+    // (We return "1" for any defined macro since we mainly care about definedness)
+    // For NDEBUG specifically, the value doesn't matter - just that it's defined
+    return "1";
+}
+
 // Define a full macro (supports function-like macros)
 // Usage: pp_define_full("__has_feature(x) 0")
 static void pp_define_full(char *def)
@@ -3747,6 +3863,8 @@ static int pp_import_system_macros(void)
 // Reset preprocessor state - call before processing a new file to avoid state leakage
 void pp_reset(void)
 {
+    // Free macro values before clearing the hashmap
+    free_all_macros();
     hashmap_clear(&macros);
     hashmap_clear(&pragma_once_files);
     hashmap_clear(&guarded_files);
@@ -3757,6 +3875,8 @@ void pp_reset(void)
     cond_incl = NULL;
     pp_eval_skip = false;
     reset_feature_test_macros();
+    // Free input files (file contents, line tables, etc.)
+    free_input_files();
     arena_reset(); // Reset token arena for reuse
 }
 

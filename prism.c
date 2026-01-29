@@ -517,7 +517,8 @@ static void emit_tok(Token *tok)
   File *f = tok_file(tok);
   int line_no = tok_line_no(tok);
 
-  if (emit_line_directives && f)
+  // Skip line directive handling for synthetic tokens (line_no == -1)
+  if (emit_line_directives && f && line_no > 0)
   {
     current_file = f->display_name ? f->display_name : f->name;
     bool file_changed = (last_filename != current_file &&
@@ -537,7 +538,7 @@ static void emit_tok(Token *tok)
       last_line_no = line_no;
       last_filename = current_file;
     }
-    else if (emit_line_directives && f && line_no > last_line_no)
+    else if (emit_line_directives && f && line_no > 0 && line_no > last_line_no)
     {
       last_line_no = line_no;
     }
@@ -2759,6 +2760,16 @@ static int transpile(char *input_file, char *output_file)
       // Wrap in #ifndef to avoid redefinition if already defined (e.g., by -include config.h)
       out_printf("#ifndef %s\n", ftm_names[i]);
       out_printf("#define %s %s\n", ftm_names[i], ftm_values[i]);
+      out_str("#endif\n", 7);
+    }
+    // If NDEBUG was defined during preprocessing, emit it here so that
+    // #include <assert.h> passed through to the backend sees it defined
+    // This is critical for programs like SQLite that define NDEBUG before including assert.h
+    const char *ndebug_val = pp_get_macro_value("NDEBUG");
+    if (ndebug_val)
+    {
+      out_str("#ifndef NDEBUG\n", 15);
+      out_printf("#define NDEBUG %s\n", ndebug_val);
       out_str("#endif\n", 7);
     }
     // Always include errno.h for error constants like EINVAL, ENOENT, etc.
