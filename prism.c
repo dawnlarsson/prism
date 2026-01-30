@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.82.0"
+#define PRISM_VERSION "0.83.0"
 
 #include "parse.c"
 
@@ -2676,6 +2676,89 @@ static Token *try_zero_init_decl(Token *tok)
   return NULL;
 }
 
+// Build an argv array from individual components (dynamic growth)
+typedef struct
+{
+  char **data;
+  int count;
+  int capacity;
+} ArgvBuilder;
+
+static void argv_builder_init(ArgvBuilder *ab)
+{
+  ab->data = NULL;
+  ab->count = 0;
+  ab->capacity = 0;
+}
+
+static bool argv_builder_add(ArgvBuilder *ab, const char *arg)
+{
+  if (ab->count + 1 >= ab->capacity) // +1 for NULL terminator
+  {
+    int new_cap = ab->capacity == 0 ? 128 : ab->capacity * 2;
+    char **new_data = realloc(ab->data, sizeof(char *) * new_cap);
+    if (!new_data)
+      return false;
+    ab->data = new_data;
+    ab->capacity = new_cap;
+  }
+  ab->data[ab->count] = strdup(arg);
+  if (!ab->data[ab->count])
+    return false;
+  ab->count++;
+  ab->data[ab->count] = NULL; // Keep NULL terminated
+  return true;
+}
+
+static char **argv_builder_finish(ArgvBuilder *ab)
+{
+  return ab->data;
+}
+
+static void free_argv(char **argv)
+{
+  if (!argv)
+    return;
+  for (int i = 0; argv[i]; i++)
+    free(argv[i]);
+  free(argv);
+}
+
+// Run a command using fork/execvp directly to avoid shell interpretation
+// Returns exit status of command, or -1 on error
+static int run_process(char **argv)
+{
+#ifdef _WIN32
+  intptr_t status = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
+  return (int)status;
+#else
+  pid_t pid = fork();
+  if (pid == -1)
+  {
+    perror("fork");
+    return -1;
+  }
+  if (pid == 0)
+  {
+    // Child process
+    execvp(argv[0], argv);
+    perror("execvp");
+    _exit(127);
+  }
+  int status;
+  if (waitpid(pid, &status, 0) == -1)
+  {
+    perror("waitpid");
+    return -1;
+  }
+  if (WIFEXITED(status))
+    return WEXITSTATUS(status);
+  if (WIFSIGNALED(status))
+    return 128 + WTERMSIG(status);
+  return -1;
+#endif
+}
+
 // Run system preprocessor (cc -E -P) on input file
 // Returns path to temp file with preprocessed output, or NULL on failure
 // Caller must free() the path and unlink() the file
@@ -2691,65 +2774,66 @@ static char *preprocess_with_cc(const char *input_file)
   }
   close(fd);
 
-  // Build cc -E -P command (-P suppresses linemarkers)
-  size_t cmd_size = 8192;
-  char *cmd = malloc(cmd_size);
-  if (!cmd)
-  {
-    unlink(tmppath);
-    return NULL;
-  }
+  // Build argv for preprocessor: cc -E -P [flags] input -o output
+  ArgvBuilder ab;
+  argv_builder_init(&ab);
 
-  // Start with compiler
   const char *cc = extra_compiler ? extra_compiler : "cc";
-  char *p = cmd;
-  p += snprintf(p, cmd_size, "%s -E -P", cc);
+  argv_builder_add(&ab, cc);
+  argv_builder_add(&ab, "-E");
+  argv_builder_add(&ab, "-P");
 
   // Add compiler flags (like -std=c99, -m32)
   for (int i = 0; i < extra_compiler_flags_count; i++)
-    p += snprintf(p, cmd_size - (p - cmd), " %s", extra_compiler_flags[i]);
+    argv_builder_add(&ab, extra_compiler_flags[i]);
 
   // Add include paths
   for (int i = 0; i < extra_include_count; i++)
-    p += snprintf(p, cmd_size - (p - cmd), " -I%s", extra_include_paths[i]);
+  {
+    argv_builder_add(&ab, "-I");
+    argv_builder_add(&ab, extra_include_paths[i]);
+  }
 
   // Add defines
   for (int i = 0; i < extra_define_count; i++)
-    p += snprintf(p, cmd_size - (p - cmd), " -D%s", extra_defines[i]);
+  {
+    argv_builder_add(&ab, "-D");
+    argv_builder_add(&ab, extra_defines[i]);
+  }
 
   // Add prism-specific macros
-  p += snprintf(p, cmd_size - (p - cmd), " -D__PRISM__=1");
+  argv_builder_add(&ab, "-D__PRISM__=1");
   if (feature_defer)
-    p += snprintf(p, cmd_size - (p - cmd), " -D__PRISM_DEFER__=1");
+    argv_builder_add(&ab, "-D__PRISM_DEFER__=1");
   if (feature_zeroinit)
-    p += snprintf(p, cmd_size - (p - cmd), " -D__PRISM_ZEROINIT__=1");
+    argv_builder_add(&ab, "-D__PRISM_ZEROINIT__=1");
 
   // Add standard feature test macros for POSIX/GNU compatibility
-  // These enable full functionality in system headers
-  p += snprintf(p, cmd_size - (p - cmd), " -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE");
+  argv_builder_add(&ab, "-D_POSIX_C_SOURCE=200809L");
+  argv_builder_add(&ab, "-D_GNU_SOURCE");
 
   // Add force-includes
   for (int i = 0; i < extra_force_include_count; i++)
-    p += snprintf(p, cmd_size - (p - cmd), " -include %s", extra_force_includes[i]);
+  {
+    argv_builder_add(&ab, "-include");
+    argv_builder_add(&ab, extra_force_includes[i]);
+  }
 
   // Input file and output
-  p += snprintf(p, cmd_size - (p - cmd), " %s -o %s 2>&1", input_file, tmppath);
+  argv_builder_add(&ab, input_file);
+  argv_builder_add(&ab, "-o");
+  argv_builder_add(&ab, tmppath);
 
-  // Run preprocessor
-  int ret = system(cmd);
-  free(cmd);
+  char **argv = argv_builder_finish(&ab);
+
+  // Run preprocessor using execvp directly to avoid shell quote stripping
+  int ret = run_process(argv);
+  free_argv(argv);
 
   if (ret != 0)
   {
     // Preprocessor failed - print error output
-    FILE *f = fopen(tmppath, "r");
-    if (f)
-    {
-      char buf[1024];
-      while (fgets(buf, sizeof(buf), f))
-        fputs(buf, stderr);
-      fclose(f);
-    }
+    // (Errors go to stderr directly from child process)
     unlink(tmppath);
     return NULL;
   }
@@ -3601,18 +3685,6 @@ static void prism_free(PrismResult *r)
 
 #ifndef PRISM_LIB_MODE
 
-// Split a space-separated string into an argv array
-// Returns number of arguments, or -1 on error
-// Caller must free each element and the array itself
-static void free_argv(char **argv)
-{
-  if (!argv)
-    return;
-  for (int i = 0; argv[i]; i++)
-    free(argv[i]);
-  free(argv);
-}
-
 static int run_command(char **argv)
 {
 #ifdef _WIN32
@@ -3646,45 +3718,6 @@ static int run_command(char **argv)
     return 128 + WTERMSIG(status);
   return -1;
 #endif
-}
-
-// Build an argv array from individual components (dynamic growth)
-typedef struct
-{
-  char **data;
-  int count;
-  int capacity;
-} ArgvBuilder;
-
-static void argv_builder_init(ArgvBuilder *ab)
-{
-  ab->data = NULL;
-  ab->count = 0;
-  ab->capacity = 0;
-}
-
-static bool argv_builder_add(ArgvBuilder *ab, const char *arg)
-{
-  if (ab->count + 1 >= ab->capacity) // +1 for NULL terminator
-  {
-    int new_cap = ab->capacity == 0 ? INITIAL_ARGS : ab->capacity * 2;
-    char **new_data = realloc(ab->data, sizeof(char *) * new_cap);
-    if (!new_data)
-      return false;
-    ab->data = new_data;
-    ab->capacity = new_cap;
-  }
-  ab->data[ab->count] = strdup(arg);
-  if (!ab->data[ab->count])
-    return false;
-  ab->count++;
-  ab->data[ab->count] = NULL; // Keep NULL terminated
-  return true;
-}
-
-static char **argv_builder_finish(ArgvBuilder *ab)
-{
-  return ab->data;
 }
 
 static char **build_argv(const char *first, ...)
