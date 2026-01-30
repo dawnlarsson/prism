@@ -142,6 +142,8 @@ static inline bool tok_at_bol(Token *tok);
 static inline bool tok_has_space(Token *tok);
 static inline void tok_set_at_bol(Token *tok, bool v);
 static inline void tok_set_has_space(Token *tok, bool v);
+static bool is_user_header_path(const char *path);
+static bool header_contains_include_next(Token *tok);
 
 // Arena Allocator for Tokens
 // Allocates tokens in large blocks to avoid per-token malloc overhead
@@ -164,8 +166,72 @@ typedef struct
 
 static TokenArena token_arena = {0};
 
+// Debug/trace for runaway token growth (opt-in via env vars)
+static size_t token_count = 0;
+static size_t token_trace_step = 0;
+static size_t token_trace_next = 0;
+static size_t token_limit = 0;
+static bool token_trace_inited = false;
+static bool token_trace_enabled = false;
+static const char *trace_current_file = NULL;
+static const char *trace_current_macro = NULL;
+static int trace_include_depth = 0;
+
+static void token_trace_init(void)
+{
+    if (token_trace_inited)
+        return;
+    token_trace_inited = true;
+
+    const char *env_trace = getenv("PRISM_TRACE_TOKENS");
+    token_trace_enabled = (env_trace && *env_trace);
+
+    const char *env_step = getenv("PRISM_TOKEN_TRACE_STEP");
+    if (env_step && *env_step)
+        token_trace_step = strtoull(env_step, NULL, 10);
+    if (token_trace_step == 0)
+        token_trace_step = 1000000; // default: 1M tokens
+    token_trace_next = token_trace_step;
+
+    const char *env_limit = getenv("PRISM_TOKEN_LIMIT");
+    if (env_limit && *env_limit)
+        token_limit = strtoull(env_limit, NULL, 10);
+}
+
+static void token_trace_tick(void)
+{
+    if (!token_trace_enabled)
+        return;
+    if (token_count < token_trace_next)
+        return;
+
+    fprintf(stderr, "[prism] tokens=%zu file=%s depth=%d macro=%s\n",
+            token_count,
+            trace_current_file ? trace_current_file : "?",
+            trace_include_depth,
+            trace_current_macro ? trace_current_macro : "-");
+    token_trace_next += token_trace_step;
+}
+
 static Token *arena_alloc_token(void)
 {
+    token_trace_init();
+    if (token_trace_enabled || token_limit)
+    {
+        token_count++;
+        if (token_limit && token_count > token_limit)
+        {
+            fprintf(stderr,
+                    "[prism] token limit exceeded (%zu). file=%s depth=%d macro=%s\n",
+                    token_count,
+                    trace_current_file ? trace_current_file : "?",
+                    trace_include_depth,
+                    trace_current_macro ? trace_current_macro : "-");
+            exit(1);
+        }
+        token_trace_tick();
+    }
+
     if (!token_arena.current || token_arena.current->used >= ARENA_BLOCK_SIZE)
     {
         // Allocate new block
@@ -1976,6 +2042,8 @@ static File *new_file(char *name, int file_no, char *contents)
     file->display_name = file->name;
     file->file_no = file_no;
     file->contents = contents;
+    // Track current file for token trace/debug
+    trace_current_file = file->name;
 
     // Build line offset table for O(log n) line number lookups
     // First pass: count lines
@@ -2314,6 +2382,16 @@ static bool is_hash(Token *tok)
     return tok_at_bol(tok) && equal(tok, "#");
 }
 
+static bool header_contains_include_next(Token *tok)
+{
+    for (Token *t = tok; t && t->kind != TK_EOF; t = t->next)
+    {
+        if (is_hash(t) && t->next && equal(t->next, "include_next"))
+            return true;
+    }
+    return false;
+}
+
 static Token *skip_line(Token *tok)
 {
     if (tok_at_bol(tok))
@@ -2496,7 +2574,7 @@ static void free_all_macros(void)
     }
 }
 
-static Macro *add_macro(char *name, bool is_objlike, Token *body)
+static Macro *add_macro(char *name, bool is_objlike, Token *body, Token *def_tok)
 {
     // Check if macro already exists - if so, free it first to avoid memory leaks
     // and corrupted state on subsequent pp_reset() calls
@@ -2522,7 +2600,11 @@ static Macro *add_macro(char *name, bool is_objlike, Token *body)
         exit(1);
     }
     m->is_objlike = is_objlike;
-    m->is_virtual = in_virtual_include; // Mark if defined in virtual include
+    // Mark macros as virtual when defined inside a virtual include context.
+    // Virtual macros are not expanded in user code (only used for #if evaluation),
+    // because the backend compiler will see the real definitions when processing
+    // the passed-through header.
+    m->is_virtual = in_virtual_include;
     m->body = body;
     hashmap_put(&macros, m->name, m);
     return m;
@@ -2560,7 +2642,7 @@ static Token *line_macro(Token *tmpl)
 
 static void add_builtin(char *name, macro_handler_fn *fn)
 {
-    Macro *m = add_macro(name, true, NULL);
+    Macro *m = add_macro(name, true, NULL, NULL);
     m->handler = fn;
 }
 
@@ -2854,7 +2936,18 @@ static bool expand_macro(Token **rest, Token *tok)
 
     if (m->handler)
     {
-        *rest = append(m->handler(tok), tok->next);
+        bool at_bol = tok_at_bol(tok);
+        bool has_space = tok_has_space(tok);
+        const char *prev_macro = trace_current_macro;
+        trace_current_macro = m->name;
+        Token *body = m->handler(tok);
+        if (body && body->kind != TK_EOF)
+        {
+            tok_set_at_bol(body, at_bol);
+            tok_set_has_space(body, has_space);
+        }
+        *rest = append(body, tok->next);
+        trace_current_macro = prev_macro;
         return true;
     }
 
@@ -2864,14 +2957,24 @@ static bool expand_macro(Token **rest, Token *tok)
         if (is_member_access_macro(m->body))
             return false;
 
+        bool at_bol = tok_at_bol(tok);
+        bool has_space = tok_has_space(tok);
+        const char *prev_macro = trace_current_macro;
+        trace_current_macro = m->name;
         Hideset *hs = hideset_union(tok_hideset(tok), new_hideset(m->name));
         Token *body = add_hideset(m->body, hs);
+        if (body && body->kind != TK_EOF)
+        {
+            tok_set_at_bol(body, at_bol);
+            tok_set_has_space(body, has_space);
+        }
         for (Token *t = body; t && t->kind != TK_EOF; t = t->next)
             tok_set_origin(t, tok);
         // For virtual macros, transfer file location so #line doesn't jump to system headers
         if (m->is_virtual)
             transfer_file_location(body, tok);
         *rest = append(body, tok->next);
+        trace_current_macro = prev_macro;
         return true;
     }
 
@@ -2885,18 +2988,28 @@ static bool expand_macro(Token **rest, Token *tok)
     if (!equal(tok->next, "("))
         return false;
 
+    bool at_bol = tok_at_bol(tok);
+    bool has_space = tok_has_space(tok);
+    const char *prev_macro = trace_current_macro;
+    trace_current_macro = m->name;
     Token *macro_tok = tok;
     MacroArg *args = read_macro_args(&tok, tok->next->next, m->params, m->va_args_name);
     Token *body = subst(m->body, args);
     Hideset *hs = hideset_intersection(tok_hideset(macro_tok), tok_hideset(tok));
     hs = hideset_union(hs, new_hideset(m->name));
     body = add_hideset(body, hs);
+    if (body && body->kind != TK_EOF)
+    {
+        tok_set_at_bol(body, at_bol);
+        tok_set_has_space(body, has_space);
+    }
     for (Token *t = body; t && t->kind != TK_EOF; t = t->next)
         tok_set_origin(t, macro_tok);
     // For virtual macros, transfer file location so #line doesn't jump to system headers
     if (m->is_virtual)
         transfer_file_location(body, macro_tok);
     *rest = append(body, tok);
+    trace_current_macro = prev_macro;
     return true;
 }
 
@@ -2909,6 +3022,74 @@ static char *search_include_paths(char *filename)
         if (stat(path, &st) == 0)
             return path;
         free(path);
+    }
+    return NULL;
+}
+
+static bool path_is_under(const char *path, const char *dir)
+{
+    if (!path || !dir)
+        return false;
+    size_t len = strlen(dir);
+    return strncmp(path, dir, len) == 0 && (path[len] == '/' || path[len] == '\0');
+}
+
+static bool is_user_header_path(const char *path)
+{
+    if (!path)
+        return false;
+    char *path_real = realpath(path, NULL);
+    const char *path_cmp = path_real ? path_real : path;
+
+    for (int i = pp_user_paths_start; i < pp_include_paths_count; i++)
+    {
+        char *inc_real = realpath(pp_include_paths[i], NULL);
+        const char *inc_cmp = inc_real ? inc_real : pp_include_paths[i];
+        bool match = path_is_under(path_cmp, inc_cmp);
+        if (inc_real)
+            free(inc_real);
+        if (match)
+        {
+            if (path_real)
+                free(path_real);
+            return true;
+        }
+    }
+
+    if (path_real)
+        free(path_real);
+    return false;
+}
+
+static bool is_config_header(const char *filename)
+{
+    const char *base = strrchr(filename, '/');
+    base = base ? base + 1 : filename;
+    return strcmp(base, "config.h") == 0;
+}
+
+// Search a subset of include paths for include_next
+static char *search_include_next_range(const char *filename, int start, int end, const char *matched_real)
+{
+    struct stat st;
+    for (int i = start; i < end; i++)
+    {
+        if (matched_real)
+        {
+            char *inc_real = realpath(pp_include_paths[i], NULL);
+            if (inc_real && strcmp(inc_real, matched_real) == 0)
+            {
+                free(inc_real);
+                continue;
+            }
+            if (inc_real)
+                free(inc_real);
+        }
+
+        char *try = format("%s/%s", pp_include_paths[i], filename);
+        if (stat(try, &st) == 0)
+            return try;
+        free(try);
     }
     return NULL;
 }
@@ -2969,9 +3150,125 @@ static char *read_include_filename(Token **rest, Token *tok, bool *is_dquote)
     error_tok(tok, "expected a filename");
 }
 
+static Token *emit_include_like_directive(Token *start, Token *next_tok, const char *path, bool use_quotes,
+                                          const char *directive)
+{
+    size_t path_len = strlen(path);
+    char *include_str = malloc(path_len + 32);
+    if (!include_str)
+        error_tok(start, "out of memory");
+    if (use_quotes)
+        sprintf(include_str, "#%s \"%s\"", directive, path);
+    else
+        sprintf(include_str, "#%s <%s>", directive, path);
+
+    Token *out_tok = copy_token(start);
+    out_tok->kind = TK_IDENT;
+    out_tok->loc = include_str;
+    out_tok->len = strlen(include_str);
+    tok_set_at_bol(out_tok, true);
+    tok_set_has_space(out_tok, false);
+    out_tok->next = next_tok;
+    if (next_tok && next_tok->kind != TK_EOF)
+        tok_set_at_bol(next_tok, true);
+    return out_tok;
+}
+
+static Token *emit_include_directive(Token *start, Token *next_tok, const char *path, bool use_quotes)
+{
+    return emit_include_like_directive(start, next_tok, path, use_quotes, "include");
+}
+
+static Token *emit_include_next_directive(Token *start, Token *next_tok, const char *path, bool use_quotes)
+{
+    return emit_include_like_directive(start, next_tok, path, use_quotes, "include_next");
+}
+
+// Check if a macro name looks like a behavior-control macro that should be
+// passed through to ensure correct behavior of passed-through headers.
+// We are careful to NOT match include guards (*_H) which would cause
+// -Wunused-macros warnings.
+static bool is_passthrough_guard_macro(const char *name, int name_len)
+{
+    // IN_* macros: "I'm building this module" guards (e.g., IN_MBSRTOC32S)
+    if (name_len >= 3 && strncmp(name, "IN_", 3) == 0)
+        return true;
+    // _GL_NO_* macros: disable feature flags (e.g., _GL_NO_CONST_GENERICS)
+    if (name_len >= 7 && strncmp(name, "_GL_NO_", 7) == 0)
+        return true;
+    return false;
+}
+
+// Convert a simple macro body to a string representation
+// Returns NULL if the body is too complex to emit as a define
+static char *macro_body_to_string(Token *body)
+{
+    if (!body || body->kind == TK_EOF)
+        return strdup("");
+
+    // For simple single-token bodies, return the token text
+    if (body->next && body->next->kind == TK_EOF)
+    {
+        return strndup(body->loc, body->len);
+    }
+
+    // For multi-token bodies, concatenate them
+    size_t total_len = 0;
+    for (Token *t = body; t && t->kind != TK_EOF; t = t->next)
+    {
+        if (tok_has_space(t) && total_len > 0)
+            total_len++;
+        total_len += t->len;
+    }
+
+    char *result = malloc(total_len + 1);
+    if (!result)
+        return NULL;
+
+    char *p = result;
+    for (Token *t = body; t && t->kind != TK_EOF; t = t->next)
+    {
+        if (tok_has_space(t) && p > result)
+            *p++ = ' ';
+        memcpy(p, t->loc, t->len);
+        p += t->len;
+    }
+    *p = '\0';
+    return result;
+}
+
+// Emit a #define directive to the output stream
+// Used to preserve guard macros that affect passed-through headers
+static Token *emit_define_directive(Token *start, Token *next_tok, const char *name, const char *value)
+{
+    size_t name_len = strlen(name);
+    size_t value_len = value ? strlen(value) : 0;
+    size_t total_len = 8 + name_len + (value_len ? 1 + value_len : 0) + 1; // "#define " + name + " " + value + null
+    char *define_str = malloc(total_len);
+    if (!define_str)
+        error_tok(start, "out of memory");
+    if (value && *value)
+        sprintf(define_str, "#define %s %s", name, value);
+    else
+        sprintf(define_str, "#define %s", name);
+
+    Token *out_tok = copy_token(start);
+    out_tok->kind = TK_IDENT;
+    out_tok->loc = define_str;
+    out_tok->len = strlen(define_str);
+    tok_set_at_bol(out_tok, true);
+    tok_set_has_space(out_tok, false);
+    out_tok->next = next_tok;
+    if (next_tok && next_tok->kind != TK_EOF)
+        tok_set_at_bol(next_tok, true);
+    return out_tok;
+}
+
 static Token *include_file(Token *tok, char *path, Token *cont)
 {
+    trace_include_depth++;
     Token *tok2 = tokenize_file(path);
+    trace_include_depth--;
     if (!tok2)
         error_tok(tok, "%s: cannot open file", path);
 
@@ -3045,7 +3342,7 @@ static void read_macro_definition(Token **rest, Token *tok)
         // Function-like macro
         char *va_name = NULL;
         MacroParam *params = read_macro_params(&tok, tok->next, &va_name);
-        Macro *m = add_macro(name, false, copy_line(rest, tok));
+        Macro *m = add_macro(name, false, copy_line(rest, tok), tok);
         free(name); // add_macro strdup's the name, so we can free our copy
         m->params = params;
         m->va_args_name = va_name;
@@ -3059,7 +3356,7 @@ static void read_macro_definition(Token **rest, Token *tok)
     if (is_feature_test_macro(name, name_len))
         record_feature_test_macro(name, name_len, body);
 
-    add_macro(name, true, body);
+    add_macro(name, true, body, tok);
     free(name); // add_macro strdup's the name, so we can free our copy
 }
 
@@ -3549,9 +3846,34 @@ static Token *preprocess2(Token *tok)
                 char *user_path = search_user_include_paths(filename);
                 if (user_path)
                 {
-                    // Found in user include paths - inline it
+                    // Found in user include paths
+                    Token *user_tok = tokenize_file(user_path);
+                    if (!user_tok)
+                        error_tok(start, "%s: cannot open file", filename);
+
+                    bool has_include_next = header_contains_include_next(user_tok);
+                    if (is_config_header(filename) || has_include_next)
+                    {
+                        // Process config.h virtually but emit include for compiler
+                        if (!hashmap_get(&virtual_includes, user_path))
+                        {
+                            hashmap_put(&virtual_includes, user_path, (void *)1);
+                            bool was_virtual = in_virtual_include;
+                            in_virtual_include = true;
+                            preprocess2(user_tok);
+                            in_virtual_include = was_virtual;
+                        }
+
+                        tok = skip_line(tok);
+                        Token *directive = emit_include_directive(start, tok, filename, false);
+                        if (!in_virtual_include)
+                            cur = cur->next = directive;
+                        continue;
+                    }
+
+                    // Inline it
                     tok = skip_line(tok);
-                    tok = include_file(start, user_path, tok);
+                    tok = append(user_tok, tok);
                     continue;
                 }
 
@@ -3565,7 +3887,9 @@ static Token *preprocess2(Token *tok)
                         hashmap_put(&virtual_includes, sys_path, (void *)1);
 
                         // Process the header to learn macros, but discard output
+                        trace_include_depth++;
                         Token *sys_tok = tokenize_file(sys_path);
+                        trace_include_depth--;
                         if (sys_tok)
                         {
                             bool was_virtual = in_virtual_include;
@@ -3577,22 +3901,9 @@ static Token *preprocess2(Token *tok)
                     free(sys_path);
                 }
 
-                // Build the entire directive as one string to avoid #line insertion between tokens
-                char *include_str = malloc(strlen(filename) + 16); // "#include <" + filename + ">"
-                if (!include_str)
-                    error_tok(start, "out of memory");
-                sprintf(include_str, "#include <%s>", filename);
-
-                Token *directive = copy_token(start);
-                directive->kind = TK_IDENT; // Treat as identifier-like for emission purposes
-                directive->loc = include_str;
-                directive->len = strlen(include_str);
-                tok_set_at_bol(directive, true); // Starts at beginning of line
-                tok_set_has_space(directive, false);
-
                 // Skip to end of line and continue
                 tok = skip_line(tok);
-                directive->next = tok;
+                Token *directive = emit_include_directive(start, tok, filename, false);
 
                 // Only emit if not inside a virtual include
                 if (!in_virtual_include)
@@ -3633,7 +3944,9 @@ static Token *preprocess2(Token *tok)
                         if (!hashmap_get(&virtual_includes, sys_path))
                         {
                             hashmap_put(&virtual_includes, sys_path, (void *)1);
+                            trace_include_depth++;
                             Token *sys_tok = tokenize_file(sys_path);
+                            trace_include_depth--;
                             if (sys_tok)
                             {
                                 bool was_virtual = in_virtual_include;
@@ -3645,20 +3958,8 @@ static Token *preprocess2(Token *tok)
                         free(sys_path);
                     }
 
-                    char *include_str = malloc(strlen(filename) + 16);
-                    if (!include_str)
-                        error_tok(start, "out of memory");
-                    sprintf(include_str, "#include <%s>", filename);
-
-                    Token *directive = copy_token(start);
-                    directive->kind = TK_IDENT;
-                    directive->loc = include_str;
-                    directive->len = strlen(include_str);
-                    tok_set_at_bol(directive, true);
-                    tok_set_has_space(directive, false);
-
                     tok = skip_line(tok);
-                    directive->next = tok;
+                    Token *directive = emit_include_directive(start, tok, filename, false);
                     if (!in_virtual_include)
                         cur = cur->next = directive;
                     continue;
@@ -3671,6 +3972,37 @@ static Token *preprocess2(Token *tok)
             }
             if (!path)
                 error_tok(start, "%s: cannot open file", filename);
+
+            if (is_user_header_path(path))
+            {
+                Token *user_tok = tokenize_file(path);
+                if (!user_tok)
+                    error_tok(start, "%s: cannot open file", filename);
+
+                bool has_include_next = header_contains_include_next(user_tok);
+                if (is_config_header(filename) || has_include_next)
+                {
+                    if (!hashmap_get(&virtual_includes, path))
+                    {
+                        hashmap_put(&virtual_includes, path, (void *)1);
+                        bool was_virtual = in_virtual_include;
+                        in_virtual_include = true;
+                        preprocess2(user_tok);
+                        in_virtual_include = was_virtual;
+                    }
+
+                    tok = skip_line(tok);
+                    Token *directive = emit_include_directive(start, tok, filename, is_dquote);
+                    if (!in_virtual_include)
+                        cur = cur->next = directive;
+                    continue;
+                }
+
+                // Inline user header that doesn't use include_next
+                tok = skip_line(tok);
+                tok = append(user_tok, tok);
+                continue;
+            }
 
             tok = skip_line(tok);
             tok = include_file(start, path, tok);
@@ -3690,24 +4022,35 @@ static Token *preprocess2(Token *tok)
             // Resolve current file to realpath for accurate comparison
             char *cur_real = realpath(cur_file, NULL);
 
-            // Find which include path the current file is under
-            int start_idx = -1;
+            // Find which include path the current file is under (prefer longest match)
+            int matched_idx = -1;
+            int matched_is_user = 0;
+            size_t matched_len = 0;
+            char *matched_real = NULL;
             for (int i = 0; i < pp_include_paths_count; i++)
             {
-                // Compare using realpath for accurate matching
                 char *inc_real = realpath(pp_include_paths[i], NULL);
                 if (!inc_real)
                     continue;
 
-                int len = strlen(inc_real);
-
-                // Check if cur_real starts with inc_real
+                size_t len = strlen(inc_real);
                 if (cur_real && strncmp(cur_real, inc_real, len) == 0 &&
                     (cur_real[len] == '/' || cur_real[len] == '\0'))
                 {
-                    start_idx = i + 1;
-                    free(inc_real);
-                    break;
+                    if (len > matched_len)
+                    {
+                        if (matched_real)
+                            free(matched_real);
+                        matched_real = inc_real;
+                        matched_len = len;
+                        matched_idx = i;
+                        matched_is_user = (i >= pp_user_paths_start);
+                    }
+                    else
+                    {
+                        free(inc_real);
+                    }
+                    continue;
                 }
                 free(inc_real);
             }
@@ -3715,36 +4058,163 @@ static Token *preprocess2(Token *tok)
             if (cur_real)
                 free(cur_real);
 
-            if (start_idx == -1)
+            if (matched_idx >= 0)
+            {
+                if (matched_is_user)
+                {
+                    // Logical search order: remaining user paths, then system paths
+                    path = search_include_next_range(filename, matched_idx + 1, pp_include_paths_count, matched_real);
+                    bool found_in_user = (path != NULL);
+                    if (!path)
+                        path = search_include_next_range(filename, 0, pp_user_paths_start, matched_real);
+
+                    if (matched_real)
+                        free(matched_real);
+
+                    if (!path)
+                        error_tok(start, "%s: cannot find next file (include_next)", filename);
+
+                    tok = skip_line(tok);
+
+                    if (found_in_user)
+                    {
+                        tok = include_file(start, path, tok);
+                        continue;
+                    }
+
+                    // System header: process virtually and emit include_next directive
+                    if (!hashmap_get(&virtual_includes, path))
+                    {
+                        hashmap_put(&virtual_includes, path, (void *)1);
+                        trace_include_depth++;
+                        Token *sys_tok = tokenize_file(path);
+                        trace_include_depth--;
+                        if (sys_tok)
+                        {
+                            bool was_virtual = in_virtual_include;
+                            in_virtual_include = true;
+                            preprocess2(sys_tok);
+                            in_virtual_include = was_virtual;
+                        }
+                    }
+
+                    Token *directive = emit_include_next_directive(start, tok, filename, is_dquote);
+                    if (!in_virtual_include)
+                        cur = cur->next = directive;
+                    continue;
+                }
+                else
+                {
+                    // Current file is in a system path: only search remaining system paths
+                    path = search_include_next_range(filename, matched_idx + 1, pp_user_paths_start, matched_real);
+                }
+            }
+            else
             {
                 // Fallback: Assume we are in a user header wrapping a system header.
-                // Jump to where system paths begin (after user -I paths).
-                start_idx = pp_user_paths_start > 0 ? pp_user_paths_start : 0;
+                // Search system paths only.
+                path = search_include_next_range(filename, 0, pp_user_paths_start, matched_real);
             }
 
-            // Search from the next path onwards
-            for (int i = start_idx; i < pp_include_paths_count; i++)
-            {
-                char *try = format("%s/%s", pp_include_paths[i], filename);
-                struct stat st;
-                if (stat(try, &st) == 0)
-                {
-                    path = try;
-                    break;
-                }
-                free(try);
-            }
+            if (matched_real)
+                free(matched_real);
             if (!path)
                 error_tok(start, "%s: cannot find next file (include_next)", filename);
 
             tok = skip_line(tok);
-            tok = include_file(start, path, tok);
-            continue;
+            // For system headers, process virtually and emit include_next directive
+            {
+                char *inc_real = realpath(path, NULL);
+                bool is_system = true;
+                if (inc_real)
+                {
+                    for (int i = pp_user_paths_start; i < pp_include_paths_count; i++)
+                    {
+                        char *usr_real = realpath(pp_include_paths[i], NULL);
+                        if (usr_real && strcmp(usr_real, inc_real) == 0)
+                        {
+                            is_system = false;
+                            free(usr_real);
+                            break;
+                        }
+                        if (usr_real)
+                            free(usr_real);
+                    }
+                    free(inc_real);
+                }
+
+                if (!is_system)
+                {
+                    tok = include_file(start, path, tok);
+                    continue;
+                }
+
+                if (!hashmap_get(&virtual_includes, path))
+                {
+                    hashmap_put(&virtual_includes, path, (void *)1);
+                    trace_include_depth++;
+                    Token *sys_tok = tokenize_file(path);
+                    trace_include_depth--;
+                    if (sys_tok)
+                    {
+                        bool was_virtual = in_virtual_include;
+                        in_virtual_include = true;
+                        preprocess2(sys_tok);
+                        in_virtual_include = was_virtual;
+                    }
+                }
+
+                Token *directive = emit_include_next_directive(start, tok, filename, is_dquote);
+                if (!in_virtual_include)
+                    cur = cur->next = directive;
+                continue;
+            }
         }
 
         if (equal(tok, "define"))
         {
+            Token *define_start = start;
+            Token *name_tok = tok->next;
+
+            // Check if this is an object-like macro (no paren immediately after name)
+            bool is_objlike = true;
+            if (name_tok && name_tok->kind == TK_IDENT)
+            {
+                Token *after_name = name_tok->next;
+                if (after_name && !tok_has_space(after_name) && equal(after_name, "("))
+                    is_objlike = false;
+            }
+
+            // Save macro name before processing
+            char *macro_name = NULL;
+            int macro_name_len = 0;
+            if (name_tok && name_tok->kind == TK_IDENT)
+            {
+                macro_name = strndup(name_tok->loc, name_tok->len);
+                macro_name_len = name_tok->len;
+            }
+
             read_macro_definition(&tok, tok->next);
+
+            // Emit guard macros when not in virtual include mode
+            // These are needed for passed-through headers to work correctly
+            if (!in_virtual_include && is_objlike && macro_name &&
+                is_passthrough_guard_macro(macro_name, macro_name_len))
+            {
+                Macro *m = hashmap_get(&macros, macro_name);
+                if (m && m->is_objlike)
+                {
+                    char *body_str = macro_body_to_string(m->body);
+                    if (body_str)
+                    {
+                        Token *directive = emit_define_directive(define_start, tok, macro_name, body_str);
+                        cur = cur->next = directive;
+                        free(body_str);
+                    }
+                }
+            }
+            if (macro_name)
+                free(macro_name);
             continue;
         }
 
@@ -3917,7 +4387,7 @@ void pp_define_macro(char *name, char *val)
     Token *tok = tokenize(new_file("<built-in>", 0, format("%s %s\n", name, val)));
     // Skip the macro name token - the body starts after it
     tok = tok->next;
-    add_macro(name, true, tok);
+    add_macro(name, true, tok, NULL);
 }
 
 // Check if a macro is defined and return its value (or "1" for macros without value)
@@ -4067,6 +4537,14 @@ void pp_reset(void)
     // Free input files (file contents, line tables, etc.)
     free_input_files();
     arena_reset(); // Reset token arena for reuse
+
+    // Reset token trace counters per translation unit
+    token_trace_init();
+    token_count = 0;
+    token_trace_next = token_trace_step;
+    trace_current_file = NULL;
+    trace_current_macro = NULL;
+    trace_include_depth = 0;
 }
 
 void pp_init(void)
@@ -4100,12 +4578,8 @@ void pp_init(void)
         pp_define_full("__has_extension(x) 0");
     if (!hashmap_get(&macros, "__has_builtin"))
         pp_define_full("__has_builtin(x) 0");
-    if (!hashmap_get(&macros, "__has_attribute"))
-        pp_define_full("__has_attribute(x) 0");
     if (!hashmap_get(&macros, "__has_warning"))
         pp_define_full("__has_warning(x) 0");
-    if (!hashmap_get(&macros, "__has_c_attribute"))
-        pp_define_full("__has_c_attribute(x) 0");
     if (!hashmap_get(&macros, "__building_module"))
         pp_define_full("__building_module(x) 0");
 

@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.78.0"
+#define PRISM_VERSION "0.79.0"
 
 #include "parse.c"
 
@@ -10,6 +10,7 @@ typedef struct
   bool defer;
   bool zeroinit;
   bool line_directives;
+  bool warn_safety; // If true, safety checks warn instead of error
 } PrismFeatures;
 
 typedef enum
@@ -32,7 +33,7 @@ typedef struct
 
 static PrismFeatures prism_defaults(void)
 {
-  return (PrismFeatures){.defer = true, .zeroinit = true, .line_directives = true};
+  return (PrismFeatures){.defer = true, .zeroinit = true, .line_directives = true, .warn_safety = false};
 }
 
 // Forward declarations for library API
@@ -83,6 +84,7 @@ static void prism_free(PrismResult *r);
 // Internal feature flags (set from PrismFeatures before transpile)
 static bool feature_defer = true;
 static bool feature_zeroinit = true;
+static bool feature_warn_safety = false; // If true, safety checks warn instead of error
 
 // Hash set for type keywords (initialized once)
 static HashMap type_keyword_map;
@@ -506,6 +508,17 @@ static bool needs_space(Token *prev, Token *tok)
 static bool is_member_access(Token *tok)
 {
   return tok && tok->kind == TK_PUNCT && (equal(tok, ".") || equal(tok, "->"));
+}
+
+static bool tok_list_contains_ident(Token *tok, const char *name)
+{
+  size_t len = strlen(name);
+  for (Token *t = tok; t && t->kind != TK_EOF; t = t->next)
+  {
+    if (t->kind == TK_IDENT && t->len == len && strncmp(t->loc, name, len) == 0)
+      return true;
+  }
+  return false;
 }
 
 // Emit a single token with appropriate spacing
@@ -2749,6 +2762,7 @@ static int transpile(char *input_file, char *output_file)
   }
 
   tok = preprocess(tok);
+  bool uses_getopt_argv_const = tok_list_contains_ident(tok, "__getopt_argv_const");
 
   FILE *out_fp = fopen(output_file, "w");
   if (!out_fp)
@@ -2779,11 +2793,13 @@ static int transpile(char *input_file, char *output_file)
       out_str("#endif\n", 7);
     }
     // glibc's getopt.h defines __getopt_argv_const which is used by bits/getopt_ext.h.
-    // When prism partially processes headers and passes #include directives through,
-    // we need to ensure this macro is defined for the backend compiler.
-    out_str("#ifndef __getopt_argv_const\n", 28);
-    out_str("#define __getopt_argv_const const\n", 34);
-    out_str("#endif\n", 7);
+    // Emit only if it appears in the token stream to avoid -Wunused-macros.
+    if (uses_getopt_argv_const)
+    {
+      out_str("#ifndef __getopt_argv_const\n", 28);
+      out_str("#define __getopt_argv_const const\n", 34);
+      out_str("#endif\n", 7);
+    }
   }
 
   // Emit force-include tokens before the main file
@@ -3128,10 +3144,18 @@ static int transpile(char *input_file, char *output_file)
         // Check if this goto would skip over a variable declaration (zero-init safety)
         Token *skipped_decl = goto_skips_decl(goto_tok, tok->loc, tok->len);
         if (skipped_decl)
-          error_tok(skipped_decl, "goto '%.*s' would skip over this variable declaration, "
-                                  "bypassing zero-initialization (undefined behavior in C). "
-                                  "Move the declaration before the goto, or restructure the code.",
-                    tok->len, tok->loc);
+        {
+          if (feature_warn_safety)
+            warn_tok(skipped_decl, "goto '%.*s' would skip over this variable declaration, "
+                                   "bypassing zero-initialization (undefined behavior in C). "
+                                   "Move the declaration before the goto, or restructure the code.",
+                     tok->len, tok->loc);
+          else
+            error_tok(skipped_decl, "goto '%.*s' would skip over this variable declaration, "
+                                    "bypassing zero-initialization (undefined behavior in C). "
+                                    "Move the declaration before the goto, or restructure the code.",
+                      tok->len, tok->loc);
+        }
 
         int target_depth = label_table_lookup(tok->loc, tok->len);
         // If label not found, assume same depth (forward reference within scope)
@@ -3169,10 +3193,18 @@ static int transpile(char *input_file, char *output_file)
       {
         Token *skipped_decl = goto_skips_decl(goto_tok, tok->loc, tok->len);
         if (skipped_decl)
-          error_tok(skipped_decl, "goto '%.*s' would skip over this variable declaration, "
-                                  "bypassing zero-initialization (undefined behavior in C). "
-                                  "Move the declaration before the goto, or restructure the code.",
-                    tok->len, tok->loc);
+        {
+          if (feature_warn_safety)
+            warn_tok(skipped_decl, "goto '%.*s' would skip over this variable declaration, "
+                                   "bypassing zero-initialization (undefined behavior in C). "
+                                   "Move the declaration before the goto, or restructure the code.",
+                     tok->len, tok->loc);
+          else
+            error_tok(skipped_decl, "goto '%.*s' would skip over this variable declaration, "
+                                    "bypassing zero-initialization (undefined behavior in C). "
+                                    "Move the declaration before the goto, or restructure the code.",
+                      tok->len, tok->loc);
+        }
       }
       emit_tok(goto_tok);
       continue;
@@ -3489,6 +3521,7 @@ static PrismResult prism_transpile_file(const char *input_file, PrismFeatures fe
   // Set global feature flags from PrismFeatures
   feature_defer = features.defer;
   feature_zeroinit = features.zeroinit;
+  feature_warn_safety = features.warn_safety;
   emit_line_directives = features.line_directives;
 
   // Create temp file for output
@@ -4204,6 +4237,7 @@ static void print_help(void)
       "Prism Options:\n"
       "  -fno-defer            Disable defer feature\n"
       "  -fno-zeroinit         Disable zero-initialization\n"
+      "  -fwarn-safety         Safety checks warn instead of error\n"
       "  --prism-cc=<compiler> Use specific compiler (default: $CC or cc)\n"
       "  --prism-verbose       Show transpile and compile commands\n\n"
       "Commands:\n"
@@ -4292,6 +4326,11 @@ static Cli cli_parse(int argc, char **argv)
     if (!strcmp(arg, "-fno-line-directives"))
     {
       cli.features.line_directives = false;
+      continue;
+    }
+    if (!strcmp(arg, "-fwarn-safety"))
+    {
+      cli.features.warn_safety = true;
       continue;
     }
 
@@ -4606,6 +4645,7 @@ int main(int argc, char **argv)
   // Set feature flags from CLI
   feature_defer = cli.features.defer;
   feature_zeroinit = cli.features.zeroinit;
+  feature_warn_safety = cli.features.warn_safety;
 
   // Set preprocessor configuration from CLI
   extra_compiler = cli.cc;
