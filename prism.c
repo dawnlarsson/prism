@@ -1799,6 +1799,11 @@ static void init_type_keyword_map(void)
       "fpos_t",
       "wchar_t",
       "wint_t",
+      // GCC/Clang extension types
+      "__int128",
+      "__uint128",
+      "__int128_t",
+      "__uint128_t",
   };
   for (int i = 0; i < (int)(sizeof(type_kw) / sizeof(*type_kw)); i++)
     hashmap_put(&type_keyword_map, type_kw[i], (void *)1);
