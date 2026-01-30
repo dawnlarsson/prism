@@ -3688,6 +3688,7 @@ static Token *read_const_expr(Token **rest, Token *tok)
         if (equal(tok, "__has_include") || equal(tok, "__has_include_next"))
         {
             Token *start_tok = tok;
+            bool is_include_next = equal(tok, "__has_include_next");
             tok = tok->next;
             tok = skip(tok, "(");
 
@@ -3717,10 +3718,75 @@ static Token *read_const_expr(Token **rest, Token *tok)
                     tok = tok->next;
                 if (filename)
                 {
-                    char *path = search_include_paths(filename);
-                    found = (path != NULL);
-                    if (path)
-                        free(path);
+                    if (is_include_next)
+                    {
+                        // For __has_include_next, search only paths after current file
+                        File *cur_file = tok_file(start_tok);
+                        char *cur_real = cur_file ? realpath(cur_file->name, NULL) : NULL;
+                        int matched_idx = -1;
+                        size_t matched_len = 0;
+                        char *matched_real = NULL;
+
+                        for (int i = 0; i < pp_include_paths_count; i++)
+                        {
+                            char *inc_real = realpath(pp_include_paths[i], NULL);
+                            if (!inc_real)
+                                continue;
+                            size_t len = strlen(inc_real);
+                            if (cur_real && strncmp(cur_real, inc_real, len) == 0 &&
+                                (cur_real[len] == '/' || cur_real[len] == '\0'))
+                            {
+                                if (len > matched_len)
+                                {
+                                    if (matched_real)
+                                        free(matched_real);
+                                    matched_real = inc_real;
+                                    matched_len = len;
+                                    matched_idx = i;
+                                }
+                                else
+                                {
+                                    free(inc_real);
+                                }
+                                continue;
+                            }
+                            free(inc_real);
+                        }
+                        if (cur_real)
+                            free(cur_real);
+
+                        // Search only after the matched path (if found)
+                        // Match #include_next behavior: system headers search system paths only
+                        char *path = NULL;
+                        if (matched_idx >= 0)
+                        {
+                            bool is_user_path = (matched_idx >= pp_user_paths_start);
+                            if (is_user_path)
+                            {
+                                // User path: search remaining user paths, then system paths
+                                path = search_include_next_range(filename, matched_idx + 1, pp_include_paths_count, matched_real);
+                                if (!path)
+                                    path = search_include_next_range(filename, 0, pp_user_paths_start, matched_real);
+                            }
+                            else
+                            {
+                                // System path: only search remaining system paths
+                                path = search_include_next_range(filename, matched_idx + 1, pp_user_paths_start, matched_real);
+                            }
+                        }
+                        if (matched_real)
+                            free(matched_real);
+                        found = (path != NULL);
+                        if (path)
+                            free(path);
+                    }
+                    else
+                    {
+                        char *path = search_include_paths(filename);
+                        found = (path != NULL);
+                        if (path)
+                            free(path);
+                    }
                     free(filename);
                 }
             }
@@ -3733,10 +3799,71 @@ static Token *read_const_expr(Token **rest, Token *tok)
                 found = (stat(filename, &st) == 0);
                 if (!found)
                 {
-                    char *path = search_include_paths(filename);
-                    found = (path != NULL);
-                    if (path)
-                        free(path);
+                    if (is_include_next)
+                    {
+                        // For __has_include_next, search only paths after current file
+                        File *cur_file = tok_file(start_tok);
+                        char *cur_real = cur_file ? realpath(cur_file->name, NULL) : NULL;
+                        int matched_idx = -1;
+                        size_t matched_len = 0;
+                        char *matched_real = NULL;
+
+                        for (int i = 0; i < pp_include_paths_count; i++)
+                        {
+                            char *inc_real = realpath(pp_include_paths[i], NULL);
+                            if (!inc_real)
+                                continue;
+                            size_t len = strlen(inc_real);
+                            if (cur_real && strncmp(cur_real, inc_real, len) == 0 &&
+                                (cur_real[len] == '/' || cur_real[len] == '\0'))
+                            {
+                                if (len > matched_len)
+                                {
+                                    if (matched_real)
+                                        free(matched_real);
+                                    matched_real = inc_real;
+                                    matched_len = len;
+                                    matched_idx = i;
+                                }
+                                else
+                                {
+                                    free(inc_real);
+                                }
+                                continue;
+                            }
+                            free(inc_real);
+                        }
+                        if (cur_real)
+                            free(cur_real);
+
+                        char *path = NULL;
+                        if (matched_idx >= 0)
+                        {
+                            bool is_user_path = (matched_idx >= pp_user_paths_start);
+                            if (is_user_path)
+                            {
+                                path = search_include_next_range(filename, matched_idx + 1, pp_include_paths_count, matched_real);
+                                if (!path)
+                                    path = search_include_next_range(filename, 0, pp_user_paths_start, matched_real);
+                            }
+                            else
+                            {
+                                path = search_include_next_range(filename, matched_idx + 1, pp_user_paths_start, matched_real);
+                            }
+                        }
+                        if (matched_real)
+                            free(matched_real);
+                        found = (path != NULL);
+                        if (path)
+                            free(path);
+                    }
+                    else
+                    {
+                        char *path = search_include_paths(filename);
+                        found = (path != NULL);
+                        if (path)
+                            free(path);
+                    }
                 }
                 free(filename);
             }
