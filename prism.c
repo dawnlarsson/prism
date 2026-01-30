@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.81.0"
+#define PRISM_VERSION "0.82.0"
 
 #include "parse.c"
 
@@ -2676,149 +2676,117 @@ static Token *try_zero_init_decl(Token *tok)
   return NULL;
 }
 
+// Run system preprocessor (cc -E -P) on input file
+// Returns path to temp file with preprocessed output, or NULL on failure
+// Caller must free() the path and unlink() the file
+static char *preprocess_with_cc(const char *input_file)
+{
+  // Create temp file for preprocessed output
+  char tmppath[] = "/tmp/prism_pp_XXXXXX";
+  int fd = mkstemp(tmppath);
+  if (fd < 0)
+  {
+    perror("mkstemp");
+    return NULL;
+  }
+  close(fd);
+
+  // Build cc -E -P command (-P suppresses linemarkers)
+  size_t cmd_size = 8192;
+  char *cmd = malloc(cmd_size);
+  if (!cmd)
+  {
+    unlink(tmppath);
+    return NULL;
+  }
+
+  // Start with compiler
+  const char *cc = extra_compiler ? extra_compiler : "cc";
+  char *p = cmd;
+  p += snprintf(p, cmd_size, "%s -E -P", cc);
+
+  // Add compiler flags (like -std=c99, -m32)
+  for (int i = 0; i < extra_compiler_flags_count; i++)
+    p += snprintf(p, cmd_size - (p - cmd), " %s", extra_compiler_flags[i]);
+
+  // Add include paths
+  for (int i = 0; i < extra_include_count; i++)
+    p += snprintf(p, cmd_size - (p - cmd), " -I%s", extra_include_paths[i]);
+
+  // Add defines
+  for (int i = 0; i < extra_define_count; i++)
+    p += snprintf(p, cmd_size - (p - cmd), " -D%s", extra_defines[i]);
+
+  // Add prism-specific macros
+  p += snprintf(p, cmd_size - (p - cmd), " -D__PRISM__=1");
+  if (feature_defer)
+    p += snprintf(p, cmd_size - (p - cmd), " -D__PRISM_DEFER__=1");
+  if (feature_zeroinit)
+    p += snprintf(p, cmd_size - (p - cmd), " -D__PRISM_ZEROINIT__=1");
+
+  // Add standard feature test macros for POSIX/GNU compatibility
+  // These enable full functionality in system headers
+  p += snprintf(p, cmd_size - (p - cmd), " -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE");
+
+  // Add force-includes
+  for (int i = 0; i < extra_force_include_count; i++)
+    p += snprintf(p, cmd_size - (p - cmd), " -include %s", extra_force_includes[i]);
+
+  // Input file and output
+  p += snprintf(p, cmd_size - (p - cmd), " %s -o %s 2>&1", input_file, tmppath);
+
+  // Run preprocessor
+  int ret = system(cmd);
+  free(cmd);
+
+  if (ret != 0)
+  {
+    // Preprocessor failed - print error output
+    FILE *f = fopen(tmppath, "r");
+    if (f)
+    {
+      char buf[1024];
+      while (fgets(buf, sizeof(buf), f))
+        fputs(buf, stderr);
+      fclose(f);
+    }
+    unlink(tmppath);
+    return NULL;
+  }
+
+  char *result = strdup(tmppath);
+  return result;
+}
+
 static int transpile(char *input_file, char *output_file)
 {
   // Initialize type keyword map (only done once)
   if (!type_keyword_map.capacity)
     init_type_keyword_map();
 
-  // Set compiler and flags BEFORE pp_init so system macro query uses them
-  if (extra_compiler)
-    pp_set_compiler(extra_compiler);
-  for (int i = 0; i < extra_compiler_flags_count; i++)
-    pp_add_compiler_flag(extra_compiler_flags[i]);
-
-  pp_init();
-  pp_add_default_include_paths();
-
-  // Add extra include paths from CLI (-I flags)
-  for (int i = 0; i < extra_include_count; i++)
-    pp_add_include_path(extra_include_paths[i]);
-
-  // Add extra defines from CLI (-D flags)
-  for (int i = 0; i < extra_define_count; i++)
+  // Run system preprocessor
+  char *pp_file = preprocess_with_cc(input_file);
+  if (!pp_file)
   {
-    const char *def = extra_defines[i];
-    char *eq = strchr(def, '=');
-    if (eq)
-    {
-      // -DNAME=VALUE
-      size_t name_len = eq - def;
-      char *name = malloc(name_len + 1);
-      memcpy(name, def, name_len);
-      name[name_len] = '\0';
-      // Note: pp_define_macro keeps pointer to name, so don't free it
-      pp_define_macro(name, (char *)(eq + 1));
-    }
-    else
-    {
-      // -DNAME (define as 1)
-      pp_define_macro((char *)def, "1");
-    }
-  }
-
-  pp_define_macro("__PRISM__", "1");
-  if (feature_defer)
-    pp_define_macro("__PRISM_DEFER__", "1");
-  if (feature_zeroinit)
-    pp_define_macro("__PRISM_ZEROINIT__", "1");
-
-  // Process forced includes (-include files) first
-  // These define macros that the main file may depend on (e.g., config.h with HAVE_*)
-  // We must preserve the preprocessed tokens (not just macros) because force-includes
-  // may contain declarations (e.g., extern int optreset;) that are protected by include
-  // guards. If we discard them, and the main file later #includes the same file,
-  // the include guard macro is already defined so the declarations are skipped.
-  Token *force_include_tokens = NULL;
-  Token *force_include_tail = NULL;
-  for (int i = 0; i < extra_force_include_count; i++)
-  {
-    Token *inc_tok = tokenize_file((char *)extra_force_includes[i]);
-    if (!inc_tok)
-    {
-      fprintf(stderr, "Failed to open forced include: %s\n", extra_force_includes[i]);
-      return 0;
-    }
-    // Preprocess the forced include
-    Token *pp_tok = preprocess(inc_tok);
-    // Append to our list (skip the final EOF token)
-    for (Token *t = pp_tok; t && t->kind != TK_EOF; t = t->next)
-    {
-      Token *copy = copy_token(t);
-      copy->next = NULL;
-      if (!force_include_tokens)
-      {
-        force_include_tokens = copy;
-        force_include_tail = copy;
-      }
-      else
-      {
-        force_include_tail->next = copy;
-        force_include_tail = copy;
-      }
-    }
-  }
-
-  Token *tok = tokenize_file(input_file);
-  if (!tok)
-  {
-    fprintf(stderr, "Failed to open: %s\n", input_file);
+    fprintf(stderr, "Preprocessing failed for: %s\n", input_file);
     return 0;
   }
 
-  tok = preprocess(tok);
-  bool uses_getopt_argv_const = tok_list_contains_ident(tok, "__getopt_argv_const");
+  // Tokenize the preprocessed output
+  Token *tok = tokenize_file(pp_file);
+  unlink(pp_file);
+  free(pp_file);
+
+  if (!tok)
+  {
+    fprintf(stderr, "Failed to tokenize preprocessed output\n");
+    return 0;
+  }
 
   FILE *out_fp = fopen(output_file, "w");
   if (!out_fp)
     return 0;
   out_init(out_fp);
-
-  // Emit feature test macros at the very start of the output
-  // These must come before any #include <...> directives for glibc to work correctly
-  {
-    const char **ftm_names;
-    const char **ftm_values;
-    int ftm_count = pp_get_feature_test_macros(&ftm_names, &ftm_values);
-    for (int i = 0; i < ftm_count; i++)
-    {
-      // Wrap in #ifndef to avoid redefinition if already defined (e.g., by -include config.h)
-      out_printf("#ifndef %s\n", ftm_names[i]);
-      out_printf("#define %s %s\n", ftm_names[i], ftm_values[i]);
-      out_str("#endif\n", 7);
-    }
-    // If NDEBUG was defined during preprocessing, emit it here so that
-    // #include <assert.h> passed through to the backend sees it defined
-    // This is critical for programs like SQLite that define NDEBUG before including assert.h
-    const char *ndebug_val = pp_get_macro_value("NDEBUG");
-    if (ndebug_val)
-    {
-      out_str("#ifndef NDEBUG\n", 15);
-      out_printf("#define NDEBUG %s\n", ndebug_val);
-      out_str("#endif\n", 7);
-    }
-    // glibc's getopt.h defines __getopt_argv_const which is used by bits/getopt_ext.h.
-    // Emit only if it appears in the token stream to avoid -Wunused-macros.
-    if (uses_getopt_argv_const)
-    {
-      out_str("#ifndef __getopt_argv_const\n", 28);
-      out_str("#define __getopt_argv_const const\n", 34);
-      out_str("#endif\n", 7);
-    }
-  }
-
-  // Emit force-include tokens before the main file
-  // These contain declarations (extern, typedef, etc.) that the main file may depend on
-  if (force_include_tokens)
-  {
-    for (Token *t = force_include_tokens; t; t = t->next)
-    {
-      emit_tok(t);
-    }
-    // Ensure we start on a new line after force-includes
-    out_char('\n');
-    last_emitted = NULL; // Reset so main file starts fresh
-  }
 
   // Reset state
   defer_depth = 0;

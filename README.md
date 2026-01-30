@@ -1,6 +1,6 @@
 ![prism_banner](https://github.com/user-attachments/assets/97c303d0-0d85-4262-8fb3-663a33ce00cd)
 
-### **Robust C by default.**
+### **Robust C by default. (Unstable refactoring)**
 
 Prism is a lightweight, self-contained transpiler that brings modern language features to standard C. It functions as a build tool with zero dependencies, allowing you to write safer code without the overhead of complex build systems or heavy frameworks, or macro hacks.
 
@@ -14,7 +14,7 @@ Prism is a propper transpiler, not a preprocessor macro.
 * **Detect Errors:** It catches unsafe patterns (like jumping into a scope with `goto`) before they become runtime bugs.
 
 ### Status
-Prism can parse & preprocess large complex C projects like `OpenSSL`, `SQlite`, `Bash`, `Dash`.
+Prism can parse & tokenize large complex C projects like `OpenSSL`, `SQlite`, `Bash`, `Dash`.
 
 All validation & edge tests pass, but,
 There is some edge cases still to be caught in the parsing, **huge speedups** and runtime memory savings to be had.
@@ -179,7 +179,7 @@ void          prism_free(PrismResult *r);
 ```
 
 # parse.c
-C tokenizer and preprocessor based from chibicc (MIT),
+C tokenizer based from chibicc (MIT),
 single file, few fixes/changes ect.
 
 # Repo
