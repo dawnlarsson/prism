@@ -77,7 +77,6 @@ static const char *pp_compiler = NULL;  // Compiler to use (default: "cc")
 static char **pp_compiler_flags = NULL; // Flags like -std=c99, -m32, etc.
 static int pp_compiler_flags_count = 0;
 
-typedef struct Type Type;
 typedef struct Token Token;
 typedef struct Hideset Hideset;
 
@@ -116,9 +115,9 @@ typedef enum
 // Token flags (packed into 8 bits)
 enum
 {
-    TF_AT_BOL = 1 << 0,    // Token is at beginning of line
-    TF_HAS_SPACE = 1 << 1, // Token preceded by whitespace
-    TF_IS_FLOAT = 1 << 2,  // For TK_NUM: value is floating point (use fval side table)
+    TF_AT_BOL = 1 << 0,      // Token is at beginning of line
+    TF_HAS_SPACE = 1 << 1,   // Token preceded by whitespace
+    TF_IS_FLOAT = 1 << 2,    // For TK_NUM: value was a floating point literal
     TF_FOREIGN_LOC = 1 << 3, // Token loc doesn't belong to tok_file() contents
 };
 
@@ -166,72 +165,8 @@ typedef struct
 
 static TokenArena token_arena = {0};
 
-// Debug/trace for runaway token growth (opt-in via env vars)
-static size_t token_count = 0;
-static size_t token_trace_step = 0;
-static size_t token_trace_next = 0;
-static size_t token_limit = 0;
-static bool token_trace_inited = false;
-static bool token_trace_enabled = false;
-static const char *trace_current_file = NULL;
-static const char *trace_current_macro = NULL;
-static int trace_include_depth = 0;
-
-static void token_trace_init(void)
-{
-    if (token_trace_inited)
-        return;
-    token_trace_inited = true;
-
-    const char *env_trace = getenv("PRISM_TRACE_TOKENS");
-    token_trace_enabled = (env_trace && *env_trace);
-
-    const char *env_step = getenv("PRISM_TOKEN_TRACE_STEP");
-    if (env_step && *env_step)
-        token_trace_step = strtoull(env_step, NULL, 10);
-    if (token_trace_step == 0)
-        token_trace_step = 1000000; // default: 1M tokens
-    token_trace_next = token_trace_step;
-
-    const char *env_limit = getenv("PRISM_TOKEN_LIMIT");
-    if (env_limit && *env_limit)
-        token_limit = strtoull(env_limit, NULL, 10);
-}
-
-static void token_trace_tick(void)
-{
-    if (!token_trace_enabled)
-        return;
-    if (token_count < token_trace_next)
-        return;
-
-    fprintf(stderr, "[prism] tokens=%zu file=%s depth=%d macro=%s\n",
-            token_count,
-            trace_current_file ? trace_current_file : "?",
-            trace_include_depth,
-            trace_current_macro ? trace_current_macro : "-");
-    token_trace_next += token_trace_step;
-}
-
 static Token *arena_alloc_token(void)
 {
-    token_trace_init();
-    if (token_trace_enabled || token_limit)
-    {
-        token_count++;
-        if (token_limit && token_count > token_limit)
-        {
-            fprintf(stderr,
-                    "[prism] token limit exceeded (%zu). file=%s depth=%d macro=%s\n",
-                    token_count,
-                    trace_current_file ? trace_current_file : "?",
-                    trace_include_depth,
-                    trace_current_macro ? trace_current_macro : "-");
-            exit(1);
-        }
-        token_trace_tick();
-    }
-
     if (!token_arena.current || token_arena.current->used >= ARENA_BLOCK_SIZE)
     {
         // Allocate new block
@@ -284,38 +219,6 @@ static void arena_free(void)
     token_arena.current = NULL;
 }
 
-// Minimal type info (only for string literals)
-typedef enum
-{
-    TY_VOID,
-    TY_BOOL,
-    TY_CHAR,
-    TY_SHORT,
-    TY_INT,
-    TY_LONG,
-    TY_FLOAT,
-    TY_DOUBLE,
-    TY_LDOUBLE,
-    TY_PTR,
-    TY_ARRAY,
-} TypeKind;
-
-struct Type
-{
-    TypeKind kind;
-    int size;
-    int align;
-    bool is_unsigned;
-    Type *base;
-    int array_len;
-};
-
-static Type ty_char_val = {TY_CHAR, 1, 1, false, NULL, 0};
-static Type ty_int_val = {TY_INT, 4, 4, false, NULL, 0};
-
-static Type *ty_char = &ty_char_val;
-static Type *ty_int = &ty_int_val;
-
 // Hashmap
 typedef struct
 {
@@ -334,8 +237,6 @@ typedef struct
 // Side tables for rarely-used token data (indexed by token pointer)
 static HashMap token_hidesets;
 static HashMap token_origins;
-static HashMap token_fvals;
-static HashMap token_types;
 
 // Error handling
 static File *current_file;
@@ -547,27 +448,6 @@ static void reset_feature_test_macros(void)
         feature_test_macros[i].value = NULL;
     }
     feature_test_macro_count = 0;
-}
-
-static Type *array_of(Type *base, int len)
-{
-    Type *ty = calloc(1, sizeof(Type));
-    if (!ty)
-    {
-        fprintf(stderr, "out of memory in array_of\n");
-        exit(1);
-    }
-    ty->kind = TY_ARRAY;
-    ty->base = base;
-    // Check for integer overflow
-    if (len > 0 && base->size > INT_MAX / len)
-    {
-        fprintf(stderr, "array size overflow\n");
-        exit(1);
-    }
-    ty->size = base->size * len;
-    ty->array_len = len;
-    return ty;
 }
 
 // Hideset for macro expansion (with pre-computed hash for fast lookup)
@@ -1216,33 +1096,6 @@ static inline void tok_set_origin(Token *tok, Token *origin)
         hashmap_delete2(&token_origins, (char *)&tok, sizeof(tok));
 }
 
-// Float value side table accessors
-static inline long double tok_fval(Token *tok)
-{
-    long double *p = (long double *)hashmap_get2(&token_fvals, (char *)&tok, sizeof(tok));
-    return p ? *p : 0.0L;
-}
-
-static inline void tok_set_fval(Token *tok, long double fval)
-{
-    long double *p = malloc(sizeof(long double));
-    *p = fval;
-    hashmap_put2(&token_fvals, (char *)&tok, sizeof(tok), p);
-    tok->flags |= TF_IS_FLOAT;
-}
-
-// Type side table accessors (for string literals)
-static inline Type *tok_type(Token *tok)
-{
-    return (Type *)hashmap_get2(&token_types, (char *)&tok, sizeof(tok));
-}
-
-static inline void tok_set_type(Token *tok, Type *ty)
-{
-    if (ty)
-        hashmap_put2(&token_types, (char *)&tok, sizeof(tok), ty);
-}
-
 // Unicode
 static uint32_t decode_utf8(char **new_pos, char *p)
 {
@@ -1797,12 +1650,11 @@ static Token *read_string_literal(char *start, char *quote)
             buf[len++] = *p++;
     }
     Token *tok = new_token(TK_STR, start, end + 1);
-    tok_set_type(tok, array_of(ty_char, len + 1));
     tok->val.str = buf;
     return tok;
 }
 
-static Token *read_char_literal(char *start, char *quote, Type *ty)
+static Token *read_char_literal(char *start, char *quote)
 {
     char *p = quote + 1;
     if (*p == '\0')
@@ -1827,11 +1679,11 @@ static Token *read_char_literal(char *start, char *quote, Type *ty)
 
         if (count == 0)
             first_c = c;
-        if (count < ty->size)
+        if (count < 4) // sizeof(int)
             val = (val << 8) | (c & 0xFF);
         count++;
         // Multi-character constants are implementation-defined but allowed
-        // Continue parsing but truncate value to ty->size bytes
+        // Continue parsing but truncate value to 4 bytes
     }
 
     if (count == 0)
@@ -1839,7 +1691,6 @@ static Token *read_char_literal(char *start, char *quote, Type *ty)
 
     Token *tok = new_token(TK_NUM, start, p + 1);
     tok->val.i64 = (count == 1) ? first_c : (int32_t)val;
-    tok_set_type(tok, ty);
     return tok;
 }
 
@@ -1951,7 +1802,8 @@ static void convert_pp_number(Token *tok)
         if (*endp)
             error_tok(tok, "invalid floating constant");
         tok->kind = TK_NUM;
-        tok_set_fval(tok, fval);
+        tok->flags |= TF_IS_FLOAT;
+        tok->val.i64 = (int64_t)fval; // Convert to int for preprocessor expressions
         free(buf);
         return;
     }
@@ -2042,8 +1894,6 @@ static File *new_file(char *name, int file_no, char *contents)
     file->display_name = file->name;
     file->file_no = file_no;
     file->contents = contents;
-    // Track current file for token trace/debug
-    trace_current_file = file->name;
 
     // Build line offset table for O(log n) line number lookups
     // First pass: count lines
@@ -2150,14 +2000,14 @@ static Token *tokenize(File *file)
         }
         if (*p == '\'')
         {
-            cur = cur->next = read_char_literal(p, p, ty_int);
+            cur = cur->next = read_char_literal(p, p);
             p += cur->len;
             continue;
         }
         // Wide and unicode character literals: L'...', u'...', U'...'
         if ((*p == 'L' || *p == 'u' || *p == 'U') && p[1] == '\'')
         {
-            cur = cur->next = read_char_literal(p, p + 1, ty_int);
+            cur = cur->next = read_char_literal(p, p + 1);
             p += cur->len;
             continue;
         }
@@ -2938,8 +2788,6 @@ static bool expand_macro(Token **rest, Token *tok)
     {
         bool at_bol = tok_at_bol(tok);
         bool has_space = tok_has_space(tok);
-        const char *prev_macro = trace_current_macro;
-        trace_current_macro = m->name;
         Token *body = m->handler(tok);
         if (body && body->kind != TK_EOF)
         {
@@ -2947,7 +2795,6 @@ static bool expand_macro(Token **rest, Token *tok)
             tok_set_has_space(body, has_space);
         }
         *rest = append(body, tok->next);
-        trace_current_macro = prev_macro;
         return true;
     }
 
@@ -2959,8 +2806,6 @@ static bool expand_macro(Token **rest, Token *tok)
 
         bool at_bol = tok_at_bol(tok);
         bool has_space = tok_has_space(tok);
-        const char *prev_macro = trace_current_macro;
-        trace_current_macro = m->name;
         Hideset *hs = hideset_union(tok_hideset(tok), new_hideset(m->name));
         Token *body = add_hideset(m->body, hs);
         if (body && body->kind != TK_EOF)
@@ -2974,7 +2819,6 @@ static bool expand_macro(Token **rest, Token *tok)
         if (m->is_virtual)
             transfer_file_location(body, tok);
         *rest = append(body, tok->next);
-        trace_current_macro = prev_macro;
         return true;
     }
 
@@ -2990,8 +2834,6 @@ static bool expand_macro(Token **rest, Token *tok)
 
     bool at_bol = tok_at_bol(tok);
     bool has_space = tok_has_space(tok);
-    const char *prev_macro = trace_current_macro;
-    trace_current_macro = m->name;
     Token *macro_tok = tok;
     MacroArg *args = read_macro_args(&tok, tok->next->next, m->params, m->va_args_name);
     Token *body = subst(m->body, args);
@@ -3009,7 +2851,6 @@ static bool expand_macro(Token **rest, Token *tok)
     if (m->is_virtual)
         transfer_file_location(body, macro_tok);
     *rest = append(body, tok);
-    trace_current_macro = prev_macro;
     return true;
 }
 
@@ -3266,9 +3107,7 @@ static Token *emit_define_directive(Token *start, Token *next_tok, const char *n
 
 static Token *include_file(Token *tok, char *path, Token *cont)
 {
-    trace_include_depth++;
     Token *tok2 = tokenize_file(path);
-    trace_include_depth--;
     if (!tok2)
         error_tok(tok, "%s: cannot open file", path);
 
@@ -4014,9 +3853,7 @@ static Token *preprocess2(Token *tok)
                         hashmap_put(&virtual_includes, sys_path, (void *)1);
 
                         // Process the header to learn macros, but discard output
-                        trace_include_depth++;
                         Token *sys_tok = tokenize_file(sys_path);
-                        trace_include_depth--;
                         if (sys_tok)
                         {
                             bool was_virtual = in_virtual_include;
@@ -4071,9 +3908,7 @@ static Token *preprocess2(Token *tok)
                         if (!hashmap_get(&virtual_includes, sys_path))
                         {
                             hashmap_put(&virtual_includes, sys_path, (void *)1);
-                            trace_include_depth++;
                             Token *sys_tok = tokenize_file(sys_path);
-                            trace_include_depth--;
                             if (sys_tok)
                             {
                                 bool was_virtual = in_virtual_include;
@@ -4213,9 +4048,7 @@ static Token *preprocess2(Token *tok)
                     if (!hashmap_get(&virtual_includes, path))
                     {
                         hashmap_put(&virtual_includes, path, (void *)1);
-                        trace_include_depth++;
                         Token *sys_tok = tokenize_file(path);
-                        trace_include_depth--;
                         if (sys_tok)
                         {
                             bool was_virtual = in_virtual_include;
@@ -4279,9 +4112,7 @@ static Token *preprocess2(Token *tok)
                 if (!hashmap_get(&virtual_includes, path))
                 {
                     hashmap_put(&virtual_includes, path, (void *)1);
-                    trace_include_depth++;
                     Token *sys_tok = tokenize_file(path);
-                    trace_include_depth--;
                     if (sys_tok)
                     {
                         bool was_virtual = in_virtual_include;
@@ -4654,8 +4485,6 @@ void pp_reset(void)
     hashmap_clear(&virtual_includes);
     hashmap_clear(&token_hidesets);
     hashmap_clear(&token_origins);
-    hashmap_clear(&token_fvals);
-    hashmap_clear(&token_types);
     cond_incl = NULL;
     pp_eval_skip = false;
     in_virtual_include = false;
@@ -4664,14 +4493,6 @@ void pp_reset(void)
     // Free input files (file contents, line tables, etc.)
     free_input_files();
     arena_reset(); // Reset token arena for reuse
-
-    // Reset token trace counters per translation unit
-    token_trace_init();
-    token_count = 0;
-    token_trace_next = token_trace_step;
-    trace_current_file = NULL;
-    trace_current_macro = NULL;
-    trace_include_depth = 0;
 }
 
 void pp_init(void)
