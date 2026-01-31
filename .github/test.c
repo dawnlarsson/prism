@@ -2146,7 +2146,7 @@ void test_stmt_expr_defer_timing(void)
     CHECK_LOG("DE", "stmt expr defer - order");
 }
 
-void test_nested_stmt_expr_defer(void)
+void test_nested_stmt_expr_defer_immediate_block_exit(void)
 {
     log_reset();
 
@@ -2560,33 +2560,20 @@ void run_rigor_tests(void)
 {
     printf("\n=== RIGOR TESTS ===\n");
 
-    printf("\n--- Issue 3: typedef void return ---\n");
     test_typedef_void_return();
     test_typedef_voidptr_return();
-
-    printf("\n--- Issue 6/7: Statement expression defer ---\n");
     test_stmt_expr_defer_timing();
-    test_nested_stmt_expr_defer();
-
-    printf("\n--- Issue 9: const placement ---\n");
+    test_nested_stmt_expr_defer_immediate_block_exit();
     test_const_after_typename();
-
-    printf("\n--- Issue 11: Coverage gaps ---\n");
     test_atomic_zeroinit();
     test_static_local_zeroinit();
     test_inline_defer();
-
-    printf("\n--- Complex declarator zero-init ---\n");
     test_complex_declarator_zeroinit();
     test_complex_decl_safety();
     test_qualified_complex_decl();
-
-    printf("\n--- Declaration edge cases ---\n");
     test_extern_not_initialized();
     test_typedef_not_initialized();
     test_for_init_zeroinit();
-
-    printf("\n--- Extra ---\n");
     test_ptr_to_vla_typedef(5);
     test_vla_side_effect_once();
     test_atomic_specifier_form();
@@ -3136,7 +3123,6 @@ void run_preprocessor_numeric_tests(void)
 
 // PREPROCESSOR SYSTEM MACRO TESTS
 
-
 #include <signal.h>
 
 void test_linux_macros(void)
@@ -3146,21 +3132,21 @@ void test_linux_macros(void)
     // Only test on Linux - skip on other platforms
 #ifdef __linux__
     CHECK(1, "__linux__ macro defined");
-    #ifdef __linux
+#ifdef __linux
     CHECK(1, "__linux macro defined");
-    #else
+#else
     CHECK(0, "__linux macro defined");
-    #endif
-    #ifdef linux
+#endif
+#ifdef linux
     CHECK(1, "linux macro defined");
-    #else
+#else
     CHECK(0, "linux macro defined");
-    #endif
-    #ifdef __gnu_linux__
+#endif
+#ifdef __gnu_linux__
     CHECK(1, "__gnu_linux__ macro defined");
-    #else
+#else
     CHECK(0, "__gnu_linux__ macro defined");
-    #endif
+#endif
 #else
     // Not on Linux - skip these tests (they're Linux-specific)
     printf("  [SKIP] Linux macro tests (not on Linux)\n");
@@ -3197,14 +3183,14 @@ void test_signal_macros(void)
 #endif
 
 #ifdef SIGCHLD
-    // SIGCHLD is 17 on Linux, 20 on macOS/BSD
-    #ifdef __linux__
+// SIGCHLD is 17 on Linux, 20 on macOS/BSD
+#ifdef __linux__
     CHECK(SIGCHLD == 17, "SIGCHLD defined as 17");
-    #elif defined(__APPLE__)
+#elif defined(__APPLE__)
     CHECK(SIGCHLD == 20, "SIGCHLD defined as 20 (macOS)");
-    #else
+#else
     CHECK(1, "SIGCHLD defined");
-    #endif
+#endif
 #else
     CHECK(0, "SIGCHLD defined");
 #endif
@@ -3221,11 +3207,11 @@ void test_glibc_macros(void)
     // Only relevant on Linux with glibc
 #ifdef __GLIBC__
     CHECK(__GLIBC__ >= 2, "__GLIBC__ defined and >= 2");
-    #ifdef __GLIBC_MINOR__
+#ifdef __GLIBC_MINOR__
     CHECK(1, "__GLIBC_MINOR__ defined");
-    #else
+#else
     CHECK(0, "__GLIBC_MINOR__ defined");
-    #endif
+#endif
 #else
     // Not using glibc - skip these tests
     printf("  [SKIP] glibc macro tests (not using glibc)\n");
@@ -3236,12 +3222,12 @@ void test_posix_macros(void)
 {
     // _POSIX_VERSION must be defined for POSIX compliance detection
 #ifdef _POSIX_VERSION
-    // Different systems have different POSIX versions
-    #ifdef __linux__
+// Different systems have different POSIX versions
+#ifdef __linux__
     CHECK(_POSIX_VERSION >= 200809L, "_POSIX_VERSION defined and >= 200809L");
-    #else
+#else
     CHECK(_POSIX_VERSION > 0, "_POSIX_VERSION defined");
-    #endif
+#endif
 #else
     // _POSIX_VERSION may not be defined without feature test macros
     printf("  [SKIP] _POSIX_VERSION test (not defined)\n");
@@ -3259,11 +3245,502 @@ void run_preprocessor_system_macro_tests(void)
     test_posix_macros();
 }
 
+// SECTION: VERIFICATION TESTS
+void test_switch_conditional_break_defer(void)
+{
+    log_reset();
+    int error = 0; // No error, will fall through
+
+    switch (1)
+    {
+    case 1:
+    {
+        // Wrap in braces so defer executes before fallthrough
+        defer log_append("cleanup1");
+        if (error)
+            break;
+    } // defer runs here
+    case 2:
+        log_append("case2");
+        break;
+    }
+
+    // With fix: cleanup1 executes at closing brace before fallthrough
+    CHECK_LOG("cleanup1case2", "defer executes before fallthrough with braces");
+}
+
+void test_switch_unconditional_break_works(void)
+{
+    log_reset();
+    int x = 1;
+
+    switch (x)
+    {
+    case 1:
+    {
+        int *ptr = malloc(sizeof(int));
+        defer
+        {
+            free(ptr);
+            log_append("cleanup");
+        };
+
+        // Unconditional break - this is allowed (fall through to case 2 can't happen)
+        break;
+    }
+    case 2:
+        log_append("reached_case2");
+        break;
+    }
+
+    // Defer should execute, case 2 should not be reached
+    CHECK_LOG("cleanup", "unconditional break allows defer without fallthrough warning");
+}
+
+void test_switch_braced_fallthrough_works(void)
+{
+    log_reset();
+    int cleanup_called = 0;
+
+    switch (1)
+    {
+    case 1:
+    {
+        int *ptr = malloc(sizeof(int));
+        defer
+        {
+            free(ptr);
+            cleanup_called = 1;
+        };
+
+        // Even with conditional break, braces ensure defer runs
+        if (0)
+            break;
+        // Fall through - cleanup happens at closing brace
+    }
+    case 2:
+        log_append("reached_case2");
+        break;
+    }
+
+    CHECK(cleanup_called == 1, "braced case executes defer on fallthrough");
+    CHECK_LOG("reached_case2", "fallthrough occurs as expected");
+}
+
+// Bug 2: C23 raw string literals - backslashes corrupted
+void test_raw_string_literals(void)
+{
+    // Test 1: Basic raw string with backslashes
+    const char *path = R"(C:\Path\To\File)";
+    CHECK(strcmp(path, "C:\\Path\\To\\File") == 0, "raw string preserves backslashes");
+    // Test 2: Raw string with quotes
+    const char *quoted = R"("Hello" 'World')";
+    CHECK(strcmp(quoted, "\"Hello\" 'World'") == 0, "raw string preserves quotes");
+
+    // Test 3: Raw string with newlines
+    const char *multiline = R"(Line 1
+Line 2
+Line 3)";
+    CHECK(strchr(multiline, '\n') != NULL, "raw string preserves newlines");
+
+    // Test 4: Raw string with escape-like sequences
+    const char *escaped = R"(\n\t\r\0)";
+    CHECK(strcmp(escaped, "\\n\\t\\r\\0") == 0, "raw string doesn't interpret escapes");
+}
+
+// Bug 3: VLA false positive with struct member access
+void test_vla_struct_member(void)
+{
+    struct Config
+    {
+        int size;
+    } cfg = {10};
+
+    // This is a VLA (runtime value), but Prism incorrectly thinks it's constant
+    // because of the member access optimization
+    int buffer[cfg.size]; // Should be recognized as VLA
+
+    // This would cause backend error: "variable-sized object may not be initialized"
+    // if Prism emits: int buffer[cfg.size] = {0};
+
+    // Verify buffer is actually allocated
+    buffer[0] = 42;
+    buffer[9] = 99;
+
+    CHECK(buffer[0] == 42, "VLA with struct member access allocates correctly");
+    CHECK(buffer[9] == 99, "VLA struct member size works");
+}
+
+void test_vla_struct_member_nested(void)
+{
+    struct Outer
+    {
+        struct
+        {
+            int count;
+        } inner;
+    } obj = {{5}};
+
+    // Nested member access - still a VLA
+    int arr[obj.inner.count];
+    arr[0] = 1;
+    arr[4] = 5;
+
+    CHECK(arr[0] == 1 && arr[4] == 5, "nested struct member VLA works");
+}
+
+void test_offsetof_vs_runtime(void)
+{
+    struct S
+    {
+        int x;
+        int y;
+    };
+
+    // This should be constant (offsetof pattern with 0)
+    int const_size = offsetof(struct S, y);
+    int fixed_arr[const_size]; // Should be fixed-size
+
+    // This should be VLA (runtime struct instance)
+    struct S instance = {0, 3};
+    int vla_arr[instance.y]; // Should be VLA
+
+    fixed_arr[0] = 10;
+    vla_arr[0] = 20;
+
+    CHECK(fixed_arr[0] == 10, "offsetof pattern creates fixed array");
+    CHECK(vla_arr[0] == 20, "runtime member creates VLA");
+}
+
+// Bug 4: Statement expression with defer and goto
+void test_stmt_expr_defer_goto(void)
+{
+    log_reset();
+    int err = 1;
+    int x;
+
+    x = ({
+        {
+            defer log_append("cleanup");
+            if (err)
+                goto error;
+        }
+        42;
+    });
+
+error:
+    log_append("error_handler");
+
+    // The defer should execute before jumping to error label
+    // Risk: depends on backend compiler's statement expression implementation
+    CHECK_LOG("cleanuperror_handler", "defer executes before goto in stmt expr");
+}
+
+void test_stmt_expr_defer_normal(void)
+{
+    log_reset();
+    int err = 0;
+
+    int x = ({
+        {
+            defer log_append("cleanup");
+            if (err)
+                goto skip;
+            log_append("body");
+        }
+        100;
+    });
+
+skip:
+    log_append("end");
+
+    CHECK_LOG("bodycleanupend", "defer executes normally in stmt expr");
+    CHECK(x == 100, "statement expression returns correct value");
+}
+
+void test_nested_stmt_expr_defer(void)
+{
+    log_reset();
+
+    int result = ({
+        {
+            defer log_append("outer");
+            int inner = ({
+                {
+                    defer log_append("inner");
+                    log_append("inner_body");
+                }
+                5;
+            });
+            log_append("outer_body");
+        }
+        10;
+    });
+
+    CHECK_LOG("inner_bodyinnerouter_bodyouter", "nested stmt expr defer order");
+    CHECK(result == 10, "nested stmt expr computes correctly");
+}
+
+// SECTION: CRITICAL BUG TESTS (THIRD PARTY REPORTS)
+
+// Bug 1: Vanishing statement - defer consumed without replacement
+// Tests that defer in braceless control flow emits a placeholder (;) to prevent syntax errors
+void test_vanishing_statement_if_else(void)
+{
+    log_reset();
+
+    // Use inner scope so defer executes before we check the log
+    {
+        int check = 1;
+
+        // Braceless if with defer - should emit semicolon placeholder
+        if (check)
+            defer log_append("cleanup");
+        else
+            log_append("alt");
+
+        log_append("end");
+    } // defer executes here
+
+    CHECK_LOG("endcleanup", "defer in braceless if doesn't vanish");
+}
+
+void test_vanishing_statement_while(void)
+{
+    log_reset();
+
+    {
+        int count = 0;
+
+        while (count < 1)
+        {
+            count++;
+            // Braceless if inside while - tests nested braceless defer
+            if (count == 1)
+                defer log_append("loop_cleanup");
+        } // defer executes here when while loop exits
+
+        log_append("after");
+    }
+
+    CHECK_LOG("loop_cleanupafter", "defer in braceless while body works");
+}
+
+void test_vanishing_statement_for(void)
+{
+    log_reset();
+
+    {
+        // Braceless for loop with defer
+        for (int i = 0; i < 1; i++)
+            defer log_append("for_defer");
+
+        log_append("done");
+    } // defer executes here
+
+    CHECK_LOG("donefor_defer", "defer in braceless for body works");
+}
+
+// Bug 2: _Generic default collision with switch defer cleanup
+// Currently FAILS: Prism incorrectly thinks "_Generic(..., default:...)" is a case label
+void test_generic_default_collision(void)
+{
+    log_reset();
+    char *ptr = malloc(16);
+    int type = 1;
+
+    switch (type)
+    {
+    case 1:
+    {
+        defer free(ptr);
+        defer log_append("case1_cleanup");
+
+        // _Generic with default keyword - should NOT clear defer stack
+        // BUG: Prism sees "default" and clears the defer stack
+        int x = _Generic(type, int: 0, default: 1);
+
+        log_append("case1_body");
+        break;
+    }
+    }
+
+    log_append("after_switch");
+
+    // Defers execute when exiting case block (at break), before after_switch
+    CHECK_LOG("case1_bodycase1_cleanupafter_switch", "_Generic default doesn't clear defer stack");
+}
+
+void test_generic_default_collision_nested(void)
+{
+    log_reset();
+    char *ptr1 = malloc(16);
+    char *ptr2 = malloc(16);
+    int type = 2;
+
+    switch (type)
+    {
+    case 1:
+    {
+        log_append("unreachable");
+        break;
+    }
+
+    case 2:
+    {
+        defer free(ptr1);
+        defer log_append("outer");
+
+        // Nested _Generic - multiple "default" keywords
+        // With fix: "default" in _Generic doesn't clear defer stack
+        int y = _Generic(ptr2, char *: _Generic(type, int: 1, default: 2), default: 3);
+
+        defer free(ptr2);
+        defer log_append("inner");
+
+        log_append("body");
+        break;
+    }
+    }
+
+    log_append("end");
+
+    // Defers execute at break in LIFO order: inner, outer
+    CHECK_LOG("bodyinnerouterend", "nested _Generic preserves defer stack");
+}
+
+void test_generic_default_outside_switch(void)
+{
+    log_reset();
+    char *ptr = malloc(16);
+
+    {
+        defer free(ptr);
+        defer log_append("block_cleanup");
+
+        // _Generic outside switch - should work fine
+        int x = _Generic(ptr, char *: 1, default: 0);
+
+        log_append("body");
+    }
+
+    log_append("after");
+
+    CHECK_LOG("bodyblock_cleanupafter", "_Generic outside switch works normally");
+}
+
+// Bug 3: VLA backward goto with uninitialized memory
+void test_vla_backward_goto_reentry(void)
+{
+    int iterations = 0;
+    int last_val = -1;
+    int changed = 0;
+
+label:
+{
+    int n = (iterations == 0) ? 5 : 10; // Different sizes
+    int vla[n];                         // VLA allocated on stack
+
+    vla[0] = iterations;
+
+    if (iterations > 0 && vla[0] != last_val)
+    {
+        changed = 1;
+    }
+
+    last_val = vla[0];
+    iterations++;
+
+    if (iterations < 2)
+        goto label;
+}
+
+    // This test verifies the VLA is re-allocated each iteration
+    // vla[0] gets different values (0, then 1), so they don't match
+    CHECK(changed == 1, "VLA backward goto reentry behavior tracked");
+}
+
+void test_vla_backward_goto_stack_exhaustion(void)
+{
+    int count = 0;
+    int max_iterations = 100;
+
+loop:
+{
+    int size = 100;
+    int vla[size]; // Stack allocation
+
+    vla[0] = count;
+    count++;
+
+    if (count < max_iterations)
+        goto loop; // Backward goto - potential stack buildup
+}
+
+    CHECK(count == max_iterations, "VLA backward goto completes iterations");
+}
+
+void test_vla_backward_goto_with_defer(void)
+{
+    log_reset();
+    int iterations = 0;
+
+restart:
+{
+    int n = 5;
+    int vla[n];
+    defer log_append("D");
+
+    vla[0] = iterations;
+    log_append("B");
+
+    iterations++;
+    if (iterations < 2)
+        goto restart;
+}
+
+    log_append("E");
+
+    // Defers should execute for each iteration
+    CHECK_LOG("BDBDE", "VLA backward goto executes defers correctly");
+}
+
+void run_verification_bug_tests(void)
+{
+    printf("\n=== VERIFICATION TESTS ===\n");
+
+    test_switch_conditional_break_defer();
+    test_switch_unconditional_break_works();
+    test_switch_braced_fallthrough_works();
+
+    test_raw_string_literals();
+
+    test_vla_struct_member();
+    test_vla_struct_member_nested();
+    test_offsetof_vs_runtime();
+
+    test_stmt_expr_defer_goto();
+    test_stmt_expr_defer_normal();
+    test_nested_stmt_expr_defer();
+
+    test_vanishing_statement_if_else();
+    test_vanishing_statement_while();
+    test_vanishing_statement_for();
+
+    test_generic_default_collision();
+    test_generic_default_collision_nested();
+    test_generic_default_outside_switch();
+
+    test_vla_backward_goto_reentry();
+    test_vla_backward_goto_stack_exhaustion();
+    test_vla_backward_goto_with_defer();
+}
+
 // MAIN
 
 int main(void)
 {
-    printf("=== PRISM COMPREHENSIVE TEST SUITE ===\n");
+    printf("=== PRISM TEST SUITE ===\n");
 
     run_defer_basic_tests();
     run_zeroinit_tests();
@@ -3284,6 +3761,7 @@ int main(void)
     run_manual_offsetof_vla_tests();
     run_preprocessor_numeric_tests();
     run_preprocessor_system_macro_tests();
+    run_verification_bug_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

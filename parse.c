@@ -8,7 +8,6 @@
 // Usage: Run "cc -E -P input.c" first, then tokenize the output.
 
 #define _POSIX_C_SOURCE 200809L
-#define _GNU_SOURCE
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>

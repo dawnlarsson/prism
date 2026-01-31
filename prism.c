@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.88.0"
+#define PRISM_VERSION "0.89.0"
 
 #include "parse.c"
 
@@ -121,6 +121,7 @@ typedef struct
   bool is_loop;          // true if this scope is a for/while/do loop
   bool is_switch;        // true if this scope is a switch statement
   bool had_control_exit; // true if break/return/goto/continue seen since last defer in switch
+  bool is_conditional;   // true if this scope is an if/while/for block (for tracking conditional control exits)
 } DeferScope;
 
 typedef struct
@@ -169,10 +170,12 @@ static char *pending_temp_file = NULL;
 // Track pending loop/switch for next scope
 static bool next_scope_is_loop = false;
 static bool next_scope_is_switch = false;
-static bool pending_control_flow = false; // True after if/else/for/while/do/switch until we see { or ;
-static int control_paren_depth = 0;       // Track parens to distinguish for(;;) from braceless body
-static bool in_for_init = false;          // True when inside the init clause of a for loop (before first ;)
-static bool pending_for_paren = false;    // True after seeing 'for', waiting for '(' to start init clause
+static bool next_scope_is_conditional = false; // True for if/while/for blocks (not switch or regular blocks)
+static bool pending_control_flow = false;      // True after if/else/for/while/do/switch until we see { or ;
+static int control_paren_depth = 0;            // Track parens to distinguish for(;;) from braceless body
+static bool in_for_init = false;               // True when inside the init clause of a for loop (before first ;)
+static bool pending_for_paren = false;         // True after seeing 'for', waiting for '(' to start init clause
+static int conditional_block_depth = 0;        // Track nesting depth of if/while/for blocks to detect conditional control exits
 
 static LabelTable label_table;
 static bool current_func_returns_void = false;
@@ -470,6 +473,7 @@ static void end_statement_after_semicolon(void)
     pending_control_flow = false;
     next_scope_is_loop = false;
     next_scope_is_switch = false;
+    next_scope_is_conditional = false;
   }
 }
 
@@ -494,6 +498,7 @@ static void defer_stack_ensure_capacity(int n)
     new_stack[i].capacity = 0;
     new_stack[i].is_loop = false;
     new_stack[i].is_switch = false;
+    new_stack[i].is_conditional = false;
     new_stack[i].had_control_exit = false;
   }
   defer_stack = new_stack;
@@ -506,16 +511,24 @@ static void defer_push_scope(void)
   defer_stack[defer_depth].count = 0;
   defer_stack[defer_depth].is_loop = next_scope_is_loop;
   defer_stack[defer_depth].is_switch = next_scope_is_switch;
+  defer_stack[defer_depth].is_conditional = next_scope_is_conditional;
   defer_stack[defer_depth].had_control_exit = false;
+  if (next_scope_is_conditional)
+    conditional_block_depth++;
   next_scope_is_loop = false;
   next_scope_is_switch = false;
+  next_scope_is_conditional = false;
   defer_depth++;
 }
 
 static void defer_pop_scope(void)
 {
   if (defer_depth > 0)
+  {
     defer_depth--;
+    if (defer_stack[defer_depth].is_conditional)
+      conditional_block_depth--;
+  }
 }
 
 // Ensure a DeferScope has capacity for at least n defers
@@ -562,8 +575,16 @@ static void defer_add(Token *defer_keyword, Token *start, Token *end)
 
 // Mark that control flow exited (break/return/goto) in the innermost switch scope
 // This tells us that defers were properly executed before the case ended
+// Only mark if the exit is unconditional (not inside an if/while/for block)
 static void mark_switch_control_exit(void)
 {
+  // Only mark as definite control exit if not inside a conditional context
+  // If inside if/while/for (even braceless), the control exit might not be taken at runtime
+  // pending_control_flow is true for braceless: "if (x) break;"
+  // conditional_block_depth > 0 for braced: "if (x) { break; }"
+  if (pending_control_flow || conditional_block_depth > 0)
+    return;
+
   for (int d = defer_depth - 1; d >= 0; d--)
   {
     if (!defer_stack[d].is_switch)
@@ -3242,10 +3263,12 @@ static int transpile(char *input_file, char *output_file)
   last_system_header = false;
   next_scope_is_loop = false;
   next_scope_is_switch = false;
+  next_scope_is_conditional = false;
   pending_control_flow = false;
   control_paren_depth = 0;
   in_for_init = false;
   pending_for_paren = false;
+  conditional_block_depth = 0;
   current_func_returns_void = false;
   stmt_expr_count = 0;
   at_stmt_start = true;  // Start of file is start of statement
@@ -3316,9 +3339,8 @@ static int transpile(char *input_file, char *output_file)
       if (pending_control_flow && control_paren_depth > 0)
         error_tok(tok, "defer cannot appear inside control statement parentheses");
 
-      // Check for braceless control flow - defer needs a proper scope
-      if (pending_control_flow)
-        error_tok(tok, "defer cannot be the body of a braceless control statement - add braces");
+      // Track if we're in braceless control flow - we'll need to emit a placeholder
+      bool in_braceless_control = pending_control_flow;
 
       // Check for defer at the top-level of a statement expression - semantics are problematic
       // In ({ defer X; expr; }), the defer would execute after expr, making the result void
@@ -3423,6 +3445,12 @@ static int transpile(char *input_file, char *output_file)
       else
         tok = stmt_end;
       end_statement_after_semicolon();
+
+      // If this defer was in a braceless control flow body, emit a semicolon placeholder
+      // to prevent syntax errors like: if (x) defer foo(); -> if (x) /* nothing */
+      if (in_braceless_control)
+        out_str(";", 1);
+
       continue;
     }
 
@@ -3669,7 +3697,24 @@ static int transpile(char *input_file, char *output_file)
     // Handle case/default labels - clear defers from switch scope
     // This prevents defers from leaking across cases (which would cause incorrect behavior
     // since the transpiler can't know which case is entered at runtime)
-    if (feature_defer && tok->kind == TK_KEYWORD && (equal(tok, "case") || equal(tok, "default")))
+    // IMPORTANT: Only treat "default" as a switch label if NOT preceded by comma
+    // This prevents false positives from _Generic: _Generic(x, int: 1, default: 2)
+    // In _Generic, "default" is preceded by ",", but switch "default:" is preceded by other tokens
+    bool is_switch_label = false;
+    if (feature_defer && tok->kind == TK_KEYWORD)
+    {
+      if (equal(tok, "case"))
+        is_switch_label = true;
+      else if (equal(tok, "default") && tok->next && equal(tok->next, ":"))
+      {
+        // "default" followed by ":" - could be switch label or _Generic
+        // Check if preceded by comma (indicates _Generic expression)
+        if (!last_emitted || !equal(last_emitted, ","))
+          is_switch_label = true;
+      }
+    }
+
+    if (is_switch_label)
     {
       // Check if there are active defers that would be lost (fallthrough scenario)
       // Must check ALL scopes from current depth down to the switch scope,
@@ -3780,6 +3825,11 @@ static int transpile(char *input_file, char *output_file)
     // Handle '{' - push scope
     if (equal(tok, "{"))
     {
+      // Track if we're entering a conditional block (if/while/for) for accurate control exit detection
+      // Switch blocks are not conditional in the same sense (we always enter one case)
+      if (pending_control_flow && !next_scope_is_switch)
+        next_scope_is_conditional = true;
+
       pending_control_flow = false; // Proper braces found
       control_paren_depth = 0;      // Reset paren tracking (no longer in control expression)
       // Check if this is a statement expression: ({ ... })
@@ -3883,6 +3933,7 @@ static int transpile(char *input_file, char *output_file)
         pending_control_flow = false;
         next_scope_is_loop = false;
         next_scope_is_switch = false;
+        next_scope_is_conditional = false;
         in_for_init = false;
         pending_for_paren = false;
       }

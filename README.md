@@ -1,6 +1,6 @@
 ![prism_banner](https://github.com/user-attachments/assets/97c303d0-0d85-4262-8fb3-663a33ce00cd)
 
-### **Robust C by default. (Unstable refactoring)**
+### **Robust C by default. (Unstable pre 0.100.0 stable)**
 
 Prism is a lightweight, self-contained transpiler that brings modern language features to standard C. It functions as a build tool with zero dependencies, allowing you to write safer code without the overhead of complex build systems or heavy frameworks, or macro hacks.
 
@@ -103,7 +103,7 @@ skip:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v0.85.0 - Robust C transpiler
+Prism v0.89.0 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 
