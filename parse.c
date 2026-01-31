@@ -693,11 +693,51 @@ static int64_t read_int_literal(char **pp, int base)
     return val;
 }
 
+// Check for C23 extended float suffix (F128, F64, F32, F16, BF16)
+static bool has_extended_float_suffix(char *p, int len)
+{
+    if (len < 3)
+        return false;
+    char *end = p + len;
+
+    // Check for BF16/bf16
+    if (len >= 4 && (end[-4] == 'B' || end[-4] == 'b') &&
+        (end[-3] == 'F' || end[-3] == 'f') && end[-2] == '1' && end[-1] == '6')
+        return true;
+
+    // Check for F128/f128
+    if (len >= 4 && (end[-4] == 'F' || end[-4] == 'f') &&
+        end[-3] == '1' && end[-2] == '2' && end[-1] == '8')
+        return true;
+
+    // Check for F64/f64, F32/f32, F16/f16
+    if ((end[-3] == 'F' || end[-3] == 'f') &&
+        (end[-2] == '6' || end[-2] == '3' || end[-2] == '1') &&
+        (end[-1] == '4' || end[-1] == '2' || end[-1] == '6'))
+    {
+        // Verify valid combinations: F64, F32, F16
+        if ((end[-2] == '6' && end[-1] == '4') ||
+            (end[-2] == '3' && end[-1] == '2') ||
+            (end[-2] == '1' && end[-1] == '6'))
+            return true;
+    }
+    return false;
+}
+
 static void convert_pp_number(Token *tok)
 {
     char *p = tok->loc;
     bool is_hex = (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'));
     bool is_bin = (p[0] == '0' && (p[1] == 'b' || p[1] == 'B'));
+
+    // Check for C23 extended float suffixes first
+    if (has_extended_float_suffix(p, tok->len))
+    {
+        tok->kind = TK_NUM;
+        tok->flags |= TF_IS_FLOAT;
+        tok->val.i64 = 0;
+        return;
+    }
 
     // Check for float
     if (!is_bin)

@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.85.0"
+#define PRISM_VERSION "0.86.0"
 
 #include "parse.c"
 
@@ -661,6 +661,53 @@ static bool tok_list_contains_ident(Token *tok, const char *name)
   return false;
 }
 
+// Check for C23 extended float suffix and return info for normalization
+// Returns: suffix length to strip (0 if no extended suffix)
+// Sets *replacement to the standard suffix to use (NULL for none, "f" for float, "L" for long double)
+static int get_extended_float_suffix(const char *p, int len, const char **replacement)
+{
+  *replacement = NULL;
+  if (len < 3)
+    return 0;
+  const char *end = p + len;
+
+  // Check for BF16/bf16 (4 chars) - no standard equivalent
+  if (len >= 4 && (end[-4] == 'B' || end[-4] == 'b') &&
+      (end[-3] == 'F' || end[-3] == 'f') && end[-2] == '1' && end[-1] == '6')
+  {
+    *replacement = "f"; // Use float as closest approximation
+    return 4;
+  }
+
+  // Check for F128/f128 (4 chars) - use long double
+  if (len >= 4 && (end[-4] == 'F' || end[-4] == 'f') &&
+      end[-3] == '1' && end[-2] == '2' && end[-1] == '8')
+  {
+    *replacement = "L";
+    return 4;
+  }
+
+  // Check for F64/f64 (3 chars) - double is default, no suffix needed
+  if ((end[-3] == 'F' || end[-3] == 'f') && end[-2] == '6' && end[-1] == '4')
+    return 3;
+
+  // Check for F32/f32 (3 chars) - use float
+  if ((end[-3] == 'F' || end[-3] == 'f') && end[-2] == '3' && end[-1] == '2')
+  {
+    *replacement = "f";
+    return 3;
+  }
+
+  // Check for F16/f16 (3 chars) - no standard equivalent
+  if ((end[-3] == 'F' || end[-3] == 'f') && end[-2] == '1' && end[-1] == '6')
+  {
+    *replacement = "f"; // Use float as closest approximation
+    return 3;
+  }
+
+  return 0;
+}
+
 // Emit a single token with appropriate spacing
 static void emit_tok(Token *tok)
 {
@@ -719,6 +766,21 @@ static void emit_tok(Token *tok)
     else if (needs_space(last_emitted, tok))
     {
       out_char(' ');
+    }
+  }
+
+  // Handle C23 extended float suffixes (F128, F64, F32, F16, BF16)
+  if (tok->kind == TK_NUM && (tok->flags & TF_IS_FLOAT))
+  {
+    const char *replacement;
+    int suffix_len = get_extended_float_suffix(tok->loc, tok->len, &replacement);
+    if (suffix_len > 0)
+    {
+      out_str(tok->loc, tok->len - suffix_len);
+      if (replacement)
+        out_str(replacement, strlen(replacement));
+      last_emitted = tok;
+      return;
     }
   }
 
