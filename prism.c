@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.84.0"
+#define PRISM_VERSION "0.85.0"
 
 #include "parse.c"
 
@@ -4728,9 +4728,9 @@ static Cli cli_parse(int argc, char **argv)
     // ─── Everything else: pass through to CC ───
     // Also track flags that affect macro/include path discovery
     if (strncmp(arg, "-std=", 5) == 0 ||
-        strncmp(arg, "-m", 2) == 0 ||      // -m32, -m64, -march=, -mtune=, etc.
+        strncmp(arg, "-m", 2) == 0 || // -m32, -m64, -march=, -mtune=, etc.
         strncmp(arg, "--target=", 9) == 0 ||
-        strcmp(arg, "-pthread") == 0 ||    // pthread flags affect preprocessor macros
+        strcmp(arg, "-pthread") == 0 || // pthread flags affect preprocessor macros
         strcmp(arg, "-pthreads") == 0 ||
         strcmp(arg, "-mthreads") == 0 ||
         strcmp(arg, "-mt") == 0 ||
