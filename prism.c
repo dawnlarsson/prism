@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.86.0"
+#define PRISM_VERSION "0.87.0"
 
 #include "parse.c"
 
@@ -1864,10 +1864,138 @@ static Token *scan_typedef_name(Token **tokp)
   return NULL;
 }
 
-// Forward declaration for is_const_array_size (used by struct_body_contains_vla and typedef_contains_vla)
+// Forward declarations (used by struct_body_contains_vla and is_true_vla_array_size)
 static bool is_const_array_size(Token *open_bracket);
+static bool has_manual_offsetof_pattern(Token *start, Token *end);
+static bool looks_like_system_typedef(Token *tok);
 
-// Check if a struct/union body contains any VLA arrays
+// Check if array dimension contains a true VLA (variable in dimension).
+// Unlike is_const_array_size, this DOES accept manual offsetof patterns as constant,
+// since they compile fine on all compilers - they're just treated specially for zero-init.
+static bool is_true_vla_array_size(Token *open_bracket)
+{
+  Token *tok = open_bracket->next;
+  int depth = 1;
+  bool is_empty = true;
+
+  // Find closing bracket
+  Token *close_bracket = NULL;
+  {
+    Token *t = open_bracket->next;
+    int d = 1;
+    while (t && t->kind != TK_EOF && d > 0)
+    {
+      if (equal(t, "["))
+        d++;
+      else if (equal(t, "]"))
+      {
+        d--;
+        if (d == 0)
+          close_bracket = t;
+      }
+      t = t->next;
+    }
+  }
+
+  // Check for manual offsetof pattern - these are actually constant, just treated specially
+  // Note: We DON'T return true here (unlike is_const_array_size) because it's not a true VLA
+  if (close_bracket && has_manual_offsetof_pattern(open_bracket->next, close_bracket))
+    return false; // Manual offsetof is constant, not a true VLA
+
+  bool prev_was_member_access = false;
+  while (tok->kind != TK_EOF && depth > 0)
+  {
+    if (equal(tok, "["))
+      depth++;
+    else if (equal(tok, "]"))
+      depth--;
+    else
+    {
+      is_empty = false;
+      // Skip sizeof, alignof, offsetof, __builtin_offsetof - all constant
+      if (equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof") ||
+          equal(tok, "offsetof") || equal(tok, "__builtin_offsetof"))
+      {
+        tok = tok->next;
+        if (tok && equal(tok, "("))
+        {
+          int paren_depth = 1;
+          tok = tok->next;
+          while (tok->kind != TK_EOF && paren_depth > 0)
+          {
+            if (equal(tok, "("))
+              paren_depth++;
+            else if (equal(tok, ")"))
+              paren_depth--;
+            tok = tok->next;
+          }
+        }
+        prev_was_member_access = false;
+        continue;
+      }
+
+      if (equal(tok, "->") || equal(tok, "."))
+      {
+        prev_was_member_access = true;
+        tok = tok->next;
+        continue;
+      }
+
+      // Check for identifiers that are NOT constants
+      if (tok->kind != TK_NUM &&
+          !equal(tok, "+") && !equal(tok, "-") && !equal(tok, "*") &&
+          !equal(tok, "/") && !equal(tok, "%") && !equal(tok, "(") && !equal(tok, ")") &&
+          !equal(tok, "<<") && !equal(tok, ">>") && !equal(tok, "&") &&
+          !equal(tok, "|") && !equal(tok, "^") && !equal(tok, "~") &&
+          !equal(tok, "!") && !equal(tok, "<") && !equal(tok, ">") &&
+          !equal(tok, "<=") && !equal(tok, ">=") && !equal(tok, "==") &&
+          !equal(tok, "!=") && !equal(tok, "&&") && !equal(tok, "||") &&
+          !equal(tok, "?") && !equal(tok, ":"))
+      {
+        if (tok->kind == TK_IDENT && !prev_was_member_access &&
+            !is_known_enum_const(tok) && !is_known_typedef(tok) &&
+            !is_type_keyword(tok) && !looks_like_system_typedef(tok))
+        {
+          return true; // Found a variable - this is a true VLA
+        }
+      }
+      prev_was_member_access = false;
+    }
+    tok = tok->next;
+  }
+  return false; // No variables found - constant size
+}
+
+// Check if a struct/union body contains any true VLA arrays (not just patterns
+// that look like VLAs for zero-init purposes, but actual variable-length arrays)
+// Scans from the opening { to the closing }
+static bool struct_body_contains_true_vla(Token *open_brace)
+{
+  if (!open_brace || !equal(open_brace, "{"))
+    return false;
+
+  Token *tok = open_brace->next;
+  int depth = 1;
+
+  while (tok && tok->kind != TK_EOF && depth > 0)
+  {
+    if (equal(tok, "{"))
+      depth++;
+    else if (equal(tok, "}"))
+      depth--;
+    else if (equal(tok, "[") && depth > 0)
+    {
+      // Found an array dimension at any level within the struct/union
+      if (is_true_vla_array_size(tok))
+        return true;
+    }
+    tok = tok->next;
+  }
+  return false;
+}
+
+// Check if a struct/union body contains any VLA-like arrays (for zero-init purposes)
+// This is more conservative than struct_body_contains_true_vla
 // Scans from the opening { to the closing }
 static bool struct_body_contains_vla(Token *open_brace)
 {
@@ -2165,8 +2293,10 @@ static bool is_const_array_size(Token *open_bracket)
       // sizeof and _Alignof/alignof always produce compile-time constants,
       // regardless of their argument (type name or expression).
       // offsetof(type, member) also produces a compile-time constant.
+      // __builtin_offsetof is what offsetof expands to after preprocessing.
       // Skip their parenthesized argument entirely.
-      if (equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof") || equal(tok, "offsetof"))
+      if (equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof") ||
+          equal(tok, "offsetof") || equal(tok, "__builtin_offsetof"))
       {
         tok = tok->next;
         if (tok && equal(tok, "("))
@@ -2289,9 +2419,9 @@ static Token *try_zero_init_decl(Token *tok)
       // Could have { body } - check for VLA members before skipping
       if (equal(tok, "{"))
       {
-        if (struct_body_contains_vla(tok))
+        if (struct_body_contains_true_vla(tok))
         {
-          is_typedef_vla = true; // Treat struct/union with VLA member like VLA typedef
+          error_tok(tok, "variable length array in struct/union is not supported");
         }
         tok = skip_balanced(tok, "{", "}");
       }
