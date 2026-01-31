@@ -45,6 +45,10 @@ typedef struct
     int line_delta;
     int *line_offsets;
     int line_count;
+    bool owns_contents;
+    bool owns_line_offsets;
+    bool is_system;
+    bool is_include_entry; // True if inside a system #include chain (not just macro expansion)
 } File;
 
 // Token types
@@ -284,6 +288,7 @@ static void hashmap_clear(HashMap *map)
 static File *current_file;
 static File **input_files;
 static int input_file_count;
+static int input_file_capacity;
 static bool at_bol;
 static bool has_space;
 
@@ -291,9 +296,9 @@ static void free_file(File *f)
 {
     if (!f)
         return;
-    if (f->contents)
+    if (f->contents && f->owns_contents)
         free(f->contents);
-    if (f->line_offsets)
+    if (f->line_offsets && f->owns_line_offsets)
         free(f->line_offsets);
     if (f->name)
         free(f->name);
@@ -326,7 +331,7 @@ static int tok_line_no(Token *tok)
         else
             hi = mid - 1;
     }
-    return lo + 1;
+    return lo + 1 + f->line_delta;
 }
 
 // Error handling
@@ -749,6 +754,10 @@ static File *new_file(char *name, int file_no, char *contents)
     file->display_name = file->name;
     file->file_no = file_no;
     file->contents = contents;
+    file->line_delta = 0;
+    file->owns_contents = true;
+    file->owns_line_offsets = true;
+    file->is_system = false;
 
     // Build line offset table
     int line_count = 1;
@@ -767,8 +776,42 @@ static File *new_file(char *name, int file_no, char *contents)
     return file;
 }
 
+static void add_input_file(File *file)
+{
+    if (input_file_count >= input_file_capacity)
+    {
+        int new_cap = input_file_capacity == 0 ? 16 : input_file_capacity * 2;
+        File **new_files = realloc(input_files, sizeof(File *) * new_cap);
+        if (!new_files)
+            error("out of memory");
+        input_files = new_files;
+        input_file_capacity = new_cap;
+    }
+    input_files[input_file_count++] = file;
+}
+
+static File *new_file_view(const char *name, File *base, int line_delta, bool is_system, bool is_include_entry)
+{
+    File *file = calloc(1, sizeof(File));
+    if (!file)
+        error("out of memory");
+    file->name = strdup(name ? name : base->name);
+    file->display_name = file->name;
+    file->file_no = input_file_count;
+    file->contents = base->contents;
+    file->line_offsets = base->line_offsets;
+    file->line_count = base->line_count;
+    file->line_delta = line_delta;
+    file->owns_contents = false;
+    file->owns_line_offsets = false;
+    file->is_system = is_system;
+    file->is_include_entry = is_include_entry;
+    return file;
+}
+
 static Token *tokenize(File *file)
 {
+    File *base_file = file;
     current_file = file;
     char *p = file->contents;
 
@@ -776,9 +819,120 @@ static Token *tokenize(File *file)
     Token *cur = &head;
     at_bol = true;
     has_space = false;
+    int line_no = 1;
+
+    // Track if we're inside a system header include chain
+    // This persists across nested includes until we return to user code
+    static bool in_system_include = false;
+    in_system_include = false; // Reset for each new file
 
     while (*p)
     {
+        // Preprocessor directives (#line markers from -E output)
+        if (at_bol && *p == '#')
+        {
+            int directive_line = line_no;
+            p++; // skip '#'
+            while (*p == ' ' || *p == '\t')
+                p++;
+
+            // Parse optional "line" keyword
+            if (!strncmp(p, "line", 4) && (p[4] == ' ' || p[4] == '\t'))
+            {
+                p += 4;
+                while (*p == ' ' || *p == '\t')
+                    p++;
+            }
+
+            // Parse line number
+            if (isdigit(*p))
+            {
+                long new_line = 0;
+                while (isdigit(*p))
+                {
+                    new_line = new_line * 10 + (*p - '0');
+                    p++;
+                }
+                while (*p == ' ' || *p == '\t')
+                    p++;
+
+                // Parse optional filename in quotes
+                char *filename = NULL;
+                if (*p == '"')
+                {
+                    p++;
+                    char *start = p;
+                    while (*p && *p != '"')
+                    {
+                        if (*p == '\\' && p[1])
+                            p++;
+                        p++;
+                    }
+                    int len = p - start;
+                    filename = malloc(len + 1);
+                    if (!filename)
+                        error("out of memory");
+                    memcpy(filename, start, len);
+                    filename[len] = '\0';
+                    if (*p == '"')
+                        p++;
+                }
+
+                // Parse flags (numbers after filename)
+                bool is_system = false;
+                bool is_entering = false;  // flag 1: entering new file
+                bool is_returning = false; // flag 2: returning from include
+                while (*p == ' ' || *p == '\t')
+                    p++;
+                while (isdigit(*p))
+                {
+                    int flag = 0;
+                    while (isdigit(*p))
+                    {
+                        flag = flag * 10 + (*p - '0');
+                        p++;
+                    }
+                    if (flag == 1)
+                        is_entering = true;
+                    if (flag == 2)
+                        is_returning = true;
+                    if (flag == 3)
+                        is_system = true;
+                    while (*p == ' ' || *p == '\t')
+                        p++;
+                }
+
+                // Track system include state:
+                // - Enter system include when flag 1 + flag 3 (entering a system header)
+                // - Leave system include when flag 2 without flag 3 (returning to user code)
+                if (is_entering && is_system)
+                    in_system_include = true;
+                else if (is_returning && !is_system)
+                    in_system_include = false;
+
+                int line_delta = (int)new_line - (directive_line + 1);
+                File *view = new_file_view(filename ? filename : current_file->name,
+                                           base_file, line_delta, is_system, in_system_include);
+                add_input_file(view);
+                current_file = view;
+
+                if (filename)
+                    free(filename);
+            }
+
+            // Skip to end of directive line
+            while (*p && *p != '\n')
+                p++;
+            if (*p == '\n')
+            {
+                p++;
+                line_no++;
+                at_bol = true;
+                has_space = false;
+            }
+            continue;
+        }
+
         // Line comment
         if (p[0] == '/' && p[1] == '/')
         {
@@ -797,6 +951,7 @@ static Token *tokenize(File *file)
         if (*p == '\n')
         {
             p++;
+            line_no++;
             at_bol = true;
             has_space = false;
             continue;
@@ -909,13 +1064,8 @@ Token *tokenize_file(char *path)
     buf[size] = '\0';
     fclose(fp);
 
-    // Add to input_files array
-    File **new_files = realloc(input_files, sizeof(File *) * (input_file_count + 1));
-    if (!new_files)
-        error("out of memory");
-    input_files = new_files;
     File *file = new_file(path, input_file_count, buf);
-    input_files[input_file_count++] = file;
+    add_input_file(file);
 
     return tokenize(file);
 }
@@ -929,5 +1079,6 @@ void tokenizer_reset(void)
     free(input_files);
     input_files = NULL;
     input_file_count = 0;
+    input_file_capacity = 0;
     current_file = NULL;
 }

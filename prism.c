@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.83.0"
+#define PRISM_VERSION "0.84.0"
 
 #include "parse.c"
 
@@ -10,7 +10,8 @@ typedef struct
   bool defer;
   bool zeroinit;
   bool line_directives;
-  bool warn_safety; // If true, safety checks warn instead of error
+  bool warn_safety;     // If true, safety checks warn instead of error
+  bool flatten_headers; // If true, include flattened system headers (default: true)
 } PrismFeatures;
 
 typedef enum
@@ -33,7 +34,7 @@ typedef struct
 
 static PrismFeatures prism_defaults(void)
 {
-  return (PrismFeatures){.defer = true, .zeroinit = true, .line_directives = true, .warn_safety = false};
+  return (PrismFeatures){.defer = true, .zeroinit = true, .line_directives = true, .warn_safety = false, .flatten_headers = true};
 }
 
 // Forward declarations for library API
@@ -84,7 +85,8 @@ static void prism_free(PrismResult *r);
 // Internal feature flags (set from PrismFeatures before transpile)
 static bool feature_defer = true;
 static bool feature_zeroinit = true;
-static bool feature_warn_safety = false; // If true, safety checks warn instead of error
+static bool feature_warn_safety = false;    // If true, safety checks warn instead of error
+static bool feature_flatten_headers = true; // If true, include flattened system header content
 
 // Hash set for type keywords (initialized once)
 static HashMap type_keyword_map;
@@ -199,6 +201,7 @@ typedef struct
 
 static OutputBuffer out_buf = {0};
 static Token *last_emitted = NULL;
+static bool last_system_header = false;
 
 static void out_init(FILE *fp)
 {
@@ -311,6 +314,143 @@ __attribute__((format(printf, 1, 2))) static void out_printf(const char *fmt, ..
 static int last_line_no = 0;
 static char *last_filename = NULL;
 static bool emit_line_directives = true; // Can be disabled with no-line-directives flag
+
+// System header tracking (for non-flattened output)
+static HashMap system_includes;    // Tracks unique system headers to emit
+static char **system_include_list; // Ordered list of includes
+static int system_include_count = 0;
+static int system_include_capacity = 0;
+
+// Extract include path from full system header path
+// /usr/include/stdio.h -> stdio.h
+// /usr/include/sys/types.h -> sys/types.h
+// /usr/include/x86_64-linux-gnu/sys/stat.h -> sys/stat.h
+// Returns NULL if header shouldn't be exposed as a public include
+static char *path_to_include(const char *fullpath)
+{
+  if (!fullpath)
+    return NULL;
+
+  // Find "/include/" in path
+  const char *inc = strstr(fullpath, "/include/");
+  if (!inc)
+    return NULL;
+
+  const char *relpath = inc + 9; // strlen("/include/")
+
+  // Skip architecture-specific prefix but keep standard subdirs
+  // e.g., x86_64-linux-gnu/sys/stat.h -> sys/stat.h
+  const char *arch_prefixes[] = {
+      "x86_64-linux-gnu/", "aarch64-linux-gnu/",
+      "arm-linux-gnueabihf/", "i386-linux-gnu/", NULL};
+  for (const char **prefix = arch_prefixes; *prefix; prefix++)
+  {
+    size_t len = strlen(*prefix);
+    if (strncmp(relpath, *prefix, len) == 0)
+    {
+      relpath += len;
+      break;
+    }
+  }
+
+  // Skip internal/implementation headers that users shouldn't include directly
+  if (strncmp(relpath, "bits/", 5) == 0 ||
+      strncmp(relpath, "asm/", 4) == 0 ||
+      strncmp(relpath, "asm-generic/", 12) == 0 ||
+      strncmp(relpath, "linux/", 6) == 0 || // kernel headers pulled in transitively
+      strstr(relpath, "/bits/") != NULL ||
+      // Internal feature test and predef headers
+      strcmp(relpath, "stdc-predef.h") == 0 ||
+      strcmp(relpath, "features.h") == 0 ||
+      strcmp(relpath, "features-time64.h") == 0 ||
+      // Other internal headers that are included indirectly
+      strcmp(relpath, "alloca.h") == 0 ||
+      strcmp(relpath, "endian.h") == 0 ||
+      // GNU-specific internal headers
+      strncmp(relpath, "gnu/", 4) == 0)
+    return NULL;
+
+  return strdup(relpath);
+}
+
+// Record a system header for later emission
+static void record_system_include(const char *path)
+{
+  char *inc = path_to_include(path);
+  if (!inc)
+    return;
+
+  // Check if already recorded (using hashmap for O(1) lookup)
+  if (hashmap_get2(&system_includes, inc, strlen(inc)))
+  {
+    free(inc);
+    return;
+  }
+
+  // Add to hashmap
+  hashmap_put(&system_includes, inc, (void *)1);
+
+  // Add to ordered list
+  if (system_include_count >= system_include_capacity)
+  {
+    int new_cap = system_include_capacity == 0 ? 32 : system_include_capacity * 2;
+    char **new_list = realloc(system_include_list, sizeof(char *) * new_cap);
+    if (!new_list)
+    {
+      free(inc);
+      return;
+    }
+    system_include_list = new_list;
+    system_include_capacity = new_cap;
+  }
+  system_include_list[system_include_count++] = inc;
+}
+
+// Collect system headers by detecting actual #include entries (not macro expansions)
+static void collect_system_includes(void)
+{
+  for (int i = 0; i < input_file_count; i++)
+  {
+    File *f = input_files[i];
+    // Only record headers that were actually #included (is_include_entry=true)
+    // Skip macro expansion sources (is_include_entry=false)
+    if (f->is_system && f->is_include_entry)
+      record_system_include(f->name);
+  }
+}
+
+// Emit collected #include directives with necessary feature test macros
+static void emit_system_includes(void)
+{
+  if (system_include_count == 0)
+    return;
+
+  // Emit feature test macros that prism uses during preprocessing
+  // These must come before any system includes to enable GNU/POSIX extensions
+  out_printf("#ifndef _POSIX_C_SOURCE\n");
+  out_printf("#define _POSIX_C_SOURCE 200809L\n");
+  out_printf("#endif\n");
+  out_printf("#ifndef _GNU_SOURCE\n");
+  out_printf("#define _GNU_SOURCE\n");
+  out_printf("#endif\n\n");
+
+  for (int i = 0; i < system_include_count; i++)
+    out_printf("#include <%s>\n", system_include_list[i]);
+  if (system_include_count > 0)
+    out_char('\n');
+}
+
+// Reset system include tracking
+static void system_includes_reset(void)
+{
+  hashmap_clear(&system_includes);
+  for (int i = 0; i < system_include_count; i++)
+    free(system_include_list[i]);
+  free(system_include_list);
+  system_include_list = NULL;
+  system_include_count = 0;
+  system_include_capacity = 0;
+}
 
 static void cleanup_temp_file(void)
 {
@@ -524,10 +664,15 @@ static bool tok_list_contains_ident(Token *tok, const char *name)
 // Emit a single token with appropriate spacing
 static void emit_tok(Token *tok)
 {
+  // Skip system header include content when not flattening
+  // But keep macro expansions (is_include_entry=false means it's a macro, not an include)
+  File *f = tok_file(tok);
+  if (!feature_flatten_headers && f && f->is_system && f->is_include_entry)
+    return;
+
   // Check if we need a #line directive BEFORE emitting the token
   bool need_line_directive = false;
   char *current_file = NULL;
-  File *f = tok_file(tok);
   int line_no = tok_line_no(tok);
 
   // Skip line directive handling for synthetic tokens (line_no == -1)
@@ -536,8 +681,9 @@ static void emit_tok(Token *tok)
     current_file = f->display_name ? f->display_name : f->name;
     bool file_changed = (last_filename != current_file &&
                          (!last_filename || !current_file || strcmp(last_filename, current_file) != 0));
+    bool system_changed = (f->is_system != last_system_header);
     bool line_jumped = (line_no != last_line_no && line_no != last_line_no + 1);
-    need_line_directive = file_changed || line_jumped;
+    need_line_directive = file_changed || line_jumped || system_changed;
   }
 
   // Handle newlines and spacing
@@ -547,9 +693,13 @@ static void emit_tok(Token *tok)
     // Emit #line directive on new line if needed
     if (need_line_directive)
     {
-      out_printf("#line %d \"%s\"\n", line_no, current_file ? current_file : "unknown");
+      if (f->is_system)
+        out_printf("# %d \"%s\" 3\n", line_no, current_file ? current_file : "unknown");
+      else
+        out_printf("#line %d \"%s\"\n", line_no, current_file ? current_file : "unknown");
       last_line_no = line_no;
       last_filename = current_file;
+      last_system_header = f->is_system;
     }
     else if (emit_line_directives && f && line_no > 0 && line_no > last_line_no)
     {
@@ -562,9 +712,13 @@ static void emit_tok(Token *tok)
     if (need_line_directive)
     {
       out_char('\n');
-      out_printf("#line %d \"%s\"\n", line_no, current_file ? current_file : "unknown");
+      if (f->is_system)
+        out_printf("# %d \"%s\" 3\n", line_no, current_file ? current_file : "unknown");
+      else
+        out_printf("#line %d \"%s\"\n", line_no, current_file ? current_file : "unknown");
       last_line_no = line_no;
       last_filename = current_file;
+      last_system_header = f->is_system;
     }
     else if (needs_space(last_emitted, tok))
     {
@@ -2781,7 +2935,6 @@ static char *preprocess_with_cc(const char *input_file)
   const char *cc = extra_compiler ? extra_compiler : "cc";
   argv_builder_add(&ab, cc);
   argv_builder_add(&ab, "-E");
-  argv_builder_add(&ab, "-P");
 
   // Add compiler flags (like -std=c99, -m32)
   for (int i = 0; i < extra_compiler_flags_count; i++)
@@ -2878,6 +3031,7 @@ static int transpile(char *input_file, char *output_file)
   last_emitted = NULL;
   last_line_no = 0;
   last_filename = NULL;
+  last_system_header = false;
   next_scope_is_loop = false;
   next_scope_is_switch = false;
   pending_control_flow = false;
@@ -2886,8 +3040,17 @@ static int transpile(char *input_file, char *output_file)
   pending_for_paren = false;
   current_func_returns_void = false;
   stmt_expr_count = 0;
-  at_stmt_start = true;                // Start of file is start of statement
-  typedef_table_reset();               // Reset typedef tracking
+  at_stmt_start = true;  // Start of file is start of statement
+  typedef_table_reset(); // Reset typedef tracking
+
+  // Handle system headers: collect and emit #includes, or flatten
+  system_includes_reset();
+  if (!feature_flatten_headers)
+  {
+    collect_system_includes();
+    emit_system_includes();
+  }
+
   bool next_func_returns_void = false; // Track void functions at top level
   Token *prev_toplevel_tok = NULL;     // Track previous token at top level for function detection
 
@@ -3580,6 +3743,7 @@ static PrismResult prism_transpile_file(const char *input_file, PrismFeatures fe
   feature_zeroinit = features.zeroinit;
   feature_warn_safety = features.warn_safety;
   emit_line_directives = features.line_directives;
+  feature_flatten_headers = features.flatten_headers;
 
   // Create temp file for output
   char temp_path[512];
@@ -4243,7 +4407,10 @@ static void print_help(void)
       "Prism Options:\n"
       "  -fno-defer            Disable defer feature\n"
       "  -fno-zeroinit         Disable zero-initialization\n"
-      "  -fwarn-safety         Safety checks warn instead of error\n"
+      "  -fno-line-directives  Disable #line directives in output\n"
+      "  -fflatten-headers     Flatten included headers into single output file\n"
+      "  -fno-flatten-headers  Disable header flattening\n"
+      "  -fno-safety           Safety checks warn instead of error\n"
       "  --prism-cc=<compiler> Use specific compiler (default: $CC or cc)\n"
       "  --prism-verbose       Show transpile and compile commands\n\n"
       "Commands:\n"
@@ -4334,9 +4501,19 @@ static Cli cli_parse(int argc, char **argv)
       cli.features.line_directives = false;
       continue;
     }
-    if (!strcmp(arg, "-fwarn-safety"))
+    if (!strcmp(arg, "-fno-safety"))
     {
       cli.features.warn_safety = true;
+      continue;
+    }
+    if (!strcmp(arg, "-fflatten-headers"))
+    {
+      cli.features.flatten_headers = true;
+      continue;
+    }
+    if (!strcmp(arg, "-fno-flatten-headers"))
+    {
+      cli.features.flatten_headers = false;
       continue;
     }
 
@@ -4664,6 +4841,7 @@ int main(int argc, char **argv)
   extra_force_includes = cli.force_includes;
   extra_force_include_count = cli.force_include_count;
   emit_line_directives = cli.features.line_directives;
+  feature_flatten_headers = cli.features.flatten_headers;
 
   // Handle special modes
   switch (cli.mode)

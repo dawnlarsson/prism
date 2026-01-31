@@ -103,7 +103,7 @@ skip:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v0.79.0 - Robust C transpiler
+Prism v0.84.0 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 
@@ -119,7 +119,10 @@ GCC-Compatible Options:
 Prism Options:
   -fno-defer            Disable defer feature
   -fno-zeroinit         Disable zero-initialization
-  -fwarn-safety         Safety checks warn instead of error
+  -fno-line-directives  Disable #line directives in output
+  -fflatten-headers     Flatten included headers into single output file
+  -fno-flatten-headers  Disable header flattening
+  -fno-safety           Safety checks warn instead of error
   --prism-cc=<compiler> Use specific compiler (default: $CC or cc)
   --prism-verbose       Show transpile and compile commands
 
