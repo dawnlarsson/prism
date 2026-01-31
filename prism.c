@@ -693,10 +693,8 @@ static void emit_tok(Token *tok)
     // Emit #line directive on new line if needed
     if (need_line_directive)
     {
-      if (f->is_system)
-        out_printf("# %d \"%s\" 3\n", line_no, current_file ? current_file : "unknown");
-      else
-        out_printf("#line %d \"%s\"\n", line_no, current_file ? current_file : "unknown");
+      // Use standard #line format to avoid -Wpedantic warnings
+      out_printf("#line %d \"%s\"\n", line_no, current_file ? current_file : "unknown");
       last_line_no = line_no;
       last_filename = current_file;
       last_system_header = f->is_system;
@@ -712,10 +710,8 @@ static void emit_tok(Token *tok)
     if (need_line_directive)
     {
       out_char('\n');
-      if (f->is_system)
-        out_printf("# %d \"%s\" 3\n", line_no, current_file ? current_file : "unknown");
-      else
-        out_printf("#line %d \"%s\"\n", line_no, current_file ? current_file : "unknown");
+      // Use standard #line format to avoid -Wpedantic warnings
+      out_printf("#line %d \"%s\"\n", line_no, current_file ? current_file : "unknown");
       last_line_no = line_no;
       last_filename = current_file;
       last_system_header = f->is_system;
@@ -4733,7 +4729,12 @@ static Cli cli_parse(int argc, char **argv)
     // Also track flags that affect macro/include path discovery
     if (strncmp(arg, "-std=", 5) == 0 ||
         strncmp(arg, "-m", 2) == 0 ||      // -m32, -m64, -march=, -mtune=, etc.
-        strncmp(arg, "--target=", 9) == 0) // Cross-compile target
+        strncmp(arg, "--target=", 9) == 0 ||
+        strcmp(arg, "-pthread") == 0 ||    // pthread flags affect preprocessor macros
+        strcmp(arg, "-pthreads") == 0 ||
+        strcmp(arg, "-mthreads") == 0 ||
+        strcmp(arg, "-mt") == 0 ||
+        strcmp(arg, "--thread-safe") == 0)
     {
       cli_add_pp_flag(&cli, arg);
     }
