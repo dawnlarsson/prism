@@ -3142,10 +3142,15 @@ void test_linux_macros(void)
 #else
     CHECK(0, "linux macro defined");
 #endif
+    // __gnu_linux__ is glibc-specific, not defined on musl (Alpine)
+#ifdef __GLIBC__
 #ifdef __gnu_linux__
     CHECK(1, "__gnu_linux__ macro defined");
 #else
     CHECK(0, "__gnu_linux__ macro defined");
+#endif
+#else
+    printf("  [SKIP] __gnu_linux__ test (not using glibc)\n");
 #endif
 #else
     // Not on Linux - skip these tests (they're Linux-specific)
