@@ -1,5 +1,5 @@
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.87.0"
+#define PRISM_VERSION "0.88.0"
 
 #include "parse.c"
 
@@ -2281,6 +2281,20 @@ static bool is_const_array_size(Token *open_bracket)
     return false; // Treat as VLA for safety
   }
 
+  // Also check for offsetof(...) or __builtin_offsetof(...) keywords BEFORE main loop
+  // GCC treats these as VLAs in struct/union contexts even though they're constant
+  {
+    Token *t = open_bracket->next;
+    while (t && t != close_bracket && t->kind != TK_EOF)
+    {
+      if (equal(t, "offsetof") || equal(t, "__builtin_offsetof"))
+      {
+        return false; // Treat as VLA for safety
+      }
+      t = t->next;
+    }
+  }
+
   while (tok->kind != TK_EOF && depth > 0)
   {
     if (equal(tok, "["))
@@ -2422,6 +2436,12 @@ static Token *try_zero_init_decl(Token *tok)
         if (struct_body_contains_true_vla(tok))
         {
           error_tok(tok, "variable length array in struct/union is not supported");
+        }
+        // Also check for VLA-like patterns (e.g., manual offsetof) that prevent zero-init
+        // GCC treats these as VLAs even though they're technically constant
+        if (struct_body_contains_vla(tok))
+        {
+          is_typedef_vla = true; // Prevent = {0} initialization
         }
         tok = skip_balanced(tok, "{", "}");
       }
