@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
 #define PRISM_VERSION "0.89.0"
 
