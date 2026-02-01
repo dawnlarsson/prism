@@ -3710,6 +3710,116 @@ restart:
     CHECK_LOG("BDBDE", "VLA backward goto executes defers correctly");
 }
 
+void test_vla_pointer_init_semantics(void)
+{
+    int n = 5;
+
+    // Pointer to VLA: CAN be zero-initialized
+    // Type is "int (*)[n]", which is a single pointer
+    int (*ptr_to_vla)[n] = {0};
+
+    // Array of pointers (VLA): storage only, no init allowed
+    // Type is "int *[n]", which is an array of size n
+    int *vla_of_ptrs[n];
+
+    // Typedef'd VLA pointer
+    typedef int Matrix[n][n];
+    Matrix *mat_ptr = {0};
+
+    // Verify pointers are zeroed
+    CHECK(ptr_to_vla == NULL, "VLA pointer zero-initialized");
+    CHECK(mat_ptr == NULL, "typedef VLA pointer zero-initialized");
+}
+
+// Typedef shadowing changes semantics
+// Bug: If local variable shadows typedef, "T * x;" changes from declaration to multiplication
+typedef int T;
+
+void test_typedef_shadow_semantics(void)
+{
+    {
+        // In outer scope, T is a typedef
+        // This IS a pointer declaration
+        T *ptr = NULL;
+        CHECK(ptr == NULL, "typedef pointer declaration works");
+    }
+
+    {
+        int T = 10; // Shadows global typedef T
+        int x = 2;
+
+        // Now T is a variable, not a type
+        // "T * x" is multiplication: 10 * 2 = 20
+        // If Prism adds "= 0", it becomes "10 * 2 = 0" -> syntax error
+        int result = T * x;
+
+        CHECK(result == 20, "typedef shadow multiplication works");
+        CHECK(T == 10, "shadowing variable correct");
+    }
+}
+
+// _Generic default should not interfere with defer
+// Bug: Prism may confuse _Generic's "default:" with switch's "default:"
+void test_generic_default_no_switch(void)
+{
+    log_reset();
+
+    {
+        defer log_append("D");
+        log_append("A");
+
+        // _Generic uses 'default:', but NOT in a switch
+        // Prism must not clear defer stack here
+        int x = 0;
+        int result = _Generic(x, int: 1, default: 2);
+
+        log_append("B");
+        CHECK(result == 1, "_Generic selection correct");
+    }
+
+    // Defer should have run
+    CHECK_LOG("ABD", "_Generic default does not break defer");
+}
+
+// K&R function definition parsing
+// Bug: Prism may fail to parse old-style function definitions
+// K&R declarations go between params and opening brace
+int knr_func_add(a, b)
+int a;
+int b;
+{
+    if (a > b)
+        goto return_a;
+    return b;
+
+return_a:
+    return a;
+}
+
+void test_knr_function_parsing(void)
+{
+    CHECK(knr_func_add(10, 5) == 10, "K&R function goto works");
+    CHECK(knr_func_add(3, 8) == 8, "K&R function fallthrough works");
+}
+
+// Comma operator vs comma separator in declarations
+// Bug: Prism's parser must distinguish comma operator from declarator separator
+void test_comma_operator_in_init(void)
+{
+    int a = 1, b = 2;
+
+    // This is ONE variable 'c', initialized to result of (a, b) which is 2
+    // Comma operator: evaluates left to right, result is rightmost value
+    int c = (a, b);
+
+    // This is TWO variables: 'd' gets 1, 'e' gets zero-init
+    int d = 1, e;
+
+    CHECK(c == 2, "comma operator in initializer");
+    CHECK(d == 1, "first multi-declarator init");
+    CHECK(e == 0, "second multi-declarator zero-init");
+}
+
 void run_verification_bug_tests(void)
 {
     printf("\n=== VERIFICATION TESTS ===\n");
@@ -3739,6 +3849,12 @@ void run_verification_bug_tests(void)
     test_vla_backward_goto_reentry();
     test_vla_backward_goto_stack_exhaustion();
     test_vla_backward_goto_with_defer();
+
+    test_vla_pointer_init_semantics();
+    test_typedef_shadow_semantics();
+    test_generic_default_no_switch();
+    test_knr_function_parsing();
+    test_comma_operator_in_init();
 }
 
 // MAIN

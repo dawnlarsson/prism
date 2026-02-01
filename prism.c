@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.89.0"
+#define PRISM_VERSION "0.90.0"
 
 #include "parse.c"
 
@@ -2990,8 +2990,14 @@ static Token *try_zero_init_decl(Token *tok)
     bool has_init = equal(tok, "=");
 
     // Combine direct VLA detection with typedef VLA detection
-    // But pointers to VLAs are NOT VLAs - they can be zero-initialized to NULL
-    bool effective_vla = (is_vla || is_typedef_vla) && !is_pointer;
+    // Key distinction:
+    //   int (*ptr)[n];  -> pointer to VLA (can initialize to NULL)  - has_paren_declarator=true
+    //   int *arr[n];    -> array of pointers (VLA, cannot init)      - has_paren_declarator=false
+    //   Matrix *ptr;    -> pointer to VLA typedef (can initialize)   - is_pointer=true
+    // A VLA is:
+    //   1. Array with variable dimension, unless it's a pointer to that array (parens)
+    //   2. VLA typedef used directly (not as a pointer)
+    bool effective_vla = (is_vla && !has_paren_declarator) || (is_typedef_vla && !is_pointer);
 
     // VLAs cannot be initialized - this is a hard error, no bypass allowed
     // C syntax doesn't allow `int arr[n] = {0};` so VLAs break safety guarantees
