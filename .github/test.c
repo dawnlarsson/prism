@@ -4132,6 +4132,53 @@ void test_bitint_zeroinit(void)
 }
 #endif
 
+void test_pragma_pack_preservation(void)
+{
+#pragma pack(push, 1)
+    struct PragmaPackTest
+    {
+        char a;
+        int b;
+    };
+#pragma pack(pop)
+
+    // On typical ABIs without packing, this would be 8 bytes (char + 3 padding + int)
+    // With pack(1), it should be 5 bytes (char + int, no padding)
+    size_t size = sizeof(struct PragmaPackTest);
+    CHECK(size == 5, "pragma pack(1) preserved - struct size is 5");
+
+    printf("[PASS] #pragma pack directives preserved\n");
+    passed++;
+    total++;
+}
+
+static int g_defer_counter;
+
+int test_return_stmt_expr_helper(int x)
+{
+    defer g_defer_counter++;
+    return ({
+        int y = x + 1;
+        y;
+    });
+}
+
+void test_return_stmt_expr_with_defer(void)
+{
+    g_defer_counter = 0;
+    int result = test_return_stmt_expr_helper(42);
+
+    // The function should return 43 (42 + 1)
+    CHECK(result == 43, "statement-expr return value correct");
+
+    // The defer should have executed once
+    CHECK(g_defer_counter == 1, "defer executed with statement-expr return");
+
+    printf("[PASS] return statement-expr with defer works\n");
+    passed++;
+    total++;
+}
+
 void run_verification_bug_tests(void)
 {
     printf("\n=== VERIFICATION TESTS ===\n");
@@ -4178,6 +4225,9 @@ void run_verification_bug_tests(void)
     test_generic_typedef_not_label();
     test_c23_attributes_zeroinit();
     test_bitint_zeroinit();
+
+    test_pragma_pack_preservation();
+    test_return_stmt_expr_with_defer();
 }
 
 // MAIN

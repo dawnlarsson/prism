@@ -59,6 +59,7 @@ typedef enum
     TK_STR,
     TK_NUM,
     TK_PP_NUM,
+    TK_PREP_DIR, // Preprocessor directive (e.g., #pragma) to preserve
     TK_EOF,
 } TokenKind;
 
@@ -867,25 +868,30 @@ static Token *tokenize(File *file)
 
     while (*p)
     {
-        // Preprocessor directives (#line markers from -E output)
+        // Preprocessor directives (#line markers from -E output, or #pragma etc.)
         if (at_bol && *p == '#')
         {
             int directive_line = line_no;
+            char *directive_start = p;
             p++; // skip '#'
             while (*p == ' ' || *p == '\t')
                 p++;
 
             // Parse optional "line" keyword
+            bool has_line_keyword = false;
             if (!strncmp(p, "line", 4) && (p[4] == ' ' || p[4] == '\t'))
             {
+                has_line_keyword = true;
                 p += 4;
                 while (*p == ' ' || *p == '\t')
                     p++;
             }
 
-            // Parse line number
+            // Parse line number (indicates this is a line marker)
+            bool is_line_marker = false;
             if (isdigit(*p))
             {
+                is_line_marker = true;
                 long new_line = 0;
                 while (isdigit(*p))
                 {
@@ -957,11 +963,35 @@ static Token *tokenize(File *file)
 
                 if (filename)
                     free(filename);
+
+                // Skip to end of line marker directive
+                while (*p && *p != '\n')
+                    p++;
+                if (*p == '\n')
+                {
+                    p++;
+                    line_no++;
+                    at_bol = true;
+                    has_space = false;
+                }
+                continue;
             }
 
-            // Skip to end of directive line
+            // Not a line marker - preserve as preprocessor directive token
+            // (e.g., #pragma, _Pragma expansions, etc.)
+            // Reset to start of directive
+            p = directive_start;
+            char *dir_start = p;
+
+            // Find end of directive line
             while (*p && *p != '\n')
                 p++;
+
+            // Create preprocessor directive token
+            cur = cur->next = new_token(TK_PREP_DIR, dir_start, p);
+            tok_set_at_bol(cur, true);
+
+            // Advance past newline
             if (*p == '\n')
             {
                 p++;

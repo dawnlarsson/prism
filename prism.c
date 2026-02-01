@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.92.0"
+#define PRISM_VERSION "0.93.0"
 
 #include "parse.c"
 
@@ -791,6 +791,17 @@ static void emit_tok(Token *tok)
     {
       out_char(' ');
     }
+  }
+
+  // Handle preprocessor directives (e.g., #pragma) - emit verbatim
+  if (tok->kind == TK_PREP_DIR)
+  {
+    // Preprocessor directives should be at BOL
+    if (!tok_at_bol(tok))
+      out_char('\n');
+    out_str(tok->loc, tok->len);
+    last_emitted = tok;
+    return;
   }
 
   // Handle C23 extended float suffixes (F128, F64, F32, F16, BF16)
@@ -3644,8 +3655,15 @@ static int transpile(char *input_file, char *output_file)
             // void function: { (expr); defers; return; }
             // The expression is executed for side effects, then we return void
             out_str(" { (", 4);
-            while (tok->kind != TK_EOF && !equal(tok, ";"))
+            int depth = 0;
+            while (tok->kind != TK_EOF)
             {
+              if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
+                depth++;
+              else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
+                depth--;
+              else if (depth == 0 && equal(tok, ";"))
+                break;
               emit_tok(tok);
               tok = tok->next;
             }
@@ -3667,9 +3685,16 @@ static int transpile(char *input_file, char *output_file)
             unsigned long long my_ret = ret_counter++;
             out_printf(" { __auto_type _prism_ret_%llu = (", my_ret);
 
-            // Emit expression until semicolon
-            while (tok->kind != TK_EOF && !equal(tok, ";"))
+            // Emit expression until semicolon (tracking depth for statement-exprs)
+            int depth = 0;
+            while (tok->kind != TK_EOF)
             {
+              if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
+                depth++;
+              else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
+                depth--;
+              else if (depth == 0 && equal(tok, ";"))
+                break;
               emit_tok(tok);
               tok = tok->next;
             }
