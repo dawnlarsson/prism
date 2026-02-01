@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.90.0"
+#define PRISM_VERSION "0.91.0"
 
 #include "parse.c"
 
@@ -123,6 +123,7 @@ typedef struct
   bool is_switch;        // true if this scope is a switch statement
   bool had_control_exit; // true if break/return/goto/continue seen since last defer in switch
   bool is_conditional;   // true if this scope is an if/while/for block (for tracking conditional control exits)
+  bool seen_case_label;  // true if case/default label seen in this switch scope (for zero-init safety)
 } DeferScope;
 
 typedef struct
@@ -514,6 +515,7 @@ static void defer_push_scope(void)
   defer_stack[defer_depth].is_switch = next_scope_is_switch;
   defer_stack[defer_depth].is_conditional = next_scope_is_conditional;
   defer_stack[defer_depth].had_control_exit = false;
+  defer_stack[defer_depth].seen_case_label = false;
   if (next_scope_is_conditional)
     conditional_block_depth++;
   next_scope_is_loop = false;
@@ -2166,6 +2168,11 @@ static void init_type_keyword_map(void)
       "__uint128",
       "__int128_t",
       "__uint128_t",
+      // C99 complex types
+      "_Complex",
+      "_Imaginary",
+      "complex",   // <complex.h> macro for _Complex
+      "imaginary", // <complex.h> macro for _Imaginary
   };
   for (int i = 0; i < (int)(sizeof(type_kw) / sizeof(*type_kw)); i++)
     hashmap_put(&type_keyword_map, type_kw[i], (void *)1);
@@ -2417,6 +2424,22 @@ static Token *try_zero_init_decl(Token *tok)
 {
   if (!feature_zeroinit || defer_depth <= 0 || struct_depth > 0)
     return NULL;
+
+  // SAFETY: Check for "switch skip hole" - declarations before first case label
+  // Such declarations are skipped by the switch jump, making zero-init useless.
+  // We defer this error until we confirm this is actually a declaration (not expression).
+  bool in_switch_before_case = false;
+  for (int d = defer_depth - 1; d >= 0; d--)
+  {
+    if (defer_stack[d].is_switch && !defer_stack[d].seen_case_label)
+    {
+      in_switch_before_case = true;
+      break;
+    }
+    // If we hit a non-switch scope, we're inside a nested block which is fine
+    if (!defer_stack[d].is_switch)
+      break;
+  }
 
   Token *start = tok;
   Token *decl_start_for_warning = tok; // Remember for potential warning
@@ -2686,7 +2709,20 @@ static Token *try_zero_init_decl(Token *tok)
     }
   }
 
-  // Now we've confirmed there's at least one declarator. Emit the base type.
+  // Now we've confirmed there's at least one declarator.
+
+  // SAFETY: Error if this declaration is inside a switch before any case label.
+  // The switch will jump directly to a case label, skipping the zero-initialization.
+  // This is a critical safety hole that must be prevented.
+  if (in_switch_before_case && !is_raw)
+  {
+    error_tok(decl_start_for_warning,
+              "variable declaration before first 'case' label in switch. "
+              "The switch jumps directly to 'case', skipping zero-initialization. "
+              "Move this declaration before the switch, or use 'raw' to suppress zero-init.");
+  }
+
+  // Emit the base type.
   emit_range(start, type_end);
 
   // Process each declarator in the list
@@ -3739,9 +3775,12 @@ static int transpile(char *input_file, char *output_file)
                     tok_file(tok)->name, tok_line_no(tok));
         }
 
-        // Stop when we hit the switch scope
+        // Mark that we've seen a case label in the switch scope (for zero-init safety)
         if (defer_stack[d].is_switch)
+        {
+          defer_stack[d].seen_case_label = true;
           break;
+        }
       }
       clear_switch_scope_defers();
     }

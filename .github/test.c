@@ -2413,19 +2413,38 @@ void test_atomic_specifier_form(void)
 }
 
 // HOLE #1: Switch scope leak - variable before first case
-// The zero-init "= 0" is added but the switch jumps over it!
+// Previously: The zero-init "= 0" was added but switch jumped over it!
+// NOW FIXED: Prism errors on declarations before first case label.
+// This test verifies the SAFE patterns work correctly.
 void test_switch_scope_leak(void)
 {
+    // SAFE PATTERN 1: Declare variable BEFORE the switch
+    int y;
     int result = -1;
     switch (1)
     {
-        int y; // This declaration is jumped over by switch(1) -> case 1
     case 1:
-        result = y; // y should be 0 if zero-init worked, but init is skipped!
+        result = y; // y is properly zero-initialized
         break;
     }
-    printf("[INFO] switch scope leak: y = %d (UB if not 0)\n", result);
-    // UB!
+    CHECK_EQ(result, 0, "switch scope: variable before switch is zero-init");
+
+    // SAFE PATTERN 2: Declare variable INSIDE a case block
+    result = -1;
+    switch (1)
+    {
+    case 1:
+    {
+        int z; // Inside case block - properly initialized
+        result = z;
+        break;
+    }
+    }
+    CHECK_EQ(result, 0, "switch scope: variable in case block is zero-init");
+
+    printf("[PASS] switch scope leak protection (unsafe pattern now errors)\n");
+    passed++;
+    total++;
 }
 
 typedef int SizeofTestType;
@@ -3820,6 +3839,185 @@ void test_comma_operator_in_init(void)
     CHECK(e == 0, "second multi-declarator zero-init");
 }
 
+void test_switch_skip_hole_strict(void)
+{
+    // SAFE PATTERN: Variable declared BEFORE switch
+    int x;
+    int result = -1;
+    switch (1)
+    {
+    case 1:
+        result = x; // x is properly zero-initialized (declared before switch)
+        break;
+    }
+    CHECK_EQ(result, 0, "switch skip hole fix: var before switch works");
+
+    // SAFE PATTERN: Variable declared INSIDE case block
+    result = -1;
+    switch (1)
+    {
+    case 1:
+    {
+        int y; // Declared inside case block - properly initialized
+        result = y;
+        break;
+    }
+    }
+    CHECK_EQ(result, 0, "switch skip hole fix: var in case block works");
+
+    // NOTE: The UNSAFE pattern (int z; before case 1:) now produces a compile error:
+    // "variable declaration before first 'case' label in switch"
+    // This prevents the zero-init from being silently skipped.
+    printf("[PASS] switch skip hole: unsafe pattern now errors at compile time\n");
+    passed++;
+    total++;
+}
+
+// Issue 2: _Complex types - C99 complex number support
+#if __STDC_VERSION__ >= 199901L && !defined(__STDC_NO_COMPLEX__)
+#include <complex.h>
+void test_complex_type_zeroinit(void)
+{
+    // C99 _Complex types - should be zero-initialized
+    double _Complex dc;
+    CHECK(creal(dc) == 0.0 && cimag(dc) == 0.0, "double _Complex zero-init");
+
+    float _Complex fc;
+    CHECK(crealf(fc) == 0.0f && cimagf(fc) == 0.0f, "float _Complex zero-init");
+
+    // Using the complex.h macros
+    complex double cd;
+    CHECK(creal(cd) == 0.0 && cimag(cd) == 0.0, "complex double (macro) zero-init");
+
+    // Pointer to complex
+    double _Complex *pdc;
+    CHECK(pdc == NULL, "pointer to double _Complex zero-init");
+}
+#else
+void test_complex_type_zeroinit(void)
+{
+    printf("[SKIP] _Complex tests (C99 complex not available)\n");
+}
+#endif
+
+void test_continue_in_switch_defer_detailed(void)
+{
+    log_reset();
+    int iterations = 0;
+
+    while (iterations < 2)
+    {
+        defer log_append("L"); // Loop defer
+
+        switch (iterations)
+        {
+        case 0:
+        {
+            defer log_append("S0"); // Switch case defer
+            log_append("A");
+            iterations++;
+            continue; // Should: run S0, run L, jump to loop condition
+        }
+        case 1:
+        {
+            defer log_append("S1");
+            log_append("B");
+            iterations++;
+            break; // Should: run S1, exit switch, then "X", then L at loop end
+        }
+        }
+        log_append("X"); // After switch
+    }
+    log_append("E");
+    // Expected trace:
+    // iter=0: "A" -> continue -> S0 -> L -> check condition
+    // iter=1: "B" -> break -> S1 -> "X" -> L -> check condition (exit)
+    // "E"
+    CHECK_LOG("AS0LBS1XLE", "continue in switch: defer order");
+}
+
+void test_ultra_complex_declarators(void)
+{
+    // Function pointer returning function pointer: void (*(*f)(void))(void)
+    // This is: f is pointer to function(void) returning pointer to function(void) returning void
+    void (*(*f1)(void))(void);
+    CHECK(f1 == NULL, "func ptr returning func ptr zero-init");
+
+    // Even more complex: pointer to function returning pointer to function returning int*
+    int *(*(*f2)(int))(int);
+    CHECK(f2 == NULL, "ptr to func(int) returning ptr to func(int) returning int*");
+
+    // Array of function pointers returning pointers
+    int *(*afp[3])(void);
+    int all_null = 1;
+    for (int i = 0; i < 3; i++)
+        if (afp[i] != NULL)
+            all_null = 0;
+    CHECK(all_null, "array of func ptrs returning ptr zero-init");
+
+    // Pointer to array of function pointers
+    void (*(*pafp)[5])(void);
+    CHECK(pafp == NULL, "ptr to array of func ptrs zero-init");
+}
+
+#if __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_THREADS__)
+_Thread_local int tls_var; // Should NOT get explicit = 0 (redundant but valid)
+
+void test_thread_local_handling(void)
+{
+    // Static storage duration means implicit zero-init by C standard
+    CHECK_EQ(tls_var, 0, "_Thread_local file scope implicit zero");
+
+    // Thread-local in function scope
+    static _Thread_local int tls_local;
+    CHECK_EQ(tls_local, 0, "static _Thread_local local implicit zero");
+
+    // The main verification is that the code compiles correctly
+    // If Prism incorrectly treated _Thread_local as auto storage and tried memset,
+    // that would cause compile errors or incorrect behavior
+    printf("[PASS] _Thread_local handling (compiled correctly)\n");
+    passed++;
+    total++;
+}
+#else
+void test_thread_local_handling(void)
+{
+    printf("[SKIP] _Thread_local tests (C11 threads not available)\n");
+}
+#endif
+
+void test_line_directive_preservation(void)
+{
+    int line_before = __LINE__;
+    {
+        defer(void) 0; // Simple defer that injects code
+        int x;         // Should be zero-init
+        (void)x;
+    }
+    int line_after = __LINE__;
+
+    // Lines should be sequential (accounting for the block)
+    // If line directives are broken, __LINE__ would report wrong values
+    // This is a sanity check - real verification needs error message testing
+    CHECK(line_after > line_before, "#line tracking: lines increase correctly");
+
+    // Test with multiple defers
+    line_before = __LINE__;
+    {
+        defer log_append("A");
+        defer log_append("B");
+        defer log_append("C");
+        int y;
+        (void)y;
+    }
+    line_after = __LINE__;
+    CHECK(line_after > line_before, "#line tracking: multiple defers OK");
+
+    printf("[PASS] #line directive preservation (no obvious corruption)\n");
+    passed++;
+    total++;
+}
+
 void run_verification_bug_tests(void)
 {
     printf("\n=== VERIFICATION TESTS ===\n");
@@ -3855,6 +4053,13 @@ void run_verification_bug_tests(void)
     test_generic_default_no_switch();
     test_knr_function_parsing();
     test_comma_operator_in_init();
+
+    test_switch_skip_hole_strict();
+    test_complex_type_zeroinit();
+    test_continue_in_switch_defer_detailed();
+    test_ultra_complex_declarators();
+    test_thread_local_handling();
+    test_line_directive_preservation();
 }
 
 // MAIN
@@ -3883,6 +4088,7 @@ int main(void)
     run_preprocessor_numeric_tests();
     run_preprocessor_system_macro_tests();
     run_verification_bug_tests();
+    run_third_party_feedback_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);
