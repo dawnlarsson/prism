@@ -1110,6 +1110,11 @@ Token *tokenize_file(char *path)
 }
 
 // Reset state for reuse
+// TODO: Minor memory leak - string literals allocated in read_string_literal()
+// (tok->val.str = malloc'd buffer) are not freed here. The arena_reset() only
+// frees Token structs, not the separate string buffers. In CLI mode this is
+// irrelevant (process exit cleans up), but in library mode this leaks memory
+// on every transpile call. Low priority for "unstable" library API.
 void tokenizer_reset(void)
 {
     arena_reset();

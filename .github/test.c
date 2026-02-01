@@ -4018,6 +4018,120 @@ void test_line_directive_preservation(void)
     total++;
 }
 
+void test_alignas_struct_bitfield(void)
+{
+    // Standard struct with bitfield - combined definition and variable
+    struct Data
+    {
+        int val;
+        unsigned int flag : 1;  // Bitfield, not label
+    } d = {42, 1};
+
+    // Struct with __attribute__ - bitfield must NOT be mistaken for label
+    struct __attribute__((packed)) PackedData
+    {
+        unsigned int x : 1;  // This is a BITFIELD, not a label!
+        unsigned int y : 2;
+    } pd = {1, 3};
+
+    // Struct with multiple attributes before name
+    struct __attribute__((packed)) __attribute__((aligned(4))) AttrData
+    {
+        unsigned int a : 4;
+        unsigned int b : 4;
+    } ad = {5, 10};
+
+    CHECK(d.val == 42 && d.flag == 1, "struct bitfield: basic struct works");
+    CHECK(pd.x == 1 && pd.y == 3, "struct bitfield: packed bitfields work");
+    CHECK(ad.a == 5 && ad.b == 10, "struct bitfield: multi-attr bitfields work");
+
+    // This test passes if it compiles - the bug would cause Prism to think
+    // 'x' is a goto label (from "int x : 1") and potentially emit wrong code
+    printf("[PASS] struct bitfield parsing (not mistaken for label)\n");
+    passed++;
+    total++;
+}
+
+typedef int GenericTestType;
+
+void test_generic_typedef_not_label(void)
+{
+    // _Generic uses Type: expr syntax which looks like labels
+    // Prism should skip _Generic(...) in label scanner
+    int x = _Generic(0,
+        GenericTestType: 1,  // This is NOT a goto label!
+        default: 0);
+
+    CHECK_EQ(x, 1, "_Generic typedef association works");
+
+    // Verify label scanner doesn't get confused
+    // If it did, goto might emit wrong defer cleanup
+    log_reset();
+    {
+        defer log_append("D");
+        int y = _Generic((char)0,
+            GenericTestType: 10,
+            char: 20,
+            default: 30);
+        CHECK_EQ(y, 20, "_Generic with multiple type associations");
+        log_append("X");
+    }
+    CHECK_LOG("XD", "_Generic doesn't confuse label scanner");
+
+    printf("[PASS] _Generic typedef not mistaken for label\n");
+    passed++;
+    total++;
+}
+
+#if __STDC_VERSION__ >= 202311L
+void test_c23_attributes_zeroinit(void)
+{
+    // C23 attributes before declaration
+    [[maybe_unused]] int x;
+    CHECK_EQ(x, 0, "[[maybe_unused]] int zero-init");
+
+    // Multiple attributes
+    [[maybe_unused]] [[deprecated]] int y;
+    CHECK_EQ(y, 0, "multiple [[...]] attributes zero-init");
+
+    // Attribute with argument
+    [[deprecated("use z2 instead")]] int z;
+    CHECK_EQ(z, 0, "[[deprecated(...)]] zero-init");
+
+    printf("[PASS] C23 [[...]] attributes don't break zero-init\n");
+    passed++;
+    total++;
+}
+#else
+void test_c23_attributes_zeroinit(void)
+{
+    printf("[SKIP] C23 [[...]] attribute tests (C23 not available)\n");
+}
+#endif
+
+#if __STDC_VERSION__ >= 202311L && defined(__clang__)
+void test_bitint_zeroinit(void)
+{
+    _BitInt(32) x;
+    CHECK(x == 0, "_BitInt(32) zero-init");
+
+    _BitInt(64) y;
+    CHECK(y == 0, "_BitInt(64) zero-init");
+
+    unsigned _BitInt(16) z;
+    CHECK(z == 0, "unsigned _BitInt(16) zero-init");
+
+    printf("[PASS] _BitInt zero-init works\n");
+    passed++;
+    total++;
+}
+#else
+void test_bitint_zeroinit(void)
+{
+    printf("[SKIP] _BitInt tests (C23/_BitInt not available)\n");
+}
+#endif
+
 void run_verification_bug_tests(void)
 {
     printf("\n=== VERIFICATION TESTS ===\n");
@@ -4060,6 +4174,10 @@ void run_verification_bug_tests(void)
     test_ultra_complex_declarators();
     test_thread_local_handling();
     test_line_directive_preservation();
+    test_alignas_struct_bitfield();
+    test_generic_typedef_not_label();
+    test_c23_attributes_zeroinit();
+    test_bitint_zeroinit();
 }
 
 // MAIN

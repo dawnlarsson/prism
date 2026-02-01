@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.91.0"
+#define PRISM_VERSION "0.92.0"
 
 #include "parse.c"
 
@@ -1167,6 +1167,9 @@ static bool is_label(Token *tok)
   return tok->kind == TK_IDENT && tok->next && equal(tok->next, ":");
 }
 
+// Forward declaration (defined later in transpiler section)
+static Token *skip_balanced(Token *tok, char *open, char *close);
+
 // Scan a function body for labels and record their scope depths
 // Also detects setjmp/longjmp/pthread_exit/vfork and inline asm usage
 // tok should point to the opening '{' of the function body
@@ -1196,15 +1199,19 @@ static void scan_labels_in_function(Token *tok)
       //   "struct name {"
       //   "struct __attribute__((packed)) {"
       //   "struct __attribute__((packed)) name {"
+      //   "struct _Alignas(16) name {"
+      //   "struct alignas(16) name {"
       Token *t = tok->next;
-      // Skip identifiers, struct names, and __attribute__((...))
-      while (t && (t->kind == TK_IDENT || equal(t, "__attribute__")))
+      // Skip identifiers, struct names, __attribute__((...)), _Alignas(...), alignas(...)
+      while (t && (t->kind == TK_IDENT || equal(t, "__attribute__") || equal(t, "__attribute") ||
+                   equal(t, "_Alignas") || equal(t, "alignas")))
       {
-        // Handle __attribute__((...)) - skip the entire attribute
-        if (equal(t, "__attribute__"))
+        // Handle __attribute__((...)), _Alignas(...), alignas(...) - skip the entire specifier
+        if (equal(t, "__attribute__") || equal(t, "__attribute") ||
+            equal(t, "_Alignas") || equal(t, "alignas"))
         {
           t = t->next;
-          // Skip (( ... ))
+          // Skip ( ... ) - may be ((...)) for __attribute__
           if (t && equal(t, "("))
           {
             int paren_depth = 1;
@@ -1273,6 +1280,19 @@ static void scan_labels_in_function(Token *tok)
     // Detect inline asm which may contain hidden jumps
     if (tok->kind == TK_KEYWORD && (equal(tok, "asm") || equal(tok, "__asm__") || equal(tok, "__asm")))
       current_func_has_asm = true;
+
+    // Skip _Generic(...) - type associations inside look like labels (Type: expr)
+    if (tok->kind == TK_KEYWORD && equal(tok, "_Generic"))
+    {
+      prev = tok;
+      tok = tok->next;
+      if (tok && equal(tok, "("))
+      {
+        tok = skip_balanced(tok, "(", ")");
+        prev = NULL; // Reset prev since we skipped a complex expression
+      }
+      continue;
+    }
 
     // Check for label: identifier followed by ':' (but not ::)
     // Filter out: ternary operator, switch cases, bitfields
@@ -1350,10 +1370,13 @@ static Token *goto_skips_defer(Token *goto_tok, char *label_name, int label_len)
     if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum"))
     {
       // Look ahead for '{' to detect struct body
+      // Skip identifiers, __attribute__((...)), _Alignas(...), alignas(...)
       Token *t = tok->next;
-      while (t && (t->kind == TK_IDENT || equal(t, "__attribute__")))
+      while (t && (t->kind == TK_IDENT || equal(t, "__attribute__") || equal(t, "__attribute") ||
+                   equal(t, "_Alignas") || equal(t, "alignas")))
       {
-        if (equal(t, "__attribute__"))
+        if (equal(t, "__attribute__") || equal(t, "__attribute") ||
+            equal(t, "_Alignas") || equal(t, "alignas"))
         {
           t = t->next;
           if (t && equal(t, "("))
@@ -1414,6 +1437,19 @@ static Token *goto_skips_defer(Token *goto_tok, char *label_name, int label_len)
       depth--;
       prev = tok;
       tok = tok->next;
+      continue;
+    }
+
+    // Skip _Generic(...) - type associations inside look like labels (Type: expr)
+    if (tok->kind == TK_KEYWORD && equal(tok, "_Generic"))
+    {
+      prev = tok;
+      tok = tok->next;
+      if (tok && equal(tok, "("))
+      {
+        tok = skip_balanced(tok, "(", ")");
+        prev = NULL;
+      }
       continue;
     }
 
@@ -1481,12 +1517,15 @@ static Token *goto_skips_decl(Token *goto_tok, char *label_name, int label_len)
   while (tok && tok->kind != TK_EOF)
   {
     // Track struct/union/enum bodies
+    // Skip identifiers, __attribute__((...)), _Alignas(...), alignas(...)
     if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum"))
     {
       Token *t = tok->next;
-      while (t && (t->kind == TK_IDENT || equal(t, "__attribute__")))
+      while (t && (t->kind == TK_IDENT || equal(t, "__attribute__") || equal(t, "__attribute") ||
+                   equal(t, "_Alignas") || equal(t, "alignas")))
       {
-        if (equal(t, "__attribute__"))
+        if (equal(t, "__attribute__") || equal(t, "__attribute") ||
+            equal(t, "_Alignas") || equal(t, "alignas"))
         {
           t = t->next;
           if (t && equal(t, "("))
@@ -1634,6 +1673,20 @@ static Token *goto_skips_decl(Token *goto_tok, char *label_name, int label_len)
           }
         }
       }
+    }
+
+    // Skip _Generic(...) - type associations inside look like labels (Type: expr)
+    if (tok->kind == TK_KEYWORD && equal(tok, "_Generic"))
+    {
+      prev = tok;
+      tok = tok->next;
+      if (tok && equal(tok, "("))
+      {
+        tok = skip_balanced(tok, "(", ")");
+        prev = NULL;
+      }
+      at_stmt_start = false;
+      continue;
     }
 
     // Found the label?
@@ -2173,6 +2226,8 @@ static void init_type_keyword_map(void)
       "_Imaginary",
       "complex",   // <complex.h> macro for _Complex
       "imaginary", // <complex.h> macro for _Imaginary
+      // C23 _BitInt type
+      "_BitInt",
   };
   for (int i = 0; i < (int)(sizeof(type_kw) / sizeof(*type_kw)); i++)
     hashmap_put(&type_keyword_map, type_kw[i], (void *)1);
@@ -2444,6 +2499,26 @@ static Token *try_zero_init_decl(Token *tok)
   Token *start = tok;
   Token *decl_start_for_warning = tok; // Remember for potential warning
 
+  // C23 standard attributes: [[maybe_unused]], [[nodiscard]], [[deprecated]], etc.
+  // Skip [[ ... ]] attribute sequences at the start of declarations
+  while (tok && equal(tok, "[") && tok->next && equal(tok->next, "["))
+  {
+    tok = tok->next->next; // skip [[
+    int bracket_depth = 1;
+    while (tok && tok->kind != TK_EOF && bracket_depth > 0)
+    {
+      if (equal(tok, "["))
+        bracket_depth++;
+      else if (equal(tok, "]"))
+        bracket_depth--;
+      tok = tok->next;
+    }
+    // After ]], skip any trailing ]
+    if (tok && equal(tok, "]"))
+      tok = tok->next;
+  }
+  start = tok; // Update start to skip emitted attributes
+
   // Check for 'raw' keyword - skip zero-init for this declaration
   bool is_raw = false;
   if (equal(tok, "raw"))
@@ -2464,8 +2539,28 @@ static Token *try_zero_init_decl(Token *tok)
   bool is_typedef_vla = false; // True if the typedef refers to a VLA
   Token *type_end = tok;       // Will point to first token after the base type
 
-  while (is_type_qualifier(tok) || is_type_keyword(tok))
+  while (is_type_qualifier(tok) || is_type_keyword(tok) ||
+         (tok && equal(tok, "[") && tok->next && equal(tok->next, "[")))
   {
+    // Skip C23 [[ ... ]] attribute sequences (e.g., [[maybe_unused]])
+    if (equal(tok, "[") && tok->next && equal(tok->next, "["))
+    {
+      tok = tok->next->next; // skip [[
+      int bracket_depth = 1;
+      while (tok && tok->kind != TK_EOF && bracket_depth > 0)
+      {
+        if (equal(tok, "["))
+          bracket_depth++;
+        else if (equal(tok, "]"))
+          bracket_depth--;
+        tok = tok->next;
+      }
+      if (tok && equal(tok, "]"))
+        tok = tok->next;
+      type_end = tok;
+      continue;
+    }
+
     if (is_type_keyword(tok))
       saw_type = true;
     // Handle struct/union/enum followed by optional tag
@@ -2473,10 +2568,21 @@ static Token *try_zero_init_decl(Token *tok)
     {
       is_struct_type = true;
       tok = tok->next;
-      if (tok->kind == TK_IDENT)
+      // Skip attributes and alignment specifiers before tag name:
+      // struct __attribute__((packed)) TagName { ... }
+      // struct _Alignas(16) TagName { ... }
+      while (tok && (equal(tok, "__attribute__") || equal(tok, "__attribute") ||
+                     equal(tok, "_Alignas") || equal(tok, "alignas")))
+      {
+        tok = tok->next;
+        if (tok && equal(tok, "("))
+          tok = skip_balanced(tok, "(", ")");
+      }
+      // Skip tag name (identifier)
+      if (tok && tok->kind == TK_IDENT)
         tok = tok->next;
       // Could have { body } - check for VLA members before skipping
-      if (equal(tok, "{"))
+      if (tok && equal(tok, "{"))
       {
         if (struct_body_contains_true_vla(tok))
         {
@@ -2497,6 +2603,16 @@ static Token *try_zero_init_decl(Token *tok)
     // Handle typeof/typeof_unqual with parenthesized expression
     if (equal(tok, "typeof") || equal(tok, "__typeof__") || equal(tok, "__typeof") ||
         equal(tok, "typeof_unqual"))
+    {
+      saw_type = true;
+      tok = tok->next;
+      if (tok && equal(tok, "("))
+        tok = skip_balanced(tok, "(", ")");
+      type_end = tok;
+      continue;
+    }
+    // Handle C23 _BitInt(N) type
+    if (equal(tok, "_BitInt"))
     {
       saw_type = true;
       tok = tok->next;
@@ -3543,6 +3659,10 @@ static int transpile(char *input_file, char *output_file)
           else
           {
             // non-void function: { __auto_type _ret = (expr); defers; return _ret; }
+            // PORTABILITY: __auto_type is a GCC/Clang extension (also supported by TCC).
+            // Standard C alternative would require parsing the return type, which is complex.
+            // Users targeting MSVC or strict C compilers should avoid defer with return values,
+            // or use C23's typeof (once widely supported).
             static unsigned long long ret_counter = 0;
             unsigned long long my_ret = ret_counter++;
             out_printf(" { __auto_type _prism_ret_%llu = (", my_ret);
