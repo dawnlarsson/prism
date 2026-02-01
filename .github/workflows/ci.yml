@@ -7,176 +7,185 @@ on:
     branches: [ main ]
 
 jobs:
-  build-matrix:
-    name: ${{ matrix.os }} - ${{ matrix.arch }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux x86_64
-          - os: linux
-            arch: x86_64
-            runner: ubuntu-latest
-            cc: gcc
-          # Linux ARM64
-          - os: linux
-            arch: arm64
-            runner: ubuntu-24.04-arm64
-            cc: gcc
-          # macOS x86_64 (Intel)
-          - os: macos
-            arch: x86_64
-            runner: macos-15-intel
-            cc: clang
-          # macOS ARM64 (Apple Silicon)
-          - os: macos
-            arch: arm64
-            runner: macos-latest
-            cc: clang
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Dependencies (Linux)
-        if: matrix.os == 'linux'
-        run: sudo apt-get update && sudo apt-get install -y build-essential
-
-      - name: Display System Info
-        run: |
-          echo "OS: ${{ matrix.os }}"
-          echo "Architecture: ${{ matrix.arch }}"
-          uname -a
-          ${{ matrix.cc }} --version
-
-      - name: Bootstrap Prism
-        run: |
-          echo "Bootstrapping prism..."
-          ${{ matrix.cc }} -o /tmp/prism prism.c
-
-      - name: Self-Install
-        run: |
-          echo "Running self-install..."
-          /tmp/prism install
-
-          if [ -f /tmp/prism ]; then
-            echo "Cleaning up temporary binary..."
-            rm /tmp/prism
-          fi
-
-      - name: Verify Installation
-        run: |
-          echo "Verifying installation on PATH..."
-          which prism
-          prism || true
-
-      - name: Test Build Functionality
-        run: |
-          echo "Creating test C file..."
-          cat <<EOF > test_hello.c
-          #include <stdio.h>
-          int main() { printf("Hello from CI on ${{ matrix.os }} ${{ matrix.arch }}!\n"); return 0; }
-          EOF
-
-          echo "Building and running with installed prism..."
-          prism test_hello.c
-
-      - name: Run Test Suite
-        run: |
-          echo "Running all tests..."
-          prism run .github/test.c
-
-  # Alpine Linux (musl libc) - separate from matrix for container testing
-  build-alpine:
-    name: alpine - x86_64
+  # Native x86_64 builds
+  build-linux:
+    name: linux - x86_64
     runs-on: ubuntu-latest
     container: alpine:latest
     steps:
       - name: Install Build Dependencies
-        run: apk add --no-cache gcc musl-dev make git
+        run: apk add --no-cache gcc musl-dev git
 
       - uses: actions/checkout@v4
 
-      - name: Bootstrap Prism
+      - name: Display System Info
         run: |
-          echo "Bootstrapping prism..."
-          gcc -o /tmp/prism prism.c
+          echo "OS: Alpine Linux"
+          echo "Architecture: x86_64"
+          uname -a
+          gcc --version
+
+      - name: Bootstrap Prism
+        run: gcc -o /tmp/prism prism.c
 
       - name: Self-Install
         run: |
-          echo "Running self-install..."
           /tmp/prism install
-
-          if [ -f /tmp/prism ]; then
-            echo "Cleaning up temporary binary..."
-            rm /tmp/prism
-          fi
+          rm -f /tmp/prism
 
       - name: Verify Installation
         run: |
-          echo "Verifying installation on PATH..."
           which prism
           prism || true
 
       - name: Test Build Functionality
         run: |
-          echo "Creating test C file..."
           cat <<EOF > test_hello.c
           #include <stdio.h>
-          int main() { printf("Hello from Alpine CI!\n"); return 0; }
+          int main() { printf("Hello from Alpine x86_64!\n"); return 0; }
           EOF
-
-          echo "Building and running with installed prism..."
           prism test_hello.c
 
       - name: Run Test Suite
-        run: |
-          echo "Running all tests..."
-          prism run .github/test.c
+        run: prism run .github/test.c
 
-  # RISC-V testing via QEMU
+  build-macos-intel:
+    name: macos - x86_64
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Display System Info
+        run: |
+          echo "OS: macOS"
+          echo "Architecture: x86_64"
+          uname -a
+          clang --version
+
+      - name: Bootstrap Prism
+        run: clang -o /tmp/prism prism.c
+
+      - name: Self-Install
+        run: |
+          /tmp/prism install
+          rm -f /tmp/prism
+
+      - name: Verify Installation
+        run: |
+          which prism
+          prism || true
+
+      - name: Test Build Functionality
+        run: |
+          cat <<EOF > test_hello.c
+          #include <stdio.h>
+          int main() { printf("Hello from macOS x86_64!\n"); return 0; }
+          EOF
+          prism test_hello.c
+
+      - name: Run Test Suite
+        run: prism run .github/test.c
+
+  build-macos-arm:
+    name: macos - arm64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Display System Info
+        run: |
+          echo "OS: macOS"
+          echo "Architecture: arm64"
+          uname -a
+          clang --version
+
+      - name: Bootstrap Prism
+        run: clang -o /tmp/prism prism.c
+
+      - name: Self-Install
+        run: |
+          /tmp/prism install
+          rm -f /tmp/prism
+
+      - name: Verify Installation
+        run: |
+          which prism
+          prism || true
+
+      - name: Test Build Functionality
+        run: |
+          cat <<EOF > test_hello.c
+          #include <stdio.h>
+          int main() { printf("Hello from macOS arm64!\n"); return 0; }
+          EOF
+          prism test_hello.c
+
+      - name: Run Test Suite
+        run: prism run .github/test.c
+
+  # Multi-arch Alpine builds via QEMU
+  build-arm64:
+    name: linux - arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build and Test in Alpine ARM64
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            alpine:latest sh -c '
+              apk add --no-cache gcc musl-dev
+              echo "Architecture: $(uname -m)"
+              gcc --version
+              gcc -o /tmp/prism prism.c
+              /tmp/prism install
+              rm -f /tmp/prism
+              which prism
+              prism || true
+              cat <<EOF > test_hello.c
+          #include <stdio.h>
+          int main() { printf("Hello from Alpine arm64!\n"); return 0; }
+          EOF
+              prism test_hello.c
+              prism run .github/test.c
+            '
+
   build-riscv:
     name: linux - riscv64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install RISC-V Toolchain and QEMU
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-riscv64-linux-gnu qemu-user-static
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64
 
-      - name: Display System Info
+      - name: Build and Test in Alpine RISC-V
         run: |
-          echo "RISC-V cross-compilation setup"
-          riscv64-linux-gnu-gcc --version
-          qemu-riscv64-static -version
-
-      - name: Bootstrap Prism (RISC-V)
-        run: |
-          echo "Cross-compiling prism for RISC-V..."
-          riscv64-linux-gnu-gcc -static -o /tmp/prism prism.c
-
-      - name: Test RISC-V Binary
-        run: |
-          echo "Testing RISC-V binary with QEMU..."
-          qemu-riscv64-static /tmp/prism || true
-
-      - name: Test Build Functionality (RISC-V)
-        run: |
-          echo "Creating test C file..."
-          cat <<EOF > test_hello.c
+          docker run --rm --platform linux/riscv64 \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            alpine:edge sh -c '
+              apk add --no-cache gcc musl-dev
+              echo "Architecture: $(uname -m)"
+              gcc --version
+              gcc -o /tmp/prism prism.c
+              /tmp/prism install
+              rm -f /tmp/prism
+              which prism
+              prism || true
+              cat <<EOF > test_hello.c
           #include <stdio.h>
-          int main() { printf("Hello from RISC-V CI!\n"); return 0; }
+          int main() { printf("Hello from Alpine riscv64!\n"); return 0; }
           EOF
-
-          echo "Cross-compiling test file..."
-          riscv64-linux-gnu-gcc -static -o test_hello test_hello.c
-
-          echo "Running RISC-V binary with QEMU..."
-          qemu-riscv64-static ./test_hello
-
-      - name: Run Test Suite (RISC-V)
-        run: |
-          echo "Running all tests on RISC-V..."
-          qemu-riscv64-static /tmp/prism run .github/test.c
+              prism test_hello.c
+              prism run .github/test.c
+            '
