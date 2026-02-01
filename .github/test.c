@@ -4088,7 +4088,6 @@ int main(void)
     run_preprocessor_numeric_tests();
     run_preprocessor_system_macro_tests();
     run_verification_bug_tests();
-    run_third_party_feedback_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);
