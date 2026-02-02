@@ -4364,6 +4364,162 @@ void test_typeof_vla_zeroinit(void)
     CHECK(copy_vla[0] == 99, "typeof(VLA) variable works without zero-init");
 }
 
+void test_bug1_ghost_shadow_while(void)
+{
+    typedef int U;
+    int x = 5;
+    while (x-- > 0)
+    {
+        int U = x; // Shadow inside braced body
+        (void)U;
+    }
+    U *ptr = NULL;
+    CHECK(ptr == NULL, "typedef U works after while with shadow");
+}
+
+void test_bug1_ghost_shadow_if(void)
+{
+    typedef int V;
+    if (1)
+        ;
+    V *ptr = NULL;
+    CHECK(ptr == NULL, "typedef V works after braceless if");
+}
+
+void test_bug2_ultra_complex_exact(void)
+{
+    // Exact example from bug report: pointer to array of 5 function pointers
+    int (*(*complex_var)[5])(void);
+    CHECK(complex_var == NULL, "ultra-complex declarator from report");
+}
+
+void test_bug2_deeply_nested_parens(void)
+{
+    // Even more nested: pointer to function returning pointer to array
+    int (*(*fp)(int))[10];
+    CHECK(fp == NULL, "deeply nested paren declarator");
+}
+
+static int defer_value_3rdparty = 0;
+
+void test_bug3_stmtexpr_defer_ordering(void)
+{
+    defer_value_3rdparty = 0;
+
+    // Test defer in nested block within statement expression
+    int x = ({
+        int val = 10;
+        {
+            defer
+            {
+                defer_value_3rdparty = val;
+            };
+            val = val + 5; // Modify to 15
+        }
+        val; // Return 15
+    });
+
+    CHECK(x == 15, "statement-expr with nested defer");
+    CHECK(defer_value_3rdparty == 15, "defer captured value");
+}
+
+void test_bug3_stmtexpr_defer_variable(void)
+{
+    int result = ({
+        int tmp = 42;
+        {
+            defer tmp = 999;
+        }
+        tmp; // Return 999
+    });
+
+    CHECK(result == 999, "defer modifies variable correctly");
+}
+
+void test_bug4_generic_fnptr(void)
+{
+    // Exact pattern from bug report: function pointer in _Generic
+    int x = _Generic(0, void (*)(int): 1, default: 0);
+    CHECK(x == 0, "_Generic with fn ptr type");
+}
+
+void test_bug4_generic_defer_interaction(void)
+{
+    int result = 0;
+    {
+        defer result = 1;
+        int y = _Generic((int *)0, int *: 5, void (*)(int): 10, default: 15);
+        result = y; // Should be 5
+    }
+    // Defer runs after, result = 1
+    CHECK(result == 1, "defer doesn't break _Generic");
+}
+
+void test_bug7_sizeof_vla_variable(void)
+{
+    int n = 5;
+    int vla[n]; // VLA
+    vla[0] = 42;
+
+    // CRITICAL: sizeof(vla) is evaluated at runtime!
+    // Array x is also a VLA, should NOT be zero-initialized
+    int x[sizeof(vla)];
+    x[0] = 99;
+
+    CHECK(vla[0] == 42 && x[0] == 99, "3rd-party bug #7: sizeof(vla) creates VLA");
+}
+
+void test_bug7_sizeof_sizeof_vla(void)
+{
+    int n = 3;
+    int arr1[n]; // VLA
+    arr1[0] = 1;
+
+    // sizeof(sizeof(arr1)) is sizeof(size_t) - constant
+    int arr2[sizeof(sizeof(arr1))];
+    arr2[0] = 2;
+
+    CHECK(arr1[0] == 1 && arr2[0] == 2, "sizeof(sizeof(VLA))");
+}
+
+void test_bug7_sizeof_vla_element(void)
+{
+    int m = 4;
+    int inner[m]; // VLA
+    inner[0] = 10;
+
+    // sizeof(inner[0]) is sizeof(int) - constant!
+    int outer[sizeof(inner[0])];
+    // outer should be zero-initialized
+    CHECK(outer[0] == 0, "sizeof(VLA[0]) is constant");
+}
+
+void test_edge_multiple_typedef_shadows(void)
+{
+    typedef int T;
+    {
+        int T = 5;
+        CHECK(T == 5, "3rd-party edge: first shadow level");
+        {
+            int T = 10;
+            CHECK(T == 10, "second shadow level");
+        }
+        CHECK(T == 5, "back to first shadow");
+    }
+    T *ptr = NULL;
+    CHECK(ptr == NULL, "typedef restored after shadows");
+}
+
+void test_edge_defer_in_generic(void)
+{
+    int result = 0;
+    {
+        int x = _Generic(1, int: 10, default: 20);
+        defer result = x;
+    }
+    CHECK(result == 10, "defer with _Generic");
+}
+
 void run_verification_bug_tests(void)
 {
     printf("\n=== VERIFICATION TESTS ===\n");
@@ -4423,6 +4579,25 @@ void run_verification_bug_tests(void)
     test_keyword_typedef_collision();
     test_sizeof_vla_typedef();
     test_typeof_vla_zeroinit();
+
+    test_bug1_ghost_shadow_while();
+    test_bug1_ghost_shadow_if();
+
+    test_bug2_ultra_complex_exact();
+    test_bug2_deeply_nested_parens();
+
+    test_bug3_stmtexpr_defer_ordering();
+    test_bug3_stmtexpr_defer_variable();
+
+    test_bug4_generic_fnptr();
+    test_bug4_generic_defer_interaction();
+
+    test_bug7_sizeof_vla_variable();
+    test_bug7_sizeof_sizeof_vla();
+    test_bug7_sizeof_vla_element();
+
+    test_edge_multiple_typedef_shadows();
+    test_edge_defer_in_generic();
 }
 
 // MAIN

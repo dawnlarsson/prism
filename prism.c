@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.94.1"
+#define PRISM_VERSION "0.95.0"
 
 #include "parse.c"
 
@@ -2432,6 +2432,69 @@ static bool is_const_array_size(Token *open_bracket)
               found_vla_in_sizeof = true;
             }
 
+            // Check if sizeof argument is a simple identifier (potentially a VLA variable)
+            // Example: int n=5; int vla[n]; int x[sizeof(vla)]; <- sizeof(vla) is runtime!
+            // We can't track all VLA variables, so be conservative: if sizeof(identifier) where
+            // identifier is not a typedef/keyword/enum, treat it as potentially a VLA variable.
+            // HOWEVER: sizeof(var[...]) is always constant (size of element type), allow that.
+            // ALSO: sizeof(var.member) or sizeof(var->member) is constant, allow that too.
+            if (!found_vla_in_sizeof && sizeof_tok && sizeof_tok->kind == TK_IDENT &&
+                !is_known_typedef(sizeof_tok) && !is_type_keyword(sizeof_tok) &&
+                !is_known_enum_const(sizeof_tok) && !looks_like_system_typedef(sizeof_tok))
+            {
+              // Check what follows the identifier
+              Token *after_ident = sizeof_tok->next;
+              if (after_ident && equal(after_ident, ")"))
+              {
+                // sizeof(identifier) - could be a VLA variable
+                // BUT check for array element count idiom: sizeof(arr) / sizeof(arr[0])
+                // If we see the same identifier later with [0], it's likely this idiom
+                bool is_array_count_idiom = false;
+                Token *lookahead = after_ident->next; // Token after the closing )
+                if (lookahead && equal(lookahead, "/"))
+                {
+                  lookahead = lookahead->next;
+                  // Skip whitespace and look for sizeof
+                  if (lookahead && equal(lookahead, "sizeof"))
+                  {
+                    lookahead = lookahead->next;
+                    if (lookahead && equal(lookahead, "("))
+                    {
+                      lookahead = lookahead->next;
+                      // Check if it's the same identifier
+                      if (lookahead && lookahead->kind == TK_IDENT &&
+                          lookahead->len == sizeof_tok->len &&
+                          memcmp(lookahead->loc, sizeof_tok->loc, sizeof_tok->len) == 0)
+                      {
+                        lookahead = lookahead->next;
+                        // Check for [0] or [anything]
+                        if (lookahead && equal(lookahead, "["))
+                        {
+                          is_array_count_idiom = true;
+                        }
+                      }
+                    }
+                  }
+                }
+
+                if (!is_array_count_idiom)
+                {
+                  // sizeof(identifier) without array count idiom - be conservative
+                  found_vla_in_sizeof = true;
+                }
+              }
+              // If followed by '[', '.', or '->', it's accessing a member/element (always constant size)
+              // Example: sizeof(arr[0]) or sizeof(s.member) or sizeof(p->member)
+              // These are always compile-time constant
+              else if (!after_ident ||
+                       !(equal(after_ident, "[") || equal(after_ident, ".") ||
+                         equal(after_ident, "->")))
+              {
+                // Something else follows, could be operators/parens, keep scanning
+                // Don't mark as VLA yet, let the normal scanning continue
+              }
+            }
+
             // Scan the sizeof argument for array dimensions with variables
             while (sizeof_tok && sizeof_tok->kind != TK_EOF && paren_depth > 0 && !found_vla_in_sizeof)
             {
@@ -2710,7 +2773,7 @@ static Token *try_zero_init_decl(Token *tok)
     if (equal(tok, "_Atomic") && tok->next && equal(tok->next, "("))
     {
       saw_type = true;
-      has_atomic = true; // Track _Atomic for zero-init
+      has_atomic = true;                  // Track _Atomic for zero-init
       tok = tok->next;                    // skip _Atomic
       tok = skip_balanced(tok, "(", ")"); // skip (type)
       type_end = tok;
@@ -4828,10 +4891,81 @@ static const char *get_real_cc(const char *cc)
 {
   if (!cc || !*cc)
     return "cc"; // NULL or empty string
+
+  // Simple check: if basename is "prism" or "prism.exe", return "cc"
   const char *base = strrchr(cc, '/');
   base = base ? base + 1 : cc;
   if (strcmp(base, "prism") == 0 || strcmp(base, "prism.exe") == 0)
     return "cc";
+
+#ifdef __linux__
+  // Advanced check: resolve symlinks and compare with current executable
+  // This prevents infinite recursion if prism is symlinked to another name
+  // Example: ln -s prism my-compiler && CC=./my-compiler ./my-compiler test.c
+  char cc_real[PATH_MAX];
+  char self_real[PATH_MAX];
+
+  // Resolve the CC path (follow symlinks)
+  ssize_t cc_len = readlink(cc, cc_real, sizeof(cc_real) - 1);
+  if (cc_len == -1)
+  {
+    // Not a symlink, use the path as-is
+    // But still check if it points to the same file via realpath
+    if (realpath(cc, cc_real) == NULL)
+    {
+      // Can't resolve, assume it's not prism
+      return cc;
+    }
+  }
+  else
+  {
+    cc_real[cc_len] = '\0';
+
+    // If relative symlink, resolve relative to directory containing the link
+    if (cc_real[0] != '/')
+    {
+      char cc_dir[PATH_MAX];
+      strncpy(cc_dir, cc, sizeof(cc_dir) - 1);
+      cc_dir[sizeof(cc_dir) - 1] = '\0';
+      char *last_slash = strrchr(cc_dir, '/');
+      if (last_slash)
+        *last_slash = '\0';
+      else
+        strcpy(cc_dir, ".");
+
+      char temp[PATH_MAX];
+      snprintf(temp, sizeof(temp), "%s/%s", cc_dir, cc_real);
+      if (realpath(temp, cc_real) == NULL)
+        return cc;
+    }
+    else
+    {
+      // Absolute symlink, but still resolve in case it's a chain
+      char temp[PATH_MAX];
+      strncpy(temp, cc_real, sizeof(temp) - 1);
+      temp[sizeof(temp) - 1] = '\0';
+      if (realpath(temp, cc_real) == NULL)
+        return cc;
+    }
+  }
+
+  // Get the path of the current executable
+  ssize_t self_len = readlink("/proc/self/exe", self_real, sizeof(self_real) - 1);
+  if (self_len == -1)
+  {
+    // Can't read /proc/self/exe, fall back to simple check
+    return cc;
+  }
+  self_real[self_len] = '\0';
+
+  // Compare the resolved paths
+  if (strcmp(cc_real, self_real) == 0)
+  {
+    // CC points to prism itself (possibly via symlink), use "cc" instead
+    return "cc";
+  }
+#endif
+
   return cc;
 }
 
