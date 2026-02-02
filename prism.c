@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.94.0"
+#define PRISM_VERSION "0.94.1"
 
 #include "parse.c"
 
@@ -2614,11 +2614,16 @@ static Token *try_zero_init_decl(Token *tok)
   bool is_typedef_type = false;
   bool is_typedef_vla = false; // True if the typedef refers to a VLA
   bool has_typeof = false;     // True if using typeof/typeof_unqual/__typeof__
+  bool has_atomic = false;     // True if using _Atomic qualifier or _Atomic(type) specifier
   Token *type_end = tok;       // Will point to first token after the base type
 
   while (is_type_qualifier(tok) || is_type_keyword(tok) ||
          (tok && equal(tok, "[") && tok->next && equal(tok->next, "[")))
   {
+    // Track _Atomic qualifier for zero-init (clang on macOS requires = 0, not = {0})
+    if (equal(tok, "_Atomic"))
+      has_atomic = true;
+
     // Skip C23 [[ ... ]] attribute sequences (e.g., [[maybe_unused]])
     if (equal(tok, "[") && tok->next && equal(tok->next, "["))
     {
@@ -2705,6 +2710,7 @@ static Token *try_zero_init_decl(Token *tok)
     if (equal(tok, "_Atomic") && tok->next && equal(tok->next, "("))
     {
       saw_type = true;
+      has_atomic = true; // Track _Atomic for zero-init
       tok = tok->next;                    // skip _Atomic
       tok = skip_balanced(tok, "(", ")"); // skip (type)
       type_end = tok;
@@ -3248,7 +3254,10 @@ static Token *try_zero_init_decl(Token *tok)
     // Add zero initializer if no existing initializer, not a VLA, and not raw
     if (!has_init && !effective_vla && !is_raw)
     {
-      if (is_array || ((is_struct_type || is_typedef_type) && !is_pointer))
+      // _Atomic types must use = 0 (not = {0}) for clang compatibility on macOS
+      if (has_atomic)
+        out_str(" = 0", 4);
+      else if (is_array || ((is_struct_type || is_typedef_type) && !is_pointer))
         out_str(" = {0}", 6);
       else
         out_str(" = 0", 4);
