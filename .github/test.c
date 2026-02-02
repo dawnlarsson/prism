@@ -4687,6 +4687,76 @@ void test_valid_number_suffixes(void)
     CHECK(ld2 == 1.0L, "suffix: 1.0L works");
 }
 
+int test_return_zeroinit_no_defer_helper(void)
+{
+    return ({
+        int x;
+        x;
+    });
+}
+
+int test_return_zeroinit_with_defer_helper(void)
+{
+    int *p = malloc(1);
+    defer free(p);
+
+    return ({
+        int x;
+        x;
+    });
+}
+
+int test_return_zeroinit_multiple_helper(void)
+{
+    int *p = malloc(1);
+    defer free(p);
+
+    return ({
+        int a;
+        int b;
+        a + b;
+    });
+}
+
+int test_return_zeroinit_nested_helper(void)
+{
+    int *p = malloc(1);
+    defer free(p);
+
+    return ({
+        int outer;
+        {
+            int inner;
+            outer = inner;
+        }
+        outer;
+    });
+}
+
+void test_return_zeroinit_no_defer(void)
+{
+    int result = test_return_zeroinit_no_defer_helper();
+    CHECK(result == 0, "return stmt-expr zero-init without defer");
+}
+
+void test_return_zeroinit_with_defer(void)
+{
+    int result = test_return_zeroinit_with_defer_helper();
+    CHECK(result == 0, "return stmt-expr zero-init WITH defer (blind spot)");
+}
+
+void test_return_zeroinit_multiple_decls(void)
+{
+    int result = test_return_zeroinit_multiple_helper();
+    CHECK(result == 0, "return stmt-expr multiple zero-inits with defer");
+}
+
+void test_return_zeroinit_nested_blocks(void)
+{
+    int result = test_return_zeroinit_nested_helper();
+    CHECK(result == 0, "return stmt-expr nested block zero-init with defer");
+}
+
 void run_verification_bug_tests(void)
 {
     printf("\n=== VERIFICATION TESTS ===\n");
@@ -4772,6 +4842,11 @@ void run_verification_bug_tests(void)
     test_hex_numbers_vs_float_suffixes();
     test_hex_and_identifier_edge_cases();
     test_valid_number_suffixes();
+
+    test_return_zeroinit_no_defer();
+    test_return_zeroinit_with_defer();
+    test_return_zeroinit_multiple_decls();
+    test_return_zeroinit_nested_blocks();
 }
 
 int main(void)

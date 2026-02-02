@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.97.0"
+#define PRISM_VERSION "0.97.5"
 
 #include "parse.c"
 
@@ -3909,16 +3909,44 @@ static int transpile(char *input_file, char *output_file)
             // The expression is executed for side effects, then we return void
             out_str(" { (", 4);
             int depth = 0;
+            bool expr_at_stmt_start = false;
+            Token *prev_tok = NULL;
             while (tok->kind != TK_EOF)
             {
               if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
+              {
                 depth++;
+                // After opening brace in statement expression, we're at statement start
+                if (equal(tok, "{"))
+                  expr_at_stmt_start = true;
+              }
               else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
                 depth--;
               else if (depth == 0 && equal(tok, ";"))
                 break;
+
+              // Try zero-init for declarations at statement start within the expression
+              if (expr_at_stmt_start && feature_zeroinit)
+              {
+                Token *next = try_zero_init_decl(tok);
+                if (next)
+                {
+                  tok = next;
+                  expr_at_stmt_start = true;
+                  continue;
+                }
+                expr_at_stmt_start = false;
+              }
+
               emit_tok(tok);
+              prev_tok = tok;
               tok = tok->next;
+
+              // Track statement boundaries: after '{', ';' or '}' we're at statement start
+              if (prev_tok && (equal(prev_tok, "{") || equal(prev_tok, ";") || equal(prev_tok, "}")))
+                expr_at_stmt_start = true;
+              else
+                expr_at_stmt_start = false;
             }
             out_str(");", 2);
             emit_all_defers();
@@ -3940,16 +3968,44 @@ static int transpile(char *input_file, char *output_file)
 
             // Emit expression until semicolon (tracking depth for statement-exprs)
             int depth = 0;
+            bool expr_at_stmt_start = false;
+            Token *prev_tok = NULL;
             while (tok->kind != TK_EOF)
             {
               if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
+              {
                 depth++;
+                // After opening brace in statement expression, we're at statement start
+                if (equal(tok, "{"))
+                  expr_at_stmt_start = true;
+              }
               else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
                 depth--;
               else if (depth == 0 && equal(tok, ";"))
                 break;
+
+              // Try zero-init for declarations at statement start within the expression
+              if (expr_at_stmt_start && feature_zeroinit)
+              {
+                Token *next = try_zero_init_decl(tok);
+                if (next)
+                {
+                  tok = next;
+                  expr_at_stmt_start = true;
+                  continue;
+                }
+                expr_at_stmt_start = false;
+              }
+
               emit_tok(tok);
+              prev_tok = tok;
               tok = tok->next;
+
+              // Track statement boundaries: after '{', ';' or '}' we're at statement start
+              if (prev_tok && (equal(prev_tok, "{") || equal(prev_tok, ";") || equal(prev_tok, "}")))
+                expr_at_stmt_start = true;
+              else
+                expr_at_stmt_start = false;
             }
 
             out_str(");", 2);
