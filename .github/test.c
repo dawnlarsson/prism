@@ -4528,12 +4528,163 @@ void test_attributed_label_defer(void)
         goto error;
     }
 
-    // GCC syntax: attribute after colon (not before)
-    // Prism label scanner should recognize this label
-    error: __attribute__((unused))
-        log_append("Error");
+// GCC syntax: attribute after colon (not before)
+// Prism label scanner should recognize this label
+error:
+    __attribute__((unused))
+    log_append("Error");
 
     CHECK(strcmp(log_buffer, "CleanupError") == 0, "attributed label defer cleanup");
+}
+
+void test_number_tokenizer_identifiers(void)
+{
+// Test that identifiers starting with letters beyond hex range aren't consumed
+// These patterns appear in binutils i386-tbl.h
+#define MN_test 0xf64
+#define SPACE_test 200
+
+    int arr1[] = {2, MN_test, 3, SPACE_test};
+    CHECK(arr1[0] == 2, "tokenizer: array element 0 is 2");
+    CHECK(arr1[1] == 0xf64, "tokenizer: MN_test expands to 0xf64");
+    CHECK(arr1[2] == 3, "tokenizer: array element 2 is 3");
+    CHECK(arr1[3] == 200, "tokenizer: SPACE_test expands to 200");
+
+    // Test that hex numbers followed by identifiers work correctly
+    int x = 0x82;
+    int MN_invpcid = 100;
+    CHECK(x == 0x82, "tokenizer: hex number 0x82 parsed correctly");
+    CHECK(MN_invpcid == 100, "tokenizer: identifier MN_invpcid separate from hex");
+
+    // Test edge cases with different identifier prefixes
+    int val1 = 0xAB;
+    int MN_other = 500;
+    int SPACE_other = 600;
+    CHECK(val1 == 0xAB, "tokenizer: hex 0xAB parsed correctly");
+    CHECK(MN_other == 500, "tokenizer: MN_ identifier works");
+    CHECK(SPACE_other == 600, "tokenizer: SPACE_ identifier works");
+}
+
+void test_hex_numbers_vs_float_suffixes(void)
+{
+    // Test hex patterns that look like C23 float suffixes
+    unsigned int h1 = 0xf64;
+    CHECK(h1 == 3940, "hex: 0xf64 not confused with F64 suffix");
+
+    unsigned int h2 = 0xf32;
+    CHECK(h2 == 3890, "hex: 0xf32 not confused with F32 suffix");
+
+    unsigned int h3 = 0xf16;
+    CHECK(h3 == 3862, "hex: 0xf16 not confused with F16 suffix");
+
+    unsigned int h4 = 0xbf16;
+    CHECK(h4 == 48918, "hex: 0xbf16 not confused with BF16 suffix");
+
+    unsigned int h5 = 0xf128;
+    CHECK(h5 == 61736, "hex: 0xf128 not confused with F128 suffix");
+
+    // Test that real float suffixes still work
+    float f1 = 1.0f;
+    double d1 = 1.0;
+    long double ld1 = 1.0L;
+    CHECK(f1 == 1.0f, "hex: float suffix f still works");
+    CHECK(d1 == 1.0, "hex: double still works");
+    CHECK(ld1 == 1.0L, "hex: long double suffix L still works");
+
+    // Test combinations in array
+    int arr[] = {0xf64, 0xf32, 0xf16, 0xabc, 0x123};
+    CHECK(arr[0] == 0xf64, "hex: array[0] = 0xf64");
+    CHECK(arr[1] == 0xf32, "hex: array[1] = 0xf32");
+    CHECK(arr[2] == 0xf16, "hex: array[2] = 0xf16");
+    CHECK(arr[3] == 0xabc, "hex: array[3] = 0xabc");
+    CHECK(arr[4] == 0x123, "hex: array[4] = 0x123");
+}
+
+void test_hex_and_identifier_edge_cases(void)
+{
+// Macro expansion with hex that looks like float suffix
+#define HEX_F64 0xf64
+#define HEX_F32 0xf32
+
+    int val1 = HEX_F64;
+    int val2 = HEX_F32;
+    CHECK(val1 == 0xf64, "edge: macro HEX_F64 expands correctly");
+    CHECK(val2 == 0xf32, "edge: macro HEX_F32 expands correctly");
+
+    // Array initializers (binutils pattern)
+    struct test_struct
+    {
+        int a;
+        int b;
+        int c;
+    };
+
+    struct test_struct s1 = {0xf64, 0x82, 2};
+    CHECK(s1.a == 0xf64, "edge: struct init with 0xf64");
+    CHECK(s1.b == 0x82, "edge: struct init with 0x82");
+    CHECK(s1.c == 2, "edge: struct init with 2");
+
+// Nested macros
+#define OUTER_MACRO 0xf64
+#define INNER_MACRO OUTER_MACRO
+    int nested = INNER_MACRO;
+    CHECK(nested == 0xf64, "edge: nested macro expansion");
+
+    // Hex numbers in expressions
+    int expr1 = 0xf64 + 0xf32;
+    CHECK(expr1 == (0xf64 + 0xf32), "edge: hex addition");
+
+    int expr2 = 0xf64 | 0xf32;
+    CHECK(expr2 == (0xf64 | 0xf32), "edge: hex bitwise OR");
+
+    // Binary numbers (should also not be confused with suffixes)
+    int bin1 = 0b1111;
+    CHECK(bin1 == 15, "edge: binary literal works");
+}
+
+// Test that valid number suffixes still work after the fix
+void test_valid_number_suffixes(void)
+{
+    // Integer suffixes
+    unsigned int u1 = 100u;
+    unsigned int u2 = 100U;
+    long l1 = 100l;
+    long l2 = 100L;
+    unsigned long ul1 = 100ul;
+    unsigned long ul2 = 100UL;
+    unsigned long long ull1 = 100ull;
+    unsigned long long ull2 = 100ULL;
+
+    CHECK(u1 == 100, "suffix: 100u works");
+    CHECK(u2 == 100, "suffix: 100U works");
+    CHECK(l1 == 100, "suffix: 100l works");
+    CHECK(l2 == 100, "suffix: 100L works");
+    CHECK(ul1 == 100, "suffix: 100ul works");
+    CHECK(ul2 == 100, "suffix: 100UL works");
+    CHECK(ull1 == 100, "suffix: 100ull works");
+    CHECK(ull2 == 100, "suffix: 100ULL works");
+
+    // Hex with suffixes
+    unsigned int hu1 = 0xFFu;
+    unsigned int hu2 = 0xFFU;
+    unsigned long hul = 0xFFUL;
+    unsigned long long hull = 0xFFULL;
+
+    CHECK(hu1 == 255, "suffix: 0xFFu works");
+    CHECK(hu2 == 255, "suffix: 0xFFU works");
+    CHECK(hul == 255, "suffix: 0xFFUL works");
+    CHECK(hull == 255, "suffix: 0xFFULL works");
+
+    // Float suffixes
+    float f1 = 1.0f;
+    float f2 = 1.0F;
+    long double ld1 = 1.0l;
+    long double ld2 = 1.0L;
+
+    CHECK(f1 == 1.0f, "suffix: 1.0f works");
+    CHECK(f2 == 1.0F, "suffix: 1.0F works");
+    CHECK(ld1 == 1.0L, "suffix: 1.0l works");
+    CHECK(ld2 == 1.0L, "suffix: 1.0L works");
 }
 
 void run_verification_bug_tests(void)
@@ -4616,9 +4767,12 @@ void run_verification_bug_tests(void)
 
     test_edge_multiple_typedef_shadows();
     test_edge_defer_in_generic();
-}
 
-// MAIN
+    test_number_tokenizer_identifiers();
+    test_hex_numbers_vs_float_suffixes();
+    test_hex_and_identifier_edge_cases();
+    test_valid_number_suffixes();
+}
 
 int main(void)
 {

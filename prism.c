@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.96.0"
+#define PRISM_VERSION "0.97.0"
 
 #include "parse.c"
 
@@ -5127,6 +5127,64 @@ static void cli_add_cc_arg(Cli *cli, const char *arg)
   cli->cc_args[cli->cc_arg_count++] = arg;
 }
 
+static bool is_assembly_file(const char *arg)
+{
+  size_t len = strlen(arg);
+  if (len < 2)
+    return false;
+  // .s/.S files (assembly) - should pass through without transpilation
+  return (!strcmp(arg + len - 2, ".s") || !strcmp(arg + len - 2, ".S"));
+}
+
+static bool is_cpp_file(const char *arg)
+{
+  size_t len = strlen(arg);
+  if (len < 3)
+    return false;
+
+  // C++ extensions: .cc, .cpp, .cxx, .C, .c++
+  if (len >= 3 && !strcmp(arg + len - 3, ".cc"))
+    return true;
+  if (len >= 4 && !strcmp(arg + len - 4, ".cpp"))
+    return true;
+  if (len >= 4 && !strcmp(arg + len - 4, ".cxx"))
+    return true;
+  if (len >= 4 && !strcmp(arg + len - 4, ".c++"))
+    return true;
+  if (len >= 2 && !strcmp(arg + len - 2, ".C"))
+    return true;
+
+  // Objective-C++: .mm
+  if (len >= 3 && !strcmp(arg + len - 3, ".mm"))
+    return true;
+
+  return false;
+}
+
+static bool is_objc_file(const char *arg)
+{
+  size_t len = strlen(arg);
+  if (len < 2)
+    return false;
+
+  // Objective-C: .m (but not .mm which is Objective-C++)
+  if (len >= 2 && !strcmp(arg + len - 2, ".m"))
+  {
+    // Make sure it's not .mm
+    if (len >= 3 && !strcmp(arg + len - 3, ".mm"))
+      return false;
+    return true;
+  }
+
+  return false;
+}
+
+static bool needs_passthrough(const char *arg)
+{
+  // Files that should not be transpiled
+  return is_assembly_file(arg) || is_cpp_file(arg) || is_objc_file(arg);
+}
+
 static bool is_source_file(const char *arg)
 {
   size_t len = strlen(arg);
@@ -5141,16 +5199,10 @@ static bool is_source_file(const char *arg)
   // .s/.S files (assembly)
   if (len >= 2 && (!strcmp(arg + len - 2, ".s") || !strcmp(arg + len - 2, ".S")))
     return true;
+  // C++/Objective-C files (will be passed through without transpilation)
+  if (is_cpp_file(arg) || is_objc_file(arg))
+    return true;
   return false;
-}
-
-static bool is_assembly_file(const char *arg)
-{
-  size_t len = strlen(arg);
-  if (len < 2)
-    return false;
-  // .s/.S files (assembly) - should pass through without transpilation
-  return (!strcmp(arg + len - 2, ".s") || !strcmp(arg + len - 2, ".S"));
 }
 
 static bool str_startswith(const char *s, const char *prefix)
@@ -5522,14 +5574,15 @@ static Cli cli_parse(int argc, char **argv)
     }
 
     // ─── Everything else: pass through to CC ───
-    // Also track flags that affect preprocessing
+    // Also track flags that affect preprocessing (but not warnings)
+    // Note: -W* warning flags are NOT passed to preprocessor as they can
+    // trigger false errors on preprocessed output (e.g., trailing whitespace in macros)
     if (strncmp(arg, "-std=", 5) == 0 ||
-        strncmp(arg, "-m", 2) == 0 ||          // -m32, -m64, -march=, -mtune=, etc.
+        strncmp(arg, "-m", 2) == 0 || // -m32, -m64, -march=, -mtune=, etc.
         strncmp(arg, "--target=", 9) == 0 ||
-        strncmp(arg, "-f", 2) == 0 ||          // -fPIC, -fpic, -fno-*, feature flags
-        strncmp(arg, "-W", 2) == 0 ||          // warning flags (can affect preprocessor)
-        strncmp(arg, "-O", 2) == 0 ||          // optimization (can affect __OPTIMIZE__)
-        strncmp(arg, "-g", 2) == 0 ||          // debug flags
+        strncmp(arg, "-f", 2) == 0 || // -fPIC, -fpic, -fno-*, feature flags
+        strncmp(arg, "-O", 2) == 0 || // optimization (can affect __OPTIMIZE__)
+        strncmp(arg, "-g", 2) == 0 || // debug flags
         strcmp(arg, "-pthread") == 0 ||
         strcmp(arg, "-pthreads") == 0 ||
         strcmp(arg, "-mthreads") == 0 ||
@@ -5909,11 +5962,42 @@ int main(int argc, char **argv)
   if (cli.source_count == 0)
     die("No source files specified");
 
+  // Check if we have any C++/Objective-C files
+  bool has_cpp_files = false;
+  bool has_objc_files = false;
+  for (int i = 0; i < cli.source_count; i++)
+  {
+    if (is_cpp_file(cli.sources[i]))
+      has_cpp_files = true;
+    if (is_objc_file(cli.sources[i]))
+      has_objc_files = true;
+  }
+
   // Determine compiler
   const char *compiler = get_real_cc(cli.cc);
   char *cross_cc = get_compiler_for_cross(cli.cross_arch, cli.cross_bits, cli.cross_platform);
   if (cross_cc)
     compiler = cross_cc;
+
+  // Switch to C++/Objective-C compiler if needed
+  if (has_cpp_files || has_objc_files)
+  {
+    // Map C compiler to C++ compiler
+    if (strstr(compiler, "gcc") || strstr(compiler, "cc"))
+    {
+      compiler = has_cpp_files ? "g++" : "gcc";
+    }
+    else if (strstr(compiler, "clang"))
+    {
+      compiler = has_cpp_files ? "clang++" : "clang";
+    }
+
+    if (cli.verbose)
+    {
+      fprintf(stderr, "[prism] Detected %s files, switching to %s\n",
+              has_cpp_files ? "C++" : "Objective-C", compiler);
+    }
+  }
 
   // Transpile all sources to temp files (skip assembly files - pass through directly)
   char **temp_files = calloc(cli.source_count, sizeof(char *));
@@ -5922,12 +6006,18 @@ int main(int argc, char **argv)
 
   for (int i = 0; i < cli.source_count; i++)
   {
-    // Assembly files (.s, .S) don't need transpilation - pass through directly
-    if (is_assembly_file(cli.sources[i]))
+    // Assembly, C++, and Objective-C files don't need transpilation - pass through directly
+    if (needs_passthrough(cli.sources[i]))
     {
       temp_files[i] = strdup(cli.sources[i]);
       if (!temp_files[i])
         die("Out of memory");
+      if (cli.verbose)
+      {
+        const char *type = is_assembly_file(cli.sources[i]) ? "assembly" : is_cpp_file(cli.sources[i]) ? "C++"
+                                                                                                       : "Objective-C";
+        fprintf(stderr, "[prism] Passing through %s file: %s\n", type, cli.sources[i]);
+      }
       continue;
     }
 
@@ -5939,7 +6029,7 @@ int main(int argc, char **argv)
     {
       for (int j = 0; j < i; j++)
       {
-        if (!is_assembly_file(cli.sources[j]))
+        if (!needs_passthrough(cli.sources[j]))
           remove(temp_files[j]);
         free(temp_files[j]);
       }
@@ -5954,7 +6044,7 @@ int main(int argc, char **argv)
     {
       for (int j = 0; j <= i; j++)
       {
-        if (!is_assembly_file(cli.sources[j]))
+        if (!needs_passthrough(cli.sources[j]))
           remove(temp_files[j]);
         free(temp_files[j]);
       }
@@ -5991,6 +6081,18 @@ int main(int argc, char **argv)
   // Add pass-through args
   for (int i = 0; i < cli.cc_arg_count; i++)
     argv_builder_add(&ab, cli.cc_args[i]);
+
+  // Suppress warnings from inlined system headers and preprocessed code
+  // These come from system headers expanded during preprocessing, or intentional
+  // fallthrough patterns in external code (binutils, coreutils, etc.)
+  argv_builder_add(&ab, "-Wno-type-limits");          // wchar.h unsigned >= 0
+  argv_builder_add(&ab, "-Wno-cast-align");           // SSE/AVX intrinsics
+  argv_builder_add(&ab, "-Wno-logical-op");           // errno EAGAIN==EWOULDBLOCK
+  argv_builder_add(&ab, "-Wno-implicit-fallthrough"); // switch fallthrough patterns
+  argv_builder_add(&ab, "-Wno-unused-function");      // system inline functions
+  argv_builder_add(&ab, "-Wno-unused-variable");      // system variables
+  argv_builder_add(&ab, "-Wno-unused-parameter");     // system function params
+  argv_builder_add(&ab, "-Wno-maybe-uninitialized");  // false positives in preprocessed code
 
   // Add -c for compile-only mode
   if (cli.mode == CLI_MODE_COMPILE_ONLY)
@@ -6041,7 +6143,7 @@ int main(int argc, char **argv)
   // Cleanup temp source files (but not assembly files - those are originals)
   for (int i = 0; i < cli.source_count; i++)
   {
-    if (!is_assembly_file(cli.sources[i]))
+    if (!needs_passthrough(cli.sources[i]))
       remove(temp_files[i]);
     free(temp_files[i]);
   }

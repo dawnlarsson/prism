@@ -731,7 +731,8 @@ static void convert_pp_number(Token *tok)
     bool is_bin = (p[0] == '0' && (p[1] == 'b' || p[1] == 'B'));
 
     // Check for C23 extended float suffixes first
-    if (has_extended_float_suffix(p, tok->len))
+    // BUT NOT if it's a hex/binary number (to avoid false matches like 0xf64 matching F64 suffix)
+    if (!is_hex && !is_bin && has_extended_float_suffix(p, tok->len))
     {
         tok->kind = TK_NUM;
         tok->flags |= TF_IS_FLOAT;
@@ -1043,9 +1044,31 @@ static Token *tokenize(File *file)
                 {
                     p += 2;
                 }
-                else if (isalnum(*p) || *p == '.')
+                else if (isdigit(*p) || *p == '.' || *p == '_')
                 {
+                    // Digits, periods, and digit separators are always allowed
                     p++;
+                }
+                else if (isalpha(*p))
+                {
+                    // For letters, be more careful to avoid consuming unrelated identifiers
+                    // Only consume if it could be part of a valid number (hex digit or suffix)
+                    char c = *p;
+                    // Allow hex digits (a-f, A-F), number prefixes (x, X, b, B), and common suffixes (u, U, l, L, f, F)
+                    // Also allow e, E, p, P for exponents (though e+/e- is handled above)
+                    if ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') ||  // Hex digits
+                        c == 'x' || c == 'X' || c == 'b' || c == 'B' ||       // Prefixes
+                        c == 'e' || c == 'E' || c == 'p' || c == 'P' ||       // Exponents
+                        c == 'u' || c == 'U' || c == 'l' || c == 'L' ||       // Integer suffixes
+                        c == 'f' || c == 'F')                                  // Float suffix
+                    {
+                        p++;
+                    }
+                    else
+                    {
+                        // Letter that can't be part of a number - stop here
+                        break;
+                    }
                 }
                 else
                 {
