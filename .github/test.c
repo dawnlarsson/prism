@@ -1434,8 +1434,10 @@ void test_switch_default_first(void)
     switch (x)
     {
     default:
+    {
         defer log_append("D");
-        break;
+    }
+    break;
     case 1:
         log_append("1");
         break;
@@ -1504,8 +1506,10 @@ void test_switch_continue(void)
         switch (i)
         {
         case 0:
+        {
             defer log_append("S"); // Switch cleanup
-            // 'continue' must trigger 'S' (switch exit) AND 'L' (loop iteration end)
+        } // defer S executes here
+            // 'continue' must trigger 'L' (loop iteration end)
             i++;
             continue;
         }
@@ -1517,9 +1521,11 @@ void test_switch_continue(void)
     // Expected order:
     // 1. Enter loop
     // 2. Enter switch
-    // 3. Register 'L', register 'S'
-    // 4. Hit continue -> Run 'S' -> Run 'L' -> Re-check loop cond
-    // 5. Loop terminates -> 'E'
+    // 3. Register 'L' in loop scope, enter case block
+    // 4. Register 'S' in case block scope
+    // 5. Exit case block -> defer 'S' executes
+    // 6. Hit continue -> defer 'L' executes -> Re-check loop cond
+    // 7. Loop terminates -> 'E'
     CHECK_LOG("SLE", "continue from inside switch");
 }
 
@@ -3507,8 +3513,9 @@ void test_nested_stmt_expr_defer(void)
 
 // SECTION: CRITICAL BUG TESTS (THIRD PARTY REPORTS)
 
-// Bug 1: Vanishing statement - defer consumed without replacement
-// Tests that defer in braceless control flow emits a placeholder (;) to prevent syntax errors
+// Bug 1: Vanishing statement - FIXED
+// Original: defer in braceless control flow could cause issues
+// Now: defer requires braces, ensuring proper scoping
 void test_vanishing_statement_if_else(void)
 {
     log_reset();
@@ -3517,16 +3524,20 @@ void test_vanishing_statement_if_else(void)
     {
         int check = 1;
 
-        // Braceless if with defer - should emit semicolon placeholder
+        // defer now requires braces
         if (check)
+        {
             defer log_append("cleanup");
+        } // defer executes here when exiting if block
         else
+        {
             log_append("alt");
+        }
 
         log_append("end");
-    } // defer executes here
+    }
 
-    CHECK_LOG("endcleanup", "defer in braceless if doesn't vanish");
+    CHECK_LOG("cleanupend", "defer with braces executes when block closes");
 }
 
 void test_vanishing_statement_while(void)
@@ -3539,15 +3550,17 @@ void test_vanishing_statement_while(void)
         while (count < 1)
         {
             count++;
-            // Braceless if inside while - tests nested braceless defer
+            // defer now requires braces
             if (count == 1)
+            {
                 defer log_append("loop_cleanup");
-        } // defer executes here when while loop exits
+            } // defer executes here when if block exits
+        }
 
         log_append("after");
     }
 
-    CHECK_LOG("loop_cleanupafter", "defer in braceless while body works");
+    CHECK_LOG("loop_cleanupafter", "defer with braces in while loop works");
 }
 
 void test_vanishing_statement_for(void)
@@ -3555,14 +3568,16 @@ void test_vanishing_statement_for(void)
     log_reset();
 
     {
-        // Braceless for loop with defer
+        // defer in for loop now requires braces
         for (int i = 0; i < 1; i++)
+        {
             defer log_append("for_defer");
+        } // defer executes here at end of each iteration
 
         log_append("done");
-    } // defer executes here
+    }
 
-    CHECK_LOG("donefor_defer", "defer in braceless for body works");
+    CHECK_LOG("for_deferdone", "defer with braces in for loop works");
 }
 
 // Bug 2: _Generic default collision with switch defer cleanup
@@ -4024,13 +4039,13 @@ void test_alignas_struct_bitfield(void)
     struct Data
     {
         int val;
-        unsigned int flag : 1;  // Bitfield, not label
+        unsigned int flag : 1; // Bitfield, not label
     } d = {42, 1};
 
     // Struct with __attribute__ - bitfield must NOT be mistaken for label
     struct __attribute__((packed)) PackedData
     {
-        unsigned int x : 1;  // This is a BITFIELD, not a label!
+        unsigned int x : 1; // This is a BITFIELD, not a label!
         unsigned int y : 2;
     } pd = {1, 3};
 
@@ -4059,7 +4074,7 @@ void test_generic_typedef_not_label(void)
     // _Generic uses Type: expr syntax which looks like labels
     // Prism should skip _Generic(...) in label scanner
     int x = _Generic(0,
-        GenericTestType: 1,  // This is NOT a goto label!
+        GenericTestType: 1, // This is NOT a goto label!
         default: 0);
 
     CHECK_EQ(x, 1, "_Generic typedef association works");
@@ -4179,6 +4194,102 @@ void test_return_stmt_expr_with_defer(void)
     total++;
 }
 
+void test_security_stmtexpr_value_corruption(void)
+{
+    log_reset();
+
+    // Test 1: Nested block with defer should work correctly
+    int val = ({
+        {
+            defer log_append("D");
+        }
+        42; // This should be the return value
+    });
+
+    CHECK_EQ(val, 42, "statement-expr value correct with nested defer");
+    CHECK_LOG("D", "nested defer in statement-expr executed");
+
+    log_reset();
+
+    // Test 2: Multiple nested blocks
+    int val2 = ({
+        int tmp = 10;
+        {
+            defer log_append("X");
+            tmp += 5;
+        }
+        tmp + 27; // Should return 42
+    });
+
+    CHECK_EQ(val2, 42, "statement-expr with multiple statements and defer");
+    CHECK_LOG("X", "defer executed before final expression");
+
+    log_reset();
+    printf("[PASS] statement expression value corruption test (protected)\n");
+    passed++;
+    total++;
+}
+
+void test_security_braceless_defer_trap(void)
+{
+    log_reset();
+
+    // FIXED: Braceless defer now errors at compile-time, preventing the security issue
+    // This test verifies the correct behavior with braces
+    {
+        int trigger = 0;
+
+        // With braces, this creates a proper scope
+        if (trigger)
+        {
+            defer log_append("FAIL");
+        }
+
+        log_append("OK");
+    }
+
+    // With the fix, defer only executes if the condition is true
+    // Since trigger=0, the defer does not execute
+    CHECK_LOG("OK", "defer with braces executes conditionally (issue FIXED)");
+
+    log_reset();
+    printf("[PASS] braceless if defer trap test (FIXED - now requires braces)\n");
+    passed++;
+    total++;
+}
+
+void test_security_switch_goto_double_free(void)
+{
+    log_reset();
+    int stage = 1;
+
+    // FIXED: Switch case defer now requires braces, which creates proper scoping
+    switch (stage)
+    {
+    case 1:
+    {
+        defer log_append("X");
+        log_append("A");
+    } // defer executes here when exiting case 1 block
+    // Note: Can't use goto to jump to another case after the block closes
+    // because that would be outside the braced block
+    break;
+
+    case 2:
+        log_append("Y");
+        break;
+    }
+
+    // With the fix, defer executes when the braced block closes
+    // Log should be "AX" (A appended, then defer X executes at })
+    CHECK_LOG("AX", "switch defer with braces executes correctly (issue FIXED)");
+
+    log_reset();
+    printf("[PASS] switch goto defer loss test (FIXED - now requires braces)\n");
+    passed++;
+    total++;
+}
+
 void run_verification_bug_tests(void)
 {
     printf("\n=== VERIFICATION TESTS ===\n");
@@ -4228,6 +4339,10 @@ void run_verification_bug_tests(void)
 
     test_pragma_pack_preservation();
     test_return_stmt_expr_with_defer();
+
+    test_security_stmtexpr_value_corruption();
+    test_security_braceless_defer_trap();
+    test_security_switch_goto_double_free();
 }
 
 // MAIN

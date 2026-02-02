@@ -3509,6 +3509,16 @@ static int transpile(char *input_file, char *output_file)
       if (pending_control_flow && control_paren_depth > 0)
         error_tok(tok, "defer cannot appear inside control statement parentheses");
 
+      // Check for defer in braceless control flow - this causes unexpected behavior
+      // The defer binds to the parent scope instead of the control statement scope,
+      // causing it to execute unconditionally regardless of the condition
+      if (pending_control_flow && control_paren_depth == 0)
+        error_tok(tok, "defer requires braces in if/while/for/switch statements.\n"
+                       "       Braceless control flow does not create a scope, so defer binds to the parent scope\n"
+                       "       and executes unconditionally. Add braces to create a proper scope:\n"
+                       "       Bad:  if (x) defer cleanup();\n"
+                       "       Good: if (x) { defer cleanup(); }");
+
       // Track if we're in braceless control flow - we'll need to emit a placeholder
       bool in_braceless_control = pending_control_flow;
 
@@ -3548,6 +3558,26 @@ static int transpile(char *input_file, char *output_file)
         error_tok(tok, "defer cannot be used in functions containing inline assembly. "
                        "Inline asm may contain jumps (jmp, call, etc.) that bypass defer cleanup. "
                        "Move the asm to a separate function, or use explicit cleanup instead.");
+      }
+
+      // Check for defer in switch case without braces
+      // Defer at switch scope level (without braces) has undefined behavior:
+      // - goto between cases doesn't execute the defer (same scope depth)
+      // - Hitting the next case label clears the defer
+      // - Result: resource leaks and unpredictable behavior
+      // Require braces to create a proper scope for the defer
+      for (int d = defer_depth - 1; d >= 0; d--)
+      {
+        if (defer_stack[d].is_switch && defer_depth - 1 == d)
+        {
+          error_tok(tok, "defer in switch case requires braces to create a proper scope.\n"
+                         "       Without braces, defer at switch-level has unpredictable behavior:\n"
+                         "       - goto between cases may not execute the defer\n"
+                         "       - Hitting the next case label clears the defer\n"
+                         "       Wrap the case body in braces:\n"
+                         "       Bad:  case X: defer cleanup(); break;\n"
+                         "       Good: case X: { defer cleanup(); } break;");
+        }
       }
 
       Token *defer_keyword = tok;
