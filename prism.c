@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.97.5"
+#define PRISM_VERSION "0.98.0"
 
 #include "parse.c"
 
@@ -674,64 +674,6 @@ static bool is_member_access(Token *tok)
   return tok && tok->kind == TK_PUNCT && (equal(tok, ".") || equal(tok, "->"));
 }
 
-static bool tok_list_contains_ident(Token *tok, const char *name)
-{
-  size_t len = strlen(name);
-  for (Token *t = tok; t && t->kind != TK_EOF; t = t->next)
-  {
-    if (t->kind == TK_IDENT && t->len == len && strncmp(t->loc, name, len) == 0)
-      return true;
-  }
-  return false;
-}
-
-// Check for C23 extended float suffix and return info for normalization
-// Returns: suffix length to strip (0 if no extended suffix)
-// Sets *replacement to the standard suffix to use (NULL for none, "f" for float, "L" for long double)
-static int get_extended_float_suffix(const char *p, int len, const char **replacement)
-{
-  *replacement = NULL;
-  if (len < 3)
-    return 0;
-  const char *end = p + len;
-
-  // Check for BF16/bf16 (4 chars) - no standard equivalent
-  if (len >= 4 && (end[-4] == 'B' || end[-4] == 'b') &&
-      (end[-3] == 'F' || end[-3] == 'f') && end[-2] == '1' && end[-1] == '6')
-  {
-    *replacement = "f"; // Use float as closest approximation
-    return 4;
-  }
-
-  // Check for F128/f128 (4 chars) - use long double
-  if (len >= 4 && (end[-4] == 'F' || end[-4] == 'f') &&
-      end[-3] == '1' && end[-2] == '2' && end[-1] == '8')
-  {
-    *replacement = "L";
-    return 4;
-  }
-
-  // Check for F64/f64 (3 chars) - double is default, no suffix needed
-  if ((end[-3] == 'F' || end[-3] == 'f') && end[-2] == '6' && end[-1] == '4')
-    return 3;
-
-  // Check for F32/f32 (3 chars) - use float
-  if ((end[-3] == 'F' || end[-3] == 'f') && end[-2] == '3' && end[-1] == '2')
-  {
-    *replacement = "f";
-    return 3;
-  }
-
-  // Check for F16/f16 (3 chars) - no standard equivalent
-  if ((end[-3] == 'F' || end[-3] == 'f') && end[-2] == '1' && end[-1] == '6')
-  {
-    *replacement = "f"; // Use float as closest approximation
-    return 3;
-  }
-
-  return 0;
-}
-
 // Emit a single token with appropriate spacing
 static void emit_tok(Token *tok)
 {
@@ -830,24 +772,23 @@ static void emit_range(Token *start, Token *end)
     emit_tok(t);
 }
 
-// Emit all defers for current scope (LIFO order)
-static void emit_scope_defers(void)
+// Emit defers with boundary control:
+// DEFER_SCOPE=current only, DEFER_ALL=all scopes, DEFER_BREAK=stop at loop/switch, DEFER_CONTINUE=stop at loop
+typedef enum
+{
+  DEFER_SCOPE,
+  DEFER_ALL,
+  DEFER_BREAK,
+  DEFER_CONTINUE
+} DeferEmitMode;
+
+static void emit_defers(DeferEmitMode mode)
 {
   if (defer_depth <= 0)
     return;
-  DeferScope *scope = &defer_stack[defer_depth - 1];
-  for (int i = scope->count - 1; i >= 0; i--)
-  {
-    out_char(' ');
-    emit_range(scope->stmts[i], scope->ends[i]);
-    out_char(';');
-  }
-}
-
-// Emit all defers from all scopes (for return statements)
-static void emit_all_defers(void)
-{
-  for (int d = defer_depth - 1; d >= 0; d--)
+  int start = (mode == DEFER_SCOPE) ? defer_depth - 1 : defer_depth - 1;
+  int end = (mode == DEFER_SCOPE) ? defer_depth - 1 : 0;
+  for (int d = start; d >= end; d--)
   {
     DeferScope *scope = &defer_stack[d];
     for (int i = scope->count - 1; i >= 0; i--)
@@ -856,43 +797,19 @@ static void emit_all_defers(void)
       emit_range(scope->stmts[i], scope->ends[i]);
       out_char(';');
     }
-  }
-}
-
-// Emit defers for break - from current scope through innermost loop/switch
-static void emit_break_defers(void)
-{
-  for (int d = defer_depth - 1; d >= 0; d--)
-  {
-    DeferScope *scope = &defer_stack[d];
-    for (int i = scope->count - 1; i >= 0; i--)
-    {
-      out_char(' ');
-      emit_range(scope->stmts[i], scope->ends[i]);
-      out_char(';');
-    }
-    if (scope->is_loop || scope->is_switch)
+    if (mode == DEFER_SCOPE)
+      break;
+    if (mode == DEFER_BREAK && (scope->is_loop || scope->is_switch))
+      break;
+    if (mode == DEFER_CONTINUE && scope->is_loop)
       break;
   }
 }
 
-// Emit defers for continue - from current scope through innermost loop scope (inclusive)
-// Continue jumps to loop update/condition, so all defers in the loop body must run
-static void emit_continue_defers(void)
-{
-  for (int d = defer_depth - 1; d >= 0; d--)
-  {
-    DeferScope *scope = &defer_stack[d];
-    for (int i = scope->count - 1; i >= 0; i--)
-    {
-      out_char(' ');
-      emit_range(scope->stmts[i], scope->ends[i]);
-      out_char(';');
-    }
-    if (scope->is_loop)
-      break;
-  }
-}
+#define emit_scope_defers() emit_defers(DEFER_SCOPE)
+#define emit_all_defers() emit_defers(DEFER_ALL)
+#define emit_break_defers() emit_defers(DEFER_BREAK)
+#define emit_continue_defers() emit_defers(DEFER_CONTINUE)
 
 // Check if there are any active defers
 static bool has_active_defers(void)
@@ -981,9 +898,15 @@ static void typedef_set_index(char *name, int len, int index)
   hashmap_put2(&typedef_table.name_map, name, len, (void *)(intptr_t)(index + 1));
 }
 
-static void typedef_add(char *name, int len, int scope_depth, bool is_vla)
+typedef enum
 {
-  // Grow if needed
+  TDK_TYPEDEF,
+  TDK_SHADOW,
+  TDK_ENUM_CONST
+} TypedefKind;
+
+static void typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool is_vla)
+{
   if (typedef_table.count >= typedef_table.capacity)
   {
     int new_cap = typedef_table.capacity == 0 ? 256 : typedef_table.capacity * 2;
@@ -998,63 +921,16 @@ static void typedef_add(char *name, int len, int scope_depth, bool is_vla)
   e->name = name;
   e->len = len;
   e->scope_depth = scope_depth;
-  e->is_vla = is_vla;
-  e->is_shadow = false;
-  e->is_enum_const = false;
+  e->is_vla = (kind == TDK_TYPEDEF) ? is_vla : false;
+  e->is_shadow = (kind == TDK_SHADOW);
+  e->is_enum_const = (kind == TDK_ENUM_CONST);
   e->prev_index = typedef_get_index(name, len);
   typedef_set_index(name, len, new_index);
 }
 
-// Add a shadow entry: marks that a variable with this name exists at this scope,
-// effectively hiding any typedef with the same name
-static void typedef_add_shadow(char *name, int len, int scope_depth)
-{
-  // Grow if needed
-  if (typedef_table.count >= typedef_table.capacity)
-  {
-    int new_cap = typedef_table.capacity == 0 ? 256 : typedef_table.capacity * 2;
-    TypedefEntry *new_entries = realloc(typedef_table.entries, sizeof(TypedefEntry) * new_cap);
-    if (!new_entries)
-      error("out of memory tracking typedefs");
-    typedef_table.entries = new_entries;
-    typedef_table.capacity = new_cap;
-  }
-  int new_index = typedef_table.count++;
-  TypedefEntry *e = &typedef_table.entries[new_index];
-  e->name = name;
-  e->len = len;
-  e->scope_depth = scope_depth;
-  e->is_vla = false;
-  e->is_shadow = true;
-  e->is_enum_const = false;
-  e->prev_index = typedef_get_index(name, len);
-  typedef_set_index(name, len, new_index);
-}
-
-// Add an enum constant entry
-static void typedef_add_enum_const(char *name, int len, int scope_depth)
-{
-  // Grow if needed
-  if (typedef_table.count >= typedef_table.capacity)
-  {
-    int new_cap = typedef_table.capacity == 0 ? 256 : typedef_table.capacity * 2;
-    TypedefEntry *new_entries = realloc(typedef_table.entries, sizeof(TypedefEntry) * new_cap);
-    if (!new_entries)
-      error("out of memory tracking typedefs");
-    typedef_table.entries = new_entries;
-    typedef_table.capacity = new_cap;
-  }
-  int new_index = typedef_table.count++;
-  TypedefEntry *e = &typedef_table.entries[new_index];
-  e->name = name;
-  e->len = len;
-  e->scope_depth = scope_depth;
-  e->is_vla = false;
-  e->is_shadow = false;
-  e->is_enum_const = true;
-  e->prev_index = typedef_get_index(name, len);
-  typedef_set_index(name, len, new_index);
-}
+#define typedef_add(name, len, depth, is_vla) typedef_add_entry(name, len, depth, TDK_TYPEDEF, is_vla)
+#define typedef_add_shadow(name, len, depth) typedef_add_entry(name, len, depth, TDK_SHADOW, false)
+#define typedef_add_enum_const(name, len, depth) typedef_add_entry(name, len, depth, TDK_ENUM_CONST, false)
 
 // Called when exiting a scope - removes typedefs defined at that depth
 static void typedef_pop_scope(int scope_depth)
@@ -1173,16 +1049,36 @@ static bool is_known_enum_const(Token *tok)
   return typedef_table.entries[idx].is_enum_const;
 }
 
-// Check if token could be a label (identifier followed by ':')
-// Note: This can have false positives from ternary operator
-// The caller should filter using context (prev token shouldn't be '?')
-static bool is_label(Token *tok)
+// Check if token is struct/union/enum keyword
+static bool is_sue_keyword(Token *tok)
 {
-  return tok->kind == TK_IDENT && tok->next && equal(tok->next, ":");
+  return equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum");
 }
 
 // Forward declaration (defined later in transpiler section)
 static Token *skip_balanced(Token *tok, char *open, char *close);
+
+// Given a struct/union/enum keyword, find its opening brace if it has a body.
+// Handles: "struct {", "struct name {", "struct __attribute__((packed)) name {"
+// Returns the '{' token, or NULL if no body (e.g., "struct name;" or "struct name var;")
+static Token *find_struct_body_brace(Token *tok)
+{
+  Token *t = tok->next;
+  while (t && (t->kind == TK_IDENT || equal(t, "__attribute__") || equal(t, "__attribute") ||
+               equal(t, "_Alignas") || equal(t, "alignas")))
+  {
+    if (equal(t, "__attribute__") || equal(t, "__attribute") ||
+        equal(t, "_Alignas") || equal(t, "alignas"))
+    {
+      t = t->next;
+      if (t && equal(t, "("))
+        t = skip_balanced(t, "(", ")");
+    }
+    else
+      t = t->next;
+  }
+  return (t && equal(t, "{")) ? t : NULL;
+}
 
 // Scan a function body for labels and record their scope depths
 // Also detects setjmp/longjmp/pthread_exit/vfork and inline asm usage
@@ -1206,47 +1102,12 @@ static void scan_labels_in_function(Token *tok)
   while (tok && tok->kind != TK_EOF)
   {
     // Track struct/union/enum bodies to skip bitfield declarations
-    if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum"))
+    if (is_sue_keyword(tok))
     {
-      // Look ahead for '{' - could be:
-      //   "struct {"
-      //   "struct name {"
-      //   "struct __attribute__((packed)) {"
-      //   "struct __attribute__((packed)) name {"
-      //   "struct _Alignas(16) name {"
-      //   "struct alignas(16) name {"
-      Token *t = tok->next;
-      // Skip identifiers, struct names, __attribute__((...)), _Alignas(...), alignas(...)
-      while (t && (t->kind == TK_IDENT || equal(t, "__attribute__") || equal(t, "__attribute") ||
-                   equal(t, "_Alignas") || equal(t, "alignas")))
+      Token *brace = find_struct_body_brace(tok);
+      if (brace)
       {
-        // Handle __attribute__((...)), _Alignas(...), alignas(...) - skip the entire specifier
-        if (equal(t, "__attribute__") || equal(t, "__attribute") ||
-            equal(t, "_Alignas") || equal(t, "alignas"))
-        {
-          t = t->next;
-          // Skip ( ... ) - may be ((...)) for __attribute__
-          if (t && equal(t, "("))
-          {
-            int paren_depth = 1;
-            t = t->next;
-            while (t && paren_depth > 0)
-            {
-              if (equal(t, "("))
-                paren_depth++;
-              else if (equal(t, ")"))
-                paren_depth--;
-              t = t->next;
-            }
-          }
-        }
-        else
-          t = t->next;
-      }
-      if (t && equal(t, "{"))
-      {
-        // Skip to the opening brace
-        while (tok != t)
+        while (tok != brace)
         {
           prev = tok;
           tok = tok->next;
@@ -1319,21 +1180,9 @@ static void scan_labels_in_function(Token *tok)
       {
         t = t->next;
         if (t && equal(t, "("))
-        {
-          int paren_depth = 1;
-          t = t->next;
-          while (t && paren_depth > 0)
-          {
-            if (equal(t, "("))
-              paren_depth++;
-            else if (equal(t, ")"))
-              paren_depth--;
-            t = t->next;
-          }
-        }
+          t = skip_balanced(t, "(", ")");
       }
 
-      // Now check if we found a colon
       if (t && equal(t, ":"))
       {
         Token *colon = t;
@@ -1380,191 +1229,28 @@ static bool goto_has_defers(int target_depth)
   return false;
 }
 
-// Check if a forward goto would skip over any defer statements
-// This scans forward from goto_tok to find if any defer exists before the target label.
+// Modes for goto_skips_check - what to look for between goto and label
+typedef enum
+{
+  GOTO_CHECK_DEFER, // Look for defer statements
+  GOTO_CHECK_DECL   // Look for variable declarations
+} GotoCheckMode;
+
+// Check if a forward goto would skip over defer statements or variable declarations.
+// Returns the token that would be skipped, or NULL if safe.
 //
 // Key distinction:
-// - INVALID: goto jumps INTO a block, landing AFTER a defer inside that block
+// - INVALID: goto jumps INTO a block, landing AFTER a defer/decl inside that block
 //   Example: goto inner; { defer X; inner: ... } -- X would run but wasn't registered
-// - VALID: goto jumps OVER an entire block containing a defer
+// - VALID: goto jumps OVER an entire block containing a defer/decl
 //   Example: goto done; { defer X; ... } done: -- we skip the whole block, defer never registered
 //
-// The rule: if we find the label BEFORE exiting the scope containing a defer, it's invalid.
-static Token *goto_skips_defer(Token *goto_tok, char *label_name, int label_len)
+// The rule: if we find the label BEFORE exiting the scope containing the item, it's invalid.
+static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len, GotoCheckMode mode)
 {
-  // Scan forward from goto to find the label
-  Token *tok = goto_tok->next->next; // skip 'goto' and label name
-  if (tok && equal(tok, ";"))
-    tok = tok->next;
-
-  int depth = 0;
-  int local_struct_depth = 0;  // Track struct/union/enum bodies for bitfield filtering
-  Token *active_defer = NULL;  // Most recently seen defer that's still "in scope"
-  int active_defer_depth = -1; // Depth at which active_defer was found
-  Token *prev = NULL;
-
-  while (tok && tok->kind != TK_EOF)
-  {
-    // Track struct/union/enum bodies to skip bitfield declarations
-    if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum"))
-    {
-      // Look ahead for '{' to detect struct body
-      // Skip identifiers, __attribute__((...)), _Alignas(...), alignas(...)
-      Token *t = tok->next;
-      while (t && (t->kind == TK_IDENT || equal(t, "__attribute__") || equal(t, "__attribute") ||
-                   equal(t, "_Alignas") || equal(t, "alignas")))
-      {
-        if (equal(t, "__attribute__") || equal(t, "__attribute") ||
-            equal(t, "_Alignas") || equal(t, "alignas"))
-        {
-          t = t->next;
-          if (t && equal(t, "("))
-          {
-            int paren_depth = 1;
-            t = t->next;
-            while (t && paren_depth > 0)
-            {
-              if (equal(t, "("))
-                paren_depth++;
-              else if (equal(t, ")"))
-                paren_depth--;
-              t = t->next;
-            }
-          }
-        }
-        else
-        {
-          t = t->next;
-        }
-      }
-      if (t && equal(t, "{"))
-      {
-        // Skip to the opening brace
-        while (tok != t)
-        {
-          prev = tok;
-          tok = tok->next;
-        }
-        local_struct_depth++;
-        depth++;
-        prev = tok;
-        tok = tok->next;
-        continue;
-      }
-    }
-
-    if (equal(tok, "{"))
-    {
-      depth++;
-      prev = tok;
-      tok = tok->next;
-      continue;
-    }
-    if (equal(tok, "}"))
-    {
-      // Exiting a scope - if we exit past where we found the defer, clear it
-      // (means the goto is skipping the entire block, which is fine)
-      if (active_defer && depth <= active_defer_depth)
-      {
-        active_defer = NULL;
-        active_defer_depth = -1;
-      }
-      if (local_struct_depth > 0)
-        local_struct_depth--;
-      if (depth == 0)
-        break; // End of containing scope, label not found here
-      depth--;
-      prev = tok;
-      tok = tok->next;
-      continue;
-    }
-
-    // Skip _Generic(...) - type associations inside look like labels (Type: expr)
-    if (tok->kind == TK_KEYWORD && equal(tok, "_Generic"))
-    {
-      prev = tok;
-      tok = tok->next;
-      if (tok && equal(tok, "("))
-      {
-        tok = skip_balanced(tok, "(", ")");
-        prev = NULL;
-      }
-      continue;
-    }
-
-    // Track defers we pass over
-    // Skip if preceded by member access (. or ->) - that's a struct field, not keyword
-    if (tok->kind == TK_KEYWORD && equal(tok, "defer") && !is_member_access(prev))
-    {
-      // Remember this defer (prefer shallowest depth if multiple)
-      if (!active_defer || depth <= active_defer_depth)
-      {
-        active_defer = tok;
-        active_defer_depth = depth;
-      }
-    }
-
-    // Found the label? Apply same filtering as scan_labels_in_function
-    // Also handle labels with attributes: identifier __attribute__((...)) :
-    if (tok->kind == TK_IDENT && tok->len == label_len &&
-        !memcmp(tok->loc, label_name, label_len))
-    {
-      // Look ahead for colon, skipping any __attribute__((...)) sequences
-      Token *t = tok->next;
-      while (t && (equal(t, "__attribute__") || equal(t, "__attribute")))
-      {
-        t = t->next;
-        if (t && equal(t, "("))
-        {
-          int paren_depth = 1;
-          t = t->next;
-          while (t && paren_depth > 0)
-          {
-            if (equal(t, "("))
-              paren_depth++;
-            else if (equal(t, ")"))
-              paren_depth--;
-            t = t->next;
-          }
-        }
-      }
-
-      // Now check if we found a colon
-      if (t && equal(t, ":"))
-      {
-        Token *colon = t;
-        // Filter out false positives:
-        bool is_scope_resolution = colon->next && equal(colon->next, ":");
-        bool is_ternary = prev && equal(prev, "?");
-        bool is_switch_case = prev && (equal(prev, "case") || equal(prev, "default"));
-        bool is_bitfield = local_struct_depth > 0;
-
-        if (!is_scope_resolution && !is_ternary && !is_switch_case && !is_bitfield)
-        {
-          // Real label found - if we have an active defer, we're jumping past it
-          return active_defer;
-        }
-      }
-    }
-
-    prev = tok;
-    tok = tok->next;
-  }
-
-  return NULL; // Label not found in forward scan, or all defers were in skipped blocks
-}
-
-// Check if a forward goto would skip over any variable declarations (with zero-init)
-// This is undefined behavior in C - the declaration executes but initialization is skipped.
-// We make this a hard error to maintain zero-init safety guarantees.
-//
-// Same logic as goto_skips_defer:
-// - INVALID: goto jumps INTO a block, landing AFTER a declaration inside that block
-// - VALID: goto jumps OVER an entire block containing a declaration
-static Token *goto_skips_decl(Token *goto_tok, char *label_name, int label_len)
-{
-  if (!feature_zeroinit)
-    return NULL; // Only check when zero-init is enabled
+  // For DECL mode, only check when zero-init is enabled
+  if (mode == GOTO_CHECK_DECL && !feature_zeroinit)
+    return NULL;
 
   // Scan forward from goto to find the label
   Token *tok = goto_tok->next->next; // skip 'goto' and label name
@@ -1573,45 +1259,20 @@ static Token *goto_skips_decl(Token *goto_tok, char *label_name, int label_len)
 
   int depth = 0;
   int local_struct_depth = 0;
-  Token *active_decl = NULL; // Most recently seen declaration that's still "in scope"
-  int active_decl_depth = -1;
+  Token *active_item = NULL;  // Most recently seen item that's still "in scope"
+  int active_item_depth = -1; // Depth at which active_item was found
   Token *prev = NULL;
-  bool at_stmt_start = true;
+  bool at_stmt_start = true; // Only needed for DECL mode
 
   while (tok && tok->kind != TK_EOF)
   {
-    // Track struct/union/enum bodies
-    // Skip identifiers, __attribute__((...)), _Alignas(...), alignas(...)
-    if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum"))
+    // Track struct/union/enum bodies to skip bitfield declarations
+    if (is_sue_keyword(tok))
     {
-      Token *t = tok->next;
-      while (t && (t->kind == TK_IDENT || equal(t, "__attribute__") || equal(t, "__attribute") ||
-                   equal(t, "_Alignas") || equal(t, "alignas")))
+      Token *brace = find_struct_body_brace(tok);
+      if (brace)
       {
-        if (equal(t, "__attribute__") || equal(t, "__attribute") ||
-            equal(t, "_Alignas") || equal(t, "alignas"))
-        {
-          t = t->next;
-          if (t && equal(t, "("))
-          {
-            int paren_depth = 1;
-            t = t->next;
-            while (t && paren_depth > 0)
-            {
-              if (equal(t, "("))
-                paren_depth++;
-              else if (equal(t, ")"))
-                paren_depth--;
-              t = t->next;
-            }
-          }
-        }
-        else
-          t = t->next;
-      }
-      if (t && equal(t, "{"))
-      {
-        while (tok != t)
+        while (tok != brace)
         {
           prev = tok;
           tok = tok->next;
@@ -1635,10 +1296,11 @@ static Token *goto_skips_decl(Token *goto_tok, char *label_name, int label_len)
     }
     if (equal(tok, "}"))
     {
-      if (active_decl && depth <= active_decl_depth)
+      // Exiting a scope - if we exit past where we found the item, clear it
+      if (active_item && depth <= active_item_depth)
       {
-        active_decl = NULL;
-        active_decl_depth = -1;
+        active_item = NULL;
+        active_item_depth = -1;
       }
       if (local_struct_depth > 0)
         local_struct_depth--;
@@ -1658,24 +1320,47 @@ static Token *goto_skips_decl(Token *goto_tok, char *label_name, int label_len)
       continue;
     }
 
-    // Detect variable declarations at statement start (not inside struct bodies)
-    // Skip extern/typedef/static declarations
-    if (at_stmt_start && local_struct_depth == 0)
+    // Skip _Generic(...) - type associations inside look like labels
+    if (tok->kind == TK_KEYWORD && equal(tok, "_Generic"))
     {
+      prev = tok;
+      tok = tok->next;
+      if (tok && equal(tok, "("))
+      {
+        tok = skip_balanced(tok, "(", ")");
+        prev = NULL;
+      }
+      at_stmt_start = false;
+      continue;
+    }
+
+    // Mode-specific: track defers or declarations
+    if (mode == GOTO_CHECK_DEFER)
+    {
+      // Track defers we pass over (skip if preceded by member access)
+      if (tok->kind == TK_KEYWORD && equal(tok, "defer") && !is_member_access(prev))
+      {
+        if (!active_item || depth <= active_item_depth)
+        {
+          active_item = tok;
+          active_item_depth = depth;
+        }
+      }
+    }
+    else if (mode == GOTO_CHECK_DECL && at_stmt_start && local_struct_depth == 0)
+    {
+      // Detect variable declarations at statement start
       Token *decl_start = tok;
+      Token *t = tok;
 
       // Skip 'raw' keyword if present
-      if (equal(tok, "raw"))
-        tok = tok->next;
+      if (equal(t, "raw"))
+        t = t->next;
 
       // Skip extern/typedef - these don't create initialized variables
-      if (!equal(tok, "extern") && !equal(tok, "typedef"))
+      if (!equal(t, "extern") && !equal(t, "typedef"))
       {
-        // Check if this looks like a declaration
-        Token *t = tok;
-
-        // Skip qualifiers and type keywords
-        bool saw_type = false;
+        // Skip qualifiers
         while (t && (equal(t, "const") || equal(t, "volatile") || equal(t, "static") ||
                      equal(t, "auto") || equal(t, "register") || equal(t, "_Atomic") ||
                      equal(t, "restrict") || equal(t, "__restrict") || equal(t, "__restrict__")))
@@ -1689,8 +1374,6 @@ static Token *goto_skips_decl(Token *goto_tok, char *label_name, int label_len)
                   equal(t, "struct") || equal(t, "union") || equal(t, "enum") ||
                   is_known_typedef(t)))
         {
-          saw_type = true;
-
           // Skip past the type
           if (equal(t, "struct") || equal(t, "union") || equal(t, "enum"))
           {
@@ -1728,32 +1411,17 @@ static Token *goto_skips_decl(Token *goto_tok, char *label_name, int label_len)
           // Should be at identifier now - and NOT followed by '(' (that's a function)
           if (t && t->kind == TK_IDENT && t->next && !equal(t->next, "("))
           {
-            // This is a variable declaration - remember it
-            if (!active_decl || depth <= active_decl_depth)
+            if (!active_item || depth <= active_item_depth)
             {
-              active_decl = decl_start;
-              active_decl_depth = depth;
+              active_item = decl_start;
+              active_item_depth = depth;
             }
           }
         }
       }
     }
 
-    // Skip _Generic(...) - type associations inside look like labels (Type: expr)
-    if (tok->kind == TK_KEYWORD && equal(tok, "_Generic"))
-    {
-      prev = tok;
-      tok = tok->next;
-      if (tok && equal(tok, "("))
-      {
-        tok = skip_balanced(tok, "(", ")");
-        prev = NULL;
-      }
-      at_stmt_start = false;
-      continue;
-    }
-
-    // Found the label? Also handle labels with attributes: identifier __attribute__((...)) :
+    // Found the label? Check with proper filtering
     if (tok->kind == TK_IDENT && tok->len == label_len &&
         !memcmp(tok->loc, label_name, label_len))
     {
@@ -1763,21 +1431,9 @@ static Token *goto_skips_decl(Token *goto_tok, char *label_name, int label_len)
       {
         t = t->next;
         if (t && equal(t, "("))
-        {
-          int paren_depth = 1;
-          t = t->next;
-          while (t && paren_depth > 0)
-          {
-            if (equal(t, "("))
-              paren_depth++;
-            else if (equal(t, ")"))
-              paren_depth--;
-            t = t->next;
-          }
-        }
+          t = skip_balanced(t, "(", ")");
       }
 
-      // Now check if we found a colon
       if (t && equal(t, ":"))
       {
         Token *colon = t;
@@ -1787,10 +1443,7 @@ static Token *goto_skips_decl(Token *goto_tok, char *label_name, int label_len)
         bool is_bitfield = local_struct_depth > 0;
 
         if (!is_scope_resolution && !is_ternary && !is_switch_case && !is_bitfield)
-        {
-          // Real label found - if we have an active decl, goto skips it
-          return active_decl;
-        }
+          return active_item; // Label found - return any active item we're skipping
       }
     }
 
@@ -1910,7 +1563,7 @@ static Token *scan_typedef_base_type(Token *tok)
   tok = skip_attributes(tok);
 
   // Handle struct/union/enum
-  if (tok && (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum")))
+  if (tok && is_sue_keyword(tok))
   {
     tok = tok->next;
 
@@ -2783,7 +2436,7 @@ static Token *try_zero_init_decl(Token *tok)
     if (is_type_keyword(tok))
       saw_type = true;
     // Handle struct/union/enum followed by optional tag
-    if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum"))
+    if (is_sue_keyword(tok))
     {
       is_struct_type = true;
       tok = tok->next;
@@ -3376,17 +3029,6 @@ static Token *try_zero_init_decl(Token *tok)
     bool effective_vla = (is_vla && !has_paren_declarator) || (is_typedef_vla && !is_pointer) || has_typeof;
 
     // VLAs cannot be initialized - this is a hard error, no bypass allowed
-    // C syntax doesn't allow `int arr[n] = {0};` so VLAs break safety guarantees
-    /* // todo make this "strict" mode, intended for prism only codebases
-    if (effective_vla && !has_init)
-    {
-      error_tok(var_name, "VLA '%.*s' cannot be zero-initialized (C language limitation). "
-                          "Options: (1) Use a fixed-size array, (2) Use malloc()+memset(), "
-                          "(3) Add explicit memset() after declaration, or "
-                          "(4) Use 'prism no-zeroinit' to disable zero-init globally.",
-                var_name->len, var_name->loc);
-    }
-    */
 
     // Add zero initializer if no existing initializer, not a VLA, and not raw
     if (!has_init && !effective_vla && !is_raw)
@@ -4089,13 +3731,13 @@ static int transpile(char *input_file, char *output_file)
       if (tok->kind == TK_IDENT)
       {
         // Check if this goto would skip over a defer statement
-        Token *skipped = goto_skips_defer(goto_tok, tok->loc, tok->len);
+        Token *skipped = goto_skips_check(goto_tok, tok->loc, tok->len, GOTO_CHECK_DEFER);
         if (skipped)
           error_tok(skipped, "goto '%.*s' would skip over this defer statement",
                     tok->len, tok->loc);
 
         // Check if this goto would skip over a variable declaration (zero-init safety)
-        Token *skipped_decl = goto_skips_decl(goto_tok, tok->loc, tok->len);
+        Token *skipped_decl = goto_skips_check(goto_tok, tok->loc, tok->len, GOTO_CHECK_DECL);
         if (skipped_decl)
         {
           if (feature_warn_safety)
@@ -4144,7 +3786,7 @@ static int transpile(char *input_file, char *output_file)
       tok = tok->next;
       if (tok->kind == TK_IDENT)
       {
-        Token *skipped_decl = goto_skips_decl(goto_tok, tok->loc, tok->len);
+        Token *skipped_decl = goto_skips_check(goto_tok, tok->loc, tok->len, GOTO_CHECK_DECL);
         if (skipped_decl)
         {
           if (feature_warn_safety)
@@ -4261,7 +3903,7 @@ static int transpile(char *input_file, char *output_file)
       next_func_returns_void = true;
 
     // Track struct/union/enum to avoid zero-init inside them
-    if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum"))
+    if (is_sue_keyword(tok))
     {
       bool is_enum = equal(tok, "enum");
       // Look ahead to see if this has a body
@@ -5099,89 +4741,28 @@ static const char *get_real_cc(const char *cc)
   return cc;
 }
 
-static void cli_add_source(Cli *cli, const char *src)
-{
-  if (cli->source_count >= cli->source_capacity)
-  {
-    int new_cap = cli->source_capacity == 0 ? 16 : cli->source_capacity * 2;
-    const char **new_sources = realloc(cli->sources, sizeof(char *) * new_cap);
-    if (!new_sources)
-      die("Out of memory");
-    cli->sources = new_sources;
-    cli->source_capacity = new_cap;
-  }
-  cli->sources[cli->source_count++] = src;
-}
+// Generic array append for CLI - grows array if needed
+#define CLI_ARRAY_APPEND(cli, arr, cnt, cap, item, init_cap)                \
+  do                                                                        \
+  {                                                                         \
+    if ((cli)->cnt >= (cli)->cap)                                           \
+    {                                                                       \
+      int new_cap = (cli)->cap == 0 ? (init_cap) : (cli)->cap * 2;          \
+      const char **new_arr = realloc((cli)->arr, sizeof(char *) * new_cap); \
+      if (!new_arr)                                                         \
+        die("Out of memory");                                               \
+      (cli)->arr = new_arr;                                                 \
+      (cli)->cap = new_cap;                                                 \
+    }                                                                       \
+    (cli)->arr[(cli)->cnt++] = (item);                                      \
+  } while (0)
 
-static void cli_add_include(Cli *cli, const char *path)
-{
-  if (cli->include_count >= cli->include_capacity)
-  {
-    int new_cap = cli->include_capacity == 0 ? 16 : cli->include_capacity * 2;
-    const char **new_paths = realloc(cli->include_paths, sizeof(char *) * new_cap);
-    if (!new_paths)
-      die("Out of memory");
-    cli->include_paths = new_paths;
-    cli->include_capacity = new_cap;
-  }
-  cli->include_paths[cli->include_count++] = path;
-}
-
-static void cli_add_define(Cli *cli, const char *def)
-{
-  if (cli->define_count >= cli->define_capacity)
-  {
-    int new_cap = cli->define_capacity == 0 ? 16 : cli->define_capacity * 2;
-    const char **new_defs = realloc(cli->defines, sizeof(char *) * new_cap);
-    if (!new_defs)
-      die("Out of memory");
-    cli->defines = new_defs;
-    cli->define_capacity = new_cap;
-  }
-  cli->defines[cli->define_count++] = def;
-}
-
-static void cli_add_force_include(Cli *cli, const char *path)
-{
-  if (cli->force_include_count >= cli->force_include_capacity)
-  {
-    int new_cap = cli->force_include_capacity == 0 ? 16 : cli->force_include_capacity * 2;
-    const char **new_paths = realloc(cli->force_includes, sizeof(char *) * new_cap);
-    if (!new_paths)
-      die("Out of memory");
-    cli->force_includes = new_paths;
-    cli->force_include_capacity = new_cap;
-  }
-  cli->force_includes[cli->force_include_count++] = path;
-}
-
-static void cli_add_pp_flag(Cli *cli, const char *flag)
-{
-  if (cli->pp_flags_count >= cli->pp_flags_capacity)
-  {
-    int new_cap = cli->pp_flags_capacity == 0 ? 16 : cli->pp_flags_capacity * 2;
-    const char **new_flags = realloc(cli->pp_flags, sizeof(char *) * new_cap);
-    if (!new_flags)
-      die("Out of memory");
-    cli->pp_flags = new_flags;
-    cli->pp_flags_capacity = new_cap;
-  }
-  cli->pp_flags[cli->pp_flags_count++] = flag;
-}
-
-static void cli_add_cc_arg(Cli *cli, const char *arg)
-{
-  if (cli->cc_arg_count >= cli->cc_arg_capacity)
-  {
-    int new_cap = cli->cc_arg_capacity == 0 ? 64 : cli->cc_arg_capacity * 2;
-    const char **new_args = realloc(cli->cc_args, sizeof(char *) * new_cap);
-    if (!new_args)
-      die("Out of memory");
-    cli->cc_args = new_args;
-    cli->cc_arg_capacity = new_cap;
-  }
-  cli->cc_args[cli->cc_arg_count++] = arg;
-}
+#define cli_add_source(cli, src) CLI_ARRAY_APPEND(cli, sources, source_count, source_capacity, src, 16)
+#define cli_add_include(cli, path) CLI_ARRAY_APPEND(cli, include_paths, include_count, include_capacity, path, 16)
+#define cli_add_define(cli, def) CLI_ARRAY_APPEND(cli, defines, define_count, define_capacity, def, 16)
+#define cli_add_force_include(cli, p) CLI_ARRAY_APPEND(cli, force_includes, force_include_count, force_include_capacity, p, 16)
+#define cli_add_pp_flag(cli, flag) CLI_ARRAY_APPEND(cli, pp_flags, pp_flags_count, pp_flags_capacity, flag, 16)
+#define cli_add_cc_arg(cli, arg) CLI_ARRAY_APPEND(cli, cc_args, cc_arg_count, cc_arg_capacity, arg, 64)
 
 static bool is_assembly_file(const char *arg)
 {

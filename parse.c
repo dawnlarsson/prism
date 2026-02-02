@@ -693,35 +693,56 @@ static int64_t read_int_literal(char **pp, int base)
     return val;
 }
 
-// Check for C23 extended float suffix (F128, F64, F32, F16, BF16)
-static bool has_extended_float_suffix(char *p, int len)
+// Check for C23 extended float suffix and return info for normalization
+// Returns: suffix length to strip (0 if no extended suffix)
+// Sets *replacement to the standard suffix to use (NULL for none, "f" for float, "L" for long double)
+static int get_extended_float_suffix(const char *p, int len, const char **replacement)
 {
+    if (replacement)
+        *replacement = NULL;
     if (len < 3)
-        return false;
-    char *end = p + len;
+        return 0;
+    const char *end = p + len;
 
-    // Check for BF16/bf16
+    // Check for BF16/bf16 (4 chars) - use float as closest approximation
     if (len >= 4 && (end[-4] == 'B' || end[-4] == 'b') &&
         (end[-3] == 'F' || end[-3] == 'f') && end[-2] == '1' && end[-1] == '6')
-        return true;
+    {
+        if (replacement)
+            *replacement = "f";
+        return 4;
+    }
 
-    // Check for F128/f128
+    // Check for F128/f128 (4 chars) - use long double
     if (len >= 4 && (end[-4] == 'F' || end[-4] == 'f') &&
         end[-3] == '1' && end[-2] == '2' && end[-1] == '8')
-        return true;
-
-    // Check for F64/f64, F32/f32, F16/f16
-    if ((end[-3] == 'F' || end[-3] == 'f') &&
-        (end[-2] == '6' || end[-2] == '3' || end[-2] == '1') &&
-        (end[-1] == '4' || end[-1] == '2' || end[-1] == '6'))
     {
-        // Verify valid combinations: F64, F32, F16
-        if ((end[-2] == '6' && end[-1] == '4') ||
-            (end[-2] == '3' && end[-1] == '2') ||
-            (end[-2] == '1' && end[-1] == '6'))
-            return true;
+        if (replacement)
+            *replacement = "L";
+        return 4;
     }
-    return false;
+
+    // Check for F64/f64 (3 chars) - double is default, no suffix needed
+    if ((end[-3] == 'F' || end[-3] == 'f') && end[-2] == '6' && end[-1] == '4')
+        return 3;
+
+    // Check for F32/f32 (3 chars) - use float
+    if ((end[-3] == 'F' || end[-3] == 'f') && end[-2] == '3' && end[-1] == '2')
+    {
+        if (replacement)
+            *replacement = "f";
+        return 3;
+    }
+
+    // Check for F16/f16 (3 chars) - use float as closest approximation
+    if ((end[-3] == 'F' || end[-3] == 'f') && end[-2] == '1' && end[-1] == '6')
+    {
+        if (replacement)
+            *replacement = "f";
+        return 3;
+    }
+
+    return 0;
 }
 
 static void convert_pp_number(Token *tok)
@@ -732,7 +753,7 @@ static void convert_pp_number(Token *tok)
 
     // Check for C23 extended float suffixes first
     // BUT NOT if it's a hex/binary number (to avoid false matches like 0xf64 matching F64 suffix)
-    if (!is_hex && !is_bin && has_extended_float_suffix(p, tok->len))
+    if (!is_hex && !is_bin && get_extended_float_suffix(p, tok->len, NULL))
     {
         tok->kind = TK_NUM;
         tok->flags |= TF_IS_FLOAT;
@@ -1056,11 +1077,11 @@ static Token *tokenize(File *file)
                     char c = *p;
                     // Allow hex digits (a-f, A-F), number prefixes (x, X, b, B), and common suffixes (u, U, l, L, f, F)
                     // Also allow e, E, p, P for exponents (though e+/e- is handled above)
-                    if ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') ||  // Hex digits
-                        c == 'x' || c == 'X' || c == 'b' || c == 'B' ||       // Prefixes
-                        c == 'e' || c == 'E' || c == 'p' || c == 'P' ||       // Exponents
-                        c == 'u' || c == 'U' || c == 'l' || c == 'L' ||       // Integer suffixes
-                        c == 'f' || c == 'F')                                  // Float suffix
+                    if ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || // Hex digits
+                        c == 'x' || c == 'X' || c == 'b' || c == 'B' ||     // Prefixes
+                        c == 'e' || c == 'E' || c == 'p' || c == 'P' ||     // Exponents
+                        c == 'u' || c == 'U' || c == 'l' || c == 'L' ||     // Integer suffixes
+                        c == 'f' || c == 'F')                               // Float suffix
                     {
                         p++;
                     }
