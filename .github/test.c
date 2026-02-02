@@ -476,12 +476,14 @@ void test_zeroinit_with_defer(void)
 #ifdef __GNUC__
 void test_zeroinit_typeof(void)
 {
+    // UPDATED: typeof no longer gets zero-init as a safety measure
+    // (cannot determine at transpile-time if typeof refers to a VLA)
     int x = 42;
-    __typeof__(x) y;
-    CHECK_EQ(y, 0, "typeof zero-init");
+    __typeof__(x) y = 0; // Explicit init required
+    CHECK_EQ(y, 0, "typeof with explicit init");
 
-    __typeof__(x) *ptr;
-    CHECK(ptr == NULL, "typeof pointer zero-init");
+    __typeof__(x) *ptr = NULL; // Explicit init required
+    CHECK(ptr == NULL, "typeof pointer with explicit init");
 }
 #endif
 
@@ -4290,6 +4292,78 @@ void test_security_switch_goto_double_free(void)
     total++;
 }
 
+void test_ghost_shadow_corruption(void)
+{
+    // This tests that typedef shadows are properly cleaned up
+    // even when loop bodies are braceless
+    typedef int T;
+
+    // Declare loop variable T that shadows typedef 'T'
+    // With braceless body, shadow must still be cleaned up
+    for (int T = 0; T < 5; T++)
+        ;
+
+    // Now use T as a type - should work correctly
+    // Without the fix, T would still be shadowed and this would parse wrong
+    T *ptr = NULL;
+
+    CHECK(ptr == NULL, "ghost shadow: typedef T works after braceless for loop");
+}
+
+void test_sizeof_vla_codegen(void)
+{
+    int n = 10;
+
+    // sizeof(int[n]) is evaluated at runtime because n is variable
+    // So arr is a VLA, not a constant-sized array
+    // Prism should NOT emit = {0} for this
+    int arr[sizeof(int[n])];
+    arr[0] = 42;
+
+    CHECK(arr[0] == 42, "sizeof(VLA) treated as runtime value");
+}
+
+void test_keyword_typedef_collision(void)
+{
+    // These typedefs use names that are also Prism keywords
+    typedef int raw;
+    typedef int defer;
+
+    // These should work correctly
+    raw x = 10;
+    defer y = 20;
+
+    CHECK(x == 10, "typedef named 'raw' works");
+    CHECK(y == 20, "typedef named 'defer' works");
+}
+
+void test_sizeof_vla_typedef(void)
+{
+    int n = 10;
+    typedef int VLA_Type[n];
+
+    // sizeof(VLA_Type) is evaluated at runtime because VLA_Type is a VLA
+    // Prism should NOT emit = {0} for this
+    int arr[sizeof(VLA_Type)];
+    arr[0] = 42;
+
+    CHECK(arr[0] == 42, "sizeof(VLA_Typedef) treated as runtime value");
+}
+
+void test_typeof_vla_zeroinit(void)
+{
+    int n = 10;
+    int vla1[n];
+    vla1[0] = 42;
+
+    // copy_vla is a VLA type via typeof
+    // Prism should NOT try to zero-initialize this
+    __typeof__(vla1) copy_vla;
+    copy_vla[0] = 99;
+
+    CHECK(copy_vla[0] == 99, "typeof(VLA) variable works without zero-init");
+}
+
 void run_verification_bug_tests(void)
 {
     printf("\n=== VERIFICATION TESTS ===\n");
@@ -4343,6 +4417,12 @@ void run_verification_bug_tests(void)
     test_security_stmtexpr_value_corruption();
     test_security_braceless_defer_trap();
     test_security_switch_goto_double_free();
+
+    test_ghost_shadow_corruption();
+    test_sizeof_vla_codegen();
+    test_keyword_typedef_collision();
+    test_sizeof_vla_typedef();
+    test_typeof_vla_zeroinit();
 }
 
 // MAIN

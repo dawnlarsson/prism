@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.93.0"
+#define PRISM_VERSION "0.94.0"
 
 #include "parse.c"
 
@@ -1136,7 +1136,8 @@ static void parse_enum_constants(Token *tok, int scope_depth)
 // Returns false if the most recent entry with this name is a shadow (variable)
 static bool is_known_typedef(Token *tok)
 {
-  if (tok->kind != TK_IDENT)
+  // Accept both TK_IDENT and TK_KEYWORD (for typedefs named 'raw' or 'defer')
+  if (tok->kind != TK_IDENT && tok->kind != TK_KEYWORD)
     return false;
   int idx = typedef_get_index(tok->loc, tok->len);
   if (idx < 0)
@@ -1148,7 +1149,8 @@ static bool is_known_typedef(Token *tok)
 // Check if token is a known VLA typedef (search most recent first for shadowing)
 static bool is_vla_typedef(Token *tok)
 {
-  if (tok->kind != TK_IDENT)
+  // Accept both TK_IDENT and TK_KEYWORD (for typedefs named 'raw' or 'defer')
+  if (tok->kind != TK_IDENT && tok->kind != TK_KEYWORD)
     return false;
   int idx = typedef_get_index(tok->loc, tok->len);
   if (idx < 0)
@@ -1162,7 +1164,8 @@ static bool is_vla_typedef(Token *tok)
 // Check if token is a known enum constant (compile-time constant)
 static bool is_known_enum_const(Token *tok)
 {
-  if (tok->kind != TK_IDENT)
+  // Accept both TK_IDENT and TK_KEYWORD (for enum constants named 'raw' or 'defer')
+  if (tok->kind != TK_IDENT && tok->kind != TK_KEYWORD)
     return false;
   int idx = typedef_get_index(tok->loc, tok->len);
   if (idx < 0)
@@ -1893,7 +1896,8 @@ static Token *scan_typedef_name(Token **tokp)
 
     tok = skip_attributes(tok);
 
-    if (tok && tok->kind == TK_IDENT)
+    // Allow both TK_IDENT and TK_KEYWORD (for typedef names like 'raw' or 'defer')
+    if (tok && (tok->kind == TK_IDENT || tok->kind == TK_KEYWORD))
     {
       Token *name = tok;
       tok = tok->next;
@@ -1931,7 +1935,8 @@ static Token *scan_typedef_name(Token **tokp)
   }
 
   // Case 2: Direct declarator - name, name[N], name(args)
-  if (tok && tok->kind == TK_IDENT)
+  // Allow both TK_IDENT and TK_KEYWORD (for typedef names like 'raw' or 'defer')
+  if (tok && (tok->kind == TK_IDENT || tok->kind == TK_KEYWORD))
   {
     Token *name = tok;
     tok = tok->next;
@@ -2399,19 +2404,79 @@ static bool is_const_array_size(Token *open_bracket)
     else
     {
       is_empty = false;
-      // sizeof and _Alignof/alignof always produce compile-time constants,
-      // regardless of their argument (type name or expression).
+      // sizeof and _Alignof/alignof produce compile-time constants UNLESS
+      // their argument is a VLA type. For example, sizeof(int[n]) where n is
+      // variable is evaluated at runtime, so arrays sized by sizeof(VLA) are VLAs.
       // offsetof(type, member) also produces a compile-time constant.
       // __builtin_offsetof is what offsetof expands to after preprocessing.
-      // Skip their parenthesized argument entirely.
       if (equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof") ||
           equal(tok, "offsetof") || equal(tok, "__builtin_offsetof"))
       {
+        bool is_sizeof = equal(tok, "sizeof");
         tok = tok->next;
         if (tok && equal(tok, "("))
         {
           int paren_depth = 1;
+          Token *sizeof_start = tok->next;
           tok = tok->next;
+
+          // For sizeof, check if the argument contains a VLA pattern
+          if (is_sizeof)
+          {
+            Token *sizeof_tok = sizeof_start;
+            bool found_vla_in_sizeof = false;
+
+            // First check if the argument is a VLA typedef (e.g., sizeof(VLA_Type))
+            if (sizeof_tok && is_vla_typedef(sizeof_tok))
+            {
+              found_vla_in_sizeof = true;
+            }
+
+            // Scan the sizeof argument for array dimensions with variables
+            while (sizeof_tok && sizeof_tok->kind != TK_EOF && paren_depth > 0 && !found_vla_in_sizeof)
+            {
+              if (equal(sizeof_tok, "("))
+                paren_depth++;
+              else if (equal(sizeof_tok, ")"))
+                paren_depth--;
+              else if (equal(sizeof_tok, "[") && paren_depth > 0)
+              {
+                // Found an array dimension inside sizeof - check if it contains a variable
+                Token *bracket_tok = sizeof_tok->next;
+                int bracket_depth = 1;
+                while (bracket_tok && bracket_tok->kind != TK_EOF && bracket_depth > 0)
+                {
+                  if (equal(bracket_tok, "["))
+                    bracket_depth++;
+                  else if (equal(bracket_tok, "]"))
+                    bracket_depth--;
+                  else if (bracket_tok->kind == TK_IDENT && bracket_depth > 0 &&
+                           !is_known_enum_const(bracket_tok) && !is_known_typedef(bracket_tok) &&
+                           !is_type_keyword(bracket_tok) && !looks_like_system_typedef(bracket_tok))
+                  {
+                    // Found a variable in the array dimension inside sizeof
+                    found_vla_in_sizeof = true;
+                    break;
+                  }
+                  bracket_tok = bracket_tok->next;
+                }
+                if (found_vla_in_sizeof)
+                  break;
+              }
+              sizeof_tok = sizeof_tok->next;
+            }
+
+            if (found_vla_in_sizeof)
+            {
+              has_only_literals = false; // sizeof(VLA) is runtime, not constant
+            }
+
+            // Skip to end of sizeof argument
+            paren_depth = 1;
+            tok = sizeof_start;
+          }
+
+          // Skip the rest of the parenthesized argument
           while (tok->kind != TK_EOF && paren_depth > 0)
           {
             if (equal(tok, "("))
@@ -2548,6 +2613,7 @@ static Token *try_zero_init_decl(Token *tok)
   bool is_struct_type = false;
   bool is_typedef_type = false;
   bool is_typedef_vla = false; // True if the typedef refers to a VLA
+  bool has_typeof = false;     // True if using typeof/typeof_unqual/__typeof__
   Token *type_end = tok;       // Will point to first token after the base type
 
   while (is_type_qualifier(tok) || is_type_keyword(tok) ||
@@ -2612,10 +2678,13 @@ static Token *try_zero_init_decl(Token *tok)
       continue;
     }
     // Handle typeof/typeof_unqual with parenthesized expression
+    // SAFETY: We cannot determine at transpile-time if typeof refers to a VLA,
+    // so we disable zero-init for all typeof declarations to avoid initializing VLAs.
     if (equal(tok, "typeof") || equal(tok, "__typeof__") || equal(tok, "__typeof") ||
         equal(tok, "typeof_unqual"))
     {
       saw_type = true;
+      has_typeof = true; // Disable zero-init for typeof declarations
       tok = tok->next;
       if (tok && equal(tok, "("))
         tok = skip_balanced(tok, "(", ")");
@@ -3160,7 +3229,8 @@ static Token *try_zero_init_decl(Token *tok)
     // A VLA is:
     //   1. Array with variable dimension, unless it's a pointer to that array (parens)
     //   2. VLA typedef used directly (not as a pointer)
-    bool effective_vla = (is_vla && !has_paren_declarator) || (is_typedef_vla && !is_pointer);
+    //   3. typeof expression (cannot determine at transpile-time if it's a VLA)
+    bool effective_vla = (is_vla && !has_paren_declarator) || (is_typedef_vla && !is_pointer) || has_typeof;
 
     // VLAs cannot be initialized - this is a hard error, no bypass allowed
     // C syntax doesn't allow `int arr[n] = {0};` so VLAs break safety guarantees
@@ -3204,9 +3274,12 @@ static Token *try_zero_init_decl(Token *tok)
     // Register shadow if this variable name matches a typedef
     // This ensures subsequent uses of this name in the same scope
     // are treated as variables, not types
+    // IMPORTANT: For loop init variables (for (int i; ...)) are scoped to the loop body,
+    // which is defer_depth + 1 (since the { hasn't been seen yet).
     if (is_known_typedef(var_name))
     {
-      typedef_add_shadow(var_name->loc, var_name->len, defer_depth);
+      int shadow_depth = in_for_init ? defer_depth + 1 : defer_depth;
+      typedef_add_shadow(var_name->loc, var_name->len, shadow_depth);
     }
 
     // Check what's next
@@ -3502,8 +3575,12 @@ static int transpile(char *input_file, char *output_file)
     // Handle 'defer' keyword
     // Skip if: preceded by member access (. or ->) - that's a struct field, not keyword
     //          inside struct/union/enum body - that's a field declaration, not keyword
+    //          preceded by a type keyword - that's a variable/typedef name, not keyword
+    //          'defer' is registered as a typedef - that's a type name, not keyword
     if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "defer") &&
-        !is_member_access(last_emitted) && struct_depth == 0)
+        !is_member_access(last_emitted) && struct_depth == 0 &&
+        !(last_emitted && (is_type_keyword(last_emitted) || equal(last_emitted, "typedef"))) &&
+        !is_known_typedef(tok))
     {
       // Check for defer inside for/while/switch/if parentheses - this is invalid
       if (pending_control_flow && control_paren_depth > 0)
@@ -4151,6 +4228,13 @@ static int transpile(char *input_file, char *output_file)
       // Semicolon at depth 0 ends a braceless statement body
       else if (equal(tok, ";") && control_paren_depth == 0)
       {
+        // Pop any phantom scopes registered at defer_depth + 1
+        // For braceless loop bodies like: for (int T = 0; T < 5; T++);
+        // The loop variable T would be registered as shadow at defer_depth + 1
+        // but we never actually enter/exit that scope with braces.
+        // Without this cleanup, the shadow persists and corrupts typedef lookups.
+        typedef_pop_scope(defer_depth + 1);
+
         pending_control_flow = false;
         next_scope_is_loop = false;
         next_scope_is_switch = false;
