@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.95.0"
+#define PRISM_VERSION "0.96.0"
 
 #include "parse.c"
 
@@ -1309,18 +1309,43 @@ static void scan_labels_in_function(Token *tok)
     }
 
     // Check for label: identifier followed by ':' (but not ::)
+    // Also handle labels with attributes: identifier __attribute__((...)) :
     // Filter out: ternary operator, switch cases, bitfields
-    if (is_label(tok))
+    if (tok->kind == TK_IDENT)
     {
-      Token *colon = tok->next;
-      // Make sure it's not :: (C++ scope resolution)
-      bool is_scope_resolution = colon->next && equal(colon->next, ":");
-      bool is_ternary = prev && equal(prev, "?");
-      bool is_switch_case = prev && (equal(prev, "case") || equal(prev, "default"));
-      bool is_bitfield = local_struct_depth > 0;
+      // Look ahead for colon, skipping any __attribute__((...)) sequences
+      Token *t = tok->next;
+      while (t && (equal(t, "__attribute__") || equal(t, "__attribute")))
+      {
+        t = t->next;
+        if (t && equal(t, "("))
+        {
+          int paren_depth = 1;
+          t = t->next;
+          while (t && paren_depth > 0)
+          {
+            if (equal(t, "("))
+              paren_depth++;
+            else if (equal(t, ")"))
+              paren_depth--;
+            t = t->next;
+          }
+        }
+      }
 
-      if (!is_scope_resolution && !is_ternary && !is_switch_case && !is_bitfield)
-        label_table_add(tok->loc, tok->len, depth);
+      // Now check if we found a colon
+      if (t && equal(t, ":"))
+      {
+        Token *colon = t;
+        // Make sure it's not :: (C++ scope resolution)
+        bool is_scope_resolution = colon->next && equal(colon->next, ":");
+        bool is_ternary = prev && equal(prev, "?");
+        bool is_switch_case = prev && (equal(prev, "case") || equal(prev, "default"));
+        bool is_bitfield = local_struct_depth > 0;
+
+        if (!is_scope_resolution && !is_ternary && !is_switch_case && !is_bitfield)
+          label_table_add(tok->loc, tok->len, depth);
+      }
     }
 
     prev = tok;
@@ -1480,20 +1505,45 @@ static Token *goto_skips_defer(Token *goto_tok, char *label_name, int label_len)
     }
 
     // Found the label? Apply same filtering as scan_labels_in_function
-    if (is_label(tok) && tok->len == label_len &&
+    // Also handle labels with attributes: identifier __attribute__((...)) :
+    if (tok->kind == TK_IDENT && tok->len == label_len &&
         !memcmp(tok->loc, label_name, label_len))
     {
-      Token *colon = tok->next;
-      // Filter out false positives:
-      bool is_scope_resolution = colon->next && equal(colon->next, ":");
-      bool is_ternary = prev && equal(prev, "?");
-      bool is_switch_case = prev && (equal(prev, "case") || equal(prev, "default"));
-      bool is_bitfield = local_struct_depth > 0;
-
-      if (!is_scope_resolution && !is_ternary && !is_switch_case && !is_bitfield)
+      // Look ahead for colon, skipping any __attribute__((...)) sequences
+      Token *t = tok->next;
+      while (t && (equal(t, "__attribute__") || equal(t, "__attribute")))
       {
-        // Real label found - if we have an active defer, we're jumping past it
-        return active_defer;
+        t = t->next;
+        if (t && equal(t, "("))
+        {
+          int paren_depth = 1;
+          t = t->next;
+          while (t && paren_depth > 0)
+          {
+            if (equal(t, "("))
+              paren_depth++;
+            else if (equal(t, ")"))
+              paren_depth--;
+            t = t->next;
+          }
+        }
+      }
+
+      // Now check if we found a colon
+      if (t && equal(t, ":"))
+      {
+        Token *colon = t;
+        // Filter out false positives:
+        bool is_scope_resolution = colon->next && equal(colon->next, ":");
+        bool is_ternary = prev && equal(prev, "?");
+        bool is_switch_case = prev && (equal(prev, "case") || equal(prev, "default"));
+        bool is_bitfield = local_struct_depth > 0;
+
+        if (!is_scope_resolution && !is_ternary && !is_switch_case && !is_bitfield)
+        {
+          // Real label found - if we have an active defer, we're jumping past it
+          return active_defer;
+        }
       }
     }
 
@@ -1703,20 +1753,44 @@ static Token *goto_skips_decl(Token *goto_tok, char *label_name, int label_len)
       continue;
     }
 
-    // Found the label?
-    if (is_label(tok) && tok->len == label_len &&
+    // Found the label? Also handle labels with attributes: identifier __attribute__((...)) :
+    if (tok->kind == TK_IDENT && tok->len == label_len &&
         !memcmp(tok->loc, label_name, label_len))
     {
-      Token *colon = tok->next;
-      bool is_scope_resolution = colon->next && equal(colon->next, ":");
-      bool is_ternary = prev && equal(prev, "?");
-      bool is_switch_case = prev && (equal(prev, "case") || equal(prev, "default"));
-      bool is_bitfield = local_struct_depth > 0;
-
-      if (!is_scope_resolution && !is_ternary && !is_switch_case && !is_bitfield)
+      // Look ahead for colon, skipping any __attribute__((...)) sequences
+      Token *t = tok->next;
+      while (t && (equal(t, "__attribute__") || equal(t, "__attribute")))
       {
-        // Real label found - if we have an active decl, goto skips it
-        return active_decl;
+        t = t->next;
+        if (t && equal(t, "("))
+        {
+          int paren_depth = 1;
+          t = t->next;
+          while (t && paren_depth > 0)
+          {
+            if (equal(t, "("))
+              paren_depth++;
+            else if (equal(t, ")"))
+              paren_depth--;
+            t = t->next;
+          }
+        }
+      }
+
+      // Now check if we found a colon
+      if (t && equal(t, ":"))
+      {
+        Token *colon = t;
+        bool is_scope_resolution = colon->next && equal(colon->next, ":");
+        bool is_ternary = prev && equal(prev, "?");
+        bool is_switch_case = prev && (equal(prev, "case") || equal(prev, "default"));
+        bool is_bitfield = local_struct_depth > 0;
+
+        if (!is_scope_resolution && !is_ternary && !is_switch_case && !is_bitfield)
+        {
+          // Real label found - if we have an active decl, goto skips it
+          return active_decl;
+        }
       }
     }
 
@@ -5371,12 +5445,23 @@ static Cli cli_parse(int argc, char **argv)
       continue;
     }
 
-    // -U (undefine) - pass to CC, prism doesn't have pp_undef yet
-    if (!strcmp(arg, "-U") || str_startswith(arg, "-U"))
+    // -U (undefine) - pass to preprocessor and CC
+    if (!strcmp(arg, "-U"))
     {
+      cli_add_pp_flag(&cli, arg);
       cli_add_cc_arg(&cli, arg);
-      if (!strcmp(arg, "-U") && i + 1 < argc)
-        cli_add_cc_arg(&cli, argv[++i]);
+      if (i + 1 < argc)
+      {
+        const char *undef = argv[++i];
+        cli_add_pp_flag(&cli, undef);
+        cli_add_cc_arg(&cli, undef);
+      }
+      continue;
+    }
+    if (str_startswith(arg, "-U"))
+    {
+      cli_add_pp_flag(&cli, arg);
+      cli_add_cc_arg(&cli, arg);
       continue;
     }
 
@@ -5437,21 +5522,34 @@ static Cli cli_parse(int argc, char **argv)
     }
 
     // ─── Everything else: pass through to CC ───
-    // Also track flags that affect macro/include path discovery
+    // Also track flags that affect preprocessing
     if (strncmp(arg, "-std=", 5) == 0 ||
-        strncmp(arg, "-m", 2) == 0 || // -m32, -m64, -march=, -mtune=, etc.
+        strncmp(arg, "-m", 2) == 0 ||          // -m32, -m64, -march=, -mtune=, etc.
         strncmp(arg, "--target=", 9) == 0 ||
-        strcmp(arg, "-pthread") == 0 || // pthread flags affect preprocessor macros
+        strncmp(arg, "-f", 2) == 0 ||          // -fPIC, -fpic, -fno-*, feature flags
+        strncmp(arg, "-W", 2) == 0 ||          // warning flags (can affect preprocessor)
+        strncmp(arg, "-O", 2) == 0 ||          // optimization (can affect __OPTIMIZE__)
+        strncmp(arg, "-g", 2) == 0 ||          // debug flags
+        strcmp(arg, "-pthread") == 0 ||
         strcmp(arg, "-pthreads") == 0 ||
         strcmp(arg, "-mthreads") == 0 ||
         strcmp(arg, "-mt") == 0 ||
-        strcmp(arg, "--thread-safe") == 0)
+        strcmp(arg, "--thread-safe") == 0 ||
+        strcmp(arg, "-pedantic") == 0 ||
+        strcmp(arg, "-pedantic-errors") == 0 ||
+        strcmp(arg, "-ansi") == 0 ||
+        strcmp(arg, "-traditional") == 0 ||
+        strcmp(arg, "-traditional-cpp") == 0 ||
+        strcmp(arg, "-nostdinc") == 0 ||
+        strcmp(arg, "-nostdinc++") == 0 ||
+        strcmp(arg, "-undef") == 0 ||
+        strncmp(arg, "-trigraphs", 10) == 0)
     {
       cli_add_pp_flag(&cli, arg);
     }
     cli_add_cc_arg(&cli, arg);
 
-    // Handle space-separated args like -L dir
+    // Handle space-separated args like -L dir, -x lang
     if (flag_needs_arg(arg) && i + 1 < argc && argv[i + 1][0] != '-')
     {
       cli_add_cc_arg(&cli, argv[++i]);

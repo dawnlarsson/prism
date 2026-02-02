@@ -4520,6 +4520,22 @@ void test_edge_defer_in_generic(void)
     CHECK(result == 10, "defer with _Generic");
 }
 
+void test_attributed_label_defer(void)
+{
+    log_reset();
+    {
+        defer log_append("Cleanup");
+        goto error;
+    }
+
+    // GCC syntax: attribute after colon (not before)
+    // Prism label scanner should recognize this label
+    error: __attribute__((unused))
+        log_append("Error");
+
+    CHECK(strcmp(log_buffer, "CleanupError") == 0, "attributed label defer cleanup");
+}
+
 void run_verification_bug_tests(void)
 {
     printf("\n=== VERIFICATION TESTS ===\n");
@@ -4541,6 +4557,8 @@ void run_verification_bug_tests(void)
     test_vanishing_statement_if_else();
     test_vanishing_statement_while();
     test_vanishing_statement_for();
+
+    test_attributed_label_defer();
 
     test_generic_default_collision();
     test_generic_default_collision_nested();
