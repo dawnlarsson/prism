@@ -2973,7 +2973,42 @@ static void argv_builder_init(ArgvBuilder *ab)
   ab->capacity = 0;
 }
 
-static int run_command(char **argv);
+// Run a command and wait for it to complete
+// Returns exit status, or -1 on error
+static int run_command(char **argv)
+{
+#ifdef _WIN32
+  intptr_t status = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
+  return (int)status;
+#else
+  pid_t pid = fork();
+  if (pid == -1)
+  {
+    perror("fork");
+    return -1;
+  }
+  if (pid == 0)
+  {
+    // Unset CC/PRISM_CC to prevent infinite recursion when prism is used as CC
+    unsetenv("CC");
+    unsetenv("PRISM_CC");
+    execvp(argv[0], argv);
+    perror("execvp");
+    _exit(127);
+  }
+  int status;
+  if (waitpid(pid, &status, 0) == -1)
+  {
+    perror("waitpid");
+    return -1;
+  }
+  if (WIFEXITED(status))
+    return WEXITSTATUS(status);
+  if (WIFSIGNALED(status))
+    return 128 + WTERMSIG(status);
+  return -1;
+#endif
+}
 
 static bool argv_builder_add(ArgvBuilder *ab, const char *arg)
 {
@@ -4091,41 +4126,6 @@ static void prism_free(PrismResult *r)
 // CLI IMPLEMENTATION (excluded with -DPRISM_LIB_MODE)
 
 #ifndef PRISM_LIB_MODE
-
-static int run_command(char **argv)
-{
-#ifdef _WIN32
-  intptr_t status = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
-  return (int)status;
-#else
-  pid_t pid = fork();
-  if (pid == -1)
-  {
-    perror("fork");
-    return -1;
-  }
-  if (pid == 0)
-  {
-    // Unset CC/PRISM_CC to prevent infinite recursion when prism is used as CC
-    unsetenv("CC");
-    unsetenv("PRISM_CC");
-    execvp(argv[0], argv);
-    perror("execvp");
-    _exit(127);
-  }
-  int status;
-  if (waitpid(pid, &status, 0) == -1)
-  {
-    perror("waitpid");
-    return -1;
-  }
-  if (WIFEXITED(status))
-    return WEXITSTATUS(status);
-  if (WIFSIGNALED(status))
-    return 128 + WTERMSIG(status);
-  return -1;
-#endif
-}
 
 static char **build_argv(const char *first, ...)
 {
