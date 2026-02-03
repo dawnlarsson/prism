@@ -103,7 +103,7 @@ skip:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v0.98.2 - Robust C transpiler
+Prism v0.98.3 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 

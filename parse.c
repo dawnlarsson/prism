@@ -153,6 +153,39 @@ static void arena_reset(void)
     token_arena.current = token_arena.head;
 }
 
+// String allocation tracker - tracks malloc'd strings for cleanup
+static char **string_allocs = NULL;
+static int string_alloc_count = 0;
+static int string_alloc_capacity = 0;
+
+static char *track_string_alloc(size_t size)
+{
+    char *ptr = calloc(1, size);
+    if (!ptr)
+        return NULL;
+    if (string_alloc_count >= string_alloc_capacity)
+    {
+        int new_cap = string_alloc_capacity == 0 ? 256 : string_alloc_capacity * 2;
+        char **new_allocs = realloc(string_allocs, sizeof(char *) * new_cap);
+        if (!new_allocs)
+        {
+            free(ptr);
+            return NULL;
+        }
+        string_allocs = new_allocs;
+        string_alloc_capacity = new_cap;
+    }
+    string_allocs[string_alloc_count++] = ptr;
+    return ptr;
+}
+
+static void free_string_allocs(void)
+{
+    for (int i = 0; i < string_alloc_count; i++)
+        free(string_allocs[i]);
+    string_alloc_count = 0;
+}
+
 // Simple hashmap for keywords
 typedef struct
 {
@@ -196,6 +229,21 @@ static void *hashmap_get(HashMap *map, char *key, int keylen)
     return NULL;
 }
 
+static void hashmap_put(HashMap *map, char *key, int keylen, void *val);
+
+static void hashmap_resize(HashMap *map, int newcap)
+{
+    HashMap map2 = {.buckets = calloc(newcap, sizeof(HashEntry)), .capacity = newcap};
+    for (int i = 0; i < map->capacity; i++)
+    {
+        HashEntry *ent = &map->buckets[i];
+        if (ent->key && ent->key != TOMBSTONE)
+            hashmap_put(&map2, ent->key, ent->keylen, ent->val);
+    }
+    free(map->buckets);
+    *map = map2;
+}
+
 static void hashmap_put(HashMap *map, char *key, int keylen, void *val)
 {
     if (!map->buckets)
@@ -203,21 +251,8 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val)
         map->buckets = calloc(64, sizeof(HashEntry));
         map->capacity = 64;
     }
-    else if ((map->used * 100) / map->capacity >= 70)
-    {
-        // Rehash
-        HashMap map2 = {};
-        map2.buckets = calloc(map->capacity * 2, sizeof(HashEntry));
-        map2.capacity = map->capacity * 2;
-        for (int i = 0; i < map->capacity; i++)
-        {
-            HashEntry *ent = &map->buckets[i];
-            if (ent->key && ent->key != TOMBSTONE)
-                hashmap_put(&map2, ent->key, ent->keylen, ent->val);
-        }
-        free(map->buckets);
-        *map = map2;
-    }
+    else if (map->used * 100 / map->capacity >= 70)
+        hashmap_resize(map, map->capacity * 2);
     uint64_t hash = fnv_hash(key, keylen);
     int first_empty = -1;
     for (int i = 0; i < map->capacity; i++)
@@ -355,21 +390,25 @@ static void verror_at(char *filename, char *input, int line_no, char *loc, char 
     while (*end && *end != '\n')
         end++;
     int indent = fprintf(stderr, "%s:%d: ", filename, line_no);
-    fprintf(stderr, "%.*s\n", (int)(end - line), line);
-    fprintf(stderr, "%*s^ ", indent + (int)(loc - line), "");
+    fprintf(stderr, "%.*s\n%*s^ ", (int)(end - line), line, indent + (int)(loc - line), "");
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
 }
 
+static int count_lines(char *base, char *loc)
+{
+    int n = 1;
+    for (char *p = base; p < loc; p++)
+        if (*p == '\n')
+            n++;
+    return n;
+}
+
 noreturn void error_at(char *loc, char *fmt, ...)
 {
-    int line_no = 1;
-    for (char *p = current_file->contents; p < loc; p++)
-        if (*p == '\n')
-            line_no++;
     va_list ap;
     va_start(ap, fmt);
-    verror_at(current_file->name, current_file->contents, line_no, loc, fmt, ap);
+    verror_at(current_file->name, current_file->contents, count_lines(current_file->contents, loc), loc, fmt, ap);
     exit(1);
 }
 
@@ -629,7 +668,7 @@ static Token *read_string_literal(char *start, char *quote)
     size_t buf_size = (end - quote);
     if (buf_size == 0)
         buf_size = 1;
-    char *buf = calloc(1, buf_size);
+    char *buf = track_string_alloc(buf_size);
     if (!buf)
         error("out of memory in read_string_literal");
     int len = 0;
@@ -674,17 +713,9 @@ static Token *read_char_literal(char *start, char *quote)
 
 static int64_t read_int_literal(char **pp, int base)
 {
-    char *p = *pp;
-    uint64_t val = 0;
-    while (isxdigit(*p))
-    {
-        int d = from_hex(*p);
-        if (d >= base)
-            break;
-        val = val * base + d;
-        p++;
-    }
-    *pp = p;
+    char *end;
+    int64_t val = strtoll(*pp, &end, base);
+    *pp = end;
     return val;
 }
 
@@ -697,46 +728,42 @@ static int get_extended_float_suffix(const char *p, int len, const char **replac
         *replacement = NULL;
     if (len < 3)
         return 0;
-    const char *end = p + len;
-
-    // Check for BF16/bf16 (4 chars) - use float as closest approximation
-    if (len >= 4 && (end[-4] == 'B' || end[-4] == 'b') &&
-        (end[-3] == 'F' || end[-3] == 'f') && end[-2] == '1' && end[-1] == '6')
+    const char *e = p + len;
+    // 4-char suffixes: BF16, F128
+    if (len >= 4)
     {
-        if (replacement)
-            *replacement = "f";
-        return 4;
+        char c = e[-4] | 0x20; // lowercase
+        if (c == 'b' && (e[-3] | 0x20) == 'f' && e[-2] == '1' && e[-1] == '6')
+        {
+            if (replacement)
+                *replacement = "f";
+            return 4;
+        }
+        if (c == 'f' && e[-3] == '1' && e[-2] == '2' && e[-1] == '8')
+        {
+            if (replacement)
+                *replacement = "L";
+            return 4;
+        }
     }
-
-    // Check for F128/f128 (4 chars) - use long double
-    if (len >= 4 && (end[-4] == 'F' || end[-4] == 'f') &&
-        end[-3] == '1' && end[-2] == '2' && end[-1] == '8')
+    // 3-char suffixes: F16, F32, F64
+    if ((e[-3] | 0x20) == 'f' && e[-1] >= '2' && e[-1] <= '6')
     {
-        if (replacement)
-            *replacement = "L";
-        return 4;
+        if (e[-2] == '6' && e[-1] == '4')
+            return 3;
+        if (e[-2] == '3' && e[-1] == '2')
+        {
+            if (replacement)
+                *replacement = "f";
+            return 3;
+        }
+        if (e[-2] == '1' && e[-1] == '6')
+        {
+            if (replacement)
+                *replacement = "f";
+            return 3;
+        }
     }
-
-    // Check for F64/f64 (3 chars) - double is default, no suffix needed
-    if ((end[-3] == 'F' || end[-3] == 'f') && end[-2] == '6' && end[-1] == '4')
-        return 3;
-
-    // Check for F32/f32 (3 chars) - use float
-    if ((end[-3] == 'F' || end[-3] == 'f') && end[-2] == '3' && end[-1] == '2')
-    {
-        if (replacement)
-            *replacement = "f";
-        return 3;
-    }
-
-    // Check for F16/f16 (3 chars) - use float as closest approximation
-    if ((end[-3] == 'F' || end[-3] == 'f') && end[-2] == '1' && end[-1] == '6')
-    {
-        if (replacement)
-            *replacement = "f";
-        return 3;
-    }
-
     return 0;
 }
 
@@ -1164,13 +1191,9 @@ Token *tokenize_file(char *path)
 }
 
 // Reset state for reuse
-// TODO: Minor memory leak - string literals allocated in read_string_literal()
-// (tok->val.str = malloc'd buffer) are not freed here. The arena_reset() only
-// frees Token structs, not the separate string buffers. In CLI mode this is
-// irrelevant (process exit cleans up), but in library mode this leaks memory
-// on every transpile call. Low priority for "unstable" library API.
 void tokenizer_reset(void)
 {
+    free_string_allocs();
     arena_reset();
     for (int i = 0; i < input_file_count; i++)
         free_file(input_files[i]);

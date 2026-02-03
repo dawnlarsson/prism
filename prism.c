@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.98.2"
+#define PRISM_VERSION "0.98.3"
 
 #include "parse.c"
 
@@ -288,44 +288,23 @@ static void out_str(const char *s, size_t len)
   }
 }
 
-__attribute__((format(printf, 1, 2))) static void out_printf(const char *fmt, ...)
+static void out_uint(unsigned long long v)
 {
-  // Use remaining buffer space for formatting
-  size_t remaining = out_buf.cap - out_buf.pos;
-  va_list ap;
-  va_start(ap, fmt);
-  int n = vsnprintf(out_buf.buf + out_buf.pos, remaining, fmt, ap);
-  va_end(ap);
-
-  if (n >= 0 && (size_t)n < remaining)
+  char buf[24], *p = buf + sizeof(buf);
+  do
   {
-    out_buf.pos += n;
-    return;
-  }
+    *--p = '0' + v % 10;
+  } while (v /= 10);
+  out_str(p, buf + sizeof(buf) - p);
+}
 
-  // Didn't fit - flush and retry with full buffer
-  out_flush();
-  va_start(ap, fmt);
-  n = vsnprintf(out_buf.buf, out_buf.cap, fmt, ap);
-  va_end(ap);
-
-  if (n >= 0 && (size_t)n < out_buf.cap)
-  {
-    out_buf.pos = n;
-  }
-  else if (n >= 0)
-  {
-    // Still too large - allocate temporary and write directly
-    char *tmp = malloc(n + 1);
-    if (tmp)
-    {
-      va_start(ap, fmt);
-      vsnprintf(tmp, n + 1, fmt, ap);
-      va_end(ap);
-      fwrite(tmp, 1, n, out_buf.fp);
-      free(tmp);
-    }
-  }
+static void out_line(int line_no, const char *file)
+{
+  out_str("#line ", 6);
+  out_uint(line_no);
+  out_str(" \"", 2);
+  out_str(file, strlen(file));
+  out_str("\"\n", 2);
 }
 
 // Line tracking for #line directives
@@ -445,15 +424,16 @@ static void emit_system_includes(void)
 
   // Emit feature test macros that prism uses during preprocessing
   // These must come before any system includes to enable GNU/POSIX extensions
-  out_printf("#ifndef _POSIX_C_SOURCE\n");
-  out_printf("#define _POSIX_C_SOURCE 200809L\n");
-  out_printf("#endif\n");
-  out_printf("#ifndef _GNU_SOURCE\n");
-  out_printf("#define _GNU_SOURCE\n");
-  out_printf("#endif\n\n");
+  out_str("#ifndef _POSIX_C_SOURCE\n#define _POSIX_C_SOURCE 200809L\n#endif\n"
+          "#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n\n",
+          99);
 
   for (int i = 0; i < system_include_count; i++)
-    out_printf("#include <%s>\n", system_include_list[i]);
+  {
+    out_str("#include <", 10);
+    out_str(system_include_list[i], strlen(system_include_list[i]));
+    out_str(">\n", 2);
+  }
   if (system_include_count > 0)
     out_char('\n');
 }
@@ -555,23 +535,11 @@ static void defer_scope_ensure_capacity(DeferScope *scope, int n)
   int new_cap = scope->capacity == 0 ? INITIAL_CAP : scope->capacity * 2;
   while (new_cap < n)
     new_cap *= 2;
-
-  // Allocate all three arrays, handling partial failures
-  Token **new_stmts = realloc(scope->stmts, sizeof(Token *) * new_cap);
-  if (!new_stmts)
-    error("out of memory growing defer scope");
-  scope->stmts = new_stmts;
-
-  Token **new_ends = realloc(scope->ends, sizeof(Token *) * new_cap);
-  if (!new_ends)
-    error("out of memory growing defer scope");
-  scope->ends = new_ends;
-
-  Token **new_defer_tok = realloc(scope->defer_tok, sizeof(Token *) * new_cap);
-  if (!new_defer_tok)
-    error("out of memory growing defer scope");
-  scope->defer_tok = new_defer_tok;
-
+  scope->stmts = realloc(scope->stmts, sizeof(Token *) * new_cap);
+  scope->ends = realloc(scope->ends, sizeof(Token *) * new_cap);
+  scope->defer_tok = realloc(scope->defer_tok, sizeof(Token *) * new_cap);
+  if (!scope->stmts || !scope->ends || !scope->defer_tok)
+    error("out of memory");
   scope->capacity = new_cap;
 }
 
@@ -719,8 +687,7 @@ static void emit_tok(Token *tok)
     // Emit #line directive on new line if needed
     if (need_line_directive)
     {
-      // Use standard #line format to avoid -Wpedantic warnings
-      out_printf("#line %d \"%s\"\n", line_no, current_file ? current_file : "unknown");
+      out_line(line_no, current_file ? current_file : "unknown");
       last_line_no = line_no;
       last_filename = current_file;
       last_system_header = f->is_system;
@@ -736,8 +703,7 @@ static void emit_tok(Token *tok)
     if (need_line_directive)
     {
       out_char('\n');
-      // Use standard #line format to avoid -Wpedantic warnings
-      out_printf("#line %d \"%s\"\n", line_no, current_file ? current_file : "unknown");
+      out_line(line_no, current_file ? current_file : "unknown");
       last_line_no = line_no;
       last_filename = current_file;
       last_system_header = f->is_system;
@@ -2954,20 +2920,20 @@ static Token *try_zero_init_decl(Token *tok)
   return NULL;
 }
 
-// Build an argv array from individual components (dynamic growth)
+// Dynamic argv array
 typedef struct
 {
   char **data;
-  int count;
-  int capacity;
+  int count, capacity;
 } ArgvBuilder;
-
-static void argv_builder_init(ArgvBuilder *ab)
+#define argv_builder_init(ab) (*(ab) = (ArgvBuilder){0})
+static inline void argv_builder_add(ArgvBuilder *ab, const char *arg)
 {
-  ab->data = NULL;
-  ab->count = 0;
-  ab->capacity = 0;
+  ENSURE_ARRAY_CAP(ab->data, ab->count + 2, ab->capacity, 64, char *);
+  ab->data[ab->count++] = strdup(arg);
+  ab->data[ab->count] = NULL;
 }
+#define argv_builder_finish(ab) ((ab)->data)
 
 // Run a command and wait for it to complete
 // Returns exit status, or -1 on error
@@ -3004,30 +2970,6 @@ static int run_command(char **argv)
     return 128 + WTERMSIG(status);
   return -1;
 #endif
-}
-
-static bool argv_builder_add(ArgvBuilder *ab, const char *arg)
-{
-  if (ab->count + 1 >= ab->capacity) // +1 for NULL terminator
-  {
-    int new_cap = ab->capacity == 0 ? 128 : ab->capacity * 2;
-    char **new_data = realloc(ab->data, sizeof(char *) * new_cap);
-    if (!new_data)
-      return false;
-    ab->data = new_data;
-    ab->capacity = new_cap;
-  }
-  ab->data[ab->count] = strdup(arg);
-  if (!ab->data[ab->count])
-    return false;
-  ab->count++;
-  ab->data[ab->count] = NULL; // Keep NULL terminated
-  return true;
-}
-
-static char **argv_builder_finish(ArgvBuilder *ab)
-{
-  return ab->data;
 }
 
 static void free_argv(char **argv)
@@ -3472,7 +3414,9 @@ static int transpile(char *input_file, char *output_file)
             // or use C23's typeof (once widely supported).
             static unsigned long long ret_counter = 0;
             unsigned long long my_ret = ret_counter++;
-            out_printf(" { __auto_type _prism_ret_%llu = (", my_ret);
+            out_str(" { __auto_type _prism_ret_", 26);
+            out_uint(my_ret);
+            out_str(" = (", 4);
 
             // Emit expression until semicolon (tracking depth for statement-exprs)
             int depth = 0;
@@ -3518,7 +3462,9 @@ static int transpile(char *input_file, char *output_file)
 
             out_str(");", 2);
             emit_all_defers();
-            out_printf(" return _prism_ret_%llu;", my_ret);
+            out_str(" return _prism_ret_", 19);
+            out_uint(my_ret);
+            out_char(';');
 
             if (equal(tok, ";"))
               tok = tok->next;
@@ -4127,41 +4073,22 @@ static char **build_argv(const char *first, ...)
 {
   ArgvBuilder ab;
   argv_builder_init(&ab);
-
   if (first)
-  {
-    if (!argv_builder_add(&ab, first))
-    {
-      free_argv(ab.data);
-      return NULL;
-    }
-  }
-
-  // Add remaining arguments
+    argv_builder_add(&ab, first);
   va_list ap;
   va_start(ap, first);
   const char *arg;
   while ((arg = va_arg(ap, const char *)) != NULL)
-  {
-    if (!argv_builder_add(&ab, arg))
-    {
-      va_end(ap);
-      free_argv(ab.data);
-      return NULL;
-    }
-  }
+    argv_builder_add(&ab, arg);
   va_end(ap);
-
   return argv_builder_finish(&ab);
 }
 
 // Append arguments from flags string to an ArgvBuilder
-// Returns true on success, false on allocation failure
-static bool argv_builder_append_flags(ArgvBuilder *ab, const char *flags)
+static void argv_builder_append_flags(ArgvBuilder *ab, const char *flags)
 {
   if (!flags || !*flags)
-    return true;
-
+    return;
   const char *p = flags;
   while (*p)
   {
@@ -4169,35 +4096,17 @@ static bool argv_builder_append_flags(ArgvBuilder *ab, const char *flags)
       p++;
     if (!*p)
       break;
-
     const char *start = p;
     while (*p && !isspace(*p))
       p++;
-
     size_t len = p - start;
     char *arg = malloc(len + 1);
-    if (!arg)
-      return false;
     memcpy(arg, start, len);
     arg[len] = '\0';
-
-    // Add to builder (takes ownership)
-    if (ab->count + 1 >= ab->capacity)
-    {
-      int new_cap = ab->capacity == 0 ? INITIAL_CAP : ab->capacity * 2;
-      char **new_data = realloc(ab->data, sizeof(char *) * new_cap);
-      if (!new_data)
-      {
-        free(arg);
-        return false;
-      }
-      ab->data = new_data;
-      ab->capacity = new_cap;
-    }
+    ENSURE_ARRAY_CAP(ab->data, ab->count + 2, ab->capacity, 64, char *);
     ab->data[ab->count++] = arg;
     ab->data[ab->count] = NULL;
   }
-  return true;
 }
 
 static void die(char *message)
