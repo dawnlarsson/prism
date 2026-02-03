@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.98.1"
+#define PRISM_VERSION "0.98.2"
 
 #include "parse.c"
 
@@ -2327,6 +2327,429 @@ static bool is_valid_varname(Token *tok)
   return false;
 }
 
+// ============================================================================
+// Zero-init declaration parsing helpers
+// ============================================================================
+
+// Skip leading C23 [[ ... ]] attributes at declaration start
+// Returns updated position after all leading attributes
+static Token *skip_leading_attributes(Token *tok)
+{
+  while (tok && equal(tok, "[") && tok->next && equal(tok->next, "["))
+  {
+    tok = tok->next->next; // skip [[
+    int depth = 1;
+    while (tok && tok->kind != TK_EOF && depth > 0)
+    {
+      if (equal(tok, "["))
+        depth++;
+      else if (equal(tok, "]"))
+        depth--;
+      tok = tok->next;
+    }
+    if (tok && equal(tok, "]"))
+      tok = tok->next;
+  }
+  return tok;
+}
+
+// Type specifier parsing result
+typedef struct
+{
+  Token *end;      // First token after the type specifier
+  bool saw_type;   // True if a type was recognized
+  bool is_struct;  // True if struct/union/enum type
+  bool is_typedef; // True if user-defined typedef
+  bool is_vla;     // True if VLA typedef or struct with VLA member
+  bool has_typeof; // True if typeof/typeof_unqual (cannot determine VLA at transpile-time)
+  bool has_atomic; // True if _Atomic qualifier/specifier present
+} TypeSpecResult;
+
+// Parse type specifier: qualifiers, type keywords, struct/union/enum, typeof, _Atomic, etc.
+// Returns info about the type and position after it
+static TypeSpecResult parse_type_specifier(Token *tok)
+{
+  TypeSpecResult r = {tok, false, false, false, false, false, false};
+
+  while (is_type_qualifier(tok) || is_type_keyword(tok) ||
+         (tok && equal(tok, "[") && tok->next && equal(tok->next, "[")))
+  {
+    // Track _Atomic
+    if (equal(tok, "_Atomic"))
+      r.has_atomic = true;
+
+    // Skip C23 [[ ... ]] attributes
+    if (equal(tok, "[") && tok->next && equal(tok->next, "["))
+    {
+      tok = tok->next->next;
+      int depth = 1;
+      while (tok && tok->kind != TK_EOF && depth > 0)
+      {
+        if (equal(tok, "["))
+          depth++;
+        else if (equal(tok, "]"))
+          depth--;
+        tok = tok->next;
+      }
+      if (tok && equal(tok, "]"))
+        tok = tok->next;
+      r.end = tok;
+      continue;
+    }
+
+    if (is_type_keyword(tok))
+      r.saw_type = true;
+
+    // struct/union/enum
+    if (is_sue_keyword(tok))
+    {
+      r.is_struct = true;
+      r.saw_type = true;
+      tok = tok->next;
+      // Skip attributes before tag
+      while (tok && (equal(tok, "__attribute__") || equal(tok, "__attribute") ||
+                     equal(tok, "_Alignas") || equal(tok, "alignas")))
+      {
+        tok = tok->next;
+        if (tok && equal(tok, "("))
+          tok = skip_balanced(tok, "(", ")");
+      }
+      // Skip tag name
+      if (tok && tok->kind == TK_IDENT)
+        tok = tok->next;
+      // Skip body
+      if (tok && equal(tok, "{"))
+      {
+        if (struct_body_contains_true_vla(tok))
+          error_tok(tok, "variable length array in struct/union is not supported");
+        if (struct_body_contains_vla(tok))
+          r.is_vla = true;
+        tok = skip_balanced(tok, "{", "}");
+      }
+      r.end = tok;
+      continue;
+    }
+
+    // typeof/typeof_unqual/__typeof__
+    if (equal(tok, "typeof") || equal(tok, "__typeof__") || equal(tok, "__typeof") ||
+        equal(tok, "typeof_unqual"))
+    {
+      r.saw_type = true;
+      r.has_typeof = true;
+      tok = tok->next;
+      if (tok && equal(tok, "("))
+        tok = skip_balanced(tok, "(", ")");
+      r.end = tok;
+      continue;
+    }
+
+    // _BitInt(N)
+    if (equal(tok, "_BitInt"))
+    {
+      r.saw_type = true;
+      tok = tok->next;
+      if (tok && equal(tok, "("))
+        tok = skip_balanced(tok, "(", ")");
+      r.end = tok;
+      continue;
+    }
+
+    // _Atomic(type) specifier form
+    if (equal(tok, "_Atomic") && tok->next && equal(tok->next, "("))
+    {
+      r.saw_type = true;
+      r.has_atomic = true;
+      tok = tok->next;
+      tok = skip_balanced(tok, "(", ")");
+      r.end = tok;
+      continue;
+    }
+
+    // _Alignas/alignas/__attribute__
+    if (equal(tok, "_Alignas") || equal(tok, "alignas") ||
+        equal(tok, "__attribute__") || equal(tok, "__attribute"))
+    {
+      tok = tok->next;
+      if (tok && equal(tok, "("))
+        tok = skip_balanced(tok, "(", ")");
+      r.end = tok;
+      continue;
+    }
+
+    // User-defined typedef
+    if (is_known_typedef(tok))
+    {
+      r.is_typedef = true;
+      if (is_vla_typedef(tok))
+        r.is_vla = true;
+      // Check if next token is declarator (not part of type)
+      Token *peek = tok->next;
+      while (peek && is_type_qualifier(peek))
+        peek = peek->next;
+      if (peek && peek->kind == TK_IDENT)
+      {
+        Token *after = peek->next;
+        if (after && (equal(after, ";") || equal(after, "[") ||
+                      equal(after, ",") || equal(after, "=")))
+        {
+          tok = tok->next;
+          r.end = tok;
+          r.saw_type = true;
+          return r; // Exit - next is variable name
+        }
+      }
+    }
+
+    tok = tok->next;
+    r.end = tok;
+  }
+
+  // Check for "typedef_name varname" pattern (no pointer)
+  if (!r.saw_type && tok->kind == TK_IDENT && is_known_typedef(tok))
+  {
+    Token *t = tok->next;
+    while (t && is_type_qualifier(t))
+      t = t->next;
+    if (t && t->kind == TK_IDENT && !equal(tok->next, "*"))
+    {
+      Token *after = t->next;
+      if (after && (equal(after, ";") || equal(after, "[") ||
+                    equal(after, ",") || equal(after, "=")))
+      {
+        r.saw_type = true;
+        r.is_typedef = true;
+        if (is_vla_typedef(tok))
+          r.is_vla = true;
+        r.end = tok->next;
+      }
+    }
+  }
+
+  return r;
+}
+
+// Declarator parsing result
+typedef struct
+{
+  Token *end;       // First token after declarator
+  Token *var_name;  // The variable name token
+  bool is_pointer;  // Has pointer modifier
+  bool is_array;    // Is array type
+  bool is_vla;      // Has variable-length array dimension
+  bool is_func_ptr; // Is function pointer
+  bool has_paren;   // Has parenthesized declarator
+  bool has_init;    // Has initializer (=)
+} DeclResult;
+
+// Emit tokens from start to end (exclusive), return end
+static Token *emit_range_to(Token *start, Token *end)
+{
+  while (start && start != end)
+  {
+    emit_tok(start);
+    start = start->next;
+  }
+  return end;
+}
+
+// Skip __attribute__((...)) and emit it, return position after
+static Token *skip_emit_attribute(Token *tok)
+{
+  emit_tok(tok);
+  tok = tok->next;
+  if (tok && equal(tok, "("))
+  {
+    emit_tok(tok);
+    tok = tok->next;
+    int depth = 1;
+    while (tok && tok->kind != TK_EOF && depth > 0)
+    {
+      if (equal(tok, "("))
+        depth++;
+      else if (equal(tok, ")"))
+        depth--;
+      emit_tok(tok);
+      tok = tok->next;
+    }
+  }
+  return tok;
+}
+
+// Emit array dimension(s) starting at '[', return position after
+static Token *emit_array_dims(Token *tok, bool *is_vla)
+{
+  while (equal(tok, "["))
+  {
+    if (!is_const_array_size(tok))
+      *is_vla = true;
+    emit_tok(tok);
+    tok = tok->next;
+    int bracket_depth = 1;
+    while (tok->kind != TK_EOF && bracket_depth > 0)
+    {
+      if (equal(tok, "["))
+        bracket_depth++;
+      else if (equal(tok, "]"))
+        bracket_depth--;
+      if (bracket_depth > 0)
+      {
+        emit_tok(tok);
+        tok = tok->next;
+      }
+    }
+    if (equal(tok, "]"))
+    {
+      emit_tok(tok);
+      tok = tok->next;
+    }
+  }
+  return tok;
+}
+
+// Emit function parameter list starting at '(', return position after
+static Token *emit_func_params(Token *tok)
+{
+  emit_tok(tok);
+  tok = tok->next;
+  int depth = 1;
+  while (tok->kind != TK_EOF && depth > 0)
+  {
+    if (equal(tok, "("))
+      depth++;
+    else if (equal(tok, ")"))
+      depth--;
+    emit_tok(tok);
+    tok = tok->next;
+  }
+  return tok;
+}
+
+// Parse a single declarator (pointer modifiers, name, array dims, etc.)
+// Emits tokens as it parses. Returns info about the declarator.
+static DeclResult parse_declarator(Token *tok, Token *warn_loc)
+{
+  DeclResult r = {tok, NULL, false, false, false, false, false, false};
+
+  // Pointer modifiers and qualifiers
+  while (equal(tok, "*") || is_type_qualifier(tok))
+  {
+    if (equal(tok, "*"))
+      r.is_pointer = true;
+    if (equal(tok, "__attribute__") || equal(tok, "__attribute"))
+    {
+      tok = skip_emit_attribute(tok);
+      continue;
+    }
+    emit_tok(tok);
+    tok = tok->next;
+  }
+
+  // Parenthesized declarator: (*name), (*name)[N], (*(*name)(args))[N]
+  int nested_paren = 0;
+  if (equal(tok, "("))
+  {
+    Token *peek = tok->next;
+    if (!equal(peek, "*") && !equal(peek, "("))
+    {
+      // Not a pointer declarator pattern
+      fprintf(stderr, "%s:%d: warning: zero-init: parenthesized pattern not recognized\n",
+              tok_file(warn_loc)->name, tok_line_no(warn_loc));
+      r.end = NULL;
+      return r;
+    }
+
+    emit_tok(tok);
+    tok = tok->next;
+    nested_paren = 1;
+    r.is_pointer = true;
+    r.has_paren = true;
+
+    // Handle nesting: (*(*(*name)...
+    while (equal(tok, "*") || is_type_qualifier(tok) || equal(tok, "("))
+    {
+      if (equal(tok, "*"))
+        r.is_pointer = true;
+      else if (equal(tok, "("))
+        nested_paren++;
+      if (equal(tok, "__attribute__") || equal(tok, "__attribute"))
+      {
+        tok = skip_emit_attribute(tok);
+        continue;
+      }
+      emit_tok(tok);
+      tok = tok->next;
+    }
+  }
+
+  // Must have identifier
+  if (!is_valid_varname(tok))
+  {
+    fprintf(stderr, "%s:%d: warning: zero-init: expected identifier in declarator\n",
+            tok_file(warn_loc)->name, tok_line_no(warn_loc));
+    r.end = NULL;
+    return r;
+  }
+
+  r.var_name = tok;
+  emit_tok(tok);
+  tok = tok->next;
+
+  // Array dims inside parens: (*name[N])
+  if (r.has_paren && equal(tok, "["))
+  {
+    r.is_array = true;
+    tok = emit_array_dims(tok, &r.is_vla);
+  }
+
+  // Close nested parens, handling function args or array dims at each level
+  while (r.has_paren && nested_paren > 0)
+  {
+    while (equal(tok, "(") || equal(tok, "["))
+    {
+      if (equal(tok, "("))
+        tok = emit_func_params(tok);
+      else
+      {
+        r.is_array = true;
+        tok = emit_array_dims(tok, &r.is_vla);
+      }
+    }
+    if (!equal(tok, ")"))
+    {
+      fprintf(stderr, "%s:%d: warning: zero-init: expected ')' in declarator\n",
+              tok_file(warn_loc)->name, tok_line_no(warn_loc));
+      r.end = NULL;
+      return r;
+    }
+    emit_tok(tok);
+    tok = tok->next;
+    nested_paren--;
+  }
+
+  // Function pointer: (*name)(args)
+  if (equal(tok, "("))
+  {
+    if (!r.has_paren)
+    {
+      r.end = NULL; // Regular function declaration
+      return r;
+    }
+    r.is_func_ptr = true;
+    tok = emit_func_params(tok);
+  }
+
+  // Array dimensions outside parens
+  if (equal(tok, "["))
+  {
+    r.is_array = true;
+    tok = emit_array_dims(tok, &r.is_vla);
+  }
+
+  r.has_init = equal(tok, "=");
+  r.end = tok;
+  return r;
+}
+
 // Try to handle a declaration with zero-init
 // Supports multi-declarators like: int a, b, *c, d[10];
 // Returns the token after the declaration if handled, NULL otherwise
@@ -2341,8 +2764,6 @@ static Token *try_zero_init_decl(Token *tok)
     return NULL;
 
   // SAFETY: Check for "switch skip hole" - declarations before first case label
-  // Such declarations are skipped by the switch jump, making zero-init useless.
-  // We defer this error until we confirm this is actually a declaration (not expression).
   bool in_switch_before_case = false;
   for (int d = defer_depth - 1; d >= 0; d--)
   {
@@ -2351,33 +2772,15 @@ static Token *try_zero_init_decl(Token *tok)
       in_switch_before_case = true;
       break;
     }
-    // If we hit a non-switch scope, we're inside a nested block which is fine
     if (!defer_stack[d].is_switch)
       break;
   }
 
-  Token *start = tok;
-  Token *decl_start_for_warning = tok; // Remember for potential warning
+  Token *decl_start_for_warning = tok;
 
-  // C23 standard attributes: [[maybe_unused]], [[nodiscard]], [[deprecated]], etc.
-  // Skip [[ ... ]] attribute sequences at the start of declarations
-  while (tok && equal(tok, "[") && tok->next && equal(tok->next, "["))
-  {
-    tok = tok->next->next; // skip [[
-    int bracket_depth = 1;
-    while (tok && tok->kind != TK_EOF && bracket_depth > 0)
-    {
-      if (equal(tok, "["))
-        bracket_depth++;
-      else if (equal(tok, "]"))
-        bracket_depth--;
-      tok = tok->next;
-    }
-    // After ]], skip any trailing ]
-    if (tok && equal(tok, "]"))
-      tok = tok->next;
-  }
-  start = tok; // Update start to skip emitted attributes
+  // Skip leading [[ ... ]] attributes
+  tok = skip_leading_attributes(tok);
+  Token *start = tok;
 
   // Check for 'raw' keyword - skip zero-init for this declaration
   bool is_raw = false;
@@ -2385,659 +2788,137 @@ static Token *try_zero_init_decl(Token *tok)
   {
     is_raw = true;
     tok = tok->next;
-    start = tok; // Don't emit 'raw'
+    start = tok;
     decl_start_for_warning = tok;
   }
 
-  if (is_skip_decl_keyword(tok)) // Skip extern/typedef
+  if (is_skip_decl_keyword(tok))
     return NULL;
 
-  // Must start with qualifier or type
-  bool saw_type = false;
-  bool is_struct_type = false;
-  bool is_typedef_type = false;
-  bool is_typedef_vla = false; // True if the typedef refers to a VLA
-  bool has_typeof = false;     // True if using typeof/typeof_unqual/__typeof__
-  bool has_atomic = false;     // True if using _Atomic qualifier or _Atomic(type) specifier
-  Token *type_end = tok;       // Will point to first token after the base type
-
-  while (is_type_qualifier(tok) || is_type_keyword(tok) ||
-         (tok && equal(tok, "[") && tok->next && equal(tok->next, "[")))
-  {
-    // Track _Atomic qualifier for zero-init (clang on macOS requires = 0, not = {0})
-    if (equal(tok, "_Atomic"))
-      has_atomic = true;
-
-    // Skip C23 [[ ... ]] attribute sequences (e.g., [[maybe_unused]])
-    if (equal(tok, "[") && tok->next && equal(tok->next, "["))
-    {
-      tok = tok->next->next; // skip [[
-      int bracket_depth = 1;
-      while (tok && tok->kind != TK_EOF && bracket_depth > 0)
-      {
-        if (equal(tok, "["))
-          bracket_depth++;
-        else if (equal(tok, "]"))
-          bracket_depth--;
-        tok = tok->next;
-      }
-      if (tok && equal(tok, "]"))
-        tok = tok->next;
-      type_end = tok;
-      continue;
-    }
-
-    if (is_type_keyword(tok))
-      saw_type = true;
-    // Handle struct/union/enum followed by optional tag
-    if (is_sue_keyword(tok))
-    {
-      is_struct_type = true;
-      tok = tok->next;
-      // Skip attributes and alignment specifiers before tag name:
-      // struct __attribute__((packed)) TagName { ... }
-      // struct _Alignas(16) TagName { ... }
-      while (tok && (equal(tok, "__attribute__") || equal(tok, "__attribute") ||
-                     equal(tok, "_Alignas") || equal(tok, "alignas")))
-      {
-        tok = tok->next;
-        if (tok && equal(tok, "("))
-          tok = skip_balanced(tok, "(", ")");
-      }
-      // Skip tag name (identifier)
-      if (tok && tok->kind == TK_IDENT)
-        tok = tok->next;
-      // Could have { body } - check for VLA members before skipping
-      if (tok && equal(tok, "{"))
-      {
-        if (struct_body_contains_true_vla(tok))
-        {
-          error_tok(tok, "variable length array in struct/union is not supported");
-        }
-        // Also check for VLA-like patterns (e.g., manual offsetof) that prevent zero-init
-        // GCC treats these as VLAs even though they're technically constant
-        if (struct_body_contains_vla(tok))
-        {
-          is_typedef_vla = true; // Prevent = {0} initialization
-        }
-        tok = skip_balanced(tok, "{", "}");
-      }
-      saw_type = true;
-      type_end = tok;
-      continue;
-    }
-    // Handle typeof/typeof_unqual with parenthesized expression
-    // SAFETY: We cannot determine at transpile-time if typeof refers to a VLA,
-    // so we disable zero-init for all typeof declarations to avoid initializing VLAs.
-    if (equal(tok, "typeof") || equal(tok, "__typeof__") || equal(tok, "__typeof") ||
-        equal(tok, "typeof_unqual"))
-    {
-      saw_type = true;
-      has_typeof = true; // Disable zero-init for typeof declarations
-      tok = tok->next;
-      if (tok && equal(tok, "("))
-        tok = skip_balanced(tok, "(", ")");
-      type_end = tok;
-      continue;
-    }
-    // Handle C23 _BitInt(N) type
-    if (equal(tok, "_BitInt"))
-    {
-      saw_type = true;
-      tok = tok->next;
-      if (tok && equal(tok, "("))
-        tok = skip_balanced(tok, "(", ")");
-      type_end = tok;
-      continue;
-    }
-    // Handle _Atomic(type) specifier form (different from _Atomic as qualifier)
-    if (equal(tok, "_Atomic") && tok->next && equal(tok->next, "("))
-    {
-      saw_type = true;
-      has_atomic = true;                  // Track _Atomic for zero-init
-      tok = tok->next;                    // skip _Atomic
-      tok = skip_balanced(tok, "(", ")"); // skip (type)
-      type_end = tok;
-      continue;
-    }
-    // Handle _Alignas/alignas and __attribute__ with parenthesized arguments
-    if (equal(tok, "_Alignas") || equal(tok, "alignas") ||
-        equal(tok, "__attribute__") || equal(tok, "__attribute"))
-    {
-      tok = tok->next;
-      if (tok && equal(tok, "("))
-        tok = skip_balanced(tok, "(", ")");
-      type_end = tok;
-      continue;
-    }
-    // Check for user-defined typedef (needs {0} initialization for structs)
-    if (is_known_typedef(tok))
-    {
-      is_typedef_type = true;
-      if (is_vla_typedef(tok))
-        is_typedef_vla = true;
-      // CRITICAL: If the next token looks like a declarator, stop here.
-      // This prevents "T T;" from consuming both Ts as the type.
-      Token *peek = tok->next;
-      while (peek && is_type_qualifier(peek))
-        peek = peek->next;
-      if (peek && peek->kind == TK_IDENT)
-      {
-        Token *after = peek->next;
-        if (after && (equal(after, ";") || equal(after, "[") ||
-                      equal(after, ",") || equal(after, "=")))
-        {
-          tok = tok->next;
-          type_end = tok;
-          break; // Exit loop - next token is variable name, not part of type
-        }
-      }
-    }
-    tok = tok->next;
-    type_end = tok;
-  }
-
-  // Check for typedef'd type: identifier followed by identifier (no pointer)
-  // Pattern: my_type x; - but NOT my_type *x; (ambiguous with multiplication)
-  // Also ensure the identifier is actually a known typedef (not shadowed)
-  if (!saw_type && tok->kind == TK_IDENT && is_known_typedef(tok))
-  {
-    Token *maybe_type = tok;
-    Token *t = tok->next;
-
-    // Only match direct "TypeName varname" pattern (no * which is ambiguous)
-    // Skip only qualifiers, NOT pointers
-    while (t && is_type_qualifier(t))
-      t = t->next;
-
-    // If directly followed by identifier (no *) then ; or [ or , this is likely a declaration
-    if (t && t->kind == TK_IDENT && !equal(maybe_type->next, "*"))
-    {
-      Token *after_name = t->next;
-      if (after_name && (equal(after_name, ";") || equal(after_name, "[") ||
-                         equal(after_name, ",") || equal(after_name, "=")))
-      {
-        saw_type = true;
-        is_typedef_type = true;
-        // Check if this is a VLA typedef
-        if (is_vla_typedef(maybe_type))
-          is_typedef_vla = true;
-        tok = maybe_type->next;
-        type_end = tok;
-      }
-    }
-  }
-
-  if (!saw_type)
+  // Parse type specifier
+  TypeSpecResult type = parse_type_specifier(tok);
+  if (!type.saw_type)
     return NULL;
+  tok = type.end;
 
-  // Before emitting anything, verify there's at least one declarator
-  // Look for: pointers/qualifiers followed by identifier (possibly inside nested parens)
+  // Validate there's at least one declarator
   Token *check = tok;
   while (equal(check, "*") || is_type_qualifier(check))
   {
-    // Skip __attribute__((...)) entirely
     if (equal(check, "__attribute__") || equal(check, "__attribute"))
     {
       check = check->next;
       if (check && equal(check, "("))
-      {
-        int attr_depth = 1;
-        check = check->next;
-        while (check && check->kind != TK_EOF && attr_depth > 0)
-        {
-          if (equal(check, "("))
-            attr_depth++;
-          else if (equal(check, ")"))
-            attr_depth--;
-          check = check->next;
-        }
-      }
+        check = skip_balanced(check, "(", ")");
       continue;
     }
     check = check->next;
   }
 
-  // Handle parenthesized declarators - may be arbitrarily nested: (*name), (*(*name)(args))[N], etc.
-  // We need to find an identifier somewhere inside the parentheses
-  int paren_depth = 0;
+  // Handle parenthesized declarators - find identifier inside parens
   bool found_ident = false;
-  Token *scan = check;
-
-  if (equal(scan, "("))
+  if (equal(check, "("))
   {
-    // Scan through nested parens to find an identifier
-    paren_depth = 1;
-    scan = scan->next;
-
-    while (scan && scan->kind != TK_EOF && paren_depth > 0)
+    int depth = 1;
+    check = check->next;
+    while (check && check->kind != TK_EOF && depth > 0)
     {
-      if (equal(scan, "("))
-        paren_depth++;
-      else if (equal(scan, ")"))
-        paren_depth--;
-      else if (scan->kind == TK_IDENT && !found_ident)
+      if (equal(check, "("))
+        depth++;
+      else if (equal(check, ")"))
+        depth--;
+      else if (check->kind == TK_IDENT && !found_ident)
       {
-        // Found potential identifier - verify it's not a type keyword
-        // (could be a typedef or cast)
-        if (!is_type_keyword(scan) && !is_known_typedef(scan))
+        if (!is_type_keyword(check) && !is_known_typedef(check))
           found_ident = true;
       }
-      scan = scan->next;
+      check = check->next;
     }
-
     if (!found_ident)
     {
-      // Saw type but couldn't find declarator identifier in parens
-      // This might be a cast or complex pattern we don't support
-      // Emit warning for safety
-      fprintf(stderr, "%s:%d: warning: zero-init: complex parenthesized pattern not parsed, "
-                      "variable may be uninitialized. Consider adding explicit initializer.\n",
+      fprintf(stderr, "%s:%d: warning: zero-init: complex pattern not parsed\n",
               tok_file(decl_start_for_warning)->name, tok_line_no(decl_start_for_warning));
       return NULL;
     }
-    check = scan; // Continue checking after the paren group
   }
-  else
-  {
-    // No parens - must have identifier directly
-    if (check->kind != TK_IDENT)
-      return NULL;
-  }
-
-  // Must have identifier - if not, this is just a type declaration (e.g., struct Foo {};)
-  // (This check is now partially redundant but kept for clarity)
-  if (!found_ident && check->kind != TK_IDENT)
+  else if (check->kind != TK_IDENT)
     return NULL;
 
-  // Before emitting anything, check if any declarator has a statement expression initializer
-  // Statement expressions like ({ ... }) can contain defer, so we need the main loop to handle them
-  // Also check for function declarations: "type name(...)" which we don't handle
+  // Check for statement expressions or function declarations
+  Token *scan = tok;
+  int scan_depth = 0;
+  bool seen_ident = false;
+  while (scan && scan->kind != TK_EOF)
   {
-    Token *scan = tok;
-    int scan_depth = 0;
-    bool seen_ident_at_top = false; // Track if we've seen an identifier at depth 0
-    while (scan && scan->kind != TK_EOF)
+    if (equal(scan, "(") || equal(scan, "[") || equal(scan, "{"))
     {
-      if (equal(scan, "(") || equal(scan, "[") || equal(scan, "{"))
+      if (equal(scan, "(") && scan->next && equal(scan->next, "{"))
+        return NULL; // Statement expression
+      if (equal(scan, "(") && scan_depth == 0 && seen_ident)
       {
-        // Check for statement expression: '(' followed by '{'
-        if (equal(scan, "(") && scan->next && equal(scan->next, "{"))
-          return NULL; // Let main loop handle statement expressions
-        // Check for function declaration: identifier immediately followed by '(' at top level
-        // But NOT if the identifier is after a '*' (pointer declarator)
-        if (equal(scan, "(") && scan_depth == 0 && seen_ident_at_top)
+        // Check if function declaration (no * before identifier)
+        Token *t = tok;
+        bool has_star = false;
+        while (t && t != scan)
         {
-          // This looks like a function declaration, not a variable
-          // Check if there's a '*' between type_end and the identifier
-          Token *t = tok;
-          bool has_star = false;
-          while (t && t != scan)
-          {
-            if (equal(t, "*"))
-              has_star = true;
-            if (equal(t, "("))
-              break; // Stop if we hit the paren we're checking
-            t = t->next;
-          }
-          if (!has_star)
-            return NULL; // Function declaration without pointer, bail
+          if (equal(t, "*"))
+            has_star = true;
+          if (equal(t, "("))
+            break;
+          t = t->next;
         }
-        scan_depth++;
+        if (!has_star)
+          return NULL;
       }
-      else if (equal(scan, ")") || equal(scan, "]") || equal(scan, "}"))
-        scan_depth--;
-      else if (scan_depth == 0 && equal(scan, ";"))
-        break; // End of declaration
-      else if (scan_depth == 0 && scan->kind == TK_IDENT)
-        seen_ident_at_top = true;
-      scan = scan->next;
+      scan_depth++;
     }
+    else if (equal(scan, ")") || equal(scan, "]") || equal(scan, "}"))
+      scan_depth--;
+    else if (scan_depth == 0 && equal(scan, ";"))
+      break;
+    else if (scan_depth == 0 && scan->kind == TK_IDENT)
+      seen_ident = true;
+    scan = scan->next;
   }
 
-  // Now we've confirmed there's at least one declarator.
-
-  // SAFETY: Error if this declaration is inside a switch before any case label.
-  // The switch will jump directly to a case label, skipping the zero-initialization.
-  // This is a critical safety hole that must be prevented.
+  // SAFETY: Error if in switch before case label
   if (in_switch_before_case && !is_raw)
   {
     error_tok(decl_start_for_warning,
               "variable declaration before first 'case' label in switch. "
-              "The switch jumps directly to 'case', skipping zero-initialization. "
               "Move this declaration before the switch, or use 'raw' to suppress zero-init.");
   }
 
-  // Emit the base type.
-  emit_range(start, type_end);
+  // Emit base type
+  emit_range(start, type.end);
 
-  // Process each declarator in the list
-  bool first_declarator = true;
+  // Process each declarator
   while (tok && tok->kind != TK_EOF)
   {
-    // For subsequent declarators, we already emitted the comma
-    Token *decl_start = tok;
-
-    // Parse this declarator's pointer modifiers
-    bool is_pointer = false;
-    while (equal(tok, "*") || is_type_qualifier(tok))
-    {
-      if (equal(tok, "*"))
-        is_pointer = true;
-      // Handle __attribute__((...)) - skip the entire attribute including parens
-      if (equal(tok, "__attribute__") || equal(tok, "__attribute"))
-      {
-        emit_tok(tok);
-        tok = tok->next;
-        if (tok && equal(tok, "("))
-        {
-          // Skip the outer and inner parens: __attribute__((xxx))
-          emit_tok(tok); // (
-          tok = tok->next;
-          int attr_depth = 1;
-          while (tok && tok->kind != TK_EOF && attr_depth > 0)
-          {
-            if (equal(tok, "("))
-              attr_depth++;
-            else if (equal(tok, ")"))
-              attr_depth--;
-            emit_tok(tok);
-            tok = tok->next;
-          }
-        }
-        continue;
-      }
-      emit_tok(tok);
-      tok = tok->next;
-    }
-
-    // Handle parenthesized declarators: (*name), (*name)[N], (*name)(args)
-    // Also handles nested patterns like (*(*name)(args))[N]
-    bool has_paren_declarator = false;
-    bool array_inside_paren = false;
-    int nested_paren_count = 0; // Track nesting level for complex declarators
-
-    if (equal(tok, "("))
-    {
-      Token *paren_start = tok;
-      Token *peek = tok->next;
-
-      // Should be * for pointer declarator (or another ( for nested)
-      if (!equal(peek, "*") && !equal(peek, "("))
-      {
-        // Saw type, started declarator, but pattern not recognized
-        fprintf(stderr, "%s:%d: warning: zero-init: parenthesized declarator pattern not recognized, "
-                        "variable may be uninitialized. Consider adding explicit initializer.\n",
-                tok_file(decl_start_for_warning)->name, tok_line_no(decl_start_for_warning));
-        return NULL; // Not a pointer declarator, bail
-      }
-
-      emit_tok(tok); // emit '('
-      tok = tok->next;
-      nested_paren_count = 1;
-      is_pointer = true;
-
-      // Handle arbitrary nesting: (*(*(*name)...
-      while (equal(tok, "*") || is_type_qualifier(tok) || equal(tok, "("))
-      {
-        if (equal(tok, "*"))
-          is_pointer = true;
-        else if (equal(tok, "("))
-          nested_paren_count++;
-        // Handle __attribute__((...)) inside parenthesized declarator
-        if (equal(tok, "__attribute__") || equal(tok, "__attribute"))
-        {
-          emit_tok(tok);
-          tok = tok->next;
-          if (tok && equal(tok, "("))
-          {
-            emit_tok(tok);
-            tok = tok->next;
-            int attr_depth = 1;
-            while (tok && tok->kind != TK_EOF && attr_depth > 0)
-            {
-              if (equal(tok, "("))
-                attr_depth++;
-              else if (equal(tok, ")"))
-                attr_depth--;
-              emit_tok(tok);
-              tok = tok->next;
-            }
-          }
-          continue;
-        }
-        emit_tok(tok);
-        tok = tok->next;
-      }
-
-      // Must be identifier now (or a prism keyword usable as varname)
-      if (!is_valid_varname(tok))
-      {
-        fprintf(stderr, "%s:%d: warning: zero-init: expected identifier in declarator, "
-                        "variable may be uninitialized. Consider adding explicit initializer.\n",
-                tok_file(decl_start_for_warning)->name, tok_line_no(decl_start_for_warning));
-        return NULL;
-      }
-
-      has_paren_declarator = true;
-    }
-
-    // Must have identifier (or a prism keyword usable as varname)
-    if (!is_valid_varname(tok))
-    {
-      // We've emitted type but no identifier - shouldn't happen if validation worked
-      fprintf(stderr, "%s:%d: warning: zero-init: expected identifier after type, "
-                      "variable may be uninitialized. Consider adding explicit initializer.\n",
-              tok_file(decl_start_for_warning)->name, tok_line_no(decl_start_for_warning));
+    DeclResult decl = parse_declarator(tok, decl_start_for_warning);
+    if (!decl.end || !decl.var_name)
       return NULL;
-    }
 
-    Token *var_name = tok;
-    emit_tok(tok);
-    tok = tok->next;
+    tok = decl.end;
 
-    // Array dimension INSIDE parentheses: (*name[N])
-    if (has_paren_declarator && equal(tok, "["))
+    // Determine effective VLA status
+    bool effective_vla = (decl.is_vla && !decl.has_paren) ||
+                         (type.is_vla && !decl.is_pointer) ||
+                         type.has_typeof;
+
+    // Add zero initializer if needed
+    if (!decl.has_init && !effective_vla && !is_raw)
     {
-      array_inside_paren = true;
-      while (equal(tok, "["))
-      {
-        emit_tok(tok);
-        tok = tok->next;
-        // Track balanced brackets and parens (for sizeof(x[0]) etc.)
-        int bracket_depth = 1;
-        int paren_depth = 0;
-        while (tok->kind != TK_EOF && bracket_depth > 0)
-        {
-          if (equal(tok, "["))
-            bracket_depth++;
-          else if (equal(tok, "]"))
-            bracket_depth--;
-          else if (equal(tok, "("))
-            paren_depth++;
-          else if (equal(tok, ")"))
-            paren_depth--;
-          if (bracket_depth > 0)
-          {
-            emit_tok(tok);
-            tok = tok->next;
-          }
-        }
-        if (equal(tok, "]"))
-        {
-          emit_tok(tok);
-          tok = tok->next;
-        }
-      }
-    }
-
-    // Close all nested parens for parenthesized declarator
-    // Each paren level may be followed by function args or array dims
-    while (has_paren_declarator && nested_paren_count > 0)
-    {
-      // Handle function args at this level: (*name)(args) or array dims
-      while (equal(tok, "(") || equal(tok, "["))
-      {
-        if (equal(tok, "("))
-        {
-          // Function parameter list
-          emit_tok(tok);
-          tok = tok->next;
-          int depth = 1;
-          while (tok->kind != TK_EOF && depth > 0)
-          {
-            if (equal(tok, "("))
-              depth++;
-            else if (equal(tok, ")"))
-              depth--;
-            emit_tok(tok);
-            tok = tok->next;
-          }
-        }
-        else if (equal(tok, "["))
-        {
-          // Array dimension
-          array_inside_paren = true;
-          while (equal(tok, "["))
-          {
-            emit_tok(tok);
-            tok = tok->next;
-            // Track balanced brackets and parens (for sizeof(x[0]) etc.)
-            int bracket_depth = 1;
-            int paren_depth = 0;
-            while (tok->kind != TK_EOF && bracket_depth > 0)
-            {
-              if (equal(tok, "["))
-                bracket_depth++;
-              else if (equal(tok, "]"))
-                bracket_depth--;
-              else if (equal(tok, "("))
-                paren_depth++;
-              else if (equal(tok, ")"))
-                paren_depth--;
-              if (bracket_depth > 0)
-              {
-                emit_tok(tok);
-                tok = tok->next;
-              }
-            }
-            if (equal(tok, "]"))
-            {
-              emit_tok(tok);
-              tok = tok->next;
-            }
-          }
-        }
-      }
-
-      // Now close this paren level
-      if (!equal(tok, ")"))
-      {
-        fprintf(stderr, "%s:%d: warning: zero-init: expected ')' in declarator, "
-                        "variable may be uninitialized. Consider adding explicit initializer.\n",
-                tok_file(decl_start_for_warning)->name, tok_line_no(decl_start_for_warning));
-        return NULL;
-      }
-      emit_tok(tok);
-      tok = tok->next;
-      nested_paren_count--;
-    }
-
-    // Check what follows the identifier
-    bool is_array = array_inside_paren;
-    bool is_vla = false;
-    bool is_func_ptr = false;
-
-    // Function pointer: (*name)(args)
-    if (equal(tok, "("))
-    {
-      if (!has_paren_declarator)
-        return NULL; // Regular function declaration
-      is_func_ptr = true;
-      // Emit the function args
-      emit_tok(tok);
-      tok = tok->next;
-      int depth = 1;
-      while (tok->kind != TK_EOF && depth > 0)
-      {
-        if (equal(tok, "("))
-          depth++;
-        else if (equal(tok, ")"))
-          depth--;
-        emit_tok(tok);
-        tok = tok->next;
-      }
-    }
-
-    // Array dimensions
-    if (equal(tok, "["))
-    {
-      is_array = true;
-      while (equal(tok, "["))
-      {
-        // Check if VLA before emitting
-        if (!is_const_array_size(tok))
-          is_vla = true;
-        emit_tok(tok); // emit opening '['
-        tok = tok->next;
-        // Track balanced brackets and parens within the array dimension
-        // This handles cases like: buf[sizeof(arr[0])] or buf[(a+b)*c]
-        int bracket_depth = 1; // for [ ]
-        int paren_depth = 0;   // for ( )
-        while (tok->kind != TK_EOF && bracket_depth > 0)
-        {
-          if (equal(tok, "["))
-            bracket_depth++;
-          else if (equal(tok, "]"))
-            bracket_depth--;
-          else if (equal(tok, "("))
-            paren_depth++;
-          else if (equal(tok, ")"))
-            paren_depth--;
-          if (bracket_depth > 0)
-          {
-            emit_tok(tok);
-            tok = tok->next;
-          }
-        }
-        if (equal(tok, "]"))
-        {
-          emit_tok(tok);
-          tok = tok->next;
-        }
-      }
-    }
-
-    // Check if this declarator already has an initializer
-    bool has_init = equal(tok, "=");
-
-    // Combine direct VLA detection with typedef VLA detection
-    // Key distinction:
-    //   int (*ptr)[n];  -> pointer to VLA (can initialize to NULL)  - has_paren_declarator=true
-    //   int *arr[n];    -> array of pointers (VLA, cannot init)      - has_paren_declarator=false
-    //   Matrix *ptr;    -> pointer to VLA typedef (can initialize)   - is_pointer=true
-    // A VLA is:
-    //   1. Array with variable dimension, unless it's a pointer to that array (parens)
-    //   2. VLA typedef used directly (not as a pointer)
-    //   3. typeof expression (cannot determine at transpile-time if it's a VLA)
-    bool effective_vla = (is_vla && !has_paren_declarator) || (is_typedef_vla && !is_pointer) || has_typeof;
-
-    // VLAs cannot be initialized - this is a hard error, no bypass allowed
-
-    // Add zero initializer if no existing initializer, not a VLA, and not raw
-    if (!has_init && !effective_vla && !is_raw)
-    {
-      // _Atomic types must use = 0 (not = {0}) for clang compatibility on macOS
-      if (has_atomic)
+      if (type.has_atomic)
         out_str(" = 0", 4);
-      else if (is_array || ((is_struct_type || is_typedef_type) && !is_pointer))
+      else if (decl.is_array || ((type.is_struct || type.is_typedef) && !decl.is_pointer))
         out_str(" = {0}", 6);
       else
         out_str(" = 0", 4);
     }
 
-    // If has initializer, emit it (= and everything up to , or ;)
-    if (has_init)
+    // Emit initializer if present
+    if (decl.has_init)
     {
       int depth = 0;
       while (tok->kind != TK_EOF)
@@ -3053,18 +2934,13 @@ static Token *try_zero_init_decl(Token *tok)
       }
     }
 
-    // Register shadow if this variable name matches a typedef
-    // This ensures subsequent uses of this name in the same scope
-    // are treated as variables, not types
-    // IMPORTANT: For loop init variables (for (int i; ...)) are scoped to the loop body,
-    // which is defer_depth + 1 (since the { hasn't been seen yet).
-    if (is_known_typedef(var_name))
+    // Register shadow for typedef names used as variables
+    if (is_known_typedef(decl.var_name))
     {
       int shadow_depth = in_for_init ? defer_depth + 1 : defer_depth;
-      typedef_add_shadow(var_name->loc, var_name->len, shadow_depth);
+      typedef_add_shadow(decl.var_name->loc, decl.var_name->len, shadow_depth);
     }
 
-    // Check what's next
     if (equal(tok, ";"))
     {
       emit_tok(tok);
@@ -3074,8 +2950,6 @@ static Token *try_zero_init_decl(Token *tok)
     {
       emit_tok(tok);
       tok = tok->next;
-      first_declarator = false;
-      // Continue to next declarator
     }
     else
       return NULL;
