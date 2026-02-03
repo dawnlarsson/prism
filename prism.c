@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.98.0"
+#define PRISM_VERSION "0.98.1"
 
 #include "parse.c"
 
@@ -111,6 +111,23 @@ static int struct_depth = 0;
 #define INITIAL_LABELS 256
 #define INITIAL_ARGS 128
 #define INITIAL_STMT_EXPR_DEPTH 32
+
+// Generic array growth: ensures *arr has capacity for n elements
+#define ENSURE_ARRAY_CAP(arr, count, cap, init_cap, T)   \
+  do                                                     \
+  {                                                      \
+    if ((count) >= (cap))                                \
+    {                                                    \
+      int new_cap = (cap) == 0 ? (init_cap) : (cap) * 2; \
+      while (new_cap < (count))                          \
+        new_cap *= 2;                                    \
+      T *tmp = realloc((arr), sizeof(T) * new_cap);      \
+      if (!tmp)                                          \
+        error("out of memory");                          \
+      (arr) = tmp;                                       \
+      (cap) = new_cap;                                   \
+    }                                                    \
+  } while (0)
 
 typedef struct
 {
@@ -386,14 +403,14 @@ static void record_system_include(const char *path)
     return;
 
   // Check if already recorded (using hashmap for O(1) lookup)
-  if (hashmap_get2(&system_includes, inc, strlen(inc)))
+  if (hashmap_get(&system_includes, inc, strlen(inc)))
   {
     free(inc);
     return;
   }
 
   // Add to hashmap
-  hashmap_put(&system_includes, inc, (void *)1);
+  hashmap_put(&system_includes, inc, strlen(inc), (void *)1);
 
   // Add to ordered list
   if (system_include_count >= system_include_capacity)
@@ -839,35 +856,20 @@ static bool control_flow_has_defers(bool include_switch)
   return found_boundary && found_defers;
 }
 
-// Ensure label_table has capacity for at least n labels
-static void label_table_ensure_capacity(int n)
-{
-  if (n <= label_table.capacity)
-    return;
-  int new_cap = label_table.capacity == 0 ? INITIAL_LABELS : label_table.capacity * 2;
-  while (new_cap < n)
-    new_cap *= 2;
-  LabelInfo *new_labels = realloc(label_table.labels, sizeof(LabelInfo) * new_cap);
-  if (!new_labels)
-    error("out of memory growing label table");
-  label_table.labels = new_labels;
-  label_table.capacity = new_cap;
-}
-
 static void label_table_add(char *name, int name_len, int scope_depth)
 {
-  label_table_ensure_capacity(label_table.count + 1);
+  ENSURE_ARRAY_CAP(label_table.labels, label_table.count + 1, label_table.capacity, INITIAL_LABELS, LabelInfo);
   LabelInfo *info = &label_table.labels[label_table.count++];
   info->name = name;
   info->name_len = name_len;
   info->scope_depth = scope_depth;
   // Store scope_depth + 1 so 0 (NULL) means "not found"
-  hashmap_put2(&label_table.name_map, name, name_len, (void *)(intptr_t)(scope_depth + 1));
+  hashmap_put(&label_table.name_map, name, name_len, (void *)(intptr_t)(scope_depth + 1));
 }
 
 static int label_table_lookup(char *name, int name_len)
 {
-  void *val = hashmap_get2(&label_table.name_map, name, name_len);
+  void *val = hashmap_get(&label_table.name_map, name, name_len);
   return val ? (int)(intptr_t)val - 1 : -1;
 }
 
@@ -887,7 +889,7 @@ static void typedef_table_reset(void)
 // Helper to get current index for a name from the hash map (-1 if not found)
 static int typedef_get_index(char *name, int len)
 {
-  void *val = hashmap_get2(&typedef_table.name_map, name, len);
+  void *val = hashmap_get(&typedef_table.name_map, name, len);
   return val ? (int)(intptr_t)val - 1 : -1;
 }
 
@@ -895,7 +897,7 @@ static int typedef_get_index(char *name, int len)
 static void typedef_set_index(char *name, int len, int index)
 {
   // Store index+1 so that 0 (NULL) means "not found"
-  hashmap_put2(&typedef_table.name_map, name, len, (void *)(intptr_t)(index + 1));
+  hashmap_put(&typedef_table.name_map, name, len, (void *)(intptr_t)(index + 1));
 }
 
 typedef enum
@@ -907,15 +909,7 @@ typedef enum
 
 static void typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool is_vla)
 {
-  if (typedef_table.count >= typedef_table.capacity)
-  {
-    int new_cap = typedef_table.capacity == 0 ? 256 : typedef_table.capacity * 2;
-    TypedefEntry *new_entries = realloc(typedef_table.entries, sizeof(TypedefEntry) * new_cap);
-    if (!new_entries)
-      error("out of memory tracking typedefs");
-    typedef_table.entries = new_entries;
-    typedef_table.capacity = new_cap;
-  }
+  ENSURE_ARRAY_CAP(typedef_table.entries, typedef_table.count + 1, typedef_table.capacity, 256, TypedefEntry);
   int new_index = typedef_table.count++;
   TypedefEntry *e = &typedef_table.entries[new_index];
   e->name = name;
@@ -1973,7 +1967,7 @@ static void init_type_keyword_map(void)
       "_BitInt",
   };
   for (int i = 0; i < (int)(sizeof(type_kw) / sizeof(*type_kw)); i++)
-    hashmap_put(&type_keyword_map, type_kw[i], (void *)1);
+    hashmap_put(&type_keyword_map, type_kw[i], strlen(type_kw[i]), (void *)1);
 }
 
 static bool is_type_keyword(Token *tok)
@@ -1981,7 +1975,7 @@ static bool is_type_keyword(Token *tok)
   if (tok->kind != TK_KEYWORD && tok->kind != TK_IDENT)
     return false;
   // Check hash set first
-  if (hashmap_get2(&type_keyword_map, tok->loc, tok->len))
+  if (hashmap_get(&type_keyword_map, tok->loc, tok->len))
     return true;
   // User-defined typedefs (tracked during transpilation)
   if (is_known_typedef(tok))
@@ -3105,6 +3099,8 @@ static void argv_builder_init(ArgvBuilder *ab)
   ab->capacity = 0;
 }
 
+static int run_command(char **argv);
+
 static bool argv_builder_add(ArgvBuilder *ab, const char *arg)
 {
   if (ab->count + 1 >= ab->capacity) // +1 for NULL terminator
@@ -3136,41 +3132,6 @@ static void free_argv(char **argv)
   for (int i = 0; argv[i]; i++)
     free(argv[i]);
   free(argv);
-}
-
-// Run a command using fork/execvp directly to avoid shell interpretation
-// Returns exit status of command, or -1 on error
-static int run_process(char **argv)
-{
-#ifdef _WIN32
-  intptr_t status = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
-  return (int)status;
-#else
-  pid_t pid = fork();
-  if (pid == -1)
-  {
-    perror("fork");
-    return -1;
-  }
-  if (pid == 0)
-  {
-    // Child process
-    execvp(argv[0], argv);
-    perror("execvp");
-    _exit(127);
-  }
-  int status;
-  if (waitpid(pid, &status, 0) == -1)
-  {
-    perror("waitpid");
-    return -1;
-  }
-  if (WIFEXITED(status))
-    return WEXITSTATUS(status);
-  if (WIFSIGNALED(status))
-    return 128 + WTERMSIG(status);
-  return -1;
-#endif
 }
 
 // Run system preprocessor (cc -E -P) on input file
@@ -3240,7 +3201,7 @@ static char *preprocess_with_cc(const char *input_file)
   char **argv = argv_builder_finish(&ab);
 
   // Run preprocessor using execvp directly to avoid shell quote stripping
-  int ret = run_process(argv);
+  int ret = run_command(argv);
   free_argv(argv);
 
   if (ret != 0)
@@ -4413,73 +4374,60 @@ static int install(char *self_path)
     return 0;
   }
 
+  // Remove first (can't overwrite running executable, but can remove and replace)
   remove(INSTALL_PATH);
 
+  // Try direct copy first (avoids sudo if we have permission)
   FILE *input = fopen(self_path, "rb");
-  FILE *output = fopen(INSTALL_PATH, "wb");
+  FILE *output = input ? fopen(INSTALL_PATH, "wb") : NULL;
 
-  if (!input || !output)
+  if (input && output)
   {
-    // Fallback to sudo - use run_command for security
-    // First try to remove existing file
-    char **rm_argv = build_argv("sudo", "rm", "-f", INSTALL_PATH, NULL);
-    if (rm_argv)
+    char buffer[4096];
+    size_t bytes;
+    while ((bytes = fread(buffer, 1, 4096, input)) > 0)
     {
-      run_command(rm_argv);
-      free_argv(rm_argv);
+      if (fwrite(buffer, 1, bytes, output) != bytes)
+      {
+        fclose(input);
+        fclose(output);
+        goto use_sudo;
+      }
     }
-
-    // Copy the file
-    char **cp_argv = build_argv("sudo", "cp", self_path, INSTALL_PATH, NULL);
-    if (!cp_argv)
-    {
-      fprintf(stderr, "Memory allocation failed\n");
-      return 1;
-    }
-    int cp_status = run_command(cp_argv);
-    free_argv(cp_argv);
-    if (cp_status != 0)
-    {
-      fprintf(stderr, "Failed to copy file\n");
-      return 1;
-    }
-
-    // Set executable permission
-    char **chmod_argv = build_argv("sudo", "chmod", "+x", INSTALL_PATH, NULL);
-    if (!chmod_argv)
-    {
-      fprintf(stderr, "Memory allocation failed\n");
-      return 1;
-    }
-    int chmod_status = run_command(chmod_argv);
-    free_argv(chmod_argv);
-    if (chmod_status != 0)
-    {
-      fprintf(stderr, "Failed to set permissions\n");
-      return 1;
-    }
-
+    fclose(input);
+    fclose(output);
+#ifndef _WIN32
+    chmod(INSTALL_PATH, 0755);
+#endif
     printf("[prism] Installed!\n");
     return 0;
   }
 
-  char buffer[4096];
-  size_t bytes;
-  while ((bytes = fread(buffer, 1, 4096, input)) > 0)
+  if (input)
+    fclose(input);
+  if (output)
+    fclose(output);
+
+use_sudo:;
+  // Remove first (can't overwrite running executable, but can remove and replace)
+  char **argv = build_argv("sudo", "rm", "-f", INSTALL_PATH, NULL);
+  run_command(argv);
+  free_argv(argv);
+
+  // Copy
+  argv = build_argv("sudo", "cp", self_path, INSTALL_PATH, NULL);
+  int status = run_command(argv);
+  free_argv(argv);
+  if (status != 0)
   {
-    if (fwrite(buffer, 1, bytes, output) != bytes)
-    {
-      fclose(input);
-      fclose(output);
-      return 1;
-    }
+    fprintf(stderr, "Failed to install\n");
+    return 1;
   }
 
-  fclose(input);
-  fclose(output);
-
 #ifndef _WIN32
-  chmod(INSTALL_PATH, 0755);
+  argv = build_argv("sudo", "chmod", "+x", INSTALL_PATH, NULL);
+  run_command(argv);
+  free_argv(argv);
 #endif
 
   printf("[prism] Installed!\n");

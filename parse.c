@@ -179,7 +179,7 @@ static uint64_t fnv_hash(char *s, int len)
     return hash;
 }
 
-static void *hashmap_get2(HashMap *map, char *key, int keylen)
+static void *hashmap_get(HashMap *map, char *key, int keylen)
 {
     if (!map->buckets)
         return NULL;
@@ -196,7 +196,7 @@ static void *hashmap_get2(HashMap *map, char *key, int keylen)
     return NULL;
 }
 
-static void hashmap_put2(HashMap *map, char *key, int keylen, void *val)
+static void hashmap_put(HashMap *map, char *key, int keylen, void *val)
 {
     if (!map->buckets)
     {
@@ -213,7 +213,7 @@ static void hashmap_put2(HashMap *map, char *key, int keylen, void *val)
         {
             HashEntry *ent = &map->buckets[i];
             if (ent->key && ent->key != TOMBSTONE)
-                hashmap_put2(&map2, ent->key, ent->keylen, ent->val);
+                hashmap_put(&map2, ent->key, ent->keylen, ent->val);
         }
         free(map->buckets);
         *map = map2;
@@ -247,11 +247,6 @@ static void hashmap_put2(HashMap *map, char *key, int keylen, void *val)
         if (ent->key != TOMBSTONE)
             map->used++;
     }
-}
-
-static void hashmap_put(HashMap *map, char *key, void *val)
-{
-    hashmap_put2(map, key, strlen(key), val);
 }
 
 static void hashmap_delete2(HashMap *map, char *key, int keylen)
@@ -473,12 +468,12 @@ static void init_keyword_map(void)
         "raw",
     };
     for (size_t i = 0; i < sizeof(kw) / sizeof(*kw); i++)
-        hashmap_put2(&keyword_map, kw[i], strlen(kw[i]), (void *)1);
+        hashmap_put(&keyword_map, kw[i], strlen(kw[i]), (void *)1);
 }
 
 static bool is_keyword(Token *tok)
 {
-    return hashmap_get2(&keyword_map, tok->loc, tok->len) != NULL;
+    return hashmap_get(&keyword_map, tok->loc, tok->len) != NULL;
 }
 
 // Tokenizer helpers
@@ -748,52 +743,46 @@ static int get_extended_float_suffix(const char *p, int len, const char **replac
 static void convert_pp_number(Token *tok)
 {
     char *p = tok->loc;
-    bool is_hex = (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'));
-    bool is_bin = (p[0] == '0' && (p[1] == 'b' || p[1] == 'B'));
-
-    // Check for C23 extended float suffixes first
-    // BUT NOT if it's a hex/binary number (to avoid false matches like 0xf64 matching F64 suffix)
-    if (!is_hex && !is_bin && get_extended_float_suffix(p, tok->len, NULL))
-    {
-        tok->kind = TK_NUM;
-        tok->flags |= TF_IS_FLOAT;
-        tok->val.i64 = 0;
-        return;
-    }
-
-    // Check for float
-    if (!is_bin)
-    {
-        for (char *q = p; q < p + tok->len; q++)
-        {
-            if (*q == '.' || *q == 'e' || *q == 'E' ||
-                (!is_hex && (*q == 'p' || *q == 'P')) ||
-                (is_hex && (*q == 'p' || *q == 'P')))
-            {
-                tok->kind = TK_NUM;
-                tok->flags |= TF_IS_FLOAT;
-                tok->val.i64 = 0; // Float value doesn't matter for transpiler
-                return;
-            }
-        }
-    }
-
     int base = 10;
-    if (is_hex)
+
+    // Determine base from prefix
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
     {
         base = 16;
         p += 2;
     }
-    else if (is_bin)
+    else if (p[0] == '0' && (p[1] == 'b' || p[1] == 'B'))
     {
         base = 2;
         p += 2;
     }
-    else if (*p == '0')
+    else if (p[0] == '0' && tok->len > 1)
         base = 8;
 
-    tok->val.i64 = read_int_literal(&p, base);
+    // Check for float (decimal/hex only, not binary)
+    if (base != 2)
+    {
+        // C23 extended float suffixes (F16, F32, F64, F128, BF16)
+        if (base == 10 && get_extended_float_suffix(tok->loc, tok->len, NULL))
+            goto is_float;
+
+        // Standard float indicators: '.', exponent (e/E for decimal, p/P for hex)
+        for (char *q = tok->loc; q < tok->loc + tok->len; q++)
+        {
+            if (*q == '.' || *q == 'p' || *q == 'P' ||
+                (base != 16 && (*q == 'e' || *q == 'E')))
+                goto is_float;
+        }
+    }
+
     tok->kind = TK_NUM;
+    tok->val.i64 = read_int_literal(&p, base);
+    return;
+
+is_float:
+    tok->kind = TK_NUM;
+    tok->flags |= TF_IS_FLOAT;
+    tok->val.i64 = 0;
 }
 
 static void convert_pp_tokens(Token *tok)
@@ -871,6 +860,140 @@ static File *new_file_view(const char *name, File *base, int line_delta, bool is
     return file;
 }
 
+// Scan a preprocessor directive starting at '#'
+// Returns new position after directive, or NULL if not a line marker (caller handles as TK_PREP_DIR)
+// Updates *in_system_include, *line_no, and may switch current_file
+static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *in_system_include)
+{
+    char *directive_start = p;
+    int directive_line = *line_no;
+    p++; // skip '#'
+    while (*p == ' ' || *p == '\t')
+        p++;
+
+    // Parse optional "line" keyword
+    if (!strncmp(p, "line", 4) && (p[4] == ' ' || p[4] == '\t'))
+    {
+        p += 4;
+        while (*p == ' ' || *p == '\t')
+            p++;
+    }
+
+    // Must have line number to be a line marker
+    if (!isdigit(*p))
+        return NULL;
+
+    long new_line = 0;
+    while (isdigit(*p))
+    {
+        new_line = new_line * 10 + (*p - '0');
+        p++;
+    }
+    while (*p == ' ' || *p == '\t')
+        p++;
+
+    // Parse optional filename in quotes
+    char *filename = NULL;
+    if (*p == '"')
+    {
+        p++;
+        char *start = p;
+        while (*p && *p != '"')
+        {
+            if (*p == '\\' && p[1])
+                p++;
+            p++;
+        }
+        int len = p - start;
+        filename = malloc(len + 1);
+        if (!filename)
+            error("out of memory");
+        memcpy(filename, start, len);
+        filename[len] = '\0';
+        if (*p == '"')
+            p++;
+    }
+
+    // Parse flags (numbers after filename)
+    bool is_system = false, is_entering = false, is_returning = false;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    while (isdigit(*p))
+    {
+        int flag = 0;
+        while (isdigit(*p))
+        {
+            flag = flag * 10 + (*p - '0');
+            p++;
+        }
+        if (flag == 1)
+            is_entering = true;
+        if (flag == 2)
+            is_returning = true;
+        if (flag == 3)
+            is_system = true;
+        while (*p == ' ' || *p == '\t')
+            p++;
+    }
+
+    // Track system include state
+    if (is_entering && is_system)
+        *in_system_include = true;
+    else if (is_returning && !is_system)
+        *in_system_include = false;
+
+    int line_delta = (int)new_line - (directive_line + 1);
+    File *view = new_file_view(filename ? filename : current_file->name,
+                               base_file, line_delta, is_system, *in_system_include);
+    add_input_file(view);
+    current_file = view;
+    free(filename);
+
+    // Skip to end of directive
+    while (*p && *p != '\n')
+        p++;
+    if (*p == '\n')
+    {
+        p++;
+        (*line_no)++;
+    }
+    return p;
+}
+
+// Scan a preprocessor number starting at p, return pointer past end
+static char *scan_pp_number(char *p)
+{
+    for (;;)
+    {
+        if (p[0] && p[1] && (p[0] == 'e' || p[0] == 'E' || p[0] == 'p' || p[0] == 'P') &&
+            (p[1] == '+' || p[1] == '-'))
+        {
+            p += 2;
+        }
+        else if (isdigit(*p) || *p == '.' || *p == '_')
+        {
+            p++;
+        }
+        else if (isalpha(*p))
+        {
+            char c = *p;
+            if ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') ||
+                c == 'x' || c == 'X' || c == 'b' || c == 'B' ||
+                c == 'e' || c == 'E' || c == 'p' || c == 'P' ||
+                c == 'u' || c == 'U' || c == 'l' || c == 'L' ||
+                c == 'f' || c == 'F')
+            {
+                p++;
+            }
+            else
+                break;
+        }
+        else
+            break;
+    }
+    return p;
+}
+
 static Token *tokenize(File *file)
 {
     File *base_file = file;
@@ -893,127 +1016,21 @@ static Token *tokenize(File *file)
         // Preprocessor directives (#line markers from -E output, or #pragma etc.)
         if (at_bol && *p == '#')
         {
-            int directive_line = line_no;
             char *directive_start = p;
-            p++; // skip '#'
-            while (*p == ' ' || *p == '\t')
-                p++;
-
-            // Parse optional "line" keyword
-            bool has_line_keyword = false;
-            if (!strncmp(p, "line", 4) && (p[4] == ' ' || p[4] == '\t'))
+            char *after = scan_line_directive(p, base_file, &line_no, &in_system_include);
+            if (after)
             {
-                has_line_keyword = true;
-                p += 4;
-                while (*p == ' ' || *p == '\t')
-                    p++;
-            }
-
-            // Parse line number (indicates this is a line marker)
-            bool is_line_marker = false;
-            if (isdigit(*p))
-            {
-                is_line_marker = true;
-                long new_line = 0;
-                while (isdigit(*p))
-                {
-                    new_line = new_line * 10 + (*p - '0');
-                    p++;
-                }
-                while (*p == ' ' || *p == '\t')
-                    p++;
-
-                // Parse optional filename in quotes
-                char *filename = NULL;
-                if (*p == '"')
-                {
-                    p++;
-                    char *start = p;
-                    while (*p && *p != '"')
-                    {
-                        if (*p == '\\' && p[1])
-                            p++;
-                        p++;
-                    }
-                    int len = p - start;
-                    filename = malloc(len + 1);
-                    if (!filename)
-                        error("out of memory");
-                    memcpy(filename, start, len);
-                    filename[len] = '\0';
-                    if (*p == '"')
-                        p++;
-                }
-
-                // Parse flags (numbers after filename)
-                bool is_system = false;
-                bool is_entering = false;  // flag 1: entering new file
-                bool is_returning = false; // flag 2: returning from include
-                while (*p == ' ' || *p == '\t')
-                    p++;
-                while (isdigit(*p))
-                {
-                    int flag = 0;
-                    while (isdigit(*p))
-                    {
-                        flag = flag * 10 + (*p - '0');
-                        p++;
-                    }
-                    if (flag == 1)
-                        is_entering = true;
-                    if (flag == 2)
-                        is_returning = true;
-                    if (flag == 3)
-                        is_system = true;
-                    while (*p == ' ' || *p == '\t')
-                        p++;
-                }
-
-                // Track system include state:
-                // - Enter system include when flag 1 + flag 3 (entering a system header)
-                // - Leave system include when flag 2 without flag 3 (returning to user code)
-                if (is_entering && is_system)
-                    in_system_include = true;
-                else if (is_returning && !is_system)
-                    in_system_include = false;
-
-                int line_delta = (int)new_line - (directive_line + 1);
-                File *view = new_file_view(filename ? filename : current_file->name,
-                                           base_file, line_delta, is_system, in_system_include);
-                add_input_file(view);
-                current_file = view;
-
-                if (filename)
-                    free(filename);
-
-                // Skip to end of line marker directive
-                while (*p && *p != '\n')
-                    p++;
-                if (*p == '\n')
-                {
-                    p++;
-                    line_no++;
-                    at_bol = true;
-                    has_space = false;
-                }
+                p = after;
+                at_bol = true;
+                has_space = false;
                 continue;
             }
 
             // Not a line marker - preserve as preprocessor directive token
-            // (e.g., #pragma, _Pragma expansions, etc.)
-            // Reset to start of directive
-            p = directive_start;
-            char *dir_start = p;
-
-            // Find end of directive line
             while (*p && *p != '\n')
                 p++;
-
-            // Create preprocessor directive token
-            cur = cur->next = new_token(TK_PREP_DIR, dir_start, p);
+            cur = cur->next = new_token(TK_PREP_DIR, directive_start, p);
             tok_set_at_bol(cur, true);
-
-            // Advance past newline
             if (*p == '\n')
             {
                 p++;
@@ -1058,44 +1075,7 @@ static Token *tokenize(File *file)
         if (isdigit(*p) || (*p == '.' && isdigit(p[1])))
         {
             char *start = p;
-            for (;;)
-            {
-                if (p[0] && p[1] && (p[0] == 'e' || p[0] == 'E' || p[0] == 'p' || p[0] == 'P') &&
-                    (p[1] == '+' || p[1] == '-'))
-                {
-                    p += 2;
-                }
-                else if (isdigit(*p) || *p == '.' || *p == '_')
-                {
-                    // Digits, periods, and digit separators are always allowed
-                    p++;
-                }
-                else if (isalpha(*p))
-                {
-                    // For letters, be more careful to avoid consuming unrelated identifiers
-                    // Only consume if it could be part of a valid number (hex digit or suffix)
-                    char c = *p;
-                    // Allow hex digits (a-f, A-F), number prefixes (x, X, b, B), and common suffixes (u, U, l, L, f, F)
-                    // Also allow e, E, p, P for exponents (though e+/e- is handled above)
-                    if ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || // Hex digits
-                        c == 'x' || c == 'X' || c == 'b' || c == 'B' ||     // Prefixes
-                        c == 'e' || c == 'E' || c == 'p' || c == 'P' ||     // Exponents
-                        c == 'u' || c == 'U' || c == 'l' || c == 'L' ||     // Integer suffixes
-                        c == 'f' || c == 'F')                               // Float suffix
-                    {
-                        p++;
-                    }
-                    else
-                    {
-                        // Letter that can't be part of a number - stop here
-                        break;
-                    }
-                }
-                else
-                {
-                    break;
-                }
-            }
+            p = scan_pp_number(p);
             cur = cur->next = new_token(TK_PP_NUM, start, p);
             continue;
         }
