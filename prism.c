@@ -105,12 +105,8 @@ static int extra_force_include_count = 0;
 
 static int struct_depth = 0;
 
-// Initial capacities for dynamic arrays (will grow as needed)
-#define INITIAL_DEFER_DEPTH 64
-#define INITIAL_DEFERS_PER_SCOPE 32
-#define INITIAL_LABELS 256
-#define INITIAL_ARGS 128
-#define INITIAL_STMT_EXPR_DEPTH 32
+// Initial capacity for all dynamic arrays (grows as needed)
+#define INITIAL_CAP 32
 
 // Generic array growth: ensures *arr has capacity for n elements
 #define ENSURE_ARRAY_CAP(arr, count, cap, init_cap, T)   \
@@ -183,7 +179,7 @@ static DeferScope *defer_stack = NULL;
 static int defer_depth = 0;
 static int defer_stack_capacity = 0;
 
-static char pending_temp_file_buf[512];
+static char pending_temp_file_buf[PATH_MAX];
 static char *pending_temp_file = NULL;
 
 // Track pending loop/switch for next scope
@@ -501,7 +497,7 @@ static void defer_stack_ensure_capacity(int n)
 {
   if (n <= defer_stack_capacity)
     return;
-  int new_cap = defer_stack_capacity == 0 ? INITIAL_DEFER_DEPTH : defer_stack_capacity * 2;
+  int new_cap = defer_stack_capacity == 0 ? INITIAL_CAP : defer_stack_capacity * 2;
   while (new_cap < n)
     new_cap *= 2;
   DeferScope *new_stack = realloc(defer_stack, sizeof(DeferScope) * new_cap);
@@ -556,7 +552,7 @@ static void defer_scope_ensure_capacity(DeferScope *scope, int n)
 {
   if (n <= scope->capacity)
     return;
-  int new_cap = scope->capacity == 0 ? INITIAL_DEFERS_PER_SCOPE : scope->capacity * 2;
+  int new_cap = scope->capacity == 0 ? INITIAL_CAP : scope->capacity * 2;
   while (new_cap < n)
     new_cap *= 2;
 
@@ -858,7 +854,7 @@ static bool control_flow_has_defers(bool include_switch)
 
 static void label_table_add(char *name, int name_len, int scope_depth)
 {
-  ENSURE_ARRAY_CAP(label_table.labels, label_table.count + 1, label_table.capacity, INITIAL_LABELS, LabelInfo);
+  ENSURE_ARRAY_CAP(label_table.labels, label_table.count + 1, label_table.capacity, INITIAL_CAP, LabelInfo);
   LabelInfo *info = &label_table.labels[label_table.count++];
   info->name = name;
   info->name_len = name_len;
@@ -909,7 +905,7 @@ typedef enum
 
 static void typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool is_vla)
 {
-  ENSURE_ARRAY_CAP(typedef_table.entries, typedef_table.count + 1, typedef_table.capacity, 256, TypedefEntry);
+  ENSURE_ARRAY_CAP(typedef_table.entries, typedef_table.count + 1, typedef_table.capacity, INITIAL_CAP, TypedefEntry);
   int new_index = typedef_table.count++;
   TypedefEntry *e = &typedef_table.entries[new_index];
   e->name = name;
@@ -3853,7 +3849,7 @@ static int transpile(char *input_file, char *output_file)
         // Grow stmt_expr_levels if needed
         if (stmt_expr_count >= stmt_expr_capacity)
         {
-          int new_cap = stmt_expr_capacity == 0 ? INITIAL_STMT_EXPR_DEPTH : stmt_expr_capacity * 2;
+          int new_cap = stmt_expr_capacity == 0 ? INITIAL_CAP : stmt_expr_capacity * 2;
           int *new_levels = realloc(stmt_expr_levels, sizeof(int) * new_cap);
           if (!new_levels)
             error("out of memory growing statement expression stack");
@@ -4024,7 +4020,7 @@ static PrismResult prism_transpile_file(const char *input_file, PrismFeatures fe
   feature_flatten_headers = features.flatten_headers;
 
   // Create temp file for output
-  char temp_path[512];
+  char temp_path[PATH_MAX];
   snprintf(temp_path, sizeof(temp_path), "%sprism_out.XXXXXX.c", TMP_DIR);
 
 #if defined(_WIN32)
@@ -4188,7 +4184,7 @@ static bool argv_builder_append_flags(ArgvBuilder *ab, const char *flags)
     // Add to builder (takes ownership)
     if (ab->count + 1 >= ab->capacity)
     {
-      int new_cap = ab->capacity == 0 ? INITIAL_ARGS : ab->capacity * 2;
+      int new_cap = ab->capacity == 0 ? INITIAL_CAP : ab->capacity * 2;
       char **new_data = realloc(ab->data, sizeof(char *) * new_cap);
       if (!new_data)
       {
@@ -5094,7 +5090,7 @@ static char *create_temp_file(const char *source, char *buf, size_t bufsize)
     snprintf(buf, bufsize, ".%s.XXXXXX.c", source);
   else
   {
-    char source_dir[512];
+    char source_dir[PATH_MAX];
     size_t dir_len = basename_ptr - source;
     if (dir_len >= sizeof(source_dir))
       dir_len = sizeof(source_dir) - 1;
@@ -5307,7 +5303,7 @@ int main(int argc, char **argv)
       else
       {
         // Transpile to stdout
-        char temp[512];
+        char temp[PATH_MAX];
         if (!create_temp_file(source, temp, sizeof(temp)))
           die("Failed to create temp file");
 
@@ -5513,7 +5509,7 @@ int main(int argc, char **argv)
   }
 
   // For RUN mode, compile to temp executable
-  char temp_exe[512] = {0};
+  char temp_exe[PATH_MAX] = {0};
   if (cli.mode == CLI_MODE_RUN)
   {
     snprintf(temp_exe, sizeof(temp_exe), "%sprism_run.XXXXXX", TMP_DIR);
@@ -5571,7 +5567,7 @@ int main(int argc, char **argv)
   else if (cli.mode == CLI_MODE_COMPILE_ONLY && cli.source_count == 1)
   {
     // GCC-compatible: -c foo.c produces foo.o
-    static char default_obj[512];
+    static char default_obj[PATH_MAX];
     const char *src = cli.sources[0];
     const char *base = strrchr(src, '/');
     base = base ? base + 1 : src;
