@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.99.4"
+#define PRISM_VERSION "0.99.5"
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -140,6 +140,51 @@ static int struct_depth = 0;
     }                                                    \
   } while (0)
 
+#define MAX_TYPEOF_VARS_PER_DECL 32
+#define MAX_ATTRIBUTE_WALK_DEPTH 100
+
+static Token *skip_balanced(Token *tok, char *open, char *close);
+
+// Check if token is an attribute keyword (__attribute__, __attribute, __declspec)
+static inline bool is_attribute_keyword(Token *tok)
+{
+  return equal(tok, "__attribute__") || equal(tok, "__attribute") || equal(tok, "__declspec");
+}
+
+// Skip all attributes (GNU-style and C23-style) starting at tok
+// Returns pointer to first token after all attributes
+static Token *skip_all_attributes(Token *tok)
+{
+  while (tok && tok->kind != TK_EOF)
+  {
+    // Skip GNU/MSVC-style: __attribute__((...)), __declspec(...)
+    if (is_attribute_keyword(tok))
+    {
+      tok = tok->next;
+      if (tok && equal(tok, "("))
+        tok = skip_balanced(tok, "(", ")");
+      continue;
+    }
+    // Skip C23-style: [[...]]
+    if (equal(tok, "[") && tok->next && equal(tok->next, "["))
+    {
+      tok = tok->next->next;
+      int depth = 1;
+      while (tok && tok->kind != TK_EOF && depth > 0)
+      {
+        if (equal(tok, "["))
+          depth++;
+        else if (equal(tok, "]"))
+          depth--;
+        tok = tok->next;
+      }
+      continue;
+    }
+    break;
+  }
+  return tok;
+}
+
 typedef struct
 {
   Token **stmts;     // Start token of each deferred statement (dynamic)
@@ -279,6 +324,8 @@ static inline void out_char(char c)
   out_buf.buf[out_buf.pos++] = c;
 }
 
+#define OUT_LIT(s) out_str(s, sizeof(s) - 1)
+
 static void out_str(const char *s, size_t len)
 {
   // If it fits in buffer, copy directly
@@ -314,11 +361,11 @@ static void out_uint(unsigned long long v)
 
 static void out_line(int line_no, const char *file)
 {
-  out_str("#line ", 6);
+  OUT_LIT("#line ");
   out_uint(line_no);
-  out_str(" \"", 2);
+  OUT_LIT(" \"");
   out_str(file, strlen(file));
-  out_str("\"\n", 2);
+  OUT_LIT("\"\n");
 }
 
 // Line tracking for #line directives
@@ -444,9 +491,9 @@ static void emit_system_includes(void)
 
   for (int i = 0; i < system_include_count; i++)
   {
-    out_str("#include <", 10);
+    OUT_LIT("#include <");
     out_str(system_include_list[i], strlen(system_include_list[i]));
-    out_str(">\n", 2);
+    OUT_LIT(">\n");
   }
   if (system_include_count > 0)
     out_char('\n');
@@ -660,6 +707,19 @@ static bool is_member_access(Token *tok)
   return tok && tok->kind == TK_PUNCT && (equal(tok, ".") || equal(tok, "->"));
 }
 
+// Check if token is an assignment or compound assignment operator
+// Used to distinguish variable assignments from keyword statements
+static bool is_assignment_op(Token *tok)
+{
+  if (!tok)
+    return false;
+  return equal(tok, "=") || equal(tok, "+=") || equal(tok, "-=") ||
+         equal(tok, "*=") || equal(tok, "/=") || equal(tok, "%=") ||
+         equal(tok, "&=") || equal(tok, "|=") || equal(tok, "^=") ||
+         equal(tok, "<<=") || equal(tok, ">>=") || equal(tok, "++") ||
+         equal(tok, "--") || equal(tok, "[");
+}
+
 // Check if 'tok' is inside a __attribute__((...)) or __declspec(...) context
 // by looking backward through last_emitted tokens.
 // This is used to prevent 'defer' from being recognized as a keyword
@@ -708,7 +768,7 @@ static bool is_inside_attribute(Token *tok)
         break;
       }
     }
-    else if (equal(t, "__attribute__") || equal(t, "__attribute") || equal(t, "__declspec"))
+    else if (is_attribute_keyword(t))
     {
       // Found attribute keyword with unbalanced parens - we're inside it
       return true;
@@ -876,7 +936,7 @@ static void emit_defers(DeferEmitMode mode)
 {
   if (defer_depth <= 0)
     return;
-  int start = (mode == DEFER_SCOPE) ? defer_depth - 1 : defer_depth - 1;
+  int start = defer_depth - 1;
   int end = (mode == DEFER_SCOPE) ? defer_depth - 1 : 0;
   for (int d = start; d >= end; d--)
   {
@@ -1131,11 +1191,10 @@ static Token *skip_balanced(Token *tok, char *open, char *close);
 static Token *find_struct_body_brace(Token *tok)
 {
   Token *t = tok->next;
-  while (t && (t->kind == TK_IDENT || equal(t, "__attribute__") || equal(t, "__attribute") ||
+  while (t && (t->kind == TK_IDENT || is_attribute_keyword(t) ||
                equal(t, "_Alignas") || equal(t, "alignas")))
   {
-    if (equal(t, "__attribute__") || equal(t, "__attribute") ||
-        equal(t, "_Alignas") || equal(t, "alignas"))
+    if (is_attribute_keyword(t) || equal(t, "_Alignas") || equal(t, "alignas"))
     {
       t = t->next;
       if (t && equal(t, "("))
@@ -1244,7 +1303,7 @@ static void scan_labels_in_function(Token *tok)
     {
       // Look ahead for colon, skipping any __attribute__((...)) sequences
       Token *t = tok->next;
-      while (t && (equal(t, "__attribute__") || equal(t, "__attribute")))
+      while (t && is_attribute_keyword(t))
       {
         t = t->next;
         if (t && equal(t, "("))
@@ -1435,20 +1494,10 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
                                        equal(prev, "restrict") || equal(prev, "__restrict") ||
                                        equal(prev, ",")); // Also check comma for multi-declarators
 
-      // Also check if followed by assignment operator - that's a variable, not defer statement
-      // Examples: defer = 1; defer += 1; defer++; etc.
-      bool is_assignment = tok->next && (equal(tok->next, "=") || equal(tok->next, "+=") ||
-                                         equal(tok->next, "-=") || equal(tok->next, "*=") ||
-                                         equal(tok->next, "/=") || equal(tok->next, "%=") ||
-                                         equal(tok->next, "&=") || equal(tok->next, "|=") ||
-                                         equal(tok->next, "^=") || equal(tok->next, "<<=") ||
-                                         equal(tok->next, ">>=") || equal(tok->next, "++") ||
-                                         equal(tok->next, "--") || equal(tok->next, "["));
-
       // Check for defer statement (not a label named "defer:")
       if (tok->kind == TK_KEYWORD && equal(tok, "defer") &&
           !equal(tok->next, ":") && // Distinguish from label named "defer:"
-          !is_member_access(prev) && !is_variable_name && !is_assignment)
+          !is_member_access(prev) && !is_variable_name && !is_assignment_op(tok->next))
       {
         if (!active_item || depth <= active_item_depth)
         {
@@ -1544,7 +1593,7 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
     {
       // Look ahead for colon, skipping any __attribute__((...)) sequences
       Token *t = tok->next;
-      while (t && (equal(t, "__attribute__") || equal(t, "__attribute")))
+      while (t && is_attribute_keyword(t))
       {
         t = t->next;
         if (t && equal(t, "("))
@@ -1610,8 +1659,7 @@ static bool is_type_keyword(Token *tok);
 // Skip attributes like __attribute__((...)) and __declspec(...)
 static Token *skip_attributes(Token *tok)
 {
-  while (tok && (equal(tok, "__attribute__") || equal(tok, "__attribute") ||
-                 equal(tok, "__declspec")))
+  while (tok && is_attribute_keyword(tok))
   {
     tok = tok->next;
     if (tok && equal(tok, "("))
@@ -1627,10 +1675,9 @@ static bool is_void_function_decl(Token *tok)
   // Skip storage class specifiers and attributes
   while (tok && (equal(tok, "static") || equal(tok, "inline") || equal(tok, "extern") ||
                  equal(tok, "_Noreturn") || equal(tok, "__inline") || equal(tok, "__inline__") ||
-                 equal(tok, "typedef") || equal(tok, "__attribute__") || equal(tok, "__attribute") ||
-                 equal(tok, "__declspec")))
+                 equal(tok, "typedef") || is_attribute_keyword(tok)))
   {
-    if (equal(tok, "__attribute__") || equal(tok, "__attribute") || equal(tok, "__declspec"))
+    if (is_attribute_keyword(tok))
       tok = skip_attributes(tok);
     else
       tok = tok->next;
@@ -1649,10 +1696,9 @@ static bool is_void_function_decl(Token *tok)
   // Skip attributes and qualifiers after void
   while (tok && (equal(tok, "const") || equal(tok, "volatile") ||
                  equal(tok, "__restrict") || equal(tok, "__restrict__") ||
-                 equal(tok, "__attribute__") || equal(tok, "__attribute") ||
-                 equal(tok, "__declspec")))
+                 is_attribute_keyword(tok)))
   {
-    if (equal(tok, "__attribute__") || equal(tok, "__attribute") || equal(tok, "__declspec"))
+    if (is_attribute_keyword(tok))
       tok = skip_attributes(tok);
     else
       tok = tok->next;
@@ -1813,21 +1859,24 @@ static Token *scan_typedef_name(Token **tokp)
   return NULL;
 }
 
-// Forward declarations (used by struct_body_contains_vla and is_true_vla_array_size)
-static bool is_const_array_size(Token *open_bracket);
+// Forward declarations (used by struct_body_contains_vla and array_size_is_vla)
+static bool array_size_is_vla(Token *open_bracket, bool strict_mode);
 static bool has_manual_offsetof_pattern(Token *start, Token *end);
 static bool looks_like_system_typedef(Token *tok);
+static bool is_const_expr_operator(Token *tok);
+static bool is_const_identifier(Token *tok);
 
-// Check if array dimension contains a true VLA (variable in dimension).
-// Unlike is_const_array_size, this DOES accept manual offsetof patterns as constant,
-// since they compile fine on all compilers - they're just treated specially for zero-init.
-static bool is_true_vla_array_size(Token *open_bracket)
+// Unified VLA array size checker
+// strict_mode=true: Treat offsetof patterns as VLA (for zero-init safety)
+// strict_mode=false: Treat offsetof patterns as constant (for struct validation)
+static bool array_size_is_vla(Token *open_bracket, bool strict_mode)
 {
   Token *tok = open_bracket->next;
   int depth = 1;
 
-  // Find closing bracket
+  // Find closing bracket (needed for offsetof pattern check)
   Token *close_bracket = NULL;
+  if (!strict_mode)
   {
     Token *t = open_bracket->next;
     int d = 1;
@@ -1843,74 +1892,149 @@ static bool is_true_vla_array_size(Token *open_bracket)
       }
       t = t->next;
     }
+    // In lenient mode, manual offsetof patterns are constant (not VLA)
+    if (close_bracket && has_manual_offsetof_pattern(open_bracket->next, close_bracket))
+      return false;
   }
-
-  // Check for manual offsetof pattern - these are actually constant, just treated specially
-  // Note: We DON'T return true here (unlike is_const_array_size) because it's not a true VLA
-  if (close_bracket && has_manual_offsetof_pattern(open_bracket->next, close_bracket))
-    return false; // Manual offsetof is constant, not a true VLA
 
   bool prev_was_member_access = false;
-  while (tok->kind != TK_EOF && depth > 0)
+  while (tok && tok->kind != TK_EOF && depth > 0)
   {
     if (equal(tok, "["))
-      depth++;
-    else if (equal(tok, "]"))
-      depth--;
-    else
     {
-      // Skip sizeof, alignof, offsetof, __builtin_offsetof - all constant
-      if (equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof") ||
-          equal(tok, "offsetof") || equal(tok, "__builtin_offsetof"))
+      depth++;
+      tok = tok->next;
+      continue;
+    }
+    if (equal(tok, "]"))
+    {
+      depth--;
+      tok = tok->next;
+      continue;
+    }
+
+    // In strict mode, offsetof keywords and patterns indicate potential VLA
+    if (strict_mode)
+    {
+      if (equal(tok, "offsetof") || equal(tok, "__builtin_offsetof"))
+        return true;
+      // Detect manual offsetof pattern: (char*)
+      if (equal(tok, "(") && tok->next && equal(tok->next, "char") &&
+          tok->next->next && equal(tok->next->next, "*"))
+        return true;
+    }
+
+    // sizeof, _Alignof, alignof - handle specially
+    if (equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof"))
+    {
+      bool is_sizeof = equal(tok, "sizeof");
+      tok = tok->next;
+      if (tok && equal(tok, "("))
       {
-        tok = tok->next;
-        if (tok && equal(tok, "("))
+        Token *arg_start = tok->next;
+
+        // Find matching closing paren
+        int paren_depth = 1;
+        Token *t = tok->next;
+        while (t && t->kind != TK_EOF && paren_depth > 0)
         {
-          int paren_depth = 1;
-          tok = tok->next;
-          while (tok->kind != TK_EOF && paren_depth > 0)
+          if (equal(t, "("))
+            paren_depth++;
+          else if (equal(t, ")"))
+            paren_depth--;
+          t = t->next;
+        }
+        Token *arg_end = t;
+
+        if (strict_mode && is_sizeof)
+        {
+          // sizeof(VLA_Type) - check for VLA typedef
+          if (arg_start && is_vla_typedef(arg_start))
+            return true;
+
+          // sizeof(identifier) - check for potential VLA variable
+          if (arg_start && arg_start->kind == TK_IDENT && arg_start->next && equal(arg_start->next, ")") &&
+              !is_const_identifier(arg_start))
           {
-            if (equal(tok, "("))
-              paren_depth++;
-            else if (equal(tok, ")"))
-              paren_depth--;
-            tok = tok->next;
+            // Check for array count idiom: sizeof(arr) / sizeof(arr[0])
+            Token *after_paren = arg_start->next->next;
+            if (!(after_paren && equal(after_paren, "/") && after_paren->next && equal(after_paren->next, "sizeof")))
+              return true;
+          }
+
+          // Check for VLA patterns inside the sizeof argument (e.g., sizeof(int[n]))
+          for (Token *st = arg_start; st && st != arg_end && st->kind != TK_EOF; st = st->next)
+          {
+            if (equal(st, "[") && array_size_is_vla(st, true))
+              return true;
           }
         }
-        prev_was_member_access = false;
-        continue;
-      }
 
-      if (equal(tok, "->") || equal(tok, "."))
+        tok = arg_end;
+      }
+      prev_was_member_access = false;
+      continue;
+    }
+
+    // In lenient mode, skip offsetof entirely (already handled above)
+    if (!strict_mode && (equal(tok, "offsetof") || equal(tok, "__builtin_offsetof")))
+    {
+      tok = tok->next;
+      if (tok && equal(tok, "("))
+        tok = skip_balanced(tok, "(", ")");
+      prev_was_member_access = false;
+      continue;
+    }
+
+    // Track member access operators
+    if (equal(tok, "->") || equal(tok, "."))
+    {
+      prev_was_member_access = true;
+      tok = tok->next;
+      continue;
+    }
+
+    // Allow constant expression operators
+    if (is_const_expr_operator(tok))
+    {
+      prev_was_member_access = false;
+      tok = tok->next;
+      continue;
+    }
+
+    // Check identifiers
+    if (tok->kind == TK_IDENT)
+    {
+      // Member names after -> or . are compile-time constant
+      if (prev_was_member_access)
       {
-        prev_was_member_access = true;
+        prev_was_member_access = false;
         tok = tok->next;
         continue;
       }
 
-      // Check for identifiers that are NOT constants
-      if (tok->kind != TK_NUM &&
-          !equal(tok, "+") && !equal(tok, "-") && !equal(tok, "*") &&
-          !equal(tok, "/") && !equal(tok, "%") && !equal(tok, "(") && !equal(tok, ")") &&
-          !equal(tok, "<<") && !equal(tok, ">>") && !equal(tok, "&") &&
-          !equal(tok, "|") && !equal(tok, "^") && !equal(tok, "~") &&
-          !equal(tok, "!") && !equal(tok, "<") && !equal(tok, ">") &&
-          !equal(tok, "<=") && !equal(tok, ">=") && !equal(tok, "==") &&
-          !equal(tok, "!=") && !equal(tok, "&&") && !equal(tok, "||") &&
-          !equal(tok, "?") && !equal(tok, ":"))
+      // Constant identifiers (enums, typedefs, type keywords, system types)
+      if (is_const_identifier(tok))
       {
-        if (tok->kind == TK_IDENT && !prev_was_member_access &&
-            !is_known_enum_const(tok) && !is_known_typedef(tok) &&
-            !is_type_keyword(tok) && !looks_like_system_typedef(tok))
-        {
-          return true; // Found a variable - this is a true VLA
-        }
+        tok = tok->next;
+        continue;
       }
-      prev_was_member_access = false;
+
+      // Non-constant identifier found - this is a VLA
+      return true;
     }
+
+    prev_was_member_access = false;
     tok = tok->next;
   }
-  return false; // No variables found - constant size
+
+  return false; // All tokens were constants
+}
+
+// Wrapper for backward compatibility - strict mode (for zero-init)
+static inline bool is_const_array_size(Token *open_bracket)
+{
+  return !array_size_is_vla(open_bracket, true);
 }
 
 // Check if a struct/union body contains any true VLA arrays (not just patterns
@@ -1933,7 +2057,8 @@ static bool struct_body_contains_true_vla(Token *open_brace)
     else if (equal(tok, "[") && depth > 0)
     {
       // Found an array dimension at any level within the struct/union
-      if (is_true_vla_array_size(tok))
+      // Use strict_mode=false: offsetof patterns are OK in struct validation
+      if (array_size_is_vla(tok, false))
         return true;
     }
     tok = tok->next;
@@ -2123,7 +2248,7 @@ static bool is_type_qualifier(Token *tok)
   return equal(tok, "const") || equal(tok, "volatile") || equal(tok, "restrict") ||
          equal(tok, "static") || equal(tok, "auto") || equal(tok, "register") ||
          equal(tok, "_Atomic") || equal(tok, "_Alignas") || equal(tok, "alignas") ||
-         equal(tok, "__attribute__") || equal(tok, "__attribute");
+         is_attribute_keyword(tok);
 }
 
 static bool is_skip_decl_keyword(Token *tok)
@@ -2201,249 +2326,25 @@ static bool has_manual_offsetof_pattern(Token *start, Token *end)
   return false;
 }
 
-// Check if array size is a compile-time constant (not a VLA)
-static bool is_const_array_size(Token *open_bracket)
+// Check if token is a constant expression operator (safe in array dimensions)
+static bool is_const_expr_operator(Token *tok)
 {
-  Token *tok = open_bracket->next;
-  int depth = 1;
-  bool has_only_literals = true;
-  bool is_empty = true;
-  bool prev_was_member_access = false; // True if previous token was -> or .
+  return tok->kind == TK_NUM ||
+         equal(tok, "+") || equal(tok, "-") || equal(tok, "*") ||
+         equal(tok, "/") || equal(tok, "%") || equal(tok, "(") || equal(tok, ")") ||
+         equal(tok, "<<") || equal(tok, ">>") || equal(tok, "&") ||
+         equal(tok, "|") || equal(tok, "^") || equal(tok, "~") ||
+         equal(tok, "!") || equal(tok, "<") || equal(tok, ">") ||
+         equal(tok, "<=") || equal(tok, ">=") || equal(tok, "==") ||
+         equal(tok, "!=") || equal(tok, "&&") || equal(tok, "||") ||
+         equal(tok, "?") || equal(tok, ":");
+}
 
-  // Find the closing bracket first
-  Token *close_bracket = NULL;
-  {
-    Token *t = open_bracket->next;
-    int d = 1;
-    while (t && t->kind != TK_EOF && d > 0)
-    {
-      if (equal(t, "["))
-        d++;
-      else if (equal(t, "]"))
-      {
-        d--;
-        if (d == 0)
-          close_bracket = t;
-      }
-      t = t->next;
-    }
-  }
-
-  // Check for manual offsetof pattern that GCC treats as VLA
-  if (close_bracket && has_manual_offsetof_pattern(open_bracket->next, close_bracket))
-  {
-    return false; // Treat as VLA for safety
-  }
-
-  // Also check for offsetof(...) or __builtin_offsetof(...) keywords BEFORE main loop
-  // GCC treats these as VLAs in struct/union contexts even though they're constant
-  {
-    Token *t = open_bracket->next;
-    while (t && t != close_bracket && t->kind != TK_EOF)
-    {
-      if (equal(t, "offsetof") || equal(t, "__builtin_offsetof"))
-      {
-        return false; // Treat as VLA for safety
-      }
-      t = t->next;
-    }
-  }
-
-  while (tok->kind != TK_EOF && depth > 0)
-  {
-    if (equal(tok, "["))
-      depth++;
-    else if (equal(tok, "]"))
-      depth--;
-    else
-    {
-      is_empty = false;
-      // sizeof and _Alignof/alignof produce compile-time constants UNLESS
-      // their argument is a VLA type. For example, sizeof(int[n]) where n is
-      // variable is evaluated at runtime, so arrays sized by sizeof(VLA) are VLAs.
-      // offsetof(type, member) also produces a compile-time constant.
-      // __builtin_offsetof is what offsetof expands to after preprocessing.
-      if (equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof") ||
-          equal(tok, "offsetof") || equal(tok, "__builtin_offsetof"))
-      {
-        bool is_sizeof = equal(tok, "sizeof");
-        tok = tok->next;
-        if (tok && equal(tok, "("))
-        {
-          int paren_depth = 1;
-          Token *sizeof_start = tok->next;
-          tok = tok->next;
-
-          // For sizeof, check if the argument contains a VLA pattern
-          if (is_sizeof)
-          {
-            Token *sizeof_tok = sizeof_start;
-            bool found_vla_in_sizeof = false;
-
-            // First check if the argument is a VLA typedef (e.g., sizeof(VLA_Type))
-            if (sizeof_tok && is_vla_typedef(sizeof_tok))
-            {
-              found_vla_in_sizeof = true;
-            }
-
-            // Check if sizeof argument is a simple identifier (potentially a VLA variable)
-            // Example: int n=5; int vla[n]; int x[sizeof(vla)]; <- sizeof(vla) is runtime!
-            // We can't track all VLA variables, so be conservative: if sizeof(identifier) where
-            // identifier is not a typedef/keyword/enum, treat it as potentially a VLA variable.
-            // HOWEVER: sizeof(var[...]) is always constant (size of element type), allow that.
-            // ALSO: sizeof(var.member) or sizeof(var->member) is constant, allow that too.
-            if (!found_vla_in_sizeof && sizeof_tok && sizeof_tok->kind == TK_IDENT &&
-                !is_known_typedef(sizeof_tok) && !is_type_keyword(sizeof_tok) &&
-                !is_known_enum_const(sizeof_tok) && !looks_like_system_typedef(sizeof_tok))
-            {
-              // Check what follows the identifier
-              Token *after_ident = sizeof_tok->next;
-              if (after_ident && equal(after_ident, ")"))
-              {
-                // sizeof(identifier) - could be a VLA variable
-                // BUT check for array element count idiom: sizeof(arr) / sizeof(arr[0])
-                // If we see the same identifier later with [0], it's likely this idiom
-                bool is_array_count_idiom = false;
-                Token *lookahead = after_ident->next; // Token after the closing )
-                if (lookahead && equal(lookahead, "/"))
-                {
-                  lookahead = lookahead->next;
-                  // Skip whitespace and look for sizeof
-                  if (lookahead && equal(lookahead, "sizeof"))
-                  {
-                    lookahead = lookahead->next;
-                    if (lookahead && equal(lookahead, "("))
-                    {
-                      lookahead = lookahead->next;
-                      // Check if it's the same identifier
-                      if (lookahead && lookahead->kind == TK_IDENT &&
-                          lookahead->len == sizeof_tok->len &&
-                          memcmp(lookahead->loc, sizeof_tok->loc, sizeof_tok->len) == 0)
-                      {
-                        lookahead = lookahead->next;
-                        // Check for [0] or [anything]
-                        if (lookahead && equal(lookahead, "["))
-                        {
-                          is_array_count_idiom = true;
-                        }
-                      }
-                    }
-                  }
-                }
-
-                if (!is_array_count_idiom)
-                {
-                  // sizeof(identifier) without array count idiom - be conservative
-                  found_vla_in_sizeof = true;
-                }
-              }
-              // If followed by '[', '.', or '->', it's accessing a member/element (always constant size)
-              // Example: sizeof(arr[0]) or sizeof(s.member) or sizeof(p->member)
-              // These are always compile-time constant
-              else if (!after_ident ||
-                       !(equal(after_ident, "[") || equal(after_ident, ".") ||
-                         equal(after_ident, "->")))
-              {
-                // Something else follows, could be operators/parens, keep scanning
-                // Don't mark as VLA yet, let the normal scanning continue
-              }
-            }
-
-            // Scan the sizeof argument for array dimensions with variables
-            while (sizeof_tok && sizeof_tok->kind != TK_EOF && paren_depth > 0 && !found_vla_in_sizeof)
-            {
-              if (equal(sizeof_tok, "("))
-                paren_depth++;
-              else if (equal(sizeof_tok, ")"))
-                paren_depth--;
-              else if (equal(sizeof_tok, "[") && paren_depth > 0)
-              {
-                // Found an array dimension inside sizeof - check if it contains a variable
-                Token *bracket_tok = sizeof_tok->next;
-                int bracket_depth = 1;
-                while (bracket_tok && bracket_tok->kind != TK_EOF && bracket_depth > 0)
-                {
-                  if (equal(bracket_tok, "["))
-                    bracket_depth++;
-                  else if (equal(bracket_tok, "]"))
-                    bracket_depth--;
-                  else if (bracket_tok->kind == TK_IDENT && bracket_depth > 0 &&
-                           !is_known_enum_const(bracket_tok) && !is_known_typedef(bracket_tok) &&
-                           !is_type_keyword(bracket_tok) && !looks_like_system_typedef(bracket_tok))
-                  {
-                    // Found a variable in the array dimension inside sizeof
-                    found_vla_in_sizeof = true;
-                    break;
-                  }
-                  bracket_tok = bracket_tok->next;
-                }
-                if (found_vla_in_sizeof)
-                  break;
-              }
-              sizeof_tok = sizeof_tok->next;
-            }
-
-            if (found_vla_in_sizeof)
-            {
-              has_only_literals = false; // sizeof(VLA) is runtime, not constant
-            }
-
-            // Skip to end of sizeof argument
-            paren_depth = 1;
-            tok = sizeof_start;
-          }
-
-          // Skip the rest of the parenthesized argument
-          while (tok->kind != TK_EOF && paren_depth > 0)
-          {
-            if (equal(tok, "("))
-              paren_depth++;
-            else if (equal(tok, ")"))
-              paren_depth--;
-            tok = tok->next;
-          }
-        }
-        prev_was_member_access = false;
-        continue;
-      }
-
-      // Track -> and . operators for member access patterns (used in offsetof expansion)
-      if (equal(tok, "->") || equal(tok, "."))
-      {
-        prev_was_member_access = true;
-        tok = tok->next;
-        continue;
-      }
-
-      // Allow numeric literals and basic operators
-      if (tok->kind != TK_NUM &&
-          !equal(tok, "+") && !equal(tok, "-") && !equal(tok, "*") &&
-          !equal(tok, "/") && !equal(tok, "%") && !equal(tok, "(") && !equal(tok, ")") &&
-          !equal(tok, "<<") && !equal(tok, ">>") && !equal(tok, "&") &&
-          !equal(tok, "|") && !equal(tok, "^") && !equal(tok, "~") &&
-          !equal(tok, "!") && !equal(tok, "<") && !equal(tok, ">") &&
-          !equal(tok, "<=") && !equal(tok, ">=") && !equal(tok, "==") &&
-          !equal(tok, "!=") && !equal(tok, "&&") && !equal(tok, "||") &&
-          !equal(tok, "?") && !equal(tok, ":"))
-      {
-        // Identifiers are only allowed if they're:
-        // - Known enum constants (compile-time constants)
-        // - Known typedefs (used in casts like (MyType)0)
-        // - Type keywords (used in casts like (int)0)
-        // - System typedefs (names ending in _t, like rlim_t, size_t)
-        // - Member names following -> or . (compile-time in offsetof patterns)
-        if (tok->kind == TK_IDENT && !prev_was_member_access &&
-            !is_known_enum_const(tok) && !is_known_typedef(tok) &&
-            !is_type_keyword(tok) && !looks_like_system_typedef(tok))
-        {
-          has_only_literals = false;
-        }
-      }
-      prev_was_member_access = false;
-    }
-    tok = tok->next;
-  }
-  return is_empty || has_only_literals;
+// Check if identifier is a compile-time constant (enum, typedef, type keyword, system type)
+static bool is_const_identifier(Token *tok)
+{
+  return is_known_enum_const(tok) || is_known_typedef(tok) ||
+         is_type_keyword(tok) || looks_like_system_typedef(tok);
 }
 
 // Check if token can be used as a variable name in a declarator.
@@ -2553,7 +2454,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       r.saw_type = true;
       tok = tok->next;
       // Skip attributes before tag
-      while (tok && (equal(tok, "__attribute__") || equal(tok, "__attribute") ||
+      while (tok && (is_attribute_keyword(tok) ||
                      equal(tok, "_Alignas") || equal(tok, "alignas")))
       {
         tok = tok->next;
@@ -2619,8 +2520,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
     }
 
     // _Alignas/alignas/__attribute__
-    if (equal(tok, "_Alignas") || equal(tok, "alignas") ||
-        equal(tok, "__attribute__") || equal(tok, "__attribute"))
+    if (equal(tok, "_Alignas") || equal(tok, "alignas") || is_attribute_keyword(tok))
     {
       tok = tok->next;
       if (tok && equal(tok, "("))
@@ -2777,7 +2677,7 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
   {
     if (equal(tok, "*"))
       r.is_pointer = true;
-    if (equal(tok, "__attribute__") || equal(tok, "__attribute"))
+    if (is_attribute_keyword(tok))
     {
       tok = skip_emit_attribute(tok);
       continue;
@@ -2813,7 +2713,7 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
         r.is_pointer = true;
       else if (equal(tok, "("))
         nested_paren++;
-      if (equal(tok, "__attribute__") || equal(tok, "__attribute"))
+      if (is_attribute_keyword(tok))
       {
         tok = skip_emit_attribute(tok);
         continue;
@@ -2837,7 +2737,7 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
   tok = tok->next;
 
   // Skip __attribute__ after variable name
-  while (equal(tok, "__attribute__") || equal(tok, "__attribute"))
+  while (is_attribute_keyword(tok))
   {
     tok = skip_emit_attribute(tok);
   }
@@ -2894,7 +2794,7 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
   }
 
   // Skip __attribute__ before initializer or end of declarator
-  while (equal(tok, "__attribute__") || equal(tok, "__attribute"))
+  while (is_attribute_keyword(tok))
   {
     tok = skip_emit_attribute(tok);
   }
@@ -3194,11 +3094,11 @@ static Token *try_zero_init_decl(Token *tok)
       // Use PRISM_ATOMIC_INIT macro only for _Atomic aggregates (Clang rejects all init for these)
       bool is_aggregate = decl.is_array || ((type.is_struct || type.is_typedef) && !decl.is_pointer);
       if (type.has_atomic && is_aggregate)
-        out_str(" PRISM_ATOMIC_INIT({0})", 23);
+        OUT_LIT(" PRISM_ATOMIC_INIT({0})");
       else if (is_aggregate)
-        out_str(" = {0}", 6);
+        OUT_LIT(" = {0}");
       else
-        out_str(" = 0", 4);
+        OUT_LIT(" = 0");
     }
 
     // Track typeof variables for memset emission after declaration
@@ -3237,11 +3137,11 @@ static Token *try_zero_init_decl(Token *tok)
       // Emit memset for typeof variables (after declaration is complete)
       for (int i = 0; i < typeof_var_count; i++)
       {
-        out_str(" memset(&", 9);
+        OUT_LIT(" memset(&");
         out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
-        out_str(", 0, sizeof(", 12);
+        OUT_LIT(", 0, sizeof(");
         out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
-        out_str("));", 3);
+        OUT_LIT("));");
       }
       return tok->next;
     }
@@ -3436,12 +3336,12 @@ static int transpile(char *input_file, char *output_file)
 
   // Emit compatibility macros for _Atomic initialization
   // Clang has issues with _Atomic initialization, GCC works correctly
-  out_str("/* Prism: _Atomic compatibility macros */\n", 42);
-  out_str("#ifdef __clang__\n", 17);
-  out_str("#define PRISM_ATOMIC_INIT(v)\n", 29);
-  out_str("#else\n", 6);
-  out_str("#define PRISM_ATOMIC_INIT(v) = v\n", 33);
-  out_str("#endif\n\n", 8);
+  OUT_LIT("/* Prism: _Atomic compatibility macros */\n");
+  OUT_LIT("#ifdef __clang__\n");
+  OUT_LIT("#define PRISM_ATOMIC_INIT(v)\n");
+  OUT_LIT("#else\n");
+  OUT_LIT("#define PRISM_ATOMIC_INIT(v) = v\n");
+  OUT_LIT("#endif\n\n");
 
   // Reset state
   defer_depth = 0;
@@ -3535,20 +3435,12 @@ static int transpile(char *input_file, char *output_file)
     //          'defer' is registered as a typedef - that's a type name, not keyword
     //          followed by assignment operator - that's a variable assignment, not defer statement
     //          inside __attribute__((...)) - that's a function name, not keyword
-    bool is_defer_assignment = tok->next && (equal(tok->next, "=") || equal(tok->next, "+=") ||
-                                             equal(tok->next, "-=") || equal(tok->next, "*=") ||
-                                             equal(tok->next, "/=") || equal(tok->next, "%=") ||
-                                             equal(tok->next, "&=") || equal(tok->next, "|=") ||
-                                             equal(tok->next, "^=") || equal(tok->next, "<<=") ||
-                                             equal(tok->next, ">>=") || equal(tok->next, "++") ||
-                                             equal(tok->next, "--") || equal(tok->next, "["));
-
     if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "defer") &&
         !equal(tok->next, ":") &&                         // Distinguish defer statement from label named "defer:"
         !(last_emitted && equal(last_emitted, "goto")) && // Distinguish from "goto defer;"
         !is_member_access(last_emitted) && struct_depth == 0 &&
         !(last_emitted && (is_type_keyword(last_emitted) || equal(last_emitted, "typedef"))) &&
-        !is_known_typedef(tok) && !is_defer_assignment &&
+        !is_known_typedef(tok) && !is_assignment_op(tok->next) &&
         !is_inside_attribute(tok))
     {
       // Check for defer inside for/while/switch/if parentheses - this is invalid
@@ -3695,7 +3587,7 @@ static int transpile(char *input_file, char *output_file)
       // If this defer was in a braceless control flow body, emit a semicolon placeholder
       // to prevent syntax errors like: if (x) defer foo(); -> if (x) /* nothing */
       if (in_braceless_control)
-        out_str(";", 1);
+        OUT_LIT(";");
 
       continue;
     }
@@ -3712,11 +3604,11 @@ static int transpile(char *input_file, char *output_file)
         if (equal(tok, ";"))
         {
           // void return: { defers; return; }
-          out_str(" {", 2);
+          OUT_LIT(" {");
           emit_all_defers();
-          out_str(" return;", 8);
+          OUT_LIT(" return;");
           tok = tok->next;
-          out_str(" }", 2);
+          OUT_LIT(" }");
         }
         else
         {
@@ -3730,7 +3622,7 @@ static int transpile(char *input_file, char *output_file)
           {
             // void function: { (expr); defers; return; }
             // The expression is executed for side effects, then we return void
-            out_str(" { (", 4);
+            OUT_LIT(" { (");
             int depth = 0;
             bool expr_at_stmt_start = false;
             Token *prev_tok = NULL;
@@ -3772,12 +3664,12 @@ static int transpile(char *input_file, char *output_file)
               else
                 expr_at_stmt_start = false;
             }
-            out_str(");", 2);
+            OUT_LIT(");");
             emit_all_defers();
-            out_str(" return;", 8);
+            OUT_LIT(" return;");
             if (equal(tok, ";"))
               tok = tok->next;
-            out_str(" }", 2);
+            OUT_LIT(" }");
           }
           else
           {
@@ -3788,9 +3680,9 @@ static int transpile(char *input_file, char *output_file)
             // or use C23's typeof (once widely supported).
             static unsigned long long ret_counter = 0;
             unsigned long long my_ret = ret_counter++;
-            out_str(" { __auto_type _prism_ret_", 26);
+            OUT_LIT(" { __auto_type _prism_ret_");
             out_uint(my_ret);
-            out_str(" = (", 4);
+            OUT_LIT(" = (");
 
             // Emit expression until semicolon (tracking depth for statement-exprs)
             int depth = 0;
@@ -3835,16 +3727,16 @@ static int transpile(char *input_file, char *output_file)
                 expr_at_stmt_start = false;
             }
 
-            out_str(");", 2);
+            OUT_LIT(");");
             emit_all_defers();
-            out_str(" return _prism_ret_", 19);
+            OUT_LIT(" return _prism_ret_");
             out_uint(my_ret);
             out_char(';');
 
             if (equal(tok, ";"))
               tok = tok->next;
 
-            out_str(" }", 2);
+            OUT_LIT(" }");
           }
         }
         end_statement_after_semicolon();
@@ -3859,9 +3751,9 @@ static int transpile(char *input_file, char *output_file)
       mark_switch_control_exit(); // Mark that we exited via break
       if (control_flow_has_defers(true))
       {
-        out_str(" {", 2);
+        OUT_LIT(" {");
         emit_break_defers();
-        out_str(" break; }", 9);
+        OUT_LIT(" break; }");
         tok = tok->next;
         // Skip the semicolon
         if (equal(tok, ";"))
@@ -3878,9 +3770,9 @@ static int transpile(char *input_file, char *output_file)
       mark_switch_control_exit(); // Continue also exits the switch (like break/return/goto)
       if (control_flow_has_defers(false))
       {
-        out_str(" {", 2);
+        OUT_LIT(" {");
         emit_continue_defers();
-        out_str(" continue; }", 12);
+        OUT_LIT(" continue; }");
         tok = tok->next;
         // Skip the semicolon
         if (equal(tok, ";"))
@@ -3949,9 +3841,9 @@ static int transpile(char *input_file, char *output_file)
 
         if (goto_has_defers(target_depth))
         {
-          out_str(" {", 2);
+          OUT_LIT(" {");
           emit_goto_defers(target_depth);
-          out_str(" goto", 5);
+          OUT_LIT(" goto");
           emit_tok(tok); // label name
           tok = tok->next;
           if (equal(tok, ";"))
@@ -3959,7 +3851,7 @@ static int transpile(char *input_file, char *output_file)
             emit_tok(tok);
             tok = tok->next;
           }
-          out_str(" }", 2);
+          OUT_LIT(" }");
           end_statement_after_semicolon();
           continue;
         }
@@ -4081,74 +3973,9 @@ static int transpile(char *input_file, char *output_file)
         if (generic_paren_depth == 0)
         {
           // Look ahead for colon, skipping any attributes
-          Token *t = tok->next;
-          while (t && t->kind != TK_EOF)
-          {
-            // Skip GNU-style attributes: __attribute__((...))
-            if (equal(t, "__attribute__") || equal(t, "__attribute"))
-            {
-              t = t->next;
-              if (t && equal(t, "("))
-              {
-                int depth = 1;
-                t = t->next;
-                while (t && depth > 0)
-                {
-                  if (equal(t, "("))
-                    depth++;
-                  else if (equal(t, ")"))
-                    depth--;
-                  t = t->next;
-                }
-              }
-              continue;
-            }
-            // Skip MSVC-style attributes: __declspec(...)
-            else if (equal(t, "__declspec"))
-            {
-              t = t->next;
-              if (t && equal(t, "("))
-              {
-                int depth = 1;
-                t = t->next;
-                while (t && depth > 0)
-                {
-                  if (equal(t, "("))
-                    depth++;
-                  else if (equal(t, ")"))
-                    depth--;
-                  t = t->next;
-                }
-              }
-              continue;
-            }
-            // Skip C23-style attributes: [[...]]
-            else if (equal(t, "[") && t->next && equal(t->next, "["))
-            {
-              t = t->next->next; // Skip [[
-              int depth = 1;
-              while (t && depth > 0)
-              {
-                if (equal(t, "["))
-                  depth++;
-                else if (equal(t, "]"))
-                  depth--;
-                t = t->next;
-              }
-              continue;
-            }
-            // Found the colon - this is a default label
-            else if (equal(t, ":"))
-            {
-              is_switch_label = true;
-              break;
-            }
-            // Something else - not a default label
-            else
-            {
-              break;
-            }
-          }
+          Token *t = skip_all_attributes(tok->next);
+          if (t && equal(t, ":"))
+            is_switch_label = true;
         }
       }
     }
@@ -4210,25 +4037,14 @@ static int transpile(char *input_file, char *output_file)
       // Must handle: struct name {, struct {, struct __attribute__((...)) name {
       Token *t = tok->next;
       // Skip identifiers and __attribute__((...))
-      while (t && (t->kind == TK_IDENT || equal(t, "__attribute__")))
+      while (t && (t->kind == TK_IDENT || is_attribute_keyword(t)))
       {
-        if (equal(t, "__attribute__"))
+        if (is_attribute_keyword(t))
         {
           t = t->next;
           // Skip (( ... ))
           if (t && equal(t, "("))
-          {
-            int paren_depth = 1;
-            t = t->next;
-            while (t && paren_depth > 0)
-            {
-              if (equal(t, "("))
-                paren_depth++;
-              else if (equal(t, ")"))
-                paren_depth--;
-              t = t->next;
-            }
-          }
+            t = skip_balanced(t, "(", ")");
         }
         else
         {
@@ -5046,56 +4862,30 @@ static const char *get_real_cc(const char *cc)
 #define cli_add_pp_flag(cli, flag) CLI_ARRAY_APPEND(cli, pp_flags, pp_flags_count, pp_flags_capacity, flag, 16)
 #define cli_add_cc_arg(cli, arg) CLI_ARRAY_APPEND(cli, cc_args, cc_arg_count, cc_arg_capacity, arg, 64)
 
+// Check if filename ends with given extension (case-sensitive)
+static inline bool has_extension(const char *filename, const char *ext)
+{
+  size_t flen = strlen(filename);
+  size_t elen = strlen(ext);
+  return flen >= elen && !strcmp(filename + flen - elen, ext);
+}
+
 static bool is_assembly_file(const char *arg)
 {
-  size_t len = strlen(arg);
-  if (len < 2)
-    return false;
-  // .s/.S files (assembly) - should pass through without transpilation
-  return (!strcmp(arg + len - 2, ".s") || !strcmp(arg + len - 2, ".S"));
+  return has_extension(arg, ".s") || has_extension(arg, ".S");
 }
 
 static bool is_cpp_file(const char *arg)
 {
-  size_t len = strlen(arg);
-  if (len < 3)
-    return false;
-
-  // C++ extensions: .cc, .cpp, .cxx, .C, .c++
-  if (len >= 3 && !strcmp(arg + len - 3, ".cc"))
-    return true;
-  if (len >= 4 && !strcmp(arg + len - 4, ".cpp"))
-    return true;
-  if (len >= 4 && !strcmp(arg + len - 4, ".cxx"))
-    return true;
-  if (len >= 4 && !strcmp(arg + len - 4, ".c++"))
-    return true;
-  if (len >= 2 && !strcmp(arg + len - 2, ".C"))
-    return true;
-
-  // Objective-C++: .mm
-  if (len >= 3 && !strcmp(arg + len - 3, ".mm"))
-    return true;
-
-  return false;
+  return has_extension(arg, ".cc") || has_extension(arg, ".cpp") ||
+         has_extension(arg, ".cxx") || has_extension(arg, ".c++") ||
+         has_extension(arg, ".C") || has_extension(arg, ".mm");
 }
 
 static bool is_objc_file(const char *arg)
 {
-  size_t len = strlen(arg);
-  if (len < 2)
-    return false;
-
-  // Objective-C: .m (but not .mm which is Objective-C++)
-  if (len >= 2 && !strcmp(arg + len - 2, ".m"))
-  {
-    // Make sure it's not .mm
-    if (len >= 3 && !strcmp(arg + len - 3, ".mm"))
-      return false;
-    return true;
-  }
-
-  return false;
+  // .m but not .mm (which is C++)
+  return has_extension(arg, ".m") && !has_extension(arg, ".mm");
 }
 
 static bool needs_passthrough(const char *arg)
@@ -5106,22 +4896,8 @@ static bool needs_passthrough(const char *arg)
 
 static bool is_source_file(const char *arg)
 {
-  size_t len = strlen(arg);
-  if (len < 2)
-    return false;
-  // .c files
-  if (len >= 2 && !strcmp(arg + len - 2, ".c"))
-    return true;
-  // .i files (preprocessed)
-  if (len >= 2 && !strcmp(arg + len - 2, ".i"))
-    return true;
-  // .s/.S files (assembly)
-  if (len >= 2 && (!strcmp(arg + len - 2, ".s") || !strcmp(arg + len - 2, ".S")))
-    return true;
-  // C++/Objective-C files (will be passed through without transpilation)
-  if (is_cpp_file(arg) || is_objc_file(arg))
-    return true;
-  return false;
+  return has_extension(arg, ".c") || has_extension(arg, ".i") ||
+         is_assembly_file(arg) || is_cpp_file(arg) || is_objc_file(arg);
 }
 
 static bool str_startswith(const char *s, const char *prefix)

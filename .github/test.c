@@ -2765,7 +2765,7 @@ void test_duffs_device(void)
     // NIGHTMARE: Nested Duff's devices (the horror!)
     int outer = 3;
     int inner_count = 2;
-    int total = 0;
+    int duff_total = 0;
     int outer_n = (outer + 1) / 2;
     switch (outer % 2)
     {
@@ -2779,9 +2779,9 @@ void test_duffs_device(void)
                 case 0:
                     do
                     {
-                        total++;
+                        duff_total++;
                     case 1:
-                        total++;
+                        duff_total++;
                     } while (--inner_n > 0);
                 }
             }
@@ -2793,16 +2793,16 @@ void test_duffs_device(void)
             case 0:
                 do
                 {
-                    total++;
+                    duff_total++;
                 case 1:
-                    total++;
+                    duff_total++;
                 } while (--inner_n > 0);
             }
         }
         } while (--outer_n > 0);
     }
     // This is truly evil nesting - the key is it parses and runs
-    CHECK(total > 0, "nightmare duff: nested devices executed");
+    CHECK(duff_total > 0, "nightmare duff: nested devices executed");
 }
 
 void test_defer_ternary(void)

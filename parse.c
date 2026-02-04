@@ -425,16 +425,6 @@ static void cache_file_view(char *filename, int line_delta, bool is_system, bool
     e->file = file;
 }
 
-// Check if a filename pointer is from the intern map (vs malloc'd independently)
-static bool is_interned_filename(char *name)
-{
-    if (!name)
-        return false;
-    int len = strlen(name);
-    char *found = hashmap_get(&filename_intern_map, name, len);
-    return found == name; // Pointer comparison
-}
-
 static void free_file(File *f)
 {
     if (!f)
@@ -444,8 +434,14 @@ static void free_file(File *f)
     if (f->line_offsets && f->owns_line_offsets)
         free(f->line_offsets);
     // Don't free interned filenames - they're managed by filename_intern_map
-    if (f->name && !is_interned_filename(f->name))
-        free(f->name);
+    // Check by looking up in the intern map (pointer comparison after lookup)
+    if (f->name)
+    {
+        int len = strlen(f->name);
+        char *found = hashmap_get(&filename_intern_map, f->name, len);
+        if (found != f->name) // Not interned, safe to free
+            free(f->name);
+    }
     free(f);
 }
 
@@ -1035,56 +1031,58 @@ static int from_hex(char c)
 }
 
 // Digraph translation table
+// Punctuator entry with precomputed length
 typedef struct
 {
-    char *digraph;
+    const char *str;
     int len;
-    char *equiv;
-} Digraph;
-static Digraph digraphs[] = {
-    {"%:%:", 4, "##"}, // Must come before %:
-    {"<:", 2, "["},
-    {":>", 2, "]"},
-    {"<%", 2, "{"},
-    {"%>", 2, "}"},
-    {"%:", 2, "#"},
-};
+} Punct;
 
 static int read_punct(char *p)
 {
-    // Check for digraphs first
+    // Check for digraphs first (must check %:%: before %:)
+    static Punct digraphs[] = {
+        {"%:%:", 4},
+        {"<:", 2},
+        {":>", 2},
+        {"<%", 2},
+        {"%>", 2},
+        {"%:", 2},
+    };
     for (size_t i = 0; i < sizeof(digraphs) / sizeof(*digraphs); i++)
-        if (!strncmp(p, digraphs[i].digraph, digraphs[i].len))
+        if (!strncmp(p, digraphs[i].str, digraphs[i].len))
             return digraphs[i].len;
 
-    static char *kw[] = {
-        "<<=",
-        ">>=",
-        "...",
-        "==",
-        "!=",
-        "<=",
-        ">=",
-        "->",
-        "+=",
-        "-=",
-        "*=",
-        "/=",
-        "%=",
-        "&=",
-        "|=",
-        "^=",
-        "&&",
-        "||",
-        "++",
-        "--",
-        "<<",
-        ">>",
-        "##",
+    // Multi-character punctuators (longest first within each length)
+    static Punct punct[] = {
+        {"<<=", 3},
+        {">>=", 3},
+        {"...", 3},
+        {"==", 2},
+        {"!=", 2},
+        {"<=", 2},
+        {">=", 2},
+        {"->", 2},
+        {"+=", 2},
+        {"-=", 2},
+        {"*=", 2},
+        {"/=", 2},
+        {"%=", 2},
+        {"&=", 2},
+        {"|=", 2},
+        {"^=", 2},
+        {"&&", 2},
+        {"||", 2},
+        {"++", 2},
+        {"--", 2},
+        {"<<", 2},
+        {">>", 2},
+        {"##", 2},
     };
-    for (size_t i = 0; i < sizeof(kw) / sizeof(*kw); i++)
-        if (!strncmp(p, kw[i], strlen(kw[i])))
-            return strlen(kw[i]);
+    for (size_t i = 0; i < sizeof(punct) / sizeof(*punct); i++)
+        if (!strncmp(p, punct[i].str, punct[i].len))
+            return punct[i].len;
+
     return ispunct(*p) ? 1 : 0;
 }
 
