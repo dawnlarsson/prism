@@ -2994,9 +2994,12 @@ static Token *try_zero_init_decl(Token *tok)
     if (!decl.has_init && !effective_vla && !is_raw)
     {
       // Use = {0} for arrays and aggregates (structs, unions, typedefs)
-      // Use = 0 for scalars (including atomic scalars)
-      // Note: _Atomic can be applied to structs, so check struct/array first
-      if (decl.is_array || ((type.is_struct || type.is_typedef) && !decl.is_pointer))
+      // Use = 0 for scalars (including _Atomic scalars)
+      // Use PRISM_ATOMIC_INIT macro for _Atomic aggregates (GCC vs Clang compat)
+      bool is_aggregate = decl.is_array || ((type.is_struct || type.is_typedef) && !decl.is_pointer);
+      if (type.has_atomic && is_aggregate)
+        out_str(" PRISM_ATOMIC_INIT", 18);
+      else if (is_aggregate)
         out_str(" = {0}", 6);
       else
         out_str(" = 0", 4);
@@ -3219,6 +3222,15 @@ static int transpile(char *input_file, char *output_file)
     return 0;
   }
   out_init(out_fp);
+
+  // Emit compatibility macro for _Atomic aggregate initialization
+  // GCC accepts {0}, Clang doesn't support any initializer syntax
+  out_str("/* Prism: _Atomic aggregate compatibility */\n", 45);
+  out_str("#ifdef __clang__\n", 17);
+  out_str("#define PRISM_ATOMIC_INIT\n", 26);
+  out_str("#else\n", 6);
+  out_str("#define PRISM_ATOMIC_INIT = {0}\n", 32);
+  out_str("#endif\n\n", 8);
 
   // Reset state
   defer_depth = 0;
@@ -4144,11 +4156,11 @@ static int transpile(char *input_file, char *output_file)
   }
 
   out_close();
-  
+
   // Reset tokenizer state for library mode reuse
   // This frees arena blocks and file state, preparing for next transpilation
   tokenizer_reset();
-  
+
   return 1;
 }
 
