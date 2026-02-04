@@ -701,33 +701,33 @@ void test_zeroinit_typeof(void)
 {
     // typeof now gets zero-init via memset (fixed in v0.99.5+)
     // This works for scalars, arrays, and even VLAs
-    
+
     // Test 1: typeof(type) - basic type
     typeof(int) a;
     CHECK_EQ(a, 0, "typeof(int) zero-init");
-    
+
     // Test 2: typeof(expr) - expression
     double pi = 3.14159;
     typeof(pi) b;
     CHECK(b == 0.0, "typeof(expr) zero-init");
-    
+
     // Test 3: __typeof__ variant (GCC extension)
     __typeof__(int) c;
     CHECK_EQ(c, 0, "__typeof__(int) zero-init");
-    
+
     // Test 4: Multi-declarator typeof
     typeof(int) x, y, z;
     CHECK(x == 0 && y == 0 && z == 0, "typeof multi-decl zero-init");
-    
+
     // Test 5: typeof with array element reference
     int arr[4] = {1, 2, 3, 4};
     typeof(arr[0]) elem;
     CHECK_EQ(elem, 0, "typeof(arr[0]) zero-init");
-    
+
     // Test 6: typeof pointer (should use = 0, not memset)
     typeof(int) *ptr;
     CHECK(ptr == NULL, "typeof(int)* pointer zero-init");
-    
+
     // Test 7: typeof with explicit init still works
     typeof(int) init = 42;
     CHECK_EQ(init, 42, "typeof with explicit init");
@@ -754,7 +754,7 @@ void test_typeof_zeroinit_all_basic_types(void)
     typeof(double) d;
     typeof(long double) ld;
     typeof(_Bool) b;
-    
+
     CHECK(c == 0 && sc == 0 && uc == 0, "typeof char types zero-init");
     CHECK(s == 0 && us == 0, "typeof short types zero-init");
     CHECK(i == 0 && ui == 0, "typeof int types zero-init");
@@ -767,41 +767,63 @@ void test_typeof_zeroinit_all_basic_types(void)
 void test_typeof_zeroinit_structs(void)
 {
     // typeof with struct expressions
-    struct { int x; int y; int z; } point = {10, 20, 30};
+    struct
+    {
+        int x;
+        int y;
+        int z;
+    } point = {10, 20, 30};
     typeof(point) pt;
     CHECK(pt.x == 0 && pt.y == 0 && pt.z == 0, "typeof(struct expr) zero-init");
-    
+
     // typeof with nested struct
-    struct { struct { int a; int b; } inner; int outer; } nested = {{1, 2}, 3};
+    struct
+    {
+        struct
+        {
+            int a;
+            int b;
+        } inner;
+        int outer;
+    } nested = {{1, 2}, 3};
     typeof(nested) n;
     CHECK(n.inner.a == 0 && n.inner.b == 0 && n.outer == 0, "typeof(nested struct) zero-init");
-    
+
     // typeof with struct containing array
-    struct { int arr[8]; int count; } container = {{1,2,3,4,5,6,7,8}, 8};
+    struct
+    {
+        int arr[8];
+        int count;
+    } container = {{1, 2, 3, 4, 5, 6, 7, 8}, 8};
     typeof(container) cont;
     int all_zero = 1;
-    for (int i = 0; i < 8; i++) if (cont.arr[i] != 0) all_zero = 0;
+    for (int i = 0; i < 8; i++)
+        if (cont.arr[i] != 0)
+            all_zero = 0;
     CHECK(all_zero && cont.count == 0, "typeof(struct with array) zero-init");
 }
 
 void test_typeof_zeroinit_arrays(void)
 {
     // typeof with fixed-size arrays
-    int arr10[10] = {1,2,3,4,5,6,7,8,9,10};
+    int arr10[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
     typeof(arr10) copy;
     int all_zero = 1;
-    for (int i = 0; i < 10; i++) if (copy[i] != 0) all_zero = 0;
+    for (int i = 0; i < 10; i++)
+        if (copy[i] != 0)
+            all_zero = 0;
     CHECK(all_zero, "typeof(int[10]) array zero-init");
-    
+
     // typeof with 2D array
-    int arr2d[3][4] = {{1,2,3,4},{5,6,7,8},{9,10,11,12}};
+    int arr2d[3][4] = {{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}};
     typeof(arr2d) copy2d;
     all_zero = 1;
     for (int i = 0; i < 3; i++)
         for (int j = 0; j < 4; j++)
-            if (copy2d[i][j] != 0) all_zero = 0;
+            if (copy2d[i][j] != 0)
+                all_zero = 0;
     CHECK(all_zero, "typeof(int[3][4]) 2D array zero-init");
-    
+
     // typeof with char array (string)
     char str[32] = "hello world";
     typeof(str) buf;
@@ -812,18 +834,18 @@ void test_typeof_zeroinit_qualifiers(void)
 {
     // typeof with const expression - use +0 to strip const
     const int ci = 42;
-    typeof(ci + 0) mutable_copy;  // ci+0 is int, not const int
+    typeof(ci + 0) mutable_copy; // ci+0 is int, not const int
     CHECK_EQ(mutable_copy, 0, "typeof(const expr + 0) zero-init");
-    
+
     // typeof with volatile - use +0 to strip volatile
     volatile int vi = 100;
-    typeof(vi + 0) vol_copy;  // vi+0 is int, not volatile int
+    typeof(vi + 0) vol_copy; // vi+0 is int, not volatile int
     CHECK_EQ(vol_copy, 0, "typeof(volatile expr + 0) zero-init");
-    
+
     // typeof with restrict pointer - pointer arithmetic strips restrict
     int dummy = 5;
-    int * restrict rp = &dummy;
-    typeof(rp + 0) rp_copy;  // rp+0 is int*, not int* restrict
+    int *restrict rp = &dummy;
+    typeof(rp + 0) rp_copy; // rp+0 is int*, not int* restrict
     CHECK(rp_copy == NULL, "typeof(restrict ptr + 0) zero-init");
 }
 
@@ -833,29 +855,32 @@ void test_typeof_zeroinit_complex_exprs(void)
     int a = 10, b = 20;
     typeof(a + b) sum;
     CHECK_EQ(sum, 0, "typeof(a + b) zero-init");
-    
+
     // typeof with ternary expression
     typeof(a > b ? a : b) max;
     CHECK_EQ(max, 0, "typeof(ternary) zero-init");
-    
+
     // typeof with cast expression
     typeof((double)a) casted;
     CHECK(casted == 0.0, "typeof((double)a) zero-init");
-    
+
     // typeof with sizeof expression (result is size_t)
     typeof(sizeof(int)) sz;
     CHECK(sz == 0, "typeof(sizeof) zero-init");
-    
+
     // typeof with array subscript
-    int arr[5] = {1,2,3,4,5};
+    int arr[5] = {1, 2, 3, 4, 5};
     typeof(arr[2]) elem;
     CHECK_EQ(elem, 0, "typeof(arr[2]) zero-init");
-    
+
     // typeof with struct member access
-    struct { int val; } s = {99};
+    struct
+    {
+        int val;
+    } s = {99};
     typeof(s.val) member;
     CHECK_EQ(member, 0, "typeof(s.val) zero-init");
-    
+
     // typeof with pointer dereference
     int x = 42;
     int *px = &x;
@@ -869,14 +894,17 @@ void test_typeof_zeroinit_vla(void)
     // memset works because sizeof(vla) is evaluated at runtime
     int n = 5;
     int vla[n];
-    for (int i = 0; i < n; i++) vla[i] = i + 1;
-    
+    for (int i = 0; i < n; i++)
+        vla[i] = i + 1;
+
     typeof(vla) vla_copy;
     int all_zero = 1;
-    for (int i = 0; i < n; i++) if (vla_copy[i] != 0) all_zero = 0;
+    for (int i = 0; i < n; i++)
+        if (vla_copy[i] != 0)
+            all_zero = 0;
     CHECK(all_zero, "typeof(VLA) now gets zero-init via memset");
-    
-    // typeof with VLA in expression  
+
+    // typeof with VLA in expression
     int m = 3;
     int vla2[m];
     typeof(vla2[0]) elem;
@@ -887,12 +915,12 @@ void test_typeof_zeroinit_function_ptrs(void)
 {
     // typeof with function pointer
     int (*fp)(int, int) = NULL;
-    typeof(fp) fp_copy;  // Pointer - should get = 0
+    typeof(fp) fp_copy; // Pointer - should get = 0
     CHECK(fp_copy == NULL, "typeof(func ptr) zero-init");
-    
+
     // typeof with function type via expression
     extern int printf(const char *, ...);
-    typeof(&printf) print_ptr;  // Pointer - should get = 0
+    typeof(&printf) print_ptr; // Pointer - should get = 0
     CHECK(print_ptr == NULL, "typeof(&printf) zero-init");
 }
 
@@ -904,12 +932,16 @@ void test_typeof_zeroinit_multi_decl_complex(void)
     CHECK(b == NULL, "typeof multi-decl: *b zero-init");
     CHECK_EQ(c, 0, "typeof multi-decl: c zero-init");
     CHECK(d == NULL, "typeof multi-decl: **d zero-init");
-    
+
     // Multi-declarator with arrays
     typeof(int) arr1[3], arr2[5];
     int all_zero = 1;
-    for (int i = 0; i < 3; i++) if (arr1[i] != 0) all_zero = 0;
-    for (int i = 0; i < 5; i++) if (arr2[i] != 0) all_zero = 0;
+    for (int i = 0; i < 3; i++)
+        if (arr1[i] != 0)
+            all_zero = 0;
+    for (int i = 0; i < 5; i++)
+        if (arr2[i] != 0)
+            all_zero = 0;
     CHECK(all_zero, "typeof multi-decl arrays zero-init");
 }
 
@@ -924,27 +956,31 @@ void test_typeof_zeroinit_in_scopes(void)
             }
         }
     }
-    
+
     // typeof in loop body
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 3; i++)
+    {
         typeof(int) loop_var;
         CHECK_EQ(loop_var, 0, "typeof in for loop");
     }
-    
+
     // typeof in if body
-    if (1) {
+    if (1)
+    {
         typeof(double) cond_var;
         CHECK(cond_var == 0.0, "typeof in if body");
     }
-    
+
     // typeof in switch case
     int sel = 1;
-    switch (sel) {
-        case 1: {
-            typeof(int) case_var;
-            CHECK_EQ(case_var, 0, "typeof in switch case");
-            break;
-        }
+    switch (sel)
+    {
+    case 1:
+    {
+        typeof(int) case_var;
+        CHECK_EQ(case_var, 0, "typeof in switch case");
+        break;
+    }
     }
 }
 
@@ -958,12 +994,12 @@ void test_typeof_zeroinit_with_defer(void)
         CHECK_EQ(val, 0, "typeof with defer: value zero-init");
     }
     CHECK_EQ(cleanup_ran, 1, "typeof with defer: defer ran");
-    
+
     // typeof in defer expression
     int counter = 0;
     {
         typeof(counter) local;
-        defer counter = local + 1;  // Uses zero-init value
+        defer counter = local + 1; // Uses zero-init value
     }
     CHECK_EQ(counter, 1, "typeof in defer expression");
 }
@@ -971,12 +1007,25 @@ void test_typeof_zeroinit_with_defer(void)
 void test_typeof_zeroinit_unions(void)
 {
     // typeof with union
-    union { int i; float f; char c[4]; } u = {.i = 0x12345678};
+    union
+    {
+        int i;
+        float f;
+        char c[4];
+    } u = {.i = 0x12345678};
     typeof(u) u_copy;
     CHECK(u_copy.i == 0, "typeof(union) zero-init");
-    
+
     // typeof with anonymous union member
-    struct { union { int a; float b; }; int c; } mixed = {.a = 99, .c = 100};
+    struct
+    {
+        union
+        {
+            int a;
+            float b;
+        };
+        int c;
+    } mixed = {.a = 99, .c = 100};
     typeof(mixed) m_copy;
     CHECK(m_copy.a == 0 && m_copy.c == 0, "typeof(struct with anon union) zero-init");
 }
@@ -988,21 +1037,21 @@ void test_typeof_zeroinit_edge_cases(void)
     typeof(x) y;
     typeof(y) z;
     CHECK_EQ(z, 0, "typeof(typeof(x)) zero-init");
-    
+
     // typeof with parenthesized expression
     int val = 5;
     typeof((((val)))) paren;
     CHECK_EQ(paren, 0, "typeof((((val)))) zero-init");
-    
+
     // typeof with comma operator (takes type of last)
     int a = 1, b = 2;
     typeof((a, b)) comma;
     CHECK_EQ(comma, 0, "typeof((a, b)) comma expr zero-init");
-    
+
     // typeof with compound literal
     typeof((int){42}) compound;
     CHECK_EQ(compound, 0, "typeof(compound literal) zero-init");
-    
+
     // typeof with _Alignof result
     typeof(_Alignof(double)) align_val;
     CHECK(align_val == 0, "typeof(_Alignof) zero-init");
@@ -1014,24 +1063,35 @@ void test_typeof_zeroinit_torture_stress(void)
     typeof(int) v0, v1, v2, v3, v4, v5, v6, v7, v8, v9;
     typeof(int) v10, v11, v12, v13, v14, v15, v16, v17, v18, v19;
     int all_zero = 1;
-    if (v0 != 0 || v1 != 0 || v2 != 0 || v3 != 0 || v4 != 0) all_zero = 0;
-    if (v5 != 0 || v6 != 0 || v7 != 0 || v8 != 0 || v9 != 0) all_zero = 0;
-    if (v10 != 0 || v11 != 0 || v12 != 0 || v13 != 0 || v14 != 0) all_zero = 0;
-    if (v15 != 0 || v16 != 0 || v17 != 0 || v18 != 0 || v19 != 0) all_zero = 0;
+    if (v0 != 0 || v1 != 0 || v2 != 0 || v3 != 0 || v4 != 0)
+        all_zero = 0;
+    if (v5 != 0 || v6 != 0 || v7 != 0 || v8 != 0 || v9 != 0)
+        all_zero = 0;
+    if (v10 != 0 || v11 != 0 || v12 != 0 || v13 != 0 || v14 != 0)
+        all_zero = 0;
+    if (v15 != 0 || v16 != 0 || v17 != 0 || v18 != 0 || v19 != 0)
+        all_zero = 0;
     CHECK(all_zero, "20 typeof vars in sequence all zero-init");
-    
+
     // Large struct via typeof
-    struct { 
+    struct
+    {
         int arr[100];
         double values[50];
         char buffer[256];
     } big = {0};
-    big.arr[0] = 1;  // Make it non-zero
+    big.arr[0] = 1; // Make it non-zero
     typeof(big) big_copy;
     all_zero = 1;
-    for (int i = 0; i < 100; i++) if (big_copy.arr[i] != 0) all_zero = 0;
-    for (int i = 0; i < 50; i++) if (big_copy.values[i] != 0.0) all_zero = 0;
-    for (int i = 0; i < 256; i++) if (big_copy.buffer[i] != 0) all_zero = 0;
+    for (int i = 0; i < 100; i++)
+        if (big_copy.arr[i] != 0)
+            all_zero = 0;
+    for (int i = 0; i < 50; i++)
+        if (big_copy.values[i] != 0.0)
+            all_zero = 0;
+    for (int i = 0; i < 256; i++)
+        if (big_copy.buffer[i] != 0)
+            all_zero = 0;
     CHECK(all_zero, "large struct via typeof all zero-init");
 }
 
@@ -1096,31 +1156,34 @@ void test_zeroinit_torture_declarators(void)
     // Pointer to array of function pointers returning pointer to int
     int *(*(*pafp)[5])(void);
     CHECK(pafp == NULL, "torture: ptr->arr[5]->func()->ptr");
-    
+
     // Array of pointers to functions returning arrays of pointers
     int *(*(*afpa[3])(int))[4];
     int all_null = 1;
-    for (int i = 0; i < 3; i++) if (afpa[i] != NULL) all_null = 0;
+    for (int i = 0; i < 3; i++)
+        if (afpa[i] != NULL)
+            all_null = 0;
     CHECK(all_null, "torture: arr[3]->func->arr[4]->ptr");
-    
+
     // Triple pointer to const volatile int
     const volatile int ***cvipp;
     CHECK(cvipp == NULL, "torture: const volatile int***");
-    
+
     // Function pointer returning function pointer
     int (*(*fp_fp)(int))(char);
     CHECK(fp_fp == NULL, "torture: func->func");
-    
+
     // Pointer to array of arrays of function pointers
-    void (*(*(*paafp)[3][4])(int, int));
+    void(*(*(*paafp)[3][4])(int, int));
     CHECK(paafp == NULL, "torture: ptr->arr[3][4]->func");
-    
+
     // Array of pointers to pointers to function pointers
     int (**(*appfp[2][3]))(void);
     all_null = 1;
     for (int i = 0; i < 2; i++)
         for (int j = 0; j < 3; j++)
-            if (appfp[i][j] != NULL) all_null = 0;
+            if (appfp[i][j] != NULL)
+                all_null = 0;
     CHECK(all_null, "torture: arr[2][3]->ptr->ptr->func");
 }
 
@@ -1130,31 +1193,33 @@ void test_zeroinit_torture_attributes(void)
     // __attribute__ before type
     __attribute__((unused)) int attr_before;
     CHECK_EQ(attr_before, 0, "torture: __attribute__ before type");
-    
+
     // __attribute__ after type
     int __attribute__((unused)) attr_after;
     CHECK_EQ(attr_after, 0, "torture: __attribute__ after type");
-    
+
     // __attribute__ after declarator
     int attr_decl __attribute__((unused));
     CHECK_EQ(attr_decl, 0, "torture: __attribute__ after declarator");
-    
+
     // Multiple __attribute__
     __attribute__((unused)) __attribute__((aligned(8))) int multi_attr;
     CHECK_EQ(multi_attr, 0, "torture: multiple __attribute__");
-    
+
     // __attribute__ with pointer
-    int * __attribute__((unused)) attr_ptr;
+    int *__attribute__((unused)) attr_ptr;
     CHECK(attr_ptr == NULL, "torture: __attribute__ with pointer");
-    
+
     // __attribute__ in multi-decl
     int __attribute__((unused)) ma1, __attribute__((unused)) ma2;
     CHECK(ma1 == 0 && ma2 == 0, "torture: __attribute__ multi-decl");
-    
+
     // Aligned array
     __attribute__((aligned(64))) int aligned_arr[16];
     int all_zero = 1;
-    for (int i = 0; i < 16; i++) if (aligned_arr[i] != 0) all_zero = 0;
+    for (int i = 0; i < 16; i++)
+        if (aligned_arr[i] != 0)
+            all_zero = 0;
     CHECK(all_zero, "torture: aligned array");
 }
 
@@ -1165,25 +1230,25 @@ void test_zeroinit_torture_partial_init(void)
     int a, b = 1, c, d = 2, e, f = 3, g;
     CHECK(a == 0 && b == 1 && c == 0 && d == 2 && e == 0 && f == 3 && g == 0,
           "torture: alternating init pattern");
-    
+
     // First init, rest no-init
     int first = 99, second, third, fourth, fifth;
     CHECK(first == 99 && second == 0 && third == 0 && fourth == 0 && fifth == 0,
           "torture: first init only");
-    
+
     // Last init, rest no-init
     int p1, p2, p3, p4, p5 = 88;
     CHECK(p1 == 0 && p2 == 0 && p3 == 0 && p4 == 0 && p5 == 88,
           "torture: last init only");
-    
+
     // Mixed pointers with partial init
     int *ptr1, *ptr2 = NULL, *ptr3, val1 = 7, val2, *ptr4;
-    CHECK(ptr1 == NULL && ptr2 == NULL && ptr3 == NULL && 
-          val1 == 7 && val2 == 0 && ptr4 == NULL,
+    CHECK(ptr1 == NULL && ptr2 == NULL && ptr3 == NULL &&
+              val1 == 7 && val2 == 0 && ptr4 == NULL,
           "torture: mixed ptr/val partial init");
-    
+
     // Array with expression init next to uninit scalars
-    int x, arr[3] = {1,2,3}, y;
+    int x, arr[3] = {1, 2, 3}, y;
     CHECK(x == 0 && arr[0] == 1 && arr[1] == 2 && arr[2] == 3 && y == 0,
           "torture: uninit around array init");
 }
@@ -1194,18 +1259,18 @@ void test_zeroinit_torture_stmt_expr(void)
 {
     // Declaration in statement expression
     int result = ({
-        int inner;  // Should be zero-init
+        int inner; // Should be zero-init
         inner + 10;
     });
     CHECK_EQ(result, 10, "torture: zero-init in stmt expr");
-    
+
     // Multiple declarations in statement expression
     int result2 = ({
         int a, b, c;
         a + b + c + 5;
     });
     CHECK_EQ(result2, 5, "torture: multi-decl in stmt expr");
-    
+
     // Nested statement expressions
     int result3 = ({
         int outer;
@@ -1216,7 +1281,7 @@ void test_zeroinit_torture_stmt_expr(void)
         outer + inner_val;
     });
     CHECK_EQ(result3, 1, "torture: nested stmt expr zero-init");
-    
+
     // Statement expression in array size - GCC treats as VLA, so Prism
     // intentionally skips zero-init (VLAs can't have initializers in C).
     // Just verify it compiles without error.
@@ -1229,28 +1294,61 @@ void test_zeroinit_torture_stmt_expr(void)
 // TORTURE: Extreme scope nesting
 void test_zeroinit_torture_deep_nesting(void)
 {
-    {{{{{{{{{{{  // 11 levels deep
-        int deep_var;
-        CHECK_EQ(deep_var, 0, "torture: 11 levels deep");
-    }}}}}}}}}}}
-    
+    {
+        {
+            {
+                {
+                    {
+                        {
+                            {
+                                {
+                                    {
+                                        {
+                                            { // 11 levels deep
+                                                int deep_var;
+                                                CHECK_EQ(deep_var, 0, "torture: 11 levels deep");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Variable in each nesting level
     int v0;
-    { int v1;
-      { int v2;
-        { int v3;
-          { int v4;
-            { int v5;
-              CHECK(v0 == 0 && v1 == 0 && v2 == 0 && v3 == 0 && v4 == 0 && v5 == 0,
-                    "torture: var per nesting level");
+    {
+        int v1;
+        {
+            int v2;
+            {
+                int v3;
+                {
+                    int v4;
+                    {
+                        int v5;
+                        CHECK(v0 == 0 && v1 == 0 && v2 == 0 && v3 == 0 && v4 == 0 && v5 == 0,
+                              "torture: var per nesting level");
+                    }
+                }
             }
-          }
         }
-      }
     }
-    
+
     // Declaration after nested block
-    { { { { int inner; } } } }
+    {
+        {
+            {
+                {
+                    int inner;
+                }
+            }
+        }
+    }
     int after_nested;
     CHECK_EQ(after_nested, 0, "torture: after deeply nested block");
 }
@@ -1258,7 +1356,8 @@ void test_zeroinit_torture_deep_nesting(void)
 // TORTURE: Bit-fields with zero-init
 void test_zeroinit_torture_bitfields(void)
 {
-    struct {
+    struct
+    {
         unsigned int a : 1;
         unsigned int b : 3;
         unsigned int c : 12;
@@ -1266,9 +1365,10 @@ void test_zeroinit_torture_bitfields(void)
     } bits;
     CHECK(bits.a == 0 && bits.b == 0 && bits.c == 0 && bits.d == 0,
           "torture: basic bit-fields");
-    
+
     // Mixed bit-fields and regular fields
-    struct {
+    struct
+    {
         int regular1;
         unsigned int bf1 : 4;
         unsigned int bf2 : 4;
@@ -1277,11 +1377,12 @@ void test_zeroinit_torture_bitfields(void)
         int *ptr;
     } mixed_bf;
     CHECK(mixed_bf.regular1 == 0 && mixed_bf.bf1 == 0 && mixed_bf.bf2 == 0 &&
-          mixed_bf.regular2 == 0 && mixed_bf.bf3 == 0 && mixed_bf.ptr == NULL,
+              mixed_bf.regular2 == 0 && mixed_bf.bf3 == 0 && mixed_bf.ptr == NULL,
           "torture: mixed bit-fields and regular");
-    
+
     // Bit-field spanning all bits
-    struct {
+    struct
+    {
         unsigned long long full : 64;
     } full_bf;
     CHECK(full_bf.full == 0, "torture: 64-bit bit-field");
@@ -1291,27 +1392,45 @@ void test_zeroinit_torture_bitfields(void)
 void test_zeroinit_torture_anonymous(void)
 {
     // Anonymous struct in struct
-    struct {
+    struct
+    {
         int before;
-        struct { int x, y, z; };  // anonymous
+        struct
+        {
+            int x, y, z;
+        }; // anonymous
         int after;
     } anon_struct;
     CHECK(anon_struct.before == 0 && anon_struct.x == 0 && anon_struct.y == 0 &&
-          anon_struct.z == 0 && anon_struct.after == 0,
+              anon_struct.z == 0 && anon_struct.after == 0,
           "torture: anonymous struct");
-    
+
     // Anonymous union in struct
-    struct {
+    struct
+    {
         int tag;
-        union { int i; float f; char c[4]; };  // anonymous
+        union
+        {
+            int i;
+            float f;
+            char c[4];
+        }; // anonymous
     } anon_union;
     CHECK(anon_union.tag == 0 && anon_union.i == 0, "torture: anonymous union");
-    
+
     // Nested anonymous
-    struct {
-        union {
-            struct { int a, b; };
-            struct { float x, y; };
+    struct
+    {
+        union
+        {
+            struct
+            {
+                int a, b;
+            };
+            struct
+            {
+                float x, y;
+            };
         };
         int z;
     } nested_anon;
@@ -1328,9 +1447,12 @@ void test_zeroinit_torture_compound_literals(void)
     int after_cl;
     CHECK(before_cl == 0 && after_cl == 0, "torture: around compound literal");
     CHECK(cl_ptr[0] == 1 && cl_ptr[1] == 2 && cl_ptr[2] == 3, "torture: compound literal values");
-    
+
     // Struct compound literal context - use named type to avoid mismatch
-    typedef struct { int x, y; } Point;
+    typedef struct
+    {
+        int x, y;
+    } Point;
     Point s_before;
     Point *sp = &(Point){10, 20};
     Point s_after;
@@ -1343,12 +1465,22 @@ void test_zeroinit_torture_compound_literals(void)
 void test_zeroinit_torture_fam_adjacent(void)
 {
     // Can't have FAM itself uninitialized, but test structs around it
-    struct HasFAM { int count; int data[]; };
-    
-    struct { int x, y; } before_fam;
-    struct HasFAM *fam_ptr;  // Pointer to FAM struct
-    struct { int a, b; } after_fam;
-    
+    struct HasFAM
+    {
+        int count;
+        int data[];
+    };
+
+    struct
+    {
+        int x, y;
+    } before_fam;
+    struct HasFAM *fam_ptr; // Pointer to FAM struct
+    struct
+    {
+        int a, b;
+    } after_fam;
+
     CHECK(before_fam.x == 0 && before_fam.y == 0, "torture: before FAM pointer");
     CHECK(fam_ptr == NULL, "torture: FAM pointer");
     CHECK(after_fam.a == 0 && after_fam.b == 0, "torture: after FAM pointer");
@@ -1361,16 +1493,24 @@ void test_zeroinit_torture_long_multidecl(void)
         v10, v11, v12, v13, v14, v15, v16, v17, v18, v19,
         v20, v21, v22, v23, v24, v25, v26, v27, v28, v29,
         v30, v31;
-    
+
     int all_zero = 1;
-    if (v00 != 0 || v01 != 0 || v02 != 0 || v03 != 0) all_zero = 0;
-    if (v04 != 0 || v05 != 0 || v06 != 0 || v07 != 0) all_zero = 0;
-    if (v08 != 0 || v09 != 0 || v10 != 0 || v11 != 0) all_zero = 0;
-    if (v12 != 0 || v13 != 0 || v14 != 0 || v15 != 0) all_zero = 0;
-    if (v16 != 0 || v17 != 0 || v18 != 0 || v19 != 0) all_zero = 0;
-    if (v20 != 0 || v21 != 0 || v22 != 0 || v23 != 0) all_zero = 0;
-    if (v24 != 0 || v25 != 0 || v26 != 0 || v27 != 0) all_zero = 0;
-    if (v28 != 0 || v29 != 0 || v30 != 0 || v31 != 0) all_zero = 0;
+    if (v00 != 0 || v01 != 0 || v02 != 0 || v03 != 0)
+        all_zero = 0;
+    if (v04 != 0 || v05 != 0 || v06 != 0 || v07 != 0)
+        all_zero = 0;
+    if (v08 != 0 || v09 != 0 || v10 != 0 || v11 != 0)
+        all_zero = 0;
+    if (v12 != 0 || v13 != 0 || v14 != 0 || v15 != 0)
+        all_zero = 0;
+    if (v16 != 0 || v17 != 0 || v18 != 0 || v19 != 0)
+        all_zero = 0;
+    if (v20 != 0 || v21 != 0 || v22 != 0 || v23 != 0)
+        all_zero = 0;
+    if (v24 != 0 || v25 != 0 || v26 != 0 || v27 != 0)
+        all_zero = 0;
+    if (v28 != 0 || v29 != 0 || v30 != 0 || v31 != 0)
+        all_zero = 0;
     CHECK(all_zero, "torture: 32-variable multi-decl");
 }
 
@@ -1378,41 +1518,57 @@ void test_zeroinit_torture_long_multidecl(void)
 void test_zeroinit_torture_control_flow(void)
 {
     // After if-else chain
-    if (0) { }
-    else if (0) { }
-    else { }
+    if (0)
+    {
+    }
+    else if (0)
+    {
+    }
+    else
+    {
+    }
     int after_if_chain;
     CHECK_EQ(after_if_chain, 0, "torture: after if-else chain");
-    
+
     // Between switch cases (inside scope)
     int sel = 1;
-    switch (sel) {
-        case 0: break;
-        case 1: {
-            int in_case1;
-            CHECK_EQ(in_case1, 0, "torture: in switch case");
-            break;
-        }
-        default: break;
+    switch (sel)
+    {
+    case 0:
+        break;
+    case 1:
+    {
+        int in_case1;
+        CHECK_EQ(in_case1, 0, "torture: in switch case");
+        break;
     }
-    
+    default:
+        break;
+    }
+
     // After switch
     int after_switch;
     CHECK_EQ(after_switch, 0, "torture: after switch");
-    
+
     // After for loop
-    for (int i = 0; i < 1; i++) { }
+    for (int i = 0; i < 1; i++)
+    {
+    }
     int after_for;
     CHECK_EQ(after_for, 0, "torture: after for loop");
-    
+
     // After while loop
     int cond = 0;
-    while (cond) { }
+    while (cond)
+    {
+    }
     int after_while;
     CHECK_EQ(after_while, 0, "torture: after while loop");
-    
+
     // After do-while
-    do { } while (0);
+    do
+    {
+    } while (0);
     int after_do;
     CHECK_EQ(after_do, 0, "torture: after do-while");
 }
@@ -1421,17 +1577,64 @@ void test_zeroinit_torture_control_flow(void)
 void test_zeroinit_torture_stress(void)
 {
     // 50 sequential declarations of different types
-    char c1; char c2; char c3; char c4; char c5;
-    short s1; short s2; short s3; short s4; short s5;
-    int i1; int i2; int i3; int i4; int i5;
-    long l1; long l2; long l3; long l4; long l5;
-    float f1; float f2; float f3; float f4; float f5;
-    double d1; double d2; double d3; double d4; double d5;
-    int *p1; int *p2; int *p3; int *p4; int *p5;
-    void *v1; void *v2; void *v3; void *v4; void *v5;
-    char arr1[4]; char arr2[4]; char arr3[4]; char arr4[4]; char arr5[4];
-    struct { int x; } st1; struct { int x; } st2; struct { int x; } st3;
-    
+    char c1;
+    char c2;
+    char c3;
+    char c4;
+    char c5;
+    short s1;
+    short s2;
+    short s3;
+    short s4;
+    short s5;
+    int i1;
+    int i2;
+    int i3;
+    int i4;
+    int i5;
+    long l1;
+    long l2;
+    long l3;
+    long l4;
+    long l5;
+    float f1;
+    float f2;
+    float f3;
+    float f4;
+    float f5;
+    double d1;
+    double d2;
+    double d3;
+    double d4;
+    double d5;
+    int *p1;
+    int *p2;
+    int *p3;
+    int *p4;
+    int *p5;
+    void *v1;
+    void *v2;
+    void *v3;
+    void *v4;
+    void *v5;
+    char arr1[4];
+    char arr2[4];
+    char arr3[4];
+    char arr4[4];
+    char arr5[4];
+    struct
+    {
+        int x;
+    } st1;
+    struct
+    {
+        int x;
+    } st2;
+    struct
+    {
+        int x;
+    } st3;
+
     CHECK(c1 == 0 && c2 == 0 && c3 == 0 && c4 == 0 && c5 == 0, "torture stress: chars");
     CHECK(s1 == 0 && s2 == 0 && s3 == 0 && s4 == 0 && s5 == 0, "torture stress: shorts");
     CHECK(i1 == 0 && i2 == 0 && i3 == 0 && i4 == 0 && i5 == 0, "torture stress: ints");
@@ -1448,21 +1651,21 @@ void test_zeroinit_torture_stress(void)
 void test_zeroinit_torture_with_defer(void)
 {
     int cleanup_order = 0;
-    
+
     {
-        int a, b, c;  // All zero-init
+        int a, b, c; // All zero-init
         defer cleanup_order |= 1;
-        int d, e, f;  // All zero-init
+        int d, e, f; // All zero-init
         defer cleanup_order |= 2;
-        int g, h, i;  // All zero-init
+        int g, h, i; // All zero-init
         defer cleanup_order |= 4;
-        
+
         CHECK(a == 0 && b == 0 && c == 0, "torture defer: a,b,c zero");
         CHECK(d == 0 && e == 0 && f == 0, "torture defer: d,e,f zero");
         CHECK(g == 0 && h == 0 && i == 0, "torture defer: g,h,i zero");
     }
     CHECK(cleanup_order == 7, "torture defer: all defers ran");
-    
+
     // Zero-init in defer target scope
     int final_value = 0;
     {
@@ -1480,12 +1683,12 @@ void test_zeroinit_torture_atomic(void)
     _Atomic(int **) atomic_pp;
     int **pp_val = atomic_load(&atomic_pp);
     CHECK(pp_val == NULL, "torture: _Atomic(int**)");
-    
+
     // _Atomic function pointer
     _Atomic(int (*)(void)) atomic_fp;
     int (*fp_val)(void) = atomic_load(&atomic_fp);
     CHECK(fp_val == NULL, "torture: _Atomic func ptr");
-    
+
     // _Atomic in multi-decl
     _Atomic int a1, a2, a3;
     CHECK(atomic_load(&a1) == 0 && atomic_load(&a2) == 0 && atomic_load(&a3) == 0,
@@ -5989,6 +6192,40 @@ void test_vanishing_statement_for(void)
     CHECK_LOG("for_deferdone", "defer with braces in for loop works");
 }
 
+void test_defer_label(void)
+{
+    log_reset();
+    goto defer;
+    log_append("skipped");
+defer:
+    log_append("label_reached");
+    CHECK_LOG("label_reached", "label named 'defer' works correctly");
+}
+
+void test_generic_default_first_association(void)
+{
+    log_reset();
+    int x = 42;
+
+    switch (x)
+    {
+    case 42:
+    {
+        defer log_append("cleanup");
+
+        // Edge case: _Generic with default as FIRST (and only) association
+        // "default" is NOT preceded by comma - only by the controlling expression
+        int result = _Generic(x, default: 100);
+
+        log_append("body");
+        break;
+    }
+    }
+
+    log_append("end");
+    CHECK_LOG("bodycleanupend", "_Generic(v, default: x) doesn't clear defer stack");
+}
+
 // Bug 2: _Generic default collision with switch defer cleanup
 // Currently FAILS: Prism incorrectly thinks "_Generic(..., default:...)" is a case label
 void test_generic_default_collision(void)
@@ -6993,12 +7230,14 @@ void test_typeof_vla_zeroinit(void)
     // copy_vla is a VLA type via typeof
     // Prism now zero-inits VLAs via memset (sizeof works at runtime)
     __typeof__(vla1) copy_vla;
-    
+
     // Verify zero-init worked
     int all_zero = 1;
-    for (int i = 0; i < n; i++) if (copy_vla[i] != 0) all_zero = 0;
+    for (int i = 0; i < n; i++)
+        if (copy_vla[i] != 0)
+            all_zero = 0;
     CHECK(all_zero, "typeof(VLA) now gets zero-init via memset");
-    
+
     // Can still assign after
     copy_vla[0] = 99;
     CHECK(copy_vla[0] == 99, "typeof(VLA) assignment after zero-init works");
@@ -7880,6 +8119,8 @@ void run_verification_bug_tests(void)
 
     test_attributed_label_defer();
 
+    test_defer_label();
+    test_generic_default_first_association();
     test_generic_default_collision();
     test_generic_default_collision_nested();
     test_generic_default_outside_switch();

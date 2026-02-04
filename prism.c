@@ -205,6 +205,7 @@ static bool control_parens_just_closed = false; // True immediately after contro
 static bool in_for_init = false;                // True when inside the init clause of a for loop (before first ;)
 static bool pending_for_paren = false;          // True after seeing 'for', waiting for '(' to start init clause
 static int conditional_block_depth = 0;         // Track nesting depth of if/while/for blocks to detect conditional control exits
+static int generic_paren_depth = 0;             // Track parens inside _Generic(...) to distinguish default: from switch labels
 
 static LabelTable label_table;
 static bool current_func_returns_void = false;
@@ -1238,7 +1239,8 @@ static void scan_labels_in_function(Token *tok)
     // Check for label: identifier followed by ':' (but not ::)
     // Also handle labels with attributes: identifier __attribute__((...)) :
     // Filter out: ternary operator, switch cases, bitfields
-    if (tok->kind == TK_IDENT)
+    // Also handle 'defer' keyword used as a label (defer:) - valid if user isn't using defer feature
+    if (tok->kind == TK_IDENT || (tok->kind == TK_KEYWORD && equal(tok, "defer")))
     {
       // Look ahead for colon, skipping any __attribute__((...)) sequences
       Token *t = tok->next;
@@ -1443,7 +1445,9 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
                                          equal(tok->next, ">>=") || equal(tok->next, "++") ||
                                          equal(tok->next, "--") || equal(tok->next, "["));
 
+      // Check for defer statement (not a label named "defer:")
       if (tok->kind == TK_KEYWORD && equal(tok, "defer") &&
+          !equal(tok->next, ":") && // Distinguish from label named "defer:"
           !is_member_access(prev) && !is_variable_name && !is_assignment)
       {
         if (!active_item || depth <= active_item_depth)
@@ -3162,7 +3166,7 @@ static Token *try_zero_init_decl(Token *tok)
 
   // Track variables that need memset for typeof zero-init
   // (We can't use = 0 because typeof might be an array/VLA type)
-  Token *typeof_vars[32];  // Variable name tokens needing memset
+  Token *typeof_vars[32]; // Variable name tokens needing memset
   int typeof_var_count = 0;
 
   // Process each declarator
@@ -3456,6 +3460,7 @@ static int transpile(char *input_file, char *output_file)
   in_for_init = false;
   pending_for_paren = false;
   conditional_block_depth = 0;
+  generic_paren_depth = 0;
   current_func_returns_void = false;
   stmt_expr_count = 0;
   at_stmt_start = true;  // Start of file is start of statement
@@ -3539,6 +3544,8 @@ static int transpile(char *input_file, char *output_file)
                                              equal(tok->next, "--") || equal(tok->next, "["));
 
     if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "defer") &&
+        !equal(tok->next, ":") &&                         // Distinguish defer statement from label named "defer:"
+        !(last_emitted && equal(last_emitted, "goto")) && // Distinguish from "goto defer;"
         !is_member_access(last_emitted) && struct_depth == 0 &&
         !(last_emitted && (is_type_keyword(last_emitted) || equal(last_emitted, "typedef"))) &&
         !is_known_typedef(tok) && !is_defer_assignment &&
@@ -3907,8 +3914,11 @@ static int transpile(char *input_file, char *output_file)
         continue;
       }
 
-      // Get the label name
-      if (tok->kind == TK_IDENT)
+      // Get the label name - can be an identifier or a keyword used as label (like 'defer')
+      // Keywords like 'defer' can be used as labels if followed by ':'
+      bool is_label_target = (tok->kind == TK_IDENT) ||
+                             (tok->kind == TK_KEYWORD && equal(tok, "defer"));
+      if (is_label_target)
       {
         // Check if this goto would skip over a defer statement
         Token *skipped = goto_skips_check(goto_tok, tok->loc, tok->len, GOTO_CHECK_DEFER);
@@ -3954,9 +3964,9 @@ static int transpile(char *input_file, char *output_file)
           continue;
         }
       }
-      // No defers or couldn't parse, emit normally
+      // No defers or couldn't parse, emit goto and let normal loop emit the rest
       emit_tok(goto_tok);
-      continue;
+      // Don't continue - let normal token processing handle the label name
     }
 
     // Check goto for zeroinit safety even when defer is disabled
@@ -3964,7 +3974,10 @@ static int transpile(char *input_file, char *output_file)
     {
       Token *goto_tok = tok;
       tok = tok->next;
-      if (tok->kind == TK_IDENT)
+      // Handle keyword labels like 'defer' used as goto target
+      bool is_label_target2 = (tok->kind == TK_IDENT) ||
+                              (tok->kind == TK_KEYWORD && equal(tok, "defer"));
+      if (is_label_target2)
       {
         Token *skipped_decl = goto_skips_check(goto_tok, tok->loc, tok->len, GOTO_CHECK_DECL);
         if (skipped_decl)
@@ -4006,6 +4019,33 @@ static int transpile(char *input_file, char *output_file)
       pending_for_paren = true;
     }
 
+    if (tok->kind == TK_KEYWORD && equal(tok, "_Generic") && generic_paren_depth == 0)
+    {
+      // Emit the _Generic token and look for the opening paren
+      emit_tok(tok);
+      last_emitted = tok;
+      tok = tok->next;
+      if (tok && equal(tok, "("))
+      {
+        generic_paren_depth = 1;
+        emit_tok(tok);
+        last_emitted = tok;
+        tok = tok->next;
+      }
+      continue;
+    }
+    // Track parentheses inside _Generic
+    if (generic_paren_depth > 0)
+    {
+      if (equal(tok, "("))
+        generic_paren_depth++;
+      else if (equal(tok, ")"))
+      {
+        generic_paren_depth--;
+        // When we exit the _Generic entirely, depth goes to 0
+      }
+    }
+
     // Mark switch keyword
     if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "switch"))
     {
@@ -4025,9 +4065,9 @@ static int transpile(char *input_file, char *output_file)
     // Handle case/default labels - clear defers from switch scope
     // This prevents defers from leaking across cases (which would cause incorrect behavior
     // since the transpiler can't know which case is entered at runtime)
-    // IMPORTANT: Only treat "default" as a switch label if NOT preceded by comma
+    // IMPORTANT: Only treat "default" as a switch label if NOT inside _Generic(...)
     // This prevents false positives from _Generic: _Generic(x, int: 1, default: 2)
-    // In _Generic, "default" is preceded by ",", but switch "default:" is preceded by other tokens
+    // Also handles edge case: _Generic(v, default: 0) where default is NOT preceded by comma
     bool is_switch_label = false;
     if (feature_defer && tok->kind == TK_KEYWORD)
     {
@@ -4037,8 +4077,8 @@ static int transpile(char *input_file, char *output_file)
       {
         // "default" could be followed by ":" or by attributes then ":"
         // Example: default __attribute__((unused)): or default [[fallthrough]]:
-        // Check if preceded by comma (indicates _Generic expression)
-        if (!last_emitted || !equal(last_emitted, ","))
+        // Skip if we're inside _Generic(...) - detected by generic_paren_depth > 0
+        if (generic_paren_depth == 0)
         {
           // Look ahead for colon, skipping any attributes
           Token *t = tok->next;
