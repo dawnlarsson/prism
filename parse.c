@@ -1375,6 +1375,8 @@ static File *new_file_view(const char *name, File *base, int line_delta, bool is
     // Cache this file view
     cache_file_view(interned_name, line_delta, is_system, is_include_entry, file);
 
+    add_input_file(file);
+
     return file;
 }
 
@@ -1462,7 +1464,6 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
     int line_delta = (int)new_line - (directive_line + 1);
     File *view = new_file_view(filename ? filename : current_file->name,
                                base_file, line_delta, is_system, *in_system_include);
-    add_input_file(view);
     current_file = view;
     free(filename);
 

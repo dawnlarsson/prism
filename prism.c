@@ -3208,12 +3208,16 @@ static int transpile(char *input_file, char *output_file)
   if (!tok)
   {
     fprintf(stderr, "Failed to tokenize preprocessed output\n");
+    tokenizer_reset(); // Clean up tokenizer state on error
     return 0;
   }
 
   FILE *out_fp = fopen(output_file, "w");
   if (!out_fp)
+  {
+    tokenizer_reset(); // Clean up tokenizer state on error
     return 0;
+  }
   out_init(out_fp);
 
   // Reset state
@@ -4140,6 +4144,11 @@ static int transpile(char *input_file, char *output_file)
   }
 
   out_close();
+  
+  // Reset tokenizer state for library mode reuse
+  // This frees arena blocks and file state, preparing for next transpilation
+  tokenizer_reset();
+  
   return 1;
 }
 
