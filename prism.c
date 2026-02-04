@@ -1557,12 +1557,24 @@ static bool is_void_function_decl(Token *tok)
 static Token *scan_typedef_base_type(Token *tok)
 {
   // Skip qualifiers: const, volatile, restrict, _Atomic
+  // Handle _Atomic(type) specifier form specially
   while (tok && (equal(tok, "const") || equal(tok, "volatile") ||
                  equal(tok, "restrict") || equal(tok, "_Atomic") ||
                  equal(tok, "__const") || equal(tok, "__const__") ||
                  equal(tok, "__volatile") || equal(tok, "__volatile__") ||
                  equal(tok, "__restrict") || equal(tok, "__restrict__")))
-    tok = tok->next;
+  {
+    // Handle _Atomic(type) specifier form - skip the parenthesized type
+    if (equal(tok, "_Atomic") && tok->next && equal(tok->next, "("))
+    {
+      tok = tok->next; // Skip _Atomic
+      tok = skip_balanced(tok, "(", ")"); // Skip (type)
+    }
+    else
+    {
+      tok = tok->next;
+    }
+  }
 
   // Skip attributes
   tok = skip_attributes(tok);
