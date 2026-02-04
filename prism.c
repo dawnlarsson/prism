@@ -4,7 +4,7 @@
 #ifndef _DARWIN_C_SOURCE
 #define _DARWIN_C_SOURCE
 #endif
-#define PRISM_VERSION "0.99.2"
+#define PRISM_VERSION "0.99.3"
 
 #include "parse.c"
 
@@ -2480,8 +2480,15 @@ static TypeSpecResult parse_type_specifier(Token *tok)
     {
       r.saw_type = true;
       r.has_atomic = true;
-      tok = tok->next;
+      tok = tok->next;                // Move past _Atomic
+      Token *inner_start = tok->next; // Start of inner type (after '(')
       tok = skip_balanced(tok, "(", ")");
+      // Check if inner type is struct/union/enum
+      if (inner_start && is_sue_keyword(inner_start))
+        r.is_struct = true;
+      // Also check for typedef'd types inside _Atomic(...)
+      if (inner_start && inner_start->kind == TK_IDENT && is_known_typedef(inner_start))
+        r.is_typedef = true;
       r.end = tok;
       continue;
     }
@@ -2986,9 +2993,10 @@ static Token *try_zero_init_decl(Token *tok)
     // Add zero initializer if needed
     if (!decl.has_init && !effective_vla && !is_raw)
     {
-      if (type.has_atomic)
-        out_str(" = 0", 4);
-      else if (decl.is_array || ((type.is_struct || type.is_typedef) && !decl.is_pointer))
+      // Use = {0} for arrays and aggregates (structs, unions, typedefs)
+      // Use = 0 for scalars (including atomic scalars)
+      // Note: _Atomic can be applied to structs, so check struct/array first
+      if (decl.is_array || ((type.is_struct || type.is_typedef) && !decl.is_pointer))
         out_str(" = {0}", 6);
       else
         out_str(" = 0", 4);

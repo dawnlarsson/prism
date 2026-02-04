@@ -3764,6 +3764,290 @@ void test_atomic_specifier_form(void)
     CHECK(d == NULL, "_Atomic(int*) zero-init");
 }
 
+void test_atomic_struct_basic(void)
+{
+    struct AtomicPoint
+    {
+        int x;
+        int y;
+    };
+    _Atomic struct AtomicPoint p;
+    CHECK(p.x == 0 && p.y == 0, "_Atomic struct basic zero-init");
+}
+
+void test_atomic_union_basic(void)
+{
+    union AtomicUnion
+    {
+        int i;
+        float f;
+    };
+    _Atomic union AtomicUnion u;
+    CHECK(u.i == 0, "_Atomic union basic zero-init");
+}
+
+void test_atomic_struct_nested(void)
+{
+    struct Inner
+    {
+        int a;
+        int b;
+    };
+    struct Outer
+    {
+        struct Inner inner;
+        int c;
+    };
+    _Atomic struct Outer o;
+    CHECK(o.inner.a == 0 && o.inner.b == 0 && o.c == 0, "_Atomic nested struct zero-init");
+}
+
+void test_atomic_struct_with_array(void)
+{
+    struct WithArray
+    {
+        int arr[4];
+        int x;
+    };
+    _Atomic struct WithArray wa;
+    CHECK(wa.arr[0] == 0 && wa.arr[3] == 0 && wa.x == 0, "_Atomic struct with array member");
+}
+
+void test_atomic_struct_with_pointer(void)
+{
+    struct WithPtr
+    {
+        int *p;
+        int x;
+    };
+    _Atomic struct WithPtr wp;
+    CHECK(wp.p == NULL && wp.x == 0, "_Atomic struct with pointer member");
+}
+
+void test_atomic_struct_specifier_form(void)
+{
+    struct SpecPoint
+    {
+        int x;
+        int y;
+    };
+    _Atomic(struct SpecPoint) sp;
+    CHECK(sp.x == 0 && sp.y == 0, "_Atomic(struct) specifier form");
+}
+
+void test_atomic_union_specifier_form(void)
+{
+    union SpecUnion
+    {
+        int i;
+        double d;
+    };
+    _Atomic(union SpecUnion) su;
+    CHECK(su.i == 0, "_Atomic(union) specifier form");
+}
+
+void test_atomic_struct_multi_decl(void)
+{
+    struct MultiPoint
+    {
+        int x;
+        int y;
+    };
+    _Atomic struct MultiPoint p1, p2, p3;
+    CHECK(p1.x == 0 && p1.y == 0, "_Atomic struct multi-decl p1");
+    CHECK(p2.x == 0 && p2.y == 0, "_Atomic struct multi-decl p2");
+    CHECK(p3.x == 0 && p3.y == 0, "_Atomic struct multi-decl p3");
+}
+
+void test_atomic_struct_pointer(void)
+{
+    struct PtrPoint
+    {
+        int x;
+        int y;
+    };
+    _Atomic struct PtrPoint *ptr;
+    CHECK(ptr == NULL, "_Atomic struct pointer uses = 0");
+}
+
+void test_atomic_struct_volatile(void)
+{
+    struct VolPoint
+    {
+        int x;
+        int y;
+    };
+    volatile _Atomic struct VolPoint vp;
+    CHECK(vp.x == 0 && vp.y == 0, "volatile _Atomic struct zero-init");
+}
+
+void test_atomic_struct_const(void)
+{
+    struct ConstPoint
+    {
+        int x;
+        int y;
+    };
+    // const _Atomic requires explicit initializer, just test it compiles
+    const _Atomic struct ConstPoint cp = {0};
+    CHECK(cp.x == 0 && cp.y == 0, "const _Atomic struct with explicit init");
+}
+
+void test_atomic_anonymous_struct(void)
+{
+    _Atomic struct
+    {
+        int x;
+        int y;
+    } anon;
+    CHECK(anon.x == 0 && anon.y == 0, "_Atomic anonymous struct zero-init");
+}
+
+void test_atomic_union_different_sizes(void)
+{
+    union MixedSizes
+    {
+        char c;
+        int i;
+        long long ll;
+    };
+    _Atomic union MixedSizes ms;
+    CHECK(ms.ll == 0, "_Atomic union different sizes zero-init");
+}
+
+void test_atomic_struct_in_loop(void)
+{
+    struct LoopPoint
+    {
+        int x;
+        int y;
+    };
+    for (int i = 0; i < 3; i++)
+    {
+        _Atomic struct LoopPoint lp;
+        CHECK(lp.x == 0 && lp.y == 0, "_Atomic struct in loop iteration");
+        lp.x = i; // Modify to ensure next iteration re-inits
+    }
+}
+
+void test_atomic_struct_nested_blocks(void)
+{
+    struct BlockPoint
+    {
+        int x;
+        int y;
+    };
+    {
+        _Atomic struct BlockPoint bp1;
+        CHECK(bp1.x == 0, "_Atomic struct outer block");
+        {
+            _Atomic struct BlockPoint bp2;
+            CHECK(bp2.x == 0, "_Atomic struct inner block");
+        }
+    }
+}
+
+void test_atomic_struct_with_defer(void)
+{
+    struct DeferPoint
+    {
+        int x;
+        int y;
+    };
+    int check_val = 0;
+    {
+        defer check_val = 1;
+        _Atomic struct DeferPoint dp;
+        CHECK(dp.x == 0 && dp.y == 0, "_Atomic struct with defer");
+    }
+    CHECK(check_val == 1, "_Atomic struct defer executed");
+}
+
+void test_atomic_scalar_contrast(void)
+{
+    _Atomic int ai;
+    _Atomic long al;
+    _Atomic char ac;
+    _Atomic double ad;
+    CHECK(ai == 0, "_Atomic int still uses = 0");
+    CHECK(al == 0, "_Atomic long still uses = 0");
+    CHECK(ac == 0, "_Atomic char still uses = 0");
+    CHECK(ad == 0.0, "_Atomic double still uses = 0");
+}
+
+void test_atomic_typedef_struct(void)
+{
+    typedef struct
+    {
+        int x;
+        int y;
+    } TPoint;
+    _Atomic TPoint tp;
+    CHECK(tp.x == 0 && tp.y == 0, "_Atomic typedef'd struct");
+}
+
+void test_atomic_typedef_atomic(void)
+{
+    typedef _Atomic struct
+    {
+        int x;
+        int y;
+    } AtomicTPoint;
+    AtomicTPoint atp;
+    CHECK(atp.x == 0 && atp.y == 0, "typedef _Atomic struct");
+}
+
+void test_atomic_struct_bitfields(void)
+{
+    struct BitFields
+    {
+        unsigned a : 4;
+        unsigned b : 4;
+        unsigned c : 8;
+    };
+    _Atomic struct BitFields bf;
+    CHECK(bf.a == 0 && bf.b == 0 && bf.c == 0, "_Atomic struct with bitfields");
+}
+
+void test_raw_atomic_struct(void)
+{
+    struct RawPoint
+    {
+        int x;
+        int y;
+    };
+    raw _Atomic struct RawPoint rp;
+    rp.x = 42;
+    rp.y = 99;
+    CHECK(rp.x == 42 && rp.y == 99, "raw _Atomic struct skips zero-init");
+}
+
+void run_atomic_aggregate_torture_tests(void)
+{
+    printf("\n=== _ATOMIC AGGREGATE TORTURE TESTS ===\n");
+    test_atomic_struct_basic();
+    test_atomic_union_basic();
+    test_atomic_struct_nested();
+    test_atomic_struct_with_array();
+    test_atomic_struct_with_pointer();
+    test_atomic_struct_specifier_form();
+    test_atomic_union_specifier_form();
+    test_atomic_struct_multi_decl();
+    test_atomic_struct_pointer();
+    test_atomic_struct_volatile();
+    test_atomic_struct_const();
+    test_atomic_anonymous_struct();
+    test_atomic_union_different_sizes();
+    test_atomic_struct_in_loop();
+    test_atomic_struct_nested_blocks();
+    test_atomic_struct_with_defer();
+    test_atomic_scalar_contrast();
+    test_atomic_typedef_struct();
+    test_atomic_typedef_atomic();
+    test_atomic_struct_bitfields();
+    test_raw_atomic_struct();
+}
+
 // HOLE #1: Switch scope leak - variable before first case
 // Previously: The zero-init "= 0" was added but switch jumped over it!
 // NOW FIXED: Prism errors on declarations before first case label.
@@ -3952,6 +4236,7 @@ void run_rigor_tests(void)
     test_ptr_to_vla_typedef(5);
     test_vla_side_effect_once();
     test_atomic_specifier_form();
+    run_atomic_aggregate_torture_tests();
 
     test_switch_scope_leak();
     test_sizeof_shadows_type();
