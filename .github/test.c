@@ -3764,6 +3764,10 @@ void test_atomic_specifier_form(void)
     CHECK(d == NULL, "_Atomic(int*) zero-init");
 }
 
+// Clang doesn't support _Atomic aggregate initialization or member access
+// These tests only run on GCC
+#ifndef __clang__
+
 void test_atomic_struct_basic(void)
 {
     struct AtomicPoint
@@ -4048,6 +4052,8 @@ void run_atomic_aggregate_torture_tests(void)
     test_raw_atomic_struct();
 }
 
+#endif // __clang__
+
 // HOLE #1: Switch scope leak - variable before first case
 // Previously: The zero-init "= 0" was added but switch jumped over it!
 // NOW FIXED: Prism errors on declarations before first case label.
@@ -4236,7 +4242,9 @@ void run_rigor_tests(void)
     test_ptr_to_vla_typedef(5);
     test_vla_side_effect_once();
     test_atomic_specifier_form();
+#ifndef __clang__
     run_atomic_aggregate_torture_tests();
+#endif
 
     test_switch_scope_leak();
     test_sizeof_shadows_type();
