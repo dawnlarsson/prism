@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.98.3"
+#define PRISM_VERSION "0.98.4"
 
 #include "parse.c"
 
@@ -903,8 +903,9 @@ static void typedef_pop_scope(int scope_depth)
   }
 }
 
-// Forward declaration for parse_enum_constants
+// Forward declarations
 static bool is_known_typedef(Token *tok);
+static bool is_type_keyword(Token *tok);
 
 // Parse enum body and register constants as shadows for any matching typedefs.
 // Enum constants are visible in the enclosing scope, so they shadow typedefs.
@@ -1219,9 +1220,28 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
   int active_item_depth = -1; // Depth at which active_item was found
   Token *prev = NULL;
   bool at_stmt_start = true; // Only needed for DECL mode
+  bool in_for_init = false;  // Track if we're in for loop initialization clause
 
   while (tok && tok->kind != TK_EOF)
   {
+    // Track for loops to detect declarations in initialization clause
+    if (mode == GOTO_CHECK_DECL && tok->kind == TK_KEYWORD && equal(tok, "for"))
+    {
+      prev = tok;
+      tok = tok->next;
+      if (tok && equal(tok, "("))
+      {
+        // We're entering the for loop initialization
+        in_for_init = true;
+        prev = tok;
+        tok = tok->next;
+        at_stmt_start = true; // Treat start of for init as statement start
+        continue;
+      }
+      at_stmt_start = false;
+      continue;
+    }
+
     // Track struct/union/enum bodies to skip bitfield declarations
     if (is_sue_keyword(tok))
     {
@@ -1271,6 +1291,9 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
     if (equal(tok, ";"))
     {
       at_stmt_start = true;
+      // If we're in for loop init, semicolon ends the init clause
+      if (in_for_init)
+        in_for_init = false;
       prev = tok;
       tok = tok->next;
       continue;
@@ -1294,7 +1317,25 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
     if (mode == GOTO_CHECK_DEFER)
     {
       // Track defers we pass over (skip if preceded by member access)
-      if (tok->kind == TK_KEYWORD && equal(tok, "defer") && !is_member_access(prev))
+      // Also skip if this is a variable declaration: "int defer;" not "defer stmt;"
+      // Check if preceded by a type keyword - if so, it's a variable name, not defer statement
+      bool is_variable_name = prev && (is_type_keyword(prev) || equal(prev, "*") ||
+                                       equal(prev, "const") || equal(prev, "volatile") ||
+                                       equal(prev, "restrict") || equal(prev, "__restrict") ||
+                                       equal(prev, ",")); // Also check comma for multi-declarators
+
+      // Also check if followed by assignment operator - that's a variable, not defer statement
+      // Examples: defer = 1; defer += 1; defer++; etc.
+      bool is_assignment = tok->next && (equal(tok->next, "=") || equal(tok->next, "+=") ||
+                                         equal(tok->next, "-=") || equal(tok->next, "*=") ||
+                                         equal(tok->next, "/=") || equal(tok->next, "%=") ||
+                                         equal(tok->next, "&=") || equal(tok->next, "|=") ||
+                                         equal(tok->next, "^=") || equal(tok->next, "<<=") ||
+                                         equal(tok->next, ">>=") || equal(tok->next, "++") ||
+                                         equal(tok->next, "--") || equal(tok->next, "["));
+
+      if (tok->kind == TK_KEYWORD && equal(tok, "defer") &&
+          !is_member_access(prev) && !is_variable_name && !is_assignment)
       {
         if (!active_item || depth <= active_item_depth)
         {
@@ -1303,15 +1344,20 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
         }
       }
     }
-    else if (mode == GOTO_CHECK_DECL && at_stmt_start && local_struct_depth == 0)
+    else if (mode == GOTO_CHECK_DECL && (at_stmt_start || in_for_init) && local_struct_depth == 0)
     {
-      // Detect variable declarations at statement start
+      // Detect variable declarations at statement start OR in for loop initialization
       Token *decl_start = tok;
       Token *t = tok;
 
-      // Skip 'raw' keyword if present
+      // Check for 'raw' keyword - if present, skip checking this declaration
+      // The 'raw' keyword explicitly opts out of zero-init, so jumping over it is allowed
+      bool has_raw = false;
       if (equal(t, "raw"))
+      {
+        has_raw = true;
         t = t->next;
+      }
 
       // Skip extern/typedef - these don't create initialized variables
       if (!equal(t, "extern") && !equal(t, "typedef"))
@@ -1367,7 +1413,9 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
           // Should be at identifier now - and NOT followed by '(' (that's a function)
           if (t && t->kind == TK_IDENT && t->next && !equal(t->next, "("))
           {
-            if (!active_item || depth <= active_item_depth)
+            // Only track as active_item if NOT marked with 'raw'
+            // 'raw' explicitly opts out of zero-init, so jumping over it is safe
+            if (!has_raw && (!active_item || depth <= active_item_depth))
             {
               active_item = decl_start;
               active_item_depth = depth;
@@ -2746,16 +2794,25 @@ static Token *try_zero_init_decl(Token *tok)
 
   // Check for 'raw' keyword - skip zero-init for this declaration
   bool is_raw = false;
+  Token *raw_tok = NULL;
   if (equal(tok, "raw"))
   {
     is_raw = true;
+    raw_tok = tok; // Remember the raw token position
     tok = tok->next;
     start = tok;
     decl_start_for_warning = tok;
   }
 
   if (is_skip_decl_keyword(tok))
+  {
+    // If we saw 'raw' but are bailing out, we need to skip emitting 'raw' in output
+    // Return raw_tok->next to indicate that 'raw' should be consumed
+    // But wait - returning non-NULL means we handled it, which we didn't
+    // So return NULL but somehow signal that 'raw' was consumed...
+    // Actually, this is tricky. Let me use a different approach.
     return NULL;
+  }
 
   // Parse type specifier
   TypeSpecResult type = parse_type_specifier(tok);
@@ -3136,12 +3193,26 @@ static int transpile(char *input_file, char *output_file)
     // Also allow in the init clause of a for loop: for (int i; ...)
     if (at_stmt_start && (!pending_control_flow || in_for_init))
     {
-      Token *next = try_zero_init_decl(tok);
+      // Special handling for 'raw' keyword to prevent it leaking into output
+      // BUT: if 'raw' is a typedef, don't treat it as the keyword
+      bool has_raw_prefix = equal(tok, "raw") && !is_known_typedef(tok);
+      Token *try_tok = has_raw_prefix ? tok->next : tok;
+
+      Token *next = try_zero_init_decl(try_tok);
       if (next)
       {
+        // Successfully handled - if there was 'raw', it's been processed
         tok = next;
         at_stmt_start = true; // Still at statement start after decl
         continue;
+      }
+
+      // try_zero_init_decl returned NULL (didn't handle it)
+      // If we had 'raw' prefix, we must skip it to prevent emission
+      if (has_raw_prefix)
+      {
+        tok = tok->next; // Skip 'raw' token
+        // Don't set at_stmt_start to false yet - we might still be at statement start
       }
     }
     at_stmt_start = false;
@@ -3173,10 +3244,19 @@ static int transpile(char *input_file, char *output_file)
     //          inside struct/union/enum body - that's a field declaration, not keyword
     //          preceded by a type keyword - that's a variable/typedef name, not keyword
     //          'defer' is registered as a typedef - that's a type name, not keyword
+    //          followed by assignment operator - that's a variable assignment, not defer statement
+    bool is_defer_assignment = tok->next && (equal(tok->next, "=") || equal(tok->next, "+=") ||
+                                             equal(tok->next, "-=") || equal(tok->next, "*=") ||
+                                             equal(tok->next, "/=") || equal(tok->next, "%=") ||
+                                             equal(tok->next, "&=") || equal(tok->next, "|=") ||
+                                             equal(tok->next, "^=") || equal(tok->next, "<<=") ||
+                                             equal(tok->next, ">>=") || equal(tok->next, "++") ||
+                                             equal(tok->next, "--") || equal(tok->next, "["));
+
     if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "defer") &&
         !is_member_access(last_emitted) && struct_depth == 0 &&
         !(last_emitted && (is_type_keyword(last_emitted) || equal(last_emitted, "typedef"))) &&
-        !is_known_typedef(tok))
+        !is_known_typedef(tok) && !is_defer_assignment)
     {
       // Check for defer inside for/while/switch/if parentheses - this is invalid
       if (pending_control_flow && control_paren_depth > 0)
@@ -3378,13 +3458,20 @@ static int transpile(char *input_file, char *output_file)
               // Try zero-init for declarations at statement start within the expression
               if (expr_at_stmt_start && feature_zeroinit)
               {
-                Token *next = try_zero_init_decl(tok);
+                bool has_raw_prefix = equal(tok, "raw") && !is_known_typedef(tok);
+                Token *try_tok = has_raw_prefix ? tok->next : tok;
+
+                Token *next = try_zero_init_decl(try_tok);
                 if (next)
                 {
                   tok = next;
                   expr_at_stmt_start = true;
                   continue;
                 }
+
+                if (has_raw_prefix)
+                  tok = tok->next; // Skip 'raw' to prevent emission
+
                 expr_at_stmt_start = false;
               }
 
@@ -3439,13 +3526,20 @@ static int transpile(char *input_file, char *output_file)
               // Try zero-init for declarations at statement start within the expression
               if (expr_at_stmt_start && feature_zeroinit)
               {
-                Token *next = try_zero_init_decl(tok);
+                bool has_raw_prefix = equal(tok, "raw") && !is_known_typedef(tok);
+                Token *try_tok = has_raw_prefix ? tok->next : tok;
+
+                Token *next = try_zero_init_decl(try_tok);
                 if (next)
                 {
                   tok = next;
                   expr_at_stmt_start = true;
                   continue;
                 }
+
+                if (has_raw_prefix)
+                  tok = tok->next; // Skip 'raw' to prevent emission
+
                 expr_at_stmt_start = false;
               }
 
@@ -3656,12 +3750,64 @@ static int transpile(char *input_file, char *output_file)
     {
       if (equal(tok, "case"))
         is_switch_label = true;
-      else if (equal(tok, "default") && tok->next && equal(tok->next, ":"))
+      else if (equal(tok, "default"))
       {
-        // "default" followed by ":" - could be switch label or _Generic
+        // "default" could be followed by ":" or by attributes then ":"
+        // Example: default __attribute__((unused)): or default [[fallthrough]]:
         // Check if preceded by comma (indicates _Generic expression)
         if (!last_emitted || !equal(last_emitted, ","))
-          is_switch_label = true;
+        {
+          // Look ahead for colon, skipping any attributes
+          Token *t = tok->next;
+          while (t && t->kind != TK_EOF)
+          {
+            // Skip GNU-style attributes: __attribute__((...))
+            if (equal(t, "__attribute__") || equal(t, "__attribute"))
+            {
+              t = t->next;
+              if (t && equal(t, "("))
+              {
+                int depth = 1;
+                t = t->next;
+                while (t && depth > 0)
+                {
+                  if (equal(t, "("))
+                    depth++;
+                  else if (equal(t, ")"))
+                    depth--;
+                  t = t->next;
+                }
+              }
+              continue;
+            }
+            // Skip C23-style attributes: [[...]]
+            else if (equal(t, "[") && t->next && equal(t->next, "["))
+            {
+              t = t->next->next; // Skip [[
+              int depth = 1;
+              while (t && depth > 0)
+              {
+                if (equal(t, "["))
+                  depth++;
+                else if (equal(t, "]"))
+                  depth--;
+                t = t->next;
+              }
+              continue;
+            }
+            // Found the colon - this is a default label
+            else if (equal(t, ":"))
+            {
+              is_switch_label = true;
+              break;
+            }
+            // Something else - not a default label
+            else
+            {
+              break;
+            }
+          }
+        }
       }
     }
 
