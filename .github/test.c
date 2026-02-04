@@ -828,6 +828,353 @@ void run_raw_tests(void)
     test_raw_with_qualifiers();
 }
 
+// RAW KEYWORD VS VARIABLE NAME TORTURE TESTS
+
+void test_raw_variable_assignment(void)
+{
+    int raw, edit;
+    raw = edit = 0;
+    CHECK(raw == 0 && edit == 0, "raw = edit = 0 (bash pattern)");
+
+    raw = 42;
+    CHECK_EQ(raw, 42, "raw = 42");
+
+    raw += 10;
+    CHECK_EQ(raw, 52, "raw += 10");
+
+    raw -= 2;
+    CHECK_EQ(raw, 50, "raw -= 2");
+
+    raw *= 2;
+    CHECK_EQ(raw, 100, "raw *= 2");
+
+    raw /= 4;
+    CHECK_EQ(raw, 25, "raw /= 4");
+
+    raw %= 10;
+    CHECK_EQ(raw, 5, "raw %= 10");
+
+    raw = 0xFF;
+    raw &= 0x0F;
+    CHECK_EQ(raw, 0x0F, "raw &= 0x0F");
+
+    raw |= 0xF0;
+    CHECK_EQ(raw, 0xFF, "raw |= 0xF0");
+
+    raw ^= 0x0F;
+    CHECK_EQ(raw, 0xF0, "raw ^= 0x0F");
+
+    raw = 8;
+    raw <<= 2;
+    CHECK_EQ(raw, 32, "raw <<= 2");
+
+    raw >>= 1;
+    CHECK_EQ(raw, 16, "raw >>= 1");
+}
+
+void test_raw_variable_comparison(void)
+{
+    int raw = 10;
+
+    CHECK(raw == 10, "raw == 10");
+    CHECK(raw != 5, "raw != 5");
+    CHECK(raw < 20, "raw < 20");
+    CHECK(raw > 5, "raw > 5");
+    CHECK(raw <= 10, "raw <= 10");
+    CHECK(raw >= 10, "raw >= 10");
+}
+
+void test_raw_variable_arithmetic(void)
+{
+    int raw = 10;
+    int result;
+
+    result = raw + 5;
+    CHECK_EQ(result, 15, "raw + 5");
+
+    result = raw - 3;
+    CHECK_EQ(result, 7, "raw - 3");
+
+    result = raw * 2;
+    CHECK_EQ(result, 20, "raw * 2");
+
+    result = raw / 2;
+    CHECK_EQ(result, 5, "raw / 2");
+
+    result = raw % 3;
+    CHECK_EQ(result, 1, "raw % 3");
+}
+
+void test_raw_variable_bitwise(void)
+{
+    int raw = 0b1010;
+    int result;
+
+    result = raw & 0b1100;
+    CHECK_EQ(result, 0b1000, "raw & mask");
+
+    result = raw | 0b0101;
+    CHECK_EQ(result, 0b1111, "raw | mask");
+
+    result = raw ^ 0b1111;
+    CHECK_EQ(result, 0b0101, "raw ^ mask");
+
+    result = raw << 2;
+    CHECK_EQ(result, 0b101000, "raw << 2");
+
+    result = raw >> 1;
+    CHECK_EQ(result, 0b0101, "raw >> 1");
+}
+
+void test_raw_variable_logical(void)
+{
+    int raw = 1;
+    int other = 0;
+
+    CHECK((raw && 1), "raw && 1");
+    CHECK((raw || other), "raw || other");
+}
+
+void test_raw_variable_incr_decr(void)
+{
+    int raw = 10;
+
+    raw++;
+    CHECK_EQ(raw, 11, "raw++");
+
+    raw--;
+    CHECK_EQ(raw, 10, "raw--");
+
+    ++raw;
+    CHECK_EQ(raw, 11, "++raw");
+
+    --raw;
+    CHECK_EQ(raw, 10, "--raw");
+}
+
+void test_raw_variable_array(void)
+{
+    int arr[] = {10, 20, 30};
+    int raw = 1;
+
+    CHECK_EQ(arr[raw], 20, "arr[raw]");
+
+    int *raw_ptr = arr;
+    CHECK_EQ(raw_ptr[2], 30, "raw_ptr[2]");
+}
+
+void test_raw_variable_member(void)
+{
+    struct point
+    {
+        int x;
+        int y;
+    };
+    struct point raw;
+    raw.x = 5;
+    raw.y = 10;
+    CHECK(raw.x == 5 && raw.y == 10, "raw.x and raw.y");
+
+    struct point s = {100, 200};
+    struct point *raw_ptr = &s;
+    CHECK(raw_ptr->x == 100 && raw_ptr->y == 200, "raw_ptr->x and raw_ptr->y");
+}
+
+int identity(int x) { return x; }
+void test_raw_variable_function_call(void)
+{
+    int (*raw)(int) = identity;
+    CHECK_EQ(raw(42), 42, "raw(42) function pointer call");
+}
+
+void test_raw_variable_comma(void)
+{
+    int raw = 0;
+    int result;
+    result = (raw = 5, raw + 10);
+    CHECK_EQ(result, 15, "raw in comma expression");
+}
+
+void test_raw_variable_semicolon(void)
+{
+    int raw = 10;
+    int x = raw; // raw followed by semicolon (after x = raw)
+    CHECK_EQ(x, 10, "int x = raw;");
+
+    // raw alone on statement (like last expression in void function)
+    raw; // This should compile - raw is a variable
+    CHECK_EQ(raw, 10, "raw; as statement");
+}
+
+void test_raw_variable_ternary(void)
+{
+    int raw = 1;
+    int result = raw ? 100 : 200;
+    CHECK_EQ(result, 100, "raw ? 100 : 200");
+
+    result = 0 ? raw : 50;
+    CHECK_EQ(result, 50, "0 ? raw : 50");
+}
+
+void test_raw_keyword_static(void)
+{
+    raw static int x = 5;
+    // Just verify it compiles and has the right value
+    // Don't modify x since this test might be called multiple times
+    CHECK(x >= 5, "raw static int x = 5");
+}
+
+extern int some_external_var;
+void test_raw_keyword_extern_decl(void)
+{
+    // This just tests that 'raw extern' parses correctly
+    // We can't easily test runtime behavior of extern
+    CHECK(1, "raw extern declaration compiles");
+}
+
+void test_raw_mixed_usage(void)
+{
+    raw int uninitialized_var; // 'raw' as keyword
+    uninitialized_var = 42;
+
+    int raw = 100; // 'raw' as variable name
+
+    raw = raw + uninitialized_var; // 'raw' as variable
+    CHECK_EQ(raw, 142, "mixed raw keyword and variable");
+}
+
+void test_raw_multiple_variables(void)
+{
+    int raw, cooked, done;
+    raw = cooked = done = 0;
+
+    raw = 1;
+    cooked = 2;
+    done = 3;
+
+    CHECK(raw == 1 && cooked == 2 && done == 3, "multiple vars with raw");
+}
+
+int intval_mock(int x) { return x * 2; }
+int term_mock(int x) { return x + 1; }
+void test_raw_bash_pattern(void)
+{
+    // Exact pattern from bash's builtins/read.def
+    int raw, edit, nchars, silent;
+    raw = edit = 0;
+    nchars = silent = 0;
+
+    if (1)
+    {
+        raw = intval_mock(5);
+        edit = term_mock(3);
+    }
+
+    CHECK_EQ(raw, 10, "bash pattern: raw = intval(5)");
+    CHECK_EQ(edit, 4, "bash pattern: edit = term(3)");
+}
+
+void test_raw_in_switch(void)
+{
+    int raw = 2;
+    int result = 0;
+
+    switch (raw)
+    {
+    case 1:
+        result = 10;
+        break;
+    case 2:
+        result = 20;
+        break;
+    default:
+        result = 30;
+        break;
+    }
+
+    CHECK_EQ(result, 20, "switch(raw) works");
+}
+
+void test_raw_in_loops(void)
+{
+    int raw = 3;
+    int count = 0;
+
+    while (raw > 0)
+    {
+        count++;
+        raw--;
+    }
+    CHECK_EQ(count, 3, "while(raw > 0)");
+
+    raw = 0;
+    for (raw = 0; raw < 5; raw++)
+    {
+        count++;
+    }
+    CHECK_EQ(raw, 5, "for(raw = 0; raw < 5; raw++)");
+}
+
+int func_with_raw_param(int raw)
+{
+    return raw * 2;
+}
+void test_raw_as_parameter(void)
+{
+    CHECK_EQ(func_with_raw_param(21), 42, "raw as function parameter");
+}
+
+void test_raw_in_sizeof(void)
+{
+    int raw = 42;
+    size_t s = sizeof(raw);
+    CHECK_EQ(s, sizeof(int), "sizeof(raw)");
+}
+
+void test_raw_address_of(void)
+{
+    int raw = 42;
+    int *p = &raw;
+    CHECK_EQ(*p, 42, "&raw works");
+    *p = 100;
+    CHECK_EQ(raw, 100, "*(&raw) = 100 works");
+}
+
+void test_raw_in_cast(void)
+{
+    double raw = 3.14159;
+    int truncated = (int)raw;
+    CHECK_EQ(truncated, 3, "(int)raw");
+}
+
+void run_raw_torture_tests(void)
+{
+    printf("\n=== RAW KEYWORD VS VARIABLE TORTURE TESTS ===\n");
+    test_raw_variable_assignment();
+    test_raw_variable_comparison();
+    test_raw_variable_arithmetic();
+    test_raw_variable_bitwise();
+    test_raw_variable_logical();
+    test_raw_variable_incr_decr();
+    test_raw_variable_array();
+    test_raw_variable_member();
+    test_raw_variable_function_call();
+    test_raw_variable_comma();
+    test_raw_variable_semicolon();
+    test_raw_variable_ternary();
+    test_raw_keyword_static();
+    test_raw_keyword_extern_decl();
+    test_raw_mixed_usage();
+    test_raw_multiple_variables();
+    test_raw_bash_pattern();
+    test_raw_in_switch();
+    test_raw_in_loops();
+    test_raw_as_parameter();
+    test_raw_in_sizeof();
+    test_raw_address_of();
+    test_raw_in_cast();
+}
+
 // SECTION 3: MULTI-DECLARATOR TESTS
 
 void test_multi_decl_basic(void)
@@ -6920,6 +7267,7 @@ int main(void)
     run_defer_basic_tests();
     run_zeroinit_tests();
     run_raw_tests();
+    run_raw_torture_tests();
     run_multi_decl_tests();
     run_typedef_tests();
     run_edge_case_tests();

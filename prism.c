@@ -1,6 +1,10 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
+#ifndef _DARWIN_C_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.99.1"
+#endif
+#define PRISM_VERSION "0.99.2"
 
 #include "parse.c"
 
@@ -179,9 +183,6 @@ static DeferScope *defer_stack = NULL;
 static int defer_depth = 0;
 static int defer_stack_capacity = 0;
 
-static char pending_temp_file_buf[PATH_MAX];
-static char *pending_temp_file = NULL;
-
 // Track pending loop/switch for next scope
 static bool next_scope_is_loop = false;
 static bool next_scope_is_switch = false;
@@ -199,7 +200,6 @@ static bool current_func_has_asm = false;
 static bool current_func_has_vfork = false;
 
 static bool at_stmt_start = false;
-static bool in_switch_case_body = false;
 // Track statement expression scopes - store the defer_depth at which each starts
 static int *stmt_expr_levels = NULL; // defer_depth when stmt expr started (dynamic)
 static int stmt_expr_count = 0;      // number of active statement expressions
@@ -448,15 +448,6 @@ static void system_includes_reset(void)
   system_include_list = NULL;
   system_include_count = 0;
   system_include_capacity = 0;
-}
-
-static void cleanup_temp_file(void)
-{
-  if (pending_temp_file && pending_temp_file[0])
-  {
-    remove(pending_temp_file);
-    pending_temp_file = NULL;
-  }
 }
 
 static void end_statement_after_semicolon(void)
@@ -1709,7 +1700,6 @@ static bool is_true_vla_array_size(Token *open_bracket)
 {
   Token *tok = open_bracket->next;
   int depth = 1;
-  bool is_empty = true;
 
   // Find closing bracket
   Token *close_bracket = NULL;
@@ -1744,7 +1734,6 @@ static bool is_true_vla_array_size(Token *open_bracket)
       depth--;
     else
     {
-      is_empty = false;
       // Skip sizeof, alignof, offsetof, __builtin_offsetof - all constant
       if (equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof") ||
           equal(tok, "offsetof") || equal(tok, "__builtin_offsetof"))
@@ -2573,17 +2562,6 @@ typedef struct
   bool has_init;    // Has initializer (=)
 } DeclResult;
 
-// Emit tokens from start to end (exclusive), return end
-static Token *emit_range_to(Token *start, Token *end)
-{
-  while (start && start != end)
-  {
-    emit_tok(start);
-    start = start->next;
-  }
-  return end;
-}
-
 // Skip __attribute__((...)) and emit it, return position after
 static Token *skip_emit_attribute(Token *tok)
 {
@@ -2788,12 +2766,12 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
 //
 // SAFETY: If we see a type but fail to parse the declarator, we emit a warning
 // to alert the user that zero-init may have been skipped.
-//
-// Debug: Compile with -DPRISM_DEBUG_ZEROINIT to trace parsing
 static Token *try_zero_init_decl(Token *tok)
 {
   if (!feature_zeroinit || defer_depth <= 0 || struct_depth > 0)
+  {
     return NULL;
+  }
 
   // SAFETY: Check for "switch skip hole" - declarations before first case label
   bool in_switch_before_case = false;
@@ -2817,15 +2795,45 @@ static Token *try_zero_init_decl(Token *tok)
   Token *start = tok;
 
   // Check for 'raw' keyword - skip zero-init for this declaration
+  // ONLY consume 'raw' if it's followed by something that looks like a declaration
+  // Otherwise 'raw' is just a variable name (e.g., raw = 1;)
   bool is_raw = false;
-  Token *raw_tok = NULL;
   if (equal(tok, "raw"))
   {
-    is_raw = true;
-    raw_tok = tok; // Remember the raw token position
-    tok = tok->next;
-    start = tok;
-    decl_start_for_warning = tok;
+    Token *after_raw = tok->next;
+    // Skip _Pragma after 'raw' for the lookahead check
+    while (after_raw && equal(after_raw, "_Pragma"))
+    {
+      after_raw = after_raw->next;
+      if (after_raw && equal(after_raw, "("))
+        after_raw = skip_balanced(after_raw, "(", ")");
+    }
+    // 'raw' is NOT the prism keyword if followed by assignment/comparison/arithmetic operators
+    // These indicate 'raw' is being used as a variable name
+    bool is_assignment_or_expr = after_raw && (equal(after_raw, "=") || equal(after_raw, "+=") || equal(after_raw, "-=") ||
+                                               equal(after_raw, "*=") || equal(after_raw, "/=") || equal(after_raw, "%=") ||
+                                               equal(after_raw, "&=") || equal(after_raw, "|=") || equal(after_raw, "^=") ||
+                                               equal(after_raw, "<<=") || equal(after_raw, ">>=") ||
+                                               equal(after_raw, "==") || equal(after_raw, "!=") ||
+                                               equal(after_raw, "<") || equal(after_raw, ">") ||
+                                               equal(after_raw, "<=") || equal(after_raw, ">=") ||
+                                               equal(after_raw, "&&") || equal(after_raw, "||") ||
+                                               equal(after_raw, "+") || equal(after_raw, "-") ||
+                                               equal(after_raw, "*") || equal(after_raw, "/") || equal(after_raw, "%") ||
+                                               equal(after_raw, "&") || equal(after_raw, "|") || equal(after_raw, "^") ||
+                                               equal(after_raw, "<<") || equal(after_raw, ">>") ||
+                                               equal(after_raw, "++") || equal(after_raw, "--") ||
+                                               equal(after_raw, "[") || equal(after_raw, ".") || equal(after_raw, "->") ||
+                                               equal(after_raw, "(") || equal(after_raw, ",") || equal(after_raw, ";") ||
+                                               equal(after_raw, "?") || equal(after_raw, ":"));
+    if (!is_assignment_or_expr)
+    {
+      is_raw = true;
+      tok = tok->next;
+      start = tok;
+      pragma_start = tok; // Also update pragma_start to skip 'raw'
+      decl_start_for_warning = tok;
+    }
   }
 
   // Skip any _Pragma after 'raw' as well
@@ -2835,18 +2843,29 @@ static Token *try_zero_init_decl(Token *tok)
 
   if (is_skip_decl_keyword(tok))
   {
-    // If we saw 'raw' but are bailing out, we need to skip emitting 'raw' in output
-    // Return raw_tok->next to indicate that 'raw' should be consumed
-    // But wait - returning non-NULL means we handled it, which we didn't
-    // So return NULL but somehow signal that 'raw' was consumed...
-    // Actually, this is tricky. Let me use a different approach.
+    // If we saw 'raw' but are bailing out due to static/extern/typedef,
+    // we still need to emit the statement without 'raw' and consume it
+    if (is_raw)
+    {
+      // Find end of statement
+      Token *end = tok;
+      while (end && !equal(end, ";") && end->kind != TK_EOF)
+        end = end->next;
+      if (equal(end, ";"))
+        end = end->next;
+      // Emit from start (after 'raw') to end
+      emit_range(start, end);
+      return end;
+    }
     return NULL;
   }
 
   // Parse type specifier
   TypeSpecResult type = parse_type_specifier(tok);
   if (!type.saw_type)
+  {
     return NULL;
+  }
   tok = type.end;
 
   // Validate there's at least one declarator
@@ -2890,7 +2909,9 @@ static Token *try_zero_init_decl(Token *tok)
     }
   }
   else if (check->kind != TK_IDENT)
+  {
     return NULL;
+  }
 
   // Check for statement expressions or function declarations
   Token *scan = tok;
@@ -2901,7 +2922,9 @@ static Token *try_zero_init_decl(Token *tok)
     if (equal(scan, "(") || equal(scan, "[") || equal(scan, "{"))
     {
       if (equal(scan, "(") && scan->next && equal(scan->next, "{"))
+      {
         return NULL; // Statement expression
+      }
       if (equal(scan, "(") && scan_depth == 0 && seen_ident)
       {
         // Check if function declaration (no * before identifier)
@@ -2916,7 +2939,9 @@ static Token *try_zero_init_decl(Token *tok)
           t = t->next;
         }
         if (!has_star)
+        {
           return NULL;
+        }
       }
       scan_depth++;
     }
@@ -3226,12 +3251,9 @@ static int transpile(char *input_file, char *output_file)
     // Also allow in the init clause of a for loop: for (int i; ...)
     if (at_stmt_start && (!pending_control_flow || in_for_init))
     {
-      // Special handling for 'raw' keyword to prevent it leaking into output
-      // BUT: if 'raw' is a typedef, don't treat it as the keyword
-      bool has_raw_prefix = equal(tok, "raw") && !is_known_typedef(tok);
-      Token *try_tok = has_raw_prefix ? tok->next : tok;
-
-      Token *next = try_zero_init_decl(try_tok);
+      // try_zero_init_decl handles 'raw' keyword internally - it only consumes it
+      // if followed by a valid declaration, otherwise treats 'raw' as a variable name
+      Token *next = try_zero_init_decl(tok);
       if (next)
       {
         // Successfully handled - if there was 'raw', it's been processed
@@ -3241,12 +3263,8 @@ static int transpile(char *input_file, char *output_file)
       }
 
       // try_zero_init_decl returned NULL (didn't handle it)
-      // If we had 'raw' prefix, we must skip it to prevent emission
-      if (has_raw_prefix)
-      {
-        tok = tok->next; // Skip 'raw' token
-        // Don't set at_stmt_start to false yet - we might still be at statement start
-      }
+      // 'raw' is handled inside try_zero_init_decl now - it only consumes it
+      // if followed by a declaration, otherwise treats it as a variable name
     }
     at_stmt_start = false;
 
@@ -3491,19 +3509,13 @@ static int transpile(char *input_file, char *output_file)
               // Try zero-init for declarations at statement start within the expression
               if (expr_at_stmt_start && feature_zeroinit)
               {
-                bool has_raw_prefix = equal(tok, "raw") && !is_known_typedef(tok);
-                Token *try_tok = has_raw_prefix ? tok->next : tok;
-
-                Token *next = try_zero_init_decl(try_tok);
+                Token *next = try_zero_init_decl(tok);
                 if (next)
                 {
                   tok = next;
                   expr_at_stmt_start = true;
                   continue;
                 }
-
-                if (has_raw_prefix)
-                  tok = tok->next; // Skip 'raw' to prevent emission
 
                 expr_at_stmt_start = false;
               }
@@ -3559,19 +3571,13 @@ static int transpile(char *input_file, char *output_file)
               // Try zero-init for declarations at statement start within the expression
               if (expr_at_stmt_start && feature_zeroinit)
               {
-                bool has_raw_prefix = equal(tok, "raw") && !is_known_typedef(tok);
-                Token *try_tok = has_raw_prefix ? tok->next : tok;
-
-                Token *next = try_zero_init_decl(try_tok);
+                Token *next = try_zero_init_decl(tok);
                 if (next)
                 {
                   tok = next;
                   expr_at_stmt_start = true;
                   continue;
                 }
-
-                if (has_raw_prefix)
-                  tok = tok->next; // Skip 'raw' to prevent emission
 
                 expr_at_stmt_start = false;
               }
@@ -4255,7 +4261,7 @@ static void prism_free(PrismResult *r)
 }
 
 // Reset all transpiler state for clean reuse (prevents memory leaks on repeated use)
-static void prism_reset(void)
+__attribute__((unused)) static void prism_reset(void)
 {
   // Full tokenizer cleanup (parse.c) - frees arena blocks
   tokenizer_cleanup();
@@ -4320,31 +4326,6 @@ static char **build_argv(const char *first, ...)
     argv_builder_add(&ab, arg);
   va_end(ap);
   return argv_builder_finish(&ab);
-}
-
-// Append arguments from flags string to an ArgvBuilder
-static void argv_builder_append_flags(ArgvBuilder *ab, const char *flags)
-{
-  if (!flags || !*flags)
-    return;
-  const char *p = flags;
-  while (*p)
-  {
-    while (*p && isspace(*p))
-      p++;
-    if (!*p)
-      break;
-    const char *start = p;
-    while (*p && !isspace(*p))
-      p++;
-    size_t len = p - start;
-    char *arg = malloc(len + 1);
-    memcpy(arg, start, len);
-    arg[len] = '\0';
-    ENSURE_ARRAY_CAP(ab->data, ab->count + 2, ab->capacity, 64, char *);
-    ab->data[ab->count++] = arg;
-    ab->data[ab->count] = NULL;
-  }
 }
 
 static void die(char *message)
@@ -4449,83 +4430,6 @@ use_sudo:;
 
   printf("[prism] Installed!\n");
   return 0;
-}
-
-// Legacy Mode enum for get_flags compatibility
-typedef enum
-{
-  MODE_DEFAULT,
-  MODE_DEBUG,
-  MODE_RELEASE,
-  MODE_SMALL
-} Mode;
-
-static void get_flags(char *source_file, char *buffer, Mode mode)
-{
-  buffer[0] = 0;
-  size_t bufsize = 2048; // Known from caller
-  size_t len = 0;
-
-  // Safe append helper
-#define SAFE_APPEND(s)                   \
-  do                                     \
-  {                                      \
-    size_t slen = strlen(s);             \
-    if (len + slen < bufsize - 1)        \
-    {                                    \
-      memcpy(buffer + len, s, slen + 1); \
-      len += slen;                       \
-    }                                    \
-  } while (0)
-
-  if (mode == MODE_DEBUG)
-    SAFE_APPEND(" -g -O0");
-  if (mode == MODE_RELEASE)
-    SAFE_APPEND(" -O3");
-  if (mode == MODE_SMALL)
-    SAFE_APPEND(" -Os");
-
-  FILE *file = fopen(source_file, "r");
-  if (!file)
-    return;
-
-  char line[1024];
-  while (fgets(line, sizeof(line), file))
-  {
-    char *ptr = line;
-    while (isspace(*ptr))
-      ptr++;
-
-    if (strncmp(ptr, "#define PRISM_", 14))
-      continue;
-    ptr += 14;
-
-    int match = ((!strncmp(ptr, "FLAGS ", 6) || !strncmp(ptr, "LIBS ", 5)) ||
-                 (mode == MODE_DEBUG && !strncmp(ptr, "FLAGS_DEBUG ", 12)) ||
-                 (mode == MODE_RELEASE && !strncmp(ptr, "FLAGS_RELEASE ", 14)) ||
-                 (mode == MODE_SMALL && !strncmp(ptr, "FLAGS_SMALL ", 12)));
-
-    if (!match)
-      continue;
-
-    char *quote_start = strchr(ptr, '"');
-    char *quote_end = quote_start ? strchr(quote_start + 1, '"') : NULL;
-    if (quote_start && quote_end)
-    {
-      *quote_end = 0;
-      size_t add_len = strlen(quote_start + 1);
-      // Bounds check: leave room for space and null
-      if (len + add_len + 2 < bufsize)
-      {
-        buffer[len++] = ' ';
-        memcpy(buffer + len, quote_start + 1, add_len + 1);
-        len += add_len;
-      }
-    }
-  }
-
-#undef SAFE_APPEND
-  fclose(file);
 }
 
 static char *get_compiler_for_cross(char *arch, int bits, char *platform)
@@ -4670,9 +4574,9 @@ static const char *get_real_cc(const char *cc)
       else
         strcpy(cc_dir, ".");
 
-      char temp[PATH_MAX];
-      snprintf(temp, sizeof(temp), "%s/%s", cc_dir, cc_real);
-      if (realpath(temp, cc_real) == NULL)
+      char temp[PATH_MAX * 2];
+      int written = snprintf(temp, sizeof(temp), "%s/%s", cc_dir, cc_real);
+      if (written < 0 || (size_t)written >= sizeof(temp) || realpath(temp, cc_real) == NULL)
         return cc;
     }
     else
@@ -4866,6 +4770,7 @@ static void print_help(void)
       "  prism -c foo.c -o foo.o          Compile to object file\n"
       "  prism -O2 -Wall foo.c -o foo     With optimization and warnings\n"
       "  CC=clang prism foo.c             Use clang as backend\n\n"
+      "Note: Windows is not supported at this time.\n\n"
       "Apache 2.0 license (c) Dawn Larsson 2026\n"
       "https://github.com/dawnlarsson/prism\n",
       PRISM_VERSION, INSTALL_PATH);

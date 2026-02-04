@@ -1,10 +1,10 @@
 ![prism_banner](https://github.com/user-attachments/assets/97c303d0-0d85-4262-8fb3-663a33ce00cd)
 
-### **Robust C by default. (Unstable pre 0.100.0 stable)**
+### **Robust C by default. (Release Candidate v0.100.0 (1.0))**
 
 Prism is a lightweight, self-contained transpiler that brings modern language features to standard C. It functions as a build tool with zero dependencies, allowing you to write safer code without the overhead of complex build systems or heavy frameworks, or macro hacks.
 
-* **Stability First:** Focused on foundational correctness, testing, and verification of edge cases.
+* **Stability:** Prism is tested against **700+** tests, edge cases, and "torture" tests.
 * **Opt out dialect features** Disable parts of the transpiler, like zero-init, with CLI flags.
 * **Drop-in overlay:** Use `CC=prism` in any build system — GCC-compatible flags pass through automatically.
 
@@ -14,10 +14,10 @@ Prism is a propper transpiler, not a preprocessor macro.
 * **Detect Errors:** It catches unsafe patterns (like jumping into a scope with `goto`) before they become runtime bugs.
 
 ### Status
-Prism can parse & tokenize large complex C projects like `OpenSSL`, `SQlite`, `Bash`, `Dash`.
+Prism can parse & tokenize large complex C projects like `OpenSSL`, `SQlite`, `Bash`, `Dash`, `GNU Core Utils`, `Make`.
 
-All validation & edge tests pass, but,
-There is some edge cases still to be caught in the parsing, **huge speedups** and runtime memory savings to be had.
+As of prism 1.0 (v0.100.0)
+Windows support is currently not there, some code might exist but no nowhere near stable.
 
 <br/>
 
@@ -103,7 +103,7 @@ skip:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v0.99.1 - Robust C transpiler
+Prism v0.99.2 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 

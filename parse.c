@@ -599,13 +599,6 @@ static inline bool equal(Token *tok, const char *op)
     return false;
 }
 
-static Token *skip(Token *tok, char *op)
-{
-    if (!equal(tok, op))
-        error_tok(tok, "expected '%s'", op);
-    return tok->next;
-}
-
 // Keyword map
 static HashMap keyword_map;
 
@@ -1390,7 +1383,6 @@ static File *new_file_view(const char *name, File *base, int line_delta, bool is
 // Updates *in_system_include, *line_no, and may switch current_file
 static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *in_system_include)
 {
-    char *directive_start = p;
     int directive_line = *line_no;
     p++; // skip '#'
     while (*p == ' ' || *p == '\t')
