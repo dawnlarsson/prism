@@ -11,6 +11,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -331,6 +332,17 @@ static void hashmap_clear(HashMap *map)
 // Forward declaration for error reporting (defined later)
 static noreturn void error(char *fmt, ...);
 
+// Library mode error recovery - when PRISM_LIB_MODE is defined, errors
+// longjmp back to a recovery point instead of calling exit(1).
+// This allows the host process to continue after transpilation errors.
+#ifdef PRISM_LIB_MODE
+static jmp_buf prism_error_jmp;
+static bool prism_error_jmp_set = false;
+static char prism_error_msg[1024];
+static int prism_error_line = 0;
+static int prism_error_col = 0;
+#endif
+
 // File tracking
 static File *current_file;
 static File **input_files;
@@ -502,8 +514,17 @@ static noreturn void error(char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
+#ifdef PRISM_LIB_MODE
+    if (prism_error_jmp_set)
+    {
+        vsnprintf(prism_error_msg, sizeof(prism_error_msg), fmt, ap);
+        va_end(ap);
+        longjmp(prism_error_jmp, 1);
+    }
+#endif
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
+    va_end(ap);
     exit(1);
 }
 
@@ -541,7 +562,17 @@ noreturn void error_at(char *loc, char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
+#ifdef PRISM_LIB_MODE
+    if (prism_error_jmp_set)
+    {
+        prism_error_line = count_lines(current_file->contents, loc);
+        vsnprintf(prism_error_msg, sizeof(prism_error_msg), fmt, ap);
+        va_end(ap);
+        longjmp(prism_error_jmp, 1);
+    }
+#endif
     verror_at(current_file->name, current_file->contents, count_lines(current_file->contents, loc), loc, fmt, ap);
+    va_end(ap);
     exit(1);
 }
 
@@ -549,8 +580,19 @@ noreturn void error_tok(Token *tok, char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
+#ifdef PRISM_LIB_MODE
+    if (prism_error_jmp_set)
+    {
+        File *f = tok_file(tok);
+        prism_error_line = tok_line_no(tok);
+        vsnprintf(prism_error_msg, sizeof(prism_error_msg), fmt, ap);
+        va_end(ap);
+        longjmp(prism_error_jmp, 1);
+    }
+#endif
     File *f = tok_file(tok);
     verror_at(f->name, f->contents, tok_line_no(tok), tok->loc, fmt, ap);
+    va_end(ap);
     exit(1);
 }
 
@@ -1187,10 +1229,30 @@ static Token *read_char_literal(char *start, char *quote)
     return tok;
 }
 
-static int64_t read_int_literal(char **pp, int base)
+// Check if an integer literal has unsigned suffix (u, U, ul, UL, ull, ULL, etc.)
+static bool has_unsigned_suffix(const char *start, int len)
+{
+    const char *p = start + len - 1;
+    // Skip trailing L/l suffixes
+    while (p > start && (*p == 'l' || *p == 'L'))
+        p--;
+    // Check for U/u suffix
+    return p >= start && (*p == 'u' || *p == 'U');
+}
+
+static int64_t read_int_literal(char **pp, int base, bool is_unsigned)
 {
     char *end;
-    int64_t val = strtoll(*pp, &end, base);
+    int64_t val;
+    if (is_unsigned)
+    {
+        // Use strtoull for unsigned literals to handle full 64-bit range
+        val = (int64_t)strtoull(*pp, &end, base);
+    }
+    else
+    {
+        val = strtoll(*pp, &end, base);
+    }
     *pp = end;
     return val;
 }
@@ -1279,7 +1341,8 @@ static void convert_pp_number(Token *tok)
     }
 
     tok->kind = TK_NUM;
-    tok->val.i64 = read_int_literal(&p, base);
+    bool is_unsigned = has_unsigned_suffix(tok->loc, tok->len);
+    tok->val.i64 = read_int_literal(&p, base, is_unsigned);
     return;
 
 is_float:

@@ -7545,10 +7545,12 @@ void test_memory_interning_pattern(void)
 void test_compound_literal_for_break(void)
 {
     log_reset();
-    for (int i = 0; i < (int){10}; i++) {
+    for (int i = 0; i < (int){10}; i++)
+    {
         defer log_append("D");
         log_append("L");
-        if (i == 0) break;  // BUG: defer must still execute on break!
+        if (i == 0)
+            break; // BUG: defer must still execute on break!
     }
     CHECK_LOG("LD", "compound literal for loop: defer on break");
 }
@@ -7556,10 +7558,12 @@ void test_compound_literal_for_break(void)
 void test_compound_literal_for_continue(void)
 {
     log_reset();
-    for (int i = 0; i < (int){2}; i++) {
+    for (int i = 0; i < (int){2}; i++)
+    {
         defer log_append("D");
         log_append("C");
-        if (i == 0) continue;  // defer must execute on continue too
+        if (i == 0)
+            continue; // defer must execute on continue too
         log_append("X");
     }
     CHECK_LOG("CDCXD", "compound literal for loop: defer on continue");
@@ -7569,10 +7573,12 @@ void test_compound_literal_while_break(void)
 {
     log_reset();
     int i = 0;
-    while (i < (int){5}) {
+    while (i < (int){5})
+    {
         defer log_append("W");
         log_append("B");
-        if (i == 0) break;
+        if (i == 0)
+            break;
         i++;
     }
     CHECK_LOG("BW", "compound literal while loop: defer on break");
@@ -7581,11 +7587,16 @@ void test_compound_literal_while_break(void)
 void test_nested_compound_literal_in_loop(void)
 {
     log_reset();
-    struct { int x; } s;
-    for (int i = 0; i < ((struct { int x; }){3}).x; i++) {
+    struct
+    {
+        int x;
+    } s;
+    for (int i = 0; i < ((struct { int x; }){3}).x; i++)
+    {
         defer log_append("N");
         log_append("I");
-        if (i == 1) break;
+        if (i == 1)
+            break;
     }
     CHECK_LOG("ININ", "nested compound literal in for: defer on break");
 }
@@ -7593,7 +7604,8 @@ void test_nested_compound_literal_in_loop(void)
 void test_multiple_compound_literals_in_for(void)
 {
     log_reset();
-    for (int i = (int){0}; i < (int){2}; i += (int){1}) {
+    for (int i = (int){0}; i < (int){2}; i += (int){1})
+    {
         defer log_append("M");
         log_append("X");
     }
@@ -7603,7 +7615,8 @@ void test_multiple_compound_literals_in_for(void)
 void test_compound_literal_if_condition(void)
 {
     log_reset();
-    if ((int){1}) {
+    if ((int){1})
+    {
         defer log_append("I");
         log_append("T");
     }
@@ -7637,8 +7650,11 @@ typedef int GlobalEnumShadowType;
 void test_enum_shadow_zeroinit(void)
 {
     // Enum constant shadows the global typedef
-    enum { GlobalEnumShadowType = 5 };
-    
+    enum
+    {
+        GlobalEnumShadowType = 5
+    };
+
     // Array size is compile-time constant (enum), so should be zero-initialized
     int arr[GlobalEnumShadowType];
     int sum = 0;
@@ -7651,6 +7667,112 @@ void run_enum_shadow_tests(void)
 {
     printf("\n=== ENUM SHADOW ZERO-INIT TESTS ===\n");
     test_enum_shadow_zeroinit();
+}
+
+void test_issue4_strtoll_unsigned(void)
+{
+    // Test 1: UINT64_MAX as hex literal
+    unsigned long long val1 = 0xFFFFFFFFFFFFFFFFULL;
+    CHECK(val1 == UINT64_MAX, "0xFFFFFFFFFFFFFFFFULL equals UINT64_MAX");
+    CHECK(val1 > 0, "UINT64_MAX > 0 (not treated as -1)");
+
+    // Test 2: Compare unsigned literals
+    unsigned long long a = 0xFFFFFFFFFFFFFFFFULL;
+    unsigned long long b = 1ULL;
+    CHECK(a > b, "UINT64_MAX > 1 in unsigned comparison");
+
+    // Test 3: Large unsigned without suffix (might overflow signed)
+    unsigned long long big = 9223372036854775808ULL;
+    CHECK(big == 9223372036854775808ULL, "large unsigned literal parses correctly");
+
+    // Test 4: Hex without suffix
+    unsigned long long hex_max = 0xFFFFFFFFFFFFFFFF;
+    CHECK(hex_max == UINT64_MAX, "hex UINT64_MAX without U suffix");
+}
+
+typedef int RawTypedefTest; // Simulates user-defined 'raw' type
+
+void test_issue5_raw_typedef_collision(void)
+{
+    // Declare variable of typedef type - should be zero-initialized
+    RawTypedefTest x;
+    CHECK(x == 0, "typedef'd type variable is zero-initialized");
+
+    // Multiple declarations
+    RawTypedefTest a, b, c;
+    CHECK(a == 0 && b == 0 && c == 0, "multiple typedef'd vars zero-initialized");
+
+    // With initializer
+    RawTypedefTest y = 42;
+    CHECK(y == 42, "typedef'd type with initializer works");
+
+    // Pointer
+    RawTypedefTest *ptr = &y;
+    CHECK(*ptr == 42, "typedef'd type pointer works");
+
+    // Array
+    RawTypedefTest arr[3];
+    CHECK(arr[0] == 0 && arr[1] == 0 && arr[2] == 0, "typedef'd type array zero-initialized");
+}
+
+static int defer_for_loop_counter = 0;
+
+void test_issue7_defer_in_for_body(void)
+{
+    // Valid use: defer INSIDE the for body
+    defer_for_loop_counter = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        defer defer_for_loop_counter++;
+    }
+    CHECK_EQ(defer_for_loop_counter, 3, "defer inside for body runs each iteration");
+}
+
+void test_issue7_defer_before_for(void)
+{
+    // Valid use: defer before for loop
+    defer_for_loop_counter = 0;
+    {
+        defer defer_for_loop_counter = 100;
+        for (int i = 0; i < 3; i++)
+        {
+            // loop body
+        }
+    }
+    CHECK_EQ(defer_for_loop_counter, 100, "defer before loop runs once at scope exit");
+}
+
+void test_defer_nested_control_structures(void)
+{
+    int cleanup_order[10];
+    int cleanup_idx = 0;
+
+    for (int i = 0; i < 2; i++)
+    {
+        defer cleanup_order[cleanup_idx++] = i * 10;
+
+        if (i == 0)
+        {
+            defer cleanup_order[cleanup_idx++] = 1;
+        }
+    }
+
+    // After first iteration: defer 1 runs, then defer 0
+    // After second iteration: defer 10 runs
+    // Expected order: 1, 0, 10
+    CHECK_EQ(cleanup_order[0], 1, "nested defer: inner if defer runs first");
+    CHECK_EQ(cleanup_order[1], 0, "nested defer: outer for defer runs second");
+    CHECK_EQ(cleanup_order[2], 10, "nested defer: second iteration defer");
+}
+
+void run_reported_bug_fix_tests(void)
+{
+    printf("\n=== BUG FIX TESTS ===\n");
+    test_issue4_strtoll_unsigned();
+    test_issue5_raw_typedef_collision();
+    test_issue7_defer_in_for_body();
+    test_issue7_defer_before_for();
+    test_defer_nested_control_structures();
 }
 
 int main(void)
@@ -7683,6 +7805,7 @@ int main(void)
     run_bug_fix_verification_tests();
     run_compound_literal_loop_tests();
     run_enum_shadow_tests();
+    run_reported_bug_fix_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

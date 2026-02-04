@@ -8,6 +8,15 @@
 
 #include "parse.c"
 
+// Platform-specific headers for get_real_cc()
+#ifdef __APPLE__
+#include <mach-o/dyld.h>  // _NSGetExecutablePath
+#endif
+#if defined(__FreeBSD__)
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#endif
+
 // LIBRARY API
 
 typedef struct
@@ -45,6 +54,7 @@ static PrismFeatures prism_defaults(void)
 // Forward declarations for library API
 static PrismResult prism_transpile_file(const char *input_file, PrismFeatures features);
 static void prism_free(PrismResult *r);
+static void prism_reset(void);
 
 // CLI CONFIGURATION (excluded with -DPRISM_LIB_MODE)
 
@@ -2817,8 +2827,9 @@ static Token *try_zero_init_decl(Token *tok)
   // Check for 'raw' keyword - skip zero-init for this declaration
   // ONLY consume 'raw' if it's followed by something that looks like a declaration
   // Otherwise 'raw' is just a variable name (e.g., raw = 1;)
+  // IMPORTANT: If 'raw' is a known typedef (e.g., typedef int raw;), it's NOT the Prism keyword
   bool is_raw = false;
-  if (equal(tok, "raw"))
+  if (equal(tok, "raw") && !is_known_typedef(tok))
   {
     Token *after_raw = tok->next;
     // Skip _Pragma after 'raw' for the lookahead check
@@ -4278,6 +4289,28 @@ static PrismResult prism_transpile_file(const char *input_file, PrismFeatures fe
 {
   PrismResult result = {0};
 
+#ifdef PRISM_LIB_MODE
+  // Set up error recovery point - if error()/error_tok()/error_at() is called,
+  // we longjmp back here instead of calling exit(1)
+  prism_error_msg[0] = '\0';
+  prism_error_line = 0;
+  prism_error_col = 0;
+  prism_error_jmp_set = true;
+
+  if (setjmp(prism_error_jmp) != 0)
+  {
+    // We got here via longjmp from an error function
+    prism_error_jmp_set = false;
+    result.status = PRISM_ERR_SYNTAX;
+    result.error_msg = strdup(prism_error_msg[0] ? prism_error_msg : "Unknown error");
+    result.error_line = prism_error_line;
+    result.error_col = prism_error_col;
+    // Reset global state to allow future transpilations
+    prism_reset();
+    return result;
+  }
+#endif
+
   // Initialize type keyword map (only done once)
   if (!type_keyword_map.capacity)
     init_type_keyword_map();
@@ -4298,6 +4331,9 @@ static PrismResult prism_transpile_file(const char *input_file, PrismFeatures fe
   {
     result.status = PRISM_ERR_IO;
     result.error_msg = strdup("Failed to create temp file");
+#ifdef PRISM_LIB_MODE
+    prism_error_jmp_set = false;
+#endif
     return result;
   }
 #elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
@@ -4307,6 +4343,9 @@ static PrismResult prism_transpile_file(const char *input_file, PrismFeatures fe
     {
       result.status = PRISM_ERR_IO;
       result.error_msg = strdup("Failed to create temp file");
+#ifdef PRISM_LIB_MODE
+      prism_error_jmp_set = false;
+#endif
       return result;
     }
     close(fd);
@@ -4318,6 +4357,9 @@ static PrismResult prism_transpile_file(const char *input_file, PrismFeatures fe
     {
       result.status = PRISM_ERR_IO;
       result.error_msg = strdup("Failed to create temp file");
+#ifdef PRISM_LIB_MODE
+      prism_error_jmp_set = false;
+#endif
       return result;
     }
     close(fd);
@@ -4338,6 +4380,9 @@ static PrismResult prism_transpile_file(const char *input_file, PrismFeatures fe
     result.status = PRISM_ERR_SYNTAX;
     result.error_msg = strdup("Transpilation failed");
     remove(temp_path);
+#ifdef PRISM_LIB_MODE
+    prism_error_jmp_set = false;
+#endif
     return result;
   }
 
@@ -4348,6 +4393,9 @@ static PrismResult prism_transpile_file(const char *input_file, PrismFeatures fe
     result.status = PRISM_ERR_IO;
     result.error_msg = strdup("Failed to read transpiled output");
     remove(temp_path);
+#ifdef PRISM_LIB_MODE
+    prism_error_jmp_set = false;
+#endif
     return result;
   }
 
@@ -4362,6 +4410,9 @@ static PrismResult prism_transpile_file(const char *input_file, PrismFeatures fe
     result.error_msg = strdup("Out of memory");
     fclose(f);
     remove(temp_path);
+#ifdef PRISM_LIB_MODE
+    prism_error_jmp_set = false;
+#endif
     return result;
   }
 
@@ -4372,6 +4423,10 @@ static PrismResult prism_transpile_file(const char *input_file, PrismFeatures fe
 
   fclose(f);
   remove(temp_path);
+
+#ifdef PRISM_LIB_MODE
+  prism_error_jmp_set = false;
+#endif
   return result;
 }
 
@@ -4668,73 +4723,77 @@ static const char *get_real_cc(const char *cc)
   if (strcmp(base, "prism") == 0 || strcmp(base, "prism.exe") == 0)
     return "cc";
 
-#ifdef __linux__
-  // Advanced check: resolve symlinks and compare with current executable
-  // This prevents infinite recursion if prism is symlinked to another name
+  // Advanced check: resolve paths and compare with current executable
+  // This prevents infinite recursion if prism is symlinked or copied to another name
   // Example: ln -s prism my-compiler && CC=./my-compiler ./my-compiler test.c
+  // Or:      cp prism cc && CC=./cc ./cc test.c (hard copy, not symlink)
   char cc_real[PATH_MAX];
   char self_real[PATH_MAX];
+  bool got_self_path = false;
 
-  // Resolve the CC path (follow symlinks)
-  ssize_t cc_len = readlink(cc, cc_real, sizeof(cc_real) - 1);
-  if (cc_len == -1)
-  {
-    // Not a symlink, use the path as-is
-    // But still check if it points to the same file via realpath
-    if (realpath(cc, cc_real) == NULL)
-    {
-      // Can't resolve, assume it's not prism
-      return cc;
-    }
-  }
-  else
-  {
-    cc_real[cc_len] = '\0';
-
-    // If relative symlink, resolve relative to directory containing the link
-    if (cc_real[0] != '/')
-    {
-      char cc_dir[PATH_MAX];
-      strncpy(cc_dir, cc, sizeof(cc_dir) - 1);
-      cc_dir[sizeof(cc_dir) - 1] = '\0';
-      char *last_slash = strrchr(cc_dir, '/');
-      if (last_slash)
-        *last_slash = '\0';
-      else
-        strcpy(cc_dir, ".");
-
-      char temp[PATH_MAX * 2];
-      int written = snprintf(temp, sizeof(temp), "%s/%s", cc_dir, cc_real);
-      if (written < 0 || (size_t)written >= sizeof(temp) || realpath(temp, cc_real) == NULL)
-        return cc;
-    }
-    else
-    {
-      // Absolute symlink, but still resolve in case it's a chain
-      char temp[PATH_MAX];
-      strncpy(temp, cc_real, sizeof(temp) - 1);
-      temp[sizeof(temp) - 1] = '\0';
-      if (realpath(temp, cc_real) == NULL)
-        return cc;
-    }
-  }
-
-  // Get the path of the current executable
+#ifdef __linux__
+  // Linux: use /proc/self/exe to get current executable path
   ssize_t self_len = readlink("/proc/self/exe", self_real, sizeof(self_real) - 1);
-  if (self_len == -1)
+  if (self_len != -1)
   {
-    // Can't read /proc/self/exe, fall back to simple check
+    self_real[self_len] = '\0';
+    got_self_path = true;
+  }
+#elif defined(__APPLE__)
+  // macOS: use _NSGetExecutablePath
+  uint32_t bufsize = sizeof(self_real);
+  if (_NSGetExecutablePath(self_real, &bufsize) == 0)
+  {
+    // Resolve to canonical path
+    char temp[PATH_MAX];
+    if (realpath(self_real, temp) != NULL)
+    {
+      strncpy(self_real, temp, sizeof(self_real) - 1);
+      self_real[sizeof(self_real) - 1] = '\0';
+      got_self_path = true;
+    }
+  }
+#elif defined(__FreeBSD__)
+  // FreeBSD: use sysctl with KERN_PROC_PATHNAME
+  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+  size_t len = sizeof(self_real);
+  if (sysctl(mib, 4, self_real, &len, NULL, 0) == 0)
+  {
+    got_self_path = true;
+  }
+#elif defined(__NetBSD__)
+  // NetBSD: use /proc/curproc/exe (if procfs is mounted)
+  ssize_t self_len = readlink("/proc/curproc/exe", self_real, sizeof(self_real) - 1);
+  if (self_len != -1)
+  {
+    self_real[self_len] = '\0';
+    got_self_path = true;
+  }
+#elif defined(__OpenBSD__)
+  // OpenBSD: no reliable way to get executable path
+  // Fall back to simple check only
+  (void)self_real;
+#endif
+
+  if (!got_self_path)
+  {
+    // Can't determine self path, fall back to simple basename check (already done above)
     return cc;
   }
-  self_real[self_len] = '\0';
+
+  // Resolve the CC path to canonical form
+  if (realpath(cc, cc_real) == NULL)
+  {
+    // Can't resolve CC path, assume it's not prism
+    return cc;
+  }
 
   // Compare the resolved paths
   if (strcmp(cc_real, self_real) == 0)
   {
-    // CC points to prism itself (possibly via symlink), use "cc" instead
+    // CC points to prism itself (possibly via symlink or hard copy), use "cc" instead
     return "cc";
   }
-#endif
 
   return cc;
 }
