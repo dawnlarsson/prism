@@ -1,16 +1,17 @@
+#define PRISM_VERSION "0.99.4"
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 #ifndef _DARWIN_C_SOURCE
 #define _DARWIN_C_SOURCE
 #endif
-#define PRISM_VERSION "0.99.3"
 
 #include "parse.c"
 
 // Platform-specific headers for get_real_cc()
 #ifdef __APPLE__
-#include <mach-o/dyld.h>  // _NSGetExecutablePath
+#include <mach-o/dyld.h> // _NSGetExecutablePath
 #endif
 #if defined(__FreeBSD__)
 #include <sys/types.h>
@@ -656,6 +657,103 @@ static bool needs_space(Token *prev, Token *tok)
 static bool is_member_access(Token *tok)
 {
   return tok && tok->kind == TK_PUNCT && (equal(tok, ".") || equal(tok, "->"));
+}
+
+// Check if 'tok' is inside a __attribute__((...)) or __declspec(...) context
+// by looking backward through last_emitted tokens.
+// This is used to prevent 'defer' from being recognized as a keyword
+// when it appears as a function name inside cleanup() or similar attributes.
+static bool is_inside_attribute(Token *tok)
+{
+  // We need to scan backward from the current token position to see if we're
+  // inside an __attribute__((...)) context. We track paren depth.
+  // Since we don't have a direct backward pointer, we'll check if the
+  // last_emitted sequence contains __attribute__ followed by unmatched ((.
+  //
+  // A simpler approach: check if last_emitted is '(' and walk back to find __attribute__
+  // with unbalanced parens.
+
+  if (!last_emitted)
+    return false;
+
+  // Quick check: if last_emitted isn't '(' or ',', we're probably not inside attribute args
+  // (defer would follow '(' in cleanup(defer) or ',' in a list)
+  if (!equal(last_emitted, "(") && !equal(last_emitted, ","))
+    return false;
+
+  // Walk backward through tokens to find __attribute__ with unmatched parens
+  Token *t = last_emitted;
+  int paren_depth = 0;
+  int max_walk = 100; // Limit how far we walk back
+
+  while (t && max_walk-- > 0)
+  {
+    if (equal(t, ")"))
+      paren_depth++;
+    else if (equal(t, "("))
+    {
+      if (paren_depth > 0)
+        paren_depth--;
+      else
+      {
+        // Unmatched '(' - check if preceded by __attribute__ or __attribute
+        // Need to find the token before this '('
+        // Unfortunately we don't have a prev pointer, so we check if last_emitted
+        // is the '(' and the prior context suggests __attribute__
+        //
+        // Since we can't easily walk backward, let's use a different approach:
+        // Check if we're currently at depth > 0 relative to __attribute__
+        // by checking if the next tokens form an identifier (function name pattern)
+        break;
+      }
+    }
+    else if (equal(t, "__attribute__") || equal(t, "__attribute") || equal(t, "__declspec"))
+    {
+      // Found attribute keyword with unbalanced parens - we're inside it
+      return true;
+    }
+
+    // Move to previous token (we don't have prev pointer, so this approach won't work)
+    // Need a different strategy
+    break;
+  }
+
+  // Alternative: Check the token stream forward from current position
+  // If we see ')' before ';' or '{', we might be inside parens
+  // And check backward pattern: if last_emitted is '(' and tok is an identifier
+  // that could be a function name like 'defer', check the context
+
+  // Simplified heuristic: If last_emitted is '(' and the token before it was
+  // an identifier like 'cleanup', we're likely inside __attribute__((cleanup(defer)))
+  // This requires tracking more state, so let's use a forward-looking check instead.
+
+  // Forward check: from tok, count parens until we hit ';' or EOF
+  // If we see unbalanced ')' first, we might be inside an attribute
+  t = tok;
+  paren_depth = 0;
+  max_walk = 50;
+  while (t && t->kind != TK_EOF && max_walk-- > 0)
+  {
+    if (equal(t, "("))
+      paren_depth++;
+    else if (equal(t, ")"))
+    {
+      paren_depth--;
+      if (paren_depth < 0)
+      {
+        // We hit an unmatched ')' - we're inside some paren context
+        // Check if we're at statement start (defer must be at stmt start)
+        // If struct_depth is 0 and defer_depth > 0, but last_emitted is '(',
+        // this is likely inside an attribute
+        return true;
+      }
+    }
+    else if (equal(t, ";") || equal(t, "{"))
+      break;
+    t = t->next;
+  }
+
+  return false;
 }
 
 // Emit a single token with appropriate spacing
@@ -1577,7 +1675,7 @@ static Token *scan_typedef_base_type(Token *tok)
     // Handle _Atomic(type) specifier form - skip the parenthesized type
     if (equal(tok, "_Atomic") && tok->next && equal(tok->next, "("))
     {
-      tok = tok->next; // Skip _Atomic
+      tok = tok->next;                    // Skip _Atomic
       tok = skip_balanced(tok, "(", ")"); // Skip (type)
     }
     else
@@ -2888,6 +2986,46 @@ static Token *try_zero_init_decl(Token *tok)
       emit_range(start, end);
       return end;
     }
+    // Check for 'static/extern raw type' pattern (raw after storage class)
+    // Only for actual storage class specifiers, not all skip keywords like 'return'
+    bool is_storage_class = equal(tok, "static") || equal(tok, "extern") || equal(tok, "typedef");
+    if (is_storage_class)
+    {
+      // Look ahead past the storage class specifier for 'raw'
+      Token *after_storage = tok->next;
+      // Skip _Pragma and attributes after storage class
+      while (after_storage && (equal(after_storage, "_Pragma") ||
+                               equal(after_storage, "__attribute__") || equal(after_storage, "__attribute")))
+      {
+        after_storage = after_storage->next;
+        if (after_storage && equal(after_storage, "("))
+          after_storage = skip_balanced(after_storage, "(", ")");
+      }
+      if (equal(after_storage, "raw") && !is_known_typedef(after_storage))
+      {
+        // Found 'static/extern raw' pattern - emit storage class without 'raw'
+        // Emit the storage class specifier
+        emit_tok(tok);
+        Token *storage_tok = tok;
+        tok = tok->next;
+        // Skip to after 'raw'
+        while (tok && tok != after_storage)
+        {
+          emit_tok(tok);
+          tok = tok->next;
+        }
+        // Skip 'raw' (don't emit it)
+        tok = tok->next;
+        // Emit the rest of the declaration
+        Token *end = tok;
+        while (end && !equal(end, ";") && end->kind != TK_EOF)
+          end = end->next;
+        if (equal(end, ";"))
+          end = end->next;
+        emit_range(tok, end);
+        return end;
+      }
+    }
     return NULL;
   }
 
@@ -3346,6 +3484,7 @@ static int transpile(char *input_file, char *output_file)
     //          preceded by a type keyword - that's a variable/typedef name, not keyword
     //          'defer' is registered as a typedef - that's a type name, not keyword
     //          followed by assignment operator - that's a variable assignment, not defer statement
+    //          inside __attribute__((...)) - that's a function name, not keyword
     bool is_defer_assignment = tok->next && (equal(tok->next, "=") || equal(tok->next, "+=") ||
                                              equal(tok->next, "-=") || equal(tok->next, "*=") ||
                                              equal(tok->next, "/=") || equal(tok->next, "%=") ||
@@ -3357,7 +3496,8 @@ static int transpile(char *input_file, char *output_file)
     if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "defer") &&
         !is_member_access(last_emitted) && struct_depth == 0 &&
         !(last_emitted && (is_type_keyword(last_emitted) || equal(last_emitted, "typedef"))) &&
-        !is_known_typedef(tok) && !is_defer_assignment)
+        !is_known_typedef(tok) && !is_defer_assignment &&
+        !is_inside_attribute(tok))
     {
       // Check for defer inside for/while/switch/if parentheses - this is invalid
       if (pending_control_flow && control_paren_depth > 0)

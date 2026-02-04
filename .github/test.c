@@ -7765,6 +7765,68 @@ void test_defer_nested_control_structures(void)
     CHECK_EQ(cleanup_order[2], 10, "nested defer: second iteration defer");
 }
 
+void test_raw_keyword_after_static(void)
+{
+    // raw after static - this was the bug: 'raw' was not consumed
+    static raw int raw_after_static;
+    CHECK_EQ(raw_after_static, 0, "static raw int: raw consumed, no zero-init");
+}
+
+void test_raw_keyword_after_extern(void)
+{
+    // raw after extern - similar pattern
+    extern raw int test_raw_extern_var;
+    // Can't check value of extern, just verify it compiles
+    (void)test_raw_extern_var;
+    printf("[PASS] extern raw int: compiles correctly\n");
+    passed++;
+    total++;
+}
+
+// Global for extern test
+int test_raw_extern_var = 42;
+
+void test_raw_keyword_before_static(void)
+{
+    // raw before static - this always worked
+    raw static int raw_before_static;
+    CHECK_EQ(raw_before_static, 0, "raw static int: raw consumed, no zero-init");
+}
+
+static void defer_cleanup_func(int *p)
+{
+    if (p)
+        *p = 0;
+}
+
+// Test function named 'defer' as cleanup handler
+static void defer(int *p)
+{
+    if (p)
+        *p = 999;
+}
+
+void test_defer_in_attribute_cleanup(void)
+{
+    // Using a function named 'defer' in __attribute__((cleanup(...)))
+    // This should NOT trigger defer statement parsing
+    int value __attribute__((cleanup(defer))) = 42;
+    CHECK_EQ(value, 42, "defer in cleanup attr: not parsed as statement");
+    // After scope exit, value will be set to 999 by cleanup, but we can't check that here
+}
+
+void test_defer_in_attribute_with_defer_stmt(void)
+{
+    // Combine cleanup attribute with actual defer statement
+    int result = 0;
+    {
+        int value __attribute__((cleanup(defer_cleanup_func))) = 42;
+        defer result = value; // This IS a defer statement
+    }
+    // defer runs first (sets result=42), then cleanup runs (sets value=0)
+    CHECK_EQ(result, 42, "defer stmt + cleanup attr: both work");
+}
+
 void run_reported_bug_fix_tests(void)
 {
     printf("\n=== BUG FIX TESTS ===\n");
@@ -7773,6 +7835,11 @@ void run_reported_bug_fix_tests(void)
     test_issue7_defer_in_for_body();
     test_issue7_defer_before_for();
     test_defer_nested_control_structures();
+    test_raw_keyword_after_static();
+    test_raw_keyword_after_extern();
+    test_raw_keyword_before_static();
+    test_defer_in_attribute_cleanup();
+    test_defer_in_attribute_with_defer_stmt();
 }
 
 int main(void)

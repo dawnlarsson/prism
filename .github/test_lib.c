@@ -606,36 +606,39 @@ static void test_repeated_reset(void)
 static void test_error_recovery_no_exit(void)
 {
     printf("\n--- Error Recovery Tests (no exit) ---\n");
-    
+
     PrismFeatures features = prism_defaults();
-    
+
     // Test 1: Syntax error that would trigger error_tok()
     // Using invalid defer usage that Prism should catch
-    const char *invalid_code1 = 
+    const char *invalid_code1 =
         "int main(void) {\n"
-        "    for (int i = 0; defer (void)0; i++) { }\n"  // defer in for header
+        "    for (int i = 0; defer (void)0; i++) { }\n" // defer in for header
         "    return 0;\n"
         "}\n";
-    
+
     char *path1 = create_temp_file(invalid_code1);
-    if (path1) {
+    if (path1)
+    {
         PrismResult result = prism_transpile_file(path1, features);
         CHECK(result.status != PRISM_OK, "syntax error returns error status (not exit)");
         CHECK(result.error_msg != NULL, "error message captured");
-        if (result.error_msg) {
-            CHECK(strstr(result.error_msg, "defer") != NULL || 
-                  strstr(result.error_msg, "control") != NULL,
+        if (result.error_msg)
+        {
+            CHECK(strstr(result.error_msg, "defer") != NULL ||
+                      strstr(result.error_msg, "control") != NULL,
                   "error message is descriptive");
         }
         prism_free(&result);
         unlink(path1);
         free(path1);
     }
-    
+
     // Test 2: After error, transpiler should still work for valid code
     const char *valid_code = "int main(void) { int x; return x; }\n";
     char *path2 = create_temp_file(valid_code);
-    if (path2) {
+    if (path2)
+    {
         PrismResult result = prism_transpile_file(path2, features);
         CHECK_EQ(result.status, PRISM_OK, "transpiler recovers after error");
         CHECK(result.output != NULL, "output generated after recovery");
@@ -643,16 +646,18 @@ static void test_error_recovery_no_exit(void)
         unlink(path2);
         free(path2);
     }
-    
+
     // Test 3: Multiple errors in sequence should all be recoverable
     const char *errors[] = {
         "int main(void) { for(; defer 0;) {} return 0; }\n",
-        "int main(void) { if (1) defer (void)0; return 0; }\n",  // braceless defer
+        "int main(void) { if (1) defer (void)0; return 0; }\n", // braceless defer
     };
-    
-    for (size_t i = 0; i < sizeof(errors)/sizeof(errors[0]); i++) {
+
+    for (size_t i = 0; i < sizeof(errors) / sizeof(errors[0]); i++)
+    {
         char *path = create_temp_file(errors[i]);
-        if (path) {
+        if (path)
+        {
             PrismResult result = prism_transpile_file(path, features);
             char name[64];
             snprintf(name, sizeof(name), "error %zu doesn't kill process", i + 1);
@@ -662,10 +667,11 @@ static void test_error_recovery_no_exit(void)
             free(path);
         }
     }
-    
+
     // Final verification: process is still alive and working
     char *path3 = create_temp_file("int main(void) { return 42; }\n");
-    if (path3) {
+    if (path3)
+    {
         PrismResult result = prism_transpile_file(path3, features);
         CHECK_EQ(result.status, PRISM_OK, "process still alive after multiple errors");
         prism_free(&result);
