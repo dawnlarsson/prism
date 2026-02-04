@@ -151,6 +151,12 @@ static inline bool is_attribute_keyword(Token *tok)
   return equal(tok, "__attribute__") || equal(tok, "__attribute") || equal(tok, "__declspec");
 }
 
+// Check if token is identifier-like (TK_IDENT or TK_KEYWORD like 'raw'/'defer')
+static inline bool is_identifier_like(Token *tok)
+{
+  return tok->kind == TK_IDENT || tok->kind == TK_KEYWORD;
+}
+
 // Skip all attributes (GNU-style and C23-style) starting at tok
 // Returns pointer to first token after all attributes
 static Token *skip_all_attributes(Token *tok)
@@ -668,8 +674,8 @@ static bool needs_space(Token *prev, Token *tok)
   char tok_first = tok->loc[0];
 
   // Identifier/keyword followed by identifier/keyword or number
-  if ((prev->kind == TK_IDENT || prev->kind == TK_KEYWORD || prev->kind == TK_NUM) &&
-      (tok->kind == TK_IDENT || tok->kind == TK_KEYWORD || tok->kind == TK_NUM))
+  if ((is_identifier_like(prev) || prev->kind == TK_NUM) &&
+      (is_identifier_like(tok) || tok->kind == TK_NUM))
     return true;
 
   // Punctuation that could merge
@@ -1139,8 +1145,7 @@ static void parse_enum_constants(Token *tok, int scope_depth)
 // Returns false if the most recent entry with this name is a shadow (variable)
 static bool is_known_typedef(Token *tok)
 {
-  // Accept both TK_IDENT and TK_KEYWORD (for typedefs named 'raw' or 'defer')
-  if (tok->kind != TK_IDENT && tok->kind != TK_KEYWORD)
+  if (!is_identifier_like(tok))
     return false;
   int idx = typedef_get_index(tok->loc, tok->len);
   if (idx < 0)
@@ -1152,8 +1157,7 @@ static bool is_known_typedef(Token *tok)
 // Check if token is a known VLA typedef (search most recent first for shadowing)
 static bool is_vla_typedef(Token *tok)
 {
-  // Accept both TK_IDENT and TK_KEYWORD (for typedefs named 'raw' or 'defer')
-  if (tok->kind != TK_IDENT && tok->kind != TK_KEYWORD)
+  if (!is_identifier_like(tok))
     return false;
   int idx = typedef_get_index(tok->loc, tok->len);
   if (idx < 0)
@@ -1167,8 +1171,7 @@ static bool is_vla_typedef(Token *tok)
 // Check if token is a known enum constant (compile-time constant)
 static bool is_known_enum_const(Token *tok)
 {
-  // Accept both TK_IDENT and TK_KEYWORD (for enum constants named 'raw' or 'defer')
-  if (tok->kind != TK_IDENT && tok->kind != TK_KEYWORD)
+  if (!is_identifier_like(tok))
     return false;
   int idx = typedef_get_index(tok->loc, tok->len);
   if (idx < 0)
@@ -1181,9 +1184,6 @@ static bool is_sue_keyword(Token *tok)
 {
   return equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum");
 }
-
-// Forward declaration (defined later in transpiler section)
-static Token *skip_balanced(Token *tok, char *open, char *close);
 
 // Given a struct/union/enum keyword, find its opening brace if it has a body.
 // Handles: "struct {", "struct name {", "struct __attribute__((packed)) name {"
@@ -1299,7 +1299,7 @@ static void scan_labels_in_function(Token *tok)
     // Also handle labels with attributes: identifier __attribute__((...)) :
     // Filter out: ternary operator, switch cases, bitfields
     // Also handle 'defer' keyword used as a label (defer:) - valid if user isn't using defer feature
-    if (tok->kind == TK_IDENT || (tok->kind == TK_KEYWORD && equal(tok, "defer")))
+    if (is_identifier_like(tok))
     {
       // Look ahead for colon, skipping any __attribute__((...)) sequences
       Token *t = tok->next;
@@ -1653,9 +1653,6 @@ static Token *skip_balanced(Token *tok, char *open, char *close)
   return tok;
 }
 
-// Forward declaration for mutual recursion
-static bool is_type_keyword(Token *tok);
-
 // Skip attributes like __attribute__((...)) and __declspec(...)
 static Token *skip_attributes(Token *tok)
 {
@@ -1798,8 +1795,7 @@ static Token *scan_typedef_name(Token **tokp)
 
     tok = skip_attributes(tok);
 
-    // Allow both TK_IDENT and TK_KEYWORD (for typedef names like 'raw' or 'defer')
-    if (tok && (tok->kind == TK_IDENT || tok->kind == TK_KEYWORD))
+    if (tok && is_identifier_like(tok))
     {
       Token *name = tok;
       tok = tok->next;
@@ -1837,8 +1833,7 @@ static Token *scan_typedef_name(Token **tokp)
   }
 
   // Case 2: Direct declarator - name, name[N], name(args)
-  // Allow both TK_IDENT and TK_KEYWORD (for typedef names like 'raw' or 'defer')
-  if (tok && (tok->kind == TK_IDENT || tok->kind == TK_KEYWORD))
+  if (tok && is_identifier_like(tok))
   {
     Token *name = tok;
     tok = tok->next;
@@ -2348,17 +2343,10 @@ static bool is_const_identifier(Token *tok)
 }
 
 // Check if token can be used as a variable name in a declarator.
-// This includes identifiers and prism keywords (raw, defer) which
-// are only special at the start of a declaration, not as variable names.
-static bool is_valid_varname(Token *tok)
+// Identifiers and prism keywords (raw, defer) which are only special at declaration start.
+static inline bool is_valid_varname(Token *tok)
 {
-  if (tok->kind == TK_IDENT)
-    return true;
-  // 'raw' and 'defer' are prism keywords but can be used as variable names
-  // in user code (e.g., "int raw, x;" or "int defer;")
-  if (equal(tok, "raw") || equal(tok, "defer"))
-    return true;
-  return false;
+  return tok->kind == TK_IDENT || equal(tok, "raw") || equal(tok, "defer");
 }
 
 // ============================================================================
@@ -2920,9 +2908,7 @@ static Token *try_zero_init_decl(Token *tok)
       if (equal(after_storage, "raw") && !is_known_typedef(after_storage))
       {
         // Found 'static/extern raw' pattern - emit storage class without 'raw'
-        // Emit the storage class specifier
         emit_tok(tok);
-        Token *storage_tok = tok;
         tok = tok->next;
         // Skip to after 'raw'
         while (tok && tok != after_storage)
@@ -3066,7 +3052,7 @@ static Token *try_zero_init_decl(Token *tok)
 
   // Track variables that need memset for typeof zero-init
   // (We can't use = 0 because typeof might be an array/VLA type)
-  Token *typeof_vars[32]; // Variable name tokens needing memset
+  Token *typeof_vars[MAX_TYPEOF_VARS_PER_DECL]; // Variable name tokens needing memset
   int typeof_var_count = 0;
 
   // Process each declarator
@@ -3102,10 +3088,8 @@ static Token *try_zero_init_decl(Token *tok)
     }
 
     // Track typeof variables for memset emission after declaration
-    if (needs_memset && typeof_var_count < 32)
-    {
+    if (needs_memset && typeof_var_count < MAX_TYPEOF_VARS_PER_DECL)
       typeof_vars[typeof_var_count++] = decl.var_name;
-    }
 
     // Emit initializer if present
     if (decl.has_init)
@@ -3806,11 +3790,8 @@ static int transpile(char *input_file, char *output_file)
         continue;
       }
 
-      // Get the label name - can be an identifier or a keyword used as label (like 'defer')
-      // Keywords like 'defer' can be used as labels if followed by ':'
-      bool is_label_target = (tok->kind == TK_IDENT) ||
-                             (tok->kind == TK_KEYWORD && equal(tok, "defer"));
-      if (is_label_target)
+      // Get the label name - can be an identifier or a keyword used as label
+      if (is_identifier_like(tok))
       {
         // Check if this goto would skip over a defer statement
         Token *skipped = goto_skips_check(goto_tok, tok->loc, tok->len, GOTO_CHECK_DEFER);
@@ -3867,9 +3848,7 @@ static int transpile(char *input_file, char *output_file)
       Token *goto_tok = tok;
       tok = tok->next;
       // Handle keyword labels like 'defer' used as goto target
-      bool is_label_target2 = (tok->kind == TK_IDENT) ||
-                              (tok->kind == TK_KEYWORD && equal(tok, "defer"));
-      if (is_label_target2)
+      if (is_identifier_like(tok))
       {
         Token *skipped_decl = goto_skips_check(goto_tok, tok->loc, tok->len, GOTO_CHECK_DECL);
         if (skipped_decl)
