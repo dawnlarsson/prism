@@ -186,12 +186,14 @@ static int defer_stack_capacity = 0;
 // Track pending loop/switch for next scope
 static bool next_scope_is_loop = false;
 static bool next_scope_is_switch = false;
-static bool next_scope_is_conditional = false; // True for if/while/for blocks (not switch or regular blocks)
-static bool pending_control_flow = false;      // True after if/else/for/while/do/switch until we see { or ;
-static int control_paren_depth = 0;            // Track parens to distinguish for(;;) from braceless body
-static bool in_for_init = false;               // True when inside the init clause of a for loop (before first ;)
-static bool pending_for_paren = false;         // True after seeing 'for', waiting for '(' to start init clause
-static int conditional_block_depth = 0;        // Track nesting depth of if/while/for blocks to detect conditional control exits
+static bool next_scope_is_conditional = false;  // True for if/while/for blocks (not switch or regular blocks)
+static bool pending_control_flow = false;       // True after if/else/for/while/do/switch until we see { or ;
+static int control_paren_depth = 0;             // Track parens to distinguish for(;;) from braceless body
+static int control_brace_depth = 0;             // Track braces inside control parens (compound literals)
+static bool control_parens_just_closed = false; // True immediately after control parens close (depth 1→0)
+static bool in_for_init = false;                // True when inside the init clause of a for loop (before first ;)
+static bool pending_for_paren = false;          // True after seeing 'for', waiting for '(' to start init clause
+static int conditional_block_depth = 0;         // Track nesting depth of if/while/for blocks to detect conditional control exits
 
 static LabelTable label_table;
 static bool current_func_returns_void = false;
@@ -878,7 +880,7 @@ static void typedef_add_entry(char *name, int len, int scope_depth, TypedefKind 
   e->len = len;
   e->scope_depth = scope_depth;
   e->is_vla = (kind == TDK_TYPEDEF) ? is_vla : false;
-  e->is_shadow = (kind == TDK_SHADOW);
+  e->is_shadow = (kind == TDK_SHADOW || kind == TDK_ENUM_CONST); // Enum consts also shadow typedefs
   e->is_enum_const = (kind == TDK_ENUM_CONST);
   e->prev_index = typedef_get_index(name, len);
   typedef_set_index(name, len, new_index);
@@ -923,12 +925,11 @@ static void parse_enum_constants(Token *tok, int scope_depth)
     // Each enum constant is: IDENTIFIER or IDENTIFIER = expr
     if (tok->kind == TK_IDENT)
     {
-      // Register this constant as a shadow if it matches any typedef
-      if (is_known_typedef(tok))
-        typedef_add_shadow(tok->loc, tok->len, scope_depth);
-      else
-        // Register as enum constant for array size detection
-        typedef_add_enum_const(tok->loc, tok->len, scope_depth);
+      // Register enum constant - it shadows any typedef with the same name
+      // Use typedef_add_enum_const which sets both is_shadow and is_enum_const
+      // (is_shadow so is_known_typedef returns false, is_enum_const so
+      // is_known_enum_const returns true for array size detection)
+      typedef_add_enum_const(tok->loc, tok->len, scope_depth);
       tok = tok->next;
 
       // Skip = expr if present
@@ -2994,11 +2995,11 @@ static Token *try_zero_init_decl(Token *tok)
     if (!decl.has_init && !effective_vla && !is_raw)
     {
       // Use = {0} for arrays and aggregates (structs, unions, typedefs)
-      // Use = 0 for scalars
-      // Use PRISM_ATOMIC_INIT macro for all _Atomic types (Clang compat)
+      // Use = 0 for scalars (including _Atomic scalars - works on both GCC and Clang)
+      // Use PRISM_ATOMIC_INIT macro only for _Atomic aggregates (Clang rejects all init for these)
       bool is_aggregate = decl.is_array || ((type.is_struct || type.is_typedef) && !decl.is_pointer);
-      if (type.has_atomic)
-        out_str(is_aggregate ? " PRISM_ATOMIC_INIT({0})" : " PRISM_ATOMIC_INIT(0)", is_aggregate ? 23 : 21);
+      if (type.has_atomic && is_aggregate)
+        out_str(" PRISM_ATOMIC_INIT({0})", 23);
       else if (is_aggregate)
         out_str(" = {0}", 6);
       else
@@ -3244,6 +3245,8 @@ static int transpile(char *input_file, char *output_file)
   next_scope_is_conditional = false;
   pending_control_flow = false;
   control_paren_depth = 0;
+  control_brace_depth = 0;
+  control_parens_just_closed = false;
   in_for_init = false;
   pending_for_paren = false;
   conditional_block_depth = 0;
@@ -3783,6 +3786,10 @@ static int transpile(char *input_file, char *output_file)
       // For 'for' loops, we need to allow zero-init in the init clause
       if (equal(tok, "for"))
         pending_for_paren = true;
+      // For 'do' loops, the body comes immediately (no parens before body)
+      // Set control_parens_just_closed so the next '{' is recognized as the loop body
+      if (equal(tok, "do"))
+        control_parens_just_closed = true;
     }
     // Also track 'for' for zero-init even if defer is disabled
     else if (feature_zeroinit && !feature_defer && tok->kind == TK_KEYWORD && equal(tok, "for"))
@@ -3800,7 +3807,12 @@ static int transpile(char *input_file, char *output_file)
 
     // Mark if/else keywords
     if (tok->kind == TK_KEYWORD && (equal(tok, "if") || equal(tok, "else")))
+    {
       pending_control_flow = true;
+      // For 'else', the body comes immediately (no parens before body like 'if')
+      if (equal(tok, "else"))
+        control_parens_just_closed = true;
+    }
 
     // Handle case/default labels - clear defers from switch scope
     // This prevents defers from leaking across cases (which would cause incorrect behavior
@@ -3826,6 +3838,25 @@ static int transpile(char *input_file, char *output_file)
           {
             // Skip GNU-style attributes: __attribute__((...))
             if (equal(t, "__attribute__") || equal(t, "__attribute"))
+            {
+              t = t->next;
+              if (t && equal(t, "("))
+              {
+                int depth = 1;
+                t = t->next;
+                while (t && depth > 0)
+                {
+                  if (equal(t, "("))
+                    depth++;
+                  else if (equal(t, ")"))
+                    depth--;
+                  t = t->next;
+                }
+              }
+              continue;
+            }
+            // Skip MSVC-style attributes: __declspec(...)
+            else if (equal(t, "__declspec"))
             {
               t = t->next;
               if (t && equal(t, "("))
@@ -3973,7 +4004,22 @@ static int transpile(char *input_file, char *output_file)
         tok = tok->next;
         struct_depth++;
         if (feature_defer)
+        {
+          // If we're inside control flow (e.g., for loop condition with
+          // anonymous struct compound literal), preserve the loop flag!
+          // struct { int x; } inside for(...) should NOT consume next_scope_is_loop.
+          bool save_loop = next_scope_is_loop;
+          bool save_switch = next_scope_is_switch;
+          bool save_conditional = next_scope_is_conditional;
           defer_push_scope();
+          // Restore flags if we're inside control flow
+          if (pending_control_flow)
+          {
+            next_scope_is_loop = save_loop;
+            next_scope_is_switch = save_switch;
+            next_scope_is_conditional = save_conditional;
+          }
+        }
         else
         {
           // Still track scope depth for typedef scoping
@@ -3988,13 +4034,40 @@ static int transpile(char *input_file, char *output_file)
     // Handle '{' - push scope
     if (equal(tok, "{"))
     {
+      // Detect compound literals in control flow expressions.
+
+      // Inside control parens: definitely compound literal
+      if (pending_control_flow && control_paren_depth > 0)
+      {
+        // This is a compound literal inside control expression - just emit and continue
+        // Do NOT call defer_push_scope() or reset control flow flags
+        emit_tok(tok);
+        tok = tok->next;
+        // Track compound literal brace depth separately
+        control_brace_depth++;
+        continue;
+      }
+
+      // Outside control parens but not immediately after they closed: compound literal after condition
+      if (pending_control_flow && control_paren_depth == 0 && !control_parens_just_closed)
+      {
+        // The control parens closed earlier (e.g., for(...) was complete) but then we saw more tokens
+        // before this '{'. This means we're in a compound literal after the condition.
+        emit_tok(tok);
+        tok = tok->next;
+        control_brace_depth++;
+        continue;
+      }
+
       // Track if we're entering a conditional block (if/while/for) for accurate control exit detection
       // Switch blocks are not conditional in the same sense (we always enter one case)
       if (pending_control_flow && !next_scope_is_switch)
         next_scope_is_conditional = true;
 
-      pending_control_flow = false; // Proper braces found
-      control_paren_depth = 0;      // Reset paren tracking (no longer in control expression)
+      pending_control_flow = false;       // Proper braces found
+      control_paren_depth = 0;            // Reset paren tracking (no longer in control expression)
+      control_brace_depth = 0;            // Reset compound literal tracking
+      control_parens_just_closed = false; // Reset this flag too
       // Check if this is a statement expression: ({ ... })
       // The previous emitted token would be '('
       if (last_emitted && equal(last_emitted, "("))
@@ -4030,6 +4103,16 @@ static int transpile(char *input_file, char *output_file)
     // Handle '}' - emit scope defers, then pop
     if (equal(tok, "}"))
     {
+      // If we're closing a compound literal inside control parentheses,
+      // just emit the brace and decrement the tracking counter - no defer handling!
+      if (pending_control_flow && control_paren_depth > 0 && control_brace_depth > 0)
+      {
+        control_brace_depth--;
+        emit_tok(tok);
+        tok = tok->next;
+        continue;
+      }
+
       if (struct_depth > 0)
         struct_depth--;
       typedef_pop_scope(defer_depth); // Pop typedefs at current scope (before depth changes)
@@ -4065,6 +4148,7 @@ static int transpile(char *input_file, char *output_file)
       if (equal(tok, "("))
       {
         control_paren_depth++;
+        control_parens_just_closed = false; // Opening paren, resets the "just closed" state
         // If we just saw 'for' and this is the opening paren, we're entering the init clause
         if (pending_for_paren)
         {
@@ -4078,10 +4162,14 @@ static int transpile(char *input_file, char *output_file)
         control_paren_depth--;
         // Exiting the for() parens entirely clears init state
         if (control_paren_depth == 0)
+        {
           in_for_init = false;
+          control_parens_just_closed = true; // Mark that we just exited control parens
+        }
+        // Note: for inner parens (depth > 0), don't change the flag
       }
       // Semicolon inside for() parens ends the init clause (first ;) and condition (second ;)
-      else if (equal(tok, ";") && control_paren_depth == 1)
+      if (equal(tok, ";") && control_paren_depth == 1)
       {
         if (in_for_init)
         {

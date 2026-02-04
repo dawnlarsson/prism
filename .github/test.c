@@ -7542,6 +7542,85 @@ void test_memory_interning_pattern(void)
     CHECK_EQ(unique_count, 2, "filename interning: 2 unique from 5 entries");
 }
 
+void test_compound_literal_for_break(void)
+{
+    log_reset();
+    for (int i = 0; i < (int){10}; i++) {
+        defer log_append("D");
+        log_append("L");
+        if (i == 0) break;  // BUG: defer must still execute on break!
+    }
+    CHECK_LOG("LD", "compound literal for loop: defer on break");
+}
+
+void test_compound_literal_for_continue(void)
+{
+    log_reset();
+    for (int i = 0; i < (int){2}; i++) {
+        defer log_append("D");
+        log_append("C");
+        if (i == 0) continue;  // defer must execute on continue too
+        log_append("X");
+    }
+    CHECK_LOG("CDCXD", "compound literal for loop: defer on continue");
+}
+
+void test_compound_literal_while_break(void)
+{
+    log_reset();
+    int i = 0;
+    while (i < (int){5}) {
+        defer log_append("W");
+        log_append("B");
+        if (i == 0) break;
+        i++;
+    }
+    CHECK_LOG("BW", "compound literal while loop: defer on break");
+}
+
+void test_nested_compound_literal_in_loop(void)
+{
+    log_reset();
+    struct { int x; } s;
+    for (int i = 0; i < ((struct { int x; }){3}).x; i++) {
+        defer log_append("N");
+        log_append("I");
+        if (i == 1) break;
+    }
+    CHECK_LOG("ININ", "nested compound literal in for: defer on break");
+}
+
+void test_multiple_compound_literals_in_for(void)
+{
+    log_reset();
+    for (int i = (int){0}; i < (int){2}; i += (int){1}) {
+        defer log_append("M");
+        log_append("X");
+    }
+    CHECK_LOG("XMXM", "multiple compound literals in for: defer executes each iteration");
+}
+
+void test_compound_literal_if_condition(void)
+{
+    log_reset();
+    if ((int){1}) {
+        defer log_append("I");
+        log_append("T");
+    }
+    CHECK_LOG("TI", "compound literal in if condition: defer works");
+}
+
+void run_compound_literal_loop_tests(void)
+{
+    printf("\n=== COMPOUND LITERAL IN LOOP HEADER TESTS ===\n");
+    test_compound_literal_for_break();
+    test_compound_literal_for_continue();
+    test_compound_literal_while_break();
+    test_nested_compound_literal_in_loop();
+    test_multiple_compound_literals_in_for();
+    test_compound_literal_if_condition();
+}
+
 void run_bug_fix_verification_tests(void)
 {
     printf("\n=== BUG FIX VERIFICATION TESTS ===\n");
@@ -7551,6 +7630,27 @@ void run_bug_fix_verification_tests(void)
     test_tcc_detection_logic();
     test_unicode_extended_ranges();
     test_memory_interning_pattern();
+}
+
+typedef int GlobalEnumShadowType;
+
+void test_enum_shadow_zeroinit(void)
+{
+    // Enum constant shadows the global typedef
+    enum { GlobalEnumShadowType = 5 };
+    
+    // Array size is compile-time constant (enum), so should be zero-initialized
+    int arr[GlobalEnumShadowType];
+    int sum = 0;
+    for (int i = 0; i < GlobalEnumShadowType; i++)
+        sum += arr[i];
+    CHECK_EQ(sum, 0, "enum constant shadowing typedef: array zero-initialized");
+}
+
+void run_enum_shadow_tests(void)
+{
+    printf("\n=== ENUM SHADOW ZERO-INIT TESTS ===\n");
+    test_enum_shadow_zeroinit();
 }
 
 int main(void)
@@ -7581,6 +7681,8 @@ int main(void)
     run_parsing_edge_case_tests();
     run_unicode_digraph_tests();
     run_bug_fix_verification_tests();
+    run_compound_literal_loop_tests();
+    run_enum_shadow_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);
