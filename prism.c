@@ -2832,6 +2832,12 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
   emit_tok(tok);
   tok = tok->next;
 
+  // Skip __attribute__ after variable name
+  while (equal(tok, "__attribute__") || equal(tok, "__attribute"))
+  {
+    tok = skip_emit_attribute(tok);
+  }
+
   // Array dims inside parens: (*name[N])
   if (r.has_paren && equal(tok, "["))
   {
@@ -2881,6 +2887,12 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
   {
     r.is_array = true;
     tok = emit_array_dims(tok, &r.is_vla);
+  }
+
+  // Skip __attribute__ before initializer or end of declarator
+  while (equal(tok, "__attribute__") || equal(tok, "__attribute"))
+  {
+    tok = skip_emit_attribute(tok);
   }
 
   r.has_init = equal(tok, "=");
@@ -3088,11 +3100,21 @@ static Token *try_zero_init_decl(Token *tok)
   bool seen_ident = false;
   while (scan && scan->kind != TK_EOF)
   {
+    // Skip __attribute__((...)) in the scan - it's not a function call or identifier
+    if (equal(scan, "__attribute__") || equal(scan, "__attribute"))
+    {
+      scan = scan->next;
+      if (scan && equal(scan, "("))
+        scan = skip_balanced(scan, "(", ")");
+      continue;
+    }
     if (equal(scan, "(") || equal(scan, "[") || equal(scan, "{"))
     {
-      if (equal(scan, "(") && scan->next && equal(scan->next, "{"))
+      // Statement expression at top level - can't safely zero-init
+      // But allow statement expressions nested inside array dims or parens
+      if (scan_depth == 0 && equal(scan, "(") && scan->next && equal(scan->next, "{"))
       {
-        return NULL; // Statement expression
+        return NULL; // Statement expression at top level
       }
       if (equal(scan, "(") && scan_depth == 0 && seen_ident)
       {
@@ -3138,6 +3160,11 @@ static Token *try_zero_init_decl(Token *tok)
   // Emit base type
   emit_range(start, type.end);
 
+  // Track variables that need memset for typeof zero-init
+  // (We can't use = 0 because typeof might be an array/VLA type)
+  Token *typeof_vars[32];  // Variable name tokens needing memset
+  int typeof_var_count = 0;
+
   // Process each declarator
   while (tok && tok->kind != TK_EOF)
   {
@@ -3147,13 +3174,16 @@ static Token *try_zero_init_decl(Token *tok)
 
     tok = decl.end;
 
-    // Determine effective VLA status
+    // Determine effective VLA status (excluding typeof - we handle it specially now)
     bool effective_vla = (decl.is_vla && !decl.has_paren) ||
-                         (type.is_vla && !decl.is_pointer) ||
-                         type.has_typeof;
+                         (type.is_vla && !decl.is_pointer);
 
-    // Add zero initializer if needed
-    if (!decl.has_init && !effective_vla && !is_raw)
+    // For typeof declarations, we use memset instead of = 0 or = {0}
+    // because we can't know at transpile time if it's a scalar, array, or VLA
+    bool needs_memset = type.has_typeof && !decl.has_init && !is_raw && !decl.is_pointer;
+
+    // Add zero initializer if needed (for non-typeof types)
+    if (!decl.has_init && !effective_vla && !is_raw && !needs_memset)
     {
       // Use = {0} for arrays and aggregates (structs, unions, typedefs)
       // Use = 0 for scalars (including _Atomic scalars - works on both GCC and Clang)
@@ -3165,6 +3195,12 @@ static Token *try_zero_init_decl(Token *tok)
         out_str(" = {0}", 6);
       else
         out_str(" = 0", 4);
+    }
+
+    // Track typeof variables for memset emission after declaration
+    if (needs_memset && typeof_var_count < 32)
+    {
+      typeof_vars[typeof_var_count++] = decl.var_name;
     }
 
     // Emit initializer if present
@@ -3194,6 +3230,15 @@ static Token *try_zero_init_decl(Token *tok)
     if (equal(tok, ";"))
     {
       emit_tok(tok);
+      // Emit memset for typeof variables (after declaration is complete)
+      for (int i = 0; i < typeof_var_count; i++)
+      {
+        out_str(" memset(&", 9);
+        out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
+        out_str(", 0, sizeof(", 12);
+        out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
+        out_str("));", 3);
+      }
       return tok->next;
     }
     else if (equal(tok, ","))
