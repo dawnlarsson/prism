@@ -1557,17 +1557,10 @@ static char *scan_pp_number(char *p)
         }
         else if (isalpha(*p))
         {
-            char c = *p;
-            if ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') ||
-                c == 'x' || c == 'X' || c == 'b' || c == 'B' ||
-                c == 'e' || c == 'E' || c == 'p' || c == 'P' ||
-                c == 'u' || c == 'U' || c == 'l' || c == 'L' ||
-                c == 'f' || c == 'F')
-            {
-                p++;
-            }
-            else
-                break;
+            // Accept any alphabetic character as part of pp-number
+            // This handles: hex digits (a-f, A-F), standard suffixes (u, l, f),
+            // GCC imaginary (i, j), GCC fixed-point (k, r), and future extensions
+            p++;
         }
         else
             break;
