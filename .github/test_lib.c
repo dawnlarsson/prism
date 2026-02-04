@@ -14,7 +14,7 @@
 #ifndef PRISM_LIB_MODE
 #define PRISM_LIB_MODE
 #endif
-#include "prism.c"
+#include "../prism.c"
 
 #include <assert.h>
 #include <sys/resource.h>
