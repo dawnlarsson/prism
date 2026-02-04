@@ -4254,6 +4254,55 @@ static void prism_free(PrismResult *r)
   }
 }
 
+// Reset all transpiler state for clean reuse (prevents memory leaks on repeated use)
+static void prism_reset(void)
+{
+  // Full tokenizer cleanup (parse.c) - frees arena blocks
+  tokenizer_cleanup();
+
+  // Reset defer stack
+  for (int i = 0; i < defer_stack_capacity; i++)
+  {
+    free(defer_stack[i].stmts);
+    free(defer_stack[i].ends);
+    free(defer_stack[i].defer_tok);
+    defer_stack[i].stmts = NULL;
+    defer_stack[i].ends = NULL;
+    defer_stack[i].defer_tok = NULL;
+    defer_stack[i].count = 0;
+    defer_stack[i].capacity = 0;
+  }
+  free(defer_stack);
+  defer_stack = NULL;
+  defer_depth = 0;
+  defer_stack_capacity = 0;
+
+  // Reset label table
+  free(label_table.labels);
+  label_table.labels = NULL;
+  label_table.count = 0;
+  label_table.capacity = 0;
+  hashmap_clear(&label_table.name_map);
+
+  // Reset typedef table (already has reset function but doesn't free hashmap buckets)
+  typedef_table_reset();
+
+  // Reset system includes
+  system_includes_reset();
+
+  // Reset statement expression tracking
+  free(stmt_expr_levels);
+  stmt_expr_levels = NULL;
+  stmt_expr_count = 0;
+  stmt_expr_capacity = 0;
+
+  // Reset output state
+  last_emitted = NULL;
+  last_line_no = 0;
+  last_filename = NULL;
+  last_system_header = false;
+}
+
 // CLI IMPLEMENTATION (excluded with -DPRISM_LIB_MODE)
 
 #ifndef PRISM_LIB_MODE

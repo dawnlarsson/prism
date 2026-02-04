@@ -153,6 +153,20 @@ static void arena_reset(void)
     token_arena.current = token_arena.head;
 }
 
+// Fully free all arena blocks (for complete cleanup)
+static void arena_free(void)
+{
+    ArenaBlock *b = token_arena.head;
+    while (b)
+    {
+        ArenaBlock *next = b->next;
+        free(b);
+        b = next;
+    }
+    token_arena.head = NULL;
+    token_arena.current = NULL;
+}
+
 // String allocation tracker - tracks malloc'd strings for cleanup
 static char **string_allocs = NULL;
 static int string_alloc_count = 0;
@@ -434,14 +448,22 @@ static void warn_tok(Token *tok, char *fmt, ...)
 // Check if token matches a digraph and return its canonical equivalent
 static inline const char *digraph_equiv(Token *tok)
 {
-    if (tok->kind != TK_PUNCT) return NULL;
-    if (tok->len == 4 && !memcmp(tok->loc, "%:%:", 4)) return "##";
-    if (tok->len == 2) {
-        if (!memcmp(tok->loc, "<:", 2)) return "[";
-        if (!memcmp(tok->loc, ":>", 2)) return "]";
-        if (!memcmp(tok->loc, "<%", 2)) return "{";
-        if (!memcmp(tok->loc, "%>", 2)) return "}";
-        if (!memcmp(tok->loc, "%:", 2)) return "#";
+    if (tok->kind != TK_PUNCT)
+        return NULL;
+    if (tok->len == 4 && !memcmp(tok->loc, "%:%:", 4))
+        return "##";
+    if (tok->len == 2)
+    {
+        if (!memcmp(tok->loc, "<:", 2))
+            return "[";
+        if (!memcmp(tok->loc, ":>", 2))
+            return "]";
+        if (!memcmp(tok->loc, "<%", 2))
+            return "{";
+        if (!memcmp(tok->loc, "%>", 2))
+            return "}";
+        if (!memcmp(tok->loc, "%:", 2))
+            return "#";
     }
     return NULL;
 }
@@ -546,11 +568,15 @@ static inline bool is_utf8_cont(unsigned char c) { return (c & 0xC0) == 0x80; }
 // Get the number of bytes in a UTF-8 sequence from the leading byte
 static int utf8_char_len(unsigned char c)
 {
-    if ((c & 0x80) == 0) return 1;      // 0xxxxxxx - ASCII
-    if ((c & 0xE0) == 0xC0) return 2;   // 110xxxxx
-    if ((c & 0xF0) == 0xE0) return 3;   // 1110xxxx
-    if ((c & 0xF8) == 0xF0) return 4;   // 11110xxx
-    return 0; // Invalid
+    if ((c & 0x80) == 0)
+        return 1; // 0xxxxxxx - ASCII
+    if ((c & 0xE0) == 0xC0)
+        return 2; // 110xxxxx
+    if ((c & 0xF0) == 0xE0)
+        return 3; // 1110xxxx
+    if ((c & 0xF8) == 0xF0)
+        return 4; // 11110xxx
+    return 0;     // Invalid
 }
 
 // Decode a UTF-8 character and return its Unicode codepoint
@@ -558,19 +584,33 @@ static uint32_t decode_utf8(char *p, int *len)
 {
     unsigned char *s = (unsigned char *)p;
     int n = utf8_char_len(s[0]);
-    if (n == 0) { *len = 1; return 0; }
-    
+    if (n == 0)
+    {
+        *len = 1;
+        return 0;
+    }
+
     // Validate continuation bytes
     for (int i = 1; i < n; i++)
-        if (!is_utf8_cont(s[i])) { *len = 1; return 0; }
-    
+        if (!is_utf8_cont(s[i]))
+        {
+            *len = 1;
+            return 0;
+        }
+
     *len = n;
-    switch (n) {
-    case 1: return s[0];
-    case 2: return ((s[0] & 0x1F) << 6) | (s[1] & 0x3F);
-    case 3: return ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
-    case 4: return ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
-    default: return 0;
+    switch (n)
+    {
+    case 1:
+        return s[0];
+    case 2:
+        return ((s[0] & 0x1F) << 6) | (s[1] & 0x3F);
+    case 3:
+        return ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+    case 4:
+        return ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+    default:
+        return 0;
     }
 }
 
@@ -578,30 +618,42 @@ static uint32_t decode_utf8(char *p, int *len)
 // Simplified: allows Latin letters, Greek, Cyrillic, CJK, and common scripts
 static bool is_ident_start_unicode(uint32_t cp)
 {
-    if (cp < 0x80) return isalpha(cp) || cp == '_' || cp == '$';
+    if (cp < 0x80)
+        return isalpha(cp) || cp == '_' || cp == '$';
     // Latin Extended, Greek, Cyrillic
-    if (cp >= 0x00C0 && cp <= 0x024F) return true;
-    if (cp >= 0x0370 && cp <= 0x03FF) return true;  // Greek
-    if (cp >= 0x0400 && cp <= 0x04FF) return true;  // Cyrillic
+    if (cp >= 0x00C0 && cp <= 0x024F)
+        return true;
+    if (cp >= 0x0370 && cp <= 0x03FF)
+        return true; // Greek
+    if (cp >= 0x0400 && cp <= 0x04FF)
+        return true; // Cyrillic
     // CJK Unified Ideographs
-    if (cp >= 0x4E00 && cp <= 0x9FFF) return true;
+    if (cp >= 0x4E00 && cp <= 0x9FFF)
+        return true;
     // Hiragana & Katakana
-    if (cp >= 0x3040 && cp <= 0x30FF) return true;
+    if (cp >= 0x3040 && cp <= 0x30FF)
+        return true;
     // Hangul
-    if (cp >= 0xAC00 && cp <= 0xD7AF) return true;
+    if (cp >= 0xAC00 && cp <= 0xD7AF)
+        return true;
     // Common identifier characters in other scripts
-    if (cp >= 0x0600 && cp <= 0x06FF) return true;  // Arabic
-    if (cp >= 0x0900 && cp <= 0x097F) return true;  // Devanagari
+    if (cp >= 0x0600 && cp <= 0x06FF)
+        return true; // Arabic
+    if (cp >= 0x0900 && cp <= 0x097F)
+        return true; // Devanagari
     return false;
 }
 
 // Check if a Unicode codepoint is valid for identifier continuation (XID_Continue)
 static bool is_ident_cont_unicode(uint32_t cp)
 {
-    if (cp < 0x80) return isalnum(cp) || cp == '_' || cp == '$';
-    if (is_ident_start_unicode(cp)) return true;
+    if (cp < 0x80)
+        return isalnum(cp) || cp == '_' || cp == '$';
+    if (is_ident_start_unicode(cp))
+        return true;
     // Combining marks and modifiers
-    if (cp >= 0x0300 && cp <= 0x036F) return true;  // Combining diacritics
+    if (cp >= 0x0300 && cp <= 0x036F)
+        return true; // Combining diacritics
     return false;
 }
 
@@ -609,20 +661,26 @@ static bool is_ident_cont_unicode(uint32_t cp)
 // Returns the number of bytes consumed, or 0 if not a valid UCN
 static int read_ucn(char *p, uint32_t *cp)
 {
-    if (p[0] != '\\') return 0;
+    if (p[0] != '\\')
+        return 0;
     int hex_len = 0;
-    if (p[1] == 'u') hex_len = 4;
-    else if (p[1] == 'U') hex_len = 8;
-    else return 0;
-    
+    if (p[1] == 'u')
+        hex_len = 4;
+    else if (p[1] == 'U')
+        hex_len = 8;
+    else
+        return 0;
+
     uint32_t val = 0;
-    for (int i = 0; i < hex_len; i++) {
+    for (int i = 0; i < hex_len; i++)
+    {
         int h = from_hex(p[2 + i]);
-        if (h < 0) return 0;
+        if (h < 0)
+            return 0;
         val = (val << 4) | h;
     }
     *cp = val;
-    return 2 + hex_len;  // \ + u/U + hex digits
+    return 2 + hex_len; // \ + u/U + hex digits
 }
 
 // Tokenizer helpers
@@ -631,32 +689,41 @@ static int read_ident(char *start)
     char *p = start;
     uint32_t cp;
     int len;
-    
+
     // Check for UCN at start
     len = read_ucn(p, &cp);
-    if (len > 0) {
-        if (!is_ident_start_unicode(cp)) return 0;
-        p += len;
-    } else {
-        // Check for UTF-8 or ASCII start
-        cp = decode_utf8(p, &len);
-        if (!is_ident_start_unicode(cp)) return 0;
+    if (len > 0)
+    {
+        if (!is_ident_start_unicode(cp))
+            return 0;
         p += len;
     }
-    
+    else
+    {
+        // Check for UTF-8 or ASCII start
+        cp = decode_utf8(p, &len);
+        if (!is_ident_start_unicode(cp))
+            return 0;
+        p += len;
+    }
+
     // Continue reading identifier characters
-    while (*p) {
+    while (*p)
+    {
         len = read_ucn(p, &cp);
-        if (len > 0) {
-            if (!is_ident_cont_unicode(cp)) break;
+        if (len > 0)
+        {
+            if (!is_ident_cont_unicode(cp))
+                break;
             p += len;
             continue;
         }
         cp = decode_utf8(p, &len);
-        if (!is_ident_cont_unicode(cp)) break;
+        if (!is_ident_cont_unicode(cp))
+            break;
         p += len;
     }
-    
+
     return p - start;
 }
 
@@ -672,9 +739,14 @@ static int from_hex(char c)
 }
 
 // Digraph translation table
-typedef struct { char *digraph; int len; char *equiv; } Digraph;
+typedef struct
+{
+    char *digraph;
+    int len;
+    char *equiv;
+} Digraph;
 static Digraph digraphs[] = {
-    {"%:%:", 4, "##"},  // Must come before %:
+    {"%:%:", 4, "##"}, // Must come before %:
     {"<:", 2, "["},
     {":>", 2, "]"},
     {"<%", 2, "{"},
@@ -688,7 +760,7 @@ static int read_punct(char *p)
     for (size_t i = 0; i < sizeof(digraphs) / sizeof(*digraphs); i++)
         if (!strncmp(p, digraphs[i].digraph, digraphs[i].len))
             return digraphs[i].len;
-    
+
     static char *kw[] = {
         "<<=",
         ">>=",
@@ -1340,11 +1412,25 @@ Token *tokenize_file(char *path)
     return tokenize(file);
 }
 
-// Reset state for reuse
+// Reset state for reuse (keeps arena blocks for reuse)
 void tokenizer_reset(void)
 {
     free_string_allocs();
     arena_reset();
+    for (int i = 0; i < input_file_count; i++)
+        free_file(input_files[i]);
+    free(input_files);
+    input_files = NULL;
+    input_file_count = 0;
+    input_file_capacity = 0;
+    current_file = NULL;
+}
+
+// Full cleanup - frees all memory including arena blocks
+void tokenizer_cleanup(void)
+{
+    free_string_allocs();
+    arena_free();
     for (int i = 0; i < input_file_count; i++)
         free_file(input_files[i]);
     free(input_files);
