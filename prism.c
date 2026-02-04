@@ -2994,11 +2994,11 @@ static Token *try_zero_init_decl(Token *tok)
     if (!decl.has_init && !effective_vla && !is_raw)
     {
       // Use = {0} for arrays and aggregates (structs, unions, typedefs)
-      // Use = 0 for scalars (including _Atomic scalars)
-      // Use PRISM_ATOMIC_INIT macro for _Atomic aggregates (GCC vs Clang compat)
+      // Use = 0 for scalars
+      // Use PRISM_ATOMIC_INIT macro for all _Atomic types (Clang compat)
       bool is_aggregate = decl.is_array || ((type.is_struct || type.is_typedef) && !decl.is_pointer);
-      if (type.has_atomic && is_aggregate)
-        out_str(" PRISM_ATOMIC_INIT", 18);
+      if (type.has_atomic)
+        out_str(is_aggregate ? " PRISM_ATOMIC_INIT({0})" : " PRISM_ATOMIC_INIT(0)", is_aggregate ? 23 : 21);
       else if (is_aggregate)
         out_str(" = {0}", 6);
       else
@@ -3223,13 +3223,13 @@ static int transpile(char *input_file, char *output_file)
   }
   out_init(out_fp);
 
-  // Emit compatibility macro for _Atomic aggregate initialization
-  // GCC accepts {0}, Clang doesn't support any initializer syntax
-  out_str("/* Prism: _Atomic aggregate compatibility */\n", 45);
+  // Emit compatibility macros for _Atomic initialization
+  // Clang has issues with _Atomic initialization, GCC works correctly
+  out_str("/* Prism: _Atomic compatibility macros */\n", 42);
   out_str("#ifdef __clang__\n", 17);
-  out_str("#define PRISM_ATOMIC_INIT\n", 26);
+  out_str("#define PRISM_ATOMIC_INIT(v)\n", 29);
   out_str("#else\n", 6);
-  out_str("#define PRISM_ATOMIC_INIT = {0}\n", 32);
+  out_str("#define PRISM_ATOMIC_INIT(v) = v\n", 33);
   out_str("#endif\n\n", 8);
 
   // Reset state

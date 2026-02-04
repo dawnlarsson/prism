@@ -119,9 +119,10 @@ static void test_basic_transpile(void)
     CHECK(result.output_len > 0, "output has content");
     CHECK(result.error_msg == NULL, "no error message");
 
-    // Check that zero-init was applied
+    // Check that zero-init was applied (may be = {0}, = 0, or PRISM_ATOMIC_INIT macro)
     CHECK(strstr(result.output, "= {0}") != NULL ||
-              strstr(result.output, "= 0") != NULL,
+              strstr(result.output, "= 0") != NULL ||
+              strstr(result.output, "PRISM_ATOMIC_INIT") != NULL,
           "zero-init applied");
 
     prism_free(&result);
