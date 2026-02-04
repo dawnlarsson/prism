@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.98.4"
+#define PRISM_VERSION "0.98.5"
 
 #include "parse.c"
 
@@ -2363,6 +2363,19 @@ static Token *skip_leading_attributes(Token *tok)
   return tok;
 }
 
+// Skip _Pragma(...) operator sequences (C99 6.10.9)
+// _Pragma is equivalent to #pragma but can appear in macro expansions
+// Returns the token after all _Pragma(...) sequences
+static Token *skip_pragma_operators(Token *tok)
+{
+  while (tok && equal(tok, "_Pragma") && tok->next && equal(tok->next, "("))
+  {
+    tok = tok->next;                    // skip _Pragma
+    tok = skip_balanced(tok, "(", ")"); // skip (...)
+  }
+  return tok;
+}
+
 // Type specifier parsing result
 typedef struct
 {
@@ -2787,9 +2800,11 @@ static Token *try_zero_init_decl(Token *tok)
   }
 
   Token *decl_start_for_warning = tok;
+  Token *pragma_start = tok; // Remember start for emitting _Pragma sequences
 
-  // Skip leading [[ ... ]] attributes
+  // Skip leading [[ ... ]] attributes and _Pragma(...) operators
   tok = skip_leading_attributes(tok);
+  tok = skip_pragma_operators(tok);
   Token *start = tok;
 
   // Check for 'raw' keyword - skip zero-init for this declaration
@@ -2803,6 +2818,11 @@ static Token *try_zero_init_decl(Token *tok)
     start = tok;
     decl_start_for_warning = tok;
   }
+
+  // Skip any _Pragma after 'raw' as well
+  tok = skip_pragma_operators(tok);
+  if (tok != start && !is_raw)
+    start = tok; // Update start if we skipped more _Pragma
 
   if (is_skip_decl_keyword(tok))
   {
@@ -2907,6 +2927,10 @@ static Token *try_zero_init_decl(Token *tok)
               "variable declaration before first 'case' label in switch. "
               "Move this declaration before the switch, or use 'raw' to suppress zero-init.");
   }
+
+  // Emit leading _Pragma operators (if any) before the type
+  if (pragma_start != start)
+    emit_range(pragma_start, start);
 
   // Emit base type
   emit_range(start, type.end);
@@ -4049,6 +4073,16 @@ static int transpile(char *input_file, char *output_file)
     // Track statement boundaries for zero-init
     if (equal(tok, ";") && !pending_control_flow)
       at_stmt_start = true;
+
+    // Preprocessor directives don't consume statement-start position
+    // This is important for _Pragma which expands to #pragma before declarations
+    if (tok->kind == TK_PREP_DIR)
+    {
+      emit_tok(tok);
+      tok = tok->next;
+      at_stmt_start = true; // Next token is still at statement start
+      continue;
+    }
 
     // Reset void function detection at top-level semicolons
     // This prevents function declarations like "void foo(void);" from affecting

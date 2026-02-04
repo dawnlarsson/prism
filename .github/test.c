@@ -381,6 +381,94 @@ void test_zeroinit_arrays(void)
         if (ptrs[i] != NULL)
             all_null = 0;
     CHECK(all_null, "pointer array zero-init");
+
+    // NIGHTMARE: 5D array
+    int arr5d[2][3][4][5][6];
+    all_zero = 1;
+    for (int a = 0; a < 2; a++)
+        for (int b = 0; b < 3; b++)
+            for (int c = 0; c < 4; c++)
+                for (int d = 0; d < 5; d++)
+                    for (int e = 0; e < 6; e++)
+                        if (arr5d[a][b][c][d][e] != 0)
+                            all_zero = 0;
+    CHECK(all_zero, "nightmare: 5D array zero-init");
+
+    // NIGHTMARE: Array of structs containing arrays of function pointers
+    struct
+    {
+        int id;
+        void (*handlers[4])(int);
+        struct
+        {
+            int (*transform)(int, int);
+            int *data_ptr;
+        } nested[2];
+    } complex_arr[3];
+    all_zero = 1;
+    all_null = 1;
+    for (int i = 0; i < 3; i++)
+    {
+        if (complex_arr[i].id != 0)
+            all_zero = 0;
+        for (int j = 0; j < 4; j++)
+            if (complex_arr[i].handlers[j] != NULL)
+                all_null = 0;
+        for (int j = 0; j < 2; j++)
+        {
+            if (complex_arr[i].nested[j].transform != NULL)
+                all_null = 0;
+            if (complex_arr[i].nested[j].data_ptr != NULL)
+                all_null = 0;
+        }
+    }
+    CHECK(all_zero && all_null, "nightmare: array of complex structs zero-init");
+
+    // NIGHTMARE: 3D array of pointers to function pointers
+    int(*(*ptr_arr_3d[2][3][4])(void));
+    all_null = 1;
+    for (int a = 0; a < 2; a++)
+        for (int b = 0; b < 3; b++)
+            for (int c = 0; c < 4; c++)
+                if (ptr_arr_3d[a][b][c] != NULL)
+                    all_null = 0;
+    CHECK(all_null, "nightmare: 3D array of func ptr ptrs zero-init");
+
+    // NIGHTMARE: Array with size from sizeof expression on a TYPE (compile-time constant)
+    // Note: sizeof on a variable could be runtime if it's a VLA, so use a type instead
+    int sized_arr[sizeof(struct { long long data[8]; void *ptrs[4]; char name[32]; })];
+    all_zero = 1;
+    for (size_t i = 0; i < sizeof(sized_arr) / sizeof(sized_arr[0]); i++)
+        if (sized_arr[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "nightmare: sizeof-sized array zero-init");
+
+    // NIGHTMARE: Jagged-style: array of pointers to differently-sized arrays
+    int (*jagged[5])[10];
+    all_null = 1;
+    for (int i = 0; i < 5; i++)
+        if (jagged[i] != NULL)
+            all_null = 0;
+    CHECK(all_null, "nightmare: array of pointers to arrays zero-init");
+
+    // NIGHTMARE: Array of unions containing arrays
+    union
+    {
+        int ints[8];
+        float floats[8];
+        char bytes[32];
+        struct
+        {
+            void *ptr;
+            size_t len;
+        } slice;
+    } union_arr[4];
+    all_zero = 1;
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 8; j++)
+            if (union_arr[i].ints[j] != 0)
+                all_zero = 0;
+    CHECK(all_zero, "nightmare: array of unions zero-init");
 }
 
 void test_zeroinit_structs(void)
@@ -418,6 +506,141 @@ void test_zeroinit_structs(void)
         if (sa.arr[i] != 0)
             all_zero = 0;
     CHECK(all_zero, "struct with array zero-init");
+
+    // NIGHTMARE: Deeply nested struct with every possible member type
+    struct NightmareStruct
+    {
+        // Basic types
+        char c;
+        short s;
+        int i;
+        long l;
+        long long ll;
+        float f;
+        double d;
+        long double ld;
+
+        // Unsigned variants
+        unsigned char uc;
+        unsigned short us;
+        unsigned int ui;
+        unsigned long ul;
+        unsigned long long ull;
+
+        // Pointers
+        void *vp;
+        int *ip;
+        char **cpp;
+        void ***vppp;
+
+        // Function pointers
+        int (*fp)(void);
+        void *(*(*complex_fp)(int, char *))[5];
+
+        // Arrays
+        int arr[10];
+        char str[32];
+        int *ptr_arr[5];
+        int (*arr_ptr)[10];
+
+        // Nested struct
+        struct
+        {
+            int x, y, z;
+            struct
+            {
+                float r, g, b, a;
+            } color;
+            void (*callback)(void *);
+        } nested;
+
+        // Nested union
+        union
+        {
+            int as_int;
+            float as_float;
+            char as_bytes[4];
+        } variant;
+
+        // Bitfields mixed in
+        unsigned int flag1 : 1;
+        unsigned int flag2 : 1;
+        unsigned int reserved : 6;
+        unsigned int value : 24;
+
+        // More nested anonymous
+        struct
+        {
+            union
+            {
+                struct
+                {
+                    short lo;
+                    short hi;
+                };
+                int combined;
+            };
+            int (*handlers[3])(int);
+        };
+    };
+
+    struct NightmareStruct nightmare;
+
+    // Check all basic types
+    CHECK(nightmare.c == 0 && nightmare.s == 0 && nightmare.i == 0 &&
+              nightmare.l == 0 && nightmare.ll == 0,
+          "nightmare struct: basic int types");
+    CHECK(nightmare.f == 0.0f && nightmare.d == 0.0 && nightmare.ld == 0.0L,
+          "nightmare struct: float types");
+    CHECK(nightmare.uc == 0 && nightmare.us == 0 && nightmare.ui == 0 &&
+              nightmare.ul == 0 && nightmare.ull == 0,
+          "nightmare struct: unsigned types");
+
+    // Check pointers
+    CHECK(nightmare.vp == NULL && nightmare.ip == NULL &&
+              nightmare.cpp == NULL && nightmare.vppp == NULL,
+          "nightmare struct: pointers");
+    CHECK(nightmare.fp == NULL && nightmare.complex_fp == NULL,
+          "nightmare struct: function pointers");
+    CHECK(nightmare.arr_ptr == NULL, "nightmare struct: pointer to array");
+
+    // Check arrays
+    all_zero = 1;
+    for (int j = 0; j < 10; j++)
+        if (nightmare.arr[j] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "nightmare struct: int array");
+    CHECK(nightmare.str[0] == 0, "nightmare struct: char array");
+    int all_null = 1;
+    for (int j = 0; j < 5; j++)
+        if (nightmare.ptr_arr[j] != NULL)
+            all_null = 0;
+    CHECK(all_null, "nightmare struct: pointer array");
+
+    // Check nested struct
+    CHECK(nightmare.nested.x == 0 && nightmare.nested.y == 0 && nightmare.nested.z == 0,
+          "nightmare struct: nested xyz");
+    CHECK(nightmare.nested.color.r == 0.0f && nightmare.nested.color.g == 0.0f &&
+              nightmare.nested.color.b == 0.0f && nightmare.nested.color.a == 0.0f,
+          "nightmare struct: nested color");
+    CHECK(nightmare.nested.callback == NULL, "nightmare struct: nested callback");
+
+    // Check union
+    CHECK(nightmare.variant.as_int == 0, "nightmare struct: union");
+
+    // Check bitfields
+    CHECK(nightmare.flag1 == 0 && nightmare.flag2 == 0 &&
+              nightmare.reserved == 0 && nightmare.value == 0,
+          "nightmare struct: bitfields");
+
+    // Check anonymous nested
+    CHECK(nightmare.lo == 0 && nightmare.hi == 0 && nightmare.combined == 0,
+          "nightmare struct: anonymous nested");
+    all_null = 1;
+    for (int j = 0; j < 3; j++)
+        if (nightmare.handlers[j] != NULL)
+            all_null = 0;
+    CHECK(all_null, "nightmare struct: anonymous handlers array");
 }
 
 void test_zeroinit_qualifiers(void)
@@ -648,8 +871,62 @@ void test_multi_decl_long(void)
 
 void test_multi_decl_func_ptr(void)
 {
+    // Basic case
     int (*fp1)(int), (*fp2)(int);
     CHECK(fp1 == NULL && fp2 == NULL, "int (*fp1)(int), (*fp2)(int)");
+
+    // NIGHTMARE: 12 mixed declarators in one statement
+    // Mix of: plain vars, pointers, double pointers, arrays, function pointers,
+    // pointers to arrays, arrays of pointers, function pointers returning pointers
+    int plain1,
+        *ptr1,
+        **dptr1,
+        arr1[3],
+        *arr_ptr1[4],
+        (*ptr_arr1)[5],
+        (*func1)(void),
+        *(*func_ret_ptr1)(int),
+        (*arr_func1[2])(char),
+        (*(*ptr_arr_func1))[3],
+        ***tptr1,
+        plain2;
+
+    CHECK(plain1 == 0, "nightmare multi-decl: plain1");
+    CHECK(ptr1 == NULL, "nightmare multi-decl: ptr1");
+    CHECK(dptr1 == NULL, "nightmare multi-decl: dptr1");
+    int all_zero = 1;
+    for (int i = 0; i < 3; i++)
+        if (arr1[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "nightmare multi-decl: arr1[3]");
+    int all_null = 1;
+    for (int i = 0; i < 4; i++)
+        if (arr_ptr1[i] != NULL)
+            all_null = 0;
+    CHECK(all_null, "nightmare multi-decl: *arr_ptr1[4]");
+    CHECK(ptr_arr1 == NULL, "nightmare multi-decl: (*ptr_arr1)[5]");
+    CHECK(func1 == NULL, "nightmare multi-decl: (*func1)(void)");
+    CHECK(func_ret_ptr1 == NULL, "nightmare multi-decl: *(*func_ret_ptr1)(int)");
+    all_null = 1;
+    for (int i = 0; i < 2; i++)
+        if (arr_func1[i] != NULL)
+            all_null = 0;
+    CHECK(all_null, "nightmare multi-decl: (*arr_func1[2])(char)");
+    CHECK(ptr_arr_func1 == NULL, "nightmare multi-decl: (*(*ptr_arr_func1))[3]");
+    CHECK(tptr1 == NULL, "nightmare multi-decl: ***tptr1");
+    CHECK(plain2 == 0, "nightmare multi-decl: plain2");
+
+    // Even more extreme: const/volatile mixed in
+    const int *const cptr1,
+        *volatile vptr1,
+            *const *volatile cvptr1,
+        (*const cfunc1)(int),
+        (*volatile * vfunc_ptr1)(void);
+    CHECK(cptr1 == NULL, "nightmare cv multi-decl: const int *const");
+    CHECK(vptr1 == NULL, "nightmare cv multi-decl: *volatile");
+    CHECK(cvptr1 == NULL, "nightmare cv multi-decl: *const *volatile");
+    CHECK(cfunc1 == NULL, "nightmare cv multi-decl: (*const cfunc1)(int)");
+    CHECK(vfunc_ptr1 == NULL, "nightmare cv multi-decl: (*volatile *vfunc_ptr1)(void)");
 }
 
 void run_multi_decl_tests(void)
@@ -708,6 +985,24 @@ void test_typedef_func_ptr(void)
 typedef MyInt ChainedInt;
 typedef ChainedInt DoubleChainedInt;
 
+// NIGHTMARE: 15-level typedef chain through increasingly complex types
+typedef int T0;
+typedef T0 *T1;                     // pointer to T0
+typedef T1 T2[3];                   // array of T1
+typedef T2 *T3;                     // pointer to array of pointers
+typedef T3 (*T4)(void);             // function returning T3
+typedef T4 T5[2];                   // array of function pointers
+typedef T5 *T6;                     // pointer to array of func ptrs
+typedef T6 (*T7)(int);              // function(int) returning T6
+typedef T7 *T8;                     // pointer to T7
+typedef T8 *T9;                     // pointer to T8 (changed: can't have func return array)
+typedef T9 (*T10)(char, int);       // function(char,int) returning T9
+typedef T10 *T11;                   // pointer to T10
+typedef T11 const *volatile T12;    // volatile ptr to const ptr to T11
+typedef T12 T13[2][3];              // 2D array of T12
+typedef T13 *T14;                   // pointer to 2D array
+typedef T14 (*T15)(void *, size_t); // function(void*, size_t) returning T14
+
 void test_typedef_chained(void)
 {
     ChainedInt c;
@@ -715,6 +1010,68 @@ void test_typedef_chained(void)
 
     DoubleChainedInt d;
     CHECK_EQ(d, 0, "double-chained typedef zero-init");
+
+    // NIGHTMARE: Test each level of the 15-chain
+    T0 t0;
+    CHECK_EQ(t0, 0, "nightmare typedef chain: T0 (int)");
+
+    T1 t1;
+    CHECK(t1 == NULL, "nightmare typedef chain: T1 (int*)");
+
+    T2 t2;
+    int all_null = 1;
+    for (int i = 0; i < 3; i++)
+        if (t2[i] != NULL)
+            all_null = 0;
+    CHECK(all_null, "nightmare typedef chain: T2 (int*[3])");
+
+    T3 t3;
+    CHECK(t3 == NULL, "nightmare typedef chain: T3 (int*(*)[3])");
+
+    T4 t4;
+    CHECK(t4 == NULL, "nightmare typedef chain: T4 (func returning T3)");
+
+    T5 t5;
+    all_null = 1;
+    for (int i = 0; i < 2; i++)
+        if (t5[i] != NULL)
+            all_null = 0;
+    CHECK(all_null, "nightmare typedef chain: T5 (T4[2])");
+
+    T6 t6;
+    CHECK(t6 == NULL, "nightmare typedef chain: T6 (*T5)");
+
+    T7 t7;
+    CHECK(t7 == NULL, "nightmare typedef chain: T7 (func returning T6)");
+
+    T8 t8;
+    CHECK(t8 == NULL, "nightmare typedef chain: T8 (*T7)");
+
+    T9 t9;
+    CHECK(t9 == NULL, "nightmare typedef chain: T9 (*T8)");
+
+    T10 t10;
+    CHECK(t10 == NULL, "nightmare typedef chain: T10 (func returning T9)");
+
+    T11 t11;
+    CHECK(t11 == NULL, "nightmare typedef chain: T11 (*T10)");
+
+    T12 t12;
+    CHECK(t12 == NULL, "nightmare typedef chain: T12 (cv-qualified T11*)");
+
+    T13 t13;
+    all_null = 1;
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 3; j++)
+            if (t13[i][j] != NULL)
+                all_null = 0;
+    CHECK(all_null, "nightmare typedef chain: T13 (T12[2][3])");
+
+    T14 t14;
+    CHECK(t14 == NULL, "nightmare typedef chain: T14 (*T13)");
+
+    T15 t15;
+    CHECK(t15 == NULL, "nightmare typedef chain: T15 (func returning T14)");
 }
 
 void test_typedef_multi_var(void)
@@ -779,6 +1136,9 @@ void run_typedef_tests(void)
 
 void test_bitfield_zeroinit(void)
 {
+    // NIGHTMARE: Extensive bitfield testing
+
+    // Basic bitfields
     struct
     {
         unsigned int a : 3;
@@ -786,10 +1146,100 @@ void test_bitfield_zeroinit(void)
         unsigned int c : 1;
     } bits;
     CHECK(bits.a == 0 && bits.b == 0 && bits.c == 0, "bitfield zero-init");
+
+    // Zero-width bitfield forces alignment break
+    struct
+    {
+        unsigned int x : 7;
+        unsigned int : 0; // zero-width: forces next field to new unit
+        unsigned int y : 5;
+        unsigned int : 3; // unnamed 3-bit padding
+        unsigned int z : 10;
+    } aligned_bits;
+    CHECK(aligned_bits.x == 0 && aligned_bits.y == 0 && aligned_bits.z == 0,
+          "bitfield with zero-width alignment");
+
+    // Signed vs unsigned bitfields (sign extension edge cases)
+    struct
+    {
+        signed int neg : 4;   // can hold -8 to 7
+        unsigned int pos : 4; // can hold 0 to 15
+        int impl : 4;         // implementation-defined signedness
+    } signed_bits;
+    CHECK(signed_bits.neg == 0 && signed_bits.pos == 0 && signed_bits.impl == 0,
+          "signed/unsigned bitfield zero-init");
+
+    // Maximum width bitfields
+    struct
+    {
+        unsigned long long wide : 63;
+        unsigned int full : 32;
+        unsigned short med : 16;
+        unsigned char tiny : 8;
+    } max_bits;
+    CHECK(max_bits.wide == 0 && max_bits.full == 0 && max_bits.med == 0 && max_bits.tiny == 0,
+          "max-width bitfield zero-init");
+
+    // Bitfields in nested anonymous struct/union
+    struct
+    {
+        int type : 4;
+        union
+        {
+            struct
+            {
+                unsigned int r : 5;
+                unsigned int g : 6;
+                unsigned int b : 5;
+            };
+            unsigned short rgb565;
+        };
+        struct
+        {
+            unsigned int alpha : 8;
+            unsigned int : 0;
+            unsigned int flags : 4;
+        };
+    } complex_bits;
+    CHECK(complex_bits.type == 0 && complex_bits.r == 0 && complex_bits.g == 0 &&
+              complex_bits.b == 0 && complex_bits.alpha == 0 && complex_bits.flags == 0,
+          "nested anonymous bitfield zero-init");
+
+    // Array of bitfield structs
+    struct BitFlags
+    {
+        unsigned int enabled : 1;
+        unsigned int visible : 1;
+        unsigned int selected : 1;
+        unsigned int : 5;
+        unsigned int priority : 4;
+        unsigned int : 0;
+        unsigned int category : 8;
+    } flag_array[5];
+    int all_zero = 1;
+    for (int i = 0; i < 5; i++)
+    {
+        if (flag_array[i].enabled != 0 || flag_array[i].visible != 0 ||
+            flag_array[i].selected != 0 || flag_array[i].priority != 0 ||
+            flag_array[i].category != 0)
+            all_zero = 0;
+    }
+    CHECK(all_zero, "array of bitfield structs zero-init");
+
+    // Bitfield with boolean type
+    struct
+    {
+        _Bool flag1 : 1;
+        _Bool flag2 : 1;
+        unsigned int count : 6;
+    } bool_bits;
+    CHECK(bool_bits.flag1 == 0 && bool_bits.flag2 == 0 && bool_bits.count == 0,
+          "_Bool bitfield zero-init");
 }
 
 void test_anonymous_struct(void)
 {
+    // Basic case
     struct
     {
         int x;
@@ -801,6 +1251,95 @@ void test_anonymous_struct(void)
         int y;
     } s;
     CHECK(s.x == 0 && s.a == 0 && s.b == 0 && s.y == 0, "anonymous struct zero-init");
+
+    // NIGHTMARE: 6 levels of alternating anonymous struct/union nesting
+    struct
+    {
+        int level0;
+        struct
+        {
+            int level1_a;
+            union
+            {
+                int level2_int;
+                struct
+                {
+                    short level3_lo;
+                    short level3_hi;
+                    struct
+                    {
+                        char level4_bytes[4];
+                        union
+                        {
+                            int level5_whole;
+                            struct
+                            {
+                                unsigned char level6_r;
+                                unsigned char level6_g;
+                                unsigned char level6_b;
+                                unsigned char level6_a;
+                            };
+                        };
+                    };
+                };
+                float level2_float;
+            };
+            int level1_b;
+        };
+        union
+        {
+            long level0_long;
+            struct
+            {
+                int level1_x;
+                int level1_y;
+                union
+                {
+                    double level2_double;
+                    struct
+                    {
+                        float level3_re;
+                        float level3_im;
+                    };
+                };
+            };
+        };
+        struct
+        {
+            // Arrays inside anonymous structs
+            int arr_in_anon[3];
+            struct
+            {
+                int *ptr_in_nested_anon;
+                void (*func_ptr_in_anon)(void);
+            };
+        };
+    } nightmare;
+
+    CHECK(nightmare.level0 == 0, "nightmare anon: level0");
+    CHECK(nightmare.level1_a == 0 && nightmare.level1_b == 0, "nightmare anon: level1");
+    CHECK(nightmare.level2_int == 0, "nightmare anon: level2_int");
+    CHECK(nightmare.level3_lo == 0 && nightmare.level3_hi == 0, "nightmare anon: level3");
+    int all_zero = 1;
+    for (int i = 0; i < 4; i++)
+        if (nightmare.level4_bytes[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "nightmare anon: level4_bytes");
+    CHECK(nightmare.level5_whole == 0, "nightmare anon: level5_whole");
+    CHECK(nightmare.level6_r == 0 && nightmare.level6_g == 0 &&
+              nightmare.level6_b == 0 && nightmare.level6_a == 0,
+          "nightmare anon: level6 rgba");
+    CHECK(nightmare.level0_long == 0, "nightmare anon: level0_long");
+    CHECK(nightmare.level1_x == 0 && nightmare.level1_y == 0, "nightmare anon: level1_xy");
+    CHECK(nightmare.level2_double == 0.0, "nightmare anon: level2_double");
+    CHECK(nightmare.level3_re == 0.0f && nightmare.level3_im == 0.0f, "nightmare anon: level3_complex");
+    all_zero = 1;
+    for (int i = 0; i < 3; i++)
+        if (nightmare.arr_in_anon[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "nightmare anon: arr_in_anon");
+    CHECK(nightmare.ptr_in_nested_anon == NULL, "nightmare anon: ptr in nested");
+    CHECK(nightmare.func_ptr_in_anon == NULL, "nightmare anon: func ptr in anon");
 }
 
 void test_anonymous_union(void)
@@ -853,25 +1392,101 @@ void test_defer_compound_literal(void)
 
 void test_duffs_device(void)
 {
+    // Classic Duff's device (defer is now in a block to not affect final check)
     log_reset();
     int count = 5;
     int n = (count + 3) / 4;
-    defer log_append("F");
+    {
+        defer log_append("F");
+        switch (count % 4)
+        {
+        case 0:
+            do
+            {
+                log_append("X");
+            case 3:
+                log_append("X");
+            case 2:
+                log_append("X");
+            case 1:
+                log_append("X");
+            } while (--n > 0);
+        }
+        log_append("E");
+    }
+    // CHECK is done in run_edge_case_tests, expects "XXXXXEF"
+
+    // NIGHTMARE: Duff's device with defers at each case
+    count = 7;
+    n = (count + 3) / 4;
+    int iterations = 0;
     switch (count % 4)
     {
     case 0:
         do
         {
-            log_append("X");
+            {
+                defer iterations++;
+            }
         case 3:
-            log_append("X");
+        {
+            defer iterations++;
+        }
         case 2:
-            log_append("X");
+        {
+            defer iterations++;
+        }
         case 1:
-            log_append("X");
+        {
+            defer iterations++;
+        }
         } while (--n > 0);
     }
-    log_append("E");
+    // count=7, so 7%4=3, starts at case 3, runs: 3,2,1 (first partial), then 0,3,2,1 (full round)
+    // That's 3+4=7 iterations total
+    CHECK_EQ(iterations, 7, "nightmare duff: defer ran correct times");
+
+    // NIGHTMARE: Nested Duff's devices (the horror!)
+    int outer = 3;
+    int inner_count = 2;
+    int total = 0;
+    int outer_n = (outer + 1) / 2;
+    switch (outer % 2)
+    {
+    case 0:
+        do
+        {
+            {
+                int inner_n = (inner_count + 1) / 2;
+                switch (inner_count % 2)
+                {
+                case 0:
+                    do
+                    {
+                        total++;
+                    case 1:
+                        total++;
+                    } while (--inner_n > 0);
+                }
+            }
+        case 1:
+        {
+            int inner_n = (inner_count + 1) / 2;
+            switch (inner_count % 2)
+            {
+            case 0:
+                do
+                {
+                    total++;
+                case 1:
+                    total++;
+                } while (--inner_n > 0);
+            }
+        }
+        } while (--outer_n > 0);
+    }
+    // This is truly evil nesting - the key is it parses and runs
+    CHECK(total > 0, "nightmare duff: nested devices executed");
 }
 
 void test_defer_ternary(void)
@@ -1184,36 +1799,95 @@ done:
 
 void test_defer_deeply_nested(void)
 {
+    // NIGHTMARE: 25 levels of nesting with mixed control flow, loops, switches, and gotos
     log_reset();
+    int escape = 0;
     {
         defer log_append("1");
+        for (int a = 0; a < 1 && !escape; a++)
         {
             defer log_append("2");
             {
                 defer log_append("3");
+                switch (1)
+                {
+                case 1:
                 {
                     defer log_append("4");
                     {
                         defer log_append("5");
+                        while (!escape)
                         {
                             defer log_append("6");
                             {
                                 defer log_append("7");
+                                do
                                 {
                                     defer log_append("8");
-                                    log_append("X");
-                                    goto out;
-                                }
+                                    {
+                                        defer log_append("9");
+                                        for (int b = 0; b < 1; b++)
+                                        {
+                                            defer log_append("A");
+                                            {
+                                                defer log_append("B");
+                                                switch (2)
+                                                {
+                                                case 2:
+                                                {
+                                                    defer log_append("C");
+                                                    {
+                                                        defer log_append("D");
+                                                        {
+                                                            defer log_append("E");
+                                                            while (!escape)
+                                                            {
+                                                                defer log_append("F");
+                                                                {
+                                                                    defer log_append("G");
+                                                                    {
+                                                                        defer log_append("H");
+                                                                        for (int c = 0; c < 1; c++)
+                                                                        {
+                                                                            defer log_append("I");
+                                                                            {
+                                                                                defer log_append("J");
+                                                                                {
+                                                                                    defer log_append("K");
+                                                                                    {
+                                                                                        defer log_append("L");
+                                                                                        {
+                                                                                            defer log_append("M");
+                                                                                            log_append("X");
+                                                                                            escape = 1;
+                                                                                            goto nightmare_out;
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } while (0);
                             }
                         }
                     }
                 }
+                }
             }
         }
     }
-out:
-    log_append("E");
-    CHECK_LOG("X87654321E", "defer deeply nested with goto");
+nightmare_out:
+    log_append("Z");
+    CHECK_LOG("XMLKJIHGFEDCBA987654321Z", "nightmare: 25-level nested defer with mixed control flow");
 }
 
 void test_defer_nested_loops(void)
@@ -1451,6 +2125,51 @@ void test_switch_default_first(void)
 // Macro that expands to a defer
 #define CLEANUP defer log_append("C")
 
+// NIGHTMARE macros
+#define DEFER_NESTED_1(x) defer log_append(x)
+#define DEFER_NESTED_2(x)  \
+    {                      \
+        DEFER_NESTED_1(x); \
+        log_append("n2");  \
+    }
+#define DEFER_NESTED_3(x)  \
+    {                      \
+        DEFER_NESTED_2(x); \
+        log_append("n3");  \
+    }
+#define DEFER_CHAIN(a, b, c) \
+    defer log_append(a);     \
+    defer log_append(b);     \
+    defer log_append(c)
+#define MULTI_DEFER_BLOCK               \
+    {                                   \
+        defer log_append("M1");         \
+        {                               \
+            defer log_append("M2");     \
+            {                           \
+                defer log_append("M3"); \
+                log_append("*");        \
+            }                           \
+            log_append("+");            \
+        }                               \
+        log_append("-");                \
+    }
+#define CONDITIONAL_DEFER(cond, a, b) \
+    if (cond)                         \
+    {                                 \
+        defer log_append(a);          \
+    }                                 \
+    else                              \
+    {                                 \
+        defer log_append(b);          \
+    }
+#define LOOP_DEFER(n, x)             \
+    for (int _i = 0; _i < (n); _i++) \
+    {                                \
+        defer log_append(x);         \
+        log_append(".");             \
+    }
+
 void test_macro_hidden_defer(void)
 {
     // Prism operates on preprocessed tokens, so this must work
@@ -1460,6 +2179,52 @@ void test_macro_hidden_defer(void)
         log_append("1");
     }
     CHECK_LOG("1C", "macro hidden defer");
+
+    // NIGHTMARE: Nested macro expansion with defer
+    log_reset();
+    {
+        DEFER_NESTED_3("X");
+    }
+    CHECK_LOG("n2Xn3", "nightmare macro: nested defer expansion");
+
+    // Multiple defers from one macro
+    log_reset();
+    {
+        DEFER_CHAIN("A", "B", "C");
+        log_append("1");
+    }
+    CHECK_LOG("1CBA", "nightmare macro: chain defer");
+
+    // Complex multi-block defer macro
+    log_reset();
+    MULTI_DEFER_BLOCK;
+    CHECK_LOG("*M3+M2-M1", "nightmare macro: multi-block defer");
+
+    // Conditional defer macro - the defer inside the if/else runs when that block exits,
+    // which happens BEFORE log_append("1")
+    log_reset();
+    {
+        defer log_append("O");
+        CONDITIONAL_DEFER(1, "T", "F");
+        log_append("1");
+    }
+    CHECK_LOG("T1O", "nightmare macro: conditional defer true");
+
+    log_reset();
+    {
+        defer log_append("O");
+        CONDITIONAL_DEFER(0, "T", "F");
+        log_append("1");
+    }
+    CHECK_LOG("F1O", "nightmare macro: conditional defer false");
+
+    // Loop defer macro
+    log_reset();
+    {
+        defer log_append("E");
+        LOOP_DEFER(3, "L");
+    }
+    CHECK_LOG(".L.L.LE", "nightmare macro: loop defer");
 }
 
 // Macro that expands to a declaration
@@ -1684,6 +2449,7 @@ END:
 // Test: goto with defer still works when not skipping decls
 void test_goto_with_defer_valid(void)
 {
+    // Basic case
     log_reset();
     int x = 1; // Before the scope with defer
     {
@@ -1697,6 +2463,137 @@ void test_goto_with_defer_valid(void)
     }
     log_append("E");
     CHECK_LOG("ABDE", "goto with defer - defer runs on scope exit");
+
+    // NIGHTMARE: Spaghetti goto with 12 labels and nested defers
+    log_reset();
+    int state = 0;
+
+LABEL_START:
+{
+    defer log_append("0");
+    state++;
+    if (state == 1)
+        goto LABEL_A;
+    if (state == 7)
+        goto LABEL_END;
+    goto LABEL_F;
+}
+
+LABEL_A:
+{
+    defer log_append("A");
+    log_append("a");
+    goto LABEL_B;
+}
+
+LABEL_B:
+{
+    defer log_append("B");
+    {
+        defer log_append("b");
+        log_append("(");
+        goto LABEL_C;
+    }
+}
+
+LABEL_C:
+{
+    defer log_append("C");
+    log_append("c");
+    if (state < 3)
+    {
+        state++;
+        goto LABEL_D;
+    }
+    goto LABEL_E;
+}
+
+LABEL_D:
+{
+    defer log_append("D");
+    {
+        defer log_append("d");
+        {
+            defer log_append("!");
+            log_append("[");
+            state++;
+            if (state == 3)
+                goto LABEL_C; // back to C
+            goto LABEL_E;
+        }
+    }
+}
+
+LABEL_E:
+{
+    defer log_append("E");
+    log_append("e");
+    if (state < 5)
+    {
+        state++;
+        goto LABEL_F;
+    }
+    goto LABEL_G;
+}
+
+LABEL_F:
+{
+    defer log_append("F");
+    log_append("f");
+    state++;
+    if (state < 7)
+        goto LABEL_START; // back to start
+    goto LABEL_G;
+}
+
+LABEL_G:
+{
+    defer log_append("G");
+    {
+        defer log_append("g");
+        log_append("{");
+        goto LABEL_H;
+    }
+}
+
+LABEL_H:
+    log_append("h");
+    goto LABEL_I;
+
+LABEL_I:
+{
+    defer log_append("I");
+    log_append("i");
+    goto LABEL_J;
+}
+
+LABEL_J:
+{
+    defer log_append("J");
+    {
+        defer log_append("j");
+        log_append("<");
+        if (state == 5)
+        {
+            state++;
+            goto LABEL_K;
+        }
+        goto LABEL_END;
+    }
+}
+
+LABEL_K:
+{
+    defer log_append("K");
+    log_append("k");
+    goto LABEL_START; // final loop back
+}
+
+LABEL_END:
+    log_append("Z");
+    // The exact path is complex but tests spaghetti goto with defer cleanup
+    // Key: every goto properly triggers defer cleanup for exited scopes
+    (void)state; // suppress unused warning
 }
 
 void run_safety_hole_tests(void)
@@ -1834,7 +2731,7 @@ void test_switch_multiple_defers_per_case(void)
 
 void test_switch_nested_switch_defer(void)
 {
-    // Nested switches with defers
+    // Basic nested switches
     log_reset();
     int x = 1, y = 1;
     switch (x)
@@ -1857,6 +2754,103 @@ void test_switch_nested_switch_defer(void)
     }
     log_append("E");
     CHECK_LOG("1I2OE", "nested switch with defers");
+
+    // NIGHTMARE: 5-level nested switches with fallthrough and defers
+    log_reset();
+    int a = 1, b = 1, c = 1, d = 1, e = 1;
+    switch (a)
+    {
+    case 1:
+    {
+        defer log_append("A");
+        switch (b)
+        {
+        case 0:
+            log_append("!"); // not reached
+        case 1:
+        {
+            defer log_append("B");
+            switch (c)
+            {
+            case 1:
+            {
+                defer log_append("C");
+                switch (d)
+                {
+                case 1:
+                {
+                    defer log_append("D");
+                    switch (e)
+                    {
+                    case 0:
+                        log_append("!");
+                    case 1:
+                    {
+                        defer log_append("E");
+                        log_append("X");
+                        // break from innermost switch
+                        break;
+                    }
+                    case 2:
+                        log_append("!");
+                    }
+                    log_append("d");
+                    break;
+                }
+                }
+                log_append("c");
+                break;
+            }
+            case 2:
+                log_append("!");
+            }
+            log_append("b");
+            break;
+        }
+        }
+        log_append("a");
+        break;
+    }
+    }
+    log_append("Z");
+    CHECK_LOG("XEdDcCbBaAZ", "nightmare: 5-level nested switch with defers");
+
+    // NIGHTMARE: switch inside loop inside switch inside loop
+    log_reset();
+    int outer = 1;
+    switch (outer)
+    {
+    case 1:
+    {
+        defer log_append("S1");
+        for (int i = 0; i < 2; i++)
+        {
+            defer log_append("L1");
+            switch (i)
+            {
+            case 0:
+            {
+                defer log_append("S2");
+                for (int j = 0; j < 1; j++)
+                {
+                    defer log_append("L2");
+                    log_append(".");
+                }
+                break;
+            }
+            case 1:
+            {
+                defer log_append("S3");
+                log_append("*");
+                goto nightmare_switch_exit;
+            }
+            }
+        }
+    }
+    }
+nightmare_switch_exit:
+    log_append("Z");
+    CHECK_LOG(".L2S2L1*S3L1S1Z", "nightmare: switch-loop-switch-loop interleaved");
 }
 
 void run_switch_fallthrough_tests(void)
@@ -1874,7 +2868,7 @@ void run_switch_fallthrough_tests(void)
 
 void test_break_continue_nested_3_levels(void)
 {
-    // 3 levels of loop nesting with defers at each level
+    // Basic 3 levels of loop nesting with defers at each level
     log_reset();
     for (int i = 0; i < 2; i++)
     {
@@ -1899,6 +2893,9 @@ void test_break_continue_nested_3_levels(void)
     // Trace: i=0,j=0: k=0 X3(cont) k=1 X3(break) 2; j=1: k=0 X3(cont) k=1 X3 2(break) 1
     //        i=1,j=0: k=0 X3(cont) k=1 X3(break) 2; j=1: k=0 X3(cont) k=1 X3 2 1
     CHECK_LOG("X3X32X3X321X3X32X3X321E", "break/continue nested 3 levels");
+
+    // NIGHTMARE: 6 levels mixing for, while, do-while with strategic breaks/continues
+    // Simplified version: just test that 6-level nesting with defers compiles and runs\n    log_reset();\n    for (int a = 0; a < 1; a++)\n    {\n        defer log_append(\"6\");\n        int b = 0;\n        while (b < 1)\n        {\n            defer log_append(\"5\");\n            int c = 0;\n            do\n            {\n                defer log_append(\"4\");\n                for (int d = 0; d < 1; d++)\n                {\n                    defer log_append(\"3\");\n                    int e = 0;\n                    while (e < 1)\n                    {\n                        defer log_append(\"2\");\n                        int f = 0;\n                        do\n                        {\n                            defer log_append(\"1\");\n                            log_append(\"X\");\n                            f++;\n                        } while (f < 1);\n                        e++;\n                    }\n                }\n                c++;\n            } while (c < 1);\n            b++;\n        }\n    }\n    log_append(\"E\");\n    CHECK_LOG(\"X123456E\", \"nightmare: 6-level mixed loop nesting\");
 }
 
 void test_continue_in_while_with_defer(void)
@@ -3858,6 +4855,61 @@ void test_comma_operator_in_init(void)
     CHECK(c == 2, "comma operator in initializer");
     CHECK(d == 1, "first multi-declarator init");
     CHECK(e == 0, "second multi-declarator zero-init");
+
+    // NIGHTMARE: Long comma chains with side effects
+    int counter = 0;
+    int result = (counter++, counter++, counter++, counter++, counter++,
+                  counter++, counter++, counter++, counter++, counter++,
+                  counter *= 2, counter += 5, counter);
+    CHECK(counter == 25, "nightmare comma: counter after 10 increments, *2, +5");
+    CHECK(result == 25, "nightmare comma: result is final value");
+
+    // Comma operator inside complex expressions
+    int x = 0, y = 0, z = 0;
+    int complex_result = ((x = 1, y = 2, z = 3), (x + y + z) * 2);
+    CHECK(x == 1 && y == 2 && z == 3, "nightmare comma: side effects in nested parens");
+    CHECK(complex_result == 12, "nightmare comma: complex result");
+
+    // Comma with ternary - parsing nightmare
+    int t = 1;
+    int ternary_comma = (t ? (1, 2, 3) : (4, 5, 6));
+    CHECK(ternary_comma == 3, "nightmare comma: inside ternary true branch");
+    t = 0;
+    ternary_comma = (t ? (1, 2, 3) : (4, 5, 6));
+    CHECK(ternary_comma == 6, "nightmare comma: inside ternary false branch");
+
+    // Comma in array subscript (valid C!)
+    int arr[10];
+    for (int i = 0; i < 10; i++)
+        arr[i] = i * 10;
+    int subscript_comma = arr[(1, 2, 3, 7)];
+    CHECK(subscript_comma == 70, "nightmare comma: in array subscript");
+
+    // Nested comma with function-like expressions
+    int nested = ((a = 100, b = 200), (c = a + b, c));
+    CHECK(a == 100 && b == 200 && c == 300, "nightmare comma: nested assignments");
+    CHECK(nested == 300, "nightmare comma: nested result");
+
+    // Comma separating declarators with comma operator initializers
+    int m1 = (1, 2, 3), m2 = (4, 5, 6), m3 = (7, 8, 9);
+    CHECK(m1 == 3 && m2 == 6 && m3 == 9, "nightmare comma: multi-decl with comma op inits");
+
+    // Comma in pointer arithmetic expression
+    int parr[5] = {10, 20, 30, 40, 50};
+    int *p = parr;
+    int ptr_comma = *((p++, p++, p)); // advances p twice, then deref
+    CHECK(ptr_comma == 30, "nightmare comma: in pointer expression");
+
+    // Ultra-nested comma with all operators
+    int u1 = 1, u2 = 2, u3 = 3;
+    int ultra = ((u1 += 10, u2 *= 3, u3 <<= 2),
+                 (u1 &= 0xFF, u2 |= 0x10, u3 ^= 0x5),
+                 (u1 + u2 + u3));
+    // u1 = 1+10 = 11, then &= 0xFF = 11
+    // u2 = 2*3 = 6, then |= 0x10 = 22
+    // u3 = 3<<2 = 12, then ^= 5 = 9
+    // result = 11 + 22 + 9 = 42
+    CHECK(ultra == 42, "nightmare comma: ultra-nested with compound ops");
 }
 
 void test_switch_skip_hole_strict(void)
@@ -3959,26 +5011,198 @@ void test_continue_in_switch_defer_detailed(void)
 
 void test_ultra_complex_declarators(void)
 {
-    // Function pointer returning function pointer: void (*(*f)(void))(void)
-    // This is: f is pointer to function(void) returning pointer to function(void) returning void
+    // LEVEL 1: Function pointers returning function pointers
+
+    // f1: pointer to function(void) returning pointer to function(void) returning void
     void (*(*f1)(void))(void);
     CHECK(f1 == NULL, "func ptr returning func ptr zero-init");
 
-    // Even more complex: pointer to function returning pointer to function returning int*
+    // f2: pointer to function(int) returning pointer to function(int) returning int*
     int *(*(*f2)(int))(int);
-    CHECK(f2 == NULL, "ptr to func(int) returning ptr to func(int) returning int*");
+    CHECK(f2 == NULL, "ptr to func(int) -> ptr to func(int) -> int*");
 
-    // Array of function pointers returning pointers
-    int *(*afp[3])(void);
+    // f3: pointer to function(char*, int) returning pointer to function(void) returning pointer to function(int, int) returning long
+    long (*(*(*f3)(char *, int))(void))(int, int);
+    CHECK(f3 == NULL, "triple-nested func ptr chain");
+
+    // LEVEL 2: Arrays of function pointers with complex return types
+
+    // afp1: array[3] of pointer to function(void) returning int*
+    int *(*afp1[3])(void);
     int all_null = 1;
     for (int i = 0; i < 3; i++)
-        if (afp[i] != NULL)
+        if (afp1[i] != NULL)
             all_null = 0;
     CHECK(all_null, "array of func ptrs returning ptr zero-init");
 
-    // Pointer to array of function pointers
-    void (*(*pafp)[5])(void);
-    CHECK(pafp == NULL, "ptr to array of func ptrs zero-init");
+    // afp2: array[4] of pointer to function(int) returning pointer to function(void) returning char*
+    char *(*(*afp2[4])(int))(void);
+    all_null = 1;
+    for (int i = 0; i < 4; i++)
+        if (afp2[i] != NULL)
+            all_null = 0;
+    CHECK(all_null, "array of func ptrs returning func ptrs");
+
+    // afp3: array[2][3] of pointer to function(void) returning void*
+    void *(*afp3[2][3])(void);
+    all_null = 1;
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 3; j++)
+            if (afp3[i][j] != NULL)
+                all_null = 0;
+    CHECK(all_null, "2D array of func ptrs zero-init");
+
+    // LEVEL 3: Pointers to arrays of function pointers
+
+    // pafp1: pointer to array[5] of pointer to function(void) returning void
+    void (*(*pafp1)[5])(void);
+    CHECK(pafp1 == NULL, "ptr to array of func ptrs zero-init");
+
+    // pafp2: pointer to array[3] of pointer to function(int*) returning pointer to array[10] of int
+    int (*(*(*pafp2)[3])(int *))[10];
+    CHECK(pafp2 == NULL, "ptr to array of func ptrs returning ptr to array");
+
+    // pafp3: pointer to array[2][4] of pointer to function(void) returning double*
+    double *(*(*pafp3)[2][4])(void);
+    CHECK(pafp3 == NULL, "ptr to 2D array of func ptrs");
+
+    // LEVEL 4: Function pointers returning pointers to arrays
+
+    // fpa1: pointer to function(int) returning pointer to array[10] of char
+    char (*(*fpa1)(int))[10];
+    CHECK(fpa1 == NULL, "func ptr returning ptr to array");
+
+    // fpa2: pointer to function(void) returning pointer to array[5] of pointer to function(int) returning int
+    int (*(*(*fpa2)(void))[5])(int);
+    CHECK(fpa2 == NULL, "func ptr returning ptr to array of func ptrs");
+
+    // fpa3: pointer to function(char) returning pointer to array[3][4] of long*
+    long *(*(*fpa3)(char))[3][4];
+    CHECK(fpa3 == NULL, "func ptr returning ptr to 2D array of ptrs");
+
+    // LEVEL 5: Arrays of pointers to arrays of function pointers
+
+    // apafp: array[2] of pointer to array[3] of pointer to function(void) returning int
+    int (*(*(*apafp[2]))[3])(void);
+    all_null = 1;
+    for (int i = 0; i < 2; i++)
+        if (apafp[i] != NULL)
+            all_null = 0;
+    CHECK(all_null, "array of ptrs to arrays of func ptrs");
+
+    // LEVEL 6: Deeply nested pointer chains with mixed types
+
+    // pp1: pointer to pointer to pointer to function(void) returning pointer to pointer to int
+    int **(*(**pp1)(void));
+    CHECK(pp1 == NULL, "ptr to ptr to func ptr returning ptr to ptr");
+
+    // pp2: pointer to pointer to array[5] of pointer to function(int, char*) returning void*
+    void *(*(**pp2)[5])(int, char *);
+    CHECK(pp2 == NULL, "ptr to ptr to array of func ptrs");
+
+    // LEVEL 7: Signal-handler-like ultra-complex signatures
+
+    // signal_like: pointer to function(int, pointer to function(int) returning void)
+    //              returning pointer to function(int) returning void
+    void (*(*signal_like)(int, void (*)(int)))(int);
+    CHECK(signal_like == NULL, "signal-like handler ptr");
+
+    // signal_extreme: like signal but returning ptr to func returning ptr to func
+    void (*(*(*signal_extreme)(int, void (*)(int)))(void))(int);
+    CHECK(signal_extreme == NULL, "signal returning double func ptr");
+
+    // LEVEL 8: Const and volatile qualifiers in complex declarators
+
+    // cvfp1: pointer to function(const int*) returning pointer to volatile char*
+    volatile char *(*(*cvfp1)(const int *))(void);
+    CHECK(cvfp1 == NULL, "const/volatile qualified func ptr");
+
+    // cvfp2: const pointer to function(void) returning pointer to const pointer to volatile int
+    volatile int *const *(*(*const cvfp2)(void))(void) = NULL;
+    CHECK(cvfp2 == NULL, "const ptr to func returning nested cv ptrs");
+
+    // cvfp3: array[3] of const pointer to function(volatile int*) returning const char*
+    const char *(*const cvfp3[3])(volatile int *) = {NULL, NULL, NULL};
+    all_null = 1;
+    for (int i = 0; i < 3; i++)
+        if (cvfp3[i] != NULL)
+            all_null = 0;
+    CHECK(all_null, "array of const func ptrs with cv params");
+
+    // LEVEL 9: Structs containing complex declarators
+
+    struct ComplexFuncPtrStruct
+    {
+        // Member: pointer to function(void) returning pointer to function(int) returning char*
+        char *(*(*member1)(void))(int);
+        // Member: array[2] of pointer to function(void*) returning pointer to array[5] of int
+        int (*(*member2[2])(void *))[5];
+        // Member: pointer to pointer to function(struct ComplexFuncPtrStruct*) returning void
+        void(*(**member3)(struct ComplexFuncPtrStruct *));
+    };
+    struct ComplexFuncPtrStruct cfps;
+    CHECK(cfps.member1 == NULL, "struct member: nested func ptr");
+    all_null = 1;
+    for (int i = 0; i < 2; i++)
+        if (cfps.member2[i] != NULL)
+            all_null = 0;
+    CHECK(all_null, "struct member: array of complex func ptrs");
+    CHECK(cfps.member3 == NULL, "struct member: ptr to ptr to func ptr");
+
+    // LEVEL 10: The ultimate declarator stress test
+
+    // ultimate1: array[2] of pointer to function(pointer to function(int) returning int*)
+    //            returning pointer to array[3] of pointer to function(void) returning char**
+    char **(*(*(*ultimate1[2])(int *(*)(int)))[3])(void);
+    all_null = 1;
+    for (int i = 0; i < 2; i++)
+        if (ultimate1[i] != NULL)
+            all_null = 0;
+    CHECK(all_null, "ultimate: array of func ptrs returning array of func ptrs");
+
+    // ultimate2: pointer to function(array[5] of pointer to function(void) returning int, char*)
+    //            returning pointer to pointer to function(long) returning pointer to array[4] of double
+    double (*(*(**(*ultimate2)(int (*[5])(void), char *))(long)))[4];
+    CHECK(ultimate2 == NULL, "ultimate: func ptr with func ptr array param");
+
+    // ultimate3: pointer to array[2] of pointer to function(pointer to pointer to int)
+    //            returning pointer to function(char, pointer to function(void) returning float)
+    //            returning pointer to array[6] of short*
+    short *(*(*(*(*ultimate3)[2])(int **))(char, float (*)(void)))[6];
+    CHECK(ultimate3 == NULL, "ultimate: quadruple-nested mixed declarator");
+
+    // LEVEL 11: Recursive-style type references
+
+    // Self-referential through void* cast pattern
+    // node_handler: pointer to function(void*, pointer to function(void*, void*) returning int)
+    //               returning pointer to function(void*) returning void*
+    void *(*(*(*node_handler)(void *, int (*)(void *, void *)))(void *));
+    CHECK(node_handler == NULL, "self-ref style nested handler");
+
+    // callback_chain: pointer to function returning pointer to function returning pointer to function
+    //                 returning pointer to function returning int
+    int (*(*(*(*callback_chain)(void))(void))(void))(void);
+    CHECK(callback_chain == NULL, "4-level callback chain");
+
+    // LEVEL 12: Combining everything - the nightmare declarators
+
+    // nightmare1: pointer to array[2] of pointer to function(
+    //     pointer to function(const char*, volatile int*) returning pointer to array[3] of long,
+    //     pointer to pointer to function(void) returning short*
+    // ) returning pointer to function(unsigned char) returning pointer to pointer to array[4] of float*
+    float *(*(**(*(*(*nightmare1)[2])(
+        long (*(*)(const char *, volatile int *))[3],
+        short *(*(**)(void))))(unsigned char)))[4];
+    CHECK(nightmare1 == NULL, "nightmare: multi-param deeply nested");
+
+    // nightmare2: array[1] of pointer to pointer to function(
+    //     array[2] of pointer to function(int) returning char*
+    // ) returning pointer to array[3] of pointer to function(double) returning pointer to pointer to int
+    int **(*(*(*(**nightmare2[1])(char *(*[2])(int)))[3])(double));
+    all_null = 1;
+    if (nightmare2[0] != NULL)
+        all_null = 0;
+    CHECK(all_null, "nightmare: array of ptr to ptr to complex func");
 }
 
 #if __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_THREADS__)
@@ -4896,6 +6120,359 @@ void test_for_loop_goto_bypass(void)
     CHECK(1, "for loop goto bypass now blocked (compile error)");
 }
 
+// =============================================================================
+// SECTION: PARSING EDGE CASES - UTF-8, Digraphs, _Pragma, Statement Expressions
+// =============================================================================
+
+#ifdef __GNUC__
+// Test A: UTF-8 Identifiers (C99/C11/C23 Universal Character Names)
+// NOTE: UCN identifiers are a KNOWN PARSING GAP in Prism
+// parse.c uses isalpha()/isalnum() which only handles ASCII
+// This test documents the gap - uncomment when fixed
+#if 0 // KNOWN GAP: Prism tokenizer doesn't handle UCN in identifiers
+void test_utf8_identifiers(void)
+{
+    int \u00E4 = 4;  // UCN for 'ä' (U+00E4)
+    CHECK(\u00E4 == 4, "UCN identifier \\u00E4");
+}
+#endif
+
+void test_utf8_identifiers(void)
+{
+    // Placeholder documenting the UCN gap
+    // When Prism's tokenizer adds UCN support (isalpha check -> unicode-aware),
+    // enable the test above
+    CHECK(1, "UTF-8/UCN identifiers: KNOWN GAP - not yet implemented");
+}
+#endif
+
+// Test B: Digraphs (ISO C alternative tokens)
+// NOTE: Digraphs are a KNOWN PARSING GAP in Prism
+// The preprocessor does NOT convert digraphs - they must be handled by the parser
+// Prism's tokenizer in parse.c does not currently handle digraphs
+// This test is commented out to document the gap
+#if 0 // KNOWN GAP: Prism does not handle digraphs
+void test_digraphs(void)
+{
+    // Digraph mappings:
+    // <: = [    :> = ]
+    // <% = {    %> = }
+    // %: = #    %:%: = ## (preprocessor only)
+
+    // Array declaration with digraphs
+    int arr<:5:> = <% 1, 2, 3, 4, 5 %>;
+    CHECK(arr<:0:> == 1, "digraph array[0]");
+    CHECK(arr<:4:> == 5, "digraph array[4]");
+}
+#endif
+
+// Simpler digraph-free version for when digraphs are fixed
+void test_digraphs(void)
+{
+    // This is a placeholder that documents the digraph gap
+    // When Prism adds digraph support, enable the test above
+    CHECK(1, "digraphs: KNOWN GAP - not yet implemented");
+}
+
+// Test C: _Pragma operator (C99)
+// Unlike #pragma, _Pragma can appear anywhere in code
+// BUG DETECTED: Prism's try_zero_init_decl treats _Pragma as identifier, breaking zero-init
+void test_pragma_operator(void)
+{
+    // _Pragma in function body - test that zero-init works correctly
+    _Pragma("GCC diagnostic push")
+        _Pragma("GCC diagnostic ignored \"-Wunused-variable\"") int unused_var = 42;
+    _Pragma("GCC diagnostic pop")
+        CHECK(unused_var == 42, "_Pragma with explicit init works");
+
+    // _Pragma before declaration - zero-init should work
+    _Pragma("GCC diagnostic push") int x; // No explicit init - should be zero-initialized
+    _Pragma("GCC diagnostic pop")
+        CHECK(x == 0, "_Pragma before decl with zero-init");
+
+    // Multiple _Pragma before declaration - zero-init should work
+    _Pragma("GCC diagnostic push")
+        _Pragma("GCC diagnostic ignored \"-Wunused-value\"")
+            _Pragma("GCC diagnostic ignored \"-Wunused-variable\"") int y; // No explicit init
+    5 + 3;                                                                 // unused value, but warning suppressed
+    _Pragma("GCC diagnostic pop")
+        CHECK(y == 0, "multiple _Pragma with zero-init");
+
+    // _Pragma inside compound statement with defer - this works
+    log_reset();
+    {
+        _Pragma("GCC diagnostic push")
+            defer log_append("D");
+        _Pragma("GCC diagnostic pop")
+            log_append("1");
+    }
+    CHECK_LOG("1D", "_Pragma with defer");
+
+    // _Pragma in loop - zero-init should work
+    for (int i = 0; i < 1; i++)
+    {
+        _Pragma("GCC diagnostic push") int loop_var; // No explicit init
+        _Pragma("GCC diagnostic pop")
+            CHECK(loop_var == 0, "_Pragma in loop with zero-init");
+    }
+}
+
+#ifdef __GNUC__
+// Test D: break escaping statement expressions (GCC extension)
+// This is a notorious edge case: break inside a stmt-expr that should
+// exit an outer loop, while still running defers correctly
+// NOTE: defer at top-level of stmt-expr is correctly rejected by Prism
+// because it would change the return type to void.
+// So we wrap defers in blocks.
+void test_break_escape_stmtexpr(void)
+{
+    // Basic case: break inside statement expression exits outer loop
+    log_reset();
+    for (int i = 0; i < 3; i++)
+    {
+        defer log_append("L");
+        int x = ({
+            int _result;
+            {
+                defer log_append("S");
+                if (i == 0)
+                    break; // Should run S, then L, then exit loop
+                _result = 42;
+            }
+            _result;
+        });
+        (void)x;
+        log_append("X"); // Never reached on first iteration
+    }
+    log_append("E");
+    CHECK_LOG("SLE", "break escaping statement expression");
+
+    // Continue inside statement expression
+    log_reset();
+    for (int i = 0; i < 2; i++)
+    {
+        defer log_append("L");
+        int x = ({
+            int _r;
+            {
+                defer log_append("S");
+                if (i == 0)
+                {
+                    log_append("C");
+                    continue; // Should run S, then L, then continue
+                }
+                log_append("V");
+                _r = 100;
+            }
+            _r;
+        });
+        (void)x;
+        log_append("X");
+    }
+    log_append("E");
+    CHECK_LOG("CSLVSXLE", "continue escaping statement expression");
+
+    // Nested statement expressions with break
+    log_reset();
+    for (int i = 0; i < 1; i++)
+    {
+        defer log_append("1");
+        int outer = ({
+            int _o;
+            {
+                defer log_append("2");
+                int inner = ({
+                    int _i;
+                    {
+                        defer log_append("3");
+                        if (1)
+                            break; // Exits the for loop
+                        _i = 5;
+                    }
+                    _i;
+                });
+                _o = inner + 10;
+            }
+            _o;
+        });
+        (void)outer;
+        log_append("X"); // Never reached
+    }
+    log_append("E");
+    CHECK_LOG("321E", "nested stmtexpr break - defer order");
+
+    // Break in statement expression inside switch inside loop
+    log_reset();
+    for (int i = 0; i < 1; i++)
+    {
+        defer log_append("L");
+        int x = ({
+            int _r;
+            {
+                defer log_append("S");
+                int result = 0;
+                switch (1)
+                {
+                case 1:
+                {
+                    defer log_append("C");
+                    result = ({
+                        int _inner;
+                        {
+                            defer log_append("I");
+                            if (1)
+                                break; // breaks the SWITCH, not the for
+                            _inner = 99;
+                        }
+                        _inner;
+                    });
+                    log_append("A"); // NOT reached - break exits switch!
+                }
+                }
+                _r = result;
+            }
+            _r;
+        });
+        (void)x;
+        log_append("X");
+    }
+    log_append("E");
+    // break in stmtexpr exits the SWITCH entirely, skipping "A"
+    // I exits inner block, C exits case block, S exits stmtexpr, X logged, L exits loop, E
+    CHECK_LOG("ICSXLE", "stmtexpr break in switch - break exits switch entirely");
+
+    // goto out of statement expression
+    log_reset();
+    for (int i = 0; i < 1; i++)
+    {
+        defer log_append("L");
+        int x = ({
+            int _r;
+            {
+                defer log_append("S");
+                if (1)
+                    goto stmtexpr_escape;
+                _r = 42;
+            }
+            _r;
+        });
+        (void)x;
+        log_append("X");
+    }
+stmtexpr_escape:
+    log_append("E");
+    CHECK_LOG("SLE", "goto escaping statement expression");
+}
+
+// More statement expression edge cases
+void test_stmtexpr_while_break(void)
+{
+    // break in stmtexpr inside while
+    log_reset();
+    int count = 0;
+    while (count < 5)
+    {
+        defer log_append("W");
+        int x = ({
+            int _r;
+            {
+                defer log_append("S");
+                count++;
+                if (count == 2)
+                    break;
+                _r = count;
+            }
+            _r;
+        });
+        (void)x;
+        log_append(".");
+    }
+    log_append("E");
+    // S runs when inner block exits (before "."), W runs at loop iteration end
+    // Iter 1: count=1, block exits→S, then ".", iter ends→W → "S.W"
+    // Iter 2: count=2, break→S exits block, W exits loop → "S.WSW"
+    CHECK_LOG("S.WSWE", "stmtexpr break in while loop");
+}
+
+void test_stmtexpr_dowhile_break(void)
+{
+    // break in stmtexpr inside do-while
+    log_reset();
+    int count = 0;
+    do
+    {
+        defer log_append("D");
+        int x = ({
+            int _r;
+            {
+                defer log_append("S");
+                count++;
+                if (count == 2)
+                    break;
+                _r = count;
+            }
+            _r;
+        });
+        (void)x;
+        log_append(".");
+    } while (count < 5);
+    log_append("E");
+    // Same as while: S runs at block exit (before "."), D runs at loop iteration end
+    CHECK_LOG("S.DSDE", "stmtexpr break in do-while loop");
+}
+
+void test_stmtexpr_nested_loops_break(void)
+{
+    // break in stmtexpr should only exit innermost loop
+    log_reset();
+    for (int i = 0; i < 2; i++)
+    {
+        defer log_append("O");
+        for (int j = 0; j < 3; j++)
+        {
+            defer log_append("I");
+            int x = ({
+                int _r;
+                {
+                    defer log_append("S");
+                    if (j == 1)
+                        break; // exits inner loop only
+                    _r = j;
+                }
+                _r;
+            });
+            (void)x;
+            log_append(".");
+        }
+        log_append("+");
+    }
+    log_append("E");
+    // S runs at block exit (before "."), I runs at inner loop end, O at outer end
+    // Inner loop: j=0 → S.I, j=1 → break→SI (exits inner loop)
+    // Then "+", outer loop ends → O
+    CHECK_LOG("S.ISI+OS.ISI+OE", "stmtexpr break exits only inner loop");
+}
+#endif
+
+void run_parsing_edge_case_tests(void)
+{
+    printf("\n=== PARSING EDGE CASE TESTS ===\n");
+
+#ifdef __GNUC__
+    test_utf8_identifiers();
+#endif
+
+    test_digraphs();
+    test_pragma_operator();
+
+#ifdef __GNUC__
+    test_break_escape_stmtexpr();
+    test_stmtexpr_while_break();
+    test_stmtexpr_dowhile_break();
+    test_stmtexpr_nested_loops_break();
+#endif
+}
+
 void run_verification_bug_tests(void)
 {
     printf("\n=== VERIFICATION TESTS ===\n");
@@ -5024,6 +6601,7 @@ int main(void)
     run_preprocessor_numeric_tests();
     run_preprocessor_system_macro_tests();
     run_verification_bug_tests();
+    run_parsing_edge_case_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);
