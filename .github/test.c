@@ -6126,10 +6126,7 @@ void test_for_loop_goto_bypass(void)
 
 #ifdef __GNUC__
 // Test A: UTF-8 Identifiers (C99/C11/C23 Universal Character Names)
-// NOTE: UCN identifiers are a KNOWN PARSING GAP in Prism
-// parse.c uses isalpha()/isalnum() which only handles ASCII
-// This test documents the gap - uncomment when fixed
-#if 0 // KNOWN GAP: Prism tokenizer doesn't handle UCN in identifiers
+// These are now SUPPORTED by Prism! See run_unicode_digraph_tests() for full test suite.
 void test_utf8_identifiers(void)
 {
     int \u00E4 = 4;  // UCN for 'ä' (U+00E4)
@@ -6137,21 +6134,8 @@ void test_utf8_identifiers(void)
 }
 #endif
 
-void test_utf8_identifiers(void)
-{
-    // Placeholder documenting the UCN gap
-    // When Prism's tokenizer adds UCN support (isalpha check -> unicode-aware),
-    // enable the test above
-    CHECK(1, "UTF-8/UCN identifiers: KNOWN GAP - not yet implemented");
-}
-#endif
-
 // Test B: Digraphs (ISO C alternative tokens)
-// NOTE: Digraphs are a KNOWN PARSING GAP in Prism
-// The preprocessor does NOT convert digraphs - they must be handled by the parser
-// Prism's tokenizer in parse.c does not currently handle digraphs
-// This test is commented out to document the gap
-#if 0 // KNOWN GAP: Prism does not handle digraphs
+// These are now SUPPORTED by Prism! See run_unicode_digraph_tests() for full test suite.
 void test_digraphs(void)
 {
     // Digraph mappings:
@@ -6163,15 +6147,6 @@ void test_digraphs(void)
     int arr<:5:> = <% 1, 2, 3, 4, 5 %>;
     CHECK(arr<:0:> == 1, "digraph array[0]");
     CHECK(arr<:4:> == 5, "digraph array[4]");
-}
-#endif
-
-// Simpler digraph-free version for when digraphs are fixed
-void test_digraphs(void)
-{
-    // This is a placeholder that documents the digraph gap
-    // When Prism adds digraph support, enable the test above
-    CHECK(1, "digraphs: KNOWN GAP - not yet implemented");
 }
 
 // Test C: _Pragma operator (C99)
@@ -6577,6 +6552,183 @@ void run_verification_bug_tests(void)
     test_for_loop_goto_bypass();
 }
 
+// SECTION: UTF-8/UCN IDENTIFIER AND DIGRAPH TESTS
+
+// Test UTF-8 identifiers with Latin Extended characters
+void test_utf8_latin_extended(void)
+{
+    int café = 42;
+    int naïve = 100;
+    int résumé = café + naïve;
+    CHECK_EQ(résumé, 142, "UTF-8 Latin Extended identifiers");
+}
+
+// Test UTF-8 identifiers with Greek letters
+void test_utf8_greek(void)
+{
+    double π = 3.14159;
+    double τ = 2.0 * π;
+    int Σ = 0;
+    for (int i = 1; i <= 10; i++) Σ += i;
+    CHECK(π > 3.14 && π < 3.15, "UTF-8 Greek pi");
+    CHECK(τ > 6.28 && τ < 6.29, "UTF-8 Greek tau");
+    CHECK_EQ(Σ, 55, "UTF-8 Greek sigma sum");
+}
+
+// Test UTF-8 identifiers with Cyrillic
+void test_utf8_cyrillic(void)
+{
+    int счётчик = 0;  // "counter" in Russian
+    for (int i = 0; i < 5; i++) счётчик++;
+    CHECK_EQ(счётчик, 5, "UTF-8 Cyrillic identifier");
+}
+
+// Test UTF-8 identifiers with CJK characters
+void test_utf8_cjk(void)
+{
+    int 変数 = 10;    // "variable" in Japanese
+    int 数值 = 20;    // "value" in Chinese
+    int 결과 = 変数 + 数值;  // "result" in Korean
+    CHECK_EQ(결과, 30, "UTF-8 CJK identifiers");
+}
+
+// Test UCN (Universal Character Name) identifiers - \uXXXX form
+void test_ucn_short(void)
+{
+    // \u03C0 = π (Greek small letter pi)
+    // \u00E9 = é (Latin small letter e with acute)
+    int \u03C0 = 314;
+    int caf\u00E9 = 42;
+    CHECK_EQ(\u03C0, 314, "UCN short form \\u03C0");
+    CHECK_EQ(caf\u00E9, 42, "UCN short form in identifier");
+}
+
+// Test UCN (Universal Character Name) identifiers - \UXXXXXXXX form
+void test_ucn_long(void)
+{
+    // \U0001F600 = 😀 (but we use valid XID characters)
+    // \U00004E2D = 中 (CJK character)
+    int \U00004E2D = 100;
+    CHECK_EQ(\U00004E2D, 100, "UCN long form \\U00004E2D");
+}
+
+// Test mixed UTF-8 and UCN identifiers
+void test_utf8_ucn_mixed(void)
+{
+    int café_var = 1;  // UTF-8 with ASCII suffix
+    int π_value = 314;
+    // Note: π and \u03C0 are the same character, so they refer to the same variable!
+    // This proves UTF-8 and UCN normalization works correctly
+    \u03C0_value = 628;  // Modify via UCN form
+    CHECK_EQ(café_var, 1, "Mixed UTF-8 and ASCII");
+    CHECK_EQ(π_value, 628, "UTF-8 and UCN same variable");
+}
+
+// Test digraphs: <: :> for [ ]
+void test_digraph_brackets(void)
+{
+    int arr<:5:> = {1, 2, 3, 4, 5};  // int arr[5] = {1, 2, 3, 4, 5};
+    int sum = 0;
+    for (int i = 0; i < 5; i++)
+        sum += arr<:i:>;  // sum += arr[i];
+    CHECK_EQ(sum, 15, "Digraph <: :> for brackets");
+    CHECK_EQ(arr<:0:>, 1, "Digraph bracket access first");
+    CHECK_EQ(arr<:4:>, 5, "Digraph bracket access last");
+}
+
+// Test digraphs: <% %> for { }
+void test_digraph_braces(void)
+<%
+    int x = 10;
+    int y = 20;
+    int result = x + y;
+    CHECK_EQ(result, 30, "Digraph <% %> for braces");
+%>
+
+// Test digraphs in struct definitions
+void test_digraph_struct(void)
+{
+    struct Point <%
+        int x;
+        int y;
+    %>;
+    struct Point p = <% .x = 3, .y = 4 %>;
+    CHECK_EQ(p.x, 3, "Digraph struct member x");
+    CHECK_EQ(p.y, 4, "Digraph struct member y");
+}
+
+// Test digraphs with arrays in structs
+void test_digraph_complex(void)
+{
+    struct Data <%
+        int values<:3:>;
+    %>;
+    struct Data d = <% .values = <% 10, 20, 30 %> %>;
+    CHECK_EQ(d.values<:0:>, 10, "Digraph nested array first");
+    CHECK_EQ(d.values<:1:>, 20, "Digraph nested array middle");
+    CHECK_EQ(d.values<:2:>, 30, "Digraph nested array last");
+}
+
+// Test digraphs with defer (Prism-specific)
+void test_digraph_defer(void)
+<%
+    log_reset();
+    <%
+        defer log_append("B");
+        log_append("A");
+    %>
+    CHECK_LOG("AB", "Digraph with defer");
+%>
+
+// Test UTF-8 identifiers with defer
+void test_utf8_defer(void)
+{
+    log_reset();
+    {
+        int счётчик = 0;
+        defer { char buf[16]; snprintf(buf, sizeof(buf), "%d", счётчик); log_append(buf); };
+        счётчик = 42;
+        log_append("X");
+    }
+    CHECK_LOG("X42", "UTF-8 identifier with defer");
+}
+
+// Test Greek letters commonly used in math/science
+void test_utf8_math_identifiers(void)
+{
+    double α = 1.0;
+    double β = 2.0;
+    double γ = α + β;
+    double Δx = 0.1;
+    double λ = 500e-9;  // wavelength in meters
+    double ω = 2.0 * 3.14159 * 1.0;  // angular frequency
+    
+    CHECK(γ > 2.9 && γ < 3.1, "Greek alpha+beta=gamma");
+    CHECK(Δx > 0.09 && Δx < 0.11, "Greek Delta");
+    CHECK(λ > 0 && λ < 1e-6, "Greek lambda");
+    CHECK(ω > 6.0 && ω < 7.0, "Greek omega");
+}
+
+// Run all UTF-8/UCN/digraph tests
+void run_unicode_digraph_tests(void)
+{
+    printf("\n--- UTF-8/UCN/Digraph Tests ---\n");
+    test_utf8_latin_extended();
+    test_utf8_greek();
+    test_utf8_cyrillic();
+    test_utf8_cjk();
+    test_ucn_short();
+    test_ucn_long();
+    test_utf8_ucn_mixed();
+    test_digraph_brackets();
+    test_digraph_braces();
+    test_digraph_struct();
+    test_digraph_complex();
+    test_digraph_defer();
+    test_utf8_defer();
+    test_utf8_math_identifiers();
+}
+
 int main(void)
 {
     printf("=== PRISM TEST SUITE ===\n");
@@ -6602,6 +6754,7 @@ int main(void)
     run_preprocessor_system_macro_tests();
     run_verification_bug_tests();
     run_parsing_edge_case_tests();
+    run_unicode_digraph_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

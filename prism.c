@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.98.5"
+#define PRISM_VERSION "0.99.0"
 
 #include "parse.c"
 
@@ -738,6 +738,15 @@ static void emit_tok(Token *tok)
       last_emitted = tok;
       return;
     }
+  }
+
+  // Handle digraphs - translate to canonical form
+  const char *equiv = digraph_equiv(tok);
+  if (equiv)
+  {
+    out_str(equiv, strlen(equiv));
+    last_emitted = tok;
+    return;
   }
 
   out_str(tok->loc, tok->len);
