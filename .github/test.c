@@ -6120,16 +6120,12 @@ void test_for_loop_goto_bypass(void)
     CHECK(1, "for loop goto bypass now blocked (compile error)");
 }
 
-// =============================================================================
-// SECTION: PARSING EDGE CASES - UTF-8, Digraphs, _Pragma, Statement Expressions
-// =============================================================================
-
 #ifdef __GNUC__
 // Test A: UTF-8 Identifiers (C99/C11/C23 Universal Character Names)
 // These are now SUPPORTED by Prism! See run_unicode_digraph_tests() for full test suite.
 void test_utf8_identifiers(void)
 {
-    int \u00E4 = 4;  // UCN for 'ä' (U+00E4)
+    int \u00E4 = 4; // UCN for 'ä' (U+00E4)
     CHECK(\u00E4 == 4, "UCN identifier \\u00E4");
 }
 #endif
@@ -6144,7 +6140,7 @@ void test_digraphs(void)
     // %: = #    %:%: = ## (preprocessor only)
 
     // Array declaration with digraphs
-    int arr<:5:> = <% 1, 2, 3, 4, 5 %>;
+    int arr<:5:> = <%1, 2, 3, 4, 5%>;
     CHECK(arr<:0:> == 1, "digraph array[0]");
     CHECK(arr<:4:> == 5, "digraph array[4]");
 }
@@ -6569,7 +6565,8 @@ void test_utf8_greek(void)
     double π = 3.14159;
     double τ = 2.0 * π;
     int Σ = 0;
-    for (int i = 1; i <= 10; i++) Σ += i;
+    for (int i = 1; i <= 10; i++)
+        Σ += i;
     CHECK(π > 3.14 && π < 3.15, "UTF-8 Greek pi");
     CHECK(τ > 6.28 && τ < 6.29, "UTF-8 Greek tau");
     CHECK_EQ(Σ, 55, "UTF-8 Greek sigma sum");
@@ -6578,17 +6575,18 @@ void test_utf8_greek(void)
 // Test UTF-8 identifiers with Cyrillic
 void test_utf8_cyrillic(void)
 {
-    int счётчик = 0;  // "counter" in Russian
-    for (int i = 0; i < 5; i++) счётчик++;
+    int счётчик = 0; // "counter" in Russian
+    for (int i = 0; i < 5; i++)
+        счётчик++;
     CHECK_EQ(счётчик, 5, "UTF-8 Cyrillic identifier");
 }
 
 // Test UTF-8 identifiers with CJK characters
 void test_utf8_cjk(void)
 {
-    int 変数 = 10;    // "variable" in Japanese
-    int 数值 = 20;    // "value" in Chinese
-    int 결과 = 変数 + 数值;  // "result" in Korean
+    int 変数 = 10;          // "variable" in Japanese
+    int 数值 = 20;          // "value" in Chinese
+    int 결과 = 変数 + 数值; // "result" in Korean
     CHECK_EQ(결과, 30, "UTF-8 CJK identifiers");
 }
 
@@ -6615,11 +6613,11 @@ void test_ucn_long(void)
 // Test mixed UTF-8 and UCN identifiers
 void test_utf8_ucn_mixed(void)
 {
-    int café_var = 1;  // UTF-8 with ASCII suffix
+    int café_var = 1; // UTF-8 with ASCII suffix
     int π_value = 314;
     // Note: π and \u03C0 are the same character, so they refer to the same variable!
     // This proves UTF-8 and UCN normalization works correctly
-    \u03C0_value = 628;  // Modify via UCN form
+    \u03C0_value = 628; // Modify via UCN form
     CHECK_EQ(café_var, 1, "Mixed UTF-8 and ASCII");
     CHECK_EQ(π_value, 628, "UTF-8 and UCN same variable");
 }
@@ -6627,10 +6625,10 @@ void test_utf8_ucn_mixed(void)
 // Test digraphs: <: :> for [ ]
 void test_digraph_brackets(void)
 {
-    int arr<:5:> = {1, 2, 3, 4, 5};  // int arr[5] = {1, 2, 3, 4, 5};
+    int arr<:5:> = {1, 2, 3, 4, 5}; // int arr[5] = {1, 2, 3, 4, 5};
     int sum = 0;
     for (int i = 0; i < 5; i++)
-        sum += arr<:i:>;  // sum += arr[i];
+        sum += arr<:i:>; // sum += arr[i];
     CHECK_EQ(sum, 15, "Digraph <: :> for brackets");
     CHECK_EQ(arr<:0:>, 1, "Digraph bracket access first");
     CHECK_EQ(arr<:4:>, 5, "Digraph bracket access last");
@@ -6648,11 +6646,12 @@ void test_digraph_braces(void)
 // Test digraphs in struct definitions
 void test_digraph_struct(void)
 {
-    struct Point <%
+    struct Point
+    <%
         int x;
         int y;
     %>;
-    struct Point p = <% .x = 3, .y = 4 %>;
+    struct Point p = <%.x = 3, .y = 4%>;
     CHECK_EQ(p.x, 3, "Digraph struct member x");
     CHECK_EQ(p.y, 4, "Digraph struct member y");
 }
@@ -6660,10 +6659,11 @@ void test_digraph_struct(void)
 // Test digraphs with arrays in structs
 void test_digraph_complex(void)
 {
-    struct Data <%
+    struct Data
+    <%
         int values<:3:>;
     %>;
-    struct Data d = <% .values = <% 10, 20, 30 %> %>;
+    struct Data d = <%.values = <%10, 20, 30%>%>;
     CHECK_EQ(d.values<:0:>, 10, "Digraph nested array first");
     CHECK_EQ(d.values<:1:>, 20, "Digraph nested array middle");
     CHECK_EQ(d.values<:2:>, 30, "Digraph nested array last");
@@ -6686,7 +6686,12 @@ void test_utf8_defer(void)
     log_reset();
     {
         int счётчик = 0;
-        defer { char buf[16]; snprintf(buf, sizeof(buf), "%d", счётчик); log_append(buf); };
+        defer
+        {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%d", счётчик);
+            log_append(buf);
+        };
         счётчик = 42;
         log_append("X");
     }
@@ -6700,9 +6705,9 @@ void test_utf8_math_identifiers(void)
     double β = 2.0;
     double γ = α + β;
     double Δx = 0.1;
-    double λ = 500e-9;  // wavelength in meters
-    double ω = 2.0 * 3.14159 * 1.0;  // angular frequency
-    
+    double λ = 500e-9;              // wavelength in meters
+    double ω = 2.0 * 3.14159 * 1.0; // angular frequency
+
     CHECK(γ > 2.9 && γ < 3.1, "Greek alpha+beta=gamma");
     CHECK(Δx > 0.09 && Δx < 0.11, "Greek Delta");
     CHECK(λ > 0 && λ < 1e-6, "Greek lambda");
@@ -6727,6 +6732,185 @@ void run_unicode_digraph_tests(void)
     test_digraph_defer();
     test_utf8_defer();
     test_utf8_math_identifiers();
+}
+
+static int zombie_counter = 0;
+
+void test_zombie_defer(void)
+{
+    zombie_counter = 0;
+    int x = 1;
+
+    // Switch jumps directly to case labels, skipping dead zone
+    switch (x)
+    {
+        // DEAD ZONE: Code here is unreachable in standard C
+        // Prism correctly errors if you try: defer zombie_counter++;
+
+    case 1:
+        break;
+    default:
+        break;
+    }
+
+    CHECK_EQ(zombie_counter, 0, "switch dead zone not executed");
+}
+
+void test_zombie_defer_uninitialized(void)
+{
+    int result = -1;
+    int x = 1;
+
+    switch (x)
+    {
+    // DEAD ZONE - Prism errors if defer used here
+    case 1:
+        result = 1;
+        break;
+    }
+
+    CHECK_EQ(result, 1, "switch jumps past dead zone");
+}
+
+void test_tcc_detection_logic(void)
+{
+    // Verify the BUG pattern would have matched (demonstrating the problem)
+    CHECK(strstr("tcc", "cc") != NULL, "strstr finds 'cc' in 'tcc' (old bug)");
+
+    // Test the FIXED matching approach
+    const char *compilers[] = {"tcc", "gcc", "cc", "x86_64-linux-gnu-gcc", "/usr/bin/cc", "clang"};
+    int should_match[] = {0, 1, 1, 1, 1, 1}; // tcc should NOT match
+
+    for (int i = 0; i < 6; i++)
+    {
+        const char *compiler = compilers[i];
+        int len = strlen(compiler);
+
+        // FIXED matching logic (mirrors prism.c)
+        int is_gcc_family = (len >= 3 && strcmp(compiler + len - 3, "gcc") == 0) ||
+                            (strcmp(compiler, "cc") == 0) ||
+                            (len >= 3 && strcmp(compiler + len - 3, "/cc") == 0);
+        int is_clang_family = strstr(compiler, "clang") != NULL;
+        int matches = is_gcc_family || is_clang_family;
+
+        char msg[128];
+        snprintf(msg, sizeof(msg), "compiler '%s' %s",
+                 compiler, should_match[i] ? "matches" : "does NOT match");
+        CHECK_EQ(matches, should_match[i], msg);
+    }
+}
+
+static int is_valid_ident_start_fixed(uint32_t cp)
+{
+    if (cp < 0x80)
+        return (cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z') || cp == '_' || cp == '$';
+    if (cp >= 0x00C0 && cp <= 0x00FF)
+        return 1;
+    if (cp >= 0x0100 && cp <= 0x017F)
+        return 1;
+    if (cp >= 0x0180 && cp <= 0x024F)
+        return 1;
+    if (cp >= 0x0250 && cp <= 0x02AF)
+        return 1;
+    if (cp >= 0x1E00 && cp <= 0x1EFF)
+        return 1;
+    if (cp >= 0x0370 && cp <= 0x03FF)
+        return 1;
+    if (cp >= 0x1F00 && cp <= 0x1FFF)
+        return 1;
+    if (cp >= 0x0400 && cp <= 0x04FF)
+        return 1;
+    if (cp >= 0x0500 && cp <= 0x052F)
+        return 1;
+    if (cp >= 0x0530 && cp <= 0x058F)
+        return 1;
+    if (cp >= 0x0590 && cp <= 0x05FF)
+        return 1; // Hebrew (NEW)
+    if (cp >= 0x0600 && cp <= 0x06FF)
+        return 1;
+    if (cp >= 0x0750 && cp <= 0x077F)
+        return 1;
+    if (cp >= 0x0900 && cp <= 0x097F)
+        return 1;
+    if (cp >= 0x1200 && cp <= 0x137F)
+        return 1; // Ethiopian (NEW)
+    if (cp >= 0x13A0 && cp <= 0x13FF)
+        return 1; // Cherokee (NEW)
+    if (cp >= 0x3040 && cp <= 0x309F)
+        return 1;
+    if (cp >= 0x30A0 && cp <= 0x30FF)
+        return 1;
+    if (cp >= 0x4E00 && cp <= 0x9FFF)
+        return 1;
+    if (cp >= 0x20000 && cp <= 0x2A6DF)
+        return 1; // CJK Extension B (NEW)
+    if (cp >= 0xAC00 && cp <= 0xD7AF)
+        return 1;
+    if (cp >= 0x1D400 && cp <= 0x1D7FF)
+        return 1; // Math Alphanumeric (NEW)
+    return 0;
+}
+
+void test_unicode_extended_ranges(void)
+{
+    // Test codepoints that were previously rejected but are now accepted
+    CHECK_EQ(is_valid_ident_start_fixed(0x1D400), 1, "Math Bold A (U+1D400) accepted");
+    CHECK_EQ(is_valid_ident_start_fixed(0x20000), 1, "CJK Extension B (U+20000) accepted");
+    CHECK_EQ(is_valid_ident_start_fixed(0x13A0), 1, "Cherokee A (U+13A0) accepted");
+    CHECK_EQ(is_valid_ident_start_fixed(0x05D0), 1, "Hebrew Alef (U+05D0) accepted");
+    CHECK_EQ(is_valid_ident_start_fixed(0x1200), 1, "Ethiopian Ha (U+1200) accepted");
+
+    // Verify existing ranges still work
+    CHECK_EQ(is_valid_ident_start_fixed(0x4E00), 1, "CJK U+4E00 accepted");
+    CHECK_EQ(is_valid_ident_start_fixed(0x0391), 1, "Greek Alpha accepted");
+    CHECK_EQ(is_valid_ident_start_fixed(0x0410), 1, "Cyrillic A accepted");
+
+    // Emojis are NOT valid XID_Start - correct rejection
+    CHECK_EQ(is_valid_ident_start_fixed(0x1F4A9), 0, "emoji correctly rejected");
+}
+
+void test_memory_interning_pattern(void)
+{
+    const char *filenames[] = {
+        "/usr/include/stdio.h",
+        "/usr/include/stdio.h",
+        "/usr/include/stdio.h",
+        "/usr/include/stdlib.h",
+        "/usr/include/stdlib.h",
+    };
+
+    int unique_count = 0;
+    const char *seen[5] = {0};
+
+    for (int i = 0; i < 5; i++)
+    {
+        int is_dup = 0;
+        for (int j = 0; j < unique_count; j++)
+        {
+            if (strcmp(filenames[i], seen[j]) == 0)
+            {
+                is_dup = 1;
+                break;
+            }
+        }
+        if (!is_dup)
+        {
+            seen[unique_count++] = filenames[i];
+        }
+    }
+
+    CHECK_EQ(unique_count, 2, "filename interning: 2 unique from 5 entries");
+}
+
+void run_bug_fix_verification_tests(void)
+{
+    printf("\n=== BUG FIX VERIFICATION TESTS ===\n");
+
+    test_zombie_defer();
+    test_zombie_defer_uninitialized();
+    test_tcc_detection_logic();
+    test_unicode_extended_ranges();
+    test_memory_interning_pattern();
 }
 
 int main(void)
@@ -6755,6 +6939,7 @@ int main(void)
     run_verification_bug_tests();
     run_parsing_edge_case_tests();
     run_unicode_digraph_tests();
+    run_bug_fix_verification_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

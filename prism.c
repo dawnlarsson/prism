@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #define _DARWIN_C_SOURCE
-#define PRISM_VERSION "0.99.0"
+#define PRISM_VERSION "0.99.1"
 
 #include "parse.c"
 
@@ -5585,16 +5585,31 @@ int main(int argc, char **argv)
   if (has_cpp_files || has_objc_files)
   {
     // Map C compiler to C++ compiler
-    if (strstr(compiler, "gcc") || strstr(compiler, "cc"))
+    // Use precise matching to avoid false positives (e.g., "tcc" contains "cc" but isn't gcc)
+    int clen = strlen(compiler);
+    bool is_gcc_family = (clen >= 3 && strcmp(compiler + clen - 3, "gcc") == 0) ||
+                         (strcmp(compiler, "cc") == 0) ||
+                         (clen >= 3 && strcmp(compiler + clen - 3, "/cc") == 0);
+    bool is_clang_family = strstr(compiler, "clang") != NULL;
+
+    if (is_gcc_family)
     {
       compiler = has_cpp_files ? "g++" : "gcc";
     }
-    else if (strstr(compiler, "clang"))
+    else if (is_clang_family)
     {
       compiler = has_cpp_files ? "clang++" : "clang";
     }
+    else if (has_cpp_files)
+    {
+      // Unknown compiler with C++ files - warn and continue with user's choice
+      fprintf(stderr, "[prism] Warning: C++ files detected but compiler '%s' is not recognized.\n"
+                      "         Prism cannot automatically switch to C++ mode for this compiler.\n"
+                      "         Please specify a C++ compiler explicitly if compilation fails.\n",
+              compiler);
+    }
 
-    if (cli.verbose)
+    if (cli.verbose && (is_gcc_family || is_clang_family))
     {
       fprintf(stderr, "[prism] Detected %s files, switching to %s\n",
               has_cpp_files ? "C++" : "Objective-C", compiler);

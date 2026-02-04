@@ -328,6 +328,9 @@ static void hashmap_clear(HashMap *map)
     map->used = 0;
 }
 
+// Forward declaration for error reporting (defined later)
+static noreturn void error(char *fmt, ...);
+
 // File tracking
 static File *current_file;
 static File **input_files;
@@ -335,6 +338,90 @@ static int input_file_count;
 static int input_file_capacity;
 static bool at_bol;
 static bool has_space;
+
+// Filename interning - avoids duplicating identical filename strings
+// Each entry maps filename string -> interned copy
+static HashMap filename_intern_map;
+
+static char *intern_filename(const char *name)
+{
+    if (!name)
+        return NULL;
+    int len = strlen(name);
+    char *existing = hashmap_get(&filename_intern_map, (char *)name, len);
+    if (existing)
+        return existing;
+    // Allocate and store new interned string
+    char *interned = malloc(len + 1);
+    if (!interned)
+        error("out of memory");
+    memcpy(interned, name, len + 1);
+    hashmap_put(&filename_intern_map, interned, len, interned);
+    return interned;
+}
+
+// File view cache - avoids creating duplicate File structs for same file context
+// Key: combines filename pointer, line_delta, is_system, is_include_entry
+// This dramatically reduces allocations for headers with many #line directives
+typedef struct
+{
+    char *filename; // Interned filename (pointer comparison valid)
+    int line_delta;
+    bool is_system;
+    bool is_include_entry;
+    File *file; // Cached File struct
+} FileViewCacheEntry;
+
+static FileViewCacheEntry *file_view_cache = NULL;
+static int file_view_cache_count = 0;
+static int file_view_cache_capacity = 0;
+
+static File *find_cached_file_view(char *filename, int line_delta, bool is_system, bool is_include_entry)
+{
+    // Linear search is acceptable for typical use (hundreds of unique entries)
+    // For very large translation units, this could be converted to a hash
+    for (int i = 0; i < file_view_cache_count; i++)
+    {
+        FileViewCacheEntry *e = &file_view_cache[i];
+        if (e->filename == filename && // Pointer comparison (interned)
+            e->line_delta == line_delta &&
+            e->is_system == is_system &&
+            e->is_include_entry == is_include_entry)
+        {
+            return e->file;
+        }
+    }
+    return NULL;
+}
+
+static void cache_file_view(char *filename, int line_delta, bool is_system, bool is_include_entry, File *file)
+{
+    if (file_view_cache_count >= file_view_cache_capacity)
+    {
+        int new_cap = file_view_cache_capacity == 0 ? 64 : file_view_cache_capacity * 2;
+        FileViewCacheEntry *new_cache = realloc(file_view_cache, sizeof(FileViewCacheEntry) * new_cap);
+        if (!new_cache)
+            error("out of memory");
+        file_view_cache = new_cache;
+        file_view_cache_capacity = new_cap;
+    }
+    FileViewCacheEntry *e = &file_view_cache[file_view_cache_count++];
+    e->filename = filename;
+    e->line_delta = line_delta;
+    e->is_system = is_system;
+    e->is_include_entry = is_include_entry;
+    e->file = file;
+}
+
+// Check if a filename pointer is from the intern map (vs malloc'd independently)
+static bool is_interned_filename(char *name)
+{
+    if (!name)
+        return false;
+    int len = strlen(name);
+    char *found = hashmap_get(&filename_intern_map, name, len);
+    return found == name; // Pointer comparison
+}
 
 static void free_file(File *f)
 {
@@ -344,9 +431,41 @@ static void free_file(File *f)
         free(f->contents);
     if (f->line_offsets && f->owns_line_offsets)
         free(f->line_offsets);
-    if (f->name)
+    // Don't free interned filenames - they're managed by filename_intern_map
+    if (f->name && !is_interned_filename(f->name))
         free(f->name);
     free(f);
+}
+
+// Free all interned filenames and clear the map
+static void free_filename_intern_map(void)
+{
+    if (!filename_intern_map.buckets)
+        return;
+    for (int i = 0; i < filename_intern_map.capacity; i++)
+    {
+        HashEntry *ent = &filename_intern_map.buckets[i];
+        if (ent->key && ent->key != TOMBSTONE)
+        {
+            free(ent->key); // Free the interned string
+        }
+    }
+    free(filename_intern_map.buckets);
+    filename_intern_map.buckets = NULL;
+    filename_intern_map.capacity = 0;
+    filename_intern_map.used = 0;
+}
+
+// Free file view cache (the File structs are freed separately)
+static void free_file_view_cache(void)
+{
+    if (file_view_cache)
+    {
+        free(file_view_cache);
+        file_view_cache = NULL;
+    }
+    file_view_cache_count = 0;
+    file_view_cache_capacity = 0;
 }
 
 static inline File *tok_file(Token *tok)
@@ -379,7 +498,7 @@ static int tok_line_no(Token *tok)
 }
 
 // Error handling
-noreturn void error(char *fmt, ...)
+static noreturn void error(char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
@@ -620,27 +739,150 @@ static bool is_ident_start_unicode(uint32_t cp)
 {
     if (cp < 0x80)
         return isalpha(cp) || cp == '_' || cp == '$';
-    // Latin Extended, Greek, Cyrillic
-    if (cp >= 0x00C0 && cp <= 0x024F)
-        return true;
+
+    // C11/C23 XID_Start compatible ranges (covers most common scripts)
+    // See: Unicode Standard Annex #31
+
+    // Latin Extended blocks
+    if (cp >= 0x00C0 && cp <= 0x00FF)
+        return true; // Latin-1 Supplement
+    if (cp >= 0x0100 && cp <= 0x017F)
+        return true; // Latin Extended-A
+    if (cp >= 0x0180 && cp <= 0x024F)
+        return true; // Latin Extended-B
+    if (cp >= 0x0250 && cp <= 0x02AF)
+        return true; // IPA Extensions
+    if (cp >= 0x1E00 && cp <= 0x1EFF)
+        return true; // Latin Extended Additional
+
+    // Greek and Coptic
     if (cp >= 0x0370 && cp <= 0x03FF)
-        return true; // Greek
+        return true;
+    if (cp >= 0x1F00 && cp <= 0x1FFF)
+        return true; // Greek Extended
+
+    // Cyrillic
     if (cp >= 0x0400 && cp <= 0x04FF)
-        return true; // Cyrillic
-    // CJK Unified Ideographs
-    if (cp >= 0x4E00 && cp <= 0x9FFF)
         return true;
-    // Hiragana & Katakana
-    if (cp >= 0x3040 && cp <= 0x30FF)
+    if (cp >= 0x0500 && cp <= 0x052F)
+        return true; // Cyrillic Supplement
+
+    // Armenian
+    if (cp >= 0x0530 && cp <= 0x058F)
         return true;
-    // Hangul
-    if (cp >= 0xAC00 && cp <= 0xD7AF)
+
+    // Hebrew
+    if (cp >= 0x0590 && cp <= 0x05FF)
         return true;
-    // Common identifier characters in other scripts
+
+    // Arabic
     if (cp >= 0x0600 && cp <= 0x06FF)
-        return true; // Arabic
+        return true;
+    if (cp >= 0x0750 && cp <= 0x077F)
+        return true; // Arabic Supplement
+
+    // Devanagari and other Indic scripts
     if (cp >= 0x0900 && cp <= 0x097F)
         return true; // Devanagari
+    if (cp >= 0x0980 && cp <= 0x09FF)
+        return true; // Bengali
+    if (cp >= 0x0A00 && cp <= 0x0A7F)
+        return true; // Gurmukhi
+    if (cp >= 0x0A80 && cp <= 0x0AFF)
+        return true; // Gujarati
+    if (cp >= 0x0B00 && cp <= 0x0B7F)
+        return true; // Oriya
+    if (cp >= 0x0B80 && cp <= 0x0BFF)
+        return true; // Tamil
+    if (cp >= 0x0C00 && cp <= 0x0C7F)
+        return true; // Telugu
+    if (cp >= 0x0C80 && cp <= 0x0CFF)
+        return true; // Kannada
+    if (cp >= 0x0D00 && cp <= 0x0D7F)
+        return true; // Malayalam
+    if (cp >= 0x0D80 && cp <= 0x0DFF)
+        return true; // Sinhala
+
+    // Thai and Lao
+    if (cp >= 0x0E00 && cp <= 0x0E7F)
+        return true; // Thai
+    if (cp >= 0x0E80 && cp <= 0x0EFF)
+        return true; // Lao
+
+    // Tibetan
+    if (cp >= 0x0F00 && cp <= 0x0FFF)
+        return true;
+
+    // Georgian
+    if (cp >= 0x10A0 && cp <= 0x10FF)
+        return true;
+
+    // Hangul Jamo and Syllables
+    if (cp >= 0x1100 && cp <= 0x11FF)
+        return true; // Hangul Jamo
+    if (cp >= 0xAC00 && cp <= 0xD7AF)
+        return true; // Hangul Syllables
+
+    // Ethiopian
+    if (cp >= 0x1200 && cp <= 0x137F)
+        return true;
+
+    // Cherokee
+    if (cp >= 0x13A0 && cp <= 0x13FF)
+        return true;
+
+    // Canadian Aboriginal Syllabics
+    if (cp >= 0x1400 && cp <= 0x167F)
+        return true;
+
+    // Khmer
+    if (cp >= 0x1780 && cp <= 0x17FF)
+        return true;
+
+    // Mongolian
+    if (cp >= 0x1800 && cp <= 0x18AF)
+        return true;
+
+    // Hiragana, Katakana, Bopomofo
+    if (cp >= 0x3040 && cp <= 0x309F)
+        return true; // Hiragana
+    if (cp >= 0x30A0 && cp <= 0x30FF)
+        return true; // Katakana
+    if (cp >= 0x3100 && cp <= 0x312F)
+        return true; // Bopomofo
+    if (cp >= 0x31A0 && cp <= 0x31BF)
+        return true; // Bopomofo Extended
+    if (cp >= 0x31F0 && cp <= 0x31FF)
+        return true; // Katakana Phonetic Extensions
+
+    // CJK Unified Ideographs (all extensions)
+    if (cp >= 0x3400 && cp <= 0x4DBF)
+        return true; // CJK Extension A
+    if (cp >= 0x4E00 && cp <= 0x9FFF)
+        return true; // CJK Unified
+    if (cp >= 0xF900 && cp <= 0xFAFF)
+        return true; // CJK Compatibility Ideographs
+    if (cp >= 0x20000 && cp <= 0x2A6DF)
+        return true; // CJK Extension B
+    if (cp >= 0x2A700 && cp <= 0x2B73F)
+        return true; // CJK Extension C
+    if (cp >= 0x2B740 && cp <= 0x2B81F)
+        return true; // CJK Extension D
+    if (cp >= 0x2B820 && cp <= 0x2CEAF)
+        return true; // CJK Extension E
+    if (cp >= 0x2CEB0 && cp <= 0x2EBEF)
+        return true; // CJK Extension F
+    if (cp >= 0x30000 && cp <= 0x3134F)
+        return true; // CJK Extension G
+
+    // Mathematical Alphanumeric Symbols (some compilers accept these)
+    if (cp >= 0x1D400 && cp <= 0x1D7FF)
+        return true;
+
+    // Letterlike Symbols
+    if (cp >= 0x2100 && cp <= 0x214F)
+        return true;
+
     return false;
 }
 
@@ -651,9 +893,28 @@ static bool is_ident_cont_unicode(uint32_t cp)
         return isalnum(cp) || cp == '_' || cp == '$';
     if (is_ident_start_unicode(cp))
         return true;
-    // Combining marks and modifiers
+    // Combining marks, modifiers, and other continuation characters
     if (cp >= 0x0300 && cp <= 0x036F)
-        return true; // Combining diacritics
+        return true; // Combining Diacritical Marks
+    if (cp >= 0x1DC0 && cp <= 0x1DFF)
+        return true; // Combining Diacritical Marks Supplement
+    if (cp >= 0x20D0 && cp <= 0x20FF)
+        return true; // Combining Diacritical Marks for Symbols
+    if (cp >= 0xFE20 && cp <= 0xFE2F)
+        return true; // Combining Half Marks
+    // Numeric characters (for continuation only)
+    if (cp >= 0x0660 && cp <= 0x0669)
+        return true; // Arabic-Indic Digits
+    if (cp >= 0x06F0 && cp <= 0x06F9)
+        return true; // Extended Arabic-Indic Digits
+    if (cp >= 0x0966 && cp <= 0x096F)
+        return true; // Devanagari Digits
+    if (cp >= 0x09E6 && cp <= 0x09EF)
+        return true; // Bengali Digits
+    if (cp >= 0x0E50 && cp <= 0x0E59)
+        return true; // Thai Digits
+    if (cp >= 0xFF10 && cp <= 0xFF19)
+        return true; // Fullwidth Digits
     return false;
 }
 
@@ -1092,10 +1353,21 @@ static void add_input_file(File *file)
 
 static File *new_file_view(const char *name, File *base, int line_delta, bool is_system, bool is_include_entry)
 {
+    // Intern the filename to allow pointer comparison
+    char *interned_name = intern_filename(name ? name : base->name);
+
+    // Check cache for existing File view with same parameters
+    File *cached = find_cached_file_view(interned_name, line_delta, is_system, is_include_entry);
+    if (cached)
+    {
+        return cached;
+    }
+
+    // Create new File view
     File *file = calloc(1, sizeof(File));
     if (!file)
         error("out of memory");
-    file->name = strdup(name ? name : base->name);
+    file->name = interned_name; // Use interned string (no strdup needed)
     file->display_name = file->name;
     file->file_no = input_file_count;
     file->contents = base->contents;
@@ -1106,6 +1378,10 @@ static File *new_file_view(const char *name, File *base, int line_delta, bool is
     file->owns_line_offsets = false;
     file->is_system = is_system;
     file->is_include_entry = is_include_entry;
+
+    // Cache this file view
+    cache_file_view(interned_name, line_delta, is_system, is_include_entry, file);
+
     return file;
 }
 
@@ -1417,6 +1693,8 @@ void tokenizer_reset(void)
 {
     free_string_allocs();
     arena_reset();
+    // Free file view cache first (before freeing files)
+    free_file_view_cache();
     for (int i = 0; i < input_file_count; i++)
         free_file(input_files[i]);
     free(input_files);
@@ -1424,6 +1702,8 @@ void tokenizer_reset(void)
     input_file_count = 0;
     input_file_capacity = 0;
     current_file = NULL;
+    // Free interned filenames last (after all files are freed)
+    free_filename_intern_map();
 }
 
 // Full cleanup - frees all memory including arena blocks
@@ -1431,6 +1711,8 @@ void tokenizer_cleanup(void)
 {
     free_string_allocs();
     arena_free();
+    // Free file view cache first (before freeing files)
+    free_file_view_cache();
     for (int i = 0; i < input_file_count; i++)
         free_file(input_files[i]);
     free(input_files);
@@ -1438,4 +1720,6 @@ void tokenizer_cleanup(void)
     input_file_count = 0;
     input_file_capacity = 0;
     current_file = NULL;
+    // Free interned filenames last (after all files are freed)
+    free_filename_intern_map();
 }
