@@ -221,15 +221,29 @@ static int defer_stack_capacity = 0;
 // Track pending loop/switch for next scope
 static bool next_scope_is_loop = false;
 static bool next_scope_is_switch = false;
-static bool next_scope_is_conditional = false;  // True for if/while/for blocks (not switch or regular blocks)
-static bool pending_control_flow = false;       // True after if/else/for/while/do/switch until we see { or ;
-static int control_paren_depth = 0;             // Track parens to distinguish for(;;) from braceless body
-static int control_brace_depth = 0;             // Track braces inside control parens (compound literals)
-static bool control_parens_just_closed = false; // True immediately after control parens close (depth 1→0)
-static bool in_for_init = false;                // True when inside the init clause of a for loop (before first ;)
-static bool pending_for_paren = false;          // True after seeing 'for', waiting for '(' to start init clause
-static int conditional_block_depth = 0;         // Track nesting depth of if/while/for blocks to detect conditional control exits
-static int generic_paren_depth = 0;             // Track parens inside _Generic(...) to distinguish default: from switch labels
+static bool next_scope_is_conditional = false; // True for if/while/for blocks (not switch or regular blocks)
+
+// Control flow parsing state - tracks the transition from control keyword to body
+// e.g., "for (int i = 0; i < n; i++)" parens, or "if (cond)" before the { or statement
+typedef struct
+{
+  bool pending;            // True after if/else/for/while/do/switch until we see { or ;
+  int paren_depth;         // Track parens to distinguish for(;;) from braceless body
+  int brace_depth;         // Track braces inside control parens (compound literals)
+  bool parens_just_closed; // True immediately after control parens close (depth 1→0)
+} ControlFlowState;
+
+static ControlFlowState control_state = {0};
+
+static inline void control_state_reset(void)
+{
+  control_state = (ControlFlowState){0};
+}
+
+static bool in_for_init = false;        // True when inside the init clause of a for loop (before first ;)
+static bool pending_for_paren = false;  // True after seeing 'for', waiting for '(' to start init clause
+static int conditional_block_depth = 0; // Track nesting depth of if/while/for blocks to detect conditional control exits
+static int generic_paren_depth = 0;     // Track parens inside _Generic(...) to distinguish default: from switch labels
 
 static LabelTable label_table;
 static bool current_func_returns_void = false;
@@ -359,56 +373,13 @@ static char **system_include_list; // Ordered list of includes
 static int system_include_count = 0;
 static int system_include_capacity = 0;
 
-// Extract include path from full system header path
-// /usr/include/stdio.h -> stdio.h
-// /usr/include/sys/types.h -> sys/types.h
-// /usr/include/x86_64-linux-gnu/sys/stat.h -> sys/stat.h
-// Returns NULL if header shouldn't be exposed as a public include
+// Return the full path for system header inclusion.
+// Trust the preprocessor output - if it included the file, include it.
 static char *path_to_include(const char *fullpath)
 {
   if (!fullpath)
     return NULL;
-
-  // Find "/include/" in path
-  const char *inc = strstr(fullpath, "/include/");
-  if (!inc)
-    return NULL;
-
-  const char *relpath = inc + 9; // strlen("/include/")
-
-  // Skip architecture-specific prefix but keep standard subdirs
-  // e.g., x86_64-linux-gnu/sys/stat.h -> sys/stat.h
-  const char *arch_prefixes[] = {
-      "x86_64-linux-gnu/", "aarch64-linux-gnu/",
-      "arm-linux-gnueabihf/", "i386-linux-gnu/", NULL};
-  for (const char **prefix = arch_prefixes; *prefix; prefix++)
-  {
-    size_t len = strlen(*prefix);
-    if (strncmp(relpath, *prefix, len) == 0)
-    {
-      relpath += len;
-      break;
-    }
-  }
-
-  // Skip internal/implementation headers that users shouldn't include directly
-  if (strncmp(relpath, "bits/", 5) == 0 ||
-      strncmp(relpath, "asm/", 4) == 0 ||
-      strncmp(relpath, "asm-generic/", 12) == 0 ||
-      strncmp(relpath, "linux/", 6) == 0 || // kernel headers pulled in transitively
-      strstr(relpath, "/bits/") != NULL ||
-      // Internal feature test and predef headers
-      strcmp(relpath, "stdc-predef.h") == 0 ||
-      strcmp(relpath, "features.h") == 0 ||
-      strcmp(relpath, "features-time64.h") == 0 ||
-      // Other internal headers that are included indirectly
-      strcmp(relpath, "alloca.h") == 0 ||
-      strcmp(relpath, "endian.h") == 0 ||
-      // GNU-specific internal headers
-      strncmp(relpath, "gnu/", 4) == 0)
-    return NULL;
-
-  return strdup(relpath);
+  return strdup(fullpath);
 }
 
 // Record a system header for later emission
@@ -471,9 +442,9 @@ static void emit_system_includes(void)
 
   for (int i = 0; i < system_include_count; i++)
   {
-    OUT_LIT("#include <");
+    OUT_LIT("#include \"");
     out_str(system_include_list[i], strlen(system_include_list[i]));
-    OUT_LIT(">\n");
+    OUT_LIT("\"\n");
   }
   if (system_include_count > 0)
     out_char('\n');
@@ -495,9 +466,9 @@ static void end_statement_after_semicolon(void)
 {
   at_stmt_start = true;
   in_for_init = false; // Semicolon ends init clause
-  if (pending_control_flow && control_paren_depth == 0)
+  if (control_state.pending && control_state.paren_depth == 0)
   {
-    pending_control_flow = false;
+    control_state.pending = false;
     next_scope_is_loop = false;
     next_scope_is_switch = false;
     next_scope_is_conditional = false;
@@ -596,9 +567,9 @@ static void mark_switch_control_exit(void)
 {
   // Only mark as definite control exit if not inside a conditional context
   // If inside if/while/for (even braceless), the control exit might not be taken at runtime
-  // pending_control_flow is true for braceless: "if (x) break;"
+  // control_state.pending is true for braceless: "if (x) break;"
   // conditional_block_depth > 0 for braced: "if (x) { break; }"
-  if (pending_control_flow || conditional_block_depth > 0)
+  if (control_state.pending || conditional_block_depth > 0)
     return;
 
   for (int d = defer_depth - 1; d >= 0; d--)
@@ -2120,18 +2091,71 @@ static void parse_typedef_declaration(Token *tok, int scope_depth)
 // Zero-init helpers
 // Sorted array of type keywords for binary search (replaces HashMap)
 static const char *const type_keywords[] = {
-    "FILE", "_BitInt", "_Bool", "_Complex", "_Imaginary", "__int128",
-    "__int128_t", "__typeof", "__typeof__", "__uint128", "__uint128_t",
-    "bool", "char", "complex", "double", "enum", "float", "fpos_t",
-    "imaginary", "int", "int16_t", "int32_t", "int64_t", "int8_t",
-    "int_fast16_t", "int_fast32_t", "int_fast64_t", "int_fast8_t",
-    "int_least16_t", "int_least32_t", "int_least64_t", "int_least8_t",
-    "intmax_t", "intptr_t", "long", "off_t", "pid_t", "ptrdiff_t",
-    "short", "signed", "size_t", "ssize_t", "struct", "time_t", "typeof",
-    "typeof_unqual", "uint16_t", "uint32_t", "uint64_t", "uint8_t",
-    "uint_fast16_t", "uint_fast32_t", "uint_fast64_t", "uint_fast8_t",
-    "uint_least16_t", "uint_least32_t", "uint_least64_t", "uint_least8_t",
-    "uintmax_t", "uintptr_t", "union", "unsigned", "void", "wchar_t", "wint_t",
+    "FILE",
+    "_BitInt",
+    "_Bool",
+    "_Complex",
+    "_Imaginary",
+    "__int128",
+    "__int128_t",
+    "__typeof",
+    "__typeof__",
+    "__uint128",
+    "__uint128_t",
+    "bool",
+    "char",
+    "complex",
+    "double",
+    "enum",
+    "float",
+    "fpos_t",
+    "imaginary",
+    "int",
+    "int16_t",
+    "int32_t",
+    "int64_t",
+    "int8_t",
+    "int_fast16_t",
+    "int_fast32_t",
+    "int_fast64_t",
+    "int_fast8_t",
+    "int_least16_t",
+    "int_least32_t",
+    "int_least64_t",
+    "int_least8_t",
+    "intmax_t",
+    "intptr_t",
+    "long",
+    "off_t",
+    "pid_t",
+    "ptrdiff_t",
+    "short",
+    "signed",
+    "size_t",
+    "ssize_t",
+    "struct",
+    "time_t",
+    "typeof",
+    "typeof_unqual",
+    "uint16_t",
+    "uint32_t",
+    "uint64_t",
+    "uint8_t",
+    "uint_fast16_t",
+    "uint_fast32_t",
+    "uint_fast64_t",
+    "uint_fast8_t",
+    "uint_least16_t",
+    "uint_least32_t",
+    "uint_least64_t",
+    "uint_least8_t",
+    "uintmax_t",
+    "uintptr_t",
+    "union",
+    "unsigned",
+    "void",
+    "wchar_t",
+    "wint_t",
 };
 
 static int compare_keyword(const void *a, const void *b)
@@ -2145,19 +2169,19 @@ static bool is_type_keyword(Token *tok)
 {
   if (tok->kind != TK_KEYWORD && tok->kind != TK_IDENT)
     return false;
-  
+
   // Create a null-terminated string from token for comparison
   char buf[256];
   if (tok->len >= (int)sizeof(buf))
     return false;
   memcpy(buf, tok->loc, tok->len);
   buf[tok->len] = '\0';
-  
+
   // Binary search in sorted array
   if (bsearch(buf, type_keywords, sizeof(type_keywords) / sizeof(type_keywords[0]),
               sizeof(type_keywords[0]), compare_keyword))
     return true;
-  
+
   // User-defined typedefs (tracked during transpilation)
   if (is_known_typedef(tok))
     return true;
@@ -3293,10 +3317,7 @@ static int transpile(char *input_file, char *output_file)
   next_scope_is_loop = false;
   next_scope_is_switch = false;
   next_scope_is_conditional = false;
-  pending_control_flow = false;
-  control_paren_depth = 0;
-  control_brace_depth = 0;
-  control_parens_just_closed = false;
+  control_state_reset();
   in_for_init = false;
   pending_for_paren = false;
   conditional_block_depth = 0;
@@ -3327,7 +3348,7 @@ static int transpile(char *input_file, char *output_file)
 
     // Try zero-init for declarations at statement start
     // Also allow in the init clause of a for loop: for (int i; ...)
-    if (at_stmt_start && (!pending_control_flow || in_for_init))
+    if (at_stmt_start && (!control_state.pending || in_for_init))
     {
       // try_zero_init_decl handles 'raw' keyword internally - it only consumes it
       // if followed by a valid declaration, otherwise treats 'raw' as a variable name
@@ -3384,13 +3405,13 @@ static int transpile(char *input_file, char *output_file)
         !is_inside_attribute(tok))
     {
       // Check for defer inside for/while/switch/if parentheses - this is invalid
-      if (pending_control_flow && control_paren_depth > 0)
+      if (control_state.pending && control_state.paren_depth > 0)
         error_tok(tok, "defer cannot appear inside control statement parentheses");
 
       // Check for defer in braceless control flow - this causes unexpected behavior
       // The defer binds to the parent scope instead of the control statement scope,
       // causing it to execute unconditionally regardless of the condition
-      if (pending_control_flow && control_paren_depth == 0)
+      if (control_state.pending && control_state.paren_depth == 0)
         error_tok(tok, "defer requires braces in if/while/for/switch statements.\n"
                        "       Braceless control flow does not create a scope, so defer binds to the parent scope\n"
                        "       and executes unconditionally. Add braces to create a proper scope:\n"
@@ -3398,7 +3419,7 @@ static int transpile(char *input_file, char *output_file)
                        "       Good: if (x) { defer cleanup(); }");
 
       // Track if we're in braceless control flow - we'll need to emit a placeholder
-      bool in_braceless_control = pending_control_flow;
+      bool in_braceless_control = control_state.pending;
 
       // Check for defer at the top-level of a statement expression - semantics are problematic
       // In ({ defer X; expr; }), the defer would execute after expr, making the result void
@@ -3830,19 +3851,19 @@ static int transpile(char *input_file, char *output_file)
         (equal(tok, "for") || equal(tok, "while") || equal(tok, "do")))
     {
       next_scope_is_loop = true;
-      pending_control_flow = true;
+      control_state.pending = true;
       // For 'for' loops, we need to allow zero-init in the init clause
       if (equal(tok, "for"))
         pending_for_paren = true;
       // For 'do' loops, the body comes immediately (no parens before body)
-      // Set control_parens_just_closed so the next '{' is recognized as the loop body
+      // Set cf.parens_just_closed so the next '{' is recognized as the loop body
       if (equal(tok, "do"))
-        control_parens_just_closed = true;
+        control_state.parens_just_closed = true;
     }
     // Also track 'for' for zero-init even if defer is disabled
     else if (feature_zeroinit && !feature_defer && tok->kind == TK_KEYWORD && equal(tok, "for"))
     {
-      pending_control_flow = true;
+      control_state.pending = true;
       pending_for_paren = true;
     }
 
@@ -3877,16 +3898,16 @@ static int transpile(char *input_file, char *output_file)
     if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "switch"))
     {
       next_scope_is_switch = true;
-      pending_control_flow = true;
+      control_state.pending = true;
     }
 
     // Mark if/else keywords
     if (tok->kind == TK_KEYWORD && (equal(tok, "if") || equal(tok, "else")))
     {
-      pending_control_flow = true;
+      control_state.pending = true;
       // For 'else', the body comes immediately (no parens before body like 'if')
       if (equal(tok, "else"))
-        control_parens_just_closed = true;
+        control_state.parens_just_closed = true;
     }
 
     // Handle case/default labels - clear defers from switch scope
@@ -4012,7 +4033,7 @@ static int transpile(char *input_file, char *output_file)
           bool save_conditional = next_scope_is_conditional;
           defer_push_scope();
           // Restore flags if we're inside control flow
-          if (pending_control_flow)
+          if (control_state.pending)
           {
             next_scope_is_loop = save_loop;
             next_scope_is_switch = save_switch;
@@ -4036,37 +4057,34 @@ static int transpile(char *input_file, char *output_file)
       // Detect compound literals in control flow expressions.
 
       // Inside control parens: definitely compound literal
-      if (pending_control_flow && control_paren_depth > 0)
+      if (control_state.pending && control_state.paren_depth > 0)
       {
         // This is a compound literal inside control expression - just emit and continue
         // Do NOT call defer_push_scope() or reset control flow flags
         emit_tok(tok);
         tok = tok->next;
         // Track compound literal brace depth separately
-        control_brace_depth++;
+        control_state.brace_depth++;
         continue;
       }
 
       // Outside control parens but not immediately after they closed: compound literal after condition
-      if (pending_control_flow && control_paren_depth == 0 && !control_parens_just_closed)
+      if (control_state.pending && control_state.paren_depth == 0 && !control_state.parens_just_closed)
       {
         // The control parens closed earlier (e.g., for(...) was complete) but then we saw more tokens
         // before this '{'. This means we're in a compound literal after the condition.
         emit_tok(tok);
         tok = tok->next;
-        control_brace_depth++;
+        control_state.brace_depth++;
         continue;
       }
 
       // Track if we're entering a conditional block (if/while/for) for accurate control exit detection
       // Switch blocks are not conditional in the same sense (we always enter one case)
-      if (pending_control_flow && !next_scope_is_switch)
+      if (control_state.pending && !next_scope_is_switch)
         next_scope_is_conditional = true;
 
-      pending_control_flow = false;       // Proper braces found
-      control_paren_depth = 0;            // Reset paren tracking (no longer in control expression)
-      control_brace_depth = 0;            // Reset compound literal tracking
-      control_parens_just_closed = false; // Reset this flag too
+      control_state_reset(); // Proper braces found - reset control flow state
       // Check if this is a statement expression: ({ ... })
       // The previous emitted token would be '('
       if (last_emitted && equal(last_emitted, "("))
@@ -4104,9 +4122,9 @@ static int transpile(char *input_file, char *output_file)
     {
       // If we're closing a compound literal inside control parentheses,
       // just emit the brace and decrement the tracking counter - no defer handling!
-      if (pending_control_flow && control_paren_depth > 0 && control_brace_depth > 0)
+      if (control_state.pending && control_state.paren_depth > 0 && control_state.brace_depth > 0)
       {
-        control_brace_depth--;
+        control_state.brace_depth--;
         emit_tok(tok);
         tok = tok->next;
         continue;
@@ -4142,12 +4160,12 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Track parentheses during pending control flow (for distinguishing for(;;) from body)
-    if (pending_control_flow)
+    if (control_state.pending)
     {
       if (equal(tok, "("))
       {
-        control_paren_depth++;
-        control_parens_just_closed = false; // Opening paren, resets the "just closed" state
+        control_state.paren_depth++;
+        control_state.parens_just_closed = false; // Opening paren, resets the "just closed" state
         // If we just saw 'for' and this is the opening paren, we're entering the init clause
         if (pending_for_paren)
         {
@@ -4158,17 +4176,17 @@ static int transpile(char *input_file, char *output_file)
       }
       else if (equal(tok, ")"))
       {
-        control_paren_depth--;
+        control_state.paren_depth--;
         // Exiting the for() parens entirely clears init state
-        if (control_paren_depth == 0)
+        if (control_state.paren_depth == 0)
         {
           in_for_init = false;
-          control_parens_just_closed = true; // Mark that we just exited control parens
+          control_state.parens_just_closed = true; // Mark that we just exited control parens
         }
         // Note: for inner parens (depth > 0), don't change the flag
       }
       // Semicolon inside for() parens ends the init clause (first ;) and condition (second ;)
-      if (equal(tok, ";") && control_paren_depth == 1)
+      if (equal(tok, ";") && control_state.paren_depth == 1)
       {
         if (in_for_init)
         {
@@ -4178,7 +4196,7 @@ static int transpile(char *input_file, char *output_file)
         }
       }
       // Semicolon at depth 0 ends a braceless statement body
-      else if (equal(tok, ";") && control_paren_depth == 0)
+      else if (equal(tok, ";") && control_state.paren_depth == 0)
       {
         // Pop any phantom scopes registered at defer_depth + 1
         // For braceless loop bodies like: for (int T = 0; T < 5; T++);
@@ -4187,7 +4205,7 @@ static int transpile(char *input_file, char *output_file)
         // Without this cleanup, the shadow persists and corrupts typedef lookups.
         typedef_pop_scope(defer_depth + 1);
 
-        pending_control_flow = false;
+        control_state.pending = false;
         next_scope_is_loop = false;
         next_scope_is_switch = false;
         next_scope_is_conditional = false;
@@ -4197,7 +4215,7 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Track statement boundaries for zero-init
-    if (equal(tok, ";") && !pending_control_flow)
+    if (equal(tok, ";") && !control_state.pending)
       at_stmt_start = true;
 
     // Preprocessor directives don't consume statement-start position

@@ -246,15 +246,15 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val);
 
 static void hashmap_resize(HashMap *map, int newcap)
 {
-    HashMap map2 = {.buckets = calloc(newcap, sizeof(HashEntry)), .capacity = newcap};
+    HashMap new_map = {.buckets = calloc(newcap, sizeof(HashEntry)), .capacity = newcap};
     for (int i = 0; i < map->capacity; i++)
     {
         HashEntry *ent = &map->buckets[i];
         if (ent->key && ent->key != TOMBSTONE)
-            hashmap_put(&map2, ent->key, ent->keylen, ent->val);
+            hashmap_put(&new_map, ent->key, ent->keylen, ent->val);
     }
     free(map->buckets);
-    *map = map2;
+    *map = new_map;
 }
 
 static void hashmap_put(HashMap *map, char *key, int keylen, void *val)
@@ -764,7 +764,10 @@ static uint32_t decode_utf8(char *p, int *len)
 
 // Unicode XID_Start ranges for identifier start characters (sorted by start)
 // See: Unicode Standard Annex #31, C11/C23 compatible
-static const struct { uint32_t start, end; } xid_start_ranges[] = {
+static const struct
+{
+    uint32_t start, end;
+} xid_start_ranges[] = {
     {0x00C0, 0x00FF},   // Latin-1 Supplement
     {0x0100, 0x017F},   // Latin Extended-A
     {0x0180, 0x024F},   // Latin Extended-B
@@ -1151,34 +1154,6 @@ static Token *read_char_literal(char *start, char *quote)
     return tok;
 }
 
-// Check if an integer literal has unsigned suffix (u, U, ul, UL, ull, ULL, etc.)
-static bool has_unsigned_suffix(const char *start, int len)
-{
-    const char *p = start + len - 1;
-    // Skip trailing L/l suffixes
-    while (p > start && (*p == 'l' || *p == 'L'))
-        p--;
-    // Check for U/u suffix
-    return p >= start && (*p == 'u' || *p == 'U');
-}
-
-static int64_t read_int_literal(char **pp, int base, bool is_unsigned)
-{
-    char *end;
-    int64_t val;
-    if (is_unsigned)
-    {
-        // Use strtoull for unsigned literals to handle full 64-bit range
-        val = (int64_t)strtoull(*pp, &end, base);
-    }
-    else
-    {
-        val = strtoll(*pp, &end, base);
-    }
-    *pp = end;
-    return val;
-}
-
 // Check for C23 extended float suffix and return info for normalization
 // Returns: suffix length to strip (0 if no extended suffix)
 // Sets *replacement to the standard suffix to use (NULL for none, "f" for float, "L" for long double)
@@ -1227,50 +1202,42 @@ static int get_extended_float_suffix(const char *p, int len, const char **replac
     return 0;
 }
 
+// Convert preprocessor number token to TK_NUM.
+// We detect floats (for C23 extended suffix rewriting) but don't parse values.
 static void convert_pp_number(Token *tok)
 {
+    tok->kind = TK_NUM;
+
     char *p = tok->loc;
-    int base = 10;
+    bool is_hex = (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'));
 
-    // Determine base from prefix
-    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+    // Detect floats by scanning for '.', or exponents
+    for (char *q = tok->loc; q < tok->loc + tok->len; q++)
     {
-        base = 16;
-        p += 2;
-    }
-    else if (p[0] == '0' && (p[1] == 'b' || p[1] == 'B'))
-    {
-        base = 2;
-        p += 2;
-    }
-    else if (p[0] == '0' && tok->len > 1)
-        base = 8;
-
-    // Check for float (decimal/hex only, not binary)
-    if (base != 2)
-    {
-        // C23 extended float suffixes (F16, F32, F64, F128, BF16)
-        if (base == 10 && get_extended_float_suffix(tok->loc, tok->len, NULL))
-            goto is_float;
-
-        // Standard float indicators: '.', exponent (e/E for decimal, p/P for hex)
-        for (char *q = tok->loc; q < tok->loc + tok->len; q++)
+        // '.' always indicates float
+        if (*q == '.')
         {
-            if (*q == '.' || *q == 'p' || *q == 'P' ||
-                (base != 16 && (*q == 'e' || *q == 'E')))
-                goto is_float;
+            tok->flags |= TF_IS_FLOAT;
+            return;
+        }
+        // 'p'/'P' exponent (hex floats)
+        if (*q == 'p' || *q == 'P')
+        {
+            tok->flags |= TF_IS_FLOAT;
+            return;
+        }
+        // 'e'/'E' exponent (decimal only - in hex these are valid digits)
+        if (!is_hex && (*q == 'e' || *q == 'E'))
+        {
+            tok->flags |= TF_IS_FLOAT;
+            return;
         }
     }
 
-    tok->kind = TK_NUM;
-    bool is_unsigned = has_unsigned_suffix(tok->loc, tok->len);
-    tok->val.i64 = read_int_literal(&p, base, is_unsigned);
-    return;
-
-is_float:
-    tok->kind = TK_NUM;
-    tok->flags |= TF_IS_FLOAT;
-    tok->val.i64 = 0;
+    // Check for C23 extended float suffixes (F16, F32, F64, F128, BF16)
+    // Only for decimal numbers - hex numbers can have these as valid hex digits
+    if (!is_hex && get_extended_float_suffix(tok->loc, tok->len, NULL))
+        tok->flags |= TF_IS_FLOAT;
 }
 
 static void convert_pp_tokens(Token *tok)
