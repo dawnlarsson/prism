@@ -250,7 +250,6 @@ static bool current_func_has_asm = false;
 static bool current_func_has_vfork = false;
 
 static bool at_stmt_start = false;
-static bool used_atomic_init = false; // Track if PRISM_ATOMIC_INIT macro was used
 // Track statement expression scopes - store the defer_depth at which each starts
 static int *stmt_expr_levels = NULL; // defer_depth when stmt expr started (dynamic)
 static int stmt_expr_count = 0;      // number of active statement expressions
@@ -1123,6 +1122,18 @@ static bool is_known_typedef(Token *tok)
     return false;
   TypedefEntry *e = &typedef_table.entries[idx];
   return !e->is_shadow && !e->is_enum_const;
+}
+
+// Check if token is a known shadow variable (variable that shadows a typedef)
+// Used to prevent looks_like_system_typedef from matching user variables like "int size_t = 10;"
+static bool is_known_shadow(Token *tok)
+{
+  if (!is_identifier_like(tok))
+    return false;
+  int idx = typedef_get_index(tok->loc, tok->len);
+  if (idx < 0)
+    return false;
+  return typedef_table.entries[idx].is_shadow;
 }
 
 // Check if token is a known VLA typedef (search most recent first for shadowing)
@@ -2184,6 +2195,13 @@ static bool is_type_keyword(Token *tok)
   // User-defined typedefs (tracked during transpilation)
   if (is_known_typedef(tok))
     return true;
+
+  // System typedefs that haven't been parsed (e.g., pthread_mutex_t when headers not flattened)
+  // This is a fallback heuristic for types like *_t, __* prefixed names
+  // BUT only if not explicitly declared as a variable (shadow) by the user
+  if (!is_known_shadow(tok) && looks_like_system_typedef(tok))
+    return true;
+
   return false;
 }
 
@@ -2290,7 +2308,7 @@ static bool is_const_expr_operator(Token *tok)
 static bool is_const_identifier(Token *tok)
 {
   return is_known_enum_const(tok) || is_known_typedef(tok) ||
-         is_type_keyword(tok) || looks_like_system_typedef(tok);
+         is_type_keyword(tok) || (!is_known_shadow(tok) && looks_like_system_typedef(tok));
 }
 
 // Check if token can be used as a variable name in a declarator.
@@ -2478,8 +2496,9 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       continue;
     }
 
-    // User-defined typedef
-    if (is_known_typedef(tok))
+    // User-defined typedef or system typedef (pthread_mutex_t, etc.)
+    // Check shadow first to handle "int size_t = 10;" correctly
+    if (is_known_typedef(tok) || (!is_known_shadow(tok) && looks_like_system_typedef(tok)))
     {
       r.is_typedef = true;
       if (is_vla_typedef(tok))
@@ -2507,7 +2526,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
   }
 
   // Check for "typedef_name varname" pattern (no pointer)
-  if (!r.saw_type && tok->kind == TK_IDENT && is_known_typedef(tok))
+  if (!r.saw_type && tok->kind == TK_IDENT && (is_known_typedef(tok) || (!is_known_shadow(tok) && looks_like_system_typedef(tok))))
   {
     Token *t = tok->next;
     while (t && is_type_qualifier(t))
@@ -2932,17 +2951,16 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, Token *warn_
                          (type->is_vla && !decl.is_pointer);
 
     // For typeof declarations, use memset instead of = 0 or = {0}
+    // Also for atomic aggregates: Clang doesn't support _Atomic aggregate init syntax
     // But NOT for register variables (can't take address) or volatile (needs volatile semantics)
-    bool needs_memset = type->has_typeof && !decl.has_init && !is_raw && !decl.is_pointer &&
-                        !type->has_register;
+    bool is_aggregate = decl.is_array || ((type->is_struct || type->is_typedef) && !decl.is_pointer);
+    bool needs_memset = !decl.has_init && !is_raw && !decl.is_pointer && !type->has_register &&
+                        (type->has_typeof || (type->has_atomic && is_aggregate));
 
-    // Add zero initializer if needed (for non-typeof types)
+    // Add zero initializer if needed (for non-memset types)
     if (!decl.has_init && !effective_vla && !is_raw && !needs_memset)
     {
-      bool is_aggregate = decl.is_array || ((type->is_struct || type->is_typedef) && !decl.is_pointer);
-      if (type->has_atomic && is_aggregate)
-        OUT_LIT(" PRISM_ATOMIC_INIT({0})");
-      else if (is_aggregate)
+      if (is_aggregate)
         OUT_LIT(" = {0}");
       else
         OUT_LIT(" = 0");
@@ -3286,53 +3304,13 @@ static int transpile(char *input_file, char *output_file)
     return 0;
   }
 
-  // Pre-scan to detect if we need PRISM_ATOMIC_INIT macro
-  // Check for _Atomic struct/union/typedef declarations with zeroinit
-  if (feature_zeroinit)
-  {
-    for (Token *t = tok; t; t = t->next)
-    {
-      if (t->kind == TK_KEYWORD && equal(t, "_Atomic"))
-      {
-        // Look ahead to see if this is an aggregate type
-        Token *next = t->next;
-        if (next && (equal(next, "struct") || equal(next, "union")))
-        {
-          used_atomic_init = true;
-          break;
-        }
-        // Also check for typedef that might be a struct/union
-        if (next && next->kind == TK_IDENT)
-        {
-          // Conservatively assume typedefs might be aggregates
-          // This errs on the side of emitting the macro when not needed,
-          // but that's better than missing it
-          used_atomic_init = true;
-          break;
-        }
-      }
-    }
-  }
-
-  FILE *out_fp = fopen(output_file, "w");
+  FILE *out_fp = fopen(output_file, "w");;
   if (!out_fp)
   {
     tokenizer_reset(); // Clean up tokenizer state on error
     return 0;
   }
   out_init(out_fp);
-
-  // Emit compatibility macros for _Atomic initialization only if used
-  // Clang has issues with _Atomic initialization, GCC works correctly
-  if (used_atomic_init)
-  {
-    OUT_LIT("/* Prism: _Atomic compatibility macros */\n");
-    OUT_LIT("#ifdef __clang__\n");
-    OUT_LIT("#define PRISM_ATOMIC_INIT(v)\n");
-    OUT_LIT("#else\n");
-    OUT_LIT("#define PRISM_ATOMIC_INIT(v) = v\n");
-    OUT_LIT("#endif\n\n");
-  }
 
   // Suppress warnings for inlined system header content.
   // System headers (especially glibc) use constructs that trigger various
@@ -3352,7 +3330,6 @@ static int transpile(char *input_file, char *output_file)
   last_line_no = 0;
   last_filename = NULL;
   last_system_header = false;
-  used_atomic_init = false;
   next_scope_is_loop = false;
   next_scope_is_switch = false;
   next_scope_is_conditional = false;

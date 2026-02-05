@@ -4,7 +4,7 @@
 
 Prism is a lightweight, self-contained transpiler that brings modern language features to standard C. It functions as a build tool with zero dependencies, allowing you to write safer code without the overhead of complex build systems or heavy frameworks, or macro hacks.
 
-* **Stability:** Prism is tested against **960+** tests, edge cases, and "torture" tests.
+* **Stability:** Prism is tested against **990+** tests, edge cases, and "torture" tests.
 * **Opt out dialect features** Disable parts of the transpiler, like zero-init, with CLI flags.
 * **Drop-in overlay:** Use `CC=prism` in any build system — GCC-compatible flags pass through automatically.
 

@@ -4518,11 +4518,34 @@ void test_atomic_zeroinit(void)
     _Atomic int *ap;
     CHECK(ap == NULL, "_Atomic pointer zero-init");
 }
+
+void test_atomic_aggregate_zeroinit(void)
+{
+    // _Atomic struct (aggregate type)
+    _Atomic struct { int x; int y; } atomic_struct;
+    int all_zero = 1;
+    unsigned char *p = (unsigned char *)&atomic_struct;
+    for (size_t i = 0; i < sizeof(atomic_struct); i++)
+        if (p[i] != 0) all_zero = 0;
+    CHECK(all_zero, "_Atomic struct memset zero-init");
+
+    // _Atomic array of ints
+    _Atomic int arr[4];
+    all_zero = 1;
+    p = (unsigned char *)&arr;
+    for (size_t i = 0; i < sizeof(arr); i++)
+        if (p[i] != 0) all_zero = 0;
+    CHECK(all_zero, "_Atomic int array zero-init");
+}
 #else
 void test_atomic_zeroinit(void)
 {
     // Skip on platforms without atomics
     printf("[SKIP] _Atomic tests (not supported)\n");
+}
+void test_atomic_aggregate_zeroinit(void)
+{
+    printf("[SKIP] _Atomic aggregate tests (not supported)\n");
 }
 #endif
 
@@ -5200,6 +5223,7 @@ void run_rigor_tests(void)
     test_nested_stmt_expr_defer_immediate_block_exit();
     test_const_after_typename();
     test_atomic_zeroinit();
+    test_atomic_aggregate_zeroinit();
     test_static_local_zeroinit();
     test_inline_defer();
     test_complex_declarator_zeroinit();
@@ -5464,6 +5488,64 @@ void test_system_typedef_pattern(void)
         if (buf1[i] != 0)
             all_zero = 0;
     CHECK(all_zero, "custom _t typedef in cast - zero-init");
+}
+
+// Test for invisible system typedef recognition
+// When system headers aren't flattened, types like pthread_mutex_t are still recognizable
+// by the looks_like_system_typedef() heuristic in the transpiler.
+// We test this using types from stddef.h and stdint.h which ARE included via standard includes.
+void test_invisible_system_typedef_pattern(void)
+{
+    // size_t - standard system typedef from stddef.h
+    size_t s1;  // should be zero-initialized
+    CHECK(s1 == 0, "size_t variable - zero-init");
+
+    // ptrdiff_t - standard system typedef from stddef.h
+    ptrdiff_t p1;
+    CHECK(p1 == 0, "ptrdiff_t variable - zero-init");
+
+    // uint32_t, int64_t - stdint.h system typedefs
+    uint32_t u32;
+    CHECK(u32 == 0, "uint32_t variable - zero-init");
+
+    int64_t i64;
+    CHECK(i64 == 0, "int64_t variable - zero-init");
+
+    uintptr_t uptr;
+    CHECK(uptr == 0, "uintptr_t variable - zero-init");
+
+    // Array of system types
+    size_t arr[3];
+    int all_zero = 1;
+    for (int i = 0; i < 3; i++)
+        if (arr[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "size_t array - zero-init");
+
+    // Pointer to system type
+    size_t *ptr;
+    CHECK(ptr == 0, "size_t* pointer - zero-init");
+}
+
+// Test that user-defined variables with system-like names shadow the typedef heuristic
+// Bug: if user declares "int size_t = 10;", the looks_like_system_typedef heuristic
+// might still treat it as a type, causing "size_t * 5" to parse as pointer declaration
+void test_system_typedef_shadow(void)
+{
+    // Shadow a system type name with a variable
+    int size_t = 10;
+    int result = size_t * 5;  // Should be multiplication, not pointer declaration
+    CHECK(result == 50, "shadowed size_t multiplication");
+
+    // Another shadow test with _t suffix
+    int my_custom_t = 7;
+    int mul = my_custom_t * 3;
+    CHECK(mul == 21, "shadowed *_t multiplication");
+
+    // Double underscore prefix shadow
+    int __internal = 8;
+    int prod = __internal * 2;
+    CHECK(prod == 16, "shadowed __* multiplication");
 }
 
 void test_alignof_in_array_bound(void)
@@ -5992,6 +6074,8 @@ void run_sizeof_constexpr_tests(void)
     test_cast_expression_in_array_bound();
     test_complex_macro_array_bound();
     test_system_typedef_pattern();
+    test_invisible_system_typedef_pattern();
+    test_system_typedef_shadow();
     test_alignof_in_array_bound();
     test_complex_operators_in_array_bound();
     test_sizeof_array_element_in_bound();
