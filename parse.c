@@ -14,6 +14,7 @@
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +31,26 @@
 #endif
 
 #define TOMBSTONE ((void *)-1)
+
+// Generic array growth: ensures *arr has capacity for n elements
+#define ENSURE_ARRAY_CAP(arr, count, cap, init_cap, T)         \
+    do                                                         \
+    {                                                          \
+        if ((count) >= (cap))                                  \
+        {                                                      \
+            int new_cap = (cap) == 0 ? (init_cap) : (cap) * 2; \
+            while (new_cap < (count))                          \
+                new_cap *= 2;                                  \
+            T *tmp = realloc((arr), sizeof(T) * new_cap);      \
+            if (!tmp)                                          \
+            {                                                  \
+                fprintf(stderr, "out of memory\n");            \
+                exit(1);                                       \
+            }                                                  \
+            (arr) = tmp;                                       \
+            (cap) = new_cap;                                   \
+        }                                                      \
+    } while (0)
 
 typedef struct Token Token;
 
@@ -103,76 +124,14 @@ static inline void tok_set_has_space(Token *tok, bool v)
         tok->flags &= ~TF_HAS_SPACE;
 }
 
-// Arena allocator for tokens
-#define ARENA_BLOCK_SIZE 4096
+// Generic arena allocator - unified "linked list of blocks" bump allocator
+// Used for both token allocation and string data
+#define ARENA_DEFAULT_BLOCK_SIZE (64 * 1024)
 
 typedef struct ArenaBlock ArenaBlock;
 struct ArenaBlock
 {
     ArenaBlock *next;
-    int used;
-    Token tokens[ARENA_BLOCK_SIZE];
-};
-
-typedef struct
-{
-    ArenaBlock *head;
-    ArenaBlock *current;
-} TokenArena;
-
-static TokenArena token_arena = {0};
-
-static Token *arena_alloc_token(void)
-{
-    if (!token_arena.current || token_arena.current->used >= ARENA_BLOCK_SIZE)
-    {
-        ArenaBlock *block = malloc(sizeof(ArenaBlock));
-        if (!block)
-        {
-            fprintf(stderr, "out of memory allocating token arena block\n");
-            exit(1);
-        }
-        block->next = NULL;
-        block->used = 0;
-        if (token_arena.current)
-            token_arena.current->next = block;
-        else
-            token_arena.head = block;
-        token_arena.current = block;
-    }
-    Token *tok = &token_arena.current->tokens[token_arena.current->used++];
-    memset(tok, 0, sizeof(Token));
-    return tok;
-}
-
-static void arena_reset(void)
-{
-    for (ArenaBlock *b = token_arena.head; b; b = b->next)
-        b->used = 0;
-    token_arena.current = token_arena.head;
-}
-
-// Fully free all arena blocks (for complete cleanup)
-static void arena_free(void)
-{
-    ArenaBlock *b = token_arena.head;
-    while (b)
-    {
-        ArenaBlock *next = b->next;
-        free(b);
-        b = next;
-    }
-    token_arena.head = NULL;
-    token_arena.current = NULL;
-}
-
-// String arena - bump allocator for string data (literals, identifiers, etc.)
-#define STRING_ARENA_BLOCK_SIZE (64 * 1024)
-
-typedef struct StringArenaBlock StringArenaBlock;
-struct StringArenaBlock
-{
-    StringArenaBlock *next;
     size_t used;
     size_t capacity;
     char data[];
@@ -180,21 +139,20 @@ struct StringArenaBlock
 
 typedef struct
 {
-    StringArenaBlock *head;
-    StringArenaBlock *current;
-} StringArena;
+    ArenaBlock *head;
+    ArenaBlock *current;
+    size_t default_block_size;
+} Arena;
 
-static StringArena string_arena = {0};
-
-static StringArenaBlock *new_string_arena_block(size_t min_size)
+static ArenaBlock *arena_new_block(size_t min_size, size_t default_size)
 {
-    size_t capacity = STRING_ARENA_BLOCK_SIZE;
+    size_t capacity = default_size;
     if (min_size > capacity)
         capacity = min_size;
-    StringArenaBlock *block = malloc(sizeof(StringArenaBlock) + capacity);
+    ArenaBlock *block = malloc(sizeof(ArenaBlock) + capacity);
     if (!block)
     {
-        fprintf(stderr, "out of memory allocating string arena block\n");
+        fprintf(stderr, "out of memory allocating arena block\n");
         exit(1);
     }
     block->next = NULL;
@@ -203,45 +161,67 @@ static StringArenaBlock *new_string_arena_block(size_t min_size)
     return block;
 }
 
-static char *string_arena_alloc(size_t size)
+static void *arena_alloc(Arena *arena, size_t size)
 {
     if (size == 0)
-        size = 1; // Always allocate at least 1 byte for null terminator
+        size = 1;
 
-    if (!string_arena.current || string_arena.current->used + size > string_arena.current->capacity)
+    // Align to 8 bytes for proper alignment of any type
+    size = (size + 7) & ~(size_t)7;
+
+    if (!arena->current || arena->current->used + size > arena->current->capacity)
     {
-        StringArenaBlock *block = new_string_arena_block(size);
-        if (string_arena.current)
-            string_arena.current->next = block;
+        size_t block_size = arena->default_block_size ? arena->default_block_size : ARENA_DEFAULT_BLOCK_SIZE;
+        ArenaBlock *block = arena_new_block(size, block_size);
+        if (arena->current)
+            arena->current->next = block;
         else
-            string_arena.head = block;
-        string_arena.current = block;
+            arena->head = block;
+        arena->current = block;
     }
 
-    char *ptr = string_arena.current->data + string_arena.current->used;
-    string_arena.current->used += size;
+    void *ptr = arena->current->data + arena->current->used;
+    arena->current->used += size;
     memset(ptr, 0, size);
     return ptr;
 }
 
-static void string_arena_reset(void)
+static void arena_reset(Arena *arena)
 {
-    for (StringArenaBlock *b = string_arena.head; b; b = b->next)
+    for (ArenaBlock *b = arena->head; b; b = b->next)
         b->used = 0;
-    string_arena.current = string_arena.head;
+    arena->current = arena->head;
 }
 
-static void string_arena_free(void)
+static void arena_free(Arena *arena)
 {
-    StringArenaBlock *b = string_arena.head;
+    ArenaBlock *b = arena->head;
     while (b)
     {
-        StringArenaBlock *next = b->next;
+        ArenaBlock *next = b->next;
         free(b);
         b = next;
     }
-    string_arena.head = NULL;
-    string_arena.current = NULL;
+    arena->head = NULL;
+    arena->current = NULL;
+}
+
+// Token arena - specialized for Token allocation
+#define TOKEN_ARENA_BLOCK_SIZE (4096 * sizeof(Token))
+static Arena token_arena = {.default_block_size = TOKEN_ARENA_BLOCK_SIZE};
+
+static Token *arena_alloc_token(void)
+{
+    return arena_alloc(&token_arena, sizeof(Token));
+}
+
+// String arena - for string data (literals, identifiers, etc.)
+#define STRING_ARENA_BLOCK_SIZE (64 * 1024)
+static Arena string_arena = {.default_block_size = STRING_ARENA_BLOCK_SIZE};
+
+static char *string_arena_alloc(size_t size)
+{
+    return arena_alloc(&string_arena, size);
 }
 
 // Simple hashmap for keywords
@@ -424,118 +404,32 @@ static char *intern_filename(const char *name)
 }
 
 // File view cache - avoids creating duplicate File structs for same file context
+// Uses the generic HashMap with a packed composite key
 // Key: combines filename pointer, line_delta, is_system, is_include_entry
-// This dramatically reduces allocations for headers with many #line directives
 typedef struct
 {
     char *filename; // Interned filename (pointer comparison valid)
     int line_delta;
-    bool is_system;
-    bool is_include_entry;
-    File *file; // Cached File struct
-} FileViewCacheEntry;
+    uint8_t flags; // is_system (bit 0), is_include_entry (bit 1)
+} FileViewKey;
 
-// File view cache using open-addressing hash table
-static FileViewCacheEntry *file_view_cache = NULL;
-static int file_view_cache_count = 0;
-static int file_view_cache_capacity = 0;
-
-// Hash function for file view cache composite key
-static uint64_t file_view_hash(char *filename, int line_delta, bool is_system, bool is_include_entry)
-{
-    uint64_t hash = 0xcbf29ce484222325;
-    // Hash the pointer value (filename is interned)
-    uintptr_t ptr = (uintptr_t)filename;
-    for (int i = 0; i < (int)sizeof(ptr); i++)
-    {
-        hash *= 0x100000001b3;
-        hash ^= (ptr >> (i * 8)) & 0xFF;
-    }
-    // Hash line_delta
-    hash *= 0x100000001b3;
-    hash ^= (uint32_t)line_delta;
-    hash *= 0x100000001b3;
-    hash ^= ((uint32_t)line_delta >> 8);
-    // Hash flags
-    hash *= 0x100000001b3;
-    hash ^= (is_system ? 1 : 0) | (is_include_entry ? 2 : 0);
-    return hash;
-}
+static HashMap file_view_cache = {0};
 
 static File *find_cached_file_view(char *filename, int line_delta, bool is_system, bool is_include_entry)
 {
-    if (!file_view_cache || file_view_cache_capacity == 0)
-        return NULL;
-
-    uint64_t hash = file_view_hash(filename, line_delta, is_system, is_include_entry);
-    for (int i = 0; i < file_view_cache_capacity; i++)
-    {
-        int idx = (hash + i) % file_view_cache_capacity;
-        FileViewCacheEntry *e = &file_view_cache[idx];
-        if (!e->filename)
-            return NULL;               // Empty slot - not found
-        if (e->filename == filename && // Pointer comparison (interned)
-            e->line_delta == line_delta &&
-            e->is_system == is_system &&
-            e->is_include_entry == is_include_entry)
-        {
-            return e->file;
-        }
-    }
-    return NULL;
+    FileViewKey key = {filename, line_delta, (is_system ? 1 : 0) | (is_include_entry ? 2 : 0)};
+    return hashmap_get(&file_view_cache, (char *)&key, sizeof(key));
 }
-
-static void file_view_cache_resize(int new_cap);
 
 static void cache_file_view(char *filename, int line_delta, bool is_system, bool is_include_entry, File *file)
 {
-    // Resize if needed (keep load factor under 70%)
-    if (!file_view_cache || file_view_cache_count * 100 / (file_view_cache_capacity ? file_view_cache_capacity : 1) >= 70)
-    {
-        int new_cap = file_view_cache_capacity == 0 ? 64 : file_view_cache_capacity * 2;
-        file_view_cache_resize(new_cap);
-    }
-
-    uint64_t hash = file_view_hash(filename, line_delta, is_system, is_include_entry);
-    for (int i = 0; i < file_view_cache_capacity; i++)
-    {
-        int idx = (hash + i) % file_view_cache_capacity;
-        FileViewCacheEntry *e = &file_view_cache[idx];
-        if (!e->filename)
-        {
-            e->filename = filename;
-            e->line_delta = line_delta;
-            e->is_system = is_system;
-            e->is_include_entry = is_include_entry;
-            e->file = file;
-            file_view_cache_count++;
-            return;
-        }
-    }
-}
-
-static void file_view_cache_resize(int new_cap)
-{
-    FileViewCacheEntry *old = file_view_cache;
-    int old_cap = file_view_cache_capacity;
-
-    file_view_cache = calloc(new_cap, sizeof(FileViewCacheEntry));
-    if (!file_view_cache)
+    FileViewKey key = {filename, line_delta, (is_system ? 1 : 0) | (is_include_entry ? 2 : 0)};
+    // Need to allocate key storage since HashMap stores pointer to key
+    FileViewKey *stored_key = malloc(sizeof(FileViewKey));
+    if (!stored_key)
         error("out of memory");
-    file_view_cache_capacity = new_cap;
-    file_view_cache_count = 0;
-
-    // Rehash existing entries
-    if (old)
-    {
-        for (int i = 0; i < old_cap; i++)
-        {
-            if (old[i].filename)
-                cache_file_view(old[i].filename, old[i].line_delta,
-                                old[i].is_system, old[i].is_include_entry, old[i].file);
-        }
-        free(old);
-    }
+    *stored_key = key;
+    hashmap_put(&file_view_cache, (char *)stored_key, sizeof(FileViewKey), file);
 }
 
 static void free_file(File *f)
@@ -577,16 +471,19 @@ static void free_filename_intern_map(void)
     filename_intern_map.used = 0;
 }
 
-// Free file view cache (the File structs are freed separately)
+// Free file view cache keys and clear the map (File structs are freed separately)
 static void free_file_view_cache(void)
 {
-    if (file_view_cache)
+    if (!file_view_cache.buckets)
+        return;
+    // Free allocated keys
+    for (int i = 0; i < file_view_cache.capacity; i++)
     {
-        free(file_view_cache);
-        file_view_cache = NULL;
+        HashEntry *ent = &file_view_cache.buckets[i];
+        if (ent->key && ent->key != TOMBSTONE)
+            free(ent->key);
     }
-    file_view_cache_count = 0;
-    file_view_cache_capacity = 0;
+    hashmap_clear(&file_view_cache);
 }
 
 static inline File *tok_file(Token *tok)
@@ -1457,15 +1354,7 @@ static File *new_file(char *name, int file_no, char *contents)
 
 static void add_input_file(File *file)
 {
-    if (input_file_count >= input_file_capacity)
-    {
-        int new_cap = input_file_capacity == 0 ? 16 : input_file_capacity * 2;
-        File **new_files = realloc(input_files, sizeof(File *) * new_cap);
-        if (!new_files)
-            error("out of memory");
-        input_files = new_files;
-        input_file_capacity = new_cap;
-    }
+    ENSURE_ARRAY_CAP(input_files, input_file_count + 1, input_file_capacity, 16, File *);
     input_files[input_file_count++] = file;
 }
 
@@ -1796,8 +1685,8 @@ Token *tokenize_file(char *path)
 // Reset state for reuse (keeps arena blocks for reuse)
 void tokenizer_reset(void)
 {
-    string_arena_reset();
-    arena_reset();
+    arena_reset(&string_arena);
+    arena_reset(&token_arena);
     // Free file view cache first (before freeing files)
     free_file_view_cache();
     for (int i = 0; i < input_file_count; i++)
@@ -1814,8 +1703,8 @@ void tokenizer_reset(void)
 // Full cleanup - frees all memory including arena blocks
 void tokenizer_cleanup(void)
 {
-    string_arena_free();
-    arena_free();
+    arena_free(&string_arena);
+    arena_free(&token_arena);
     // Free file view cache first (before freeing files)
     free_file_view_cache();
     for (int i = 0; i < input_file_count; i++)

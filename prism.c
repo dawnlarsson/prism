@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.99.5"
+#define PRISM_VERSION "0.99.6"
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -96,22 +96,7 @@ static int struct_depth = 0;
 // Initial capacity for all dynamic arrays (grows as needed)
 #define INITIAL_CAP 32
 
-// Generic array growth: ensures *arr has capacity for n elements
-#define ENSURE_ARRAY_CAP(arr, count, cap, init_cap, T)   \
-  do                                                     \
-  {                                                      \
-    if ((count) >= (cap))                                \
-    {                                                    \
-      int new_cap = (cap) == 0 ? (init_cap) : (cap) * 2; \
-      while (new_cap < (count))                          \
-        new_cap *= 2;                                    \
-      T *tmp = realloc((arr), sizeof(T) * new_cap);      \
-      if (!tmp)                                          \
-        error("out of memory");                          \
-      (arr) = tmp;                                       \
-      (cap) = new_cap;                                   \
-    }                                                    \
-  } while (0)
+// Note: ENSURE_ARRAY_CAP is defined in parse.c
 
 #define MAX_TYPEOF_VARS_PER_DECL 32
 #define MAX_ATTRIBUTE_WALK_DEPTH 100
@@ -160,6 +145,19 @@ static Token *skip_all_attributes(Token *tok)
       continue;
     }
     break;
+  }
+  return tok;
+}
+
+// Skip only GNU/MSVC-style attributes: __attribute__((...)), __declspec(...)
+// For use when C23 [[...]] attributes aren't expected
+static Token *skip_gnu_attributes(Token *tok)
+{
+  while (tok && is_attribute_keyword(tok))
+  {
+    tok = tok->next;
+    if (tok && equal(tok, "("))
+      tok = skip_balanced(tok, "(", ")");
   }
   return tok;
 }
@@ -401,18 +399,7 @@ static void record_system_include(const char *path)
   hashmap_put(&system_includes, inc, strlen(inc), (void *)1);
 
   // Add to ordered list
-  if (system_include_count >= system_include_capacity)
-  {
-    int new_cap = system_include_capacity == 0 ? 32 : system_include_capacity * 2;
-    char **new_list = realloc(system_include_list, sizeof(char *) * new_cap);
-    if (!new_list)
-    {
-      free(inc);
-      return;
-    }
-    system_include_list = new_list;
-    system_include_capacity = new_cap;
-  }
+  ENSURE_ARRAY_CAP(system_include_list, system_include_count + 1, system_include_capacity, 32, char *);
   system_include_list[system_include_count++] = inc;
 }
 
@@ -1257,13 +1244,7 @@ static void scan_labels_in_function(Token *tok)
     if (is_identifier_like(tok))
     {
       // Look ahead for colon, skipping any __attribute__((...)) sequences
-      Token *t = tok->next;
-      while (t && is_attribute_keyword(t))
-      {
-        t = t->next;
-        if (t && equal(t, "("))
-          t = skip_balanced(t, "(", ")");
-      }
+      Token *t = skip_gnu_attributes(tok->next);
 
       if (t && equal(t, ":"))
       {
@@ -1547,13 +1528,7 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
         !memcmp(tok->loc, label_name, label_len))
     {
       // Look ahead for colon, skipping any __attribute__((...)) sequences
-      Token *t = tok->next;
-      while (t && is_attribute_keyword(t))
-      {
-        t = t->next;
-        if (t && equal(t, "("))
-          t = skip_balanced(t, "(", ")");
-      }
+      Token *t = skip_gnu_attributes(tok->next);
 
       if (t && equal(t, ":"))
       {
@@ -1608,18 +1583,6 @@ static Token *skip_balanced(Token *tok, char *open, char *close)
   return tok;
 }
 
-// Skip attributes like __attribute__((...)) and __declspec(...)
-static Token *skip_attributes(Token *tok)
-{
-  while (tok && is_attribute_keyword(tok))
-  {
-    tok = tok->next;
-    if (tok && equal(tok, "("))
-      tok = skip_balanced(tok, "(", ")");
-  }
-  return tok;
-}
-
 // Check if token starts a void function declaration
 // Handles: void func(, static void func(, __attribute__((...)) void func(, etc.
 static bool is_void_function_decl(Token *tok)
@@ -1630,7 +1593,7 @@ static bool is_void_function_decl(Token *tok)
                  equal(tok, "typedef") || is_attribute_keyword(tok)))
   {
     if (is_attribute_keyword(tok))
-      tok = skip_attributes(tok);
+      tok = skip_gnu_attributes(tok);
     else
       tok = tok->next;
   }
@@ -1651,7 +1614,7 @@ static bool is_void_function_decl(Token *tok)
                  is_attribute_keyword(tok)))
   {
     if (is_attribute_keyword(tok))
-      tok = skip_attributes(tok);
+      tok = skip_gnu_attributes(tok);
     else
       tok = tok->next;
   }
@@ -1684,7 +1647,7 @@ static Token *scan_typedef_base_type(Token *tok)
   }
 
   // Skip attributes
-  tok = skip_attributes(tok);
+  tok = skip_gnu_attributes(tok);
 
   // Handle struct/union/enum
   if (tok && is_sue_keyword(tok))
@@ -1692,7 +1655,7 @@ static Token *scan_typedef_base_type(Token *tok)
     tok = tok->next;
 
     // Skip attributes after keyword
-    tok = skip_attributes(tok);
+    tok = skip_gnu_attributes(tok);
 
     // Skip optional tag name
     if (tok && tok->kind == TK_IDENT)
@@ -1713,7 +1676,7 @@ static Token *scan_typedef_base_type(Token *tok)
   {
     tok = tok->next;
     // Skip attributes between type keywords
-    tok = skip_attributes(tok);
+    tok = skip_gnu_attributes(tok);
   }
 
   return tok;
@@ -1733,7 +1696,7 @@ static Token *scan_typedef_name(Token **tokp)
     tok = tok->next;
 
   // Skip attributes on pointer
-  tok = skip_attributes(tok);
+  tok = skip_gnu_attributes(tok);
 
   // Case 1: Parenthesized declarator - (*name), (*name[N]), (*name)(args)
   if (tok && equal(tok, "("))
@@ -1745,7 +1708,7 @@ static Token *scan_typedef_name(Token **tokp)
                    equal(tok, "restrict") || equal(tok, "_Atomic")))
       tok = tok->next;
 
-    tok = skip_attributes(tok);
+    tok = skip_gnu_attributes(tok);
 
     if (tok && is_identifier_like(tok))
     {
@@ -2754,7 +2717,7 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
 // Result of validating a declaration structure after type parsing
 typedef struct
 {
-  bool valid;       // True if this is a valid variable declaration
+  bool valid;        // True if this is a valid variable declaration
   bool warn_complex; // True if we should warn about unparsed pattern
 } DeclValidation;
 
@@ -4096,15 +4059,7 @@ static int transpile(char *input_file, char *output_file)
         // Remember the defer_depth BEFORE we push the new scope
         // This will be the scope level of the statement expression
         // Grow stmt_expr_levels if needed
-        if (stmt_expr_count >= stmt_expr_capacity)
-        {
-          int new_cap = stmt_expr_capacity == 0 ? INITIAL_CAP : stmt_expr_capacity * 2;
-          int *new_levels = realloc(stmt_expr_levels, sizeof(int) * new_cap);
-          if (!new_levels)
-            error("out of memory growing statement expression stack");
-          stmt_expr_levels = new_levels;
-          stmt_expr_capacity = new_cap;
-        }
+        ENSURE_ARRAY_CAP(stmt_expr_levels, stmt_expr_count + 1, stmt_expr_capacity, INITIAL_CAP, int);
         stmt_expr_levels[stmt_expr_count++] = defer_depth + 1; // +1 because we're about to push
       }
       emit_tok(tok);
@@ -4506,7 +4461,7 @@ static char **build_argv(const char *first, ...)
   return argv_builder_finish(&ab);
 }
 
-static void die(char *message)
+static noreturn void die(char *message)
 {
   fprintf(stderr, "%s\n", message);
   exit(1);
@@ -4882,6 +4837,74 @@ static void print_help(void)
       PRISM_VERSION, INSTALL_PATH);
 }
 
+// Table-driven CLI parsing
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Flags that set CLI mode
+typedef struct
+{
+  const char *flag;
+  const char *alt; // Alternate flag (e.g., -h for --help), NULL if none
+  CliMode mode;
+  bool passthrough; // If true, also pass to CC
+} ModeFlagDef;
+
+static const ModeFlagDef mode_flags[] = {
+    {"run", NULL, CLI_MODE_RUN, false},
+    {"transpile", NULL, CLI_MODE_EMIT, false},
+    {"install", NULL, CLI_MODE_INSTALL, false},
+    {"--help", "-h", CLI_MODE_HELP, false},
+    {"--version", "-v", CLI_MODE_VERSION, false},
+    {"-c", NULL, CLI_MODE_COMPILE_ONLY, false},
+    {"--prism-emit", NULL, CLI_MODE_EMIT, false},
+    {NULL, NULL, 0, false}};
+
+// Passthrough mode flags (set mode + pass to CC)
+static const ModeFlagDef passthrough_mode_flags[] = {
+    {"-E", NULL, CLI_MODE_PASSTHROUGH, true},
+    {"-S", NULL, CLI_MODE_PASSTHROUGH, true},
+    {NULL, NULL, 0, false}};
+
+// Feature flags that toggle booleans
+typedef struct
+{
+  const char *flag;
+  size_t offset; // offsetof(PrismFeatures, field)
+  bool value;    // Value to set when flag is matched
+} FeatureFlagDef;
+
+#define FEATURE_FLAG(name, field, val) {name, offsetof(PrismFeatures, field), val}
+
+static const FeatureFlagDef feature_flags[] = {
+    FEATURE_FLAG("-fno-defer", defer, false),
+    FEATURE_FLAG("-fno-zeroinit", zeroinit, false),
+    FEATURE_FLAG("-fno-line-directives", line_directives, false),
+    FEATURE_FLAG("-fno-safety", warn_safety, true),
+    FEATURE_FLAG("-fflatten-headers", flatten_headers, true),
+    FEATURE_FLAG("-fno-flatten-headers", flatten_headers, false),
+    {NULL, 0, false}};
+
+// Prefixes that should also be passed to preprocessor
+static const char *pp_prefixes[] = {
+    "-std=", "-m", "--target=", "-f", "-O", "-g", NULL};
+
+static const char *pp_exact_flags[] = {
+    "-pthread", "-pthreads", "-mthreads", "-mt", "--thread-safe",
+    "-pedantic", "-pedantic-errors", "-ansi", "-traditional",
+    "-traditional-cpp", "-nostdinc", "-nostdinc++", "-undef", "-trigraphs",
+    NULL};
+
+static bool should_pass_to_pp(const char *arg)
+{
+  for (const char **p = pp_prefixes; *p; p++)
+    if (strncmp(arg, *p, strlen(*p)) == 0)
+      return true;
+  for (const char **p = pp_exact_flags; *p; p++)
+    if (strcmp(arg, *p) == 0)
+      return true;
+  return false;
+}
+
 static Cli cli_parse(int argc, char **argv)
 {
   Cli cli = {
@@ -4900,72 +4923,49 @@ static Cli cli_parse(int argc, char **argv)
   for (int i = 1; i < argc; i++)
   {
     char *arg = argv[i];
+    bool handled = false;
 
-    // ─── Prism commands ───
-    if (!strcmp(arg, "run"))
+    // ─── Mode flags (table-driven) ───
+    for (const ModeFlagDef *f = mode_flags; f->flag; f++)
     {
-      cli.mode = CLI_MODE_RUN;
-      continue;
+      if (!strcmp(arg, f->flag) || (f->alt && !strcmp(arg, f->alt)))
+      {
+        cli.mode = f->mode;
+        handled = true;
+        break;
+      }
     }
-    if (!strcmp(arg, "transpile"))
-    {
-      cli.mode = CLI_MODE_EMIT;
+    if (handled)
       continue;
-    }
-    if (!strcmp(arg, "install"))
-    {
-      cli.mode = CLI_MODE_INSTALL;
-      continue;
-    }
-    if (!strcmp(arg, "--help") || !strcmp(arg, "-h"))
-    {
-      cli.mode = CLI_MODE_HELP;
-      continue;
-    }
-    if (!strcmp(arg, "--version") || !strcmp(arg, "-v"))
-    {
-      cli.mode = CLI_MODE_VERSION;
-      continue;
-    }
 
-    // ─── Prism feature flags (gcc-style) ───
-    if (!strcmp(arg, "-fno-defer"))
+    // ─── Passthrough mode flags (table-driven) ───
+    for (const ModeFlagDef *f = passthrough_mode_flags; f->flag; f++)
     {
-      cli.features.defer = false;
-      continue;
+      if (!strcmp(arg, f->flag))
+      {
+        cli.mode = f->mode;
+        cli_add_cc_arg(&cli, arg);
+        handled = true;
+        break;
+      }
     }
-    if (!strcmp(arg, "-fno-zeroinit"))
-    {
-      cli.features.zeroinit = false;
+    if (handled)
       continue;
-    }
-    if (!strcmp(arg, "-fno-line-directives"))
-    {
-      cli.features.line_directives = false;
-      continue;
-    }
-    if (!strcmp(arg, "-fno-safety"))
-    {
-      cli.features.warn_safety = true;
-      continue;
-    }
-    if (!strcmp(arg, "-fflatten-headers"))
-    {
-      cli.features.flatten_headers = true;
-      continue;
-    }
-    if (!strcmp(arg, "-fno-flatten-headers"))
-    {
-      cli.features.flatten_headers = false;
-      continue;
-    }
 
-    // ─── Prism-specific options ───
-    if (!strcmp(arg, "--prism-emit"))
+    // ─── Feature flags (table-driven) ───
+    for (const FeatureFlagDef *f = feature_flags; f->flag; f++)
     {
-      cli.mode = CLI_MODE_EMIT;
-      continue;
+      if (!strcmp(arg, f->flag))
+      {
+        *(bool *)((char *)&cli.features + f->offset) = f->value;
+        handled = true;
+        break;
+      }
     }
+    if (handled)
+      continue;
+
+    // ─── Prism-specific options with arguments ───
     if (str_startswith(arg, "--prism-emit="))
     {
       cli.mode = CLI_MODE_EMIT;
@@ -4996,22 +4996,7 @@ static Cli cli_parse(int argc, char **argv)
       continue;
     }
 
-    // ─── GCC-compatible: compile only ───
-    if (!strcmp(arg, "-c"))
-    {
-      cli.mode = CLI_MODE_COMPILE_ONLY;
-      continue;
-    }
-
-    // ─── GCC-compatible: preprocess only or compile to assembly ───
-    // These modes pass sources directly to CC without transpiling
-    if (!strcmp(arg, "-E") || !strcmp(arg, "-S"))
-    {
-      cli.mode = CLI_MODE_PASSTHROUGH;
-      cli_add_cc_arg(&cli, arg);
-      continue;
-    }
-
+    // ─── GCC-compatible: include paths ───
     if (!strcmp(arg, "-I"))
     {
       if (i + 1 < argc)
@@ -5031,7 +5016,7 @@ static Cli cli_parse(int argc, char **argv)
       continue;
     }
 
-    // -D (define)
+    // ─── GCC-compatible: defines ───
     if (!strcmp(arg, "-D"))
     {
       if (i + 1 < argc)
@@ -5051,7 +5036,7 @@ static Cli cli_parse(int argc, char **argv)
       continue;
     }
 
-    // -U (undefine) - pass to preprocessor and CC
+    // ─── GCC-compatible: undefines ───
     if (!strcmp(arg, "-U"))
     {
       cli_add_pp_flag(&cli, arg);
@@ -5071,7 +5056,7 @@ static Cli cli_parse(int argc, char **argv)
       continue;
     }
 
-    // -include (force include) - process in prism AND pass to CC
+    // ─── GCC-compatible: force include ───
     if (!strcmp(arg, "-include"))
     {
       cli_add_cc_arg(&cli, arg);
@@ -5084,7 +5069,7 @@ static Cli cli_parse(int argc, char **argv)
       continue;
     }
 
-    // -isystem (system include path) - treat like -I for prism
+    // ─── GCC-compatible: system include path ───
     if (!strcmp(arg, "-isystem"))
     {
       if (i + 1 < argc)
@@ -5114,7 +5099,6 @@ static Cli cli_parse(int argc, char **argv)
     // ─── Object files and libraries (pass through) ───
     if (arg[0] != '-')
     {
-      // Could be .o file, .a file, .so file, etc. - pass to linker
       size_t len = strlen(arg);
       if ((len >= 2 && !strcmp(arg + len - 2, ".o")) ||
           (len >= 2 && !strcmp(arg + len - 2, ".a")) ||
@@ -5128,39 +5112,13 @@ static Cli cli_parse(int argc, char **argv)
     }
 
     // ─── Everything else: pass through to CC ───
-    // Also track flags that affect preprocessing (but not warnings)
-    // Note: -W* warning flags are NOT passed to preprocessor as they can
-    // trigger false errors on preprocessed output (e.g., trailing whitespace in macros)
-    if (strncmp(arg, "-std=", 5) == 0 ||
-        strncmp(arg, "-m", 2) == 0 || // -m32, -m64, -march=, -mtune=, etc.
-        strncmp(arg, "--target=", 9) == 0 ||
-        strncmp(arg, "-f", 2) == 0 || // -fPIC, -fpic, -fno-*, feature flags
-        strncmp(arg, "-O", 2) == 0 || // optimization (can affect __OPTIMIZE__)
-        strncmp(arg, "-g", 2) == 0 || // debug flags
-        strcmp(arg, "-pthread") == 0 ||
-        strcmp(arg, "-pthreads") == 0 ||
-        strcmp(arg, "-mthreads") == 0 ||
-        strcmp(arg, "-mt") == 0 ||
-        strcmp(arg, "--thread-safe") == 0 ||
-        strcmp(arg, "-pedantic") == 0 ||
-        strcmp(arg, "-pedantic-errors") == 0 ||
-        strcmp(arg, "-ansi") == 0 ||
-        strcmp(arg, "-traditional") == 0 ||
-        strcmp(arg, "-traditional-cpp") == 0 ||
-        strcmp(arg, "-nostdinc") == 0 ||
-        strcmp(arg, "-nostdinc++") == 0 ||
-        strcmp(arg, "-undef") == 0 ||
-        strncmp(arg, "-trigraphs", 10) == 0)
-    {
+    if (should_pass_to_pp(arg))
       cli_add_pp_flag(&cli, arg);
-    }
     cli_add_cc_arg(&cli, arg);
 
     // Handle space-separated args like -L dir, -x lang
     if (flag_needs_arg(arg) && i + 1 < argc && argv[i + 1][0] != '-')
-    {
       cli_add_cc_arg(&cli, argv[++i]);
-    }
   }
 
   return cli;
@@ -5560,7 +5518,8 @@ int main(int argc, char **argv)
   }
 
   // Transpile all sources to temp files (skip assembly files - pass through directly)
-  char **temp_files = calloc(cli.source_count, sizeof(char *));
+  // Note: source_count is guaranteed > 0 here (checked above), cast suppresses warning
+  char **temp_files = calloc((unsigned)cli.source_count, sizeof(char *));
   if (!temp_files)
     die("Out of memory");
 
