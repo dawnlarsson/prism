@@ -9294,7 +9294,7 @@ void test_register_typeof_zeroinit(void)
     // So typeof(int) register x should NOT use memset(&x, ...)
     // It should use = 0 instead
     typeof(int) register x;
-    x = 42;  // Assign after declaration
+    x = 42; // Assign after declaration
     CHECK(x == 42, "register typeof compiles (no memset)");
 }
 
@@ -9302,9 +9302,14 @@ void test_register_typeof_multiple(void)
 {
     // Multiple register typeof variables
     typeof(int) register a, b, c;
-    a = 1; b = 2; c = 3;
+    a = 1;
+    b = 2;
+    c = 3;
     CHECK(a == 1 && b == 2 && c == 3, "multiple register typeof");
 }
+
+// C23 digit separator tests - only run if compiler supports C23
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
 
 void test_c23_digit_separator_decimal(void)
 {
@@ -9362,6 +9367,8 @@ void test_c23_digit_separator_suffix(void)
     CHECK(u == 4294967295U, "C23 digit sep with U suffix");
 }
 
+#endif // C23 digit separator tests
+
 void test_volatile_typeof_zeroinit(void)
 {
     // volatile typeof should use volatile-safe zeroing, not memset
@@ -9373,7 +9380,11 @@ void test_volatile_typeof_zeroinit(void)
 void test_volatile_typeof_struct(void)
 {
     // volatile struct with typeof
-    struct TestStruct { int x; int y; };
+    struct TestStruct
+    {
+        int x;
+        int y;
+    };
     volatile typeof(struct TestStruct) vs;
     CHECK(vs.x == 0 && vs.y == 0, "volatile typeof struct zeroed");
 }
@@ -9384,7 +9395,8 @@ void test_volatile_typeof_array(void)
     volatile typeof(int[4]) arr;
     int all_zero = 1;
     for (int i = 0; i < 4; i++)
-        if (arr[i] != 0) all_zero = 0;
+        if (arr[i] != 0)
+            all_zero = 0;
     CHECK(all_zero, "volatile typeof array zeroed");
 }
 
@@ -9392,15 +9404,19 @@ void run_additional_bug_fix_tests(void)
 {
     printf("\n=== ADDITIONAL BUG FIX TESTS ===\n");
     printf("(register+typeof, C23 digit separators, volatile+typeof)\n\n");
-    
+
     test_register_typeof_zeroinit();
     test_register_typeof_multiple();
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
     test_c23_digit_separator_decimal();
     test_c23_digit_separator_binary();
     test_c23_digit_separator_hex();
     test_c23_digit_separator_octal();
     test_c23_digit_separator_float();
     test_c23_digit_separator_suffix();
+#else
+    printf("(C23 digit separator tests skipped - compiler doesn't support C23)\n");
+#endif
     test_volatile_typeof_zeroinit();
     test_volatile_typeof_struct();
     test_volatile_typeof_array();
