@@ -143,7 +143,6 @@ static int struct_depth = 0;
 // Note: ENSURE_ARRAY_CAP is defined in parse.c
 
 #define MAX_TYPEOF_VARS_PER_DECL 32
-#define MAX_ATTRIBUTE_WALK_DEPTH 100
 
 static Token *skip_balanced(Token *tok, char *open, char *close);
 
@@ -415,19 +414,12 @@ static char **system_include_list; // Ordered list of includes
 static int system_include_count = 0;
 static int system_include_capacity = 0;
 
-// Return the full path for system header inclusion.
-// Trust the preprocessor output - if it included the file, include it.
-static char *path_to_include(const char *fullpath)
-{
-  if (!fullpath)
-    return NULL;
-  return strdup(fullpath);
-}
-
 // Record a system header for later emission
 static void record_system_include(const char *path)
 {
-  char *inc = path_to_include(path);
+  if (!path)
+    return;
+  char *inc = strdup(path);
   if (!inc)
     return;
 
@@ -463,26 +455,26 @@ static void collect_system_includes(void)
 // System headers use constructs that trigger various warnings with strict flags.
 static void emit_system_header_diag_push(void)
 {
-  OUT_LIT("#if defined(__GNUC__) || defined(__clang__)\n");
-  OUT_LIT("#pragma GCC diagnostic push\n");
-  OUT_LIT("#pragma GCC diagnostic ignored \"-Wredundant-decls\"\n");
-  OUT_LIT("#pragma GCC diagnostic ignored \"-Wstrict-prototypes\"\n");
-  OUT_LIT("#pragma GCC diagnostic ignored \"-Wold-style-definition\"\n");
-  OUT_LIT("#pragma GCC diagnostic ignored \"-Wpedantic\"\n");
-  OUT_LIT("#pragma GCC diagnostic ignored \"-Wunused-function\"\n");
-  OUT_LIT("#pragma GCC diagnostic ignored \"-Wunused-parameter\"\n");
-  OUT_LIT("#pragma GCC diagnostic ignored \"-Wunused-variable\"\n");
-  OUT_LIT("#pragma GCC diagnostic ignored \"-Wcast-qual\"\n");
-  OUT_LIT("#pragma GCC diagnostic ignored \"-Wsign-conversion\"\n");
-  OUT_LIT("#pragma GCC diagnostic ignored \"-Wconversion\"\n");
-  OUT_LIT("#endif\n");
+  OUT_LIT("#if defined(__GNUC__) || defined(__clang__)\n"
+          "#pragma GCC diagnostic push\n"
+          "#pragma GCC diagnostic ignored \"-Wredundant-decls\"\n"
+          "#pragma GCC diagnostic ignored \"-Wstrict-prototypes\"\n"
+          "#pragma GCC diagnostic ignored \"-Wold-style-definition\"\n"
+          "#pragma GCC diagnostic ignored \"-Wpedantic\"\n"
+          "#pragma GCC diagnostic ignored \"-Wunused-function\"\n"
+          "#pragma GCC diagnostic ignored \"-Wunused-parameter\"\n"
+          "#pragma GCC diagnostic ignored \"-Wunused-variable\"\n"
+          "#pragma GCC diagnostic ignored \"-Wcast-qual\"\n"
+          "#pragma GCC diagnostic ignored \"-Wsign-conversion\"\n"
+          "#pragma GCC diagnostic ignored \"-Wconversion\"\n"
+          "#endif\n");
 }
 
 static void emit_system_header_diag_pop(void)
 {
-  OUT_LIT("#if defined(__GNUC__) || defined(__clang__)\n");
-  OUT_LIT("#pragma GCC diagnostic pop\n");
-  OUT_LIT("#endif\n");
+  OUT_LIT("#if defined(__GNUC__) || defined(__clang__)\n"
+          "#pragma GCC diagnostic pop\n"
+          "#endif\n");
 }
 
 // Emit collected #include directives with necessary feature test macros
@@ -732,98 +724,34 @@ static bool is_assignment_op(Token *tok)
          equal(tok, "--") || equal(tok, "[");
 }
 
-// Check if 'tok' is inside a __attribute__((...)) or __declspec(...) context
-// by looking backward through last_emitted tokens.
-// This is used to prevent 'defer' from being recognized as a keyword
-// when it appears as a function name inside cleanup() or similar attributes.
+// Check if 'tok' is inside a __attribute__((...)) or __declspec(...) context.
+// This prevents 'defer' from being recognized as a keyword when it appears
+// as a function name inside cleanup() or similar attributes.
+// Uses forward-looking heuristic: if we see unbalanced ')' before ';' or '{',
+// we're likely inside a parenthesized context (attribute argument list).
 static bool is_inside_attribute(Token *tok)
 {
-  // We need to scan backward from the current token position to see if we're
-  // inside an __attribute__((...)) context. We track paren depth.
-  // Since we don't have a direct backward pointer, we'll check if the
-  // last_emitted sequence contains __attribute__ followed by unmatched ((.
-  //
-  // A simpler approach: check if last_emitted is '(' and walk back to find __attribute__
-  // with unbalanced parens.
-
   if (!last_emitted)
     return false;
 
-  // Quick check: if last_emitted isn't '(' or ',', we're probably not inside attribute args
-  // (defer would follow '(' in cleanup(defer) or ',' in a list)
+  // Quick check: defer in cleanup(defer) would follow '(' or ','
   if (!equal(last_emitted, "(") && !equal(last_emitted, ","))
     return false;
 
-  // Walk backward through tokens to find __attribute__ with unmatched parens
-  Token *t = last_emitted;
-  int paren_depth = 0;
-  int max_walk = 100; // Limit how far we walk back
-
-  while (t && max_walk-- > 0)
-  {
-    if (equal(t, ")"))
-      paren_depth++;
-    else if (equal(t, "("))
-    {
-      if (paren_depth > 0)
-        paren_depth--;
-      else
-      {
-        // Unmatched '(' - check if preceded by __attribute__ or __attribute
-        // Need to find the token before this '('
-        // Unfortunately we don't have a prev pointer, so we check if last_emitted
-        // is the '(' and the prior context suggests __attribute__
-        //
-        // Since we can't easily walk backward, let's use a different approach:
-        // Check if we're currently at depth > 0 relative to __attribute__
-        // by checking if the next tokens form an identifier (function name pattern)
-        break;
-      }
-    }
-    else if (is_attribute_keyword(t))
-    {
-      // Found attribute keyword with unbalanced parens - we're inside it
-      return true;
-    }
-
-    // Move to previous token (we don't have prev pointer, so this approach won't work)
-    // Need a different strategy
-    break;
-  }
-
-  // Alternative: Check the token stream forward from current position
-  // If we see ')' before ';' or '{', we might be inside parens
-  // And check backward pattern: if last_emitted is '(' and tok is an identifier
-  // that could be a function name like 'defer', check the context
-
-  // Simplified heuristic: If last_emitted is '(' and the token before it was
-  // an identifier like 'cleanup', we're likely inside __attribute__((cleanup(defer)))
-  // This requires tracking more state, so let's use a forward-looking check instead.
-
   // Forward check: from tok, count parens until we hit ';' or EOF
-  // If we see unbalanced ')' first, we might be inside an attribute
-  t = tok;
-  paren_depth = 0;
-  max_walk = 50;
-  while (t && t->kind != TK_EOF && max_walk-- > 0)
+  // If we see unbalanced ')' first, we're inside some paren context
+  int paren_depth = 0;
+  for (Token *t = tok; t && t->kind != TK_EOF; t = t->next)
   {
     if (equal(t, "("))
       paren_depth++;
     else if (equal(t, ")"))
     {
-      paren_depth--;
-      if (paren_depth < 0)
-      {
-        // We hit an unmatched ')' - we're inside some paren context
-        // Check if we're at statement start (defer must be at stmt start)
-        // If struct_depth is 0 and defer_depth > 0, but last_emitted is '(',
-        // this is likely inside an attribute
-        return true;
-      }
+      if (--paren_depth < 0)
+        return true; // Unmatched ')' - inside attribute parens
     }
     else if (equal(t, ";") || equal(t, "{"))
       break;
-    t = t->next;
   }
 
   return false;
@@ -840,15 +768,15 @@ static void emit_tok(Token *tok)
 
   // Check if we need a #line directive BEFORE emitting the token
   bool need_line_directive = false;
-  char *current_file = NULL;
+  char *tok_fname = NULL;
   int line_no = tok_line_no(tok);
 
   // Skip line directive handling for synthetic tokens (line_no == -1)
   if (emit_line_directives && f && line_no > 0)
   {
-    current_file = f->display_name ? f->display_name : f->name;
-    bool file_changed = (last_filename != current_file &&
-                         (!last_filename || !current_file || strcmp(last_filename, current_file) != 0));
+    tok_fname = f->display_name ? f->display_name : f->name;
+    bool file_changed = (last_filename != tok_fname &&
+                         (!last_filename || !tok_fname || strcmp(last_filename, tok_fname) != 0));
     bool system_changed = (f->is_system != last_system_header);
     bool line_jumped = (line_no != last_line_no && line_no != last_line_no + 1);
     need_line_directive = file_changed || line_jumped || system_changed;
@@ -861,9 +789,9 @@ static void emit_tok(Token *tok)
     // Emit #line directive on new line if needed
     if (need_line_directive)
     {
-      out_line(line_no, current_file ? current_file : "unknown");
+      out_line(line_no, tok_fname ? tok_fname : "unknown");
       last_line_no = line_no;
-      last_filename = current_file;
+      last_filename = tok_fname;
       last_system_header = f->is_system;
     }
     else if (emit_line_directives && f && line_no > 0 && line_no > last_line_no)
@@ -877,9 +805,9 @@ static void emit_tok(Token *tok)
     if (need_line_directive)
     {
       out_char('\n');
-      out_line(line_no, current_file ? current_file : "unknown");
+      out_line(line_no, tok_fname ? tok_fname : "unknown");
       last_line_no = line_no;
-      last_filename = current_file;
+      last_filename = tok_fname;
       last_system_header = f->is_system;
     }
     else if (needs_space(last_emitted, tok))
@@ -1411,8 +1339,8 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
   Token *active_item = NULL;  // Most recently seen item that's still "in scope"
   int active_item_depth = -1; // Depth at which active_item was found
   Token *prev = NULL;
-  bool at_stmt_start = true; // Only needed for DECL mode
-  bool in_for_init = false;  // Track if we're in for loop initialization clause
+  bool is_stmt_start = true; // Only needed for DECL mode
+  bool is_in_for_init = false;  // Track if we're in for loop initialization clause
 
   while (tok && tok->kind != TK_EOF)
   {
@@ -1424,13 +1352,13 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
       if (tok && equal(tok, "("))
       {
         // We're entering the for loop initialization
-        in_for_init = true;
+        is_in_for_init = true;
         prev = tok;
         tok = tok->next;
-        at_stmt_start = true; // Treat start of for init as statement start
+        is_stmt_start = true; // Treat start of for init as statement start
         continue;
       }
-      at_stmt_start = false;
+      is_stmt_start = false;
       continue;
     }
 
@@ -1449,7 +1377,7 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
         depth++;
         prev = tok;
         tok = tok->next;
-        at_stmt_start = false;
+        is_stmt_start = false;
         continue;
       }
     }
@@ -1459,7 +1387,7 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
       depth++;
       prev = tok;
       tok = tok->next;
-      at_stmt_start = true;
+      is_stmt_start = true;
       continue;
     }
     if (equal(tok, "}"))
@@ -1477,15 +1405,15 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
       depth--;
       prev = tok;
       tok = tok->next;
-      at_stmt_start = true;
+      is_stmt_start = true;
       continue;
     }
     if (equal(tok, ";"))
     {
-      at_stmt_start = true;
+      is_stmt_start = true;
       // If we're in for loop init, semicolon ends the init clause
-      if (in_for_init)
-        in_for_init = false;
+      if (is_in_for_init)
+        is_in_for_init = false;
       prev = tok;
       tok = tok->next;
       continue;
@@ -1501,7 +1429,7 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
         tok = skip_balanced(tok, "(", ")");
         prev = NULL;
       }
-      at_stmt_start = false;
+      is_stmt_start = false;
       continue;
     }
 
@@ -1528,7 +1456,7 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
         }
       }
     }
-    else if (mode == GOTO_CHECK_DECL && (at_stmt_start || in_for_init) && local_struct_depth == 0)
+    else if (mode == GOTO_CHECK_DECL && (is_stmt_start || is_in_for_init) && local_struct_depth == 0)
     {
       // Detect variable declarations at statement start OR in for loop initialization
       Token *decl_start = tok;
@@ -1629,7 +1557,7 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
       }
     }
 
-    at_stmt_start = false;
+    is_stmt_start = false;
     prev = tok;
     tok = tok->next;
   }
@@ -3365,7 +3293,6 @@ static int transpile(char *input_file, char *output_file)
   }
 
   FILE *out_fp = fopen(output_file, "w");
-  ;
   if (!out_fp)
   {
     tokenizer_reset(); // Clean up tokenizer state on error
@@ -4543,7 +4470,7 @@ PRISM_API void prism_free(PrismResult *r)
 }
 
 // Reset all transpiler state for clean reuse (prevents memory leaks on repeated use)
-__attribute__((unused)) PRISM_API void prism_reset(void)
+PRISM_API void prism_reset(void)
 {
   // Full tokenizer cleanup (parse.c) - frees arena blocks
   tokenizer_cleanup();
