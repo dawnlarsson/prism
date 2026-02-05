@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.99.9"
+#define PRISM_VERSION "0.100.0"
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -99,12 +99,32 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
 PRISM_API void prism_free(PrismResult *r);
 PRISM_API void prism_reset(void);
 
-// Temp directory for preprocessor and output files (used in both CLI and library mode)
+// Get temp directory - respects $TMPDIR environment variable (POSIX standard)
+// Returns path with trailing slash (or empty string on Windows)
+static const char *get_tmp_dir(void)
+{
 #ifdef _WIN32
-#define TMP_DIR ""
+  return "";
 #else
-#define TMP_DIR "/tmp/"
+  static char tmp_buf[PATH_MAX];
+  const char *tmpdir = getenv("TMPDIR");
+  if (tmpdir && tmpdir[0])
+  {
+    size_t len = strlen(tmpdir);
+    if (len > 0 && len < PATH_MAX - 1)
+    {
+      strcpy(tmp_buf, tmpdir);
+      if (tmp_buf[len - 1] != '/')
+      {
+        tmp_buf[len] = '/';
+        tmp_buf[len + 1] = '\0';
+      }
+      return tmp_buf;
+    }
+  }
+  return "/tmp/";
 #endif
+}
 
 // CLI CONFIGURATION (excluded with -DPRISM_LIB_MODE)
 
@@ -3111,6 +3131,63 @@ static Token *try_zero_init_decl(Token *tok)
   return process_declarators(type.end, &type, warn_loc, is_raw);
 }
 
+// Emit an expression until semicolon, tracking depth for statement expressions.
+// Handles zero-init for declarations inside statement expressions.
+// Returns the token after the expression (the semicolon, or EOF).
+static Token *emit_expr_to_semicolon(Token *tok)
+{
+  int depth = 0;
+  bool expr_at_stmt_start = false;
+  Token *prev_tok = NULL;
+  while (tok->kind != TK_EOF)
+  {
+    if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
+    {
+      depth++;
+      if (equal(tok, "{"))
+        expr_at_stmt_start = true;
+    }
+    else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
+      depth--;
+    else if (depth == 0 && equal(tok, ";"))
+      break;
+
+    if (expr_at_stmt_start && feature_zeroinit)
+    {
+      Token *next = try_zero_init_decl(tok);
+      if (next)
+      {
+        tok = next;
+        expr_at_stmt_start = true;
+        continue;
+      }
+      expr_at_stmt_start = false;
+    }
+
+    emit_tok(tok);
+    prev_tok = tok;
+    tok = tok->next;
+
+    if (prev_tok && (equal(prev_tok, "{") || equal(prev_tok, ";") || equal(prev_tok, "}")))
+      expr_at_stmt_start = true;
+    else
+      expr_at_stmt_start = false;
+  }
+  return tok;
+}
+
+// Report goto skipping over a variable declaration (warn or error based on feature_warn_safety)
+static void report_goto_skips_decl(Token *skipped_decl, Token *label_tok)
+{
+  const char *msg = "goto '%.*s' would skip over this variable declaration, "
+                    "bypassing zero-initialization (undefined behavior in C). "
+                    "Move the declaration before the goto, or restructure the code.";
+  if (feature_warn_safety)
+    warn_tok(skipped_decl, msg, label_tok->len, label_tok->loc);
+  else
+    error_tok(skipped_decl, msg, label_tok->len, label_tok->loc);
+}
+
 // Dynamic argv array
 typedef struct
 {
@@ -3178,13 +3255,13 @@ static void free_argv(char **argv)
 //
 // NOTE: In library mode (PRISM_LIB_MODE), errors from the C compiler
 // (e.g., #error directives, missing includes) go directly to stderr.
-// A host IDE/GUI cannot capture these messages for display in a UI pane.
-// TODO: Capture child stderr via pipe for library mode error reporting.
+// NOTE: In library mode, a host IDE/GUI cannot capture these messages for
+// display in a UI pane. A future version could capture child stderr via pipe.
 static char *preprocess_with_cc(const char *input_file)
 {
   // Create temp file for preprocessed output
   char tmppath[PATH_MAX];
-  snprintf(tmppath, sizeof(tmppath), "%sprism_pp_XXXXXX", TMP_DIR);
+  snprintf(tmppath, sizeof(tmppath), "%sprism_pp_XXXXXX", get_tmp_dir());
   int fd = mkstemp(tmppath);
   if (fd < 0)
   {
@@ -3422,9 +3499,6 @@ static int transpile(char *input_file, char *output_file)
                        "       Bad:  if (x) defer cleanup();\n"
                        "       Good: if (x) { defer cleanup(); }");
 
-      // Track if we're in braceless control flow - we'll need to emit a placeholder
-      bool in_braceless_control = control_state.pending;
-
       // Check for defer at the top-level of a statement expression - semantics are problematic
       // In ({ defer X; expr; }), the defer would execute after expr, making the result void
       // But defer in nested blocks inside stmt expr is OK: ({ { defer X; } expr; })
@@ -3549,11 +3623,6 @@ static int transpile(char *input_file, char *output_file)
         tok = stmt_end;
       end_statement_after_semicolon();
 
-      // If this defer was in a braceless control flow body, emit a semicolon placeholder
-      // to prevent syntax errors like: if (x) defer foo(); -> if (x) /* nothing */
-      if (in_braceless_control)
-        OUT_LIT(";");
-
       continue;
     }
 
@@ -3588,47 +3657,7 @@ static int transpile(char *input_file, char *output_file)
             // void function: { (expr); defers; return; }
             // The expression is executed for side effects, then we return void
             OUT_LIT(" { (");
-            int depth = 0;
-            bool expr_at_stmt_start = false;
-            Token *prev_tok = NULL;
-            while (tok->kind != TK_EOF)
-            {
-              if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
-              {
-                depth++;
-                // After opening brace in statement expression, we're at statement start
-                if (equal(tok, "{"))
-                  expr_at_stmt_start = true;
-              }
-              else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
-                depth--;
-              else if (depth == 0 && equal(tok, ";"))
-                break;
-
-              // Try zero-init for declarations at statement start within the expression
-              if (expr_at_stmt_start && feature_zeroinit)
-              {
-                Token *next = try_zero_init_decl(tok);
-                if (next)
-                {
-                  tok = next;
-                  expr_at_stmt_start = true;
-                  continue;
-                }
-
-                expr_at_stmt_start = false;
-              }
-
-              emit_tok(tok);
-              prev_tok = tok;
-              tok = tok->next;
-
-              // Track statement boundaries: after '{', ';' or '}' we're at statement start
-              if (prev_tok && (equal(prev_tok, "{") || equal(prev_tok, ";") || equal(prev_tok, "}")))
-                expr_at_stmt_start = true;
-              else
-                expr_at_stmt_start = false;
-            }
+            tok = emit_expr_to_semicolon(tok);
             OUT_LIT(");");
             emit_all_defers();
             OUT_LIT(" return;");
@@ -3649,48 +3678,7 @@ static int transpile(char *input_file, char *output_file)
             out_uint(my_ret);
             OUT_LIT(" = (");
 
-            // Emit expression until semicolon (tracking depth for statement-exprs)
-            int depth = 0;
-            bool expr_at_stmt_start = false;
-            Token *prev_tok = NULL;
-            while (tok->kind != TK_EOF)
-            {
-              if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
-              {
-                depth++;
-                // After opening brace in statement expression, we're at statement start
-                if (equal(tok, "{"))
-                  expr_at_stmt_start = true;
-              }
-              else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
-                depth--;
-              else if (depth == 0 && equal(tok, ";"))
-                break;
-
-              // Try zero-init for declarations at statement start within the expression
-              if (expr_at_stmt_start && feature_zeroinit)
-              {
-                Token *next = try_zero_init_decl(tok);
-                if (next)
-                {
-                  tok = next;
-                  expr_at_stmt_start = true;
-                  continue;
-                }
-
-                expr_at_stmt_start = false;
-              }
-
-              emit_tok(tok);
-              prev_tok = tok;
-              tok = tok->next;
-
-              // Track statement boundaries: after '{', ';' or '}' we're at statement start
-              if (prev_tok && (equal(prev_tok, "{") || equal(prev_tok, ";") || equal(prev_tok, "}")))
-                expr_at_stmt_start = true;
-              else
-                expr_at_stmt_start = false;
-            }
+            tok = emit_expr_to_semicolon(tok);
 
             OUT_LIT(");");
             emit_all_defers();
@@ -3783,18 +3771,7 @@ static int transpile(char *input_file, char *output_file)
         // Check if this goto would skip over a variable declaration (zero-init safety)
         Token *skipped_decl = goto_skips_check(goto_tok, tok->loc, tok->len, GOTO_CHECK_DECL);
         if (skipped_decl)
-        {
-          if (feature_warn_safety)
-            warn_tok(skipped_decl, "goto '%.*s' would skip over this variable declaration, "
-                                   "bypassing zero-initialization (undefined behavior in C). "
-                                   "Move the declaration before the goto, or restructure the code.",
-                     tok->len, tok->loc);
-          else
-            error_tok(skipped_decl, "goto '%.*s' would skip over this variable declaration, "
-                                    "bypassing zero-initialization (undefined behavior in C). "
-                                    "Move the declaration before the goto, or restructure the code.",
-                      tok->len, tok->loc);
-        }
+          report_goto_skips_decl(skipped_decl, tok);
 
         int target_depth = label_table_lookup(tok->loc, tok->len);
         // If label not found, assume same depth (forward reference within scope)
@@ -3833,18 +3810,7 @@ static int transpile(char *input_file, char *output_file)
       {
         Token *skipped_decl = goto_skips_check(goto_tok, tok->loc, tok->len, GOTO_CHECK_DECL);
         if (skipped_decl)
-        {
-          if (feature_warn_safety)
-            warn_tok(skipped_decl, "goto '%.*s' would skip over this variable declaration, "
-                                   "bypassing zero-initialization (undefined behavior in C). "
-                                   "Move the declaration before the goto, or restructure the code.",
-                     tok->len, tok->loc);
-          else
-            error_tok(skipped_decl, "goto '%.*s' would skip over this variable declaration, "
-                                    "bypassing zero-initialization (undefined behavior in C). "
-                                    "Move the declaration before the goto, or restructure the code.",
-                      tok->len, tok->loc);
-        }
+          report_goto_skips_decl(skipped_decl, tok);
       }
       emit_tok(goto_tok);
       continue;
@@ -4274,14 +4240,6 @@ static int transpile(char *input_file, char *output_file)
 
 // LIBRARY API IMPLEMENTATION
 
-#ifndef TMP_DIR
-#ifdef _WIN32
-#define TMP_DIR ""
-#else
-#define TMP_DIR "/tmp/"
-#endif
-#endif
-
 PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures features)
 {
   PrismResult result = {0};
@@ -4339,7 +4297,7 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
 
   // Create temp file for output
   char temp_path[PATH_MAX];
-  snprintf(temp_path, sizeof(temp_path), "%sprism_out.XXXXXX.c", TMP_DIR);
+  snprintf(temp_path, sizeof(temp_path), "%sprism_out.XXXXXX.c", get_tmp_dir());
 
 #if defined(_WIN32)
   if (_mktemp_s(temp_path, sizeof(temp_path)) != 0)
@@ -4511,7 +4469,16 @@ PRISM_API void prism_reset(void)
   stmt_expr_count = 0;
   stmt_expr_capacity = 0;
 
-  // Reset output state
+  // Reset output state - close file if open (prevents FD leak on error recovery)
+  if (out_buf.fp)
+  {
+    fclose(out_buf.fp);
+    out_buf.fp = NULL;
+  }
+  free(out_buf.buf);
+  out_buf.buf = NULL;
+  out_buf.pos = 0;
+  out_buf.cap = 0;
   last_emitted = NULL;
   last_line_no = 0;
   last_filename = NULL;
@@ -4873,7 +4840,7 @@ static void print_help(void)
       "Prism v%s - Robust C transpiler\n\n"
       "Usage: prism [options] source.c... [-o output]\n\n"
       "GCC-Compatible Options:\n"
-      "  -c                    Compile only, dont link\n"
+      "  -c                    Compile only, don't link\n"
       "  -o <file>             Output file\n"
       "  -O0/-O1/-O2/-O3/-Os   Optimization level (passed to CC)\n"
       "  -g                    Debug info (passed to CC)\n"
@@ -5405,7 +5372,7 @@ int main(int argc, char **argv)
     {
       // Compile sources to a temp binary, then install that
       char temp_bin[PATH_MAX];
-      snprintf(temp_bin, sizeof(temp_bin), "%sprism_install_%d", TMP_DIR, getpid());
+      snprintf(temp_bin, sizeof(temp_bin), "%sprism_install_%d", get_tmp_dir(), getpid());
 
       // Build compile command
       const char *cc = get_real_cc(cli.cc ? cli.cc : getenv("PRISM_CC"));
@@ -5428,7 +5395,7 @@ int main(int argc, char **argv)
         temp_files[i] = malloc(PATH_MAX);
         if (!temp_files[i])
           die("Memory allocation failed");
-        snprintf(temp_files[i], PATH_MAX, "%sprism_install_%d_%d.c", TMP_DIR, getpid(), i);
+        snprintf(temp_files[i], PATH_MAX, "%sprism_install_%d_%d.c", get_tmp_dir(), getpid(), i);
 
         PrismResult result = prism_transpile_file(cli.sources[i], cli.features);
         if (result.status != PRISM_OK)
@@ -5527,7 +5494,9 @@ int main(int argc, char **argv)
       }
       else
       {
-        // Transpile to stdout
+        // Transpile to stdout - use /dev/stdout to avoid temp file I/O
+#ifdef _WIN32
+        // Windows: fall back to temp file
         char temp[PATH_MAX];
         if (!create_temp_file(source, temp, sizeof(temp)))
           die("Failed to create temp file");
@@ -5547,6 +5516,11 @@ int main(int argc, char **argv)
           fclose(f);
         }
         remove(temp);
+#else
+        // Unix: write directly to /dev/stdout
+        if (!transpile((char *)source, "/dev/stdout"))
+          die("Transpilation failed");
+#endif
       }
     }
     cli_free(&cli);
@@ -5744,7 +5718,7 @@ int main(int argc, char **argv)
   char temp_exe[PATH_MAX] = {0};
   if (cli.mode == CLI_MODE_RUN)
   {
-    snprintf(temp_exe, sizeof(temp_exe), "%sprism_run.XXXXXX", TMP_DIR);
+    snprintf(temp_exe, sizeof(temp_exe), "%sprism_run.XXXXXX", get_tmp_dir());
 #if defined(_WIN32)
     _mktemp_s(temp_exe, sizeof(temp_exe));
     strcat(temp_exe, ".exe");
@@ -5808,7 +5782,11 @@ int main(int argc, char **argv)
     if (dot)
       strcpy(dot, ".o");
     else
-      strcat(default_obj, ".o");
+    {
+      size_t len = strlen(default_obj);
+      if (len + 2 < sizeof(default_obj))
+        memcpy(default_obj + len, ".o", 3);
+    }
     argv_builder_add(&ab, "-o");
     argv_builder_add(&ab, default_obj);
   }

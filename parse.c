@@ -540,7 +540,7 @@ static noreturn void error(char *fmt, ...)
     exit(1);
 }
 
-static void verror_at(char *filename, char *input, int line_no, char *loc, char *fmt, va_list ap)
+static void verror_at(char *filename, char *input, int line_no, char *loc, const char *fmt, va_list ap)
 {
     if (!input || !loc || line_no <= 0)
     {
@@ -591,7 +591,7 @@ noreturn void error_at(char *loc, char *fmt, ...)
     exit(1);
 }
 
-noreturn void error_tok(Token *tok, char *fmt, ...)
+noreturn void error_tok(Token *tok, const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
@@ -611,7 +611,7 @@ noreturn void error_tok(Token *tok, char *fmt, ...)
     exit(1);
 }
 
-static void warn_tok(Token *tok, char *fmt, ...)
+static void warn_tok(Token *tok, const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);

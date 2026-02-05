@@ -1,19 +1,19 @@
 ![prism_banner](https://github.com/user-attachments/assets/97c303d0-0d85-4262-8fb3-663a33ce00cd)
 
-## Robust C by default (Release Candidate)
+## Robust C by default
 **A dialect of C with `defer` and automatic zero-initialization.**
 
 Prism is a single-file transpiler that makes C safer without changing how you write it.
 Drop it into any build system with CC=prism — all GCC flags pass through automatically.
 
 - **995 tests** — edge cases, control flow, nightmares, trying hard break Prism
-- **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make
+- **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Proper transpiler** — tracks typedefs, respects scope, catches unsafe patterns
 - **Opt-out features** Disable parts of the transpiler, like zero-init, with CLI flags
 - **Drop-in overlay** Use `CC=prism` in any build system — GCC-compatible flags pass through automatically
 - **Single Repo** — 7.6k lines, zero dependencies, easy to audit
 
-Prism is a propper transpiler, not a preprocessor macro.
+Prism is a proper transpiler, not a preprocessor macro.
 * **Track Types:** It parses `typedef`s to distinguish pointer declarations from multiplication (the "lexer hack"), ensuring correct zero-initialization.
 * **Respect Scope:** It understands braces `{}`, statement expressions `({ ... })`, and switch-case fallthrough, ensuring `defer` fires exactly when it should.
 * **Detect Errors:** It catches unsafe patterns (like jumping into a scope with `goto`) before they become runtime bugs.
@@ -23,7 +23,7 @@ build & install
 ```c
 cc prism.c -flto -s -O3 -o /tmp/prism && /tmp/prism install && rm /tmp/prism
 ```
-As of Prism 1.0 (v0.100.0) - **Windows support is currently not there**, some code might exist but no nowhere near stable.
+As of Prism 1.0 (v0.100.0) - **Windows support is currently not there**, some code exists but is nowhere near stable.
 
 ## Defer
 
@@ -209,7 +209,7 @@ Not:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v0.99.9 - Robust C transpiler
+Prism v0.100.0 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 
@@ -253,6 +253,8 @@ Examples:
   prism -O2 -Wall foo.c -o foo     With optimization and warnings
   CC=clang prism foo.c             Use clang as backend
 
+Note: Windows is not supported at this time.
+
 Apache 2.0 license (c) Dawn Larsson 2026
 https://github.com/dawnlarsson/prism
 ```
@@ -288,10 +290,6 @@ void          prism_free(PrismResult *r);
 ```
 
 **Note:** Library mode is currently limited and **not thread-safe**. The transpiler uses global state internally. Call from a single thread only, or protect with a mutex.
-
-# parse.c
-C tokenizer based from chibicc (MIT),
-single file, few fixes/changes ect.
 
 # Repo
 Apache 2.0 license (c) Dawn Larsson 2026
