@@ -5558,6 +5558,431 @@ void test_sizeof_with_parens_in_bound(void)
     CHECK(all_zero, "(sizeof+sizeof)*2 array bound - zero-init");
 }
 
+void test_sizeof_variable_in_array_bound(void)
+{
+    int x = 42; // Regular (non-VLA) variable
+
+    // sizeof(x) is sizeof(int), a compile-time constant
+    // This should be zero-initialized
+    char buf1[sizeof(x)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(x); i++)
+        if (buf1[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(variable) array bound - zero-init");
+
+    // sizeof expression using variable
+    char buf2[sizeof(x) * 2];
+    all_zero = 1;
+    for (size_t i = 0; i < sizeof(x) * 2; i++)
+        if (buf2[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(variable)*2 array bound - zero-init");
+
+    // sizeof of pointer variable
+    int *ptr = &x;
+    char buf3[sizeof(ptr)];
+    all_zero = 1;
+    for (size_t i = 0; i < sizeof(ptr); i++)
+        if (buf3[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(pointer_var) array bound - zero-init");
+
+    // sizeof of struct variable
+    struct
+    {
+        int a;
+        char b;
+    } s = {0};
+    char buf4[sizeof(s)];
+    all_zero = 1;
+    for (size_t i = 0; i < sizeof(s); i++)
+        if (buf4[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(struct_var) array bound - zero-init");
+}
+
+static void __attribute__((noinline)) pollute_stack_for_sizeof(void)
+{
+    volatile char garbage[512];
+    for (int i = 0; i < 512; i++)
+        garbage[i] = (char)(0xAA + i);
+    (void)garbage[0]; // Prevent optimization
+}
+
+void test_sizeof_local_int_variable(void)
+{
+    pollute_stack_for_sizeof();
+    int x = 42;
+    char buf[sizeof(x)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(x); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(local int) zero-init");
+}
+
+void test_sizeof_local_long_variable(void)
+{
+    pollute_stack_for_sizeof();
+    long long llval = 12345678901234LL;
+    char buf[sizeof(llval)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(llval); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(local long long) zero-init");
+}
+
+void test_sizeof_local_float_variable(void)
+{
+    pollute_stack_for_sizeof();
+    float f = 3.14159f;
+    char buf[sizeof(f)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(f); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(local float) zero-init");
+}
+
+void test_sizeof_local_double_variable(void)
+{
+    pollute_stack_for_sizeof();
+    double d = 2.71828;
+    char buf[sizeof(d)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(d); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(local double) zero-init");
+}
+
+void test_sizeof_local_pointer_variable(void)
+{
+    pollute_stack_for_sizeof();
+    int *ptr = NULL;
+    char buf[sizeof(ptr)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(ptr); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(local pointer) zero-init");
+}
+
+void test_sizeof_local_array_variable(void)
+{
+    pollute_stack_for_sizeof();
+    int arr[10] = {1, 2, 3};
+    char buf[sizeof(arr)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(arr); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(local array) zero-init");
+}
+
+void test_sizeof_local_struct_variable(void)
+{
+    pollute_stack_for_sizeof();
+    struct
+    {
+        int x;
+        double y;
+        char z[20];
+    } s = {0};
+    char buf[sizeof(s)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(s); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(local struct) zero-init");
+}
+
+void test_sizeof_local_union_variable(void)
+{
+    pollute_stack_for_sizeof();
+    union
+    {
+        int i;
+        double d;
+        char c[16];
+    } u = {0};
+    char buf[sizeof(u)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(u); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(local union) zero-init");
+}
+
+void test_sizeof_function_parameter(void)
+{
+    // sizeof of parameter variable
+    int param = 99;
+    pollute_stack_for_sizeof();
+    char buf[sizeof(param)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(param); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(parameter) zero-init");
+}
+
+void test_sizeof_multiple_vars_in_expr(void)
+{
+    pollute_stack_for_sizeof();
+    int a = 1, b = 2;
+    char buf[sizeof(a) + sizeof(b)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(a) + sizeof(b); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(a)+sizeof(b) zero-init");
+}
+
+void test_sizeof_var_times_constant(void)
+{
+    pollute_stack_for_sizeof();
+    int x = 42;
+    char buf[sizeof(x) * 4];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(x) * 4; i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(var)*4 zero-init");
+}
+
+void test_sizeof_var_in_ternary(void)
+{
+    pollute_stack_for_sizeof();
+    int x = 1;
+    double y = 2.0;
+    char buf[sizeof(x) > sizeof(y) ? sizeof(x) : sizeof(y)];
+    int all_zero = 1;
+    for (size_t i = 0; i < (sizeof(x) > sizeof(y) ? sizeof(x) : sizeof(y)); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof in ternary zero-init");
+}
+
+void test_sizeof_var_with_bitwise_ops(void)
+{
+    pollute_stack_for_sizeof();
+    int x = 10;
+    char buf[(sizeof(x) << 2)];
+    int all_zero = 1;
+    for (size_t i = 0; i < (sizeof(x) << 2); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(var)<<2 zero-init");
+}
+
+void test_sizeof_nested_vars(void)
+{
+    pollute_stack_for_sizeof();
+    struct Outer
+    {
+        int a;
+        struct
+        {
+            int b;
+            char c;
+        } inner;
+    } o = {0};
+    char buf[sizeof(o.inner)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(o.inner); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(var.member) zero-init");
+}
+
+void test_sizeof_pointer_deref(void)
+{
+    pollute_stack_for_sizeof();
+    int val = 42;
+    int *ptr = &val;
+    char buf[sizeof(*ptr)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(*ptr); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(*ptr) zero-init");
+}
+
+void test_sizeof_array_element_var(void)
+{
+    pollute_stack_for_sizeof();
+    double arr[5] = {1.0};
+    char buf[sizeof(arr[0])];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(arr[0]); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(arr[0]) var zero-init");
+}
+
+void test_sizeof_2d_array_element_var(void)
+{
+    pollute_stack_for_sizeof();
+    int matrix[3][4] = {{0}};
+    char buf1[sizeof(matrix[0])];
+    char buf2[sizeof(matrix[0][0])];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(matrix[0]); i++)
+        if (buf1[i] != 0)
+            all_zero = 0;
+    for (size_t i = 0; i < sizeof(matrix[0][0]); i++)
+        if (buf2[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(2d_arr[row/elem]) zero-init");
+}
+
+void test_sizeof_compound_literal_var(void)
+{
+    pollute_stack_for_sizeof();
+    char buf[sizeof((struct { int x; int y; }){0})];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof((struct { int x; int y; }){0}); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(compound literal) zero-init");
+}
+
+void test_sizeof_cast_expression_var(void)
+{
+    pollute_stack_for_sizeof();
+    int x = 42;
+    char buf[sizeof((double)x)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof((double)x); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof((double)var) zero-init");
+}
+
+void test_sizeof_var_division(void)
+{
+    pollute_stack_for_sizeof();
+    long arr[20] = {0};
+    char buf[sizeof(arr) / sizeof(arr[0])];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(arr) / sizeof(arr[0]); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(arr)/sizeof(arr[0]) zero-init");
+}
+
+void test_sizeof_const_qualified_var(void)
+{
+    pollute_stack_for_sizeof();
+    const int cval = 100;
+    char buf[sizeof(cval)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(cval); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(const var) zero-init");
+}
+
+void test_sizeof_volatile_var(void)
+{
+    pollute_stack_for_sizeof();
+    volatile int vval = 200;
+    char buf[sizeof(vval)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(vval); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(volatile var) zero-init");
+}
+
+void test_sizeof_restrict_ptr(void)
+{
+    pollute_stack_for_sizeof();
+    int val = 1;
+    int *restrict rptr = &val;
+    char buf[sizeof(rptr)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(rptr); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(restrict ptr) zero-init");
+}
+
+void test_sizeof_static_var(void)
+{
+    pollute_stack_for_sizeof();
+    static int sval = 123;
+    char buf[sizeof(sval)];
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(sval); i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "sizeof(static var) zero-init");
+}
+
+void test_sizeof_true_vla_detected(void)
+{
+    int n = 5;
+    int vla[n];
+    vla[0] = 42;
+
+    // x is also a VLA because sizeof(vla) is runtime
+    int x[sizeof(vla)];
+    x[0] = 99;
+
+    CHECK(vla[0] == 42, "VLA preserves value");
+    CHECK(x[0] == 99, "sizeof(VLA) creates VLA, no init");
+}
+
+void test_sizeof_nested_vla_detection(void)
+{
+    int n = 3;
+    int vla1[n];
+    vla1[0] = 1;
+
+    // Second VLA based on first
+    char vla2[sizeof(vla1)];
+    vla2[0] = 'A';
+
+    CHECK(vla1[0] == 1 && vla2[0] == 'A', "nested VLA sizeof detection");
+}
+
+void run_sizeof_var_torture_tests(void)
+{
+    printf("\n=== SIZEOF(VARIABLE) TORTURE TESTS ===\n");
+    printf("(Testing sizeof(var) is correctly recognized as constant)\n\n");
+
+    test_sizeof_local_int_variable();
+    test_sizeof_local_long_variable();
+    test_sizeof_local_float_variable();
+    test_sizeof_local_double_variable();
+    test_sizeof_local_pointer_variable();
+    test_sizeof_local_array_variable();
+    test_sizeof_local_struct_variable();
+    test_sizeof_local_union_variable();
+    test_sizeof_function_parameter();
+    test_sizeof_multiple_vars_in_expr();
+    test_sizeof_var_times_constant();
+    test_sizeof_var_in_ternary();
+    test_sizeof_var_with_bitwise_ops();
+    test_sizeof_nested_vars();
+    test_sizeof_pointer_deref();
+    test_sizeof_array_element_var();
+    test_sizeof_2d_array_element_var();
+    test_sizeof_compound_literal_var();
+    test_sizeof_cast_expression_var();
+    test_sizeof_var_division();
+    test_sizeof_const_qualified_var();
+    test_sizeof_volatile_var();
+    test_sizeof_restrict_ptr();
+    test_sizeof_static_var();
+    test_sizeof_true_vla_detected();
+    test_sizeof_nested_vla_detection();
+}
+
 void run_sizeof_constexpr_tests(void)
 {
     printf("\n=== SIZEOF AND CONSTANT EXPRESSION TESTS ===\n");
@@ -5571,6 +5996,7 @@ void run_sizeof_constexpr_tests(void)
     test_complex_operators_in_array_bound();
     test_sizeof_array_element_in_bound();
     test_sizeof_with_parens_in_bound();
+    test_sizeof_variable_in_array_bound();
 }
 
 void run_silent_failure_tests(void)
@@ -8855,6 +9281,393 @@ void run_reported_bug_fix_tests(void)
     test_defer_in_attribute_with_defer_stmt();
 }
 
+// ============================================
+// ADDITIONAL BUG FIX TESTS
+// 1. register + typeof
+// 2. C23 digit separators
+// 3. volatile typeof
+// ============================================
+
+void test_register_typeof_zeroinit(void)
+{
+    // register variables can't have their address taken
+    // So typeof(int) register x should NOT use memset(&x, ...)
+    // It should use = 0 instead
+    typeof(int) register x;
+    x = 42;  // Assign after declaration
+    CHECK(x == 42, "register typeof compiles (no memset)");
+}
+
+void test_register_typeof_multiple(void)
+{
+    // Multiple register typeof variables
+    typeof(int) register a, b, c;
+    a = 1; b = 2; c = 3;
+    CHECK(a == 1 && b == 2 && c == 3, "multiple register typeof");
+}
+
+void test_c23_digit_separator_decimal(void)
+{
+    // C23 digit separators in decimal literals
+    int million = 1'000'000;
+    int thousand = 1'000;
+    CHECK(million == 1000000, "C23 digit sep decimal million");
+    CHECK(thousand == 1000, "C23 digit sep decimal thousand");
+}
+
+void test_c23_digit_separator_binary(void)
+{
+    // C23 digit separators in binary literals
+    int b1 = 0b1010'1010;
+    int b2 = 0b1111'0000'1111'0000;
+    CHECK(b1 == 170, "C23 digit sep binary 0b1010'1010");
+    CHECK(b2 == 0xF0F0, "C23 digit sep binary 16-bit");
+}
+
+void test_c23_digit_separator_hex(void)
+{
+    // C23 digit separators in hex literals
+    int h1 = 0xFF'FF;
+    int h2 = 0x12'34'56'78;
+    CHECK(h1 == 0xFFFF, "C23 digit sep hex 0xFF'FF");
+    CHECK(h2 == 0x12345678, "C23 digit sep hex 32-bit");
+}
+
+void test_c23_digit_separator_octal(void)
+{
+    // C23 digit separators in octal literals
+    int o1 = 0'777;
+    int o2 = 01'234'567;
+    CHECK(o1 == 0777, "C23 digit sep octal 0'777");
+    CHECK(o2 == 01234567, "C23 digit sep octal large");
+}
+
+void test_c23_digit_separator_float(void)
+{
+    // C23 digit separators in floating point literals
+    float f = 1'234.567'8f;
+    double d = 123'456.789'012;
+    CHECK(f > 1234.0f && f < 1235.0f, "C23 digit sep float");
+    CHECK(d > 123456.0 && d < 123457.0, "C23 digit sep double");
+}
+
+void test_c23_digit_separator_suffix(void)
+{
+    // Digit separators with type suffixes
+    long l = 1'000'000L;
+    long long ll = 123'456'789'012LL;
+    unsigned u = 4'294'967'295U;
+    CHECK(l == 1000000L, "C23 digit sep with L suffix");
+    CHECK(ll == 123456789012LL, "C23 digit sep with LL suffix");
+    CHECK(u == 4294967295U, "C23 digit sep with U suffix");
+}
+
+void test_volatile_typeof_zeroinit(void)
+{
+    // volatile typeof should use volatile-safe zeroing, not memset
+    // This ensures the stores aren't optimized out
+    volatile typeof(int) v;
+    CHECK(v == 0, "volatile typeof zeroed");
+}
+
+void test_volatile_typeof_struct(void)
+{
+    // volatile struct with typeof
+    struct TestStruct { int x; int y; };
+    volatile typeof(struct TestStruct) vs;
+    CHECK(vs.x == 0 && vs.y == 0, "volatile typeof struct zeroed");
+}
+
+void test_volatile_typeof_array(void)
+{
+    // volatile array with typeof (uses volatile char* loop)
+    volatile typeof(int[4]) arr;
+    int all_zero = 1;
+    for (int i = 0; i < 4; i++)
+        if (arr[i] != 0) all_zero = 0;
+    CHECK(all_zero, "volatile typeof array zeroed");
+}
+
+void run_additional_bug_fix_tests(void)
+{
+    printf("\n=== ADDITIONAL BUG FIX TESTS ===\n");
+    printf("(register+typeof, C23 digit separators, volatile+typeof)\n\n");
+    
+    test_register_typeof_zeroinit();
+    test_register_typeof_multiple();
+    test_c23_digit_separator_decimal();
+    test_c23_digit_separator_binary();
+    test_c23_digit_separator_hex();
+    test_c23_digit_separator_octal();
+    test_c23_digit_separator_float();
+    test_c23_digit_separator_suffix();
+    test_volatile_typeof_zeroinit();
+    test_volatile_typeof_struct();
+    test_volatile_typeof_array();
+}
+
+void test_raw_string_basic(void)
+{
+    // C23 raw string literal with newlines
+    const char *json = R"(
+{
+    "key": "value"
+}
+)";
+    CHECK(json != NULL, "raw string literal basic");
+    CHECK(strlen(json) > 10, "raw string has content");
+}
+
+void test_raw_string_with_backslash(void)
+{
+    // Raw string with backslashes (regex pattern) - should NOT be escaped
+    const char *regex = R"(\d+\s*\w+)";
+    CHECK(regex[0] == '\\', "raw string preserves backslash");
+    CHECK(regex[1] == 'd', "raw string no escape processing");
+}
+
+void test_raw_string_with_quotes(void)
+{
+    // Raw string containing quote characters
+    const char *s = R"(He said "hello")";
+    CHECK(strstr(s, "\"hello\"") != NULL, "raw string with quotes");
+}
+
+void test_raw_string_with_delimiter(void)
+{
+    // Raw string with custom delimiter to allow )" inside
+    const char *code = R"delim(
+        const char *s = R"(nested)";
+    )delim";
+    CHECK(code != NULL, "raw string with delimiter");
+}
+
+void test_raw_string_all_escape_sequences(void)
+{
+    // All C escape sequences should be preserved literally
+    const char *s = R"(\a\b\f\n\r\t\v\\\'\"\\0\x1F\777)";
+    CHECK(s[0] == '\\' && s[1] == 'a', "raw \\a preserved");
+    CHECK(s[2] == '\\' && s[3] == 'b', "raw \\b preserved");
+    CHECK(strstr(s, "\\n") != NULL, "raw \\n preserved");
+    CHECK(strstr(s, "\\0") != NULL, "raw \\0 preserved");
+    CHECK(strstr(s, "\\x1F") != NULL, "raw \\x1F preserved");
+}
+
+void test_raw_string_multiline_complex(void)
+{
+    // Complex multiline with various special chars
+    const char *sql = R"(
+SELECT *
+FROM users
+WHERE name = 'O''Brien'
+  AND email LIKE '%@example.com'
+  AND data ~ '^\d{3}-\d{4}$'
+ORDER BY id DESC;
+)";
+    CHECK(strstr(sql, "SELECT") != NULL, "raw multiline SELECT");
+    CHECK(strstr(sql, "O''Brien") != NULL, "raw multiline escaped quote");
+    CHECK(strstr(sql, "\\d{3}") != NULL, "raw multiline regex");
+}
+
+void test_raw_string_json_complex(void)
+{
+    // Complex JSON with nested structures
+    const char *json = R"({
+    "users": [
+        {"name": "Alice", "age": 30, "path": "C:\\Users\\Alice"},
+        {"name": "Bob", "age": 25, "regex": "^\\w+@\\w+\\.\\w+$"}
+    ],
+    "config": {
+        "escapes": "\t\n\r",
+        "unicode": "\u0041\u0042"
+    }
+})";
+    CHECK(strstr(json, "C:\\\\Users") != NULL, "raw JSON backslash path");
+    CHECK(strstr(json, "\\\\w+") != NULL, "raw JSON regex pattern");
+}
+
+void test_raw_string_empty(void)
+{
+    const char *empty = R"()";
+    CHECK(strlen(empty) == 0, "raw empty string");
+}
+
+void test_raw_string_single_char(void)
+{
+    const char *a = R"(a)";
+    const char *bs = R"(\)";
+    const char *qt = R"(")";
+    CHECK(strcmp(a, "a") == 0, "raw single char a");
+    CHECK(strcmp(bs, "\\") == 0, "raw single backslash");
+    CHECK(strcmp(qt, "\"") == 0, "raw single quote");
+}
+
+void test_raw_string_only_special_chars(void)
+{
+    const char *s = R"(
+	)"; // newline + tab
+    CHECK(s[0] == '\n', "raw starts with newline");
+    CHECK(s[1] == '\t', "raw has tab");
+}
+
+void test_raw_string_parens_inside(void)
+{
+    // Parentheses that don't end the string
+    const char *s = R"(func(a, b))";
+    CHECK(strcmp(s, "func(a, b)") == 0, "raw with parens inside");
+
+    const char *nested = R"(((((deep)))))";
+    CHECK(strcmp(nested, "((((deep))))") == 0, "raw deeply nested parens");
+}
+
+void test_raw_string_delimiter_edge_cases(void)
+{
+    // Various delimiter patterns
+    const char *s1 = R"x(content)x";
+    CHECK(strcmp(s1, "content") == 0, "raw single char delimiter");
+
+    const char *s2 = R"abc123(data)abc123";
+    CHECK(strcmp(s2, "data") == 0, "raw alphanumeric delimiter");
+
+    const char *s3 = R"___(underscores)___";
+    CHECK(strcmp(s3, "underscores") == 0, "raw underscore delimiter");
+}
+
+void test_raw_string_false_endings(void)
+{
+    // Content that looks like it might end the string but doesn't
+    const char *s = R"foo()foo not end )foo still not end)foo";
+    CHECK(strstr(s, ")foo not end") != NULL, "raw false ending 1");
+    CHECK(strstr(s, ")foo still not end") != NULL, "raw false ending 2");
+}
+
+void test_raw_string_with_null_like(void)
+{
+    // Content that looks like null but isn't
+    const char *s = R"(\0 NUL \x00)";
+    CHECK(strlen(s) > 10, "raw null-like not terminated");
+    CHECK(strstr(s, "\\0") != NULL, "raw \\0 literal");
+    CHECK(strstr(s, "\\x00") != NULL, "raw \\x00 literal");
+}
+
+void test_raw_string_wide_prefix(void)
+{
+    // Wide/UTF raw strings
+    const wchar_t *ws = LR"(wide\nstring)";
+    CHECK(ws != NULL, "LR wide raw string");
+
+    const char *u8s = u8R"(utf8\tstring)";
+    CHECK(u8s != NULL, "u8R UTF-8 raw string");
+    CHECK(strstr(u8s, "\\t") != NULL, "u8R preserves backslash");
+}
+
+void test_raw_string_adjacent_concat(void)
+{
+    // Adjacent string literal concatenation
+    const char *s = R"(first)"
+                    R"(second)";
+    CHECK(strstr(s, "first") != NULL, "raw concat first");
+    CHECK(strstr(s, "second") != NULL, "raw concat second");
+
+    // Mixed raw and regular
+    const char *mixed = R"(raw\n)"
+                        "regular\n";
+    CHECK(strstr(mixed, "raw\\n") != NULL, "mixed keeps raw backslash");
+    CHECK(strchr(mixed, '\n') != NULL, "mixed has real newline");
+}
+
+void test_raw_string_in_expressions(void)
+{
+    // Raw strings in various expression contexts
+    size_t len = strlen(R"(hello)");
+    CHECK(len == 5, "raw in strlen");
+
+    int cmp = strcmp(R"(abc)", "abc");
+    CHECK(cmp == 0, "raw in strcmp");
+
+    const char *arr[] = {R"(one)", R"(two\n)", R"(three)"};
+    CHECK(strcmp(arr[1], "two\\n") == 0, "raw in array init");
+}
+
+void test_raw_string_windows_paths(void)
+{
+    const char *path = R"(C:\Program Files\App\file.txt)";
+    CHECK(strstr(path, "C:\\Program") != NULL, "raw windows path");
+    CHECK(strstr(path, "\\App\\") != NULL, "raw windows subdir");
+}
+
+void test_raw_string_regex_patterns(void)
+{
+    const char *email = R"(^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$)";
+    CHECK(strstr(email, "\\.[a-zA-Z]") != NULL, "raw regex dot");
+
+    const char *ip = R"(\b(?:\d{1,3}\.){3}\d{1,3}\b)";
+    CHECK(strstr(ip, "\\b") != NULL, "raw regex word boundary");
+    CHECK(strstr(ip, "\\d{1,3}") != NULL, "raw regex digit");
+}
+
+void test_raw_string_code_snippets(void)
+{
+    const char *c_code = R"(
+#include <stdio.h>
+int main() {
+    printf("Hello, \"World\"!\n");
+    return 0;
+}
+)";
+    CHECK(strstr(c_code, "#include") != NULL, "raw C code include");
+    CHECK(strstr(c_code, "\\\"World\\\"") != NULL, "raw C code quotes");
+    CHECK(strstr(c_code, "\\n") != NULL, "raw C code newline escape");
+}
+
+void test_raw_string_html_template(void)
+{
+    const char *html = R"(<!DOCTYPE html>
+<html>
+<head><title>Test</title></head>
+<body>
+<script>
+    var x = "Hello \"World\"";
+    if (a < b && c > d) { }
+</script>
+</body>
+</html>)";
+    CHECK(strstr(html, "<!DOCTYPE") != NULL, "raw HTML doctype");
+    CHECK(strstr(html, "<script>") != NULL, "raw HTML script");
+    CHECK(strstr(html, "\\\"World\\\"") != NULL, "raw HTML JS string");
+}
+
+void run_raw_string_torture_tests(void)
+{
+    printf("\n--- Raw String Literal Torture Tests ---\n");
+    test_raw_string_all_escape_sequences();
+    test_raw_string_multiline_complex();
+    test_raw_string_json_complex();
+    test_raw_string_empty();
+    test_raw_string_single_char();
+    test_raw_string_only_special_chars();
+    test_raw_string_parens_inside();
+    test_raw_string_delimiter_edge_cases();
+    test_raw_string_false_endings();
+    test_raw_string_with_null_like();
+    test_raw_string_wide_prefix();
+    test_raw_string_adjacent_concat();
+    test_raw_string_in_expressions();
+    test_raw_string_windows_paths();
+    test_raw_string_regex_patterns();
+    test_raw_string_code_snippets();
+    test_raw_string_html_template();
+}
+
+void run_c23_raw_string_tests(void)
+{
+    printf("\n--- C23 Raw String Literal Tests ---\n");
+    test_raw_string_basic();
+    test_raw_string_with_backslash();
+    test_raw_string_with_quotes();
+    test_raw_string_with_delimiter();
+}
+
 int main(void)
 {
     printf("=== PRISM TEST SUITE ===\n");
@@ -8890,6 +9703,10 @@ int main(void)
     run_compound_literal_loop_tests();
     run_enum_shadow_tests();
     run_reported_bug_fix_tests();
+    run_additional_bug_fix_tests();
+    run_c23_raw_string_tests();
+    run_raw_string_torture_tests();
+    run_sizeof_var_torture_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

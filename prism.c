@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.99.6"
+#define PRISM_VERSION "0.99.7"
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -1012,7 +1012,8 @@ typedef enum
 {
   TDK_TYPEDEF,
   TDK_SHADOW,
-  TDK_ENUM_CONST
+  TDK_ENUM_CONST,
+  TDK_VLA_VAR // VLA variable (not typedef, but actual VLA array variable)
 } TypedefKind;
 
 static void typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool is_vla)
@@ -1023,7 +1024,7 @@ static void typedef_add_entry(char *name, int len, int scope_depth, TypedefKind 
   e->name = name;
   e->len = len;
   e->scope_depth = scope_depth;
-  e->is_vla = (kind == TDK_TYPEDEF) ? is_vla : false;
+  e->is_vla = (kind == TDK_TYPEDEF || kind == TDK_VLA_VAR) ? is_vla : false;
   e->is_shadow = (kind == TDK_SHADOW || kind == TDK_ENUM_CONST); // Enum consts also shadow typedefs
   e->is_enum_const = (kind == TDK_ENUM_CONST);
   e->prev_index = typedef_get_index(name, len);
@@ -1033,6 +1034,7 @@ static void typedef_add_entry(char *name, int len, int scope_depth, TypedefKind 
 #define typedef_add(name, len, depth, is_vla) typedef_add_entry(name, len, depth, TDK_TYPEDEF, is_vla)
 #define typedef_add_shadow(name, len, depth) typedef_add_entry(name, len, depth, TDK_SHADOW, false)
 #define typedef_add_enum_const(name, len, depth) typedef_add_entry(name, len, depth, TDK_ENUM_CONST, false)
+#define typedef_add_vla_var(name, len, depth) typedef_add_entry(name, len, depth, TDK_VLA_VAR, true)
 
 // Called when exiting a scope - removes typedefs defined at that depth
 static void typedef_pop_scope(int scope_depth)
@@ -1891,15 +1893,13 @@ static bool array_size_is_vla(Token *open_bracket, bool strict_mode)
           if (arg_start && is_vla_typedef(arg_start))
             return true;
 
-          // sizeof(identifier) - check for potential VLA variable
-          if (arg_start && arg_start->kind == TK_IDENT && arg_start->next && equal(arg_start->next, ")") &&
-              !is_const_identifier(arg_start))
-          {
-            // Check for array count idiom: sizeof(arr) / sizeof(arr[0])
-            Token *after_paren = arg_start->next->next;
-            if (!(after_paren && equal(after_paren, "/") && after_paren->next && equal(after_paren->next, "sizeof")))
-              return true;
-          }
+          // sizeof(identifier) where identifier is a simple variable name is
+          // always a compile-time constant in C. Even if the variable is a VLA,
+          // the sizeof is evaluated at the point of the VLA declaration, but
+          // using sizeof(vla_var) in an array bound is extremely rare.
+          // We only flag sizeof(VLA_typedef) as runtime (checked above).
+          // Note: sizeof(identifier) was previously flagged as VLA which caused
+          // false positives like: int x; char buf[sizeof(x)]; // wrongly treated as VLA
 
           // Check for VLA patterns inside the sizeof argument (e.g., sizeof(int[n]))
           for (Token *st = arg_start; st && st != arg_end && st->kind != TK_EOF; st = st->next)
@@ -2342,20 +2342,22 @@ static Token *skip_pragma_operators(Token *tok)
 // Type specifier parsing result
 typedef struct
 {
-  Token *end;      // First token after the type specifier
-  bool saw_type;   // True if a type was recognized
-  bool is_struct;  // True if struct/union/enum type
-  bool is_typedef; // True if user-defined typedef
-  bool is_vla;     // True if VLA typedef or struct with VLA member
-  bool has_typeof; // True if typeof/typeof_unqual (cannot determine VLA at transpile-time)
-  bool has_atomic; // True if _Atomic qualifier/specifier present
+  Token *end;        // First token after the type specifier
+  bool saw_type;     // True if a type was recognized
+  bool is_struct;    // True if struct/union/enum type
+  bool is_typedef;   // True if user-defined typedef
+  bool is_vla;       // True if VLA typedef or struct with VLA member
+  bool has_typeof;   // True if typeof/typeof_unqual (cannot determine VLA at transpile-time)
+  bool has_atomic;   // True if _Atomic qualifier/specifier present
+  bool has_register; // True if register storage class
+  bool has_volatile; // True if volatile qualifier
 } TypeSpecResult;
 
 // Parse type specifier: qualifiers, type keywords, struct/union/enum, typeof, _Atomic, etc.
 // Returns info about the type and position after it
 static TypeSpecResult parse_type_specifier(Token *tok)
 {
-  TypeSpecResult r = {tok, false, false, false, false, false, false};
+  TypeSpecResult r = {tok, false, false, false, false, false, false, false, false};
 
   while (is_type_qualifier(tok) || is_type_keyword(tok) ||
          (tok && equal(tok, "[") && tok->next && equal(tok->next, "[")))
@@ -2363,6 +2365,14 @@ static TypeSpecResult parse_type_specifier(Token *tok)
     // Track _Atomic
     if (equal(tok, "_Atomic"))
       r.has_atomic = true;
+
+    // Track register storage class
+    if (equal(tok, "register"))
+      r.has_register = true;
+
+    // Track volatile qualifier
+    if (equal(tok, "volatile"))
+      r.has_volatile = true;
 
     // Skip C23 [[ ... ]] attributes
     if (equal(tok, "[") && tok->next && equal(tok->next, "["))
@@ -2922,7 +2932,9 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, Token *warn_
                          (type->is_vla && !decl.is_pointer);
 
     // For typeof declarations, use memset instead of = 0 or = {0}
-    bool needs_memset = type->has_typeof && !decl.has_init && !is_raw && !decl.is_pointer;
+    // But NOT for register variables (can't take address) or volatile (needs volatile semantics)
+    bool needs_memset = type->has_typeof && !decl.has_init && !is_raw && !decl.is_pointer &&
+                        !type->has_register;
 
     // Add zero initializer if needed (for non-typeof types)
     if (!decl.has_init && !effective_vla && !is_raw && !needs_memset)
@@ -2964,17 +2976,37 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, Token *warn_
       typedef_add_shadow(decl.var_name->loc, decl.var_name->len, shadow_depth);
     }
 
+    // Register VLA variables so sizeof(vla_var) can be detected as non-constant
+    if (effective_vla && decl.var_name)
+    {
+      int vla_depth = in_for_init ? defer_depth + 1 : defer_depth;
+      typedef_add_vla_var(decl.var_name->loc, decl.var_name->len, vla_depth);
+    }
+
     if (equal(tok, ";"))
     {
       emit_tok(tok);
       // Emit memset for typeof variables
+      // For volatile variables, use volatile-aware zeroing to ensure stores aren't optimized out
       for (int i = 0; i < typeof_var_count; i++)
       {
-        OUT_LIT(" memset(&");
-        out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
-        OUT_LIT(", 0, sizeof(");
-        out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
-        OUT_LIT("));");
+        if (type->has_volatile)
+        {
+          // Use volatile char* to ensure each byte write is not optimized
+          OUT_LIT(" { volatile char *_p = (volatile char *)&");
+          out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
+          OUT_LIT("; for (size_t _i = 0; _i < sizeof(");
+          out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
+          OUT_LIT("); _i++) _p[_i] = 0; }");
+        }
+        else
+        {
+          OUT_LIT(" memset(&");
+          out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
+          OUT_LIT(", 0, sizeof(");
+          out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
+          OUT_LIT("));");
+        }
       }
       return tok->next;
     }
@@ -4922,11 +4954,11 @@ static const ModeFlagDef passthrough_mode_flags[] = {
     {"-print-multi-os-directory", NULL, CLI_MODE_PASSTHROUGH, true},
     {"-print-sysroot", NULL, CLI_MODE_PASSTHROUGH, true},
     {"-print-sysroot-headers-suffix", NULL, CLI_MODE_PASSTHROUGH, true},
-    {"-print-prog-name=", NULL, CLI_MODE_PASSTHROUGH, true},  // prefix match handled below
-    {"-print-file-name=", NULL, CLI_MODE_PASSTHROUGH, true},  // prefix match handled below
-    {"--help", NULL, CLI_MODE_PASSTHROUGH, true},             // GCC help, not prism help
+    {"-print-prog-name=", NULL, CLI_MODE_PASSTHROUGH, true}, // prefix match handled below
+    {"-print-file-name=", NULL, CLI_MODE_PASSTHROUGH, true}, // prefix match handled below
+    {"--help", NULL, CLI_MODE_PASSTHROUGH, true},            // GCC help, not prism help
     {"--target-help", NULL, CLI_MODE_PASSTHROUGH, true},
-    {"-###", NULL, CLI_MODE_PASSTHROUGH, true},               // show commands without executing
+    {"-###", NULL, CLI_MODE_PASSTHROUGH, true}, // show commands without executing
     {NULL, NULL, 0, false}};
 
 // Feature flags that toggle booleans

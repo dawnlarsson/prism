@@ -1149,6 +1149,39 @@ static char *string_literal_end(char *p)
     return p;
 }
 
+// Scan C++11/C23 raw string literal: R"delimiter(content)delimiter"
+// p points to the opening quote after 'R' prefix (or after LR, uR, etc.)
+// Returns pointer past the closing quote, or NULL if not a valid raw string
+static char *raw_string_literal_end(char *p)
+{
+    // p points to '"' - extract delimiter between '"' and '('
+    char *delim_start = p + 1;
+    char *paren = delim_start;
+    while (*paren && *paren != '(' && *paren != ')' && *paren != '\\' &&
+           *paren != ' ' && *paren != '\t' && *paren != '\n' && (paren - delim_start) < 16)
+        paren++;
+
+    if (*paren != '(')
+        return NULL; // Not a valid raw string literal
+
+    int delim_len = paren - delim_start;
+    char *content = paren + 1;
+
+    // Search for )delimiter"
+    for (char *q = content; *q; q++)
+    {
+        if (*q == ')' &&
+            (delim_len == 0 || strncmp(q + 1, delim_start, delim_len) == 0) &&
+            q[1 + delim_len] == '"')
+        {
+            return q + 1 + delim_len + 1; // Past the closing quote
+        }
+    }
+
+    error_at(p, "unclosed raw string literal");
+    return NULL;
+}
+
 static Token *new_token(TokenKind kind, char *start, char *end)
 {
     Token *tok = arena_alloc_token();
@@ -1181,6 +1214,35 @@ static Token *read_string_literal(char *start, char *quote)
     }
 
     Token *tok = new_token(TK_STR, start, end + 1);
+    tok->val.str = buf;
+    return tok;
+}
+
+// Read a C++11/C23 raw string literal token
+// start points to the beginning of the token (R, or prefix like L, u, U, u8)
+// quote points to the opening '"'
+static Token *read_raw_string_literal(char *start, char *quote)
+{
+    char *end = raw_string_literal_end(quote);
+    if (!end)
+        error_at(start, "invalid raw string literal");
+
+    // For raw strings, we store the content between ( and ) without escape processing
+    // Find the delimiter and content boundaries
+    char *delim_start = quote + 1;
+    char *paren = delim_start;
+    while (*paren != '(')
+        paren++;
+    int delim_len = paren - delim_start;
+    char *content_start = paren + 1;
+    char *content_end = end - 2 - delim_len; // Back from )" or )delim"
+
+    size_t content_len = content_end - content_start;
+    char *buf = string_arena_alloc(content_len + 1);
+    memcpy(buf, content_start, content_len);
+    buf[content_len] = '\0';
+
+    Token *tok = new_token(TK_STR, start, end);
     tok->val.str = buf;
     return tok;
 }
@@ -1507,6 +1569,11 @@ static char *scan_pp_number(char *p)
             // Accept digits, letters (hex, suffixes, extensions), dot, underscore
             p++;
         }
+        else if (c == '\'' && (isxdigit(p[1]) || isdigit(p[1])))
+        {
+            // C23 digit separator: accept ' if followed by a digit (hex or decimal)
+            p++;
+        }
         else
             break;
     }
@@ -1596,6 +1663,25 @@ static Token *tokenize(File *file)
             char *start = p;
             p = scan_pp_number(p);
             cur = cur->next = new_token(TK_PP_NUM, start, p);
+            continue;
+        }
+        // C++11/C23 raw string literals: R"...", LR"...", uR"...", UR"...", u8R"..."
+        if (p[0] == 'R' && p[1] == '"')
+        {
+            cur = cur->next = read_raw_string_literal(p, p + 1);
+            p += cur->len;
+            continue;
+        }
+        if ((p[0] == 'L' || p[0] == 'u' || p[0] == 'U') && p[1] == 'R' && p[2] == '"')
+        {
+            cur = cur->next = read_raw_string_literal(p, p + 2);
+            p += cur->len;
+            continue;
+        }
+        if (p[0] == 'u' && p[1] == '8' && p[2] == 'R' && p[3] == '"')
+        {
+            cur = cur->next = read_raw_string_literal(p, p + 3);
+            p += cur->len;
             continue;
         }
         // String literal
