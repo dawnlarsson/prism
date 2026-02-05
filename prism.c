@@ -9,6 +9,9 @@
 
 #include "parse.c"
 
+#include <sys/stat.h>
+#include <sys/wait.h>
+
 // Platform-specific headers for get_real_cc()
 #ifdef __APPLE__
 #include <mach-o/dyld.h> // _NSGetExecutablePath
@@ -71,41 +74,11 @@ static void prism_reset(void);
 
 #endif // PRISM_LIB_MODE
 
-#if defined(__x86_64__) || defined(_M_X64)
-#define NATIVE_ARCH "x86"
-#define NATIVE_BITS 64
-#elif defined(__i386__) || defined(_M_IX86)
-#define NATIVE_ARCH "x86"
-#define NATIVE_BITS 32
-#elif defined(__aarch64__) || defined(_M_ARM64)
-#define NATIVE_ARCH "arm"
-#define NATIVE_BITS 64
-#elif defined(__arm__) || defined(_M_ARM)
-#define NATIVE_ARCH "arm"
-#define NATIVE_BITS 32
-#else
-#define NATIVE_ARCH "x86"
-#define NATIVE_BITS 64
-#endif
-
-#if defined(__linux__)
-#define NATIVE_PLATFORM "linux"
-#elif defined(_WIN32)
-#define NATIVE_PLATFORM "windows"
-#elif defined(__APPLE__)
-#define NATIVE_PLATFORM "macos"
-#else
-#define NATIVE_PLATFORM "linux"
-#endif
-
 // Internal feature flags (set from PrismFeatures before transpile)
 static bool feature_defer = true;
 static bool feature_zeroinit = true;
 static bool feature_warn_safety = false;    // If true, safety checks warn instead of error
 static bool feature_flatten_headers = true; // If true, include flattened system header content
-
-// Hash set for type keywords (initialized once)
-static HashMap type_keyword_map;
 
 // Extra preprocessor configuration (set by CLI before transpile)
 static const char *extra_compiler = NULL;        // Compiler name (cc, gcc, clang, etc.)
@@ -265,6 +238,7 @@ static bool current_func_has_asm = false;
 static bool current_func_has_vfork = false;
 
 static bool at_stmt_start = false;
+static bool used_atomic_init = false; // Track if PRISM_ATOMIC_INIT macro was used
 // Track statement expression scopes - store the defer_depth at which each starts
 static int *stmt_expr_levels = NULL; // defer_depth when stmt expr started (dynamic)
 static int stmt_expr_count = 0;      // number of active statement expressions
@@ -2144,92 +2118,46 @@ static void parse_typedef_declaration(Token *tok, int scope_depth)
 }
 
 // Zero-init helpers
-static void init_type_keyword_map(void)
+// Sorted array of type keywords for binary search (replaces HashMap)
+static const char *const type_keywords[] = {
+    "FILE", "_BitInt", "_Bool", "_Complex", "_Imaginary", "__int128",
+    "__int128_t", "__typeof", "__typeof__", "__uint128", "__uint128_t",
+    "bool", "char", "complex", "double", "enum", "float", "fpos_t",
+    "imaginary", "int", "int16_t", "int32_t", "int64_t", "int8_t",
+    "int_fast16_t", "int_fast32_t", "int_fast64_t", "int_fast8_t",
+    "int_least16_t", "int_least32_t", "int_least64_t", "int_least8_t",
+    "intmax_t", "intptr_t", "long", "off_t", "pid_t", "ptrdiff_t",
+    "short", "signed", "size_t", "ssize_t", "struct", "time_t", "typeof",
+    "typeof_unqual", "uint16_t", "uint32_t", "uint64_t", "uint8_t",
+    "uint_fast16_t", "uint_fast32_t", "uint_fast64_t", "uint_fast8_t",
+    "uint_least16_t", "uint_least32_t", "uint_least64_t", "uint_least8_t",
+    "uintmax_t", "uintptr_t", "union", "unsigned", "void", "wchar_t", "wint_t",
+};
+
+static int compare_keyword(const void *a, const void *b)
 {
-  static char *type_kw[] = {
-      // Standard C type keywords
-      "int",
-      "char",
-      "short",
-      "long",
-      "float",
-      "double",
-      "void",
-      "signed",
-      "unsigned",
-      "struct",
-      "union",
-      "enum",
-      "_Bool",
-      "bool",
-      // typeof extensions
-      "typeof",
-      "__typeof__",
-      "__typeof",
-      "typeof_unqual",
-      // Common typedefs from stdint.h, stddef.h
-      "size_t",
-      "ssize_t",
-      "ptrdiff_t",
-      "intptr_t",
-      "uintptr_t",
-      "intmax_t",
-      "uintmax_t",
-      "int8_t",
-      "int16_t",
-      "int32_t",
-      "int64_t",
-      "uint8_t",
-      "uint16_t",
-      "uint32_t",
-      "uint64_t",
-      "int_fast8_t",
-      "int_fast16_t",
-      "int_fast32_t",
-      "int_fast64_t",
-      "uint_fast8_t",
-      "uint_fast16_t",
-      "uint_fast32_t",
-      "uint_fast64_t",
-      "int_least8_t",
-      "int_least16_t",
-      "int_least32_t",
-      "int_least64_t",
-      "uint_least8_t",
-      "uint_least16_t",
-      "uint_least32_t",
-      "uint_least64_t",
-      "time_t",
-      "off_t",
-      "pid_t",
-      "FILE",
-      "fpos_t",
-      "wchar_t",
-      "wint_t",
-      // GCC/Clang extension types
-      "__int128",
-      "__uint128",
-      "__int128_t",
-      "__uint128_t",
-      // C99 complex types
-      "_Complex",
-      "_Imaginary",
-      "complex",   // <complex.h> macro for _Complex
-      "imaginary", // <complex.h> macro for _Imaginary
-      // C23 _BitInt type
-      "_BitInt",
-  };
-  for (int i = 0; i < (int)(sizeof(type_kw) / sizeof(*type_kw)); i++)
-    hashmap_put(&type_keyword_map, type_kw[i], strlen(type_kw[i]), (void *)1);
+  const char *key = (const char *)a;
+  const char *const *keyword = (const char *const *)b;
+  return strcmp(key, *keyword);
 }
 
 static bool is_type_keyword(Token *tok)
 {
   if (tok->kind != TK_KEYWORD && tok->kind != TK_IDENT)
     return false;
-  // Check hash set first
-  if (hashmap_get(&type_keyword_map, tok->loc, tok->len))
+  
+  // Create a null-terminated string from token for comparison
+  char buf[256];
+  if (tok->len >= (int)sizeof(buf))
+    return false;
+  memcpy(buf, tok->loc, tok->len);
+  buf[tok->len] = '\0';
+  
+  // Binary search in sorted array
+  if (bsearch(buf, type_keywords, sizeof(type_keywords) / sizeof(type_keywords[0]),
+              sizeof(type_keywords[0]), compare_keyword))
     return true;
+  
   // User-defined typedefs (tracked during transpilation)
   if (is_known_typedef(tok))
     return true;
@@ -3286,10 +3214,6 @@ static char *preprocess_with_cc(const char *input_file)
 
 static int transpile(char *input_file, char *output_file)
 {
-  // Initialize type keyword map (only done once)
-  if (!type_keyword_map.capacity)
-    init_type_keyword_map();
-
   // Run system preprocessor
   char *pp_file = preprocess_with_cc(input_file);
   if (!pp_file)
@@ -3310,6 +3234,34 @@ static int transpile(char *input_file, char *output_file)
     return 0;
   }
 
+  // Pre-scan to detect if we need PRISM_ATOMIC_INIT macro
+  // Check for _Atomic struct/union/typedef declarations with zeroinit
+  if (feature_zeroinit)
+  {
+    for (Token *t = tok; t; t = t->next)
+    {
+      if (t->kind == TK_KEYWORD && equal(t, "_Atomic"))
+      {
+        // Look ahead to see if this is an aggregate type
+        Token *next = t->next;
+        if (next && (equal(next, "struct") || equal(next, "union")))
+        {
+          used_atomic_init = true;
+          break;
+        }
+        // Also check for typedef that might be a struct/union
+        if (next && next->kind == TK_IDENT)
+        {
+          // Conservatively assume typedefs might be aggregates
+          // This errs on the side of emitting the macro when not needed,
+          // but that's better than missing it
+          used_atomic_init = true;
+          break;
+        }
+      }
+    }
+  }
+
   FILE *out_fp = fopen(output_file, "w");
   if (!out_fp)
   {
@@ -3318,14 +3270,17 @@ static int transpile(char *input_file, char *output_file)
   }
   out_init(out_fp);
 
-  // Emit compatibility macros for _Atomic initialization
+  // Emit compatibility macros for _Atomic initialization only if used
   // Clang has issues with _Atomic initialization, GCC works correctly
-  OUT_LIT("/* Prism: _Atomic compatibility macros */\n");
-  OUT_LIT("#ifdef __clang__\n");
-  OUT_LIT("#define PRISM_ATOMIC_INIT(v)\n");
-  OUT_LIT("#else\n");
-  OUT_LIT("#define PRISM_ATOMIC_INIT(v) = v\n");
-  OUT_LIT("#endif\n\n");
+  if (used_atomic_init)
+  {
+    OUT_LIT("/* Prism: _Atomic compatibility macros */\n");
+    OUT_LIT("#ifdef __clang__\n");
+    OUT_LIT("#define PRISM_ATOMIC_INIT(v)\n");
+    OUT_LIT("#else\n");
+    OUT_LIT("#define PRISM_ATOMIC_INIT(v) = v\n");
+    OUT_LIT("#endif\n\n");
+  }
 
   // Reset state
   defer_depth = 0;
@@ -3334,6 +3289,7 @@ static int transpile(char *input_file, char *output_file)
   last_line_no = 0;
   last_filename = NULL;
   last_system_header = false;
+  used_atomic_init = false;
   next_scope_is_loop = false;
   next_scope_is_switch = false;
   next_scope_is_conditional = false;
@@ -4331,10 +4287,6 @@ static PrismResult prism_transpile_file(const char *input_file, PrismFeatures fe
   }
 #endif
 
-  // Initialize type keyword map (only done once)
-  if (!type_keyword_map.capacity)
-    init_type_keyword_map();
-
   // Set global feature flags from PrismFeatures
   feature_defer = features.defer;
   feature_zeroinit = features.zeroinit;
@@ -4636,37 +4588,6 @@ use_sudo:;
   return 0;
 }
 
-static char *get_compiler_for_cross(char *arch, int bits, char *platform)
-{
-  int is_native = !strcmp(arch, NATIVE_ARCH) && bits == NATIVE_BITS &&
-                  !strcmp(platform, NATIVE_PLATFORM);
-  if (is_native)
-    return NULL; // Use default CC
-
-  if (!strcmp(platform, "linux"))
-  {
-    if (!strcmp(arch, "arm"))
-      return bits == 64 ? "aarch64-linux-gnu-gcc" : "arm-linux-gnueabihf-gcc";
-    else
-      return bits == 64 ? "x86_64-linux-gnu-gcc" : "i686-linux-gnu-gcc";
-  }
-
-  if (!strcmp(platform, "windows"))
-  {
-    if (!strcmp(arch, "arm"))
-      return bits == 64 ? "aarch64-w64-mingw32-gcc" : "armv7-w64-mingw32-gcc";
-    else
-      return bits == 64 ? "x86_64-w64-mingw32-gcc" : "i686-w64-mingw32-gcc";
-  }
-
-  if (!strcmp(platform, "macos"))
-  {
-    return !strcmp(arch, "arm") ? "oa64-clang" : "o64-clang";
-  }
-
-  return NULL;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI Types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4721,11 +4642,6 @@ typedef struct
   // Prism-specific
   const char *cc; // --prism-cc (default: $PRISM_CC or $CC or "cc")
   bool verbose;   // --prism-verbose
-
-  // Cross-compilation (legacy support)
-  char *cross_arch;
-  int cross_bits;
-  char *cross_platform;
 
   // Link-only mode detection
   bool has_objects; // true if .o, .a, or .so files were provided
@@ -4949,9 +4865,6 @@ static Cli cli_parse(int argc, char **argv)
   Cli cli = {
       .mode = CLI_MODE_COMPILE_AND_LINK,
       .features = prism_defaults(),
-      .cross_arch = NATIVE_ARCH,
-      .cross_bits = NATIVE_BITS,
-      .cross_platform = NATIVE_PLATFORM,
   };
 
   // Get compiler from environment
@@ -5022,62 +4935,6 @@ static Cli cli_parse(int argc, char **argv)
     if (!strcmp(arg, "-fno-flatten-headers"))
     {
       cli.features.flatten_headers = false;
-      continue;
-    }
-
-    // ─── Legacy prism flags (still supported) ───
-    if (!strcmp(arg, "no-defer"))
-    {
-      cli.features.defer = false;
-      continue;
-    }
-    if (!strcmp(arg, "no-zeroinit"))
-    {
-      cli.features.zeroinit = false;
-      continue;
-    }
-
-    // ─── Legacy cross-compilation (still supported) ───
-    if (!strcmp(arg, "arm"))
-    {
-      cli.cross_arch = "arm";
-      continue;
-    }
-    if (!strcmp(arg, "x86"))
-    {
-      cli.cross_arch = "x86";
-      continue;
-    }
-    if (!strcmp(arg, "32"))
-    {
-      cli.cross_bits = 32;
-      continue;
-    }
-    if (!strcmp(arg, "64"))
-    {
-      cli.cross_bits = 64;
-      continue;
-    }
-    if (!strcmp(arg, "linux"))
-    {
-      cli.cross_platform = "linux";
-      continue;
-    }
-    if (!strcmp(arg, "windows"))
-    {
-      cli.cross_platform = "windows";
-      continue;
-    }
-    if (!strcmp(arg, "macos"))
-    {
-      cli.cross_platform = "macos";
-      continue;
-    }
-
-    // ─── Legacy modes (backward compatibility) ───
-    if (!strcmp(arg, "build"))
-    {
-      // 'build' is now the default behavior, ignore for compat
       continue;
     }
 
@@ -5552,9 +5409,6 @@ int main(int argc, char **argv)
   {
     // Pass sources directly to compiler without transpiling (-E, -S modes)
     const char *compiler = get_real_cc(cli.cc);
-    char *cross_cc = get_compiler_for_cross(cli.cross_arch, cli.cross_bits, cli.cross_platform);
-    if (cross_cc)
-      compiler = cross_cc;
 
     ArgvBuilder ab;
     argv_builder_init(&ab);
@@ -5600,9 +5454,6 @@ int main(int argc, char **argv)
   if (cli.source_count == 0 && cli.has_objects && cli.mode != CLI_MODE_RUN)
   {
     const char *compiler = get_real_cc(cli.cc);
-    char *cross_cc = get_compiler_for_cross(cli.cross_arch, cli.cross_bits, cli.cross_platform);
-    if (cross_cc)
-      compiler = cross_cc;
 
     ArgvBuilder ab;
     argv_builder_init(&ab);
@@ -5650,9 +5501,6 @@ int main(int argc, char **argv)
 
   // Determine compiler
   const char *compiler = get_real_cc(cli.cc);
-  char *cross_cc = get_compiler_for_cross(cli.cross_arch, cli.cross_bits, cli.cross_platform);
-  if (cross_cc)
-    compiler = cross_cc;
 
   // Switch to C++/Objective-C compiler if needed
   if (has_cpp_files || has_objc_files)

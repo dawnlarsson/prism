@@ -19,8 +19,6 @@
 #include <stdlib.h>
 #include <stdnoreturn.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #ifndef PATH_MAX
@@ -764,156 +762,82 @@ static uint32_t decode_utf8(char *p, int *len)
     }
 }
 
+// Unicode XID_Start ranges for identifier start characters (sorted by start)
+// See: Unicode Standard Annex #31, C11/C23 compatible
+static const struct { uint32_t start, end; } xid_start_ranges[] = {
+    {0x00C0, 0x00FF},   // Latin-1 Supplement
+    {0x0100, 0x017F},   // Latin Extended-A
+    {0x0180, 0x024F},   // Latin Extended-B
+    {0x0250, 0x02AF},   // IPA Extensions
+    {0x0370, 0x03FF},   // Greek and Coptic
+    {0x0400, 0x04FF},   // Cyrillic
+    {0x0500, 0x052F},   // Cyrillic Supplement
+    {0x0530, 0x058F},   // Armenian
+    {0x0590, 0x05FF},   // Hebrew
+    {0x0600, 0x06FF},   // Arabic
+    {0x0750, 0x077F},   // Arabic Supplement
+    {0x0900, 0x097F},   // Devanagari
+    {0x0980, 0x09FF},   // Bengali
+    {0x0A00, 0x0A7F},   // Gurmukhi
+    {0x0A80, 0x0AFF},   // Gujarati
+    {0x0B00, 0x0B7F},   // Oriya
+    {0x0B80, 0x0BFF},   // Tamil
+    {0x0C00, 0x0C7F},   // Telugu
+    {0x0C80, 0x0CFF},   // Kannada
+    {0x0D00, 0x0D7F},   // Malayalam
+    {0x0D80, 0x0DFF},   // Sinhala
+    {0x0E00, 0x0E7F},   // Thai
+    {0x0E80, 0x0EFF},   // Lao
+    {0x0F00, 0x0FFF},   // Tibetan
+    {0x10A0, 0x10FF},   // Georgian
+    {0x1100, 0x11FF},   // Hangul Jamo
+    {0x1200, 0x137F},   // Ethiopian
+    {0x13A0, 0x13FF},   // Cherokee
+    {0x1400, 0x167F},   // Canadian Aboriginal Syllabics
+    {0x1780, 0x17FF},   // Khmer
+    {0x1800, 0x18AF},   // Mongolian
+    {0x1E00, 0x1EFF},   // Latin Extended Additional
+    {0x1F00, 0x1FFF},   // Greek Extended
+    {0x2100, 0x214F},   // Letterlike Symbols
+    {0x3040, 0x309F},   // Hiragana
+    {0x30A0, 0x30FF},   // Katakana
+    {0x3100, 0x312F},   // Bopomofo
+    {0x31A0, 0x31BF},   // Bopomofo Extended
+    {0x31F0, 0x31FF},   // Katakana Phonetic Extensions
+    {0x3400, 0x4DBF},   // CJK Extension A
+    {0x4E00, 0x9FFF},   // CJK Unified
+    {0xAC00, 0xD7AF},   // Hangul Syllables
+    {0xF900, 0xFAFF},   // CJK Compatibility Ideographs
+    {0x1D400, 0x1D7FF}, // Mathematical Alphanumeric Symbols
+    {0x20000, 0x2A6DF}, // CJK Extension B
+    {0x2A700, 0x2B73F}, // CJK Extension C
+    {0x2B740, 0x2B81F}, // CJK Extension D
+    {0x2B820, 0x2CEAF}, // CJK Extension E
+    {0x2CEB0, 0x2EBEF}, // CJK Extension F
+    {0x30000, 0x3134F}, // CJK Extension G
+};
+
+#define XID_START_RANGE_COUNT (sizeof(xid_start_ranges) / sizeof(xid_start_ranges[0]))
+
 // Check if a Unicode codepoint is valid for identifier start (XID_Start + _ + $)
-// Simplified: allows Latin letters, Greek, Cyrillic, CJK, and common scripts
+// Uses binary search over sorted ranges for O(log N) lookup
 static bool is_ident_start_unicode(uint32_t cp)
 {
     if (cp < 0x80)
         return isalpha(cp) || cp == '_' || cp == '$';
 
-    // C11/C23 XID_Start compatible ranges (covers most common scripts)
-    // See: Unicode Standard Annex #31
-
-    // Latin Extended blocks
-    if (cp >= 0x00C0 && cp <= 0x00FF)
-        return true; // Latin-1 Supplement
-    if (cp >= 0x0100 && cp <= 0x017F)
-        return true; // Latin Extended-A
-    if (cp >= 0x0180 && cp <= 0x024F)
-        return true; // Latin Extended-B
-    if (cp >= 0x0250 && cp <= 0x02AF)
-        return true; // IPA Extensions
-    if (cp >= 0x1E00 && cp <= 0x1EFF)
-        return true; // Latin Extended Additional
-
-    // Greek and Coptic
-    if (cp >= 0x0370 && cp <= 0x03FF)
-        return true;
-    if (cp >= 0x1F00 && cp <= 0x1FFF)
-        return true; // Greek Extended
-
-    // Cyrillic
-    if (cp >= 0x0400 && cp <= 0x04FF)
-        return true;
-    if (cp >= 0x0500 && cp <= 0x052F)
-        return true; // Cyrillic Supplement
-
-    // Armenian
-    if (cp >= 0x0530 && cp <= 0x058F)
-        return true;
-
-    // Hebrew
-    if (cp >= 0x0590 && cp <= 0x05FF)
-        return true;
-
-    // Arabic
-    if (cp >= 0x0600 && cp <= 0x06FF)
-        return true;
-    if (cp >= 0x0750 && cp <= 0x077F)
-        return true; // Arabic Supplement
-
-    // Devanagari and other Indic scripts
-    if (cp >= 0x0900 && cp <= 0x097F)
-        return true; // Devanagari
-    if (cp >= 0x0980 && cp <= 0x09FF)
-        return true; // Bengali
-    if (cp >= 0x0A00 && cp <= 0x0A7F)
-        return true; // Gurmukhi
-    if (cp >= 0x0A80 && cp <= 0x0AFF)
-        return true; // Gujarati
-    if (cp >= 0x0B00 && cp <= 0x0B7F)
-        return true; // Oriya
-    if (cp >= 0x0B80 && cp <= 0x0BFF)
-        return true; // Tamil
-    if (cp >= 0x0C00 && cp <= 0x0C7F)
-        return true; // Telugu
-    if (cp >= 0x0C80 && cp <= 0x0CFF)
-        return true; // Kannada
-    if (cp >= 0x0D00 && cp <= 0x0D7F)
-        return true; // Malayalam
-    if (cp >= 0x0D80 && cp <= 0x0DFF)
-        return true; // Sinhala
-
-    // Thai and Lao
-    if (cp >= 0x0E00 && cp <= 0x0E7F)
-        return true; // Thai
-    if (cp >= 0x0E80 && cp <= 0x0EFF)
-        return true; // Lao
-
-    // Tibetan
-    if (cp >= 0x0F00 && cp <= 0x0FFF)
-        return true;
-
-    // Georgian
-    if (cp >= 0x10A0 && cp <= 0x10FF)
-        return true;
-
-    // Hangul Jamo and Syllables
-    if (cp >= 0x1100 && cp <= 0x11FF)
-        return true; // Hangul Jamo
-    if (cp >= 0xAC00 && cp <= 0xD7AF)
-        return true; // Hangul Syllables
-
-    // Ethiopian
-    if (cp >= 0x1200 && cp <= 0x137F)
-        return true;
-
-    // Cherokee
-    if (cp >= 0x13A0 && cp <= 0x13FF)
-        return true;
-
-    // Canadian Aboriginal Syllabics
-    if (cp >= 0x1400 && cp <= 0x167F)
-        return true;
-
-    // Khmer
-    if (cp >= 0x1780 && cp <= 0x17FF)
-        return true;
-
-    // Mongolian
-    if (cp >= 0x1800 && cp <= 0x18AF)
-        return true;
-
-    // Hiragana, Katakana, Bopomofo
-    if (cp >= 0x3040 && cp <= 0x309F)
-        return true; // Hiragana
-    if (cp >= 0x30A0 && cp <= 0x30FF)
-        return true; // Katakana
-    if (cp >= 0x3100 && cp <= 0x312F)
-        return true; // Bopomofo
-    if (cp >= 0x31A0 && cp <= 0x31BF)
-        return true; // Bopomofo Extended
-    if (cp >= 0x31F0 && cp <= 0x31FF)
-        return true; // Katakana Phonetic Extensions
-
-    // CJK Unified Ideographs (all extensions)
-    if (cp >= 0x3400 && cp <= 0x4DBF)
-        return true; // CJK Extension A
-    if (cp >= 0x4E00 && cp <= 0x9FFF)
-        return true; // CJK Unified
-    if (cp >= 0xF900 && cp <= 0xFAFF)
-        return true; // CJK Compatibility Ideographs
-    if (cp >= 0x20000 && cp <= 0x2A6DF)
-        return true; // CJK Extension B
-    if (cp >= 0x2A700 && cp <= 0x2B73F)
-        return true; // CJK Extension C
-    if (cp >= 0x2B740 && cp <= 0x2B81F)
-        return true; // CJK Extension D
-    if (cp >= 0x2B820 && cp <= 0x2CEAF)
-        return true; // CJK Extension E
-    if (cp >= 0x2CEB0 && cp <= 0x2EBEF)
-        return true; // CJK Extension F
-    if (cp >= 0x30000 && cp <= 0x3134F)
-        return true; // CJK Extension G
-
-    // Mathematical Alphanumeric Symbols (some compilers accept these)
-    if (cp >= 0x1D400 && cp <= 0x1D7FF)
-        return true;
-
-    // Letterlike Symbols
-    if (cp >= 0x2100 && cp <= 0x214F)
-        return true;
-
+    // Binary search over XID_Start ranges
+    int lo = 0, hi = XID_START_RANGE_COUNT - 1;
+    while (lo <= hi)
+    {
+        int mid = lo + (hi - lo) / 2;
+        if (cp < xid_start_ranges[mid].start)
+            hi = mid - 1;
+        else if (cp > xid_start_ranges[mid].end)
+            lo = mid + 1;
+        else
+            return true; // cp is within range [start, end]
+    }
     return false;
 }
 
@@ -1544,20 +1468,16 @@ static char *scan_pp_number(char *p)
 {
     for (;;)
     {
-        if (p[0] && p[1] && (p[0] == 'e' || p[0] == 'E' || p[0] == 'p' || p[0] == 'P') &&
+        // Handle exponent signs: e+, e-, E+, E-, p+, p-, P+, P- (hex floats)
+        char c = *p;
+        if ((c == 'e' || c == 'E' || c == 'p' || c == 'P') &&
             (p[1] == '+' || p[1] == '-'))
         {
             p += 2;
         }
-        else if (isdigit(*p) || *p == '.' || *p == '_')
+        else if (isalnum(c) || c == '.' || c == '_')
         {
-            p++;
-        }
-        else if (isalpha(*p))
-        {
-            // Accept any alphabetic character as part of pp-number
-            // This handles: hex digits (a-f, A-F), standard suffixes (u, l, f),
-            // GCC imaginary (i, j), GCC fixed-point (k, r), and future extensions
+            // Accept digits, letters (hex, suffixes, extensions), dot, underscore
             p++;
         }
         else
