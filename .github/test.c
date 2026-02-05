@@ -9362,12 +9362,15 @@ void test_defer_in_attribute_with_defer_stmt(void)
 // 2. arena_new_block used fprintf+exit(1) instead of error()
 // 3. hashmap_put/hashmap_resize didn't check calloc return value
 // All now use error() which properly uses longjmp in PRISM_LIB_MODE.
+// 4. error() function had potential va_list reuse UB - fixed with separate scopes
 //
 // Bugs fixed (prism.c):
-// 4. API functions (prism_defaults, prism_transpile_file, prism_free, prism_reset)
+// 5. API functions (prism_defaults, prism_transpile_file, prism_free, prism_reset)
 //    were static - now use PRISM_API macro for visibility in library mode
-// 5. Temp files leaked on error - now tracked and cleaned up on longjmp recovery
-// 6. preprocess_with_cc used hardcoded "/tmp/" instead of TMP_DIR macro
+// 6. Temp files leaked on error - now tracked and cleaned up on longjmp recovery
+// 7. preprocess_with_cc used hardcoded "/tmp/" instead of TMP_DIR macro
+// 8. PrismFeatures now includes preprocessor config (include_paths, defines,
+//    compiler_flags, force_includes, compiler) so library users can configure -I/-D
 //
 // Full library mode testing is in test_lib.c
 void test_lib_mode_error_handling_documented(void)
@@ -9378,10 +9381,12 @@ void test_lib_mode_error_handling_documented(void)
     // - arena_new_block: uses error("out of memory allocating arena block")
     // - hashmap_put: checks calloc, uses error("out of memory allocating hashmap")
     // - hashmap_resize: checks calloc, uses error("out of memory resizing hashmap")
+    // - error(): uses separate va_list scopes to avoid UB
     // And in prism.c:
     // - PRISM_API macro controls static/extern visibility
     // - prism_active_temp_output/prism_active_temp_pp track temp files for cleanup
     // - TMP_DIR used consistently for temp file paths
+    // - PrismFeatures includes compiler, include_paths, defines, compiler_flags, force_includes
     CHECK(1, "lib mode: OOM uses error() not exit() (documented fix)");
 }
 

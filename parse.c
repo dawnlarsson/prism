@@ -518,18 +518,22 @@ static int tok_line_no(Token *tok)
 }
 
 // Error handling
+// Note: va_list scoping is intentional to avoid undefined behavior when
+// PRISM_LIB_MODE is defined but prism_error_jmp_set is false.
 static noreturn void error(char *fmt, ...)
 {
-    va_list ap;
-    va_start(ap, fmt);
 #ifdef PRISM_LIB_MODE
     if (prism_error_jmp_set)
     {
+        va_list ap;
+        va_start(ap, fmt);
         vsnprintf(prism_error_msg, sizeof(prism_error_msg), fmt, ap);
         va_end(ap);
         longjmp(prism_error_jmp, 1);
     }
 #endif
+    va_list ap;
+    va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
     va_end(ap);

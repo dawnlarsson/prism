@@ -30,6 +30,17 @@ typedef struct
   bool line_directives;
   bool warn_safety;     // If true, safety checks warn instead of error
   bool flatten_headers; // If true, include flattened system headers (default: true)
+
+  // Preprocessor configuration (optional - can be left NULL/0 for defaults)
+  const char *compiler;          // Compiler to use (default: "cc")
+  const char **include_paths;    // -I paths
+  int include_count;
+  const char **defines;          // -D macros
+  int define_count;
+  const char **compiler_flags;   // Additional flags (-std=c99, -m32, etc.)
+  int compiler_flags_count;
+  const char **force_includes;   // -include files
+  int force_include_count;
 } PrismFeatures;
 
 typedef enum
@@ -66,7 +77,21 @@ static char prism_active_temp_pp[PATH_MAX] = {0};
 
 PRISM_API PrismFeatures prism_defaults(void)
 {
-  return (PrismFeatures){.defer = true, .zeroinit = true, .line_directives = true, .warn_safety = false, .flatten_headers = true};
+  return (PrismFeatures){
+      .defer = true,
+      .zeroinit = true,
+      .line_directives = true,
+      .warn_safety = false,
+      .flatten_headers = true,
+      .compiler = NULL,
+      .include_paths = NULL,
+      .include_count = 0,
+      .defines = NULL,
+      .define_count = 0,
+      .compiler_flags = NULL,
+      .compiler_flags_count = 0,
+      .force_includes = NULL,
+      .force_include_count = 0};
 }
 
 // Forward declarations for library API
@@ -4373,6 +4398,17 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
   feature_warn_safety = features.warn_safety;
   emit_line_directives = features.line_directives;
   feature_flatten_headers = features.flatten_headers;
+
+  // Set preprocessor configuration from PrismFeatures
+  extra_compiler = features.compiler;
+  extra_include_paths = features.include_paths;
+  extra_include_count = features.include_count;
+  extra_defines = features.defines;
+  extra_define_count = features.define_count;
+  extra_compiler_flags = features.compiler_flags;
+  extra_compiler_flags_count = features.compiler_flags_count;
+  extra_force_includes = features.force_includes;
+  extra_force_include_count = features.force_include_count;
 
   // Create temp file for output
   char temp_path[PATH_MAX];
