@@ -4863,6 +4863,23 @@ static const ModeFlagDef mode_flags[] = {
 static const ModeFlagDef passthrough_mode_flags[] = {
     {"-E", NULL, CLI_MODE_PASSTHROUGH, true},
     {"-S", NULL, CLI_MODE_PASSTHROUGH, true},
+    // Compiler probe flags used by libtool/autoconf/configure scripts
+    {"-dumpmachine", NULL, CLI_MODE_PASSTHROUGH, true},
+    {"-dumpversion", NULL, CLI_MODE_PASSTHROUGH, true},
+    {"-dumpfullversion", NULL, CLI_MODE_PASSTHROUGH, true},
+    {"-dumpspecs", NULL, CLI_MODE_PASSTHROUGH, true},
+    {"-print-search-dirs", NULL, CLI_MODE_PASSTHROUGH, true},
+    {"-print-libgcc-file-name", NULL, CLI_MODE_PASSTHROUGH, true},
+    {"-print-multi-lib", NULL, CLI_MODE_PASSTHROUGH, true},
+    {"-print-multi-directory", NULL, CLI_MODE_PASSTHROUGH, true},
+    {"-print-multi-os-directory", NULL, CLI_MODE_PASSTHROUGH, true},
+    {"-print-sysroot", NULL, CLI_MODE_PASSTHROUGH, true},
+    {"-print-sysroot-headers-suffix", NULL, CLI_MODE_PASSTHROUGH, true},
+    {"-print-prog-name=", NULL, CLI_MODE_PASSTHROUGH, true},  // prefix match handled below
+    {"-print-file-name=", NULL, CLI_MODE_PASSTHROUGH, true},  // prefix match handled below
+    {"--help", NULL, CLI_MODE_PASSTHROUGH, true},             // GCC help, not prism help
+    {"--target-help", NULL, CLI_MODE_PASSTHROUGH, true},
+    {"-###", NULL, CLI_MODE_PASSTHROUGH, true},               // show commands without executing
     {NULL, NULL, 0, false}};
 
 // Feature flags that toggle booleans
@@ -4905,6 +4922,29 @@ static bool should_pass_to_pp(const char *arg)
   return false;
 }
 
+// Helper to check if a string starts with "prism" (possibly with path prefix)
+// Used to detect when CC=prism or CC="prism " to avoid infinite recursion
+static bool is_prism_cc(const char *cc)
+{
+  if (!cc || !*cc)
+    return false;
+
+  // Get basename (skip path)
+  const char *base = strrchr(cc, '/');
+  base = base ? base + 1 : cc;
+
+  // Compare just the "prism" part (ignore trailing space or args like "prism -std=c11")
+  // We need to match: "prism", "prism ", "prism -std=gnu11", "prism.exe", etc.
+  if (strncmp(base, "prism", 5) == 0)
+  {
+    char next = base[5];
+    // Valid if: end of string, space, dot (for .exe), or other delimiter
+    if (next == '\0' || next == ' ' || next == '.')
+      return true;
+  }
+  return false;
+}
+
 static Cli cli_parse(int argc, char **argv)
 {
   Cli cli = {
@@ -4913,9 +4953,16 @@ static Cli cli_parse(int argc, char **argv)
   };
 
   // Get compiler from environment
+  // Note: We check PRISM_CC first, then CC. If CC=prism or CC="prism -flag",
+  // we ignore it to avoid infinite recursion.
   char *env_cc = getenv("PRISM_CC");
-  if (!env_cc || !*env_cc)
+  if (!env_cc || !*env_cc || is_prism_cc(env_cc))
+  {
     env_cc = getenv("CC");
+    // If CC is set to "prism" or contains prism as the command, ignore it
+    if (is_prism_cc(env_cc))
+      env_cc = NULL;
+  }
   if (!env_cc || !*env_cc)
     env_cc = NULL;
   cli.cc = env_cc ? env_cc : "cc";
@@ -4941,7 +4988,12 @@ static Cli cli_parse(int argc, char **argv)
     // ─── Passthrough mode flags (table-driven) ───
     for (const ModeFlagDef *f = passthrough_mode_flags; f->flag; f++)
     {
-      if (!strcmp(arg, f->flag))
+      // Check for exact match or prefix match (for flags ending with =)
+      size_t flen = strlen(f->flag);
+      bool is_prefix = flen > 0 && f->flag[flen - 1] == '=';
+      bool matches = is_prefix ? strncmp(arg, f->flag, flen) == 0
+                               : strcmp(arg, f->flag) == 0;
+      if (matches)
       {
         cli.mode = f->mode;
         cli_add_cc_arg(&cli, arg);
@@ -5206,7 +5258,8 @@ int main(int argc, char **argv)
   feature_warn_safety = cli.features.warn_safety;
 
   // Set preprocessor configuration from CLI
-  extra_compiler = cli.cc;
+  // Use get_real_cc() to avoid infinite recursion if CC=prism
+  extra_compiler = get_real_cc(cli.cc);
   extra_compiler_flags = cli.pp_flags;
   extra_compiler_flags_count = cli.pp_flags_count;
   extra_include_paths = cli.include_paths;
@@ -5227,6 +5280,45 @@ int main(int argc, char **argv)
     return 0;
 
   case CLI_MODE_VERSION:
+    // If -v was used with source files or other args, pass through to compiler
+    // Only show prism version when -v/--version is used alone
+    if (cli.source_count > 0 || cli.cc_arg_count > 0 || cli.has_objects)
+    {
+      // Pass -v through to compiler
+      const char *compiler = get_real_cc(cli.cc);
+
+      ArgvBuilder ab;
+      argv_builder_init(&ab);
+      argv_builder_add(&ab, compiler);
+      argv_builder_add(&ab, "-v");
+
+      for (int i = 0; i < cli.cc_arg_count; i++)
+        argv_builder_add(&ab, cli.cc_args[i]);
+
+      for (int i = 0; i < cli.source_count; i++)
+        argv_builder_add(&ab, cli.sources[i]);
+
+      if (cli.output)
+      {
+        argv_builder_add(&ab, "-o");
+        argv_builder_add(&ab, cli.output);
+      }
+
+      char **pass_argv = argv_builder_finish(&ab);
+
+      if (cli.verbose)
+      {
+        fprintf(stderr, "[prism] Passthrough -v: ");
+        for (int i = 0; pass_argv[i]; i++)
+          fprintf(stderr, "%s ", pass_argv[i]);
+        fprintf(stderr, "\n");
+      }
+
+      int status = run_command(pass_argv);
+      free_argv(pass_argv);
+      cli_free(&cli);
+      return status;
+    }
     printf("prism %s\n", PRISM_VERSION);
     cli_free(&cli);
     return 0;
