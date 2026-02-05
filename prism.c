@@ -416,6 +416,32 @@ static void collect_system_includes(void)
   }
 }
 
+// Emit diagnostic pragmas to suppress warnings from system headers.
+// System headers use constructs that trigger various warnings with strict flags.
+static void emit_system_header_diag_push(void)
+{
+  OUT_LIT("#if defined(__GNUC__) || defined(__clang__)\n");
+  OUT_LIT("#pragma GCC diagnostic push\n");
+  OUT_LIT("#pragma GCC diagnostic ignored \"-Wredundant-decls\"\n");
+  OUT_LIT("#pragma GCC diagnostic ignored \"-Wstrict-prototypes\"\n");
+  OUT_LIT("#pragma GCC diagnostic ignored \"-Wold-style-definition\"\n");
+  OUT_LIT("#pragma GCC diagnostic ignored \"-Wpedantic\"\n");
+  OUT_LIT("#pragma GCC diagnostic ignored \"-Wunused-function\"\n");
+  OUT_LIT("#pragma GCC diagnostic ignored \"-Wunused-parameter\"\n");
+  OUT_LIT("#pragma GCC diagnostic ignored \"-Wunused-variable\"\n");
+  OUT_LIT("#pragma GCC diagnostic ignored \"-Wcast-qual\"\n");
+  OUT_LIT("#pragma GCC diagnostic ignored \"-Wsign-conversion\"\n");
+  OUT_LIT("#pragma GCC diagnostic ignored \"-Wconversion\"\n");
+  OUT_LIT("#endif\n");
+}
+
+static void emit_system_header_diag_pop(void)
+{
+  OUT_LIT("#if defined(__GNUC__) || defined(__clang__)\n");
+  OUT_LIT("#pragma GCC diagnostic pop\n");
+  OUT_LIT("#endif\n");
+}
+
 // Emit collected #include directives with necessary feature test macros
 static void emit_system_includes(void)
 {
@@ -424,9 +450,10 @@ static void emit_system_includes(void)
 
   // Emit feature test macros that prism uses during preprocessing
   // These must come before any system includes to enable GNU/POSIX extensions
-  out_str("#ifndef _POSIX_C_SOURCE\n#define _POSIX_C_SOURCE 200809L\n#endif\n"
-          "#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n\n",
-          99);
+  OUT_LIT("#ifndef _POSIX_C_SOURCE\n#define _POSIX_C_SOURCE 200809L\n#endif\n"
+          "#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n\n");
+
+  emit_system_header_diag_push();
 
   for (int i = 0; i < system_include_count; i++)
   {
@@ -434,6 +461,8 @@ static void emit_system_includes(void)
     out_str(system_include_list[i], strlen(system_include_list[i]));
     OUT_LIT("\"\n");
   }
+
+  emit_system_header_diag_pop();
 
   if (system_include_count > 0)
     out_char('\n');
@@ -3273,6 +3302,17 @@ static int transpile(char *input_file, char *output_file)
     OUT_LIT("#endif\n\n");
   }
 
+  // Suppress warnings for inlined system header content.
+  // System headers (especially glibc) use constructs that trigger various
+  // warnings when compiled with strict flags. We disable these for the
+  // entire flattened output since macro expansions can inject system
+  // header content mid-expression, making per-region tracking impractical.
+  if (feature_flatten_headers)
+  {
+    emit_system_header_diag_push();
+    out_char('\n');
+  }
+
   // Reset state
   defer_depth = 0;
   struct_depth = 0;
@@ -4217,6 +4257,13 @@ static int transpile(char *input_file, char *output_file)
     // Default: emit token as-is
     emit_tok(tok);
     tok = tok->next;
+  }
+
+  // Close diagnostic pragma that was opened at the start for flatten mode
+  if (feature_flatten_headers)
+  {
+    out_char('\n');
+    emit_system_header_diag_pop();
   }
 
   out_close();
