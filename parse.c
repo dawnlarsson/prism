@@ -166,37 +166,82 @@ static void arena_free(void)
     token_arena.current = NULL;
 }
 
-// String allocation tracker - tracks malloc'd strings for cleanup
-static char **string_allocs = NULL;
-static int string_alloc_count = 0;
-static int string_alloc_capacity = 0;
+// String arena - bump allocator for string data (literals, identifiers, etc.)
+#define STRING_ARENA_BLOCK_SIZE (64 * 1024)
 
-static char *track_string_alloc(size_t size)
+typedef struct StringArenaBlock StringArenaBlock;
+struct StringArenaBlock
 {
-    char *ptr = calloc(1, size);
-    if (!ptr)
-        return NULL;
-    if (string_alloc_count >= string_alloc_capacity)
+    StringArenaBlock *next;
+    size_t used;
+    size_t capacity;
+    char data[];
+};
+
+typedef struct
+{
+    StringArenaBlock *head;
+    StringArenaBlock *current;
+} StringArena;
+
+static StringArena string_arena = {0};
+
+static StringArenaBlock *new_string_arena_block(size_t min_size)
+{
+    size_t capacity = STRING_ARENA_BLOCK_SIZE;
+    if (min_size > capacity)
+        capacity = min_size;
+    StringArenaBlock *block = malloc(sizeof(StringArenaBlock) + capacity);
+    if (!block)
     {
-        int new_cap = string_alloc_capacity == 0 ? 256 : string_alloc_capacity * 2;
-        char **new_allocs = realloc(string_allocs, sizeof(char *) * new_cap);
-        if (!new_allocs)
-        {
-            free(ptr);
-            return NULL;
-        }
-        string_allocs = new_allocs;
-        string_alloc_capacity = new_cap;
+        fprintf(stderr, "out of memory allocating string arena block\n");
+        exit(1);
     }
-    string_allocs[string_alloc_count++] = ptr;
+    block->next = NULL;
+    block->used = 0;
+    block->capacity = capacity;
+    return block;
+}
+
+static char *string_arena_alloc(size_t size)
+{
+    if (size == 0)
+        size = 1; // Always allocate at least 1 byte for null terminator
+
+    if (!string_arena.current || string_arena.current->used + size > string_arena.current->capacity)
+    {
+        StringArenaBlock *block = new_string_arena_block(size);
+        if (string_arena.current)
+            string_arena.current->next = block;
+        else
+            string_arena.head = block;
+        string_arena.current = block;
+    }
+
+    char *ptr = string_arena.current->data + string_arena.current->used;
+    string_arena.current->used += size;
+    memset(ptr, 0, size);
     return ptr;
 }
 
-static void free_string_allocs(void)
+static void string_arena_reset(void)
 {
-    for (int i = 0; i < string_alloc_count; i++)
-        free(string_allocs[i]);
-    string_alloc_count = 0;
+    for (StringArenaBlock *b = string_arena.head; b; b = b->next)
+        b->used = 0;
+    string_arena.current = string_arena.head;
+}
+
+static void string_arena_free(void)
+{
+    StringArenaBlock *b = string_arena.head;
+    while (b)
+    {
+        StringArenaBlock *next = b->next;
+        free(b);
+        b = next;
+    }
+    string_arena.head = NULL;
+    string_arena.current = NULL;
 }
 
 // Simple hashmap for keywords
@@ -265,12 +310,17 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val)
         map->capacity = 64;
     }
     else if (map->used * 100 / map->capacity >= 70)
+    {
         hashmap_resize(map, map->capacity * 2);
+    }
+
     uint64_t hash = fnv_hash(key, keylen);
     int first_empty = -1;
+
     for (int i = 0; i < map->capacity; i++)
     {
         HashEntry *ent = &map->buckets[(hash + i) % map->capacity];
+
         // Check for existing key to update
         if (ent->key && ent->key != TOMBSTONE &&
             ent->keylen == keylen && !memcmp(ent->key, key, keylen))
@@ -278,23 +328,26 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val)
             ent->val = val; // Update existing entry
             return;
         }
+
         // Remember first empty slot
         if (first_empty < 0 && (!ent->key || ent->key == TOMBSTONE))
             first_empty = (hash + i) % map->capacity;
+
         // Stop at truly empty slot (not tombstone)
         if (!ent->key)
             break;
     }
+
     // Insert into first empty slot
-    if (first_empty >= 0)
-    {
-        HashEntry *ent = &map->buckets[first_empty];
-        ent->key = key;
-        ent->keylen = keylen;
-        ent->val = val;
-        if (ent->key != TOMBSTONE)
-            map->used++;
-    }
+    if (first_empty < 0)
+        return;
+
+    HashEntry *ent = &map->buckets[first_empty];
+    ent->key = key;
+    ent->keylen = keylen;
+    ent->val = val;
+    if (ent->key != TOMBSTONE)
+        map->used++;
 }
 
 static void hashmap_delete2(HashMap *map, char *key, int keylen)
@@ -382,17 +435,45 @@ typedef struct
     File *file; // Cached File struct
 } FileViewCacheEntry;
 
+// File view cache using open-addressing hash table
 static FileViewCacheEntry *file_view_cache = NULL;
 static int file_view_cache_count = 0;
 static int file_view_cache_capacity = 0;
 
+// Hash function for file view cache composite key
+static uint64_t file_view_hash(char *filename, int line_delta, bool is_system, bool is_include_entry)
+{
+    uint64_t hash = 0xcbf29ce484222325;
+    // Hash the pointer value (filename is interned)
+    uintptr_t ptr = (uintptr_t)filename;
+    for (int i = 0; i < (int)sizeof(ptr); i++)
+    {
+        hash *= 0x100000001b3;
+        hash ^= (ptr >> (i * 8)) & 0xFF;
+    }
+    // Hash line_delta
+    hash *= 0x100000001b3;
+    hash ^= (uint32_t)line_delta;
+    hash *= 0x100000001b3;
+    hash ^= ((uint32_t)line_delta >> 8);
+    // Hash flags
+    hash *= 0x100000001b3;
+    hash ^= (is_system ? 1 : 0) | (is_include_entry ? 2 : 0);
+    return hash;
+}
+
 static File *find_cached_file_view(char *filename, int line_delta, bool is_system, bool is_include_entry)
 {
-    // Linear search is acceptable for typical use (hundreds of unique entries)
-    // For very large translation units, this could be converted to a hash
-    for (int i = 0; i < file_view_cache_count; i++)
+    if (!file_view_cache || file_view_cache_capacity == 0)
+        return NULL;
+
+    uint64_t hash = file_view_hash(filename, line_delta, is_system, is_include_entry);
+    for (int i = 0; i < file_view_cache_capacity; i++)
     {
-        FileViewCacheEntry *e = &file_view_cache[i];
+        int idx = (hash + i) % file_view_cache_capacity;
+        FileViewCacheEntry *e = &file_view_cache[idx];
+        if (!e->filename)
+            return NULL;               // Empty slot - not found
         if (e->filename == filename && // Pointer comparison (interned)
             e->line_delta == line_delta &&
             e->is_system == is_system &&
@@ -404,23 +485,57 @@ static File *find_cached_file_view(char *filename, int line_delta, bool is_syste
     return NULL;
 }
 
+static void file_view_cache_resize(int new_cap);
+
 static void cache_file_view(char *filename, int line_delta, bool is_system, bool is_include_entry, File *file)
 {
-    if (file_view_cache_count >= file_view_cache_capacity)
+    // Resize if needed (keep load factor under 70%)
+    if (!file_view_cache || file_view_cache_count * 100 / (file_view_cache_capacity ? file_view_cache_capacity : 1) >= 70)
     {
         int new_cap = file_view_cache_capacity == 0 ? 64 : file_view_cache_capacity * 2;
-        FileViewCacheEntry *new_cache = realloc(file_view_cache, sizeof(FileViewCacheEntry) * new_cap);
-        if (!new_cache)
-            error("out of memory");
-        file_view_cache = new_cache;
-        file_view_cache_capacity = new_cap;
+        file_view_cache_resize(new_cap);
     }
-    FileViewCacheEntry *e = &file_view_cache[file_view_cache_count++];
-    e->filename = filename;
-    e->line_delta = line_delta;
-    e->is_system = is_system;
-    e->is_include_entry = is_include_entry;
-    e->file = file;
+
+    uint64_t hash = file_view_hash(filename, line_delta, is_system, is_include_entry);
+    for (int i = 0; i < file_view_cache_capacity; i++)
+    {
+        int idx = (hash + i) % file_view_cache_capacity;
+        FileViewCacheEntry *e = &file_view_cache[idx];
+        if (!e->filename)
+        {
+            e->filename = filename;
+            e->line_delta = line_delta;
+            e->is_system = is_system;
+            e->is_include_entry = is_include_entry;
+            e->file = file;
+            file_view_cache_count++;
+            return;
+        }
+    }
+}
+
+static void file_view_cache_resize(int new_cap)
+{
+    FileViewCacheEntry *old = file_view_cache;
+    int old_cap = file_view_cache_capacity;
+
+    file_view_cache = calloc(new_cap, sizeof(FileViewCacheEntry));
+    if (!file_view_cache)
+        error("out of memory");
+    file_view_cache_capacity = new_cap;
+    file_view_cache_count = 0;
+
+    // Rehash existing entries
+    if (old)
+    {
+        for (int i = 0; i < old_cap; i++)
+        {
+            if (old[i].filename)
+                cache_file_view(old[i].filename, old[i].line_delta,
+                                old[i].is_system, old[i].is_include_entry, old[i].file);
+        }
+        free(old);
+    }
 }
 
 static void free_file(File *f)
@@ -486,10 +601,12 @@ static int tok_line_no(Token *tok)
     File *f = tok_file(tok);
     if (!f || !f->contents || !tok->loc)
         return -1;
+
     char *file_start = f->contents;
     char *file_end = f->contents + strlen(f->contents);
     if (tok->loc < file_start || tok->loc >= file_end)
         return -1;
+
     int offset = (int)(tok->loc - f->contents);
     int lo = 0, hi = f->line_count - 1;
     while (lo < hi)
@@ -531,12 +648,15 @@ static void verror_at(char *filename, char *input, int line_no, char *loc, char 
         fprintf(stderr, "\n");
         return;
     }
+
     char *line = loc;
     while (input < line && line[-1] != '\n')
         line--;
+
     char *end = loc;
     while (*end && *end != '\n')
         end++;
+
     int indent = fprintf(stderr, "%s:%d: ", filename, line_no);
     fprintf(stderr, "%.*s\n%*s^ ", (int)(end - line), line, indent + (int)(loc - line), "");
     vfprintf(stderr, fmt, ap);
@@ -605,34 +725,37 @@ static inline const char *digraph_equiv(Token *tok)
 {
     if (tok->kind != TK_PUNCT)
         return NULL;
+
     if (tok->len == 4 && !memcmp(tok->loc, "%:%:", 4))
         return "##";
-    if (tok->len == 2)
-    {
-        if (!memcmp(tok->loc, "<:", 2))
-            return "[";
-        if (!memcmp(tok->loc, ":>", 2))
-            return "]";
-        if (!memcmp(tok->loc, "<%", 2))
-            return "{";
-        if (!memcmp(tok->loc, "%>", 2))
-            return "}";
-        if (!memcmp(tok->loc, "%:", 2))
-            return "#";
-    }
+
+    if (tok->len != 2)
+        return NULL;
+
+    if (!memcmp(tok->loc, "<:", 2))
+        return "[";
+    if (!memcmp(tok->loc, ":>", 2))
+        return "]";
+    if (!memcmp(tok->loc, "<%", 2))
+        return "{";
+    if (!memcmp(tok->loc, "%>", 2))
+        return "}";
+    if (!memcmp(tok->loc, "%:", 2))
+        return "#";
+
     return NULL;
 }
 
 static inline bool equal(Token *tok, const char *op)
 {
     size_t len = __builtin_constant_p(*op) ? __builtin_strlen(op) : strlen(op);
+
     if (tok->len == (int)len && !memcmp(tok->loc, op, len))
         return true;
+
     // Check digraph equivalence
     const char *equiv = digraph_equiv(tok);
-    if (equiv && strlen(equiv) == len && !memcmp(equiv, op, len))
-        return true;
-    return false;
+    return equiv && strlen(equiv) == len && !memcmp(equiv, op, len);
 }
 
 // Keyword map
@@ -937,6 +1060,7 @@ static int read_ident(char *start)
             p += len;
             continue;
         }
+
         cp = decode_utf8(p, &len);
         if (!is_ident_cont_unicode(cp))
             break;
@@ -967,50 +1091,86 @@ typedef struct
 
 static int read_punct(char *p)
 {
-    // Check for digraphs first (must check %:%: before %:)
-    static Punct digraphs[] = {
-        {"%:%:", 4},
-        {"<:", 2},
-        {":>", 2},
-        {"<%", 2},
-        {"%>", 2},
-        {"%:", 2},
-    };
-    for (size_t i = 0; i < sizeof(digraphs) / sizeof(*digraphs); i++)
-        if (!strncmp(p, digraphs[i].str, digraphs[i].len))
-            return digraphs[i].len;
-
-    // Multi-character punctuators (longest first within each length)
-    static Punct punct[] = {
-        {"<<=", 3},
-        {">>=", 3},
-        {"...", 3},
-        {"==", 2},
-        {"!=", 2},
-        {"<=", 2},
-        {">=", 2},
-        {"->", 2},
-        {"+=", 2},
-        {"-=", 2},
-        {"*=", 2},
-        {"/=", 2},
-        {"%=", 2},
-        {"&=", 2},
-        {"|=", 2},
-        {"^=", 2},
-        {"&&", 2},
-        {"||", 2},
-        {"++", 2},
-        {"--", 2},
-        {"<<", 2},
-        {">>", 2},
-        {"##", 2},
-    };
-    for (size_t i = 0; i < sizeof(punct) / sizeof(*punct); i++)
-        if (!strncmp(p, punct[i].str, punct[i].len))
-            return punct[i].len;
-
-    return ispunct(*p) ? 1 : 0;
+    // Switch-on-first-char optimization: O(1) dispatch instead of O(N) strncmp calls
+    switch (*p)
+    {
+    case '<':
+        if (p[1] == '<' && p[2] == '=')
+            return 3; // <<=
+        if (p[1] == '<')
+            return 2; // <<
+        if (p[1] == '=')
+            return 2; // <=
+        if (p[1] == ':')
+            return 2; // <: (digraph)
+        if (p[1] == '%')
+            return 2; // <% (digraph)
+        return 1;
+    case '>':
+        if (p[1] == '>' && p[2] == '=')
+            return 3; // >>=
+        if (p[1] == '>')
+            return 2; // >>
+        if (p[1] == '=')
+            return 2; // >=
+        return 1;
+    case '.':
+        if (p[1] == '.' && p[2] == '.')
+            return 3; // ...
+        return 1;
+    case '=':
+        return (p[1] == '=') ? 2 : 1; // == or =
+    case '!':
+        return (p[1] == '=') ? 2 : 1; // != or !
+    case '-':
+        if (p[1] == '>')
+            return 2; // ->
+        if (p[1] == '=')
+            return 2; // -=
+        if (p[1] == '-')
+            return 2; // --
+        return 1;
+    case '+':
+        if (p[1] == '=')
+            return 2; // +=
+        if (p[1] == '+')
+            return 2; // ++
+        return 1;
+    case '*':
+        return (p[1] == '=') ? 2 : 1; // *= or *
+    case '/':
+        return (p[1] == '=') ? 2 : 1; // /= or /
+    case '%':
+        if (p[1] == ':' && p[2] == '%' && p[3] == ':')
+            return 4; // %:%: (digraph ##)
+        if (p[1] == ':')
+            return 2; // %: (digraph #)
+        if (p[1] == '>')
+            return 2; // %> (digraph })
+        if (p[1] == '=')
+            return 2; // %=
+        return 1;
+    case '&':
+        if (p[1] == '&')
+            return 2; // &&
+        if (p[1] == '=')
+            return 2; // &=
+        return 1;
+    case '|':
+        if (p[1] == '|')
+            return 2; // ||
+        if (p[1] == '=')
+            return 2; // |=
+        return 1;
+    case '^':
+        return (p[1] == '=') ? 2 : 1; // ^= or ^
+    case '#':
+        return (p[1] == '#') ? 2 : 1; // ## or #
+    case ':':
+        return (p[1] == '>') ? 2 : 1; // :> (digraph) or :
+    default:
+        return ispunct((unsigned char)*p) ? 1 : 0;
+    }
 }
 
 static bool is_space(char c)
@@ -1111,10 +1271,10 @@ static Token *read_string_literal(char *start, char *quote)
     size_t buf_size = (end - quote);
     if (buf_size == 0)
         buf_size = 1;
-    char *buf = track_string_alloc(buf_size);
-    if (!buf)
-        error("out of memory in read_string_literal");
+
+    char *buf = string_arena_alloc(buf_size);
     int len = 0;
+
     for (char *p = quote + 1; p < end;)
     {
         if (*p == '\\')
@@ -1122,6 +1282,7 @@ static Token *read_string_literal(char *start, char *quote)
         else
             buf[len++] = *p++;
     }
+
     Token *tok = new_token(TK_STR, start, end + 1);
     tok->val.str = buf;
     return tok;
@@ -1132,14 +1293,17 @@ static Token *read_char_literal(char *start, char *quote)
     char *p = quote + 1;
     if (*p == '\0')
         error_at(start, "unclosed char literal");
+
     uint64_t val = 0;
     int count = 0, first_c = 0;
+
     for (;;)
     {
         if (*p == '\n' || *p == '\0')
             error_at(p, "unclosed char literal");
         if (*p == '\'')
             break;
+
         int c = (*p == '\\') ? read_escaped_char(&p, p + 1) : (unsigned char)*p++;
         if (count == 0)
             first_c = c;
@@ -1147,8 +1311,10 @@ static Token *read_char_literal(char *start, char *quote)
             val = (val << 8) | (c & 0xFF);
         count++;
     }
+
     if (count == 0)
         error_at(start, "empty char literal");
+
     Token *tok = new_token(TK_NUM, start, p + 1);
     tok->val.i64 = (count == 1) ? first_c : (int32_t)val;
     return tok;
@@ -1161,9 +1327,12 @@ static int get_extended_float_suffix(const char *p, int len, const char **replac
 {
     if (replacement)
         *replacement = NULL;
+
     if (len < 3)
         return 0;
+
     const char *e = p + len;
+
     // 4-char suffixes: BF16, F128
     if (len >= 4)
     {
@@ -1181,24 +1350,28 @@ static int get_extended_float_suffix(const char *p, int len, const char **replac
             return 4;
         }
     }
+
     // 3-char suffixes: F16, F32, F64
-    if ((e[-3] | 0x20) == 'f' && e[-1] >= '2' && e[-1] <= '6')
+    if ((e[-3] | 0x20) != 'f' || e[-1] < '2' || e[-1] > '6')
+        return 0;
+
+    if (e[-2] == '6' && e[-1] == '4')
+        return 3;
+
+    if (e[-2] == '3' && e[-1] == '2')
     {
-        if (e[-2] == '6' && e[-1] == '4')
-            return 3;
-        if (e[-2] == '3' && e[-1] == '2')
-        {
-            if (replacement)
-                *replacement = "f";
-            return 3;
-        }
-        if (e[-2] == '1' && e[-1] == '6')
-        {
-            if (replacement)
-                *replacement = "f";
-            return 3;
-        }
+        if (replacement)
+            *replacement = "f";
+        return 3;
     }
+
+    if (e[-2] == '1' && e[-1] == '6')
+    {
+        if (replacement)
+            *replacement = "f";
+        return 3;
+    }
+
     return 0;
 }
 
@@ -1304,14 +1477,13 @@ static File *new_file_view(const char *name, File *base, int line_delta, bool is
     // Check cache for existing File view with same parameters
     File *cached = find_cached_file_view(interned_name, line_delta, is_system, is_include_entry);
     if (cached)
-    {
         return cached;
-    }
 
     // Create new File view
     File *file = calloc(1, sizeof(File));
     if (!file)
         error("out of memory");
+
     file->name = interned_name; // Use interned string (no strdup needed)
     file->display_name = file->name;
     file->file_no = input_file_count;
@@ -1326,7 +1498,6 @@ static File *new_file_view(const char *name, File *base, int line_delta, bool is
 
     // Cache this file view
     cache_file_view(interned_name, line_delta, is_system, is_include_entry, file);
-
     add_input_file(file);
 
     return file;
@@ -1625,7 +1796,7 @@ Token *tokenize_file(char *path)
 // Reset state for reuse (keeps arena blocks for reuse)
 void tokenizer_reset(void)
 {
-    free_string_allocs();
+    string_arena_reset();
     arena_reset();
     // Free file view cache first (before freeing files)
     free_file_view_cache();
@@ -1643,7 +1814,7 @@ void tokenizer_reset(void)
 // Full cleanup - frees all memory including arena blocks
 void tokenizer_cleanup(void)
 {
-    free_string_allocs();
+    string_arena_free();
     arena_free();
     // Free file view cache first (before freeing files)
     free_file_view_cache();

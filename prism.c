@@ -309,12 +309,11 @@ static void out_close(void)
   }
 }
 
-static inline void out_char(char c)
+static void out_char(char c)
 {
   if (out_buf.pos >= out_buf.cap)
-  {
     out_flush();
-  }
+
   out_buf.buf[out_buf.pos++] = c;
 }
 
@@ -329,27 +328,29 @@ static void out_str(const char *s, size_t len)
     out_buf.pos += len;
     return;
   }
+
   // Flush and handle large writes
   out_flush();
   if (len >= out_buf.cap)
   {
     // Write directly for very large strings
     fwrite(s, 1, len, out_buf.fp);
+    return;
   }
-  else
-  {
-    memcpy(out_buf.buf, s, len);
-    out_buf.pos = len;
-  }
+
+  memcpy(out_buf.buf, s, len);
+  out_buf.pos = len;
 }
 
 static void out_uint(unsigned long long v)
 {
   char buf[24], *p = buf + sizeof(buf);
+
   do
   {
     *--p = '0' + v % 10;
   } while (v /= 10);
+
   out_str(p, buf + sizeof(buf) - p);
 }
 
@@ -446,6 +447,7 @@ static void emit_system_includes(void)
     out_str(system_include_list[i], strlen(system_include_list[i]));
     OUT_LIT("\"\n");
   }
+
   if (system_include_count > 0)
     out_char('\n');
 }
@@ -512,8 +514,10 @@ static void defer_push_scope(void)
   defer_stack[defer_depth].is_conditional = next_scope_is_conditional;
   defer_stack[defer_depth].had_control_exit = false;
   defer_stack[defer_depth].seen_case_label = false;
+
   if (next_scope_is_conditional)
     conditional_block_depth++;
+
   next_scope_is_loop = false;
   next_scope_is_switch = false;
   next_scope_is_conditional = false;
@@ -624,31 +628,28 @@ static bool needs_space(Token *prev, Token *tok)
     return true;
 
   // Punctuation that could merge
-  if (prev->kind == TK_PUNCT && tok->kind == TK_PUNCT)
-  {
-    // Check common cases: ++ -- << >> && || etc.
-    if ((prev_last == '+' && tok_first == '+') ||
-        (prev_last == '-' && tok_first == '-') ||
-        (prev_last == '<' && tok_first == '<') ||
-        (prev_last == '>' && tok_first == '>') ||
-        (prev_last == '&' && tok_first == '&') ||
-        (prev_last == '|' && tok_first == '|') ||
-        (prev_last == '=' && tok_first == '=') ||
-        (prev_last == '!' && tok_first == '=') ||
-        (prev_last == '<' && tok_first == '=') ||
-        (prev_last == '>' && tok_first == '=') ||
-        (prev_last == '+' && tok_first == '=') ||
-        (prev_last == '-' && tok_first == '=') ||
-        (prev_last == '*' && tok_first == '=') ||
-        (prev_last == '/' && tok_first == '=') ||
-        (prev_last == '-' && tok_first == '>') ||
-        (prev_last == '#' && tok_first == '#') ||
-        (prev_last == '/' && tok_first == '*') ||
-        (prev_last == '*' && tok_first == '/'))
-      return true;
-  }
+  if (prev->kind != TK_PUNCT || tok->kind != TK_PUNCT)
+    return false;
 
-  return false;
+  // Check common cases: ++ -- << >> && || etc.
+  return (prev_last == '+' && tok_first == '+') ||
+         (prev_last == '-' && tok_first == '-') ||
+         (prev_last == '<' && tok_first == '<') ||
+         (prev_last == '>' && tok_first == '>') ||
+         (prev_last == '&' && tok_first == '&') ||
+         (prev_last == '|' && tok_first == '|') ||
+         (prev_last == '=' && tok_first == '=') ||
+         (prev_last == '!' && tok_first == '=') ||
+         (prev_last == '<' && tok_first == '=') ||
+         (prev_last == '>' && tok_first == '=') ||
+         (prev_last == '+' && tok_first == '=') ||
+         (prev_last == '-' && tok_first == '=') ||
+         (prev_last == '*' && tok_first == '=') ||
+         (prev_last == '/' && tok_first == '=') ||
+         (prev_last == '-' && tok_first == '>') ||
+         (prev_last == '#' && tok_first == '#') ||
+         (prev_last == '/' && tok_first == '*') ||
+         (prev_last == '*' && tok_first == '/');
 }
 
 // Check if token is a member access operator (. or ->)
@@ -664,6 +665,7 @@ static bool is_assignment_op(Token *tok)
 {
   if (!tok)
     return false;
+
   return equal(tok, "=") || equal(tok, "+=") || equal(tok, "-=") ||
          equal(tok, "*=") || equal(tok, "/=") || equal(tok, "%=") ||
          equal(tok, "&=") || equal(tok, "|=") || equal(tok, "^=") ||
@@ -887,8 +889,10 @@ static void emit_defers(DeferEmitMode mode)
 {
   if (defer_depth <= 0)
     return;
+
   int start = defer_depth - 1;
   int end = (mode == DEFER_SCOPE) ? defer_depth - 1 : 0;
+
   for (int d = start; d >= end; d--)
   {
     DeferScope *scope = &defer_stack[d];
@@ -898,6 +902,7 @@ static void emit_defers(DeferEmitMode mode)
       emit_range(scope->stmts[i], scope->ends[i]);
       out_char(';');
     }
+
     if (mode == DEFER_SCOPE)
       break;
     if (mode == DEFER_BREAK && (scope->is_loop || scope->is_switch))
@@ -927,16 +932,19 @@ static bool control_flow_has_defers(bool include_switch)
 {
   bool found_boundary = false;
   bool found_defers = false;
+
   for (int d = defer_depth - 1; d >= 0; d--)
   {
     if (defer_stack[d].count > 0)
       found_defers = true;
+
     if (defer_stack[d].is_loop || (include_switch && defer_stack[d].is_switch))
     {
       found_boundary = true;
       break;
     }
   }
+
   return found_boundary && found_defers;
 }
 
@@ -1146,7 +1154,9 @@ static Token *find_struct_body_brace(Token *tok)
         t = skip_balanced(t, "(", ")");
     }
     else
+    {
       t = t->next;
+    }
   }
   return (t && equal(t, "{")) ? t : NULL;
 }
@@ -1647,10 +1657,7 @@ static bool is_void_function_decl(Token *tok)
   }
 
   // Should be at function name followed by (
-  if (tok && tok->kind == TK_IDENT && tok->next && equal(tok->next, "("))
-    return true;
-
-  return false;
+  return tok && tok->kind == TK_IDENT && tok->next && equal(tok->next, "(");
 }
 
 // Skip the base type in a typedef (everything before the declarator)
@@ -2744,155 +2751,21 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
   return r;
 }
 
-// Try to handle a declaration with zero-init
-// Supports multi-declarators like: int a, b, *c, d[10];
-// Returns the token after the declaration if handled, NULL otherwise
-//
-// SAFETY: If we see a type but fail to parse the declarator, we emit a warning
-// to alert the user that zero-init may have been skipped.
-static Token *try_zero_init_decl(Token *tok)
+// Result of validating a declaration structure after type parsing
+typedef struct
 {
-  if (!feature_zeroinit || defer_depth <= 0 || struct_depth > 0)
-  {
-    return NULL;
-  }
+  bool valid;       // True if this is a valid variable declaration
+  bool warn_complex; // True if we should warn about unparsed pattern
+} DeclValidation;
 
-  // SAFETY: Check for "switch skip hole" - declarations before first case label
-  bool in_switch_before_case = false;
-  for (int d = defer_depth - 1; d >= 0; d--)
-  {
-    if (defer_stack[d].is_switch && !defer_stack[d].seen_case_label)
-    {
-      in_switch_before_case = true;
-      break;
-    }
-    if (!defer_stack[d].is_switch)
-      break;
-  }
+// Validate declaration structure and check for statement expressions/function declarations
+// Combines two checks in a single scan for efficiency
+static DeclValidation validate_declaration(Token *type_end, Token *warn_loc)
+{
+  DeclValidation result = {false, false};
+  Token *check = type_end;
 
-  Token *decl_start_for_warning = tok;
-  Token *pragma_start = tok; // Remember start for emitting _Pragma sequences
-
-  // Skip leading [[ ... ]] attributes and _Pragma(...) operators
-  tok = skip_leading_attributes(tok);
-  tok = skip_pragma_operators(tok);
-  Token *start = tok;
-
-  // Check for 'raw' keyword - skip zero-init for this declaration
-  // ONLY consume 'raw' if it's followed by something that looks like a declaration
-  // Otherwise 'raw' is just a variable name (e.g., raw = 1;)
-  // IMPORTANT: If 'raw' is a known typedef (e.g., typedef int raw;), it's NOT the Prism keyword
-  bool is_raw = false;
-  if (equal(tok, "raw") && !is_known_typedef(tok))
-  {
-    Token *after_raw = tok->next;
-    // Skip _Pragma after 'raw' for the lookahead check
-    while (after_raw && equal(after_raw, "_Pragma"))
-    {
-      after_raw = after_raw->next;
-      if (after_raw && equal(after_raw, "("))
-        after_raw = skip_balanced(after_raw, "(", ")");
-    }
-    // 'raw' is NOT the prism keyword if followed by assignment/comparison/arithmetic operators
-    // These indicate 'raw' is being used as a variable name
-    bool is_assignment_or_expr = after_raw && (equal(after_raw, "=") || equal(after_raw, "+=") || equal(after_raw, "-=") ||
-                                               equal(after_raw, "*=") || equal(after_raw, "/=") || equal(after_raw, "%=") ||
-                                               equal(after_raw, "&=") || equal(after_raw, "|=") || equal(after_raw, "^=") ||
-                                               equal(after_raw, "<<=") || equal(after_raw, ">>=") ||
-                                               equal(after_raw, "==") || equal(after_raw, "!=") ||
-                                               equal(after_raw, "<") || equal(after_raw, ">") ||
-                                               equal(after_raw, "<=") || equal(after_raw, ">=") ||
-                                               equal(after_raw, "&&") || equal(after_raw, "||") ||
-                                               equal(after_raw, "+") || equal(after_raw, "-") ||
-                                               equal(after_raw, "*") || equal(after_raw, "/") || equal(after_raw, "%") ||
-                                               equal(after_raw, "&") || equal(after_raw, "|") || equal(after_raw, "^") ||
-                                               equal(after_raw, "<<") || equal(after_raw, ">>") ||
-                                               equal(after_raw, "++") || equal(after_raw, "--") ||
-                                               equal(after_raw, "[") || equal(after_raw, ".") || equal(after_raw, "->") ||
-                                               equal(after_raw, "(") || equal(after_raw, ",") || equal(after_raw, ";") ||
-                                               equal(after_raw, "?") || equal(after_raw, ":"));
-    if (!is_assignment_or_expr)
-    {
-      is_raw = true;
-      tok = tok->next;
-      start = tok;
-      pragma_start = tok; // Also update pragma_start to skip 'raw'
-      decl_start_for_warning = tok;
-    }
-  }
-
-  // Skip any _Pragma after 'raw' as well
-  tok = skip_pragma_operators(tok);
-  if (tok != start && !is_raw)
-    start = tok; // Update start if we skipped more _Pragma
-
-  if (is_skip_decl_keyword(tok))
-  {
-    // If we saw 'raw' but are bailing out due to static/extern/typedef,
-    // we still need to emit the statement without 'raw' and consume it
-    if (is_raw)
-    {
-      // Find end of statement
-      Token *end = tok;
-      while (end && !equal(end, ";") && end->kind != TK_EOF)
-        end = end->next;
-      if (equal(end, ";"))
-        end = end->next;
-      // Emit from start (after 'raw') to end
-      emit_range(start, end);
-      return end;
-    }
-    // Check for 'static/extern raw type' pattern (raw after storage class)
-    // Only for actual storage class specifiers, not all skip keywords like 'return'
-    bool is_storage_class = equal(tok, "static") || equal(tok, "extern") || equal(tok, "typedef");
-    if (is_storage_class)
-    {
-      // Look ahead past the storage class specifier for 'raw'
-      Token *after_storage = tok->next;
-      // Skip _Pragma and attributes after storage class
-      while (after_storage && (equal(after_storage, "_Pragma") ||
-                               equal(after_storage, "__attribute__") || equal(after_storage, "__attribute")))
-      {
-        after_storage = after_storage->next;
-        if (after_storage && equal(after_storage, "("))
-          after_storage = skip_balanced(after_storage, "(", ")");
-      }
-      if (equal(after_storage, "raw") && !is_known_typedef(after_storage))
-      {
-        // Found 'static/extern raw' pattern - emit storage class without 'raw'
-        emit_tok(tok);
-        tok = tok->next;
-        // Skip to after 'raw'
-        while (tok && tok != after_storage)
-        {
-          emit_tok(tok);
-          tok = tok->next;
-        }
-        // Skip 'raw' (don't emit it)
-        tok = tok->next;
-        // Emit the rest of the declaration
-        Token *end = tok;
-        while (end && !equal(end, ";") && end->kind != TK_EOF)
-          end = end->next;
-        if (equal(end, ";"))
-          end = end->next;
-        emit_range(tok, end);
-        return end;
-      }
-    }
-    return NULL;
-  }
-
-  // Parse type specifier
-  TypeSpecResult type = parse_type_specifier(tok);
-  if (!type.saw_type)
-  {
-    return NULL;
-  }
-  tok = type.end;
-
-  // Validate there's at least one declarator
-  Token *check = tok;
+  // Skip pointer modifiers and qualifiers to find first declarator token
   while (equal(check, "*") || is_type_qualifier(check))
   {
     if (equal(check, "__attribute__") || equal(check, "__attribute"))
@@ -2905,44 +2778,43 @@ static Token *try_zero_init_decl(Token *tok)
     check = check->next;
   }
 
-  // Handle parenthesized declarators - find identifier inside parens
-  bool found_ident = false;
-  if (equal(check, "("))
+  // Check for valid declarator start
+  bool has_paren_declarator = equal(check, "(");
+  if (has_paren_declarator)
   {
+    // Parenthesized declarator - find identifier inside
     int depth = 1;
-    check = check->next;
-    while (check && check->kind != TK_EOF && depth > 0)
+    Token *inner = check->next;
+    bool found_ident = false;
+    while (inner && inner->kind != TK_EOF && depth > 0)
     {
-      if (equal(check, "("))
+      if (equal(inner, "("))
         depth++;
-      else if (equal(check, ")"))
+      else if (equal(inner, ")"))
         depth--;
-      else if (check->kind == TK_IDENT && !found_ident)
-      {
-        if (!is_type_keyword(check) && !is_known_typedef(check))
-          found_ident = true;
-      }
-      check = check->next;
+      else if (inner->kind == TK_IDENT && !found_ident &&
+               !is_type_keyword(inner) && !is_known_typedef(inner))
+        found_ident = true;
+      inner = inner->next;
     }
     if (!found_ident)
     {
-      fprintf(stderr, "%s:%d: warning: zero-init: complex pattern not parsed\n",
-              tok_file(decl_start_for_warning)->name, tok_line_no(decl_start_for_warning));
-      return NULL;
+      result.warn_complex = true;
+      return result;
     }
   }
   else if (check->kind != TK_IDENT)
   {
-    return NULL;
+    return result; // Not a declaration
   }
 
-  // Check for statement expressions or function declarations
-  Token *scan = tok;
-  int scan_depth = 0;
+  // Scan for statement expressions or function declarations
+  Token *scan = type_end;
+  int depth = 0;
   bool seen_ident = false;
+
   while (scan && scan->kind != TK_EOF)
   {
-    // Skip __attribute__((...)) in the scan - it's not a function call or identifier
     if (equal(scan, "__attribute__") || equal(scan, "__attribute"))
     {
       scan = scan->next;
@@ -2952,16 +2824,13 @@ static Token *try_zero_init_decl(Token *tok)
     }
     if (equal(scan, "(") || equal(scan, "[") || equal(scan, "{"))
     {
-      // Statement expression at top level - can't safely zero-init
-      // But allow statement expressions nested inside array dims or parens
-      if (scan_depth == 0 && equal(scan, "(") && scan->next && equal(scan->next, "{"))
+      // Statement expression at top level
+      if (depth == 0 && equal(scan, "(") && scan->next && equal(scan->next, "{"))
+        return result;
+      // Function declaration (identifier followed by paren, no pointer)
+      if (depth == 0 && equal(scan, "(") && seen_ident)
       {
-        return NULL; // Statement expression at top level
-      }
-      if (equal(scan, "(") && scan_depth == 0 && seen_ident)
-      {
-        // Check if function declaration (no * before identifier)
-        Token *t = tok;
+        Token *t = type_end;
         bool has_star = false;
         while (t && t != scan)
         {
@@ -2972,66 +2841,102 @@ static Token *try_zero_init_decl(Token *tok)
           t = t->next;
         }
         if (!has_star)
-        {
-          return NULL;
-        }
+          return result;
       }
-      scan_depth++;
+      depth++;
     }
     else if (equal(scan, ")") || equal(scan, "]") || equal(scan, "}"))
-      scan_depth--;
-    else if (scan_depth == 0 && equal(scan, ";"))
+      depth--;
+    else if (depth == 0 && equal(scan, ";"))
       break;
-    else if (scan_depth == 0 && scan->kind == TK_IDENT)
+    else if (depth == 0 && scan->kind == TK_IDENT)
       seen_ident = true;
     scan = scan->next;
   }
 
-  // SAFETY: Error if in switch before case label
-  if (in_switch_before_case && !is_raw)
+  result.valid = true;
+  if (result.warn_complex)
+    fprintf(stderr, "%s:%d: warning: zero-init: complex pattern not parsed\n",
+            tok_file(warn_loc)->name, tok_line_no(warn_loc));
+  return result;
+}
+
+// Check if token after 'raw' indicates 'raw' is being used as an identifier, not the keyword
+// Returns true if 'raw' is followed by something that makes it look like a declaration
+static bool is_raw_declaration_context(Token *after_raw)
+{
+  if (!after_raw)
+    return false;
+  // If followed by a type keyword, typedef, or attribute, 'raw' is the prism keyword
+  return is_type_keyword(after_raw) || is_known_typedef(after_raw) ||
+         is_type_qualifier(after_raw) || is_sue_keyword(after_raw) ||
+         equal(after_raw, "__attribute__") || equal(after_raw, "__attribute") ||
+         equal(after_raw, "typeof") || equal(after_raw, "__typeof__") ||
+         equal(after_raw, "_Atomic");
+}
+
+// Emit tokens from start through semicolon
+static Token *emit_to_semicolon(Token *start)
+{
+  Token *end = start;
+  while (end && !equal(end, ";") && end->kind != TK_EOF)
+    end = end->next;
+  if (equal(end, ";"))
+    end = end->next;
+  emit_range(start, end);
+  return end;
+}
+
+// Handle 'raw' after storage class: "static raw int x;"
+static Token *handle_storage_raw(Token *storage_tok)
+{
+  Token *p = storage_tok->next;
+  while (p && (equal(p, "_Pragma") || equal(p, "__attribute__") || equal(p, "__attribute")))
   {
-    error_tok(decl_start_for_warning,
-              "variable declaration before first 'case' label in switch. "
-              "Move this declaration before the switch, or use 'raw' to suppress zero-init.");
+    p = p->next;
+    if (p && equal(p, "("))
+      p = skip_balanced(p, "(", ")");
   }
+  if (!equal(p, "raw") || is_known_typedef(p))
+    return NULL;
 
-  // Emit leading _Pragma operators (if any) before the type
-  if (pragma_start != start)
-    emit_range(pragma_start, start);
+  // Emit storage class and any attributes, skip 'raw'
+  Token *t = storage_tok;
+  while (t != p)
+  {
+    emit_tok(t);
+    t = t->next;
+  }
+  return emit_to_semicolon(p->next); // Skip 'raw', emit rest
+}
 
-  // Emit base type
-  emit_range(start, type.end);
-
-  // Track variables that need memset for typeof zero-init
-  // (We can't use = 0 because typeof might be an array/VLA type)
-  Token *typeof_vars[MAX_TYPEOF_VARS_PER_DECL]; // Variable name tokens needing memset
+// Process all declarators in a declaration and emit with zero-init
+// Returns token after declaration, or NULL on failure
+static Token *process_declarators(Token *tok, TypeSpecResult *type, Token *warn_loc, bool is_raw)
+{
+  Token *typeof_vars[MAX_TYPEOF_VARS_PER_DECL];
   int typeof_var_count = 0;
 
-  // Process each declarator
   while (tok && tok->kind != TK_EOF)
   {
-    DeclResult decl = parse_declarator(tok, decl_start_for_warning);
+    DeclResult decl = parse_declarator(tok, warn_loc);
     if (!decl.end || !decl.var_name)
       return NULL;
 
     tok = decl.end;
 
-    // Determine effective VLA status (excluding typeof - we handle it specially now)
+    // Determine effective VLA status (excluding typeof - handled specially)
     bool effective_vla = (decl.is_vla && !decl.has_paren) ||
-                         (type.is_vla && !decl.is_pointer);
+                         (type->is_vla && !decl.is_pointer);
 
-    // For typeof declarations, we use memset instead of = 0 or = {0}
-    // because we can't know at transpile time if it's a scalar, array, or VLA
-    bool needs_memset = type.has_typeof && !decl.has_init && !is_raw && !decl.is_pointer;
+    // For typeof declarations, use memset instead of = 0 or = {0}
+    bool needs_memset = type->has_typeof && !decl.has_init && !is_raw && !decl.is_pointer;
 
     // Add zero initializer if needed (for non-typeof types)
     if (!decl.has_init && !effective_vla && !is_raw && !needs_memset)
     {
-      // Use = {0} for arrays and aggregates (structs, unions, typedefs)
-      // Use = 0 for scalars (including _Atomic scalars - works on both GCC and Clang)
-      // Use PRISM_ATOMIC_INIT macro only for _Atomic aggregates (Clang rejects all init for these)
-      bool is_aggregate = decl.is_array || ((type.is_struct || type.is_typedef) && !decl.is_pointer);
-      if (type.has_atomic && is_aggregate)
+      bool is_aggregate = decl.is_array || ((type->is_struct || type->is_typedef) && !decl.is_pointer);
+      if (type->has_atomic && is_aggregate)
         OUT_LIT(" PRISM_ATOMIC_INIT({0})");
       else if (is_aggregate)
         OUT_LIT(" = {0}");
@@ -3039,7 +2944,7 @@ static Token *try_zero_init_decl(Token *tok)
         OUT_LIT(" = 0");
     }
 
-    // Track typeof variables for memset emission after declaration
+    // Track typeof variables for memset emission
     if (needs_memset && typeof_var_count < MAX_TYPEOF_VARS_PER_DECL)
       typeof_vars[typeof_var_count++] = decl.var_name;
 
@@ -3070,7 +2975,7 @@ static Token *try_zero_init_decl(Token *tok)
     if (equal(tok, ";"))
     {
       emit_tok(tok);
-      // Emit memset for typeof variables (after declaration is complete)
+      // Emit memset for typeof variables
       for (int i = 0; i < typeof_var_count; i++)
       {
         OUT_LIT(" memset(&");
@@ -3091,6 +2996,105 @@ static Token *try_zero_init_decl(Token *tok)
   }
 
   return NULL;
+}
+
+// Try to handle a declaration with zero-init
+// Supports multi-declarators like: int a, b, *c, d[10];
+// Returns the token after the declaration if handled, NULL otherwise
+//
+// SAFETY: If we see a type but fail to parse the declarator, we emit a warning
+// to alert the user that zero-init may have been skipped.
+static Token *try_zero_init_decl(Token *tok)
+{
+  if (!feature_zeroinit || defer_depth <= 0 || struct_depth > 0)
+    return NULL;
+
+  // Check for "switch skip hole" - declarations before first case label
+  bool in_switch_before_case = false;
+  for (int d = defer_depth - 1; d >= 0; d--)
+  {
+    if (defer_stack[d].is_switch && !defer_stack[d].seen_case_label)
+    {
+      in_switch_before_case = true;
+      break;
+    }
+    if (!defer_stack[d].is_switch)
+      break;
+  }
+
+  Token *warn_loc = tok;
+  Token *pragma_start = tok;
+
+  // Skip leading attributes and pragmas
+  tok = skip_leading_attributes(tok);
+  tok = skip_pragma_operators(tok);
+  Token *start = tok;
+
+  // Check for 'raw' keyword
+  bool is_raw = false;
+  if (equal(tok, "raw") && !is_known_typedef(tok))
+  {
+    Token *after_raw = tok->next;
+    while (after_raw && equal(after_raw, "_Pragma"))
+    {
+      after_raw = after_raw->next;
+      if (after_raw && equal(after_raw, "("))
+        after_raw = skip_balanced(after_raw, "(", ")");
+    }
+    if (is_raw_declaration_context(after_raw))
+    {
+      is_raw = true;
+      tok = tok->next;
+      start = tok;
+      pragma_start = tok;
+      warn_loc = tok;
+    }
+  }
+
+  // Skip pragmas after 'raw'
+  Token *before = tok;
+  tok = skip_pragma_operators(tok);
+  if (tok != before && !is_raw)
+    start = tok;
+
+  // Handle storage class specifiers
+  if (is_skip_decl_keyword(tok))
+  {
+    if (is_raw)
+      return emit_to_semicolon(start);
+    if (equal(tok, "static") || equal(tok, "extern") || equal(tok, "typedef"))
+    {
+      Token *result = handle_storage_raw(tok);
+      if (result)
+        return result;
+    }
+    return NULL;
+  }
+
+  // Parse type specifier
+  TypeSpecResult type = parse_type_specifier(tok);
+  if (!type.saw_type)
+    return NULL;
+
+  // Validate declaration structure (combined check)
+  DeclValidation v = validate_declaration(type.end, warn_loc);
+  if (!v.valid)
+    return NULL;
+
+  // Error if in switch before case label
+  if (in_switch_before_case && !is_raw)
+  {
+    error_tok(warn_loc,
+              "variable declaration before first 'case' label in switch. "
+              "Move this declaration before the switch, or use 'raw' to suppress zero-init.");
+  }
+
+  // Emit pragmas and type
+  if (pragma_start != start)
+    emit_range(pragma_start, start);
+  emit_range(start, type.end);
+
+  return process_declarators(type.end, &type, warn_loc, is_raw);
 }
 
 // Dynamic argv array
