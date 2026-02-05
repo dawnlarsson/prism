@@ -1,85 +1,137 @@
 ![prism_banner](https://github.com/user-attachments/assets/97c303d0-0d85-4262-8fb3-663a33ce00cd)
 
-### **Robust C by default. (Release Candidate v0.100.0 (1.0))**
+## Robust C by default (Release Candidate)
+**A dialect of C with `defer` and automatic zero-initialization.**
 
-Prism is a lightweight, self-contained transpiler that brings modern language features to standard C. It functions as a build tool with zero dependencies, allowing you to write safer code without the overhead of complex build systems or heavy frameworks, or macro hacks.
+Prism is a single-file transpiler that makes C safer without changing how you write it.
+Drop it into any build system with CC=prism — all GCC flags pass through automatically.
 
-* **Stability:** Prism is tested against **990+** tests, edge cases, and "torture" tests.
-* **Opt out dialect features** Disable parts of the transpiler, like zero-init, with CLI flags.
-* **Drop-in overlay:** Use `CC=prism` in any build system — GCC-compatible flags pass through automatically.
+- **995 tests** — edge cases, control flow, nightmares, trying hard break Prism
+- **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make
+- **Proper transpiler** — tracks typedefs, respects scope, catches unsafe patterns
+- **Opt-out features** Disable parts of the transpiler, like zero-init, with CLI flags
+- **Drop-in overlay** Use `CC=prism` in any build system — GCC-compatible flags pass through automatically
+- **Single Repo** — 7.6k lines, zero dependencies, easy to audit
 
 Prism is a propper transpiler, not a preprocessor macro.
 * **Track Types:** It parses `typedef`s to distinguish pointer declarations from multiplication (the "lexer hack"), ensuring correct zero-initialization.
 * **Respect Scope:** It understands braces `{}`, statement expressions `({ ... })`, and switch-case fallthrough, ensuring `defer` fires exactly when it should.
 * **Detect Errors:** It catches unsafe patterns (like jumping into a scope with `goto`) before they become runtime bugs.
 
-### Status
-Prism can parse & tokenize large complex C projects like `OpenSSL`, `SQlite`, `Bash`, `Dash`, `GNU Core Utils`, `Make`.
-
-As of prism 1.0 (v0.100.0)
-Windows support is currently not there, some code might exist but no nowhere near stable.
-
-<br/>
-
+## Quick Start
 build & install
 ```c
 cc prism.c -flto -s -O3 -o /tmp/prism && /tmp/prism install && rm /tmp/prism
 ```
+As of Prism 1.0 (v0.100.0) - **Windows support is currently not there**, some code might exist but no nowhere near stable.
 
 ## Defer
-Scope-based resource management. Statements execute in LIFO order upon scope exit, including `return`, `break`, `continue`, and `goto`.
 
-`defer` is robust against complex control flow. It correctly injects cleanup code before:
-* `return` (including void and value returns)
-* `break` / `continue` (handles loops and switches correctly)
-* `goto` (unwinds scopes properly)
+**The problem:** C requires manual cleanup at every exit point. Miss one and you leak.
 
 ```c
-void example() {
-    FILE *f = fopen("file.txt", "r");
-    defer fclose(f);
-
-    void *mem = malloc(1024);
-    defer free(mem);
-
-    if (!f || !mem) return; // Cleanups run automatically
+// Standard C — 3 places to forget cleanup
+int process(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    
+    void *buf = malloc(4096);
+    if (!buf) { fclose(f); return -1; }  // Easy to forget fclose here
+    
+    if (parse(buf) < 0) { free(buf); fclose(f); return -1; }  // And here
+    
+    free(buf);
+    fclose(f);
+    return 0;
 }
 ```
 
-*Note: Defer is explicitly forbidden in functions using `setjmp`/`longjmp` or computed gotos to prevent resource leaks.*
+**With Prism:** Write cleanup once. It runs on every exit.
+
+```c
+int process(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    defer fclose(f);
+    
+    void *buf = malloc(4096);
+    if (!buf) return -1;  // fclose(f) runs automatically
+    defer free(buf);
+    
+    if (parse(buf) < 0) return -1;  // both cleanup, in reverse order
+    return 0;
+}
+```
+
+Defers execute in **LIFO order** (last defer runs first) at scope exit — whether via `return`, `break`, `continue`, `goto`, or reaching `}`.
+
+**Edge cases handled:**
+- Statement expressions `({ ... })` — defers fire at inner scope, not outer
+- `switch` fallthrough — defers don't double-fire between cases  
+- Nested loops — `break`/`continue` unwind the correct scope
+
+**Forbidden patterns:** Functions using `setjmp`/`longjmp`, `vfork`, or inline assembly are rejected to prevent resource leaks from non-local jumps.
 
 **Opt-out:** `prism -fno-defer src.c`
 
 ## Zero-Init
-Local variables are automatically zero-initialized.
+
+**The problem:** Uninitialized reads are the #1 source of C vulnerabilities. Compilers don't require initialization, and `-Wall` only catches obvious cases.
 
 ```c
-void example() {
-    int x;           // x = 0
-    char *ptr;       // ptr = NULL
-    int arr[10];     // all elements = 0
-    struct { int a; float b; } s;  // s = {0}
-    
-    typedef struct { int x, y; } Point;
-    Point p;         // p = {0}
+// Standard C — compiles fine, undefined behavior at runtime
+int sum_positive(int *arr, int n) {
+    int total;  // uninitialized — could be anything
+    for (int i = 0; i < n; i++)
+        if (arr[i] > 0) total += arr[i];
+    return total;  // UB: total was never set if no positives
 }
 ```
 
-Works with: primitives, pointers, arrays, structs, unions, enums, and user-defined typedefs (including from headers like `uint8_t`, `size_t`, `FILE*`, `pthread_mutex_t`, etc).
+**With Prism:** All locals start at zero. The above code just works.
 
-**Opt-out:** `prism -fno-zeroinit src.c`
+```c
+void example() {
+    int x;                            // 0
+    char *ptr;                        // NULL  
+    int arr[10];                      // {0, 0, ...}
+    struct { int a; float b; } s;     // {0, 0.0}
+}
+```
+
+**Typedef tracking:** Prism parses headers to recognize `size_t`, `uint8_t`, `FILE *`, `pthread_mutex_t`, etc. This distinguishes `size_t x;` (declaration → initialize) from `size_t * x;` (expression → don't touch).
+
+**VLA support:** Variable-length arrays get `memset` at runtime.
+
+**Opt-out:** `prism -fno-zeroinit src.c` or per-variable with `raw`.
 
 ## Raw
-Skip zero-initialization for a specific variable using the `raw` keyword.
+
+The `raw` keyword opts out of zero-initialization for a specific variable.
 
 ```c
 void example() {
-    raw int x;           // x is uninitialized
-    raw char buffer[4096]; // buffer is uninitialized (faster for large arrays)
+    raw int x;             // Uninitialized
+    raw char buf[65536];   // No memset overhead
+    raw struct large data; // Skip zeroing
 }
 ```
 
-Useful when you need to avoid the overhead of zero-initialization for performance-critical code or large buffers that will be immediately overwritten.
+**When to use:**
+- Large buffers that will be immediately overwritten (`read()`, `recv()`)
+- Performance-critical inner loops where zeroing is measurable overhead
+- Interfacing with APIs that fully initialize the data
+
+**Safety interaction:** Variables marked `raw` can be safely jumped over by `goto` — since they're not initialized anyway, skipping them isn't undefined behavior.
+
+```c
+void allowed() {
+    goto skip;
+    raw int x;  // OK: raw opts out of initialization
+skip:
+    return;
+}
+```
 
 ## Safety Enforcement
 Prism acts as a static analysis tool, turning common C pitfalls into compile-time errors.
@@ -98,12 +150,66 @@ skip:
 // Error: goto 'skip' would skip over variable declaration 'x'
 ```
 
+### Defer in Forbidden Contexts
+
+Prism rejects `defer` in functions that use non-local control flow:
+
+```c
+void bad() {
+    jmp_buf buf;
+    defer cleanup();  // Error: defer forbidden with setjmp
+    if (setjmp(buf)) return;
+}
+```
+
+This prevents resource leaks when `longjmp` bypasses defer cleanup.
+
+### Downgrade to Warnings
+
+Use `-fno-safety` to turn safety errors into warnings (for gradual adoption):
+
+```sh
+prism -fno-safety legacy.c  # Compiles with warnings instead of errors
+```
+
+## Multi-File & Passthrough
+
+Prism handles real-world build scenarios:
+
+```sh
+# Multiple source files
+prism main.c utils.c -o app
+
+# Mix with assembly
+prism main.c boot.s -o kernel
+
+# C++ files pass through untouched (uses g++/clang++ automatically)
+prism main.c helper.cpp -o mixed
+```
+
+**Passthrough files:** `.s`, `.S` (assembly), `.cc`, `.cpp`, `.cxx`, `.mm` (C++), `.m` (Objective-C) are passed directly to the compiler without transpilation.
+
+## Error Reporting
+
+Prism emits `#line` directives so compiler errors point to your original source, not the transpiled output:
+
+```
+main.c:42:5: error: use of undeclared identifier 'foo'
+```
+
+Not:
+```
+/tmp/prism_xyz.c:1847:5: error: use of undeclared identifier 'foo'
+```
+
+**Disable:** `prism -fno-line-directives src.c` (useful for debugging transpiler output)
+
 ## CLI
 
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v0.99.8 - Robust C transpiler
+Prism v0.99.9 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 
@@ -180,6 +286,8 @@ PrismFeatures prism_defaults(void);
 PrismResult   prism_transpile_file(const char *path, PrismFeatures features);
 void          prism_free(PrismResult *r);
 ```
+
+**Note:** Library mode is currently limited and **not thread-safe**. The transpiler uses global state internally. Call from a single thread only, or protect with a mutex.
 
 # parse.c
 C tokenizer based from chibicc (MIT),

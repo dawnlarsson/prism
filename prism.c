@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.99.8"
+#define PRISM_VERSION "0.99.9"
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -32,14 +32,14 @@ typedef struct
   bool flatten_headers; // If true, include flattened system headers (default: true)
 
   // Preprocessor configuration (optional - can be left NULL/0 for defaults)
-  const char *compiler;          // Compiler to use (default: "cc")
-  const char **include_paths;    // -I paths
+  const char *compiler;       // Compiler to use (default: "cc")
+  const char **include_paths; // -I paths
   int include_count;
-  const char **defines;          // -D macros
+  const char **defines; // -D macros
   int define_count;
-  const char **compiler_flags;   // Additional flags (-std=c99, -m32, etc.)
+  const char **compiler_flags; // Additional flags (-std=c99, -m32, etc.)
   int compiler_flags_count;
-  const char **force_includes;   // -include files
+  const char **force_includes; // -include files
   int force_include_count;
 } PrismFeatures;
 
@@ -1339,8 +1339,8 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
   Token *active_item = NULL;  // Most recently seen item that's still "in scope"
   int active_item_depth = -1; // Depth at which active_item was found
   Token *prev = NULL;
-  bool is_stmt_start = true; // Only needed for DECL mode
-  bool is_in_for_init = false;  // Track if we're in for loop initialization clause
+  bool is_stmt_start = true;   // Only needed for DECL mode
+  bool is_in_for_init = false; // Track if we're in for loop initialization clause
 
   while (tok && tok->kind != TK_EOF)
   {
