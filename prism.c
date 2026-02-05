@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.99.7"
+#define PRISM_VERSION "0.99.8"
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -50,15 +50,36 @@ typedef struct
   int error_col;
 } PrismResult;
 
-static PrismFeatures prism_defaults(void)
+// API visibility control - in library mode, API functions are non-static for linking
+#ifdef PRISM_LIB_MODE
+#define PRISM_API
+#else
+#define PRISM_API static
+#endif
+
+// Temp file tracking for cleanup on error (longjmp recovery)
+// These are set before creating temp files and cleared after cleanup
+#ifdef PRISM_LIB_MODE
+static char prism_active_temp_output[PATH_MAX] = {0};
+static char prism_active_temp_pp[PATH_MAX] = {0};
+#endif
+
+PRISM_API PrismFeatures prism_defaults(void)
 {
   return (PrismFeatures){.defer = true, .zeroinit = true, .line_directives = true, .warn_safety = false, .flatten_headers = true};
 }
 
 // Forward declarations for library API
-static PrismResult prism_transpile_file(const char *input_file, PrismFeatures features);
-static void prism_free(PrismResult *r);
-static void prism_reset(void);
+PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures features);
+PRISM_API void prism_free(PrismResult *r);
+PRISM_API void prism_reset(void);
+
+// Temp directory for preprocessor and output files (used in both CLI and library mode)
+#ifdef _WIN32
+#define TMP_DIR ""
+#else
+#define TMP_DIR "/tmp/"
+#endif
 
 // CLI CONFIGURATION (excluded with -DPRISM_LIB_MODE)
 
@@ -66,10 +87,8 @@ static void prism_reset(void);
 
 #ifdef _WIN32
 #define INSTALL_PATH "prism.exe"
-#define TMP_DIR ""
 #else
 #define INSTALL_PATH "/usr/local/bin/prism"
-#define TMP_DIR "/tmp/"
 #endif
 
 #endif // PRISM_LIB_MODE
@@ -3203,10 +3222,16 @@ static void free_argv(char **argv)
 // Run system preprocessor (cc -E -P) on input file
 // Returns path to temp file with preprocessed output, or NULL on failure
 // Caller must free() the path and unlink() the file
+//
+// NOTE: In library mode (PRISM_LIB_MODE), errors from the C compiler
+// (e.g., #error directives, missing includes) go directly to stderr.
+// A host IDE/GUI cannot capture these messages for display in a UI pane.
+// TODO: Capture child stderr via pipe for library mode error reporting.
 static char *preprocess_with_cc(const char *input_file)
 {
   // Create temp file for preprocessed output
-  char tmppath[] = "/tmp/prism_pp_XXXXXX";
+  char tmppath[PATH_MAX];
+  snprintf(tmppath, sizeof(tmppath), "%sprism_pp_XXXXXX", TMP_DIR);
   int fd = mkstemp(tmppath);
   if (fd < 0)
   {
@@ -3292,10 +3317,20 @@ static int transpile(char *input_file, char *output_file)
     return 0;
   }
 
+#ifdef PRISM_LIB_MODE
+  // Track preprocessor temp file for cleanup on error
+  strncpy(prism_active_temp_pp, pp_file, PATH_MAX - 1);
+  prism_active_temp_pp[PATH_MAX - 1] = '\0';
+#endif
+
   // Tokenize the preprocessed output
   Token *tok = tokenize_file(pp_file);
   unlink(pp_file);
   free(pp_file);
+
+#ifdef PRISM_LIB_MODE
+  prism_active_temp_pp[0] = '\0'; // Clear tracking after cleanup
+#endif
 
   if (!tok)
   {
@@ -3304,7 +3339,8 @@ static int transpile(char *input_file, char *output_file)
     return 0;
   }
 
-  FILE *out_fp = fopen(output_file, "w");;
+  FILE *out_fp = fopen(output_file, "w");
+  ;
   if (!out_fp)
   {
     tokenizer_reset(); // Clean up tokenizer state on error
@@ -4294,7 +4330,7 @@ static int transpile(char *input_file, char *output_file)
 #endif
 #endif
 
-static PrismResult prism_transpile_file(const char *input_file, PrismFeatures features)
+PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures features)
 {
   PrismResult result = {0};
 
@@ -4314,6 +4350,17 @@ static PrismResult prism_transpile_file(const char *input_file, PrismFeatures fe
     result.error_msg = strdup(prism_error_msg[0] ? prism_error_msg : "Unknown error");
     result.error_line = prism_error_line;
     result.error_col = prism_error_col;
+    // Clean up any temp files that were created before the error
+    if (prism_active_temp_output[0])
+    {
+      remove(prism_active_temp_output);
+      prism_active_temp_output[0] = '\0';
+    }
+    if (prism_active_temp_pp[0])
+    {
+      unlink(prism_active_temp_pp);
+      prism_active_temp_pp[0] = '\0';
+    }
     // Reset global state to allow future transpilations
     prism_reset();
     return result;
@@ -4379,6 +4426,12 @@ static PrismResult prism_transpile_file(const char *input_file, PrismFeatures fe
   }
 #endif
 
+#ifdef PRISM_LIB_MODE
+  // Track output temp file for cleanup on error (temp_path is now the actual path)
+  strncpy(prism_active_temp_output, temp_path, PATH_MAX - 1);
+  prism_active_temp_output[PATH_MAX - 1] = '\0';
+#endif
+
   // Transpile
   if (!transpile((char *)input_file, temp_path))
   {
@@ -4386,6 +4439,7 @@ static PrismResult prism_transpile_file(const char *input_file, PrismFeatures fe
     result.error_msg = strdup("Transpilation failed");
     remove(temp_path);
 #ifdef PRISM_LIB_MODE
+    prism_active_temp_output[0] = '\0';
     prism_error_jmp_set = false;
 #endif
     return result;
@@ -4399,6 +4453,7 @@ static PrismResult prism_transpile_file(const char *input_file, PrismFeatures fe
     result.error_msg = strdup("Failed to read transpiled output");
     remove(temp_path);
 #ifdef PRISM_LIB_MODE
+    prism_active_temp_output[0] = '\0';
     prism_error_jmp_set = false;
 #endif
     return result;
@@ -4416,6 +4471,7 @@ static PrismResult prism_transpile_file(const char *input_file, PrismFeatures fe
     fclose(f);
     remove(temp_path);
 #ifdef PRISM_LIB_MODE
+    prism_active_temp_output[0] = '\0';
     prism_error_jmp_set = false;
 #endif
     return result;
@@ -4430,12 +4486,13 @@ static PrismResult prism_transpile_file(const char *input_file, PrismFeatures fe
   remove(temp_path);
 
 #ifdef PRISM_LIB_MODE
+  prism_active_temp_output[0] = '\0';
   prism_error_jmp_set = false;
 #endif
   return result;
 }
 
-static void prism_free(PrismResult *r)
+PRISM_API void prism_free(PrismResult *r)
 {
   if (r->output)
   {
@@ -4450,7 +4507,7 @@ static void prism_free(PrismResult *r)
 }
 
 // Reset all transpiler state for clean reuse (prevents memory leaks on repeated use)
-__attribute__((unused)) static void prism_reset(void)
+__attribute__((unused)) PRISM_API void prism_reset(void)
 {
   // Full tokenizer cleanup (parse.c) - frees arena blocks
   tokenizer_cleanup();

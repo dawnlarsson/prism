@@ -33,6 +33,8 @@
 #define TOMBSTONE ((void *)-1)
 
 // Generic array growth: ensures *arr has capacity for n elements
+// Note: Uses error() instead of exit(1) to support PRISM_LIB_MODE where
+// error() uses longjmp for recovery instead of terminating the host process.
 #define ENSURE_ARRAY_CAP(arr, count, cap, init_cap, T)         \
     do                                                         \
     {                                                          \
@@ -43,10 +45,7 @@
                 new_cap *= 2;                                  \
             T *tmp = realloc((arr), sizeof(T) * new_cap);      \
             if (!tmp)                                          \
-            {                                                  \
-                fprintf(stderr, "out of memory\n");            \
-                exit(1);                                       \
-            }                                                  \
+                error("out of memory");                        \
             (arr) = tmp;                                       \
             (cap) = new_cap;                                   \
         }                                                      \
@@ -124,6 +123,9 @@ static inline void tok_set_has_space(Token *tok, bool v)
         tok->flags &= ~TF_HAS_SPACE;
 }
 
+// Forward declaration for error reporting (used by arena and hashmap OOM handling)
+static noreturn void error(char *fmt, ...);
+
 // Generic arena allocator - unified "linked list of blocks" bump allocator
 // Used for both token allocation and string data
 #define ARENA_DEFAULT_BLOCK_SIZE (64 * 1024)
@@ -151,10 +153,7 @@ static ArenaBlock *arena_new_block(size_t min_size, size_t default_size)
         capacity = min_size;
     ArenaBlock *block = malloc(sizeof(ArenaBlock) + capacity);
     if (!block)
-    {
-        fprintf(stderr, "out of memory allocating arena block\n");
-        exit(1);
-    }
+        error("out of memory allocating arena block");
     block->next = NULL;
     block->used = 0;
     block->capacity = capacity;
@@ -272,6 +271,8 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val);
 static void hashmap_resize(HashMap *map, int newcap)
 {
     HashMap new_map = {.buckets = calloc(newcap, sizeof(HashEntry)), .capacity = newcap};
+    if (!new_map.buckets)
+        error("out of memory resizing hashmap");
     for (int i = 0; i < map->capacity; i++)
     {
         HashEntry *ent = &map->buckets[i];
@@ -287,6 +288,8 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val)
     if (!map->buckets)
     {
         map->buckets = calloc(64, sizeof(HashEntry));
+        if (!map->buckets)
+            error("out of memory allocating hashmap");
         map->capacity = 64;
     }
     else if (map->used * 100 / map->capacity >= 70)
@@ -359,9 +362,6 @@ static void hashmap_clear(HashMap *map)
     map->capacity = 0;
     map->used = 0;
 }
-
-// Forward declaration for error reporting (defined later)
-static noreturn void error(char *fmt, ...);
 
 // Library mode error recovery - when PRISM_LIB_MODE is defined, errors
 // longjmp back to a recovery point instead of calling exit(1).

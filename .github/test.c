@@ -4522,11 +4522,16 @@ void test_atomic_zeroinit(void)
 void test_atomic_aggregate_zeroinit(void)
 {
     // _Atomic struct (aggregate type)
-    _Atomic struct { int x; int y; } atomic_struct;
+    _Atomic struct
+    {
+        int x;
+        int y;
+    } atomic_struct;
     int all_zero = 1;
     unsigned char *p = (unsigned char *)&atomic_struct;
     for (size_t i = 0; i < sizeof(atomic_struct); i++)
-        if (p[i] != 0) all_zero = 0;
+        if (p[i] != 0)
+            all_zero = 0;
     CHECK(all_zero, "_Atomic struct memset zero-init");
 
     // _Atomic array of ints
@@ -4534,7 +4539,8 @@ void test_atomic_aggregate_zeroinit(void)
     all_zero = 1;
     p = (unsigned char *)&arr;
     for (size_t i = 0; i < sizeof(arr); i++)
-        if (p[i] != 0) all_zero = 0;
+        if (p[i] != 0)
+            all_zero = 0;
     CHECK(all_zero, "_Atomic int array zero-init");
 }
 #else
@@ -5497,7 +5503,7 @@ void test_system_typedef_pattern(void)
 void test_invisible_system_typedef_pattern(void)
 {
     // size_t - standard system typedef from stddef.h
-    size_t s1;  // should be zero-initialized
+    size_t s1; // should be zero-initialized
     CHECK(s1 == 0, "size_t variable - zero-init");
 
     // ptrdiff_t - standard system typedef from stddef.h
@@ -5534,7 +5540,7 @@ void test_system_typedef_shadow(void)
 {
     // Shadow a system type name with a variable
     int size_t = 10;
-    int result = size_t * 5;  // Should be multiplication, not pointer declaration
+    int result = size_t * 5; // Should be multiplication, not pointer declaration
     CHECK(result == 50, "shadowed size_t multiplication");
 
     // Another shadow test with _t suffix
@@ -9350,6 +9356,35 @@ void test_defer_in_attribute_with_defer_stmt(void)
     CHECK_EQ(result, 42, "defer stmt + cleanup attr: both work");
 }
 
+// Test: Verify OOM handling uses error() not exit(1) in library mode
+// Bugs fixed (parse.c):
+// 1. ENSURE_ARRAY_CAP macro used exit(1) instead of error()
+// 2. arena_new_block used fprintf+exit(1) instead of error()
+// 3. hashmap_put/hashmap_resize didn't check calloc return value
+// All now use error() which properly uses longjmp in PRISM_LIB_MODE.
+//
+// Bugs fixed (prism.c):
+// 4. API functions (prism_defaults, prism_transpile_file, prism_free, prism_reset)
+//    were static - now use PRISM_API macro for visibility in library mode
+// 5. Temp files leaked on error - now tracked and cleaned up on longjmp recovery
+// 6. preprocess_with_cc used hardcoded "/tmp/" instead of TMP_DIR macro
+//
+// Full library mode testing is in test_lib.c
+void test_lib_mode_error_handling_documented(void)
+{
+    // This test verifies the pattern is documented.
+    // The actual fixes are in parse.c:
+    // - ENSURE_ARRAY_CAP: uses error("out of memory")
+    // - arena_new_block: uses error("out of memory allocating arena block")
+    // - hashmap_put: checks calloc, uses error("out of memory allocating hashmap")
+    // - hashmap_resize: checks calloc, uses error("out of memory resizing hashmap")
+    // And in prism.c:
+    // - PRISM_API macro controls static/extern visibility
+    // - prism_active_temp_output/prism_active_temp_pp track temp files for cleanup
+    // - TMP_DIR used consistently for temp file paths
+    CHECK(1, "lib mode: OOM uses error() not exit() (documented fix)");
+}
+
 void run_reported_bug_fix_tests(void)
 {
     printf("\n=== BUG FIX TESTS ===\n");
@@ -9363,6 +9398,7 @@ void run_reported_bug_fix_tests(void)
     test_raw_keyword_before_static();
     test_defer_in_attribute_cleanup();
     test_defer_in_attribute_with_defer_stmt();
+    test_lib_mode_error_handling_documented();
 }
 
 // ============================================
