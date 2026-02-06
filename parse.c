@@ -833,10 +833,6 @@ static uint8_t keyword_tag(Token *tok)
 // Forward declaration for hex digit conversion
 static int from_hex(char c);
 
-// UTF-8 helpers for identifier parsing
-// Check if byte is a UTF-8 continuation byte (10xxxxxx)
-static inline bool is_utf8_cont(unsigned char c) { return (c & 0xC0) == 0x80; }
-
 // Get the number of bytes in a UTF-8 sequence from the leading byte
 static int utf8_char_len(unsigned char c)
 {
@@ -851,154 +847,9 @@ static int utf8_char_len(unsigned char c)
     return 0;     // Invalid
 }
 
-// Decode a UTF-8 character and return its Unicode codepoint
-static uint32_t decode_utf8(char *p, int *len)
-{
-    unsigned char *s = (unsigned char *)p;
-    int n = utf8_char_len(s[0]);
-    if (n == 0)
-    {
-        *len = 1;
-        return 0;
-    }
-
-    // Validate continuation bytes
-    for (int i = 1; i < n; i++)
-        if (!is_utf8_cont(s[i]))
-        {
-            *len = 1;
-            return 0;
-        }
-
-    *len = n;
-    switch (n)
-    {
-    case 1:
-        return s[0];
-    case 2:
-        return ((s[0] & 0x1F) << 6) | (s[1] & 0x3F);
-    case 3:
-        return ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
-    case 4:
-        return ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
-    default:
-        return 0;
-    }
-}
-
-// Unicode XID_Start ranges for identifier start characters (sorted by start)
-// See: Unicode Standard Annex #31, C11/C23 compatible
-static const struct
-{
-    uint32_t start, end;
-} xid_start_ranges[] = {
-    {0x00C0, 0x00FF},   // Latin-1 Supplement
-    {0x0100, 0x017F},   // Latin Extended-A
-    {0x0180, 0x024F},   // Latin Extended-B
-    {0x0250, 0x02AF},   // IPA Extensions
-    {0x0370, 0x03FF},   // Greek and Coptic
-    {0x0400, 0x04FF},   // Cyrillic
-    {0x0500, 0x052F},   // Cyrillic Supplement
-    {0x0530, 0x058F},   // Armenian
-    {0x0590, 0x05FF},   // Hebrew
-    {0x0600, 0x06FF},   // Arabic
-    {0x0750, 0x077F},   // Arabic Supplement
-    {0x0900, 0x097F},   // Devanagari
-    {0x0980, 0x09FF},   // Bengali
-    {0x0A00, 0x0A7F},   // Gurmukhi
-    {0x0A80, 0x0AFF},   // Gujarati
-    {0x0B00, 0x0B7F},   // Oriya
-    {0x0B80, 0x0BFF},   // Tamil
-    {0x0C00, 0x0C7F},   // Telugu
-    {0x0C80, 0x0CFF},   // Kannada
-    {0x0D00, 0x0D7F},   // Malayalam
-    {0x0D80, 0x0DFF},   // Sinhala
-    {0x0E00, 0x0E7F},   // Thai
-    {0x0E80, 0x0EFF},   // Lao
-    {0x0F00, 0x0FFF},   // Tibetan
-    {0x10A0, 0x10FF},   // Georgian
-    {0x1100, 0x11FF},   // Hangul Jamo
-    {0x1200, 0x137F},   // Ethiopian
-    {0x13A0, 0x13FF},   // Cherokee
-    {0x1400, 0x167F},   // Canadian Aboriginal Syllabics
-    {0x1780, 0x17FF},   // Khmer
-    {0x1800, 0x18AF},   // Mongolian
-    {0x1E00, 0x1EFF},   // Latin Extended Additional
-    {0x1F00, 0x1FFF},   // Greek Extended
-    {0x2100, 0x214F},   // Letterlike Symbols
-    {0x3040, 0x309F},   // Hiragana
-    {0x30A0, 0x30FF},   // Katakana
-    {0x3100, 0x312F},   // Bopomofo
-    {0x31A0, 0x31BF},   // Bopomofo Extended
-    {0x31F0, 0x31FF},   // Katakana Phonetic Extensions
-    {0x3400, 0x4DBF},   // CJK Extension A
-    {0x4E00, 0x9FFF},   // CJK Unified
-    {0xAC00, 0xD7AF},   // Hangul Syllables
-    {0xF900, 0xFAFF},   // CJK Compatibility Ideographs
-    {0x1D400, 0x1D7FF}, // Mathematical Alphanumeric Symbols
-    {0x20000, 0x2A6DF}, // CJK Extension B
-    {0x2A700, 0x2B73F}, // CJK Extension C
-    {0x2B740, 0x2B81F}, // CJK Extension D
-    {0x2B820, 0x2CEAF}, // CJK Extension E
-    {0x2CEB0, 0x2EBEF}, // CJK Extension F
-    {0x30000, 0x3134F}, // CJK Extension G
-};
-
-#define XID_START_RANGE_COUNT (sizeof(xid_start_ranges) / sizeof(xid_start_ranges[0]))
-
-// Check if a Unicode codepoint is valid for identifier start (XID_Start + _ + $)
-// Uses binary search over sorted ranges for O(log N) lookup
-static bool is_ident_start_unicode(uint32_t cp)
-{
-    if (cp < 0x80)
-        return isalpha(cp) || cp == '_' || cp == '$';
-
-    // Binary search over XID_Start ranges
-    int lo = 0, hi = XID_START_RANGE_COUNT - 1;
-    while (lo <= hi)
-    {
-        int mid = lo + (hi - lo) / 2;
-        if (cp < xid_start_ranges[mid].start)
-            hi = mid - 1;
-        else if (cp > xid_start_ranges[mid].end)
-            lo = mid + 1;
-        else
-            return true; // cp is within range [start, end]
-    }
-    return false;
-}
-
-// Check if a Unicode codepoint is valid for identifier continuation (XID_Continue)
-static bool is_ident_cont_unicode(uint32_t cp)
-{
-    if (cp < 0x80)
-        return isalnum(cp) || cp == '_' || cp == '$';
-    if (is_ident_start_unicode(cp))
-        return true;
-    // Combining marks, modifiers, and other continuation characters
-    if (cp >= 0x0300 && cp <= 0x036F)
-        return true; // Combining Diacritical Marks
-    if (cp >= 0x1DC0 && cp <= 0x1DFF)
-        return true; // Combining Diacritical Marks Supplement
-    if (cp >= 0x20D0 && cp <= 0x20FF)
-        return true; // Combining Diacritical Marks for Symbols
-    if (cp >= 0xFE20 && cp <= 0xFE2F)
-        return true; // Combining Half Marks
-    // Numeric characters (for continuation only)
-    if (cp >= 0x0660 && cp <= 0x0669)
-        return true; // Arabic-Indic Digits
-    if (cp >= 0x06F0 && cp <= 0x06F9)
-        return true; // Extended Arabic-Indic Digits
-    if (cp >= 0x0966 && cp <= 0x096F)
-        return true; // Devanagari Digits
-    if (cp >= 0x09E6 && cp <= 0x09EF)
-        return true; // Bengali Digits
-    if (cp >= 0x0E50 && cp <= 0x0E59)
-        return true; // Thai Digits
-    if (cp >= 0xFF10 && cp <= 0xFF19)
-        return true; // Fullwidth Digits
-    return false;
-}
+// any non-ASCII byte or UCN that survived preprocessing is a valid identifier.
+static inline bool is_ident_start_ascii(char c) { return isalpha(c) || c == '_' || c == '$'; }
+static inline bool is_ident_cont_ascii(char c) { return isalnum(c) || c == '_' || c == '$'; }
 
 // Read a UCN (Universal Character Name) \uXXXX or \UXXXXXXXX
 // Returns the number of bytes consumed, or 0 if not a valid UCN
@@ -1033,21 +884,24 @@ static int read_ident(char *start)
     uint32_t cp;
     int len;
 
-    // Check for UCN at start
+    // Check for UCN at start (\uXXXX or \UXXXXXXXX)
     len = read_ucn(p, &cp);
     if (len > 0)
     {
-        if (!is_ident_start_unicode(cp))
-            return 0;
+        p += len;
+    }
+    else if ((unsigned char)*p >= 0x80)
+    {
+        // Non-ASCII UTF-8 start byte
+        len = utf8_char_len((unsigned char)*p);
+        if (len == 0) return 0;
         p += len;
     }
     else
     {
-        // Check for UTF-8 or ASCII start
-        cp = decode_utf8(p, &len);
-        if (!is_ident_start_unicode(cp))
+        if (!is_ident_start_ascii(*p))
             return 0;
-        p += len;
+        p++;
     }
 
     // Continue reading identifier characters
@@ -1056,16 +910,21 @@ static int read_ident(char *start)
         len = read_ucn(p, &cp);
         if (len > 0)
         {
-            if (!is_ident_cont_unicode(cp))
-                break;
             p += len;
             continue;
         }
 
-        cp = decode_utf8(p, &len);
-        if (!is_ident_cont_unicode(cp))
+        if ((unsigned char)*p >= 0x80)
+        {
+            len = utf8_char_len((unsigned char)*p);
+            if (len == 0) break;
+            p += len;
+            continue;
+        }
+
+        if (!is_ident_cont_ascii(*p))
             break;
-        p += len;
+        p++;
     }
 
     return p - start;
