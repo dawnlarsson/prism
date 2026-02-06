@@ -2913,8 +2913,9 @@ static char *preprocess_with_cc(const char *input_file)
   const char *cc = ctx->extra_compiler ? ctx->extra_compiler : "cc";
   argv_builder_add(&ab, cc);
   argv_builder_add(&ab, "-E");
+  argv_builder_add(&ab, "-w"); // suppress warnings (linker flags passed through are harmless)
 
-  // Add compiler flags (like -std=c99, -m32)
+  // Add compiler flags
   for (int i = 0; i < ctx->extra_compiler_flags_count; i++)
     argv_builder_add(&ab, ctx->extra_compiler_flags[i]);
 
@@ -4245,62 +4246,23 @@ use_sudo:;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CLI Types
+// CLI
 // ─────────────────────────────────────────────────────────────────────────────
 
-typedef enum
-{
-  CLI_MODE_COMPILE_AND_LINK, // default: prism foo.c → a.out (GCC-compatible)
-  CLI_MODE_COMPILE_ONLY,     // -c: prism -c foo.c -o foo.o
-  CLI_MODE_PASSTHROUGH,      // -E/-S: pass sources directly to CC without transpiling
-  CLI_MODE_RUN,              // run: prism run foo.c (transpile + compile + execute)
-  CLI_MODE_EMIT,             // transpile: prism transpile foo.c (output C)
-  CLI_MODE_INSTALL,          // prism install
-  CLI_MODE_HELP,             // --help / -h
-  CLI_MODE_VERSION,          // --version / -v
-} CliMode;
+typedef enum { CLI_DEFAULT, CLI_RUN, CLI_EMIT, CLI_INSTALL } CliMode;
 
 typedef struct
 {
   CliMode mode;
   PrismFeatures features;
-
-  // Sources
   const char **sources;
-  int source_count;
-  int source_capacity;
-
-  // Output
-  const char *output; // -o target
-
-  // Pass-through to CC
+  int source_count, source_cap;
   const char **cc_args;
-  int cc_arg_count;
-  int cc_arg_capacity;
-
-  // Preprocessor flags (need to feed to prism's preprocessor AND pass to CC)
-  const char **include_paths; // -I paths
-  int include_count;
-  int include_capacity;
-  const char **defines; // -D macros (name or name=value)
-  int define_count;
-  int define_capacity;
-  const char **force_includes; // -include files
-  int force_include_count;
-  int force_include_capacity;
-
-  // Compiler flags that affect macro/include path discovery
-  // (e.g., -std=c99, -m32, -march=x86_64)
-  const char **pp_flags;
-  int pp_flags_count;
-  int pp_flags_capacity;
-
-  // Prism-specific
-  const char *cc; // --prism-cc (default: $PRISM_CC or $CC or "cc")
-  bool verbose;   // --prism-verbose
-
-  // Link-only mode detection
-  bool has_objects; // true if .o, .a, or .so files were provided
+  int cc_arg_count, cc_arg_cap;
+  const char *output;
+  const char *cc;
+  bool verbose;
+  bool compile_only;
 } Cli;
 
 // Get the actual C compiler to use, avoiding infinite recursion if CC=prism
@@ -4317,14 +4279,11 @@ static const char *get_real_cc(const char *cc)
 
   // Advanced check: resolve paths and compare with current executable
   // This prevents infinite recursion if prism is symlinked or copied to another name
-  // Example: ln -s prism my-compiler && CC=./my-compiler ./my-compiler test.c
-  // Or:      cp prism cc && CC=./cc ./cc test.c (hard copy, not symlink)
   char cc_real[PATH_MAX];
   char self_real[PATH_MAX];
   bool got_self_path = false;
 
 #ifdef __linux__
-  // Linux: use /proc/self/exe to get current executable path
   ssize_t self_len = readlink("/proc/self/exe", self_real, sizeof(self_real) - 1);
   if (self_len != -1)
   {
@@ -4332,11 +4291,9 @@ static const char *get_real_cc(const char *cc)
     got_self_path = true;
   }
 #elif defined(__APPLE__)
-  // macOS: use _NSGetExecutablePath
   uint32_t bufsize = sizeof(self_real);
   if (_NSGetExecutablePath(self_real, &bufsize) == 0)
   {
-    // Resolve to canonical path
     char temp[PATH_MAX];
     if (realpath(self_real, temp) != NULL)
     {
@@ -4346,15 +4303,11 @@ static const char *get_real_cc(const char *cc)
     }
   }
 #elif defined(__FreeBSD__)
-  // FreeBSD: use sysctl with KERN_PROC_PATHNAME
   int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
   size_t len = sizeof(self_real);
   if (sysctl(mib, 4, self_real, &len, NULL, 0) == 0)
-  {
     got_self_path = true;
-  }
 #elif defined(__NetBSD__)
-  // NetBSD: use /proc/curproc/exe (if procfs is mounted)
   ssize_t self_len = readlink("/proc/curproc/exe", self_real, sizeof(self_real) - 1);
   if (self_len != -1)
   {
@@ -4362,93 +4315,39 @@ static const char *get_real_cc(const char *cc)
     got_self_path = true;
   }
 #elif defined(__OpenBSD__)
-  // OpenBSD: no reliable way to get executable path
-  // Fall back to simple check only
   (void)self_real;
 #endif
 
   if (!got_self_path)
-  {
-    // Can't determine self path, fall back to simple basename check (already done above)
     return cc;
-  }
 
-  // Resolve the CC path to canonical form
   if (realpath(cc, cc_real) == NULL)
-  {
-    // Can't resolve CC path, assume it's not prism
     return cc;
-  }
 
-  // Compare the resolved paths
   if (strcmp(cc_real, self_real) == 0)
-  {
-    // CC points to prism itself (possibly via symlink or hard copy), use "cc" instead
     return "cc";
-  }
 
   return cc;
 }
 
-// Generic array append for CLI - grows array if needed
-#define CLI_ARRAY_APPEND(cli, arr, cnt, cap, item, init_cap)                \
-  do                                                                        \
-  {                                                                         \
-    if ((cli)->cnt >= (cli)->cap)                                           \
-    {                                                                       \
-      int new_cap = (cli)->cap == 0 ? (init_cap) : (cli)->cap * 2;          \
-      const char **new_arr = realloc((cli)->arr, sizeof(char *) * new_cap); \
-      if (!new_arr)                                                         \
-        die("Out of memory");                                               \
-      (cli)->arr = new_arr;                                                 \
-      (cli)->cap = new_cap;                                                 \
-    }                                                                       \
-    (cli)->arr[(cli)->cnt++] = (item);                                      \
+#define CLI_PUSH(arr, cnt, cap, item)                                    \
+  do                                                                     \
+  {                                                                      \
+    if ((cnt) >= (cap))                                                   \
+    {                                                                    \
+      int nc = (cap) ? (cap) * 2 : 16;                                   \
+      (arr) = realloc((arr), sizeof(*(arr)) * nc);                       \
+      if (!(arr))                                                        \
+        die("Out of memory");                                            \
+      (cap) = nc;                                                        \
+    }                                                                    \
+    (arr)[(cnt)++] = (item);                                             \
   } while (0)
 
-#define cli_add_source(cli, src) CLI_ARRAY_APPEND(cli, sources, source_count, source_capacity, src, 16)
-#define cli_add_include(cli, path) CLI_ARRAY_APPEND(cli, include_paths, include_count, include_capacity, path, 16)
-#define cli_add_define(cli, def) CLI_ARRAY_APPEND(cli, defines, define_count, define_capacity, def, 16)
-#define cli_add_force_include(cli, p) CLI_ARRAY_APPEND(cli, force_includes, force_include_count, force_include_capacity, p, 16)
-#define cli_add_pp_flag(cli, flag) CLI_ARRAY_APPEND(cli, pp_flags, pp_flags_count, pp_flags_capacity, flag, 16)
-#define cli_add_cc_arg(cli, arg) CLI_ARRAY_APPEND(cli, cc_args, cc_arg_count, cc_arg_capacity, arg, 64)
-
-// Check if filename ends with given extension (case-sensitive)
-static inline bool has_extension(const char *filename, const char *ext)
+static inline bool has_ext(const char *f, const char *ext)
 {
-  size_t flen = strlen(filename);
-  size_t elen = strlen(ext);
-  return flen >= elen && !strcmp(filename + flen - elen, ext);
-}
-
-static bool is_assembly_file(const char *arg)
-{
-  return has_extension(arg, ".s") || has_extension(arg, ".S");
-}
-
-static bool is_cpp_file(const char *arg)
-{
-  return has_extension(arg, ".cc") || has_extension(arg, ".cpp") ||
-         has_extension(arg, ".cxx") || has_extension(arg, ".c++") ||
-         has_extension(arg, ".C") || has_extension(arg, ".mm");
-}
-
-static bool is_objc_file(const char *arg)
-{
-  // .m but not .mm (which is C++)
-  return has_extension(arg, ".m") && !has_extension(arg, ".mm");
-}
-
-static bool needs_passthrough(const char *arg)
-{
-  // Files that should not be transpiled
-  return is_assembly_file(arg) || is_cpp_file(arg) || is_objc_file(arg);
-}
-
-static bool is_source_file(const char *arg)
-{
-  return has_extension(arg, ".c") || has_extension(arg, ".i") ||
-         is_assembly_file(arg) || is_cpp_file(arg) || is_objc_file(arg);
+  size_t fl = strlen(f), el = strlen(ext);
+  return fl >= el && !strcmp(f + fl - el, ext);
 }
 
 static bool str_startswith(const char *s, const char *prefix)
@@ -4456,15 +4355,17 @@ static bool str_startswith(const char *s, const char *prefix)
   return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
-// Check if flag needs a separate argument (e.g., -L, -x)
-// Note: -I, -D, -U, -include, -isystem are handled explicitly above
-static bool flag_needs_arg(const char *arg)
+// Check if a string starts with "prism" (possibly with path prefix)
+static bool is_prism_cc(const char *cc)
 {
-  // These flags can be space-separated: -L dir, -l lib, etc.
-  const char *flags[] = {"-L", "-l", "-idirafter", "-iprefix", "-iwithprefix", "-x", NULL};
-  for (int i = 0; flags[i]; i++)
+  if (!cc || !*cc)
+    return false;
+  const char *base = strrchr(cc, '/');
+  base = base ? base + 1 : cc;
+  if (strncmp(base, "prism", 5) == 0)
   {
-    if (!strcmp(arg, flags[i]))
+    char next = base[5];
+    if (next == '\0' || next == ' ' || next == '.')
       return true;
   }
   return false;
@@ -4473,329 +4374,169 @@ static bool flag_needs_arg(const char *arg)
 static void print_help(void)
 {
   printf(
-      "Prism v%s - Robust C transpiler\n\n"
+      "Prism v%s - C transpiler adding defer and zero-init\n\n"
       "Usage: prism [options] source.c... [-o output]\n\n"
-      "GCC-Compatible Options:\n"
-      "  -c                    Compile only, don't link\n"
-      "  -o <file>             Output file\n"
-      "  -O0/-O1/-O2/-O3/-Os   Optimization level (passed to CC)\n"
-      "  -g                    Debug info (passed to CC)\n"
-      "  -W...                 Warnings (passed to CC)\n"
-      "  -I/-D/-U/-L/-l        Include/define/lib flags (passed to CC)\n"
-      "  -std=...              Language standard (passed to CC)\n\n"
-      "Prism Options:\n"
-      "  -fno-defer            Disable defer feature\n"
-      "  -fno-zeroinit         Disable zero-initialization\n"
-      "  -fno-line-directives  Disable #line directives in output\n"
-      "  -fflatten-headers     Flatten included headers into single output file\n"
-      "  -fno-flatten-headers  Disable header flattening\n"
-      "  -fno-safety           Safety checks warn instead of error\n"
-      "  --prism-cc=<compiler> Use specific compiler (default: $CC or cc)\n"
-      "  --prism-verbose       Show transpile and compile commands\n\n"
       "Commands:\n"
-      "  run <src.c>           Transpile, compile, and execute\n"
+      "  run <src.c>           Transpile, compile, and run\n"
       "  transpile <src.c>     Output transpiled C to stdout\n"
-      "  install               Install prism to %s\n"
-      "  --help, -h            Show this help\n"
-      "  --version, -v         Show version\n\n"
-      "Environment:\n"
-      "  CC                    C compiler to use (default: cc)\n"
-      "  PRISM_CC              Override CC for prism specifically\n\n"
+      "  install [src.c...]    Install prism to %s\n\n"
+      "Prism Flags (consumed, not passed to CC):\n"
+      "  -fno-defer            Disable defer\n"
+      "  -fno-zeroinit         Disable zero-initialization\n"
+      "  -fno-line-directives  Disable #line directives\n"
+      "  -fno-safety           Safety checks warn instead of error\n"
+      "  -fflatten-headers     Flatten headers into single output\n"
+      "  -fno-flatten-headers  Disable header flattening\n"
+      "  --prism-cc=<compiler> Use specific compiler\n"
+      "  --prism-verbose       Show commands\n\n"
+      "All other flags are passed through to CC.\n\n"
       "Examples:\n"
-      "  prism foo.c                      Compile to a.out (GCC-compatible)\n"
-      "  prism foo.c -o foo               Compile to 'foo'\n"
-      "  prism run foo.c                  Compile and run immediately\n"
+      "  prism foo.c -o foo               Compile (GCC-compatible)\n"
+      "  prism run foo.c                  Compile and run\n"
       "  prism transpile foo.c            Output transpiled C\n"
-      "  prism transpile foo.c -o out.c   Transpile to file\n"
-      "  prism -c foo.c -o foo.o          Compile to object file\n"
-      "  prism -O2 -Wall foo.c -o foo     With optimization and warnings\n"
+      "  prism -O2 -Wall foo.c -o foo     With optimization\n"
       "  CC=clang prism foo.c             Use clang as backend\n\n"
-      "Note: Windows is not supported at this time.\n\n"
       "Apache 2.0 license (c) Dawn Larsson 2026\n"
       "https://github.com/dawnlarsson/prism\n",
       PRISM_VERSION, INSTALL_PATH);
 }
 
-// Table-driven CLI parsing
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Flags that set CLI mode
-typedef struct
-{
-  const char *flag;
-  const char *alt; // Alternate flag (e.g., -h for --help), NULL if none
-  CliMode mode;
-  bool passthrough; // If true, also pass to CC
-} ModeFlagDef;
-
-static const ModeFlagDef mode_flags[] = {
-    {"run", NULL, CLI_MODE_RUN, false},
-    {"transpile", NULL, CLI_MODE_EMIT, false},
-    {"install", NULL, CLI_MODE_INSTALL, false},
-    {"--help", "-h", CLI_MODE_HELP, false},
-    {"--version", "-v", CLI_MODE_VERSION, false},
-    {"-c", NULL, CLI_MODE_COMPILE_ONLY, false},
-    {"--prism-emit", NULL, CLI_MODE_EMIT, false},
-    {NULL, NULL, 0, false}};
-
-// Passthrough mode flags (set mode + pass to CC)
-static const ModeFlagDef passthrough_mode_flags[] = {
-    {"-E", NULL, CLI_MODE_PASSTHROUGH, true},
-    {"-S", NULL, CLI_MODE_PASSTHROUGH, true},
-    // Compiler probe flags used by libtool/autoconf/configure scripts
-    {"-dumpmachine", NULL, CLI_MODE_PASSTHROUGH, true},
-    {"-dumpversion", NULL, CLI_MODE_PASSTHROUGH, true},
-    {"-dumpfullversion", NULL, CLI_MODE_PASSTHROUGH, true},
-    {"-dumpspecs", NULL, CLI_MODE_PASSTHROUGH, true},
-    {"-print-search-dirs", NULL, CLI_MODE_PASSTHROUGH, true},
-    {"-print-libgcc-file-name", NULL, CLI_MODE_PASSTHROUGH, true},
-    {"-print-multi-lib", NULL, CLI_MODE_PASSTHROUGH, true},
-    {"-print-multi-directory", NULL, CLI_MODE_PASSTHROUGH, true},
-    {"-print-multi-os-directory", NULL, CLI_MODE_PASSTHROUGH, true},
-    {"-print-sysroot", NULL, CLI_MODE_PASSTHROUGH, true},
-    {"-print-sysroot-headers-suffix", NULL, CLI_MODE_PASSTHROUGH, true},
-    {"-print-prog-name=", NULL, CLI_MODE_PASSTHROUGH, true}, // prefix match handled below
-    {"-print-file-name=", NULL, CLI_MODE_PASSTHROUGH, true}, // prefix match handled below
-    {"--help", NULL, CLI_MODE_PASSTHROUGH, true},            // GCC help, not prism help
-    {"--target-help", NULL, CLI_MODE_PASSTHROUGH, true},
-    {"-###", NULL, CLI_MODE_PASSTHROUGH, true}, // show commands without executing
-    {NULL, NULL, 0, false}};
-
-// Feature flags that toggle booleans
-typedef struct
-{
-  const char *flag;
-  size_t offset; // offsetof(PrismFeatures, field)
-  bool value;    // Value to set when flag is matched
-} FeatureFlagDef;
-
-#define FEATURE_FLAG(name, field, val) {name, offsetof(PrismFeatures, field), val}
-
-static const FeatureFlagDef feature_flags[] = {
-    FEATURE_FLAG("-fno-defer", defer, false),
-    FEATURE_FLAG("-fno-zeroinit", zeroinit, false),
-    FEATURE_FLAG("-fno-line-directives", line_directives, false),
-    FEATURE_FLAG("-fno-safety", warn_safety, true),
-    FEATURE_FLAG("-fflatten-headers", flatten_headers, true),
-    FEATURE_FLAG("-fno-flatten-headers", flatten_headers, false),
-    {NULL, 0, false}};
-
-// Prefixes that should also be passed to preprocessor
-static const char *pp_prefixes[] = {
-    "-std=", "-m", "--target=", "-f", "-O", "-g", NULL};
-
-static const char *pp_exact_flags[] = {
-    "-pthread", "-pthreads", "-mthreads", "-mt", "--thread-safe",
-    "-pedantic", "-pedantic-errors", "-ansi", "-traditional",
-    "-traditional-cpp", "-nostdinc", "-nostdinc++", "-undef", "-trigraphs",
-    NULL};
-
-static bool should_pass_to_pp(const char *arg)
-{
-  for (const char **p = pp_prefixes; *p; p++)
-    if (strncmp(arg, *p, strlen(*p)) == 0)
-      return true;
-  for (const char **p = pp_exact_flags; *p; p++)
-    if (strcmp(arg, *p) == 0)
-      return true;
-  return false;
-}
-
-// Helper to check if a string starts with "prism" (possibly with path prefix)
-// Used to detect when CC=prism or CC="prism " to avoid infinite recursion
-static bool is_prism_cc(const char *cc)
-{
-  if (!cc || !*cc)
-    return false;
-
-  // Get basename (skip path)
-  const char *base = strrchr(cc, '/');
-  base = base ? base + 1 : cc;
-
-  // Compare just the "prism" part (ignore trailing space or args like "prism -std=c11")
-  // We need to match: "prism", "prism ", "prism -std=gnu11", "prism.exe", etc.
-  if (strncmp(base, "prism", 5) == 0)
-  {
-    char next = base[5];
-    // Valid if: end of string, space, dot (for .exe), or other delimiter
-    if (next == '\0' || next == ' ' || next == '.')
-      return true;
-  }
-  return false;
-}
-
 static Cli cli_parse(int argc, char **argv)
 {
-  Cli cli = {
-      .mode = CLI_MODE_COMPILE_AND_LINK,
-      .features = prism_defaults(),
-  };
+  Cli cli = {.features = prism_defaults()};
 
-  // Get compiler from environment
-  // Note: We check PRISM_CC first, then CC. If CC=prism or CC="prism -flag",
-  // we ignore it to avoid infinite recursion.
+  // Get compiler from environment (avoid infinite recursion if CC=prism)
   char *env_cc = getenv("PRISM_CC");
   if (!env_cc || !*env_cc || is_prism_cc(env_cc))
   {
     env_cc = getenv("CC");
-    // If CC is set to "prism" or contains prism as the command, ignore it
     if (is_prism_cc(env_cc))
       env_cc = NULL;
   }
-  if (!env_cc || !*env_cc)
-    env_cc = NULL;
-  cli.cc = env_cc ? env_cc : "cc";
+  cli.cc = (env_cc && *env_cc) ? env_cc : "cc";
+
+  // Pre-scan for -E (passthrough mode — sources go directly to CC)
+  bool passthrough = false;
+  for (int i = 1; i < argc; i++)
+    if (!strcmp(argv[i], "-E"))
+    {
+      passthrough = true;
+      break;
+    }
 
   for (int i = 1; i < argc; i++)
   {
-    char *arg = argv[i];
-    bool handled = false;
+    char *a = argv[i];
 
-    // ─── Mode flags (table-driven) ───
-    for (const ModeFlagDef *f = mode_flags; f->flag; f++)
+    // Prism commands
+    if (!strcmp(a, "run"))
     {
-      if (!strcmp(arg, f->flag) || (f->alt && !strcmp(arg, f->alt)))
-      {
-        cli.mode = f->mode;
-        handled = true;
-        break;
-      }
-    }
-    if (handled)
+      cli.mode = CLI_RUN;
       continue;
+    }
+    if (!strcmp(a, "transpile"))
+    {
+      cli.mode = CLI_EMIT;
+      continue;
+    }
+    if (!strcmp(a, "install"))
+    {
+      cli.mode = CLI_INSTALL;
+      continue;
+    }
 
-    // ─── Passthrough mode flags (table-driven) ───
-    for (const ModeFlagDef *f = passthrough_mode_flags; f->flag; f++)
+    // Help / version (print and exit)
+    if (!strcmp(a, "-h") || !strcmp(a, "--help"))
     {
-      // Check for exact match or prefix match (for flags ending with =)
-      size_t flen = strlen(f->flag);
-      bool is_prefix = flen > 0 && f->flag[flen - 1] == '=';
-      bool matches = is_prefix ? strncmp(arg, f->flag, flen) == 0
-                               : strcmp(arg, f->flag) == 0;
-      if (matches)
-      {
-        cli.mode = f->mode;
-        cli_add_cc_arg(&cli, arg);
-        handled = true;
-        break;
-      }
+      print_help();
+      exit(0);
     }
-    if (handled)
-      continue;
+    if (!strcmp(a, "--version"))
+    {
+      printf("prism %s\n", PRISM_VERSION);
+      exit(0);
+    }
 
-    // ─── Feature flags (table-driven) ───
-    for (const FeatureFlagDef *f = feature_flags; f->flag; f++)
+    // Prism feature flags (consume, don't pass to CC)
+    if (!strcmp(a, "-fno-defer"))
     {
-      if (!strcmp(arg, f->flag))
-      {
-        *(bool *)((char *)&cli.features + f->offset) = f->value;
-        handled = true;
-        break;
-      }
-    }
-    if (handled)
+      cli.features.defer = false;
       continue;
+    }
+    if (!strcmp(a, "-fno-zeroinit"))
+    {
+      cli.features.zeroinit = false;
+      continue;
+    }
+    if (!strcmp(a, "-fno-line-directives"))
+    {
+      cli.features.line_directives = false;
+      continue;
+    }
+    if (!strcmp(a, "-fno-safety"))
+    {
+      cli.features.warn_safety = true;
+      continue;
+    }
+    if (!strcmp(a, "-fflatten-headers"))
+    {
+      cli.features.flatten_headers = true;
+      continue;
+    }
+    if (!strcmp(a, "-fno-flatten-headers"))
+    {
+      cli.features.flatten_headers = false;
+      continue;
+    }
 
-    // ─── Prism-specific options with arguments ───
-    if (str_startswith(arg, "--prism-emit="))
+    // Prism options
+    if (str_startswith(a, "--prism-cc="))
     {
-      cli.mode = CLI_MODE_EMIT;
-      cli.output = arg + 13;
+      cli.cc = a + 11;
       continue;
     }
-    if (str_startswith(arg, "--prism-cc="))
-    {
-      cli.cc = arg + 11;
-      continue;
-    }
-    if (!strcmp(arg, "--prism-verbose"))
+    if (!strcmp(a, "--prism-verbose"))
     {
       cli.verbose = true;
       continue;
     }
-
-    // ─── GCC-compatible: output ───
-    if (!strcmp(arg, "-o"))
+    if (str_startswith(a, "--prism-emit="))
     {
-      if (i + 1 < argc)
-        cli.output = argv[++i];
+      cli.mode = CLI_EMIT;
+      cli.output = a + 13;
       continue;
     }
-    if (str_startswith(arg, "-o"))
+    if (!strcmp(a, "--prism-emit"))
     {
-      cli.output = arg + 2;
-      continue;
-    }
-
-    // ─── GCC-compatible: -I/-D/-U/-isystem/-include (table-driven) ───
-    {
-      // Flags that register a value with a handler and forward to CC
-      // Supports both space-separated (-I dir) and joined (-Idir) forms
-      typedef enum { REG_INCLUDE, REG_DEFINE, REG_PP, REG_FORCE_INCLUDE } RegKind;
-      static const struct { const char *flag; int len; RegKind kind; } reg_flags[] = {
-        {"-I",       2, REG_INCLUDE},
-        {"-D",       2, REG_DEFINE},
-        {"-U",       2, REG_PP},
-        {"-isystem", 8, REG_INCLUDE},
-        {"-include", 8, REG_FORCE_INCLUDE},
-      };
-      bool reg_handled = false;
-      for (int r = 0; r < (int)(sizeof(reg_flags) / sizeof(reg_flags[0])); r++)
-      {
-        int flen = reg_flags[r].len;
-        if (strncmp(arg, reg_flags[r].flag, flen) != 0)
-          continue;
-        const char *val = arg[flen] ? arg + flen : (i + 1 < argc ? argv[++i] : NULL);
-        if (!val) { reg_handled = true; break; }
-        bool joined = (arg[flen] != '\0');
-        switch (reg_flags[r].kind)
-        {
-          case REG_INCLUDE:       cli_add_include(&cli, val); break;
-          case REG_DEFINE:        cli_add_define(&cli, val); break;
-          case REG_FORCE_INCLUDE: cli_add_force_include(&cli, val); break;
-          case REG_PP:
-            cli_add_pp_flag(&cli, arg);
-            if (!joined) cli_add_pp_flag(&cli, val);
-            break;
-        }
-        if (joined) { cli_add_cc_arg(&cli, arg); }
-        else { cli_add_cc_arg(&cli, reg_flags[r].flag); cli_add_cc_arg(&cli, val); }
-        reg_handled = true;
-        break;
-      }
-      if (reg_handled) continue;
-    }
-
-    // ─── Source files ───
-    if (arg[0] != '-' && is_source_file(arg))
-    {
-      cli_add_source(&cli, arg);
+      cli.mode = CLI_EMIT;
       continue;
     }
 
-    // ─── Object files and libraries (pass through) ───
-    if (arg[0] != '-')
+    // Output (intercept — we add -o ourselves later)
+    if (!strcmp(a, "-o") && i + 1 < argc)
     {
-      size_t len = strlen(arg);
-      if ((len >= 2 && !strcmp(arg + len - 2, ".o")) ||
-          (len >= 2 && !strcmp(arg + len - 2, ".a")) ||
-          (len >= 3 && !strcmp(arg + len - 3, ".so")) ||
-          (len > 3 && strstr(arg, ".so.") != NULL))
-      {
-        cli.has_objects = true;
-      }
-      cli_add_cc_arg(&cli, arg);
+      cli.output = argv[++i];
+      continue;
+    }
+    if (a[0] == '-' && a[1] == 'o' && a[2])
+    {
+      cli.output = a + 2;
       continue;
     }
 
-    // ─── Everything else: pass through to CC ───
-    if (should_pass_to_pp(arg))
-      cli_add_pp_flag(&cli, arg);
-    cli_add_cc_arg(&cli, arg);
+    // Track -c (also passes through to CC below)
+    if (!strcmp(a, "-c"))
+      cli.compile_only = true;
 
-    // Handle space-separated args like -L dir, -x lang
-    if (flag_needs_arg(arg) && i + 1 < argc && argv[i + 1][0] != '-')
-      cli_add_cc_arg(&cli, argv[++i]);
+    // Source files (.c/.i) — transpile unless -E passthrough
+    if (a[0] != '-' && (has_ext(a, ".c") || has_ext(a, ".i")) && !passthrough)
+    {
+      CLI_PUSH(cli.sources, cli.source_count, cli.source_cap, a);
+      continue;
+    }
+
+    // Everything else: pass through to CC
+    CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
   }
 
   return cli;
@@ -4805,10 +4546,6 @@ static void cli_free(Cli *cli)
 {
   free(cli->sources);
   free(cli->cc_args);
-  free(cli->include_paths);
-  free(cli->defines);
-  free(cli->force_includes);
-  free(cli->pp_flags);
 }
 
 static char *create_temp_file(const char *source, char *buf, size_t bufsize)
@@ -4879,86 +4616,26 @@ int main(int argc, char **argv)
 
   Cli cli = cli_parse(argc, argv);
 
-  // Set feature flags from CLI
+  // Configure context from CLI
   ctx->feature_defer = cli.features.defer;
   ctx->feature_zeroinit = cli.features.zeroinit;
   ctx->feature_warn_safety = cli.features.warn_safety;
-
-  // Set preprocessor configuration from CLI
-  // Use get_real_cc() to avoid infinite recursion if CC=prism
   ctx->extra_compiler = get_real_cc(cli.cc);
-  ctx->extra_compiler_flags = cli.pp_flags;
-  ctx->extra_compiler_flags_count = cli.pp_flags_count;
-  ctx->extra_include_paths = cli.include_paths;
-  ctx->extra_include_count = cli.include_count;
-  ctx->extra_defines = cli.defines;
-  ctx->extra_define_count = cli.define_count;
-  ctx->extra_force_includes = cli.force_includes;
-  ctx->extra_force_include_count = cli.force_include_count;
   ctx->emit_line_directives = cli.features.line_directives;
   ctx->feature_flatten_headers = cli.features.flatten_headers;
+  // Pass all CC args to preprocessor — cc -E ignores flags it doesn't need
+  ctx->extra_compiler_flags = cli.cc_args;
+  ctx->extra_compiler_flags_count = cli.cc_arg_count;
 
-  // Handle special modes
-  switch (cli.mode)
+  // ─── Install ───
+  if (cli.mode == CLI_INSTALL)
   {
-  case CLI_MODE_HELP:
-    print_help();
-    cli_free(&cli);
-    return 0;
-
-  case CLI_MODE_VERSION:
-    // If -v was used with source files or other args, pass through to compiler
-    // Only show prism version when -v/--version is used alone
-    if (cli.source_count > 0 || cli.cc_arg_count > 0 || cli.has_objects)
-    {
-      // Pass -v through to compiler
-      const char *compiler = get_real_cc(cli.cc);
-
-      ArgvBuilder ab;
-      argv_builder_init(&ab);
-      argv_builder_add(&ab, compiler);
-      argv_builder_add(&ab, "-v");
-
-      for (int i = 0; i < cli.cc_arg_count; i++)
-        argv_builder_add(&ab, cli.cc_args[i]);
-
-      for (int i = 0; i < cli.source_count; i++)
-        argv_builder_add(&ab, cli.sources[i]);
-
-      if (cli.output)
-      {
-        argv_builder_add(&ab, "-o");
-        argv_builder_add(&ab, cli.output);
-      }
-
-      char **pass_argv = argv_builder_finish(&ab);
-
-      if (cli.verbose)
-      {
-        fprintf(stderr, "[prism] Passthrough -v: ");
-        for (int i = 0; pass_argv[i]; i++)
-          fprintf(stderr, "%s ", pass_argv[i]);
-        fprintf(stderr, "\n");
-      }
-
-      int status = run_command(pass_argv);
-      free_argv(pass_argv);
-      cli_free(&cli);
-      return status;
-    }
-    printf("prism %s\n", PRISM_VERSION);
-    cli_free(&cli);
-    return 0;
-
-  case CLI_MODE_INSTALL:
-    // If source files provided, compile them first to produce the binary to install
     if (cli.source_count > 0)
     {
-      // Compile sources to a temp binary, then install that
+      // Install from source: transpile, compile, then install the binary
       char temp_bin[PATH_MAX];
       snprintf(temp_bin, sizeof(temp_bin), "%sprism_install_%d", get_tmp_dir(), getpid());
 
-      // Build compile command
       const char *cc = get_real_cc(cli.cc ? cli.cc : getenv("PRISM_CC"));
       if (!cc || (strcmp(cc, "cc") == 0 && !cli.cc))
       {
@@ -4969,7 +4646,6 @@ int main(int argc, char **argv)
       if (!cc)
         cc = "cc";
 
-      // Transpile and compile each source
       char **temp_files = malloc(cli.source_count * sizeof(char *));
       if (!temp_files)
         die("Memory allocation failed");
@@ -5008,27 +4684,27 @@ int main(int argc, char **argv)
         prism_free(&result);
       }
 
-      // Build argv for compiler: cc -O2 temp1.c temp2.c ... -o temp_bin
-      int argc_max = 4 + cli.source_count + cli.cc_arg_count;
-      char **argv_cc = malloc((argc_max + 1) * sizeof(char *));
+      // Build compile command: cc -O2 temp1.c temp2.c ... [cc_args] -o temp_bin
+      int amax = 4 + cli.source_count + cli.cc_arg_count;
+      char **argv_cc = malloc((amax + 1) * sizeof(char *));
       if (!argv_cc)
         die("Memory allocation failed");
 
-      int argc_cc = 0;
-      argv_cc[argc_cc++] = (char *)cc;
-      argv_cc[argc_cc++] = "-O2";
+      int ac = 0;
+      argv_cc[ac++] = (char *)cc;
+      argv_cc[ac++] = "-O2";
       for (int i = 0; i < cli.source_count; i++)
-        argv_cc[argc_cc++] = temp_files[i];
+        argv_cc[ac++] = temp_files[i];
       for (int i = 0; i < cli.cc_arg_count; i++)
-        argv_cc[argc_cc++] = (char *)cli.cc_args[i];
-      argv_cc[argc_cc++] = "-o";
-      argv_cc[argc_cc++] = temp_bin;
-      argv_cc[argc_cc] = NULL;
+        argv_cc[ac++] = (char *)cli.cc_args[i];
+      argv_cc[ac++] = "-o";
+      argv_cc[ac++] = temp_bin;
+      argv_cc[ac] = NULL;
 
       if (cli.verbose)
       {
         fprintf(stderr, "[prism] Compiling:");
-        for (int i = 0; i < argc_cc; i++)
+        for (int i = 0; i < ac; i++)
           fprintf(stderr, " %s", argv_cc[i]);
         fprintf(stderr, "\n");
       }
@@ -5036,7 +4712,6 @@ int main(int argc, char **argv)
       int status = run_command(argv_cc);
       free(argv_cc);
 
-      // Clean up temp source files
       for (int i = 0; i < cli.source_count; i++)
       {
         remove(temp_files[i]);
@@ -5050,47 +4725,41 @@ int main(int argc, char **argv)
         return 1;
       }
 
-      // Install the compiled binary
       int result = install(temp_bin);
       remove(temp_bin);
       cli_free(&cli);
       return result;
     }
+
     cli_free(&cli);
     return install(argv[0]);
+  }
 
-  case CLI_MODE_EMIT:
+  // ─── Transpile (emit) ───
+  if (cli.mode == CLI_EMIT)
   {
     if (cli.source_count == 0)
       die("No source files specified");
-
     for (int i = 0; i < cli.source_count; i++)
     {
-      const char *source = cli.sources[i];
-
       if (cli.output)
       {
-        // Transpile to file
         if (cli.verbose)
-          fprintf(stderr, "[prism] %s -> %s\n", source, cli.output);
-        if (!transpile((char *)source, (char *)cli.output))
+          fprintf(stderr, "[prism] %s -> %s\n", cli.sources[i], cli.output);
+        if (!transpile((char *)cli.sources[i], (char *)cli.output))
           die("Transpilation failed");
       }
       else
       {
-        // Transpile to stdout - use /dev/stdout to avoid temp file I/O
 #ifdef _WIN32
-        // Windows: fall back to temp file
         char temp[PATH_MAX];
-        if (!create_temp_file(source, temp, sizeof(temp)))
+        if (!create_temp_file(cli.sources[i], temp, sizeof(temp)))
           die("Failed to create temp file");
-
-        if (!transpile((char *)source, temp))
+        if (!transpile((char *)cli.sources[i], temp))
         {
           remove(temp);
           die("Transpilation failed");
         }
-
         FILE *f = fopen(temp, "r");
         if (f)
         {
@@ -5101,8 +4770,7 @@ int main(int argc, char **argv)
         }
         remove(temp);
 #else
-        // Unix: write directly to /dev/stdout
-        if (!transpile((char *)source, "/dev/stdout"))
+        if (!transpile((char *)cli.sources[i], "/dev/stdout"))
           die("Transpilation failed");
 #endif
       }
@@ -5111,186 +4779,53 @@ int main(int argc, char **argv)
     return 0;
   }
 
-  case CLI_MODE_PASSTHROUGH:
-  {
-    // Pass sources directly to compiler without transpiling (-E, -S modes)
-    const char *compiler = get_real_cc(cli.cc);
-
-    ArgvBuilder ab;
-    argv_builder_init(&ab);
-    argv_builder_add(&ab, compiler);
-
-    // Add all CC args (includes -E or -S flag)
-    for (int i = 0; i < cli.cc_arg_count; i++)
-      argv_builder_add(&ab, cli.cc_args[i]);
-
-    // Add source files directly (no transpiling)
-    for (int i = 0; i < cli.source_count; i++)
-      argv_builder_add(&ab, cli.sources[i]);
-
-    if (cli.output)
-    {
-      argv_builder_add(&ab, "-o");
-      argv_builder_add(&ab, cli.output);
-    }
-
-    char **pass_argv = argv_builder_finish(&ab);
-
-    if (cli.verbose)
-    {
-      fprintf(stderr, "[prism] Passthrough: ");
-      for (int i = 0; pass_argv[i]; i++)
-        fprintf(stderr, "%s ", pass_argv[i]);
-      fprintf(stderr, "\n");
-    }
-
-    int status = run_command(pass_argv);
-    free_argv(pass_argv);
-    cli_free(&cli);
-    return status;
-  }
-
-  case CLI_MODE_COMPILE_ONLY:
-  case CLI_MODE_COMPILE_AND_LINK:
-  case CLI_MODE_RUN:
-    break; // Continue below
-  }
-
-  // Link-only mode: if no sources but has object files, pass through to compiler
-  if (cli.source_count == 0 && cli.has_objects && cli.mode != CLI_MODE_RUN)
-  {
-    const char *compiler = get_real_cc(cli.cc);
-
-    ArgvBuilder ab;
-    argv_builder_init(&ab);
-    argv_builder_add(&ab, compiler);
-
-    for (int i = 0; i < cli.cc_arg_count; i++)
-      argv_builder_add(&ab, cli.cc_args[i]);
-
-    if (cli.output)
-    {
-      argv_builder_add(&ab, "-o");
-      argv_builder_add(&ab, cli.output);
-    }
-
-    char **link_argv = argv_builder_finish(&ab);
-
-    if (cli.verbose)
-    {
-      fprintf(stderr, "[prism] Link-only: ");
-      for (int i = 0; link_argv[i]; i++)
-        fprintf(stderr, "%s ", link_argv[i]);
-      fprintf(stderr, "\n");
-    }
-
-    int status = run_command(link_argv);
-    free_argv(link_argv);
-    cli_free(&cli);
-    return status;
-  }
-
-  // Need at least one source
+  // ─── No sources: passthrough to CC (link-only, probes, -v, etc.) ───
   if (cli.source_count == 0)
-    die("No source files specified");
-
-  // Check if we have any C++/Objective-C files
-  bool has_cpp_files = false;
-  bool has_objc_files = false;
-  for (int i = 0; i < cli.source_count; i++)
   {
-    if (is_cpp_file(cli.sources[i]))
-      has_cpp_files = true;
-    if (is_objc_file(cli.sources[i]))
-      has_objc_files = true;
+    const char *compiler = get_real_cc(cli.cc);
+    ArgvBuilder ab;
+    argv_builder_init(&ab);
+    argv_builder_add(&ab, compiler);
+    for (int i = 0; i < cli.cc_arg_count; i++)
+      argv_builder_add(&ab, cli.cc_args[i]);
+    if (cli.output)
+    {
+      argv_builder_add(&ab, "-o");
+      argv_builder_add(&ab, cli.output);
+    }
+    char **pass = argv_builder_finish(&ab);
+    if (cli.verbose)
+    {
+      fprintf(stderr, "[prism] ");
+      for (int i = 0; pass[i]; i++)
+        fprintf(stderr, "%s ", pass[i]);
+      fprintf(stderr, "\n");
+    }
+    int st = run_command(pass);
+    free_argv(pass);
+    cli_free(&cli);
+    return st;
   }
 
-  // Determine compiler
-  const char *compiler = get_real_cc(cli.cc);
-
-  // Switch to C++/Objective-C compiler if needed
-  if (has_cpp_files || has_objc_files)
-  {
-    // Map C compiler to C++ compiler
-    // Use precise matching to avoid false positives (e.g., "tcc" contains "cc" but isn't gcc)
-    int clen = strlen(compiler);
-    bool is_gcc_family = (clen >= 3 && strcmp(compiler + clen - 3, "gcc") == 0) ||
-                         (strcmp(compiler, "cc") == 0) ||
-                         (clen >= 3 && strcmp(compiler + clen - 3, "/cc") == 0);
-    bool is_clang_family = strstr(compiler, "clang") != NULL;
-
-    if (is_gcc_family)
-    {
-      compiler = has_cpp_files ? "g++" : "gcc";
-    }
-    else if (is_clang_family)
-    {
-      compiler = has_cpp_files ? "clang++" : "clang";
-    }
-    else if (has_cpp_files)
-    {
-      // Unknown compiler with C++ files - warn and continue with user's choice
-      fprintf(stderr, "[prism] Warning: C++ files detected but compiler '%s' is not recognized.\n"
-                      "         Prism cannot automatically switch to C++ mode for this compiler.\n"
-                      "         Please specify a C++ compiler explicitly if compilation fails.\n",
-              compiler);
-    }
-
-    if (cli.verbose && (is_gcc_family || is_clang_family))
-    {
-      fprintf(stderr, "[prism] Detected %s files, switching to %s\n",
-              has_cpp_files ? "C++" : "Objective-C", compiler);
-    }
-  }
-
-  // Transpile all sources to temp files (skip assembly files - pass through directly)
-  // Note: source_count is guaranteed > 0 here (checked above), cast suppresses warning
+  // ─── Transpile sources to temp files ───
   char **temp_files = calloc((unsigned)cli.source_count, sizeof(char *));
   if (!temp_files)
     die("Out of memory");
 
   for (int i = 0; i < cli.source_count; i++)
   {
-    // Assembly, C++, and Objective-C files don't need transpilation - pass through directly
-    if (needs_passthrough(cli.sources[i]))
-    {
-      temp_files[i] = strdup(cli.sources[i]);
-      if (!temp_files[i])
-        die("Out of memory");
-      if (cli.verbose)
-      {
-        const char *type = is_assembly_file(cli.sources[i]) ? "assembly" : is_cpp_file(cli.sources[i]) ? "C++"
-                                                                                                       : "Objective-C";
-        fprintf(stderr, "[prism] Passing through %s file: %s\n", type, cli.sources[i]);
-      }
-      continue;
-    }
-
     temp_files[i] = malloc(512);
     if (!temp_files[i])
       die("Out of memory");
-
     if (!create_temp_file(cli.sources[i], temp_files[i], 512))
-    {
-      for (int j = 0; j < i; j++)
-      {
-        if (!needs_passthrough(cli.sources[j]))
-          remove(temp_files[j]);
-        free(temp_files[j]);
-      }
-      free(temp_files);
       die("Failed to create temp file");
-    }
-
     if (cli.verbose)
       fprintf(stderr, "[prism] Transpiling %s -> %s\n", cli.sources[i], temp_files[i]);
-
     if (!transpile((char *)cli.sources[i], temp_files[i]))
     {
       for (int j = 0; j <= i; j++)
       {
-        if (!needs_passthrough(cli.sources[j]))
-          remove(temp_files[j]);
+        remove(temp_files[j]);
         free(temp_files[j]);
       }
       free(temp_files);
@@ -5300,7 +4835,7 @@ int main(int argc, char **argv)
 
   // For RUN mode, compile to temp executable
   char temp_exe[PATH_MAX] = {0};
-  if (cli.mode == CLI_MODE_RUN)
+  if (cli.mode == CLI_RUN)
   {
     snprintf(temp_exe, sizeof(temp_exe), "%sprism_run.XXXXXX", get_tmp_dir());
 #if defined(_WIN32)
@@ -5313,23 +4848,18 @@ int main(int argc, char **argv)
 #endif
   }
 
-  // Build compiler command
+  // Build compile command
+  const char *compiler = get_real_cc(cli.cc);
   ArgvBuilder ab;
   argv_builder_init(&ab);
-
   argv_builder_add(&ab, compiler);
 
-  // Add transpiled sources
   for (int i = 0; i < cli.source_count; i++)
     argv_builder_add(&ab, temp_files[i]);
-
-  // Add pass-through args
   for (int i = 0; i < cli.cc_arg_count; i++)
     argv_builder_add(&ab, cli.cc_args[i]);
 
-  // Suppress warnings from inlined system headers and preprocessed code
-  // These come from system headers expanded during preprocessing, or intentional
-  // fallthrough patterns in external code (binutils, coreutils, etc.)
+  // Suppress warnings from preprocessed/inlined system headers
   argv_builder_add(&ab, "-Wno-type-limits");          // wchar.h unsigned >= 0
   argv_builder_add(&ab, "-Wno-cast-align");           // SSE/AVX intrinsics
   argv_builder_add(&ab, "-Wno-logical-op");           // errno EAGAIN==EWOULDBLOCK
@@ -5339,12 +4869,7 @@ int main(int argc, char **argv)
   argv_builder_add(&ab, "-Wno-unused-parameter");     // system function params
   argv_builder_add(&ab, "-Wno-maybe-uninitialized");  // false positives in preprocessed code
 
-  // Add -c for compile-only mode
-  if (cli.mode == CLI_MODE_COMPILE_ONLY)
-    argv_builder_add(&ab, "-c");
-
-  // Add output
-  if (cli.mode == CLI_MODE_RUN)
+  if (cli.mode == CLI_RUN)
   {
     argv_builder_add(&ab, "-o");
     argv_builder_add(&ab, temp_exe);
@@ -5354,30 +4879,21 @@ int main(int argc, char **argv)
     argv_builder_add(&ab, "-o");
     argv_builder_add(&ab, cli.output);
   }
-  else if (cli.mode == CLI_MODE_COMPILE_ONLY && cli.source_count == 1)
+  else if (cli.compile_only && cli.source_count == 1)
   {
     // GCC-compatible: -c foo.c produces foo.o
-    static char default_obj[PATH_MAX];
-    const char *src = cli.sources[0];
-    const char *base = strrchr(src, '/');
-    base = base ? base + 1 : src;
-    snprintf(default_obj, sizeof(default_obj), "%s", base);
-    char *dot = strrchr(default_obj, '.');
+    static char defobj[PATH_MAX];
+    const char *base = strrchr(cli.sources[0], '/');
+    base = base ? base + 1 : cli.sources[0];
+    snprintf(defobj, sizeof(defobj), "%s", base);
+    char *dot = strrchr(defobj, '.');
     if (dot)
       strcpy(dot, ".o");
-    else
-    {
-      size_t len = strlen(default_obj);
-      if (len + 2 < sizeof(default_obj))
-        memcpy(default_obj + len, ".o", 3);
-    }
     argv_builder_add(&ab, "-o");
-    argv_builder_add(&ab, default_obj);
+    argv_builder_add(&ab, defobj);
   }
-  // GCC-compatible: no -o means output to a.out (handled by CC)
 
   char **compile_argv = argv_builder_finish(&ab);
-
   if (cli.verbose)
   {
     fprintf(stderr, "[prism] ");
@@ -5389,31 +4905,30 @@ int main(int argc, char **argv)
   int status = run_command(compile_argv);
   free_argv(compile_argv);
 
-  // Cleanup temp source files (but not assembly files - those are originals)
+  // Cleanup temp source files
   for (int i = 0; i < cli.source_count; i++)
   {
-    if (!needs_passthrough(cli.sources[i]))
-      remove(temp_files[i]);
+    remove(temp_files[i]);
     free(temp_files[i]);
   }
   free(temp_files);
 
   if (status != 0)
   {
-    if (cli.mode == CLI_MODE_RUN && temp_exe[0])
+    if (cli.mode == CLI_RUN && temp_exe[0])
       remove(temp_exe);
     cli_free(&cli);
     return status;
   }
 
   // RUN mode: execute the compiled binary
-  if (cli.mode == CLI_MODE_RUN)
+  if (cli.mode == CLI_RUN)
   {
-    char **run_argv = build_argv(temp_exe, NULL);
+    char **run = build_argv(temp_exe, NULL);
     if (cli.verbose)
       fprintf(stderr, "[prism] Running %s\n", temp_exe);
-    status = run_command(run_argv);
-    free_argv(run_argv);
+    status = run_command(run);
+    free_argv(run);
     remove(temp_exe);
   }
 
