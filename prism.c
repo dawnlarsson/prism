@@ -140,6 +140,22 @@ static const char *get_tmp_dir(void)
 
 static Token *skip_balanced(Token *tok, char *open, char *close);
 
+// Forward declaration: Type specifier parsing result
+typedef struct
+{
+  Token *end;        // First token after the type specifier
+  bool saw_type;     // True if a type was recognized
+  bool is_struct;    // True if struct/union/enum type
+  bool is_typedef;   // True if user-defined typedef
+  bool is_vla;       // True if VLA typedef or struct with VLA member
+  bool has_typeof;   // True if typeof/typeof_unqual (cannot determine VLA at transpile-time)
+  bool has_atomic;   // True if _Atomic qualifier/specifier present
+  bool has_register; // True if register storage class
+  bool has_volatile; // True if volatile qualifier
+  Token *struct_vla_error_tok; // Non-NULL if struct body has true VLA (caller should error)
+} TypeSpecResult;
+static TypeSpecResult parse_type_specifier(Token *tok);
+
 // Check if token is identifier-like (TK_IDENT or TK_KEYWORD like 'raw'/'defer')
 static inline bool is_identifier_like(Token *tok)
 {
@@ -1428,9 +1444,8 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
       Token *t = tok;
 
       // Check for 'raw' keyword - if present, skip checking this declaration
-      // The 'raw' keyword explicitly opts out of zero-init, so jumping over it is allowed
       bool has_raw = false;
-      if (equal(t, "raw"))
+      if (equal(t, "raw") && !is_known_typedef(t))
       {
         has_raw = true;
         t = t->next;
@@ -1439,57 +1454,20 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
       // Skip extern/typedef - these don't create initialized variables
       if (!equal(t, "extern") && !equal(t, "typedef"))
       {
-        // Skip qualifiers
-        while (t && (equal(t, "const") || equal(t, "volatile") || equal(t, "static") ||
-                     equal(t, "auto") || equal(t, "register") || equal(t, "_Atomic") ||
-                     equal(t, "restrict") || equal(t, "__restrict") || equal(t, "__restrict__")))
-          t = t->next;
-
-        // Check for type keyword
-        if (t && (equal(t, "int") || equal(t, "char") || equal(t, "short") ||
-                  equal(t, "long") || equal(t, "float") || equal(t, "double") ||
-                  equal(t, "void") || equal(t, "signed") || equal(t, "unsigned") ||
-                  equal(t, "_Bool") || equal(t, "bool") ||
-                  equal(t, "struct") || equal(t, "union") || equal(t, "enum") ||
-                  is_known_typedef(t)))
+        // Use unified type parser to detect and skip the type
+        TypeSpecResult type = parse_type_specifier(t);
+        if (type.saw_type)
         {
-          // Skip past the type
-          if (equal(t, "struct") || equal(t, "union") || equal(t, "enum"))
-          {
-            t = t->next;
-            if (t && t->kind == TK_IDENT)
-              t = t->next;
-            if (t && equal(t, "{"))
-            {
-              int bd = 1;
-              t = t->next;
-              while (t && bd > 0)
-              {
-                if (equal(t, "{"))
-                  bd++;
-                else if (equal(t, "}"))
-                  bd--;
-                t = t->next;
-              }
-            }
-          }
-          else
-          {
-            while (t && ((t->tag & TT_TYPE) ||
-                         is_known_typedef(t)))
-              t = t->next;
-          }
+          t = type.end;
 
           // Skip pointers and qualifiers
-          while (t && (equal(t, "*") || equal(t, "const") || equal(t, "volatile") ||
-                       equal(t, "restrict") || equal(t, "__restrict") || equal(t, "__restrict__")))
+          while (t && (equal(t, "*") || (t->tag & TT_QUALIFIER) ||
+                       equal(t, "__restrict") || equal(t, "__restrict__")))
             t = t->next;
 
           // Should be at identifier now - and NOT followed by '(' (that's a function)
           if (t && t->kind == TK_IDENT && t->next && !equal(t->next, "("))
           {
-            // Only track as active_item if NOT marked with 'raw'
-            // 'raw' explicitly opts out of zero-init, so jumping over it is safe
             if (!has_raw && (!active_item || depth <= active_item_depth))
             {
               active_item = decl_start;
@@ -1564,10 +1542,11 @@ static Token *skip_balanced(Token *tok, char *open, char *close)
 // Handles: void func(, static void func(, __attribute__((...)) void func(, etc.
 static bool is_void_function_decl(Token *tok)
 {
-  // Skip storage class specifiers and attributes
-  while (tok && (equal(tok, "static") || equal(tok, "inline") || equal(tok, "extern") ||
-                 equal(tok, "_Noreturn") || equal(tok, "__inline") || equal(tok, "__inline__") ||
-                 equal(tok, "typedef") || (tok->tag & TT_ATTR)))
+  // Skip storage class specifiers, qualifiers, and attributes
+  // These are all tagged TT_SKIP_DECL, TT_QUALIFIER, or TT_ATTR
+  while (tok && ((tok->tag & (TT_QUALIFIER | TT_SKIP_DECL | TT_ATTR)) ||
+                 equal(tok, "inline") || equal(tok, "__inline") || equal(tok, "__inline__") ||
+                 equal(tok, "_Noreturn")))
   {
     if (tok->tag & TT_ATTR)
       tok = skip_gnu_attributes(tok);
@@ -1578,7 +1557,6 @@ static bool is_void_function_decl(Token *tok)
   // Must be at 'void' now
   if (!tok || !equal(tok, "void"))
     return false;
-
   tok = tok->next;
 
   // void* is not a void-returning function
@@ -1586,9 +1564,8 @@ static bool is_void_function_decl(Token *tok)
     return false;
 
   // Skip attributes and qualifiers after void
-  while (tok && (equal(tok, "const") || equal(tok, "volatile") ||
-                 equal(tok, "__restrict") || equal(tok, "__restrict__") ||
-                 (tok->tag & TT_ATTR)))
+  while (tok && ((tok->tag & (TT_QUALIFIER | TT_ATTR)) ||
+                 equal(tok, "__restrict") || equal(tok, "__restrict__")))
   {
     if (tok->tag & TT_ATTR)
       tok = skip_gnu_attributes(tok);
@@ -1601,62 +1578,10 @@ static bool is_void_function_decl(Token *tok)
 }
 
 // Skip the base type in a typedef (everything before the declarator)
+// Reuses parse_type_specifier() for unified type-skipping logic.
 static Token *scan_typedef_base_type(Token *tok)
 {
-  // Skip qualifiers: const, volatile, restrict, _Atomic
-  // Handle _Atomic(type) specifier form specially
-  while (tok && (equal(tok, "const") || equal(tok, "volatile") ||
-                 equal(tok, "restrict") || equal(tok, "_Atomic") ||
-                 equal(tok, "__const") || equal(tok, "__const__") ||
-                 equal(tok, "__volatile") || equal(tok, "__volatile__") ||
-                 equal(tok, "__restrict") || equal(tok, "__restrict__")))
-  {
-    // Handle _Atomic(type) specifier form - skip the parenthesized type
-    if (equal(tok, "_Atomic") && tok->next && equal(tok->next, "("))
-    {
-      tok = tok->next;                    // Skip _Atomic
-      tok = skip_balanced(tok, "(", ")"); // Skip (type)
-    }
-    else
-    {
-      tok = tok->next;
-    }
-  }
-
-  // Skip attributes
-  tok = skip_gnu_attributes(tok);
-
-  // Handle struct/union/enum
-  if (tok && (tok->tag & TT_SUE))
-  {
-    tok = tok->next;
-
-    // Skip attributes after keyword
-    tok = skip_gnu_attributes(tok);
-
-    // Skip optional tag name
-    if (tok && tok->kind == TK_IDENT)
-      tok = tok->next;
-
-    // Skip body { ... } if present
-    if (tok && equal(tok, "{"))
-      tok = skip_balanced(tok, "{", "}");
-
-    return tok;
-  }
-
-  // Skip type specifiers and existing typedef names
-  while (tok && tok->kind != TK_EOF &&
-         (is_type_keyword(tok) || is_known_typedef(tok) ||
-          equal(tok, "signed") || equal(tok, "unsigned") ||
-          equal(tok, "__signed__") || equal(tok, "__signed")))
-  {
-    tok = tok->next;
-    // Skip attributes between type keywords
-    tok = skip_gnu_attributes(tok);
-  }
-
-  return tok;
+  return parse_type_specifier(tok).end;
 }
 
 // Extract the typedef name from a declarator, advance *tokp past the declarator
@@ -2152,25 +2077,11 @@ static Token *skip_pragma_operators(Token *tok)
   return tok;
 }
 
-// Type specifier parsing result
-typedef struct
-{
-  Token *end;        // First token after the type specifier
-  bool saw_type;     // True if a type was recognized
-  bool is_struct;    // True if struct/union/enum type
-  bool is_typedef;   // True if user-defined typedef
-  bool is_vla;       // True if VLA typedef or struct with VLA member
-  bool has_typeof;   // True if typeof/typeof_unqual (cannot determine VLA at transpile-time)
-  bool has_atomic;   // True if _Atomic qualifier/specifier present
-  bool has_register; // True if register storage class
-  bool has_volatile; // True if volatile qualifier
-} TypeSpecResult;
-
 // Parse type specifier: qualifiers, type keywords, struct/union/enum, typeof, _Atomic, etc.
 // Returns info about the type and position after it
 static TypeSpecResult parse_type_specifier(Token *tok)
 {
-  TypeSpecResult r = {tok, false, false, false, false, false, false, false, false};
+  TypeSpecResult r = {tok, false, false, false, false, false, false, false, false, NULL};
 
   while ((tok->tag & TT_QUALIFIER) || is_type_keyword(tok) ||
          (tok && equal(tok, "[") && tok->next && equal(tok->next, "[")))
@@ -2229,7 +2140,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       if (tok && equal(tok, "{"))
       {
         if (struct_body_contains_vla(tok, false))
-          error_tok(tok, "variable length array in struct/union is not supported");
+          r.struct_vla_error_tok = tok;
         if (struct_body_contains_vla(tok, true))
           r.is_vla = true;
         tok = skip_balanced(tok, "{", "}");
@@ -2908,6 +2819,10 @@ static Token *try_zero_init_decl(Token *tok)
   TypeSpecResult type = parse_type_specifier(tok);
   if (!type.saw_type)
     return NULL;
+
+  // Error on true VLA in struct/union body (deferred from parse_type_specifier)
+  if (type.struct_vla_error_tok)
+    error_tok(type.struct_vla_error_tok, "variable length array in struct/union is not supported");
 
   // Validate declaration structure (combined check)
   DeclValidation v = validate_declaration(type.end, warn_loc);
