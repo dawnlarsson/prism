@@ -486,16 +486,25 @@ static void system_includes_reset(void)
   system_include_capacity = 0;
 }
 
+static void typedef_pop_scope(int scope_depth); // Forward declaration
+
 static void end_statement_after_semicolon(void)
 {
   ctx->at_stmt_start = true;
   ctx->in_for_init = false; // Semicolon ends init clause
   if (control_state.pending && control_state.paren_depth == 0)
   {
+    // Pop phantom scopes for braceless control bodies ending via break/continue/return/goto.
+    // For-init variables (e.g., "for (int T = 0; ...)  break;") are registered at
+    // defer_depth + 1 but never get a matching '}' pop. Without this, the shadow
+    // persists and corrupts subsequent typedef lookups (ghost shadow bug).
+    typedef_pop_scope(ctx->defer_depth + 1);
+
     control_state.pending = false;
     ctx->next_scope_is_loop = false;
     ctx->next_scope_is_switch = false;
     ctx->next_scope_is_conditional = false;
+    ctx->pending_for_paren = false;
   }
 }
 
@@ -998,10 +1007,14 @@ static void typedef_add_entry(char *name, int len, int scope_depth, TypedefKind 
 #define typedef_add_enum_const(name, len, depth) typedef_add_entry(name, len, depth, TDK_ENUM_CONST, false)
 #define typedef_add_vla_var(name, len, depth) typedef_add_entry(name, len, depth, TDK_VLA_VAR, true)
 
-// Called when exiting a scope - removes typedefs defined at that depth
+// Called when exiting a scope - removes typedefs defined at or above given depth.
+// Uses >= instead of == for resilience: if a deeper scope's entries weren't cleaned up
+// (e.g., missed phantom pop, macro edge case), they get swept up here rather than
+// permanently blocking the stack. In normal operation, entries are monotonically
+// non-decreasing in depth, so >= behaves identically to ==.
 static void typedef_pop_scope(int scope_depth)
 {
-  while (typedef_table.count > 0 && typedef_table.entries[typedef_table.count - 1].scope_depth == scope_depth)
+  while (typedef_table.count > 0 && typedef_table.entries[typedef_table.count - 1].scope_depth >= scope_depth)
   {
     TypedefEntry *e = &typedef_table.entries[typedef_table.count - 1];
     // Restore hash map to point to previous entry (or remove if none)

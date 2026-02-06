@@ -8547,6 +8547,58 @@ void test_bug1_ghost_shadow_if(void)
     CHECK(ptr == NULL, "typedef V works after braceless if");
 }
 
+// Regression tests for ghost shadows when braceless bodies end via
+// break/continue/return/goto (end_statement_after_semicolon path)
+static int ghost_shadow_return_helper(void)
+{
+    typedef int T;
+    for (int T = 0; T < 5; T++)
+        return T;
+    // T should be restored as typedef after braceless for+return
+    T val = 42;
+    return val;
+}
+
+void test_ghost_shadow_braceless_break(void)
+{
+    typedef int T;
+
+    // break in braceless for body - shadow must be cleaned up
+    for (int T = 0; T < 5; T++)
+        break;
+    T *ptr = NULL;
+    CHECK(ptr == NULL, "ghost shadow: typedef T works after braceless for+break");
+}
+
+void test_ghost_shadow_braceless_continue(void)
+{
+    typedef int T;
+
+    // continue in braceless for body - shadow must be cleaned up
+    for (int T = 0; T < 5; T++)
+        continue;
+    T *ptr = NULL;
+    CHECK(ptr == NULL, "ghost shadow: typedef T works after braceless for+continue");
+}
+
+void test_ghost_shadow_braceless_return(void)
+{
+    int result = ghost_shadow_return_helper();
+    CHECK(result == 0, "ghost shadow: typedef T works after braceless for+return");
+}
+
+void test_ghost_shadow_nested_braceless(void)
+{
+    typedef int T;
+
+    // Nested braceless: if inside for - both must clean up properly
+    for (int T = 0; T < 5; T++)
+        if (T > 2)
+            break;
+    T *ptr = NULL;
+    CHECK(ptr == NULL, "ghost shadow: typedef T works after nested braceless for+if+break");
+}
+
 void test_bug2_ultra_complex_exact(void)
 {
     // Exact example from bug report: pointer to array of 5 function pointers
@@ -9443,6 +9495,10 @@ void run_verification_bug_tests(void)
 
     test_bug1_ghost_shadow_while();
     test_bug1_ghost_shadow_if();
+    test_ghost_shadow_braceless_break();
+    test_ghost_shadow_braceless_continue();
+    test_ghost_shadow_braceless_return();
+    test_ghost_shadow_nested_braceless();
 
     test_bug2_ultra_complex_exact();
     test_bug2_deeply_nested_parens();
