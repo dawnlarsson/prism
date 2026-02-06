@@ -844,25 +844,29 @@ static void emit_range(Token *start, Token *end)
 }
 
 // Emit defers with boundary control:
-// DEFER_SCOPE=current only, DEFER_ALL=all scopes, DEFER_BREAK=stop at loop/switch, DEFER_CONTINUE=stop at loop
+// DEFER_SCOPE=current only, DEFER_ALL=all scopes, DEFER_BREAK=stop at loop/switch,
+// DEFER_CONTINUE=stop at loop, DEFER_TO_DEPTH=stop at given depth (for goto)
 typedef enum
 {
   DEFER_SCOPE,
   DEFER_ALL,
   DEFER_BREAK,
-  DEFER_CONTINUE
+  DEFER_CONTINUE,
+  DEFER_TO_DEPTH
 } DeferEmitMode;
 
-static void emit_defers(DeferEmitMode mode)
+static void emit_defers_ex(DeferEmitMode mode, int stop_depth)
 {
   if (ctx->defer_depth <= 0)
     return;
 
-  int start = ctx->defer_depth - 1;
-  int end = (mode == DEFER_SCOPE) ? ctx->defer_depth - 1 : 0;
-
-  for (int d = start; d >= end; d--)
+  for (int d = ctx->defer_depth - 1; d >= 0; d--)
   {
+    if (mode == DEFER_SCOPE && d < ctx->defer_depth - 1)
+      break;
+    if (mode == DEFER_TO_DEPTH && d < stop_depth)
+      break;
+
     DeferScope *scope = &defer_stack[d];
     for (int i = scope->count - 1; i >= 0; i--)
     {
@@ -871,8 +875,6 @@ static void emit_defers(DeferEmitMode mode)
       out_char(';');
     }
 
-    if (mode == DEFER_SCOPE)
-      break;
     if (mode == DEFER_BREAK && (scope->is_loop || scope->is_switch))
       break;
     if (mode == DEFER_CONTINUE && scope->is_loop)
@@ -880,41 +882,34 @@ static void emit_defers(DeferEmitMode mode)
   }
 }
 
+#define emit_defers(mode) emit_defers_ex(mode, 0)
 #define emit_scope_defers() emit_defers(DEFER_SCOPE)
 #define emit_all_defers() emit_defers(DEFER_ALL)
 #define emit_break_defers() emit_defers(DEFER_BREAK)
 #define emit_continue_defers() emit_defers(DEFER_CONTINUE)
+#define emit_goto_defers(depth) emit_defers_ex(DEFER_TO_DEPTH, depth)
 
-// Check if there are any active defers
-static bool has_active_defers(void)
+// Check if defers exist in scopes from current depth down to stop_depth (or boundary).
+// mode: DEFER_ALL=any active, DEFER_BREAK=to loop/switch, DEFER_CONTINUE=to loop, DEFER_TO_DEPTH=to depth
+static bool has_defers_for(DeferEmitMode mode, int stop_depth)
 {
-  for (int d = 0; d < ctx->defer_depth; d++)
+  for (int d = ctx->defer_depth - 1; d >= 0; d--)
+  {
+    if (mode == DEFER_TO_DEPTH && d < stop_depth)
+      break;
     if (defer_stack[d].count > 0)
       return true;
+    if (mode == DEFER_BREAK && (defer_stack[d].is_loop || defer_stack[d].is_switch))
+      return false; // Hit boundary without finding defers
+    if (mode == DEFER_CONTINUE && defer_stack[d].is_loop)
+      return false;
+  }
   return false;
 }
 
-// Check if break/continue needs to emit defers
-// include_switch: true for break (stops at loop OR switch), false for continue (stops at loop only)
-static bool control_flow_has_defers(bool include_switch)
-{
-  bool found_boundary = false;
-  bool found_defers = false;
-
-  for (int d = ctx->defer_depth - 1; d >= 0; d--)
-  {
-    if (defer_stack[d].count > 0)
-      found_defers = true;
-
-    if (defer_stack[d].is_loop || (include_switch && defer_stack[d].is_switch))
-    {
-      found_boundary = true;
-      break;
-    }
-  }
-
-  return found_boundary && found_defers;
-}
+#define has_active_defers() has_defers_for(DEFER_ALL, 0)
+#define control_flow_has_defers(include_switch) has_defers_for((include_switch) ? DEFER_BREAK : DEFER_CONTINUE, 0)
+#define goto_has_defers(depth) has_defers_for(DEFER_TO_DEPTH, depth)
 
 static void label_table_add(char *name, int name_len, int scope_depth)
 {
@@ -1013,7 +1008,7 @@ static bool is_type_keyword(Token *tok);
 
 // Parse enum body and register constants as shadows for any matching typedefs.
 // Enum constants are visible in the enclosing scope, so they shadow typedefs.
-// Also register all enum constants for is_const_array_size detection.
+// Also register all enum constants for VLA array size detection.
 // tok should point to the opening '{' of the enum body.
 // scope_depth is the scope where the enum constants become visible.
 static void parse_enum_constants(Token *tok, int scope_depth)
@@ -1257,32 +1252,8 @@ static void scan_labels_in_function(Token *tok)
   }
 }
 
-// Emit defers for goto - from current scope down to target scope (inclusive)
-// We emit defers for scopes we're EXITING, not the scope we're jumping TO
-static void emit_goto_defers(int target_depth)
-{
-  for (int d = ctx->defer_depth - 1; d >= target_depth; d--)
-  {
-    DeferScope *scope = &defer_stack[d];
-    for (int i = scope->count - 1; i >= 0; i--)
-    {
-      out_char(' ');
-      emit_range(scope->stmts[i], scope->ends[i]);
-      out_char(';');
-    }
-  }
-}
-
-// Check if goto needs defers (jumping out of scopes with defers)
-static bool goto_has_defers(int target_depth)
-{
-  for (int d = ctx->defer_depth - 1; d >= target_depth; d--)
-  {
-    if (defer_stack[d].count > 0)
-      return true;
-  }
-  return false;
-}
+// Note: emit_goto_defers() and goto_has_defers() are now macros
+// defined via the unified emit_defers_ex/has_defers_for functions above.
 
 // Modes for goto_skips_check - what to look for between goto and label
 typedef enum
@@ -1671,9 +1642,8 @@ static Token *scan_typedef_name(Token **tokp)
   return NULL;
 }
 
-// Forward declarations (used by struct_body_contains_vla and array_size_is_vla)
+// Forward declarations
 static bool array_size_is_vla(Token *open_bracket, bool strict_mode);
-static bool has_manual_offsetof_pattern(Token *start, Token *end);
 static bool looks_like_system_typedef(Token *tok);
 static bool is_const_expr_operator(Token *tok);
 static bool is_const_identifier(Token *tok);
@@ -1686,27 +1656,33 @@ static bool array_size_is_vla(Token *open_bracket, bool strict_mode)
   Token *tok = open_bracket->next;
   int depth = 1;
 
-  // Find closing bracket (needed for offsetof pattern check)
-  Token *close_bracket = NULL;
+  // In lenient mode, check for manual offsetof pattern: (char*)...->...- (char*)
+  // GCC treats this as VLA even though it's a compile-time constant
   if (!strict_mode)
   {
-    Token *t = open_bracket->next;
-    int d = 1;
-    while (t && t->kind != TK_EOF && d > 0)
+    for (Token *t = open_bracket->next; t && t->kind != TK_EOF; t = t->next)
     {
-      if (equal(t, "["))
-        d++;
-      else if (equal(t, "]"))
+      if (equal(t, "]"))
+        break;
+      if (equal(t, "(") && t->next && equal(t->next, "char") &&
+          t->next->next && equal(t->next->next, "*") &&
+          t->next->next->next && equal(t->next->next->next, ")"))
       {
-        d--;
-        if (d == 0)
-          close_bracket = t;
+        // Found (char*), look for -> or . followed by - (char*)
+        for (Token *t2 = t->next->next->next->next; t2 && t2->kind != TK_EOF && !equal(t2, "]"); t2 = t2->next)
+        {
+          if ((equal(t2, "->") || equal(t2, ".")) && t2->next)
+          {
+            for (Token *t3 = t2->next; t3 && t3->kind != TK_EOF && !equal(t3, "]"); t3 = t3->next)
+            {
+              if (equal(t3, "-") && t3->next && equal(t3->next, "(") &&
+                  t3->next->next && equal(t3->next->next, "char"))
+                return false; // Manual offsetof pattern — constant
+            }
+          }
+        }
       }
-      t = t->next;
     }
-    // In lenient mode, manual offsetof patterns are constant (not VLA)
-    if (close_bracket && has_manual_offsetof_pattern(open_bracket->next, close_bracket))
-      return false;
   }
 
   bool prev_was_member_access = false;
@@ -1841,30 +1817,31 @@ static bool array_size_is_vla(Token *open_bracket, bool strict_mode)
   return false; // All tokens were constants
 }
 
-// Wrapper for backward compatibility - strict mode (for zero-init)
-static inline bool is_const_array_size(Token *open_bracket)
+// Scan a token range for VLA array dimensions.
+// Checks every '[' at the top level of the given delimited region.
+// For struct bodies: pass open="{", close="}"
+// For typedef-to-semicolon: pass open=NULL, close=";"
+static bool scan_for_vla(Token *tok, const char *open, const char *close, bool strict_mode)
 {
-  return !array_size_is_vla(open_bracket, true);
-}
-
-// Check if a struct/union body contains VLA arrays
-// strict_mode=false: true VLAs only (offsetof patterns are constants)
-// strict_mode=true:  conservative, treats offsetof-like patterns as VLAs too
-static bool struct_body_contains_vla(Token *open_brace, bool strict_mode)
-{
-  if (!open_brace || !equal(open_brace, "{"))
+  if (open && (!tok || !equal(tok, open)))
     return false;
-
-  Token *tok = open_brace->next;
+  if (open)
+    tok = tok->next; // skip opening delimiter
   int depth = 1;
-
-  while (tok && tok->kind != TK_EOF && depth > 0)
+  while (tok && tok->kind != TK_EOF)
   {
-    if (equal(tok, "{"))
+    if (open && equal(tok, open))
       depth++;
-    else if (equal(tok, "}"))
+    else if (equal(tok, close))
+    {
+      if (open) { depth--; if (depth <= 0) break; }
+      else break;
+    }
+    else if (!open && (equal(tok, "(") || equal(tok, "{")))
+      depth++;
+    else if (!open && (equal(tok, ")") || equal(tok, "}")))
       depth--;
-    else if (equal(tok, "[") && depth > 0)
+    else if (equal(tok, "[") && (open ? depth >= 1 : depth == 1))
     {
       if (array_size_is_vla(tok, strict_mode))
         return true;
@@ -1874,27 +1851,9 @@ static bool struct_body_contains_vla(Token *open_brace, bool strict_mode)
   return false;
 }
 
-// Parse a typedef declaration and add names to the typedef table
-// Check if a typedef declaration contains a VLA (scan from current position to semicolon)
-static bool typedef_contains_vla(Token *tok)
-{
-  int depth = 0;
-  while (tok && !equal(tok, ";") && tok->kind != TK_EOF)
-  {
-    if (equal(tok, "(") || equal(tok, "{"))
-      depth++;
-    else if (equal(tok, ")") || equal(tok, "}"))
-      depth--;
-    else if (equal(tok, "[") && depth == 0)
-    {
-      // Found array dimension - check if it's a VLA
-      if (!is_const_array_size(tok))
-        return true;
-    }
-    tok = tok->next;
-  }
-  return false;
-}
+// Convenience wrappers
+#define struct_body_contains_vla(brace, strict) scan_for_vla(brace, "{", "}", strict)
+#define typedef_contains_vla(tok) scan_for_vla(tok, NULL, ";", true)
 
 static void parse_typedef_declaration(Token *tok, int scope_depth)
 {
@@ -1969,43 +1928,6 @@ static bool looks_like_system_typedef(Token *tok)
     if (next && equal(next, "("))
       return false; // Function call, not a typedef
     return true;
-  }
-  return false;
-}
-
-// Check if the array size contains manual offsetof pointer arithmetic pattern:
-// ((size_t)((char*)&((TYPE*)0)->MEMBER - (char*)0))
-// GCC treats this as a VLA even though it's technically a compile-time constant.
-static bool has_manual_offsetof_pattern(Token *start, Token *end)
-{
-  // Look for the pattern: (char*) followed eventually by -> and then - (char*)
-  // This matches the manual offsetof expansion that GCC doesn't treat as constant
-  for (Token *tok = start; tok && tok != end && tok->kind != TK_EOF; tok = tok->next)
-  {
-    // Look for (char*) pattern
-    if (equal(tok, "(") && tok->next && equal(tok->next, "char"))
-    {
-      Token *t = tok->next->next;
-      if (t && equal(t, "*") && t->next && equal(t->next, ")"))
-      {
-        // Found (char*), now look for -> followed by - (char*)
-        for (Token *t2 = t->next; t2 && t2 != end && t2->kind != TK_EOF; t2 = t2->next)
-        {
-          if (equal(t2, "->") || equal(t2, "."))
-          {
-            // Found member access, look for - (char*) pattern after it
-            for (Token *t3 = t2->next; t3 && t3 != end && t3->kind != TK_EOF; t3 = t3->next)
-            {
-              if (equal(t3, "-") && t3->next && equal(t3->next, "(") &&
-                  t3->next->next && equal(t3->next->next, "char"))
-              {
-                return true; // Found manual offsetof pattern
-              }
-            }
-          }
-        }
-      }
-    }
   }
   return false;
 }
@@ -2295,7 +2217,7 @@ static Token *emit_array_dims(Token *tok, bool *is_vla)
 {
   while (equal(tok, "["))
   {
-    if (!is_const_array_size(tok))
+    if (array_size_is_vla(tok, true))
       *is_vla = true;
     emit_tok(tok);
     tok = tok->next;
@@ -3411,36 +3333,20 @@ static int transpile(char *input_file, char *output_file)
       // No defers, emit normally
     }
 
-    // Handle 'break' - emit defers up through loop/switch
-    if (ctx->feature_defer && tok->kind == TK_KEYWORD && equal(tok, "break"))
+    // Handle 'break' / 'continue' - emit defers up to boundary
+    if (ctx->feature_defer && tok->kind == TK_KEYWORD &&
+        (equal(tok, "break") || equal(tok, "continue")))
     {
-      mark_switch_control_exit(); // Mark that we exited via break
-      if (control_flow_has_defers(true))
+      bool is_break = equal(tok, "break");
+      mark_switch_control_exit();
+      if (control_flow_has_defers(is_break))
       {
         OUT_LIT(" {");
-        emit_break_defers();
-        OUT_LIT(" break; }");
+        emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
+        out_char(' ');
+        out_str(tok->loc, tok->len);
+        OUT_LIT("; }");
         tok = tok->next;
-        // Skip the semicolon
-        if (equal(tok, ";"))
-          tok = tok->next;
-        end_statement_after_semicolon();
-        continue;
-      }
-      // No defers, emit normally (fall through to default emit)
-    }
-
-    // Handle 'continue' - emit defers up to (not including) loop
-    if (ctx->feature_defer && tok->kind == TK_KEYWORD && equal(tok, "continue"))
-    {
-      mark_switch_control_exit(); // Continue also exits the switch (like break/return/goto)
-      if (control_flow_has_defers(false))
-      {
-        OUT_LIT(" {");
-        emit_continue_defers();
-        OUT_LIT(" continue; }");
-        tok = tok->next;
-        // Skip the semicolon
         if (equal(tok, ";"))
           tok = tok->next;
         end_statement_after_semicolon();
