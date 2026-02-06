@@ -4406,6 +4406,772 @@ void run_case_label_tests(void)
     test_duff_device_with_defer_at_top();
 }
 
+// Test: Sequential switch statements don't leak defers between them
+void test_switch_sequential_no_leak(void)
+{
+    log_reset();
+    switch (1)
+    {
+    case 1:
+    {
+        defer log_append("A");
+        log_append("1");
+        break;
+    }
+    }
+    switch (2)
+    {
+    case 2:
+    {
+        defer log_append("B");
+        log_append("2");
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("1A2BE", "sequential switches don't leak defers");
+}
+
+// Test: Multiple case labels sharing one body (case group)
+void test_switch_case_group_defer(void)
+{
+    log_reset();
+    int x = 2;
+    switch (x)
+    {
+    case 1:
+    case 2:
+    case 3:
+    {
+        defer log_append("D");
+        log_append("X");
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("XDE", "case group labels sharing body with defer");
+}
+
+// Test: Case group with fallthrough into next group
+void test_switch_case_group_fallthrough(void)
+{
+    log_reset();
+    switch (0)
+    {
+    case 0:
+    case 1:
+    {
+        defer log_append("A");
+        log_append("X");
+    } // A fires at }, then fallthrough
+    case 2:
+    case 3:
+    {
+        defer log_append("B");
+        log_append("Y");
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("XAYBE", "case group fallthrough with defers");
+}
+
+// Test: Deep nesting inside a case with break
+void test_switch_deep_nested_break(void)
+{
+    log_reset();
+    switch (1)
+    {
+    case 1:
+    {
+        defer log_append("1");
+        {
+            defer log_append("2");
+            {
+                defer log_append("3");
+                {
+                    defer log_append("4");
+                    log_append("X");
+                    break; // Should trigger 4, 3, 2, 1 in LIFO order
+                }
+            }
+        }
+    }
+    }
+    log_append("E");
+    CHECK_LOG("X4321E", "deep nested blocks in switch case with break");
+}
+
+// Test: Return from deeply nested switch unwinds all scopes
+int test_switch_deep_return_helper(void)
+{
+    log_reset();
+    defer log_append("F"); // function scope
+    switch (1)
+    {
+    case 1:
+    {
+        defer log_append("S"); // switch case scope
+        {
+            defer log_append("N"); // nested block
+            log_append("X");
+            return 42; // Should trigger N, S, F
+        }
+    }
+    }
+    return 0;
+}
+
+void test_switch_deep_return(void)
+{
+    int ret = test_switch_deep_return_helper();
+    CHECK_LOG("XNSF", "return from deep switch unwinds all scopes");
+    CHECK_EQ(ret, 42, "deep switch return value preserved");
+}
+
+// Test: Switch with only default case
+void test_switch_only_default(void)
+{
+    log_reset();
+    switch (999)
+    {
+    default:
+    {
+        defer log_append("D");
+        log_append("X");
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("XDE", "switch with only default and defer");
+}
+
+// Test: Switch with all cases having defers and break
+void test_switch_all_cases_defer(void)
+{
+    log_reset();
+    int x = 2;
+    switch (x)
+    {
+    case 1:
+    {
+        defer log_append("A");
+        log_append("1");
+        break;
+    }
+    case 2:
+    {
+        defer log_append("B");
+        log_append("2");
+        break;
+    }
+    case 3:
+    {
+        defer log_append("C");
+        log_append("3");
+        break;
+    }
+    default:
+    {
+        defer log_append("D");
+        log_append("X");
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("2BE", "all cases with defers - only active case fires");
+}
+
+// Test: Empty switch body with defer in enclosing scope
+void test_switch_defer_enclosing_scope(void)
+{
+    log_reset();
+    {
+        defer log_append("D");
+        switch (42)
+        {
+        default:
+            break;
+        }
+        log_append("X");
+    }
+    log_append("E");
+    CHECK_LOG("XDE", "switch with defer in enclosing scope");
+}
+
+// Test: Nested switch where inner has no defers but outer does
+void test_switch_nested_mixed_defer(void)
+{
+    log_reset();
+    switch (1)
+    {
+    case 1:
+    {
+        defer log_append("O");
+        switch (2)
+        {
+        case 2:
+            log_append("I"); // No defer in inner switch
+            break;
+        }
+        log_append("M");
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("IMOE", "nested switch - inner no defer, outer has defer");
+}
+
+// Test: Nested switch where inner has defers but outer doesn't
+void test_switch_nested_inner_defer(void)
+{
+    log_reset();
+    switch (1)
+    {
+    case 1:
+    {
+        switch (2)
+        {
+        case 2:
+        {
+            defer log_append("I");
+            log_append("X");
+            break;
+        }
+        }
+        log_append("M"); // No defer at outer case scope
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("XIME", "nested switch - inner has defer, outer doesn't");
+}
+
+// Test: Switch with do-while(0) pattern inside a case (common macro pattern)
+void test_switch_do_while_0(void)
+{
+    log_reset();
+    switch (1)
+    {
+    case 1:
+    {
+        defer log_append("D");
+        do
+        {
+            log_append("X");
+        } while (0);
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("XDE", "switch case with do-while(0) and defer");
+}
+
+// Test: Switch with defer and negative case values
+void test_switch_negative_cases(void)
+{
+    log_reset();
+    switch (-1)
+    {
+    case -2:
+    {
+        defer log_append("A");
+        log_append("a");
+        break;
+    }
+    case -1:
+    {
+        defer log_append("B");
+        log_append("b");
+        break;
+    }
+    case 0:
+    {
+        defer log_append("C");
+        log_append("c");
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("bBE", "switch with negative case values and defer");
+}
+
+// Test: Switch with defer inside statement expression inside cases
+void test_switch_stmt_expr_defer(void)
+{
+    log_reset();
+    switch (1)
+    {
+    case 1:
+    {
+        defer log_append("O");
+        int val = ({
+            int r;
+            {
+                defer log_append("SE");
+                log_append("X");
+                r = 42;
+            }
+            r;
+        });
+        (void)val;
+        log_append("Y");
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("XSEYOE", "switch with stmt expr containing defer");
+}
+
+// Test: Switch inside statement expression inside another switch
+void test_switch_in_stmt_expr_in_switch(void)
+{
+    log_reset();
+    int x = 1;
+    switch (x)
+    {
+    case 1:
+    {
+        defer log_append("O");
+        int val = ({
+            int r = 0;
+            switch (2)
+            {
+            case 2:
+            {
+                defer log_append("I");
+                r = 42;
+                break;
+            }
+            }
+            r;
+        });
+        (void)val;
+        log_append("X");
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("IXOE", "switch in stmt expr in switch");
+}
+
+// Test: Three sequential switches to verify clean state between them
+void test_switch_triple_sequential(void)
+{
+    log_reset();
+    for (int i = 0; i < 3; i++)
+    {
+        switch (i)
+        {
+        case 0:
+        {
+            defer log_append("A");
+            log_append("0");
+            break;
+        }
+        case 1:
+        {
+            defer log_append("B");
+            log_append("1");
+            break;
+        }
+        case 2:
+        {
+            defer log_append("C");
+            log_append("2");
+            break;
+        }
+        }
+    }
+    log_append("E");
+    CHECK_LOG("0A1B2CE", "triple sequential switches in loop");
+}
+
+// Test: Duff's device with defers at each iteration (braced pattern)
+void test_duffs_device_braced_defers(void)
+{
+    int duff_total = 0;
+    int count = 6;
+    int n = (count + 3) / 4;
+    switch (count % 4)
+    {
+    case 0:
+        do
+        {
+            {
+                defer duff_total++;
+            }
+        case 3:
+        {
+            defer duff_total++;
+        }
+        case 2:
+        {
+            defer duff_total++;
+        }
+        case 1:
+        {
+            defer duff_total++;
+        }
+        } while (--n > 0);
+    }
+    // count=6, 6%4=2, starts at case 2: 2,1 (2 iterations first partial)
+    // then 0,3,2,1 (4 iterations full round)
+    // Total: 2+4 = 6
+    CHECK_EQ(duff_total, 6, "duff braced defers: count=6 iterations");
+}
+
+// Test: Duff's device with different entry points
+void test_duffs_device_all_entries(void)
+{
+    // Test each possible entry point
+    for (int entry = 0; entry < 4; entry++)
+    {
+        int duff_total = 0;
+        int items = 4 + entry; // 4,5,6,7 items
+        int n = (items + 3) / 4;
+        switch (items % 4)
+        {
+        case 0:
+            do
+            {
+                {
+                    defer duff_total++;
+                }
+            case 3:
+            {
+                defer duff_total++;
+            }
+            case 2:
+            {
+                defer duff_total++;
+            }
+            case 1:
+            {
+                defer duff_total++;
+            }
+            } while (--n > 0);
+        }
+        CHECK_EQ(duff_total, items, "duff all entries: correct iteration count");
+    }
+}
+
+// Test: Switch with goto out and defers at multiple nesting levels
+void test_switch_goto_deep(void)
+{
+    log_reset();
+    defer log_append("F"); // function-level
+    switch (1)
+    {
+    case 1:
+    {
+        defer log_append("S");
+        {
+            defer log_append("N");
+            log_append("X");
+            goto out;
+        }
+    }
+    }
+out:
+    log_append("E");
+}
+
+// Test: Switch with continue from enclosing loop, defers at both levels
+void test_switch_continue_enclosing_loop_defer(void)
+{
+    log_reset();
+    for (int i = 0; i < 2; i++)
+    {
+        defer log_append("L");
+        switch (i)
+        {
+        case 0:
+        {
+            defer log_append("S0");
+            log_append("A");
+            continue; // should fire S0 then L
+        }
+        case 1:
+        {
+            defer log_append("S1");
+            log_append("B");
+            break;
+        }
+        }
+        log_append("M"); // only reached for case 1 (break doesn't skip this)
+    }
+    log_append("E");
+    CHECK_LOG("AS0LBS1MLE", "switch continue from enclosing loop");
+}
+
+// Test: Nested switches where break in inner doesn't affect outer
+void test_switch_inner_break_isolation(void)
+{
+    log_reset();
+    switch (1)
+    {
+    case 1:
+    {
+        defer log_append("O");
+        switch (1)
+        {
+        case 1:
+        {
+            defer log_append("I");
+            log_append("X");
+            break; // breaks from INNER switch only
+        }
+        }
+        // Execution continues here after inner break
+        log_append("Y");
+        break; // breaks from OUTER switch
+    }
+    }
+    log_append("E");
+    CHECK_LOG("XIYOE", "inner break doesn't affect outer switch");
+}
+
+// Test: Switch with computed case value (enum arithmetic)
+void test_switch_computed_case(void)
+{
+    log_reset();
+    enum
+    {
+        BASE = 10,
+        OFFSET = 5
+    };
+    switch (BASE + OFFSET)
+    {
+    case BASE + OFFSET:
+    {
+        defer log_append("D");
+        log_append("X");
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("XDE", "computed case value with defer");
+}
+
+// Test: Switch where default is in the middle (not first or last)
+void test_switch_default_middle(void)
+{
+    log_reset();
+    switch (42) // doesn't match any explicit case
+    {
+    case 1:
+    {
+        defer log_append("A");
+        log_append("1");
+        break;
+    }
+    default:
+    {
+        defer log_append("D");
+        log_append("X");
+        break;
+    }
+    case 2:
+    {
+        defer log_append("B");
+        log_append("2");
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("XDE", "default in middle of switch with defer");
+}
+
+// Test: Switch with fallthrough across multiple braced cases
+void test_switch_multi_fallthrough(void)
+{
+    log_reset();
+    switch (0)
+    {
+    case 0:
+    {
+        defer log_append("A");
+        log_append("0");
+    }
+    case 1:
+    {
+        defer log_append("B");
+        log_append("1");
+    }
+    case 2:
+    {
+        defer log_append("C");
+        log_append("2");
+    }
+    case 3:
+    {
+        defer log_append("D");
+        log_append("3");
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("0A1B2C3DE", "multi-level fallthrough with defers");
+}
+
+// Test: Duff's device with 1 item (minimal edge case)
+void test_duffs_device_single_item(void)
+{
+    int duff_total = 0;
+    int count = 1;
+    int n = (count + 3) / 4;
+    switch (count % 4)
+    {
+    case 0:
+        do
+        {
+            {
+                defer duff_total++;
+            }
+        case 3:
+        {
+            defer duff_total++;
+        }
+        case 2:
+        {
+            defer duff_total++;
+        }
+        case 1:
+        {
+            defer duff_total++;
+        }
+        } while (--n > 0);
+    }
+    CHECK_EQ(duff_total, 1, "duff single item: exactly 1 iteration");
+}
+
+// Test: Switch with goto between cases (forward) with defer
+void test_switch_goto_forward_case(void)
+{
+    log_reset();
+    int x = 1;
+    switch (x)
+    {
+    case 1:
+    {
+        defer log_append("A");
+        log_append("1");
+        goto skip;
+    }
+    case 2:
+    {
+        log_append("2");
+        break;
+    }
+    }
+skip:
+    log_append("E");
+    CHECK_LOG("1AE", "switch goto forward past cases");
+}
+
+// Test: Switch-loop-switch pattern (switch, loop around it, another switch)
+void test_switch_loop_switch(void)
+{
+    log_reset();
+    int sum = 0;
+    for (int i = 0; i < 2; i++)
+    {
+        defer log_append("L");
+        switch (i)
+        {
+        case 0:
+        {
+            defer log_append("X");
+            sum += 1;
+            break;
+        }
+        case 1:
+        {
+            defer log_append("Y");
+            sum += 10;
+            break;
+        }
+        }
+    }
+    log_append("E");
+    CHECK_EQ(sum, 11, "switch-loop-switch sum correct");
+    CHECK_LOG("XLYLE", "switch-loop-switch defer order");
+}
+
+// Test: 3-level nested switch with return from innermost
+int test_triple_nested_switch_return_helper(void)
+{
+    log_reset();
+    defer log_append("F");
+    switch (1)
+    {
+    case 1:
+    {
+        defer log_append("A");
+        switch (2)
+        {
+        case 2:
+        {
+            defer log_append("B");
+            switch (3)
+            {
+            case 3:
+            {
+                defer log_append("C");
+                log_append("X");
+                return 99;
+            }
+            }
+        }
+        }
+    }
+    }
+    return 0;
+}
+
+void test_triple_nested_switch_return(void)
+{
+    int ret = test_triple_nested_switch_return_helper();
+    CHECK_LOG("XCBAF", "triple nested switch return unwinds all");
+    CHECK_EQ(ret, 99, "triple nested switch return value");
+}
+
+void run_switch_defer_bulletproof_tests(void)
+{
+    printf("\n=== SWITCH + DEFER BULLETPROOF TESTS ===\n");
+    test_switch_sequential_no_leak();
+    test_switch_case_group_defer();
+    test_switch_case_group_fallthrough();
+    test_switch_deep_nested_break();
+    test_switch_deep_return();
+    test_switch_only_default();
+    test_switch_all_cases_defer();
+    test_switch_defer_enclosing_scope();
+    test_switch_nested_mixed_defer();
+    test_switch_nested_inner_defer();
+    test_switch_do_while_0();
+    test_switch_negative_cases();
+    test_switch_stmt_expr_defer();
+    test_switch_in_stmt_expr_in_switch();
+    test_switch_triple_sequential();
+    test_duffs_device_braced_defers();
+    test_duffs_device_all_entries();
+
+    test_switch_goto_deep();
+    CHECK_LOG("XNSEF", "switch goto deep unwinds through nested scopes");
+
+    test_switch_continue_enclosing_loop_defer();
+    test_switch_inner_break_isolation();
+    test_switch_computed_case();
+    test_switch_default_middle();
+    test_switch_multi_fallthrough();
+    test_duffs_device_single_item();
+    test_switch_goto_forward_case();
+    test_switch_loop_switch();
+    test_triple_nested_switch_return();
+}
+
 // SECTION 12: RIGOR TESTS - Testing identified concerns
 
 typedef void VoidType;
@@ -9831,6 +10597,7 @@ int main(void)
     run_switch_fallthrough_tests();
     run_complex_nesting_tests();
     run_case_label_tests();
+    run_switch_defer_bulletproof_tests();
     run_rigor_tests();
     run_silent_failure_tests();
     run_sizeof_constexpr_tests();

@@ -208,7 +208,8 @@ typedef struct
   int capacity;          // Current capacity of the arrays
   bool is_loop;          // true if this scope is a for/while/do loop
   bool is_switch;        // true if this scope is a switch statement
-  bool had_control_exit; // true if break/return/goto/continue seen since last defer in switch
+  bool had_control_exit; // true if unconditional break/return/goto/continue was seen
+                         // NOTE: only set on switch scopes (by mark_switch_control_exit)
   bool is_conditional;   // true if this scope is an if/while/for block (for tracking conditional control exits)
   bool seen_case_label;  // true if case/default label seen in this switch scope (for zero-init safety)
 } DeferScope;
@@ -607,6 +608,17 @@ static void mark_switch_control_exit(void)
   }
 }
 
+// Check if we're currently inside a switch scope
+static bool inside_switch_scope(void)
+{
+  for (int d = ctx->defer_depth - 1; d >= 0; d--)
+  {
+    if (defer_stack[d].is_switch)
+      return true;
+  }
+  return false;
+}
+
 // Clear defers at innermost switch scope when hitting case/default
 // This is necessary because the transpiler can't track which case was entered at runtime.
 // Note: This means defer in case with fallthrough will NOT preserve defers from previous cases.
@@ -615,16 +627,25 @@ static void mark_switch_control_exit(void)
 // because case labels can appear inside nested blocks (e.g., Duff's device pattern).
 static void clear_switch_scope_defers(void)
 {
-  // Find the switch scope and clear all scopes from current down to it
+  // First find the switch scope to avoid clearing non-switch scopes
+  // if case/default somehow appears outside a switch (malformed input)
+  int switch_depth = -1;
   for (int d = ctx->defer_depth - 1; d >= 0; d--)
   {
-    // Clear defers at this scope
+    if (defer_stack[d].is_switch)
+    {
+      switch_depth = d;
+      break;
+    }
+  }
+  if (switch_depth < 0)
+    return; // Not inside a switch — don't clear anything
+
+  // Clear all scopes from current depth down to and including the switch scope
+  for (int d = ctx->defer_depth - 1; d >= switch_depth; d--)
+  {
     defer_stack[d].count = 0;
     defer_stack[d].had_control_exit = false;
-
-    // Stop when we hit the switch scope
-    if (defer_stack[d].is_switch)
-      return;
   }
 }
 
@@ -3855,7 +3876,7 @@ static int transpile(char *input_file, char *output_file)
       }
     }
 
-    if (is_switch_label)
+    if (is_switch_label && inside_switch_scope())
     {
       // Check if there are active defers that would be lost (fallthrough scenario)
       // Must check ALL scopes from current depth down to the switch scope,
