@@ -1329,8 +1329,11 @@ typedef enum
 // The rule: if we find the label BEFORE exiting the scope containing the item, it's invalid.
 static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len, GotoCheckMode mode)
 {
-  // For DECL mode, only check when zero-init is enabled
-  if (mode == GOTO_CHECK_DECL && !ctx->feature_zeroinit)
+  // For DECL mode, check when zero-init OR defer is enabled.
+  // goto-over-initialization is UB regardless of zero-init; the defer goto handler
+  // (line ~3756) also calls this, and should still catch jumped-over declarations
+  // even when the user has disabled zero-init but kept defer on.
+  if (mode == GOTO_CHECK_DECL && !ctx->feature_zeroinit && !ctx->feature_defer)
     return NULL;
 
   // Scan forward from goto to find the label
