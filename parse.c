@@ -90,6 +90,19 @@ enum
     TF_IS_FLOAT = 1 << 2,
 };
 
+// Token tags - bitmask classification assigned once at tokenize time
+// Eliminates repeated string comparisons in the transpiler
+enum
+{
+    TT_TYPE = 1 << 0,      // Type keyword (int, char, void, struct, etc.)
+    TT_QUALIFIER = 1 << 1, // Type qualifier (const, volatile, restrict, static, auto, register, _Atomic, _Alignas, __attribute__)
+    TT_SUE = 1 << 2,       // struct/union/enum
+    TT_SKIP_DECL = 1 << 3, // Keywords that can't start a zero-init declaration
+    TT_ATTR = 1 << 4,      // Attribute keyword (__attribute__, __attribute, __declspec)
+    TT_ASSIGN = 1 << 5,    // Assignment or compound assignment operator (=, +=, ++, --, [)
+    TT_MEMBER = 1 << 6,    // Member access operator (. or ->)
+};
+
 struct Token
 {
     char *loc;
@@ -103,6 +116,7 @@ struct Token
     TokenKind kind;
     uint16_t file_idx;
     uint8_t flags;
+    uint8_t tag; // TT_* bitmask - token classification
 };
 
 // Token accessors
@@ -708,72 +722,112 @@ static inline bool equal(Token *tok, const char *op)
     return equiv && strlen(equiv) == len && !memcmp(equiv, op, len);
 }
 
+// Internal marker bit for keyword map: values are (tag | KW_MARKER)
+// This distinguishes tag=0 keywords from "not found" (NULL)
+#define KW_MARKER 0x80
+
 static void init_keyword_map(void)
 {
-    static char *kw[] = {
-        "return",
-        "if",
-        "else",
-        "for",
-        "while",
-        "do",
-        "switch",
-        "case",
-        "default",
-        "break",
-        "continue",
-        "goto",
-        "sizeof",
-        "alignof",
-        "struct",
-        "union",
-        "enum",
-        "typedef",
-        "static",
-        "extern",
-        "inline",
-        "const",
-        "volatile",
-        "restrict",
-        "_Atomic",
-        "_Noreturn",
-        "_Thread_local",
-        "void",
-        "char",
-        "short",
-        "int",
-        "long",
-        "float",
-        "double",
-        "signed",
-        "unsigned",
-        "_Bool",
-        "auto",
-        "register",
-        "_Alignas",
-        "_Static_assert",
-        "_Generic",
-        "typeof",
-        "__typeof__",
-        "asm",
-        "__asm__",
-        "__attribute__",
-        "__extension__",
-        "__builtin_va_list",
-        "__builtin_va_arg",
-        "__builtin_offsetof",
-        "__builtin_types_compatible_p",
+    // Each entry: {keyword, TT_* tag bitmask}
+    // Tags are assigned once here, then stored on tokens during convert_pp_tokens
+    static struct
+    {
+        char *name;
+        uint8_t tag;
+    } kw[] = {
+        // Control flow (skip-decl: can't start a zero-init declaration)
+        {"return", TT_SKIP_DECL},
+        {"if", TT_SKIP_DECL},
+        {"else", TT_SKIP_DECL},
+        {"for", TT_SKIP_DECL},
+        {"while", TT_SKIP_DECL},
+        {"do", TT_SKIP_DECL},
+        {"switch", TT_SKIP_DECL},
+        {"case", TT_SKIP_DECL},
+        {"default", TT_SKIP_DECL},
+        {"break", TT_SKIP_DECL},
+        {"continue", TT_SKIP_DECL},
+        {"goto", TT_SKIP_DECL},
+        {"sizeof", TT_SKIP_DECL},
+        {"alignof", TT_SKIP_DECL},
+        {"_Alignof", TT_SKIP_DECL},
+        {"_Generic", TT_SKIP_DECL},
+        {"_Static_assert", 0},
+        // struct/union/enum (also type keywords)
+        {"struct", TT_TYPE | TT_SUE},
+        {"union", TT_TYPE | TT_SUE},
+        {"enum", TT_TYPE | TT_SUE},
+        // Storage class / qualifiers that also skip decl
+        {"typedef", TT_SKIP_DECL},
+        {"static", TT_QUALIFIER | TT_SKIP_DECL},
+        {"extern", TT_SKIP_DECL},
+        {"inline", 0},
+        // Type qualifiers
+        {"const", TT_QUALIFIER},
+        {"volatile", TT_QUALIFIER},
+        {"restrict", TT_QUALIFIER},
+        {"_Atomic", TT_QUALIFIER | TT_TYPE},
+        {"_Noreturn", 0},
+        {"_Thread_local", 0},
+        // Type keywords
+        {"void", TT_TYPE},
+        {"char", TT_TYPE},
+        {"short", TT_TYPE},
+        {"int", TT_TYPE},
+        {"long", TT_TYPE},
+        {"float", TT_TYPE},
+        {"double", TT_TYPE},
+        {"signed", TT_TYPE},
+        {"unsigned", TT_TYPE},
+        {"_Bool", TT_TYPE},
+        {"bool", TT_TYPE},
+        {"_Complex", TT_TYPE},
+        {"_Imaginary", TT_TYPE},
+        {"__int128", TT_TYPE},
+        {"__int128_t", TT_TYPE},
+        {"__uint128", TT_TYPE},
+        {"__uint128_t", TT_TYPE},
+        {"typeof_unqual", TT_TYPE},
+        {"auto", TT_QUALIFIER},
+        {"register", TT_QUALIFIER},
+        {"_Alignas", TT_QUALIFIER},
+        {"typeof", TT_TYPE},
+        {"__typeof__", TT_TYPE},
+        {"__typeof", TT_TYPE},
+        {"_BitInt", TT_TYPE},
+        // Asm (skip-decl: can't start a declaration)
+        {"asm", TT_SKIP_DECL},
+        {"__asm__", TT_SKIP_DECL},
+        {"__asm", TT_SKIP_DECL},
+        // Attributes
+        {"__attribute__", TT_ATTR | TT_QUALIFIER},
+        {"__attribute", TT_ATTR | TT_QUALIFIER},
+        {"__declspec", TT_ATTR | TT_QUALIFIER},
+        // Other builtins
+        {"__extension__", 0},
+        {"__builtin_va_list", 0},
+        {"__builtin_va_arg", 0},
+        {"__builtin_offsetof", 0},
+        {"__builtin_types_compatible_p", 0},
         // Prism keywords
-        "defer",
-        "raw",
+        {"defer", 0},
+        {"raw", 0},
     };
     for (size_t i = 0; i < sizeof(kw) / sizeof(*kw); i++)
-        hashmap_put(&ctx->keyword_map, kw[i], strlen(kw[i]), (void *)1);
+        hashmap_put(&ctx->keyword_map, kw[i].name, strlen(kw[i].name),
+                    (void *)(uintptr_t)(kw[i].tag | KW_MARKER));
 }
 
 static bool is_keyword(Token *tok)
 {
     return hashmap_get(&ctx->keyword_map, tok->loc, tok->len) != NULL;
+}
+
+// Get the tag bits for a keyword (0 if not a keyword)
+static uint8_t keyword_tag(Token *tok)
+{
+    void *val = hashmap_get(&ctx->keyword_map, tok->loc, tok->len);
+    return val ? (uint8_t)((uintptr_t)val & ~KW_MARKER) : 0;
 }
 
 // Forward declaration for hex digit conversion
@@ -1427,9 +1481,46 @@ static void convert_pp_tokens(Token *tok)
     for (Token *t = tok; t && t->kind != TK_EOF; t = t->next)
     {
         if (is_keyword(t))
+        {
             t->kind = TK_KEYWORD;
+            t->tag = keyword_tag(t);
+        }
         else if (t->kind == TK_PP_NUM)
             convert_pp_number(t);
+        else if (t->kind == TK_PUNCT)
+        {
+            // Tag punctuators: assignment ops and member access
+            char c = t->loc[0];
+            if (t->len == 1)
+            {
+                if (c == '=' || c == '[')
+                    t->tag = TT_ASSIGN;
+                else if (c == '.')
+                    t->tag = TT_MEMBER;
+            }
+            else if (t->len == 2)
+            {
+                char c2 = t->loc[1];
+                if (c2 == '=')
+                {
+                    // +=, -=, *=, /=, %=, &=, |=, ^= are assignment; !=, <=, >= are not
+                    if (c != '!' && c != '<' && c != '>' && c != '=')
+                        t->tag = TT_ASSIGN;
+                }
+                else if (c == '+' && c2 == '+')
+                    t->tag = TT_ASSIGN;
+                else if (c == '-' && c2 == '-')
+                    t->tag = TT_ASSIGN;
+                else if (c == '-' && c2 == '>')
+                    t->tag = TT_MEMBER;
+            }
+            else if (t->len == 3 && t->loc[2] == '=')
+            {
+                // <<= and >>=
+                if ((c == '<' || c == '>') && t->loc[1] == c)
+                    t->tag = TT_ASSIGN;
+            }
+        }
     }
 }
 
@@ -1818,11 +1909,15 @@ Token *tokenize_file(char *path)
     return tokenize(file);
 }
 
-// Reset state for reuse (keeps arena blocks for reuse)
-void tokenizer_reset(void)
+// Teardown tokenizer state
+// full=false: reset for reuse (keeps arena blocks allocated)
+// full=true:  free all memory including arena blocks and keyword map
+void tokenizer_teardown(bool full)
 {
-    arena_reset(&ctx->main_arena);
-    // Free file view cache first (before freeing files)
+    if (full)
+        arena_free(&ctx->main_arena);
+    else
+        arena_reset(&ctx->main_arena);
     free_file_view_cache();
     for (int i = 0; i < ctx->input_file_count; i++)
         free_file(ctx->input_files[i]);
@@ -1831,24 +1926,7 @@ void tokenizer_reset(void)
     ctx->input_file_count = 0;
     ctx->input_file_capacity = 0;
     ctx->current_file = NULL;
-    // Free interned filenames last (after all files are freed)
     free_filename_intern_map();
-}
-
-// Full cleanup - frees all memory including arena blocks
-void tokenizer_cleanup(void)
-{
-    arena_free(&ctx->main_arena);
-    // Free file view cache first (before freeing files)
-    free_file_view_cache();
-    for (int i = 0; i < ctx->input_file_count; i++)
-        free_file(ctx->input_files[i]);
-    free(ctx->input_files);
-    ctx->input_files = NULL;
-    ctx->input_file_count = 0;
-    ctx->input_file_capacity = 0;
-    ctx->current_file = NULL;
-    // Free interned filenames last (after all files are freed)
-    free_filename_intern_map();
-    hashmap_clear(&ctx->keyword_map);
+    if (full)
+        hashmap_clear(&ctx->keyword_map);
 }

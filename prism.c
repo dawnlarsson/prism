@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.101.0"
+#define PRISM_VERSION "0.102.0"
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -140,61 +140,47 @@ static const char *get_tmp_dir(void)
 
 static Token *skip_balanced(Token *tok, char *open, char *close);
 
-// Check if token is an attribute keyword (__attribute__, __attribute, __declspec)
-static inline bool is_attribute_keyword(Token *tok)
-{
-  return equal(tok, "__attribute__") || equal(tok, "__attribute") || equal(tok, "__declspec");
-}
-
 // Check if token is identifier-like (TK_IDENT or TK_KEYWORD like 'raw'/'defer')
 static inline bool is_identifier_like(Token *tok)
 {
   return tok->kind == TK_IDENT || tok->kind == TK_KEYWORD;
 }
 
-// Skip all attributes (GNU-style and C23-style) starting at tok
-// Returns pointer to first token after all attributes
+// Skip GNU/MSVC-style attributes: __attribute__((...)), __declspec(...)
+static Token *skip_gnu_attributes(Token *tok)
+{
+  while (tok && (tok->tag & TT_ATTR))
+  {
+    tok = tok->next;
+    if (tok && equal(tok, "("))
+      tok = skip_balanced(tok, "(", ")");
+  }
+  return tok;
+}
+
+// Skip all attributes (GNU-style and C23-style [[...]])
 static Token *skip_all_attributes(Token *tok)
 {
   while (tok && tok->kind != TK_EOF)
   {
-    // Skip GNU/MSVC-style: __attribute__((...)), __declspec(...)
-    if (is_attribute_keyword(tok))
+    if (tok->tag & TT_ATTR)
     {
-      tok = tok->next;
-      if (tok && equal(tok, "("))
-        tok = skip_balanced(tok, "(", ")");
+      tok = skip_gnu_attributes(tok);
       continue;
     }
-    // Skip C23-style: [[...]]
     if (equal(tok, "[") && tok->next && equal(tok->next, "["))
     {
       tok = tok->next->next;
       int depth = 1;
       while (tok && tok->kind != TK_EOF && depth > 0)
       {
-        if (equal(tok, "["))
-          depth++;
-        else if (equal(tok, "]"))
-          depth--;
+        if (equal(tok, "[")) depth++;
+        else if (equal(tok, "]")) depth--;
         tok = tok->next;
       }
       continue;
     }
     break;
-  }
-  return tok;
-}
-
-// Skip only GNU/MSVC-style attributes: __attribute__((...)), __declspec(...)
-// For use when C23 [[...]] attributes aren't expected
-static Token *skip_gnu_attributes(Token *tok)
-{
-  while (tok && is_attribute_keyword(tok))
-  {
-    tok = tok->next;
-    if (tok && equal(tok, "("))
-      tok = skip_balanced(tok, "(", ")");
   }
   return tok;
 }
@@ -703,27 +689,6 @@ static bool needs_space(Token *prev, Token *tok)
          (prev_last == '*' && tok_first == '/');
 }
 
-// Check if token is a member access operator (. or ->)
-// Used to distinguish keyword usage from struct member names
-static bool is_member_access(Token *tok)
-{
-  return tok && tok->kind == TK_PUNCT && (equal(tok, ".") || equal(tok, "->"));
-}
-
-// Check if token is an assignment or compound assignment operator
-// Used to distinguish variable assignments from keyword statements
-static bool is_assignment_op(Token *tok)
-{
-  if (!tok)
-    return false;
-
-  return equal(tok, "=") || equal(tok, "+=") || equal(tok, "-=") ||
-         equal(tok, "*=") || equal(tok, "/=") || equal(tok, "%=") ||
-         equal(tok, "&=") || equal(tok, "|=") || equal(tok, "^=") ||
-         equal(tok, "<<=") || equal(tok, ">>=") || equal(tok, "++") ||
-         equal(tok, "--") || equal(tok, "[");
-}
-
 // Check if 'tok' is inside a __attribute__((...)) or __declspec(...) context.
 // This prevents 'defer' from being recognized as a keyword when it appears
 // as a function name inside cleanup() or similar attributes.
@@ -1137,22 +1102,15 @@ static bool is_known_enum_const(Token *tok)
   return typedef_table.entries[idx].is_enum_const;
 }
 
-// Check if token is struct/union/enum keyword
-static bool is_sue_keyword(Token *tok)
-{
-  return equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum");
-}
-
 // Given a struct/union/enum keyword, find its opening brace if it has a body.
 // Handles: "struct {", "struct name {", "struct __attribute__((packed)) name {"
 // Returns the '{' token, or NULL if no body (e.g., "struct name;" or "struct name var;")
 static Token *find_struct_body_brace(Token *tok)
 {
   Token *t = tok->next;
-  while (t && (t->kind == TK_IDENT || is_attribute_keyword(t) ||
-               equal(t, "_Alignas") || equal(t, "alignas")))
+  while (t && (t->kind == TK_IDENT || (t->tag & (TT_ATTR | TT_QUALIFIER))))
   {
-    if (is_attribute_keyword(t) || equal(t, "_Alignas") || equal(t, "alignas"))
+    if (t->tag & (TT_ATTR | TT_QUALIFIER))
     {
       t = t->next;
       if (t && equal(t, "("))
@@ -1188,7 +1146,7 @@ static void scan_labels_in_function(Token *tok)
   while (tok && tok->kind != TK_EOF)
   {
     // Track struct/union/enum bodies to skip bitfield declarations
-    if (is_sue_keyword(tok))
+    if (tok->tag & TT_SUE)
     {
       Token *brace = find_struct_body_brace(tok);
       if (brace)
@@ -1370,7 +1328,7 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
     }
 
     // Track struct/union/enum bodies to skip bitfield declarations
-    if (is_sue_keyword(tok))
+    if (tok->tag & TT_SUE)
     {
       Token *brace = find_struct_body_brace(tok);
       if (brace)
@@ -1454,7 +1412,7 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
       // Check for defer statement (not a label named "defer:")
       if (tok->kind == TK_KEYWORD && equal(tok, "defer") &&
           !equal(tok->next, ":") && // Distinguish from label named "defer:"
-          !is_member_access(prev) && !is_variable_name && !is_assignment_op(tok->next))
+          !(prev && (prev->tag & TT_MEMBER)) && !is_variable_name && !(tok->next && (tok->next->tag & TT_ASSIGN)))
       {
         if (!active_item || depth <= active_item_depth)
         {
@@ -1517,9 +1475,7 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
           }
           else
           {
-            while (t && (equal(t, "int") || equal(t, "char") || equal(t, "short") ||
-                         equal(t, "long") || equal(t, "float") || equal(t, "double") ||
-                         equal(t, "signed") || equal(t, "unsigned") ||
+            while (t && ((t->tag & TT_TYPE) ||
                          is_known_typedef(t)))
               t = t->next;
           }
@@ -1611,9 +1567,9 @@ static bool is_void_function_decl(Token *tok)
   // Skip storage class specifiers and attributes
   while (tok && (equal(tok, "static") || equal(tok, "inline") || equal(tok, "extern") ||
                  equal(tok, "_Noreturn") || equal(tok, "__inline") || equal(tok, "__inline__") ||
-                 equal(tok, "typedef") || is_attribute_keyword(tok)))
+                 equal(tok, "typedef") || (tok->tag & TT_ATTR)))
   {
-    if (is_attribute_keyword(tok))
+    if (tok->tag & TT_ATTR)
       tok = skip_gnu_attributes(tok);
     else
       tok = tok->next;
@@ -1632,9 +1588,9 @@ static bool is_void_function_decl(Token *tok)
   // Skip attributes and qualifiers after void
   while (tok && (equal(tok, "const") || equal(tok, "volatile") ||
                  equal(tok, "__restrict") || equal(tok, "__restrict__") ||
-                 is_attribute_keyword(tok)))
+                 (tok->tag & TT_ATTR)))
   {
-    if (is_attribute_keyword(tok))
+    if (tok->tag & TT_ATTR)
       tok = skip_gnu_attributes(tok);
     else
       tok = tok->next;
@@ -1671,7 +1627,7 @@ static Token *scan_typedef_base_type(Token *tok)
   tok = skip_gnu_attributes(tok);
 
   // Handle struct/union/enum
-  if (tok && is_sue_keyword(tok))
+  if (tok && (tok->tag & TT_SUE))
   {
     tok = tok->next;
 
@@ -1966,10 +1922,10 @@ static inline bool is_const_array_size(Token *open_bracket)
   return !array_size_is_vla(open_bracket, true);
 }
 
-// Check if a struct/union body contains any true VLA arrays (not just patterns
-// that look like VLAs for zero-init purposes, but actual variable-length arrays)
-// Scans from the opening { to the closing }
-static bool struct_body_contains_true_vla(Token *open_brace)
+// Check if a struct/union body contains VLA arrays
+// strict_mode=false: true VLAs only (offsetof patterns are constants)
+// strict_mode=true:  conservative, treats offsetof-like patterns as VLAs too
+static bool struct_body_contains_vla(Token *open_brace, bool strict_mode)
 {
   if (!open_brace || !equal(open_brace, "{"))
     return false;
@@ -1985,37 +1941,7 @@ static bool struct_body_contains_true_vla(Token *open_brace)
       depth--;
     else if (equal(tok, "[") && depth > 0)
     {
-      // Found an array dimension at any level within the struct/union
-      // Use strict_mode=false: offsetof patterns are OK in struct validation
-      if (array_size_is_vla(tok, false))
-        return true;
-    }
-    tok = tok->next;
-  }
-  return false;
-}
-
-// Check if a struct/union body contains any VLA-like arrays (for zero-init purposes)
-// This is more conservative than struct_body_contains_true_vla
-// Scans from the opening { to the closing }
-static bool struct_body_contains_vla(Token *open_brace)
-{
-  if (!open_brace || !equal(open_brace, "{"))
-    return false;
-
-  Token *tok = open_brace->next;
-  int depth = 1;
-
-  while (tok && tok->kind != TK_EOF && depth > 0)
-  {
-    if (equal(tok, "{"))
-      depth++;
-    else if (equal(tok, "}"))
-      depth--;
-    else if (equal(tok, "[") && depth > 0)
-    {
-      // Found an array dimension at any level within the struct/union
-      if (!is_const_array_size(tok))
+      if (array_size_is_vla(tok, strict_mode))
         return true;
     }
     tok = tok->next;
@@ -2078,97 +2004,14 @@ static void parse_typedef_declaration(Token *tok, int scope_depth)
 }
 
 // Zero-init helpers
-// Sorted array of type keywords for binary search (replaces HashMap)
-static const char *const type_keywords[] = {
-    "FILE",
-    "_BitInt",
-    "_Bool",
-    "_Complex",
-    "_Imaginary",
-    "__int128",
-    "__int128_t",
-    "__typeof",
-    "__typeof__",
-    "__uint128",
-    "__uint128_t",
-    "bool",
-    "char",
-    "complex",
-    "double",
-    "enum",
-    "float",
-    "fpos_t",
-    "imaginary",
-    "int",
-    "int16_t",
-    "int32_t",
-    "int64_t",
-    "int8_t",
-    "int_fast16_t",
-    "int_fast32_t",
-    "int_fast64_t",
-    "int_fast8_t",
-    "int_least16_t",
-    "int_least32_t",
-    "int_least64_t",
-    "int_least8_t",
-    "intmax_t",
-    "intptr_t",
-    "long",
-    "off_t",
-    "pid_t",
-    "ptrdiff_t",
-    "short",
-    "signed",
-    "size_t",
-    "ssize_t",
-    "struct",
-    "time_t",
-    "typeof",
-    "typeof_unqual",
-    "uint16_t",
-    "uint32_t",
-    "uint64_t",
-    "uint8_t",
-    "uint_fast16_t",
-    "uint_fast32_t",
-    "uint_fast64_t",
-    "uint_fast8_t",
-    "uint_least16_t",
-    "uint_least32_t",
-    "uint_least64_t",
-    "uint_least8_t",
-    "uintmax_t",
-    "uintptr_t",
-    "union",
-    "unsigned",
-    "void",
-    "wchar_t",
-    "wint_t",
-};
-
-static int compare_keyword(const void *a, const void *b)
-{
-  const char *key = (const char *)a;
-  const char *const *keyword = (const char *const *)b;
-  return strcmp(key, *keyword);
-}
 
 static bool is_type_keyword(Token *tok)
 {
   if (tok->kind != TK_KEYWORD && tok->kind != TK_IDENT)
     return false;
 
-  // Create a null-terminated string from token for comparison
-  char buf[256];
-  if (tok->len >= (int)sizeof(buf))
-    return false;
-  memcpy(buf, tok->loc, tok->len);
-  buf[tok->len] = '\0';
-
-  // Binary search in sorted array
-  if (bsearch(buf, type_keywords, sizeof(type_keywords) / sizeof(type_keywords[0]),
-              sizeof(type_keywords[0]), compare_keyword))
+  // Tagged type keywords (int, char, struct, etc.) - O(1) bitmask check
+  if (tok->tag & TT_TYPE)
     return true;
 
   // User-defined typedefs (tracked during transpilation)
@@ -2181,33 +2024,6 @@ static bool is_type_keyword(Token *tok)
   if (!is_known_shadow(tok) && looks_like_system_typedef(tok))
     return true;
 
-  return false;
-}
-
-static bool is_type_qualifier(Token *tok)
-{
-  if (tok->kind != TK_KEYWORD && tok->kind != TK_IDENT)
-    return false;
-  return equal(tok, "const") || equal(tok, "volatile") || equal(tok, "restrict") ||
-         equal(tok, "static") || equal(tok, "auto") || equal(tok, "register") ||
-         equal(tok, "_Atomic") || equal(tok, "_Alignas") || equal(tok, "alignas") ||
-         is_attribute_keyword(tok);
-}
-
-static bool is_skip_decl_keyword(Token *tok)
-{
-  // Storage class specifiers that prism shouldn't zero-init
-  if (equal(tok, "extern") || equal(tok, "typedef") || equal(tok, "static"))
-    return true;
-  // Expression keywords that cannot start a declaration
-  if (equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof") ||
-      equal(tok, "_Generic") || equal(tok, "return") || equal(tok, "if") ||
-      equal(tok, "else") || equal(tok, "while") || equal(tok, "for") ||
-      equal(tok, "do") || equal(tok, "switch") || equal(tok, "case") ||
-      equal(tok, "default") || equal(tok, "break") || equal(tok, "continue") ||
-      equal(tok, "goto") || equal(tok, "asm") || equal(tok, "__asm__") ||
-      equal(tok, "__asm"))
-    return true;
   return false;
 }
 
@@ -2356,7 +2172,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
 {
   TypeSpecResult r = {tok, false, false, false, false, false, false, false, false};
 
-  while (is_type_qualifier(tok) || is_type_keyword(tok) ||
+  while ((tok->tag & TT_QUALIFIER) || is_type_keyword(tok) ||
          (tok && equal(tok, "[") && tok->next && equal(tok->next, "[")))
   {
     // Track _Atomic
@@ -2394,14 +2210,13 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       r.saw_type = true;
 
     // struct/union/enum
-    if (is_sue_keyword(tok))
+    if (tok->tag & TT_SUE)
     {
       r.is_struct = true;
       r.saw_type = true;
       tok = tok->next;
       // Skip attributes before tag
-      while (tok && (is_attribute_keyword(tok) ||
-                     equal(tok, "_Alignas") || equal(tok, "alignas")))
+      while (tok && (tok->tag & (TT_ATTR | TT_QUALIFIER)))
       {
         tok = tok->next;
         if (tok && equal(tok, "("))
@@ -2413,9 +2228,9 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       // Skip body
       if (tok && equal(tok, "{"))
       {
-        if (struct_body_contains_true_vla(tok))
+        if (struct_body_contains_vla(tok, false))
           error_tok(tok, "variable length array in struct/union is not supported");
-        if (struct_body_contains_vla(tok))
+        if (struct_body_contains_vla(tok, true))
           r.is_vla = true;
         tok = skip_balanced(tok, "{", "}");
       }
@@ -2456,7 +2271,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       Token *inner_start = tok->next; // Start of inner type (after '(')
       tok = skip_balanced(tok, "(", ")");
       // Check if inner type is struct/union/enum
-      if (inner_start && is_sue_keyword(inner_start))
+      if (inner_start && (inner_start->tag & TT_SUE))
         r.is_struct = true;
       // Also check for typedef'd types inside _Atomic(...)
       if (inner_start && inner_start->kind == TK_IDENT && is_known_typedef(inner_start))
@@ -2465,8 +2280,8 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       continue;
     }
 
-    // _Alignas/alignas/__attribute__
-    if (equal(tok, "_Alignas") || equal(tok, "alignas") || is_attribute_keyword(tok))
+    // _Alignas/alignas/__attribute__ (all tagged as TT_QUALIFIER or TT_ATTR)
+    if ((tok->tag & TT_ATTR) || equal(tok, "_Alignas") || equal(tok, "alignas"))
     {
       tok = tok->next;
       if (tok && equal(tok, "("))
@@ -2484,7 +2299,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
         r.is_vla = true;
       // Check if next token is declarator (not part of type)
       Token *peek = tok->next;
-      while (peek && is_type_qualifier(peek))
+      while (peek && (peek->tag & TT_QUALIFIER))
         peek = peek->next;
       if (peek && peek->kind == TK_IDENT)
       {
@@ -2508,7 +2323,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
   if (!r.saw_type && tok->kind == TK_IDENT && (is_known_typedef(tok) || (!is_known_shadow(tok) && looks_like_system_typedef(tok))))
   {
     Token *t = tok->next;
-    while (t && is_type_qualifier(t))
+    while (t && (t->tag & TT_QUALIFIER))
       t = t->next;
     if (t && t->kind == TK_IDENT && !equal(tok->next, "*"))
     {
@@ -2620,11 +2435,11 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
   DeclResult r = {tok, NULL, false, false, false, false, false, false};
 
   // Pointer modifiers and qualifiers
-  while (equal(tok, "*") || is_type_qualifier(tok))
+  while (equal(tok, "*") || (tok->tag & TT_QUALIFIER))
   {
     if (equal(tok, "*"))
       r.is_pointer = true;
-    if (is_attribute_keyword(tok))
+    if (tok->tag & TT_ATTR)
     {
       tok = skip_emit_attribute(tok);
       continue;
@@ -2654,13 +2469,13 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
     r.has_paren = true;
 
     // Handle nesting: (*(*(*name)...
-    while (equal(tok, "*") || is_type_qualifier(tok) || equal(tok, "("))
+    while (equal(tok, "*") || (tok->tag & TT_QUALIFIER) || equal(tok, "("))
     {
       if (equal(tok, "*"))
         r.is_pointer = true;
       else if (equal(tok, "("))
         nested_paren++;
-      if (is_attribute_keyword(tok))
+      if (tok->tag & TT_ATTR)
       {
         tok = skip_emit_attribute(tok);
         continue;
@@ -2684,7 +2499,7 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
   tok = tok->next;
 
   // Skip __attribute__ after variable name
-  while (is_attribute_keyword(tok))
+  while (tok->tag & TT_ATTR)
   {
     tok = skip_emit_attribute(tok);
   }
@@ -2741,7 +2556,7 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
   }
 
   // Skip __attribute__ before initializer or end of declarator
-  while (is_attribute_keyword(tok))
+  while (tok->tag & TT_ATTR)
   {
     tok = skip_emit_attribute(tok);
   }
@@ -2766,7 +2581,7 @@ static DeclValidation validate_declaration(Token *type_end, Token *warn_loc)
   Token *check = type_end;
 
   // Skip pointer modifiers and qualifiers to find first declarator token
-  while (equal(check, "*") || is_type_qualifier(check))
+  while (equal(check, "*") || (check->tag & TT_QUALIFIER))
   {
     if (equal(check, "__attribute__") || equal(check, "__attribute"))
     {
@@ -2867,12 +2682,9 @@ static bool is_raw_declaration_context(Token *after_raw)
 {
   if (!after_raw)
     return false;
-  // If followed by a type keyword, typedef, or attribute, 'raw' is the prism keyword
+  // If followed by a type keyword, typedef, qualifier, or attribute, 'raw' is the prism keyword
   return is_type_keyword(after_raw) || is_known_typedef(after_raw) ||
-         is_type_qualifier(after_raw) || is_sue_keyword(after_raw) ||
-         equal(after_raw, "__attribute__") || equal(after_raw, "__attribute") ||
-         equal(after_raw, "typeof") || equal(after_raw, "__typeof__") ||
-         equal(after_raw, "_Atomic");
+         (after_raw->tag & (TT_QUALIFIER | TT_SUE));
 }
 
 // Emit tokens from start through semicolon
@@ -3079,7 +2891,7 @@ static Token *try_zero_init_decl(Token *tok)
     start = tok;
 
   // Handle storage class specifiers
-  if (is_skip_decl_keyword(tok))
+  if (tok->tag & TT_SKIP_DECL)
   {
     if (is_raw)
       return emit_to_semicolon(start);
@@ -3352,14 +3164,14 @@ static int transpile(char *input_file, char *output_file)
   if (!tok)
   {
     fprintf(stderr, "Failed to tokenize preprocessed output\n");
-    tokenizer_reset(); // Clean up tokenizer state on error
+    tokenizer_teardown(false); // Clean up tokenizer state on error
     return 0;
   }
 
   FILE *out_fp = fopen(output_file, "w");
   if (!out_fp)
   {
-    tokenizer_reset(); // Clean up tokenizer state on error
+    tokenizer_teardown(false); // Clean up tokenizer state on error
     return 0;
   }
   out_init(out_fp);
@@ -3467,9 +3279,9 @@ static int transpile(char *input_file, char *output_file)
     if (ctx->feature_defer && tok->kind == TK_KEYWORD && equal(tok, "defer") &&
         !equal(tok->next, ":") &&                         // Distinguish defer statement from label named "defer:"
         !(last_emitted && equal(last_emitted, "goto")) && // Distinguish from "goto defer;"
-        !is_member_access(last_emitted) && ctx->struct_depth == 0 &&
+        !(last_emitted && (last_emitted->tag & TT_MEMBER)) && ctx->struct_depth == 0 &&
         !(last_emitted && (is_type_keyword(last_emitted) || equal(last_emitted, "typedef"))) &&
-        !is_known_typedef(tok) && !is_assignment_op(tok->next) &&
+        !is_known_typedef(tok) && !(tok->next && (tok->next->tag & TT_ASSIGN)) &&
         !is_inside_attribute(tok))
     {
       // Check for defer inside for/while/switch/if parentheses - this is invalid
@@ -3942,16 +3754,16 @@ static int transpile(char *input_file, char *output_file)
       next_func_returns_void = true;
 
     // Track struct/union/enum to avoid zero-init inside them
-    if (is_sue_keyword(tok))
+    if (tok->tag & TT_SUE)
     {
       bool is_enum = equal(tok, "enum");
       // Look ahead to see if this has a body
       // Must handle: struct name {, struct {, struct __attribute__((...)) name {
       Token *t = tok->next;
       // Skip identifiers and __attribute__((...))
-      while (t && (t->kind == TK_IDENT || is_attribute_keyword(t)))
+      while (t && (t->kind == TK_IDENT || (t->tag & TT_ATTR)))
       {
-        if (is_attribute_keyword(t))
+        if (t->tag & TT_ATTR)
         {
           t = t->next;
           // Skip (( ... ))
@@ -4219,7 +4031,7 @@ static int transpile(char *input_file, char *output_file)
 
   // Reset tokenizer state for library mode reuse
   // This frees arena blocks and file state, preparing for next transpilation
-  tokenizer_reset();
+  tokenizer_teardown(false);
 
   return 1;
 }
@@ -4418,7 +4230,7 @@ PRISM_API void prism_free(PrismResult *r)
 PRISM_API void prism_reset(void)
 {
   // Full tokenizer cleanup (parse.c) - frees arena blocks
-  tokenizer_cleanup();
+  tokenizer_teardown(true);
 
   // Reset defer stack
   for (int i = 0; i < defer_stack_capacity; i++)
@@ -5094,97 +4906,43 @@ static Cli cli_parse(int argc, char **argv)
       continue;
     }
 
-    // ─── GCC-compatible: include paths ───
-    if (!strcmp(arg, "-I"))
+    // ─── GCC-compatible: -I/-D/-U/-isystem/-include (table-driven) ───
     {
-      if (i + 1 < argc)
+      // Flags that register a value with a handler and forward to CC
+      // Supports both space-separated (-I dir) and joined (-Idir) forms
+      typedef enum { REG_INCLUDE, REG_DEFINE, REG_PP, REG_FORCE_INCLUDE } RegKind;
+      static const struct { const char *flag; int len; RegKind kind; } reg_flags[] = {
+        {"-I",       2, REG_INCLUDE},
+        {"-D",       2, REG_DEFINE},
+        {"-U",       2, REG_PP},
+        {"-isystem", 8, REG_INCLUDE},
+        {"-include", 8, REG_FORCE_INCLUDE},
+      };
+      bool reg_handled = false;
+      for (int r = 0; r < (int)(sizeof(reg_flags) / sizeof(reg_flags[0])); r++)
       {
-        const char *path = argv[++i];
-        cli_add_include(&cli, path);
-        cli_add_cc_arg(&cli, "-I");
-        cli_add_cc_arg(&cli, path);
+        int flen = reg_flags[r].len;
+        if (strncmp(arg, reg_flags[r].flag, flen) != 0)
+          continue;
+        const char *val = arg[flen] ? arg + flen : (i + 1 < argc ? argv[++i] : NULL);
+        if (!val) { reg_handled = true; break; }
+        bool joined = (arg[flen] != '\0');
+        switch (reg_flags[r].kind)
+        {
+          case REG_INCLUDE:       cli_add_include(&cli, val); break;
+          case REG_DEFINE:        cli_add_define(&cli, val); break;
+          case REG_FORCE_INCLUDE: cli_add_force_include(&cli, val); break;
+          case REG_PP:
+            cli_add_pp_flag(&cli, arg);
+            if (!joined) cli_add_pp_flag(&cli, val);
+            break;
+        }
+        if (joined) { cli_add_cc_arg(&cli, arg); }
+        else { cli_add_cc_arg(&cli, reg_flags[r].flag); cli_add_cc_arg(&cli, val); }
+        reg_handled = true;
+        break;
       }
-      continue;
-    }
-    if (str_startswith(arg, "-I"))
-    {
-      const char *path = arg + 2;
-      cli_add_include(&cli, path);
-      cli_add_cc_arg(&cli, arg);
-      continue;
-    }
-
-    // ─── GCC-compatible: defines ───
-    if (!strcmp(arg, "-D"))
-    {
-      if (i + 1 < argc)
-      {
-        const char *def = argv[++i];
-        cli_add_define(&cli, def);
-        cli_add_cc_arg(&cli, "-D");
-        cli_add_cc_arg(&cli, def);
-      }
-      continue;
-    }
-    if (str_startswith(arg, "-D"))
-    {
-      const char *def = arg + 2;
-      cli_add_define(&cli, def);
-      cli_add_cc_arg(&cli, arg);
-      continue;
-    }
-
-    // ─── GCC-compatible: undefines ───
-    if (!strcmp(arg, "-U"))
-    {
-      cli_add_pp_flag(&cli, arg);
-      cli_add_cc_arg(&cli, arg);
-      if (i + 1 < argc)
-      {
-        const char *undef = argv[++i];
-        cli_add_pp_flag(&cli, undef);
-        cli_add_cc_arg(&cli, undef);
-      }
-      continue;
-    }
-    if (str_startswith(arg, "-U"))
-    {
-      cli_add_pp_flag(&cli, arg);
-      cli_add_cc_arg(&cli, arg);
-      continue;
-    }
-
-    // ─── GCC-compatible: force include ───
-    if (!strcmp(arg, "-include"))
-    {
-      cli_add_cc_arg(&cli, arg);
-      if (i + 1 < argc)
-      {
-        const char *path = argv[++i];
-        cli_add_cc_arg(&cli, path);
-        cli_add_force_include(&cli, path);
-      }
-      continue;
-    }
-
-    // ─── GCC-compatible: system include path ───
-    if (!strcmp(arg, "-isystem"))
-    {
-      if (i + 1 < argc)
-      {
-        const char *path = argv[++i];
-        cli_add_include(&cli, path);
-        cli_add_cc_arg(&cli, "-isystem");
-        cli_add_cc_arg(&cli, path);
-      }
-      continue;
-    }
-    if (str_startswith(arg, "-isystem"))
-    {
-      const char *path = arg + 8;
-      cli_add_include(&cli, path);
-      cli_add_cc_arg(&cli, arg);
-      continue;
+      if (reg_handled) continue;
     }
 
     // ─── Source files ───
