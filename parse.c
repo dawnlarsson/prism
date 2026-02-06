@@ -205,25 +205,6 @@ static void arena_free(Arena *arena)
     arena->current = NULL;
 }
 
-// Token arena - specialized for Token allocation
-#define TOKEN_ARENA_BLOCK_SIZE (4096 * sizeof(Token))
-static Arena token_arena = {.default_block_size = TOKEN_ARENA_BLOCK_SIZE};
-
-static Token *arena_alloc_token(void)
-{
-    return arena_alloc(&token_arena, sizeof(Token));
-}
-
-// String arena - for string data (literals, identifiers, etc.)
-#define STRING_ARENA_BLOCK_SIZE (64 * 1024)
-static Arena string_arena = {.default_block_size = STRING_ARENA_BLOCK_SIZE};
-
-static char *string_arena_alloc(size_t size)
-{
-    return arena_alloc(&string_arena, size);
-}
-
-// Simple hashmap for keywords
 typedef struct
 {
     char *key;
@@ -237,6 +218,97 @@ typedef struct
     int capacity;
     int used;
 } HashMap;
+
+typedef struct PrismContext
+{
+    Arena main_arena;
+    File *current_file;
+    File **input_files;
+    int input_file_count;
+    int input_file_capacity;
+    bool at_bol;
+    bool has_space;
+    HashMap filename_intern_map;
+    HashMap file_view_cache;
+    HashMap keyword_map;
+#ifdef PRISM_LIB_MODE
+    jmp_buf error_jmp;
+    bool error_jmp_set;
+    char error_msg[1024];
+    int error_line;
+    int error_col;
+#endif
+    bool feature_defer;
+    bool feature_zeroinit;
+    bool feature_warn_safety;
+    bool feature_flatten_headers;
+    bool emit_line_directives;
+    const char *extra_compiler;
+    const char **extra_compiler_flags;
+    int extra_compiler_flags_count;
+    const char **extra_include_paths;
+    int extra_include_count;
+    const char **extra_defines;
+    int extra_define_count;
+    const char **extra_force_includes;
+    int extra_force_include_count;
+    int struct_depth;
+    int defer_depth;
+    bool next_scope_is_loop;
+    bool next_scope_is_switch;
+    bool next_scope_is_conditional;
+    bool in_for_init;
+    bool pending_for_paren;
+    int conditional_block_depth;
+    int generic_paren_depth;
+    bool current_func_returns_void;
+    bool current_func_has_setjmp;
+    bool current_func_has_asm;
+    bool current_func_has_vfork;
+    int stmt_expr_count;
+    bool last_system_header;
+    int last_line_no;
+    char *last_filename;
+    bool at_stmt_start;
+    int system_include_count;
+    unsigned long long ret_counter;
+#ifdef PRISM_LIB_MODE
+    char active_temp_output[PATH_MAX];
+    char active_temp_pp[PATH_MAX];
+#endif
+} PrismContext;
+
+static PrismContext *ctx = NULL;
+
+static void prism_ctx_init(void)
+{
+    if (ctx)
+        return;
+    ctx = calloc(1, sizeof(PrismContext));
+    if (!ctx)
+    {
+        fprintf(stderr, "prism: out of memory\n");
+        exit(1);
+    }
+    ctx->main_arena.default_block_size = ARENA_DEFAULT_BLOCK_SIZE;
+    ctx->feature_defer = true;
+    ctx->feature_zeroinit = true;
+    ctx->emit_line_directives = true;
+    ctx->feature_flatten_headers = true;
+    ctx->at_stmt_start = true;
+}
+
+// Token arena - uses main_arena
+static Token *arena_alloc_token(void)
+{
+    return arena_alloc(&ctx->main_arena, sizeof(Token));
+}
+
+// String arena - uses main_arena
+static char *string_arena_alloc(size_t size)
+{
+    return arena_alloc(&ctx->main_arena, size);
+}
 
 static uint64_t fnv_hash(char *s, int len)
 {
@@ -363,35 +435,15 @@ static void hashmap_clear(HashMap *map)
     map->used = 0;
 }
 
-// Library mode error recovery - when PRISM_LIB_MODE is defined, errors
-// longjmp back to a recovery point instead of calling exit(1).
-// This allows the host process to continue after transpilation errors.
-#ifdef PRISM_LIB_MODE
-static jmp_buf prism_error_jmp;
-static bool prism_error_jmp_set = false;
-static char prism_error_msg[1024];
-static int prism_error_line = 0;
-static int prism_error_col = 0;
-#endif
-
-// File tracking
-static File *current_file;
-static File **input_files;
-static int input_file_count;
-static int input_file_capacity;
-static bool at_bol;
-static bool has_space;
-
 // Filename interning - avoids duplicating identical filename strings
 // Each entry maps filename string -> interned copy
-static HashMap filename_intern_map;
 
 static char *intern_filename(const char *name)
 {
     if (!name)
         return NULL;
     int len = strlen(name);
-    char *existing = hashmap_get(&filename_intern_map, (char *)name, len);
+    char *existing = hashmap_get(&ctx->filename_intern_map, (char *)name, len);
     if (existing)
         return existing;
     // Allocate and store new interned string
@@ -399,7 +451,7 @@ static char *intern_filename(const char *name)
     if (!interned)
         error("out of memory");
     memcpy(interned, name, len + 1);
-    hashmap_put(&filename_intern_map, interned, len, interned);
+    hashmap_put(&ctx->filename_intern_map, interned, len, interned);
     return interned;
 }
 
@@ -413,12 +465,10 @@ typedef struct
     uint8_t flags; // is_system (bit 0), is_include_entry (bit 1)
 } FileViewKey;
 
-static HashMap file_view_cache = {0};
-
 static File *find_cached_file_view(char *filename, int line_delta, bool is_system, bool is_include_entry)
 {
     FileViewKey key = {filename, line_delta, (is_system ? 1 : 0) | (is_include_entry ? 2 : 0)};
-    return hashmap_get(&file_view_cache, (char *)&key, sizeof(key));
+    return hashmap_get(&ctx->file_view_cache, (char *)&key, sizeof(key));
 }
 
 static void cache_file_view(char *filename, int line_delta, bool is_system, bool is_include_entry, File *file)
@@ -429,7 +479,7 @@ static void cache_file_view(char *filename, int line_delta, bool is_system, bool
     if (!stored_key)
         error("out of memory");
     *stored_key = key;
-    hashmap_put(&file_view_cache, (char *)stored_key, sizeof(FileViewKey), file);
+    hashmap_put(&ctx->file_view_cache, (char *)stored_key, sizeof(FileViewKey), file);
 }
 
 static void free_file(File *f)
@@ -445,7 +495,7 @@ static void free_file(File *f)
     if (f->name)
     {
         int len = strlen(f->name);
-        char *found = hashmap_get(&filename_intern_map, f->name, len);
+        char *found = hashmap_get(&ctx->filename_intern_map, f->name, len);
         if (found != f->name) // Not interned, safe to free
             free(f->name);
     }
@@ -455,42 +505,42 @@ static void free_file(File *f)
 // Free all interned filenames and clear the map
 static void free_filename_intern_map(void)
 {
-    if (!filename_intern_map.buckets)
+    if (!ctx->filename_intern_map.buckets)
         return;
-    for (int i = 0; i < filename_intern_map.capacity; i++)
+    for (int i = 0; i < ctx->filename_intern_map.capacity; i++)
     {
-        HashEntry *ent = &filename_intern_map.buckets[i];
+        HashEntry *ent = &ctx->filename_intern_map.buckets[i];
         if (ent->key && ent->key != TOMBSTONE)
         {
             free(ent->key); // Free the interned string
         }
     }
-    free(filename_intern_map.buckets);
-    filename_intern_map.buckets = NULL;
-    filename_intern_map.capacity = 0;
-    filename_intern_map.used = 0;
+    free(ctx->filename_intern_map.buckets);
+    ctx->filename_intern_map.buckets = NULL;
+    ctx->filename_intern_map.capacity = 0;
+    ctx->filename_intern_map.used = 0;
 }
 
 // Free file view cache keys and clear the map (File structs are freed separately)
 static void free_file_view_cache(void)
 {
-    if (!file_view_cache.buckets)
+    if (!ctx->file_view_cache.buckets)
         return;
     // Free allocated keys
-    for (int i = 0; i < file_view_cache.capacity; i++)
+    for (int i = 0; i < ctx->file_view_cache.capacity; i++)
     {
-        HashEntry *ent = &file_view_cache.buckets[i];
+        HashEntry *ent = &ctx->file_view_cache.buckets[i];
         if (ent->key && ent->key != TOMBSTONE)
             free(ent->key);
     }
-    hashmap_clear(&file_view_cache);
+    hashmap_clear(&ctx->file_view_cache);
 }
 
 static inline File *tok_file(Token *tok)
 {
-    if (!tok || tok->file_idx >= input_file_count)
-        return current_file;
-    return input_files[tok->file_idx];
+    if (!tok || tok->file_idx >= ctx->input_file_count)
+        return ctx->current_file;
+    return ctx->input_files[tok->file_idx];
 }
 
 static int tok_line_no(Token *tok)
@@ -519,17 +569,17 @@ static int tok_line_no(Token *tok)
 
 // Error handling
 // Note: va_list scoping is intentional to avoid undefined behavior when
-// PRISM_LIB_MODE is defined but prism_error_jmp_set is false.
+// PRISM_LIB_MODE is defined but ctx->error_jmp_set is false.
 static noreturn void error(char *fmt, ...)
 {
 #ifdef PRISM_LIB_MODE
-    if (prism_error_jmp_set)
+    if (ctx->error_jmp_set)
     {
         va_list ap;
         va_start(ap, fmt);
-        vsnprintf(prism_error_msg, sizeof(prism_error_msg), fmt, ap);
+        vsnprintf(ctx->error_msg, sizeof(ctx->error_msg), fmt, ap);
         va_end(ap);
-        longjmp(prism_error_jmp, 1);
+        longjmp(ctx->error_jmp, 1);
     }
 #endif
     va_list ap;
@@ -578,15 +628,15 @@ noreturn void error_at(char *loc, char *fmt, ...)
     va_list ap;
     va_start(ap, fmt);
 #ifdef PRISM_LIB_MODE
-    if (prism_error_jmp_set)
+    if (ctx->error_jmp_set)
     {
-        prism_error_line = count_lines(current_file->contents, loc);
-        vsnprintf(prism_error_msg, sizeof(prism_error_msg), fmt, ap);
+        ctx->error_line = count_lines(ctx->current_file->contents, loc);
+        vsnprintf(ctx->error_msg, sizeof(ctx->error_msg), fmt, ap);
         va_end(ap);
-        longjmp(prism_error_jmp, 1);
+        longjmp(ctx->error_jmp, 1);
     }
 #endif
-    verror_at(current_file->name, current_file->contents, count_lines(current_file->contents, loc), loc, fmt, ap);
+    verror_at(ctx->current_file->name, ctx->current_file->contents, count_lines(ctx->current_file->contents, loc), loc, fmt, ap);
     va_end(ap);
     exit(1);
 }
@@ -595,17 +645,16 @@ noreturn void error_tok(Token *tok, const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
+    File *f = tok_file(tok);
 #ifdef PRISM_LIB_MODE
-    if (prism_error_jmp_set)
+    if (ctx->error_jmp_set)
     {
-        File *f = tok_file(tok);
-        prism_error_line = tok_line_no(tok);
-        vsnprintf(prism_error_msg, sizeof(prism_error_msg), fmt, ap);
+        ctx->error_line = tok_line_no(tok);
+        vsnprintf(ctx->error_msg, sizeof(ctx->error_msg), fmt, ap);
         va_end(ap);
-        longjmp(prism_error_jmp, 1);
+        longjmp(ctx->error_jmp, 1);
     }
 #endif
-    File *f = tok_file(tok);
     verror_at(f->name, f->contents, tok_line_no(tok), tok->loc, fmt, ap);
     va_end(ap);
     exit(1);
@@ -658,9 +707,6 @@ static inline bool equal(Token *tok, const char *op)
     const char *equiv = digraph_equiv(tok);
     return equiv && strlen(equiv) == len && !memcmp(equiv, op, len);
 }
-
-// Keyword map
-static HashMap keyword_map;
 
 static void init_keyword_map(void)
 {
@@ -722,12 +768,12 @@ static void init_keyword_map(void)
         "raw",
     };
     for (size_t i = 0; i < sizeof(kw) / sizeof(*kw); i++)
-        hashmap_put(&keyword_map, kw[i], strlen(kw[i]), (void *)1);
+        hashmap_put(&ctx->keyword_map, kw[i], strlen(kw[i]), (void *)1);
 }
 
 static bool is_keyword(Token *tok)
 {
-    return hashmap_get(&keyword_map, tok->loc, tok->len) != NULL;
+    return hashmap_get(&ctx->keyword_map, tok->loc, tok->len) != NULL;
 }
 
 // Forward declaration for hex digit conversion
@@ -1192,10 +1238,10 @@ static Token *new_token(TokenKind kind, char *start, char *end)
     tok->kind = kind;
     tok->loc = start;
     tok->len = end - start;
-    tok->file_idx = current_file ? current_file->file_no : 0;
-    tok_set_at_bol(tok, at_bol);
-    tok_set_has_space(tok, has_space);
-    at_bol = has_space = false;
+    tok->file_idx = ctx->current_file ? ctx->current_file->file_no : 0;
+    tok_set_at_bol(tok, ctx->at_bol);
+    tok_set_has_space(tok, ctx->has_space);
+    ctx->at_bol = ctx->has_space = false;
     return tok;
 }
 
@@ -1420,8 +1466,8 @@ static File *new_file(char *name, int file_no, char *contents)
 
 static void add_input_file(File *file)
 {
-    ENSURE_ARRAY_CAP(input_files, input_file_count + 1, input_file_capacity, 16, File *);
-    input_files[input_file_count++] = file;
+    ENSURE_ARRAY_CAP(ctx->input_files, ctx->input_file_count + 1, ctx->input_file_capacity, 16, File *);
+    ctx->input_files[ctx->input_file_count++] = file;
 }
 
 static File *new_file_view(const char *name, File *base, int line_delta, bool is_system, bool is_include_entry)
@@ -1441,7 +1487,7 @@ static File *new_file_view(const char *name, File *base, int line_delta, bool is
 
     file->name = interned_name; // Use interned string (no strdup needed)
     file->display_name = file->name;
-    file->file_no = input_file_count;
+    file->file_no = ctx->input_file_count;
     file->contents = base->contents;
     file->line_offsets = base->line_offsets;
     file->line_count = base->line_count;
@@ -1460,7 +1506,7 @@ static File *new_file_view(const char *name, File *base, int line_delta, bool is
 
 // Scan a preprocessor directive starting at '#'
 // Returns new position after directive, or NULL if not a line marker (caller handles as TK_PREP_DIR)
-// Updates *in_system_include, *line_no, and may switch current_file
+// Updates *in_system_include, *line_no, and may switch ctx->current_file
 static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *in_system_include)
 {
     int directive_line = *line_no;
@@ -1540,9 +1586,9 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
         *in_system_include = false;
 
     int line_delta = (int)new_line - (directive_line + 1);
-    File *view = new_file_view(filename ? filename : current_file->name,
+    File *view = new_file_view(filename ? filename : ctx->current_file->name,
                                base_file, line_delta, is_system, *in_system_include);
-    current_file = view;
+    ctx->current_file = view;
     free(filename);
 
     // Skip to end of directive
@@ -1587,13 +1633,13 @@ static char *scan_pp_number(char *p)
 static Token *tokenize(File *file)
 {
     File *base_file = file;
-    current_file = file;
+    ctx->current_file = file;
     char *p = file->contents;
 
     Token head = {};
     Token *cur = &head;
-    at_bol = true;
-    has_space = false;
+    ctx->at_bol = true;
+    ctx->has_space = false;
     int line_no = 1;
 
     // Track if we're inside a system header include chain
@@ -1604,15 +1650,15 @@ static Token *tokenize(File *file)
     while (*p)
     {
         // Preprocessor directives (#line markers from -E output, or #pragma etc.)
-        if (at_bol && *p == '#')
+        if (ctx->at_bol && *p == '#')
         {
             char *directive_start = p;
             char *after = scan_line_directive(p, base_file, &line_no, &in_system_include);
             if (after)
             {
                 p = after;
-                at_bol = true;
-                has_space = false;
+                ctx->at_bol = true;
+                ctx->has_space = false;
                 continue;
             }
 
@@ -1625,8 +1671,8 @@ static Token *tokenize(File *file)
             {
                 p++;
                 line_no++;
-                at_bol = true;
-                has_space = false;
+                ctx->at_bol = true;
+                ctx->has_space = false;
             }
             continue;
         }
@@ -1635,14 +1681,14 @@ static Token *tokenize(File *file)
         if (p[0] == '/' && p[1] == '/')
         {
             p = skip_line_comment(p + 2);
-            has_space = true;
+            ctx->has_space = true;
             continue;
         }
         // Block comment
         if (p[0] == '/' && p[1] == '*')
         {
             p = skip_block_comment(p + 2);
-            has_space = true;
+            ctx->has_space = true;
             continue;
         }
         // Newline
@@ -1650,15 +1696,15 @@ static Token *tokenize(File *file)
         {
             p++;
             line_no++;
-            at_bol = true;
-            has_space = false;
+            ctx->at_bol = true;
+            ctx->has_space = false;
             continue;
         }
         // Whitespace
         if (is_space(*p))
         {
             p++;
-            has_space = true;
+            ctx->has_space = true;
             continue;
         }
         // Preprocessor number
@@ -1745,7 +1791,7 @@ static Token *tokenize(File *file)
 Token *tokenize_file(char *path)
 {
     // Initialize keyword map on first call
-    if (!keyword_map.capacity)
+    if (!ctx->keyword_map.capacity)
         init_keyword_map();
 
     FILE *fp = fopen(path, "r");
@@ -1766,7 +1812,7 @@ Token *tokenize_file(char *path)
     buf[size] = '\0';
     fclose(fp);
 
-    File *file = new_file(path, input_file_count, buf);
+    File *file = new_file(path, ctx->input_file_count, buf);
     add_input_file(file);
 
     return tokenize(file);
@@ -1775,17 +1821,16 @@ Token *tokenize_file(char *path)
 // Reset state for reuse (keeps arena blocks for reuse)
 void tokenizer_reset(void)
 {
-    arena_reset(&string_arena);
-    arena_reset(&token_arena);
+    arena_reset(&ctx->main_arena);
     // Free file view cache first (before freeing files)
     free_file_view_cache();
-    for (int i = 0; i < input_file_count; i++)
-        free_file(input_files[i]);
-    free(input_files);
-    input_files = NULL;
-    input_file_count = 0;
-    input_file_capacity = 0;
-    current_file = NULL;
+    for (int i = 0; i < ctx->input_file_count; i++)
+        free_file(ctx->input_files[i]);
+    free(ctx->input_files);
+    ctx->input_files = NULL;
+    ctx->input_file_count = 0;
+    ctx->input_file_capacity = 0;
+    ctx->current_file = NULL;
     // Free interned filenames last (after all files are freed)
     free_filename_intern_map();
 }
@@ -1793,17 +1838,17 @@ void tokenizer_reset(void)
 // Full cleanup - frees all memory including arena blocks
 void tokenizer_cleanup(void)
 {
-    arena_free(&string_arena);
-    arena_free(&token_arena);
+    arena_free(&ctx->main_arena);
     // Free file view cache first (before freeing files)
     free_file_view_cache();
-    for (int i = 0; i < input_file_count; i++)
-        free_file(input_files[i]);
-    free(input_files);
-    input_files = NULL;
-    input_file_count = 0;
-    input_file_capacity = 0;
-    current_file = NULL;
+    for (int i = 0; i < ctx->input_file_count; i++)
+        free_file(ctx->input_files[i]);
+    free(ctx->input_files);
+    ctx->input_files = NULL;
+    ctx->input_file_count = 0;
+    ctx->input_file_capacity = 0;
+    ctx->current_file = NULL;
     // Free interned filenames last (after all files are freed)
     free_filename_intern_map();
+    hashmap_clear(&ctx->keyword_map);
 }

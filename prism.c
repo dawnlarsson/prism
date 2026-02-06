@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.100.0"
+#define PRISM_VERSION "0.101.0"
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -68,13 +68,6 @@ typedef struct
 #define PRISM_API static
 #endif
 
-// Temp file tracking for cleanup on error (longjmp recovery)
-// These are set before creating temp files and cleared after cleanup
-#ifdef PRISM_LIB_MODE
-static char prism_active_temp_output[PATH_MAX] = {0};
-static char prism_active_temp_pp[PATH_MAX] = {0};
-#endif
-
 PRISM_API PrismFeatures prism_defaults(void)
 {
   return (PrismFeatures){
@@ -137,25 +130,6 @@ static const char *get_tmp_dir(void)
 #endif
 
 #endif // PRISM_LIB_MODE
-
-// Internal feature flags (set from PrismFeatures before transpile)
-static bool feature_defer = true;
-static bool feature_zeroinit = true;
-static bool feature_warn_safety = false;    // If true, safety checks warn instead of error
-static bool feature_flatten_headers = true; // If true, include flattened system header content
-
-// Extra preprocessor configuration (set by CLI before transpile)
-static const char *extra_compiler = NULL;        // Compiler name (cc, gcc, clang, etc.)
-static const char **extra_compiler_flags = NULL; // Flags that affect macros (-std=, -m32, etc.)
-static int extra_compiler_flags_count = 0;
-static const char **extra_include_paths = NULL;
-static int extra_include_count = 0;
-static const char **extra_defines = NULL;
-static int extra_define_count = 0;
-static const char **extra_force_includes = NULL;
-static int extra_force_include_count = 0;
-
-static int struct_depth = 0;
 
 // Initial capacity for all dynamic arrays (grows as needed)
 #define INITIAL_CAP 32
@@ -258,7 +232,7 @@ typedef struct
 {
   char *name; // Points into token stream (no alloc needed)
   int len;
-  int scope_depth;    // Scope where defined (aligns with defer_depth)
+  int scope_depth;    // Scope where defined (aligns with ctx->defer_depth)
   bool is_vla;        // True if typedef refers to a VLA type
   bool is_shadow;     // True if this entry shadows a typedef (variable with same name)
   bool is_enum_const; // True if this is an enum constant (compile-time constant)
@@ -276,13 +250,7 @@ typedef struct
 static TypedefTable typedef_table;
 
 static DeferScope *defer_stack = NULL;
-static int defer_depth = 0;
 static int defer_stack_capacity = 0;
-
-// Track pending loop/switch for next scope
-static bool next_scope_is_loop = false;
-static bool next_scope_is_switch = false;
-static bool next_scope_is_conditional = false; // True for if/while/for blocks (not switch or regular blocks)
 
 // Control flow parsing state - tracks the transition from control keyword to body
 // e.g., "for (int i = 0; i < n; i++)" parens, or "if (cond)" before the { or statement
@@ -301,21 +269,10 @@ static inline void control_state_reset(void)
   control_state = (ControlFlowState){0};
 }
 
-static bool in_for_init = false;        // True when inside the init clause of a for loop (before first ;)
-static bool pending_for_paren = false;  // True after seeing 'for', waiting for '(' to start init clause
-static int conditional_block_depth = 0; // Track nesting depth of if/while/for blocks to detect conditional control exits
-static int generic_paren_depth = 0;     // Track parens inside _Generic(...) to distinguish default: from switch labels
-
 static LabelTable label_table;
-static bool current_func_returns_void = false;
-static bool current_func_has_setjmp = false;
-static bool current_func_has_asm = false;
-static bool current_func_has_vfork = false;
 
-static bool at_stmt_start = false;
-// Track statement expression scopes - store the defer_depth at which each starts
-static int *stmt_expr_levels = NULL; // defer_depth when stmt expr started (dynamic)
-static int stmt_expr_count = 0;      // number of active statement expressions
+// Track statement expression scopes - store the ctx->defer_depth at which each starts
+static int *stmt_expr_levels = NULL; // ctx->defer_depth when stmt expr started (dynamic)
 static int stmt_expr_capacity = 0;   // capacity of stmt_expr_levels array
 
 // Token emission - Buffered Output Writer
@@ -332,7 +289,6 @@ typedef struct
 
 static OutputBuffer out_buf = {0};
 static Token *last_emitted = NULL;
-static bool last_system_header = false;
 
 static void out_init(FILE *fp)
 {
@@ -423,15 +379,9 @@ static void out_line(int line_no, const char *file)
   OUT_LIT("\"\n");
 }
 
-// Line tracking for #line directives
-static int last_line_no = 0;
-static char *last_filename = NULL;
-static bool emit_line_directives = true; // Can be disabled with no-line-directives flag
-
 // System header tracking (for non-flattened output)
 static HashMap system_includes;    // Tracks unique system headers to emit
 static char **system_include_list; // Ordered list of includes
-static int system_include_count = 0;
 static int system_include_capacity = 0;
 
 // Record a system header for later emission
@@ -454,16 +404,16 @@ static void record_system_include(const char *path)
   hashmap_put(&system_includes, inc, strlen(inc), (void *)1);
 
   // Add to ordered list
-  ENSURE_ARRAY_CAP(system_include_list, system_include_count + 1, system_include_capacity, 32, char *);
-  system_include_list[system_include_count++] = inc;
+  ENSURE_ARRAY_CAP(system_include_list, ctx->system_include_count + 1, system_include_capacity, 32, char *);
+  system_include_list[ctx->system_include_count++] = inc;
 }
 
 // Collect system headers by detecting actual #include entries (not macro expansions)
 static void collect_system_includes(void)
 {
-  for (int i = 0; i < input_file_count; i++)
+  for (int i = 0; i < ctx->input_file_count; i++)
   {
-    File *f = input_files[i];
+    File *f = ctx->input_files[i];
     // Only record headers that were actually #included (is_include_entry=true)
     // Skip macro expansion sources (is_include_entry=false)
     if (f->is_system && f->is_include_entry)
@@ -500,7 +450,7 @@ static void emit_system_header_diag_pop(void)
 // Emit collected #include directives with necessary feature test macros
 static void emit_system_includes(void)
 {
-  if (system_include_count == 0)
+  if (ctx->system_include_count == 0)
     return;
 
   // Emit feature test macros that prism uses during preprocessing
@@ -510,7 +460,7 @@ static void emit_system_includes(void)
 
   emit_system_header_diag_push();
 
-  for (int i = 0; i < system_include_count; i++)
+  for (int i = 0; i < ctx->system_include_count; i++)
   {
     OUT_LIT("#include \"");
     out_str(system_include_list[i], strlen(system_include_list[i]));
@@ -519,7 +469,7 @@ static void emit_system_includes(void)
 
   emit_system_header_diag_pop();
 
-  if (system_include_count > 0)
+  if (ctx->system_include_count > 0)
     out_char('\n');
 }
 
@@ -527,24 +477,24 @@ static void emit_system_includes(void)
 static void system_includes_reset(void)
 {
   hashmap_clear(&system_includes);
-  for (int i = 0; i < system_include_count; i++)
+  for (int i = 0; i < ctx->system_include_count; i++)
     free(system_include_list[i]);
   free(system_include_list);
   system_include_list = NULL;
-  system_include_count = 0;
+  ctx->system_include_count = 0;
   system_include_capacity = 0;
 }
 
 static void end_statement_after_semicolon(void)
 {
-  at_stmt_start = true;
-  in_for_init = false; // Semicolon ends init clause
+  ctx->at_stmt_start = true;
+  ctx->in_for_init = false; // Semicolon ends init clause
   if (control_state.pending && control_state.paren_depth == 0)
   {
     control_state.pending = false;
-    next_scope_is_loop = false;
-    next_scope_is_switch = false;
-    next_scope_is_conditional = false;
+    ctx->next_scope_is_loop = false;
+    ctx->next_scope_is_switch = false;
+    ctx->next_scope_is_conditional = false;
   }
 }
 
@@ -578,30 +528,30 @@ static void defer_stack_ensure_capacity(int n)
 
 static void defer_push_scope(void)
 {
-  defer_stack_ensure_capacity(defer_depth + 1);
-  defer_stack[defer_depth].count = 0;
-  defer_stack[defer_depth].is_loop = next_scope_is_loop;
-  defer_stack[defer_depth].is_switch = next_scope_is_switch;
-  defer_stack[defer_depth].is_conditional = next_scope_is_conditional;
-  defer_stack[defer_depth].had_control_exit = false;
-  defer_stack[defer_depth].seen_case_label = false;
+  defer_stack_ensure_capacity(ctx->defer_depth + 1);
+  defer_stack[ctx->defer_depth].count = 0;
+  defer_stack[ctx->defer_depth].is_loop = ctx->next_scope_is_loop;
+  defer_stack[ctx->defer_depth].is_switch = ctx->next_scope_is_switch;
+  defer_stack[ctx->defer_depth].is_conditional = ctx->next_scope_is_conditional;
+  defer_stack[ctx->defer_depth].had_control_exit = false;
+  defer_stack[ctx->defer_depth].seen_case_label = false;
 
-  if (next_scope_is_conditional)
-    conditional_block_depth++;
+  if (ctx->next_scope_is_conditional)
+    ctx->conditional_block_depth++;
 
-  next_scope_is_loop = false;
-  next_scope_is_switch = false;
-  next_scope_is_conditional = false;
-  defer_depth++;
+  ctx->next_scope_is_loop = false;
+  ctx->next_scope_is_switch = false;
+  ctx->next_scope_is_conditional = false;
+  ctx->defer_depth++;
 }
 
 static void defer_pop_scope(void)
 {
-  if (defer_depth > 0)
+  if (ctx->defer_depth > 0)
   {
-    defer_depth--;
-    if (defer_stack[defer_depth].is_conditional)
-      conditional_block_depth--;
+    ctx->defer_depth--;
+    if (defer_stack[ctx->defer_depth].is_conditional)
+      ctx->conditional_block_depth--;
   }
 }
 
@@ -623,9 +573,9 @@ static void defer_scope_ensure_capacity(DeferScope *scope, int n)
 
 static void defer_add(Token *defer_keyword, Token *start, Token *end)
 {
-  if (defer_depth <= 0)
+  if (ctx->defer_depth <= 0)
     error_tok(start, "defer outside of any scope");
-  DeferScope *scope = &defer_stack[defer_depth - 1];
+  DeferScope *scope = &defer_stack[ctx->defer_depth - 1];
   defer_scope_ensure_capacity(scope, scope->count + 1);
   scope->defer_tok[scope->count] = defer_keyword;
   scope->stmts[scope->count] = start;
@@ -643,11 +593,11 @@ static void mark_switch_control_exit(void)
   // Only mark as definite control exit if not inside a conditional context
   // If inside if/while/for (even braceless), the control exit might not be taken at runtime
   // control_state.pending is true for braceless: "if (x) break;"
-  // conditional_block_depth > 0 for braced: "if (x) { break; }"
-  if (control_state.pending || conditional_block_depth > 0)
+  // ctx->conditional_block_depth > 0 for braced: "if (x) { break; }"
+  if (control_state.pending || ctx->conditional_block_depth > 0)
     return;
 
-  for (int d = defer_depth - 1; d >= 0; d--)
+  for (int d = ctx->defer_depth - 1; d >= 0; d--)
   {
     if (!defer_stack[d].is_switch)
       continue;
@@ -666,7 +616,7 @@ static void mark_switch_control_exit(void)
 static void clear_switch_scope_defers(void)
 {
   // Find the switch scope and clear all scopes from current down to it
-  for (int d = defer_depth - 1; d >= 0; d--)
+  for (int d = ctx->defer_depth - 1; d >= 0; d--)
   {
     // Clear defers at this scope
     defer_stack[d].count = 0;
@@ -783,7 +733,7 @@ static void emit_tok(Token *tok)
   // Skip system header include content when not flattening
   // But keep macro expansions (is_include_entry=false means it's a macro, not an include)
   File *f = tok_file(tok);
-  if (!feature_flatten_headers && f && f->is_system && f->is_include_entry)
+  if (!ctx->feature_flatten_headers && f && f->is_system && f->is_include_entry)
     return;
 
   // Check if we need a #line directive BEFORE emitting the token
@@ -792,13 +742,13 @@ static void emit_tok(Token *tok)
   int line_no = tok_line_no(tok);
 
   // Skip line directive handling for synthetic tokens (line_no == -1)
-  if (emit_line_directives && f && line_no > 0)
+  if (ctx->emit_line_directives && f && line_no > 0)
   {
     tok_fname = f->display_name ? f->display_name : f->name;
-    bool file_changed = (last_filename != tok_fname &&
-                         (!last_filename || !tok_fname || strcmp(last_filename, tok_fname) != 0));
-    bool system_changed = (f->is_system != last_system_header);
-    bool line_jumped = (line_no != last_line_no && line_no != last_line_no + 1);
+    bool file_changed = (ctx->last_filename != tok_fname &&
+                         (!ctx->last_filename || !tok_fname || strcmp(ctx->last_filename, tok_fname) != 0));
+    bool system_changed = (f->is_system != ctx->last_system_header);
+    bool line_jumped = (line_no != ctx->last_line_no && line_no != ctx->last_line_no + 1);
     need_line_directive = file_changed || line_jumped || system_changed;
   }
 
@@ -810,13 +760,13 @@ static void emit_tok(Token *tok)
     if (need_line_directive)
     {
       out_line(line_no, tok_fname ? tok_fname : "unknown");
-      last_line_no = line_no;
-      last_filename = tok_fname;
-      last_system_header = f->is_system;
+      ctx->last_line_no = line_no;
+      ctx->last_filename = tok_fname;
+      ctx->last_system_header = f->is_system;
     }
-    else if (emit_line_directives && f && line_no > 0 && line_no > last_line_no)
+    else if (ctx->emit_line_directives && f && line_no > 0 && line_no > ctx->last_line_no)
     {
-      last_line_no = line_no;
+      ctx->last_line_no = line_no;
     }
   }
   else
@@ -826,9 +776,9 @@ static void emit_tok(Token *tok)
     {
       out_char('\n');
       out_line(line_no, tok_fname ? tok_fname : "unknown");
-      last_line_no = line_no;
-      last_filename = tok_fname;
-      last_system_header = f->is_system;
+      ctx->last_line_no = line_no;
+      ctx->last_filename = tok_fname;
+      ctx->last_system_header = f->is_system;
     }
     else if (needs_space(last_emitted, tok))
     {
@@ -894,11 +844,11 @@ typedef enum
 
 static void emit_defers(DeferEmitMode mode)
 {
-  if (defer_depth <= 0)
+  if (ctx->defer_depth <= 0)
     return;
 
-  int start = defer_depth - 1;
-  int end = (mode == DEFER_SCOPE) ? defer_depth - 1 : 0;
+  int start = ctx->defer_depth - 1;
+  int end = (mode == DEFER_SCOPE) ? ctx->defer_depth - 1 : 0;
 
   for (int d = start; d >= end; d--)
   {
@@ -927,7 +877,7 @@ static void emit_defers(DeferEmitMode mode)
 // Check if there are any active defers
 static bool has_active_defers(void)
 {
-  for (int d = 0; d < defer_depth; d++)
+  for (int d = 0; d < ctx->defer_depth; d++)
     if (defer_stack[d].count > 0)
       return true;
   return false;
@@ -940,7 +890,7 @@ static bool control_flow_has_defers(bool include_switch)
   bool found_boundary = false;
   bool found_defers = false;
 
-  for (int d = defer_depth - 1; d >= 0; d--)
+  for (int d = ctx->defer_depth - 1; d >= 0; d--)
   {
     if (defer_stack[d].count > 0)
       found_defers = true;
@@ -1189,13 +1139,13 @@ static void scan_labels_in_function(Token *tok)
 {
   label_table.count = 0;
   hashmap_clear(&label_table.name_map); // Clear for O(1) lookups
-  current_func_has_setjmp = false;      // Reset for new function
-  current_func_has_asm = false;         // Reset for new function
-  current_func_has_vfork = false;       // Reset for new function
+  ctx->current_func_has_setjmp = false; // Reset for new function
+  ctx->current_func_has_asm = false;    // Reset for new function
+  ctx->current_func_has_vfork = false;  // Reset for new function
   if (!tok || !equal(tok, "{"))
     return;
 
-  // Start at depth 1 to align with defer_depth (which is 1 inside function body)
+  // Start at depth 1 to align with ctx->defer_depth (which is 1 inside function body)
   int depth = 1;
   int local_struct_depth = 0; // Track nesting inside struct/union/enum bodies
   Token *prev = NULL;
@@ -1248,15 +1198,15 @@ static void scan_labels_in_function(Token *tok)
          equal(tok, "_setjmp") || equal(tok, "_longjmp") ||
          equal(tok, "sigsetjmp") || equal(tok, "siglongjmp") ||
          equal(tok, "pthread_exit")))
-      current_func_has_setjmp = true;
+      ctx->current_func_has_setjmp = true;
 
     // Detect vfork which has unpredictable control flow
     if (tok->kind == TK_IDENT && equal(tok, "vfork"))
-      current_func_has_vfork = true;
+      ctx->current_func_has_vfork = true;
 
     // Detect inline asm which may contain hidden jumps
     if (tok->kind == TK_KEYWORD && (equal(tok, "asm") || equal(tok, "__asm__") || equal(tok, "__asm")))
-      current_func_has_asm = true;
+      ctx->current_func_has_asm = true;
 
     // Skip _Generic(...) - type associations inside look like labels (Type: expr)
     if (tok->kind == TK_KEYWORD && equal(tok, "_Generic"))
@@ -1303,7 +1253,7 @@ static void scan_labels_in_function(Token *tok)
 // We emit defers for scopes we're EXITING, not the scope we're jumping TO
 static void emit_goto_defers(int target_depth)
 {
-  for (int d = defer_depth - 1; d >= target_depth; d--)
+  for (int d = ctx->defer_depth - 1; d >= target_depth; d--)
   {
     DeferScope *scope = &defer_stack[d];
     for (int i = scope->count - 1; i >= 0; i--)
@@ -1318,7 +1268,7 @@ static void emit_goto_defers(int target_depth)
 // Check if goto needs defers (jumping out of scopes with defers)
 static bool goto_has_defers(int target_depth)
 {
-  for (int d = defer_depth - 1; d >= target_depth; d--)
+  for (int d = ctx->defer_depth - 1; d >= target_depth; d--)
   {
     if (defer_stack[d].count > 0)
       return true;
@@ -1346,7 +1296,7 @@ typedef enum
 static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len, GotoCheckMode mode)
 {
   // For DECL mode, only check when zero-init is enabled
-  if (mode == GOTO_CHECK_DECL && !feature_zeroinit)
+  if (mode == GOTO_CHECK_DECL && !ctx->feature_zeroinit)
     return NULL;
 
   // Scan forward from goto to find the label
@@ -2982,14 +2932,14 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, Token *warn_
     // Register shadow for typedef names used as variables
     if (is_known_typedef(decl.var_name))
     {
-      int shadow_depth = in_for_init ? defer_depth + 1 : defer_depth;
+      int shadow_depth = ctx->in_for_init ? ctx->defer_depth + 1 : ctx->defer_depth;
       typedef_add_shadow(decl.var_name->loc, decl.var_name->len, shadow_depth);
     }
 
     // Register VLA variables so sizeof(vla_var) can be detected as non-constant
     if (effective_vla && decl.var_name)
     {
-      int vla_depth = in_for_init ? defer_depth + 1 : defer_depth;
+      int vla_depth = ctx->in_for_init ? ctx->defer_depth + 1 : ctx->defer_depth;
       typedef_add_vla_var(decl.var_name->loc, decl.var_name->len, vla_depth);
     }
 
@@ -3040,12 +2990,12 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, Token *warn_
 // to alert the user that zero-init may have been skipped.
 static Token *try_zero_init_decl(Token *tok)
 {
-  if (!feature_zeroinit || defer_depth <= 0 || struct_depth > 0)
+  if (!ctx->feature_zeroinit || ctx->defer_depth <= 0 || ctx->struct_depth > 0)
     return NULL;
 
   // Check for "switch skip hole" - declarations before first case label
   bool in_switch_before_case = false;
-  for (int d = defer_depth - 1; d >= 0; d--)
+  for (int d = ctx->defer_depth - 1; d >= 0; d--)
   {
     if (defer_stack[d].is_switch && !defer_stack[d].seen_case_label)
     {
@@ -3152,7 +3102,7 @@ static Token *emit_expr_to_semicolon(Token *tok)
     else if (depth == 0 && equal(tok, ";"))
       break;
 
-    if (expr_at_stmt_start && feature_zeroinit)
+    if (expr_at_stmt_start && ctx->feature_zeroinit)
     {
       Token *next = try_zero_init_decl(tok);
       if (next)
@@ -3176,13 +3126,13 @@ static Token *emit_expr_to_semicolon(Token *tok)
   return tok;
 }
 
-// Report goto skipping over a variable declaration (warn or error based on feature_warn_safety)
+// Report goto skipping over a variable declaration (warn or error based on ctx->feature_warn_safety)
 static void report_goto_skips_decl(Token *skipped_decl, Token *label_tok)
 {
   const char *msg = "goto '%.*s' would skip over this variable declaration, "
                     "bypassing zero-initialization (undefined behavior in C). "
                     "Move the declaration before the goto, or restructure the code.";
-  if (feature_warn_safety)
+  if (ctx->feature_warn_safety)
     warn_tok(skipped_decl, msg, label_tok->len, label_tok->loc);
   else
     error_tok(skipped_decl, msg, label_tok->len, label_tok->loc);
@@ -3274,33 +3224,33 @@ static char *preprocess_with_cc(const char *input_file)
   ArgvBuilder ab;
   argv_builder_init(&ab);
 
-  const char *cc = extra_compiler ? extra_compiler : "cc";
+  const char *cc = ctx->extra_compiler ? ctx->extra_compiler : "cc";
   argv_builder_add(&ab, cc);
   argv_builder_add(&ab, "-E");
 
   // Add compiler flags (like -std=c99, -m32)
-  for (int i = 0; i < extra_compiler_flags_count; i++)
-    argv_builder_add(&ab, extra_compiler_flags[i]);
+  for (int i = 0; i < ctx->extra_compiler_flags_count; i++)
+    argv_builder_add(&ab, ctx->extra_compiler_flags[i]);
 
   // Add include paths
-  for (int i = 0; i < extra_include_count; i++)
+  for (int i = 0; i < ctx->extra_include_count; i++)
   {
     argv_builder_add(&ab, "-I");
-    argv_builder_add(&ab, extra_include_paths[i]);
+    argv_builder_add(&ab, ctx->extra_include_paths[i]);
   }
 
   // Add defines
-  for (int i = 0; i < extra_define_count; i++)
+  for (int i = 0; i < ctx->extra_define_count; i++)
   {
     argv_builder_add(&ab, "-D");
-    argv_builder_add(&ab, extra_defines[i]);
+    argv_builder_add(&ab, ctx->extra_defines[i]);
   }
 
   // Add prism-specific macros
   argv_builder_add(&ab, "-D__PRISM__=1");
-  if (feature_defer)
+  if (ctx->feature_defer)
     argv_builder_add(&ab, "-D__PRISM_DEFER__=1");
-  if (feature_zeroinit)
+  if (ctx->feature_zeroinit)
     argv_builder_add(&ab, "-D__PRISM_ZEROINIT__=1");
 
   // Add standard feature test macros for POSIX/GNU compatibility
@@ -3308,10 +3258,10 @@ static char *preprocess_with_cc(const char *input_file)
   argv_builder_add(&ab, "-D_GNU_SOURCE");
 
   // Add force-includes
-  for (int i = 0; i < extra_force_include_count; i++)
+  for (int i = 0; i < ctx->extra_force_include_count; i++)
   {
     argv_builder_add(&ab, "-include");
-    argv_builder_add(&ab, extra_force_includes[i]);
+    argv_builder_add(&ab, ctx->extra_force_includes[i]);
   }
 
   // Input file and output
@@ -3349,8 +3299,8 @@ static int transpile(char *input_file, char *output_file)
 
 #ifdef PRISM_LIB_MODE
   // Track preprocessor temp file for cleanup on error
-  strncpy(prism_active_temp_pp, pp_file, PATH_MAX - 1);
-  prism_active_temp_pp[PATH_MAX - 1] = '\0';
+  strncpy(ctx->active_temp_pp, pp_file, PATH_MAX - 1);
+  ctx->active_temp_pp[PATH_MAX - 1] = '\0';
 #endif
 
   // Tokenize the preprocessed output
@@ -3359,7 +3309,7 @@ static int transpile(char *input_file, char *output_file)
   free(pp_file);
 
 #ifdef PRISM_LIB_MODE
-  prism_active_temp_pp[0] = '\0'; // Clear tracking after cleanup
+  ctx->active_temp_pp[0] = '\0'; // Clear tracking after cleanup
 #endif
 
   if (!tok)
@@ -3382,35 +3332,35 @@ static int transpile(char *input_file, char *output_file)
   // warnings when compiled with strict flags. We disable these for the
   // entire flattened output since macro expansions can inject system
   // header content mid-expression, making per-region tracking impractical.
-  if (feature_flatten_headers)
+  if (ctx->feature_flatten_headers)
   {
     emit_system_header_diag_push();
     out_char('\n');
   }
 
   // Reset state
-  defer_depth = 0;
-  struct_depth = 0;
+  ctx->defer_depth = 0;
+  ctx->struct_depth = 0;
   last_emitted = NULL;
-  last_line_no = 0;
-  last_filename = NULL;
-  last_system_header = false;
-  next_scope_is_loop = false;
-  next_scope_is_switch = false;
-  next_scope_is_conditional = false;
+  ctx->last_line_no = 0;
+  ctx->last_filename = NULL;
+  ctx->last_system_header = false;
+  ctx->next_scope_is_loop = false;
+  ctx->next_scope_is_switch = false;
+  ctx->next_scope_is_conditional = false;
   control_state_reset();
-  in_for_init = false;
-  pending_for_paren = false;
-  conditional_block_depth = 0;
-  generic_paren_depth = 0;
-  current_func_returns_void = false;
-  stmt_expr_count = 0;
-  at_stmt_start = true;  // Start of file is start of statement
-  typedef_table_reset(); // Reset typedef tracking
+  ctx->in_for_init = false;
+  ctx->pending_for_paren = false;
+  ctx->conditional_block_depth = 0;
+  ctx->generic_paren_depth = 0;
+  ctx->current_func_returns_void = false;
+  ctx->stmt_expr_count = 0;
+  ctx->at_stmt_start = true; // Start of file is start of statement
+  typedef_table_reset();     // Reset typedef tracking
 
   // Handle system headers: collect and emit #includes, or flatten
   system_includes_reset();
-  if (!feature_flatten_headers)
+  if (!ctx->feature_flatten_headers)
   {
     collect_system_includes();
     emit_system_includes();
@@ -3424,12 +3374,12 @@ static int transpile(char *input_file, char *output_file)
   {
     // Track typedefs for zero-init (must happen before zero-init check)
     // Only at statement start and outside struct/union/enum bodies
-    if (at_stmt_start && struct_depth == 0 && equal(tok, "typedef"))
-      parse_typedef_declaration(tok, defer_depth); // Fall through to emit the typedef normally
+    if (ctx->at_stmt_start && ctx->struct_depth == 0 && equal(tok, "typedef"))
+      parse_typedef_declaration(tok, ctx->defer_depth); // Fall through to emit the typedef normally
 
     // Try zero-init for declarations at statement start
     // Also allow in the init clause of a for loop: for (int i; ...)
-    if (at_stmt_start && (!control_state.pending || in_for_init))
+    if (ctx->at_stmt_start && (!control_state.pending || ctx->in_for_init))
     {
       // try_zero_init_decl handles 'raw' keyword internally - it only consumes it
       // if followed by a valid declaration, otherwise treats 'raw' as a variable name
@@ -3438,7 +3388,7 @@ static int transpile(char *input_file, char *output_file)
       {
         // Successfully handled - if there was 'raw', it's been processed
         tok = next;
-        at_stmt_start = true; // Still at statement start after decl
+        ctx->at_stmt_start = true; // Still at statement start after decl
         continue;
       }
 
@@ -3446,12 +3396,12 @@ static int transpile(char *input_file, char *output_file)
       // 'raw' is handled inside try_zero_init_decl now - it only consumes it
       // if followed by a declaration, otherwise treats it as a variable name
     }
-    at_stmt_start = false;
+    ctx->at_stmt_start = false;
 
     // Warn about noreturn functions that bypass defer cleanup
     // These functions terminate the program without running defers - RAII violation
     // Also mark as control exit for switch fallthrough detection (they don't fall through)
-    if (feature_defer && tok->kind == TK_IDENT && tok->next && equal(tok->next, "("))
+    if (ctx->feature_defer && tok->kind == TK_IDENT && tok->next && equal(tok->next, "("))
     {
       if (equal(tok, "exit") || equal(tok, "_Exit") || equal(tok, "_exit") ||
           equal(tok, "abort") || equal(tok, "quick_exit") ||
@@ -3477,10 +3427,10 @@ static int transpile(char *input_file, char *output_file)
     //          'defer' is registered as a typedef - that's a type name, not keyword
     //          followed by assignment operator - that's a variable assignment, not defer statement
     //          inside __attribute__((...)) - that's a function name, not keyword
-    if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "defer") &&
+    if (ctx->feature_defer && tok->kind == TK_KEYWORD && equal(tok, "defer") &&
         !equal(tok->next, ":") &&                         // Distinguish defer statement from label named "defer:"
         !(last_emitted && equal(last_emitted, "goto")) && // Distinguish from "goto defer;"
-        !is_member_access(last_emitted) && struct_depth == 0 &&
+        !is_member_access(last_emitted) && ctx->struct_depth == 0 &&
         !(last_emitted && (is_type_keyword(last_emitted) || equal(last_emitted, "typedef"))) &&
         !is_known_typedef(tok) && !is_assignment_op(tok->next) &&
         !is_inside_attribute(tok))
@@ -3502,9 +3452,9 @@ static int transpile(char *input_file, char *output_file)
       // Check for defer at the top-level of a statement expression - semantics are problematic
       // In ({ defer X; expr; }), the defer would execute after expr, making the result void
       // But defer in nested blocks inside stmt expr is OK: ({ { defer X; } expr; })
-      for (int i = 0; i < stmt_expr_count; i++)
+      for (int i = 0; i < ctx->stmt_expr_count; i++)
       {
-        if (defer_depth == stmt_expr_levels[i])
+        if (ctx->defer_depth == stmt_expr_levels[i])
         {
           error_tok(tok, "defer cannot be used at the top level of statement expressions ({ ... }). "
                          "The defer would execute after the final expression, changing the return type to void. "
@@ -3514,7 +3464,7 @@ static int transpile(char *input_file, char *output_file)
       }
 
       // setjmp/longjmp/pthread_exit bypasses defer cleanup - this MUST be an error
-      if (current_func_has_setjmp)
+      if (ctx->current_func_has_setjmp)
       {
         error_tok(tok, "defer cannot be used in functions that call setjmp/longjmp/pthread_exit. "
                        "These functions bypass defer cleanup entirely, causing resource leaks. "
@@ -3522,7 +3472,7 @@ static int transpile(char *input_file, char *output_file)
       }
 
       // vfork has unpredictable control flow that can bypass cleanup
-      if (current_func_has_vfork)
+      if (ctx->current_func_has_vfork)
       {
         error_tok(tok, "defer cannot be used in functions that call vfork(). "
                        "vfork shares address space with parent and has unpredictable control flow. "
@@ -3530,7 +3480,7 @@ static int transpile(char *input_file, char *output_file)
       }
 
       // Inline asm may contain hidden jumps that bypass defer
-      if (current_func_has_asm)
+      if (ctx->current_func_has_asm)
       {
         error_tok(tok, "defer cannot be used in functions containing inline assembly. "
                        "Inline asm may contain jumps (jmp, call, etc.) that bypass defer cleanup. "
@@ -3543,9 +3493,9 @@ static int transpile(char *input_file, char *output_file)
       // - Hitting the next case label clears the defer
       // - Result: resource leaks and unpredictable behavior
       // Require braces to create a proper scope for the defer
-      for (int d = defer_depth - 1; d >= 0; d--)
+      for (int d = ctx->defer_depth - 1; d >= 0; d--)
       {
-        if (defer_stack[d].is_switch && defer_depth - 1 == d)
+        if (defer_stack[d].is_switch && ctx->defer_depth - 1 == d)
         {
           error_tok(tok, "defer in switch case requires braces to create a proper scope.\n"
                          "       Without braces, defer at switch-level has unpredictable behavior:\n"
@@ -3576,7 +3526,7 @@ static int transpile(char *input_file, char *output_file)
       int bracket_depth = 0;
       for (Token *t = stmt_start; t != stmt_end && t->kind != TK_EOF; t = t->next)
       {
-        // Check at_bol BEFORE updating depths, skip for grouping tokens themselves
+        // Check ctx->at_bol BEFORE updating depths, skip for grouping tokens themselves
         // Allow multi-line when inside any grouping: (), [], {}
         bool at_top_level = (brace_depth == 0 && paren_depth == 0 && bracket_depth == 0);
         if (t != stmt_start && tok_at_bol(t) && at_top_level &&
@@ -3627,7 +3577,7 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Handle 'return' - evaluate expr, run defers, then return
-    if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "return"))
+    if (ctx->feature_defer && tok->kind == TK_KEYWORD && equal(tok, "return"))
     {
       mark_switch_control_exit(); // Mark that we exited via return
       if (has_active_defers())
@@ -3652,7 +3602,7 @@ static int transpile(char *input_file, char *output_file)
           bool is_void_cast = equal(tok, "(") && tok->next && equal(tok->next, "void") &&
                               tok->next->next && equal(tok->next->next, ")");
 
-          if (current_func_returns_void || is_void_cast)
+          if (ctx->current_func_returns_void || is_void_cast)
           {
             // void function: { (expr); defers; return; }
             // The expression is executed for side effects, then we return void
@@ -3672,8 +3622,7 @@ static int transpile(char *input_file, char *output_file)
             // Standard C alternative would require parsing the return type, which is complex.
             // Users targeting MSVC or strict C compilers should avoid defer with return values,
             // or use C23's typeof (once widely supported).
-            static unsigned long long ret_counter = 0;
-            unsigned long long my_ret = ret_counter++;
+            unsigned long long my_ret = ctx->ret_counter++;
             OUT_LIT(" { __auto_type _prism_ret_");
             out_uint(my_ret);
             OUT_LIT(" = (");
@@ -3699,7 +3648,7 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Handle 'break' - emit defers up through loop/switch
-    if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "break"))
+    if (ctx->feature_defer && tok->kind == TK_KEYWORD && equal(tok, "break"))
     {
       mark_switch_control_exit(); // Mark that we exited via break
       if (control_flow_has_defers(true))
@@ -3718,7 +3667,7 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Handle 'continue' - emit defers up to (not including) loop
-    if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "continue"))
+    if (ctx->feature_defer && tok->kind == TK_KEYWORD && equal(tok, "continue"))
     {
       mark_switch_control_exit(); // Continue also exits the switch (like break/return/goto)
       if (control_flow_has_defers(false))
@@ -3737,7 +3686,7 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Handle 'goto' - emit defers for scopes being exited
-    if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "goto"))
+    if (ctx->feature_defer && tok->kind == TK_KEYWORD && equal(tok, "goto"))
     {
       mark_switch_control_exit(); // Mark that we exited via goto (like break/return)
       Token *goto_tok = tok;
@@ -3776,7 +3725,7 @@ static int transpile(char *input_file, char *output_file)
         int target_depth = label_table_lookup(tok->loc, tok->len);
         // If label not found, assume same depth (forward reference within scope)
         if (target_depth < 0)
-          target_depth = defer_depth;
+          target_depth = ctx->defer_depth;
 
         if (goto_has_defers(target_depth))
         {
@@ -3801,7 +3750,7 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Check goto for zeroinit safety even when defer is disabled
-    if (feature_zeroinit && !feature_defer && tok->kind == TK_KEYWORD && equal(tok, "goto"))
+    if (ctx->feature_zeroinit && !ctx->feature_defer && tok->kind == TK_KEYWORD && equal(tok, "goto"))
     {
       Token *goto_tok = tok;
       tok = tok->next;
@@ -3817,27 +3766,27 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Mark loop keywords so next '{' knows it's a loop scope
-    if (feature_defer && tok->kind == TK_KEYWORD &&
+    if (ctx->feature_defer && tok->kind == TK_KEYWORD &&
         (equal(tok, "for") || equal(tok, "while") || equal(tok, "do")))
     {
-      next_scope_is_loop = true;
+      ctx->next_scope_is_loop = true;
       control_state.pending = true;
       // For 'for' loops, we need to allow zero-init in the init clause
       if (equal(tok, "for"))
-        pending_for_paren = true;
+        ctx->pending_for_paren = true;
       // For 'do' loops, the body comes immediately (no parens before body)
       // Set cf.parens_just_closed so the next '{' is recognized as the loop body
       if (equal(tok, "do"))
         control_state.parens_just_closed = true;
     }
     // Also track 'for' for zero-init even if defer is disabled
-    else if (feature_zeroinit && !feature_defer && tok->kind == TK_KEYWORD && equal(tok, "for"))
+    else if (ctx->feature_zeroinit && !ctx->feature_defer && tok->kind == TK_KEYWORD && equal(tok, "for"))
     {
       control_state.pending = true;
-      pending_for_paren = true;
+      ctx->pending_for_paren = true;
     }
 
-    if (tok->kind == TK_KEYWORD && equal(tok, "_Generic") && generic_paren_depth == 0)
+    if (tok->kind == TK_KEYWORD && equal(tok, "_Generic") && ctx->generic_paren_depth == 0)
     {
       // Emit the _Generic token and look for the opening paren
       emit_tok(tok);
@@ -3845,7 +3794,7 @@ static int transpile(char *input_file, char *output_file)
       tok = tok->next;
       if (tok && equal(tok, "("))
       {
-        generic_paren_depth = 1;
+        ctx->generic_paren_depth = 1;
         emit_tok(tok);
         last_emitted = tok;
         tok = tok->next;
@@ -3853,21 +3802,21 @@ static int transpile(char *input_file, char *output_file)
       continue;
     }
     // Track parentheses inside _Generic
-    if (generic_paren_depth > 0)
+    if (ctx->generic_paren_depth > 0)
     {
       if (equal(tok, "("))
-        generic_paren_depth++;
+        ctx->generic_paren_depth++;
       else if (equal(tok, ")"))
       {
-        generic_paren_depth--;
+        ctx->generic_paren_depth--;
         // When we exit the _Generic entirely, depth goes to 0
       }
     }
 
     // Mark switch keyword
-    if (feature_defer && tok->kind == TK_KEYWORD && equal(tok, "switch"))
+    if (ctx->feature_defer && tok->kind == TK_KEYWORD && equal(tok, "switch"))
     {
-      next_scope_is_switch = true;
+      ctx->next_scope_is_switch = true;
       control_state.pending = true;
     }
 
@@ -3887,7 +3836,7 @@ static int transpile(char *input_file, char *output_file)
     // This prevents false positives from _Generic: _Generic(x, int: 1, default: 2)
     // Also handles edge case: _Generic(v, default: 0) where default is NOT preceded by comma
     bool is_switch_label = false;
-    if (feature_defer && tok->kind == TK_KEYWORD)
+    if (ctx->feature_defer && tok->kind == TK_KEYWORD)
     {
       if (equal(tok, "case"))
         is_switch_label = true;
@@ -3895,8 +3844,8 @@ static int transpile(char *input_file, char *output_file)
       {
         // "default" could be followed by ":" or by attributes then ":"
         // Example: default __attribute__((unused)): or default [[fallthrough]]:
-        // Skip if we're inside _Generic(...) - detected by generic_paren_depth > 0
-        if (generic_paren_depth == 0)
+        // Skip if we're inside _Generic(...) - detected by ctx->generic_paren_depth > 0
+        if (ctx->generic_paren_depth == 0)
         {
           // Look ahead for colon, skipping any attributes
           Token *t = skip_all_attributes(tok->next);
@@ -3911,7 +3860,7 @@ static int transpile(char *input_file, char *output_file)
       // Check if there are active defers that would be lost (fallthrough scenario)
       // Must check ALL scopes from current depth down to the switch scope,
       // because case labels can appear inside nested blocks
-      for (int d = defer_depth - 1; d >= 0; d--)
+      for (int d = ctx->defer_depth - 1; d >= 0; d--)
       {
         // Check for defers at this scope that would be cleared
         if (defer_stack[d].count > 0 && !defer_stack[d].had_control_exit)
@@ -3937,7 +3886,7 @@ static int transpile(char *input_file, char *output_file)
     // Detect function definition and scan for labels
     // Pattern: identifier '(' ... ')' '{'
     // Only trigger when previous token at top level was ')' (end of parameter list)
-    if (feature_defer && equal(tok, "{") && defer_depth == 0)
+    if (ctx->feature_defer && equal(tok, "{") && ctx->defer_depth == 0)
     {
       // Only scan for labels if this looks like a function body (prev token is ')')
       // This avoids false positives from: int arr[] = {1,2,3}; or compound literals
@@ -3945,14 +3894,14 @@ static int transpile(char *input_file, char *output_file)
       {
         scan_labels_in_function(tok);
         // Set the void return flag from what we detected
-        current_func_returns_void = next_func_returns_void;
+        ctx->current_func_returns_void = next_func_returns_void;
       }
       next_func_returns_void = false;
     }
 
     // Detect void function definitions at top level
     // This sets next_func_returns_void for when we enter the function body
-    if (defer_depth == 0 && is_void_function_decl(tok))
+    if (ctx->defer_depth == 0 && is_void_function_decl(tok))
       next_func_returns_void = true;
 
     // Track struct/union/enum to avoid zero-init inside them
@@ -3980,9 +3929,9 @@ static int transpile(char *input_file, char *output_file)
       if (t && equal(t, "{"))
       {
         // For enums, parse constants to register shadows BEFORE emitting
-        // Enum constants are visible at the enclosing scope (defer_depth)
+        // Enum constants are visible at the enclosing scope (ctx->defer_depth)
         if (is_enum)
-          parse_enum_constants(t, defer_depth);
+          parse_enum_constants(t, ctx->defer_depth);
 
         // Emit tokens up to and including the {
         while (tok != t)
@@ -3992,31 +3941,31 @@ static int transpile(char *input_file, char *output_file)
         }
         emit_tok(tok); // emit the {
         tok = tok->next;
-        struct_depth++;
-        if (feature_defer)
+        ctx->struct_depth++;
+        if (ctx->feature_defer)
         {
           // If we're inside control flow (e.g., for loop condition with
           // anonymous struct compound literal), preserve the loop flag!
-          // struct { int x; } inside for(...) should NOT consume next_scope_is_loop.
-          bool save_loop = next_scope_is_loop;
-          bool save_switch = next_scope_is_switch;
-          bool save_conditional = next_scope_is_conditional;
+          // struct { int x; } inside for(...) should NOT consume ctx->next_scope_is_loop.
+          bool save_loop = ctx->next_scope_is_loop;
+          bool save_switch = ctx->next_scope_is_switch;
+          bool save_conditional = ctx->next_scope_is_conditional;
           defer_push_scope();
           // Restore flags if we're inside control flow
           if (control_state.pending)
           {
-            next_scope_is_loop = save_loop;
-            next_scope_is_switch = save_switch;
-            next_scope_is_conditional = save_conditional;
+            ctx->next_scope_is_loop = save_loop;
+            ctx->next_scope_is_switch = save_switch;
+            ctx->next_scope_is_conditional = save_conditional;
           }
         }
         else
         {
           // Still track scope depth for typedef scoping
-          defer_stack_ensure_capacity(defer_depth + 1);
-          defer_depth++;
+          defer_stack_ensure_capacity(ctx->defer_depth + 1);
+          ctx->defer_depth++;
         }
-        at_stmt_start = true;
+        ctx->at_stmt_start = true;
         continue;
       }
     }
@@ -4051,31 +4000,31 @@ static int transpile(char *input_file, char *output_file)
 
       // Track if we're entering a conditional block (if/while/for) for accurate control exit detection
       // Switch blocks are not conditional in the same sense (we always enter one case)
-      if (control_state.pending && !next_scope_is_switch)
-        next_scope_is_conditional = true;
+      if (control_state.pending && !ctx->next_scope_is_switch)
+        ctx->next_scope_is_conditional = true;
 
       control_state_reset(); // Proper braces found - reset control flow state
       // Check if this is a statement expression: ({ ... })
       // The previous emitted token would be '('
       if (last_emitted && equal(last_emitted, "("))
       {
-        // Remember the defer_depth BEFORE we push the new scope
+        // Remember the ctx->defer_depth BEFORE we push the new scope
         // This will be the scope level of the statement expression
         // Grow stmt_expr_levels if needed
-        ENSURE_ARRAY_CAP(stmt_expr_levels, stmt_expr_count + 1, stmt_expr_capacity, INITIAL_CAP, int);
-        stmt_expr_levels[stmt_expr_count++] = defer_depth + 1; // +1 because we're about to push
+        ENSURE_ARRAY_CAP(stmt_expr_levels, ctx->stmt_expr_count + 1, stmt_expr_capacity, INITIAL_CAP, int);
+        stmt_expr_levels[ctx->stmt_expr_count++] = ctx->defer_depth + 1; // +1 because we're about to push
       }
       emit_tok(tok);
       tok = tok->next;
-      if (feature_defer)
+      if (ctx->feature_defer)
         defer_push_scope();
       else
       {
         // Still need to track scope depth for typedef scoping even without defer
-        defer_stack_ensure_capacity(defer_depth + 1);
-        defer_depth++;
+        defer_stack_ensure_capacity(ctx->defer_depth + 1);
+        ctx->defer_depth++;
       }
-      at_stmt_start = true;
+      ctx->at_stmt_start = true;
       continue;
     }
 
@@ -4092,10 +4041,10 @@ static int transpile(char *input_file, char *output_file)
         continue;
       }
 
-      if (struct_depth > 0)
-        struct_depth--;
-      typedef_pop_scope(defer_depth); // Pop typedefs at current scope (before depth changes)
-      if (feature_defer)
+      if (ctx->struct_depth > 0)
+        ctx->struct_depth--;
+      typedef_pop_scope(ctx->defer_depth); // Pop typedefs at current scope (before depth changes)
+      if (ctx->feature_defer)
       {
         emit_scope_defers();
         defer_pop_scope();
@@ -4103,21 +4052,21 @@ static int transpile(char *input_file, char *output_file)
       else
       {
         // Still need to track scope depth for typedef scoping even without defer
-        if (defer_depth > 0)
-          defer_depth--;
+        if (ctx->defer_depth > 0)
+          ctx->defer_depth--;
       }
       emit_tok(tok);
       tok = tok->next;
       // Check if we're exiting a statement expression: ... })
       // Match if the next token is ')' and we're at a stmt_expr level
-      if (tok && equal(tok, ")") && stmt_expr_count > 0 &&
-          stmt_expr_levels[stmt_expr_count - 1] == defer_depth + 1)
+      if (tok && equal(tok, ")") && ctx->stmt_expr_count > 0 &&
+          stmt_expr_levels[ctx->stmt_expr_count - 1] == ctx->defer_depth + 1)
       {
-        stmt_expr_count--;
+        ctx->stmt_expr_count--;
       }
       // After closing brace, we're at the start of a new statement
       // (especially important at file scope for tracking typedefs)
-      at_stmt_start = true;
+      ctx->at_stmt_start = true;
       continue;
     }
 
@@ -4129,11 +4078,11 @@ static int transpile(char *input_file, char *output_file)
         control_state.paren_depth++;
         control_state.parens_just_closed = false; // Opening paren, resets the "just closed" state
         // If we just saw 'for' and this is the opening paren, we're entering the init clause
-        if (pending_for_paren)
+        if (ctx->pending_for_paren)
         {
-          in_for_init = true;
-          at_stmt_start = true; // Init clause is like start of a statement
-          pending_for_paren = false;
+          ctx->in_for_init = true;
+          ctx->at_stmt_start = true; // Init clause is like start of a statement
+          ctx->pending_for_paren = false;
         }
       }
       else if (equal(tok, ")"))
@@ -4142,7 +4091,7 @@ static int transpile(char *input_file, char *output_file)
         // Exiting the for() parens entirely clears init state
         if (control_state.paren_depth == 0)
         {
-          in_for_init = false;
+          ctx->in_for_init = false;
           control_state.parens_just_closed = true; // Mark that we just exited control parens
         }
         // Note: for inner parens (depth > 0), don't change the flag
@@ -4150,35 +4099,35 @@ static int transpile(char *input_file, char *output_file)
       // Semicolon inside for() parens ends the init clause (first ;) and condition (second ;)
       if (equal(tok, ";") && control_state.paren_depth == 1)
       {
-        if (in_for_init)
+        if (ctx->in_for_init)
         {
-          in_for_init = false;
+          ctx->in_for_init = false;
           // After init clause semicolon, we're at start of condition
-          // (not a declaration context, so don't set at_stmt_start)
+          // (not a declaration context, so don't set ctx->at_stmt_start)
         }
       }
       // Semicolon at depth 0 ends a braceless statement body
       else if (equal(tok, ";") && control_state.paren_depth == 0)
       {
-        // Pop any phantom scopes registered at defer_depth + 1
+        // Pop any phantom scopes registered at ctx->defer_depth + 1
         // For braceless loop bodies like: for (int T = 0; T < 5; T++);
-        // The loop variable T would be registered as shadow at defer_depth + 1
+        // The loop variable T would be registered as shadow at ctx->defer_depth + 1
         // but we never actually enter/exit that scope with braces.
         // Without this cleanup, the shadow persists and corrupts typedef lookups.
-        typedef_pop_scope(defer_depth + 1);
+        typedef_pop_scope(ctx->defer_depth + 1);
 
         control_state.pending = false;
-        next_scope_is_loop = false;
-        next_scope_is_switch = false;
-        next_scope_is_conditional = false;
-        in_for_init = false;
-        pending_for_paren = false;
+        ctx->next_scope_is_loop = false;
+        ctx->next_scope_is_switch = false;
+        ctx->next_scope_is_conditional = false;
+        ctx->in_for_init = false;
+        ctx->pending_for_paren = false;
       }
     }
 
     // Track statement boundaries for zero-init
     if (equal(tok, ";") && !control_state.pending)
-      at_stmt_start = true;
+      ctx->at_stmt_start = true;
 
     // Preprocessor directives don't consume statement-start position
     // This is important for _Pragma which expands to #pragma before declarations
@@ -4186,21 +4135,21 @@ static int transpile(char *input_file, char *output_file)
     {
       emit_tok(tok);
       tok = tok->next;
-      at_stmt_start = true; // Next token is still at statement start
+      ctx->at_stmt_start = true; // Next token is still at statement start
       continue;
     }
 
     // Reset void function detection at top-level semicolons
     // This prevents function declarations like "void foo(void);" from affecting
     // subsequent function definitions
-    if (equal(tok, ";") && defer_depth == 0)
+    if (equal(tok, ";") && ctx->defer_depth == 0)
       next_func_returns_void = false;
 
     // Handle user-defined labels (label:) - statement after label is at statement start
     // This ensures declarations after labels get zero-initialized
     // Must distinguish from: ternary (?:), bitfield (int x:5), case/default (handled above)
     if (equal(tok, ":") && last_emitted && last_emitted->kind == TK_IDENT &&
-        struct_depth == 0 && defer_depth > 0)
+        ctx->struct_depth == 0 && ctx->defer_depth > 0)
     {
       // Check if previous identifier was part of a ternary by looking back further
       // In ternary, there would be a '?' before the identifier
@@ -4209,12 +4158,12 @@ static int transpile(char *input_file, char *output_file)
       // This is an approximation - case/default are already handled above
       emit_tok(tok);
       tok = tok->next;
-      at_stmt_start = true;
+      ctx->at_stmt_start = true;
       continue;
     }
 
     // Track previous token at top level for function detection
-    if (defer_depth == 0)
+    if (ctx->defer_depth == 0)
       prev_toplevel_tok = tok;
 
     // Default: emit token as-is
@@ -4223,7 +4172,7 @@ static int transpile(char *input_file, char *output_file)
   }
 
   // Close diagnostic pragma that was opened at the start for flatten mode
-  if (feature_flatten_headers)
+  if (ctx->feature_flatten_headers)
   {
     out_char('\n');
     emit_system_header_diag_pop();
@@ -4242,34 +4191,35 @@ static int transpile(char *input_file, char *output_file)
 
 PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures features)
 {
+  prism_ctx_init();
   PrismResult result = {0};
 
 #ifdef PRISM_LIB_MODE
   // Set up error recovery point - if error()/error_tok()/error_at() is called,
   // we longjmp back here instead of calling exit(1)
-  prism_error_msg[0] = '\0';
-  prism_error_line = 0;
-  prism_error_col = 0;
-  prism_error_jmp_set = true;
+  ctx->error_msg[0] = '\0';
+  ctx->error_line = 0;
+  ctx->error_col = 0;
+  ctx->error_jmp_set = true;
 
-  if (setjmp(prism_error_jmp) != 0)
+  if (setjmp(ctx->error_jmp) != 0)
   {
     // We got here via longjmp from an error function
-    prism_error_jmp_set = false;
+    ctx->error_jmp_set = false;
     result.status = PRISM_ERR_SYNTAX;
-    result.error_msg = strdup(prism_error_msg[0] ? prism_error_msg : "Unknown error");
-    result.error_line = prism_error_line;
-    result.error_col = prism_error_col;
+    result.error_msg = strdup(ctx->error_msg[0] ? ctx->error_msg : "Unknown error");
+    result.error_line = ctx->error_line;
+    result.error_col = ctx->error_col;
     // Clean up any temp files that were created before the error
-    if (prism_active_temp_output[0])
+    if (ctx->active_temp_output[0])
     {
-      remove(prism_active_temp_output);
-      prism_active_temp_output[0] = '\0';
+      remove(ctx->active_temp_output);
+      ctx->active_temp_output[0] = '\0';
     }
-    if (prism_active_temp_pp[0])
+    if (ctx->active_temp_pp[0])
     {
-      unlink(prism_active_temp_pp);
-      prism_active_temp_pp[0] = '\0';
+      unlink(ctx->active_temp_pp);
+      ctx->active_temp_pp[0] = '\0';
     }
     // Reset global state to allow future transpilations
     prism_reset();
@@ -4278,22 +4228,22 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
 #endif
 
   // Set global feature flags from PrismFeatures
-  feature_defer = features.defer;
-  feature_zeroinit = features.zeroinit;
-  feature_warn_safety = features.warn_safety;
-  emit_line_directives = features.line_directives;
-  feature_flatten_headers = features.flatten_headers;
+  ctx->feature_defer = features.defer;
+  ctx->feature_zeroinit = features.zeroinit;
+  ctx->feature_warn_safety = features.warn_safety;
+  ctx->emit_line_directives = features.line_directives;
+  ctx->feature_flatten_headers = features.flatten_headers;
 
   // Set preprocessor configuration from PrismFeatures
-  extra_compiler = features.compiler;
-  extra_include_paths = features.include_paths;
-  extra_include_count = features.include_count;
-  extra_defines = features.defines;
-  extra_define_count = features.define_count;
-  extra_compiler_flags = features.compiler_flags;
-  extra_compiler_flags_count = features.compiler_flags_count;
-  extra_force_includes = features.force_includes;
-  extra_force_include_count = features.force_include_count;
+  ctx->extra_compiler = features.compiler;
+  ctx->extra_include_paths = features.include_paths;
+  ctx->extra_include_count = features.include_count;
+  ctx->extra_defines = features.defines;
+  ctx->extra_define_count = features.define_count;
+  ctx->extra_compiler_flags = features.compiler_flags;
+  ctx->extra_compiler_flags_count = features.compiler_flags_count;
+  ctx->extra_force_includes = features.force_includes;
+  ctx->extra_force_include_count = features.force_include_count;
 
   // Create temp file for output
   char temp_path[PATH_MAX];
@@ -4305,7 +4255,7 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
     result.status = PRISM_ERR_IO;
     result.error_msg = strdup("Failed to create temp file");
 #ifdef PRISM_LIB_MODE
-    prism_error_jmp_set = false;
+    ctx->error_jmp_set = false;
 #endif
     return result;
   }
@@ -4317,7 +4267,7 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
       result.status = PRISM_ERR_IO;
       result.error_msg = strdup("Failed to create temp file");
 #ifdef PRISM_LIB_MODE
-      prism_error_jmp_set = false;
+      ctx->error_jmp_set = false;
 #endif
       return result;
     }
@@ -4331,7 +4281,7 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
       result.status = PRISM_ERR_IO;
       result.error_msg = strdup("Failed to create temp file");
 #ifdef PRISM_LIB_MODE
-      prism_error_jmp_set = false;
+      ctx->error_jmp_set = false;
 #endif
       return result;
     }
@@ -4349,8 +4299,8 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
 
 #ifdef PRISM_LIB_MODE
   // Track output temp file for cleanup on error (temp_path is now the actual path)
-  strncpy(prism_active_temp_output, temp_path, PATH_MAX - 1);
-  prism_active_temp_output[PATH_MAX - 1] = '\0';
+  strncpy(ctx->active_temp_output, temp_path, PATH_MAX - 1);
+  ctx->active_temp_output[PATH_MAX - 1] = '\0';
 #endif
 
   // Transpile
@@ -4360,8 +4310,8 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
     result.error_msg = strdup("Transpilation failed");
     remove(temp_path);
 #ifdef PRISM_LIB_MODE
-    prism_active_temp_output[0] = '\0';
-    prism_error_jmp_set = false;
+    ctx->active_temp_output[0] = '\0';
+    ctx->error_jmp_set = false;
 #endif
     return result;
   }
@@ -4374,8 +4324,8 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
     result.error_msg = strdup("Failed to read transpiled output");
     remove(temp_path);
 #ifdef PRISM_LIB_MODE
-    prism_active_temp_output[0] = '\0';
-    prism_error_jmp_set = false;
+    ctx->active_temp_output[0] = '\0';
+    ctx->error_jmp_set = false;
 #endif
     return result;
   }
@@ -4392,8 +4342,8 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
     fclose(f);
     remove(temp_path);
 #ifdef PRISM_LIB_MODE
-    prism_active_temp_output[0] = '\0';
-    prism_error_jmp_set = false;
+    ctx->active_temp_output[0] = '\0';
+    ctx->error_jmp_set = false;
 #endif
     return result;
   }
@@ -4407,8 +4357,8 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
   remove(temp_path);
 
 #ifdef PRISM_LIB_MODE
-  prism_active_temp_output[0] = '\0';
-  prism_error_jmp_set = false;
+  ctx->active_temp_output[0] = '\0';
+  ctx->error_jmp_set = false;
 #endif
   return result;
 }
@@ -4447,7 +4397,7 @@ PRISM_API void prism_reset(void)
   }
   free(defer_stack);
   defer_stack = NULL;
-  defer_depth = 0;
+  ctx->defer_depth = 0;
   defer_stack_capacity = 0;
 
   // Reset label table
@@ -4466,7 +4416,7 @@ PRISM_API void prism_reset(void)
   // Reset statement expression tracking
   free(stmt_expr_levels);
   stmt_expr_levels = NULL;
-  stmt_expr_count = 0;
+  ctx->stmt_expr_count = 0;
   stmt_expr_capacity = 0;
 
   // Reset output state - close file if open (prevents FD leak on error recovery)
@@ -4480,9 +4430,25 @@ PRISM_API void prism_reset(void)
   out_buf.pos = 0;
   out_buf.cap = 0;
   last_emitted = NULL;
-  last_line_no = 0;
-  last_filename = NULL;
-  last_system_header = false;
+  ctx->last_line_no = 0;
+  ctx->last_filename = NULL;
+  ctx->last_system_header = false;
+
+  ctx->struct_depth = 0;
+  ctx->ret_counter = 0;
+  ctx->next_scope_is_loop = false;
+  ctx->next_scope_is_switch = false;
+  ctx->next_scope_is_conditional = false;
+  ctx->in_for_init = false;
+  ctx->pending_for_paren = false;
+  ctx->conditional_block_depth = 0;
+  ctx->generic_paren_depth = 0;
+  ctx->current_func_returns_void = false;
+  ctx->current_func_has_setjmp = false;
+  ctx->current_func_has_asm = false;
+  ctx->current_func_has_vfork = false;
+  ctx->at_stmt_start = true;
+  control_state_reset();
 }
 
 // CLI IMPLEMENTATION (excluded with -DPRISM_LIB_MODE)
@@ -5287,6 +5253,8 @@ static char *create_temp_file(const char *source, char *buf, size_t bufsize)
 
 int main(int argc, char **argv)
 {
+  prism_ctx_init();
+
   if (argc < 2)
   {
     print_help();
@@ -5296,23 +5264,23 @@ int main(int argc, char **argv)
   Cli cli = cli_parse(argc, argv);
 
   // Set feature flags from CLI
-  feature_defer = cli.features.defer;
-  feature_zeroinit = cli.features.zeroinit;
-  feature_warn_safety = cli.features.warn_safety;
+  ctx->feature_defer = cli.features.defer;
+  ctx->feature_zeroinit = cli.features.zeroinit;
+  ctx->feature_warn_safety = cli.features.warn_safety;
 
   // Set preprocessor configuration from CLI
   // Use get_real_cc() to avoid infinite recursion if CC=prism
-  extra_compiler = get_real_cc(cli.cc);
-  extra_compiler_flags = cli.pp_flags;
-  extra_compiler_flags_count = cli.pp_flags_count;
-  extra_include_paths = cli.include_paths;
-  extra_include_count = cli.include_count;
-  extra_defines = cli.defines;
-  extra_define_count = cli.define_count;
-  extra_force_includes = cli.force_includes;
-  extra_force_include_count = cli.force_include_count;
-  emit_line_directives = cli.features.line_directives;
-  feature_flatten_headers = cli.features.flatten_headers;
+  ctx->extra_compiler = get_real_cc(cli.cc);
+  ctx->extra_compiler_flags = cli.pp_flags;
+  ctx->extra_compiler_flags_count = cli.pp_flags_count;
+  ctx->extra_include_paths = cli.include_paths;
+  ctx->extra_include_count = cli.include_count;
+  ctx->extra_defines = cli.defines;
+  ctx->extra_define_count = cli.define_count;
+  ctx->extra_force_includes = cli.force_includes;
+  ctx->extra_force_include_count = cli.force_include_count;
+  ctx->emit_line_directives = cli.features.line_directives;
+  ctx->feature_flatten_headers = cli.features.flatten_headers;
 
   // Handle special modes
   switch (cli.mode)

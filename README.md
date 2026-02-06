@@ -4,9 +4,8 @@
 **A dialect of C with `defer` and automatic zero-initialization.**
 
 Prism is a single-file transpiler that makes C safer without changing how you write it.
-Drop it into any build system with CC=prism — all GCC flags pass through automatically.
 
-- **995 tests** — edge cases, control flow, nightmares, trying hard break Prism
+- **995 tests** — edge cases, control flow, nightmares, trying hard break to Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Proper transpiler** — tracks typedefs, respects scope, catches unsafe patterns
 - **Opt-out features** Disable parts of the transpiler, like zero-init, with CLI flags
@@ -209,7 +208,7 @@ Not:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v0.100.0 - Robust C transpiler
+Prism v0.101.0 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 
