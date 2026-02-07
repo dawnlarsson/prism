@@ -58,6 +58,7 @@ typedef struct
     char *name;
     int file_no;
     char *contents;
+    size_t contents_len;
     char *display_name;
     int line_delta;
     int *line_offsets;
@@ -568,7 +569,7 @@ static int tok_line_no(Token *tok)
         return -1;
 
     char *file_start = f->contents;
-    char *file_end = f->contents + strlen(f->contents);
+    char *file_end = f->contents + f->contents_len;
     if (tok->loc < file_start || tok->loc >= file_end)
         return -1;
 
@@ -721,9 +722,14 @@ static inline bool equal(Token *tok, const char *op)
     if (tok->len == (int)len && !memcmp(tok->loc, op, len))
         return true;
 
-    // Check digraph equivalence
+    // Check digraph equivalence (digraph equivs are short constant strings,
+    // use direct length check instead of strlen)
     const char *equiv = digraph_equiv(tok);
-    return equiv && strlen(equiv) == len && !memcmp(equiv, op, len);
+    if (!equiv)
+        return false;
+    // digraph equivalents are 1 or 2 chars, compute length directly
+    size_t elen = equiv[0] ? (equiv[1] ? 2 : 1) : 0;
+    return elen == len && !memcmp(equiv, op, len);
 }
 
 // Internal marker bit for keyword map: values are (tag | KW_MARKER)
@@ -1174,6 +1180,7 @@ static File *new_file(char *name, int file_no, char *contents)
     file->display_name = file->name;
     file->file_no = file_no;
     file->contents = contents;
+    file->contents_len = strlen(contents);
     file->line_delta = 0;
     file->owns_contents = true;
     file->owns_line_offsets = true;
@@ -1221,6 +1228,7 @@ static File *new_file_view(const char *name, File *base, int line_delta, bool is
     file->display_name = file->name;
     file->file_no = ctx->input_file_count;
     file->contents = base->contents;
+    file->contents_len = base->contents_len;
     file->line_offsets = base->line_offsets;
     file->line_count = base->line_count;
     file->line_delta = line_delta;

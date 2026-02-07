@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.105.0"
+#define PRISM_VERSION "0.106.0"
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -595,15 +595,19 @@ static void emit_tok(Token *tok)
   // Check if we need a #line directive BEFORE emitting the token
   bool need_line = false;
   char *tok_fname = NULL;
-  int line_no = tok_line_no(tok);
+  int line_no = 0;
 
-  if (FEAT(F_LINE_DIR) && f && line_no > 0)
+  if (FEAT(F_LINE_DIR) && f)
   {
-    tok_fname = f->display_name ? f->display_name : f->name;
-    need_line = (ctx->last_filename != tok_fname &&
-                 (!ctx->last_filename || !tok_fname || strcmp(ctx->last_filename, tok_fname) != 0)) ||
-                (f->is_system != ctx->last_system_header) ||
-                (line_no != ctx->last_line_no && line_no != ctx->last_line_no + 1);
+    line_no = tok_line_no(tok);
+    if (line_no > 0)
+    {
+      tok_fname = f->display_name ? f->display_name : f->name;
+      need_line = (ctx->last_filename != tok_fname &&
+                   (!ctx->last_filename || !tok_fname || strcmp(ctx->last_filename, tok_fname) != 0)) ||
+                  (f->is_system != ctx->last_system_header) ||
+                  (line_no != ctx->last_line_no && line_no != ctx->last_line_no + 1);
+    }
   }
 
   // Spacing: BOL gets newline, otherwise check for #line or token-merge space
