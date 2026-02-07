@@ -94,13 +94,20 @@ enum
 // Eliminates repeated string comparisons in the transpiler
 enum
 {
-    TT_TYPE = 1 << 0,      // Type keyword (int, char, void, struct, etc.)
-    TT_QUALIFIER = 1 << 1, // Type qualifier (const, volatile, restrict, static, auto, register, _Atomic, _Alignas, __attribute__)
-    TT_SUE = 1 << 2,       // struct/union/enum
-    TT_SKIP_DECL = 1 << 3, // Keywords that can't start a zero-init declaration
-    TT_ATTR = 1 << 4,      // Attribute keyword (__attribute__, __attribute, __declspec)
-    TT_ASSIGN = 1 << 5,    // Assignment or compound assignment operator (=, +=, ++, --, [)
-    TT_MEMBER = 1 << 6,    // Member access operator (. or ->)
+    TT_TYPE = 1 << 0,         // Type keyword (int, char, void, struct, etc.)
+    TT_QUALIFIER = 1 << 1,    // Type qualifier (const, volatile, restrict, static, auto, register, _Atomic, _Alignas, __attribute__)
+    TT_SUE = 1 << 2,          // struct/union/enum
+    TT_SKIP_DECL = 1 << 3,    // Keywords that can't start a zero-init declaration
+    TT_ATTR = 1 << 4,         // Attribute keyword (__attribute__, __attribute, __declspec)
+    TT_ASSIGN = 1 << 5,       // Assignment or compound assignment operator (=, +=, ++, --, [)
+    TT_MEMBER = 1 << 6,       // Member access operator (. or ->)
+    TT_LOOP = 1 << 7,         // Loop keyword (for, while, do)
+    TT_CONTROL = 1 << 8,      // Control flow keyword (if, else, for, while, do, switch)
+    TT_ASM = 1 << 9,          // Inline assembly (asm, __asm__, __asm)
+    TT_INLINE = 1 << 10,      // inline, __inline, __inline__
+    TT_NORETURN_FN = 1 << 11, // Noreturn function identifier (exit, abort, etc.)
+    TT_SETJMP_FN = 1 << 12,   // setjmp/longjmp family identifier
+    TT_VFORK_FN = 1 << 13,    // vfork identifier
 };
 
 struct Token
@@ -116,7 +123,7 @@ struct Token
     TokenKind kind;
     uint16_t file_idx;
     uint8_t flags;
-    uint8_t tag; // TT_* bitmask - token classification
+    uint16_t tag; // TT_* bitmask - token classification
 };
 
 // Token accessors
@@ -724,7 +731,7 @@ static inline bool equal(Token *tok, const char *op)
 
 // Internal marker bit for keyword map: values are (tag | KW_MARKER)
 // This distinguishes tag=0 keywords from "not found" (NULL)
-#define KW_MARKER 0x80
+#define KW_MARKER 0x8000
 
 static void init_keyword_map(void)
 {
@@ -733,16 +740,16 @@ static void init_keyword_map(void)
     static struct
     {
         char *name;
-        uint8_t tag;
+        uint16_t tag;
     } kw[] = {
-        // Control flow (skip-decl: can't start a zero-init declaration)
+        // Control flow (skip-decl is set on all; can't start a zero-init declaration)
         {"return", TT_SKIP_DECL},
-        {"if", TT_SKIP_DECL},
-        {"else", TT_SKIP_DECL},
-        {"for", TT_SKIP_DECL},
-        {"while", TT_SKIP_DECL},
-        {"do", TT_SKIP_DECL},
-        {"switch", TT_SKIP_DECL},
+        {"if", TT_SKIP_DECL | TT_CONTROL},
+        {"else", TT_SKIP_DECL | TT_CONTROL},
+        {"for", TT_SKIP_DECL | TT_LOOP | TT_CONTROL},
+        {"while", TT_SKIP_DECL | TT_LOOP | TT_CONTROL},
+        {"do", TT_SKIP_DECL | TT_LOOP | TT_CONTROL},
+        {"switch", TT_SKIP_DECL | TT_CONTROL},
         {"case", TT_SKIP_DECL},
         {"default", TT_SKIP_DECL},
         {"break", TT_SKIP_DECL},
@@ -761,13 +768,15 @@ static void init_keyword_map(void)
         {"typedef", TT_SKIP_DECL},
         {"static", TT_QUALIFIER | TT_SKIP_DECL},
         {"extern", TT_SKIP_DECL},
-        {"inline", 0},
+        {"inline", TT_INLINE},
         // Type qualifiers
         {"const", TT_QUALIFIER},
         {"volatile", TT_QUALIFIER},
         {"restrict", TT_QUALIFIER},
         {"_Atomic", TT_QUALIFIER | TT_TYPE},
         {"_Noreturn", 0},
+        {"__inline", TT_INLINE},
+        {"__inline__", TT_INLINE},
         {"_Thread_local", 0},
         // Type keywords
         {"void", TT_TYPE},
@@ -796,9 +805,9 @@ static void init_keyword_map(void)
         {"__typeof", TT_TYPE},
         {"_BitInt", TT_TYPE},
         // Asm (skip-decl: can't start a declaration)
-        {"asm", TT_SKIP_DECL},
-        {"__asm__", TT_SKIP_DECL},
-        {"__asm", TT_SKIP_DECL},
+        {"asm", TT_SKIP_DECL | TT_ASM},
+        {"__asm__", TT_SKIP_DECL | TT_ASM},
+        {"__asm", TT_SKIP_DECL | TT_ASM},
         // Attributes
         {"__attribute__", TT_ATTR | TT_QUALIFIER},
         {"__attribute", TT_ATTR | TT_QUALIFIER},
@@ -824,10 +833,10 @@ static bool is_keyword(Token *tok)
 }
 
 // Get the tag bits for a keyword (0 if not a keyword)
-static uint8_t keyword_tag(Token *tok)
+static uint16_t keyword_tag(Token *tok)
 {
     void *val = hashmap_get(&ctx->keyword_map, tok->loc, tok->len);
-    return val ? (uint8_t)((uintptr_t)val & ~KW_MARKER) : 0;
+    return val ? (uint16_t)((uintptr_t)val & ~KW_MARKER) : 0;
 }
 
 // Forward declaration for hex digit conversion
@@ -894,7 +903,8 @@ static int read_ident(char *start)
     {
         // Non-ASCII UTF-8 start byte
         len = utf8_char_len((unsigned char)*p);
-        if (len == 0) return 0;
+        if (len == 0)
+            return 0;
         p += len;
     }
     else
@@ -917,7 +927,8 @@ static int read_ident(char *start)
         if ((unsigned char)*p >= 0x80)
         {
             len = utf8_char_len((unsigned char)*p);
-            if (len == 0) break;
+            if (len == 0)
+                break;
             p += len;
             continue;
         }
@@ -1346,6 +1357,41 @@ static void convert_pp_tokens(Token *tok)
         }
         else if (t->kind == TK_PP_NUM)
             convert_pp_number(t);
+        else if (t->kind == TK_IDENT)
+        {
+            // Tag well-known identifiers for O(1) classification in transpiler
+            static const struct
+            {
+                const char *name;
+                uint16_t tag;
+            } ident_tags[] = {
+                {"exit", TT_NORETURN_FN},
+                {"_Exit", TT_NORETURN_FN},
+                {"_exit", TT_NORETURN_FN},
+                {"abort", TT_NORETURN_FN},
+                {"quick_exit", TT_NORETURN_FN},
+                {"__builtin_trap", TT_NORETURN_FN},
+                {"__builtin_unreachable", TT_NORETURN_FN},
+                {"thrd_exit", TT_NORETURN_FN},
+                {"setjmp", TT_SETJMP_FN},
+                {"longjmp", TT_SETJMP_FN},
+                {"_setjmp", TT_SETJMP_FN},
+                {"_longjmp", TT_SETJMP_FN},
+                {"sigsetjmp", TT_SETJMP_FN},
+                {"siglongjmp", TT_SETJMP_FN},
+                {"pthread_exit", TT_SETJMP_FN},
+                {"vfork", TT_VFORK_FN},
+            };
+            for (size_t i = 0; i < sizeof(ident_tags) / sizeof(*ident_tags); i++)
+            {
+                size_t nlen = strlen(ident_tags[i].name);
+                if ((int)nlen == t->len && !memcmp(t->loc, ident_tags[i].name, nlen))
+                {
+                    t->tag = ident_tags[i].tag;
+                    break;
+                }
+            }
+        }
         else if (t->kind == TK_PUNCT)
         {
             // Tag punctuators: assignment ops and member access

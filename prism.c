@@ -1135,120 +1135,140 @@ static Token *find_struct_body_brace(Token *tok)
   return (t && equal(t, "{")) ? t : NULL;
 }
 
+// Unified token walker — iterates tokens tracking brace depth, struct bodies,
+// and _Generic skipping. Used by scan_labels_in_function and goto_skips_check
+// to eliminate duplicated structural token-walking logic.
+typedef struct
+{
+  Token *tok;        // Current token
+  Token *prev;       // Previous meaningful token
+  int depth;         // Brace depth (updated on { and })
+  int struct_depth;  // Nesting inside struct/union/enum bodies
+  int initial_depth; // Starting depth (break when } would go below this)
+} TokenWalker;
+
+static void walker_init(TokenWalker *w, Token *start, int initial_depth)
+{
+  *w = (TokenWalker){.tok = start, .initial_depth = initial_depth, .depth = initial_depth};
+}
+
+// Advance to next meaningful token. Skips struct/union/enum body openings
+// (fast-forwards from keyword to past '{') and _Generic(...) expressions.
+// Tracks brace depth on { and } — these ARE returned to the caller.
+// Returns false when region ends (EOF or '}' at initial_depth).
+static bool walker_next(TokenWalker *w)
+{
+  for (;;)
+  {
+    if (!w->tok || w->tok->kind == TK_EOF)
+      return false;
+
+    // Skip struct/union/enum body openings (keyword → past '{')
+    if (w->tok->tag & TT_SUE)
+    {
+      Token *brace = find_struct_body_brace(w->tok);
+      if (brace)
+      {
+        while (w->tok != brace)
+        {
+          w->prev = w->tok;
+          w->tok = w->tok->next;
+        }
+        w->struct_depth++;
+        w->depth++;
+        w->prev = w->tok;
+        w->tok = w->tok->next;
+        continue;
+      }
+    }
+
+    // Skip _Generic(...)
+    if (w->tok->kind == TK_KEYWORD && equal(w->tok, "_Generic"))
+    {
+      w->prev = w->tok;
+      w->tok = w->tok->next;
+      if (w->tok && equal(w->tok, "("))
+        w->tok = skip_balanced(w->tok, "(", ")");
+      w->prev = NULL;
+      continue;
+    }
+
+    // Track braces — update depth but still return token to caller
+    if (equal(w->tok, "{"))
+    {
+      w->depth++;
+    }
+    else if (equal(w->tok, "}"))
+    {
+      if (w->depth <= w->initial_depth)
+        return false; // End of region
+      if (w->struct_depth > 0)
+        w->struct_depth--;
+      w->depth--;
+    }
+
+    return true;
+  }
+}
+
+static inline void walker_advance(TokenWalker *w)
+{
+  w->prev = w->tok;
+  w->tok = w->tok->next;
+}
+
+// Check if current token is a goto label (identifier followed by ':').
+// Filters out: '::', ternary '?:', case/default, bitfields in struct bodies.
+static Token *walker_check_label(TokenWalker *w)
+{
+  if (!is_identifier_like(w->tok))
+    return NULL;
+  Token *t = skip_gnu_attributes(w->tok->next);
+  if (!t || !equal(t, ":"))
+    return NULL;
+  if (t->next && equal(t->next, ":"))
+    return NULL; // :: scope resolution
+  if (w->prev && equal(w->prev, "?"))
+    return NULL; // ternary
+  if (w->prev && (equal(w->prev, "case") || equal(w->prev, "default")))
+    return NULL; // switch case
+  if (w->struct_depth > 0)
+    return NULL; // bitfield
+  return w->tok;
+}
+
+// ============================================================================
+
 // Scan a function body for labels and record their scope depths
 // Also detects setjmp/longjmp/pthread_exit/vfork and inline asm usage
 // tok should point to the opening '{' of the function body
 static void scan_labels_in_function(Token *tok)
 {
   label_table.count = 0;
-  hashmap_clear(&label_table.name_map); // Clear for O(1) lookups
-  ctx->current_func_has_setjmp = false; // Reset for new function
-  ctx->current_func_has_asm = false;    // Reset for new function
-  ctx->current_func_has_vfork = false;  // Reset for new function
+  hashmap_clear(&label_table.name_map);
+  ctx->current_func_has_setjmp = false;
+  ctx->current_func_has_asm = false;
+  ctx->current_func_has_vfork = false;
   if (!tok || !equal(tok, "{"))
     return;
 
-  // Start at depth 1 to align with ctx->defer_depth (which is 1 inside function body)
-  int depth = 1;
-  int local_struct_depth = 0; // Track nesting inside struct/union/enum bodies
-  Token *prev = NULL;
-  tok = tok->next; // Skip opening brace
+  TokenWalker w;
+  walker_init(&w, tok->next, 1); // depth 1 = inside function body
 
-  while (tok && tok->kind != TK_EOF)
+  while (walker_next(&w))
   {
-    // Track struct/union/enum bodies to skip bitfield declarations
-    if (tok->tag & TT_SUE)
-    {
-      Token *brace = find_struct_body_brace(tok);
-      if (brace)
-      {
-        while (tok != brace)
-        {
-          prev = tok;
-          tok = tok->next;
-        }
-        local_struct_depth++;
-        depth++;
-        prev = tok;
-        tok = tok->next;
-        continue;
-      }
-    }
-
-    if (equal(tok, "{"))
-    {
-      depth++;
-      prev = tok;
-      tok = tok->next;
-      continue;
-    }
-    if (equal(tok, "}"))
-    {
-      if (depth == 1)
-        break; // End of function
-      if (local_struct_depth > 0)
-        local_struct_depth--;
-      depth--;
-      prev = tok;
-      tok = tok->next;
-      continue;
-    }
-
-    // Detect setjmp/longjmp/sigsetjmp/siglongjmp usage
-    // Also detect pthread_exit which bypasses cleanup like longjmp
-    if (tok->kind == TK_IDENT &&
-        (equal(tok, "setjmp") || equal(tok, "longjmp") ||
-         equal(tok, "_setjmp") || equal(tok, "_longjmp") ||
-         equal(tok, "sigsetjmp") || equal(tok, "siglongjmp") ||
-         equal(tok, "pthread_exit")))
+    if (w.tok->tag & TT_SETJMP_FN)
       ctx->current_func_has_setjmp = true;
-
-    // Detect vfork which has unpredictable control flow
-    if (tok->kind == TK_IDENT && equal(tok, "vfork"))
+    if (w.tok->tag & TT_VFORK_FN)
       ctx->current_func_has_vfork = true;
-
-    // Detect inline asm which may contain hidden jumps
-    if (tok->kind == TK_KEYWORD && (equal(tok, "asm") || equal(tok, "__asm__") || equal(tok, "__asm")))
+    if (w.tok->tag & TT_ASM)
       ctx->current_func_has_asm = true;
 
-    // Skip _Generic(...) - type associations inside look like labels (Type: expr)
-    if (tok->kind == TK_KEYWORD && equal(tok, "_Generic"))
-    {
-      prev = tok;
-      tok = tok->next;
-      if (tok && equal(tok, "("))
-      {
-        tok = skip_balanced(tok, "(", ")");
-        prev = NULL; // Reset prev since we skipped a complex expression
-      }
-      continue;
-    }
+    Token *label = walker_check_label(&w);
+    if (label)
+      label_table_add(label->loc, label->len, w.depth);
 
-    // Check for label: identifier followed by ':' (but not ::)
-    // Also handle labels with attributes: identifier __attribute__((...)) :
-    // Filter out: ternary operator, switch cases, bitfields
-    // Also handle 'defer' keyword used as a label (defer:) - valid if user isn't using defer feature
-    if (is_identifier_like(tok))
-    {
-      // Look ahead for colon, skipping any __attribute__((...)) sequences
-      Token *t = skip_gnu_attributes(tok->next);
-
-      if (t && equal(t, ":"))
-      {
-        Token *colon = t;
-        // Make sure it's not :: (C++ scope resolution)
-        bool is_scope_resolution = colon->next && equal(colon->next, ":");
-        bool is_ternary = prev && equal(prev, "?");
-        bool is_switch_case = prev && (equal(prev, "case") || equal(prev, "default"));
-        bool is_bitfield = local_struct_depth > 0;
-
-        if (!is_scope_resolution && !is_ternary && !is_switch_case && !is_bitfield)
-          label_table_add(tok->loc, tok->len, depth);
-      }
-    }
-
-    prev = tok;
-    tok = tok->next;
+    walker_advance(&w);
   }
 }
 
@@ -1274,147 +1294,91 @@ typedef enum
 // The rule: if we find the label BEFORE exiting the scope containing the item, it's invalid.
 static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len, GotoCheckMode mode)
 {
-  // For DECL mode, check when zero-init OR defer is enabled.
-  // goto-over-initialization is UB regardless of zero-init; the defer goto handler
-  // (line ~3756) also calls this, and should still catch jumped-over declarations
-  // even when the user has disabled zero-init but kept defer on.
   if (mode == GOTO_CHECK_DECL && !ctx->feature_zeroinit && !ctx->feature_defer)
     return NULL;
 
-  // Scan forward from goto to find the label
-  Token *tok = goto_tok->next->next; // skip 'goto' and label name
-  if (tok && equal(tok, ";"))
-    tok = tok->next;
+  Token *start = goto_tok->next->next; // skip 'goto' and label name
+  if (start && equal(start, ";"))
+    start = start->next;
 
-  int depth = 0;
-  int local_struct_depth = 0;
-  Token *active_item = NULL;  // Most recently seen item that's still "in scope"
-  int active_item_depth = -1; // Depth at which active_item was found
-  Token *prev = NULL;
-  bool is_stmt_start = true;   // Only needed for DECL mode
-  bool is_in_for_init = false; // Track if we're in for loop initialization clause
+  Token *active_item = NULL;
+  int active_item_depth = -1;
+  bool is_stmt_start = true;
+  bool is_in_for_init = false;
 
-  while (tok && tok->kind != TK_EOF)
+  TokenWalker w;
+  walker_init(&w, start, 0);
+
+  while (walker_next(&w))
   {
-    // Track for loops to detect declarations in initialization clause
-    if (mode == GOTO_CHECK_DECL && tok->kind == TK_KEYWORD && equal(tok, "for"))
+    // For-loop init detection (DECL mode only)
+    if (mode == GOTO_CHECK_DECL && w.tok->kind == TK_KEYWORD && equal(w.tok, "for"))
     {
-      prev = tok;
-      tok = tok->next;
-      if (tok && equal(tok, "("))
+      walker_advance(&w);
+      if (w.tok && equal(w.tok, "("))
       {
-        // We're entering the for loop initialization
         is_in_for_init = true;
-        prev = tok;
-        tok = tok->next;
-        is_stmt_start = true; // Treat start of for init as statement start
+        walker_advance(&w);
+        is_stmt_start = true;
         continue;
       }
       is_stmt_start = false;
       continue;
     }
 
-    // Track struct/union/enum bodies to skip bitfield declarations
-    if (tok->tag & TT_SUE)
+    // Scope changes — depth already updated by walker
+    if (equal(w.tok, "{"))
     {
-      Token *brace = find_struct_body_brace(tok);
-      if (brace)
-      {
-        while (tok != brace)
-        {
-          prev = tok;
-          tok = tok->next;
-        }
-        local_struct_depth++;
-        depth++;
-        prev = tok;
-        tok = tok->next;
-        is_stmt_start = false;
-        continue;
-      }
-    }
-
-    if (equal(tok, "{"))
-    {
-      depth++;
-      prev = tok;
-      tok = tok->next;
       is_stmt_start = true;
+      walker_advance(&w);
       continue;
     }
-    if (equal(tok, "}"))
+    if (equal(w.tok, "}"))
     {
-      // Exiting a scope - if we exit past where we found the item, clear it
-      if (active_item && depth <= active_item_depth)
+      // Clear active_item if we've exited its scope (depth already decremented)
+      if (active_item && w.depth < active_item_depth)
       {
         active_item = NULL;
         active_item_depth = -1;
       }
-      if (local_struct_depth > 0)
-        local_struct_depth--;
-      if (depth == 0)
-        break;
-      depth--;
-      prev = tok;
-      tok = tok->next;
       is_stmt_start = true;
+      walker_advance(&w);
       continue;
     }
-    if (equal(tok, ";"))
+    if (equal(w.tok, ";"))
     {
       is_stmt_start = true;
-      // If we're in for loop init, semicolon ends the init clause
       if (is_in_for_init)
         is_in_for_init = false;
-      prev = tok;
-      tok = tok->next;
-      continue;
-    }
-
-    // Skip _Generic(...) - type associations inside look like labels
-    if (tok->kind == TK_KEYWORD && equal(tok, "_Generic"))
-    {
-      prev = tok;
-      tok = tok->next;
-      if (tok && equal(tok, "("))
-      {
-        tok = skip_balanced(tok, "(", ")");
-        prev = NULL;
-      }
-      is_stmt_start = false;
+      walker_advance(&w);
       continue;
     }
 
     // Mode-specific: track defers or declarations
     if (mode == GOTO_CHECK_DEFER)
     {
-      // Track defers we pass over (skip if preceded by member access)
-      // Also skip if this is a variable declaration: "int defer;" not "defer stmt;"
-      // Check if preceded by a type keyword - if so, it's a variable name, not defer statement
-      bool is_variable_name = prev && (is_type_keyword(prev) || equal(prev, "*") ||
-                                       equal(prev, "const") || equal(prev, "volatile") ||
-                                       equal(prev, "restrict") || equal(prev, "__restrict") ||
-                                       equal(prev, ",")); // Also check comma for multi-declarators
+      bool is_variable_name = w.prev && (is_type_keyword(w.prev) || equal(w.prev, "*") ||
+                                         equal(w.prev, "const") || equal(w.prev, "volatile") ||
+                                         equal(w.prev, "restrict") || equal(w.prev, "__restrict") ||
+                                         equal(w.prev, ","));
 
-      // Check for defer statement (not a label named "defer:")
-      if (tok->kind == TK_KEYWORD && equal(tok, "defer") &&
-          !equal(tok->next, ":") && // Distinguish from label named "defer:"
-          !(prev && (prev->tag & TT_MEMBER)) && !is_variable_name && !(tok->next && (tok->next->tag & TT_ASSIGN)))
+      if (w.tok->kind == TK_KEYWORD && equal(w.tok, "defer") &&
+          !equal(w.tok->next, ":") &&
+          !(w.prev && (w.prev->tag & TT_MEMBER)) && !is_variable_name &&
+          !(w.tok->next && (w.tok->next->tag & TT_ASSIGN)))
       {
-        if (!active_item || depth <= active_item_depth)
+        if (!active_item || w.depth <= active_item_depth)
         {
-          active_item = tok;
-          active_item_depth = depth;
+          active_item = w.tok;
+          active_item_depth = w.depth;
         }
       }
     }
-    else if (mode == GOTO_CHECK_DECL && (is_stmt_start || is_in_for_init) && local_struct_depth == 0)
+    else if (mode == GOTO_CHECK_DECL && (is_stmt_start || is_in_for_init) && w.struct_depth == 0)
     {
-      // Detect variable declarations at statement start OR in for loop initialization
-      Token *decl_start = tok;
-      Token *t = tok;
+      Token *decl_start = w.tok;
+      Token *t = w.tok;
 
-      // Check for 'raw' keyword - if present, skip checking this declaration
       bool has_raw = false;
       if (equal(t, "raw") && !is_known_typedef(t))
       {
@@ -1422,56 +1386,38 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
         t = t->next;
       }
 
-      // Skip extern/typedef - these don't create initialized variables
       if (!equal(t, "extern") && !equal(t, "typedef"))
       {
-        // Use unified type parser to detect and skip the type
         TypeSpecResult type = parse_type_specifier(t);
         if (type.saw_type)
         {
           t = type.end;
-
-          // Skip pointers and qualifiers
           while (t && (equal(t, "*") || (t->tag & TT_QUALIFIER) ||
                        equal(t, "__restrict") || equal(t, "__restrict__")))
             t = t->next;
-
-          // Should be at identifier now - and NOT followed by '(' (that's a function)
           if (t && t->kind == TK_IDENT && t->next && !equal(t->next, "("))
           {
-            if (!has_raw && (!active_item || depth <= active_item_depth))
+            if (!has_raw && (!active_item || w.depth <= active_item_depth))
             {
               active_item = decl_start;
-              active_item_depth = depth;
+              active_item_depth = w.depth;
             }
           }
         }
       }
     }
 
-    // Found the label? Check with proper filtering
-    if (tok->kind == TK_IDENT && tok->len == label_len &&
-        !memcmp(tok->loc, label_name, label_len))
+    // Label detection
+    if (w.tok->kind == TK_IDENT && w.tok->len == label_len &&
+        !memcmp(w.tok->loc, label_name, label_len))
     {
-      // Look ahead for colon, skipping any __attribute__((...)) sequences
-      Token *t = skip_gnu_attributes(tok->next);
-
-      if (t && equal(t, ":"))
-      {
-        Token *colon = t;
-        bool is_scope_resolution = colon->next && equal(colon->next, ":");
-        bool is_ternary = prev && equal(prev, "?");
-        bool is_switch_case = prev && (equal(prev, "case") || equal(prev, "default"));
-        bool is_bitfield = local_struct_depth > 0;
-
-        if (!is_scope_resolution && !is_ternary && !is_switch_case && !is_bitfield)
-          return active_item; // Label found - return any active item we're skipping
-      }
+      Token *label = walker_check_label(&w);
+      if (label)
+        return active_item;
     }
 
     is_stmt_start = false;
-    prev = tok;
-    tok = tok->next;
+    walker_advance(&w);
   }
 
   return NULL;
@@ -1514,9 +1460,7 @@ static Token *skip_balanced(Token *tok, char *open, char *close)
 static bool is_void_function_decl(Token *tok)
 {
   // Skip storage class specifiers, qualifiers, and attributes
-  // These are all tagged TT_SKIP_DECL, TT_QUALIFIER, or TT_ATTR
-  while (tok && ((tok->tag & (TT_QUALIFIER | TT_SKIP_DECL | TT_ATTR)) ||
-                 equal(tok, "inline") || equal(tok, "__inline") || equal(tok, "__inline__") ||
+  while (tok && ((tok->tag & (TT_QUALIFIER | TT_SKIP_DECL | TT_ATTR | TT_INLINE)) ||
                  equal(tok, "_Noreturn")))
   {
     if (tok->tag & TT_ATTR)
@@ -3088,22 +3032,16 @@ static int transpile(char *input_file, char *output_file)
     // Warn about noreturn functions that bypass defer cleanup
     // These functions terminate the program without running defers - RAII violation
     // Also mark as control exit for switch fallthrough detection (they don't fall through)
-    if (ctx->feature_defer && tok->kind == TK_IDENT && tok->next && equal(tok->next, "("))
+    if (ctx->feature_defer && (tok->tag & TT_NORETURN_FN) && tok->next && equal(tok->next, "("))
     {
-      if (equal(tok, "exit") || equal(tok, "_Exit") || equal(tok, "_exit") ||
-          equal(tok, "abort") || equal(tok, "quick_exit") ||
-          equal(tok, "__builtin_trap") || equal(tok, "__builtin_unreachable") ||
-          equal(tok, "thrd_exit"))
-      {
-        // Mark as control exit - noreturn functions don't fall through to next case
-        mark_switch_control_exit();
+      // Mark as control exit - noreturn functions don't fall through to next case
+      mark_switch_control_exit();
 
-        if (has_active_defers())
-        {
-          fprintf(stderr, "%s:%d: warning: '%.*s' called with active defers - deferred statements will NOT run. "
-                          "Consider using return with cleanup, or restructure to avoid defer here.\n",
-                  tok_file(tok)->name, tok_line_no(tok), tok->len, tok->loc);
-        }
+      if (has_active_defers())
+      {
+        fprintf(stderr, "%s:%d: warning: '%.*s' called with active defers - deferred statements will NOT run. "
+                        "Consider using return with cleanup, or restructure to avoid defer here.\n",
+                tok_file(tok)->name, tok_line_no(tok), tok->len, tok->loc);
       }
     }
 
@@ -3437,21 +3375,17 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Mark loop keywords so next '{' knows it's a loop scope
-    if (ctx->feature_defer && tok->kind == TK_KEYWORD &&
-        (equal(tok, "for") || equal(tok, "while") || equal(tok, "do")))
+    if (ctx->feature_defer && (tok->tag & TT_LOOP))
     {
       ctx->next_scope_is_loop = true;
       control_state.pending = true;
-      // For 'for' loops, we need to allow zero-init in the init clause
       if (equal(tok, "for"))
         ctx->pending_for_paren = true;
-      // For 'do' loops, the body comes immediately (no parens before body)
-      // Set cf.parens_just_closed so the next '{' is recognized as the loop body
       if (equal(tok, "do"))
         control_state.parens_just_closed = true;
     }
     // Also track 'for' for zero-init even if defer is disabled
-    else if (ctx->feature_zeroinit && !ctx->feature_defer && tok->kind == TK_KEYWORD && equal(tok, "for"))
+    else if (ctx->feature_zeroinit && !ctx->feature_defer && equal(tok, "for"))
     {
       control_state.pending = true;
       ctx->pending_for_paren = true;
@@ -3492,10 +3426,9 @@ static int transpile(char *input_file, char *output_file)
     }
 
     // Mark if/else keywords
-    if (tok->kind == TK_KEYWORD && (equal(tok, "if") || equal(tok, "else")))
+    if (equal(tok, "if") || equal(tok, "else"))
     {
       control_state.pending = true;
-      // For 'else', the body comes immediately (no parens before body like 'if')
       if (equal(tok, "else"))
         control_state.parens_just_closed = true;
     }
