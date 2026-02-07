@@ -3750,6 +3750,24 @@ static bool is_prism_cc(const char *cc)
   return false;
 }
 
+// Check if the system compiler is clang.
+// On macOS, cc/gcc are always Apple Clang (hardlinked, not symlinked,
+// so realpath doesn't help).  On other platforms, check the basename.
+static bool cc_is_clang(const char *cc)
+{
+#ifdef __APPLE__
+  // On macOS, the default "cc" is always Apple Clang.
+  // Only return false if the user explicitly set a non-clang compiler.
+  if (!cc || !*cc || strcmp(cc, "cc") == 0 || strcmp(cc, "gcc") == 0)
+    return true;
+#endif
+  if (!cc || !*cc)
+    return false;
+  const char *base = strrchr(cc, '/');
+  base = base ? base + 1 : cc;
+  return strncmp(base, "clang", 5) == 0;
+}
+
 static void print_help(void)
 {
   printf(
@@ -4125,6 +4143,7 @@ int main(int argc, char **argv)
   if (cli.source_count == 1)
   {
     const char *compiler = get_real_cc(cli.cc);
+    bool clang = cc_is_clang(compiler);
     ArgvBuilder ab;
     argv_builder_init(&ab);
     argv_builder_add(&ab, compiler);
@@ -4132,17 +4151,23 @@ int main(int argc, char **argv)
     // Tell cc the input is already preprocessed (flatten mode).
     // -fpreprocessed skips macro expansion and #include processing on the second pass.
     // In non-flatten mode, the output may contain #include/#define, so we skip this.
+    // Clang does not support -fpreprocessed.
     argv_builder_add(&ab, "-x");
     argv_builder_add(&ab, "c");
-    if (FEAT(F_FLATTEN))
+    if (FEAT(F_FLATTEN) && !clang)
       argv_builder_add(&ab, "-fpreprocessed");
 
     // Read from stdin (the pipe)
     argv_builder_add(&ab, "-");
 
-    // Reset language so subsequent args (.o, .s, etc.) aren't forced to C
-    argv_builder_add(&ab, "-x");
-    argv_builder_add(&ab, "none");
+    // Reset language so subsequent args (.o, .s, etc.) aren't forced to C.
+    // Only emit when there are trailing args, to avoid clang's
+    // "'-x none' after last input file has no effect" warning.
+    if (cli.cc_arg_count > 0)
+    {
+      argv_builder_add(&ab, "-x");
+      argv_builder_add(&ab, "none");
+    }
 
     for (int i = 0; i < cli.cc_arg_count; i++)
       argv_builder_add(&ab, cli.cc_args[i]);
@@ -4151,12 +4176,11 @@ int main(int argc, char **argv)
     static const char *wflags[] = {
         "-Wno-type-limits",
         "-Wno-cast-align",
-        "-Wno-logical-op",
         "-Wno-implicit-fallthrough",
         "-Wno-unused-function",
         "-Wno-unused-variable",
         "-Wno-unused-parameter",
-        "-Wno-maybe-uninitialized",
+        "-Wno-unknown-warning-option",
     };
     for (int i = 0; i < (int)(sizeof(wflags) / sizeof(*wflags)); i++)
       argv_builder_add(&ab, wflags[i]);
@@ -4264,19 +4288,21 @@ int main(int argc, char **argv)
 
   // Build compile command
   const char *compiler = get_real_cc(cli.cc);
+  bool clang = cc_is_clang(compiler);
   ArgvBuilder ab;
   argv_builder_init(&ab);
   argv_builder_add(&ab, compiler);
 
-  // Tell cc input files are already preprocessed (flatten mode)
-  if (FEAT(F_FLATTEN))
+  // Tell cc input files are already preprocessed (flatten mode).
+  // Clang does not support -fpreprocessed.
+  if (FEAT(F_FLATTEN) && !clang)
     argv_builder_add(&ab, "-fpreprocessed");
 
   for (int i = 0; i < cli.source_count; i++)
     argv_builder_add(&ab, temp_files[i]);
 
   // Reset -fpreprocessed so cc_args (like assembly or other files) aren't affected
-  if (FEAT(F_FLATTEN))
+  if (FEAT(F_FLATTEN) && !clang)
     argv_builder_add(&ab, "-fno-preprocessed");
 
   for (int i = 0; i < cli.cc_arg_count; i++)
@@ -4286,12 +4312,11 @@ int main(int argc, char **argv)
   static const char *wflags[] = {
       "-Wno-type-limits",
       "-Wno-cast-align",
-      "-Wno-logical-op",
       "-Wno-implicit-fallthrough",
       "-Wno-unused-function",
       "-Wno-unused-variable",
       "-Wno-unused-parameter",
-      "-Wno-maybe-uninitialized",
+      "-Wno-unknown-warning-option",
   };
   for (int i = 0; i < (int)(sizeof(wflags) / sizeof(*wflags)); i++)
     argv_builder_add(&ab, wflags[i]);
