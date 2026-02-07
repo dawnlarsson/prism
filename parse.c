@@ -352,7 +352,6 @@ typedef struct PrismContext
     unsigned long long ret_counter;
 #ifdef PRISM_LIB_MODE
     char active_temp_output[PATH_MAX];
-    char active_temp_pp[PATH_MAX];
 #endif
 } PrismContext;
 
@@ -1650,6 +1649,23 @@ static Token *tokenize(File *file)
 
     cur = cur->next = new_token(TK_EOF, p, p);
     return head.next;
+}
+
+// Tokenize from an already-loaded buffer (takes ownership of buf).
+// The buffer must be NUL-terminated. Used by pipe-based preprocessor
+// to avoid writing/reading temp files.
+static Token *tokenize_buffer(char *name, char *buf)
+{
+    if (!ctx->keyword_map.capacity)
+        init_keyword_map();
+
+    if (!buf)
+        return NULL;
+
+    File *file = new_file(name, ctx->input_file_count, buf);
+    add_input_file(file);
+
+    return tokenize(file);
 }
 
 Token *tokenize_file(char *path)

@@ -9,6 +9,7 @@
 
 #include "parse.c"
 
+#include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 
@@ -326,9 +327,9 @@ static void out_flush(void)
 
 static inline void out_char(char c)
 {
-  out_buf[out_buf_pos++] = c;
   if (__builtin_expect(out_buf_pos >= OUT_BUF_SIZE, 0))
     out_flush();
+  out_buf[out_buf_pos++] = c;
 }
 
 static inline void out_str(const char *s, int len)
@@ -374,11 +375,13 @@ static void out_uint(unsigned long long v)
 
 static void out_line(int line_no, const char *file)
 {
-  // Build #line directive in a single buffer to minimize stdio calls
+  // Emit GCC linemarker format: # N "file"
+  // This is compatible with -fpreprocessed (unlike #line N "file")
+  // and is what cc -E itself outputs.
   char buf[PATH_MAX + 32];
   int n = 0;
-  memcpy(buf, "#line ", 6);
-  n = 6;
+  buf[n++] = '#';
+  buf[n++] = ' ';
   // Convert line_no to string
   char num[24];
   char *p = num + sizeof(num);
@@ -427,8 +430,7 @@ static void collect_system_includes(void)
 // Emit diagnostic pragmas to suppress warnings from system headers.
 static void emit_system_header_diag_push(void)
 {
-  OUT_LIT("#if defined(__GNUC__) || defined(__clang__)\n"
-          "#pragma GCC diagnostic push\n"
+  OUT_LIT("#pragma GCC diagnostic push\n"
           "#pragma GCC diagnostic ignored \"-Wredundant-decls\"\n"
           "#pragma GCC diagnostic ignored \"-Wstrict-prototypes\"\n"
           "#pragma GCC diagnostic ignored \"-Wold-style-definition\"\n"
@@ -438,16 +440,16 @@ static void emit_system_header_diag_push(void)
           "#pragma GCC diagnostic ignored \"-Wunused-variable\"\n"
           "#pragma GCC diagnostic ignored \"-Wcast-qual\"\n"
           "#pragma GCC diagnostic ignored \"-Wsign-conversion\"\n"
-          "#pragma GCC diagnostic ignored \"-Wconversion\"\n"
-          "#endif\n");
+          "#pragma GCC diagnostic ignored \"-Wconversion\"\n");
 }
 
 static void emit_system_header_diag_pop(void)
 {
-  OUT_LIT("#if defined(__GNUC__) || defined(__clang__)\n"
-          "#pragma GCC diagnostic pop\n"
-          "#endif\n");
+  OUT_LIT("#pragma GCC diagnostic pop\n");
 }
+
+// Note: #if guards removed — unknown pragmas are ignored per C11 §6.10.6,
+// and removing them enables -fpreprocessed (skip preprocessing on compile).
 
 // Emit collected #include directives with necessary feature test macros
 static void emit_system_includes(void)
@@ -2713,29 +2715,31 @@ static inline void argv_builder_add(ArgvBuilder *ab, const char *arg)
 }
 #define argv_builder_finish(ab) ((ab)->data)
 
-// Run a command and wait for it to complete
-// Returns exit status, or -1 on error
-static int run_command(char **argv)
+// Build a copy of 'environ' with CC and PRISM_CC removed.
+// Caller must free() the returned array (but not individual strings — they alias environ).
+extern char **environ;
+static char **build_clean_environ(void)
 {
-#ifdef _WIN32
-  intptr_t status = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
-  return (int)status;
-#else
-  pid_t pid = fork();
-  if (pid == -1)
+  int n = 0;
+  for (char **e = environ; *e; e++)
+    n++;
+  char **env = malloc((n + 1) * sizeof(char *));
+  if (!env)
+    return NULL;
+  int j = 0;
+  for (int i = 0; i < n; i++)
   {
-    perror("fork");
-    return -1;
+    if (strncmp(environ[i], "CC=", 3) == 0 ||
+        strncmp(environ[i], "PRISM_CC=", 9) == 0)
+      continue;
+    env[j++] = environ[i];
   }
-  if (pid == 0)
-  {
-    // Unset CC/PRISM_CC to prevent infinite recursion when prism is used as CC
-    unsetenv("CC");
-    unsetenv("PRISM_CC");
-    execvp(argv[0], argv);
-    perror("execvp");
-    _exit(127);
-  }
+  env[j] = NULL;
+  return env;
+}
+
+static int wait_for_child(pid_t pid)
+{
   int status;
   if (waitpid(pid, &status, 0) == -1)
   {
@@ -2747,6 +2751,28 @@ static int run_command(char **argv)
   if (WIFSIGNALED(status))
     return 128 + WTERMSIG(status);
   return -1;
+}
+
+// Run a command and wait for it to complete
+// Returns exit status, or -1 on error
+static int run_command(char **argv)
+{
+#ifdef _WIN32
+  intptr_t status = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
+  return (int)status;
+#else
+  char **env = build_clean_environ();
+  if (!env)
+    return -1;
+  pid_t pid;
+  int err = posix_spawnp(&pid, argv[0], NULL, NULL, argv, env);
+  free(env);
+  if (err)
+  {
+    fprintf(stderr, "posix_spawnp: %s: %s\n", argv[0], strerror(err));
+    return -1;
+  }
+  return wait_for_child(pid);
 #endif
 }
 
@@ -2812,84 +2838,130 @@ static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suf
   return 0;
 }
 
-// Run system preprocessor (cc -E -P) on input file
-// Returns path to temp file with preprocessed output, or NULL on failure
-// Caller must free() the path and unlink() the file
-static char *preprocess_with_cc(const char *input_file)
+// Build preprocessor argv into an ArgvBuilder.
+// Shared between pipe-based and file-based preprocessor paths.
+static void build_pp_argv(ArgvBuilder *ab, const char *input_file)
 {
-  char tmppath[PATH_MAX];
-  if (make_temp_file(tmppath, sizeof(tmppath), "prism_pp_XXXXXX", 0, NULL) < 0)
-  {
-    perror("mkstemp");
-    return NULL;
-  }
-
-  // Build argv for preprocessor: cc -E -P [flags] input -o output
-  ArgvBuilder ab;
-  argv_builder_init(&ab);
-
   const char *cc = ctx->extra_compiler ? ctx->extra_compiler : "cc";
-  argv_builder_add(&ab, cc);
-  argv_builder_add(&ab, "-E");
-  argv_builder_add(&ab, "-w"); // suppress warnings (linker flags passed through are harmless)
+  argv_builder_add(ab, cc);
+  argv_builder_add(ab, "-E");
+  argv_builder_add(ab, "-w"); // suppress warnings (linker flags passed through are harmless)
 
   // Add compiler flags
   for (int i = 0; i < ctx->extra_compiler_flags_count; i++)
-    argv_builder_add(&ab, ctx->extra_compiler_flags[i]);
+    argv_builder_add(ab, ctx->extra_compiler_flags[i]);
 
   // Add include paths
   for (int i = 0; i < ctx->extra_include_count; i++)
   {
-    argv_builder_add(&ab, "-I");
-    argv_builder_add(&ab, ctx->extra_include_paths[i]);
+    argv_builder_add(ab, "-I");
+    argv_builder_add(ab, ctx->extra_include_paths[i]);
   }
 
   // Add defines
   for (int i = 0; i < ctx->extra_define_count; i++)
   {
-    argv_builder_add(&ab, "-D");
-    argv_builder_add(&ab, ctx->extra_defines[i]);
+    argv_builder_add(ab, "-D");
+    argv_builder_add(ab, ctx->extra_defines[i]);
   }
 
   // Add prism-specific macros
-  argv_builder_add(&ab, "-D__PRISM__=1");
+  argv_builder_add(ab, "-D__PRISM__=1");
   if (FEAT(F_DEFER))
-    argv_builder_add(&ab, "-D__PRISM_DEFER__=1");
+    argv_builder_add(ab, "-D__PRISM_DEFER__=1");
   if (FEAT(F_ZEROINIT))
-    argv_builder_add(&ab, "-D__PRISM_ZEROINIT__=1");
+    argv_builder_add(ab, "-D__PRISM_ZEROINIT__=1");
 
   // Add standard feature test macros for POSIX/GNU compatibility
-  argv_builder_add(&ab, "-D_POSIX_C_SOURCE=200809L");
-  argv_builder_add(&ab, "-D_GNU_SOURCE");
+  argv_builder_add(ab, "-D_POSIX_C_SOURCE=200809L");
+  argv_builder_add(ab, "-D_GNU_SOURCE");
 
   // Add force-includes
   for (int i = 0; i < ctx->extra_force_include_count; i++)
   {
-    argv_builder_add(&ab, "-include");
-    argv_builder_add(&ab, ctx->extra_force_includes[i]);
+    argv_builder_add(ab, "-include");
+    argv_builder_add(ab, ctx->extra_force_includes[i]);
   }
 
-  // Input file and output
-  argv_builder_add(&ab, input_file);
-  argv_builder_add(&ab, "-o");
-  argv_builder_add(&ab, tmppath);
+  argv_builder_add(ab, input_file);
+}
 
+// Run system preprocessor (cc -E) via pipe — no temp files.
+// Returns a malloc'd NUL-terminated buffer with preprocessed output, or NULL on failure.
+// Caller must free() the buffer.
+static char *preprocess_with_cc(const char *input_file)
+{
+  ArgvBuilder ab;
+  argv_builder_init(&ab);
+  build_pp_argv(&ab, input_file);
   char **argv = argv_builder_finish(&ab);
 
-  // Run preprocessor using execvp directly to avoid shell quote stripping
-  int ret = run_command(argv);
-  free_argv(argv);
-
-  if (ret != 0)
+  // Set up pipe: child writes preprocessed output to stdout, we read from pipe
+  int pipefd[2];
+  if (pipe(pipefd) == -1)
   {
-    // Preprocessor failed - print error output
-    // (Errors go to stderr directly from child process)
-    unlink(tmppath);
+    perror("pipe");
+    free_argv(argv);
     return NULL;
   }
 
-  char *result = strdup(tmppath);
-  return result;
+  // Set up file actions: child stdout → pipe write end
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_addclose(&fa, pipefd[0]);
+  posix_spawn_file_actions_adddup2(&fa, pipefd[1], STDOUT_FILENO);
+  posix_spawn_file_actions_addclose(&fa, pipefd[1]);
+
+  char **env = build_clean_environ();
+  pid_t pid;
+  int err = posix_spawnp(&pid, argv[0], &fa, NULL, argv, env);
+  posix_spawn_file_actions_destroy(&fa);
+  free(env);
+  close(pipefd[1]);
+  free_argv(argv);
+
+  if (err)
+  {
+    fprintf(stderr, "posix_spawnp: %s\n", strerror(err));
+    close(pipefd[0]);
+    return NULL;
+  }
+
+  // Parent: read all preprocessed output from pipe
+
+  size_t cap = 128 * 1024, len = 0;
+  char *buf = malloc(cap);
+  if (!buf)
+  {
+    close(pipefd[0]);
+    waitpid(pid, NULL, 0);
+    return NULL;
+  }
+
+  ssize_t n;
+  while ((n = read(pipefd[0], buf + len, cap - len - 1)) > 0)
+  {
+    len += (size_t)n;
+    if (len + 1 >= cap)
+    {
+      cap *= 2;
+      char *tmp = realloc(buf, cap);
+      if (!tmp) { free(buf); close(pipefd[0]); waitpid(pid, NULL, 0); return NULL; }
+      buf = tmp;
+    }
+  }
+  close(pipefd[0]);
+  buf[len] = '\0';
+
+  int status;
+  waitpid(pid, &status, 0);
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+  {
+    free(buf);
+    return NULL;
+  }
+
+  return buf;
 }
 
 static void reset_transpiler_state(void)
@@ -2906,45 +2978,48 @@ static void reset_transpiler_state(void)
   last_emitted = NULL;
 }
 
+// Forward declaration
+static int transpile_tokens(Token *tok, FILE *fp);
+
+// Preprocess + tokenize + transpile to a file path.
+// This is the original interface used by the CLI and library API.
 static int transpile(char *input_file, char *output_file)
 {
-  // Run system preprocessor
-  char *pp_file = preprocess_with_cc(input_file);
-  if (!pp_file)
+  // Run system preprocessor via pipe — no temp files
+  char *pp_buf = preprocess_with_cc(input_file);
+  if (!pp_buf)
   {
     fprintf(stderr, "Preprocessing failed for: %s\n", input_file);
     return 0;
   }
 
-#ifdef PRISM_LIB_MODE
-  // Track preprocessor temp file for cleanup on error
-  strncpy(ctx->active_temp_pp, pp_file, PATH_MAX - 1);
-  ctx->active_temp_pp[PATH_MAX - 1] = '\0';
-#endif
-
-  // Tokenize the preprocessed output
-  Token *tok = tokenize_file(pp_file);
-  unlink(pp_file);
-  free(pp_file);
-
-#ifdef PRISM_LIB_MODE
-  ctx->active_temp_pp[0] = '\0'; // Clear tracking after cleanup
-#endif
+  // Tokenize directly from the in-memory buffer (takes ownership of pp_buf)
+  Token *tok = tokenize_buffer(input_file, pp_buf);
+  // pp_buf is now owned by the tokenizer (freed in tokenizer_teardown)
 
   if (!tok)
   {
     fprintf(stderr, "Failed to tokenize preprocessed output\n");
-    tokenizer_teardown(false); // Clean up tokenizer state on error
+    tokenizer_teardown(false);
     return 0;
   }
 
-  FILE *out_fp = fopen(output_file, "w");
-  if (!out_fp)
+  FILE *fp = fopen(output_file, "w");
+  if (!fp)
   {
-    tokenizer_teardown(false); // Clean up tokenizer state on error
+    tokenizer_teardown(false);
     return 0;
   }
-  out_init(out_fp);
+
+  return transpile_tokens(tok, fp);
+}
+
+// Core transpile: emit transformed tokens to an already-opened FILE*.
+// Handles the main transpilation loop, system headers, and cleanup.
+// The caller has already preprocessed and tokenized the input.
+static int transpile_tokens(Token *tok, FILE *fp)
+{
+  out_init(fp);
 
   // Suppress warnings for inlined system header content.
   if (FEAT(F_FLATTEN))
@@ -3242,11 +3317,6 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
       remove(ctx->active_temp_output);
       ctx->active_temp_output[0] = '\0';
     }
-    if (ctx->active_temp_pp[0])
-    {
-      unlink(ctx->active_temp_pp);
-      ctx->active_temp_pp[0] = '\0';
-    }
     // Reset global state to allow future transpilations
     prism_reset();
     return result;
@@ -3375,6 +3445,83 @@ PRISM_API void prism_reset(void)
 // CLI IMPLEMENTATION (excluded with -DPRISM_LIB_MODE)
 
 #ifndef PRISM_LIB_MODE
+
+// Transpile a single source file and pipe the output directly to the compiler.
+// No temp files for transpiled output. The compiler reads from stdin.
+// compile_argv must contain the full argv for the compiler (without input file — uses stdin via "-").
+// Returns the compiler's exit status, or -1 on error.
+static int transpile_and_compile(char *input_file, char **compile_argv, bool verbose)
+{
+  // Preprocess via pipe
+  char *pp_buf = preprocess_with_cc(input_file);
+  if (!pp_buf)
+  {
+    fprintf(stderr, "Preprocessing failed for: %s\n", input_file);
+    return -1;
+  }
+
+  Token *tok = tokenize_buffer(input_file, pp_buf);
+  if (!tok)
+  {
+    fprintf(stderr, "Failed to tokenize preprocessed output\n");
+    tokenizer_teardown(false);
+    return -1;
+  }
+
+  // Set up pipe: prism writes transpiled output → compiler reads from stdin
+  int pipefd[2];
+  if (pipe(pipefd) == -1)
+  {
+    perror("pipe");
+    tokenizer_teardown(false);
+    return -1;
+  }
+
+  if (verbose)
+  {
+    fprintf(stderr, "[prism] ");
+    for (int i = 0; compile_argv[i]; i++)
+      fprintf(stderr, "%s ", compile_argv[i]);
+    fprintf(stderr, "\n");
+  }
+
+  // Set up file actions: child stdin ← pipe read end
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_addclose(&fa, pipefd[1]);
+  posix_spawn_file_actions_adddup2(&fa, pipefd[0], STDIN_FILENO);
+  posix_spawn_file_actions_addclose(&fa, pipefd[0]);
+
+  char **env = build_clean_environ();
+  pid_t pid;
+  int err = posix_spawnp(&pid, compile_argv[0], &fa, NULL, compile_argv, env);
+  posix_spawn_file_actions_destroy(&fa);
+  free(env);
+  close(pipefd[0]);
+
+  if (err)
+  {
+    fprintf(stderr, "posix_spawnp: %s: %s\n", compile_argv[0], strerror(err));
+    close(pipefd[1]);
+    tokenizer_teardown(false);
+    return -1;
+  }
+
+  // Parent: write transpiled output to pipe
+  FILE *fp = fdopen(pipefd[1], "w");
+  if (!fp)
+  {
+    close(pipefd[1]);
+    tokenizer_teardown(false);
+    waitpid(pid, NULL, 0);
+    return -1;
+  }
+
+  transpile_tokens(tok, fp);
+  // out_close() inside transpile_tokens closes fp → closes pipe → EOF to compiler
+
+  return wait_for_child(pid);
+}
 
 static char **build_argv(const char *first, ...)
 {
@@ -3974,7 +4121,107 @@ int main(int argc, char **argv)
     return st;
   }
 
-  // ─── Transpile sources to temp files ───
+  // ─── Single source: pipe-based transpile+compile (no temp files) ───
+  if (cli.source_count == 1)
+  {
+    const char *compiler = get_real_cc(cli.cc);
+    ArgvBuilder ab;
+    argv_builder_init(&ab);
+    argv_builder_add(&ab, compiler);
+
+    // Tell cc the input is already preprocessed (flatten mode).
+    // -fpreprocessed skips macro expansion and #include processing on the second pass.
+    // In non-flatten mode, the output may contain #include/#define, so we skip this.
+    argv_builder_add(&ab, "-x");
+    argv_builder_add(&ab, "c");
+    if (FEAT(F_FLATTEN))
+      argv_builder_add(&ab, "-fpreprocessed");
+
+    // Read from stdin (the pipe)
+    argv_builder_add(&ab, "-");
+
+    // Reset language so subsequent args (.o, .s, etc.) aren't forced to C
+    argv_builder_add(&ab, "-x");
+    argv_builder_add(&ab, "none");
+
+    for (int i = 0; i < cli.cc_arg_count; i++)
+      argv_builder_add(&ab, cli.cc_args[i]);
+
+    // Suppress warnings from preprocessed/inlined system headers
+    static const char *wflags[] = {
+        "-Wno-type-limits",
+        "-Wno-cast-align",
+        "-Wno-logical-op",
+        "-Wno-implicit-fallthrough",
+        "-Wno-unused-function",
+        "-Wno-unused-variable",
+        "-Wno-unused-parameter",
+        "-Wno-maybe-uninitialized",
+    };
+    for (int i = 0; i < (int)(sizeof(wflags) / sizeof(*wflags)); i++)
+      argv_builder_add(&ab, wflags[i]);
+
+    // For RUN mode, compile to temp executable
+    char temp_exe[PATH_MAX] = {0};
+    if (cli.mode == CLI_RUN)
+    {
+      snprintf(temp_exe, sizeof(temp_exe), "%sprism_run.XXXXXX", get_tmp_dir());
+      int fd = mkstemp(temp_exe);
+      if (fd >= 0)
+        close(fd);
+      argv_builder_add(&ab, "-o");
+      argv_builder_add(&ab, temp_exe);
+    }
+    else if (cli.output)
+    {
+      argv_builder_add(&ab, "-o");
+      argv_builder_add(&ab, cli.output);
+    }
+    else if (cli.compile_only)
+    {
+      // GCC-compatible: -c foo.c produces foo.o
+      static char defobj[PATH_MAX];
+      const char *base = strrchr(cli.sources[0], '/');
+      base = base ? base + 1 : cli.sources[0];
+      snprintf(defobj, sizeof(defobj), "%s", base);
+      char *dot = strrchr(defobj, '.');
+      if (dot)
+        strcpy(dot, ".o");
+      argv_builder_add(&ab, "-o");
+      argv_builder_add(&ab, defobj);
+    }
+
+    char **compile_argv = argv_builder_finish(&ab);
+
+    if (cli.verbose)
+      fprintf(stderr, "[prism] Transpiling %s (pipe → cc)\n", cli.sources[0]);
+    int status = transpile_and_compile((char *)cli.sources[0], compile_argv, cli.verbose);
+    free_argv(compile_argv);
+
+    if (status != 0)
+    {
+      if (cli.mode == CLI_RUN && temp_exe[0])
+        remove(temp_exe);
+      cli_free(&cli);
+      return status;
+    }
+
+    // RUN mode: execute the compiled binary
+    if (cli.mode == CLI_RUN)
+    {
+      char **run = build_argv(temp_exe, NULL);
+      if (cli.verbose)
+        fprintf(stderr, "[prism] Running %s\n", temp_exe);
+      status = run_command(run);
+      free_argv(run);
+      remove(temp_exe);
+    }
+
+    cli_free(&cli);
+    return status;
+  }
+
+  // ─── Multi-source: transpile to temp files, then compile together ───
   char **temp_files = calloc((unsigned)cli.source_count, sizeof(char *));
   if (!temp_files)
     die("Out of memory");
@@ -4021,8 +4268,17 @@ int main(int argc, char **argv)
   argv_builder_init(&ab);
   argv_builder_add(&ab, compiler);
 
+  // Tell cc input files are already preprocessed (flatten mode)
+  if (FEAT(F_FLATTEN))
+    argv_builder_add(&ab, "-fpreprocessed");
+
   for (int i = 0; i < cli.source_count; i++)
     argv_builder_add(&ab, temp_files[i]);
+
+  // Reset -fpreprocessed so cc_args (like assembly or other files) aren't affected
+  if (FEAT(F_FLATTEN))
+    argv_builder_add(&ab, "-fno-preprocessed");
+
   for (int i = 0; i < cli.cc_arg_count; i++)
     argv_builder_add(&ab, cli.cc_args[i]);
 
