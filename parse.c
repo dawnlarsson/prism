@@ -77,7 +77,6 @@ typedef enum
     TK_KEYWORD,
     TK_STR,
     TK_NUM,
-    TK_PP_NUM,
     TK_PREP_DIR, // Preprocessor directive (e.g., #pragma) to preserve
     TK_EOF,
 } TokenKind;
@@ -126,11 +125,6 @@ struct Token
 {
     char *loc;
     Token *next;
-    union
-    {
-        int64_t i64;
-        char *str;
-    } val;
     int len;
     TokenKind kind;
     uint16_t file_idx;
@@ -253,7 +247,14 @@ typedef struct
 } HashMap;
 
 // Feature flags (compact bitmask for PrismContext.features)
-enum { F_DEFER = 1, F_ZEROINIT = 2, F_LINE_DIR = 4, F_WARN_SAFETY = 8, F_FLATTEN = 16 };
+enum
+{
+    F_DEFER = 1,
+    F_ZEROINIT = 2,
+    F_LINE_DIR = 4,
+    F_WARN_SAFETY = 8,
+    F_FLATTEN = 16
+};
 
 typedef struct PrismContext
 {
@@ -326,12 +327,6 @@ static void prism_ctx_init(void)
 static Token *arena_alloc_token(void)
 {
     return arena_alloc(&ctx->main_arena, sizeof(Token));
-}
-
-// String arena - uses main_arena
-static char *string_arena_alloc(size_t size)
-{
-    return arena_alloc(&ctx->main_arena, size);
 }
 
 static uint64_t fnv_hash(char *s, int len)
@@ -859,139 +854,20 @@ static void init_keyword_map(void)
                     (void *)(uintptr_t)(id_tags[i].tag));
 }
 
-static bool is_keyword(Token *tok)
-{
-    void *val = hashmap_get(&ctx->keyword_map, tok->loc, tok->len);
-    return val && ((uintptr_t)val & KW_MARKER);
-}
-
-// Get the tag bits for a keyword (0 if not a keyword)
-static uint32_t keyword_tag(Token *tok)
-{
-    void *val = hashmap_get(&ctx->keyword_map, tok->loc, tok->len);
-    return val ? (uint32_t)((uintptr_t)val & ~KW_MARKER) : 0;
-}
-
-// Forward declaration for hex digit conversion
-static int from_hex(char c);
-
-// Get the number of bytes in a UTF-8 sequence from the leading byte
-static int utf8_char_len(unsigned char c)
-{
-    if ((c & 0x80) == 0)
-        return 1; // 0xxxxxxx - ASCII
-    if ((c & 0xE0) == 0xC0)
-        return 2; // 110xxxxx
-    if ((c & 0xF0) == 0xE0)
-        return 3; // 1110xxxx
-    if ((c & 0xF8) == 0xF0)
-        return 4; // 11110xxx
-    return 0;     // Invalid
-}
-
-// any non-ASCII byte or UCN that survived preprocessing is a valid identifier.
-static inline bool is_ident_start_ascii(char c) { return isalpha(c) || c == '_' || c == '$'; }
-static inline bool is_ident_cont_ascii(char c) { return isalnum(c) || c == '_' || c == '$'; }
-
-// Read a UCN (Universal Character Name) \uXXXX or \UXXXXXXXX
-// Returns the number of bytes consumed, or 0 if not a valid UCN
-static int read_ucn(char *p, uint32_t *cp)
-{
-    if (p[0] != '\\')
-        return 0;
-    int hex_len = 0;
-    if (p[1] == 'u')
-        hex_len = 4;
-    else if (p[1] == 'U')
-        hex_len = 8;
-    else
-        return 0;
-
-    uint32_t val = 0;
-    for (int i = 0; i < hex_len; i++)
-    {
-        int h = from_hex(p[2 + i]);
-        if (h < 0)
-            return 0;
-        val = (val << 4) | h;
-    }
-    *cp = val;
-    return 2 + hex_len; // \ + u/U + hex digits
-}
-
-// Tokenizer helpers
+// After cc -E, UCNs are resolved. Just handle ASCII + pass through non-ASCII bytes.
 static int read_ident(char *start)
 {
     char *p = start;
-    uint32_t cp;
-    int len;
-
-    // Check for UCN at start (\uXXXX or \UXXXXXXXX)
-    len = read_ucn(p, &cp);
-    if (len > 0)
-    {
-        p += len;
-    }
-    else if ((unsigned char)*p >= 0x80)
-    {
-        // Non-ASCII UTF-8 start byte
-        len = utf8_char_len((unsigned char)*p);
-        if (len == 0)
-            return 0;
-        p += len;
-    }
+    if ((unsigned char)*p >= 0x80)
+        p++;
+    else if (isalpha(*p) || *p == '_' || *p == '$')
+        p++;
     else
-    {
-        if (!is_ident_start_ascii(*p))
-            return 0;
+        return 0;
+    while (isalnum(*p) || *p == '_' || *p == '$' || (unsigned char)*p >= 0x80)
         p++;
-    }
-
-    // Continue reading identifier characters
-    while (*p)
-    {
-        len = read_ucn(p, &cp);
-        if (len > 0)
-        {
-            p += len;
-            continue;
-        }
-
-        if ((unsigned char)*p >= 0x80)
-        {
-            len = utf8_char_len((unsigned char)*p);
-            if (len == 0)
-                break;
-            p += len;
-            continue;
-        }
-
-        if (!is_ident_cont_ascii(*p))
-            break;
-        p++;
-    }
-
     return p - start;
 }
-
-static int from_hex(char c)
-{
-    if ('0' <= c && c <= '9')
-        return c - '0';
-    if ('a' <= c && c <= 'f')
-        return c - 'a' + 10;
-    if ('A' <= c && c <= 'F')
-        return c - 'A' + 10;
-    return -1;
-}
-
-// Digraph translation table
-// Punctuator entry with precomputed length
-typedef struct
-{
-    const char *str;
-    int len;
-} Punct;
 
 static int read_punct(char *p)
 {
@@ -1097,53 +973,6 @@ static char *skip_block_comment(char *p)
     error_at(p, "unclosed block comment");
 }
 
-static int read_escaped_char(char **new_pos, char *p)
-{
-    if ('0' <= *p && *p <= '7')
-    {
-        int c = *p++ - '0';
-        if ('0' <= *p && *p <= '7')
-            c = (c << 3) + (*p++ - '0');
-        if ('0' <= *p && *p <= '7')
-            c = (c << 3) + (*p++ - '0');
-        *new_pos = p;
-        return c;
-    }
-    if (*p == 'x')
-    {
-        p++;
-        if (!isxdigit(*p))
-            error_at(p, "invalid hex escape");
-        int c = 0;
-        while (isxdigit(*p))
-            c = (c << 4) + from_hex(*p++);
-        *new_pos = p;
-        return c;
-    }
-    *new_pos = p + 1;
-    switch (*p)
-    {
-    case 'a':
-        return '\a';
-    case 'b':
-        return '\b';
-    case 't':
-        return '\t';
-    case 'n':
-        return '\n';
-    case 'v':
-        return '\v';
-    case 'f':
-        return '\f';
-    case 'r':
-        return '\r';
-    case 'e':
-        return 27;
-    default:
-        return *p;
-    }
-}
-
 static char *string_literal_end(char *p)
 {
     for (; *p != '"'; p++)
@@ -1205,53 +1034,15 @@ static Token *new_token(TokenKind kind, char *start, char *end)
 static Token *read_string_literal(char *start, char *quote)
 {
     char *end = string_literal_end(quote + 1);
-    size_t buf_size = (end - quote);
-    if (buf_size == 0)
-        buf_size = 1;
-
-    char *buf = string_arena_alloc(buf_size);
-    int len = 0;
-
-    for (char *p = quote + 1; p < end;)
-    {
-        if (*p == '\\')
-            buf[len++] = read_escaped_char(&p, p + 1);
-        else
-            buf[len++] = *p++;
-    }
-
-    Token *tok = new_token(TK_STR, start, end + 1);
-    tok->val.str = buf;
-    return tok;
+    return new_token(TK_STR, start, end + 1);
 }
 
-// Read a C++11/C23 raw string literal token
-// start points to the beginning of the token (R, or prefix like L, u, U, u8)
-// quote points to the opening '"'
 static Token *read_raw_string_literal(char *start, char *quote)
 {
     char *end = raw_string_literal_end(quote);
     if (!end)
         error_at(start, "invalid raw string literal");
-
-    // For raw strings, we store the content between ( and ) without escape processing
-    // Find the delimiter and content boundaries
-    char *delim_start = quote + 1;
-    char *paren = delim_start;
-    while (*paren != '(')
-        paren++;
-    int delim_len = paren - delim_start;
-    char *content_start = paren + 1;
-    char *content_end = end - 2 - delim_len; // Back from )" or )delim"
-
-    size_t content_len = content_end - content_start;
-    char *buf = string_arena_alloc(content_len + 1);
-    memcpy(buf, content_start, content_len);
-    buf[content_len] = '\0';
-
-    Token *tok = new_token(TK_STR, start, end);
-    tok->val.str = buf;
-    return tok;
+    return new_token(TK_STR, start, end);
 }
 
 static Token *read_char_literal(char *start, char *quote)
@@ -1259,31 +1050,14 @@ static Token *read_char_literal(char *start, char *quote)
     char *p = quote + 1;
     if (*p == '\0')
         error_at(start, "unclosed char literal");
-
-    uint64_t val = 0;
-    int count = 0, first_c = 0;
-
-    for (;;)
+    for (; *p != '\''; p++)
     {
         if (*p == '\n' || *p == '\0')
             error_at(p, "unclosed char literal");
-        if (*p == '\'')
-            break;
-
-        int c = (*p == '\\') ? read_escaped_char(&p, p + 1) : (unsigned char)*p++;
-        if (count == 0)
-            first_c = c;
-        if (count < 4)
-            val = (val << 8) | (c & 0xFF);
-        count++;
+        if (*p == '\\')
+            p++;
     }
-
-    if (count == 0)
-        error_at(start, "empty char literal");
-
-    Token *tok = new_token(TK_NUM, start, p + 1);
-    tok->val.i64 = (count == 1) ? first_c : (int32_t)val;
-    return tok;
+    return new_token(TK_NUM, start, p + 1);
 }
 
 // Check for C23 extended float suffix and return info for normalization
@@ -1343,95 +1117,53 @@ static int get_extended_float_suffix(const char *p, int len, const char **replac
 
 // Convert preprocessor number token to TK_NUM.
 // We detect floats (for C23 extended suffix rewriting) but don't parse values.
-static void convert_pp_number(Token *tok)
+// Classify a number token: detect floats for C23 suffix rewriting
+static void classify_number(Token *tok)
 {
-    tok->kind = TK_NUM;
-
     char *p = tok->loc;
     bool is_hex = (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'));
-
-    // Detect floats by scanning for '.', or exponents
-    for (char *q = tok->loc; q < tok->loc + tok->len; q++)
+    for (char *q = p; q < p + tok->len; q++)
     {
-        // '.' always indicates float
-        if (*q == '.')
+        if (*q == '.' || *q == 'p' || *q == 'P')
         {
             tok->flags |= TF_IS_FLOAT;
             return;
         }
-        // 'p'/'P' exponent (hex floats)
-        if (*q == 'p' || *q == 'P')
-        {
-            tok->flags |= TF_IS_FLOAT;
-            return;
-        }
-        // 'e'/'E' exponent (decimal only - in hex these are valid digits)
         if (!is_hex && (*q == 'e' || *q == 'E'))
         {
             tok->flags |= TF_IS_FLOAT;
             return;
         }
     }
-
-    // Check for C23 extended float suffixes (F16, F32, F64, F128, BF16)
-    // Only for decimal numbers - hex numbers can have these as valid hex digits
-    if (!is_hex && get_extended_float_suffix(tok->loc, tok->len, NULL))
+    if (!is_hex && get_extended_float_suffix(p, tok->len, NULL))
         tok->flags |= TF_IS_FLOAT;
 }
 
-static void convert_pp_tokens(Token *tok)
+// Tag a punctuator token with TT_ASSIGN or TT_MEMBER
+static inline void classify_punct(Token *t)
 {
-    for (Token *t = tok; t && t->kind != TK_EOF; t = t->next)
+    char c = t->loc[0];
+    if (t->len == 1)
     {
-        if (is_keyword(t))
-        {
-            t->kind = TK_KEYWORD;
-            t->tag = keyword_tag(t);
-        }
-        else if (t->kind == TK_PP_NUM)
-            convert_pp_number(t);
-        else if (t->kind == TK_IDENT)
-        {
-            // O(1) tag lookup for well-known identifiers (exit, setjmp, vfork, etc.)
-            void *val = hashmap_get(&ctx->keyword_map, t->loc, t->len);
-            if (val && !((uintptr_t)val & KW_MARKER))
-                t->tag = (uint32_t)(uintptr_t)val;
-        }
-        else if (t->kind == TK_PUNCT)
-        {
-            // Tag punctuators: assignment ops and member access
-            char c = t->loc[0];
-            if (t->len == 1)
-            {
-                if (c == '=' || c == '[')
-                    t->tag = TT_ASSIGN;
-                else if (c == '.')
-                    t->tag = TT_MEMBER;
-            }
-            else if (t->len == 2)
-            {
-                char c2 = t->loc[1];
-                if (c2 == '=')
-                {
-                    // +=, -=, *=, /=, %=, &=, |=, ^= are assignment; !=, <=, >= are not
-                    if (c != '!' && c != '<' && c != '>' && c != '=')
-                        t->tag = TT_ASSIGN;
-                }
-                else if (c == '+' && c2 == '+')
-                    t->tag = TT_ASSIGN;
-                else if (c == '-' && c2 == '-')
-                    t->tag = TT_ASSIGN;
-                else if (c == '-' && c2 == '>')
-                    t->tag = TT_MEMBER;
-            }
-            else if (t->len == 3 && t->loc[2] == '=')
-            {
-                // <<= and >>=
-                if ((c == '<' || c == '>') && t->loc[1] == c)
-                    t->tag = TT_ASSIGN;
-            }
-        }
+        if (c == '=' || c == '[')
+            t->tag = TT_ASSIGN;
+        else if (c == '.')
+            t->tag = TT_MEMBER;
     }
+    else if (t->len == 2)
+    {
+        char c2 = t->loc[1];
+        if (c2 == '=' && c != '!' && c != '<' && c != '>' && c != '=')
+            t->tag = TT_ASSIGN;
+        else if (c == '+' && c2 == '+')
+            t->tag = TT_ASSIGN;
+        else if (c == '-' && c2 == '-')
+            t->tag = TT_ASSIGN;
+        else if (c == '-' && c2 == '>')
+            t->tag = TT_MEMBER;
+    }
+    else if (t->len == 3 && t->loc[2] == '=' && (c == '<' || c == '>') && t->loc[1] == c)
+        t->tag = TT_ASSIGN;
 }
 
 static File *new_file(char *name, int file_no, char *contents)
@@ -1708,12 +1440,13 @@ static Token *tokenize(File *file)
             ctx->has_space = true;
             continue;
         }
-        // Preprocessor number
+        // Number
         if (isdigit(*p) || (*p == '.' && isdigit(p[1])))
         {
             char *start = p;
             p = scan_pp_number(p);
-            cur = cur->next = new_token(TK_PP_NUM, start, p);
+            Token *t = cur = cur->next = new_token(TK_NUM, start, p);
+            classify_number(t);
             continue;
         }
         // C++11/C23 raw string literals: R"...", LR"...", uR"...", UR"...", u8R"..."
@@ -1765,11 +1498,23 @@ static Token *tokenize(File *file)
             p += cur->len;
             continue;
         }
-        // Identifier
+        // Identifier / keyword
         int ident_len = read_ident(p);
         if (ident_len)
         {
-            cur = cur->next = new_token(TK_IDENT, p, p + ident_len);
+            Token *t = cur = cur->next = new_token(TK_IDENT, p, p + ident_len);
+            void *kw = hashmap_get(&ctx->keyword_map, p, ident_len);
+            if (kw)
+            {
+                uintptr_t v = (uintptr_t)kw;
+                if (v & KW_MARKER)
+                {
+                    t->kind = TK_KEYWORD;
+                    t->tag = (uint32_t)(v & ~KW_MARKER);
+                }
+                else
+                    t->tag = (uint32_t)v;
+            }
             p += ident_len;
             continue;
         }
@@ -1777,7 +1522,8 @@ static Token *tokenize(File *file)
         int punct_len = read_punct(p);
         if (punct_len)
         {
-            cur = cur->next = new_token(TK_PUNCT, p, p + punct_len);
+            Token *t = cur = cur->next = new_token(TK_PUNCT, p, p + punct_len);
+            classify_punct(t);
             p += punct_len;
             continue;
         }
@@ -1785,7 +1531,6 @@ static Token *tokenize(File *file)
     }
 
     cur = cur->next = new_token(TK_EOF, p, p);
-    convert_pp_tokens(head.next);
     return head.next;
 }
 
