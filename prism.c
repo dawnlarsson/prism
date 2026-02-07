@@ -314,108 +314,27 @@ static LabelTable label_table;
 static int *stmt_expr_levels = NULL; // ctx->defer_depth when stmt expr started (dynamic)
 static int stmt_expr_capacity = 0;   // capacity of stmt_expr_levels array
 
-// Token emission - Buffered Output Writer
-// Uses a memory buffer to batch small writes, significantly faster than per-token fprintf
-#define OUT_BUF_SIZE (64 * 1024) // 64KB buffer
-
-typedef struct
-{
-  FILE *fp;
-  char *buf;
-  size_t pos;
-  size_t cap;
-} OutputBuffer;
-
-static OutputBuffer out_buf = {0};
+// Token emission - delegates to stdio with setvbuf for buffering
+static FILE *out_fp;
 static Token *last_emitted = NULL;
 
-static void out_init(FILE *fp)
-{
-  out_buf.fp = fp;
-  if (!out_buf.buf)
-  {
-    out_buf.buf = malloc(OUT_BUF_SIZE);
-    if (!out_buf.buf)
-    {
-      fprintf(stderr, "out of memory allocating output buffer\n");
-      exit(1);
-    }
-    out_buf.cap = OUT_BUF_SIZE;
-  }
-  out_buf.pos = 0;
-}
+static void out_init(FILE *fp) { out_fp = fp; setvbuf(fp, NULL, _IOFBF, 65536); }
+static void out_close(void) { if (out_fp) { fclose(out_fp); out_fp = NULL; } }
 
-static void out_flush(void)
-{
-  if (out_buf.pos > 0 && out_buf.fp)
-  {
-    fwrite(out_buf.buf, 1, out_buf.pos, out_buf.fp);
-    out_buf.pos = 0;
-  }
-}
-
-static void out_close(void)
-{
-  out_flush();
-  if (out_buf.fp)
-  {
-    fclose(out_buf.fp);
-    out_buf.fp = NULL;
-  }
-}
-
-static void out_char(char c)
-{
-  if (out_buf.pos >= out_buf.cap)
-    out_flush();
-
-  out_buf.buf[out_buf.pos++] = c;
-}
-
-#define OUT_LIT(s) out_str(s, sizeof(s) - 1)
-
-static void out_str(const char *s, size_t len)
-{
-  // If it fits in buffer, copy directly
-  if (out_buf.pos + len <= out_buf.cap)
-  {
-    memcpy(out_buf.buf + out_buf.pos, s, len);
-    out_buf.pos += len;
-    return;
-  }
-
-  // Flush and handle large writes
-  out_flush();
-  if (len >= out_buf.cap)
-  {
-    // Write directly for very large strings
-    fwrite(s, 1, len, out_buf.fp);
-    return;
-  }
-
-  memcpy(out_buf.buf, s, len);
-  out_buf.pos = len;
-}
+#define out_char(c) fputc(c, out_fp)
+#define out_str(s, len) fwrite(s, 1, len, out_fp)
+#define OUT_LIT(s) fwrite(s, 1, sizeof(s) - 1, out_fp)
 
 static void out_uint(unsigned long long v)
 {
   char buf[24], *p = buf + sizeof(buf);
-
-  do
-  {
-    *--p = '0' + v % 10;
-  } while (v /= 10);
-
-  out_str(p, buf + sizeof(buf) - p);
+  do { *--p = '0' + v % 10; } while (v /= 10);
+  fwrite(p, 1, buf + sizeof(buf) - p, out_fp);
 }
 
 static void out_line(int line_no, const char *file)
 {
-  OUT_LIT("#line ");
-  out_uint(line_no);
-  OUT_LIT(" \"");
-  out_str(file, strlen(file));
-  OUT_LIT("\"\n");
+  fprintf(out_fp, "#line %d \"%s\"\n", line_no, file);
 }
 
 // System header tracking (for non-flattened output)
@@ -3559,16 +3478,8 @@ PRISM_API void prism_reset(void)
   ctx->stmt_expr_count = 0;
   stmt_expr_capacity = 0;
 
-  // Reset output state - close file if open (prevents FD leak on error recovery)
-  if (out_buf.fp)
-  {
-    fclose(out_buf.fp);
-    out_buf.fp = NULL;
-  }
-  free(out_buf.buf);
-  out_buf.buf = NULL;
-  out_buf.pos = 0;
-  out_buf.cap = 0;
+  // Reset output state
+  if (out_fp) { fclose(out_fp); out_fp = NULL; }
   last_emitted = NULL;
   ctx->last_line_no = 0;
   ctx->last_filename = NULL;
