@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.104.0"
+#define PRISM_VERSION "0.105.0"
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -89,10 +89,9 @@ PRISM_API PrismFeatures prism_defaults(void)
 
 // Feature flag check macro
 #define FEAT(f) (ctx->features & (f))
-static uint32_t features_to_bits(PrismFeatures f) {
-  return (f.defer ? F_DEFER : 0) | (f.zeroinit ? F_ZEROINIT : 0)
-       | (f.line_directives ? F_LINE_DIR : 0) | (f.warn_safety ? F_WARN_SAFETY : 0)
-       | (f.flatten_headers ? F_FLATTEN : 0);
+static uint32_t features_to_bits(PrismFeatures f)
+{
+  return (f.defer ? F_DEFER : 0) | (f.zeroinit ? F_ZEROINIT : 0) | (f.line_directives ? F_LINE_DIR : 0) | (f.warn_safety ? F_WARN_SAFETY : 0) | (f.flatten_headers ? F_FLATTEN : 0);
 }
 
 // Forward declarations for library API
@@ -151,15 +150,15 @@ static Token *skip_balanced(Token *tok, char *open, char *close);
 // Forward declaration: Type specifier parsing result
 typedef struct
 {
-  Token *end;                  // First token after the type specifier
-  bool saw_type;               // True if a type was recognized
-  bool is_struct;              // True if struct/union/enum type
-  bool is_typedef;             // True if user-defined typedef
-  bool is_vla;                 // True if VLA typedef or struct with VLA member
-  bool has_typeof;             // True if typeof/typeof_unqual (cannot determine VLA at transpile-time)
-  bool has_atomic;             // True if _Atomic qualifier/specifier present
-  bool has_register;           // True if register storage class
-  bool has_volatile;           // True if volatile qualifier
+  Token *end;        // First token after the type specifier
+  bool saw_type;     // True if a type was recognized
+  bool is_struct;    // True if struct/union/enum type
+  bool is_typedef;   // True if user-defined typedef
+  bool is_vla;       // True if VLA typedef or struct with VLA member
+  bool has_typeof;   // True if typeof/typeof_unqual (cannot determine VLA at transpile-time)
+  bool has_atomic;   // True if _Atomic qualifier/specifier present
+  bool has_register; // True if register storage class
+  bool has_volatile; // True if volatile qualifier
 
 } TypeSpecResult;
 static TypeSpecResult parse_type_specifier(Token *tok);
@@ -207,8 +206,16 @@ static Token *skip_all_attributes(Token *tok)
 {
   while (tok && tok->kind != TK_EOF)
   {
-    if (tok->tag & TT_ATTR) { tok = skip_gnu_attributes(tok); continue; }
-    if (is_c23_attr(tok)) { tok = skip_c23_attr(tok); continue; }
+    if (tok->tag & TT_ATTR)
+    {
+      tok = skip_gnu_attributes(tok);
+      continue;
+    }
+    if (is_c23_attr(tok))
+    {
+      tok = skip_c23_attr(tok);
+      continue;
+    }
     break;
   }
   return tok;
@@ -272,12 +279,18 @@ static DeferScope *defer_stack = NULL;
 static int defer_stack_capacity = 0;
 
 // Control flow state — tracks control keyword to body transition
-enum { NS_LOOP = 1, NS_SWITCH = 2, NS_CONDITIONAL = 4 };
+enum
+{
+  NS_LOOP = 1,
+  NS_SWITCH = 2,
+  NS_CONDITIONAL = 4
+};
 
-typedef struct {
+typedef struct
+{
   int paren_depth;
   int brace_depth;
-  uint8_t next_scope;     // NS_LOOP | NS_SWITCH | NS_CONDITIONAL
+  uint8_t next_scope; // NS_LOOP | NS_SWITCH | NS_CONDITIONAL
   bool pending;
   bool parens_just_closed;
   bool for_init;
@@ -298,8 +311,19 @@ static int stmt_expr_capacity = 0;   // capacity of stmt_expr_levels array
 static FILE *out_fp;
 static Token *last_emitted = NULL;
 
-static void out_init(FILE *fp) { out_fp = fp; setvbuf(fp, NULL, _IOFBF, 65536); }
-static void out_close(void) { if (out_fp) { fclose(out_fp); out_fp = NULL; } }
+static void out_init(FILE *fp)
+{
+  out_fp = fp;
+  setvbuf(fp, NULL, _IOFBF, 65536);
+}
+static void out_close(void)
+{
+  if (out_fp)
+  {
+    fclose(out_fp);
+    out_fp = NULL;
+  }
+}
 
 #define out_char(c) fputc(c, out_fp)
 #define out_str(s, len) fwrite(s, 1, len, out_fp)
@@ -308,7 +332,10 @@ static void out_close(void) { if (out_fp) { fclose(out_fp); out_fp = NULL; } }
 static void out_uint(unsigned long long v)
 {
   char buf[24], *p = buf + sizeof(buf);
-  do { *--p = '0' + v % 10; } while (v /= 10);
+  do
+  {
+    *--p = '0' + v % 10;
+  } while (v /= 10);
   fwrite(p, 1, buf + sizeof(buf) - p, out_fp);
 }
 
@@ -498,7 +525,8 @@ static void mark_switch_control_exit(void)
 static int find_switch_scope(void)
 {
   for (int d = ctx->defer_depth - 1; d >= 0; d--)
-    if (defer_stack[d].is_switch) return d;
+    if (defer_stack[d].is_switch)
+      return d;
   return -1;
 }
 #define inside_switch_scope() (find_switch_scope() >= 0)
@@ -508,7 +536,8 @@ static int find_switch_scope(void)
 static void clear_switch_scope_defers(void)
 {
   int sd = find_switch_scope();
-  if (sd < 0) return;
+  if (sd < 0)
+    return;
   for (int d = ctx->defer_depth - 1; d >= sd; d--)
   {
     defer_stack[d].count = 0;
@@ -519,17 +548,21 @@ static void clear_switch_scope_defers(void)
 // Check if a space is needed between two tokens
 static bool needs_space(Token *prev, Token *tok)
 {
-  if (!prev || tok_at_bol(tok)) return false;
-  if (tok_has_space(tok)) return true;
+  if (!prev || tok_at_bol(tok))
+    return false;
+  if (tok_has_space(tok))
+    return true;
   if ((is_identifier_like(prev) || prev->kind == TK_NUM) &&
       (is_identifier_like(tok) || tok->kind == TK_NUM))
     return true;
-  if (prev->kind != TK_PUNCT || tok->kind != TK_PUNCT) return false;
+  if (prev->kind != TK_PUNCT || tok->kind != TK_PUNCT)
+    return false;
   // Two adjacent punctuators that would merge into a different token
   uint8_t a = (uint8_t)prev->loc[prev->len - 1], b = (uint8_t)tok->loc[0];
-  // 'b' is always '=' or matches 'a' (++ -- << >> && || == ## /* */), plus -> 
-  if (b == '=') return a == '=' || a == '!' || a == '<' || a == '>' ||
-                       a == '+' || a == '-' || a == '*' || a == '/';
+  // 'b' is always '=' or matches 'a' (++ -- << >> && || == ## /* */), plus ->
+  if (b == '=')
+    return a == '=' || a == '!' || a == '<' || a == '>' ||
+           a == '+' || a == '-' || a == '*' || a == '/';
   return (a == b && (a == '+' || a == '-' || a == '<' || a == '>' ||
                      a == '&' || a == '|' || a == '#')) ||
          (a == '-' && b == '>') || (a == '/' && b == '*') || (a == '*' && b == '/');
@@ -543,8 +576,10 @@ static bool is_inside_attribute(Token *tok)
     return false;
   int depth = 0;
   for (Token *t = tok; t && t->kind != TK_EOF && !equal(t, ";") && !equal(t, "{"); t = t->next)
-    if (equal(t, "(")) depth++;
-    else if (equal(t, ")") && --depth < 0) return true;
+    if (equal(t, "("))
+      depth++;
+    else if (equal(t, ")") && --depth < 0)
+      return true;
   return false;
 }
 
@@ -984,7 +1019,7 @@ static bool walker_next(TokenWalker *w)
     }
 
     // Skip _Generic(...)
-    if (w->tok->kind == TK_KEYWORD && equal(w->tok, "_Generic"))
+    if (w->tok->tag & TT_GENERIC)
     {
       w->prev = w->tok;
       w->tok = w->tok->next;
@@ -1031,7 +1066,7 @@ static Token *walker_check_label(TokenWalker *w)
     return NULL; // :: scope resolution
   if (w->prev && equal(w->prev, "?"))
     return NULL; // ternary
-  if (w->prev && (equal(w->prev, "case") || equal(w->prev, "default")))
+  if (w->prev && (w->prev->tag & (TT_CASE | TT_DEFAULT)))
     return NULL; // switch case
   if (w->struct_depth > 0)
     return NULL; // bitfield
@@ -1161,7 +1196,7 @@ static GotoSkipResult goto_skips_check(Token *goto_tok, char *label_name, int la
                                equal(w.prev, "const") || equal(w.prev, "volatile") ||
                                equal(w.prev, "restrict") || equal(w.prev, "__restrict") ||
                                equal(w.prev, ","));
-      if (w.tok->kind == TK_KEYWORD && equal(w.tok, "defer") &&
+      if ((w.tok->tag & TT_DEFER) &&
           !equal(w.tok->next, ":") &&
           !(w.prev && (w.prev->tag & TT_MEMBER)) && !is_var &&
           !(w.tok->next && (w.tok->next->tag & TT_ASSIGN)))
@@ -1322,7 +1357,11 @@ static bool array_size_is_vla(Token *open_bracket)
   while (tok && tok->kind != TK_EOF && !equal(tok, "]"))
   {
     // Skip nested brackets
-    if (equal(tok, "[")) { tok = skip_balanced(tok, "[", "]"); continue; }
+    if (equal(tok, "["))
+    {
+      tok = skip_balanced(tok, "[", "]");
+      continue;
+    }
 
     // sizeof/alignof — skip argument, but check for VLA typedef and VLA inner types
     if (equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof"))
@@ -1379,8 +1418,13 @@ static bool scan_for_vla(Token *tok, const char *open, const char *close)
       depth++;
     else if (equal(tok, close))
     {
-      if (open) { if (--depth <= 0) break; }
-      else break;
+      if (open)
+      {
+        if (--depth <= 0)
+          break;
+      }
+      else
+        break;
     }
     else if (!open && (equal(tok, "(") || equal(tok, "{")))
       depth++;
@@ -1450,8 +1494,6 @@ static inline bool is_valid_varname(Token *tok)
 // ============================================================================
 // Zero-init declaration parsing helpers
 // ============================================================================
-
-
 
 // Skip _Pragma(...) operator sequences (C99 6.10.9)
 // _Pragma is equivalent to #pragma but can appear in macro expansions
@@ -1646,11 +1688,41 @@ static DeclResult parse_declarator(Token *tok, bool emit)
 {
   DeclResult r = {tok, NULL, false, false, false, false, false, false};
 
-  // Helper macros for conditional emit
-  #define DECL_EMIT(t) do { if (emit) emit_tok(t); } while(0)
-  #define DECL_BALANCED(t) (emit ? emit_balanced(t) : skip_balanced(t, equal(t,"(") ? "(" : equal(t,"[") ? "[" : "{", equal(t,"(") ? ")" : equal(t,"[") ? "]" : "}"))
-  #define DECL_ATTR(t) do { if (emit) { t = emit_attr(t); } else { t = (t)->next; if (t && equal(t,"(")) t = skip_balanced(t,"(",")"); } } while(0)
-  #define DECL_ARRAY_DIMS(t, vla) do { while (equal(t, "[")) { if (array_size_is_vla(t)) *(vla) = true; t = DECL_BALANCED(t); } } while(0)
+// Helper macros for conditional emit
+#define DECL_EMIT(t) \
+  do                 \
+  {                  \
+    if (emit)        \
+      emit_tok(t);   \
+  } while (0)
+#define DECL_BALANCED(t) (emit ? emit_balanced(t) : skip_balanced(t, equal(t, "(") ? "(" : equal(t, "[") ? "["  \
+                                                                                                         : "{", \
+                                                                  equal(t, "(") ? ")" : equal(t, "[") ? "]"     \
+                                                                                                      : "}"))
+#define DECL_ATTR(t)                    \
+  do                                    \
+  {                                     \
+    if (emit)                           \
+    {                                   \
+      t = emit_attr(t);                 \
+    }                                   \
+    else                                \
+    {                                   \
+      t = (t)->next;                    \
+      if (t && equal(t, "("))           \
+        t = skip_balanced(t, "(", ")"); \
+    }                                   \
+  } while (0)
+#define DECL_ARRAY_DIMS(t, vla) \
+  do                            \
+  {                             \
+    while (equal(t, "["))       \
+    {                           \
+      if (array_size_is_vla(t)) \
+        *(vla) = true;          \
+      t = DECL_BALANCED(t);     \
+    }                           \
+  } while (0)
 
   // Pointer modifiers and qualifiers
   while (equal(tok, "*") || (tok->tag & TT_QUALIFIER))
@@ -1771,10 +1843,10 @@ static DeclResult parse_declarator(Token *tok, bool emit)
   r.has_init = equal(tok, "=");
   r.end = tok;
 
-  #undef DECL_EMIT
-  #undef DECL_BALANCED
-  #undef DECL_ATTR
-  #undef DECL_ARRAY_DIMS
+#undef DECL_EMIT
+#undef DECL_BALANCED
+#undef DECL_ATTR
+#undef DECL_ARRAY_DIMS
 
   return r;
 }
@@ -1824,7 +1896,7 @@ static bool is_raw_declaration_context(Token *after_raw)
 static Token *handle_storage_raw(Token *storage_tok)
 {
   Token *p = storage_tok->next;
-  while (p && (equal(p, "_Pragma") || equal(p, "__attribute__") || equal(p, "__attribute")))
+  while (p && (equal(p, "_Pragma") || (p->tag & TT_ATTR)))
   {
     p = p->next;
     if (p && equal(p, "("))
@@ -1842,8 +1914,10 @@ static Token *handle_storage_raw(Token *storage_tok)
   }
   // Skip 'raw', emit rest through semicolon
   Token *t2 = p->next;
-  while (t2 && !equal(t2, ";") && t2->kind != TK_EOF) t2 = t2->next;
-  if (equal(t2, ";")) t2 = t2->next;
+  while (t2 && !equal(t2, ";") && t2->kind != TK_EOF)
+    t2 = t2->next;
+  if (equal(t2, ";"))
+    t2 = t2->next;
   emit_range(p->next, t2);
   return t2;
 }
@@ -2023,12 +2097,14 @@ static Token *try_zero_init_decl(Token *tok)
     if (is_raw)
     {
       Token *e = start;
-      while (e && !equal(e, ";") && e->kind != TK_EOF) e = e->next;
-      if (equal(e, ";")) e = e->next;
+      while (e && !equal(e, ";") && e->kind != TK_EOF)
+        e = e->next;
+      if (equal(e, ";"))
+        e = e->next;
       emit_range(start, e);
       return e;
     }
-    if (equal(tok, "static") || equal(tok, "extern") || equal(tok, "typedef"))
+    if (equal(tok, "static") || equal(tok, "extern") || (tok->tag & TT_TYPEDEF))
     {
       Token *result = handle_storage_raw(tok);
       if (result)
@@ -2132,7 +2208,10 @@ static Token *handle_defer_keyword(Token *tok)
     error_tok(tok, "defer requires braces in control statements (braceless has no scope)");
   for (int i = 0; i < ctx->stmt_expr_count; i++)
     if (ctx->defer_depth == stmt_expr_levels[i])
-    { error_tok(tok, "defer cannot be at top level of statement expression; wrap in a block"); break; }
+    {
+      error_tok(tok, "defer cannot be at top level of statement expression; wrap in a block");
+      break;
+    }
   if (ctx->current_func_has_setjmp)
     error_tok(tok, "defer cannot be used in functions that call setjmp/longjmp/pthread_exit");
   if (ctx->current_func_has_vfork)
@@ -2400,7 +2479,8 @@ static Token *handle_open_brace(Token *tok)
   }
   if (ctrl.pending && !(ctrl.next_scope & NS_SWITCH))
     ctrl.next_scope |= NS_CONDITIONAL;
-  uint8_t _ns = ctrl.next_scope; ctrl = (ControlFlow){.next_scope = _ns};
+  uint8_t _ns = ctrl.next_scope;
+  ctrl = (ControlFlow){.next_scope = _ns};
 
   // Detect statement expression: ({
   if (last_emitted && equal(last_emitted, "("))
@@ -2516,14 +2596,15 @@ static void free_argv(char **argv)
 // If source_adjacent is non-NULL, creates file next to that source file instead of in tmp dir.
 // Returns 0 on success, -1 on failure. Path written to buf.
 static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len,
-                         const char *source_adjacent)
+                          const char *source_adjacent)
 {
   if (source_adjacent)
   {
     const char *slash = strrchr(source_adjacent, '/');
 #ifdef _WIN32
     const char *bslash = strrchr(source_adjacent, '\\');
-    if (!slash || (bslash && bslash > slash)) slash = bslash;
+    if (!slash || (bslash && bslash > slash))
+      slash = bslash;
 #endif
     if (slash)
     {
@@ -2644,14 +2725,15 @@ static char *preprocess_with_cc(const char *input_file)
   return result;
 }
 
-static void reset_transpiler_state(void) {
+static void reset_transpiler_state(void)
+{
   ctx->defer_depth = ctx->struct_depth = ctx->conditional_block_depth =
-  ctx->generic_paren_depth = ctx->stmt_expr_count = ctx->last_line_no = 0;
+      ctx->generic_paren_depth = ctx->stmt_expr_count = ctx->last_line_no = 0;
   ctx->ret_counter = 0;
   ctx->last_filename = NULL;
   ctx->last_system_header = ctx->current_func_returns_void =
-  ctx->current_func_has_setjmp = ctx->current_func_has_asm =
-  ctx->current_func_has_vfork = false;
+      ctx->current_func_has_setjmp = ctx->current_func_has_asm =
+          ctx->current_func_has_vfork = false;
   ctx->at_stmt_start = true;
   control_flow_reset();
   last_emitted = NULL;
@@ -2706,7 +2788,7 @@ static int transpile(char *input_file, char *output_file)
 
   // Reset state
   reset_transpiler_state();
-  typedef_table_reset();     // Reset typedef tracking
+  typedef_table_reset(); // Reset typedef tracking
 
   // Handle system headers: collect and emit #includes, or flatten
   system_includes_reset();
@@ -2726,7 +2808,15 @@ static int transpile(char *input_file, char *output_file)
     uint32_t tag = tok->tag;
 
     // Dispatch macro: call handler, advance if it consumed tokens
-#define DISPATCH(handler) { next = handler(tok); if (next) { tok = next; continue; } }
+#define DISPATCH(handler) \
+  {                       \
+    next = handler(tok);  \
+    if (next)             \
+    {                     \
+      tok = next;         \
+      continue;           \
+    }                     \
+  }
 
     // Track typedefs (must precede zero-init check)
     if (ctx->at_stmt_start && ctx->struct_depth == 0 && (tag & TT_TYPEDEF))
@@ -3063,8 +3153,10 @@ cleanup:
 
 PRISM_API void prism_free(PrismResult *r)
 {
-  free(r->output);  r->output = NULL;
-  free(r->error_msg); r->error_msg = NULL;
+  free(r->output);
+  r->output = NULL;
+  free(r->error_msg);
+  r->error_msg = NULL;
 }
 
 // Reset all transpiler state for clean reuse
@@ -3093,7 +3185,11 @@ PRISM_API void prism_reset(void)
   ctx->stmt_expr_count = 0;
   stmt_expr_capacity = 0;
 
-  if (out_fp) { fclose(out_fp); out_fp = NULL; }
+  if (out_fp)
+  {
+    fclose(out_fp);
+    out_fp = NULL;
+  }
 
   reset_transpiler_state();
 }
@@ -3128,24 +3224,38 @@ static bool get_self_exe_path(char *buf, size_t bufsize)
 {
 #if defined(__linux__)
   ssize_t len = readlink("/proc/self/exe", buf, bufsize - 1);
-  if (len > 0) { buf[len] = '\0'; return true; }
+  if (len > 0)
+  {
+    buf[len] = '\0';
+    return true;
+  }
 #elif defined(__APPLE__)
   uint32_t sz = (uint32_t)bufsize;
   if (_NSGetExecutablePath(buf, &sz) == 0)
   {
     char temp[PATH_MAX];
-    if (realpath(buf, temp)) { strncpy(buf, temp, bufsize - 1); buf[bufsize - 1] = '\0'; }
+    if (realpath(buf, temp))
+    {
+      strncpy(buf, temp, bufsize - 1);
+      buf[bufsize - 1] = '\0';
+    }
     return true;
   }
 #elif defined(__FreeBSD__)
   int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
   size_t len = bufsize;
-  if (sysctl(mib, 4, buf, &len, NULL, 0) == 0) return true;
+  if (sysctl(mib, 4, buf, &len, NULL, 0) == 0)
+    return true;
 #elif defined(__NetBSD__)
   ssize_t len = readlink("/proc/curproc/exe", buf, bufsize - 1);
-  if (len > 0) { buf[len] = '\0'; return true; }
+  if (len > 0)
+  {
+    buf[len] = '\0';
+    return true;
+  }
 #endif
-  (void)buf; (void)bufsize;
+  (void)buf;
+  (void)bufsize;
   return false;
 }
 
@@ -3281,8 +3391,12 @@ static const char *get_real_cc(const char *cc)
   return cc;
 }
 
-#define CLI_PUSH(arr, cnt, cap, item) \
-  do { ENSURE_ARRAY_CAP(arr, (cnt) + 1, cap, 16, __typeof__(*(arr))); (arr)[(cnt)++] = (item); } while (0)
+#define CLI_PUSH(arr, cnt, cap, item)                              \
+  do                                                               \
+  {                                                                \
+    ENSURE_ARRAY_CAP(arr, (cnt) + 1, cap, 16, __typeof__(*(arr))); \
+    (arr)[(cnt)++] = (item);                                       \
+  } while (0)
 
 static inline bool has_ext(const char *f, const char *ext)
 {
@@ -3398,19 +3512,29 @@ static Cli cli_parse(int argc, char **argv)
     }
 
     // Prism feature flags (consume, don't pass to CC)
-    static const struct { const char *flag; int off; int val; } feat_flags[] = {
-      {"-fno-defer",           offsetof(PrismFeatures, defer), 0},
-      {"-fno-zeroinit",        offsetof(PrismFeatures, zeroinit), 0},
-      {"-fno-line-directives", offsetof(PrismFeatures, line_directives), 0},
-      {"-fno-safety",          offsetof(PrismFeatures, warn_safety), 1},
-      {"-fflatten-headers",    offsetof(PrismFeatures, flatten_headers), 1},
-      {"-fno-flatten-headers", offsetof(PrismFeatures, flatten_headers), 0},
+    static const struct
+    {
+      const char *flag;
+      int off;
+      int val;
+    } feat_flags[] = {
+        {"-fno-defer", offsetof(PrismFeatures, defer), 0},
+        {"-fno-zeroinit", offsetof(PrismFeatures, zeroinit), 0},
+        {"-fno-line-directives", offsetof(PrismFeatures, line_directives), 0},
+        {"-fno-safety", offsetof(PrismFeatures, warn_safety), 1},
+        {"-fflatten-headers", offsetof(PrismFeatures, flatten_headers), 1},
+        {"-fno-flatten-headers", offsetof(PrismFeatures, flatten_headers), 0},
     };
     bool matched = false;
-    for (int f = 0; f < (int)(sizeof(feat_flags)/sizeof(*feat_flags)); f++)
+    for (int f = 0; f < (int)(sizeof(feat_flags) / sizeof(*feat_flags)); f++)
       if (!strcmp(a, feat_flags[f].flag))
-      { *(bool *)((char *)&cli.features + feat_flags[f].off) = feat_flags[f].val; matched = true; break; }
-    if (matched) continue;
+      {
+        *(bool *)((char *)&cli.features + feat_flags[f].off) = feat_flags[f].val;
+        matched = true;
+        break;
+      }
+    if (matched)
+      continue;
 
     // Prism options
     if (str_startswith(a, "--prism-cc="))
@@ -3726,11 +3850,16 @@ int main(int argc, char **argv)
 
   // Suppress warnings from preprocessed/inlined system headers
   static const char *wflags[] = {
-    "-Wno-type-limits", "-Wno-cast-align", "-Wno-logical-op",
-    "-Wno-implicit-fallthrough", "-Wno-unused-function", "-Wno-unused-variable",
-    "-Wno-unused-parameter", "-Wno-maybe-uninitialized",
+      "-Wno-type-limits",
+      "-Wno-cast-align",
+      "-Wno-logical-op",
+      "-Wno-implicit-fallthrough",
+      "-Wno-unused-function",
+      "-Wno-unused-variable",
+      "-Wno-unused-parameter",
+      "-Wno-maybe-uninitialized",
   };
-  for (int i = 0; i < (int)(sizeof(wflags)/sizeof(*wflags)); i++)
+  for (int i = 0; i < (int)(sizeof(wflags) / sizeof(*wflags)); i++)
     argv_builder_add(&ab, wflags[i]);
 
   if (cli.mode == CLI_RUN)
