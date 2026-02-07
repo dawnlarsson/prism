@@ -205,11 +205,14 @@ static Token *skip_all_attributes(Token *tok)
 
 typedef struct
 {
-  Token **stmts;     // Start token of each deferred statement (dynamic)
-  Token **ends;      // End token (the semicolon) (dynamic)
-  Token **defer_tok; // The 'defer' keyword token (for error messages) (dynamic)
+  Token *stmt, *end, *defer_kw;
+} DeferEntry;
+
+typedef struct
+{
+  DeferEntry *entries; // Deferred statements (dynamic)
   int count;
-  int capacity;          // Current capacity of the arrays
+  int capacity;
   bool is_loop;          // true if this scope is a for/while/do loop
   bool is_switch;        // true if this scope is a switch statement
   bool had_control_exit; // true if unconditional break/return/goto/continue was seen
@@ -525,17 +528,7 @@ static void defer_stack_ensure_capacity(int n)
     error("out of memory growing defer stack");
   // Initialize new scopes
   for (int i = defer_stack_capacity; i < new_cap; i++)
-  {
-    new_stack[i].stmts = NULL;
-    new_stack[i].ends = NULL;
-    new_stack[i].defer_tok = NULL;
-    new_stack[i].count = 0;
-    new_stack[i].capacity = 0;
-    new_stack[i].is_loop = false;
-    new_stack[i].is_switch = false;
-    new_stack[i].is_conditional = false;
-    new_stack[i].had_control_exit = false;
-  }
+    new_stack[i] = (DeferScope){0};
   defer_stack = new_stack;
   defer_stack_capacity = new_cap;
 }
@@ -577,10 +570,8 @@ static void defer_scope_ensure_capacity(DeferScope *scope, int n)
   int new_cap = scope->capacity == 0 ? INITIAL_CAP : scope->capacity * 2;
   while (new_cap < n)
     new_cap *= 2;
-  scope->stmts = realloc(scope->stmts, sizeof(Token *) * new_cap);
-  scope->ends = realloc(scope->ends, sizeof(Token *) * new_cap);
-  scope->defer_tok = realloc(scope->defer_tok, sizeof(Token *) * new_cap);
-  if (!scope->stmts || !scope->ends || !scope->defer_tok)
+  scope->entries = realloc(scope->entries, sizeof(DeferEntry) * new_cap);
+  if (!scope->entries)
     error("out of memory");
   scope->capacity = new_cap;
 }
@@ -591,10 +582,7 @@ static void defer_add(Token *defer_keyword, Token *start, Token *end)
     error_tok(start, "defer outside of any scope");
   DeferScope *scope = &defer_stack[ctx->defer_depth - 1];
   defer_scope_ensure_capacity(scope, scope->count + 1);
-  scope->defer_tok[scope->count] = defer_keyword;
-  scope->stmts[scope->count] = start;
-  scope->ends[scope->count] = end;
-  scope->count++;
+  scope->entries[scope->count++] = (DeferEntry){start, end, defer_keyword};
   // Reset control exit flag - new defer means we need a new control exit
   scope->had_control_exit = false;
 }
@@ -668,43 +656,47 @@ static bool needs_space(Token *prev, Token *tok)
   if (!prev)
     return false;
   if (tok_at_bol(tok))
-    return false; // newline will be emitted
+    return false;
   if (tok_has_space(tok))
     return true;
 
-  // Check if merging would create a different token
-  // e.g., "int" + "x" -> "intx", "+" + "+" -> "++"
-  char prev_last = prev->loc[prev->len - 1];
-  char tok_first = tok->loc[0];
-
-  // Identifier/keyword followed by identifier/keyword or number
+  // Identifier/keyword/number adjacency
   if ((is_identifier_like(prev) || prev->kind == TK_NUM) &&
       (is_identifier_like(tok) || tok->kind == TK_NUM))
     return true;
 
-  // Punctuation that could merge
   if (prev->kind != TK_PUNCT || tok->kind != TK_PUNCT)
     return false;
 
-  // Check common cases: ++ -- << >> && || etc.
-  return (prev_last == '+' && tok_first == '+') ||
-         (prev_last == '-' && tok_first == '-') ||
-         (prev_last == '<' && tok_first == '<') ||
-         (prev_last == '>' && tok_first == '>') ||
-         (prev_last == '&' && tok_first == '&') ||
-         (prev_last == '|' && tok_first == '|') ||
-         (prev_last == '=' && tok_first == '=') ||
-         (prev_last == '!' && tok_first == '=') ||
-         (prev_last == '<' && tok_first == '=') ||
-         (prev_last == '>' && tok_first == '=') ||
-         (prev_last == '+' && tok_first == '=') ||
-         (prev_last == '-' && tok_first == '=') ||
-         (prev_last == '*' && tok_first == '=') ||
-         (prev_last == '/' && tok_first == '=') ||
-         (prev_last == '-' && tok_first == '>') ||
-         (prev_last == '#' && tok_first == '#') ||
-         (prev_last == '/' && tok_first == '*') ||
-         (prev_last == '*' && tok_first == '/');
+  // Lookup in pairs table
+  char a = prev->loc[prev->len - 1], b = tok->loc[0];
+  static const uint16_t pairs[] = {
+      '+' + ('+' << 8),
+      '-' + ('-' << 8),
+      '<' + ('<' << 8),
+      '>' + ('>'
+             << 8),
+      '&' + ('&' << 8),
+      '|' + ('|' << 8),
+      '=' + ('=' << 8),
+      '!' + ('=' << 8),
+      '<' + ('=' << 8),
+      '>' + ('=' << 8),
+      '+' + ('=' << 8),
+      '-' + ('=' << 8),
+      '*' + ('=' << 8),
+      '/' + ('=' << 8),
+      '-' + ('>'
+             << 8),
+      '#' + ('#' << 8),
+      '/' + ('*' << 8),
+      '*' + ('/' << 8),
+  };
+  uint16_t key = (uint8_t)a | ((uint8_t)b << 8);
+  for (int i = 0; i < (int)(sizeof(pairs) / sizeof(*pairs)); i++)
+    if (pairs[i] == key)
+      return true;
+  return false;
 }
 
 // Check if 'tok' is inside a __attribute__((...)) or __declspec(...) context.
@@ -873,7 +865,7 @@ static void emit_defers_ex(DeferEmitMode mode, int stop_depth)
     for (int i = scope->count - 1; i >= 0; i--)
     {
       out_char(' ');
-      emit_range(scope->stmts[i], scope->ends[i]);
+      emit_range(scope->entries[i].stmt, scope->entries[i].end);
       out_char(';');
     }
 
@@ -1289,34 +1281,33 @@ static void scan_labels_in_function(Token *tok)
 // Note: emit_goto_defers() and goto_has_defers() are now macros
 // defined via the unified emit_defers_ex/has_defers_for functions above.
 
-// Modes for goto_skips_check - what to look for between goto and label
-typedef enum
+// Result of goto skip analysis — both defer and decl checked in a single walk
+typedef struct
 {
-  GOTO_CHECK_DEFER, // Look for defer statements
-  GOTO_CHECK_DECL   // Look for variable declarations
-} GotoCheckMode;
+  Token *skipped_defer;
+  Token *skipped_decl;
+} GotoSkipResult;
 
 // Check if a forward goto would skip over defer statements or variable declarations.
-// Returns the token that would be skipped, or NULL if safe.
+// Returns both results in one walk. Either field NULL means safe for that check.
 //
-// Key distinction:
-// - INVALID: goto jumps INTO a block, landing AFTER a defer/decl inside that block
-//   Example: goto inner; { defer X; inner: ... } -- X would run but wasn't registered
-// - VALID: goto jumps OVER an entire block containing a defer/decl
-//   Example: goto done; { defer X; ... } done: -- we skip the whole block, defer never registered
-//
-// The rule: if we find the label BEFORE exiting the scope containing the item, it's invalid.
-static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len, GotoCheckMode mode)
+// Key rule: if we find the label BEFORE exiting the scope containing the item, it's invalid.
+// A goto that jumps OVER an entire block is fine; jumping INTO a block past a defer/decl is not.
+static GotoSkipResult goto_skips_check(Token *goto_tok, char *label_name, int label_len,
+                                       bool check_defer, bool check_decl)
 {
-  if (mode == GOTO_CHECK_DECL && !ctx->feature_zeroinit && !ctx->feature_defer)
-    return NULL;
+  GotoSkipResult r = {NULL, NULL};
+  if (check_decl && !ctx->feature_zeroinit && !ctx->feature_defer)
+    check_decl = false;
+  if (!check_defer && !check_decl)
+    return r;
 
   Token *start = goto_tok->next->next; // skip 'goto' and label name
   if (start && equal(start, ";"))
     start = start->next;
 
-  Token *active_item = NULL;
-  int active_item_depth = -1;
+  Token *active_defer = NULL, *active_decl = NULL;
+  int defer_depth = -1, decl_depth = -1;
   bool is_stmt_start = true;
   bool is_in_for_init = false;
 
@@ -1325,8 +1316,8 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
 
   while (walker_next(&w))
   {
-    // For-loop init detection (DECL mode only)
-    if (mode == GOTO_CHECK_DECL && w.tok->kind == TK_KEYWORD && equal(w.tok, "for"))
+    // For-loop init detection (for decl check)
+    if (check_decl && w.tok->kind == TK_KEYWORD && equal(w.tok, "for"))
     {
       walker_advance(&w);
       if (w.tok && equal(w.tok, "("))
@@ -1340,7 +1331,6 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
       continue;
     }
 
-    // Scope changes — depth already updated by walker
     if (equal(w.tok, "{"))
     {
       is_stmt_start = true;
@@ -1349,11 +1339,15 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
     }
     if (equal(w.tok, "}"))
     {
-      // Clear active_item if we've exited its scope (depth already decremented)
-      if (active_item && w.depth < active_item_depth)
+      if (active_defer && w.depth < defer_depth)
       {
-        active_item = NULL;
-        active_item_depth = -1;
+        active_defer = NULL;
+        defer_depth = -1;
+      }
+      if (active_decl && w.depth < decl_depth)
+      {
+        active_decl = NULL;
+        decl_depth = -1;
       }
       is_stmt_start = true;
       walker_advance(&w);
@@ -1368,38 +1362,37 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
       continue;
     }
 
-    // Mode-specific: track defers or declarations
-    if (mode == GOTO_CHECK_DEFER)
+    // Track defers
+    if (check_defer)
     {
-      bool is_variable_name = w.prev && (is_type_keyword(w.prev) || equal(w.prev, "*") ||
-                                         equal(w.prev, "const") || equal(w.prev, "volatile") ||
-                                         equal(w.prev, "restrict") || equal(w.prev, "__restrict") ||
-                                         equal(w.prev, ","));
-
+      bool is_var = w.prev && (is_type_keyword(w.prev) || equal(w.prev, "*") ||
+                               equal(w.prev, "const") || equal(w.prev, "volatile") ||
+                               equal(w.prev, "restrict") || equal(w.prev, "__restrict") ||
+                               equal(w.prev, ","));
       if (w.tok->kind == TK_KEYWORD && equal(w.tok, "defer") &&
           !equal(w.tok->next, ":") &&
-          !(w.prev && (w.prev->tag & TT_MEMBER)) && !is_variable_name &&
+          !(w.prev && (w.prev->tag & TT_MEMBER)) && !is_var &&
           !(w.tok->next && (w.tok->next->tag & TT_ASSIGN)))
       {
-        if (!active_item || w.depth <= active_item_depth)
+        if (!active_defer || w.depth <= defer_depth)
         {
-          active_item = w.tok;
-          active_item_depth = w.depth;
+          active_defer = w.tok;
+          defer_depth = w.depth;
         }
       }
     }
-    else if (mode == GOTO_CHECK_DECL && (is_stmt_start || is_in_for_init) && w.struct_depth == 0)
+
+    // Track declarations
+    if (check_decl && (is_stmt_start || is_in_for_init) && w.struct_depth == 0)
     {
       Token *decl_start = w.tok;
       Token *t = w.tok;
-
       bool has_raw = false;
       if (equal(t, "raw") && !is_known_typedef(t))
       {
         has_raw = true;
         t = t->next;
       }
-
       if (!equal(t, "extern") && !equal(t, "typedef"))
       {
         TypeSpecResult type = parse_type_specifier(t);
@@ -1411,10 +1404,10 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
             t = t->next;
           if (t && t->kind == TK_IDENT && t->next && !equal(t->next, "("))
           {
-            if (!has_raw && (!active_item || w.depth <= active_item_depth))
+            if (!has_raw && (!active_decl || w.depth <= decl_depth))
             {
-              active_item = decl_start;
-              active_item_depth = w.depth;
+              active_decl = decl_start;
+              decl_depth = w.depth;
             }
           }
         }
@@ -1427,14 +1420,18 @@ static Token *goto_skips_check(Token *goto_tok, char *label_name, int label_len,
     {
       Token *label = walker_check_label(&w);
       if (label)
-        return active_item;
+      {
+        r.skipped_defer = active_defer;
+        r.skipped_decl = active_decl;
+        return r;
+      }
     }
 
     is_stmt_start = false;
     walker_advance(&w);
   }
 
-  return NULL;
+  return r;
 }
 
 // Transpiler
@@ -2794,12 +2791,11 @@ static Token *handle_goto_keyword(Token *tok)
 
     if (is_identifier_like(tok))
     {
-      Token *skipped = goto_skips_check(goto_tok, tok->loc, tok->len, GOTO_CHECK_DEFER);
-      if (skipped)
-        error_tok(skipped, "goto '%.*s' would skip over this defer statement", tok->len, tok->loc);
-      Token *skipped_decl = goto_skips_check(goto_tok, tok->loc, tok->len, GOTO_CHECK_DECL);
-      if (skipped_decl)
-        report_goto_skips_decl(skipped_decl, tok);
+      GotoSkipResult skip = goto_skips_check(goto_tok, tok->loc, tok->len, true, true);
+      if (skip.skipped_defer)
+        error_tok(skip.skipped_defer, "goto '%.*s' would skip over this defer statement", tok->len, tok->loc);
+      if (skip.skipped_decl)
+        report_goto_skips_decl(skip.skipped_decl, tok);
 
       int target_depth = label_table_lookup(tok->loc, tok->len);
       if (target_depth < 0)
@@ -2830,9 +2826,9 @@ static Token *handle_goto_keyword(Token *tok)
   // Zeroinit-only goto safety
   if (ctx->feature_zeroinit && is_identifier_like(tok))
   {
-    Token *skipped_decl = goto_skips_check(goto_tok, tok->loc, tok->len, GOTO_CHECK_DECL);
-    if (skipped_decl)
-      report_goto_skips_decl(skipped_decl, tok);
+    GotoSkipResult skip = goto_skips_check(goto_tok, tok->loc, tok->len, false, true);
+    if (skip.skipped_decl)
+      report_goto_skips_decl(skip.skipped_decl, tok);
   }
   emit_tok(goto_tok);
   return tok;
@@ -2857,7 +2853,7 @@ static void handle_case_default(Token *tok)
   for (int d = ctx->defer_depth - 1; d >= 0; d--)
   {
     if (defer_stack[d].count > 0 && !defer_stack[d].had_control_exit)
-      error_tok(defer_stack[d].defer_tok[0],
+      error_tok(defer_stack[d].entries[0].defer_kw,
                 "defer would be skipped due to switch fallthrough at %s:%d. "
                 "Add 'break;' before the next case, or wrap case body in braces.",
                 tok_file(tok)->name, tok_line_no(tok));
@@ -3068,26 +3064,50 @@ static void free_argv(char **argv)
   free(argv);
 }
 
+// Unified temp file creation with optional suffix (e.g., ".c" → suffix_len=2)
+// Returns 0 on success, -1 on failure. Path written to buf.
+static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len)
+{
+  snprintf(buf, bufsize, "%s%s", get_tmp_dir(), prefix);
+#if defined(_WIN32)
+  if (_mktemp_s(buf, bufsize) != 0)
+    return -1;
+#elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
+  int fd = suffix_len > 0 ? mkstemps(buf, suffix_len) : mkstemp(buf);
+  if (fd < 0)
+    return -1;
+  close(fd);
+#else
+  int fd = mkstemp(buf);
+  if (fd < 0)
+    return -1;
+  close(fd);
+  if (suffix_len > 0)
+  {
+    unlink(buf);
+    size_t len = strlen(buf);
+    if (len + suffix_len < bufsize)
+    {
+      buf[len] = '.';
+      buf[len + 1] = 'c';
+      buf[len + 2] = '\0';
+    }
+  }
+#endif
+  return 0;
+}
+
 // Run system preprocessor (cc -E -P) on input file
 // Returns path to temp file with preprocessed output, or NULL on failure
 // Caller must free() the path and unlink() the file
-//
-// NOTE: In library mode (PRISM_LIB_MODE), errors from the C compiler
-// (e.g., #error directives, missing includes) go directly to stderr.
-// NOTE: In library mode, a host IDE/GUI cannot capture these messages for
-// display in a UI pane. A future version could capture child stderr via pipe.
 static char *preprocess_with_cc(const char *input_file)
 {
-  // Create temp file for preprocessed output
   char tmppath[PATH_MAX];
-  snprintf(tmppath, sizeof(tmppath), "%sprism_pp_XXXXXX", get_tmp_dir());
-  int fd = mkstemp(tmppath);
-  if (fd < 0)
+  if (make_temp_file(tmppath, sizeof(tmppath), "prism_pp_XXXXXX", 0) < 0)
   {
     perror("mkstemp");
     return NULL;
   }
-  close(fd);
 
   // Build argv for preprocessor: cc -E -P [flags] input -o output
   ArgvBuilder ab;
@@ -3567,58 +3587,15 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
 
   // Create temp file for output
   char temp_path[PATH_MAX];
-  snprintf(temp_path, sizeof(temp_path), "%sprism_out.XXXXXX.c", get_tmp_dir());
-
-#if defined(_WIN32)
-  if (_mktemp_s(temp_path, sizeof(temp_path)) != 0)
+  temp_path[0] = '\0';
+  if (make_temp_file(temp_path, sizeof(temp_path), "prism_out.XXXXXX.c", 2) < 0)
   {
     result.status = PRISM_ERR_IO;
     result.error_msg = strdup("Failed to create temp file");
-#ifdef PRISM_LIB_MODE
-    ctx->error_jmp_set = false;
-#endif
-    return result;
+    goto cleanup;
   }
-#elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
-  {
-    int fd = mkstemps(temp_path, 2);
-    if (fd < 0)
-    {
-      result.status = PRISM_ERR_IO;
-      result.error_msg = strdup("Failed to create temp file");
-#ifdef PRISM_LIB_MODE
-      ctx->error_jmp_set = false;
-#endif
-      return result;
-    }
-    close(fd);
-  }
-#else
-  {
-    int fd = mkstemp(temp_path);
-    if (fd < 0)
-    {
-      result.status = PRISM_ERR_IO;
-      result.error_msg = strdup("Failed to create temp file");
-#ifdef PRISM_LIB_MODE
-      ctx->error_jmp_set = false;
-#endif
-      return result;
-    }
-    close(fd);
-    unlink(temp_path);
-    size_t len = strlen(temp_path);
-    if (len + 2 < sizeof(temp_path))
-    {
-      temp_path[len] = '.';
-      temp_path[len + 1] = 'c';
-      temp_path[len + 2] = '\0';
-    }
-  }
-#endif
 
 #ifdef PRISM_LIB_MODE
-  // Track output temp file for cleanup on error (temp_path is now the actual path)
   strncpy(ctx->active_temp_output, temp_path, PATH_MAX - 1);
   ctx->active_temp_output[PATH_MAX - 1] = '\0';
 #endif
@@ -3628,54 +3605,42 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
   {
     result.status = PRISM_ERR_SYNTAX;
     result.error_msg = strdup("Transpilation failed");
-    remove(temp_path);
-#ifdef PRISM_LIB_MODE
-    ctx->active_temp_output[0] = '\0';
-    ctx->error_jmp_set = false;
-#endif
-    return result;
+    goto cleanup;
   }
 
   // Read result into memory
-  FILE *f = fopen(temp_path, "rb");
-  if (!f)
   {
-    result.status = PRISM_ERR_IO;
-    result.error_msg = strdup("Failed to read transpiled output");
-    remove(temp_path);
-#ifdef PRISM_LIB_MODE
-    ctx->active_temp_output[0] = '\0';
-    ctx->error_jmp_set = false;
-#endif
-    return result;
-  }
+    FILE *f = fopen(temp_path, "rb");
+    if (!f)
+    {
+      result.status = PRISM_ERR_IO;
+      result.error_msg = strdup("Failed to read transpiled output");
+      goto cleanup;
+    }
 
-  fseek(f, 0, SEEK_END);
-  long size = ftell(f);
-  fseek(f, 0, SEEK_SET);
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
 
-  result.output = malloc(size + 1);
-  if (!result.output)
-  {
-    result.status = PRISM_ERR_IO;
-    result.error_msg = strdup("Out of memory");
+    result.output = malloc(size + 1);
+    if (!result.output)
+    {
+      result.status = PRISM_ERR_IO;
+      result.error_msg = strdup("Out of memory");
+      fclose(f);
+      goto cleanup;
+    }
+
+    size_t read = fread(result.output, 1, size, f);
+    result.output[read] = '\0';
+    result.output_len = read;
+    result.status = PRISM_OK;
     fclose(f);
-    remove(temp_path);
-#ifdef PRISM_LIB_MODE
-    ctx->active_temp_output[0] = '\0';
-    ctx->error_jmp_set = false;
-#endif
-    return result;
   }
 
-  size_t read = fread(result.output, 1, size, f);
-  result.output[read] = '\0';
-  result.output_len = read;
-  result.status = PRISM_OK;
-
-  fclose(f);
-  remove(temp_path);
-
+cleanup:
+  if (temp_path[0])
+    remove(temp_path);
 #ifdef PRISM_LIB_MODE
   ctx->active_temp_output[0] = '\0';
   ctx->error_jmp_set = false;
@@ -3706,14 +3671,8 @@ PRISM_API void prism_reset(void)
   // Reset defer stack
   for (int i = 0; i < defer_stack_capacity; i++)
   {
-    free(defer_stack[i].stmts);
-    free(defer_stack[i].ends);
-    free(defer_stack[i].defer_tok);
-    defer_stack[i].stmts = NULL;
-    defer_stack[i].ends = NULL;
-    defer_stack[i].defer_tok = NULL;
-    defer_stack[i].count = 0;
-    defer_stack[i].capacity = 0;
+    free(defer_stack[i].entries);
+    defer_stack[i] = (DeferScope){0};
   }
   free(defer_stack);
   defer_stack = NULL;
