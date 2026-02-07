@@ -10,7 +10,7 @@ Prism is a single-file transpiler that makes C safer without changing how you wr
 - **Proper transpiler** — tracks typedefs, respects scope, catches unsafe patterns
 - **Opt-out features** Disable parts of the transpiler, like zero-init, with CLI flags
 - **Drop-in overlay** Use `CC=prism` in any build system — GCC-compatible flags pass through automatically
-- **Single Repo** — 7.6k lines, zero dependencies, easy to audit
+- **Single Repo** — 6.4k lines, zero dependencies, easy to audit
 
 Prism is a proper transpiler, not a preprocessor macro.
 * **Track Types:** It parses `typedef`s to distinguish pointer declarations from multiplication (the "lexer hack"), ensuring correct zero-initialization.
@@ -208,7 +208,7 @@ Not:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v0.102.0 - Robust C transpiler
+Prism v0.103.0 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 

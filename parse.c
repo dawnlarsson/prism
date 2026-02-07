@@ -108,6 +108,18 @@ enum
     TT_NORETURN_FN = 1 << 11, // Noreturn function identifier (exit, abort, etc.)
     TT_SETJMP_FN = 1 << 12,   // setjmp/longjmp family identifier
     TT_VFORK_FN = 1 << 13,    // vfork identifier
+    // Dispatch tags for main loop (bits 14-24)
+    TT_RETURN = 1 << 14,   // return
+    TT_BREAK = 1 << 15,    // break
+    TT_CONTINUE = 1 << 16, // continue
+    TT_GOTO = 1 << 17,     // goto
+    TT_CASE = 1 << 18,     // case
+    TT_DEFAULT = 1 << 19,  // default
+    TT_DEFER = 1 << 20,    // defer
+    TT_GENERIC = 1 << 21,  // _Generic
+    TT_SWITCH = 1 << 22,   // switch
+    TT_IF = 1 << 23,       // if, else
+    TT_TYPEDEF = 1 << 24,  // typedef
 };
 
 struct Token
@@ -123,7 +135,7 @@ struct Token
     TokenKind kind;
     uint16_t file_idx;
     uint8_t flags;
-    uint16_t tag; // TT_* bitmask - token classification
+    uint32_t tag; // TT_* bitmask - token classification
 };
 
 // Token accessors
@@ -731,7 +743,7 @@ static inline bool equal(Token *tok, const char *op)
 
 // Internal marker bit for keyword map: values are (tag | KW_MARKER)
 // This distinguishes tag=0 keywords from "not found" (NULL)
-#define KW_MARKER 0x8000
+#define KW_MARKER 0x80000000UL
 
 static void init_keyword_map(void)
 {
@@ -740,32 +752,32 @@ static void init_keyword_map(void)
     static struct
     {
         char *name;
-        uint16_t tag;
+        uint32_t tag;
     } kw[] = {
         // Control flow (skip-decl is set on all; can't start a zero-init declaration)
-        {"return", TT_SKIP_DECL},
-        {"if", TT_SKIP_DECL | TT_CONTROL},
-        {"else", TT_SKIP_DECL | TT_CONTROL},
+        {"return", TT_SKIP_DECL | TT_RETURN},
+        {"if", TT_SKIP_DECL | TT_CONTROL | TT_IF},
+        {"else", TT_SKIP_DECL | TT_CONTROL | TT_IF},
         {"for", TT_SKIP_DECL | TT_LOOP | TT_CONTROL},
         {"while", TT_SKIP_DECL | TT_LOOP | TT_CONTROL},
         {"do", TT_SKIP_DECL | TT_LOOP | TT_CONTROL},
-        {"switch", TT_SKIP_DECL | TT_CONTROL},
-        {"case", TT_SKIP_DECL},
-        {"default", TT_SKIP_DECL},
-        {"break", TT_SKIP_DECL},
-        {"continue", TT_SKIP_DECL},
-        {"goto", TT_SKIP_DECL},
+        {"switch", TT_SKIP_DECL | TT_CONTROL | TT_SWITCH},
+        {"case", TT_SKIP_DECL | TT_CASE},
+        {"default", TT_SKIP_DECL | TT_DEFAULT},
+        {"break", TT_SKIP_DECL | TT_BREAK},
+        {"continue", TT_SKIP_DECL | TT_CONTINUE},
+        {"goto", TT_SKIP_DECL | TT_GOTO},
         {"sizeof", TT_SKIP_DECL},
         {"alignof", TT_SKIP_DECL},
         {"_Alignof", TT_SKIP_DECL},
-        {"_Generic", TT_SKIP_DECL},
+        {"_Generic", TT_SKIP_DECL | TT_GENERIC},
         {"_Static_assert", 0},
         // struct/union/enum (also type keywords)
         {"struct", TT_TYPE | TT_SUE},
         {"union", TT_TYPE | TT_SUE},
         {"enum", TT_TYPE | TT_SUE},
         // Storage class / qualifiers that also skip decl
-        {"typedef", TT_SKIP_DECL},
+        {"typedef", TT_SKIP_DECL | TT_TYPEDEF},
         {"static", TT_QUALIFIER | TT_SKIP_DECL},
         {"extern", TT_SKIP_DECL},
         {"inline", TT_INLINE},
@@ -819,24 +831,54 @@ static void init_keyword_map(void)
         {"__builtin_offsetof", 0},
         {"__builtin_types_compatible_p", 0},
         // Prism keywords
-        {"defer", 0},
+        {"defer", TT_DEFER},
         {"raw", 0},
     };
     for (size_t i = 0; i < sizeof(kw) / sizeof(*kw); i++)
         hashmap_put(&ctx->keyword_map, kw[i].name, strlen(kw[i].name),
                     (void *)(uintptr_t)(kw[i].tag | KW_MARKER));
+
+    // Tagged identifiers — not keywords (stay TK_IDENT) but carry
+    // classification tags for O(1) lookup in the transpiler.
+    // Stored WITHOUT KW_MARKER so is_keyword() returns false.
+    static struct
+    {
+        char *name;
+        uint32_t tag;
+    } id_tags[] = {
+        {"exit", TT_NORETURN_FN},
+        {"_Exit", TT_NORETURN_FN},
+        {"_exit", TT_NORETURN_FN},
+        {"abort", TT_NORETURN_FN},
+        {"quick_exit", TT_NORETURN_FN},
+        {"__builtin_trap", TT_NORETURN_FN},
+        {"__builtin_unreachable", TT_NORETURN_FN},
+        {"thrd_exit", TT_NORETURN_FN},
+        {"setjmp", TT_SETJMP_FN},
+        {"longjmp", TT_SETJMP_FN},
+        {"_setjmp", TT_SETJMP_FN},
+        {"_longjmp", TT_SETJMP_FN},
+        {"sigsetjmp", TT_SETJMP_FN},
+        {"siglongjmp", TT_SETJMP_FN},
+        {"pthread_exit", TT_SETJMP_FN},
+        {"vfork", TT_VFORK_FN},
+    };
+    for (size_t i = 0; i < sizeof(id_tags) / sizeof(*id_tags); i++)
+        hashmap_put(&ctx->keyword_map, id_tags[i].name, strlen(id_tags[i].name),
+                    (void *)(uintptr_t)(id_tags[i].tag));
 }
 
 static bool is_keyword(Token *tok)
 {
-    return hashmap_get(&ctx->keyword_map, tok->loc, tok->len) != NULL;
+    void *val = hashmap_get(&ctx->keyword_map, tok->loc, tok->len);
+    return val && ((uintptr_t)val & KW_MARKER);
 }
 
 // Get the tag bits for a keyword (0 if not a keyword)
-static uint16_t keyword_tag(Token *tok)
+static uint32_t keyword_tag(Token *tok)
 {
     void *val = hashmap_get(&ctx->keyword_map, tok->loc, tok->len);
-    return val ? (uint16_t)((uintptr_t)val & ~KW_MARKER) : 0;
+    return val ? (uint32_t)((uintptr_t)val & ~KW_MARKER) : 0;
 }
 
 // Forward declaration for hex digit conversion
@@ -1359,38 +1401,10 @@ static void convert_pp_tokens(Token *tok)
             convert_pp_number(t);
         else if (t->kind == TK_IDENT)
         {
-            // Tag well-known identifiers for O(1) classification in transpiler
-            static const struct
-            {
-                const char *name;
-                uint16_t tag;
-            } ident_tags[] = {
-                {"exit", TT_NORETURN_FN},
-                {"_Exit", TT_NORETURN_FN},
-                {"_exit", TT_NORETURN_FN},
-                {"abort", TT_NORETURN_FN},
-                {"quick_exit", TT_NORETURN_FN},
-                {"__builtin_trap", TT_NORETURN_FN},
-                {"__builtin_unreachable", TT_NORETURN_FN},
-                {"thrd_exit", TT_NORETURN_FN},
-                {"setjmp", TT_SETJMP_FN},
-                {"longjmp", TT_SETJMP_FN},
-                {"_setjmp", TT_SETJMP_FN},
-                {"_longjmp", TT_SETJMP_FN},
-                {"sigsetjmp", TT_SETJMP_FN},
-                {"siglongjmp", TT_SETJMP_FN},
-                {"pthread_exit", TT_SETJMP_FN},
-                {"vfork", TT_VFORK_FN},
-            };
-            for (size_t i = 0; i < sizeof(ident_tags) / sizeof(*ident_tags); i++)
-            {
-                size_t nlen = strlen(ident_tags[i].name);
-                if ((int)nlen == t->len && !memcmp(t->loc, ident_tags[i].name, nlen))
-                {
-                    t->tag = ident_tags[i].tag;
-                    break;
-                }
-            }
+            // O(1) tag lookup for well-known identifiers (exit, setjmp, vfork, etc.)
+            void *val = hashmap_get(&ctx->keyword_map, t->loc, t->len);
+            if (val && !((uintptr_t)val & KW_MARKER))
+                t->tag = (uint32_t)(uintptr_t)val;
         }
         else if (t->kind == TK_PUNCT)
         {

@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.102.0"
+#define PRISM_VERSION "0.103.0"
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -143,15 +143,15 @@ static Token *skip_balanced(Token *tok, char *open, char *close);
 // Forward declaration: Type specifier parsing result
 typedef struct
 {
-  Token *end;        // First token after the type specifier
-  bool saw_type;     // True if a type was recognized
-  bool is_struct;    // True if struct/union/enum type
-  bool is_typedef;   // True if user-defined typedef
-  bool is_vla;       // True if VLA typedef or struct with VLA member
-  bool has_typeof;   // True if typeof/typeof_unqual (cannot determine VLA at transpile-time)
-  bool has_atomic;   // True if _Atomic qualifier/specifier present
-  bool has_register; // True if register storage class
-  bool has_volatile; // True if volatile qualifier
+  Token *end;                  // First token after the type specifier
+  bool saw_type;               // True if a type was recognized
+  bool is_struct;              // True if struct/union/enum type
+  bool is_typedef;             // True if user-defined typedef
+  bool is_vla;                 // True if VLA typedef or struct with VLA member
+  bool has_typeof;             // True if typeof/typeof_unqual (cannot determine VLA at transpile-time)
+  bool has_atomic;             // True if _Atomic qualifier/specifier present
+  bool has_register;           // True if register storage class
+  bool has_volatile;           // True if volatile qualifier
   Token *struct_vla_error_tok; // Non-NULL if struct body has true VLA (caller should error)
 } TypeSpecResult;
 static TypeSpecResult parse_type_specifier(Token *tok);
@@ -190,8 +190,10 @@ static Token *skip_all_attributes(Token *tok)
       int depth = 1;
       while (tok && tok->kind != TK_EOF && depth > 0)
       {
-        if (equal(tok, "[")) depth++;
-        else if (equal(tok, "]")) depth--;
+        if (equal(tok, "["))
+          depth++;
+        else if (equal(tok, "]"))
+          depth--;
         tok = tok->next;
       }
       continue;
@@ -1063,8 +1065,7 @@ static void parse_enum_constants(Token *tok, int scope_depth)
   }
 }
 
-// Check if token is a known typedef (search most recent first for shadowing)
-// Returns false if the most recent entry with this name is a shadow (variable)
+// Check if token is a known typedef (exact match only, no heuristic)
 static bool is_known_typedef(Token *tok)
 {
   if (!is_identifier_like(tok))
@@ -1076,16 +1077,29 @@ static bool is_known_typedef(Token *tok)
   return !e->is_shadow && !e->is_enum_const;
 }
 
-// Check if token is a known shadow variable (variable that shadows a typedef)
-// Used to prevent looks_like_system_typedef from matching user variables like "int size_t = 10;"
-static bool is_known_shadow(Token *tok)
+// Check if token is a known typedef or looks like a system typedef (e.g., size_t, __rlim_t)
+// Unified check: known typedef OR (not shadowed AND matches system typedef naming pattern)
+static bool is_typedef_like(Token *tok)
 {
   if (!is_identifier_like(tok))
     return false;
   int idx = typedef_get_index(tok->loc, tok->len);
-  if (idx < 0)
+  if (idx >= 0)
+  {
+    TypedefEntry *e = &typedef_table.entries[idx];
+    if (!e->is_shadow && !e->is_enum_const)
+      return true; // Known typedef
+    return false;  // Shadowed or enum constant
+  }
+  // Heuristic: system typedefs not seen during transpilation
+  // Matches *_t (size_t, time_t) and __* (glibc internals) but not __func()
+  if (tok->kind != TK_IDENT)
     return false;
-  return typedef_table.entries[idx].is_shadow;
+  if (tok->len >= 3 && tok->loc[tok->len - 2] == '_' && tok->loc[tok->len - 1] == 't')
+    return true;
+  if (tok->len >= 2 && tok->loc[0] == '_' && tok->loc[1] == '_')
+    return !(tok->next && equal(tok->next, "("));
+  return false;
 }
 
 // Check if token is a known VLA typedef (search most recent first for shadowing)
@@ -1492,92 +1506,50 @@ static bool is_void_function_decl(Token *tok)
   return tok && tok->kind == TK_IDENT && tok->next && equal(tok->next, "(");
 }
 
-// Skip the base type in a typedef (everything before the declarator)
-// Reuses parse_type_specifier() for unified type-skipping logic.
-static Token *scan_typedef_base_type(Token *tok)
-{
-  return parse_type_specifier(tok).end;
-}
-
-// Extract the typedef name from a declarator, advance *tokp past the declarator
-static Token *scan_typedef_name(Token **tokp)
+// Skip a C declarator without emitting, returning the variable name token.
+// Handles: pointers, qualifiers, attributes, parenthesized declarators,
+// array dimensions, and function parameter lists. Advances *tokp past the declarator.
+static Token *skip_declarator(Token **tokp)
 {
   Token *tok = *tokp;
 
-  // Skip pointers and qualifiers
-  while (tok && (equal(tok, "*") || equal(tok, "const") || equal(tok, "volatile") ||
-                 equal(tok, "restrict") || equal(tok, "_Atomic") ||
-                 equal(tok, "__const") || equal(tok, "__const__") ||
-                 equal(tok, "__volatile") || equal(tok, "__volatile__") ||
-                 equal(tok, "__restrict") || equal(tok, "__restrict__")))
+  // Skip pointers, qualifiers, attributes
+  while (tok && (equal(tok, "*") || (tok->tag & TT_QUALIFIER)))
+  {
+    if (tok->tag & TT_ATTR)
+    {
+      tok = tok->next;
+      if (tok && equal(tok, "("))
+        tok = skip_balanced(tok, "(", ")");
+      continue;
+    }
     tok = tok->next;
+  }
 
-  // Skip attributes on pointer
-  tok = skip_gnu_attributes(tok);
-
-  // Case 1: Parenthesized declarator - (*name), (*name[N]), (*name)(args)
+  // Parenthesized declarator: (*name), (*name[N]), (*name)(args)
   if (tok && equal(tok, "("))
   {
     tok = tok->next;
-
-    // Skip inner pointers and qualifiers
-    while (tok && (equal(tok, "*") || equal(tok, "const") || equal(tok, "volatile") ||
-                   equal(tok, "restrict") || equal(tok, "_Atomic")))
+    // Recurse into parenthesized declarator
+    Token *name = skip_declarator(&tok);
+    if (tok && equal(tok, ")"))
       tok = tok->next;
-
-    tok = skip_gnu_attributes(tok);
-
-    if (tok && is_identifier_like(tok))
-    {
-      Token *name = tok;
-      tok = tok->next;
-
-      // Skip array dims inside parens: (*name[N])
-      while (tok && equal(tok, "["))
-        tok = skip_balanced(tok, "[", "]");
-
-      // Skip closing paren
-      if (tok && equal(tok, ")"))
-        tok = tok->next;
-
-      // Skip trailing array dims or function params
-      while (tok && equal(tok, "["))
-        tok = skip_balanced(tok, "[", "]");
-      if (tok && equal(tok, "("))
-        tok = skip_balanced(tok, "(", ")");
-
-      *tokp = tok;
-      return name;
-    }
-
-    // Nested/complex - try to skip to matching ) and continue
-    int depth = 1;
-    while (tok && tok->kind != TK_EOF && depth > 0)
-    {
-      if (equal(tok, "("))
-        depth++;
-      else if (equal(tok, ")"))
-        depth--;
-      tok = tok->next;
-    }
+    // Skip trailing suffixes (array dims, function params)
+    while (tok && (equal(tok, "[") || equal(tok, "(")))
+      tok = skip_balanced(tok, equal(tok, "[") ? "[" : "(", equal(tok, "[") ? "]" : ")");
     *tokp = tok;
-    return NULL; // Couldn't extract - graceful failure
+    return name;
   }
 
-  // Case 2: Direct declarator - name, name[N], name(args)
+  // Direct declarator: name, name[N]
+  // Note: we do NOT skip (args) here — a bare name followed by (args)
+  // is a function declaration, not a variable declarator.
   if (tok && is_identifier_like(tok))
   {
     Token *name = tok;
     tok = tok->next;
-
-    // Skip array dimensions
     while (tok && equal(tok, "["))
       tok = skip_balanced(tok, "[", "]");
-
-    // Skip function params (for func types without outer parens)
-    if (tok && equal(tok, "("))
-      tok = skip_balanced(tok, "(", ")");
-
     *tokp = tok;
     return name;
   }
@@ -1588,7 +1560,6 @@ static Token *scan_typedef_name(Token **tokp)
 
 // Forward declarations
 static bool array_size_is_vla(Token *open_bracket, bool strict_mode);
-static bool looks_like_system_typedef(Token *tok);
 static bool is_const_expr_operator(Token *tok);
 static bool is_const_identifier(Token *tok);
 
@@ -1778,8 +1749,14 @@ static bool scan_for_vla(Token *tok, const char *open, const char *close, bool s
       depth++;
     else if (equal(tok, close))
     {
-      if (open) { depth--; if (depth <= 0) break; }
-      else break;
+      if (open)
+      {
+        depth--;
+        if (depth <= 0)
+          break;
+      }
+      else
+        break;
     }
     else if (!open && (equal(tok, "(") || equal(tok, "{")))
       depth++;
@@ -1802,8 +1779,8 @@ static bool scan_for_vla(Token *tok, const char *open, const char *close, bool s
 static void parse_typedef_declaration(Token *tok, int scope_depth)
 {
   Token *typedef_start = tok;
-  tok = tok->next;                   // Skip 'typedef'
-  tok = scan_typedef_base_type(tok); // Skip the base type
+  tok = tok->next;                     // Skip 'typedef'
+  tok = parse_type_specifier(tok).end; // Skip the base type
 
   // Check if this typedef contains a VLA anywhere
   bool is_vla = typedef_contains_vla(typedef_start);
@@ -1811,7 +1788,7 @@ static void parse_typedef_declaration(Token *tok, int scope_depth)
   // Parse declarator(s) until semicolon
   while (tok && !equal(tok, ";") && tok->kind != TK_EOF)
   {
-    Token *name = scan_typedef_name(&tok);
+    Token *name = skip_declarator(&tok);
     if (name)
       typedef_add(name->loc, name->len, scope_depth, is_vla);
 
@@ -1837,43 +1814,9 @@ static bool is_type_keyword(Token *tok)
 {
   if (tok->kind != TK_KEYWORD && tok->kind != TK_IDENT)
     return false;
-
-  // Tagged type keywords (int, char, struct, etc.) - O(1) bitmask check
   if (tok->tag & TT_TYPE)
     return true;
-
-  // User-defined typedefs (tracked during transpilation)
-  if (is_known_typedef(tok))
-    return true;
-
-  // System typedefs that haven't been parsed (e.g., pthread_mutex_t when headers not flattened)
-  // This is a fallback heuristic for types like *_t, __* prefixed names
-  // BUT only if not explicitly declared as a variable (shadow) by the user
-  if (!is_known_shadow(tok) && looks_like_system_typedef(tok))
-    return true;
-
-  return false;
-}
-
-// Check if an identifier looks like a system/standard typedef name
-// These are commonly used in constant expressions (sizeof, casts)
-static bool looks_like_system_typedef(Token *tok)
-{
-  if (tok->kind != TK_IDENT)
-    return false;
-  // Common pattern: ends with _t (size_t, time_t, rlim_t, etc.)
-  if (tok->len >= 3 && tok->loc[tok->len - 2] == '_' && tok->loc[tok->len - 1] == 't')
-    return true;
-  // Common pattern: starts with __ (glibc internal types like __rlim_t)
-  // But NOT if followed by ( which indicates a function call like __ctype_get_mb_cur_max()
-  if (tok->len >= 2 && tok->loc[0] == '_' && tok->loc[1] == '_')
-  {
-    Token *next = tok->next;
-    if (next && equal(next, "("))
-      return false; // Function call, not a typedef
-    return true;
-  }
-  return false;
+  return is_typedef_like(tok);
 }
 
 // Check if token is a constant expression operator (safe in array dimensions)
@@ -1893,8 +1836,7 @@ static bool is_const_expr_operator(Token *tok)
 // Check if identifier is a compile-time constant (enum, typedef, type keyword, system type)
 static bool is_const_identifier(Token *tok)
 {
-  return is_known_enum_const(tok) || is_known_typedef(tok) ||
-         is_type_keyword(tok) || (!is_known_shadow(tok) && looks_like_system_typedef(tok));
+  return is_known_enum_const(tok) || is_type_keyword(tok);
 }
 
 // Check if token can be used as a variable name in a declarator.
@@ -2068,8 +2010,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
     }
 
     // User-defined typedef or system typedef (pthread_mutex_t, etc.)
-    // Check shadow first to handle "int size_t = 10;" correctly
-    if (is_known_typedef(tok) || (!is_known_shadow(tok) && looks_like_system_typedef(tok)))
+    if (is_typedef_like(tok))
     {
       r.is_typedef = true;
       if (is_vla_typedef(tok))
@@ -2097,7 +2038,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
   }
 
   // Check for "typedef_name varname" pattern (no pointer)
-  if (!r.saw_type && tok->kind == TK_IDENT && (is_known_typedef(tok) || (!is_known_shadow(tok) && looks_like_system_typedef(tok))))
+  if (!r.saw_type && tok->kind == TK_IDENT && is_typedef_like(tok))
   {
     Token *t = tok->next;
     while (t && (t->tag & TT_QUALIFIER))
@@ -2133,71 +2074,22 @@ typedef struct
   bool has_init;    // Has initializer (=)
 } DeclResult;
 
-// Skip __attribute__((...)) and emit it, return position after
-static Token *skip_emit_attribute(Token *tok)
+// Emit a balanced token group: emits 'tok' and all tokens through matching close.
+// Works for (), [], and __attribute__((...)). Returns position after.
+static Token *emit_balanced(Token *tok)
 {
-  emit_tok(tok);
-  tok = tok->next;
-  if (tok && equal(tok, "("))
-  {
-    emit_tok(tok);
-    tok = tok->next;
-    int depth = 1;
-    while (tok && tok->kind != TK_EOF && depth > 0)
-    {
-      if (equal(tok, "("))
-        depth++;
-      else if (equal(tok, ")"))
-        depth--;
-      emit_tok(tok);
-      tok = tok->next;
-    }
-  }
-  return tok;
-}
-
-// Emit array dimension(s) starting at '[', return position after
-static Token *emit_array_dims(Token *tok, bool *is_vla)
-{
-  while (equal(tok, "["))
-  {
-    if (array_size_is_vla(tok, true))
-      *is_vla = true;
-    emit_tok(tok);
-    tok = tok->next;
-    int bracket_depth = 1;
-    while (tok->kind != TK_EOF && bracket_depth > 0)
-    {
-      if (equal(tok, "["))
-        bracket_depth++;
-      else if (equal(tok, "]"))
-        bracket_depth--;
-      if (bracket_depth > 0)
-      {
-        emit_tok(tok);
-        tok = tok->next;
-      }
-    }
-    if (equal(tok, "]"))
-    {
-      emit_tok(tok);
-      tok = tok->next;
-    }
-  }
-  return tok;
-}
-
-// Emit function parameter list starting at '(', return position after
-static Token *emit_func_params(Token *tok)
-{
+  const char *open_s = equal(tok, "(") ? "(" : equal(tok, "[") ? "["
+                                                               : "{";
+  const char *close_s = equal(tok, "(") ? ")" : equal(tok, "[") ? "]"
+                                                                : "}";
   emit_tok(tok);
   tok = tok->next;
   int depth = 1;
-  while (tok->kind != TK_EOF && depth > 0)
+  while (tok && tok->kind != TK_EOF && depth > 0)
   {
-    if (equal(tok, "("))
+    if (equal(tok, open_s))
       depth++;
-    else if (equal(tok, ")"))
+    else if (equal(tok, close_s))
       depth--;
     emit_tok(tok);
     tok = tok->next;
@@ -2205,9 +2097,31 @@ static Token *emit_func_params(Token *tok)
   return tok;
 }
 
+// Emit __attribute__((...)) and return position after
+static Token *emit_attr(Token *tok)
+{
+  emit_tok(tok);
+  tok = tok->next;
+  if (tok && equal(tok, "("))
+    tok = emit_balanced(tok);
+  return tok;
+}
+
+// Emit array dimension(s) starting at '[', check VLA, return position after
+static Token *emit_array_dims(Token *tok, bool *is_vla)
+{
+  while (equal(tok, "["))
+  {
+    if (array_size_is_vla(tok, true))
+      *is_vla = true;
+    tok = emit_balanced(tok);
+  }
+  return tok;
+}
+
 // Parse a single declarator (pointer modifiers, name, array dims, etc.)
 // Emits tokens as it parses. Returns info about the declarator.
-static DeclResult parse_declarator(Token *tok, Token *warn_loc)
+static DeclResult parse_declarator(Token *tok)
 {
   DeclResult r = {tok, NULL, false, false, false, false, false, false};
 
@@ -2218,7 +2132,7 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
       r.is_pointer = true;
     if (tok->tag & TT_ATTR)
     {
-      tok = skip_emit_attribute(tok);
+      tok = emit_attr(tok);
       continue;
     }
     emit_tok(tok);
@@ -2232,9 +2146,6 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
     Token *peek = tok->next;
     if (!equal(peek, "*") && !equal(peek, "("))
     {
-      // Not a pointer declarator pattern
-      fprintf(stderr, "%s:%d: warning: zero-init: parenthesized pattern not recognized\n",
-              tok_file(warn_loc)->name, tok_line_no(warn_loc));
       r.end = NULL;
       return r;
     }
@@ -2254,7 +2165,7 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
         nested_paren++;
       if (tok->tag & TT_ATTR)
       {
-        tok = skip_emit_attribute(tok);
+        tok = emit_attr(tok);
         continue;
       }
       emit_tok(tok);
@@ -2265,8 +2176,6 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
   // Must have identifier
   if (!is_valid_varname(tok))
   {
-    fprintf(stderr, "%s:%d: warning: zero-init: expected identifier in declarator\n",
-            tok_file(warn_loc)->name, tok_line_no(warn_loc));
     r.end = NULL;
     return r;
   }
@@ -2277,9 +2186,7 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
 
   // Skip __attribute__ after variable name
   while (tok->tag & TT_ATTR)
-  {
-    tok = skip_emit_attribute(tok);
-  }
+    tok = emit_attr(tok);
 
   // Array dims inside parens: (*name[N])
   if (r.has_paren && equal(tok, "["))
@@ -2294,7 +2201,7 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
     while (equal(tok, "(") || equal(tok, "["))
     {
       if (equal(tok, "("))
-        tok = emit_func_params(tok);
+        tok = emit_balanced(tok);
       else
       {
         r.is_array = true;
@@ -2303,8 +2210,6 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
     }
     if (!equal(tok, ")"))
     {
-      fprintf(stderr, "%s:%d: warning: zero-init: expected ')' in declarator\n",
-              tok_file(warn_loc)->name, tok_line_no(warn_loc));
       r.end = NULL;
       return r;
     }
@@ -2322,7 +2227,7 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
       return r;
     }
     r.is_func_ptr = true;
-    tok = emit_func_params(tok);
+    tok = emit_balanced(tok);
   }
 
   // Array dimensions outside parens
@@ -2334,123 +2239,50 @@ static DeclResult parse_declarator(Token *tok, Token *warn_loc)
 
   // Skip __attribute__ before initializer or end of declarator
   while (tok->tag & TT_ATTR)
-  {
-    tok = skip_emit_attribute(tok);
-  }
+    tok = emit_attr(tok);
 
   r.has_init = equal(tok, "=");
   r.end = tok;
   return r;
 }
 
-// Result of validating a declaration structure after type parsing
-typedef struct
+// Quick pre-check: is this a variable declaration (not a function decl or stmt expr)?
+// Uses skip_declarator for the heavy lifting, avoiding a separate scan.
+static bool is_var_declaration(Token *type_end)
 {
-  bool valid;        // True if this is a valid variable declaration
-  bool warn_complex; // True if we should warn about unparsed pattern
-} DeclValidation;
-
-// Validate declaration structure and check for statement expressions/function declarations
-// Combines two checks in a single scan for efficiency
-static DeclValidation validate_declaration(Token *type_end, Token *warn_loc)
-{
-  DeclValidation result = {false, false};
   Token *check = type_end;
 
-  // Skip pointer modifiers and qualifiers to find first declarator token
-  while (equal(check, "*") || (check->tag & TT_QUALIFIER))
+  // Use skip_declarator to find the first declarator name
+  Token *name = skip_declarator(&check);
+  if (!name)
+    return false;
+
+  // After the declarator, must see '=', ',', ';', or '__attribute__'
+  // A '(' here without having been in a paren-declarator means function decl
+  while (check && (check->tag & TT_ATTR))
   {
-    if (equal(check, "__attribute__") || equal(check, "__attribute"))
-    {
-      check = check->next;
-      if (check && equal(check, "("))
-        check = skip_balanced(check, "(", ")");
-      continue;
-    }
     check = check->next;
+    if (check && equal(check, "("))
+      check = skip_balanced(check, "(", ")");
   }
+  if (!check)
+    return false;
 
-  // Check for valid declarator start
-  bool has_paren_declarator = equal(check, "(");
-  if (has_paren_declarator)
+  // Statement expression initializer: type name = ({...})
+  // Must NOT be handled by zero-init — the stmt expr may contain defer etc.
+  if (equal(check, "="))
   {
-    // Parenthesized declarator - find identifier inside
-    int depth = 1;
-    Token *inner = check->next;
-    bool found_ident = false;
-    while (inner && inner->kind != TK_EOF && depth > 0)
-    {
-      if (equal(inner, "("))
-        depth++;
-      else if (equal(inner, ")"))
-        depth--;
-      else if (inner->kind == TK_IDENT && !found_ident &&
-               !is_type_keyword(inner) && !is_known_typedef(inner))
-        found_ident = true;
-      inner = inner->next;
-    }
-    if (!found_ident)
-    {
-      result.warn_complex = true;
-      return result;
-    }
-  }
-  else if (check->kind != TK_IDENT)
-  {
-    return result; // Not a declaration
+    Token *after_eq = check->next;
+    if (after_eq && equal(after_eq, "(") && after_eq->next && equal(after_eq->next, "{"))
+      return false;
+    return true;
   }
 
-  // Scan for statement expressions or function declarations
-  Token *scan = type_end;
-  int depth = 0;
-  bool seen_ident = false;
+  if (equal(check, ",") || equal(check, ";"))
+    return true;
 
-  while (scan && scan->kind != TK_EOF)
-  {
-    if (equal(scan, "__attribute__") || equal(scan, "__attribute"))
-    {
-      scan = scan->next;
-      if (scan && equal(scan, "("))
-        scan = skip_balanced(scan, "(", ")");
-      continue;
-    }
-    if (equal(scan, "(") || equal(scan, "[") || equal(scan, "{"))
-    {
-      // Statement expression at top level
-      if (depth == 0 && equal(scan, "(") && scan->next && equal(scan->next, "{"))
-        return result;
-      // Function declaration (identifier followed by paren, no pointer)
-      if (depth == 0 && equal(scan, "(") && seen_ident)
-      {
-        Token *t = type_end;
-        bool has_star = false;
-        while (t && t != scan)
-        {
-          if (equal(t, "*"))
-            has_star = true;
-          if (equal(t, "("))
-            break;
-          t = t->next;
-        }
-        if (!has_star)
-          return result;
-      }
-      depth++;
-    }
-    else if (equal(scan, ")") || equal(scan, "]") || equal(scan, "}"))
-      depth--;
-    else if (depth == 0 && equal(scan, ";"))
-      break;
-    else if (depth == 0 && scan->kind == TK_IDENT)
-      seen_ident = true;
-    scan = scan->next;
-  }
-
-  result.valid = true;
-  if (result.warn_complex)
-    fprintf(stderr, "%s:%d: warning: zero-init: complex pattern not parsed\n",
-            tok_file(warn_loc)->name, tok_line_no(warn_loc));
-  return result;
+  // A '(' here means function declaration (not handled)
+  return false;
 }
 
 // Check if token after 'raw' indicates 'raw' is being used as an identifier, not the keyword
@@ -2501,14 +2333,14 @@ static Token *handle_storage_raw(Token *storage_tok)
 
 // Process all declarators in a declaration and emit with zero-init
 // Returns token after declaration, or NULL on failure
-static Token *process_declarators(Token *tok, TypeSpecResult *type, Token *warn_loc, bool is_raw)
+static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
 {
   Token *typeof_vars[MAX_TYPEOF_VARS_PER_DECL];
   int typeof_var_count = 0;
 
   while (tok && tok->kind != TK_EOF)
   {
-    DeclResult decl = parse_declarator(tok, warn_loc);
+    DeclResult decl = parse_declarator(tok);
     if (!decl.end || !decl.var_name)
       return NULL;
 
@@ -2690,9 +2522,8 @@ static Token *try_zero_init_decl(Token *tok)
   if (type.struct_vla_error_tok)
     error_tok(type.struct_vla_error_tok, "variable length array in struct/union is not supported");
 
-  // Validate declaration structure (combined check)
-  DeclValidation v = validate_declaration(type.end, warn_loc);
-  if (!v.valid)
+  // Validate declaration structure
+  if (!is_var_declaration(type.end))
     return NULL;
 
   // Error if in switch before case label
@@ -2708,7 +2539,7 @@ static Token *try_zero_init_decl(Token *tok)
     emit_range(pragma_start, start);
   emit_range(start, type.end);
 
-  return process_declarators(type.end, &type, warn_loc, is_raw);
+  return process_declarators(type.end, &type, is_raw);
 }
 
 // Emit an expression until semicolon, tracking depth for statement expressions.
@@ -2753,6 +2584,414 @@ static Token *emit_expr_to_semicolon(Token *tok)
     else
       expr_at_stmt_start = false;
   }
+  return tok;
+}
+
+static void report_goto_skips_decl(Token *skipped_decl, Token *label_tok);
+
+// Handle 'defer' keyword: validate context, record deferred statement.
+// Returns next token after the defer statement, or NULL if tok is not a valid defer.
+static Token *handle_defer_keyword(Token *tok)
+{
+  if (!(tok->tag & TT_DEFER) || tok->kind != TK_KEYWORD)
+    return NULL;
+  if (!ctx->feature_defer)
+    return NULL;
+  // Distinguish struct field, label, goto target, variable assignment, attribute usage
+  if (equal(tok->next, ":") ||
+      (last_emitted && (last_emitted->tag & (TT_MEMBER | TT_GOTO))) ||
+      (last_emitted && (is_type_keyword(last_emitted) || (last_emitted->tag & TT_TYPEDEF))) ||
+      is_known_typedef(tok) ||
+      (tok->next && (tok->next->tag & TT_ASSIGN)) ||
+      ctx->struct_depth > 0 ||
+      is_inside_attribute(tok))
+    return NULL;
+
+  // Context validation
+  if (control_state.pending && control_state.paren_depth > 0)
+    error_tok(tok, "defer cannot appear inside control statement parentheses");
+  if (control_state.pending && control_state.paren_depth == 0)
+    error_tok(tok, "defer requires braces in if/while/for/switch statements.\n"
+                   "       Braceless control flow does not create a scope, so defer binds to the parent scope\n"
+                   "       and executes unconditionally. Add braces to create a proper scope:\n"
+                   "       Bad:  if (x) defer cleanup();\n"
+                   "       Good: if (x) { defer cleanup(); }");
+  for (int i = 0; i < ctx->stmt_expr_count; i++)
+  {
+    if (ctx->defer_depth == stmt_expr_levels[i])
+    {
+      error_tok(tok, "defer cannot be used at the top level of statement expressions ({ ... }). "
+                     "The defer would execute after the final expression, changing the return type to void. "
+                     "Wrap the defer in a block: ({ { defer X; ... } result; })");
+      break;
+    }
+  }
+  if (ctx->current_func_has_setjmp)
+    error_tok(tok, "defer cannot be used in functions that call setjmp/longjmp/pthread_exit. "
+                   "These functions bypass defer cleanup entirely, causing resource leaks. "
+                   "Use explicit cleanup patterns (goto cleanup, or manual RAII) instead.");
+  if (ctx->current_func_has_vfork)
+    error_tok(tok, "defer cannot be used in functions that call vfork(). "
+                   "vfork shares address space with parent and has unpredictable control flow. "
+                   "Use fork() instead, or move defer to a wrapper function.");
+  if (ctx->current_func_has_asm)
+    error_tok(tok, "defer cannot be used in functions containing inline assembly. "
+                   "Inline asm may contain jumps (jmp, call, etc.) that bypass defer cleanup. "
+                   "Move the asm to a separate function, or use explicit cleanup instead.");
+  for (int d = ctx->defer_depth - 1; d >= 0; d--)
+  {
+    if (defer_stack[d].is_switch && ctx->defer_depth - 1 == d)
+      error_tok(tok, "defer in switch case requires braces to create a proper scope.\n"
+                     "       Without braces, defer at switch-level has unpredictable behavior:\n"
+                     "       - goto between cases may not execute the defer\n"
+                     "       - Hitting the next case label clears the defer\n"
+                     "       Wrap the case body in braces:\n"
+                     "       Bad:  case X: defer cleanup(); break;\n"
+                     "       Good: case X: { defer cleanup(); } break;");
+  }
+
+  Token *defer_keyword = tok;
+  tok = tok->next;
+  Token *stmt_start = tok;
+  Token *stmt_end = skip_to_semicolon(tok);
+
+  if (stmt_end->kind == TK_EOF || !equal(stmt_end, ";"))
+    error_tok(defer_keyword, "unterminated defer statement; expected ';'");
+
+  // Validate: no bare control-flow keywords, no unbracketed multi-line spans
+  int bd = 0, pd = 0, bkd = 0;
+  for (Token *t = stmt_start; t != stmt_end && t->kind != TK_EOF; t = t->next)
+  {
+    bool at_top = (bd == 0 && pd == 0 && bkd == 0);
+    if (t != stmt_start && tok_at_bol(t) && at_top &&
+        !equal(t, "{") && !equal(t, "(") && !equal(t, "["))
+      error_tok(defer_keyword, "defer statement spans multiple lines without ';' - add semicolon");
+    if (equal(t, "{"))
+      bd++;
+    else if (equal(t, "}"))
+      bd--;
+    else if (equal(t, "("))
+      pd++;
+    else if (equal(t, ")"))
+      pd--;
+    else if (equal(t, "["))
+      bkd++;
+    else if (equal(t, "]"))
+      bkd--;
+    if (at_top && t->kind == TK_KEYWORD &&
+        (t->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO |
+                   TT_IF | TT_LOOP | TT_SWITCH | TT_CASE | TT_DEFAULT | TT_DEFER)))
+      error_tok(defer_keyword, "defer statement appears to be missing ';' (found '%.*s' keyword inside)",
+                t->len, t->loc);
+  }
+
+  defer_add(defer_keyword, stmt_start, stmt_end);
+  tok = (stmt_end->kind != TK_EOF) ? stmt_end->next : stmt_end;
+  end_statement_after_semicolon();
+  return tok;
+}
+
+// Handle 'return' with active defers: save expr, emit defers, then return.
+// Returns next token if handled, or NULL to let normal emit proceed.
+static Token *handle_return_defer(Token *tok)
+{
+  if (!(tok->tag & TT_RETURN))
+    return NULL;
+  mark_switch_control_exit();
+  if (!has_active_defers())
+    return NULL;
+  tok = tok->next; // skip 'return'
+
+  if (equal(tok, ";"))
+  {
+    OUT_LIT(" {");
+    emit_all_defers();
+    OUT_LIT(" return;");
+    tok = tok->next;
+    OUT_LIT(" }");
+  }
+  else
+  {
+    bool is_void_cast = equal(tok, "(") && tok->next && equal(tok->next, "void") &&
+                        tok->next->next && equal(tok->next->next, ")");
+    if (ctx->current_func_returns_void || is_void_cast)
+    {
+      OUT_LIT(" { (");
+      tok = emit_expr_to_semicolon(tok);
+      OUT_LIT(");");
+      emit_all_defers();
+      OUT_LIT(" return;");
+      if (equal(tok, ";"))
+        tok = tok->next;
+      OUT_LIT(" }");
+    }
+    else
+    {
+      unsigned long long my_ret = ctx->ret_counter++;
+      OUT_LIT(" { __auto_type _prism_ret_");
+      out_uint(my_ret);
+      OUT_LIT(" = (");
+      tok = emit_expr_to_semicolon(tok);
+      OUT_LIT(");");
+      emit_all_defers();
+      OUT_LIT(" return _prism_ret_");
+      out_uint(my_ret);
+      out_char(';');
+      if (equal(tok, ";"))
+        tok = tok->next;
+      OUT_LIT(" }");
+    }
+  }
+  end_statement_after_semicolon();
+  return tok;
+}
+
+// Handle 'break' or 'continue' with active defers.
+// Returns next token if handled, or NULL.
+static Token *handle_break_continue_defer(Token *tok)
+{
+  if (!(tok->tag & (TT_BREAK | TT_CONTINUE)))
+    return NULL;
+  bool is_break = tok->tag & TT_BREAK;
+  mark_switch_control_exit();
+  if (!control_flow_has_defers(is_break))
+    return NULL;
+  OUT_LIT(" {");
+  emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
+  out_char(' ');
+  out_str(tok->loc, tok->len);
+  OUT_LIT("; }");
+  tok = tok->next;
+  if (equal(tok, ";"))
+    tok = tok->next;
+  end_statement_after_semicolon();
+  return tok;
+}
+
+// Handle 'goto': defer cleanup + zeroinit safety checks.
+// Returns next token if fully handled, or NULL to let normal emit proceed.
+static Token *handle_goto_keyword(Token *tok)
+{
+  if (!(tok->tag & TT_GOTO))
+    return NULL;
+  Token *goto_tok = tok;
+  tok = tok->next;
+
+  if (ctx->feature_defer)
+  {
+    mark_switch_control_exit();
+
+    // Computed goto
+    if (equal(tok, "*"))
+    {
+      if (has_active_defers())
+        error_tok(goto_tok, "computed goto (goto *) cannot be used with active defer statements. "
+                            "Defer cleanup cannot be guaranteed for runtime-determined jump targets. "
+                            "Restructure code to avoid computed goto or move defer outside this scope.");
+      emit_tok(goto_tok);
+      return tok; // let main loop emit '*' and rest
+    }
+
+    if (is_identifier_like(tok))
+    {
+      Token *skipped = goto_skips_check(goto_tok, tok->loc, tok->len, GOTO_CHECK_DEFER);
+      if (skipped)
+        error_tok(skipped, "goto '%.*s' would skip over this defer statement", tok->len, tok->loc);
+      Token *skipped_decl = goto_skips_check(goto_tok, tok->loc, tok->len, GOTO_CHECK_DECL);
+      if (skipped_decl)
+        report_goto_skips_decl(skipped_decl, tok);
+
+      int target_depth = label_table_lookup(tok->loc, tok->len);
+      if (target_depth < 0)
+        target_depth = ctx->defer_depth;
+
+      if (goto_has_defers(target_depth))
+      {
+        OUT_LIT(" {");
+        emit_goto_defers(target_depth);
+        OUT_LIT(" goto");
+        emit_tok(tok);
+        tok = tok->next;
+        if (equal(tok, ";"))
+        {
+          emit_tok(tok);
+          tok = tok->next;
+        }
+        OUT_LIT(" }");
+        end_statement_after_semicolon();
+        return tok;
+      }
+    }
+    // No defers — emit goto, let main loop handle the rest
+    emit_tok(goto_tok);
+    return tok;
+  }
+
+  // Zeroinit-only goto safety
+  if (ctx->feature_zeroinit && is_identifier_like(tok))
+  {
+    Token *skipped_decl = goto_skips_check(goto_tok, tok->loc, tok->len, GOTO_CHECK_DECL);
+    if (skipped_decl)
+      report_goto_skips_decl(skipped_decl, tok);
+  }
+  emit_tok(goto_tok);
+  return tok;
+}
+
+// Handle case/default labels: check for defer fallthrough, clear switch defers.
+static void handle_case_default(Token *tok)
+{
+  if (!ctx->feature_defer || !inside_switch_scope())
+    return;
+  bool is_case = tok->tag & TT_CASE;
+  bool is_default = (tok->tag & TT_DEFAULT) && ctx->generic_paren_depth == 0;
+  if (is_default)
+  {
+    Token *t = skip_all_attributes(tok->next);
+    if (!t || !equal(t, ":"))
+      return; // Not a switch label
+  }
+  if (!is_case && !is_default)
+    return;
+
+  for (int d = ctx->defer_depth - 1; d >= 0; d--)
+  {
+    if (defer_stack[d].count > 0 && !defer_stack[d].had_control_exit)
+      error_tok(defer_stack[d].defer_tok[0],
+                "defer would be skipped due to switch fallthrough at %s:%d. "
+                "Add 'break;' before the next case, or wrap case body in braces.",
+                tok_file(tok)->name, tok_line_no(tok));
+    if (defer_stack[d].is_switch)
+    {
+      defer_stack[d].seen_case_label = true;
+      break;
+    }
+  }
+  clear_switch_scope_defers();
+}
+
+// Handle struct/union/enum body opening: emit to '{', push scope.
+// Returns next token if handled, or NULL if no body follows.
+static Token *handle_sue_body(Token *tok)
+{
+  if (!(tok->tag & TT_SUE))
+    return NULL;
+  bool is_enum = equal(tok, "enum");
+  Token *t = tok->next;
+  while (t && (t->kind == TK_IDENT || (t->tag & TT_ATTR)))
+  {
+    if (t->tag & TT_ATTR)
+    {
+      t = t->next;
+      if (t && equal(t, "("))
+        t = skip_balanced(t, "(", ")");
+    }
+    else
+      t = t->next;
+  }
+  if (!t || !equal(t, "{"))
+    return NULL;
+
+  if (is_enum)
+    parse_enum_constants(t, ctx->defer_depth);
+  while (tok != t)
+  {
+    emit_tok(tok);
+    tok = tok->next;
+  }
+  emit_tok(tok); // emit '{'
+  tok = tok->next;
+  ctx->struct_depth++;
+  if (ctx->feature_defer)
+  {
+    bool save_loop = ctx->next_scope_is_loop;
+    bool save_switch = ctx->next_scope_is_switch;
+    bool save_conditional = ctx->next_scope_is_conditional;
+    defer_push_scope();
+    if (control_state.pending)
+    {
+      ctx->next_scope_is_loop = save_loop;
+      ctx->next_scope_is_switch = save_switch;
+      ctx->next_scope_is_conditional = save_conditional;
+    }
+  }
+  else
+  {
+    defer_stack_ensure_capacity(ctx->defer_depth + 1);
+    ctx->defer_depth++;
+  }
+  ctx->at_stmt_start = true;
+  return tok;
+}
+
+// Handle '{': push scope, detect statement expressions and compound literals.
+// Returns next token.
+static Token *handle_open_brace(Token *tok)
+{
+  // Compound literal inside control parens
+  if (control_state.pending && control_state.paren_depth > 0)
+  {
+    emit_tok(tok);
+    control_state.brace_depth++;
+    return tok->next;
+  }
+  // Compound literal after condition (before body)
+  if (control_state.pending && control_state.paren_depth == 0 && !control_state.parens_just_closed)
+  {
+    emit_tok(tok);
+    control_state.brace_depth++;
+    return tok->next;
+  }
+  if (control_state.pending && !ctx->next_scope_is_switch)
+    ctx->next_scope_is_conditional = true;
+  control_state_reset();
+
+  // Detect statement expression: ({
+  if (last_emitted && equal(last_emitted, "("))
+  {
+    ENSURE_ARRAY_CAP(stmt_expr_levels, ctx->stmt_expr_count + 1, stmt_expr_capacity, INITIAL_CAP, int);
+    stmt_expr_levels[ctx->stmt_expr_count++] = ctx->defer_depth + 1;
+  }
+  emit_tok(tok);
+  tok = tok->next;
+  if (ctx->feature_defer)
+    defer_push_scope();
+  else
+  {
+    defer_stack_ensure_capacity(ctx->defer_depth + 1);
+    ctx->defer_depth++;
+  }
+  ctx->at_stmt_start = true;
+  return tok;
+}
+
+// Handle '}': emit defers, pop scope, detect stmt-expr exit.
+// Returns next token.
+static Token *handle_close_brace(Token *tok)
+{
+  // Compound literal close inside control parens
+  if (control_state.pending && control_state.paren_depth > 0 && control_state.brace_depth > 0)
+  {
+    control_state.brace_depth--;
+    emit_tok(tok);
+    return tok->next;
+  }
+  if (ctx->struct_depth > 0)
+    ctx->struct_depth--;
+  typedef_pop_scope(ctx->defer_depth);
+  if (ctx->feature_defer)
+  {
+    emit_scope_defers();
+    defer_pop_scope();
+  }
+  else if (ctx->defer_depth > 0)
+    ctx->defer_depth--;
+  emit_tok(tok);
+  tok = tok->next;
+  if (tok && equal(tok, ")") && ctx->stmt_expr_count > 0 &&
+      stmt_expr_levels[ctx->stmt_expr_count - 1] == ctx->defer_depth + 1)
+    ctx->stmt_expr_count--;
+  ctx->at_stmt_start = true;
   return tok;
 }
 
@@ -3003,397 +3242,100 @@ static int transpile(char *input_file, char *output_file)
   // Walk tokens and emit
   while (tok->kind != TK_EOF)
   {
-    // Track typedefs for zero-init (must happen before zero-init check)
-    // Only at statement start and outside struct/union/enum bodies
-    if (ctx->at_stmt_start && ctx->struct_depth == 0 && equal(tok, "typedef"))
-      parse_typedef_declaration(tok, ctx->defer_depth); // Fall through to emit the typedef normally
+    Token *next;
+    uint32_t tag = tok->tag;
 
-    // Try zero-init for declarations at statement start
-    // Also allow in the init clause of a for loop: for (int i; ...)
+    // Track typedefs (must precede zero-init check)
+    if (ctx->at_stmt_start && ctx->struct_depth == 0 && (tag & TT_TYPEDEF))
+      parse_typedef_declaration(tok, ctx->defer_depth);
+
+    // Zero-init declarations at statement start
     if (ctx->at_stmt_start && (!control_state.pending || ctx->in_for_init))
     {
-      // try_zero_init_decl handles 'raw' keyword internally - it only consumes it
-      // if followed by a valid declaration, otherwise treats 'raw' as a variable name
-      Token *next = try_zero_init_decl(tok);
+      next = try_zero_init_decl(tok);
       if (next)
       {
-        // Successfully handled - if there was 'raw', it's been processed
         tok = next;
-        ctx->at_stmt_start = true; // Still at statement start after decl
+        ctx->at_stmt_start = true;
         continue;
       }
-
-      // try_zero_init_decl returned NULL (didn't handle it)
-      // 'raw' is handled inside try_zero_init_decl now - it only consumes it
-      // if followed by a declaration, otherwise treats it as a variable name
     }
     ctx->at_stmt_start = false;
 
-    // Warn about noreturn functions that bypass defer cleanup
-    // These functions terminate the program without running defers - RAII violation
-    // Also mark as control exit for switch fallthrough detection (they don't fall through)
-    if (ctx->feature_defer && (tok->tag & TT_NORETURN_FN) && tok->next && equal(tok->next, "("))
+    // Noreturn function warning
+    if ((tag & TT_NORETURN_FN) && tok->next && equal(tok->next, "("))
     {
-      // Mark as control exit - noreturn functions don't fall through to next case
       mark_switch_control_exit();
-
-      if (has_active_defers())
-      {
+      if (ctx->feature_defer && has_active_defers())
         fprintf(stderr, "%s:%d: warning: '%.*s' called with active defers - deferred statements will NOT run. "
                         "Consider using return with cleanup, or restructure to avoid defer here.\n",
                 tok_file(tok)->name, tok_line_no(tok), tok->len, tok->loc);
-      }
     }
 
-    // Handle 'defer' keyword
-    // Skip if: preceded by member access (. or ->) - that's a struct field, not keyword
-    //          inside struct/union/enum body - that's a field declaration, not keyword
-    //          preceded by a type keyword - that's a variable/typedef name, not keyword
-    //          'defer' is registered as a typedef - that's a type name, not keyword
-    //          followed by assignment operator - that's a variable assignment, not defer statement
-    //          inside __attribute__((...)) - that's a function name, not keyword
-    if (ctx->feature_defer && tok->kind == TK_KEYWORD && equal(tok, "defer") &&
-        !equal(tok->next, ":") &&                         // Distinguish defer statement from label named "defer:"
-        !(last_emitted && equal(last_emitted, "goto")) && // Distinguish from "goto defer;"
-        !(last_emitted && (last_emitted->tag & TT_MEMBER)) && ctx->struct_depth == 0 &&
-        !(last_emitted && (is_type_keyword(last_emitted) || equal(last_emitted, "typedef"))) &&
-        !is_known_typedef(tok) && !(tok->next && (tok->next->tag & TT_ASSIGN)) &&
-        !is_inside_attribute(tok))
+    // ── Keyword dispatch (defer, return, break/continue, goto) ──
+
+    if (tag & TT_DEFER)
     {
-      // Check for defer inside for/while/switch/if parentheses - this is invalid
-      if (control_state.pending && control_state.paren_depth > 0)
-        error_tok(tok, "defer cannot appear inside control statement parentheses");
-
-      // Check for defer in braceless control flow - this causes unexpected behavior
-      // The defer binds to the parent scope instead of the control statement scope,
-      // causing it to execute unconditionally regardless of the condition
-      if (control_state.pending && control_state.paren_depth == 0)
-        error_tok(tok, "defer requires braces in if/while/for/switch statements.\n"
-                       "       Braceless control flow does not create a scope, so defer binds to the parent scope\n"
-                       "       and executes unconditionally. Add braces to create a proper scope:\n"
-                       "       Bad:  if (x) defer cleanup();\n"
-                       "       Good: if (x) { defer cleanup(); }");
-
-      // Check for defer at the top-level of a statement expression - semantics are problematic
-      // In ({ defer X; expr; }), the defer would execute after expr, making the result void
-      // But defer in nested blocks inside stmt expr is OK: ({ { defer X; } expr; })
-      for (int i = 0; i < ctx->stmt_expr_count; i++)
+      next = handle_defer_keyword(tok);
+      if (next)
       {
-        if (ctx->defer_depth == stmt_expr_levels[i])
-        {
-          error_tok(tok, "defer cannot be used at the top level of statement expressions ({ ... }). "
-                         "The defer would execute after the final expression, changing the return type to void. "
-                         "Wrap the defer in a block: ({ { defer X; ... } result; })");
-          break;
-        }
-      }
-
-      // setjmp/longjmp/pthread_exit bypasses defer cleanup - this MUST be an error
-      if (ctx->current_func_has_setjmp)
-      {
-        error_tok(tok, "defer cannot be used in functions that call setjmp/longjmp/pthread_exit. "
-                       "These functions bypass defer cleanup entirely, causing resource leaks. "
-                       "Use explicit cleanup patterns (goto cleanup, or manual RAII) instead.");
-      }
-
-      // vfork has unpredictable control flow that can bypass cleanup
-      if (ctx->current_func_has_vfork)
-      {
-        error_tok(tok, "defer cannot be used in functions that call vfork(). "
-                       "vfork shares address space with parent and has unpredictable control flow. "
-                       "Use fork() instead, or move defer to a wrapper function.");
-      }
-
-      // Inline asm may contain hidden jumps that bypass defer
-      if (ctx->current_func_has_asm)
-      {
-        error_tok(tok, "defer cannot be used in functions containing inline assembly. "
-                       "Inline asm may contain jumps (jmp, call, etc.) that bypass defer cleanup. "
-                       "Move the asm to a separate function, or use explicit cleanup instead.");
-      }
-
-      // Check for defer in switch case without braces
-      // Defer at switch scope level (without braces) has undefined behavior:
-      // - goto between cases doesn't execute the defer (same scope depth)
-      // - Hitting the next case label clears the defer
-      // - Result: resource leaks and unpredictable behavior
-      // Require braces to create a proper scope for the defer
-      for (int d = ctx->defer_depth - 1; d >= 0; d--)
-      {
-        if (defer_stack[d].is_switch && ctx->defer_depth - 1 == d)
-        {
-          error_tok(tok, "defer in switch case requires braces to create a proper scope.\n"
-                         "       Without braces, defer at switch-level has unpredictable behavior:\n"
-                         "       - goto between cases may not execute the defer\n"
-                         "       - Hitting the next case label clears the defer\n"
-                         "       Wrap the case body in braces:\n"
-                         "       Bad:  case X: defer cleanup(); break;\n"
-                         "       Good: case X: { defer cleanup(); } break;");
-        }
-      }
-
-      Token *defer_keyword = tok;
-      tok = tok->next; // skip 'defer'
-
-      // Find the statement (up to semicolon)
-      Token *stmt_start = tok;
-      Token *stmt_end = skip_to_semicolon(tok);
-
-      // Error if semicolon not found (ran to EOF or end of block)
-      if (stmt_end->kind == TK_EOF || !equal(stmt_end, ";"))
-        error_tok(defer_keyword, "unterminated defer statement; expected ';'");
-
-      // Validate defer statement doesn't contain control flow keywords
-      // (which would indicate the semicolon came from a different statement)
-      // Track all grouping depths - content inside (), [], {} is allowed to span lines
-      int brace_depth = 0;
-      int paren_depth = 0;
-      int bracket_depth = 0;
-      for (Token *t = stmt_start; t != stmt_end && t->kind != TK_EOF; t = t->next)
-      {
-        // Check ctx->at_bol BEFORE updating depths, skip for grouping tokens themselves
-        // Allow multi-line when inside any grouping: (), [], {}
-        bool at_top_level = (brace_depth == 0 && paren_depth == 0 && bracket_depth == 0);
-        if (t != stmt_start && tok_at_bol(t) && at_top_level &&
-            !equal(t, "{") && !equal(t, "(") && !equal(t, "["))
-        {
-          error_tok(defer_keyword,
-                    "defer statement spans multiple lines without ';' - add semicolon");
-        }
-        // Update depths
-        if (equal(t, "{"))
-          brace_depth++;
-        else if (equal(t, "}"))
-          brace_depth--;
-        else if (equal(t, "("))
-          paren_depth++;
-        else if (equal(t, ")"))
-          paren_depth--;
-        else if (equal(t, "["))
-          bracket_depth++;
-        else if (equal(t, "]"))
-          bracket_depth--;
-        // Only flag control-flow keywords at top level (not inside compound defer block)
-        if (brace_depth == 0 && paren_depth == 0 && bracket_depth == 0 &&
-            t->kind == TK_KEYWORD &&
-            (equal(t, "return") || equal(t, "break") || equal(t, "continue") ||
-             equal(t, "goto") || equal(t, "if") || equal(t, "else") ||
-             equal(t, "for") || equal(t, "while") || equal(t, "do") ||
-             equal(t, "switch") || equal(t, "case") || equal(t, "default") ||
-             equal(t, "defer")))
-        {
-          error_tok(defer_keyword,
-                    "defer statement appears to be missing ';' (found '%.*s' keyword inside)",
-                    t->len, t->loc);
-        }
-      }
-
-      // Record the defer
-      defer_add(defer_keyword, stmt_start, stmt_end);
-
-      // Skip past the semicolon (don't emit the defer yet)
-      if (stmt_end->kind != TK_EOF)
-        tok = stmt_end->next;
-      else
-        tok = stmt_end;
-      end_statement_after_semicolon();
-
-      continue;
-    }
-
-    // Handle 'return' - evaluate expr, run defers, then return
-    if (ctx->feature_defer && tok->kind == TK_KEYWORD && equal(tok, "return"))
-    {
-      mark_switch_control_exit(); // Mark that we exited via return
-      if (has_active_defers())
-      {
-        tok = tok->next; // skip 'return'
-
-        // Check if there's an expression or just "return;"
-        if (equal(tok, ";"))
-        {
-          // void return: { defers; return; }
-          OUT_LIT(" {");
-          emit_all_defers();
-          OUT_LIT(" return;");
-          tok = tok->next;
-          OUT_LIT(" }");
-        }
-        else
-        {
-          // return with expression
-          // Check if expression is a void cast: (void)expr - treat as void return
-          // This handles typedef void cases like: VoidType func() { return (void)expr; }
-          bool is_void_cast = equal(tok, "(") && tok->next && equal(tok->next, "void") &&
-                              tok->next->next && equal(tok->next->next, ")");
-
-          if (ctx->current_func_returns_void || is_void_cast)
-          {
-            // void function: { (expr); defers; return; }
-            // The expression is executed for side effects, then we return void
-            OUT_LIT(" { (");
-            tok = emit_expr_to_semicolon(tok);
-            OUT_LIT(");");
-            emit_all_defers();
-            OUT_LIT(" return;");
-            if (equal(tok, ";"))
-              tok = tok->next;
-            OUT_LIT(" }");
-          }
-          else
-          {
-            // non-void function: { __auto_type _ret = (expr); defers; return _ret; }
-            // PORTABILITY: __auto_type is a GCC/Clang extension (also supported by TCC).
-            // Standard C alternative would require parsing the return type, which is complex.
-            // Users targeting MSVC or strict C compilers should avoid defer with return values,
-            // or use C23's typeof (once widely supported).
-            unsigned long long my_ret = ctx->ret_counter++;
-            OUT_LIT(" { __auto_type _prism_ret_");
-            out_uint(my_ret);
-            OUT_LIT(" = (");
-
-            tok = emit_expr_to_semicolon(tok);
-
-            OUT_LIT(");");
-            emit_all_defers();
-            OUT_LIT(" return _prism_ret_");
-            out_uint(my_ret);
-            out_char(';');
-
-            if (equal(tok, ";"))
-              tok = tok->next;
-
-            OUT_LIT(" }");
-          }
-        }
-        end_statement_after_semicolon();
+        tok = next;
         continue;
       }
-      // No defers, emit normally
     }
 
-    // Handle 'break' / 'continue' - emit defers up to boundary
-    if (ctx->feature_defer && tok->kind == TK_KEYWORD &&
-        (equal(tok, "break") || equal(tok, "continue")))
+    if (ctx->feature_defer && (tag & TT_RETURN))
     {
-      bool is_break = equal(tok, "break");
-      mark_switch_control_exit();
-      if (control_flow_has_defers(is_break))
+      next = handle_return_defer(tok);
+      if (next)
       {
-        OUT_LIT(" {");
-        emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
-        out_char(' ');
-        out_str(tok->loc, tok->len);
-        OUT_LIT("; }");
-        tok = tok->next;
-        if (equal(tok, ";"))
-          tok = tok->next;
-        end_statement_after_semicolon();
+        tok = next;
         continue;
       }
-      // No defers, emit normally
     }
 
-    // Handle 'goto' - emit defers for scopes being exited
-    if (ctx->feature_defer && tok->kind == TK_KEYWORD && equal(tok, "goto"))
+    if (ctx->feature_defer && (tag & (TT_BREAK | TT_CONTINUE)))
     {
-      mark_switch_control_exit(); // Mark that we exited via goto (like break/return)
-      Token *goto_tok = tok;
-      tok = tok->next; // skip 'goto'
-
-      // Handle computed goto (goto *ptr) - GCC extension
-      if (equal(tok, "*"))
+      next = handle_break_continue_defer(tok);
+      if (next)
       {
-        // Computed goto target is determined at runtime - can't emit defers safely
-        // This MUST be an error because we can't guarantee cleanup runs
-        if (has_active_defers())
-        {
-          error_tok(goto_tok, "computed goto (goto *) cannot be used with active defer statements. "
-                              "Defer cleanup cannot be guaranteed for runtime-determined jump targets. "
-                              "Restructure code to avoid computed goto or move defer outside this scope.");
-        }
-        // No defers active, emit normally
-        emit_tok(goto_tok);
+        tok = next;
         continue;
       }
-
-      // Get the label name - can be an identifier or a keyword used as label
-      if (is_identifier_like(tok))
-      {
-        // Check if this goto would skip over a defer statement
-        Token *skipped = goto_skips_check(goto_tok, tok->loc, tok->len, GOTO_CHECK_DEFER);
-        if (skipped)
-          error_tok(skipped, "goto '%.*s' would skip over this defer statement",
-                    tok->len, tok->loc);
-
-        // Check if this goto would skip over a variable declaration (zero-init safety)
-        Token *skipped_decl = goto_skips_check(goto_tok, tok->loc, tok->len, GOTO_CHECK_DECL);
-        if (skipped_decl)
-          report_goto_skips_decl(skipped_decl, tok);
-
-        int target_depth = label_table_lookup(tok->loc, tok->len);
-        // If label not found, assume same depth (forward reference within scope)
-        if (target_depth < 0)
-          target_depth = ctx->defer_depth;
-
-        if (goto_has_defers(target_depth))
-        {
-          OUT_LIT(" {");
-          emit_goto_defers(target_depth);
-          OUT_LIT(" goto");
-          emit_tok(tok); // label name
-          tok = tok->next;
-          if (equal(tok, ";"))
-          {
-            emit_tok(tok);
-            tok = tok->next;
-          }
-          OUT_LIT(" }");
-          end_statement_after_semicolon();
-          continue;
-        }
-      }
-      // No defers or couldn't parse, emit goto and let normal loop emit the rest
-      emit_tok(goto_tok);
-      // Don't continue - let normal token processing handle the label name
     }
 
-    // Check goto for zeroinit safety even when defer is disabled
-    if (ctx->feature_zeroinit && !ctx->feature_defer && tok->kind == TK_KEYWORD && equal(tok, "goto"))
+    if ((tag & TT_GOTO) && (ctx->feature_defer || ctx->feature_zeroinit))
     {
-      Token *goto_tok = tok;
-      tok = tok->next;
-      // Handle keyword labels like 'defer' used as goto target
-      if (is_identifier_like(tok))
+      next = handle_goto_keyword(tok);
+      if (next)
       {
-        Token *skipped_decl = goto_skips_check(goto_tok, tok->loc, tok->len, GOTO_CHECK_DECL);
-        if (skipped_decl)
-          report_goto_skips_decl(skipped_decl, tok);
+        tok = next;
+        continue;
       }
-      emit_tok(goto_tok);
-      continue;
     }
 
-    // Mark loop keywords so next '{' knows it's a loop scope
-    if (ctx->feature_defer && (tok->tag & TT_LOOP))
+    // ── Control-flow flag setting (loop, switch, if/else) ──
+
+    if (tag & TT_LOOP)
     {
-      ctx->next_scope_is_loop = true;
-      control_state.pending = true;
-      if (equal(tok, "for"))
+      if (ctx->feature_defer)
+      {
+        ctx->next_scope_is_loop = true;
+        control_state.pending = true;
+        if (equal(tok, "for"))
+          ctx->pending_for_paren = true;
+        if (equal(tok, "do"))
+          control_state.parens_just_closed = true;
+      }
+      else if (ctx->feature_zeroinit && equal(tok, "for"))
+      {
+        control_state.pending = true;
         ctx->pending_for_paren = true;
-      if (equal(tok, "do"))
-        control_state.parens_just_closed = true;
-    }
-    // Also track 'for' for zero-init even if defer is disabled
-    else if (ctx->feature_zeroinit && !ctx->feature_defer && equal(tok, "for"))
-    {
-      control_state.pending = true;
-      ctx->pending_for_paren = true;
+      }
     }
 
-    if (tok->kind == TK_KEYWORD && equal(tok, "_Generic") && ctx->generic_paren_depth == 0)
+    if ((tag & TT_GENERIC) && ctx->generic_paren_depth == 0)
     {
-      // Emit the _Generic token and look for the opening paren
       emit_tok(tok);
       last_emitted = tok;
       tok = tok->next;
@@ -3406,320 +3348,105 @@ static int transpile(char *input_file, char *output_file)
       }
       continue;
     }
-    // Track parentheses inside _Generic
     if (ctx->generic_paren_depth > 0)
     {
       if (equal(tok, "("))
         ctx->generic_paren_depth++;
       else if (equal(tok, ")"))
-      {
         ctx->generic_paren_depth--;
-        // When we exit the _Generic entirely, depth goes to 0
-      }
     }
 
-    // Mark switch keyword
-    if (ctx->feature_defer && tok->kind == TK_KEYWORD && equal(tok, "switch"))
+    if (ctx->feature_defer && (tag & TT_SWITCH))
     {
       ctx->next_scope_is_switch = true;
       control_state.pending = true;
     }
 
-    // Mark if/else keywords
-    if (equal(tok, "if") || equal(tok, "else"))
+    if (tag & TT_IF)
     {
       control_state.pending = true;
       if (equal(tok, "else"))
         control_state.parens_just_closed = true;
     }
 
-    // Handle case/default labels - clear defers from switch scope
-    // This prevents defers from leaking across cases (which would cause incorrect behavior
-    // since the transpiler can't know which case is entered at runtime)
-    // IMPORTANT: Only treat "default" as a switch label if NOT inside _Generic(...)
-    // This prevents false positives from _Generic: _Generic(x, int: 1, default: 2)
-    // Also handles edge case: _Generic(v, default: 0) where default is NOT preceded by comma
-    bool is_switch_label = false;
-    if (ctx->feature_defer && tok->kind == TK_KEYWORD)
-    {
-      if (equal(tok, "case"))
-        is_switch_label = true;
-      else if (equal(tok, "default"))
-      {
-        // "default" could be followed by ":" or by attributes then ":"
-        // Example: default __attribute__((unused)): or default [[fallthrough]]:
-        // Skip if we're inside _Generic(...) - detected by ctx->generic_paren_depth > 0
-        if (ctx->generic_paren_depth == 0)
-        {
-          // Look ahead for colon, skipping any attributes
-          Token *t = skip_all_attributes(tok->next);
-          if (t && equal(t, ":"))
-            is_switch_label = true;
-        }
-      }
-    }
+    // Case/default label handling
+    if (tag & (TT_CASE | TT_DEFAULT))
+      handle_case_default(tok);
 
-    if (is_switch_label && inside_switch_scope())
-    {
-      // Check if there are active defers that would be lost (fallthrough scenario)
-      // Must check ALL scopes from current depth down to the switch scope,
-      // because case labels can appear inside nested blocks
-      for (int d = ctx->defer_depth - 1; d >= 0; d--)
-      {
-        // Check for defers at this scope that would be cleared
-        if (defer_stack[d].count > 0 && !defer_stack[d].had_control_exit)
-        {
-          // There are defers that will be cleared - this is a resource leak!
-          // Make it an error to force the user to fix it.
-          error_tok(defer_stack[d].defer_tok[0],
-                    "defer would be skipped due to switch fallthrough at %s:%d. "
-                    "Add 'break;' before the next case, or wrap case body in braces.",
-                    tok_file(tok)->name, tok_line_no(tok));
-        }
+    // ── Scope management ──
 
-        // Mark that we've seen a case label in the switch scope (for zero-init safety)
-        if (defer_stack[d].is_switch)
-        {
-          defer_stack[d].seen_case_label = true;
-          break;
-        }
-      }
-      clear_switch_scope_defers();
-    }
-
-    // Detect function definition and scan for labels
-    // Pattern: identifier '(' ... ')' '{'
-    // Only trigger when previous token at top level was ')' (end of parameter list)
+    // Function definition detection at top level
     if (ctx->feature_defer && equal(tok, "{") && ctx->defer_depth == 0)
     {
-      // Only scan for labels if this looks like a function body (prev token is ')')
-      // This avoids false positives from: int arr[] = {1,2,3}; or compound literals
       if (prev_toplevel_tok && equal(prev_toplevel_tok, ")"))
       {
         scan_labels_in_function(tok);
-        // Set the void return flag from what we detected
         ctx->current_func_returns_void = next_func_returns_void;
       }
       next_func_returns_void = false;
     }
 
-    // Detect void function definitions at top level
-    // This sets next_func_returns_void for when we enter the function body
+    // Void function detection at top level
     if (ctx->defer_depth == 0 && is_void_function_decl(tok))
       next_func_returns_void = true;
 
-    // Track struct/union/enum to avoid zero-init inside them
-    if (tok->tag & TT_SUE)
+    // struct/union/enum body
+    if (tag & TT_SUE)
     {
-      bool is_enum = equal(tok, "enum");
-      // Look ahead to see if this has a body
-      // Must handle: struct name {, struct {, struct __attribute__((...)) name {
-      Token *t = tok->next;
-      // Skip identifiers and __attribute__((...))
-      while (t && (t->kind == TK_IDENT || (t->tag & TT_ATTR)))
+      next = handle_sue_body(tok);
+      if (next)
       {
-        if (t->tag & TT_ATTR)
-        {
-          t = t->next;
-          // Skip (( ... ))
-          if (t && equal(t, "("))
-            t = skip_balanced(t, "(", ")");
-        }
-        else
-        {
-          t = t->next;
-        }
-      }
-      if (t && equal(t, "{"))
-      {
-        // For enums, parse constants to register shadows BEFORE emitting
-        // Enum constants are visible at the enclosing scope (ctx->defer_depth)
-        if (is_enum)
-          parse_enum_constants(t, ctx->defer_depth);
-
-        // Emit tokens up to and including the {
-        while (tok != t)
-        {
-          emit_tok(tok);
-          tok = tok->next;
-        }
-        emit_tok(tok); // emit the {
-        tok = tok->next;
-        ctx->struct_depth++;
-        if (ctx->feature_defer)
-        {
-          // If we're inside control flow (e.g., for loop condition with
-          // anonymous struct compound literal), preserve the loop flag!
-          // struct { int x; } inside for(...) should NOT consume ctx->next_scope_is_loop.
-          bool save_loop = ctx->next_scope_is_loop;
-          bool save_switch = ctx->next_scope_is_switch;
-          bool save_conditional = ctx->next_scope_is_conditional;
-          defer_push_scope();
-          // Restore flags if we're inside control flow
-          if (control_state.pending)
-          {
-            ctx->next_scope_is_loop = save_loop;
-            ctx->next_scope_is_switch = save_switch;
-            ctx->next_scope_is_conditional = save_conditional;
-          }
-        }
-        else
-        {
-          // Still track scope depth for typedef scoping
-          defer_stack_ensure_capacity(ctx->defer_depth + 1);
-          ctx->defer_depth++;
-        }
-        ctx->at_stmt_start = true;
+        tok = next;
         continue;
       }
     }
 
-    // Handle '{' - push scope
+    // Open brace
     if (equal(tok, "{"))
     {
-      // Detect compound literals in control flow expressions.
-
-      // Inside control parens: definitely compound literal
-      if (control_state.pending && control_state.paren_depth > 0)
-      {
-        // This is a compound literal inside control expression - just emit and continue
-        // Do NOT call defer_push_scope() or reset control flow flags
-        emit_tok(tok);
-        tok = tok->next;
-        // Track compound literal brace depth separately
-        control_state.brace_depth++;
-        continue;
-      }
-
-      // Outside control parens but not immediately after they closed: compound literal after condition
-      if (control_state.pending && control_state.paren_depth == 0 && !control_state.parens_just_closed)
-      {
-        // The control parens closed earlier (e.g., for(...) was complete) but then we saw more tokens
-        // before this '{'. This means we're in a compound literal after the condition.
-        emit_tok(tok);
-        tok = tok->next;
-        control_state.brace_depth++;
-        continue;
-      }
-
-      // Track if we're entering a conditional block (if/while/for) for accurate control exit detection
-      // Switch blocks are not conditional in the same sense (we always enter one case)
-      if (control_state.pending && !ctx->next_scope_is_switch)
-        ctx->next_scope_is_conditional = true;
-
-      control_state_reset(); // Proper braces found - reset control flow state
-      // Check if this is a statement expression: ({ ... })
-      // The previous emitted token would be '('
-      if (last_emitted && equal(last_emitted, "("))
-      {
-        // Remember the ctx->defer_depth BEFORE we push the new scope
-        // This will be the scope level of the statement expression
-        // Grow stmt_expr_levels if needed
-        ENSURE_ARRAY_CAP(stmt_expr_levels, ctx->stmt_expr_count + 1, stmt_expr_capacity, INITIAL_CAP, int);
-        stmt_expr_levels[ctx->stmt_expr_count++] = ctx->defer_depth + 1; // +1 because we're about to push
-      }
-      emit_tok(tok);
-      tok = tok->next;
-      if (ctx->feature_defer)
-        defer_push_scope();
-      else
-      {
-        // Still need to track scope depth for typedef scoping even without defer
-        defer_stack_ensure_capacity(ctx->defer_depth + 1);
-        ctx->defer_depth++;
-      }
-      ctx->at_stmt_start = true;
+      tok = handle_open_brace(tok);
       continue;
     }
 
-    // Handle '}' - emit scope defers, then pop
+    // Close brace
     if (equal(tok, "}"))
     {
-      // If we're closing a compound literal inside control parentheses,
-      // just emit the brace and decrement the tracking counter - no defer handling!
-      if (control_state.pending && control_state.paren_depth > 0 && control_state.brace_depth > 0)
-      {
-        control_state.brace_depth--;
-        emit_tok(tok);
-        tok = tok->next;
-        continue;
-      }
-
-      if (ctx->struct_depth > 0)
-        ctx->struct_depth--;
-      typedef_pop_scope(ctx->defer_depth); // Pop typedefs at current scope (before depth changes)
-      if (ctx->feature_defer)
-      {
-        emit_scope_defers();
-        defer_pop_scope();
-      }
-      else
-      {
-        // Still need to track scope depth for typedef scoping even without defer
-        if (ctx->defer_depth > 0)
-          ctx->defer_depth--;
-      }
-      emit_tok(tok);
-      tok = tok->next;
-      // Check if we're exiting a statement expression: ... })
-      // Match if the next token is ')' and we're at a stmt_expr level
-      if (tok && equal(tok, ")") && ctx->stmt_expr_count > 0 &&
-          stmt_expr_levels[ctx->stmt_expr_count - 1] == ctx->defer_depth + 1)
-      {
-        ctx->stmt_expr_count--;
-      }
-      // After closing brace, we're at the start of a new statement
-      // (especially important at file scope for tracking typedefs)
-      ctx->at_stmt_start = true;
+      tok = handle_close_brace(tok);
       continue;
     }
 
-    // Track parentheses during pending control flow (for distinguishing for(;;) from body)
+    // ── Parenthesis and semicolon tracking ──
+
     if (control_state.pending)
     {
       if (equal(tok, "("))
       {
         control_state.paren_depth++;
-        control_state.parens_just_closed = false; // Opening paren, resets the "just closed" state
-        // If we just saw 'for' and this is the opening paren, we're entering the init clause
+        control_state.parens_just_closed = false;
         if (ctx->pending_for_paren)
         {
           ctx->in_for_init = true;
-          ctx->at_stmt_start = true; // Init clause is like start of a statement
+          ctx->at_stmt_start = true;
           ctx->pending_for_paren = false;
         }
       }
       else if (equal(tok, ")"))
       {
         control_state.paren_depth--;
-        // Exiting the for() parens entirely clears init state
         if (control_state.paren_depth == 0)
         {
           ctx->in_for_init = false;
-          control_state.parens_just_closed = true; // Mark that we just exited control parens
+          control_state.parens_just_closed = true;
         }
-        // Note: for inner parens (depth > 0), don't change the flag
       }
-      // Semicolon inside for() parens ends the init clause (first ;) and condition (second ;)
       if (equal(tok, ";") && control_state.paren_depth == 1)
       {
         if (ctx->in_for_init)
-        {
           ctx->in_for_init = false;
-          // After init clause semicolon, we're at start of condition
-          // (not a declaration context, so don't set ctx->at_stmt_start)
-        }
       }
-      // Semicolon at depth 0 ends a braceless statement body
       else if (equal(tok, ";") && control_state.paren_depth == 0)
       {
-        // Pop any phantom scopes registered at ctx->defer_depth + 1
-        // For braceless loop bodies like: for (int T = 0; T < 5; T++);
-        // The loop variable T would be registered as shadow at ctx->defer_depth + 1
-        // but we never actually enter/exit that scope with braces.
-        // Without this cleanup, the shadow persists and corrupts typedef lookups.
         typedef_pop_scope(ctx->defer_depth + 1);
-
         control_state.pending = false;
         ctx->next_scope_is_loop = false;
         ctx->next_scope_is_switch = false;
@@ -3729,37 +3456,26 @@ static int transpile(char *input_file, char *output_file)
       }
     }
 
-    // Track statement boundaries for zero-init
     if (equal(tok, ";") && !control_state.pending)
       ctx->at_stmt_start = true;
 
-    // Preprocessor directives don't consume statement-start position
-    // This is important for _Pragma which expands to #pragma before declarations
+    // Preprocessor directives
     if (tok->kind == TK_PREP_DIR)
     {
       emit_tok(tok);
       tok = tok->next;
-      ctx->at_stmt_start = true; // Next token is still at statement start
+      ctx->at_stmt_start = true;
       continue;
     }
 
-    // Reset void function detection at top-level semicolons
-    // This prevents function declarations like "void foo(void);" from affecting
-    // subsequent function definitions
+    // Reset void detection at top-level semicolons
     if (equal(tok, ";") && ctx->defer_depth == 0)
       next_func_returns_void = false;
 
-    // Handle user-defined labels (label:) - statement after label is at statement start
-    // This ensures declarations after labels get zero-initialized
-    // Must distinguish from: ternary (?:), bitfield (int x:5), case/default (handled above)
+    // Label detection (label:)
     if (equal(tok, ":") && last_emitted && last_emitted->kind == TK_IDENT &&
         ctx->struct_depth == 0 && ctx->defer_depth > 0)
     {
-      // Check if previous identifier was part of a ternary by looking back further
-      // In ternary, there would be a '?' before the identifier
-      // We can't easily look back multiple tokens, so we rely on a different check:
-      // If we're at a label, the identifier is at statement start position
-      // This is an approximation - case/default are already handled above
       emit_tok(tok);
       tok = tok->next;
       ctx->at_stmt_start = true;
@@ -4182,7 +3898,13 @@ use_sudo:;
 // CLI
 // ─────────────────────────────────────────────────────────────────────────────
 
-typedef enum { CLI_DEFAULT, CLI_RUN, CLI_EMIT, CLI_INSTALL } CliMode;
+typedef enum
+{
+  CLI_DEFAULT,
+  CLI_RUN,
+  CLI_EMIT,
+  CLI_INSTALL
+} CliMode;
 
 typedef struct
 {
@@ -4263,18 +3985,18 @@ static const char *get_real_cc(const char *cc)
   return cc;
 }
 
-#define CLI_PUSH(arr, cnt, cap, item)                                    \
-  do                                                                     \
-  {                                                                      \
-    if ((cnt) >= (cap))                                                   \
-    {                                                                    \
-      int nc = (cap) ? (cap) * 2 : 16;                                   \
-      (arr) = realloc((arr), sizeof(*(arr)) * nc);                       \
-      if (!(arr))                                                        \
-        die("Out of memory");                                            \
-      (cap) = nc;                                                        \
-    }                                                                    \
-    (arr)[(cnt)++] = (item);                                             \
+#define CLI_PUSH(arr, cnt, cap, item)              \
+  do                                               \
+  {                                                \
+    if ((cnt) >= (cap))                            \
+    {                                              \
+      int nc = (cap) ? (cap) * 2 : 16;             \
+      (arr) = realloc((arr), sizeof(*(arr)) * nc); \
+      if (!(arr))                                  \
+        die("Out of memory");                      \
+      (cap) = nc;                                  \
+    }                                              \
+    (arr)[(cnt)++] = (item);                       \
   } while (0)
 
 static inline bool has_ext(const char *f, const char *ext)
