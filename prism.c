@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.103.0"
+#define PRISM_VERSION "0.104.0"
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -519,41 +519,22 @@ static void mark_switch_control_exit(void)
   }
 }
 
-// Check if we're currently inside a switch scope
-static bool inside_switch_scope(void)
+// Find innermost switch scope index, or -1 if not in a switch
+static int find_switch_scope(void)
 {
   for (int d = ctx->defer_depth - 1; d >= 0; d--)
-  {
-    if (defer_stack[d].is_switch)
-      return true;
-  }
-  return false;
+    if (defer_stack[d].is_switch) return d;
+  return -1;
 }
+#define inside_switch_scope() (find_switch_scope() >= 0)
 
-// Clear defers at innermost switch scope when hitting case/default
-// This is necessary because the transpiler can't track which case was entered at runtime.
-// Note: This means defer in case with fallthrough will NOT preserve defers from previous cases.
-// For reliable defer behavior in switch, wrap each case body in braces.
-// Must clear defers at ALL scopes from current depth down to the switch scope,
-// because case labels can appear inside nested blocks (e.g., Duff's device pattern).
+// Clear defers from current depth down to the innermost switch scope.
+// Case labels can appear inside nested blocks (Duff's device), so we clear all levels.
 static void clear_switch_scope_defers(void)
 {
-  // First find the switch scope to avoid clearing non-switch scopes
-  // if case/default somehow appears outside a switch (malformed input)
-  int switch_depth = -1;
-  for (int d = ctx->defer_depth - 1; d >= 0; d--)
-  {
-    if (defer_stack[d].is_switch)
-    {
-      switch_depth = d;
-      break;
-    }
-  }
-  if (switch_depth < 0)
-    return; // Not inside a switch — don't clear anything
-
-  // Clear all scopes from current depth down to and including the switch scope
-  for (int d = ctx->defer_depth - 1; d >= switch_depth; d--)
+  int sd = find_switch_scope();
+  if (sd < 0) return;
+  for (int d = ctx->defer_depth - 1; d >= sd; d--)
   {
     defer_stack[d].count = 0;
     defer_stack[d].had_control_exit = false;
@@ -563,82 +544,32 @@ static void clear_switch_scope_defers(void)
 // Check if a space is needed between two tokens
 static bool needs_space(Token *prev, Token *tok)
 {
-  if (!prev)
-    return false;
-  if (tok_at_bol(tok))
-    return false;
-  if (tok_has_space(tok))
-    return true;
-
-  // Identifier/keyword/number adjacency
+  if (!prev || tok_at_bol(tok)) return false;
+  if (tok_has_space(tok)) return true;
   if ((is_identifier_like(prev) || prev->kind == TK_NUM) &&
       (is_identifier_like(tok) || tok->kind == TK_NUM))
     return true;
-
-  if (prev->kind != TK_PUNCT || tok->kind != TK_PUNCT)
-    return false;
-
-  // Lookup in pairs table
-  char a = prev->loc[prev->len - 1], b = tok->loc[0];
-  static const uint16_t pairs[] = {
-      '+' + ('+' << 8),
-      '-' + ('-' << 8),
-      '<' + ('<' << 8),
-      '>' + ('>'
-             << 8),
-      '&' + ('&' << 8),
-      '|' + ('|' << 8),
-      '=' + ('=' << 8),
-      '!' + ('=' << 8),
-      '<' + ('=' << 8),
-      '>' + ('=' << 8),
-      '+' + ('=' << 8),
-      '-' + ('=' << 8),
-      '*' + ('=' << 8),
-      '/' + ('=' << 8),
-      '-' + ('>'
-             << 8),
-      '#' + ('#' << 8),
-      '/' + ('*' << 8),
-      '*' + ('/' << 8),
-  };
-  uint16_t key = (uint8_t)a | ((uint8_t)b << 8);
-  for (int i = 0; i < (int)(sizeof(pairs) / sizeof(*pairs)); i++)
-    if (pairs[i] == key)
-      return true;
-  return false;
+  if (prev->kind != TK_PUNCT || tok->kind != TK_PUNCT) return false;
+  // Two adjacent punctuators that would merge into a different token
+  uint8_t a = (uint8_t)prev->loc[prev->len - 1], b = (uint8_t)tok->loc[0];
+  // 'b' is always '=' or matches 'a' (++ -- << >> && || == ## /* */), plus -> 
+  if (b == '=') return a == '=' || a == '!' || a == '<' || a == '>' ||
+                       a == '+' || a == '-' || a == '*' || a == '/';
+  return (a == b && (a == '+' || a == '-' || a == '<' || a == '>' ||
+                     a == '&' || a == '|' || a == '#')) ||
+         (a == '-' && b == '>') || (a == '/' && b == '*') || (a == '*' && b == '/');
 }
 
-// Check if 'tok' is inside a __attribute__((...)) or __declspec(...) context.
-// This prevents 'defer' from being recognized as a keyword when it appears
-// as a function name inside cleanup() or similar attributes.
-// Uses forward-looking heuristic: if we see unbalanced ')' before ';' or '{',
-// we're likely inside a parenthesized context (attribute argument list).
+// Check if 'tok' is inside a parenthesized context (e.g., __attribute__((cleanup(defer)))).
+// Prevents 'defer' from being treated as a keyword when used as an identifier in attributes.
 static bool is_inside_attribute(Token *tok)
 {
-  if (!last_emitted)
+  if (!last_emitted || (!equal(last_emitted, "(") && !equal(last_emitted, ",")))
     return false;
-
-  // Quick check: defer in cleanup(defer) would follow '(' or ','
-  if (!equal(last_emitted, "(") && !equal(last_emitted, ","))
-    return false;
-
-  // Forward check: from tok, count parens until we hit ';' or EOF
-  // If we see unbalanced ')' first, we're inside some paren context
-  int paren_depth = 0;
-  for (Token *t = tok; t && t->kind != TK_EOF; t = t->next)
-  {
-    if (equal(t, "("))
-      paren_depth++;
-    else if (equal(t, ")"))
-    {
-      if (--paren_depth < 0)
-        return true; // Unmatched ')' - inside attribute parens
-    }
-    else if (equal(t, ";") || equal(t, "{"))
-      break;
-  }
-
+  int depth = 0;
+  for (Token *t = tok; t && t->kind != TK_EOF && !equal(t, ";") && !equal(t, "{"); t = t->next)
+    if (equal(t, "(")) depth++;
+    else if (equal(t, ")") && --depth < 0) return true;
   return false;
 }
 
@@ -652,54 +583,36 @@ static void emit_tok(Token *tok)
     return;
 
   // Check if we need a #line directive BEFORE emitting the token
-  bool need_line_directive = false;
+  bool need_line = false;
   char *tok_fname = NULL;
   int line_no = tok_line_no(tok);
 
-  // Skip line directive handling for synthetic tokens (line_no == -1)
   if (ctx->emit_line_directives && f && line_no > 0)
   {
     tok_fname = f->display_name ? f->display_name : f->name;
-    bool file_changed = (ctx->last_filename != tok_fname &&
-                         (!ctx->last_filename || !tok_fname || strcmp(ctx->last_filename, tok_fname) != 0));
-    bool system_changed = (f->is_system != ctx->last_system_header);
-    bool line_jumped = (line_no != ctx->last_line_no && line_no != ctx->last_line_no + 1);
-    need_line_directive = file_changed || line_jumped || system_changed;
+    need_line = (ctx->last_filename != tok_fname &&
+                 (!ctx->last_filename || !tok_fname || strcmp(ctx->last_filename, tok_fname) != 0)) ||
+                (f->is_system != ctx->last_system_header) ||
+                (line_no != ctx->last_line_no && line_no != ctx->last_line_no + 1);
   }
 
-  // Handle newlines and spacing
+  // Spacing: BOL gets newline, otherwise check for #line or token-merge space
   if (tok_at_bol(tok))
-  {
     out_char('\n');
-    // Emit #line directive on new line if needed
-    if (need_line_directive)
-    {
-      out_line(line_no, tok_fname ? tok_fname : "unknown");
-      ctx->last_line_no = line_no;
-      ctx->last_filename = tok_fname;
-      ctx->last_system_header = f->is_system;
-    }
-    else if (ctx->emit_line_directives && f && line_no > 0 && line_no > ctx->last_line_no)
-    {
-      ctx->last_line_no = line_no;
-    }
-  }
-  else
+  else if (need_line)
+    out_char('\n');
+  else if (needs_space(last_emitted, tok))
+    out_char(' ');
+
+  if (need_line)
   {
-    // Not at beginning of line - emit #line before token if file/line changed significantly
-    if (need_line_directive)
-    {
-      out_char('\n');
-      out_line(line_no, tok_fname ? tok_fname : "unknown");
-      ctx->last_line_no = line_no;
-      ctx->last_filename = tok_fname;
-      ctx->last_system_header = f->is_system;
-    }
-    else if (needs_space(last_emitted, tok))
-    {
-      out_char(' ');
-    }
+    out_line(line_no, tok_fname ? tok_fname : "unknown");
+    ctx->last_line_no = line_no;
+    ctx->last_filename = tok_fname;
+    ctx->last_system_header = f->is_system;
   }
+  else if (ctx->emit_line_directives && f && line_no > 0 && line_no > ctx->last_line_no)
+    ctx->last_line_no = line_no;
 
   // Handle preprocessor directives (e.g., #pragma) - emit verbatim
   if (tok->kind == TK_PREP_DIR)
@@ -1716,27 +1629,6 @@ static TypeSpecResult parse_type_specifier(Token *tok)
     r.end = tok;
   }
 
-  // Check for "typedef_name varname" pattern (no pointer)
-  if (!r.saw_type && tok->kind == TK_IDENT && is_typedef_like(tok))
-  {
-    Token *t = tok->next;
-    while (t && (t->tag & TT_QUALIFIER))
-      t = t->next;
-    if (t && t->kind == TK_IDENT && !equal(tok->next, "*"))
-    {
-      Token *after = t->next;
-      if (after && (equal(after, ";") || equal(after, "[") ||
-                    equal(after, ",") || equal(after, "=")))
-      {
-        r.saw_type = true;
-        r.is_typedef = true;
-        if (is_vla_typedef(tok))
-          r.is_vla = true;
-        r.end = tok->next;
-      }
-    }
-  }
-
   return r;
 }
 
@@ -1953,17 +1845,6 @@ static bool is_raw_declaration_context(Token *after_raw)
 }
 
 // Emit tokens from start through semicolon
-static Token *emit_to_semicolon(Token *start)
-{
-  Token *end = start;
-  while (end && !equal(end, ";") && end->kind != TK_EOF)
-    end = end->next;
-  if (equal(end, ";"))
-    end = end->next;
-  emit_range(start, end);
-  return end;
-}
-
 // Handle 'raw' after storage class: "static raw int x;"
 static Token *handle_storage_raw(Token *storage_tok)
 {
@@ -1984,7 +1865,12 @@ static Token *handle_storage_raw(Token *storage_tok)
     emit_tok(t);
     t = t->next;
   }
-  return emit_to_semicolon(p->next); // Skip 'raw', emit rest
+  // Skip 'raw', emit rest through semicolon
+  Token *t2 = p->next;
+  while (t2 && !equal(t2, ";") && t2->kind != TK_EOF) t2 = t2->next;
+  if (equal(t2, ";")) t2 = t2->next;
+  emit_range(p->next, t2);
+  return t2;
 }
 
 // Process all declarators in a declaration and emit with zero-init
@@ -2160,7 +2046,13 @@ static Token *try_zero_init_decl(Token *tok)
   if (tok->tag & TT_SKIP_DECL)
   {
     if (is_raw)
-      return emit_to_semicolon(start);
+    {
+      Token *e = start;
+      while (e && !equal(e, ";") && e->kind != TK_EOF) e = e->next;
+      if (equal(e, ";")) e = e->next;
+      emit_range(start, e);
+      return e;
+    }
     if (equal(tok, "static") || equal(tok, "extern") || equal(tok, "typedef"))
     {
       Token *result = handle_storage_raw(tok);
