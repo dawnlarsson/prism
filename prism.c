@@ -174,6 +174,26 @@ static Token *skip_gnu_attributes(Token *tok)
   return tok;
 }
 
+// Skip a single C23 [[ ... ]] attribute. Assumes tok is at first '['.
+static Token *skip_c23_attr(Token *tok)
+{
+  tok = tok->next->next; // skip [[
+  int depth = 1;
+  while (tok && tok->kind != TK_EOF && depth > 0)
+  {
+    if (equal(tok, "["))
+      depth++;
+    else if (equal(tok, "]"))
+      depth--;
+    tok = tok->next;
+  }
+  if (tok && equal(tok, "]"))
+    tok = tok->next;
+  return tok;
+}
+
+#define is_c23_attr(t) ((t) && equal(t, "[") && (t)->next && equal((t)->next, "["))
+
 // Skip all attributes (GNU-style and C23-style [[...]])
 static Token *skip_all_attributes(Token *tok)
 {
@@ -184,8 +204,9 @@ static Token *skip_all_attributes(Token *tok)
       tok = skip_gnu_attributes(tok);
       continue;
     }
-    if (equal(tok, "[") && tok->next && equal(tok->next, "["))
+    if (is_c23_attr(tok))
     {
+      // Skip [[ ... ]] but NOT the trailing ] (original behavior)
       tok = tok->next->next;
       int depth = 1;
       while (tok && tok->kind != TK_EOF && depth > 0)
@@ -275,6 +296,16 @@ static ControlFlowState control_state = {0};
 static inline void control_state_reset(void)
 {
   control_state = (ControlFlowState){0};
+}
+
+static inline void control_flow_reset(void)
+{
+  control_state_reset();
+  ctx->next_scope_is_loop = false;
+  ctx->next_scope_is_switch = false;
+  ctx->next_scope_is_conditional = false;
+  ctx->in_for_init = false;
+  ctx->pending_for_paren = false;
 }
 
 static LabelTable label_table;
@@ -392,40 +423,25 @@ static HashMap system_includes;    // Tracks unique system headers to emit
 static char **system_include_list; // Ordered list of includes
 static int system_include_capacity = 0;
 
-// Record a system header for later emission
-static void record_system_include(const char *path)
-{
-  if (!path)
-    return;
-  char *inc = strdup(path);
-  if (!inc)
-    return;
-
-  // Check if already recorded (using hashmap for O(1) lookup)
-  if (hashmap_get(&system_includes, inc, strlen(inc)))
-  {
-    free(inc);
-    return;
-  }
-
-  // Add to hashmap
-  hashmap_put(&system_includes, inc, strlen(inc), (void *)1);
-
-  // Add to ordered list
-  ENSURE_ARRAY_CAP(system_include_list, ctx->system_include_count + 1, system_include_capacity, 32, char *);
-  system_include_list[ctx->system_include_count++] = inc;
-}
-
 // Collect system headers by detecting actual #include entries (not macro expansions)
 static void collect_system_includes(void)
 {
   for (int i = 0; i < ctx->input_file_count; i++)
   {
     File *f = ctx->input_files[i];
-    // Only record headers that were actually #included (is_include_entry=true)
-    // Skip macro expansion sources (is_include_entry=false)
-    if (f->is_system && f->is_include_entry)
-      record_system_include(f->name);
+    if (!f->is_system || !f->is_include_entry || !f->name)
+      continue;
+    char *inc = strdup(f->name);
+    if (!inc)
+      continue;
+    if (hashmap_get(&system_includes, inc, strlen(inc)))
+    {
+      free(inc);
+      continue;
+    }
+    hashmap_put(&system_includes, inc, strlen(inc), (void *)1);
+    ENSURE_ARRAY_CAP(system_include_list, ctx->system_include_count + 1, system_include_capacity, 32, char *);
+    system_include_list[ctx->system_include_count++] = inc;
   }
 }
 
@@ -506,49 +522,47 @@ static void end_statement_after_semicolon(void)
     // defer_depth + 1 but never get a matching '}' pop. Without this, the shadow
     // persists and corrupts subsequent typedef lookups (ghost shadow bug).
     typedef_pop_scope(ctx->defer_depth + 1);
-
-    control_state.pending = false;
-    ctx->next_scope_is_loop = false;
-    ctx->next_scope_is_switch = false;
-    ctx->next_scope_is_conditional = false;
-    ctx->pending_for_paren = false;
+    control_flow_reset();
   }
 }
 
-// Ensure defer_stack has capacity for at least n scopes
-static void defer_stack_ensure_capacity(int n)
+static void defer_push_scope(bool consume_flags)
 {
-  if (n <= defer_stack_capacity)
-    return;
-  int new_cap = defer_stack_capacity == 0 ? INITIAL_CAP : defer_stack_capacity * 2;
-  while (new_cap < n)
-    new_cap *= 2;
-  DeferScope *new_stack = realloc(defer_stack, sizeof(DeferScope) * new_cap);
-  if (!new_stack)
-    error("out of memory growing defer stack");
-  // Initialize new scopes
-  for (int i = defer_stack_capacity; i < new_cap; i++)
-    new_stack[i] = (DeferScope){0};
-  defer_stack = new_stack;
-  defer_stack_capacity = new_cap;
-}
-
-static void defer_push_scope(void)
-{
-  defer_stack_ensure_capacity(ctx->defer_depth + 1);
-  defer_stack[ctx->defer_depth].count = 0;
-  defer_stack[ctx->defer_depth].is_loop = ctx->next_scope_is_loop;
-  defer_stack[ctx->defer_depth].is_switch = ctx->next_scope_is_switch;
-  defer_stack[ctx->defer_depth].is_conditional = ctx->next_scope_is_conditional;
-  defer_stack[ctx->defer_depth].had_control_exit = false;
-  defer_stack[ctx->defer_depth].seen_case_label = false;
-
-  if (ctx->next_scope_is_conditional)
-    ctx->conditional_block_depth++;
-
-  ctx->next_scope_is_loop = false;
-  ctx->next_scope_is_switch = false;
-  ctx->next_scope_is_conditional = false;
+  int n = ctx->defer_depth + 1;
+  if (n > defer_stack_capacity)
+  {
+    int new_cap = defer_stack_capacity == 0 ? INITIAL_CAP : defer_stack_capacity * 2;
+    while (new_cap < n)
+      new_cap *= 2;
+    DeferScope *new_stack = realloc(defer_stack, sizeof(DeferScope) * new_cap);
+    if (!new_stack)
+      error("out of memory growing defer stack");
+    for (int i = defer_stack_capacity; i < new_cap; i++)
+      new_stack[i] = (DeferScope){0};
+    defer_stack = new_stack;
+    defer_stack_capacity = new_cap;
+  }
+  DeferScope *s = &defer_stack[ctx->defer_depth];
+  s->count = 0;
+  s->had_control_exit = false;
+  s->seen_case_label = false;
+  if (consume_flags)
+  {
+    s->is_loop = ctx->next_scope_is_loop;
+    s->is_switch = ctx->next_scope_is_switch;
+    s->is_conditional = ctx->next_scope_is_conditional;
+    if (ctx->next_scope_is_conditional)
+      ctx->conditional_block_depth++;
+    ctx->next_scope_is_loop = false;
+    ctx->next_scope_is_switch = false;
+    ctx->next_scope_is_conditional = false;
+  }
+  else
+  {
+    s->is_loop = false;
+    s->is_switch = false;
+    s->is_conditional = false;
+  }
   ctx->defer_depth++;
 }
 
@@ -562,28 +576,23 @@ static void defer_pop_scope(void)
   }
 }
 
-// Ensure a DeferScope has capacity for at least n defers
-static void defer_scope_ensure_capacity(DeferScope *scope, int n)
-{
-  if (n <= scope->capacity)
-    return;
-  int new_cap = scope->capacity == 0 ? INITIAL_CAP : scope->capacity * 2;
-  while (new_cap < n)
-    new_cap *= 2;
-  scope->entries = realloc(scope->entries, sizeof(DeferEntry) * new_cap);
-  if (!scope->entries)
-    error("out of memory");
-  scope->capacity = new_cap;
-}
-
 static void defer_add(Token *defer_keyword, Token *start, Token *end)
 {
   if (ctx->defer_depth <= 0)
     error_tok(start, "defer outside of any scope");
   DeferScope *scope = &defer_stack[ctx->defer_depth - 1];
-  defer_scope_ensure_capacity(scope, scope->count + 1);
+  int n = scope->count + 1;
+  if (n > scope->capacity)
+  {
+    int new_cap = scope->capacity == 0 ? INITIAL_CAP : scope->capacity * 2;
+    while (new_cap < n)
+      new_cap *= 2;
+    scope->entries = realloc(scope->entries, sizeof(DeferEntry) * new_cap);
+    if (!scope->entries)
+      error("out of memory");
+    scope->capacity = new_cap;
+  }
   scope->entries[scope->count++] = (DeferEntry){start, end, defer_keyword};
-  // Reset control exit flag - new defer means we need a new control exit
   scope->had_control_exit = false;
 }
 
@@ -877,10 +886,7 @@ static void emit_defers_ex(DeferEmitMode mode, int stop_depth)
 }
 
 #define emit_defers(mode) emit_defers_ex(mode, 0)
-#define emit_scope_defers() emit_defers(DEFER_SCOPE)
 #define emit_all_defers() emit_defers(DEFER_ALL)
-#define emit_break_defers() emit_defers(DEFER_BREAK)
-#define emit_continue_defers() emit_defers(DEFER_CONTINUE)
 #define emit_goto_defers(depth) emit_defers_ex(DEFER_TO_DEPTH, depth)
 
 // Check if defers exist in scopes from current depth down to stop_depth (or boundary).
@@ -1278,9 +1284,6 @@ static void scan_labels_in_function(Token *tok)
   }
 }
 
-// Note: emit_goto_defers() and goto_has_defers() are now macros
-// defined via the unified emit_defers_ex/has_defers_for functions above.
-
 // Result of goto skip analysis — both defer and decl checked in a single walk
 typedef struct
 {
@@ -1503,57 +1506,21 @@ static bool is_void_function_decl(Token *tok)
   return tok && tok->kind == TK_IDENT && tok->next && equal(tok->next, "(");
 }
 
-// Skip a C declarator without emitting, returning the variable name token.
-// Handles: pointers, qualifiers, attributes, parenthesized declarators,
-// array dimensions, and function parameter lists. Advances *tokp past the declarator.
-static Token *skip_declarator(Token **tokp)
+// Declarator parsing result
+typedef struct
 {
-  Token *tok = *tokp;
+  Token *end;       // First token after declarator
+  Token *var_name;  // The variable name token
+  bool is_pointer;  // Has pointer modifier
+  bool is_array;    // Is array type
+  bool is_vla;      // Has variable-length array dimension
+  bool is_func_ptr; // Is function pointer
+  bool has_paren;   // Has parenthesized declarator
+  bool has_init;    // Has initializer (=)
+} DeclResult;
 
-  // Skip pointers, qualifiers, attributes
-  while (tok && (equal(tok, "*") || (tok->tag & TT_QUALIFIER)))
-  {
-    if (tok->tag & TT_ATTR)
-    {
-      tok = tok->next;
-      if (tok && equal(tok, "("))
-        tok = skip_balanced(tok, "(", ")");
-      continue;
-    }
-    tok = tok->next;
-  }
-
-  // Parenthesized declarator: (*name), (*name[N]), (*name)(args)
-  if (tok && equal(tok, "("))
-  {
-    tok = tok->next;
-    // Recurse into parenthesized declarator
-    Token *name = skip_declarator(&tok);
-    if (tok && equal(tok, ")"))
-      tok = tok->next;
-    // Skip trailing suffixes (array dims, function params)
-    while (tok && (equal(tok, "[") || equal(tok, "(")))
-      tok = skip_balanced(tok, equal(tok, "[") ? "[" : "(", equal(tok, "[") ? "]" : ")");
-    *tokp = tok;
-    return name;
-  }
-
-  // Direct declarator: name, name[N]
-  // Note: we do NOT skip (args) here — a bare name followed by (args)
-  // is a function declaration, not a variable declarator.
-  if (tok && is_identifier_like(tok))
-  {
-    Token *name = tok;
-    tok = tok->next;
-    while (tok && equal(tok, "["))
-      tok = skip_balanced(tok, "[", "]");
-    *tokp = tok;
-    return name;
-  }
-
-  *tokp = tok;
-  return NULL;
-}
+// Forward declaration: unified declarator parser (emit=true emits tokens, emit=false skips)
+static DeclResult parse_declarator(Token *tok, bool emit);
 
 // Forward declarations
 static bool array_size_is_vla(Token *open_bracket, bool strict_mode);
@@ -1785,11 +1752,12 @@ static void parse_typedef_declaration(Token *tok, int scope_depth)
   // Parse declarator(s) until semicolon
   while (tok && !equal(tok, ";") && tok->kind != TK_EOF)
   {
-    Token *name = skip_declarator(&tok);
-    if (name)
-      typedef_add(name->loc, name->len, scope_depth, is_vla);
+    DeclResult decl = parse_declarator(tok, false);
+    if (decl.var_name)
+      typedef_add(decl.var_name->loc, decl.var_name->len, scope_depth, is_vla);
+    tok = decl.end ? decl.end : tok->next;
 
-    // Skip to comma or semicolon
+    // Skip to comma or semicolon (past any initializer)
     while (tok && !equal(tok, ",") && !equal(tok, ";") && tok->kind != TK_EOF)
     {
       if (equal(tok, "("))
@@ -1847,27 +1815,7 @@ static inline bool is_valid_varname(Token *tok)
 // Zero-init declaration parsing helpers
 // ============================================================================
 
-// Skip leading C23 [[ ... ]] attributes at declaration start
-// Returns updated position after all leading attributes
-static Token *skip_leading_attributes(Token *tok)
-{
-  while (tok && equal(tok, "[") && tok->next && equal(tok->next, "["))
-  {
-    tok = tok->next->next; // skip [[
-    int depth = 1;
-    while (tok && tok->kind != TK_EOF && depth > 0)
-    {
-      if (equal(tok, "["))
-        depth++;
-      else if (equal(tok, "]"))
-        depth--;
-      tok = tok->next;
-    }
-    if (tok && equal(tok, "]"))
-      tok = tok->next;
-  }
-  return tok;
-}
+
 
 // Skip _Pragma(...) operator sequences (C99 6.10.9)
 // _Pragma is equivalent to #pragma but can appear in macro expansions
@@ -1888,8 +1836,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
 {
   TypeSpecResult r = {tok, false, false, false, false, false, false, false, false, NULL};
 
-  while ((tok->tag & TT_QUALIFIER) || is_type_keyword(tok) ||
-         (tok && equal(tok, "[") && tok->next && equal(tok->next, "[")))
+  while ((tok->tag & TT_QUALIFIER) || is_type_keyword(tok) || is_c23_attr(tok))
   {
     // Track _Atomic
     if (equal(tok, "_Atomic"))
@@ -1904,20 +1851,9 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       r.has_volatile = true;
 
     // Skip C23 [[ ... ]] attributes
-    if (equal(tok, "[") && tok->next && equal(tok->next, "["))
+    if (is_c23_attr(tok))
     {
-      tok = tok->next->next;
-      int depth = 1;
-      while (tok && tok->kind != TK_EOF && depth > 0)
-      {
-        if (equal(tok, "["))
-          depth++;
-        else if (equal(tok, "]"))
-          depth--;
-        tok = tok->next;
-      }
-      if (tok && equal(tok, "]"))
-        tok = tok->next;
+      tok = skip_c23_attr(tok);
       r.end = tok;
       continue;
     }
@@ -2058,19 +1994,6 @@ static TypeSpecResult parse_type_specifier(Token *tok)
   return r;
 }
 
-// Declarator parsing result
-typedef struct
-{
-  Token *end;       // First token after declarator
-  Token *var_name;  // The variable name token
-  bool is_pointer;  // Has pointer modifier
-  bool is_array;    // Is array type
-  bool is_vla;      // Has variable-length array dimension
-  bool is_func_ptr; // Is function pointer
-  bool has_paren;   // Has parenthesized declarator
-  bool has_init;    // Has initializer (=)
-} DeclResult;
-
 // Emit a balanced token group: emits 'tok' and all tokens through matching close.
 // Works for (), [], and __attribute__((...)). Returns position after.
 static Token *emit_balanced(Token *tok)
@@ -2104,23 +2027,17 @@ static Token *emit_attr(Token *tok)
   return tok;
 }
 
-// Emit array dimension(s) starting at '[', check VLA, return position after
-static Token *emit_array_dims(Token *tok, bool *is_vla)
-{
-  while (equal(tok, "["))
-  {
-    if (array_size_is_vla(tok, true))
-      *is_vla = true;
-    tok = emit_balanced(tok);
-  }
-  return tok;
-}
-
-// Parse a single declarator (pointer modifiers, name, array dims, etc.)
-// Emits tokens as it parses. Returns info about the declarator.
-static DeclResult parse_declarator(Token *tok)
+// Unified declarator parser. When emit=true, emits tokens while parsing.
+// When emit=false, only advances without output (replaces old skip_declarator).
+static DeclResult parse_declarator(Token *tok, bool emit)
 {
   DeclResult r = {tok, NULL, false, false, false, false, false, false};
+
+  // Helper macros for conditional emit
+  #define DECL_EMIT(t) do { if (emit) emit_tok(t); } while(0)
+  #define DECL_BALANCED(t) (emit ? emit_balanced(t) : skip_balanced(t, equal(t,"(") ? "(" : equal(t,"[") ? "[" : "{", equal(t,"(") ? ")" : equal(t,"[") ? "]" : "}"))
+  #define DECL_ATTR(t) do { if (emit) { t = emit_attr(t); } else { t = (t)->next; if (t && equal(t,"(")) t = skip_balanced(t,"(",")"); } } while(0)
+  #define DECL_ARRAY_DIMS(t, vla) do { while (equal(t, "[")) { if (array_size_is_vla(t, true)) *(vla) = true; t = DECL_BALANCED(t); } } while(0)
 
   // Pointer modifiers and qualifiers
   while (equal(tok, "*") || (tok->tag & TT_QUALIFIER))
@@ -2129,10 +2046,10 @@ static DeclResult parse_declarator(Token *tok)
       r.is_pointer = true;
     if (tok->tag & TT_ATTR)
     {
-      tok = emit_attr(tok);
+      DECL_ATTR(tok);
       continue;
     }
-    emit_tok(tok);
+    DECL_EMIT(tok);
     tok = tok->next;
   }
 
@@ -2147,7 +2064,7 @@ static DeclResult parse_declarator(Token *tok)
       return r;
     }
 
-    emit_tok(tok);
+    DECL_EMIT(tok);
     tok = tok->next;
     nested_paren = 1;
     r.is_pointer = true;
@@ -2162,10 +2079,10 @@ static DeclResult parse_declarator(Token *tok)
         nested_paren++;
       if (tok->tag & TT_ATTR)
       {
-        tok = emit_attr(tok);
+        DECL_ATTR(tok);
         continue;
       }
-      emit_tok(tok);
+      DECL_EMIT(tok);
       tok = tok->next;
     }
   }
@@ -2178,18 +2095,18 @@ static DeclResult parse_declarator(Token *tok)
   }
 
   r.var_name = tok;
-  emit_tok(tok);
+  DECL_EMIT(tok);
   tok = tok->next;
 
   // Skip __attribute__ after variable name
   while (tok->tag & TT_ATTR)
-    tok = emit_attr(tok);
+    DECL_ATTR(tok);
 
   // Array dims inside parens: (*name[N])
   if (r.has_paren && equal(tok, "["))
   {
     r.is_array = true;
-    tok = emit_array_dims(tok, &r.is_vla);
+    DECL_ARRAY_DIMS(tok, &r.is_vla);
   }
 
   // Close nested parens, handling function args or array dims at each level
@@ -2198,11 +2115,11 @@ static DeclResult parse_declarator(Token *tok)
     while (equal(tok, "(") || equal(tok, "["))
     {
       if (equal(tok, "("))
-        tok = emit_balanced(tok);
+        tok = DECL_BALANCED(tok);
       else
       {
         r.is_array = true;
-        tok = emit_array_dims(tok, &r.is_vla);
+        DECL_ARRAY_DIMS(tok, &r.is_vla);
       }
     }
     if (!equal(tok, ")"))
@@ -2210,7 +2127,7 @@ static DeclResult parse_declarator(Token *tok)
       r.end = NULL;
       return r;
     }
-    emit_tok(tok);
+    DECL_EMIT(tok);
     tok = tok->next;
     nested_paren--;
   }
@@ -2224,44 +2141,40 @@ static DeclResult parse_declarator(Token *tok)
       return r;
     }
     r.is_func_ptr = true;
-    tok = emit_balanced(tok);
+    tok = DECL_BALANCED(tok);
   }
 
   // Array dimensions outside parens
   if (equal(tok, "["))
   {
     r.is_array = true;
-    tok = emit_array_dims(tok, &r.is_vla);
+    DECL_ARRAY_DIMS(tok, &r.is_vla);
   }
 
   // Skip __attribute__ before initializer or end of declarator
   while (tok->tag & TT_ATTR)
-    tok = emit_attr(tok);
+    DECL_ATTR(tok);
 
   r.has_init = equal(tok, "=");
   r.end = tok;
+
+  #undef DECL_EMIT
+  #undef DECL_BALANCED
+  #undef DECL_ATTR
+  #undef DECL_ARRAY_DIMS
+
   return r;
 }
 
 // Quick pre-check: is this a variable declaration (not a function decl or stmt expr)?
-// Uses skip_declarator for the heavy lifting, avoiding a separate scan.
+// Uses parse_declarator(skip mode) for the heavy lifting, avoiding a separate scan.
 static bool is_var_declaration(Token *type_end)
 {
-  Token *check = type_end;
-
-  // Use skip_declarator to find the first declarator name
-  Token *name = skip_declarator(&check);
-  if (!name)
+  DeclResult decl = parse_declarator(type_end, false);
+  if (!decl.var_name)
     return false;
 
-  // After the declarator, must see '=', ',', ';', or '__attribute__'
-  // A '(' here without having been in a paren-declarator means function decl
-  while (check && (check->tag & TT_ATTR))
-  {
-    check = check->next;
-    if (check && equal(check, "("))
-      check = skip_balanced(check, "(", ")");
-  }
+  Token *check = decl.end;
   if (!check)
     return false;
 
@@ -2337,7 +2250,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
 
   while (tok && tok->kind != TK_EOF)
   {
-    DeclResult decl = parse_declarator(tok);
+    DeclResult decl = parse_declarator(tok, true);
     if (!decl.end || !decl.var_name)
       return NULL;
 
@@ -2465,7 +2378,8 @@ static Token *try_zero_init_decl(Token *tok)
   Token *pragma_start = tok;
 
   // Skip leading attributes and pragmas
-  tok = skip_leading_attributes(tok);
+  while (is_c23_attr(tok))
+    tok = skip_c23_attr(tok);
   tok = skip_pragma_operators(tok);
   Token *start = tok;
 
@@ -2898,24 +2812,7 @@ static Token *handle_sue_body(Token *tok)
   emit_tok(tok); // emit '{'
   tok = tok->next;
   ctx->struct_depth++;
-  if (ctx->feature_defer)
-  {
-    bool save_loop = ctx->next_scope_is_loop;
-    bool save_switch = ctx->next_scope_is_switch;
-    bool save_conditional = ctx->next_scope_is_conditional;
-    defer_push_scope();
-    if (control_state.pending)
-    {
-      ctx->next_scope_is_loop = save_loop;
-      ctx->next_scope_is_switch = save_switch;
-      ctx->next_scope_is_conditional = save_conditional;
-    }
-  }
-  else
-  {
-    defer_stack_ensure_capacity(ctx->defer_depth + 1);
-    ctx->defer_depth++;
-  }
+  defer_push_scope(false);
   ctx->at_stmt_start = true;
   return tok;
 }
@@ -2950,13 +2847,7 @@ static Token *handle_open_brace(Token *tok)
   }
   emit_tok(tok);
   tok = tok->next;
-  if (ctx->feature_defer)
-    defer_push_scope();
-  else
-  {
-    defer_stack_ensure_capacity(ctx->defer_depth + 1);
-    ctx->defer_depth++;
-  }
+  defer_push_scope(true);
   ctx->at_stmt_start = true;
   return tok;
 }
@@ -2976,12 +2867,8 @@ static Token *handle_close_brace(Token *tok)
     ctx->struct_depth--;
   typedef_pop_scope(ctx->defer_depth);
   if (ctx->feature_defer)
-  {
-    emit_scope_defers();
-    defer_pop_scope();
-  }
-  else if (ctx->defer_depth > 0)
-    ctx->defer_depth--;
+    emit_defers(DEFER_SCOPE);
+  defer_pop_scope();
   emit_tok(tok);
   tok = tok->next;
   if (tok && equal(tok, ")") && ctx->stmt_expr_count > 0 &&
@@ -3065,10 +2952,29 @@ static void free_argv(char **argv)
 }
 
 // Unified temp file creation with optional suffix (e.g., ".c" → suffix_len=2)
+// If source_adjacent is non-NULL, creates file next to that source file instead of in tmp dir.
 // Returns 0 on success, -1 on failure. Path written to buf.
-static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len)
+static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len,
+                         const char *source_adjacent)
 {
-  snprintf(buf, bufsize, "%s%s", get_tmp_dir(), prefix);
+  if (source_adjacent)
+  {
+    const char *slash = strrchr(source_adjacent, '/');
+#ifdef _WIN32
+    const char *bslash = strrchr(source_adjacent, '\\');
+    if (!slash || (bslash && bslash > slash)) slash = bslash;
+#endif
+    if (slash)
+    {
+      int dir_len = (int)(slash - source_adjacent);
+      snprintf(buf, bufsize, "%.*s/.%s.XXXXXX.c", dir_len, source_adjacent, slash + 1);
+    }
+    else
+      snprintf(buf, bufsize, ".%s.XXXXXX.c", source_adjacent);
+    suffix_len = 2; // .c suffix
+  }
+  else
+    snprintf(buf, bufsize, "%s%s", get_tmp_dir(), prefix);
 #if defined(_WIN32)
   if (_mktemp_s(buf, bufsize) != 0)
     return -1;
@@ -3103,7 +3009,7 @@ static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suf
 static char *preprocess_with_cc(const char *input_file)
 {
   char tmppath[PATH_MAX];
-  if (make_temp_file(tmppath, sizeof(tmppath), "prism_pp_XXXXXX", 0) < 0)
+  if (make_temp_file(tmppath, sizeof(tmppath), "prism_pp_XXXXXX", 0, NULL) < 0)
   {
     perror("mkstemp");
     return NULL;
@@ -3235,12 +3141,7 @@ static int transpile(char *input_file, char *output_file)
   ctx->last_line_no = 0;
   ctx->last_filename = NULL;
   ctx->last_system_header = false;
-  ctx->next_scope_is_loop = false;
-  ctx->next_scope_is_switch = false;
-  ctx->next_scope_is_conditional = false;
-  control_state_reset();
-  ctx->in_for_init = false;
-  ctx->pending_for_paren = false;
+  control_flow_reset();
   ctx->conditional_block_depth = 0;
   ctx->generic_paren_depth = 0;
   ctx->current_func_returns_void = false;
@@ -3264,6 +3165,9 @@ static int transpile(char *input_file, char *output_file)
   {
     Token *next;
     uint32_t tag = tok->tag;
+
+    // Dispatch macro: call handler, advance if it consumed tokens
+#define DISPATCH(handler) { next = handler(tok); if (next) { tok = next; continue; } }
 
     // Track typedefs (must precede zero-init check)
     if (ctx->at_stmt_start && ctx->struct_depth == 0 && (tag & TT_TYPEDEF))
@@ -3295,44 +3199,13 @@ static int transpile(char *input_file, char *output_file)
     // ── Keyword dispatch (defer, return, break/continue, goto) ──
 
     if (tag & TT_DEFER)
-    {
-      next = handle_defer_keyword(tok);
-      if (next)
-      {
-        tok = next;
-        continue;
-      }
-    }
-
+      DISPATCH(handle_defer_keyword);
     if (ctx->feature_defer && (tag & TT_RETURN))
-    {
-      next = handle_return_defer(tok);
-      if (next)
-      {
-        tok = next;
-        continue;
-      }
-    }
-
+      DISPATCH(handle_return_defer);
     if (ctx->feature_defer && (tag & (TT_BREAK | TT_CONTINUE)))
-    {
-      next = handle_break_continue_defer(tok);
-      if (next)
-      {
-        tok = next;
-        continue;
-      }
-    }
-
+      DISPATCH(handle_break_continue_defer);
     if ((tag & TT_GOTO) && (ctx->feature_defer || ctx->feature_zeroinit))
-    {
-      next = handle_goto_keyword(tok);
-      if (next)
-      {
-        tok = next;
-        continue;
-      }
-    }
+      DISPATCH(handle_goto_keyword);
 
     // ── Control-flow flag setting (loop, switch, if/else) ──
 
@@ -3412,14 +3285,7 @@ static int transpile(char *input_file, char *output_file)
 
     // struct/union/enum body
     if (tag & TT_SUE)
-    {
-      next = handle_sue_body(tok);
-      if (next)
-      {
-        tok = next;
-        continue;
-      }
-    }
+      DISPATCH(handle_sue_body);
 
     // Open brace
     if (equal(tok, "{"))
@@ -3467,12 +3333,7 @@ static int transpile(char *input_file, char *output_file)
       else if (equal(tok, ";") && control_state.paren_depth == 0)
       {
         typedef_pop_scope(ctx->defer_depth + 1);
-        control_state.pending = false;
-        ctx->next_scope_is_loop = false;
-        ctx->next_scope_is_switch = false;
-        ctx->next_scope_is_conditional = false;
-        ctx->in_for_init = false;
-        ctx->pending_for_paren = false;
+        control_flow_reset();
       }
     }
 
@@ -3588,7 +3449,7 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
   // Create temp file for output
   char temp_path[PATH_MAX];
   temp_path[0] = '\0';
-  if (make_temp_file(temp_path, sizeof(temp_path), "prism_out.XXXXXX.c", 2) < 0)
+  if (make_temp_file(temp_path, sizeof(temp_path), "prism_out.XXXXXX.c", 2, NULL) < 0)
   {
     result.status = PRISM_ERR_IO;
     result.error_msg = strdup("Failed to create temp file");
@@ -3715,11 +3576,7 @@ PRISM_API void prism_reset(void)
 
   ctx->struct_depth = 0;
   ctx->ret_counter = 0;
-  ctx->next_scope_is_loop = false;
-  ctx->next_scope_is_switch = false;
-  ctx->next_scope_is_conditional = false;
-  ctx->in_for_init = false;
-  ctx->pending_for_paren = false;
+  control_flow_reset();
   ctx->conditional_block_depth = 0;
   ctx->generic_paren_depth = 0;
   ctx->current_func_returns_void = false;
@@ -3727,7 +3584,6 @@ PRISM_API void prism_reset(void)
   ctx->current_func_has_asm = false;
   ctx->current_func_has_vfork = false;
   ctx->at_stmt_start = true;
-  control_state_reset();
 }
 
 // CLI IMPLEMENTATION (excluded with -DPRISM_LIB_MODE)
@@ -3755,35 +3611,40 @@ static noreturn void die(char *message)
   exit(1);
 }
 
+// Resolve the path to the currently running executable (platform-specific)
+static bool get_self_exe_path(char *buf, size_t bufsize)
+{
+#if defined(__linux__)
+  ssize_t len = readlink("/proc/self/exe", buf, bufsize - 1);
+  if (len > 0) { buf[len] = '\0'; return true; }
+#elif defined(__APPLE__)
+  uint32_t sz = (uint32_t)bufsize;
+  if (_NSGetExecutablePath(buf, &sz) == 0)
+  {
+    char temp[PATH_MAX];
+    if (realpath(buf, temp)) { strncpy(buf, temp, bufsize - 1); buf[bufsize - 1] = '\0'; }
+    return true;
+  }
+#elif defined(__FreeBSD__)
+  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+  size_t len = bufsize;
+  if (sysctl(mib, 4, buf, &len, NULL, 0) == 0) return true;
+#elif defined(__NetBSD__)
+  ssize_t len = readlink("/proc/curproc/exe", buf, bufsize - 1);
+  if (len > 0) { buf[len] = '\0'; return true; }
+#endif
+  (void)buf; (void)bufsize;
+  return false;
+}
+
 static int install(char *self_path)
 {
   printf("[prism] Installing to %s...\n", INSTALL_PATH);
 
   // Resolve self_path to actual executable path only if the given path doesn't exist
-  // This allows installing from a temp binary (e.g., after compiling from sources)
   char resolved_path[PATH_MAX];
-  bool use_resolved = false;
-
-  // First check if the given path exists as a file
   struct stat st;
-  if (stat(self_path, &st) != 0)
-  {
-    // Path doesn't exist, try to resolve via /proc/self/exe or equivalent
-#if defined(__linux__)
-    ssize_t len = readlink("/proc/self/exe", resolved_path, sizeof(resolved_path) - 1);
-    if (len > 0)
-    {
-      resolved_path[len] = '\0';
-      use_resolved = true;
-    }
-#elif defined(__APPLE__)
-    uint32_t size = sizeof(resolved_path);
-    if (_NSGetExecutablePath(resolved_path, &size) == 0)
-      use_resolved = true;
-#endif
-  }
-
-  if (use_resolved)
+  if (stat(self_path, &st) != 0 && get_self_exe_path(resolved_path, sizeof(resolved_path)))
     self_path = resolved_path;
 
   // Check if we're trying to install over ourselves
@@ -3879,6 +3740,8 @@ typedef struct
   bool compile_only;
 } Cli;
 
+static bool is_prism_cc(const char *cc); // Forward declaration
+
 // Get the actual C compiler to use, avoiding infinite recursion if CC=prism
 static const char *get_real_cc(const char *cc)
 {
@@ -3886,53 +3749,15 @@ static const char *get_real_cc(const char *cc)
     return "cc"; // NULL or empty string
 
   // Simple check: if basename is "prism" or "prism.exe", return "cc"
-  const char *base = strrchr(cc, '/');
-  base = base ? base + 1 : cc;
-  if (strcmp(base, "prism") == 0 || strcmp(base, "prism.exe") == 0)
+  if (is_prism_cc(cc))
     return "cc";
 
   // Advanced check: resolve paths and compare with current executable
   // This prevents infinite recursion if prism is symlinked or copied to another name
   char cc_real[PATH_MAX];
   char self_real[PATH_MAX];
-  bool got_self_path = false;
 
-#ifdef __linux__
-  ssize_t self_len = readlink("/proc/self/exe", self_real, sizeof(self_real) - 1);
-  if (self_len != -1)
-  {
-    self_real[self_len] = '\0';
-    got_self_path = true;
-  }
-#elif defined(__APPLE__)
-  uint32_t bufsize = sizeof(self_real);
-  if (_NSGetExecutablePath(self_real, &bufsize) == 0)
-  {
-    char temp[PATH_MAX];
-    if (realpath(self_real, temp) != NULL)
-    {
-      strncpy(self_real, temp, sizeof(self_real) - 1);
-      self_real[sizeof(self_real) - 1] = '\0';
-      got_self_path = true;
-    }
-  }
-#elif defined(__FreeBSD__)
-  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
-  size_t len = sizeof(self_real);
-  if (sysctl(mib, 4, self_real, &len, NULL, 0) == 0)
-    got_self_path = true;
-#elif defined(__NetBSD__)
-  ssize_t self_len = readlink("/proc/curproc/exe", self_real, sizeof(self_real) - 1);
-  if (self_len != -1)
-  {
-    self_real[self_len] = '\0';
-    got_self_path = true;
-  }
-#elif defined(__OpenBSD__)
-  (void)self_real;
-#endif
-
-  if (!got_self_path)
+  if (!get_self_exe_path(self_real, sizeof(self_real)))
     return cc;
 
   if (realpath(cc, cc_real) == NULL)
@@ -4162,61 +3987,7 @@ static void cli_free(Cli *cli)
   free(cli->cc_args);
 }
 
-static char *create_temp_file(const char *source, char *buf, size_t bufsize)
-{
-  char *basename_ptr = strrchr(source, '/');
-#ifdef _WIN32
-  char *win_basename = strrchr(source, '\\');
-  if (!basename_ptr || (win_basename && win_basename > basename_ptr))
-    basename_ptr = win_basename;
-#endif
-
-  if (!basename_ptr)
-    snprintf(buf, bufsize, ".%s.XXXXXX.c", source);
-  else
-  {
-    char source_dir[PATH_MAX];
-    size_t dir_len = basename_ptr - source;
-    if (dir_len >= sizeof(source_dir))
-      dir_len = sizeof(source_dir) - 1;
-    strncpy(source_dir, source, dir_len);
-    source_dir[dir_len] = 0;
-    basename_ptr++;
-    snprintf(buf, bufsize, "%s/.%s.XXXXXX.c", source_dir, basename_ptr);
-  }
-
-#if defined(_WIN32)
-  if (_mktemp_s(buf, bufsize) != 0)
-    return NULL;
-#elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
-  {
-    int fd = mkstemps(buf, 2);
-    if (fd < 0)
-    {
-      fprintf(stderr, "prism: mkstemps failed for '%s': %s\n", buf, strerror(errno));
-      return NULL;
-    }
-    close(fd);
-  }
-#else
-  {
-    int fd = mkstemp(buf);
-    if (fd < 0)
-      return NULL;
-    close(fd);
-    unlink(buf);
-    size_t len = strlen(buf);
-    if (len + 2 < bufsize)
-    {
-      buf[len] = '.';
-      buf[len + 1] = 'c';
-      buf[len + 2] = '\0';
-    }
-  }
-#endif
-
-  return buf;
-}
+// create_temp_file: Merged into make_temp_file(buf, size, NULL, 0, source)
 
 int main(int argc, char **argv)
 {
@@ -4367,7 +4138,7 @@ int main(int argc, char **argv)
       {
 #ifdef _WIN32
         char temp[PATH_MAX];
-        if (!create_temp_file(cli.sources[i], temp, sizeof(temp)))
+        if (make_temp_file(temp, sizeof(temp), NULL, 0, cli.sources[i]) < 0)
           die("Failed to create temp file");
         if (!transpile((char *)cli.sources[i], temp))
         {
@@ -4431,7 +4202,7 @@ int main(int argc, char **argv)
     temp_files[i] = malloc(512);
     if (!temp_files[i])
       die("Out of memory");
-    if (!create_temp_file(cli.sources[i], temp_files[i], 512))
+    if (make_temp_file(temp_files[i], 512, NULL, 0, cli.sources[i]) < 0)
       die("Failed to create temp file");
     if (cli.verbose)
       fprintf(stderr, "[prism] Transpiling %s -> %s\n", cli.sources[i], temp_files[i]);
