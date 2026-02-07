@@ -31,6 +31,12 @@
 
 #define TOMBSTONE ((void *)-1)
 
+// Inline character classification - avoids TLS __ctype_b_loc overhead
+#define IS_DIGIT(c) ((unsigned)(c) - '0' < 10u)
+#define IS_ALPHA(c) (((unsigned)((c) | 0x20) - 'a') < 26u || (c) == '_' || (c) == '$')
+#define IS_ALNUM(c) (IS_DIGIT(c) || IS_ALPHA(c))
+#define IS_XDIGIT(c) (IS_DIGIT(c) || ((unsigned)((c) | 0x20) - 'a') < 6u)
+
 // Generic array growth: ensures *arr has capacity for n elements
 // Note: Uses error() instead of exit(1) to support PRISM_LIB_MODE where
 // error() uses longjmp for recovery instead of terminating the host process.
@@ -61,10 +67,7 @@ typedef struct
     size_t contents_len;
     char *display_name;
     int line_delta;
-    int *line_offsets;
-    int line_count;
     bool owns_contents;
-    bool owns_line_offsets;
     bool is_system;
     bool is_include_entry; // True if inside a system #include chain (not just macro expansion)
 } File;
@@ -87,6 +90,7 @@ enum
     TF_AT_BOL = 1 << 0,
     TF_HAS_SPACE = 1 << 1,
     TF_IS_FLOAT = 1 << 2,
+    TF_IS_DIGRAPH = 1 << 3,
 };
 
 // Token tags - bitmask classification assigned once at tokenize time
@@ -126,6 +130,7 @@ struct Token
     char *loc;
     Token *next;
     int len;
+    int line_no; // Cached line number (computed once during tokenization)
     TokenKind kind;
     uint16_t file_idx;
     uint8_t flags;
@@ -187,6 +192,7 @@ static ArenaBlock *arena_new_block(size_t min_size, size_t default_size)
     return block;
 }
 
+static void *arena_alloc(Arena *arena, size_t size) __attribute__((unused));
 static void *arena_alloc(Arena *arena, size_t size)
 {
     if (size == 0)
@@ -209,6 +215,29 @@ static void *arena_alloc(Arena *arena, size_t size)
     void *ptr = arena->current->data + arena->current->used;
     arena->current->used += size;
     memset(ptr, 0, size);
+    return ptr;
+}
+
+// Like arena_alloc but without zeroing - caller must initialize all fields
+static void *arena_alloc_uninit(Arena *arena, size_t size)
+{
+    if (size == 0)
+        size = 1;
+    size = (size + 7) & ~(size_t)7;
+
+    if (!arena->current || arena->current->used + size > arena->current->capacity)
+    {
+        size_t block_size = arena->default_block_size ? arena->default_block_size : ARENA_DEFAULT_BLOCK_SIZE;
+        ArenaBlock *block = arena_new_block(size, block_size);
+        if (arena->current)
+            arena->current->next = block;
+        else
+            arena->head = block;
+        arena->current = block;
+    }
+
+    void *ptr = arena->current->data + arena->current->used;
+    arena->current->used += size;
     return ptr;
 }
 
@@ -265,6 +294,7 @@ typedef struct PrismContext
     int input_file_capacity;
     bool at_bol;
     bool has_space;
+    int tok_line_no; // Current line number during tokenization
     HashMap filename_intern_map;
     HashMap file_view_cache;
     HashMap keyword_map;
@@ -326,7 +356,7 @@ static void prism_ctx_init(void)
 // Token arena - uses main_arena
 static Token *arena_alloc_token(void)
 {
-    return arena_alloc(&ctx->main_arena, sizeof(Token));
+    return arena_alloc_uninit(&ctx->main_arena, sizeof(Token));
 }
 
 static uint64_t fnv_hash(char *s, int len)
@@ -507,8 +537,6 @@ static void free_file(File *f)
         return;
     if (f->contents && f->owns_contents)
         free(f->contents);
-    if (f->line_offsets && f->owns_line_offsets)
-        free(f->line_offsets);
     // Don't free interned filenames - they're managed by filename_intern_map
     // Check by looking up in the intern map (pointer comparison after lookup)
     if (f->name)
@@ -564,26 +592,7 @@ static inline File *tok_file(Token *tok)
 
 static int tok_line_no(Token *tok)
 {
-    File *f = tok_file(tok);
-    if (!f || !f->contents || !tok->loc)
-        return -1;
-
-    char *file_start = f->contents;
-    char *file_end = f->contents + f->contents_len;
-    if (tok->loc < file_start || tok->loc >= file_end)
-        return -1;
-
-    int offset = (int)(tok->loc - f->contents);
-    int lo = 0, hi = f->line_count - 1;
-    while (lo < hi)
-    {
-        int mid = lo + (hi - lo + 1) / 2;
-        if (f->line_offsets[mid] <= offset)
-            lo = mid;
-        else
-            hi = mid - 1;
-    }
-    return lo + 1 + f->line_delta;
+    return tok->line_no;
 }
 
 // Error handling
@@ -715,15 +724,14 @@ static inline const char *digraph_equiv(Token *tok)
     return NULL;
 }
 
-static inline bool equal(Token *tok, const char *op)
+static inline bool equal_n(Token *tok, const char *op, size_t len)
 {
-    size_t len = __builtin_constant_p(*op) ? __builtin_strlen(op) : strlen(op);
-
     if (tok->len == (int)len && !memcmp(tok->loc, op, len))
         return true;
 
-    // Check digraph equivalence (digraph equivs are short constant strings,
-    // use direct length check instead of strlen)
+    // Only check digraph equivalence if token was flagged as a digraph
+    if (!(tok->flags & TF_IS_DIGRAPH))
+        return false;
     const char *equiv = digraph_equiv(tok);
     if (!equiv)
         return false;
@@ -731,6 +739,47 @@ static inline bool equal(Token *tok, const char *op)
     size_t elen = equiv[0] ? (equiv[1] ? 2 : 1) : 0;
     return elen == len && !memcmp(equiv, op, len);
 }
+
+// Cold path: check digraph equivalence for single-char comparison
+static bool __attribute__((noinline)) _equal_1_digraph(Token *tok, char c)
+{
+    const char *e = digraph_equiv(tok);
+    return e && e[0] == c && !e[1];
+}
+
+// Fast inline path for single-char comparisons (avoids function call + memcmp)
+static inline bool _equal_1(Token *tok, char c)
+{
+    if (tok->len == 1)
+        return tok->loc[0] == c;
+    if (__builtin_expect(tok->flags & TF_IS_DIGRAPH, 0))
+        return _equal_1_digraph(tok, c);
+    return false;
+}
+
+// Cold path: check digraph equivalence for two-char comparison
+static bool __attribute__((noinline)) _equal_2_digraph(Token *tok, const char *s)
+{
+    const char *e = digraph_equiv(tok);
+    return e && e[0] == s[0] && e[1] == s[1];
+}
+
+// Fast inline path for two-char comparisons
+static inline bool _equal_2(Token *tok, const char *s)
+{
+    if (tok->len == 2)
+        return tok->loc[0] == s[0] && tok->loc[1] == s[1];
+    if (__builtin_expect(tok->flags & TF_IS_DIGRAPH, 0))
+        return _equal_2_digraph(tok, s);
+    return false;
+}
+
+// Dispatch: compile-time length → inline fast path, runtime length → equal_n
+#define equal(tok, s) (__builtin_constant_p(s) ? \
+    (__builtin_strlen(s) == 1 ? _equal_1(tok, (s)[0]) : \
+     __builtin_strlen(s) == 2 ? _equal_2(tok, s) : \
+     equal_n(tok, s, __builtin_strlen(s))) : \
+    equal_n(tok, s, strlen(s)))
 
 // Internal marker bit for keyword map: values are (tag | KW_MARKER)
 // This distinguishes tag=0 keywords from "not found" (NULL)
@@ -865,11 +914,11 @@ static int read_ident(char *start)
     char *p = start;
     if ((unsigned char)*p >= 0x80)
         p++;
-    else if (isalpha(*p) || *p == '_' || *p == '$')
+    else if (IS_ALPHA(*p))
         p++;
     else
         return 0;
-    while (isalnum(*p) || *p == '_' || *p == '$' || (unsigned char)*p >= 0x80)
+    while (IS_ALNUM(*p) || (unsigned char)*p >= 0x80)
         p++;
     return p - start;
 }
@@ -887,9 +936,9 @@ static int read_punct(char *p)
         if (p[1] == '=')
             return 2; // <=
         if (p[1] == ':')
-            return 2; // <: (digraph)
+            return -2; // <: (digraph)
         if (p[1] == '%')
-            return 2; // <% (digraph)
+            return -2; // <% (digraph)
         return 1;
     case '>':
         if (p[1] == '>' && p[2] == '=')
@@ -927,11 +976,11 @@ static int read_punct(char *p)
         return (p[1] == '=') ? 2 : 1; // /= or /
     case '%':
         if (p[1] == ':' && p[2] == '%' && p[3] == ':')
-            return 4; // %:%: (digraph ##)
+            return -4; // %:%: (digraph ##)
         if (p[1] == ':')
-            return 2; // %: (digraph #)
+            return -2; // %: (digraph #)
         if (p[1] == '>')
-            return 2; // %> (digraph })
+            return -2; // %> (digraph })
         if (p[1] == '=')
             return 2; // %=
         return 1;
@@ -952,9 +1001,9 @@ static int read_punct(char *p)
     case '#':
         return (p[1] == '#') ? 2 : 1; // ## or #
     case ':':
-        return (p[1] == '>') ? 2 : 1; // :> (digraph) or :
+        return (p[1] == '>') ? -2 : 1; // :> (digraph) or :
     default:
-        return ispunct((unsigned char)*p) ? 1 : 0;
+        return ((unsigned char)*p > 0x20 && *p != 0x7f && !IS_ALNUM(*p)) ? 1 : 0;
     }
 }
 
@@ -1029,9 +1078,15 @@ static Token *new_token(TokenKind kind, char *start, char *end)
     tok->kind = kind;
     tok->loc = start;
     tok->len = end - start;
-    tok->file_idx = ctx->current_file ? ctx->current_file->file_no : 0;
-    tok_set_at_bol(tok, ctx->at_bol);
-    tok_set_has_space(tok, ctx->has_space);
+    tok->next = NULL;
+    tok->tag = 0;
+    tok->line_no = ctx->tok_line_no + ctx->current_file->line_delta;
+    tok->file_idx = ctx->current_file->file_no;
+    tok->flags = 0;
+    if (ctx->at_bol)
+        tok->flags |= TF_AT_BOL;
+    if (ctx->has_space)
+        tok->flags |= TF_HAS_SPACE;
     ctx->at_bol = ctx->has_space = false;
     return tok;
 }
@@ -1183,23 +1238,7 @@ static File *new_file(char *name, int file_no, char *contents)
     file->contents_len = strlen(contents);
     file->line_delta = 0;
     file->owns_contents = true;
-    file->owns_line_offsets = true;
     file->is_system = false;
-
-    // Build line offset table
-    int line_count = 1;
-    for (char *p = contents; *p; p++)
-        if (*p == '\n')
-            line_count++;
-    file->line_offsets = malloc(sizeof(int) * line_count);
-    if (!file->line_offsets)
-        error("out of memory");
-    file->line_count = line_count;
-    file->line_offsets[0] = 0;
-    int line = 1;
-    for (char *p = contents; *p; p++)
-        if (*p == '\n' && line < line_count)
-            file->line_offsets[line++] = (p - contents) + 1;
     return file;
 }
 
@@ -1229,11 +1268,8 @@ static File *new_file_view(const char *name, File *base, int line_delta, bool is
     file->file_no = ctx->input_file_count;
     file->contents = base->contents;
     file->contents_len = base->contents_len;
-    file->line_offsets = base->line_offsets;
-    file->line_count = base->line_count;
     file->line_delta = line_delta;
     file->owns_contents = false;
-    file->owns_line_offsets = false;
     file->is_system = is_system;
     file->is_include_entry = is_include_entry;
 
@@ -1263,11 +1299,11 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
     }
 
     // Must have line number to be a line marker
-    if (!isdigit(*p))
+    if (!IS_DIGIT(*p))
         return NULL;
 
     long new_line = 0;
-    while (isdigit(*p))
+    while (IS_DIGIT(*p))
     {
         new_line = new_line * 10 + (*p - '0');
         p++;
@@ -1301,10 +1337,10 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
     bool is_system = false, is_entering = false, is_returning = false;
     while (*p == ' ' || *p == '\t')
         p++;
-    while (isdigit(*p))
+    while (IS_DIGIT(*p))
     {
         int flag = 0;
-        while (isdigit(*p))
+        while (IS_DIGIT(*p))
         {
             flag = flag * 10 + (*p - '0');
             p++;
@@ -1354,12 +1390,12 @@ static char *scan_pp_number(char *p)
         {
             p += 2;
         }
-        else if (isalnum(c) || c == '.' || c == '_')
+        else if (IS_ALNUM(c) || c == '.' || c == '_')
         {
             // Accept digits, letters (hex, suffixes, extensions), dot, underscore
             p++;
         }
-        else if (c == '\'' && (isxdigit(p[1]) || isdigit(p[1])))
+        else if (c == '\'' && (IS_XDIGIT(p[1]) || IS_DIGIT(p[1])))
         {
             // C23 digit separator: accept ' if followed by a digit (hex or decimal)
             p++;
@@ -1380,7 +1416,7 @@ static Token *tokenize(File *file)
     Token *cur = &head;
     ctx->at_bol = true;
     ctx->has_space = false;
-    int line_no = 1;
+    ctx->tok_line_no = 1;
 
     // Track if we're inside a system header include chain
     // This persists across nested includes until we return to user code
@@ -1393,7 +1429,7 @@ static Token *tokenize(File *file)
         if (ctx->at_bol && *p == '#')
         {
             char *directive_start = p;
-            char *after = scan_line_directive(p, base_file, &line_no, &in_system_include);
+            char *after = scan_line_directive(p, base_file, &ctx->tok_line_no, &in_system_include);
             if (after)
             {
                 p = after;
@@ -1410,7 +1446,7 @@ static Token *tokenize(File *file)
             if (*p == '\n')
             {
                 p++;
-                line_no++;
+                ctx->tok_line_no++;
                 ctx->at_bol = true;
                 ctx->has_space = false;
             }
@@ -1435,7 +1471,7 @@ static Token *tokenize(File *file)
         if (*p == '\n')
         {
             p++;
-            line_no++;
+            ctx->tok_line_no++;
             ctx->at_bol = true;
             ctx->has_space = false;
             continue;
@@ -1448,7 +1484,7 @@ static Token *tokenize(File *file)
             continue;
         }
         // Number
-        if (isdigit(*p) || (*p == '.' && isdigit(p[1])))
+        if (IS_DIGIT(*p) || (*p == '.' && IS_DIGIT(p[1])))
         {
             char *start = p;
             p = scan_pp_number(p);
@@ -1525,13 +1561,16 @@ static Token *tokenize(File *file)
             p += ident_len;
             continue;
         }
-        // Punctuator
+        // Punctuator (read_punct returns negative for digraphs)
         int punct_len = read_punct(p);
         if (punct_len)
         {
-            Token *t = cur = cur->next = new_token(TK_PUNCT, p, p + punct_len);
+            int abs_len = punct_len < 0 ? -punct_len : punct_len;
+            Token *t = cur = cur->next = new_token(TK_PUNCT, p, p + abs_len);
+            if (punct_len < 0)
+                t->flags |= TF_IS_DIGRAPH;
             classify_punct(t);
-            p += punct_len;
+            p += abs_len;
             continue;
         }
         error_at(p, "invalid token");

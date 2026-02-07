@@ -325,9 +325,15 @@ static void out_close(void)
   }
 }
 
-#define out_char(c) fputc(c, out_fp)
+// Use unlocked stdio for single-threaded output (avoids per-call locking overhead)
+#define out_char(c) putc_unlocked(c, out_fp)
+#ifdef _GNU_SOURCE
+#define out_str(s, len) fwrite_unlocked(s, 1, len, out_fp)
+#define OUT_LIT(s) fwrite_unlocked(s, 1, sizeof(s) - 1, out_fp)
+#else
 #define out_str(s, len) fwrite(s, 1, len, out_fp)
 #define OUT_LIT(s) fwrite(s, 1, sizeof(s) - 1, out_fp)
+#endif
 
 static void out_uint(unsigned long long v)
 {
