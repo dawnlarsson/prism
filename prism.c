@@ -152,7 +152,7 @@ typedef struct
   bool has_atomic;             // True if _Atomic qualifier/specifier present
   bool has_register;           // True if register storage class
   bool has_volatile;           // True if volatile qualifier
-  Token *struct_vla_error_tok; // Non-NULL if struct body has true VLA (caller should error)
+
 } TypeSpecResult;
 static TypeSpecResult parse_type_specifier(Token *tok);
 
@@ -199,26 +199,8 @@ static Token *skip_all_attributes(Token *tok)
 {
   while (tok && tok->kind != TK_EOF)
   {
-    if (tok->tag & TT_ATTR)
-    {
-      tok = skip_gnu_attributes(tok);
-      continue;
-    }
-    if (is_c23_attr(tok))
-    {
-      // Skip [[ ... ]] but NOT the trailing ] (original behavior)
-      tok = tok->next->next;
-      int depth = 1;
-      while (tok && tok->kind != TK_EOF && depth > 0)
-      {
-        if (equal(tok, "["))
-          depth++;
-        else if (equal(tok, "]"))
-          depth--;
-        tok = tok->next;
-      }
-      continue;
-    }
+    if (tok->tag & TT_ATTR) { tok = skip_gnu_attributes(tok); continue; }
+    if (is_c23_attr(tok)) { tok = skip_c23_attr(tok); continue; }
     break;
   }
   return tok;
@@ -1441,190 +1423,67 @@ typedef struct
 // Forward declaration: unified declarator parser (emit=true emits tokens, emit=false skips)
 static DeclResult parse_declarator(Token *tok, bool emit);
 
-// Forward declarations
-static bool array_size_is_vla(Token *open_bracket, bool strict_mode);
-static bool is_const_expr_operator(Token *tok);
-static bool is_const_identifier(Token *tok);
-
-// Unified VLA array size checker
-// strict_mode=true: Treat offsetof patterns as VLA (for zero-init safety)
-// strict_mode=false: Treat offsetof patterns as constant (for struct validation)
-static bool array_size_is_vla(Token *open_bracket, bool strict_mode)
+// Check if an array dimension (from '[' to matching ']') contains a VLA expression.
+// Simple rule: any identifier that isn't a type/enum constant, or appears after
+// member access (./->) is a runtime variable → VLA. sizeof/alignof/offsetof
+// arguments are skipped (always constant) except sizeof(VLA_Typedef).
+static bool array_size_is_vla(Token *open_bracket)
 {
   Token *tok = open_bracket->next;
-  int depth = 1;
 
-  // In lenient mode, check for manual offsetof pattern: (char*)...->...- (char*)
-  // GCC treats this as VLA even though it's a compile-time constant
-  if (!strict_mode)
+  while (tok && tok->kind != TK_EOF && !equal(tok, "]"))
   {
-    for (Token *t = open_bracket->next; t && t->kind != TK_EOF; t = t->next)
-    {
-      if (equal(t, "]"))
-        break;
-      if (equal(t, "(") && t->next && equal(t->next, "char") &&
-          t->next->next && equal(t->next->next, "*") &&
-          t->next->next->next && equal(t->next->next->next, ")"))
-      {
-        // Found (char*), look for -> or . followed by - (char*)
-        for (Token *t2 = t->next->next->next->next; t2 && t2->kind != TK_EOF && !equal(t2, "]"); t2 = t2->next)
-        {
-          if ((equal(t2, "->") || equal(t2, ".")) && t2->next)
-          {
-            for (Token *t3 = t2->next; t3 && t3->kind != TK_EOF && !equal(t3, "]"); t3 = t3->next)
-            {
-              if (equal(t3, "-") && t3->next && equal(t3->next, "(") &&
-                  t3->next->next && equal(t3->next->next, "char"))
-                return false; // Manual offsetof pattern — constant
-            }
-          }
-        }
-      }
-    }
-  }
+    // Skip nested brackets
+    if (equal(tok, "[")) { tok = skip_balanced(tok, "[", "]"); continue; }
 
-  bool prev_was_member_access = false;
-  while (tok && tok->kind != TK_EOF && depth > 0)
-  {
-    if (equal(tok, "["))
-    {
-      depth++;
-      tok = tok->next;
-      continue;
-    }
-    if (equal(tok, "]"))
-    {
-      depth--;
-      tok = tok->next;
-      continue;
-    }
-
-    // In strict mode, offsetof keywords and patterns indicate potential VLA
-    if (strict_mode)
-    {
-      if (equal(tok, "offsetof") || equal(tok, "__builtin_offsetof"))
-        return true;
-      // Detect manual offsetof pattern: (char*)
-      if (equal(tok, "(") && tok->next && equal(tok->next, "char") &&
-          tok->next->next && equal(tok->next->next, "*"))
-        return true;
-    }
-
-    // sizeof, _Alignof, alignof - handle specially
+    // sizeof/alignof — skip argument, but check for VLA typedef and VLA inner types
     if (equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof"))
     {
       bool is_sizeof = equal(tok, "sizeof");
       tok = tok->next;
       if (tok && equal(tok, "("))
       {
-        Token *arg_start = tok->next;
-
-        // Find matching closing paren
-        int paren_depth = 1;
-        Token *t = tok->next;
-        while (t && t->kind != TK_EOF && paren_depth > 0)
+        if (is_sizeof)
         {
-          if (equal(t, "("))
-            paren_depth++;
-          else if (equal(t, ")"))
-            paren_depth--;
-          t = t->next;
-        }
-        Token *arg_end = t;
-
-        if (strict_mode && is_sizeof)
-        {
-          // sizeof(VLA_Type) - check for VLA typedef
-          if (arg_start && is_vla_typedef(arg_start))
+          if (tok->next && is_vla_typedef(tok->next))
             return true;
-
-          // sizeof(identifier) where identifier is a simple variable name is
-          // always a compile-time constant in C. Even if the variable is a VLA,
-          // the sizeof is evaluated at the point of the VLA declaration, but
-          // using sizeof(vla_var) in an array bound is extremely rare.
-          // We only flag sizeof(VLA_typedef) as runtime (checked above).
-          // Note: sizeof(identifier) was previously flagged as VLA which caused
-          // false positives like: int x; char buf[sizeof(x)]; // wrongly treated as VLA
-
-          // Check for VLA patterns inside the sizeof argument (e.g., sizeof(int[n]))
-          for (Token *st = arg_start; st && st != arg_end && st->kind != TK_EOF; st = st->next)
-          {
-            if (equal(st, "[") && array_size_is_vla(st, true))
+          Token *inner = tok->next;
+          Token *end = skip_balanced(tok, "(", ")");
+          for (; inner && inner != end && inner->kind != TK_EOF; inner = inner->next)
+            if (equal(inner, "[") && array_size_is_vla(inner))
               return true;
-          }
+          tok = end;
         }
-
-        tok = arg_end;
+        else
+          tok = skip_balanced(tok, "(", ")");
       }
-      prev_was_member_access = false;
       continue;
     }
 
-    // In lenient mode, skip offsetof entirely (already handled above)
-    if (!strict_mode && (equal(tok, "offsetof") || equal(tok, "__builtin_offsetof")))
-    {
-      tok = tok->next;
-      if (tok && equal(tok, "("))
-        tok = skip_balanced(tok, "(", ")");
-      prev_was_member_access = false;
-      continue;
-    }
-
-    // Track member access operators
-    if (equal(tok, "->") || equal(tok, "."))
-    {
-      prev_was_member_access = true;
-      tok = tok->next;
-      continue;
-    }
-
-    // Allow constant expression operators
-    if (is_const_expr_operator(tok))
-    {
-      prev_was_member_access = false;
-      tok = tok->next;
-      continue;
-    }
-
-    // Check identifiers
-    if (tok->kind == TK_IDENT)
-    {
-      // Member names after -> or . are compile-time constant
-      if (prev_was_member_access)
-      {
-        prev_was_member_access = false;
-        tok = tok->next;
-        continue;
-      }
-
-      // Constant identifiers (enums, typedefs, type keywords, system types)
-      if (is_const_identifier(tok))
-      {
-        tok = tok->next;
-        continue;
-      }
-
-      // Non-constant identifier found - this is a VLA
+    // offsetof — GCC treats as VLA in array bounds
+    if (equal(tok, "offsetof") || equal(tok, "__builtin_offsetof"))
       return true;
-    }
 
-    prev_was_member_access = false;
+    // Member access operators — non-ICE (pointer/struct dereference)
+    if (equal(tok, "->") || equal(tok, "."))
+      return true;
+
+    // Non-constant identifier → VLA
+    if (tok->kind == TK_IDENT && !is_known_enum_const(tok) && !is_type_keyword(tok))
+      return true;
+
     tok = tok->next;
   }
-
-  return false; // All tokens were constants
+  return false;
 }
 
-// Scan a token range for VLA array dimensions.
-// Checks every '[' at the top level of the given delimited region.
-// For struct bodies: pass open="{", close="}"
-// For typedef-to-semicolon: pass open=NULL, close=";"
-static bool scan_for_vla(Token *tok, const char *open, const char *close, bool strict_mode)
+// Scan a delimited region for VLA array dimensions.
+static bool scan_for_vla(Token *tok, const char *open, const char *close)
 {
   if (open && (!tok || !equal(tok, open)))
     return false;
   if (open)
-    tok = tok->next; // skip opening delimiter
+    tok = tok->next;
   int depth = 1;
   while (tok && tok->kind != TK_EOF)
   {
@@ -1632,32 +1491,22 @@ static bool scan_for_vla(Token *tok, const char *open, const char *close, bool s
       depth++;
     else if (equal(tok, close))
     {
-      if (open)
-      {
-        depth--;
-        if (depth <= 0)
-          break;
-      }
-      else
-        break;
+      if (open) { if (--depth <= 0) break; }
+      else break;
     }
     else if (!open && (equal(tok, "(") || equal(tok, "{")))
       depth++;
     else if (!open && (equal(tok, ")") || equal(tok, "}")))
       depth--;
-    else if (equal(tok, "[") && (open ? depth >= 1 : depth == 1))
-    {
-      if (array_size_is_vla(tok, strict_mode))
-        return true;
-    }
+    else if (equal(tok, "[") && depth >= 1 && array_size_is_vla(tok))
+      return true;
     tok = tok->next;
   }
   return false;
 }
 
-// Convenience wrappers
-#define struct_body_contains_vla(brace, strict) scan_for_vla(brace, "{", "}", strict)
-#define typedef_contains_vla(tok) scan_for_vla(tok, NULL, ";", true)
+#define struct_body_contains_vla(brace) scan_for_vla(brace, "{", "}")
+#define typedef_contains_vla(tok) scan_for_vla(tok, NULL, ";")
 
 static void parse_typedef_declaration(Token *tok, int scope_depth)
 {
@@ -1703,26 +1552,6 @@ static bool is_type_keyword(Token *tok)
   return is_typedef_like(tok);
 }
 
-// Check if token is a constant expression operator (safe in array dimensions)
-static bool is_const_expr_operator(Token *tok)
-{
-  return tok->kind == TK_NUM ||
-         equal(tok, "+") || equal(tok, "-") || equal(tok, "*") ||
-         equal(tok, "/") || equal(tok, "%") || equal(tok, "(") || equal(tok, ")") ||
-         equal(tok, "<<") || equal(tok, ">>") || equal(tok, "&") ||
-         equal(tok, "|") || equal(tok, "^") || equal(tok, "~") ||
-         equal(tok, "!") || equal(tok, "<") || equal(tok, ">") ||
-         equal(tok, "<=") || equal(tok, ">=") || equal(tok, "==") ||
-         equal(tok, "!=") || equal(tok, "&&") || equal(tok, "||") ||
-         equal(tok, "?") || equal(tok, ":");
-}
-
-// Check if identifier is a compile-time constant (enum, typedef, type keyword, system type)
-static bool is_const_identifier(Token *tok)
-{
-  return is_known_enum_const(tok) || is_type_keyword(tok);
-}
-
 // Check if token can be used as a variable name in a declarator.
 // Identifiers and prism keywords (raw, defer) which are only special at declaration start.
 static inline bool is_valid_varname(Token *tok)
@@ -1753,7 +1582,7 @@ static Token *skip_pragma_operators(Token *tok)
 // Returns info about the type and position after it
 static TypeSpecResult parse_type_specifier(Token *tok)
 {
-  TypeSpecResult r = {tok, false, false, false, false, false, false, false, false, NULL};
+  TypeSpecResult r = {tok, false, false, false, false, false, false, false, false};
 
   while ((tok->tag & TT_QUALIFIER) || is_type_keyword(tok) || is_c23_attr(tok))
   {
@@ -1799,9 +1628,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       // Skip body
       if (tok && equal(tok, "{"))
       {
-        if (struct_body_contains_vla(tok, false))
-          r.struct_vla_error_tok = tok;
-        if (struct_body_contains_vla(tok, true))
+        if (struct_body_contains_vla(tok))
           r.is_vla = true;
         tok = skip_balanced(tok, "{", "}");
       }
@@ -1956,7 +1783,7 @@ static DeclResult parse_declarator(Token *tok, bool emit)
   #define DECL_EMIT(t) do { if (emit) emit_tok(t); } while(0)
   #define DECL_BALANCED(t) (emit ? emit_balanced(t) : skip_balanced(t, equal(t,"(") ? "(" : equal(t,"[") ? "[" : "{", equal(t,"(") ? ")" : equal(t,"[") ? "]" : "}"))
   #define DECL_ATTR(t) do { if (emit) { t = emit_attr(t); } else { t = (t)->next; if (t && equal(t,"(")) t = skip_balanced(t,"(",")"); } } while(0)
-  #define DECL_ARRAY_DIMS(t, vla) do { while (equal(t, "[")) { if (array_size_is_vla(t, true)) *(vla) = true; t = DECL_BALANCED(t); } } while(0)
+  #define DECL_ARRAY_DIMS(t, vla) do { while (equal(t, "[")) { if (array_size_is_vla(t)) *(vla) = true; t = DECL_BALANCED(t); } } while(0)
 
   // Pointer modifiers and qualifiers
   while (equal(tok, "*") || (tok->tag & TT_QUALIFIER))
@@ -2347,10 +2174,6 @@ static Token *try_zero_init_decl(Token *tok)
   TypeSpecResult type = parse_type_specifier(tok);
   if (!type.saw_type)
     return NULL;
-
-  // Error on true VLA in struct/union body (deferred from parse_type_specifier)
-  if (type.struct_vla_error_tok)
-    error_tok(type.struct_vla_error_tok, "variable length array in struct/union is not supported");
 
   // Validate declaration structure
   if (!is_var_declaration(type.end))
