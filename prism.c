@@ -429,20 +429,10 @@ static void end_statement_after_semicolon(void)
 
 static void defer_push_scope(bool consume_flags)
 {
-  int n = ctx->defer_depth + 1;
-  if (n > defer_stack_capacity)
-  {
-    int new_cap = defer_stack_capacity == 0 ? INITIAL_CAP : defer_stack_capacity * 2;
-    while (new_cap < n)
-      new_cap *= 2;
-    DeferScope *new_stack = realloc(defer_stack, sizeof(DeferScope) * new_cap);
-    if (!new_stack)
-      error("out of memory growing defer stack");
-    for (int i = defer_stack_capacity; i < new_cap; i++)
-      new_stack[i] = (DeferScope){0};
-    defer_stack = new_stack;
-    defer_stack_capacity = new_cap;
-  }
+  int old_cap = defer_stack_capacity;
+  ENSURE_ARRAY_CAP(defer_stack, ctx->defer_depth + 1, defer_stack_capacity, INITIAL_CAP, DeferScope);
+  for (int i = old_cap; i < defer_stack_capacity; i++)
+    defer_stack[i] = (DeferScope){0};
   DeferScope *s = &defer_stack[ctx->defer_depth];
   s->count = 0;
   s->had_control_exit = false;
@@ -482,17 +472,7 @@ static void defer_add(Token *defer_keyword, Token *start, Token *end)
   if (ctx->defer_depth <= 0)
     error_tok(start, "defer outside of any scope");
   DeferScope *scope = &defer_stack[ctx->defer_depth - 1];
-  int n = scope->count + 1;
-  if (n > scope->capacity)
-  {
-    int new_cap = scope->capacity == 0 ? INITIAL_CAP : scope->capacity * 2;
-    while (new_cap < n)
-      new_cap *= 2;
-    scope->entries = realloc(scope->entries, sizeof(DeferEntry) * new_cap);
-    if (!scope->entries)
-      error("out of memory");
-    scope->capacity = new_cap;
-  }
+  ENSURE_ARRAY_CAP(scope->entries, scope->count + 1, scope->capacity, INITIAL_CAP, DeferEntry);
   scope->entries[scope->count++] = (DeferEntry){start, end, defer_keyword};
   scope->had_control_exit = false;
 }
@@ -2156,44 +2136,19 @@ static Token *handle_defer_keyword(Token *tok)
   if (control_state.pending && control_state.paren_depth > 0)
     error_tok(tok, "defer cannot appear inside control statement parentheses");
   if (control_state.pending && control_state.paren_depth == 0)
-    error_tok(tok, "defer requires braces in if/while/for/switch statements.\n"
-                   "       Braceless control flow does not create a scope, so defer binds to the parent scope\n"
-                   "       and executes unconditionally. Add braces to create a proper scope:\n"
-                   "       Bad:  if (x) defer cleanup();\n"
-                   "       Good: if (x) { defer cleanup(); }");
+    error_tok(tok, "defer requires braces in control statements (braceless has no scope)");
   for (int i = 0; i < ctx->stmt_expr_count; i++)
-  {
     if (ctx->defer_depth == stmt_expr_levels[i])
-    {
-      error_tok(tok, "defer cannot be used at the top level of statement expressions ({ ... }). "
-                     "The defer would execute after the final expression, changing the return type to void. "
-                     "Wrap the defer in a block: ({ { defer X; ... } result; })");
-      break;
-    }
-  }
+    { error_tok(tok, "defer cannot be at top level of statement expression; wrap in a block"); break; }
   if (ctx->current_func_has_setjmp)
-    error_tok(tok, "defer cannot be used in functions that call setjmp/longjmp/pthread_exit. "
-                   "These functions bypass defer cleanup entirely, causing resource leaks. "
-                   "Use explicit cleanup patterns (goto cleanup, or manual RAII) instead.");
+    error_tok(tok, "defer cannot be used in functions that call setjmp/longjmp/pthread_exit");
   if (ctx->current_func_has_vfork)
-    error_tok(tok, "defer cannot be used in functions that call vfork(). "
-                   "vfork shares address space with parent and has unpredictable control flow. "
-                   "Use fork() instead, or move defer to a wrapper function.");
+    error_tok(tok, "defer cannot be used in functions that call vfork()");
   if (ctx->current_func_has_asm)
-    error_tok(tok, "defer cannot be used in functions containing inline assembly. "
-                   "Inline asm may contain jumps (jmp, call, etc.) that bypass defer cleanup. "
-                   "Move the asm to a separate function, or use explicit cleanup instead.");
+    error_tok(tok, "defer cannot be used in functions containing inline assembly");
   for (int d = ctx->defer_depth - 1; d >= 0; d--)
-  {
     if (defer_stack[d].is_switch && ctx->defer_depth - 1 == d)
-      error_tok(tok, "defer in switch case requires braces to create a proper scope.\n"
-                     "       Without braces, defer at switch-level has unpredictable behavior:\n"
-                     "       - goto between cases may not execute the defer\n"
-                     "       - Hitting the next case label clears the defer\n"
-                     "       Wrap the case body in braces:\n"
-                     "       Bad:  case X: defer cleanup(); break;\n"
-                     "       Good: case X: { defer cleanup(); } break;");
-  }
+      error_tok(tok, "defer in switch case requires braces");
 
   Token *defer_keyword = tok;
   tok = tok->next;
@@ -2259,33 +2214,30 @@ static Token *handle_return_defer(Token *tok)
   {
     bool is_void_cast = equal(tok, "(") && tok->next && equal(tok->next, "void") &&
                         tok->next->next && equal(tok->next->next, ")");
-    if (ctx->current_func_returns_void || is_void_cast)
+    bool is_void = ctx->current_func_returns_void || is_void_cast;
+    OUT_LIT(" {");
+    if (!is_void)
     {
-      OUT_LIT(" { (");
-      tok = emit_expr_to_semicolon(tok);
-      OUT_LIT(");");
-      emit_all_defers();
-      OUT_LIT(" return;");
-      if (equal(tok, ";"))
-        tok = tok->next;
-      OUT_LIT(" }");
+      OUT_LIT(" __auto_type _prism_ret_");
+      out_uint(ctx->ret_counter);
+      OUT_LIT(" = (");
     }
     else
+      OUT_LIT(" (");
+    tok = emit_expr_to_semicolon(tok);
+    OUT_LIT(");");
+    emit_all_defers();
+    if (!is_void)
     {
-      unsigned long long my_ret = ctx->ret_counter++;
-      OUT_LIT(" { __auto_type _prism_ret_");
-      out_uint(my_ret);
-      OUT_LIT(" = (");
-      tok = emit_expr_to_semicolon(tok);
-      OUT_LIT(");");
-      emit_all_defers();
       OUT_LIT(" return _prism_ret_");
-      out_uint(my_ret);
-      out_char(';');
-      if (equal(tok, ";"))
-        tok = tok->next;
-      OUT_LIT(" }");
+      out_uint(ctx->ret_counter++);
     }
+    else
+      OUT_LIT(" return");
+    out_char(';');
+    if (equal(tok, ";"))
+      tok = tok->next;
+    OUT_LIT(" }");
   }
   end_statement_after_semicolon();
   return tok;
@@ -2330,9 +2282,7 @@ static Token *handle_goto_keyword(Token *tok)
     if (equal(tok, "*"))
     {
       if (has_active_defers())
-        error_tok(goto_tok, "computed goto (goto *) cannot be used with active defer statements. "
-                            "Defer cleanup cannot be guaranteed for runtime-determined jump targets. "
-                            "Restructure code to avoid computed goto or move defer outside this scope.");
+        error_tok(goto_tok, "computed goto cannot be used with active defer statements");
       emit_tok(goto_tok);
       return tok; // let main loop emit '*' and rest
     }
@@ -2402,8 +2352,7 @@ static void handle_case_default(Token *tok)
   {
     if (defer_stack[d].count > 0 && !defer_stack[d].had_control_exit)
       error_tok(defer_stack[d].entries[0].defer_kw,
-                "defer would be skipped due to switch fallthrough at %s:%d. "
-                "Add 'break;' before the next case, or wrap case body in braces.",
+                "defer skipped by switch fallthrough at %s:%d",
                 tok_file(tok)->name, tok_line_no(tok));
     if (defer_stack[d].is_switch)
     {
@@ -2455,15 +2404,10 @@ static Token *handle_sue_body(Token *tok)
 // Returns next token.
 static Token *handle_open_brace(Token *tok)
 {
-  // Compound literal inside control parens
-  if (control_state.pending && control_state.paren_depth > 0)
-  {
-    emit_tok(tok);
-    control_state.brace_depth++;
-    return tok->next;
-  }
-  // Compound literal after condition (before body)
-  if (control_state.pending && control_state.paren_depth == 0 && !control_state.parens_just_closed)
+  // Compound literal inside control parens, or after condition (before body)
+  if (control_state.pending &&
+      (control_state.paren_depth > 0 ||
+       (control_state.paren_depth == 0 && !control_state.parens_just_closed)))
   {
     emit_tok(tok);
     control_state.brace_depth++;
@@ -2515,9 +2459,7 @@ static Token *handle_close_brace(Token *tok)
 // Report goto skipping over a variable declaration (warn or error based on ctx->feature_warn_safety)
 static void report_goto_skips_decl(Token *skipped_decl, Token *label_tok)
 {
-  const char *msg = "goto '%.*s' would skip over this variable declaration, "
-                    "bypassing zero-initialization (undefined behavior in C). "
-                    "Move the declaration before the goto, or restructure the code.";
+  const char *msg = "goto '%.*s' would skip over this variable declaration (bypasses zero-init)";
   if (ctx->feature_warn_safety)
     warn_tok(skipped_decl, msg, label_tok->len, label_tok->loc);
   else
@@ -2825,8 +2767,7 @@ static int transpile(char *input_file, char *output_file)
     {
       mark_switch_control_exit();
       if (ctx->feature_defer && has_active_defers())
-        fprintf(stderr, "%s:%d: warning: '%.*s' called with active defers - deferred statements will NOT run. "
-                        "Consider using return with cleanup, or restructure to avoid defer here.\n",
+        fprintf(stderr, "%s:%d: warning: '%.*s' called with active defers (defers will not run)\n",
                 tok_file(tok)->name, tok_line_no(tok), tok->len, tok->loc);
     }
 
@@ -2849,12 +2790,10 @@ static int transpile(char *input_file, char *output_file)
       {
         ctx->next_scope_is_loop = true;
         control_state.pending = true;
-        if (equal(tok, "for"))
-          ctx->pending_for_paren = true;
         if (equal(tok, "do"))
           control_state.parens_just_closed = true;
       }
-      else if (ctx->feature_zeroinit && equal(tok, "for"))
+      if (equal(tok, "for") && (ctx->feature_defer || ctx->feature_zeroinit))
       {
         control_state.pending = true;
         ctx->pending_for_paren = true;
@@ -3395,19 +3334,8 @@ static const char *get_real_cc(const char *cc)
   return cc;
 }
 
-#define CLI_PUSH(arr, cnt, cap, item)              \
-  do                                               \
-  {                                                \
-    if ((cnt) >= (cap))                            \
-    {                                              \
-      int nc = (cap) ? (cap) * 2 : 16;             \
-      (arr) = realloc((arr), sizeof(*(arr)) * nc); \
-      if (!(arr))                                  \
-        die("Out of memory");                      \
-      (cap) = nc;                                  \
-    }                                              \
-    (arr)[(cnt)++] = (item);                       \
-  } while (0)
+#define CLI_PUSH(arr, cnt, cap, item) \
+  do { ENSURE_ARRAY_CAP(arr, (cnt) + 1, cap, 16, __typeof__(*(arr))); (arr)[(cnt)++] = (item); } while (0)
 
 static inline bool has_ext(const char *f, const char *ext)
 {
