@@ -307,33 +307,60 @@ static LabelTable label_table;
 static int *stmt_expr_levels = NULL; // ctx->defer_depth when stmt expr started (dynamic)
 static int stmt_expr_capacity = 0;   // capacity of stmt_expr_levels array
 
-// Token emission - delegates to stdio with setvbuf for buffering
+// Token emission - user-space buffered output for minimal syscall overhead
 static FILE *out_fp;
 static Token *last_emitted = NULL;
+
+#define OUT_BUF_SIZE (128 * 1024)
+static char out_buf[OUT_BUF_SIZE];
+static int out_buf_pos = 0;
+
+static void out_flush(void)
+{
+  if (out_buf_pos > 0)
+  {
+    fwrite(out_buf, 1, out_buf_pos, out_fp);
+    out_buf_pos = 0;
+  }
+}
+
+static inline void out_char(char c)
+{
+  out_buf[out_buf_pos++] = c;
+  if (__builtin_expect(out_buf_pos >= OUT_BUF_SIZE, 0))
+    out_flush();
+}
+
+static inline void out_str(const char *s, int len)
+{
+  if (__builtin_expect(out_buf_pos + len > OUT_BUF_SIZE, 0))
+    out_flush();
+  if (__builtin_expect(len > OUT_BUF_SIZE, 0))
+  {
+    fwrite(s, 1, len, out_fp);
+    return;
+  }
+  memcpy(out_buf + out_buf_pos, s, len);
+  out_buf_pos += len;
+}
+
+#define OUT_LIT(s) out_str(s, sizeof(s) - 1)
 
 static void out_init(FILE *fp)
 {
   out_fp = fp;
-  setvbuf(fp, NULL, _IOFBF, 65536);
+  out_buf_pos = 0;
 }
 static void out_close(void)
 {
   if (out_fp)
   {
+    out_flush();
     fclose(out_fp);
     out_fp = NULL;
   }
 }
 
-// Use unlocked stdio for single-threaded output (avoids per-call locking overhead)
-#define out_char(c) putc_unlocked(c, out_fp)
-#ifdef __GLIBC__
-#define out_str(s, len) fwrite_unlocked(s, 1, len, out_fp)
-#define OUT_LIT(s) fwrite_unlocked(s, 1, sizeof(s) - 1, out_fp)
-#else
-#define out_str(s, len) fwrite(s, 1, len, out_fp)
-#define OUT_LIT(s) fwrite(s, 1, sizeof(s) - 1, out_fp)
-#endif
 
 static void out_uint(unsigned long long v)
 {
@@ -342,12 +369,32 @@ static void out_uint(unsigned long long v)
   {
     *--p = '0' + v % 10;
   } while (v /= 10);
-  fwrite(p, 1, buf + sizeof(buf) - p, out_fp);
+  out_str(p, buf + sizeof(buf) - p);
 }
 
 static void out_line(int line_no, const char *file)
 {
-  fprintf(out_fp, "#line %d \"%s\"\n", line_no, file);
+  // Build #line directive in a single buffer to minimize stdio calls
+  char buf[PATH_MAX + 32];
+  int n = 0;
+  memcpy(buf, "#line ", 6);
+  n = 6;
+  // Convert line_no to string
+  char num[24];
+  char *p = num + sizeof(num);
+  unsigned long long v = line_no;
+  do { *--p = '0' + v % 10; } while (v /= 10);
+  int numlen = num + sizeof(num) - p;
+  memcpy(buf + n, p, numlen);
+  n += numlen;
+  buf[n++] = ' ';
+  buf[n++] = '"';
+  int flen = strlen(file);
+  memcpy(buf + n, file, flen);
+  n += flen;
+  buf[n++] = '"';
+  buf[n++] = '\n';
+  out_str(buf, n);
 }
 
 // System header tracking (for non-flattened output)
@@ -592,10 +639,11 @@ static bool is_inside_attribute(Token *tok)
 // Emit a single token with appropriate spacing
 static void emit_tok(Token *tok)
 {
+  // Get file info — tok is always non-NULL here, file_idx is always valid
+  File *f = ctx->input_files[tok->file_idx];
+
   // Skip system header include content when not flattening
-  // But keep macro expansions (is_include_entry=false means it's a macro, not an include)
-  File *f = tok_file(tok);
-  if (!FEAT(F_FLATTEN) && f && f->is_system && f->is_include_entry)
+  if (__builtin_expect(!FEAT(F_FLATTEN) && f->is_system && f->is_include_entry, 0))
     return;
 
   // Check if we need a #line directive BEFORE emitting the token
@@ -603,17 +651,14 @@ static void emit_tok(Token *tok)
   char *tok_fname = NULL;
   int line_no = 0;
 
-  if (FEAT(F_LINE_DIR) && f)
+  if (FEAT(F_LINE_DIR))
   {
-    line_no = tok_line_no(tok);
-    if (line_no > 0)
-    {
-      tok_fname = f->display_name ? f->display_name : f->name;
-      need_line = (ctx->last_filename != tok_fname &&
-                   (!ctx->last_filename || !tok_fname || strcmp(ctx->last_filename, tok_fname) != 0)) ||
-                  (f->is_system != ctx->last_system_header) ||
-                  (line_no != ctx->last_line_no && line_no != ctx->last_line_no + 1);
-    }
+    line_no = tok->line_no;
+    tok_fname = f->display_name ? f->display_name : f->name;
+    need_line = (ctx->last_filename != tok_fname &&
+                 (!ctx->last_filename || !tok_fname || strcmp(ctx->last_filename, tok_fname) != 0)) ||
+                (f->is_system != ctx->last_system_header) ||
+                (line_no != ctx->last_line_no && line_no != ctx->last_line_no + 1);
   }
 
   // Spacing: BOL gets newline, otherwise check for #line or token-merge space
@@ -621,7 +666,7 @@ static void emit_tok(Token *tok)
     out_char('\n');
   else if (need_line)
     out_char('\n');
-  else if (needs_space(last_emitted, tok))
+  else if ((tok->flags & TF_HAS_SPACE) || needs_space(last_emitted, tok))
     out_char(' ');
 
   if (need_line)
@@ -631,7 +676,7 @@ static void emit_tok(Token *tok)
     ctx->last_filename = tok_fname;
     ctx->last_system_header = f->is_system;
   }
-  else if (FEAT(F_LINE_DIR) && f && line_no > 0 && line_no > ctx->last_line_no)
+  else if (line_no > ctx->last_line_no)
     ctx->last_line_no = line_no;
 
   // Handle preprocessor directives (e.g., #pragma) - emit verbatim
@@ -645,28 +690,35 @@ static void emit_tok(Token *tok)
     return;
   }
 
-  // Handle C23 extended float suffixes (F128, F64, F32, F16, BF16)
-  if (tok->kind == TK_NUM && (tok->flags & TF_IS_FLOAT))
+  // Handle rare special cases: C23 float suffixes, digraphs, prep directives
+  if (__builtin_expect(tok->flags & (TF_IS_FLOAT | TF_IS_DIGRAPH), 0))
   {
-    const char *replacement;
-    int suffix_len = get_extended_float_suffix(tok->loc, tok->len, &replacement);
-    if (suffix_len > 0)
+    // Handle C23 extended float suffixes (F128, F64, F32, F16, BF16)
+    if ((tok->flags & TF_IS_FLOAT) && tok->kind == TK_NUM)
     {
-      out_str(tok->loc, tok->len - suffix_len);
-      if (replacement)
-        out_str(replacement, strlen(replacement));
-      last_emitted = tok;
-      return;
+      const char *replacement;
+      int suffix_len = get_extended_float_suffix(tok->loc, tok->len, &replacement);
+      if (suffix_len > 0)
+      {
+        out_str(tok->loc, tok->len - suffix_len);
+        if (replacement)
+          out_str(replacement, strlen(replacement));
+        last_emitted = tok;
+        return;
+      }
     }
-  }
 
-  // Handle digraphs - translate to canonical form
-  const char *equiv = digraph_equiv(tok);
-  if (equiv)
-  {
-    out_str(equiv, strlen(equiv));
-    last_emitted = tok;
-    return;
+    // Handle digraphs - translate to canonical form
+    if (tok->flags & TF_IS_DIGRAPH)
+    {
+      const char *equiv = digraph_equiv(tok);
+      if (equiv)
+      {
+        out_str(equiv, strlen(equiv));
+        last_emitted = tok;
+        return;
+      }
+    }
   }
 
   out_str(tok->loc, tok->len);
@@ -1040,17 +1092,34 @@ static bool walker_next(TokenWalker *w)
     }
 
     // Track braces — update depth but still return token to caller
-    if (equal(w->tok, "{"))
+    // Fast path: single len==1 check covers both { and }, avoiding two equal() calls
+    if (w->tok->len == 1)
     {
-      w->depth++;
+      char c = w->tok->loc[0];
+      if (c == '{')
+        w->depth++;
+      else if (c == '}')
+      {
+        if (w->depth <= w->initial_depth)
+          return false; // End of region
+        if (w->struct_depth > 0)
+          w->struct_depth--;
+        w->depth--;
+      }
     }
-    else if (equal(w->tok, "}"))
+    else if (__builtin_expect(w->tok->flags & TF_IS_DIGRAPH, 0))
     {
-      if (w->depth <= w->initial_depth)
-        return false; // End of region
-      if (w->struct_depth > 0)
-        w->struct_depth--;
-      w->depth--;
+      // Handle <% and %> digraphs (extremely rare)
+      if (_equal_1(w->tok, '{'))
+        w->depth++;
+      else if (_equal_1(w->tok, '}'))
+      {
+        if (w->depth <= w->initial_depth)
+          return false;
+        if (w->struct_depth > 0)
+          w->struct_depth--;
+        w->depth--;
+      }
     }
 
     return true;
@@ -1088,6 +1157,10 @@ static Token *walker_check_label(TokenWalker *w)
 // Scan a function body for labels and record their scope depths
 // Also detects setjmp/longjmp/pthread_exit/vfork and inline asm usage
 // tok should point to the opening '{' of the function body
+//
+// Performance: this is a hot function (~77K tokens scanned per run).
+// Uses a two-phase approach: quick pre-scan for goto/setjmp/vfork/asm,
+// then full label scan only if the function contains goto statements.
 static void scan_labels_in_function(Token *tok)
 {
   label_table.count = 0;
@@ -1098,23 +1171,107 @@ static void scan_labels_in_function(Token *tok)
   if (!tok || !equal(tok, "{"))
     return;
 
-  TokenWalker w;
-  walker_init(&w, tok->next, 1); // depth 1 = inside function body
-
-  while (walker_next(&w))
+  // Phase 1: Quick scan for goto + setjmp/vfork/asm (cheap: ~5 insns/token)
+  bool needs_labels = false;
   {
-    if (w.tok->tag & TT_SETJMP_FN)
-      ctx->current_func_has_setjmp = true;
-    if (w.tok->tag & TT_VFORK_FN)
-      ctx->current_func_has_vfork = true;
-    if (w.tok->tag & TT_ASM)
-      ctx->current_func_has_asm = true;
+    int d = 1;
+    for (Token *t = tok->next; t && t->kind != TK_EOF; t = t->next)
+    {
+      uint32_t tag = t->tag;
+      if (__builtin_expect(tag & (TT_SETJMP_FN | TT_VFORK_FN | TT_ASM | TT_GOTO), 0))
+      {
+        if (tag & TT_SETJMP_FN) ctx->current_func_has_setjmp = true;
+        if (tag & TT_VFORK_FN) ctx->current_func_has_vfork = true;
+        if (tag & TT_ASM)      ctx->current_func_has_asm = true;
+        if (tag & TT_GOTO)     needs_labels = true;
+      }
+      if (t->len == 1)
+      {
+        if (t->loc[0] == '{') d++;
+        else if (t->loc[0] == '}' && --d <= 0) break;
+      }
+    }
+  }
 
-    Token *label = walker_check_label(&w);
-    if (label)
-      label_table_add(label->loc, label->len, w.depth);
+  // Phase 2: Full label scan — only needed when function contains goto
+  if (!needs_labels)
+    return;
 
-    walker_advance(&w);
+  Token *t = tok->next;
+  Token *prev = NULL;
+  int depth = 1;
+  int struct_depth = 0;
+
+  while (t && t->kind != TK_EOF)
+  {
+    uint32_t tag = t->tag;
+
+    // Skip struct/union/enum body openings (keyword -> past '{')
+    if (__builtin_expect(tag & TT_SUE, 0))
+    {
+      Token *brace = find_struct_body_brace(t);
+      if (brace)
+      {
+        while (t != brace) { prev = t; t = t->next; }
+        struct_depth++;
+        depth++;
+        prev = t; t = t->next;
+        continue;
+      }
+    }
+
+    // Skip _Generic(...)
+    if (__builtin_expect(tag & TT_GENERIC, 0))
+    {
+      prev = t; t = t->next;
+      if (t && equal(t, "("))
+        t = skip_balanced(t, "(", ")");
+      prev = NULL;
+      continue;
+    }
+
+    // Brace tracking — fast path for single-char tokens
+    if (t->len == 1)
+    {
+      char c = t->loc[0];
+      if (c == '{')
+        depth++;
+      else if (c == '}')
+      {
+        if (depth <= 1)
+          break;
+        if (struct_depth > 0)
+          struct_depth--;
+        depth--;
+      }
+    }
+    else if (__builtin_expect(t->flags & TF_IS_DIGRAPH, 0))
+    {
+      if (_equal_1(t, '{')) depth++;
+      else if (_equal_1(t, '}'))
+      {
+        if (depth <= 1) break;
+        if (struct_depth > 0) struct_depth--;
+        depth--;
+      }
+    }
+
+    // Label check: identifier followed by ':' (not '::')
+    // Filters: ternary '?:', case/default, bitfields
+    if (struct_depth == 0 && (t->kind == TK_IDENT || t->kind == TK_KEYWORD))
+    {
+      Token *after = skip_gnu_attributes(t->next);
+      if (after && after->len == 1 && after->loc[0] == ':' &&
+          !(after->next && after->next->len == 1 && after->next->loc[0] == ':') &&
+          !(prev && prev->len == 1 && prev->loc[0] == '?') &&
+          !(prev && (prev->tag & (TT_CASE | TT_DEFAULT))))
+      {
+        label_table_add(t->loc, t->len, depth);
+      }
+    }
+
+    prev = t;
+    t = t->next;
   }
 }
 
@@ -2846,13 +3003,20 @@ static int transpile(char *input_file, char *output_file)
     ctx->at_stmt_start = false;
 
     // Noreturn function warning
-    if ((tag & TT_NORETURN_FN) && tok->next && equal(tok->next, "("))
+    if (tag & TT_NORETURN_FN)
     {
-      mark_switch_control_exit();
-      if (FEAT(F_DEFER) && has_active_defers())
-        fprintf(stderr, "%s:%d: warning: '%.*s' called with active defers (defers will not run)\n",
-                tok_file(tok)->name, tok_line_no(tok), tok->len, tok->loc);
+      if (tok->next && equal(tok->next, "("))
+      {
+        mark_switch_control_exit();
+        if (FEAT(F_DEFER) && has_active_defers())
+          fprintf(stderr, "%s:%d: warning: '%.*s' called with active defers (defers will not run)\n",
+                  tok_file(tok)->name, tok_line_no(tok), tok->len, tok->loc);
+      }
     }
+
+    // ── Tag-dependent dispatch (skip entirely for untagged tokens like punctuation) ──
+    if (tag)
+    {
 
     // ── Keyword dispatch (defer, return, break/continue, goto) ──
 
@@ -2897,13 +3061,6 @@ static int transpile(char *input_file, char *output_file)
       }
       continue;
     }
-    if (ctx->generic_paren_depth > 0)
-    {
-      if (equal(tok, "("))
-        ctx->generic_paren_depth++;
-      else if (equal(tok, ")"))
-        ctx->generic_paren_depth--;
-    }
 
     if (FEAT(F_DEFER) && (tag & TT_SWITCH))
     {
@@ -2922,10 +3079,21 @@ static int transpile(char *input_file, char *output_file)
     if (tag & (TT_CASE | TT_DEFAULT))
       handle_case_default(tok);
 
+    } // end if (tag)
+
+    // _Generic paren tracking (only active inside _Generic expressions)
+    if (__builtin_expect(ctx->generic_paren_depth > 0, 0))
+    {
+      if (equal(tok, "("))
+        ctx->generic_paren_depth++;
+      else if (equal(tok, ")"))
+        ctx->generic_paren_depth--;
+    }
+
     // ── Scope management ──
 
-    // Function definition detection at top level
-    if (FEAT(F_DEFER) && equal(tok, "{") && ctx->defer_depth == 0)
+    // Function definition detection at top level (defer_depth check first to skip inside bodies)
+    if (ctx->defer_depth == 0 && FEAT(F_DEFER) && equal(tok, "{"))
     {
       if (prev_toplevel_tok && equal(prev_toplevel_tok, ")"))
       {
@@ -2935,8 +3103,8 @@ static int transpile(char *input_file, char *output_file)
       next_func_returns_void = false;
     }
 
-    // Void function detection at top level
-    if (ctx->defer_depth == 0 && is_void_function_decl(tok))
+    // Void function detection — only for keywords at top level
+    if (ctx->defer_depth == 0 && tok->kind == TK_KEYWORD && is_void_function_decl(tok))
       next_func_returns_void = true;
 
     // struct/union/enum body
@@ -2996,8 +3164,8 @@ static int transpile(char *input_file, char *output_file)
     if (equal(tok, ";") && !ctrl.pending)
       ctx->at_stmt_start = true;
 
-    // Preprocessor directives
-    if (tok->kind == TK_PREP_DIR)
+    // Preprocessor directives (checked early for fast dispatch)
+    if (__builtin_expect(tok->kind == TK_PREP_DIR, 0))
     {
       emit_tok(tok);
       tok = tok->next;
@@ -3005,12 +3173,13 @@ static int transpile(char *input_file, char *output_file)
       continue;
     }
 
-    // Reset void detection at top-level semicolons
-    if (equal(tok, ";") && ctx->defer_depth == 0)
-      next_func_returns_void = false;
-
-    // Label detection (label:)
-    if (equal(tok, ":") && last_emitted && last_emitted->kind == TK_IDENT &&
+    // Semicolons and labels — single equal() check covers both
+    if (equal(tok, ";"))
+    {
+      if (ctx->defer_depth == 0)
+        next_func_returns_void = false;
+    }
+    else if (equal(tok, ":") && last_emitted && last_emitted->kind == TK_IDENT &&
         ctx->struct_depth == 0 && ctx->defer_depth > 0)
     {
       emit_tok(tok);
@@ -3197,11 +3366,10 @@ PRISM_API void prism_reset(void)
 
   if (out_fp)
   {
+    out_flush();
     fclose(out_fp);
     out_fp = NULL;
   }
-
-  reset_transpiler_state();
 }
 
 // CLI IMPLEMENTATION (excluded with -DPRISM_LIB_MODE)

@@ -37,6 +37,16 @@
 #define IS_ALNUM(c) (IS_DIGIT(c) || IS_ALPHA(c))
 #define IS_XDIGIT(c) (IS_DIGIT(c) || ((unsigned)((c) | 0x20) - 'a') < 6u)
 
+// Lookup table for identifier-continuation chars (alnum + _ + $ + bytes >= 0x80)
+static const uint8_t ident_char[256] = {
+    ['0' ... '9'] = 1,
+    ['A' ... 'Z'] = 1,
+    ['a' ... 'z'] = 1,
+    ['_'] = 1,
+    ['$'] = 1,
+    [0x80 ... 0xFF] = 1,
+};
+
 // Generic array growth: ensures *arr has capacity for n elements
 // Note: Uses error() instead of exit(1) to support PRISM_LIB_MODE where
 // error() uses longjmp for recovery instead of terminating the host process.
@@ -275,6 +285,16 @@ typedef struct
     int used;
 } HashMap;
 
+// Perfect hash keyword table — O(1) lookup with single memcmp
+typedef struct
+{
+    char *name;
+    uint8_t len;
+    uintptr_t value;
+} KeywordEntry;
+
+static KeywordEntry keyword_perfect[256];
+
 // Feature flags (compact bitmask for PrismContext.features)
 enum
 {
@@ -353,19 +373,28 @@ static void prism_ctx_init(void)
     ctx->at_stmt_start = true;
 }
 
-// Token arena - uses main_arena
-static Token *arena_alloc_token(void)
+// Token arena - uses main_arena with inlined bump allocator
+#define TOKEN_ALLOC_SIZE (((int)sizeof(Token) + 7) & ~7)
+static inline Token *arena_alloc_token(void)
 {
-    return arena_alloc_uninit(&ctx->main_arena, sizeof(Token));
+    Arena *arena = &ctx->main_arena;
+    ArenaBlock *blk = arena->current;
+    if (__builtin_expect(blk && blk->used + TOKEN_ALLOC_SIZE <= blk->capacity, 1))
+    {
+        Token *tok = (Token *)(blk->data + blk->used);
+        blk->used += TOKEN_ALLOC_SIZE;
+        return tok;
+    }
+    return arena_alloc_uninit(arena, sizeof(Token));
 }
 
-static uint64_t fnv_hash(char *s, int len)
+static inline uint64_t fnv_hash(char *s, int len)
 {
     uint64_t hash = 0xcbf29ce484222325;
     for (int i = 0; i < len; i++)
     {
-        hash *= 0x100000001b3;
         hash ^= (unsigned char)s[i];
+        hash *= 0x100000001b3;
     }
     return hash;
 }
@@ -375,9 +404,10 @@ static void *hashmap_get(HashMap *map, char *key, int keylen)
     if (!map->buckets)
         return NULL;
     uint64_t hash = fnv_hash(key, keylen);
-    for (int i = 0; i < map->capacity; i++)
+    int mask = map->capacity - 1; // capacity is always power-of-2
+    for (int i = 0; i <= mask; i++)
     {
-        HashEntry *ent = &map->buckets[(hash + i) % map->capacity];
+        HashEntry *ent = &map->buckets[(hash + i) & mask];
         if (ent->key && ent->key != TOMBSTONE &&
             ent->keylen == keylen && !memcmp(ent->key, key, keylen))
             return ent->val;
@@ -419,11 +449,13 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val)
     }
 
     uint64_t hash = fnv_hash(key, keylen);
+    int mask = map->capacity - 1;
     int first_empty = -1;
 
-    for (int i = 0; i < map->capacity; i++)
+    for (int i = 0; i <= mask; i++)
     {
-        HashEntry *ent = &map->buckets[(hash + i) % map->capacity];
+        int idx = (hash + i) & mask;
+        HashEntry *ent = &map->buckets[idx];
 
         // Check for existing key to update
         if (ent->key && ent->key != TOMBSTONE &&
@@ -435,7 +467,7 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val)
 
         // Remember first empty slot
         if (first_empty < 0 && (!ent->key || ent->key == TOMBSTONE))
-            first_empty = (hash + i) % map->capacity;
+            first_empty = idx;
 
         // Stop at truly empty slot (not tombstone)
         if (!ent->key)
@@ -459,9 +491,10 @@ static void hashmap_delete2(HashMap *map, char *key, int keylen)
     if (!map->buckets)
         return;
     uint64_t hash = fnv_hash(key, keylen);
-    for (int i = 0; i < map->capacity; i++)
+    int mask = map->capacity - 1;
+    for (int i = 0; i <= mask; i++)
     {
-        HashEntry *ent = &map->buckets[(hash + i) % map->capacity];
+        HashEntry *ent = &map->buckets[(hash + i) & mask];
         if (ent->key && ent->key != TOMBSTONE &&
             ent->keylen == keylen && !memcmp(ent->key, key, keylen))
         {
@@ -775,15 +808,32 @@ static inline bool _equal_2(Token *tok, const char *s)
 }
 
 // Dispatch: compile-time length → inline fast path, runtime length → equal_n
-#define equal(tok, s) (__builtin_constant_p(s) ? \
-    (__builtin_strlen(s) == 1 ? _equal_1(tok, (s)[0]) : \
-     __builtin_strlen(s) == 2 ? _equal_2(tok, s) : \
-     equal_n(tok, s, __builtin_strlen(s))) : \
-    equal_n(tok, s, strlen(s)))
+#define equal(tok, s) (__builtin_constant_p(s) ? (__builtin_strlen(s) == 1 ? _equal_1(tok, (s)[0]) : __builtin_strlen(s) == 2 ? _equal_2(tok, s)                      \
+                                                                                                                              : equal_n(tok, s, __builtin_strlen(s))) \
+                                               : equal_n(tok, s, strlen(s)))
 
 // Internal marker bit for keyword map: values are (tag | KW_MARKER)
 // This distinguishes tag=0 keywords from "not found" (NULL)
 #define KW_MARKER 0x80000000UL
+
+// Perfect hash for keyword lookup: maps all 86 keywords to unique slots in a 256-entry table.
+// Hash uses (len, first char, second char, char at position 6 or last char).
+#define KEYWORD_HASH(key, len)                                         \
+    (((unsigned)(len) * 2 + (unsigned char)(key)[0] * 99 +             \
+      (unsigned char)(key)[1] * 125 +                                  \
+      (unsigned char)((len) > 6 ? (key)[6] : (key)[(len) - 1]) * 69) & \
+     255)
+
+static inline uintptr_t keyword_lookup(char *key, int keylen)
+{
+    if (keylen < 2)
+        return 0; // No keyword is shorter than 2 chars
+    unsigned slot = KEYWORD_HASH(key, keylen);
+    KeywordEntry *ent = &keyword_perfect[slot];
+    if (ent->len == keylen && !memcmp(ent->name, key, keylen))
+        return ent->value;
+    return 0;
+}
 
 static void init_keyword_map(void)
 {
@@ -906,6 +956,29 @@ static void init_keyword_map(void)
     for (size_t i = 0; i < sizeof(id_tags) / sizeof(*id_tags); i++)
         hashmap_put(&ctx->keyword_map, id_tags[i].name, strlen(id_tags[i].name),
                     (void *)(uintptr_t)(id_tags[i].tag));
+
+    // Populate perfect hash table for O(1) keyword lookup
+    memset(keyword_perfect, 0, sizeof(keyword_perfect));
+    for (size_t i = 0; i < sizeof(kw) / sizeof(*kw); i++)
+    {
+        int len = strlen(kw[i].name);
+        unsigned slot = KEYWORD_HASH(kw[i].name, len);
+        if (keyword_perfect[slot].name)
+            error("keyword hash collision: '%s' and '%s'", keyword_perfect[slot].name, kw[i].name);
+        keyword_perfect[slot].name = kw[i].name;
+        keyword_perfect[slot].len = len;
+        keyword_perfect[slot].value = kw[i].tag | KW_MARKER;
+    }
+    for (size_t i = 0; i < sizeof(id_tags) / sizeof(*id_tags); i++)
+    {
+        int len = strlen(id_tags[i].name);
+        unsigned slot = KEYWORD_HASH(id_tags[i].name, len);
+        if (keyword_perfect[slot].name)
+            error("keyword hash collision: '%s' and '%s'", keyword_perfect[slot].name, id_tags[i].name);
+        keyword_perfect[slot].name = id_tags[i].name;
+        keyword_perfect[slot].len = len;
+        keyword_perfect[slot].value = id_tags[i].tag;
+    }
 }
 
 // After cc -E, UCNs are resolved. Just handle ASCII + pass through non-ASCII bytes.
@@ -918,7 +991,7 @@ static int read_ident(char *start)
         p++;
     else
         return 0;
-    while (IS_ALNUM(*p) || (unsigned char)*p >= 0x80)
+    while (ident_char[(unsigned char)*p])
         p++;
     return p - start;
 }
@@ -1072,7 +1145,7 @@ static char *raw_string_literal_end(char *p)
     return NULL;
 }
 
-static Token *new_token(TokenKind kind, char *start, char *end)
+static inline __attribute__((always_inline)) Token *new_token(TokenKind kind, char *start, char *end)
 {
     Token *tok = arena_alloc_token();
     tok->kind = kind;
@@ -1390,7 +1463,7 @@ static char *scan_pp_number(char *p)
         {
             p += 2;
         }
-        else if (IS_ALNUM(c) || c == '.' || c == '_')
+        else if (ident_char[(unsigned char)c] || c == '.')
         {
             // Accept digits, letters (hex, suffixes, extensions), dot, underscore
             p++;
@@ -1546,17 +1619,16 @@ static Token *tokenize(File *file)
         if (ident_len)
         {
             Token *t = cur = cur->next = new_token(TK_IDENT, p, p + ident_len);
-            void *kw = hashmap_get(&ctx->keyword_map, p, ident_len);
+            uintptr_t kw = keyword_lookup(p, ident_len);
             if (kw)
             {
-                uintptr_t v = (uintptr_t)kw;
-                if (v & KW_MARKER)
+                if (kw & KW_MARKER)
                 {
                     t->kind = TK_KEYWORD;
-                    t->tag = (uint32_t)(v & ~KW_MARKER);
+                    t->tag = (uint32_t)(kw & ~KW_MARKER);
                 }
                 else
-                    t->tag = (uint32_t)v;
+                    t->tag = (uint32_t)kw;
             }
             p += ident_len;
             continue;
