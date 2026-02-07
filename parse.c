@@ -252,6 +252,9 @@ typedef struct
     int used;
 } HashMap;
 
+// Feature flags (compact bitmask for PrismContext.features)
+enum { F_DEFER = 1, F_ZEROINIT = 2, F_LINE_DIR = 4, F_WARN_SAFETY = 8, F_FLATTEN = 16 };
+
 typedef struct PrismContext
 {
     Arena main_arena;
@@ -271,11 +274,7 @@ typedef struct PrismContext
     int error_line;
     int error_col;
 #endif
-    bool feature_defer;
-    bool feature_zeroinit;
-    bool feature_warn_safety;
-    bool feature_flatten_headers;
-    bool emit_line_directives;
+    uint32_t features; // F_DEFER | F_ZEROINIT | F_LINE_DIR | F_WARN_SAFETY | F_FLATTEN
     const char *extra_compiler;
     const char **extra_compiler_flags;
     int extra_compiler_flags_count;
@@ -287,11 +286,6 @@ typedef struct PrismContext
     int extra_force_include_count;
     int struct_depth;
     int defer_depth;
-    bool next_scope_is_loop;
-    bool next_scope_is_switch;
-    bool next_scope_is_conditional;
-    bool in_for_init;
-    bool pending_for_paren;
     int conditional_block_depth;
     int generic_paren_depth;
     bool current_func_returns_void;
@@ -324,10 +318,7 @@ static void prism_ctx_init(void)
         exit(1);
     }
     ctx->main_arena.default_block_size = ARENA_DEFAULT_BLOCK_SIZE;
-    ctx->feature_defer = true;
-    ctx->feature_zeroinit = true;
-    ctx->emit_line_directives = true;
-    ctx->feature_flatten_headers = true;
+    ctx->features = F_DEFER | F_ZEROINIT | F_LINE_DIR | F_FLATTEN;
     ctx->at_stmt_start = true;
 }
 

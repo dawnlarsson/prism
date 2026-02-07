@@ -87,6 +87,14 @@ PRISM_API PrismFeatures prism_defaults(void)
       .force_include_count = 0};
 }
 
+// Feature flag check macro
+#define FEAT(f) (ctx->features & (f))
+static uint32_t features_to_bits(PrismFeatures f) {
+  return (f.defer ? F_DEFER : 0) | (f.zeroinit ? F_ZEROINIT : 0)
+       | (f.line_directives ? F_LINE_DIR : 0) | (f.warn_safety ? F_WARN_SAFETY : 0)
+       | (f.flatten_headers ? F_FLATTEN : 0);
+}
+
 // Forward declarations for library API
 PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures features);
 PRISM_API void prism_free(PrismResult *r);
@@ -263,32 +271,22 @@ static TypedefTable typedef_table;
 static DeferScope *defer_stack = NULL;
 static int defer_stack_capacity = 0;
 
-// Control flow parsing state - tracks the transition from control keyword to body
-// e.g., "for (int i = 0; i < n; i++)" parens, or "if (cond)" before the { or statement
-typedef struct
-{
-  bool pending;            // True after if/else/for/while/do/switch until we see { or ;
-  int paren_depth;         // Track parens to distinguish for(;;) from braceless body
-  int brace_depth;         // Track braces inside control parens (compound literals)
-  bool parens_just_closed; // True immediately after control parens close (depth 1→0)
-} ControlFlowState;
+// Control flow state — tracks control keyword to body transition
+enum { NS_LOOP = 1, NS_SWITCH = 2, NS_CONDITIONAL = 4 };
 
-static ControlFlowState control_state = {0};
+typedef struct {
+  int paren_depth;
+  int brace_depth;
+  uint8_t next_scope;     // NS_LOOP | NS_SWITCH | NS_CONDITIONAL
+  bool pending;
+  bool parens_just_closed;
+  bool for_init;
+  bool await_for_paren;
+} ControlFlow;
 
-static inline void control_state_reset(void)
-{
-  control_state = (ControlFlowState){0};
-}
+static ControlFlow ctrl = {0};
 
-static inline void control_flow_reset(void)
-{
-  control_state_reset();
-  ctx->next_scope_is_loop = false;
-  ctx->next_scope_is_switch = false;
-  ctx->next_scope_is_conditional = false;
-  ctx->in_for_init = false;
-  ctx->pending_for_paren = false;
-}
+static inline void control_flow_reset(void) { ctrl = (ControlFlow){0}; }
 
 static LabelTable label_table;
 
@@ -347,7 +345,6 @@ static void collect_system_includes(void)
 }
 
 // Emit diagnostic pragmas to suppress warnings from system headers.
-// System headers use constructs that trigger various warnings with strict flags.
 static void emit_system_header_diag_push(void)
 {
   OUT_LIT("#if defined(__GNUC__) || defined(__clang__)\n"
@@ -415,8 +412,8 @@ static void typedef_pop_scope(int scope_depth); // Forward declaration
 static void end_statement_after_semicolon(void)
 {
   ctx->at_stmt_start = true;
-  ctx->in_for_init = false; // Semicolon ends init clause
-  if (control_state.pending && control_state.paren_depth == 0)
+  ctrl.for_init = false; // Semicolon ends init clause
+  if (ctrl.pending && ctrl.paren_depth == 0)
   {
     // Pop phantom scopes for braceless control bodies ending via break/continue/return/goto.
     // For-init variables (e.g., "for (int T = 0; ...)  break;") are registered at
@@ -439,14 +436,12 @@ static void defer_push_scope(bool consume_flags)
   s->seen_case_label = false;
   if (consume_flags)
   {
-    s->is_loop = ctx->next_scope_is_loop;
-    s->is_switch = ctx->next_scope_is_switch;
-    s->is_conditional = ctx->next_scope_is_conditional;
-    if (ctx->next_scope_is_conditional)
+    s->is_loop = ctrl.next_scope & NS_LOOP;
+    s->is_switch = ctrl.next_scope & NS_SWITCH;
+    s->is_conditional = ctrl.next_scope & NS_CONDITIONAL;
+    if (ctrl.next_scope & NS_CONDITIONAL)
       ctx->conditional_block_depth++;
-    ctx->next_scope_is_loop = false;
-    ctx->next_scope_is_switch = false;
-    ctx->next_scope_is_conditional = false;
+    ctrl.next_scope = 0;
   }
   else
   {
@@ -484,9 +479,9 @@ static void mark_switch_control_exit(void)
 {
   // Only mark as definite control exit if not inside a conditional context
   // If inside if/while/for (even braceless), the control exit might not be taken at runtime
-  // control_state.pending is true for braceless: "if (x) break;"
+  // ctrl.pending is true for braceless: "if (x) break;"
   // ctx->conditional_block_depth > 0 for braced: "if (x) { break; }"
-  if (control_state.pending || ctx->conditional_block_depth > 0)
+  if (ctrl.pending || ctx->conditional_block_depth > 0)
     return;
 
   for (int d = ctx->defer_depth - 1; d >= 0; d--)
@@ -559,7 +554,7 @@ static void emit_tok(Token *tok)
   // Skip system header include content when not flattening
   // But keep macro expansions (is_include_entry=false means it's a macro, not an include)
   File *f = tok_file(tok);
-  if (!ctx->feature_flatten_headers && f && f->is_system && f->is_include_entry)
+  if (!FEAT(F_FLATTEN) && f && f->is_system && f->is_include_entry)
     return;
 
   // Check if we need a #line directive BEFORE emitting the token
@@ -567,7 +562,7 @@ static void emit_tok(Token *tok)
   char *tok_fname = NULL;
   int line_no = tok_line_no(tok);
 
-  if (ctx->emit_line_directives && f && line_no > 0)
+  if (FEAT(F_LINE_DIR) && f && line_no > 0)
   {
     tok_fname = f->display_name ? f->display_name : f->name;
     need_line = (ctx->last_filename != tok_fname &&
@@ -591,7 +586,7 @@ static void emit_tok(Token *tok)
     ctx->last_filename = tok_fname;
     ctx->last_system_header = f->is_system;
   }
-  else if (ctx->emit_line_directives && f && line_no > 0 && line_no > ctx->last_line_no)
+  else if (FEAT(F_LINE_DIR) && f && line_no > 0 && line_no > ctx->last_line_no)
     ctx->last_line_no = line_no;
 
   // Handle preprocessor directives (e.g., #pragma) - emit verbatim
@@ -1094,7 +1089,7 @@ static GotoSkipResult goto_skips_check(Token *goto_tok, char *label_name, int la
                                        bool check_defer, bool check_decl)
 {
   GotoSkipResult r = {NULL, NULL};
-  if (check_decl && !ctx->feature_zeroinit && !ctx->feature_defer)
+  if (check_decl && !FEAT(F_ZEROINIT | F_DEFER))
     check_decl = false;
   if (!check_defer && !check_decl)
     return r;
@@ -1912,14 +1907,14 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
     // Register shadow for typedef names used as variables
     if (is_known_typedef(decl.var_name))
     {
-      int shadow_depth = ctx->in_for_init ? ctx->defer_depth + 1 : ctx->defer_depth;
+      int shadow_depth = ctrl.for_init ? ctx->defer_depth + 1 : ctx->defer_depth;
       typedef_add_shadow(decl.var_name->loc, decl.var_name->len, shadow_depth);
     }
 
     // Register VLA variables so sizeof(vla_var) can be detected as non-constant
     if (effective_vla && decl.var_name)
     {
-      int vla_depth = ctx->in_for_init ? ctx->defer_depth + 1 : ctx->defer_depth;
+      int vla_depth = ctrl.for_init ? ctx->defer_depth + 1 : ctx->defer_depth;
       typedef_add_vla_var(decl.var_name->loc, decl.var_name->len, vla_depth);
     }
 
@@ -1970,7 +1965,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
 // to alert the user that zero-init may have been skipped.
 static Token *try_zero_init_decl(Token *tok)
 {
-  if (!ctx->feature_zeroinit || ctx->defer_depth <= 0 || ctx->struct_depth > 0)
+  if (!FEAT(F_ZEROINIT) || ctx->defer_depth <= 0 || ctx->struct_depth > 0)
     return NULL;
 
   // Check for "switch skip hole" - declarations before first case label
@@ -2088,7 +2083,7 @@ static Token *emit_expr_to_semicolon(Token *tok)
     else if (depth == 0 && equal(tok, ";"))
       break;
 
-    if (expr_at_stmt_start && ctx->feature_zeroinit)
+    if (expr_at_stmt_start && FEAT(F_ZEROINIT))
     {
       Token *next = try_zero_init_decl(tok);
       if (next)
@@ -2118,9 +2113,7 @@ static void report_goto_skips_decl(Token *skipped_decl, Token *label_tok);
 // Returns next token after the defer statement, or NULL if tok is not a valid defer.
 static Token *handle_defer_keyword(Token *tok)
 {
-  if (!(tok->tag & TT_DEFER) || tok->kind != TK_KEYWORD)
-    return NULL;
-  if (!ctx->feature_defer)
+  if (!FEAT(F_DEFER))
     return NULL;
   // Distinguish struct field, label, goto target, variable assignment, attribute usage
   if (equal(tok->next, ":") ||
@@ -2133,9 +2126,9 @@ static Token *handle_defer_keyword(Token *tok)
     return NULL;
 
   // Context validation
-  if (control_state.pending && control_state.paren_depth > 0)
+  if (ctrl.pending && ctrl.paren_depth > 0)
     error_tok(tok, "defer cannot appear inside control statement parentheses");
-  if (control_state.pending && control_state.paren_depth == 0)
+  if (ctrl.pending && ctrl.paren_depth == 0)
     error_tok(tok, "defer requires braces in control statements (braceless has no scope)");
   for (int i = 0; i < ctx->stmt_expr_count; i++)
     if (ctx->defer_depth == stmt_expr_levels[i])
@@ -2195,8 +2188,6 @@ static Token *handle_defer_keyword(Token *tok)
 // Returns next token if handled, or NULL to let normal emit proceed.
 static Token *handle_return_defer(Token *tok)
 {
-  if (!(tok->tag & TT_RETURN))
-    return NULL;
   mark_switch_control_exit();
   if (!has_active_defers())
     return NULL;
@@ -2247,8 +2238,6 @@ static Token *handle_return_defer(Token *tok)
 // Returns next token if handled, or NULL.
 static Token *handle_break_continue_defer(Token *tok)
 {
-  if (!(tok->tag & (TT_BREAK | TT_CONTINUE)))
-    return NULL;
   bool is_break = tok->tag & TT_BREAK;
   mark_switch_control_exit();
   if (!control_flow_has_defers(is_break))
@@ -2269,12 +2258,10 @@ static Token *handle_break_continue_defer(Token *tok)
 // Returns next token if fully handled, or NULL to let normal emit proceed.
 static Token *handle_goto_keyword(Token *tok)
 {
-  if (!(tok->tag & TT_GOTO))
-    return NULL;
   Token *goto_tok = tok;
   tok = tok->next;
 
-  if (ctx->feature_defer)
+  if (FEAT(F_DEFER))
   {
     mark_switch_control_exit();
 
@@ -2322,7 +2309,7 @@ static Token *handle_goto_keyword(Token *tok)
   }
 
   // Zeroinit-only goto safety
-  if (ctx->feature_zeroinit && is_identifier_like(tok))
+  if (FEAT(F_ZEROINIT) && is_identifier_like(tok))
   {
     GotoSkipResult skip = goto_skips_check(goto_tok, tok->loc, tok->len, false, true);
     if (skip.skipped_decl)
@@ -2335,7 +2322,7 @@ static Token *handle_goto_keyword(Token *tok)
 // Handle case/default labels: check for defer fallthrough, clear switch defers.
 static void handle_case_default(Token *tok)
 {
-  if (!ctx->feature_defer || !inside_switch_scope())
+  if (!FEAT(F_DEFER) || !inside_switch_scope())
     return;
   bool is_case = tok->tag & TT_CASE;
   bool is_default = (tok->tag & TT_DEFAULT) && ctx->generic_paren_depth == 0;
@@ -2367,8 +2354,6 @@ static void handle_case_default(Token *tok)
 // Returns next token if handled, or NULL if no body follows.
 static Token *handle_sue_body(Token *tok)
 {
-  if (!(tok->tag & TT_SUE))
-    return NULL;
   bool is_enum = equal(tok, "enum");
   Token *t = tok->next;
   while (t && (t->kind == TK_IDENT || (t->tag & TT_ATTR)))
@@ -2405,17 +2390,17 @@ static Token *handle_sue_body(Token *tok)
 static Token *handle_open_brace(Token *tok)
 {
   // Compound literal inside control parens, or after condition (before body)
-  if (control_state.pending &&
-      (control_state.paren_depth > 0 ||
-       (control_state.paren_depth == 0 && !control_state.parens_just_closed)))
+  if (ctrl.pending &&
+      (ctrl.paren_depth > 0 ||
+       (ctrl.paren_depth == 0 && !ctrl.parens_just_closed)))
   {
     emit_tok(tok);
-    control_state.brace_depth++;
+    ctrl.brace_depth++;
     return tok->next;
   }
-  if (control_state.pending && !ctx->next_scope_is_switch)
-    ctx->next_scope_is_conditional = true;
-  control_state_reset();
+  if (ctrl.pending && !(ctrl.next_scope & NS_SWITCH))
+    ctrl.next_scope |= NS_CONDITIONAL;
+  uint8_t _ns = ctrl.next_scope; ctrl = (ControlFlow){.next_scope = _ns};
 
   // Detect statement expression: ({
   if (last_emitted && equal(last_emitted, "("))
@@ -2435,16 +2420,16 @@ static Token *handle_open_brace(Token *tok)
 static Token *handle_close_brace(Token *tok)
 {
   // Compound literal close inside control parens
-  if (control_state.pending && control_state.paren_depth > 0 && control_state.brace_depth > 0)
+  if (ctrl.pending && ctrl.paren_depth > 0 && ctrl.brace_depth > 0)
   {
-    control_state.brace_depth--;
+    ctrl.brace_depth--;
     emit_tok(tok);
     return tok->next;
   }
   if (ctx->struct_depth > 0)
     ctx->struct_depth--;
   typedef_pop_scope(ctx->defer_depth);
-  if (ctx->feature_defer)
+  if (FEAT(F_DEFER))
     emit_defers(DEFER_SCOPE);
   defer_pop_scope();
   emit_tok(tok);
@@ -2456,11 +2441,11 @@ static Token *handle_close_brace(Token *tok)
   return tok;
 }
 
-// Report goto skipping over a variable declaration (warn or error based on ctx->feature_warn_safety)
+// Report goto skipping over a variable declaration (warn or error based on FEAT(F_WARN_SAFETY))
 static void report_goto_skips_decl(Token *skipped_decl, Token *label_tok)
 {
   const char *msg = "goto '%.*s' would skip over this variable declaration (bypasses zero-init)";
-  if (ctx->feature_warn_safety)
+  if (FEAT(F_WARN_SAFETY))
     warn_tok(skipped_decl, msg, label_tok->len, label_tok->loc);
   else
     error_tok(skipped_decl, msg, label_tok->len, label_tok->loc);
@@ -2620,9 +2605,9 @@ static char *preprocess_with_cc(const char *input_file)
 
   // Add prism-specific macros
   argv_builder_add(&ab, "-D__PRISM__=1");
-  if (ctx->feature_defer)
+  if (FEAT(F_DEFER))
     argv_builder_add(&ab, "-D__PRISM_DEFER__=1");
-  if (ctx->feature_zeroinit)
+  if (FEAT(F_ZEROINIT))
     argv_builder_add(&ab, "-D__PRISM_ZEROINIT__=1");
 
   // Add standard feature test macros for POSIX/GNU compatibility
@@ -2657,6 +2642,19 @@ static char *preprocess_with_cc(const char *input_file)
 
   char *result = strdup(tmppath);
   return result;
+}
+
+static void reset_transpiler_state(void) {
+  ctx->defer_depth = ctx->struct_depth = ctx->conditional_block_depth =
+  ctx->generic_paren_depth = ctx->stmt_expr_count = ctx->last_line_no = 0;
+  ctx->ret_counter = 0;
+  ctx->last_filename = NULL;
+  ctx->last_system_header = ctx->current_func_returns_void =
+  ctx->current_func_has_setjmp = ctx->current_func_has_asm =
+  ctx->current_func_has_vfork = false;
+  ctx->at_stmt_start = true;
+  control_flow_reset();
+  last_emitted = NULL;
 }
 
 static int transpile(char *input_file, char *output_file)
@@ -2700,34 +2698,19 @@ static int transpile(char *input_file, char *output_file)
   out_init(out_fp);
 
   // Suppress warnings for inlined system header content.
-  // System headers (especially glibc) use constructs that trigger various
-  // warnings when compiled with strict flags. We disable these for the
-  // entire flattened output since macro expansions can inject system
-  // header content mid-expression, making per-region tracking impractical.
-  if (ctx->feature_flatten_headers)
+  if (FEAT(F_FLATTEN))
   {
     emit_system_header_diag_push();
     out_char('\n');
   }
 
   // Reset state
-  ctx->defer_depth = 0;
-  ctx->struct_depth = 0;
-  last_emitted = NULL;
-  ctx->last_line_no = 0;
-  ctx->last_filename = NULL;
-  ctx->last_system_header = false;
-  control_flow_reset();
-  ctx->conditional_block_depth = 0;
-  ctx->generic_paren_depth = 0;
-  ctx->current_func_returns_void = false;
-  ctx->stmt_expr_count = 0;
-  ctx->at_stmt_start = true; // Start of file is start of statement
+  reset_transpiler_state();
   typedef_table_reset();     // Reset typedef tracking
 
   // Handle system headers: collect and emit #includes, or flatten
   system_includes_reset();
-  if (!ctx->feature_flatten_headers)
+  if (!FEAT(F_FLATTEN))
   {
     collect_system_includes();
     emit_system_includes();
@@ -2750,7 +2733,7 @@ static int transpile(char *input_file, char *output_file)
       parse_typedef_declaration(tok, ctx->defer_depth);
 
     // Zero-init declarations at statement start
-    if (ctx->at_stmt_start && (!control_state.pending || ctx->in_for_init))
+    if (ctx->at_stmt_start && (!ctrl.pending || ctrl.for_init))
     {
       next = try_zero_init_decl(tok);
       if (next)
@@ -2766,7 +2749,7 @@ static int transpile(char *input_file, char *output_file)
     if ((tag & TT_NORETURN_FN) && tok->next && equal(tok->next, "("))
     {
       mark_switch_control_exit();
-      if (ctx->feature_defer && has_active_defers())
+      if (FEAT(F_DEFER) && has_active_defers())
         fprintf(stderr, "%s:%d: warning: '%.*s' called with active defers (defers will not run)\n",
                 tok_file(tok)->name, tok_line_no(tok), tok->len, tok->loc);
     }
@@ -2775,28 +2758,28 @@ static int transpile(char *input_file, char *output_file)
 
     if (tag & TT_DEFER)
       DISPATCH(handle_defer_keyword);
-    if (ctx->feature_defer && (tag & TT_RETURN))
+    if (FEAT(F_DEFER) && (tag & TT_RETURN))
       DISPATCH(handle_return_defer);
-    if (ctx->feature_defer && (tag & (TT_BREAK | TT_CONTINUE)))
+    if (FEAT(F_DEFER) && (tag & (TT_BREAK | TT_CONTINUE)))
       DISPATCH(handle_break_continue_defer);
-    if ((tag & TT_GOTO) && (ctx->feature_defer || ctx->feature_zeroinit))
+    if ((tag & TT_GOTO) && FEAT(F_DEFER | F_ZEROINIT))
       DISPATCH(handle_goto_keyword);
 
     // ── Control-flow flag setting (loop, switch, if/else) ──
 
     if (tag & TT_LOOP)
     {
-      if (ctx->feature_defer)
+      if (FEAT(F_DEFER))
       {
-        ctx->next_scope_is_loop = true;
-        control_state.pending = true;
+        ctrl.next_scope |= NS_LOOP;
+        ctrl.pending = true;
         if (equal(tok, "do"))
-          control_state.parens_just_closed = true;
+          ctrl.parens_just_closed = true;
       }
-      if (equal(tok, "for") && (ctx->feature_defer || ctx->feature_zeroinit))
+      if (equal(tok, "for") && FEAT(F_DEFER | F_ZEROINIT))
       {
-        control_state.pending = true;
-        ctx->pending_for_paren = true;
+        ctrl.pending = true;
+        ctrl.await_for_paren = true;
       }
     }
 
@@ -2822,17 +2805,17 @@ static int transpile(char *input_file, char *output_file)
         ctx->generic_paren_depth--;
     }
 
-    if (ctx->feature_defer && (tag & TT_SWITCH))
+    if (FEAT(F_DEFER) && (tag & TT_SWITCH))
     {
-      ctx->next_scope_is_switch = true;
-      control_state.pending = true;
+      ctrl.next_scope |= NS_SWITCH;
+      ctrl.pending = true;
     }
 
     if (tag & TT_IF)
     {
-      control_state.pending = true;
+      ctrl.pending = true;
       if (equal(tok, "else"))
-        control_state.parens_just_closed = true;
+        ctrl.parens_just_closed = true;
     }
 
     // Case/default label handling
@@ -2842,7 +2825,7 @@ static int transpile(char *input_file, char *output_file)
     // ── Scope management ──
 
     // Function definition detection at top level
-    if (ctx->feature_defer && equal(tok, "{") && ctx->defer_depth == 0)
+    if (FEAT(F_DEFER) && equal(tok, "{") && ctx->defer_depth == 0)
     {
       if (prev_toplevel_tok && equal(prev_toplevel_tok, ")"))
       {
@@ -2876,41 +2859,41 @@ static int transpile(char *input_file, char *output_file)
 
     // ── Parenthesis and semicolon tracking ──
 
-    if (control_state.pending)
+    if (ctrl.pending)
     {
       if (equal(tok, "("))
       {
-        control_state.paren_depth++;
-        control_state.parens_just_closed = false;
-        if (ctx->pending_for_paren)
+        ctrl.paren_depth++;
+        ctrl.parens_just_closed = false;
+        if (ctrl.await_for_paren)
         {
-          ctx->in_for_init = true;
+          ctrl.for_init = true;
           ctx->at_stmt_start = true;
-          ctx->pending_for_paren = false;
+          ctrl.await_for_paren = false;
         }
       }
       else if (equal(tok, ")"))
       {
-        control_state.paren_depth--;
-        if (control_state.paren_depth == 0)
+        ctrl.paren_depth--;
+        if (ctrl.paren_depth == 0)
         {
-          ctx->in_for_init = false;
-          control_state.parens_just_closed = true;
+          ctrl.for_init = false;
+          ctrl.parens_just_closed = true;
         }
       }
-      if (equal(tok, ";") && control_state.paren_depth == 1)
+      if (equal(tok, ";") && ctrl.paren_depth == 1)
       {
-        if (ctx->in_for_init)
-          ctx->in_for_init = false;
+        if (ctrl.for_init)
+          ctrl.for_init = false;
       }
-      else if (equal(tok, ";") && control_state.paren_depth == 0)
+      else if (equal(tok, ";") && ctrl.paren_depth == 0)
       {
         typedef_pop_scope(ctx->defer_depth + 1);
         control_flow_reset();
       }
     }
 
-    if (equal(tok, ";") && !control_state.pending)
+    if (equal(tok, ";") && !ctrl.pending)
       ctx->at_stmt_start = true;
 
     // Preprocessor directives
@@ -2946,7 +2929,7 @@ static int transpile(char *input_file, char *output_file)
   }
 
   // Close diagnostic pragma that was opened at the start for flatten mode
-  if (ctx->feature_flatten_headers)
+  if (FEAT(F_FLATTEN))
   {
     out_char('\n');
     emit_system_header_diag_pop();
@@ -3002,11 +2985,7 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
 #endif
 
   // Set global feature flags from PrismFeatures
-  ctx->feature_defer = features.defer;
-  ctx->feature_zeroinit = features.zeroinit;
-  ctx->feature_warn_safety = features.warn_safety;
-  ctx->emit_line_directives = features.line_directives;
-  ctx->feature_flatten_headers = features.flatten_headers;
+  ctx->features = features_to_bits(features);
 
   // Set preprocessor configuration from PrismFeatures
   ctx->extra_compiler = features.compiler;
@@ -3084,25 +3063,15 @@ cleanup:
 
 PRISM_API void prism_free(PrismResult *r)
 {
-  if (r->output)
-  {
-    free(r->output);
-    r->output = NULL;
-  }
-  if (r->error_msg)
-  {
-    free(r->error_msg);
-    r->error_msg = NULL;
-  }
+  free(r->output);  r->output = NULL;
+  free(r->error_msg); r->error_msg = NULL;
 }
 
-// Reset all transpiler state for clean reuse (prevents memory leaks on repeated use)
+// Reset all transpiler state for clean reuse
 PRISM_API void prism_reset(void)
 {
-  // Full tokenizer cleanup (parse.c) - frees arena blocks
   tokenizer_teardown(true);
 
-  // Reset defer stack
   for (int i = 0; i < defer_stack_capacity; i++)
   {
     free(defer_stack[i].entries);
@@ -3113,42 +3082,20 @@ PRISM_API void prism_reset(void)
   ctx->defer_depth = 0;
   defer_stack_capacity = 0;
 
-  // Reset label table
   free(label_table.labels);
-  label_table.labels = NULL;
-  label_table.count = 0;
-  label_table.capacity = 0;
-  hashmap_clear(&label_table.name_map);
+  label_table = (LabelTable){0};
 
-  // Reset typedef table (already has reset function but doesn't free hashmap buckets)
   typedef_table_reset();
-
-  // Reset system includes
   system_includes_reset();
 
-  // Reset statement expression tracking
   free(stmt_expr_levels);
   stmt_expr_levels = NULL;
   ctx->stmt_expr_count = 0;
   stmt_expr_capacity = 0;
 
-  // Reset output state
   if (out_fp) { fclose(out_fp); out_fp = NULL; }
-  last_emitted = NULL;
-  ctx->last_line_no = 0;
-  ctx->last_filename = NULL;
-  ctx->last_system_header = false;
 
-  ctx->struct_depth = 0;
-  ctx->ret_counter = 0;
-  control_flow_reset();
-  ctx->conditional_block_depth = 0;
-  ctx->generic_paren_depth = 0;
-  ctx->current_func_returns_void = false;
-  ctx->current_func_has_setjmp = false;
-  ctx->current_func_has_asm = false;
-  ctx->current_func_has_vfork = false;
-  ctx->at_stmt_start = true;
+  reset_transpiler_state();
 }
 
 // CLI IMPLEMENTATION (excluded with -DPRISM_LIB_MODE)
@@ -3451,36 +3398,19 @@ static Cli cli_parse(int argc, char **argv)
     }
 
     // Prism feature flags (consume, don't pass to CC)
-    if (!strcmp(a, "-fno-defer"))
-    {
-      cli.features.defer = false;
-      continue;
-    }
-    if (!strcmp(a, "-fno-zeroinit"))
-    {
-      cli.features.zeroinit = false;
-      continue;
-    }
-    if (!strcmp(a, "-fno-line-directives"))
-    {
-      cli.features.line_directives = false;
-      continue;
-    }
-    if (!strcmp(a, "-fno-safety"))
-    {
-      cli.features.warn_safety = true;
-      continue;
-    }
-    if (!strcmp(a, "-fflatten-headers"))
-    {
-      cli.features.flatten_headers = true;
-      continue;
-    }
-    if (!strcmp(a, "-fno-flatten-headers"))
-    {
-      cli.features.flatten_headers = false;
-      continue;
-    }
+    static const struct { const char *flag; int off; int val; } feat_flags[] = {
+      {"-fno-defer",           offsetof(PrismFeatures, defer), 0},
+      {"-fno-zeroinit",        offsetof(PrismFeatures, zeroinit), 0},
+      {"-fno-line-directives", offsetof(PrismFeatures, line_directives), 0},
+      {"-fno-safety",          offsetof(PrismFeatures, warn_safety), 1},
+      {"-fflatten-headers",    offsetof(PrismFeatures, flatten_headers), 1},
+      {"-fno-flatten-headers", offsetof(PrismFeatures, flatten_headers), 0},
+    };
+    bool matched = false;
+    for (int f = 0; f < (int)(sizeof(feat_flags)/sizeof(*feat_flags)); f++)
+      if (!strcmp(a, feat_flags[f].flag))
+      { *(bool *)((char *)&cli.features + feat_flags[f].off) = feat_flags[f].val; matched = true; break; }
+    if (matched) continue;
 
     // Prism options
     if (str_startswith(a, "--prism-cc="))
@@ -3556,12 +3486,8 @@ int main(int argc, char **argv)
   Cli cli = cli_parse(argc, argv);
 
   // Configure context from CLI
-  ctx->feature_defer = cli.features.defer;
-  ctx->feature_zeroinit = cli.features.zeroinit;
-  ctx->feature_warn_safety = cli.features.warn_safety;
+  ctx->features = features_to_bits(cli.features);
   ctx->extra_compiler = get_real_cc(cli.cc);
-  ctx->emit_line_directives = cli.features.line_directives;
-  ctx->feature_flatten_headers = cli.features.flatten_headers;
   // Pass all CC args to preprocessor — cc -E ignores flags it doesn't need
   ctx->extra_compiler_flags = cli.cc_args;
   ctx->extra_compiler_flags_count = cli.cc_arg_count;
@@ -3799,14 +3725,13 @@ int main(int argc, char **argv)
     argv_builder_add(&ab, cli.cc_args[i]);
 
   // Suppress warnings from preprocessed/inlined system headers
-  argv_builder_add(&ab, "-Wno-type-limits");          // wchar.h unsigned >= 0
-  argv_builder_add(&ab, "-Wno-cast-align");           // SSE/AVX intrinsics
-  argv_builder_add(&ab, "-Wno-logical-op");           // errno EAGAIN==EWOULDBLOCK
-  argv_builder_add(&ab, "-Wno-implicit-fallthrough"); // switch fallthrough patterns
-  argv_builder_add(&ab, "-Wno-unused-function");      // system inline functions
-  argv_builder_add(&ab, "-Wno-unused-variable");      // system variables
-  argv_builder_add(&ab, "-Wno-unused-parameter");     // system function params
-  argv_builder_add(&ab, "-Wno-maybe-uninitialized");  // false positives in preprocessed code
+  static const char *wflags[] = {
+    "-Wno-type-limits", "-Wno-cast-align", "-Wno-logical-op",
+    "-Wno-implicit-fallthrough", "-Wno-unused-function", "-Wno-unused-variable",
+    "-Wno-unused-parameter", "-Wno-maybe-uninitialized",
+  };
+  for (int i = 0; i < (int)(sizeof(wflags)/sizeof(*wflags)); i++)
+    argv_builder_add(&ab, wflags[i]);
 
   if (cli.mode == CLI_RUN)
   {
