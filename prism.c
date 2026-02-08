@@ -12,12 +12,13 @@
 #include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 
 // Platform-specific headers for get_real_cc()
 #ifdef __APPLE__
 #include <mach-o/dyld.h> // _NSGetExecutablePath
 #endif
-#if defined(__FreeBSD__)
+#if defined(__FreeBSD__) || defined(__DragonFly__)
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #endif
@@ -841,6 +842,19 @@ typedef enum
 
 static void typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool is_vla)
 {
+  // Skip duplicate typedef re-definitions at the same scope (valid C11 §6.7/3).
+  // Prevents table bloat in unity builds with repeated typedef declarations.
+  if (kind == TDK_TYPEDEF)
+  {
+    int existing = typedef_get_index(name, len);
+    if (existing >= 0)
+    {
+      TypedefEntry *prev = &typedef_table.entries[existing];
+      if (prev->scope_depth == scope_depth && !prev->is_shadow && !prev->is_enum_const)
+        return; // Benign re-definition — already registered
+    }
+  }
+
   ENSURE_ARRAY_CAP(typedef_table.entries, typedef_table.count + 1, typedef_table.capacity, INITIAL_ARRAY_CAP, TypedefEntry);
   int new_index = typedef_table.count++;
   TypedefEntry *e = &typedef_table.entries[new_index];
@@ -2189,7 +2203,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
         }
         else
         {
-          OUT_LIT(" memset(&");
+          OUT_LIT(" __builtin_memset(&");
           out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
           OUT_LIT(", 0, sizeof(");
           out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
@@ -2920,12 +2934,16 @@ static char *preprocess_with_cc(const char *input_file)
     return NULL;
   }
 
-  // Set up file actions: child stdout → pipe write end
+  // Set up file actions: child stdout → pipe write end, stderr → /dev/null
+  // Redirecting stderr prevents deadlock: if the compiler emits massive stderr
+  // output (e.g., thousands of errors), the child would block writing stderr
+  // while the parent blocks reading stdout, causing a deadlock.
   posix_spawn_file_actions_t fa;
   posix_spawn_file_actions_init(&fa);
   posix_spawn_file_actions_addclose(&fa, pipefd[0]);
   posix_spawn_file_actions_adddup2(&fa, pipefd[1], STDOUT_FILENO);
   posix_spawn_file_actions_addclose(&fa, pipefd[1]);
+  posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
 
   char **env = build_clean_environ();
   pid_t pid;
@@ -3587,7 +3605,7 @@ static bool get_self_exe_path(char *buf, size_t bufsize)
     }
     return true;
   }
-#elif defined(__FreeBSD__)
+#elif defined(__FreeBSD__) || defined(__DragonFly__)
   int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
   size_t len = bufsize;
   if (sysctl(mib, 4, buf, &len, NULL, 0) == 0)
@@ -3598,6 +3616,29 @@ static bool get_self_exe_path(char *buf, size_t bufsize)
   {
     buf[len] = '\0';
     return true;
+  }
+#elif defined(__OpenBSD__)
+  // OpenBSD doesn't expose exe path via sysctl or /proc;
+  // use argv[0] resolution via realpath at caller site.
+  // Fallthrough to return false.
+#endif
+  // Generic fallback: try Solaris/Illumos /proc path, then Linux-style
+#if !defined(__APPLE__) && !defined(__FreeBSD__) && !defined(__DragonFly__) && !defined(__NetBSD__)
+  {
+    // Solaris/Illumos
+    ssize_t len2 = readlink("/proc/self/path/a.out", buf, bufsize - 1);
+    if (len2 > 0)
+    {
+      buf[len2] = '\0';
+      return true;
+    }
+    // Linux-style fallback (for musl, Alpine, etc. where first #if might not trigger)
+    len2 = readlink("/proc/self/exe", buf, bufsize - 1);
+    if (len2 > 0)
+    {
+      buf[len2] = '\0';
+      return true;
+    }
   }
 #endif
   (void)buf;

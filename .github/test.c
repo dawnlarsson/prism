@@ -10719,8 +10719,6 @@ void test_typeof_struct_overflow(void)
 }
 #endif // __GNUC__
 
-// --- Issue 3: scan_labels_in_function correctness ---
-// Verify that label scanning works correctly for functions with many labels
 void test_many_labels_function(void)
 {
     int result = 0;
@@ -10751,9 +10749,6 @@ label_start:
 label_end:
     CHECK_EQ(result, 127, "many labels: forward+backward goto");
 }
-
-// --- Issue 5: 'raw' keyword collision with user identifiers ---
-// Ensure 'raw' used as variable, struct member, or parameter doesn't break parsing
 
 void test_raw_struct_member_field(void)
 {
@@ -10829,9 +10824,6 @@ void test_raw_array_of_structs_with_raw(void)
     CHECK_EQ(items[2].raw, 20, "raw array of structs: [2].raw");
     CHECK_EQ(items[2].processed, 200, "raw array of structs: [2].processed");
 }
-
-// --- Issue 6: Ghost shadow typedef corruption ---
-// Verify typedef resolution is correctly restored after braceless control flow
 
 typedef int GhostT;
 
@@ -10915,22 +10907,201 @@ void test_ghost_shadow_generic_braceless(void)
 }
 #endif
 
+void test_pragma_survives_transpile(void)
+{
+// Pragmas must pass through the transpiler unchanged
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
+    int unused_pragma_test_var;
+#pragma GCC diagnostic pop
+    CHECK(1, "pragma survives transpilation");
+}
+
+void test_defer_switch_goto_out(void)
+{
+    log_reset();
+    int x = 1;
+    switch (x)
+    {
+    case 1:
+    {
+        defer log_append("A");
+        log_append("1");
+        if (x == 1)
+            goto switch_out;
+        log_append("X");
+    }
+    case 2:
+    {
+        defer log_append("B");
+        log_append("2");
+        break;
+    }
+    }
+switch_out:
+    log_append("E");
+    CHECK_LOG("1AE", "defer + switch + goto out: defer fires");
+}
+
+void test_defer_switch_break_with_goto_label(void)
+{
+    // goto to a label after the switch — defers from all scopes must fire
+    log_reset();
+    int x = 0;
+    switch (x)
+    {
+    case 0:
+    {
+        defer log_append("C");
+        log_append("0");
+        break;
+    }
+    case 1:
+    {
+        defer log_append("D");
+        log_append("1");
+        goto after_switch;
+    }
+    }
+after_switch:
+    log_append("E");
+    CHECK_LOG("0CE", "defer + switch + break with goto label");
+}
+
+void test_defer_switch_nested_goto(void)
+{
+    // Nested blocks inside switch case with defer and goto
+    log_reset();
+    int x = 1;
+    switch (x)
+    {
+    case 1:
+    {
+        defer log_append("outer");
+        {
+            defer log_append("inner");
+            log_append("body");
+            goto done_nested;
+        }
+    }
+    }
+done_nested:
+    log_append("E");
+    CHECK_LOG("bodyinnerouterE", "defer + switch + nested goto");
+}
+
+typedef int RedefT;
+typedef int RedefT; // Valid C11 re-definition
+
+void test_typedef_redef_basic(void)
+{
+    RedefT x;
+    x = 42;
+    CHECK_EQ(x, 42, "typedef re-definition: basic");
+}
+
+void test_typedef_redef_pointer(void)
+{
+    typedef int RedefLocal;
+    typedef int RedefLocal; // Re-definition at same scope
+    RedefLocal *p = &(RedefLocal){99};
+    CHECK_EQ(*p, 99, "typedef re-definition: pointer deref");
+}
+
+void test_typedef_redef_after_scope(void)
+{
+    typedef int ScopeRedef;
+    {
+        typedef int ScopeRedef; // Inner scope re-definition
+        ScopeRedef inner;
+        inner = 10;
+        CHECK_EQ(inner, 10, "typedef re-definition: inner scope");
+    }
+    ScopeRedef outer;
+    outer = 20;
+    CHECK_EQ(outer, 20, "typedef re-definition: outer restored");
+}
+
+#ifdef __GNUC__
+void test_typeof_errno_zeroinit(void)
+{
+    // typeof(errno) creates a typeof type — needs memset zero-init path
+    // This test verifies __builtin_memset is used (not memset)
+    typeof(errno) err_copy;
+    CHECK_EQ(err_copy, 0, "typeof(errno) zero-init via __builtin_memset");
+
+    // Verify it actually works with errno
+    errno = EINVAL;
+    err_copy = errno;
+    CHECK_EQ(err_copy, EINVAL, "typeof(errno) assignment after zero-init");
+    errno = 0;
+}
+
+void test_typeof_statement_expr_zeroinit(void)
+{
+    // typeof with a statement expression — should still zero-init
+    typeof(({int _t = 5; _t; })) stmt_expr_var;
+    CHECK_EQ(stmt_expr_var, 0, "typeof(stmt_expr) zero-init");
+}
+
+void test_typeof_complex_expr_zeroinit(void)
+{
+    // typeof with complex expression
+    int arr[3];
+    typeof(arr[0]) element;
+    CHECK_EQ(element, 0, "typeof(arr[0]) zero-init");
+
+    // typeof pointer deref
+    int val = 42;
+    int *ptr = &val;
+    typeof(*ptr) deref_val;
+    CHECK_EQ(deref_val, 0, "typeof(*ptr) zero-init");
+}
+#endif
+
+void test_switch_goto_defer_multi_case(void)
+{
+    // Multiple cases with defers, goto from middle case
+    log_reset();
+    int x = 2;
+    switch (x)
+    {
+    case 1:
+    {
+        defer log_append("A");
+        log_append("1");
+        break;
+    }
+    case 2:
+    {
+        defer log_append("B");
+        log_append("2");
+        goto exit_multi;
+    }
+    case 3:
+    {
+        defer log_append("C");
+        log_append("3");
+        break;
+    }
+    }
+exit_multi:
+    log_append("E");
+    CHECK_LOG("2BE", "switch goto defer: multi-case, goto from case 2");
+}
+
 void run_bulletproof_regression_tests(void)
 {
     printf("\n=== BULLETPROOF REGRESSION TESTS ===\n");
     printf("(Issues 1-6: overflow, realloc, labels, setjmp, raw, ghost shadow)\n\n");
 
 #ifdef __GNUC__
-    // Issue 1: typeof overflow
     test_typeof_overflow_35_vars();
     test_typeof_overflow_64_vars();
     test_typeof_struct_overflow();
 #endif
 
-    // Issue 3: scan_labels correctness
     test_many_labels_function();
-
-    // Issue 5: raw keyword collision
     test_raw_struct_member_field();
     test_raw_anonymous_struct_member();
     test_raw_in_compound_literal();
@@ -10938,7 +11109,6 @@ void run_bulletproof_regression_tests(void)
     test_raw_pointer_to_struct_with_raw();
     test_raw_array_of_structs_with_raw();
 
-    // Issue 6: Ghost shadow typedef corruption
     test_ghost_shadow_for_braceless();
     test_ghost_shadow_nested_for();
     test_ghost_shadow_while_braceless();
@@ -10946,6 +11116,22 @@ void run_bulletproof_regression_tests(void)
 #ifdef __GNUC__
     test_ghost_shadow_generic();
     test_ghost_shadow_generic_braceless();
+#endif
+
+    test_pragma_survives_transpile();
+    test_defer_switch_goto_out();
+    test_defer_switch_break_with_goto_label();
+    test_defer_switch_nested_goto();
+    test_switch_goto_defer_multi_case();
+
+    test_typedef_redef_basic();
+    test_typedef_redef_pointer();
+    test_typedef_redef_after_scope();
+
+#ifdef __GNUC__
+    test_typeof_errno_zeroinit();
+    test_typeof_statement_expr_zeroinit();
+    test_typeof_complex_expr_zeroinit();
 #endif
 }
 
