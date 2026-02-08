@@ -218,13 +218,27 @@ static void *arena_alloc(Arena *arena, size_t size)
 
     if (!arena->current || arena->current->used + size > arena->current->capacity)
     {
-        size_t block_size = arena->default_block_size ? arena->default_block_size : ARENA_DEFAULT_BLOCK_SIZE;
-        ArenaBlock *block = arena_new_block(size, block_size);
-        if (arena->current)
-            arena->current->next = block;
+        // Try reusing the next block in the chain (from a previous arena_reset cycle)
+        if (arena->current && arena->current->next &&
+            arena->current->next->used + size <= arena->current->next->capacity)
+        {
+            arena->current = arena->current->next;
+            // used is already 0 from arena_reset
+        }
         else
-            arena->head = block;
-        arena->current = block;
+        {
+            size_t block_size = arena->default_block_size ? arena->default_block_size : ARENA_DEFAULT_BLOCK_SIZE;
+            ArenaBlock *block = arena_new_block(size, block_size);
+            if (arena->current)
+            {
+                // Preserve the rest of the chain so arena_free can free all blocks
+                block->next = arena->current->next;
+                arena->current->next = block;
+            }
+            else
+                arena->head = block;
+            arena->current = block;
+        }
     }
 
     void *ptr = arena->current->data + arena->current->used;
@@ -242,13 +256,25 @@ static void *arena_alloc_uninit(Arena *arena, size_t size)
 
     if (!arena->current || arena->current->used + size > arena->current->capacity)
     {
-        size_t block_size = arena->default_block_size ? arena->default_block_size : ARENA_DEFAULT_BLOCK_SIZE;
-        ArenaBlock *block = arena_new_block(size, block_size);
-        if (arena->current)
-            arena->current->next = block;
+        // Try reusing the next block in the chain (from a previous arena_reset cycle)
+        if (arena->current && arena->current->next &&
+            arena->current->next->used + size <= arena->current->next->capacity)
+        {
+            arena->current = arena->current->next;
+        }
         else
-            arena->head = block;
-        arena->current = block;
+        {
+            size_t block_size = arena->default_block_size ? arena->default_block_size : ARENA_DEFAULT_BLOCK_SIZE;
+            ArenaBlock *block = arena_new_block(size, block_size);
+            if (arena->current)
+            {
+                block->next = arena->current->next;
+                arena->current->next = block;
+            }
+            else
+                arena->head = block;
+            arena->current = block;
+        }
     }
 
     void *ptr = arena->current->data + arena->current->used;
@@ -553,18 +579,23 @@ typedef struct
 
 static File *find_cached_file_view(char *filename, int line_delta, bool is_system, bool is_include_entry)
 {
-    FileViewKey key = {filename, line_delta, (is_system ? 1 : 0) | (is_include_entry ? 2 : 0)};
+    FileViewKey key;
+    memset(&key, 0, sizeof(key)); // Zero padding bytes for reliable hash/memcmp
+    key.filename = filename;
+    key.line_delta = line_delta;
+    key.flags = (is_system ? 1 : 0) | (is_include_entry ? 2 : 0);
     return hashmap_get(&ctx->file_view_cache, (char *)&key, sizeof(key));
 }
 
 static void cache_file_view(char *filename, int line_delta, bool is_system, bool is_include_entry, File *file)
 {
-    FileViewKey key = {filename, line_delta, (is_system ? 1 : 0) | (is_include_entry ? 2 : 0)};
     // Need to allocate key storage since HashMap stores pointer to key
-    FileViewKey *stored_key = malloc(sizeof(FileViewKey));
+    FileViewKey *stored_key = calloc(1, sizeof(FileViewKey)); // calloc zeros padding bytes
     if (!stored_key)
         error("out of memory");
-    *stored_key = key;
+    stored_key->filename = filename;
+    stored_key->line_delta = line_delta;
+    stored_key->flags = (is_system ? 1 : 0) | (is_include_entry ? 2 : 0);
     hashmap_put(&ctx->file_view_cache, (char *)stored_key, sizeof(FileViewKey), file);
 }
 
@@ -1501,8 +1532,7 @@ static Token *tokenize(File *file)
 
     // Track if we're inside a system header include chain
     // This persists across nested includes until we return to user code
-    static bool in_system_include = false;
-    in_system_include = false; // Reset for each new file
+    bool in_system_include = false;
 
     while (*p)
     {
@@ -1691,6 +1721,11 @@ Token *tokenize_file(char *path)
 
     fseek(fp, 0, SEEK_END);
     long size = ftell(fp);
+    if (size < 0)
+    {
+        fclose(fp);
+        return NULL;
+    }
     fseek(fp, 0, SEEK_SET);
 
     char *buf = malloc(size + 1);
@@ -1699,8 +1734,8 @@ Token *tokenize_file(char *path)
         fclose(fp);
         return NULL;
     }
-    fread(buf, 1, size, fp);
-    buf[size] = '\0';
+    size_t nread = fread(buf, 1, size, fp);
+    buf[nread] = '\0';
     fclose(fp);
 
     File *file = new_file(path, ctx->input_file_count, buf);

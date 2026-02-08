@@ -631,8 +631,8 @@ static bool is_inside_attribute(Token *tok)
 // Emit a single token with appropriate spacing
 static void emit_tok(Token *tok)
 {
-  // Get file info — tok is always non-NULL here, file_idx is always valid
-  File *f = ctx->input_files[tok->file_idx];
+  // Get file info via tok_file() which bounds-checks file_idx
+  File *f = tok_file(tok);
 
   // Skip system header include content when not flattening
   if (__builtin_expect(!FEAT(F_FLATTEN) && f->is_system && f->is_include_entry, 0))
@@ -2017,7 +2017,7 @@ static DeclResult parse_declarator(Token *tok, bool emit)
   tok = tok->next;
 
   // Skip __attribute__ after variable name
-  while (tok->tag & TT_ATTR)
+  while (tok && tok->kind != TK_EOF && (tok->tag & TT_ATTR))
     DECL_ATTR(tok);
 
   // Array dims inside parens: (*name[N])
@@ -2070,7 +2070,7 @@ static DeclResult parse_declarator(Token *tok, bool emit)
   }
 
   // Skip __attribute__ before initializer or end of declarator
-  while (tok->tag & TT_ATTR)
+  while (tok && tok->kind != TK_EOF && (tok->tag & TT_ATTR))
     DECL_ATTR(tok);
 
   r.has_init = equal(tok, "=");
