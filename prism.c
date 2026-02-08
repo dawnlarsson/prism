@@ -2820,6 +2820,7 @@ static void free_argv(char **argv)
 static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len,
                           const char *source_adjacent)
 {
+  int n;
   if (source_adjacent)
   {
     const char *slash = strrchr(source_adjacent, '/');
@@ -2831,14 +2832,16 @@ static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suf
     if (slash)
     {
       int dir_len = (int)(slash - source_adjacent);
-      snprintf(buf, bufsize, "%.*s/.%s.XXXXXX.c", dir_len, source_adjacent, slash + 1);
+      n = snprintf(buf, bufsize, "%.*s/.%s.XXXXXX.c", dir_len, source_adjacent, slash + 1);
     }
     else
-      snprintf(buf, bufsize, ".%s.XXXXXX.c", source_adjacent);
+      n = snprintf(buf, bufsize, ".%s.XXXXXX.c", source_adjacent);
     suffix_len = 2; // .c suffix
   }
   else
-    snprintf(buf, bufsize, "%s%s", get_tmp_dir(), prefix);
+    n = snprintf(buf, bufsize, "%s%s", get_tmp_dir(), prefix);
+  if (n < 0 || (size_t)n >= bufsize)
+    return -1; // path truncated, XXXXXX template would be corrupted
 #if defined(_WIN32)
   if (_mktemp_s(buf, bufsize) != 0)
     return -1;

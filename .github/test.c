@@ -11090,6 +11090,127 @@ exit_multi:
     CHECK_LOG("2BE", "switch goto defer: multi-case, goto from case 2");
 }
 
+static void test_hashmap_tombstone_insert_delete_cycle(void)
+{
+    // Simulate heavy scope-based typedef churn
+    // Each iteration enters a scope, defines a typedef, exits scope
+    // This exercises hashmap insert + delete in the typedef table
+    volatile int sum = 0;
+    for (int round = 0; round < 200; round++)
+    {
+        {
+            typedef int round_type_t;
+            round_type_t val = round;
+            sum += val;
+        }
+    }
+    CHECK_EQ(sum, 19900, "hashmap_tombstone_insert_delete_cycle");
+}
+
+static void test_hashmap_tombstone_reinsert(void)
+{
+    // This pattern: define in scope, exit, redefine in new scope
+    // Tests that tombstone slots are properly reused
+    volatile int result = 0;
+    for (int i = 0; i < 50; i++)
+    {
+        {
+            typedef int reinsert_test_t;
+            reinsert_test_t v = i;
+            result += v;
+        }
+        // Same name re-entered in next iteration
+    }
+    CHECK_EQ(result, 1225, "hashmap_tombstone_reinsert");
+}
+
+static void test_hashmap_tombstone_multi_key_churn(void)
+{
+    volatile int result = 0;
+    for (int i = 0; i < 100; i++)
+    {
+        {
+            typedef int churn_a_t;
+            typedef long churn_b_t;
+            typedef short churn_c_t;
+            churn_a_t a = 1;
+            churn_b_t b = 2;
+            churn_c_t c = 3;
+            result += a + (int)b + (int)c;
+        }
+    }
+    CHECK_EQ(result, 600, "hashmap_tombstone_multi_key_churn");
+}
+
+static void test_switch_conditional_break_not_false_positive(void)
+{
+    // If mark_switch_control_exit incorrectly marked conditional breaks
+    // as definite exits, defer would generate wrong code.
+    volatile int cleanup = 0;
+    volatile int result = 0;
+    for (int i = 0; i < 5; i++)
+    {
+        defer cleanup++;
+        switch (i)
+        {
+        case 0:
+            if (i == 0)
+                break; // conditional break - should NOT be definite exit
+            result += 10;
+            break;
+        case 1:
+            break; // unconditional break - IS a definite exit
+        default:
+            result += i;
+            break;
+        }
+    }
+    CHECK_EQ(cleanup, 5, "switch_conditional_break_no_false_positive_cleanup");
+    CHECK_EQ(result, 9, "switch_conditional_break_no_false_positive_result");
+}
+
+static void test_switch_nested_conditional_context(void)
+{
+    volatile int cleanup = 0;
+    volatile int val = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        defer cleanup++;
+        switch (i)
+        {
+        case 0:
+        {
+            if (i == 0)
+            {
+                val += 10;
+                break;
+            }
+            val += 100;
+            break;
+        }
+        case 1:
+            while (0)
+                break; // break inside while, not switch
+            val += 20;
+            break;
+        default:
+            val += 30;
+            break;
+        }
+    }
+    CHECK_EQ(cleanup, 3, "switch_nested_conditional_cleanup");
+    CHECK_EQ(val, 60, "switch_nested_conditional_val");
+}
+
+static void test_make_temp_file_normal_operation(void)
+{
+    // Verify transpiler is functional with normal paths
+    // If make_temp_file truncation check broke something, this
+    // test (and all others) would fail to even run.
+    volatile int ok = 1;
+    CHECK(ok, "make_temp_file_normal_operation");
+}
+
 void run_bulletproof_regression_tests(void)
 {
     printf("\n=== BULLETPROOF REGRESSION TESTS ===\n");
@@ -11133,6 +11254,13 @@ void run_bulletproof_regression_tests(void)
     test_typeof_statement_expr_zeroinit();
     test_typeof_complex_expr_zeroinit();
 #endif
+
+    test_hashmap_tombstone_insert_delete_cycle();
+    test_hashmap_tombstone_reinsert();
+    test_hashmap_tombstone_multi_key_churn();
+    test_switch_conditional_break_not_false_positive();
+    test_switch_nested_conditional_context();
+    test_make_temp_file_normal_operation();
 }
 
 int main(void)

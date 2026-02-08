@@ -486,8 +486,7 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val)
     ent->key = key;
     ent->keylen = keylen;
     ent->val = val;
-    if (ent->key != TOMBSTONE)
-        map->used++;
+    map->used++;
 }
 
 static void hashmap_delete2(HashMap *map, char *key, int keylen)
@@ -503,6 +502,7 @@ static void hashmap_delete2(HashMap *map, char *key, int keylen)
             ent->keylen == keylen && !memcmp(ent->key, key, keylen))
         {
             ent->key = TOMBSTONE;
+            map->used--;
             return;
         }
         if (!ent->key)
