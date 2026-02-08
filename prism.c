@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.107.0"
+#define PRISM_VERSION "0.108.0"
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -248,6 +248,7 @@ typedef struct
   int len;
   int scope_depth;    // Scope where defined (aligns with ctx->defer_depth)
   bool is_vla;        // True if typedef refers to a VLA type
+  bool is_void;       // True if typedef resolves to void (e.g., typedef void Void)
   bool is_shadow;     // True if this entry shadows a typedef (variable with same name)
   bool is_enum_const; // True if this is an enum constant (compile-time constant)
   int prev_index;     // Index of previous entry with same name (-1 if none), for hash map chaining
@@ -840,7 +841,8 @@ typedef enum
   TDK_VLA_VAR // VLA variable (not typedef, but actual VLA array variable)
 } TypedefKind;
 
-static void typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool is_vla)
+static void typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool is_vla,
+                              bool is_void)
 {
   // Skip duplicate typedef re-definitions at the same scope (valid C11 §6.7/3).
   // Prevents table bloat in unity builds with repeated typedef declarations.
@@ -862,16 +864,17 @@ static void typedef_add_entry(char *name, int len, int scope_depth, TypedefKind 
   e->len = len;
   e->scope_depth = scope_depth;
   e->is_vla = (kind == TDK_TYPEDEF || kind == TDK_VLA_VAR) ? is_vla : false;
+  e->is_void = (kind == TDK_TYPEDEF) ? is_void : false;
   e->is_shadow = (kind == TDK_SHADOW || kind == TDK_ENUM_CONST); // Enum consts also shadow typedefs
   e->is_enum_const = (kind == TDK_ENUM_CONST);
   e->prev_index = typedef_get_index(name, len);
   typedef_set_index(name, len, new_index);
 }
 
-#define typedef_add(name, len, depth, is_vla) typedef_add_entry(name, len, depth, TDK_TYPEDEF, is_vla)
-#define typedef_add_shadow(name, len, depth) typedef_add_entry(name, len, depth, TDK_SHADOW, false)
-#define typedef_add_enum_const(name, len, depth) typedef_add_entry(name, len, depth, TDK_ENUM_CONST, false)
-#define typedef_add_vla_var(name, len, depth) typedef_add_entry(name, len, depth, TDK_VLA_VAR, true)
+#define typedef_add(name, len, depth, is_vla, is_void) typedef_add_entry(name, len, depth, TDK_TYPEDEF, is_vla, is_void)
+#define typedef_add_shadow(name, len, depth) typedef_add_entry(name, len, depth, TDK_SHADOW, false, false)
+#define typedef_add_enum_const(name, len, depth) typedef_add_entry(name, len, depth, TDK_ENUM_CONST, false, false)
+#define typedef_add_vla_var(name, len, depth) typedef_add_entry(name, len, depth, TDK_VLA_VAR, true, false)
 
 // Called when exiting a scope - removes typedefs defined at or above given depth.
 // Uses >= instead of == for resilience: if a deeper scope's entries weren't cleaned up
@@ -1002,6 +1005,20 @@ static bool is_vla_typedef(Token *tok)
   if (e->is_shadow)
     return false;
   return e->is_vla;
+}
+
+// Check if token is a known void typedef (e.g., typedef void Void)
+static bool is_void_typedef(Token *tok)
+{
+  if (!is_identifier_like(tok))
+    return false;
+  int idx = typedef_get_index(tok->loc, tok->len);
+  if (idx < 0)
+    return false;
+  TypedefEntry *e = &typedef_table.entries[idx];
+  if (e->is_shadow)
+    return false;
+  return e->is_void;
 }
 
 // Check if token is a known enum constant (compile-time constant)
@@ -1494,7 +1511,8 @@ static bool is_void_function_decl(Token *tok)
   }
 
   // Must be at 'void' now
-  if (!tok || !equal(tok, "void"))
+  // Must be at 'void' or a typedef alias for void now
+  if (!tok || (!equal(tok, "void") && !is_void_typedef(tok)))
     return false;
   tok = tok->next;
 
@@ -1629,18 +1647,47 @@ static bool scan_for_vla(Token *tok, const char *open, const char *close)
 static void parse_typedef_declaration(Token *tok, int scope_depth)
 {
   Token *typedef_start = tok;
-  tok = tok->next;                     // Skip 'typedef'
+  tok = tok->next; // Skip 'typedef'
+  Token *type_start = tok;
   tok = parse_type_specifier(tok).end; // Skip the base type
 
   // Check if this typedef contains a VLA anywhere
   bool is_vla = typedef_contains_vla(typedef_start);
+
+  // Check if the base type is void (or a typedef alias for void).
+  // Scan tokens from type_start to tok for 'void' keyword or known void typedef.
+  // Excludes: struct/union/enum, typeof, _Atomic(...), function pointers.
+  bool base_is_void = false;
+  for (Token *t = type_start; t && t != tok; t = t->next)
+  {
+    if (equal(t, "void"))
+    {
+      base_is_void = true;
+      break;
+    }
+    // Check for chained typedefs: typedef Void MyVoid;
+    if (t->kind == TK_IDENT && is_known_typedef(t))
+    {
+      int idx = typedef_get_index(t->loc, t->len);
+      if (idx >= 0 && typedef_table.entries[idx].is_void)
+      {
+        base_is_void = true;
+        break;
+      }
+    }
+  }
 
   // Parse declarator(s) until semicolon
   while (tok && !equal(tok, ";") && tok->kind != TK_EOF)
   {
     DeclResult decl = parse_declarator(tok, false);
     if (decl.var_name)
-      typedef_add(decl.var_name->loc, decl.var_name->len, scope_depth, is_vla);
+    {
+      // A typedef is void only if the base type is void AND the declarator
+      // is plain (no pointer, array, or function pointer indirection)
+      bool is_void = base_is_void && !decl.is_pointer && !decl.is_array && !decl.is_func_ptr;
+      typedef_add(decl.var_name->loc, decl.var_name->len, scope_depth, is_vla, is_void);
+    }
     tok = decl.end ? decl.end : tok->next;
 
     // Skip to comma or semicolon (past any initializer)
@@ -2843,8 +2890,26 @@ static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suf
   if (n < 0 || (size_t)n >= bufsize)
     return -1; // path truncated, XXXXXX template would be corrupted
 #if defined(_WIN32)
-  if (_mktemp_s(buf, bufsize) != 0)
+  // Use _sopen_s with _O_CREAT|_O_EXCL for atomic creation (avoids TOCTOU race of _mktemp_s)
+  {
+    // Try up to 100 unique names
+    for (int attempt = 0; attempt < 100; attempt++)
+    {
+      char try_buf[PATH_MAX];
+      memcpy(try_buf, buf, bufsize);
+      if (_mktemp_s(try_buf, bufsize) != 0)
+        return -1;
+      int fd;
+      errno_t err = _sopen_s(&fd, try_buf, _O_CREAT | _O_EXCL | _O_WRONLY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
+      if (err == 0 && fd >= 0)
+      {
+        _close(fd);
+        memcpy(buf, try_buf, bufsize);
+        return 0;
+      }
+    }
     return -1;
+  }
 #elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
   int fd = suffix_len > 0 ? mkstemps(buf, suffix_len) : mkstemp(buf);
   if (fd < 0)
@@ -3220,8 +3285,10 @@ static int transpile_tokens(Token *tok, FILE *fp)
       next_func_returns_void = false;
     }
 
-    // Void function detection — only for keywords at top level
-    if (ctx->defer_depth == 0 && tok->kind == TK_KEYWORD && is_void_function_decl(tok))
+    // Void function detection — keywords and void typedef identifiers at top level
+    if (ctx->defer_depth == 0 &&
+        (tok->kind == TK_KEYWORD || (tok->kind == TK_IDENT && is_void_typedef(tok))) &&
+        is_void_function_decl(tok))
       next_func_returns_void = true;
 
     // struct/union/enum body
@@ -4063,8 +4130,26 @@ static void make_run_temp(char *buf, size_t size, CliMode mode)
     return;
   snprintf(buf, size, "%sprism_run.XXXXXX", get_tmp_dir());
 #if defined(_WIN32)
-  _mktemp_s(buf, size);
-  strcat(buf, ".exe");
+  // Atomic temp file creation to avoid TOCTOU race
+  {
+    char try_buf[PATH_MAX];
+    for (int attempt = 0; attempt < 100; attempt++)
+    {
+      memcpy(try_buf, buf, size);
+      if (_mktemp_s(try_buf, size) != 0)
+        break;
+      strcat(try_buf, ".exe");
+      int fd;
+      errno_t err = _sopen_s(&fd, try_buf, _O_CREAT | _O_EXCL | _O_WRONLY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
+      if (err == 0 && fd >= 0)
+      {
+        _close(fd);
+        memcpy(buf, try_buf, strlen(try_buf) + 1);
+        return;
+      }
+    }
+    buf[0] = '\0'; // Failed
+  }
 #else
   int fd = mkstemp(buf);
   if (fd >= 0)

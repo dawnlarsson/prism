@@ -11211,6 +11211,108 @@ static void test_make_temp_file_normal_operation(void)
     CHECK(ok, "make_temp_file_normal_operation");
 }
 
+typedef void VoidAlias;
+
+static volatile int void_typedef_cleanup_count;
+
+static void void_typedef_helper(void)
+{
+    void_typedef_cleanup_count++;
+}
+
+static VoidAlias test_void_typedef_return_basic_impl(void)
+{
+    defer void_typedef_cleanup_count += 10;
+    return void_typedef_helper();
+}
+
+static void test_void_typedef_return_basic(void)
+{
+    void_typedef_cleanup_count = 0;
+    test_void_typedef_return_basic_impl();
+    CHECK_EQ(void_typedef_cleanup_count, 11, "void_typedef_return_basic");
+}
+
+typedef VoidAlias ChainedVoidAlias;
+
+static ChainedVoidAlias test_chained_void_typedef_impl(void)
+{
+    defer void_typedef_cleanup_count += 100;
+    return void_typedef_helper();
+}
+
+static void test_chained_void_typedef_return(void)
+{
+    void_typedef_cleanup_count = 0;
+    test_chained_void_typedef_impl();
+    CHECK_EQ(void_typedef_cleanup_count, 101, "chained_void_typedef_return");
+}
+
+// Static qualifier + void typedef
+static VoidAlias test_static_void_typedef_impl(void)
+{
+    defer void_typedef_cleanup_count += 1000;
+    return void_typedef_helper();
+}
+
+static void test_static_void_typedef_return(void)
+{
+    void_typedef_cleanup_count = 0;
+    test_static_void_typedef_impl();
+    CHECK_EQ(void_typedef_cleanup_count, 1001, "static_void_typedef_return");
+}
+
+// Void typedef with bare return (no expression)
+static VoidAlias test_void_typedef_bare_return_impl(void)
+{
+    defer void_typedef_cleanup_count += 5;
+    return;
+}
+
+static void test_void_typedef_bare_return(void)
+{
+    void_typedef_cleanup_count = 0;
+    test_void_typedef_bare_return_impl();
+    CHECK_EQ(void_typedef_cleanup_count, 5, "void_typedef_bare_return");
+}
+
+typedef void *VoidPtrAlias;
+
+static VoidPtrAlias test_void_ptr_typedef_return_impl(void)
+{
+    static int val = 42;
+    defer void_typedef_cleanup_count += 1;
+    return &val;
+}
+
+static void test_void_ptr_typedef_not_void(void)
+{
+    void_typedef_cleanup_count = 0;
+    int *p = test_void_ptr_typedef_return_impl();
+    CHECK_EQ(*p, 42, "void_ptr_typedef_not_void_val");
+    CHECK_EQ(void_typedef_cleanup_count, 1, "void_ptr_typedef_not_void_cleanup");
+}
+
+typedef VoidAlias (*VoidFuncPtr)(void);
+
+static void test_void_func_ptr_typedef(void)
+{
+    VoidFuncPtr fp = void_typedef_helper;
+    void_typedef_cleanup_count = 0;
+    fp();
+    CHECK_EQ(void_typedef_cleanup_count, 1, "void_func_ptr_typedef_call");
+}
+
+static void test_generic_void_typedef_no_label_confusion(void)
+{
+    int x = 42;
+    int result = _Generic(x,
+        int: 1,
+        VoidAlias *: 2,
+        default: 3);
+    CHECK_EQ(result, 1, "generic_void_typedef_no_label_confusion");
+}
+
 void run_bulletproof_regression_tests(void)
 {
     printf("\n=== BULLETPROOF REGRESSION TESTS ===\n");
@@ -11261,6 +11363,14 @@ void run_bulletproof_regression_tests(void)
     test_switch_conditional_break_not_false_positive();
     test_switch_nested_conditional_context();
     test_make_temp_file_normal_operation();
+
+    test_void_typedef_return_basic();
+    test_chained_void_typedef_return();
+    test_static_void_typedef_return();
+    test_void_typedef_bare_return();
+    test_void_ptr_typedef_not_void();
+    test_void_func_ptr_typedef();
+    test_generic_void_typedef_no_label_confusion();
 }
 
 int main(void)
