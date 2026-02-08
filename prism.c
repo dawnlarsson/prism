@@ -3961,7 +3961,7 @@ static void cli_free(Cli *cli)
   free(cli->cc_args);
 }
 
-static void add_warn_suppress(ArgvBuilder *ab)
+static void add_warn_suppress(ArgvBuilder *ab, bool clang)
 {
   static const char *w[] = {
       "-Wno-type-limits",
@@ -3970,10 +3970,13 @@ static void add_warn_suppress(ArgvBuilder *ab)
       "-Wno-unused-function",
       "-Wno-unused-variable",
       "-Wno-unused-parameter",
-      "-Wno-unknown-warning-option",
   };
   for (int i = 0; i < (int)(sizeof(w) / sizeof(*w)); i++)
     argv_builder_add(ab, w[i]);
+  if (clang)
+    argv_builder_add(ab, "-Wno-unknown-warning-option");
+  else
+    argv_builder_add(ab, "-Wno-logical-op");
 }
 
 static void verbose_argv(char **args)
@@ -4171,7 +4174,7 @@ static int compile_sources(Cli *cli)
 
     for (int i = 0; i < cli->cc_arg_count; i++)
       argv_builder_add(&ab, cli->cc_args[i]);
-    add_warn_suppress(&ab);
+    add_warn_suppress(&ab, clang);
     add_output_flags(&ab, cli, temp_exe);
     char **argv_cc = argv_builder_finish(&ab);
 
@@ -4219,7 +4222,7 @@ static int compile_sources(Cli *cli)
       argv_builder_add(&ab, "-fno-preprocessed");
     for (int i = 0; i < cli->cc_arg_count; i++)
       argv_builder_add(&ab, cli->cc_args[i]);
-    add_warn_suppress(&ab);
+    add_warn_suppress(&ab, clang);
     add_output_flags(&ab, cli, temp_exe);
     char **argv_cc = argv_builder_finish(&ab);
 

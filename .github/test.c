@@ -10631,6 +10631,33 @@ void run_c23_raw_string_tests(void)
     test_raw_string_with_delimiter();
 }
 
+#include <errno.h>
+
+#ifdef EWOULDBLOCK
+#define TEST_IS_EAGAIN(e) ((e) == EAGAIN || (e) == EWOULDBLOCK)
+#else
+#define TEST_IS_EAGAIN(e) ((e) == EAGAIN)
+#endif
+
+void test_logical_op_eagain(void)
+{
+    // This pattern caused -Werror=logical-op when EAGAIN == EWOULDBLOCK
+    int saved_errno = EAGAIN;
+    int result = TEST_IS_EAGAIN(saved_errno);
+    CHECK(result, "IS_EAGAIN macro (logical-op regression)");
+
+    saved_errno = 0;
+    result = TEST_IS_EAGAIN(saved_errno);
+    CHECK(!result, "IS_EAGAIN false case (logical-op regression)");
+}
+
+void run_logical_op_regression_tests(void)
+{
+    printf("\n=== LOGICAL-OP REGRESSION TESTS ===\n");
+    printf("(coreutils iopoll.c -Wlogical-op / -fpreprocessed fix)\n\n");
+    test_logical_op_eagain();
+}
+
 int main(void)
 {
     printf("=== PRISM TEST SUITE ===\n");
@@ -10671,6 +10698,7 @@ int main(void)
     run_c23_raw_string_tests();
     run_raw_string_torture_tests();
     run_sizeof_var_torture_tests();
+    run_logical_op_regression_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);
