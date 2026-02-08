@@ -10658,6 +10658,297 @@ void run_logical_op_regression_tests(void)
     test_logical_op_eagain();
 }
 
+#ifdef __GNUC__
+void test_typeof_overflow_35_vars(void)
+{
+    // 35 typeof variables in one declaration — exceeds old limit of 32
+    typeof(int) v1, v2, v3, v4, v5, v6, v7, v8,
+        v9, v10, v11, v12, v13, v14, v15, v16,
+        v17, v18, v19, v20, v21, v22, v23, v24,
+        v25, v26, v27, v28, v29, v30, v31, v32,
+        v33, v34, v35;
+
+    // All must be zero-initialized, including those past the old limit
+    CHECK_EQ(v1, 0, "typeof overflow: v1 zero-init");
+    CHECK_EQ(v16, 0, "typeof overflow: v16 zero-init");
+    CHECK_EQ(v32, 0, "typeof overflow: v32 zero-init (old limit)");
+    CHECK_EQ(v33, 0, "typeof overflow: v33 zero-init (past old limit)");
+    CHECK_EQ(v34, 0, "typeof overflow: v34 zero-init (past old limit)");
+    CHECK_EQ(v35, 0, "typeof overflow: v35 zero-init (past old limit)");
+}
+
+void test_typeof_overflow_64_vars(void)
+{
+    // 64 typeof variables — stress test for dynamic allocation
+    typeof(int) a01, a02, a03, a04, a05, a06, a07, a08,
+        a09, a10, a11, a12, a13, a14, a15, a16,
+        a17, a18, a19, a20, a21, a22, a23, a24,
+        a25, a26, a27, a28, a29, a30, a31, a32,
+        a33, a34, a35, a36, a37, a38, a39, a40,
+        a41, a42, a43, a44, a45, a46, a47, a48,
+        a49, a50, a51, a52, a53, a54, a55, a56,
+        a57, a58, a59, a60, a61, a62, a63, a64;
+
+    CHECK_EQ(a01, 0, "typeof overflow 64: a01");
+    CHECK_EQ(a32, 0, "typeof overflow 64: a32");
+    CHECK_EQ(a33, 0, "typeof overflow 64: a33");
+    CHECK_EQ(a48, 0, "typeof overflow 64: a48");
+    CHECK_EQ(a64, 0, "typeof overflow 64: a64");
+}
+
+void test_typeof_struct_overflow(void)
+{
+    // typeof with struct — memset path
+    struct pair
+    {
+        int x, y;
+    };
+    struct pair p;
+    p.x = 42;
+    p.y = 99;
+    typeof(p) s1, s2, s3, s4, s5, s6, s7, s8,
+        s9, s10, s11, s12, s13, s14, s15, s16,
+        s17, s18, s19, s20, s21, s22, s23, s24,
+        s25, s26, s27, s28, s29, s30, s31, s32,
+        s33, s34;
+
+    CHECK_EQ(s1.x, 0, "typeof struct overflow: s1.x");
+    CHECK_EQ(s32.x, 0, "typeof struct overflow: s32.x (old limit)");
+    CHECK_EQ(s33.x, 0, "typeof struct overflow: s33.x (past old limit)");
+    CHECK_EQ(s34.y, 0, "typeof struct overflow: s34.y (past old limit)");
+}
+#endif // __GNUC__
+
+// --- Issue 3: scan_labels_in_function correctness ---
+// Verify that label scanning works correctly for functions with many labels
+void test_many_labels_function(void)
+{
+    int result = 0;
+    goto label_start;
+label_01:
+    result += 1;
+    goto label_02;
+label_02:
+    result += 2;
+    goto label_03;
+label_03:
+    result += 4;
+    goto label_04;
+label_04:
+    result += 8;
+    goto label_05;
+label_05:
+    result += 16;
+    goto label_06;
+label_06:
+    result += 32;
+    goto label_07;
+label_07:
+    result += 64;
+    goto label_end;
+label_start:
+    goto label_01;
+label_end:
+    CHECK_EQ(result, 127, "many labels: forward+backward goto");
+}
+
+// --- Issue 5: 'raw' keyword collision with user identifiers ---
+// Ensure 'raw' used as variable, struct member, or parameter doesn't break parsing
+
+void test_raw_struct_member_field(void)
+{
+    // Struct with member named 'raw' — must not confuse parser
+    struct data
+    {
+        int raw;
+        int cooked;
+    };
+    struct data d;
+    d.raw = 42;
+    d.cooked = 99;
+    CHECK_EQ(d.raw, 42, "raw struct member: d.raw");
+    CHECK_EQ(d.cooked, 99, "raw struct member: d.cooked");
+}
+
+void test_raw_anonymous_struct_member(void)
+{
+    // Anonymous struct with 'raw' member
+    struct
+    {
+        int raw;
+        char name[8];
+    } item;
+    item.raw = 7;
+    memcpy(item.name, "test", 5);
+    CHECK_EQ(item.raw, 7, "raw anonymous struct member");
+    CHECK(strcmp(item.name, "test") == 0, "raw anonymous struct: name field");
+}
+
+void test_raw_in_compound_literal(void)
+{
+    // 'raw' as variable initialized from compound literal
+    int raw = ((struct { int raw; }){.raw = 55}).raw;
+    CHECK_EQ(raw, 55, "raw in compound literal member access");
+}
+
+void test_raw_typedef_name(void)
+{
+    // typedef named 'raw' — should shadow the keyword
+    typedef int raw;
+    raw x;
+    x = 123;
+    CHECK_EQ(x, 123, "raw as typedef name");
+}
+
+void test_raw_pointer_to_struct_with_raw(void)
+{
+    struct raw_data
+    {
+        int raw;
+    };
+    struct raw_data val;
+    val.raw = 88;
+    struct raw_data *ptr = &val;
+    CHECK_EQ(ptr->raw, 88, "raw: ptr->raw member access");
+}
+
+void test_raw_array_of_structs_with_raw(void)
+{
+    struct item
+    {
+        int raw;
+        int processed;
+    };
+    struct item items[3];
+    for (int i = 0; i < 3; i++)
+    {
+        items[i].raw = i * 10;
+        items[i].processed = i * 100;
+    }
+    CHECK_EQ(items[0].raw, 0, "raw array of structs: [0].raw");
+    CHECK_EQ(items[2].raw, 20, "raw array of structs: [2].raw");
+    CHECK_EQ(items[2].processed, 200, "raw array of structs: [2].processed");
+}
+
+// --- Issue 6: Ghost shadow typedef corruption ---
+// Verify typedef resolution is correctly restored after braceless control flow
+
+typedef int GhostT;
+
+void test_ghost_shadow_for_braceless(void)
+{
+    // Baseline: GhostT is a type
+    GhostT *p1 = &(GhostT){10};
+    CHECK_EQ(*p1, 10, "ghost shadow: GhostT before for");
+
+    // For-init shadows GhostT with a variable
+    for (int GhostT = 0; GhostT < 1; GhostT++)
+        (void)GhostT; // braceless body
+
+    // GhostT must be a type again
+    GhostT *p2 = &(GhostT){20};
+    CHECK_EQ(*p2, 20, "ghost shadow: GhostT restored after braceless for");
+}
+
+void test_ghost_shadow_nested_for(void)
+{
+    GhostT *p0 = &(GhostT){5};
+    CHECK_EQ(*p0, 5, "ghost shadow nested: before");
+
+    for (int GhostT = 0; GhostT < 1; GhostT++)
+        for (int GhostT = 0; GhostT < 1; GhostT++)
+            (void)GhostT; // double braceless nesting
+
+    GhostT *p1 = &(GhostT){15};
+    CHECK_EQ(*p1, 15, "ghost shadow nested: after double braceless for");
+}
+
+void test_ghost_shadow_while_braceless(void)
+{
+    GhostT val = 42;
+    int count = 0;
+
+    while (count < 1)
+        count++;
+
+    GhostT *p = &val;
+    CHECK_EQ(*p, 42, "ghost shadow: GhostT after braceless while");
+}
+
+void test_ghost_shadow_if_else_braceless(void)
+{
+    GhostT a = 10;
+    int cond = 1;
+
+    if (cond)
+        a = 20;
+    else
+        a = 30;
+
+    GhostT *p = &a;
+    CHECK_EQ(*p, 20, "ghost shadow: GhostT after braceless if/else");
+}
+
+#ifdef __GNUC__
+void test_ghost_shadow_generic(void)
+{
+    // _Generic inside a for body that shadows a typedef
+    GhostT val = 100;
+    for (int GhostT = 0; GhostT < 1; GhostT++)
+    {
+        int r = _Generic(GhostT, int: 1, default: 0);
+        (void)r;
+    }
+
+    GhostT *p = &val;
+    CHECK_EQ(*p, 100, "ghost shadow: GhostT after for with _Generic");
+}
+
+void test_ghost_shadow_generic_braceless(void)
+{
+    GhostT val = 200;
+    for (int GhostT = 0; GhostT < 1; GhostT++)
+        (void)_Generic(GhostT, int: 1, default: 0);
+
+    GhostT *p = &val;
+    CHECK_EQ(*p, 200, "ghost shadow: GhostT after braceless for with _Generic");
+}
+#endif
+
+void run_bulletproof_regression_tests(void)
+{
+    printf("\n=== BULLETPROOF REGRESSION TESTS ===\n");
+    printf("(Issues 1-6: overflow, realloc, labels, setjmp, raw, ghost shadow)\n\n");
+
+#ifdef __GNUC__
+    // Issue 1: typeof overflow
+    test_typeof_overflow_35_vars();
+    test_typeof_overflow_64_vars();
+    test_typeof_struct_overflow();
+#endif
+
+    // Issue 3: scan_labels correctness
+    test_many_labels_function();
+
+    // Issue 5: raw keyword collision
+    test_raw_struct_member_field();
+    test_raw_anonymous_struct_member();
+    test_raw_in_compound_literal();
+    test_raw_typedef_name();
+    test_raw_pointer_to_struct_with_raw();
+    test_raw_array_of_structs_with_raw();
+
+    // Issue 6: Ghost shadow typedef corruption
+    test_ghost_shadow_for_braceless();
+    test_ghost_shadow_nested_for();
+    test_ghost_shadow_while_braceless();
+    test_ghost_shadow_if_else_braceless();
+#ifdef __GNUC__
+    test_ghost_shadow_generic();
+    test_ghost_shadow_generic_braceless();
+#endif
+}
+
 int main(void)
 {
     printf("=== PRISM TEST SUITE ===\n");
@@ -10699,6 +10990,7 @@ int main(void)
     run_raw_string_torture_tests();
     run_sizeof_var_torture_tests();
     run_logical_op_regression_tests();
+    run_bulletproof_regression_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

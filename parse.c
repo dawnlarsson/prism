@@ -58,9 +58,14 @@ static const uint8_t ident_char[256] = {
             int new_cap = (cap) == 0 ? (init_cap) : (cap) * 2; \
             while (new_cap < (count))                          \
                 new_cap *= 2;                                  \
+            T *old_ptr_ = (arr);                               \
             T *tmp = realloc((arr), sizeof(T) * new_cap);      \
             if (!tmp)                                          \
+            {                                                  \
+                free(old_ptr_);                                \
+                (arr) = NULL;                                  \
                 error("out of memory");                        \
+            }                                                  \
             (arr) = tmp;                                       \
             (cap) = new_cap;                                   \
         }                                                      \
@@ -950,6 +955,10 @@ static void init_keyword_map(void)
         {"sigsetjmp", TT_SETJMP_FN},
         {"siglongjmp", TT_SETJMP_FN},
         {"pthread_exit", TT_SETJMP_FN},
+        {"__builtin_setjmp", TT_SETJMP_FN},
+        {"__builtin_longjmp", TT_SETJMP_FN},
+        {"__builtin_setjmp_receive", TT_SETJMP_FN},
+        {"savectx", TT_SETJMP_FN},
         {"vfork", TT_VFORK_FN},
     };
     for (size_t i = 0; i < sizeof(id_tags) / sizeof(*id_tags); i++)
@@ -973,7 +982,7 @@ static void init_keyword_map(void)
         int len = strlen(id_tags[i].name);
         unsigned slot = KEYWORD_HASH(id_tags[i].name, len);
         if (keyword_perfect[slot].name)
-            error("keyword hash collision: '%s' and '%s'", keyword_perfect[slot].name, id_tags[i].name);
+            continue; // Collision with keyword — fall back to hashmap for this tag
         keyword_perfect[slot].name = id_tags[i].name;
         keyword_perfect[slot].len = len;
         keyword_perfect[slot].value = id_tags[i].tag;
@@ -1619,6 +1628,8 @@ static Token *tokenize(File *file)
         {
             Token *t = cur = cur->next = new_token(TK_IDENT, p, p + ident_len);
             uintptr_t kw = keyword_lookup(p, ident_len);
+            if (!kw)
+                kw = (uintptr_t)hashmap_get(&ctx->keyword_map, p, ident_len);
             if (kw)
             {
                 if (kw & KW_MARKER)

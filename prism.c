@@ -22,7 +22,19 @@
 #include <sys/sysctl.h>
 #endif
 
-// LIBRARY API
+#define INITIAL_ARRAY_CAP 32
+
+#ifdef _WIN32
+#define INSTALL_PATH "prism.exe"
+#else
+#define INSTALL_PATH "/usr/local/bin/prism"
+#endif
+
+#ifdef PRISM_LIB_MODE
+#define PRISM_API
+#else
+#define PRISM_API static
+#endif
 
 typedef struct
 {
@@ -61,13 +73,6 @@ typedef struct
   int error_line;
   int error_col;
 } PrismResult;
-
-// API visibility control - in library mode, API functions are non-static for linking
-#ifdef PRISM_LIB_MODE
-#define PRISM_API
-#else
-#define PRISM_API static
-#endif
 
 PRISM_API PrismFeatures prism_defaults(void)
 {
@@ -126,25 +131,6 @@ static const char *get_tmp_dir(void)
   return "/tmp/";
 #endif
 }
-
-// CLI CONFIGURATION (excluded with -DPRISM_LIB_MODE)
-
-#ifndef PRISM_LIB_MODE
-
-#ifdef _WIN32
-#define INSTALL_PATH "prism.exe"
-#else
-#define INSTALL_PATH "/usr/local/bin/prism"
-#endif
-
-#endif // PRISM_LIB_MODE
-
-// Initial capacity for all dynamic arrays (grows as needed)
-#define INITIAL_CAP 32
-
-// Note: ENSURE_ARRAY_CAP is defined in parse.c
-
-#define MAX_TYPEOF_VARS_PER_DECL 32
 
 static Token *skip_balanced(Token *tok, char *open, char *close);
 
@@ -511,7 +497,7 @@ static void end_statement_after_semicolon(void)
 static void defer_push_scope(bool consume_flags)
 {
   int old_cap = defer_stack_capacity;
-  ENSURE_ARRAY_CAP(defer_stack, ctx->defer_depth + 1, defer_stack_capacity, INITIAL_CAP, DeferScope);
+  ENSURE_ARRAY_CAP(defer_stack, ctx->defer_depth + 1, defer_stack_capacity, INITIAL_ARRAY_CAP, DeferScope);
   for (int i = old_cap; i < defer_stack_capacity; i++)
     defer_stack[i] = (DeferScope){0};
   DeferScope *s = &defer_stack[ctx->defer_depth];
@@ -551,7 +537,7 @@ static void defer_add(Token *defer_keyword, Token *start, Token *end)
   if (ctx->defer_depth <= 0)
     error_tok(start, "defer outside of any scope");
   DeferScope *scope = &defer_stack[ctx->defer_depth - 1];
-  ENSURE_ARRAY_CAP(scope->entries, scope->count + 1, scope->capacity, INITIAL_CAP, DeferEntry);
+  ENSURE_ARRAY_CAP(scope->entries, scope->count + 1, scope->capacity, INITIAL_ARRAY_CAP, DeferEntry);
   scope->entries[scope->count++] = (DeferEntry){start, end, defer_keyword};
   scope->had_control_exit = false;
 }
@@ -803,7 +789,7 @@ static bool has_defers_for(DeferEmitMode mode, int stop_depth)
 
 static void label_table_add(char *name, int name_len, int scope_depth)
 {
-  ENSURE_ARRAY_CAP(label_table.labels, label_table.count + 1, label_table.capacity, INITIAL_CAP, LabelInfo);
+  ENSURE_ARRAY_CAP(label_table.labels, label_table.count + 1, label_table.capacity, INITIAL_ARRAY_CAP, LabelInfo);
   LabelInfo *info = &label_table.labels[label_table.count++];
   info->name = name;
   info->name_len = name_len;
@@ -855,7 +841,7 @@ typedef enum
 
 static void typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool is_vla)
 {
-  ENSURE_ARRAY_CAP(typedef_table.entries, typedef_table.count + 1, typedef_table.capacity, INITIAL_CAP, TypedefEntry);
+  ENSURE_ARRAY_CAP(typedef_table.entries, typedef_table.count + 1, typedef_table.capacity, INITIAL_ARRAY_CAP, TypedefEntry);
   int new_index = typedef_table.count++;
   TypedefEntry *e = &typedef_table.entries[new_index];
   e->name = name;
@@ -2112,14 +2098,18 @@ static Token *handle_storage_raw(Token *storage_tok)
 // Returns token after declaration, or NULL on failure
 static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
 {
-  Token *typeof_vars[MAX_TYPEOF_VARS_PER_DECL];
+  Token **typeof_vars = NULL;
   int typeof_var_count = 0;
+  int typeof_var_cap = 0;
 
   while (tok && tok->kind != TK_EOF)
   {
     DeclResult decl = parse_declarator(tok, true);
     if (!decl.end || !decl.var_name)
+    {
+      free(typeof_vars);
       return NULL;
+    }
 
     tok = decl.end;
 
@@ -2143,9 +2133,12 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
         OUT_LIT(" = 0");
     }
 
-    // Track typeof variables for memset emission
-    if (needs_memset && typeof_var_count < MAX_TYPEOF_VARS_PER_DECL)
+    // Track typeof variables for memset emission (dynamic, no hard limit)
+    if (needs_memset)
+    {
+      ENSURE_ARRAY_CAP(typeof_vars, typeof_var_count + 1, typeof_var_cap, 8, Token *);
       typeof_vars[typeof_var_count++] = decl.var_name;
+    }
 
     // Emit initializer if present
     if (decl.has_init)
@@ -2203,6 +2196,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
           OUT_LIT("));");
         }
       }
+      free(typeof_vars);
       return tok->next;
     }
     else if (equal(tok, ","))
@@ -2211,9 +2205,13 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
       tok = tok->next;
     }
     else
+    {
+      free(typeof_vars);
       return NULL;
+    }
   }
 
+  free(typeof_vars);
   return NULL;
 }
 
@@ -2671,7 +2669,7 @@ static Token *handle_open_brace(Token *tok)
   // Detect statement expression: ({
   if (last_emitted && equal(last_emitted, "("))
   {
-    ENSURE_ARRAY_CAP(stmt_expr_levels, ctx->stmt_expr_count + 1, stmt_expr_capacity, INITIAL_CAP, int);
+    ENSURE_ARRAY_CAP(stmt_expr_levels, ctx->stmt_expr_count + 1, stmt_expr_capacity, INITIAL_ARRAY_CAP, int);
     stmt_expr_levels[ctx->stmt_expr_count++] = ctx->defer_depth + 1;
   }
   emit_tok(tok);
