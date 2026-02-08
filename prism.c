@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.106.0"
+#define PRISM_VERSION "0.107.0"
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -362,7 +362,6 @@ static void out_close(void)
   }
 }
 
-
 static void out_uint(unsigned long long v)
 {
   char buf[24], *p = buf + sizeof(buf);
@@ -386,7 +385,10 @@ static void out_line(int line_no, const char *file)
   char num[24];
   char *p = num + sizeof(num);
   unsigned long long v = line_no;
-  do { *--p = '0' + v % 10; } while (v /= 10);
+  do
+  {
+    *--p = '0' + v % 10;
+  } while (v /= 10);
   int numlen = num + sizeof(num) - p;
   memcpy(buf + n, p, numlen);
   n += numlen;
@@ -1182,15 +1184,21 @@ static void scan_labels_in_function(Token *tok)
       uint32_t tag = t->tag;
       if (__builtin_expect(tag & (TT_SETJMP_FN | TT_VFORK_FN | TT_ASM | TT_GOTO), 0))
       {
-        if (tag & TT_SETJMP_FN) ctx->current_func_has_setjmp = true;
-        if (tag & TT_VFORK_FN) ctx->current_func_has_vfork = true;
-        if (tag & TT_ASM)      ctx->current_func_has_asm = true;
-        if (tag & TT_GOTO)     needs_labels = true;
+        if (tag & TT_SETJMP_FN)
+          ctx->current_func_has_setjmp = true;
+        if (tag & TT_VFORK_FN)
+          ctx->current_func_has_vfork = true;
+        if (tag & TT_ASM)
+          ctx->current_func_has_asm = true;
+        if (tag & TT_GOTO)
+          needs_labels = true;
       }
       if (t->len == 1)
       {
-        if (t->loc[0] == '{') d++;
-        else if (t->loc[0] == '}' && --d <= 0) break;
+        if (t->loc[0] == '{')
+          d++;
+        else if (t->loc[0] == '}' && --d <= 0)
+          break;
       }
     }
   }
@@ -1214,10 +1222,15 @@ static void scan_labels_in_function(Token *tok)
       Token *brace = find_struct_body_brace(t);
       if (brace)
       {
-        while (t != brace) { prev = t; t = t->next; }
+        while (t != brace)
+        {
+          prev = t;
+          t = t->next;
+        }
         struct_depth++;
         depth++;
-        prev = t; t = t->next;
+        prev = t;
+        t = t->next;
         continue;
       }
     }
@@ -1225,7 +1238,8 @@ static void scan_labels_in_function(Token *tok)
     // Skip _Generic(...)
     if (__builtin_expect(tag & TT_GENERIC, 0))
     {
-      prev = t; t = t->next;
+      prev = t;
+      t = t->next;
       if (t && equal(t, "("))
         t = skip_balanced(t, "(", ")");
       prev = NULL;
@@ -1249,11 +1263,14 @@ static void scan_labels_in_function(Token *tok)
     }
     else if (__builtin_expect(t->flags & TF_IS_DIGRAPH, 0))
     {
-      if (_equal_1(t, '{')) depth++;
+      if (_equal_1(t, '{'))
+        depth++;
       else if (_equal_1(t, '}'))
       {
-        if (depth <= 1) break;
-        if (struct_depth > 0) struct_depth--;
+        if (depth <= 1)
+          break;
+        if (struct_depth > 0)
+          struct_depth--;
         depth--;
       }
     }
@@ -2946,7 +2963,13 @@ static char *preprocess_with_cc(const char *input_file)
     {
       cap *= 2;
       char *tmp = realloc(buf, cap);
-      if (!tmp) { free(buf); close(pipefd[0]); waitpid(pid, NULL, 0); return NULL; }
+      if (!tmp)
+      {
+        free(buf);
+        close(pipefd[0]);
+        waitpid(pid, NULL, 0);
+        return NULL;
+      }
       buf = tmp;
     }
   }
@@ -3093,66 +3116,66 @@ static int transpile_tokens(Token *tok, FILE *fp)
     if (tag)
     {
 
-    // ── Keyword dispatch (defer, return, break/continue, goto) ──
+      // ── Keyword dispatch (defer, return, break/continue, goto) ──
 
-    if (tag & TT_DEFER)
-      DISPATCH(handle_defer_keyword);
-    if (FEAT(F_DEFER) && (tag & TT_RETURN))
-      DISPATCH(handle_return_defer);
-    if (FEAT(F_DEFER) && (tag & (TT_BREAK | TT_CONTINUE)))
-      DISPATCH(handle_break_continue_defer);
-    if ((tag & TT_GOTO) && FEAT(F_DEFER | F_ZEROINIT))
-      DISPATCH(handle_goto_keyword);
+      if (tag & TT_DEFER)
+        DISPATCH(handle_defer_keyword);
+      if (FEAT(F_DEFER) && (tag & TT_RETURN))
+        DISPATCH(handle_return_defer);
+      if (FEAT(F_DEFER) && (tag & (TT_BREAK | TT_CONTINUE)))
+        DISPATCH(handle_break_continue_defer);
+      if ((tag & TT_GOTO) && FEAT(F_DEFER | F_ZEROINIT))
+        DISPATCH(handle_goto_keyword);
 
-    // ── Control-flow flag setting (loop, switch, if/else) ──
+      // ── Control-flow flag setting (loop, switch, if/else) ──
 
-    if (tag & TT_LOOP)
-    {
-      if (FEAT(F_DEFER))
+      if (tag & TT_LOOP)
       {
-        ctrl.next_scope |= NS_LOOP;
-        ctrl.pending = true;
-        if (equal(tok, "do"))
-          ctrl.parens_just_closed = true;
+        if (FEAT(F_DEFER))
+        {
+          ctrl.next_scope |= NS_LOOP;
+          ctrl.pending = true;
+          if (equal(tok, "do"))
+            ctrl.parens_just_closed = true;
+        }
+        if (equal(tok, "for") && FEAT(F_DEFER | F_ZEROINIT))
+        {
+          ctrl.pending = true;
+          ctrl.await_for_paren = true;
+        }
       }
-      if (equal(tok, "for") && FEAT(F_DEFER | F_ZEROINIT))
-      {
-        ctrl.pending = true;
-        ctrl.await_for_paren = true;
-      }
-    }
 
-    if ((tag & TT_GENERIC) && ctx->generic_paren_depth == 0)
-    {
-      emit_tok(tok);
-      last_emitted = tok;
-      tok = tok->next;
-      if (tok && equal(tok, "("))
+      if ((tag & TT_GENERIC) && ctx->generic_paren_depth == 0)
       {
-        ctx->generic_paren_depth = 1;
         emit_tok(tok);
         last_emitted = tok;
         tok = tok->next;
+        if (tok && equal(tok, "("))
+        {
+          ctx->generic_paren_depth = 1;
+          emit_tok(tok);
+          last_emitted = tok;
+          tok = tok->next;
+        }
+        continue;
       }
-      continue;
-    }
 
-    if (FEAT(F_DEFER) && (tag & TT_SWITCH))
-    {
-      ctrl.next_scope |= NS_SWITCH;
-      ctrl.pending = true;
-    }
+      if (FEAT(F_DEFER) && (tag & TT_SWITCH))
+      {
+        ctrl.next_scope |= NS_SWITCH;
+        ctrl.pending = true;
+      }
 
-    if (tag & TT_IF)
-    {
-      ctrl.pending = true;
-      if (equal(tok, "else"))
-        ctrl.parens_just_closed = true;
-    }
+      if (tag & TT_IF)
+      {
+        ctrl.pending = true;
+        if (equal(tok, "else"))
+          ctrl.parens_just_closed = true;
+      }
 
-    // Case/default label handling
-    if (tag & (TT_CASE | TT_DEFAULT))
-      handle_case_default(tok);
+      // Case/default label handling
+      if (tag & (TT_CASE | TT_DEFAULT))
+        handle_case_default(tok);
 
     } // end if (tag)
 
@@ -3255,7 +3278,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
         next_func_returns_void = false;
     }
     else if (equal(tok, ":") && last_emitted && last_emitted->kind == TK_IDENT &&
-        ctx->struct_depth == 0 && ctx->defer_depth > 0)
+             ctx->struct_depth == 0 && ctx->defer_depth > 0)
     {
       emit_tok(tok);
       tok = tok->next;
@@ -3938,7 +3961,301 @@ static void cli_free(Cli *cli)
   free(cli->cc_args);
 }
 
-// create_temp_file: Merged into make_temp_file(buf, size, NULL, 0, source)
+static void add_warn_suppress(ArgvBuilder *ab)
+{
+  static const char *w[] = {
+      "-Wno-type-limits",
+      "-Wno-cast-align",
+      "-Wno-implicit-fallthrough",
+      "-Wno-unused-function",
+      "-Wno-unused-variable",
+      "-Wno-unused-parameter",
+      "-Wno-unknown-warning-option",
+  };
+  for (int i = 0; i < (int)(sizeof(w) / sizeof(*w)); i++)
+    argv_builder_add(ab, w[i]);
+}
+
+static void verbose_argv(char **args)
+{
+  fprintf(stderr, "[prism]");
+  for (int i = 0; args[i]; i++)
+    fprintf(stderr, " %s", args[i]);
+  fprintf(stderr, "\n");
+}
+
+static void add_output_flags(ArgvBuilder *ab, const Cli *cli, const char *temp_exe)
+{
+  static char defobj[PATH_MAX];
+  const char *out = NULL;
+
+  if (cli->mode == CLI_RUN)
+    out = temp_exe;
+  else if (cli->output)
+    out = cli->output;
+  else if (cli->compile_only && cli->source_count == 1)
+  {
+    const char *base = strrchr(cli->sources[0], '/');
+    base = base ? base + 1 : cli->sources[0];
+    snprintf(defobj, sizeof(defobj), "%s", base);
+    char *dot = strrchr(defobj, '.');
+    if (dot)
+      strcpy(dot, ".o");
+    out = defobj;
+  }
+
+  if (out)
+  {
+    argv_builder_add(ab, "-o");
+    argv_builder_add(ab, out);
+  }
+}
+
+static void make_run_temp(char *buf, size_t size, CliMode mode)
+{
+  buf[0] = '\0';
+  if (mode != CLI_RUN)
+    return;
+  snprintf(buf, size, "%sprism_run.XXXXXX", get_tmp_dir());
+#if defined(_WIN32)
+  _mktemp_s(buf, size);
+  strcat(buf, ".exe");
+#else
+  int fd = mkstemp(buf);
+  if (fd >= 0)
+    close(fd);
+#endif
+}
+
+static int passthrough_cc(const Cli *cli)
+{
+  const char *compiler = get_real_cc(cli->cc);
+  ArgvBuilder ab;
+  argv_builder_init(&ab);
+  argv_builder_add(&ab, compiler);
+  for (int i = 0; i < cli->cc_arg_count; i++)
+    argv_builder_add(&ab, cli->cc_args[i]);
+  if (cli->output)
+  {
+    argv_builder_add(&ab, "-o");
+    argv_builder_add(&ab, cli->output);
+  }
+  char **pass = argv_builder_finish(&ab);
+  if (cli->verbose)
+    verbose_argv(pass);
+  int st = run_command(pass);
+  free_argv(pass);
+  return st;
+}
+
+static int install_from_source(Cli *cli)
+{
+  char temp_bin[PATH_MAX];
+  snprintf(temp_bin, sizeof(temp_bin), "%sprism_install_%d", get_tmp_dir(), getpid());
+
+  const char *cc = get_real_cc(cli->cc ? cli->cc : getenv("PRISM_CC"));
+  if (!cc || (strcmp(cc, "cc") == 0 && !cli->cc))
+  {
+    cc = getenv("CC");
+    if (cc)
+      cc = get_real_cc(cc);
+  }
+  if (!cc)
+    cc = "cc";
+
+  char **temp_files = malloc(cli->source_count * sizeof(char *));
+  if (!temp_files)
+    die("Memory allocation failed");
+
+  for (int i = 0; i < cli->source_count; i++)
+  {
+    temp_files[i] = malloc(PATH_MAX);
+    if (!temp_files[i])
+      die("Memory allocation failed");
+    snprintf(temp_files[i], PATH_MAX, "%sprism_install_%d_%d.c", get_tmp_dir(), getpid(), i);
+
+    PrismResult result = prism_transpile_file(cli->sources[i], cli->features);
+    if (result.status != PRISM_OK)
+    {
+      fprintf(stderr, "%s:%d:%d: error: %s\n",
+              cli->sources[i], result.error_line, result.error_col,
+              result.error_msg ? result.error_msg : "transpilation failed");
+      for (int j = 0; j <= i; j++)
+      {
+        remove(temp_files[j]);
+        free(temp_files[j]);
+      }
+      free(temp_files);
+      return 1;
+    }
+
+    FILE *f = fopen(temp_files[i], "w");
+    if (!f)
+    {
+      prism_free(&result);
+      die("Failed to create temp file");
+    }
+    fwrite(result.output, 1, result.output_len, f);
+    fclose(f);
+    prism_free(&result);
+  }
+
+  ArgvBuilder ab;
+  argv_builder_init(&ab);
+  argv_builder_add(&ab, cc);
+  argv_builder_add(&ab, "-O2");
+  for (int i = 0; i < cli->source_count; i++)
+    argv_builder_add(&ab, temp_files[i]);
+  for (int i = 0; i < cli->cc_arg_count; i++)
+    argv_builder_add(&ab, cli->cc_args[i]);
+  argv_builder_add(&ab, "-o");
+  argv_builder_add(&ab, temp_bin);
+  char **argv_cc = argv_builder_finish(&ab);
+
+  if (cli->verbose)
+  {
+    fprintf(stderr, "[prism] Compiling:");
+    for (int i = 0; argv_cc[i]; i++)
+      fprintf(stderr, " %s", argv_cc[i]);
+    fprintf(stderr, "\n");
+  }
+
+  int status = run_command(argv_cc);
+  free_argv(argv_cc);
+
+  for (int i = 0; i < cli->source_count; i++)
+  {
+    remove(temp_files[i]);
+    free(temp_files[i]);
+  }
+  free(temp_files);
+
+  if (status != 0)
+    return 1;
+
+  int result = install(temp_bin);
+  remove(temp_bin);
+  return result;
+}
+
+static int compile_sources(Cli *cli)
+{
+  const char *compiler = get_real_cc(cli->cc);
+  bool clang = cc_is_clang(compiler);
+  char temp_exe[PATH_MAX];
+  make_run_temp(temp_exe, sizeof(temp_exe), cli->mode);
+
+  int status;
+
+  if (cli->source_count == 1)
+  {
+    // Single source: pipe-based transpile+compile (no temp files)
+    ArgvBuilder ab;
+    argv_builder_init(&ab);
+    argv_builder_add(&ab, compiler);
+
+    // Tell cc the input is already preprocessed (flatten mode).
+    // Clang does not support -fpreprocessed.
+    argv_builder_add(&ab, "-x");
+    argv_builder_add(&ab, "c");
+    if (FEAT(F_FLATTEN) && !clang)
+      argv_builder_add(&ab, "-fpreprocessed");
+    argv_builder_add(&ab, "-");
+
+    // Reset language so subsequent args aren't forced to C.
+    if (cli->cc_arg_count > 0)
+    {
+      argv_builder_add(&ab, "-x");
+      argv_builder_add(&ab, "none");
+    }
+
+    for (int i = 0; i < cli->cc_arg_count; i++)
+      argv_builder_add(&ab, cli->cc_args[i]);
+    add_warn_suppress(&ab);
+    add_output_flags(&ab, cli, temp_exe);
+    char **argv_cc = argv_builder_finish(&ab);
+
+    if (cli->verbose)
+      fprintf(stderr, "[prism] Transpiling %s (pipe → cc)\n", cli->sources[0]);
+    status = transpile_and_compile((char *)cli->sources[0], argv_cc, cli->verbose);
+    free_argv(argv_cc);
+  }
+  else
+  {
+    // Multi-source: transpile to temp files, then compile together
+    char **temps = calloc((unsigned)cli->source_count, sizeof(char *));
+    if (!temps)
+      die("Out of memory");
+
+    for (int i = 0; i < cli->source_count; i++)
+    {
+      temps[i] = malloc(512);
+      if (!temps[i])
+        die("Out of memory");
+      if (make_temp_file(temps[i], 512, NULL, 0, cli->sources[i]) < 0)
+        die("Failed to create temp file");
+      if (cli->verbose)
+        fprintf(stderr, "[prism] Transpiling %s -> %s\n", cli->sources[i], temps[i]);
+      if (!transpile((char *)cli->sources[i], temps[i]))
+      {
+        for (int j = 0; j <= i; j++)
+        {
+          remove(temps[j]);
+          free(temps[j]);
+        }
+        free(temps);
+        die("Transpilation failed");
+      }
+    }
+
+    ArgvBuilder ab;
+    argv_builder_init(&ab);
+    argv_builder_add(&ab, compiler);
+    if (FEAT(F_FLATTEN) && !clang)
+      argv_builder_add(&ab, "-fpreprocessed");
+    for (int i = 0; i < cli->source_count; i++)
+      argv_builder_add(&ab, temps[i]);
+    if (FEAT(F_FLATTEN) && !clang)
+      argv_builder_add(&ab, "-fno-preprocessed");
+    for (int i = 0; i < cli->cc_arg_count; i++)
+      argv_builder_add(&ab, cli->cc_args[i]);
+    add_warn_suppress(&ab);
+    add_output_flags(&ab, cli, temp_exe);
+    char **argv_cc = argv_builder_finish(&ab);
+
+    if (cli->verbose)
+      verbose_argv(argv_cc);
+    status = run_command(argv_cc);
+    free_argv(argv_cc);
+
+    for (int i = 0; i < cli->source_count; i++)
+    {
+      remove(temps[i]);
+      free(temps[i]);
+    }
+    free(temps);
+  }
+
+  if (status != 0)
+  {
+    if (temp_exe[0])
+      remove(temp_exe);
+    return status;
+  }
+
+  // RUN mode: execute the compiled binary
+  if (cli->mode == CLI_RUN)
+  {
+    char **run = build_argv(temp_exe, NULL);
+    if (cli->verbose)
+      fprintf(stderr, "[prism] Running %s\n", temp_exe);
+    status = run_command(run);
+    free_argv(run);
+    remove(temp_exe);
+  }
+
+  return status;
+}
 
 int main(int argc, char **argv)
 {
@@ -3951,124 +4268,16 @@ int main(int argc, char **argv)
   }
 
   Cli cli = cli_parse(argc, argv);
-
-  // Configure context from CLI
   ctx->features = features_to_bits(cli.features);
   ctx->extra_compiler = get_real_cc(cli.cc);
-  // Pass all CC args to preprocessor — cc -E ignores flags it doesn't need
   ctx->extra_compiler_flags = cli.cc_args;
   ctx->extra_compiler_flags_count = cli.cc_arg_count;
 
-  // ─── Install ───
+  int status = 0;
+
   if (cli.mode == CLI_INSTALL)
-  {
-    if (cli.source_count > 0)
-    {
-      // Install from source: transpile, compile, then install the binary
-      char temp_bin[PATH_MAX];
-      snprintf(temp_bin, sizeof(temp_bin), "%sprism_install_%d", get_tmp_dir(), getpid());
-
-      const char *cc = get_real_cc(cli.cc ? cli.cc : getenv("PRISM_CC"));
-      if (!cc || (strcmp(cc, "cc") == 0 && !cli.cc))
-      {
-        cc = getenv("CC");
-        if (cc)
-          cc = get_real_cc(cc);
-      }
-      if (!cc)
-        cc = "cc";
-
-      char **temp_files = malloc(cli.source_count * sizeof(char *));
-      if (!temp_files)
-        die("Memory allocation failed");
-
-      for (int i = 0; i < cli.source_count; i++)
-      {
-        temp_files[i] = malloc(PATH_MAX);
-        if (!temp_files[i])
-          die("Memory allocation failed");
-        snprintf(temp_files[i], PATH_MAX, "%sprism_install_%d_%d.c", get_tmp_dir(), getpid(), i);
-
-        PrismResult result = prism_transpile_file(cli.sources[i], cli.features);
-        if (result.status != PRISM_OK)
-        {
-          fprintf(stderr, "%s:%d:%d: error: %s\n",
-                  cli.sources[i], result.error_line, result.error_col,
-                  result.error_msg ? result.error_msg : "transpilation failed");
-          for (int j = 0; j <= i; j++)
-          {
-            remove(temp_files[j]);
-            free(temp_files[j]);
-          }
-          free(temp_files);
-          cli_free(&cli);
-          return 1;
-        }
-
-        FILE *f = fopen(temp_files[i], "w");
-        if (!f)
-        {
-          prism_free(&result);
-          die("Failed to create temp file");
-        }
-        fwrite(result.output, 1, result.output_len, f);
-        fclose(f);
-        prism_free(&result);
-      }
-
-      // Build compile command: cc -O2 temp1.c temp2.c ... [cc_args] -o temp_bin
-      int amax = 4 + cli.source_count + cli.cc_arg_count;
-      char **argv_cc = malloc((amax + 1) * sizeof(char *));
-      if (!argv_cc)
-        die("Memory allocation failed");
-
-      int ac = 0;
-      argv_cc[ac++] = (char *)cc;
-      argv_cc[ac++] = "-O2";
-      for (int i = 0; i < cli.source_count; i++)
-        argv_cc[ac++] = temp_files[i];
-      for (int i = 0; i < cli.cc_arg_count; i++)
-        argv_cc[ac++] = (char *)cli.cc_args[i];
-      argv_cc[ac++] = "-o";
-      argv_cc[ac++] = temp_bin;
-      argv_cc[ac] = NULL;
-
-      if (cli.verbose)
-      {
-        fprintf(stderr, "[prism] Compiling:");
-        for (int i = 0; i < ac; i++)
-          fprintf(stderr, " %s", argv_cc[i]);
-        fprintf(stderr, "\n");
-      }
-
-      int status = run_command(argv_cc);
-      free(argv_cc);
-
-      for (int i = 0; i < cli.source_count; i++)
-      {
-        remove(temp_files[i]);
-        free(temp_files[i]);
-      }
-      free(temp_files);
-
-      if (status != 0)
-      {
-        cli_free(&cli);
-        return 1;
-      }
-
-      int result = install(temp_bin);
-      remove(temp_bin);
-      cli_free(&cli);
-      return result;
-    }
-
-    cli_free(&cli);
-    return install(argv[0]);
-  }
-
-  // ─── Transpile (emit) ───
-  if (cli.mode == CLI_EMIT)
+    status = cli.source_count > 0 ? install_from_source(&cli) : install(argv[0]);
+  else if (cli.mode == CLI_EMIT)
   {
     if (cli.source_count == 0)
       die("No source files specified");
@@ -4107,282 +4316,11 @@ int main(int argc, char **argv)
 #endif
       }
     }
-    cli_free(&cli);
-    return 0;
   }
-
-  // ─── No sources: passthrough to CC (link-only, probes, -v, etc.) ───
-  if (cli.source_count == 0)
-  {
-    const char *compiler = get_real_cc(cli.cc);
-    ArgvBuilder ab;
-    argv_builder_init(&ab);
-    argv_builder_add(&ab, compiler);
-    for (int i = 0; i < cli.cc_arg_count; i++)
-      argv_builder_add(&ab, cli.cc_args[i]);
-    if (cli.output)
-    {
-      argv_builder_add(&ab, "-o");
-      argv_builder_add(&ab, cli.output);
-    }
-    char **pass = argv_builder_finish(&ab);
-    if (cli.verbose)
-    {
-      fprintf(stderr, "[prism] ");
-      for (int i = 0; pass[i]; i++)
-        fprintf(stderr, "%s ", pass[i]);
-      fprintf(stderr, "\n");
-    }
-    int st = run_command(pass);
-    free_argv(pass);
-    cli_free(&cli);
-    return st;
-  }
-
-  // ─── Single source: pipe-based transpile+compile (no temp files) ───
-  if (cli.source_count == 1)
-  {
-    const char *compiler = get_real_cc(cli.cc);
-    bool clang = cc_is_clang(compiler);
-    ArgvBuilder ab;
-    argv_builder_init(&ab);
-    argv_builder_add(&ab, compiler);
-
-    // Tell cc the input is already preprocessed (flatten mode).
-    // -fpreprocessed skips macro expansion and #include processing on the second pass.
-    // In non-flatten mode, the output may contain #include/#define, so we skip this.
-    // Clang does not support -fpreprocessed.
-    argv_builder_add(&ab, "-x");
-    argv_builder_add(&ab, "c");
-    if (FEAT(F_FLATTEN) && !clang)
-      argv_builder_add(&ab, "-fpreprocessed");
-
-    // Read from stdin (the pipe)
-    argv_builder_add(&ab, "-");
-
-    // Reset language so subsequent args (.o, .s, etc.) aren't forced to C.
-    // Only emit when there are trailing args, to avoid clang's
-    // "'-x none' after last input file has no effect" warning.
-    if (cli.cc_arg_count > 0)
-    {
-      argv_builder_add(&ab, "-x");
-      argv_builder_add(&ab, "none");
-    }
-
-    for (int i = 0; i < cli.cc_arg_count; i++)
-      argv_builder_add(&ab, cli.cc_args[i]);
-
-    // Suppress warnings from preprocessed/inlined system headers
-    static const char *wflags[] = {
-        "-Wno-type-limits",
-        "-Wno-cast-align",
-        "-Wno-implicit-fallthrough",
-        "-Wno-unused-function",
-        "-Wno-unused-variable",
-        "-Wno-unused-parameter",
-        "-Wno-unknown-warning-option",
-    };
-    for (int i = 0; i < (int)(sizeof(wflags) / sizeof(*wflags)); i++)
-      argv_builder_add(&ab, wflags[i]);
-
-    // For RUN mode, compile to temp executable
-    char temp_exe[PATH_MAX] = {0};
-    if (cli.mode == CLI_RUN)
-    {
-      snprintf(temp_exe, sizeof(temp_exe), "%sprism_run.XXXXXX", get_tmp_dir());
-      int fd = mkstemp(temp_exe);
-      if (fd >= 0)
-        close(fd);
-      argv_builder_add(&ab, "-o");
-      argv_builder_add(&ab, temp_exe);
-    }
-    else if (cli.output)
-    {
-      argv_builder_add(&ab, "-o");
-      argv_builder_add(&ab, cli.output);
-    }
-    else if (cli.compile_only)
-    {
-      // GCC-compatible: -c foo.c produces foo.o
-      static char defobj[PATH_MAX];
-      const char *base = strrchr(cli.sources[0], '/');
-      base = base ? base + 1 : cli.sources[0];
-      snprintf(defobj, sizeof(defobj), "%s", base);
-      char *dot = strrchr(defobj, '.');
-      if (dot)
-        strcpy(dot, ".o");
-      argv_builder_add(&ab, "-o");
-      argv_builder_add(&ab, defobj);
-    }
-
-    char **compile_argv = argv_builder_finish(&ab);
-
-    if (cli.verbose)
-      fprintf(stderr, "[prism] Transpiling %s (pipe → cc)\n", cli.sources[0]);
-    int status = transpile_and_compile((char *)cli.sources[0], compile_argv, cli.verbose);
-    free_argv(compile_argv);
-
-    if (status != 0)
-    {
-      if (cli.mode == CLI_RUN && temp_exe[0])
-        remove(temp_exe);
-      cli_free(&cli);
-      return status;
-    }
-
-    // RUN mode: execute the compiled binary
-    if (cli.mode == CLI_RUN)
-    {
-      char **run = build_argv(temp_exe, NULL);
-      if (cli.verbose)
-        fprintf(stderr, "[prism] Running %s\n", temp_exe);
-      status = run_command(run);
-      free_argv(run);
-      remove(temp_exe);
-    }
-
-    cli_free(&cli);
-    return status;
-  }
-
-  // ─── Multi-source: transpile to temp files, then compile together ───
-  char **temp_files = calloc((unsigned)cli.source_count, sizeof(char *));
-  if (!temp_files)
-    die("Out of memory");
-
-  for (int i = 0; i < cli.source_count; i++)
-  {
-    temp_files[i] = malloc(512);
-    if (!temp_files[i])
-      die("Out of memory");
-    if (make_temp_file(temp_files[i], 512, NULL, 0, cli.sources[i]) < 0)
-      die("Failed to create temp file");
-    if (cli.verbose)
-      fprintf(stderr, "[prism] Transpiling %s -> %s\n", cli.sources[i], temp_files[i]);
-    if (!transpile((char *)cli.sources[i], temp_files[i]))
-    {
-      for (int j = 0; j <= i; j++)
-      {
-        remove(temp_files[j]);
-        free(temp_files[j]);
-      }
-      free(temp_files);
-      die("Transpilation failed");
-    }
-  }
-
-  // For RUN mode, compile to temp executable
-  char temp_exe[PATH_MAX] = {0};
-  if (cli.mode == CLI_RUN)
-  {
-    snprintf(temp_exe, sizeof(temp_exe), "%sprism_run.XXXXXX", get_tmp_dir());
-#if defined(_WIN32)
-    _mktemp_s(temp_exe, sizeof(temp_exe));
-    strcat(temp_exe, ".exe");
-#else
-    int fd = mkstemp(temp_exe);
-    if (fd >= 0)
-      close(fd);
-#endif
-  }
-
-  // Build compile command
-  const char *compiler = get_real_cc(cli.cc);
-  bool clang = cc_is_clang(compiler);
-  ArgvBuilder ab;
-  argv_builder_init(&ab);
-  argv_builder_add(&ab, compiler);
-
-  // Tell cc input files are already preprocessed (flatten mode).
-  // Clang does not support -fpreprocessed.
-  if (FEAT(F_FLATTEN) && !clang)
-    argv_builder_add(&ab, "-fpreprocessed");
-
-  for (int i = 0; i < cli.source_count; i++)
-    argv_builder_add(&ab, temp_files[i]);
-
-  // Reset -fpreprocessed so cc_args (like assembly or other files) aren't affected
-  if (FEAT(F_FLATTEN) && !clang)
-    argv_builder_add(&ab, "-fno-preprocessed");
-
-  for (int i = 0; i < cli.cc_arg_count; i++)
-    argv_builder_add(&ab, cli.cc_args[i]);
-
-  // Suppress warnings from preprocessed/inlined system headers
-  static const char *wflags[] = {
-      "-Wno-type-limits",
-      "-Wno-cast-align",
-      "-Wno-implicit-fallthrough",
-      "-Wno-unused-function",
-      "-Wno-unused-variable",
-      "-Wno-unused-parameter",
-      "-Wno-unknown-warning-option",
-  };
-  for (int i = 0; i < (int)(sizeof(wflags) / sizeof(*wflags)); i++)
-    argv_builder_add(&ab, wflags[i]);
-
-  if (cli.mode == CLI_RUN)
-  {
-    argv_builder_add(&ab, "-o");
-    argv_builder_add(&ab, temp_exe);
-  }
-  else if (cli.output)
-  {
-    argv_builder_add(&ab, "-o");
-    argv_builder_add(&ab, cli.output);
-  }
-  else if (cli.compile_only && cli.source_count == 1)
-  {
-    // GCC-compatible: -c foo.c produces foo.o
-    static char defobj[PATH_MAX];
-    const char *base = strrchr(cli.sources[0], '/');
-    base = base ? base + 1 : cli.sources[0];
-    snprintf(defobj, sizeof(defobj), "%s", base);
-    char *dot = strrchr(defobj, '.');
-    if (dot)
-      strcpy(dot, ".o");
-    argv_builder_add(&ab, "-o");
-    argv_builder_add(&ab, defobj);
-  }
-
-  char **compile_argv = argv_builder_finish(&ab);
-  if (cli.verbose)
-  {
-    fprintf(stderr, "[prism] ");
-    for (int i = 0; compile_argv[i]; i++)
-      fprintf(stderr, "%s ", compile_argv[i]);
-    fprintf(stderr, "\n");
-  }
-
-  int status = run_command(compile_argv);
-  free_argv(compile_argv);
-
-  // Cleanup temp source files
-  for (int i = 0; i < cli.source_count; i++)
-  {
-    remove(temp_files[i]);
-    free(temp_files[i]);
-  }
-  free(temp_files);
-
-  if (status != 0)
-  {
-    if (cli.mode == CLI_RUN && temp_exe[0])
-      remove(temp_exe);
-    cli_free(&cli);
-    return status;
-  }
-
-  // RUN mode: execute the compiled binary
-  if (cli.mode == CLI_RUN)
-  {
-    char **run = build_argv(temp_exe, NULL);
-    if (cli.verbose)
-      fprintf(stderr, "[prism] Running %s\n", temp_exe);
-    status = run_command(run);
-    free_argv(run);
-    remove(temp_exe);
-  }
+  else if (cli.source_count == 0)
+    status = passthrough_cc(&cli);
+  else
+    status = compile_sources(&cli);
 
   cli_free(&cli);
   return status;
