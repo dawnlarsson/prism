@@ -11313,6 +11313,90 @@ static void test_generic_void_typedef_no_label_confusion(void)
     CHECK_EQ(result, 1, "generic_void_typedef_no_label_confusion");
 }
 
+// === VLA zero-init regression tests ===
+static void test_vla_zeroinit_basic(void)
+{
+    int n = 10;
+    int arr[n]; // Standard VLA - should be zero-initialized by Prism
+    int all_zero = 1;
+    for (int i = 0; i < n; i++)
+        if (arr[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "VLA basic zero-init via memset");
+}
+
+static void test_vla_zeroinit_expression_size(void)
+{
+    int a = 3, b = 4;
+    int arr[a + b]; // VLA with expression size
+    int all_zero = 1;
+    for (int i = 0; i < a + b; i++)
+        if (arr[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "VLA expression-size zero-init via memset");
+}
+
+static void test_vla_zeroinit_large(void)
+{
+    int n = 256;
+    char buf[n]; // Larger VLA
+    int all_zero = 1;
+    for (int i = 0; i < n; i++)
+        if (buf[i] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "VLA large zero-init via memset");
+}
+
+static void test_vla_zeroinit_nested_scope(void)
+{
+    for (int round = 0; round < 3; round++)
+    {
+        int n = 8 + round;
+        int arr[n];
+        int all_zero = 1;
+        for (int i = 0; i < n; i++)
+            if (arr[i] != 0)
+                all_zero = 0;
+        CHECK(all_zero, "VLA nested-scope zero-init via memset");
+    }
+}
+
+// === Hashmap tombstone load factor regression test ===
+static void test_hashmap_tombstone_high_churn_load(void)
+{
+    // Heavy typedef churn: if tombstones aren't counted in load factor,
+    // probe chains degrade. We verify correctness under high churn.
+    volatile int sum = 0;
+    for (int round = 0; round < 500; round++)
+    {
+        {
+            typedef int churn_load_a_t;
+            typedef long churn_load_b_t;
+            typedef short churn_load_c_t;
+            typedef char churn_load_d_t;
+            churn_load_a_t a = 1;
+            churn_load_b_t b = 2;
+            churn_load_c_t c = 3;
+            churn_load_d_t d = 4;
+            sum += a + (int)b + (int)c + (int)d;
+        }
+    }
+    CHECK_EQ(sum, 5000, "hashmap_tombstone_high_churn_load");
+}
+
+// === Parser depth regression test ===
+static void test_deep_pointer_nesting(void)
+{
+    // Deeply nested pointer declarations should compile fine
+    int x = 42;
+    int *p1 = &x;
+    int **p2 = &p1;
+    int ***p3 = &p2;
+    int ****p4 = &p3;
+    int *****p5 = &p4;
+    CHECK_EQ(*****p5, 42, "deep pointer nesting compiles and works");
+}
+
 void run_bulletproof_regression_tests(void)
 {
     printf("\n=== BULLETPROOF REGRESSION TESTS ===\n");
@@ -11371,6 +11455,18 @@ void run_bulletproof_regression_tests(void)
     test_void_ptr_typedef_not_void();
     test_void_func_ptr_typedef();
     test_generic_void_typedef_no_label_confusion();
+
+    // VLA zero-init: standard VLAs should be memset to zero at runtime
+    test_vla_zeroinit_basic();
+    test_vla_zeroinit_expression_size();
+    test_vla_zeroinit_large();
+    test_vla_zeroinit_nested_scope();
+
+    // Hashmap tombstone load factor: resize must account for tombstones
+    test_hashmap_tombstone_high_churn_load();
+
+    // Parser depth: deeply nested pointers should compile without crashing
+    test_deep_pointer_nesting();
 }
 
 int main(void)

@@ -1957,11 +1957,19 @@ static DeclResult parse_declarator(Token *tok, bool emit)
     }                           \
   } while (0)
 
-  // Pointer modifiers and qualifiers
+  // Pointer modifiers and qualifiers (with depth limit for safety)
+  int ptr_depth = 0;
   while (equal(tok, "*") || (tok->tag & TT_QUALIFIER))
   {
     if (equal(tok, "*"))
+    {
       r.is_pointer = true;
+      if (++ptr_depth > 256)
+      {
+        r.end = NULL;
+        return r;
+      }
+    }
     if (tok->tag & TT_ATTR)
     {
       DECL_ATTR(tok);
@@ -2180,10 +2188,11 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
 
     // For typeof declarations, use memset instead of = 0 or = {0}
     // Also for atomic aggregates: Clang doesn't support _Atomic aggregate init syntax
+    // Also for VLAs: can't use = {0}, so memset at runtime (sizeof evaluates to runtime size)
     // But NOT for register variables (can't take address) or volatile (needs volatile semantics)
     bool is_aggregate = decl.is_array || ((type->is_struct || type->is_typedef) && !decl.is_pointer);
     bool needs_memset = !decl.has_init && !is_raw && !decl.is_pointer && !type->has_register &&
-                        (type->has_typeof || (type->has_atomic && is_aggregate));
+                        (type->has_typeof || (type->has_atomic && is_aggregate) || effective_vla);
 
     // Add zero initializer if needed (for non-memset types)
     if (!decl.has_init && !effective_vla && !is_raw && !needs_memset)

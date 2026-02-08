@@ -314,6 +314,7 @@ typedef struct
     HashEntry *buckets;
     int capacity;
     int used;
+    int tombstones;
 } HashMap;
 
 // Perfect hash keyword table — O(1) lookup with single memcmp
@@ -473,7 +474,7 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val)
             error("out of memory allocating hashmap");
         map->capacity = 64;
     }
-    else if (map->used * 100 / map->capacity >= 70)
+    else if ((map->used + map->tombstones) * 100 / map->capacity >= 70)
     {
         hashmap_resize(map, map->capacity * 2);
     }
@@ -509,6 +510,8 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val)
         return;
 
     HashEntry *ent = &map->buckets[first_empty];
+    if (ent->key == TOMBSTONE)
+        map->tombstones--;
     ent->key = key;
     ent->keylen = keylen;
     ent->val = val;
@@ -529,6 +532,7 @@ static void hashmap_delete2(HashMap *map, char *key, int keylen)
         {
             ent->key = TOMBSTONE;
             map->used--;
+            map->tombstones++;
             return;
         }
         if (!ent->key)
