@@ -73,26 +73,26 @@ static const uint8_t ident_char[256] = {
 // Generic array growth: ensures *arr has capacity for n elements
 // Note: Uses error() instead of exit(1) to support PRISM_LIB_MODE where
 // error() uses longjmp for recovery instead of terminating the host process.
-#define ENSURE_ARRAY_CAP(arr, count, cap, init_cap, T)         \
-    do                                                         \
-    {                                                          \
-        if ((count) >= (cap))                                  \
-        {                                                      \
+#define ENSURE_ARRAY_CAP(arr, count, cap, init_cap, T)                    \
+    do                                                                    \
+    {                                                                     \
+        if ((count) >= (cap))                                             \
+        {                                                                 \
             size_t new_cap = (cap) == 0 ? (init_cap) : (size_t)(cap) * 2; \
-            while (new_cap < (size_t)(count))                  \
-                new_cap *= 2;                                  \
-            T *old_ptr_ = (arr);                               \
-            T *tmp = realloc((arr), sizeof(T) * new_cap);      \
-            if (!tmp)                                          \
-            {                                                  \
-                free(old_ptr_);                                \
-                (arr) = NULL;                                  \
-                (cap) = 0;                                     \
-                error("out of memory");                        \
-            }                                                  \
-            (arr) = tmp;                                       \
-            (cap) = new_cap;                                   \
-        }                                                      \
+            while (new_cap < (size_t)(count))                             \
+                new_cap *= 2;                                             \
+            T *old_ptr_ = (arr);                                          \
+            T *tmp = realloc((arr), sizeof(T) * new_cap);                 \
+            if (!tmp)                                                     \
+            {                                                             \
+                free(old_ptr_);                                           \
+                (arr) = NULL;                                             \
+                (cap) = 0;                                                \
+                error("out of memory");                                   \
+            }                                                             \
+            (arr) = tmp;                                                  \
+            (cap) = new_cap;                                              \
+        }                                                                 \
     } while (0)
 
 typedef struct Token Token;

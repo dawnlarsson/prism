@@ -25,7 +25,7 @@
 #include <BaseTsd.h>
 
 typedef SSIZE_T ssize_t;
-typedef int pid_t;
+typedef intptr_t pid_t;
 typedef int mode_t;
 
 // MSVC doesn't have these — define them away or provide equivalents.
@@ -93,7 +93,10 @@ typedef int mode_t;
 #define getpid _getpid
 #define unlink _unlink
 #define close _close
-#define read posix_read
+// Use inline function instead of macro to avoid colliding with struct members,
+// local variables, or other uses of the identifier 'read'.
+static inline ssize_t read(int fd, void *buf, size_t count);
+#define read(fd, buf, count) read(fd, buf, count)
 
 #define SPAWN_ACTION_MAX 8
 
@@ -124,7 +127,7 @@ static int pipe(int pipefd[2]) { return _pipe(pipefd, 65536, _O_BINARY); }
 static char *realpath(const char *path, char *resolved) { return _fullpath(resolved, path, PATH_MAX); }
 
 // MSVC _read takes unsigned int for count, returns int
-static ssize_t posix_read(int fd, void *buf, size_t count)
+static inline ssize_t read(int fd, void *buf, size_t count)
 {
     unsigned int to_read = (count > 0x7FFFFFFF) ? 0x7FFFFFFF : (unsigned int)count;
     return (ssize_t)_read(fd, buf, to_read);
@@ -173,10 +176,60 @@ static int mkstemp(char *tmpl)
 
 static int mkstemps(char *tmpl, int suffix_len)
 {
-    // For Windows, just use mkstemp — the template is already formatted
-    // The suffix is already part of the template string
-    (void)suffix_len;
-    return mkstemp(tmpl);
+    if (suffix_len <= 0)
+        return mkstemp(tmpl);
+
+    // Template is like "foo.XXXXXX.c" — X's are before the suffix.
+    // Temporarily strip the suffix so mkstemp sees X's at the end.
+    size_t len = strlen(tmpl);
+    if ((size_t)suffix_len >= len)
+        return -1;
+    char saved[16]; // suffix_len is always small (2 for ".c")
+    if (suffix_len > (int)sizeof(saved))
+        return -1;
+    memcpy(saved, tmpl + len - suffix_len, suffix_len);
+    tmpl[len - suffix_len] = '\0';
+
+    int fd = mkstemp(tmpl);
+    if (fd < 0)
+    {
+        // Restore suffix on failure
+        memcpy(tmpl + len - suffix_len, saved, suffix_len);
+        tmpl[len] = '\0';
+        return -1;
+    }
+
+    // mkstemp succeeded — restore suffix and rename the file
+    // tmpl now has the randomized name without suffix
+    char with_suffix[PATH_MAX];
+    size_t new_len = strlen(tmpl);
+    if (new_len + suffix_len >= sizeof(with_suffix))
+    {
+        _close(fd);
+        _unlink(tmpl);
+        return -1;
+    }
+    memcpy(with_suffix, tmpl, new_len);
+    memcpy(with_suffix + new_len, saved, suffix_len);
+    with_suffix[new_len + suffix_len] = '\0';
+
+    // Close the fd, rename, then reopen
+    _close(fd);
+    if (rename(tmpl, with_suffix) != 0)
+    {
+        _unlink(tmpl);
+        return -1;
+    }
+    memcpy(tmpl, with_suffix, new_len + suffix_len + 1);
+
+    // Reopen with same flags as mkstemp
+    errno_t err = _sopen_s(&fd, tmpl, _O_RDWR | _O_BINARY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
+    if (err != 0)
+    {
+        _unlink(tmpl);
+        return -1;
+    }
+    return fd;
 }
 
 // No-op on Windows
@@ -440,7 +493,7 @@ cleanup:
 //                         const posix_spawn_file_actions_t *fa,
 //                         const void *attrp, char *const argv[], char *const envp[])
 // Returns 0 on success, error code on failure.
-// On Windows, *pid is stuffed with the process HANDLE (cast to pid_t / int).
+// On Windows, *pid is stuffed with the process HANDLE (cast to pid_t / intptr_t).
 // This is a cheat — but waitpid() below knows to interpret it as a HANDLE.
 static int posix_spawnp(pid_t *pid, const char *file,
                         posix_spawn_file_actions_t *fa,
@@ -453,16 +506,23 @@ static int posix_spawnp(pid_t *pid, const char *file,
     if (hp == INVALID_HANDLE_VALUE)
         return ENOENT; // Return an error code (not zero)
 
-    // Stash the HANDLE as pid_t — waitpid will cast it back
-    *pid = (pid_t)(intptr_t)hp;
+    // Stash the HANDLE as pid_t — waitpid will cast it back (lossless: pid_t = intptr_t)
+    *pid = (pid_t)hp;
     return 0;
 }
 
 static pid_t waitpid(pid_t pid, int *status, int options)
 {
     (void)options;
-    HANDLE hp = (HANDLE)(intptr_t)pid;
-    WaitForSingleObject(hp, INFINITE);
+    HANDLE hp = (HANDLE)pid;
+    DWORD wait_result = WaitForSingleObject(hp, INFINITE);
+    if (wait_result == WAIT_FAILED)
+    {
+        CloseHandle(hp);
+        if (status)
+            *status = 1;
+        return -1;
+    }
     DWORD exit_code = 1;
     GetExitCodeProcess(hp, &exit_code);
     CloseHandle(hp);

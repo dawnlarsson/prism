@@ -12075,7 +12075,7 @@ void test_raw_star_ptr_decl(void)
 {
     int x = 42;
     {
-        defer (void)0;
+        defer(void) 0;
         raw IntPtr p;
         p = &x;
         CHECK_EQ(*p, 42, "raw typedef ptr declaration");

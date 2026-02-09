@@ -505,9 +505,9 @@ static void system_includes_reset(void)
   hashmap_clear(&system_includes);
   if (system_include_list)
   {
-      for (int i = 0; i < ctx->system_include_count; i++)
-          free(system_include_list[i]);
-      free(system_include_list);
+    for (int i = 0; i < ctx->system_include_count; i++)
+      free(system_include_list[i]);
+    free(system_include_list);
   }
   system_include_list = NULL;
   ctx->system_include_count = 0;
