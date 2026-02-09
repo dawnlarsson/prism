@@ -1,18 +1,34 @@
-#define PRISM_VERSION "0.108.0"
+#define PRISM_VERSION "0.109.0"
 
+#ifndef _WIN32
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 #ifndef _DARWIN_C_SOURCE
 #define _DARWIN_C_SOURCE
 #endif
+#endif
 
 #include "parse.c"
 
+#ifndef _WIN32
 #include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#endif
+
+// Forward declarations for functions used before definition
+static bool cc_is_msvc(const char *cc);
+
+// Platform constants
+#ifdef _WIN32
+#define PRISM_DEFAULT_CC "cl"
+#define EXE_SUFFIX ".exe"
+#else
+#define PRISM_DEFAULT_CC "cc"
+#define EXE_SUFFIX ""
+#endif
 
 // Platform-specific headers for get_real_cc()
 #ifdef __APPLE__
@@ -110,18 +126,24 @@ PRISM_API void prism_reset(void);
 // Returns path with trailing slash (or empty string on Windows)
 static const char *get_tmp_dir(void)
 {
-#ifdef _WIN32
-  return "";
-#else
   static char tmp_buf[PATH_MAX];
+#ifdef _WIN32
+  const char *tmpdir = getenv("TEMP");
+  if (!tmpdir || !tmpdir[0])
+    tmpdir = getenv("TMP");
+  static const char *fallback = ".\\";
+#else
   const char *tmpdir = getenv("TMPDIR");
+  static const char *fallback = "/tmp/";
+#endif
   if (tmpdir && tmpdir[0])
   {
     size_t len = strlen(tmpdir);
-    if (len > 0 && len < PATH_MAX - 1)
+    if (len > 0 && len < PATH_MAX - 2)
     {
       strcpy(tmp_buf, tmpdir);
-      if (tmp_buf[len - 1] != '/')
+      char last = tmp_buf[len - 1];
+      if (last != '/' && last != '\\')
       {
         tmp_buf[len] = '/';
         tmp_buf[len + 1] = '\0';
@@ -129,8 +151,7 @@ static const char *get_tmp_dir(void)
       return tmp_buf;
     }
   }
-  return "/tmp/";
-#endif
+  return fallback;
 }
 
 static Token *skip_balanced(Token *tok, char *open, char *close);
@@ -2877,22 +2898,33 @@ static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suf
                           const char *source_adjacent)
 {
   int n;
+  int actual_suffix_len = 0;
   if (source_adjacent)
   {
     const char *slash = strrchr(source_adjacent, '/');
-#ifdef _WIN32
     const char *bslash = strrchr(source_adjacent, '\\');
-    if (!slash || (bslash && bslash > slash))
+    if (bslash && (!slash || bslash > slash))
       slash = bslash;
-#endif
     if (slash)
     {
       int dir_len = (int)(slash - source_adjacent);
+#ifdef _WIN32
+      // _mktemp_s needs XXXXXX at the END — append .c after temp name is generated
+      n = snprintf(buf, bufsize, "%.*s/.%s.XXXXXX", dir_len, source_adjacent, slash + 1);
+#else
       n = snprintf(buf, bufsize, "%.*s/.%s.XXXXXX.c", dir_len, source_adjacent, slash + 1);
+#endif
     }
     else
+    {
+#ifdef _WIN32
+      n = snprintf(buf, bufsize, ".%s.XXXXXX", source_adjacent);
+#else
       n = snprintf(buf, bufsize, ".%s.XXXXXX.c", source_adjacent);
-    suffix_len = 2; // .c suffix
+#endif
+    }
+    actual_suffix_len = 2; // .c suffix
+    suffix_len = 2;
   }
   else
     n = snprintf(buf, bufsize, "%s%s", get_tmp_dir(), prefix);
@@ -2900,20 +2932,32 @@ static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suf
     return -1; // path truncated, XXXXXX template would be corrupted
 #if defined(_WIN32)
   // Use _sopen_s with _O_CREAT|_O_EXCL for atomic creation (avoids TOCTOU race of _mktemp_s)
+  // Note: _mktemp_s requires XXXXXX at end of template — suffix is appended after.
   {
     // Try up to 100 unique names
     for (int attempt = 0; attempt < 100; attempt++)
     {
       char try_buf[PATH_MAX];
-      memcpy(try_buf, buf, bufsize);
-      if (_mktemp_s(try_buf, bufsize) != 0)
+      size_t len = strlen(buf);
+      memcpy(try_buf, buf, len + 1);
+      if (_mktemp_s(try_buf, len + 1) != 0)
         return -1;
+      // Append .c suffix if needed
+      if (actual_suffix_len > 0)
+      {
+        size_t tlen = strlen(try_buf);
+        if (tlen + 3 >= sizeof(try_buf))
+          return -1;
+        try_buf[tlen] = '.';
+        try_buf[tlen + 1] = 'c';
+        try_buf[tlen + 2] = '\0';
+      }
       int fd;
       errno_t err = _sopen_s(&fd, try_buf, _O_CREAT | _O_EXCL | _O_WRONLY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
       if (err == 0 && fd >= 0)
       {
         _close(fd);
-        memcpy(buf, try_buf, bufsize);
+        memcpy(buf, try_buf, strlen(try_buf) + 1);
         return 0;
       }
     }
@@ -2948,7 +2992,7 @@ static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suf
 // Shared between pipe-based and file-based preprocessor paths.
 static void build_pp_argv(ArgvBuilder *ab, const char *input_file)
 {
-  const char *cc = ctx->extra_compiler ? ctx->extra_compiler : "cc";
+  const char *cc = ctx->extra_compiler ? ctx->extra_compiler : PRISM_DEFAULT_CC;
   argv_builder_add(ab, cc);
   argv_builder_add(ab, "-E");
   argv_builder_add(ab, "-w"); // suppress warnings (linker flags passed through are harmless)
@@ -2979,13 +3023,15 @@ static void build_pp_argv(ArgvBuilder *ab, const char *input_file)
     argv_builder_add(ab, "-D__PRISM_ZEROINIT__=1");
 
   // Add standard feature test macros for POSIX/GNU compatibility
+#ifndef _WIN32
   argv_builder_add(ab, "-D_POSIX_C_SOURCE=200809L");
   argv_builder_add(ab, "-D_GNU_SOURCE");
+#endif
 
   // Add force-includes
   for (int i = 0; i < ctx->extra_force_include_count; i++)
   {
-    argv_builder_add(ab, "-include");
+    argv_builder_add(ab, cc_is_msvc(ab->data[0]) ? "/FI" : "-include");
     argv_builder_add(ab, ctx->extra_force_includes[i]);
   }
 
@@ -3665,7 +3711,10 @@ static noreturn void die(char *message)
 // Resolve the path to the currently running executable (platform-specific)
 static bool get_self_exe_path(char *buf, size_t bufsize)
 {
-#if defined(__linux__)
+#if defined(_WIN32)
+  DWORD len = GetModuleFileNameA(NULL, buf, (DWORD)bufsize);
+  return (len > 0 && len < bufsize);
+#elif defined(__linux__)
   ssize_t len = readlink("/proc/self/exe", buf, bufsize - 1);
   if (len > 0)
   {
@@ -3702,7 +3751,7 @@ static bool get_self_exe_path(char *buf, size_t bufsize)
   // Fallthrough to return false.
 #endif
   // Generic fallback: try Solaris/Illumos /proc path, then Linux-style
-#if !defined(__APPLE__) && !defined(__FreeBSD__) && !defined(__DragonFly__) && !defined(__NetBSD__)
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__FreeBSD__) && !defined(__DragonFly__) && !defined(__NetBSD__)
   {
     // Solaris/Illumos
     ssize_t len2 = readlink("/proc/self/path/a.out", buf, bufsize - 1);
@@ -3764,9 +3813,7 @@ static int install(char *self_path)
     }
     fclose(input);
     fclose(output);
-#ifndef _WIN32
-    chmod(INSTALL_PATH, 0755);
-#endif
+    chmod(INSTALL_PATH, 0755); // no-op on Windows (shimmed)
     printf("[prism] Installed!\n");
     return 0;
   }
@@ -3777,6 +3824,11 @@ static int install(char *self_path)
     fclose(output);
 
 use_sudo:;
+#ifdef _WIN32
+  // Windows: no sudo — just report failure
+  fprintf(stderr, "Failed to install (run as Administrator?)\n");
+  return 1;
+#else
   // Remove first (can't overwrite running executable, but can remove and replace)
   char **argv = build_argv("sudo", "rm", "-f", INSTALL_PATH, NULL);
   run_command(argv);
@@ -3792,7 +3844,6 @@ use_sudo:;
     return 1;
   }
 
-#ifndef _WIN32
   argv = build_argv("sudo", "chmod", "+x", INSTALL_PATH, NULL);
   run_command(argv);
   free_argv(argv);
@@ -3834,11 +3885,11 @@ static bool is_prism_cc(const char *cc); // Forward declaration
 static const char *get_real_cc(const char *cc)
 {
   if (!cc || !*cc)
-    return "cc"; // NULL or empty string
+    return PRISM_DEFAULT_CC; // NULL or empty string
 
-  // Simple check: if basename is "prism" or "prism.exe", return "cc"
+  // Simple check: if basename is "prism" or "prism.exe", return default
   if (is_prism_cc(cc))
-    return "cc";
+    return PRISM_DEFAULT_CC;
 
   // Advanced check: resolve paths and compare with current executable
   // This prevents infinite recursion if prism is symlinked or copied to another name
@@ -3852,7 +3903,7 @@ static const char *get_real_cc(const char *cc)
     return cc;
 
   if (strcmp(cc_real, self_real) == 0)
-    return "cc";
+    return PRISM_DEFAULT_CC;
 
   return cc;
 }
@@ -3875,13 +3926,22 @@ static bool str_startswith(const char *s, const char *prefix)
   return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
+// Extract filename from path (handles both / and \ separators)
+static const char *path_basename(const char *path)
+{
+  const char *fwd = strrchr(path, '/');
+  const char *bck = strrchr(path, '\\');
+  if (bck && (!fwd || bck > fwd))
+    fwd = bck;
+  return fwd ? fwd + 1 : path;
+}
+
 // Check if a string starts with "prism" (possibly with path prefix)
 static bool is_prism_cc(const char *cc)
 {
   if (!cc || !*cc)
     return false;
-  const char *base = strrchr(cc, '/');
-  base = base ? base + 1 : cc;
+  const char *base = path_basename(cc);
   if (strncmp(base, "prism", 5) == 0)
   {
     char next = base[5];
@@ -3904,9 +3964,22 @@ static bool cc_is_clang(const char *cc)
 #endif
   if (!cc || !*cc)
     return false;
-  const char *base = strrchr(cc, '/');
-  base = base ? base + 1 : cc;
+  const char *base = path_basename(cc);
   return strncmp(base, "clang", 5) == 0;
+}
+
+// Check if the compiler is MSVC cl.exe
+static bool cc_is_msvc(const char *cc)
+{
+#ifndef _WIN32
+  (void)cc;
+  return false;
+#else
+  if (!cc || !*cc)
+    return false;
+  const char *base = path_basename(cc);
+  return (_stricmp(base, "cl") == 0 || _stricmp(base, "cl.exe") == 0);
+#endif
 }
 
 static void print_help(void)
@@ -3951,7 +4024,7 @@ static Cli cli_parse(int argc, char **argv)
     if (is_prism_cc(env_cc))
       env_cc = NULL;
   }
-  cli.cc = (env_cc && *env_cc) ? env_cc : "cc";
+  cli.cc = (env_cc && *env_cc) ? env_cc : PRISM_DEFAULT_CC;
 
   // Pre-scan for -E (passthrough mode — sources go directly to CC)
   bool passthrough = false;
@@ -4079,8 +4152,17 @@ static void cli_free(Cli *cli)
   free(cli->cc_args);
 }
 
-static void add_warn_suppress(ArgvBuilder *ab, bool clang)
+static void add_warn_suppress(ArgvBuilder *ab, bool clang, bool msvc)
 {
+  if (msvc)
+  {
+    // MSVC: suppress common transpiler-generated warnings
+    argv_builder_add(ab, "/wd4100"); // unreferenced formal parameter
+    argv_builder_add(ab, "/wd4189"); // local variable initialized but not referenced
+    argv_builder_add(ab, "/wd4244"); // possible loss of data (implicit narrowing)
+    argv_builder_add(ab, "/wd4267"); // conversion from 'size_t' to 'int'
+    return;
+  }
   static const char *w[] = {
       "-Wno-type-limits",
       "-Wno-cast-align",
@@ -4105,7 +4187,7 @@ static void verbose_argv(char **args)
   fprintf(stderr, "\n");
 }
 
-static void add_output_flags(ArgvBuilder *ab, const Cli *cli, const char *temp_exe)
+static void add_output_flags(ArgvBuilder *ab, const Cli *cli, const char *temp_exe, bool msvc)
 {
   static char defobj[PATH_MAX];
   const char *out = NULL;
@@ -4116,16 +4198,28 @@ static void add_output_flags(ArgvBuilder *ab, const Cli *cli, const char *temp_e
     out = cli->output;
   else if (cli->compile_only && cli->source_count == 1)
   {
-    const char *base = strrchr(cli->sources[0], '/');
-    base = base ? base + 1 : cli->sources[0];
+    const char *base = path_basename(cli->sources[0]);
     snprintf(defobj, sizeof(defobj), "%s", base);
     char *dot = strrchr(defobj, '.');
     if (dot)
-      strcpy(dot, ".o");
+      strcpy(dot, msvc ? ".obj" : ".o");
     out = defobj;
   }
 
-  if (out)
+  if (!out)
+    return;
+
+  if (msvc)
+  {
+    // cl.exe: /Fe:exe or /Fo:obj
+    static char flag[PATH_MAX + 8];
+    if (cli->compile_only)
+      snprintf(flag, sizeof(flag), "/Fo:%s", out);
+    else
+      snprintf(flag, sizeof(flag), "/Fe:%s", out);
+    argv_builder_add(ab, flag);
+  }
+  else
   {
     argv_builder_add(ab, "-o");
     argv_builder_add(ab, out);
@@ -4169,6 +4263,7 @@ static void make_run_temp(char *buf, size_t size, CliMode mode)
 static int passthrough_cc(const Cli *cli)
 {
   const char *compiler = get_real_cc(cli->cc);
+  bool msvc = cc_is_msvc(compiler);
   ArgvBuilder ab;
   argv_builder_init(&ab);
   argv_builder_add(&ab, compiler);
@@ -4176,8 +4271,17 @@ static int passthrough_cc(const Cli *cli)
     argv_builder_add(&ab, cli->cc_args[i]);
   if (cli->output)
   {
-    argv_builder_add(&ab, "-o");
-    argv_builder_add(&ab, cli->output);
+    if (msvc)
+    {
+      static char fe_flag[PATH_MAX + 8];
+      snprintf(fe_flag, sizeof(fe_flag), "/Fe:%s", cli->output);
+      argv_builder_add(&ab, fe_flag);
+    }
+    else
+    {
+      argv_builder_add(&ab, "-o");
+      argv_builder_add(&ab, cli->output);
+    }
   }
   char **pass = argv_builder_finish(&ab);
   if (cli->verbose)
@@ -4190,7 +4294,7 @@ static int passthrough_cc(const Cli *cli)
 static int install_from_source(Cli *cli)
 {
   char temp_bin[PATH_MAX];
-  snprintf(temp_bin, sizeof(temp_bin), "%sprism_install_%d", get_tmp_dir(), getpid());
+  snprintf(temp_bin, sizeof(temp_bin), "%sprism_install_%d" EXE_SUFFIX, get_tmp_dir(), getpid());
 
   const char *cc = get_real_cc(cli->cc ? cli->cc : getenv("PRISM_CC"));
   if (!cc || (strcmp(cc, "cc") == 0 && !cli->cc))
@@ -4199,8 +4303,11 @@ static int install_from_source(Cli *cli)
     if (cc)
       cc = get_real_cc(cc);
   }
+
   if (!cc)
-    cc = "cc";
+    cc = PRISM_DEFAULT_CC;
+
+  bool msvc = cc_is_msvc(cc);
 
   char **temp_files = malloc(cli->source_count * sizeof(char *));
   if (!temp_files)
@@ -4242,13 +4349,25 @@ static int install_from_source(Cli *cli)
   ArgvBuilder ab;
   argv_builder_init(&ab);
   argv_builder_add(&ab, cc);
-  argv_builder_add(&ab, "-O2");
+  argv_builder_add(&ab, msvc ? "/O2" : "-O2");
+
   for (int i = 0; i < cli->source_count; i++)
     argv_builder_add(&ab, temp_files[i]);
+
   for (int i = 0; i < cli->cc_arg_count; i++)
     argv_builder_add(&ab, cli->cc_args[i]);
-  argv_builder_add(&ab, "-o");
-  argv_builder_add(&ab, temp_bin);
+
+  if (msvc)
+  {
+    static char fe_flag[PATH_MAX + 8];
+    snprintf(fe_flag, sizeof(fe_flag), "/Fe:%s", temp_bin);
+    argv_builder_add(&ab, fe_flag);
+  }
+  else
+  {
+    argv_builder_add(&ab, "-o");
+    argv_builder_add(&ab, temp_bin);
+  }
   char **argv_cc = argv_builder_finish(&ab);
 
   if (cli->verbose)
@@ -4281,14 +4400,16 @@ static int compile_sources(Cli *cli)
 {
   const char *compiler = get_real_cc(cli->cc);
   bool clang = cc_is_clang(compiler);
+  bool msvc = cc_is_msvc(compiler);
   char temp_exe[PATH_MAX];
   make_run_temp(temp_exe, sizeof(temp_exe), cli->mode);
 
   int status;
 
-  if (cli->source_count == 1)
+  if (cli->source_count == 1 && !msvc)
   {
     // Single source: pipe-based transpile+compile (no temp files)
+    // MSVC cl.exe cannot read C from stdin, so it always uses the temp-file path below.
     ArgvBuilder ab;
     argv_builder_init(&ab);
     argv_builder_add(&ab, compiler);
@@ -4310,8 +4431,9 @@ static int compile_sources(Cli *cli)
 
     for (int i = 0; i < cli->cc_arg_count; i++)
       argv_builder_add(&ab, cli->cc_args[i]);
-    add_warn_suppress(&ab, clang);
-    add_output_flags(&ab, cli, temp_exe);
+
+    add_warn_suppress(&ab, clang, false);
+    add_output_flags(&ab, cli, temp_exe, false);
     char **argv_cc = argv_builder_finish(&ab);
 
     if (cli->verbose)
@@ -4350,16 +4472,21 @@ static int compile_sources(Cli *cli)
     ArgvBuilder ab;
     argv_builder_init(&ab);
     argv_builder_add(&ab, compiler);
-    if (FEAT(F_FLATTEN) && !clang)
+
+    if (FEAT(F_FLATTEN) && !clang && !msvc)
       argv_builder_add(&ab, "-fpreprocessed");
+
     for (int i = 0; i < cli->source_count; i++)
       argv_builder_add(&ab, temps[i]);
-    if (FEAT(F_FLATTEN) && !clang)
+
+    if (FEAT(F_FLATTEN) && !clang && !msvc)
       argv_builder_add(&ab, "-fno-preprocessed");
+
     for (int i = 0; i < cli->cc_arg_count; i++)
       argv_builder_add(&ab, cli->cc_args[i]);
-    add_warn_suppress(&ab, clang);
-    add_output_flags(&ab, cli, temp_exe);
+
+    add_warn_suppress(&ab, clang, msvc);
+    add_output_flags(&ab, cli, temp_exe, msvc);
     char **argv_cc = argv_builder_finish(&ab);
 
     if (cli->verbose)

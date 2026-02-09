@@ -18,11 +18,20 @@ Prism is a proper transpiler, not a preprocessor macro.
 * **Detect Errors:** It catches unsafe patterns (like jumping into a scope with `goto`) before they become runtime bugs.
 
 ## Quick Start
-build & install
-```c
+
+### Linux / macOS
+```sh
 cc prism.c -flto -s -O3 -o /tmp/prism && /tmp/prism install && rm /tmp/prism
 ```
-As of Prism 1.0 (v0.100.0) - **Windows support is currently not there**, some code exists but is nowhere near stable.
+
+### Windows (MSVC)
+Open a **Developer Command Prompt** (or run `vcvars64.bat`) and build:
+```sh
+cl /Fe:prism.exe prism.c /O2 /D_CRT_SECURE_NO_WARNINGS /nologo
+```
+Requires Visual Studio Build Tools with the **Desktop development with C++** workload.
+
+> **Note:** Prism builds and runs natively on Windows. The transpiler output is GCC/Clang-first — features like `__auto_type` in `defer` return values are not yet MSVC-compatible. Use `CC=gcc` or `CC=clang` as the backend compiler on Windows for full transpiled-code support.
 
 ## Defer
 
@@ -208,7 +217,7 @@ Not:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v0.108.0 - Robust C transpiler
+Prism v0.109.0 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 
@@ -251,8 +260,6 @@ Examples:
   prism -c foo.c -o foo.o          Compile to object file
   prism -O2 -Wall foo.c -o foo     With optimization and warnings
   CC=clang prism foo.c             Use clang as backend
-
-Note: Windows is not supported at this time.
 
 Apache 2.0 license (c) Dawn Larsson 2026
 https://github.com/dawnlarsson/prism

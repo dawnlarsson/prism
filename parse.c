@@ -7,7 +7,14 @@
 //
 // Usage: Run "cc -E -P input.c" first, then tokenize the output.
 
+#ifdef _WIN32
+#include "windows.c"
+#else
 #define _POSIX_C_SOURCE 200809L
+#include <stdnoreturn.h>
+#include <unistd.h>
+#endif
+
 #include <ctype.h>
 #include <limits.h>
 #include <setjmp.h>
@@ -17,15 +24,13 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdnoreturn.h>
 #include <string.h>
-#include <unistd.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__attribute__)
 #define __attribute__(x)
 #endif
 
@@ -38,6 +43,23 @@
 #define IS_XDIGIT(c) (IS_DIGIT(c) || ((unsigned)((c) | 0x20) - 'a') < 6u)
 
 // Lookup table for identifier-continuation chars (alnum + _ + $ + bytes >= 0x80)
+#ifdef _WIN32
+// MSVC: no GCC range designators — initialize at startup
+static uint8_t ident_char[256];
+static void init_ident_char(void)
+{
+    for (int c = '0'; c <= '9'; c++)
+        ident_char[c] = 1;
+    for (int c = 'A'; c <= 'Z'; c++)
+        ident_char[c] = 1;
+    for (int c = 'a'; c <= 'z'; c++)
+        ident_char[c] = 1;
+    ident_char['_'] = 1;
+    ident_char['$'] = 1;
+    for (int c = 0x80; c <= 0xFF; c++)
+        ident_char[c] = 1;
+}
+#else
 static const uint8_t ident_char[256] = {
     ['0' ... '9'] = 1,
     ['A' ... 'Z'] = 1,
@@ -46,6 +68,7 @@ static const uint8_t ident_char[256] = {
     ['$'] = 1,
     [0x80 ... 0xFF] = 1,
 };
+#endif
 
 // Generic array growth: ensures *arr has capacity for n elements
 // Note: Uses error() instead of exit(1) to support PRISM_LIB_MODE where
@@ -402,6 +425,9 @@ static void prism_ctx_init(void)
     ctx->main_arena.default_block_size = ARENA_DEFAULT_BLOCK_SIZE;
     ctx->features = F_DEFER | F_ZEROINIT | F_LINE_DIR | F_FLATTEN;
     ctx->at_stmt_start = true;
+#ifdef _WIN32
+    init_ident_char();
+#endif
 }
 
 // Token arena - uses main_arena with inlined bump allocator

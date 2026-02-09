@@ -138,6 +138,27 @@ jobs:
           clang -DPRISM_LIB_MODE -o test_lib .github/test_lib.c
           ./test_lib
 
+  build-windows:
+    name: windows - x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Display System Info
+        run: |
+          echo "OS: Windows"
+          echo "Architecture: x86_64"
+          cl 2>&1 | head -1
+
+      - name: Bootstrap Prism
+        run: cl /Fe:prism.exe prism.c /nologo /O2 /D_CRT_SECURE_NO_WARNINGS
+
+      - name: Verify Build
+        run: .\prism.exe --version
+
   # Multi-arch Alpine builds via QEMU
   build-arm64:
     name: linux - arm64
