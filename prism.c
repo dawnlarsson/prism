@@ -144,7 +144,17 @@ static const char *get_tmp_dir(void)
   return fallback;
 }
 
-static Token *skip_balanced(Token *tok, char *open, char *close);
+static Token *skip_balanced(Token *tok, char open, char close);
+
+// Fast single-char match for balanced scanners: direct char compare with rare digraph fallback
+static inline bool match_ch(Token *tok, char c)
+{
+  if (tok->len == 1)
+    return tok->loc[0] == c;
+  if (__builtin_expect(tok->flags & TF_IS_DIGRAPH, 0))
+    return _equal_1_digraph(tok, c);
+  return false;
+}
 
 // Forward declaration: Type specifier parsing result
 typedef struct
@@ -175,7 +185,7 @@ static Token *skip_gnu_attributes(Token *tok)
   {
     tok = tok->next;
     if (tok && equal(tok, "("))
-      tok = skip_balanced(tok, "(", ")");
+      tok = skip_balanced(tok, '(', ')');
   }
   return tok;
 }
@@ -187,13 +197,13 @@ static Token *skip_c23_attr(Token *tok)
   int depth = 1;
   while (tok && tok->kind != TK_EOF && depth > 0)
   {
-    if (equal(tok, "["))
+    if (match_ch(tok, '['))
       depth++;
-    else if (equal(tok, "]"))
+    else if (match_ch(tok, ']'))
       depth--;
     tok = tok->next;
   }
-  if (tok && equal(tok, "]"))
+  if (tok && match_ch(tok, ']'))
     tok = tok->next;
   return tok;
 }
@@ -529,11 +539,7 @@ static void defer_push_scope(bool consume_flags)
     ctrl.next_scope = 0;
   }
   else
-  {
-    s->is_loop = false;
-    s->is_switch = false;
-    s->is_conditional = false;
-  }
+    s->is_loop = s->is_switch = s->is_conditional = false;
   ctx->defer_depth++;
 }
 
@@ -667,9 +673,7 @@ static void emit_tok(Token *tok)
   }
 
   // Spacing: BOL gets newline, otherwise check for #line or token-merge space
-  if (tok_at_bol(tok))
-    out_char('\n');
-  else if (need_line)
+  if (tok_at_bol(tok) || need_line)
     out_char('\n');
   else if ((tok->flags & TF_HAS_SPACE) || needs_space(last_emitted, tok))
     out_char(' ');
@@ -900,7 +904,7 @@ static void typedef_pop_scope(int scope_depth)
     if (e->prev_index >= 0)
       typedef_set_index(e->name, e->len, e->prev_index);
     else
-      hashmap_delete2(&typedef_table.name_map, e->name, e->len);
+      hashmap_delete(&typedef_table.name_map, e->name, e->len);
     typedef_table.count--;
   }
 }
@@ -1038,7 +1042,7 @@ static Token *find_struct_body_brace(Token *tok)
     {
       t = t->next;
       if (t && equal(t, "("))
-        t = skip_balanced(t, "(", ")");
+        t = skip_balanced(t, '(', ')');
     }
     else
     {
@@ -1101,7 +1105,7 @@ static bool walker_next(TokenWalker *w)
       w->prev = w->tok;
       w->tok = w->tok->next;
       if (w->tok && equal(w->tok, "("))
-        w->tok = skip_balanced(w->tok, "(", ")");
+        w->tok = skip_balanced(w->tok, '(', ')');
       w->prev = NULL;
       continue;
     }
@@ -1405,15 +1409,15 @@ static Token *skip_to_semicolon(Token *tok)
   return tok;
 }
 
-static Token *skip_balanced(Token *tok, char *open, char *close)
+static Token *skip_balanced(Token *tok, char open, char close)
 {
   int depth = 1;
   tok = tok->next; // skip opening
   while (tok->kind != TK_EOF && depth > 0)
   {
-    if (equal(tok, open))
+    if (match_ch(tok, open))
       depth++;
-    else if (equal(tok, close))
+    else if (match_ch(tok, close))
       depth--;
     tok = tok->next;
   }
@@ -1486,7 +1490,7 @@ static bool array_size_is_vla(Token *open_bracket)
     // Skip nested brackets
     if (equal(tok, "["))
     {
-      tok = skip_balanced(tok, "[", "]");
+      tok = skip_balanced(tok, '[', ']');
       continue;
     }
 
@@ -1502,14 +1506,14 @@ static bool array_size_is_vla(Token *open_bracket)
           if (tok->next && is_vla_typedef(tok->next))
             return true;
           Token *inner = tok->next;
-          Token *end = skip_balanced(tok, "(", ")");
+          Token *end = skip_balanced(tok, '(', ')');
           for (; inner && inner != end && inner->kind != TK_EOF; inner = inner->next)
             if (equal(inner, "[") && array_size_is_vla(inner))
               return true;
           tok = end;
         }
         else
-          tok = skip_balanced(tok, "(", ")");
+          tok = skip_balanced(tok, '(', ')');
       }
       continue;
     }
@@ -1617,9 +1621,9 @@ static void parse_typedef_declaration(Token *tok, int scope_depth)
     while (tok && !equal(tok, ",") && !equal(tok, ";") && tok->kind != TK_EOF)
     {
       if (equal(tok, "("))
-        tok = skip_balanced(tok, "(", ")");
+        tok = skip_balanced(tok, '(', ')');
       else if (equal(tok, "["))
-        tok = skip_balanced(tok, "[", "]");
+        tok = skip_balanced(tok, '[', ']');
       else
         tok = tok->next;
     }
@@ -1633,9 +1637,12 @@ static void parse_typedef_declaration(Token *tok, int scope_depth)
 
 static bool is_type_keyword(Token *tok)
 {
-  if (tok->kind != TK_KEYWORD && tok->kind != TK_IDENT)
+  if (tok->tag & TT_TYPE)
+    return true;
+  // Keywords are never user-defined typedefs — skip the expensive typedef lookup
+  if (tok->kind != TK_IDENT)
     return false;
-  return (tok->tag & TT_TYPE) || is_typedef_like(tok);
+  return is_typedef_like(tok);
 }
 
 // Check if token can be used as a variable name in a declarator.
@@ -1654,10 +1661,11 @@ static inline bool is_valid_varname(Token *tok)
 // Returns the token after all _Pragma(...) sequences
 static Token *skip_pragma_operators(Token *tok)
 {
-  while (tok && equal(tok, "_Pragma") && tok->next && equal(tok->next, "("))
+  // Fast path: _Pragma is 7 chars and extremely rare in preprocessed output
+  while (tok && tok->len == 7 && equal(tok, "_Pragma") && tok->next && equal(tok->next, "("))
   {
     tok = tok->next;                    // skip _Pragma
-    tok = skip_balanced(tok, "(", ")"); // skip (...)
+    tok = skip_balanced(tok, '(', ')'); // skip (...)
   }
   return tok;
 }
@@ -1668,7 +1676,8 @@ static TypeSpecResult parse_type_specifier(Token *tok)
 {
   TypeSpecResult r = {tok, false, false, false, false, false, false, false, false};
 
-  while ((tok->tag & TT_QUALIFIER) || is_type_keyword(tok) || is_c23_attr(tok))
+  bool is_type = false;
+  while ((tok->tag & TT_QUALIFIER) || (is_type = is_type_keyword(tok)) || is_c23_attr(tok))
   {
     // Track _Atomic
     if (equal(tok, "_Atomic"))
@@ -1687,11 +1696,13 @@ static TypeSpecResult parse_type_specifier(Token *tok)
     {
       tok = skip_c23_attr(tok);
       r.end = tok;
+      is_type = false;
       continue;
     }
 
-    if (is_type_keyword(tok))
+    if (is_type)
       r.saw_type = true;
+    is_type = false;
 
     // struct/union/enum
     if (tok->tag & TT_SUE)
@@ -1704,7 +1715,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       {
         tok = tok->next;
         if (tok && equal(tok, "("))
-          tok = skip_balanced(tok, "(", ")");
+          tok = skip_balanced(tok, '(', ')');
       }
       // Skip tag name
       if (tok && tok->kind == TK_IDENT)
@@ -1714,7 +1725,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       {
         if (struct_body_contains_vla(tok))
           r.is_vla = true;
-        tok = skip_balanced(tok, "{", "}");
+        tok = skip_balanced(tok, '{', '}');
       }
       r.end = tok;
       continue;
@@ -1728,7 +1739,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       r.has_typeof = true;
       tok = tok->next;
       if (tok && equal(tok, "("))
-        tok = skip_balanced(tok, "(", ")");
+        tok = skip_balanced(tok, '(', ')');
       r.end = tok;
       continue;
     }
@@ -1739,7 +1750,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       r.saw_type = true;
       tok = tok->next;
       if (tok && equal(tok, "("))
-        tok = skip_balanced(tok, "(", ")");
+        tok = skip_balanced(tok, '(', ')');
       r.end = tok;
       continue;
     }
@@ -1751,7 +1762,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       r.has_atomic = true;
       tok = tok->next;                // Move past _Atomic
       Token *inner_start = tok->next; // Start of inner type (after '(')
-      tok = skip_balanced(tok, "(", ")");
+      tok = skip_balanced(tok, '(', ')');
       // Check if inner type is struct/union/enum
       if (inner_start && (inner_start->tag & TT_SUE))
         r.is_struct = true;
@@ -1767,7 +1778,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
     {
       tok = tok->next;
       if (tok && equal(tok, "("))
-        tok = skip_balanced(tok, "(", ")");
+        tok = skip_balanced(tok, '(', ')');
       r.end = tok;
       continue;
     }
@@ -1803,22 +1814,36 @@ static TypeSpecResult parse_type_specifier(Token *tok)
   return r;
 }
 
+// Get canonical delimiter char (digraph-aware)
+static inline char tok_open_ch(Token *t)
+{
+  if (t->len == 1)
+    return t->loc[0];
+  if (__builtin_expect(t->flags & TF_IS_DIGRAPH, 0))
+  {
+    const char *e = digraph_equiv(t);
+    if (e)
+      return e[0];
+  }
+  return t->loc[0];
+}
+static inline char close_for(char c) { return c == '(' ? ')' : c == '[' ? ']'
+                                                                        : '}'; }
+
 // Emit a balanced token group: emits 'tok' and all tokens through matching close.
 // Works for (), [], and __attribute__((...)). Returns position after.
 static Token *emit_balanced(Token *tok)
 {
-  const char *open_s = equal(tok, "(") ? "(" : equal(tok, "[") ? "["
-                                                               : "{";
-  const char *close_s = equal(tok, "(") ? ")" : equal(tok, "[") ? "]"
-                                                                : "}";
+  char open_c = tok_open_ch(tok);
+  char close_c = close_for(open_c);
   emit_tok(tok);
   tok = tok->next;
   int depth = 1;
   while (tok && tok->kind != TK_EOF && depth > 0)
   {
-    if (equal(tok, open_s))
+    if (match_ch(tok, open_c))
       depth++;
-    else if (equal(tok, close_s))
+    else if (match_ch(tok, close_c))
       depth--;
     emit_tok(tok);
     tok = tok->next;
@@ -1849,10 +1874,7 @@ static DeclResult parse_declarator(Token *tok, bool emit)
     if (emit)        \
       emit_tok(t);   \
   } while (0)
-#define DECL_BALANCED(t) (emit ? emit_balanced(t) : skip_balanced(t, equal(t, "(") ? "(" : equal(t, "[") ? "["  \
-                                                                                                         : "{", \
-                                                                  equal(t, "(") ? ")" : equal(t, "[") ? "]"     \
-                                                                                                      : "}"))
+#define DECL_BALANCED(t) (emit ? emit_balanced(t) : skip_balanced(t, tok_open_ch(t), close_for(tok_open_ch(t))))
 #define DECL_ATTR(t)                    \
   do                                    \
   {                                     \
@@ -1864,7 +1886,7 @@ static DeclResult parse_declarator(Token *tok, bool emit)
     {                                   \
       t = (t)->next;                    \
       if (t && equal(t, "("))           \
-        t = skip_balanced(t, "(", ")"); \
+        t = skip_balanced(t, '(', ')'); \
     }                                   \
   } while (0)
 #define DECL_ARRAY_DIMS(t, vla) \
@@ -1911,7 +1933,7 @@ static DeclResult parse_declarator(Token *tok, bool emit)
     {
       peek = peek->next;
       if (peek && equal(peek, "("))
-        peek = skip_balanced(peek, "(", ")");
+        peek = skip_balanced(peek, '(', ')');
     }
     if (!equal(peek, "*") && !equal(peek, "("))
     {
@@ -2057,7 +2079,7 @@ static Token *handle_storage_raw(Token *storage_tok)
   {
     p = p->next;
     if (p && equal(p, "("))
-      p = skip_balanced(p, "(", ")");
+      p = skip_balanced(p, '(', ')');
   }
   if (!equal(p, "raw") || is_known_typedef(p))
     return NULL;
@@ -2212,6 +2234,10 @@ static Token *try_zero_init_decl(Token *tok)
   if (!FEAT(F_ZEROINIT) || ctx->defer_depth <= 0 || ctx->struct_depth > 0)
     return NULL;
 
+  // Fast reject: punctuation, numbers, strings, and EOF can never start a declaration
+  if (tok->kind >= TK_STR)
+    return NULL;
+
   // Check for "switch skip hole" - declarations directly in switch body
   // without braces can have their initialization skipped by case jumps.
   // This catches both: before first case label, and between case labels.
@@ -2223,7 +2249,8 @@ static Token *try_zero_init_decl(Token *tok)
   // Skip leading attributes and pragmas
   while (is_c23_attr(tok))
     tok = skip_c23_attr(tok);
-  tok = skip_pragma_operators(tok);
+  if (tok->len == 7) // Fast path: only call skip_pragma_operators if token could be _Pragma
+    tok = skip_pragma_operators(tok);
   Token *start = tok;
 
   // Check for 'raw' keyword
@@ -2235,7 +2262,7 @@ static Token *try_zero_init_decl(Token *tok)
     {
       after_raw = after_raw->next;
       if (after_raw && equal(after_raw, "("))
-        after_raw = skip_balanced(after_raw, "(", ")");
+        after_raw = skip_balanced(after_raw, '(', ')');
     }
     if (is_raw_declaration_context(after_raw))
     {
@@ -2248,10 +2275,13 @@ static Token *try_zero_init_decl(Token *tok)
   }
 
   // Skip pragmas after 'raw'
-  Token *before = tok;
-  tok = skip_pragma_operators(tok);
-  if (tok != before && !is_raw)
-    start = tok;
+  if (tok->len == 7)
+  { // Fast path: only check if token could be _Pragma
+    Token *before = tok;
+    tok = skip_pragma_operators(tok);
+    if (tok != before && !is_raw)
+      start = tok;
+  }
 
   // Handle storage class specifiers
   if (tok->tag & TT_SKIP_DECL)
@@ -2371,10 +2401,7 @@ static Token *handle_defer_keyword(Token *tok)
     error_tok(tok, "defer requires braces in control statements (braceless has no scope)");
   for (int i = 0; i < ctx->stmt_expr_count; i++)
     if (ctx->defer_depth == stmt_expr_levels[i])
-    {
       error_tok(tok, "defer cannot be at top level of statement expression; wrap in a block");
-      break;
-    }
   // setjmp/longjmp safety: only direct calls are detected by scan_labels_in_function.
   // Indirect calls via function pointers or wrappers are not caught (see limitation
   // comment on scan_labels_in_function).
@@ -2606,13 +2633,9 @@ static Token *handle_sue_body(Token *tok)
 
   if (is_enum)
     parse_enum_constants(brace, ctx->defer_depth);
-  while (tok != brace)
-  {
-    emit_tok(tok);
-    tok = tok->next;
-  }
-  emit_tok(tok); // emit '{'
-  tok = tok->next;
+  emit_range(tok, brace);
+  emit_tok(brace); // emit '{'
+  tok = brace->next;
   ctx->struct_depth++;
   defer_push_scope(false);
   ctx->at_stmt_start = true;
@@ -2624,9 +2647,7 @@ static Token *handle_sue_body(Token *tok)
 static Token *handle_open_brace(Token *tok)
 {
   // Compound literal inside control parens, or after condition (before body)
-  if (ctrl.pending &&
-      (ctrl.paren_depth > 0 ||
-       (ctrl.paren_depth == 0 && !ctrl.parens_just_closed)))
+  if (ctrl.pending && (ctrl.paren_depth > 0 || !ctrl.parens_just_closed))
   {
     emit_tok(tok);
     ctrl.brace_depth++;
@@ -2701,10 +2722,15 @@ static inline void argv_builder_add(ArgvBuilder *ab, const char *arg)
 #define argv_builder_finish(ab) ((ab)->data)
 
 // Build a copy of 'environ' with CC and PRISM_CC removed.
-// Caller must free() the returned array (but not individual strings — they alias environ).
+// Build a copy of 'environ' with CC and PRISM_CC removed.
+// Cached: built once, reused for all child processes.
+// Caller must NOT free() the returned array.
 extern char **environ;
+static char **cached_clean_env = NULL;
 static char **build_clean_environ(void)
 {
+  if (cached_clean_env)
+    return cached_clean_env;
   int n = 0;
   for (char **e = environ; *e; e++)
     n++;
@@ -2720,6 +2746,7 @@ static char **build_clean_environ(void)
     env[j++] = environ[i];
   }
   env[j] = NULL;
+  cached_clean_env = env;
   return env;
 }
 
@@ -2751,7 +2778,6 @@ static int run_command(char **argv)
     return -1;
   pid_t pid;
   int err = posix_spawnp(&pid, argv[0], NULL, NULL, argv, env);
-  free(env);
   if (err)
   {
     fprintf(stderr, "posix_spawnp: %s: %s\n", argv[0], strerror(err));
@@ -2951,7 +2977,6 @@ static char *preprocess_with_cc(const char *input_file)
   pid_t pid;
   int err = posix_spawnp(&pid, argv[0], &fa, NULL, argv, env);
   posix_spawn_file_actions_destroy(&fa);
-  free(env);
   close(pipefd[1]);
   free_argv(argv);
 
@@ -3107,6 +3132,109 @@ static int transpile_tokens(Token *tok, FILE *fp)
     }                     \
   }
 
+    // ── Fast path: untagged tokens with no stmt-start processing ──
+    // Most tokens (~70-80%) are plain identifiers, numbers, or operators without
+    // any tag bits set and not at statement start. Skip all dispatch and emit directly.
+    if (__builtin_expect(!tag && !ctx->at_stmt_start, 1))
+    {
+      // Still need to handle structural single-char tokens
+      if (__builtin_expect(tok->len == 1, 0))
+      {
+        char c = tok->loc[0];
+        if (c == '{')
+        {
+          // Function definition detection at top level (must precede handle_open_brace)
+          if (ctx->defer_depth == 0 && FEAT(F_DEFER))
+          {
+            if (prev_toplevel_tok && equal(prev_toplevel_tok, ")"))
+            {
+              scan_labels_in_function(tok);
+              ctx->current_func_returns_void = next_func_returns_void;
+            }
+            next_func_returns_void = false;
+          }
+          tok = handle_open_brace(tok);
+          continue;
+        }
+        if (c == '}')
+        {
+          tok = handle_close_brace(tok);
+          continue;
+        }
+        if (c == ';')
+        {
+          if (ctrl.pending)
+          {
+            if (ctrl.paren_depth == 1 && ctrl.for_init)
+              ctrl.for_init = false;
+            else if (ctrl.paren_depth == 0)
+            {
+              typedef_pop_scope(ctx->defer_depth + 1);
+              control_flow_reset();
+            }
+          }
+          if (!ctrl.pending)
+            ctx->at_stmt_start = true;
+          if (ctx->defer_depth == 0)
+          {
+            next_func_returns_void = false;
+            prev_toplevel_tok = tok;
+          }
+          emit_tok(tok);
+          tok = tok->next;
+          continue;
+        }
+        // Paren tracking for control flow
+        if (ctrl.pending)
+        {
+          if (c == '(')
+          {
+            ctrl.paren_depth++;
+            ctrl.parens_just_closed = false;
+            if (ctrl.await_for_paren)
+            {
+              ctrl.for_init = true;
+              ctx->at_stmt_start = true;
+              ctrl.await_for_paren = false;
+            }
+          }
+          else if (c == ')')
+          {
+            ctrl.paren_depth--;
+            if (ctrl.paren_depth == 0)
+            {
+              ctrl.for_init = false;
+              ctrl.parens_just_closed = true;
+            }
+          }
+        }
+        // Labels
+        if (c == ':' && last_emitted && last_emitted->kind == TK_IDENT &&
+            ctx->struct_depth == 0 && ctx->defer_depth > 0)
+        {
+          emit_tok(tok);
+          tok = tok->next;
+          ctx->at_stmt_start = true;
+          continue;
+        }
+      }
+      // _Generic paren tracking (rare)
+      if (__builtin_expect(ctx->generic_paren_depth > 0, 0))
+      {
+        if (equal(tok, "("))
+          ctx->generic_paren_depth++;
+        else if (equal(tok, ")"))
+          ctx->generic_paren_depth--;
+      }
+      if (ctx->defer_depth == 0)
+        prev_toplevel_tok = tok;
+      emit_tok(tok);
+      tok = tok->next;
+      continue;
+    }
+
+    // ── Slower path: statement-start processing and tagged tokens ──
+
     // Track typedefs (must precede zero-init check)
     if (ctx->at_stmt_start && ctx->struct_depth == 0 && (tag & TT_TYPEDEF))
       parse_typedef_declaration(tok, ctx->defer_depth);
@@ -3226,8 +3354,11 @@ static int transpile_tokens(Token *tok, FILE *fp)
     }
 
     // Void function detection — keywords and void typedef identifiers at top level
+    // Fast-reject: only enter is_void_function_decl for tokens that could plausibly
+    // start a void function (storage/qualifier/attr tags, or 'void' itself)
     if (ctx->defer_depth == 0 &&
         (tok->kind == TK_KEYWORD || (tok->kind == TK_IDENT && is_void_typedef(tok))) &&
+        (tag & (TT_TYPE | TT_QUALIFIER | TT_SKIP_DECL | TT_ATTR | TT_INLINE) || equal(tok, "void")) &&
         is_void_function_decl(tok))
       next_func_returns_void = true;
 
@@ -3452,9 +3583,8 @@ cleanup:
 PRISM_API void prism_free(PrismResult *r)
 {
   free(r->output);
-  r->output = NULL;
   free(r->error_msg);
-  r->error_msg = NULL;
+  r->output = r->error_msg = NULL;
 }
 
 // Reset all transpiler state for clean reuse
@@ -3572,7 +3702,6 @@ static int transpile_and_compile(char *input_file, char **compile_argv, bool ver
   pid_t pid;
   int err = posix_spawnp(&pid, compile_argv[0], &fa, NULL, compile_argv, env);
   posix_spawn_file_actions_destroy(&fa);
-  free(env);
   close(pipefd[0]);
 
   if (err)
@@ -3799,6 +3928,12 @@ static const char *get_real_cc(const char *cc)
   if (is_prism_cc(cc))
     return PRISM_DEFAULT_CC;
 
+  // Fast path: if cc has no path separator, it's a bare command name like "cc" or "gcc".
+  // These can't be a renamed prism binary (we already checked is_prism_cc above),
+  // so skip the expensive realpath() + get_self_exe_path() syscalls.
+  if (!strchr(cc, '/') && !strchr(cc, '\\'))
+    return cc;
+
   // Advanced check: resolve paths and compare with current executable
   // This prevents infinite recursion if prism is symlinked or copied to another name
   char cc_real[PATH_MAX];
@@ -3910,20 +4045,132 @@ static Cli cli_parse(int argc, char **argv)
   }
   cli.cc = (env_cc && *env_cc) ? env_cc : PRISM_DEFAULT_CC;
 
-  // Pre-scan for -E (passthrough mode — sources go directly to CC)
-  bool passthrough = false;
-  for (int i = 1; i < argc; i++)
-    if (!strcmp(argv[i], "-E"))
-    {
-      passthrough = true;
-      break;
-    }
+  bool passthrough = false; // -E passthrough detected inline
 
   for (int i = 1; i < argc; i++)
   {
     char *a = argv[i];
 
-    // Prism commands
+    // ── Fast path: flags starting with '-' that are clearly CC flags ──
+    // The vast majority of args (90%+) are CC flags like -D, -I, -W, -g, -O, -m, -std, etc.
+    // Reject prism flag prefixes first, then fall through to CC passthrough immediately.
+    if (a[0] == '-' && a[1] != '\0')
+    {
+      // Single-letter flags that need special handling
+      char c1 = a[1];
+
+      // -o: intercept output path
+      if (c1 == 'o')
+      {
+        if (a[2])
+          cli.output = a + 2;
+        else if (i + 1 < argc)
+          cli.output = argv[++i];
+        continue;
+      }
+
+      // -c: track compile-only (also passes through)
+      if (c1 == 'c' && !a[2])
+      {
+        cli.compile_only = true;
+        CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
+        continue;
+      }
+
+      // -E: passthrough mode
+      if (c1 == 'E' && !a[2])
+      {
+        passthrough = true;
+        CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
+        continue;
+      }
+
+      // -h: help
+      if (c1 == 'h' && !a[2])
+      {
+        print_help();
+        exit(0);
+      }
+
+      // -- prefix: prism options or help
+      if (c1 == '-')
+      {
+        if (!strcmp(a, "--help"))
+        {
+          print_help();
+          exit(0);
+        }
+        if (!strcmp(a, "--version"))
+        {
+          printf("prism %s\n", PRISM_VERSION);
+          exit(0);
+        }
+        if (str_startswith(a, "--prism-cc="))
+        {
+          cli.cc = a + 11;
+          continue;
+        }
+        if (!strcmp(a, "--prism-verbose"))
+        {
+          cli.verbose = true;
+          continue;
+        }
+        if (str_startswith(a, "--prism-emit="))
+        {
+          cli.mode = CLI_EMIT;
+          cli.output = a + 13;
+          continue;
+        }
+        if (!strcmp(a, "--prism-emit"))
+        {
+          cli.mode = CLI_EMIT;
+          continue;
+        }
+        // All other --flags pass through to CC
+        CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
+        continue;
+      }
+
+      // -f prefix: check for prism feature flags, else CC passthrough
+      if (c1 == 'f')
+      {
+        static const struct
+        {
+          const char *flag;
+          int off;
+          int val;
+        } feat_flags[] = {
+            {"-fno-defer", offsetof(PrismFeatures, defer), 0},
+            {"-fno-zeroinit", offsetof(PrismFeatures, zeroinit), 0},
+            {"-fno-line-directives", offsetof(PrismFeatures, line_directives), 0},
+            {"-fno-safety", offsetof(PrismFeatures, warn_safety), 1},
+            {"-fflatten-headers", offsetof(PrismFeatures, flatten_headers), 1},
+            {"-fno-flatten-headers", offsetof(PrismFeatures, flatten_headers), 0},
+        };
+        bool matched = false;
+        for (int f = 0; f < (int)(sizeof(feat_flags) / sizeof(*feat_flags)); f++)
+          if (!strcmp(a, feat_flags[f].flag))
+          {
+            *(bool *)((char *)&cli.features + feat_flags[f].off) = feat_flags[f].val;
+            matched = true;
+            break;
+          }
+        if (matched)
+          continue;
+        // Not a prism -f flag — pass through
+        CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
+        continue;
+      }
+
+      // All other -X flags (e.g. -D, -I, -W, -g, -O, -m, -std, -l, -L, -s, etc.)
+      // are CC passthrough — skip all prism checks entirely
+      CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
+      continue;
+    }
+
+    // ── Non-flag arguments ──
+
+    // Prism commands (only valid as first non-flag arg, but checked unconditionally)
     if (!strcmp(a, "run"))
     {
       cli.mode = CLI_RUN;
@@ -3940,90 +4187,14 @@ static Cli cli_parse(int argc, char **argv)
       continue;
     }
 
-    // Help / version (print and exit)
-    if (!strcmp(a, "-h") || !strcmp(a, "--help"))
-    {
-      print_help();
-      exit(0);
-    }
-    if (!strcmp(a, "--version"))
-    {
-      printf("prism %s\n", PRISM_VERSION);
-      exit(0);
-    }
-
-    // Prism feature flags (consume, don't pass to CC)
-    static const struct
-    {
-      const char *flag;
-      int off;
-      int val;
-    } feat_flags[] = {
-        {"-fno-defer", offsetof(PrismFeatures, defer), 0},
-        {"-fno-zeroinit", offsetof(PrismFeatures, zeroinit), 0},
-        {"-fno-line-directives", offsetof(PrismFeatures, line_directives), 0},
-        {"-fno-safety", offsetof(PrismFeatures, warn_safety), 1},
-        {"-fflatten-headers", offsetof(PrismFeatures, flatten_headers), 1},
-        {"-fno-flatten-headers", offsetof(PrismFeatures, flatten_headers), 0},
-    };
-    bool matched = false;
-    for (int f = 0; f < (int)(sizeof(feat_flags) / sizeof(*feat_flags)); f++)
-      if (!strcmp(a, feat_flags[f].flag))
-      {
-        *(bool *)((char *)&cli.features + feat_flags[f].off) = feat_flags[f].val;
-        matched = true;
-        break;
-      }
-    if (matched)
-      continue;
-
-    // Prism options
-    if (str_startswith(a, "--prism-cc="))
-    {
-      cli.cc = a + 11;
-      continue;
-    }
-    if (!strcmp(a, "--prism-verbose"))
-    {
-      cli.verbose = true;
-      continue;
-    }
-    if (str_startswith(a, "--prism-emit="))
-    {
-      cli.mode = CLI_EMIT;
-      cli.output = a + 13;
-      continue;
-    }
-    if (!strcmp(a, "--prism-emit"))
-    {
-      cli.mode = CLI_EMIT;
-      continue;
-    }
-
-    // Output (intercept — we add -o ourselves later)
-    if (!strcmp(a, "-o") && i + 1 < argc)
-    {
-      cli.output = argv[++i];
-      continue;
-    }
-    if (a[0] == '-' && a[1] == 'o' && a[2])
-    {
-      cli.output = a + 2;
-      continue;
-    }
-
-    // Track -c (also passes through to CC below)
-    if (!strcmp(a, "-c"))
-      cli.compile_only = true;
-
     // Source files (.c/.i) — transpile unless -E passthrough
-    if (a[0] != '-' && (has_ext(a, ".c") || has_ext(a, ".i")) && !passthrough)
+    if ((has_ext(a, ".c") || has_ext(a, ".i")) && !passthrough)
     {
       CLI_PUSH(cli.sources, cli.source_count, cli.source_cap, a);
       continue;
     }
 
-    // Everything else: pass through to CC
+    // Everything else: pass through to CC (object files, libraries, etc.)
     CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
   }
 

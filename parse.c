@@ -494,7 +494,7 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val)
     map->used++;
 }
 
-static void hashmap_delete2(HashMap *map, char *key, int keylen)
+static void hashmap_delete(HashMap *map, char *key, int keylen)
 {
     if (!map->buckets)
         return;
@@ -742,15 +742,16 @@ static inline const char *digraph_equiv(Token *tok)
     if (tok->len != 2)
         return NULL;
 
-    if (!memcmp(tok->loc, "<:", 2))
+    char a = tok->loc[0], b = tok->loc[1];
+    if (a == '<' && b == ':')
         return "[";
-    if (!memcmp(tok->loc, ":>", 2))
+    if (a == ':' && b == '>')
         return "]";
-    if (!memcmp(tok->loc, "<%", 2))
+    if (a == '<' && b == '%')
         return "{";
-    if (!memcmp(tok->loc, "%>", 2))
+    if (a == '%' && b == '>')
         return "}";
-    if (!memcmp(tok->loc, "%:", 2))
+    if (a == '%' && b == ':')
         return "#";
 
     return NULL;

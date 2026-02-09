@@ -338,28 +338,24 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
         }
     }
 
+    HANDLE hResult = INVALID_HANDLE_VALUE;
     char *cmdline = win32_argv_to_cmdline(argv);
     if (!cmdline)
-    {
-        // Restore original handle inheritance flags
-        if (si.dwFlags & STARTF_USESTDHANDLES)
-        {
-            if (hStdIn != INVALID_HANDLE_VALUE)
-                SetHandleInformation(hStdIn, HANDLE_FLAG_INHERIT, orig_in_flags & HANDLE_FLAG_INHERIT);
-            if (hStdOut != INVALID_HANDLE_VALUE)
-                SetHandleInformation(hStdOut, HANDLE_FLAG_INHERIT, orig_out_flags & HANDLE_FLAG_INHERIT);
-            if (hStdErr != INVALID_HANDLE_VALUE)
-                SetHandleInformation(hStdErr, HANDLE_FLAG_INHERIT, orig_err_flags & HANDLE_FLAG_INHERIT);
-        }
-        if (hNul != INVALID_HANDLE_VALUE)
-            CloseHandle(hNul);
-        return INVALID_HANDLE_VALUE;
-    }
+        goto cleanup;
 
     BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
     free(cmdline);
 
-    // Restore original handle inheritance flags regardless of success/failure
+    if (!ok)
+        fprintf(stderr, "CreateProcess failed for '%s': error %lu\n", argv[0], GetLastError());
+    else
+    {
+        CloseHandle(pi.hThread);
+        hResult = pi.hProcess;
+    }
+
+cleanup:
+    // Restore original handle inheritance flags
     if (si.dwFlags & STARTF_USESTDHANDLES)
     {
         if (hStdIn != INVALID_HANDLE_VALUE)
@@ -369,18 +365,9 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
         if (hStdErr != INVALID_HANDLE_VALUE)
             SetHandleInformation(hStdErr, HANDLE_FLAG_INHERIT, orig_err_flags & HANDLE_FLAG_INHERIT);
     }
-
     if (hNul != INVALID_HANDLE_VALUE)
         CloseHandle(hNul);
-
-    if (!ok)
-    {
-        fprintf(stderr, "CreateProcess failed for '%s': error %lu\n", argv[0], GetLastError());
-        return INVALID_HANDLE_VALUE;
-    }
-
-    CloseHandle(pi.hThread);
-    return pi.hProcess;
+    return hResult;
 }
 
 // POSIX: int posix_spawnp(pid_t *pid, const char *file,
