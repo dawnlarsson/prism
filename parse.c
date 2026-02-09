@@ -634,7 +634,7 @@ static int tok_line_no(Token *tok)
 static noreturn void error(char *fmt, ...)
 {
 #ifdef PRISM_LIB_MODE
-    if (ctx->error_jmp_set)
+    if (ctx && ctx->error_jmp_set)
     {
         va_list ap;
         va_start(ap, fmt);
@@ -1106,8 +1106,12 @@ static char *skip_line_comment(char *p)
 static char *skip_block_comment(char *p)
 {
     for (; *p; p++)
+    {
+        if (*p == '\n')
+            ctx->tok_line_no++;
         if (p[0] == '*' && p[1] == '/')
             return p + 2;
+    }
     error_at(p, "unclosed block comment");
 }
 
@@ -1144,6 +1148,8 @@ static char *raw_string_literal_end(char *p)
     // Search for )delimiter"
     for (char *q = content; *q; q++)
     {
+        if (*q == '\n')
+            ctx->tok_line_no++;
         if (*q == ')' &&
             (delim_len == 0 || strncmp(q + 1, delim_start, delim_len) == 0) &&
             q[1 + delim_len] == '"')
@@ -1387,7 +1393,10 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
     long new_line = 0;
     while (IS_DIGIT(*p))
     {
+        long prev = new_line;
         new_line = new_line * 10 + (*p - '0');
+        if (new_line < prev) // overflow
+            return NULL;
         p++;
     }
     while (*p == ' ' || *p == '\t')

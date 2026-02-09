@@ -2407,6 +2407,7 @@ static Token *try_zero_init_decl(Token *tok)
 static Token *emit_expr_to_semicolon(Token *tok)
 {
   int depth = 0;
+  int ternary_depth = 0;
   bool expr_at_stmt_start = false;
   Token *prev_tok = NULL;
   while (tok->kind != TK_EOF)
@@ -2421,6 +2422,8 @@ static Token *emit_expr_to_semicolon(Token *tok)
       depth--;
     else if (depth == 0 && equal(tok, ";"))
       break;
+    else if (equal(tok, "?"))
+      ternary_depth++;
 
     if (expr_at_stmt_start && FEAT(F_ZEROINIT))
     {
@@ -2438,10 +2441,16 @@ static Token *emit_expr_to_semicolon(Token *tok)
     prev_tok = tok;
     tok = tok->next;
 
-    if (prev_tok && (equal(prev_tok, "{") || equal(prev_tok, ";") || equal(prev_tok, "}") || equal(prev_tok, ":")))
+    if (prev_tok && (equal(prev_tok, "{") || equal(prev_tok, ";") || equal(prev_tok, "}")))
+      expr_at_stmt_start = true;
+    else if (prev_tok && equal(prev_tok, ":") && ternary_depth <= 0)
       expr_at_stmt_start = true;
     else
+    {
+      if (prev_tok && equal(prev_tok, ":") && ternary_depth > 0)
+        ternary_depth--;
       expr_at_stmt_start = false;
+    }
   }
   return tok;
 }

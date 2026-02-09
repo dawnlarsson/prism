@@ -93,10 +93,9 @@ typedef int mode_t;
 #define getpid _getpid
 #define unlink _unlink
 #define close _close
-// Use inline function instead of macro to avoid colliding with struct members,
-// local variables, or other uses of the identifier 'read'.
-static inline ssize_t read(int fd, void *buf, size_t count);
-#define read(fd, buf, count) read(fd, buf, count)
+// Redirect read() calls to our wrapper via macro.
+// Using a unique name avoids conflicting with MSVC ucrt's read() declaration.
+#define read prism_posix_read_
 
 #define SPAWN_ACTION_MAX 8
 
@@ -127,7 +126,7 @@ static int pipe(int pipefd[2]) { return _pipe(pipefd, 65536, _O_BINARY); }
 static char *realpath(const char *path, char *resolved) { return _fullpath(resolved, path, PATH_MAX); }
 
 // MSVC _read takes unsigned int for count, returns int
-static inline ssize_t read(int fd, void *buf, size_t count)
+static ssize_t prism_posix_read_(int fd, void *buf, size_t count)
 {
     unsigned int to_read = (count > 0x7FFFFFFF) ? 0x7FFFFFFF : (unsigned int)count;
     return (ssize_t)_read(fd, buf, to_read);
