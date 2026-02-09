@@ -3606,6 +3606,16 @@ PRISM_API void prism_reset(void)
   }
 }
 
+// Extract filename from path (handles both / and \ separators)
+static const char *path_basename(const char *path)
+{
+  const char *fwd = strrchr(path, '/');
+  const char *bck = strrchr(path, '\\');
+  if (bck && (!fwd || bck > fwd))
+    fwd = bck;
+  return fwd ? fwd + 1 : path;
+}
+
 static bool cc_is_msvc(const char *cc)
 {
 #ifndef _WIN32
@@ -3937,16 +3947,6 @@ static inline bool has_ext(const char *f, const char *ext)
 static bool str_startswith(const char *s, const char *prefix)
 {
   return strncmp(s, prefix, strlen(prefix)) == 0;
-}
-
-// Extract filename from path (handles both / and \ separators)
-static const char *path_basename(const char *path)
-{
-  const char *fwd = strrchr(path, '/');
-  const char *bck = strrchr(path, '\\');
-  if (bck && (!fwd || bck > fwd))
-    fwd = bck;
-  return fwd ? fwd + 1 : path;
 }
 
 // Check if a string starts with "prism" (possibly with path prefix)
