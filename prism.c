@@ -3606,6 +3606,19 @@ PRISM_API void prism_reset(void)
   }
 }
 
+static bool cc_is_msvc(const char *cc)
+{
+#ifndef _WIN32
+  (void)cc;
+  return false;
+#else
+  if (!cc || !*cc)
+    return false;
+  const char *base = path_basename(cc);
+  return (_stricmp(base, "cl") == 0 || _stricmp(base, "cl.exe") == 0);
+#endif
+}
+
 // CLI IMPLEMENTATION (excluded with -DPRISM_LIB_MODE)
 
 #ifndef PRISM_LIB_MODE
@@ -3966,20 +3979,6 @@ static bool cc_is_clang(const char *cc)
     return false;
   const char *base = path_basename(cc);
   return strncmp(base, "clang", 5) == 0;
-}
-
-// Check if the compiler is MSVC cl.exe
-static bool cc_is_msvc(const char *cc)
-{
-#ifndef _WIN32
-  (void)cc;
-  return false;
-#else
-  if (!cc || !*cc)
-    return false;
-  const char *base = path_basename(cc);
-  return (_stricmp(base, "cl") == 0 || _stricmp(base, "cl.exe") == 0);
-#endif
 }
 
 static void print_help(void)
