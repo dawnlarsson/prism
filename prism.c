@@ -97,17 +97,7 @@ PRISM_API PrismFeatures prism_defaults(void)
       .defer = true,
       .zeroinit = true,
       .line_directives = true,
-      .warn_safety = false,
-      .flatten_headers = true,
-      .compiler = NULL,
-      .include_paths = NULL,
-      .include_count = 0,
-      .defines = NULL,
-      .define_count = 0,
-      .compiler_flags = NULL,
-      .compiler_flags_count = 0,
-      .force_includes = NULL,
-      .force_include_count = 0};
+      .flatten_headers = true};
 }
 
 // Feature flag check macro
@@ -139,7 +129,7 @@ static const char *get_tmp_dir(void)
   if (tmpdir && tmpdir[0])
   {
     size_t len = strlen(tmpdir);
-    if (len > 0 && len < PATH_MAX - 2)
+    if (len < PATH_MAX - 2)
     {
       strcpy(tmp_buf, tmpdir);
       char last = tmp_buf[len - 1];
@@ -383,32 +373,12 @@ static void out_uint(unsigned long long v)
 
 static void out_line(int line_no, const char *file)
 {
-  // Emit GCC linemarker format: # N "file"
-  // This is compatible with -fpreprocessed (unlike #line N "file")
-  // and is what cc -E itself outputs.
-  char buf[PATH_MAX + 32];
-  int n = 0;
-  buf[n++] = '#';
-  buf[n++] = ' ';
-  // Convert line_no to string
-  char num[24];
-  char *p = num + sizeof(num);
-  unsigned long long v = line_no;
-  do
-  {
-    *--p = '0' + v % 10;
-  } while (v /= 10);
-  int numlen = num + sizeof(num) - p;
-  memcpy(buf + n, p, numlen);
-  n += numlen;
-  buf[n++] = ' ';
-  buf[n++] = '"';
-  int flen = strlen(file);
-  memcpy(buf + n, file, flen);
-  n += flen;
-  buf[n++] = '"';
-  buf[n++] = '\n';
-  out_str(buf, n);
+  // GCC linemarker format: # N "file" (compatible with -fpreprocessed)
+  OUT_LIT("# ");
+  out_uint(line_no);
+  OUT_LIT(" \"");
+  out_str(file, strlen(file));
+  OUT_LIT("\"\n");
 }
 
 // System header tracking (for non-flattened output)
@@ -852,11 +822,8 @@ static int label_table_lookup(char *name, int name_len)
 // Typedef tracking for zero-init
 static void typedef_table_reset(void)
 {
-  if (typedef_table.entries)
-  {
-    free(typedef_table.entries);
-    typedef_table.entries = NULL;
-  }
+  free(typedef_table.entries);
+  typedef_table.entries = NULL;
   typedef_table.count = 0;
   typedef_table.capacity = 0;
   hashmap_clear(&typedef_table.name_map);
@@ -999,16 +966,20 @@ static void parse_enum_constants(Token *tok, int scope_depth)
   }
 }
 
+// Helper: look up a typedef entry by token, or NULL if not found/not identifier
+static TypedefEntry *typedef_lookup(Token *tok)
+{
+  if (!is_identifier_like(tok))
+    return NULL;
+  int idx = typedef_get_index(tok->loc, tok->len);
+  return idx >= 0 ? &typedef_table.entries[idx] : NULL;
+}
+
 // Check if token is a known typedef (exact match only, no heuristic)
 static bool is_known_typedef(Token *tok)
 {
-  if (!is_identifier_like(tok))
-    return false;
-  int idx = typedef_get_index(tok->loc, tok->len);
-  if (idx < 0)
-    return false;
-  TypedefEntry *e = &typedef_table.entries[idx];
-  return !e->is_shadow && !e->is_enum_const;
+  TypedefEntry *e = typedef_lookup(tok);
+  return e && !e->is_shadow && !e->is_enum_const;
 }
 
 // Check if token is a known typedef or looks like a system typedef (e.g., size_t, __rlim_t)
@@ -1021,9 +992,7 @@ static bool is_typedef_like(Token *tok)
   if (idx >= 0)
   {
     TypedefEntry *e = &typedef_table.entries[idx];
-    if (!e->is_shadow && !e->is_enum_const)
-      return true; // Known typedef
-    return false;  // Shadowed or enum constant
+    return !e->is_shadow && !e->is_enum_const;
   }
   // Heuristic: system typedefs not seen during transpilation
   // Matches *_t (size_t, time_t) and __* (glibc internals) but not __func()
@@ -1039,40 +1008,22 @@ static bool is_typedef_like(Token *tok)
 // Check if token is a known VLA typedef (search most recent first for shadowing)
 static bool is_vla_typedef(Token *tok)
 {
-  if (!is_identifier_like(tok))
-    return false;
-  int idx = typedef_get_index(tok->loc, tok->len);
-  if (idx < 0)
-    return false;
-  TypedefEntry *e = &typedef_table.entries[idx];
-  if (e->is_shadow)
-    return false;
-  return e->is_vla;
+  TypedefEntry *e = typedef_lookup(tok);
+  return e && !e->is_shadow && e->is_vla;
 }
 
 // Check if token is a known void typedef (e.g., typedef void Void)
 static bool is_void_typedef(Token *tok)
 {
-  if (!is_identifier_like(tok))
-    return false;
-  int idx = typedef_get_index(tok->loc, tok->len);
-  if (idx < 0)
-    return false;
-  TypedefEntry *e = &typedef_table.entries[idx];
-  if (e->is_shadow)
-    return false;
-  return e->is_void;
+  TypedefEntry *e = typedef_lookup(tok);
+  return e && !e->is_shadow && e->is_void;
 }
 
 // Check if token is a known enum constant (compile-time constant)
 static bool is_known_enum_const(Token *tok)
 {
-  if (!is_identifier_like(tok))
-    return false;
-  int idx = typedef_get_index(tok->loc, tok->len);
-  if (idx < 0)
-    return false;
-  return typedef_table.entries[idx].is_enum_const;
+  TypedefEntry *e = typedef_lookup(tok);
+  return e && e->is_enum_const;
 }
 
 // Given a struct/union/enum keyword, find its opening brace if it has a body.
@@ -1273,90 +1224,14 @@ static void scan_labels_in_function(Token *tok)
   if (!needs_labels)
     return;
 
-  Token *t = tok->next;
-  Token *prev = NULL;
-  int depth = 1;
-  int struct_depth = 0;
-
-  while (t && t->kind != TK_EOF)
+  TokenWalker w;
+  walker_init(&w, tok->next, 1);
+  while (walker_next(&w))
   {
-    uint32_t tag = t->tag;
-
-    // Skip struct/union/enum body openings (keyword -> past '{')
-    if (__builtin_expect(tag & TT_SUE, 0))
-    {
-      Token *brace = find_struct_body_brace(t);
-      if (brace)
-      {
-        while (t != brace)
-        {
-          prev = t;
-          t = t->next;
-        }
-        struct_depth++;
-        depth++;
-        prev = t;
-        t = t->next;
-        continue;
-      }
-    }
-
-    // Skip _Generic(...)
-    if (__builtin_expect(tag & TT_GENERIC, 0))
-    {
-      prev = t;
-      t = t->next;
-      if (t && equal(t, "("))
-        t = skip_balanced(t, "(", ")");
-      prev = NULL;
-      continue;
-    }
-
-    // Brace tracking — fast path for single-char tokens
-    if (t->len == 1)
-    {
-      char c = t->loc[0];
-      if (c == '{')
-        depth++;
-      else if (c == '}')
-      {
-        if (depth <= 1)
-          break;
-        if (struct_depth > 0)
-          struct_depth--;
-        depth--;
-      }
-    }
-    else if (__builtin_expect(t->flags & TF_IS_DIGRAPH, 0))
-    {
-      if (_equal_1(t, '{'))
-        depth++;
-      else if (_equal_1(t, '}'))
-      {
-        if (depth <= 1)
-          break;
-        if (struct_depth > 0)
-          struct_depth--;
-        depth--;
-      }
-    }
-
-    // Label check: identifier followed by ':' (not '::')
-    // Filters: ternary '?:', case/default, bitfields
-    if (struct_depth == 0 && (t->kind == TK_IDENT || t->kind == TK_KEYWORD))
-    {
-      Token *after = skip_gnu_attributes(t->next);
-      if (after && after->len == 1 && after->loc[0] == ':' &&
-          !(after->next && after->next->len == 1 && after->next->loc[0] == ':') &&
-          !(prev && prev->len == 1 && prev->loc[0] == '?') &&
-          !(prev && (prev->tag & (TT_CASE | TT_DEFAULT))))
-      {
-        label_table_add(t->loc, t->len, depth);
-      }
-    }
-
-    prev = t;
-    t = t->next;
+    Token *label = walker_check_label(&w);
+    if (label)
+      label_table_add(label->loc, label->len, w.depth);
+    walker_advance(&w);
   }
 }
 
@@ -1559,8 +1434,7 @@ static bool is_void_function_decl(Token *tok)
       tok = tok->next;
   }
 
-  // Must be at 'void' now
-  // Must be at 'void' or a typedef alias for void now
+  // Must be at 'void' or a typedef alias for void
   if (!tok || (!equal(tok, "void") && !is_void_typedef(tok)))
     return false;
   tok = tok->next;
@@ -1761,9 +1635,7 @@ static bool is_type_keyword(Token *tok)
 {
   if (tok->kind != TK_KEYWORD && tok->kind != TK_IDENT)
     return false;
-  if (tok->tag & TT_TYPE)
-    return true;
-  return is_typedef_like(tok);
+  return (tok->tag & TT_TYPE) || is_typedef_like(tok);
 }
 
 // Check if token can be used as a variable name in a declarator.
@@ -2154,39 +2026,26 @@ static DeclResult parse_declarator(Token *tok, bool emit)
 static bool is_var_declaration(Token *type_end)
 {
   DeclResult decl = parse_declarator(type_end, false);
-  if (!decl.var_name)
-    return false;
-
-  Token *check = decl.end;
-  if (!check)
+  if (!decl.var_name || !decl.end)
     return false;
 
   // Statement expression initializer: type name = ({...})
   // Must NOT be handled by zero-init — the stmt expr may contain defer etc.
-  if (equal(check, "="))
+  if (equal(decl.end, "="))
   {
-    Token *after_eq = check->next;
-    if (after_eq && equal(after_eq, "(") && after_eq->next && equal(after_eq->next, "{"))
-      return false;
-    return true;
+    Token *after_eq = decl.end->next;
+    return !(after_eq && equal(after_eq, "(") && after_eq->next && equal(after_eq->next, "{"));
   }
 
-  if (equal(check, ",") || equal(check, ";"))
-    return true;
-
-  // A '(' here means function declaration (not handled)
-  return false;
+  return equal(decl.end, ",") || equal(decl.end, ";");
 }
 
 // Check if token after 'raw' indicates 'raw' is being used as an identifier, not the keyword
 // Returns true if 'raw' is followed by something that makes it look like a declaration
 static bool is_raw_declaration_context(Token *after_raw)
 {
-  if (!after_raw)
-    return false;
-  // If followed by a type keyword, typedef, qualifier, or attribute, 'raw' is the prism keyword
-  return is_type_keyword(after_raw) || is_known_typedef(after_raw) ||
-         (after_raw->tag & (TT_QUALIFIER | TT_SUE));
+  return after_raw && (is_type_keyword(after_raw) || is_known_typedef(after_raw) ||
+                       (after_raw->tag & (TT_QUALIFIER | TT_SUE)));
 }
 
 // Emit tokens from start through semicolon
@@ -2356,17 +2215,7 @@ static Token *try_zero_init_decl(Token *tok)
   // Check for "switch skip hole" - declarations directly in switch body
   // without braces can have their initialization skipped by case jumps.
   // This catches both: before first case label, and between case labels.
-  bool in_switch_scope_unbraced = false;
-  for (int d = ctx->defer_depth - 1; d >= 0; d--)
-  {
-    if (defer_stack[d].is_switch)
-    {
-      in_switch_scope_unbraced = true;
-      break;
-    }
-    if (!defer_stack[d].is_switch)
-      break;
-  }
+  bool in_switch_scope_unbraced = ctx->defer_depth > 0 && defer_stack[ctx->defer_depth - 1].is_switch;
 
   Token *warn_loc = tok;
   Token *pragma_start = tok;
@@ -2751,24 +2600,13 @@ static void handle_case_default(Token *tok)
 static Token *handle_sue_body(Token *tok)
 {
   bool is_enum = equal(tok, "enum");
-  Token *t = tok->next;
-  while (t && (t->kind == TK_IDENT || (t->tag & TT_ATTR)))
-  {
-    if (t->tag & TT_ATTR)
-    {
-      t = t->next;
-      if (t && equal(t, "("))
-        t = skip_balanced(t, "(", ")");
-    }
-    else
-      t = t->next;
-  }
-  if (!t || !equal(t, "{"))
+  Token *brace = find_struct_body_brace(tok);
+  if (!brace)
     return NULL;
 
   if (is_enum)
-    parse_enum_constants(t, ctx->defer_depth);
-  while (tok != t)
+    parse_enum_constants(brace, ctx->defer_depth);
+  while (tok != brace)
   {
     emit_tok(tok);
     tok = tok->next;
@@ -2796,8 +2634,7 @@ static Token *handle_open_brace(Token *tok)
   }
   if (ctrl.pending && !(ctrl.next_scope & NS_SWITCH))
     ctrl.next_scope |= NS_CONDITIONAL;
-  uint8_t _ns = ctrl.next_scope;
-  ctrl = (ControlFlow){.next_scope = _ns};
+  ctrl = (ControlFlow){.next_scope = ctrl.next_scope};
 
   // Detect statement expression: ({
   if (last_emitted && equal(last_emitted, "("))
@@ -3170,13 +3007,19 @@ static char *preprocess_with_cc(const char *input_file)
 
 static void reset_transpiler_state(void)
 {
-  ctx->defer_depth = ctx->struct_depth = ctx->conditional_block_depth =
-      ctx->generic_paren_depth = ctx->stmt_expr_count = ctx->last_line_no = 0;
+  ctx->defer_depth = 0;
+  ctx->struct_depth = 0;
+  ctx->conditional_block_depth = 0;
+  ctx->generic_paren_depth = 0;
+  ctx->stmt_expr_count = 0;
+  ctx->last_line_no = 0;
   ctx->ret_counter = 0;
   ctx->last_filename = NULL;
-  ctx->last_system_header = ctx->current_func_returns_void =
-      ctx->current_func_has_setjmp = ctx->current_func_has_asm =
-          ctx->current_func_has_vfork = false;
+  ctx->last_system_header = false;
+  ctx->current_func_returns_void = false;
+  ctx->current_func_has_setjmp = false;
+  ctx->current_func_has_asm = false;
+  ctx->current_func_has_vfork = false;
   ctx->at_stmt_start = true;
   control_flow_reset();
   last_emitted = NULL;
@@ -3634,6 +3477,7 @@ PRISM_API void prism_reset(void)
   defer_stack_capacity = 0;
 
   free(label_table.labels);
+  hashmap_clear(&label_table.name_map);
   label_table = (LabelTable){0};
 
   system_includes_reset();
@@ -3859,9 +3703,6 @@ static int install(char *self_path)
     return 0;
   }
 
-  // Remove first (can't overwrite running executable, but can remove and replace)
-  remove(INSTALL_PATH);
-
   // Try direct copy first (avoids sudo if we have permission)
   FILE *input = fopen(self_path, "rb");
   FILE *output = input ? fopen(INSTALL_PATH, "wb") : NULL;
@@ -3897,7 +3738,6 @@ use_sudo:;
   fprintf(stderr, "Failed to install (run as Administrator?)\n");
   return 1;
 #else
-  // Remove first (can't overwrite running executable, but can remove and replace)
   char **argv = build_argv("sudo", "rm", "-f", INSTALL_PATH, NULL);
   run_command(argv);
   free_argv(argv);
@@ -4415,12 +4255,7 @@ static int install_from_source(Cli *cli)
   char **argv_cc = argv_builder_finish(&ab);
 
   if (cli->verbose)
-  {
-    fprintf(stderr, "[prism] Compiling:");
-    for (int i = 0; argv_cc[i]; i++)
-      fprintf(stderr, " %s", argv_cc[i]);
-    fprintf(stderr, "\n");
-  }
+    verbose_argv(argv_cc);
 
   int status = run_command(argv_cc);
   free_argv(argv_cc);
@@ -4488,7 +4323,7 @@ static int compile_sources(Cli *cli)
   else
   {
     // Multi-source: transpile to temp files, then compile together
-    char **temps = calloc((unsigned)cli->source_count, sizeof(char *));
+    char **temps = calloc(cli->source_count, sizeof(char *));
     if (!temps)
       die("Out of memory");
 

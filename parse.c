@@ -178,20 +178,8 @@ struct Token
 // Token accessors
 static inline bool tok_at_bol(Token *tok) { return tok->flags & TF_AT_BOL; }
 static inline bool tok_has_space(Token *tok) { return tok->flags & TF_HAS_SPACE; }
-static inline void tok_set_at_bol(Token *tok, bool v)
-{
-    if (v)
-        tok->flags |= TF_AT_BOL;
-    else
-        tok->flags &= ~TF_AT_BOL;
-}
-static inline void tok_set_has_space(Token *tok, bool v)
-{
-    if (v)
-        tok->flags |= TF_HAS_SPACE;
-    else
-        tok->flags &= ~TF_HAS_SPACE;
-}
+static inline void tok_set_at_bol(Token *tok, bool v) { tok->flags = v ? (tok->flags | TF_AT_BOL) : (tok->flags & ~TF_AT_BOL); }
+static inline void tok_set_has_space(Token *tok, bool v) { tok->flags = v ? (tok->flags | TF_HAS_SPACE) : (tok->flags & ~TF_HAS_SPACE); }
 
 // Forward declaration for error reporting (used by arena and hashmap OOM handling)
 static noreturn void error(char *fmt, ...);
@@ -230,44 +218,29 @@ static ArenaBlock *arena_new_block(size_t min_size, size_t default_size)
     return block;
 }
 
-static void *arena_alloc(Arena *arena, size_t size) __attribute__((unused));
-static void *arena_alloc(Arena *arena, size_t size)
+// Ensure arena has room for 'size' bytes, growing if needed
+static void arena_ensure(Arena *arena, size_t size)
 {
-    if (size == 0)
-        size = 1;
-
-    // Align to 8 bytes for proper alignment of any type
-    size = (size + 7) & ~(size_t)7;
-
-    if (!arena->current || arena->current->used + size > arena->current->capacity)
+    if (arena->current && arena->current->used + size <= arena->current->capacity)
+        return;
+    // Try reusing the next block in the chain (from a previous arena_reset cycle)
+    if (arena->current && arena->current->next &&
+        arena->current->next->used + size <= arena->current->next->capacity)
     {
-        // Try reusing the next block in the chain (from a previous arena_reset cycle)
-        if (arena->current && arena->current->next &&
-            arena->current->next->used + size <= arena->current->next->capacity)
-        {
-            arena->current = arena->current->next;
-            // used is already 0 from arena_reset
-        }
-        else
-        {
-            size_t block_size = arena->default_block_size ? arena->default_block_size : ARENA_DEFAULT_BLOCK_SIZE;
-            ArenaBlock *block = arena_new_block(size, block_size);
-            if (arena->current)
-            {
-                // Preserve the rest of the chain so arena_free can free all blocks
-                block->next = arena->current->next;
-                arena->current->next = block;
-            }
-            else
-                arena->head = block;
-            arena->current = block;
-        }
+        arena->current = arena->current->next;
+        return;
     }
-
-    void *ptr = arena->current->data + arena->current->used;
-    arena->current->used += size;
-    memset(ptr, 0, size);
-    return ptr;
+    size_t block_size = arena->default_block_size ? arena->default_block_size : ARENA_DEFAULT_BLOCK_SIZE;
+    ArenaBlock *block = arena_new_block(size, block_size);
+    if (arena->current)
+    {
+        // Preserve the rest of the chain so arena_free can free all blocks
+        block->next = arena->current->next;
+        arena->current->next = block;
+    }
+    else
+        arena->head = block;
+    arena->current = block;
 }
 
 // Like arena_alloc but without zeroing - caller must initialize all fields
@@ -276,30 +249,7 @@ static void *arena_alloc_uninit(Arena *arena, size_t size)
     if (size == 0)
         size = 1;
     size = (size + 7) & ~(size_t)7;
-
-    if (!arena->current || arena->current->used + size > arena->current->capacity)
-    {
-        // Try reusing the next block in the chain (from a previous arena_reset cycle)
-        if (arena->current && arena->current->next &&
-            arena->current->next->used + size <= arena->current->next->capacity)
-        {
-            arena->current = arena->current->next;
-        }
-        else
-        {
-            size_t block_size = arena->default_block_size ? arena->default_block_size : ARENA_DEFAULT_BLOCK_SIZE;
-            ArenaBlock *block = arena_new_block(size, block_size);
-            if (arena->current)
-            {
-                block->next = arena->current->next;
-                arena->current->next = block;
-            }
-            else
-                arena->head = block;
-            arena->current = block;
-        }
-    }
-
+    arena_ensure(arena, size);
     void *ptr = arena->current->data + arena->current->used;
     arena->current->used += size;
     return ptr;
@@ -568,13 +518,24 @@ static void hashmap_delete2(HashMap *map, char *key, int keylen)
 
 static void hashmap_clear(HashMap *map)
 {
-    if (map->buckets)
-    {
-        free(map->buckets);
-        map->buckets = NULL;
-    }
+    free(map->buckets);
+    map->buckets = NULL;
     map->capacity = 0;
     map->used = 0;
+}
+
+// Free all keys in a hashmap and clear it
+static void hashmap_free_keys(HashMap *map)
+{
+    if (!map->buckets)
+        return;
+    for (int i = 0; i < map->capacity; i++)
+    {
+        HashEntry *ent = &map->buckets[i];
+        if (ent->key && ent->key != TOMBSTONE)
+            free(ent->key);
+    }
+    hashmap_clear(map);
 }
 
 // Filename interning - avoids duplicating identical filename strings
@@ -647,38 +608,11 @@ static void free_file(File *f)
     free(f);
 }
 
-// Free all interned filenames and clear the map
-static void free_filename_intern_map(void)
-{
-    if (!ctx->filename_intern_map.buckets)
-        return;
-    for (int i = 0; i < ctx->filename_intern_map.capacity; i++)
-    {
-        HashEntry *ent = &ctx->filename_intern_map.buckets[i];
-        if (ent->key && ent->key != TOMBSTONE)
-        {
-            free(ent->key); // Free the interned string
-        }
-    }
-    free(ctx->filename_intern_map.buckets);
-    ctx->filename_intern_map.buckets = NULL;
-    ctx->filename_intern_map.capacity = 0;
-    ctx->filename_intern_map.used = 0;
-}
+static void free_filename_intern_map(void) { hashmap_free_keys(&ctx->filename_intern_map); }
 
-// Free file view cache keys and clear the map (File structs are freed separately)
 static void free_file_view_cache(void)
 {
-    if (!ctx->file_view_cache.buckets)
-        return;
-    // Free allocated keys
-    for (int i = 0; i < ctx->file_view_cache.capacity; i++)
-    {
-        HashEntry *ent = &ctx->file_view_cache.buckets[i];
-        if (ent->key && ent->key != TOMBSTONE)
-            free(ent->key);
-    }
-    hashmap_clear(&ctx->file_view_cache);
+    hashmap_free_keys(&ctx->file_view_cache);
 }
 
 static inline File *tok_file(Token *tok)
@@ -1224,11 +1158,7 @@ static inline __attribute__((always_inline)) Token *new_token(TokenKind kind, ch
     tok->tag = 0;
     tok->line_no = ctx->tok_line_no + ctx->current_file->line_delta;
     tok->file_idx = ctx->current_file->file_no;
-    tok->flags = 0;
-    if (ctx->at_bol)
-        tok->flags |= TF_AT_BOL;
-    if (ctx->has_space)
-        tok->flags |= TF_HAS_SPACE;
+    tok->flags = (ctx->at_bol ? TF_AT_BOL : 0) | (ctx->has_space ? TF_HAS_SPACE : 0);
     ctx->at_bol = ctx->has_space = false;
     return tok;
 }
@@ -1326,12 +1256,8 @@ static void classify_number(Token *tok)
     bool is_hex = (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'));
     for (char *q = p; q < p + tok->len; q++)
     {
-        if (*q == '.' || *q == 'p' || *q == 'P')
-        {
-            tok->flags |= TF_IS_FLOAT;
-            return;
-        }
-        if (!is_hex && (*q == 'e' || *q == 'E'))
+        char c = *q;
+        if (c == '.' || c == 'p' || c == 'P' || (!is_hex && (c == 'e' || c == 'E')))
         {
             tok->flags |= TF_IS_FLOAT;
             return;
@@ -1378,9 +1304,7 @@ static File *new_file(char *name, int file_no, char *contents)
     file->file_no = file_no;
     file->contents = contents;
     file->contents_len = strlen(contents);
-    file->line_delta = 0;
     file->owns_contents = true;
-    file->is_system = false;
     return file;
 }
 
@@ -1411,7 +1335,6 @@ static File *new_file_view(const char *name, File *base, int line_delta, bool is
     file->contents = base->contents;
     file->contents_len = base->contents_len;
     file->line_delta = line_delta;
-    file->owns_contents = false;
     file->is_system = is_system;
     file->is_include_entry = is_include_entry;
 
