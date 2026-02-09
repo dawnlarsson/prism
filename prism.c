@@ -1433,6 +1433,49 @@ static Token *skip_balanced(Token *tok, char open, char close)
   return tok;
 }
 
+// Check if tokens between after_paren and brace form K&R parameter declarations.
+// K&R pattern: type ident [, ident]* ; ... repeated until {
+// Example: int func(a, b) int a; int b; {
+static bool is_knr_params(Token *after_paren, Token *brace)
+{
+  Token *t = after_paren;
+  bool saw_any = false;
+  while (t && t != brace && t->kind != TK_EOF)
+  {
+    // Each K&R declaration starts with a type specifier
+    TypeSpecResult type = parse_type_specifier(t);
+    if (!type.saw_type)
+      return false;
+    t = type.end;
+    // Skip declarators: pointers, identifiers, arrays, commas
+    bool saw_ident = false;
+    while (t && t != brace && !equal(t, ";"))
+    {
+      if (equal(t, "*") || (t->tag & TT_QUALIFIER) ||
+          equal(t, "__restrict") || equal(t, "__restrict__"))
+        t = t->next;
+      else if (t->kind == TK_IDENT)
+      {
+        saw_ident = true;
+        t = t->next;
+      }
+      else if (equal(t, "["))
+        t = skip_balanced(t, '[', ']');
+      else if (equal(t, ","))
+        t = t->next;
+      else if (equal(t, "("))
+        t = skip_balanced(t, '(', ')');
+      else
+        return false;
+    }
+    if (!saw_ident || !equal(t, ";"))
+      return false;
+    t = t->next;
+    saw_any = true;
+  }
+  return saw_any && t == brace;
+}
+
 // Check if token starts a void function declaration
 // Handles: void func(, static void func(, __attribute__((...)) void func(, etc.
 static bool is_void_function_decl(Token *tok)
@@ -1744,11 +1787,25 @@ static TypeSpecResult parse_type_specifier(Token *tok)
     if (equal(tok, "typeof") || equal(tok, "__typeof__") || equal(tok, "__typeof") ||
         equal(tok, "typeof_unqual"))
     {
+      bool is_unqual = equal(tok, "typeof_unqual");
       r.saw_type = true;
       r.has_typeof = true;
       tok = tok->next;
       if (tok && equal(tok, "("))
-        tok = skip_balanced(tok, '(', ')');
+      {
+        Token *end = skip_balanced(tok, '(', ')');
+        // Check for volatile inside typeof() (typeof_unqual strips qualifiers)
+        if (!is_unqual)
+        {
+          for (Token *t = tok->next; t && t != end; t = t->next)
+            if (equal(t, "volatile"))
+            {
+              r.has_volatile = true;
+              break;
+            }
+        }
+        tok = end;
+      }
       r.end = tok;
       continue;
     }
@@ -2377,7 +2434,7 @@ static Token *emit_expr_to_semicolon(Token *tok)
     prev_tok = tok;
     tok = tok->next;
 
-    if (prev_tok && (equal(prev_tok, "{") || equal(prev_tok, ";") || equal(prev_tok, "}")))
+    if (prev_tok && (equal(prev_tok, "{") || equal(prev_tok, ";") || equal(prev_tok, "}") || equal(prev_tok, ":")))
       expr_at_stmt_start = true;
     else
       expr_at_stmt_start = false;
@@ -2936,10 +2993,30 @@ static void build_pp_argv(ArgvBuilder *ab, const char *input_file)
   if (FEAT(F_ZEROINIT))
     argv_builder_add(ab, "-D__PRISM_ZEROINIT__=1");
 
-  // Add standard feature test macros for POSIX/GNU compatibility
+  // Add standard feature test macros for POSIX/GNU compatibility (unless user already defined them)
 #ifndef _WIN32
-  argv_builder_add(ab, "-D_POSIX_C_SOURCE=200809L");
-  argv_builder_add(ab, "-D_GNU_SOURCE");
+  {
+    bool user_has_posix = false, user_has_gnu = false;
+    for (int i = 0; i < ctx->extra_define_count; i++)
+    {
+      if (strncmp(ctx->extra_defines[i], "_POSIX_C_SOURCE", 15) == 0)
+        user_has_posix = true;
+      if (strncmp(ctx->extra_defines[i], "_GNU_SOURCE", 11) == 0)
+        user_has_gnu = true;
+    }
+    for (int i = 0; i < ctx->extra_compiler_flags_count; i++)
+    {
+      const char *f = ctx->extra_compiler_flags[i];
+      if (strncmp(f, "-D_POSIX_C_SOURCE", 17) == 0 || strncmp(f, "-U_POSIX_C_SOURCE", 17) == 0)
+        user_has_posix = true;
+      if (strncmp(f, "-D_GNU_SOURCE", 13) == 0 || strncmp(f, "-U_GNU_SOURCE", 13) == 0)
+        user_has_gnu = true;
+    }
+    if (!user_has_posix)
+      argv_builder_add(ab, "-D_POSIX_C_SOURCE=200809L");
+    if (!user_has_gnu)
+      argv_builder_add(ab, "-D_GNU_SOURCE");
+  }
 #endif
 
   // Add force-includes
@@ -3123,6 +3200,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
 
   bool next_func_returns_void = false; // Track void functions at top level
   Token *prev_toplevel_tok = NULL;     // Track previous token at top level for function detection
+  Token *last_toplevel_paren = NULL;   // Track last ')' at top level for K&R detection
 
   // Walk tokens and emit
   while (tok->kind != TK_EOF)
@@ -3155,12 +3233,14 @@ static int transpile_tokens(Token *tok, FILE *fp)
           // Function definition detection at top level (must precede handle_open_brace)
           if (ctx->defer_depth == 0 && FEAT(F_DEFER))
           {
-            if (prev_toplevel_tok && equal(prev_toplevel_tok, ")"))
+            if ((prev_toplevel_tok && equal(prev_toplevel_tok, ")")) ||
+                (last_toplevel_paren && is_knr_params(last_toplevel_paren->next, tok)))
             {
               scan_labels_in_function(tok);
               ctx->current_func_returns_void = next_func_returns_void;
             }
             next_func_returns_void = false;
+            last_toplevel_paren = NULL;
           }
           tok = handle_open_brace(tok);
           continue;
@@ -3236,7 +3316,11 @@ static int transpile_tokens(Token *tok, FILE *fp)
           ctx->generic_paren_depth--;
       }
       if (ctx->defer_depth == 0)
+      {
+        if (match_ch(tok, ')'))
+          last_toplevel_paren = tok;
         prev_toplevel_tok = tok;
+      }
       emit_tok(tok);
       tok = tok->next;
       continue;
@@ -3354,12 +3438,14 @@ static int transpile_tokens(Token *tok, FILE *fp)
     // Function definition detection at top level (defer_depth check first to skip inside bodies)
     if (ctx->defer_depth == 0 && FEAT(F_DEFER) && equal(tok, "{"))
     {
-      if (prev_toplevel_tok && equal(prev_toplevel_tok, ")"))
+      if ((prev_toplevel_tok && equal(prev_toplevel_tok, ")")) ||
+          (last_toplevel_paren && is_knr_params(last_toplevel_paren->next, tok)))
       {
         scan_labels_in_function(tok);
         ctx->current_func_returns_void = next_func_returns_void;
       }
       next_func_returns_void = false;
+      last_toplevel_paren = NULL;
     }
 
     // Void function detection — keywords and void typedef identifiers at top level
@@ -3454,7 +3540,11 @@ static int transpile_tokens(Token *tok, FILE *fp)
 
     // Track previous token at top level for function detection
     if (ctx->defer_depth == 0)
+    {
+      if (match_ch(tok, ')'))
+        last_toplevel_paren = tok;
       prev_toplevel_tok = tok;
+    }
 
     // Default: emit token as-is
     emit_tok(tok);

@@ -240,26 +240,79 @@ static int posix_spawn_file_actions_addopen(posix_spawn_file_actions_t *fa, int 
     return 0;
 }
 
-// Build a command line string from argv (with quoting for spaces)
+// Build a command line string from argv, following MSVC/CommandLineToArgvW
+// escaping rules: backslashes are literal unless immediately before a double
+// quote, in which case they must be doubled. Embedded quotes are escaped as \".
 static char *win32_argv_to_cmdline(char **argv)
 {
+    // First pass: compute total length needed
     size_t total = 0;
     for (int i = 0; argv[i]; i++)
-        total += strlen(argv[i]) + 3; // quotes + space
+    {
+        if (i > 0)
+            total++; // space separator
+        const char *s = argv[i];
+        int needs_quote = (s[0] == '\0' || strchr(s, ' ') || strchr(s, '\t') || strchr(s, '"'));
+        if (needs_quote)
+            total += 2; // opening and closing quotes
+        for (const char *c = s; *c; c++)
+        {
+            if (*c == '"')
+                total += 2; // \" escape
+            else if (*c == '\\')
+            {
+                size_t run = 0;
+                while (c[run] == '\\')
+                    run++;
+                if (c[run] == '"' || (c[run] == '\0' && needs_quote))
+                    total += run * 2; // double backslashes before quote
+                else
+                    total += run; // literal backslashes
+                c += run - 1;
+            }
+            else
+                total++;
+        }
+    }
+
     char *cmdline = (char *)malloc(total + 1);
     if (!cmdline)
         return NULL;
     char *p = cmdline;
+
+    // Second pass: emit quoted/escaped arguments
     for (int i = 0; argv[i]; i++)
     {
         if (i > 0)
             *p++ = ' ';
-        int needs_quote = (strchr(argv[i], ' ') || strchr(argv[i], '\t') || argv[i][0] == '\0');
+        const char *s = argv[i];
+        int needs_quote = (s[0] == '\0' || strchr(s, ' ') || strchr(s, '\t') || strchr(s, '"'));
         if (needs_quote)
             *p++ = '"';
-        size_t len = strlen(argv[i]);
-        memcpy(p, argv[i], len);
-        p += len;
+        for (const char *c = s; *c; c++)
+        {
+            if (*c == '\\')
+            {
+                size_t run = 0;
+                while (c[run] == '\\')
+                    run++;
+                // Double backslashes only if followed by " or end-of-string inside quotes
+                if (c[run] == '"' || (c[run] == '\0' && needs_quote))
+                    for (size_t j = 0; j < run * 2; j++)
+                        *p++ = '\\';
+                else
+                    for (size_t j = 0; j < run; j++)
+                        *p++ = '\\';
+                c += run - 1;
+            }
+            else if (*c == '"')
+            {
+                *p++ = '\\';
+                *p++ = '"';
+            }
+            else
+                *p++ = *c;
+        }
         if (needs_quote)
             *p++ = '"';
     }

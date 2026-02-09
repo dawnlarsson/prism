@@ -11925,9 +11925,9 @@ void test_generic_stmt_expr_with_defer(void)
     defer log_append("outer");
     int val = _Generic(x,
         int: ({
-            int tmp = x * 2;
-            tmp;
-        }),
+                           int tmp = x * 2;
+                           tmp;
+                       }),
         default: 0);
     CHECK_EQ(val, 20, "generic stmt expr value");
     log_append("body");
@@ -11958,6 +11958,117 @@ void test_assert_still_active_after_reinclusion(void)
     triggered = 1;
     CHECK_EQ(triggered, 1, "assert active after re-include without NDEBUG");
 }
+
+static int knr_defer_counter;
+
+void knr_defer_func(a, b, out) int a;
+int b;
+int *out;
+{
+    defer knr_defer_counter += 100;
+    if (a > b)
+    {
+        *out = a;
+        return;
+    }
+    *out = b;
+}
+
+void test_knr_defer_goto(void)
+{
+    int result;
+    knr_defer_counter = 0;
+    knr_defer_func(10, 5, &result);
+    CHECK_EQ(result, 10, "K&R defer result when a > b");
+    CHECK_EQ(knr_defer_counter, 100, "K&R defer ran on return (a > b)");
+    knr_defer_counter = 0;
+    knr_defer_func(3, 8, &result);
+    CHECK_EQ(result, 8, "K&R defer result when b > a");
+    CHECK_EQ(knr_defer_counter, 100, "K&R defer ran on return (b > a)");
+}
+
+typedef int KnrTypedef;
+
+static int knr_typedef_defer_flag;
+
+void knr_typedef_param(x, y, out)
+    KnrTypedef x;
+int y;
+int *out;
+{
+    defer knr_typedef_defer_flag = 1;
+    *out = x + y;
+}
+
+void test_knr_typedef_param_defer(void)
+{
+    int result;
+    knr_typedef_defer_flag = 0;
+    knr_typedef_param(5, 3, &result);
+    CHECK_EQ(result, 8, "K&R typedef param result");
+    CHECK_EQ(knr_typedef_defer_flag, 1, "K&R typedef param defer ran");
+}
+
+static int knr_label_defer_count;
+
+void knr_multi_label(a, result) int a;
+int *result;
+{
+    defer knr_label_defer_count++;
+    if (a == 1)
+        goto first;
+    if (a == 2)
+        goto second;
+    *result = a;
+    return;
+first:
+    *result = 10;
+    return;
+second:
+    *result = 20;
+}
+
+void test_knr_multi_label(void)
+{
+    int r;
+    knr_label_defer_count = 0;
+    knr_multi_label(1, &r);
+    CHECK_EQ(r, 10, "K&R multi label first");
+    CHECK_EQ(knr_label_defer_count, 1, "K&R multi label first defer");
+    knr_label_defer_count = 0;
+    knr_multi_label(2, &r);
+    CHECK_EQ(r, 20, "K&R multi label second");
+    CHECK_EQ(knr_label_defer_count, 1, "K&R multi label second defer");
+    knr_label_defer_count = 0;
+    knr_multi_label(3, &r);
+    CHECK_EQ(r, 3, "K&R multi label end");
+    CHECK_EQ(knr_label_defer_count, 1, "K&R multi label end defer");
+}
+
+#ifdef __GNUC__
+void test_label_zeroinit_in_stmt_expr(void)
+{
+    int val = ({ start: (void)0; int x; x; });
+    CHECK_EQ(val, 0, "labeled decl in stmt expr zeroed");
+
+    int val2 = ({ lbl: int a; int b; a + b; });
+    CHECK_EQ(val2, 0, "labeled multi-decl in stmt expr zeroed");
+
+    int val3 = ({ int pre; goto mid; mid: int post; pre + post; });
+    CHECK_EQ(val3, 0, "goto-mid labeled decl zeroed");
+}
+#endif
+
+#ifdef __GNUC__
+void test_typeof_volatile_inner_zeroed(void)
+{
+    typeof(volatile int) v;
+    CHECK(v == 0, "typeof(volatile int) zeroed");
+
+    typeof(volatile short) s;
+    CHECK(s == 0, "typeof(volatile short) zeroed");
+}
+#endif
 
 void run_issue_validation_tests(void)
 {
@@ -11998,6 +12109,13 @@ void run_issue_validation_tests(void)
 #endif
     test_assert_active_by_default();
     test_assert_still_active_after_reinclusion();
+    test_knr_defer_goto();
+    test_knr_typedef_param_defer();
+    test_knr_multi_label();
+#ifdef __GNUC__
+    test_label_zeroinit_in_stmt_expr();
+    test_typeof_volatile_inner_zeroed();
+#endif
 }
 
 int main(void)

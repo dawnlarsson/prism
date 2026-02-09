@@ -722,11 +722,17 @@ noreturn void error_tok(Token *tok, const char *fmt, ...)
 
 static void warn_tok(Token *tok, const char *fmt, ...)
 {
+#ifdef PRISM_LIB_MODE
+    (void)tok;
+    (void)fmt;
+    return; // Suppress warnings in library mode — don't pollute host's stderr
+#else
     va_list ap;
     va_start(ap, fmt);
     File *f = tok_file(tok);
     verror_at(f->name, f->contents, tok_line_no(tok), tok->loc, fmt, ap);
     va_end(ap);
+#endif
 }
 
 // Token helpers
