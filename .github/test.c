@@ -12070,6 +12070,22 @@ void test_typeof_volatile_inner_zeroed(void)
 }
 #endif
 
+typedef int *IntPtr;
+void test_raw_star_ptr_decl(void)
+{
+    int x = 42;
+    {
+        defer (void)0;
+        raw IntPtr p;
+        p = &x;
+        CHECK_EQ(*p, 42, "raw typedef ptr declaration");
+
+        raw int *q;
+        q = &x;
+        CHECK_EQ(*q, 42, "raw int *q declaration");
+    }
+}
+
 void run_issue_validation_tests(void)
 {
     printf("\n=== ISSUE VALIDATION TESTS ===\n");
@@ -12116,6 +12132,7 @@ void run_issue_validation_tests(void)
     test_label_zeroinit_in_stmt_expr();
     test_typeof_volatile_inner_zeroed();
 #endif
+    test_raw_star_ptr_decl();
 }
 
 int main(void)

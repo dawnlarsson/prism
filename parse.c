@@ -78,8 +78,8 @@ static const uint8_t ident_char[256] = {
     {                                                          \
         if ((count) >= (cap))                                  \
         {                                                      \
-            int new_cap = (cap) == 0 ? (init_cap) : (cap) * 2; \
-            while (new_cap < (count))                          \
+            size_t new_cap = (cap) == 0 ? (init_cap) : (size_t)(cap) * 2; \
+            while (new_cap < (size_t)(count))                  \
                 new_cap *= 2;                                  \
             T *old_ptr_ = (arr);                               \
             T *tmp = realloc((arr), sizeof(T) * new_cap);      \
@@ -87,6 +87,7 @@ static const uint8_t ident_char[256] = {
             {                                                  \
                 free(old_ptr_);                                \
                 (arr) = NULL;                                  \
+                (cap) = 0;                                     \
                 error("out of memory");                        \
             }                                                  \
             (arr) = tmp;                                       \
@@ -1305,8 +1306,17 @@ static File *new_file(char *name, int file_no, char *contents)
 {
     File *file = calloc(1, sizeof(File));
     if (!file)
+    {
+        free(contents);
         error("out of memory");
+    }
     file->name = strdup(name);
+    if (!file->name)
+    {
+        free(contents);
+        free(file);
+        error("out of memory");
+    }
     file->display_name = file->name;
     file->file_no = file_no;
     file->contents = contents;
@@ -1660,11 +1670,15 @@ static Token *tokenize(File *file)
 // to avoid writing/reading temp files.
 static Token *tokenize_buffer(char *name, char *buf)
 {
-    if (!ctx->keyword_map.capacity)
-        init_keyword_map();
-
     if (!buf)
         return NULL;
+
+    // Init keyword map before new_file() takes ownership of buf.
+    // If init_keyword_map() fails (OOM → longjmp in lib mode), buf hasn't
+    // been stored yet, so the caller can still free it. By failing early
+    // here, we avoid leaking buf.
+    if (!ctx->keyword_map.capacity)
+        init_keyword_map();
 
     File *file = new_file(name, ctx->input_file_count, buf);
     add_input_file(file);
@@ -1717,9 +1731,12 @@ void tokenizer_teardown(bool full)
     else
         arena_reset(&ctx->main_arena);
     free_file_view_cache();
-    for (int i = 0; i < ctx->input_file_count; i++)
-        free_file(ctx->input_files[i]);
-    free(ctx->input_files);
+    if (ctx->input_files)
+    {
+        for (int i = 0; i < ctx->input_file_count; i++)
+            free_file(ctx->input_files[i]);
+        free(ctx->input_files);
+    }
     ctx->input_files = NULL;
     ctx->input_file_count = 0;
     ctx->input_file_capacity = 0;

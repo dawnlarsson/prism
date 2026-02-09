@@ -503,9 +503,12 @@ static void emit_system_includes(void)
 static void system_includes_reset(void)
 {
   hashmap_clear(&system_includes);
-  for (int i = 0; i < ctx->system_include_count; i++)
-    free(system_include_list[i]);
-  free(system_include_list);
+  if (system_include_list)
+  {
+      for (int i = 0; i < ctx->system_include_count; i++)
+          free(system_include_list[i]);
+      free(system_include_list);
+  }
   system_include_list = NULL;
   ctx->system_include_count = 0;
   system_include_capacity = 0;
@@ -2133,6 +2136,7 @@ static bool is_var_declaration(Token *type_end)
 static bool is_raw_declaration_context(Token *after_raw)
 {
   return after_raw && (is_type_keyword(after_raw) || is_known_typedef(after_raw) ||
+                       equal(after_raw, "*") ||
                        (after_raw->tag & (TT_QUALIFIER | TT_SUE)));
 }
 
@@ -2782,7 +2786,10 @@ typedef struct
 static inline void argv_builder_add(ArgvBuilder *ab, const char *arg)
 {
   ENSURE_ARRAY_CAP(ab->data, ab->count + 2, ab->capacity, 64, char *);
-  ab->data[ab->count++] = strdup(arg);
+  ab->data[ab->count] = strdup(arg);
+  if (!ab->data[ab->count])
+    error("out of memory");
+  ab->count++;
   ab->data[ab->count] = NULL;
 }
 #define argv_builder_finish(ab) ((ab)->data)
@@ -2940,21 +2947,12 @@ static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suf
     return -1;
   close(fd);
 #else
-  int fd = mkstemp(buf);
+  // Fallback: use mkstemps where available, otherwise mkstemp.
+  // mkstemps is widely available on any system that has mkstemp.
+  int fd = suffix_len > 0 ? mkstemps(buf, suffix_len) : mkstemp(buf);
   if (fd < 0)
     return -1;
   close(fd);
-  if (suffix_len > 0)
-  {
-    unlink(buf);
-    size_t len = strlen(buf);
-    if (len + suffix_len < bufsize)
-    {
-      buf[len] = '.';
-      buf[len + 1] = 'c';
-      buf[len + 2] = '\0';
-    }
-  }
 #endif
   return 0;
 }
@@ -3143,6 +3141,11 @@ static int transpile_tokens(Token *tok, FILE *fp);
 // This is the original interface used by the CLI and library API.
 static int transpile(char *input_file, char *output_file)
 {
+  // Ensure keyword map is initialized before allocating preprocessor buffer.
+  // If init fails (OOM → longjmp in lib mode), we haven't allocated pp_buf yet.
+  if (!ctx->keyword_map.capacity)
+    init_keyword_map();
+
   // Run system preprocessor via pipe — no temp files
   char *pp_buf = preprocess_with_cc(input_file);
   if (!pp_buf)
