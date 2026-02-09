@@ -130,7 +130,7 @@ static ssize_t posix_read(int fd, void *buf, size_t count)
     return (ssize_t)_read(fd, buf, to_read);
 }
 
-// tries up to 100 unique names with _mktemp_s + _sopen_s
+// tries up to 10000 unique names with _mktemp_s + _sopen_s
 static int mkstemp(char *tmpl)
 {
     // Save template for retry
@@ -139,7 +139,7 @@ static int mkstemp(char *tmpl)
     if (!try_buf)
         return -1;
 
-    for (int attempt = 0; attempt < 100; attempt++)
+    for (int attempt = 0; attempt < 10000; attempt++)
     {
         memcpy(try_buf, tmpl, len + 1);
         if (_mktemp_s(try_buf, len + 1) != 0)
@@ -553,7 +553,7 @@ static ssize_t posix_read(int fd, void *buf, size_t count)
     return (ssize_t)_read(fd, buf, to_read);
 }
 
-// tries up to 100 unique names with _mktemp_s + _sopen_s
+// tries up to 10000 unique names with _mktemp_s + _sopen_s
 static int mkstemp(char *tmpl)
 {
     // Save template for retry
@@ -562,7 +562,7 @@ static int mkstemp(char *tmpl)
     if (!try_buf)
         return -1;
 
-    for (int attempt = 0; attempt < 100; attempt++)
+    for (int attempt = 0; attempt < 10000; attempt++)
     {
         memcpy(try_buf, tmpl, len + 1);
         if (_mktemp_s(try_buf, len + 1) != 0)

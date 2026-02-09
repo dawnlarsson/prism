@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.109.0"
+#define PRISM_VERSION "0.110.0"
 
 #ifndef _WIN32
 #ifndef _GNU_SOURCE
@@ -468,8 +468,30 @@ static void emit_system_includes(void)
   if (ctx->system_include_count == 0)
     return;
 
-  // Emit feature test macros that prism uses during preprocessing
-  // These must come before any system includes to enable GNU/POSIX extensions
+  // Emit user-specified defines (take priority over built-in feature test macros)
+  for (int i = 0; i < ctx->extra_define_count; i++)
+  {
+    const char *def = ctx->extra_defines[i];
+    const char *eq = strchr(def, '=');
+    OUT_LIT("#ifndef ");
+    if (eq)
+    {
+      out_str(def, eq - def);
+      OUT_LIT("\n#define ");
+      out_str(def, eq - def);
+      OUT_LIT(" ");
+      out_str(eq + 1, strlen(eq + 1));
+    }
+    else
+    {
+      out_str(def, strlen(def));
+      OUT_LIT("\n#define ");
+      out_str(def, strlen(def));
+    }
+    OUT_LIT("\n#endif\n");
+  }
+
+  // Emit built-in feature test macros (guarded to not override user defines)
   OUT_LIT("#ifndef _POSIX_C_SOURCE\n#define _POSIX_C_SOURCE 200809L\n#endif\n"
           "#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n\n");
 
@@ -2011,6 +2033,14 @@ static DeclResult parse_declarator(Token *tok, bool emit)
   if (equal(tok, "("))
   {
     Token *peek = tok->next;
+    // Skip __attribute__((...)) before '*' in parenthesized declarators
+    // e.g. int (__attribute__((unused)) *p);
+    while (peek && (peek->tag & TT_ATTR))
+    {
+      peek = peek->next;
+      if (peek && equal(peek, "("))
+        peek = skip_balanced(peek, "(", ")");
+    }
     if (!equal(peek, "*") && !equal(peek, "("))
     {
       r.end = NULL;

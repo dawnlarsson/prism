@@ -11648,7 +11648,10 @@ void test_raw_as_loop_counter(void)
 
 void test_raw_struct_field_access(void)
 {
-    struct { int raw; } s;
+    struct
+    {
+        int raw;
+    } s;
     s.raw = 77;
     CHECK_EQ(s.raw, 77, "raw as struct field access");
 }
@@ -11665,10 +11668,8 @@ void test_generic_nested_default_in_switch_defer(void)
         int r = _Generic(x,
             int: _Generic((long){0L},
                 long: 50,
-                default: 0
-            ),
-            default: -1
-        );
+                default: 0),
+            default: -1);
         CHECK_EQ(r, 50, "nested _Generic default in switch+defer");
         log_append("B");
         break;
@@ -11740,10 +11741,124 @@ void test_vla_typedef_pointer_vs_value(void)
     VlaArr val;
     int all_zero = 1;
     for (int i = 0; i < n; i++)
-        if (val[i] != 0) all_zero = 0;
+        if (val[i] != 0)
+            all_zero = 0;
     CHECK(all_zero, "VLA typedef value zeroed");
     VlaArr *ptr;
     CHECK(ptr == NULL, "VLA typedef pointer null-init");
+}
+
+void test_vla_zeroed_each_loop_iteration(void)
+{
+    int n = 8;
+    for (int i = 0; i < 3; i++)
+    {
+        int buf[n];
+        int all_zero = 1;
+        for (int j = 0; j < n; j++)
+            if (buf[j] != 0)
+                all_zero = 0;
+        CHECK(all_zero, "VLA zeroed on each loop iteration");
+        for (int j = 0; j < n; j++)
+            buf[j] = 42 + i;
+    }
+}
+
+void test_raw_vla_skips_zeroinit(void)
+{
+    int n = 4;
+    int sum = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        raw int buf[n];
+        buf[0] = i;
+        sum += buf[0];
+    }
+    CHECK_EQ(sum, 3, "raw VLA in loop compiles and runs");
+}
+
+void test_atomic_int_zeroed(void)
+{
+    _Atomic int a;
+    CHECK(a == 0, "atomic int zero-initialized");
+}
+
+void test_atomic_struct_zeroed(void)
+{
+    typedef struct
+    {
+        int x;
+        int y;
+    } AtomicTestS;
+    _Atomic AtomicTestS a;
+    unsigned char zeros[sizeof(a)];
+    memset(zeros, 0, sizeof(zeros));
+    CHECK(memcmp(&a, zeros, sizeof(a)) == 0, "atomic struct zero-initialized");
+}
+
+void test_atomic_specifier_struct_zeroed(void)
+{
+    typedef struct
+    {
+        int a;
+        int b;
+    } AtomicSpecS;
+    _Atomic(AtomicSpecS) v;
+    unsigned char zeros[sizeof(v)];
+    memset(zeros, 0, sizeof(zeros));
+    CHECK(memcmp(&v, zeros, sizeof(v)) == 0, "atomic specifier struct zero-initialized");
+}
+
+void test_attr_before_type_zeroed(void)
+{
+    __attribute__((unused)) int x;
+    CHECK_EQ(x, 0, "attr before type zero-init");
+}
+
+void test_attr_between_type_and_var_zeroed(void)
+{
+    int __attribute__((unused)) x;
+    CHECK_EQ(x, 0, "attr between type and var zero-init");
+}
+
+void test_attr_after_var_zeroed(void)
+{
+    int x __attribute__((unused));
+    CHECK_EQ(x, 0, "attr after var zero-init");
+}
+
+void test_attr_pointer_zeroed(void)
+{
+    int *__attribute__((unused)) p;
+    CHECK(p == NULL, "attr on pointer zero-init");
+}
+
+static void __attribute__((noinline)) check_attr_paren_ptr(void)
+{
+    int(__attribute__((unused)) * p);
+    CHECK(p == NULL, "attr in paren pointer zero-init");
+}
+
+void test_attr_paren_ptr_zeroed(void)
+{
+    pollute_stack_for_switch();
+    check_attr_paren_ptr();
+}
+
+void test_multi_attr_zeroed(void)
+{
+    __attribute__((unused)) __attribute__((aligned(sizeof(int)))) int x;
+    CHECK_EQ(x, 0, "multiple attrs zero-init");
+}
+
+void test_attr_struct_var_zeroed(void)
+{
+    struct
+    {
+        int a;
+        int b;
+    } __attribute__((aligned(sizeof(int)))) s;
+    CHECK(s.a == 0 && s.b == 0, "attr on struct var zero-init");
 }
 
 void run_issue_validation_tests(void)
@@ -11765,6 +11880,18 @@ void run_issue_validation_tests(void)
     test_typedef_nested_braceless_restore();
     test_typedef_braceless_while_restore();
     test_vla_typedef_pointer_vs_value();
+    test_vla_zeroed_each_loop_iteration();
+    test_raw_vla_skips_zeroinit();
+    test_atomic_int_zeroed();
+    test_atomic_struct_zeroed();
+    test_atomic_specifier_struct_zeroed();
+    test_attr_before_type_zeroed();
+    test_attr_between_type_and_var_zeroed();
+    test_attr_after_var_zeroed();
+    test_attr_pointer_zeroed();
+    test_attr_paren_ptr_zeroed();
+    test_multi_attr_zeroed();
+    test_attr_struct_var_zeroed();
 }
 
 int main(void)
