@@ -1537,9 +1537,12 @@ static char *scan_pp_number(char *p)
             // Accept digits, letters (hex, suffixes, extensions), dot, underscore
             p++;
         }
-        else if (c == '\'' && (IS_XDIGIT(p[1]) || IS_DIGIT(p[1])))
+        else if (c == '\'' && ident_char[(unsigned char)p[1]])
         {
-            // C23 digit separator: accept ' if followed by a digit (hex or decimal)
+            // C23 digit separator: accept ' followed by any identifier char
+            // (digit or nondigit), matching the pp-number grammar:
+            //   pp-number ' digit
+            //   pp-number ' nondigit
             p++;
         }
         else

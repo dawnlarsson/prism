@@ -321,15 +321,18 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
     DWORD orig_in_flags = 0, orig_out_flags = 0, orig_err_flags = 0;
     if (si.dwFlags & STARTF_USESTDHANDLES)
     {
-        if (hStdIn != INVALID_HANDLE_VALUE) {
+        if (hStdIn != INVALID_HANDLE_VALUE)
+        {
             GetHandleInformation(hStdIn, &orig_in_flags);
             SetHandleInformation(hStdIn, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
         }
-        if (hStdOut != INVALID_HANDLE_VALUE) {
+        if (hStdOut != INVALID_HANDLE_VALUE)
+        {
             GetHandleInformation(hStdOut, &orig_out_flags);
             SetHandleInformation(hStdOut, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
         }
-        if (hStdErr != INVALID_HANDLE_VALUE) {
+        if (hStdErr != INVALID_HANDLE_VALUE)
+        {
             GetHandleInformation(hStdErr, &orig_err_flags);
             SetHandleInformation(hStdErr, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
         }
@@ -741,15 +744,18 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
     DWORD orig_in_flags = 0, orig_out_flags = 0, orig_err_flags = 0;
     if (si.dwFlags & STARTF_USESTDHANDLES)
     {
-        if (hStdIn != INVALID_HANDLE_VALUE) {
+        if (hStdIn != INVALID_HANDLE_VALUE)
+        {
             GetHandleInformation(hStdIn, &orig_in_flags);
             SetHandleInformation(hStdIn, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
         }
-        if (hStdOut != INVALID_HANDLE_VALUE) {
+        if (hStdOut != INVALID_HANDLE_VALUE)
+        {
             GetHandleInformation(hStdOut, &orig_out_flags);
             SetHandleInformation(hStdOut, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
         }
-        if (hStdErr != INVALID_HANDLE_VALUE) {
+        if (hStdErr != INVALID_HANDLE_VALUE)
+        {
             GetHandleInformation(hStdErr, &orig_err_flags);
             SetHandleInformation(hStdErr, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
         }

@@ -5,7 +5,7 @@
 
 Prism is a single-file transpiler that makes C safer without changing how you write it.
 
-- **1220 tests** — edge cases, control flow, nightmares, trying hard to break Prism
+- **1234 tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Proper transpiler** — tracks typedefs, respects scope, catches unsafe patterns
 - **Opt-out features** Disable parts of the transpiler, like zero-init, with CLI flags

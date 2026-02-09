@@ -11592,7 +11592,11 @@ void test_typedef_table_scope_resilience(void)
     CHECK_EQ(restored, 0, "typedef table: restored after shadow");
 
     {
-        typedef struct { int x; int y; } TTR_B;
+        typedef struct
+        {
+            int x;
+            int y;
+        } TTR_B;
         TTR_B b;
         CHECK(b.x == 0 && b.y == 0, "typedef table: struct in scope");
     }
@@ -11628,6 +11632,120 @@ void test_setjmp_detection_direct(void)
     CHECK_LOG("BD", "defer works in function without setjmp");
 }
 
+void test_raw_as_function_pointer_var(void)
+{
+    int (*raw)(const char *) = (int (*)(const char *))strlen;
+    CHECK(raw("hello") == 5, "raw as function pointer variable");
+}
+
+void test_raw_as_loop_counter(void)
+{
+    int sum = 0;
+    for (int raw = 0; raw < 5; raw++)
+        sum += raw;
+    CHECK_EQ(sum, 10, "raw as loop counter");
+}
+
+void test_raw_struct_field_access(void)
+{
+    struct { int raw; } s;
+    s.raw = 77;
+    CHECK_EQ(s.raw, 77, "raw as struct field access");
+}
+
+void test_generic_nested_default_in_switch_defer(void)
+{
+    log_reset();
+    int x = 1;
+    switch (x)
+    {
+    case 1:
+    {
+        defer log_append("D");
+        int r = _Generic(x,
+            int: _Generic((long){0L},
+                long: 50,
+                default: 0
+            ),
+            default: -1
+        );
+        CHECK_EQ(r, 50, "nested _Generic default in switch+defer");
+        log_append("B");
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("BDE", "nested _Generic defer ordering");
+}
+
+void test_generic_multi_default_switch(void)
+{
+    int x = 1;
+    switch (x)
+    {
+    case 1:
+    {
+        int a = _Generic(x, int: 10, default: 0);
+        int b = _Generic((short){1}, short: 20, default: 0);
+        int c = _Generic((char){1}, char: 30, default: 0);
+        CHECK_EQ(a + b + c, 60, "multiple _Generic defaults in one case");
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void test_typedef_braceless_for_restore(void)
+{
+    typedef int BFT;
+    BFT before;
+    CHECK_EQ(before, 0, "typedef before braceless for");
+    for (int BFT = 0; BFT < 3; BFT++)
+        ;
+    BFT after;
+    CHECK_EQ(after, 0, "typedef after braceless for");
+}
+
+void test_typedef_nested_braceless_restore(void)
+{
+    typedef int NBFT;
+    NBFT before;
+    CHECK_EQ(before, 0, "typedef nested braceless before");
+    for (int NBFT = 0; NBFT < 2; NBFT++)
+        for (int i = 0; i < 1; i++)
+            ;
+    NBFT recovered;
+    CHECK_EQ(recovered, 0, "typedef nested braceless restore");
+}
+
+void test_typedef_braceless_while_restore(void)
+{
+    typedef int WBT;
+    int limit = 0;
+    while (limit++ < 1)
+    {
+        typedef float WBT;
+        WBT f;
+        CHECK(f == 0.0f, "typedef in while body");
+    }
+    WBT after;
+    CHECK_EQ(after, 0, "typedef after while body");
+}
+
+void test_vla_typedef_pointer_vs_value(void)
+{
+    int n = 4;
+    typedef int VlaArr[n];
+    VlaArr val;
+    int all_zero = 1;
+    for (int i = 0; i < n; i++)
+        if (val[i] != 0) all_zero = 0;
+    CHECK(all_zero, "VLA typedef value zeroed");
+    VlaArr *ptr;
+    CHECK(ptr == NULL, "VLA typedef pointer null-init");
+}
+
 void run_issue_validation_tests(void)
 {
     printf("\n=== ISSUE VALIDATION TESTS ===\n");
@@ -11638,6 +11756,15 @@ void run_issue_validation_tests(void)
     test_typedef_table_scope_resilience();
     test_typedef_table_churn();
     test_setjmp_detection_direct();
+    test_raw_as_function_pointer_var();
+    test_raw_as_loop_counter();
+    test_raw_struct_field_access();
+    test_generic_nested_default_in_switch_defer();
+    test_generic_multi_default_switch();
+    test_typedef_braceless_for_restore();
+    test_typedef_nested_braceless_restore();
+    test_typedef_braceless_while_restore();
+    test_vla_typedef_pointer_vs_value();
 }
 
 int main(void)
