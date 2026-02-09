@@ -130,20 +130,33 @@ static ssize_t posix_read(int fd, void *buf, size_t count)
     return (ssize_t)_read(fd, buf, to_read);
 }
 
-// tries up to 10000 unique names with _mktemp_s + _sopen_s
+// tries up to 10000 unique names with randomized template + _sopen_s
 static int mkstemp(char *tmpl)
 {
-    // Save template for retry
+    static const char chars[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     size_t len = strlen(tmpl);
     char *try_buf = (char *)malloc(len + 1);
     if (!try_buf)
         return -1;
 
+    // Find the X's in the template
+    size_t x_start = len;
+    while (x_start > 0 && tmpl[x_start - 1] == 'X')
+        x_start--;
+    size_t x_count = len - x_start;
+
+    // Seed with PID + tick count for initial entropy
+    unsigned int seed = (unsigned int)_getpid() ^ (unsigned int)GetTickCount();
+
     for (int attempt = 0; attempt < 10000; attempt++)
     {
         memcpy(try_buf, tmpl, len + 1);
-        if (_mktemp_s(try_buf, len + 1) != 0)
-            break;
+        // Randomize the X positions ourselves
+        for (size_t i = x_start; i < x_start + x_count; i++)
+        {
+            seed = seed * 1103515245 + 12345;
+            try_buf[i] = chars[(seed >> 16) % (sizeof(chars) - 1)];
+        }
         int fd;
         errno_t err = _sopen_s(&fd, try_buf, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY,
                                _SH_DENYNO, _S_IREAD | _S_IWRITE);

@@ -11861,6 +11861,104 @@ void test_attr_struct_var_zeroed(void)
     CHECK(s.a == 0 && s.b == 0, "attr on struct var zero-init");
 }
 
+void test_switch_no_match_defer_skipped(void)
+{
+    log_reset();
+    int cleanup = 0;
+    switch (99)
+    {
+    case 1:
+    {
+        defer cleanup += 10;
+        log_append("A");
+        break;
+    }
+    case 2:
+    {
+        defer cleanup += 20;
+        log_append("B");
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_EQ(cleanup, 0, "switch no match skips all case defers");
+    CHECK_LOG("E", "switch no match straight to end");
+}
+
+void test_switch_no_default_no_match_with_defer(void)
+{
+    log_reset();
+    int resource = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        defer resource = 0;
+        resource = 1;
+        switch (i + 100)
+        {
+        case 0:
+        {
+            defer log_append("X");
+            break;
+        }
+        }
+        log_append("L");
+    }
+    log_append("E");
+    CHECK_EQ(resource, 0, "defer in loop with unmatched switch");
+    CHECK_LOG("LLLE", "loop continues after unmatched switch");
+}
+
+void test_generic_compound_literal_association(void)
+{
+    int x = 42;
+    int result = _Generic(x,
+        int: ((struct { int v; }){x}).v,
+        default: -1);
+    CHECK_EQ(result, 42, "generic compound literal in association");
+}
+
+#ifdef __GNUC__
+void test_generic_stmt_expr_with_defer(void)
+{
+    log_reset();
+    int x = 10;
+    defer log_append("outer");
+    int val = _Generic(x,
+        int: ({
+            int tmp = x * 2;
+            tmp;
+        }),
+        default: 0);
+    CHECK_EQ(val, 20, "generic stmt expr value");
+    log_append("body");
+}
+
+static void test_generic_stmt_expr_with_defer_wrapper(void)
+{
+    test_generic_stmt_expr_with_defer();
+    CHECK_LOG("bodyouter", "generic stmt expr defer ordering");
+}
+#endif
+
+#include <assert.h>
+void test_assert_active_by_default(void)
+{
+    volatile int triggered = 0;
+    assert(1 == 1);
+    triggered = 1;
+    CHECK_EQ(triggered, 1, "assert true does not abort");
+}
+
+#undef NDEBUG
+#include <assert.h>
+void test_assert_still_active_after_reinclusion(void)
+{
+    volatile int triggered = 0;
+    assert(1 == 1);
+    triggered = 1;
+    CHECK_EQ(triggered, 1, "assert active after re-include without NDEBUG");
+}
+
 void run_issue_validation_tests(void)
 {
     printf("\n=== ISSUE VALIDATION TESTS ===\n");
@@ -11892,6 +11990,14 @@ void run_issue_validation_tests(void)
     test_attr_paren_ptr_zeroed();
     test_multi_attr_zeroed();
     test_attr_struct_var_zeroed();
+    test_switch_no_match_defer_skipped();
+    test_switch_no_default_no_match_with_defer();
+    test_generic_compound_literal_association();
+#ifdef __GNUC__
+    test_generic_stmt_expr_with_defer_wrapper();
+#endif
+    test_assert_active_by_default();
+    test_assert_still_active_after_reinclusion();
 }
 
 int main(void)

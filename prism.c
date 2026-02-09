@@ -396,6 +396,15 @@ static HashMap system_includes;    // Tracks unique system headers to emit
 static char **system_include_list; // Ordered list of includes
 static int system_include_capacity = 0;
 
+// Headers that must not be deduplicated (C standard requires re-includability)
+static bool is_reincludable_header(const char *name)
+{
+  // C11 §7.2: <assert.h> behavior depends on NDEBUG at point of inclusion
+  const char *base = strrchr(name, '/');
+  base = base ? base + 1 : name;
+  return strcmp(base, "assert.h") == 0;
+}
+
 // Collect system headers by detecting actual #include entries (not macro expansions)
 static void collect_system_includes(void)
 {
@@ -407,7 +416,7 @@ static void collect_system_includes(void)
     char *inc = strdup(f->name);
     if (!inc)
       continue;
-    if (hashmap_get(&system_includes, inc, strlen(inc)))
+    if (!is_reincludable_header(inc) && hashmap_get(&system_includes, inc, strlen(inc)))
     {
       free(inc);
       continue;
@@ -3489,6 +3498,8 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
     ctx->error_jmp_set = false;
     result.status = PRISM_ERR_SYNTAX;
     result.error_msg = strdup(ctx->error_msg[0] ? ctx->error_msg : "Unknown error");
+    if (!result.error_msg)
+      result.error_msg = (char *)"out of memory during error reporting";
     result.error_line = ctx->error_line;
     result.error_col = ctx->error_col;
     // Clean up any temp files that were created before the error
