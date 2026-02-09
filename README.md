@@ -1,4 +1,4 @@
-![prism_banner](https://github.com/user-attachments/assets/97c303d0-0d85-4262-8fb3-663a33ce00cd)
+![Prism Banner](https://github.com/user-attachments/assets/051187c2-decd-497e-9beb-b74031eb84ed)
 
 ## Robust C by default
 **A dialect of C with `defer` and automatic zero-initialization.**
