@@ -1200,6 +1200,12 @@ static Token *walker_check_label(TokenWalker *w)
 // Also detects setjmp/longjmp/pthread_exit/vfork and inline asm usage
 // tok should point to the opening '{' of the function body
 //
+// Limitation: detection is token-based and only catches direct calls to
+// setjmp/longjmp/_setjmp/_longjmp/sigsetjmp/siglongjmp/pthread_exit/vfork.
+// Indirect calls through function pointers or wrapper functions (e.g.
+// "my_longjmp(buf, 1)") are NOT detected. In such cases, defer cleanup
+// code may execute incorrectly if a longjmp crosses a defer scope.
+//
 // Performance: this is a hot function (~77K tokens scanned per run).
 // Uses a two-phase approach: quick pre-scan for goto/setjmp/vfork/asm,
 // then full label scan only if the function contains goto statements.
@@ -2317,13 +2323,15 @@ static Token *try_zero_init_decl(Token *tok)
   if (!FEAT(F_ZEROINIT) || ctx->defer_depth <= 0 || ctx->struct_depth > 0)
     return NULL;
 
-  // Check for "switch skip hole" - declarations before first case label
-  bool in_switch_before_case = false;
+  // Check for "switch skip hole" - declarations directly in switch body
+  // without braces can have their initialization skipped by case jumps.
+  // This catches both: before first case label, and between case labels.
+  bool in_switch_scope_unbraced = false;
   for (int d = ctx->defer_depth - 1; d >= 0; d--)
   {
-    if (defer_stack[d].is_switch && !defer_stack[d].seen_case_label)
+    if (defer_stack[d].is_switch)
     {
-      in_switch_before_case = true;
+      in_switch_scope_unbraced = true;
       break;
     }
     if (!defer_stack[d].is_switch)
@@ -2397,12 +2405,13 @@ static Token *try_zero_init_decl(Token *tok)
   if (!is_var_declaration(type.end))
     return NULL;
 
-  // Error if in switch before case label
-  if (in_switch_before_case && !is_raw)
+  // Error if in switch scope without braces
+  if (in_switch_scope_unbraced && !is_raw)
   {
     error_tok(warn_loc,
-              "variable declaration before first 'case' label in switch. "
-              "Move this declaration before the switch, or use 'raw' to suppress zero-init.");
+              "variable declaration directly in switch body without braces. "
+              "Wrap in braces: 'case N: { int x; ... }' to ensure safe zero-initialization, "
+              "or use 'raw' to suppress zero-init.");
   }
 
   // Emit pragmas and type
@@ -2487,6 +2496,9 @@ static Token *handle_defer_keyword(Token *tok)
       error_tok(tok, "defer cannot be at top level of statement expression; wrap in a block");
       break;
     }
+  // setjmp/longjmp safety: only direct calls are detected by scan_labels_in_function.
+  // Indirect calls via function pointers or wrappers are not caught (see limitation
+  // comment on scan_labels_in_function).
   if (ctx->current_func_has_setjmp)
     error_tok(tok, "defer cannot be used in functions that call setjmp/longjmp/pthread_exit");
   if (ctx->current_func_has_vfork)
@@ -3575,6 +3587,10 @@ PRISM_API void prism_free(PrismResult *r)
 // Reset all transpiler state for clean reuse
 PRISM_API void prism_reset(void)
 {
+  // Clear typedef table before freeing file contents, since typedef entries
+  // hold pointers into the token stream (which points into file data).
+  typedef_table_reset();
+
   tokenizer_teardown(true);
 
   for (int i = 0; i < defer_stack_capacity; i++)
@@ -3590,7 +3606,6 @@ PRISM_API void prism_reset(void)
   free(label_table.labels);
   label_table = (LabelTable){0};
 
-  typedef_table_reset();
   system_includes_reset();
 
   free(stmt_expr_levels);

@@ -7508,8 +7508,7 @@ void test_generic_default_first_association(void)
     CHECK_LOG("bodycleanupend", "_Generic(v, default: x) doesn't clear defer stack");
 }
 
-// Bug 2: _Generic default collision with switch defer cleanup
-// Currently FAILS: Prism incorrectly thinks "_Generic(..., default:...)" is a case label
+// _Generic default collision with switch defer cleanup
 void test_generic_default_collision(void)
 {
     log_reset();
@@ -11469,6 +11468,178 @@ void run_bulletproof_regression_tests(void)
     test_deep_pointer_nesting();
 }
 
+static void __attribute__((noinline)) pollute_stack_for_switch(void)
+{
+    volatile char garbage[256];
+    for (int i = 0; i < 256; i++)
+        garbage[i] = (char)(0xCC + i);
+    (void)garbage[0];
+}
+
+void test_switch_unbraced_inter_case_decl(void)
+{
+    pollute_stack_for_switch();
+    int result = -1;
+    int selector = 2;
+    switch (selector)
+    {
+    case 1:
+    {
+        int y;
+        result = y;
+        break;
+    }
+    case 2:
+    {
+        int z;
+        result = z;
+        break;
+    }
+    }
+    CHECK_EQ(result, 0, "switch braced inter-case decl zero-init");
+}
+
+void test_switch_unbraced_multi_decl_inter_case(void)
+{
+    pollute_stack_for_switch();
+    int result_a = -1, result_b = -1;
+    switch (3)
+    {
+    case 1:
+    {
+        int a;
+        int b;
+        result_a = a;
+        result_b = b;
+        break;
+    }
+    case 2:
+    {
+        int c;
+        result_a = c;
+        break;
+    }
+    case 3:
+    {
+        int d;
+        int e;
+        result_a = d;
+        result_b = e;
+        break;
+    }
+    }
+    CHECK_EQ(result_a, 0, "switch braced multi-decl inter-case a");
+    CHECK_EQ(result_b, 0, "switch braced multi-decl inter-case b");
+}
+
+void test_generic_default_switch_defer_combo(void)
+{
+    log_reset();
+    int type = 42;
+    switch (type)
+    {
+    case 42:
+    {
+        defer log_append("D");
+        int r1 = _Generic(type, int: 10, default: 20);
+        int r2 = _Generic(type, long: 30, default: 40);
+        CHECK_EQ(r1, 10, "_Generic int match in switch+defer");
+        CHECK_EQ(r2, 40, "_Generic default match in switch+defer");
+        log_append("B");
+        break;
+    }
+    }
+    log_append("E");
+    CHECK_LOG("BDE", "_Generic default in switch doesn't break defer");
+}
+
+void test_generic_default_nested_switch_defer(void)
+{
+    log_reset();
+    int x = 1;
+    switch (x)
+    {
+    case 1:
+    {
+        defer log_append("outer");
+        switch (2)
+        {
+        case 2:
+        {
+            defer log_append("inner");
+            int t = _Generic(x, int: 100, default: 200);
+            CHECK_EQ(t, 100, "nested _Generic in nested switch");
+            log_append("body");
+            break;
+        }
+        }
+        break;
+    }
+    }
+    log_append("end");
+    CHECK_LOG("bodyinnerouterend", "nested _Generic+switch+defer ordering");
+}
+
+void test_typedef_table_scope_resilience(void)
+{
+    typedef int TTR_A;
+    {
+        typedef float TTR_A;
+        TTR_A f;
+        CHECK(f == 0.0f, "typedef table: shadowed type zero-init");
+    }
+    TTR_A restored;
+    CHECK_EQ(restored, 0, "typedef table: restored after shadow");
+
+    {
+        typedef struct { int x; int y; } TTR_B;
+        TTR_B b;
+        CHECK(b.x == 0 && b.y == 0, "typedef table: struct in scope");
+    }
+
+    TTR_A still_works;
+    CHECK_EQ(still_works, 0, "typedef table: still tracks after scope exit");
+}
+
+void test_typedef_table_churn(void)
+{
+    for (int i = 0; i < 50; i++)
+    {
+        typedef int ChurnT;
+        ChurnT v;
+        CHECK(v == 0, "typedef churn iteration");
+        {
+            typedef float ChurnT;
+            ChurnT f;
+            CHECK(f == 0.0f, "typedef churn shadow");
+        }
+    }
+    int final_val;
+    CHECK_EQ(final_val, 0, "typedef churn: no table corruption");
+}
+
+void test_setjmp_detection_direct(void)
+{
+    log_reset();
+    {
+        defer log_append("D");
+        log_append("B");
+    }
+    CHECK_LOG("BD", "defer works in function without setjmp");
+}
+
+void run_issue_validation_tests(void)
+{
+    printf("\n=== ISSUE VALIDATION TESTS ===\n");
+    test_switch_unbraced_inter_case_decl();
+    test_switch_unbraced_multi_decl_inter_case();
+    test_generic_default_switch_defer_combo();
+    test_generic_default_nested_switch_defer();
+    test_typedef_table_scope_resilience();
+    test_typedef_table_churn();
+    test_setjmp_detection_direct();
+}
+
 int main(void)
 {
     printf("=== PRISM TEST SUITE ===\n");
@@ -11511,6 +11682,7 @@ int main(void)
     run_sizeof_var_torture_tests();
     run_logical_op_regression_tests();
     run_bulletproof_regression_tests();
+    run_issue_validation_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);
