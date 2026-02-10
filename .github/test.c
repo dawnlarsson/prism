@@ -12135,6 +12135,566 @@ void run_issue_validation_tests(void)
     test_raw_star_ptr_decl();
 }
 
+// orelse
+
+int orelse_return_null_helper(void *p)
+{
+    int *x = (int *)p orelse return -1;
+    return *x;
+}
+
+void test_orelse_return_null(void)
+{
+    int val = 42;
+    CHECK(orelse_return_null_helper(&val) == 42, "orelse return: non-null passes through");
+    CHECK(orelse_return_null_helper((void *)0) == -1, "orelse return: null triggers return");
+}
+
+int orelse_return_void_ptr_helper(void)
+{
+    char *p = (char *)0 orelse return -1;
+    (void)p;
+    return 0;
+}
+
+void test_orelse_return_cast(void)
+{
+    CHECK(orelse_return_void_ptr_helper() == -1, "orelse return: cast-to-null triggers return");
+}
+
+int orelse_return_expr_helper(int *p)
+{
+    int *x = p orelse return 100 + 23;
+    return *x;
+}
+
+void test_orelse_return_expr(void)
+{
+    int val = 7;
+    CHECK(orelse_return_expr_helper(&val) == 7, "orelse return expr: non-null");
+    CHECK(orelse_return_expr_helper((void *)0) == 123, "orelse return expr: null returns expression");
+}
+
+static int orelse_void_flag = 0;
+
+void orelse_void_return_helper(int *p)
+{
+    int *x = p orelse return;
+    orelse_void_flag = *x;
+}
+
+void test_orelse_return_void(void)
+{
+    orelse_void_flag = 0;
+    int val = 99;
+    orelse_void_return_helper(&val);
+    CHECK(orelse_void_flag == 99, "orelse return void: non-null sets value");
+    orelse_void_flag = 0;
+    orelse_void_return_helper((void *)0);
+    CHECK(orelse_void_flag == 0, "orelse return void: null triggers void return");
+}
+
+void test_orelse_break(void)
+{
+    int *ptrs[4];
+    int a = 10, b = 20;
+    ptrs[0] = &a;
+    ptrs[1] = &b;
+    ptrs[2] = (void *)0;
+    ptrs[3] = &a; // should not be reached
+
+    int sum = 0;
+    for (int i = 0; i < 4; i++)
+    {
+        int *p = ptrs[i] orelse break;
+        sum += *p;
+    }
+    CHECK(sum == 30, "orelse break: stops at null");
+}
+
+void test_orelse_continue(void)
+{
+    int *ptrs[4];
+    int a = 10, b = 20, c = 30;
+    ptrs[0] = &a;
+    ptrs[1] = (void *)0;
+    ptrs[2] = &b;
+    ptrs[3] = &c;
+
+    int sum = 0;
+    for (int i = 0; i < 4; i++)
+    {
+        int *p = ptrs[i] orelse continue;
+        sum += *p;
+    }
+    CHECK(sum == 60, "orelse continue: skips null, processes rest");
+}
+
+int orelse_goto_helper(int *p)
+{
+    int *x = p orelse goto fail;
+    return *x;
+fail:
+    return -999;
+}
+
+void test_orelse_goto(void)
+{
+    int val = 77;
+    CHECK(orelse_goto_helper(&val) == 77, "orelse goto: non-null");
+    CHECK(orelse_goto_helper((void *)0) == -999, "orelse goto: null goes to label");
+}
+
+void test_orelse_fallback(void)
+{
+    int a = 42;
+    int *p = &a;
+    int *q = (int *)0;
+    int *x = p orelse & a;
+    int *y = q orelse & a;
+    CHECK(x == &a, "orelse fallback: non-null keeps value");
+    CHECK(y == &a, "orelse fallback: null replaced with fallback");
+    CHECK(*y == 42, "orelse fallback: fallback value is correct");
+}
+
+void test_orelse_block(void)
+{
+    log_reset();
+    int *p = (int *)0 orelse
+    {
+        log_append("block_hit");
+    }
+    (void)p;
+    CHECK_LOG("block_hit", "orelse block: null triggers block");
+}
+
+void test_orelse_block_nonull(void)
+{
+    log_reset();
+    int val = 1;
+    int *p = &val orelse
+    {
+        log_append("should_not_run");
+    }
+    (void)p;
+    CHECK_LOG("", "orelse block: non-null skips block");
+}
+
+int orelse_defer_return_helper(int *p)
+{
+    log_reset();
+    defer log_append("D");
+    int *x = p orelse return -1;
+    log_append("A");
+    return *x;
+}
+
+void test_orelse_defer_return(void)
+{
+    int val = 5;
+    int r = orelse_defer_return_helper(&val);
+    CHECK(r == 5, "orelse defer return: non-null value");
+    CHECK_LOG("AD", "orelse defer return: non-null defer order");
+
+    r = orelse_defer_return_helper((void *)0);
+    CHECK(r == -1, "orelse defer return: null returns -1");
+    CHECK_LOG("D", "orelse defer return: null runs defers");
+}
+
+int orelse_defer_return_expr_helper(int *p)
+{
+    log_reset();
+    defer log_append("D");
+    int *x = p orelse return 50 + 50;
+    log_append("A");
+    return *x;
+}
+
+void test_orelse_defer_return_expr(void)
+{
+    int r = orelse_defer_return_expr_helper((void *)0);
+    CHECK(r == 100, "orelse defer return expr: null returns 100");
+    CHECK_LOG("D", "orelse defer return expr: defers run");
+}
+
+void test_orelse_defer_break(void)
+{
+    log_reset();
+    int *ptrs[3];
+    int a = 1;
+    ptrs[0] = &a;
+    ptrs[1] = (void *)0;
+    ptrs[2] = &a;
+    int sum = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        defer log_append("L");
+        int *p = ptrs[i] orelse break;
+        sum += *p;
+    }
+    CHECK(sum == 1, "orelse defer break: stops at null");
+    CHECK_LOG("LL", "orelse defer break: defers run for both iterations");
+}
+
+void test_orelse_defer_continue(void)
+{
+    log_reset();
+    int *ptrs[3];
+    int a = 10;
+    ptrs[0] = &a;
+    ptrs[1] = (void *)0;
+    ptrs[2] = &a;
+    int sum = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        defer log_append("L");
+        int *p = ptrs[i] orelse continue;
+        sum += *p;
+    }
+    CHECK(sum == 20, "orelse defer continue: skips null");
+    CHECK_LOG("LLL", "orelse defer continue: defers run for all 3 iters");
+}
+
+int orelse_defer_goto_helper(int *p)
+{
+    log_reset();
+    defer log_append("D");
+    int *x = p orelse goto fail;
+    log_append("ok");
+    return *x;
+fail:
+    log_append("F");
+    return -1;
+}
+
+void test_orelse_defer_goto(void)
+{
+    int val = 7;
+    int r = orelse_defer_goto_helper(&val);
+    CHECK(r == 7, "orelse defer goto: non-null value");
+    CHECK_LOG("okD", "orelse defer goto: non-null defer order");
+
+    r = orelse_defer_goto_helper((void *)0);
+    CHECK(r == -1, "orelse defer goto: null goes to fail");
+    // Same-scope goto doesn't run defers; defers run at function return
+    CHECK_LOG("FD", "orelse defer goto: defers run at return, not at goto");
+}
+
+// --- orelse with simple declaration ---
+
+int orelse_decl_helper(int *p)
+{
+    int *x = p orelse return -1;
+    return *x + 1;
+}
+
+void test_orelse_simple_decl(void)
+{
+    int a = 10;
+    CHECK(orelse_decl_helper(&a) == 11, "orelse simple decl: non-null");
+    CHECK(orelse_decl_helper((void *)0) == -1, "orelse simple decl: null");
+}
+
+// --- orelse with integer types (non-pointer) ---
+
+void test_orelse_int_zero(void)
+{
+    int x = 0 orelse return;
+    // 0 is falsy, so orelse triggers return — we should NOT reach here
+    // But since this test function returns void and we're testing reachability,
+    // let's structure differently:
+    (void)x;
+    // If we get here, x was 0 (falsy) but orelse returned. Actually:
+    // This would return, so test_orelse_int_zero never reaches CHECK.
+    // We need a wrapper.
+}
+
+int orelse_int_nonzero_helper(int val)
+{
+    int x = val orelse return -1;
+    return x + 100;
+}
+
+void test_orelse_int_values(void)
+{
+    CHECK(orelse_int_nonzero_helper(42) == 142, "orelse int: nonzero passes through");
+    CHECK(orelse_int_nonzero_helper(0) == -1, "orelse int: zero triggers return");
+    CHECK(orelse_int_nonzero_helper(1) == 101, "orelse int: 1 passes through");
+}
+
+// --- orelse chained (multiple orelse in sequence) ---
+
+int orelse_chain_helper(int *a, int *b)
+{
+    int *p = a orelse return -1;
+    int *q = b orelse return -2;
+    return *p + *q;
+}
+
+void test_orelse_chain(void)
+{
+    int x = 10, y = 20;
+    CHECK(orelse_chain_helper(&x, &y) == 30, "orelse chain: both non-null");
+    CHECK(orelse_chain_helper((void *)0, &y) == -1, "orelse chain: first null");
+    CHECK(orelse_chain_helper(&x, (void *)0) == -2, "orelse chain: second null");
+}
+
+// --- orelse in loop body ---
+
+void test_orelse_loop_body(void)
+{
+    int a = 5;
+    int *ptrs[] = {&a, &a, (void *)0};
+    int sum = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        int *p = ptrs[i] orelse break;
+        sum += *p;
+    }
+    CHECK(sum == 10, "orelse loop body: sum before null");
+}
+
+// --- orelse nested scopes ---
+
+int orelse_nested_helper(int *outer, int *inner)
+{
+    int *a = outer orelse return -1;
+    {
+        int *b = inner orelse return -2;
+        return *a + *b;
+    }
+}
+
+void test_orelse_nested(void)
+{
+    int x = 3, y = 7;
+    CHECK(orelse_nested_helper(&x, &y) == 10, "orelse nested: both non-null");
+    CHECK(orelse_nested_helper((void *)0, &y) == -1, "orelse nested: outer null");
+    CHECK(orelse_nested_helper(&x, (void *)0) == -2, "orelse nested: inner null");
+}
+
+// --- orelse with struct pointer ---
+
+typedef struct
+{
+    int x;
+    int y;
+} OrelseXY;
+
+void test_orelse_struct_ptr(void)
+{
+    OrelseXY s = {10, 20};
+    OrelseXY *p = &s orelse return;
+    CHECK(p->x == 10, "orelse struct ptr: field x");
+    CHECK(p->y == 20, "orelse struct ptr: field y");
+}
+
+// --- orelse does not fire on non-null ---
+
+void test_orelse_nonnull_passthrough(void)
+{
+    int val = 123;
+    int *p = &val orelse return;
+    CHECK(*p == 123, "orelse nonnull: passthrough correct value");
+}
+
+// --- bare expression orelse ---
+
+static int bare_orelse_flag = 0;
+
+int bare_orelse_return_helper(int val)
+{
+    bare_orelse_flag = 0;
+    val orelse return -1;
+    bare_orelse_flag = 1;
+    return val + 10;
+}
+
+void test_bare_orelse_return(void)
+{
+    CHECK(bare_orelse_return_helper(5) == 15, "bare orelse return: nonzero continues");
+    CHECK(bare_orelse_flag == 1, "bare orelse return: flag set after nonzero");
+    CHECK(bare_orelse_return_helper(0) == -1, "bare orelse return: zero triggers return");
+    CHECK(bare_orelse_flag == 0, "bare orelse return: flag not set after zero");
+}
+
+void test_bare_orelse_break(void)
+{
+    int vals[] = {3, 5, 0, 7};
+    int sum = 0;
+    for (int i = 0; i < 4; i++)
+    {
+        vals[i] orelse break;
+        sum += vals[i];
+    }
+    CHECK(sum == 8, "bare orelse break: sums until zero");
+}
+
+void test_bare_orelse_continue(void)
+{
+    int vals[] = {3, 0, 5, 0, 7};
+    int sum = 0;
+    for (int i = 0; i < 5; i++)
+    {
+        vals[i] orelse continue;
+        sum += vals[i];
+    }
+    CHECK(sum == 15, "bare orelse continue: skips zeros");
+}
+
+int bare_orelse_goto_helper(int val)
+{
+    val orelse goto fail;
+    return val + 1;
+fail:
+    return -1;
+}
+
+void test_bare_orelse_goto(void)
+{
+    CHECK(bare_orelse_goto_helper(10) == 11, "bare orelse goto: nonzero");
+    CHECK(bare_orelse_goto_helper(0) == -1, "bare orelse goto: zero jumps to fail");
+}
+
+// --- bare orelse with defer ---
+
+int bare_orelse_defer_helper(int val)
+{
+    log_reset();
+    defer log_append("D");
+    val orelse return -1;
+    log_append("ok");
+    return val;
+}
+
+void test_bare_orelse_defer(void)
+{
+    int r = bare_orelse_defer_helper(10);
+    CHECK(r == 10, "bare orelse defer: nonzero value");
+    CHECK_LOG("okD", "bare orelse defer: nonzero log");
+    r = bare_orelse_defer_helper(0);
+    CHECK(r == -1, "bare orelse defer: zero returns -1");
+    CHECK_LOG("D", "bare orelse defer: zero runs defers");
+}
+
+// --- orelse in while loop ---
+
+void test_orelse_while_loop(void)
+{
+    int a = 1, b = 2;
+    int *ptrs[] = {&a, &b, (void *)0};
+    int i = 0;
+    int sum = 0;
+    while (i < 3)
+    {
+        int *p = ptrs[i] orelse break;
+        sum += *p;
+        i++;
+    }
+    CHECK(sum == 3, "orelse while: break on null");
+    CHECK(i == 2, "orelse while: iteration count");
+}
+
+// --- orelse in do-while ---
+
+void test_orelse_do_while(void)
+{
+    int a = 5, b = 10;
+    int *ptrs[] = {&a, &b, (void *)0};
+    int i = 0;
+    int sum = 0;
+    do
+    {
+        int *p = ptrs[i] orelse break;
+        sum += *p;
+        i++;
+    } while (i < 3);
+    CHECK(sum == 15, "orelse do-while: break on null");
+}
+
+// --- orelse with function call init ---
+
+static int *get_ptr_or_null(int *p) { return p; }
+
+int orelse_funcall_helper(int *p)
+{
+    int *x = get_ptr_or_null(p) orelse return -1;
+    return *x;
+}
+
+void test_orelse_funcall(void)
+{
+    int val = 88;
+    CHECK(orelse_funcall_helper(&val) == 88, "orelse funcall: non-null");
+    CHECK(orelse_funcall_helper((void *)0) == -1, "orelse funcall: null from func");
+}
+
+// --- orelse with ternary in init ---
+
+int orelse_ternary_helper(int flag)
+{
+    int a = 42;
+    int *p = (flag ? &a : (int *)0)orelse return -1;
+    return *p;
+}
+
+void test_orelse_ternary(void)
+{
+    CHECK(orelse_ternary_helper(1) == 42, "orelse ternary: true path non-null");
+    CHECK(orelse_ternary_helper(0) == -1, "orelse ternary: false path null");
+}
+
+// --- orelse identifier shadowing (orelse as struct field is fine in C) ---
+
+typedef struct
+{
+    int value;
+} OrelseTestStruct;
+
+void test_orelse_struct_type(void)
+{
+    // Ensure orelse works with struct pointer types
+    OrelseTestStruct s = {42};
+    OrelseTestStruct *p = &s orelse return;
+    CHECK(p->value == 42, "orelse struct type: struct ptr works");
+}
+
+void run_orelse_tests(void)
+{
+    test_orelse_return_null();
+    test_orelse_return_cast();
+    test_orelse_return_expr();
+    test_orelse_return_void();
+    test_orelse_break();
+    test_orelse_continue();
+    test_orelse_goto();
+    test_orelse_fallback();
+    test_orelse_block();
+    test_orelse_block_nonull();
+    test_orelse_defer_return();
+    test_orelse_defer_return_expr();
+    test_orelse_defer_break();
+    test_orelse_defer_continue();
+    test_orelse_defer_goto();
+    test_orelse_simple_decl();
+    test_orelse_int_values();
+    test_orelse_chain();
+    test_orelse_loop_body();
+    test_orelse_nested();
+    test_orelse_struct_ptr();
+    test_orelse_nonnull_passthrough();
+    test_bare_orelse_return();
+    test_bare_orelse_break();
+    test_bare_orelse_continue();
+    test_bare_orelse_goto();
+    test_bare_orelse_defer();
+    test_orelse_while_loop();
+    test_orelse_do_while();
+    test_orelse_funcall();
+    test_orelse_ternary();
+    test_orelse_struct_type();
+}
+
 int main(void)
 {
     printf("=== PRISM TEST SUITE ===\n");
@@ -12178,6 +12738,7 @@ int main(void)
     run_logical_op_regression_tests();
     run_bulletproof_regression_tests();
     run_issue_validation_tests();
+    run_orelse_tests();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

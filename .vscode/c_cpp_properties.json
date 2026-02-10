@@ -8,7 +8,8 @@
             "defines": [
                 "defer=",
                 "__auto_type=typeof",
-                "raw="
+                "raw=",
+                "orelse=;if(0)"
             ],
             "compilerPath": "/usr/bin/gcc",
             "cStandard": "c11",

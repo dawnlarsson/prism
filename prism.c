@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.111.0"
+#define PRISM_VERSION "0.112.0"
 
 #ifdef _WIN32
 #define PRISM_DEFAULT_CC "cl"
@@ -289,6 +289,7 @@ static DeclResult parse_declarator(Token *tok, bool emit);
 static bool is_type_keyword(Token *tok);
 static void typedef_pop_scope(int scope_depth);
 static TypeSpecResult parse_type_specifier(Token *tok);
+static Token *emit_expr_to_semicolon(Token *tok);
 
 static inline void control_flow_reset(void) { ctrl = (ControlFlow){0}; }
 static void walker_init(TokenWalker *w, Token *start, int initial_depth)
@@ -2214,6 +2215,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
     if (decl.has_init)
     {
       int depth = 0;
+      bool hit_orelse = false;
       while (tok->kind != TK_EOF)
       {
         if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
@@ -2222,8 +2224,194 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
           depth--;
         else if (depth == 0 && (equal(tok, ",") || equal(tok, ";")))
           break;
+        // Detect 'orelse' at depth 0 in initializer
+        if (depth == 0 && (tok->tag & TT_ORELSE) && !is_known_typedef(tok))
+        {
+          hit_orelse = true;
+          break;
+        }
         emit_tok(tok);
         tok = tok->next;
+      }
+
+      if (hit_orelse)
+      {
+        out_char(';');
+
+        for (int i = 0; i < typeof_var_count; i++)
+        {
+          if (type->has_volatile)
+          {
+            OUT_LIT(" { volatile char *_p = (volatile char *)&");
+            out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
+            OUT_LIT("; for (size_t _i = 0; _i < sizeof(");
+            out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
+            OUT_LIT("); _i++) _p[_i] = 0; }");
+          }
+          else
+          {
+            OUT_LIT(" __builtin_memset(&");
+            out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
+            OUT_LIT(", 0, sizeof(");
+            out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
+            OUT_LIT("));");
+          }
+        }
+        free(typeof_vars);
+
+        // Register shadow for typedef names used as variables
+        if (is_known_typedef(decl.var_name))
+        {
+          int shadow_depth = ctrl.for_init ? ctx->defer_depth + 1 : ctx->defer_depth;
+          typedef_add_shadow(decl.var_name->loc, decl.var_name->len, shadow_depth);
+        }
+
+        // Register VLA variables
+        if (effective_vla && decl.var_name)
+        {
+          int vla_depth = ctrl.for_init ? ctx->defer_depth + 1 : ctx->defer_depth;
+          typedef_add_vla_var(decl.var_name->loc, decl.var_name->len, vla_depth);
+        }
+
+        tok = tok->next; // skip 'orelse'
+
+        if (tok->tag & TT_RETURN)
+        {
+          mark_switch_control_exit();
+          tok = tok->next; // skip 'return'
+          OUT_LIT(" if (!");
+          out_str(decl.var_name->loc, decl.var_name->len);
+          OUT_LIT(") {");
+          if (FEAT(F_DEFER) && has_active_defers())
+          {
+            if (equal(tok, ";"))
+            {
+              emit_all_defers();
+              OUT_LIT(" return;");
+              tok = tok->next;
+            }
+            else
+            {
+              bool is_void_cast = equal(tok, "(") && tok->next && equal(tok->next, "void") &&
+                                  tok->next->next && equal(tok->next->next, ")");
+              bool is_void = ctx->current_func_returns_void || is_void_cast;
+              if (!is_void)
+              {
+                OUT_LIT(" __auto_type _prism_ret_");
+                out_uint(ctx->ret_counter);
+                OUT_LIT(" = (");
+              }
+              else
+                OUT_LIT(" (");
+              tok = emit_expr_to_semicolon(tok);
+              OUT_LIT(");");
+              emit_all_defers();
+              if (!is_void)
+              {
+                OUT_LIT(" return _prism_ret_");
+                out_uint(ctx->ret_counter++);
+              }
+              else
+                OUT_LIT(" return");
+              out_char(';');
+              if (equal(tok, ";"))
+                tok = tok->next;
+            }
+          }
+          else
+          {
+            OUT_LIT(" return");
+            if (!equal(tok, ";"))
+            {
+              out_char(' ');
+              tok = emit_expr_to_semicolon(tok);
+            }
+            out_char(';');
+            if (equal(tok, ";"))
+              tok = tok->next;
+          }
+          OUT_LIT(" }");
+          end_statement_after_semicolon();
+          return tok;
+        }
+        else if (tok->tag & (TT_BREAK | TT_CONTINUE))
+        {
+          bool is_break = tok->tag & TT_BREAK;
+          mark_switch_control_exit();
+          OUT_LIT(" if (!");
+          out_str(decl.var_name->loc, decl.var_name->len);
+          OUT_LIT(") {");
+          if (FEAT(F_DEFER) && control_flow_has_defers(is_break))
+            emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
+          out_char(' ');
+          out_str(tok->loc, tok->len);
+          OUT_LIT("; }");
+          tok = tok->next;
+          if (equal(tok, ";"))
+            tok = tok->next;
+          end_statement_after_semicolon();
+          return tok;
+        }
+        else if (tok->tag & TT_GOTO)
+        {
+          mark_switch_control_exit();
+          OUT_LIT(" if (!");
+          out_str(decl.var_name->loc, decl.var_name->len);
+          OUT_LIT(") {");
+          tok = tok->next; // skip 'goto'
+          if (FEAT(F_DEFER) && is_identifier_like(tok))
+          {
+            int target_depth = label_table_lookup(tok->loc, tok->len);
+            if (target_depth < 0)
+              target_depth = ctx->defer_depth;
+            if (goto_has_defers(target_depth))
+              emit_goto_defers(target_depth);
+          }
+          OUT_LIT(" goto ");
+          if (is_identifier_like(tok))
+          {
+            out_str(tok->loc, tok->len);
+            tok = tok->next;
+          }
+          OUT_LIT("; }");
+          if (equal(tok, ";"))
+            tok = tok->next;
+          end_statement_after_semicolon();
+          return tok;
+        }
+        else if (equal(tok, "{"))
+        {
+          OUT_LIT(" if (!");
+          out_str(decl.var_name->loc, decl.var_name->len);
+          out_char(')');
+          ctx->at_stmt_start = false;
+          return tok;
+        }
+        else
+        {
+          OUT_LIT(" if (!");
+          out_str(decl.var_name->loc, decl.var_name->len);
+          OUT_LIT(") ");
+          out_str(decl.var_name->loc, decl.var_name->len);
+          OUT_LIT(" =");
+          int fdepth = 0;
+          while (tok->kind != TK_EOF)
+          {
+            if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
+              fdepth++;
+            else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
+              fdepth--;
+            else if (fdepth == 0 && equal(tok, ";"))
+              break;
+            emit_tok(tok);
+            tok = tok->next;
+          }
+          out_char(';');
+          if (equal(tok, ";"))
+            tok = tok->next;
+          end_statement_after_semicolon();
+          return tok;
+        }
       }
     }
 
@@ -3294,6 +3482,153 @@ static int transpile_tokens(Token *tok, FILE *fp)
         tok = next;
         ctx->at_stmt_start = true;
         continue;
+      }
+
+      // Bare expression orelse
+      if (ctx->defer_depth > 0 && ctx->struct_depth == 0)
+      {
+        int scan_depth = 0;
+        bool found_orelse = false;
+        for (Token *s = tok; s->kind != TK_EOF; s = s->next)
+        {
+          if (equal(s, "(") || equal(s, "[") || equal(s, "{"))
+            scan_depth++;
+          else if (equal(s, ")") || equal(s, "]") || equal(s, "}"))
+          {
+            scan_depth--;
+            if (scan_depth < 0)
+              break;
+          }
+          else if (scan_depth == 0 && equal(s, ";"))
+            break;
+          if (scan_depth == 0 && (s->tag & TT_ORELSE) && !is_known_typedef(s))
+          {
+            found_orelse = true;
+            break;
+          }
+        }
+        if (found_orelse)
+        {
+          OUT_LIT(" if (!(");
+          int edepth = 0;
+          while (tok->kind != TK_EOF)
+          {
+            if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
+              edepth++;
+            else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
+              edepth--;
+            if (edepth == 0 && (tok->tag & TT_ORELSE) && !is_known_typedef(tok))
+              break;
+            emit_tok(tok);
+            tok = tok->next;
+          }
+          OUT_LIT("))");
+          tok = tok->next; // skip 'orelse'
+
+          if (tok->tag & TT_RETURN)
+          {
+            mark_switch_control_exit();
+            tok = tok->next; // skip 'return'
+            OUT_LIT(" {");
+            if (FEAT(F_DEFER) && has_active_defers())
+            {
+              if (equal(tok, ";"))
+              {
+                emit_all_defers();
+                OUT_LIT(" return;");
+                tok = tok->next;
+              }
+              else
+              {
+                bool is_void_cast = equal(tok, "(") && tok->next && equal(tok->next, "void") &&
+                                    tok->next->next && equal(tok->next->next, ")");
+                bool is_void = ctx->current_func_returns_void || is_void_cast;
+                if (!is_void)
+                {
+                  OUT_LIT(" __auto_type _prism_ret_");
+                  out_uint(ctx->ret_counter);
+                  OUT_LIT(" = (");
+                }
+                else
+                  OUT_LIT(" (");
+                tok = emit_expr_to_semicolon(tok);
+                OUT_LIT(");");
+                emit_all_defers();
+                if (!is_void)
+                {
+                  OUT_LIT(" return _prism_ret_");
+                  out_uint(ctx->ret_counter++);
+                }
+                else
+                  OUT_LIT(" return");
+                out_char(';');
+                if (equal(tok, ";"))
+                  tok = tok->next;
+              }
+            }
+            else
+            {
+              OUT_LIT(" return");
+              if (!equal(tok, ";"))
+              {
+                out_char(' ');
+                tok = emit_expr_to_semicolon(tok);
+              }
+              out_char(';');
+              if (equal(tok, ";"))
+                tok = tok->next;
+            }
+            OUT_LIT(" }");
+          }
+          else if (tok->tag & (TT_BREAK | TT_CONTINUE))
+          {
+            bool is_break = tok->tag & TT_BREAK;
+            mark_switch_control_exit();
+            OUT_LIT(" {");
+            if (FEAT(F_DEFER) && control_flow_has_defers(is_break))
+              emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
+            out_char(' ');
+            out_str(tok->loc, tok->len);
+            OUT_LIT("; }");
+            tok = tok->next;
+            if (equal(tok, ";"))
+              tok = tok->next;
+          }
+          else if (tok->tag & TT_GOTO)
+          {
+            mark_switch_control_exit();
+            tok = tok->next; // skip 'goto'
+            OUT_LIT(" {");
+            if (FEAT(F_DEFER) && is_identifier_like(tok))
+            {
+              int target_depth = label_table_lookup(tok->loc, tok->len);
+              if (target_depth < 0)
+                target_depth = ctx->defer_depth;
+              if (goto_has_defers(target_depth))
+                emit_goto_defers(target_depth);
+            }
+            OUT_LIT(" goto ");
+            if (is_identifier_like(tok))
+            {
+              out_str(tok->loc, tok->len);
+              tok = tok->next;
+            }
+            OUT_LIT("; }");
+            if (equal(tok, ";"))
+              tok = tok->next;
+          }
+          else if (equal(tok, "{"))
+          {
+            ctx->at_stmt_start = false;
+            continue;
+          }
+          else
+          {
+            error_tok(tok, "orelse fallback requires an assignment target (use a declaration)");
+          }
+          end_statement_after_semicolon();
+          continue;
+        }
       }
     }
     ctx->at_stmt_start = false;

@@ -35,12 +35,47 @@
 #endif
 
 #define TOMBSTONE ((void *)-1)
-
-// Inline character classification - avoids TLS __ctype_b_loc overhead
 #define IS_DIGIT(c) ((unsigned)(c) - '0' < 10u)
 #define IS_ALPHA(c) (((unsigned)((c) | 0x20) - 'a') < 26u || (c) == '_' || (c) == '$')
 #define IS_ALNUM(c) (IS_DIGIT(c) || IS_ALPHA(c))
 #define IS_XDIGIT(c) (IS_DIGIT(c) || ((unsigned)((c) | 0x20) - 'a') < 6u)
+#define ARENA_DEFAULT_BLOCK_SIZE (64 * 1024)
+#define KW_MARKER 0x80000000UL // Internal marker bit for keyword map: values are (tag | KW_MARKER)
+#define TOKEN_ALLOC_SIZE (((int)sizeof(Token) + 7) & ~7)
+
+#define equal(tok, s)                                                                                                                               \
+    (__builtin_constant_p(s) ? (__builtin_strlen(s) == 1 ? _equal_1(tok, (s)[0]) : __builtin_strlen(s) == 2 ? _equal_2(tok, s)                      \
+                                                                                                            : equal_n(tok, s, __builtin_strlen(s))) \
+                             : equal_n(tok, s, strlen(s)))
+
+#define KEYWORD_HASH(key, len)                                         \
+    (((unsigned)(len) * 2 + (unsigned char)(key)[0] * 99 +             \
+      (unsigned char)(key)[1] * 125 +                                  \
+      (unsigned char)((len) > 6 ? (key)[6] : (key)[(len) - 1]) * 69) & \
+     255)
+
+// Uses error() for OOM to support PRISM_LIB_MODE longjmp recovery
+#define ENSURE_ARRAY_CAP(arr, count, cap, init_cap, T)                    \
+    do                                                                    \
+    {                                                                     \
+        if ((count) >= (cap))                                             \
+        {                                                                 \
+            size_t new_cap = (cap) == 0 ? (init_cap) : (size_t)(cap) * 2; \
+            while (new_cap < (size_t)(count))                             \
+                new_cap *= 2;                                             \
+            T *old_ptr_ = (arr);                                          \
+            T *tmp = realloc((arr), sizeof(T) * new_cap);                 \
+            if (!tmp)                                                     \
+            {                                                             \
+                free(old_ptr_);                                           \
+                (arr) = NULL;                                             \
+                (cap) = 0;                                                \
+                error("out of memory");                                   \
+            }                                                             \
+            (arr) = tmp;                                                  \
+            (cap) = new_cap;                                              \
+        }                                                                 \
+    } while (0)
 
 // Lookup table for identifier-continuation chars (alnum + _ + $ + bytes >= 0x80)
 #ifdef _WIN32
@@ -70,32 +105,8 @@ static const uint8_t ident_char[256] = {
 };
 #endif
 
-// Generic array growth: ensures *arr has capacity for n elements
-// Note: Uses error() instead of exit(1) to support PRISM_LIB_MODE where
-// error() uses longjmp for recovery instead of terminating the host process.
-#define ENSURE_ARRAY_CAP(arr, count, cap, init_cap, T)                    \
-    do                                                                    \
-    {                                                                     \
-        if ((count) >= (cap))                                             \
-        {                                                                 \
-            size_t new_cap = (cap) == 0 ? (init_cap) : (size_t)(cap) * 2; \
-            while (new_cap < (size_t)(count))                             \
-                new_cap *= 2;                                             \
-            T *old_ptr_ = (arr);                                          \
-            T *tmp = realloc((arr), sizeof(T) * new_cap);                 \
-            if (!tmp)                                                     \
-            {                                                             \
-                free(old_ptr_);                                           \
-                (arr) = NULL;                                             \
-                (cap) = 0;                                                \
-                error("out of memory");                                   \
-            }                                                             \
-            (arr) = tmp;                                                  \
-            (cap) = new_cap;                                              \
-        }                                                                 \
-    } while (0)
-
 typedef struct Token Token;
+typedef struct ArenaBlock ArenaBlock;
 
 // File info
 typedef struct
@@ -168,6 +179,7 @@ enum
     TT_TYPEOF = 1 << 27,   // typeof, typeof_unqual, __typeof__, __typeof
     TT_BITINT = 1 << 28,   // _BitInt
     TT_ALIGNAS = 1 << 29,  // _Alignas, alignas
+    TT_ORELSE = 1 << 30,   // orelse
 };
 
 struct Token
@@ -182,20 +194,40 @@ struct Token
     uint32_t tag; // TT_* bitmask - token classification
 };
 
-// Token accessors
-static inline bool tok_at_bol(Token *tok) { return tok->flags & TF_AT_BOL; }
-static inline bool tok_has_space(Token *tok) { return tok->flags & TF_HAS_SPACE; }
-static inline void tok_set_at_bol(Token *tok, bool v) { tok->flags = v ? (tok->flags | TF_AT_BOL) : (tok->flags & ~TF_AT_BOL); }
-static inline void tok_set_has_space(Token *tok, bool v) { tok->flags = v ? (tok->flags | TF_HAS_SPACE) : (tok->flags & ~TF_HAS_SPACE); }
+typedef struct
+{
+    char *key;
+    int keylen;
+    void *val;
+} HashEntry;
 
-// Forward declaration for error reporting (used by arena and hashmap OOM handling)
-static noreturn void error(char *fmt, ...);
+typedef struct
+{
+    HashEntry *buckets;
+    int capacity;
+    int used;
+    int tombstones;
+} HashMap;
 
-// Generic arena allocator - unified "linked list of blocks" bump allocator
-// Used for both token allocation and string data
-#define ARENA_DEFAULT_BLOCK_SIZE (64 * 1024)
+// Perfect hash keyword table — O(1) lookup with single memcmp
+typedef struct
+{
+    char *name;
+    uint8_t len;
+    uintptr_t value;
+} KeywordEntry;
 
-typedef struct ArenaBlock ArenaBlock;
+static KeywordEntry keyword_perfect[256];
+
+enum // Feature flags
+{
+    F_DEFER = 1,
+    F_ZEROINIT = 2,
+    F_LINE_DIR = 4,
+    F_WARN_SAFETY = 8,
+    F_FLATTEN = 16
+};
+
 struct ArenaBlock
 {
     ArenaBlock *next;
@@ -210,6 +242,81 @@ typedef struct
     ArenaBlock *current;
     size_t default_block_size;
 } Arena;
+
+typedef struct PrismContext
+{
+    Arena main_arena;
+    File *current_file;
+    File **input_files;
+    int input_file_count;
+    int input_file_capacity;
+    bool at_bol;
+    bool has_space;
+    int tok_line_no; // Current line number during tokenization
+    HashMap filename_intern_map;
+    HashMap file_view_cache;
+    HashMap keyword_map;
+#ifdef PRISM_LIB_MODE
+    jmp_buf error_jmp;
+    bool error_jmp_set;
+    char error_msg[1024];
+    int error_line;
+    int error_col;
+#endif
+    uint32_t features; // F_DEFER | F_ZEROINIT | F_LINE_DIR | F_WARN_SAFETY | F_FLATTEN
+    const char *extra_compiler;
+    const char **extra_compiler_flags;
+    int extra_compiler_flags_count;
+    const char **extra_include_paths;
+    int extra_include_count;
+    const char **extra_defines;
+    int extra_define_count;
+    const char **extra_force_includes;
+    int extra_force_include_count;
+    int struct_depth;
+    int defer_depth;
+    int conditional_block_depth;
+    int generic_paren_depth;
+    bool current_func_returns_void;
+    bool current_func_has_setjmp;
+    bool current_func_has_asm;
+    bool current_func_has_vfork;
+    int stmt_expr_count;
+    bool last_system_header;
+    int last_line_no;
+    char *last_filename;
+    bool at_stmt_start;
+    int system_include_count;
+    unsigned long long ret_counter;
+#ifdef PRISM_LIB_MODE
+    char active_temp_output[PATH_MAX];
+#endif
+} PrismContext;
+
+typedef struct
+{
+    char *filename; // Interned filename (pointer comparison valid)
+    int line_delta;
+    uint8_t flags; // is_system (bit 0), is_include_entry (bit 1)
+} FileViewKey;
+
+typedef struct
+{
+    char c1, c2;
+    const char *equiv;
+} Digraph;
+
+static const Digraph digraphs[] = {{'<', ':', "["}, {':', '>', "]"}, {'<', '%', "{"}, {'%', '>', "}"}, {'%', ':', "#"}, {0, 0, NULL}};
+
+static PrismContext *ctx = NULL;
+
+static noreturn void error(char *fmt, ...);
+static void hashmap_put(HashMap *map, char *key, int keylen, void *val);
+
+static inline bool tok_at_bol(Token *tok) { return tok->flags & TF_AT_BOL; }
+static inline bool tok_has_space(Token *tok) { return tok->flags & TF_HAS_SPACE; }
+static inline void tok_set_at_bol(Token *tok, bool v) { tok->flags = v ? (tok->flags | TF_AT_BOL) : (tok->flags & ~TF_AT_BOL); }
+static inline void tok_set_has_space(Token *tok, bool v) { tok->flags = v ? (tok->flags | TF_HAS_SPACE) : (tok->flags & ~TF_HAS_SPACE); }
 
 static ArenaBlock *arena_new_block(size_t min_size, size_t default_size)
 {
@@ -282,93 +389,6 @@ static void arena_free(Arena *arena)
     arena->current = NULL;
 }
 
-typedef struct
-{
-    char *key;
-    int keylen;
-    void *val;
-} HashEntry;
-
-typedef struct
-{
-    HashEntry *buckets;
-    int capacity;
-    int used;
-    int tombstones;
-} HashMap;
-
-// Perfect hash keyword table — O(1) lookup with single memcmp
-typedef struct
-{
-    char *name;
-    uint8_t len;
-    uintptr_t value;
-} KeywordEntry;
-
-static KeywordEntry keyword_perfect[256];
-
-// Feature flags (compact bitmask for PrismContext.features)
-enum
-{
-    F_DEFER = 1,
-    F_ZEROINIT = 2,
-    F_LINE_DIR = 4,
-    F_WARN_SAFETY = 8,
-    F_FLATTEN = 16
-};
-
-typedef struct PrismContext
-{
-    Arena main_arena;
-    File *current_file;
-    File **input_files;
-    int input_file_count;
-    int input_file_capacity;
-    bool at_bol;
-    bool has_space;
-    int tok_line_no; // Current line number during tokenization
-    HashMap filename_intern_map;
-    HashMap file_view_cache;
-    HashMap keyword_map;
-#ifdef PRISM_LIB_MODE
-    jmp_buf error_jmp;
-    bool error_jmp_set;
-    char error_msg[1024];
-    int error_line;
-    int error_col;
-#endif
-    uint32_t features; // F_DEFER | F_ZEROINIT | F_LINE_DIR | F_WARN_SAFETY | F_FLATTEN
-    const char *extra_compiler;
-    const char **extra_compiler_flags;
-    int extra_compiler_flags_count;
-    const char **extra_include_paths;
-    int extra_include_count;
-    const char **extra_defines;
-    int extra_define_count;
-    const char **extra_force_includes;
-    int extra_force_include_count;
-    int struct_depth;
-    int defer_depth;
-    int conditional_block_depth;
-    int generic_paren_depth;
-    bool current_func_returns_void;
-    bool current_func_has_setjmp;
-    bool current_func_has_asm;
-    bool current_func_has_vfork;
-    int stmt_expr_count;
-    bool last_system_header;
-    int last_line_no;
-    char *last_filename;
-    bool at_stmt_start;
-    int system_include_count;
-    unsigned long long ret_counter;
-#ifdef PRISM_LIB_MODE
-    char active_temp_output[PATH_MAX];
-#endif
-} PrismContext;
-
-static PrismContext *ctx = NULL;
-
 static void prism_ctx_init(void)
 {
     if (ctx)
@@ -387,8 +407,6 @@ static void prism_ctx_init(void)
 #endif
 }
 
-// Token arena - uses main_arena with inlined bump allocator
-#define TOKEN_ALLOC_SIZE (((int)sizeof(Token) + 7) & ~7)
 static inline Token *arena_alloc_token(void)
 {
     Arena *arena = &ctx->main_arena;
@@ -430,8 +448,6 @@ static void *hashmap_get(HashMap *map, char *key, int keylen)
     }
     return NULL;
 }
-
-static void hashmap_put(HashMap *map, char *key, int keylen, void *val);
 
 static void hashmap_resize(HashMap *map, int newcap)
 {
@@ -547,7 +563,6 @@ static void hashmap_free_keys(HashMap *map)
 
 // Filename interning - avoids duplicating identical filename strings
 // Each entry maps filename string -> interned copy
-
 static char *intern_filename(const char *name)
 {
     if (!name)
@@ -564,16 +579,6 @@ static char *intern_filename(const char *name)
     hashmap_put(&ctx->filename_intern_map, interned, len, interned);
     return interned;
 }
-
-// File view cache - avoids creating duplicate File structs for same file context
-// Uses the generic HashMap with a packed composite key
-// Key: combines filename pointer, line_delta, is_system, is_include_entry
-typedef struct
-{
-    char *filename; // Interned filename (pointer comparison valid)
-    int line_delta;
-    uint8_t flags; // is_system (bit 0), is_include_entry (bit 1)
-} FileViewKey;
 
 static File *find_cached_file_view(char *filename, int line_delta, bool is_system, bool is_include_entry)
 {
@@ -616,11 +621,7 @@ static void free_file(File *f)
 }
 
 static void free_filename_intern_map(void) { hashmap_free_keys(&ctx->filename_intern_map); }
-
-static void free_file_view_cache(void)
-{
-    hashmap_free_keys(&ctx->file_view_cache);
-}
+static void free_file_view_cache(void) { hashmap_free_keys(&ctx->file_view_cache); }
 
 static inline File *tok_file(Token *tok)
 {
@@ -629,10 +630,7 @@ static inline File *tok_file(Token *tok)
     return ctx->input_files[tok->file_idx];
 }
 
-static int tok_line_no(Token *tok)
-{
-    return tok->line_no;
-}
+static int tok_line_no(Token *tok) { return tok->line_no; }
 
 // Error handling
 // Note: va_list scoping is intentional to avoid undefined behavior when
@@ -742,16 +740,6 @@ static void warn_tok(Token *tok, const char *fmt, ...)
 #endif
 }
 
-// Token helpers
-// Check if token matches a digraph and return its canonical equivalent
-typedef struct
-{
-    char c1, c2;
-    const char *equiv;
-} Digraph;
-static const Digraph digraphs[] = {
-    {'<', ':', "["}, {':', '>', "]"}, {'<', '%', "{"}, {'%', '>', "}"}, {'%', ':', "#"}, {0, 0, NULL}};
-
 static inline const char *digraph_equiv(Token *tok)
 {
     if (tok->kind != TK_PUNCT)
@@ -815,23 +803,6 @@ static inline bool _equal_2(Token *tok, const char *s)
         return _equal_2_digraph(tok, s);
     return false;
 }
-
-// Dispatch: compile-time length → inline fast path, runtime length → equal_n
-#define equal(tok, s) (__builtin_constant_p(s) ? (__builtin_strlen(s) == 1 ? _equal_1(tok, (s)[0]) : __builtin_strlen(s) == 2 ? _equal_2(tok, s)                      \
-                                                                                                                              : equal_n(tok, s, __builtin_strlen(s))) \
-                                               : equal_n(tok, s, strlen(s)))
-
-// Internal marker bit for keyword map: values are (tag | KW_MARKER)
-// This distinguishes tag=0 keywords from "not found" (NULL)
-#define KW_MARKER 0x80000000UL
-
-// Perfect hash for keyword lookup: maps all 86 keywords to unique slots in a 256-entry table.
-// Hash uses (len, first char, second char, char at position 6 or last char).
-#define KEYWORD_HASH(key, len)                                         \
-    (((unsigned)(len) * 2 + (unsigned char)(key)[0] * 99 +             \
-      (unsigned char)(key)[1] * 125 +                                  \
-      (unsigned char)((len) > 6 ? (key)[6] : (key)[(len) - 1]) * 69) & \
-     255)
 
 static inline uintptr_t keyword_lookup(char *key, int keylen)
 {
@@ -932,6 +903,7 @@ static void init_keyword_map(void)
         {"__builtin_types_compatible_p", 0},
         // Prism keywords
         {"defer", TT_DEFER},
+        {"orelse", TT_ORELSE},
         {"raw", 0},
     };
     for (size_t i = 0; i < sizeof(kw) / sizeof(*kw); i++)
@@ -1222,8 +1194,7 @@ static int get_extended_float_suffix(const char *p, int len, const char **replac
 
     const char *e = p + len;
 
-    // 4-char suffixes: BF16, F128
-    if (len >= 4)
+    if (len >= 4) // 4-char suffixes: BF16, F128
     {
         char c = e[-4] | 0x20; // lowercase
         if (c == 'b' && (e[-3] | 0x20) == 'f' && e[-2] == '1' && e[-1] == '6')
@@ -1389,8 +1360,7 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
             p++;
     }
 
-    // Must have line number to be a line marker
-    if (!IS_DIGIT(*p))
+    if (!IS_DIGIT(*p)) // Must have line number to be a line marker
         return NULL;
 
     long new_line = 0;
@@ -1449,7 +1419,6 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
             p++;
     }
 
-    // Track system include state
     if (is_entering && is_system)
         *in_system_include = true;
     else if (is_returning && !is_system)
@@ -1479,23 +1448,17 @@ static char *scan_pp_number(char *p)
     {
         // Handle exponent signs: e+, e-, E+, E-, p+, p-, P+, P- (hex floats)
         char c = *p;
-        if ((c == 'e' || c == 'E' || c == 'p' || c == 'P') &&
-            (p[1] == '+' || p[1] == '-'))
+        if ((c == 'e' || c == 'E' || c == 'p' || c == 'P') && (p[1] == '+' || p[1] == '-'))
         {
             p += 2;
         }
         else if (ident_char[(unsigned char)c] || c == '.')
         {
-            // Accept digits, letters (hex, suffixes, extensions), dot, underscore
-            p++;
+            p++; // Accept digits, letters (hex, suffixes, extensions), dot, underscore
         }
         else if (c == '\'' && ident_char[(unsigned char)p[1]])
         {
-            // C23 digit separator: accept ' followed by any identifier char
-            // (digit or nondigit), matching the pp-number grammar:
-            //   pp-number ' digit
-            //   pp-number ' nondigit
-            p++;
+            p++; // C23 digit separator: accept ' followed by any identifier char
         }
         else
             break;
@@ -1534,8 +1497,7 @@ static Token *tokenize(File *file)
                 continue;
             }
 
-            // Not a line marker - preserve as preprocessor directive token
-            while (*p && *p != '\n')
+            while (*p && *p != '\n') // Not a line marker - preserve as preprocessor directive token
                 p++;
             cur = cur->next = new_token(TK_PREP_DIR, directive_start, p);
             tok_set_at_bol(cur, true);
@@ -1549,22 +1511,19 @@ static Token *tokenize(File *file)
             continue;
         }
 
-        // Line comment
-        if (p[0] == '/' && p[1] == '/')
+        if (p[0] == '/' && p[1] == '/') // Line comment
         {
             p = skip_line_comment(p + 2);
             ctx->has_space = true;
             continue;
         }
-        // Block comment
-        if (p[0] == '/' && p[1] == '*')
+        if (p[0] == '/' && p[1] == '*') // Block comment
         {
             p = skip_block_comment(p + 2);
             ctx->has_space = true;
             continue;
         }
-        // Newline
-        if (*p == '\n')
+        if (*p == '\n') // Newline
         {
             p++;
             ctx->tok_line_no++;
@@ -1572,14 +1531,12 @@ static Token *tokenize(File *file)
             ctx->has_space = false;
             continue;
         }
-        // Whitespace
-        if (is_space(*p))
+        if (is_space(*p)) // Whitespace
         {
             p++;
             ctx->has_space = true;
             continue;
         }
-        // Number
         if (IS_DIGIT(*p) || (*p == '.' && IS_DIGIT(p[1])))
         {
             char *start = p;
@@ -1588,8 +1545,7 @@ static Token *tokenize(File *file)
             classify_number(t);
             continue;
         }
-        // C++11/C23 raw string literals: R"...", LR"...", uR"...", UR"...", u8R"..."
-        {
+        { // C++11/C23 raw string literals: R"...", LR"...", uR"...", UR"...", u8R"..."
             int raw_pfx = (p[0] == 'R')                                                  ? 0
                           : (p[0] == 'u' && p[1] == '8' && p[2] == 'R')                  ? 2
                           : ((p[0] == 'L' || p[0] == 'u' || p[0] == 'U') && p[1] == 'R') ? 1
@@ -1601,16 +1557,14 @@ static Token *tokenize(File *file)
                 continue;
             }
         }
-        // String literal
-        if (*p == '"')
+        if (*p == '"') // String literal
         {
             cur = cur->next = read_string_literal(p, p);
             p += cur->len;
             continue;
         }
         // UTF-8/wide string
-        if ((p[0] == 'u' && p[1] == '8' && p[2] == '"') ||
-            ((p[0] == 'u' || p[0] == 'U' || p[0] == 'L') && p[1] == '"'))
+        if ((p[0] == 'u' && p[1] == '8' && p[2] == '"') || ((p[0] == 'u' || p[0] == 'U' || p[0] == 'L') && p[1] == '"'))
         {
             char *start = p;
             p += (p[0] == 'u' && p[1] == '8') ? 2 : 1;
@@ -1618,8 +1572,7 @@ static Token *tokenize(File *file)
             p = start + cur->len;
             continue;
         }
-        // Character literal
-        if (*p == '\'')
+        if (*p == '\'') // Character literal
         {
             cur = cur->next = read_char_literal(p, p);
             p += cur->len;

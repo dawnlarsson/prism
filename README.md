@@ -1,11 +1,11 @@
 ![Prism Banner](https://github.com/user-attachments/assets/051187c2-decd-497e-9beb-b74031eb84ed)
 
 ## Robust C by default
-**A dialect of C with `defer` and automatic zero-initialization.**
+**A dialect of C with `defer`, `orelse`, and automatic zero-initialization.**
 
 Prism is a lightweight and very fast transpiler that makes C safer without changing how you write it.
 
-- **1276 tests** — edge cases, control flow, nightmares, trying hard to break Prism
+- **1341 tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Proper transpiler** — tracks typedefs, respects scope, catches unsafe patterns
 - **Opt-out features** Disable parts of the transpiler, like zero-init, with CLI flags
@@ -35,39 +35,65 @@ Requires Visual Studio Build Tools with the **Desktop development with C++** wor
 
 ## Defer
 
-**The problem:** C requires manual cleanup at every exit point. Miss one and you leak.
+**The problem:** C requires manual cleanup at every exit point. Each new resource adds cleanup to *every* error path. Miss one and you leak.
 
 ```c
-// Standard C — 3 places to forget cleanup
-int process(const char *path) {
+// Standard C — cleanup grows with every new resource
+int compile(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return -1;
-    
-    void *buf = malloc(4096);
-    if (!buf) { fclose(f); return -1; }  // Easy to forget fclose here
-    
-    if (parse(buf) < 0) { free(buf); fclose(f); return -1; }  // And here
-    
-    free(buf);
-    fclose(f);
-    return 0;
+
+    char *src = read_file(f);
+    if (!src) {
+        fclose(f); 
+        return -1; 
+    }
+
+    Token *tok = tokenize(src);
+    if (!tok) { 
+        free(src); 
+        fclose(f); 
+        return -1; 
+    }
+
+    Node *ast = parse(tok);
+    if (!ast) { 
+        token_free(tok); 
+        free(src); 
+        fclose(f); 
+        return -1; 
+    }
+
+    int result = emit(ast);
+    node_free(ast);    // remember all four
+    token_free(tok);   // in the right order
+    free(src);         // or you leak
+    fclose(f);         // every single time
+    return result;
 }
 ```
 
-**With Prism:** Write cleanup once. It runs on every exit.
+**With Prism:** Write cleanup once. It runs on every exit. It is better, but we can take it further, see `orelse` section.
 
 ```c
-int process(const char *path) {
+int compile(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return -1;
     defer fclose(f);
-    
-    void *buf = malloc(4096);
-    if (!buf) return -1;  // fclose(f) runs automatically
-    defer free(buf);
-    
-    if (parse(buf) < 0) return -1;  // both cleanup, in reverse order
-    return 0;
+
+    char *src = read_file(f);
+    if (!src) return -1;           // fclose runs
+    defer free(src);
+
+    Token *tok = tokenize(src);
+    if (!tok) return -1;           // free, fclose run
+    defer token_free(tok);
+
+    Node *ast = parse(tok);
+    if (!ast) return -1;           // token_free, free, fclose run
+    defer node_free(ast);
+
+    return emit(ast);              // all four, reverse order
 }
 ```
 
@@ -139,6 +165,71 @@ void allowed() {
 skip:
     return;
 }
+```
+
+## orelse
+
+The `orelse` keyword handles failure inline — check a value and bail in one line.
+
+`defer` solved the cleanup problem, but notice the function still has a repetitive pattern: call, null-check, bail. Four times. `orelse` collapses each check-and-bail into the declaration itself:
+
+```c
+int compile(const char *path) {
+    FILE *f = fopen(path, "r") orelse return -1;
+    defer fclose(f);
+
+    char *src = read_file(f) orelse return -1;
+    defer free(src);
+
+    Token *tok = tokenize(src) orelse return -1;
+    defer token_free(tok);
+
+    Node *ast = parse(tok) orelse return -1;
+    defer node_free(ast);
+
+    return emit(ast);
+}
+```
+
+Same function, three versions: **32 lines → 19 lines → 15 lines.** No cleanup bugs, no null-check boilerplate.
+
+`orelse` checks if the initialized value is falsy (null pointer, zero). If so, the action fires. All active defers run — just like a normal `return`.
+
+### Forms
+
+**Control flow** — return, break, continue, goto:
+```c
+int *p = get_ptr() orelse return -1;
+int *q = next()    orelse break;
+int *r = try_it()  orelse continue;
+int *s = find()    orelse goto cleanup;
+```
+
+**Block** — run arbitrary code on failure:
+```c
+FILE *f = fopen(path, "r") orelse {
+    log_error("failed to open %s", path);
+    return -1;
+}
+```
+
+**Fallback value** — substitute a default:
+```c
+char *name = get_name() orelse "unknown";
+```
+
+**Bare expression** — check without assignment:
+```c
+do_init() orelse return -1;
+```
+
+### Works with any falsy value
+
+`orelse` isn't limited to pointers — it works with any type where `!value` is meaningful:
+
+```c
+int fd = open(path, O_RDONLY) orelse return -1;  // 0 is falsy
+size_t n = read_data(fd, buf) orelse break;      // 0 bytes = done
 ```
 
 ## Safety Enforcement
@@ -217,7 +308,7 @@ Not:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v0.111.0 - Robust C transpiler
+Prism v0.112.0 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 
