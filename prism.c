@@ -1,13 +1,5 @@
 #define PRISM_VERSION "0.111.0"
 
-#include "parse.c"
-
-#ifdef PRISM_LIB_MODE
-#define PRISM_API
-#else
-#define PRISM_API static
-#endif
-
 #ifdef _WIN32
 #define PRISM_DEFAULT_CC "cl"
 #define EXE_SUFFIX ".exe"
@@ -28,6 +20,14 @@
 #define _DARWIN_C_SOURCE
 #endif
 #endif
+
+#ifdef PRISM_LIB_MODE
+#define PRISM_API
+#else
+#define PRISM_API static
+#endif
+
+#include "parse.c"
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h> // _NSGetExecutablePath
