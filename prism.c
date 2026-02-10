@@ -5,6 +5,12 @@
 #define EXE_SUFFIX ".exe"
 #define INSTALL_PATH "prism.exe"
 #else
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE
+#endif
 #include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -13,12 +19,6 @@
 #define INSTALL_PATH "/usr/local/bin/prism"
 #define PRISM_DEFAULT_CC "cc"
 #define EXE_SUFFIX ""
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-#ifndef _DARWIN_C_SOURCE
-#define _DARWIN_C_SOURCE
-#endif
 #endif
 
 #ifdef PRISM_LIB_MODE

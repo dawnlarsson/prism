@@ -93,6 +93,8 @@ typedef int mode_t;
 #define getpid _getpid
 #define unlink _unlink
 #define close _close
+#define popen _popen
+#define pclose _pclose
 // Redirect read() calls to our wrapper via macro.
 // Using a unique name avoids conflicting with MSVC ucrt's read() declaration.
 #define read prism_posix_read_
