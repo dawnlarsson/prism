@@ -151,9 +151,7 @@ static int mkstemp(char *tmpl)
     // Avoids collisions in parallel build systems (e.g., ninja -j32)
     LARGE_INTEGER perf_counter;
     QueryPerformanceCounter(&perf_counter);
-    unsigned int seed = (unsigned int)_getpid() ^ (unsigned int)GetTickCount()
-                      ^ (unsigned int)perf_counter.LowPart
-                      ^ (unsigned int)(perf_counter.LowPart >> 16);
+    unsigned int seed = (unsigned int)_getpid() ^ (unsigned int)GetTickCount() ^ (unsigned int)perf_counter.LowPart ^ (unsigned int)(perf_counter.LowPart >> 16);
 
     for (int attempt = 0; attempt < 10000; attempt++)
     {

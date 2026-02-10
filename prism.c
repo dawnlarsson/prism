@@ -4196,6 +4196,42 @@ static bool get_self_exe_path(char *buf, size_t bufsize)
   return false;
 }
 
+static void check_path_shadow(void)
+{
+#ifdef _WIN32
+  const char *cmd = "where prism.exe 2>nul";
+#else
+  const char *cmd = "which -a prism 2>/dev/null || command -v prism 2>/dev/null";
+#endif
+  FILE *fp = popen(cmd, "r");
+  if (!fp)
+    return;
+  char first_hit[PATH_MAX];
+  first_hit[0] = '\0';
+  if (fgets(first_hit, sizeof(first_hit), fp))
+  {
+    // Strip trailing newline
+    size_t len = strlen(first_hit);
+    while (len > 0 && (first_hit[len - 1] == '\n' || first_hit[len - 1] == '\r'))
+      first_hit[--len] = '\0';
+  }
+  pclose(fp);
+  if (first_hit[0] && strcmp(first_hit, INSTALL_PATH) != 0)
+  {
+    // Resolve symlinks for both paths before comparing
+    char resolved_hit[PATH_MAX], resolved_install[PATH_MAX];
+    char *rh = realpath(first_hit, resolved_hit);
+    char *ri = realpath(INSTALL_PATH, resolved_install);
+    if (rh && ri && strcmp(rh, ri) == 0)
+      return; // Same file via symlink — no shadow
+    fprintf(stderr,
+            "[prism] Warning: '%s' shadows '%s' in your PATH.\n"
+            "[prism] The newly installed version will NOT be used.\n"
+            "[prism] Fix: remove or update '%s', or adjust your PATH.\n",
+            first_hit, INSTALL_PATH, first_hit);
+  }
+}
+
 static int install(char *self_path)
 {
   printf("[prism] Installing to %s...\n", INSTALL_PATH);
@@ -4233,6 +4269,7 @@ static int install(char *self_path)
     fclose(output);
     chmod(INSTALL_PATH, 0755); // no-op on Windows (shimmed)
     printf("[prism] Installed!\n");
+    check_path_shadow();
     return 0;
   }
 
@@ -4266,6 +4303,7 @@ use_sudo:;
 #endif
 
   printf("[prism] Installed!\n");
+  check_path_shadow();
   return 0;
 }
 

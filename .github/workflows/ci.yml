@@ -25,13 +25,19 @@ jobs:
           uname -a
           gcc --version
 
-      - name: Bootstrap Prism
-        run: gcc -o /tmp/prism prism.c
+      - name: "Stage 0: Build with host compiler"
+        run: gcc -o /tmp/prism_stage0 prism.c
 
-      - name: Self-Install
+      - name: "Stage 1: Prism builds itself"
+        run: /tmp/prism_stage0 prism.c -o /tmp/prism_stage1
+
+      - name: "Stage 2: Self-built Prism builds itself again"
+        run: /tmp/prism_stage1 prism.c -o /tmp/prism_stage2
+
+      - name: Install Stage 2
         run: |
-          /tmp/prism install
-          rm -f /tmp/prism
+          /tmp/prism_stage2 install
+          rm -f /tmp/prism_stage0 /tmp/prism_stage1 /tmp/prism_stage2
 
       - name: Verify Installation
         run: |
@@ -67,13 +73,19 @@ jobs:
           uname -a
           clang --version
 
-      - name: Bootstrap Prism
-        run: clang -o /tmp/prism prism.c
+      - name: "Stage 0: Build with host compiler"
+        run: clang -o /tmp/prism_stage0 prism.c
 
-      - name: Self-Install
+      - name: "Stage 1: Prism builds itself"
+        run: /tmp/prism_stage0 prism.c -o /tmp/prism_stage1
+
+      - name: "Stage 2: Self-built Prism builds itself again"
+        run: /tmp/prism_stage1 prism.c -o /tmp/prism_stage2
+
+      - name: Install Stage 2
         run: |
-          /tmp/prism install
-          rm -f /tmp/prism
+          /tmp/prism_stage2 install
+          rm -f /tmp/prism_stage0 /tmp/prism_stage1 /tmp/prism_stage2
 
       - name: Verify Installation
         run: |
@@ -109,13 +121,19 @@ jobs:
           uname -a
           clang --version
 
-      - name: Bootstrap Prism
-        run: clang -o /tmp/prism prism.c
+      - name: "Stage 0: Build with host compiler"
+        run: clang -o /tmp/prism_stage0 prism.c
 
-      - name: Self-Install
+      - name: "Stage 1: Prism builds itself"
+        run: /tmp/prism_stage0 prism.c -o /tmp/prism_stage1
+
+      - name: "Stage 2: Self-built Prism builds itself again"
+        run: /tmp/prism_stage1 prism.c -o /tmp/prism_stage2
+
+      - name: Install Stage 2
         run: |
-          /tmp/prism install
-          rm -f /tmp/prism
+          /tmp/prism_stage2 install
+          rm -f /tmp/prism_stage0 /tmp/prism_stage1 /tmp/prism_stage2
 
       - name: Verify Installation
         run: |
@@ -180,9 +198,14 @@ jobs:
               apk add --no-cache gcc musl-dev
               echo "Architecture: $(uname -m)"
               gcc --version
-              gcc -o /tmp/prism prism.c
-              /tmp/prism install
-              rm -f /tmp/prism
+              echo "=== Stage 0: Build with host compiler ==="
+              gcc -o /tmp/prism_stage0 prism.c
+              echo "=== Stage 1: Prism builds itself ==="
+              /tmp/prism_stage0 prism.c -o /tmp/prism_stage1
+              echo "=== Stage 2: Self-built Prism builds itself again ==="
+              /tmp/prism_stage1 prism.c -o /tmp/prism_stage2
+              /tmp/prism_stage2 install
+              rm -f /tmp/prism_stage0 /tmp/prism_stage1 /tmp/prism_stage2
               which prism
               prism || true
               cat <<EOF > test_hello.c
@@ -215,9 +238,14 @@ jobs:
               apk add --no-cache gcc musl-dev
               echo "Architecture: $(uname -m)"
               gcc --version
-              gcc -o /tmp/prism prism.c
-              /tmp/prism install
-              rm -f /tmp/prism
+              echo "=== Stage 0: Build with host compiler ==="
+              gcc -o /tmp/prism_stage0 prism.c
+              echo "=== Stage 1: Prism builds itself ==="
+              /tmp/prism_stage0 prism.c -o /tmp/prism_stage1
+              echo "=== Stage 2: Self-built Prism builds itself again ==="
+              /tmp/prism_stage1 prism.c -o /tmp/prism_stage2
+              /tmp/prism_stage2 install
+              rm -f /tmp/prism_stage0 /tmp/prism_stage1 /tmp/prism_stage2
               which prism
               prism || true
               cat <<EOF > test_hello.c
