@@ -357,7 +357,12 @@ void test_zeroinit_basic_types(void)
     signed char sc;
     CHECK_EQ(sc, 0, "signed char zero-init");
 
-    enum { RED, GREEN, BLUE } color;
+    enum
+    {
+        RED,
+        GREEN,
+        BLUE
+    } color;
     CHECK_EQ(color, 0, "enum variable zero-init");
 
     size_t sz;
@@ -3284,32 +3289,40 @@ void test_deep_defer_with_zeroinit(void)
 {
     log_reset();
     int outer;
-    { defer log_append("1");
-      int a;
-      { defer log_append("2");
-        int b;
-        { defer log_append("3");
-          int c;
-          { defer log_append("4");
-            int d;
-            { defer log_append("5");
-              int e;
-              { defer log_append("6");
-                int f;
-                { defer log_append("7");
-                  int g;
-                  { defer log_append("8");
-                    int h;
-                    CHECK(a == 0 && b == 0 && c == 0 && d == 0, "deep zeroinit: a-d");
-                    CHECK(e == 0 && f == 0 && g == 0 && h == 0, "deep zeroinit: e-h");
-                    log_append("X");
-                  }
+    {
+        defer log_append("1");
+        int a;
+        {
+            defer log_append("2");
+            int b;
+            {
+                defer log_append("3");
+                int c;
+                {
+                    defer log_append("4");
+                    int d;
+                    {
+                        defer log_append("5");
+                        int e;
+                        {
+                            defer log_append("6");
+                            int f;
+                            {
+                                defer log_append("7");
+                                int g;
+                                {
+                                    defer log_append("8");
+                                    int h;
+                                    CHECK(a == 0 && b == 0 && c == 0 && d == 0, "deep zeroinit: a-d");
+                                    CHECK(e == 0 && f == 0 && g == 0 && h == 0, "deep zeroinit: e-h");
+                                    log_append("X");
+                                }
+                            }
+                        }
+                    }
                 }
-              }
             }
-          }
         }
-      }
     }
     CHECK_LOG("X87654321", "deep zeroinit defer ordering");
     CHECK_EQ(outer, 0, "deep zeroinit outer var");
@@ -3724,15 +3737,27 @@ void test_typedef_scope_churn_heavy(void)
     {
         typedef int ChurnHeavyT;
         ChurnHeavyT v;
-        if (v != 0) { ok = 0; break; }
+        if (v != 0)
+        {
+            ok = 0;
+            break;
+        }
         {
             typedef float ChurnHeavyT;
             ChurnHeavyT f;
-            if (f != 0.0f) { ok = 0; break; }
+            if (f != 0.0f)
+            {
+                ok = 0;
+                break;
+            }
             {
                 typedef char ChurnHeavyT;
                 ChurnHeavyT c;
-                if (c != 0) { ok = 0; break; }
+                if (c != 0)
+                {
+                    ok = 0;
+                    break;
+                }
             }
         }
     }
@@ -3752,13 +3777,21 @@ void test_typedef_scope_churn_varied(void)
         CT_A a;
         CT_B b;
         CT_C c;
-        if (a != 0 || b != 0 || c != 0) { ok = 0; break; }
+        if (a != 0 || b != 0 || c != 0)
+        {
+            ok = 0;
+            break;
+        }
         {
             typedef double CT_A;
             typedef char CT_B;
             CT_A da;
             CT_B cb;
-            if (da != 0.0 || cb != 0) { ok = 0; break; }
+            if (da != 0.0 || cb != 0)
+            {
+                ok = 0;
+                break;
+            }
         }
     }
     CHECK(ok, "typedef varied churn 200: all zeroed");
@@ -12168,7 +12201,8 @@ void test_typedef_as_raw(void)
     raw arr[4];
     int all_zero = 1;
     for (int i = 0; i < 4; i++)
-        if (arr[i] != 0) all_zero = 0;
+        if (arr[i] != 0)
+            all_zero = 0;
     CHECK(all_zero, "typedef raw array: zero-initialized");
 }
 
@@ -12911,7 +12945,7 @@ static void _pce_set(void) { _pce_flag = 1; }
 
 static int *_pce_orelse_helper(int *p)
 {
-    int *x = (_pce_set(), p) orelse return NULL;
+    int *x = (_pce_set(), p)orelse return NULL;
     return x;
 }
 
@@ -12930,7 +12964,9 @@ void test_orelse_paren_comma_expr(void)
 
 static int *_multiarg_get(int *p, int a, int b, int c)
 {
-    (void)a; (void)b; (void)c;
+    (void)a;
+    (void)b;
+    (void)c;
     return p;
 }
 
@@ -12947,7 +12983,11 @@ void test_orelse_multiarg_funcall(void)
     CHECK_EQ(_multiarg_orelse_helper(NULL), -1, "orelse multi-arg funcall: null triggers return");
 }
 
-static int *_nested_call_inner(int *p, int x) { (void)x; return p; }
+static int *_nested_call_inner(int *p, int x)
+{
+    (void)x;
+    return p;
+}
 static int *_nested_call_outer(int *p, int a, int b) { return _nested_call_inner(p, a + b); }
 
 static int _nested_call_orelse_helper(int *p)
