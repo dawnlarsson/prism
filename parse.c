@@ -162,6 +162,12 @@ enum
     TT_SWITCH = 1 << 22,   // switch
     TT_IF = 1 << 23,       // if, else
     TT_TYPEDEF = 1 << 24,  // typedef
+    // Specific keyword ID tags (bits 25-29) - eliminates equal() in parse_type_specifier
+    TT_VOLATILE = 1 << 25, // volatile
+    TT_REGISTER = 1 << 26, // register
+    TT_TYPEOF = 1 << 27,   // typeof, typeof_unqual, __typeof__, __typeof
+    TT_BITINT = 1 << 28,   // _BitInt
+    TT_ALIGNAS = 1 << 29,  // _Alignas, alignas
 };
 
 struct Token
@@ -738,29 +744,25 @@ static void warn_tok(Token *tok, const char *fmt, ...)
 
 // Token helpers
 // Check if token matches a digraph and return its canonical equivalent
+typedef struct
+{
+    char c1, c2;
+    const char *equiv;
+} Digraph;
+static const Digraph digraphs[] = {
+    {'<', ':', "["}, {':', '>', "]"}, {'<', '%', "{"}, {'%', '>', "}"}, {'%', ':', "#"}, {0, 0, NULL}};
+
 static inline const char *digraph_equiv(Token *tok)
 {
     if (tok->kind != TK_PUNCT)
         return NULL;
-
     if (tok->len == 4 && !memcmp(tok->loc, "%:%:", 4))
         return "##";
-
     if (tok->len != 2)
         return NULL;
-
-    char a = tok->loc[0], b = tok->loc[1];
-    if (a == '<' && b == ':')
-        return "[";
-    if (a == ':' && b == '>')
-        return "]";
-    if (a == '<' && b == '%')
-        return "{";
-    if (a == '%' && b == '>')
-        return "}";
-    if (a == '%' && b == ':')
-        return "#";
-
+    for (const Digraph *d = digraphs; d->equiv; d++)
+        if (tok->loc[0] == d->c1 && tok->loc[1] == d->c2)
+            return d->equiv;
     return NULL;
 }
 
@@ -880,7 +882,7 @@ static void init_keyword_map(void)
         {"inline", TT_INLINE},
         // Type qualifiers
         {"const", TT_QUALIFIER},
-        {"volatile", TT_QUALIFIER},
+        {"volatile", TT_QUALIFIER | TT_VOLATILE},
         {"restrict", TT_QUALIFIER},
         {"_Atomic", TT_QUALIFIER | TT_TYPE},
         {"_Noreturn", 0},
@@ -905,14 +907,15 @@ static void init_keyword_map(void)
         {"__int128_t", TT_TYPE},
         {"__uint128", TT_TYPE},
         {"__uint128_t", TT_TYPE},
-        {"typeof_unqual", TT_TYPE},
+        {"typeof_unqual", TT_TYPE | TT_TYPEOF},
         {"auto", TT_QUALIFIER},
-        {"register", TT_QUALIFIER},
-        {"_Alignas", TT_QUALIFIER},
-        {"typeof", TT_TYPE},
-        {"__typeof__", TT_TYPE},
-        {"__typeof", TT_TYPE},
-        {"_BitInt", TT_TYPE},
+        {"register", TT_QUALIFIER | TT_REGISTER},
+        {"_Alignas", TT_QUALIFIER | TT_ALIGNAS},
+        {"alignas", TT_QUALIFIER | TT_ALIGNAS},
+        {"typeof", TT_TYPE | TT_TYPEOF},
+        {"__typeof__", TT_TYPE | TT_TYPEOF},
+        {"__typeof", TT_TYPE | TT_TYPEOF},
+        {"_BitInt", TT_TYPE | TT_BITINT},
         // Asm (skip-decl: can't start a declaration)
         {"asm", TT_SKIP_DECL | TT_ASM},
         {"__asm__", TT_SKIP_DECL | TT_ASM},
@@ -1586,23 +1589,17 @@ static Token *tokenize(File *file)
             continue;
         }
         // C++11/C23 raw string literals: R"...", LR"...", uR"...", UR"...", u8R"..."
-        if (p[0] == 'R' && p[1] == '"')
         {
-            cur = cur->next = read_raw_string_literal(p, p + 1);
-            p += cur->len;
-            continue;
-        }
-        if ((p[0] == 'L' || p[0] == 'u' || p[0] == 'U') && p[1] == 'R' && p[2] == '"')
-        {
-            cur = cur->next = read_raw_string_literal(p, p + 2);
-            p += cur->len;
-            continue;
-        }
-        if (p[0] == 'u' && p[1] == '8' && p[2] == 'R' && p[3] == '"')
-        {
-            cur = cur->next = read_raw_string_literal(p, p + 3);
-            p += cur->len;
-            continue;
+            int raw_pfx = (p[0] == 'R')                                                  ? 0
+                          : (p[0] == 'u' && p[1] == '8' && p[2] == 'R')                  ? 2
+                          : ((p[0] == 'L' || p[0] == 'u' || p[0] == 'U') && p[1] == 'R') ? 1
+                                                                                         : -1;
+            if (raw_pfx >= 0 && p[raw_pfx] == 'R' && p[raw_pfx + 1] == '"')
+            {
+                cur = cur->next = read_raw_string_literal(p, p + raw_pfx + 1);
+                p += cur->len;
+                continue;
+            }
         }
         // String literal
         if (*p == '"')

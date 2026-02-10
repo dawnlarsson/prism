@@ -1,6 +1,26 @@
-#define PRISM_VERSION "0.110.0"
+#define PRISM_VERSION "0.111.0"
 
-#ifndef _WIN32
+#include "parse.c"
+
+#ifdef PRISM_LIB_MODE
+#define PRISM_API
+#else
+#define PRISM_API static
+#endif
+
+#ifdef _WIN32
+#define PRISM_DEFAULT_CC "cl"
+#define EXE_SUFFIX ".exe"
+#define INSTALL_PATH "prism.exe"
+#else
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+
+#define INSTALL_PATH "/usr/local/bin/prism"
+#define PRISM_DEFAULT_CC "cc"
+#define EXE_SUFFIX ""
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -9,28 +29,6 @@
 #endif
 #endif
 
-#include "parse.c"
-
-#ifndef _WIN32
-#include <spawn.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <fcntl.h>
-#endif
-
-// Forward declarations for functions used before definition
-static bool cc_is_msvc(const char *cc);
-
-// Platform constants
-#ifdef _WIN32
-#define PRISM_DEFAULT_CC "cl"
-#define EXE_SUFFIX ".exe"
-#else
-#define PRISM_DEFAULT_CC "cc"
-#define EXE_SUFFIX ""
-#endif
-
-// Platform-specific headers for get_real_cc()
 #ifdef __APPLE__
 #include <mach-o/dyld.h> // _NSGetExecutablePath
 #endif
@@ -40,18 +38,23 @@ static bool cc_is_msvc(const char *cc);
 #endif
 
 #define INITIAL_ARRAY_CAP 32
+#define OUT_BUF_SIZE (128 * 1024)
 
-#ifdef _WIN32
-#define INSTALL_PATH "prism.exe"
-#else
-#define INSTALL_PATH "/usr/local/bin/prism"
-#endif
+#define FEAT(f) (ctx->features & (f))
+#define is_c23_attr(t) ((t) && equal(t, "[") && (t)->next && equal((t)->next, "["))
 
-#ifdef PRISM_LIB_MODE
-#define PRISM_API
-#else
-#define PRISM_API static
-#endif
+#define emit_defers(mode) emit_defers_ex(mode, 0)
+#define emit_all_defers() emit_defers(DEFER_ALL)
+#define emit_goto_defers(depth) emit_defers_ex(DEFER_TO_DEPTH, depth)
+#define has_active_defers() has_defers_for(DEFER_ALL, 0)
+#define control_flow_has_defers(include_switch) has_defers_for((include_switch) ? DEFER_BREAK : DEFER_CONTINUE, 0)
+#define goto_has_defers(depth) has_defers_for(DEFER_TO_DEPTH, depth)
+#define typedef_add(name, len, depth, is_vla, is_void) typedef_add_entry(name, len, depth, TDK_TYPEDEF, is_vla, is_void)
+#define typedef_add_shadow(name, len, depth) typedef_add_entry(name, len, depth, TDK_SHADOW, false, false)
+#define typedef_add_enum_const(name, len, depth) typedef_add_entry(name, len, depth, TDK_ENUM_CONST, false, false)
+#define typedef_add_vla_var(name, len, depth) typedef_add_entry(name, len, depth, TDK_VLA_VAR, true, false)
+#define argv_builder_init(ab) (*(ab) = (ArgvBuilder){0})
+#define argv_builder_finish(ab) ((ab)->data)
 
 typedef struct
 {
@@ -91,72 +94,6 @@ typedef struct
   int error_col;
 } PrismResult;
 
-PRISM_API PrismFeatures prism_defaults(void)
-{
-  return (PrismFeatures){
-      .defer = true,
-      .zeroinit = true,
-      .line_directives = true,
-      .flatten_headers = true};
-}
-
-// Feature flag check macro
-#define FEAT(f) (ctx->features & (f))
-static uint32_t features_to_bits(PrismFeatures f)
-{
-  return (f.defer ? F_DEFER : 0) | (f.zeroinit ? F_ZEROINIT : 0) | (f.line_directives ? F_LINE_DIR : 0) | (f.warn_safety ? F_WARN_SAFETY : 0) | (f.flatten_headers ? F_FLATTEN : 0);
-}
-
-// Forward declarations for library API
-PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures features);
-PRISM_API void prism_free(PrismResult *r);
-PRISM_API void prism_reset(void);
-
-// Get temp directory - respects $TMPDIR environment variable (POSIX standard)
-// Returns path with trailing slash (or empty string on Windows)
-static const char *get_tmp_dir(void)
-{
-  static char tmp_buf[PATH_MAX];
-#ifdef _WIN32
-  const char *tmpdir = getenv("TEMP");
-  if (!tmpdir || !tmpdir[0])
-    tmpdir = getenv("TMP");
-  static const char *fallback = ".\\";
-#else
-  const char *tmpdir = getenv("TMPDIR");
-  static const char *fallback = "/tmp/";
-#endif
-  if (tmpdir && tmpdir[0])
-  {
-    size_t len = strlen(tmpdir);
-    if (len < PATH_MAX - 2)
-    {
-      strcpy(tmp_buf, tmpdir);
-      char last = tmp_buf[len - 1];
-      if (last != '/' && last != '\\')
-      {
-        tmp_buf[len] = '/';
-        tmp_buf[len + 1] = '\0';
-      }
-      return tmp_buf;
-    }
-  }
-  return fallback;
-}
-
-static Token *skip_balanced(Token *tok, char open, char close);
-
-// Fast single-char match for balanced scanners: direct char compare with rare digraph fallback
-static inline bool match_ch(Token *tok, char c)
-{
-  if (tok->len == 1)
-    return tok->loc[0] == c;
-  if (__builtin_expect(tok->flags & TF_IS_DIGRAPH, 0))
-    return _equal_1_digraph(tok, c);
-  return false;
-}
-
-// Forward declaration: Type specifier parsing result
 typedef struct
 {
   Token *end;        // First token after the type specifier
@@ -168,67 +105,24 @@ typedef struct
   bool has_atomic;   // True if _Atomic qualifier/specifier present
   bool has_register; // True if register storage class
   bool has_volatile; // True if volatile qualifier
-
 } TypeSpecResult;
-static TypeSpecResult parse_type_specifier(Token *tok);
 
-// Check if token is identifier-like (TK_IDENT or TK_KEYWORD like 'raw'/'defer')
-static inline bool is_identifier_like(Token *tok)
+typedef enum
 {
-  return tok->kind == TK_IDENT || tok->kind == TK_KEYWORD;
-}
+  DEFER_SCOPE,    // DEFER_SCOPE=current only
+  DEFER_ALL,      // DEFER_ALL=all scopes
+  DEFER_BREAK,    // DEFER_BREAK=stop at loop/switch,
+  DEFER_CONTINUE, // DEFER_CONTINUE=stop at loop,
+  DEFER_TO_DEPTH  // DEFER_TO_DEPTH=stop at given depth (for goto)
+} DeferEmitMode;
 
-// Skip GNU/MSVC-style attributes: __attribute__((...)), __declspec(...)
-static Token *skip_gnu_attributes(Token *tok)
+typedef enum
 {
-  while (tok && (tok->tag & TT_ATTR))
-  {
-    tok = tok->next;
-    if (tok && equal(tok, "("))
-      tok = skip_balanced(tok, '(', ')');
-  }
-  return tok;
-}
-
-// Skip a single C23 [[ ... ]] attribute. Assumes tok is at first '['.
-static Token *skip_c23_attr(Token *tok)
-{
-  tok = tok->next->next; // skip [[
-  int depth = 1;
-  while (tok && tok->kind != TK_EOF && depth > 0)
-  {
-    if (match_ch(tok, '['))
-      depth++;
-    else if (match_ch(tok, ']'))
-      depth--;
-    tok = tok->next;
-  }
-  if (tok && match_ch(tok, ']'))
-    tok = tok->next;
-  return tok;
-}
-
-#define is_c23_attr(t) ((t) && equal(t, "[") && (t)->next && equal((t)->next, "["))
-
-// Skip all attributes (GNU-style and C23-style [[...]])
-static Token *skip_all_attributes(Token *tok)
-{
-  while (tok && tok->kind != TK_EOF)
-  {
-    if (tok->tag & TT_ATTR)
-    {
-      tok = skip_gnu_attributes(tok);
-      continue;
-    }
-    if (is_c23_attr(tok))
-    {
-      tok = skip_c23_attr(tok);
-      continue;
-    }
-    break;
-  }
-  return tok;
-}
+  TDK_TYPEDEF,
+  TDK_SHADOW,
+  TDK_ENUM_CONST,
+  TDK_VLA_VAR // VLA variable (not typedef, but actual VLA array variable)
+} TypedefKind;
 
 typedef struct
 {
@@ -283,10 +177,27 @@ typedef struct
   HashMap name_map; // Maps name -> index+1 of most recent entry (0 means not found)
 } TypedefTable;
 
-static TypedefTable typedef_table;
+typedef enum
+{
+  CLI_DEFAULT,
+  CLI_RUN,
+  CLI_EMIT,
+  CLI_INSTALL
+} CliMode;
 
-static DeferScope *defer_stack = NULL;
-static int defer_stack_capacity = 0;
+typedef struct
+{
+  CliMode mode;
+  PrismFeatures features;
+  const char **sources;
+  int source_count, source_cap;
+  const char **cc_args;
+  int cc_arg_count, cc_arg_cap;
+  const char *output;
+  const char *cc;
+  bool verbose;
+  bool compile_only;
+} Cli;
 
 // Control flow state — tracks control keyword to body transition
 enum
@@ -307,13 +218,57 @@ typedef struct
   bool await_for_paren;
 } ControlFlow;
 
+typedef struct
+{
+  char **data;
+  int count, capacity;
+} ArgvBuilder;
+
+// Unified token walker — iterates tokens tracking brace depth, struct bodies,
+// and _Generic skipping. Used by scan_labels_in_function and goto_skips_check
+// to eliminate duplicated structural token-walking logic.
+typedef struct
+{
+  Token *tok;        // Current token
+  Token *prev;       // Previous meaningful token
+  int depth;         // Brace depth (updated on { and })
+  int struct_depth;  // Nesting inside struct/union/enum bodies
+  int initial_depth; // Starting depth (break when } would go below this)
+} TokenWalker;
+
+// Result of goto skip analysis — both defer and decl checked in a single walk
+typedef struct
+{
+  Token *skipped_defer;
+  Token *skipped_decl;
+} GotoSkipResult;
+
+// Declarator parsing result
+typedef struct
+{
+  Token *end;       // First token after declarator
+  Token *var_name;  // The variable name token
+  bool is_pointer;  // Has pointer modifier
+  bool is_array;    // Is array type
+  bool is_vla;      // Has variable-length array dimension
+  bool is_func_ptr; // Is function pointer
+  bool has_paren;   // Has parenthesized declarator
+  bool has_init;    // Has initializer (=)
+} DeclResult;
+
+#define struct_body_contains_vla(brace) scan_for_vla(brace, "{", "}")
+#define typedef_contains_vla(tok) scan_for_vla(tok, NULL, ";")
+
+extern char **environ;
+static char **cached_clean_env = NULL;
+
+static HashMap system_includes;    // Tracks unique system headers to emit
+static char **system_include_list; // Ordered list of includes
+static int system_include_capacity = 0;
+
 static ControlFlow ctrl = {0};
-
-static inline void control_flow_reset(void) { ctrl = (ControlFlow){0}; }
-
 static LabelTable label_table;
 
-// Track statement expression scopes - store the ctx->defer_depth at which each starts
 static int *stmt_expr_levels = NULL; // ctx->defer_depth when stmt expr started (dynamic)
 static int stmt_expr_capacity = 0;   // capacity of stmt_expr_levels array
 
@@ -321,9 +276,190 @@ static int stmt_expr_capacity = 0;   // capacity of stmt_expr_levels array
 static FILE *out_fp;
 static Token *last_emitted = NULL;
 
-#define OUT_BUF_SIZE (128 * 1024)
 static char out_buf[OUT_BUF_SIZE];
 static int out_buf_pos = 0;
+
+static TypedefTable typedef_table;
+
+static DeferScope *defer_stack = NULL;
+static int defer_stack_capacity = 0;
+
+// Forward declarations (only for functions used before their definition)
+static DeclResult parse_declarator(Token *tok, bool emit);
+static bool is_type_keyword(Token *tok);
+static void typedef_pop_scope(int scope_depth);
+static TypeSpecResult parse_type_specifier(Token *tok);
+
+static inline void control_flow_reset(void) { ctrl = (ControlFlow){0}; }
+static void walker_init(TokenWalker *w, Token *start, int initial_depth)
+{
+  *w = (TokenWalker){.tok = start, .initial_depth = initial_depth, .depth = initial_depth};
+}
+
+static void reset_transpiler_state(void)
+{
+  ctx->defer_depth = 0;
+  ctx->struct_depth = 0;
+  ctx->conditional_block_depth = 0;
+  ctx->generic_paren_depth = 0;
+  ctx->stmt_expr_count = 0;
+  ctx->last_line_no = 0;
+  ctx->ret_counter = 0;
+  ctx->last_filename = NULL;
+  ctx->last_system_header = false;
+  ctx->current_func_returns_void = false;
+  ctx->current_func_has_setjmp = false;
+  ctx->current_func_has_asm = false;
+  ctx->current_func_has_vfork = false;
+  ctx->at_stmt_start = true;
+  control_flow_reset();
+  last_emitted = NULL;
+}
+
+PRISM_API PrismFeatures prism_defaults(void)
+{
+  return (PrismFeatures){
+      .defer = true,
+      .zeroinit = true,
+      .line_directives = true,
+      .flatten_headers = true};
+}
+
+static uint32_t features_to_bits(PrismFeatures f)
+{
+  return (f.defer ? F_DEFER : 0) | (f.zeroinit ? F_ZEROINIT : 0) | (f.line_directives ? F_LINE_DIR : 0) | (f.warn_safety ? F_WARN_SAFETY : 0) | (f.flatten_headers ? F_FLATTEN : 0);
+}
+
+// respects $TMPDIR environment variable - Returns path with trailing slash (or empty string on Windows)
+static const char *get_tmp_dir(void)
+{
+  static char tmp_buf[PATH_MAX];
+#ifdef _WIN32
+  const char *tmpdir = getenv("TEMP");
+  if (!tmpdir || !tmpdir[0])
+    tmpdir = getenv("TMP");
+  static const char *fallback = ".\\";
+#else
+  const char *tmpdir = getenv("TMPDIR");
+  static const char *fallback = "/tmp/";
+#endif
+  if (tmpdir && tmpdir[0])
+  {
+    size_t len = strlen(tmpdir);
+    if (len < PATH_MAX - 2)
+    {
+      strcpy(tmp_buf, tmpdir);
+      char last = tmp_buf[len - 1];
+      if (last != '/' && last != '\\')
+      {
+        tmp_buf[len] = '/';
+        tmp_buf[len + 1] = '\0';
+      }
+      return tmp_buf;
+    }
+  }
+  return fallback;
+}
+
+// Fast single-char match for balanced scanners: direct char compare with rare digraph fallback
+static inline bool match_ch(Token *tok, char c)
+{
+  if (tok->len == 1)
+    return tok->loc[0] == c;
+  if (__builtin_expect(tok->flags & TF_IS_DIGRAPH, 0))
+    return _equal_1_digraph(tok, c);
+  return false;
+}
+
+// Check if token is identifier-like (TK_IDENT or TK_KEYWORD like 'raw'/'defer')
+static inline bool is_identifier_like(Token *tok)
+{
+  return tok->kind == TK_IDENT || tok->kind == TK_KEYWORD;
+}
+
+// Skip tokens to the next semicolon at depth 0, respecting balanced delimiters
+static Token *skip_to_semicolon(Token *tok)
+{
+  int depth = 0;
+  while (tok->kind != TK_EOF)
+  {
+    if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
+      depth++;
+    else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
+      depth--;
+    else if (depth == 0 && equal(tok, ";"))
+      return tok;
+    tok = tok->next;
+  }
+  return tok;
+}
+
+// Skip a balanced pair of delimiters (parens, brackets, braces).
+// tok must point to the opening delimiter. Returns the token after the closing one.
+static Token *skip_balanced(Token *tok, char open, char close)
+{
+  int depth = 1;
+  tok = tok->next; // skip opening
+  while (tok->kind != TK_EOF && depth > 0)
+  {
+    if (match_ch(tok, open))
+      depth++;
+    else if (match_ch(tok, close))
+      depth--;
+    tok = tok->next;
+  }
+  return tok;
+}
+
+// Skip GNU/MSVC-style attributes: __attribute__((...)), __declspec(...)
+static Token *skip_gnu_attributes(Token *tok)
+{
+  while (tok && (tok->tag & TT_ATTR))
+  {
+    tok = tok->next;
+    if (tok && equal(tok, "("))
+      tok = skip_balanced(tok, '(', ')');
+  }
+  return tok;
+}
+
+// Skip a single C23 [[ ... ]] attribute. Assumes tok is at first '['.
+static Token *skip_c23_attr(Token *tok)
+{
+  tok = tok->next->next; // skip [[
+  int depth = 1;
+  while (tok && tok->kind != TK_EOF && depth > 0)
+  {
+    if (match_ch(tok, '['))
+      depth++;
+    else if (match_ch(tok, ']'))
+      depth--;
+    tok = tok->next;
+  }
+  if (tok && match_ch(tok, ']'))
+    tok = tok->next;
+  return tok;
+}
+
+// Skip all attributes (GNU-style and C23-style [[...]])
+static Token *skip_all_attributes(Token *tok)
+{
+  while (tok && tok->kind != TK_EOF)
+  {
+    if (tok->tag & TT_ATTR)
+    {
+      tok = skip_gnu_attributes(tok);
+      continue;
+    }
+    if (is_c23_attr(tok))
+    {
+      tok = skip_c23_attr(tok);
+      continue;
+    }
+    break;
+  }
+  return tok;
+}
 
 static void out_flush(void)
 {
@@ -391,11 +527,6 @@ static void out_line(int line_no, const char *file)
   OUT_LIT("\"\n");
 }
 
-// System header tracking (for non-flattened output)
-static HashMap system_includes;    // Tracks unique system headers to emit
-static char **system_include_list; // Ordered list of includes
-static int system_include_capacity = 0;
-
 // Headers that must not be deduplicated (C standard requires re-includability)
 static bool is_reincludable_header(const char *name)
 {
@@ -447,9 +578,6 @@ static void emit_system_header_diag_pop(void)
 {
   OUT_LIT("#pragma GCC diagnostic pop\n");
 }
-
-// Note: #if guards removed — unknown pragmas are ignored per C11 §6.10.6,
-// and removing them enables -fpreprocessed (skip preprocessing on compile).
 
 // Emit collected #include directives with necessary feature test macros
 static void emit_system_includes(void)
@@ -513,8 +641,6 @@ static void system_includes_reset(void)
   ctx->system_include_count = 0;
   system_include_capacity = 0;
 }
-
-static void typedef_pop_scope(int scope_depth); // Forward declaration
 
 static void end_statement_after_semicolon(void)
 {
@@ -637,10 +763,9 @@ static bool needs_space(Token *prev, Token *tok)
   uint8_t a = (uint8_t)prev->loc[prev->len - 1], b = (uint8_t)tok->loc[0];
   // 'b' is always '=' or matches 'a' (++ -- << >> && || == ## /* */), plus ->
   if (b == '=')
-    return a == '=' || a == '!' || a == '<' || a == '>' ||
-           a == '+' || a == '-' || a == '*' || a == '/';
-  return (a == b && (a == '+' || a == '-' || a == '<' || a == '>' ||
-                     a == '&' || a == '|' || a == '#')) ||
+    return a == '=' || a == '!' || a == '<' || a == '>' || a == '+' || a == '-' || a == '*' || a == '/';
+
+  return (a == b && (a == '+' || a == '-' || a == '<' || a == '>' || a == '&' || a == '|' || a == '#')) ||
          (a == '-' && b == '>') || (a == '/' && b == '*') || (a == '*' && b == '/');
 }
 
@@ -753,18 +878,6 @@ static void emit_range(Token *start, Token *end)
     emit_tok(t);
 }
 
-// Emit defers with boundary control:
-// DEFER_SCOPE=current only, DEFER_ALL=all scopes, DEFER_BREAK=stop at loop/switch,
-// DEFER_CONTINUE=stop at loop, DEFER_TO_DEPTH=stop at given depth (for goto)
-typedef enum
-{
-  DEFER_SCOPE,
-  DEFER_ALL,
-  DEFER_BREAK,
-  DEFER_CONTINUE,
-  DEFER_TO_DEPTH
-} DeferEmitMode;
-
 static void emit_defers_ex(DeferEmitMode mode, int stop_depth)
 {
   if (ctx->defer_depth <= 0)
@@ -792,10 +905,6 @@ static void emit_defers_ex(DeferEmitMode mode, int stop_depth)
   }
 }
 
-#define emit_defers(mode) emit_defers_ex(mode, 0)
-#define emit_all_defers() emit_defers(DEFER_ALL)
-#define emit_goto_defers(depth) emit_defers_ex(DEFER_TO_DEPTH, depth)
-
 // Check if defers exist in scopes from current depth down to stop_depth (or boundary).
 // mode: DEFER_ALL=any active, DEFER_BREAK=to loop/switch, DEFER_CONTINUE=to loop, DEFER_TO_DEPTH=to depth
 static bool has_defers_for(DeferEmitMode mode, int stop_depth)
@@ -813,10 +922,6 @@ static bool has_defers_for(DeferEmitMode mode, int stop_depth)
   }
   return false;
 }
-
-#define has_active_defers() has_defers_for(DEFER_ALL, 0)
-#define control_flow_has_defers(include_switch) has_defers_for((include_switch) ? DEFER_BREAK : DEFER_CONTINUE, 0)
-#define goto_has_defers(depth) has_defers_for(DEFER_TO_DEPTH, depth)
 
 static void label_table_add(char *name, int name_len, int scope_depth)
 {
@@ -859,14 +964,6 @@ static void typedef_set_index(char *name, int len, int index)
   hashmap_put(&typedef_table.name_map, name, len, (void *)(intptr_t)(index + 1));
 }
 
-typedef enum
-{
-  TDK_TYPEDEF,
-  TDK_SHADOW,
-  TDK_ENUM_CONST,
-  TDK_VLA_VAR // VLA variable (not typedef, but actual VLA array variable)
-} TypedefKind;
-
 static void typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool is_vla,
                               bool is_void)
 {
@@ -897,11 +994,6 @@ static void typedef_add_entry(char *name, int len, int scope_depth, TypedefKind 
   typedef_set_index(name, len, new_index);
 }
 
-#define typedef_add(name, len, depth, is_vla, is_void) typedef_add_entry(name, len, depth, TDK_TYPEDEF, is_vla, is_void)
-#define typedef_add_shadow(name, len, depth) typedef_add_entry(name, len, depth, TDK_SHADOW, false, false)
-#define typedef_add_enum_const(name, len, depth) typedef_add_entry(name, len, depth, TDK_ENUM_CONST, false, false)
-#define typedef_add_vla_var(name, len, depth) typedef_add_entry(name, len, depth, TDK_VLA_VAR, true, false)
-
 // Called when exiting a scope - removes typedefs defined at or above given depth.
 // Uses >= instead of == for resilience: if a deeper scope's entries weren't cleaned up
 // (e.g., missed phantom pop, macro edge case), they get swept up here rather than
@@ -920,10 +1012,6 @@ static void typedef_pop_scope(int scope_depth)
     typedef_table.count--;
   }
 }
-
-// Forward declarations
-static bool is_known_typedef(Token *tok);
-static bool is_type_keyword(Token *tok);
 
 // Parse enum body and register constants as shadows for any matching typedefs.
 // Enum constants are visible in the enclosing scope, so they shadow typedefs.
@@ -1062,23 +1150,6 @@ static Token *find_struct_body_brace(Token *tok)
     }
   }
   return (t && equal(t, "{")) ? t : NULL;
-}
-
-// Unified token walker — iterates tokens tracking brace depth, struct bodies,
-// and _Generic skipping. Used by scan_labels_in_function and goto_skips_check
-// to eliminate duplicated structural token-walking logic.
-typedef struct
-{
-  Token *tok;        // Current token
-  Token *prev;       // Previous meaningful token
-  int depth;         // Brace depth (updated on { and })
-  int struct_depth;  // Nesting inside struct/union/enum bodies
-  int initial_depth; // Starting depth (break when } would go below this)
-} TokenWalker;
-
-static void walker_init(TokenWalker *w, Token *start, int initial_depth)
-{
-  *w = (TokenWalker){.tok = start, .initial_depth = initial_depth, .depth = initial_depth};
 }
 
 // Advance to next meaningful token. Skips struct/union/enum body openings
@@ -1251,13 +1322,6 @@ static void scan_labels_in_function(Token *tok)
   }
 }
 
-// Result of goto skip analysis — both defer and decl checked in a single walk
-typedef struct
-{
-  Token *skipped_defer;
-  Token *skipped_decl;
-} GotoSkipResult;
-
 // Check if a forward goto would skip over defer statements or variable declarations.
 // Returns both results in one walk. Either field NULL means safe for that check.
 //
@@ -1287,7 +1351,7 @@ static GotoSkipResult goto_skips_check(Token *goto_tok, char *label_name, int la
   while (walker_next(&w))
   {
     // For-loop init detection (for decl check)
-    if (check_decl && w.tok->kind == TK_KEYWORD && equal(w.tok, "for"))
+    if (check_decl && (w.tok->tag & TT_LOOP) && equal(w.tok, "for"))
     {
       walker_advance(&w);
       if (w.tok && equal(w.tok, "("))
@@ -1301,44 +1365,39 @@ static GotoSkipResult goto_skips_check(Token *goto_tok, char *label_name, int la
       continue;
     }
 
-    if (equal(w.tok, "{"))
+    // Consolidated structural token handling: {, }, ;
+    if (w.tok->len == 1)
     {
-      is_stmt_start = true;
-      walker_advance(&w);
-      continue;
-    }
-    if (equal(w.tok, "}"))
-    {
-      if (active_defer && w.depth < defer_depth)
+      char c = w.tok->loc[0];
+      if (c == '{' || c == '}' || c == ';')
       {
-        active_defer = NULL;
-        defer_depth = -1;
+        if (c == '}')
+        {
+          if (active_defer && w.depth < defer_depth)
+          {
+            active_defer = NULL;
+            defer_depth = -1;
+          }
+          if (active_decl && w.depth < decl_depth)
+          {
+            active_decl = NULL;
+            decl_depth = -1;
+          }
+        }
+        if (c == ';' && is_in_for_init)
+          is_in_for_init = false;
+        is_stmt_start = true;
+        walker_advance(&w);
+        continue;
       }
-      if (active_decl && w.depth < decl_depth)
-      {
-        active_decl = NULL;
-        decl_depth = -1;
-      }
-      is_stmt_start = true;
-      walker_advance(&w);
-      continue;
-    }
-    if (equal(w.tok, ";"))
-    {
-      is_stmt_start = true;
-      if (is_in_for_init)
-        is_in_for_init = false;
-      walker_advance(&w);
-      continue;
     }
 
     // Track defers
     if (check_defer)
     {
       bool is_var = w.prev && (is_type_keyword(w.prev) || equal(w.prev, "*") ||
-                               equal(w.prev, "const") || equal(w.prev, "volatile") ||
-                               equal(w.prev, "restrict") || equal(w.prev, "__restrict") ||
-                               equal(w.prev, ","));
+                               (w.prev->tag & TT_QUALIFIER) ||
+                               equal(w.prev, "__restrict") || equal(w.prev, ","));
       if ((w.tok->tag & TT_DEFER) &&
           !equal(w.tok->next, ":") &&
           !(w.prev && (w.prev->tag & TT_MEMBER)) && !is_var &&
@@ -1402,38 +1461,6 @@ static GotoSkipResult goto_skips_check(Token *goto_tok, char *label_name, int la
   }
 
   return r;
-}
-
-// Transpiler
-static Token *skip_to_semicolon(Token *tok)
-{
-  int depth = 0;
-  while (tok->kind != TK_EOF)
-  {
-    if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
-      depth++;
-    else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
-      depth--;
-    else if (depth == 0 && equal(tok, ";"))
-      return tok;
-    tok = tok->next;
-  }
-  return tok;
-}
-
-static Token *skip_balanced(Token *tok, char open, char close)
-{
-  int depth = 1;
-  tok = tok->next; // skip opening
-  while (tok->kind != TK_EOF && depth > 0)
-  {
-    if (match_ch(tok, open))
-      depth++;
-    else if (match_ch(tok, close))
-      depth--;
-    tok = tok->next;
-  }
-  return tok;
 }
 
 // Check if tokens between after_paren and brace form K&R parameter declarations.
@@ -1516,22 +1543,6 @@ static bool is_void_function_decl(Token *tok)
   return tok && tok->kind == TK_IDENT && tok->next && equal(tok->next, "(");
 }
 
-// Declarator parsing result
-typedef struct
-{
-  Token *end;       // First token after declarator
-  Token *var_name;  // The variable name token
-  bool is_pointer;  // Has pointer modifier
-  bool is_array;    // Is array type
-  bool is_vla;      // Has variable-length array dimension
-  bool is_func_ptr; // Is function pointer
-  bool has_paren;   // Has parenthesized declarator
-  bool has_init;    // Has initializer (=)
-} DeclResult;
-
-// Forward declaration: unified declarator parser (emit=true emits tokens, emit=false skips)
-static DeclResult parse_declarator(Token *tok, bool emit);
-
 // Check if an array dimension (from '[' to matching ']') contains a VLA expression.
 // Simple rule: any identifier that isn't a type/enum constant, or appears after
 // member access (./->) is a runtime variable → VLA. sizeof/alignof/offsetof
@@ -1542,8 +1553,7 @@ static bool array_size_is_vla(Token *open_bracket)
 
   while (tok && tok->kind != TK_EOF && !equal(tok, "]"))
   {
-    // Skip nested brackets
-    if (equal(tok, "["))
+    if (equal(tok, "[")) // Skip nested brackets
     {
       tok = skip_balanced(tok, '[', ']');
       continue;
@@ -1623,9 +1633,6 @@ static bool scan_for_vla(Token *tok, const char *open, const char *close)
   return false;
 }
 
-#define struct_body_contains_vla(brace) scan_for_vla(brace, "{", "}")
-#define typedef_contains_vla(tok) scan_for_vla(tok, NULL, ";")
-
 static void parse_typedef_declaration(Token *tok, int scope_depth)
 {
   Token *typedef_start = tok;
@@ -1633,7 +1640,6 @@ static void parse_typedef_declaration(Token *tok, int scope_depth)
   Token *type_start = tok;
   tok = parse_type_specifier(tok).end; // Skip the base type
 
-  // Check if this typedef contains a VLA anywhere
   bool is_vla = typedef_contains_vla(typedef_start);
 
   // Check if the base type is void (or a typedef alias for void).
@@ -1734,20 +1740,19 @@ static TypeSpecResult parse_type_specifier(Token *tok)
   bool is_type = false;
   while ((tok->tag & TT_QUALIFIER) || (is_type = is_type_keyword(tok)) || is_c23_attr(tok))
   {
-    // Track _Atomic
-    if (equal(tok, "_Atomic"))
-      r.has_atomic = true;
+    // Track qualifiers via tag bits (no string comparisons)
+    if (tok->tag & TT_QUALIFIER)
+    {
+      if (tok->tag & TT_VOLATILE)
+        r.has_volatile = true;
+      if (tok->tag & TT_REGISTER)
+        r.has_register = true;
+    }
+    if (tok->tag & TT_TYPE)
+      if (tok->tag & TT_QUALIFIER) // _Atomic is TT_QUALIFIER | TT_TYPE
+        r.has_atomic = true;
 
-    // Track register storage class
-    if (equal(tok, "register"))
-      r.has_register = true;
-
-    // Track volatile qualifier
-    if (equal(tok, "volatile"))
-      r.has_volatile = true;
-
-    // Skip C23 [[ ... ]] attributes
-    if (is_c23_attr(tok))
+    if (is_c23_attr(tok)) // Skip C23 [[ ... ]] attributes
     {
       tok = skip_c23_attr(tok);
       r.end = tok;
@@ -1759,8 +1764,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       r.saw_type = true;
     is_type = false;
 
-    // struct/union/enum
-    if (tok->tag & TT_SUE)
+    if (tok->tag & TT_SUE) // struct/union/enum
     {
       r.is_struct = true;
       r.saw_type = true;
@@ -1772,11 +1776,12 @@ static TypeSpecResult parse_type_specifier(Token *tok)
         if (tok && equal(tok, "("))
           tok = skip_balanced(tok, '(', ')');
       }
-      // Skip tag name
-      if (tok && tok->kind == TK_IDENT)
+
+      if (tok && tok->kind == TK_IDENT) // Skip tag name
         tok = tok->next;
-      // Skip body
-      if (tok && equal(tok, "{"))
+
+      if (tok && equal(tok, "{")) // Skip body
+
       {
         if (struct_body_contains_vla(tok))
           r.is_vla = true;
@@ -1786,9 +1791,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       continue;
     }
 
-    // typeof/typeof_unqual/__typeof__
-    if (equal(tok, "typeof") || equal(tok, "__typeof__") || equal(tok, "__typeof") ||
-        equal(tok, "typeof_unqual"))
+    if (tok->tag & TT_TYPEOF) // typeof/typeof_unqual/__typeof__
     {
       bool is_unqual = equal(tok, "typeof_unqual");
       r.saw_type = true;
@@ -1801,7 +1804,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
         if (!is_unqual)
         {
           for (Token *t = tok->next; t && t != end; t = t->next)
-            if (equal(t, "volatile"))
+            if (t->tag & TT_VOLATILE)
             {
               r.has_volatile = true;
               break;
@@ -1813,8 +1816,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       continue;
     }
 
-    // _BitInt(N)
-    if (equal(tok, "_BitInt"))
+    if (tok->tag & TT_BITINT) // _BitInt(N)
     {
       r.saw_type = true;
       tok = tok->next;
@@ -1825,7 +1827,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
     }
 
     // _Atomic(type) specifier form
-    if (equal(tok, "_Atomic") && tok->next && equal(tok->next, "("))
+    if ((tok->tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE) && tok->next && equal(tok->next, "("))
     {
       r.saw_type = true;
       r.has_atomic = true;
@@ -1842,8 +1844,8 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       continue;
     }
 
-    // _Alignas/alignas/__attribute__ (all tagged as TT_QUALIFIER or TT_ATTR)
-    if ((tok->tag & TT_ATTR) || equal(tok, "_Alignas") || equal(tok, "alignas"))
+    // _Alignas/alignas/__attribute__ (all tagged TT_ALIGNAS or TT_ATTR)
+    if ((tok->tag & TT_ATTR) || (tok->tag & TT_ALIGNAS))
     {
       tok = tok->next;
       if (tok && equal(tok, "("))
@@ -1930,44 +1932,43 @@ static Token *emit_attr(Token *tok)
   return tok;
 }
 
+static inline void decl_emit(Token *t, bool emit)
+{
+  if (emit)
+    emit_tok(t);
+}
+
+static inline Token *decl_balanced(Token *t, bool emit)
+{
+  return emit ? emit_balanced(t) : skip_balanced(t, tok_open_ch(t), close_for(tok_open_ch(t)));
+}
+
+static inline Token *decl_attr(Token *t, bool emit)
+{
+  if (emit)
+    return emit_attr(t);
+  t = t->next;
+  if (t && equal(t, "("))
+    t = skip_balanced(t, '(', ')');
+  return t;
+}
+
+static inline Token *decl_array_dims(Token *t, bool emit, bool *vla)
+{
+  while (equal(t, "["))
+  {
+    if (array_size_is_vla(t))
+      *vla = true;
+    t = decl_balanced(t, emit);
+  }
+  return t;
+}
+
 // Unified declarator parser. When emit=true, emits tokens while parsing.
 // When emit=false, only advances without output (replaces old skip_declarator).
 static DeclResult parse_declarator(Token *tok, bool emit)
 {
   DeclResult r = {tok, NULL, false, false, false, false, false, false};
-
-// Helper macros for conditional emit
-#define DECL_EMIT(t) \
-  do                 \
-  {                  \
-    if (emit)        \
-      emit_tok(t);   \
-  } while (0)
-#define DECL_BALANCED(t) (emit ? emit_balanced(t) : skip_balanced(t, tok_open_ch(t), close_for(tok_open_ch(t))))
-#define DECL_ATTR(t)                    \
-  do                                    \
-  {                                     \
-    if (emit)                           \
-    {                                   \
-      t = emit_attr(t);                 \
-    }                                   \
-    else                                \
-    {                                   \
-      t = (t)->next;                    \
-      if (t && equal(t, "("))           \
-        t = skip_balanced(t, '(', ')'); \
-    }                                   \
-  } while (0)
-#define DECL_ARRAY_DIMS(t, vla) \
-  do                            \
-  {                             \
-    while (equal(t, "["))       \
-    {                           \
-      if (array_size_is_vla(t)) \
-        *(vla) = true;          \
-      t = DECL_BALANCED(t);     \
-    }                           \
-  } while (0)
 
   // Pointer modifiers and qualifiers (with depth limit for safety)
   int ptr_depth = 0;
@@ -1984,10 +1985,10 @@ static DeclResult parse_declarator(Token *tok, bool emit)
     }
     if (tok->tag & TT_ATTR)
     {
-      DECL_ATTR(tok);
+      tok = decl_attr(tok, emit);
       continue;
     }
-    DECL_EMIT(tok);
+    decl_emit(tok, emit);
     tok = tok->next;
   }
 
@@ -2010,7 +2011,7 @@ static DeclResult parse_declarator(Token *tok, bool emit)
       return r;
     }
 
-    DECL_EMIT(tok);
+    decl_emit(tok, emit);
     tok = tok->next;
     nested_paren = 1;
     r.is_pointer = true;
@@ -2025,34 +2026,33 @@ static DeclResult parse_declarator(Token *tok, bool emit)
         nested_paren++;
       if (tok->tag & TT_ATTR)
       {
-        DECL_ATTR(tok);
+        tok = decl_attr(tok, emit);
         continue;
       }
-      DECL_EMIT(tok);
+      decl_emit(tok, emit);
       tok = tok->next;
     }
   }
 
-  // Must have identifier
-  if (!is_valid_varname(tok))
+  if (!is_valid_varname(tok)) // Must have identifier
   {
     r.end = NULL;
     return r;
   }
 
   r.var_name = tok;
-  DECL_EMIT(tok);
+  decl_emit(tok, emit);
   tok = tok->next;
 
   // Skip __attribute__ after variable name
   while (tok && tok->kind != TK_EOF && (tok->tag & TT_ATTR))
-    DECL_ATTR(tok);
+    tok = decl_attr(tok, emit);
 
   // Array dims inside parens: (*name[N])
   if (r.has_paren && equal(tok, "["))
   {
     r.is_array = true;
-    DECL_ARRAY_DIMS(tok, &r.is_vla);
+    tok = decl_array_dims(tok, emit, &r.is_vla);
   }
 
   // Close nested parens, handling function args or array dims at each level
@@ -2061,11 +2061,11 @@ static DeclResult parse_declarator(Token *tok, bool emit)
     while (equal(tok, "(") || equal(tok, "["))
     {
       if (equal(tok, "("))
-        tok = DECL_BALANCED(tok);
+        tok = decl_balanced(tok, emit);
       else
       {
         r.is_array = true;
-        DECL_ARRAY_DIMS(tok, &r.is_vla);
+        tok = decl_array_dims(tok, emit, &r.is_vla);
       }
     }
     if (!equal(tok, ")"))
@@ -2073,7 +2073,7 @@ static DeclResult parse_declarator(Token *tok, bool emit)
       r.end = NULL;
       return r;
     }
-    DECL_EMIT(tok);
+    decl_emit(tok, emit);
     tok = tok->next;
     nested_paren--;
   }
@@ -2087,27 +2087,22 @@ static DeclResult parse_declarator(Token *tok, bool emit)
       return r;
     }
     r.is_func_ptr = true;
-    tok = DECL_BALANCED(tok);
+    tok = decl_balanced(tok, emit);
   }
 
   // Array dimensions outside parens
   if (equal(tok, "["))
   {
     r.is_array = true;
-    DECL_ARRAY_DIMS(tok, &r.is_vla);
+    tok = decl_array_dims(tok, emit, &r.is_vla);
   }
 
   // Skip __attribute__ before initializer or end of declarator
   while (tok && tok->kind != TK_EOF && (tok->tag & TT_ATTR))
-    DECL_ATTR(tok);
+    tok = decl_attr(tok, emit);
 
   r.has_init = equal(tok, "=");
   r.end = tok;
-
-#undef DECL_EMIT
-#undef DECL_BALANCED
-#undef DECL_ATTR
-#undef DECL_ARRAY_DIMS
 
   return r;
 }
@@ -2135,9 +2130,7 @@ static bool is_var_declaration(Token *type_end)
 // Returns true if 'raw' is followed by something that makes it look like a declaration
 static bool is_raw_declaration_context(Token *after_raw)
 {
-  return after_raw && (is_type_keyword(after_raw) || is_known_typedef(after_raw) ||
-                       equal(after_raw, "*") ||
-                       (after_raw->tag & (TT_QUALIFIER | TT_SUE)));
+  return after_raw && (is_type_keyword(after_raw) || is_known_typedef(after_raw) || equal(after_raw, "*") || (after_raw->tag & (TT_QUALIFIER | TT_SUE)));
 }
 
 // Emit tokens from start through semicolon
@@ -2191,8 +2184,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
     tok = decl.end;
 
     // Determine effective VLA status (excluding typeof - handled specially)
-    bool effective_vla = (decl.is_vla && !decl.has_paren) ||
-                         (type->is_vla && !decl.is_pointer);
+    bool effective_vla = (decl.is_vla && !decl.has_paren) || (type->is_vla && !decl.is_pointer);
 
     // For typeof declarations, use memset instead of = 0 or = {0}
     // Also for atomic aggregates: Clang doesn't support _Atomic aggregate init syntax
@@ -2304,8 +2296,7 @@ static Token *try_zero_init_decl(Token *tok)
   if (!FEAT(F_ZEROINIT) || ctx->defer_depth <= 0 || ctx->struct_depth > 0)
     return NULL;
 
-  // Fast reject: punctuation, numbers, strings, and EOF can never start a declaration
-  if (tok->kind >= TK_STR)
+  if (tok->kind >= TK_STR) // Fast reject: punctuation, numbers, strings, and EOF can never start a declaration
     return NULL;
 
   // Check for "switch skip hole" - declarations directly in switch body
@@ -2353,8 +2344,7 @@ static Token *try_zero_init_decl(Token *tok)
       start = tok;
   }
 
-  // Handle storage class specifiers
-  if (tok->tag & TT_SKIP_DECL)
+  if (tok->tag & TT_SKIP_DECL) // Storage class specifiers
   {
     if (is_raw)
     {
@@ -2454,8 +2444,6 @@ static Token *emit_expr_to_semicolon(Token *tok)
   }
   return tok;
 }
-
-static void report_goto_skips_decl(Token *skipped_decl, Token *label_tok);
 
 // Handle 'defer' keyword: validate context, record deferred statement.
 // Returns next token after the defer statement, or NULL if tok is not a valid defer.
@@ -2605,6 +2593,16 @@ static Token *handle_break_continue_defer(Token *tok)
   return tok;
 }
 
+// Report goto skipping over a variable declaration (warn or error based on FEAT(F_WARN_SAFETY))
+static void report_goto_skips_decl(Token *skipped_decl, Token *label_tok)
+{
+  const char *msg = "goto '%.*s' would skip over this variable declaration (bypasses zero-init)";
+  if (FEAT(F_WARN_SAFETY))
+    warn_tok(skipped_decl, msg, label_tok->len, label_tok->loc);
+  else
+    error_tok(skipped_decl, msg, label_tok->len, label_tok->loc);
+}
+
 // Handle 'goto': defer cleanup + zeroinit safety checks.
 // Returns next token if fully handled, or NULL to let normal emit proceed.
 static Token *handle_goto_keyword(Token *tok)
@@ -2616,8 +2614,7 @@ static Token *handle_goto_keyword(Token *tok)
   {
     mark_switch_control_exit();
 
-    // Computed goto
-    if (equal(tok, "*"))
+    if (equal(tok, "*")) // Computed goto
     {
       if (has_active_defers())
         error_tok(goto_tok, "computed goto cannot be used with active defer statements");
@@ -2775,23 +2772,6 @@ static Token *handle_close_brace(Token *tok)
   return tok;
 }
 
-// Report goto skipping over a variable declaration (warn or error based on FEAT(F_WARN_SAFETY))
-static void report_goto_skips_decl(Token *skipped_decl, Token *label_tok)
-{
-  const char *msg = "goto '%.*s' would skip over this variable declaration (bypasses zero-init)";
-  if (FEAT(F_WARN_SAFETY))
-    warn_tok(skipped_decl, msg, label_tok->len, label_tok->loc);
-  else
-    error_tok(skipped_decl, msg, label_tok->len, label_tok->loc);
-}
-
-// Dynamic argv array
-typedef struct
-{
-  char **data;
-  int count, capacity;
-} ArgvBuilder;
-#define argv_builder_init(ab) (*(ab) = (ArgvBuilder){0})
 static inline void argv_builder_add(ArgvBuilder *ab, const char *arg)
 {
   ENSURE_ARRAY_CAP(ab->data, ab->count + 2, ab->capacity, 64, char *);
@@ -2801,14 +2781,11 @@ static inline void argv_builder_add(ArgvBuilder *ab, const char *arg)
   ab->count++;
   ab->data[ab->count] = NULL;
 }
-#define argv_builder_finish(ab) ((ab)->data)
 
 // Build a copy of 'environ' with CC and PRISM_CC removed.
 // Build a copy of 'environ' with CC and PRISM_CC removed.
 // Cached: built once, reused for all child processes.
 // Caller must NOT free() the returned array.
-extern char **environ;
-static char **cached_clean_env = NULL;
 static char **build_clean_environ(void)
 {
   if (cached_clean_env)
@@ -2881,11 +2858,43 @@ static void free_argv(char **argv)
 // Unified temp file creation with optional suffix (e.g., ".c" → suffix_len=2)
 // If source_adjacent is non-NULL, creates file next to that source file instead of in tmp dir.
 // Returns 0 on success, -1 on failure. Path written to buf.
-static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len,
-                          const char *source_adjacent)
+// Atomically creates a temp file from an XXXXXX template.
+// On Windows, appends win_suffix (e.g. ".c", ".exe") after name generation.
+// On POSIX, uses mkstemps if suffix_len > 0 (suffix is already in template).
+#if defined(_WIN32)
+static int atomic_mkstemp(char *buf, size_t bufsize, const char *win_suffix)
+{
+  for (int attempt = 0; attempt < 100; attempt++)
+  {
+    char try_buf[PATH_MAX];
+    size_t len = strlen(buf);
+    memcpy(try_buf, buf, len + 1);
+    if (_mktemp_s(try_buf, len + 1) != 0)
+      return -1;
+    if (win_suffix)
+    {
+      size_t tlen = strlen(try_buf);
+      size_t slen = strlen(win_suffix);
+      if (tlen + slen + 1 >= sizeof(try_buf))
+        return -1;
+      memcpy(try_buf + tlen, win_suffix, slen + 1);
+    }
+    int fd;
+    errno_t err = _sopen_s(&fd, try_buf, _O_CREAT | _O_EXCL | _O_WRONLY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
+    if (err == 0 && fd >= 0)
+    {
+      _close(fd);
+      memcpy(buf, try_buf, strlen(try_buf) + 1);
+      return 0;
+    }
+  }
+  return -1;
+}
+#endif
+
+static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len, const char *source_adjacent)
 {
   int n;
-  int actual_suffix_len = 0;
   if (source_adjacent)
   {
     const char *slash = strrchr(source_adjacent, '/');
@@ -2896,7 +2905,6 @@ static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suf
     {
       int dir_len = (int)(slash - source_adjacent);
 #ifdef _WIN32
-      // _mktemp_s needs XXXXXX at the END — append .c after temp name is generated
       n = snprintf(buf, bufsize, "%.*s/.%s.XXXXXX", dir_len, source_adjacent, slash + 1);
 #else
       n = snprintf(buf, bufsize, "%.*s/.%s.XXXXXX.c", dir_len, source_adjacent, slash + 1);
@@ -2910,60 +2918,50 @@ static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suf
       n = snprintf(buf, bufsize, ".%s.XXXXXX.c", source_adjacent);
 #endif
     }
-    actual_suffix_len = 2; // .c suffix
     suffix_len = 2;
   }
   else
     n = snprintf(buf, bufsize, "%s%s", get_tmp_dir(), prefix);
   if (n < 0 || (size_t)n >= bufsize)
-    return -1; // path truncated, XXXXXX template would be corrupted
-#if defined(_WIN32)
-  // Use _sopen_s with _O_CREAT|_O_EXCL for atomic creation (avoids TOCTOU race of _mktemp_s)
-  // Note: _mktemp_s requires XXXXXX at end of template — suffix is appended after.
-  {
-    // Try up to 100 unique names
-    for (int attempt = 0; attempt < 100; attempt++)
-    {
-      char try_buf[PATH_MAX];
-      size_t len = strlen(buf);
-      memcpy(try_buf, buf, len + 1);
-      if (_mktemp_s(try_buf, len + 1) != 0)
-        return -1;
-      // Append .c suffix if needed
-      if (actual_suffix_len > 0)
-      {
-        size_t tlen = strlen(try_buf);
-        if (tlen + 3 >= sizeof(try_buf))
-          return -1;
-        try_buf[tlen] = '.';
-        try_buf[tlen + 1] = 'c';
-        try_buf[tlen + 2] = '\0';
-      }
-      int fd;
-      errno_t err = _sopen_s(&fd, try_buf, _O_CREAT | _O_EXCL | _O_WRONLY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
-      if (err == 0 && fd >= 0)
-      {
-        _close(fd);
-        memcpy(buf, try_buf, strlen(try_buf) + 1);
-        return 0;
-      }
-    }
     return -1;
-  }
+#if defined(_WIN32)
+  return atomic_mkstemp(buf, bufsize, source_adjacent ? ".c" : NULL);
 #elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
   int fd = suffix_len > 0 ? mkstemps(buf, suffix_len) : mkstemp(buf);
   if (fd < 0)
     return -1;
   close(fd);
+  return 0;
 #else
-  // Fallback: use mkstemps where available, otherwise mkstemp.
-  // mkstemps is widely available on any system that has mkstemp.
   int fd = suffix_len > 0 ? mkstemps(buf, suffix_len) : mkstemp(buf);
   if (fd < 0)
     return -1;
   close(fd);
-#endif
   return 0;
+#endif
+}
+
+// Extract filename from path (handles both / and \ separators)
+static const char *path_basename(const char *path)
+{
+  const char *fwd = strrchr(path, '/');
+  const char *bck = strrchr(path, '\\');
+  if (bck && (!fwd || bck > fwd))
+    fwd = bck;
+  return fwd ? fwd + 1 : path;
+}
+
+static bool cc_is_msvc(const char *cc)
+{
+#ifndef _WIN32
+  (void)cc;
+  return false;
+#else
+  if (!cc || !*cc)
+    return false;
+  const char *base = path_basename(cc);
+  return (_stricmp(base, "cl") == 0 || _stricmp(base, "cl.exe") == 0);
+#endif
 }
 
 // Build preprocessor argv into an ArgvBuilder.
@@ -2975,19 +2973,16 @@ static void build_pp_argv(ArgvBuilder *ab, const char *input_file)
   argv_builder_add(ab, "-E");
   argv_builder_add(ab, "-w"); // suppress warnings (linker flags passed through are harmless)
 
-  // Add compiler flags
-  for (int i = 0; i < ctx->extra_compiler_flags_count; i++)
+  for (int i = 0; i < ctx->extra_compiler_flags_count; i++) // compiler flags
     argv_builder_add(ab, ctx->extra_compiler_flags[i]);
 
-  // Add include paths
-  for (int i = 0; i < ctx->extra_include_count; i++)
+  for (int i = 0; i < ctx->extra_include_count; i++) // include paths
   {
     argv_builder_add(ab, "-I");
     argv_builder_add(ab, ctx->extra_include_paths[i]);
   }
 
-  // Add defines
-  for (int i = 0; i < ctx->extra_define_count; i++)
+  for (int i = 0; i < ctx->extra_define_count; i++) // defines
   {
     argv_builder_add(ab, "-D");
     argv_builder_add(ab, ctx->extra_defines[i]);
@@ -3026,8 +3021,7 @@ static void build_pp_argv(ArgvBuilder *ab, const char *input_file)
   }
 #endif
 
-  // Add force-includes
-  for (int i = 0; i < ctx->extra_force_include_count; i++)
+  for (int i = 0; i < ctx->extra_force_include_count; i++) // force-includes
   {
     argv_builder_add(ab, cc_is_msvc(ab->data[0]) ? "/FI" : "-include");
     argv_builder_add(ab, ctx->extra_force_includes[i]);
@@ -3081,7 +3075,6 @@ static char *preprocess_with_cc(const char *input_file)
   }
 
   // Parent: read all preprocessed output from pipe
-
   size_t cap = 128 * 1024, len = 0;
   char *buf = malloc(cap);
   if (!buf)
@@ -3123,65 +3116,47 @@ static char *preprocess_with_cc(const char *input_file)
   return buf;
 }
 
-static void reset_transpiler_state(void)
+// ── Shared helpers for transpile_tokens (called from both fast and slow paths) ──
+
+static inline void track_ctrl_paren_open(void)
 {
-  ctx->defer_depth = 0;
-  ctx->struct_depth = 0;
-  ctx->conditional_block_depth = 0;
-  ctx->generic_paren_depth = 0;
-  ctx->stmt_expr_count = 0;
-  ctx->last_line_no = 0;
-  ctx->ret_counter = 0;
-  ctx->last_filename = NULL;
-  ctx->last_system_header = false;
-  ctx->current_func_returns_void = false;
-  ctx->current_func_has_setjmp = false;
-  ctx->current_func_has_asm = false;
-  ctx->current_func_has_vfork = false;
-  ctx->at_stmt_start = true;
-  control_flow_reset();
-  last_emitted = NULL;
+  ctrl.paren_depth++;
+  ctrl.parens_just_closed = false;
+  if (ctrl.await_for_paren)
+  {
+    ctrl.for_init = true;
+    ctx->at_stmt_start = true;
+    ctrl.await_for_paren = false;
+  }
 }
 
-// Forward declaration
-static int transpile_tokens(Token *tok, FILE *fp);
-
-// Preprocess + tokenize + transpile to a file path.
-// This is the original interface used by the CLI and library API.
-static int transpile(char *input_file, char *output_file)
+static inline void track_ctrl_paren_close(void)
 {
-  // Ensure keyword map is initialized before allocating preprocessor buffer.
-  // If init fails (OOM → longjmp in lib mode), we haven't allocated pp_buf yet.
-  if (!ctx->keyword_map.capacity)
-    init_keyword_map();
-
-  // Run system preprocessor via pipe — no temp files
-  char *pp_buf = preprocess_with_cc(input_file);
-  if (!pp_buf)
+  ctrl.paren_depth--;
+  if (ctrl.paren_depth == 0)
   {
-    fprintf(stderr, "Preprocessing failed for: %s\n", input_file);
-    return 0;
+    ctrl.for_init = false;
+    ctrl.parens_just_closed = true;
   }
+}
 
-  // Tokenize directly from the in-memory buffer (takes ownership of pp_buf)
-  Token *tok = tokenize_buffer(input_file, pp_buf);
-  // pp_buf is now owned by the tokenizer (freed in tokenizer_teardown)
-
-  if (!tok)
+static inline void track_ctrl_semicolon(void)
+{
+  if (ctrl.paren_depth == 1 && ctrl.for_init)
+    ctrl.for_init = false;
+  else if (ctrl.paren_depth == 0)
   {
-    fprintf(stderr, "Failed to tokenize preprocessed output\n");
-    tokenizer_teardown(false);
-    return 0;
+    typedef_pop_scope(ctx->defer_depth + 1);
+    control_flow_reset();
   }
+}
 
-  FILE *fp = fopen(output_file, "w");
-  if (!fp)
-  {
-    tokenizer_teardown(false);
-    return 0;
-  }
-
-  return transpile_tokens(tok, fp);
+static inline void track_generic_paren(Token *tok)
+{
+  if (equal(tok, "("))
+    ctx->generic_paren_depth++;
+  else if (equal(tok, ")"))
+    ctx->generic_paren_depth--;
 }
 
 // Core transpile: emit transformed tokens to an already-opened FILE*.
@@ -3191,19 +3166,16 @@ static int transpile_tokens(Token *tok, FILE *fp)
 {
   out_init(fp);
 
-  // Suppress warnings for inlined system header content.
-  if (FEAT(F_FLATTEN))
+  if (FEAT(F_FLATTEN)) // Suppress warnings for inlined system header content.
   {
     emit_system_header_diag_push();
     out_char('\n');
   }
 
-  // Reset state
   reset_transpiler_state();
-  typedef_table_reset(); // Reset typedef tracking
-
-  // Handle system headers: collect and emit #includes, or flatten
+  typedef_table_reset();
   system_includes_reset();
+
   if (!FEAT(F_FLATTEN))
   {
     collect_system_includes();
@@ -3220,7 +3192,6 @@ static int transpile_tokens(Token *tok, FILE *fp)
     Token *next;
     uint32_t tag = tok->tag;
 
-    // Dispatch macro: call handler, advance if it consumed tokens
 #define DISPATCH(handler) \
   {                       \
     next = handler(tok);  \
@@ -3265,15 +3236,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
         if (c == ';')
         {
           if (ctrl.pending)
-          {
-            if (ctrl.paren_depth == 1 && ctrl.for_init)
-              ctrl.for_init = false;
-            else if (ctrl.paren_depth == 0)
-            {
-              typedef_pop_scope(ctx->defer_depth + 1);
-              control_flow_reset();
-            }
-          }
+            track_ctrl_semicolon();
           if (!ctrl.pending)
             ctx->at_stmt_start = true;
           if (ctx->defer_depth == 0)
@@ -3289,29 +3252,12 @@ static int transpile_tokens(Token *tok, FILE *fp)
         if (ctrl.pending)
         {
           if (c == '(')
-          {
-            ctrl.paren_depth++;
-            ctrl.parens_just_closed = false;
-            if (ctrl.await_for_paren)
-            {
-              ctrl.for_init = true;
-              ctx->at_stmt_start = true;
-              ctrl.await_for_paren = false;
-            }
-          }
+            track_ctrl_paren_open();
           else if (c == ')')
-          {
-            ctrl.paren_depth--;
-            if (ctrl.paren_depth == 0)
-            {
-              ctrl.for_init = false;
-              ctrl.parens_just_closed = true;
-            }
-          }
+            track_ctrl_paren_close();
         }
         // Labels
-        if (c == ':' && last_emitted && last_emitted->kind == TK_IDENT &&
-            ctx->struct_depth == 0 && ctx->defer_depth > 0)
+        if (c == ':' && last_emitted && last_emitted->kind == TK_IDENT && ctx->struct_depth == 0 && ctx->defer_depth > 0)
         {
           emit_tok(tok);
           tok = tok->next;
@@ -3321,12 +3267,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
       }
       // _Generic paren tracking (rare)
       if (__builtin_expect(ctx->generic_paren_depth > 0, 0))
-      {
-        if (equal(tok, "("))
-          ctx->generic_paren_depth++;
-        else if (equal(tok, ")"))
-          ctx->generic_paren_depth--;
-      }
+        track_generic_paren(tok);
       if (ctx->defer_depth == 0)
       {
         if (match_ch(tok, ')'))
@@ -3338,7 +3279,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
       continue;
     }
 
-    // ── Slower path: statement-start processing and tagged tokens ──
+    // Slower path: statement-start processing and tagged tokens
 
     // Track typedefs (must precede zero-init check)
     if (ctx->at_stmt_start && ctx->struct_depth == 0 && (tag & TT_TYPEDEF))
@@ -3357,8 +3298,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
     }
     ctx->at_stmt_start = false;
 
-    // Noreturn function warning
-    if (tag & TT_NORETURN_FN)
+    if (tag & TT_NORETURN_FN) // Noreturn function warning
     {
       if (tok->next && equal(tok->next, "("))
       {
@@ -3372,7 +3312,6 @@ static int transpile_tokens(Token *tok, FILE *fp)
     // ── Tag-dependent dispatch (skip entirely for untagged tokens like punctuation) ──
     if (tag)
     {
-
       // ── Keyword dispatch (defer, return, break/continue, goto) ──
 
       if (tag & TT_DEFER)
@@ -3438,12 +3377,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
 
     // _Generic paren tracking (only active inside _Generic expressions)
     if (__builtin_expect(ctx->generic_paren_depth > 0, 0))
-    {
-      if (equal(tok, "("))
-        ctx->generic_paren_depth++;
-      else if (equal(tok, ")"))
-        ctx->generic_paren_depth--;
-    }
+      track_generic_paren(tok);
 
     // ── Scope management ──
 
@@ -3469,19 +3403,16 @@ static int transpile_tokens(Token *tok, FILE *fp)
         is_void_function_decl(tok))
       next_func_returns_void = true;
 
-    // struct/union/enum body
-    if (tag & TT_SUE)
+    if (tag & TT_SUE) // struct/union/enum body
       DISPATCH(handle_sue_body);
 
-    // Open brace
-    if (equal(tok, "{"))
+    if (equal(tok, "{")) // Open brace
     {
       tok = handle_open_brace(tok);
       continue;
     }
 
-    // Close brace
-    if (equal(tok, "}"))
+    if (equal(tok, "}")) // Close brace
     {
       tok = handle_close_brace(tok);
       continue;
@@ -3492,35 +3423,11 @@ static int transpile_tokens(Token *tok, FILE *fp)
     if (ctrl.pending)
     {
       if (equal(tok, "("))
-      {
-        ctrl.paren_depth++;
-        ctrl.parens_just_closed = false;
-        if (ctrl.await_for_paren)
-        {
-          ctrl.for_init = true;
-          ctx->at_stmt_start = true;
-          ctrl.await_for_paren = false;
-        }
-      }
+        track_ctrl_paren_open();
       else if (equal(tok, ")"))
-      {
-        ctrl.paren_depth--;
-        if (ctrl.paren_depth == 0)
-        {
-          ctrl.for_init = false;
-          ctrl.parens_just_closed = true;
-        }
-      }
-      if (equal(tok, ";") && ctrl.paren_depth == 1)
-      {
-        if (ctrl.for_init)
-          ctrl.for_init = false;
-      }
-      else if (equal(tok, ";") && ctrl.paren_depth == 0)
-      {
-        typedef_pop_scope(ctx->defer_depth + 1);
-        control_flow_reset();
-      }
+        track_ctrl_paren_close();
+      if (equal(tok, ";"))
+        track_ctrl_semicolon();
     }
 
     if (equal(tok, ";") && !ctrl.pending)
@@ -3563,23 +3470,97 @@ static int transpile_tokens(Token *tok, FILE *fp)
     tok = tok->next;
   }
 
-  // Close diagnostic pragma that was opened at the start for flatten mode
-  if (FEAT(F_FLATTEN))
+  if (FEAT(F_FLATTEN)) // Close diagnostic pragma in flattening mode
   {
     out_char('\n');
     emit_system_header_diag_pop();
   }
 
   out_close();
-
-  // Reset tokenizer state for library mode reuse
-  // This frees arena blocks and file state, preparing for next transpilation
   tokenizer_teardown(false);
-
   return 1;
 }
 
-// LIBRARY API IMPLEMENTATION
+// Preprocess + tokenize + transpile to a file path.
+// This is the original interface used by the CLI and library API.
+static int transpile(char *input_file, char *output_file)
+{
+  // Ensure keyword map is initialized before allocating preprocessor buffer.
+  // If init fails (OOM → longjmp in lib mode), we haven't allocated pp_buf yet.
+  if (!ctx->keyword_map.capacity)
+    init_keyword_map();
+
+  // Run system preprocessor via pipe — no temp files
+  char *pp_buf = preprocess_with_cc(input_file);
+  if (!pp_buf)
+  {
+    fprintf(stderr, "Preprocessing failed for: %s\n", input_file);
+    return 0;
+  }
+
+  // Tokenize directly from the in-memory buffer (takes ownership of pp_buf)
+  Token *tok = tokenize_buffer(input_file, pp_buf);
+  // pp_buf is now owned by the tokenizer (freed in tokenizer_teardown)
+
+  if (!tok)
+  {
+    fprintf(stderr, "Failed to tokenize preprocessed output\n");
+    tokenizer_teardown(false);
+    return 0;
+  }
+
+  FILE *fp = fopen(output_file, "w");
+  if (!fp)
+  {
+    tokenizer_teardown(false);
+    return 0;
+  }
+
+  return transpile_tokens(tok, fp);
+}
+
+// LIBRARY API
+
+PRISM_API void prism_free(PrismResult *r)
+{
+  free(r->output);
+  free(r->error_msg);
+  r->output = r->error_msg = NULL;
+}
+
+PRISM_API void prism_reset(void)
+{
+  typedef_table_reset();
+  tokenizer_teardown(true);
+
+  for (int i = 0; i < defer_stack_capacity; i++)
+  {
+    free(defer_stack[i].entries);
+    defer_stack[i] = (DeferScope){0};
+  }
+  free(defer_stack);
+  defer_stack = NULL;
+  ctx->defer_depth = 0;
+  defer_stack_capacity = 0;
+
+  free(label_table.labels);
+  hashmap_clear(&label_table.name_map);
+  label_table = (LabelTable){0};
+
+  system_includes_reset();
+
+  free(stmt_expr_levels);
+  stmt_expr_levels = NULL;
+  ctx->stmt_expr_count = 0;
+  stmt_expr_capacity = 0;
+
+  if (out_fp)
+  {
+    out_flush();
+    fclose(out_fp);
+    out_fp = NULL;
+  }
+}
 
 PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures features)
 {
@@ -3616,10 +3597,7 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
   }
 #endif
 
-  // Set global feature flags from PrismFeatures
   ctx->features = features_to_bits(features);
-
-  // Set preprocessor configuration from PrismFeatures
   ctx->extra_compiler = features.compiler;
   ctx->extra_include_paths = features.include_paths;
   ctx->extra_include_count = features.include_count;
@@ -3630,7 +3608,6 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
   ctx->extra_force_includes = features.force_includes;
   ctx->extra_force_include_count = features.force_include_count;
 
-  // Create temp file for output
   char temp_path[PATH_MAX];
   temp_path[0] = '\0';
   if (make_temp_file(temp_path, sizeof(temp_path), "prism_out.XXXXXX.c", 2, NULL) < 0)
@@ -3645,7 +3622,6 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
   ctx->active_temp_output[PATH_MAX - 1] = '\0';
 #endif
 
-  // Transpile
   if (!transpile((char *)input_file, temp_path))
   {
     result.status = PRISM_ERR_SYNTAX;
@@ -3653,8 +3629,7 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
     goto cleanup;
   }
 
-  // Read result into memory
-  {
+  { // Read result into memory
     FILE *f = fopen(temp_path, "rb");
     if (!f)
     {
@@ -3692,76 +3667,6 @@ cleanup:
 #endif
   return result;
 }
-
-PRISM_API void prism_free(PrismResult *r)
-{
-  free(r->output);
-  free(r->error_msg);
-  r->output = r->error_msg = NULL;
-}
-
-// Reset all transpiler state for clean reuse
-PRISM_API void prism_reset(void)
-{
-  // Clear typedef table before freeing file contents, since typedef entries
-  // hold pointers into the token stream (which points into file data).
-  typedef_table_reset();
-
-  tokenizer_teardown(true);
-
-  for (int i = 0; i < defer_stack_capacity; i++)
-  {
-    free(defer_stack[i].entries);
-    defer_stack[i] = (DeferScope){0};
-  }
-  free(defer_stack);
-  defer_stack = NULL;
-  ctx->defer_depth = 0;
-  defer_stack_capacity = 0;
-
-  free(label_table.labels);
-  hashmap_clear(&label_table.name_map);
-  label_table = (LabelTable){0};
-
-  system_includes_reset();
-
-  free(stmt_expr_levels);
-  stmt_expr_levels = NULL;
-  ctx->stmt_expr_count = 0;
-  stmt_expr_capacity = 0;
-
-  if (out_fp)
-  {
-    out_flush();
-    fclose(out_fp);
-    out_fp = NULL;
-  }
-}
-
-// Extract filename from path (handles both / and \ separators)
-static const char *path_basename(const char *path)
-{
-  const char *fwd = strrchr(path, '/');
-  const char *bck = strrchr(path, '\\');
-  if (bck && (!fwd || bck > fwd))
-    fwd = bck;
-  return fwd ? fwd + 1 : path;
-}
-
-static bool cc_is_msvc(const char *cc)
-{
-#ifndef _WIN32
-  (void)cc;
-  return false;
-#else
-  if (!cc || !*cc)
-    return false;
-  const char *base = path_basename(cc);
-  return (_stricmp(base, "cl") == 0 || _stricmp(base, "cl.exe") == 0);
-#endif
-}
-
-// CLI IMPLEMENTATION (excluded with -DPRISM_LIB_MODE)
 
 #ifndef PRISM_LIB_MODE
 
@@ -3938,7 +3843,6 @@ static int install(char *self_path)
   if (stat(self_path, &st) != 0 && get_self_exe_path(resolved_path, sizeof(resolved_path)))
     self_path = resolved_path;
 
-  // Check if we're trying to install over ourselves
   if (strcmp(self_path, INSTALL_PATH) == 0)
   {
     printf("[prism] Already installed at %s\n", INSTALL_PATH);
@@ -3975,8 +3879,7 @@ static int install(char *self_path)
     fclose(output);
 
 use_sudo:;
-#ifdef _WIN32
-  // Windows: no sudo — just report failure
+#ifdef _WIN32 // Windows: no sudo — just report failure
   fprintf(stderr, "Failed to install (run as Administrator?)\n");
   return 1;
 #else
@@ -4003,33 +3906,22 @@ use_sudo:;
   return 0;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // CLI
 // ─────────────────────────────────────────────────────────────────────────────
 
-typedef enum
+static bool is_prism_cc(const char *cc)
 {
-  CLI_DEFAULT,
-  CLI_RUN,
-  CLI_EMIT,
-  CLI_INSTALL
-} CliMode;
-
-typedef struct
-{
-  CliMode mode;
-  PrismFeatures features;
-  const char **sources;
-  int source_count, source_cap;
-  const char **cc_args;
-  int cc_arg_count, cc_arg_cap;
-  const char *output;
-  const char *cc;
-  bool verbose;
-  bool compile_only;
-} Cli;
-
-static bool is_prism_cc(const char *cc); // Forward declaration
+  if (!cc || !*cc)
+    return false;
+  const char *base = path_basename(cc);
+  if (strncmp(base, "prism", 5) == 0)
+  {
+    char next = base[5];
+    if (next == '\0' || next == ' ' || next == '.')
+      return true;
+  }
+  return false;
+}
 
 // Get the actual C compiler to use, avoiding infinite recursion if CC=prism
 static const char *get_real_cc(const char *cc)
@@ -4082,21 +3974,6 @@ static bool str_startswith(const char *s, const char *prefix)
   return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
-// Check if a string starts with "prism" (possibly with path prefix)
-static bool is_prism_cc(const char *cc)
-{
-  if (!cc || !*cc)
-    return false;
-  const char *base = path_basename(cc);
-  if (strncmp(base, "prism", 5) == 0)
-  {
-    char next = base[5];
-    if (next == '\0' || next == ' ' || next == '.')
-      return true;
-  }
-  return false;
-}
-
 // Check if the system compiler is clang.
 // On macOS, cc/gcc are always Apple Clang (hardlinked, not symlinked,
 // so realpath doesn't help).  On other platforms, check the basename.
@@ -4146,6 +4023,7 @@ static void print_help(void)
 
 static Cli cli_parse(int argc, char **argv)
 {
+  bool passthrough = false; // -E passthrough detected inline
   Cli cli = {.features = prism_defaults()};
 
   // Get compiler from environment (avoid infinite recursion if CC=prism)
@@ -4158,22 +4036,15 @@ static Cli cli_parse(int argc, char **argv)
   }
   cli.cc = (env_cc && *env_cc) ? env_cc : PRISM_DEFAULT_CC;
 
-  bool passthrough = false; // -E passthrough detected inline
-
   for (int i = 1; i < argc; i++)
   {
     char *a = argv[i];
 
-    // ── Fast path: flags starting with '-' that are clearly CC flags ──
-    // The vast majority of args (90%+) are CC flags like -D, -I, -W, -g, -O, -m, -std, etc.
-    // Reject prism flag prefixes first, then fall through to CC passthrough immediately.
-    if (a[0] == '-' && a[1] != '\0')
+    if (a[0] == '-' && a[1] != '\0') // Fast path: Reject prism flag prefixes first, then fall through to CC passthrough immediately.
     {
-      // Single-letter flags that need special handling
-      char c1 = a[1];
+      char c1 = a[1]; // Single-letter flags that need special handling
 
-      // -o: intercept output path
-      if (c1 == 'o')
+      if (c1 == 'o') // -o: intercept output path
       {
         if (a[2])
           cli.output = a + 2;
@@ -4182,31 +4053,27 @@ static Cli cli_parse(int argc, char **argv)
         continue;
       }
 
-      // -c: track compile-only (also passes through)
-      if (c1 == 'c' && !a[2])
+      if (c1 == 'c' && !a[2]) // -c: track compile-only
       {
         cli.compile_only = true;
         CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
         continue;
       }
 
-      // -E: passthrough mode
-      if (c1 == 'E' && !a[2])
+      if (c1 == 'E' && !a[2]) // -E: passthrough mode
       {
         passthrough = true;
         CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
         continue;
       }
 
-      // -h: help
       if (c1 == 'h' && !a[2])
       {
         print_help();
         exit(0);
       }
 
-      // -- prefix: prism options or help
-      if (c1 == '-')
+      if (c1 == '-') // -- prefix: prism options
       {
         if (!strcmp(a, "--help"))
         {
@@ -4239,13 +4106,11 @@ static Cli cli_parse(int argc, char **argv)
           cli.mode = CLI_EMIT;
           continue;
         }
-        // All other --flags pass through to CC
         CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
         continue;
       }
 
-      // -f prefix: check for prism feature flags, else CC passthrough
-      if (c1 == 'f')
+      if (c1 == 'f') // check for prism feature flags, else CC passthrough
       {
         static const struct
         {
@@ -4281,23 +4146,27 @@ static Cli cli_parse(int argc, char **argv)
       continue;
     }
 
-    // ── Non-flag arguments ──
-
-    // Prism commands (only valid as first non-flag arg, but checked unconditionally)
-    if (!strcmp(a, "run"))
+    // Prism subcommands
     {
-      cli.mode = CLI_RUN;
-      continue;
-    }
-    if (!strcmp(a, "transpile"))
-    {
-      cli.mode = CLI_EMIT;
-      continue;
-    }
-    if (!strcmp(a, "install"))
-    {
-      cli.mode = CLI_INSTALL;
-      continue;
+      static const struct
+      {
+        const char *cmd;
+        CliMode mode;
+      } subcmds[] = {
+          {"run", CLI_RUN},
+          {"transpile", CLI_EMIT},
+          {"install", CLI_INSTALL},
+      };
+      bool matched = false;
+      for (int j = 0; j < (int)(sizeof(subcmds) / sizeof(*subcmds)); j++)
+        if (!strcmp(a, subcmds[j].cmd))
+        {
+          cli.mode = subcmds[j].mode;
+          matched = true;
+          break;
+        }
+      if (matched)
+        continue;
     }
 
     // Source files (.c/.i) — transpile unless -E passthrough
@@ -4307,8 +4176,7 @@ static Cli cli_parse(int argc, char **argv)
       continue;
     }
 
-    // Everything else: pass through to CC (object files, libraries, etc.)
-    CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
+    CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a); // pass through to CC (object files, libraries, etc.)
   }
 
   return cli;
@@ -4322,9 +4190,8 @@ static void cli_free(Cli *cli)
 
 static void add_warn_suppress(ArgvBuilder *ab, bool clang, bool msvc)
 {
-  if (msvc)
+  if (msvc) // suppress common transpiler-generated warnings
   {
-    // MSVC: suppress common transpiler-generated warnings
     argv_builder_add(ab, "/wd4100"); // unreferenced formal parameter
     argv_builder_add(ab, "/wd4189"); // local variable initialized but not referenced
     argv_builder_add(ab, "/wd4244"); // possible loss of data (implicit narrowing)
@@ -4379,8 +4246,7 @@ static void add_output_flags(ArgvBuilder *ab, const Cli *cli, const char *temp_e
 
   if (msvc)
   {
-    // cl.exe: /Fe:exe or /Fo:obj
-    static char flag[PATH_MAX + 8];
+    static char flag[PATH_MAX + 8]; // cl.exe: /Fe:exe or /Fo:obj
     if (cli->compile_only)
       snprintf(flag, sizeof(flag), "/Fo:%s", out);
     else
@@ -4401,26 +4267,8 @@ static void make_run_temp(char *buf, size_t size, CliMode mode)
     return;
   snprintf(buf, size, "%sprism_run.XXXXXX", get_tmp_dir());
 #if defined(_WIN32)
-  // Atomic temp file creation to avoid TOCTOU race
-  {
-    char try_buf[PATH_MAX];
-    for (int attempt = 0; attempt < 100; attempt++)
-    {
-      memcpy(try_buf, buf, size);
-      if (_mktemp_s(try_buf, size) != 0)
-        break;
-      strcat(try_buf, ".exe");
-      int fd;
-      errno_t err = _sopen_s(&fd, try_buf, _O_CREAT | _O_EXCL | _O_WRONLY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
-      if (err == 0 && fd >= 0)
-      {
-        _close(fd);
-        memcpy(buf, try_buf, strlen(try_buf) + 1);
-        return;
-      }
-    }
-    buf[0] = '\0'; // Failed
-  }
+  if (atomic_mkstemp(buf, size, ".exe") != 0)
+    buf[0] = '\0';
 #else
   int fd = mkstemp(buf);
   if (fd >= 0)
@@ -4561,13 +4409,12 @@ static int install_from_source(Cli *cli)
 
 static int compile_sources(Cli *cli)
 {
+  int status = 0;
   const char *compiler = get_real_cc(cli->cc);
   bool clang = cc_is_clang(compiler);
   bool msvc = cc_is_msvc(compiler);
   char temp_exe[PATH_MAX];
   make_run_temp(temp_exe, sizeof(temp_exe), cli->mode);
-
-  int status;
 
   if (cli->source_count == 1 && !msvc)
   {
@@ -4585,8 +4432,7 @@ static int compile_sources(Cli *cli)
       argv_builder_add(&ab, "-fpreprocessed");
     argv_builder_add(&ab, "-");
 
-    // Reset language so subsequent args aren't forced to C.
-    if (cli->cc_arg_count > 0)
+    if (cli->cc_arg_count > 0) // Reset language so subsequent args aren't forced to C.
     {
       argv_builder_add(&ab, "-x");
       argv_builder_add(&ab, "none");
@@ -4672,7 +4518,6 @@ static int compile_sources(Cli *cli)
     return status;
   }
 
-  // RUN mode: execute the compiled binary
   if (cli->mode == CLI_RUN)
   {
     char **run = build_argv(temp_exe, NULL);
@@ -4688,6 +4533,7 @@ static int compile_sources(Cli *cli)
 
 int main(int argc, char **argv)
 {
+  int status = 0;
   prism_ctx_init();
 
   if (argc < 2)
@@ -4701,8 +4547,6 @@ int main(int argc, char **argv)
   ctx->extra_compiler = get_real_cc(cli.cc);
   ctx->extra_compiler_flags = cli.cc_args;
   ctx->extra_compiler_flags_count = cli.cc_arg_count;
-
-  int status = 0;
 
   if (cli.mode == CLI_INSTALL)
     status = cli.source_count > 0 ? install_from_source(&cli) : install(argv[0]);
