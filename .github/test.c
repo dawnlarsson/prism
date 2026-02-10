@@ -12659,6 +12659,83 @@ void test_orelse_struct_type(void)
     CHECK(p->value == 42, "orelse struct type: struct ptr works");
 }
 
+#ifdef __GNUC__
+int orelse_typeof_init_return_helper(int val)
+{
+    typeof(int) x = val orelse return -1;
+    return x;
+}
+
+int orelse_typeof_fallback_helper(int val)
+{
+    typeof(int) x = val orelse 99;
+    return x;
+}
+
+void test_orelse_typeof_init(void)
+{
+    CHECK_EQ(orelse_typeof_init_return_helper(42), 42, "orelse typeof init: non-zero preserved");
+    CHECK_EQ(orelse_typeof_init_return_helper(1), 1, "orelse typeof init: 1 preserved");
+    CHECK_EQ(orelse_typeof_init_return_helper(0), -1, "orelse typeof init: zero triggers return");
+}
+
+void test_orelse_typeof_fallback(void)
+{
+    CHECK_EQ(orelse_typeof_fallback_helper(5), 5, "orelse typeof fallback: non-zero preserved");
+    CHECK_EQ(orelse_typeof_fallback_helper(0), 99, "orelse typeof fallback: zero gets default");
+    CHECK_EQ(orelse_typeof_fallback_helper(-3), -3, "orelse typeof fallback: negative preserved");
+}
+#endif
+
+const int *orelse_const_ptr_return_helper(const int *p)
+{
+    const int *q = p orelse return NULL;
+    return q;
+}
+
+void test_orelse_const_ptr(void)
+{
+    int val = 77;
+    CHECK(orelse_const_ptr_return_helper(&val) == &val, "orelse const ptr: non-null preserved");
+    CHECK(orelse_const_ptr_return_helper(NULL) == NULL, "orelse const ptr: null triggers return");
+}
+
+void test_orelse_for_body_vals(void)
+{
+    int sum = 0;
+    int vals[] = {3, 5, 0, 7};
+    for (int i = 0; i < 4; i++)
+    {
+        int v = vals[i] orelse break;
+        sum += v;
+    }
+    CHECK_EQ(sum, 8, "orelse for body vals: break on zero");
+}
+
+int orelse_long_init_helper(long val)
+{
+    long x = val orelse return -1;
+    return (int)x;
+}
+
+void test_orelse_long_init(void)
+{
+    CHECK_EQ(orelse_long_init_helper(100L), 100, "orelse long init: non-zero preserved");
+    CHECK_EQ(orelse_long_init_helper(0L), -1, "orelse long init: zero triggers return");
+}
+
+int orelse_fallback_arith_helper(int val)
+{
+    int x = val orelse 10 + 20;
+    return x;
+}
+
+void test_orelse_fallback_arith(void)
+{
+    CHECK_EQ(orelse_fallback_arith_helper(7), 7, "orelse fallback arith: non-zero preserved");
+    CHECK_EQ(orelse_fallback_arith_helper(0), 30, "orelse fallback arith: zero gets expression");
+}
+
 void run_orelse_tests(void)
 {
     test_orelse_return_null();
@@ -12693,6 +12770,14 @@ void run_orelse_tests(void)
     test_orelse_funcall();
     test_orelse_ternary();
     test_orelse_struct_type();
+#ifdef __GNUC__
+    test_orelse_typeof_init();
+    test_orelse_typeof_fallback();
+#endif
+    test_orelse_const_ptr();
+    test_orelse_for_body_vals();
+    test_orelse_long_init();
+    test_orelse_fallback_arith();
 }
 
 int main(void)

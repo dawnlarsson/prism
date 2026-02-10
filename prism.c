@@ -63,6 +63,7 @@ typedef struct
   bool line_directives;
   bool warn_safety;     // If true, safety checks warn instead of error
   bool flatten_headers; // If true, include flattened system headers (default: true)
+  bool orelse;          // If true, enable orelse keyword (default: true)
 
   // Preprocessor configuration (optional - can be left NULL/0 for defaults)
   const char *compiler;       // Compiler to use (default: "cc")
@@ -105,6 +106,7 @@ typedef struct
   bool has_atomic;   // True if _Atomic qualifier/specifier present
   bool has_register; // True if register storage class
   bool has_volatile; // True if volatile qualifier
+  bool has_const;    // True if const qualifier
 } TypeSpecResult;
 
 typedef enum
@@ -323,12 +325,13 @@ PRISM_API PrismFeatures prism_defaults(void)
       .defer = true,
       .zeroinit = true,
       .line_directives = true,
-      .flatten_headers = true};
+      .flatten_headers = true,
+      .orelse = true};
 }
 
 static uint32_t features_to_bits(PrismFeatures f)
 {
-  return (f.defer ? F_DEFER : 0) | (f.zeroinit ? F_ZEROINIT : 0) | (f.line_directives ? F_LINE_DIR : 0) | (f.warn_safety ? F_WARN_SAFETY : 0) | (f.flatten_headers ? F_FLATTEN : 0);
+  return (f.defer ? F_DEFER : 0) | (f.zeroinit ? F_ZEROINIT : 0) | (f.line_directives ? F_LINE_DIR : 0) | (f.warn_safety ? F_WARN_SAFETY : 0) | (f.flatten_headers ? F_FLATTEN : 0) | (f.orelse ? F_ORELSE : 0);
 }
 
 // respects $TMPDIR environment variable - Returns path with trailing slash (or empty string on Windows)
@@ -1736,7 +1739,7 @@ static Token *skip_pragma_operators(Token *tok)
 // Returns info about the type and position after it
 static TypeSpecResult parse_type_specifier(Token *tok)
 {
-  TypeSpecResult r = {tok, false, false, false, false, false, false, false, false};
+  TypeSpecResult r = {tok, false, false, false, false, false, false, false, false, false};
 
   bool is_type = false;
   while ((tok->tag & TT_QUALIFIER) || (is_type = is_type_keyword(tok)) || is_c23_attr(tok))
@@ -1748,6 +1751,8 @@ static TypeSpecResult parse_type_specifier(Token *tok)
         r.has_volatile = true;
       if (tok->tag & TT_REGISTER)
         r.has_register = true;
+      if (equal(tok, "const"))
+        r.has_const = true;
     }
     if (tok->tag & TT_TYPE)
       if (tok->tag & TT_QUALIFIER) // _Atomic is TT_QUALIFIER | TT_TYPE
@@ -2225,7 +2230,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
         else if (depth == 0 && (equal(tok, ",") || equal(tok, ";")))
           break;
         // Detect 'orelse' at depth 0 in initializer
-        if (depth == 0 && (tok->tag & TT_ORELSE) && !is_known_typedef(tok))
+        if (FEAT(F_ORELSE) && depth == 0 && (tok->tag & TT_ORELSE) && !is_known_typedef(tok) &&
+            !(last_emitted && (last_emitted->tag & TT_MEMBER)))
         {
           hit_orelse = true;
           break;
@@ -2236,6 +2242,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
 
       if (hit_orelse)
       {
+        if (ctrl.for_init)
+          error_tok(tok, "orelse cannot be used in for-loop initializers");
         out_char(';');
 
         for (int i = 0; i < typeof_var_count; i++)
@@ -2389,6 +2397,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
         }
         else
         {
+          if (type->has_const)
+            error_tok(tok, "orelse fallback cannot reassign a const-qualified variable");
           OUT_LIT(" if (!");
           out_str(decl.var_name->loc, decl.var_name->len);
           OUT_LIT(") ");
@@ -3485,10 +3495,11 @@ static int transpile_tokens(Token *tok, FILE *fp)
       }
 
       // Bare expression orelse
-      if (ctx->defer_depth > 0 && ctx->struct_depth == 0)
+      if (FEAT(F_ORELSE) && ctx->defer_depth > 0 && ctx->struct_depth == 0)
       {
         int scan_depth = 0;
         bool found_orelse = false;
+        Token *prev_s = NULL;
         for (Token *s = tok; s->kind != TK_EOF; s = s->next)
         {
           if (equal(s, "(") || equal(s, "[") || equal(s, "{"))
@@ -3501,14 +3512,18 @@ static int transpile_tokens(Token *tok, FILE *fp)
           }
           else if (scan_depth == 0 && equal(s, ";"))
             break;
-          if (scan_depth == 0 && (s->tag & TT_ORELSE) && !is_known_typedef(s))
+          if (scan_depth == 0 && (s->tag & TT_ORELSE) && !is_known_typedef(s) &&
+              !(prev_s && (prev_s->tag & TT_MEMBER)))
           {
             found_orelse = true;
             break;
           }
+          prev_s = s;
         }
         if (found_orelse)
         {
+          if (tok->tag & TT_ORELSE && !is_known_typedef(tok))
+            error_tok(tok, "expected expression before 'orelse'");
           OUT_LIT(" if (!(");
           int edepth = 0;
           while (tok->kind != TK_EOF)
@@ -3517,7 +3532,8 @@ static int transpile_tokens(Token *tok, FILE *fp)
               edepth++;
             else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
               edepth--;
-            if (edepth == 0 && (tok->tag & TT_ORELSE) && !is_known_typedef(tok))
+            if (edepth == 0 && (tok->tag & TT_ORELSE) && !is_known_typedef(tok) &&
+                !(last_emitted && (last_emitted->tag & TT_MEMBER)))
               break;
             emit_tok(tok);
             tok = tok->next;
@@ -4338,6 +4354,7 @@ static void print_help(void)
       "Prism Flags (consumed, not passed to CC):\n"
       "  -fno-defer            Disable defer\n"
       "  -fno-zeroinit         Disable zero-initialization\n"
+      "  -fno-orelse           Disable orelse keyword\n"
       "  -fno-line-directives  Disable #line directives\n"
       "  -fno-safety           Safety checks warn instead of error\n"
       "  -fflatten-headers     Flatten headers into single output\n"
@@ -4455,6 +4472,7 @@ static Cli cli_parse(int argc, char **argv)
         } feat_flags[] = {
             {"-fno-defer", offsetof(PrismFeatures, defer), 0},
             {"-fno-zeroinit", offsetof(PrismFeatures, zeroinit), 0},
+            {"-fno-orelse", offsetof(PrismFeatures, orelse), 0},
             {"-fno-line-directives", offsetof(PrismFeatures, line_directives), 0},
             {"-fno-safety", offsetof(PrismFeatures, warn_safety), 1},
             {"-fflatten-headers", offsetof(PrismFeatures, flatten_headers), 1},

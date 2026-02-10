@@ -225,7 +225,8 @@ enum // Feature flags
     F_ZEROINIT = 2,
     F_LINE_DIR = 4,
     F_WARN_SAFETY = 8,
-    F_FLATTEN = 16
+    F_FLATTEN = 16,
+    F_ORELSE = 32
 };
 
 struct ArenaBlock
@@ -263,7 +264,7 @@ typedef struct PrismContext
     int error_line;
     int error_col;
 #endif
-    uint32_t features; // F_DEFER | F_ZEROINIT | F_LINE_DIR | F_WARN_SAFETY | F_FLATTEN
+    uint32_t features; // F_DEFER | F_ZEROINIT | F_LINE_DIR | F_WARN_SAFETY | F_FLATTEN | F_ORELSE
     const char *extra_compiler;
     const char **extra_compiler_flags;
     int extra_compiler_flags_count;
@@ -400,7 +401,7 @@ static void prism_ctx_init(void)
         exit(1);
     }
     ctx->main_arena.default_block_size = ARENA_DEFAULT_BLOCK_SIZE;
-    ctx->features = F_DEFER | F_ZEROINIT | F_LINE_DIR | F_FLATTEN;
+    ctx->features = F_DEFER | F_ZEROINIT | F_LINE_DIR | F_FLATTEN | F_ORELSE;
     ctx->at_stmt_start = true;
 #ifdef _WIN32
     init_ident_char();
