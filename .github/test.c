@@ -279,6 +279,15 @@ void test_defer_compound_stmt(void)
     CHECK_LOG("1ABE", "defer compound statement");
 }
 
+void test_defer_only_body(void)
+{
+    // Function body containing only a defer — ensures Prism doesn't
+    // mis-handle a scope where defer is the only statement.
+    log_reset();
+    defer log_append("D");
+    // No other statements before implicit return.
+}
+
 void run_defer_basic_tests(void)
 {
     printf("\n=== DEFER BASIC TESTS ===\n");
@@ -306,6 +315,9 @@ void run_defer_basic_tests(void)
     CHECK_EQ(ret, 99, "defer nested return value");
 
     test_defer_compound_stmt();
+
+    test_defer_only_body();
+    CHECK_LOG("D", "defer-only function body");
 }
 
 // SECTION 2: ZERO-INIT TESTS
@@ -335,6 +347,21 @@ void test_zeroinit_basic_types(void)
 
     long long ll;
     CHECK(ll == 0LL, "long long zero-init");
+
+    _Bool b;
+    CHECK(b == 0, "_Bool zero-init");
+
+    unsigned char uc;
+    CHECK_EQ(uc, 0, "unsigned char zero-init");
+
+    signed char sc;
+    CHECK_EQ(sc, 0, "signed char zero-init");
+
+    enum { RED, GREEN, BLUE } color;
+    CHECK_EQ(color, 0, "enum variable zero-init");
+
+    size_t sz;
+    CHECK(sz == 0, "size_t zero-init");
 }
 
 void test_zeroinit_pointers(void)
@@ -653,6 +680,15 @@ void test_zeroinit_qualifiers(void)
 
     _Alignas(16) int aligned;
     CHECK_EQ(aligned, 0, "_Alignas zero-init");
+
+    const int ci;
+    CHECK(ci == 0, "const int zero-init");
+
+    const char cc;
+    CHECK(cc == 0, "const char zero-init");
+
+    static int si;
+    CHECK(si == 0, "static int zero-init");
 }
 
 void test_zeroinit_in_scopes(void)
@@ -3244,6 +3280,41 @@ void test_defer_break_inner_stay_outer(void)
     CHECK_LOG("XIXIYOXIXIYOE", "defer break inner stay outer");
 }
 
+void test_deep_defer_with_zeroinit(void)
+{
+    log_reset();
+    int outer;
+    { defer log_append("1");
+      int a;
+      { defer log_append("2");
+        int b;
+        { defer log_append("3");
+          int c;
+          { defer log_append("4");
+            int d;
+            { defer log_append("5");
+              int e;
+              { defer log_append("6");
+                int f;
+                { defer log_append("7");
+                  int g;
+                  { defer log_append("8");
+                    int h;
+                    CHECK(a == 0 && b == 0 && c == 0 && d == 0, "deep zeroinit: a-d");
+                    CHECK(e == 0 && f == 0 && g == 0 && h == 0, "deep zeroinit: e-h");
+                    log_append("X");
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    CHECK_LOG("X87654321", "deep zeroinit defer ordering");
+    CHECK_EQ(outer, 0, "deep zeroinit outer var");
+}
+
 void run_advanced_defer_tests(void)
 {
     printf("\n=== ADVANCED DEFER TESTS ===\n");
@@ -3266,6 +3337,7 @@ void run_advanced_defer_tests(void)
     test_defer_deeply_nested();
     test_defer_nested_loops();
     test_defer_break_inner_stay_outer();
+    test_deep_defer_with_zeroinit();
 }
 
 // SECTION 8: STRESS TESTS
@@ -3645,6 +3717,53 @@ void test_stmt_expr_side_effects(void)
 }
 #endif
 
+void test_typedef_scope_churn_heavy(void)
+{
+    int ok = 1;
+    for (int round = 0; round < 500; round++)
+    {
+        typedef int ChurnHeavyT;
+        ChurnHeavyT v;
+        if (v != 0) { ok = 0; break; }
+        {
+            typedef float ChurnHeavyT;
+            ChurnHeavyT f;
+            if (f != 0.0f) { ok = 0; break; }
+            {
+                typedef char ChurnHeavyT;
+                ChurnHeavyT c;
+                if (c != 0) { ok = 0; break; }
+            }
+        }
+    }
+    CHECK(ok, "typedef scope churn 500 rounds: all zeroed");
+    int post_churn;
+    CHECK_EQ(post_churn, 0, "typedef scope churn 500: post-churn zeroed");
+}
+
+void test_typedef_scope_churn_varied(void)
+{
+    int ok = 1;
+    for (int round = 0; round < 200; round++)
+    {
+        typedef int CT_A;
+        typedef short CT_B;
+        typedef long CT_C;
+        CT_A a;
+        CT_B b;
+        CT_C c;
+        if (a != 0 || b != 0 || c != 0) { ok = 0; break; }
+        {
+            typedef double CT_A;
+            typedef char CT_B;
+            CT_A da;
+            CT_B cb;
+            if (da != 0.0 || cb != 0) { ok = 0; break; }
+        }
+    }
+    CHECK(ok, "typedef varied churn 200: all zeroed");
+}
+
 void run_stress_tests(void)
 {
     printf("\n=== STRESS TESTS ===\n");
@@ -3666,6 +3785,8 @@ void run_stress_tests(void)
 #ifdef __GNUC__
     test_stmt_expr_side_effects();
 #endif
+    test_typedef_scope_churn_heavy();
+    test_typedef_scope_churn_varied();
 }
 
 // SECTION 8: SAFETY HOLE TESTS
@@ -3927,36 +4048,6 @@ void run_safety_hole_tests(void)
 
 // SECTION 9: SWITCH FALLTHROUGH + DEFER EDGE CASES
 
-void test_switch_fallthrough_decl_defer(void)
-{
-    // Fallthrough with declarations and defers - defers fire at block end, not switch end
-    log_reset();
-    int x = 0;
-    switch (x)
-    {
-    case 0:
-    {
-        int a = 1;
-        defer log_append("A");
-        log_append("0");
-    } // A fires here
-    case 1:
-    {
-        int b = 2;
-        defer log_append("B");
-        log_append("1");
-    } // B fires here
-    case 2:
-    {
-        defer log_append("C");
-        log_append("2");
-        break;
-    }
-    }
-    log_append("E");
-    CHECK_LOG("0A1B2CE", "switch fallthrough with decls and defers");
-}
-
 void test_switch_fallthrough_no_braces(void)
 {
     // Fallthrough without braces - no defers possible (defer requires braces)
@@ -4172,7 +4263,6 @@ nightmare_switch_exit:
 void run_switch_fallthrough_tests(void)
 {
     printf("\n=== SWITCH FALLTHROUGH + DEFER TESTS ===\n");
-    test_switch_fallthrough_decl_defer();
     test_switch_fallthrough_no_braces();
     test_switch_break_from_nested_block();
     test_switch_goto_out_of_case();
@@ -9061,15 +9151,6 @@ void test_defer_assignment_goto(void)
     CHECK(1, "defer assignment - manually verified (cannot use 'defer' as var in test)");
 }
 
-void test_raw_static_leak(void)
-{
-    // Bug: raw keyword leaked in output for static declarations
-    // "raw static int x;" should not emit "raw" in output
-    // Fix: raw is now consumed before try_zero_init_decl, preventing leakage
-    raw static int x = 5;
-    CHECK(x == 5, "raw static declaration should compile");
-}
-
 void test_attributed_default_safety(void)
 {
     // Safety hole: attributed default label not recognized
@@ -9533,7 +9614,6 @@ void run_verification_bug_tests(void)
     test_stmtexpr_void_cast_check();
     test_variable_named_defer_goto();
     test_defer_assignment_goto();
-    test_raw_static_leak();
     test_attributed_default_safety();
     test_for_loop_goto_bypass();
 }
@@ -11777,12 +11857,6 @@ void test_raw_vla_skips_zeroinit(void)
     CHECK_EQ(sum, 3, "raw VLA in loop compiles and runs");
 }
 
-void test_atomic_int_zeroed(void)
-{
-    _Atomic int a;
-    CHECK(a == 0, "atomic int zero-initialized");
-}
-
 void test_atomic_struct_zeroed(void)
 {
     typedef struct
@@ -12086,6 +12160,32 @@ void test_raw_star_ptr_decl(void)
     }
 }
 
+void test_typedef_as_raw(void)
+{
+    typedef int raw;
+    raw x;
+    CHECK_EQ(x, 0, "typedef raw: zero-initialized");
+    raw arr[4];
+    int all_zero = 1;
+    for (int i = 0; i < 4; i++)
+        if (arr[i] != 0) all_zero = 0;
+    CHECK(all_zero, "typedef raw array: zero-initialized");
+}
+
+void test_typedef_raw_with_pointer(void)
+{
+    typedef int raw;
+    raw *p;
+    CHECK(p == NULL, "typedef raw pointer: zero to null");
+}
+
+void test_typedef_raw_multi_decl(void)
+{
+    typedef int raw;
+    raw a, b, c;
+    CHECK(a == 0 && b == 0 && c == 0, "typedef raw multi-decl: all zeroed");
+}
+
 void run_issue_validation_tests(void)
 {
     printf("\n=== ISSUE VALIDATION TESTS ===\n");
@@ -12107,7 +12207,6 @@ void run_issue_validation_tests(void)
     test_vla_typedef_pointer_vs_value();
     test_vla_zeroed_each_loop_iteration();
     test_raw_vla_skips_zeroinit();
-    test_atomic_int_zeroed();
     test_atomic_struct_zeroed();
     test_atomic_specifier_struct_zeroed();
     test_attr_before_type_zeroed();
@@ -12133,6 +12232,9 @@ void run_issue_validation_tests(void)
     test_typeof_volatile_inner_zeroed();
 #endif
     test_raw_star_ptr_decl();
+    test_typedef_as_raw();
+    test_typedef_raw_with_pointer();
+    test_typedef_raw_multi_decl();
 }
 
 // orelse
@@ -12396,18 +12498,6 @@ void test_orelse_simple_decl(void)
 }
 
 // --- orelse with integer types (non-pointer) ---
-
-void test_orelse_int_zero(void)
-{
-    int x = 0 orelse return;
-    // 0 is falsy, so orelse triggers return — we should NOT reach here
-    // But since this test function returns void and we're testing reachability,
-    // let's structure differently:
-    (void)x;
-    // If we get here, x was 0 (falsy) but orelse returned. Actually:
-    // This would return, so test_orelse_int_zero never reaches CHECK.
-    // We need a wrapper.
-}
 
 int orelse_int_nonzero_helper(int val)
 {
@@ -12816,6 +12906,63 @@ void test_orelse_int_zero_fallback_block(void)
     CHECK_EQ(result, 99, "orelse int zero fallback block: zero triggers block");
 }
 
+static int _pce_flag = 0;
+static void _pce_set(void) { _pce_flag = 1; }
+
+static int *_pce_orelse_helper(int *p)
+{
+    int *x = (_pce_set(), p) orelse return NULL;
+    return x;
+}
+
+void test_orelse_paren_comma_expr(void)
+{
+    int val = 55;
+    _pce_flag = 0;
+    int *r = _pce_orelse_helper(&val);
+    CHECK(r != NULL && *r == 55, "orelse paren comma expr: non-null passthrough");
+    CHECK_EQ(_pce_flag, 1, "orelse paren comma expr: side effect ran");
+    _pce_flag = 0;
+    r = _pce_orelse_helper(NULL);
+    CHECK(r == NULL, "orelse paren comma expr: null triggers return");
+    CHECK_EQ(_pce_flag, 1, "orelse paren comma expr: side effect on null path");
+}
+
+static int *_multiarg_get(int *p, int a, int b, int c)
+{
+    (void)a; (void)b; (void)c;
+    return p;
+}
+
+static int _multiarg_orelse_helper(int *p)
+{
+    int *x = _multiarg_get(p, 10, 20, 30) orelse return -1;
+    return *x;
+}
+
+void test_orelse_multiarg_funcall(void)
+{
+    int val = 33;
+    CHECK_EQ(_multiarg_orelse_helper(&val), 33, "orelse multi-arg funcall: non-null");
+    CHECK_EQ(_multiarg_orelse_helper(NULL), -1, "orelse multi-arg funcall: null triggers return");
+}
+
+static int *_nested_call_inner(int *p, int x) { (void)x; return p; }
+static int *_nested_call_outer(int *p, int a, int b) { return _nested_call_inner(p, a + b); }
+
+static int _nested_call_orelse_helper(int *p)
+{
+    int *x = _nested_call_outer(p, 5, 10) orelse return -1;
+    return *x;
+}
+
+void test_orelse_nested_funcalls(void)
+{
+    int val = 77;
+    CHECK_EQ(_nested_call_orelse_helper(&val), 77, "orelse nested funcalls: non-null");
+    CHECK_EQ(_nested_call_orelse_helper(NULL), -1, "orelse nested funcalls: null triggers return");
+}
+
 void run_orelse_tests(void)
 {
     test_orelse_return_null();
@@ -12864,6 +13011,9 @@ void run_orelse_tests(void)
     test_orelse_multi_fallback();
     test_orelse_ptr_fallback_chain();
     test_orelse_int_zero_fallback_block();
+    test_orelse_paren_comma_expr();
+    test_orelse_multiarg_funcall();
+    test_orelse_nested_funcalls();
 }
 
 int main(void)

@@ -476,7 +476,9 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val)
     }
     else if ((map->used + map->tombstones) * 100 / map->capacity >= 70)
     {
-        hashmap_resize(map, map->capacity * 2);
+        // Compact in place when tombstones dominate; otherwise double capacity
+        int newcap = (map->tombstones > map->used) ? map->capacity : map->capacity * 2;
+        hashmap_resize(map, newcap);
     }
 
     uint64_t hash = fnv_hash(key, keylen);
@@ -546,6 +548,7 @@ static void hashmap_clear(HashMap *map)
     map->buckets = NULL;
     map->capacity = 0;
     map->used = 0;
+    map->tombstones = 0;
 }
 
 // Free all keys in a hashmap and clear it

@@ -5,7 +5,7 @@
 
 Prism is a lightweight and very fast transpiler that makes C safer without changing how you write it.
 
-- **1367 tests** — edge cases, control flow, nightmares, trying hard to break Prism
+- **1392 tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Proper transpiler** — tracks typedefs, respects scope, catches unsafe patterns
 - **Opt-out features** Disable parts of the transpiler, like zero-init, with CLI flags
@@ -232,6 +232,8 @@ int fd = open(path, O_RDONLY) orelse return -1;  // 0 is falsy
 size_t n = read_data(fd, buf) orelse break;      // 0 bytes = done
 ```
 
+**Opt-out:** `prism -fno-orelse src.c`
+
 ## Safety Enforcement
 Prism acts as a static analysis tool, turning common C pitfalls into compile-time errors.
 
@@ -312,44 +314,29 @@ Prism v0.112.0 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 
-GCC-Compatible Options:
-  -c                    Compile only, dont link
-  -o <file>             Output file
-  -O0/-O1/-O2/-O3/-Os   Optimization level (passed to CC)
-  -g                    Debug info (passed to CC)
-  -W...                 Warnings (passed to CC)
-  -I/-D/-U/-L/-l        Include/define/lib flags (passed to CC)
-  -std=...              Language standard (passed to CC)
-
-Prism Options:
-  -fno-defer            Disable defer feature
-  -fno-zeroinit         Disable zero-initialization
-  -fno-line-directives  Disable #line directives in output
-  -fflatten-headers     Flatten included headers into single output file
-  -fno-flatten-headers  Disable header flattening
-  -fno-safety           Safety checks warn instead of error
-  --prism-cc=<compiler> Use specific compiler (default: $CC or cc)
-  --prism-verbose       Show transpile and compile commands
-
 Commands:
-  run <src.c>           Transpile, compile, and execute
+  run <src.c>           Transpile, compile, and run
   transpile <src.c>     Output transpiled C to stdout
-  install               Install prism to /usr/local/bin/prism
-  --help, -h            Show this help
-  --version, -v         Show version
+  install [src.c...]    Install prism to /usr/local/bin/prism
 
-Environment:
-  CC                    C compiler to use (default: cc)
-  PRISM_CC              Override CC for prism specifically
+Prism Flags (consumed, not passed to CC):
+  -fno-defer            Disable defer
+  -fno-zeroinit         Disable zero-initialization
+  -fno-orelse           Disable orelse keyword
+  -fno-line-directives  Disable #line directives
+  -fno-safety           Safety checks warn instead of error
+  -fflatten-headers     Flatten headers into single output
+  -fno-flatten-headers  Disable header flattening
+  --prism-cc=<compiler> Use specific compiler
+  --prism-verbose       Show commands
+
+All other flags are passed through to CC.
 
 Examples:
-  prism foo.c                      Compile to a.out (GCC-compatible)
-  prism foo.c -o foo               Compile to 'foo'
-  prism run foo.c                  Compile and run immediately
+  prism foo.c -o foo               Compile (GCC-compatible)
+  prism run foo.c                  Compile and run
   prism transpile foo.c            Output transpiled C
-  prism transpile foo.c -o out.c   Transpile to file
-  prism -c foo.c -o foo.o          Compile to object file
-  prism -O2 -Wall foo.c -o foo     With optimization and warnings
+  prism -O2 -Wall foo.c -o foo     With optimization
   CC=clang prism foo.c             Use clang as backend
 
 Apache 2.0 license (c) Dawn Larsson 2026

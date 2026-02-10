@@ -156,11 +156,13 @@ static int mkstemp(char *tmpl)
     for (int attempt = 0; attempt < 10000; attempt++)
     {
         memcpy(try_buf, tmpl, len + 1);
-        // Randomize the X positions ourselves
+        // Per-attempt seed: mix attempt number to ensure distinct sequences
+        // even if multiple processes share the same initial seed
+        unsigned int attempt_seed = seed ^ ((unsigned int)attempt * 2654435761u);
         for (size_t i = x_start; i < x_start + x_count; i++)
         {
-            seed = seed * 1103515245 + 12345;
-            try_buf[i] = chars[(seed >> 16) % (sizeof(chars) - 1)];
+            attempt_seed = attempt_seed * 1103515245 + 12345;
+            try_buf[i] = chars[(attempt_seed >> 16) % (sizeof(chars) - 1)];
         }
         int fd;
         errno_t err = _sopen_s(&fd, try_buf, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY,

@@ -1704,8 +1704,8 @@ static bool is_type_keyword(Token *tok)
 {
   if (tok->tag & TT_TYPE)
     return true;
-  // Keywords are never user-defined typedefs — skip the expensive typedef lookup
-  if (tok->kind != TK_IDENT)
+  // Only identifiers and prism keywords (raw, defer, orelse) can be user-defined typedefs
+  if (tok->kind != TK_IDENT && tok->kind != TK_KEYWORD)
     return false;
   return is_typedef_like(tok);
 }
@@ -4395,7 +4395,7 @@ static bool cc_is_clang(const char *cc)
 static void print_help(void)
 {
   printf(
-      "Prism v%s - C transpiler adding defer and zero-init\n\n"
+      "Prism v%s - Robust C transpiler\n\n"
       "Usage: prism [options] source.c... [-o output]\n\n"
       "Commands:\n"
       "  run <src.c>           Transpile, compile, and run\n"
