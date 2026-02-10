@@ -2283,6 +2283,15 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
 
         tok = tok->next; // skip 'orelse'
 
+        // Error on missing action: "int x = val orelse;" is malformed
+        if (equal(tok, ";"))
+          error_tok(tok, "expected statement after 'orelse'");
+
+        // Warn if orelse is applied to a non-pointer array (address is never NULL)
+        if (decl.is_array && !decl.is_pointer)
+          warn_tok(decl.var_name, "orelse on array variable '%.*s' will never trigger (array address is never NULL)",
+                   decl.var_name->len, decl.var_name->loc);
+
         if (tok->tag & TT_RETURN)
         {
           mark_switch_control_exit();
@@ -3540,6 +3549,9 @@ static int transpile_tokens(Token *tok, FILE *fp)
           }
           OUT_LIT("))");
           tok = tok->next; // skip 'orelse'
+
+          if (equal(tok, ";"))
+            error_tok(tok, "expected statement after 'orelse'");
 
           if (tok->tag & TT_RETURN)
           {

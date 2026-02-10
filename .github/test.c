@@ -12736,6 +12736,86 @@ void test_orelse_fallback_arith(void)
     CHECK_EQ(orelse_fallback_arith_helper(0), 30, "orelse fallback arith: zero gets expression");
 }
 
+int orelse_const_ptr_return_ctrl_helper(const int *p)
+{
+    const int *x = p orelse return -1;
+    return *x;
+}
+
+void test_orelse_const_ptr_ctrl(void)
+{
+    int val = 77;
+    CHECK_EQ(orelse_const_ptr_return_ctrl_helper(&val), 77, "orelse const ptr ctrl: non-null ok");
+    CHECK_EQ(orelse_const_ptr_return_ctrl_helper(NULL), -1, "orelse const ptr ctrl: null returns");
+}
+
+void test_orelse_const_ptr_break_loop(void)
+{
+    const int a = 10, b = 20;
+    const int *ptrs[] = {&a, &b, NULL};
+    int sum = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        const int *p = ptrs[i] orelse break;
+        sum += *p;
+    }
+    CHECK_EQ(sum, 30, "orelse const ptr break: stops at null");
+}
+
+int orelse_fallback_reassign_helper(int val)
+{
+    int x = val orelse 42;
+    return x;
+}
+
+void test_orelse_fallback_reassign(void)
+{
+    CHECK_EQ(orelse_fallback_reassign_helper(5), 5, "orelse fallback reassign: non-zero kept");
+    CHECK_EQ(orelse_fallback_reassign_helper(0), 42, "orelse fallback reassign: zero replaced");
+}
+
+int orelse_multi_fallback_helper(int a, int b)
+{
+    int x = a orelse 10;
+    int y = b orelse 20;
+    return x + y;
+}
+
+void test_orelse_multi_fallback(void)
+{
+    CHECK_EQ(orelse_multi_fallback_helper(1, 2), 3, "orelse multi fallback: both non-zero");
+    CHECK_EQ(orelse_multi_fallback_helper(0, 2), 12, "orelse multi fallback: first zero");
+    CHECK_EQ(orelse_multi_fallback_helper(1, 0), 21, "orelse multi fallback: second zero");
+    CHECK_EQ(orelse_multi_fallback_helper(0, 0), 30, "orelse multi fallback: both zero");
+}
+
+int orelse_ptr_fallback_helper(int *p, int *fallback)
+{
+    int *x = p orelse return -1;
+    int *y = fallback orelse return -2;
+    return *x + *y;
+}
+
+void test_orelse_ptr_fallback_chain(void)
+{
+    int a = 3, b = 7;
+    CHECK_EQ(orelse_ptr_fallback_helper(&a, &b), 10, "orelse ptr chain: both ok");
+    CHECK_EQ(orelse_ptr_fallback_helper(NULL, &b), -1, "orelse ptr chain: first null");
+    CHECK_EQ(orelse_ptr_fallback_helper(&a, NULL), -2, "orelse ptr chain: second null");
+}
+
+void test_orelse_int_zero_fallback_block(void)
+{
+    int val = 0;
+    int result = -1;
+    int x = val orelse
+    {
+        result = 99;
+    }
+    (void)x;
+    CHECK_EQ(result, 99, "orelse int zero fallback block: zero triggers block");
+}
+
 void run_orelse_tests(void)
 {
     test_orelse_return_null();
@@ -12778,6 +12858,12 @@ void run_orelse_tests(void)
     test_orelse_for_body_vals();
     test_orelse_long_init();
     test_orelse_fallback_arith();
+    test_orelse_const_ptr_ctrl();
+    test_orelse_const_ptr_break_loop();
+    test_orelse_fallback_reassign();
+    test_orelse_multi_fallback();
+    test_orelse_ptr_fallback_chain();
+    test_orelse_int_zero_fallback_block();
 }
 
 int main(void)

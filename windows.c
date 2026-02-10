@@ -147,8 +147,13 @@ static int mkstemp(char *tmpl)
         x_start--;
     size_t x_count = len - x_start;
 
-    // Seed with PID + tick count for initial entropy
-    unsigned int seed = (unsigned int)_getpid() ^ (unsigned int)GetTickCount();
+    // Seed with PID + high-resolution timer + tick count for better entropy
+    // Avoids collisions in parallel build systems (e.g., ninja -j32)
+    LARGE_INTEGER perf_counter;
+    QueryPerformanceCounter(&perf_counter);
+    unsigned int seed = (unsigned int)_getpid() ^ (unsigned int)GetTickCount()
+                      ^ (unsigned int)perf_counter.LowPart
+                      ^ (unsigned int)(perf_counter.LowPart >> 16);
 
     for (int attempt = 0; attempt < 10000; attempt++)
     {
