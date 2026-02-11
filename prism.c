@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.112.0"
+#define PRISM_VERSION "0.113.0"
 
 #ifdef _WIN32
 #define PRISM_DEFAULT_CC "cl"
@@ -293,6 +293,7 @@ static bool is_type_keyword(Token *tok);
 static void typedef_pop_scope(int scope_depth);
 static TypeSpecResult parse_type_specifier(Token *tok);
 static Token *emit_expr_to_semicolon(Token *tok);
+static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const);
 
 static inline void control_flow_reset(void) { ctrl = (ControlFlow){0}; }
 static void walker_init(TokenWalker *w, Token *start, int initial_depth)
@@ -2189,6 +2190,30 @@ static Token *handle_storage_raw(Token *storage_tok)
   return t2;
 }
 
+// Emit memset-based zeroing for typeof/atomic/VLA variables
+static void emit_typeof_memsets(Token **vars, int count, bool has_volatile)
+{
+  for (int i = 0; i < count; i++)
+  {
+    if (has_volatile)
+    {
+      OUT_LIT(" { volatile char *_p = (volatile char *)&");
+      out_str(vars[i]->loc, vars[i]->len);
+      OUT_LIT("; for (size_t _i = 0; _i < sizeof(");
+      out_str(vars[i]->loc, vars[i]->len);
+      OUT_LIT("); _i++) _p[_i] = 0; }");
+    }
+    else
+    {
+      OUT_LIT(" __builtin_memset(&");
+      out_str(vars[i]->loc, vars[i]->len);
+      OUT_LIT(", 0, sizeof(");
+      out_str(vars[i]->loc, vars[i]->len);
+      OUT_LIT("));");
+    }
+  }
+}
+
 // Process all declarators in a declaration and emit with zero-init
 // Returns token after declaration, or NULL on failure
 static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
@@ -2265,25 +2290,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
           error_tok(tok, "orelse cannot be used in for-loop initializers");
         out_char(';');
 
-        for (int i = 0; i < typeof_var_count; i++)
-        {
-          if (type->has_volatile)
-          {
-            OUT_LIT(" { volatile char *_p = (volatile char *)&");
-            out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
-            OUT_LIT("; for (size_t _i = 0; _i < sizeof(");
-            out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
-            OUT_LIT("); _i++) _p[_i] = 0; }");
-          }
-          else
-          {
-            OUT_LIT(" __builtin_memset(&");
-            out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
-            OUT_LIT(", 0, sizeof(");
-            out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
-            OUT_LIT("));");
-          }
-        }
+        emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile);
         free(typeof_vars);
 
         // Register shadow for typedef names used as variables
@@ -2311,145 +2318,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
           warn_tok(decl.var_name, "orelse on array variable '%.*s' will never trigger (array address is never NULL)",
                    decl.var_name->len, decl.var_name->loc);
 
-        if (tok->tag & TT_RETURN)
-        {
-          mark_switch_control_exit();
-          tok = tok->next; // skip 'return'
-          OUT_LIT(" if (!");
-          out_str(decl.var_name->loc, decl.var_name->len);
-          OUT_LIT(") {");
-          if (FEAT(F_DEFER) && has_active_defers())
-          {
-            if (equal(tok, ";"))
-            {
-              emit_all_defers();
-              OUT_LIT(" return;");
-              tok = tok->next;
-            }
-            else
-            {
-              bool is_void_cast = equal(tok, "(") && tok->next && equal(tok->next, "void") &&
-                                  tok->next->next && equal(tok->next->next, ")");
-              bool is_void = ctx->current_func_returns_void || is_void_cast;
-              if (!is_void)
-              {
-                OUT_LIT(" __auto_type _prism_ret_");
-                out_uint(ctx->ret_counter);
-                OUT_LIT(" = (");
-              }
-              else
-                OUT_LIT(" (");
-              tok = emit_expr_to_semicolon(tok);
-              OUT_LIT(");");
-              emit_all_defers();
-              if (!is_void)
-              {
-                OUT_LIT(" return _prism_ret_");
-                out_uint(ctx->ret_counter++);
-              }
-              else
-                OUT_LIT(" return");
-              out_char(';');
-              if (equal(tok, ";"))
-                tok = tok->next;
-            }
-          }
-          else
-          {
-            OUT_LIT(" return");
-            if (!equal(tok, ";"))
-            {
-              out_char(' ');
-              tok = emit_expr_to_semicolon(tok);
-            }
-            out_char(';');
-            if (equal(tok, ";"))
-              tok = tok->next;
-          }
-          OUT_LIT(" }");
-          end_statement_after_semicolon();
-          return tok;
-        }
-        else if (tok->tag & (TT_BREAK | TT_CONTINUE))
-        {
-          bool is_break = tok->tag & TT_BREAK;
-          mark_switch_control_exit();
-          OUT_LIT(" if (!");
-          out_str(decl.var_name->loc, decl.var_name->len);
-          OUT_LIT(") {");
-          if (FEAT(F_DEFER) && control_flow_has_defers(is_break))
-            emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
-          out_char(' ');
-          out_str(tok->loc, tok->len);
-          OUT_LIT("; }");
-          tok = tok->next;
-          if (equal(tok, ";"))
-            tok = tok->next;
-          end_statement_after_semicolon();
-          return tok;
-        }
-        else if (tok->tag & TT_GOTO)
-        {
-          mark_switch_control_exit();
-          OUT_LIT(" if (!");
-          out_str(decl.var_name->loc, decl.var_name->len);
-          OUT_LIT(") {");
-          tok = tok->next; // skip 'goto'
-          if (FEAT(F_DEFER) && is_identifier_like(tok))
-          {
-            int target_depth = label_table_lookup(tok->loc, tok->len);
-            if (target_depth < 0)
-              target_depth = ctx->defer_depth;
-            if (goto_has_defers(target_depth))
-              emit_goto_defers(target_depth);
-          }
-          OUT_LIT(" goto ");
-          if (is_identifier_like(tok))
-          {
-            out_str(tok->loc, tok->len);
-            tok = tok->next;
-          }
-          OUT_LIT("; }");
-          if (equal(tok, ";"))
-            tok = tok->next;
-          end_statement_after_semicolon();
-          return tok;
-        }
-        else if (equal(tok, "{"))
-        {
-          OUT_LIT(" if (!");
-          out_str(decl.var_name->loc, decl.var_name->len);
-          out_char(')');
-          ctx->at_stmt_start = false;
-          return tok;
-        }
-        else
-        {
-          if (type->has_const || decl.is_const)
-            error_tok(tok, "orelse fallback cannot reassign a const-qualified variable");
-          OUT_LIT(" if (!");
-          out_str(decl.var_name->loc, decl.var_name->len);
-          OUT_LIT(") ");
-          out_str(decl.var_name->loc, decl.var_name->len);
-          OUT_LIT(" =");
-          int fdepth = 0;
-          while (tok->kind != TK_EOF)
-          {
-            if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
-              fdepth++;
-            else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
-              fdepth--;
-            else if (fdepth == 0 && equal(tok, ";"))
-              break;
-            emit_tok(tok);
-            tok = tok->next;
-          }
-          out_char(';');
-          if (equal(tok, ";"))
-            tok = tok->next;
-          end_statement_after_semicolon();
-          return tok;
-        }
+        tok = emit_orelse_action(tok, decl.var_name, type->has_const || decl.is_const);
+        return tok;
       }
     }
 
@@ -2470,28 +2340,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
     if (equal(tok, ";"))
     {
       emit_tok(tok);
-      // Emit memset for typeof variables
-      // For volatile variables, use volatile-aware zeroing to ensure stores aren't optimized out
-      for (int i = 0; i < typeof_var_count; i++)
-      {
-        if (type->has_volatile)
-        {
-          // Use volatile char* to ensure each byte write is not optimized
-          OUT_LIT(" { volatile char *_p = (volatile char *)&");
-          out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
-          OUT_LIT("; for (size_t _i = 0; _i < sizeof(");
-          out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
-          OUT_LIT("); _i++) _p[_i] = 0; }");
-        }
-        else
-        {
-          OUT_LIT(" __builtin_memset(&");
-          out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
-          OUT_LIT(", 0, sizeof(");
-          out_str(typeof_vars[i]->loc, typeof_vars[i]->len);
-          OUT_LIT("));");
-        }
-      }
+      emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile);
       free(typeof_vars);
       return tok->next;
     }
@@ -2749,6 +2598,174 @@ static Token *handle_defer_keyword(Token *tok)
   return tok;
 }
 
+// Emit return statement body with optional defer cleanup.
+// tok points to first token after 'return'. Returns updated tok.
+static Token *emit_return_body(Token *tok)
+{
+  if (FEAT(F_DEFER) && has_active_defers())
+  {
+    if (equal(tok, ";"))
+    {
+      emit_all_defers();
+      OUT_LIT(" return;");
+      tok = tok->next;
+    }
+    else
+    {
+      bool is_void_cast = equal(tok, "(") && tok->next && equal(tok->next, "void") &&
+                          tok->next->next && equal(tok->next->next, ")");
+      bool is_void = ctx->current_func_returns_void || is_void_cast;
+      if (!is_void)
+      {
+        OUT_LIT(" __auto_type _prism_ret_");
+        out_uint(ctx->ret_counter);
+        OUT_LIT(" = (");
+      }
+      else
+        OUT_LIT(" (");
+      tok = emit_expr_to_semicolon(tok);
+      OUT_LIT(");");
+      emit_all_defers();
+      if (!is_void)
+      {
+        OUT_LIT(" return _prism_ret_");
+        out_uint(ctx->ret_counter++);
+      }
+      else
+        OUT_LIT(" return");
+      out_char(';');
+      if (equal(tok, ";"))
+        tok = tok->next;
+    }
+  }
+  else
+  {
+    OUT_LIT(" return");
+    if (!equal(tok, ";"))
+    {
+      out_char(' ');
+      tok = emit_expr_to_semicolon(tok);
+    }
+    out_char(';');
+    if (equal(tok, ";"))
+      tok = tok->next;
+  }
+  return tok;
+}
+
+// Emit orelse action: the fallback part after 'orelse'.
+// For declaration orelse: var_name is the variable, has_const from type/decl.
+// For bare expression orelse: var_name is NULL (condition already emitted).
+// Calls end_statement_after_semicolon() internally for non-block cases.
+static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const)
+{
+// Helper: emit condition opening
+#define ORELSE_OPEN()                        \
+  do                                         \
+  {                                          \
+    if (var_name)                            \
+    {                                        \
+      OUT_LIT(" if (!");                     \
+      out_str(var_name->loc, var_name->len); \
+      OUT_LIT(") {");                        \
+    }                                        \
+    else                                     \
+      OUT_LIT(" {");                         \
+  } while (0)
+
+  if (tok->tag & TT_RETURN)
+  {
+    mark_switch_control_exit();
+    tok = tok->next;
+    ORELSE_OPEN();
+    tok = emit_return_body(tok);
+    OUT_LIT(" }");
+    end_statement_after_semicolon();
+    return tok;
+  }
+  if (tok->tag & (TT_BREAK | TT_CONTINUE))
+  {
+    bool is_break = tok->tag & TT_BREAK;
+    mark_switch_control_exit();
+    ORELSE_OPEN();
+    if (FEAT(F_DEFER) && control_flow_has_defers(is_break))
+      emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
+    out_char(' ');
+    out_str(tok->loc, tok->len);
+    OUT_LIT("; }");
+    tok = tok->next;
+    if (equal(tok, ";"))
+      tok = tok->next;
+    end_statement_after_semicolon();
+    return tok;
+  }
+  if (tok->tag & TT_GOTO)
+  {
+    mark_switch_control_exit();
+    ORELSE_OPEN();
+    tok = tok->next; // skip 'goto'
+    if (FEAT(F_DEFER) && is_identifier_like(tok))
+    {
+      int target_depth = label_table_lookup(tok->loc, tok->len);
+      if (target_depth < 0)
+        target_depth = ctx->defer_depth;
+      if (goto_has_defers(target_depth))
+        emit_goto_defers(target_depth);
+    }
+    OUT_LIT(" goto ");
+    if (is_identifier_like(tok))
+    {
+      out_str(tok->loc, tok->len);
+      tok = tok->next;
+    }
+    OUT_LIT("; }");
+    if (equal(tok, ";"))
+      tok = tok->next;
+    end_statement_after_semicolon();
+    return tok;
+  }
+  if (equal(tok, "{"))
+  {
+    if (var_name)
+    {
+      OUT_LIT(" if (!");
+      out_str(var_name->loc, var_name->len);
+      out_char(')');
+    }
+    ctx->at_stmt_start = false;
+    return tok; // '{' handled by caller
+  }
+  // Fallback: assignment (declarations) or error (bare expressions)
+  if (!var_name)
+    error_tok(tok, "orelse fallback requires an assignment target (use a declaration)");
+  if (has_const)
+    error_tok(tok, "orelse fallback cannot reassign a const-qualified variable");
+  OUT_LIT(" if (!");
+  out_str(var_name->loc, var_name->len);
+  OUT_LIT(") ");
+  out_str(var_name->loc, var_name->len);
+  OUT_LIT(" =");
+  int fdepth = 0;
+  while (tok->kind != TK_EOF)
+  {
+    if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
+      fdepth++;
+    else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
+      fdepth--;
+    else if (fdepth == 0 && equal(tok, ";"))
+      break;
+    emit_tok(tok);
+    tok = tok->next;
+  }
+  out_char(';');
+  if (equal(tok, ";"))
+    tok = tok->next;
+  end_statement_after_semicolon();
+  return tok;
+
+#undef ORELSE_OPEN
+}
+
 // Handle 'return' with active defers: save expr, emit defers, then return.
 // Returns next token if handled, or NULL to let normal emit proceed.
 static Token *handle_return_defer(Token *tok)
@@ -2757,44 +2774,9 @@ static Token *handle_return_defer(Token *tok)
   if (!has_active_defers())
     return NULL;
   tok = tok->next; // skip 'return'
-
-  if (equal(tok, ";"))
-  {
-    OUT_LIT(" {");
-    emit_all_defers();
-    OUT_LIT(" return;");
-    tok = tok->next;
-    OUT_LIT(" }");
-  }
-  else
-  {
-    bool is_void_cast = equal(tok, "(") && tok->next && equal(tok->next, "void") &&
-                        tok->next->next && equal(tok->next->next, ")");
-    bool is_void = ctx->current_func_returns_void || is_void_cast;
-    OUT_LIT(" {");
-    if (!is_void)
-    {
-      OUT_LIT(" __auto_type _prism_ret_");
-      out_uint(ctx->ret_counter);
-      OUT_LIT(" = (");
-    }
-    else
-      OUT_LIT(" (");
-    tok = emit_expr_to_semicolon(tok);
-    OUT_LIT(");");
-    emit_all_defers();
-    if (!is_void)
-    {
-      OUT_LIT(" return _prism_ret_");
-      out_uint(ctx->ret_counter++);
-    }
-    else
-      OUT_LIT(" return");
-    out_char(';');
-    if (equal(tok, ";"))
-      tok = tok->next;
-    OUT_LIT(" }");
-  }
+  OUT_LIT(" {");
+  tok = emit_return_body(tok);
+  OUT_LIT(" }");
   end_statement_after_semicolon();
   return tok;
 }
@@ -3575,108 +3557,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
           if (equal(tok, ";"))
             error_tok(tok, "expected statement after 'orelse'");
 
-          if (tok->tag & TT_RETURN)
-          {
-            mark_switch_control_exit();
-            tok = tok->next; // skip 'return'
-            OUT_LIT(" {");
-            if (FEAT(F_DEFER) && has_active_defers())
-            {
-              if (equal(tok, ";"))
-              {
-                emit_all_defers();
-                OUT_LIT(" return;");
-                tok = tok->next;
-              }
-              else
-              {
-                bool is_void_cast = equal(tok, "(") && tok->next && equal(tok->next, "void") &&
-                                    tok->next->next && equal(tok->next->next, ")");
-                bool is_void = ctx->current_func_returns_void || is_void_cast;
-                if (!is_void)
-                {
-                  OUT_LIT(" __auto_type _prism_ret_");
-                  out_uint(ctx->ret_counter);
-                  OUT_LIT(" = (");
-                }
-                else
-                  OUT_LIT(" (");
-                tok = emit_expr_to_semicolon(tok);
-                OUT_LIT(");");
-                emit_all_defers();
-                if (!is_void)
-                {
-                  OUT_LIT(" return _prism_ret_");
-                  out_uint(ctx->ret_counter++);
-                }
-                else
-                  OUT_LIT(" return");
-                out_char(';');
-                if (equal(tok, ";"))
-                  tok = tok->next;
-              }
-            }
-            else
-            {
-              OUT_LIT(" return");
-              if (!equal(tok, ";"))
-              {
-                out_char(' ');
-                tok = emit_expr_to_semicolon(tok);
-              }
-              out_char(';');
-              if (equal(tok, ";"))
-                tok = tok->next;
-            }
-            OUT_LIT(" }");
-          }
-          else if (tok->tag & (TT_BREAK | TT_CONTINUE))
-          {
-            bool is_break = tok->tag & TT_BREAK;
-            mark_switch_control_exit();
-            OUT_LIT(" {");
-            if (FEAT(F_DEFER) && control_flow_has_defers(is_break))
-              emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
-            out_char(' ');
-            out_str(tok->loc, tok->len);
-            OUT_LIT("; }");
-            tok = tok->next;
-            if (equal(tok, ";"))
-              tok = tok->next;
-          }
-          else if (tok->tag & TT_GOTO)
-          {
-            mark_switch_control_exit();
-            tok = tok->next; // skip 'goto'
-            OUT_LIT(" {");
-            if (FEAT(F_DEFER) && is_identifier_like(tok))
-            {
-              int target_depth = label_table_lookup(tok->loc, tok->len);
-              if (target_depth < 0)
-                target_depth = ctx->defer_depth;
-              if (goto_has_defers(target_depth))
-                emit_goto_defers(target_depth);
-            }
-            OUT_LIT(" goto ");
-            if (is_identifier_like(tok))
-            {
-              out_str(tok->loc, tok->len);
-              tok = tok->next;
-            }
-            OUT_LIT("; }");
-            if (equal(tok, ";"))
-              tok = tok->next;
-          }
-          else if (equal(tok, "{"))
-          {
-            ctx->at_stmt_start = false;
-            continue;
-          }
-          else
-          {
-            error_tok(tok, "orelse fallback requires an assignment target (use a declaration)");
-          }
-          end_statement_after_semicolon();
+          tok = emit_orelse_action(tok, NULL, false);
           continue;
         }
       }
@@ -3828,11 +3709,13 @@ static int transpile_tokens(Token *tok, FILE *fp)
       }
       else if (c == '(')
       {
-        if (ctrl.pending) track_ctrl_paren_open();
+        if (ctrl.pending)
+          track_ctrl_paren_open();
       }
       else if (c == ')')
       {
-        if (ctrl.pending) track_ctrl_paren_close();
+        if (ctrl.pending)
+          track_ctrl_paren_close();
       }
       else if (c == ':' && last_emitted && last_emitted->kind == TK_IDENT &&
                ctx->struct_depth == 0 && ctx->defer_depth > 0)

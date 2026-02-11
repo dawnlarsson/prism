@@ -1190,52 +1190,42 @@ static Token *read_char_literal(char *start, char *quote)
 // Sets *replacement to the standard suffix to use (NULL for none, "f" for float, "L" for long double)
 static int get_extended_float_suffix(const char *p, int len, const char **replacement)
 {
+    static const struct
+    {
+        const char suffix[5];
+        int slen;
+        const char *repl;
+    } tbl[] = {
+        {"bf16", 4, "f"},
+        {"f128", 4, "L"},
+        {"f64", 3, NULL},
+        {"f32", 3, "f"},
+        {"f16", 3, "f"},
+    };
     if (replacement)
         *replacement = NULL;
-
     if (len < 3)
         return 0;
-
     const char *e = p + len;
-
-    if (len >= 4) // 4-char suffixes: BF16, F128
+    for (int i = 0; i < (int)(sizeof(tbl) / sizeof(*tbl)); i++)
     {
-        char c = e[-4] | 0x20; // lowercase
-        if (c == 'b' && (e[-3] | 0x20) == 'f' && e[-2] == '1' && e[-1] == '6')
+        int sl = tbl[i].slen;
+        if (len < sl)
+            continue;
+        bool match = true;
+        for (int j = 0; j < sl; j++)
+            if ((e[-sl + j] | 0x20) != tbl[i].suffix[j])
+            {
+                match = false;
+                break;
+            }
+        if (match)
         {
             if (replacement)
-                *replacement = "f";
-            return 4;
-        }
-        if (c == 'f' && e[-3] == '1' && e[-2] == '2' && e[-1] == '8')
-        {
-            if (replacement)
-                *replacement = "L";
-            return 4;
+                *replacement = tbl[i].repl;
+            return sl;
         }
     }
-
-    // 3-char suffixes: F16, F32, F64
-    if ((e[-3] | 0x20) != 'f' || e[-1] < '2' || e[-1] > '6')
-        return 0;
-
-    if (e[-2] == '6' && e[-1] == '4')
-        return 3;
-
-    if (e[-2] == '3' && e[-1] == '2')
-    {
-        if (replacement)
-            *replacement = "f";
-        return 3;
-    }
-
-    if (e[-2] == '1' && e[-1] == '6')
-    {
-        if (replacement)
-            *replacement = "f";
-        return 3;
-    }
-
     return 0;
 }
 

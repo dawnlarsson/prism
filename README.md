@@ -310,7 +310,7 @@ Not:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v0.112.0 - Robust C transpiler
+Prism v0.113.0 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 
