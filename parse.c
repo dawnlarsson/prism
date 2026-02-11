@@ -35,6 +35,7 @@
 #endif
 
 #define TOMBSTONE ((void *)-1)
+#define ENTRY_MATCHES(ent, k, kl) ((ent)->key && (ent)->key != TOMBSTONE && (ent)->keylen == (kl) && !memcmp((ent)->key, (k), (kl)))
 #define IS_DIGIT(c) ((unsigned)(c) - '0' < 10u)
 #define IS_ALPHA(c) (((unsigned)((c) | 0x20) - 'a') < 26u || (c) == '_' || (c) == '$')
 #define IS_ALNUM(c) (IS_DIGIT(c) || IS_ALPHA(c))
@@ -441,8 +442,7 @@ static void *hashmap_get(HashMap *map, char *key, int keylen)
     for (int i = 0; i <= mask; i++)
     {
         HashEntry *ent = &map->buckets[(hash + i) & mask];
-        if (ent->key && ent->key != TOMBSTONE &&
-            ent->keylen == keylen && !memcmp(ent->key, key, keylen))
+        if (ENTRY_MATCHES(ent, key, keylen))
             return ent->val;
         if (!ent->key)
             return NULL;
@@ -491,8 +491,7 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val)
         HashEntry *ent = &map->buckets[idx];
 
         // Check for existing key to update
-        if (ent->key && ent->key != TOMBSTONE &&
-            ent->keylen == keylen && !memcmp(ent->key, key, keylen))
+        if (ENTRY_MATCHES(ent, key, keylen))
         {
             ent->val = val; // Update existing entry
             return;
@@ -529,8 +528,7 @@ static void hashmap_delete(HashMap *map, char *key, int keylen)
     for (int i = 0; i <= mask; i++)
     {
         HashEntry *ent = &map->buckets[(hash + i) & mask];
-        if (ent->key && ent->key != TOMBSTONE &&
-            ent->keylen == keylen && !memcmp(ent->key, key, keylen))
+        if (ENTRY_MATCHES(ent, key, keylen))
         {
             ent->key = TOMBSTONE;
             map->used--;
@@ -639,6 +637,15 @@ static int tok_line_no(Token *tok) { return tok->line_no; }
 // Error handling
 // Note: va_list scoping is intentional to avoid undefined behavior when
 // PRISM_LIB_MODE is defined but ctx->error_jmp_set is false.
+#ifdef PRISM_LIB_MODE
+static noreturn void lib_error_jump(int line, const char *fmt, va_list ap)
+{
+    ctx->error_line = line;
+    vsnprintf(ctx->error_msg, sizeof(ctx->error_msg), fmt, ap);
+    longjmp(ctx->error_jmp, 1);
+}
+#endif
+
 static noreturn void error(char *fmt, ...)
 {
 #ifdef PRISM_LIB_MODE
@@ -646,9 +653,7 @@ static noreturn void error(char *fmt, ...)
     {
         va_list ap;
         va_start(ap, fmt);
-        vsnprintf(ctx->error_msg, sizeof(ctx->error_msg), fmt, ap);
-        va_end(ap);
-        longjmp(ctx->error_jmp, 1);
+        lib_error_jump(0, fmt, ap);
     }
 #endif
     va_list ap;
@@ -698,12 +703,7 @@ noreturn void error_at(char *loc, char *fmt, ...)
     va_start(ap, fmt);
 #ifdef PRISM_LIB_MODE
     if (ctx->error_jmp_set)
-    {
-        ctx->error_line = count_lines(ctx->current_file->contents, loc);
-        vsnprintf(ctx->error_msg, sizeof(ctx->error_msg), fmt, ap);
-        va_end(ap);
-        longjmp(ctx->error_jmp, 1);
-    }
+        lib_error_jump(count_lines(ctx->current_file->contents, loc), fmt, ap);
 #endif
     verror_at(ctx->current_file->name, ctx->current_file->contents, count_lines(ctx->current_file->contents, loc), loc, fmt, ap);
     va_end(ap);
@@ -717,12 +717,7 @@ noreturn void error_tok(Token *tok, const char *fmt, ...)
     File *f = tok_file(tok);
 #ifdef PRISM_LIB_MODE
     if (ctx->error_jmp_set)
-    {
-        ctx->error_line = tok_line_no(tok);
-        vsnprintf(ctx->error_msg, sizeof(ctx->error_msg), fmt, ap);
-        va_end(ap);
-        longjmp(ctx->error_jmp, 1);
-    }
+        lib_error_jump(tok_line_no(tok), fmt, ap);
 #endif
     verror_at(f->name, f->contents, tok_line_no(tok), tok->loc, fmt, ap);
     va_end(ap);
@@ -823,83 +818,107 @@ static void init_keyword_map(void)
 {
     // Unified table: keywords (is_kw=true) get KW_MARKER and become TK_KEYWORD;
     // tagged identifiers (is_kw=false) stay TK_IDENT but carry classification tags.
-    static struct { char *name; uint32_t tag; bool is_kw; } entries[] = {
+    static struct
+    {
+        char *name;
+        uint32_t tag;
+        bool is_kw;
+    } entries[] = {
         // Control flow
-        {"return",    TT_SKIP_DECL | TT_RETURN, true},
-        {"if",        TT_SKIP_DECL | TT_CONTROL | TT_IF, true},
-        {"else",      TT_SKIP_DECL | TT_CONTROL | TT_IF, true},
-        {"for",       TT_SKIP_DECL | TT_LOOP | TT_CONTROL, true},
-        {"while",     TT_SKIP_DECL | TT_LOOP | TT_CONTROL, true},
-        {"do",        TT_SKIP_DECL | TT_LOOP | TT_CONTROL, true},
-        {"switch",    TT_SKIP_DECL | TT_CONTROL | TT_SWITCH, true},
-        {"case",      TT_SKIP_DECL | TT_CASE, true},
-        {"default",   TT_SKIP_DECL | TT_DEFAULT, true},
-        {"break",     TT_SKIP_DECL | TT_BREAK, true},
-        {"continue",  TT_SKIP_DECL | TT_CONTINUE, true},
-        {"goto",      TT_SKIP_DECL | TT_GOTO, true},
-        {"sizeof",    TT_SKIP_DECL, true},
-        {"alignof",   TT_SKIP_DECL, true},
-        {"_Alignof",  TT_SKIP_DECL, true},
-        {"_Generic",  TT_SKIP_DECL | TT_GENERIC, true},
+        {"return", TT_SKIP_DECL | TT_RETURN, true},
+        {"if", TT_SKIP_DECL | TT_CONTROL | TT_IF, true},
+        {"else", TT_SKIP_DECL | TT_CONTROL | TT_IF, true},
+        {"for", TT_SKIP_DECL | TT_LOOP | TT_CONTROL, true},
+        {"while", TT_SKIP_DECL | TT_LOOP | TT_CONTROL, true},
+        {"do", TT_SKIP_DECL | TT_LOOP | TT_CONTROL, true},
+        {"switch", TT_SKIP_DECL | TT_CONTROL | TT_SWITCH, true},
+        {"case", TT_SKIP_DECL | TT_CASE, true},
+        {"default", TT_SKIP_DECL | TT_DEFAULT, true},
+        {"break", TT_SKIP_DECL | TT_BREAK, true},
+        {"continue", TT_SKIP_DECL | TT_CONTINUE, true},
+        {"goto", TT_SKIP_DECL | TT_GOTO, true},
+        {"sizeof", TT_SKIP_DECL, true},
+        {"alignof", TT_SKIP_DECL, true},
+        {"_Alignof", TT_SKIP_DECL, true},
+        {"_Generic", TT_SKIP_DECL | TT_GENERIC, true},
         {"_Static_assert", 0, true},
         // struct/union/enum
         {"struct", TT_TYPE | TT_SUE, true},
-        {"union",  TT_TYPE | TT_SUE, true},
-        {"enum",   TT_TYPE | TT_SUE, true},
+        {"union", TT_TYPE | TT_SUE, true},
+        {"enum", TT_TYPE | TT_SUE, true},
         // Storage class / qualifiers
         {"typedef", TT_SKIP_DECL | TT_TYPEDEF, true},
-        {"static",  TT_QUALIFIER | TT_SKIP_DECL, true},
-        {"extern",  TT_SKIP_DECL, true},
-        {"inline",  TT_INLINE, true},
-        {"const",   TT_QUALIFIER, true},
+        {"static", TT_QUALIFIER | TT_SKIP_DECL, true},
+        {"extern", TT_SKIP_DECL, true},
+        {"inline", TT_INLINE, true},
+        {"const", TT_QUALIFIER, true},
         {"volatile", TT_QUALIFIER | TT_VOLATILE, true},
         {"restrict", TT_QUALIFIER, true},
         {"_Atomic", TT_QUALIFIER | TT_TYPE, true},
         {"_Noreturn", 0, true},
-        {"__inline",   TT_INLINE, true},
+        {"__inline", TT_INLINE, true},
         {"__inline__", TT_INLINE, true},
         {"_Thread_local", 0, true},
         // Type keywords
-        {"void", TT_TYPE, true}, {"char", TT_TYPE, true}, {"short", TT_TYPE, true},
-        {"int", TT_TYPE, true}, {"long", TT_TYPE, true}, {"float", TT_TYPE, true},
-        {"double", TT_TYPE, true}, {"signed", TT_TYPE, true}, {"unsigned", TT_TYPE, true},
-        {"_Bool", TT_TYPE, true}, {"bool", TT_TYPE, true},
-        {"_Complex", TT_TYPE, true}, {"_Imaginary", TT_TYPE, true},
-        {"__int128", TT_TYPE, true}, {"__int128_t", TT_TYPE, true},
-        {"__uint128", TT_TYPE, true}, {"__uint128_t", TT_TYPE, true},
+        {"void", TT_TYPE, true},
+        {"char", TT_TYPE, true},
+        {"short", TT_TYPE, true},
+        {"int", TT_TYPE, true},
+        {"long", TT_TYPE, true},
+        {"float", TT_TYPE, true},
+        {"double", TT_TYPE, true},
+        {"signed", TT_TYPE, true},
+        {"unsigned", TT_TYPE, true},
+        {"_Bool", TT_TYPE, true},
+        {"bool", TT_TYPE, true},
+        {"_Complex", TT_TYPE, true},
+        {"_Imaginary", TT_TYPE, true},
+        {"__int128", TT_TYPE, true},
+        {"__int128_t", TT_TYPE, true},
+        {"__uint128", TT_TYPE, true},
+        {"__uint128_t", TT_TYPE, true},
         {"typeof_unqual", TT_TYPE | TT_TYPEOF, true},
         {"auto", TT_QUALIFIER, true},
         {"register", TT_QUALIFIER | TT_REGISTER, true},
         {"_Alignas", TT_QUALIFIER | TT_ALIGNAS, true},
-        {"alignas",  TT_QUALIFIER | TT_ALIGNAS, true},
-        {"typeof",     TT_TYPE | TT_TYPEOF, true},
+        {"alignas", TT_QUALIFIER | TT_ALIGNAS, true},
+        {"typeof", TT_TYPE | TT_TYPEOF, true},
         {"__typeof__", TT_TYPE | TT_TYPEOF, true},
-        {"__typeof",   TT_TYPE | TT_TYPEOF, true},
+        {"__typeof", TT_TYPE | TT_TYPEOF, true},
         {"_BitInt", TT_TYPE | TT_BITINT, true},
         // Asm
-        {"asm",      TT_SKIP_DECL | TT_ASM, true},
-        {"__asm__",  TT_SKIP_DECL | TT_ASM, true},
-        {"__asm",    TT_SKIP_DECL | TT_ASM, true},
+        {"asm", TT_SKIP_DECL | TT_ASM, true},
+        {"__asm__", TT_SKIP_DECL | TT_ASM, true},
+        {"__asm", TT_SKIP_DECL | TT_ASM, true},
         // Attributes
         {"__attribute__", TT_ATTR | TT_QUALIFIER, true},
-        {"__attribute",   TT_ATTR | TT_QUALIFIER, true},
-        {"__declspec",    TT_ATTR | TT_QUALIFIER, true},
+        {"__attribute", TT_ATTR | TT_QUALIFIER, true},
+        {"__declspec", TT_ATTR | TT_QUALIFIER, true},
         // Other builtins
-        {"__extension__", 0, true}, {"__builtin_va_list", 0, true},
-        {"__builtin_va_arg", 0, true}, {"__builtin_offsetof", 0, true},
+        {"__extension__", 0, true},
+        {"__builtin_va_list", 0, true},
+        {"__builtin_va_arg", 0, true},
+        {"__builtin_offsetof", 0, true},
         {"__builtin_types_compatible_p", 0, true},
         // Prism keywords
-        {"defer", TT_DEFER, true}, {"orelse", TT_ORELSE, true}, {"raw", 0, true},
+        {"defer", TT_DEFER, true},
+        {"orelse", TT_ORELSE, true},
+        {"raw", 0, true},
         // Tagged identifiers (not keywords — stay TK_IDENT)
-        {"exit", TT_NORETURN_FN, false}, {"_Exit", TT_NORETURN_FN, false},
-        {"_exit", TT_NORETURN_FN, false}, {"abort", TT_NORETURN_FN, false},
+        {"exit", TT_NORETURN_FN, false},
+        {"_Exit", TT_NORETURN_FN, false},
+        {"_exit", TT_NORETURN_FN, false},
+        {"abort", TT_NORETURN_FN, false},
         {"quick_exit", TT_NORETURN_FN, false},
         {"__builtin_trap", TT_NORETURN_FN, false},
         {"__builtin_unreachable", TT_NORETURN_FN, false},
         {"thrd_exit", TT_NORETURN_FN, false},
-        {"setjmp", TT_SETJMP_FN, false}, {"longjmp", TT_SETJMP_FN, false},
-        {"_setjmp", TT_SETJMP_FN, false}, {"_longjmp", TT_SETJMP_FN, false},
-        {"sigsetjmp", TT_SETJMP_FN, false}, {"siglongjmp", TT_SETJMP_FN, false},
+        {"setjmp", TT_SETJMP_FN, false},
+        {"longjmp", TT_SETJMP_FN, false},
+        {"_setjmp", TT_SETJMP_FN, false},
+        {"_longjmp", TT_SETJMP_FN, false},
+        {"sigsetjmp", TT_SETJMP_FN, false},
+        {"siglongjmp", TT_SETJMP_FN, false},
         {"pthread_exit", TT_SETJMP_FN, false},
         {"__builtin_setjmp", TT_SETJMP_FN, false},
         {"__builtin_longjmp", TT_SETJMP_FN, false},

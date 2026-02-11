@@ -707,28 +707,6 @@ static void defer_add(Token *defer_keyword, Token *start, Token *end)
   scope->had_control_exit = false;
 }
 
-// Mark that control flow exited (break/return/goto) in the innermost switch scope
-// This tells us that defers were properly executed before the case ended
-// Only mark if the exit is unconditional (not inside an if/while/for block)
-static void mark_switch_control_exit(void)
-{
-  // Only mark as definite control exit if not inside a conditional context
-  // If inside if/while/for (even braceless), the control exit might not be taken at runtime
-  // ctrl.pending is true for braceless: "if (x) break;"
-  // ctx->conditional_block_depth > 0 for braced: "if (x) { break; }"
-  if (ctrl.pending || ctx->conditional_block_depth > 0)
-    return;
-
-  for (int d = ctx->defer_depth - 1; d >= 0; d--)
-  {
-    if (!defer_stack[d].is_switch)
-      continue;
-
-    defer_stack[d].had_control_exit = true;
-    return;
-  }
-}
-
 // Find innermost switch scope index, or -1 if not in a switch
 static int find_switch_scope(void)
 {
@@ -737,21 +715,44 @@ static int find_switch_scope(void)
       return d;
   return -1;
 }
-#define inside_switch_scope() (find_switch_scope() >= 0)
 
-// Clear defers from current depth down to the innermost switch scope.
-// Case labels can appear inside nested blocks (Duff's device), so we clear all levels.
-static void clear_switch_scope_defers(void)
+// Mark that control flow exited (break/return/goto) in the innermost switch scope.
+// Only mark if the exit is unconditional (not inside an if/while/for block).
+static void mark_switch_control_exit(void)
 {
-  int sd = find_switch_scope();
-  if (sd < 0)
+  if (ctrl.pending || ctx->conditional_block_depth > 0)
     return;
-  for (int d = ctx->defer_depth - 1; d >= sd; d--)
-  {
-    defer_stack[d].count = 0;
-    defer_stack[d].had_control_exit = false;
-  }
+  int sd = find_switch_scope();
+  if (sd >= 0)
+    defer_stack[sd].had_control_exit = true;
 }
+
+// Lookup tables for punctuator merge detection (replaces 20+ branch chain)
+// merges_with_eq[c]=1 means 'c=' would form a compound token (+=, ==, !=, etc.)
+static const uint8_t merges_with_eq[256] = {
+    ['='] = 1,
+    ['!'] = 1,
+    ['<'] = 1,
+    ['>'] = 1,
+    ['+'] = 1,
+    ['-'] = 1,
+    ['*'] = 1,
+    ['/'] = 1,
+    ['%'] = 1,
+    ['&'] = 1,
+    ['|'] = 1,
+    ['^'] = 1,
+};
+// merges_with_self[c]=1 means 'cc' forms a different token (++, --, <<, >>, etc.)
+static const uint8_t merges_with_self[256] = {
+    ['+'] = 1,
+    ['-'] = 1,
+    ['<'] = 1,
+    ['>'] = 1,
+    ['&'] = 1,
+    ['|'] = 1,
+    ['#'] = 1,
+};
 
 // Check if a space is needed between two tokens
 static bool needs_space(Token *prev, Token *tok)
@@ -767,11 +768,9 @@ static bool needs_space(Token *prev, Token *tok)
     return false;
   // Two adjacent punctuators that would merge into a different token
   uint8_t a = (uint8_t)prev->loc[prev->len - 1], b = (uint8_t)tok->loc[0];
-  // 'b' is always '=' or matches 'a' (++ -- << >> && || == ## /* */), plus ->
   if (b == '=')
-    return a == '=' || a == '!' || a == '<' || a == '>' || a == '+' || a == '-' || a == '*' || a == '/' || a == '%' || a == '&' || a == '|' || a == '^';
-
-  return (a == b && (a == '+' || a == '-' || a == '<' || a == '>' || a == '&' || a == '|' || a == '#')) ||
+    return merges_with_eq[a];
+  return (a == b && merges_with_self[a]) ||
          (a == '-' && b == '>') || (a == '/' && b == '*') || (a == '*' && b == '/');
 }
 
@@ -787,6 +786,33 @@ static bool is_inside_attribute(Token *tok)
       depth++;
     else if (equal(t, ")") && --depth < 0)
       return true;
+  return false;
+}
+
+// Cold path: emit C23 float suffix or digraph translation (rare, <1% of tokens)
+static bool __attribute__((noinline)) emit_tok_special(Token *tok)
+{
+  if ((tok->flags & TF_IS_FLOAT) && tok->kind == TK_NUM)
+  {
+    const char *replacement;
+    int suffix_len = get_extended_float_suffix(tok->loc, tok->len, &replacement);
+    if (suffix_len > 0)
+    {
+      out_str(tok->loc, tok->len - suffix_len);
+      if (replacement)
+        out_str(replacement, strlen(replacement));
+      return true;
+    }
+  }
+  if (tok->flags & TF_IS_DIGRAPH)
+  {
+    const char *equiv = digraph_equiv(tok);
+    if (equiv)
+    {
+      out_str(equiv, strlen(equiv));
+      return true;
+    }
+  }
   return false;
 }
 
@@ -832,9 +858,8 @@ static void emit_tok(Token *tok)
     ctx->last_line_no = line_no;
 
   // Handle preprocessor directives (e.g., #pragma) - emit verbatim
-  if (tok->kind == TK_PREP_DIR)
+  if (__builtin_expect(tok->kind == TK_PREP_DIR, 0))
   {
-    // Preprocessor directives should be at BOL
     if (!tok_at_bol(tok))
       out_char('\n');
     out_str(tok->loc, tok->len);
@@ -842,35 +867,11 @@ static void emit_tok(Token *tok)
     return;
   }
 
-  // Handle rare special cases: C23 float suffixes, digraphs, prep directives
-  if (__builtin_expect(tok->flags & (TF_IS_FLOAT | TF_IS_DIGRAPH), 0))
+  // Handle rare special cases: C23 float suffixes, digraphs
+  if (__builtin_expect(tok->flags & (TF_IS_FLOAT | TF_IS_DIGRAPH), 0) && emit_tok_special(tok))
   {
-    // Handle C23 extended float suffixes (F128, F64, F32, F16, BF16)
-    if ((tok->flags & TF_IS_FLOAT) && tok->kind == TK_NUM)
-    {
-      const char *replacement;
-      int suffix_len = get_extended_float_suffix(tok->loc, tok->len, &replacement);
-      if (suffix_len > 0)
-      {
-        out_str(tok->loc, tok->len - suffix_len);
-        if (replacement)
-          out_str(replacement, strlen(replacement));
-        last_emitted = tok;
-        return;
-      }
-    }
-
-    // Handle digraphs - translate to canonical form
-    if (tok->flags & TF_IS_DIGRAPH)
-    {
-      const char *equiv = digraph_equiv(tok);
-      if (equiv)
-      {
-        out_str(equiv, strlen(equiv));
-        last_emitted = tok;
-        return;
-      }
-    }
+    last_emitted = tok;
+    return;
   }
 
   out_str(tok->loc, tok->len);
@@ -1086,26 +1087,36 @@ static TypedefEntry *typedef_lookup(Token *tok)
 }
 
 // Typedef query flags (single lookup, check multiple properties)
-enum { TDF_TYPEDEF = 1, TDF_VLA = 2, TDF_VOID = 4, TDF_ENUM_CONST = 8 };
+enum
+{
+  TDF_TYPEDEF = 1,
+  TDF_VLA = 2,
+  TDF_VOID = 4,
+  TDF_ENUM_CONST = 8
+};
 
 static inline int typedef_flags(Token *tok)
 {
   TypedefEntry *e = typedef_lookup(tok);
-  if (!e) return 0;
-  if (e->is_enum_const) return TDF_ENUM_CONST;
-  if (e->is_shadow) return 0;
+  if (!e)
+    return 0;
+  if (e->is_enum_const)
+    return TDF_ENUM_CONST;
+  if (e->is_shadow)
+    return 0;
   return TDF_TYPEDEF | (e->is_vla ? TDF_VLA : 0) | (e->is_void ? TDF_VOID : 0);
 }
 #define is_known_typedef(tok) (typedef_flags(tok) & TDF_TYPEDEF)
-#define is_vla_typedef(tok)   (typedef_flags(tok) & TDF_VLA)
-#define is_void_typedef(tok)  (typedef_flags(tok) & TDF_VOID)
+#define is_vla_typedef(tok) (typedef_flags(tok) & TDF_VLA)
+#define is_void_typedef(tok) (typedef_flags(tok) & TDF_VOID)
 #define is_known_enum_const(tok) (typedef_flags(tok) & TDF_ENUM_CONST)
 
 // Heuristic: matches system typedefs not seen during transpilation
 // *_t (size_t, time_t) and __* (glibc internals) but not __func()
 static inline bool is_typedef_heuristic(Token *tok)
 {
-  if (tok->kind != TK_IDENT) return false;
+  if (tok->kind != TK_IDENT)
+    return false;
   if (tok->len >= 3 && tok->loc[tok->len - 2] == '_' && tok->loc[tok->len - 1] == 't')
     return true;
   if (tok->len >= 2 && tok->loc[0] == '_' && tok->loc[1] == '_')
@@ -1499,11 +1510,9 @@ static bool is_knr_params(Token *after_paren, Token *brace)
   return saw_any && t == brace;
 }
 
-// Check if token starts a void function declaration
-// Handles: void func(, static void func(, __attribute__((...)) void func(, etc.
-static bool is_void_function_decl(Token *tok)
+// Skip function specifiers/qualifiers/attributes that can precede a type
+static Token *skip_func_specifiers(Token *tok)
 {
-  // Skip storage class specifiers, qualifiers, and attributes
   while (tok && ((tok->tag & (TT_QUALIFIER | TT_SKIP_DECL | TT_ATTR | TT_INLINE)) ||
                  equal(tok, "_Noreturn")))
   {
@@ -1512,6 +1521,14 @@ static bool is_void_function_decl(Token *tok)
     else
       tok = tok->next;
   }
+  return tok;
+}
+
+// Check if token starts a void function declaration
+// Handles: void func(, static void func(, __attribute__((...)) void func(, etc.
+static bool is_void_function_decl(Token *tok)
+{
+  tok = skip_func_specifiers(tok);
 
   // Must be at 'void', a typedef alias for void, or typeof(void)/typeof_unqual(void)
   if (!tok)
@@ -1522,9 +1539,7 @@ static bool is_void_function_decl(Token *tok)
     Token *t = tok->next;
     if (t && equal(t, "(") && t->next && equal(t->next, "void") &&
         t->next->next && equal(t->next->next, ")"))
-    {
-      tok = t->next->next->next; // skip past typeof(void)
-    }
+      tok = t->next->next->next;
     else
       return false;
   }
@@ -1538,14 +1553,7 @@ static bool is_void_function_decl(Token *tok)
     return false;
 
   // Skip attributes and qualifiers after void
-  while (tok && ((tok->tag & (TT_QUALIFIER | TT_ATTR)) ||
-                 equal(tok, "__restrict") || equal(tok, "__restrict__")))
-  {
-    if (tok->tag & TT_ATTR)
-      tok = skip_gnu_attributes(tok);
-    else
-      tok = tok->next;
-  }
+  tok = skip_func_specifiers(tok);
 
   // Should be at function name followed by (
   return tok && tok->kind == TK_IDENT && tok->next && equal(tok->next, "(");
@@ -2842,7 +2850,10 @@ static Token *handle_goto_keyword(Token *tok)
 // Handle case/default labels: check for defer fallthrough, clear switch defers.
 static void handle_case_default(Token *tok)
 {
-  if (!FEAT(F_DEFER) || !inside_switch_scope())
+  if (!FEAT(F_DEFER))
+    return;
+  int sd = find_switch_scope();
+  if (sd < 0)
     return;
   bool is_case = tok->tag & TT_CASE;
   bool is_default = (tok->tag & TT_DEFAULT) && ctx->generic_paren_depth == 0;
@@ -2855,19 +2866,17 @@ static void handle_case_default(Token *tok)
   if (!is_case && !is_default)
     return;
 
-  for (int d = ctx->defer_depth - 1; d >= 0; d--)
+  // Check for defer fallthrough and clear defers (single pass)
+  for (int d = ctx->defer_depth - 1; d >= sd; d--)
   {
     if (defer_stack[d].count > 0 && !defer_stack[d].had_control_exit)
       error_tok(defer_stack[d].entries[0].defer_kw,
                 "defer skipped by switch fallthrough at %s:%d",
                 tok_file(tok)->name, tok_line_no(tok));
-    if (defer_stack[d].is_switch)
-    {
-      defer_stack[d].seen_case_label = true;
-      break;
-    }
+    defer_stack[d].count = 0;
+    defer_stack[d].had_control_exit = false;
   }
-  clear_switch_scope_defers();
+  defer_stack[sd].seen_case_label = true;
 }
 
 // Handle struct/union/enum body opening: emit to '{', push scope.
@@ -3409,7 +3418,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
       continue;
     }
 
-    structural:
+  structural:
 
     // Slower path: statement-start processing and tagged tokens
 
