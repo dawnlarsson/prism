@@ -821,153 +821,109 @@ static inline uintptr_t keyword_lookup(char *key, int keylen)
 
 static void init_keyword_map(void)
 {
-    // Each entry: {keyword, TT_* tag bitmask}
-    // Tags are assigned once here, then stored on tokens during convert_pp_tokens
-    static struct
-    {
-        char *name;
-        uint32_t tag;
-    } kw[] = {
-        // Control flow (skip-decl is set on all; can't start a zero-init declaration)
-        {"return", TT_SKIP_DECL | TT_RETURN},
-        {"if", TT_SKIP_DECL | TT_CONTROL | TT_IF},
-        {"else", TT_SKIP_DECL | TT_CONTROL | TT_IF},
-        {"for", TT_SKIP_DECL | TT_LOOP | TT_CONTROL},
-        {"while", TT_SKIP_DECL | TT_LOOP | TT_CONTROL},
-        {"do", TT_SKIP_DECL | TT_LOOP | TT_CONTROL},
-        {"switch", TT_SKIP_DECL | TT_CONTROL | TT_SWITCH},
-        {"case", TT_SKIP_DECL | TT_CASE},
-        {"default", TT_SKIP_DECL | TT_DEFAULT},
-        {"break", TT_SKIP_DECL | TT_BREAK},
-        {"continue", TT_SKIP_DECL | TT_CONTINUE},
-        {"goto", TT_SKIP_DECL | TT_GOTO},
-        {"sizeof", TT_SKIP_DECL},
-        {"alignof", TT_SKIP_DECL},
-        {"_Alignof", TT_SKIP_DECL},
-        {"_Generic", TT_SKIP_DECL | TT_GENERIC},
-        {"_Static_assert", 0},
-        // struct/union/enum (also type keywords)
-        {"struct", TT_TYPE | TT_SUE},
-        {"union", TT_TYPE | TT_SUE},
-        {"enum", TT_TYPE | TT_SUE},
-        // Storage class / qualifiers that also skip decl
-        {"typedef", TT_SKIP_DECL | TT_TYPEDEF},
-        {"static", TT_QUALIFIER | TT_SKIP_DECL},
-        {"extern", TT_SKIP_DECL},
-        {"inline", TT_INLINE},
-        // Type qualifiers
-        {"const", TT_QUALIFIER},
-        {"volatile", TT_QUALIFIER | TT_VOLATILE},
-        {"restrict", TT_QUALIFIER},
-        {"_Atomic", TT_QUALIFIER | TT_TYPE},
-        {"_Noreturn", 0},
-        {"__inline", TT_INLINE},
-        {"__inline__", TT_INLINE},
-        {"_Thread_local", 0},
+    // Unified table: keywords (is_kw=true) get KW_MARKER and become TK_KEYWORD;
+    // tagged identifiers (is_kw=false) stay TK_IDENT but carry classification tags.
+    static struct { char *name; uint32_t tag; bool is_kw; } entries[] = {
+        // Control flow
+        {"return",    TT_SKIP_DECL | TT_RETURN, true},
+        {"if",        TT_SKIP_DECL | TT_CONTROL | TT_IF, true},
+        {"else",      TT_SKIP_DECL | TT_CONTROL | TT_IF, true},
+        {"for",       TT_SKIP_DECL | TT_LOOP | TT_CONTROL, true},
+        {"while",     TT_SKIP_DECL | TT_LOOP | TT_CONTROL, true},
+        {"do",        TT_SKIP_DECL | TT_LOOP | TT_CONTROL, true},
+        {"switch",    TT_SKIP_DECL | TT_CONTROL | TT_SWITCH, true},
+        {"case",      TT_SKIP_DECL | TT_CASE, true},
+        {"default",   TT_SKIP_DECL | TT_DEFAULT, true},
+        {"break",     TT_SKIP_DECL | TT_BREAK, true},
+        {"continue",  TT_SKIP_DECL | TT_CONTINUE, true},
+        {"goto",      TT_SKIP_DECL | TT_GOTO, true},
+        {"sizeof",    TT_SKIP_DECL, true},
+        {"alignof",   TT_SKIP_DECL, true},
+        {"_Alignof",  TT_SKIP_DECL, true},
+        {"_Generic",  TT_SKIP_DECL | TT_GENERIC, true},
+        {"_Static_assert", 0, true},
+        // struct/union/enum
+        {"struct", TT_TYPE | TT_SUE, true},
+        {"union",  TT_TYPE | TT_SUE, true},
+        {"enum",   TT_TYPE | TT_SUE, true},
+        // Storage class / qualifiers
+        {"typedef", TT_SKIP_DECL | TT_TYPEDEF, true},
+        {"static",  TT_QUALIFIER | TT_SKIP_DECL, true},
+        {"extern",  TT_SKIP_DECL, true},
+        {"inline",  TT_INLINE, true},
+        {"const",   TT_QUALIFIER, true},
+        {"volatile", TT_QUALIFIER | TT_VOLATILE, true},
+        {"restrict", TT_QUALIFIER, true},
+        {"_Atomic", TT_QUALIFIER | TT_TYPE, true},
+        {"_Noreturn", 0, true},
+        {"__inline",   TT_INLINE, true},
+        {"__inline__", TT_INLINE, true},
+        {"_Thread_local", 0, true},
         // Type keywords
-        {"void", TT_TYPE},
-        {"char", TT_TYPE},
-        {"short", TT_TYPE},
-        {"int", TT_TYPE},
-        {"long", TT_TYPE},
-        {"float", TT_TYPE},
-        {"double", TT_TYPE},
-        {"signed", TT_TYPE},
-        {"unsigned", TT_TYPE},
-        {"_Bool", TT_TYPE},
-        {"bool", TT_TYPE},
-        {"_Complex", TT_TYPE},
-        {"_Imaginary", TT_TYPE},
-        {"__int128", TT_TYPE},
-        {"__int128_t", TT_TYPE},
-        {"__uint128", TT_TYPE},
-        {"__uint128_t", TT_TYPE},
-        {"typeof_unqual", TT_TYPE | TT_TYPEOF},
-        {"auto", TT_QUALIFIER},
-        {"register", TT_QUALIFIER | TT_REGISTER},
-        {"_Alignas", TT_QUALIFIER | TT_ALIGNAS},
-        {"alignas", TT_QUALIFIER | TT_ALIGNAS},
-        {"typeof", TT_TYPE | TT_TYPEOF},
-        {"__typeof__", TT_TYPE | TT_TYPEOF},
-        {"__typeof", TT_TYPE | TT_TYPEOF},
-        {"_BitInt", TT_TYPE | TT_BITINT},
-        // Asm (skip-decl: can't start a declaration)
-        {"asm", TT_SKIP_DECL | TT_ASM},
-        {"__asm__", TT_SKIP_DECL | TT_ASM},
-        {"__asm", TT_SKIP_DECL | TT_ASM},
+        {"void", TT_TYPE, true}, {"char", TT_TYPE, true}, {"short", TT_TYPE, true},
+        {"int", TT_TYPE, true}, {"long", TT_TYPE, true}, {"float", TT_TYPE, true},
+        {"double", TT_TYPE, true}, {"signed", TT_TYPE, true}, {"unsigned", TT_TYPE, true},
+        {"_Bool", TT_TYPE, true}, {"bool", TT_TYPE, true},
+        {"_Complex", TT_TYPE, true}, {"_Imaginary", TT_TYPE, true},
+        {"__int128", TT_TYPE, true}, {"__int128_t", TT_TYPE, true},
+        {"__uint128", TT_TYPE, true}, {"__uint128_t", TT_TYPE, true},
+        {"typeof_unqual", TT_TYPE | TT_TYPEOF, true},
+        {"auto", TT_QUALIFIER, true},
+        {"register", TT_QUALIFIER | TT_REGISTER, true},
+        {"_Alignas", TT_QUALIFIER | TT_ALIGNAS, true},
+        {"alignas",  TT_QUALIFIER | TT_ALIGNAS, true},
+        {"typeof",     TT_TYPE | TT_TYPEOF, true},
+        {"__typeof__", TT_TYPE | TT_TYPEOF, true},
+        {"__typeof",   TT_TYPE | TT_TYPEOF, true},
+        {"_BitInt", TT_TYPE | TT_BITINT, true},
+        // Asm
+        {"asm",      TT_SKIP_DECL | TT_ASM, true},
+        {"__asm__",  TT_SKIP_DECL | TT_ASM, true},
+        {"__asm",    TT_SKIP_DECL | TT_ASM, true},
         // Attributes
-        {"__attribute__", TT_ATTR | TT_QUALIFIER},
-        {"__attribute", TT_ATTR | TT_QUALIFIER},
-        {"__declspec", TT_ATTR | TT_QUALIFIER},
+        {"__attribute__", TT_ATTR | TT_QUALIFIER, true},
+        {"__attribute",   TT_ATTR | TT_QUALIFIER, true},
+        {"__declspec",    TT_ATTR | TT_QUALIFIER, true},
         // Other builtins
-        {"__extension__", 0},
-        {"__builtin_va_list", 0},
-        {"__builtin_va_arg", 0},
-        {"__builtin_offsetof", 0},
-        {"__builtin_types_compatible_p", 0},
+        {"__extension__", 0, true}, {"__builtin_va_list", 0, true},
+        {"__builtin_va_arg", 0, true}, {"__builtin_offsetof", 0, true},
+        {"__builtin_types_compatible_p", 0, true},
         // Prism keywords
-        {"defer", TT_DEFER},
-        {"orelse", TT_ORELSE},
-        {"raw", 0},
+        {"defer", TT_DEFER, true}, {"orelse", TT_ORELSE, true}, {"raw", 0, true},
+        // Tagged identifiers (not keywords — stay TK_IDENT)
+        {"exit", TT_NORETURN_FN, false}, {"_Exit", TT_NORETURN_FN, false},
+        {"_exit", TT_NORETURN_FN, false}, {"abort", TT_NORETURN_FN, false},
+        {"quick_exit", TT_NORETURN_FN, false},
+        {"__builtin_trap", TT_NORETURN_FN, false},
+        {"__builtin_unreachable", TT_NORETURN_FN, false},
+        {"thrd_exit", TT_NORETURN_FN, false},
+        {"setjmp", TT_SETJMP_FN, false}, {"longjmp", TT_SETJMP_FN, false},
+        {"_setjmp", TT_SETJMP_FN, false}, {"_longjmp", TT_SETJMP_FN, false},
+        {"sigsetjmp", TT_SETJMP_FN, false}, {"siglongjmp", TT_SETJMP_FN, false},
+        {"pthread_exit", TT_SETJMP_FN, false},
+        {"__builtin_setjmp", TT_SETJMP_FN, false},
+        {"__builtin_longjmp", TT_SETJMP_FN, false},
+        {"__builtin_setjmp_receive", TT_SETJMP_FN, false},
+        {"savectx", TT_SETJMP_FN, false},
+        {"vfork", TT_VFORK_FN, false},
     };
-    for (size_t i = 0; i < sizeof(kw) / sizeof(*kw); i++)
-        hashmap_put(&ctx->keyword_map, kw[i].name, strlen(kw[i].name),
-                    (void *)(uintptr_t)(kw[i].tag | KW_MARKER));
 
-    // Tagged identifiers — not keywords (stay TK_IDENT) but carry
-    // classification tags for O(1) lookup in the transpiler.
-    // Stored WITHOUT KW_MARKER so is_keyword() returns false.
-    static struct
-    {
-        char *name;
-        uint32_t tag;
-    } id_tags[] = {
-        {"exit", TT_NORETURN_FN},
-        {"_Exit", TT_NORETURN_FN},
-        {"_exit", TT_NORETURN_FN},
-        {"abort", TT_NORETURN_FN},
-        {"quick_exit", TT_NORETURN_FN},
-        {"__builtin_trap", TT_NORETURN_FN},
-        {"__builtin_unreachable", TT_NORETURN_FN},
-        {"thrd_exit", TT_NORETURN_FN},
-        {"setjmp", TT_SETJMP_FN},
-        {"longjmp", TT_SETJMP_FN},
-        {"_setjmp", TT_SETJMP_FN},
-        {"_longjmp", TT_SETJMP_FN},
-        {"sigsetjmp", TT_SETJMP_FN},
-        {"siglongjmp", TT_SETJMP_FN},
-        {"pthread_exit", TT_SETJMP_FN},
-        {"__builtin_setjmp", TT_SETJMP_FN},
-        {"__builtin_longjmp", TT_SETJMP_FN},
-        {"__builtin_setjmp_receive", TT_SETJMP_FN},
-        {"savectx", TT_SETJMP_FN},
-        {"vfork", TT_VFORK_FN},
-    };
-    for (size_t i = 0; i < sizeof(id_tags) / sizeof(*id_tags); i++)
-        hashmap_put(&ctx->keyword_map, id_tags[i].name, strlen(id_tags[i].name),
-                    (void *)(uintptr_t)(id_tags[i].tag));
-
-    // Populate perfect hash table for O(1) keyword lookup
+    // Single pass: populate hashmap + perfect hash table
     memset(keyword_perfect, 0, sizeof(keyword_perfect));
-    for (size_t i = 0; i < sizeof(kw) / sizeof(*kw); i++)
+    for (size_t i = 0; i < sizeof(entries) / sizeof(*entries); i++)
     {
-        int len = strlen(kw[i].name);
-        unsigned slot = KEYWORD_HASH(kw[i].name, len);
+        int len = strlen(entries[i].name);
+        uintptr_t val = entries[i].is_kw ? (entries[i].tag | KW_MARKER) : entries[i].tag;
+        hashmap_put(&ctx->keyword_map, entries[i].name, len, (void *)val);
+
+        unsigned slot = KEYWORD_HASH(entries[i].name, len);
         if (keyword_perfect[slot].name)
-            error("keyword hash collision: '%s' and '%s'", keyword_perfect[slot].name, kw[i].name);
-        keyword_perfect[slot].name = kw[i].name;
-        keyword_perfect[slot].len = len;
-        keyword_perfect[slot].value = kw[i].tag | KW_MARKER;
-    }
-    for (size_t i = 0; i < sizeof(id_tags) / sizeof(*id_tags); i++)
-    {
-        int len = strlen(id_tags[i].name);
-        unsigned slot = KEYWORD_HASH(id_tags[i].name, len);
-        if (keyword_perfect[slot].name)
-            continue; // Collision with keyword — fall back to hashmap for this tag
-        keyword_perfect[slot].name = id_tags[i].name;
-        keyword_perfect[slot].len = len;
-        keyword_perfect[slot].value = id_tags[i].tag;
+        {
+            if (entries[i].is_kw)
+                error("keyword hash collision: '%s' and '%s'", keyword_perfect[slot].name, entries[i].name);
+            continue; // Tagged ident collision — fall back to hashmap
+        }
+        keyword_perfect[slot] = (KeywordEntry){entries[i].name, len, val};
     }
 }
 
