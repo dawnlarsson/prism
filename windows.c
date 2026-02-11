@@ -99,6 +99,62 @@ typedef int mode_t;
 // Using a unique name avoids conflicting with MSVC ucrt's read() declaration.
 #define read prism_posix_read_
 
+// POSIX open_memstream returns a FILE* that writes to a growing buffer.
+// On fclose, *bufp and *sizep are updated.  Windows has no equivalent,
+// so we back the stream with a temp file and intercept fclose to read
+// the contents into a malloc'd buffer.
+
+static FILE *win32_memstream_fp;
+static char **win32_memstream_bufp;
+static size_t *win32_memstream_sizep;
+static char win32_memstream_path[MAX_PATH];
+
+// Grab the real CRT fclose BEFORE we macro-redirect it.
+static int (*win32_real_fclose)(FILE *) = fclose;
+
+static FILE *open_memstream(char **bufp, size_t *sizep)
+{
+    char tmpdir[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmpdir);
+    GetTempFileNameA(tmpdir, "prm", 0, win32_memstream_path);
+    FILE *fp = fopen(win32_memstream_path, "w+b");
+    if (!fp)
+        return NULL;
+    *bufp = NULL;
+    *sizep = 0;
+    win32_memstream_fp = fp;
+    win32_memstream_bufp = bufp;
+    win32_memstream_sizep = sizep;
+    return fp;
+}
+
+static int win32_fclose_wrapper(FILE *fp)
+{
+    if (fp && fp == win32_memstream_fp)
+    {
+        fflush(fp);
+        long pos = ftell(fp);
+        if (pos < 0)
+            pos = 0;
+        rewind(fp);
+        char *buf = (char *)malloc((size_t)pos + 1);
+        if (buf)
+        {
+            size_t nread = fread(buf, 1, (size_t)pos, fp);
+            buf[nread] = '\0';
+            *win32_memstream_bufp = buf;
+            *win32_memstream_sizep = nread;
+        }
+        int ret = win32_real_fclose(fp);
+        _unlink(win32_memstream_path);
+        win32_memstream_fp = NULL;
+        return ret;
+    }
+    return win32_real_fclose(fp);
+}
+
+#define fclose(fp) win32_fclose_wrapper(fp)
+
 #define SPAWN_ACTION_MAX 8
 
 typedef enum

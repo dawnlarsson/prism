@@ -8,8 +8,8 @@ Prism is a lightweight and very fast transpiler that makes C safer without chang
 - **1404 tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Proper transpiler** — tracks typedefs, respects scope, catches unsafe patterns
-- **Opt-out features** Disable parts of the transpiler, like zero-init, with CLI flags
-- **Drop-in overlay** Use `CC=prism` in any build system — GCC-compatible flags pass through automatically
+- **Opt-out features** — Disable parts of the transpiler, like zero-init, with CLI flags
+- **Drop-in overlay** — Use `CC=prism` in any build system — GCC-compatible flags pass through automatically
 - **Single Repo** — 7k lines, zero dependencies, easy to audit
 
 Prism is a proper transpiler, not a preprocessor macro.
@@ -73,7 +73,7 @@ int compile(const char *path) {
 }
 ```
 
-**With Prism:** Write cleanup once. It runs on every exit. It is better, but we can take it further, see `orelse` section.
+**With Prism:** Write cleanup once. It runs on every exit.
 
 ```c
 int compile(const char *path) {
@@ -96,6 +96,8 @@ int compile(const char *path) {
     return emit(ast);              // all four, reverse order
 }
 ```
+It is better, but we can take it further, see `orelse` section.
+
 
 Defers execute in **LIFO order** (last defer runs first) at scope exit — whether via `return`, `break`, `continue`, `goto`, or reaching `}`.
 
