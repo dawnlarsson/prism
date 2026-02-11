@@ -1283,29 +1283,30 @@ static void scan_labels_in_function(Token *tok)
   if (!tok || !equal(tok, "{"))
     return;
 
-  // Phase 1: Quick scan for goto + setjmp/vfork/asm (cheap: ~5 insns/token)
+  // Phase 1: Quick scan for goto + setjmp/vfork/asm
+  // Uses TT_STRUCTURAL tag for brace depth tracking (avoids len==1 check on every token)
   bool needs_labels = false;
   {
     int d = 1;
     for (Token *t = tok->next; t && t->kind != TK_EOF; t = t->next)
     {
-      uint32_t tag = t->tag;
-      if (__builtin_expect(tag & (TT_SETJMP_FN | TT_VFORK_FN | TT_ASM | TT_GOTO), 0))
+      uint32_t tg = t->tag;
+      if (__builtin_expect(tg & (TT_SETJMP_FN | TT_VFORK_FN | TT_ASM | TT_GOTO), 0))
       {
-        if (tag & TT_SETJMP_FN)
+        if (tg & TT_SETJMP_FN)
           ctx->current_func_has_setjmp = true;
-        if (tag & TT_VFORK_FN)
+        if (tg & TT_VFORK_FN)
           ctx->current_func_has_vfork = true;
-        if (tag & TT_ASM)
+        if (tg & TT_ASM)
           ctx->current_func_has_asm = true;
-        if (tag & TT_GOTO)
+        if (tg & TT_GOTO)
           needs_labels = true;
       }
-      if (t->len == 1)
+      if (__builtin_expect(tg & TT_STRUCTURAL, 0))
       {
-        if (t->loc[0] == '{')
+        if (match_ch(t, '{'))
           d++;
-        else if (t->loc[0] == '}' && --d <= 0)
+        else if (match_ch(t, '}') && --d <= 0)
           break;
       }
     }
@@ -1906,13 +1907,14 @@ static inline char tok_open_ch(Token *t)
 static inline char close_for(char c) { return c == '(' ? ')' : c == '[' ? ']'
                                                                         : '}'; }
 
-// Emit a balanced token group: emits 'tok' and all tokens through matching close.
-// Works for (), [], and __attribute__((...)). Returns position after.
-static Token *emit_balanced(Token *tok)
+// Walk a balanced token group. When emit=true, emits all tokens; when false, skips.
+// Works for (), [], {}, and __attribute__((...)). Returns position after closing delimiter.
+static Token *walk_balanced(Token *tok, bool emit)
 {
   char open_c = tok_open_ch(tok);
   char close_c = close_for(open_c);
-  emit_tok(tok);
+  if (emit)
+    emit_tok(tok);
   tok = tok->next;
   int depth = 1;
   while (tok && tok->kind != TK_EOF && depth > 0)
@@ -1921,19 +1923,10 @@ static Token *emit_balanced(Token *tok)
       depth++;
     else if (match_ch(tok, close_c))
       depth--;
-    emit_tok(tok);
+    if (emit)
+      emit_tok(tok);
     tok = tok->next;
   }
-  return tok;
-}
-
-// Emit __attribute__((...)) and return position after
-static Token *emit_attr(Token *tok)
-{
-  emit_tok(tok);
-  tok = tok->next;
-  if (tok && equal(tok, "("))
-    tok = emit_balanced(tok);
   return tok;
 }
 
@@ -1945,16 +1938,16 @@ static inline void decl_emit(Token *t, bool emit)
 
 static inline Token *decl_balanced(Token *t, bool emit)
 {
-  return emit ? emit_balanced(t) : skip_balanced(t, tok_open_ch(t), close_for(tok_open_ch(t)));
+  return emit ? walk_balanced(t, true) : skip_balanced(t, tok_open_ch(t), close_for(tok_open_ch(t)));
 }
 
 static inline Token *decl_attr(Token *t, bool emit)
 {
   if (emit)
-    return emit_attr(t);
+    emit_tok(t);
   t = t->next;
   if (t && equal(t, "("))
-    t = skip_balanced(t, '(', ')');
+    t = emit ? walk_balanced(t, true) : skip_balanced(t, '(', ')');
   return t;
 }
 
@@ -3389,21 +3382,16 @@ static int transpile_tokens(Token *tok, FILE *fp)
     // ── Fast path: untagged tokens with no stmt-start processing ──
     // Most tokens (~70-80%) are plain identifiers, numbers, or operators without
     // any tag bits set and not at statement start. Skip all dispatch and emit directly.
+    // Structural punctuation ({, }, ;, :) has TT_STRUCTURAL set, so it falls through.
     if (__builtin_expect(!tag && !ctx->at_stmt_start, 1))
     {
-      // Structural tokens ({, }, ;, :) need unified state tracking — fall through
-      if (__builtin_expect(tok->len == 1, 0))
+      if (__builtin_expect(ctrl.pending && tok->len == 1, 0))
       {
         char c = tok->loc[0];
-        if (c == '{' || c == '}' || c == ';' || c == ':')
-          goto structural;
-        if (ctrl.pending)
-        {
-          if (c == '(')
-            track_ctrl_paren_open();
-          else if (c == ')')
-            track_ctrl_paren_close();
-        }
+        if (c == '(')
+          track_ctrl_paren_open();
+        else if (c == ')')
+          track_ctrl_paren_close();
       }
       if (__builtin_expect(ctx->generic_paren_depth > 0, 0))
         track_generic_paren(tok);
@@ -3417,8 +3405,6 @@ static int transpile_tokens(Token *tok, FILE *fp)
       tok = tok->next;
       continue;
     }
-
-  structural:
 
     // Slower path: statement-start processing and tagged tokens
 
@@ -3575,21 +3561,6 @@ static int transpile_tokens(Token *tok, FILE *fp)
     if (__builtin_expect(ctx->generic_paren_depth > 0, 0))
       track_generic_paren(tok);
 
-    // ── Scope management ──
-
-    // Function definition detection at top level (defer_depth check first to skip inside bodies)
-    if (ctx->defer_depth == 0 && FEAT(F_DEFER) && equal(tok, "{"))
-    {
-      if ((prev_toplevel_tok && equal(prev_toplevel_tok, ")")) ||
-          (last_toplevel_paren && is_knr_params(last_toplevel_paren->next, tok)))
-      {
-        scan_labels_in_function(tok);
-        ctx->current_func_returns_void = next_func_returns_void;
-      }
-      next_func_returns_void = false;
-      last_toplevel_paren = NULL;
-    }
-
     // Void function detection at top level
     // Fast-reject: only enter is_void_function_decl for tokens that could plausibly
     // start a void function (tagged keywords, or void typedef identifiers)
@@ -3602,16 +3573,56 @@ static int transpile_tokens(Token *tok, FILE *fp)
     if (tag & TT_SUE) // struct/union/enum body
       DISPATCH(handle_sue_body);
 
-    if (equal(tok, "{")) // Open brace
+    // Structural punctuation dispatch: { } ; :
+    // TT_STRUCTURAL is set on { } ; : (and their digraph equivalents <% %>)
+    if (tag & TT_STRUCTURAL)
     {
-      tok = handle_open_brace(tok);
-      continue;
-    }
-
-    if (equal(tok, "}")) // Close brace
-    {
-      tok = handle_close_brace(tok);
-      continue;
+      // Use match_ch for digraph-safe comparison
+      if (match_ch(tok, '{'))
+      {
+        // First check: function definition detection at top level
+        if (ctx->defer_depth == 0 && FEAT(F_DEFER))
+        {
+          if ((prev_toplevel_tok && equal(prev_toplevel_tok, ")")) ||
+              (last_toplevel_paren && is_knr_params(last_toplevel_paren->next, tok)))
+          {
+            scan_labels_in_function(tok);
+            ctx->current_func_returns_void = next_func_returns_void;
+          }
+          next_func_returns_void = false;
+          last_toplevel_paren = NULL;
+        }
+        tok = handle_open_brace(tok);
+        continue;
+      }
+      if (match_ch(tok, '}'))
+      {
+        tok = handle_close_brace(tok);
+        continue;
+      }
+      // ; and : are never digraphs — direct char compare
+      char c = tok->loc[0];
+      if (c == ';')
+      {
+        if (ctrl.pending)
+          track_ctrl_semicolon();
+        if (!ctrl.pending)
+          ctx->at_stmt_start = true;
+        if (ctx->defer_depth == 0)
+          next_func_returns_void = false;
+        emit_tok(tok);
+        tok = tok->next;
+        continue;
+      }
+      if (c == ':' && last_emitted && last_emitted->kind == TK_IDENT &&
+          ctx->struct_depth == 0 && ctx->defer_depth > 0)
+      {
+        emit_tok(tok);
+        tok = tok->next;
+        ctx->at_stmt_start = true;
+        continue;
+      }
+      // ':' that isn't a label — fall through to default emit
     }
 
     // Preprocessor directives
@@ -3623,38 +3634,14 @@ static int transpile_tokens(Token *tok, FILE *fp)
       continue;
     }
 
-    // ── Structural single-char dispatch: parens, semicolons, labels ──
-    // Semicolons, parens, and colons are never digraphs, so direct char compare suffices.
-    if (tok->len == 1)
+    // Paren tracking for control flow (parens without TT_STRUCTURAL are ( and ))
+    if (ctrl.pending && tok->len == 1)
     {
       char c = tok->loc[0];
-      if (c == ';')
-      {
-        if (ctrl.pending)
-          track_ctrl_semicolon();
-        if (!ctrl.pending)
-          ctx->at_stmt_start = true;
-        if (ctx->defer_depth == 0)
-          next_func_returns_void = false;
-      }
-      else if (c == '(')
-      {
-        if (ctrl.pending)
-          track_ctrl_paren_open();
-      }
+      if (c == '(')
+        track_ctrl_paren_open();
       else if (c == ')')
-      {
-        if (ctrl.pending)
-          track_ctrl_paren_close();
-      }
-      else if (c == ':' && last_emitted && last_emitted->kind == TK_IDENT &&
-               ctx->struct_depth == 0 && ctx->defer_depth > 0)
-      {
-        emit_tok(tok);
-        tok = tok->next;
-        ctx->at_stmt_start = true;
-        continue;
-      }
+        track_ctrl_paren_close();
     }
 
     // Track previous token at top level for function detection

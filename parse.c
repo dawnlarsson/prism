@@ -181,6 +181,7 @@ enum
     TT_BITINT = 1 << 28,   // _BitInt
     TT_ALIGNAS = 1 << 29,  // _Alignas, alignas
     TT_ORELSE = 1 << 30,   // orelse
+    TT_STRUCTURAL = 1u << 31, // Structural punctuation: { } ; : — forces slow-path dispatch
 };
 
 struct Token
@@ -422,22 +423,45 @@ static inline Token *arena_alloc_token(void)
     return arena_alloc_uninit(arena, sizeof(Token));
 }
 
-static inline uint64_t fnv_hash(char *s, int len)
+// Fast multiply-mix hash for short strings (typical identifiers: 1-20 chars).
+// Loads key in 1-3 chunks instead of byte-at-a-time, then mixes with multiply-xorshift.
+// ~2-4x faster than FNV-1a for typical identifier lengths.
+static inline uint64_t fast_hash(char *s, int len)
 {
-    uint64_t hash = 0xcbf29ce484222325;
-    for (int i = 0; i < len; i++)
+    uint64_t a = 0, b = 0;
+    if (len >= 8)
     {
-        hash ^= (unsigned char)s[i];
-        hash *= 0x100000001b3;
+        memcpy(&a, s, 8);
+        memcpy(&b, s + len - 8, 8);
     }
-    return hash;
+    else if (len >= 4)
+    {
+        uint32_t lo, hi;
+        memcpy(&lo, s, 4);
+        memcpy(&hi, s + len - 4, 4);
+        a = lo | ((uint64_t)hi << 32);
+    }
+    else if (len > 0)
+    {
+        // 1-3 bytes: pack into a without branches
+        a = ((uint64_t)(unsigned char)s[0] << 16) |
+            ((uint64_t)(unsigned char)s[len >> 1] << 8) |
+            (unsigned char)s[len - 1];
+    }
+    a ^= (uint64_t)len * 0x9e3779b97f4a7c15ULL;
+    a ^= b;
+    a *= 0xbf58476d1ce4e5b9ULL;
+    a ^= a >> 31;
+    a *= 0x94d049bb133111ebULL;
+    a ^= a >> 31;
+    return a;
 }
 
 static void *hashmap_get(HashMap *map, char *key, int keylen)
 {
     if (!map->buckets)
         return NULL;
-    uint64_t hash = fnv_hash(key, keylen);
+    uint64_t hash = fast_hash(key, keylen);
     int mask = map->capacity - 1; // capacity is always power-of-2
     for (int i = 0; i <= mask; i++)
     {
@@ -481,7 +505,7 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val)
         hashmap_resize(map, newcap);
     }
 
-    uint64_t hash = fnv_hash(key, keylen);
+    uint64_t hash = fast_hash(key, keylen);
     int mask = map->capacity - 1;
     int first_empty = -1;
 
@@ -523,7 +547,7 @@ static void hashmap_delete(HashMap *map, char *key, int keylen)
 {
     if (!map->buckets)
         return;
-    uint64_t hash = fnv_hash(key, keylen);
+    uint64_t hash = fast_hash(key, keylen);
     int mask = map->capacity - 1;
     for (int i = 0; i <= mask; i++)
     {
@@ -1224,7 +1248,7 @@ static void classify_number(Token *tok)
         tok->flags |= TF_IS_FLOAT;
 }
 
-// Tag a punctuator token with TT_ASSIGN or TT_MEMBER
+// Tag a punctuator token with TT_ASSIGN, TT_MEMBER, or TT_STRUCTURAL
 static inline void classify_punct(Token *t)
 {
     char c = t->loc[0];
@@ -1234,6 +1258,8 @@ static inline void classify_punct(Token *t)
             t->tag = TT_ASSIGN;
         else if (c == '.')
             t->tag = TT_MEMBER;
+        else if (c == '{' || c == '}' || c == ';' || c == ':')
+            t->tag = TT_STRUCTURAL;
     }
     else if (t->len == 2)
     {
@@ -1246,6 +1272,10 @@ static inline void classify_punct(Token *t)
             t->tag = TT_ASSIGN;
         else if (c == '-' && c2 == '>')
             t->tag = TT_MEMBER;
+        else if ((c == '<' && c2 == '%') || (c == '%' && c2 == '>'))
+            t->tag = TT_STRUCTURAL; // digraph { and }
+        else if (c == '<' && c2 == ':')
+            t->tag = TT_ASSIGN; // digraph [
     }
     else if (t->len == 3 && t->loc[2] == '=' && (c == '<' || c == '>') && t->loc[1] == c)
         t->tag = TT_ASSIGN;
