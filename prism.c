@@ -296,7 +296,7 @@ static bool is_type_keyword(Token *tok);
 static void typedef_pop_scope(int scope_depth);
 static TypeSpecResult parse_type_specifier(Token *tok);
 static Token *emit_expr_to_semicolon(Token *tok);
-static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const);
+static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma);
 
 static inline void control_flow_reset(void) { ctrl = (ControlFlow){0}; }
 static void walker_init(TokenWalker *w, Token *start, int initial_depth)
@@ -2228,7 +2228,7 @@ static inline void register_decl_shadows(Token *var_name, bool effective_vla)
 
 // Process all declarators in a declaration and emit with zero-init
 // Returns token after declaration, or NULL on failure
-static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
+static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw, Token *type_start)
 {
   Token **typeof_vars = NULL;
   int typeof_var_count = 0;
@@ -2303,7 +2303,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
         out_char(';');
 
         emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile);
-        free(typeof_vars);
+        typeof_var_count = 0; // reset for remaining declarators
 
         register_decl_shadows(decl.var_name, effective_vla);
 
@@ -2318,7 +2318,30 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
           warn_tok(decl.var_name, "orelse on array variable '%.*s' will never trigger (array address is never NULL)",
                    decl.var_name->len, decl.var_name->loc);
 
-        tok = emit_orelse_action(tok, decl.var_name, type->has_const || decl.is_const);
+        // Find boundary comma for multi-declarator orelse
+        Token *stop_comma = NULL;
+        {
+          int sd = 0;
+          for (Token *t = tok; t->kind != TK_EOF; t = t->next)
+          {
+            if (t->flags & TF_OPEN) sd++;
+            else if (t->flags & TF_CLOSE) sd--;
+            else if (sd == 0 && equal(t, ",")) { stop_comma = t; break; }
+            else if (sd == 0 && equal(t, ";")) break;
+          }
+        }
+
+        tok = emit_orelse_action(tok, decl.var_name, type->has_const || decl.is_const, stop_comma);
+
+        // Continue processing remaining declarators after comma
+        if (stop_comma && equal(tok, ","))
+        {
+          tok = tok->next; // skip comma
+          // Re-emit the type specifier for the next declarator
+          emit_range(type_start, type->end);
+          continue;
+        }
+        free(typeof_vars);
         return tok;
       }
     }
@@ -2455,7 +2478,7 @@ static Token *try_zero_init_decl(Token *tok)
     emit_range(pragma_start, start);
   emit_range(start, type.end);
 
-  return process_declarators(type.end, &type, is_raw);
+  return process_declarators(type.end, &type, is_raw, start);
 }
 
 // Emit an expression until semicolon, tracking depth for statement expressions.
@@ -2661,7 +2684,7 @@ static inline void orelse_open(Token *var_name)
     OUT_LIT(" {");
 }
 
-static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const)
+static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma)
 {
   // Block orelse: '{' handled by caller
   if (equal(tok, "{"))
@@ -2682,7 +2705,75 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const)
     mark_switch_control_exit();
     tok = tok->next;
     orelse_open(var_name);
-    tok = emit_return_body(tok);
+    if (stop_comma)
+    {
+      // Multi-declarator context: emit return body stopping at the declarator comma
+      bool has_defers = FEAT(F_DEFER) && has_active_defers();
+      bool at_end = equal(tok, ";") || tok == stop_comma;
+      if (has_defers)
+      {
+        if (at_end)
+        {
+          emit_all_defers();
+          OUT_LIT(" return;");
+        }
+        else
+        {
+          bool is_void_cast = equal(tok, "(") && tok->next && equal(tok->next, "void") &&
+                              tok->next->next && equal(tok->next->next, ")");
+          bool is_void = ctx->current_func_returns_void || is_void_cast;
+          if (!is_void)
+          {
+            OUT_LIT(" __auto_type _prism_ret_");
+            out_uint(ctx->ret_counter);
+            OUT_LIT(" = (");
+          }
+          else
+            OUT_LIT(" (");
+          int rd = 0;
+          while (tok->kind != TK_EOF && tok != stop_comma)
+          {
+            if (tok->flags & TF_OPEN) rd++;
+            else if (tok->flags & TF_CLOSE) rd--;
+            else if (rd == 0 && equal(tok, ";")) break;
+            emit_tok(tok);
+            tok = tok->next;
+          }
+          OUT_LIT(");");
+          emit_all_defers();
+          if (!is_void)
+          {
+            OUT_LIT(" return _prism_ret_");
+            out_uint(ctx->ret_counter++);
+          }
+          else
+            OUT_LIT(" return");
+          out_char(';');
+        }
+      }
+      else
+      {
+        OUT_LIT(" return");
+        if (!at_end)
+        {
+          out_char(' ');
+          int rd = 0;
+          while (tok->kind != TK_EOF && tok != stop_comma)
+          {
+            if (tok->flags & TF_OPEN) rd++;
+            else if (tok->flags & TF_CLOSE) rd--;
+            else if (rd == 0 && equal(tok, ";")) break;
+            emit_tok(tok);
+            tok = tok->next;
+          }
+        }
+        out_char(';');
+      }
+      if (equal(tok, ";"))
+        tok = tok->next;
+    }
+    else
+      tok = emit_return_body(tok);
     OUT_LIT(" }");
     end_statement_after_semicolon();
     return tok;
@@ -2750,7 +2841,7 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const)
       fdepth++;
     else if (tok->flags & TF_CLOSE)
       fdepth--;
-    else if (fdepth == 0 && equal(tok, ";"))
+    else if (fdepth == 0 && (equal(tok, ";") || equal(tok, ",")))
       break;
     emit_tok(tok);
     tok = tok->next;
@@ -3499,7 +3590,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
           if (equal(tok, ";"))
             error_tok(tok, "expected statement after 'orelse'");
 
-          tok = emit_orelse_action(tok, NULL, false);
+          tok = emit_orelse_action(tok, NULL, false, NULL);
           continue;
         }
       }

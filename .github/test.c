@@ -13124,6 +13124,99 @@ void test_orelse_const_ptr_defer_return(void)
     CHECK_LOG("D", "const ptr defer orelse null: defer runs");
 }
 
+void test_orelse_fallback_multi_decl(void)
+{
+    int val = 0;
+    int x = val orelse 5, y = 10;
+    CHECK_EQ(x, 5, "orelse fallback multi-decl: x gets fallback");
+    CHECK_EQ(y, 10, "orelse fallback multi-decl: y declared");
+}
+
+void test_orelse_fallback_multi_decl_nontrigger(void)
+{
+    int val = 42;
+    int x = val orelse 5, y = 10;
+    CHECK_EQ(x, 42, "orelse fallback multi-decl nontrigger: x keeps value");
+    CHECK_EQ(y, 10, "orelse fallback multi-decl nontrigger: y declared");
+}
+
+void test_orelse_break_multi_decl(void)
+{
+    int a = 5, b = 10;
+    int *ptrs[] = {&a, &b, 0};
+    int sum = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        int *p = ptrs[i] orelse break, val = *p;
+        sum += val;
+    }
+    CHECK_EQ(sum, 15, "orelse break multi-decl: sums before null");
+}
+
+void test_orelse_continue_multi_decl(void)
+{
+    int a = 5, b = 10;
+    int *ptrs[] = {&a, 0, &b};
+    int sum = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        int *p = ptrs[i] orelse continue, val = *p;
+        sum += val;
+    }
+    CHECK_EQ(sum, 15, "orelse continue multi-decl: skips null");
+}
+
+static int _orelse_return_multi_decl_helper(int val)
+{
+    int x = val orelse return -1, y = 10;
+    return x + y;
+}
+
+void test_orelse_return_multi_decl(void)
+{
+    CHECK_EQ(_orelse_return_multi_decl_helper(3), 13, "orelse return multi-decl: non-zero");
+    CHECK_EQ(_orelse_return_multi_decl_helper(0), -1, "orelse return multi-decl: zero returns");
+}
+
+static int _orelse_goto_multi_decl_helper(int val)
+{
+    int x = val orelse goto fail, y = 10;
+    return x + y;
+fail:
+    return -1;
+}
+
+void test_orelse_goto_multi_decl(void)
+{
+    CHECK_EQ(_orelse_goto_multi_decl_helper(3), 13, "orelse goto multi-decl: non-zero");
+    CHECK_EQ(_orelse_goto_multi_decl_helper(0), -1, "orelse goto multi-decl: zero gotos");
+}
+
+static void _orelse_void_return_multi_decl_helper(int val, int *out)
+{
+    int x = val orelse return, y = 10;
+    *out = x + y;
+}
+
+void test_orelse_void_return_multi_decl(void)
+{
+    int out = -1;
+    _orelse_void_return_multi_decl_helper(3, &out);
+    CHECK_EQ(out, 13, "orelse void return multi-decl: non-zero");
+    out = -1;
+    _orelse_void_return_multi_decl_helper(0, &out);
+    CHECK_EQ(out, -1, "orelse void return multi-decl: zero returns");
+}
+
+void test_orelse_fallback_three_decls(void)
+{
+    int val = 0;
+    int x = val orelse 99, y = 10, z = 20;
+    CHECK_EQ(x, 99, "orelse fallback three decls: x gets fallback");
+    CHECK_EQ(y, 10, "orelse fallback three decls: y declared");
+    CHECK_EQ(z, 20, "orelse fallback three decls: z declared");
+}
+
 void run_orelse_tests(void)
 {
     test_orelse_return_null();
@@ -13179,6 +13272,14 @@ void run_orelse_tests(void)
     test_orelse_const_ptr_return_val();
     test_orelse_const_ptr_break_vals();
     test_orelse_const_ptr_defer_return();
+    test_orelse_fallback_multi_decl();
+    test_orelse_fallback_multi_decl_nontrigger();
+    test_orelse_break_multi_decl();
+    test_orelse_continue_multi_decl();
+    test_orelse_return_multi_decl();
+    test_orelse_goto_multi_decl();
+    test_orelse_void_return_multi_decl();
+    test_orelse_fallback_three_decls();
 }
 
 int main(void)
