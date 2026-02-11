@@ -1367,13 +1367,13 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
     if (!IS_DIGIT(*p)) // Must have line number to be a line marker
         return NULL;
 
-    long new_line = 0;
+    unsigned long new_line = 0;
     while (IS_DIGIT(*p))
     {
-        long prev = new_line;
-        new_line = new_line * 10 + (*p - '0');
-        if (new_line < prev) // overflow
-            return NULL;
+        unsigned int digit = *p - '0';
+        if (new_line > (ULONG_MAX - digit) / 10)
+            return NULL; // overflow
+        new_line = new_line * 10 + digit;
         p++;
     }
     while (*p == ' ' || *p == '\t')
@@ -1427,6 +1427,9 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
         *in_system_include = true;
     else if (is_returning && !is_system)
         *in_system_include = false;
+
+    if (new_line > (unsigned long)INT_MAX)
+        return NULL; // line number too large for int
 
     int line_delta = (int)new_line - (directive_line + 1);
     File *view = new_file_view(filename ? filename : ctx->current_file->name,

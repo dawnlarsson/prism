@@ -3156,13 +3156,29 @@ static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suf
   int fd = suffix_len > 0 ? mkstemps(buf, suffix_len) : mkstemp(buf);
   if (fd < 0)
     return -1;
-  close(fd);
+  // Keep fd open and use fdopen to avoid TOCTOU race between close+fopen.
+  // We immediately close the FILE* (which also closes fd) since the caller
+  // will reopen the path later via fopen/transpile. The file now exists
+  // atomically with our chosen name.
+  FILE *fp = fdopen(fd, "w");
+  if (!fp)
+  {
+    close(fd);
+    return -1;
+  }
+  fclose(fp);
   return 0;
 #else
   int fd = suffix_len > 0 ? mkstemps(buf, suffix_len) : mkstemp(buf);
   if (fd < 0)
     return -1;
-  close(fd);
+  FILE *fp = fdopen(fd, "w");
+  if (!fp)
+  {
+    close(fd);
+    return -1;
+  }
+  fclose(fp);
   return 0;
 #endif
 }

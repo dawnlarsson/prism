@@ -3344,7 +3344,37 @@ void test_typeof_void_defer_return(void)
     _typeof_void_defer_func(&val);
     CHECK_EQ(val, 11, "typeof void defer return: value correct");
 }
+
+static void _dunder_typeof_void_inner(int *p) { *p += 100; }
+
+__typeof__(void) _dunder_typeof_void_defer_func(int *out)
+{
+    defer { *out += 1; };
+    return _dunder_typeof_void_inner(out);
+}
+
+void test_dunder_typeof_void_defer_return(void)
+{
+    int val = 0;
+    _dunder_typeof_void_defer_func(&val);
+    CHECK_EQ(val, 101, "__typeof__ void defer return: value correct");
+}
 #endif
+
+static int _void_return_void0_flag = 0;
+void _void_return_void0_impl(void)
+{
+    defer { _void_return_void0_flag += 1; };
+    _void_return_void0_flag += 10;
+    return (void)0;
+}
+
+void test_void_return_void0_defer(void)
+{
+    _void_return_void0_flag = 0;
+    _void_return_void0_impl();
+    CHECK_EQ(_void_return_void0_flag, 11, "return (void)0 with defer: correct");
+}
 
 void run_advanced_defer_tests(void)
 {
@@ -3371,7 +3401,9 @@ void run_advanced_defer_tests(void)
     test_deep_defer_with_zeroinit();
 #ifdef __GNUC__
     test_typeof_void_defer_return();
+    test_dunder_typeof_void_defer_return();
 #endif
+    test_void_return_void0_defer();
 }
 
 // SECTION 8: STRESS TESTS
@@ -12351,6 +12383,28 @@ void test_orelse_return_void(void)
     CHECK(orelse_void_flag == 0, "orelse return void: null triggers void return");
 }
 
+static int _orelse_void_defer_side = 0;
+static void _orelse_void_defer_inner(int *p) { *p += 100; }
+
+void _orelse_void_defer_return_call_impl(int *arr, int *out)
+{
+    defer { *out += 1; };
+    int *x = arr orelse return _orelse_void_defer_inner(out);
+    *out += *x;
+}
+
+void test_orelse_void_defer_return_call(void)
+{
+    int val = 5;
+    int out = 0;
+    _orelse_void_defer_return_call_impl(&val, &out);
+    CHECK_EQ(out, 6, "orelse void defer return call: non-null path");
+
+    out = 0;
+    _orelse_void_defer_return_call_impl(NULL, &out);
+    CHECK_EQ(out, 101, "orelse void defer return call: null path");
+}
+
 void test_orelse_break(void)
 {
     int *ptrs[4];
@@ -13026,7 +13080,7 @@ void test_orelse_nested_funcalls(void)
 
 static int _const_ptr_orelse_return_impl(int *input)
 {
-    int * const p = input orelse return -1;
+    int *const p = input orelse return -1;
     return *p;
 }
 
@@ -13044,7 +13098,7 @@ void test_orelse_const_ptr_break_vals(void)
     int sum = 0;
     for (int i = 0; i < 4; i++)
     {
-        int * const p = ptrs[i] orelse break;
+        int *const p = ptrs[i] orelse break;
         sum += *p;
     }
     CHECK_EQ(sum, 15, "const ptr orelse break: stops at null");
@@ -13054,7 +13108,7 @@ static int _const_ptr_defer_orelse_impl(int *input)
 {
     log_reset();
     defer log_append("D");
-    int * const p = input orelse return -1;
+    int *const p = input orelse return -1;
     log_append("A");
     return *p;
 }
@@ -13076,6 +13130,7 @@ void run_orelse_tests(void)
     test_orelse_return_cast();
     test_orelse_return_expr();
     test_orelse_return_void();
+    test_orelse_void_defer_return_call();
     test_orelse_break();
     test_orelse_continue();
     test_orelse_goto();
