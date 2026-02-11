@@ -768,7 +768,7 @@ static bool needs_space(Token *prev, Token *tok)
   uint8_t a = (uint8_t)prev->loc[prev->len - 1], b = (uint8_t)tok->loc[0];
   // 'b' is always '=' or matches 'a' (++ -- << >> && || == ## /* */), plus ->
   if (b == '=')
-    return a == '=' || a == '!' || a == '<' || a == '>' || a == '+' || a == '-' || a == '*' || a == '/';
+    return a == '=' || a == '!' || a == '<' || a == '>' || a == '+' || a == '-' || a == '*' || a == '/' || a == '%' || a == '&' || a == '|' || a == '^';
 
   return (a == b && (a == '+' || a == '-' || a == '<' || a == '>' || a == '&' || a == '|' || a == '#')) ||
          (a == '-' && b == '>') || (a == '/' && b == '*') || (a == '*' && b == '/');
@@ -3009,7 +3009,6 @@ static inline void argv_builder_add(ArgvBuilder *ab, const char *arg)
 }
 
 // Build a copy of 'environ' with CC and PRISM_CC removed.
-// Build a copy of 'environ' with CC and PRISM_CC removed.
 // Cached: built once, reused for all child processes.
 // Caller must NOT free() the returned array.
 static char **build_clean_environ(void)
@@ -3152,7 +3151,7 @@ static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suf
     return -1;
 #if defined(_WIN32)
   return atomic_mkstemp(buf, bufsize, source_adjacent ? ".c" : NULL);
-#elif defined(__APPLE__) || defined(__linux__) || defined(__unix__)
+#else
   int fd = suffix_len > 0 ? mkstemps(buf, suffix_len) : mkstemp(buf);
   if (fd < 0)
     return -1;
@@ -3160,18 +3159,6 @@ static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suf
   // We immediately close the FILE* (which also closes fd) since the caller
   // will reopen the path later via fopen/transpile. The file now exists
   // atomically with our chosen name.
-  FILE *fp = fdopen(fd, "w");
-  if (!fp)
-  {
-    close(fd);
-    return -1;
-  }
-  fclose(fp);
-  return 0;
-#else
-  int fd = suffix_len > 0 ? mkstemps(buf, suffix_len) : mkstemp(buf);
-  if (fd < 0)
-    return -1;
   FILE *fp = fdopen(fd, "w");
   if (!fp)
   {
@@ -3792,12 +3779,12 @@ static int transpile_tokens(Token *tok, FILE *fp)
       last_toplevel_paren = NULL;
     }
 
-    // Void function detection — keywords and void typedef identifiers at top level
+    // Void function detection at top level
     // Fast-reject: only enter is_void_function_decl for tokens that could plausibly
-    // start a void function (storage/qualifier/attr tags, or 'void' itself)
+    // start a void function (tagged keywords, or void typedef identifiers)
     if (ctx->defer_depth == 0 &&
-        (tok->kind == TK_KEYWORD || (tok->kind == TK_IDENT && is_void_typedef(tok))) &&
-        (tag & (TT_TYPE | TT_QUALIFIER | TT_SKIP_DECL | TT_ATTR | TT_INLINE) || equal(tok, "void")) &&
+        (tag & (TT_TYPE | TT_QUALIFIER | TT_SKIP_DECL | TT_ATTR | TT_INLINE) ||
+         (tok->kind == TK_IDENT && is_void_typedef(tok))) &&
         is_void_function_decl(tok))
       next_func_returns_void = true;
 
@@ -3816,22 +3803,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
       continue;
     }
 
-    // ── Parenthesis and semicolon tracking ──
-
-    if (ctrl.pending)
-    {
-      if (equal(tok, "("))
-        track_ctrl_paren_open();
-      else if (equal(tok, ")"))
-        track_ctrl_paren_close();
-      if (equal(tok, ";"))
-        track_ctrl_semicolon();
-    }
-
-    if (equal(tok, ";") && !ctrl.pending)
-      ctx->at_stmt_start = true;
-
-    // Preprocessor directives (checked early for fast dispatch)
+    // Preprocessor directives
     if (__builtin_expect(tok->kind == TK_PREP_DIR, 0))
     {
       emit_tok(tok);
@@ -3840,19 +3812,36 @@ static int transpile_tokens(Token *tok, FILE *fp)
       continue;
     }
 
-    // Semicolons and labels — single equal() check covers both
-    if (equal(tok, ";"))
+    // ── Structural single-char dispatch: parens, semicolons, labels ──
+    // Semicolons, parens, and colons are never digraphs, so direct char compare suffices.
+    if (tok->len == 1)
     {
-      if (ctx->defer_depth == 0)
-        next_func_returns_void = false;
-    }
-    else if (equal(tok, ":") && last_emitted && last_emitted->kind == TK_IDENT &&
-             ctx->struct_depth == 0 && ctx->defer_depth > 0)
-    {
-      emit_tok(tok);
-      tok = tok->next;
-      ctx->at_stmt_start = true;
-      continue;
+      char c = tok->loc[0];
+      if (c == ';')
+      {
+        if (ctrl.pending)
+          track_ctrl_semicolon();
+        if (!ctrl.pending)
+          ctx->at_stmt_start = true;
+        if (ctx->defer_depth == 0)
+          next_func_returns_void = false;
+      }
+      else if (c == '(')
+      {
+        if (ctrl.pending) track_ctrl_paren_open();
+      }
+      else if (c == ')')
+      {
+        if (ctrl.pending) track_ctrl_paren_close();
+      }
+      else if (c == ':' && last_emitted && last_emitted->kind == TK_IDENT &&
+               ctx->struct_depth == 0 && ctx->defer_depth > 0)
+      {
+        emit_tok(tok);
+        tok = tok->next;
+        ctx->at_stmt_start = true;
+        continue;
+      }
     }
 
     // Track previous token at top level for function detection
@@ -4208,7 +4197,7 @@ static bool get_self_exe_path(char *buf, size_t bufsize)
   // Fallthrough to return false.
 #endif
   // Generic fallback: try Solaris/Illumos /proc path, then Linux-style
-#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__FreeBSD__) && !defined(__DragonFly__) && !defined(__NetBSD__)
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__FreeBSD__) && !defined(__DragonFly__) && !defined(__NetBSD__) && !defined(__linux__)
   {
     // Solaris/Illumos
     ssize_t len2 = readlink("/proc/self/path/a.out", buf, bufsize - 1);
@@ -4217,7 +4206,7 @@ static bool get_self_exe_path(char *buf, size_t bufsize)
       buf[len2] = '\0';
       return true;
     }
-    // Linux-style fallback (for musl, Alpine, etc. where first #if might not trigger)
+    // Other /proc-based systems
     len2 = readlink("/proc/self/exe", buf, bufsize - 1);
     if (len2 > 0)
     {
