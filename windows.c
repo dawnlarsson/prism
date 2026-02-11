@@ -135,19 +135,26 @@ static ssize_t prism_posix_read_(int fd, void *buf, size_t count)
 }
 
 // tries up to 10000 unique names with randomized template + _sopen_s
-static int mkstemp(char *tmpl)
+// suffix_len: number of chars after the X's (e.g. 2 for ".c" in "foo.XXXXXX.c")
+static int mkstemps(char *tmpl, int suffix_len)
 {
     static const char chars[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     size_t len = strlen(tmpl);
+    if (suffix_len < 0)
+        suffix_len = 0;
+    if ((size_t)suffix_len >= len)
+        return -1;
+
     char *try_buf = (char *)malloc(len + 1);
     if (!try_buf)
         return -1;
 
-    // Find the X's in the template
-    size_t x_start = len;
+    // Find the X's in the template (before the suffix)
+    size_t x_end = len - suffix_len;
+    size_t x_start = x_end;
     while (x_start > 0 && tmpl[x_start - 1] == 'X')
         x_start--;
-    size_t x_count = len - x_start;
+    size_t x_count = x_end - x_start;
 
     // Seed with PID + high-resolution timer + tick count for better entropy
     // Avoids collisions in parallel build systems (e.g., ninja -j32)
@@ -180,63 +187,7 @@ static int mkstemp(char *tmpl)
     return -1;
 }
 
-static int mkstemps(char *tmpl, int suffix_len)
-{
-    if (suffix_len <= 0)
-        return mkstemp(tmpl);
-
-    // Template is like "foo.XXXXXX.c" — X's are before the suffix.
-    // Temporarily strip the suffix so mkstemp sees X's at the end.
-    size_t len = strlen(tmpl);
-    if ((size_t)suffix_len >= len)
-        return -1;
-    char saved[16]; // suffix_len is always small (2 for ".c")
-    if (suffix_len > (int)sizeof(saved))
-        return -1;
-    memcpy(saved, tmpl + len - suffix_len, suffix_len);
-    tmpl[len - suffix_len] = '\0';
-
-    int fd = mkstemp(tmpl);
-    if (fd < 0)
-    {
-        // Restore suffix on failure
-        memcpy(tmpl + len - suffix_len, saved, suffix_len);
-        tmpl[len] = '\0';
-        return -1;
-    }
-
-    // mkstemp succeeded — restore suffix and rename the file
-    // tmpl now has the randomized name without suffix
-    char with_suffix[PATH_MAX];
-    size_t new_len = strlen(tmpl);
-    if (new_len + suffix_len >= sizeof(with_suffix))
-    {
-        _close(fd);
-        _unlink(tmpl);
-        return -1;
-    }
-    memcpy(with_suffix, tmpl, new_len);
-    memcpy(with_suffix + new_len, saved, suffix_len);
-    with_suffix[new_len + suffix_len] = '\0';
-
-    // Close the fd, rename, then reopen
-    _close(fd);
-    if (rename(tmpl, with_suffix) != 0)
-    {
-        _unlink(tmpl);
-        return -1;
-    }
-    memcpy(tmpl, with_suffix, new_len + suffix_len + 1);
-
-    // Reopen with same flags as mkstemp
-    errno_t err = _sopen_s(&fd, tmpl, _O_RDWR | _O_BINARY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
-    if (err != 0)
-    {
-        _unlink(tmpl);
-        return -1;
-    }
-    return fd;
-}
+static int mkstemp(char *tmpl) { return mkstemps(tmpl, 0); }
 
 // No-op on Windows
 static int chmod(const char *path, mode_t mode)

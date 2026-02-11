@@ -177,6 +177,7 @@ typedef struct
   int count;
   int capacity;
   HashMap name_map; // Maps name -> index+1 of most recent entry (0 means not found)
+  uint64_t bloom;   // Bloom filter for fast-reject of non-typedef lookups
 } TypedefTable;
 
 typedef enum
@@ -278,6 +279,8 @@ static int stmt_expr_capacity = 0;   // capacity of stmt_expr_levels array
 // Token emission - user-space buffered output for minimal syscall overhead
 static FILE *out_fp;
 static Token *last_emitted = NULL;
+static uint16_t cached_file_idx = 0xFFFF;
+static File *cached_file = NULL;
 
 static char out_buf[OUT_BUF_SIZE];
 static int out_buf_pos = 0;
@@ -319,6 +322,8 @@ static void reset_transpiler_state(void)
   ctx->at_stmt_start = true;
   control_flow_reset();
   last_emitted = NULL;
+  cached_file_idx = 0xFFFF;
+  cached_file = NULL;
 }
 
 PRISM_API PrismFeatures prism_defaults(void)
@@ -371,7 +376,7 @@ static const char *get_tmp_dir(void)
 static inline bool match_ch(Token *tok, char c)
 {
   if (tok->len == 1)
-    return tok->loc[0] == c;
+    return tok->shortcut == (uint8_t)c;
   if (__builtin_expect(tok->flags & TF_IS_DIGRAPH, 0))
     return _equal_1_digraph(tok, c);
   return false;
@@ -380,7 +385,7 @@ static inline bool match_ch(Token *tok, char c)
 // Check if token is identifier-like (TK_IDENT or TK_KEYWORD like 'raw'/'defer')
 static inline bool is_identifier_like(Token *tok)
 {
-  return tok->kind == TK_IDENT || tok->kind == TK_KEYWORD;
+  return tok->kind <= TK_KEYWORD; // TK_IDENT=0, TK_KEYWORD=1
 }
 
 // Skip tokens to the next semicolon at depth 0, respecting balanced delimiters
@@ -389,9 +394,9 @@ static Token *skip_to_semicolon(Token *tok)
   int depth = 0;
   while (tok->kind != TK_EOF)
   {
-    if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
+    if (tok->flags & TF_OPEN)
       depth++;
-    else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
+    else if (tok->flags & TF_CLOSE)
       depth--;
     else if (depth == 0 && equal(tok, ";"))
       return tok;
@@ -767,7 +772,8 @@ static bool needs_space(Token *prev, Token *tok)
   if (prev->kind != TK_PUNCT || tok->kind != TK_PUNCT)
     return false;
   // Two adjacent punctuators that would merge into a different token
-  uint8_t a = (uint8_t)prev->loc[prev->len - 1], b = (uint8_t)tok->loc[0];
+  uint8_t a = (prev->len == 1) ? prev->shortcut : (uint8_t)prev->loc[prev->len - 1];
+  uint8_t b = tok->shortcut;
   if (b == '=')
     return merges_with_eq[a];
   return (a == b && merges_with_self[a]) ||
@@ -819,8 +825,16 @@ static bool __attribute__((noinline)) emit_tok_special(Token *tok)
 // Emit a single token with appropriate spacing
 static void emit_tok(Token *tok)
 {
-  // Get file info via tok_file() which bounds-checks file_idx
-  File *f = tok_file(tok);
+  // Get file info — cache to avoid repeated indexing for consecutive tokens
+  File *f;
+  if (__builtin_expect(tok->file_idx == cached_file_idx, 1))
+    f = cached_file;
+  else
+  {
+    f = tok_file(tok);
+    cached_file_idx = tok->file_idx;
+    cached_file = f;
+  }
 
   // Skip system header include content when not flattening
   if (__builtin_expect(!FEAT(F_FLATTEN) && f->is_system && f->is_include_entry, 0))
@@ -834,9 +848,8 @@ static void emit_tok(Token *tok)
   if (FEAT(F_LINE_DIR))
   {
     line_no = tok->line_no;
-    tok_fname = f->display_name ? f->display_name : f->name;
-    need_line = (ctx->last_filename != tok_fname &&
-                 (!ctx->last_filename || !tok_fname || strcmp(ctx->last_filename, tok_fname) != 0)) ||
+    tok_fname = f->name; // always interned — pointer compare is safe
+    need_line = (ctx->last_filename != tok_fname) ||
                 (f->is_system != ctx->last_system_header) ||
                 (line_no != ctx->last_line_no && line_no != ctx->last_line_no + 1);
   }
@@ -849,7 +862,7 @@ static void emit_tok(Token *tok)
 
   if (need_line)
   {
-    out_line(line_no, tok_fname ? tok_fname : "unknown");
+    out_line(line_no, tok_fname);
     ctx->last_line_no = line_no;
     ctx->last_filename = tok_fname;
     ctx->last_system_header = f->is_system;
@@ -954,12 +967,23 @@ static void typedef_table_reset(void)
   typedef_table.entries = NULL;
   typedef_table.count = 0;
   typedef_table.capacity = 0;
+  typedef_table.bloom = 0;
   hashmap_clear(&typedef_table.name_map);
 }
 
 // Helper to get current index for a name from the hash map (-1 if not found)
+// Bloom filter hash: constant-time from length + first/last byte → bit position (0-63)
+static inline uint64_t typedef_bloom_bit(char *name, int len)
+{
+  unsigned h = (unsigned)len ^ ((unsigned char)name[0] * 7) ^ ((unsigned char)name[len - 1] * 31);
+  return 1ULL << (h & 63);
+}
+
 static int typedef_get_index(char *name, int len)
 {
+  // Bloom filter fast-reject: if the bit isn't set, this name was never added
+  if (!(typedef_table.bloom & typedef_bloom_bit(name, len)))
+    return -1;
   void *val = hashmap_get(&typedef_table.name_map, name, len);
   return val ? (int)(intptr_t)val - 1 : -1;
 }
@@ -988,6 +1012,7 @@ static void typedef_add_entry(char *name, int len, int scope_depth, TypedefKind 
   }
 
   ENSURE_ARRAY_CAP(typedef_table.entries, typedef_table.count + 1, typedef_table.capacity, INITIAL_ARRAY_CAP, TypedefEntry);
+  typedef_table.bloom |= typedef_bloom_bit(name, len);
   int new_index = typedef_table.count++;
   TypedefEntry *e = &typedef_table.entries[new_index];
   e->name = name;
@@ -1051,13 +1076,13 @@ static void parse_enum_constants(Token *tok, int scope_depth)
         int depth = 0;
         while (tok && tok->kind != TK_EOF)
         {
-          if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
+          if (tok->flags & TF_OPEN)
             depth++;
-          else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
+          else if (tok->flags & TF_CLOSE)
           {
             if (depth > 0)
               depth--;
-            else if (equal(tok, "}"))
+            else if (match_ch(tok, '}'))
               break;
           }
           else if (depth == 0 && equal(tok, ","))
@@ -1291,12 +1316,15 @@ static void scan_labels_in_function(Token *tok)
     for (Token *t = tok->next; t && t->kind != TK_EOF; t = t->next)
     {
       uint32_t tg = t->tag;
-      if (__builtin_expect(tg & (TT_SETJMP_FN | TT_VFORK_FN | TT_ASM | TT_GOTO), 0))
+      if (__builtin_expect(tg & (TT_SPECIAL_FN | TT_ASM | TT_GOTO), 0))
       {
-        if (tg & TT_SETJMP_FN)
-          ctx->current_func_has_setjmp = true;
-        if (tg & TT_VFORK_FN)
-          ctx->current_func_has_vfork = true;
+        if (tg & TT_SPECIAL_FN)
+        {
+          if (equal(t, "vfork"))
+            ctx->current_func_has_vfork = true;
+          else
+            ctx->current_func_has_setjmp = true;
+        }
         if (tg & TT_ASM)
           ctx->current_func_has_asm = true;
         if (tg & TT_GOTO)
@@ -1514,8 +1542,7 @@ static bool is_knr_params(Token *after_paren, Token *brace)
 // Skip function specifiers/qualifiers/attributes that can precede a type
 static Token *skip_func_specifiers(Token *tok)
 {
-  while (tok && ((tok->tag & (TT_QUALIFIER | TT_SKIP_DECL | TT_ATTR | TT_INLINE)) ||
-                 equal(tok, "_Noreturn")))
+  while (tok && (tok->tag & (TT_QUALIFIER | TT_SKIP_DECL | TT_ATTR | TT_INLINE)))
   {
     if (tok->tag & TT_ATTR)
       tok = skip_gnu_attributes(tok);
@@ -1766,7 +1793,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
         r.has_volatile = true;
       if (tag & TT_REGISTER)
         r.has_register = true;
-      if (equal(tok, "const"))
+      if (tag & TT_CONST)
         r.has_const = true;
       if (tag & TT_TYPE) // _Atomic is TT_QUALIFIER | TT_TYPE
         r.has_atomic = true;
@@ -1982,7 +2009,7 @@ static DeclResult parse_declarator(Token *tok, bool emit)
         return r;
       }
     }
-    else if (r.is_pointer && equal(tok, "const"))
+    else if (r.is_pointer && (tok->tag & TT_CONST))
       r.is_const = true;
     if (tok->tag & TT_ATTR)
     {
@@ -2252,9 +2279,9 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
       bool hit_orelse = false;
       while (tok->kind != TK_EOF)
       {
-        if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
+        if (tok->flags & TF_OPEN)
           depth++;
-        else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
+        else if (tok->flags & TF_CLOSE)
           depth--;
         else if (depth == 0 && (equal(tok, ",") || equal(tok, ";")))
           break;
@@ -2332,7 +2359,7 @@ static Token *try_zero_init_decl(Token *tok)
   if (!FEAT(F_ZEROINIT) || ctx->defer_depth <= 0 || ctx->struct_depth > 0)
     return NULL;
 
-  if (tok->kind >= TK_STR) // Fast reject: punctuation, numbers, strings, and EOF can never start a declaration
+  if (tok->kind >= TK_STR) // Fast reject: strings, numbers, prep directives, EOF can't start a declaration
     return NULL;
 
   // Check for "switch skip hole" - declarations directly in switch body
@@ -2401,6 +2428,10 @@ static Token *try_zero_init_decl(Token *tok)
     return NULL;
   }
 
+  // Fast reject: if token has no declaration-start tag and isn't a typedef, skip parse_type_specifier
+  if (!(tok->tag & TT_DECL_START) && !is_typedef_like(tok))
+    return NULL;
+
   // Parse type specifier
   TypeSpecResult type = parse_type_specifier(tok);
   if (!type.saw_type)
@@ -2438,13 +2469,13 @@ static Token *emit_expr_to_semicolon(Token *tok)
   Token *prev_tok = NULL;
   while (tok->kind != TK_EOF)
   {
-    if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
+    if (tok->flags & TF_OPEN)
     {
       depth++;
-      if (equal(tok, "{"))
+      if (match_ch(tok, '{'))
         expr_at_stmt_start = true;
     }
-    else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
+    else if (tok->flags & TF_CLOSE)
       depth--;
     else if (depth == 0 && equal(tok, ";"))
       break;
@@ -2715,9 +2746,9 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const)
   int fdepth = 0;
   while (tok->kind != TK_EOF)
   {
-    if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
+    if (tok->flags & TF_OPEN)
       fdepth++;
-    else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
+    else if (tok->flags & TF_CLOSE)
       fdepth--;
     else if (fdepth == 0 && equal(tok, ";"))
       break;
@@ -2934,7 +2965,7 @@ static Token *handle_close_brace(Token *tok)
   if (ctx->struct_depth > 0)
     ctx->struct_depth--;
   typedef_pop_scope(ctx->defer_depth);
-  if (FEAT(F_DEFER))
+  if (FEAT(F_DEFER) && ctx->defer_depth > 0 && defer_stack[ctx->defer_depth - 1].count > 0)
     emit_defers(DEFER_SCOPE);
   defer_pop_scope();
   emit_tok(tok);
@@ -3336,6 +3367,31 @@ static inline void track_generic_paren(Token *tok)
     ctx->generic_paren_depth--;
 }
 
+// Scan ahead for 'orelse' at depth 0 in a bare expression.
+// Returns the orelse token, or NULL if not found before ';' or unbalanced close.
+static Token *find_bare_orelse(Token *tok)
+{
+  int depth = 0;
+  Token *prev = NULL;
+  for (Token *s = tok; s->kind != TK_EOF; s = s->next)
+  {
+    if (s->flags & TF_OPEN)
+      depth++;
+    else if (s->flags & TF_CLOSE)
+    {
+      if (--depth < 0)
+        return NULL;
+    }
+    else if (depth == 0 && equal(s, ";"))
+      return NULL;
+    if (depth == 0 && (s->tag & TT_ORELSE) && !is_known_typedef(s) &&
+        !(prev && (prev->tag & TT_MEMBER)))
+      return s;
+    prev = s;
+  }
+  return NULL;
+}
+
 // Core transpile: emit transformed tokens to an already-opened FILE*.
 // Handles the main transpilation loop, system headers, and cleanup.
 // The caller has already preprocessed and tokenized the input.
@@ -3387,7 +3443,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
     {
       if (__builtin_expect(ctrl.pending && tok->len == 1, 0))
       {
-        char c = tok->loc[0];
+        char c = tok->shortcut;
         if (c == '(')
           track_ctrl_paren_open();
         else if (c == ')')
@@ -3426,44 +3482,14 @@ static int transpile_tokens(Token *tok, FILE *fp)
       // Bare expression orelse
       if (FEAT(F_ORELSE) && ctx->defer_depth > 0 && ctx->struct_depth == 0)
       {
-        int scan_depth = 0;
-        bool found_orelse = false;
-        Token *prev_s = NULL;
-        for (Token *s = tok; s->kind != TK_EOF; s = s->next)
-        {
-          if (equal(s, "(") || equal(s, "[") || equal(s, "{"))
-            scan_depth++;
-          else if (equal(s, ")") || equal(s, "]") || equal(s, "}"))
-          {
-            scan_depth--;
-            if (scan_depth < 0)
-              break;
-          }
-          else if (scan_depth == 0 && equal(s, ";"))
-            break;
-          if (scan_depth == 0 && (s->tag & TT_ORELSE) && !is_known_typedef(s) &&
-              !(prev_s && (prev_s->tag & TT_MEMBER)))
-          {
-            found_orelse = true;
-            break;
-          }
-          prev_s = s;
-        }
-        if (found_orelse)
+        Token *orelse_tok = find_bare_orelse(tok);
+        if (orelse_tok)
         {
           if (tok->tag & TT_ORELSE && !is_known_typedef(tok))
             error_tok(tok, "expected expression before 'orelse'");
           OUT_LIT(" if (!(");
-          int edepth = 0;
-          while (tok->kind != TK_EOF)
+          while (tok != orelse_tok)
           {
-            if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{"))
-              edepth++;
-            else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}"))
-              edepth--;
-            if (edepth == 0 && (tok->tag & TT_ORELSE) && !is_known_typedef(tok) &&
-                !(last_emitted && (last_emitted->tag & TT_MEMBER)))
-              break;
             emit_tok(tok);
             tok = tok->next;
           }
@@ -3496,13 +3522,13 @@ static int transpile_tokens(Token *tok, FILE *fp)
     {
       // ── Keyword dispatch (defer, return, break/continue, goto) ──
 
-      if (tag & TT_DEFER)
+      if (__builtin_expect(tag & TT_DEFER, 0))
         DISPATCH(handle_defer_keyword);
-      if (FEAT(F_DEFER) && (tag & TT_RETURN))
+      if (__builtin_expect(FEAT(F_DEFER) && (tag & TT_RETURN), 0))
         DISPATCH(handle_return_defer);
-      if (FEAT(F_DEFER) && (tag & (TT_BREAK | TT_CONTINUE)))
+      if (__builtin_expect(FEAT(F_DEFER) && (tag & (TT_BREAK | TT_CONTINUE)), 0))
         DISPATCH(handle_break_continue_defer);
-      if ((tag & TT_GOTO) && FEAT(F_DEFER | F_ZEROINIT))
+      if (__builtin_expect((tag & TT_GOTO) && FEAT(F_DEFER | F_ZEROINIT), 0))
         DISPATCH(handle_goto_keyword);
 
       // ── Control-flow flag setting (loop, switch, if/else) ──
@@ -3795,61 +3821,55 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
   ctx->extra_force_includes = features.force_includes;
   ctx->extra_force_include_count = features.force_include_count;
 
-  char temp_path[PATH_MAX];
-  temp_path[0] = '\0';
-  if (make_temp_file(temp_path, sizeof(temp_path), "prism_out.XXXXXX.c", 2, NULL) < 0)
+  // Use open_memstream to write directly to memory (no temp files)
+  if (!ctx->keyword_map.capacity)
+    init_keyword_map();
+
+  char *pp_buf = preprocess_with_cc((char *)input_file);
+  if (!pp_buf)
   {
     result.status = PRISM_ERR_IO;
-    result.error_msg = strdup("Failed to create temp file");
+    result.error_msg = strdup("Preprocessing failed");
     goto cleanup;
   }
 
-#ifdef PRISM_LIB_MODE
-  strncpy(ctx->active_temp_output, temp_path, PATH_MAX - 1);
-  ctx->active_temp_output[PATH_MAX - 1] = '\0';
-#endif
-
-  if (!transpile((char *)input_file, temp_path))
+  Token *tok = tokenize_buffer((char *)input_file, pp_buf);
+  if (!tok)
   {
     result.status = PRISM_ERR_SYNTAX;
-    result.error_msg = strdup("Transpilation failed");
+    result.error_msg = strdup("Failed to tokenize");
+    tokenizer_teardown(false);
     goto cleanup;
   }
 
-  { // Read result into memory
-    FILE *f = fopen(temp_path, "rb");
-    if (!f)
+  {
+    char *membuf = NULL;
+    size_t memlen = 0;
+    FILE *fp = open_memstream(&membuf, &memlen);
+    if (!fp)
     {
       result.status = PRISM_ERR_IO;
-      result.error_msg = strdup("Failed to read transpiled output");
+      result.error_msg = strdup("open_memstream failed");
+      tokenizer_teardown(false);
       goto cleanup;
     }
 
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    result.output = malloc(size + 1);
-    if (!result.output)
+    if (transpile_tokens(tok, fp))
     {
-      result.status = PRISM_ERR_IO;
-      result.error_msg = strdup("Out of memory");
-      fclose(f);
-      goto cleanup;
+      result.output = membuf;
+      result.output_len = memlen;
+      result.status = PRISM_OK;
     }
-
-    size_t read = fread(result.output, 1, size, f);
-    result.output[read] = '\0';
-    result.output_len = read;
-    result.status = PRISM_OK;
-    fclose(f);
+    else
+    {
+      free(membuf);
+      result.status = PRISM_ERR_SYNTAX;
+      result.error_msg = strdup("Transpilation failed");
+    }
   }
 
 cleanup:
-  if (temp_path[0])
-    remove(temp_path);
 #ifdef PRISM_LIB_MODE
-  ctx->active_temp_output[0] = '\0';
   ctx->error_jmp_set = false;
 #endif
   return result;

@@ -127,8 +127,8 @@ typedef struct
 typedef enum
 {
     TK_IDENT,
-    TK_PUNCT,
     TK_KEYWORD,
+    TK_PUNCT,
     TK_STR,
     TK_NUM,
     TK_PREP_DIR, // Preprocessor directive (e.g., #pragma) to preserve
@@ -142,6 +142,8 @@ enum
     TF_HAS_SPACE = 1 << 1,
     TF_IS_FLOAT = 1 << 2,
     TF_IS_DIGRAPH = 1 << 3,
+    TF_OPEN = 1 << 4,  // Opening delimiter: ( [ { and digraph equivalents
+    TF_CLOSE = 1 << 5, // Closing delimiter: ) ] } and digraph equivalents
 };
 
 // Token tags - bitmask classification assigned once at tokenize time
@@ -160,8 +162,8 @@ enum
     TT_ASM = 1 << 9,          // Inline assembly (asm, __asm__, __asm)
     TT_INLINE = 1 << 10,      // inline, __inline, __inline__
     TT_NORETURN_FN = 1 << 11, // Noreturn function identifier (exit, abort, etc.)
-    TT_SETJMP_FN = 1 << 12,   // setjmp/longjmp family identifier
-    TT_VFORK_FN = 1 << 13,    // vfork identifier
+    TT_SPECIAL_FN = 1 << 12,  // setjmp/longjmp/vfork family (cold path differentiates via equal())
+    TT_CONST = 1 << 13,       // const keyword
     // Dispatch tags for main loop (bits 14-24)
     TT_RETURN = 1 << 14,   // return
     TT_BREAK = 1 << 15,    // break
@@ -175,14 +177,18 @@ enum
     TT_IF = 1 << 23,       // if, else
     TT_TYPEDEF = 1 << 24,  // typedef
     // Specific keyword ID tags (bits 25-29) - eliminates equal() in parse_type_specifier
-    TT_VOLATILE = 1 << 25, // volatile
-    TT_REGISTER = 1 << 26, // register
-    TT_TYPEOF = 1 << 27,   // typeof, typeof_unqual, __typeof__, __typeof
-    TT_BITINT = 1 << 28,   // _BitInt
-    TT_ALIGNAS = 1 << 29,  // _Alignas, alignas
-    TT_ORELSE = 1 << 30,   // orelse
+    TT_VOLATILE = 1 << 25,    // volatile
+    TT_REGISTER = 1 << 26,    // register
+    TT_TYPEOF = 1 << 27,      // typeof, typeof_unqual, __typeof__, __typeof
+    TT_BITINT = 1 << 28,      // _BitInt
+    TT_ALIGNAS = 1 << 29,     // _Alignas, alignas
+    TT_ORELSE = 1 << 30,      // orelse
     TT_STRUCTURAL = 1u << 31, // Structural punctuation: { } ; : — forces slow-path dispatch
 };
+
+// Combined mask: tags that can appear at the start of a declaration
+// Used by try_zero_init_decl to fast-reject non-declaration tokens before parse_type_specifier
+#define TT_DECL_START (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_INLINE | TT_ALIGNAS | TT_SKIP_DECL | TT_ATTR)
 
 struct Token
 {
@@ -193,7 +199,8 @@ struct Token
     TokenKind kind;
     uint16_t file_idx;
     uint8_t flags;
-    uint32_t tag; // TT_* bitmask - token classification
+    uint8_t shortcut; // First byte of token (tok->loc[0]), avoids pointer chase
+    uint32_t tag;     // TT_* bitmask - token classification
 };
 
 typedef struct
@@ -259,6 +266,7 @@ typedef struct PrismContext
     HashMap filename_intern_map;
     HashMap file_view_cache;
     HashMap keyword_map;
+    uint64_t keyword_bloom; // Bloom filter for keyword_map — fast-rejects non-keyword identifiers
 #ifdef PRISM_LIB_MODE
     jmp_buf error_jmp;
     bool error_jmp_set;
@@ -779,7 +787,7 @@ static inline const char *digraph_equiv(Token *tok)
 
 static inline bool equal_n(Token *tok, const char *op, size_t len)
 {
-    if (tok->len == (int)len && !memcmp(tok->loc, op, len))
+    if (tok->len == (int)len && tok->shortcut == (uint8_t)op[0] && !memcmp(tok->loc + 1, op + 1, len - 1))
         return true;
 
     // Only check digraph equivalence if token was flagged as a digraph
@@ -804,7 +812,7 @@ static bool __attribute__((noinline)) _equal_1_digraph(Token *tok, char c)
 static inline bool _equal_1(Token *tok, char c)
 {
     if (tok->len == 1)
-        return tok->loc[0] == c;
+        return tok->shortcut == (uint8_t)c;
     if (__builtin_expect(tok->flags & TF_IS_DIGRAPH, 0))
         return _equal_1_digraph(tok, c);
     return false;
@@ -875,11 +883,11 @@ static void init_keyword_map(void)
         {"static", TT_QUALIFIER | TT_SKIP_DECL, true},
         {"extern", TT_SKIP_DECL, true},
         {"inline", TT_INLINE, true},
-        {"const", TT_QUALIFIER, true},
+        {"const", TT_QUALIFIER | TT_CONST, true},
         {"volatile", TT_QUALIFIER | TT_VOLATILE, true},
         {"restrict", TT_QUALIFIER, true},
         {"_Atomic", TT_QUALIFIER | TT_TYPE, true},
-        {"_Noreturn", 0, true},
+        {"_Noreturn", TT_SKIP_DECL, true},
         {"__inline", TT_INLINE, true},
         {"__inline__", TT_INLINE, true},
         {"_Thread_local", 0, true},
@@ -937,27 +945,31 @@ static void init_keyword_map(void)
         {"__builtin_trap", TT_NORETURN_FN, false},
         {"__builtin_unreachable", TT_NORETURN_FN, false},
         {"thrd_exit", TT_NORETURN_FN, false},
-        {"setjmp", TT_SETJMP_FN, false},
-        {"longjmp", TT_SETJMP_FN, false},
-        {"_setjmp", TT_SETJMP_FN, false},
-        {"_longjmp", TT_SETJMP_FN, false},
-        {"sigsetjmp", TT_SETJMP_FN, false},
-        {"siglongjmp", TT_SETJMP_FN, false},
-        {"pthread_exit", TT_SETJMP_FN, false},
-        {"__builtin_setjmp", TT_SETJMP_FN, false},
-        {"__builtin_longjmp", TT_SETJMP_FN, false},
-        {"__builtin_setjmp_receive", TT_SETJMP_FN, false},
-        {"savectx", TT_SETJMP_FN, false},
-        {"vfork", TT_VFORK_FN, false},
+        {"setjmp", TT_SPECIAL_FN, false},
+        {"longjmp", TT_SPECIAL_FN, false},
+        {"_setjmp", TT_SPECIAL_FN, false},
+        {"_longjmp", TT_SPECIAL_FN, false},
+        {"sigsetjmp", TT_SPECIAL_FN, false},
+        {"siglongjmp", TT_SPECIAL_FN, false},
+        {"pthread_exit", TT_SPECIAL_FN, false},
+        {"__builtin_setjmp", TT_SPECIAL_FN, false},
+        {"__builtin_longjmp", TT_SPECIAL_FN, false},
+        {"__builtin_setjmp_receive", TT_SPECIAL_FN, false},
+        {"savectx", TT_SPECIAL_FN, false},
+        {"vfork", TT_SPECIAL_FN, false},
     };
 
-    // Single pass: populate hashmap + perfect hash table
+    // Single pass: populate hashmap + perfect hash table + bloom filter
     memset(keyword_perfect, 0, sizeof(keyword_perfect));
+    ctx->keyword_bloom = 0;
     for (size_t i = 0; i < sizeof(entries) / sizeof(*entries); i++)
     {
         int len = strlen(entries[i].name);
         uintptr_t val = entries[i].is_kw ? (entries[i].tag | KW_MARKER) : entries[i].tag;
         hashmap_put(&ctx->keyword_map, entries[i].name, len, (void *)val);
+        // Seed bloom filter: same hash as typedef_bloom_bit
+        unsigned bh = (unsigned)len ^ ((unsigned char)entries[i].name[0] * 7) ^ ((unsigned char)entries[i].name[len - 1] * 31);
+        ctx->keyword_bloom |= 1ULL << (bh & 63);
 
         unsigned slot = KEYWORD_HASH(entries[i].name, len);
         if (keyword_perfect[slot].name)
@@ -1151,6 +1163,7 @@ static inline __attribute__((always_inline)) Token *new_token(TokenKind kind, ch
     tok->line_no = ctx->tok_line_no + ctx->current_file->line_delta;
     tok->file_idx = ctx->current_file->file_no;
     tok->flags = (ctx->at_bol ? TF_AT_BOL : 0) | (ctx->has_space ? TF_HAS_SPACE : 0);
+    tok->shortcut = (uint8_t)*start;
     ctx->at_bol = ctx->has_space = false;
     return tok;
 }
@@ -1228,25 +1241,7 @@ static int get_extended_float_suffix(const char *p, int len, const char **replac
     return 0;
 }
 
-// Convert preprocessor number token to TK_NUM.
-// We detect floats (for C23 extended suffix rewriting) but don't parse values.
-// Classify a number token: detect floats for C23 suffix rewriting
-static void classify_number(Token *tok)
-{
-    char *p = tok->loc;
-    bool is_hex = (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'));
-    for (char *q = p; q < p + tok->len; q++)
-    {
-        char c = *q;
-        if (c == '.' || c == 'p' || c == 'P' || (!is_hex && (c == 'e' || c == 'E')))
-        {
-            tok->flags |= TF_IS_FLOAT;
-            return;
-        }
-    }
-    if (!is_hex && get_extended_float_suffix(p, tok->len, NULL))
-        tok->flags |= TF_IS_FLOAT;
-}
+// Note: classify_number logic is merged into scan_pp_number to avoid double-scanning.
 
 // Tag a punctuator token with TT_ASSIGN, TT_MEMBER, or TT_STRUCTURAL
 static inline void classify_punct(Token *t)
@@ -1260,6 +1255,10 @@ static inline void classify_punct(Token *t)
             t->tag = TT_MEMBER;
         else if (c == '{' || c == '}' || c == ';' || c == ':')
             t->tag = TT_STRUCTURAL;
+        if (c == '(' || c == '[' || c == '{')
+            t->flags |= TF_OPEN;
+        else if (c == ')' || c == ']' || c == '}')
+            t->flags |= TF_CLOSE;
     }
     else if (t->len == 2)
     {
@@ -1273,9 +1272,14 @@ static inline void classify_punct(Token *t)
         else if (c == '-' && c2 == '>')
             t->tag = TT_MEMBER;
         else if ((c == '<' && c2 == '%') || (c == '%' && c2 == '>'))
-            t->tag = TT_STRUCTURAL; // digraph { and }
+            t->tag = TT_STRUCTURAL;
         else if (c == '<' && c2 == ':')
-            t->tag = TT_ASSIGN; // digraph [
+            t->tag = TT_ASSIGN;
+        // Digraph open/close flags
+        if (c == '<' && (c2 == '%' || c2 == ':'))
+            t->flags |= TF_OPEN; // <% = {, <: = [
+        else if ((c == '%' || c == ':') && c2 == '>')
+            t->flags |= TF_CLOSE; // %> = }, :> = ]
     }
     else if (t->len == 3 && t->loc[2] == '=' && (c == '<' || c == '>') && t->loc[1] == c)
         t->tag = TT_ASSIGN;
@@ -1289,13 +1293,7 @@ static File *new_file(char *name, int file_no, char *contents)
         free(contents);
         error("out of memory");
     }
-    file->name = strdup(name);
-    if (!file->name)
-    {
-        free(contents);
-        free(file);
-        error("out of memory");
-    }
+    file->name = intern_filename(name);
     file->display_name = file->name;
     file->file_no = file_no;
     file->contents = contents;
@@ -1443,24 +1441,33 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
     return p;
 }
 
-// Scan a preprocessor number starting at p, return pointer past end
-static char *scan_pp_number(char *p)
+// Scan a preprocessor number starting at p, return pointer past end.
+// Sets *is_float if the number contains '.', 'e/E' (non-hex), or 'p/P' exponent.
+static char *scan_pp_number(char *p, bool *is_float)
 {
+    bool is_hex = (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'));
+    *is_float = false;
     for (;;)
     {
-        // Handle exponent signs: e+, e-, E+, E-, p+, p-, P+, P- (hex floats)
         char c = *p;
         if ((c == 'e' || c == 'E' || c == 'p' || c == 'P') && (p[1] == '+' || p[1] == '-'))
         {
+            if (c == 'p' || c == 'P' || !is_hex)
+                *is_float = true;
             p += 2;
         }
-        else if (ident_char[(unsigned char)c] || c == '.')
+        else if (c == '.')
         {
-            p++; // Accept digits, letters (hex, suffixes, extensions), dot, underscore
+            *is_float = true;
+            p++;
+        }
+        else if (ident_char[(unsigned char)c])
+        {
+            p++;
         }
         else if (c == '\'' && ident_char[(unsigned char)p[1]])
         {
-            p++; // C23 digit separator: accept ' followed by any identifier char
+            p++; // C23 digit separator
         }
         else
             break;
@@ -1535,16 +1542,24 @@ static Token *tokenize(File *file)
         }
         if (is_space(*p)) // Whitespace
         {
-            p++;
+            do
+            {
+                p++;
+            } while (is_space(*p));
             ctx->has_space = true;
             continue;
         }
         if (IS_DIGIT(*p) || (*p == '.' && IS_DIGIT(p[1])))
         {
             char *start = p;
-            p = scan_pp_number(p);
+            bool is_float;
+            p = scan_pp_number(p, &is_float);
             Token *t = cur = cur->next = new_token(TK_NUM, start, p);
-            classify_number(t);
+            if (is_float)
+                t->flags |= TF_IS_FLOAT;
+            else if (!(start[0] == '0' && (start[1] == 'x' || start[1] == 'X')) &&
+                     get_extended_float_suffix(start, t->len, NULL))
+                t->flags |= TF_IS_FLOAT;
             continue;
         }
         { // C++11/C23 raw string literals: R"...", LR"...", uR"...", UR"...", u8R"..."
@@ -1593,7 +1608,12 @@ static Token *tokenize(File *file)
             Token *t = cur = cur->next = new_token(TK_IDENT, p, p + ident_len);
             uintptr_t kw = keyword_lookup(p, ident_len);
             if (!kw)
-                kw = (uintptr_t)hashmap_get(&ctx->keyword_map, p, ident_len);
+            {
+                // Bloom filter fast-reject: most regular identifiers skip hashmap_get entirely
+                unsigned bh = (unsigned)ident_len ^ ((unsigned char)p[0] * 7) ^ ((unsigned char)p[ident_len - 1] * 31);
+                if (ctx->keyword_bloom & (1ULL << (bh & 63)))
+                    kw = (uintptr_t)hashmap_get(&ctx->keyword_map, p, ident_len);
+            }
             if (kw)
             {
                 if (kw & KW_MARKER)
