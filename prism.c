@@ -256,6 +256,7 @@ typedef struct
   bool is_func_ptr; // Is function pointer
   bool has_paren;   // Has parenthesized declarator
   bool has_init;    // Has initializer (=)
+  bool is_const;    // Has const qualifier on declarator (e.g. * const)
 } DeclResult;
 
 #define struct_body_contains_vla(brace) scan_for_vla(brace, "{", "}")
@@ -1524,10 +1525,25 @@ static bool is_void_function_decl(Token *tok)
       tok = tok->next;
   }
 
-  // Must be at 'void' or a typedef alias for void
-  if (!tok || (!equal(tok, "void") && !is_void_typedef(tok)))
+  // Must be at 'void', a typedef alias for void, or typeof(void)/typeof_unqual(void)
+  if (!tok)
     return false;
-  tok = tok->next;
+  if (tok->tag & TT_TYPEOF)
+  {
+    // Check for typeof(void) or typeof_unqual(void)
+    Token *t = tok->next;
+    if (t && equal(t, "(") && t->next && equal(t->next, "void") &&
+        t->next->next && equal(t->next->next, ")"))
+    {
+      tok = t->next->next->next; // skip past typeof(void)
+    }
+    else
+      return false;
+  }
+  else if (!equal(tok, "void") && !is_void_typedef(tok))
+    return false;
+  else
+    tok = tok->next;
 
   // void* is not a void-returning function
   if (tok && equal(tok, "*"))
@@ -1974,7 +1990,7 @@ static inline Token *decl_array_dims(Token *t, bool emit, bool *vla)
 // When emit=false, only advances without output (replaces old skip_declarator).
 static DeclResult parse_declarator(Token *tok, bool emit)
 {
-  DeclResult r = {tok, NULL, false, false, false, false, false, false};
+  DeclResult r = {tok, NULL, false, false, false, false, false, false, false};
 
   // Pointer modifiers and qualifiers (with depth limit for safety)
   int ptr_depth = 0;
@@ -1983,12 +1999,15 @@ static DeclResult parse_declarator(Token *tok, bool emit)
     if (equal(tok, "*"))
     {
       r.is_pointer = true;
+      r.is_const = false; // Reset: const after a new '*' applies to this pointer level
       if (++ptr_depth > 256)
       {
         r.end = NULL;
         return r;
       }
     }
+    else if (r.is_pointer && equal(tok, "const"))
+      r.is_const = true;
     if (tok->tag & TT_ATTR)
     {
       tok = decl_attr(tok, emit);
@@ -2406,7 +2425,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw)
         }
         else
         {
-          if (type->has_const)
+          if (type->has_const || decl.is_const)
             error_tok(tok, "orelse fallback cannot reassign a const-qualified variable");
           OUT_LIT(" if (!");
           out_str(decl.var_name->loc, decl.var_name->len);

@@ -3328,6 +3328,24 @@ void test_deep_defer_with_zeroinit(void)
     CHECK_EQ(outer, 0, "deep zeroinit outer var");
 }
 
+#ifdef __GNUC__
+static void _typeof_void_noop(void) {}
+
+typeof(void) _typeof_void_defer_func(int *out)
+{
+    defer { *out += 1; };
+    *out += 10;
+    return _typeof_void_noop();
+}
+
+void test_typeof_void_defer_return(void)
+{
+    int val = 0;
+    _typeof_void_defer_func(&val);
+    CHECK_EQ(val, 11, "typeof void defer return: value correct");
+}
+#endif
+
 void run_advanced_defer_tests(void)
 {
     printf("\n=== ADVANCED DEFER TESTS ===\n");
@@ -3351,6 +3369,9 @@ void run_advanced_defer_tests(void)
     test_defer_nested_loops();
     test_defer_break_inner_stay_outer();
     test_deep_defer_with_zeroinit();
+#ifdef __GNUC__
+    test_typeof_void_defer_return();
+#endif
 }
 
 // SECTION 8: STRESS TESTS
@@ -13003,6 +13024,52 @@ void test_orelse_nested_funcalls(void)
     CHECK_EQ(_nested_call_orelse_helper(NULL), -1, "orelse nested funcalls: null triggers return");
 }
 
+static int _const_ptr_orelse_return_impl(int *input)
+{
+    int * const p = input orelse return -1;
+    return *p;
+}
+
+void test_orelse_const_ptr_return_val(void)
+{
+    int val = 99;
+    CHECK_EQ(_const_ptr_orelse_return_impl(&val), 99, "const ptr orelse return: non-null kept");
+    CHECK_EQ(_const_ptr_orelse_return_impl(NULL), -1, "const ptr orelse return: null returns");
+}
+
+void test_orelse_const_ptr_break_vals(void)
+{
+    int a = 5, b = 10, c = 15;
+    int *ptrs[] = {&a, &b, NULL, &c};
+    int sum = 0;
+    for (int i = 0; i < 4; i++)
+    {
+        int * const p = ptrs[i] orelse break;
+        sum += *p;
+    }
+    CHECK_EQ(sum, 15, "const ptr orelse break: stops at null");
+}
+
+static int _const_ptr_defer_orelse_impl(int *input)
+{
+    log_reset();
+    defer log_append("D");
+    int * const p = input orelse return -1;
+    log_append("A");
+    return *p;
+}
+
+void test_orelse_const_ptr_defer_return(void)
+{
+    int val = 77;
+    int r = _const_ptr_defer_orelse_impl(&val);
+    CHECK_EQ(r, 77, "const ptr defer orelse return: non-null");
+    CHECK_LOG("AD", "const ptr defer orelse return: defer order");
+    r = _const_ptr_defer_orelse_impl(NULL);
+    CHECK_EQ(r, -1, "const ptr defer orelse return: null");
+    CHECK_LOG("D", "const ptr defer orelse null: defer runs");
+}
+
 void run_orelse_tests(void)
 {
     test_orelse_return_null();
@@ -13054,6 +13121,9 @@ void run_orelse_tests(void)
     test_orelse_paren_comma_expr();
     test_orelse_multiarg_funcall();
     test_orelse_nested_funcalls();
+    test_orelse_const_ptr_return_val();
+    test_orelse_const_ptr_break_vals();
+    test_orelse_const_ptr_defer_return();
 }
 
 int main(void)
