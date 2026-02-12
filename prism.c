@@ -2412,14 +2412,30 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
         if (ctrl.for_init)
           error_tok(tok, "orelse cannot be used in for-loop initializers");
 
+        // Detect struct/union value (not enum — enums are integer types)
+        bool type_is_sue_not_enum = type->is_struct;
+        if (type_is_sue_not_enum)
+        {
+          for (Token *t = type_start; t && t != type->end; t = t->next)
+          {
+            if (equal(t, "enum"))
+            {
+              type_is_sue_not_enum = false;
+              break;
+            }
+            if (equal(t, "struct") || equal(t, "union"))
+              break;
+          }
+        }
+
         bool has_const_qual = type->has_const || decl.is_const;
-        bool is_struct_val = (type->is_struct || type->is_typedef) && !decl.is_pointer && !decl.is_array;
+        bool is_struct_val = type_is_sue_not_enum && !decl.is_pointer && !decl.is_array;
 
         // Peek at action after 'orelse' to detect fallback (non-control-flow) orelse
         Token *peek_action = tok->next;
         bool is_orelse_fallback = peek_action &&
-            !(peek_action->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
-            !equal(peek_action, "{") && !equal(peek_action, ";");
+                                  !(peek_action->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
+                                  !equal(peek_action, "{") && !equal(peek_action, ";");
 
         // const + fallback orelse: use GNU ternary ?: to avoid reassigning const variable
         if (has_const_qual && is_orelse_fallback)
@@ -2535,7 +2551,10 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
           }
         }
 
-        bool is_struct_value = (type->is_struct || type->is_typedef) && !decl.is_pointer && !decl.is_array;
+        // Struct/union value orelse — error (already computed type_is_sue_not_enum above)
+        bool is_struct_value = type_is_sue_not_enum && !decl.is_pointer && !decl.is_array;
+        if (is_struct_value)
+          error_tok(decl.var_name, "orelse on struct/union values is not supported (memcmp cannot reliably detect zero due to padding)");
         tok = emit_orelse_action(tok, decl.var_name, type->has_const || decl.is_const, stop_comma, is_struct_value);
 
         // Continue processing remaining declarators after comma
@@ -2895,24 +2914,9 @@ static inline void orelse_open(Token *var_name, bool is_struct_value)
 {
   if (var_name)
   {
-    if (is_struct_value)
-    {
-      OUT_LIT(" __builtin_clear_padding(&");
-      out_str(var_name->loc, var_name->len);
-      OUT_LIT("); if (__builtin_memcmp(&");
-      out_str(var_name->loc, var_name->len);
-      OUT_LIT(", &(__typeof__(");
-      out_str(var_name->loc, var_name->len);
-      OUT_LIT(")){0}, sizeof(");
-      out_str(var_name->loc, var_name->len);
-      OUT_LIT(")) == 0) {");
-    }
-    else
-    {
-      OUT_LIT(" if (!");
-      out_str(var_name->loc, var_name->len);
-      OUT_LIT(") {");
-    }
+    OUT_LIT(" if (!");
+    out_str(var_name->loc, var_name->len);
+    OUT_LIT(") {");
   }
   else
     OUT_LIT(" {");
@@ -2925,24 +2929,9 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
   {
     if (var_name)
     {
-      if (is_struct_value)
-      {
-        OUT_LIT(" __builtin_clear_padding(&");
-        out_str(var_name->loc, var_name->len);
-        OUT_LIT("); if (__builtin_memcmp(&");
-        out_str(var_name->loc, var_name->len);
-        OUT_LIT(", &(__typeof__(");
-        out_str(var_name->loc, var_name->len);
-        OUT_LIT(")){0}, sizeof(");
-        out_str(var_name->loc, var_name->len);
-        OUT_LIT(")) == 0)");
-      }
-      else
-      {
-        OUT_LIT(" if (!");
-        out_str(var_name->loc, var_name->len);
-        out_char(')');
-      }
+      OUT_LIT(" if (!");
+      out_str(var_name->loc, var_name->len);
+      out_char(')');
     }
     ctx->at_stmt_start = false;
     return tok;
@@ -3084,24 +3073,9 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
     error_tok(tok, "orelse fallback requires an assignment target (use a declaration)");
   if (has_const)
     error_tok(tok, "orelse fallback cannot reassign a const-qualified variable");
-  if (is_struct_value)
-  {
-    OUT_LIT(" __builtin_clear_padding(&");
-    out_str(var_name->loc, var_name->len);
-    OUT_LIT("); if (__builtin_memcmp(&");
-    out_str(var_name->loc, var_name->len);
-    OUT_LIT(", &(__typeof__(");
-    out_str(var_name->loc, var_name->len);
-    OUT_LIT(")){0}, sizeof(");
-    out_str(var_name->loc, var_name->len);
-    OUT_LIT(")) == 0) ");
-  }
-  else
-  {
-    OUT_LIT(" if (!");
-    out_str(var_name->loc, var_name->len);
-    OUT_LIT(") ");
-  }
+  OUT_LIT(" if (!");
+  out_str(var_name->loc, var_name->len);
+  OUT_LIT(") ");
   out_str(var_name->loc, var_name->len);
   OUT_LIT(" =");
   int fdepth = 0;

@@ -14186,59 +14186,6 @@ static void test_vla_typedef_complex_size(void)
     CHECK_EQ(arr3[0], 300, "vla typedef with parens");
 }
 
-typedef struct
-{
-    int x, y;
-} OrelseVec2;
-static OrelseVec2 make_vec2(int set) { return (OrelseVec2){set, set * 2}; }
-
-static int orelse_struct_val_helper(int set)
-{
-    OrelseVec2 v = make_vec2(set) orelse return -1;
-    return v.x + v.y;
-}
-
-static void test_orelse_struct_val(void)
-{
-    CHECK_EQ(orelse_struct_val_helper(5), 15, "orelse struct val non-zero");
-    CHECK_EQ(orelse_struct_val_helper(0), -1, "orelse struct val zero triggers");
-}
-
-static OrelseVec2 orelse_struct_fallback_helper(int set)
-{
-    OrelseVec2 v = make_vec2(set) orelse(OrelseVec2){99, 99};
-    return v;
-}
-
-static void test_orelse_struct_fallback(void)
-{
-    OrelseVec2 a = orelse_struct_fallback_helper(3);
-    CHECK_EQ(a.x, 3, "orelse struct fallback non-zero x");
-    CHECK_EQ(a.y, 6, "orelse struct fallback non-zero y");
-    OrelseVec2 b = orelse_struct_fallback_helper(0);
-    CHECK_EQ(b.x, 99, "orelse struct fallback zero x");
-    CHECK_EQ(b.y, 99, "orelse struct fallback zero y");
-}
-
-static void orelse_struct_block_helper(int set, int *out)
-{
-    OrelseVec2 v = make_vec2(set) orelse
-    {
-        *out = -1;
-        return;
-    };
-    *out = v.x + v.y;
-}
-
-static void test_orelse_struct_block(void)
-{
-    int r;
-    orelse_struct_block_helper(4, &r);
-    CHECK_EQ(r, 12, "orelse struct block non-zero");
-    orelse_struct_block_helper(0, &r);
-    CHECK_EQ(r, -1, "orelse struct block zero triggers");
-}
-
 static void test_goto_stress_many_targets(void)
 {
     int result = 0;
@@ -14367,45 +14314,6 @@ static void test_defer_with_indirect_call(void)
     CHECK_LOG("XD", "defer with indirect call");
 }
 
-struct _PadS { char c; int i; };
-
-static struct _PadS _make_pad_struct(int set)
-{
-    union { struct _PadS s; unsigned char b[sizeof(struct _PadS)]; } u;
-    memset(u.b, 0xFF, sizeof(u.b));
-    u.s.c = (char)set;
-    u.s.i = set;
-    return u.s;
-}
-
-static int _pad_orelse_return_helper(int set)
-{
-    struct _PadS p = _make_pad_struct(set) orelse return -1;
-    return p.c + p.i;
-}
-
-static struct _PadS _pad_orelse_fallback_helper(int set)
-{
-    struct _PadS p = _make_pad_struct(set) orelse (struct _PadS){42, 42};
-    return p;
-}
-
-static void test_struct_padding_orelse_return(void)
-{
-    CHECK_EQ(_pad_orelse_return_helper(5), 10, "padded struct orelse return non-zero");
-    CHECK_EQ(_pad_orelse_return_helper(0), -1, "padded struct orelse return zero");
-}
-
-static void test_struct_padding_orelse_fallback(void)
-{
-    struct _PadS a = _pad_orelse_fallback_helper(3);
-    CHECK_EQ(a.c, 3, "padded struct orelse fb non-zero c");
-    CHECK_EQ(a.i, 3, "padded struct orelse fb non-zero i");
-    struct _PadS b = _pad_orelse_fallback_helper(0);
-    CHECK_EQ(b.c, 42, "padded struct orelse fb zero c");
-    CHECK_EQ(b.i, 42, "padded struct orelse fb zero i");
-}
-
 static void test_vla_size_side_effect(void)
 {
     int n = 5;
@@ -14525,16 +14433,11 @@ int main(void)
     test_c23_attr_positions();
 #endif
     test_vla_typedef_complex_size();
-    test_orelse_struct_val();
-    test_orelse_struct_fallback();
-    test_orelse_struct_block();
     test_goto_stress_many_targets();
     test_goto_converging_defers();
     test_switch_raw_var_in_body();
     test_stack_aggregate_zeroinit();
     test_defer_with_indirect_call();
-    test_struct_padding_orelse_return();
-    test_struct_padding_orelse_fallback();
     test_vla_size_side_effect();
     test_multi_ptr_zeroinit();
     test_typedef_scope_after_braceless();

@@ -5,7 +5,7 @@
 
 Prism is a lightweight and very fast transpiler that makes C safer without changing how you write it.
 
-- **1629 tests** — edge cases, control flow, nightmares, trying hard to break Prism
+- **1630 tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Proper transpiler** — tracks typedefs, respects scope, catches unsafe patterns
 - **Opt-out features** — Disable parts of the transpiler, like zero-init, with CLI flags
@@ -232,6 +232,24 @@ do_init() orelse return -1;
 ```c
 int fd = open(path, O_RDONLY) orelse return -1;  // 0 is falsy
 size_t n = read_data(fd, buf) orelse break;      // 0 bytes = done
+```
+
+### Limitation: struct/union values
+
+`orelse` does not **currently** support struct or union **values** — it is a compile error:
+
+```c
+struct Vec2 { int x, y; };
+
+struct Vec2 v = make_vec2() orelse return -1;  // Error
+```
+
+The reason: `orelse` works by testing `!value`, which is well-defined for scalars and pointers but not for structs. A whole-struct zero check would require `memcmp`, which can give false negatives due to padding bytes.
+
+Struct and union **pointers** work fine:
+
+```c
+struct Vec2 *p = get_vec2() orelse return -1;  // OK — pointer is scalar
 ```
 
 **Opt-out:** `prism -fno-orelse src.c`
