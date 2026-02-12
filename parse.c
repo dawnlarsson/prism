@@ -49,33 +49,33 @@
                                                                                                             : equal_n(tok, s, __builtin_strlen(s))) \
                              : equal_n(tok, s, strlen(s)))
 
-#define KEYWORD_HASH(key, len)                                         \
-    (((unsigned)(len) * 2 + (unsigned char)(key)[0] * 99 +             \
-      (unsigned char)((len) > 1 ? (key)[1] : (key)[0]) * 125 +         \
+#define KEYWORD_HASH(key, len)                                                                  \
+    (((unsigned)(len) * 2 + (unsigned char)(key)[0] * 99 +                                      \
+      (unsigned char)((len) > 1 ? (key)[1] : (key)[0]) * 125 +                                  \
       (unsigned char)((len) > 6 ? (key)[6] : ((len) > 0 ? (key)[(len) - 1] : (key)[0])) * 69) & \
      255)
 
 // Uses error() for OOM to support PRISM_LIB_MODE longjmp recovery
-#define ENSURE_ARRAY_CAP(arr, count, cap, init_cap, T)                    \
-    do                                                                    \
-    {                                                                     \
-        if ((count) >= (cap))                                             \
-        {                                                                 \
-            size_t new_cap = (cap) == 0 ? (init_cap) : (size_t)(cap) * 2; \
-            while (new_cap < (size_t)(count))                             \
-                new_cap *= 2;                                             \
-            T *old_ptr_ = (arr);                                          \
-            T *tmp = realloc((arr), sizeof(T) * new_cap);                 \
-            if (!tmp)                                                     \
-            {                                                             \
-                free(old_ptr_);                                           \
-                (arr) = NULL;                                             \
-                (cap) = 0;                                                \
-                error("out of memory");                                   \
-            }                                                             \
-            (arr) = tmp;                                                  \
-            (cap) = new_cap;                                              \
-        }                                                                 \
+#define ENSURE_ARRAY_CAP(arr, count, cap, init_cap, T)                                                   \
+    do                                                                                                   \
+    {                                                                                                    \
+        if ((count) >= (cap))                                                                            \
+        {                                                                                                \
+            size_t new_cap = (cap) == 0 ? ((init_cap) > 0 ? (size_t)(init_cap) : 1) : (size_t)(cap) * 2; \
+            while (new_cap < (size_t)(count))                                                            \
+                new_cap *= 2;                                                                            \
+            T *old_ptr_ = (arr);                                                                         \
+            T *tmp = realloc((arr), sizeof(T) * new_cap);                                                \
+            if (!tmp)                                                                                    \
+            {                                                                                            \
+                free(old_ptr_);                                                                          \
+                (arr) = NULL;                                                                            \
+                (cap) = 0;                                                                               \
+                error("out of memory");                                                                  \
+            }                                                                                            \
+            (arr) = tmp;                                                                                 \
+            (cap) = new_cap;                                                                             \
+        }                                                                                                \
     } while (0)
 
 // Lookup table for identifier-continuation chars (alnum + _ + $ + bytes >= 0x80)
@@ -197,7 +197,7 @@ struct Token
     int len;
     int line_no; // Cached line number (computed once during tokenization)
     TokenKind kind;
-    uint16_t file_idx;
+    int file_idx;
     uint8_t flags;
     uint8_t shortcut; // First byte of token (tok->loc[0]), avoids pointer chase
     uint32_t tag;     // TT_* bitmask - token classification
@@ -301,6 +301,7 @@ typedef struct PrismContext
     unsigned long long ret_counter;
 #ifdef PRISM_LIB_MODE
     char active_temp_output[PATH_MAX];
+    char *active_membuf; // open_memstream buffer; freed on longjmp recovery
 #endif
 } PrismContext;
 
@@ -507,7 +508,7 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val)
             error("out of memory allocating hashmap");
         map->capacity = 64;
     }
-    else if ((map->used + map->tombstones) * 100 / map->capacity >= 70)
+    else if ((unsigned long)(map->used + map->tombstones) * 100 / (unsigned long)map->capacity >= 70)
     {
         // Compact in place when tombstones dominate; otherwise double capacity
         int newcap = (map->tombstones > map->used) ? map->capacity : map->capacity * 2;
@@ -602,7 +603,8 @@ static char *intern_filename(const char *name)
 {
     if (!name)
         return NULL;
-    int len = strlen(name);
+    size_t slen = strlen(name);
+    int len = slen > (size_t)INT_MAX ? INT_MAX : (int)slen;
     char *existing = hashmap_get(&ctx->filename_intern_map, (char *)name, len);
     if (existing)
         return existing;
@@ -686,7 +688,10 @@ static noreturn void error(char *fmt, ...)
     {
         va_list ap;
         va_start(ap, fmt);
-        lib_error_jump(0, fmt, ap);
+        va_list ap2;
+        va_copy(ap2, ap);
+        va_end(ap);
+        lib_error_jump(0, fmt, ap2);
     }
 #endif
     va_list ap;
@@ -737,10 +742,22 @@ noreturn void error_at(char *loc, char *fmt, ...)
 #ifdef PRISM_LIB_MODE
     if (ctx->error_jmp_set)
     {
-        lib_error_jump(count_lines(ctx->current_file->contents, loc), fmt, ap);
+        va_list ap2;
+        va_copy(ap2, ap);
+        va_end(ap);
+        if (ctx->current_file)
+            lib_error_jump(count_lines(ctx->current_file->contents, loc), fmt, ap2);
+        else
+            lib_error_jump(0, fmt, ap2);
     }
 #endif
-    verror_at(ctx->current_file->name, ctx->current_file->contents, count_lines(ctx->current_file->contents, loc), loc, fmt, ap);
+    if (ctx->current_file)
+        verror_at(ctx->current_file->name, ctx->current_file->contents, count_lines(ctx->current_file->contents, loc), loc, fmt, ap);
+    else
+    {
+        vfprintf(stderr, fmt, ap);
+        fprintf(stderr, "\n");
+    }
     va_end(ap);
     exit(1);
 }
@@ -753,7 +770,10 @@ noreturn void error_tok(Token *tok, const char *fmt, ...)
 #ifdef PRISM_LIB_MODE
     if (ctx->error_jmp_set)
     {
-        lib_error_jump(tok_line_no(tok), fmt, ap);
+        va_list ap2;
+        va_copy(ap2, ap);
+        va_end(ap);
+        lib_error_jump(tok_line_no(tok), fmt, ap2);
     }
 #endif
     verror_at(f->name, f->contents, tok_line_no(tok), tok->loc, fmt, ap);
@@ -1103,10 +1123,15 @@ static char *skip_block_comment(char *p)
     for (; *p; p++)
     {
         if (*p == '\n')
+        {
             ctx->tok_line_no++;
+            ctx->at_bol = true;
+        }
         if (p[0] == '*' && p[1] == '/')
             return p + 2;
     }
+    // p points to the NUL terminator; count_lines in error_at will scan from
+    // contents to p to derive the correct line number.
     error_at(p, "unclosed block comment");
 }
 
@@ -1169,7 +1194,10 @@ static inline __attribute__((always_inline)) Token *new_token(TokenKind kind, ch
     tok->len = end - start;
     tok->next = NULL;
     tok->tag = 0;
-    tok->line_no = ctx->tok_line_no + ctx->current_file->line_delta;
+    { // Clamped addition to avoid int overflow UB with extreme line directives
+        long long ln = (long long)ctx->tok_line_no + ctx->current_file->line_delta;
+        tok->line_no = ln > INT_MAX ? INT_MAX : (ln < INT_MIN ? INT_MIN : (int)ln);
+    }
     tok->file_idx = ctx->current_file->file_no;
     tok->flags = (ctx->at_bol ? TF_AT_BOL : 0) | (ctx->has_space ? TF_HAS_SPACE : 0);
     tok->shortcut = (uint8_t)*start;
@@ -1423,6 +1451,12 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
         int flag = 0;
         while (IS_DIGIT(*p))
         {
+            if (flag > INT_MAX / 10)
+            {
+                while (IS_DIGIT(*p))
+                    p++; // skip remaining digits
+                break;
+            }
             flag = flag * 10 + (*p - '0');
             p++;
         }
@@ -1444,7 +1478,13 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
     if (new_line > (unsigned long)INT_MAX)
         return NULL; // line number too large for int
 
-    int line_delta = (int)new_line - (directive_line + 1);
+    // Guard against overflow: if directive_line is INT_MAX, directive_line + 1 wraps
+    long long ld = (long long)(int)new_line - ((long long)directive_line + 1);
+    if (ld > INT_MAX)
+        ld = INT_MAX;
+    if (ld < INT_MIN)
+        ld = INT_MIN;
+    int line_delta = (int)ld;
     File *view = new_file_view(filename ? filename : ctx->current_file->name,
                                base_file, line_delta, is_system, *in_system_include);
     ctx->current_file = view;
@@ -1487,7 +1527,7 @@ static char *scan_pp_number(char *p, bool *is_float)
         }
         else if (c == '\'' && ident_char[(unsigned char)p[1]])
         {
-            p++; // C23 digit separator
+            p++; // C23 digit separator — next char consumed by next iteration via ident_char[]
         }
         else
             break;
@@ -1698,7 +1738,11 @@ Token *tokenize_file(char *path)
     if (!fp)
         return NULL;
 
-    fseek(fp, 0, SEEK_END);
+    if (fseek(fp, 0, SEEK_END) != 0)
+    {
+        fclose(fp);
+        return NULL;
+    }
     long raw_size = ftell(fp);
     if (raw_size < 0)
     {
@@ -1706,7 +1750,11 @@ Token *tokenize_file(char *path)
         return NULL;
     }
     size_t size = (size_t)raw_size;
-    fseek(fp, 0, SEEK_SET);
+    if (fseek(fp, 0, SEEK_SET) != 0)
+    {
+        fclose(fp);
+        return NULL;
+    }
 
     char *buf = malloc(size + 1);
     if (!buf)
@@ -1734,6 +1782,8 @@ void tokenizer_teardown(bool full)
     else
         arena_reset(&ctx->main_arena);
     free_file_view_cache();
+    // IMPORTANT: free_file() looks up ctx->filename_intern_map to decide whether
+    // to free f->name. This must happen BEFORE free_filename_intern_map() below.
     if (ctx->input_files)
     {
         for (int i = 0; i < ctx->input_file_count; i++)

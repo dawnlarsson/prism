@@ -233,11 +233,11 @@ typedef struct
 // to eliminate duplicated structural token-walking logic.
 typedef struct
 {
-  Token *tok;        // Current token
-  Token *prev;       // Previous meaningful token
-  int depth;         // Brace depth (updated on { and })
-  int struct_depth;  // Nesting inside struct/union/enum bodies
-  int initial_depth; // Starting depth (break when } would go below this)
+  Token *tok;               // Current token
+  Token *prev;              // Previous meaningful token
+  int depth;                // Brace depth (updated on { and })
+  int struct_depth;         // Nesting inside struct/union/enum bodies
+  int initial_depth;        // Starting depth (break when } would go below this)
   uint64_t struct_at_depth; // Bitset: bit i set = depth i is a struct/union/enum scope
 } TokenWalker;
 
@@ -281,7 +281,7 @@ static int stmt_expr_capacity = 0;   // capacity of stmt_expr_levels array
 // Token emission - user-space buffered output for minimal syscall overhead
 static FILE *out_fp;
 static Token *last_emitted = NULL;
-static uint16_t cached_file_idx = 0xFFFF;
+static int cached_file_idx = -1;
 static File *cached_file = NULL;
 
 static char out_buf[OUT_BUF_SIZE];
@@ -325,7 +325,7 @@ static void reset_transpiler_state(void)
   ctx->at_stmt_start = true;
   control_flow_reset();
   last_emitted = NULL;
-  cached_file_idx = 0xFFFF;
+  cached_file_idx = -1;
   cached_file = NULL;
 }
 
@@ -493,7 +493,9 @@ static inline void out_char(char c)
 
 static inline void out_str(const char *s, int len)
 {
-  if (__builtin_expect(out_buf_pos + len > OUT_BUF_SIZE, 0))
+  if (__builtin_expect(len <= 0, 0))
+    return;
+  if (__builtin_expect((size_t)out_buf_pos + (size_t)len > OUT_BUF_SIZE, 0))
     out_flush();
   if (__builtin_expect(len > OUT_BUF_SIZE, 0))
   {
@@ -644,6 +646,8 @@ static void emit_system_includes(void)
 // Reset system include tracking
 static void system_includes_reset(void)
 {
+  // Clear hashmap first to avoid dangling key pointers
+  // (keys are the same strdup'd pointers stored in system_include_list)
   hashmap_clear(&system_includes);
   if (system_include_list)
   {
@@ -1266,6 +1270,9 @@ static bool walker_next(TokenWalker *w)
         w->depth++;
         if ((unsigned)w->depth < 64)
           w->struct_at_depth |= (1ULL << w->depth);
+        // Depths >= 64 can't be tracked in the bitmask; struct_depth is
+        // still incremented and will be decremented on '}' via the
+        // fallback below.
         w->prev = w->tok;
         w->tok = w->tok->next;
         continue;
@@ -1294,11 +1301,19 @@ static bool walker_next(TokenWalker *w)
       {
         if (w->depth <= w->initial_depth)
           return false; // End of region
-        if ((unsigned)w->depth < 64 && (w->struct_at_depth & (1ULL << w->depth)))
+        if ((unsigned)w->depth < 64)
         {
-          w->struct_at_depth &= ~(1ULL << w->depth);
-          if (w->struct_depth > 0)
-            w->struct_depth--;
+          if (w->struct_at_depth & (1ULL << w->depth))
+          {
+            w->struct_at_depth &= ~(1ULL << w->depth);
+            if (w->struct_depth > 0)
+              w->struct_depth--;
+          }
+        }
+        else if (w->struct_depth > 0)
+        {
+          // Depth >= 64: bitmask can't track, conservatively decrement
+          w->struct_depth--;
         }
         w->depth--;
       }
@@ -1312,11 +1327,19 @@ static bool walker_next(TokenWalker *w)
       {
         if (w->depth <= w->initial_depth)
           return false;
-        if ((unsigned)w->depth < 64 && (w->struct_at_depth & (1ULL << w->depth)))
+        if ((unsigned)w->depth < 64)
         {
-          w->struct_at_depth &= ~(1ULL << w->depth);
-          if (w->struct_depth > 0)
-            w->struct_depth--;
+          if (w->struct_at_depth & (1ULL << w->depth))
+          {
+            w->struct_at_depth &= ~(1ULL << w->depth);
+            if (w->struct_depth > 0)
+              w->struct_depth--;
+          }
+        }
+        else if (w->struct_depth > 0)
+        {
+          // Depth >= 64: bitmask can't track, conservatively decrement
+          w->struct_depth--;
         }
         w->depth--;
       }
@@ -3557,6 +3580,9 @@ static inline void track_generic_paren(Token *tok)
 
 // Scan ahead for 'orelse' at depth 0 in a bare expression.
 // Returns the orelse token, or NULL if not found before ';' or unbalanced close.
+// Note: This does NOT stop at commas — in a bare expression context,
+// commas are part of the C comma operator, not declarator separators.
+// Multi-declarator orelse is handled separately by process_declarators.
 static Token *find_bare_orelse(Token *tok)
 {
   int depth = 0;
@@ -3993,8 +4019,7 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
     ctx->error_jmp_set = false;
     result.status = PRISM_ERR_SYNTAX;
     result.error_msg = strdup(ctx->error_msg[0] ? ctx->error_msg : "Unknown error");
-    if (!result.error_msg)
-      result.error_msg = NULL; // avoid free() on string literal
+    // strdup returning NULL is fine — caller treats NULL error_msg as "unknown"
     result.error_line = ctx->error_line;
     result.error_col = ctx->error_col;
     // Clean up any temp files that were created before the error
@@ -4002,6 +4027,12 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
     {
       remove(ctx->active_temp_output);
       ctx->active_temp_output[0] = '\0';
+    }
+    // Free open_memstream buffer if longjmp fired during transpile_tokens
+    if (ctx->active_membuf)
+    {
+      free(ctx->active_membuf);
+      ctx->active_membuf = NULL;
     }
     // Reset global state to allow future transpilations
     prism_reset();
@@ -4049,10 +4080,13 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
     {
       result.status = PRISM_ERR_IO;
       result.error_msg = strdup("open_memstream failed");
-      tokenizer_teardown(false);
+      prism_reset();
       goto cleanup;
     }
 
+#ifdef PRISM_LIB_MODE
+    ctx->active_membuf = membuf; // Stash for longjmp recovery
+#endif
     if (transpile_tokens(tok, fp))
     {
       result.output = membuf;
@@ -4065,6 +4099,9 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
       result.status = PRISM_ERR_SYNTAX;
       result.error_msg = strdup("Transpilation failed");
     }
+#ifdef PRISM_LIB_MODE
+    ctx->active_membuf = NULL;
+#endif
   }
 
 cleanup:

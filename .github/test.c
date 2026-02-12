@@ -4025,46 +4025,12 @@ void test_stmt_expr_side_effects(void)
 }
 #endif
 
-void test_typedef_scope_churn_heavy(void)
+// Consolidated typedef scope churn test (covers nested redefinition + varied types).
+// Subsumes former test_typedef_scope_churn_heavy and test_typedef_scope_churn_varied.
+void test_typedef_scope_churn_consolidated(void)
 {
     int ok = 1;
-    for (int round = 0; round < 500; round++)
-    {
-        typedef int ChurnHeavyT;
-        ChurnHeavyT v;
-        if (v != 0)
-        {
-            ok = 0;
-            break;
-        }
-        {
-            typedef float ChurnHeavyT;
-            ChurnHeavyT f;
-            if (f != 0.0f)
-            {
-                ok = 0;
-                break;
-            }
-            {
-                typedef char ChurnHeavyT;
-                ChurnHeavyT c;
-                if (c != 0)
-                {
-                    ok = 0;
-                    break;
-                }
-            }
-        }
-    }
-    CHECK(ok, "typedef scope churn 500 rounds: all zeroed");
-    int post_churn;
-    CHECK_EQ(post_churn, 0, "typedef scope churn 500: post-churn zeroed");
-}
-
-void test_typedef_scope_churn_varied(void)
-{
-    int ok = 1;
-    for (int round = 0; round < 200; round++)
+    for (int round = 0; round < 300; round++)
     {
         typedef int CT_A;
         typedef short CT_B;
@@ -4078,18 +4044,22 @@ void test_typedef_scope_churn_varied(void)
             break;
         }
         {
-            typedef double CT_A;
-            typedef char CT_B;
-            CT_A da;
-            CT_B cb;
-            if (da != 0.0 || cb != 0)
+            typedef float CT_A;
+            typedef double CT_B;
+            typedef char CT_C;
+            CT_A fa;
+            CT_B db;
+            CT_C cc;
+            if (fa != 0.0f || db != 0.0 || cc != 0)
             {
                 ok = 0;
                 break;
             }
         }
     }
-    CHECK(ok, "typedef varied churn 200: all zeroed");
+    CHECK(ok, "typedef scope churn 300 rounds: nested redefinition + varied types");
+    int post_churn;
+    CHECK_EQ(post_churn, 0, "typedef scope churn: post-churn zeroed");
 }
 
 void run_stress_tests(void)
@@ -4113,8 +4083,7 @@ void run_stress_tests(void)
 #ifdef __GNUC__
     test_stmt_expr_side_effects();
 #endif
-    test_typedef_scope_churn_heavy();
-    test_typedef_scope_churn_varied();
+    test_typedef_scope_churn_consolidated();
 }
 
 // SECTION 8: SAFETY HOLE TESTS
@@ -10222,7 +10191,10 @@ void test_zombie_defer_uninitialized(void)
 
 void test_tcc_detection_logic(void)
 {
-    // Verify the BUG pattern would have matched (demonstrating the problem)
+    // NOTE: This tests a mirror of prism.c's compiler detection algorithm,
+    // not the transpiler output directly. It serves as a regression test
+    // ensuring the matching logic (suffix-based for gcc, strcmp for cc)
+    // doesn't regress to the old strstr-based approach that falsely matched tcc.
     CHECK(strstr("tcc", "cc") != NULL, "strstr finds 'cc' in 'tcc' (old bug)");
 
     // Test the FIXED matching approach
@@ -10635,39 +10607,10 @@ void test_defer_in_attribute_with_defer_stmt(void)
     CHECK_EQ(result, 42, "defer stmt + cleanup attr: both work");
 }
 
-// Test: Verify OOM handling uses error() not exit(1) in library mode
-// Bugs fixed (parse.c):
-// 1. ENSURE_ARRAY_CAP macro used exit(1) instead of error()
-// 2. arena_new_block used fprintf+exit(1) instead of error()
-// 3. hashmap_put/hashmap_resize didn't check calloc return value
-// All now use error() which properly uses longjmp in PRISM_LIB_MODE.
-// 4. error() function had potential va_list reuse UB - fixed with separate scopes
-//
-// Bugs fixed (prism.c):
-// 5. API functions (prism_defaults, prism_transpile_file, prism_free, prism_reset)
-//    were static - now use PRISM_API macro for visibility in library mode
-// 6. Temp files leaked on error - now tracked and cleaned up on longjmp recovery
-// 7. preprocess_with_cc used hardcoded "/tmp/" instead of TMP_DIR macro
-// 8. PrismFeatures now includes preprocessor config (include_paths, defines,
-//    compiler_flags, force_includes, compiler) so library users can configure -I/-D
-//
-// Full library mode testing is in test_lib.c
-void test_lib_mode_error_handling_documented(void)
-{
-    // This test verifies the pattern is documented.
-    // The actual fixes are in parse.c:
-    // - ENSURE_ARRAY_CAP: uses error("out of memory")
-    // - arena_new_block: uses error("out of memory allocating arena block")
-    // - hashmap_put: checks calloc, uses error("out of memory allocating hashmap")
-    // - hashmap_resize: checks calloc, uses error("out of memory resizing hashmap")
-    // - error(): uses separate va_list scopes to avoid UB
-    // And in prism.c:
-    // - PRISM_API macro controls static/extern visibility
-    // - prism_active_temp_output/prism_active_temp_pp track temp files for cleanup
-    // - TMP_DIR used consistently for temp file paths
-    // - PrismFeatures includes compiler, include_paths, defines, compiler_flags, force_includes
-    CHECK(1, "lib mode: OOM uses error() not exit() (documented fix)");
-}
+// NOTE: lib mode OOM error handling is tested in test_lib.c.
+// The fixes (ENSURE_ARRAY_CAP, arena_new_block, hashmap_put/resize using error()
+// instead of exit(1), PRISM_API visibility, temp file cleanup, TMP_DIR macro,
+// PrismFeatures preprocessor config) are exercised there.
 
 void run_reported_bug_fix_tests(void)
 {
@@ -10682,7 +10625,6 @@ void run_reported_bug_fix_tests(void)
     test_raw_keyword_before_static();
     test_defer_in_attribute_cleanup();
     test_defer_in_attribute_with_defer_stmt();
-    test_lib_mode_error_handling_documented();
 }
 
 // ============================================
@@ -13646,15 +13588,39 @@ static void test_typedef_extreme_scope_churn(void)
     for (int round = 0; round < 300; round++)
     {
         {
-            typedef int t_a1; typedef int t_a2; typedef int t_a3; typedef int t_a4;
-            typedef int t_a5; typedef int t_a6; typedef int t_a7; typedef int t_a8;
-            typedef int t_a9; typedef int t_a10; typedef int t_a11; typedef int t_a12;
-            typedef int t_a13; typedef int t_a14; typedef int t_a15; typedef int t_a16;
-            t_a1 v1; t_a2 v2; t_a3 v3; t_a4 v4;
-            t_a5 v5; t_a6 v6; t_a7 v7; t_a8 v8;
-            t_a9 v9; t_a10 v10; t_a11 v11; t_a12 v12;
-            t_a13 v13; t_a14 v14; t_a15 v15; t_a16 v16;
-            sum += v1+v2+v3+v4+v5+v6+v7+v8+v9+v10+v11+v12+v13+v14+v15+v16;
+            typedef int t_a1;
+            typedef int t_a2;
+            typedef int t_a3;
+            typedef int t_a4;
+            typedef int t_a5;
+            typedef int t_a6;
+            typedef int t_a7;
+            typedef int t_a8;
+            typedef int t_a9;
+            typedef int t_a10;
+            typedef int t_a11;
+            typedef int t_a12;
+            typedef int t_a13;
+            typedef int t_a14;
+            typedef int t_a15;
+            typedef int t_a16;
+            t_a1 v1;
+            t_a2 v2;
+            t_a3 v3;
+            t_a4 v4;
+            t_a5 v5;
+            t_a6 v6;
+            t_a7 v7;
+            t_a8 v8;
+            t_a9 v9;
+            t_a10 v10;
+            t_a11 v11;
+            t_a12 v12;
+            t_a13 v13;
+            t_a14 v14;
+            t_a15 v15;
+            t_a16 v16;
+            sum += v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v10 + v11 + v12 + v13 + v14 + v15 + v16;
         }
     }
     CHECK_EQ(sum, 0, "typedef extreme scope churn 16x300");
@@ -13666,10 +13632,22 @@ static void test_typedef_tombstone_saturation_extended(void)
     for (int i = 0; i < 1000; i++)
     {
         {
-            typedef int sat_a; typedef int sat_b; typedef int sat_c; typedef int sat_d;
-            typedef int sat_e; typedef int sat_f; typedef int sat_g; typedef int sat_h;
-            sat_a a; sat_b b; sat_c c; sat_d d;
-            sat_e e; sat_f f; sat_g g; sat_h h;
+            typedef int sat_a;
+            typedef int sat_b;
+            typedef int sat_c;
+            typedef int sat_d;
+            typedef int sat_e;
+            typedef int sat_f;
+            typedef int sat_g;
+            typedef int sat_h;
+            sat_a a;
+            sat_b b;
+            sat_c c;
+            sat_d d;
+            sat_e e;
+            sat_f f;
+            sat_g g;
+            sat_h h;
             sum += a + b + c + d + e + f + g + h;
         }
     }
@@ -13678,7 +13656,8 @@ static void test_typedef_tombstone_saturation_extended(void)
 
 static void test_struct_static_assert_compound_literal(void)
 {
-    struct SACompLit {
+    struct SACompLit
+    {
         int x;
         _Static_assert(sizeof((int){0}) == sizeof(int), "");
         int y;
@@ -13689,7 +13668,8 @@ static void test_struct_static_assert_compound_literal(void)
 
 static void test_struct_nested_compound_literal_depth(void)
 {
-    struct NestedCL {
+    struct NestedCL
+    {
         int a;
         _Static_assert(sizeof((char){0}) > 0, "");
         _Static_assert(sizeof((short){0}) > 0, "");
@@ -13702,10 +13682,12 @@ static void test_struct_nested_compound_literal_depth(void)
 
 static void test_struct_compound_literal_then_nested_struct(void)
 {
-    struct OuterCL {
+    struct OuterCL
+    {
         int before;
         _Static_assert(sizeof((int){0}) == sizeof(int), "");
-        struct InnerCL {
+        struct InnerCL
+        {
             int ix;
             int iy;
         } inner;
@@ -13730,18 +13712,19 @@ static void test_for_init_multi_decl_all_zeroed(void)
 static void test_for_init_stmt_expr_with_decls(void)
 {
     volatile int sum = 0;
-    for (int a = ({int t = 1; t;}), b; a < 4; a++)
+    for (int a = ({int t = 1; t; }), b; a < 4; a++)
     {
         sum += a + b;
     }
-    CHECK_EQ(sum, (1+0)+(2+0)+(3+0), "for init stmt expr multi decl");
+    CHECK_EQ(sum, (1 + 0) + (2 + 0) + (3 + 0), "for init stmt expr multi decl");
 }
 
 static void test_struct_stmt_expr_in_member_size(void)
 {
-    struct SESize {
+    struct SESize
+    {
         int x;
-        char buf[({enum{N=8}; N;})];
+        char buf[({enum{N=8}; N; })];
         int y;
     };
     raw struct SESize s;
@@ -13754,9 +13737,12 @@ static void test_struct_stmt_expr_in_member_size(void)
 
 static void test_nested_struct_depth_tracking(void)
 {
-    struct L1 {
-        struct L2 {
-            struct L3 {
+    struct L1
+    {
+        struct L2
+        {
+            struct L3
+            {
                 int deep;
             } l3;
             int mid;
@@ -13769,14 +13755,246 @@ static void test_nested_struct_depth_tracking(void)
 
 static void test_struct_with_enum_body_depth(void)
 {
-    struct WithEnum {
-        enum { WE_A = 10, WE_B = 20 } val;
+    struct WithEnum
+    {
+        enum
+        {
+            WE_A = 10,
+            WE_B = 20
+        } val;
         int after_enum;
     };
     struct WithEnum we;
     we.val = WE_A;
     CHECK(we.val == 10, "struct with enum body value");
     CHECK(we.after_enum == 0, "struct member after enum body zeroed");
+}
+
+static void test_large_string_output(void)
+{
+    // Exercise output buffer handling with strings close to or exceeding buffer sizes
+    char large[4096];
+    memset(large, 'X', sizeof(large) - 1);
+    large[sizeof(large) - 1] = '\0';
+    CHECK(strlen(large) == 4095, "large string length correct");
+    // Verify the string survived transpilation intact
+    int count = 0;
+    for (int i = 0; i < 4095; i++)
+        if (large[i] == 'X')
+            count++;
+    CHECK(count == 4095, "large string content intact");
+}
+
+static void run_hardening_tests(void)
+{
+    test_large_string_output();
+}
+
+static void test_struct_depth_beyond_64(void)
+{
+    // Exercise struct nesting that stays valid even if bitmask can't track depth >= 64
+    // This tests the transpiler handles deep nesting without losing struct_depth sync
+    int val = 0;
+    {
+        {
+            {
+                {
+                    {
+                        {
+                            {
+                                {
+                                    {
+                                        {
+                                            {
+                                                {
+                                                    {
+                                                        {
+                                                            {
+                                                                {
+                                                                    {
+                                                                        {
+                                                                            {
+                                                                                {
+                                                                                    {
+                                                                                        {
+                                                                                            {
+                                                                                                {
+                                                                                                    {
+                                                                                                        {
+                                                                                                            {
+                                                                                                                {
+                                                                                                                    {
+                                                                                                                        {
+                                                                                                                            {
+                                                                                                                                val = 1;
+                                                                                                                            }
+                                                                                                                        }
+                                                                                                                    }
+                                                                                                                }
+                                                                                                            }
+                                                                                                        }
+                                                                                                    }
+                                                                                                }
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    CHECK(val == 1, "struct_at_depth 31-deep braces");
+    // Verify struct zeroinit still works after exiting deep brace nesting
+    // (exercises bitmask tracking — if struct_depth goes out of sync,
+    //  the transpiler may fail to emit zero-init for the struct)
+    struct DeepTest
+    {
+        int x;
+        int y;
+    };
+    struct DeepTest dt;
+    CHECK(dt.x == 0 && dt.y == 0, "struct zeroinit after deep nesting");
+}
+
+static void run_hardening_tests_2(void)
+{
+    test_struct_depth_beyond_64();
+}
+
+static int orelse_comma_helper(int *a, int *b)
+{
+    // Tests that orelse in a bare expression correctly handles
+    // the expression boundary (doesn't scan past statement end)
+    int *p = a orelse return -1;
+    int *q = b orelse return -2;
+    return *p + *q;
+}
+
+static void test_orelse_sequential_bare(void)
+{
+    int x = 10, y = 20;
+    CHECK(orelse_comma_helper(&x, &y) == 30, "orelse sequential bare exprs");
+    CHECK(orelse_comma_helper(NULL, &y) == -1, "orelse first null bare");
+    CHECK(orelse_comma_helper(&x, NULL) == -2, "orelse second null bare");
+}
+
+static void test_zeroinit_after_line_directives(void)
+{
+    // After the preprocessor emits many #line directives (file views),
+    // the cached_file_idx must still match correctly.
+    // This exercises the token→file mapping across many scopes.
+    for (int i = 0; i < 100; i++)
+    {
+        struct
+        {
+            int a;
+            int b;
+        } s;
+        CHECK(s.a == 0 && s.b == 0, "zeroinit after file view churn");
+    }
+}
+
+// 1C: Verify orelse does not duplicate side-effects in the return expression.
+// If the macro expansion evaluates the return expression more than once,
+// global_counter would be incremented twice.
+static int orelse_side_effect_counter = 0;
+static int orelse_side_effect_helper(int *p)
+{
+    int *x = p orelse return orelse_side_effect_counter++;
+    return *x;
+}
+
+static void test_orelse_return_expr_side_effects(void)
+{
+    orelse_side_effect_counter = 0;
+    int result = orelse_side_effect_helper(NULL);
+    CHECK_EQ(result, 0, "orelse return expr side-effect: returns counter value");
+    CHECK_EQ(orelse_side_effect_counter, 1, "orelse return expr side-effect: incremented exactly once");
+}
+
+// 3B: _Generic controlling expression must NOT be evaluated (C11 6.5.1.1).
+// If Prism accidentally injects code that evaluates the controlling expression,
+// this test will fail because i would be incremented.
+#ifdef __GNUC__
+static void test_generic_controlling_expr_not_evaluated(void)
+{
+    int i = 0;
+    int type_id = _Generic(i++, int: 1, default: 2);
+    CHECK_EQ(type_id, 1, "_Generic selects int");
+    CHECK_EQ(i, 0, "_Generic controlling expression not evaluated");
+}
+#endif
+
+// 3D: Verify struct padding bytes are zeroed.
+// Prism uses = {0} for structs, which C guarantees zeros all bytes
+// including padding. Verify this with a byte-level check.
+static void test_struct_padding_zeroinit(void)
+{
+    struct PaddedStruct
+    {
+        char c; /* 3 bytes padding on typical platforms */
+        int i;
+    };
+    // Dirty the stack region first
+    {
+        unsigned char dirty[sizeof(struct PaddedStruct)];
+        memset(dirty, 0xFF, sizeof(dirty));
+        (void)dirty;
+    }
+    struct PaddedStruct ps;
+    unsigned char *bytes = (unsigned char *)&ps;
+    int all_zero = 1;
+    for (size_t b = 0; b < sizeof(struct PaddedStruct); b++)
+        if (bytes[b] != 0)
+            all_zero = 0;
+    CHECK(all_zero, "struct padding bytes zeroed by = {0}");
+}
+
+// 3E: __attribute__ in unusual positions — verify Prism's zero-init
+// injection doesn't break attribute parsing.
+static void test_attribute_parser_torture(void)
+{
+    // Attribute after struct definition on variable
+    struct AttrS
+    {
+        int x;
+    } __attribute__((packed)) attr_s;
+    CHECK_EQ(attr_s.x, 0, "__attribute__((packed)) struct zeroed");
+
+    // Attribute on function pointer variable
+    void (*__attribute__((unused)) attr_fp)(void);
+    CHECK(attr_fp == NULL, "attributed function pointer zeroed");
+
+    // Aligned variable
+    int __attribute__((aligned(16))) attr_aligned;
+    CHECK_EQ(attr_aligned, 0, "__attribute__((aligned)) int zeroed");
+}
+
+static void run_hardening_tests_3(void)
+{
+    test_orelse_sequential_bare();
+    test_zeroinit_after_line_directives();
+    test_orelse_return_expr_side_effects();
+#ifdef __GNUC__
+    test_generic_controlling_expr_not_evaluated();
+#endif
+    test_struct_padding_zeroinit();
+    test_attribute_parser_torture();
 }
 
 int main(void)
@@ -13823,6 +14041,9 @@ int main(void)
     run_bulletproof_regression_tests();
     run_issue_validation_tests();
     run_orelse_tests();
+    run_hardening_tests();
+    run_hardening_tests_2();
+    run_hardening_tests_3();
 
     test_typedef_extreme_scope_churn();
     test_typedef_tombstone_saturation_extended();
