@@ -2547,6 +2547,56 @@ void test_typedef_multi_declarator(void)
     CHECK(p == NULL, "multi-declarator typedef ptr zero-init");
 }
 
+void test_typedef_after_braceless_while(void)
+{
+    typedef int NumT;
+    NumT counter = 3;
+    while (counter > 0)
+        counter--;
+    NumT after = counter;
+    CHECK_EQ(after, 0, "typedef after braceless while");
+}
+
+void test_typedef_after_braceless_if_else(void)
+{
+    typedef int FlagT;
+    FlagT x = 1;
+    FlagT y;
+    if (x)
+        y = 100;
+    else
+        y = 200;
+    FlagT z = y;
+    CHECK_EQ(z, 100, "typedef after braceless if-else");
+}
+
+void test_typedef_braceless_nested_control(void)
+{
+    typedef int IdxT;
+    IdxT sum = 0;
+    for (IdxT i = 0; i < 3; i++)
+        if (i > 0)
+            sum += i;
+    IdxT result = sum;
+    CHECK_EQ(result, 3, "typedef braceless nested if in for");
+}
+
+void test_typedef_multi_braceless_sequential(void)
+{
+    typedef int ValT;
+    ValT a = 1;
+    if (a > 0)
+        a = 10;
+    ValT b = a;
+    if (b > 5)
+        b = 20;
+    ValT c = b;
+    while (c > 15)
+        c--;
+    ValT d = c;
+    CHECK_EQ(d, 15, "typedef multi braceless sequential");
+}
+
 void run_typedef_tests(void)
 {
     printf("\n=== TYPEDEF TRACKING TESTS ===\n");
@@ -2560,6 +2610,10 @@ void run_typedef_tests(void)
     test_typedef_block_scoped();
     test_typedef_shadowing();
     test_typedef_multi_declarator();
+    test_typedef_after_braceless_while();
+    test_typedef_after_braceless_if_else();
+    test_typedef_braceless_nested_control();
+    test_typedef_multi_braceless_sequential();
 }
 
 // SECTION 5: EDGE CASES
@@ -2963,6 +3017,117 @@ void test_defer_comma_operator(void)
     CHECK_LOG("1AB", "defer with comma operator");
 }
 
+void test_struct_in_braceless_control(void)
+{
+    int result = 0;
+    struct
+    {
+        int a;
+        int b;
+    } pair;
+    pair.a = 10;
+    pair.b = 20;
+    if (pair.a > 0)
+        result = pair.a + pair.b;
+    CHECK_EQ(result, 30, "struct in braceless control");
+
+    for (int i = 0; i < 1; i++)
+        result = pair.b;
+    CHECK_EQ(result, 20, "struct after braceless for");
+}
+
+void test_defer_across_struct_boundaries(void)
+{
+    log_reset();
+    {
+        struct
+        {
+            int x;
+        } s1;
+        s1.x = 1;
+        defer log_append("outer");
+        {
+            struct
+            {
+                struct
+                {
+                    int y;
+                } inner;
+            } s2;
+            s2.inner.y = 2;
+            defer log_append("inner");
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%d%d", s1.x, s2.inner.y);
+            log_append(buf);
+        }
+    }
+    CHECK_LOG("12innerouter", "defer across struct boundaries");
+}
+
+static void _nested_struct_defer_helper(int val)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "d%d", val);
+    log_append(buf);
+}
+
+void test_nested_struct_union_with_defer(void)
+{
+    log_reset();
+    {
+        struct
+        {
+            struct
+            {
+                union
+                {
+                    int x;
+                    float f;
+                } val;
+                int tag;
+            } inner;
+            int count;
+        } outer;
+        outer.inner.val.x = 99;
+        outer.inner.tag = 1;
+        outer.count = 3;
+        defer _nested_struct_defer_helper(outer.inner.val.x);
+        log_append("body");
+    }
+    CHECK_LOG("bodyd99", "nested struct/union with defer");
+}
+
+void test_deeply_nested_struct_defer_scopes(void)
+{
+    log_reset();
+    {
+        defer log_append("A");
+        struct
+        {
+            struct
+            {
+                struct
+                {
+                    int v;
+                } a;
+            } b;
+        } s;
+        s.b.a.v = 7;
+        {
+            defer log_append("B");
+            struct
+            {
+                int x;
+            } inner;
+            inner.x = s.b.a.v + 1;
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%d", inner.x);
+            log_append(buf);
+        }
+    }
+    CHECK_LOG("8BA", "deeply nested struct defer scopes");
+}
+
 void run_edge_case_tests(void)
 {
     printf("\n=== EDGE CASE TESTS ===\n");
@@ -2973,6 +3138,10 @@ void run_edge_case_tests(void)
     test_func_ptr_array();
     test_ptr_to_array();
     test_defer_compound_literal();
+    test_nested_struct_union_with_defer();
+    test_deeply_nested_struct_defer_scopes();
+    test_struct_in_braceless_control();
+    test_defer_across_struct_boundaries();
 
     test_duffs_device();
     CHECK_LOG("XXXXXEF", "Duff's device with defer");
@@ -9649,6 +9818,54 @@ void test_stmtexpr_nested_loops_break(void)
 }
 #endif
 
+void test_string_escape_sequences_varied(void)
+{
+    const char *s1 = "abc\\def";
+    CHECK(strlen(s1) == 7, "string with backslash-d escape");
+
+    const char *s2 = "hello \"world\" end";
+    CHECK(strlen(s2) == 17, "string with escaped quotes");
+
+    const char *s3 = "\\\\\\\\";
+    CHECK(strlen(s3) == 4, "string with multiple double-backslashes");
+
+    const char *s4 = "line1\nline2\ttab\r\0hidden";
+    CHECK(s4[5] == '\n' && s4[11] == '\t', "string with mixed escapes");
+
+    const char *s5 = "\x41\x42\x43";
+    CHECK(s5[0] == 'A' && s5[1] == 'B' && s5[2] == 'C', "string with hex escapes");
+
+    const char *s6 = "end\\";
+    CHECK(s6[3] == '\\', "string ending with backslash char");
+
+    const char *s7 = "a\\'b";
+    CHECK(s7[1] == '\\' && s7[2] == '\'' && strlen(s7) == 4, "string with backslash-quote");
+}
+
+void test_char_literal_escape_sequences(void)
+{
+    char c1 = '\\';
+    CHECK(c1 == 92, "char literal backslash");
+
+    char c2 = '\'';
+    CHECK(c2 == 39, "char literal escaped single-quote");
+
+    char c3 = '\"';
+    CHECK(c3 == 34, "char literal escaped double-quote");
+
+    char c4 = '\n';
+    CHECK(c4 == 10, "char literal newline");
+
+    char c5 = '\t';
+    CHECK(c5 == 9, "char literal tab");
+
+    char c6 = '\0';
+    CHECK(c6 == 0, "char literal null");
+
+    char c7 = '\x7F';
+    CHECK(c7 == 127, "char literal hex escape");
+}
+
 void run_parsing_edge_case_tests(void)
 {
     printf("\n=== PARSING EDGE CASE TESTS ===\n");
@@ -9666,6 +9883,8 @@ void run_parsing_edge_case_tests(void)
     test_stmtexpr_dowhile_break();
     test_stmtexpr_nested_loops_break();
 #endif
+    test_string_escape_sequences_varied();
+    test_char_literal_escape_sequences();
 }
 
 void run_verification_bug_tests(void)

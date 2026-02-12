@@ -51,7 +51,7 @@
 
 #define KEYWORD_HASH(key, len)                                         \
     (((unsigned)(len) * 2 + (unsigned char)(key)[0] * 99 +             \
-      (unsigned char)(key)[1] * 125 +                                  \
+      (unsigned char)((len) > 1 ? (key)[1] : (key)[0]) * 125 +         \
       (unsigned char)((len) > 6 ? (key)[6] : (key)[(len) - 1]) * 69) & \
      255)
 
@@ -353,6 +353,7 @@ static void arena_ensure(Arena *arena, size_t size)
         arena->current->next->used + size <= arena->current->next->capacity)
     {
         arena->current = arena->current->next;
+        arena->current->used = 0;
         return;
     }
     size_t block_size = arena->default_block_size ? arena->default_block_size : ARENA_DEFAULT_BLOCK_SIZE;
@@ -685,7 +686,10 @@ static noreturn void error(char *fmt, ...)
     {
         va_list ap;
         va_start(ap, fmt);
-        lib_error_jump(0, fmt, ap);
+        va_list ap_copy;
+        va_copy(ap_copy, ap);
+        va_end(ap);
+        lib_error_jump(0, fmt, ap_copy);
     }
 #endif
     va_list ap;
@@ -735,7 +739,12 @@ noreturn void error_at(char *loc, char *fmt, ...)
     va_start(ap, fmt);
 #ifdef PRISM_LIB_MODE
     if (ctx->error_jmp_set)
-        lib_error_jump(count_lines(ctx->current_file->contents, loc), fmt, ap);
+    {
+        va_list ap_copy;
+        va_copy(ap_copy, ap);
+        va_end(ap);
+        lib_error_jump(count_lines(ctx->current_file->contents, loc), fmt, ap_copy);
+    }
 #endif
     verror_at(ctx->current_file->name, ctx->current_file->contents, count_lines(ctx->current_file->contents, loc), loc, fmt, ap);
     va_end(ap);
@@ -749,7 +758,12 @@ noreturn void error_tok(Token *tok, const char *fmt, ...)
     File *f = tok_file(tok);
 #ifdef PRISM_LIB_MODE
     if (ctx->error_jmp_set)
-        lib_error_jump(tok_line_no(tok), fmt, ap);
+    {
+        va_list ap_copy;
+        va_copy(ap_copy, ap);
+        va_end(ap);
+        lib_error_jump(tok_line_no(tok), fmt, ap_copy);
+    }
 #endif
     verror_at(f->name, f->contents, tok_line_no(tok), tok->loc, fmt, ap);
     va_end(ap);
@@ -1112,7 +1126,11 @@ static char *string_literal_end(char *p)
         if (*p == '\0')
             error_at(p, "unclosed string literal");
         if (*p == '\\')
+        {
             p++;
+            if (*p == '\0')
+                error_at(p, "unclosed string literal");
+        }
     }
     return p;
 }
@@ -1192,7 +1210,11 @@ static Token *read_char_literal(char *start, char *quote)
         if (*p == '\n' || *p == '\0')
             error_at(p, "unclosed char literal");
         if (*p == '\\')
+        {
             p++;
+            if (*p == '\0')
+                error_at(p, "unclosed char literal");
+        }
     }
     return new_token(TK_NUM, start, p + 1);
 }
@@ -1384,11 +1406,18 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
                 p++;
             p++;
         }
-        int len = p - start;
-        filename = malloc(len + 1);
+        int raw_len = p - start;
+        filename = malloc(raw_len + 1);
         if (!filename)
             error("out of memory");
-        memcpy(filename, start, len);
+        // Unescape backslash sequences in the filename
+        int len = 0;
+        for (char *s = start; s < start + raw_len; s++)
+        {
+            if (*s == '\\' && s + 1 < start + raw_len)
+                s++;
+            filename[len++] = *s;
+        }
         filename[len] = '\0';
         if (*p == '"')
             p++;

@@ -3980,7 +3980,7 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
     result.status = PRISM_ERR_SYNTAX;
     result.error_msg = strdup(ctx->error_msg[0] ? ctx->error_msg : "Unknown error");
     if (!result.error_msg)
-      result.error_msg = (char *)"out of memory during error reporting";
+      result.error_msg = NULL; // avoid free() on string literal
     result.error_line = ctx->error_line;
     result.error_col = ctx->error_col;
     // Clean up any temp files that were created before the error
