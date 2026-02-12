@@ -14186,7 +14186,10 @@ static void test_vla_typedef_complex_size(void)
     CHECK_EQ(arr3[0], 300, "vla typedef with parens");
 }
 
-typedef struct { int x, y; } OrelseVec2;
+typedef struct
+{
+    int x, y;
+} OrelseVec2;
 static OrelseVec2 make_vec2(int set) { return (OrelseVec2){set, set * 2}; }
 
 static int orelse_struct_val_helper(int set)
@@ -14203,7 +14206,7 @@ static void test_orelse_struct_val(void)
 
 static OrelseVec2 orelse_struct_fallback_helper(int set)
 {
-    OrelseVec2 v = make_vec2(set) orelse (OrelseVec2){99, 99};
+    OrelseVec2 v = make_vec2(set) orelse(OrelseVec2){99, 99};
     return v;
 }
 
@@ -14219,7 +14222,11 @@ static void test_orelse_struct_fallback(void)
 
 static void orelse_struct_block_helper(int set, int *out)
 {
-    OrelseVec2 v = make_vec2(set) orelse { *out = -1; return; };
+    OrelseVec2 v = make_vec2(set) orelse
+    {
+        *out = -1;
+        return;
+    };
     *out = v.x + v.y;
 }
 
@@ -14239,25 +14246,49 @@ static void test_goto_stress_many_targets(void)
 
     {
         defer result += 100;
-        if (path == 1) goto gs_t1;
-        if (path == 2) goto gs_t2;
-        if (path == 3) goto gs_t3;
-        if (path == 4) goto gs_t4;
-        if (path == 5) goto gs_t5;
-        if (path == 6) goto gs_t6;
-        if (path == 7) goto gs_t7;
-        if (path == 8) goto gs_t8;
+        if (path == 1)
+            goto gs_t1;
+        if (path == 2)
+            goto gs_t2;
+        if (path == 3)
+            goto gs_t3;
+        if (path == 4)
+            goto gs_t4;
+        if (path == 5)
+            goto gs_t5;
+        if (path == 6)
+            goto gs_t6;
+        if (path == 7)
+            goto gs_t7;
+        if (path == 8)
+            goto gs_t8;
         result = 999;
     }
     goto gs_done;
-gs_t1: result += 1; goto gs_done;
-gs_t2: result += 2; goto gs_done;
-gs_t3: result += 3; goto gs_done;
-gs_t4: result += 4; goto gs_done;
-gs_t5: result += 5; goto gs_done;
-gs_t6: result += 6; goto gs_done;
-gs_t7: result += 7; goto gs_done;
-gs_t8: result += 8; goto gs_done;
+gs_t1:
+    result += 1;
+    goto gs_done;
+gs_t2:
+    result += 2;
+    goto gs_done;
+gs_t3:
+    result += 3;
+    goto gs_done;
+gs_t4:
+    result += 4;
+    goto gs_done;
+gs_t5:
+    result += 5;
+    goto gs_done;
+gs_t6:
+    result += 6;
+    goto gs_done;
+gs_t7:
+    result += 7;
+    goto gs_done;
+gs_t8:
+    result += 8;
+    goto gs_done;
 gs_done:
     CHECK_EQ(result, 107, "goto stress many targets with defer");
 }
@@ -14270,9 +14301,12 @@ static void test_goto_converging_defers(void)
         defer log_append("Z");
         {
             defer log_append("Y");
-            if (sel == 1) goto gc_out;
-            if (sel == 2) goto gc_out;
-            if (sel == 3) goto gc_out;
+            if (sel == 1)
+                goto gc_out;
+            if (sel == 2)
+                goto gc_out;
+            if (sel == 3)
+                goto gc_out;
             log_append("X");
         }
     }
@@ -14285,25 +14319,41 @@ static void test_switch_raw_var_in_body(void)
 {
     int result = 0;
     int x = 2;
-    switch (x) {
+    switch (x)
+    {
         raw int y;
-        case 1: y = 10; result = y; break;
-        case 2: y = 20; result = y; break;
-        default: y = 30; result = y; break;
+    case 1:
+        y = 10;
+        result = y;
+        break;
+    case 2:
+        y = 20;
+        result = y;
+        break;
+    default:
+        y = 30;
+        result = y;
+        break;
     }
     CHECK_EQ(result, 20, "switch raw var in body");
 }
 
 static void test_stack_aggregate_zeroinit(void)
 {
-    struct { int a; long b; char c[32]; void *d; } compound;
+    struct
+    {
+        int a;
+        long b;
+        char c[32];
+        void *d;
+    } compound;
     CHECK_EQ(compound.a, 0, "compound struct a zeroed");
     CHECK_EQ(compound.b, 0, "compound struct b zeroed");
     CHECK_EQ(compound.c[0], 0, "compound struct c zeroed");
     CHECK(compound.d == NULL, "compound struct d zeroed");
 }
 
-static void _safe_noop(void) { }
+static void _safe_noop(void) {}
 static void (*volatile _indirect_fn_ptr)(void) = _safe_noop;
 
 static void test_defer_with_indirect_call(void)
@@ -14315,6 +14365,93 @@ static void test_defer_with_indirect_call(void)
         log_append("X");
     }
     CHECK_LOG("XD", "defer with indirect call");
+}
+
+struct _PadS { char c; int i; };
+
+static struct _PadS _make_pad_struct(int set)
+{
+    union { struct _PadS s; unsigned char b[sizeof(struct _PadS)]; } u;
+    memset(u.b, 0xFF, sizeof(u.b));
+    u.s.c = (char)set;
+    u.s.i = set;
+    return u.s;
+}
+
+static int _pad_orelse_return_helper(int set)
+{
+    struct _PadS p = _make_pad_struct(set) orelse return -1;
+    return p.c + p.i;
+}
+
+static struct _PadS _pad_orelse_fallback_helper(int set)
+{
+    struct _PadS p = _make_pad_struct(set) orelse (struct _PadS){42, 42};
+    return p;
+}
+
+static void test_struct_padding_orelse_return(void)
+{
+    CHECK_EQ(_pad_orelse_return_helper(5), 10, "padded struct orelse return non-zero");
+    CHECK_EQ(_pad_orelse_return_helper(0), -1, "padded struct orelse return zero");
+}
+
+static void test_struct_padding_orelse_fallback(void)
+{
+    struct _PadS a = _pad_orelse_fallback_helper(3);
+    CHECK_EQ(a.c, 3, "padded struct orelse fb non-zero c");
+    CHECK_EQ(a.i, 3, "padded struct orelse fb non-zero i");
+    struct _PadS b = _pad_orelse_fallback_helper(0);
+    CHECK_EQ(b.c, 42, "padded struct orelse fb zero c");
+    CHECK_EQ(b.i, 42, "padded struct orelse fb zero i");
+}
+
+static void test_vla_size_side_effect(void)
+{
+    int n = 5;
+    int vla[n++];
+    (void)vla;
+    CHECK_EQ(n, 6, "VLA size expr evaluated once");
+}
+
+static void test_multi_ptr_zeroinit(void)
+{
+    int *p1;
+    int **p2;
+    int ***p3;
+    int ****p4;
+    CHECK(p1 == NULL, "1-ptr zeroinit");
+    CHECK(p2 == NULL, "2-ptr zeroinit");
+    CHECK(p3 == NULL, "3-ptr zeroinit");
+    CHECK(p4 == NULL, "4-ptr zeroinit");
+}
+
+static void test_typedef_scope_after_braceless(void)
+{
+    typedef int _BST;
+    _BST x;
+    CHECK_EQ(x, 0, "typedef before braceless");
+    if (1)
+    {
+        typedef float _BST;
+        _BST f;
+        (void)f;
+    }
+    _BST y;
+    CHECK_EQ(y, 0, "typedef restored after scope");
+}
+
+static int _const_orelse_value(int v)
+{
+    return v;
+}
+
+static void test_const_orelse_scalar_fallback(void)
+{
+    const int a = _const_orelse_value(5) orelse 42;
+    CHECK_EQ(a, 5, "const orelse scalar: non-zero kept");
+    const int b = _const_orelse_value(0) orelse 42;
+    CHECK_EQ(b, 42, "const orelse scalar: zero uses fallback");
 }
 
 int main(void)
@@ -14396,6 +14533,12 @@ int main(void)
     test_switch_raw_var_in_body();
     test_stack_aggregate_zeroinit();
     test_defer_with_indirect_call();
+    test_struct_padding_orelse_return();
+    test_struct_padding_orelse_fallback();
+    test_vla_size_side_effect();
+    test_multi_ptr_zeroinit();
+    test_typedef_scope_after_braceless();
+    test_const_orelse_scalar_fallback();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

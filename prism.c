@@ -2104,6 +2104,7 @@ static DeclResult parse_declarator(Token *tok, bool emit)
       r.is_const = false; // Reset: const after a new '*' applies to this pointer level
       if (++ptr_depth > 256)
       {
+        warn_tok(tok, "pointer depth exceeds 256; zero-initialization skipped for this declaration");
         r.end = NULL;
         return r;
       }
@@ -2410,6 +2411,92 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
       {
         if (ctrl.for_init)
           error_tok(tok, "orelse cannot be used in for-loop initializers");
+
+        bool has_const_qual = type->has_const || decl.is_const;
+        bool is_struct_val = (type->is_struct || type->is_typedef) && !decl.is_pointer && !decl.is_array;
+
+        // Peek at action after 'orelse' to detect fallback (non-control-flow) orelse
+        Token *peek_action = tok->next;
+        bool is_orelse_fallback = peek_action &&
+            !(peek_action->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
+            !equal(peek_action, "{") && !equal(peek_action, ";");
+
+        // const + fallback orelse: use GNU ternary ?: to avoid reassigning const variable
+        if (has_const_qual && is_orelse_fallback)
+        {
+          if (is_struct_val)
+            error_tok(tok, "orelse fallback on const struct is not supported; "
+                           "use a control flow action (return/break/goto) or remove const");
+
+          // Already emitted: "const T x = val"
+          // Emit: " ?: fallback;" so result is "const T x = val ?: fallback;"
+          OUT_LIT(" ?:");
+
+          register_decl_shadows(decl.var_name, effective_vla);
+          tok = tok->next; // skip 'orelse'
+
+          // Find boundary comma for multi-declarator
+          Token *stop_comma = NULL;
+          {
+            int sd = 0;
+            for (Token *t = tok; t->kind != TK_EOF; t = t->next)
+            {
+              if (t->flags & TF_OPEN)
+                sd++;
+              else if (t->flags & TF_CLOSE)
+                sd--;
+              else if (sd == 0 && equal(t, ","))
+              {
+                stop_comma = t;
+                break;
+              }
+              else if (sd == 0 && equal(t, ";"))
+                break;
+            }
+          }
+
+          // Emit fallback expression tokens
+          int fdepth = 0;
+          while (tok->kind != TK_EOF)
+          {
+            if (tok->flags & TF_OPEN)
+              fdepth++;
+            else if (tok->flags & TF_CLOSE)
+              fdepth--;
+            else if (fdepth == 0 && (equal(tok, ";") || (stop_comma && tok == stop_comma)))
+              break;
+            emit_tok(tok);
+            tok = tok->next;
+          }
+          out_char(';');
+
+          emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile);
+          typeof_var_count = 0;
+
+          if (equal(tok, ";"))
+            tok = tok->next;
+          end_statement_after_semicolon();
+
+          // Handle remaining declarators after comma
+          if (stop_comma && equal(tok, ","))
+          {
+            tok = tok->next;
+            for (Token *t = type_start; t != type->end; t = t->next)
+            {
+              if (equal(t, "{"))
+              {
+                t = skip_balanced(t, '{', '}');
+                if (t == type->end)
+                  break;
+              }
+              emit_tok(t);
+            }
+            continue;
+          }
+          free(typeof_vars);
+          return tok;
+        }
+
         out_char(';');
 
         emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile);
@@ -2810,7 +2897,9 @@ static inline void orelse_open(Token *var_name, bool is_struct_value)
   {
     if (is_struct_value)
     {
-      OUT_LIT(" if (__builtin_memcmp(&");
+      OUT_LIT(" __builtin_clear_padding(&");
+      out_str(var_name->loc, var_name->len);
+      OUT_LIT("); if (__builtin_memcmp(&");
       out_str(var_name->loc, var_name->len);
       OUT_LIT(", &(__typeof__(");
       out_str(var_name->loc, var_name->len);
@@ -2838,7 +2927,9 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
     {
       if (is_struct_value)
       {
-        OUT_LIT(" if (__builtin_memcmp(&");
+        OUT_LIT(" __builtin_clear_padding(&");
+        out_str(var_name->loc, var_name->len);
+        OUT_LIT("); if (__builtin_memcmp(&");
         out_str(var_name->loc, var_name->len);
         OUT_LIT(", &(__typeof__(");
         out_str(var_name->loc, var_name->len);
@@ -2995,7 +3086,9 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
     error_tok(tok, "orelse fallback cannot reassign a const-qualified variable");
   if (is_struct_value)
   {
-    OUT_LIT(" if (__builtin_memcmp(&");
+    OUT_LIT(" __builtin_clear_padding(&");
+    out_str(var_name->loc, var_name->len);
+    OUT_LIT("); if (__builtin_memcmp(&");
     out_str(var_name->loc, var_name->len);
     OUT_LIT(", &(__typeof__(");
     out_str(var_name->loc, var_name->len);
