@@ -440,6 +440,8 @@ static Token *skip_gnu_attributes(Token *tok)
 // Skip a single C23 [[ ... ]] attribute. Assumes tok is at first '['.
 static Token *skip_c23_attr(Token *tok)
 {
+  if (!tok->next || !tok->next->next)
+    return tok->next ? tok->next : tok;
   tok = tok->next->next; // skip [[
   int depth = 1;
   while (tok && tok->kind != TK_EOF && depth > 0)
@@ -1761,7 +1763,10 @@ static bool scan_for_vla(Token *tok, const char *open, const char *close)
     else if (!open && (equal(tok, "(") || equal(tok, "{")))
       depth++;
     else if (!open && (equal(tok, ")") || equal(tok, "}")))
-      depth--;
+    {
+      if (depth > 0)
+        depth--;
+    }
     else if (equal(tok, "[") && depth >= 1 && array_size_is_vla(tok))
       return true;
     tok = tok->next;
@@ -3858,7 +3863,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
         if (ctrl.pending)
           track_ctrl_semicolon();
         if (!ctrl.pending)
-          ctx->at_stmt_start = true;
+          end_statement_after_semicolon();
         if (ctx->defer_depth == 0)
           next_func_returns_void = false;
         emit_tok(tok);
@@ -4029,6 +4034,12 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
       ctx->active_temp_output[0] = '\0';
     }
     // Free open_memstream buffer if longjmp fired during transpile_tokens
+    // Close out_fp first since it references the membuf (open_memstream FILE)
+    if (out_fp)
+    {
+      fclose(out_fp);
+      out_fp = NULL;
+    }
     if (ctx->active_membuf)
     {
       free(ctx->active_membuf);
@@ -4073,9 +4084,14 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
   }
 
   {
-    char *membuf = NULL;
     size_t memlen = 0;
+#ifdef PRISM_LIB_MODE
+    ctx->active_membuf = NULL;
+    FILE *fp = open_memstream(&ctx->active_membuf, &memlen);
+#else
+    char *membuf = NULL;
     FILE *fp = open_memstream(&membuf, &memlen);
+#endif
     if (!fp)
     {
       result.status = PRISM_ERR_IO;
@@ -4084,18 +4100,23 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
       goto cleanup;
     }
 
-#ifdef PRISM_LIB_MODE
-    ctx->active_membuf = membuf; // Stash for longjmp recovery
-#endif
     if (transpile_tokens(tok, fp))
     {
+#ifdef PRISM_LIB_MODE
+      result.output = ctx->active_membuf;
+#else
       result.output = membuf;
+#endif
       result.output_len = memlen;
       result.status = PRISM_OK;
     }
     else
     {
+#ifdef PRISM_LIB_MODE
+      free(ctx->active_membuf);
+#else
       free(membuf);
+#endif
       result.status = PRISM_ERR_SYNTAX;
       result.error_msg = strdup("Transpilation failed");
     }

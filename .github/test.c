@@ -13997,6 +13997,195 @@ static void run_hardening_tests_3(void)
     test_attribute_parser_torture();
 }
 
+// VLA detection with nested delimiters and expression complexity
+static void test_vla_nested_delimiter_depth(void)
+{
+    int n = 4;
+    // VLA inside nested parenthesized expression
+    int a1[(n)];
+    a1[0] = 10;
+    CHECK_EQ(a1[0], 10, "vla with parens around size");
+
+    // VLA with deeper nesting
+    int a2[((n + 1))];
+    a2[0] = 20;
+    CHECK_EQ(a2[0], 20, "vla with double-parens around size");
+
+    // VLA with mixed braces in surrounding context
+    {
+        int a3[n + 0];
+        a3[0] = 30;
+        CHECK_EQ(a3[0], 30, "vla inside nested braces");
+    }
+
+    // VLA after complex expression with parens and commas
+    int m = (n > 0 ? n : 1);
+    int a4[m];
+    a4[0] = 40;
+    CHECK_EQ(a4[0], 40, "vla from ternary result");
+}
+
+// Typedef tracking survives semicolons outside control flow
+static void test_typedef_survives_bare_semicolons(void)
+{
+    typedef int MyT;
+    MyT x;
+    CHECK_EQ(x, 0, "typedef before bare semicolons");
+
+    ;
+    ; // bare semicolons (empty statements)
+
+    MyT y;
+    CHECK_EQ(y, 0, "typedef after bare semicolons");
+
+    for (int i = 0; i < 1; i++)
+    {
+        MyT z;
+        CHECK_EQ(z, 0, "typedef inside for after bare semicolons");
+    }
+
+    MyT w;
+    CHECK_EQ(w, 0, "typedef after for with bare semicolons");
+}
+
+// for-init typedef shadow cleanup across all semicolons
+static void test_for_init_typedef_shadow_cleanup(void)
+{
+    typedef int T;
+    T before;
+    CHECK_EQ(before, 0, "T works before for-init shadow");
+
+    for (int T = 0; T < 1; T++)
+    {
+        // T shadows the typedef here
+        int copy = T;
+        CHECK_EQ(copy, 0, "for-init shadow T is variable");
+    }
+
+    // T should be typedef again after the for loop
+    T after;
+    CHECK_EQ(after, 0, "T is typedef again after for");
+
+    // Nested for with typedef shadow
+    for (int T = 0; T < 1; T++)
+    {
+        for (int j = 0; j < 1; j++)
+        {
+            int inner = T + j;
+            CHECK_EQ(inner, 0, "nested for-init shadow");
+        }
+    }
+    T final;
+    CHECK_EQ(final, 0, "T restored after nested for");
+}
+
+// orelse with comma operator in expression context
+static int *orelse_comma_passthru(int *p) { return p; }
+
+static int orelse_comma_fn_null(int *p)
+{
+    int *q = orelse_comma_passthru(p) orelse return -1;
+    return *q;
+}
+
+static int orelse_comma_fn_nonnull(int *p)
+{
+    int *q = orelse_comma_passthru(p) orelse return -1;
+    return *q + 1;
+}
+
+static void test_orelse_comma_operator_expr(void)
+{
+    int fallback = 77;
+    CHECK_EQ(orelse_comma_fn_null(NULL), -1, "orelse comma: null triggers return");
+    CHECK_EQ(orelse_comma_fn_nonnull(&fallback), 78, "orelse comma: non-null passes through");
+}
+
+// Multiple sequential orelse in same function
+static int orelse_comma_seq_a(int *p)
+{
+    int *q = p orelse return -1;
+    return *q;
+}
+static int orelse_comma_seq_b(int *a, int *b)
+{
+    int *x = a orelse return -1;
+    int *y = b orelse return -2;
+    return *x + *y;
+}
+
+static void test_orelse_sequential_comma(void)
+{
+    int a = 10, b = 20;
+    CHECK_EQ(orelse_comma_seq_a(&a), 10, "orelse seq: non-null");
+    CHECK_EQ(orelse_comma_seq_a(NULL), -1, "orelse seq: null");
+    CHECK_EQ(orelse_comma_seq_b(&a, &b), 30, "orelse seq: both non-null");
+    CHECK_EQ(orelse_comma_seq_b(NULL, &b), -1, "orelse seq: first null");
+    CHECK_EQ(orelse_comma_seq_b(&a, NULL), -2, "orelse seq: second null");
+}
+
+// Short keyword tokens exercising tokenizer lookup
+static void test_short_keyword_recognition(void)
+{
+    // All short C keywords: if, do, for, int, ...
+    // Verify they parse correctly in various positions
+    int x;
+    CHECK_EQ(x, 0, "int keyword recognized");
+
+    if (1)
+    {
+        x = 1;
+    }
+    CHECK_EQ(x, 1, "if keyword recognized");
+
+    do
+    {
+        x = 2;
+    } while (0);
+    CHECK_EQ(x, 2, "do keyword recognized");
+
+    for (int i = 0; i < 1; i++)
+    {
+        x = 3;
+    }
+    CHECK_EQ(x, 3, "for keyword recognized");
+}
+
+#if __STDC_VERSION__ >= 202311L
+static void test_c23_attr_positions(void)
+{
+    [[maybe_unused]] int c23_a;
+    CHECK_EQ(c23_a, 0, "c23 attr: maybe_unused int");
+
+    [[deprecated("old")]] int c23_b;
+    CHECK_EQ(c23_b, 0, "c23 attr: deprecated zeroed");
+
+    [[maybe_unused]] int c23_c;
+    CHECK_EQ(c23_c, 0, "c23 attr: second maybe_unused zeroed");
+}
+#endif
+
+// VLA typedef with various array size expressions
+static void test_vla_typedef_complex_size(void)
+{
+    int n = 3;
+    typedef int VArr[n];
+    VArr arr;
+    arr[0] = 100;
+    CHECK_EQ(arr[0], 100, "vla typedef basic");
+
+    typedef int VArr2[n + 1];
+    VArr2 arr2;
+    arr2[0] = 200;
+    CHECK_EQ(arr2[0], 200, "vla typedef with addition");
+
+    // VLA typedef with parens around expression
+    typedef int VArr3[(n)];
+    VArr3 arr3;
+    arr3[0] = 300;
+    CHECK_EQ(arr3[0], 300, "vla typedef with parens");
+}
+
 int main(void)
 {
     printf("=== PRISM TEST SUITE ===\n");
@@ -14057,6 +14246,17 @@ int main(void)
 #endif
     test_nested_struct_depth_tracking();
     test_struct_with_enum_body_depth();
+
+    test_vla_nested_delimiter_depth();
+    test_typedef_survives_bare_semicolons();
+    test_for_init_typedef_shadow_cleanup();
+    test_orelse_comma_operator_expr();
+    test_orelse_sequential_comma();
+    test_short_keyword_recognition();
+#if __STDC_VERSION__ >= 202311L
+    test_c23_attr_positions();
+#endif
+    test_vla_typedef_complex_size();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

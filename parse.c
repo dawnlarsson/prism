@@ -49,11 +49,8 @@
                                                                                                             : equal_n(tok, s, __builtin_strlen(s))) \
                              : equal_n(tok, s, strlen(s)))
 
-#define KEYWORD_HASH(key, len)                                                                  \
-    (((unsigned)(len) * 2 + (unsigned char)(key)[0] * 99 +                                      \
-      (unsigned char)((len) > 1 ? (key)[1] : (key)[0]) * 125 +                                  \
-      (unsigned char)((len) > 6 ? (key)[6] : ((len) > 0 ? (key)[(len) - 1] : (key)[0])) * 69) & \
-     255)
+#define KEYWORD_HASH(key, len) \
+    ((len) == 0 ? 0 : (((unsigned)(len) * 2 + (unsigned char)(key)[0] * 99 + (unsigned char)((len) > 1 ? (key)[1] : (key)[0]) * 125 + (unsigned char)((len) > 6 ? (key)[6] : (key)[(len) - 1]) * 69) & 255))
 
 // Uses error() for OOM to support PRISM_LIB_MODE longjmp recovery
 #define ENSURE_ARRAY_CAP(arr, count, cap, init_cap, T)                                                   \
@@ -612,7 +609,8 @@ static char *intern_filename(const char *name)
     char *interned = malloc(len + 1);
     if (!interned)
         error("out of memory");
-    memcpy(interned, name, len + 1);
+    memcpy(interned, name, len);
+    interned[len] = '\0';
     hashmap_put(&ctx->filename_intern_map, interned, len, interned);
     return interned;
 }
@@ -670,13 +668,12 @@ static inline File *tok_file(Token *tok)
 static int tok_line_no(Token *tok) { return tok->line_no; }
 
 // Error handling
-// Note: va_list scoping is intentional to avoid undefined behavior when
-// PRISM_LIB_MODE is defined but ctx->error_jmp_set is false.
+// In PRISM_LIB_MODE, errors format into ctx->error_msg, call va_end in the
+// same function as va_start (per C11 §7.16.1), then longjmp to recovery.
 #ifdef PRISM_LIB_MODE
-static noreturn void lib_error_jump(int line, const char *fmt, va_list ap)
+static noreturn void lib_error_jump(int line)
 {
     ctx->error_line = line;
-    vsnprintf(ctx->error_msg, sizeof(ctx->error_msg), fmt, ap);
     longjmp(ctx->error_jmp, 1);
 }
 #endif
@@ -688,10 +685,9 @@ static noreturn void error(char *fmt, ...)
     {
         va_list ap;
         va_start(ap, fmt);
-        va_list ap2;
-        va_copy(ap2, ap);
+        vsnprintf(ctx->error_msg, sizeof(ctx->error_msg), fmt, ap);
         va_end(ap);
-        lib_error_jump(0, fmt, ap2);
+        lib_error_jump(0);
     }
 #endif
     va_list ap;
@@ -742,13 +738,10 @@ noreturn void error_at(char *loc, char *fmt, ...)
 #ifdef PRISM_LIB_MODE
     if (ctx->error_jmp_set)
     {
-        va_list ap2;
-        va_copy(ap2, ap);
+        int line = ctx->current_file ? count_lines(ctx->current_file->contents, loc) : 0;
+        vsnprintf(ctx->error_msg, sizeof(ctx->error_msg), fmt, ap);
         va_end(ap);
-        if (ctx->current_file)
-            lib_error_jump(count_lines(ctx->current_file->contents, loc), fmt, ap2);
-        else
-            lib_error_jump(0, fmt, ap2);
+        lib_error_jump(line);
     }
 #endif
     if (ctx->current_file)
@@ -770,10 +763,9 @@ noreturn void error_tok(Token *tok, const char *fmt, ...)
 #ifdef PRISM_LIB_MODE
     if (ctx->error_jmp_set)
     {
-        va_list ap2;
-        va_copy(ap2, ap);
+        vsnprintf(ctx->error_msg, sizeof(ctx->error_msg), fmt, ap);
         va_end(ap);
-        lib_error_jump(tok_line_no(tok), fmt, ap2);
+        lib_error_jump(tok_line_no(tok));
     }
 #endif
     verror_at(f->name, f->contents, tok_line_no(tok), tok->loc, fmt, ap);
