@@ -145,11 +145,19 @@ typedef struct
   bool is_struct;        // true if this scope is a struct/union/enum body
 } DeferScope;
 
+// Result of goto skip analysis — both defer and decl checked in a single walk
+typedef struct
+{
+  Token *skipped_defer;
+  Token *skipped_decl;
+} GotoSkipResult;
+
 typedef struct
 {
   char *name;
   int name_len;
   int scope_depth;
+  Token *tok; // Token pointer for the label
 } LabelInfo;
 
 typedef struct
@@ -241,13 +249,6 @@ typedef struct
   uint64_t struct_at_depth; // Bitset: bit i set = depth i is a struct/union/enum scope
 } TokenWalker;
 
-// Result of goto skip analysis — both defer and decl checked in a single walk
-typedef struct
-{
-  Token *skipped_defer;
-  Token *skipped_decl;
-} GotoSkipResult;
-
 // Declarator parsing result
 typedef struct
 {
@@ -298,7 +299,7 @@ static bool is_type_keyword(Token *tok);
 static void typedef_pop_scope(int scope_depth);
 static TypeSpecResult parse_type_specifier(Token *tok);
 static Token *emit_expr_to_semicolon(Token *tok);
-static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma);
+static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma, bool is_struct_value);
 static Token *try_zero_init_decl(Token *tok);
 
 static inline void control_flow_reset(void) { ctrl = (ControlFlow){0}; }
@@ -1008,13 +1009,14 @@ static bool has_defers_for(DeferEmitMode mode, int stop_depth)
   return false;
 }
 
-static void label_table_add(char *name, int name_len, int scope_depth)
+static void label_table_add(char *name, int name_len, int scope_depth, Token *tok)
 {
   ENSURE_ARRAY_CAP(label_table.labels, label_table.count + 1, label_table.capacity, INITIAL_ARRAY_CAP, LabelInfo);
   LabelInfo *info = &label_table.labels[label_table.count++];
   info->name = name;
   info->name_len = name_len;
   info->scope_depth = scope_depth;
+  info->tok = tok;
   // Store scope_depth + 1 so 0 (NULL) means "not found"
   hashmap_put(&label_table.name_map, name, name_len, (void *)(intptr_t)(scope_depth + 1));
 }
@@ -1444,7 +1446,7 @@ static void scan_labels_in_function(Token *tok)
   {
     Token *label = walker_check_label(&w);
     if (label)
-      label_table_add(label->loc, label->len, w.depth);
+      label_table_add(label->loc, label->len, w.depth, label);
     walker_advance(&w);
   }
 }
@@ -2446,7 +2448,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
           }
         }
 
-        tok = emit_orelse_action(tok, decl.var_name, type->has_const || decl.is_const, stop_comma);
+        bool is_struct_value = (type->is_struct || type->is_typedef) && !decl.is_pointer && !decl.is_array;
+        tok = emit_orelse_action(tok, decl.var_name, type->has_const || decl.is_const, stop_comma, is_struct_value);
 
         // Continue processing remaining declarators after comma
         if (stop_comma && equal(tok, ","))
@@ -2801,28 +2804,54 @@ static Token *emit_return_body(Token *tok)
 // For declaration orelse: var_name is the variable, has_const from type/decl.
 // For bare expression orelse: var_name is NULL (condition already emitted).
 // Calls end_statement_after_semicolon() internally for non-block cases.
-static inline void orelse_open(Token *var_name)
+static inline void orelse_open(Token *var_name, bool is_struct_value)
 {
   if (var_name)
   {
-    OUT_LIT(" if (!");
-    out_str(var_name->loc, var_name->len);
-    OUT_LIT(") {");
+    if (is_struct_value)
+    {
+      OUT_LIT(" if (__builtin_memcmp(&");
+      out_str(var_name->loc, var_name->len);
+      OUT_LIT(", &(__typeof__(");
+      out_str(var_name->loc, var_name->len);
+      OUT_LIT(")){0}, sizeof(");
+      out_str(var_name->loc, var_name->len);
+      OUT_LIT(")) == 0) {");
+    }
+    else
+    {
+      OUT_LIT(" if (!");
+      out_str(var_name->loc, var_name->len);
+      OUT_LIT(") {");
+    }
   }
   else
     OUT_LIT(" {");
 }
 
-static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma)
+static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma, bool is_struct_value)
 {
   // Block orelse: '{' handled by caller
   if (equal(tok, "{"))
   {
     if (var_name)
     {
-      OUT_LIT(" if (!");
-      out_str(var_name->loc, var_name->len);
-      out_char(')');
+      if (is_struct_value)
+      {
+        OUT_LIT(" if (__builtin_memcmp(&");
+        out_str(var_name->loc, var_name->len);
+        OUT_LIT(", &(__typeof__(");
+        out_str(var_name->loc, var_name->len);
+        OUT_LIT(")){0}, sizeof(");
+        out_str(var_name->loc, var_name->len);
+        OUT_LIT(")) == 0)");
+      }
+      else
+      {
+        OUT_LIT(" if (!");
+        out_str(var_name->loc, var_name->len);
+        out_char(')');
+      }
     }
     ctx->at_stmt_start = false;
     return tok;
@@ -2833,7 +2862,7 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
   {
     mark_switch_control_exit();
     tok = tok->next;
-    orelse_open(var_name);
+    orelse_open(var_name, is_struct_value);
     if (stop_comma)
     {
       // Multi-declarator context: emit return body stopping at the declarator comma
@@ -2919,7 +2948,7 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
   {
     bool is_break = tok->tag & TT_BREAK;
     mark_switch_control_exit();
-    orelse_open(var_name);
+    orelse_open(var_name, is_struct_value);
     if (FEAT(F_DEFER) && control_flow_has_defers(is_break))
       emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
     out_char(' ');
@@ -2936,7 +2965,7 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
   if (tok->tag & TT_GOTO)
   {
     mark_switch_control_exit();
-    orelse_open(var_name);
+    orelse_open(var_name, is_struct_value);
     tok = tok->next;
     if (FEAT(F_DEFER) && is_identifier_like(tok))
     {
@@ -2964,9 +2993,22 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
     error_tok(tok, "orelse fallback requires an assignment target (use a declaration)");
   if (has_const)
     error_tok(tok, "orelse fallback cannot reassign a const-qualified variable");
-  OUT_LIT(" if (!");
-  out_str(var_name->loc, var_name->len);
-  OUT_LIT(") ");
+  if (is_struct_value)
+  {
+    OUT_LIT(" if (__builtin_memcmp(&");
+    out_str(var_name->loc, var_name->len);
+    OUT_LIT(", &(__typeof__(");
+    out_str(var_name->loc, var_name->len);
+    OUT_LIT(")){0}, sizeof(");
+    out_str(var_name->loc, var_name->len);
+    OUT_LIT(")) == 0) ");
+  }
+  else
+  {
+    OUT_LIT(" if (!");
+    out_str(var_name->loc, var_name->len);
+    OUT_LIT(") ");
+  }
   out_str(var_name->loc, var_name->len);
   OUT_LIT(" =");
   int fdepth = 0;
@@ -3729,7 +3771,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
           if (equal(tok, ";"))
             error_tok(tok, "expected statement after 'orelse'");
 
-          tok = emit_orelse_action(tok, NULL, false, NULL);
+          tok = emit_orelse_action(tok, NULL, false, NULL, false);
           continue;
         }
       }

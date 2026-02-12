@@ -14186,6 +14186,137 @@ static void test_vla_typedef_complex_size(void)
     CHECK_EQ(arr3[0], 300, "vla typedef with parens");
 }
 
+typedef struct { int x, y; } OrelseVec2;
+static OrelseVec2 make_vec2(int set) { return (OrelseVec2){set, set * 2}; }
+
+static int orelse_struct_val_helper(int set)
+{
+    OrelseVec2 v = make_vec2(set) orelse return -1;
+    return v.x + v.y;
+}
+
+static void test_orelse_struct_val(void)
+{
+    CHECK_EQ(orelse_struct_val_helper(5), 15, "orelse struct val non-zero");
+    CHECK_EQ(orelse_struct_val_helper(0), -1, "orelse struct val zero triggers");
+}
+
+static OrelseVec2 orelse_struct_fallback_helper(int set)
+{
+    OrelseVec2 v = make_vec2(set) orelse (OrelseVec2){99, 99};
+    return v;
+}
+
+static void test_orelse_struct_fallback(void)
+{
+    OrelseVec2 a = orelse_struct_fallback_helper(3);
+    CHECK_EQ(a.x, 3, "orelse struct fallback non-zero x");
+    CHECK_EQ(a.y, 6, "orelse struct fallback non-zero y");
+    OrelseVec2 b = orelse_struct_fallback_helper(0);
+    CHECK_EQ(b.x, 99, "orelse struct fallback zero x");
+    CHECK_EQ(b.y, 99, "orelse struct fallback zero y");
+}
+
+static void orelse_struct_block_helper(int set, int *out)
+{
+    OrelseVec2 v = make_vec2(set) orelse { *out = -1; return; };
+    *out = v.x + v.y;
+}
+
+static void test_orelse_struct_block(void)
+{
+    int r;
+    orelse_struct_block_helper(4, &r);
+    CHECK_EQ(r, 12, "orelse struct block non-zero");
+    orelse_struct_block_helper(0, &r);
+    CHECK_EQ(r, -1, "orelse struct block zero triggers");
+}
+
+static void test_goto_stress_many_targets(void)
+{
+    int result = 0;
+    int path = 7;
+
+    {
+        defer result += 100;
+        if (path == 1) goto gs_t1;
+        if (path == 2) goto gs_t2;
+        if (path == 3) goto gs_t3;
+        if (path == 4) goto gs_t4;
+        if (path == 5) goto gs_t5;
+        if (path == 6) goto gs_t6;
+        if (path == 7) goto gs_t7;
+        if (path == 8) goto gs_t8;
+        result = 999;
+    }
+    goto gs_done;
+gs_t1: result += 1; goto gs_done;
+gs_t2: result += 2; goto gs_done;
+gs_t3: result += 3; goto gs_done;
+gs_t4: result += 4; goto gs_done;
+gs_t5: result += 5; goto gs_done;
+gs_t6: result += 6; goto gs_done;
+gs_t7: result += 7; goto gs_done;
+gs_t8: result += 8; goto gs_done;
+gs_done:
+    CHECK_EQ(result, 107, "goto stress many targets with defer");
+}
+
+static void test_goto_converging_defers(void)
+{
+    log_reset();
+    int sel = 2;
+    {
+        defer log_append("Z");
+        {
+            defer log_append("Y");
+            if (sel == 1) goto gc_out;
+            if (sel == 2) goto gc_out;
+            if (sel == 3) goto gc_out;
+            log_append("X");
+        }
+    }
+gc_out:
+    log_append("E");
+    CHECK_LOG("YZE", "goto converging defers");
+}
+
+static void test_switch_raw_var_in_body(void)
+{
+    int result = 0;
+    int x = 2;
+    switch (x) {
+        raw int y;
+        case 1: y = 10; result = y; break;
+        case 2: y = 20; result = y; break;
+        default: y = 30; result = y; break;
+    }
+    CHECK_EQ(result, 20, "switch raw var in body");
+}
+
+static void test_stack_aggregate_zeroinit(void)
+{
+    struct { int a; long b; char c[32]; void *d; } compound;
+    CHECK_EQ(compound.a, 0, "compound struct a zeroed");
+    CHECK_EQ(compound.b, 0, "compound struct b zeroed");
+    CHECK_EQ(compound.c[0], 0, "compound struct c zeroed");
+    CHECK(compound.d == NULL, "compound struct d zeroed");
+}
+
+static void _safe_noop(void) { }
+static void (*volatile _indirect_fn_ptr)(void) = _safe_noop;
+
+static void test_defer_with_indirect_call(void)
+{
+    log_reset();
+    {
+        defer log_append("D");
+        _indirect_fn_ptr();
+        log_append("X");
+    }
+    CHECK_LOG("XD", "defer with indirect call");
+}
+
 int main(void)
 {
     printf("=== PRISM TEST SUITE ===\n");
@@ -14257,6 +14388,14 @@ int main(void)
     test_c23_attr_positions();
 #endif
     test_vla_typedef_complex_size();
+    test_orelse_struct_val();
+    test_orelse_struct_fallback();
+    test_orelse_struct_block();
+    test_goto_stress_many_targets();
+    test_goto_converging_defers();
+    test_switch_raw_var_in_body();
+    test_stack_aggregate_zeroinit();
+    test_defer_with_indirect_call();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);
