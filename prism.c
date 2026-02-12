@@ -2241,11 +2241,22 @@ static bool is_var_declaration(Token *type_end)
     return false;
 
   // Statement expression initializer: type name = ({...})
-  // Must NOT be handled by zero-init — the stmt expr may contain defer etc.
+  // For single-declarator stmt-expr decls, the main loop handles scope/defer processing.
+  // For multi-declarator decls (e.g. int a = ({...}), b;), we still need to process
+  // subsequent declarators for zero-init, so skip past the stmt-expr and check for ',' or ';'.
   if (equal(decl.end, "="))
   {
     Token *after_eq = decl.end->next;
-    return !(after_eq && equal(after_eq, "(") && after_eq->next && equal(after_eq->next, "{"));
+    if (after_eq && equal(after_eq, "(") && after_eq->next && equal(after_eq->next, "{"))
+    {
+      // Skip past the balanced (...) of the statement expression
+      Token *after_stmt_expr = skip_balanced(after_eq, '(', ')');
+      // Skip trailing attributes
+      while (after_stmt_expr && after_stmt_expr->kind != TK_EOF && (after_stmt_expr->tag & TT_ATTR))
+        after_stmt_expr = skip_gnu_attributes(after_stmt_expr);
+      return equal(after_stmt_expr, ",");
+    }
+    return true; // Regular initializer (not stmt expr)
   }
 
   return equal(decl.end, ",") || equal(decl.end, ";");
