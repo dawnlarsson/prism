@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.113.0"
+#define PRISM_VERSION "0.114.0"
 
 #ifdef _WIN32
 #define PRISM_DEFAULT_CC "cl"
@@ -297,6 +297,7 @@ static void typedef_pop_scope(int scope_depth);
 static TypeSpecResult parse_type_specifier(Token *tok);
 static Token *emit_expr_to_semicolon(Token *tok);
 static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma);
+static Token *try_zero_init_decl(Token *tok);
 
 static inline void control_flow_reset(void) { ctrl = (ControlFlow){0}; }
 static void walker_init(TokenWalker *w, Token *start, int initial_depth)
@@ -898,6 +899,61 @@ static void emit_range(Token *start, Token *end)
     emit_tok(t);
 }
 
+// Emit a deferred token range with feature processing (zero-init, raw, orelse).
+// Unlike emit_range, this processes tokens through the transpilation pipeline
+// so that Prism features work correctly inside defer blocks.
+static void emit_deferred_range(Token *start, Token *end)
+{
+  bool saved_stmt_start = ctx->at_stmt_start;
+  ControlFlow saved_ctrl = ctrl;
+  ctrl = (ControlFlow){0};
+
+  // Determine initial stmt_start based on whether body is braced
+  ctx->at_stmt_start = true;
+
+  for (Token *t = start; t && t != end && t->kind != TK_EOF;)
+  {
+    // Zero-init / raw / orelse at statement start
+    if (ctx->at_stmt_start && FEAT(F_ZEROINIT))
+    {
+      Token *next = try_zero_init_decl(t);
+      if (next)
+      {
+        t = next;
+        ctx->at_stmt_start = true;
+        continue;
+      }
+    }
+    ctx->at_stmt_start = false;
+
+    // Track structural tokens for statement boundaries
+    if (t->tag & TT_STRUCTURAL)
+    {
+      if (match_ch(t, '{') || match_ch(t, '}'))
+      {
+        emit_tok(t);
+        t = t->next;
+        ctx->at_stmt_start = true;
+        continue;
+      }
+      char c = t->loc[0];
+      if (c == ';' || c == ':')
+      {
+        emit_tok(t);
+        t = t->next;
+        ctx->at_stmt_start = true;
+        continue;
+      }
+    }
+
+    emit_tok(t);
+    t = t->next;
+  }
+
+  ctx->at_stmt_start = saved_stmt_start;
+  ctrl = saved_ctrl;
+}
+
 static void emit_defers_ex(DeferEmitMode mode, int stop_depth)
 {
   if (ctx->defer_depth <= 0)
@@ -914,7 +970,7 @@ static void emit_defers_ex(DeferEmitMode mode, int stop_depth)
     for (int i = scope->count - 1; i >= 0; i--)
     {
       out_char(' ');
-      emit_range(scope->entries[i].stmt, scope->entries[i].end);
+      emit_deferred_range(scope->entries[i].stmt, scope->entries[i].end);
       out_char(';');
     }
 
@@ -2324,10 +2380,17 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
           int sd = 0;
           for (Token *t = tok; t->kind != TK_EOF; t = t->next)
           {
-            if (t->flags & TF_OPEN) sd++;
-            else if (t->flags & TF_CLOSE) sd--;
-            else if (sd == 0 && equal(t, ",")) { stop_comma = t; break; }
-            else if (sd == 0 && equal(t, ";")) break;
+            if (t->flags & TF_OPEN)
+              sd++;
+            else if (t->flags & TF_CLOSE)
+              sd--;
+            else if (sd == 0 && equal(t, ","))
+            {
+              stop_comma = t;
+              break;
+            }
+            else if (sd == 0 && equal(t, ";"))
+              break;
           }
         }
 
@@ -2337,8 +2400,18 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
         if (stop_comma && equal(tok, ","))
         {
           tok = tok->next; // skip comma
-          // Re-emit the type specifier for the next declarator
-          emit_range(type_start, type->end);
+          // Re-emit the type specifier, skipping struct/union/enum bodies
+          // to avoid redefinition errors (e.g. enum constant redeclaration)
+          for (Token *t = type_start; t != type->end; t = t->next)
+          {
+            if (equal(t, "{"))
+            {
+              t = skip_balanced(t, '{', '}');
+              if (t == type->end)
+                break;
+            }
+            emit_tok(t);
+          }
           continue;
         }
         free(typeof_vars);
@@ -2733,9 +2806,12 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
           int rd = 0;
           while (tok->kind != TK_EOF && tok != stop_comma)
           {
-            if (tok->flags & TF_OPEN) rd++;
-            else if (tok->flags & TF_CLOSE) rd--;
-            else if (rd == 0 && equal(tok, ";")) break;
+            if (tok->flags & TF_OPEN)
+              rd++;
+            else if (tok->flags & TF_CLOSE)
+              rd--;
+            else if (rd == 0 && equal(tok, ";"))
+              break;
             emit_tok(tok);
             tok = tok->next;
           }
@@ -2760,9 +2836,12 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
           int rd = 0;
           while (tok->kind != TK_EOF && tok != stop_comma)
           {
-            if (tok->flags & TF_OPEN) rd++;
-            else if (tok->flags & TF_CLOSE) rd--;
-            else if (rd == 0 && equal(tok, ";")) break;
+            if (tok->flags & TF_OPEN)
+              rd++;
+            else if (tok->flags & TF_CLOSE)
+              rd--;
+            else if (rd == 0 && equal(tok, ";"))
+              break;
             emit_tok(tok);
             tok = tok->next;
           }

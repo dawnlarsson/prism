@@ -279,6 +279,37 @@ void test_defer_compound_stmt(void)
     CHECK_LOG("1ABE", "defer compound statement");
 }
 
+// Regression: zero-init was not applied inside deferred blocks (emit_range bypass)
+void test_defer_zeroinit_inside(void)
+{
+    int result = -1;
+    {
+        defer { int x; result = x; };
+    }
+    CHECK_EQ(result, 0, "defer zeroinit: variable inside defer block");
+}
+
+void test_defer_zeroinit_struct_inside(void)
+{
+    struct _dzi { int a; int b; };
+    struct _dzi result = {-1, -1};
+    {
+        defer { struct _dzi s; result = s; };
+    }
+    CHECK_EQ(result.a, 0, "defer zeroinit struct: a");
+    CHECK_EQ(result.b, 0, "defer zeroinit struct: b");
+}
+
+void test_defer_raw_inside(void)
+{
+    volatile int result = -1;
+    {
+        // 'raw' keyword inside defer should suppress zero-init
+        defer { raw int sentinel = 42; result = sentinel; };
+    }
+    CHECK_EQ(result, 42, "defer raw inside: raw suppresses zero-init");
+}
+
 void test_defer_only_body(void)
 {
     // Function body containing only a defer — ensures Prism doesn't
@@ -315,6 +346,9 @@ void run_defer_basic_tests(void)
     CHECK_EQ(ret, 99, "defer nested return value");
 
     test_defer_compound_stmt();
+    test_defer_zeroinit_inside();
+    test_defer_zeroinit_struct_inside();
+    test_defer_raw_inside();
 
     test_defer_only_body();
     CHECK_LOG("D", "defer-only function body");
@@ -13217,6 +13251,57 @@ void test_orelse_fallback_three_decls(void)
     CHECK_EQ(z, 20, "orelse fallback three decls: z declared");
 }
 
+void test_orelse_enum_body_multi_decl(void)
+{
+    enum _OE_tag { _OE_A = 10, _OE_B = 20 } x = 0 orelse _OE_B, y = _OE_A;
+    CHECK_EQ(x, 20, "orelse enum body multi-decl: x gets fallback");
+    CHECK_EQ(y, 10, "orelse enum body multi-decl: y declared");
+}
+
+struct _orelse_struct_body { int v; };
+static struct _orelse_struct_body *_osb_get(struct _orelse_struct_body *p) { return p; }
+
+void test_orelse_struct_body_multi_decl(void)
+{
+    struct _orelse_struct_body a = {42};
+    struct _orelse_struct_body { int v; } *p = _osb_get(&a) orelse return,
+                                          *q = &a;
+    CHECK_EQ(p->v, 42, "orelse struct body multi-decl: p deref");
+    CHECK_EQ(q->v, 42, "orelse struct body multi-decl: q deref");
+}
+
+static int _orelse_defer_multi_decl_helper(int val, int *out)
+{
+    log_reset();
+    defer log_append("D");
+    int x = val orelse return -1, y = 10;
+    *out = x + y;
+    return 0;
+}
+
+void test_orelse_defer_return_multi_decl(void)
+{
+    int out = -1;
+    int r = _orelse_defer_multi_decl_helper(5, &out);
+    CHECK_EQ(r, 0, "orelse defer return multi-decl: non-zero retval");
+    CHECK_EQ(out, 15, "orelse defer return multi-decl: non-zero sum");
+    CHECK_LOG("D", "orelse defer return multi-decl: non-zero defers");
+
+    out = -1;
+    r = _orelse_defer_multi_decl_helper(0, &out);
+    CHECK_EQ(r, -1, "orelse defer return multi-decl: zero retval");
+    CHECK_EQ(out, -1, "orelse defer return multi-decl: zero no side effect");
+    CHECK_LOG("D", "orelse defer return multi-decl: zero defers");
+}
+
+void test_orelse_funcall_multi_decl(void)
+{
+    int a = 42;
+    int *p = get_ptr_or_null(&a) orelse return, *q = &a;
+    CHECK_EQ(*p, 42, "orelse funcall multi-decl: p deref");
+    CHECK_EQ(*q, 42, "orelse funcall multi-decl: q deref");
+}
+
 void run_orelse_tests(void)
 {
     test_orelse_return_null();
@@ -13280,6 +13365,10 @@ void run_orelse_tests(void)
     test_orelse_goto_multi_decl();
     test_orelse_void_return_multi_decl();
     test_orelse_fallback_three_decls();
+    test_orelse_enum_body_multi_decl();
+    test_orelse_struct_body_multi_decl();
+    test_orelse_defer_return_multi_decl();
+    test_orelse_funcall_multi_decl();
 }
 
 int main(void)

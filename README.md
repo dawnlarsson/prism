@@ -5,7 +5,7 @@
 
 Prism is a lightweight and very fast transpiler that makes C safer without changing how you write it.
 
-- **1404 tests** — edge cases, control flow, nightmares, trying hard to break Prism
+- **1435 tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Proper transpiler** — tracks typedefs, respects scope, catches unsafe patterns
 - **Opt-out features** — Disable parts of the transpiler, like zero-init, with CLI flags
@@ -312,7 +312,7 @@ Not:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v0.113.0 - Robust C transpiler
+Prism v0.114.0 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 
