@@ -142,6 +142,7 @@ typedef struct
                          // NOTE: only set on switch scopes (by mark_switch_control_exit)
   bool is_conditional;   // true if this scope is an if/while/for block (for tracking conditional control exits)
   bool seen_case_label;  // true if case/default label seen in this switch scope (for zero-init safety)
+  bool is_struct;        // true if this scope is a struct/union/enum body
 } DeferScope;
 
 typedef struct
@@ -237,6 +238,7 @@ typedef struct
   int depth;         // Brace depth (updated on { and })
   int struct_depth;  // Nesting inside struct/union/enum bodies
   int initial_depth; // Starting depth (break when } would go below this)
+  uint64_t struct_at_depth; // Bitset: bit i set = depth i is a struct/union/enum scope
 } TokenWalker;
 
 // Result of goto skip analysis — both defer and decl checked in a single walk
@@ -679,6 +681,7 @@ static void defer_push_scope(bool consume_flags)
   s->count = 0;
   s->had_control_exit = false;
   s->seen_case_label = false;
+  s->is_struct = false;
   if (consume_flags)
   {
     s->is_loop = ctrl.next_scope & NS_LOOP;
@@ -1261,6 +1264,8 @@ static bool walker_next(TokenWalker *w)
         }
         w->struct_depth++;
         w->depth++;
+        if ((unsigned)w->depth < 64)
+          w->struct_at_depth |= (1ULL << w->depth);
         w->prev = w->tok;
         w->tok = w->tok->next;
         continue;
@@ -1289,8 +1294,12 @@ static bool walker_next(TokenWalker *w)
       {
         if (w->depth <= w->initial_depth)
           return false; // End of region
-        if (w->struct_depth > 0)
-          w->struct_depth--;
+        if ((unsigned)w->depth < 64 && (w->struct_at_depth & (1ULL << w->depth)))
+        {
+          w->struct_at_depth &= ~(1ULL << w->depth);
+          if (w->struct_depth > 0)
+            w->struct_depth--;
+        }
         w->depth--;
       }
     }
@@ -1303,8 +1312,12 @@ static bool walker_next(TokenWalker *w)
       {
         if (w->depth <= w->initial_depth)
           return false;
-        if (w->struct_depth > 0)
-          w->struct_depth--;
+        if ((unsigned)w->depth < 64 && (w->struct_at_depth & (1ULL << w->depth)))
+        {
+          w->struct_at_depth &= ~(1ULL << w->depth);
+          if (w->struct_depth > 0)
+            w->struct_depth--;
+        }
         w->depth--;
       }
     }
@@ -3093,6 +3106,7 @@ static Token *handle_sue_body(Token *tok)
   tok = brace->next;
   ctx->struct_depth++;
   defer_push_scope(false);
+  defer_stack[ctx->defer_depth - 1].is_struct = true;
   ctx->at_stmt_start = true;
   return tok;
 }
@@ -3136,7 +3150,7 @@ static Token *handle_close_brace(Token *tok)
     emit_tok(tok);
     return tok->next;
   }
-  if (ctx->struct_depth > 0)
+  if (ctx->defer_depth > 0 && defer_stack[ctx->defer_depth - 1].is_struct && ctx->struct_depth > 0)
     ctx->struct_depth--;
   typedef_pop_scope(ctx->defer_depth);
   if (FEAT(F_DEFER) && ctx->defer_depth > 0 && defer_stack[ctx->defer_depth - 1].count > 0)
@@ -3524,7 +3538,7 @@ static inline void track_ctrl_paren_close(void)
 
 static inline void track_ctrl_semicolon(void)
 {
-  if (ctrl.paren_depth == 1 && ctrl.for_init)
+  if (ctrl.paren_depth == 1 && ctrl.for_init && ctrl.brace_depth == 0)
     ctrl.for_init = false;
   else if (ctrl.paren_depth == 0)
   {

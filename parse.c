@@ -52,7 +52,7 @@
 #define KEYWORD_HASH(key, len)                                         \
     (((unsigned)(len) * 2 + (unsigned char)(key)[0] * 99 +             \
       (unsigned char)((len) > 1 ? (key)[1] : (key)[0]) * 125 +         \
-      (unsigned char)((len) > 6 ? (key)[6] : (key)[(len) - 1]) * 69) & \
+      (unsigned char)((len) > 6 ? (key)[6] : ((len) > 0 ? (key)[(len) - 1] : (key)[0])) * 69) & \
      255)
 
 // Uses error() for OOM to support PRISM_LIB_MODE longjmp recovery
@@ -350,7 +350,7 @@ static void arena_ensure(Arena *arena, size_t size)
         return;
     // Try reusing the next block in the chain (from a previous arena_reset cycle)
     if (arena->current && arena->current->next &&
-        arena->current->next->used + size <= arena->current->next->capacity)
+        size <= arena->current->next->capacity)
     {
         arena->current = arena->current->next;
         arena->current->used = 0;
@@ -541,7 +541,7 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val)
 
     // Insert into first empty slot
     if (first_empty < 0)
-        return;
+        error("hashmap_put: no empty slot found (internal error)");
 
     HashEntry *ent = &map->buckets[first_empty];
     if (ent->key == TOMBSTONE)
@@ -686,10 +686,7 @@ static noreturn void error(char *fmt, ...)
     {
         va_list ap;
         va_start(ap, fmt);
-        va_list ap_copy;
-        va_copy(ap_copy, ap);
-        va_end(ap);
-        lib_error_jump(0, fmt, ap_copy);
+        lib_error_jump(0, fmt, ap);
     }
 #endif
     va_list ap;
@@ -740,10 +737,7 @@ noreturn void error_at(char *loc, char *fmt, ...)
 #ifdef PRISM_LIB_MODE
     if (ctx->error_jmp_set)
     {
-        va_list ap_copy;
-        va_copy(ap_copy, ap);
-        va_end(ap);
-        lib_error_jump(count_lines(ctx->current_file->contents, loc), fmt, ap_copy);
+        lib_error_jump(count_lines(ctx->current_file->contents, loc), fmt, ap);
     }
 #endif
     verror_at(ctx->current_file->name, ctx->current_file->contents, count_lines(ctx->current_file->contents, loc), loc, fmt, ap);
@@ -759,10 +753,7 @@ noreturn void error_tok(Token *tok, const char *fmt, ...)
 #ifdef PRISM_LIB_MODE
     if (ctx->error_jmp_set)
     {
-        va_list ap_copy;
-        va_copy(ap_copy, ap);
-        va_end(ap);
-        lib_error_jump(tok_line_no(tok), fmt, ap_copy);
+        lib_error_jump(tok_line_no(tok), fmt, ap);
     }
 #endif
     verror_at(f->name, f->contents, tok_line_no(tok), tok->loc, fmt, ap);
@@ -1708,12 +1699,13 @@ Token *tokenize_file(char *path)
         return NULL;
 
     fseek(fp, 0, SEEK_END);
-    long size = ftell(fp);
-    if (size < 0)
+    long raw_size = ftell(fp);
+    if (raw_size < 0)
     {
         fclose(fp);
         return NULL;
     }
+    size_t size = (size_t)raw_size;
     fseek(fp, 0, SEEK_SET);
 
     char *buf = malloc(size + 1);

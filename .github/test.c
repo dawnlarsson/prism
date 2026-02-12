@@ -13640,6 +13640,145 @@ void run_orelse_tests(void)
     test_orelse_funcall_multi_decl();
 }
 
+static void test_typedef_extreme_scope_churn(void)
+{
+    volatile int sum = 0;
+    for (int round = 0; round < 300; round++)
+    {
+        {
+            typedef int t_a1; typedef int t_a2; typedef int t_a3; typedef int t_a4;
+            typedef int t_a5; typedef int t_a6; typedef int t_a7; typedef int t_a8;
+            typedef int t_a9; typedef int t_a10; typedef int t_a11; typedef int t_a12;
+            typedef int t_a13; typedef int t_a14; typedef int t_a15; typedef int t_a16;
+            t_a1 v1; t_a2 v2; t_a3 v3; t_a4 v4;
+            t_a5 v5; t_a6 v6; t_a7 v7; t_a8 v8;
+            t_a9 v9; t_a10 v10; t_a11 v11; t_a12 v12;
+            t_a13 v13; t_a14 v14; t_a15 v15; t_a16 v16;
+            sum += v1+v2+v3+v4+v5+v6+v7+v8+v9+v10+v11+v12+v13+v14+v15+v16;
+        }
+    }
+    CHECK_EQ(sum, 0, "typedef extreme scope churn 16x300");
+}
+
+static void test_typedef_tombstone_saturation_extended(void)
+{
+    volatile int sum = 0;
+    for (int i = 0; i < 1000; i++)
+    {
+        {
+            typedef int sat_a; typedef int sat_b; typedef int sat_c; typedef int sat_d;
+            typedef int sat_e; typedef int sat_f; typedef int sat_g; typedef int sat_h;
+            sat_a a; sat_b b; sat_c c; sat_d d;
+            sat_e e; sat_f f; sat_g g; sat_h h;
+            sum += a + b + c + d + e + f + g + h;
+        }
+    }
+    CHECK_EQ(sum, 0, "typedef tombstone saturation 8x1000");
+}
+
+static void test_struct_static_assert_compound_literal(void)
+{
+    struct SACompLit {
+        int x;
+        _Static_assert(sizeof((int){0}) == sizeof(int), "");
+        int y;
+    };
+    struct SACompLit s;
+    CHECK(s.x == 0 && s.y == 0, "struct member after _Static_assert compound literal");
+}
+
+static void test_struct_nested_compound_literal_depth(void)
+{
+    struct NestedCL {
+        int a;
+        _Static_assert(sizeof((char){0}) > 0, "");
+        _Static_assert(sizeof((short){0}) > 0, "");
+        int b;
+        int c;
+    };
+    struct NestedCL nc;
+    CHECK(nc.a == 0 && nc.b == 0 && nc.c == 0, "struct multiple _Static_assert compound literals");
+}
+
+static void test_struct_compound_literal_then_nested_struct(void)
+{
+    struct OuterCL {
+        int before;
+        _Static_assert(sizeof((int){0}) == sizeof(int), "");
+        struct InnerCL {
+            int ix;
+            int iy;
+        } inner;
+        int after;
+    };
+    struct OuterCL o;
+    CHECK(o.before == 0 && o.inner.ix == 0 && o.inner.iy == 0 && o.after == 0,
+          "struct compound literal then nested struct");
+}
+
+static void test_for_init_multi_decl_all_zeroed(void)
+{
+    volatile int sum = 0;
+    for (int a, b, c; a < 3; a++)
+    {
+        sum += a + b + c;
+    }
+    CHECK_EQ(sum, 3, "for init triple decl all zeroed");
+}
+
+#ifdef __GNUC__
+static void test_for_init_stmt_expr_with_decls(void)
+{
+    volatile int sum = 0;
+    for (int a = ({int t = 1; t;}), b; a < 4; a++)
+    {
+        sum += a + b;
+    }
+    CHECK_EQ(sum, (1+0)+(2+0)+(3+0), "for init stmt expr multi decl");
+}
+
+static void test_struct_stmt_expr_in_member_size(void)
+{
+    struct SESize {
+        int x;
+        char buf[({enum{N=8}; N;})];
+        int y;
+    };
+    raw struct SESize s;
+    memset(&s, 0, sizeof(s));
+    s.x = 10;
+    s.y = 20;
+    CHECK(s.x == 10 && s.y == 20, "struct stmt expr in member array size");
+}
+#endif
+
+static void test_nested_struct_depth_tracking(void)
+{
+    struct L1 {
+        struct L2 {
+            struct L3 {
+                int deep;
+            } l3;
+            int mid;
+        } l2;
+        int top;
+    };
+    struct L1 s;
+    CHECK(s.l2.l3.deep == 0 && s.l2.mid == 0 && s.top == 0, "triple nested struct depth");
+}
+
+static void test_struct_with_enum_body_depth(void)
+{
+    struct WithEnum {
+        enum { WE_A = 10, WE_B = 20 } val;
+        int after_enum;
+    };
+    struct WithEnum we;
+    we.val = WE_A;
+    CHECK(we.val == 10, "struct with enum body value");
+    CHECK(we.after_enum == 0, "struct member after enum body zeroed");
+}
+
 int main(void)
 {
     printf("=== PRISM TEST SUITE ===\n");
@@ -13684,6 +13823,19 @@ int main(void)
     run_bulletproof_regression_tests();
     run_issue_validation_tests();
     run_orelse_tests();
+
+    test_typedef_extreme_scope_churn();
+    test_typedef_tombstone_saturation_extended();
+    test_struct_static_assert_compound_literal();
+    test_struct_nested_compound_literal_depth();
+    test_struct_compound_literal_then_nested_struct();
+    test_for_init_multi_decl_all_zeroed();
+#ifdef __GNUC__
+    test_for_init_stmt_expr_with_decls();
+    test_struct_stmt_expr_in_member_size();
+#endif
+    test_nested_struct_depth_tracking();
+    test_struct_with_enum_body_depth();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);
