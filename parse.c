@@ -296,9 +296,11 @@ typedef struct PrismContext
     bool at_stmt_start;
     int system_include_count;
     unsigned long long ret_counter;
+    void *active_typeof_vars; // process_declarators heap alloc; freed on longjmp recovery
 #ifdef PRISM_LIB_MODE
     char active_temp_output[PATH_MAX];
-    char *active_membuf; // open_memstream buffer; freed on longjmp recovery
+    char *active_membuf;           // open_memstream buffer; freed on longjmp recovery
+    uint32_t keyword_map_features; // features used when keyword_map was built
 #endif
 } PrismContext;
 
@@ -997,6 +999,9 @@ static void init_keyword_map(void)
         }
         keyword_perfect[slot] = (KeywordEntry){entries[i].name, len, val};
     }
+#ifdef PRISM_LIB_MODE
+    ctx->keyword_map_features = ctx->features;
+#endif
 }
 
 // After cc -E, UCNs are resolved. Just handle ASCII + pass through non-ASCII bytes.
@@ -1707,12 +1712,17 @@ static Token *tokenize_buffer(char *name, char *buf)
     if (!buf)
         return NULL;
 
-    // Init keyword map before new_file() takes ownership of buf.
-    // If init_keyword_map() fails (OOM → longjmp in lib mode), buf hasn't
-    // been stored yet, so the caller can still free it. By failing early
-    // here, we avoid leaking buf.
+    // Init keyword map before new_file() takes ownership of buf.\n    // If init_keyword_map() fails (OOM → longjmp in lib mode), buf hasn't\n    // been stored yet, so the caller can still free it. By failing early\n    // here, we avoid leaking buf.
     if (!ctx->keyword_map.capacity)
         init_keyword_map();
+#ifdef PRISM_LIB_MODE
+    // Reinitialize if features changed (e.g., defer toggled between calls)
+    else if (ctx->keyword_map_features != ctx->features)
+    {
+        hashmap_clear(&ctx->keyword_map);
+        init_keyword_map();
+    }
+#endif
 
     File *file = new_file(name, ctx->input_file_count, buf);
     add_input_file(file);
@@ -1725,6 +1735,13 @@ Token *tokenize_file(char *path)
     // Initialize keyword map on first call
     if (!ctx->keyword_map.capacity)
         init_keyword_map();
+#ifdef PRISM_LIB_MODE
+    else if (ctx->keyword_map_features != ctx->features)
+    {
+        hashmap_clear(&ctx->keyword_map);
+        init_keyword_map();
+    }
+#endif
 
     FILE *fp = fopen(path, "r");
     if (!fp)

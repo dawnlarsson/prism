@@ -296,6 +296,7 @@ static int defer_stack_capacity = 0;
 // Forward declarations (only for functions used before their definition)
 static DeclResult parse_declarator(Token *tok, bool emit);
 static bool is_type_keyword(Token *tok);
+static inline bool is_valid_varname(Token *tok);
 static void typedef_pop_scope(int scope_depth);
 static TypeSpecResult parse_type_specifier(Token *tok);
 static Token *emit_expr_to_semicolon(Token *tok);
@@ -1126,7 +1127,7 @@ static void parse_enum_constants(Token *tok, int scope_depth)
   while (tok && tok->kind != TK_EOF && !equal(tok, "}"))
   {
     // Each enum constant is: IDENTIFIER or IDENTIFIER = expr
-    if (tok->kind == TK_IDENT)
+    if (is_valid_varname(tok))
     {
       // Register enum constant - it shadows any typedef with the same name
       // Use typedef_add_enum_const which sets both is_shadow and is_enum_const
@@ -1232,7 +1233,7 @@ static bool is_typedef_like(Token *tok)
 static Token *find_struct_body_brace(Token *tok)
 {
   Token *t = tok->next;
-  while (t && (t->kind == TK_IDENT || (t->tag & (TT_ATTR | TT_QUALIFIER))))
+  while (t && (is_valid_varname(t) || (t->tag & (TT_ATTR | TT_QUALIFIER))))
   {
     if (t->tag & (TT_ATTR | TT_QUALIFIER))
     {
@@ -1560,7 +1561,7 @@ static GotoSkipResult goto_skips_check(Token *goto_tok, char *label_name, int la
           while (t && (equal(t, "*") || (t->tag & TT_QUALIFIER) ||
                        equal(t, "__restrict") || equal(t, "__restrict__")))
             t = t->next;
-          if (t && t->kind == TK_IDENT && t->next && !equal(t->next, "("))
+          if (t && is_valid_varname(t) && t->next && !equal(t->next, "("))
           {
             if (!has_raw && (!active_decl || w.depth <= decl_depth))
             {
@@ -1613,7 +1614,7 @@ static bool is_knr_params(Token *after_paren, Token *brace)
       if (equal(t, "*") || (t->tag & TT_QUALIFIER) ||
           equal(t, "__restrict") || equal(t, "__restrict__"))
         t = t->next;
-      else if (t->kind == TK_IDENT)
+      else if (is_valid_varname(t))
       {
         saw_ident = true;
         t = t->next;
@@ -1680,7 +1681,7 @@ static bool is_void_function_decl(Token *tok)
   tok = skip_func_specifiers(tok);
 
   // Should be at function name followed by (
-  return tok && tok->kind == TK_IDENT && tok->next && equal(tok->next, "(");
+  return tok && is_valid_varname(tok) && tok->next && equal(tok->next, "(");
 }
 
 // Check if an array dimension (from '[' to matching ']') contains a VLA expression.
@@ -1732,7 +1733,7 @@ static bool array_size_is_vla(Token *open_bracket)
       return true;
 
     // Non-constant identifier → VLA
-    if (tok->kind == TK_IDENT && !is_known_enum_const(tok) && !is_type_keyword(tok))
+    if (is_valid_varname(tok) && !is_known_enum_const(tok) && !is_type_keyword(tok))
       return true;
 
     tok = tok->next;
@@ -1797,7 +1798,7 @@ static void parse_typedef_declaration(Token *tok, int scope_depth)
       break;
     }
     // Check for chained typedefs: typedef Void MyVoid;
-    if (t->kind == TK_IDENT && is_known_typedef(t))
+    if (is_identifier_like(t) && is_known_typedef(t))
     {
       int idx = typedef_get_index(t->loc, t->len);
       if (idx >= 0 && typedef_table.entries[idx].is_void)
@@ -1850,10 +1851,10 @@ static bool is_type_keyword(Token *tok)
 }
 
 // Check if token can be used as a variable name in a declarator.
-// Identifiers and prism keywords (raw, defer) which are only special at declaration start.
+// Identifiers and prism keywords (raw, defer, orelse) which are only special at declaration start.
 static inline bool is_valid_varname(Token *tok)
 {
-  return tok->kind == TK_IDENT || equal(tok, "raw") || equal(tok, "defer");
+  return tok->kind == TK_IDENT || equal(tok, "raw") || equal(tok, "defer") || equal(tok, "orelse");
 }
 
 // ============================================================================
@@ -1921,7 +1922,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       tok = skip_balanced(tok, '(', ')');
       if (inner_start && (inner_start->tag & TT_SUE))
         r.is_struct = true;
-      if (inner_start && inner_start->kind == TK_IDENT && is_known_typedef(inner_start))
+      if (inner_start && is_identifier_like(inner_start) && is_known_typedef(inner_start))
         r.is_typedef = true;
       r.end = tok;
       continue;
@@ -1939,7 +1940,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
         if (tok && equal(tok, "("))
           tok = skip_balanced(tok, '(', ')');
       }
-      if (tok && tok->kind == TK_IDENT)
+      if (tok && is_valid_varname(tok))
         tok = tok->next;
       if (tok && equal(tok, "{"))
       {
@@ -1996,7 +1997,7 @@ static TypeSpecResult parse_type_specifier(Token *tok)
       Token *peek = tok->next;
       while (peek && (peek->tag & TT_QUALIFIER))
         peek = peek->next;
-      if (peek && peek->kind == TK_IDENT)
+      if (peek && is_valid_varname(peek))
       {
         Token *after = peek->next;
         if (after && (equal(after, ";") || equal(after, "[") ||
@@ -2344,6 +2345,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
   Token **typeof_vars = NULL;
   int typeof_var_count = 0;
   int typeof_var_cap = 0;
+  ctx->active_typeof_vars = NULL; // Track for longjmp safety
 
   while (tok && tok->kind != TK_EOF)
   {
@@ -2351,6 +2353,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
     if (!decl.end || !decl.var_name)
     {
       free(typeof_vars);
+      ctx->active_typeof_vars = NULL;
       return NULL;
     }
 
@@ -2381,6 +2384,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
     {
       ENSURE_ARRAY_CAP(typeof_vars, typeof_var_count + 1, typeof_var_cap, 8, Token *);
       typeof_vars[typeof_var_count++] = decl.var_name;
+      ctx->active_typeof_vars = typeof_vars; // Update tracking after potential realloc
     }
 
     // Emit initializer if present
@@ -2510,6 +2514,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
             continue;
           }
           free(typeof_vars);
+          ctx->active_typeof_vars = NULL;
           return tok;
         }
 
@@ -2576,6 +2581,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
           continue;
         }
         free(typeof_vars);
+        ctx->active_typeof_vars = NULL;
         return tok;
       }
     }
@@ -2587,6 +2593,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
       emit_tok(tok);
       emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile);
       free(typeof_vars);
+      ctx->active_typeof_vars = NULL;
       return tok->next;
     }
     else if (equal(tok, ","))
@@ -2597,11 +2604,13 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
     else
     {
       free(typeof_vars);
+      ctx->active_typeof_vars = NULL;
       return NULL;
     }
   }
 
   free(typeof_vars);
+  ctx->active_typeof_vars = NULL;
   return NULL;
 }
 
@@ -3931,7 +3940,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
     // start a void function (tagged keywords, or void typedef identifiers)
     if (ctx->defer_depth == 0 &&
         (tag & (TT_TYPE | TT_QUALIFIER | TT_SKIP_DECL | TT_ATTR | TT_INLINE) ||
-         (tok->kind == TK_IDENT && is_void_typedef(tok))) &&
+         (is_identifier_like(tok) && is_void_typedef(tok))) &&
         is_void_function_decl(tok))
       next_func_returns_void = true;
 
@@ -3990,7 +3999,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
         tok = tok->next;
         continue;
       }
-      if (c == ':' && last_emitted && last_emitted->kind == TK_IDENT &&
+      if (c == ':' && last_emitted && is_identifier_like(last_emitted) &&
           ctx->struct_depth == 0 && ctx->defer_depth > 0)
       {
         emit_tok(tok);
@@ -4152,6 +4161,12 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
     {
       remove(ctx->active_temp_output);
       ctx->active_temp_output[0] = '\0';
+    }
+    // Free typeof_vars if longjmp fired inside process_declarators
+    if (ctx->active_typeof_vars)
+    {
+      free(ctx->active_typeof_vars);
+      ctx->active_typeof_vars = NULL;
     }
     // Free open_memstream buffer if longjmp fired during transpile_tokens
     // Close out_fp first since it references the membuf (open_memstream FILE)
