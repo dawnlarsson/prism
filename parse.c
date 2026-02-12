@@ -1557,7 +1557,8 @@ static Token *tokenize(File *file)
             Token *t = cur = cur->next = new_token(TK_NUM, start, p);
             if (is_float)
                 t->flags |= TF_IS_FLOAT;
-            else if (!(start[0] == '0' && (start[1] == 'x' || start[1] == 'X')) &&
+            else if (!(start[0] == '0' && (start[1] == 'x' || start[1] == 'X' ||
+                                           start[1] == 'b' || start[1] == 'B')) &&
                      get_extended_float_suffix(start, t->len, NULL))
                 t->flags |= TF_IS_FLOAT;
             continue;

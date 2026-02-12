@@ -2678,6 +2678,10 @@ static Token *handle_defer_keyword(Token *tok)
                    TT_IF | TT_LOOP | TT_SWITCH | TT_CASE | TT_DEFAULT | TT_DEFER)))
       error_tok(defer_keyword, "defer statement appears to be missing ';' (found '%.*s' keyword inside)",
                 t->len, t->loc);
+    // Nested defer is never valid — catch it at any depth (includes braced blocks)
+    if (!at_top && (t->tag & TT_DEFER) && !is_known_typedef(t) && !equal(t->next, ":") &&
+        !(t->next && (t->next->tag & TT_ASSIGN)))
+      error_tok(defer_keyword, "nested defer is not supported (found 'defer' inside deferred block)");
   }
 
   defer_add(defer_keyword, stmt_start, stmt_end);
@@ -3779,8 +3783,19 @@ static int transpile_tokens(Token *tok, FILE *fp)
         // First check: function definition detection at top level
         if (ctx->defer_depth == 0 && FEAT(F_DEFER))
         {
-          if ((prev_toplevel_tok && equal(prev_toplevel_tok, ")")) ||
-              (last_toplevel_paren && is_knr_params(last_toplevel_paren->next, tok)))
+          bool is_func_def = false;
+          if (prev_toplevel_tok && equal(prev_toplevel_tok, ")"))
+            is_func_def = true;
+          else if (last_toplevel_paren && is_knr_params(last_toplevel_paren->next, tok))
+            is_func_def = true;
+          else if (last_toplevel_paren)
+          {
+            // Check for attributes between ')' and '{' (e.g. C23 [[...]] attrs)
+            Token *after = skip_all_attributes(last_toplevel_paren->next);
+            if (after == tok)
+              is_func_def = true;
+          }
+          if (is_func_def)
           {
             scan_labels_in_function(tok);
             ctx->current_func_returns_void = next_func_returns_void;

@@ -144,6 +144,28 @@ end:
     CHECK_LOG("1CBA2", "defer nested scopes with goto");
 }
 
+// Regression: C23 [[...]] attrs between ')' and '{' broke function detection,
+// causing scan_labels_in_function to be skipped and goto+defer to misbehave.
+static void _c23_attr_goto_helper(void) [[gnu::cold]]
+{
+    log_reset();
+    {
+        defer log_append("D1");
+        {
+            defer log_append("D2");
+            goto c23done;
+        }
+    }
+c23done:
+    log_append("E");
+}
+
+void test_defer_goto_c23_attr(void)
+{
+    _c23_attr_goto_helper();
+    CHECK_LOG("D2D1E", "defer goto with C23 attr on func");
+}
+
 void test_defer_break(void)
 {
     log_reset();
@@ -284,17 +306,29 @@ void test_defer_zeroinit_inside(void)
 {
     int result = -1;
     {
-        defer { int x; result = x; };
+        defer
+        {
+            int x;
+            result = x;
+        };
     }
     CHECK_EQ(result, 0, "defer zeroinit: variable inside defer block");
 }
 
 void test_defer_zeroinit_struct_inside(void)
 {
-    struct _dzi { int a; int b; };
+    struct _dzi
+    {
+        int a;
+        int b;
+    };
     struct _dzi result = {-1, -1};
     {
-        defer { struct _dzi s; result = s; };
+        defer
+        {
+            struct _dzi s;
+            result = s;
+        };
     }
     CHECK_EQ(result.a, 0, "defer zeroinit struct: a");
     CHECK_EQ(result.b, 0, "defer zeroinit struct: b");
@@ -305,7 +339,11 @@ void test_defer_raw_inside(void)
     volatile int result = -1;
     {
         // 'raw' keyword inside defer should suppress zero-init
-        defer { raw int sentinel = 42; result = sentinel; };
+        defer
+        {
+            raw int sentinel = 42;
+            result = sentinel;
+        };
     }
     CHECK_EQ(result, 42, "defer raw inside: raw suppresses zero-init");
 }
@@ -332,6 +370,7 @@ void run_defer_basic_tests(void)
     CHECK_EQ(ret, 42, "defer return value preserved");
 
     test_defer_goto_out();
+    test_defer_goto_c23_attr();
     test_defer_nested_scopes();
     test_defer_break();
     test_defer_continue();
@@ -13253,19 +13292,30 @@ void test_orelse_fallback_three_decls(void)
 
 void test_orelse_enum_body_multi_decl(void)
 {
-    enum _OE_tag { _OE_A = 10, _OE_B = 20 } x = 0 orelse _OE_B, y = _OE_A;
+    enum _OE_tag
+    {
+        _OE_A = 10,
+        _OE_B = 20
+    } x = 0 orelse _OE_B,
+      y = _OE_A;
     CHECK_EQ(x, 20, "orelse enum body multi-decl: x gets fallback");
     CHECK_EQ(y, 10, "orelse enum body multi-decl: y declared");
 }
 
-struct _orelse_struct_body { int v; };
+struct _orelse_struct_body
+{
+    int v;
+};
 static struct _orelse_struct_body *_osb_get(struct _orelse_struct_body *p) { return p; }
 
 void test_orelse_struct_body_multi_decl(void)
 {
     struct _orelse_struct_body a = {42};
-    struct _orelse_struct_body { int v; } *p = _osb_get(&a) orelse return,
-                                          *q = &a;
+    struct _orelse_struct_body
+    {
+        int v;
+    } *p = _osb_get(&a) orelse return,
+      *q = &a;
     CHECK_EQ(p->v, 42, "orelse struct body multi-decl: p deref");
     CHECK_EQ(q->v, 42, "orelse struct body multi-decl: q deref");
 }
