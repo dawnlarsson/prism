@@ -295,7 +295,8 @@ static File *cached_file = NULL;
 
 static char out_buf[OUT_BUF_SIZE];
 static int out_buf_pos = 0;
-static int oe_buf_checkpoint = -1; // Output buffer checkpoint for const+fallback orelse rollback
+static int oe_buf_checkpoint = -1;   // Output buffer checkpoint for const+fallback orelse rollback
+static bool use_linemarkers = false; // true = GCC linemarker "# N", false = C99 "#line N"
 
 static TypedefTable typedef_table;
 
@@ -545,8 +546,11 @@ static void out_uint(unsigned long long v)
 
 static void out_line(int line_no, const char *file)
 {
-  // C99 §6.10.4 standard line directive format
-  OUT_LIT("#line ");
+  if (use_linemarkers) // gcc support
+    OUT_LIT("# ");
+  else
+    OUT_LIT("#line ");
+
   out_uint(line_no);
   OUT_LIT(" \"");
   out_str(file, strlen(file));
@@ -587,8 +591,7 @@ static void collect_system_includes(void)
 // Emit diagnostic pragmas to suppress warnings from system headers.
 static void emit_system_header_diag_push(void)
 {
-  OUT_LIT("#ifdef __GNUC__\n"
-          "#pragma GCC diagnostic push\n"
+  OUT_LIT("#pragma GCC diagnostic push\n"
           "#pragma GCC diagnostic ignored \"-Wredundant-decls\"\n"
           "#pragma GCC diagnostic ignored \"-Wstrict-prototypes\"\n"
           "#pragma GCC diagnostic ignored \"-Wold-style-definition\"\n"
@@ -598,15 +601,12 @@ static void emit_system_header_diag_push(void)
           "#pragma GCC diagnostic ignored \"-Wunused-variable\"\n"
           "#pragma GCC diagnostic ignored \"-Wcast-qual\"\n"
           "#pragma GCC diagnostic ignored \"-Wsign-conversion\"\n"
-          "#pragma GCC diagnostic ignored \"-Wconversion\"\n"
-          "#endif\n");
+          "#pragma GCC diagnostic ignored \"-Wconversion\"\n");
 }
 
 static void emit_system_header_diag_pop(void)
 {
-  OUT_LIT("#ifdef __GNUC__\n"
-          "#pragma GCC diagnostic pop\n"
-          "#endif\n");
+  OUT_LIT("#pragma GCC diagnostic pop\n");
 }
 
 // Emit collected #include directives with necessary feature test macros
@@ -5214,6 +5214,9 @@ static int compile_sources(Cli *cli)
   bool msvc = cc_is_msvc(compiler);
   char temp_exe[PATH_MAX];
   make_run_temp(temp_exe, sizeof(temp_exe), cli->mode);
+
+  // Use GCC linemarker format when -fpreprocessed will be passed to the compiler
+  use_linemarkers = FEAT(F_FLATTEN) && !clang && !msvc;
 
   if (cli->source_count == 1 && !msvc)
   {
