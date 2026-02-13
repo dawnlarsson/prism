@@ -1,9 +1,12 @@
-#define PRISM_VERSION "0.114.0"
+#define PRISM_VERSION "0.115.0"
 
 #ifdef _WIN32
 #define PRISM_DEFAULT_CC "cl"
 #define EXE_SUFFIX ".exe"
-#define INSTALL_PATH "prism.exe"
+#define TMPDIR_ENVVAR "TEMP"
+#define TMPDIR_ENVVAR_ALT "TMP"
+#define TMPDIR_FALLBACK ".\\"
+#define FIND_EXE_CMD "where prism.exe 2>nul"
 #else
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -19,6 +22,11 @@
 #define INSTALL_PATH "/usr/local/bin/prism"
 #define PRISM_DEFAULT_CC "cc"
 #define EXE_SUFFIX ""
+#define TMPDIR_ENVVAR "TMPDIR"
+#define TMPDIR_ENVVAR_ALT NULL
+#define TMPDIR_FALLBACK "/tmp/"
+#define FIND_EXE_CMD "which -a prism 2>/dev/null || command -v prism 2>/dev/null"
+#define stricmp strcasecmp
 #endif
 
 #ifdef PRISM_LIB_MODE
@@ -287,6 +295,7 @@ static File *cached_file = NULL;
 
 static char out_buf[OUT_BUF_SIZE];
 static int out_buf_pos = 0;
+static int oe_buf_checkpoint = -1; // Output buffer checkpoint for const+fallback orelse rollback
 
 static TypedefTable typedef_table;
 
@@ -318,6 +327,8 @@ static void reset_transpiler_state(void)
   ctx->stmt_expr_count = 0;
   ctx->last_line_no = 0;
   ctx->ret_counter = 0;
+  ctx->func_ret_type_start = NULL;
+  ctx->func_ret_type_end = NULL;
   ctx->last_filename = NULL;
   ctx->last_system_header = false;
   ctx->current_func_returns_void = false;
@@ -346,19 +357,14 @@ static uint32_t features_to_bits(PrismFeatures f)
   return (f.defer ? F_DEFER : 0) | (f.zeroinit ? F_ZEROINIT : 0) | (f.line_directives ? F_LINE_DIR : 0) | (f.warn_safety ? F_WARN_SAFETY : 0) | (f.flatten_headers ? F_FLATTEN : 0) | (f.orelse ? F_ORELSE : 0);
 }
 
-// respects $TMPDIR environment variable - Returns path with trailing slash (or empty string on Windows)
+// respects $TMPDIR environment variable - Returns path with trailing slash
 static const char *get_tmp_dir(void)
 {
   static char tmp_buf[PATH_MAX];
-#ifdef _WIN32
-  const char *tmpdir = getenv("TEMP");
-  if (!tmpdir || !tmpdir[0])
-    tmpdir = getenv("TMP");
-  static const char *fallback = ".\\";
-#else
-  const char *tmpdir = getenv("TMPDIR");
-  static const char *fallback = "/tmp/";
-#endif
+  const char *tmpdir = getenv(TMPDIR_ENVVAR);
+  if ((!tmpdir || !tmpdir[0]) && TMPDIR_ENVVAR_ALT)
+    tmpdir = getenv(TMPDIR_ENVVAR_ALT);
+  static const char *fallback = TMPDIR_FALLBACK;
   if (tmpdir && tmpdir[0])
   {
     size_t len = strlen(tmpdir);
@@ -539,8 +545,8 @@ static void out_uint(unsigned long long v)
 
 static void out_line(int line_no, const char *file)
 {
-  // GCC linemarker format: # N "file" (compatible with -fpreprocessed)
-  OUT_LIT("# ");
+  // C99 §6.10.4 standard line directive format
+  OUT_LIT("#line ");
   out_uint(line_no);
   OUT_LIT(" \"");
   out_str(file, strlen(file));
@@ -581,7 +587,8 @@ static void collect_system_includes(void)
 // Emit diagnostic pragmas to suppress warnings from system headers.
 static void emit_system_header_diag_push(void)
 {
-  OUT_LIT("#pragma GCC diagnostic push\n"
+  OUT_LIT("#ifdef __GNUC__\n"
+          "#pragma GCC diagnostic push\n"
           "#pragma GCC diagnostic ignored \"-Wredundant-decls\"\n"
           "#pragma GCC diagnostic ignored \"-Wstrict-prototypes\"\n"
           "#pragma GCC diagnostic ignored \"-Wold-style-definition\"\n"
@@ -591,12 +598,15 @@ static void emit_system_header_diag_push(void)
           "#pragma GCC diagnostic ignored \"-Wunused-variable\"\n"
           "#pragma GCC diagnostic ignored \"-Wcast-qual\"\n"
           "#pragma GCC diagnostic ignored \"-Wsign-conversion\"\n"
-          "#pragma GCC diagnostic ignored \"-Wconversion\"\n");
+          "#pragma GCC diagnostic ignored \"-Wconversion\"\n"
+          "#endif\n");
 }
 
 static void emit_system_header_diag_pop(void)
 {
-  OUT_LIT("#pragma GCC diagnostic pop\n");
+  OUT_LIT("#ifdef __GNUC__\n"
+          "#pragma GCC diagnostic pop\n"
+          "#endif\n");
 }
 
 // Emit collected #include directives with necessary feature test macros
@@ -629,8 +639,10 @@ static void emit_system_includes(void)
   }
 
   // Emit built-in feature test macros (guarded to not override user defines)
-  OUT_LIT("#ifndef _POSIX_C_SOURCE\n#define _POSIX_C_SOURCE 200809L\n#endif\n"
-          "#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n\n");
+  OUT_LIT("#if !defined(_WIN32)\n"
+          "#ifndef _POSIX_C_SOURCE\n#define _POSIX_C_SOURCE 200809L\n#endif\n"
+          "#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n"
+          "#endif\n\n");
 
   emit_system_header_diag_push();
 
@@ -1684,6 +1696,109 @@ static bool is_void_function_decl(Token *tok)
   return tok && is_valid_varname(tok) && tok->next && equal(tok->next, "(");
 }
 
+// Capture the return type of a non-void function declaration.
+// Sets ctx->func_ret_type_start and ctx->func_ret_type_end so that
+// emit_ret_type() can replay the type tokens instead of __auto_type.
+// Returns true if a valid function declaration was recognized.
+static bool try_capture_func_return_type(Token *tok)
+{
+  // Skip storage class specifiers, function specifiers, and attributes.
+  // These are NOT part of the return type for variable declarations.
+  while (tok && tok->kind != TK_EOF)
+  {
+    // Storage class: static, extern, _Thread_local, thread_local
+    if (equal(tok, "static") || equal(tok, "extern") ||
+        equal(tok, "_Thread_local") || equal(tok, "thread_local"))
+    {
+      tok = tok->next;
+      continue;
+    }
+    // Function specifiers: inline variants, noreturn variants
+    if (tok->tag & TT_INLINE)
+    {
+      tok = tok->next;
+      continue;
+    }
+    if (equal(tok, "_Noreturn") || equal(tok, "noreturn"))
+    {
+      tok = tok->next;
+      continue;
+    }
+    // GNU/MSVC attributes: __attribute__((...)), __declspec(...)
+    if (tok->tag & TT_ATTR)
+    {
+      tok = skip_gnu_attributes(tok);
+      continue;
+    }
+    // C23 [[ ... ]] attributes
+    if (is_c23_attr(tok))
+    {
+      tok = skip_c23_attr(tok);
+      continue;
+    }
+    break;
+  }
+  if (!tok || tok->kind == TK_EOF)
+    return false;
+
+  Token *type_start = tok;
+
+  // void return type — not captured (handled by current_func_returns_void)
+  if (equal(tok, "void") || is_void_typedef(tok))
+    return false;
+  if (tok->tag & TT_TYPEOF)
+  {
+    Token *t = tok->next;
+    if (t && equal(t, "(") && t->next && equal(t->next, "void") &&
+        t->next->next && equal(t->next->next, ")"))
+      return false;
+  }
+
+  // Parse the type specifier (int, struct Foo, size_t, typeof(...), etc.)
+  TypeSpecResult type = parse_type_specifier(tok);
+  if (!type.saw_type)
+    return false;
+
+  tok = type.end;
+
+  // Skip pointer decorations and qualifiers: *, const, volatile, restrict
+  while (tok && tok->kind != TK_EOF &&
+         (equal(tok, "*") || (tok->tag & TT_CONST) || (tok->tag & TT_VOLATILE) ||
+          equal(tok, "restrict") || equal(tok, "__restrict") || equal(tok, "__restrict__")))
+    tok = tok->next;
+
+  // Skip any trailing attributes between pointer/qualifiers and name
+  tok = skip_all_attributes(tok);
+
+  // Should be at function name followed by (
+  if (!tok || !is_valid_varname(tok) || !tok->next || !equal(tok->next, "("))
+    return false;
+
+  ctx->func_ret_type_start = type_start;
+  ctx->func_ret_type_end = tok; // exclusive: the function name token
+  return true;
+}
+
+// Emit the captured return type tokens for MSVC-compatible defer return.
+// Falls back to __auto_type if return type was not captured.
+static void emit_ret_type(void)
+{
+  if (ctx->func_ret_type_start && ctx->func_ret_type_end)
+  {
+    for (Token *t = ctx->func_ret_type_start;
+         t && t != ctx->func_ret_type_end && t->kind != TK_EOF; t = t->next)
+    {
+      if (t != ctx->func_ret_type_start)
+        out_char(' ');
+      out_str(t->loc, t->len);
+    }
+  }
+  else
+    // Return type capture failed — emit __auto_type as last resort (GCC only).
+    // This indicates a parser gap in try_capture_func_return_type().
+    OUT_LIT("__auto_type");
+}
+
 // Check if an array dimension (from '[' to matching ']') contains a VLA expression.
 // Simple rule: any identifier that isn't a type/enum constant, or appears after
 // member access (./->) is a runtime variable → VLA. sizeof/alignof/offsetof
@@ -2304,7 +2419,7 @@ static Token *handle_storage_raw(Token *storage_tok)
   return t2;
 }
 
-// Emit memset-based zeroing for typeof/atomic/VLA variables
+// Emit zeroing for typeof/atomic/VLA variables (pure C99, no <string.h> needed)
 static void emit_typeof_memsets(Token **vars, int count, bool has_volatile)
 {
   for (int i = 0; i < count; i++)
@@ -2313,17 +2428,17 @@ static void emit_typeof_memsets(Token **vars, int count, bool has_volatile)
     {
       OUT_LIT(" { volatile char *_p = (volatile char *)&");
       out_str(vars[i]->loc, vars[i]->len);
-      OUT_LIT("; for (size_t _i = 0; _i < sizeof(");
+      OUT_LIT("; for (unsigned long _i = 0; _i < sizeof(");
       out_str(vars[i]->loc, vars[i]->len);
       OUT_LIT("); _i++) _p[_i] = 0; }");
     }
     else
     {
-      OUT_LIT(" __builtin_memset(&");
+      OUT_LIT(" { char *_p = (char *)&");
       out_str(vars[i]->loc, vars[i]->len);
-      OUT_LIT(", 0, sizeof(");
+      OUT_LIT("; for (unsigned long _i = 0; _i < sizeof(");
       out_str(vars[i]->loc, vars[i]->len);
-      OUT_LIT("));");
+      OUT_LIT("); _i++) _p[_i] = 0; }");
     }
   }
 }
@@ -2441,19 +2556,18 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
                                   !(peek_action->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
                                   !equal(peek_action, "{") && !equal(peek_action, ";");
 
-        // const + fallback orelse: use GNU ternary ?: to avoid reassigning const variable
+        // const + fallback orelse: use temp variable to avoid GNU ternary ?: extension
         if (has_const_qual && is_orelse_fallback)
         {
           if (is_struct_val)
             error_tok(tok, "orelse fallback on const struct is not supported; "
                            "use a control flow action (return/break/goto) or remove const");
 
-          // Already emitted: "const T x = val"
-          // Emit: " ?: fallback;" so result is "const T x = val ?: fallback;"
-          OUT_LIT(" ?:");
+          Token *orelse_tok = tok;
+          Token *val_start = decl.end->next; // First value token after '='
 
           register_decl_shadows(decl.var_name, effective_vla);
-          tok = tok->next; // skip 'orelse'
+          tok = orelse_tok->next; // skip 'orelse'
 
           // Find boundary comma for multi-declarator
           Token *stop_comma = NULL;
@@ -2475,6 +2589,55 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
             }
           }
 
+          // MSVC-compatible: roll back output and re-emit with temp variable
+          // Instead of: "const T x = val ?: fallback;"
+          // Emit: "T _prism_oe_N = (val); const T x = _prism_oe_N ? _prism_oe_N : (fallback);"
+          if (oe_buf_checkpoint >= 0 && out_buf_pos >= oe_buf_checkpoint)
+          {
+            // Roll back to before type+declarator+initializer emission
+            out_buf_pos = oe_buf_checkpoint;
+            last_emitted = NULL;
+
+            // Emit type WITHOUT const (for temp variable)
+            for (Token *t = type_start; t && t != type->end && t->kind != TK_EOF; t = t->next)
+            {
+              if (t->tag & TT_CONST)
+                continue;
+              emit_tok(t);
+            }
+            // Emit pointer prefix from declarator WITHOUT const
+            for (Token *t = type->end; t && t != decl.var_name && t->kind != TK_EOF; t = t->next)
+            {
+              if (t->tag & TT_CONST)
+                continue;
+              emit_tok(t);
+            }
+            // Emit temp variable name and value
+            OUT_LIT(" _prism_oe_");
+            out_uint(ctx->ret_counter);
+            OUT_LIT(" = (");
+            emit_range(val_start, orelse_tok);
+            OUT_LIT(");");
+
+            // Emit full original type + declarator (with const)
+            emit_range(type_start, type->end);
+            parse_declarator(type->end, true);
+
+            // Emit ternary using temp variable
+            OUT_LIT(" = _prism_oe_");
+            out_uint(ctx->ret_counter);
+            OUT_LIT(" ? _prism_oe_");
+            out_uint(ctx->ret_counter);
+            OUT_LIT(" : (");
+            ctx->ret_counter++;
+          }
+          else
+          {
+            // Fallback: GNU ternary ?: (rollback not available).
+            // This is a GCC extension; non-GCC compilers will reject this.
+            OUT_LIT(" ?:");
+          }
+
           // Emit fallback expression tokens
           int fdepth = 0;
           while (tok->kind != TK_EOF)
@@ -2488,6 +2651,10 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
             emit_tok(tok);
             tok = tok->next;
           }
+
+          // Close the ternary paren if using temp variable path
+          if (oe_buf_checkpoint >= 0)
+            out_char(')');
           out_char(';');
 
           emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile);
@@ -2717,11 +2884,15 @@ static Token *try_zero_init_decl(Token *tok)
   }
 
   // Emit pragmas and type
+  // Save output buffer position for possible const+fallback orelse rollback
+  oe_buf_checkpoint = out_buf_pos;
   if (pragma_start != start)
     emit_range(pragma_start, start);
   emit_range(start, type.end);
 
-  return process_declarators(type.end, &type, is_raw, start);
+  Token *result = process_declarators(type.end, &type, is_raw, start);
+  oe_buf_checkpoint = -1;
+  return result;
 }
 
 // Emit an expression until semicolon, tracking depth for statement expressions.
@@ -2879,7 +3050,9 @@ static Token *emit_return_body(Token *tok)
       bool is_void = ctx->current_func_returns_void || is_void_cast;
       if (!is_void)
       {
-        OUT_LIT(" __auto_type _prism_ret_");
+        out_char(' ');
+        emit_ret_type();
+        OUT_LIT(" _prism_ret_");
         out_uint(ctx->ret_counter);
         OUT_LIT(" = (");
       }
@@ -2971,7 +3144,9 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
           bool is_void = ctx->current_func_returns_void || is_void_cast;
           if (!is_void)
           {
-            OUT_LIT(" __auto_type _prism_ret_");
+            out_char(' ');
+            emit_ret_type();
+            OUT_LIT(" _prism_ret_");
             out_uint(ctx->ret_counter);
             OUT_LIT(" = (");
           }
@@ -3375,12 +3550,10 @@ static int wait_for_child(pid_t pid)
 
 // Run a command and wait for it to complete
 // Returns exit status, or -1 on error
+// Windows: defined in windows.c via _spawnvp
+#ifndef _WIN32
 static int run_command(char **argv)
 {
-#ifdef _WIN32
-  intptr_t status = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
-  return (int)status;
-#else
   char **env = build_clean_environ();
   if (!env)
     return -1;
@@ -3392,8 +3565,8 @@ static int run_command(char **argv)
     return -1;
   }
   return wait_for_child(pid);
-#endif
 }
+#endif
 
 static void free_argv(char **argv)
 {
@@ -3407,40 +3580,7 @@ static void free_argv(char **argv)
 // Unified temp file creation with optional suffix (e.g., ".c" → suffix_len=2)
 // If source_adjacent is non-NULL, creates file next to that source file instead of in tmp dir.
 // Returns 0 on success, -1 on failure. Path written to buf.
-// Atomically creates a temp file from an XXXXXX template.
-// On Windows, appends win_suffix (e.g. ".c", ".exe") after name generation.
-// On POSIX, uses mkstemps if suffix_len > 0 (suffix is already in template).
-#if defined(_WIN32)
-static int atomic_mkstemp(char *buf, size_t bufsize, const char *win_suffix)
-{
-  for (int attempt = 0; attempt < 100; attempt++)
-  {
-    char try_buf[PATH_MAX];
-    size_t len = strlen(buf);
-    memcpy(try_buf, buf, len + 1);
-    if (_mktemp_s(try_buf, len + 1) != 0)
-      return -1;
-    if (win_suffix)
-    {
-      size_t tlen = strlen(try_buf);
-      size_t slen = strlen(win_suffix);
-      if (tlen + slen + 1 >= sizeof(try_buf))
-        return -1;
-      memcpy(try_buf + tlen, win_suffix, slen + 1);
-    }
-    int fd;
-    errno_t err = _sopen_s(&fd, try_buf, _O_CREAT | _O_EXCL | _O_WRONLY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
-    if (err == 0 && fd >= 0)
-    {
-      _close(fd);
-      memcpy(buf, try_buf, strlen(try_buf) + 1);
-      return 0;
-    }
-  }
-  return -1;
-}
-#endif
-
+// Uses mkstemps on all platforms (Windows shim provided by windows.c).
 static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len, const char *source_adjacent)
 {
   int n;
@@ -3453,45 +3593,21 @@ static int make_temp_file(char *buf, size_t bufsize, const char *prefix, int suf
     if (slash)
     {
       int dir_len = (int)(slash - source_adjacent);
-#ifdef _WIN32
-      n = snprintf(buf, bufsize, "%.*s/.%s.XXXXXX", dir_len, source_adjacent, slash + 1);
-#else
       n = snprintf(buf, bufsize, "%.*s/.%s.XXXXXX.c", dir_len, source_adjacent, slash + 1);
-#endif
     }
     else
-    {
-#ifdef _WIN32
-      n = snprintf(buf, bufsize, ".%s.XXXXXX", source_adjacent);
-#else
       n = snprintf(buf, bufsize, ".%s.XXXXXX.c", source_adjacent);
-#endif
-    }
     suffix_len = 2;
   }
   else
     n = snprintf(buf, bufsize, "%s%s", get_tmp_dir(), prefix);
   if (n < 0 || (size_t)n >= bufsize)
     return -1;
-#if defined(_WIN32)
-  return atomic_mkstemp(buf, bufsize, source_adjacent ? ".c" : NULL);
-#else
   int fd = suffix_len > 0 ? mkstemps(buf, suffix_len) : mkstemp(buf);
   if (fd < 0)
     return -1;
-  // Keep fd open and use fdopen to avoid TOCTOU race between close+fopen.
-  // We immediately close the FILE* (which also closes fd) since the caller
-  // will reopen the path later via fopen/transpile. The file now exists
-  // atomically with our chosen name.
-  FILE *fp = fdopen(fd, "w");
-  if (!fp)
-  {
-    close(fd);
-    return -1;
-  }
-  fclose(fp);
+  close(fd);
   return 0;
-#endif
 }
 
 // Extract filename from path (handles both / and \ separators)
@@ -3504,18 +3620,14 @@ static const char *path_basename(const char *path)
   return fwd ? fwd + 1 : path;
 }
 
+// Windows: cc_is_msvc is defined in windows.c
+#ifndef _WIN32
 static bool cc_is_msvc(const char *cc)
 {
-#ifndef _WIN32
   (void)cc;
   return false;
-#else
-  if (!cc || !*cc)
-    return false;
-  const char *base = path_basename(cc);
-  return (_stricmp(base, "cl") == 0 || _stricmp(base, "cl.exe") == 0);
-#endif
 }
+#endif
 
 // Build preprocessor argv into an ArgvBuilder.
 // Shared between pipe-based and file-based preprocessor paths.
@@ -3764,6 +3876,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
   }
 
   bool next_func_returns_void = false; // Track void functions at top level
+  bool next_func_ret_captured = false; // Track if return type was already captured
   Token *prev_toplevel_tok = NULL;     // Track previous token at top level for function detection
   Token *last_toplevel_paren = NULL;   // Track last ')' at top level for K&R detection
 
@@ -3935,14 +4048,18 @@ static int transpile_tokens(Token *tok, FILE *fp)
     if (__builtin_expect(ctx->generic_paren_depth > 0, 0))
       track_generic_paren(tok);
 
-    // Void function detection at top level
-    // Fast-reject: only enter is_void_function_decl for tokens that could plausibly
-    // start a void function (tagged keywords, or void typedef identifiers)
+    // Void function detection and return type capture at top level
+    // Fast-reject: only enter for tokens that could plausibly start a function
     if (ctx->defer_depth == 0 &&
         (tag & (TT_TYPE | TT_QUALIFIER | TT_SKIP_DECL | TT_ATTR | TT_INLINE) ||
-         (is_identifier_like(tok) && is_void_typedef(tok))) &&
-        is_void_function_decl(tok))
-      next_func_returns_void = true;
+         (is_identifier_like(tok) && (is_void_typedef(tok) || is_known_typedef(tok)))))
+    {
+      if (is_void_function_decl(tok))
+        next_func_returns_void = true;
+      else if (!next_func_ret_captured && (tag & (TT_TYPE | TT_QUALIFIER | TT_ATTR | TT_INLINE) ||
+                                           (is_identifier_like(tok) && is_known_typedef(tok))))
+        next_func_ret_captured = try_capture_func_return_type(tok);
+    }
 
     if (tag & TT_SUE) // struct/union/enum body
       DISPATCH(handle_sue_body);
@@ -3973,8 +4090,21 @@ static int transpile_tokens(Token *tok, FILE *fp)
           {
             scan_labels_in_function(tok);
             ctx->current_func_returns_void = next_func_returns_void;
+            // Clear captured return type for void functions or when capture didn't succeed
+            if (next_func_returns_void || !next_func_ret_captured)
+            {
+              ctx->func_ret_type_start = NULL;
+              ctx->func_ret_type_end = NULL;
+            }
+          }
+          else
+          {
+            // Not a function definition — clear stale captured return type
+            ctx->func_ret_type_start = NULL;
+            ctx->func_ret_type_end = NULL;
           }
           next_func_returns_void = false;
+          next_func_ret_captured = false;
           last_toplevel_paren = NULL;
         }
         tok = handle_open_brace(tok);
@@ -3994,7 +4124,10 @@ static int transpile_tokens(Token *tok, FILE *fp)
         if (!ctrl.pending)
           end_statement_after_semicolon();
         if (ctx->defer_depth == 0)
+        {
           next_func_returns_void = false;
+          next_func_ret_captured = false;
+        }
         emit_tok(tok);
         tok = tok->next;
         continue;
@@ -4367,12 +4500,11 @@ static noreturn void die(char *message)
 }
 
 // Resolve the path to the currently running executable (platform-specific)
+// Windows: defined in windows.c via GetModuleFileNameA
+#ifndef _WIN32
 static bool get_self_exe_path(char *buf, size_t bufsize)
 {
-#if defined(_WIN32)
-  DWORD len = GetModuleFileNameA(NULL, buf, (DWORD)bufsize);
-  return (len > 0 && len < bufsize);
-#elif defined(__linux__)
+#if defined(__linux__)
   ssize_t len = readlink("/proc/self/exe", buf, bufsize - 1);
   if (len > 0)
   {
@@ -4409,7 +4541,7 @@ static bool get_self_exe_path(char *buf, size_t bufsize)
   // Fallthrough to return false.
 #endif
   // Generic fallback: try Solaris/Illumos /proc path, then Linux-style
-#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__FreeBSD__) && !defined(__DragonFly__) && !defined(__NetBSD__) && !defined(__linux__)
+#if !defined(__APPLE__) && !defined(__FreeBSD__) && !defined(__DragonFly__) && !defined(__NetBSD__) && !defined(__linux__)
   {
     // Solaris/Illumos
     ssize_t len2 = readlink("/proc/self/path/a.out", buf, bufsize - 1);
@@ -4431,14 +4563,22 @@ static bool get_self_exe_path(char *buf, size_t bufsize)
   (void)bufsize;
   return false;
 }
-
-static void check_path_shadow(void)
-{
-#ifdef _WIN32
-  const char *cmd = "where prism.exe 2>nul";
-#else
-  const char *cmd = "which -a prism 2>/dev/null || command -v prism 2>/dev/null";
 #endif
+
+// Windows: get_install_path, ensure_install_dir, add_to_user_path defined in windows.c
+#ifndef _WIN32
+static const char *get_install_path(void) { return INSTALL_PATH; }
+static bool ensure_install_dir(const char *p)
+{
+  (void)p;
+  return true;
+}
+static void add_to_user_path(const char *dir) { (void)dir; }
+#endif
+
+static void check_path_shadow(const char *install_path)
+{
+  const char *cmd = FIND_EXE_CMD;
   FILE *fp = popen(cmd, "r");
   if (!fp)
     return;
@@ -4452,25 +4592,33 @@ static void check_path_shadow(void)
       first_hit[--len] = '\0';
   }
   pclose(fp);
-  if (first_hit[0] && strcmp(first_hit, INSTALL_PATH) != 0)
+  if (first_hit[0] && strcmp(first_hit, install_path) != 0)
   {
     // Resolve symlinks for both paths before comparing
     char resolved_hit[PATH_MAX], resolved_install[PATH_MAX];
     char *rh = realpath(first_hit, resolved_hit);
-    char *ri = realpath(INSTALL_PATH, resolved_install);
+    char *ri = realpath(install_path, resolved_install);
     if (rh && ri && strcmp(rh, ri) == 0)
       return; // Same file via symlink — no shadow
     fprintf(stderr,
             "[prism] Warning: '%s' shadows '%s' in your PATH.\n"
             "[prism] The newly installed version will NOT be used.\n"
             "[prism] Fix: remove or update '%s', or adjust your PATH.\n",
-            first_hit, INSTALL_PATH, first_hit);
+            first_hit, install_path, first_hit);
   }
 }
 
 static int install(char *self_path)
 {
-  printf("[prism] Installing to %s...\n", INSTALL_PATH);
+  const char *install_path = get_install_path();
+  printf("[prism] Installing to %s...\n", install_path);
+
+  // Ensure the install directory exists (windows.c creates %LOCALAPPDATA%\prism, unix no-op)
+  if (!ensure_install_dir(install_path))
+  {
+    fprintf(stderr, "[prism] Failed to create install directory\n");
+    return 1;
+  }
 
   // Resolve self_path to actual executable path only if the given path doesn't exist
   char resolved_path[PATH_MAX];
@@ -4478,15 +4626,15 @@ static int install(char *self_path)
   if (stat(self_path, &st) != 0 && get_self_exe_path(resolved_path, sizeof(resolved_path)))
     self_path = resolved_path;
 
-  if (strcmp(self_path, INSTALL_PATH) == 0)
+  if (strcmp(self_path, install_path) == 0)
   {
-    printf("[prism] Already installed at %s\n", INSTALL_PATH);
+    printf("[prism] Already installed at %s\n", install_path);
     return 0;
   }
 
   // Try direct copy first (avoids sudo if we have permission)
   FILE *input = fopen(self_path, "rb");
-  FILE *output = input ? fopen(INSTALL_PATH, "wb") : NULL;
+  FILE *output = input ? fopen(install_path, "wb") : NULL;
 
   if (input && output)
   {
@@ -4503,9 +4651,22 @@ static int install(char *self_path)
     }
     fclose(input);
     fclose(output);
-    chmod(INSTALL_PATH, 0755); // no-op on Windows (shimmed)
+    chmod(install_path, 0755); // no-op on Windows (shimmed)
     printf("[prism] Installed!\n");
-    check_path_shadow();
+    // On Windows, add install directory to user PATH if not already there
+    {
+      char dir[PATH_MAX];
+      strncpy(dir, install_path, PATH_MAX - 1);
+      dir[PATH_MAX - 1] = '\0';
+      char *sep = strrchr(dir, '/');
+      char *bsep = strrchr(dir, '\\');
+      if (bsep && (!sep || bsep > sep))
+        sep = bsep;
+      if (sep)
+        *sep = '\0';
+      add_to_user_path(dir);
+    }
+    check_path_shadow(install_path);
     return 0;
   }
 
@@ -4515,31 +4676,32 @@ static int install(char *self_path)
     fclose(output);
 
 use_sudo:;
-#ifdef _WIN32 // Windows: no sudo — just report failure
-  fprintf(stderr, "Failed to install (run as Administrator?)\n");
+#ifdef _WIN32
+  fprintf(stderr, "[prism] Failed to install (run as Administrator?)\n");
   return 1;
 #else
-  char **argv = build_argv("sudo", "rm", "-f", INSTALL_PATH, NULL);
-  run_command(argv);
-  free_argv(argv);
-
-  // Copy
-  argv = build_argv("sudo", "cp", self_path, INSTALL_PATH, NULL);
-  int status = run_command(argv);
-  free_argv(argv);
-  if (status != 0)
   {
-    fprintf(stderr, "Failed to install\n");
-    return 1;
-  }
+    char **argv = build_argv("sudo", "rm", "-f", install_path, NULL);
+    run_command(argv);
+    free_argv(argv);
 
-  argv = build_argv("sudo", "chmod", "+x", INSTALL_PATH, NULL);
-  run_command(argv);
-  free_argv(argv);
+    argv = build_argv("sudo", "cp", self_path, install_path, NULL);
+    int status = run_command(argv);
+    free_argv(argv);
+    if (status != 0)
+    {
+      fprintf(stderr, "Failed to install\n");
+      return 1;
+    }
+
+    argv = build_argv("sudo", "chmod", "+x", install_path, NULL);
+    run_command(argv);
+    free_argv(argv);
+  }
 #endif
 
   printf("[prism] Installed!\n");
-  check_path_shadow();
+  check_path_shadow(install_path);
   return 0;
 }
 
@@ -4656,7 +4818,7 @@ static void print_help(void)
       "  CC=clang prism foo.c             Use clang as backend\n\n"
       "Apache 2.0 license (c) Dawn Larsson 2026\n"
       "https://github.com/dawnlarsson/prism\n",
-      PRISM_VERSION, INSTALL_PATH);
+      PRISM_VERSION, get_install_path());
 }
 
 static Cli cli_parse(int argc, char **argv)
@@ -4904,15 +5066,13 @@ static void make_run_temp(char *buf, size_t size, CliMode mode)
   buf[0] = '\0';
   if (mode != CLI_RUN)
     return;
-  snprintf(buf, size, "%sprism_run.XXXXXX", get_tmp_dir());
-#if defined(_WIN32)
-  if (atomic_mkstemp(buf, size, ".exe") != 0)
-    buf[0] = '\0';
-#else
-  int fd = mkstemp(buf);
+  int suffix_len = (int)strlen(EXE_SUFFIX);
+  snprintf(buf, size, "%sprism_run.XXXXXX%s", get_tmp_dir(), EXE_SUFFIX);
+  int fd = suffix_len > 0 ? mkstemps(buf, suffix_len) : mkstemp(buf);
   if (fd >= 0)
     close(fd);
-#endif
+  else
+    buf[0] = '\0';
 }
 
 static int passthrough_cc(const Cli *cli)

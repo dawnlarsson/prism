@@ -544,7 +544,121 @@ static pid_t waitpid(pid_t pid, int *status, int options)
     return pid;
 }
 
-// get_self_exe_path: readlink() shim returns -1 on Windows.
-// prism.c handles _WIN32 via GetModuleFileNameA directly.
+// Resolve the path to the currently running executable
+static bool get_self_exe_path(char *buf, size_t bufsize)
+{
+    DWORD len = GetModuleFileNameA(NULL, buf, (DWORD)bufsize);
+    return (len > 0 && len < bufsize);
+}
+
+// Detect whether the compiler is MSVC cl.exe
+static bool cc_is_msvc(const char *cc)
+{
+    if (!cc || !*cc)
+        return false;
+    const char *fwd = strrchr(cc, '/');
+    const char *bck = strrchr(cc, '\\');
+    if (bck && (!fwd || bck > fwd))
+        fwd = bck;
+    const char *base = fwd ? fwd + 1 : cc;
+    return (_stricmp(base, "cl") == 0 || _stricmp(base, "cl.exe") == 0);
+}
+
+// Run a command and wait for it to complete.
+// Returns exit status, or -1 on error.
+static int run_command(char **argv)
+{
+    intptr_t status = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
+    return (int)status;
+}
+
+// Get the platform install path: %LOCALAPPDATA%\prism\prism.exe
+static const char *get_install_path(void)
+{
+    static char path[MAX_PATH];
+    if (path[0])
+        return path;
+    DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH - 20)
+    {
+        // Fallback: install next to the running executable
+        if (GetModuleFileNameA(NULL, path, MAX_PATH))
+            return path;
+        strcpy(path, "prism.exe");
+        return path;
+    }
+    // Append \prism\prism.exe
+    strcat(path, "\\prism\\prism.exe");
+    return path;
+}
+
+// Ensure the install directory exists (create %LOCALAPPDATA%\prism)
+static bool ensure_install_dir(const char *install_path)
+{
+    // Extract directory from install_path
+    char dir[MAX_PATH];
+    strncpy(dir, install_path, MAX_PATH - 1);
+    dir[MAX_PATH - 1] = '\0';
+    char *last_sep = strrchr(dir, '\\');
+    if (!last_sep)
+        last_sep = strrchr(dir, '/');
+    if (last_sep)
+        *last_sep = '\0';
+    else
+        return true; // No directory component
+
+    DWORD attr = GetFileAttributesA(dir);
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
+        return true; // Already exists
+
+    return CreateDirectoryA(dir, NULL) != 0;
+}
+
+// Add a directory to the user's PATH via setx (persistent)
+static void add_to_user_path(const char *dir)
+{
+    // Check if dir is already in PATH
+    char *path_env = getenv("PATH");
+    if (path_env && strstr(path_env, dir))
+        return; // Already in PATH
+
+    // Use setx to persistently add to user PATH
+    char cmd[MAX_PATH * 2];
+    snprintf(cmd, sizeof(cmd), "setx PATH \"%%PATH%%;%s\" >nul 2>&1", dir);
+    system(cmd);
+    fprintf(stderr, "[prism] Added '%s' to your PATH (restart your terminal to use 'prism' directly).\n", dir);
+}
+
+// Atomically create a temp file from an XXXXXX template.
+// Appends win_suffix (e.g. ".c", ".exe") after name generation.
+// Returns 0 on success, -1 on failure.
+static int atomic_mkstemp(char *buf, size_t bufsize, const char *win_suffix)
+{
+    for (int attempt = 0; attempt < 100; attempt++)
+    {
+        char try_buf[MAX_PATH];
+        size_t len = strlen(buf);
+        memcpy(try_buf, buf, len + 1);
+        if (_mktemp_s(try_buf, len + 1) != 0)
+            return -1;
+        if (win_suffix)
+        {
+            size_t tlen = strlen(try_buf);
+            size_t slen = strlen(win_suffix);
+            if (tlen + slen + 1 >= sizeof(try_buf))
+                return -1;
+            memcpy(try_buf + tlen, win_suffix, slen + 1);
+        }
+        int fd;
+        errno_t err = _sopen_s(&fd, try_buf, _O_CREAT | _O_EXCL | _O_WRONLY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
+        if (err == 0 && fd >= 0)
+        {
+            _close(fd);
+            memcpy(buf, try_buf, strlen(try_buf) + 1);
+            return 0;
+        }
+    }
+    return -1;
+}
 
 #endif // PRISM_WINDOWS_C

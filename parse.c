@@ -296,6 +296,8 @@ typedef struct PrismContext
     bool at_stmt_start;
     int system_include_count;
     unsigned long long ret_counter;
+    Token *func_ret_type_start; // First token of return type (after storage/function specifiers)
+    Token *func_ret_type_end;   // Function name token (exclusive end of return type range)
     void *active_typeof_vars; // process_declarators heap alloc; freed on longjmp recovery
 #ifdef PRISM_LIB_MODE
     char active_temp_output[PATH_MAX];
