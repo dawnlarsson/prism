@@ -14611,6 +14611,168 @@ static void test_for_init_shadow_braceless_body(void)
     CHECK_EQ(final, 0, "typedef after braced for-init shadow");
 }
 
+static int _oe_eval_ctr;
+static int *_oe_eval_fn(int *p)
+{
+    _oe_eval_ctr++;
+    return p;
+}
+
+static void test_const_orelse_ptr_eval_once(void)
+{
+    int val = 42;
+    int fb = 99;
+    _oe_eval_ctr = 0;
+    const int *p = _oe_eval_fn(&val) orelse &fb;
+    CHECK(*p == 42, "const ptr orelse: non-null preserved");
+    CHECK_EQ(_oe_eval_ctr, 1, "const ptr orelse: init evaluated once");
+
+    _oe_eval_ctr = 0;
+    const int *q = _oe_eval_fn(NULL) orelse &fb;
+    CHECK(*q == 99, "const ptr orelse: null uses fallback");
+    CHECK_EQ(_oe_eval_ctr, 1, "const ptr orelse null: init evaluated once");
+}
+
+static void test_const_orelse_multi_fallback(void)
+{
+    int a = 7, b = 0;
+    const int x = a orelse 10, y = b orelse 20;
+    CHECK_EQ(x, 7, "const orelse multi first non-zero");
+    CHECK_EQ(y, 20, "const orelse multi second zero fallback");
+
+    const int m = 0 orelse 55, n = 3 orelse 66;
+    CHECK_EQ(m, 55, "const orelse multi both: first");
+    CHECK_EQ(n, 3, "const orelse multi both: second");
+}
+
+static void _void_defer_side_fn(void) { log_append("V"); }
+
+static void _void_return_call_defer_impl(void)
+{
+    defer log_append("D");
+    log_append("1");
+    return _void_defer_side_fn();
+}
+
+static void test_void_return_call_with_defer(void)
+{
+    log_reset();
+    _void_return_call_defer_impl();
+    CHECK_LOG("1VD", "void return funcall with defer");
+}
+
+static void _void_return_cast_defer_impl(void)
+{
+    defer log_append("D");
+    log_append("1");
+    return (void)0;
+}
+
+static void test_void_return_cast_with_defer(void)
+{
+    log_reset();
+    _void_return_cast_defer_impl();
+    CHECK_LOG("1D", "void return cast with defer");
+}
+
+static void test_switch_case_defer_ordering(void)
+{
+    log_reset();
+    for (int i = 0; i < 3; i++)
+    {
+        switch (i)
+        {
+        case 0:
+        {
+            defer log_append("A");
+            log_append("0");
+            break;
+        }
+        case 1:
+        {
+            defer log_append("B");
+            log_append("1");
+            break;
+        }
+        default:
+        {
+            defer log_append("C");
+            log_append("2");
+            break;
+        }
+        }
+    }
+    CHECK_LOG("0A1B2C", "switch case defer ordering");
+}
+
+static void test_switch_defer_loop_nested(void)
+{
+    log_reset();
+    for (int i = 0; i < 2; i++)
+    {
+        defer log_append("L");
+        switch (i)
+        {
+        case 0:
+        {
+            defer log_append("S0");
+            log_append("a");
+            break;
+        }
+        case 1:
+        {
+            defer log_append("S1");
+            log_append("b");
+            break;
+        }
+        }
+    }
+    CHECK_LOG("aS0LbS1L", "switch defer in loop nested");
+}
+
+static void test_typedef_for_switch_scope(void)
+{
+    typedef int _TFS;
+    _TFS before;
+    CHECK_EQ(before, 0, "typedef before for-switch");
+    for (int _TFS = 0; _TFS < 2; _TFS++)
+    {
+        switch (_TFS)
+        {
+        case 0:
+            break;
+        case 1:
+            break;
+        }
+    }
+    _TFS after;
+    CHECK_EQ(after, 0, "typedef after for-switch scope");
+}
+
+static void test_typedef_nested_for_braceless(void)
+{
+    typedef int _TNF;
+    _TNF x;
+    CHECK_EQ(x, 0, "typedef nested for braceless: before");
+    for (int _TNF = 0; _TNF < 1; _TNF++)
+        for (int j = 0; j < 1; j++)
+            ;
+    _TNF y;
+    CHECK_EQ(y, 0, "typedef nested for braceless: after");
+}
+
+static void test_raw_string_max_delimiter(void)
+{
+    const char *s = R"ABCDEFGHIJKLMNOP(hello raw)ABCDEFGHIJKLMNOP";
+    CHECK(strcmp(s, "hello raw") == 0, "raw string 16-char delimiter");
+}
+
+static void test_raw_string_near_max_delimiter(void)
+{
+    const char *s = R"ABCDEFGHIJKLMNO(near max)ABCDEFGHIJKLMNO";
+    CHECK(strcmp(s, "near max") == 0, "raw string 15-char delimiter");
+}
+
 int main(void)
 {
     printf("=== PRISM TEST SUITE ===\n");
@@ -14708,6 +14870,17 @@ int main(void)
     test_defer_braceless_rejected();
     test_zeroinit_typedef_after_control();
     test_for_init_shadow_braceless_body();
+
+    test_const_orelse_ptr_eval_once();
+    test_const_orelse_multi_fallback();
+    test_void_return_call_with_defer();
+    test_void_return_cast_with_defer();
+    test_switch_case_defer_ordering();
+    test_switch_defer_loop_nested();
+    test_typedef_for_switch_scope();
+    test_typedef_nested_for_braceless();
+    test_raw_string_max_delimiter();
+    test_raw_string_near_max_delimiter();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

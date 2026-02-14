@@ -559,9 +559,19 @@ static void out_line(int line_no, const char *file)
 #ifdef _WIN32
   // Emit forward slashes to avoid MSVC C4129 warnings on backslash escapes
   for (const char *p = file; *p; p++)
-    out_char(*p == '\\' ? '/' : *p);
+  {
+    char c = (*p == '\\') ? '/' : *p;
+    if (c == '"')
+      out_char('\\');
+    out_char(c);
+  }
 #else
-  out_str(file, strlen(file));
+  for (const char *p = file; *p; p++)
+  {
+    if (*p == '"' || *p == '\\')
+      out_char('\\');
+    out_char(*p);
+  }
 #endif
   OUT_LIT("\"\n");
 }
@@ -2468,6 +2478,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
   while (tok && tok->kind != TK_EOF)
   {
+    Token *decl_start = tok; // Save start of current declarator for rollback
     DeclResult decl = parse_declarator(tok, true);
     if (!decl.end || !decl.var_name)
     {
@@ -2610,7 +2621,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
               emit_tok(t);
             }
             // Emit pointer prefix from declarator WITHOUT const
-            for (Token *t = type->end; t && t != decl.var_name && t->kind != TK_EOF; t = t->next)
+            for (Token *t = decl_start; t && t != decl.var_name && t->kind != TK_EOF; t = t->next)
             {
               if (t->tag & TT_CONST)
                 continue;
@@ -2625,7 +2636,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
             // Emit full original type + declarator (with const)
             emit_range(type_start, type->end);
-            parse_declarator(type->end, true);
+            parse_declarator(decl_start, true);
 
             // Emit ternary using temp variable
             OUT_LIT(" = _prism_oe_");
@@ -2637,9 +2648,11 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
           }
           else
           {
-            // Fallback: GNU ternary ?: (rollback not available).
-            // This is a GCC extension; non-GCC compilers will reject this.
-            OUT_LIT(" ?:");
+            // Buffer was flushed — can't roll back for temp variable approach.
+            // Emit standard ternary with value re-evaluation instead of GNU ?: extension.
+            OUT_LIT(" ? (");
+            emit_range(val_start, orelse_tok);
+            OUT_LIT(") : (");
           }
 
           // Emit fallback expression tokens
@@ -2672,6 +2685,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
           if (stop_comma && equal(tok, ","))
           {
             tok = tok->next;
+            oe_buf_checkpoint = out_buf_pos;
+            oe_buf_flushed = false;
             for (Token *t = type_start; t != type->end; t = t->next)
             {
               if (equal(t, "{"))
@@ -2737,6 +2752,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
         if (stop_comma && equal(tok, ","))
         {
           tok = tok->next; // skip comma
+          oe_buf_checkpoint = out_buf_pos;
+          oe_buf_flushed = false;
           // Re-emit the type specifier, skipping struct/union/enum bodies
           // to avoid redefinition errors (e.g. enum constant redeclaration)
           for (Token *t = type_start; t != type->end; t = t->next)
