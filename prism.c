@@ -2124,11 +2124,12 @@ static TypeSpecResult parse_type_specifier(Token *tok)
         Token *end = skip_balanced(tok, '(', ')');
         if (!is_unqual)
           for (Token *t = tok->next; t && t != end; t = t->next)
+          {
             if (t->tag & TT_VOLATILE)
-            {
               r.has_volatile = true;
-              break;
-            }
+            if (t->tag & TT_CONST)
+              r.has_const = true;
+          }
         tok = end;
       }
       r.end = tok;
@@ -2551,10 +2552,14 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
     bool needs_memset = !decl.has_init && !is_raw && !decl.is_pointer && !type->has_register &&
                         (type->has_typeof || (type->has_atomic && is_aggregate) || effective_vla);
 
+    // const typeof: memset would cast away const (UB). Downgrade to = {0} path.
+    if (needs_memset && (type->has_const || decl.is_const) && type->has_typeof)
+      needs_memset = false;
+
     // Add zero initializer if needed (for non-memset types)
     if (!decl.has_init && !effective_vla && !is_raw && !needs_memset)
     {
-      if (is_aggregate)
+      if (is_aggregate || type->has_typeof) // typeof: always use {0} (unknown underlying type)
         OUT_LIT(" = {0}");
       else
         OUT_LIT(" = 0");

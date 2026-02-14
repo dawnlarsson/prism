@@ -15099,6 +15099,16 @@ _gap_label:;
     CHECK_EQ((*arr)[2], 30, "goto array-ptr decl after label: accessible");
 }
 
+// typeof(const T) must use = {0} instead of memset (memset casts away const = UB)
+static void test_typeof_const_zero_init(void)
+{
+    typeof(const int) a;
+    CHECK_EQ(a, 0, "typeof(const int) zero-init via = {0}");
+
+    const typeof(int) b;
+    CHECK_EQ(b, 0, "const typeof(int) zero-init via = {0}");
+}
+
 int main(void)
 {
     printf("=== PRISM TEST SUITE ===\n");
@@ -15234,6 +15244,7 @@ int main(void)
     test_goto_fnptr_decl_after_label();
     test_goto_fnptr_decl_before_goto();
     test_goto_array_ptr_decl_after_label();
+    test_typeof_const_zero_init();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);
