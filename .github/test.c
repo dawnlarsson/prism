@@ -15073,6 +15073,32 @@ static void test_raw_string_16_char_delimiter(void)
     CHECK(strcmp(s, "sixteen char delim") == 0, "raw string exactly 16-char delimiter");
 }
 
+static int _goto_fnptr_helper(void) { return 42; }
+static void test_goto_fnptr_decl_after_label(void)
+{
+    goto _gfp_label;
+_gfp_label:;
+    int (*fn)(void) = _goto_fnptr_helper;
+    CHECK_EQ(fn(), 42, "goto fnptr decl after label: callable");
+}
+
+static void test_goto_fnptr_decl_before_goto(void)
+{
+    int (*fn)(void) = _goto_fnptr_helper;
+    goto _gfpb_label;
+_gfpb_label:
+    CHECK_EQ(fn(), 42, "goto fnptr decl before goto: preserved");
+}
+
+static void test_goto_array_ptr_decl_after_label(void)
+{
+    int data[4] = {10, 20, 30, 40};
+    goto _gap_label;
+_gap_label:;
+    int (*arr)[4] = &data;
+    CHECK_EQ((*arr)[2], 30, "goto array-ptr decl after label: accessible");
+}
+
 int main(void)
 {
     printf("=== PRISM TEST SUITE ===\n");
@@ -15204,6 +15230,10 @@ int main(void)
     test_named_struct_return_with_defer();
     test_typedef_struct_return_with_defer();
     test_raw_string_16_char_delimiter();
+
+    test_goto_fnptr_decl_after_label();
+    test_goto_fnptr_decl_before_goto();
+    test_goto_array_ptr_decl_after_label();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

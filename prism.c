@@ -1593,7 +1593,20 @@ static GotoSkipResult goto_skips_check(Token *goto_tok, char *label_name, int la
           while (t && (equal(t, "*") || (t->tag & TT_QUALIFIER) ||
                        equal(t, "__restrict") || equal(t, "__restrict__")))
             t = t->next;
-          if (t && is_valid_varname(t) && t->next && !equal(t->next, "("))
+          // Check for plain declarator: `type *name`
+          bool found_decl = (t && is_valid_varname(t) && t->next && !equal(t->next, "("));
+          // Check for parenthesized declarator: `type (*name)...`
+          // Covers function pointers: int (*fp)(void)
+          // and arrays of pointers: int (*arr)[10]
+          if (!found_decl && t && equal(t, "("))
+          {
+            Token *inner = t->next;
+            while (inner && (equal(inner, "*") || (inner->tag & TT_QUALIFIER)))
+              inner = inner->next;
+            if (inner && is_valid_varname(inner))
+              found_decl = true;
+          }
+          if (found_decl)
           {
             if (!has_raw && (!active_decl || w.depth <= decl_depth))
             {
@@ -2299,7 +2312,14 @@ static DeclResult parse_declarator(Token *tok, bool emit)
       if (equal(tok, "*"))
         r.is_pointer = true;
       else if (equal(tok, "("))
-        nested_paren++;
+      {
+        if (++nested_paren > 1024)
+        {
+          warn_tok(tok, "declarator parenthesization depth exceeds 1024; zero-initialization skipped");
+          r.end = NULL;
+          return r;
+        }
+      }
       if (tok->tag & TT_ATTR)
       {
         tok = decl_attr(tok, emit);
