@@ -1156,7 +1156,7 @@ static char *raw_string_literal_end(char *p)
     char *delim_start = p + 1;
     char *paren = delim_start;
     while (*paren && *paren != '(' && *paren != ')' && *paren != '\\' &&
-           *paren != ' ' && *paren != '\t' && *paren != '\n' && (paren - delim_start) < 16)
+           *paren != ' ' && *paren != '\t' && *paren != '\n' && (paren - delim_start) < 17)
         paren++;
 
     if (*paren != '(')

@@ -13931,7 +13931,9 @@ static void test_orelse_return_expr_side_effects(void)
 static void test_generic_controlling_expr_not_evaluated(void)
 {
     int i = 0;
-    int type_id = _Generic(i++, int: 1, default: 2);
+    // Use (i) instead of (i++) to avoid Clang -Wunevaluated-expression.
+    // _Generic's controlling expression is unevaluated, so side effects are moot.
+    int type_id = _Generic(i, int: 1, default: 2);
     CHECK_EQ(type_id, 1, "_Generic selects int");
     CHECK_EQ(i, 0, "_Generic controlling expression not evaluated");
 }
@@ -14953,9 +14955,10 @@ static void test_typedef_shadow_for_with_if_body(void)
     CHECK(sizeof(y) == sizeof(int), "typedef size after for-if-else");
 }
 
+// for(typedef ...) is a GCC extension rejected by Clang, so guard these tests.
+#if defined(__GNUC__) && !defined(__clang__)
 static void test_for_init_typedef_no_leak(void)
 {
-    // T is not a typedef in the outer scope
     // for-init typedef should NOT persist after the loop
     typedef int _FITL;
     _FITL a;
@@ -14997,6 +15000,7 @@ static void test_for_init_typedef_nested_loops(void)
     CHECK_EQ(outer, 0, "outer typedef restored after nested for-init shadow");
     CHECK(sizeof(outer) == sizeof(int), "outer typedef is int after nested for");
 }
+#endif
 
 static void test_defer_switch_dead_zone_braced(void)
 {
@@ -15021,6 +15025,52 @@ static void test_generic_const_array_zeroinit(void)
     int arr[_Generic(0, int: 10, default: 20)];
     CHECK_EQ(arr[0], 0, "_Generic const array first elem zero");
     CHECK_EQ(arr[9], 0, "_Generic const array last elem zero");
+}
+
+struct _AnonRetTest
+{
+    int x;
+    int y;
+};
+static int _anon_ret_defer_flag;
+static struct _AnonRetTest _named_struct_ret_with_defer(void)
+{
+    defer _anon_ret_defer_flag = 1;
+    return (struct _AnonRetTest){42, 99};
+}
+static void test_named_struct_return_with_defer(void)
+{
+    _anon_ret_defer_flag = 0;
+    struct _AnonRetTest p = _named_struct_ret_with_defer();
+    CHECK_EQ(p.x, 42, "named struct return with defer: x correct");
+    CHECK_EQ(p.y, 99, "named struct return with defer: y correct");
+    CHECK_EQ(_anon_ret_defer_flag, 1, "named struct return with defer: defer fired");
+}
+
+// Typedef alias for struct: return type captured as typedef name
+typedef struct
+{
+    int val;
+} _TypedefRetTest;
+static int _trt_defer_flag;
+static _TypedefRetTest _typedef_struct_ret_with_defer(void)
+{
+    defer _trt_defer_flag = 1;
+    return (_TypedefRetTest){77};
+}
+static void test_typedef_struct_return_with_defer(void)
+{
+    _trt_defer_flag = 0;
+    _TypedefRetTest r = _typedef_struct_ret_with_defer();
+    CHECK_EQ(r.val, 77, "typedef struct return with defer: value correct");
+    CHECK_EQ(_trt_defer_flag, 1, "typedef struct return with defer: defer fired");
+}
+
+// ── Issue 5A: Raw string with exactly 16-char delimiter ──
+static void test_raw_string_16_char_delimiter(void)
+{
+    const char *s = R"1234567890ABCDEF(sixteen char delim)1234567890ABCDEF";
+    CHECK(strcmp(s, "sixteen char delim") == 0, "raw string exactly 16-char delimiter");
 }
 
 int main(void)
@@ -15143,11 +15193,17 @@ int main(void)
     test_typedef_shadow_braceless_for_nested_loops();
     test_typedef_shadow_for_with_if_body();
 
+#if defined(__GNUC__) && !defined(__clang__)
     test_for_init_typedef_no_leak();
     test_for_init_typedef_braceless_no_leak();
     test_for_init_typedef_nested_loops();
+#endif
     test_defer_switch_dead_zone_braced();
     test_generic_const_array_zeroinit();
+
+    test_named_struct_return_with_defer();
+    test_typedef_struct_return_with_defer();
+    test_raw_string_16_char_delimiter();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

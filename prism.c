@@ -14,6 +14,7 @@
 #ifndef _DARWIN_C_SOURCE
 #define _DARWIN_C_SOURCE
 #endif
+#include <signal.h>
 #include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -1779,6 +1780,18 @@ static bool try_capture_func_return_type(Token *tok)
     return false;
 
   tok = type.end;
+
+  // Reject anonymous struct/union/enum return types.
+  // In C, each anonymous struct definition creates a unique type.
+  // Re-emitting the tokens for _prism_ret_N would create a second,
+  // incompatible type, causing "incompatible types" errors.
+  // Fall through to __auto_type for these cases.
+  if (type.is_struct)
+  {
+    for (Token *t = type_start; t && t != tok && t->kind != TK_EOF; t = t->next)
+      if (equal(t, "{"))
+        return false; // Contains struct/union/enum body — anonymous type
+  }
 
   // Skip pointer decorations and qualifiers: *, const, volatile, restrict
   while (tok && tok->kind != TK_EOF &&
@@ -3780,16 +3793,30 @@ static char *preprocess_with_cc(const char *input_file)
     return NULL;
   }
 
-  // Set up file actions: child stdout → pipe write end, stderr → /dev/null
-  // Redirecting stderr prevents deadlock: if the compiler emits massive stderr
-  // output (e.g., thousands of errors), the child would block writing stderr
-  // while the parent blocks reading stdout, causing a deadlock.
+  // Capture preprocessor stderr to a temp file so we can show diagnostics
+  // on failure, while still avoiding deadlock (parent only reads stdout pipe;
+  // stderr goes to a file the OS buffers independently).
+  char pp_stderr_path[256] = "";
+  {
+    const char *tmpdir = getenv(TMPDIR_ENVVAR);
+    if ((!tmpdir || !*tmpdir) && TMPDIR_ENVVAR_ALT)
+      tmpdir = getenv(TMPDIR_ENVVAR_ALT);
+    if (!tmpdir || !*tmpdir)
+      tmpdir = TMPDIR_FALLBACK;
+    snprintf(pp_stderr_path, sizeof pp_stderr_path, "%s/prism_pp_err_XXXXXX", tmpdir);
+    int fd = mkstemp(pp_stderr_path);
+    if (fd >= 0)
+      close(fd);
+    else
+      pp_stderr_path[0] = '\0'; // Fall back to /dev/null
+  }
   posix_spawn_file_actions_t fa;
   posix_spawn_file_actions_init(&fa);
   posix_spawn_file_actions_addclose(&fa, pipefd[0]);
   posix_spawn_file_actions_adddup2(&fa, pipefd[1], STDOUT_FILENO);
   posix_spawn_file_actions_addclose(&fa, pipefd[1]);
-  posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+  posix_spawn_file_actions_addopen(&fa, STDERR_FILENO,
+                                   pp_stderr_path[0] ? pp_stderr_path : "/dev/null", O_WRONLY | O_TRUNC, 0644);
 
   char **env = build_clean_environ();
   pid_t pid;
@@ -3840,9 +3867,24 @@ static char *preprocess_with_cc(const char *input_file)
   waitpid(pid, &status, 0);
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
   {
+    // Print captured preprocessor stderr so the user sees the actual error
+    if (pp_stderr_path[0])
+    {
+      FILE *ef = fopen(pp_stderr_path, "r");
+      if (ef)
+      {
+        char line[512];
+        while (fgets(line, sizeof line, ef))
+          fputs(line, stderr);
+        fclose(ef);
+      }
+      unlink(pp_stderr_path);
+    }
     free(buf);
     return NULL;
   }
+  if (pp_stderr_path[0])
+    unlink(pp_stderr_path);
 
   return buf;
 }
@@ -5405,6 +5447,10 @@ static int compile_sources(Cli *cli)
 
 int main(int argc, char **argv)
 {
+#ifndef _WIN32
+  // Ignore SIGPIPE so that pipe writes return EPIPE instead of killing the process.
+  signal(SIGPIPE, SIG_IGN);
+#endif
   int status = 0;
   prism_ctx_init();
 
