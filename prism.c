@@ -296,6 +296,7 @@ static File *cached_file = NULL;
 static char out_buf[OUT_BUF_SIZE];
 static int out_buf_pos = 0;
 static int oe_buf_checkpoint = -1;   // Output buffer checkpoint for const+fallback orelse rollback
+static bool oe_buf_flushed = false;  // True if buffer was flushed while checkpoint was active
 static bool use_linemarkers = false; // true = GCC linemarker "# N", false = C99 "#line N"
 
 static TypedefTable typedef_table;
@@ -310,7 +311,7 @@ static inline bool is_valid_varname(Token *tok);
 static void typedef_pop_scope(int scope_depth);
 static TypeSpecResult parse_type_specifier(Token *tok);
 static Token *emit_expr_to_semicolon(Token *tok);
-static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma, bool is_struct_value);
+static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma);
 static Token *try_zero_init_decl(Token *tok);
 
 static inline void control_flow_reset(void) { ctrl = (ControlFlow){0}; }
@@ -492,6 +493,8 @@ static void out_flush(void)
   {
     fwrite(out_buf, 1, out_buf_pos, out_fp);
     out_buf_pos = 0;
+    if (oe_buf_checkpoint >= 0)
+      oe_buf_flushed = true; // Checkpoint data lost — rollback no longer safe
   }
 }
 
@@ -506,7 +509,7 @@ static inline void out_str(const char *s, int len)
 {
   if (__builtin_expect(len <= 0, 0))
     return;
-  if (__builtin_expect((size_t)out_buf_pos + (size_t)len > OUT_BUF_SIZE, 0))
+  if (__builtin_expect((size_t)out_buf_pos + (size_t)len >= OUT_BUF_SIZE, 0))
     out_flush();
   if (__builtin_expect(len > OUT_BUF_SIZE, 0))
   {
@@ -553,7 +556,13 @@ static void out_line(int line_no, const char *file)
 
   out_uint(line_no);
   OUT_LIT(" \"");
+#ifdef _WIN32
+  // Emit forward slashes to avoid MSVC C4129 warnings on backslash escapes
+  for (const char *p = file; *p; p++)
+    out_char(*p == '\\' ? '/' : *p);
+#else
   out_str(file, strlen(file));
+#endif
   OUT_LIT("\"\n");
 }
 
@@ -2422,24 +2431,19 @@ static Token *handle_storage_raw(Token *storage_tok)
 // Emit zeroing for typeof/atomic/VLA variables (pure C99, no <string.h> needed)
 static void emit_typeof_memsets(Token **vars, int count, bool has_volatile)
 {
+  const char *vol = has_volatile ? "volatile " : "";
+  int vol_len = has_volatile ? 9 : 0;
   for (int i = 0; i < count; i++)
   {
-    if (has_volatile)
-    {
-      OUT_LIT(" { volatile char *_p = (volatile char *)&");
-      out_str(vars[i]->loc, vars[i]->len);
-      OUT_LIT("; for (unsigned long _i = 0; _i < sizeof(");
-      out_str(vars[i]->loc, vars[i]->len);
-      OUT_LIT("); _i++) _p[_i] = 0; }");
-    }
-    else
-    {
-      OUT_LIT(" { char *_p = (char *)&");
-      out_str(vars[i]->loc, vars[i]->len);
-      OUT_LIT("; for (unsigned long _i = 0; _i < sizeof(");
-      out_str(vars[i]->loc, vars[i]->len);
-      OUT_LIT("); _i++) _p[_i] = 0; }");
-    }
+    OUT_LIT(" { ");
+    out_str(vol, vol_len);
+    OUT_LIT("char *_p = (");
+    out_str(vol, vol_len);
+    OUT_LIT("char *)&");
+    out_str(vars[i]->loc, vars[i]->len);
+    OUT_LIT("; for (unsigned long _i = 0; _i < sizeof(");
+    out_str(vars[i]->loc, vars[i]->len);
+    OUT_LIT("); _i++) _p[_i] = 0; }");
   }
 }
 
@@ -2592,7 +2596,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
           // MSVC-compatible: roll back output and re-emit with temp variable
           // Instead of: "const T x = val ?: fallback;"
           // Emit: "T _prism_oe_N = (val); const T x = _prism_oe_N ? _prism_oe_N : (fallback);"
-          if (oe_buf_checkpoint >= 0 && out_buf_pos >= oe_buf_checkpoint)
+          if (oe_buf_checkpoint >= 0 && !oe_buf_flushed && out_buf_pos >= oe_buf_checkpoint)
           {
             // Roll back to before type+declarator+initializer emission
             out_buf_pos = oe_buf_checkpoint;
@@ -2727,7 +2731,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
         bool is_struct_value = type_is_sue_not_enum && !decl.is_pointer && !decl.is_array;
         if (is_struct_value)
           error_tok(decl.var_name, "orelse on struct/union values is not supported (memcmp cannot reliably detect zero due to padding)");
-        tok = emit_orelse_action(tok, decl.var_name, type->has_const || decl.is_const, stop_comma, is_struct_value);
+        tok = emit_orelse_action(tok, decl.var_name, type->has_const || decl.is_const, stop_comma);
 
         // Continue processing remaining declarators after comma
         if (stop_comma && equal(tok, ","))
@@ -2886,6 +2890,7 @@ static Token *try_zero_init_decl(Token *tok)
   // Emit pragmas and type
   // Save output buffer position for possible const+fallback orelse rollback
   oe_buf_checkpoint = out_buf_pos;
+  oe_buf_flushed = false;
   if (pragma_start != start)
     emit_range(pragma_start, start);
   emit_range(start, type.end);
@@ -2903,7 +2908,6 @@ static Token *emit_expr_to_semicolon(Token *tok)
   int depth = 0;
   int ternary_depth = 0;
   bool expr_at_stmt_start = false;
-  Token *prev_tok = NULL;
   while (tok->kind != TK_EOF)
   {
     if (tok->flags & TF_OPEN)
@@ -2932,16 +2936,15 @@ static Token *emit_expr_to_semicolon(Token *tok)
     }
 
     emit_tok(tok);
-    prev_tok = tok;
     tok = tok->next;
 
-    if (prev_tok && (equal(prev_tok, "{") || equal(prev_tok, ";") || equal(prev_tok, "}")))
+    if (last_emitted && (equal(last_emitted, "{") || equal(last_emitted, ";") || equal(last_emitted, "}")))
       expr_at_stmt_start = true;
-    else if (prev_tok && equal(prev_tok, ":") && ternary_depth <= 0)
+    else if (last_emitted && equal(last_emitted, ":") && ternary_depth <= 0)
       expr_at_stmt_start = true;
     else
     {
-      if (prev_tok && equal(prev_tok, ":") && ternary_depth > 0)
+      if (last_emitted && equal(last_emitted, ":") && ternary_depth > 0)
         ternary_depth--;
       expr_at_stmt_start = false;
     }
@@ -3092,7 +3095,7 @@ static Token *emit_return_body(Token *tok)
 // For declaration orelse: var_name is the variable, has_const from type/decl.
 // For bare expression orelse: var_name is NULL (condition already emitted).
 // Calls end_statement_after_semicolon() internally for non-block cases.
-static inline void orelse_open(Token *var_name, bool is_struct_value)
+static inline void orelse_open(Token *var_name)
 {
   if (var_name)
   {
@@ -3104,7 +3107,7 @@ static inline void orelse_open(Token *var_name, bool is_struct_value)
     OUT_LIT(" {");
 }
 
-static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma, bool is_struct_value)
+static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma)
 {
   // Block orelse: '{' handled by caller
   if (equal(tok, "{"))
@@ -3124,7 +3127,7 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
   {
     mark_switch_control_exit();
     tok = tok->next;
-    orelse_open(var_name, is_struct_value);
+    orelse_open(var_name);
     if (stop_comma)
     {
       // Multi-declarator context: emit return body stopping at the declarator comma
@@ -3212,7 +3215,7 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
   {
     bool is_break = tok->tag & TT_BREAK;
     mark_switch_control_exit();
-    orelse_open(var_name, is_struct_value);
+    orelse_open(var_name);
     if (FEAT(F_DEFER) && control_flow_has_defers(is_break))
       emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
     out_char(' ');
@@ -3229,7 +3232,7 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
   if (tok->tag & TT_GOTO)
   {
     mark_switch_control_exit();
-    orelse_open(var_name, is_struct_value);
+    orelse_open(var_name);
     tok = tok->next;
     if (FEAT(F_DEFER) && is_identifier_like(tok))
     {
@@ -3960,7 +3963,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
           if (equal(tok, ";"))
             error_tok(tok, "expected statement after 'orelse'");
 
-          tok = emit_orelse_action(tok, NULL, false, NULL, false);
+          tok = emit_orelse_action(tok, NULL, false, NULL);
           continue;
         }
       }
@@ -4997,6 +5000,7 @@ static void add_warn_suppress(ArgvBuilder *ab, bool clang, bool msvc)
     argv_builder_add(ab, "/wd4189"); // local variable initialized but not referenced
     argv_builder_add(ab, "/wd4244"); // possible loss of data (implicit narrowing)
     argv_builder_add(ab, "/wd4267"); // conversion from 'size_t' to 'int'
+    argv_builder_add(ab, "/wd4068"); // unknown pragma (GCC diagnostic pragmas)
     return;
   }
   static const char *w[] = {

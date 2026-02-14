@@ -138,13 +138,17 @@ static int win32_fclose_wrapper(FILE *fp)
             pos = 0;
         rewind(fp);
         char *buf = (char *)malloc((size_t)pos + 1);
-        if (buf)
+        if (!buf)
         {
-            size_t nread = fread(buf, 1, (size_t)pos, fp);
-            buf[nread] = '\0';
-            *win32_memstream_bufp = buf;
-            *win32_memstream_sizep = nread;
+            win32_real_fclose(fp);
+            remove(win32_memstream_path);
+            errno = ENOMEM;
+            return EOF;
         }
+        size_t nread = fread(buf, 1, (size_t)pos, fp);
+        buf[nread] = '\0';
+        *win32_memstream_bufp = buf;
+        *win32_memstream_sizep = nread;
         int ret = win32_real_fclose(fp);
         _unlink(win32_memstream_path);
         win32_memstream_fp = NULL;
@@ -201,9 +205,12 @@ static int mkstemps(char *tmpl, int suffix_len)
     if ((size_t)suffix_len >= len)
         return -1;
 
-    char *try_buf = (char *)malloc(len + 1);
-    if (!try_buf)
+    char try_buf[MAX_PATH];
+    if (len >= MAX_PATH)
+    {
+        errno = ENAMETOOLONG;
         return -1;
+    }
 
     // Find the X's in the template (before the suffix)
     size_t x_end = len - suffix_len;
@@ -235,11 +242,9 @@ static int mkstemps(char *tmpl, int suffix_len)
         if (err == 0 && fd >= 0)
         {
             memcpy(tmpl, try_buf, len + 1);
-            free(try_buf);
             return fd;
         }
     }
-    free(try_buf);
     return -1;
 }
 
@@ -253,7 +258,7 @@ static int chmod(const char *path, mode_t mode)
     return 0;
 }
 
-// No-op on Windows
+/* Stub: Windows callers use get_self_exe_path() via GetModuleFileNameA instead */
 static ssize_t readlink(const char *path, char *buf, size_t bufsize)
 {
     (void)path;
@@ -437,12 +442,14 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
                 SECURITY_ATTRIBUTES sa_nul = {sizeof(sa_nul), NULL, TRUE};
                 hNul = CreateFileA(winpath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                    &sa_nul, OPEN_EXISTING, 0, NULL);
+                if (hNul == INVALID_HANDLE_VALUE)
+                    return INVALID_HANDLE_VALUE;
                 if (a->fd == STDERR_FILENO)
                     hStdErr = hNul;
                 else if (a->fd == STDOUT_FILENO)
                     hStdOut = hNul;
             }
-            // SPAWN_ACT_CLOSE: we handle these after spawn (close our end of pipes)
+            // SPAWN_ACT_CLOSE: handled by the caller manually, not by this function
         }
         si.hStdInput = hStdIn;
         si.hStdOutput = hStdOut;
@@ -627,38 +634,6 @@ static void add_to_user_path(const char *dir)
     snprintf(cmd, sizeof(cmd), "setx PATH \"%%PATH%%;%s\" >nul 2>&1", dir);
     system(cmd);
     fprintf(stderr, "[prism] Added '%s' to your PATH (restart your terminal to use 'prism' directly).\n", dir);
-}
-
-// Atomically create a temp file from an XXXXXX template.
-// Appends win_suffix (e.g. ".c", ".exe") after name generation.
-// Returns 0 on success, -1 on failure.
-static int atomic_mkstemp(char *buf, size_t bufsize, const char *win_suffix)
-{
-    for (int attempt = 0; attempt < 100; attempt++)
-    {
-        char try_buf[MAX_PATH];
-        size_t len = strlen(buf);
-        memcpy(try_buf, buf, len + 1);
-        if (_mktemp_s(try_buf, len + 1) != 0)
-            return -1;
-        if (win_suffix)
-        {
-            size_t tlen = strlen(try_buf);
-            size_t slen = strlen(win_suffix);
-            if (tlen + slen + 1 >= sizeof(try_buf))
-                return -1;
-            memcpy(try_buf + tlen, win_suffix, slen + 1);
-        }
-        int fd;
-        errno_t err = _sopen_s(&fd, try_buf, _O_CREAT | _O_EXCL | _O_WRONLY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
-        if (err == 0 && fd >= 0)
-        {
-            _close(fd);
-            memcpy(buf, try_buf, strlen(try_buf) + 1);
-            return 0;
-        }
-    }
-    return -1;
 }
 
 #endif // PRISM_WINDOWS_C

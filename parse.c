@@ -44,7 +44,7 @@
 #define KW_MARKER 0x80000000UL // Internal marker bit for keyword map: values are (tag | KW_MARKER)
 #define TOKEN_ALLOC_SIZE (((int)sizeof(Token) + 7) & ~7)
 
-#define equal(tok, s)                                                                                                                               \
+#define equal(tok, s) /* known-length strings of 1/2 bytes use branchless comparisons; others use memcmp. Runtime strings fall back to strlen. */   \
     (__builtin_constant_p(s) ? (__builtin_strlen(s) == 1 ? _equal_1(tok, (s)[0]) : __builtin_strlen(s) == 2 ? _equal_2(tok, s)                      \
                                                                                                             : equal_n(tok, s, __builtin_strlen(s))) \
                              : equal_n(tok, s, strlen(s)))
@@ -298,7 +298,7 @@ typedef struct PrismContext
     unsigned long long ret_counter;
     Token *func_ret_type_start; // First token of return type (after storage/function specifiers)
     Token *func_ret_type_end;   // Function name token (exclusive end of return type range)
-    void *active_typeof_vars; // process_declarators heap alloc; freed on longjmp recovery
+    void *active_typeof_vars;   // process_declarators heap alloc; freed on longjmp recovery
 #ifdef PRISM_LIB_MODE
     char active_temp_output[PATH_MAX];
     char *active_membuf;           // open_memstream buffer; freed on longjmp recovery
@@ -329,7 +329,6 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val);
 static inline bool tok_at_bol(Token *tok) { return tok->flags & TF_AT_BOL; }
 static inline bool tok_has_space(Token *tok) { return tok->flags & TF_HAS_SPACE; }
 static inline void tok_set_at_bol(Token *tok, bool v) { tok->flags = v ? (tok->flags | TF_AT_BOL) : (tok->flags & ~TF_AT_BOL); }
-static inline void tok_set_has_space(Token *tok, bool v) { tok->flags = v ? (tok->flags | TF_HAS_SPACE) : (tok->flags & ~TF_HAS_SPACE); }
 
 static ArenaBlock *arena_new_block(size_t min_size, size_t default_size)
 {
@@ -664,7 +663,7 @@ static void free_file_view_cache(void) { hashmap_free_keys(&ctx->file_view_cache
 
 static inline File *tok_file(Token *tok)
 {
-    if (!tok || tok->file_idx >= ctx->input_file_count)
+    if (!tok || tok->file_idx < 0 || tok->file_idx >= ctx->input_file_count)
         return ctx->current_file;
     return ctx->input_files[tok->file_idx];
 }
@@ -721,6 +720,8 @@ static void verror_at(char *filename, char *input, int line_no, char *loc, const
         end++;
 
     int indent = fprintf(stderr, "%s:%d: ", filename, line_no);
+    if (indent < 0)
+        indent = 0;
     fprintf(stderr, "%.*s\n%*s^ ", (int)(end - line), line, indent + (int)(loc - line), "");
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
@@ -742,7 +743,7 @@ noreturn void error_at(char *loc, char *fmt, ...)
 #ifdef PRISM_LIB_MODE
     if (ctx->error_jmp_set)
     {
-        int line = ctx->current_file ? count_lines(ctx->current_file->contents, loc) : 0;
+        int line = ctx->current_file && ctx->current_file->contents ? count_lines(ctx->current_file->contents, loc) : 0;
         vsnprintf(ctx->error_msg, sizeof(ctx->error_msg), fmt, ap);
         va_end(ap);
         lib_error_jump(line);
@@ -1182,7 +1183,6 @@ static char *raw_string_literal_end(char *p)
     }
 
     error_at(p, "unclosed raw string literal");
-    return NULL;
 }
 
 static inline __attribute__((always_inline)) Token *new_token(TokenKind kind, char *start, char *end)
@@ -1280,8 +1280,6 @@ static int get_extended_float_suffix(const char *p, int len, const char **replac
     }
     return 0;
 }
-
-// Note: classify_number logic is merged into scan_pp_number to avoid double-scanning.
 
 // Tag a punctuator token with TT_ASSIGN, TT_MEMBER, or TT_STRUCTURAL
 static inline void classify_punct(Token *t)
@@ -1706,6 +1704,19 @@ static Token *tokenize(File *file)
     return head.next;
 }
 
+static void ensure_keyword_map(void)
+{
+    if (!ctx->keyword_map.capacity)
+        init_keyword_map();
+#ifdef PRISM_LIB_MODE
+    else if (ctx->keyword_map_features != ctx->features)
+    {
+        hashmap_clear(&ctx->keyword_map);
+        init_keyword_map();
+    }
+#endif
+}
+
 // Tokenize from an already-loaded buffer (takes ownership of buf).
 // The buffer must be NUL-terminated. Used by pipe-based preprocessor
 // to avoid writing/reading temp files.
@@ -1714,17 +1725,11 @@ static Token *tokenize_buffer(char *name, char *buf)
     if (!buf)
         return NULL;
 
-    // Init keyword map before new_file() takes ownership of buf.\n    // If init_keyword_map() fails (OOM → longjmp in lib mode), buf hasn't\n    // been stored yet, so the caller can still free it. By failing early\n    // here, we avoid leaking buf.
-    if (!ctx->keyword_map.capacity)
-        init_keyword_map();
-#ifdef PRISM_LIB_MODE
-    // Reinitialize if features changed (e.g., defer toggled between calls)
-    else if (ctx->keyword_map_features != ctx->features)
-    {
-        hashmap_clear(&ctx->keyword_map);
-        init_keyword_map();
-    }
-#endif
+    // Init keyword map before new_file() takes ownership of buf.
+    // If init_keyword_map() fails (OOM → longjmp in lib mode), buf hasn't
+    // been stored yet, so the caller can still free it. By failing early
+    // here, we avoid leaking buf.
+    ensure_keyword_map();
 
     File *file = new_file(name, ctx->input_file_count, buf);
     add_input_file(file);
@@ -1735,15 +1740,7 @@ static Token *tokenize_buffer(char *name, char *buf)
 Token *tokenize_file(char *path)
 {
     // Initialize keyword map on first call
-    if (!ctx->keyword_map.capacity)
-        init_keyword_map();
-#ifdef PRISM_LIB_MODE
-    else if (ctx->keyword_map_features != ctx->features)
-    {
-        hashmap_clear(&ctx->keyword_map);
-        init_keyword_map();
-    }
-#endif
+    ensure_keyword_map();
 
     FILE *fp = fopen(path, "r");
     if (!fp)
