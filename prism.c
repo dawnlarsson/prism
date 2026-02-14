@@ -314,6 +314,7 @@ static TypeSpecResult parse_type_specifier(Token *tok);
 static Token *emit_expr_to_semicolon(Token *tok);
 static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma);
 static Token *try_zero_init_decl(Token *tok);
+static Token *skip_pragma_operators(Token *tok);
 
 static inline void control_flow_reset(void) { ctrl = (ControlFlow){0}; }
 static void walker_init(TokenWalker *w, Token *start, int initial_depth)
@@ -1256,6 +1257,11 @@ static bool is_typedef_like(Token *tok)
     return false;
   if (is_known_typedef(tok))
     return true;
+  // Before falling back to the _t / __ heuristic, check if a shadow was
+  // registered for this name (variable declared with a heuristic-type name).
+  TypedefEntry *e = typedef_lookup(tok);
+  if (e && e->is_shadow)
+    return false;
   return is_typedef_heuristic(tok);
 }
 
@@ -1584,7 +1590,12 @@ static GotoSkipResult goto_skips_check(Token *goto_tok, char *label_name, int la
         has_raw = true;
         t = t->next;
       }
-      if (!equal(t, "extern") && !equal(t, "typedef"))
+      // Skip _Pragma(...) sequences that may precede a declaration
+      if (t && t->len == 7 && equal(t, "_Pragma") && t->next && equal(t->next, "("))
+        t = skip_pragma_operators(t);
+      // static variables have static storage duration — always initialized before
+      // program startup. Jumping over them with goto is safe (C11 §6.2.4¶3).
+      if (!equal(t, "extern") && !equal(t, "typedef") && !equal(t, "static"))
       {
         TypeSpecResult type = parse_type_specifier(t);
         if (type.saw_type)
@@ -2524,13 +2535,13 @@ static void register_param_shadows(Token *open_paren, Token *close_paren)
       last_ident = t;
     if (depth == 0 && (equal(t, ",") || t->next == close_paren))
     {
-      if (last_ident && is_known_typedef(last_ident))
+      if (last_ident && (is_known_typedef(last_ident) || is_typedef_heuristic(last_ident)))
         typedef_add_shadow(last_ident->loc, last_ident->len, 1);
       last_ident = NULL;
     }
   }
   // Handle last parameter (if close_paren was hit without trailing comma)
-  if (last_ident && is_known_typedef(last_ident))
+  if (last_ident && (is_known_typedef(last_ident) || is_typedef_heuristic(last_ident)))
     typedef_add_shadow(last_ident->loc, last_ident->len, 1);
 }
 
@@ -2538,7 +2549,7 @@ static void register_param_shadows(Token *open_paren, Token *close_paren)
 static inline void register_decl_shadows(Token *var_name, bool effective_vla)
 {
   int depth = ctx->defer_depth + (ctrl.for_init ? 1 : 0);
-  if (is_known_typedef(var_name))
+  if (is_known_typedef(var_name) || is_typedef_heuristic(var_name))
     typedef_add_shadow(var_name->loc, var_name->len, depth);
   if (effective_vla && var_name)
     typedef_add_vla_var(var_name->loc, var_name->len, depth);
@@ -3149,14 +3160,21 @@ static Token *handle_defer_keyword(Token *tok)
     if (!at_top && (t->tag & TT_DEFER) && !is_known_typedef(t) && !equal(t->next, ":") &&
         !(t->next && (t->next->tag & TT_ASSIGN)))
       error_tok(defer_keyword, "nested defer is not supported (found 'defer' inside deferred block)");
-    // return/goto inside a braced defer body would bypass other defers (they are
-    // emitted as inline cleanup code, so a raw 'return' exits the function).
+    // return/goto/break/continue inside a braced defer body would bypass other defers
+    // (they are emitted as inline cleanup code, so a raw 'return' exits the function,
+    // and 'break'/'continue' affect the parent loop/switch, skipping earlier defers).
     if (!at_top && t->kind == TK_KEYWORD && (t->tag & TT_RETURN))
       error_tok(t, "'return' inside defer block would bypass remaining defers; "
                    "move the return after the deferred scope");
     if (!at_top && t->kind == TK_KEYWORD && (t->tag & TT_GOTO) && !is_known_typedef(t))
       error_tok(t, "'goto' inside defer block could bypass remaining defers; "
                    "move the goto after the deferred scope");
+    if (!at_top && t->kind == TK_KEYWORD && (t->tag & TT_BREAK))
+      error_tok(t, "'break' inside defer block would bypass remaining defers; "
+                   "wrap complex cleanup in a function");
+    if (!at_top && t->kind == TK_KEYWORD && (t->tag & TT_CONTINUE))
+      error_tok(t, "'continue' inside defer block would bypass remaining defers; "
+                   "wrap complex cleanup in a function");
   }
 
   defer_add(defer_keyword, stmt_start, stmt_end);
@@ -4038,12 +4056,12 @@ static int transpile_tokens(Token *tok, FILE *fp)
     emit_system_includes();
   }
 
-  bool next_func_returns_void = false; // Track void functions at top level
-  bool next_func_ret_captured = false; // Track if return type was already captured
-  Token *prev_toplevel_tok = NULL;     // Track previous token at top level for function detection
-  Token *last_toplevel_paren = NULL;   // Track last ')' at top level for K&R detection
+  bool next_func_returns_void = false;    // Track void functions at top level
+  bool next_func_ret_captured = false;    // Track if return type was already captured
+  Token *prev_toplevel_tok = NULL;        // Track previous token at top level for function detection
+  Token *last_toplevel_paren = NULL;      // Track last ')' at top level for K&R detection
   Token *last_toplevel_open_paren = NULL; // Track matching '(' for param shadow detection
-  int toplevel_paren_depth = 0;          // Depth counter for top-level paren tracking
+  int toplevel_paren_depth = 0;           // Depth counter for top-level paren tracking
 
   // Walk tokens and emit
   while (tok->kind != TK_EOF)

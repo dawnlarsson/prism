@@ -15110,14 +15110,16 @@ static void test_typeof_const_zero_init(void)
 }
 
 // Function parameter that shadows a typedef must be treated as a variable, not a type
-static int _param_shadow_helper(int MyInt) {
+static int _param_shadow_helper(int MyInt)
+{
     int y = 3;
-    int result = MyInt * y;  // multiplication, NOT pointer declaration
+    int result = MyInt * y; // multiplication, NOT pointer declaration
     return result;
 }
 
-static void _param_shadow_scope_check(void) {
-    MyInt x;  // MyInt should be typedef again after _param_shadow_helper
+static void _param_shadow_scope_check(void)
+{
+    MyInt x; // MyInt should be typedef again after _param_shadow_helper
     CHECK_EQ(x, 0, "param shadow: typedef restored after function");
 }
 
@@ -15125,6 +15127,96 @@ static void test_param_typedef_shadow(void)
 {
     CHECK_EQ(_param_shadow_helper(5), 15, "param shadow: multiplication not ptr decl");
     _param_shadow_scope_check();
+}
+
+// goto over static variable should be allowed (static storage = always initialized)
+static void test_goto_over_static_decl(void)
+{
+    goto _gos_label;
+    static int _gos_x = 42;
+_gos_label:
+    CHECK_EQ(_gos_x, 42, "goto over static decl: allowed and value correct");
+}
+
+// break/continue inside defer body is now a compile-time error.
+// Prism rejects these because defers are emitted as inline cleanup code,
+// so a raw 'break'/'continue' would affect the parent loop/switch,
+// silently skipping earlier defers.
+// Cannot test directly because the code errors during transpilation.
+// See test_lib.c test_defer_break_continue_rejected() for error message verification.
+static void test_defer_break_continue_rejected(void)
+{
+    // Bare break/continue inside defer body: caught by "missing ';'" heuristic
+    CHECK(1, "defer break; rejected (compile error)");
+    CHECK(1, "defer continue; rejected (compile error)");
+    // Braced break/continue inside defer body: caught by "unterminated" or !at_top check
+    CHECK(1, "defer { break; } rejected (compile error)");
+    CHECK(1, "defer { continue; } rejected (compile error)");
+}
+
+// _t heuristic shadowing: a variable ending in _t must suppress the typedef heuristic
+// so that expressions like count_t * x aren't misread as pointer declarations.
+static void test_t_heuristic_shadow_mul(void)
+{
+    // count_t looks like a typedef to the _t heuristic,
+    // but declaring 'int count_t' should shadow it.
+    int count_t = 10;
+    int x = 2;
+    int result = count_t * x; // multiplication, NOT pointer decl
+    CHECK_EQ(result, 20, "_t shadow: multiplication not misread as decl");
+}
+
+static void test_t_heuristic_shadow_arith(void)
+{
+    // Arithmetic on a _t-shadowed variable
+    int offset_t = 7;
+    int y = offset_t + 3;
+    CHECK_EQ(y, 10, "_t shadow: addition works");
+    y = offset_t - 2;
+    CHECK_EQ(y, 5, "_t shadow: subtraction works");
+}
+
+static void test_t_heuristic_shadow_ptr_deref(void)
+{
+    // Dereferencing through a pointer named foo_t
+    int val = 42;
+    int *ptr_t = &val;
+    int got = *ptr_t; // dereference, not a declaration
+    CHECK_EQ(got, 42, "_t shadow: pointer deref not misread as decl");
+}
+
+static void test_t_heuristic_shadow_scope(void)
+{
+    // Shadow should be scoped — after block, the heuristic should resume
+    {
+        int size_t = 99; // shadows the real size_t inside this block
+        int z = size_t * 2;
+        CHECK_EQ(z, 198, "_t shadow in scope: mul works");
+    }
+    // After the block, size_t should be a type again
+    size_t n = 0;
+    (void)n;
+    CHECK(1, "_t shadow: real size_t accessible after block");
+}
+
+static void test_t_heuristic_shadow_param(void)
+{
+    // Function-scoped via a helper (parameters should shadow too)
+    // We test this inline with a block to simulate the effect
+    {
+        int count_t = 5;
+        int arr[3];
+        arr[0] = count_t; // index expression, not decl
+        CHECK_EQ(arr[0], 5, "_t shadow: array index expr works");
+    }
+}
+
+static void test_t_heuristic_noshadow(void)
+{
+    // Verify the heuristic still works for real typedefs
+    size_t a = 0;
+    (void)a;
+    CHECK(1, "_t heuristic: size_t still recognized as type");
 }
 
 int main(void)
@@ -15264,6 +15356,15 @@ int main(void)
     test_goto_array_ptr_decl_after_label();
     test_typeof_const_zero_init();
     test_param_typedef_shadow();
+    test_goto_over_static_decl();
+    test_defer_break_continue_rejected();
+
+    test_t_heuristic_shadow_mul();
+    test_t_heuristic_shadow_arith();
+    test_t_heuristic_shadow_ptr_deref();
+    test_t_heuristic_shadow_scope();
+    test_t_heuristic_shadow_param();
+    test_t_heuristic_noshadow();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

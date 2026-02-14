@@ -680,6 +680,117 @@ static void test_error_recovery_no_exit(void)
     }
 }
 
+static void test_defer_break_continue_rejected(void)
+{
+    printf("\n--- Defer Break/Continue Rejection Tests ---\n");
+
+    PrismFeatures features = prism_defaults();
+
+    // Test 1: bare 'break' inside defer statement
+    const char *code_break_bare =
+        "int main(void) {\n"
+        "    for (int i = 0; i < 10; i++) {\n"
+        "        defer break;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n";
+    char *path = create_temp_file(code_break_bare);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status != PRISM_OK, "defer break; rejected");
+        CHECK(result.error_msg != NULL, "defer break; has error message");
+        if (result.error_msg)
+            CHECK(strstr(result.error_msg, "break") != NULL ||
+                      strstr(result.error_msg, "missing") != NULL,
+                  "defer break; error mentions break or missing");
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+
+    // Test 2: bare 'continue' inside defer statement
+    const char *code_cont_bare =
+        "int main(void) {\n"
+        "    for (int i = 0; i < 10; i++) {\n"
+        "        defer continue;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n";
+    path = create_temp_file(code_cont_bare);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status != PRISM_OK, "defer continue; rejected");
+        CHECK(result.error_msg != NULL, "defer continue; has error message");
+        if (result.error_msg)
+            CHECK(strstr(result.error_msg, "continue") != NULL ||
+                      strstr(result.error_msg, "missing") != NULL,
+                  "defer continue; error mentions continue or missing");
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+
+    // Test 3: break inside braced defer body (with trailing ;)
+    const char *code_break_braced =
+        "int main(void) {\n"
+        "    for (int i = 0; i < 10; i++) {\n"
+        "        defer { (void)0; break; };\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n";
+    path = create_temp_file(code_break_braced);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status != PRISM_OK, "defer { break; }; rejected");
+        CHECK(result.error_msg != NULL, "defer { break; }; has error message");
+        if (result.error_msg)
+            CHECK(strstr(result.error_msg, "break") != NULL &&
+                      strstr(result.error_msg, "bypass") != NULL,
+                  "defer { break; }; error mentions bypass");
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+
+    // Test 4: continue inside braced defer body (with trailing ;)
+    const char *code_cont_braced =
+        "int main(void) {\n"
+        "    for (int i = 0; i < 10; i++) {\n"
+        "        defer { (void)0; continue; };\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n";
+    path = create_temp_file(code_cont_braced);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status != PRISM_OK, "defer { continue; }; rejected");
+        CHECK(result.error_msg != NULL, "defer { continue; }; has error message");
+        if (result.error_msg)
+            CHECK(strstr(result.error_msg, "continue") != NULL &&
+                      strstr(result.error_msg, "bypass") != NULL,
+                  "defer { continue; }; error mentions bypass");
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+
+    // Test 5: Recovery — transpiler still works after break/continue errors
+    const char *valid_code = "int main(void) { int x; return x; }\n";
+    path = create_temp_file(valid_code);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK_EQ(result.status, PRISM_OK, "transpiler recovers after break/continue rejection");
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+}
+
 int main(void)
 {
     printf("=== PRISM LIBRARY MODE TEST SUITE ===\n");
@@ -697,6 +808,7 @@ int main(void)
     test_double_free_protection();
     test_repeated_reset();
     test_error_recovery_no_exit();
+    test_defer_break_continue_rejected();
     test_memory_leak_stress(); // Run last as it does many iterations
 
     printf("\n========================================\n");
