@@ -1139,9 +1139,9 @@ static char *string_literal_end(char *p)
             error_at(p, "unclosed string literal");
         if (*p == '\\')
         {
-            p++;
-            if (*p == '\0')
+            if (p[1] == '\0')
                 error_at(p, "unclosed string literal");
+            p++;
         }
     }
     return p;
@@ -1422,11 +1422,14 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
         filename = malloc(raw_len + 1);
         if (!filename)
             error("out of memory");
-        // Unescape backslash sequences in the filename
+        // Unescape doubled backslashes in the filename.
+        // Only consume a backslash when it precedes another backslash
+        // (i.e. \\  -> \).  Windows paths use single backslashes
+        // (e.g. C:\temp\file.c) which must be preserved.
         int len = 0;
         for (char *s = start; s < start + raw_len; s++)
         {
-            if (*s == '\\' && s + 1 < start + raw_len)
+            if (*s == '\\' && s + 1 < start + raw_len && s[1] == '\\')
                 s++;
             filename[len++] = *s;
         }

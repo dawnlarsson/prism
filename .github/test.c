@@ -14839,6 +14839,107 @@ static void test_raw_string_near_max_delimiter(void)
     CHECK(strcmp(s, "near max") == 0, "raw string 15-char delimiter");
 }
 
+static void test_typedef_shadow_braceless_for_complex(void)
+{
+    typedef int _TSFC;
+    _TSFC a;
+    CHECK_EQ(a, 0, "typedef before for-shadow complex");
+    for (int _TSFC = 0; _TSFC < 3; _TSFC++)
+        if (_TSFC == 1)
+            ;
+    _TSFC b;
+    CHECK_EQ(b, 0, "typedef after braceless for with if body");
+    CHECK(sizeof(b) == sizeof(int), "typedef size after complex braceless for");
+}
+
+static void test_typeof_large_struct_zeroinit(void)
+{
+#ifdef __GNUC__
+    struct _large_tzi {
+        int data[256];
+        char name[64];
+        double values[32];
+    };
+    struct _large_tzi ref = {{0}, {0}, {0}};
+    typeof(ref) copy;
+    int all_zero = 1;
+    for (int i = 0; i < 256; i++)
+        if (copy.data[i] != 0) all_zero = 0;
+    for (int i = 0; i < 64; i++)
+        if (copy.name[i] != 0) all_zero = 0;
+    for (int i = 0; i < 32; i++)
+        if (copy.values[i] != 0.0) all_zero = 0;
+    CHECK(all_zero, "typeof large struct zeroinit: all fields zero");
+#endif
+}
+
+static void test_typeof_nested_struct_zeroinit(void)
+{
+#ifdef __GNUC__
+    struct _inner_tnz { int x; int y; };
+    struct _outer_tnz { struct _inner_tnz a; struct _inner_tnz b; int c; };
+    struct _outer_tnz ref;
+    ref.a.x = 0;
+    typeof(ref) copy;
+    CHECK_EQ(copy.a.x, 0, "typeof nested struct: a.x zero");
+    CHECK_EQ(copy.a.y, 0, "typeof nested struct: a.y zero");
+    CHECK_EQ(copy.b.x, 0, "typeof nested struct: b.x zero");
+    CHECK_EQ(copy.b.y, 0, "typeof nested struct: b.y zero");
+    CHECK_EQ(copy.c, 0, "typeof nested struct: c zero");
+#endif
+}
+
+static void test_typedef_shadow_braceless_for_multi_stmt(void)
+{
+    typedef int _TSFM;
+    _TSFM v1;
+    CHECK_EQ(v1, 0, "typedef before multi braceless for");
+    for (int _TSFM = 0; _TSFM < 2; _TSFM++)
+        ;
+    _TSFM v2;
+    CHECK_EQ(v2, 0, "typedef after first braceless for");
+    for (int _TSFM = 10; _TSFM < 12; _TSFM++)
+        ;
+    _TSFM v3;
+    CHECK_EQ(v3, 0, "typedef after second braceless for");
+}
+
+static void test_typedef_shadow_braceless_for_nested_loops(void)
+{
+    typedef int _TSFN;
+    _TSFN a;
+    CHECK_EQ(a, 0, "typedef before nested braceless for");
+    for (int _TSFN = 0; _TSFN < 2; _TSFN++)
+        for (int j = 0; j < 2; j++)
+            ;
+    _TSFN b;
+    CHECK_EQ(b, 0, "typedef after nested braceless for");
+    for (int i = 0; i < 2; i++)
+        for (int _TSFN = 0; _TSFN < 2; _TSFN++)
+            ;
+    _TSFN c;
+    CHECK_EQ(c, 0, "typedef after inner braceless for shadow");
+}
+
+static void test_typedef_shadow_for_with_if_body(void)
+{
+    typedef int _TSFI;
+    _TSFI x;
+    CHECK_EQ(x, 0, "typedef before for-if-else shadow");
+    for (int _TSFI = 0; _TSFI < 3; _TSFI++)
+    {
+        if (_TSFI == 0)
+            ;
+        else if (_TSFI == 1)
+            ;
+        else
+            ;
+    }
+    _TSFI y;
+    CHECK_EQ(y, 0, "typedef after for-if-else shadow");
+    CHECK(sizeof(y) == sizeof(int), "typedef size after for-if-else");
+}
+
 int main(void)
 {
     printf("=== PRISM TEST SUITE ===\n");
@@ -14951,6 +15052,13 @@ int main(void)
     test_typedef_nested_for_braceless();
     test_raw_string_max_delimiter();
     test_raw_string_near_max_delimiter();
+
+    test_typedef_shadow_braceless_for_complex();
+    test_typeof_large_struct_zeroinit();
+    test_typeof_nested_struct_zeroinit();
+    test_typedef_shadow_braceless_for_multi_stmt();
+    test_typedef_shadow_braceless_for_nested_loops();
+    test_typedef_shadow_for_with_if_body();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

@@ -2445,15 +2445,28 @@ static void emit_typeof_memsets(Token **vars, int count, bool has_volatile)
   int vol_len = has_volatile ? 9 : 0;
   for (int i = 0; i < count; i++)
   {
-    OUT_LIT(" { ");
-    out_str(vol, vol_len);
-    OUT_LIT("char *_p = (");
-    out_str(vol, vol_len);
-    OUT_LIT("char *)&");
-    out_str(vars[i]->loc, vars[i]->len);
-    OUT_LIT("; for (unsigned long _i = 0; _i < sizeof(");
-    out_str(vars[i]->loc, vars[i]->len);
-    OUT_LIT("); _i++) _p[_i] = 0; }");
+    // Use memset() instead of a byte-by-byte loop for better codegen.
+    // The volatile path still needs a byte loop (memset drops volatile semantics).
+    if (has_volatile)
+    {
+      OUT_LIT(" { ");
+      out_str(vol, vol_len);
+      OUT_LIT("char *_p = (");
+      out_str(vol, vol_len);
+      OUT_LIT("char *)&");
+      out_str(vars[i]->loc, vars[i]->len);
+      OUT_LIT("; for (unsigned long _i = 0; _i < sizeof(");
+      out_str(vars[i]->loc, vars[i]->len);
+      OUT_LIT("); _i++) _p[_i] = 0; }");
+    }
+    else
+    {
+      OUT_LIT(" memset(&");
+      out_str(vars[i]->loc, vars[i]->len);
+      OUT_LIT(", 0, sizeof(");
+      out_str(vars[i]->loc, vars[i]->len);
+      OUT_LIT("));");
+    }
   }
 }
 
@@ -2479,9 +2492,14 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
   while (tok && tok->kind != TK_EOF)
   {
     Token *decl_start = tok; // Save start of current declarator for rollback
+    int buf_pos_before_decl = out_buf_pos;
     DeclResult decl = parse_declarator(tok, true);
     if (!decl.end || !decl.var_name)
     {
+      // Rollback any tokens emitted by parse_declarator before it failed,
+      // so the caller can re-emit the original tokens without duplication.
+      if (!oe_buf_flushed && buf_pos_before_decl <= out_buf_pos)
+        out_buf_pos = buf_pos_before_decl;
       free(typeof_vars);
       ctx->active_typeof_vars = NULL;
       return NULL;
@@ -2916,6 +2934,13 @@ static Token *try_zero_init_decl(Token *tok)
   emit_range(start, type.end);
 
   Token *result = process_declarators(type.end, &type, is_raw, start);
+  if (!result && !oe_buf_flushed && oe_buf_checkpoint >= 0)
+  {
+    // Rollback all emitted output (type specifier + partial declarator)
+    // so the caller's main loop can re-emit the original tokens.
+    out_buf_pos = oe_buf_checkpoint;
+    last_emitted = NULL;
+  }
   oe_buf_checkpoint = -1;
   return result;
 }
