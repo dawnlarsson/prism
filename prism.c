@@ -2504,6 +2504,36 @@ static void emit_typeof_memsets(Token **vars, int count, bool has_volatile)
   }
 }
 
+// Register typedef shadows for function parameters that shadow typedef names.
+// Walks the parameter list between open_paren and close_paren.
+// In each parameter declaration, the last identifier before ',' or ')' at depth 0
+// is the parameter name. If it shadows a typedef, register it at depth 1 (function body).
+static void register_param_shadows(Token *open_paren, Token *close_paren)
+{
+  if (!open_paren || !close_paren)
+    return;
+  Token *last_ident = NULL;
+  int depth = 0;
+  for (Token *t = open_paren->next; t && t != close_paren && t->kind != TK_EOF; t = t->next)
+  {
+    if (t->flags & TF_OPEN)
+      depth++;
+    else if (t->flags & TF_CLOSE)
+      depth--;
+    else if (depth == 0 && is_valid_varname(t) && !(t->tag & (TT_QUALIFIER | TT_TYPE | TT_SUE | TT_TYPEOF | TT_ATTR)))
+      last_ident = t;
+    if (depth == 0 && (equal(t, ",") || t->next == close_paren))
+    {
+      if (last_ident && is_known_typedef(last_ident))
+        typedef_add_shadow(last_ident->loc, last_ident->len, 1);
+      last_ident = NULL;
+    }
+  }
+  // Handle last parameter (if close_paren was hit without trailing comma)
+  if (last_ident && is_known_typedef(last_ident))
+    typedef_add_shadow(last_ident->loc, last_ident->len, 1);
+}
+
 // Register typedef shadows and VLA variables for a declarator
 static inline void register_decl_shadows(Token *var_name, bool effective_vla)
 {
@@ -4012,6 +4042,8 @@ static int transpile_tokens(Token *tok, FILE *fp)
   bool next_func_ret_captured = false; // Track if return type was already captured
   Token *prev_toplevel_tok = NULL;     // Track previous token at top level for function detection
   Token *last_toplevel_paren = NULL;   // Track last ')' at top level for K&R detection
+  Token *last_toplevel_open_paren = NULL; // Track matching '(' for param shadow detection
+  int toplevel_paren_depth = 0;          // Depth counter for top-level paren tracking
 
   // Walk tokens and emit
   while (tok->kind != TK_EOF)
@@ -4047,8 +4079,20 @@ static int transpile_tokens(Token *tok, FILE *fp)
         track_generic_paren(tok);
       if (ctx->defer_depth == 0)
       {
-        if (match_ch(tok, ')'))
-          last_toplevel_paren = tok;
+        if (match_ch(tok, '('))
+        {
+          if (toplevel_paren_depth == 0)
+            last_toplevel_open_paren = tok;
+          toplevel_paren_depth++;
+        }
+        else if (match_ch(tok, ')'))
+        {
+          if (--toplevel_paren_depth <= 0)
+          {
+            toplevel_paren_depth = 0;
+            last_toplevel_paren = tok;
+          }
+        }
         prev_toplevel_tok = tok;
       }
       emit_tok(tok);
@@ -4225,6 +4269,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
           if (is_func_def)
           {
             scan_labels_in_function(tok);
+            register_param_shadows(last_toplevel_open_paren, last_toplevel_paren);
             ctx->current_func_returns_void = next_func_returns_void;
             // Clear captured return type for void functions or when capture didn't succeed
             if (next_func_returns_void || !next_func_ret_captured)
@@ -4301,8 +4346,20 @@ static int transpile_tokens(Token *tok, FILE *fp)
     // Track previous token at top level for function detection
     if (ctx->defer_depth == 0)
     {
-      if (match_ch(tok, ')'))
-        last_toplevel_paren = tok;
+      if (match_ch(tok, '('))
+      {
+        if (toplevel_paren_depth == 0)
+          last_toplevel_open_paren = tok;
+        toplevel_paren_depth++;
+      }
+      else if (match_ch(tok, ')'))
+      {
+        if (--toplevel_paren_depth <= 0)
+        {
+          toplevel_paren_depth = 0;
+          last_toplevel_paren = tok;
+        }
+      }
       prev_toplevel_tok = tok;
     }
 

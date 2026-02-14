@@ -15109,6 +15109,24 @@ static void test_typeof_const_zero_init(void)
     CHECK_EQ(b, 0, "const typeof(int) zero-init via = {0}");
 }
 
+// Function parameter that shadows a typedef must be treated as a variable, not a type
+static int _param_shadow_helper(int MyInt) {
+    int y = 3;
+    int result = MyInt * y;  // multiplication, NOT pointer declaration
+    return result;
+}
+
+static void _param_shadow_scope_check(void) {
+    MyInt x;  // MyInt should be typedef again after _param_shadow_helper
+    CHECK_EQ(x, 0, "param shadow: typedef restored after function");
+}
+
+static void test_param_typedef_shadow(void)
+{
+    CHECK_EQ(_param_shadow_helper(5), 15, "param shadow: multiplication not ptr decl");
+    _param_shadow_scope_check();
+}
+
 int main(void)
 {
     printf("=== PRISM TEST SUITE ===\n");
@@ -15245,6 +15263,7 @@ int main(void)
     test_goto_fnptr_decl_before_goto();
     test_goto_array_ptr_decl_after_label();
     test_typeof_const_zero_init();
+    test_param_typedef_shadow();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);
