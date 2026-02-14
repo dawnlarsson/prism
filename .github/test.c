@@ -14359,6 +14359,72 @@ static void test_const_orelse_scalar_fallback(void)
     CHECK_EQ(b, 42, "const orelse scalar: zero uses fallback");
 }
 
+static int _coe_scalar_ctr;
+static int _coe_scalar_fn(int v)
+{
+    _coe_scalar_ctr++;
+    return v;
+}
+
+static void test_const_orelse_scalar_eval_once(void)
+{
+    _coe_scalar_ctr = 0;
+    const int a = _coe_scalar_fn(7) orelse 99;
+    CHECK_EQ(a, 7, "const orelse scalar eval: non-zero kept");
+    CHECK_EQ(_coe_scalar_ctr, 1, "const orelse scalar eval: called once (truthy)");
+
+    _coe_scalar_ctr = 0;
+    const int b = _coe_scalar_fn(0) orelse 99;
+    CHECK_EQ(b, 99, "const orelse scalar eval: zero uses fallback");
+    CHECK_EQ(_coe_scalar_ctr, 1, "const orelse scalar eval: called once (falsy)");
+}
+
+static int _coe_multi_ctr;
+static int _coe_multi_fn(int v)
+{
+    _coe_multi_ctr++;
+    return v;
+}
+
+static void test_const_orelse_multi_eval_once(void)
+{
+    _coe_multi_ctr = 0;
+    const int a = _coe_multi_fn(3) orelse 10, b = _coe_multi_fn(0) orelse 20;
+    CHECK_EQ(a, 3, "const orelse multi eval: first non-zero");
+    CHECK_EQ(b, 20, "const orelse multi eval: second zero fallback");
+    CHECK_EQ(_coe_multi_ctr, 2, "const orelse multi eval: each called once");
+}
+
+static void test_defer_all_scopes_fire(void)
+{
+    log_reset();
+    {
+        defer log_append("D");
+        {
+            defer log_append("C");
+            {
+                defer log_append("B");
+                {
+                    defer log_append("A");
+                    log_append("0");
+                }
+            }
+        }
+    }
+    CHECK_LOG("0ABCD", "all nested defers fire in order");
+}
+
+static void test_defer_loop_all_iters_fire(void)
+{
+    log_reset();
+    for (int i = 0; i < 4; i++)
+    {
+        defer log_append("X");
+        log_append(".");
+    }
+    CHECK_LOG(".X.X.X.X", "defer fires every loop iteration");
+}
+
 static void test_typedef_braceless_if_no_leak(void)
 {
     typedef int _BIF;
@@ -14623,12 +14689,12 @@ static void test_const_orelse_ptr_eval_once(void)
     int val = 42;
     int fb = 99;
     _oe_eval_ctr = 0;
-    const int *p = _oe_eval_fn(&val) orelse &fb;
+    const int *p = _oe_eval_fn(&val) orelse & fb;
     CHECK(*p == 42, "const ptr orelse: non-null preserved");
     CHECK_EQ(_oe_eval_ctr, 1, "const ptr orelse: init evaluated once");
 
     _oe_eval_ctr = 0;
-    const int *q = _oe_eval_fn(NULL) orelse &fb;
+    const int *q = _oe_eval_fn(NULL) orelse & fb;
     CHECK(*q == 99, "const ptr orelse: null uses fallback");
     CHECK_EQ(_oe_eval_ctr, 1, "const ptr orelse null: init evaluated once");
 }
@@ -14853,6 +14919,10 @@ int main(void)
     test_multi_ptr_zeroinit();
     test_typedef_scope_after_braceless();
     test_const_orelse_scalar_fallback();
+    test_const_orelse_scalar_eval_once();
+    test_const_orelse_multi_eval_once();
+    test_defer_all_scopes_fire();
+    test_defer_loop_all_iters_fire();
 
     test_typedef_braceless_if_no_leak();
     test_typedef_braceless_while_no_leak();

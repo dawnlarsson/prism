@@ -2237,9 +2237,9 @@ static DeclResult parse_declarator(Token *tok, bool emit)
     {
       r.is_pointer = true;
       r.is_const = false; // Reset: const after a new '*' applies to this pointer level
-      if (++ptr_depth > 256)
+      if (++ptr_depth > 1024)
       {
-        warn_tok(tok, "pointer depth exceeds 256; zero-initialization skipped for this declaration");
+        warn_tok(tok, "pointer depth exceeds 1024; zero-initialization skipped for this declaration");
         r.end = NULL;
         return r;
       }
@@ -2648,11 +2648,11 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
           }
           else
           {
-            // Buffer was flushed — can't roll back for temp variable approach.
-            // Emit standard ternary with value re-evaluation instead of GNU ?: extension.
-            OUT_LIT(" ? (");
-            emit_range(val_start, orelse_tok);
-            OUT_LIT(") : (");
+            // Buffer was flushed despite pre-flush — declaration exceeds buffer capacity.
+            // Cannot roll back for temp variable approach; refuse rather than emit
+            // a ternary that would double-evaluate the init expression.
+            error_tok(orelse_tok, "const orelse fallback: declaration too large for output buffer rollback "
+                                  "(would cause double-evaluation of init expression)");
           }
 
           // Emit fallback expression tokens
@@ -2905,7 +2905,10 @@ static Token *try_zero_init_decl(Token *tok)
   }
 
   // Emit pragmas and type
-  // Save output buffer position for possible const+fallback orelse rollback
+  // Flush buffer before setting checkpoint so rollback is always possible.
+  // Without this, a mid-declaration flush would prevent const+fallback orelse
+  // from using the temp variable approach, potentially causing double-evaluation.
+  out_flush();
   oe_buf_checkpoint = out_buf_pos;
   oe_buf_flushed = false;
   if (pragma_start != start)
@@ -3043,6 +3046,14 @@ static Token *handle_defer_keyword(Token *tok)
     if (!at_top && (t->tag & TT_DEFER) && !is_known_typedef(t) && !equal(t->next, ":") &&
         !(t->next && (t->next->tag & TT_ASSIGN)))
       error_tok(defer_keyword, "nested defer is not supported (found 'defer' inside deferred block)");
+    // return/goto inside a braced defer body would bypass other defers (they are
+    // emitted as inline cleanup code, so a raw 'return' exits the function).
+    if (!at_top && t->kind == TK_KEYWORD && (t->tag & TT_RETURN))
+      error_tok(t, "'return' inside defer block would bypass remaining defers; "
+                   "move the return after the deferred scope");
+    if (!at_top && t->kind == TK_KEYWORD && (t->tag & TT_GOTO) && !is_known_typedef(t))
+      error_tok(t, "'goto' inside defer block could bypass remaining defers; "
+                   "move the goto after the deferred scope");
   }
 
   defer_add(defer_keyword, stmt_start, stmt_end);

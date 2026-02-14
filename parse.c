@@ -61,13 +61,9 @@
             size_t new_cap = (cap) == 0 ? ((init_cap) > 0 ? (size_t)(init_cap) : 1) : (size_t)(cap) * 2; \
             while (new_cap < (size_t)(count))                                                            \
                 new_cap *= 2;                                                                            \
-            T *old_ptr_ = (arr);                                                                         \
             T *tmp = realloc((arr), sizeof(T) * new_cap);                                                \
             if (!tmp)                                                                                    \
             {                                                                                            \
-                free(old_ptr_);                                                                          \
-                (arr) = NULL;                                                                            \
-                (cap) = 0;                                                                               \
                 error("out of memory");                                                                  \
             }                                                                                            \
             (arr) = tmp;                                                                                 \
