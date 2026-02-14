@@ -2941,6 +2941,16 @@ static Token *try_zero_init_decl(Token *tok)
     out_buf_pos = oe_buf_checkpoint;
     last_emitted = NULL;
   }
+  else if (!result && oe_buf_flushed)
+  {
+    // Buffer was flushed to stdout during type/declarator emission and then
+    // the declarator parse failed.  We cannot roll back what was already
+    // written, so the output stream is now corrupt.  Abort rather than
+    // silently producing broken code.
+    error_tok(warn_loc, "declaration parse rolled back after output buffer was "
+                        "already flushed (output may be corrupt). Please simplify the "
+                        "declaration or report this as a bug.");
+  }
   oe_buf_checkpoint = -1;
   return result;
 }
@@ -3982,8 +3992,11 @@ static int transpile_tokens(Token *tok, FILE *fp)
     // Slower path: statement-start processing and tagged tokens
 
     // Track typedefs (must precede zero-init check)
+    // For-init typedefs (e.g., for (typedef int T;;)) must be registered at
+    // defer_depth + 1 so they're scoped to the for statement and cleaned up
+    // when the loop body's '}' or braceless semicolon pops that depth.
     if (ctx->at_stmt_start && ctx->struct_depth == 0 && (tag & TT_TYPEDEF))
-      parse_typedef_declaration(tok, ctx->defer_depth);
+      parse_typedef_declaration(tok, ctx->defer_depth + (ctrl.for_init ? 1 : 0));
 
     // Zero-init declarations at statement start
     if (ctx->at_stmt_start && (!ctrl.pending || ctrl.for_init))

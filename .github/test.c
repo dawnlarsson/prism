@@ -14855,7 +14855,8 @@ static void test_typedef_shadow_braceless_for_complex(void)
 static void test_typeof_large_struct_zeroinit(void)
 {
 #ifdef __GNUC__
-    struct _large_tzi {
+    struct _large_tzi
+    {
         int data[256];
         char name[64];
         double values[32];
@@ -14864,11 +14865,14 @@ static void test_typeof_large_struct_zeroinit(void)
     typeof(ref) copy;
     int all_zero = 1;
     for (int i = 0; i < 256; i++)
-        if (copy.data[i] != 0) all_zero = 0;
+        if (copy.data[i] != 0)
+            all_zero = 0;
     for (int i = 0; i < 64; i++)
-        if (copy.name[i] != 0) all_zero = 0;
+        if (copy.name[i] != 0)
+            all_zero = 0;
     for (int i = 0; i < 32; i++)
-        if (copy.values[i] != 0.0) all_zero = 0;
+        if (copy.values[i] != 0.0)
+            all_zero = 0;
     CHECK(all_zero, "typeof large struct zeroinit: all fields zero");
 #endif
 }
@@ -14876,8 +14880,17 @@ static void test_typeof_large_struct_zeroinit(void)
 static void test_typeof_nested_struct_zeroinit(void)
 {
 #ifdef __GNUC__
-    struct _inner_tnz { int x; int y; };
-    struct _outer_tnz { struct _inner_tnz a; struct _inner_tnz b; int c; };
+    struct _inner_tnz
+    {
+        int x;
+        int y;
+    };
+    struct _outer_tnz
+    {
+        struct _inner_tnz a;
+        struct _inner_tnz b;
+        int c;
+    };
     struct _outer_tnz ref;
     ref.a.x = 0;
     typeof(ref) copy;
@@ -14938,6 +14951,76 @@ static void test_typedef_shadow_for_with_if_body(void)
     _TSFI y;
     CHECK_EQ(y, 0, "typedef after for-if-else shadow");
     CHECK(sizeof(y) == sizeof(int), "typedef size after for-if-else");
+}
+
+static void test_for_init_typedef_no_leak(void)
+{
+    // T is not a typedef in the outer scope
+    // for-init typedef should NOT persist after the loop
+    typedef int _FITL;
+    _FITL a;
+    CHECK_EQ(a, 0, "typedef visible before for-init shadow");
+    for (typedef double _FITL;;)
+    {
+        _FITL x;
+        (void)x;
+        break;
+    }
+    // After for loop, _FITL should revert to outer int, not double
+    _FITL b;
+    CHECK_EQ(b, 0, "typedef restored after for-init shadow");
+    CHECK(sizeof(b) == sizeof(int), "for-init typedef correctly scoped (int, not double)");
+}
+
+static void test_for_init_typedef_braceless_no_leak(void)
+{
+    typedef int _FITBL;
+    _FITBL a;
+    CHECK_EQ(a, 0, "typedef before braceless for-init shadow");
+    for (typedef double _FITBL;;)
+        break;
+    _FITBL b;
+    CHECK_EQ(b, 0, "typedef after braceless for-init shadow");
+    CHECK(sizeof(b) == sizeof(int), "braceless for-init typedef correctly scoped");
+}
+
+static void test_for_init_typedef_nested_loops(void)
+{
+    typedef int _FITNL;
+    for (typedef double _FITNL;;)
+    {
+        _FITNL inner;
+        CHECK(sizeof(inner) == sizeof(double), "nested for-init typedef is double");
+        break;
+    }
+    _FITNL outer;
+    CHECK_EQ(outer, 0, "outer typedef restored after nested for-init shadow");
+    CHECK(sizeof(outer) == sizeof(int), "outer typedef is int after nested for");
+}
+
+static void test_defer_switch_dead_zone_braced(void)
+{
+    int val = 0;
+    switch (1)
+    {
+    case 1:
+        val = 10;
+        break;
+    case 2:
+    {
+        defer val += 100;
+        val = 99;
+    }
+    }
+    // Case 2 is dead code — val should remain 10
+    CHECK_EQ(val, 10, "defer in dead switch case does not fire");
+}
+
+static void test_generic_const_array_zeroinit(void)
+{
+    int arr[_Generic(0, int: 10, default: 20)];
+    CHECK_EQ(arr[0], 0, "_Generic const array first elem zero");
+    CHECK_EQ(arr[9], 0, "_Generic const array last elem zero");
 }
 
 int main(void)
@@ -15059,6 +15142,12 @@ int main(void)
     test_typedef_shadow_braceless_for_multi_stmt();
     test_typedef_shadow_braceless_for_nested_loops();
     test_typedef_shadow_for_with_if_body();
+
+    test_for_init_typedef_no_leak();
+    test_for_init_typedef_braceless_no_leak();
+    test_for_init_typedef_nested_loops();
+    test_defer_switch_dead_zone_braced();
+    test_generic_const_array_zeroinit();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);
