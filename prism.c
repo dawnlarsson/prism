@@ -1696,12 +1696,16 @@ static bool is_knr_params(Token *after_paren, Token *brace)
 // Skip function specifiers/qualifiers/attributes that can precede a type
 static Token *skip_func_specifiers(Token *tok)
 {
-  while (tok && (tok->tag & (TT_QUALIFIER | TT_SKIP_DECL | TT_ATTR | TT_INLINE)))
+  while (tok && tok->kind != TK_EOF)
   {
-    if (tok->tag & TT_ATTR)
-      tok = skip_gnu_attributes(tok);
-    else
+    if (tok->tag & (TT_QUALIFIER | TT_SKIP_DECL | TT_INLINE))
       tok = tok->next;
+    else if (tok->tag & TT_ATTR)
+      tok = skip_gnu_attributes(tok);
+    else if (is_c23_attr(tok))
+      tok = skip_c23_attr(tok);
+    else
+      break;
   }
   return tok;
 }
@@ -1869,6 +1873,16 @@ static bool array_size_is_vla(Token *open_bracket)
     if (equal(tok, "[")) // Skip nested brackets
     {
       tok = skip_balanced(tok, '[', ']');
+      continue;
+    }
+
+    // _Generic(...) — the controlling expression is unevaluated and the result
+    // is a compile-time selection, so skip the entire balanced parens.
+    if (tok->tag & TT_GENERIC)
+    {
+      tok = tok->next;
+      if (tok && equal(tok, "("))
+        tok = skip_balanced(tok, '(', ')');
       continue;
     }
 

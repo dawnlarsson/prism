@@ -15539,6 +15539,36 @@ done:
     CHECK(d.leaf == 0, "deep struct nesting: zero-init works");
 }
 
+// _Generic in array size should not trigger false VLA detection.
+// _Generic is a compile-time selection, so arr[_Generic(x, int: 10, ...)]
+// has a constant size and should use = {0}, not memset.
+static void test_generic_array_not_vla(void)
+{
+    int x = 0;
+    int arr[_Generic(x, int: 5, default: 10)];
+    // If falsely detected as VLA, Prism would use memset.
+    // With the fix, it should use = {0} and sizeof is constant.
+    CHECK_EQ((int)sizeof(arr), 5 * (int)sizeof(int), "_Generic array size: not VLA");
+}
+
+// void [[attr]] func() — C23 attributes after void must not break void detection
+// See test_lib.c test_c23_attr_void_function() for transpiler output verification.
+#if __STDC_VERSION__ >= 202311L
+__attribute__((unused))
+static void test_c23_attr_void_helper(int *out) {
+    void [[maybe_unused]] c23_void_func(void) {
+        defer { *out = 42; };
+    }
+    // Note: nested functions are a GCC extension, so this test is limited.
+    // The lib-mode test verifies the transpiler output directly.
+}
+#endif
+static void test_c23_attr_void_function(void)
+{
+    // Placeholder — actual verification is in lib-mode tests via transpile output
+    CHECK(1, "C23 [[attr]] void func: handled (see lib tests)");
+}
+
 int main(void)
 {
     printf("=== PRISM TEST SUITE ===\n");
@@ -15692,6 +15722,8 @@ int main(void)
     test_t_heuristic_noshadow();
     test_array_orelse_rejected();
     test_deep_struct_nesting_goto();
+    test_generic_array_not_vla();
+    test_c23_attr_void_function();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

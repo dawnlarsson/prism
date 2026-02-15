@@ -1065,6 +1065,94 @@ static void test_deep_struct_nesting_walker(void)
     }
 }
 
+static void test_c23_attr_void_function(void)
+{
+    printf("\n--- C23 Attribute Void Function Tests ---\n");
+
+    PrismFeatures features = prism_defaults();
+
+    // Test 1: void [[attr]] func() — should be recognized as void-returning
+    // Without fix, Prism would generate __auto_type _prism_ret = ... for return
+    const char *code_c23_void =
+        "void [[deprecated]] func(void) {\n"
+        "    defer (void)0;\n"
+        "    return;\n"
+        "}\n"
+        "int main(void) { func(); return 0; }\n";
+    char *path = create_temp_file(code_c23_void);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status == PRISM_OK, "C23 void [[attr]] func: transpiles OK");
+        if (result.output)
+        {
+            // Must NOT contain _prism_ret (void function doesn't capture return value)
+            CHECK(strstr(result.output, "_prism_ret") == NULL,
+                  "C23 void [[attr]] func: no _prism_ret generated");
+            // Must still contain the attribute and function
+            CHECK(strstr(result.output, "[[deprecated]]") != NULL,
+                  "C23 void [[attr]] func: attribute preserved");
+        }
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+
+    // Test 2: void [[attr1]] [[attr2]] func() — multiple C23 attributes
+    const char *code_multi_attr =
+        "void [[deprecated]] [[maybe_unused]] func2(void) {\n"
+        "    defer (void)0;\n"
+        "    return;\n"
+        "}\n"
+        "int main(void) { func2(); return 0; }\n";
+    path = create_temp_file(code_multi_attr);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status == PRISM_OK, "C23 void multi [[attr]] func: transpiles OK");
+        if (result.output)
+            CHECK(strstr(result.output, "_prism_ret") == NULL,
+                  "C23 void multi [[attr]] func: no _prism_ret");
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+}
+
+static void test_generic_array_not_vla(void)
+{
+    printf("\n--- _Generic Array Not VLA Tests ---\n");
+
+    PrismFeatures features = prism_defaults();
+
+    // _Generic in array size should not trigger VLA detection
+    // Before fix: `x` inside _Generic was seen as non-constant identifier → VLA
+    // After fix: _Generic(...) is skipped entirely
+    const char *code_generic_arr =
+        "int main(void) {\n"
+        "    int x = 0;\n"
+        "    int arr[_Generic(x, int: 10, default: 20)];\n"
+        "    return arr[0];\n"
+        "}\n";
+    char *path = create_temp_file(code_generic_arr);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status == PRISM_OK, "_Generic array: transpiles OK");
+        if (result.output)
+        {
+            // Should use = {0} (constant size), NOT memset (VLA)
+            CHECK(strstr(result.output, "= {0}") != NULL,
+                  "_Generic array: uses = {0} not memset");
+            CHECK(strstr(result.output, "memset") == NULL,
+                  "_Generic array: no memset (not VLA)");
+        }
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+}
+
 int main(void)
 {
     printf("=== PRISM LIBRARY MODE TEST SUITE ===\n");
@@ -1085,6 +1173,8 @@ int main(void)
     test_defer_break_continue_rejected();
     test_array_orelse_rejected();
     test_deep_struct_nesting_walker();
+    test_c23_attr_void_function();
+    test_generic_array_not_vla();
     test_memory_leak_stress(); // Run last as it does many iterations
 
     printf("\n========================================\n");
