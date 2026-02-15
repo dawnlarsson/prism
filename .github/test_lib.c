@@ -789,6 +789,280 @@ static void test_defer_break_continue_rejected(void)
         unlink(path);
         free(path);
     }
+
+    // Test 6: break inside for loop inside defer — should be ALLOWED
+    const char *code_loop_break =
+        "void f(void) {\n"
+        "    defer {\n"
+        "        for (int i = 0; i < 10; i++) {\n"
+        "            if (i == 3) break;\n"
+        "        }\n"
+        "    };\n"
+        "}\n"
+        "int main(void) { f(); return 0; }\n";
+    path = create_temp_file(code_loop_break);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status == PRISM_OK, "break in for inside defer: allowed");
+        CHECK(result.error_msg == NULL, "break in for inside defer: no error");
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+
+    // Test 7: continue inside while loop inside defer — should be ALLOWED
+    const char *code_loop_cont =
+        "void f(void) {\n"
+        "    defer {\n"
+        "        int i = 0;\n"
+        "        while (i < 5) {\n"
+        "            i++;\n"
+        "            if (i == 3) continue;\n"
+        "        }\n"
+        "    };\n"
+        "}\n"
+        "int main(void) { f(); return 0; }\n";
+    path = create_temp_file(code_loop_cont);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status == PRISM_OK, "continue in while inside defer: allowed");
+        CHECK(result.error_msg == NULL, "continue in while inside defer: no error");
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+
+    // Test 8: break inside switch inside defer — should be ALLOWED
+    const char *code_switch_break =
+        "void f(int x) {\n"
+        "    defer {\n"
+        "        switch (x) {\n"
+        "            case 1: break;\n"
+        "            default: break;\n"
+        "        }\n"
+        "    };\n"
+        "}\n"
+        "int main(void) { f(1); return 0; }\n";
+    path = create_temp_file(code_switch_break);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status == PRISM_OK, "break in switch inside defer: allowed");
+        CHECK(result.error_msg == NULL, "break in switch inside defer: no error");
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+
+    // Test 9: continue inside switch (no loop) inside defer — should be REJECTED
+    // (continue in switch targets the enclosing loop, which is outside the defer)
+    const char *code_switch_cont =
+        "void f(int x) {\n"
+        "    for (int i = 0; i < 10; i++) {\n"
+        "        defer {\n"
+        "            switch (x) {\n"
+        "                case 1: continue;\n"
+        "            }\n"
+        "        };\n"
+        "    }\n"
+        "}\n"
+        "int main(void) { f(1); return 0; }\n";
+    path = create_temp_file(code_switch_cont);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status != PRISM_OK, "continue in switch (no loop) inside defer: rejected");
+        CHECK(result.error_msg != NULL, "continue in switch inside defer: has error");
+        if (result.error_msg)
+            CHECK(strstr(result.error_msg, "continue") != NULL &&
+                      strstr(result.error_msg, "bypass") != NULL,
+                  "continue in switch inside defer: error mentions bypass");
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+
+    // Test 10: break inside do-while inside defer — should be ALLOWED
+    const char *code_dowhile =
+        "void f(void) {\n"
+        "    defer {\n"
+        "        int i = 0;\n"
+        "        do {\n"
+        "            i++;\n"
+        "            if (i == 3) break;\n"
+        "        } while (i < 10);\n"
+        "    };\n"
+        "}\n"
+        "int main(void) { f(); return 0; }\n";
+    path = create_temp_file(code_dowhile);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status == PRISM_OK, "break in do-while inside defer: allowed");
+        CHECK(result.error_msg == NULL, "break in do-while inside defer: no error");
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+}
+
+static void test_array_orelse_rejected(void)
+{
+    printf("\n--- Array Orelse Rejection Tests ---\n");
+
+    PrismFeatures features = prism_defaults();
+
+    // Test 1: array orelse with block fallback (e.g. orelse { return 1; })
+    const char *code_arr_block =
+        "int main(void) {\n"
+        "    int arr[] = {1, 2} orelse { return 1; };\n"
+        "    return arr[0];\n"
+        "}\n";
+    char *path = create_temp_file(code_arr_block);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status != PRISM_OK, "array orelse block: rejected");
+        CHECK(result.error_msg != NULL, "array orelse block: has error message");
+        if (result.error_msg)
+            CHECK(strstr(result.error_msg, "array") != NULL &&
+                      strstr(result.error_msg, "never NULL") != NULL,
+                  "array orelse block: error mentions array never NULL");
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+
+    // Test 2: const array orelse with expression fallback
+    const char *code_const_arr =
+        "int main(void) {\n"
+        "    const int arr[] = {1, 2} orelse (int[]){3, 4};\n"
+        "    return arr[0];\n"
+        "}\n";
+    path = create_temp_file(code_const_arr);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status != PRISM_OK, "const array orelse fallback: rejected");
+        CHECK(result.error_msg != NULL, "const array orelse fallback: has error message");
+        if (result.error_msg)
+            CHECK(strstr(result.error_msg, "array") != NULL &&
+                      strstr(result.error_msg, "never NULL") != NULL,
+                  "const array orelse fallback: error mentions array never NULL");
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+
+    // Test 3: non-const array orelse with expression fallback
+    const char *code_arr_expr =
+        "int main(void) {\n"
+        "    int arr[] = {1, 2} orelse (int[]){3, 4};\n"
+        "    return arr[0];\n"
+        "}\n";
+    path = create_temp_file(code_arr_expr);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status != PRISM_OK, "array orelse fallback: rejected");
+        CHECK(result.error_msg != NULL, "array orelse fallback: has error message");
+        if (result.error_msg)
+            CHECK(strstr(result.error_msg, "array") != NULL &&
+                      strstr(result.error_msg, "never NULL") != NULL,
+                  "array orelse fallback: error mentions array never NULL");
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+}
+
+static void test_deep_struct_nesting_walker(void)
+{
+    printf("\n--- Deep Struct Nesting Walker Tests ---\n");
+
+    PrismFeatures features = prism_defaults();
+
+    // Test 1: 70 levels of nested anonymous structs inside a function with goto.
+    // The walker's struct_depth must not desync when depth exceeds the 64-bit
+    // bitmask capacity. Before the fix, closing braces at depth >= 64 would
+    // blindly decrement struct_depth, potentially causing false goto errors.
+    char code[8192];
+    int pos = 0;
+    pos += snprintf(code + pos, sizeof(code) - pos,
+                    "#include <stdio.h>\n"
+                    "void func(int flag) {\n"
+                    "    struct Deep {\n");
+
+    // 69 levels of nested anonymous structs (total depth = 70 with outer struct)
+    for (int i = 0; i < 69; i++)
+        pos += snprintf(code + pos, sizeof(code) - pos, "    struct {\n");
+
+    pos += snprintf(code + pos, sizeof(code) - pos, "        int leaf;\n");
+
+    for (int i = 0; i < 69; i++)
+        pos += snprintf(code + pos, sizeof(code) - pos, "    };\n");
+
+    pos += snprintf(code + pos, sizeof(code) - pos,
+                    "    };\n"
+                    "    if (flag)\n"
+                    "        goto done;\n"
+                    "    printf(\"not skipped\\n\");\n"
+                    "    done:\n"
+                    "    printf(\"done\\n\");\n"
+                    "}\n"
+                    "int main(void) { func(1); return 0; }\n");
+
+    char *path = create_temp_file(code);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status == PRISM_OK, "deep struct nesting: transpiles OK");
+        CHECK(result.error_msg == NULL, "deep struct nesting: no error");
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+
+    // Test 2: Same deep nesting but goto skips over a variable declaration.
+    // Walker must correctly identify the declaration despite deep struct nesting.
+    pos = 0;
+    pos += snprintf(code + pos, sizeof(code) - pos,
+                    "void func2(int flag) {\n"
+                    "    struct Deep2 {\n");
+
+    for (int i = 0; i < 69; i++)
+        pos += snprintf(code + pos, sizeof(code) - pos, "    struct {\n");
+    pos += snprintf(code + pos, sizeof(code) - pos, "        int leaf;\n");
+    for (int i = 0; i < 69; i++)
+        pos += snprintf(code + pos, sizeof(code) - pos, "    };\n");
+
+    pos += snprintf(code + pos, sizeof(code) - pos,
+                    "    };\n"
+                    "    if (flag)\n"
+                    "        goto done;\n"
+                    "    int val = 42;\n"
+                    "    done:\n"
+                    "    (void)0;\n"
+                    "}\n"
+                    "int main(void) { func2(1); return 0; }\n");
+
+    path = create_temp_file(code);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        // Should error: goto skips over 'val' declaration
+        CHECK(result.status != PRISM_OK, "deep struct nesting + goto skip: rejected");
+        CHECK(result.error_msg != NULL, "deep struct nesting + goto skip: has error");
+        if (result.error_msg)
+            CHECK(strstr(result.error_msg, "skip") != NULL ||
+                      strstr(result.error_msg, "bypass") != NULL,
+                  "deep struct nesting + goto skip: error mentions skip/bypass");
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
 }
 
 int main(void)
@@ -809,6 +1083,8 @@ int main(void)
     test_repeated_reset();
     test_error_recovery_no_exit();
     test_defer_break_continue_rejected();
+    test_array_orelse_rejected();
+    test_deep_struct_nesting_walker();
     test_memory_leak_stress(); // Run last as it does many iterations
 
     printf("\n========================================\n");

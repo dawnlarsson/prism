@@ -15154,6 +15154,96 @@ static void test_defer_break_continue_rejected(void)
     CHECK(1, "defer { continue; } rejected (compile error)");
 }
 
+// break/continue inside a loop/switch that's nested inside a defer block should
+// be allowed — they target the inner construct, not the enclosing scope.
+static void helper_defer_for_break(int *out)
+{
+    defer
+    {
+        for (int i = 0; i < 10; i++)
+        {
+            if (i == 3)
+                break;
+            *out += i;
+        }
+    };
+}
+
+static void test_defer_inner_loop_break(void)
+{
+    int sum = 0;
+    helper_defer_for_break(&sum);
+    CHECK_EQ(sum, 3, "defer inner for break: 0+1+2=3");
+}
+
+static void helper_defer_while_continue(int *out)
+{
+    defer
+    {
+        int i = 0;
+        while (i < 5)
+        {
+            i++;
+            if (i == 3)
+                continue;
+            *out += i;
+        }
+    };
+}
+
+static void test_defer_inner_loop_continue(void)
+{
+    int sum = 0;
+    helper_defer_while_continue(&sum);
+    CHECK_EQ(sum, 12, "defer inner while continue: 1+2+4+5=12");
+}
+
+static void helper_defer_switch_break(int val, int *out)
+{
+    defer
+    {
+        switch (val)
+        {
+        case 1:
+            *out = 10;
+            break;
+        case 2:
+            *out = 20;
+            break;
+        default:
+            *out = 30;
+            break;
+        }
+    };
+}
+
+static void test_defer_inner_switch_break(void)
+{
+    int result = 0;
+    helper_defer_switch_break(2, &result);
+    CHECK_EQ(result, 20, "defer inner switch break: case 2");
+}
+
+static void helper_defer_dowhile_break(int *out)
+{
+    defer
+    {
+        do
+        {
+            (*out)++;
+            if (*out == 3)
+                break;
+        } while (*out < 10);
+    };
+}
+
+static void test_defer_inner_do_while_break(void)
+{
+    int count = 0;
+    helper_defer_dowhile_break(&count);
+    CHECK_EQ(count, 3, "defer inner do-while break: stopped at 3");
+}
+
 // _t heuristic shadowing: a variable ending in _t must suppress the typedef heuristic
 // so that expressions like count_t * x aren't misread as pointer declarations.
 static void test_t_heuristic_shadow_mul(void)
@@ -15217,6 +15307,236 @@ static void test_t_heuristic_noshadow(void)
     size_t a = 0;
     (void)a;
     CHECK(1, "_t heuristic: size_t still recognized as type");
+}
+
+// orelse on array variables must be rejected — array addresses are never NULL
+// and the generated code would be invalid C.
+// See test_lib.c test_array_orelse_rejected() for error message verification.
+static void test_array_orelse_rejected(void)
+{
+    CHECK(1, "array orelse block rejected (compile error)");
+    CHECK(1, "const array orelse fallback rejected (compile error)");
+    CHECK(1, "non-const array orelse fallback rejected (compile error)");
+}
+
+// Test that deeply nested structs (>64 levels) don't desync the walker's
+// struct_depth counter. The goto safety checker must correctly track
+// struct nesting at depths beyond the 64-bit bitmask capacity.
+// See test_lib.c test_deep_struct_nesting_walker() for full verification.
+static void test_deep_struct_nesting_goto(void)
+{
+    // This struct has 66 levels of nesting, pushing depth past the 64-bit
+    // bitmask threshold. The walker's deep_struct_opens counter tracks these.
+    struct D0
+    {
+        struct
+        {
+            struct
+            {
+                struct
+                {
+                    struct
+                    {
+                        struct
+                        { // 6
+                            struct
+                            {
+                                struct
+                                {
+                                    struct
+                                    {
+                                        struct
+                                        {
+                                            struct
+                                            {
+                                                struct
+                                                { // 12
+                                                    struct
+                                                    {
+                                                        struct
+                                                        {
+                                                            struct
+                                                            {
+                                                                struct
+                                                                {
+                                                                    struct
+                                                                    {
+                                                                        struct
+                                                                        { // 18
+                                                                            struct
+                                                                            {
+                                                                                struct
+                                                                                {
+                                                                                    struct
+                                                                                    {
+                                                                                        struct
+                                                                                        {
+                                                                                            struct
+                                                                                            {
+                                                                                                struct
+                                                                                                { // 24
+                                                                                                    struct
+                                                                                                    {
+                                                                                                        struct
+                                                                                                        {
+                                                                                                            struct
+                                                                                                            {
+                                                                                                                struct
+                                                                                                                {
+                                                                                                                    struct
+                                                                                                                    {
+                                                                                                                        struct
+                                                                                                                        { // 30
+                                                                                                                            struct
+                                                                                                                            {
+                                                                                                                                struct
+                                                                                                                                {
+                                                                                                                                    struct
+                                                                                                                                    {
+                                                                                                                                        struct
+                                                                                                                                        {
+                                                                                                                                            struct
+                                                                                                                                            {
+                                                                                                                                                struct
+                                                                                                                                                { // 36
+                                                                                                                                                    struct
+                                                                                                                                                    {
+                                                                                                                                                        struct
+                                                                                                                                                        {
+                                                                                                                                                            struct
+                                                                                                                                                            {
+                                                                                                                                                                struct
+                                                                                                                                                                {
+                                                                                                                                                                    struct
+                                                                                                                                                                    {
+                                                                                                                                                                        struct
+                                                                                                                                                                        { // 42
+                                                                                                                                                                            struct
+                                                                                                                                                                            {
+                                                                                                                                                                                struct
+                                                                                                                                                                                {
+                                                                                                                                                                                    struct
+                                                                                                                                                                                    {
+                                                                                                                                                                                        struct
+                                                                                                                                                                                        {
+                                                                                                                                                                                            struct
+                                                                                                                                                                                            {
+                                                                                                                                                                                                struct
+                                                                                                                                                                                                { // 48
+                                                                                                                                                                                                    struct
+                                                                                                                                                                                                    {
+                                                                                                                                                                                                        struct
+                                                                                                                                                                                                        {
+                                                                                                                                                                                                            struct
+                                                                                                                                                                                                            {
+                                                                                                                                                                                                                struct
+                                                                                                                                                                                                                {
+                                                                                                                                                                                                                    struct
+                                                                                                                                                                                                                    {
+                                                                                                                                                                                                                        struct
+                                                                                                                                                                                                                        { // 54
+                                                                                                                                                                                                                            struct
+                                                                                                                                                                                                                            {
+                                                                                                                                                                                                                                struct
+                                                                                                                                                                                                                                {
+                                                                                                                                                                                                                                    struct
+                                                                                                                                                                                                                                    {
+                                                                                                                                                                                                                                        struct
+                                                                                                                                                                                                                                        {
+                                                                                                                                                                                                                                            struct
+                                                                                                                                                                                                                                            {
+                                                                                                                                                                                                                                                struct
+                                                                                                                                                                                                                                                { // 60
+                                                                                                                                                                                                                                                    struct
+                                                                                                                                                                                                                                                    {
+                                                                                                                                                                                                                                                        struct
+                                                                                                                                                                                                                                                        {
+                                                                                                                                                                                                                                                            struct
+                                                                                                                                                                                                                                                            {
+                                                                                                                                                                                                                                                                struct
+                                                                                                                                                                                                                                                                {
+                                                                                                                                                                                                                                                                    struct
+                                                                                                                                                                                                                                                                    {
+                                                                                                                                                                                                                                                                        struct
+                                                                                                                                                                                                                                                                        { // 66
+                                                                                                                                                                                                                                                                            int leaf;
+                                                                                                                                                                                                                                                                        };
+                                                                                                                                                                                                                                                                    };
+                                                                                                                                                                                                                                                                };
+                                                                                                                                                                                                                                                            };
+                                                                                                                                                                                                                                                        };
+                                                                                                                                                                                                                                                    }; // 60
+                                                                                                                                                                                                                                                };
+                                                                                                                                                                                                                                            };
+                                                                                                                                                                                                                                        };
+                                                                                                                                                                                                                                    };
+                                                                                                                                                                                                                                };
+                                                                                                                                                                                                                            }; // 54
+                                                                                                                                                                                                                        };
+                                                                                                                                                                                                                    };
+                                                                                                                                                                                                                };
+                                                                                                                                                                                                            };
+                                                                                                                                                                                                        };
+                                                                                                                                                                                                    }; // 48
+                                                                                                                                                                                                };
+                                                                                                                                                                                            };
+                                                                                                                                                                                        };
+                                                                                                                                                                                    };
+                                                                                                                                                                                };
+                                                                                                                                                                            }; // 42
+                                                                                                                                                                        };
+                                                                                                                                                                    };
+                                                                                                                                                                };
+                                                                                                                                                            };
+                                                                                                                                                        };
+                                                                                                                                                    }; // 36
+                                                                                                                                                };
+                                                                                                                                            };
+                                                                                                                                        };
+                                                                                                                                    };
+                                                                                                                                };
+                                                                                                                            }; // 30
+                                                                                                                        };
+                                                                                                                    };
+                                                                                                                };
+                                                                                                            };
+                                                                                                        };
+                                                                                                    }; // 24
+                                                                                                };
+                                                                                            };
+                                                                                        };
+                                                                                    };
+                                                                                };
+                                                                            }; // 18
+                                                                        };
+                                                                    };
+                                                                };
+                                                            };
+                                                        };
+                                                    }; // 12
+                                                };
+                                            };
+                                        };
+                                    };
+                                };
+                            }; // 6
+                        };
+                    };
+                };
+            };
+        };
+    }; // 0
+
+    struct D0 d = {0};
+    // goto after the struct definition — walker must not misidentify
+    // struct members as labels due to struct_depth desync
+    int flag = 1;
+    if (flag)
+        goto done;
+    flag = 0;
+done:
+    CHECK(flag == 1, "deep struct nesting: goto works correctly");
+    CHECK(d.leaf == 0, "deep struct nesting: zero-init works");
 }
 
 int main(void)
@@ -15359,12 +15679,19 @@ int main(void)
     test_goto_over_static_decl();
     test_defer_break_continue_rejected();
 
+    test_defer_inner_loop_break();
+    test_defer_inner_loop_continue();
+    test_defer_inner_switch_break();
+    test_defer_inner_do_while_break();
+
     test_t_heuristic_shadow_mul();
     test_t_heuristic_shadow_arith();
     test_t_heuristic_shadow_ptr_deref();
     test_t_heuristic_shadow_scope();
     test_t_heuristic_shadow_param();
     test_t_heuristic_noshadow();
+    test_array_orelse_rejected();
+    test_deep_struct_nesting_goto();
 
     printf("\n========================================\n");
     printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

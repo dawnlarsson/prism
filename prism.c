@@ -255,6 +255,7 @@ typedef struct
   int depth;                // Brace depth (updated on { and })
   int struct_depth;         // Nesting inside struct/union/enum bodies
   int initial_depth;        // Starting depth (break when } would go below this)
+  int deep_struct_opens;    // Count of struct opens at depth >= 64 (bitmask can't track)
   uint64_t struct_at_depth; // Bitset: bit i set = depth i is a struct/union/enum scope
 } TokenWalker;
 
@@ -1313,9 +1314,8 @@ static bool walker_next(TokenWalker *w)
         w->depth++;
         if ((unsigned)w->depth < 64)
           w->struct_at_depth |= (1ULL << w->depth);
-        // Depths >= 64 can't be tracked in the bitmask; struct_depth is
-        // still incremented and will be decremented on '}' via the
-        // fallback below.
+        else
+          w->deep_struct_opens++;
         w->prev = w->tok;
         w->tok = w->tok->next;
         continue;
@@ -1353,9 +1353,10 @@ static bool walker_next(TokenWalker *w)
               w->struct_depth--;
           }
         }
-        else if (w->struct_depth > 0)
+        else if (w->deep_struct_opens > 0)
         {
-          // Depth >= 64: bitmask can't track, conservatively decrement
+          // Depth >= 64: only decrement if a struct was actually opened here
+          w->deep_struct_opens--;
           w->struct_depth--;
         }
         w->depth--;
@@ -1379,9 +1380,9 @@ static bool walker_next(TokenWalker *w)
               w->struct_depth--;
           }
         }
-        else if (w->struct_depth > 0)
+        else if (w->deep_struct_opens > 0)
         {
-          // Depth >= 64: bitmask can't track, conservatively decrement
+          w->deep_struct_opens--;
           w->struct_depth--;
         }
         w->depth--;
@@ -2674,6 +2675,10 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
           if (is_struct_val)
             error_tok(tok, "orelse fallback on const struct is not supported; "
                            "use a control flow action (return/break/goto) or remove const");
+          if (decl.is_array && !decl.is_pointer)
+            error_tok(decl.var_name, "orelse on array variable '%.*s' will never trigger "
+                                     "(array address is never NULL); remove the orelse clause",
+                      decl.var_name->len, decl.var_name->loc);
 
           Token *orelse_tok = tok;
           Token *val_start = decl.end->next; // First value token after '='
@@ -2814,10 +2819,13 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
         if (equal(tok, ";"))
           error_tok(tok, "expected statement after 'orelse'");
 
-        // Warn if orelse is applied to a non-pointer array (address is never NULL)
+        // Error if orelse is applied to a non-pointer array (address is never NULL,
+        // and the fallback branch generates invalid C — brace-enclosed initializer
+        // lists are not valid statement expressions in standard C).
         if (decl.is_array && !decl.is_pointer)
-          warn_tok(decl.var_name, "orelse on array variable '%.*s' will never trigger (array address is never NULL)",
-                   decl.var_name->len, decl.var_name->loc);
+          error_tok(decl.var_name, "orelse on array variable '%.*s' will never trigger "
+                                   "(array address is never NULL); remove the orelse clause",
+                    decl.var_name->len, decl.var_name->loc);
 
         // Find boundary comma for multi-declarator orelse
         Token *stop_comma = NULL;
@@ -3133,16 +3141,168 @@ static Token *handle_defer_keyword(Token *tok)
 
   // Validate: no bare control-flow keywords, no unbracketed multi-line spans
   int bd = 0, pd = 0, bkd = 0;
+
+  // Track loop/switch nesting inside defer block for break/continue validation.
+  // break is safe inside a nested loop or switch; continue is safe inside a nested loop.
+  int inner_loop_depth = 0;   // for/while/do nesting (break + continue safe)
+  int inner_switch_depth = 0; // switch nesting (break safe, continue NOT safe)
+  uint64_t loop_at_bd = 0;    // bitmask: bit i = bd i is a loop body
+  uint64_t switch_at_bd = 0;  // bitmask: bit i = bd i is a switch body
+  int deep_loop_opens = 0;    // loop opens at bd >= 64
+  int deep_switch_opens = 0;  // switch opens at bd >= 64
+
+  // State machine for detecting loop/switch body entry
+  bool pk_is_loop = false;      // true for for/while, false for switch
+  int pk_paren = 0;             // paren depth for condition (for/while/switch)
+  bool pk_tracking = false;     // currently tracking condition parens
+  bool pk_body_next = false;    // condition ended, next token starts body
+  bool pk_do_body = false;      // after 'do', next { starts loop body
+  bool pk_skip_body = false;    // do-while's 'while' — skip body detection
+  bool prev_was_rbrace = false; // previous token was '}' (for do-while detection)
+
+  // Braceless loop/switch body tracking (approximate for rare edge cases)
+  int braceless_loop_n = 0;
+  int braceless_switch_n = 0;
+  int braceless_bd = -1;
+
   for (Token *t = stmt_start; t != stmt_end && t->kind != TK_EOF; t = t->next)
   {
     bool at_top = (bd == 0 && pd == 0 && bkd == 0);
     if (t != stmt_start && tok_at_bol(t) && at_top &&
         !equal(t, "{") && !equal(t, "(") && !equal(t, "["))
       error_tok(defer_keyword, "defer statement spans multiple lines without ';' - add semicolon");
+
+    // --- Loop/switch body entry detection (runs before brace tracking) ---
+    // Check if this token enters a loop/switch body (braced or braceless)
+    if (pk_body_next || pk_do_body)
+    {
+      if (equal(t, "{"))
+      {
+        // Braced body: mark at bd+1 in bitmask, increment counter
+        int new_bd = bd + 1;
+        bool is_loop = pk_is_loop || pk_do_body;
+        if ((unsigned)new_bd < 64)
+        {
+          if (is_loop)
+            loop_at_bd |= (1ULL << new_bd);
+          else
+            switch_at_bd |= (1ULL << new_bd);
+        }
+        else
+        {
+          if (is_loop)
+            deep_loop_opens++;
+          else
+            deep_switch_opens++;
+        }
+        if (is_loop)
+          inner_loop_depth++;
+        else
+          inner_switch_depth++;
+        pk_body_next = false;
+        pk_do_body = false;
+      }
+      else
+      {
+        // Braceless body (e.g. for (...) break;)
+        if (pk_is_loop || pk_do_body)
+        {
+          inner_loop_depth++;
+          braceless_loop_n++;
+        }
+        else
+        {
+          inner_switch_depth++;
+          braceless_switch_n++;
+        }
+        braceless_bd = bd;
+        pk_body_next = false;
+        pk_do_body = false;
+      }
+    }
+
+    // Detect loop/switch keywords inside the defer block
+    if (bd > 0 && t->kind == TK_KEYWORD)
+    {
+      if ((t->tag & TT_LOOP) && !prev_was_rbrace)
+      {
+        // for/while/do — but skip do-while's 'while' (preceded by '}')
+        if (equal(t, "do"))
+        {
+          pk_do_body = true;
+          pk_is_loop = true;
+        }
+        else
+        {
+          pk_tracking = true;
+          pk_is_loop = true;
+          pk_paren = 0;
+        }
+      }
+      else if (t->tag & TT_SWITCH)
+      {
+        pk_tracking = true;
+        pk_is_loop = false;
+        pk_paren = 0;
+      }
+    }
+
+    // Track condition parens for for/while/switch
+    if (pk_tracking)
+    {
+      if (equal(t, "("))
+        pk_paren++;
+      else if (equal(t, ")"))
+      {
+        pk_paren--;
+        if (pk_paren <= 0)
+        {
+          if (!pk_skip_body)
+            pk_body_next = true;
+          pk_tracking = false;
+          pk_skip_body = false;
+        }
+      }
+    }
+
+    // --- Brace/paren/bracket tracking ---
     if (equal(t, "{"))
       bd++;
     else if (equal(t, "}"))
+    {
+      // Check if closing brace ends a loop/switch body
+      if ((unsigned)bd < 64)
+      {
+        if (loop_at_bd & (1ULL << bd))
+        {
+          loop_at_bd &= ~(1ULL << bd);
+          if (inner_loop_depth > 0)
+            inner_loop_depth--;
+        }
+        if (switch_at_bd & (1ULL << bd))
+        {
+          switch_at_bd &= ~(1ULL << bd);
+          if (inner_switch_depth > 0)
+            inner_switch_depth--;
+        }
+      }
+      else
+      {
+        if (deep_loop_opens > 0)
+        {
+          deep_loop_opens--;
+          if (inner_loop_depth > 0)
+            inner_loop_depth--;
+        }
+        else if (deep_switch_opens > 0)
+        {
+          deep_switch_opens--;
+          if (inner_switch_depth > 0)
+            inner_switch_depth--;
+        }
+      }
       bd--;
+    }
     else if (equal(t, "("))
       pd++;
     else if (equal(t, ")"))
@@ -3151,6 +3311,29 @@ static Token *handle_defer_keyword(Token *tok)
       bkd++;
     else if (equal(t, "]"))
       bkd--;
+
+    // Braceless body end detection: ';' at the entry depth closes braceless bodies
+    if (equal(t, ";") && pd == 0 && bkd == 0 && braceless_bd >= 0 && bd <= braceless_bd + 1)
+    {
+      if (braceless_loop_n > 0)
+      {
+        inner_loop_depth -= braceless_loop_n;
+        if (inner_loop_depth < 0)
+          inner_loop_depth = 0;
+        braceless_loop_n = 0;
+      }
+      if (braceless_switch_n > 0)
+      {
+        inner_switch_depth -= braceless_switch_n;
+        if (inner_switch_depth < 0)
+          inner_switch_depth = 0;
+        braceless_switch_n = 0;
+      }
+      braceless_bd = -1;
+    }
+
+    prev_was_rbrace = equal(t, "}");
+
     if (at_top && t->kind == TK_KEYWORD &&
         (t->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO |
                    TT_IF | TT_LOOP | TT_SWITCH | TT_CASE | TT_DEFAULT | TT_DEFER)))
@@ -3160,19 +3343,20 @@ static Token *handle_defer_keyword(Token *tok)
     if (!at_top && (t->tag & TT_DEFER) && !is_known_typedef(t) && !equal(t->next, ":") &&
         !(t->next && (t->next->tag & TT_ASSIGN)))
       error_tok(defer_keyword, "nested defer is not supported (found 'defer' inside deferred block)");
-    // return/goto/break/continue inside a braced defer body would bypass other defers
-    // (they are emitted as inline cleanup code, so a raw 'return' exits the function,
-    // and 'break'/'continue' affect the parent loop/switch, skipping earlier defers).
+    // return/goto inside a braced defer body would bypass other defers
     if (!at_top && t->kind == TK_KEYWORD && (t->tag & TT_RETURN))
       error_tok(t, "'return' inside defer block would bypass remaining defers; "
                    "move the return after the deferred scope");
     if (!at_top && t->kind == TK_KEYWORD && (t->tag & TT_GOTO) && !is_known_typedef(t))
       error_tok(t, "'goto' inside defer block could bypass remaining defers; "
                    "move the goto after the deferred scope");
-    if (!at_top && t->kind == TK_KEYWORD && (t->tag & TT_BREAK))
+    // break/continue inside defer is only dangerous if NOT inside a nested loop/switch
+    if (!at_top && t->kind == TK_KEYWORD && (t->tag & TT_BREAK) &&
+        inner_loop_depth == 0 && inner_switch_depth == 0)
       error_tok(t, "'break' inside defer block would bypass remaining defers; "
                    "wrap complex cleanup in a function");
-    if (!at_top && t->kind == TK_KEYWORD && (t->tag & TT_CONTINUE))
+    if (!at_top && t->kind == TK_KEYWORD && (t->tag & TT_CONTINUE) &&
+        inner_loop_depth == 0)
       error_tok(t, "'continue' inside defer block would bypass remaining defers; "
                    "wrap complex cleanup in a function");
   }
