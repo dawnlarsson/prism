@@ -295,10 +295,11 @@ static Token *last_emitted = NULL;
 static int cached_file_idx = -1;
 static File *cached_file = NULL;
 
-static char out_buf[OUT_BUF_SIZE];
+static char out_buf_static[OUT_BUF_SIZE];
+static char *out_buf = out_buf_static;
 static int out_buf_pos = 0;
-static int oe_buf_checkpoint = -1;   // Output buffer checkpoint for const+fallback orelse rollback
-static bool oe_buf_flushed = false;  // True if buffer was flushed while checkpoint was active
+static int out_buf_cap = OUT_BUF_SIZE;
+static int oe_buf_checkpoint = -1;   // Output buffer checkpoint for speculative rollback
 static bool use_linemarkers = false; // true = GCC linemarker "# N", false = C99 "#line N"
 
 static TypedefTable typedef_table;
@@ -388,7 +389,7 @@ static const char *get_tmp_dir(void)
   return fallback;
 }
 
-#define match_ch _equal_1 // Alias: identical to _equal_1 (single-char + rare digraph fallback)
+#define match_ch _equal_1 // Alias: identical to _equal_1 (single-char token comparison)
 
 // Check if token is identifier-like (TK_IDENT or TK_KEYWORD like 'raw'/'defer')
 static inline bool is_identifier_like(Token *tok)
@@ -402,10 +403,14 @@ static Token *find_boundary_comma(Token *tok)
   int depth = 0;
   for (Token *t = tok; t->kind != TK_EOF; t = t->next)
   {
-    if (t->flags & TF_OPEN) depth++;
-    else if (t->flags & TF_CLOSE) depth--;
-    else if (depth == 0 && equal(t, ",")) return t;
-    else if (depth == 0 && equal(t, ";")) return NULL;
+    if (t->flags & TF_OPEN)
+      depth++;
+    else if (t->flags & TF_CLOSE)
+      depth--;
+    else if (depth == 0 && equal(t, ","))
+      return t;
+    else if (depth == 0 && equal(t, ";"))
+      return NULL;
   }
   return NULL;
 }
@@ -496,20 +501,44 @@ static Token *skip_all_attributes(Token *tok)
   return tok;
 }
 
+static void out_buf_grow(void)
+{
+  int new_cap = out_buf_cap * 2;
+  char *new_buf = malloc(new_cap);
+  if (!new_buf)
+    error("out of memory");
+  memcpy(new_buf, out_buf, out_buf_pos);
+  if (out_buf != out_buf_static)
+    free(out_buf);
+  out_buf = new_buf;
+  out_buf_cap = new_cap;
+}
+
 static void out_flush(void)
 {
+  if (oe_buf_checkpoint >= 0)
+  {
+    // Speculative mode: grow buffer instead of flushing to preserve rollback ability
+    out_buf_grow();
+    return;
+  }
   if (out_buf_pos > 0)
   {
     fwrite(out_buf, 1, out_buf_pos, out_fp);
     out_buf_pos = 0;
-    if (oe_buf_checkpoint >= 0)
-      oe_buf_flushed = true; // Checkpoint data lost — rollback no longer safe
+  }
+  // Shrink back to static buffer if it was grown during speculation
+  if (out_buf != out_buf_static)
+  {
+    free(out_buf);
+    out_buf = out_buf_static;
+    out_buf_cap = OUT_BUF_SIZE;
   }
 }
 
 static inline void out_char(char c)
 {
-  if (__builtin_expect(out_buf_pos >= OUT_BUF_SIZE, 0))
+  if (__builtin_expect(out_buf_pos >= out_buf_cap, 0))
     out_flush();
   out_buf[out_buf_pos++] = c;
 }
@@ -518,12 +547,21 @@ static inline void out_str(const char *s, int len)
 {
   if (__builtin_expect(len <= 0, 0))
     return;
-  if (__builtin_expect((size_t)out_buf_pos + (size_t)len >= OUT_BUF_SIZE, 0))
+  if (__builtin_expect((size_t)out_buf_pos + (size_t)len >= (size_t)out_buf_cap, 0))
     out_flush();
-  if (__builtin_expect(len > OUT_BUF_SIZE, 0))
+  if (__builtin_expect(len > out_buf_cap, 0))
   {
-    fwrite(s, 1, len, out_fp);
-    return;
+    if (oe_buf_checkpoint >= 0)
+    {
+      // Speculative mode: grow buffer to fit
+      while ((size_t)out_buf_pos + (size_t)len >= (size_t)out_buf_cap)
+        out_buf_grow();
+    }
+    else
+    {
+      fwrite(s, 1, len, out_fp);
+      return;
+    }
   }
   memcpy(out_buf + out_buf_pos, s, len);
   out_buf_pos += len;
@@ -596,16 +634,11 @@ static void collect_system_includes(void)
     File *f = ctx->input_files[i];
     if (!f->is_system || !f->is_include_entry || !f->name)
       continue;
-    char *inc = strdup(f->name);
-    if (!inc)
-      continue;
+    char *inc = arena_strdup(&ctx->main_arena, f->name);
     if (!is_reincludable_header(inc) && hashmap_get(&system_includes, inc, strlen(inc)))
-    {
-      free(inc);
       continue;
-    }
     hashmap_put(&system_includes, inc, strlen(inc), (void *)1);
-    ENSURE_ARRAY_CAP(system_include_list, ctx->system_include_count + 1, system_include_capacity, 32, char *);
+    ARENA_ENSURE_CAP(&ctx->main_arena, system_include_list, ctx->system_include_count + 1, system_include_capacity, 32, char *);
     system_include_list[ctx->system_include_count++] = inc;
   }
 }
@@ -683,15 +716,9 @@ static void emit_system_includes(void)
 // Reset system include tracking
 static void system_includes_reset(void)
 {
-  // Clear hashmap first to avoid dangling key pointers
-  // (keys are the same strdup'd pointers stored in system_include_list)
+  // Keys are the same arena-allocated pointers in system_include_list
   hashmap_clear(&system_includes);
-  if (system_include_list)
-  {
-    for (int i = 0; i < ctx->system_include_count; i++)
-      free(system_include_list[i]);
-    free(system_include_list);
-  }
+  // system_include_list and its strings are arena-allocated; just reset pointers.
   system_include_list = NULL;
   ctx->system_include_count = 0;
   system_include_capacity = 0;
@@ -714,8 +741,11 @@ static void end_statement_after_semicolon(void)
 
 static void defer_push_scope(bool consume_flags)
 {
+  // Guard against pathologically deep nesting (e.g., fuzz input with thousands of '{')
+  if (ctx->defer_depth >= 4096)
+    error("brace nesting depth exceeds 4096");
   int old_cap = defer_stack_capacity;
-  ENSURE_ARRAY_CAP(defer_stack, ctx->defer_depth + 1, defer_stack_capacity, INITIAL_ARRAY_CAP, DeferScope);
+  ARENA_ENSURE_CAP(&ctx->main_arena, defer_stack, ctx->defer_depth + 1, defer_stack_capacity, INITIAL_ARRAY_CAP, DeferScope);
   for (int i = old_cap; i < defer_stack_capacity; i++)
     defer_stack[i] = (DeferScope){0};
   DeferScope *s = &defer_stack[ctx->defer_depth];
@@ -749,7 +779,7 @@ static void defer_add(Token *defer_keyword, Token *start, Token *end)
   if (ctx->defer_depth <= 0)
     error_tok(start, "defer outside of any scope");
   DeferScope *scope = &defer_stack[ctx->defer_depth - 1];
-  ENSURE_ARRAY_CAP(scope->entries, scope->count + 1, scope->capacity, INITIAL_ARRAY_CAP, DeferEntry);
+  ARENA_ENSURE_CAP(&ctx->main_arena, scope->entries, scope->count + 1, scope->capacity, INITIAL_ARRAY_CAP, DeferEntry);
   scope->entries[scope->count++] = (DeferEntry){start, end, defer_keyword};
   scope->had_control_exit = false;
 }
@@ -837,29 +867,19 @@ static bool is_inside_attribute(Token *tok)
   return false;
 }
 
-// Cold path: emit C23 float suffix or digraph translation (rare, <1% of tokens)
+// Cold path: emit C23 float suffix normalization (rare, <1% of tokens)
 static bool __attribute__((noinline)) emit_tok_special(Token *tok)
 {
-  if ((tok->flags & TF_IS_FLOAT) && tok->kind == TK_NUM)
+  if (tok->kind != TK_NUM)
+    return false;
+  const char *replacement;
+  int suffix_len = get_extended_float_suffix(tok->loc, tok->len, &replacement);
+  if (suffix_len > 0)
   {
-    const char *replacement;
-    int suffix_len = get_extended_float_suffix(tok->loc, tok->len, &replacement);
-    if (suffix_len > 0)
-    {
-      out_str(tok->loc, tok->len - suffix_len);
-      if (replacement)
-        out_str(replacement, strlen(replacement));
-      return true;
-    }
-  }
-  if (tok->flags & TF_IS_DIGRAPH)
-  {
-    const char *equiv = digraph_equiv(tok);
-    if (equiv)
-    {
-      out_str(equiv, strlen(equiv));
-      return true;
-    }
+    out_str(tok->loc, tok->len - suffix_len);
+    if (replacement)
+      out_str(replacement, strlen(replacement));
+    return true;
   }
   return false;
 }
@@ -922,8 +942,8 @@ static void emit_tok(Token *tok)
     return;
   }
 
-  // Handle rare special cases: C23 float suffixes, digraphs
-  if (__builtin_expect(tok->flags & (TF_IS_FLOAT | TF_IS_DIGRAPH), 0) && emit_tok_special(tok))
+  // Handle rare special case: C23 float suffix normalization
+  if (__builtin_expect(tok->flags & TF_IS_FLOAT, 0) && emit_tok_special(tok))
   {
     last_emitted = tok;
     return;
@@ -1042,7 +1062,7 @@ static bool has_defers_for(DeferEmitMode mode, int stop_depth)
 
 static void label_table_add(char *name, int name_len, int scope_depth, Token *tok)
 {
-  ENSURE_ARRAY_CAP(label_table.labels, label_table.count + 1, label_table.capacity, INITIAL_ARRAY_CAP, LabelInfo);
+  ARENA_ENSURE_CAP(&ctx->main_arena, label_table.labels, label_table.count + 1, label_table.capacity, INITIAL_ARRAY_CAP, LabelInfo);
   LabelInfo *info = &label_table.labels[label_table.count++];
   info->name = name;
   info->name_len = name_len;
@@ -1061,7 +1081,7 @@ static int label_table_lookup(char *name, int name_len)
 // Typedef tracking for zero-init
 static void typedef_table_reset(void)
 {
-  free(typedef_table.entries);
+  // entries array is arena-allocated; just reset pointers.
   typedef_table.entries = NULL;
   typedef_table.count = 0;
   typedef_table.capacity = 0;
@@ -1109,7 +1129,7 @@ static void typedef_add_entry(char *name, int len, int scope_depth, TypedefKind 
     }
   }
 
-  ENSURE_ARRAY_CAP(typedef_table.entries, typedef_table.count + 1, typedef_table.capacity, INITIAL_ARRAY_CAP, TypedefEntry);
+  ARENA_ENSURE_CAP(&ctx->main_arena, typedef_table.entries, typedef_table.count + 1, typedef_table.capacity, INITIAL_ARRAY_CAP, TypedefEntry);
   typedef_table.bloom |= typedef_bloom_bit(name, len);
   int new_index = typedef_table.count++;
   TypedefEntry *e = &typedef_table.entries[new_index];
@@ -2169,17 +2189,9 @@ static TypeSpecResult parse_type_specifier(Token *tok)
   return r;
 }
 
-// Get canonical delimiter char (digraph-aware)
+// Get canonical delimiter char for balanced walking
 static inline char tok_open_ch(Token *t)
 {
-  if (t->len == 1)
-    return t->loc[0];
-  if (__builtin_expect(t->flags & TF_IS_DIGRAPH, 0))
-  {
-    const char *e = digraph_equiv(t);
-    if (e)
-      return e[0];
-  }
   return t->loc[0];
 }
 static inline char close_for(char c) { return c == '(' ? ')' : c == '[' ? ']'
@@ -2550,6 +2562,73 @@ static void re_emit_type_specifier(Token *type_start, Token *type_end)
   }
 }
 
+// const + fallback orelse: roll back speculative output, re-emit with temp variable.
+// MSVC-compatible: instead of "const T x = val ?: fallback;",
+// emit: "T _prism_oe_N = (val); const T x = _prism_oe_N ? _prism_oe_N : (fallback);"
+// Returns token after fallback expression (at ';' or boundary comma).
+static Token *handle_const_orelse_fallback(Token *tok, Token *orelse_tok, Token *val_start,
+                                           Token *decl_start, DeclResult *decl,
+                                           Token *type_start, TypeSpecResult *type,
+                                           Token *stop_comma)
+{
+  // Roll back to before type+declarator+initializer emission
+  // Always safe: buffer grows instead of flushing during speculation.
+  out_buf_pos = oe_buf_checkpoint;
+  last_emitted = NULL;
+
+  // Emit type WITHOUT const (for temp variable)
+  for (Token *t = type_start; t && t != type->end && t->kind != TK_EOF; t = t->next)
+  {
+    if (t->tag & TT_CONST)
+      continue;
+    emit_tok(t);
+  }
+  // Emit pointer prefix from declarator WITHOUT const
+  for (Token *t = decl_start; t && t != decl->var_name && t->kind != TK_EOF; t = t->next)
+  {
+    if (t->tag & TT_CONST)
+      continue;
+    emit_tok(t);
+  }
+  // Emit temp variable name and value
+  OUT_LIT(" _prism_oe_");
+  out_uint(ctx->ret_counter);
+  OUT_LIT(" = (");
+  emit_range(val_start, orelse_tok);
+  OUT_LIT(");");
+
+  // Emit full original type + declarator (with const)
+  emit_range(type_start, type->end);
+  parse_declarator(decl_start, true);
+
+  // Emit ternary using temp variable
+  OUT_LIT(" = _prism_oe_");
+  out_uint(ctx->ret_counter);
+  OUT_LIT(" ? _prism_oe_");
+  out_uint(ctx->ret_counter);
+  OUT_LIT(" : (");
+  ctx->ret_counter++;
+
+  // Emit fallback expression tokens
+  int fdepth = 0;
+  while (tok->kind != TK_EOF)
+  {
+    if (tok->flags & TF_OPEN)
+      fdepth++;
+    else if (tok->flags & TF_CLOSE)
+      fdepth--;
+    else if (fdepth == 0 && (equal(tok, ";") || (stop_comma && tok == stop_comma)))
+      break;
+    emit_tok(tok);
+    tok = tok->next;
+  }
+
+  // Close the ternary paren
+  out_char(')');
+  out_char(';');
+  return tok;
+}
+
 // Process all declarators in a declaration and emit with zero-init
 // Returns token after declaration, or NULL on failure
 static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw, Token *type_start)
@@ -2568,9 +2647,9 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
     {
       // Rollback any tokens emitted by parse_declarator before it failed,
       // so the caller can re-emit the original tokens without duplication.
-      if (!oe_buf_flushed && buf_pos_before_decl <= out_buf_pos)
+      // Always safe: buffer grows instead of flushing during speculation.
+      if (buf_pos_before_decl <= out_buf_pos)
         out_buf_pos = buf_pos_before_decl;
-      free(typeof_vars);
       ctx->active_typeof_vars = NULL;
       return NULL;
     }
@@ -2604,7 +2683,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
     // Track typeof variables for memset emission (dynamic, no hard limit)
     if (needs_memset)
     {
-      ENSURE_ARRAY_CAP(typeof_vars, typeof_var_count + 1, typeof_var_cap, 8, Token *);
+      ARENA_ENSURE_CAP(&ctx->main_arena, typeof_vars, typeof_var_count + 1, typeof_var_cap, 8, Token *);
       typeof_vars[typeof_var_count++] = decl.var_name;
       ctx->active_typeof_vars = typeof_vars; // Update tracking after potential realloc
     }
@@ -2684,75 +2763,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
           Token *stop_comma = find_boundary_comma(tok);
 
-          // MSVC-compatible: roll back output and re-emit with temp variable
-          // Instead of: "const T x = val ?: fallback;"
-          // Emit: "T _prism_oe_N = (val); const T x = _prism_oe_N ? _prism_oe_N : (fallback);"
-          if (oe_buf_checkpoint >= 0 && !oe_buf_flushed && out_buf_pos >= oe_buf_checkpoint)
-          {
-            // Roll back to before type+declarator+initializer emission
-            out_buf_pos = oe_buf_checkpoint;
-            last_emitted = NULL;
-
-            // Emit type WITHOUT const (for temp variable)
-            for (Token *t = type_start; t && t != type->end && t->kind != TK_EOF; t = t->next)
-            {
-              if (t->tag & TT_CONST)
-                continue;
-              emit_tok(t);
-            }
-            // Emit pointer prefix from declarator WITHOUT const
-            for (Token *t = decl_start; t && t != decl.var_name && t->kind != TK_EOF; t = t->next)
-            {
-              if (t->tag & TT_CONST)
-                continue;
-              emit_tok(t);
-            }
-            // Emit temp variable name and value
-            OUT_LIT(" _prism_oe_");
-            out_uint(ctx->ret_counter);
-            OUT_LIT(" = (");
-            emit_range(val_start, orelse_tok);
-            OUT_LIT(");");
-
-            // Emit full original type + declarator (with const)
-            emit_range(type_start, type->end);
-            parse_declarator(decl_start, true);
-
-            // Emit ternary using temp variable
-            OUT_LIT(" = _prism_oe_");
-            out_uint(ctx->ret_counter);
-            OUT_LIT(" ? _prism_oe_");
-            out_uint(ctx->ret_counter);
-            OUT_LIT(" : (");
-            ctx->ret_counter++;
-          }
-          else
-          {
-            // Buffer was flushed despite pre-flush — declaration exceeds buffer capacity.
-            // Cannot roll back for temp variable approach; refuse rather than emit
-            // a ternary that would double-evaluate the init expression.
-            error_tok(orelse_tok, "const orelse fallback: declaration too large for output buffer rollback "
-                                  "(would cause double-evaluation of init expression)");
-          }
-
-          // Emit fallback expression tokens
-          int fdepth = 0;
-          while (tok->kind != TK_EOF)
-          {
-            if (tok->flags & TF_OPEN)
-              fdepth++;
-            else if (tok->flags & TF_CLOSE)
-              fdepth--;
-            else if (fdepth == 0 && (equal(tok, ";") || (stop_comma && tok == stop_comma)))
-              break;
-            emit_tok(tok);
-            tok = tok->next;
-          }
-
-          // Close the ternary paren if using temp variable path
-          if (oe_buf_checkpoint >= 0)
-            out_char(')');
-          out_char(';');
+          tok = handle_const_orelse_fallback(tok, orelse_tok, val_start, decl_start, &decl,
+                                             type_start, type, stop_comma);
 
           emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile);
           typeof_var_count = 0;
@@ -2766,11 +2778,9 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
           {
             tok = tok->next;
             oe_buf_checkpoint = out_buf_pos;
-            oe_buf_flushed = false;
             re_emit_type_specifier(type_start, type->end);
             continue;
           }
-          free(typeof_vars);
           ctx->active_typeof_vars = NULL;
           return tok;
         }
@@ -2801,11 +2811,9 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
         {
           tok = tok->next; // skip comma
           oe_buf_checkpoint = out_buf_pos;
-          oe_buf_flushed = false;
           re_emit_type_specifier(type_start, type->end);
           continue;
         }
-        free(typeof_vars);
         ctx->active_typeof_vars = NULL;
         return tok;
       }
@@ -2817,7 +2825,6 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
     {
       emit_tok(tok);
       emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile);
-      free(typeof_vars);
       ctx->active_typeof_vars = NULL;
       return tok->next;
     }
@@ -2828,13 +2835,11 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
     }
     else
     {
-      free(typeof_vars);
       ctx->active_typeof_vars = NULL;
       return NULL;
     }
   }
 
-  free(typeof_vars);
   ctx->active_typeof_vars = NULL;
   return NULL;
 }
@@ -2942,33 +2947,24 @@ static Token *try_zero_init_decl(Token *tok)
   }
 
   // Emit pragmas and type
-  // Flush buffer before setting checkpoint so rollback is always possible.
-  // Without this, a mid-declaration flush would prevent const+fallback orelse
-  // from using the temp variable approach, potentially causing double-evaluation.
+  // Flush buffer before setting checkpoint so speculative output (during
+  // declarator parsing and possible const+fallback orelse) begins cleanly.
+  // During speculation, the buffer grows instead of flushing, ensuring
+  // rollback is always safe.
   out_flush();
   oe_buf_checkpoint = out_buf_pos;
-  oe_buf_flushed = false;
   if (pragma_start != start)
     emit_range(pragma_start, start);
   emit_range(start, type.end);
 
   Token *result = process_declarators(type.end, &type, is_raw, start);
-  if (!result && !oe_buf_flushed && oe_buf_checkpoint >= 0)
+  if (!result && oe_buf_checkpoint >= 0)
   {
     // Rollback all emitted output (type specifier + partial declarator)
     // so the caller's main loop can re-emit the original tokens.
+    // Always safe: buffer grows instead of flushing during speculation.
     out_buf_pos = oe_buf_checkpoint;
     last_emitted = NULL;
-  }
-  else if (!result && oe_buf_flushed)
-  {
-    // Buffer was flushed to stdout during type/declarator emission and then
-    // the declarator parse failed.  We cannot roll back what was already
-    // written, so the output stream is now corrupt.  Abort rather than
-    // silently producing broken code.
-    error_tok(warn_loc, "declaration parse rolled back after output buffer was "
-                        "already flushed (output may be corrupt). Please simplify the "
-                        "declaration or report this as a bug.");
   }
   oe_buf_checkpoint = -1;
   return result;
@@ -3733,7 +3729,7 @@ static Token *handle_open_brace(Token *tok)
   // Detect statement expression: ({
   if (last_emitted && equal(last_emitted, "("))
   {
-    ENSURE_ARRAY_CAP(stmt_expr_levels, ctx->stmt_expr_count + 1, stmt_expr_capacity, INITIAL_ARRAY_CAP, int);
+    ARENA_ENSURE_CAP(&ctx->main_arena, stmt_expr_levels, ctx->stmt_expr_count + 1, stmt_expr_capacity, INITIAL_ARRAY_CAP, int);
     stmt_expr_levels[ctx->stmt_expr_count++] = ctx->defer_depth + 1;
   }
   emit_tok(tok);
@@ -3771,10 +3767,8 @@ static Token *handle_close_brace(Token *tok)
 
 static inline void argv_builder_add(ArgvBuilder *ab, const char *arg)
 {
-  ENSURE_ARRAY_CAP(ab->data, ab->count + 2, ab->capacity, 64, char *);
-  ab->data[ab->count] = strdup(arg);
-  if (!ab->data[ab->count])
-    error("out of memory");
+  ARENA_ENSURE_CAP(&ctx->main_arena, ab->data, ab->count + 2, ab->capacity, 64, char *);
+  ab->data[ab->count] = arena_strdup(&ctx->main_arena, arg);
   ab->count++;
   ab->data[ab->count] = NULL;
 }
@@ -3840,13 +3834,10 @@ static int run_command(char **argv)
 }
 #endif
 
+// argv data and strings are arena-allocated; nothing to free individually.
 static void free_argv(char **argv)
 {
-  if (!argv)
-    return;
-  for (int i = 0; argv[i]; i++)
-    free(argv[i]);
-  free(argv);
+  (void)argv;
 }
 
 // Unified temp file creation with optional suffix (e.g., ".c" → suffix_len=2)
@@ -4200,19 +4191,24 @@ static int transpile_tokens(Token *tok, FILE *fp)
   }
 
 // Track top-level parentheses for function detection (used in fast and slow paths)
-#define TRACK_TOPLEVEL_PAREN(tok)                            \
-  if (ctx->defer_depth == 0) {                               \
-    if (match_ch(tok, '(')) {                                \
-      if (toplevel_paren_depth == 0)                         \
-        last_toplevel_open_paren = tok;                      \
-      toplevel_paren_depth++;                                \
-    } else if (match_ch(tok, ')')) {                          \
-      if (--toplevel_paren_depth <= 0) {                     \
-        toplevel_paren_depth = 0;                            \
-        last_toplevel_paren = tok;                           \
-      }                                                      \
-    }                                                        \
-    prev_toplevel_tok = tok;                                 \
+#define TRACK_TOPLEVEL_PAREN(tok)       \
+  if (ctx->defer_depth == 0)            \
+  {                                     \
+    if (match_ch(tok, '('))             \
+    {                                   \
+      if (toplevel_paren_depth == 0)    \
+        last_toplevel_open_paren = tok; \
+      toplevel_paren_depth++;           \
+    }                                   \
+    else if (match_ch(tok, ')'))        \
+    {                                   \
+      if (--toplevel_paren_depth <= 0)  \
+      {                                 \
+        toplevel_paren_depth = 0;       \
+        last_toplevel_paren = tok;      \
+      }                                 \
+    }                                   \
+    prev_toplevel_tok = tok;            \
   }
 
     // ── Fast path: untagged tokens with no stmt-start processing ──
@@ -4382,10 +4378,9 @@ static int transpile_tokens(Token *tok, FILE *fp)
       DISPATCH(handle_sue_body);
 
     // Structural punctuation dispatch: { } ; :
-    // TT_STRUCTURAL is set on { } ; : (and their digraph equivalents <% %>)
+    // TT_STRUCTURAL is set on { } ; :
     if (tag & TT_STRUCTURAL)
     {
-      // Use match_ch for digraph-safe comparison
       if (match_ch(tok, '{'))
       {
         // First check: function definition detection at top level
@@ -4433,7 +4428,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
         tok = handle_close_brace(tok);
         continue;
       }
-      // ; and : are never digraphs — direct char compare
+      // ; and :
       char c = tok->loc[0];
       if (c == ';')
       {
@@ -4551,23 +4546,18 @@ PRISM_API void prism_reset(void)
   typedef_table_reset();
   tokenizer_teardown(true);
 
-  for (int i = 0; i < defer_stack_capacity; i++)
-  {
-    free(defer_stack[i].entries);
-    defer_stack[i] = (DeferScope){0};
-  }
-  free(defer_stack);
+  // defer_stack and entries are arena-allocated; just reset pointers.
   defer_stack = NULL;
   ctx->defer_depth = 0;
   defer_stack_capacity = 0;
 
-  free(label_table.labels);
+  // label_table.labels is arena-allocated.
   hashmap_clear(&label_table.name_map);
   label_table = (LabelTable){0};
 
   system_includes_reset();
 
-  free(stmt_expr_levels);
+  // stmt_expr_levels is arena-allocated; just reset pointers.
   stmt_expr_levels = NULL;
   ctx->stmt_expr_count = 0;
   stmt_expr_capacity = 0;
@@ -4608,12 +4598,8 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
       remove(ctx->active_temp_output);
       ctx->active_temp_output[0] = '\0';
     }
-    // Free typeof_vars if longjmp fired inside process_declarators
-    if (ctx->active_typeof_vars)
-    {
-      free(ctx->active_typeof_vars);
-      ctx->active_typeof_vars = NULL;
-    }
+    // typeof_vars is arena-allocated; just clear the tracking pointer.
+    ctx->active_typeof_vars = NULL;
     // Free open_memstream buffer if longjmp fired during transpile_tokens
     // Close out_fp first since it references the membuf (open_memstream FILE)
     if (out_fp)
@@ -4878,7 +4864,7 @@ static bool get_self_exe_path(char *buf, size_t bufsize)
 }
 #endif
 
-// Windows: get_install_path, ensure_install_dir, add_to_user_path defined in windows.c
+// Windows: os_get_install_path, os_ensure_install_dir, os_add_to_user_path defined in windows.c
 #ifndef _WIN32
 static const char *get_install_path(void) { return INSTALL_PATH; }
 static bool ensure_install_dir(const char *p)

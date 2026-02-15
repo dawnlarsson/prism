@@ -41,8 +41,8 @@
 #define IS_ALNUM(c) (IS_DIGIT(c) || IS_ALPHA(c))
 #define IS_XDIGIT(c) (IS_DIGIT(c) || ((unsigned)((c) | 0x20) - 'a') < 6u)
 #define ARENA_DEFAULT_BLOCK_SIZE (64 * 1024)
-#define KW_MARKER 0x80000000UL // Internal marker bit for keyword map: values are (tag | KW_MARKER)
-#define ARENA_ALIGN 8 // Alignment for arena allocations (>= max_align_t on 64-bit)
+#define KW_MARKER 0x80000000UL                 // Internal marker bit for keyword map: values are (tag | KW_MARKER)
+#define ARENA_ALIGN (__alignof__(long double)) // Alignment for arena allocations (max fundamental type)
 #define TOKEN_ALLOC_SIZE (((int)sizeof(Token) + (ARENA_ALIGN - 1)) & ~(ARENA_ALIGN - 1))
 
 #define equal(tok, s) /* known-length strings of 1/2 bytes use branchless comparisons; others use memcmp. Runtime strings fall back to strlen. */   \
@@ -72,25 +72,280 @@
         }                                                                                                \
     } while (0)
 
+// Like ENSURE_ARRAY_CAP but allocates from arena (old block abandoned on grow, freed at arena_free)
+#define ARENA_ENSURE_CAP(arena, arr, count, cap, init_cap, T)                                        \
+    do                                                                                               \
+    {                                                                                                \
+        if ((count) >= (cap))                                                                        \
+        {                                                                                            \
+            size_t old_cap = (size_t)(cap);                                                          \
+            size_t new_cap = old_cap == 0 ? ((init_cap) > 0 ? (size_t)(init_cap) : 1) : old_cap * 2; \
+            while (new_cap < (size_t)(count))                                                        \
+                new_cap *= 2;                                                                        \
+            (arr) = arena_realloc((arena), (arr), sizeof(T) * old_cap, sizeof(T) * new_cap);         \
+            (cap) = new_cap;                                                                         \
+        }                                                                                            \
+    } while (0)
+
 // Lookup table for identifier-continuation chars (alnum + _ + $ + bytes >= 0x80)
 // Hardcoded for portability (no GCC range designators, no runtime init)
 static const uint8_t ident_char[256] = {
-    0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, // 0x00-0x0F
-    0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, // 0x10-0x1F
-    0,0,0,0,1,0,0,0, 0,0,0,0,0,0,0,0, // 0x20-0x2F ($)
-    1,1,1,1,1,1,1,1, 1,1,0,0,0,0,0,0, // 0x30-0x3F (0-9)
-    0,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1, // 0x40-0x4F (A-O)
-    1,1,1,1,1,1,1,1, 1,1,1,0,0,0,0,1, // 0x50-0x5F (P-Z, _)
-    0,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1, // 0x60-0x6F (a-o)
-    1,1,1,1,1,1,1,1, 1,1,1,0,0,0,0,0, // 0x70-0x7F (p-z)
-    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1, // 0x80-0xFF (non-ASCII)
-    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
-    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
-    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
-    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
-    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
-    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
-    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0, // 0x00-0x0F
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0, // 0x10-0x1F
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0, // 0x20-0x2F ($)
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0, // 0x30-0x3F (0-9)
+    0,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1, // 0x40-0x4F (A-O)
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    0,
+    0,
+    0,
+    0,
+    1, // 0x50-0x5F (P-Z, _)
+    0,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1, // 0x60-0x6F (a-o)
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0, // 0x70-0x7F (p-z)
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1, // 0x80-0xFF (non-ASCII)
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
 };
 
 typedef struct Token Token;
@@ -128,9 +383,8 @@ enum
     TF_AT_BOL = 1 << 0,
     TF_HAS_SPACE = 1 << 1,
     TF_IS_FLOAT = 1 << 2,
-    TF_IS_DIGRAPH = 1 << 3,
-    TF_OPEN = 1 << 4,  // Opening delimiter: ( [ { and digraph equivalents
-    TF_CLOSE = 1 << 5, // Closing delimiter: ) ] } and digraph equivalents
+    TF_OPEN = 1 << 3,  // Opening delimiter: ( [ {
+    TF_CLOSE = 1 << 4, // Closing delimiter: ) ] }
 };
 
 // Token tags - bitmask classification assigned once at tokenize time
@@ -288,7 +542,7 @@ typedef struct PrismContext
     unsigned long long ret_counter;
     Token *func_ret_type_start; // First token of return type (after storage/function specifiers)
     Token *func_ret_type_end;   // Function name token (exclusive end of return type range)
-    void *active_typeof_vars;   // process_declarators heap alloc; freed on longjmp recovery
+    void *active_typeof_vars;   // process_declarators arena alloc; cleared on longjmp recovery
 #ifdef PRISM_LIB_MODE
     char active_temp_output[PATH_MAX];
     char *active_membuf;           // open_memstream buffer; freed on longjmp recovery
@@ -303,13 +557,15 @@ typedef struct
     uint8_t flags; // is_system (bit 0), is_include_entry (bit 1)
 } FileViewKey;
 
-typedef struct
-{
-    char c1, c2;
-    const char *equiv;
-} Digraph;
-
-static const Digraph digraphs[] = {{'<', ':', "["}, {':', '>', "]"}, {'<', '%', "{"}, {'%', '>', "}"}, {'%', ':', "#"}, {0, 0, NULL}};
+// Normalized digraph equivalents (static storage for token loc pointers).
+// Digraphs (<: :> <% %> %: %:%:) are normalized to their standard equivalents
+// at tokenize time. This eliminates all digraph checks from equal() and emit_tok().
+static char digraph_norm_bracket_open[] = "[";
+static char digraph_norm_bracket_close[] = "]";
+static char digraph_norm_brace_open[] = "{";
+static char digraph_norm_brace_close[] = "}";
+static char digraph_norm_hash[] = "#";
+static char digraph_norm_paste[] = "##";
 
 static PrismContext *ctx = NULL;
 
@@ -370,6 +626,34 @@ static void *arena_alloc_uninit(Arena *arena, size_t size)
     void *ptr = arena->current->data + arena->current->used;
     arena->current->used += size;
     return ptr;
+}
+
+// Allocate zeroed memory from arena
+static void *arena_alloc(Arena *arena, size_t size)
+{
+    void *ptr = arena_alloc_uninit(arena, size);
+    memset(ptr, 0, size);
+    return ptr;
+}
+
+// Grow an arena allocation — old block is abandoned (freed on arena_free/reset).
+static void *arena_realloc(Arena *arena, void *old, size_t old_size, size_t new_size)
+{
+    void *p = arena_alloc_uninit(arena, new_size);
+    if (old && old_size > 0)
+        memcpy(p, old, old_size < new_size ? old_size : new_size);
+    if (new_size > old_size)
+        memset((char *)p + old_size, 0, new_size - old_size);
+    return p;
+}
+
+// Duplicate a string into arena memory
+static char *arena_strdup(Arena *arena, const char *s)
+{
+    size_t len = strlen(s);
+    char *p = arena_alloc_uninit(arena, len + 1);
+    memcpy(p, s, len + 1);
+    return p;
 }
 
 static void arena_reset(Arena *arena)
@@ -570,20 +854,6 @@ static void hashmap_clear(HashMap *map)
     map->tombstones = 0;
 }
 
-// Free all keys in a hashmap and clear it
-static void hashmap_free_keys(HashMap *map)
-{
-    if (!map->buckets)
-        return;
-    for (int i = 0; i < map->capacity; i++)
-    {
-        HashEntry *ent = &map->buckets[i];
-        if (ent->key && ent->key != TOMBSTONE)
-            free(ent->key);
-    }
-    hashmap_clear(map);
-}
-
 // Filename interning - avoids duplicating identical filename strings
 // Each entry maps filename string -> interned copy
 static char *intern_filename(const char *name)
@@ -596,11 +866,7 @@ static char *intern_filename(const char *name)
     if (existing)
         return existing;
     // Allocate and store new interned string
-    char *interned = malloc(len + 1);
-    if (!interned)
-        error("out of memory");
-    memcpy(interned, name, len);
-    interned[len] = '\0';
+    char *interned = arena_strdup(&ctx->main_arena, name);
     hashmap_put(&ctx->filename_intern_map, interned, len, interned);
     return interned;
 }
@@ -618,35 +884,25 @@ static File *find_cached_file_view(char *filename, int line_delta, bool is_syste
 static void cache_file_view(char *filename, int line_delta, bool is_system, bool is_include_entry, File *file)
 {
     // Need to allocate key storage since HashMap stores pointer to key
-    FileViewKey *stored_key = calloc(1, sizeof(FileViewKey)); // calloc zeros padding bytes
-    if (!stored_key)
-        error("out of memory");
+    FileViewKey *stored_key = arena_alloc(&ctx->main_arena, sizeof(FileViewKey));
     stored_key->filename = filename;
     stored_key->line_delta = line_delta;
     stored_key->flags = (is_system ? 1 : 0) | (is_include_entry ? 2 : 0);
     hashmap_put(&ctx->file_view_cache, (char *)stored_key, sizeof(FileViewKey), file);
 }
 
-static void free_file(File *f)
+// File objects are arena-allocated; only contents need explicit free when owned.
+static void free_file_contents(File *f)
 {
     if (!f)
         return;
     if (f->contents && f->owns_contents)
         free(f->contents);
-    // Don't free interned filenames - they're managed by filename_intern_map
-    // Check by looking up in the intern map (pointer comparison after lookup)
-    if (f->name)
-    {
-        int len = strlen(f->name);
-        char *found = hashmap_get(&ctx->filename_intern_map, f->name, len);
-        if (found != f->name) // Not interned, safe to free
-            free(f->name);
-    }
-    free(f);
 }
 
-static void free_filename_intern_map(void) { hashmap_free_keys(&ctx->filename_intern_map); }
-static void free_file_view_cache(void) { hashmap_free_keys(&ctx->file_view_cache); }
+// Keys are arena-allocated; just clear the bucket array.
+static void free_filename_intern_map(void) { hashmap_clear(&ctx->filename_intern_map); }
+static void free_file_view_cache(void) { hashmap_clear(&ctx->file_view_cache); }
 
 static inline File *tok_file(Token *tok)
 {
@@ -690,9 +946,11 @@ static noreturn void error(char *fmt, ...)
 
 static void verror_at(char *filename, char *input, int line_no, char *loc, const char *fmt, va_list ap)
 {
-    if (!input || !loc || line_no <= 0)
+    // Guard: loc must be within [input, input+N] for safe pointer arithmetic.
+    // Normalized digraph tokens have loc pointing to static storage, not the source buffer.
+    if (!input || !loc || line_no <= 0 || loc < input)
     {
-        fprintf(stderr, "%s:?: ", filename ? filename : "<unknown>");
+        fprintf(stderr, "%s:%d: ", filename ? filename : "<unknown>", line_no > 0 ? line_no : 0);
         vfprintf(stderr, fmt, ap);
         fprintf(stderr, "\n");
         return;
@@ -780,68 +1038,21 @@ static void warn_tok(Token *tok, const char *fmt, ...)
 #endif
 }
 
-static inline const char *digraph_equiv(Token *tok)
-{
-    if (tok->kind != TK_PUNCT)
-        return NULL;
-    if (tok->len == 4 && !memcmp(tok->loc, "%:%:", 4))
-        return "##";
-    if (tok->len != 2)
-        return NULL;
-    for (const Digraph *d = digraphs; d->equiv; d++)
-        if (tok->loc[0] == d->c1 && tok->loc[1] == d->c2)
-            return d->equiv;
-    return NULL;
-}
-
 static inline bool equal_n(Token *tok, const char *op, size_t len)
 {
-    if (tok->len == (int)len && tok->shortcut == (uint8_t)op[0] && !memcmp(tok->loc + 1, op + 1, len - 1))
-        return true;
-
-    // Only check digraph equivalence if token was flagged as a digraph
-    if (!(tok->flags & TF_IS_DIGRAPH))
-        return false;
-    const char *equiv = digraph_equiv(tok);
-    if (!equiv)
-        return false;
-    // digraph equivalents are 1 or 2 chars, compute length directly
-    size_t elen = equiv[0] ? (equiv[1] ? 2 : 1) : 0;
-    return elen == len && !memcmp(equiv, op, len);
-}
-
-// Cold path: check digraph equivalence for single-char comparison
-static bool __attribute__((noinline)) _equal_1_digraph(Token *tok, char c)
-{
-    const char *e = digraph_equiv(tok);
-    return e && e[0] == c && !e[1];
+    return tok->len == (int)len && tok->shortcut == (uint8_t)op[0] && !memcmp(tok->loc + 1, op + 1, len - 1);
 }
 
 // Fast inline path for single-char comparisons (avoids function call + memcmp)
 static inline bool _equal_1(Token *tok, char c)
 {
-    if (tok->len == 1)
-        return tok->shortcut == (uint8_t)c;
-    if (__builtin_expect(tok->flags & TF_IS_DIGRAPH, 0))
-        return _equal_1_digraph(tok, c);
-    return false;
-}
-
-// Cold path: check digraph equivalence for two-char comparison
-static bool __attribute__((noinline)) _equal_2_digraph(Token *tok, const char *s)
-{
-    const char *e = digraph_equiv(tok);
-    return e && e[0] == s[0] && e[1] == s[1];
+    return tok->len == 1 && tok->shortcut == (uint8_t)c;
 }
 
 // Fast inline path for two-char comparisons
 static inline bool _equal_2(Token *tok, const char *s)
 {
-    if (tok->len == 2)
-        return tok->loc[0] == s[0] && tok->loc[1] == s[1];
-    if (__builtin_expect(tok->flags & TF_IS_DIGRAPH, 0))
-        return _equal_2_digraph(tok, s);
-    return false;
+    return tok->len == 2 && tok->loc[0] == s[0] && tok->loc[1] == s[1];
 }
 
 static inline uintptr_t keyword_lookup(char *key, int keylen)
@@ -1296,15 +1507,6 @@ static inline void classify_punct(Token *t)
             t->tag = TT_ASSIGN;
         else if (c == '-' && c2 == '>')
             t->tag = TT_MEMBER;
-        else if ((c == '<' && c2 == '%') || (c == '%' && c2 == '>'))
-            t->tag = TT_STRUCTURAL;
-        else if (c == '<' && c2 == ':')
-            t->tag = TT_ASSIGN;
-        // Digraph open/close flags
-        if (c == '<' && (c2 == '%' || c2 == ':'))
-            t->flags |= TF_OPEN; // <% = {, <: = [
-        else if ((c == '%' || c == ':') && c2 == '>')
-            t->flags |= TF_CLOSE; // %> = }, :> = ]
     }
     else if (t->len == 3 && t->loc[2] == '=' && (c == '<' || c == '>') && t->loc[1] == c)
         t->tag = TT_ASSIGN;
@@ -1312,12 +1514,7 @@ static inline void classify_punct(Token *t)
 
 static File *new_file(char *name, int file_no, char *contents)
 {
-    File *file = calloc(1, sizeof(File));
-    if (!file)
-    {
-        free(contents);
-        error("out of memory");
-    }
+    File *file = arena_alloc(&ctx->main_arena, sizeof(File));
     file->name = intern_filename(name);
     file->display_name = file->name;
     file->file_no = file_no;
@@ -1329,7 +1526,7 @@ static File *new_file(char *name, int file_no, char *contents)
 
 static void add_input_file(File *file)
 {
-    ENSURE_ARRAY_CAP(ctx->input_files, ctx->input_file_count + 1, ctx->input_file_capacity, 16, File *);
+    ARENA_ENSURE_CAP(&ctx->main_arena, ctx->input_files, ctx->input_file_count + 1, ctx->input_file_capacity, 16, File *);
     ctx->input_files[ctx->input_file_count++] = file;
 }
 
@@ -1344,9 +1541,7 @@ static File *new_file_view(const char *name, File *base, int line_delta, bool is
         return cached;
 
     // Create new File view
-    File *file = calloc(1, sizeof(File));
-    if (!file)
-        error("out of memory");
+    File *file = arena_alloc(&ctx->main_arena, sizeof(File));
 
     file->name = interned_name; // Use interned string (no strdup needed)
     file->display_name = file->name;
@@ -1682,7 +1877,29 @@ static Token *tokenize(File *file)
             int abs_len = punct_len < 0 ? -punct_len : punct_len;
             Token *t = cur = cur->next = new_token(TK_PUNCT, p, p + abs_len);
             if (punct_len < 0)
-                t->flags |= TF_IS_DIGRAPH;
+            {
+                // Normalize digraphs to standard equivalents at tokenize time.
+                // This eliminates all digraph branching from equal()/emit_tok().
+                char *norm;
+                switch (abs_len == 4 ? '%' : p[0])
+                {
+                case '<':
+                    norm = p[1] == ':' ? digraph_norm_bracket_open : digraph_norm_brace_open;
+                    break;
+                case ':':
+                    norm = digraph_norm_bracket_close;
+                    break;
+                case '%':
+                    norm = abs_len == 4 ? digraph_norm_paste : (p[1] == '>' ? digraph_norm_brace_close : digraph_norm_hash);
+                    break;
+                default:
+                    norm = p;
+                    break; // unreachable
+                }
+                t->loc = norm;
+                t->len = (abs_len == 4) ? 2 : 1;
+                t->shortcut = (uint8_t)norm[0];
+            }
             classify_punct(t);
             p += abs_len;
             continue;
@@ -1775,19 +1992,18 @@ Token *tokenize_file(char *path)
 // full=true:  free all memory including arena blocks and keyword map
 void tokenizer_teardown(bool full)
 {
+    // Free owned file contents before arena reset (contents are malloc'd by read_file)
+    if (ctx->input_files)
+    {
+        for (int i = 0; i < ctx->input_file_count; i++)
+            free_file_contents(ctx->input_files[i]);
+    }
     if (full)
         arena_free(&ctx->main_arena);
     else
         arena_reset(&ctx->main_arena);
     free_file_view_cache();
-    // IMPORTANT: free_file() looks up ctx->filename_intern_map to decide whether
-    // to free f->name. This must happen BEFORE free_filename_intern_map() below.
-    if (ctx->input_files)
-    {
-        for (int i = 0; i < ctx->input_file_count; i++)
-            free_file(ctx->input_files[i]);
-        free(ctx->input_files);
-    }
+    // input_files array and File structs are arena-allocated; just reset pointers.
     ctx->input_files = NULL;
     ctx->input_file_count = 0;
     ctx->input_file_capacity = 0;
