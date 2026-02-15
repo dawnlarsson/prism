@@ -388,20 +388,26 @@ static const char *get_tmp_dir(void)
   return fallback;
 }
 
-// Fast single-char match for balanced scanners: direct char compare with rare digraph fallback
-static inline bool match_ch(Token *tok, char c)
-{
-  if (tok->len == 1)
-    return tok->shortcut == (uint8_t)c;
-  if (__builtin_expect(tok->flags & TF_IS_DIGRAPH, 0))
-    return _equal_1_digraph(tok, c);
-  return false;
-}
+#define match_ch _equal_1 // Alias: identical to _equal_1 (single-char + rare digraph fallback)
 
 // Check if token is identifier-like (TK_IDENT or TK_KEYWORD like 'raw'/'defer')
 static inline bool is_identifier_like(Token *tok)
 {
   return tok->kind <= TK_KEYWORD; // TK_IDENT=0, TK_KEYWORD=1
+}
+
+// Find the next comma at depth 0 in a declarator list, or NULL if semicolon/EOF first.
+static Token *find_boundary_comma(Token *tok)
+{
+  int depth = 0;
+  for (Token *t = tok; t->kind != TK_EOF; t = t->next)
+  {
+    if (t->flags & TF_OPEN) depth++;
+    else if (t->flags & TF_CLOSE) depth--;
+    else if (depth == 0 && equal(t, ",")) return t;
+    else if (depth == 0 && equal(t, ";")) return NULL;
+  }
+  return NULL;
 }
 
 // Skip tokens to the next semicolon at depth 0, respecting balanced delimiters
@@ -559,23 +565,17 @@ static void out_line(int line_no, const char *file)
 
   out_uint(line_no);
   OUT_LIT(" \"");
-#ifdef _WIN32
-  // Emit forward slashes to avoid MSVC C4129 warnings on backslash escapes
   for (const char *p = file; *p; p++)
   {
-    char c = (*p == '\\') ? '/' : *p;
-    if (c == '"')
+#ifdef _WIN32
+    char c = (*p == '\\') ? '/' : *p; // normalize backslashes for MSVC C4129
+#else
+    char c = *p;
+#endif
+    if (c == '"' || c == '\\')
       out_char('\\');
     out_char(c);
   }
-#else
-  for (const char *p = file; *p; p++)
-  {
-    if (*p == '"' || *p == '\\')
-      out_char('\\');
-    out_char(*p);
-  }
-#endif
   OUT_LIT("\"\n");
 }
 
@@ -677,8 +677,7 @@ static void emit_system_includes(void)
 
   emit_system_header_diag_pop();
 
-  if (ctx->system_include_count > 0)
-    out_char('\n');
+  out_char('\n');
 }
 
 // Reset system include tracking
@@ -720,10 +719,9 @@ static void defer_push_scope(bool consume_flags)
   for (int i = old_cap; i < defer_stack_capacity; i++)
     defer_stack[i] = (DeferScope){0};
   DeferScope *s = &defer_stack[ctx->defer_depth];
-  s->count = 0;
-  s->had_control_exit = false;
-  s->seen_case_label = false;
-  s->is_struct = false;
+  DeferEntry *prev_entries = s->entries;
+  int prev_cap = s->capacity;
+  *s = (DeferScope){.entries = prev_entries, .capacity = prev_cap};
   if (consume_flags)
   {
     s->is_loop = ctrl.next_scope & NS_LOOP;
@@ -733,8 +731,6 @@ static void defer_push_scope(bool consume_flags)
       ctx->conditional_block_depth++;
     ctrl.next_scope = 0;
   }
-  else
-    s->is_loop = s->is_switch = s->is_conditional = false;
   ctx->defer_depth++;
 }
 
@@ -1334,59 +1330,27 @@ static bool walker_next(TokenWalker *w)
     }
 
     // Track braces — update depth but still return token to caller
-    // Fast path: single len==1 check covers both { and }, avoiding two equal() calls
-    if (w->tok->len == 1)
+    if (match_ch(w->tok, '{'))
+      w->depth++;
+    else if (match_ch(w->tok, '}'))
     {
-      char c = w->tok->loc[0];
-      if (c == '{')
-        w->depth++;
-      else if (c == '}')
+      if (w->depth <= w->initial_depth)
+        return false; // End of region
+      if ((unsigned)w->depth < 64)
       {
-        if (w->depth <= w->initial_depth)
-          return false; // End of region
-        if ((unsigned)w->depth < 64)
+        if (w->struct_at_depth & (1ULL << w->depth))
         {
-          if (w->struct_at_depth & (1ULL << w->depth))
-          {
-            w->struct_at_depth &= ~(1ULL << w->depth);
-            if (w->struct_depth > 0)
-              w->struct_depth--;
-          }
+          w->struct_at_depth &= ~(1ULL << w->depth);
+          if (w->struct_depth > 0)
+            w->struct_depth--;
         }
-        else if (w->deep_struct_opens > 0)
-        {
-          // Depth >= 64: only decrement if a struct was actually opened here
-          w->deep_struct_opens--;
-          w->struct_depth--;
-        }
-        w->depth--;
       }
-    }
-    else if (__builtin_expect(w->tok->flags & TF_IS_DIGRAPH, 0))
-    {
-      // Handle <% and %> digraphs (extremely rare)
-      if (_equal_1(w->tok, '{'))
-        w->depth++;
-      else if (_equal_1(w->tok, '}'))
+      else if (w->deep_struct_opens > 0)
       {
-        if (w->depth <= w->initial_depth)
-          return false;
-        if ((unsigned)w->depth < 64)
-        {
-          if (w->struct_at_depth & (1ULL << w->depth))
-          {
-            w->struct_at_depth &= ~(1ULL << w->depth);
-            if (w->struct_depth > 0)
-              w->struct_depth--;
-          }
-        }
-        else if (w->deep_struct_opens > 0)
-        {
-          w->deep_struct_opens--;
-          w->struct_depth--;
-        }
-        w->depth--;
+        w->deep_struct_opens--;
+        w->struct_depth--;
       }
+      w->depth--;
     }
 
     return true;
@@ -2570,6 +2534,22 @@ static inline void register_decl_shadows(Token *var_name, bool effective_vla)
     typedef_add_vla_var(var_name->loc, var_name->len, depth);
 }
 
+// Re-emit type specifier tokens, skipping struct/union/enum bodies
+// to avoid redefinition errors (e.g. enum constant redeclaration)
+static void re_emit_type_specifier(Token *type_start, Token *type_end)
+{
+  for (Token *t = type_start; t != type_end; t = t->next)
+  {
+    if (equal(t, "{"))
+    {
+      t = skip_balanced(t, '{', '}');
+      if (t == type_end)
+        break;
+    }
+    emit_tok(t);
+  }
+}
+
 // Process all declarators in a declaration and emit with zero-init
 // Returns token after declaration, or NULL on failure
 static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw, Token *type_start)
@@ -2677,6 +2657,12 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
         bool has_const_qual = type->has_const || decl.is_const;
         bool is_struct_val = type_is_sue_not_enum && !decl.is_pointer && !decl.is_array;
 
+        // Array address is never NULL — orelse can never trigger
+        if (decl.is_array && !decl.is_pointer)
+          error_tok(decl.var_name, "orelse on array variable '%.*s' will never trigger "
+                                   "(array address is never NULL); remove the orelse clause",
+                    decl.var_name->len, decl.var_name->loc);
+
         // Peek at action after 'orelse' to detect fallback (non-control-flow) orelse
         Token *peek_action = tok->next;
         bool is_orelse_fallback = peek_action &&
@@ -2689,10 +2675,6 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
           if (is_struct_val)
             error_tok(tok, "orelse fallback on const struct is not supported; "
                            "use a control flow action (return/break/goto) or remove const");
-          if (decl.is_array && !decl.is_pointer)
-            error_tok(decl.var_name, "orelse on array variable '%.*s' will never trigger "
-                                     "(array address is never NULL); remove the orelse clause",
-                      decl.var_name->len, decl.var_name->loc);
 
           Token *orelse_tok = tok;
           Token *val_start = decl.end->next; // First value token after '='
@@ -2700,25 +2682,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
           register_decl_shadows(decl.var_name, effective_vla);
           tok = orelse_tok->next; // skip 'orelse'
 
-          // Find boundary comma for multi-declarator
-          Token *stop_comma = NULL;
-          {
-            int sd = 0;
-            for (Token *t = tok; t->kind != TK_EOF; t = t->next)
-            {
-              if (t->flags & TF_OPEN)
-                sd++;
-              else if (t->flags & TF_CLOSE)
-                sd--;
-              else if (sd == 0 && equal(t, ","))
-              {
-                stop_comma = t;
-                break;
-              }
-              else if (sd == 0 && equal(t, ";"))
-                break;
-            }
-          }
+          Token *stop_comma = find_boundary_comma(tok);
 
           // MSVC-compatible: roll back output and re-emit with temp variable
           // Instead of: "const T x = val ?: fallback;"
@@ -2803,16 +2767,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
             tok = tok->next;
             oe_buf_checkpoint = out_buf_pos;
             oe_buf_flushed = false;
-            for (Token *t = type_start; t != type->end; t = t->next)
-            {
-              if (equal(t, "{"))
-              {
-                t = skip_balanced(t, '{', '}');
-                if (t == type->end)
-                  break;
-              }
-              emit_tok(t);
-            }
+            re_emit_type_specifier(type_start, type->end);
             continue;
           }
           free(typeof_vars);
@@ -2833,33 +2788,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
         if (equal(tok, ";"))
           error_tok(tok, "expected statement after 'orelse'");
 
-        // Error if orelse is applied to a non-pointer array (address is never NULL,
-        // and the fallback branch generates invalid C — brace-enclosed initializer
-        // lists are not valid statement expressions in standard C).
-        if (decl.is_array && !decl.is_pointer)
-          error_tok(decl.var_name, "orelse on array variable '%.*s' will never trigger "
-                                   "(array address is never NULL); remove the orelse clause",
-                    decl.var_name->len, decl.var_name->loc);
-
-        // Find boundary comma for multi-declarator orelse
-        Token *stop_comma = NULL;
-        {
-          int sd = 0;
-          for (Token *t = tok; t->kind != TK_EOF; t = t->next)
-          {
-            if (t->flags & TF_OPEN)
-              sd++;
-            else if (t->flags & TF_CLOSE)
-              sd--;
-            else if (sd == 0 && equal(t, ","))
-            {
-              stop_comma = t;
-              break;
-            }
-            else if (sd == 0 && equal(t, ";"))
-              break;
-          }
-        }
+        Token *stop_comma = find_boundary_comma(tok);
 
         // Struct/union value orelse — error (already computed type_is_sue_not_enum above)
         bool is_struct_value = type_is_sue_not_enum && !decl.is_pointer && !decl.is_array;
@@ -2873,18 +2802,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
           tok = tok->next; // skip comma
           oe_buf_checkpoint = out_buf_pos;
           oe_buf_flushed = false;
-          // Re-emit the type specifier, skipping struct/union/enum bodies
-          // to avoid redefinition errors (e.g. enum constant redeclaration)
-          for (Token *t = type_start; t != type->end; t = t->next)
-          {
-            if (equal(t, "{"))
-            {
-              t = skip_balanced(t, '{', '}');
-              if (t == type->end)
-                break;
-            }
-            emit_tok(t);
-          }
+          re_emit_type_specifier(type_start, type->end);
           continue;
         }
         free(typeof_vars);
@@ -3106,6 +3024,19 @@ static Token *emit_expr_to_semicolon(Token *tok)
     }
   }
   return tok;
+}
+
+// Validate control flow keywords inside defer blocks are safe
+static void validate_defer_control_flow(Token *t, int inner_loop_depth, int inner_switch_depth)
+{
+  if (t->tag & TT_RETURN)
+    error_tok(t, "'return' inside defer block bypasses remaining defers");
+  if ((t->tag & TT_GOTO) && !is_known_typedef(t))
+    error_tok(t, "'goto' inside defer block could bypass remaining defers");
+  if ((t->tag & TT_BREAK) && inner_loop_depth == 0 && inner_switch_depth == 0)
+    error_tok(t, "'break' inside defer block bypasses remaining defers");
+  if ((t->tag & TT_CONTINUE) && inner_loop_depth == 0)
+    error_tok(t, "'continue' inside defer block bypasses remaining defers");
 }
 
 // Handle 'defer' keyword: validate context, record deferred statement.
@@ -3353,32 +3284,27 @@ static Token *handle_defer_keyword(Token *tok)
                    TT_IF | TT_LOOP | TT_SWITCH | TT_CASE | TT_DEFAULT | TT_DEFER)))
       error_tok(defer_keyword, "defer statement appears to be missing ';' (found '%.*s' keyword inside)",
                 t->len, t->loc);
-    // Nested defer is never valid — catch it at any depth (includes braced blocks)
+    // Nested defer is never valid
     if (!at_top && (t->tag & TT_DEFER) && !is_known_typedef(t) && !equal(t->next, ":") &&
         !(t->next && (t->next->tag & TT_ASSIGN)))
-      error_tok(defer_keyword, "nested defer is not supported (found 'defer' inside deferred block)");
-    // return/goto inside a braced defer body would bypass other defers
-    if (!at_top && t->kind == TK_KEYWORD && (t->tag & TT_RETURN))
-      error_tok(t, "'return' inside defer block would bypass remaining defers; "
-                   "move the return after the deferred scope");
-    if (!at_top && t->kind == TK_KEYWORD && (t->tag & TT_GOTO) && !is_known_typedef(t))
-      error_tok(t, "'goto' inside defer block could bypass remaining defers; "
-                   "move the goto after the deferred scope");
-    // break/continue inside defer is only dangerous if NOT inside a nested loop/switch
-    if (!at_top && t->kind == TK_KEYWORD && (t->tag & TT_BREAK) &&
-        inner_loop_depth == 0 && inner_switch_depth == 0)
-      error_tok(t, "'break' inside defer block would bypass remaining defers; "
-                   "wrap complex cleanup in a function");
-    if (!at_top && t->kind == TK_KEYWORD && (t->tag & TT_CONTINUE) &&
-        inner_loop_depth == 0)
-      error_tok(t, "'continue' inside defer block would bypass remaining defers; "
-                   "wrap complex cleanup in a function");
+      error_tok(defer_keyword, "nested defer is not supported");
+    if (!at_top && t->kind == TK_KEYWORD &&
+        (t->tag & (TT_RETURN | TT_GOTO | TT_BREAK | TT_CONTINUE)))
+      validate_defer_control_flow(t, inner_loop_depth, inner_switch_depth);
   }
 
   defer_add(defer_keyword, stmt_start, stmt_end);
   tok = (stmt_end->kind != TK_EOF) ? stmt_end->next : stmt_end;
   end_statement_after_semicolon();
   return tok;
+}
+
+// Check if a return expression is void (void function or explicit (void) cast)
+static inline bool is_void_return(Token *tok)
+{
+  return ctx->current_func_returns_void ||
+         (equal(tok, "(") && tok->next && equal(tok->next, "void") &&
+          tok->next->next && equal(tok->next->next, ")"));
 }
 
 // Emit return statement body with optional defer cleanup.
@@ -3395,9 +3321,7 @@ static Token *emit_return_body(Token *tok)
     }
     else
     {
-      bool is_void_cast = equal(tok, "(") && tok->next && equal(tok->next, "void") &&
-                          tok->next->next && equal(tok->next->next, ")");
-      bool is_void = ctx->current_func_returns_void || is_void_cast;
+      bool is_void = is_void_return(tok);
       if (!is_void)
       {
         out_char(' ');
@@ -3489,9 +3413,7 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
         }
         else
         {
-          bool is_void_cast = equal(tok, "(") && tok->next && equal(tok->next, "void") &&
-                              tok->next->next && equal(tok->next->next, ")");
-          bool is_void = ctx->current_func_returns_void || is_void_cast;
+          bool is_void = is_void_return(tok);
           if (!is_void)
           {
             out_char(' ');
@@ -4277,6 +4199,22 @@ static int transpile_tokens(Token *tok, FILE *fp)
     }                     \
   }
 
+// Track top-level parentheses for function detection (used in fast and slow paths)
+#define TRACK_TOPLEVEL_PAREN(tok)                            \
+  if (ctx->defer_depth == 0) {                               \
+    if (match_ch(tok, '(')) {                                \
+      if (toplevel_paren_depth == 0)                         \
+        last_toplevel_open_paren = tok;                      \
+      toplevel_paren_depth++;                                \
+    } else if (match_ch(tok, ')')) {                          \
+      if (--toplevel_paren_depth <= 0) {                     \
+        toplevel_paren_depth = 0;                            \
+        last_toplevel_paren = tok;                           \
+      }                                                      \
+    }                                                        \
+    prev_toplevel_tok = tok;                                 \
+  }
+
     // ── Fast path: untagged tokens with no stmt-start processing ──
     // Most tokens (~70-80%) are plain identifiers, numbers, or operators without
     // any tag bits set and not at statement start. Skip all dispatch and emit directly.
@@ -4293,24 +4231,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
       }
       if (__builtin_expect(ctx->generic_paren_depth > 0, 0))
         track_generic_paren(tok);
-      if (ctx->defer_depth == 0)
-      {
-        if (match_ch(tok, '('))
-        {
-          if (toplevel_paren_depth == 0)
-            last_toplevel_open_paren = tok;
-          toplevel_paren_depth++;
-        }
-        else if (match_ch(tok, ')'))
-        {
-          if (--toplevel_paren_depth <= 0)
-          {
-            toplevel_paren_depth = 0;
-            last_toplevel_paren = tok;
-          }
-        }
-        prev_toplevel_tok = tok;
-      }
+      TRACK_TOPLEVEL_PAREN(tok);
       emit_tok(tok);
       tok = tok->next;
       continue;
@@ -4560,24 +4481,7 @@ static int transpile_tokens(Token *tok, FILE *fp)
     }
 
     // Track previous token at top level for function detection
-    if (ctx->defer_depth == 0)
-    {
-      if (match_ch(tok, '('))
-      {
-        if (toplevel_paren_depth == 0)
-          last_toplevel_open_paren = tok;
-        toplevel_paren_depth++;
-      }
-      else if (match_ch(tok, ')'))
-      {
-        if (--toplevel_paren_depth <= 0)
-        {
-          toplevel_paren_depth = 0;
-          last_toplevel_paren = tok;
-        }
-      }
-      prev_toplevel_tok = tok;
-    }
+    TRACK_TOPLEVEL_PAREN(tok);
 
     // Default: emit token as-is
     emit_tok(tok);

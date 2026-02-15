@@ -42,7 +42,8 @@
 #define IS_XDIGIT(c) (IS_DIGIT(c) || ((unsigned)((c) | 0x20) - 'a') < 6u)
 #define ARENA_DEFAULT_BLOCK_SIZE (64 * 1024)
 #define KW_MARKER 0x80000000UL // Internal marker bit for keyword map: values are (tag | KW_MARKER)
-#define TOKEN_ALLOC_SIZE (((int)sizeof(Token) + 7) & ~7)
+#define ARENA_ALIGN 8 // Alignment for arena allocations (>= max_align_t on 64-bit)
+#define TOKEN_ALLOC_SIZE (((int)sizeof(Token) + (ARENA_ALIGN - 1)) & ~(ARENA_ALIGN - 1))
 
 #define equal(tok, s) /* known-length strings of 1/2 bytes use branchless comparisons; others use memcmp. Runtime strings fall back to strlen. */   \
     (__builtin_constant_p(s) ? (__builtin_strlen(s) == 1 ? _equal_1(tok, (s)[0]) : __builtin_strlen(s) == 2 ? _equal_2(tok, s)                      \
@@ -72,32 +73,25 @@
     } while (0)
 
 // Lookup table for identifier-continuation chars (alnum + _ + $ + bytes >= 0x80)
-#ifdef _WIN32
-// MSVC: no GCC range designators — initialize at startup
-static uint8_t ident_char[256];
-static void init_ident_char(void)
-{
-    for (int c = '0'; c <= '9'; c++)
-        ident_char[c] = 1;
-    for (int c = 'A'; c <= 'Z'; c++)
-        ident_char[c] = 1;
-    for (int c = 'a'; c <= 'z'; c++)
-        ident_char[c] = 1;
-    ident_char['_'] = 1;
-    ident_char['$'] = 1;
-    for (int c = 0x80; c <= 0xFF; c++)
-        ident_char[c] = 1;
-}
-#else
+// Hardcoded for portability (no GCC range designators, no runtime init)
 static const uint8_t ident_char[256] = {
-    ['0' ... '9'] = 1,
-    ['A' ... 'Z'] = 1,
-    ['a' ... 'z'] = 1,
-    ['_'] = 1,
-    ['$'] = 1,
-    [0x80 ... 0xFF] = 1,
+    0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, // 0x00-0x0F
+    0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, // 0x10-0x1F
+    0,0,0,0,1,0,0,0, 0,0,0,0,0,0,0,0, // 0x20-0x2F ($)
+    1,1,1,1,1,1,1,1, 1,1,0,0,0,0,0,0, // 0x30-0x3F (0-9)
+    0,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1, // 0x40-0x4F (A-O)
+    1,1,1,1,1,1,1,1, 1,1,1,0,0,0,0,1, // 0x50-0x5F (P-Z, _)
+    0,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1, // 0x60-0x6F (a-o)
+    1,1,1,1,1,1,1,1, 1,1,1,0,0,0,0,0, // 0x70-0x7F (p-z)
+    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1, // 0x80-0xFF (non-ASCII)
+    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
 };
-#endif
 
 typedef struct Token Token;
 typedef struct ArenaBlock ArenaBlock;
@@ -211,7 +205,7 @@ typedef struct
     int tombstones;
 } HashMap;
 
-// Perfect hash keyword table — O(1) lookup with single memcmp
+// Keyword cache — O(1) lookup by hash slot with single memcmp
 typedef struct
 {
     char *name;
@@ -219,7 +213,7 @@ typedef struct
     uintptr_t value;
 } KeywordEntry;
 
-static KeywordEntry keyword_perfect[256];
+static KeywordEntry keyword_cache[256];
 
 enum // Feature flags
 {
@@ -371,7 +365,7 @@ static void *arena_alloc_uninit(Arena *arena, size_t size)
 {
     if (size == 0)
         size = 1;
-    size = (size + 7) & ~(size_t)7;
+    size = (size + (ARENA_ALIGN - 1)) & ~(size_t)(ARENA_ALIGN - 1);
     arena_ensure(arena, size);
     void *ptr = arena->current->data + arena->current->used;
     arena->current->used += size;
@@ -411,9 +405,6 @@ static void prism_ctx_init(void)
     ctx->main_arena.default_block_size = ARENA_DEFAULT_BLOCK_SIZE;
     ctx->features = F_DEFER | F_ZEROINIT | F_LINE_DIR | F_FLATTEN | F_ORELSE;
     ctx->at_stmt_start = true;
-#ifdef _WIN32
-    init_ident_char();
-#endif
 }
 
 static inline Token *arena_alloc_token(void)
@@ -858,7 +849,7 @@ static inline uintptr_t keyword_lookup(char *key, int keylen)
     if (keylen < 2)
         return 0; // No keyword is shorter than 2 chars
     unsigned slot = KEYWORD_HASH(key, keylen);
-    KeywordEntry *ent = &keyword_perfect[slot];
+    KeywordEntry *ent = &keyword_cache[slot];
     if (ent->len == keylen && !memcmp(ent->name, key, keylen))
         return ent->value;
     return 0;
@@ -977,8 +968,8 @@ static void init_keyword_map(void)
         {"vfork", TT_SPECIAL_FN, false},
     };
 
-    // Single pass: populate hashmap + perfect hash table + bloom filter
-    memset(keyword_perfect, 0, sizeof(keyword_perfect));
+    // Single pass: populate hashmap + keyword cache + bloom filter
+    memset(keyword_cache, 0, sizeof(keyword_cache));
     ctx->keyword_bloom = 0;
     for (size_t i = 0; i < sizeof(entries) / sizeof(*entries); i++)
     {
@@ -990,13 +981,13 @@ static void init_keyword_map(void)
         ctx->keyword_bloom |= 1ULL << (bh & 63);
 
         unsigned slot = KEYWORD_HASH(entries[i].name, len);
-        if (keyword_perfect[slot].name)
+        if (keyword_cache[slot].name)
         {
             if (entries[i].is_kw)
-                error("keyword hash collision: '%s' and '%s'", keyword_perfect[slot].name, entries[i].name);
+                error("keyword hash collision: '%s' and '%s'", keyword_cache[slot].name, entries[i].name);
             continue; // Tagged ident collision — fall back to hashmap
         }
-        keyword_perfect[slot] = (KeywordEntry){entries[i].name, len, val};
+        keyword_cache[slot] = (KeywordEntry){entries[i].name, len, val};
     }
 #ifdef PRISM_LIB_MODE
     ctx->keyword_map_features = ctx->features;
