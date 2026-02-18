@@ -34,6 +34,7 @@ typedef int mode_t;
 #define __builtin_constant_p(x) 0
 #define __builtin_strlen(s) strlen(s)
 #define __typeof__(x) const char * // only used for CLI_PUSH's array elem type
+#define __alignof__(x) __alignof(x)
 
 #define WIFEXITED(s) 1	   // Always "exited" on Windows (no signals)
 #define WEXITSTATUS(s) (s) // status IS the exit code
