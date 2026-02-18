@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.115.0"
+#define PRISM_VERSION "0.116.0"
 
 #ifdef _WIN32
 #define PRISM_DEFAULT_CC "cl"
@@ -292,6 +292,43 @@ static Token *emit_expr_to_semicolon(Token *tok);
 static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma);
 static Token *try_zero_init_decl(Token *tok);
 static Token *skip_pragma_operators(Token *tok);
+static inline void out_char(char c);
+static inline void out_str(const char *s, int len);
+static Token *skip_balanced(Token *tok, char open, char close);
+static Token *skip_gnu_attributes(Token *tok);
+static Token *skip_c23_attr(Token *tok);
+
+// Emit space-separated token range [start, end). First token has no leading space.
+static inline void emit_token_range(Token *start, Token *end) {
+	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = t->next) {
+		if (t != start) out_char(' ');
+		out_str(t->loc, t->len);
+	}
+}
+
+// Clear captured function return type (all four fields).
+static inline void clear_func_ret_type(void) {
+	ctx->func_ret_type_start = ctx->func_ret_type_end = NULL;
+	ctx->func_ret_type_suffix_start = ctx->func_ret_type_suffix_end = NULL;
+}
+
+// Skip trailing declarator parts (attrs, array dims, param lists) until '{' or ';'.
+// Returns the token at which scanning stopped (the '{', ';', EOF, or first non-suffix token).
+static Token *skip_declarator_suffix(Token *tok) {
+	while (tok && tok->kind != TK_EOF && !equal(tok, "{") && !equal(tok, ";")) {
+		if (tok->tag & TT_ATTR)
+			tok = skip_gnu_attributes(tok);
+		else if (is_c23_attr(tok))
+			tok = skip_c23_attr(tok);
+		else if (equal(tok, "["))
+			tok = skip_balanced(tok, '[', ']');
+		else if (equal(tok, "("))
+			tok = skip_balanced(tok, '(', ')');
+		else
+			break;
+	}
+	return tok;
+}
 
 static inline void control_flow_reset(void) {
 	ctrl = (ControlFlow){0};
@@ -309,8 +346,7 @@ static void reset_transpiler_state(void) {
 	ctx->stmt_expr_count = 0;
 	ctx->last_line_no = 0;
 	ctx->ret_counter = 0;
-	ctx->func_ret_type_start = NULL;
-	ctx->func_ret_type_end = NULL;
+	clear_func_ret_type();
 	ctx->last_filename = NULL;
 	ctx->last_system_header = false;
 	ctx->current_func_returns_void = false;
@@ -1534,8 +1570,16 @@ static bool try_capture_func_return_type(Token *tok) {
 
 	Token *type_start = tok;
 
-	// void return type — not captured (handled by current_func_returns_void)
-	if (equal(tok, "void") || is_void_typedef(tok)) return false;
+	// void return type — not captured (handled by current_func_returns_void).
+	// BUT: void (*func(...))(args) returns a function pointer, not void.
+	// Only skip if void is followed by a simple name (not * or parens).
+	if (equal(tok, "void") || is_void_typedef(tok)) {
+		Token *after_void = tok->next;
+		// void* is a pointer type, void( starts a complex declarator — both non-void returns
+		if (after_void && !equal(after_void, "*") && !equal(after_void, "("))
+			return false;
+		// void* and void( fall through to the type parser below
+	}
 	if (tok->tag & TT_TYPEOF) {
 		Token *t = tok->next;
 		if (t && equal(t, "(") && t->next && equal(t->next, "void") && t->next->next &&
@@ -1568,28 +1612,68 @@ static bool try_capture_func_return_type(Token *tok) {
 	// Skip any trailing attributes between pointer/qualifiers and name
 	tok = skip_all_attributes(tok);
 
-	// Should be at function name followed by (
-	if (!tok || !is_valid_varname(tok) || !tok->next || !equal(tok->next, "(")) return false;
+	// Simple case: function name followed by (
+	if (tok && is_valid_varname(tok) && tok->next && equal(tok->next, "(")) {
+		ctx->func_ret_type_start = type_start;
+		ctx->func_ret_type_end = tok;
+		ctx->func_ret_type_suffix_start = ctx->func_ret_type_suffix_end = NULL;
+		return true;
+	}
 
-	ctx->func_ret_type_start = type_start;
-	ctx->func_ret_type_end = tok; // exclusive: the function name token
-	return true;
+	// Complex declarator: TYPE (* FUNCNAME(PARAMS))(ARGS) or TYPE (* FUNCNAME(PARAMS))[N]
+	// The function name is inside a parenthesized declarator group.
+	if (tok && equal(tok, "(")) {
+		Token *inner = tok->next;
+		while (inner && inner->kind != TK_EOF &&
+		       (equal(inner, "*") || (inner->tag & (TT_CONST | TT_VOLATILE)) ||
+			equal(inner, "restrict") || equal(inner, "__restrict") ||
+			equal(inner, "__restrict__") || (inner->tag & TT_ATTR))) {
+			inner = (inner->tag & TT_ATTR) ? skip_gnu_attributes(inner) : inner->next;
+		}
+		if (inner && is_valid_varname(inner) && inner->next && equal(inner->next, "(")) {
+			Token *after_params = skip_balanced(inner->next, '(', ')');
+			if (after_params && equal(after_params, ")")) {
+				ctx->func_ret_type_start = type_start;
+				ctx->func_ret_type_end = inner;
+				ctx->func_ret_type_suffix_start = after_params;
+				ctx->func_ret_type_suffix_end = skip_declarator_suffix(after_params->next);
+				return true;
+			}
+		}
+	}
+
+	return false;
 }
 
-// Emit the captured return type tokens for MSVC-compatible defer return.
-// Falls back to __auto_type if return type was not captured.
+// Emit the captured return type for defer return variable declaration.
+// Complex declarators (function pointers, array pointers) get a typedef.
+// Falls back to __auto_type (GCC/Clang) or void* (MSVC) if capture failed.
 static void emit_ret_type(void) {
 	if (ctx->func_ret_type_start && ctx->func_ret_type_end) {
-		for (Token *t = ctx->func_ret_type_start;
-		     t && t != ctx->func_ret_type_end && t->kind != TK_EOF;
-		     t = t->next) {
-			if (t != ctx->func_ret_type_start) out_char(' ');
-			out_str(t->loc, t->len);
+		if (ctx->func_ret_type_suffix_start) {
+			// typedef PREFIX _prism_ret_t_N SUFFIX; _prism_ret_t_N
+			OUT_LIT("typedef ");
+			emit_token_range(ctx->func_ret_type_start, ctx->func_ret_type_end);
+			OUT_LIT(" _prism_ret_t_");
+			out_uint(ctx->ret_counter);
+			for (Token *t = ctx->func_ret_type_suffix_start;
+			     t && t != ctx->func_ret_type_suffix_end && t->kind != TK_EOF;
+			     t = t->next) {
+				out_char(' ');
+				out_str(t->loc, t->len);
+			}
+			OUT_LIT("; _prism_ret_t_");
+			out_uint(ctx->ret_counter);
+		} else {
+			emit_token_range(ctx->func_ret_type_start, ctx->func_ret_type_end);
 		}
-	} else
-		// Return type capture failed — emit __auto_type as last resort (GCC only).
-		// This indicates a parser gap in try_capture_func_return_type().
+	} else {
+#ifdef _WIN32
+		OUT_LIT("void *");
+#else
 		OUT_LIT("__auto_type");
+#endif
+	}
 }
 
 // Check if an array dimension (from '[' to matching ']') contains a VLA expression.
@@ -1845,7 +1929,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 
 		// User-defined typedef or system typedef (pthread_mutex_t, etc.)
 		int tflags = typedef_flags(tok);
-		if ((tflags & TDF_TYPEDEF) || is_typedef_heuristic(tok)) {
+		if ((tflags & TDF_TYPEDEF) || is_typedef_like(tok)) {
 			r.is_typedef = true;
 			if (tflags & TDF_VLA) r.is_vla = true;
 			Token *peek = tok->next;
@@ -2455,6 +2539,78 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 	ctx->active_typeof_vars = NULL;
 	return NULL;
+}
+
+// Register shadows for file-scope _t/__* variable declarations.
+// Prevents the typedef heuristic from misidentifying them as types.
+// Only called at ctx->defer_depth == 0. Uses a conservative type-specifier
+// scan that avoids is_typedef_heuristic (chicken-and-egg problem).
+static void register_toplevel_shadows(Token *tok) {
+	if (tok->kind >= TK_STR) return;
+
+	// Skip storage class / function specifiers / attributes
+	Token *t = tok;
+	while (t && t->kind != TK_EOF) {
+		if (t->tag & TT_SKIP_DECL) {
+			if (t->tag & TT_TYPEDEF) return;
+			t = t->next; continue;
+		}
+		if (t->tag & TT_INLINE) { t = t->next; continue; }
+		if (t->tag & TT_ATTR) { t = skip_gnu_attributes(t); continue; }
+		if (is_c23_attr(t)) { t = skip_c23_attr(t); continue; }
+		break;
+	}
+	if (!t || t->kind == TK_EOF) return;
+
+	// Must start with a real type keyword or known typedef
+	if (!(t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT)) &&
+	    !is_known_typedef(t))
+		return;
+
+	// Advance past type specifier (only unambiguous type tokens)
+	while (t && t->kind != TK_EOF) {
+		if (t->tag & (TT_TYPE | TT_QUALIFIER)) { t = t->next; continue; }
+		if (t->tag & TT_SUE) {
+			t = t->next;
+			if (t && (t->tag & (TT_ATTR | TT_QUALIFIER))) {
+				t = t->next;
+				if (t && equal(t, "(")) t = skip_balanced(t, '(', ')');
+			}
+			if (t && is_valid_varname(t)) t = t->next;
+			if (t && equal(t, "{")) t = skip_balanced(t, '{', '}');
+			continue;
+		}
+		if (t->tag & (TT_TYPEOF | TT_ATTR | TT_BITINT | TT_ALIGNAS)) {
+			t = t->next;
+			if (t && equal(t, "(")) t = skip_balanced(t, '(', ')');
+			continue;
+		}
+		if (is_c23_attr(t)) { t = skip_c23_attr(t); continue; }
+		if (is_known_typedef(t)) { t = t->next; continue; }
+		break;
+	}
+	if (!t || t->kind == TK_EOF) return;
+
+	// Scan declarator(s), register shadows for _t/__* names
+	while (t && !equal(t, ";") && t->kind != TK_EOF) {
+		DeclResult decl = parse_declarator(t, false);
+		if (!decl.var_name || !decl.end) break;
+		if (equal(decl.end, "(")) return; // function declaration, not variable
+
+		if (is_typedef_heuristic(decl.var_name))
+			typedef_add_shadow(decl.var_name->loc, decl.var_name->len, 0);
+
+		t = decl.end;
+		if (equal(t, "=")) { // skip initializer
+			t = t->next;
+			for (int depth = 0; t && t->kind != TK_EOF; t = t->next) {
+				if (t->flags & TF_OPEN) depth++;
+				else if (t->flags & TF_CLOSE) depth--;
+				else if (depth == 0 && (equal(t, ",") || equal(t, ";"))) break;
+			}
+		}
+		if (t && equal(t, ",")) t = t->next; else break;
+	}
 }
 
 // Try to handle a declaration with zero-init
@@ -3287,7 +3443,9 @@ static void free_argv(char **argv) {
 }
 
 // Unified temp file creation with optional suffix (e.g., ".c" → suffix_len=2)
-// If source_adjacent is non-NULL, creates file next to that source file instead of in tmp dir.
+// If source_adjacent is non-NULL, tries to create file next to that source file first,
+// then falls back to TMPDIR if the source directory is not writable (e.g., read-only
+// mounts, git submodules, system directories).
 // Returns 0 on success, -1 on failure. Path written to buf.
 // Uses mkstemps on all platforms (Windows shim provided by windows.c).
 static int
@@ -3302,6 +3460,17 @@ make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len, co
 			n = snprintf(buf, bufsize, "%.*s/.%s.XXXXXX.c", dir_len, source_adjacent, slash + 1);
 		} else
 			n = snprintf(buf, bufsize, ".%s.XXXXXX.c", source_adjacent);
+		suffix_len = 2;
+		if (n >= 0 && (size_t)n < bufsize) {
+			int fd = mkstemps(buf, suffix_len);
+			if (fd >= 0) {
+				close(fd);
+				return 0;
+			}
+		}
+		// Source directory not writable — fall back to TMPDIR
+		const char *base = slash ? slash + 1 : source_adjacent;
+		n = snprintf(buf, bufsize, "%s.%s.XXXXXX.c", get_tmp_dir(), base);
 		suffix_len = 2;
 	} else
 		n = snprintf(buf, bufsize, "%s%s", get_tmp_dir(), prefix);
@@ -3626,6 +3795,13 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		if (ctx->at_stmt_start && ctx->struct_depth == 0 && (tag & TT_TYPEDEF))
 			parse_typedef_declaration(tok, ctx->defer_depth + (ctrl.for_init ? 1 : 0));
 
+		// Register shadows for file-scope variable declarations with _t / __ names.
+		// Prevents the typedef heuristic from misinterpreting these as types
+		// when they're used inside function bodies with defer/zeroinit.
+		if (ctx->at_stmt_start && ctx->defer_depth == 0 && ctx->struct_depth == 0 &&
+		    !(tag & TT_TYPEDEF))
+			register_toplevel_shadows(tok);
+
 		// Zero-init declarations at statement start
 		if (ctx->at_stmt_start && (!ctrl.pending || ctrl.for_init)) {
 			next = try_zero_init_decl(tok);
@@ -3759,8 +3935,8 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 						 is_knr_params(last_toplevel_paren->next, tok))
 						is_func_def = true;
 					else if (last_toplevel_paren) {
-						// Check for attributes between ')' and '{' (e.g. C23 [[...]] attrs)
-						Token *after = skip_all_attributes(last_toplevel_paren->next);
+						// Skip attrs, array dims, param lists between ')' and '{'
+						Token *after = skip_declarator_suffix(last_toplevel_paren->next);
 						if (after == tok) is_func_def = true;
 					}
 					if (is_func_def) {
@@ -3768,15 +3944,10 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 						register_param_shadows(last_toplevel_open_paren,
 								       last_toplevel_paren);
 						ctx->current_func_returns_void = next_func_returns_void;
-						// Clear captured return type for void functions or when capture didn't succeed
-						if (next_func_returns_void || !next_func_ret_captured) {
-							ctx->func_ret_type_start = NULL;
-							ctx->func_ret_type_end = NULL;
-						}
+						if (next_func_returns_void || !next_func_ret_captured)
+							clear_func_ret_type();
 					} else {
-						// Not a function definition — clear stale captured return type
-						ctx->func_ret_type_start = NULL;
-						ctx->func_ret_type_end = NULL;
+						clear_func_ret_type();
 					}
 					next_func_returns_void = false;
 					next_func_ret_captured = false;

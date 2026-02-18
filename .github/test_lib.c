@@ -1153,6 +1153,122 @@ static void test_generic_array_not_vla(void)
     }
 }
 
+static void test_fnptr_return_type_capture(void)
+{
+    printf("\n--- Function Pointer Return Type Capture Tests ---\n");
+
+    PrismFeatures features = prism_defaults();
+
+    // Test 1: Function returning a raw function pointer with defer
+    // void (*get_callback(void))(void) { defer ...; return fn; }
+    // Prism must NOT emit __auto_type for the _prism_ret variable
+    const char *code_fnptr =
+        "static void my_fn(void) {}\n"
+        "void (*get_callback(void))(void) {\n"
+        "    defer (void)0;\n"
+        "    return my_fn;\n"
+        "}\n"
+        "int main(void) { get_callback()(); return 0; }\n";
+    char *path = create_temp_file(code_fnptr);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status == PRISM_OK, "bug_r2: fnptr return transpiles OK");
+        if (result.output)
+        {
+            CHECK(strstr(result.output, "__auto_type") == NULL,
+                  "bug_r2: fnptr return has no __auto_type");
+            CHECK(strstr(result.output, "_prism_ret") != NULL,
+                  "bug_r2: fnptr return has _prism_ret (captured type)");
+        }
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+
+    // Test 2: Typedef function pointer return (should always work)
+    const char *code_typedef =
+        "typedef void (*callback_t)(void);\n"
+        "static void my_fn(void) {}\n"
+        "callback_t get_cb(void) {\n"
+        "    defer (void)0;\n"
+        "    return my_fn;\n"
+        "}\n"
+        "int main(void) { get_cb()(); return 0; }\n";
+    path = create_temp_file(code_typedef);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status == PRISM_OK, "bug_r2: typedef fnptr return transpiles OK");
+        if (result.output)
+        {
+            CHECK(strstr(result.output, "__auto_type") == NULL,
+                  "bug_r2: typedef fnptr return has no __auto_type");
+        }
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+
+    // Test 3: Complex return type — pointer to array
+    const char *code_arrptr =
+        "static int arr[5] = {1,2,3,4,5};\n"
+        "int (*get_arr(void))[5] {\n"
+        "    defer (void)0;\n"
+        "    return &arr;\n"
+        "}\n"
+        "int main(void) { return (*get_arr())[0] - 1; }\n";
+    path = create_temp_file(code_arrptr);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status == PRISM_OK, "bug_r2: array ptr return transpiles OK");
+        if (result.output)
+        {
+            CHECK(strstr(result.output, "__auto_type") == NULL,
+                  "bug_r2: array ptr return has no __auto_type");
+        }
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+}
+
+static void test_line_directive_escaped_quote(void)
+{
+    printf("\n--- Line Directive Escaped Quote Tests ---\n");
+
+    PrismFeatures features = prism_defaults();
+
+    // Create code with an embedded #line directive containing an escaped quote
+    // This simulates what the preprocessor would emit for a file named foo"bar.c
+    const char *code =
+        "#line 1 \"foo\\\"bar.c\"\n"
+        "int main(void) {\n"
+        "    defer (void)0;\n"
+        "    return 0;\n"
+        "}\n";
+    char *path = create_temp_file(code);
+    if (path)
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK(result.status == PRISM_OK, "bug_r3: escaped quote #line transpiles OK");
+        if (result.output)
+        {
+            // The output should contain foo"bar.c properly escaped as foo\"bar.c
+            // but NOT foo\\\"bar.c (double-escaped backslash + escaped quote)
+            CHECK(strstr(result.output, "foo\\\\\\\"bar.c") == NULL,
+                  "bug_r3: no triple-escaped filename in output");
+            // Should have the properly escaped version
+            CHECK(strstr(result.output, "foo\\\"bar.c") != NULL,
+                  "bug_r3: properly escaped filename in output");
+        }
+        prism_free(&result);
+        unlink(path);
+        free(path);
+    }
+}
+
 int main(void)
 {
     printf("=== PRISM LIBRARY MODE TEST SUITE ===\n");
@@ -1175,7 +1291,11 @@ int main(void)
     test_deep_struct_nesting_walker();
     test_c23_attr_void_function();
     test_generic_array_not_vla();
-    test_memory_leak_stress(); // Run last as it does many iterations
+
+    test_fnptr_return_type_capture();
+    test_line_directive_escaped_quote();
+
+    test_memory_leak_stress();
 
     printf("\n========================================\n");
     printf("TOTAL: %d passed, %d failed\n", passed, failed);

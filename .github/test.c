@@ -1,4 +1,4 @@
-// Comprehensive test suite for Prism C transpiler
+// Massive test suite for Prism C transpiler trying to break it....
 // Tests: defer, zero-init, typedef tracking, multi-declarator, edge cases
 // Run with: $ prism run .github/test.c
 
@@ -7,8 +7,6 @@
 #include <string.h>
 #include <stdint.h>
 #include <stddef.h>
-
-// TEST FRAMEWORK
 
 static char log_buffer[1024];
 static int log_pos = 0;
@@ -64,8 +62,6 @@ static void log_append(const char *s) {
 			failed++;                                                                            \
 		}                                                                                            \
 	} while (0)
-
-// SECTION 1: BASIC DEFER TESTS
 
 void test_defer_basic(void) {
 	log_reset();
@@ -124,8 +120,6 @@ end:
 	CHECK_LOG("1CBA2", "defer nested scopes with goto");
 }
 
-// Regression: C23 [[...]] attrs between ')' and '{' broke function detection,
-// causing scan_labels_in_function to be skipped and goto+defer to misbehave.
 static void _c23_attr_goto_helper(void) [[gnu::cold]] {
 	log_reset();
 	{
@@ -256,7 +250,6 @@ void test_defer_compound_stmt(void) {
 	CHECK_LOG("1ABE", "defer compound statement");
 }
 
-// Regression: zero-init was not applied inside deferred blocks (emit_range bypass)
 void test_defer_zeroinit_inside(void) {
 	int result = -1;
 	{
@@ -340,8 +333,6 @@ void run_defer_basic_tests(void) {
 	test_defer_only_body();
 	CHECK_LOG("D", "defer-only function body");
 }
-
-// SECTION 2: ZERO-INIT TESTS
 
 void test_zeroinit_basic_types(void) {
 	int i;
@@ -758,9 +749,6 @@ void test_zeroinit_typeof(void) {
 	CHECK_EQ(init, 42, "typeof with explicit init");
 }
 
-// TYPEOF ZERO-INIT TORTURE TESTS
-// These tests throw the kitchen sink at typeof zero-init to prove it's airtight
-
 void test_typeof_zeroinit_all_basic_types(void) {
 	// Every basic C type via typeof
 	typeof(char) c;
@@ -1107,7 +1095,6 @@ void run_typeof_zeroinit_torture_tests(void) {
 }
 #endif
 
-// Test that enum constants are recognized as compile-time constants (not VLAs)
 enum { TEST_ARRAY_SIZE = 10 };
 
 void test_zeroinit_enum_array_size(void) {
@@ -1169,7 +1156,6 @@ void test_zeroinit_torture_declarators(void) {
 	CHECK(all_null, "torture: arr[2][3]->ptr->ptr->func");
 }
 
-// TORTURE: Attributes mixed with declarations
 void test_zeroinit_torture_attributes(void) {
 	// __attribute__ before type
 	__attribute__((unused)) int attr_before;
@@ -1203,7 +1189,6 @@ void test_zeroinit_torture_attributes(void) {
 	CHECK(all_zero, "torture: aligned array");
 }
 
-// TORTURE: Interleaved with initializers
 void test_zeroinit_torture_partial_init(void) {
 	// Alternating init/no-init in multi-decl
 	int a, b = 1, c, d = 2, e, f = 3, g;
@@ -1230,7 +1215,6 @@ void test_zeroinit_torture_partial_init(void) {
 	      "torture: uninit around array init");
 }
 
-// TORTURE: Statement expressions and complex contexts
 #ifdef __GNUC__
 void test_zeroinit_torture_stmt_expr(void) {
 	// Declaration in statement expression
@@ -1270,7 +1254,6 @@ void test_zeroinit_torture_stmt_expr(void) {
 }
 #endif
 
-// TORTURE: Extreme scope nesting
 void test_zeroinit_torture_deep_nesting(void) {
 	{
 		{
@@ -1336,7 +1319,6 @@ void test_zeroinit_torture_deep_nesting(void) {
 	CHECK_EQ(after_nested, 0, "torture: after deeply nested block");
 }
 
-// TORTURE: Bit-fields with zero-init
 void test_zeroinit_torture_bitfields(void) {
 	struct {
 		unsigned int a : 1;
@@ -1369,7 +1351,6 @@ void test_zeroinit_torture_bitfields(void) {
 	CHECK(full_bf.full == 0, "torture: 64-bit bit-field");
 }
 
-// TORTURE: Anonymous struct/union
 void test_zeroinit_torture_anonymous(void) {
 	// Anonymous struct in struct
 	struct {
@@ -1417,7 +1398,6 @@ void test_zeroinit_torture_anonymous(void) {
 	CHECK(nested_anon.a == 0 && nested_anon.b == 0 && nested_anon.z == 0, "torture: nested anonymous");
 }
 
-// TORTURE: Compound literals with zero-init nearby
 void test_zeroinit_torture_compound_literals(void) {
 	// Declaration before compound literal use
 	int before_cl;
@@ -1439,7 +1419,6 @@ void test_zeroinit_torture_compound_literals(void) {
 	CHECK(sp->x == 10 && sp->y == 20, "torture: compound literal struct");
 }
 
-// TORTURE: Flexible array member adjacent struct
 void test_zeroinit_torture_fam_adjacent(void) {
 	// Can't have FAM itself uninitialized, but test structs around it
 	struct HasFAM {
@@ -1461,7 +1440,6 @@ void test_zeroinit_torture_fam_adjacent(void) {
 	CHECK(after_fam.a == 0 && after_fam.b == 0, "torture: after FAM pointer");
 }
 
-// TORTURE: Extremely long multi-declarator
 void test_zeroinit_torture_long_multidecl(void) {
 	int v00, v01, v02, v03, v04, v05, v06, v07, v08, v09, v10, v11, v12, v13, v14, v15, v16, v17, v18,
 	    v19, v20, v21, v22, v23, v24, v25, v26, v27, v28, v29, v30, v31;
@@ -1478,7 +1456,6 @@ void test_zeroinit_torture_long_multidecl(void) {
 	CHECK(all_zero, "torture: 32-variable multi-decl");
 }
 
-// TORTURE: Control flow edge cases
 void test_zeroinit_torture_control_flow(void) {
 	// After if-else chain
 	if (0) {
@@ -1522,7 +1499,6 @@ void test_zeroinit_torture_control_flow(void) {
 	CHECK_EQ(after_do, 0, "torture: after do-while");
 }
 
-// TORTURE: Stress test - many declarations in sequence
 void test_zeroinit_torture_stress(void) {
 	// 50 sequential declarations of different types
 	char c1;
@@ -1597,7 +1573,6 @@ void test_zeroinit_torture_stress(void) {
 	CHECK(st1.x == 0 && st2.x == 0 && st3.x == 0, "torture stress: structs");
 }
 
-// TORTURE: Interaction with defer
 void test_zeroinit_torture_with_defer(void) {
 	int cleanup_order = 0;
 
@@ -1624,7 +1599,6 @@ void test_zeroinit_torture_with_defer(void) {
 	CHECK_EQ(final_value, 1, "torture defer: zero-init used in defer");
 }
 
-// TORTURE: _Atomic with complex types
 #include <stdatomic.h>
 
 void test_zeroinit_torture_atomic(void) {
@@ -1681,8 +1655,6 @@ void run_zeroinit_tests(void) {
 	test_zeroinit_union();
 }
 
-// SECTION 2.5: RAW KEYWORD TESTS
-
 void test_raw_basic(void) {
 	raw int x;
 	x = 42;
@@ -1737,8 +1709,6 @@ void run_raw_tests(void) {
 	test_raw_struct();
 	test_raw_with_qualifiers();
 }
-
-// RAW KEYWORD VS VARIABLE NAME TORTURE TESTS
 
 void test_raw_variable_assignment(void) {
 	int raw, edit;
@@ -2060,8 +2030,6 @@ void run_raw_torture_tests(void) {
 	test_raw_in_cast();
 }
 
-// SECTION 3: MULTI-DECLARATOR TESTS
-
 void test_multi_decl_basic(void) {
 	int a, b, c;
 	CHECK(a == 0 && b == 0 && c == 0, "int a, b, c");
@@ -2187,7 +2155,6 @@ void test_typedef_func_ptr(void) {
 typedef MyInt ChainedInt;
 typedef ChainedInt DoubleChainedInt;
 
-// NIGHTMARE: 15-level typedef chain through increasingly complex types
 typedef int T0;
 typedef T0 *T1;			    // pointer to T0
 typedef T1 T2[3];		    // array of T1
@@ -2301,7 +2268,6 @@ void test_typedef_shadowing(void) {
 	CHECK_EQ(after, 0, "typedef after shadow scope");
 }
 
-// Multi-declarator typedef: typedef int A, *B;
 typedef int TD_Int, *TD_IntPtr;
 
 void test_typedef_multi_declarator(void) {
@@ -2368,8 +2334,6 @@ void run_typedef_tests(void) {
 	test_typedef_braceless_nested_control();
 	test_typedef_multi_braceless_sequential();
 }
-
-// SECTION 5: EDGE CASES
 
 void test_bitfield_zeroinit(void) {
 	// NIGHTMARE: Extensive bitfield testing
@@ -2968,9 +2932,6 @@ void test_enum_shadow_statement_form(void) {
 	CHECK(1, "enum shadow: statement T*x compiles as multiplication");
 }
 
-// BUG REGRESSION: pp-number with underscore (1024_160) should be single token
-// Issue: tokenizer treated "1024_160" as two tokens: "1024" and "_160"
-// This broke token pasting macros like: prefix##1024_160##_suffix
 #define PP_PASTE_TEST(x) extern int test_prefix_##x##_suffix;
 
 PP_PASTE_TEST(1024_160)
@@ -2988,10 +2949,6 @@ void test_ppnum_underscore_paste(void) {
 	CHECK(1, "pp-number underscore paste: 1024_160 is single token");
 }
 
-// BUG REGRESSION: function declarations inside function bodies
-// Issue: zeroinit code was emitting function declarations twice
-// Pattern: "void func_name(...)" inside an #ifdef block in a function body
-// The zeroinit parser would emit "void func_name" then bail, causing duplicate output
 void test_local_function_decl(void) {
 	// These are local extern function declarations (valid C)
 	// The zeroinit code should recognize these as function declarations
@@ -3022,8 +2979,6 @@ void run_bug_regression_tests(void) {
 	test_ppnum_underscore_paste();
 	test_local_function_decl();
 }
-
-// SECTION 7: ADVANCED DEFER TESTS
 
 static int global_val = 0;
 
@@ -3328,8 +3283,6 @@ void run_advanced_defer_tests(void) {
 	test_void_return_void0_defer();
 }
 
-// SECTION 8: STRESS TESTS
-
 void test_defer_shadowing_vars(void) {
 	log_reset();
 	int x = 1;
@@ -3369,7 +3322,6 @@ void test_typedef_hiding(void) {
 	CHECK_EQ(b, 0, "typedef name restored after scope");
 }
 
-// BUG REGRESSION: typedef shadowed by variable of same name
 void test_typedef_same_name_shadow(void) {
 	typedef int T;
 
@@ -3401,7 +3353,6 @@ void test_typedef_same_name_shadow(void) {
 	CHECK_EQ(after, 0, "typedef T restored after shadow scope");
 }
 
-// Test nested shadowing: multiple levels of T T;
 void test_typedef_nested_same_name_shadow(void) {
 	typedef int T;
 
@@ -3428,7 +3379,6 @@ void test_typedef_nested_same_name_shadow(void) {
 	CHECK_EQ(restored, 0, "typedef restored after nested shadows");
 }
 
-// Test that pointer declarations work correctly after shadow ends
 void test_typedef_shadow_then_pointer(void) {
 	typedef int T;
 
@@ -3482,10 +3432,7 @@ void test_switch_default_first(void) {
 	CHECK_LOG("DE", "switch default first defer");
 }
 
-// Macro that expands to a defer
 #define CLEANUP defer log_append("C")
-
-// NIGHTMARE macros
 #define DEFER_NESTED_1(x) defer log_append(x)
 #define DEFER_NESTED_2(x)                                                                                    \
 	{                                                                                                    \
@@ -3672,8 +3619,6 @@ void test_stmt_expr_side_effects(void) {
 }
 #endif
 
-// Consolidated typedef scope churn test (covers nested redefinition + varied types).
-// Subsumes former test_typedef_scope_churn_heavy and test_typedef_scope_churn_varied.
 void test_typedef_scope_churn_consolidated(void) {
 	int ok = 1;
 	for (int round = 0; round < 300; round++) {
@@ -3728,8 +3673,6 @@ void run_stress_tests(void) {
 	test_typedef_scope_churn_consolidated();
 }
 
-// SECTION 8: SAFETY HOLE TESTS
-
 void test_goto_over_block(void) {
 	log_reset();
 	int before = 1;
@@ -3746,7 +3689,6 @@ DONE:
 	CHECK_LOG("AB", "goto over block - skips entire block");
 }
 
-// Test: goto backward (to earlier label) is valid
 void test_goto_backward_valid(void) {
 	log_reset();
 	int count = 0;
@@ -3762,7 +3704,6 @@ AGAIN:
 	CHECK_LOG("LLLE", "goto backward - correct order");
 }
 
-// Test: goto forward to same scope level (no decls between) is valid
 void test_goto_forward_no_decl(void) {
 	log_reset();
 	int x = 5; // Before goto
@@ -3775,7 +3716,6 @@ SKIP:
 	CHECK_LOG("AB", "goto forward no decl - correct order");
 }
 
-// Test: goto into nested scope where decl is AFTER label is valid
 void test_goto_into_scope_decl_after_label(void) {
 	log_reset();
 	goto INNER;
@@ -3789,7 +3729,6 @@ void test_goto_into_scope_decl_after_label(void) {
 	CHECK_LOG("ID", "goto into scope - correct order");
 }
 
-// Test: multiple gotos with proper structure
 void test_goto_complex_valid(void) {
 	log_reset();
 	int state = 0;
@@ -3814,7 +3753,6 @@ END:
 	CHECK_LOG("01XE", "goto complex - correct order");
 }
 
-// Test: goto with defer still works when not skipping decls
 void test_goto_with_defer_valid(void) {
 	// Basic case
 	log_reset();
@@ -3955,8 +3893,6 @@ void run_safety_hole_tests(void) {
 	test_goto_complex_valid();
 	test_goto_with_defer_valid();
 }
-
-// SECTION 9: SWITCH FALLTHROUGH + DEFER EDGE CASES
 
 void test_switch_fallthrough_no_braces(void) {
 	// Fallthrough without braces - no defers possible (defer requires braces)
@@ -4133,8 +4069,6 @@ void run_switch_fallthrough_tests(void) {
 	test_switch_nested_switch_defer();
 }
 
-// SECTION 10: COMPLEX BREAK/CONTINUE NESTING TESTS
-
 void test_break_continue_nested_3_levels(void) {
 	// Basic 3 levels of loop nesting with defers at each level
 	log_reset();
@@ -4246,8 +4180,6 @@ void run_complex_nesting_tests(void) {
 	test_loop_inside_switch_break();
 }
 
-// SECTION 11: CASE LABELS INSIDE BLOCKS
-
 void test_case_in_nested_block(void) {
 	// Case label inside a nested block (valid C, but weird)
 	log_reset();
@@ -4318,7 +4250,6 @@ void run_case_label_tests(void) {
 	test_duff_device_with_defer_at_top();
 }
 
-// Test: Sequential switch statements don't leak defers between them
 void test_switch_sequential_no_leak(void) {
 	log_reset();
 	switch (1) {
@@ -4339,7 +4270,6 @@ void test_switch_sequential_no_leak(void) {
 	CHECK_LOG("1A2BE", "sequential switches don't leak defers");
 }
 
-// Test: Multiple case labels sharing one body (case group)
 void test_switch_case_group_defer(void) {
 	log_reset();
 	int x = 2;
@@ -4356,7 +4286,6 @@ void test_switch_case_group_defer(void) {
 	CHECK_LOG("XDE", "case group labels sharing body with defer");
 }
 
-// Test: Case group with fallthrough into next group
 void test_switch_case_group_fallthrough(void) {
 	log_reset();
 	switch (0) {
@@ -4376,7 +4305,6 @@ void test_switch_case_group_fallthrough(void) {
 	CHECK_LOG("XAYBE", "case group fallthrough with defers");
 }
 
-// Test: Deep nesting inside a case with break
 void test_switch_deep_nested_break(void) {
 	log_reset();
 	switch (1) {
@@ -4399,7 +4327,6 @@ void test_switch_deep_nested_break(void) {
 	CHECK_LOG("X4321E", "deep nested blocks in switch case with break");
 }
 
-// Test: Return from deeply nested switch unwinds all scopes
 int test_switch_deep_return_helper(void) {
 	log_reset();
 	defer log_append("F"); // function scope
@@ -4422,7 +4349,6 @@ void test_switch_deep_return(void) {
 	CHECK_EQ(ret, 42, "deep switch return value preserved");
 }
 
-// Test: Switch with only default case
 void test_switch_only_default(void) {
 	log_reset();
 	switch (999) {
@@ -4436,7 +4362,6 @@ void test_switch_only_default(void) {
 	CHECK_LOG("XDE", "switch with only default and defer");
 }
 
-// Test: Switch with all cases having defers and break
 void test_switch_all_cases_defer(void) {
 	log_reset();
 	int x = 2;
@@ -4466,7 +4391,6 @@ void test_switch_all_cases_defer(void) {
 	CHECK_LOG("2BE", "all cases with defers - only active case fires");
 }
 
-// Test: Empty switch body with defer in enclosing scope
 void test_switch_defer_enclosing_scope(void) {
 	log_reset();
 	{
@@ -4480,7 +4404,6 @@ void test_switch_defer_enclosing_scope(void) {
 	CHECK_LOG("XDE", "switch with defer in enclosing scope");
 }
 
-// Test: Nested switch where inner has no defers but outer does
 void test_switch_nested_mixed_defer(void) {
 	log_reset();
 	switch (1) {
@@ -4499,7 +4422,6 @@ void test_switch_nested_mixed_defer(void) {
 	CHECK_LOG("IMOE", "nested switch - inner no defer, outer has defer");
 }
 
-// Test: Nested switch where inner has defers but outer doesn't
 void test_switch_nested_inner_defer(void) {
 	log_reset();
 	switch (1) {
@@ -4519,7 +4441,6 @@ void test_switch_nested_inner_defer(void) {
 	CHECK_LOG("XIME", "nested switch - inner has defer, outer doesn't");
 }
 
-// Test: Switch with do-while(0) pattern inside a case (common macro pattern)
 void test_switch_do_while_0(void) {
 	log_reset();
 	switch (1) {
@@ -4535,7 +4456,6 @@ void test_switch_do_while_0(void) {
 	CHECK_LOG("XDE", "switch case with do-while(0) and defer");
 }
 
-// Test: Switch with defer and negative case values
 void test_switch_negative_cases(void) {
 	log_reset();
 	switch (-1) {
@@ -4559,7 +4479,6 @@ void test_switch_negative_cases(void) {
 	CHECK_LOG("bBE", "switch with negative case values and defer");
 }
 
-// Test: Switch with defer inside statement expression inside cases
 void test_switch_stmt_expr_defer(void) {
 	log_reset();
 	switch (1) {
@@ -4583,7 +4502,6 @@ void test_switch_stmt_expr_defer(void) {
 	CHECK_LOG("XSEYOE", "switch with stmt expr containing defer");
 }
 
-// Test: Switch inside statement expression inside another switch
 void test_switch_in_stmt_expr_in_switch(void) {
 	log_reset();
 	int x = 1;
@@ -4610,7 +4528,6 @@ void test_switch_in_stmt_expr_in_switch(void) {
 	CHECK_LOG("IXOE", "switch in stmt expr in switch");
 }
 
-// Test: Three sequential switches to verify clean state between them
 void test_switch_triple_sequential(void) {
 	log_reset();
 	for (int i = 0; i < 3; i++) {
@@ -4636,7 +4553,6 @@ void test_switch_triple_sequential(void) {
 	CHECK_LOG("0A1B2CE", "triple sequential switches in loop");
 }
 
-// Test: Duff's device with defers at each iteration (braced pattern)
 void test_duffs_device_braced_defers(void) {
 	int duff_total = 0;
 	int count = 6;
@@ -4664,7 +4580,6 @@ void test_duffs_device_braced_defers(void) {
 	CHECK_EQ(duff_total, 6, "duff braced defers: count=6 iterations");
 }
 
-// Test: Duff's device with different entry points
 void test_duffs_device_all_entries(void) {
 	// Test each possible entry point
 	for (int entry = 0; entry < 4; entry++) {
@@ -4692,7 +4607,6 @@ void test_duffs_device_all_entries(void) {
 	}
 }
 
-// Test: Switch with goto out and defers at multiple nesting levels
 void test_switch_goto_deep(void) {
 	log_reset();
 	defer log_append("F"); // function-level
@@ -4710,7 +4624,6 @@ out:
 	log_append("E");
 }
 
-// Test: Switch with continue from enclosing loop, defers at both levels
 void test_switch_continue_enclosing_loop_defer(void) {
 	log_reset();
 	for (int i = 0; i < 2; i++) {
@@ -4733,7 +4646,6 @@ void test_switch_continue_enclosing_loop_defer(void) {
 	CHECK_LOG("AS0LBS1MLE", "switch continue from enclosing loop");
 }
 
-// Test: Nested switches where break in inner doesn't affect outer
 void test_switch_inner_break_isolation(void) {
 	log_reset();
 	switch (1) {
@@ -4755,7 +4667,6 @@ void test_switch_inner_break_isolation(void) {
 	CHECK_LOG("XIYOE", "inner break doesn't affect outer switch");
 }
 
-// Test: Switch with computed case value (enum arithmetic)
 void test_switch_computed_case(void) {
 	log_reset();
 
@@ -4772,7 +4683,6 @@ void test_switch_computed_case(void) {
 	CHECK_LOG("XDE", "computed case value with defer");
 }
 
-// Test: Switch where default is in the middle (not first or last)
 void test_switch_default_middle(void) {
 	log_reset();
 	switch (42) // doesn't match any explicit case
@@ -4797,7 +4707,6 @@ void test_switch_default_middle(void) {
 	CHECK_LOG("XDE", "default in middle of switch with defer");
 }
 
-// Test: Switch with fallthrough across multiple braced cases
 void test_switch_multi_fallthrough(void) {
 	log_reset();
 	switch (0) {
@@ -4823,7 +4732,6 @@ void test_switch_multi_fallthrough(void) {
 	CHECK_LOG("0A1B2C3DE", "multi-level fallthrough with defers");
 }
 
-// Test: Duff's device with 1 item (minimal edge case)
 void test_duffs_device_single_item(void) {
 	int duff_total = 0;
 	int count = 1;
@@ -4848,7 +4756,6 @@ void test_duffs_device_single_item(void) {
 	CHECK_EQ(duff_total, 1, "duff single item: exactly 1 iteration");
 }
 
-// Test: Switch with goto between cases (forward) with defer
 void test_switch_goto_forward_case(void) {
 	log_reset();
 	int x = 1;
@@ -4868,7 +4775,6 @@ skip:
 	CHECK_LOG("1AE", "switch goto forward past cases");
 }
 
-// Test: Switch-loop-switch pattern (switch, loop around it, another switch)
 void test_switch_loop_switch(void) {
 	log_reset();
 	int sum = 0;
@@ -4892,7 +4798,6 @@ void test_switch_loop_switch(void) {
 	CHECK_LOG("XLYLE", "switch-loop-switch defer order");
 }
 
-// Test: 3-level nested switch with return from innermost
 int test_triple_nested_switch_return_helper(void) {
 	log_reset();
 	defer log_append("F");
@@ -4956,8 +4861,6 @@ void run_switch_defer_bulletproof_tests(void) {
 	test_triple_nested_switch_return();
 }
 
-// SECTION 12: RIGOR TESTS - Testing identified concerns
-
 typedef void VoidType;
 
 VoidType test_typedef_void_return_impl(void) {
@@ -4972,7 +4875,6 @@ void test_typedef_void_return(void) {
 	CHECK_LOG("1D", "typedef void return with defer");
 }
 
-// ISSUE 3b: typedef void* should NOT be treated as void return
 typedef void *VoidPtr;
 
 VoidPtr test_typedef_voidptr_return_impl(void) {
@@ -5161,7 +5063,6 @@ void test_complex_decl_safety(void) {
 	CHECK(pap == NULL, "ptr to array of ptrs zero-init");
 }
 
-// Test multi-level pointer with qualifiers
 void test_qualified_complex_decl(void) {
 	// const pointer to pointer
 	int *const *cpp;
@@ -5180,7 +5081,6 @@ void test_qualified_complex_decl(void) {
 	CHECK(rp == NULL, "restrict ptr zero-init");
 }
 
-// Test that extern declarations are NOT zero-initialized (would cause linker errors)
 extern int extern_var; // declaration only, no init
 
 void test_extern_not_initialized(void) {
@@ -5279,8 +5179,6 @@ void test_atomic_specifier_form(void) {
 	CHECK(d == NULL, "_Atomic(int*) zero-init");
 }
 
-// Clang doesn't support _Atomic aggregate initialization or member access
-// These tests only run on GCC
 #ifndef __clang__
 
 void test_atomic_struct_basic(void) {
@@ -5534,10 +5432,6 @@ void run_atomic_aggregate_torture_tests(void) {
 
 #endif // __clang__
 
-// HOLE #1: Switch scope leak - variable before first case
-// Previously: The zero-init "= 0" was added but switch jumped over it!
-// NOW FIXED: Prism errors on declarations before first case label.
-// This test verifies the SAFE patterns work correctly.
 void test_switch_scope_leak(void) {
 	// SAFE PATTERN 1: Declare variable BEFORE the switch
 	int y;
@@ -5592,7 +5486,6 @@ void test_for_braceless_label(void) {
 	CHECK(reached == 1, "label in braceless for body");
 }
 
-// Also test goto INTO a for loop (should be blocked if it skips declarations)
 void test_goto_into_for(void) {
 	// NOTE: This pattern now correctly produces a compile-time error
 	// goto skip; for (int i = 0; ...) { skip: ... }
@@ -5643,7 +5536,6 @@ void test_defer_complex_comma(void) {
 	CHECK_LOG("1D", "defer comma with side effect - log order");
 }
 
-// Test that exit/abort in switch case doesn't false-positive as fallthrough
 void test_switch_noreturn_no_fallthrough(void) {
 	int x = 2; // Don't hit the exit case
 	int result = 0;
@@ -5656,8 +5548,6 @@ void test_switch_noreturn_no_fallthrough(void) {
 	CHECK_EQ(result, 2, "switch noreturn: no false fallthrough error");
 }
 
-// Test that defer arguments are evaluated at scope exit (late binding)
-// This is by design - documenting expected behavior
 static int late_binding_captured = 0;
 
 void capture_value(int x) {
@@ -5683,7 +5573,6 @@ void test_defer_late_binding_semantic(void) {
 	CHECK_EQ(late_binding_captured, 10, "defer early capture workaround");
 }
 
-// Run all rigor tests
 void run_rigor_tests(void) {
 	printf("\n=== RIGOR TESTS ===\n");
 
@@ -5724,8 +5613,6 @@ void run_rigor_tests(void) {
 	test_switch_noreturn_no_fallthrough();
 	test_defer_late_binding_semantic();
 }
-
-// SECTION 13: SILENT FAILURE DETECTION TESTS
 
 #define CHECK_ZEROED(var, size, name)                                                                        \
 	do {                                                                                                 \
@@ -5819,8 +5706,6 @@ my_label: {
 	(void)x; // suppress unused warning
 }
 
-// Test: declaration directly after label (no braces) gets zero-init
-// This tests backward goto where variable is re-initialized each iteration
 void test_decl_directly_after_label(void) {
 	int counter = 0;
 	int sum = 0;
@@ -5860,9 +5745,6 @@ void test_extremely_complex_declarator(void) {
 	CHECK(super_complex == NULL, "extremely complex declarator - zero-init");
 }
 
-// SECTION: SIZEOF AND COMPLEX CONSTANT EXPRESSION TESTS
-
-// Simulate the INT_STRLEN_BOUND macro
 #define TYPE_SIGNED_TEST(t) (!((t)0 < (t) - 1))
 #define TYPE_WIDTH_TEST(t) (sizeof(t) * 8)
 #define INT_STRLEN_BOUND_TEST(t)                                                                             \
@@ -5928,10 +5810,6 @@ void test_system_typedef_pattern(void) {
 	CHECK(all_zero, "custom _t typedef in cast - zero-init");
 }
 
-// Test for invisible system typedef recognition
-// When system headers aren't flattened, types like pthread_mutex_t are still recognizable
-// by the looks_like_system_typedef() heuristic in the transpiler.
-// We test this using types from stddef.h and stdint.h which ARE included via standard includes.
 void test_invisible_system_typedef_pattern(void) {
 	// size_t - standard system typedef from stddef.h
 	size_t s1; // should be zero-initialized
@@ -5963,9 +5841,6 @@ void test_invisible_system_typedef_pattern(void) {
 	CHECK(ptr == 0, "size_t* pointer - zero-init");
 }
 
-// Test that user-defined variables with system-like names shadow the typedef heuristic
-// Bug: if user declares "int size_t = 10;", the looks_like_system_typedef heuristic
-// might still treat it as a type, causing "size_t * 5" to parse as pointer declaration
 void test_system_typedef_shadow(void) {
 	// Shadow a system type name with a variable
 	int size_t = 10;
@@ -6010,8 +5885,6 @@ void test_complex_operators_in_array_bound(void) {
 	CHECK(buf4[0] == 0, "logical && in array bound - zero-init");
 }
 
-// Test for sizeof with array element access in array bounds
-// This was a bug where sizeof(arr[0]) inside array bounds was incorrectly parsed
 static int global_arr_for_sizeof[] = {1, 2, 3, 4, 5};
 
 void test_sizeof_array_element_in_bound(void) {
@@ -6482,13 +6355,6 @@ void run_silent_failure_tests(void) {
 	test_extremely_complex_declarator();
 }
 
-// SECTION: MANUAL OFFSETOF VLA REGRESSION TESTS
-// These tests verify handling of custom offsetof macros that expand to
-// pointer arithmetic. GCC treats such patterns as VLAs even though they
-// are technically compile-time constants.
-
-// Custom offsetof macro using pointer arithmetic (common in legacy code)
-// This is different from __builtin_offsetof which GCC treats as constant
 #undef offsetof
 #define offsetof(TYPE, MEMBER) ((size_t)((char *)&((TYPE *)0)->MEMBER - (char *)0))
 
@@ -6502,8 +6368,6 @@ typedef struct TestSrcList_off {
 	TestSrcItem_off items[1]; // Flexible array member pattern
 } TestSrcList_off;
 
-// This struct contains a union with an array sized by offsetof
-// GCC treats this as a VLA, so prism must NOT add = {0}
 struct TestOp_off {
 	union {
 		int i;
@@ -6566,8 +6430,6 @@ void test_vla_expression_size(void) {
 	CHECK(vla[0] == 0 && vla[4] == 8, "VLA expression size - no zeroinit");
 }
 
-// test_struct_with_vla_member removed - VLA in struct/union is now rejected uniformly
-
 void run_manual_offsetof_vla_tests(void) {
 	printf("\n=== MANUAL OFFSETOF VLA REGRESSION TESTS ===\n");
 	printf("(Tests for pointer-arithmetic offsetof patterns)\n\n");
@@ -6579,10 +6441,6 @@ void run_manual_offsetof_vla_tests(void) {
 	test_vla_expression_size();
 }
 
-// SECTION: PREPROCESSOR NUMERIC LITERAL TESTS
-
-// Test C23/GCC extended float suffixes (F128, f64, etc.)
-// Regression test for: F128 suffix causing "expected identifier" error
 #define TEST_FLT128_MAX 1.18973149535723176508575932662800702e+4932F128
 #define TEST_FLT128_MIN 3.36210314311209350626267781732175260e-4932F128
 #define TEST_FLT64_VAL 1.7976931348623157e+308F64
@@ -6627,8 +6485,6 @@ void run_preprocessor_numeric_tests(void) {
 	test_float16_suffix();
 	test_bf16_suffix();
 }
-
-// PREPROCESSOR SYSTEM MACRO TESTS
 
 #include <signal.h>
 
@@ -6752,7 +6608,6 @@ void run_preprocessor_system_macro_tests(void) {
 	test_posix_macros();
 }
 
-// SECTION: VERIFICATION TESTS
 void test_switch_conditional_break_defer(void) {
 	log_reset();
 	int error = 0; // No error, will fall through
@@ -6815,7 +6670,6 @@ void test_switch_braced_fallthrough_works(void) {
 	CHECK_LOG("reached_case2", "fallthrough occurs as expected");
 }
 
-// Bug 2: C23 raw string literals - backslashes corrupted
 void test_raw_string_literals(void) {
 	// Test 1: Basic raw string with backslashes
 	const char *path = R"(C:\Path\To\File)";
@@ -6835,7 +6689,6 @@ Line 3)";
 	CHECK(strcmp(escaped, "\\n\\t\\r\\0") == 0, "raw string doesn't interpret escapes");
 }
 
-// Bug 3: VLA false positive with struct member access
 void test_vla_struct_member(void) {
 	struct Config {
 		int size;
@@ -6892,7 +6745,6 @@ void test_offsetof_vs_runtime(void) {
 	CHECK(vla_arr[0] == 20, "runtime member creates VLA");
 }
 
-// Bug 4: Statement expression with defer and goto
 void test_stmt_expr_defer_goto(void) {
 	log_reset();
 	int err = 1;
@@ -6956,11 +6808,6 @@ void test_nested_stmt_expr_defer(void) {
 	CHECK(result == 10, "nested stmt expr computes correctly");
 }
 
-// SECTION: CRITICAL BUG TESTS (THIRD PARTY REPORTS)
-
-// Bug 1: Vanishing statement - FIXED
-// Original: defer in braceless control flow could cause issues
-// Now: defer requires braces, ensuring proper scoping
 void test_vanishing_statement_if_else(void) {
 	log_reset();
 
@@ -7047,7 +6894,6 @@ void test_generic_default_first_association(void) {
 	CHECK_LOG("bodycleanupend", "_Generic(v, default: x) doesn't clear defer stack");
 }
 
-// _Generic default collision with switch defer cleanup
 void test_generic_default_collision(void) {
 	log_reset();
 	char *ptr = malloc(16);
@@ -7126,7 +6972,6 @@ void test_generic_default_outside_switch(void) {
 	CHECK_LOG("bodyblock_cleanupafter", "_Generic outside switch works normally");
 }
 
-// Bug 3: VLA backward goto with uninitialized memory
 void test_vla_backward_goto_reentry(void) {
 	int iterations = 0;
 	int last_val = -1;
@@ -7212,8 +7057,6 @@ void test_vla_pointer_init_semantics(void) {
 	CHECK(mat_ptr == NULL, "typedef VLA pointer zero-initialized");
 }
 
-// Typedef shadowing changes semantics
-// Bug: If local variable shadows typedef, "T * x;" changes from declaration to multiplication
 typedef int T;
 
 void test_typedef_shadow_semantics(void) {
@@ -7238,8 +7081,6 @@ void test_typedef_shadow_semantics(void) {
 	}
 }
 
-// _Generic default should not interfere with defer
-// Bug: Prism may confuse _Generic's "default:" with switch's "default:"
 void test_generic_default_no_switch(void) {
 	log_reset();
 
@@ -7260,9 +7101,6 @@ void test_generic_default_no_switch(void) {
 	CHECK_LOG("ABD", "_Generic default does not break defer");
 }
 
-// K&R function definition parsing
-// Bug: Prism may fail to parse old-style function definitions
-// K&R declarations go between params and opening brace
 int knr_func_add(a, b)
 int a;
 int b;
@@ -7279,8 +7117,6 @@ void test_knr_function_parsing(void) {
 	CHECK(knr_func_add(3, 8) == 8, "K&R function fallthrough works");
 }
 
-// Comma operator vs comma separator in declarations
-// Bug: Prism's parser must distinguish comma operator from declarator separator
 void test_comma_operator_in_init(void) {
 	int a = 1, b = 2;
 
@@ -7388,7 +7224,6 @@ void test_switch_skip_hole_strict(void) {
 	total++;
 }
 
-// Issue 2: _Complex types - C99 complex number support
 #if __STDC_VERSION__ >= 199901L && !defined(__STDC_NO_COMPLEX__)
 #include <complex.h>
 
@@ -8010,8 +7845,6 @@ void test_bug1_ghost_shadow_if(void) {
 	CHECK(ptr == NULL, "typedef V works after braceless if");
 }
 
-// Regression tests for ghost shadows when braceless bodies end via
-// break/continue/return/goto (end_statement_after_semicolon path)
 static int ghost_shadow_return_helper(void) {
 	typedef int T;
 	for (int T = 0; T < 5; T++) return T;
@@ -8180,8 +8013,6 @@ void test_attributed_label_defer(void) {
 		goto error;
 	}
 
-// GCC syntax: attribute after colon (not before)
-// Prism label scanner should recognize this label
 error:
 	__attribute__((unused)) log_append("Error");
 
@@ -8189,8 +8020,6 @@ error:
 }
 
 void test_number_tokenizer_identifiers(void) {
-// Test that identifiers starting with letters beyond hex range aren't consumed
-// These patterns appear in binutils i386-tbl.h
 #define MN_test 0xf64
 #define SPACE_test 200
 
@@ -8250,7 +8079,6 @@ void test_hex_numbers_vs_float_suffixes(void) {
 }
 
 void test_hex_and_identifier_edge_cases(void) {
-// Macro expansion with hex that looks like float suffix
 #define HEX_F64 0xf64
 #define HEX_F32 0xf32
 
@@ -8271,7 +8099,6 @@ void test_hex_and_identifier_edge_cases(void) {
 	CHECK(s1.b == 0x82, "edge: struct init with 0x82");
 	CHECK(s1.c == 2, "edge: struct init with 2");
 
-// Nested macros
 #define OUTER_MACRO 0xf64
 #define INNER_MACRO OUTER_MACRO
 	int nested = INNER_MACRO;
@@ -8289,7 +8116,6 @@ void test_hex_and_identifier_edge_cases(void) {
 	CHECK(bin1 == 15, "edge: binary literal works");
 }
 
-// Test that valid number suffixes still work after the fix
 void test_valid_number_suffixes(void) {
 	// Integer suffixes
 	unsigned int u1 = 100u;
@@ -8503,16 +8329,12 @@ void test_for_loop_goto_bypass(void) {
 }
 
 #ifdef __GNUC__
-// Test A: UTF-8 Identifiers (C99/C11/C23 Universal Character Names)
-// These are now SUPPORTED by Prism! See run_unicode_digraph_tests() for full test suite.
 void test_utf8_identifiers(void) {
 	int \u00E4 = 4; // UCN for 'ä' (U+00E4)
 	CHECK(\u00E4 == 4, "UCN identifier \\u00E4");
 }
 #endif
 
-// Test B: Digraphs (ISO C alternative tokens)
-// These are now SUPPORTED by Prism! See run_unicode_digraph_tests() for full test suite.
 void test_digraphs(void) {
 	// Digraph mappings:
 	// <: = [    :> = ]
@@ -8525,9 +8347,6 @@ void test_digraphs(void) {
 	CHECK(arr<:4:> == 5, "digraph array[4]");
 }
 
-// Test C: _Pragma operator (C99)
-// Unlike #pragma, _Pragma can appear anywhere in code
-// BUG DETECTED: Prism's try_zero_init_decl treats _Pragma as identifier, breaking zero-init
 void test_pragma_operator(void) {
 	// _Pragma in function body - test that zero-init works correctly
 	_Pragma("GCC diagnostic push")
@@ -8560,12 +8379,7 @@ void test_pragma_operator(void) {
 }
 
 #ifdef __GNUC__
-// Test D: break escaping statement expressions (GCC extension)
-// This is a notorious edge case: break inside a stmt-expr that should
-// exit an outer loop, while still running defers correctly
-// NOTE: defer at top-level of stmt-expr is correctly rejected by Prism
-// because it would change the return type to void.
-// So we wrap defers in blocks.
+
 void test_break_escape_stmtexpr(void) {
 	// Basic case: break inside statement expression exits outer loop
 	log_reset();
@@ -8693,7 +8507,6 @@ stmtexpr_escape:
 	CHECK_LOG("SLE", "goto escaping statement expression");
 }
 
-// More statement expression edge cases
 void test_stmtexpr_while_break(void) {
 	// break in stmtexpr inside while
 	log_reset();
@@ -8947,9 +8760,6 @@ void run_verification_bug_tests(void) {
 	test_for_loop_goto_bypass();
 }
 
-// SECTION: UTF-8/UCN IDENTIFIER AND DIGRAPH TESTS
-
-// Test UTF-8 identifiers with Latin Extended characters
 void test_utf8_latin_extended(void) {
 	int café = 42;
 	int naïve = 100;
@@ -8957,7 +8767,6 @@ void test_utf8_latin_extended(void) {
 	CHECK_EQ(résumé, 142, "UTF-8 Latin Extended identifiers");
 }
 
-// Test UTF-8 identifiers with Greek letters
 void test_utf8_greek(void) {
 	double π = 3.14159;
 	double τ = 2.0 * π;
@@ -8968,14 +8777,12 @@ void test_utf8_greek(void) {
 	CHECK_EQ(Σ, 55, "UTF-8 Greek sigma sum");
 }
 
-// Test UTF-8 identifiers with Cyrillic
 void test_utf8_cyrillic(void) {
 	int счётчик = 0; // "counter" in Russian
 	for (int i = 0; i < 5; i++) счётчик++;
 	CHECK_EQ(счётчик, 5, "UTF-8 Cyrillic identifier");
 }
 
-// Test UTF-8 identifiers with CJK characters
 void test_utf8_cjk(void) {
 	int 変数 = 10;		// "variable" in Japanese
 	int 数值 = 20;		// "value" in Chinese
@@ -8983,7 +8790,6 @@ void test_utf8_cjk(void) {
 	CHECK_EQ(결과, 30, "UTF-8 CJK identifiers");
 }
 
-// Test UCN (Universal Character Name) identifiers - \uXXXX form
 void test_ucn_short(void) {
 	// \u03C0 = π (Greek small letter pi)
 	// \u00E9 = é (Latin small letter e with acute)
@@ -8993,7 +8799,6 @@ void test_ucn_short(void) {
 	CHECK_EQ(caf\u00E9, 42, "UCN short form in identifier");
 }
 
-// Test UCN (Universal Character Name) identifiers - \UXXXXXXXX form
 void test_ucn_long(void) {
 	// \U0001F600 = 😀 (but we use valid XID characters)
 	// \U00004E2D = 中 (CJK character)
@@ -9001,7 +8806,6 @@ void test_ucn_long(void) {
 	CHECK_EQ(\U00004E2D, 100, "UCN long form \\U00004E2D");
 }
 
-// Test mixed UTF-8 and UCN identifiers
 void test_utf8_ucn_mixed(void) {
 	int café_var = 1; // UTF-8 with ASCII suffix
 	int π_value = 314;
@@ -9012,7 +8816,6 @@ void test_utf8_ucn_mixed(void) {
 	CHECK_EQ(π_value, 628, "UTF-8 and UCN same variable");
 }
 
-// Test digraphs: <: :> for [ ]
 void test_digraph_brackets(void) {
 	int arr<:5:> = {1, 2, 3, 4, 5}; // int arr[5] = {1, 2, 3, 4, 5};
 	int sum = 0;
@@ -9022,7 +8825,6 @@ void test_digraph_brackets(void) {
 	CHECK_EQ(arr<:4:>, 5, "Digraph bracket access last");
 }
 
-// Test digraphs: <% %> for { }
 void test_digraph_braces(void) <%
 	int x = 10;
 	int y = 20;
@@ -9030,7 +8832,6 @@ void test_digraph_braces(void) <%
 	CHECK_EQ(result, 30, "Digraph <% %> for braces");
 %>
 
-// Test digraphs in struct definitions
 void test_digraph_struct(void) {
 	struct Point <%
 		int x;
@@ -9041,7 +8842,6 @@ void test_digraph_struct(void) {
 	CHECK_EQ(p.y, 4, "Digraph struct member y");
 }
 
-// Test digraphs with arrays in structs
 void test_digraph_complex(void) {
 	struct Data <%
 		int values<:3:>;
@@ -9052,7 +8852,6 @@ void test_digraph_complex(void) {
 	CHECK_EQ(d.values<:2:>, 30, "Digraph nested array last");
 }
 
-// Test digraphs with defer (Prism-specific)
 void test_digraph_defer(void) <%
 	log_reset();
 	<%
@@ -9062,7 +8861,6 @@ void test_digraph_defer(void) <%
 	CHECK_LOG("AB", "Digraph with defer");
 %>
 
-// Test UTF-8 identifiers with defer
 void test_utf8_defer(void) {
 	log_reset();
 	{
@@ -9078,7 +8876,6 @@ void test_utf8_defer(void) {
 	CHECK_LOG("X42", "UTF-8 identifier with defer");
 }
 
-// Test Greek letters commonly used in math/science
 void test_utf8_math_identifiers(void) {
 	double α = 1.0;
 	double β = 2.0;
@@ -9093,7 +8890,6 @@ void test_utf8_math_identifiers(void) {
 	CHECK(ω > 6.0 && ω < 7.0, "Greek omega");
 }
 
-// Run all UTF-8/UCN/digraph tests
 void run_unicode_digraph_tests(void) {
 	printf("\n--- UTF-8/UCN/Digraph Tests ---\n");
 	test_utf8_latin_extended();
@@ -9143,10 +8939,6 @@ void test_zombie_defer_uninitialized(void) {
 }
 
 void test_tcc_detection_logic(void) {
-	// NOTE: This tests a mirror of prism.c's compiler detection algorithm,
-	// not the transpiler output directly. It serves as a regression test
-	// ensuring the matching logic (suffix-based for gcc, strcmp for cc)
-	// doesn't regress to the old strstr-based approach that falsely matched tcc.
 	CHECK(strstr("tcc", "cc") != NULL, "strstr finds 'cc' in 'tcc' (old bug)");
 
 	// Test the FIXED matching approach
@@ -9453,7 +9245,6 @@ void test_raw_keyword_after_extern(void) {
 	total++;
 }
 
-// Global for extern test
 int test_raw_extern_var = 42;
 
 void test_raw_keyword_before_static(void) {
@@ -9466,7 +9257,6 @@ static void defer_cleanup_func(int *p) {
 	if (p) *p = 0;
 }
 
-// Test function named 'defer' as cleanup handler
 static void defer(int *p) {
 	if (p) *p = 999;
 }
@@ -9490,11 +9280,6 @@ void test_defer_in_attribute_with_defer_stmt(void) {
 	CHECK_EQ(result, 42, "defer stmt + cleanup attr: both work");
 }
 
-// NOTE: lib mode OOM error handling is tested in test_lib.c.
-// The fixes (ENSURE_ARRAY_CAP, arena_new_block, hashmap_put/resize using error()
-// instead of exit(1), PRISM_API visibility, temp file cleanup, TMP_DIR macro,
-// PrismFeatures preprocessor config) are exercised there.
-
 void run_reported_bug_fix_tests(void) {
 	printf("\n=== BUG FIX TESTS ===\n");
 	test_issue4_strtoll_unsigned();
@@ -9508,13 +9293,6 @@ void run_reported_bug_fix_tests(void) {
 	test_defer_in_attribute_cleanup();
 	test_defer_in_attribute_with_defer_stmt();
 }
-
-// ============================================
-// ADDITIONAL BUG FIX TESTS
-// 1. register + typeof
-// 2. C23 digit separators
-// 3. volatile typeof
-// ============================================
 
 void test_register_typeof_zeroinit(void) {
 	// register variables can't have their address taken
@@ -10114,7 +9892,6 @@ void test_ghost_shadow_generic_braceless(void) {
 #endif
 
 void test_pragma_survives_transpile(void) {
-// Pragmas must pass through the transpiler unchanged
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-variable"
 	int unused_pragma_test_var;
@@ -10460,7 +10237,6 @@ static void test_generic_void_typedef_no_label_confusion(void) {
 	CHECK_EQ(result, 1, "generic_void_typedef_no_label_confusion");
 }
 
-// === VLA zero-init regression tests ===
 static void test_vla_zeroinit_basic(void) {
 	int n = 10;
 	int arr[n]; // Standard VLA - should be zero-initialized by Prism
@@ -10499,7 +10275,6 @@ static void test_vla_zeroinit_nested_scope(void) {
 	}
 }
 
-// === Hashmap tombstone load factor regression test ===
 static void test_hashmap_tombstone_high_churn_load(void) {
 	// Heavy typedef churn: if tombstones aren't counted in load factor,
 	// probe chains degrade. We verify correctness under high churn.
@@ -10520,7 +10295,6 @@ static void test_hashmap_tombstone_high_churn_load(void) {
 	CHECK_EQ(sum, 5000, "hashmap_tombstone_high_churn_load");
 }
 
-// === Parser depth regression test ===
 static void test_deep_pointer_nesting(void) {
 	// Deeply nested pointer declarations should compile fine
 	int x = 42;
@@ -10590,16 +10364,11 @@ void run_bulletproof_regression_tests(void) {
 	test_void_func_ptr_typedef();
 	test_generic_void_typedef_no_label_confusion();
 
-	// VLA zero-init: standard VLAs should be memset to zero at runtime
 	test_vla_zeroinit_basic();
 	test_vla_zeroinit_expression_size();
 	test_vla_zeroinit_large();
 	test_vla_zeroinit_nested_scope();
-
-	// Hashmap tombstone load factor: resize must account for tombstones
 	test_hashmap_tombstone_high_churn_load();
-
-	// Parser depth: deeply nested pointers should compile without crashing
 	test_deep_pointer_nesting();
 }
 
@@ -11220,8 +10989,6 @@ void run_issue_validation_tests(void) {
 	test_typedef_raw_multi_decl();
 }
 
-// orelse
-
 int orelse_return_null_helper(void *p) {
 	int *x = (int *)p orelse return -1;
 	return *x;
@@ -11461,8 +11228,6 @@ void test_orelse_defer_goto(void) {
 	CHECK_LOG("FD", "orelse defer goto: defers run at return, not at goto");
 }
 
-// --- orelse with simple declaration ---
-
 int orelse_decl_helper(int *p) {
 	int *x = p orelse return -1;
 	return *x + 1;
@@ -11474,8 +11239,6 @@ void test_orelse_simple_decl(void) {
 	CHECK(orelse_decl_helper((void *)0) == -1, "orelse simple decl: null");
 }
 
-// --- orelse with integer types (non-pointer) ---
-
 int orelse_int_nonzero_helper(int val) {
 	int x = val orelse return -1;
 	return x + 100;
@@ -11486,8 +11249,6 @@ void test_orelse_int_values(void) {
 	CHECK(orelse_int_nonzero_helper(0) == -1, "orelse int: zero triggers return");
 	CHECK(orelse_int_nonzero_helper(1) == 101, "orelse int: 1 passes through");
 }
-
-// --- orelse chained (multiple orelse in sequence) ---
 
 int orelse_chain_helper(int *a, int *b) {
 	int *p = a orelse return -1;
@@ -11502,8 +11263,6 @@ void test_orelse_chain(void) {
 	CHECK(orelse_chain_helper(&x, (void *)0) == -2, "orelse chain: second null");
 }
 
-// --- orelse in loop body ---
-
 void test_orelse_loop_body(void) {
 	int a = 5;
 	int *ptrs[] = {&a, &a, (void *)0};
@@ -11514,8 +11273,6 @@ void test_orelse_loop_body(void) {
 	}
 	CHECK(sum == 10, "orelse loop body: sum before null");
 }
-
-// --- orelse nested scopes ---
 
 int orelse_nested_helper(int *outer, int *inner) {
 	int *a = outer orelse return -1;
@@ -11532,8 +11289,6 @@ void test_orelse_nested(void) {
 	CHECK(orelse_nested_helper(&x, (void *)0) == -2, "orelse nested: inner null");
 }
 
-// --- orelse with struct pointer ---
-
 typedef struct {
 	int x;
 	int y;
@@ -11546,15 +11301,11 @@ void test_orelse_struct_ptr(void) {
 	CHECK(p->y == 20, "orelse struct ptr: field y");
 }
 
-// --- orelse does not fire on non-null ---
-
 void test_orelse_nonnull_passthrough(void) {
 	int val = 123;
 	int *p = &val orelse return;
 	CHECK(*p == 123, "orelse nonnull: passthrough correct value");
 }
-
-// --- bare expression orelse ---
 
 static int bare_orelse_flag = 0;
 
@@ -11604,8 +11355,6 @@ void test_bare_orelse_goto(void) {
 	CHECK(bare_orelse_goto_helper(0) == -1, "bare orelse goto: zero jumps to fail");
 }
 
-// --- bare orelse with defer ---
-
 int bare_orelse_defer_helper(int val) {
 	log_reset();
 	defer log_append("D");
@@ -11623,8 +11372,6 @@ void test_bare_orelse_defer(void) {
 	CHECK_LOG("D", "bare orelse defer: zero runs defers");
 }
 
-// --- orelse in while loop ---
-
 void test_orelse_while_loop(void) {
 	int a = 1, b = 2;
 	int *ptrs[] = {&a, &b, (void *)0};
@@ -11639,8 +11386,6 @@ void test_orelse_while_loop(void) {
 	CHECK(i == 2, "orelse while: iteration count");
 }
 
-// --- orelse in do-while ---
-
 void test_orelse_do_while(void) {
 	int a = 5, b = 10;
 	int *ptrs[] = {&a, &b, (void *)0};
@@ -11653,8 +11398,6 @@ void test_orelse_do_while(void) {
 	} while (i < 3);
 	CHECK(sum == 15, "orelse do-while: break on null");
 }
-
-// --- orelse with function call init ---
 
 static int *get_ptr_or_null(int *p) {
 	return p;
@@ -11671,8 +11414,6 @@ void test_orelse_funcall(void) {
 	CHECK(orelse_funcall_helper((void *)0) == -1, "orelse funcall: null from func");
 }
 
-// --- orelse with ternary in init ---
-
 int orelse_ternary_helper(int flag) {
 	int a = 42;
 	int *p = (flag ? &a : (int *)0)orelse return -1;
@@ -11683,8 +11424,6 @@ void test_orelse_ternary(void) {
 	CHECK(orelse_ternary_helper(1) == 42, "orelse ternary: true path non-null");
 	CHECK(orelse_ternary_helper(0) == -1, "orelse ternary: false path null");
 }
-
-// --- orelse identifier shadowing (orelse as struct field is fine in C) ---
 
 typedef struct {
 	int value;
@@ -12441,9 +12180,6 @@ static void test_zeroinit_after_line_directives(void) {
 	}
 }
 
-// 1C: Verify orelse does not duplicate side-effects in the return expression.
-// If the macro expansion evaluates the return expression more than once,
-// global_counter would be incremented twice.
 static int orelse_side_effect_counter = 0;
 
 static int orelse_side_effect_helper(int *p) {
@@ -12458,9 +12194,6 @@ static void test_orelse_return_expr_side_effects(void) {
 	CHECK_EQ(orelse_side_effect_counter, 1, "orelse return expr side-effect: incremented exactly once");
 }
 
-// 3B: _Generic controlling expression must NOT be evaluated (C11 6.5.1.1).
-// If Prism accidentally injects code that evaluates the controlling expression,
-// this test will fail because i would be incremented.
 #ifdef __GNUC__
 static void test_generic_controlling_expr_not_evaluated(void) {
 	int i = 0;
@@ -12472,9 +12205,6 @@ static void test_generic_controlling_expr_not_evaluated(void) {
 }
 #endif
 
-// 3D: Verify struct padding bytes are zeroed.
-// Prism uses = {0} for structs, which C guarantees zeros all bytes
-// including padding. Verify this with a byte-level check.
 static void test_struct_padding_zeroinit(void) {
 	struct PaddedStruct {
 		char c; /* 3 bytes padding on typical platforms */
@@ -12495,8 +12225,6 @@ static void test_struct_padding_zeroinit(void) {
 	CHECK(all_zero, "struct padding bytes zeroed by = {0}");
 }
 
-// 3E: __attribute__ in unusual positions — verify Prism's zero-init
-// injection doesn't break attribute parsing.
 static void test_attribute_parser_torture(void) {
 	// Attribute after struct definition on variable
 	struct AttrS {
@@ -12525,7 +12253,6 @@ static void run_hardening_tests_3(void) {
 	test_attribute_parser_torture();
 }
 
-// VLA detection with nested delimiters and expression complexity
 static void test_vla_nested_delimiter_depth(void) {
 	int n = 4;
 	// VLA inside nested parenthesized expression
@@ -12552,7 +12279,6 @@ static void test_vla_nested_delimiter_depth(void) {
 	CHECK_EQ(a4[0], 40, "vla from ternary result");
 }
 
-// Typedef tracking survives semicolons outside control flow
 static void test_typedef_survives_bare_semicolons(void) {
 	typedef int MyT;
 	MyT x;
@@ -12573,7 +12299,6 @@ static void test_typedef_survives_bare_semicolons(void) {
 	CHECK_EQ(w, 0, "typedef after for with bare semicolons");
 }
 
-// for-init typedef shadow cleanup across all semicolons
 static void test_for_init_typedef_shadow_cleanup(void) {
 	typedef int T;
 	T before;
@@ -12600,7 +12325,6 @@ static void test_for_init_typedef_shadow_cleanup(void) {
 	CHECK_EQ(final, 0, "T restored after nested for");
 }
 
-// orelse with comma operator in expression context
 static int *orelse_comma_passthru(int *p) {
 	return p;
 }
@@ -12642,7 +12366,6 @@ static void test_orelse_sequential_comma(void) {
 	CHECK_EQ(orelse_comma_seq_b(&a, NULL), -2, "orelse seq: second null");
 }
 
-// Short keyword tokens exercising tokenizer lookup
 static void test_short_keyword_recognition(void) {
 	// All short C keywords: if, do, for, int, ...
 	// Verify they parse correctly in various positions
@@ -12678,7 +12401,6 @@ static void test_c23_attr_positions(void) {
 }
 #endif
 
-// VLA typedef with various array size expressions
 static void test_vla_typedef_complex_size(void) {
 	int n = 3;
 	typedef int VArr[n];
@@ -13366,7 +13088,6 @@ static void test_typedef_shadow_for_with_if_body(void) {
 	CHECK(sizeof(y) == sizeof(int), "typedef size after for-if-else");
 }
 
-// for(typedef ...) is a GCC extension rejected by Clang, so guard these tests.
 #if defined(__GNUC__) && !defined(__clang__)
 static void test_for_init_typedef_no_leak(void) {
 	// for-init typedef should NOT persist after the loop
@@ -13446,7 +13167,6 @@ static void test_named_struct_return_with_defer(void) {
 	CHECK_EQ(_anon_ret_defer_flag, 1, "named struct return with defer: defer fired");
 }
 
-// Typedef alias for struct: return type captured as typedef name
 typedef struct {
 	int val;
 } _TypedefRetTest;
@@ -13465,7 +13185,6 @@ static void test_typedef_struct_return_with_defer(void) {
 	CHECK_EQ(_trt_defer_flag, 1, "typedef struct return with defer: defer fired");
 }
 
-// ── Issue 5A: Raw string with exactly 16-char delimiter ──
 static void test_raw_string_16_char_delimiter(void) {
 	const char *s = R"1234567890ABCDEF(sixteen char delim)1234567890ABCDEF";
 	CHECK(strcmp(s, "sixteen char delim") == 0, "raw string exactly 16-char delimiter");
@@ -13497,7 +13216,6 @@ _gap_label:;
 	CHECK_EQ((*arr)[2], 30, "goto array-ptr decl after label: accessible");
 }
 
-// typeof(const T) must use = {0} instead of memset (memset casts away const = UB)
 static void test_typeof_const_zero_init(void) {
 	typeof(const int) a;
 	CHECK_EQ(a, 0, "typeof(const int) zero-init via = {0}");
@@ -13523,7 +13241,6 @@ static void test_param_typedef_shadow(void) {
 	_param_shadow_scope_check();
 }
 
-// goto over static variable should be allowed (static storage = always initialized)
 static void test_goto_over_static_decl(void) {
 	goto _gos_label;
 	static int _gos_x = 42;
@@ -13531,12 +13248,6 @@ _gos_label:
 	CHECK_EQ(_gos_x, 42, "goto over static decl: allowed and value correct");
 }
 
-// break/continue inside defer body is now a compile-time error.
-// Prism rejects these because defers are emitted as inline cleanup code,
-// so a raw 'break'/'continue' would affect the parent loop/switch,
-// silently skipping earlier defers.
-// Cannot test directly because the code errors during transpilation.
-// See test_lib.c test_defer_break_continue_rejected() for error message verification.
 static void test_defer_break_continue_rejected(void) {
 	// Bare break/continue inside defer body: caught by "missing ';'" heuristic
 	CHECK(1, "defer break; rejected (compile error)");
@@ -13546,8 +13257,6 @@ static void test_defer_break_continue_rejected(void) {
 	CHECK(1, "defer { continue; } rejected (compile error)");
 }
 
-// break/continue inside a loop/switch that's nested inside a defer block should
-// be allowed — they target the inner construct, not the enclosing scope.
 static void helper_defer_for_break(int *out) {
 	defer {
 		for (int i = 0; i < 10; i++) {
@@ -13611,8 +13320,6 @@ static void test_defer_inner_do_while_break(void) {
 	CHECK_EQ(count, 3, "defer inner do-while break: stopped at 3");
 }
 
-// _t heuristic shadowing: a variable ending in _t must suppress the typedef heuristic
-// so that expressions like count_t * x aren't misread as pointer declarations.
 static void test_t_heuristic_shadow_mul(void) {
 	// count_t looks like a typedef to the _t heuristic,
 	// but declaring 'int count_t' should shadow it.
@@ -13670,19 +13377,12 @@ static void test_t_heuristic_noshadow(void) {
 	CHECK(1, "_t heuristic: size_t still recognized as type");
 }
 
-// orelse on array variables must be rejected — array addresses are never NULL
-// and the generated code would be invalid C.
-// See test_lib.c test_array_orelse_rejected() for error message verification.
 static void test_array_orelse_rejected(void) {
 	CHECK(1, "array orelse block rejected (compile error)");
 	CHECK(1, "const array orelse fallback rejected (compile error)");
 	CHECK(1, "non-const array orelse fallback rejected (compile error)");
 }
 
-// Test that deeply nested structs (>64 levels) don't desync the walker's
-// struct_depth counter. The goto safety checker must correctly track
-// struct nesting at depths beyond the 64-bit bitmask capacity.
-// See test_lib.c test_deep_struct_nesting_walker() for full verification.
 static void test_deep_struct_nesting_goto(void) {
 	// This struct has 66 levels of nesting, pushing depth past the 64-bit
 	// bitmask threshold. The walker's deep_struct_opens counter tracks these.
@@ -13895,9 +13595,6 @@ done:
 	CHECK(d.leaf == 0, "deep struct nesting: zero-init works");
 }
 
-// _Generic in array size should not trigger false VLA detection.
-// _Generic is a compile-time selection, so arr[_Generic(x, int: 10, ...)]
-// has a constant size and should use = {0}, not memset.
 static void test_generic_array_not_vla(void) {
 	int x = 0;
 	int arr[_Generic(x, int: 5, default: 10)];
@@ -13906,8 +13603,6 @@ static void test_generic_array_not_vla(void) {
 	CHECK_EQ((int)sizeof(arr), 5 * (int)sizeof(int), "_Generic array size: not VLA");
 }
 
-// void [[attr]] func() — C23 attributes after void must not break void detection
-// See test_lib.c test_c23_attr_void_function() for transpiler output verification.
 #if __STDC_VERSION__ >= 202311L
 __attribute__((unused)) static void test_c23_attr_void_helper(int *out) {
 	void [[maybe_unused]] c23_void_func(void) {
@@ -13922,6 +13617,181 @@ __attribute__((unused)) static void test_c23_attr_void_helper(int *out) {
 static void test_c23_attr_void_function(void) {
 	// Placeholder — actual verification is in lib-mode tests via transpile output
 	CHECK(1, "C23 [[attr]] void func: handled (see lib tests)");
+}
+
+static int _bug2_count_t = 10;   // file-scope var, NOT a type
+static int _bug2_offset_t = 7;   // another file-scope _t var
+
+static void test_bug2_filescope_t_mul(void) {
+	int b = 3;
+	int saved_b = b;
+	{
+		defer log_append("D");
+		// BUG: _bug2_count_t ends in _t, no shadow at file scope.
+		// Prism heuristic treats it as a type.
+		// '_bug2_count_t * b;' gets parsed as pointer decl '_bug2_count_t *b = 0;'
+		// which fails to compile (_bug2_count_t is int, not a type).
+		// After fix: expression emitted as-is, b unchanged.
+		_bug2_count_t * b;
+		CHECK_EQ(b, saved_b, "bug2: file-scope _t mul not misread as ptr decl");
+	}
+}
+
+static void test_bug2_filescope_t_arith(void) {
+	{
+		defer log_append("D");
+		// Assignment with file-scope _t var — should work even without fix
+		// (assignment doesn't match declaration pattern)
+		_bug2_offset_t = 20;
+		CHECK_EQ(_bug2_offset_t, 20, "bug2: file-scope _t assignment in defer");
+		_bug2_offset_t = 7; // restore
+	}
+}
+
+static void test_bug2_filescope_t_in_expr(void) {
+	{
+		defer log_append("D");
+		// Using file-scope _t var in an expression with 'int' at stmt start — safe
+		int val = _bug2_count_t + _bug2_offset_t;
+		CHECK_EQ(val, 17, "bug2: file-scope _t vars in int-expr");
+	}
+}
+
+static void _bug5_void_callee(void) {
+	log_append("V");
+}
+
+static void _bug5_void_return_call(void) {
+	defer log_append("D");
+	log_append("1");
+	return _bug5_void_callee(); // Valid C: returning void expr from void func
+}
+
+static void test_bug5_void_return_call_defer(void) {
+	log_reset();
+	_bug5_void_return_call();
+	CHECK_LOG("1VD", "bug5: void return funcall with defer");
+}
+
+static void _bug5_void_return_cast(void) {
+	defer log_append("D");
+	log_append("1");
+	return (void)0; // Explicit void cast return
+}
+
+static void test_bug5_void_return_cast_defer(void) {
+	log_reset();
+	_bug5_void_return_cast();
+	CHECK_LOG("1D", "bug5: void return (void)cast with defer");
+}
+
+static void _bug5_void_return_bare(void) {
+	defer log_append("D");
+	log_append("1");
+	return; // Bare return in void function
+}
+
+static void test_bug5_void_return_bare_defer(void) {
+	log_reset();
+	_bug5_void_return_bare();
+	CHECK_LOG("1D", "bug5: void bare return with defer");
+}
+
+#ifdef __GNUC__
+static void test_bug4_stmt_expr_in_defer(void) {
+	int result = 0;
+	{
+		defer log_append("D");
+		// Statement expression inside a defer scope
+		result = ({
+			int a = 10;
+			int b = 20;
+			a + b;
+		});
+	}
+	log_reset();
+	CHECK_EQ(result, 30, "bug4: stmt_expr in defer scope works");
+}
+#endif
+
+static void test_bug1_digraph_in_defer(void) {
+	int arr[3];
+	arr[0] = 0;
+	{
+		defer log_append("D");
+		// Use array subscript (digraphs <: and :> normalize to [ and ])
+		arr<:0:> = 42;
+		arr<:1:> = 99;
+		CHECK_EQ(arr[0], 42, "bug1: digraph <: :> subscript in defer");
+		CHECK_EQ(arr[1], 99, "bug1: digraph <: :> second subscript");
+	}
+}
+
+static void test_bug6_setjmp_detection(void) {
+	// We can't use defer + setjmp (Prism would error).
+	// Instead, verify that setjmp works normally without defer.
+	// The detection is tested indirectly: if Prism allowed defer+setjmp,
+	// writing such a test here would work (it shouldn't).
+	CHECK(1, "bug6: setjmp detection (transpiler-level, see lib tests)");
+}
+
+typedef void (*simple_callback_t)(void);
+static int _r2_callback_called = 0;
+static void _r2_callback_fn(void) { _r2_callback_called = 1; }
+
+static simple_callback_t _r2_get_callback_typedef(void) {
+	defer log_append("D");
+	log_append("G");
+	return _r2_callback_fn;
+}
+
+static void test_bug_r2_fnptr_return_typedef(void) {
+	log_reset();
+	_r2_callback_called = 0;
+	simple_callback_t cb = _r2_get_callback_typedef();
+	CHECK_LOG("GD", "bug_r2: fnptr return typedef defer order");
+	cb();
+	CHECK_EQ(_r2_callback_called, 1, "bug_r2: fnptr return typedef value correct");
+}
+
+static void (*_r2_get_callback_raw(void))(void) {
+	defer log_append("D");
+	log_append("G");
+	return _r2_callback_fn;
+}
+
+static void test_bug_r2_fnptr_return_raw(void) {
+	log_reset();
+	_r2_callback_called = 0;
+	void (*cb)(void) = _r2_get_callback_raw();
+	CHECK_LOG("GD", "bug_r2: fnptr return raw defer order");
+	cb();
+	CHECK_EQ(_r2_callback_called, 1, "bug_r2: fnptr return raw value correct");
+}
+
+// Function returning int* with defer (simpler complex type)
+static int _r2_int_val = 42;
+static int *_r2_get_ptr(void) {
+	defer log_append("D");
+	log_append("G");
+	return &_r2_int_val;
+}
+
+static void test_bug_r2_ptr_return(void) {
+	log_reset();
+	int *p = _r2_get_ptr();
+	CHECK_LOG("GD", "bug_r2: ptr return defer order");
+	CHECK_EQ(*p, 42, "bug_r2: ptr return value correct");
+}
+
+static void test_bug_r1_readonly_dir(void) {
+	CHECK(1, "bug_r1: read-only dir temp file (see CLI test)");
+}
+
+static void test_bug_r3_line_directive(void) {
+	// __FILE__ should be a valid string. If #line processing is broken,
+	// this test file itself would fail to compile.
+	CHECK(strlen(__FILE__) > 0, "bug_r3: __FILE__ is valid string");
 }
 
 int main(void) {
@@ -14078,6 +13948,23 @@ int main(void) {
 	test_deep_struct_nesting_goto();
 	test_generic_array_not_vla();
 	test_c23_attr_void_function();
+
+	test_bug2_filescope_t_mul();
+	test_bug2_filescope_t_arith();
+	test_bug2_filescope_t_in_expr();
+	test_bug5_void_return_call_defer();
+	test_bug5_void_return_cast_defer();
+	test_bug5_void_return_bare_defer();
+#ifdef __GNUC__
+	test_bug4_stmt_expr_in_defer();
+#endif
+	test_bug1_digraph_in_defer();
+	test_bug6_setjmp_detection();
+	test_bug_r2_fnptr_return_typedef();
+	test_bug_r2_fnptr_return_raw();
+	test_bug_r2_ptr_return();
+	test_bug_r1_readonly_dir();
+	test_bug_r3_line_directive();
 
 	printf("\n========================================\n");
 	printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

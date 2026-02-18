@@ -301,8 +301,10 @@ typedef struct PrismContext {
 	bool at_stmt_start;
 	int system_include_count;
 	unsigned long long ret_counter;
-	Token *func_ret_type_start; // First token of return type (after storage/function specifiers)
-	Token *func_ret_type_end;   // Function name token (exclusive end of return type range)
+	Token *func_ret_type_start;	   // First token of return type (after storage/function specifiers)
+	Token *func_ret_type_end;	   // Function name token (exclusive end of return type range)
+	Token *func_ret_type_suffix_start; // For complex declarators: closing ')' after func params
+	Token *func_ret_type_suffix_end;   // For complex declarators: token after suffix (exclusive)
 	void *active_typeof_vars;   // process_declarators arena alloc; cleared on longjmp recovery
 #ifdef PRISM_LIB_MODE
 	char active_temp_output[PATH_MAX];
@@ -326,6 +328,14 @@ static char digraph_norm_brace_open[] = "{";
 static char digraph_norm_brace_close[] = "}";
 static char digraph_norm_hash[] = "#";
 static char digraph_norm_paste[] = "##";
+
+// Check if a token's loc points to a digraph normalization static buffer
+// (not the source file buffer). Used to avoid UB pointer arithmetic in error reporting.
+static inline bool is_digraph_loc(char *loc) {
+	return loc == digraph_norm_bracket_open || loc == digraph_norm_bracket_close ||
+	       loc == digraph_norm_brace_open || loc == digraph_norm_brace_close ||
+	       loc == digraph_norm_hash || loc == digraph_norm_paste;
+}
 
 static PrismContext *ctx = NULL;
 
@@ -652,7 +662,9 @@ static noreturn void error(char *fmt, ...) {
 static void verror_at(char *filename, char *input, int line_no, char *loc, const char *fmt, va_list ap) {
 	// Guard: loc must be within [input, input+N] for safe pointer arithmetic.
 	// Normalized digraph tokens have loc pointing to static storage, not the source buffer.
-	if (!input || !loc || line_no <= 0 || loc < input) {
+	// Use is_digraph_loc() instead of 'loc < input' to avoid undefined behavior
+	// from comparing pointers to distinct objects (static storage vs heap).
+	if (!input || !loc || line_no <= 0 || is_digraph_loc(loc)) {
 		fprintf(stderr, "%s:%d: ", filename ? filename : "<unknown>", line_no > 0 ? line_no : 0);
 		vfprintf(stderr, fmt, ap);
 		fprintf(stderr, "\n");
@@ -684,7 +696,7 @@ noreturn void error_at(char *loc, char *fmt, ...) {
 	va_start(ap, fmt);
 #ifdef PRISM_LIB_MODE
 	if (ctx->error_jmp_set) {
-		int line = ctx->current_file && ctx->current_file->contents
+		int line = ctx->current_file && ctx->current_file->contents && !is_digraph_loc(loc)
 			       ? count_lines(ctx->current_file->contents, loc)
 			       : 0;
 		vsnprintf(ctx->error_msg, sizeof(ctx->error_msg), fmt, ap);
@@ -695,7 +707,7 @@ noreturn void error_at(char *loc, char *fmt, ...) {
 	if (ctx->current_file)
 		verror_at(ctx->current_file->name,
 			  ctx->current_file->contents,
-			  count_lines(ctx->current_file->contents, loc),
+			  is_digraph_loc(loc) ? 0 : count_lines(ctx->current_file->contents, loc),
 			  loc,
 			  fmt,
 			  ap);
@@ -1213,13 +1225,17 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
 		int raw_len = p - start;
 		filename = malloc(raw_len + 1);
 		if (!filename) error("out of memory");
-		// Unescape doubled backslashes in the filename.
-		// Only consume a backslash when it precedes another backslash
-		// (i.e. \\  -> \).  Windows paths use single backslashes
-		// (e.g. C:\temp\file.c) which must be preserved.
+		// Unescape backslash sequences in the filename.
+		// Handle \\  -> \  (doubled backslash) and \"  -> "  (escaped quote).
+		// Windows paths use single backslashes (e.g. C:\temp\file.c)
+		// which must be preserved — only consume a backslash when it
+		// precedes another backslash or a double-quote.
 		int len = 0;
 		for (char *s = start; s < start + raw_len; s++) {
-			if (*s == '\\' && s + 1 < start + raw_len && s[1] == '\\') s++;
+			if (*s == '\\' && s + 1 < start + raw_len &&
+			    (s[1] == '\\' || s[1] == '"')) {
+				s++;
+			}
 			filename[len++] = *s;
 		}
 		filename[len] = '\0';
