@@ -574,6 +574,14 @@ static void hashmap_clear(HashMap *map) {
 	map->tombstones = 0;
 }
 
+// Reset hashmap entries without freeing the bucket array.
+// Avoids calloc/free churn that causes heap fragmentation on musl ARM64.
+static void hashmap_zero(HashMap *map) {
+	if (map->buckets) memset(map->buckets, 0, (size_t)map->capacity * sizeof(HashEntry));
+	map->used = 0;
+	map->tombstones = 0;
+}
+
 // Filename interning - avoids duplicating identical filename strings
 // Each entry maps filename string -> interned copy
 static char *intern_filename(const char *name) {
@@ -613,13 +621,13 @@ static void free_file_contents(File *f) {
 	if (f->contents && f->owns_contents) free(f->contents);
 }
 
-// Keys are arena-allocated; just clear the bucket array.
+// Keys are arena-allocated; zero the bucket array (keep allocation for reuse).
 static void free_filename_intern_map(void) {
-	hashmap_clear(&ctx->filename_intern_map);
+	hashmap_zero(&ctx->filename_intern_map);
 }
 
 static void free_file_view_cache(void) {
-	hashmap_clear(&ctx->file_view_cache);
+	hashmap_zero(&ctx->file_view_cache);
 }
 
 static inline File *tok_file(Token *tok) {
@@ -1563,15 +1571,19 @@ void tokenizer_teardown(bool full) {
 	if (ctx->input_files) {
 		for (int i = 0; i < ctx->input_file_count; i++) free_file_contents(ctx->input_files[i]);
 	}
-	if (full) arena_free(&ctx->main_arena);
-	else
+	if (full) {
+		arena_free(&ctx->main_arena);
+		hashmap_clear(&ctx->file_view_cache);
+		hashmap_clear(&ctx->filename_intern_map);
+		hashmap_clear(&ctx->keyword_map);
+	} else {
 		arena_reset(&ctx->main_arena);
-	free_file_view_cache();
+		free_file_view_cache();
+		free_filename_intern_map();
+	}
 	// input_files array and File structs are arena-allocated; just reset pointers.
 	ctx->input_files = NULL;
 	ctx->input_file_count = 0;
 	ctx->input_file_capacity = 0;
 	ctx->current_file = NULL;
-	free_filename_intern_map();
-	if (full) hashmap_clear(&ctx->keyword_map);
 }

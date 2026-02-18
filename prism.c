@@ -371,7 +371,7 @@ static void reset_transpiler_state(void) {
 	label_table.labels = NULL;
 	label_table.count = 0;
 	label_table.capacity = 0;
-	hashmap_clear(&label_table.name_map);
+	hashmap_zero(&label_table.name_map);
 }
 
 PRISM_API PrismFeatures prism_defaults(void) {
@@ -689,7 +689,7 @@ static void emit_system_includes(void) {
 // Reset system include tracking
 static void system_includes_reset(void) {
 	// Keys are the same arena-allocated pointers in system_include_list
-	hashmap_clear(&system_includes);
+	hashmap_zero(&system_includes);
 	// system_include_list and its strings are arena-allocated; just reset pointers.
 	system_include_list = NULL;
 	ctx->system_include_count = 0;
@@ -1007,7 +1007,7 @@ static void typedef_table_reset(void) {
 	typedef_table.count = 0;
 	typedef_table.capacity = 0;
 	typedef_table.bloom = 0;
-	hashmap_clear(&typedef_table.name_map);
+	hashmap_zero(&typedef_table.name_map);
 }
 
 // Helper to get current index for a name from the hash map (-1 if not found)
@@ -1275,7 +1275,7 @@ static Token *walker_check_label(TokenWalker *w) {
 // then full label scan only if the function contains goto statements.
 static void scan_labels_in_function(Token *tok) {
 	label_table.count = 0;
-	hashmap_clear(&label_table.name_map);
+	hashmap_zero(&label_table.name_map);
 	ctx->current_func_has_setjmp = false;
 	ctx->current_func_has_asm = false;
 	ctx->current_func_has_vfork = false;
@@ -4069,8 +4069,10 @@ PRISM_API void prism_reset(void) {
 	defer_stack_capacity = 0;
 
 	// label_table.labels is arena-allocated.
-	hashmap_clear(&label_table.name_map);
-	label_table = (LabelTable){0};
+	hashmap_zero(&label_table.name_map);
+	label_table.labels = NULL;
+	label_table.count = 0;
+	label_table.capacity = 0;
 
 	system_includes_reset();
 
