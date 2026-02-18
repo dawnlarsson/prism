@@ -322,6 +322,20 @@ static void reset_transpiler_state(void) {
 	last_emitted = NULL;
 	cached_file_idx = -1;
 	cached_file = NULL;
+
+	// Reset arena-allocated arrays to prevent stale pointers after arena_reset.
+	// After tokenizer_teardown(false) resets the arena, these pointers become
+	// dangling. Without clearing them, ARENA_ENSURE_CAP would skip allocation
+	// (thinking capacity is sufficient) and write through dangling pointers,
+	// corrupting token data in the reused arena blocks.
+	defer_stack = NULL;
+	defer_stack_capacity = 0;
+	stmt_expr_levels = NULL;
+	stmt_expr_capacity = 0;
+	label_table.labels = NULL;
+	label_table.count = 0;
+	label_table.capacity = 0;
+	hashmap_clear(&label_table.name_map);
 }
 
 PRISM_API PrismFeatures prism_defaults(void) {
@@ -503,6 +517,14 @@ static inline void out_str(const char *s, int len) {
 static void out_init(FILE *fp) {
 	out_fp = fp;
 	out_buf_pos = 0;
+	oe_buf_checkpoint = -1;
+	// Shrink back to static buffer if it was grown (e.g., by speculation
+	// in a previous call that was interrupted by longjmp error recovery).
+	if (out_buf != out_buf_static) {
+		free(out_buf);
+		out_buf = out_buf_static;
+		out_buf_cap = OUT_BUF_SIZE;
+	}
 }
 
 static void out_close(void) {
