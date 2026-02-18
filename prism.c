@@ -4061,7 +4061,7 @@ PRISM_API void prism_free(PrismResult *r) {
 
 PRISM_API void prism_reset(void) {
 	typedef_table_reset();
-	tokenizer_teardown(true);
+	tokenizer_teardown(false);
 
 	// defer_stack and entries are arena-allocated; just reset pointers.
 	defer_stack = NULL;
@@ -4728,11 +4728,6 @@ static Cli cli_parse(int argc, char **argv) {
 	return cli;
 }
 
-static void cli_free(Cli *cli) {
-	free(cli->sources);
-	free(cli->cc_args);
-}
-
 static void add_warn_suppress(ArgvBuilder *ab, bool clang, bool msvc) {
 	if (msvc) // suppress common transpiler-generated warnings
 	{
@@ -5069,7 +5064,8 @@ int main(int argc, char **argv) {
 	else
 		status = compile_sources(&cli);
 
-	cli_free(&cli);
+	// free(cli.sources); OS takes care of cleanup...
+	// free(cli.cc_args);
 	return status;
 }
 
