@@ -323,7 +323,7 @@ static void test_memory_leak_stress(void)
         printf("  Trust valgrind's leak report, not RSS growth.\n");
     }
 
-    // Verify the full pipeline works first (preprocess + transpile).
+    // Verify the full pipeline works (preprocess + transpile via fork).
     {
         PrismResult result = prism_transpile_file(path, features);
         CHECK_EQ(result.status, PRISM_OK, "full pipeline sanity check");
@@ -331,11 +331,27 @@ static void test_memory_leak_stress(void)
         prism_reset();
     }
 
-    // Preprocess once. The stress loop below tests prism's transpiler for
-    // leaks; forking cc -E 100 times would measure OS/QEMU overhead, not
-    // prism memory management.
-    char *pp_buf = preprocess_with_cc(path);
-    CHECK(pp_buf != NULL, "preprocess for stress loop");
+    unlink(path);
+    free(path);
+
+    // Stress loop uses a small source string passed directly to
+    // prism_transpile_source (no preprocessing, no fork/exec per iteration).
+    // This isolates the transpiler's memory management from OS/QEMU
+    // process-creation overhead and from large-buffer allocator effects.
+    const char *stress_src =
+        "typedef struct { int x; int y; } Point;\n"
+        "int main(void) {\n"
+        "    Point p;\n"
+        "    int arr[10];\n"
+        "    {\n"
+        "        defer arr[0] = 0;\n"
+        "        int local;\n"
+        "        for (int i; i < 10; i++) {\n"
+        "            arr[i] = i;\n"
+        "        }\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n";
 
     // Warmup — first iterations allocate caches, arena blocks, and
     // JIT translation buffers (under QEMU). Use enough iterations
@@ -343,7 +359,7 @@ static void test_memory_leak_stress(void)
     int warmup = iterations < 10 ? 1 : 10;
     for (int i = 0; i < warmup; i++)
     {
-        PrismResult result = prism_transpile_source(pp_buf, path, features);
+        PrismResult result = prism_transpile_source(stress_src, "stress.c", features);
         prism_free(&result);
         prism_reset();
     }
@@ -351,14 +367,15 @@ static void test_memory_leak_stress(void)
     // Get baseline memory after warmup
     long baseline_mem = get_memory_usage_kb();
 
-    // Run iterations — transpile only (no fork per iteration)
+    // Run iterations — transpile only (no fork, no preprocessing)
     for (int i = 0; i < iterations; i++)
     {
-        PrismResult result = prism_transpile_source(pp_buf, path, features);
+        PrismResult result = prism_transpile_source(stress_src, "stress.c", features);
 
         if (result.status != PRISM_OK)
         {
-            printf("[FAIL] stress iteration %d failed\n", i);
+            printf("[FAIL] stress iteration %d failed: %s\n", i,
+                   result.error_msg ? result.error_msg : "unknown");
             failed++;
             prism_free(&result);
             break;
@@ -369,8 +386,6 @@ static void test_memory_leak_stress(void)
         // Call prism_reset to clean up all transpiler state
         prism_reset();
     }
-
-    free(pp_buf);
 
     // Get final memory
     long final_mem = get_memory_usage_kb();
@@ -414,9 +429,6 @@ static void test_memory_leak_stress(void)
 
     passed++; // Count the stress test as passed if we got here
     printf("[PASS] completed %d stress iterations\n", iterations);
-
-    unlink(path);
-    free(path);
 }
 
 // Test 7: UTF-8 and digraph handling in lib mode
