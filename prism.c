@@ -3608,7 +3608,7 @@ static char *preprocess_with_cc(const char *input_file) {
 	}
 
 	// Parent: read all preprocessed output from pipe
-	size_t cap = 128 * 1024, len = 0;
+	size_t cap = 8192, len = 0;
 	char *buf = malloc(cap);
 	if (!buf) {
 		close(pipefd[0]);
@@ -3633,6 +3633,13 @@ static char *preprocess_with_cc(const char *input_file) {
 	}
 	close(pipefd[0]);
 	buf[len] = '\0';
+
+	// Right-size buffer to reduce heap fragmentation in repeated use (lib mode).
+	// The buffer often has significant slack from the doubling growth strategy.
+	if (len + 1 < cap) {
+		char *fitted = realloc(buf, len + 1);
+		if (fitted) buf = fitted;
+	}
 
 	int status;
 	waitpid(pid, &status, 0);

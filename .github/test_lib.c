@@ -323,8 +323,10 @@ static void test_memory_leak_stress(void)
         printf("  Trust valgrind's leak report, not RSS growth.\n");
     }
 
-    // Warmup - first few iterations may allocate caches
-    int warmup = iterations < 10 ? 1 : 5;
+    // Warmup - first iterations allocate caches, arena blocks, and
+    // JIT translation buffers (under QEMU). Use enough iterations
+    // to reach steady state before measuring.
+    int warmup = iterations < 10 ? 1 : 10;
     for (int i = 0; i < warmup; i++)
     {
         PrismResult result = prism_transpile_file(path, features);
