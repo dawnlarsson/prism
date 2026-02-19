@@ -4212,6 +4212,109 @@ cleanup:
 	return result;
 }
 
+#ifdef PRISM_LIB_MODE
+// Transpile already-preprocessed source text (no fork/exec of cc -E).
+// The caller retains ownership of `source`; it is copied internally.
+// `filename` is used only for diagnostics and may be NULL.
+PRISM_API PrismResult prism_transpile_source(const char *source, const char *filename,
+                                             PrismFeatures features) {
+	prism_ctx_init();
+	PrismResult result = {0};
+
+	if (!source) {
+		result.status = PRISM_ERR_IO;
+		result.error_msg = strdup("source is NULL");
+		return result;
+	}
+
+	const char *fname = filename ? filename : "<source>";
+
+	ctx->error_msg[0] = '\0';
+	ctx->error_line = 0;
+	ctx->error_col = 0;
+	ctx->error_jmp_set = true;
+
+	if (setjmp(ctx->error_jmp) != 0) {
+		ctx->error_jmp_set = false;
+		result.status = PRISM_ERR_SYNTAX;
+		result.error_msg = strdup(ctx->error_msg[0] ? ctx->error_msg : "Unknown error");
+		result.error_line = ctx->error_line;
+		result.error_col = ctx->error_col;
+		if (ctx->active_temp_output[0]) {
+			remove(ctx->active_temp_output);
+			ctx->active_temp_output[0] = '\0';
+		}
+		ctx->active_typeof_vars = NULL;
+		if (out_fp) {
+			fclose(out_fp);
+			out_fp = NULL;
+		}
+		if (ctx->active_membuf) {
+			free(ctx->active_membuf);
+			ctx->active_membuf = NULL;
+		}
+		prism_reset();
+		return result;
+	}
+
+	ctx->features = features_to_bits(features);
+	ctx->extra_compiler = features.compiler;
+	ctx->extra_include_paths = features.include_paths;
+	ctx->extra_include_count = features.include_count;
+	ctx->extra_defines = features.defines;
+	ctx->extra_define_count = features.define_count;
+	ctx->extra_compiler_flags = features.compiler_flags;
+	ctx->extra_compiler_flags_count = features.compiler_flags_count;
+	ctx->extra_force_includes = features.force_includes;
+	ctx->extra_force_include_count = features.force_include_count;
+
+	if (!ctx->keyword_map.capacity) init_keyword_map();
+
+	// tokenize_buffer takes ownership of the buffer, so we must copy.
+	char *buf = strdup(source);
+	if (!buf) {
+		result.status = PRISM_ERR_IO;
+		result.error_msg = strdup("Out of memory");
+		goto src_cleanup;
+	}
+
+	Token *tok = tokenize_buffer((char *)fname, buf);
+	if (!tok) {
+		result.status = PRISM_ERR_SYNTAX;
+		result.error_msg = strdup("Failed to tokenize");
+		tokenizer_teardown(false);
+		goto src_cleanup;
+	}
+
+	{
+		size_t memlen = 0;
+		ctx->active_membuf = NULL;
+		FILE *fp = open_memstream(&ctx->active_membuf, &memlen);
+		if (!fp) {
+			result.status = PRISM_ERR_IO;
+			result.error_msg = strdup("open_memstream failed");
+			prism_reset();
+			goto src_cleanup;
+		}
+
+		if (transpile_tokens(tok, fp)) {
+			result.output = ctx->active_membuf;
+			result.output_len = memlen;
+			result.status = PRISM_OK;
+		} else {
+			free(ctx->active_membuf);
+			result.status = PRISM_ERR_SYNTAX;
+			result.error_msg = strdup("Transpilation failed");
+		}
+		ctx->active_membuf = NULL;
+	}
+
+src_cleanup:
+	ctx->error_jmp_set = false;
+	return result;
+}
+#endif // PRISM_LIB_MODE
+
 #ifndef PRISM_LIB_MODE
 
 // Transpile a single source file and pipe the output directly to the compiler.

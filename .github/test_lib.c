@@ -323,13 +323,27 @@ static void test_memory_leak_stress(void)
         printf("  Trust valgrind's leak report, not RSS growth.\n");
     }
 
-    // Warmup - first iterations allocate caches, arena blocks, and
+    // Verify the full pipeline works first (preprocess + transpile).
+    {
+        PrismResult result = prism_transpile_file(path, features);
+        CHECK_EQ(result.status, PRISM_OK, "full pipeline sanity check");
+        prism_free(&result);
+        prism_reset();
+    }
+
+    // Preprocess once. The stress loop below tests prism's transpiler for
+    // leaks; forking cc -E 100 times would measure OS/QEMU overhead, not
+    // prism memory management.
+    char *pp_buf = preprocess_with_cc(path);
+    CHECK(pp_buf != NULL, "preprocess for stress loop");
+
+    // Warmup — first iterations allocate caches, arena blocks, and
     // JIT translation buffers (under QEMU). Use enough iterations
     // to reach steady state before measuring.
     int warmup = iterations < 10 ? 1 : 10;
     for (int i = 0; i < warmup; i++)
     {
-        PrismResult result = prism_transpile_file(path, features);
+        PrismResult result = prism_transpile_source(pp_buf, path, features);
         prism_free(&result);
         prism_reset();
     }
@@ -337,10 +351,10 @@ static void test_memory_leak_stress(void)
     // Get baseline memory after warmup
     long baseline_mem = get_memory_usage_kb();
 
-    // Run iterations
+    // Run iterations — transpile only (no fork per iteration)
     for (int i = 0; i < iterations; i++)
     {
-        PrismResult result = prism_transpile_file(path, features);
+        PrismResult result = prism_transpile_source(pp_buf, path, features);
 
         if (result.status != PRISM_OK)
         {
@@ -355,6 +369,8 @@ static void test_memory_leak_stress(void)
         // Call prism_reset to clean up all transpiler state
         prism_reset();
     }
+
+    free(pp_buf);
 
     // Get final memory
     long final_mem = get_memory_usage_kb();
