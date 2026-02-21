@@ -1053,8 +1053,8 @@ static inline int typedef_flags(Token *tok) {
 
 static inline bool is_typedef_heuristic(Token *tok) {
 	if (tok->kind != TK_IDENT || tok->len < 2) return false;
-	if (tok->loc == '_' && tok->loc == 't') return true;
-	return tok->loc == '_' && tok->loc == '_' && !(tok->next && equal(tok->next, "("));
+	if (tok->loc[tok->len - 2] == '_' && tok->loc[tok->len - 1] == 't') return true;
+	return tok->loc[0] == '_' && tok->loc[1] == '_' && !(tok->next && equal(tok->next, "("));
 }
 
 // Check if token is a known typedef or looks like a system typedef (e.g., size_t, __rlim_t)
@@ -4126,10 +4126,10 @@ static bool get_self_exe_path(char *buf, size_t bufsize) {
 #if defined(__APPLE__)
 	uint32_t sz = (uint32_t)bufsize;
 	if (_NSGetExecutablePath(buf, &sz) == 0) {
-		char temp;
+		char temp[PATH_MAX];
 		if (realpath(buf, temp)) {
 			strncpy(buf, temp, bufsize - 1);
-			buf = '\0';
+			buf[bufsize - 1] = '\0';
 		}
 		return true;
 	}
