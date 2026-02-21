@@ -385,18 +385,15 @@ static uint32_t features_to_bits(PrismFeatures f) {
 	       (f.flatten_headers ? F_FLATTEN : 0) | (f.orelse ? F_ORELSE : 0);
 }
 
-// respects $TMPDIR environment variable - Returns path with trailing slash
 static const char *get_tmp_dir(void) {
-	static char tmp_buf[PATH_MAX];
-	const char *tmpdir = getenv(TMPDIR_ENVVAR);
-	if ((!tmpdir || !*tmpdir) && TMPDIR_ENVVAR_ALT) tmpdir = getenv(TMPDIR_ENVVAR_ALT);
-	if (tmpdir && *tmpdir) {
-		size_t len = strlen(tmpdir);
-		char last = tmpdir[len - 1];
-		snprintf(tmp_buf, sizeof(tmp_buf), "%s%s", tmpdir, (last == '/' || last == '\\') ? "" : "/");
-		return tmp_buf;
-	}
-	return TMPDIR_FALLBACK;
+	static char buf[PATH_MAX];
+	const char *t = getenv(TMPDIR_ENVVAR);
+	if ((!t || !*t) && TMPDIR_ENVVAR_ALT) t = getenv(TMPDIR_ENVVAR_ALT);
+	if (!t || !*t) return TMPDIR_FALLBACK;
+	
+	size_t len = strlen(t);
+	snprintf(buf, sizeof(buf), "%s%s", t, (t[len - 1] == '/' || t[len - 1] == '\\') ? "" : "/");
+	return buf;
 }
 
 #define match_ch _equal_1 // Alias: identical to _equal_1 (single-char token comparison)
@@ -496,7 +493,7 @@ static inline void out_str(const char *s, int len) {
 	if (__builtin_expect(len <= 0, 0)) return;
 	while (__builtin_expect(out_buf_pos + len >= out_buf_cap, 0)) {
 		if (oe_buf_checkpoint >= 0) out_buf_grow();
-		else if (len > out_buf_cap) { fwrite(s, 1, len, out_fp); return; }
+		else if (len >= out_buf_cap) { out_flush(); fwrite(s, 1, len, out_fp); return; }
 		else out_flush();
 	}
 	memcpy(out_buf + out_buf_pos, s, len);
@@ -551,12 +548,9 @@ static void out_line(int line_no, const char *file) {
 	OUT_LIT("\"\n");
 }
 
-// Headers that must not be deduplicated (C standard requires re-includability)
 static bool is_reincludable_header(const char *name) {
-	// C11 §7.2: <assert.h> behavior depends on NDEBUG at point of inclusion
 	const char *base = strrchr(name, '/');
-	base = base ? base + 1 : name;
-	return strcmp(base, "assert.h") == 0;
+	return !strcmp(base ? base + 1 : name, "assert.h");
 }
 
 // Collect system headers by detecting actual #include entries (not macro expansions)
@@ -786,11 +780,11 @@ static void emit_tok(Token *tok) {
 
 	if (need_line) {
 		out_line(line_no, tok_fname);
-		ctx->last_line_no = line_no;
 		ctx->last_filename = tok_fname;
 		ctx->last_system_header = f->is_system;
-	} else if (line_no > ctx->last_line_no)
-		ctx->last_line_no = line_no;
+	}
+
+	ctx->last_line_no = line_no;
 
 	// Handle preprocessor directives (e.g., #pragma) - emit verbatim
 	if (__builtin_expect(tok->kind == TK_PREP_DIR, 0)) {
@@ -994,12 +988,18 @@ static void parse_enum_constants(Token *tok, int scope_depth) {
 	tok = tok->next; // Skip '{'
 
 	while (tok && tok->kind != TK_EOF && !equal(tok, "}")) {
+		// Skip GCC/C23 attributes to prevent registering attribute parameters as enum constants
+		if (tok->tag & TT_ATTR) {
+			tok = skip_gnu_attributes(tok);
+			continue;
+		}
+		if (is_c23_attr(tok)) {
+			tok = skip_c23_attr(tok);
+			continue;
+		}
+
 		// Each enum constant is: IDENTIFIER or IDENTIFIER = expr
 		if (is_valid_varname(tok)) {
-			// Register enum constant - it shadows any typedef with the same name
-			// Use typedef_add_enum_const which sets both is_shadow and is_enum_const
-			// (is_shadow so is_known_typedef returns false, is_enum_const so
-			// is_known_enum_const returns true for array size detection)
 			typedef_add_enum_const(tok->loc, tok->len, scope_depth);
 			tok = tok->next;
 
@@ -1051,14 +1051,10 @@ static inline int typedef_flags(Token *tok) {
 #define is_void_typedef(tok) (typedef_flags(tok) & TDF_VOID)
 #define is_known_enum_const(tok) (typedef_flags(tok) & TDF_ENUM_CONST)
 
-// Heuristic: matches system typedefs not seen during transpilation
-// *_t (size_t, time_t) and __* (glibc internals) but not __func()
 static inline bool is_typedef_heuristic(Token *tok) {
-	if (tok->kind != TK_IDENT) return false;
-	if (tok->len >= 3 && tok->loc[tok->len - 2] == '_' && tok->loc[tok->len - 1] == 't') return true;
-	if (tok->len >= 2 && tok->loc[0] == '_' && tok->loc[1] == '_')
-		return !(tok->next && equal(tok->next, "("));
-	return false;
+	if (tok->kind != TK_IDENT || tok->len < 2) return false;
+	if (tok->loc == '_' && tok->loc == 't') return true;
+	return tok->loc == '_' && tok->loc == '_' && !(tok->next && equal(tok->next, "("));
 }
 
 // Check if token is a known typedef or looks like a system typedef (e.g., size_t, __rlim_t)
@@ -2075,16 +2071,9 @@ static Token *handle_const_orelse_fallback(Token *tok,
 	out_buf_pos = oe_buf_checkpoint;
 	last_emitted = NULL;
 
-	// Emit type WITHOUT const (for temp variable)
-	for (Token *t = type_start; t && t != type->end && t->kind != TK_EOF; t = t->next) {
-		if (t->tag & TT_CONST) continue;
-		emit_tok(t);
-	}
-	// Emit pointer prefix from declarator WITHOUT const
-	for (Token *t = decl_start; t && t != decl->var_name && t->kind != TK_EOF; t = t->next) {
-		if (t->tag & TT_CONST) continue;
-		emit_tok(t);
-	}
+	emit_range(type_start, type->end);
+	emit_range(decl_start, decl->var_name);
+	
 	// Emit temp variable name and value
 	OUT_LIT(" _prism_oe_");
 	out_uint(ctx->ret_counter);
@@ -3029,7 +3018,6 @@ static Token *handle_goto_keyword(Token *tok) {
 	return tok;
 }
 
-// Handle case/default labels: check for defer fallthrough, clear switch defers.
 static void handle_case_default(Token *tok) {
 	if (!FEAT(F_DEFER)) return;
 	int sd = find_switch_scope();
@@ -3073,8 +3061,6 @@ static Token *handle_sue_body(Token *tok) {
 	return tok;
 }
 
-// Handle '{': push scope, detect statement expressions and compound literals.
-// Returns next token.
 static Token *handle_open_brace(Token *tok) {
 	// Compound literal inside control parens, or after condition (before body)
 	if (ctrl.pending && (ctrl.paren_depth > 0 || !ctrl.parens_just_closed)) {
@@ -3102,8 +3088,6 @@ static Token *handle_open_brace(Token *tok) {
 	return tok;
 }
 
-// Handle '}': emit defers, pop scope, detect stmt-expr exit.
-// Returns next token.
 static Token *handle_close_brace(Token *tok) {
 	// Compound literal close inside control parens
 	if (ctrl.pending && ctrl.paren_depth > 0 && ctrl.brace_depth > 0) {
@@ -3179,11 +3163,6 @@ static int run_command(char **argv) {
 }
 #endif
 
-// argv data and strings are arena-allocated; nothing to free individually.
-static void free_argv(char **argv) {
-	(void)argv;
-}
-
 // Unified temp file creation with optional suffix (e.g., ".c" → suffix_len=2)
 // If source_adjacent is non-NULL, tries to create file next to that source file first,
 // then falls back to TMPDIR if the source directory is not writable (e.g., read-only
@@ -3215,7 +3194,7 @@ make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len, co
 		n = snprintf(buf, bufsize, "%s.%s.XXXXXX.c", get_tmp_dir(), base);
 		suffix_len = 2;
 	} else
-		n = snprintf(buf, bufsize, "%s%s", get_tmp_dir(), prefix);
+		n = snprintf(buf, bufsize, "%s%s", get_tmp_dir(), prefix ? prefix : "prism_tmp");
 	if (n < 0 || (size_t)n >= bufsize) return -1;
 	int fd = suffix_len > 0 ? mkstemps(buf, suffix_len) : mkstemp(buf);
 	if (fd < 0) return -1;
@@ -3223,15 +3202,14 @@ make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len, co
 	return 0;
 }
 
-// Extract filename from path (handles both / and \ separators)
 static const char *path_basename(const char *path) {
-	const char *slash = strrchr(path, '/');
-	const char *bslash = strrchr(path, '\\');
-	const char *base = (bslash && (!slash || bslash > slash)) ? bslash : slash;
-	return base ? base + 1 : path;
+	const char *base = path;
+	for (const char *p = path; *p; p++) {
+		if (*p == '/' || *p == '\\') base = p + 1;
+	}
+	return base;
 }
 
-// Windows: cc_is_msvc is defined in windows.c
 #ifndef _WIN32
 static bool cc_is_msvc(const char *cc) {
 	(void)cc;
@@ -3310,7 +3288,6 @@ static char *preprocess_with_cc(const char *input_file) {
 	int pipefd[2];
 	if (pipe(pipefd) == -1) {
 		perror("pipe");
-		free_argv(argv);
 		return NULL;
 	}
 
@@ -3341,7 +3318,6 @@ static char *preprocess_with_cc(const char *input_file) {
 	int err = posix_spawnp(&pid, argv[0], &fa, NULL, argv, env);
 	posix_spawn_file_actions_destroy(&fa);
 	close(pipefd[1]);
-	free_argv(argv);
 
 	if (err) {
 		fprintf(stderr, "posix_spawnp: %s\n", strerror(err));
@@ -4144,70 +4120,39 @@ static noreturn void die(char *message) {
 	exit(1);
 }
 
-// Resolve the path to the currently running executable (platform-specific)
 // Windows: defined in windows.c via GetModuleFileNameA
 #ifndef _WIN32
 static bool get_self_exe_path(char *buf, size_t bufsize) {
-#if defined(__linux__)
-	ssize_t len = readlink("/proc/self/exe", buf, bufsize - 1);
-	if (len > 0) {
-		buf[len] = '\0';
-		return true;
-	}
-#elif defined(__APPLE__)
+#if defined(__APPLE__)
 	uint32_t sz = (uint32_t)bufsize;
 	if (_NSGetExecutablePath(buf, &sz) == 0) {
-		char temp[PATH_MAX];
+		char temp;
 		if (realpath(buf, temp)) {
 			strncpy(buf, temp, bufsize - 1);
-			buf[bufsize - 1] = '\0';
+			buf = '\0';
 		}
 		return true;
 	}
 #elif defined(__FreeBSD__) || defined(__DragonFly__)
-	int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+	int mib = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
 	size_t len = bufsize;
 	if (sysctl(mib, 4, buf, &len, NULL, 0) == 0) return true;
-#elif defined(__NetBSD__)
-	ssize_t len = readlink("/proc/curproc/exe", buf, bufsize - 1);
-	if (len > 0) {
-		buf[len] = '\0';
-		return true;
-	}
-#elif defined(__OpenBSD__)
-	// OpenBSD doesn't expose exe path via sysctl or /proc;
-	// use argv[0] resolution via realpath at caller site.
-	// Fallthrough to return false.
-#endif
-	// Generic fallback: try Solaris/Illumos /proc path, then Linux-style
-#if !defined(__APPLE__) && !defined(__FreeBSD__) && !defined(__DragonFly__) && !defined(__NetBSD__) &&       \
-    !defined(__linux__)
-	{
-		// Solaris/Illumos
-		ssize_t len2 = readlink("/proc/self/path/a.out", buf, bufsize - 1);
-		if (len2 > 0) {
-			buf[len2] = '\0';
-			return true;
-		}
-		// Other /proc-based systems
-		len2 = readlink("/proc/self/exe", buf, bufsize - 1);
-		if (len2 > 0) {
-			buf[len2] = '\0';
+#else
+	const char *links[] = {"/proc/self/exe", "/proc/curproc/exe", "/proc/self/path/a.out"};
+	for (int i = 0; i < 3; i++) {
+		ssize_t len = readlink(links[i], buf, bufsize - 1);
+		if (len > 0) {
+			buf[len] = '\0';
 			return true;
 		}
 	}
 #endif
-	(void)buf;
-	(void)bufsize;
 	return false;
 }
 #endif
 
-// Windows: os_get_install_path, os_ensure_install_dir, os_add_to_user_path defined in windows.c
 #ifndef _WIN32
-static const char *get_install_path(void) {
-	return INSTALL_PATH;
-}
+static const char *get_install_path(void) { return INSTALL_PATH; }
 
 static bool ensure_install_dir(const char *p) {
 	(void)p;
@@ -4310,11 +4255,9 @@ use_sudo:;
 	{
 		char **argv = build_argv("sudo", "rm", "-f", install_path, NULL);
 		run_command(argv);
-		free_argv(argv);
 
 		argv = build_argv("sudo", "cp", self_path, install_path, NULL);
 		int status = run_command(argv);
-		free_argv(argv);
 		if (status != 0) {
 			fprintf(stderr, "Failed to install\n");
 			return 1;
@@ -4322,7 +4265,6 @@ use_sudo:;
 
 		argv = build_argv("sudo", "chmod", "+x", install_path, NULL);
 		run_command(argv);
-		free_argv(argv);
 	}
 #endif
 
@@ -4330,9 +4272,6 @@ use_sudo:;
 	check_path_shadow(install_path);
 	return 0;
 }
-
-// CLI
-// ─────────────────────────────────────────────────────────────────────────────
 
 static bool is_prism_cc(const char *cc) {
 	if (!cc || !*cc) return false;
@@ -4344,28 +4283,13 @@ static bool is_prism_cc(const char *cc) {
 	return false;
 }
 
-// Get the actual C compiler to use, avoiding infinite recursion if CC=prism
 static const char *get_real_cc(const char *cc) {
-	if (!cc || !*cc) return PRISM_DEFAULT_CC; // NULL or empty string
+	if (!cc || !*cc || is_prism_cc(cc)) return PRISM_DEFAULT_CC;
+	if (!strpbrk(cc, "/\\")) return cc;
 
-	// Simple check: if basename is "prism" or "prism.exe", return default
-	if (is_prism_cc(cc)) return PRISM_DEFAULT_CC;
-
-	// Fast path: if cc has no path separator, it's a bare command name like "cc" or "gcc".
-	// These can't be a renamed prism binary (we already checked is_prism_cc above),
-	// so skip the expensive realpath() + get_self_exe_path() syscalls.
-	if (!strchr(cc, '/') && !strchr(cc, '\\')) return cc;
-
-	// Advanced check: resolve paths and compare with current executable
-	// This prevents infinite recursion if prism is symlinked or copied to another name
-	char cc_real[PATH_MAX];
-	char self_real[PATH_MAX];
-
-	if (!get_self_exe_path(self_real, sizeof(self_real))) return cc;
-
-	if (realpath(cc, cc_real) == NULL) return cc;
-
-	if (strcmp(cc_real, self_real) == 0) return PRISM_DEFAULT_CC;
+	char cc_real[PATH_MAX], self_real[PATH_MAX];
+	if (get_self_exe_path(self_real, sizeof(self_real)) && realpath(cc, cc_real))
+		if (strcmp(cc_real, self_real) == 0) return PRISM_DEFAULT_CC;
 
 	return cc;
 }
@@ -4615,7 +4539,6 @@ static int passthrough_cc(const Cli *cli) {
 	char **pass = argv_builder_finish(&ab);
 	if (cli->verbose) verbose_argv(pass);
 	int st = run_command(pass);
-	free_argv(pass);
 	return st;
 }
 
@@ -4689,7 +4612,6 @@ static int install_from_source(Cli *cli) {
 	if (cli->verbose) verbose_argv(argv_cc);
 
 	int status = run_command(argv_cc);
-	free_argv(argv_cc);
 
 	for (int i = 0; i < cli->source_count; i++) {
 		remove(temp_files[i]);
@@ -4743,7 +4665,6 @@ static int compile_sources(Cli *cli) {
 
 		if (cli->verbose) fprintf(stderr, "[prism] Transpiling %s (pipe → cc)\n", cli->sources[0]);
 		status = transpile_and_compile((char *)cli->sources[0], argv_cc, cli->verbose);
-		free_argv(argv_cc);
 	} else {
 		// Multi-source: transpile to temp files, then compile together
 		char **temps = calloc(cli->source_count, sizeof(char *));
@@ -4784,7 +4705,6 @@ static int compile_sources(Cli *cli) {
 
 		if (cli->verbose) verbose_argv(argv_cc);
 		status = run_command(argv_cc);
-		free_argv(argv_cc);
 
 		for (int i = 0; i < cli->source_count; i++) {
 			remove(temps[i]);
@@ -4802,7 +4722,6 @@ static int compile_sources(Cli *cli) {
 		char **run = build_argv(temp_exe, NULL);
 		if (cli->verbose) fprintf(stderr, "[prism] Running %s\n", temp_exe);
 		status = run_command(run);
-		free_argv(run);
 		remove(temp_exe);
 	}
 

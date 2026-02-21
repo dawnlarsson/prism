@@ -1638,6 +1638,32 @@ void run_zeroinit_torture_tests(void) {
 	test_zeroinit_torture_atomic();
 }
 
+void test_ternary_zeroinit(void) {
+        log_reset();
+        int cond = 0;
+        int my_val_t = 5; 
+        int b = 2;
+        
+        // BUG: Prism sees ':' as a structural token (statement start).
+        // It then sees 'my_val_t' (which triggers the typedef heuristic because of '_t')
+        // followed by '* b'. It mistakenly rewrites this into a zero-initialized declaration:
+        // cond ? 0 : my_val_t * b = 0;
+        // This mutates 'b' to 0 and returns 0!
+        int result = cond ? 0 : my_val_t * b;
+        
+        CHECK_EQ(result, 10, "ternary colon safely ignored without mutating variables");
+        CHECK_EQ(b, 2, "variable 'b' was not mutated by rogue zero-init");
+}
+
+#define REPEAT_64(x) x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x
+#define MASSIVE_STRING REPEAT_64(REPEAT_64("A")) // Creates a massive token
+
+void test_buffer_boundary_hang(void) {
+        log_reset();
+        const char *huge = MASSIVE_STRING;
+        CHECK(huge[0] == 'A', "transpiler survived massive buffer boundary flush");
+}
+
 void run_zeroinit_tests(void) {
 	printf("\n=== ZERO-INIT TESTS ===\n");
 	test_zeroinit_basic_types();
@@ -1653,6 +1679,8 @@ void run_zeroinit_tests(void) {
 	test_zeroinit_enum_array_size();
 	test_zeroinit_alignas_array();
 	test_zeroinit_union();
+	test_ternary_zeroinit();
+	test_buffer_boundary_hang();
 }
 
 void test_raw_basic(void) {
@@ -8652,6 +8680,20 @@ void run_parsing_edge_case_tests(void) {
 	test_char_literal_escape_sequences();
 }
 
+typedef int my_attr_param_t;
+enum { MY_VAL __attribute__((my_attr_param_t)) = 1 };
+
+void test_enum_attribute_pollution(void) {
+        // If 'my_attr_param_t' was poisoned as an enum constant, Prism no longer 
+        // recognizes it as a type here! Thus, it skips zero-initializing 'ptr'.
+        my_attr_param_t *ptr = (my_attr_param_t *)0xDEADBEEF; 
+        
+        {
+            my_attr_param_t *ptr; // Should be zero-initialized to NULL
+            CHECK_EQ((uintptr_t)ptr, 0, "attribute parameters don't pollute typedef table");
+        }
+}
+
 void run_verification_bug_tests(void) {
 	printf("\n=== VERIFICATION TESTS ===\n");
 
@@ -8758,6 +8800,8 @@ void run_verification_bug_tests(void) {
 	test_defer_assignment_goto();
 	test_attributed_default_safety();
 	test_for_loop_goto_bypass();
+
+	test_enum_attribute_pollution();
 }
 
 void test_utf8_latin_extended(void) {
@@ -11805,6 +11849,36 @@ void test_orelse_funcall_multi_decl(void) {
 	CHECK_EQ(*q, 42, "orelse funcall multi-decl: q deref");
 }
 
+static const char *return_null_string(void) {
+        return NULL;
+}
+
+static const char *return_valid_string(void) {
+        return "primary_value";
+}
+
+void test_orelse_const_stripping(void) {
+        log_reset();
+
+        // BUG CONTEXT: When transpiling this, Prism used to strip the `const` from 
+        // the temporary variable it generated. Because string literals and our helper 
+        // functions return `const char *`, assigning them to a stripped `char *` temp 
+        // variable triggers strict compiler warnings/errors in the backend C compiler.
+        
+        // Test 1: Primary value is NULL, should trigger the fallback
+        const char *result_fallback = return_null_string() orelse "fallback_value";
+        
+        // Test 2: Primary value is valid, should NOT trigger the fallback
+        const char *result_primary = return_valid_string() orelse "fallback_value";
+
+        log_append(result_fallback);
+        log_append("|");
+        log_append(result_primary);
+
+        // Verify the runtime logic works as expected after it successfully compiles
+        CHECK_LOG("fallback_value|primary_value", "const stripping in orelse fallbacks");
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -11871,6 +11945,8 @@ void run_orelse_tests(void) {
 	test_orelse_struct_body_multi_decl();
 	test_orelse_defer_return_multi_decl();
 	test_orelse_funcall_multi_decl();
+
+	test_orelse_const_stripping();
 }
 
 static void test_typedef_extreme_scope_churn(void) {
