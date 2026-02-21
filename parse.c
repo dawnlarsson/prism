@@ -247,7 +247,7 @@ struct ArenaBlock {
 	ArenaBlock *next;
 	size_t used;
 	size_t capacity;
-	char data[];
+	_Alignas(ARENA_ALIGN) char data[];
 };
 
 typedef struct {
@@ -1273,7 +1273,10 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
 	else if (is_returning && !is_system)
 		*in_system_include = false;
 
-	if (new_line > (unsigned long)INT_MAX) return NULL; // line number too large for int
+	if (new_line > (unsigned long)INT_MAX) {
+		free(filename);
+		return NULL; // line number too large for int
+	}
 
 	// Guard against overflow: if directive_line is INT_MAX, directive_line + 1 wraps
 	long long ld = (long long)(int)new_line - ((long long)directive_line + 1);
@@ -1508,20 +1511,13 @@ static void ensure_keyword_map(void) {
 #endif
 }
 
-// Tokenize from an already-loaded buffer (takes ownership of buf).
-// The buffer must be NUL-terminated. Used by pipe-based preprocessor
-// to avoid writing/reading temp files.
 static Token *tokenize_buffer(char *name, char *buf) {
 	if (!buf) return NULL;
 
-	// Init keyword map before new_file() takes ownership of buf.
-	// If init_keyword_map() fails (OOM → longjmp in lib mode), buf hasn't
-	// been stored yet, so the caller can still free it. By failing early
-	// here, we avoid leaking buf.
-	ensure_keyword_map();
-
 	File *file = new_file(name, ctx->input_file_count, buf);
 	add_input_file(file);
+    
+	ensure_keyword_map();
 
 	return tokenize(file);
 }

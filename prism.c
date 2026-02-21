@@ -558,8 +558,8 @@ static void collect_system_includes(void) {
 	for (int i = 0; i < ctx->input_file_count; i++) {
 		File *f = ctx->input_files[i];
 		if (!f->is_system || !f->is_include_entry || !f->name) continue;
+		if (!is_reincludable_header(f->name) && hashmap_get(&system_includes, f->name, strlen(f->name))) continue;
 		char *inc = arena_strdup(&ctx->main_arena, f->name);
-		if (!is_reincludable_header(inc) && hashmap_get(&system_includes, inc, strlen(inc))) continue;
 		hashmap_put(&system_includes, inc, strlen(inc), (void *)1);
 		ARENA_ENSURE_CAP(&ctx->main_arena,
 				 system_include_list,
@@ -1085,46 +1085,38 @@ static Token *find_struct_body_brace(Token *tok) {
 	return (t && equal(t, "{")) ? t : NULL;
 }
 
-// Advance to next meaningful token. Skips struct/union/enum body openings
-// (fast-forwards from keyword to past '{') and _Generic(...) expressions.
-// Tracks brace depth on { and } — these ARE returned to the caller.
-// Returns false when region ends (EOF or '}' at initial_depth).
 static bool walker_next(TokenWalker *w) {
-	for (;;) {
-		if (!w->tok || w->tok->kind == TK_EOF) return false;
+	if (!w->tok || w->tok->kind == TK_EOF) return false;
 
-		// Skip struct/union/enum bodies entirely in one hop
-		if (w->tok->tag & TT_SUE) {
-			Token *brace = find_struct_body_brace(w->tok);
-			if (brace) {
-				w->tok = skip_balanced(brace, '{', '}');
-				w->prev = NULL;
-				continue;
-			}
-		}
-
-		// Skip _Generic(...)
-		if (w->tok->tag & TT_GENERIC) {
-			w->prev = w->tok;
-			w->tok = w->tok->next;
-			if (w->tok && equal(w->tok, "(")) w->tok = skip_balanced(w->tok, '(', ')');
-			w->prev = NULL;
-			continue;
-		}
-
-		// Track braces — update depth but still return token to caller
-		if (match_ch(w->tok, '{')) w->depth++;
-		else if (match_ch(w->tok, '}')) {
-			if (w->depth <= w->initial_depth) return false; // End of region
-			w->depth--;
-		}
-
-		return true;
+	// Track braces — update depth but still return token to caller
+	if (match_ch(w->tok, '{')) w->depth++;
+	else if (match_ch(w->tok, '}')) {
+		if (w->depth <= w->initial_depth) return false; // End of region
+		w->depth--;
 	}
+
+	return true;
 }
 
 static inline void walker_advance(TokenWalker *w) {
 	w->prev = w->tok;
+	
+	// Skip struct/union/enum bodies entirely in one hop
+	if (w->tok->tag & TT_SUE) {
+		Token *brace = find_struct_body_brace(w->tok);
+		if (brace) {
+			w->tok = skip_balanced(brace, '{', '}');
+			return;
+		}
+	}
+	
+	// Skip _Generic(...)
+	if (w->tok->tag & TT_GENERIC) {
+		w->tok = w->tok->next;
+		if (w->tok && equal(w->tok, "(")) w->tok = skip_balanced(w->tok, '(', ')');
+		return;
+	}
+	
 	w->tok = w->tok->next;
 }
 
@@ -1595,12 +1587,29 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 
 	// Check if the base type is void (or a typedef alias for void).
 	// Scan tokens from type_start to tok for 'void' keyword or known void typedef.
-	// Excludes: struct/union/enum, typeof, _Atomic(...), function pointers.
+	// excludes struct/union/enum, typeof, _Atomic(...), function pointers.
 	bool base_is_void = false;
-	for (Token *t = type_start; t && t != tok; t = t->next) {
-		if (equal(t, "void") || is_void_typedef(t)) {
+	Token *t = type_start;
+	while (t && t != tok) {
+		if (t->tag & TT_TYPEOF) {
+			t = t->next;
+			if (t && equal(t, "(")) t = skip_balanced(t, '(', ')');
+		} else if (t->tag & TT_SUE) {
+			Token *brace = find_struct_body_brace(t);
+			if (brace) t = skip_balanced(brace, '{', '}');
+			else t = t->next;
+		} else if ((t->tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE) && t->next && equal(t->next, "(")) {
+			t = skip_balanced(t->next, '(', ')');
+		} else if (t->tag & (TT_BITINT | TT_ATTR | TT_ALIGNAS)) {
+			t = t->next;
+			if (t && equal(t, "(")) t = skip_balanced(t, '(', ')');
+		} else if (is_c23_attr(t)) {
+			t = skip_c23_attr(t);
+		} else if (equal(t, "void") || is_void_typedef(t)) {
 			base_is_void = true;
 			break;
+		} else {
+			t = t->next;
 		}
 	}
 
@@ -2587,7 +2596,7 @@ static Token *handle_defer_keyword(Token *tok) {
 	// break is safe inside a nested loop or switch; continue is safe inside a nested loop.
 	int inner_loop_depth = 0;
 	int inner_switch_depth = 0;
-	uint8_t scope_stack = {0}; // 1 = loop, 2 = switch
+	uint8_t scope_stack = 0; // 1 = loop, 2 = switch
 
 	// State machine for detecting loop/switch body entry
 	bool pk_is_loop = false;      // true for for/while, false for switch
@@ -4492,7 +4501,7 @@ static void add_output_flags(ArgvBuilder *ab, const Cli *cli, const char *temp_e
 		const char *base = path_basename(cli->sources[0]);
 		snprintf(defobj, sizeof(defobj), "%s", base);
 		char *dot = strrchr(defobj, '.');
-		if (dot) strcpy(dot, msvc ? ".obj" : ".o");
+		if (dot) snprintf(dot, sizeof(defobj) - (dot - defobj), "%s", msvc ? ".obj" : ".o");
 		out = defobj;
 	}
 

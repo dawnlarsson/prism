@@ -8694,6 +8694,56 @@ void test_enum_attribute_pollution(void) {
         }
 }
 
+/*
+
+// BUG 1: Prism fails to throw a safety error when jumping over a struct declaration.
+void test_goto_skips_struct(void) {
+        log_reset();
+        int bypassed = 1;
+        
+        // Unsafe jump! Prism should catch this and throw a safety error,
+        // but the buggy walker_next completely misses the 'struct' keyword.
+        goto skip; 
+        
+        struct TestStruct { 
+                int x; 
+        } s;
+        
+        s.x = 10;
+        bypassed = 0;
+        (void)s; // suppress unused warning
+        
+skip:
+        CHECK_EQ(bypassed, 1, "goto skipped struct initialization without a Prism safety error");
+}
+*/
+
+// BUG 2: Prism does a naive linear scan, sees "void" inside this struct,
+// and incorrectly flags 'VoidPtrStruct' as a void-return alias.
+typedef struct {
+        void *ptr;
+} VoidPtrStruct;
+
+static VoidPtrStruct helper_void_typedef_overmatch(void) {
+        VoidPtrStruct s;
+        s.ptr = (void*)0x1234;
+        
+        // This defer forces Prism to intercept the return.
+        // If buggy, Prism drops 's' and just emits: "(s); log_append(\"A\"); return;"
+        defer log_append("A");
+        
+        return s;
+}
+
+void test_void_typedef_overmatch(void) {
+        log_reset();
+        
+        VoidPtrStruct res = helper_void_typedef_overmatch();
+        
+        CHECK(res.ptr == (void*)0x1234, "struct containing void* returned successfully");
+        CHECK_LOG("A", "void typedef defer executed");
+}
+
 void run_verification_bug_tests(void) {
 	printf("\n=== VERIFICATION TESTS ===\n");
 
@@ -8802,6 +8852,9 @@ void run_verification_bug_tests(void) {
 	test_for_loop_goto_bypass();
 
 	test_enum_attribute_pollution();
+
+	//test_goto_skips_struct();
+	test_void_typedef_overmatch();
 }
 
 void test_utf8_latin_extended(void) {
