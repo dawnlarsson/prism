@@ -3608,7 +3608,12 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			register_toplevel_shadows(tok);
 
 		// Zero-init declarations at statement start
-		if (ctx->at_stmt_start && (!ctrl.pending || ctrl.for_init || ctrl.parens_just_closed)) {
+		// Skip structural tokens ({, }, ;, :) — they never start declarations
+		// and are dispatched below. Without this guard, find_bare_orelse scans
+		// the entire brace block for '{' after for(...), touching arena pages
+		// that cause RSS growth on musl ARM64 under QEMU.
+		if (ctx->at_stmt_start && !(tag & TT_STRUCTURAL) &&
+		    (!ctrl.pending || ctrl.for_init || ctrl.parens_just_closed)) {
 			next = try_zero_init_decl(tok);
 			if (next) {
 				tok = next;
