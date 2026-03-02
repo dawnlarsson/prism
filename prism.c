@@ -1892,8 +1892,12 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 
 		// Handle nesting: (*(*(*name)...
 		while (equal(tok, "*") || (tok->tag & TT_QUALIFIER) || equal(tok, "(")) {
-			if (equal(tok, "*")) r.is_pointer = true;
-			else if (equal(tok, "(")) {
+			if (equal(tok, "*")) {
+				r.is_pointer = true;
+				r.is_const = false; // Reset: const after a new '*' applies to this level
+			} else if (r.is_pointer && (tok->tag & TT_CONST))
+				r.is_const = true;
+			if (equal(tok, "(")) {
 				if (++nested_paren > 1024) {
 					warn_tok(tok,
 						 "declarator parenthesization depth exceeds 1024; "
@@ -2092,16 +2096,23 @@ static Token *handle_const_orelse_fallback(Token *tok,
 	// The temp must be mutable for chained orelse re-assignment.
 	// For non-pointer types: strip 'const' from the type specifier (it makes the variable const).
 	// For pointer types: keep type-specifier 'const' (it qualifies the pointed-to type, not the pointer).
-	// Declarator-level const (e.g. *const) is naturally not emitted since we build our own declarator prefix.
+	// For function pointers: strip 'const' — it qualifies the return type, not the pointer variable,
+	// and keeping it creates an incompatible function pointer type (e.g. const int(*)(int) vs int(*)(int)).
+	// Declarator-level const (e.g. *const) is stripped from the temp's declarator prefix
+	// so the temp variable remains mutable for chained orelse re-assignment.
 	// For complex declarators (e.g. function pointers), emit both the prefix
 	// (before var_name) and suffix (after var_name, like )(int)) around the temp name.
-	bool strip_type_const = !decl->is_pointer;
+	bool strip_type_const = !decl->is_pointer || decl->is_func_ptr;
 	for (Token *t = type_start; t != type->end; t = t->next) {
 		if (strip_type_const && (t->tag & TT_CONST)) continue; // skip const for mutable temp
 		if (equal(t, "{")) { t = skip_balanced(t, '{', '}'); if (t == type->end) break; }
 		emit_tok(t);
 	}
-	emit_range(decl_start, decl->var_name);
+	// Emit declarator prefix, stripping const qualifiers so the temp is mutable.
+	for (Token *t = decl_start; t != decl->var_name; t = t->next) {
+		if (t->tag & TT_CONST) continue; // skip const for mutable temp
+		emit_tok(t);
+	}
 	
 	OUT_LIT(" _prism_oe_");
 	out_uint(oe_id);
@@ -2248,7 +2259,9 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					}
 				}
 
-				bool has_const_qual = type->has_const || decl.is_const;
+				// For function pointers, type-level const qualifies the return type,
+				// not the pointer variable — the variable is still mutable.
+				bool has_const_qual = (type->has_const && !decl.is_func_ptr) || decl.is_const;
 				bool is_struct_val =
 				    type_is_sue_not_enum && !decl.is_pointer && !decl.is_array;
 
@@ -2332,7 +2345,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 						  "orelse on struct/union values is not supported (memcmp "
 						  "cannot reliably detect zero due to padding)");
 				tok = emit_orelse_action(
-				    tok, decl.var_name, type->has_const || decl.is_const, stop_comma);
+				    tok, decl.var_name, has_const_qual, stop_comma);
 
 				// Continue processing remaining declarators after comma
 				if (stop_comma && equal(tok, ",")) {

@@ -875,10 +875,10 @@ static int (*_cfp_get_null(void))(int) { return NULL; }
 static int (*_cfp_get_valid(void))(int) { return _cfp_fallback; }
 
 void test_orelse_const_fnptr_fallback(void) {
-	const int (*fp1)(int) = _cfp_get_null() orelse _cfp_fallback;
+	int (* const fp1)(int) = _cfp_get_null() orelse _cfp_fallback;
 	CHECK_EQ(fp1(3), 30, "const fnptr orelse: null gets fallback");
 
-	const int (*fp2)(int) = _cfp_get_valid() orelse _cfp_fallback;
+	int (* const fp2)(int) = _cfp_get_valid() orelse _cfp_fallback;
 	CHECK_EQ(fp2(3), 30, "const fnptr orelse: non-null keeps value");
 }
 
