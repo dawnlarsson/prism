@@ -1,4 +1,4 @@
-#define PRISM_VERSION "0.116.0"
+#define PRISM_VERSION "0.117.0"
 
 #ifdef _WIN32
 #define PRISM_DEFAULT_CC "cl"
@@ -260,6 +260,8 @@ static LabelTable label_table;
 
 static int *stmt_expr_levels = NULL; // ctx->defer_depth when stmt expr started (dynamic)
 static int stmt_expr_capacity = 0;   // capacity of stmt_expr_levels array
+static int *orelse_guard_levels = NULL; // defer_depth+1 for pending dangling-else guard braces
+static int orelse_guard_capacity = 0;
 
 // Token emission - user-space buffered output for minimal syscall overhead
 static FILE *out_fp;
@@ -341,6 +343,7 @@ static void reset_transpiler_state(void) {
 	ctx->conditional_block_depth = 0;
 	ctx->generic_paren_depth = 0;
 	ctx->stmt_expr_count = 0;
+	ctx->orelse_guard_count = 0;
 	ctx->last_line_no = 0;
 	ctx->ret_counter = 0;
 	clear_func_ret_type();
@@ -365,6 +368,8 @@ static void reset_transpiler_state(void) {
 	defer_stack_capacity = 0;
 	stmt_expr_levels = NULL;
 	stmt_expr_capacity = 0;
+	orelse_guard_levels = NULL;
+	orelse_guard_capacity = 0;
 	label_table.labels = NULL;
 	label_table.count = 0;
 	label_table.capacity = 0;
@@ -2065,7 +2070,8 @@ static void re_emit_type_specifier(Token *type_start, Token *type_end) {
 
 // const + fallback orelse: roll back speculative output, re-emit with temp variable.
 // MSVC-compatible: instead of "const T x = val ?: fallback;",
-// emit: "T _prism_oe_N = (val); const T x = _prism_oe_N ? _prism_oe_N : (fallback);"
+// emit: "T _prism_oe_N = (val); if (!_prism_oe_N) _prism_oe_N = (fallback); const T x = _prism_oe_N;"
+// Handles chained orelse naturally: each chain link adds another if-assignment on the temp.
 // Returns token after fallback expression (at ';' or boundary comma).
 static Token *handle_const_orelse_fallback(Token *tok,
 					   Token *orelse_tok,
@@ -2080,42 +2086,71 @@ static Token *handle_const_orelse_fallback(Token *tok,
 	out_buf_pos = oe_buf_checkpoint;
 	last_emitted = NULL;
 
-	emit_range(type_start, type->end);
+	unsigned oe_id = ctx->ret_counter++;
+
+	// Emit temp variable: "T _prism_oe_N = (val);"
+	// The temp must be mutable for chained orelse re-assignment.
+	// For non-pointer types: strip 'const' from the type specifier (it makes the variable const).
+	// For pointer types: keep type-specifier 'const' (it qualifies the pointed-to type, not the pointer).
+	// Declarator-level const (e.g. *const) is naturally not emitted since we build our own declarator prefix.
+	// For complex declarators (e.g. function pointers), emit both the prefix
+	// (before var_name) and suffix (after var_name, like )(int)) around the temp name.
+	bool strip_type_const = !decl->is_pointer;
+	for (Token *t = type_start; t != type->end; t = t->next) {
+		if (strip_type_const && (t->tag & TT_CONST)) continue; // skip const for mutable temp
+		if (equal(t, "{")) { t = skip_balanced(t, '{', '}'); if (t == type->end) break; }
+		emit_tok(t);
+	}
 	emit_range(decl_start, decl->var_name);
 	
-	// Emit temp variable name and value
 	OUT_LIT(" _prism_oe_");
-	out_uint(ctx->ret_counter);
+	out_uint(oe_id);
+	// Emit declarator suffix (e.g. )(int) for function pointers, [N] for arrays)
+	emit_range(decl->var_name->next, decl->end);
 	OUT_LIT(" = (");
 	emit_range(val_start, orelse_tok);
 	OUT_LIT(");");
 
-	// Emit full original type + declarator (with const)
+	// Emit fallback assignment(s): "if (!_prism_oe_N) _prism_oe_N = (fallback);"
+	// Handles chained orelse by looping: each 'orelse' adds another if-assignment.
+	for (;;) {
+		OUT_LIT(" if (!_prism_oe_");
+		out_uint(oe_id);
+		OUT_LIT(") _prism_oe_");
+		out_uint(oe_id);
+		OUT_LIT(" = (");
+
+		int fdepth = 0;
+		bool chained = false;
+		while (tok->kind != TK_EOF) {
+			if (tok->flags & TF_OPEN) fdepth++;
+			else if (tok->flags & TF_CLOSE)
+				fdepth--;
+			else if (fdepth == 0 && (equal(tok, ";") || (stop_comma && tok == stop_comma)))
+				break;
+			// Detect chained orelse at depth 0
+			if (fdepth == 0 && (tok->tag & TT_ORELSE) && !is_known_typedef(tok) &&
+			    !(last_emitted && (last_emitted->tag & TT_MEMBER))) {
+				chained = true;
+				tok = tok->next; // skip 'orelse'
+				break;
+			}
+			if (equal(tok, "(") && tok->next && equal(tok->next, "{"))
+				error_tok(tok, "GNU statement expressions in orelse fallback values are not "
+					  "supported; use 'orelse { ... }' block form instead");
+			emit_tok(tok);
+			tok = tok->next;
+		}
+		OUT_LIT(");");
+		if (!chained) break;
+	}
+
+	// Emit final const declaration: "const T declarator = _prism_oe_N;"
 	emit_range(type_start, type->end);
 	parse_declarator(decl_start, true);
 
-	// Emit ternary using temp variable
 	OUT_LIT(" = _prism_oe_");
-	out_uint(ctx->ret_counter);
-	OUT_LIT(" ? _prism_oe_");
-	out_uint(ctx->ret_counter);
-	OUT_LIT(" : (");
-	ctx->ret_counter++;
-
-	// Emit fallback expression tokens
-	int fdepth = 0;
-	while (tok->kind != TK_EOF) {
-		if (tok->flags & TF_OPEN) fdepth++;
-		else if (tok->flags & TF_CLOSE)
-			fdepth--;
-		else if (fdepth == 0 && (equal(tok, ";") || (stop_comma && tok == stop_comma)))
-			break;
-		emit_tok(tok);
-		tok = tok->next;
-	}
-
-	// Close the ternary paren
-	out_char(')');
+	out_uint(oe_id);
 	out_char(';');
 	return tok;
 }
@@ -2919,8 +2954,21 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
 		if (tok->flags & TF_OPEN) fdepth++;
 		else if (tok->flags & TF_CLOSE)
 			fdepth--;
-		else if (fdepth == 0 && (equal(tok, ";") || equal(tok, ",")))
+		else if (fdepth == 0 && (equal(tok, ";") || (stop_comma && tok == stop_comma) || equal(tok, ",")))
 			break;
+		// Chained orelse: "x = a orelse b orelse c" → close this assignment,
+		// then recursively handle the next orelse on the same variable.
+		if (fdepth == 0 && (tok->tag & TT_ORELSE) && !is_known_typedef(tok) &&
+		    !(last_emitted && (last_emitted->tag & TT_MEMBER))) {
+			out_char(';');
+			tok = tok->next; // skip 'orelse'
+			if (equal(tok, ";"))
+				error_tok(tok, "expected statement after 'orelse'");
+			return emit_orelse_action(tok, var_name, has_const, stop_comma);
+		}
+		if (equal(tok, "(") && tok->next && equal(tok->next, "{"))
+			error_tok(tok, "GNU statement expressions in orelse fallback values are not "
+				  "supported; use 'orelse { ... }' block form instead");
 		emit_tok(tok);
 		tok = tok->next;
 	}
@@ -3111,6 +3159,12 @@ static Token *handle_close_brace(Token *tok) {
 		emit_defers(DEFER_SCOPE);
 	defer_pop_scope();
 	emit_tok(tok);
+	// Close dangling-else guard brace from bare block orelse
+	if (ctx->orelse_guard_count > 0 &&
+	    orelse_guard_levels[ctx->orelse_guard_count - 1] == ctx->defer_depth + 1) {
+		ctx->orelse_guard_count--;
+		OUT_LIT(" }");
+	}
 	tok = tok->next;
 	if (tok && equal(tok, ")") && ctx->stmt_expr_count > 0 &&
 	    stmt_expr_levels[ctx->stmt_expr_count - 1] == ctx->defer_depth + 1)
@@ -3406,6 +3460,10 @@ static inline void track_ctrl_paren_close(void) {
 	if (ctrl.paren_depth == 0) {
 		ctrl.for_init = false;
 		ctrl.parens_just_closed = true;
+		// Mark next token as statement start for braceless control flow bodies.
+		// Without this, "if (x) get() orelse break;" fails because the body
+		// token never gets at_stmt_start=true (only braced bodies did via handle_open_brace).
+		ctx->at_stmt_start = true;
 	}
 }
 
@@ -3537,7 +3595,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			register_toplevel_shadows(tok);
 
 		// Zero-init declarations at statement start
-		if (ctx->at_stmt_start && (!ctrl.pending || ctrl.for_init)) {
+		if (ctx->at_stmt_start && (!ctrl.pending || ctrl.for_init || ctrl.parens_just_closed)) {
 			next = try_zero_init_decl(tok);
 			if (next) {
 				tok = next;
@@ -3546,11 +3604,26 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			}
 
 			// Bare expression orelse
-			if (FEAT(F_ORELSE) && ctx->defer_depth > 0 && ctx->struct_depth == 0) {
+			// Skip if the statement starts with a keyword that introduces a
+			// sub-statement or label (if/for/while/switch/case/default/return/
+			// break/continue/goto) — those are handled by tagged dispatch.
+			// Without this guard, find_bare_orelse scans across keywords and
+			// their sub-structures, sweeping them into the if(!(...)) condition:
+			// - "return get() orelse break;" → "if(!(return get())) { break; }"
+			// - "case 1: val orelse break;" → "if(!(case 1: val)) { break; }"
+			// - "if (c) val orelse break;" → "if(!(if (c) val)) { break; }"
+			if (FEAT(F_ORELSE) && ctx->defer_depth > 0 && ctx->struct_depth == 0 &&
+			    !(tok->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO |
+					  TT_CASE | TT_DEFAULT | TT_IF | TT_LOOP | TT_SWITCH))) {
 				Token *orelse_tok = find_bare_orelse(tok);
 				if (orelse_tok) {
+					if (ctrl.for_init)
+						error_tok(tok, "orelse cannot be used in for-loop initializers");
 					if (tok->tag & TT_ORELSE && !is_known_typedef(tok))
 						error_tok(tok, "expected expression before 'orelse'");
+					// Wrap in braces to prevent C's dangling-else from
+					// binding an outer else to orelse's generated if.
+					OUT_LIT(" {");
 					OUT_LIT(" if (!(");
 					while (tok != orelse_tok) {
 						emit_tok(tok);
@@ -3562,7 +3635,23 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					if (equal(tok, ";"))
 						error_tok(tok, "expected statement after 'orelse'");
 
+					bool is_block_action = equal(tok, "{");
 					tok = emit_orelse_action(tok, NULL, false, NULL);
+					if (is_block_action) {
+						// Block orelse: '{' returns to main loop for
+						// full pipeline processing. Record the level
+						// so handle_close_brace emits the guard '}'.
+						ARENA_ENSURE_CAP(&ctx->main_arena,
+								 orelse_guard_levels,
+								 ctx->orelse_guard_count + 1,
+								 orelse_guard_capacity,
+								 INITIAL_ARRAY_CAP,
+								 int);
+						orelse_guard_levels[ctx->orelse_guard_count++] =
+						    ctx->defer_depth + 1;
+					} else {
+						OUT_LIT(" }");
+					}
 					continue;
 				}
 			}
@@ -3707,7 +3796,8 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				tok = tok->next;
 				continue;
 			}
-			if (c == ':' && last_emitted && is_identifier_like(last_emitted) &&
+			if (c == ':' && last_emitted &&
+			    (is_identifier_like(last_emitted) || last_emitted->kind == TK_NUM) &&
 			    ctx->struct_depth == 0 && ctx->defer_depth > 0) {
 				emit_tok(tok);
 				tok = tok->next;
@@ -3735,6 +3825,17 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 		// Track previous token at top level for function detection
 		TRACK_TOPLEVEL_PAREN(tok);
+
+		// Warn on unprocessed 'orelse' — likely used in a context where it cannot
+		// be handled (inside parentheses, return expression, etc.)
+		// Skip inside struct/union/enum bodies where 'orelse' may be a field name,
+		// and after '.' or '->' where it's a member access (e.g. kf.orelse).
+		if (__builtin_expect((tag & TT_ORELSE) && FEAT(F_ORELSE) && !is_known_typedef(tok) &&
+				     ctx->struct_depth == 0 &&
+				     !(last_emitted && (last_emitted->tag & TT_MEMBER)), 0))
+			error_tok(tok,
+				  "'orelse' cannot be used here (it must appear at the "
+				  "statement level in a declaration or bare expression)");
 
 		// Default: emit token as-is
 		emit_tok(tok);
@@ -3814,6 +3915,9 @@ PRISM_API void prism_reset(void) {
 	stmt_expr_levels = NULL;
 	ctx->stmt_expr_count = 0;
 	stmt_expr_capacity = 0;
+	orelse_guard_levels = NULL;
+	ctx->orelse_guard_count = 0;
+	orelse_guard_capacity = 0;
 
 	if (out_fp) {
 		out_flush();

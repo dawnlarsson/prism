@@ -844,6 +844,235 @@ void test_orelse_const_stripping(void) {
         CHECK_LOG("fallback_value|primary_value", "const stripping in orelse fallbacks");
 }
 
+static int _chained_helper(int a, int b, int c) {
+	int x = a orelse b orelse c;
+	return x;
+}
+
+void test_orelse_chained_fallback(void) {
+	CHECK_EQ(_chained_helper(5, 0, 0), 5, "chained orelse: first non-zero");
+	CHECK_EQ(_chained_helper(0, 7, 0), 7, "chained orelse: second non-zero");
+	CHECK_EQ(_chained_helper(0, 0, 9), 9, "chained orelse: third non-zero");
+	CHECK_EQ(_chained_helper(0, 0, 0), 0, "chained orelse: all zero");
+}
+
+static int _chained3_helper(int *a, int *b, int *c) {
+	int *p = a orelse b orelse c;
+	if (!p) return -1;
+	return *p;
+}
+
+void test_orelse_chained_three(void) {
+	int x = 10, y = 20, z = 30;
+	CHECK_EQ(_chained3_helper(&x, &y, &z), 10, "chained ptr orelse: first non-null");
+	CHECK_EQ(_chained3_helper(NULL, &y, &z), 20, "chained ptr orelse: second non-null");
+	CHECK_EQ(_chained3_helper(NULL, NULL, &z), 30, "chained ptr orelse: third non-null");
+	CHECK_EQ(_chained3_helper(NULL, NULL, NULL), -1, "chained ptr orelse: all null");
+}
+
+static int _cfp_fallback(int x) { return x * 10; }
+static int (*_cfp_get_null(void))(int) { return NULL; }
+static int (*_cfp_get_valid(void))(int) { return _cfp_fallback; }
+
+void test_orelse_const_fnptr_fallback(void) {
+	const int (*fp1)(int) = _cfp_get_null() orelse _cfp_fallback;
+	CHECK_EQ(fp1(3), 30, "const fnptr orelse: null gets fallback");
+
+	const int (*fp2)(int) = _cfp_get_valid() orelse _cfp_fallback;
+	CHECK_EQ(fp2(3), 30, "const fnptr orelse: non-null keeps value");
+}
+
+static int _bare_assign_ctrl_helper(int *p) {
+	int *x;
+	x = p orelse return -1;
+	return *x;
+}
+
+void test_orelse_bare_assign_ctrl_flow(void) {
+	int val = 42;
+	CHECK_EQ(_bare_assign_ctrl_helper(&val), 42, "bare assign ctrl: non-null");
+	CHECK_EQ(_bare_assign_ctrl_helper(NULL), -1, "bare assign ctrl: null returns");
+}
+
+static int _defer_block_counter = 0;
+static void _defer_block_inc(void) { _defer_block_counter++; }
+
+static int _defer_block_helper(int *p) {
+	defer _defer_block_inc();
+	int *x = p orelse {
+		defer _defer_block_inc();
+		return -1;
+	}
+	return *x;
+}
+
+void test_orelse_defer_in_block(void) {
+	int val = 7;
+	_defer_block_counter = 0;
+	CHECK_EQ(_defer_block_helper(&val), 7, "defer in orelse block: non-null value");
+	CHECK_EQ(_defer_block_counter, 1, "defer in orelse block: non-null runs outer defer");
+
+	_defer_block_counter = 0;
+	CHECK_EQ(_defer_block_helper(NULL), -1, "defer in orelse block: null returns");
+	CHECK_EQ(_defer_block_counter, 2, "defer in orelse block: null runs both defers");
+}
+
+#define _OE_CHECK_OR_RET(x) x orelse return -1
+
+static int _macro_helper(int val) {
+	int x = _OE_CHECK_OR_RET(val);
+	return x + 10;
+}
+
+void test_orelse_macro_expansion(void) {
+	CHECK_EQ(_macro_helper(5), 15, "macro orelse: non-zero passes through");
+	CHECK_EQ(_macro_helper(0), -1, "macro orelse: zero triggers return");
+}
+
+#ifdef __GNUC__
+static int _typeof_fb_helper(int val) {
+	typeof(val) x = val orelse 42;
+	return x;
+}
+
+void test_orelse_typeof_fallback_expr(void) {
+	CHECK_EQ(_typeof_fb_helper(7), 7, "typeof orelse fallback: non-zero kept");
+	CHECK_EQ(_typeof_fb_helper(0), 42, "typeof orelse fallback: zero gets default");
+}
+#endif
+
+// Bug: Braceless control flow trap — bare orelse as immediate unbraced body
+// of if/while/for was rejected because at_stmt_start was never set.
+static int _braceless_if_helper(int val) {
+	if (val)
+		val orelse return -1;
+	return val + 10;
+}
+
+void test_orelse_braceless_if(void) {
+	CHECK_EQ(_braceless_if_helper(5), 15, "braceless if: non-zero body runs orelse check");
+	CHECK_EQ(_braceless_if_helper(0), 10, "braceless if: zero skips body");
+}
+
+void test_orelse_braceless_for(void) {
+	int *ptrs[4];
+	int a = 10, b = 20;
+	ptrs[0] = &a;
+	ptrs[1] = &b;
+	ptrs[2] = (void *)0;
+	ptrs[3] = &a;
+	int sum = 0;
+	for (int i = 0; i < 4; i++) {
+		int *p = ptrs[i] orelse break;
+		sum += *p;
+	}
+	CHECK_EQ(sum, 30, "braceless for: orelse break stops at null");
+}
+
+void test_orelse_braceless_while(void) {
+	int vals[] = {1, 2, 0, 3};
+	int i = 0, sum = 0;
+	while (i < 4) {
+		int v = vals[i++];
+		if (!v) break;
+		sum += v;
+	}
+	// Now test with bare orelse in while body
+	int vals2[] = {10, 20, 0, 30};
+	i = 0;
+	sum = 0;
+	while (i < 4) {
+		int v = vals2[i++] orelse break;
+		sum += v;
+	}
+	CHECK_EQ(sum, 30, "braceless while: orelse break works");
+}
+
+// Bug: Numeric case label — "case 1:" didn't reset at_stmt_start because
+// the colon handler only checked is_identifier_like, which fails for TK_NUM.
+static int _case_num_orelse_helper(int which) {
+	switch (which) {
+	case 1: {
+		int x = 0 orelse return -1;
+		(void)x;
+		return 1;
+	}
+	case 2: {
+		int x = 42 orelse return -2;
+		return x;
+	}
+	default:
+		return 0;
+	}
+}
+
+void test_orelse_case_numeric(void) {
+	CHECK_EQ(_case_num_orelse_helper(1), -1, "case numeric: zero triggers orelse");
+	CHECK_EQ(_case_num_orelse_helper(2), 42, "case numeric: non-zero passes");
+	CHECK_EQ(_case_num_orelse_helper(99), 0, "case numeric: default");
+}
+
+// Bare orelse directly after numeric case label (no braces)
+static int _bare_case_num_helper(int which, int val) {
+	switch (which) {
+	case 1:
+		val orelse return -1;
+		return val + 10;
+	case 2:
+		val orelse return -2;
+		return val + 20;
+	default:
+		return 0;
+	}
+}
+
+void test_orelse_bare_case_numeric(void) {
+	CHECK_EQ(_bare_case_num_helper(1, 5), 15, "bare case num: non-zero case 1");
+	CHECK_EQ(_bare_case_num_helper(1, 0), -1, "bare case num: zero case 1");
+	CHECK_EQ(_bare_case_num_helper(2, 3), 23, "bare case num: non-zero case 2");
+	CHECK_EQ(_bare_case_num_helper(2, 0), -2, "bare case num: zero case 2");
+}
+
+// Bug: Dangling else — bare orelse in unbraced if body generates a hidden
+// inner "if" that steals the else from the outer if. The fix wraps bare
+// orelse output in { } to prevent else misbinding.
+static int _get_or_zero(int v) { return v; }
+
+static int _dangling_else_helper(int cond, int val) {
+	// Without the fix, the else would bind to the inner if(!(x = ...))
+	// generated by orelse, executing fail path when cond=1 && val!=0.
+	int x;
+	if (cond)
+		x = _get_or_zero(val) orelse return -1;
+	else
+		return -99;
+	return x;
+}
+
+void test_orelse_dangling_else(void) {
+	CHECK_EQ(_dangling_else_helper(1, 42), 42, "dangling else: cond=1 val=42 returns val");
+	CHECK_EQ(_dangling_else_helper(1, 0), -1, "dangling else: cond=1 val=0 orelse fires");
+	CHECK_EQ(_dangling_else_helper(0, 42), -99, "dangling else: cond=0 takes else branch");
+	CHECK_EQ(_dangling_else_helper(0, 0), -99, "dangling else: cond=0 val=0 takes else branch");
+}
+
+// Also test dangling else with block-action orelse
+static int _dangling_else_block_helper(int cond, int val) {
+	int x;
+	if (cond)
+		x = _get_or_zero(val) orelse { return -1; }
+	else
+		return -99;
+	return x;
+}
+
+void test_orelse_dangling_else_block(void) {
+	CHECK_EQ(_dangling_else_block_helper(1, 42), 42, "dangling else block: cond=1 val=42");
+	CHECK_EQ(_dangling_else_block_helper(1, 0), -1, "dangling else block: cond=1 val=0 orelse fires");
+	CHECK_EQ(_dangling_else_block_helper(0, 42), -99, "dangling else block: cond=0 takes else");
+	CHECK_EQ(_dangling_else_block_helper(0, 0), -99, "dangling else block: cond=0 val=0 takes else");
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -912,4 +1141,22 @@ void run_orelse_tests(void) {
 	test_orelse_funcall_multi_decl();
 
 	test_orelse_const_stripping();
+
+	test_orelse_chained_fallback();
+	test_orelse_chained_three();
+	test_orelse_const_fnptr_fallback();
+	test_orelse_bare_assign_ctrl_flow();
+	test_orelse_defer_in_block();
+	test_orelse_macro_expansion();
+#ifdef __GNUC__
+	test_orelse_typeof_fallback_expr();
+#endif
+
+	test_orelse_braceless_if();
+	test_orelse_braceless_for();
+	test_orelse_braceless_while();
+	test_orelse_case_numeric();
+	test_orelse_bare_case_numeric();
+	test_orelse_dangling_else();
+	test_orelse_dangling_else_block();
 }

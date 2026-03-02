@@ -3117,13 +3117,52 @@ void test_keyword_typedef_collision(void) {
 	// These typedefs use names that are also Prism keywords
 	typedef int raw;
 	typedef int defer;
+	typedef int orelse;
 
 	// These should work correctly
 	raw x = 10;
 	defer y = 20;
+	orelse z = 30;
 
 	CHECK(x == 10, "typedef named 'raw' works");
 	CHECK(y == 20, "typedef named 'defer' works");
+	CHECK(z == 30, "typedef named 'orelse' works");
+}
+
+// Regression: Prism keywords used as struct/union field names.
+// This is valid C — 'defer', 'orelse', 'raw' are not C keywords.
+// Bug: 'bool orelse;' in PrismFeatures struct triggered the error diagnostic.
+struct _KeywordFields {
+	int defer;
+	int orelse;
+	int raw;
+};
+
+void test_keyword_as_struct_field(void) {
+	struct _KeywordFields kf;
+	kf.defer = 1;
+	kf.orelse = 2;
+	kf.raw = 3;
+	CHECK(kf.defer == 1, "struct field named 'defer' works");
+	CHECK(kf.orelse == 2, "struct field named 'orelse' works");
+	CHECK(kf.raw == 3, "struct field named 'raw' works");
+
+	// Compound literal
+	struct _KeywordFields kf2 = {.defer = 10, .orelse = 20, .raw = 30};
+	CHECK(kf2.defer == 10, "compound literal field 'defer' works");
+	CHECK(kf2.orelse == 20, "compound literal field 'orelse' works");
+	CHECK(kf2.raw == 30, "compound literal field 'raw' works");
+}
+
+// Keywords as function names
+static int _fn_named_orelse(int x) { return x + 1; }
+
+void test_keyword_as_function_name(void) {
+	CHECK(_fn_named_orelse(5) == 6, "function named with keyword prefix works");
+
+	// Function pointer to keyword-named function
+	int (*fp)(int) = _fn_named_orelse;
+	CHECK(fp(10) == 11, "fnptr to keyword-named function works");
 }
 
 void test_sizeof_vla_typedef(void) {
@@ -4107,6 +4146,8 @@ void run_verification_bug_tests(void) {
 	test_ghost_shadow_corruption();
 	test_sizeof_vla_codegen();
 	test_keyword_typedef_collision();
+	test_keyword_as_struct_field();
+	test_keyword_as_function_name();
 	test_sizeof_vla_typedef();
 	test_typeof_vla_zeroinit();
 

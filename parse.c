@@ -308,6 +308,7 @@ typedef struct PrismContext {
 	bool current_func_has_asm;
 	bool current_func_has_vfork;
 	int stmt_expr_count;
+	int orelse_guard_count;
 	bool last_system_header;
 	int last_line_no;
 	char *last_filename;

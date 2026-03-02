@@ -256,6 +256,17 @@ Struct and union **pointers** work fine:
 struct Vec2 *p = get_vec2() orelse return -1;  // OK — pointer is scalar
 ```
 
+> **Note:** This protection only works for explicit `struct` / `union` keywords.
+> If the struct is hidden behind a `typedef`, Prism has no way to detect it
+> (it does not have a full type-checker). The code will be emitted and the
+> backend C compiler will report a less helpful error such as
+> *"used struct type value where scalar is required"*.
+>
+> ```c
+> typedef struct { int x, y; } Vec2;
+> Vec2 v = make_vec2() orelse return -1;  // Passes Prism, fails at CC
+> ```
+
 **Opt-out:** `prism -fno-orelse src.c`
 
 ## Safety Enforcement
@@ -334,7 +345,7 @@ Not:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v0.116.0 - Robust C transpiler
+Prism v0.117.0 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 
