@@ -43,7 +43,13 @@
 #define IS_XDIGIT(c) (IS_DIGIT(c) || ((unsigned)((c) | 0x20) - 'a') < 6u)
 #define ARENA_DEFAULT_BLOCK_SIZE (64 * 1024)
 #define KW_MARKER 0x80000000UL // Internal marker bit for keyword map: values are (tag | KW_MARKER)
+
+#if defined(_MSC_VER)
+#define ARENA_ALIGN 8
+#else
 #define ARENA_ALIGN (__alignof__(long double)) // Alignment for arena allocations (max fundamental type)
+#endif
+
 #define TOKEN_ALLOC_SIZE (((int)sizeof(Token) + (ARENA_ALIGN - 1)) & ~(ARENA_ALIGN - 1))
 
 #define equal(                                                                                                                     \
@@ -243,11 +249,18 @@ enum // Feature flags
 	F_ORELSE = 32
 };
 
+struct ArenaBlock;
+typedef struct ArenaBlock ArenaBlock;
+
 struct ArenaBlock {
 	ArenaBlock *next;
 	size_t used;
 	size_t capacity;
+#if defined(_MSC_VER)
+	__declspec(align(ARENA_ALIGN)) char data[];
+#else
 	_Alignas(ARENA_ALIGN) char data[];
+#endif
 };
 
 typedef struct {
