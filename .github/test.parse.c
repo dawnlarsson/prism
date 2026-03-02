@@ -7114,6 +7114,7 @@ static void test_bug5_void_return_bare_defer(void) {
 
 #ifdef __GNUC__
 static void test_bug4_stmt_expr_in_defer(void) {
+	log_reset();
 	int result = 0;
 	{
 		defer log_append("D");
@@ -7124,8 +7125,8 @@ static void test_bug4_stmt_expr_in_defer(void) {
 			a + b;
 		});
 	}
-	log_reset();
 	CHECK_EQ(result, 30, "bug4: stmt_expr in defer scope works");
+	CHECK_LOG("D", "bug4: defer scope logged correctly");
 }
 #endif
 

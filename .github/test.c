@@ -70,6 +70,7 @@ static void log_append(const char *s) {
 #include "test.defer.c"
 #include "test.orelse.c"
 #include "test.zeroinit.c"
+#include "test.harsh.c"
 
 int main(void) {
 	printf("=== PRISM TEST SUITE ===\n");
@@ -242,6 +243,7 @@ int main(void) {
 	test_bug_r2_ptr_return();
 	test_bug_r1_readonly_dir();
 	test_bug_r3_line_directive();
+	run_harsh_review_tests();
 
 	printf("\n========================================\n");
 	printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);
