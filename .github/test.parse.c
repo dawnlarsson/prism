@@ -3353,6 +3353,19 @@ void test_bug7_sizeof_vla_element(void) {
 	CHECK(outer[0] == 0, "sizeof(VLA[0]) is constant");
 }
 
+void test_sizeof_parenthesized_vla(void) {
+	int n = 5;
+	int vla[n]; // VLA
+	vla[0] = 42;
+
+	// sizeof((vla)) is still runtime — extra parens around VLA variable
+	int arr[sizeof((vla))];
+	arr[0] = 99;
+
+	CHECK(arr[0] == 99, "sizeof((vla)): parenthesized VLA treated as runtime");
+	CHECK(vla[0] == 42, "sizeof((vla)): original VLA not clobbered");
+}
+
 void test_edge_multiple_typedef_shadows(void) {
 	typedef int T;
 	{
@@ -4170,6 +4183,7 @@ void run_verification_bug_tests(void) {
 	test_bug7_sizeof_vla_variable();
 	test_bug7_sizeof_sizeof_vla();
 	test_bug7_sizeof_vla_element();
+	test_sizeof_parenthesized_vla();
 
 	test_edge_multiple_typedef_shadows();
 	test_edge_defer_in_generic();
@@ -5660,6 +5674,53 @@ void test_typedef_raw_multi_decl(void) {
 	CHECK(a == 0 && b == 0 && c == 0, "typedef raw multi-decl: all zeroed");
 }
 
+typedef int GenCount;
+static int _generic_colon_helper(void) {
+	GenCount n = 10;
+	defer (void)0;
+	// _Generic with typedef type in defer scope — colon must not trigger label logic
+	int r = _Generic(n, GenCount: n * 2, default: 0);
+	return r;
+}
+
+void test_generic_colon_in_defer(void) {
+	int r = _generic_colon_helper();
+	CHECK_EQ(r, 20, "_Generic colon in defer: typedef association correct");
+}
+
+static int _goto_kw_label_helper(int skip) {
+	log_reset();
+	defer log_append("D");
+	if (skip) goto raw;
+	log_append("body");
+raw:
+	log_append("end");
+	return 0;
+}
+
+void test_goto_keyword_label_defer(void) {
+	// Non-skip path: body + end + defer
+	_goto_kw_label_helper(0);
+	CHECK_LOG("bodyendD", "goto keyword label: non-skip defer fires");
+	// Skip path: goto raw jumps to raw: label, defer still fires at return
+	_goto_kw_label_helper(1);
+	CHECK_LOG("endD", "goto keyword label: skip path defer fires");
+}
+
+// Keyword label with zero-init variable — goto does NOT skip over the decl
+static int _goto_kw_zeroinit_helper(int skip) {
+	int x;
+	if (skip) goto defer;
+	x = 42;
+defer:
+	return x;
+}
+
+void test_goto_keyword_label_zeroinit(void) {
+	CHECK_EQ(_goto_kw_zeroinit_helper(0), 42, "goto keyword label zeroinit: non-skip");
+	CHECK_EQ(_goto_kw_zeroinit_helper(1), 0, "goto keyword label zeroinit: skip (x = 0)");
+}
+
 void run_issue_validation_tests(void) {
 	printf("\n=== ISSUE VALIDATION TESTS ===\n");
 	test_switch_unbraced_inter_case_decl();
@@ -5708,6 +5769,9 @@ void run_issue_validation_tests(void) {
 	test_typedef_as_raw();
 	test_typedef_raw_with_pointer();
 	test_typedef_raw_multi_decl();
+	test_generic_colon_in_defer();
+	test_goto_keyword_label_defer();
+	test_goto_keyword_label_zeroinit();
 }
 static void test_vla_nested_delimiter_depth(void) {
 	int n = 4;
@@ -7251,3 +7315,17 @@ static void test_bug_r3_line_directive(void) {
 	CHECK(strlen(__FILE__) > 0, "bug_r3: __FILE__ is valid string");
 }
 
+static int _paren_void_flag = 0;
+
+void (_paren_void_func)(void) {
+	defer {
+		_paren_void_flag += 1;
+	};
+	_paren_void_flag += 10;
+}
+
+static void test_void_parenthesized_func_defer(void) {
+	_paren_void_flag = 0;
+	_paren_void_func();
+	CHECK_EQ(_paren_void_flag, 11, "void (func)(): defer fires correctly");
+}

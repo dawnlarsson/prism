@@ -243,6 +243,7 @@ int main(void) {
 	test_bug_r2_ptr_return();
 	test_bug_r1_readonly_dir();
 	test_bug_r3_line_directive();
+	test_void_parenthesized_func_defer();
 	run_harsh_review_tests();
 
 	printf("\n========================================\n");

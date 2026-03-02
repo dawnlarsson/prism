@@ -1358,7 +1358,57 @@ void test_enum_shadow_zeroinit(void) {
 	CHECK_EQ(sum, 0, "enum constant shadowing typedef: array zero-initialized");
 }
 
+int _ternary_result_global; // global forces bare assignment (not a declaration)
+
+void test_ternary_bare_expr_in_defer(void) {
+	int my_val_t = 5;
+	int b = 2;
+
+	// Bare assignment with ternary inside a defer scope.
+	// Before fix: Prism rewrites to `my_val_t * b = 0`, mutating b.
+	{
+		defer (void)0;
+		_ternary_result_global = 0 ? 0 : my_val_t * b;
+	}
+	CHECK_EQ(_ternary_result_global, 10, "bare ternary in defer: correct value");
+	CHECK_EQ(b, 2, "bare ternary in defer: b not mutated");
+
+	// Nested ternary: two colons in a bare assignment
+	{
+		defer (void)0;
+		_ternary_result_global = 1 ? (0 ? 10 : my_val_t * b) : 99;
+	}
+	CHECK_EQ(_ternary_result_global, 10, "nested bare ternary in defer: correct");
+	CHECK_EQ(b, 2, "nested bare ternary in defer: b still intact");
+}
+
+void test_nested_ternary_zeroinit(void) {
+	// Declaration-based ternary tests (go through emit_expr_to_semicolon
+	// which has its own ternary_depth tracking).
+	int a_val_t = 3;
+	int b = 4;
+	int r1 = 1 ? (0 ? 10 : a_val_t * b) : 99;
+	CHECK_EQ(r1, 12, "decl ternary: nested ternary correct");
+	CHECK_EQ(b, 4, "decl ternary: b not mutated");
+}
+
+void test_inline_enum_const_array_size(void) {
+	// Inline enum with explicit value, then use the constant as an array size
+	enum { INLINE_SIZE = 8 } tag;
+	int arr[INLINE_SIZE];
+
+	// If the constant wasn't registered, Prism would think INLINE_SIZE is a
+	// variable, treat arr as a VLA, and skip = {0}.
+	int sum = 0;
+	for (int i = 0; i < INLINE_SIZE; i++) sum += arr[i];
+	CHECK_EQ(sum, 0, "inline enum const as array size: zero-initialized");
+	CHECK_EQ((int)tag, 0, "inline enum var itself is zero-initialized");
+}
+
 void run_enum_shadow_tests(void) {
 	printf("\n=== ENUM SHADOW ZERO-INIT TESTS ===\n");
 	test_enum_shadow_zeroinit();
+	test_ternary_bare_expr_in_defer();
+	test_nested_ternary_zeroinit();
+	test_inline_enum_const_array_size();
 }

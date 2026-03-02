@@ -1301,7 +1301,7 @@ goto_skips_check(Token *goto_tok, char *label_name, int label_len, bool check_de
 		}
 
 		// Label detection
-		if (w.tok->kind == TK_IDENT && w.tok->len == label_len &&
+		if (is_identifier_like(w.tok) && w.tok->len == label_len &&
 		    !memcmp(w.tok->loc, label_name, label_len)) {
 			Token *label = walker_check_label(&w);
 			if (label) {
@@ -1376,7 +1376,23 @@ static bool is_void_function_decl(Token *tok) {
 	if (tok && equal(tok, "*")) return false; // void* is a pointer type, not a void function
 
 	tok = skip_func_specifiers(tok);
-	return tok && is_valid_varname(tok) && tok->next && equal(tok->next, "(");
+
+	// Handle simple case: void foo()
+	if (tok && is_valid_varname(tok) && tok->next && equal(tok->next, "(")) return true;
+
+	// Handle parenthesized case: void (foo)() or void (__attr foo)()
+	if (tok && equal(tok, "(")) {
+		Token *inner = tok->next;
+		while (inner && inner->kind != TK_EOF && (inner->tag & TT_ATTR)) {
+			inner = skip_gnu_attributes(inner);
+		}
+		if (inner && is_valid_varname(inner) && inner->next && equal(inner->next, ")")) {
+			Token *after = inner->next->next;
+			return after && equal(after, "(");
+		}
+	}
+
+	return false;
 }
 
 // Capture the return type of a non-void function declaration.
@@ -1535,10 +1551,11 @@ static bool array_size_is_vla(Token *open_bracket) {
 			if (tok && equal(tok, "(")) {
 				Token *end = skip_balanced(tok, '(', ')');
 				if (is_sizeof) {
-					if (tok->next && is_vla_typedef(tok->next)) return true;
-					for (Token *inner = tok->next; inner && inner != end; inner = inner->next)
-						if (equal(inner, "[") && array_size_is_vla(inner))
-							return true;
+					// Scan the entire sizeof(...) contents for VLA usage
+					for (Token *inner = tok->next; inner && inner != end; inner = inner->next) {
+						if (is_vla_typedef(inner)) return true;
+						if (equal(inner, "[") && array_size_is_vla(inner)) return true;
+					}
 				}
 				tok = end; // Used safely for both sizeof and alignof!
 			}
@@ -2517,6 +2534,17 @@ static Token *try_zero_init_decl(Token *tok) {
 			  "variable declaration directly in switch body without braces. "
 			  "Wrap in braces: 'case N: { int x; ... }' to ensure safe zero-initialization, "
 			  "or use 'raw' to suppress zero-init.");
+	}
+
+	// Check for enum bodies to register constants before emitting
+	if (type.is_struct) {
+		for (Token *t = start; t && t != type.end; t = t->next) {
+			if (equal(t, "enum")) {
+				Token *brace = find_struct_body_brace(t);
+				if (brace && brace != type.end) parse_enum_constants(brace, ctx->defer_depth);
+				break;
+			}
+		}
 	}
 
 	// Emit pragmas and type
@@ -3543,11 +3571,14 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 	Token *last_toplevel_paren = NULL;	// Track last ')' at top level for K&R detection
 	Token *last_toplevel_open_paren = NULL; // Track matching '(' for param shadow detection
 	int toplevel_paren_depth = 0;		// Depth counter for top-level paren tracking
+	int ternary_depth = 0;			// Depth counter for ? : operators
 
 	// Walk tokens and emit
 	while (tok->kind != TK_EOF) {
 		Token *next;
 		uint32_t tag = tok->tag;
+
+		if (tok->len == 1 && tok->shortcut == '?') ternary_depth++;
 
 #define DISPATCH(handler)                                                                                    \
 	{                                                                                                    \
@@ -3814,13 +3845,20 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				tok = tok->next;
 				continue;
 			}
-			if (c == ':' && last_emitted &&
-			    (is_identifier_like(last_emitted) || last_emitted->kind == TK_NUM) &&
-			    ctx->struct_depth == 0 && ctx->defer_depth > 0) {
-				emit_tok(tok);
-				tok = tok->next;
-				ctx->at_stmt_start = true;
-				continue;
+			if (c == ':') {
+				if (ternary_depth > 0) {
+					ternary_depth--;
+					// fall through to default emit
+				} else if (ctx->generic_paren_depth > 0) {
+					// _Generic association colon — not a label
+				} else if (last_emitted &&
+				           (is_identifier_like(last_emitted) || last_emitted->kind == TK_NUM) &&
+				           ctx->struct_depth == 0 && ctx->defer_depth > 0) {
+					emit_tok(tok);
+					tok = tok->next;
+					ctx->at_stmt_start = true;
+					continue;
+				}
 			}
 			// ':' that isn't a label — fall through to default emit
 		}
