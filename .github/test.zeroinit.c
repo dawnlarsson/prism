@@ -1367,7 +1367,45 @@ void test_zeroinit_parenthesized_array(void) {
 	CHECK(all_zero, "parenthesized array int (arr[5]) zero-init");
 }
 
+
+void test_typeof_register_vla_bug(void) {
+#ifdef __GNUC__
+	int n = 10;
+	register typeof(int[n]) val;
+	(void)sizeof(val);
+	CHECK(1, "register typeof VLA compilation fails");
+#endif
+}
+
+void test_atomic_register_struct_bug(void) {
+#if !defined(__TINYC__)
+	register _Atomic struct S_bug { int x, y; } s1;
+	(void)s1;
+	CHECK(1, "register _Atomic struct compilation fails");
+#endif
+}
+
+void test_const_typeof_vla_bug(void) {
+#ifdef __GNUC__
+	int n = 10;
+	int vla[n];
+	const typeof(vla) val;
+	(void)val;
+	CHECK(1, "const typeof VLA compilation fails");
+#endif
+}
+
+void test_const_typeof_atomic_struct_bug(void) {
+#if !defined(__TINYC__)
+	_Atomic struct S2_bug { int x, y; } s1;
+	const typeof(s1) s2;
+	(void)s1; (void)s2;
+	CHECK(1, "const typeof _Atomic struct compilation fails");
+#endif
+}
+
 void run_zeroinit_tests(void) {
+
 	printf("\n=== ZERO-INIT TESTS ===\n");
 
 	/* Basic zero-init */
@@ -1430,4 +1468,9 @@ void run_zeroinit_tests(void) {
 
 	test_zeroinit_parenthesized_declarator();
 	test_zeroinit_parenthesized_array();
+
+	test_typeof_register_vla_bug();
+	test_atomic_register_struct_bug();
+	test_const_typeof_vla_bug();
+	test_const_typeof_atomic_struct_bug();
 }

@@ -1825,7 +1825,22 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 					for (Token *t = tok->next; t && t != end; t = t->next) {
 						if (t->tag & TT_VOLATILE) r.has_volatile = true;
 						if (t->tag & TT_CONST) r.has_const = true;
+						// _Atomic is TT_QUALIFIER | TT_TYPE
+						if ((t->tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE))
+							r.has_atomic = true;
 					}
+				// Detect VLA inside typeof: array dimensions with runtime variables,
+				// or references to known VLA variables
+				for (Token *t = tok->next; t && t != end; t = t->next) {
+					if (equal(t, "[") && array_size_is_vla(t)) {
+						r.is_vla = true;
+						break;
+					}
+					if (is_identifier_like(t) && (typedef_flags(t) & TDF_VLA)) {
+						r.is_vla = true;
+						break;
+					}
+				}
 				tok = end;
 			}
 			r.end = tok;
@@ -2075,7 +2090,7 @@ static Token *handle_storage_raw(Token *storage_tok) {
 }
 
 // Emit zeroing for typeof/atomic/VLA variables (pure C99, no <string.h> needed)
-static void emit_typeof_memsets(Token **vars, int count, bool has_volatile) {
+static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool has_const) {
 	const char *vol = has_volatile ? "volatile " : "";
 	int vol_len = has_volatile ? 9 : 0;
 	for (int i = 0; i < count; i++) {
@@ -2084,15 +2099,27 @@ static void emit_typeof_memsets(Token **vars, int count, bool has_volatile) {
 		if (has_volatile) {
 			OUT_LIT(" { ");
 			out_str(vol, vol_len);
-			OUT_LIT("char *_p = (");
-			out_str(vol, vol_len);
-			OUT_LIT("char *)&");
+			// const typeof: cast through (void *) to drop const before volatile char *
+			if (has_const) {
+				OUT_LIT("char *_p = (");
+				out_str(vol, vol_len);
+				OUT_LIT("char *)(void *)&");
+			} else {
+				OUT_LIT("char *_p = (");
+				out_str(vol, vol_len);
+				OUT_LIT("char *)&");
+			}
 			out_str(vars[i]->loc, vars[i]->len);
 			OUT_LIT("; for (unsigned long _i = 0; _i < sizeof(");
 			out_str(vars[i]->loc, vars[i]->len);
 			OUT_LIT("); _i++) _p[_i] = 0; }");
 		} else {
-			OUT_LIT(" memset(&");
+			// const typeof: cast through (void *) to drop const qualifier.
+			// Safe during initialization before first read.
+			if (has_const)
+				OUT_LIT(" memset((void *)&");
+			else
+				OUT_LIT(" memset(&");
 			out_str(vars[i]->loc, vars[i]->len);
 			OUT_LIT(", 0, sizeof(");
 			out_str(vars[i]->loc, vars[i]->len);
@@ -2317,13 +2344,14 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		bool needs_memset = !decl.has_init && !is_raw && !decl.is_pointer && !type->has_register &&
 				    (type->has_typeof || (type->has_atomic && is_aggregate) || effective_vla);
 
-		// const typeof: memset would cast away const (UB). Downgrade to = {0} path.
-		if (needs_memset && (type->has_const || decl.is_const) && type->has_typeof)
-			needs_memset = false;
-
 		// Add zero initializer if needed (for non-memset types)
 		if (!decl.has_init && !effective_vla && !is_raw && !needs_memset) {
-			if (is_aggregate ||
+			// register + _Atomic aggregate: can't memset (register prevents &)
+			// and can't = {0} (Clang rejects _Atomic aggregate initializers).
+			// Skip zero-init entirely.
+			if (type->has_register && type->has_atomic && is_aggregate)
+				; // skip — no safe zero-init path
+			else if (is_aggregate ||
 			    type->has_typeof) // typeof: always use {0} (unknown underlying type)
 				OUT_LIT(" = {0}");
 			else
@@ -2422,7 +2450,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 									   stop_comma);
 
 					emit_typeof_memsets(
-					    typeof_vars, typeof_var_count, type->has_volatile);
+					    typeof_vars, typeof_var_count, type->has_volatile, type->has_const);
 					typeof_var_count = 0;
 
 					if (equal(tok, ";")) tok = tok->next;
@@ -2441,7 +2469,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 				out_char(';');
 
-				emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile);
+				emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile, type->has_const);
 				typeof_var_count = 0; // reset for remaining declarators
 
 				register_decl_shadows(decl.var_name, effective_vla);
@@ -2479,7 +2507,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 		if (equal(tok, ";")) {
 			emit_tok(tok);
-			emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile);
+			emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile, type->has_const);
 			ctx->active_typeof_vars = NULL;
 			return tok->next;
 		} else if (equal(tok, ",")) {
