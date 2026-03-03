@@ -52,6 +52,37 @@ static int failed = 0;
         }                                                                         \
     } while (0)
 
+static bool is_emulated(void)
+{
+#ifdef __linux__
+    // Environment variable override (set by CI or user)
+    if (getenv("PRISM_EMULATED"))
+        return true;
+
+    // On non-x86 architectures, check if /proc/cpuinfo contains x86-only
+    // fields, which indicates QEMU user-mode emulation via binfmt_misc.
+#if defined(__aarch64__) || defined(__arm__) || defined(__riscv) || \
+    defined(__s390x__) || defined(__mips__) || defined(__powerpc__)
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if (f)
+    {
+        char line[256];
+        while (fgets(line, sizeof(line), f))
+        {
+            if (strncmp(line, "vendor_id", 9) == 0 ||
+                strncmp(line, "model name", 10) == 0)
+            {
+                fclose(f);
+                return true;
+            }
+        }
+        fclose(f);
+    }
+#endif
+#endif
+    return false;
+}
+
 // Get current memory usage in KB (Linux-specific, returns 0 on other platforms)
 static long get_memory_usage_kb(void)
 {
@@ -315,12 +346,17 @@ static void test_memory_leak_stress(void)
     // Use fewer iterations when running under valgrind to avoid timeout
     int iterations = 100;
     bool under_valgrind = getenv("VALGRIND") || getenv("RUNNING_ON_VALGRIND");
+    bool under_emulation = is_emulated();
     if (under_valgrind)
     {
         iterations = 5;
         printf("  (Valgrind mode: reduced to %d iterations)\n", iterations);
         printf("  Note: Memory growth under valgrind is inflated by instrumentation.\n");
         printf("  Trust valgrind's leak report, not RSS growth.\n");
+    }
+    if (under_emulation)
+    {
+        printf("  (QEMU emulation detected: memory thresholds are informational only)\n");
     }
 
     // Verify the full pipeline works (preprocess + transpile via fork).
@@ -395,14 +431,27 @@ static void test_memory_leak_stress(void)
     printf("  Memory after %d iterations: %ld KB\n", iterations, final_mem);
     printf("  Memory growth: %ld KB\n", mem_growth);
 
-    // Allow some growth for internal caches, but flag excessive growth
-    // After warmup, should be minimal growth (< 1MB for 100 iterations)
-    // Under valgrind, memory reporting is unreliable due to instrumentation overhead
-    if (under_valgrind)
+    // Allow some growth for internal caches, but flag excessive growth.
+    // After warmup, should be minimal growth (< 1MB for 100 iterations).
+    //
+    // Under valgrind or QEMU emulation, RSS measurement is unreliable:
+    //   - Valgrind: instrumentation overhead inflates RSS
+    //   - QEMU: TCG JIT translation caches, host page accounting, and
+    //     emulation overhead cause RSS to grow unpredictably
+    // In both cases the memory test is informational only — we still run
+    // it (to catch crashes/correctness issues) but don't fail on growth.
+    bool mem_unreliable = under_valgrind || under_emulation;
+
+    if (mem_unreliable)
     {
-        // Under valgrind, trust valgrind's leak report, not RSS growth
+        if (under_valgrind)
+            printf("[PASS] memory test (valgrind mode - check leak summary above)\n");
+        else
+            printf("[PASS] memory test (emulation mode - RSS is unreliable under QEMU)\n");
+        if (mem_growth >= 1024)
+            printf("  [info] RSS grew %ld KB — expected under %s\n",
+                   mem_growth, under_valgrind ? "valgrind" : "QEMU emulation");
         passed++;
-        printf("[PASS] memory test (valgrind mode - check leak summary above)\n");
     }
     else if (mem_growth < 1024)
     {
