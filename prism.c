@@ -1950,7 +1950,7 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 			peek = peek->next;
 			if (peek && equal(peek, "(")) peek = skip_balanced(peek, '(', ')');
 		}
-		if (!equal(peek, "*") && !equal(peek, "(")) {
+		if (!equal(peek, "*") && !equal(peek, "(") && !is_valid_varname(peek)) {
 			r.end = NULL;
 			return r;
 		}
@@ -1958,7 +1958,6 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 		decl_emit(tok, emit);
 		tok = tok->next;
 		nested_paren = 1;
-		r.is_pointer = true;
 		r.has_paren = true;
 
 		// Handle nesting: (*(*(*name)...

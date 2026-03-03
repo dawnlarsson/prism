@@ -1354,6 +1354,19 @@ void test_inline_enum_const_array_size(void) {
 	CHECK_EQ((int)tag, 0, "inline enum var itself is zero-initialized");
 }
 
+void test_zeroinit_parenthesized_declarator(void) {
+	int (x);
+	CHECK_EQ(x, 0, "parenthesized declarator int (x) zero-init");
+}
+
+void test_zeroinit_parenthesized_array(void) {
+	int (arr[5]);
+	int all_zero = 1;
+	for (int i = 0; i < 5; i++)
+		if (arr[i] != 0) all_zero = 0;
+	CHECK(all_zero, "parenthesized array int (arr[5]) zero-init");
+}
+
 void run_zeroinit_tests(void) {
 	printf("\n=== ZERO-INIT TESTS ===\n");
 
@@ -1414,4 +1427,7 @@ void run_zeroinit_tests(void) {
 	test_ternary_bare_expr_in_defer();
 	test_nested_ternary_zeroinit();
 	test_inline_enum_const_array_size();
+
+	test_zeroinit_parenthesized_declarator();
+	test_zeroinit_parenthesized_array();
 }
