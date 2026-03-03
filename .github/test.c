@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <sys/resource.h>
 
 static char log_buffer[1024];
 static int log_pos = 0;
@@ -67,6 +68,60 @@ static void log_append(const char *s) {
 		}                                                                                            \
 	} while (0)
 
+static char *create_temp_file(const char *content) {
+	char *path = malloc(64);
+	snprintf(path, 64, "/tmp/prism_test_XXXXXX.c");
+	int fd = mkstemps(path, 2);
+	if (fd < 0) {
+		free(path);
+		return NULL;
+	}
+	write(fd, content, strlen(content));
+	close(fd);
+	return path;
+}
+
+static long get_memory_usage_kb(void) {
+#ifdef __linux__
+	FILE *f = fopen("/proc/self/status", "r");
+	if (!f) return 0;
+	char line[256];
+	long vmrss = 0;
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, "VmRSS:", 6) == 0) {
+			sscanf(line + 6, "%ld", &vmrss);
+			break;
+		}
+	}
+	fclose(f);
+	return vmrss;
+#else
+	return 0;
+#endif
+}
+
+static bool is_emulated(void) {
+#ifdef __linux__
+	if (getenv("PRISM_EMULATED")) return true;
+#if defined(__aarch64__) || defined(__arm__) || defined(__riscv) || \
+    defined(__s390x__) || defined(__mips__) || defined(__powerpc__)
+	FILE *f = fopen("/proc/cpuinfo", "r");
+	if (f) {
+		char line[256];
+		while (fgets(line, sizeof(line), f)) {
+			if (strncmp(line, "vendor_id", 9) == 0 ||
+			    strncmp(line, "model name", 10) == 0) {
+				fclose(f);
+				return true;
+			}
+		}
+		fclose(f);
+	}
+#endif
+#endif
+	return false;
+}
+
 
 #include "test.safe.c"
 #include "test.raw.c"
@@ -75,7 +130,7 @@ static void log_append(const char *s) {
 #include "test.orelse.c"
 #include "test.zeroinit.c"
 #include "test.harsh.c"
-#include "test.library.c"
+#include "test.api.c"
 
 int main(void) {
 	printf("=== PRISM TEST SUITE ===\n");
@@ -87,7 +142,7 @@ int main(void) {
 	run_parse_tests();
 	run_orelse_tests();
 	run_harsh_review_tests();
-	run_library_tests();
+	run_api_tests();
 
 	printf("\n========================================\n");
 	printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

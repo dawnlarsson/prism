@@ -1,60 +1,3 @@
-#include <sys/resource.h>
-
-static bool is_emulated(void) {
-#ifdef __linux__
-	if (getenv("PRISM_EMULATED")) return true;
-#if defined(__aarch64__) || defined(__arm__) || defined(__riscv) || \
-    defined(__s390x__) || defined(__mips__) || defined(__powerpc__)
-	FILE *f = fopen("/proc/cpuinfo", "r");
-	if (f) {
-		char line[256];
-		while (fgets(line, sizeof(line), f)) {
-			if (strncmp(line, "vendor_id", 9) == 0 ||
-			    strncmp(line, "model name", 10) == 0) {
-				fclose(f);
-				return true;
-			}
-		}
-		fclose(f);
-	}
-#endif
-#endif
-	return false;
-}
-
-static long get_memory_usage_kb(void) {
-#ifdef __linux__
-	FILE *f = fopen("/proc/self/status", "r");
-	if (!f) return 0;
-	char line[256];
-	long vmrss = 0;
-	while (fgets(line, sizeof(line), f)) {
-		if (strncmp(line, "VmRSS:", 6) == 0) {
-			sscanf(line + 6, "%ld", &vmrss);
-			break;
-		}
-	}
-	fclose(f);
-	return vmrss;
-#else
-	return 0;
-#endif
-}
-
-static char *create_temp_file(const char *content) {
-	char *path = malloc(64);
-	snprintf(path, 64, "/tmp/prism_test_XXXXXX.c");
-	int fd = mkstemps(path, 2);
-	if (fd < 0) {
-		free(path);
-		return NULL;
-	}
-	write(fd, content, strlen(content));
-	close(fd);
-	return path;
-}
-
-// --- Basic Transpile ---
 
 static void test_basic_transpile(void) {
 	printf("\n--- Basic Transpile Tests ---\n");
@@ -91,8 +34,6 @@ static void test_basic_transpile(void) {
 	free(path);
 }
 
-// --- Defer Transpile ---
-
 static void test_defer_transpile(void) {
 	printf("\n--- Defer Transpile Tests ---\n");
 
@@ -120,8 +61,6 @@ static void test_defer_transpile(void) {
 	unlink(path);
 	free(path);
 }
-
-// --- Feature Flags ---
 
 static void test_feature_flags(void) {
 	printf("\n--- Feature Flag Tests ---\n");
@@ -179,8 +118,6 @@ static void test_feature_flags(void) {
 	free(path);
 }
 
-// --- Error Handling ---
-
 static void test_error_handling(void) {
 	printf("\n--- Error Handling Tests ---\n");
 
@@ -193,8 +130,6 @@ static void test_error_handling(void) {
 	prism_free(&result);
 	CHECK(result.output == NULL, "cleanup after error");
 }
-
-// --- Sequential Transpilations ---
 
 static void test_sequential_transpilations(void) {
 	printf("\n--- Sequential Transpilation Tests ---\n");
@@ -224,8 +159,6 @@ static void test_sequential_transpilations(void) {
 		free(path);
 	}
 }
-
-// --- Memory Leak Stress ---
 
 static void test_memory_leak_stress(void) {
 	printf("\n--- Memory Leak Stress Test ---\n");
@@ -323,6 +256,7 @@ static void test_memory_leak_stress(void) {
 
 	bool mem_unreliable = under_valgrind || under_emulation;
 
+	total++;
 	if (mem_unreliable) {
 		if (under_valgrind)
 			printf("[PASS] memory test (valgrind mode - check leak summary above)\n");
@@ -348,10 +282,9 @@ static void test_memory_leak_stress(void) {
 	}
 
 	passed++;
+	total++;
 	printf("[PASS] completed %d stress iterations\n", iterations);
 }
-
-// --- Unicode/Digraph Lib ---
 
 static void test_unicode_digraph_lib(void) {
 	printf("\n--- Unicode/Digraph Lib Tests ---\n");
@@ -399,8 +332,6 @@ static void test_unicode_digraph_lib(void) {
 	unlink(path);
 	free(path);
 }
-
-// --- Complex Code ---
 
 static void test_complex_code(void) {
 	printf("\n--- Complex Code Test ---\n");
@@ -458,8 +389,6 @@ static void test_complex_code(void) {
 	free(path);
 }
 
-// --- Defaults ---
-
 static void test_lib_defaults(void) {
 	printf("\n--- Defaults Test ---\n");
 
@@ -471,8 +400,6 @@ static void test_lib_defaults(void) {
 	CHECK(features.warn_safety == false, "default warn_safety=false");
 	CHECK(features.flatten_headers == true, "default flatten_headers=true");
 }
-
-// --- Double-Free Protection ---
 
 static void test_double_free_protection(void) {
 	printf("\n--- Double-Free Protection Test ---\n");
@@ -493,13 +420,12 @@ static void test_double_free_protection(void) {
 	CHECK(result.output == NULL, "second free safe");
 
 	passed++;
+	total++;
 	printf("[PASS] double prism_free() is safe\n");
 
 	unlink(path);
 	free(path);
 }
-
-// --- Repeated Reset ---
 
 static void test_repeated_reset(void) {
 	printf("\n--- Repeated Reset Test ---\n");
@@ -542,8 +468,6 @@ static void test_repeated_reset(void) {
 	unlink(path);
 	free(path);
 }
-
-// --- Error Recovery ---
 
 static void test_error_recovery_no_exit(void) {
 	printf("\n--- Error Recovery Tests (no exit) ---\n");
@@ -609,8 +533,6 @@ static void test_error_recovery_no_exit(void) {
 		free(path3);
 	}
 }
-
-// --- Defer Break/Continue Rejection ---
 
 static void test_lib_defer_break_continue_rejected(void) {
 	printf("\n--- Defer Break/Continue Rejection Tests ---\n");
@@ -828,8 +750,6 @@ static void test_lib_defer_break_continue_rejected(void) {
 	}
 }
 
-// --- Array Orelse Rejection ---
-
 static void test_lib_array_orelse_rejected(void) {
 	printf("\n--- Array Orelse Rejection Tests ---\n");
 
@@ -892,8 +812,6 @@ static void test_lib_array_orelse_rejected(void) {
 		free(path);
 	}
 }
-
-// --- Deep Struct Nesting Walker ---
 
 static void test_deep_struct_nesting_walker(void) {
 	printf("\n--- Deep Struct Nesting Walker Tests ---\n");
@@ -972,8 +890,6 @@ static void test_deep_struct_nesting_walker(void) {
 	}
 }
 
-// --- C23 Attribute Void Function ---
-
 static void test_lib_c23_attr_void_function(void) {
 	printf("\n--- C23 Attribute Void Function Tests ---\n");
 
@@ -1019,8 +935,6 @@ static void test_lib_c23_attr_void_function(void) {
 	}
 }
 
-// --- _Generic Array Not VLA ---
-
 static void test_lib_generic_array_not_vla(void) {
 	printf("\n--- _Generic Array Not VLA Tests ---\n");
 
@@ -1047,8 +961,6 @@ static void test_lib_generic_array_not_vla(void) {
 		free(path);
 	}
 }
-
-// --- Function Pointer Return Type Capture ---
 
 static void test_fnptr_return_type_capture(void) {
 	printf("\n--- Function Pointer Return Type Capture Tests ---\n");
@@ -1119,8 +1031,6 @@ static void test_fnptr_return_type_capture(void) {
 	}
 }
 
-// --- Line Directive Escaped Quote ---
-
 static void test_line_directive_escaped_quote(void) {
 	printf("\n--- Line Directive Escaped Quote Tests ---\n");
 
@@ -1148,10 +1058,8 @@ static void test_line_directive_escaped_quote(void) {
 	}
 }
 
-// --- Entry point ---
-
-void run_library_tests(void) {
-	printf("\n=== LIBRARY TESTS ===\n");
+void run_api_tests(void) {
+	printf("\n=== API TESTS ===\n");
 
 	test_lib_defaults();
 	test_basic_transpile();
@@ -1172,6 +1080,5 @@ void run_library_tests(void) {
 	test_fnptr_return_type_capture();
 	test_line_directive_escaped_quote();
 
-	/* Memory stress test last (heaviest) */
 	test_memory_leak_stress();
 }

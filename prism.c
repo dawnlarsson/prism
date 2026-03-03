@@ -412,7 +412,16 @@ static Token *find_boundary_comma(Token *tok) {
 	for (int depth = 0; tok->kind != TK_EOF; tok = tok->next) {
 		if (tok->flags & TF_OPEN) depth++;
 		else if (tok->flags & TF_CLOSE) depth--;
-		else if (depth == 0 && match_ch(tok, ',')) return tok;
+		else if (depth == 0 && match_ch(tok, ',')) {
+			// Verify following token can start a declarator (*, (, qualifier, or identifier).
+			// If not, this is a comma operator, not a declarator separator.
+			Token *n = tok->next;
+			if (n && (match_ch(n, '*') || match_ch(n, '(') ||
+				  (n->tag & TT_QUALIFIER) ||
+				  (is_valid_varname(n) && !(n->tag & (TT_TYPE | TT_SUE | TT_TYPEOF)))))
+				return tok;
+			// else: comma operator — continue searching
+		}
 		else if (depth == 0 && match_ch(tok, ';')) return NULL;
 	}
 	return NULL;
@@ -1240,6 +1249,28 @@ static int forward_goto_scope_exits(Token *after_goto_label, char *label_name, i
 		prev = t;
 	}
 	return 0; // label not found (backward goto or end of function)
+}
+
+// Check if a backward goto (label before goto) requires exiting scopes.
+// Scans from the label token forward to goto_tok, tracking brace depth.
+// Returns the number of scope levels the path dips below the starting depth.
+static int backward_goto_scope_exits(Token *goto_tok, char *label_name, int label_len) {
+	for (int i = 0; i < label_table.count; i++) {
+		LabelInfo *info = &label_table.labels[i];
+		if (info->name_len == label_len && !memcmp(info->name, label_name, label_len)) {
+			// Only process backward gotos (label before goto in source)
+			if (info->tok->loc >= goto_tok->loc) return 0;
+			int depth = 0, min_depth = 0;
+			for (Token *t = info->tok; t && t != goto_tok && t->kind != TK_EOF; t = t->next) {
+				if (match_ch(t, '{')) depth++;
+				else if (match_ch(t, '}')) {
+					if (--depth < min_depth) min_depth = depth;
+				}
+			}
+			return -min_depth;
+		}
+	}
+	return 0;
 }
 
 // Check if a forward goto would skip over defer statements or variable declarations.
@@ -2136,17 +2167,21 @@ static void register_param_shadows(Token *open_paren, Token *close_paren) {
 	if (!open_paren || !close_paren) return;
 	Token *last_ident = NULL;
 	int depth = 0;
+	bool had_close_depth0 = false; // Tracks if we returned from a paren group to depth 0
 	for (Token *t = open_paren->next; t && t != close_paren && t->kind != TK_EOF; t = t->next) {
 		if (t->flags & TF_OPEN) depth++;
-		else if (t->flags & TF_CLOSE)
+		else if (t->flags & TF_CLOSE) {
 			depth--;
-		else if (depth == 0 && is_valid_varname(t) &&
+			if (depth == 0) had_close_depth0 = true;
+		}
+		else if ((depth == 0 || (depth > 0 && !had_close_depth0)) && is_valid_varname(t) &&
 			 !(t->tag & (TT_QUALIFIER | TT_TYPE | TT_SUE | TT_TYPEOF | TT_ATTR)))
 			last_ident = t;
 		if (depth == 0 && (equal(t, ",") || t->next == close_paren)) {
 			if (last_ident && (is_known_typedef(last_ident) || is_typedef_heuristic(last_ident)))
 				typedef_add_shadow(last_ident->loc, last_ident->len, 1);
 			last_ident = NULL;
+			had_close_depth0 = false;
 		}
 	}
 	// Handle last parameter (if close_paren was hit without trailing comma)
@@ -3163,7 +3198,7 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
 		if (tok->flags & TF_OPEN) fdepth++;
 		else if (tok->flags & TF_CLOSE)
 			fdepth--;
-		else if (fdepth == 0 && (equal(tok, ";") || (stop_comma && tok == stop_comma) || equal(tok, ",")))
+		else if (fdepth == 0 && (equal(tok, ";") || (stop_comma && tok == stop_comma)))
 			break;
 		// Chained orelse: "x = a orelse b orelse c" → close this assignment,
 		// then recursively handle the next orelse on the same variable.
@@ -3255,6 +3290,7 @@ static Token *handle_goto_keyword(Token *tok) {
 			if (skip.skipped_decl) report_goto_skips_decl(skip.skipped_decl, tok);
 
 			int target_depth = label_table_lookup(tok->loc, tok->len);
+			bool label_found = (target_depth >= 0);
 			if (target_depth < 0) target_depth = ctx->defer_depth;
 
 			// Sibling scope fix: if goto exits its current scope to reach a
@@ -3265,6 +3301,13 @@ static Token *handle_goto_keyword(Token *tok) {
 				if (exits > 0) {
 					target_depth = ctx->defer_depth - exits;
 					if (target_depth < 0) target_depth = 0;
+				} else if (label_found) {
+					// Backward goto to sibling scope
+					exits = backward_goto_scope_exits(goto_tok, tok->loc, tok->len);
+					if (exits > 0) {
+						target_depth = ctx->defer_depth - exits;
+						if (target_depth < 0) target_depth = 0;
+					}
 				}
 			}
 

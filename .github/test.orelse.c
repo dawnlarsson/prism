@@ -1117,6 +1117,35 @@ void test_orelse_braceless_else_decl(void) {
 	CHECK_EQ(_braceless_else_decl_helper(0, NULL), -1, "braceless else decl: cond=0 null triggers");
 }
 
+static void test_orelse_comma_decl_fallback(void) {
+	printf("\n--- Orelse Comma Decl Fallback ---\n");
+
+	const char *code =
+	    "int get_val(void) { return 0; }\n"
+	    "int log_err(void) { return -99; }\n"
+	    "void f(void) {\n"
+	    "    int x = get_val() orelse log_err(), -1;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "orelse comma decl: create temp file");
+
+	PrismResult r = prism_transpile_file(path, prism_defaults());
+
+	if (r.status == PRISM_OK && r.output) {
+		char *first = strstr(r.output, "int x =");
+		char *second = first ? strstr(first + 7, "int x =") : NULL;
+		bool garbled = (second != NULL) || (strstr(r.output, "log_err();") != NULL);
+		CHECK(!garbled, "orelse comma decl: fallback not split by comma");
+	} else {
+		CHECK(r.status == PRISM_OK, "orelse comma decl: transpiles without error");
+	}
+
+	prism_free(&r);
+	unlink(path);
+	free(path);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -1208,4 +1237,6 @@ void run_orelse_tests(void) {
 	test_orelse_bare_assign_fallback_val();
 	test_orelse_braceless_else_bare();
 	test_orelse_braceless_else_decl();
+
+	test_orelse_comma_decl_fallback();
 }

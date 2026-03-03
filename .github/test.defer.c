@@ -1373,10 +1373,9 @@ static int _defer_sibling_goto_helper(void) {
 
 void test_defer_sibling_goto_bug(void) {
 	int val = _defer_sibling_goto_helper();
-	CHECK_EQ(val, 10, "BUG: goto to sibling block must emit source block defer");
+	CHECK_EQ(val, 10, "goto to sibling block emits source block defer");
 }
 
-// Same bug but with multiple defers in the source block
 static int _defer_sibling_goto_multi_helper(void) {
 	int counter = 0;
 	{
@@ -1393,10 +1392,9 @@ static int _defer_sibling_goto_multi_helper(void) {
 
 void test_defer_sibling_goto_multi_bug(void) {
 	int val = _defer_sibling_goto_multi_helper();
-	CHECK_EQ(val, 111, "BUG: goto to sibling block must emit all source defers (LIFO)");
+	CHECK_EQ(val, 111, "goto to sibling block emits all source defers (LIFO)");
 }
 
-// Same bug with log_append to verify LIFO order
 void test_defer_sibling_goto_lifo_bug(void) {
 	log_reset();
 	{
@@ -1410,7 +1408,25 @@ void test_defer_sibling_goto_lifo_bug(void) {
 	sib:
 		log_append("2");
 	}
-	CHECK_LOG("1ABC2", "BUG: goto to sibling block defers fire in LIFO order");
+	CHECK_LOG("1ABC2", "goto to sibling block defers fire in LIFO order");
+}
+
+void test_defer_backward_goto_sibling(void) {
+	log_reset();
+	int visited = 0;
+	{
+	back_sib_target:
+		log_append("T");
+		if (visited) goto back_sib_done;
+	}
+	{
+		defer log_append("D");
+		visited = 1;
+		goto back_sib_target;
+	}
+back_sib_done:
+	log_append("E");
+	CHECK_LOG("TDTE", "backward goto to sibling scope fires defer");
 }
 
 void test_defer_goto_forward(void) {
@@ -1444,7 +1460,6 @@ void test_defer_goto_into_scope(void) {
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
 
-	/* Basic defer */
 	test_defer_basic();
 	test_defer_lifo();
 	log_reset();
@@ -1471,7 +1486,6 @@ void run_defer_tests(void) {
 	test_defer_only_body();
 	CHECK_LOG("D", "defer-only function body");
 
-	/* Advanced defer */
 	global_val = 0;
 	ret = test_return_side_effect();
 	CHECK_EQ(ret, 0, "return side effect - return value");
@@ -1494,21 +1508,18 @@ void run_defer_tests(void) {
 #endif
 	test_void_return_void0_defer();
 
-	/* Switch fallthrough + defer */
 	test_switch_fallthrough_no_braces();
 	test_switch_break_from_nested_block();
 	test_switch_goto_out_of_case();
 	test_switch_multiple_defers_per_case();
 	test_switch_nested_switch_defer();
 
-	/* Complex break/continue nesting */
 	test_break_continue_nested_3_levels();
 	test_continue_in_while_with_defer();
 	test_break_in_do_while_with_defer();
 	test_switch_inside_loop_continue();
 	test_loop_inside_switch_break();
 
-	/* Switch + defer bulletproof */
 	test_switch_sequential_no_leak();
 	test_switch_case_group_defer();
 	test_switch_case_group_fallthrough();
@@ -1538,11 +1549,12 @@ void run_defer_tests(void) {
 	test_switch_loop_switch();
 	test_triple_nested_switch_return();
 
-	/* Defer sibling goto bug tests */
 	test_defer_sibling_goto_bug();
 	test_defer_sibling_goto_multi_bug();
 	test_defer_sibling_goto_lifo_bug();
 
 	test_defer_goto_forward();
 	test_defer_goto_into_scope();
+
+	test_defer_backward_goto_sibling();
 }

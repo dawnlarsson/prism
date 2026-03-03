@@ -6169,6 +6169,35 @@ static void test_void_parenthesized_func_defer(void) {
 	CHECK_EQ(_paren_void_flag, 11, "void (func)(): defer fires correctly");
 }
 
+static void test_paren_param_typedef_shadow(void) {
+	printf("\n--- Parenthesized Param Typedef Shadow ---\n");
+
+	const char *code =
+	    "typedef int T;\n"
+	    "void f(int (T)) {\n"
+	    "    T x;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "paren param typedef shadow: create temp file");
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_file(path, feat);
+
+	if (r.status == PRISM_OK && r.output) {
+		bool has_zeroinit = (strstr(r.output, "T x = 0") != NULL ||
+				     strstr(r.output, "T x ={0}") != NULL ||
+				     strstr(r.output, "T x = {0}") != NULL);
+		CHECK(!has_zeroinit, "paren param typedef shadow: T shadowed by param, no zero-init");
+	} else {
+		CHECK(0, "paren param typedef shadow: transpilation failed");
+	}
+
+	prism_free(&r);
+	unlink(path);
+	free(path);
+}
+
 void run_parse_tests(void) {
 	printf("\n=== PARSE TESTS ===\n");
 
@@ -6574,4 +6603,6 @@ void run_parse_tests(void) {
 	test_bug_r1_readonly_dir();
 	test_bug_r3_line_directive();
 	test_void_parenthesized_func_defer();
+
+	test_paren_param_typedef_shadow();
 }
