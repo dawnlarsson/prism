@@ -289,6 +289,7 @@ static void typedef_pop_scope(int scope_depth);
 static TypeSpecResult parse_type_specifier(Token *tok);
 static Token *emit_expr_to_semicolon(Token *tok);
 static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma);
+static Token *emit_return_body(Token *tok);
 static Token *try_zero_init_decl(Token *tok);
 static Token *skip_pragma_operators(Token *tok);
 static inline void out_char(char c);
@@ -2194,7 +2195,48 @@ static Token *handle_const_orelse_fallback(Token *tok,
 
 	// Emit fallback assignment(s): "if (!_prism_oe_N) _prism_oe_N = (fallback);"
 	// Handles chained orelse by looping: each 'orelse' adds another if-assignment.
+	// When the last chain link is control flow (return/break/continue/goto),
+	// emit it as a block instead of an invalid assignment.
 	for (;;) {
+		// Check if this link is a control flow action (not a fallback value)
+		if (tok->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) {
+			OUT_LIT(" if (!_prism_oe_");
+			out_uint(oe_id);
+			OUT_LIT(") {");
+			if (tok->tag & TT_RETURN) {
+				mark_switch_control_exit();
+				tok = tok->next;
+				tok = emit_return_body(tok);
+			} else if (tok->tag & (TT_BREAK | TT_CONTINUE)) {
+				bool is_break = tok->tag & TT_BREAK;
+				mark_switch_control_exit();
+				if (FEAT(F_DEFER) && control_flow_has_defers(is_break))
+					emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
+				out_char(' ');
+				out_str(tok->loc, tok->len);
+				out_char(';');
+				tok = tok->next;
+				if (equal(tok, ";")) tok = tok->next;
+			} else if (tok->tag & TT_GOTO) {
+				mark_switch_control_exit();
+				tok = tok->next;
+				if (FEAT(F_DEFER) && is_identifier_like(tok)) {
+					int td = label_table_lookup(tok->loc, tok->len);
+					if (td < 0) td = ctx->defer_depth;
+					if (goto_has_defers(td)) emit_goto_defers(td);
+				}
+				OUT_LIT(" goto ");
+				if (is_identifier_like(tok)) {
+					out_str(tok->loc, tok->len);
+					tok = tok->next;
+				}
+				out_char(';');
+				if (equal(tok, ";")) tok = tok->next;
+			}
+			OUT_LIT(" }");
+			break;
+		}
+
 		OUT_LIT(" if (!_prism_oe_");
 		out_uint(oe_id);
 		OUT_LIT(") _prism_oe_");
@@ -2607,10 +2649,18 @@ static Token *try_zero_init_decl(Token *tok) {
 	// rollback is always safe.
 	out_flush();
 	oe_buf_checkpoint = out_buf_pos;
+
+	// Braceless control body (e.g. "else int *x = p orelse return -1;"): wrap
+	// in braces because orelse expands to multiple statements. The open brace
+	// is inside the speculative buffer so it rolls back cleanly on failure.
+	bool brace_wrap = ctrl.pending && ctrl.parens_just_closed;
+	if (brace_wrap) OUT_LIT(" {");
+
 	if (pragma_start != start) emit_range(pragma_start, start);
 	emit_range(start, type.end);
 
 	Token *result = process_declarators(type.end, &type, is_raw, start);
+	if (result && brace_wrap) OUT_LIT(" }");
 	if (!result && oe_buf_checkpoint >= 0) {
 		// Rollback all emitted output (type specifier + partial declarator)
 		// so the caller's main loop can re-emit the original tokens.
@@ -3737,6 +3787,23 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					// Wrap in braces to prevent C's dangling-else from
 					// binding an outer else to orelse's generated if.
 					OUT_LIT(" {");
+
+					// For bare assign fallback (x = p orelse fb;), find the
+					// assignment target so we can re-emit it for the fallback.
+					Token *bare_lhs_start = tok;
+					Token *bare_assign_eq = NULL;
+					{
+						int sd = 0;
+						for (Token *s = tok; s != orelse_tok; s = s->next) {
+							if (s->flags & TF_OPEN) sd++;
+							else if (s->flags & TF_CLOSE) sd--;
+							else if (sd == 0 && equal(s, "=")) {
+								bare_assign_eq = s;
+								break;
+							}
+						}
+					}
+
 					OUT_LIT(" if (!(");
 					while (tok != orelse_tok) {
 						emit_tok(tok);
@@ -3747,6 +3814,30 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 					if (equal(tok, ";"))
 						error_tok(tok, "expected statement after 'orelse'");
+
+					// Bare assign with fallback value: re-emit LHS = fallback;
+					bool is_bare_fallback = bare_assign_eq &&
+						!(tok->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
+						!equal(tok, "{") && !equal(tok, ";");
+					if (is_bare_fallback) {
+						out_char(' ');
+						for (Token *t = bare_lhs_start; t != bare_assign_eq; t = t->next)
+							emit_tok(t);
+						OUT_LIT(" =");
+						int fd = 0;
+						while (tok->kind != TK_EOF) {
+							if (tok->flags & TF_OPEN) fd++;
+							else if (tok->flags & TF_CLOSE) fd--;
+							else if (fd == 0 && equal(tok, ";")) break;
+							emit_tok(tok);
+							tok = tok->next;
+						}
+						out_char(';');
+						if (equal(tok, ";")) tok = tok->next;
+						OUT_LIT(" }");
+						end_statement_after_semicolon();
+						continue;
+					}
 
 					bool is_block_action = equal(tok, "{");
 					tok = emit_orelse_action(tok, NULL, false, NULL);
@@ -3832,7 +3923,10 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 			if (tag & TT_IF) {
 				ctrl.pending = true;
-				if (equal(tok, "else")) ctrl.parens_just_closed = true;
+				if (equal(tok, "else")) {
+					ctrl.parens_just_closed = true;
+					ctx->at_stmt_start = true;
+				}
 			}
 
 			// Case/default label handling
