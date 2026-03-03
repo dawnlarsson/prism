@@ -6198,6 +6198,19 @@ static void test_paren_param_typedef_shadow(void) {
 	free(path);
 }
 
+typedef int _epf_inner_param;
+
+static void _epf_func(int ((*func_ptr)(int _epf_inner_param))) {
+	// If the transpiler incorrectly shadows _epf_inner_param due to the
+	// extra-parenthesized function pointer, x won't be zero-initialized.
+	_epf_inner_param x;
+	CHECK_EQ(x, 0, "extra-paren funcptr shadow: typedef not falsely shadowed");
+}
+
+static void test_extra_paren_funcptr_shadow(void) {
+	_epf_func(NULL);
+}
+
 void run_parse_tests(void) {
 	printf("\n=== PARSE TESTS ===\n");
 
@@ -6605,4 +6618,5 @@ void run_parse_tests(void) {
 	test_void_parenthesized_func_defer();
 
 	test_paren_param_typedef_shadow();
+	test_extra_paren_funcptr_shadow();
 }

@@ -1058,6 +1058,32 @@ static void test_line_directive_escaped_quote(void) {
 	}
 }
 
+static void test_cross_compile_msvc_ret_type(void) {
+	printf("\n--- Cross-Compile MSVC Ret Type ---\n");
+
+	// Anonymous struct return with defer forces the ret type fallback path.
+	// When compiler is "cl", output must use "void *" instead of __auto_type.
+	const char *code =
+	    "struct { int x; } make(void) {\n"
+	    "    struct { int x; } s;\n"
+	    "    s.x = 1;\n"
+	    "    defer (void)0;\n"
+	    "    return s;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	feat.compiler = "cl";
+	PrismResult r = prism_transpile_source(code, "cross_msvc.c", feat);
+	CHECK(r.status == PRISM_OK, "cross-compile msvc: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "__auto_type") == NULL,
+		      "cross-compile msvc: no __auto_type emitted");
+		CHECK(strstr(r.output, "void *") != NULL,
+		      "cross-compile msvc: uses void * for ret type");
+	}
+	prism_free(&r);
+}
+
 void run_api_tests(void) {
 	printf("\n=== API TESTS ===\n");
 
@@ -1079,6 +1105,7 @@ void run_api_tests(void) {
 	test_lib_generic_array_not_vla();
 	test_fnptr_return_type_capture();
 	test_line_directive_escaped_quote();
+	test_cross_compile_msvc_ret_type();
 
 	test_memory_leak_stress();
 }

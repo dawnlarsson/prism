@@ -1404,6 +1404,19 @@ void test_const_typeof_atomic_struct_bug(void) {
 #endif
 }
 
+static void test_sizeof_unparenthesized_not_vla(void) {
+	// sizeof without parentheses should not trigger VLA detection.
+	// If it does, the transpiler emits memset instead of = {0}.
+	int my_var;
+	int arr[sizeof my_var];
+	int all_zero = 1;
+	for (unsigned i = 0; i < sizeof my_var / sizeof(int); i++)
+		if (arr[i] != 0) all_zero = 0;
+	CHECK(all_zero, "sizeof unparenthesized: array zero-initialized");
+	CHECK(sizeof(arr) == sizeof(int) * sizeof my_var,
+	      "sizeof unparenthesized: correct size");
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -1473,4 +1486,6 @@ void run_zeroinit_tests(void) {
 	test_atomic_register_struct_bug();
 	test_const_typeof_vla_bug();
 	test_const_typeof_atomic_struct_bug();
+
+	test_sizeof_unparenthesized_not_vla();
 }

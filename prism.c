@@ -297,6 +297,7 @@ static inline void out_str(const char *s, int len);
 static Token *skip_balanced(Token *tok, char open, char close);
 static Token *skip_gnu_attributes(Token *tok);
 static Token *skip_c23_attr(Token *tok);
+static bool cc_is_msvc(const char *cc);
 
 // Emit space-separated token range [start, end). First token has no leading space.
 static inline void emit_token_range(Token *start, Token *end) {
@@ -1604,11 +1605,10 @@ static void emit_ret_type(void) {
 			emit_token_range(ctx->func_ret_type_start, ctx->func_ret_type_end);
 		}
 	} else {
-#ifdef _WIN32
-		OUT_LIT("void *");
-#else
-		OUT_LIT("__auto_type");
-#endif
+		if (cc_is_msvc(ctx->extra_compiler))
+			OUT_LIT("void *");
+		else
+			OUT_LIT("__auto_type");
 	}
 }
 
@@ -1648,6 +1648,25 @@ static bool array_size_is_vla(Token *open_bracket) {
 					}
 				}
 				tok = end; // Used safely for both sizeof and alignof!
+			} else if (tok && !equal(tok, "]")) {
+				// Unparenthesized sizeof/alignof: e.g. "sizeof x", "sizeof *p"
+				// Skip prefix unary operators
+				while (tok && !equal(tok, "]") &&
+				       (equal(tok, "*") || equal(tok, "&") || equal(tok, "!") ||
+				        equal(tok, "~") || equal(tok, "++") || equal(tok, "--")))
+					tok = tok->next;
+				// Skip primary token
+				if (tok && !equal(tok, "]")) tok = tok->next;
+				// Skip postfix: .member, ->member, [subscript]
+				while (tok && !equal(tok, "]")) {
+					if (equal(tok, ".") || equal(tok, "->")) {
+						tok = tok->next;
+						if (tok && !equal(tok, "]")) tok = tok->next;
+					} else if (equal(tok, "[")) {
+						tok = skip_balanced(tok, '[', ']');
+					} else
+						break;
+				}
 			}
 			continue;
 		}
@@ -2167,21 +2186,25 @@ static void register_param_shadows(Token *open_paren, Token *close_paren) {
 	if (!open_paren || !close_paren) return;
 	Token *last_ident = NULL;
 	int depth = 0;
-	bool had_close_depth0 = false; // Tracks if we returned from a paren group to depth 0
+	int ident_depth = -1;              // depth where last_ident was captured
+	bool seen_close_after_ident = false; // ')' closed back to ident_depth or shallower
 	for (Token *t = open_paren->next; t && t != close_paren && t->kind != TK_EOF; t = t->next) {
 		if (t->flags & TF_OPEN) depth++;
 		else if (t->flags & TF_CLOSE) {
 			depth--;
-			if (depth == 0) had_close_depth0 = true;
+			if (last_ident && depth <= ident_depth) seen_close_after_ident = true;
 		}
-		else if ((depth == 0 || (depth > 0 && !had_close_depth0)) && is_valid_varname(t) &&
-			 !(t->tag & (TT_QUALIFIER | TT_TYPE | TT_SUE | TT_TYPEOF | TT_ATTR)))
+		else if (!seen_close_after_ident && is_valid_varname(t) &&
+			 !(t->tag & (TT_QUALIFIER | TT_TYPE | TT_SUE | TT_TYPEOF | TT_ATTR))) {
 			last_ident = t;
+			ident_depth = depth;
+		}
 		if (depth == 0 && (equal(t, ",") || t->next == close_paren)) {
 			if (last_ident && (is_known_typedef(last_ident) || is_typedef_heuristic(last_ident)))
 				typedef_add_shadow(last_ident->loc, last_ident->len, 1);
 			last_ident = NULL;
-			had_close_depth0 = false;
+			ident_depth = -1;
+			seen_close_after_ident = false;
 		}
 	}
 	// Handle last parameter (if close_paren was hit without trailing comma)
@@ -3540,8 +3563,11 @@ static const char *path_basename(const char *path) {
 
 #ifndef _WIN32
 static bool cc_is_msvc(const char *cc) {
-	(void)cc;
-	return false;
+	if (!cc || !*cc) return false;
+	const char *base = cc;
+	for (const char *p = cc; *p; p++)
+		if (*p == '/' || *p == '\\') base = p + 1;
+	return (strcasecmp(base, "cl") == 0 || strcasecmp(base, "cl.exe") == 0);
 }
 #endif
 
