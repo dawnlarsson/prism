@@ -1413,6 +1413,34 @@ void test_defer_sibling_goto_lifo_bug(void) {
 	CHECK_LOG("1ABC2", "BUG: goto to sibling block defers fire in LIFO order");
 }
 
+void test_defer_goto_forward(void) {
+	log_reset();
+	goto target;
+	{
+		defer log_append("A");
+		log_append("B");
+	}
+target:
+	log_append("C");
+	CHECK_LOG("C", "goto forward skipping defer block");
+}
+
+void test_defer_goto_into_scope(void) {
+	log_reset();
+	int i = 0;
+	goto target;
+	{
+		defer log_append("D");
+	target:
+		log_append("1");
+		if (i == 0) {
+			i = 1;
+			goto target;
+		}
+	}
+	CHECK_LOG("11D", "goto into block with defer");
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
 
@@ -1514,4 +1542,7 @@ void run_defer_tests(void) {
 	test_defer_sibling_goto_bug();
 	test_defer_sibling_goto_multi_bug();
 	test_defer_sibling_goto_lifo_bug();
+
+	test_defer_goto_forward();
+	test_defer_goto_into_scope();
 }

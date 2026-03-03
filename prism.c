@@ -1323,7 +1323,11 @@ goto_skips_check(Token *goto_tok, char *label_name, int label_len, bool check_de
 			if ((w.tok->tag & TT_DEFER) && !equal(w.tok->next, ":") &&
 			    !(w.prev && (w.prev->tag & TT_MEMBER)) && !is_var &&
 			    !(w.tok->next && (w.tok->next->tag & TT_ASSIGN))) {
-				if (!active_defer || w.depth <= defer_depth) {
+				// Only flag defers at depth <= 0 (same scope as the goto).
+				// Defers at depth > 0 are inside blocks being entered —
+				// they fire at scope exit regardless of how the block was
+				// entered, so jumping into a block past a defer is safe.
+				if (w.depth <= 0 && (!active_defer || w.depth <= defer_depth)) {
 					active_defer = w.tok;
 					defer_depth = w.depth;
 				}
@@ -3213,11 +3217,13 @@ static Token *handle_goto_keyword(Token *tok) {
 
 		if (is_identifier_like(tok)) {
 			GotoSkipResult skip = goto_skips_check(goto_tok, tok->loc, tok->len, true, true);
-			if (skip.skipped_defer)
-				error_tok(skip.skipped_defer,
-					  "goto '%.*s' would skip over this defer statement",
-					  tok->len,
-					  tok->loc);
+			if (skip.skipped_defer) {
+				const char *msg = "goto '%.*s' would skip over this defer statement";
+				if (FEAT(F_WARN_SAFETY))
+					warn_tok(skip.skipped_defer, msg, tok->len, tok->loc);
+				else
+					error_tok(skip.skipped_defer, msg, tok->len, tok->loc);
+			}
 			if (skip.skipped_decl) report_goto_skips_decl(skip.skipped_decl, tok);
 
 			int target_depth = label_table_lookup(tok->loc, tok->len);
