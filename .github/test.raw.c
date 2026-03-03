@@ -737,6 +737,46 @@ static void test_raw_string_16_char_delimiter(void) {
 	CHECK(strcmp(s, "sixteen char delim") == 0, "raw string exactly 16-char delimiter");
 }
 
+
+void test_raw_c23_attribute(void) {
+    [[maybe_unused]] raw int x;
+    x = 10;
+    CHECK_EQ(x, 10, "raw with C23 attribute");
+}
+
+void test_raw_gnu_attribute(void) {
+    __attribute__((unused)) raw int y;
+    y = 20;
+    CHECK_EQ(y, 20, "raw with GNU attribute");
+}
+
+void test_raw_atomic(void) {
+    _Atomic raw int z;
+    z = 30;
+    CHECK_EQ(z, 30, "raw with _Atomic");
+}
+
+void test_raw_qualifier_order(void) {
+    volatile raw int a;
+    a = 40;
+    CHECK_EQ(a, 40, "raw succeeding volatile");
+
+    const raw int b = 50;
+    CHECK_EQ(b, 50, "raw succeeding const");
+}
+
+void test_raw_register(void) {
+    register raw int c;
+    c = 60;
+    CHECK_EQ(c, 60, "raw with register");
+}
+
+void test_raw_thread_local(void) {
+    static _Thread_local raw int d;
+    d = 70;
+    CHECK_EQ(d, 70, "raw with _Thread_local");
+}
+
 void run_raw_tests(void) {
 	printf("\n=== RAW KEYWORD TESTS ===\n");
 
@@ -817,4 +857,11 @@ void run_raw_tests(void) {
 	test_raw_string_max_delimiter();
 	test_raw_string_near_max_delimiter();
 	test_raw_string_16_char_delimiter();
+
+	test_raw_c23_attribute();
+	test_raw_gnu_attribute();
+	test_raw_atomic();
+	test_raw_qualifier_order();
+	test_raw_register();
+	test_raw_thread_local();
 }

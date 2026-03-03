@@ -2586,14 +2586,42 @@ static Token *try_zero_init_decl(Token *tok) {
 
 	// Check for 'raw' keyword
 	bool is_raw = false;
+	Token *raw_tok = NULL;
 	if (equal(tok, "raw") && !is_known_typedef(tok)) {
 		Token *after_raw = skip_pragma_operators(tok->next);
 		if (is_raw_declaration_context(after_raw)) {
 			is_raw = true;
+			raw_tok = tok;
 			tok = after_raw;
 			start = tok;
-			pragma_start = tok;
+			// Only reset pragma_start when no C23 attrs preceded raw
+			if (pragma_start == raw_tok) pragma_start = tok;
 			warn_loc = tok;
+		}
+	}
+
+	// If 'raw' not found directly, probe past qualifiers, attributes, and
+	// storage classes to find it. When found, emit prefix and rest (skipping
+	// 'raw') and short-circuit — raw declarations need no zero-init processing.
+	if (!is_raw) {
+		Token *probe = start;
+		while (probe && probe->kind != TK_EOF) {
+			Token *next = skip_all_attributes(probe);
+			if (next != probe) { probe = next; continue; }
+			if (probe->tag & TT_QUALIFIER) { probe = probe->next; continue; }
+			if (equal(probe, "_Pragma")) { probe = skip_pragma_operators(probe); continue; }
+			if (equal(probe, "_Thread_local")) { probe = probe->next; continue; }
+			break;
+		}
+		if (probe && equal(probe, "raw") && !is_known_typedef(probe)) {
+			Token *after_raw = skip_pragma_operators(probe->next);
+			if (is_raw_declaration_context(after_raw)) {
+				emit_range(pragma_start, probe);
+				Token *end = skip_to_semicolon(after_raw);
+				if (end->kind != TK_EOF) end = end->next;
+				emit_range(after_raw, end);
+				return end;
+			}
 		}
 	}
 
@@ -2656,7 +2684,12 @@ static Token *try_zero_init_decl(Token *tok) {
 	bool brace_wrap = ctrl.pending && ctrl.parens_just_closed;
 	if (brace_wrap) OUT_LIT(" {");
 
-	if (pragma_start != start) emit_range(pragma_start, start);
+	if (raw_tok && pragma_start != start) {
+		// C23 attrs preceded 'raw' — emit attrs (up to raw_tok), skip raw
+		emit_range(pragma_start, raw_tok);
+	} else if (pragma_start != start) {
+		emit_range(pragma_start, start);
+	}
 	emit_range(start, type.end);
 
 	Token *result = process_declarators(type.end, &type, is_raw, start);
