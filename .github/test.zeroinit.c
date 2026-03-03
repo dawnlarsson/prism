@@ -741,22 +741,6 @@ void test_typeof_zeroinit_torture_stress(void) {
 	CHECK(all_zero, "large struct via typeof all zero-init");
 }
 
-void run_typeof_zeroinit_torture_tests(void) {
-	printf("\n=== TYPEOF ZERO-INIT TORTURE TESTS ===\n");
-	test_typeof_zeroinit_all_basic_types();
-	test_typeof_zeroinit_structs();
-	test_typeof_zeroinit_arrays();
-	test_typeof_zeroinit_qualifiers();
-	test_typeof_zeroinit_complex_exprs();
-	test_typeof_zeroinit_vla();
-	test_typeof_zeroinit_function_ptrs();
-	test_typeof_zeroinit_multi_decl_complex();
-	test_typeof_zeroinit_in_scopes();
-	test_typeof_zeroinit_with_defer();
-	test_typeof_zeroinit_unions();
-	test_typeof_zeroinit_edge_cases();
-	test_typeof_zeroinit_torture_stress();
-}
 #endif
 
 enum { TEST_ARRAY_SIZE = 10 };
@@ -1282,25 +1266,7 @@ void test_zeroinit_torture_atomic(void) {
 	      "torture: _Atomic multi-decl");
 }
 
-void run_zeroinit_torture_tests(void) {
-	printf("\n=== ZERO-INIT TORTURE TESTS ===\n");
-	test_zeroinit_torture_declarators();
-	test_zeroinit_torture_attributes();
-	test_zeroinit_torture_partial_init();
-#ifdef __GNUC__
-	test_zeroinit_torture_stmt_expr();
-#endif
-	test_zeroinit_torture_deep_nesting();
-	test_zeroinit_torture_bitfields();
-	test_zeroinit_torture_anonymous();
-	test_zeroinit_torture_compound_literals();
-	test_zeroinit_torture_fam_adjacent();
-	test_zeroinit_torture_long_multidecl();
-	test_zeroinit_torture_control_flow();
-	test_zeroinit_torture_stress();
-	test_zeroinit_torture_with_defer();
-	test_zeroinit_torture_atomic();
-}
+
 void test_ternary_zeroinit(void) {
         log_reset();
         int cond = 0;
@@ -1327,24 +1293,7 @@ void test_buffer_boundary_hang(void) {
         CHECK(huge[0] == 'A', "transpiler survived massive buffer boundary flush");
 }
 
-void run_zeroinit_tests(void) {
-	printf("\n=== ZERO-INIT TESTS ===\n");
-	test_zeroinit_basic_types();
-	test_zeroinit_pointers();
-	test_zeroinit_arrays();
-	test_zeroinit_structs();
-	test_zeroinit_qualifiers();
-	test_zeroinit_in_scopes();
-	test_zeroinit_with_defer();
-#ifdef __GNUC__
-	test_zeroinit_typeof();
-#endif
-	test_zeroinit_enum_array_size();
-	test_zeroinit_alignas_array();
-	test_zeroinit_union();
-	test_ternary_zeroinit();
-	test_buffer_boundary_hang();
-}
+
 typedef int GlobalEnumShadowType;
 
 void test_enum_shadow_zeroinit(void) {
@@ -1405,8 +1354,62 @@ void test_inline_enum_const_array_size(void) {
 	CHECK_EQ((int)tag, 0, "inline enum var itself is zero-initialized");
 }
 
-void run_enum_shadow_tests(void) {
-	printf("\n=== ENUM SHADOW ZERO-INIT TESTS ===\n");
+void run_zeroinit_tests(void) {
+	printf("\n=== ZERO-INIT TESTS ===\n");
+
+	/* Basic zero-init */
+	test_zeroinit_basic_types();
+	test_zeroinit_pointers();
+	test_zeroinit_arrays();
+	test_zeroinit_structs();
+	test_zeroinit_qualifiers();
+	test_zeroinit_in_scopes();
+	test_zeroinit_with_defer();
+#ifdef __GNUC__
+	test_zeroinit_typeof();
+#endif
+	test_zeroinit_enum_array_size();
+	test_zeroinit_alignas_array();
+	test_zeroinit_union();
+	test_ternary_zeroinit();
+	test_buffer_boundary_hang();
+
+	/* Torture tests */
+	test_zeroinit_torture_declarators();
+	test_zeroinit_torture_attributes();
+	test_zeroinit_torture_partial_init();
+#ifdef __GNUC__
+	test_zeroinit_torture_stmt_expr();
+#endif
+	test_zeroinit_torture_deep_nesting();
+	test_zeroinit_torture_bitfields();
+	test_zeroinit_torture_anonymous();
+	test_zeroinit_torture_compound_literals();
+	test_zeroinit_torture_fam_adjacent();
+	test_zeroinit_torture_long_multidecl();
+	test_zeroinit_torture_control_flow();
+	test_zeroinit_torture_stress();
+	test_zeroinit_torture_with_defer();
+	test_zeroinit_torture_atomic();
+
+	/* Typeof zero-init torture */
+#ifdef __GNUC__
+	test_typeof_zeroinit_all_basic_types();
+	test_typeof_zeroinit_structs();
+	test_typeof_zeroinit_arrays();
+	test_typeof_zeroinit_qualifiers();
+	test_typeof_zeroinit_complex_exprs();
+	test_typeof_zeroinit_vla();
+	test_typeof_zeroinit_function_ptrs();
+	test_typeof_zeroinit_multi_decl_complex();
+	test_typeof_zeroinit_in_scopes();
+	test_typeof_zeroinit_with_defer();
+	test_typeof_zeroinit_unions();
+	test_typeof_zeroinit_edge_cases();
+	test_typeof_zeroinit_torture_stress();
+#endif
+
+	/* Enum shadow */
 	test_enum_shadow_zeroinit();
 	test_ternary_bare_expr_in_defer();
 	test_nested_ternary_zeroinit();

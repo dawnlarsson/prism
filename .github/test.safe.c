@@ -207,17 +207,7 @@ LABEL_END:
 	(void)state; // suppress unused warning
 }
 
-void run_safety_hole_tests(void) {
-	printf("\n=== SAFETY HOLE TESTS ===\n");
-	printf("(Verifying valid goto patterns work; invalid patterns are compile-time errors)\n");
 
-	test_goto_over_block();
-	test_goto_backward_valid();
-	test_goto_forward_no_decl();
-	test_goto_into_scope_decl_after_label();
-	test_goto_complex_valid();
-	test_goto_with_defer_valid();
-}
 typedef void VoidType;
 
 VoidType test_typedef_void_return_impl(void) {
@@ -762,30 +752,6 @@ void test_raw_atomic_struct(void) {
 	CHECK(rp.x == 42 && rp.y == 99, "raw _Atomic struct skips zero-init");
 }
 
-void run_atomic_aggregate_torture_tests(void) {
-	printf("\n=== _ATOMIC AGGREGATE TORTURE TESTS ===\n");
-	test_atomic_struct_basic();
-	test_atomic_union_basic();
-	test_atomic_struct_nested();
-	test_atomic_struct_with_array();
-	test_atomic_struct_with_pointer();
-	test_atomic_struct_specifier_form();
-	test_atomic_union_specifier_form();
-	test_atomic_struct_multi_decl();
-	test_atomic_struct_pointer();
-	test_atomic_struct_volatile();
-	test_atomic_struct_const();
-	test_atomic_anonymous_struct();
-	test_atomic_union_different_sizes();
-	test_atomic_struct_in_loop();
-	test_atomic_struct_nested_blocks();
-	test_atomic_struct_with_defer();
-	test_atomic_scalar_contrast();
-	test_atomic_typedef_struct();
-	test_atomic_typedef_atomic();
-	test_atomic_struct_bitfields();
-	test_raw_atomic_struct();
-}
 #endif // __clang__
 
 void test_switch_scope_leak(void) {
@@ -929,46 +895,7 @@ void test_defer_late_binding_semantic(void) {
 	CHECK_EQ(late_binding_captured, 10, "defer early capture workaround");
 }
 
-void run_rigor_tests(void) {
-	printf("\n=== RIGOR TESTS ===\n");
 
-	test_typedef_void_return();
-	test_typedef_voidptr_return();
-	test_stmt_expr_defer_timing();
-	test_nested_stmt_expr_defer_immediate_block_exit();
-	test_const_after_typename();
-	test_atomic_zeroinit();
-	test_atomic_aggregate_zeroinit();
-	test_static_local_zeroinit();
-	test_inline_defer();
-	test_complex_declarator_zeroinit();
-	test_complex_decl_safety();
-	test_qualified_complex_decl();
-	test_extern_not_initialized();
-	test_typedef_not_initialized();
-	test_for_init_zeroinit();
-	test_ptr_to_vla_typedef(5);
-	test_vla_side_effect_once();
-	test_atomic_specifier_form();
-#ifndef __clang__
-	run_atomic_aggregate_torture_tests();
-#endif
-
-	test_switch_scope_leak();
-	test_sizeof_shadows_type();
-
-#if __STDC_VERSION__ >= 201112L
-	test_generic_colons();
-#endif
-
-	test_for_braceless_label();
-	test_goto_into_for();
-	test_attribute_positions();
-	test_rigor_defer_comma_operator();
-	test_defer_complex_comma();
-	test_switch_noreturn_no_fallthrough();
-	test_defer_late_binding_semantic();
-}
 #define CHECK_ZEROED(var, size, name)                                                                        \
 	do {                                                                                                 \
 		char zero_buf[size];                                                                         \
@@ -1641,72 +1568,9 @@ void test_sizeof_nested_vla_detection(void) {
 	CHECK(vla1[0] == 1 && vla2[0] == 'A', "nested VLA sizeof detection");
 }
 
-void run_sizeof_var_torture_tests(void) {
-	printf("\n=== SIZEOF(VARIABLE) TORTURE TESTS ===\n");
-	printf("(Testing sizeof(var) is correctly recognized as constant)\n\n");
 
-	test_sizeof_local_int_variable();
-	test_sizeof_local_long_variable();
-	test_sizeof_local_float_variable();
-	test_sizeof_local_double_variable();
-	test_sizeof_local_pointer_variable();
-	test_sizeof_local_array_variable();
-	test_sizeof_local_struct_variable();
-	test_sizeof_local_union_variable();
-	test_sizeof_function_parameter();
-	test_sizeof_multiple_vars_in_expr();
-	test_sizeof_var_times_constant();
-	test_sizeof_var_in_ternary();
-	test_sizeof_var_with_bitwise_ops();
-	test_sizeof_nested_vars();
-	test_sizeof_pointer_deref();
-	test_sizeof_array_element_var();
-	test_sizeof_2d_array_element_var();
-	test_sizeof_compound_literal_var();
-	test_sizeof_cast_expression_var();
-	test_sizeof_var_division();
-	test_sizeof_const_qualified_var();
-	test_sizeof_volatile_var();
-	test_sizeof_restrict_ptr();
-	test_sizeof_static_var();
-	test_sizeof_true_vla_detected();
-	test_sizeof_nested_vla_detection();
-}
-void run_sizeof_constexpr_tests(void) {
-	printf("\n=== SIZEOF AND CONSTANT EXPRESSION TESTS ===\n");
-	printf("(Regression tests for VLA false-positive detection)\n\n");
 
-	test_sizeof_in_array_bound();
-	test_cast_expression_in_array_bound();
-	test_complex_macro_array_bound();
-	test_system_typedef_pattern();
-	test_invisible_system_typedef_pattern();
-	test_system_typedef_shadow();
-	test_alignof_in_array_bound();
-	test_complex_operators_in_array_bound();
-	test_sizeof_array_element_in_bound();
-	test_sizeof_with_parens_in_bound();
-	test_sizeof_variable_in_array_bound();
-}
-void run_silent_failure_tests(void) {
-	printf("\n=== SILENT FAILURE DETECTION TESTS ===\n");
-	printf("(Testing complex declarators that might silently skip zero-init)\n\n");
 
-	test_complex_func_ptr_array();
-	test_array_of_complex_func_ptrs();
-	test_func_ptr_taking_func_ptr();
-	test_ptr_to_array_of_func_ptrs();
-	test_multi_level_ptr_chain();
-	test_complex_func_ptr_with_struct();
-	test_paren_grouped_declarator();
-	test_multi_dim_array_ptrs();
-	test_sizeof_array_bounds();
-	test_decl_after_label();
-	test_decl_directly_after_label();
-	test_decl_in_else();
-	test_volatile_func_ptr();
-	test_extremely_complex_declarator();
-}
 #undef offsetof
 #define offsetof(TYPE, MEMBER) ((size_t)((char *)&((TYPE *)0)->MEMBER - (char *)0))
 
@@ -1782,16 +1646,7 @@ void test_vla_expression_size(void) {
 	CHECK(vla[0] == 0 && vla[4] == 8, "VLA expression size - no zeroinit");
 }
 
-void run_manual_offsetof_vla_tests(void) {
-	printf("\n=== MANUAL OFFSETOF VLA REGRESSION TESTS ===\n");
-	printf("(Tests for pointer-arithmetic offsetof patterns)\n\n");
 
-	test_manual_offsetof_in_union();
-	test_manual_offsetof_local();
-	test_union_offsetof_division();
-	test_vla_basic();
-	test_vla_expression_size();
-}
 #ifdef __GNUC__
 void test_typeof_overflow_35_vars(void) {
 	// 35 typeof variables in one declaration — exceeds old limit of 32
@@ -2419,71 +2274,7 @@ static void test_deep_pointer_nesting(void) {
 	CHECK_EQ(*****p5, 42, "deep pointer nesting compiles and works");
 }
 
-void run_bulletproof_regression_tests(void) {
-	printf("\n=== BULLETPROOF REGRESSION TESTS ===\n");
-	printf("(Issues 1-6: overflow, realloc, labels, setjmp, raw, ghost shadow)\n\n");
 
-#ifdef __GNUC__
-	test_typeof_overflow_35_vars();
-	test_typeof_overflow_64_vars();
-	test_typeof_struct_overflow();
-#endif
-
-	test_many_labels_function();
-	test_raw_struct_member_field();
-	test_raw_anonymous_struct_member();
-	test_raw_in_compound_literal();
-	test_raw_typedef_name();
-	test_raw_pointer_to_struct_with_raw();
-	test_raw_array_of_structs_with_raw();
-
-	test_ghost_shadow_for_braceless();
-	test_ghost_shadow_nested_for();
-	test_ghost_shadow_while_braceless();
-	test_ghost_shadow_if_else_braceless();
-#ifdef __GNUC__
-	test_ghost_shadow_generic();
-	test_ghost_shadow_generic_braceless();
-#endif
-
-	test_pragma_survives_transpile();
-	test_defer_switch_goto_out();
-	test_defer_switch_break_with_goto_label();
-	test_defer_switch_nested_goto();
-	test_switch_goto_defer_multi_case();
-
-	test_typedef_redef_basic();
-	test_typedef_redef_pointer();
-	test_typedef_redef_after_scope();
-
-#ifdef __GNUC__
-	test_typeof_errno_zeroinit();
-	test_typeof_statement_expr_zeroinit();
-	test_typeof_complex_expr_zeroinit();
-#endif
-
-	test_hashmap_tombstone_insert_delete_cycle();
-	test_hashmap_tombstone_reinsert();
-	test_hashmap_tombstone_multi_key_churn();
-	test_switch_conditional_break_not_false_positive();
-	test_switch_nested_conditional_context();
-	test_make_temp_file_normal_operation();
-
-	test_void_typedef_return_basic();
-	test_chained_void_typedef_return();
-	test_static_void_typedef_return();
-	test_void_typedef_bare_return();
-	test_void_ptr_typedef_not_void();
-	test_void_func_ptr_typedef();
-	test_generic_void_typedef_no_label_confusion();
-
-	test_vla_zeroinit_basic();
-	test_vla_zeroinit_expression_size();
-	test_vla_zeroinit_large();
-	test_vla_zeroinit_nested_scope();
-	test_hashmap_tombstone_high_churn_load();
-	test_deep_pointer_nesting();
-}
 static void test_typedef_extreme_scope_churn(void) {
 	volatile int sum = 0;
 	for (int round = 0; round < 300; round++) {
@@ -2673,9 +2464,7 @@ static void test_large_string_output(void) {
 	CHECK(count == 4095, "large string content intact");
 }
 
-static void run_hardening_tests(void) {
-	test_large_string_output();
-}
+
 static void test_struct_depth_beyond_64(void) {
 	// Exercise struct nesting that stays valid even if bitmask can't track depth >= 64
 	// This tests the transpiler handles deep nesting without losing struct_depth sync
@@ -2757,9 +2546,7 @@ static void test_struct_depth_beyond_64(void) {
 	CHECK(dt.x == 0 && dt.y == 0, "struct zeroinit after deep nesting");
 }
 
-static void run_hardening_tests_2(void) {
-	test_struct_depth_beyond_64();
-}
+
 static int orelse_comma_helper(int *a, int *b) {
 	// Tests that orelse in a bare expression correctly handles
 	// the expression boundary (doesn't scan past statement end)
@@ -2851,7 +2638,270 @@ static void test_attribute_parser_torture(void) {
 	CHECK_EQ(attr_aligned, 0, "__attribute__((aligned)) int zeroed");
 }
 
-static void run_hardening_tests_3(void) {
+
+
+// =============================================================================
+// BUG: goto_skips_check false positive for for-init declarations
+// `for (int i = 0; ...)` scopes `i` to the for-loop per C99+. A goto that
+// jumps over the entire for-loop does NOT skip `i`'s scope, so it is safe.
+// Prism incorrectly reports: "goto 'xxx' would skip over this variable
+// declaration (bypasses zero-init)" because the walker tracks for-init
+// declarations at the outer scope depth rather than the for-body depth.
+// GCC/Clang accept this code without warnings.
+//
+// NOTE: This is a TRANSPILE-TIME error (Prism rejects valid code).
+// Guarded by TEST_GOTO_FOR_INIT_BUG because the false positive causes Prism
+// to emit corrupt output that kills GCC compilation of the entire suite.
+// Test individually: prism run .github/test.safe.c -DTEST_GOTO_FOR_INIT_BUG
+// Or verify: prism transpile <file-with-goto-over-for> shows the error.
+// =============================================================================
+
+#ifdef TEST_GOTO_FOR_INIT_BUG
+
+static void test_goto_over_for_init_bug(void) {
+	// goto over a for-loop with init-declaration should be allowed
+	int x = 1;
+	goto skip_for;
+	for (int i = 0; i < 10; i++) {
+		x += i;
+	}
+skip_for:
+	CHECK_EQ(x, 1, "BUG: goto over for-init should not be rejected");
+}
+
+static void test_goto_over_for_init_braceless_bug(void) {
+	// Same bug, but braceless for body
+	int x = 1;
+	goto skip_for2;
+	for (int i = 0; i < 5; i++)
+		x += i;
+skip_for2:
+	CHECK_EQ(x, 1, "BUG: goto over braceless for-init should not be rejected");
+}
+
+static void test_goto_over_multiple_for_init_bug(void) {
+	// Multiple for-loops, all with init-declarations
+	int x = 1;
+	goto skip_all;
+	for (int i = 0; i < 3; i++) {
+		x += i;
+	}
+	for (int j = 0; j < 3; j++) {
+		x += j;
+	}
+skip_all:
+	CHECK_EQ(x, 1, "BUG: goto over multiple for-inits should not be rejected");
+}
+
+static void run_goto_over_for_init_bug_tests(void) {
+	test_goto_over_for_init_bug();
+	test_goto_over_for_init_braceless_bug();
+	test_goto_over_multiple_for_init_bug();
+}
+
+#endif /* TEST_GOTO_FOR_INIT_BUG */
+
+void run_safe_tests(void) {
+	printf("\n=== SAFE TESTS ===\n");
+
+	/* Safety hole tests */
+	test_goto_over_block();
+	test_goto_backward_valid();
+	test_goto_forward_no_decl();
+	test_goto_into_scope_decl_after_label();
+	test_goto_complex_valid();
+	test_goto_with_defer_valid();
+
+	/* Rigor tests */
+	test_typedef_void_return();
+	test_typedef_voidptr_return();
+	test_stmt_expr_defer_timing();
+	test_nested_stmt_expr_defer_immediate_block_exit();
+	test_const_after_typename();
+	test_atomic_zeroinit();
+	test_atomic_aggregate_zeroinit();
+	test_static_local_zeroinit();
+	test_inline_defer();
+	test_complex_declarator_zeroinit();
+	test_complex_decl_safety();
+	test_qualified_complex_decl();
+	test_extern_not_initialized();
+	test_typedef_not_initialized();
+	test_for_init_zeroinit();
+	test_ptr_to_vla_typedef(5);
+	test_vla_side_effect_once();
+	test_atomic_specifier_form();
+#ifndef __clang__
+	test_atomic_struct_basic();
+	test_atomic_union_basic();
+	test_atomic_struct_nested();
+	test_atomic_struct_with_array();
+	test_atomic_struct_with_pointer();
+	test_atomic_struct_specifier_form();
+	test_atomic_union_specifier_form();
+	test_atomic_struct_multi_decl();
+	test_atomic_struct_pointer();
+	test_atomic_struct_volatile();
+	test_atomic_struct_const();
+	test_atomic_anonymous_struct();
+	test_atomic_union_different_sizes();
+	test_atomic_struct_in_loop();
+	test_atomic_struct_nested_blocks();
+	test_atomic_struct_with_defer();
+	test_atomic_scalar_contrast();
+	test_atomic_typedef_struct();
+	test_atomic_typedef_atomic();
+	test_atomic_struct_bitfields();
+	test_raw_atomic_struct();
+#endif
+	test_switch_scope_leak();
+	test_sizeof_shadows_type();
+#if __STDC_VERSION__ >= 201112L
+	test_generic_colons();
+#endif
+	test_for_braceless_label();
+	test_goto_into_for();
+	test_attribute_positions();
+	test_rigor_defer_comma_operator();
+	test_defer_complex_comma();
+	test_switch_noreturn_no_fallthrough();
+	test_defer_late_binding_semantic();
+
+	/* sizeof(variable) torture */
+	test_sizeof_local_int_variable();
+	test_sizeof_local_long_variable();
+	test_sizeof_local_float_variable();
+	test_sizeof_local_double_variable();
+	test_sizeof_local_pointer_variable();
+	test_sizeof_local_array_variable();
+	test_sizeof_local_struct_variable();
+	test_sizeof_local_union_variable();
+	test_sizeof_function_parameter();
+	test_sizeof_multiple_vars_in_expr();
+	test_sizeof_var_times_constant();
+	test_sizeof_var_in_ternary();
+	test_sizeof_var_with_bitwise_ops();
+	test_sizeof_nested_vars();
+	test_sizeof_pointer_deref();
+	test_sizeof_array_element_var();
+	test_sizeof_2d_array_element_var();
+	test_sizeof_compound_literal_var();
+	test_sizeof_cast_expression_var();
+	test_sizeof_var_division();
+	test_sizeof_const_qualified_var();
+	test_sizeof_volatile_var();
+	test_sizeof_restrict_ptr();
+	test_sizeof_static_var();
+	test_sizeof_true_vla_detected();
+	test_sizeof_nested_vla_detection();
+
+	/* sizeof/constexpr */
+	test_sizeof_in_array_bound();
+	test_cast_expression_in_array_bound();
+	test_complex_macro_array_bound();
+	test_system_typedef_pattern();
+	test_invisible_system_typedef_pattern();
+	test_system_typedef_shadow();
+	test_alignof_in_array_bound();
+	test_complex_operators_in_array_bound();
+	test_sizeof_array_element_in_bound();
+	test_sizeof_with_parens_in_bound();
+	test_sizeof_variable_in_array_bound();
+
+	/* Silent failure detection */
+	test_complex_func_ptr_array();
+	test_array_of_complex_func_ptrs();
+	test_func_ptr_taking_func_ptr();
+	test_ptr_to_array_of_func_ptrs();
+	test_multi_level_ptr_chain();
+	test_complex_func_ptr_with_struct();
+	test_paren_grouped_declarator();
+	test_multi_dim_array_ptrs();
+	test_sizeof_array_bounds();
+	test_decl_after_label();
+	test_decl_directly_after_label();
+	test_decl_in_else();
+	test_volatile_func_ptr();
+	test_extremely_complex_declarator();
+
+	/* Manual offsetof / VLA */
+	test_manual_offsetof_in_union();
+	test_manual_offsetof_local();
+	test_union_offsetof_division();
+	test_vla_basic();
+	test_vla_expression_size();
+
+	/* Bulletproof regression */
+#ifdef __GNUC__
+	test_typeof_overflow_35_vars();
+	test_typeof_overflow_64_vars();
+	test_typeof_struct_overflow();
+#endif
+	test_many_labels_function();
+	test_raw_struct_member_field();
+	test_raw_anonymous_struct_member();
+	test_raw_in_compound_literal();
+	test_raw_typedef_name();
+	test_raw_pointer_to_struct_with_raw();
+	test_raw_array_of_structs_with_raw();
+	test_ghost_shadow_for_braceless();
+	test_ghost_shadow_nested_for();
+	test_ghost_shadow_while_braceless();
+	test_ghost_shadow_if_else_braceless();
+#ifdef __GNUC__
+	test_ghost_shadow_generic();
+	test_ghost_shadow_generic_braceless();
+#endif
+	test_pragma_survives_transpile();
+	test_defer_switch_goto_out();
+	test_defer_switch_break_with_goto_label();
+	test_defer_switch_nested_goto();
+	test_switch_goto_defer_multi_case();
+	test_typedef_redef_basic();
+	test_typedef_redef_pointer();
+	test_typedef_redef_after_scope();
+#ifdef __GNUC__
+	test_typeof_errno_zeroinit();
+	test_typeof_statement_expr_zeroinit();
+	test_typeof_complex_expr_zeroinit();
+#endif
+	test_hashmap_tombstone_insert_delete_cycle();
+	test_hashmap_tombstone_reinsert();
+	test_hashmap_tombstone_multi_key_churn();
+	test_switch_conditional_break_not_false_positive();
+	test_switch_nested_conditional_context();
+	test_make_temp_file_normal_operation();
+	test_void_typedef_return_basic();
+	test_chained_void_typedef_return();
+	test_static_void_typedef_return();
+	test_void_typedef_bare_return();
+	test_void_ptr_typedef_not_void();
+	test_void_func_ptr_typedef();
+	test_generic_void_typedef_no_label_confusion();
+	test_vla_zeroinit_basic();
+	test_vla_zeroinit_expression_size();
+	test_vla_zeroinit_large();
+	test_vla_zeroinit_nested_scope();
+	test_hashmap_tombstone_high_churn_load();
+	test_deep_pointer_nesting();
+
+	/* Additional safe tests */
+	test_typedef_extreme_scope_churn();
+	test_typedef_tombstone_saturation_extended();
+	test_struct_static_assert_compound_literal();
+	test_struct_nested_compound_literal_depth();
+	test_struct_compound_literal_then_nested_struct();
+	test_for_init_multi_decl_all_zeroed();
+#ifdef __GNUC__
+	test_for_init_stmt_expr_with_decls();
+	test_struct_stmt_expr_in_member_size();
+#endif
+	test_nested_struct_depth_tracking();
+	test_struct_with_enum_body_depth();
+
+	/* Hardening */
+	test_large_string_output();
+	test_struct_depth_beyond_64();
 	test_orelse_sequential_bare();
 	test_zeroinit_after_line_directives();
 	test_orelse_return_expr_side_effects();
@@ -2860,4 +2910,9 @@ static void run_hardening_tests_3(void) {
 #endif
 	test_struct_padding_zeroinit();
 	test_attribute_parser_torture();
+
+	/* Goto over for-init bug */
+#ifdef TEST_GOTO_FOR_INIT_BUG
+	run_goto_over_for_init_bug_tests();
+#endif
 }

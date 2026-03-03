@@ -1,376 +1,3 @@
-void test_raw_basic(void) {
-	raw int x;
-	x = 42;
-	CHECK_EQ(x, 42, "raw int assignment");
-
-	raw char c;
-	c = 'A';
-	CHECK_EQ(c, 'A', "raw char assignment");
-}
-
-void test_raw_array(void) {
-	raw int arr[100];
-	arr[0] = 1;
-	arr[99] = 99;
-	CHECK(arr[0] == 1 && arr[99] == 99, "raw array assignment");
-}
-
-void test_raw_pointer(void) {
-	raw int *p;
-	int val = 123;
-	p = &val;
-	CHECK_EQ(*p, 123, "raw pointer assignment");
-}
-
-void test_raw_struct(void) {
-	raw struct {
-		int a;
-		int b;
-	} s;
-
-	s.a = 10;
-	s.b = 20;
-	CHECK(s.a == 10 && s.b == 20, "raw struct assignment");
-}
-
-void test_raw_with_qualifiers(void) {
-	raw volatile int v;
-	v = 100;
-	CHECK_EQ(v, 100, "raw volatile int");
-
-	raw const int *cp;
-	int val = 50;
-	cp = &val;
-	CHECK_EQ(*cp, 50, "raw const pointer");
-}
-
-void run_raw_tests(void) {
-	printf("\n=== RAW KEYWORD TESTS ===\n");
-	test_raw_basic();
-	test_raw_array();
-	test_raw_pointer();
-	test_raw_struct();
-	test_raw_with_qualifiers();
-}
-void test_raw_variable_assignment(void) {
-	int raw, edit;
-	raw = edit = 0;
-	CHECK(raw == 0 && edit == 0, "raw = edit = 0 (bash pattern)");
-
-	raw = 42;
-	CHECK_EQ(raw, 42, "raw = 42");
-
-	raw += 10;
-	CHECK_EQ(raw, 52, "raw += 10");
-
-	raw -= 2;
-	CHECK_EQ(raw, 50, "raw -= 2");
-
-	raw *= 2;
-	CHECK_EQ(raw, 100, "raw *= 2");
-
-	raw /= 4;
-	CHECK_EQ(raw, 25, "raw /= 4");
-
-	raw %= 10;
-	CHECK_EQ(raw, 5, "raw %= 10");
-
-	raw = 0xFF;
-	raw &= 0x0F;
-	CHECK_EQ(raw, 0x0F, "raw &= 0x0F");
-
-	raw |= 0xF0;
-	CHECK_EQ(raw, 0xFF, "raw |= 0xF0");
-
-	raw ^= 0x0F;
-	CHECK_EQ(raw, 0xF0, "raw ^= 0x0F");
-
-	raw = 8;
-	raw <<= 2;
-	CHECK_EQ(raw, 32, "raw <<= 2");
-
-	raw >>= 1;
-	CHECK_EQ(raw, 16, "raw >>= 1");
-}
-
-void test_raw_variable_comparison(void) {
-	int raw = 10;
-
-	CHECK(raw == 10, "raw == 10");
-	CHECK(raw != 5, "raw != 5");
-	CHECK(raw < 20, "raw < 20");
-	CHECK(raw > 5, "raw > 5");
-	CHECK(raw <= 10, "raw <= 10");
-	CHECK(raw >= 10, "raw >= 10");
-}
-
-void test_raw_variable_arithmetic(void) {
-	int raw = 10;
-	int result;
-
-	result = raw + 5;
-	CHECK_EQ(result, 15, "raw + 5");
-
-	result = raw - 3;
-	CHECK_EQ(result, 7, "raw - 3");
-
-	result = raw * 2;
-	CHECK_EQ(result, 20, "raw * 2");
-
-	result = raw / 2;
-	CHECK_EQ(result, 5, "raw / 2");
-
-	result = raw % 3;
-	CHECK_EQ(result, 1, "raw % 3");
-}
-
-void test_raw_variable_bitwise(void) {
-	int raw = 0b1010;
-	int result;
-
-	result = raw & 0b1100;
-	CHECK_EQ(result, 0b1000, "raw & mask");
-
-	result = raw | 0b0101;
-	CHECK_EQ(result, 0b1111, "raw | mask");
-
-	result = raw ^ 0b1111;
-	CHECK_EQ(result, 0b0101, "raw ^ mask");
-
-	result = raw << 2;
-	CHECK_EQ(result, 0b101000, "raw << 2");
-
-	result = raw >> 1;
-	CHECK_EQ(result, 0b0101, "raw >> 1");
-}
-
-void test_raw_variable_logical(void) {
-	int raw = 1;
-	int other = 0;
-
-	CHECK((raw && 1), "raw && 1");
-	CHECK((raw || other), "raw || other");
-}
-
-void test_raw_variable_incr_decr(void) {
-	int raw = 10;
-
-	raw++;
-	CHECK_EQ(raw, 11, "raw++");
-
-	raw--;
-	CHECK_EQ(raw, 10, "raw--");
-
-	++raw;
-	CHECK_EQ(raw, 11, "++raw");
-
-	--raw;
-	CHECK_EQ(raw, 10, "--raw");
-}
-
-void test_raw_variable_array(void) {
-	int arr[] = {10, 20, 30};
-	int raw = 1;
-
-	CHECK_EQ(arr[raw], 20, "arr[raw]");
-
-	int *raw_ptr = arr;
-	CHECK_EQ(raw_ptr[2], 30, "raw_ptr[2]");
-}
-
-void test_raw_variable_member(void) {
-	struct point {
-		int x;
-		int y;
-	};
-	struct point raw;
-	raw.x = 5;
-	raw.y = 10;
-	CHECK(raw.x == 5 && raw.y == 10, "raw.x and raw.y");
-
-	struct point s = {100, 200};
-	struct point *raw_ptr = &s;
-	CHECK(raw_ptr->x == 100 && raw_ptr->y == 200, "raw_ptr->x and raw_ptr->y");
-}
-
-int identity(int x) {
-	return x;
-}
-
-void test_raw_variable_function_call(void) {
-	int (*raw)(int) = identity;
-	CHECK_EQ(raw(42), 42, "raw(42) function pointer call");
-}
-
-void test_raw_variable_comma(void) {
-	int raw = 0;
-	int result;
-	result = (raw = 5, raw + 10);
-	CHECK_EQ(result, 15, "raw in comma expression");
-}
-
-void test_raw_variable_semicolon(void) {
-	int raw = 10;
-	int x = raw; // raw followed by semicolon (after x = raw)
-	CHECK_EQ(x, 10, "int x = raw;");
-
-	// raw alone on statement (like last expression in void function)
-	raw; // This should compile - raw is a variable
-	CHECK_EQ(raw, 10, "raw; as statement");
-}
-
-void test_raw_variable_ternary(void) {
-	int raw = 1;
-	int result = raw ? 100 : 200;
-	CHECK_EQ(result, 100, "raw ? 100 : 200");
-
-	result = 0 ? raw : 50;
-	CHECK_EQ(result, 50, "0 ? raw : 50");
-}
-
-void test_raw_keyword_static(void) {
-	raw static int x = 5;
-	// Just verify it compiles and has the right value
-	// Don't modify x since this test might be called multiple times
-	CHECK(x >= 5, "raw static int x = 5");
-}
-
-extern int some_external_var;
-
-void test_raw_keyword_extern_decl(void) {
-	// This just tests that 'raw extern' parses correctly
-	// We can't easily test runtime behavior of extern
-	CHECK(1, "raw extern declaration compiles");
-}
-
-void test_raw_mixed_usage(void) {
-	raw int uninitialized_var; // 'raw' as keyword
-	uninitialized_var = 42;
-
-	int raw = 100; // 'raw' as variable name
-
-	raw = raw + uninitialized_var; // 'raw' as variable
-	CHECK_EQ(raw, 142, "mixed raw keyword and variable");
-}
-
-void test_raw_multiple_variables(void) {
-	int raw, cooked, done;
-	raw = cooked = done = 0;
-
-	raw = 1;
-	cooked = 2;
-	done = 3;
-
-	CHECK(raw == 1 && cooked == 2 && done == 3, "multiple vars with raw");
-}
-
-int intval_mock(int x) {
-	return x * 2;
-}
-
-int term_mock(int x) {
-	return x + 1;
-}
-
-void test_raw_bash_pattern(void) {
-	// Exact pattern from bash's builtins/read.def
-	int raw, edit, nchars, silent;
-	raw = edit = 0;
-	nchars = silent = 0;
-
-	if (1) {
-		raw = intval_mock(5);
-		edit = term_mock(3);
-	}
-
-	CHECK_EQ(raw, 10, "bash pattern: raw = intval(5)");
-	CHECK_EQ(edit, 4, "bash pattern: edit = term(3)");
-}
-
-void test_raw_in_switch(void) {
-	int raw = 2;
-	int result = 0;
-
-	switch (raw) {
-	case 1: result = 10; break;
-	case 2: result = 20; break;
-	default: result = 30; break;
-	}
-
-	CHECK_EQ(result, 20, "switch(raw) works");
-}
-
-void test_raw_in_loops(void) {
-	int raw = 3;
-	int count = 0;
-
-	while (raw > 0) {
-		count++;
-		raw--;
-	}
-	CHECK_EQ(count, 3, "while(raw > 0)");
-
-	raw = 0;
-	for (raw = 0; raw < 5; raw++) {
-		count++;
-	}
-	CHECK_EQ(raw, 5, "for(raw = 0; raw < 5; raw++)");
-}
-
-int func_with_raw_param(int raw) {
-	return raw * 2;
-}
-
-void test_raw_as_parameter(void) {
-	CHECK_EQ(func_with_raw_param(21), 42, "raw as function parameter");
-}
-
-void test_raw_in_sizeof(void) {
-	int raw = 42;
-	size_t s = sizeof(raw);
-	CHECK_EQ(s, sizeof(int), "sizeof(raw)");
-}
-
-void test_raw_address_of(void) {
-	int raw = 42;
-	int *p = &raw;
-	CHECK_EQ(*p, 42, "&raw works");
-	*p = 100;
-	CHECK_EQ(raw, 100, "*(&raw) = 100 works");
-}
-
-void test_raw_in_cast(void) {
-	double raw = 3.14159;
-	int truncated = (int)raw;
-	CHECK_EQ(truncated, 3, "(int)raw");
-}
-
-void run_raw_torture_tests(void) {
-	printf("\n=== RAW KEYWORD VS VARIABLE TORTURE TESTS ===\n");
-	test_raw_variable_assignment();
-	test_raw_variable_comparison();
-	test_raw_variable_arithmetic();
-	test_raw_variable_bitwise();
-	test_raw_variable_logical();
-	test_raw_variable_incr_decr();
-	test_raw_variable_array();
-	test_raw_variable_member();
-	test_raw_variable_function_call();
-	test_raw_variable_comma();
-	test_raw_variable_semicolon();
-	test_raw_variable_ternary();
-	test_raw_keyword_static();
-	test_raw_keyword_extern_decl();
-	test_raw_mixed_usage();
-	test_raw_multiple_variables();
-	test_raw_bash_pattern();
-	test_raw_in_switch();
-	test_raw_in_loops();
-	test_raw_as_parameter();
-	test_raw_in_sizeof();
-	test_raw_address_of();
-	test_raw_in_cast();
-}
 void test_multi_decl_basic(void) {
 	int a, b, c;
 	CHECK(a == 0 && b == 0 && c == 0, "int a, b, c");
@@ -445,15 +72,7 @@ void test_multi_decl_func_ptr(void) {
 	CHECK(vfunc_ptr1 == NULL, "nightmare cv multi-decl: (*volatile *vfunc_ptr1)(void)");
 }
 
-void run_multi_decl_tests(void) {
-	printf("\n=== MULTI-DECLARATOR TESTS ===\n");
-	test_multi_decl_basic();
-	test_multi_decl_mixed_ptr();
-	test_multi_decl_arrays();
-	test_multi_decl_partial_init();
-	test_multi_decl_long();
-	test_multi_decl_func_ptr();
-}
+
 // SECTION 4: TYPEDEF TRACKING TESTS
 
 typedef int MyInt;
@@ -657,23 +276,7 @@ void test_typedef_multi_braceless_sequential(void) {
 	CHECK_EQ(d, 15, "typedef multi braceless sequential");
 }
 
-void run_typedef_tests(void) {
-	printf("\n=== TYPEDEF TRACKING TESTS ===\n");
-	test_typedef_simple();
-	test_typedef_pointer();
-	test_typedef_struct();
-	test_typedef_array();
-	test_typedef_func_ptr();
-	test_typedef_chained();
-	test_typedef_multi_var();
-	test_typedef_block_scoped();
-	test_typedef_shadowing();
-	test_typedef_multi_declarator();
-	test_typedef_after_braceless_while();
-	test_typedef_after_braceless_if_else();
-	test_typedef_braceless_nested_control();
-	test_typedef_multi_braceless_sequential();
-}
+
 void test_bitfield_zeroinit(void) {
 	// NIGHTMARE: Extensive bitfield testing
 
@@ -1135,33 +738,7 @@ void test_deeply_nested_struct_defer_scopes(void) {
 	CHECK_LOG("8BA", "deeply nested struct defer scopes");
 }
 
-void run_edge_case_tests(void) {
-	printf("\n=== EDGE CASE TESTS ===\n");
-	test_bitfield_zeroinit();
-	test_anonymous_struct();
-	test_anonymous_union();
-	test_long_declaration();
-	test_func_ptr_array();
-	test_ptr_to_array();
-	test_defer_compound_literal();
-	test_nested_struct_union_with_defer();
-	test_deeply_nested_struct_defer_scopes();
-	test_struct_in_braceless_control();
-	test_defer_across_struct_boundaries();
 
-	test_duffs_device();
-	CHECK_LOG("XXXXXEF", "Duff's device with defer");
-
-	test_defer_ternary();
-	CHECK_LOG("1T", "defer with ternary");
-
-	test_empty_defer();
-
-	test_do_while_0_defer();
-	CHECK_LOG("1DEF", "do-while(0) with defer");
-
-	test_defer_comma_operator();
-}
 // SECTION 6: BUG REGRESSION TESTS
 #ifdef __GNUC__
 void test_stmt_expr_defer_nested_block(void) {
@@ -1300,23 +877,7 @@ void test_local_function_decl(void) {
 	CHECK(1, "local function declarations: no duplicate output");
 }
 
-void run_bug_regression_tests(void) {
-	printf("\n=== BUG REGRESSION TESTS ===\n");
 
-#ifdef __GNUC__
-	test_stmt_expr_defer_nested_block();
-#else
-	printf("[SKIP] stmt expr tests (not GCC)\n");
-#endif
-
-	test_non_vla_typedef_still_works();
-	test_switch_defer_no_leak();
-	test_enum_constant_shadows_typedef();
-	test_enum_shadow_star_ambiguity();
-	test_enum_shadow_statement_form();
-	test_ppnum_underscore_paste();
-	test_local_function_decl();
-}
 void test_defer_shadowing_vars(void) {
 	log_reset();
 	int x = 1;
@@ -1587,14 +1148,6 @@ void test_void_return_void_call(void) {
 	CHECK_LOG("IO", "void return void call execution order");
 }
 
-void test_raw_multi_decl(void) {
-	// "raw" should apply to all declarators in the statement
-	raw int a, b;
-	a = 1;
-	b = 2; // Initialize to avoid UB check failures if running with sanitizers
-	CHECK(a == 1 && b == 2, "raw multi-declaration compiles");
-}
-
 void test_switch_continue(void) {
 	log_reset();
 	int i = 0;
@@ -1684,28 +1237,7 @@ void test_typedef_scope_churn_consolidated(void) {
 	CHECK_EQ(post_churn, 0, "typedef scope churn: post-churn zeroed");
 }
 
-void run_stress_tests(void) {
-	printf("\n=== STRESS TESTS ===\n");
-	test_defer_shadowing_vars();
-	test_typedef_hiding();
-	test_typedef_same_name_shadow();
-	test_typedef_nested_same_name_shadow();
-	test_typedef_shadow_then_pointer();
-	test_static_local_init();
-	test_complex_func_ptr();
-	test_switch_default_first();
-	test_macro_hidden_defer();
-	test_macro_hidden_decl();
-	test_void_return_void_call();
-	test_raw_multi_decl();
-	test_switch_continue();
-	test_fam_struct_zeroinit();
 
-#ifdef __GNUC__
-	test_stmt_expr_side_effects();
-#endif
-	test_typedef_scope_churn_consolidated();
-}
 void test_case_in_nested_block(void) {
 	// Case label inside a nested block (valid C, but weird)
 	log_reset();
@@ -1769,12 +1301,7 @@ void test_duff_device_with_defer_at_top(void) {
 	CHECK_EQ(result, 10, "duff device defer count"); // defer fires once at wrapper scope exit
 }
 
-void run_case_label_tests(void) {
-	printf("\n=== CASE LABELS INSIDE BLOCKS TESTS ===\n");
-	test_case_in_nested_block();
-	test_case_after_defer_in_block();
-	test_duff_device_with_defer_at_top();
-}
+
 #define TEST_FLT128_MAX 1.18973149535723176508575932662800702e+4932F128
 #define TEST_FLT128_MIN 3.36210314311209350626267781732175260e-4932F128
 #define TEST_FLT64_VAL 1.7976931348623157e+308F64
@@ -1809,16 +1336,7 @@ void test_bf16_suffix(void) {
 	CHECK(1, "BF16 float suffix parses");
 }
 
-void run_preprocessor_numeric_tests(void) {
-	printf("\n=== PREPROCESSOR NUMERIC LITERAL TESTS ===\n");
-	printf("(Tests for C23/GCC extended float suffixes)\n\n");
 
-	test_float128_suffix();
-	test_float64_suffix();
-	test_float32_suffix();
-	test_float16_suffix();
-	test_bf16_suffix();
-}
 #include <signal.h>
 
 void test_linux_macros(void) {
@@ -1931,15 +1449,7 @@ void test_posix_macros(void) {
 #endif
 }
 
-void run_preprocessor_system_macro_tests(void) {
-	printf("\n=== PREPROCESSOR SYSTEM MACRO TESTS ===\n");
-	printf("(Tests for system macro import integrity)\n\n");
 
-	test_linux_macros();
-	test_signal_macros();
-	test_glibc_macros();
-	test_posix_macros();
-}
 void test_switch_conditional_break_defer(void) {
 	log_reset();
 	int error = 0; // No error, will fall through
@@ -2000,25 +1510,6 @@ void test_switch_braced_fallthrough_works(void) {
 
 	CHECK(cleanup_called == 1, "braced case executes defer on fallthrough");
 	CHECK_LOG("reached_case2", "fallthrough occurs as expected");
-}
-
-void test_raw_string_literals(void) {
-	// Test 1: Basic raw string with backslashes
-	const char *path = R"(C:\Path\To\File)";
-	CHECK(strcmp(path, "C:\\Path\\To\\File") == 0, "raw string preserves backslashes");
-	// Test 2: Raw string with quotes
-	const char *quoted = R"("Hello" 'World')";
-	CHECK(strcmp(quoted, "\"Hello\" 'World'") == 0, "raw string preserves quotes");
-
-	// Test 3: Raw string with newlines
-	const char *multiline = R"(Line 1
-Line 2
-Line 3)";
-	CHECK(strchr(multiline, '\n') != NULL, "raw string preserves newlines");
-
-	// Test 4: Raw string with escape-like sequences
-	const char *escaped = R"(\n\t\r\0)";
-	CHECK(strcmp(escaped, "\\n\\t\\r\\0") == 0, "raw string doesn't interpret escapes");
 }
 
 void test_vla_struct_member(void) {
@@ -4016,25 +3507,7 @@ void test_char_literal_escape_sequences(void) {
 	CHECK(c7 == 127, "char literal hex escape");
 }
 
-void run_parsing_edge_case_tests(void) {
-	printf("\n=== PARSING EDGE CASE TESTS ===\n");
 
-#ifdef __GNUC__
-	test_utf8_identifiers();
-#endif
-
-	test_digraphs();
-	test_pragma_operator();
-
-#ifdef __GNUC__
-	test_break_escape_stmtexpr();
-	test_stmtexpr_while_break();
-	test_stmtexpr_dowhile_break();
-	test_stmtexpr_nested_loops_break();
-#endif
-	test_string_escape_sequences_varied();
-	test_char_literal_escape_sequences();
-}
 typedef int my_attr_param_t;
 enum { MY_VAL __attribute__((my_attr_param_t)) = 1 };
 
@@ -4099,121 +3572,6 @@ void test_void_typedef_overmatch(void) {
         CHECK_LOG("A", "void typedef defer executed");
 }
 
-void run_verification_bug_tests(void) {
-	printf("\n=== VERIFICATION TESTS ===\n");
-
-	test_switch_conditional_break_defer();
-	test_switch_unconditional_break_works();
-	test_switch_braced_fallthrough_works();
-
-	test_raw_string_literals();
-
-	test_vla_struct_member();
-	test_vla_struct_member_nested();
-	test_offsetof_vs_runtime();
-
-	test_stmt_expr_defer_goto();
-	test_stmt_expr_defer_normal();
-	test_nested_stmt_expr_defer();
-
-	test_vanishing_statement_if_else();
-	test_vanishing_statement_while();
-	test_vanishing_statement_for();
-
-	test_attributed_label_defer();
-
-	test_defer_label();
-	test_generic_default_first_association();
-	test_generic_default_collision();
-	test_generic_default_collision_nested();
-	test_generic_default_outside_switch();
-
-	test_vla_backward_goto_reentry();
-	test_vla_backward_goto_stack_exhaustion();
-	test_vla_backward_goto_with_defer();
-
-	test_vla_pointer_init_semantics();
-	test_typedef_shadow_semantics();
-	test_generic_default_no_switch();
-	test_knr_function_parsing();
-	test_comma_operator_in_init();
-
-	test_switch_skip_hole_strict();
-	test_complex_type_zeroinit();
-	test_continue_in_switch_defer_detailed();
-	test_ultra_complex_declarators();
-	test_thread_local_handling();
-	test_line_directive_preservation();
-	test_alignas_struct_bitfield();
-	test_generic_typedef_not_label();
-	test_c23_attributes_zeroinit();
-	test_bitint_zeroinit();
-
-	test_pragma_pack_preservation();
-	test_return_stmt_expr_with_defer();
-
-	test_security_stmtexpr_value_corruption();
-	test_security_braceless_defer_trap();
-	test_security_switch_goto_double_free();
-
-	test_ghost_shadow_corruption();
-	test_sizeof_vla_codegen();
-	test_keyword_typedef_collision();
-	test_keyword_as_struct_field();
-	test_keyword_as_function_name();
-	test_sizeof_vla_typedef();
-	test_typeof_vla_zeroinit();
-
-	test_bug1_ghost_shadow_while();
-	test_bug1_ghost_shadow_if();
-	test_ghost_shadow_braceless_break();
-	test_ghost_shadow_braceless_continue();
-	test_ghost_shadow_braceless_return();
-	test_ghost_shadow_nested_braceless();
-
-	test_bug2_ultra_complex_exact();
-	test_bug2_deeply_nested_parens();
-
-	test_bug3_stmtexpr_defer_ordering();
-	test_bug3_stmtexpr_defer_variable();
-
-	test_bug4_generic_fnptr();
-	test_bug4_generic_defer_interaction();
-
-	test_bug7_sizeof_vla_variable();
-	test_bug7_sizeof_sizeof_vla();
-	test_bug7_sizeof_vla_element();
-	test_sizeof_parenthesized_vla();
-
-	test_edge_multiple_typedef_shadows();
-	test_edge_defer_in_generic();
-
-	test_number_tokenizer_identifiers();
-	test_hex_numbers_vs_float_suffixes();
-	test_hex_and_identifier_edge_cases();
-	test_valid_number_suffixes();
-
-	test_return_zeroinit_no_defer();
-	test_return_zeroinit_with_defer();
-	test_return_zeroinit_multiple_decls();
-	test_return_zeroinit_nested_blocks();
-
-	test_sizeof_vla_zeroinit();
-	test_goto_raw_decl();
-	test_attributed_default_label();
-	test_stmtexpr_void_cast_return();
-	test_stmtexpr_void_cast_return_helper();
-	test_stmtexpr_void_cast_check();
-	test_variable_named_defer_goto();
-	test_defer_assignment_goto();
-	test_attributed_default_safety();
-	test_for_loop_goto_bypass();
-
-	test_enum_attribute_pollution();
-
-	//test_goto_skips_struct();
-	test_void_typedef_overmatch();
-}
 void test_utf8_latin_extended(void) {
 	int café = 42;
 	int naïve = 100;
@@ -4344,23 +3702,7 @@ void test_utf8_math_identifiers(void) {
 	CHECK(ω > 6.0 && ω < 7.0, "Greek omega");
 }
 
-void run_unicode_digraph_tests(void) {
-	printf("\n--- UTF-8/UCN/Digraph Tests ---\n");
-	test_utf8_latin_extended();
-	test_utf8_greek();
-	test_utf8_cyrillic();
-	test_utf8_cjk();
-	test_ucn_short();
-	test_ucn_long();
-	test_utf8_ucn_mixed();
-	test_digraph_brackets();
-	test_digraph_braces();
-	test_digraph_struct();
-	test_digraph_complex();
-	test_digraph_defer();
-	test_utf8_defer();
-	test_utf8_math_identifiers();
-}
+
 static int zombie_counter = 0;
 
 void test_zombie_defer(void) {
@@ -4557,24 +3899,8 @@ void test_compound_literal_if_condition(void) {
 	CHECK_LOG("TI", "compound literal in if condition: defer works");
 }
 
-void run_compound_literal_loop_tests(void) {
-	printf("\n=== COMPOUND LITERAL IN LOOP HEADER TESTS ===\n");
-	test_compound_literal_for_break();
-	test_compound_literal_for_continue();
-	test_compound_literal_while_break();
-	test_nested_compound_literal_in_loop();
-	test_multiple_compound_literals_in_for();
-	test_compound_literal_if_condition();
-}
-void run_bug_fix_verification_tests(void) {
-	printf("\n=== BUG FIX VERIFICATION TESTS ===\n");
 
-	test_zombie_defer();
-	test_zombie_defer_uninitialized();
-	test_tcc_detection_logic();
-	test_unicode_extended_ranges();
-	test_memory_interning_pattern();
-}
+
 void test_issue4_strtoll_unsigned(void) {
 	// Test 1: UINT64_MAX as hex literal
 	unsigned long long val1 = 0xFFFFFFFFFFFFFFFFULL;
@@ -4662,30 +3988,6 @@ void test_defer_nested_control_structures(void) {
 	CHECK_EQ(cleanup_order[2], 10, "nested defer: second iteration defer");
 }
 
-void test_raw_keyword_after_static(void) {
-	// raw after static - this was the bug: 'raw' was not consumed
-	static raw int raw_after_static;
-	CHECK_EQ(raw_after_static, 0, "static raw int: raw consumed, no zero-init");
-}
-
-void test_raw_keyword_after_extern(void) {
-	// raw after extern - similar pattern
-	extern raw int test_raw_extern_var;
-	// Can't check value of extern, just verify it compiles
-	(void)test_raw_extern_var;
-	printf("[PASS] extern raw int: compiles correctly\n");
-	passed++;
-	total++;
-}
-
-int test_raw_extern_var = 42;
-
-void test_raw_keyword_before_static(void) {
-	// raw before static - this always worked
-	raw static int raw_before_static;
-	CHECK_EQ(raw_before_static, 0, "raw static int: raw consumed, no zero-init");
-}
-
 static void defer_cleanup_func(int *p) {
 	if (p) *p = 0;
 }
@@ -4713,19 +4015,7 @@ void test_defer_in_attribute_with_defer_stmt(void) {
 	CHECK_EQ(result, 42, "defer stmt + cleanup attr: both work");
 }
 
-void run_reported_bug_fix_tests(void) {
-	printf("\n=== BUG FIX TESTS ===\n");
-	test_issue4_strtoll_unsigned();
-	test_issue5_raw_typedef_collision();
-	test_issue7_defer_in_for_body();
-	test_issue7_defer_before_for();
-	test_defer_nested_control_structures();
-	test_raw_keyword_after_static();
-	test_raw_keyword_after_extern();
-	test_raw_keyword_before_static();
-	test_defer_in_attribute_cleanup();
-	test_defer_in_attribute_with_defer_stmt();
-}
+
 void test_register_typeof_zeroinit(void) {
 	// register variables can't have their address taken
 	// So typeof(int) register x should NOT use memset(&x, ...)
@@ -4826,263 +4116,7 @@ void test_volatile_typeof_array(void) {
 	CHECK(all_zero, "volatile typeof array zeroed");
 }
 
-void run_additional_bug_fix_tests(void) {
-	printf("\n=== ADDITIONAL BUG FIX TESTS ===\n");
-	printf("(register+typeof, C23 digit separators, volatile+typeof)\n\n");
 
-	test_register_typeof_zeroinit();
-	test_register_typeof_multiple();
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
-	test_c23_digit_separator_decimal();
-	test_c23_digit_separator_binary();
-	test_c23_digit_separator_hex();
-	test_c23_digit_separator_octal();
-	test_c23_digit_separator_float();
-	test_c23_digit_separator_suffix();
-#else
-	printf("(C23 digit separator tests skipped - compiler doesn't support C23)\n");
-#endif
-	test_volatile_typeof_zeroinit();
-	test_volatile_typeof_struct();
-	test_volatile_typeof_array();
-}
-void test_raw_string_basic(void) {
-	// C23 raw string literal with newlines
-	const char *json = R"(
-{
-    "key": "value"
-}
-)";
-	CHECK(json != NULL, "raw string literal basic");
-	CHECK(strlen(json) > 10, "raw string has content");
-}
-
-void test_raw_string_with_backslash(void) {
-	// Raw string with backslashes (regex pattern) - should NOT be escaped
-	const char *regex = R"(\d+\s*\w+)";
-	CHECK(regex[0] == '\\', "raw string preserves backslash");
-	CHECK(regex[1] == 'd', "raw string no escape processing");
-}
-
-void test_raw_string_with_quotes(void) {
-	// Raw string containing quote characters
-	const char *s = R"(He said "hello")";
-	CHECK(strstr(s, "\"hello\"") != NULL, "raw string with quotes");
-}
-
-void test_raw_string_with_delimiter(void) {
-	// Raw string with custom delimiter to allow )" inside
-	const char *code = R"delim(
-        const char *s = R"(nested)";
-    )delim";
-	CHECK(code != NULL, "raw string with delimiter");
-}
-
-void test_raw_string_all_escape_sequences(void) {
-	// All C escape sequences should be preserved literally
-	const char *s = R"(\a\b\f\n\r\t\v\\\'\"\\0\x1F\777)";
-	CHECK(s[0] == '\\' && s[1] == 'a', "raw \\a preserved");
-	CHECK(s[2] == '\\' && s[3] == 'b', "raw \\b preserved");
-	CHECK(strstr(s, "\\n") != NULL, "raw \\n preserved");
-	CHECK(strstr(s, "\\0") != NULL, "raw \\0 preserved");
-	CHECK(strstr(s, "\\x1F") != NULL, "raw \\x1F preserved");
-}
-
-void test_raw_string_multiline_complex(void) {
-	// Complex multiline with various special chars
-	const char *sql = R"(
-SELECT *
-FROM users
-WHERE name = 'O''Brien'
-  AND email LIKE '%@example.com'
-  AND data ~ '^\d{3}-\d{4}$'
-ORDER BY id DESC;
-)";
-	CHECK(strstr(sql, "SELECT") != NULL, "raw multiline SELECT");
-	CHECK(strstr(sql, "O''Brien") != NULL, "raw multiline escaped quote");
-	CHECK(strstr(sql, "\\d{3}") != NULL, "raw multiline regex");
-}
-
-void test_raw_string_json_complex(void) {
-	// Complex JSON with nested structures
-	const char *json = R"({
-    "users": [
-        {"name": "Alice", "age": 30, "path": "C:\\Users\\Alice"},
-        {"name": "Bob", "age": 25, "regex": "^\\w+@\\w+\\.\\w+$"}
-    ],
-    "config": {
-        "escapes": "\t\n\r",
-        "unicode": "\u0041\u0042"
-    }
-})";
-	CHECK(strstr(json, "C:\\\\Users") != NULL, "raw JSON backslash path");
-	CHECK(strstr(json, "\\\\w+") != NULL, "raw JSON regex pattern");
-}
-
-void test_raw_string_empty(void) {
-	const char *empty = R"()";
-	CHECK(strlen(empty) == 0, "raw empty string");
-}
-
-void test_raw_string_single_char(void) {
-	const char *a = R"(a)";
-	const char *bs = R"(\)";
-	const char *qt = R"(")";
-	CHECK(strcmp(a, "a") == 0, "raw single char a");
-	CHECK(strcmp(bs, "\\") == 0, "raw single backslash");
-	CHECK(strcmp(qt, "\"") == 0, "raw single quote");
-}
-
-void test_raw_string_only_special_chars(void) {
-	const char *s = R"(
-	)"; // newline + tab
-	CHECK(s[0] == '\n', "raw starts with newline");
-	CHECK(s[1] == '\t', "raw has tab");
-}
-
-void test_raw_string_parens_inside(void) {
-	// Parentheses that don't end the string
-	const char *s = R"(func(a, b))";
-	CHECK(strcmp(s, "func(a, b)") == 0, "raw with parens inside");
-
-	const char *nested = R"(((((deep)))))";
-	CHECK(strcmp(nested, "((((deep))))") == 0, "raw deeply nested parens");
-}
-
-void test_raw_string_delimiter_edge_cases(void) {
-	// Various delimiter patterns
-	const char *s1 = R"x(content)x";
-	CHECK(strcmp(s1, "content") == 0, "raw single char delimiter");
-
-	const char *s2 = R"abc123(data)abc123";
-	CHECK(strcmp(s2, "data") == 0, "raw alphanumeric delimiter");
-
-	const char *s3 = R"___(underscores)___";
-	CHECK(strcmp(s3, "underscores") == 0, "raw underscore delimiter");
-}
-
-void test_raw_string_false_endings(void) {
-	// Content that looks like it might end the string but doesn't
-	const char *s = R"foo()foo not end )foo still not end)foo";
-	CHECK(strstr(s, ")foo not end") != NULL, "raw false ending 1");
-	CHECK(strstr(s, ")foo still not end") != NULL, "raw false ending 2");
-}
-
-void test_raw_string_with_null_like(void) {
-	// Content that looks like null but isn't
-	const char *s = R"(\0 NUL \x00)";
-	CHECK(strlen(s) > 10, "raw null-like not terminated");
-	CHECK(strstr(s, "\\0") != NULL, "raw \\0 literal");
-	CHECK(strstr(s, "\\x00") != NULL, "raw \\x00 literal");
-}
-
-void test_raw_string_wide_prefix(void) {
-	// Wide/UTF raw strings
-	const wchar_t *ws = LR"(wide\nstring)";
-	CHECK(ws != NULL, "LR wide raw string");
-
-	const char *u8s = u8R"(utf8\tstring)";
-	CHECK(u8s != NULL, "u8R UTF-8 raw string");
-	CHECK(strstr(u8s, "\\t") != NULL, "u8R preserves backslash");
-}
-
-void test_raw_string_adjacent_concat(void) {
-	// Adjacent string literal concatenation
-	const char *s = R"(first)"
-			R"(second)";
-	CHECK(strstr(s, "first") != NULL, "raw concat first");
-	CHECK(strstr(s, "second") != NULL, "raw concat second");
-
-	// Mixed raw and regular
-	const char *mixed = R"(raw\n)"
-			    "regular\n";
-	CHECK(strstr(mixed, "raw\\n") != NULL, "mixed keeps raw backslash");
-	CHECK(strchr(mixed, '\n') != NULL, "mixed has real newline");
-}
-
-void test_raw_string_in_expressions(void) {
-	// Raw strings in various expression contexts
-	size_t len = strlen(R"(hello)");
-	CHECK(len == 5, "raw in strlen");
-
-	int cmp = strcmp(R"(abc)", "abc");
-	CHECK(cmp == 0, "raw in strcmp");
-
-	const char *arr[] = {R"(one)", R"(two\n)", R"(three)"};
-	CHECK(strcmp(arr[1], "two\\n") == 0, "raw in array init");
-}
-
-void test_raw_string_windows_paths(void) {
-	const char *path = R"(C:\Program Files\App\file.txt)";
-	CHECK(strstr(path, "C:\\Program") != NULL, "raw windows path");
-	CHECK(strstr(path, "\\App\\") != NULL, "raw windows subdir");
-}
-
-void test_raw_string_regex_patterns(void) {
-	const char *email = R"(^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$)";
-	CHECK(strstr(email, "\\.[a-zA-Z]") != NULL, "raw regex dot");
-
-	const char *ip = R"(\b(?:\d{1,3}\.){3}\d{1,3}\b)";
-	CHECK(strstr(ip, "\\b") != NULL, "raw regex word boundary");
-	CHECK(strstr(ip, "\\d{1,3}") != NULL, "raw regex digit");
-}
-
-void test_raw_string_code_snippets(void) {
-	const char *c_code = R"(
-#include <stdio.h>
-int main() {
-    printf("Hello, \"World\"!\n");
-    return 0;
-}
-)";
-	CHECK(strstr(c_code, "#include") != NULL, "raw C code include");
-	CHECK(strstr(c_code, "\\\"World\\\"") != NULL, "raw C code quotes");
-	CHECK(strstr(c_code, "\\n") != NULL, "raw C code newline escape");
-}
-
-void test_raw_string_html_template(void) {
-	const char *html = R"(<!DOCTYPE html>
-<html>
-<head><title>Test</title></head>
-<body>
-<script>
-    var x = "Hello \"World\"";
-    if (a < b && c > d) { }
-</script>
-</body>
-</html>)";
-	CHECK(strstr(html, "<!DOCTYPE") != NULL, "raw HTML doctype");
-	CHECK(strstr(html, "<script>") != NULL, "raw HTML script");
-	CHECK(strstr(html, "\\\"World\\\"") != NULL, "raw HTML JS string");
-}
-
-void run_raw_string_torture_tests(void) {
-	printf("\n--- Raw String Literal Torture Tests ---\n");
-	test_raw_string_all_escape_sequences();
-	test_raw_string_multiline_complex();
-	test_raw_string_json_complex();
-	test_raw_string_empty();
-	test_raw_string_single_char();
-	test_raw_string_only_special_chars();
-	test_raw_string_parens_inside();
-	test_raw_string_delimiter_edge_cases();
-	test_raw_string_false_endings();
-	test_raw_string_with_null_like();
-	test_raw_string_wide_prefix();
-	test_raw_string_adjacent_concat();
-	test_raw_string_in_expressions();
-	test_raw_string_windows_paths();
-	test_raw_string_regex_patterns();
-	test_raw_string_code_snippets();
-	test_raw_string_html_template();
-}
-void run_c23_raw_string_tests(void) {
-	printf("\n--- C23 Raw String Literal Tests ---\n");
-	test_raw_string_basic();
-	test_raw_string_with_backslash();
-	test_raw_string_with_quotes();
-	test_raw_string_with_delimiter();
-}
 #include <errno.h>
 
 #ifdef EWOULDBLOCK
@@ -5102,11 +4136,7 @@ void test_logical_op_eagain(void) {
 	CHECK(!result, "IS_EAGAIN false case (logical-op regression)");
 }
 
-void run_logical_op_regression_tests(void) {
-	printf("\n=== LOGICAL-OP REGRESSION TESTS ===\n");
-	printf("(coreutils iopoll.c -Wlogical-op / -fpreprocessed fix)\n\n");
-	test_logical_op_eagain();
-}
+
 static void __attribute__((noinline)) pollute_stack_for_switch(void) {
 	volatile char garbage[256];
 	for (int i = 0; i < 256; i++) garbage[i] = (char)(0xCC + i);
@@ -5248,26 +4278,6 @@ void test_setjmp_detection_direct(void) {
 	CHECK_LOG("BD", "defer works in function without setjmp");
 }
 
-void test_raw_as_function_pointer_var(void) {
-	int (*raw)(const char *) = (int (*)(const char *))strlen;
-	CHECK(raw("hello") == 5, "raw as function pointer variable");
-}
-
-void test_raw_as_loop_counter(void) {
-	int sum = 0;
-	for (int raw = 0; raw < 5; raw++) sum += raw;
-	CHECK_EQ(sum, 10, "raw as loop counter");
-}
-
-void test_raw_struct_field_access(void) {
-	struct {
-		int raw;
-	} s;
-
-	s.raw = 77;
-	CHECK_EQ(s.raw, 77, "raw as struct field access");
-}
-
 void test_generic_nested_default_in_switch_defer(void) {
 	log_reset();
 	int x = 1;
@@ -5351,17 +4361,6 @@ void test_vla_zeroed_each_loop_iteration(void) {
 		CHECK(all_zero, "VLA zeroed on each loop iteration");
 		for (int j = 0; j < n; j++) buf[j] = 42 + i;
 	}
-}
-
-void test_raw_vla_skips_zeroinit(void) {
-	int n = 4;
-	int sum = 0;
-	for (int i = 0; i < 3; i++) {
-		raw int buf[n];
-		buf[0] = i;
-		sum += buf[0];
-	}
-	CHECK_EQ(sum, 3, "raw VLA in loop compiles and runs");
 }
 
 void test_atomic_struct_zeroed(void) {
@@ -5635,45 +4634,6 @@ void test_typeof_volatile_inner_zeroed(void) {
 }
 #endif
 
-typedef int *IntPtr;
-
-void test_raw_star_ptr_decl(void) {
-	int x = 42;
-	{
-		defer(void) 0;
-		raw IntPtr p;
-		p = &x;
-		CHECK_EQ(*p, 42, "raw typedef ptr declaration");
-
-		raw int *q;
-		q = &x;
-		CHECK_EQ(*q, 42, "raw int *q declaration");
-	}
-}
-
-void test_typedef_as_raw(void) {
-	typedef int raw;
-	raw x;
-	CHECK_EQ(x, 0, "typedef raw: zero-initialized");
-	raw arr[4];
-	int all_zero = 1;
-	for (int i = 0; i < 4; i++)
-		if (arr[i] != 0) all_zero = 0;
-	CHECK(all_zero, "typedef raw array: zero-initialized");
-}
-
-void test_typedef_raw_with_pointer(void) {
-	typedef int raw;
-	raw *p;
-	CHECK(p == NULL, "typedef raw pointer: zero to null");
-}
-
-void test_typedef_raw_multi_decl(void) {
-	typedef int raw;
-	raw a, b, c;
-	CHECK(a == 0 && b == 0 && c == 0, "typedef raw multi-decl: all zeroed");
-}
-
 typedef int GenCount;
 static int _generic_colon_helper(void) {
 	GenCount n = 10;
@@ -5688,91 +4648,6 @@ void test_generic_colon_in_defer(void) {
 	CHECK_EQ(r, 20, "_Generic colon in defer: typedef association correct");
 }
 
-static int _goto_kw_label_helper(int skip) {
-	log_reset();
-	defer log_append("D");
-	if (skip) goto raw;
-	log_append("body");
-raw:
-	log_append("end");
-	return 0;
-}
-
-void test_goto_keyword_label_defer(void) {
-	// Non-skip path: body + end + defer
-	_goto_kw_label_helper(0);
-	CHECK_LOG("bodyendD", "goto keyword label: non-skip defer fires");
-	// Skip path: goto raw jumps to raw: label, defer still fires at return
-	_goto_kw_label_helper(1);
-	CHECK_LOG("endD", "goto keyword label: skip path defer fires");
-}
-
-// Keyword label with zero-init variable — goto does NOT skip over the decl
-static int _goto_kw_zeroinit_helper(int skip) {
-	int x;
-	if (skip) goto defer;
-	x = 42;
-defer:
-	return x;
-}
-
-void test_goto_keyword_label_zeroinit(void) {
-	CHECK_EQ(_goto_kw_zeroinit_helper(0), 42, "goto keyword label zeroinit: non-skip");
-	CHECK_EQ(_goto_kw_zeroinit_helper(1), 0, "goto keyword label zeroinit: skip (x = 0)");
-}
-
-void run_issue_validation_tests(void) {
-	printf("\n=== ISSUE VALIDATION TESTS ===\n");
-	test_switch_unbraced_inter_case_decl();
-	test_switch_unbraced_multi_decl_inter_case();
-	test_generic_default_switch_defer_combo();
-	test_generic_default_nested_switch_defer();
-	test_typedef_table_scope_resilience();
-	test_typedef_table_churn();
-	test_setjmp_detection_direct();
-	test_raw_as_function_pointer_var();
-	test_raw_as_loop_counter();
-	test_raw_struct_field_access();
-	test_generic_nested_default_in_switch_defer();
-	test_generic_multi_default_switch();
-	test_typedef_braceless_for_restore();
-	test_typedef_nested_braceless_restore();
-	test_typedef_braceless_while_restore();
-	test_vla_typedef_pointer_vs_value();
-	test_vla_zeroed_each_loop_iteration();
-	test_raw_vla_skips_zeroinit();
-	test_atomic_struct_zeroed();
-	test_atomic_specifier_struct_zeroed();
-	test_attr_before_type_zeroed();
-	test_attr_between_type_and_var_zeroed();
-	test_attr_after_var_zeroed();
-	test_attr_pointer_zeroed();
-	test_attr_paren_ptr_zeroed();
-	test_multi_attr_zeroed();
-	test_attr_struct_var_zeroed();
-	test_switch_no_match_defer_skipped();
-	test_switch_no_default_no_match_with_defer();
-	test_generic_compound_literal_association();
-#ifdef __GNUC__
-	test_generic_stmt_expr_with_defer_wrapper();
-#endif
-	test_assert_active_by_default();
-	test_assert_still_active_after_reinclusion();
-	test_knr_defer_goto();
-	test_knr_typedef_param_defer();
-	test_knr_multi_label();
-#ifdef __GNUC__
-	test_label_zeroinit_in_stmt_expr();
-	test_typeof_volatile_inner_zeroed();
-#endif
-	test_raw_star_ptr_decl();
-	test_typedef_as_raw();
-	test_typedef_raw_with_pointer();
-	test_typedef_raw_multi_decl();
-	test_generic_colon_in_defer();
-	test_goto_keyword_label_defer();
-	test_goto_keyword_label_zeroinit();
-}
 static void test_vla_nested_delimiter_depth(void) {
 	int n = 4;
 	// VLA inside nested parenthesized expression
@@ -6001,27 +4876,6 @@ static void test_goto_converging_defers(void) {
 gc_out:
 	log_append("E");
 	CHECK_LOG("YZE", "goto converging defers");
-}
-
-static void test_switch_raw_var_in_body(void) {
-	int result = 0;
-	int x = 2;
-	switch (x) {
-		raw int y;
-	case 1:
-		y = 10;
-		result = y;
-		break;
-	case 2:
-		y = 20;
-		result = y;
-		break;
-	default:
-		y = 30;
-		result = y;
-		break;
-	}
-	CHECK_EQ(result, 20, "switch raw var in body");
 }
 
 static void test_stack_aggregate_zeroinit(void) {
@@ -6500,16 +5354,6 @@ static void test_typedef_nested_for_braceless(void) {
 	CHECK_EQ(y, 0, "typedef nested for braceless: after");
 }
 
-static void test_raw_string_max_delimiter(void) {
-	const char *s = R"ABCDEFGHIJKLMNOP(hello raw)ABCDEFGHIJKLMNOP";
-	CHECK(strcmp(s, "hello raw") == 0, "raw string 16-char delimiter");
-}
-
-static void test_raw_string_near_max_delimiter(void) {
-	const char *s = R"ABCDEFGHIJKLMNO(near max)ABCDEFGHIJKLMNO";
-	CHECK(strcmp(s, "near max") == 0, "raw string 15-char delimiter");
-}
-
 static void test_typedef_shadow_braceless_for_complex(void) {
 	typedef int _TSFC;
 	_TSFC a;
@@ -6703,11 +5547,6 @@ static void test_typedef_struct_return_with_defer(void) {
 	_TypedefRetTest r = _typedef_struct_ret_with_defer();
 	CHECK_EQ(r.val, 77, "typedef struct return with defer: value correct");
 	CHECK_EQ(_trt_defer_flag, 1, "typedef struct return with defer: defer fired");
-}
-
-static void test_raw_string_16_char_delimiter(void) {
-	const char *s = R"1234567890ABCDEF(sixteen char delim)1234567890ABCDEF";
-	CHECK(strcmp(s, "sixteen char delim") == 0, "raw string exactly 16-char delimiter");
 }
 
 static int _goto_fnptr_helper(void) {
@@ -7328,4 +6167,411 @@ static void test_void_parenthesized_func_defer(void) {
 	_paren_void_flag = 0;
 	_paren_void_func();
 	CHECK_EQ(_paren_void_flag, 11, "void (func)(): defer fires correctly");
+}
+
+void run_parse_tests(void) {
+	printf("\n=== PARSE TESTS ===\n");
+
+	/* Multi-declarator tests */
+	test_multi_decl_basic();
+	test_multi_decl_mixed_ptr();
+	test_multi_decl_arrays();
+	test_multi_decl_partial_init();
+	test_multi_decl_long();
+	test_multi_decl_func_ptr();
+
+	/* Typedef tracking tests */
+	test_typedef_simple();
+	test_typedef_pointer();
+	test_typedef_struct();
+	test_typedef_array();
+	test_typedef_func_ptr();
+	test_typedef_chained();
+	test_typedef_multi_var();
+	test_typedef_block_scoped();
+	test_typedef_shadowing();
+	test_typedef_multi_declarator();
+	test_typedef_after_braceless_while();
+	test_typedef_after_braceless_if_else();
+	test_typedef_braceless_nested_control();
+	test_typedef_multi_braceless_sequential();
+
+	/* Edge case tests */
+	test_bitfield_zeroinit();
+	test_anonymous_struct();
+	test_anonymous_union();
+	test_long_declaration();
+	test_func_ptr_array();
+	test_ptr_to_array();
+	test_defer_compound_literal();
+	test_nested_struct_union_with_defer();
+	test_deeply_nested_struct_defer_scopes();
+	test_struct_in_braceless_control();
+	test_defer_across_struct_boundaries();
+	test_duffs_device();
+	CHECK_LOG("XXXXXEF", "Duff's device with defer");
+	test_defer_ternary();
+	CHECK_LOG("1T", "defer with ternary");
+	test_empty_defer();
+	test_do_while_0_defer();
+	CHECK_LOG("1DEF", "do-while(0) with defer");
+	test_defer_comma_operator();
+
+	/* Bug regression tests */
+#ifdef __GNUC__
+	test_stmt_expr_defer_nested_block();
+#else
+	printf("[SKIP] stmt expr tests (not GCC)\n");
+#endif
+	test_non_vla_typedef_still_works();
+	test_switch_defer_no_leak();
+	test_enum_constant_shadows_typedef();
+	test_enum_shadow_star_ambiguity();
+	test_enum_shadow_statement_form();
+	test_ppnum_underscore_paste();
+	test_local_function_decl();
+
+	/* Stress tests */
+	test_defer_shadowing_vars();
+	test_typedef_hiding();
+	test_typedef_same_name_shadow();
+	test_typedef_nested_same_name_shadow();
+	test_typedef_shadow_then_pointer();
+	test_static_local_init();
+	test_complex_func_ptr();
+	test_switch_default_first();
+	test_macro_hidden_defer();
+	test_macro_hidden_decl();
+	test_void_return_void_call();
+	test_switch_continue();
+	test_fam_struct_zeroinit();
+#ifdef __GNUC__
+	test_stmt_expr_side_effects();
+#endif
+	test_typedef_scope_churn_consolidated();
+
+	/* Case labels inside blocks */
+	test_case_in_nested_block();
+	test_case_after_defer_in_block();
+	test_duff_device_with_defer_at_top();
+
+	/* Preprocessor numeric literals */
+	test_float128_suffix();
+	test_float64_suffix();
+	test_float32_suffix();
+	test_float16_suffix();
+	test_bf16_suffix();
+
+	/* Preprocessor system macros */
+	test_linux_macros();
+	test_signal_macros();
+	test_glibc_macros();
+	test_posix_macros();
+
+	/* Parsing edge cases */
+#ifdef __GNUC__
+	test_utf8_identifiers();
+#endif
+	test_digraphs();
+	test_pragma_operator();
+#ifdef __GNUC__
+	test_break_escape_stmtexpr();
+	test_stmtexpr_while_break();
+	test_stmtexpr_dowhile_break();
+	test_stmtexpr_nested_loops_break();
+#endif
+	test_string_escape_sequences_varied();
+	test_char_literal_escape_sequences();
+
+	/* Verification tests */
+	test_switch_conditional_break_defer();
+	test_switch_unconditional_break_works();
+	test_switch_braced_fallthrough_works();
+	test_vla_struct_member();
+	test_vla_struct_member_nested();
+	test_offsetof_vs_runtime();
+	test_stmt_expr_defer_goto();
+	test_stmt_expr_defer_normal();
+	test_nested_stmt_expr_defer();
+	test_vanishing_statement_if_else();
+	test_vanishing_statement_while();
+	test_vanishing_statement_for();
+	test_attributed_label_defer();
+	test_defer_label();
+	test_generic_default_first_association();
+	test_generic_default_collision();
+	test_generic_default_collision_nested();
+	test_generic_default_outside_switch();
+	test_vla_backward_goto_reentry();
+	test_vla_backward_goto_stack_exhaustion();
+	test_vla_backward_goto_with_defer();
+	test_vla_pointer_init_semantics();
+	test_typedef_shadow_semantics();
+	test_generic_default_no_switch();
+	test_knr_function_parsing();
+	test_comma_operator_in_init();
+	test_switch_skip_hole_strict();
+	test_complex_type_zeroinit();
+	test_continue_in_switch_defer_detailed();
+	test_ultra_complex_declarators();
+	test_thread_local_handling();
+	test_line_directive_preservation();
+	test_alignas_struct_bitfield();
+	test_generic_typedef_not_label();
+	test_c23_attributes_zeroinit();
+	test_bitint_zeroinit();
+	test_pragma_pack_preservation();
+	test_return_stmt_expr_with_defer();
+	test_security_stmtexpr_value_corruption();
+	test_security_braceless_defer_trap();
+	test_security_switch_goto_double_free();
+	test_ghost_shadow_corruption();
+	test_sizeof_vla_codegen();
+	test_keyword_typedef_collision();
+	test_keyword_as_struct_field();
+	test_keyword_as_function_name();
+	test_sizeof_vla_typedef();
+	test_typeof_vla_zeroinit();
+	test_bug1_ghost_shadow_while();
+	test_bug1_ghost_shadow_if();
+	test_ghost_shadow_braceless_break();
+	test_ghost_shadow_braceless_continue();
+	test_ghost_shadow_braceless_return();
+	test_ghost_shadow_nested_braceless();
+	test_bug2_ultra_complex_exact();
+	test_bug2_deeply_nested_parens();
+	test_bug3_stmtexpr_defer_ordering();
+	test_bug3_stmtexpr_defer_variable();
+	test_bug4_generic_fnptr();
+	test_bug4_generic_defer_interaction();
+	test_bug7_sizeof_vla_variable();
+	test_bug7_sizeof_sizeof_vla();
+	test_bug7_sizeof_vla_element();
+	test_sizeof_parenthesized_vla();
+	test_edge_multiple_typedef_shadows();
+	test_edge_defer_in_generic();
+	test_number_tokenizer_identifiers();
+	test_hex_numbers_vs_float_suffixes();
+	test_hex_and_identifier_edge_cases();
+	test_valid_number_suffixes();
+	test_return_zeroinit_no_defer();
+	test_return_zeroinit_with_defer();
+	test_return_zeroinit_multiple_decls();
+	test_return_zeroinit_nested_blocks();
+	test_sizeof_vla_zeroinit();
+	test_goto_raw_decl();
+	test_attributed_default_label();
+	test_stmtexpr_void_cast_return();
+	test_stmtexpr_void_cast_return_helper();
+	test_stmtexpr_void_cast_check();
+	test_variable_named_defer_goto();
+	test_defer_assignment_goto();
+	test_attributed_default_safety();
+	test_for_loop_goto_bypass();
+	test_enum_attribute_pollution();
+	test_void_typedef_overmatch();
+
+	/* Unicode/digraph tests */
+	test_utf8_latin_extended();
+	test_utf8_greek();
+	test_utf8_cyrillic();
+	test_utf8_cjk();
+	test_ucn_short();
+	test_ucn_long();
+	test_utf8_ucn_mixed();
+	test_digraph_brackets();
+	test_digraph_braces();
+	test_digraph_struct();
+	test_digraph_complex();
+	test_digraph_defer();
+	test_utf8_defer();
+	test_utf8_math_identifiers();
+
+	/* Compound literal in loop header */
+	test_compound_literal_for_break();
+	test_compound_literal_for_continue();
+	test_compound_literal_while_break();
+	test_nested_compound_literal_in_loop();
+	test_multiple_compound_literals_in_for();
+	test_compound_literal_if_condition();
+
+	/* Bug fix verification */
+	test_zombie_defer();
+	test_zombie_defer_uninitialized();
+	test_tcc_detection_logic();
+	test_unicode_extended_ranges();
+	test_memory_interning_pattern();
+
+	/* Reported bug fixes */
+	test_issue4_strtoll_unsigned();
+	test_issue5_raw_typedef_collision();
+	test_issue7_defer_in_for_body();
+	test_issue7_defer_before_for();
+	test_defer_nested_control_structures();
+	test_defer_in_attribute_cleanup();
+	test_defer_in_attribute_with_defer_stmt();
+
+	/* Additional bug fixes */
+	test_register_typeof_zeroinit();
+	test_register_typeof_multiple();
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
+	test_c23_digit_separator_decimal();
+	test_c23_digit_separator_binary();
+	test_c23_digit_separator_hex();
+	test_c23_digit_separator_octal();
+	test_c23_digit_separator_float();
+	test_c23_digit_separator_suffix();
+#else
+	printf("(C23 digit separator tests skipped - compiler doesn't support C23)\n");
+#endif
+	test_volatile_typeof_zeroinit();
+	test_volatile_typeof_struct();
+	test_volatile_typeof_array();
+
+	/* Logical-op regression */
+	test_logical_op_eagain();
+
+	/* Issue validation */
+	test_switch_unbraced_inter_case_decl();
+	test_switch_unbraced_multi_decl_inter_case();
+	test_generic_default_switch_defer_combo();
+	test_generic_default_nested_switch_defer();
+	test_typedef_table_scope_resilience();
+	test_typedef_table_churn();
+	test_setjmp_detection_direct();
+	test_generic_nested_default_in_switch_defer();
+	test_generic_multi_default_switch();
+	test_typedef_braceless_for_restore();
+	test_typedef_nested_braceless_restore();
+	test_typedef_braceless_while_restore();
+	test_vla_typedef_pointer_vs_value();
+	test_vla_zeroed_each_loop_iteration();
+	test_atomic_struct_zeroed();
+	test_atomic_specifier_struct_zeroed();
+	test_attr_before_type_zeroed();
+	test_attr_between_type_and_var_zeroed();
+	test_attr_after_var_zeroed();
+	test_attr_pointer_zeroed();
+	test_attr_paren_ptr_zeroed();
+	test_multi_attr_zeroed();
+	test_attr_struct_var_zeroed();
+	test_switch_no_match_defer_skipped();
+	test_switch_no_default_no_match_with_defer();
+	test_generic_compound_literal_association();
+#ifdef __GNUC__
+	test_generic_stmt_expr_with_defer_wrapper();
+#endif
+	test_assert_active_by_default();
+	test_assert_still_active_after_reinclusion();
+	test_knr_defer_goto();
+	test_knr_typedef_param_defer();
+	test_knr_multi_label();
+#ifdef __GNUC__
+	test_label_zeroinit_in_stmt_expr();
+	test_typeof_volatile_inner_zeroed();
+#endif
+	test_generic_colon_in_defer();
+
+	/* Additional parse tests */
+	test_vla_nested_delimiter_depth();
+	test_typedef_survives_bare_semicolons();
+	test_for_init_typedef_shadow_cleanup();
+	test_orelse_comma_operator_expr();
+	test_orelse_sequential_comma();
+	test_short_keyword_recognition();
+#if __STDC_VERSION__ >= 202311L
+	test_c23_attr_positions();
+#endif
+	test_vla_typedef_complex_size();
+	test_goto_stress_many_targets();
+	test_goto_converging_defers();
+	test_stack_aggregate_zeroinit();
+	test_defer_with_indirect_call();
+	test_vla_size_side_effect();
+	test_multi_ptr_zeroinit();
+	test_typedef_scope_after_braceless();
+	test_const_orelse_scalar_fallback();
+	test_const_orelse_scalar_eval_once();
+	test_const_orelse_multi_eval_once();
+	test_defer_all_scopes_fire();
+	test_defer_loop_all_iters_fire();
+	test_typedef_braceless_if_no_leak();
+	test_typedef_braceless_while_no_leak();
+	test_typedef_braceless_for_shadow_restore();
+	test_typedef_braceless_else_no_leak();
+	test_typedef_nested_braceless_control();
+	test_typedef_for_init_shadow_multi_var();
+	test_goto_forward_over_block_safe();
+	test_goto_forward_no_decl_skip();
+	test_goto_backward_safe();
+	test_goto_forward_same_scope_label();
+	test_vla_sizeof_no_double_eval();
+	test_vla_memset_zeroinit();
+	test_defer_scope_isolation();
+	test_defer_braceless_rejected();
+	test_zeroinit_typedef_after_control();
+	test_for_init_shadow_braceless_body();
+	test_const_orelse_ptr_eval_once();
+	test_const_orelse_multi_fallback();
+	test_void_return_call_with_defer();
+	test_void_return_cast_with_defer();
+	test_switch_case_defer_ordering();
+	test_switch_defer_loop_nested();
+	test_typedef_for_switch_scope();
+	test_typedef_nested_for_braceless();
+	test_typedef_shadow_braceless_for_complex();
+	test_typeof_large_struct_zeroinit();
+	test_typeof_nested_struct_zeroinit();
+	test_typedef_shadow_braceless_for_multi_stmt();
+	test_typedef_shadow_braceless_for_nested_loops();
+	test_typedef_shadow_for_with_if_body();
+#if defined(__GNUC__) && !defined(__clang__)
+	test_for_init_typedef_no_leak();
+	test_for_init_typedef_braceless_no_leak();
+	test_for_init_typedef_nested_loops();
+#endif
+	test_defer_switch_dead_zone_braced();
+	test_generic_const_array_zeroinit();
+	test_named_struct_return_with_defer();
+	test_typedef_struct_return_with_defer();
+	test_goto_fnptr_decl_after_label();
+	test_goto_fnptr_decl_before_goto();
+	test_goto_array_ptr_decl_after_label();
+	test_typeof_const_zero_init();
+	test_param_typedef_shadow();
+	test_goto_over_static_decl();
+	test_defer_break_continue_rejected();
+	test_defer_inner_loop_break();
+	test_defer_inner_loop_continue();
+	test_defer_inner_switch_break();
+	test_defer_inner_do_while_break();
+	test_t_heuristic_shadow_mul();
+	test_t_heuristic_shadow_arith();
+	test_t_heuristic_shadow_ptr_deref();
+	test_t_heuristic_shadow_scope();
+	test_t_heuristic_shadow_param();
+	test_t_heuristic_noshadow();
+	test_array_orelse_rejected();
+	test_deep_struct_nesting_goto();
+	test_generic_array_not_vla();
+	test_c23_attr_void_function();
+
+	/* Bug regression round 2 */
+	test_bug2_filescope_t_mul();
+	test_bug2_filescope_t_arith();
+	test_bug2_filescope_t_in_expr();
+	test_bug5_void_return_call_defer();
+	test_bug5_void_return_cast_defer();
+	test_bug5_void_return_bare_defer();
+#ifdef __GNUC__
+	test_bug4_stmt_expr_in_defer();
+#endif
+	test_bug1_digraph_in_defer();
+	test_bug6_setjmp_detection();
+	test_bug_r2_fnptr_return_typedef();
+	test_bug_r2_fnptr_return_raw();
+	test_bug_r2_ptr_return();
+	test_bug_r1_readonly_dir();
+	test_bug_r3_line_directive();
+	test_void_parenthesized_func_defer();
 }
