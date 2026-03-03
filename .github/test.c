@@ -1,6 +1,9 @@
 // Massive test suite for Prism C transpiler trying to break it....
-// Tests: defer, zero-init, typedef tracking, multi-declarator, edge cases
+// Tests: defer, zero-init, typedef tracking, multi-declarator, edge cases, library API
 // Run with: $ prism run .github/test.c
+
+#define PRISM_LIB_MODE
+#include "../prism.c"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,6 +75,7 @@ static void log_append(const char *s) {
 #include "test.orelse.c"
 #include "test.zeroinit.c"
 #include "test.harsh.c"
+#include "test.library.c"
 
 int main(void) {
 	printf("=== PRISM TEST SUITE ===\n");
@@ -83,6 +87,7 @@ int main(void) {
 	run_parse_tests();
 	run_orelse_tests();
 	run_harsh_review_tests();
+	run_library_tests();
 
 	printf("\n========================================\n");
 	printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);

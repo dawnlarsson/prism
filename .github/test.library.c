@@ -1,0 +1,1177 @@
+#include <sys/resource.h>
+
+static bool is_emulated(void) {
+#ifdef __linux__
+	if (getenv("PRISM_EMULATED")) return true;
+#if defined(__aarch64__) || defined(__arm__) || defined(__riscv) || \
+    defined(__s390x__) || defined(__mips__) || defined(__powerpc__)
+	FILE *f = fopen("/proc/cpuinfo", "r");
+	if (f) {
+		char line[256];
+		while (fgets(line, sizeof(line), f)) {
+			if (strncmp(line, "vendor_id", 9) == 0 ||
+			    strncmp(line, "model name", 10) == 0) {
+				fclose(f);
+				return true;
+			}
+		}
+		fclose(f);
+	}
+#endif
+#endif
+	return false;
+}
+
+static long get_memory_usage_kb(void) {
+#ifdef __linux__
+	FILE *f = fopen("/proc/self/status", "r");
+	if (!f) return 0;
+	char line[256];
+	long vmrss = 0;
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, "VmRSS:", 6) == 0) {
+			sscanf(line + 6, "%ld", &vmrss);
+			break;
+		}
+	}
+	fclose(f);
+	return vmrss;
+#else
+	return 0;
+#endif
+}
+
+static char *create_temp_file(const char *content) {
+	char *path = malloc(64);
+	snprintf(path, 64, "/tmp/prism_test_XXXXXX.c");
+	int fd = mkstemps(path, 2);
+	if (fd < 0) {
+		free(path);
+		return NULL;
+	}
+	write(fd, content, strlen(content));
+	close(fd);
+	return path;
+}
+
+// --- Basic Transpile ---
+
+static void test_basic_transpile(void) {
+	printf("\n--- Basic Transpile Tests ---\n");
+
+	const char *code =
+	    "#include <stdio.h>\n"
+	    "int main(void) {\n"
+	    "    int x;\n"
+	    "    printf(\"%d\\n\", x);\n"
+	    "    return 0;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+
+	CHECK_EQ(result.status, PRISM_OK, "transpile status OK");
+	CHECK(result.output != NULL, "output not NULL");
+	CHECK(result.output_len > 0, "output has content");
+	CHECK(result.error_msg == NULL, "no error message");
+
+	CHECK(strstr(result.output, "= {0}") != NULL ||
+	          strstr(result.output, "= 0") != NULL ||
+	          strstr(result.output, "PRISM_ATOMIC_INIT") != NULL,
+	      "zero-init applied");
+
+	prism_free(&result);
+	CHECK(result.output == NULL, "output freed");
+	CHECK(result.error_msg == NULL, "error_msg freed");
+
+	unlink(path);
+	free(path);
+}
+
+// --- Defer Transpile ---
+
+static void test_defer_transpile(void) {
+	printf("\n--- Defer Transpile Tests ---\n");
+
+	const char *code =
+	    "#include <stdio.h>\n"
+	    "int main(void) {\n"
+	    "    {\n"
+	    "        defer printf(\"B\");\n"
+	    "        printf(\"A\");\n"
+	    "    }\n"
+	    "    return 0;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "create temp file for defer");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+
+	CHECK_EQ(result.status, PRISM_OK, "defer transpile OK");
+	CHECK(result.output != NULL, "defer output not NULL");
+	CHECK(result.output_len > strlen(code), "defer expansion increased output");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+// --- Feature Flags ---
+
+static void test_feature_flags(void) {
+	printf("\n--- Feature Flag Tests ---\n");
+
+	const char *code =
+	    "int main(void) {\n"
+	    "    int x;\n"
+	    "    return x;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "create temp file for features");
+
+	// Test with zeroinit disabled
+	{
+		PrismFeatures features = prism_defaults();
+		features.zeroinit = false;
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK_EQ(result.status, PRISM_OK, "no-zeroinit transpile OK");
+		prism_free(&result);
+	}
+
+	// Test with defer disabled
+	{
+		const char *defer_code =
+		    "int main(void) {\n"
+		    "    { defer (void)0; }\n"
+		    "    return 0;\n"
+		    "}\n";
+		char *defer_path = create_temp_file(defer_code);
+
+		PrismFeatures features = prism_defaults();
+		features.defer = false;
+		PrismResult result = prism_transpile_file(defer_path, features);
+		CHECK(result.status == PRISM_OK || result.status == PRISM_ERR_SYNTAX,
+		      "defer disabled handled gracefully");
+		prism_free(&result);
+		unlink(defer_path);
+		free(defer_path);
+	}
+
+	// Test with line directives disabled
+	{
+		PrismFeatures features = prism_defaults();
+		features.line_directives = false;
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK_EQ(result.status, PRISM_OK, "no-line-directives OK");
+		CHECK(strstr(result.output, "#line") == NULL ||
+		          strstr(result.output, "# ") == NULL,
+		      "no line directives in output");
+		prism_free(&result);
+	}
+
+	unlink(path);
+	free(path);
+}
+
+// --- Error Handling ---
+
+static void test_error_handling(void) {
+	printf("\n--- Error Handling Tests ---\n");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file("/nonexistent/path/file.c", features);
+
+	CHECK(result.status != PRISM_OK, "nonexistent file returns error");
+	CHECK(result.output == NULL, "no output on error");
+
+	prism_free(&result);
+	CHECK(result.output == NULL, "cleanup after error");
+}
+
+// --- Sequential Transpilations ---
+
+static void test_sequential_transpilations(void) {
+	printf("\n--- Sequential Transpilation Tests ---\n");
+
+	const char *codes[] = {
+	    "int main(void) { int a; return a; }\n",
+	    "int main(void) { int b; { defer (void)0; } return b; }\n",
+	    "#include <stdio.h>\nint main(void) { int c; printf(\"%d\", c); return 0; }\n",
+	    "typedef int MyInt; int main(void) { MyInt x; return x; }\n",
+	    "int main(void) { for(int i; i < 10; i++) { int j; } return 0; }\n",
+	};
+
+	PrismFeatures features = prism_defaults();
+
+	for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
+		char *path = create_temp_file(codes[i]);
+		if (!path) continue;
+
+		PrismResult result = prism_transpile_file(path, features);
+
+		char name[64];
+		snprintf(name, sizeof(name), "sequential transpile %zu", i + 1);
+		CHECK_EQ(result.status, PRISM_OK, name);
+
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+}
+
+// --- Memory Leak Stress ---
+
+static void test_memory_leak_stress(void) {
+	printf("\n--- Memory Leak Stress Test ---\n");
+
+	const char *code =
+	    "#include <stdio.h>\n"
+	    "#include <stdlib.h>\n"
+	    "typedef struct { int x; int y; } Point;\n"
+	    "int main(void) {\n"
+	    "    Point p;\n"
+	    "    int arr[10];\n"
+	    "    {\n"
+	    "        defer printf(\"cleanup\\n\");\n"
+	    "        int local;\n"
+	    "        for (int i; i < 10; i++) {\n"
+	    "            arr[i] = i;\n"
+	    "        }\n"
+	    "    }\n"
+	    "    return 0;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "create stress test file");
+
+	PrismFeatures features = prism_defaults();
+
+	int iterations = 100;
+	bool under_valgrind = getenv("VALGRIND") || getenv("RUNNING_ON_VALGRIND");
+	bool under_emulation = is_emulated();
+	if (under_valgrind) {
+		iterations = 5;
+		printf("  (Valgrind mode: reduced to %d iterations)\n", iterations);
+		printf("  Note: Memory growth under valgrind is inflated by instrumentation.\n");
+		printf("  Trust valgrind's leak report, not RSS growth.\n");
+	}
+	if (under_emulation) {
+		printf("  (QEMU emulation detected: memory thresholds are informational only)\n");
+	}
+
+	// Verify the full pipeline works (preprocess + transpile via fork).
+	{
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK_EQ(result.status, PRISM_OK, "full pipeline sanity check");
+		prism_free(&result);
+		prism_reset();
+	}
+
+	unlink(path);
+	free(path);
+
+	const char *stress_src =
+	    "typedef struct { int x; int y; } Point;\n"
+	    "int main(void) {\n"
+	    "    Point p;\n"
+	    "    int arr[10];\n"
+	    "    {\n"
+	    "        defer arr[0] = 0;\n"
+	    "        int local;\n"
+	    "        for (int i; i < 10; i++) {\n"
+	    "            arr[i] = i;\n"
+	    "        }\n"
+	    "    }\n"
+	    "    return 0;\n"
+	    "}\n";
+
+	// Warmup
+	int warmup = iterations < 10 ? 1 : 10;
+	for (int i = 0; i < warmup; i++) {
+		PrismResult result = prism_transpile_source(stress_src, "stress.c", features);
+		prism_free(&result);
+		prism_reset();
+	}
+
+	long baseline_mem = get_memory_usage_kb();
+
+	for (int i = 0; i < iterations; i++) {
+		PrismResult result = prism_transpile_source(stress_src, "stress.c", features);
+		if (result.status != PRISM_OK) {
+			printf("[FAIL] stress iteration %d failed: %s\n", i,
+			       result.error_msg ? result.error_msg : "unknown");
+			failed++;
+			prism_free(&result);
+			break;
+		}
+		prism_free(&result);
+		prism_reset();
+	}
+
+	long final_mem = get_memory_usage_kb();
+	long mem_growth = final_mem - baseline_mem;
+
+	printf("  Memory after warmup: %ld KB\n", baseline_mem);
+	printf("  Memory after %d iterations: %ld KB\n", iterations, final_mem);
+	printf("  Memory growth: %ld KB\n", mem_growth);
+
+	bool mem_unreliable = under_valgrind || under_emulation;
+
+	if (mem_unreliable) {
+		if (under_valgrind)
+			printf("[PASS] memory test (valgrind mode - check leak summary above)\n");
+		else
+			printf("[PASS] memory test (emulation mode - RSS is unreliable under QEMU)\n");
+		if (mem_growth >= 1024)
+			printf("  [info] RSS grew %ld KB — expected under %s\n",
+			       mem_growth, under_valgrind ? "valgrind" : "QEMU emulation");
+		passed++;
+	} else if (mem_growth < 1024) {
+		passed++;
+		printf("[PASS] memory growth under 1MB after warmup\n");
+	} else {
+		printf("[WARN] memory growth %ld KB - may indicate leak\n", mem_growth);
+		printf("       Growth per iteration: %.1f KB\n", (float)mem_growth / iterations);
+		if (mem_growth / iterations < 10) {
+			passed++;
+			printf("[PASS] growth rate acceptable (< 10KB/iteration)\n");
+		} else {
+			failed++;
+			printf("[FAIL] excessive memory growth detected\n");
+		}
+	}
+
+	passed++;
+	printf("[PASS] completed %d stress iterations\n", iterations);
+}
+
+// --- Unicode/Digraph Lib ---
+
+static void test_unicode_digraph_lib(void) {
+	printf("\n--- Unicode/Digraph Lib Tests ---\n");
+
+	const char *utf8_code =
+	    "int main(void) {\n"
+	    "    int café = 42;\n"
+	    "    int π = 314;\n"
+	    "    return café + π;\n"
+	    "}\n";
+
+	char *path = create_temp_file(utf8_code);
+	CHECK(path != NULL, "create UTF-8 test file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+
+	CHECK_EQ(result.status, PRISM_OK, "UTF-8 transpile OK");
+	CHECK(result.output != NULL, "UTF-8 output not NULL");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+
+	const char *digraph_code =
+	    "int main(void) <%\n"
+	    "    int arr<:3:> = <% 1, 2, 3 %>;\n"
+	    "    return arr<:0:>;\n"
+	    "%>\n";
+
+	path = create_temp_file(digraph_code);
+	CHECK(path != NULL, "create digraph test file");
+
+	result = prism_transpile_file(path, features);
+
+	CHECK_EQ(result.status, PRISM_OK, "digraph transpile OK");
+	CHECK(result.output != NULL, "digraph output not NULL");
+
+	if (result.output) {
+		CHECK(strstr(result.output, "{") != NULL, "digraph <% translated to {");
+		CHECK(strstr(result.output, "[") != NULL, "digraph <: translated to [");
+	}
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+// --- Complex Code ---
+
+static void test_complex_code(void) {
+	printf("\n--- Complex Code Test ---\n");
+
+	const char *code =
+	    "#include <stdio.h>\n"
+	    "#include <stdlib.h>\n"
+	    "\n"
+	    "typedef struct Node {\n"
+	    "    int value;\n"
+	    "    struct Node *next;\n"
+	    "} Node;\n"
+	    "\n"
+	    "Node *create_node(int val) {\n"
+	    "    Node *n = malloc(sizeof(Node));\n"
+	    "    if (!n) return NULL;\n"
+	    "    n->value = val;\n"
+	    "    n->next = NULL;\n"
+	    "    return n;\n"
+	    "}\n"
+	    "\n"
+	    "void process(void) {\n"
+	    "    Node *head;\n"
+	    "    defer { if (head) free(head); };\n"
+	    "    head = create_node(42);\n"
+	    "    if (!head) return;\n"
+	    "    printf(\"Value: %d\\n\", head->value);\n"
+	    "}\n"
+	    "\n"
+	    "int main(void) {\n"
+	    "    int result;\n"
+	    "    {\n"
+	    "        defer printf(\"Cleanup\\n\");\n"
+	    "        for (int i; i < 5; i++) {\n"
+	    "            int temp;\n"
+	    "            result += temp;\n"
+	    "        }\n"
+	    "    }\n"
+	    "    process();\n"
+	    "    return result;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "create complex test file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+
+	CHECK_EQ(result.status, PRISM_OK, "complex code transpile OK");
+	CHECK(result.output != NULL, "complex output not NULL");
+	CHECK(result.output_len > strlen(code), "complex code expanded");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+// --- Defaults ---
+
+static void test_lib_defaults(void) {
+	printf("\n--- Defaults Test ---\n");
+
+	PrismFeatures features = prism_defaults();
+
+	CHECK(features.defer == true, "default defer=true");
+	CHECK(features.zeroinit == true, "default zeroinit=true");
+	CHECK(features.line_directives == true, "default line_directives=true");
+	CHECK(features.warn_safety == false, "default warn_safety=false");
+	CHECK(features.flatten_headers == true, "default flatten_headers=true");
+}
+
+// --- Double-Free Protection ---
+
+static void test_double_free_protection(void) {
+	printf("\n--- Double-Free Protection Test ---\n");
+
+	const char *code = "int main(void) { return 0; }\n";
+	char *path = create_temp_file(code);
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+
+	CHECK_EQ(result.status, PRISM_OK, "simple transpile for double-free test");
+
+	prism_free(&result);
+	CHECK(result.output == NULL, "first free nulls output");
+	CHECK(result.error_msg == NULL, "first free nulls error_msg");
+
+	prism_free(&result);
+	CHECK(result.output == NULL, "second free safe");
+
+	passed++;
+	printf("[PASS] double prism_free() is safe\n");
+
+	unlink(path);
+	free(path);
+}
+
+// --- Repeated Reset ---
+
+static void test_repeated_reset(void) {
+	printf("\n--- Repeated Reset Test ---\n");
+
+	PrismFeatures features = prism_defaults();
+
+	const char *codes[] = {
+	    "#include <stdio.h>\nint main(void) { printf(\"hello\"); return 0; }\n",
+	    "typedef int MyInt; MyInt add(MyInt a, MyInt b) { return a + b; }\n",
+	    "struct Point { int x, y; }; int main(void) { struct Point p; return 0; }\n",
+	    "int factorial(int n) { return n <= 1 ? 1 : n * factorial(n-1); }\n",
+	};
+
+	for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
+		char *path = create_temp_file(codes[i]);
+		if (!path) continue;
+
+		PrismResult result = prism_transpile_file(path, features);
+
+		char name[64];
+		snprintf(name, sizeof(name), "reset+transpile %zu", i + 1);
+		CHECK_EQ(result.status, PRISM_OK, name);
+		CHECK(result.output != NULL, "output not NULL after reset");
+		CHECK(result.output_len > 0, "output has content after reset");
+
+		prism_free(&result);
+		prism_reset();
+
+		unlink(path);
+		free(path);
+	}
+
+	const char *final_code = "int main(void) { int x; { defer (void)0; } return x; }\n";
+	char *path = create_temp_file(final_code);
+
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "final transpile after resets");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+// --- Error Recovery ---
+
+static void test_error_recovery_no_exit(void) {
+	printf("\n--- Error Recovery Tests (no exit) ---\n");
+
+	PrismFeatures features = prism_defaults();
+
+	const char *invalid_code1 =
+	    "int main(void) {\n"
+	    "    for (int i = 0; defer (void)0; i++) { }\n"
+	    "    return 0;\n"
+	    "}\n";
+
+	char *path1 = create_temp_file(invalid_code1);
+	if (path1) {
+		PrismResult result = prism_transpile_file(path1, features);
+		CHECK(result.status != PRISM_OK, "syntax error returns error status (not exit)");
+		CHECK(result.error_msg != NULL, "error message captured");
+		if (result.error_msg) {
+			CHECK(strstr(result.error_msg, "defer") != NULL ||
+			          strstr(result.error_msg, "control") != NULL,
+			      "error message is descriptive");
+		}
+		prism_free(&result);
+		unlink(path1);
+		free(path1);
+	}
+
+	const char *valid_code = "int main(void) { int x; return x; }\n";
+	char *path2 = create_temp_file(valid_code);
+	if (path2) {
+		PrismResult result = prism_transpile_file(path2, features);
+		CHECK_EQ(result.status, PRISM_OK, "transpiler recovers after error");
+		CHECK(result.output != NULL, "output generated after recovery");
+		prism_free(&result);
+		unlink(path2);
+		free(path2);
+	}
+
+	const char *errors[] = {
+	    "int main(void) { for(; defer 0;) {} return 0; }\n",
+	    "int main(void) { if (1) defer (void)0; return 0; }\n",
+	};
+
+	for (size_t i = 0; i < sizeof(errors) / sizeof(errors[0]); i++) {
+		char *path = create_temp_file(errors[i]);
+		if (path) {
+			PrismResult result = prism_transpile_file(path, features);
+			char name[64];
+			snprintf(name, sizeof(name), "error %zu doesn't kill process", i + 1);
+			CHECK(result.status != PRISM_OK, name);
+			prism_free(&result);
+			unlink(path);
+			free(path);
+		}
+	}
+
+	char *path3 = create_temp_file("int main(void) { return 42; }\n");
+	if (path3) {
+		PrismResult result = prism_transpile_file(path3, features);
+		CHECK_EQ(result.status, PRISM_OK, "process still alive after multiple errors");
+		prism_free(&result);
+		unlink(path3);
+		free(path3);
+	}
+}
+
+// --- Defer Break/Continue Rejection ---
+
+static void test_lib_defer_break_continue_rejected(void) {
+	printf("\n--- Defer Break/Continue Rejection Tests ---\n");
+
+	PrismFeatures features = prism_defaults();
+
+	// Test 1: bare 'break' inside defer
+	const char *code_break_bare =
+	    "int main(void) {\n"
+	    "    for (int i = 0; i < 10; i++) {\n"
+	    "        defer break;\n"
+	    "    }\n"
+	    "    return 0;\n"
+	    "}\n";
+	char *path = create_temp_file(code_break_bare);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status != PRISM_OK, "defer break; rejected");
+		CHECK(result.error_msg != NULL, "defer break; has error message");
+		if (result.error_msg)
+			CHECK(strstr(result.error_msg, "break") != NULL ||
+			          strstr(result.error_msg, "missing") != NULL,
+			      "defer break; error mentions break or missing");
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+
+	// Test 2: bare 'continue' inside defer
+	const char *code_cont_bare =
+	    "int main(void) {\n"
+	    "    for (int i = 0; i < 10; i++) {\n"
+	    "        defer continue;\n"
+	    "    }\n"
+	    "    return 0;\n"
+	    "}\n";
+	path = create_temp_file(code_cont_bare);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status != PRISM_OK, "defer continue; rejected");
+		CHECK(result.error_msg != NULL, "defer continue; has error message");
+		if (result.error_msg)
+			CHECK(strstr(result.error_msg, "continue") != NULL ||
+			          strstr(result.error_msg, "missing") != NULL,
+			      "defer continue; error mentions continue or missing");
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+
+	// Test 3: break inside braced defer body
+	const char *code_break_braced =
+	    "int main(void) {\n"
+	    "    for (int i = 0; i < 10; i++) {\n"
+	    "        defer { (void)0; break; };\n"
+	    "    }\n"
+	    "    return 0;\n"
+	    "}\n";
+	path = create_temp_file(code_break_braced);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status != PRISM_OK, "defer { break; }; rejected");
+		CHECK(result.error_msg != NULL, "defer { break; }; has error message");
+		if (result.error_msg)
+			CHECK(strstr(result.error_msg, "break") != NULL &&
+			          strstr(result.error_msg, "bypass") != NULL,
+			      "defer { break; }; error mentions bypass");
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+
+	// Test 4: continue inside braced defer body
+	const char *code_cont_braced =
+	    "int main(void) {\n"
+	    "    for (int i = 0; i < 10; i++) {\n"
+	    "        defer { (void)0; continue; };\n"
+	    "    }\n"
+	    "    return 0;\n"
+	    "}\n";
+	path = create_temp_file(code_cont_braced);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status != PRISM_OK, "defer { continue; }; rejected");
+		CHECK(result.error_msg != NULL, "defer { continue; }; has error message");
+		if (result.error_msg)
+			CHECK(strstr(result.error_msg, "continue") != NULL &&
+			          strstr(result.error_msg, "bypass") != NULL,
+			      "defer { continue; }; error mentions bypass");
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+
+	// Test 5: recovery after break/continue errors
+	const char *valid_code = "int main(void) { int x; return x; }\n";
+	path = create_temp_file(valid_code);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK_EQ(result.status, PRISM_OK, "transpiler recovers after break/continue rejection");
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+
+	// Test 6: break inside for loop inside defer — ALLOWED
+	const char *code_loop_break =
+	    "void f(void) {\n"
+	    "    defer {\n"
+	    "        for (int i = 0; i < 10; i++) {\n"
+	    "            if (i == 3) break;\n"
+	    "        }\n"
+	    "    };\n"
+	    "}\n"
+	    "int main(void) { f(); return 0; }\n";
+	path = create_temp_file(code_loop_break);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status == PRISM_OK, "break in for inside defer: allowed");
+		CHECK(result.error_msg == NULL, "break in for inside defer: no error");
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+
+	// Test 7: continue inside while loop inside defer — ALLOWED
+	const char *code_loop_cont =
+	    "void f(void) {\n"
+	    "    defer {\n"
+	    "        int i = 0;\n"
+	    "        while (i < 5) {\n"
+	    "            i++;\n"
+	    "            if (i == 3) continue;\n"
+	    "        }\n"
+	    "    };\n"
+	    "}\n"
+	    "int main(void) { f(); return 0; }\n";
+	path = create_temp_file(code_loop_cont);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status == PRISM_OK, "continue in while inside defer: allowed");
+		CHECK(result.error_msg == NULL, "continue in while inside defer: no error");
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+
+	// Test 8: break inside switch inside defer — ALLOWED
+	const char *code_switch_break =
+	    "void f(int x) {\n"
+	    "    defer {\n"
+	    "        switch (x) {\n"
+	    "            case 1: break;\n"
+	    "            default: break;\n"
+	    "        }\n"
+	    "    };\n"
+	    "}\n"
+	    "int main(void) { f(1); return 0; }\n";
+	path = create_temp_file(code_switch_break);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status == PRISM_OK, "break in switch inside defer: allowed");
+		CHECK(result.error_msg == NULL, "break in switch inside defer: no error");
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+
+	// Test 9: continue inside switch (no loop) inside defer — REJECTED
+	const char *code_switch_cont =
+	    "void f(int x) {\n"
+	    "    for (int i = 0; i < 10; i++) {\n"
+	    "        defer {\n"
+	    "            switch (x) {\n"
+	    "                case 1: continue;\n"
+	    "            }\n"
+	    "        };\n"
+	    "    }\n"
+	    "}\n"
+	    "int main(void) { f(1); return 0; }\n";
+	path = create_temp_file(code_switch_cont);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status != PRISM_OK, "continue in switch (no loop) inside defer: rejected");
+		CHECK(result.error_msg != NULL, "continue in switch inside defer: has error");
+		if (result.error_msg)
+			CHECK(strstr(result.error_msg, "continue") != NULL &&
+			          strstr(result.error_msg, "bypass") != NULL,
+			      "continue in switch inside defer: error mentions bypass");
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+
+	// Test 10: break inside do-while inside defer — ALLOWED
+	const char *code_dowhile =
+	    "void f(void) {\n"
+	    "    defer {\n"
+	    "        int i = 0;\n"
+	    "        do {\n"
+	    "            i++;\n"
+	    "            if (i == 3) break;\n"
+	    "        } while (i < 10);\n"
+	    "    };\n"
+	    "}\n"
+	    "int main(void) { f(); return 0; }\n";
+	path = create_temp_file(code_dowhile);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status == PRISM_OK, "break in do-while inside defer: allowed");
+		CHECK(result.error_msg == NULL, "break in do-while inside defer: no error");
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+}
+
+// --- Array Orelse Rejection ---
+
+static void test_lib_array_orelse_rejected(void) {
+	printf("\n--- Array Orelse Rejection Tests ---\n");
+
+	PrismFeatures features = prism_defaults();
+
+	const char *code_arr_block =
+	    "int main(void) {\n"
+	    "    int arr[] = {1, 2} orelse { return 1; };\n"
+	    "    return arr[0];\n"
+	    "}\n";
+	char *path = create_temp_file(code_arr_block);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status != PRISM_OK, "array orelse block: rejected");
+		CHECK(result.error_msg != NULL, "array orelse block: has error message");
+		if (result.error_msg)
+			CHECK(strstr(result.error_msg, "array") != NULL &&
+			          strstr(result.error_msg, "never NULL") != NULL,
+			      "array orelse block: error mentions array never NULL");
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+
+	const char *code_const_arr =
+	    "int main(void) {\n"
+	    "    const int arr[] = {1, 2} orelse (int[]){3, 4};\n"
+	    "    return arr[0];\n"
+	    "}\n";
+	path = create_temp_file(code_const_arr);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status != PRISM_OK, "const array orelse fallback: rejected");
+		CHECK(result.error_msg != NULL, "const array orelse fallback: has error message");
+		if (result.error_msg)
+			CHECK(strstr(result.error_msg, "array") != NULL &&
+			          strstr(result.error_msg, "never NULL") != NULL,
+			      "const array orelse fallback: error mentions array never NULL");
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+
+	const char *code_arr_expr =
+	    "int main(void) {\n"
+	    "    int arr[] = {1, 2} orelse (int[]){3, 4};\n"
+	    "    return arr[0];\n"
+	    "}\n";
+	path = create_temp_file(code_arr_expr);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status != PRISM_OK, "array orelse fallback: rejected");
+		CHECK(result.error_msg != NULL, "array orelse fallback: has error message");
+		if (result.error_msg)
+			CHECK(strstr(result.error_msg, "array") != NULL &&
+			          strstr(result.error_msg, "never NULL") != NULL,
+			      "array orelse fallback: error mentions array never NULL");
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+}
+
+// --- Deep Struct Nesting Walker ---
+
+static void test_deep_struct_nesting_walker(void) {
+	printf("\n--- Deep Struct Nesting Walker Tests ---\n");
+
+	PrismFeatures features = prism_defaults();
+
+	char code[8192];
+	int pos = 0;
+	pos += snprintf(code + pos, sizeof(code) - pos,
+	                "#include <stdio.h>\n"
+	                "void func(int flag) {\n"
+	                "    struct Deep {\n");
+
+	for (int i = 0; i < 69; i++)
+		pos += snprintf(code + pos, sizeof(code) - pos, "    struct {\n");
+
+	pos += snprintf(code + pos, sizeof(code) - pos, "        int leaf;\n");
+
+	for (int i = 0; i < 69; i++)
+		pos += snprintf(code + pos, sizeof(code) - pos, "    };\n");
+
+	pos += snprintf(code + pos, sizeof(code) - pos,
+	                "    };\n"
+	                "    if (flag)\n"
+	                "        goto done;\n"
+	                "    printf(\"not skipped\\n\");\n"
+	                "    done:\n"
+	                "    printf(\"done\\n\");\n"
+	                "}\n"
+	                "int main(void) { func(1); return 0; }\n");
+
+	char *path = create_temp_file(code);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status == PRISM_OK, "deep struct nesting: transpiles OK");
+		CHECK(result.error_msg == NULL, "deep struct nesting: no error");
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+
+	// Test 2: goto skips over a variable declaration with deep nesting
+	pos = 0;
+	pos += snprintf(code + pos, sizeof(code) - pos,
+	                "void func2(int flag) {\n"
+	                "    struct Deep2 {\n");
+
+	for (int i = 0; i < 69; i++)
+		pos += snprintf(code + pos, sizeof(code) - pos, "    struct {\n");
+	pos += snprintf(code + pos, sizeof(code) - pos, "        int leaf;\n");
+	for (int i = 0; i < 69; i++)
+		pos += snprintf(code + pos, sizeof(code) - pos, "    };\n");
+
+	pos += snprintf(code + pos, sizeof(code) - pos,
+	                "    };\n"
+	                "    if (flag)\n"
+	                "        goto done;\n"
+	                "    int val = 42;\n"
+	                "    done:\n"
+	                "    (void)0;\n"
+	                "}\n"
+	                "int main(void) { func2(1); return 0; }\n");
+
+	path = create_temp_file(code);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status != PRISM_OK, "deep struct nesting + goto skip: rejected");
+		CHECK(result.error_msg != NULL, "deep struct nesting + goto skip: has error");
+		if (result.error_msg)
+			CHECK(strstr(result.error_msg, "skip") != NULL ||
+			          strstr(result.error_msg, "bypass") != NULL,
+			      "deep struct nesting + goto skip: error mentions skip/bypass");
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+}
+
+// --- C23 Attribute Void Function ---
+
+static void test_lib_c23_attr_void_function(void) {
+	printf("\n--- C23 Attribute Void Function Tests ---\n");
+
+	PrismFeatures features = prism_defaults();
+
+	const char *code_c23_void =
+	    "void [[deprecated]] func(void) {\n"
+	    "    defer (void)0;\n"
+	    "    return;\n"
+	    "}\n"
+	    "int main(void) { func(); return 0; }\n";
+	char *path = create_temp_file(code_c23_void);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status == PRISM_OK, "C23 void [[attr]] func: transpiles OK");
+		if (result.output) {
+			CHECK(strstr(result.output, "_prism_ret") == NULL,
+			      "C23 void [[attr]] func: no _prism_ret generated");
+			CHECK(strstr(result.output, "[[deprecated]]") != NULL,
+			      "C23 void [[attr]] func: attribute preserved");
+		}
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+
+	const char *code_multi_attr =
+	    "void [[deprecated]] [[maybe_unused]] func2(void) {\n"
+	    "    defer (void)0;\n"
+	    "    return;\n"
+	    "}\n"
+	    "int main(void) { func2(); return 0; }\n";
+	path = create_temp_file(code_multi_attr);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status == PRISM_OK, "C23 void multi [[attr]] func: transpiles OK");
+		if (result.output)
+			CHECK(strstr(result.output, "_prism_ret") == NULL,
+			      "C23 void multi [[attr]] func: no _prism_ret");
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+}
+
+// --- _Generic Array Not VLA ---
+
+static void test_lib_generic_array_not_vla(void) {
+	printf("\n--- _Generic Array Not VLA Tests ---\n");
+
+	PrismFeatures features = prism_defaults();
+
+	const char *code_generic_arr =
+	    "int main(void) {\n"
+	    "    int x = 0;\n"
+	    "    int arr[_Generic(x, int: 10, default: 20)];\n"
+	    "    return arr[0];\n"
+	    "}\n";
+	char *path = create_temp_file(code_generic_arr);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status == PRISM_OK, "_Generic array: transpiles OK");
+		if (result.output) {
+			CHECK(strstr(result.output, "= {0}") != NULL,
+			      "_Generic array: uses = {0} not memset");
+			CHECK(strstr(result.output, "memset") == NULL,
+			      "_Generic array: no memset (not VLA)");
+		}
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+}
+
+// --- Function Pointer Return Type Capture ---
+
+static void test_fnptr_return_type_capture(void) {
+	printf("\n--- Function Pointer Return Type Capture Tests ---\n");
+
+	PrismFeatures features = prism_defaults();
+
+	const char *code_fnptr =
+	    "static void my_fn(void) {}\n"
+	    "void (*get_callback(void))(void) {\n"
+	    "    defer (void)0;\n"
+	    "    return my_fn;\n"
+	    "}\n"
+	    "int main(void) { get_callback()(); return 0; }\n";
+	char *path = create_temp_file(code_fnptr);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status == PRISM_OK, "bug_r2: fnptr return transpiles OK");
+		if (result.output) {
+			CHECK(strstr(result.output, "__auto_type") == NULL,
+			      "bug_r2: fnptr return has no __auto_type");
+			CHECK(strstr(result.output, "_prism_ret") != NULL,
+			      "bug_r2: fnptr return has _prism_ret (captured type)");
+		}
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+
+	const char *code_typedef =
+	    "typedef void (*callback_t)(void);\n"
+	    "static void my_fn(void) {}\n"
+	    "callback_t get_cb(void) {\n"
+	    "    defer (void)0;\n"
+	    "    return my_fn;\n"
+	    "}\n"
+	    "int main(void) { get_cb()(); return 0; }\n";
+	path = create_temp_file(code_typedef);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status == PRISM_OK, "bug_r2: typedef fnptr return transpiles OK");
+		if (result.output) {
+			CHECK(strstr(result.output, "__auto_type") == NULL,
+			      "bug_r2: typedef fnptr return has no __auto_type");
+		}
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+
+	const char *code_arrptr =
+	    "static int arr[5] = {1,2,3,4,5};\n"
+	    "int (*get_arr(void))[5] {\n"
+	    "    defer (void)0;\n"
+	    "    return &arr;\n"
+	    "}\n"
+	    "int main(void) { return (*get_arr())[0] - 1; }\n";
+	path = create_temp_file(code_arrptr);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status == PRISM_OK, "bug_r2: array ptr return transpiles OK");
+		if (result.output) {
+			CHECK(strstr(result.output, "__auto_type") == NULL,
+			      "bug_r2: array ptr return has no __auto_type");
+		}
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+}
+
+// --- Line Directive Escaped Quote ---
+
+static void test_line_directive_escaped_quote(void) {
+	printf("\n--- Line Directive Escaped Quote Tests ---\n");
+
+	PrismFeatures features = prism_defaults();
+
+	const char *code =
+	    "#line 1 \"foo\\\"bar.c\"\n"
+	    "int main(void) {\n"
+	    "    defer (void)0;\n"
+	    "    return 0;\n"
+	    "}\n";
+	char *path = create_temp_file(code);
+	if (path) {
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK(result.status == PRISM_OK, "bug_r3: escaped quote #line transpiles OK");
+		if (result.output) {
+			CHECK(strstr(result.output, "foo\\\\\\\"bar.c") == NULL,
+			      "bug_r3: no triple-escaped filename in output");
+			CHECK(strstr(result.output, "foo\\\"bar.c") != NULL,
+			      "bug_r3: properly escaped filename in output");
+		}
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+}
+
+// --- Entry point ---
+
+void run_library_tests(void) {
+	printf("\n=== LIBRARY TESTS ===\n");
+
+	test_lib_defaults();
+	test_basic_transpile();
+	test_defer_transpile();
+	test_feature_flags();
+	test_error_handling();
+	test_sequential_transpilations();
+	test_unicode_digraph_lib();
+	test_complex_code();
+	test_double_free_protection();
+	test_repeated_reset();
+	test_error_recovery_no_exit();
+	test_lib_defer_break_continue_rejected();
+	test_lib_array_orelse_rejected();
+	test_deep_struct_nesting_walker();
+	test_lib_c23_attr_void_function();
+	test_lib_generic_array_not_vla();
+	test_fnptr_return_type_capture();
+	test_line_directive_escaped_quote();
+
+	/* Memory stress test last (heaviest) */
+	test_memory_leak_stress();
+}

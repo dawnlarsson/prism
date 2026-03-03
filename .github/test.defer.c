@@ -1357,15 +1357,6 @@ void test_triple_nested_switch_return(void) {
 	CHECK_EQ(ret, 99, "triple nested switch return value");
 }
 
-
-
-// =============================================================================
-// BUG: goto to sibling block does not emit defers from source block
-// When goto jumps from one block to a label in a sibling block at the same
-// depth, the defer in the source block is never emitted. The depth-based
-// emit_goto_defers model can't distinguish sibling scopes at the same level.
-// =============================================================================
-
 static int _defer_sibling_goto_helper(void) {
 	int counter = 0;
 	{

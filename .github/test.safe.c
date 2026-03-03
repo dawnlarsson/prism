@@ -2638,26 +2638,6 @@ static void test_attribute_parser_torture(void) {
 	CHECK_EQ(attr_aligned, 0, "__attribute__((aligned)) int zeroed");
 }
 
-
-
-// =============================================================================
-// BUG: goto_skips_check false positive for for-init declarations
-// `for (int i = 0; ...)` scopes `i` to the for-loop per C99+. A goto that
-// jumps over the entire for-loop does NOT skip `i`'s scope, so it is safe.
-// Prism incorrectly reports: "goto 'xxx' would skip over this variable
-// declaration (bypasses zero-init)" because the walker tracks for-init
-// declarations at the outer scope depth rather than the for-body depth.
-// GCC/Clang accept this code without warnings.
-//
-// NOTE: This is a TRANSPILE-TIME error (Prism rejects valid code).
-// Guarded by TEST_GOTO_FOR_INIT_BUG because the false positive causes Prism
-// to emit corrupt output that kills GCC compilation of the entire suite.
-// Test individually: prism run .github/test.safe.c -DTEST_GOTO_FOR_INIT_BUG
-// Or verify: prism transpile <file-with-goto-over-for> shows the error.
-// =============================================================================
-
-#ifdef TEST_GOTO_FOR_INIT_BUG
-
 static void test_goto_over_for_init_bug(void) {
 	// goto over a for-loop with init-declaration should be allowed
 	int x = 1;
@@ -2698,8 +2678,6 @@ static void run_goto_over_for_init_bug_tests(void) {
 	test_goto_over_for_init_braceless_bug();
 	test_goto_over_multiple_for_init_bug();
 }
-
-#endif /* TEST_GOTO_FOR_INIT_BUG */
 
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
@@ -2911,8 +2889,6 @@ void run_safe_tests(void) {
 	test_struct_padding_zeroinit();
 	test_attribute_parser_torture();
 
-	/* Goto over for-init bug */
-#ifdef TEST_GOTO_FOR_INIT_BUG
+	/* Goto over for-init */
 	run_goto_over_for_init_bug_tests();
-#endif
 }

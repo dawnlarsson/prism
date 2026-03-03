@@ -1211,6 +1211,36 @@ static bool is_raw_declaration_context(Token *after_raw) {
 }
 
 
+// Check if a forward goto to a same-depth label requires exiting the current scope
+// (i.e. the label is in a sibling block, not the same block).
+// Returns the number of scope levels the path dips below the starting depth (0 = same scope).
+// This is needed because the depth-based defer model can't distinguish sibling scopes at the
+// same depth — a goto from {defer A; goto L;} to {L:} must still emit A.
+static int forward_goto_scope_exits(Token *after_goto_label, char *label_name, int label_len) {
+	int depth = 0;
+	int min_depth = 0;
+	Token *prev = NULL;
+	for (Token *t = after_goto_label; t && t->kind != TK_EOF; t = t->next) {
+		if (match_ch(t, '{')) depth++;
+		else if (match_ch(t, '}')) {
+			if (--depth < min_depth) min_depth = depth;
+		}
+		if (is_identifier_like(t) && t->len == label_len &&
+		    !memcmp(t->loc, label_name, label_len)) {
+			Token *n = t->next;
+			// Skip C23 attributes between label name and ':'
+			while (n && (n->tag & TT_ATTR)) n = skip_gnu_attributes(n);
+			if (n && equal(n, ":") && !(n->next && equal(n->next, ":"))) {
+				// Filter out ternary ?: (prev is '?')
+				if (!(prev && equal(prev, "?")))
+					return -min_depth;
+			}
+		}
+		prev = t;
+	}
+	return 0; // label not found (backward goto or end of function)
+}
+
 // Check if a forward goto would skip over defer statements or variable declarations.
 // Returns both results in one walk. Either field NULL means safe for that check.
 //
@@ -1228,18 +1258,41 @@ goto_skips_check(Token *goto_tok, char *label_name, int label_len, bool check_de
 	Token *active_defer = NULL, *active_decl = NULL;
 	int defer_depth = -1, decl_depth = -1;
 	bool is_stmt_start = true;
-	bool is_in_for_init = false;
 
 	TokenWalker w;
 	walker_init(&w, start, 0);
 
 	while (walker_next(&w)) {
 		// For-loop init detection (for decl check)
+		// Skip entire for-header (...) and check for decl in the init clause.
+		// For-init vars (e.g. `int i` in `for (int i = 0; ...)`) are scoped to
+		// the for body per C99+. Record at depth+1 so the decl is cleared when
+		// leaving the for body scope — a goto over the entire for is safe.
 		if (check_decl && (w.tok->tag & TT_LOOP) && equal(w.tok, "for")) {
 			walker_advance(&w);
 			if (w.tok && equal(w.tok, "(")) {
-				is_in_for_init = true;
-				walker_advance(&w);
+				Token *paren = w.tok;
+				Token *after_paren = skip_balanced(paren, '(', ')');
+
+				// Check first clause (between '(' and first ';') for a decl
+				Token *t = paren->next;
+				if (t && !equal(t, ";")) {
+					Token *s = t;
+					if (equal(s, "raw") && !is_known_typedef(s)) s = s->next;
+					if (s && !equal(s, "extern") && !equal(s, "typedef") &&
+					    !equal(s, "static")) {
+						TypeSpecResult type = parse_type_specifier(s);
+						if (type.saw_type && is_var_declaration(type.end)) {
+							if (!active_decl || w.depth + 1 <= decl_depth) {
+								active_decl = t;
+								decl_depth = w.depth + 1;
+							}
+						}
+					}
+				}
+
+				w.prev = paren;
+				w.tok = after_paren;
 				is_stmt_start = true;
 				continue;
 			}
@@ -1252,8 +1305,9 @@ goto_skips_check(Token *goto_tok, char *label_name, int label_len, bool check_de
 			if (match_ch(w.tok, '}')) {
 				if (active_defer && w.depth < defer_depth) { active_defer = NULL; defer_depth = -1; }
 				if (active_decl && w.depth < decl_depth) { active_decl = NULL; decl_depth = -1; }
-			} else if (match_ch(w.tok, ';') && is_in_for_init) {
-				is_in_for_init = false;
+			} else if (match_ch(w.tok, ';')) {
+				// Clear decls whose scope has ended (for-init decls in braceless for bodies)
+				if (active_decl && w.depth < decl_depth) { active_decl = NULL; decl_depth = -1; }
 			}
 			is_stmt_start = true;
 			walker_advance(&w);
@@ -1276,7 +1330,7 @@ goto_skips_check(Token *goto_tok, char *label_name, int label_len, bool check_de
 		}
 
 		// Track declarations
-		if (check_decl && (is_stmt_start || is_in_for_init)) {
+		if (check_decl && is_stmt_start) {
 			Token *decl_start = w.tok;
 			Token *t = w.tok;
 			bool has_raw = false;
@@ -3086,6 +3140,17 @@ static Token *handle_goto_keyword(Token *tok) {
 
 			int target_depth = label_table_lookup(tok->loc, tok->len);
 			if (target_depth < 0) target_depth = ctx->defer_depth;
+
+			// Sibling scope fix: if goto exits its current scope to reach a
+			// same-depth label in a sibling block, adjust target_depth so
+			// the current scope's defers are emitted.
+			if (target_depth >= ctx->defer_depth) {
+				int exits = forward_goto_scope_exits(tok->next, tok->loc, tok->len);
+				if (exits > 0) {
+					target_depth = ctx->defer_depth - exits;
+					if (target_depth < 0) target_depth = 0;
+				}
+			}
 
 			if (goto_has_defers(target_depth)) {
 				OUT_LIT(" {");
