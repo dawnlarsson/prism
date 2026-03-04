@@ -1474,6 +1474,303 @@ void test_defer_goto_c23_attr_label(void) {
 	CHECK_LOG("BDE", "goto to C23 attributed label fires defer");
 }
 
+
+static void test_auto_type_fallback_requires_gnu_extensions(void) {
+	printf("\n--- __auto_type Fallback Requires GNU Extensions ---\n");
+
+	const char *code =
+	    "#include <stdio.h>\n"
+	    "struct { int x; } anon_fn(void) {\n"
+	    "    defer printf(\"deferred\\n\");\n"
+	    "    return (struct { int x; }){42};\n"
+	    "}\n"
+	    "int main(void) { return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "auto_type fallback: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "auto_type fallback: transpiles OK");
+	CHECK(result.output != NULL, "auto_type fallback: output not NULL");
+
+	// __auto_type is the only correct approach for anonymous struct returns with defer.
+	// Each anonymous struct definition creates a unique type in C, so __typeof__ and
+	// re-emitting the struct tokens would both produce incompatible types.
+	// __auto_type uses the reserved __ prefix and works in all C standard modes
+	// (including -std=c99 and -std=c11) with GCC and Clang.
+	CHECK(strstr(result.output, "__auto_type") != NULL,
+	      "auto_type fallback: anonymous struct return with defer should use __auto_type");
+	// Verify the defer is still emitted correctly
+	CHECK(strstr(result.output, "printf") != NULL,
+	      "auto_type fallback: deferred printf should be present in output");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_ternary_cast_corrupts_label_detection(void) {
+	printf("\n--- Ternary Casts Corrupt goto Label Detection ---\n");
+
+	// In "cond ? (int)done : 0", the cast puts ')' before 'done',
+	// so the "prev == '?'" ternary filter fails and 'done:' is
+	// falsely registered as a label. This causes goto_skips_check
+	// to return early, missing the defer between the false and real label.
+	const char *code =
+	    "void cleanup(void);\n"
+	    "int done = 42;\n"
+	    "void f(void) {\n"
+	    "    goto done;\n"
+	    "    (void)(1 ? (int)done : 0);\n"
+	    "    defer cleanup();\n"
+	    "    done:\n"
+	    "    (void)0;\n"
+	    "}\n"
+	    "int main(void) { f(); return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "ternary cast label: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+
+	// The goto jumps past "defer cleanup()" to reach "done:".
+	// The transpiler should error about skipping the defer.
+	// With the bug, the cast in "(int)done" causes false label detection,
+	// making goto_skips_check return early and miss the defer.
+	CHECK(result.status != PRISM_OK,
+	      "ternary cast label: goto skipping defer should be caught even with ternary cast");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_gnu_nested_func_breaks_outer_defer(void) {
+	printf("\n--- GNU Nested Function Breaks Outer Defer ---\n");
+
+	const char *code =
+	    "int outer(int n) {\n"
+	    "    defer (void)0;\n"
+	    "    int inner(int x) {\n"
+	    "        return x * 2;\n"
+	    "    }\n"
+	    "    return inner(n);\n"
+	    "}\n"
+	    "int main(void) { return outer(5) == 10 ? 0 : 1; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "nested func: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	// Either: (a) transpile succeeds and the output is correct (inner's return
+	// does NOT trigger outer's defer), or (b) transpiler errors on nested function.
+	// Currently the transpiler silently produces wrong code.
+	if (result.status == PRISM_OK && result.output) {
+		// If it transpiles, the inner return must NOT reference outer's defer.
+		// Check that _Prism_ret only appears for outer's return, not inner's.
+		// The inner function's return should be a plain "return x * 2;".
+		const char *inner_body = strstr(result.output, "int inner(int x)");
+		CHECK(inner_body != NULL, "nested func: inner function present in output");
+		if (inner_body) {
+			// Find the closing brace of inner function
+			const char *inner_ret = strstr(inner_body, "return");
+			CHECK(inner_ret != NULL, "nested func: inner has return statement");
+			if (inner_ret) {
+				// The inner return should NOT trigger outer's defers
+				// (no _Prism_ret or defer emission between "return" and inner's "}")
+				const char *after_ret = inner_ret + 6; // skip "return"
+				const char *semi = strchr(after_ret, ';');
+				// Check there's no defer emission in the inner return
+				CHECK(strstr(inner_body, "(void)0;") == NULL ||
+				      strstr(inner_body, "_Prism_ret") == NULL,
+				      "nested func: inner return must not trigger outer defer");
+			}
+		}
+	} else {
+		// If it errors, that's an acceptable fix (rejecting nested functions with defer)
+		CHECK(result.status != PRISM_OK,
+		      "nested func: should error when nested function is inside defer scope");
+	}
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_knr_nested_func_detection(void) {
+	printf("\n--- K&R Nested Function Bypasses Guardrail ---\n");
+
+	const char *code =
+	    "void outer(void) {\n"
+	    "    defer (void)0;\n"
+	    "    int inner(x)\n"
+	    "        int x;\n"
+	    "    {\n"
+	    "        return x + 1;\n"
+	    "    }\n"
+	    "}\n"
+	    "int main(void) { return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "knr nested func: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+
+	// K&R-style nested function must be detected and rejected.
+	CHECK(result.status != PRISM_OK,
+	      "knr nested func: should error on K&R-style nested function in defer scope");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_defer_scope_state_machine_overwrite(void) {
+	printf("\n--- defer Scope State Machine Overwrite Allows Unsafe Escapes ---\n");
+
+	// When a switch is nested inside a loop inside defer, closing the switch '}'
+	// used to overwrite the scalar scope_stack, causing the outer loop's depth
+	// to never decrement.  The trailing "break;" after the loop should be caught
+	// as an illegal escape from the defer block.
+	const char *code =
+	    "void f(int x) {\n"
+	    "    defer {\n"
+	    "        while (1) {\n"
+	    "            switch (x) {\n"
+	    "                default: break;\n"
+	    "            }\n"
+	    "            break;\n"
+	    "        }\n"
+	    "        break;\n"  /* this must be caught */
+	    "    }\n"
+	    "}\n"
+	    "int main(void) { f(0); return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "defer scope overwrite: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+
+	CHECK(result.status != PRISM_OK,
+	      "defer scope overwrite: break after while/switch inside defer must be rejected");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_braceless_body_semicolon_trap(void) {
+	printf("\n--- Braceless Body Semicolon Trap inside defer ---\n");
+
+	// A braceless while body containing an if/else with braced arms
+	// used to trigger premature braceless body ending on ';' inside
+	// the braced arms (bd <= braceless_bd + 1 was too broad).
+	// This caused inner_loop_depth to decrement early, and the second
+	// break in the else arm was rejected as a false-positive error.
+	const char *code =
+	    "void f(int cond) {\n"
+	    "    defer {\n"
+	    "        while(1)\n"
+	    "            if (cond) { break; } else { break; }\n"
+	    "    };\n"
+	    "}\n"
+	    "int main(void) { f(1); return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "braceless trap: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+
+	CHECK_EQ(result.status, PRISM_OK,
+	         "braceless trap: both breaks inside while are valid (not false positive)");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_scope_type_at_depth_overflow(void) {
+	printf("\n--- 256-Depth scope_type_at_depth Overflow ---\n");
+
+	// When brace depth exceeds the scope_type_at_depth array bound,
+	// inner_loop_depth gets incremented on '{' but not decremented on '}',
+	// causing permanent skew. With the expanded 4096-element array, depths
+	// up to 4095 are handled correctly.
+	// Build code with 300 nested braces inside defer + for loop body.
+	char code[16384];
+	int pos = 0;
+	pos += snprintf(code + pos, sizeof(code) - pos,
+	    "int main(void) {\n"
+	    "    defer (void)0;\n"
+	    "    for (int i = 0; i < 1; i++) {\n");
+	for (int i = 0; i < 300; i++)
+		pos += snprintf(code + pos, sizeof(code) - pos, "{\n");
+	pos += snprintf(code + pos, sizeof(code) - pos, "(void)0;\n");
+	for (int i = 0; i < 300; i++)
+		pos += snprintf(code + pos, sizeof(code) - pos, "}\n");
+	pos += snprintf(code + pos, sizeof(code) - pos,
+	    "    }\n"
+	    "    return 0;\n"
+	    "}\n");
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "scope depth overflow: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "scope depth overflow: transpiles OK");
+
+	// The output should compile as valid C (no corrupted control flow).
+	// If inner_loop_depth is permanently skewed, break/continue handling
+	// would emit incorrect gotos.
+	CHECK(result.output != NULL, "scope depth overflow: output not NULL");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_fno_defer_shadow_leak(void) {
+	printf("\n--- -fno-defer Shadow Leak ---\n");
+
+	// After a function definition, a global variable with a __-prefixed typedef
+	// name should still get zero-initialized (typedef is still recognized).
+	// With the bug, last_toplevel_paren stays set, blocking register_toplevel_shadows.
+	const char *code =
+	    "typedef struct { int v; } __widget_t;\n"
+	    "\n"
+	    "void first_func(void) {}\n"
+	    "\n"
+	    "void second_func(void) {\n"
+	    "    __widget_t w;\n"
+	    "    (void)w;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "fno-defer shadow: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	features.defer = false;
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "fno-defer shadow: transpiles OK");
+	CHECK(result.output != NULL, "fno-defer shadow: output not NULL");
+
+	// __widget_t w; should still get = {0} because __widget_t is a known typedef.
+	// If shadow tracking is broken, the typedef might be misinterpreted.
+	CHECK(strstr(result.output, "= {0}") != NULL,
+	      "fno-defer shadow: __widget_t w still gets = {0} after first function");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
 
@@ -1576,4 +1873,12 @@ void run_defer_tests(void) {
 	test_defer_backward_goto_sibling();
 
 	test_defer_goto_c23_attr_label();
+	test_auto_type_fallback_requires_gnu_extensions();
+	test_ternary_cast_corrupts_label_detection();
+	test_gnu_nested_func_breaks_outer_defer();
+	test_knr_nested_func_detection();
+	test_defer_scope_state_machine_overwrite();
+	test_braceless_body_semicolon_trap();
+	test_scope_type_at_depth_overflow();
+	test_fno_defer_shadow_leak();
 }

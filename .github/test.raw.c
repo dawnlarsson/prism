@@ -777,6 +777,205 @@ void test_raw_thread_local(void) {
     CHECK_EQ(d, 70, "raw with _Thread_local");
 }
 
+
+static void test_raw_multi_declarator_second_var_uninitialized(void) {
+	printf("\n--- raw Propagates Across Multi-Declarators ---\n");
+
+	const char *code =
+	    "int main(void) {\n"
+	    "    raw int x, y;\n"
+	    "    return 0;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "raw multi-decl: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "raw multi-decl: transpiles OK");
+	CHECK(result.output != NULL, "raw multi-decl: output not NULL");
+
+	bool x_has_init = strstr(result.output, "x = 0") != NULL ||
+	                  strstr(result.output, "x = {0}") != NULL;
+	bool y_has_init = strstr(result.output, "y = 0") != NULL ||
+	                  strstr(result.output, "y = {0}") != NULL;
+
+	CHECK(!x_has_init, "raw multi-decl: x is raw (no init) as expected");
+	CHECK(y_has_init,
+	      "raw multi-decl: y should be zero-initialized (raw should bind per-variable, not per-declaration)");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_static_const_raw_ordering(void) {
+	printf("\n--- static const raw Ordering Inconsistency ---\n");
+
+	// "static const raw int x;" should strip 'raw' and not zero-init.
+	// Currently handle_storage_raw fails to skip qualifiers, leaving 'raw' in output.
+	const char *code =
+	    "void f(void) {\n"
+	    "    static const raw int x;\n"
+	    "    (void)x;\n"
+	    "}\n"
+	    "int main(void) { f(); return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "static const raw: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "static const raw: transpiles OK");
+	CHECK(result.output != NULL, "static const raw: output not NULL");
+
+	// 'raw' must be stripped from the output (it's not valid C).
+	CHECK(strstr(result.output, " raw ") == NULL,
+	      "static const raw: 'raw' keyword must be consumed, not emitted");
+	// Should NOT have zero-init (raw suppresses it).
+	CHECK(strstr(result.output, "= 0") == NULL && strstr(result.output, "= {0}") == NULL,
+	      "static const raw: variable should NOT be zero-initialized (raw suppresses it)");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_raw_typedef_blinds_type_tracker(void) {
+	printf("\n--- raw typedef Blinds Type Tracker ---\n");
+
+	const char *code =
+	    "raw typedef int my_int;\n"
+	    "void f(void) {\n"
+	    "    my_int x;\n"
+	    "    x = 42;\n"
+	    "    (void)x;\n"
+	    "}\n"
+	    "int main(void) { f(); return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "raw typedef: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "raw typedef: transpiles OK");
+	CHECK(result.output != NULL, "raw typedef: output not NULL");
+
+	// 'raw' should be stripped from the output (not valid C).
+	CHECK(strstr(result.output, "raw ") == NULL,
+	      "raw typedef: 'raw' keyword must be consumed, not emitted");
+	// The typedef must be registered so that 'my_int x' is zero-initialized.
+	CHECK(strstr(result.output, "= {0}") != NULL || strstr(result.output, "= 0") != NULL,
+	      "raw typedef: variable of typedef type should be zero-initialized");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_raw_static_multi_decl_consistency(void) {
+	printf("\n--- raw Static Multi-Declarator Consistency ---\n");
+
+	// "static raw int x, y;" — static variables are auto-zero-initialized by C,
+	// so raw for static/extern means "don't touch" for ALL declarators.
+	// No = 0 should be added (adding = 0 to extern turns a declaration into a
+	// definition, causing linker errors).
+	const char *code =
+	    "void test(void) {\n"
+	    "    {\n"
+	    "        static raw int x, y;\n"
+	    "        extern raw int a, b;\n"
+	    "        raw int c, d;\n"
+	    "    }\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "raw static multi-decl: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "raw static multi-decl: transpiles OK");
+	CHECK(result.output != NULL, "raw static multi-decl: output not NULL");
+
+	// static: no = 0 (auto-zeroed by C standard)
+	CHECK(strstr(result.output, "static int x, y;") != NULL,
+	      "raw static multi-decl: static has no = 0 (auto-zeroed)");
+	// extern: no = 0 (would turn declaration into definition — linker bomb)
+	CHECK(strstr(result.output, "extern int a, b;") != NULL,
+	      "raw extern multi-decl: extern has no = 0 (would be linker bomb)");
+	// local: d gets = 0 (automatic storage needs explicit zero-init)
+	CHECK(strstr(result.output, "d = 0") != NULL,
+	      "raw local multi-decl: local d gets = 0 (automatic storage)");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_raw_extern_no_initializer(void) {
+	printf("\n--- raw extern No Initializer ---\n");
+
+	const char *code =
+	    "void test(void) {\n"
+	    "    extern raw int x, y;\n"
+	    "    extern raw int a;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "raw extern no init: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "raw extern no init: transpiles OK");
+	CHECK(result.output != NULL, "raw extern no init: output not NULL");
+
+	// extern declarations must NEVER have = 0 appended
+	CHECK(strstr(result.output, "= 0") == NULL,
+	      "raw extern no init: no = 0 anywhere (would turn declaration into definition)");
+	// The raw keyword itself should be stripped
+	CHECK(strstr(result.output, "raw") == NULL,
+	      "raw extern no init: raw keyword stripped from output");
+	// extern should survive
+	CHECK(strstr(result.output, "extern int x, y;") != NULL,
+	      "raw extern no init: extern int x, y; preserved");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_raw_prep_dir_pragma(void) {
+	printf("\n--- raw TK_PREP_DIR Pragma ---\n");
+
+	const char *code =
+	    "void test(void) {\n"
+	    "    raw _Pragma(\"pack(push,1)\") int x;\n"
+	    "    (void)x;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "raw prep_dir: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "raw prep_dir: transpiles OK");
+	CHECK(result.output != NULL, "raw prep_dir: output not NULL");
+
+	// "raw" should NOT appear in the output — it must be consumed as a keyword.
+	CHECK(strstr(result.output, "raw") == NULL,
+	      "raw prep_dir: 'raw' keyword consumed (not emitted as identifier)");
+	// int x should NOT have = 0 (raw suppresses zero-init)
+	CHECK(strstr(result.output, "= 0") == NULL && strstr(result.output, "= {0}") == NULL,
+	      "raw prep_dir: no zero-init (raw suppression active through pragma)");
+	// The pragma should still be present
+	CHECK(strstr(result.output, "#pragma pack(push,1)") != NULL,
+	      "raw prep_dir: #pragma pack preserved in output");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
 void run_raw_tests(void) {
 	printf("\n=== RAW KEYWORD TESTS ===\n");
 
@@ -864,4 +1063,10 @@ void run_raw_tests(void) {
 	test_raw_qualifier_order();
 	test_raw_register();
 	test_raw_thread_local();
+	test_raw_multi_declarator_second_var_uninitialized();
+	test_static_const_raw_ordering();
+	test_raw_typedef_blinds_type_tracker();
+	test_raw_static_multi_decl_consistency();
+	test_raw_extern_no_initializer();
+	test_raw_prep_dir_pragma();
 }

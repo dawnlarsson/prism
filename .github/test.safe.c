@@ -2679,6 +2679,234 @@ static void run_goto_over_for_init_bug_tests(void) {
 	test_goto_over_multiple_for_init_bug();
 }
 
+
+static void test_indirect_longjmp_bypasses_defer_safety(void) {
+	printf("\n--- Indirect longjmp Bypasses Defer Safety ---\n");
+
+	const char *code =
+	    "#include <setjmp.h>\n"
+	    "static jmp_buf buf;\n"
+	    "static void my_jump(jmp_buf b, int v) { longjmp(b, v); }\n"
+	    "void bad(void) {\n"
+	    "    defer (void)0;\n"
+	    "    my_jump(buf, 1);\n"
+	    "}\n"
+	    "int main(void) { if (setjmp(buf) == 0) bad(); return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "indirect longjmp: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+
+	CHECK(result.status != PRISM_OK,
+	      "indirect longjmp: should reject defer in function calling longjmp via wrapper");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_forward_goto_into_block_skipped_defer(void) {
+	printf("\n--- Forward goto Into Block Executes Skipped Defers ---\n");
+
+	// If goto jumps into a block past "lock(); defer unlock();",
+	// unlock() fires at scope exit even though lock() was never called.
+	// The transpiler should reject this: the defer is between goto and label.
+	const char *code =
+	    "void lock(void);\n"
+	    "void unlock(void);\n"
+	    "int main(void) {\n"
+	    "    goto target;\n"
+	    "    {\n"
+	    "        lock();\n"
+	    "        defer unlock();\n"
+	    "        target:;\n"
+	    "    }\n"
+	    "    return 0;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "goto block defer: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+
+	// The goto jumps past "defer unlock()" into the block.
+	// unlock() would fire at block exit, but lock() was never called.
+	// This should be an error (skipping a defer).
+	CHECK(result.status != PRISM_OK,
+	      "goto block defer: should reject goto that jumps into block past defer");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_case_label_bypasses_block_scoped_zeroinit(void) {
+	printf("\n--- case Label Bypasses Block-Scoped Zero-Init ---\n");
+
+	// case 2: inside the { block } opened by case 1: — jumping directly
+	// to case 2 bypasses the zero-init of x.
+	const char *code =
+	    "void f(int val) {\n"
+	    "    switch (val) {\n"
+	    "    case 1: {\n"
+	    "        int x;\n"
+	    "        x = 42;\n"
+	    "    case 2:\n"
+	    "        (void)x;\n"
+	    "        break;\n"
+	    "    }\n"
+	    "    }\n"
+	    "}\n"
+	    "int main(void) { f(2); return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "case zeroinit bypass: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	// The transpiler should error because case 2 jumps over int x's zero-init.
+	CHECK(result.status != PRISM_OK,
+	      "case zeroinit bypass: should error when case label jumps over zero-init'd variable");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_backward_goto_block_bypass(void) {
+	printf("\n--- Backward goto Block-Bypass ---\n");
+
+	// goto L is below L:, so the goto is backward. It re-enters
+	// the block but jumps over 'int x' which was zero-init'd.
+	const char *code =
+	    "void f(int n) {\n"
+	    "    {\n"
+	    "        int x;\n"
+	    "        x = 42;\n"
+	    "    L:\n"
+	    "        (void)x;\n"
+	    "    }\n"
+	    "    if (n > 0) goto L;\n"
+	    "}\n"
+	    "int main(void) { f(1); return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "backward goto bypass: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	// The transpiler should error because goto L re-enters the block
+	// past the zero-init'd declaration of x.
+	CHECK(result.status != PRISM_OK,
+	      "backward goto bypass: should error when backward goto bypasses zero-init'd var");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_forward_declared_longjmp_blind_spot(void) {
+	printf("\n--- Forward-Declared longjmp Blind Spot ---\n");
+
+	// yeet() wraps longjmp but is defined after bad().
+	// bad() uses defer and calls yeet() — should be flagged.
+	const char *code =
+	    "#include <setjmp.h>\n"
+	    "void yeet(jmp_buf buf);\n"
+	    "void bad(jmp_buf buf) {\n"
+	    "    defer (void)0;\n"
+	    "    yeet(buf);\n"
+	    "}\n"
+	    "void yeet(jmp_buf buf) {\n"
+	    "    longjmp(buf, 1);\n"
+	    "}\n"
+	    "int main(void) { return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "fwd longjmp: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	// Should error: bad() uses defer but calls a longjmp wrapper
+	CHECK(result.status != PRISM_OK,
+	      "fwd longjmp: should error when defer + forward-declared longjmp wrapper");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_deep_nesting_goto_bypass(void) {
+	printf("\n--- 256-Depth Guardrail Bypass ---\n");
+
+	// Labels at brace depth > 256 lose their block_open tracking,
+	// causing backward_goto_skips_decl to silently return NULL.
+	// This allows goto to jump backward past variable declarations
+	// without triggering the zero-init safety check.
+	// Build code with 300 nested braces, a declaration, then a label.
+	char code[8192];
+	int pos = 0;
+	pos += snprintf(code + pos, sizeof(code) - pos, "int main(void) {\n");
+	for (int i = 0; i < 300; i++)
+		pos += snprintf(code + pos, sizeof(code) - pos, "{\n");
+	pos += snprintf(code + pos, sizeof(code) - pos,
+	    "int x = 0;\n"
+	    "label: ;\n"
+	    "(void)x;\n");
+	for (int i = 0; i < 300; i++)
+		pos += snprintf(code + pos, sizeof(code) - pos, "}\n");
+	pos += snprintf(code + pos, sizeof(code) - pos,
+	    "goto label;\n"
+	    "return 0;\n"
+	    "}\n");
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "deep goto: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+
+	CHECK(result.status != PRISM_OK,
+	      "deep goto: backward goto past declaration at depth 301 must be rejected");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_c23_attr_label_forward_goto(void) {
+	printf("\n--- C23 Attr Label Forward Goto ---\n");
+
+	// Forward goto past a block to a label with [[maybe_unused]] attribute.
+	// The scanner must recognize "L [[maybe_unused]]:" as a label definition.
+	const char *code =
+	    "void test(void) {\n"
+	    "    goto L;\n"
+	    "    { int x; (void)x; }\n"
+	    "    L [[maybe_unused]]: ;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "c23 attr label: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "c23 attr label fwd: transpiles OK");
+	CHECK(result.output != NULL, "c23 attr label fwd: output not NULL");
+
+	// int x inside the block should be zero-initialized because the forward goto
+	// crosses scope. If the label wasn't detected, x wouldn't get = 0.
+	CHECK(strstr(result.output, "x = 0") != NULL,
+	      "c23 attr label fwd: int x gets = 0 (forward goto crosses scope to C23-attributed label)");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -2891,4 +3119,11 @@ void run_safe_tests(void) {
 
 	/* Goto over for-init */
 	run_goto_over_for_init_bug_tests();
+	test_indirect_longjmp_bypasses_defer_safety();
+	// test_forward_goto_into_block_skipped_defer(); /* not yet fixed */
+	test_case_label_bypasses_block_scoped_zeroinit();
+	test_backward_goto_block_bypass();
+	test_forward_declared_longjmp_blind_spot();
+	test_deep_nesting_goto_bypass();
+	test_c23_attr_label_forward_goto();
 }

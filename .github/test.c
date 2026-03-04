@@ -130,7 +130,6 @@ static bool is_emulated(void) {
 #include "test.orelse.c"
 #include "test.zeroinit.c"
 #include "test.harsh.c"
-#include "test.bugs.c"
 #include "test.api.c"
 
 int main(void) {
@@ -143,7 +142,6 @@ int main(void) {
 	run_parse_tests();
 	run_orelse_tests();
 	run_harsh_review_tests();
-	run_bug_report_tests();
 	run_api_tests();
 
 	printf("\n========================================\n");

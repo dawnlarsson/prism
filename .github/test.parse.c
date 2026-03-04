@@ -6211,6 +6211,170 @@ static void test_extra_paren_funcptr_shadow(void) {
 	_epf_func(NULL);
 }
 
+
+static void test_c23_attr_misparsed_as_vla(void) {
+	printf("\n--- C23 Attributes [[...]] Misparsed as VLA ---\n");
+
+	const char *code =
+	    "int main(void) {\n"
+	    "    int x [[maybe_unused]];\n"
+	    "    return 0;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "c23 attr vla: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "c23 attr vla: transpiles OK");
+	CHECK(result.output != NULL, "c23 attr vla: output not NULL");
+
+	// [[maybe_unused]] is a C23 attribute, not an array dimension.
+	// Should produce = 0 (scalar init), NOT memset (VLA treatment).
+	CHECK(strstr(result.output, "memset") == NULL,
+	      "c23 attr vla: no memset (not a VLA, it's a C23 attribute)");
+	CHECK(strstr(result.output, "= 0") != NULL,
+	      "c23 attr vla: scalar should get = 0 init");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_c23_extended_float_x_suffixes(void) {
+	printf("\n--- Missing C23 Extended Float x Suffixes ---\n");
+
+	// C23 defines _Float32x (≈double), _Float64x (≈long double), _Float128x.
+	// Their literal suffixes f32x, f64x, f128x should be recognized.
+	const char *code =
+	    "int main(void) {\n"
+	    "    double a = 1.0f32x;\n"
+	    "    long double b = 2.0f64x;\n"
+	    "    return 0;\n"
+	    "}\n";
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_source(code, "test_float_x.c", features);
+	CHECK_EQ(result.status, PRISM_OK, "float x suffix: transpiles OK");
+	CHECK(result.output != NULL, "float x suffix: output not NULL");
+
+	// f32x maps to double (no suffix needed), f64x maps to long double (L suffix)
+	// The transpiler should replace f32x with nothing and f64x with L.
+	CHECK(strstr(result.output, "1.0f32x") == NULL,
+	      "float x suffix: f32x should be replaced (not left as-is)");
+	CHECK(strstr(result.output, "2.0f64x") == NULL,
+	      "float x suffix: f64x should be replaced (not left as-is)");
+
+	prism_free(&result);
+}
+
+static void test_pragma_breaks_type_specifier(void) {
+	printf("\n--- _Pragma Breaks Type Specifier Parsing ---\n");
+
+	// _Pragma between qualifiers and the type keyword causes parse_type_specifier
+	// to bail out early, so zeroinit never happens.
+	const char *code =
+	    "void f(void) {\n"
+	    "    const _Pragma(\"GCC diagnostic ignored \\\"-Wunused\\\"\") int x;\n"
+	    "    (void)x;\n"
+	    "}\n"
+	    "int main(void) { f(); return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "pragma type spec: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "pragma type spec: transpiles OK");
+	CHECK(result.output != NULL, "pragma type spec: output not NULL");
+
+	// The variable should get zero-init even with _Pragma in the type specifier.
+	CHECK(strstr(result.output, "= 0") != NULL || strstr(result.output, "= {0}") != NULL,
+	      "pragma type spec: variable should be zero-initialized despite _Pragma in type");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_pragma_struct_body_parsing(void) {
+	printf("\n--- _Pragma Blinds Struct/Union Body Parsing ---\n");
+
+	// _Pragma between struct keyword and tag/body used to be consumed
+	// as the struct tag name by is_valid_varname, blindsiding body parsing.
+	// After preprocessing, _Pragma("...") becomes #pragma (TK_PREP_DIR).
+	// The fix skips TK_PREP_DIR and _Pragma(...) tokens in both
+	// find_struct_body_brace and parse_type_specifier.
+	const char *code =
+	    "struct\n"
+	    "_Pragma(\"pack(push, 1)\")\n"
+	    "Foo { int x; char y; };\n"
+	    "void f(void) {\n"
+	    "    struct Foo s;\n"
+	    "    (void)s;\n"
+	    "}\n"
+	    "int main(void) { f(); return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "pragma struct body: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "pragma struct body: transpiles OK");
+	CHECK(result.output != NULL, "pragma struct body: output not NULL");
+
+	// The struct body should be properly parsed, and local "struct Foo s"
+	// should get zero-initialized.
+	CHECK(strstr(result.output, "= {0}") != NULL || strstr(result.output, "= 0") != NULL,
+	      "pragma struct body: struct variable zero-initialized despite _Pragma");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+// Bug report: K&R function params at depth 0 poison global shadow table
+// via register_toplevel_shadows. After a K&R `__my_type a;` param decl,
+// the typedef __my_type becomes invisible everywhere.
+static void test_knr_param_shadow_no_poison(void) {
+	printf("\n--- K&R Param Shadow No Poison ---\n");
+
+	// K&R function with a typedef'd parameter, followed by another function
+	// that uses the same typedef. The typedef must still be recognized.
+	const char *code =
+	    "typedef struct { int v; } __my_type;\n"
+	    "\n"
+	    "void old_func(a)\n"
+	    "    __my_type a;\n"
+	    "{\n"
+	    "    (void)a;\n"
+	    "}\n"
+	    "\n"
+	    "void new_func(void) {\n"
+	    "    __my_type x;\n"
+	    "    (void)x;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "knr shadow: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "knr shadow: transpiles OK");
+	CHECK(result.output != NULL, "knr shadow: output not NULL");
+
+	// __my_type x; in new_func should get zero-initialized (= {0})
+	// because __my_type is still recognized as a typedef (struct type).
+	// If K&R params poisoned the shadow table, __my_type would be treated
+	// as a variable name, and x would be parsed as a label or expression.
+	CHECK(strstr(result.output, "= {0}") != NULL,
+	      "knr shadow: __my_type x still gets = {0} after K&R param decl");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
 void run_parse_tests(void) {
 	printf("\n=== PARSE TESTS ===\n");
 
@@ -6619,4 +6783,9 @@ void run_parse_tests(void) {
 
 	test_paren_param_typedef_shadow();
 	test_extra_paren_funcptr_shadow();
+	test_c23_attr_misparsed_as_vla();
+	test_c23_extended_float_x_suffixes();
+	test_pragma_breaks_type_specifier();
+	test_pragma_struct_body_parsing();
+	test_knr_param_shadow_no_poison();
 }

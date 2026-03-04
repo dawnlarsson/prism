@@ -1469,6 +1469,275 @@ static void test_sizeof_unary_prefix_not_vla(void) {
 	      "sizeof unary prefix pos: correct size");
 }
 
+
+static void test_vla_pessimization_inline_enum_in_sizeof(void) {
+	printf("\n--- VLA Pessimization: Inline Enum in sizeof ---\n");
+
+	const char *code =
+	    "int main(void) {\n"
+	    "    int arr[sizeof(enum { A = 5 }) + A];\n"
+	    "    return 0;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "vla inline enum: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "vla inline enum: transpiles OK");
+	CHECK(result.output != NULL, "vla inline enum: output not NULL");
+
+	CHECK(strstr(result.output, "= {0}") != NULL,
+	      "vla inline enum: uses = {0} not memset (array size is compile-time constant)");
+	CHECK(strstr(result.output, "memset") == NULL,
+	      "vla inline enum: no memset (A is enum constant, not runtime variable)");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_prism_p_temp_var_namespace_collision(void) {
+	printf("\n--- Temp Variable Namespace Collision (_prism_p_) ---\n");
+
+	const char *code =
+	    "#include <stdio.h>\n"
+	    "int main(void) {\n"
+	    "    char *_prism_p_0 = \"Gotcha\";\n"
+	    "    volatile typeof(struct { int a; int b; }) x;\n"
+	    "    printf(\"p=%s a=%d b=%d\\n\", _prism_p_0, x.a, x.b);\n"
+	    "    return 0;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "prism_p collision: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "prism_p collision: transpiles OK");
+
+	// After fix: generated temps use reserved _Prism_p_ prefix, not _prism_p_.
+	// User's _prism_p_0 should coexist with generated _Prism_p_0.
+	CHECK(strstr(result.output, "_Prism_p_") != NULL || strstr(result.output, "_Prism_i_") != NULL,
+	      "prism_p collision: transpiler should use reserved _Prism_ prefix for volatile memset temps");
+	CHECK(strstr(result.output, "volatile char *_prism_p_") == NULL,
+	      "prism_p collision: generated volatile memset temp must not use _prism_p_ prefix");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_vla_pointer_array_no_init(void) {
+	printf("\n--- Arrays of Pointers to VLAs Skip Initialization ---\n");
+
+	const char *code =
+	    "int main(void) {\n"
+	    "    int n = 5;\n"
+	    "    int *p[n];\n"
+	    "    return 0;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "vla ptr array: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "vla ptr array: transpiles OK");
+	CHECK(result.output != NULL, "vla ptr array: output not NULL");
+
+	// int *p[n] is a VLA of pointers. decl.is_pointer=true AND decl.is_array=true.
+	// The !decl.is_pointer guard in needs_memset wrongly skips init for this case.
+	// It should get memset (VLA can't use = {0}).
+	CHECK(strstr(result.output, "memset") != NULL,
+	      "vla ptr array: VLA of pointers should be memset-initialized");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_stmt_expr_initializer_features(void) {
+	printf("\n--- Statement Expression Initializer Features ---\n");
+
+	// Regression: ensure zeroinit and defer work inside statement expression initializers.
+	// The initializer loop in process_declarators emits tokens that the main loop processes,
+	// so features like zeroinit and defer must work inside ({ ... }) initializers.
+
+	// Test 1: zeroinit inside stmt expr initializer
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int x = ({ int y; y = 1; y; });\n"
+		    "    (void)x;\n"
+		    "}\n"
+		    "int main(void) { f(); return 0; }\n";
+
+		char *path = create_temp_file(code);
+		CHECK(path != NULL, "stmt expr zeroinit: create temp file");
+
+		PrismFeatures features = prism_defaults();
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK_EQ(result.status, PRISM_OK, "stmt expr zeroinit: transpiles OK");
+		CHECK(result.output != NULL, "stmt expr zeroinit: output not NULL");
+		CHECK(strstr(result.output, "y = 0") != NULL,
+		      "stmt expr zeroinit: variable inside stmt expr initializer should be zero-initialized");
+
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+
+	// Test 2: defer inside block inside stmt expr initializer
+	{
+		const char *code =
+		    "#include <stdio.h>\n"
+		    "void f(void) {\n"
+		    "    int x = ({ { defer (void)0; } 1; });\n"
+		    "    (void)x;\n"
+		    "}\n"
+		    "int main(void) { f(); return 0; }\n";
+
+		char *path = create_temp_file(code);
+		CHECK(path != NULL, "stmt expr defer: create temp file");
+
+		PrismFeatures features = prism_defaults();
+		PrismResult result = prism_transpile_file(path, features);
+		CHECK_EQ(result.status, PRISM_OK, "stmt expr defer: transpiles OK");
+		CHECK(result.output != NULL, "stmt expr defer: output not NULL");
+		CHECK(strstr(result.output, "defer") == NULL,
+		      "stmt expr defer: 'defer' keyword must be processed, not emitted raw");
+
+		prism_free(&result);
+		unlink(path);
+		free(path);
+	}
+}
+
+static void test_vla_sizeof_pointer_deref(void) {
+	printf("\n--- VLA sizeof Pointer Deref ---\n");
+
+	const char *code =
+	    "void f(int n, int (*vla_ptr)[n]) {\n"
+	    "    int arr[sizeof(*vla_ptr) / sizeof(int)];\n"
+	    "    arr[0] = 1;\n"
+	    "    (void)arr;\n"
+	    "}\n"
+	    "int main(void) { f(5, 0); return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "vla sizeof ptr: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "vla sizeof ptr: transpiles OK");
+	CHECK(result.output != NULL, "vla sizeof ptr: output not NULL");
+
+	// arr is a VLA (its size depends on sizeof(*vla_ptr) which is runtime-dependent).
+	// It must use memset, not = {0}.
+	CHECK(strstr(result.output, "memset") != NULL,
+	      "vla sizeof ptr: VLA array should use memset (sizeof of VLA pointer deref is runtime)");
+	CHECK(strstr(result.output, "= {0}") == NULL,
+	      "vla sizeof ptr: should NOT use = {0} (would be compile error on VLA)");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_vla_sizeof_paren_bracket(void) {
+	printf("\n--- VLA sizeof Detection: Parenthesized Type Before Bracket ---\n");
+
+	const char *code =
+	    "#include <stdlib.h>\n"
+	    "void f(int n) {\n"
+	    "    int arr[sizeof(typeof(int)[n]) / sizeof(int)];\n"
+	    "    arr[0] = 1;\n"
+	    "    (void)arr;\n"
+	    "}\n"
+	    "int main(void) { f(5); return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "vla sizeof paren: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "vla sizeof paren: transpiles OK");
+	CHECK(result.output != NULL, "vla sizeof paren: output not NULL");
+
+	// sizeof(typeof(int)[n]) is runtime-dependent — the array must use memset.
+	CHECK(strstr(result.output, "memset") != NULL,
+	      "vla sizeof paren: VLA array should use memset (sizeof(typeof(int)[n]) is runtime)");
+	CHECK(strstr(result.output, "= {0}") == NULL,
+	      "vla sizeof paren: should NOT use = {0} (would be compile error on VLA)");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_paren_pointer_vla_masking(void) {
+	printf("\n--- Paren-Pointer VLA Masking Triggers Illegal = {0} ---\n");
+
+	const char *code =
+	    "void f(int m, int n) {\n"
+	    "    int (*p[m])[n];\n"
+	    "    (void)p;\n"
+	    "}\n"
+	    "int main(void) { f(3, 4); return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "paren VLA: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "paren VLA: transpiles OK");
+	CHECK(result.output != NULL, "paren VLA: output not NULL");
+
+	// int (*p[m])[n] is a VLA — must use memset, not = {0}
+	CHECK(strstr(result.output, "memset") != NULL,
+	      "paren VLA: VLA of pointers should use memset");
+	CHECK(strstr(result.output, "= {0}") == NULL,
+	      "paren VLA: should NOT use = {0} (would be compile error on VLA)");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_func_returned_vla_sizeof(void) {
+	printf("\n--- Function-Returned VLA Pointer sizeof Blind Spot ---\n");
+
+	const char *code =
+	    "#include <stdlib.h>\n"
+	    "typedef int (*vla_ptr_t)[1];\n"
+	    "vla_ptr_t get_vla(int n);\n"
+	    "void f(int n) {\n"
+	    "    int arr[sizeof(*get_vla(n)) / sizeof(int)];\n"
+	    "    arr[0] = 1;\n"
+	    "    (void)arr;\n"
+	    "}\n"
+	    "int main(void) { f(5); return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "func VLA sizeof: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "func VLA sizeof: transpiles OK");
+	CHECK(result.output != NULL, "func VLA sizeof: output not NULL");
+
+	// sizeof(*get_vla(n)) might be runtime-dependent — must use memset
+	CHECK(strstr(result.output, "memset") != NULL,
+	      "func VLA sizeof: should use memset (sizeof of dereferenced func call with runtime arg)");
+	CHECK(strstr(result.output, "= {0}") == NULL,
+	      "func VLA sizeof: should NOT use = {0} (potentially VLA)");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -1547,4 +1816,12 @@ void run_zeroinit_tests(void) {
 
 	test_sizeof_unparenthesized_not_vla();
 	test_sizeof_unary_prefix_not_vla();
+	test_vla_pessimization_inline_enum_in_sizeof();
+	test_prism_p_temp_var_namespace_collision();
+	test_vla_pointer_array_no_init();
+	test_stmt_expr_initializer_features();
+	test_vla_sizeof_pointer_deref();
+	test_vla_sizeof_paren_bracket();
+	test_paren_pointer_vla_masking();
+	test_func_returned_vla_sizeof();
 }

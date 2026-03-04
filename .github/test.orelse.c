@@ -1202,6 +1202,405 @@ void test_orelse_bare_comma_not_swallowed(void) {
 	CHECK_EQ(y, 2, "bare orelse comma: y = 2 always executes");
 }
 
+
+static void test_prism_oe_temp_var_namespace_collision(void) {
+	printf("\n--- Temp Variable Namespace Collision (_prism_oe_) ---\n");
+
+	const char *code =
+	    "#include <stdio.h>\n"
+	    "int *get_val(void) { static int v = 42; return &v; }\n"
+	    "int *get_fb(void) { static int v = 99; return &v; }\n"
+	    "int main(void) {\n"
+	    "    int *_prism_oe_0 = (int*)0xDEAD;\n"
+	    "    const int *x = get_val() orelse get_fb();\n"
+	    "    (void)x;\n"
+	    "    printf(\"%p\\n\", (void*)_prism_oe_0);\n"
+	    "    return 0;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "prism_oe collision: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "prism_oe collision: transpiles OK");
+
+	// After fix: generated temps use reserved _Prism_oe_ prefix, not _prism_oe_.
+	// User's _prism_oe_0 should coexist with generated _Prism_oe_0.
+	CHECK(strstr(result.output, "_Prism_oe_") != NULL,
+	      "prism_oe collision: transpiler should use reserved _Prism_ prefix for generated temps");
+	// Verify no generated variable uses the user-accessible _prism_oe_ prefix
+	// (only user's own code should contain _prism_oe_0)
+	const char *gen = strstr(result.output, " _prism_oe_");
+	bool gen_uses_old_prefix = false;
+	while (gen) {
+		// Skip if this is inside the user's code (user wrote "_prism_oe_0")
+		if (gen > result.output && *(gen - 1) == '*') { gen = strstr(gen + 1, " _prism_oe_"); continue; }
+		// Check if this looks like a generated declaration (has " = (" after it)
+		const char *after = gen + 11;
+		while (*after == ' ' || (*after >= '0' && *after <= '9')) after++;
+		if (*after == '=' || strncmp(after, " = (", 4) == 0) { gen_uses_old_prefix = true; break; }
+		gen = strstr(gen + 1, " _prism_oe_");
+	}
+	CHECK(!gen_uses_old_prefix,
+	      "prism_oe collision: generated temp must use _Prism_ prefix, not _prism_");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_const_typedef_breaks_orelse_temp(void) {
+	printf("\n--- const Typedef Breaks orelse Temp Mutability ---\n");
+
+	const char *code =
+	    "typedef const int cint;\n"
+	    "cint get_val(void) { return 0; }\n"
+	    "void f(void) {\n"
+	    "    cint x = get_val() orelse 5;\n"
+	    "    (void)x;\n"
+	    "}\n"
+	    "int main(void) { f(); return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "const typedef orelse: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "const typedef orelse: transpiles OK");
+	CHECK(result.output != NULL, "const typedef orelse: output not NULL");
+
+	// The transpiled output must compile without errors.
+	// If the temp variable retains the const from the typedef,
+	// the reassignment "temp = 5;" will fail to compile.
+	// The fix should either use _Prism_oe_N pattern with a non-const temp
+	// or otherwise ensure the fallback assignment is valid.
+	CHECK(strstr(result.output, "_Prism_oe") != NULL,
+	      "const typedef orelse: should use _Prism_oe temp (typedef has hidden const)");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_anon_struct_orelse_type_corruption(void) {
+	printf("\n--- Anonymous Struct Type Corruption in Multi-Declarator orelse ---\n");
+
+	const char *code =
+	    "#include <stdlib.h>\n"
+	    "int f(void) {\n"
+	    "    struct { int a; } *s1 = malloc(sizeof(int)) orelse return -1,\n"
+	    "                      *s2 = malloc(sizeof(int)) orelse return -1;\n"
+	    "    s1->a = 1;\n"
+	    "    s2->a = 2;\n"
+	    "    int r = s1->a + s2->a;\n"
+	    "    free(s1); free(s2);\n"
+	    "    return r;\n"
+	    "}\n"
+	    "int main(void) { return f() == 3 ? 0 : 1; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "anon struct orelse: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "anon struct orelse: transpiles OK");
+	CHECK(result.output != NULL, "anon struct orelse: output not NULL");
+
+	// The second declarator must have the full anonymous struct body, not bare 'struct'.
+	// Look for two occurrences of 'struct { int a; }'.
+	const char *first = strstr(result.output, "struct { int a; }");
+	CHECK(first != NULL, "anon struct orelse: first declarator has struct body");
+	if (first) {
+		const char *second = strstr(first + 1, "struct { int a; }");
+		CHECK(second != NULL,
+		      "anon struct orelse: second declarator preserves anonymous struct body");
+	}
+
+	// Must NOT contain bare 'struct *' (the broken output).
+	CHECK(strstr(result.output, "struct *s2") == NULL,
+	      "anon struct orelse: no bare 'struct *s2' (type must be complete)");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_compound_literal_orelse_lifetime(void) {
+	printf("\n--- Compound Literal orelse Destroys Variable Lifetime ---\n");
+
+	const char *code =
+	    "#include <stdlib.h>\n"
+	    "const int *get(void) { return NULL; }\n"
+	    "int main(void) {\n"
+	    "    const int *p = get() orelse (int[]){1, 2, 3};\n"
+	    "    return p[0] == 1 ? 0 : 1;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "compound lit orelse: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "compound lit orelse: transpiles OK");
+	CHECK(result.output != NULL, "compound lit orelse: output not NULL");
+
+	// The fallback assignment must use ternary, not an unbraced if-body,
+	// to keep the compound literal in the enclosing block scope.
+	CHECK(strstr(result.output, "if (!_Prism_oe_") == NULL,
+	      "compound lit orelse: no if-assignment (lifetime-destroying pattern)");
+	CHECK(strstr(result.output, "? _Prism_oe_") != NULL,
+	      "compound lit orelse: uses ternary to preserve compound literal lifetime");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_orelse_bare_assign_double_eval(void) {
+	printf("\n--- orelse Bare Assignment Double Evaluation ---\n");
+
+	// When the LHS of a bare assignment has side effects (e.g. ptr++),
+	// orelse used to re-emit the LHS tokens in the fallback body,
+	// causing double evaluation.  This should now be an error.
+	const char *code =
+	    "#include <stdlib.h>\n"
+	    "int *get(void) { return NULL; }\n"
+	    "void f(int *arr) {\n"
+	    "    int *ptr = arr;\n"
+	    "    *ptr++ = (int)(long)get() orelse 42;\n"
+	    "}\n"
+	    "int main(void) { int a[4] = {0}; f(a); return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "orelse double eval: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+
+	CHECK(result.status != PRISM_OK,
+	      "orelse double eval: side-effectful LHS (*ptr++) must be rejected");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_const_opaque_ptr_orelse(void) {
+	printf("\n--- Const Opaque Pointer Constraint Violation ---\n");
+
+	// typedef const optr Handle (where optr = struct Opaque *)
+	// makes Handle a const pointer to incomplete struct Opaque.
+	// The arithmetic trick __typeof__((Handle)0 + 0) does pointer
+	// arithmetic on an incomplete type, violating C constraints.
+	// Fix: use __typeof__(&*(Handle)0) which strips top-level const
+	// via &* cancellation without requiring a complete pointee type.
+	const char *code =
+	    "struct Opaque;\n"
+	    "typedef struct Opaque *optr;\n"
+	    "typedef const optr Handle;\n"
+	    "Handle get(void);\n"
+	    "Handle make_default(void);\n"
+	    "void test(void) {\n"
+	    "    Handle h = get() orelse make_default();\n"
+	    "    (void)h;\n"
+	    "}\n"
+	    "int main(void) { return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "const opaque ptr: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+
+	CHECK_EQ(result.status, PRISM_OK, "const opaque ptr: transpiles OK");
+	CHECK(result.output != NULL, "const opaque ptr: output not NULL");
+
+	// The output should use &* trick, not + 0 (which would fail for incomplete type)
+	CHECK(strstr(result.output, "&*(") != NULL,
+	      "const opaque ptr: uses &* to strip const (safe for incomplete types)");
+	CHECK(strstr(result.output, ")0 + 0)") == NULL,
+	      "const opaque ptr: does NOT use + 0 (would be constraint violation)");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_array_typedef_is_ptr_orelse(void) {
+	printf("\n--- Array Typedef is_ptr in orelse ---\n");
+
+	// typedef const int arr_t[5]; should NOT be flagged as is_ptr.
+	// Arrays are not pointer types; (arr_t)0 is a cast-to-array constraint
+	// violation. The orelse path should use the non-pointer code path.
+	const char *code =
+	    "typedef const int arr_t[5];\n"
+	    "arr_t *get_arr(void);\n"
+	    "void test(void) {\n"
+	    "    defer (void)0;\n"
+	    "    arr_t *p = get_arr() orelse return;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "array typedef orelse: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "array typedef orelse: transpiles OK");
+	CHECK(result.output != NULL, "array typedef orelse: output not NULL");
+
+	// With the fix, arr_t should NOT have is_ptr=true, so the &*(arr_t)0
+	// const-stripping path should not be taken.
+	CHECK(strstr(result.output, "(arr_t)0") == NULL,
+	      "array typedef orelse: no (arr_t)0 cast (arrays are not pointers)");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_pragma_absorbed_into_orelse_condition(void) {
+	printf("\n--- Pragma Absorbed into orelse Condition ---\n");
+
+	// _Pragma("...") expands to TK_PREP_DIR (#pragma) tokens.
+	// In bare orelse (p = GET orelse return;), these tokens must NOT
+	// appear inside the if (!(…)) parenthesized condition — #pragma
+	// directives are line-based and invalid inside parentheses.
+	// They should be hoisted before the if wrapper.
+	const char *code =
+	    "#define GET _Pragma(\"GCC diagnostic push\") get()\n"
+	    "void *get(void);\n"
+	    "void test(void) {\n"
+	    "    void *p;\n"
+	    "    {\n"
+	    "        p = GET orelse return;\n"
+	    "    }\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "pragma orelse: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "pragma orelse: transpiles OK");
+	CHECK(result.output != NULL, "pragma orelse: output not NULL");
+
+	// The #pragma should NOT appear between "if (!(" and "))"
+	// Check that #pragma appears BEFORE "if (!(" in the output
+	const char *pragma_pos = strstr(result.output, "#pragma GCC diagnostic push");
+	const char *if_pos = strstr(result.output, "if (!(");
+	CHECK(pragma_pos != NULL, "pragma orelse: #pragma present in output");
+	CHECK(if_pos != NULL, "pragma orelse: if (!( present in output");
+	CHECK(pragma_pos < if_pos,
+	      "pragma orelse: #pragma appears before if (!( (hoisted out of condition)");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_array_typedef_const_orelse_ternary(void) {
+	printf("\n--- Array Typedef const orelse Ternary ---\n");
+
+	const char *code =
+	    "typedef int arr_t[4];\n"
+	    "typedef const arr_t carr_t;\n"
+	    "const int *get(void);\n"
+	    "void test(void) {\n"
+	    "    const int *p = get() orelse NULL;\n"
+	    "    carr_t *q = (carr_t *)get() orelse NULL;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "arr_td const orelse: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "arr_td const orelse: transpiles OK");
+	CHECK(result.output != NULL, "arr_td const orelse: output not NULL");
+
+	// The output must NOT contain "(carr_t)0" — that's a constraint violation for array types.
+	CHECK(strstr(result.output, "(carr_t)0") == NULL,
+	      "arr_td const orelse: no (carr_t)0 cast (constraint violation for array type)");
+	// For array typedefs, we expect the pointer-yield trick via 0 ? (type*)0 : (type*)0
+	// to extract the element type safely.
+	CHECK(strstr(result.output, "carr_t") != NULL || strstr(result.output, "arr_t") != NULL,
+	      "arr_td const orelse: type name appears in output");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_bare_orelse_compound_literal_ternary(void) {
+	printf("\n--- Bare orelse Compound Literal Ternary ---\n");
+
+	// Must be a bare assignment (not declaration) to trigger the bare orelse path.
+	const char *code =
+	    "int *get(void);\n"
+	    "void test(void) {\n"
+	    "    int *p;\n"
+	    "    p = get() orelse (int[]){1, 2, 3};\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "bare orelse compound: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "bare orelse compound: transpiles OK");
+	CHECK(result.output != NULL, "bare orelse compound: output not NULL");
+
+	// The fallback should use a ternary (? :) to keep the compound literal alive.
+	// It must NOT use "if (!(" for the bare fallback path.
+	CHECK(strstr(result.output, "?") != NULL,
+	      "bare orelse compound: uses ternary (?) to preserve compound literal lifetime");
+	// The compound literal should appear in the output
+	CHECK(strstr(result.output, "(int[]){1, 2, 3}") != NULL ||
+	      strstr(result.output, "(int[]){ 1, 2, 3 }") != NULL,
+	      "bare orelse compound: compound literal present in output");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_chained_bare_orelse(void) {
+	printf("\n--- Chained Bare orelse ---\n");
+
+	const char *code =
+	    "int *a(void);\n"
+	    "int *b(void);\n"
+	    "void test(void) {\n"
+	    "    int *p;\n"
+	    "    p = a() orelse b() orelse (int[]){42};\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "chained bare orelse: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "chained bare orelse: transpiles OK");
+	CHECK(result.output != NULL, "chained bare orelse: output not NULL");
+
+	// The output must NOT contain the literal "orelse" keyword — that's not valid C.
+	CHECK(strstr(result.output, "orelse") == NULL,
+	      "chained bare orelse: no raw 'orelse' keyword in C output");
+	// Should produce two ternary expressions for the chain
+	const char *first_q = strstr(result.output, "?");
+	CHECK(first_q != NULL, "chained bare orelse: first ternary (?) present");
+	const char *second_q = first_q ? strstr(first_q + 1, "?") : NULL;
+	CHECK(second_q != NULL, "chained bare orelse: second ternary (?) for chain");
+	// The compound literal should survive in the output
+	CHECK(strstr(result.output, "(int[]){42}") != NULL,
+	      "chained bare orelse: compound literal preserved");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -1299,4 +1698,15 @@ void run_orelse_tests(void) {
 	test_orelse_comma_decl_fallback();
 
 	test_orelse_bare_comma_not_swallowed();
+	test_prism_oe_temp_var_namespace_collision();
+	test_const_typedef_breaks_orelse_temp();
+	test_anon_struct_orelse_type_corruption();
+	test_compound_literal_orelse_lifetime();
+	test_orelse_bare_assign_double_eval();
+	test_const_opaque_ptr_orelse();
+	test_array_typedef_is_ptr_orelse();
+	test_pragma_absorbed_into_orelse_condition();
+	test_array_typedef_const_orelse_ternary();
+	test_bare_orelse_compound_literal_ternary();
+	test_chained_bare_orelse();
 }
