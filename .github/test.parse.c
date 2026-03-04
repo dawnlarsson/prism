@@ -5962,17 +5962,6 @@ static void test_generic_array_not_vla(void) {
 	CHECK_EQ((int)sizeof(arr), 5 * (int)sizeof(int), "_Generic array size: not VLA");
 }
 
-#if __STDC_VERSION__ >= 202311L
-__attribute__((unused)) static void test_c23_attr_void_helper(int *out) {
-	void [[maybe_unused]] c23_void_func(void) {
-		defer {
-			*out = 42;
-		};
-	}
-	// Note: nested functions are a GCC extension, so this test is limited.
-	// The lib-mode test verifies the transpiler output directly.
-}
-#endif
 static void test_c23_attr_void_function(void) {
 	// Placeholder — actual verification is in lib-mode tests via transpile output
 	CHECK(1, "C23 [[attr]] void func: handled (see lib tests)");

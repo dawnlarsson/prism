@@ -1234,64 +1234,60 @@ static bool is_longjmp_wrapper(char *name, int len) {
 	return hashmap_get(&longjmp_wrapper_map, name, len) != NULL;
 }
 
-// Pre-scan all top-level function bodies to register longjmp wrappers early.
+// Pre-scan all top-level function bodies to register direct longjmp wrappers.
 // This makes forward-declared wrappers visible to scan_labels_in_function
-// during the main transpilation pass. Runs iteratively until no new wrappers
-// are discovered, handling transitive chains (A calls B calls longjmp).
+// during the main transpilation pass.  Only registers functions whose bodies
+// directly contain setjmp/longjmp/siglongjmp calls (TT_SPECIAL_FN tokens).
+// scan_labels_in_function then checks the wrapper map to detect one level of
+// indirect calls (A calls wrapper B which calls longjmp).  Deeper transitive
+// chains are intentionally not tracked — they would poison the wrapper map
+// in self-hosted builds where error_tok → longjmp propagates everywhere.
 static void prescan_longjmp_wrappers(Token *tok) {
-	bool changed = true;
-	while (changed) {
-		changed = false;
-		int depth = 0;
-		Token *func_name = NULL; // Function name (identifier before top-level '(')
-		Token *prev = NULL;
-		for (Token *t = tok; t && t->kind != TK_EOF; t = t->next) {
-			if (depth == 0) {
-				// Track function name: identifier before '(' at top-level
-				if (is_identifier_like(t) && t->next && equal(t->next, "(") &&
-				    !(t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_ATTR)))
-					func_name = t;
-				// Detect function definition: ')' or K&R params followed by '{'
-				if (equal(t, "{") && prev && (equal(prev, ")") ||
-				    (func_name && is_identifier_like(prev)))) {
-					// Scan function body for longjmp calls
-					if (func_name && !is_longjmp_wrapper(func_name->loc, func_name->len)) {
-						bool has_longjmp = false;
-						int bd = 1;
-						for (Token *b = t->next; b && b->kind != TK_EOF; b = b->next) {
-							if (equal(b, "{")) bd++;
-							else if (equal(b, "}")) { if (--bd <= 0) break; }
-							if ((b->tag & TT_SPECIAL_FN) && !equal(b, "vfork"))
-								has_longjmp = true;
-							if (!has_longjmp && is_identifier_like(b) &&
-							    b->next && equal(b->next, "(") &&
-							    is_longjmp_wrapper(b->loc, b->len))
-								has_longjmp = true;
-						}
-						if (has_longjmp) {
-							register_longjmp_wrapper(func_name->loc, func_name->len);
-							changed = true;
-						}
-					}
-					// Skip function body
-					depth = 1;
+	int depth = 0;
+	Token *func_name = NULL; // Function name (identifier before top-level '(')
+	Token *prev = NULL;
+	for (Token *t = tok; t && t->kind != TK_EOF; t = t->next) {
+		if (depth == 0) {
+			// Track function name: identifier before '(' at top-level
+			if (is_identifier_like(t) && t->next && equal(t->next, "(") &&
+			    !(t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_ATTR)))
+				func_name = t;
+			// Detect function definition: ')' or K&R params followed by '{'
+			if (equal(t, "{") && prev && (equal(prev, ")") ||
+			    (func_name && is_identifier_like(prev)))) {
+				// Scan function body for direct longjmp/siglongjmp calls only
+				if (func_name) {
+					bool has_longjmp = false;
+					int bd = 1;
 					for (Token *b = t->next; b && b->kind != TK_EOF; b = b->next) {
-						if (equal(b, "{")) depth++;
-						else if (equal(b, "}")) {
-							if (--depth <= 0) { t = b; break; }
+						if (equal(b, "{")) bd++;
+						else if (equal(b, "}")) { if (--bd <= 0) break; }
+						if ((b->tag & TT_SPECIAL_FN) && !equal(b, "vfork")) {
+							has_longjmp = true;
+							break;
 						}
 					}
-					depth = 0;
-					func_name = NULL;
-					prev = t;
-					continue;
+					if (has_longjmp)
+						register_longjmp_wrapper(func_name->loc, func_name->len);
 				}
-			} else {
-				if (equal(t, "{")) depth++;
-				else if (equal(t, "}")) depth--;
+				// Skip function body
+				depth = 1;
+				for (Token *b = t->next; b && b->kind != TK_EOF; b = b->next) {
+					if (equal(b, "{")) depth++;
+					else if (equal(b, "}")) {
+						if (--depth <= 0) { t = b; break; }
+					}
+				}
+				depth = 0;
+				func_name = NULL;
+				prev = t;
+				continue;
 			}
-			prev = t;
+		} else {
+			if (equal(t, "{")) depth++;
+			else if (equal(t, "}")) depth--;
 		}
+		prev = t;
 	}
 }
 
@@ -4965,15 +4961,6 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					}
 					if (is_func_def) {
 						scan_labels_in_function(tok);
-						// Record longjmp wrapper: if this function calls longjmp directly,
-						// register its name so callers are also flagged.
-						if (ctx->current_func_has_setjmp &&
-						    func_name_before_paren &&
-						    is_identifier_like(func_name_before_paren)) {
-							register_longjmp_wrapper(
-							    func_name_before_paren->loc,
-							    func_name_before_paren->len);
-						}
 						register_param_shadows(last_toplevel_open_paren,
 								       last_toplevel_paren);
 						ctx->current_func_returns_void = next_func_returns_void;
@@ -4996,6 +4983,15 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			}
 			if (match_ch(tok, '}')) {
 				tok = handle_close_brace(tok);
+				// Reset per-function flags when leaving a function body
+				// (defer_depth returns to 0). This prevents stale flags
+				// from the previous function bleeding into the next one
+				// if the function-definition detection fails to fire.
+				if (ctx->defer_depth == 0) {
+					ctx->current_func_has_setjmp = false;
+					ctx->current_func_has_vfork = false;
+					ctx->current_func_has_asm = false;
+				}
 				continue;
 			}
 			// ; and :
