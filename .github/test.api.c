@@ -906,7 +906,7 @@ static void test_lib_c23_attr_void_function(void) {
 		PrismResult result = prism_transpile_file(path, features);
 		CHECK(result.status == PRISM_OK, "C23 void [[attr]] func: transpiles OK");
 		if (result.output) {
-			CHECK(strstr(result.output, "_prism_ret") == NULL,
+			CHECK(strstr(result.output, "_Prism_ret") == NULL,
 			      "C23 void [[attr]] func: no _prism_ret generated");
 			CHECK(strstr(result.output, "[[deprecated]]") != NULL,
 			      "C23 void [[attr]] func: attribute preserved");
@@ -927,7 +927,7 @@ static void test_lib_c23_attr_void_function(void) {
 		PrismResult result = prism_transpile_file(path, features);
 		CHECK(result.status == PRISM_OK, "C23 void multi [[attr]] func: transpiles OK");
 		if (result.output)
-			CHECK(strstr(result.output, "_prism_ret") == NULL,
+			CHECK(strstr(result.output, "_Prism_ret") == NULL,
 			      "C23 void multi [[attr]] func: no _prism_ret");
 		prism_free(&result);
 		unlink(path);
@@ -983,7 +983,7 @@ static void test_fnptr_return_type_capture(void) {
 		if (result.output) {
 			CHECK(strstr(result.output, "__auto_type") == NULL,
 			      "bug_r2: fnptr return has no __auto_type");
-			CHECK(strstr(result.output, "_prism_ret") != NULL,
+			CHECK(strstr(result.output, "_Prism_ret") != NULL,
 			      "bug_r2: fnptr return has _prism_ret (captured type)");
 		}
 		prism_free(&result);
@@ -1078,7 +1078,7 @@ static void test_nested_fnptr_return_type(void) {
 	if (r.output) {
 		CHECK(strstr(r.output, "__auto_type") == NULL,
 		      "nested fnptr ret: no __auto_type (type captured)");
-		CHECK(strstr(r.output, "_prism_ret_t_") != NULL,
+		CHECK(strstr(r.output, "_Prism_ret_t_") != NULL,
 		      "nested fnptr ret: has typedef for return type");
 	}
 	prism_free(&r);
@@ -1200,9 +1200,9 @@ static void test_typeof_memset_no_shadow(void) {
 	PrismResult r = prism_transpile_source(code, "typeof_shadow.c", feat);
 	CHECK(r.status == PRISM_OK, "typeof memset shadow: transpiles OK");
 	if (r.output) {
-		CHECK(strstr(r.output, "_prism_p_") != NULL,
+		CHECK(strstr(r.output, "_Prism_p_") != NULL,
 		      "typeof memset shadow: uses _prism_p_ prefix");
-		CHECK(strstr(r.output, "_prism_i_") != NULL,
+		CHECK(strstr(r.output, "_Prism_i_") != NULL,
 		      "typeof memset shadow: uses _prism_i_ prefix");
 		// Make sure the old bare _p / _i loop vars are not emitted
 		// (user's own _p/_i assignments are fine, but the memset loop
@@ -1485,7 +1485,7 @@ static void test_pragma_return_type_capture(void) {
 	if (r.output) {
 		// If return type was captured correctly, the defer variable should use "int"
 		// not __auto_type or void*
-		CHECK(strstr(r.output, "int _prism_ret") != NULL,
+		CHECK(strstr(r.output, "int _Prism_ret") != NULL,
 		      "pragma ret: exact return type captured");
 	}
 	prism_free(&r);

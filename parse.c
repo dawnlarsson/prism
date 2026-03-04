@@ -1106,12 +1106,15 @@ static Token *read_char_literal(char *start, char *quote) {
 // Sets *replacement to the standard suffix to use (NULL for none, "f" for float, "L" for long double)
 static int get_extended_float_suffix(const char *p, int len, const char **replacement) {
 	static const struct {
-		const char suffix[5];
+		const char suffix[6];
 		int slen;
 		const char *repl;
 	} tbl[] = {
+	    {"f128x", 5, "L"},
 	    {"bf16", 4, "f"},
 	    {"f128", 4, "L"},
+	    {"f32x", 4, NULL},
+	    {"f64x", 4, "L"},
 	    {"f64", 3, NULL},
 	    {"f32", 3, "f"},
 	    {"f16", 3, "f"},

@@ -231,6 +231,7 @@ typedef struct {
 	Token *prev;
 	int depth;
 	int initial_depth;
+	int ternary_depth;
 } TokenWalker;
 
 // Declarator parsing result
@@ -256,6 +257,8 @@ static char **cached_clean_env = NULL;
 static HashMap system_includes;	   // Tracks unique system headers to emit
 static char **system_include_list; // Ordered list of includes
 static int system_include_capacity = 0;
+
+static HashMap longjmp_wrapper_map; // Tracks functions that call longjmp (for indirect detection)
 
 static ControlFlow ctrl = {0};
 static LabelTable label_table;
@@ -378,6 +381,7 @@ static void reset_transpiler_state(void) {
 	label_table.count = 0;
 	label_table.capacity = 0;
 	hashmap_zero(&label_table.name_map);
+	hashmap_zero(&longjmp_wrapper_map);
 }
 
 PRISM_API PrismFeatures prism_defaults(void) {
@@ -1158,6 +1162,9 @@ static bool walker_next(TokenWalker *w) {
 }
 
 static inline void walker_advance(TokenWalker *w) {
+	// Track ternary '?' operators before advancing
+	if (match_ch(w->tok, '?')) w->ternary_depth++;
+
 	w->prev = w->tok;
 	
 	// Skip struct/union/enum bodies entirely in one hop
@@ -1186,22 +1193,31 @@ static Token *walker_check_label(TokenWalker *w) {
 	Token *t = skip_all_attributes(w->tok->next);
 	if (!t || !equal(t, ":")) return NULL;
 	if (t->next && equal(t->next, ":")) return NULL;		     // :: scope resolution
-	if (w->prev && equal(w->prev, "?")) return NULL;		     // ternary
+	if (w->prev && equal(w->prev, "?")) return NULL;		     // ternary (simple)
+	if (w->ternary_depth > 0) { w->ternary_depth--; return NULL; }	     // ternary (with cast/parens)
 	if (w->prev && (w->prev->tag & (TT_CASE | TT_DEFAULT))) return NULL; // switch case
 	return w->tok;
 }
 
 // ============================================================================
 
+// Register a function as a longjmp wrapper (calls longjmp/siglongjmp/etc.)
+static void register_longjmp_wrapper(char *name, int len) {
+	hashmap_put(&longjmp_wrapper_map, name, len, (void *)1);
+}
+
+// Check if a function is a known longjmp wrapper
+static bool is_longjmp_wrapper(char *name, int len) {
+	return hashmap_get(&longjmp_wrapper_map, name, len) != NULL;
+}
+
 // Scan a function body for labels and record their scope depths
 // Also detects setjmp/longjmp/pthread_exit/vfork and inline asm usage
 // tok should point to the opening '{' of the function body
 //
-// Limitation: detection is token-based and only catches direct calls to
-// setjmp/longjmp/_setjmp/_longjmp/sigsetjmp/siglongjmp/pthread_exit/vfork.
-// Indirect calls through function pointers or wrapper functions (e.g.
-// "my_longjmp(buf, 1)") are NOT detected. In such cases, defer cleanup
-// code may execute incorrectly if a longjmp crosses a defer scope.
+// Detection includes both direct calls to setjmp/longjmp family functions
+// and indirect calls through known wrapper functions that were previously
+// observed to contain longjmp/siglongjmp/etc.
 //
 // Performance: this is a hot function (~77K tokens scanned per run).
 // Uses a two-phase approach: quick pre-scan for goto/setjmp/vfork/asm,
@@ -1223,6 +1239,13 @@ static void scan_labels_in_function(Token *tok) {
 			else ctx->current_func_has_setjmp = true;
 		}
 		if (tg & TT_ASM) ctx->current_func_has_asm = true;
+
+		// Check for indirect longjmp via known wrapper functions
+		if (!ctx->current_func_has_setjmp &&
+		    is_identifier_like(w.tok) && w.tok->next && equal(w.tok->next, "(") &&
+		    is_longjmp_wrapper(w.tok->loc, w.tok->len)) {
+			ctx->current_func_has_setjmp = true;
+		}
 
 		Token *label = walker_check_label(&w);
 		if (label) label_table_add(label->loc, label->len, w.depth, label);
@@ -1275,21 +1298,24 @@ static bool is_raw_declaration_context(Token *after_raw) {
 static int forward_goto_scope_exits(Token *after_goto_label, char *label_name, int label_len) {
 	int depth = 0;
 	int min_depth = 0;
+	int ternary_depth = 0;
 	Token *prev = NULL;
 	for (Token *t = after_goto_label; t && t->kind != TK_EOF; t = t->next) {
 		if (match_ch(t, '{')) depth++;
 		else if (match_ch(t, '}')) {
 			if (--depth < min_depth) min_depth = depth;
 		}
+		if (match_ch(t, '?')) ternary_depth++;
 		if (is_identifier_like(t) && t->len == label_len &&
 		    !memcmp(t->loc, label_name, label_len)) {
 			Token *n = t->next;
 			// Skip C23 attributes between label name and ':'
 			while (n && (n->tag & TT_ATTR)) n = skip_gnu_attributes(n);
 			if (n && equal(n, ":") && !(n->next && equal(n->next, ":"))) {
-				// Filter out ternary ?: (prev is '?')
-				if (!(prev && equal(prev, "?")))
-					return -min_depth;
+				// Filter out ternary ?: (prev is '?' or inside ternary with cast/parens)
+				if (prev && equal(prev, "?")) continue;
+				if (ternary_depth > 0) { ternary_depth--; continue; }
+				return -min_depth;
 			}
 		}
 		prev = t;
@@ -1584,7 +1610,7 @@ static bool try_capture_func_return_type(Token *tok) {
 
 	// Reject anonymous struct/union/enum return types.
 	// In C, each anonymous struct definition creates a unique type.
-	// Re-emitting the tokens for _prism_ret_N would create a second,
+	// Re-emitting the tokens for _Prism_ret_N would create a second,
 	// incompatible type, causing "incompatible types" errors.
 	// Fall through to __auto_type for these cases.
 	if (type.is_struct) {
@@ -1655,10 +1681,10 @@ static bool try_capture_func_return_type(Token *tok) {
 static void emit_ret_type(void) {
 	if (ctx->func_ret_type_start && ctx->func_ret_type_end) {
 		if (ctx->func_ret_type_suffix_start) {
-			// typedef PREFIX _prism_ret_t_N SUFFIX; _prism_ret_t_N
+			// typedef PREFIX _Prism_ret_t_N SUFFIX; _Prism_ret_t_N
 			OUT_LIT("typedef ");
 			emit_token_range(ctx->func_ret_type_start, ctx->func_ret_type_end);
-			OUT_LIT(" _prism_ret_t_");
+			OUT_LIT(" _Prism_ret_t_");
 			out_uint(ctx->ret_counter);
 			for (Token *t = ctx->func_ret_type_suffix_start;
 			     t && t != ctx->func_ret_type_suffix_end && t->kind != TK_EOF;
@@ -1666,7 +1692,7 @@ static void emit_ret_type(void) {
 				out_char(' ');
 				out_str(t->loc, t->len);
 			}
-			OUT_LIT("; _prism_ret_t_");
+			OUT_LIT("; _Prism_ret_t_");
 			out_uint(ctx->ret_counter);
 		} else {
 			emit_token_range(ctx->func_ret_type_start, ctx->func_ret_type_end);
@@ -1722,6 +1748,7 @@ static bool array_size_is_vla(Token *open_bracket) {
 						if (equal(inner, "enum")) {
 							Token *brace = find_struct_body_brace(inner);
 							if (brace) {
+								parse_enum_constants(brace, ctx->defer_depth);
 								inner = skip_balanced(brace, '{', '}');
 								if (inner == end) break;
 								continue;
@@ -1915,7 +1942,9 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 	TypeSpecResult r = { .end = tok };
 
 	bool is_type = false;
-	while ((tok->tag & TT_QUALIFIER) || (is_type = is_type_keyword(tok)) || is_c23_attr(tok)) {
+	while ((tok->tag & TT_QUALIFIER) || (is_type = is_type_keyword(tok)) || is_c23_attr(tok)
+	       || tok->kind == TK_PREP_DIR
+	       || (equal(tok, "_Pragma") && tok->next && equal(tok->next, "("))) {
 		bool had_type = r.saw_type; // Was a type already seen before this iteration?
 		uint32_t tag = tok->tag;
 
@@ -1934,6 +1963,23 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 
 		if (is_c23_attr(tok)) {
 			tok = skip_c23_attr(tok);
+			r.end = tok;
+			is_type = false;
+			continue;
+		}
+
+		// _Pragma(...) can appear between qualifiers/type keywords in macro expansions.
+		// Skip it transparently so it doesn't break type specifier parsing.
+		// Source-level _Pragma("...") tokens:
+		if (equal(tok, "_Pragma") && tok->next && equal(tok->next, "(")) {
+			tok = skip_pragma_operators(tok);
+			r.end = tok;
+			is_type = false;
+			continue;
+		}
+		// Preprocessor-expanded _Pragma becomes #pragma (TK_PREP_DIR):
+		if (tok->kind == TK_PREP_DIR) {
+			tok = tok->next;
 			r.end = tok;
 			is_type = false;
 			continue;
@@ -2216,8 +2262,12 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 	decl_emit(tok, emit);
 	tok = tok->next;
 
-	// Skip __attribute__ after variable name
-	while (tok && tok->kind != TK_EOF && (tok->tag & TT_ATTR)) tok = decl_attr(tok, emit);
+	// Skip __attribute__ and C23 [[...]] attributes after variable name
+	while (tok && tok->kind != TK_EOF) {
+		if (tok->tag & TT_ATTR) tok = decl_attr(tok, emit);
+		else if (is_c23_attr(tok)) tok = decl_balanced(tok, emit);
+		else break;
+	}
 
 	// Array dims inside parens: (*name[N])
 	if (r.has_paren && equal(tok, "[")) {
@@ -2259,9 +2309,10 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 		tok = decl_array_dims(tok, emit, &r.is_vla);
 	}
 
-	// Skip __attribute__ and asm() before initializer or end of declarator
+	// Skip __attribute__, C23 [[...]] attrs, and asm() before initializer or end of declarator
 	while (tok && tok->kind != TK_EOF) {
 		if (tok->tag & TT_ATTR) tok = decl_attr(tok, emit);
+		else if (is_c23_attr(tok)) tok = decl_balanced(tok, emit);
 		else if (tok->tag & TT_ASM) {
 			if (emit) emit_tok(tok);
 			tok = tok->next;
@@ -2310,30 +2361,30 @@ static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool
 			// Use unique names to avoid shadowing user variables
 			// const typeof: cast through (void *) to drop const before volatile char *
 			if (has_const) {
-				OUT_LIT("char *_prism_p_");
+				OUT_LIT("char *_Prism_p_");
 				out_uint(ctx->ret_counter);
 				OUT_LIT(" = (");
 				out_str(vol, vol_len);
 				OUT_LIT("char *)(void *)&");
 			} else {
-				OUT_LIT("char *_prism_p_");
+				OUT_LIT("char *_Prism_p_");
 				out_uint(ctx->ret_counter);
 				OUT_LIT(" = (");
 				out_str(vol, vol_len);
 				OUT_LIT("char *)&");
 			}
 			out_str(vars[i]->loc, vars[i]->len);
-			OUT_LIT("; for (unsigned long _prism_i_");
+			OUT_LIT("; for (unsigned long _Prism_i_");
 			out_uint(ctx->ret_counter);
-			OUT_LIT(" = 0; _prism_i_");
+			OUT_LIT(" = 0; _Prism_i_");
 			out_uint(ctx->ret_counter);
 			OUT_LIT(" < sizeof(");
 			out_str(vars[i]->loc, vars[i]->len);
-			OUT_LIT("); _prism_i_");
+			OUT_LIT("); _Prism_i_");
 			out_uint(ctx->ret_counter);
-			OUT_LIT("++) _prism_p_");
+			OUT_LIT("++) _Prism_p_");
 			out_uint(ctx->ret_counter);
-			OUT_LIT("[_prism_i_");
+			OUT_LIT("[_Prism_i_");
 			out_uint(ctx->ret_counter);
 			OUT_LIT("] = 0; }");
 			ctx->ret_counter++;
@@ -2408,7 +2459,7 @@ static void re_emit_type_specifier(Token *type_start, Token *type_end) {
 
 // const + fallback orelse: roll back speculative output, re-emit with temp variable.
 // MSVC-compatible: instead of "const T x = val ?: fallback;",
-// emit: "T _prism_oe_N = (val); if (!_prism_oe_N) _prism_oe_N = (fallback); const T x = _prism_oe_N;"
+// emit: "T _Prism_oe_N = (val); if (!_Prism_oe_N) _Prism_oe_N = (fallback); const T x = _Prism_oe_N;"
 // Handles chained orelse naturally: each chain link adds another if-assignment on the temp.
 // Returns token after fallback expression (at ';' or boundary comma).
 static Token *handle_const_orelse_fallback(Token *tok,
@@ -2426,7 +2477,7 @@ static Token *handle_const_orelse_fallback(Token *tok,
 
 	unsigned oe_id = ctx->ret_counter++;
 
-	// Emit temp variable: "T _prism_oe_N = (val);"
+	// Emit temp variable: "T _Prism_oe_N = (val);"
 	// The temp must be mutable for chained orelse re-assignment.
 	// For non-pointer types: strip 'const' from the type specifier (it makes the variable const).
 	// For pointer types: keep type-specifier 'const' (it qualifies the pointed-to type, not the pointer).
@@ -2448,7 +2499,7 @@ static Token *handle_const_orelse_fallback(Token *tok,
 		emit_tok(t);
 	}
 	
-	OUT_LIT(" _prism_oe_");
+	OUT_LIT(" _Prism_oe_");
 	out_uint(oe_id);
 	// Emit declarator suffix (e.g. )(int) for function pointers, [N] for arrays)
 	emit_range(decl->var_name->next, decl->end);
@@ -2456,14 +2507,14 @@ static Token *handle_const_orelse_fallback(Token *tok,
 	emit_range(val_start, orelse_tok);
 	OUT_LIT(");");
 
-	// Emit fallback assignment(s): "if (!_prism_oe_N) _prism_oe_N = (fallback);"
+	// Emit fallback assignment(s): "if (!_Prism_oe_N) _Prism_oe_N = (fallback);"
 	// Handles chained orelse by looping: each 'orelse' adds another if-assignment.
 	// When the last chain link is control flow (return/break/continue/goto),
 	// emit it as a block instead of an invalid assignment.
 	for (;;) {
 		// Check if this link is a control flow action (not a fallback value)
 		if (tok->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) {
-			OUT_LIT(" if (!_prism_oe_");
+			OUT_LIT(" if (!_Prism_oe_");
 			out_uint(oe_id);
 			OUT_LIT(") {");
 			if (tok->tag & TT_RETURN) {
@@ -2500,9 +2551,9 @@ static Token *handle_const_orelse_fallback(Token *tok,
 			break;
 		}
 
-		OUT_LIT(" if (!_prism_oe_");
+		OUT_LIT(" if (!_Prism_oe_");
 		out_uint(oe_id);
-		OUT_LIT(") _prism_oe_");
+		OUT_LIT(") _Prism_oe_");
 		out_uint(oe_id);
 		OUT_LIT(" = (");
 
@@ -2531,11 +2582,11 @@ static Token *handle_const_orelse_fallback(Token *tok,
 		if (!chained) break;
 	}
 
-	// Emit final const declaration: "const T declarator = _prism_oe_N;"
+	// Emit final const declaration: "const T declarator = _Prism_oe_N;"
 	emit_range(type_start, type->end);
 	parse_declarator(decl_start, true);
 
-	OUT_LIT(" = _prism_oe_");
+	OUT_LIT(" = _Prism_oe_");
 	out_uint(oe_id);
 	out_char(';');
 	return tok;
@@ -2595,7 +2646,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		// But NOT for register variables (can't take address) or volatile (needs volatile semantics)
 		bool is_aggregate =
 		    decl.is_array || ((type->is_struct || type->is_typedef) && !decl.is_pointer);
-		bool needs_memset = !decl.has_init && !is_raw && !decl.is_pointer && !type->has_register &&
+		bool needs_memset = !decl.has_init && !is_raw && (!decl.is_pointer || decl.is_array) &&
+				    !type->has_register &&
 				    (type->has_typeof || (type->has_atomic && is_aggregate) || effective_vla);
 
 		// Add zero initializer if needed (for non-memset types)
@@ -2724,6 +2776,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 						tok = tok->next;
 						oe_buf_checkpoint = out_buf_pos;
 						re_emit_type_specifier(type_start, type->end);
+						is_raw = false;
 						continue;
 					}
 					ctx->active_typeof_vars = NULL;
@@ -2759,6 +2812,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					tok = tok->next; // skip comma
 					oe_buf_checkpoint = out_buf_pos;
 					re_emit_type_specifier(type_start, type->end);
+					is_raw = false;
 					continue;
 				}
 				ctx->active_typeof_vars = NULL;
@@ -2776,6 +2830,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		} else if (equal(tok, ",")) {
 			emit_tok(tok);
 			tok = tok->next;
+			is_raw = false; // raw applies to first declarator only
 		} else {
 			// If orelse already committed output, emit remaining raw
 			if (oe_buf_checkpoint != original_oe_checkpoint) {
@@ -3095,9 +3150,8 @@ static Token *handle_defer_keyword(Token *tok) {
 		if (ctx->defer_depth == stmt_expr_levels[i])
 			error_tok(tok,
 				  "defer cannot be at top level of statement expression; wrap in a block");
-	// setjmp/longjmp safety: only direct calls are detected by scan_labels_in_function.
-	// Indirect calls via function pointers or wrappers are not caught (see limitation
-	// comment on scan_labels_in_function).
+	// setjmp/longjmp safety: detects direct calls and indirect calls through
+	// known wrapper functions (registered by longjmp_wrapper_map).
 	if (ctx->current_func_has_setjmp)
 		error_tok(tok, "defer cannot be used in functions that call setjmp/longjmp/pthread_exit");
 	if (ctx->current_func_has_vfork)
@@ -3283,14 +3337,14 @@ static Token *emit_return_body(Token *tok) {
 			bool is_void = is_void_return(tok);
 			if (!is_void) {
 				out_char(' '); emit_ret_type();
-				OUT_LIT(" _prism_ret_"); out_uint(ctx->ret_counter); OUT_LIT(" = (");
+				OUT_LIT(" _Prism_ret_"); out_uint(ctx->ret_counter); OUT_LIT(" = (");
 			} else OUT_LIT(" (");
 
 			tok = emit_expr_to_semicolon(tok);
 			OUT_LIT(");");
 			emit_all_defers();
 
-			if (!is_void) { OUT_LIT(" return _prism_ret_"); out_uint(ctx->ret_counter++); }
+			if (!is_void) { OUT_LIT(" return _Prism_ret_"); out_uint(ctx->ret_counter++); }
 			else OUT_LIT(" return");
 			out_char(';');
 		}
@@ -3347,7 +3401,7 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
 					if (!is_void) {
 						out_char(' ');
 						emit_ret_type();
-						OUT_LIT(" _prism_ret_");
+						OUT_LIT(" _Prism_ret_");
 						out_uint(ctx->ret_counter);
 						OUT_LIT(" = (");
 					} else
@@ -3365,7 +3419,7 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
 					OUT_LIT(");");
 					emit_all_defers();
 					if (!is_void) {
-						OUT_LIT(" return _prism_ret_");
+						OUT_LIT(" return _Prism_ret_");
 						out_uint(ctx->ret_counter++);
 					} else
 						OUT_LIT(" return");
@@ -4045,6 +4099,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 	Token *prev_toplevel_tok = NULL;	// Track previous token at top level for function detection
 	Token *last_toplevel_paren = NULL;	// Track last ')' at top level for K&R detection
 	Token *last_toplevel_open_paren = NULL; // Track matching '(' for param shadow detection
+	Token *func_name_before_paren = NULL;	// Track function name (token before top-level '(')
 	int toplevel_paren_depth = 0;		// Depth counter for top-level paren tracking
 	int ternary_depth = 0;			// Depth counter for ? : operators
 
@@ -4068,7 +4123,10 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 #define TRACK_TOPLEVEL_PAREN(tok)                                                                            \
 	if (ctx->defer_depth == 0) {                                                                         \
 		if (match_ch(tok, '(')) {                                                                    \
-			if (toplevel_paren_depth == 0) last_toplevel_open_paren = tok;                       \
+			if (toplevel_paren_depth == 0) {                                                     \
+				last_toplevel_open_paren = tok;                                              \
+				func_name_before_paren = prev_toplevel_tok;                                  \
+			}                                                                                    \
 			toplevel_paren_depth++;                                                              \
 		} else if (match_ch(tok, ')')) {                                                             \
 			if (--toplevel_paren_depth <= 0) {                                                   \
@@ -4336,6 +4394,15 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					}
 					if (is_func_def) {
 						scan_labels_in_function(tok);
+						// Record longjmp wrapper: if this function calls longjmp directly,
+						// register its name so callers are also flagged.
+						if (ctx->current_func_has_setjmp &&
+						    func_name_before_paren &&
+						    is_identifier_like(func_name_before_paren)) {
+							register_longjmp_wrapper(
+							    func_name_before_paren->loc,
+							    func_name_before_paren->len);
+						}
 						register_param_shadows(last_toplevel_open_paren,
 								       last_toplevel_paren);
 						ctx->current_func_returns_void = next_func_returns_void;
