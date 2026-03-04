@@ -1117,6 +1117,49 @@ void test_orelse_braceless_else_decl(void) {
 	CHECK_EQ(_braceless_else_decl_helper(0, NULL), -1, "braceless else decl: cond=0 null triggers");
 }
 
+static int *_ocop_get_null(void) { return NULL; }
+static int _ocop_static_val = 42;
+static int *_ocop_get_ptr(void) { return &_ocop_static_val; }
+static int _ocop_side = 0;
+static void _ocop_side_fn(void) { _ocop_side = 1; }
+
+static void test_orelse_comma_operator_fallback(void) {
+	total++;
+	_ocop_side = 0;
+	// The comma in 'orelse _ocop_get_ptr(), _ocop_side_fn()' must be treated as
+	// a comma operator (not a declaration separator) because _ocop_side_fn is
+	// followed by '('.  Without the fix, find_boundary_comma would split this
+	// into two garbled declarations.
+	int *x = _ocop_get_null() orelse _ocop_get_ptr(), _ocop_side_fn();
+	if (x && *x == 42 && _ocop_side) {
+		passed++;
+		printf("[PASS] %s\n", __func__);
+	} else {
+		printf("[FAIL] %s: x=%p *x=%d side=%d\n", __func__,
+		       (void *)x, x ? *x : -1, _ocop_side);
+	}
+}
+
+static int _occc_get_zero(void) { return 0; }
+static int _occc_fallback(void) { return 77; }
+static int _occc_status = 99;
+
+static void test_orelse_comma_cast_fallback(void) {
+	total++;
+	// A cast '(int)status' after comma must not be mistaken for a declarator.
+	// Without the fix, '(' followed by a type keyword was treated as a
+	// grouped-declarator start, breaking the fallback expression.
+	// Note: comma operator binds weaker than assignment, so
+	// 'x = fallback(), (int)status' assigns fallback() to x and discards the cast.
+	int x = _occc_get_zero() orelse _occc_fallback(), (int)_occc_status;
+	if (x == 77) {
+		passed++;
+		printf("[PASS] %s\n", __func__);
+	} else {
+		printf("[FAIL] %s: x=%d expected 77\n", __func__, x);
+	}
+}
+
 static void test_orelse_comma_decl_fallback(void) {
 	printf("\n--- Orelse Comma Decl Fallback ---\n");
 
@@ -1238,5 +1281,7 @@ void run_orelse_tests(void) {
 	test_orelse_braceless_else_bare();
 	test_orelse_braceless_else_decl();
 
+	test_orelse_comma_operator_fallback();
+	test_orelse_comma_cast_fallback();
 	test_orelse_comma_decl_fallback();
 }

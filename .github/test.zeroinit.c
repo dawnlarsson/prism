@@ -1417,6 +1417,24 @@ static void test_sizeof_unparenthesized_not_vla(void) {
 	      "sizeof unparenthesized: correct size");
 }
 
+static void test_sizeof_unary_prefix_not_vla(void) {
+	// sizeof with unary +/- prefix should not trigger VLA detection.
+	// e.g. int arr[sizeof -x] is NOT a VLA.
+	int x = 42;
+	int arr_neg[sizeof -x];
+	int arr_pos[sizeof +x];
+	int all_zero = 1;
+	for (unsigned i = 0; i < sizeof arr_neg / sizeof(int); i++)
+		if (arr_neg[i] != 0) all_zero = 0;
+	for (unsigned i = 0; i < sizeof arr_pos / sizeof(int); i++)
+		if (arr_pos[i] != 0) all_zero = 0;
+	CHECK(all_zero, "sizeof unary prefix: arrays zero-initialized");
+	CHECK(sizeof(arr_neg) == sizeof(int) * sizeof(-x),
+	      "sizeof unary prefix neg: correct size");
+	CHECK(sizeof(arr_pos) == sizeof(int) * sizeof(+x),
+	      "sizeof unary prefix pos: correct size");
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -1488,4 +1506,5 @@ void run_zeroinit_tests(void) {
 	test_const_typeof_atomic_struct_bug();
 
 	test_sizeof_unparenthesized_not_vla();
+	test_sizeof_unary_prefix_not_vla();
 }

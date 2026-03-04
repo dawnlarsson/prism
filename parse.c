@@ -837,6 +837,8 @@ static void init_keyword_map(void) {
 	    {"__inline", TT_INLINE, true},
 	    {"__inline__", TT_INLINE, true},
 	    {"_Thread_local", 0, true},
+	    {"constexpr", TT_QUALIFIER | TT_SKIP_DECL, true},
+	    {"thread_local", TT_QUALIFIER | TT_SKIP_DECL, true},
 	    // Type keywords
 	    {"void", TT_TYPE, true},
 	    {"char", TT_TYPE, true},
@@ -856,7 +858,7 @@ static void init_keyword_map(void) {
 	    {"__uint128", TT_TYPE, true},
 	    {"__uint128_t", TT_TYPE, true},
 	    {"typeof_unqual", TT_TYPE | TT_TYPEOF, true},
-	    {"auto", TT_QUALIFIER, true},
+	    {"auto", TT_QUALIFIER | TT_TYPE, true},
 	    {"register", TT_QUALIFIER | TT_REGISTER, true},
 	    {"_Alignas", TT_QUALIFIER | TT_ALIGNAS, true},
 	    {"alignas", TT_QUALIFIER | TT_ALIGNAS, true},

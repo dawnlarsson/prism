@@ -1058,6 +1058,104 @@ static void test_line_directive_escaped_quote(void) {
 	}
 }
 
+static void test_nested_fnptr_return_type(void) {
+	printf("\n--- Nested Function Pointer Return Type ---\n");
+
+	// Two-level nested function pointer: foo returns pointer-to-function(int)
+	// returning pointer-to-function(double) returning int.
+	// Without the fix, try_capture_func_return_type fails to recurse through
+	// the nested parenthesized declarator and falls back to __auto_type.
+	const char *code =
+	    "int (*(*foo(void))(int))(double) {\n"
+	    "    defer (void)0;\n"
+	    "    return 0;\n"
+	    "}\n";
+
+	PrismResult r = prism_transpile_source(code, "nested_fnptr.c", prism_defaults());
+	CHECK(r.status == PRISM_OK, "nested fnptr ret: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "__auto_type") == NULL,
+		      "nested fnptr ret: no __auto_type (type captured)");
+		CHECK(strstr(r.output, "_prism_ret_t_") != NULL,
+		      "nested fnptr ret: has typedef for return type");
+	}
+	prism_free(&r);
+}
+
+static void test_generic_defer_passthrough(void) {
+	printf("\n--- _Generic Defer Passthrough ---\n");
+
+	// defer inside _Generic must NOT be processed by the transpiler.
+	// Without the fix, handle_defer_keyword fires, corrupts the stream,
+	// and emits cleanup code at end of scope.
+	const char *code =
+	    "void clean_int(int x) { (void)x; }\n"
+	    "#define CLEAN(x) _Generic((x), int: defer clean_int(x), default: 0)\n"
+	    "void test(void) {\n"
+	    "    int val = 42;\n"
+	    "    CLEAN(val);\n"
+	    "}\n";
+
+	PrismResult r = prism_transpile_source(code, "generic_defer.c", prism_defaults());
+	CHECK(r.status == PRISM_OK, "generic defer: transpiles OK");
+	if (r.output) {
+		// The defer should pass through untouched — no brace wrapping
+		CHECK(strstr(r.output, "unterminated") == NULL,
+		      "generic defer: no unterminated error");
+		// The _Generic expression should remain intact in the output
+		CHECK(strstr(r.output, "_Generic") != NULL,
+		      "generic defer: _Generic preserved in output");
+	}
+	prism_free(&r);
+}
+
+static void test_raw_c23_attr_interleave(void) {
+	printf("\n--- Raw C23 Attr Interleave ---\n");
+
+	// 'raw [[maybe_unused]] int x;' must consume the raw keyword,
+	// preserve the C23 attribute, and suppress zero-init.
+	const char *code =
+	    "void f(void) {\n"
+	    "    raw [[maybe_unused]] int x;\n"
+	    "}\n";
+
+	PrismResult r = prism_transpile_source(code, "c23_attr_decl.c", prism_defaults());
+	CHECK(r.status == PRISM_OK, "raw c23 attr: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "raw") == NULL,
+		      "raw c23 attr: 'raw' keyword consumed");
+		CHECK(strstr(r.output, "[[maybe_unused]]") != NULL,
+		      "raw c23 attr: attribute preserved");
+		CHECK(strstr(r.output, "= 0") == NULL,
+		      "raw c23 attr: no zero-init");
+	}
+	prism_free(&r);
+}
+
+static void test_c23_auto_orelse(void) {
+	printf("\n--- C23 Auto Orelse ---\n");
+
+	// C23 'auto' used for type inference with orelse must be processed
+	// through the declaration pipeline, not the bare expression path.
+	const char *code =
+	    "int *try_fn(void) { return 0; }\n"
+	    "int test(void) {\n"
+	    "    auto ptr = try_fn() orelse return -1;\n"
+	    "    return *ptr;\n"
+	    "}\n";
+
+	PrismResult r = prism_transpile_source(code, "c23_auto_decl.c", prism_defaults());
+	CHECK(r.status == PRISM_OK, "c23 auto orelse: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "if (!ptr)") != NULL,
+		      "c23 auto orelse: orelse expanded correctly");
+		// Must not contain the raw orelse keyword in output
+		CHECK(strstr(r.output, "orelse") == NULL,
+		      "c23 auto orelse: orelse keyword consumed");
+	}
+	prism_free(&r);
+}
+
 static void test_cross_compile_msvc_ret_type(void) {
 	printf("\n--- Cross-Compile MSVC Ret Type ---\n");
 
@@ -1084,6 +1182,563 @@ static void test_cross_compile_msvc_ret_type(void) {
 	prism_free(&r);
 }
 
+static void test_typeof_memset_no_shadow(void) {
+	printf("\n--- Typeof Memset No Shadow ---\n");
+
+	// When the transpiler emits typeof-based memset loops
+	// for VLA zero-init, the loop variables must not shadow user variables.
+	const char *code =
+	    "void f(int n) {\n"
+	    "    char *_p = \"hello\";\n"
+	    "    int _i = 42;\n"
+	    "    volatile typeof(int[n]) vla;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "typeof_shadow.c", feat);
+	CHECK(r.status == PRISM_OK, "typeof memset shadow: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "_prism_p_") != NULL,
+		      "typeof memset shadow: uses _prism_p_ prefix");
+		CHECK(strstr(r.output, "_prism_i_") != NULL,
+		      "typeof memset shadow: uses _prism_i_ prefix");
+		// Make sure the old bare _p / _i loop vars are not emitted
+		// (user's own _p/_i assignments are fine, but the memset loop
+		// must not add another bare 'char *_p' or 'unsigned long _i').
+		char *loop_shadow = strstr(r.output, "char *_p =");
+		// There should be exactly one occurrence (user's), not two.
+		if (loop_shadow) {
+			CHECK(strstr(loop_shadow + 1, "char *_p =") == NULL,
+			      "typeof memset shadow: no duplicate char *_p");
+		}
+	}
+	prism_free(&r);
+}
+
+static void test_c23_constexpr_thread_local(void) {
+	printf("\n--- C23 constexpr/thread_local ---\n");
+
+	// constexpr and thread_local must not be fast-rejected by
+	// try_zero_init_decl. They need TT_QUALIFIER | TT_SKIP_DECL tags
+	// so the declaration pipeline processes them.
+	const char *code =
+	    "int get(void) { return 42; }\n"
+	    "void f(void) {\n"
+	    "    thread_local int y;\n"
+	    "    int *p = &y orelse return;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "c23kw.c", feat);
+	CHECK(r.status == PRISM_OK, "c23 constexpr/thread_local: transpiles OK");
+	if (r.output) {
+		// orelse must have been expanded, not rejected
+		CHECK(strstr(r.output, "orelse") == NULL,
+		      "c23 constexpr/thread_local: orelse consumed");
+	}
+	prism_free(&r);
+
+	// constexpr declaration should also pass through
+	const char *code2 =
+	    "void g(void) {\n"
+	    "    constexpr int x = 10;\n"
+	    "}\n";
+	PrismResult r2 = prism_transpile_source(code2, "c23kw2.c", feat);
+	CHECK(r2.status == PRISM_OK, "c23 constexpr: transpiles OK");
+	if (r2.output) {
+		CHECK(strstr(r2.output, "constexpr") != NULL,
+		      "c23 constexpr: keyword preserved in output");
+	}
+	prism_free(&r2);
+}
+
+static void test_orelse_backtrack_desync(void) {
+	printf("\n--- Orelse Backtracking Desync ---\n");
+
+	// Multi-declarator: variable with orelse + function prototype.
+	// The orelse must be expanded for 'a', and the function prototype
+	// 'f(void)' must survive as a raw declaration — not get swallowed
+	// into the fallback or cause a rollback desync.
+	const char *code =
+	    "int get(void) { return 42; }\n"
+	    "void test(void) {\n"
+	    "    int a = get() orelse 0, f(void);\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "bt_desync.c", feat);
+	CHECK(r.status == PRISM_OK, "orelse backtrack desync: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "orelse") == NULL,
+		      "orelse backtrack desync: orelse consumed");
+		// The orelse expansion should produce an if-check for a
+		CHECK(strstr(r.output, "if (!") != NULL,
+		      "orelse backtrack desync: orelse expanded to if-check");
+		// Function prototype must appear as a separate declaration
+		CHECK(strstr(r.output, "int f(void);") != NULL,
+		      "orelse backtrack desync: prototype preserved");
+	}
+	prism_free(&r);
+}
+
+static void test_orelse_nested_paren_rejected(void) {
+	printf("\n--- Orelse Nested Paren Rejected ---\n");
+
+	// orelse inside parentheses cannot be expanded to statement-level
+	// if-checks. Must produce a clear error, not silently emit invalid C.
+	const char *code =
+	    "int get(void) { return 0; }\n"
+	    "void f(void) {\n"
+	    "    int x = (get() orelse 0);\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "paren_orelse.c", feat);
+	CHECK(r.status != PRISM_OK, "orelse nested paren: rejected");
+	if (r.error_msg) {
+		CHECK(strstr(r.error_msg, "orelse") != NULL,
+		      "orelse nested paren: error mentions orelse");
+		CHECK(strstr(r.error_msg, "parenthes") != NULL,
+		      "orelse nested paren: error mentions parentheses");
+	}
+	prism_free(&r);
+}
+
+static void test_vla_var_not_typedef(void) {
+	printf("\n--- VLA Variable Not Typedef ---\n");
+
+	// VLA multiplication misidentified as declaration.
+	// After "int x[n];", Prism registered x as TDK_VLA_VAR which fell through
+	// to TDF_TYPEDEF in typedef_flags. This made "x * y;" look like a pointer
+	// declaration, causing try_zero_init_decl to emit "x * y = 0;".
+	{
+		const char *code =
+		    "void f(int n) {\n"
+		    "    int x[n];\n"
+		    "    int y = 1;\n"
+		    "    x * y;\n"
+		    "}\n";
+		PrismFeatures feat = prism_defaults();
+		PrismResult r = prism_transpile_source(code, "vla_mul.c", feat);
+		CHECK(r.status == PRISM_OK, "vla mul: transpiles OK");
+		if (r.output) {
+			// The multiplication must survive as-is, not become "x * y = 0;"
+			CHECK(strstr(r.output, "= 0") == NULL,
+			      "vla mul: no spurious zero-init");
+			CHECK(strstr(r.output, "x * y") != NULL,
+			      "vla mul: multiplication preserved");
+		}
+		prism_free(&r);
+	}
+
+	// Shadow overwrite when VLA variable shadows a typedef.
+	// register_decl_shadows first added a shadow (is_shadow=true), then
+	// typedef_add_vla_var added a second entry (is_shadow=false) that replaced
+	// the shadow in the hash map, making the typedef visible again.
+	{
+		const char *code =
+		    "typedef int T;\n"
+		    "void f(int n) {\n"
+		    "    int T[n];\n"
+		    "    T * p;\n"		// must be multiplication, not pointer decl
+		    "}\n";
+		PrismFeatures feat = prism_defaults();
+		PrismResult r = prism_transpile_source(code, "vla_shadow.c", feat);
+		CHECK(r.status == PRISM_OK, "vla shadow: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "= 0") == NULL,
+			      "vla shadow: no spurious zero-init");
+			CHECK(strstr(r.output, "T * p") != NULL,
+			      "vla shadow: multiplication preserved");
+		}
+		prism_free(&r);
+	}
+}
+
+static void test_orelse_typedef_cast_comma(void) {
+	printf("\n--- Orelse Typedef Cast Comma ---\n");
+
+	// A typedef cast like (size_t)0 after a comma operator must not be
+	// mistaken for a parenthesized declarator boundary.
+	const char *code =
+	    "#include <stddef.h>\n"
+	    "int get(void);\n"
+	    "int fallback(void);\n"
+	    "void f(void) {\n"
+	    "    int x = get() orelse fallback(), (size_t)0;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "td_cast_comma.c", feat);
+	CHECK(r.status == PRISM_OK, "typedef cast comma: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "orelse") == NULL,
+		      "typedef cast comma: orelse consumed");
+		// The (size_t)0 must appear in the output as part of the comma expression
+		CHECK(strstr(r.output, "(size_t)0") != NULL,
+		      "typedef cast comma: cast expression preserved");
+	}
+	prism_free(&r);
+}
+
+static void test_atomic_typedef_qualifier(void) {
+	printf("\n--- Atomic Typedef Qualifier ---\n");
+
+	// _Atomic as a bare qualifier must not short-circuit type parsing.
+	// Previously, _Atomic set saw_type=true (via TT_TYPE), so the had_type
+	// guard broke out before consuming the typedef name T.
+	const char *code =
+	    "typedef int T;\n"
+	    "void f(void) {\n"
+	    "    _Atomic T x;\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "atomic_td.c", feat);
+	CHECK(r.status == PRISM_OK, "atomic typedef: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "_Atomic") != NULL,
+		      "atomic typedef: _Atomic preserved");
+		CHECK(strstr(r.output, "= 0") != NULL || strstr(r.output, "memset") != NULL,
+		      "atomic typedef: zero-init applied");
+	}
+	prism_free(&r);
+}
+
+static void test_pragma_in_declarator(void) {
+	printf("\n--- Pragma In Declarator ---\n");
+
+	// _Pragma can appear anywhere whitespace can (C99 6.10.9).
+	// parse_declarator must skip _Pragma(...) in the pointer/qualifier prefix.
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int _Pragma(\"GCC diagnostic ignored \\\"-Wpadded\\\"\") *x;\n"
+		    "}\n";
+		PrismFeatures feat = prism_defaults();
+		PrismResult r = prism_transpile_source(code, "pragma_decl.c", feat);
+		CHECK(r.status == PRISM_OK, "pragma decl: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "= 0") != NULL,
+			      "pragma decl: zero-init applied");
+		}
+		prism_free(&r);
+	}
+
+	// _Pragma after a comma in multi-declarator must not break find_boundary_comma.
+	{
+		const char *code =
+		    "int get(void) { return 42; }\n"
+		    "void f(void) {\n"
+		    "    int a = get() orelse 0, _Pragma(\"GCC unroll 4\") b;\n"
+		    "}\n";
+		PrismFeatures feat = prism_defaults();
+		PrismResult r = prism_transpile_source(code, "pragma_comma.c", feat);
+		CHECK(r.status == PRISM_OK, "pragma comma: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "pragma comma: orelse consumed");
+		}
+		prism_free(&r);
+	}
+}
+
+static void test_chained_sizeof_not_vla(void) {
+	printf("\n--- Chained sizeof Not VLA ---\n");
+
+	// "sizeof sizeof x" is a compile-time constant expression (the outer sizeof
+	// evaluates the type size_t).  The inner sizeof's operand must not cause
+	// the array to be flagged as a VLA.
+	const char *code =
+	    "int x;\n"
+	    "void f(void) {\n"
+	    "    int arr[sizeof sizeof x];\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "chain_sizeof.c", feat);
+	CHECK(r.status == PRISM_OK, "chained sizeof: transpiles OK");
+	if (r.output) {
+		// Fixed-size array must get = {0}, not memset (VLA path)
+		CHECK(strstr(r.output, "= {0}") != NULL,
+		      "chained sizeof: brace-init, not memset");
+		CHECK(strstr(r.output, "memset") == NULL,
+		      "chained sizeof: no spurious memset");
+	}
+	prism_free(&r);
+}
+
+static void test_pragma_return_type_capture(void) {
+	printf("\n--- Pragma Return Type Capture ---\n");
+
+	// _Pragma before a function definition must not prevent return type capture.
+	// try_capture_func_return_type must skip _Pragma(...) like it skips attributes.
+	const char *code =
+	    "_Pragma(\"pack(push,1)\")\n"
+	    "int f(void) {\n"
+	    "    defer (void)0;\n"
+	    "    return 1;\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "pragma_ret.c", feat);
+	CHECK(r.status == PRISM_OK, "pragma ret: transpiles OK");
+	if (r.output) {
+		// If return type was captured correctly, the defer variable should use "int"
+		// not __auto_type or void*
+		CHECK(strstr(r.output, "int _prism_ret") != NULL,
+		      "pragma ret: exact return type captured");
+	}
+	prism_free(&r);
+}
+
+static void test_c23_attr_comma_boundary(void) {
+	printf("\n--- C23 Attr Comma Boundary ---\n");
+
+	// [[maybe_unused]] after a comma must be recognized as starting a new
+	// declarator, not as part of a comma operator expression.
+	const char *code =
+	    "int get(void) { return 42; }\n"
+	    "void f(void) {\n"
+	    "    int a = get() orelse 0, [[maybe_unused]] b = 1;\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "attr_comma.c", feat);
+	CHECK(r.status == PRISM_OK, "c23 attr comma: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "orelse") == NULL,
+		      "c23 attr comma: orelse consumed");
+		CHECK(strstr(r.output, "[[maybe_unused]]") != NULL,
+		      "c23 attr comma: attribute preserved");
+	}
+	prism_free(&r);
+}
+
+static void test_thread_local_goto_exempt(void) {
+	printf("\n--- Thread Local Goto Exempt ---\n");
+
+	// thread_local / _Thread_local variables have thread storage duration,
+	// so jumping over them with goto is safe (like static).
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    goto L;\n"
+		    "    _Thread_local int x = 5;\n"
+		    "    L:;\n"
+		    "}\n";
+		PrismFeatures feat = prism_defaults();
+		PrismResult r = prism_transpile_source(code, "tl_goto1.c", feat);
+		CHECK(r.status == PRISM_OK, "goto over _Thread_local: OK");
+		prism_free(&r);
+	}
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    goto L;\n"
+		    "    thread_local int x = 5;\n"
+		    "    L:;\n"
+		    "}\n";
+		PrismFeatures feat = prism_defaults();
+		PrismResult r = prism_transpile_source(code, "tl_goto2.c", feat);
+		CHECK(r.status == PRISM_OK, "goto over thread_local: OK");
+		prism_free(&r);
+	}
+}
+
+static void test_vla_heuristic_zombie(void) {
+	printf("\n--- VLA Heuristic Zombie ---\n");
+
+	// A VLA variable whose name matches the _t heuristic (e.g. size_t)
+	// must not be resurrected as a typedef by is_typedef_like.
+	const char *code =
+	    "void f(int n) {\n"
+	    "    int size_t[n];\n"
+	    "    size_t * y;\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "vla_zombie.c", feat);
+	CHECK(r.status == PRISM_OK, "vla zombie: transpiles OK");
+	if (r.output) {
+		// size_t * y must be multiplication, not a pointer declaration
+		CHECK(strstr(r.output, "= 0") == NULL,
+		      "vla zombie: no spurious zero-init");
+		CHECK(strstr(r.output, "size_t * y") != NULL,
+		      "vla zombie: multiplication preserved");
+	}
+	prism_free(&r);
+}
+
+static void test_pragma_declarator_zeroinit(void) {
+	printf("\n--- Pragma Declarator Zero-Init ---\n");
+
+	// _Pragma between pointer and name: parse_declarator must skip it
+	// (emitting when emit=true) without losing the variable or zero-init.
+	const char *code =
+	    "void f(void) {\n"
+	    "    int * _Pragma(\"GCC unroll 4\") x;\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "pragma_zinit.c", feat);
+	CHECK(r.status == PRISM_OK, "pragma decl zeroinit: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "= 0") != NULL,
+		      "pragma decl zeroinit: zero-init applied");
+		CHECK(strstr(r.output, "_Pragma") != NULL,
+		      "pragma decl zeroinit: _Pragma preserved");
+	}
+	prism_free(&r);
+}
+
+static void test_sizeof_vla_var_not_skipped(void) {
+	printf("\n--- sizeof VLA Variable Not Skipped ---\n");
+
+	// sizeof vla (unparenthesized) where vla is a VLA variable:
+	// sizeof evaluates at runtime, so arr[sizeof vla] is itself a VLA.
+	const char *code =
+	    "void f(int n) {\n"
+	    "    int vla[n];\n"
+	    "    int arr[sizeof vla];\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "sizeof_vla_var.c", feat);
+	CHECK(r.status == PRISM_OK, "sizeof vla var: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "memset(&arr") != NULL,
+		      "sizeof vla var: arr gets memset (is VLA)");
+		CHECK(strstr(r.output, "arr[sizeof vla] = {0}") == NULL,
+		      "sizeof vla var: no brace-init (would fail to compile)");
+	}
+	prism_free(&r);
+}
+
+static void test_c23_attr_cast_comma_boundary(void) {
+	printf("\n--- C23 Attr Cast Comma Boundary ---\n");
+
+	// ([[maybe_unused]] int)0 after comma must be recognized as a cast,
+	// not a grouped declarator, so find_boundary_comma doesn't stop early.
+	const char *code =
+	    "int get(void) { return 42; }\n"
+	    "int fallback(void) { return 0; }\n"
+	    "void f(void) {\n"
+	    "    int x = get() orelse fallback(), ([[maybe_unused]] int)0;\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "attr_cast_comma.c", feat);
+	CHECK(r.status == PRISM_OK, "c23 attr cast comma: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "orelse") == NULL,
+		      "c23 attr cast comma: orelse consumed");
+		CHECK(strstr(r.output, "[[maybe_unused]]") != NULL,
+		      "c23 attr cast comma: attribute preserved");
+	}
+	prism_free(&r);
+}
+
+static void test_subscript_vla_in_brackets(void) {
+	printf("\n--- Subscript VLA In Brackets ---\n");
+
+	// "hello"[x] inside array bounds: the nested [x] contains a runtime
+	// variable, so the outer array is a VLA. array_size_is_vla must
+	// recursively check nested brackets, not blindly skip them.
+	const char *code =
+	    "void f(int x) {\n"
+	    "    int arr[\"hello\"[x]];\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "subscript_vla.c", feat);
+	CHECK(r.status == PRISM_OK, "subscript vla: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "memset") != NULL,
+		      "subscript vla: gets memset (is VLA)");
+		CHECK(strstr(r.output, "= {0}") == NULL,
+		      "subscript vla: no brace-init");
+	}
+	prism_free(&r);
+}
+
+static void test_typeof_index_not_vla(void) {
+	printf("\n--- typeof Index Not VLA ---\n");
+
+	// typeof(arr[x]) is an expression index, not a type dimension.
+	// The resulting type is a plain int, not a VLA type. With register,
+	// the variable must still get zero-init (= {0} or = 0).
+	const char *code =
+	    "void f(void) {\n"
+	    "    int arr[10];\n"
+	    "    int x = 3;\n"
+	    "    register typeof(arr[x]) temp;\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "typeof_idx.c", feat);
+	CHECK(r.status == PRISM_OK, "typeof index: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "temp =") != NULL ||
+		      strstr(r.output, "temp;") == NULL,
+		      "typeof index: temp gets zero-init");
+	}
+	prism_free(&r);
+}
+
+static void test_asm_register_zeroinit(void) {
+	printf("\n--- ASM Register Zero-Init ---\n");
+
+	// GNU asm register pinning: parse_declarator must skip asm("reg")
+	// so that is_var_declaration sees '=' or ';', not '__asm__'.
+	const char *code =
+	    "void f(void) {\n"
+	    "    register int core_id __asm__(\"r12\");\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "asm_reg.c", feat);
+	CHECK(r.status == PRISM_OK, "asm reg: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "= 0") != NULL,
+		      "asm reg: zero-init applied");
+	}
+	prism_free(&r);
+}
+
+static void test_sizeof_compound_literal_not_vla(void) {
+	printf("\n--- sizeof Compound Literal Not VLA ---\n");
+
+	// sizeof (int){x} — the (int) is a cast, {x} is the initializer.
+	// The whole compound literal is a compile-time sizeof operand.
+	const char *code =
+	    "int x = 5;\n"
+	    "void f(void) {\n"
+	    "    int arr[sizeof (int){x}];\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "cl_sizeof.c", feat);
+	CHECK(r.status == PRISM_OK, "sizeof compound literal: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "= {0}") != NULL,
+		      "sizeof compound literal: brace-init, not memset");
+		CHECK(strstr(r.output, "memset") == NULL,
+		      "sizeof compound literal: no spurious memset");
+	}
+	prism_free(&r);
+}
+
+static void test_sizeof_unary_paren_not_vla(void) {
+	printf("\n--- sizeof Unary Paren Not VLA ---\n");
+
+	// sizeof +(x) — the unary + is skipped, then the primary (x) must be
+	// skipped as a balanced group, not just the opening '('.
+	const char *code =
+	    "int x;\n"
+	    "void f(void) {\n"
+	    "    int arr[sizeof +(x)];\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "sz_uparen.c", feat);
+	CHECK(r.status == PRISM_OK, "sizeof unary paren: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "= {0}") != NULL,
+		      "sizeof unary paren: brace-init, not memset");
+		CHECK(strstr(r.output, "memset") == NULL,
+		      "sizeof unary paren: no spurious memset");
+	}
+	prism_free(&r);
+}
+
 void run_api_tests(void) {
 	printf("\n=== API TESTS ===\n");
 
@@ -1104,8 +1759,33 @@ void run_api_tests(void) {
 	test_lib_c23_attr_void_function();
 	test_lib_generic_array_not_vla();
 	test_fnptr_return_type_capture();
+	test_nested_fnptr_return_type();
+	test_generic_defer_passthrough();
+	test_raw_c23_attr_interleave();
+	test_c23_auto_orelse();
 	test_line_directive_escaped_quote();
 	test_cross_compile_msvc_ret_type();
+	test_typeof_memset_no_shadow();
+	test_c23_constexpr_thread_local();
+	test_orelse_backtrack_desync();
+	test_orelse_nested_paren_rejected();
+	test_vla_var_not_typedef();
+	test_orelse_typedef_cast_comma();
+	test_atomic_typedef_qualifier();
+	test_pragma_in_declarator();
+	test_chained_sizeof_not_vla();
+	test_pragma_return_type_capture();
+	test_c23_attr_comma_boundary();
+	test_thread_local_goto_exempt();
+	test_asm_register_zeroinit();
+	test_sizeof_unary_paren_not_vla();
+	test_sizeof_compound_literal_not_vla();
+	test_vla_heuristic_zombie();
+	test_pragma_declarator_zeroinit();
+	test_sizeof_vla_var_not_skipped();
+	test_c23_attr_cast_comma_boundary();
+	test_subscript_vla_in_brackets();
+	test_typeof_index_not_vla();
 
 	test_memory_leak_stress();
 }
