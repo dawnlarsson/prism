@@ -1457,6 +1457,23 @@ void test_defer_goto_into_scope(void) {
 	CHECK_LOG("11D", "goto into block with defer");
 }
 
+static void _c23_attr_label_helper(void) {
+	log_reset();
+	{
+		defer log_append("D");
+		log_append("B");
+		goto done;
+		log_append("X"); // unreachable
+	}
+	[[maybe_unused]] done:
+	log_append("E");
+}
+
+void test_defer_goto_c23_attr_label(void) {
+	_c23_attr_label_helper();
+	CHECK_LOG("BDE", "goto to C23 attributed label fires defer");
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
 
@@ -1557,4 +1574,6 @@ void run_defer_tests(void) {
 	test_defer_goto_into_scope();
 
 	test_defer_backward_goto_sibling();
+
+	test_defer_goto_c23_attr_label();
 }

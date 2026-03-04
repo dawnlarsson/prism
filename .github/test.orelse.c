@@ -1189,6 +1189,19 @@ static void test_orelse_comma_decl_fallback(void) {
 	free(path);
 }
 
+static int _bare_comma_get(void) { return 0; }
+static int _bare_comma_fb(void) { return 42; }
+
+void test_orelse_bare_comma_not_swallowed(void) {
+	// Bare orelse with comma operator: y = 2 must execute unconditionally.
+	// The comma separates two independent expressions; orelse must not
+	// consume the part after the comma.
+	int x, y = 0;
+	x = _bare_comma_get() orelse _bare_comma_fb(), y = 2;
+	CHECK_EQ(x, 42, "bare orelse comma: x gets fallback");
+	CHECK_EQ(y, 2, "bare orelse comma: y = 2 always executes");
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -1284,4 +1297,6 @@ void run_orelse_tests(void) {
 	test_orelse_comma_operator_fallback();
 	test_orelse_comma_cast_fallback();
 	test_orelse_comma_decl_fallback();
+
+	test_orelse_bare_comma_not_swallowed();
 }

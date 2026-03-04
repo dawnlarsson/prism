@@ -237,13 +237,14 @@ typedef struct {
 typedef struct {
 	Token *end;	  // First token after declarator
 	Token *var_name;  // The variable name token
-	bool is_pointer;  // Has pointer modifier
-	bool is_array;	  // Is array type
-	bool is_vla;	  // Has variable-length array dimension
-	bool is_func_ptr; // Is function pointer
-	bool has_paren;	  // Has parenthesized declarator
-	bool has_init;	  // Has initializer (=)
-	bool is_const;	  // Has const qualifier on declarator (e.g. * const)
+	bool is_pointer;	// Has pointer modifier
+	bool is_array;		// Is array type
+	bool is_vla;		// Has variable-length array dimension
+	bool is_func_ptr;	// Is function pointer
+	bool has_paren;		// Has parenthesized declarator
+	bool paren_pointer;	// Has pointer (*) inside parenthesized declarator
+	bool has_init;		// Has initializer (=)
+	bool is_const;		// Has const qualifier on declarator (e.g. * const)
 } DeclResult;
 
 #define struct_body_contains_vla(brace) scan_for_vla(brace, "{", "}")
@@ -751,6 +752,10 @@ static bool __attribute__((noinline)) emit_tok_special(Token *tok) {
 	return false;
 }
 
+// Forward declarations for ghost enum detection in emit_tok
+static Token *find_struct_body_brace(Token *tok);
+static void parse_enum_constants(Token *tok, int scope_depth);
+
 // Emit a single token with appropriate spacing
 static void emit_tok(Token *tok) {
 	// Get file info — cache to avoid repeated indexing for consecutive tokens
@@ -796,6 +801,15 @@ static void emit_tok(Token *tok) {
 	if (__builtin_expect(tok->flags & TF_IS_FLOAT, 0) && emit_tok_special(tok)) {
 		last_emitted = tok;
 		return;
+	}
+
+	// Catch "ghost enums" — enum bodies hidden in casts, initializers, or
+	// parameter lists that bypass try_zero_init_decl / handle_sue_body.
+	// Register their constants immediately so array_size_is_vla won't
+	// mistake them for runtime variables.
+	if (__builtin_expect(tok->tag & TT_SUE, 0) && equal(tok, "enum")) {
+		Token *brace = find_struct_body_brace(tok);
+		if (brace) parse_enum_constants(brace, ctx->defer_depth);
 	}
 
 	out_str(tok->loc, tok->len);
@@ -1169,7 +1183,7 @@ static inline void walker_advance(TokenWalker *w) {
 // Filters out: '::', ternary '?:', case/default, bitfields in struct bodies.
 static Token *walker_check_label(TokenWalker *w) {
 	if (!is_identifier_like(w->tok)) return NULL;
-	Token *t = skip_gnu_attributes(w->tok->next);
+	Token *t = skip_all_attributes(w->tok->next);
 	if (!t || !equal(t, ":")) return NULL;
 	if (t->next && equal(t->next, ":")) return NULL;		     // :: scope resolution
 	if (w->prev && equal(w->prev, "?")) return NULL;		     // ternary
@@ -1680,13 +1694,16 @@ static bool array_size_is_vla(Token *open_bracket) {
 			continue;
 		}
 
-		// _Generic(...) — the controlling expression is unevaluated and the result
-		// is a compile-time selection, so skip the entire balanced parens.
+		// _Generic(...) — may select a runtime expression (e.g., _Generic(1, int: x, ...)).
+		// At the token level it's undecidable whether results are constants or variables,
+		// so conservatively assume VLA to prevent fatal = {0} on a variable-length array.
 		if (tok->tag & TT_GENERIC) {
-			tok = tok->next;
-			if (tok && equal(tok, "(")) tok = skip_balanced(tok, '(', ')');
-			continue;
+			return true; // Safe fallback: assume VLA to prevent fatal = {0} compile crash
 		}
+
+		// _Pragma(...) or preprocessor-expanded #pragma — skip over without evaluating
+		if (equal(tok, "_Pragma")) { tok = skip_pragma_operators(tok); continue; }
+		if (tok->kind == TK_PREP_DIR) { tok = tok->next; continue; }
 
 		// sizeof/alignof — skip argument, but check for VLA typedef and VLA inner types
 		if (equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof")) {
@@ -1695,10 +1712,28 @@ static bool array_size_is_vla(Token *open_bracket) {
 			if (tok && equal(tok, "(")) {
 				Token *end = skip_balanced(tok, '(', ')');
 				if (is_sizeof) {
-					// Scan the entire sizeof(...) contents for VLA usage
-					for (Token *inner = tok->next; inner && inner != end; inner = inner->next) {
+					// Scan the entire sizeof(...) contents for VLA usage.
+					// Skip enum bodies — their constants are compile-time and
+					// aren't registered yet during speculative scanning.
+					// Track prev_inner to distinguish array dimensions (int[x])
+					// from expression indexing (ptr[x]) — same guard as typeof.
+					Token *prev_inner = tok;
+					for (Token *inner = tok->next; inner && inner != end; prev_inner = inner, inner = inner->next) {
+						if (equal(inner, "enum")) {
+							Token *brace = find_struct_body_brace(inner);
+							if (brace) {
+								inner = skip_balanced(brace, '{', '}');
+								if (inner == end) break;
+								continue;
+							}
+						}
 						if (is_vla_typedef(inner)) return true;
-						if (equal(inner, "[") && array_size_is_vla(inner)) return true;
+						if (equal(inner, "[") &&
+						    (is_type_keyword(prev_inner) || is_known_typedef(prev_inner) ||
+						     equal(prev_inner, "]") || equal(prev_inner, "*")) &&
+						    array_size_is_vla(inner)) {
+							return true;
+						}
 					}
 				}
 				tok = end; // Used safely for both sizeof and alignof!
@@ -1714,6 +1749,12 @@ static bool array_size_is_vla(Token *open_bracket) {
 				        equal(tok, "+") || equal(tok, "-") ||
 				        equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof")))
 					tok = tok->next;
+				// Skip _Pragma(...) or preprocessor-expanded #pragma between operator and operand
+				while (tok && !equal(tok, "]")) {
+					if (equal(tok, "_Pragma")) { tok = skip_pragma_operators(tok); continue; }
+					if (tok->kind == TK_PREP_DIR) { tok = tok->next; continue; }
+					break;
+				}
 				// Skip primary token (respect balanced parens and compound literals)
 				if (tok && !equal(tok, "]")) {
 					if (equal(tok, "(")) {
@@ -1963,16 +2004,21 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 				// or references to known VLA variables.
 				// Only treat '[' as an array dimension if it follows a type keyword,
 				// typedef, pointer, or another ']' — not an expression like arr[x].
+				// Track paren depth: if depth > 1, we're inside a nested (...)
+				// such as a function pointer parameter list, so ignore VLAs there.
+				int typeof_paren_depth = 1;
 				Token *prev = tok; // '(' itself
 				for (Token *t = tok->next; t && t != end; prev = t, t = t->next) {
-					if (equal(t, "[") &&
+					if (equal(t, "(")) typeof_paren_depth++;
+					else if (equal(t, ")")) typeof_paren_depth--;
+					if (typeof_paren_depth == 1 && equal(t, "[") &&
 					    (is_type_keyword(prev) || is_known_typedef(prev) ||
 					     equal(prev, "]") || equal(prev, "*")) &&
 					    array_size_is_vla(t)) {
 						r.is_vla = true;
 						break;
 					}
-					if (is_identifier_like(t) && (typedef_flags(t) & TDF_VLA)) {
+					if (typeof_paren_depth == 1 && is_identifier_like(t) && (typedef_flags(t) & TDF_VLA)) {
 						r.is_vla = true;
 						break;
 					}
@@ -2138,6 +2184,7 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 		while (equal(tok, "*") || (tok->tag & TT_QUALIFIER) || equal(tok, "(")) {
 			if (equal(tok, "*")) {
 				r.is_pointer = true;
+				r.paren_pointer = true;
 				r.is_const = false; // Reset: const after a new '*' applies to this level
 			} else if (r.is_pointer && (tok->tag & TT_CONST))
 				r.is_const = true;
@@ -2539,7 +2586,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		tok = decl.end;
 
 		// Determine effective VLA status (excluding typeof - handled specially)
-		bool effective_vla = (decl.is_vla && !decl.has_paren) || (type->is_vla && !decl.is_pointer);
+		bool effective_vla = (decl.is_vla && !decl.paren_pointer) || (type->is_vla && !decl.is_pointer);
+		bool is_vla_type = decl.is_vla || type->is_vla; // Track type identity separately for VLA registration
 
 		// For typeof declarations, use memset instead of = 0 or = {0}
 		// Also for atomic aggregates: Clang doesn't support _Atomic aggregate init syntax
@@ -2650,7 +2698,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					Token *orelse_tok = tok;
 					Token *val_start = decl.end->next; // First value token after '='
 
-					register_decl_shadows(decl.var_name, effective_vla);
+					register_decl_shadows(decl.var_name, is_vla_type);
 					tok = orelse_tok->next; // skip 'orelse'
 
 					Token *stop_comma = find_boundary_comma(tok);
@@ -2687,7 +2735,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 				emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile, type->has_const);
 				typeof_var_count = 0; // reset for remaining declarators
 
-				register_decl_shadows(decl.var_name, effective_vla);
+				register_decl_shadows(decl.var_name, is_vla_type);
 
 				tok = tok->next; // skip 'orelse'
 
@@ -2718,7 +2766,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			}
 		}
 
-		register_decl_shadows(decl.var_name, effective_vla);
+		register_decl_shadows(decl.var_name, is_vla_type);
 
 		if (equal(tok, ";")) {
 			emit_tok(tok);
@@ -4141,12 +4189,13 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 						while (tok->kind != TK_EOF) {
 							if (tok->flags & TF_OPEN) fd++;
 							else if (tok->flags & TF_CLOSE) fd--;
-							else if (fd == 0 && equal(tok, ";")) break;
+							else if (fd == 0 && (equal(tok, ";") || equal(tok, ","))) break;
 							emit_tok(tok);
 							tok = tok->next;
 						}
 						out_char(';');
 						if (equal(tok, ";")) tok = tok->next;
+						else if (equal(tok, ",")) tok = tok->next; // swallow comma separator
 						OUT_LIT(" }");
 						end_statement_after_semicolon();
 						continue;

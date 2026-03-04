@@ -951,10 +951,12 @@ static void test_lib_generic_array_not_vla(void) {
 		PrismResult result = prism_transpile_file(path, features);
 		CHECK(result.status == PRISM_OK, "_Generic array: transpiles OK");
 		if (result.output) {
-			CHECK(strstr(result.output, "= {0}") != NULL,
-			      "_Generic array: uses = {0} not memset");
-			CHECK(strstr(result.output, "memset") == NULL,
-			      "_Generic array: no memset (not VLA)");
+			// _Generic in array bounds is conservatively treated as VLA
+			// to prevent fatal = {0} when a branch selects a runtime var.
+			CHECK(strstr(result.output, "memset") != NULL,
+			      "_Generic array: uses memset (conservative VLA)");
+			CHECK(strstr(result.output, "= {0}") == NULL,
+			      "_Generic array: no brace-init (would fail if VLA)");
 		}
 		prism_free(&result);
 		unlink(path);
@@ -1676,6 +1678,47 @@ static void test_typeof_index_not_vla(void) {
 	prism_free(&r);
 }
 
+static void test_pragma_in_array_bounds(void) {
+	printf("\n--- Pragma In Array Bounds ---\n");
+
+	// _Pragma inside array bounds must not be treated as a variable.
+	// Also, _Pragma between sizeof and its operand must not consume the
+	// operand's primary token slot.
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int arr[_Pragma(\"GCC unroll 4\") 10];\n"
+		    "}\n";
+		PrismFeatures feat = prism_defaults();
+		PrismResult r = prism_transpile_source(code, "pragma_arr.c", feat);
+		CHECK(r.status == PRISM_OK, "pragma in bounds: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "= {0}") != NULL,
+			      "pragma in bounds: brace-init (not VLA)");
+			CHECK(strstr(r.output, "memset") == NULL,
+			      "pragma in bounds: no memset");
+		}
+		prism_free(&r);
+	}
+	{
+		const char *code =
+		    "int x;\n"
+		    "void f(void) {\n"
+		    "    int arr2[sizeof _Pragma(\"GCC ivdep\") x];\n"
+		    "}\n";
+		PrismFeatures feat = prism_defaults();
+		PrismResult r = prism_transpile_source(code, "pragma_sizeof.c", feat);
+		CHECK(r.status == PRISM_OK, "pragma sizeof: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "= {0}") != NULL,
+			      "pragma sizeof: brace-init (not VLA)");
+			CHECK(strstr(r.output, "memset") == NULL,
+			      "pragma sizeof: no memset");
+		}
+		prism_free(&r);
+	}
+}
+
 static void test_asm_register_zeroinit(void) {
 	printf("\n--- ASM Register Zero-Init ---\n");
 
@@ -1739,6 +1782,176 @@ static void test_sizeof_unary_paren_not_vla(void) {
 	prism_free(&r);
 }
 
+static void test_pointer_to_vla_sizeof_erasure(void) {
+	printf("\n--- Pointer-to-VLA sizeof Erasure ---\n");
+
+	// int (*p)[x] is a pointer to a VLA. sizeof *p evaluates at runtime
+	// to x * sizeof(int), so arr[sizeof *p] is itself a VLA.
+	// Prism must register p as a VLA type so array_size_is_vla sees it.
+	const char *code =
+	    "void f(int x) {\n"
+	    "    int (*p)[x];\n"
+	    "    int arr[sizeof *p];\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "ptr_vla_sizeof.c", feat);
+	CHECK(r.status == PRISM_OK, "ptr-to-VLA sizeof: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "memset(&arr") != NULL,
+		      "ptr-to-VLA sizeof: arr gets memset (is VLA)");
+		CHECK(strstr(r.output, "arr[sizeof *p] = {0}") == NULL,
+		      "ptr-to-VLA sizeof: no brace-init (would fail to compile)");
+	}
+	prism_free(&r);
+}
+
+static void test_generic_vla_black_hole(void) {
+	printf("\n--- _Generic VLA Black Hole ---\n");
+
+	// _Generic(1, int: x, float: 10) may select x (a runtime variable),
+	// making the array a VLA. Prism must not skip _Generic blindly;
+	// it should conservatively assume VLA and use memset.
+	const char *code =
+	    "void f(int x) {\n"
+	    "    int arr[_Generic(1, int: x, float: 10)];\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "generic_vla.c", feat);
+	CHECK(r.status == PRISM_OK, "_Generic VLA: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "memset(&arr") != NULL,
+		      "_Generic VLA: arr gets memset (is VLA)");
+		CHECK(strstr(r.output, "= {0}") == NULL,
+		      "_Generic VLA: no brace-init (would fail to compile)");
+	}
+	prism_free(&r);
+}
+
+static void test_sizeof_expr_index_not_vla(void) {
+	printf("\n--- sizeof Expression Indexing Not VLA ---\n");
+
+	// sizeof(ptr[x]) is always sizeof(int) — compile-time constant.
+	// The [x] is expression indexing (subscript), not an array dimension.
+	// Prism must not treat arr as a VLA.
+	const char *code =
+	    "int *ptr;\n"
+	    "int x = 5;\n"
+	    "void f(void) {\n"
+	    "    int arr[ sizeof(ptr[x]) ];\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "sizeof_expr_idx.c", feat);
+	CHECK(r.status == PRISM_OK, "sizeof expr index: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "= {0}") != NULL,
+		      "sizeof expr index: brace-init (static array)");
+		CHECK(strstr(r.output, "memset") == NULL,
+		      "sizeof expr index: no memset (not VLA)");
+	}
+	prism_free(&r);
+}
+
+static void test_ghost_enum_cast_initializer(void) {
+	printf("\n--- Ghost Enum (Cast Initializer) ---\n");
+
+	// Enum defined in a cast expression initializer: the enum constants
+	// must be registered so the subsequent array dimension is recognized
+	// as a compile-time constant, not a VLA.
+	const char *code =
+	    "void f(void) {\n"
+	    "    int val = (enum { FLAG = 10 })0;\n"
+	    "    int arr[FLAG];\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "ghost_enum_cast.c", feat);
+	CHECK(r.status == PRISM_OK, "ghost enum cast: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "arr[FLAG] = {0}") != NULL ||
+		      strstr(r.output, "arr[10] = {0}") != NULL,
+		      "ghost enum cast: arr uses brace-init (static)");
+		CHECK(strstr(r.output, "memset(&arr") == NULL,
+		      "ghost enum cast: no memset (not VLA)");
+	}
+	prism_free(&r);
+}
+
+static void test_ghost_enum_fnptr_param(void) {
+	printf("\n--- Ghost Enum (Function Pointer Param) ---\n");
+
+	// Enum defined inside a function pointer parameter list.
+	const char *code =
+	    "void g(void) {\n"
+	    "    void (*fp)(enum { MAGIC = 42 } e);\n"
+	    "    int arr[MAGIC];\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "ghost_enum_fnptr.c", feat);
+	CHECK(r.status == PRISM_OK, "ghost enum fnptr: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "arr[MAGIC] = {0}") != NULL ||
+		      strstr(r.output, "arr[42] = {0}") != NULL,
+		      "ghost enum fnptr: arr uses brace-init (static)");
+		CHECK(strstr(r.output, "memset(&arr") == NULL,
+		      "ghost enum fnptr: no memset (not VLA)");
+	}
+	prism_free(&r);
+}
+
+static void test_bare_orelse_comma_boundary(void) {
+	printf("\n--- Bare Orelse Comma Boundary ---\n");
+
+	// Bare orelse must break on comma at depth 0.
+	// y = 2 is after the comma and must not be swallowed into the orelse fallback.
+	const char *code =
+	    "int get(void) { return 0; }\n"
+	    "int fallback(void) { return 42; }\n"
+	    "void f(void) {\n"
+	    "    int x, y = 0;\n"
+	    "    x = get() orelse fallback(), y = 2;\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "bare_comma.c", feat);
+	CHECK(r.status == PRISM_OK, "bare orelse comma: transpiles OK");
+	if (r.output) {
+		// y = 2 must appear OUTSIDE the if block
+		CHECK(strstr(r.output, "y = 2") != NULL,
+		      "bare orelse comma: y = 2 preserved");
+		// The fallback block should end with fallback(); not fallback(), y = 2;
+		CHECK(strstr(r.output, "fallback(), y") == NULL,
+		      "bare orelse comma: comma not swallowed into fallback");
+	}
+	prism_free(&r);
+}
+
+static void test_c23_attr_label_defer(void) {
+	printf("\n--- C23 Attributed Label Defer ---\n");
+
+	// A label with [[maybe_unused]] placed between identifier and colon
+	// (GCC-extension form) must be recognized by the label scanner so
+	// goto fires the correct defer cleanup when exiting a scope.
+	const char *code =
+	    "void f(void) {\n"
+	    "    int x;\n"
+	    "    {\n"
+	    "        defer x = 1;\n"
+	    "        goto done;\n"
+	    "    }\n"
+	    "    done [[maybe_unused]]:\n"
+	    "    (void)x;\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "c23_label.c", feat);
+	CHECK(r.status == PRISM_OK, "c23 attr label: transpiles OK");
+	if (r.output) {
+		// The defer cleanup (x = 1) must appear before the goto
+		char *goto_pos = strstr(r.output, "goto done");
+		char *cleanup = strstr(r.output, "x = 1");
+		CHECK(goto_pos != NULL && cleanup != NULL && cleanup < goto_pos,
+		      "c23 attr label: defer fires before goto");
+	}
+	prism_free(&r);
+}
+
 void run_api_tests(void) {
 	printf("\n=== API TESTS ===\n");
 
@@ -1786,6 +1999,14 @@ void run_api_tests(void) {
 	test_c23_attr_cast_comma_boundary();
 	test_subscript_vla_in_brackets();
 	test_typeof_index_not_vla();
+	test_pragma_in_array_bounds();
+	test_pointer_to_vla_sizeof_erasure();
+	test_generic_vla_black_hole();
+	test_sizeof_expr_index_not_vla();
+	test_ghost_enum_cast_initializer();
+	test_ghost_enum_fnptr_param();
+	test_bare_orelse_comma_boundary();
+	test_c23_attr_label_defer();
 
 	test_memory_leak_stress();
 }

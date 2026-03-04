@@ -1367,6 +1367,40 @@ void test_zeroinit_parenthesized_array(void) {
 	CHECK(all_zero, "parenthesized array int (arr[5]) zero-init");
 }
 
+void test_parenthesized_vla_zeroinit(void) {
+	int x = 5;
+	int (arr)[x];
+	int all_zero = 1;
+	for (int i = 0; i < x; i++)
+		if (arr[i] != 0) all_zero = 0;
+	CHECK(all_zero, "parenthesized VLA int (arr)[x] zero-init");
+}
+
+void test_typeof_fnptr_vla_param_zeroinit(void) {
+#ifdef __GNUC__
+	int x = 5;
+	typeof( void (*)(int[x]) ) fn_ptr;
+	CHECK(fn_ptr == NULL, "typeof fn-ptr with VLA param zero-init");
+#endif
+}
+
+void test_typeof_register_fnptr_vla_param(void) {
+#ifdef __GNUC__
+	int x = 5;
+	register typeof( void (*)(int[x]) ) fn_ptr;
+	(void)sizeof(fn_ptr);
+	CHECK(1, "register typeof fn-ptr with VLA param compiles");
+#endif
+}
+
+void test_sizeof_inline_enum_not_vla(void) {
+	int arr[ sizeof(enum { MY_CONST = 5 }) ];
+	int all_zero = 1;
+	for (unsigned i = 0; i < sizeof(arr)/sizeof(int); i++)
+		if (arr[i] != 0) all_zero = 0;
+	CHECK(all_zero, "sizeof inline enum: not VLA");
+}
+
 
 void test_typeof_register_vla_bug(void) {
 #ifdef __GNUC__
@@ -1499,6 +1533,12 @@ void run_zeroinit_tests(void) {
 
 	test_zeroinit_parenthesized_declarator();
 	test_zeroinit_parenthesized_array();
+
+	test_parenthesized_vla_zeroinit();
+	test_typeof_fnptr_vla_param_zeroinit();
+	test_typeof_register_fnptr_vla_param();
+
+	test_sizeof_inline_enum_not_vla();
 
 	test_typeof_register_vla_bug();
 	test_atomic_register_struct_bug();
