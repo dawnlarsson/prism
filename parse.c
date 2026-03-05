@@ -4,7 +4,9 @@
 #ifdef _WIN32
 #include "windows.c"
 #else
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include <stdnoreturn.h>
 #include <unistd.h>
 #endif
@@ -37,6 +39,7 @@
 #define IS_XDIGIT(c) (IS_DIGIT(c) || ((unsigned)((c) | 0x20) - 'a') < 6u)
 #define ARENA_DEFAULT_BLOCK_SIZE (64 * 1024)
 #define KW_MARKER 0x80000000UL // Internal marker bit for keyword map: values are (tag | KW_MARKER)
+#define KW_FLAGS_SHIFT 32       // Extra token flags encoded in bits 32-39 of keyword value
 
 #if defined(_MSC_VER)
 #define ARENA_ALIGN 8
@@ -143,8 +146,11 @@ enum {
 	TF_AT_BOL = 1 << 0,
 	TF_HAS_SPACE = 1 << 1,
 	TF_IS_FLOAT = 1 << 2,
-	TF_OPEN = 1 << 3,  // Opening delimiter: ( [ {
-	TF_CLOSE = 1 << 4, // Closing delimiter: ) ] }
+	TF_OPEN = 1 << 3,     // Opening delimiter: ( [ {
+	TF_CLOSE = 1 << 4,    // Closing delimiter: ) ] }
+	TF_C23_ATTR = 1 << 5, // First '[' of C23 [[ ... ]] attribute
+	TF_RAW = 1 << 6,      // 'raw' keyword
+	TF_SIZEOF = 1 << 7,   // sizeof, alignof, _Alignof
 };
 
 // Token tags — bitmask set at tokenize time
@@ -158,7 +164,7 @@ enum {
 	TT_ASSIGN = 1 << 5,	  // Assignment or compound assignment operator (=, +=, ++, --, [)
 	TT_MEMBER = 1 << 6,	  // Member access operator (. or ->)
 	TT_LOOP = 1 << 7,	  // Loop keyword (for, while, do)
-	TT_CONTROL = 1 << 8,	  // Control flow keyword (if, else, for, while, do, switch)
+	TT_STORAGE = 1 << 8,	  // Storage class: extern, static, _Thread_local, thread_local
 	TT_ASM = 1 << 9,	  // Inline assembly (asm, __asm__, __asm)
 	TT_INLINE = 1 << 10,	  // inline, __inline, __inline__
 	TT_NORETURN_FN = 1 << 11, // Noreturn function identifier (exit, abort, etc.)
@@ -193,6 +199,7 @@ enum {
 struct Token {
 	char *loc;
 	Token *next;
+	Token *match; // Linked matching delimiter (open↔close)
 	int len;
 	int line_no; // Cached line number (computed once during tokenization)
 	TokenKind kind;
@@ -292,8 +299,7 @@ typedef struct PrismContext {
 	bool current_func_has_setjmp;
 	bool current_func_has_asm;
 	bool current_func_has_vfork;
-	int stmt_expr_count;
-	int orelse_guard_count;
+
 	bool last_system_header;
 	int last_line_no;
 	char *last_filename;
@@ -748,34 +754,37 @@ static inline uintptr_t keyword_lookup(char *key, int keylen) {
 }
 
 static void init_keyword_map(void) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 	static struct {
 		char *name;
 		uint32_t tag;
 		bool is_kw;
+		uint8_t extra_flags;
 	} entries[] = {
 		{"return", TT_SKIP_DECL | TT_RETURN, true},
-	    {"if", TT_SKIP_DECL | TT_CONTROL | TT_IF, true},
-	    {"else", TT_SKIP_DECL | TT_CONTROL | TT_IF, true},
-	    {"for", TT_SKIP_DECL | TT_LOOP | TT_CONTROL, true},
-	    {"while", TT_SKIP_DECL | TT_LOOP | TT_CONTROL, true},
-	    {"do", TT_SKIP_DECL | TT_LOOP | TT_CONTROL, true},
-	    {"switch", TT_SKIP_DECL | TT_CONTROL | TT_SWITCH, true},
+	    {"if", TT_SKIP_DECL | TT_IF, true},
+	    {"else", TT_SKIP_DECL | TT_IF, true},
+	    {"for", TT_SKIP_DECL | TT_LOOP, true},
+	    {"while", TT_SKIP_DECL | TT_LOOP, true},
+	    {"do", TT_SKIP_DECL | TT_LOOP, true},
+	    {"switch", TT_SKIP_DECL | TT_SWITCH, true},
 	    {"case", TT_SKIP_DECL | TT_CASE, true},
 	    {"default", TT_SKIP_DECL | TT_DEFAULT, true},
 	    {"break", TT_SKIP_DECL | TT_BREAK, true},
 	    {"continue", TT_SKIP_DECL | TT_CONTINUE, true},
 	    {"goto", TT_SKIP_DECL | TT_GOTO, true},
-	    {"sizeof", TT_SKIP_DECL, true},
-	    {"alignof", TT_SKIP_DECL, true},
-	    {"_Alignof", TT_SKIP_DECL, true},
+	    {"sizeof", TT_SKIP_DECL, true, TF_SIZEOF},
+	    {"alignof", TT_SKIP_DECL, true, TF_SIZEOF},
+	    {"_Alignof", TT_SKIP_DECL, true, TF_SIZEOF},
 	    {"_Generic", TT_SKIP_DECL | TT_GENERIC, true},
 	    {"_Static_assert", 0, true},
 	    {"struct", TT_TYPE | TT_SUE, true},
 	    {"union", TT_TYPE | TT_SUE, true},
 	    {"enum", TT_TYPE | TT_SUE, true},
 	    {"typedef", TT_SKIP_DECL | TT_TYPEDEF, true},
-	    {"static", TT_QUALIFIER | TT_SKIP_DECL, true},
-	    {"extern", TT_SKIP_DECL, true},
+	    {"static", TT_QUALIFIER | TT_SKIP_DECL | TT_STORAGE, true},
+	    {"extern", TT_SKIP_DECL | TT_STORAGE, true},
 	    {"inline", TT_INLINE, true},
 	    {"const", TT_QUALIFIER | TT_CONST, true},
 	    {"volatile", TT_QUALIFIER | TT_VOLATILE, true},
@@ -784,9 +793,9 @@ static void init_keyword_map(void) {
 	    {"_Noreturn", TT_SKIP_DECL, true},
 	    {"__inline", TT_INLINE, true},
 	    {"__inline__", TT_INLINE, true},
-	    {"_Thread_local", 0, true},
+	    {"_Thread_local", TT_STORAGE, true},
 	    {"constexpr", TT_QUALIFIER | TT_SKIP_DECL, true},
-	    {"thread_local", TT_QUALIFIER | TT_SKIP_DECL, true},
+	    {"thread_local", TT_QUALIFIER | TT_SKIP_DECL | TT_STORAGE, true},
 	    {"void", TT_TYPE, true},
 	    {"char", TT_TYPE, true},
 	    {"short", TT_TYPE, true},
@@ -826,7 +835,7 @@ static void init_keyword_map(void) {
 	    {"__builtin_types_compatible_p", 0, true},
 	    {"defer", TT_DEFER, true},
 	    {"orelse", TT_ORELSE, true},
-	    {"raw", 0, true},
+	    {"raw", 0, true, TF_RAW},
 	    {"exit", TT_NORETURN_FN, false},
 	    {"_Exit", TT_NORETURN_FN, false},
 	    {"_exit", TT_NORETURN_FN, false},
@@ -848,12 +857,14 @@ static void init_keyword_map(void) {
 	    {"savectx", TT_SPECIAL_FN, false},
 	    {"vfork", TT_SPECIAL_FN, false},
 	};
+#pragma GCC diagnostic pop
 
 	memset(keyword_cache, 0, sizeof(keyword_cache));
 	ctx->keyword_bloom = 0;
 	for (size_t i = 0; i < sizeof(entries) / sizeof(*entries); i++) {
 		int len = strlen(entries[i].name);
 		uintptr_t val = entries[i].is_kw ? (entries[i].tag | KW_MARKER) : entries[i].tag;
+		val |= (uintptr_t)entries[i].extra_flags << KW_FLAGS_SHIFT;
 		hashmap_put(&ctx->keyword_map, entries[i].name, len, (void *)val);
 		unsigned bh = (unsigned)len ^ ((unsigned char)entries[i].name[0] * 7) ^
 			      ((unsigned char)entries[i].name[len - 1] * 31);
@@ -998,6 +1009,7 @@ static inline __attribute__((always_inline)) Token *new_token(TokenKind kind, ch
 	tok->len = end - start;
 	tok->next = NULL;
 	tok->tag = 0;
+	tok->match = NULL;
 	{
 		long long ln = (long long)ctx->tok_line_no + ctx->current_file->line_delta;
 		tok->line_no = ln > INT_MAX ? INT_MAX : (ln < INT_MIN ? INT_MIN : (int)ln);
@@ -1387,6 +1399,7 @@ static Token *tokenize(File *file) {
 					t->tag = (uint32_t)(kw & ~KW_MARKER);
 				} else
 					t->tag = (uint32_t)kw;
+				t->flags |= (uint8_t)(kw >> KW_FLAGS_SHIFT);
 			}
 			p += ident_len;
 			continue;
@@ -1422,6 +1435,84 @@ static Token *tokenize(File *file) {
 	}
 
 	cur = cur->next = new_token(TK_EOF, p, p);
+
+	// Link matching delimiters: connect every TF_OPEN to its TF_CLOSE via tok->match.
+	// Also detect C23 [[ ... ]] attributes and tag the first '[' with TF_C23_ATTR.
+	{
+		Token *stack[4096];
+		int sp = 0;
+		for (Token *t = head.next; t && t->kind != TK_EOF; t = t->next) {
+			if (t->flags & TF_OPEN) {
+				if (sp < 4096) stack[sp++] = t;
+			} else if (t->flags & TF_CLOSE) {
+				if (sp > 0) {
+					Token *open = stack[--sp];
+					open->match = t;
+					t->match = open;
+				}
+			}
+		}
+		// Tag C23 attributes: first '[' of [[ ... ]]
+		for (Token *t = head.next; t && t->kind != TK_EOF; t = t->next) {
+			if (t->shortcut == '[' && (t->flags & TF_OPEN) &&
+			    t->next && t->next->shortcut == '[' && (t->next->flags & TF_OPEN))
+				t->flags |= TF_C23_ATTR;
+		}
+
+		// Pre-scan function bodies: tag '{' with TT_SPECIAL_FN / TT_ASM / TT_NORETURN_FN(=vfork).
+		// Also propagate TT_SPECIAL_FN to indirect longjmp wrappers (one level).
+		// Function body heuristic: depth-0 '{' preceded by ')'.
+		{
+			HashMap wrapper_map = {0};
+			Token *func_name = NULL;
+			for (Token *t = head.next; t && t->kind != TK_EOF; t = t->next) {
+				if (t->kind <= TK_KEYWORD && t->next &&
+				    t->next->shortcut == '(' && (t->next->flags & TF_OPEN) &&
+				    !(t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_ATTR)))
+					func_name = t;
+				if (t->shortcut == '{' && (t->flags & TF_OPEN) && t->match) {
+					Token *end = t->match;
+					for (Token *b = t->next; b != end; b = b->next) {
+						if (b->tag & TT_SPECIAL_FN) {
+							if (b->shortcut == 'v' && b->len == 5)
+								t->tag |= TT_NORETURN_FN;
+							else
+								t->tag |= TT_SPECIAL_FN;
+						}
+						if (b->tag & TT_ASM) t->tag |= TT_ASM;
+					}
+					if (func_name && (t->tag & TT_SPECIAL_FN))
+						hashmap_put(&wrapper_map, func_name->loc, func_name->len, (void *)1);
+					func_name = NULL;
+					t = end;
+				}
+			}
+			// Pass 2: propagate to functions that call a wrapper.
+			func_name = NULL;
+			for (Token *t = head.next; t && t->kind != TK_EOF; t = t->next) {
+				if (t->kind <= TK_KEYWORD && t->next &&
+				    t->next->shortcut == '(' && (t->next->flags & TF_OPEN) &&
+				    !(t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_ATTR)))
+					func_name = t;
+				if (t->shortcut == '{' && (t->flags & TF_OPEN) && t->match) {
+					Token *end = t->match;
+					if (!(t->tag & TT_SPECIAL_FN) && wrapper_map.used) {
+						for (Token *b = t->next; b != end; b = b->next)
+							if (b->kind == TK_IDENT && b->next &&
+							    b->next->shortcut == '(' &&
+							    hashmap_get(&wrapper_map, b->loc, b->len)) {
+								t->tag |= TT_SPECIAL_FN;
+								break;
+							}
+					}
+					func_name = NULL;
+					t = end;
+				}
+			}
+			hashmap_clear(&wrapper_map);
+		}
+	}
+
 	return head.next;
 }
 
