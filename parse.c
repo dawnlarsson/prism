@@ -219,7 +219,6 @@ typedef struct {
 	HashEntry *buckets;
 	int capacity;
 	int used;
-	int tombstones;
 } HashMap;
 
 // O(1) keyword lookup by hash slot
@@ -503,9 +502,8 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val) {
 		map->buckets = calloc(64, sizeof(HashEntry));
 		if (!map->buckets) error("out of memory allocating hashmap");
 		map->capacity = 64;
-	} else if ((unsigned long)(map->used + map->tombstones) * 100 / (unsigned long)map->capacity >= 70) {
-		int newcap = (map->tombstones > map->used) ? map->capacity : map->capacity * 2;
-		hashmap_resize(map, newcap);
+	} else if ((unsigned long)map->used * 100 / (unsigned long)map->capacity >= 70) {
+		hashmap_resize(map, map->capacity * 2);
 	}
 
 	uint64_t hash = fast_hash(key, keylen);
@@ -521,35 +519,17 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val) {
 			return;
 		}
 
-		if (first_empty < 0 && (!ent->key || ent->key == TOMBSTONE)) first_empty = idx;
-
+		if (first_empty < 0 && !ent->key) first_empty = idx;
 		if (!ent->key) break;
 	}
 
 	if (first_empty < 0) error("hashmap_put: no empty slot found (internal error)");
 
 	HashEntry *ent = &map->buckets[first_empty];
-	if (ent->key == TOMBSTONE) map->tombstones--;
 	ent->key = key;
 	ent->keylen = keylen;
 	ent->val = val;
 	map->used++;
-}
-
-static void hashmap_delete(HashMap *map, char *key, int keylen) {
-	if (!map->buckets) return;
-	uint64_t hash = fast_hash(key, keylen);
-	int mask = map->capacity - 1;
-	for (int i = 0; i <= mask; i++) {
-		HashEntry *ent = &map->buckets[(hash + i) & mask];
-		if (ENTRY_MATCHES(ent, key, keylen)) {
-			ent->key = TOMBSTONE;
-			map->used--;
-			map->tombstones++;
-			return;
-		}
-		if (!ent->key) return;
-	}
 }
 
 static void hashmap_clear(HashMap *map) {
@@ -557,14 +537,12 @@ static void hashmap_clear(HashMap *map) {
 	map->buckets = NULL;
 	map->capacity = 0;
 	map->used = 0;
-	map->tombstones = 0;
 }
 
 // Reset entries without freeing the bucket array
 static void hashmap_zero(HashMap *map) {
 	if (map->buckets) memset(map->buckets, 0, (size_t)map->capacity * sizeof(HashEntry));
 	map->used = 0;
-	map->tombstones = 0;
 }
 
 static char *intern_filename(const char *name) {

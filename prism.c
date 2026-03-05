@@ -256,7 +256,6 @@ static bool typedef_contains_vla(Token *);
 extern char **environ;
 static char **cached_clean_env = NULL;
 
-static HashMap system_includes;	   // Tracks unique system headers to emit
 static char **system_include_list; // Ordered list of includes
 static int system_include_capacity = 0;
 
@@ -507,16 +506,20 @@ static void collect_system_includes(void) {
 	for (int i = 0; i < ctx->input_file_count; i++) {
 		File *f = ctx->input_files[i];
 		if (!f->is_system || !f->is_include_entry || !f->name) continue;
-		if (!is_reincludable_header(f->name) && hashmap_get(&system_includes, f->name, strlen(f->name))) continue;
-		char *inc = arena_strdup(&ctx->main_arena, f->name);
-		hashmap_put(&system_includes, inc, strlen(inc), (void *)1);
+		if (!is_reincludable_header(f->name)) {
+			bool found = false;
+			for (int j = 0; j < ctx->system_include_count; j++) {
+				if (system_include_list[j] == f->name) { found = true; break; }
+			}
+			if (found) continue;
+		}
 		ARENA_ENSURE_CAP(&ctx->main_arena,
 				 system_include_list,
 				 ctx->system_include_count + 1,
 				 system_include_capacity,
 				 32,
 				 char *);
-		system_include_list[ctx->system_include_count++] = inc;
+		system_include_list[ctx->system_include_count++] = f->name;
 	}
 }
 
@@ -578,8 +581,6 @@ static void emit_system_includes(void) {
 }
 
 static void system_includes_reset(void) {
-	// Keys are arena strings in system_include_list
-	hashmap_zero(&system_includes);
 	system_include_list = NULL;
 	ctx->system_include_count = 0;
 	system_include_capacity = 0;
@@ -899,7 +900,7 @@ static void typedef_pop_scope(int scope_depth) {
 		TypedefEntry *e = &typedef_table.entries[typedef_table.count - 1];
 		if (e->prev_index >= 0) typedef_set_index(e->name, e->len, e->prev_index);
 		else
-			hashmap_delete(&typedef_table.name_map, e->name, e->len);
+			hashmap_put(&typedef_table.name_map, e->name, e->len, NULL);
 		typedef_table.count--;
 	}
 }
@@ -1313,21 +1314,11 @@ static int capture_function_return_type(Token *tok) {
 	if (!tok || tok->kind == TK_EOF) return 0;
 
 	Token *type_start = tok;
-	bool is_void = false;
-
-	if (equal(tok, "void") || is_void_typedef(tok)) {
-		Token *after = skip_noise(tok->next);
-		if (after && !match_ch(after, '*') && !match_ch(after, '(')) is_void = true;
-	} else if (tok->tag & TT_TYPEOF) {
-		Token *t = tok->next;
-		if (t && match_ch(t, '(') && t->next && equal(t->next, "void") && t->next->next && match_ch(t->next->next, ')')) {
-			Token *after = skip_noise(t->next->next->next);
-			if (after && !match_ch(after, '*') && !match_ch(after, '(')) is_void = true;
-		}
-	}
-
+	
 	TypeSpecResult type = parse_type_specifier(tok);
 	if (!type.saw_type) return 0;
+	
+	bool is_void = type.has_void;
 	tok = type.end;
 
 	if (type.is_struct) {
@@ -1703,7 +1694,8 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			r.has_typeof = true;
 			tok = tok->next;
 			if (tok && match_ch(tok, '(')) {
-				Token *end = skip_balanced(tok, '(', ')');
+				Token *end = walk_balanced(tok, false);
+				if (tok->next && equal(tok->next, "void") && tok->next->next == tok->match) r.has_void = true;
 				if (!is_unqual)
 					for (Token *t = tok->next; t && t != end; t = t->next) {
 						if (t->tag & TT_VOLATILE) r.has_volatile = true;
@@ -4594,6 +4586,52 @@ static int passthrough_cc(const Cli *cli) {
 	return st;
 }
 
+static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
+	char **temps = calloc(cli->source_count, sizeof(char *));
+	if (!temps) die("Out of memory");
+
+	for (int i = 0; i < cli->source_count; i++) {
+		if (use_lib_api) {
+			temps[i] = malloc(PATH_MAX);
+			if (!temps[i]) die("Out of memory");
+			snprintf(temps[i], PATH_MAX, "%sprism_install_%d_%d.c", get_tmp_dir(), getpid(), i);
+
+			PrismResult result = prism_transpile_file(cli->sources[i], cli->features);
+			if (result.status != PRISM_OK) {
+				fprintf(stderr, "%s:%d:%d: error: %s\n", cli->sources[i],
+					result.error_line, result.error_col,
+					result.error_msg ? result.error_msg : "transpilation failed");
+				for (int j = 0; j <= i; j++) { remove(temps[j]); free(temps[j]); }
+				free(temps);
+				return NULL;
+			}
+			FILE *f = fopen(temps[i], "w");
+			if (!f) { prism_free(&result); die("Failed to create temp file"); }
+			fwrite(result.output, 1, result.output_len, f);
+			fclose(f);
+			prism_free(&result);
+		} else {
+			temps[i] = malloc(512);
+			if (!temps[i]) die("Out of memory");
+			if (make_temp_file(temps[i], 512, NULL, 0, cli->sources[i]) < 0)
+				die("Failed to create temp file");
+			if (cli->verbose)
+				fprintf(stderr, "[prism] Transpiling %s -> %s\n", cli->sources[i], temps[i]);
+			if (!transpile((char *)cli->sources[i], temps[i])) {
+				for (int j = 0; j <= i; j++) { remove(temps[j]); free(temps[j]); }
+				free(temps);
+				return NULL;
+			}
+		}
+	}
+	return temps;
+}
+
+static void cleanup_temps(char **temps, int count) {
+	for (int i = 0; i < count; i++) { remove(temps[i]); free(temps[i]); }
+	free(temps);
+}
+
 static int install_from_source(Cli *cli) {
 	char temp_bin[PATH_MAX];
 	snprintf(temp_bin, sizeof(temp_bin), "%sprism_install_%d" EXE_SUFFIX, get_tmp_dir(), getpid());
@@ -4603,54 +4641,18 @@ static int install_from_source(Cli *cli) {
 		cc = getenv("CC");
 		if (cc) cc = get_real_cc(cc);
 	}
-
 	if (!cc) cc = PRISM_DEFAULT_CC;
-
 	bool msvc = cc_is_msvc(cc);
 
-	char **temp_files = malloc(cli->source_count * sizeof(char *));
-	if (!temp_files) die("Memory allocation failed");
-
-	for (int i = 0; i < cli->source_count; i++) {
-		temp_files[i] = malloc(PATH_MAX);
-		if (!temp_files[i]) die("Memory allocation failed");
-		snprintf(temp_files[i], PATH_MAX, "%sprism_install_%d_%d.c", get_tmp_dir(), getpid(), i);
-
-		PrismResult result = prism_transpile_file(cli->sources[i], cli->features);
-		if (result.status != PRISM_OK) {
-			fprintf(stderr,
-				"%s:%d:%d: error: %s\n",
-				cli->sources[i],
-				result.error_line,
-				result.error_col,
-				result.error_msg ? result.error_msg : "transpilation failed");
-			for (int j = 0; j <= i; j++) {
-				remove(temp_files[j]);
-				free(temp_files[j]);
-			}
-			free(temp_files);
-			return 1;
-		}
-
-		FILE *f = fopen(temp_files[i], "w");
-		if (!f) {
-			prism_free(&result);
-			die("Failed to create temp file");
-		}
-		fwrite(result.output, 1, result.output_len, f);
-		fclose(f);
-		prism_free(&result);
-	}
+	char **temps = transpile_sources_to_temps(cli, true);
+	if (!temps) return 1;
 
 	ArgvBuilder ab;
 	argv_builder_init(&ab);
 	argv_builder_add(&ab, cc);
 	argv_builder_add(&ab, msvc ? "/O2" : "-O2");
-
-	for (int i = 0; i < cli->source_count; i++) argv_builder_add(&ab, temp_files[i]);
-
+	for (int i = 0; i < cli->source_count; i++) argv_builder_add(&ab, temps[i]);
 	for (int i = 0; i < cli->cc_arg_count; i++) argv_builder_add(&ab, cli->cc_args[i]);
-
 	if (msvc) {
 		static char fe_flag[PATH_MAX + 8];
 		snprintf(fe_flag, sizeof(fe_flag), "/Fe:%s", temp_bin);
@@ -4660,17 +4662,10 @@ static int install_from_source(Cli *cli) {
 		argv_builder_add(&ab, temp_bin);
 	}
 	char **argv_cc = argv_builder_finish(&ab);
-
 	if (cli->verbose) verbose_argv(argv_cc);
 
 	int status = run_command(argv_cc);
-
-	for (int i = 0; i < cli->source_count; i++) {
-		remove(temp_files[i]);
-		free(temp_files[i]);
-	}
-	free(temp_files);
-
+	cleanup_temps(temps, cli->source_count);
 	if (status != 0) return 1;
 
 	int result = install(temp_bin);
@@ -4692,19 +4687,15 @@ static int compile_sources(Cli *cli) {
 		ArgvBuilder ab;
 		argv_builder_init(&ab);
 		argv_builder_add(&ab, compiler);
-
 		argv_builder_add(&ab, "-x");
 		argv_builder_add(&ab, "c");
 		if (FEAT(F_FLATTEN) && !clang) argv_builder_add(&ab, "-fpreprocessed");
 		argv_builder_add(&ab, "-");
-
 		if (cli->cc_arg_count > 0) {
 			argv_builder_add(&ab, "-x");
 			argv_builder_add(&ab, "none");
 		}
-
 		for (int i = 0; i < cli->cc_arg_count; i++) argv_builder_add(&ab, cli->cc_args[i]);
-
 		add_warn_suppress(&ab, clang, false);
 		add_output_flags(&ab, cli, temp_exe, false);
 		char **argv_cc = argv_builder_finish(&ab);
@@ -4712,50 +4703,23 @@ static int compile_sources(Cli *cli) {
 		if (cli->verbose) fprintf(stderr, "[prism] Transpiling %s (pipe → cc)\n", cli->sources[0]);
 		status = transpile_and_compile((char *)cli->sources[0], argv_cc, cli->verbose);
 	} else {
-		char **temps = calloc(cli->source_count, sizeof(char *));
-		if (!temps) die("Out of memory");
-
-		for (int i = 0; i < cli->source_count; i++) {
-			temps[i] = malloc(512);
-			if (!temps[i]) die("Out of memory");
-			if (make_temp_file(temps[i], 512, NULL, 0, cli->sources[i]) < 0)
-				die("Failed to create temp file");
-			if (cli->verbose)
-				fprintf(stderr, "[prism] Transpiling %s -> %s\n", cli->sources[i], temps[i]);
-			if (!transpile((char *)cli->sources[i], temps[i])) {
-				for (int j = 0; j <= i; j++) {
-					remove(temps[j]);
-					free(temps[j]);
-				}
-				free(temps);
-				die("Transpilation failed");
-			}
-		}
+		char **temps = transpile_sources_to_temps(cli, false);
+		if (!temps) die("Transpilation failed");
 
 		ArgvBuilder ab;
 		argv_builder_init(&ab);
 		argv_builder_add(&ab, compiler);
-
 		if (FEAT(F_FLATTEN) && !clang && !msvc) argv_builder_add(&ab, "-fpreprocessed");
-
 		for (int i = 0; i < cli->source_count; i++) argv_builder_add(&ab, temps[i]);
-
 		if (FEAT(F_FLATTEN) && !clang && !msvc) argv_builder_add(&ab, "-fno-preprocessed");
-
 		for (int i = 0; i < cli->cc_arg_count; i++) argv_builder_add(&ab, cli->cc_args[i]);
-
 		add_warn_suppress(&ab, clang, msvc);
 		add_output_flags(&ab, cli, temp_exe, msvc);
 		char **argv_cc = argv_builder_finish(&ab);
 
 		if (cli->verbose) verbose_argv(argv_cc);
 		status = run_command(argv_cc);
-
-		for (int i = 0; i < cli->source_count; i++) {
-			remove(temps[i]);
-			free(temps[i]);
-		}
-		free(temps);
+		cleanup_temps(temps, cli->source_count);
 	}
 
 	if (status != 0) {
