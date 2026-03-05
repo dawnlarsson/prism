@@ -271,8 +271,7 @@ typedef struct PrismContext {
 	int tok_line_no; // Current line number during tokenization
 	HashMap filename_intern_map;
 	HashMap file_view_cache;
-	HashMap keyword_map;
-	uint64_t keyword_bloom; // Bloom filter for keyword_map — fast-rejects non-keyword identifiers
+
 #ifdef PRISM_LIB_MODE
 	jmp_buf error_jmp;
 	bool error_jmp_set;
@@ -290,10 +289,8 @@ typedef struct PrismContext {
 	int extra_define_count;
 	const char **extra_force_includes;
 	int extra_force_include_count;
-	int struct_depth;
-	int defer_depth;
-	int conditional_block_depth;
-	int generic_paren_depth;
+	int scope_depth;
+	int block_depth;
 	bool current_func_returns_void;
 	bool current_func_has_setjmp;
 	bool current_func_has_asm;
@@ -311,7 +308,7 @@ typedef struct PrismContext {
 	Token *func_ret_type_suffix_end;   // For complex declarators: token after suffix (exclusive)
 #ifdef PRISM_LIB_MODE
 	char *active_membuf;	       // open_memstream buffer; freed on longjmp recovery
-	uint32_t keyword_map_features; // features used when keyword_map was built
+	uint32_t keyword_cache_features; // features used when keyword_cache was built
 #endif
 } PrismContext;
 
@@ -724,8 +721,11 @@ static inline bool _equal_2(Token *tok, const char *s) {
 static inline uintptr_t keyword_lookup(char *key, int keylen) {
 	if (keylen < 2) return 0;
 	unsigned slot = KEYWORD_HASH(key, keylen);
-	KeywordEntry *ent = &keyword_cache[slot];
-	if (ent->len == keylen && !memcmp(ent->name, key, keylen)) return ent->value;
+	for (int i = 0; i < 8; i++) {
+		KeywordEntry *ent = &keyword_cache[(slot + i) & 255];
+		if (!ent->name) return 0;
+		if (ent->len == keylen && !memcmp(ent->name, key, keylen)) return ent->value;
+	}
 	return 0;
 }
 
@@ -840,28 +840,16 @@ static void init_keyword_map(void) {
 #pragma GCC diagnostic pop
 
 	memset(keyword_cache, 0, sizeof(keyword_cache));
-	ctx->keyword_bloom = 0;
 	for (size_t i = 0; i < sizeof(entries) / sizeof(*entries); i++) {
 		int len = strlen(entries[i].name);
 		uintptr_t val = entries[i].is_kw ? (entries[i].tag | KW_MARKER) : entries[i].tag;
 		val |= (uintptr_t)entries[i].extra_flags << KW_FLAGS_SHIFT;
-		hashmap_put(&ctx->keyword_map, entries[i].name, len, (void *)val);
-		unsigned bh = (unsigned)len ^ ((unsigned char)entries[i].name[0] * 7) ^
-			      ((unsigned char)entries[i].name[len - 1] * 31);
-		ctx->keyword_bloom |= 1ULL << (bh & 63);
-
 		unsigned slot = KEYWORD_HASH(entries[i].name, len);
-		if (keyword_cache[slot].name) {
-			if (entries[i].is_kw)
-				error("keyword hash collision: '%s' and '%s'",
-				      keyword_cache[slot].name,
-				      entries[i].name);
-			continue;
-		}
-		keyword_cache[slot] = (KeywordEntry){entries[i].name, len, val};
+		while (keyword_cache[slot & 255].name) slot++;
+		keyword_cache[slot & 255] = (KeywordEntry){entries[i].name, len, val};
 	}
 #ifdef PRISM_LIB_MODE
-	ctx->keyword_map_features = ctx->features;
+	ctx->keyword_cache_features = ctx->features;
 #endif
 }
 
@@ -1366,13 +1354,7 @@ static Token *tokenize(File *file) {
 		int ident_len = read_ident(p);
 		if (ident_len) {
 			Token *t = cur = cur->next = new_token(TK_IDENT, p, p + ident_len);
-			uintptr_t kw = keyword_lookup(p, ident_len);
-			if (!kw) {
-				unsigned bh = (unsigned)ident_len ^ ((unsigned char)p[0] * 7) ^
-					      ((unsigned char)p[ident_len - 1] * 31);
-				if (ctx->keyword_bloom & (1ULL << (bh & 63)))
-					kw = (uintptr_t)hashmap_get(&ctx->keyword_map, p, ident_len);
-			}
+				uintptr_t kw = keyword_lookup(p, ident_len);
 			if (kw) {
 				if (kw & KW_MARKER) {
 					t->kind = TK_KEYWORD;
@@ -1492,13 +1474,10 @@ static Token *tokenize(File *file) {
 	return head.next;
 }
 
-static void ensure_keyword_map(void) {
-	if (!ctx->keyword_map.capacity) init_keyword_map();
+static void ensure_keyword_cache(void) {
+	if (!keyword_cache[0].name && !keyword_cache[1].name) init_keyword_map();
 #ifdef PRISM_LIB_MODE
-	else if (ctx->keyword_map_features != ctx->features) {
-		hashmap_clear(&ctx->keyword_map);
-		init_keyword_map();
-	}
+	else if (ctx->keyword_cache_features != ctx->features) init_keyword_map();
 #endif
 }
 
@@ -1508,13 +1487,13 @@ static Token *tokenize_buffer(char *name, char *buf) {
 	File *file = new_file(name, ctx->input_file_count, buf);
 	add_input_file(file);
     
-	ensure_keyword_map();
+	ensure_keyword_cache();
 
 	return tokenize(file);
 }
 
 Token *tokenize_file(char *path) {
-	ensure_keyword_map();
+	ensure_keyword_cache();
 
 	FILE *fp = fopen(path, "r");
 	if (!fp) return NULL;
@@ -1558,7 +1537,7 @@ void tokenizer_teardown(bool full) {
 		arena_free(&ctx->main_arena);
 		hashmap_clear(&ctx->file_view_cache);
 		hashmap_clear(&ctx->filename_intern_map);
-		hashmap_clear(&ctx->keyword_map);
+		memset(keyword_cache, 0, sizeof(keyword_cache));
 	} else {
 		arena_reset(&ctx->main_arena);
 		free_file_view_cache();
