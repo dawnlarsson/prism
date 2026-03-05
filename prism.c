@@ -4368,7 +4368,8 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
 		goto cleanup;
 	}
 
-	Token *tok = tokenize_buffer((char *)input_file, pp_buf);
+	Token *tok;
+	tok = tokenize_buffer((char *)input_file, pp_buf);
 	if (!tok) {
 		result.status = PRISM_ERR_SYNTAX;
 		result.error_msg = strdup("Failed to tokenize");
@@ -4406,6 +4407,7 @@ PRISM_API PrismResult prism_transpile_source(const char *source, const char *fil
 	apply_features(features);
 	if (!ctx->keyword_map.capacity) init_keyword_map();
 
+	Token *tok;
 	char *buf = strdup(source);
 	if (!buf) {
 		result.status = PRISM_ERR_IO;
@@ -4413,7 +4415,7 @@ PRISM_API PrismResult prism_transpile_source(const char *source, const char *fil
 		goto src_cleanup;
 	}
 
-	Token *tok = tokenize_buffer((char *)fname, buf);
+	tok = tokenize_buffer((char *)fname, buf);
 	if (!tok) {
 		result.status = PRISM_ERR_SYNTAX;
 		result.error_msg = strdup("Failed to tokenize");
