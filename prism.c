@@ -4361,6 +4361,7 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
 	apply_features(features);
 	if (!ctx->keyword_map.capacity) init_keyword_map();
 
+	Token *tok;
 	char *pp_buf = preprocess_with_cc((char *)input_file);
 	if (!pp_buf) {
 		result.status = PRISM_ERR_IO;
@@ -4368,7 +4369,6 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
 		goto cleanup;
 	}
 
-	Token *tok;
 	tok = tokenize_buffer((char *)input_file, pp_buf);
 	if (!tok) {
 		result.status = PRISM_ERR_SYNTAX;
@@ -4408,7 +4408,8 @@ PRISM_API PrismResult prism_transpile_source(const char *source, const char *fil
 	if (!ctx->keyword_map.capacity) init_keyword_map();
 
 	Token *tok;
-	char *buf = strdup(source);
+	char *buf;
+	buf = strdup(source);
 	if (!buf) {
 		result.status = PRISM_ERR_IO;
 		result.error_msg = strdup("Out of memory");
