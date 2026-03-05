@@ -27,7 +27,6 @@
 #define TMPDIR_ENVVAR_ALT NULL
 #define TMPDIR_FALLBACK "/tmp/"
 #define FIND_EXE_CMD "which -a prism 2>/dev/null || command -v prism 2>/dev/null"
-#define stricmp strcasecmp
 #endif
 
 #ifdef PRISM_LIB_MODE
@@ -39,7 +38,7 @@
 #include "parse.c"
 
 #ifdef __APPLE__
-#include <mach-o/dyld.h> // _NSGetExecutablePath
+#include <mach-o/dyld.h>
 #endif
 #if defined(__FreeBSD__) || defined(__DragonFly__)
 #include <sys/types.h>
@@ -137,11 +136,11 @@ typedef struct {
 } DeferEntry;
 
 typedef struct {
-	DeferEntry *entries; // Deferred statements (dynamic)
+	DeferEntry *entries;
 	int count;
 	int capacity;
 	bool is_loop;	       // true if this scope is a for/while/do loop
-	bool is_switch;	       // true if this scope is a switch statement
+	bool is_switch;
 	bool had_control_exit; // true if unconditional break/return/goto/continue was seen
 			       // NOTE: only set on switch scopes (by mark_switch_control_exit)
 	bool
@@ -161,12 +160,12 @@ typedef struct {
 	char *name;
 	int name_len;
 	int scope_depth;
-	Token *tok; // Token pointer for the label
+	Token *tok;
 	Token *block_open; // The '{' that opens the label's immediate scope
 } LabelInfo;
 
 typedef struct {
-	LabelInfo *labels; // Dynamic array
+	LabelInfo *labels;
 	int count;
 	int capacity;
 	HashMap name_map; // For O(1) lookups by name
@@ -192,7 +191,6 @@ typedef struct {
 	int count;
 	int capacity;
 	HashMap name_map; // Maps name -> index+1 of most recent entry (0 means not found)
-	uint64_t bloom;	  // Bloom filter for fast-reject of non-typedef lookups
 } TypedefTable;
 
 typedef enum { CLI_DEFAULT, CLI_RUN, CLI_EMIT, CLI_INSTALL } CliMode;
@@ -210,7 +208,7 @@ typedef struct {
 	bool compile_only;
 } Cli;
 
-// Control flow state — tracks control keyword to body transition
+// Control flow state
 enum { NS_LOOP = 1, NS_SWITCH = 2, NS_CONDITIONAL = 4 };
 
 typedef struct {
@@ -228,9 +226,7 @@ typedef struct {
 	int count, capacity;
 } ArgvBuilder;
 
-// Unified token walker — iterates tokens tracking brace depth, struct bodies,
-// and _Generic skipping. Used by scan_labels_in_function and goto_skips_check
-// to eliminate duplicated structural token-walking logic.
+// Unified token walker used by scan_labels_in_function and goto_skips_check
 typedef struct {
 	Token *tok;
 	Token *prev;
@@ -242,15 +238,15 @@ typedef struct {
 // Declarator parsing result
 typedef struct {
 	Token *end;	  // First token after declarator
-	Token *var_name;  // The variable name token
-	bool is_pointer;	// Has pointer modifier
-	bool is_array;		// Is array type
+	Token *var_name;
+	bool is_pointer;
+	bool is_array;
 	bool is_vla;		// Has variable-length array dimension
-	bool is_func_ptr;	// Is function pointer
-	bool has_paren;		// Has parenthesized declarator
+	bool is_func_ptr;
+	bool has_paren;
 	bool paren_pointer;	// Has pointer (*) inside parenthesized declarator
 	bool paren_array;	// Has array dimension inside parenthesized declarator
-	bool has_init;		// Has initializer (=)
+	bool has_init;
 	bool is_const;		// Has const qualifier on declarator (e.g. * const)
 } DeclResult;
 
@@ -270,7 +266,7 @@ static ControlFlow ctrl = {0};
 static LabelTable label_table;
 
 static int *stmt_expr_levels = NULL; // ctx->defer_depth when stmt expr started (dynamic)
-static int stmt_expr_capacity = 0;   // capacity of stmt_expr_levels array
+static int stmt_expr_capacity = 0;
 static int *orelse_guard_levels = NULL; // defer_depth+1 for pending dangling-else guard braces
 static int orelse_guard_capacity = 0;
 
@@ -300,7 +296,7 @@ static void typedef_pop_scope(int scope_depth);
 static TypeSpecResult parse_type_specifier(Token *tok);
 static Token *emit_expr_to_semicolon(Token *tok);
 static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma);
-static Token *emit_return_body(Token *tok);
+static Token *emit_return_body(Token *tok, Token *stop);
 static Token *try_zero_init_decl(Token *tok);
 static Token *skip_pragma_operators(Token *tok);
 static inline void out_char(char c);
@@ -318,14 +314,12 @@ static inline void emit_token_range(Token *start, Token *end) {
 	}
 }
 
-// Clear captured function return type (all four fields).
 static inline void clear_func_ret_type(void) {
 	ctx->func_ret_type_start = ctx->func_ret_type_end = NULL;
 	ctx->func_ret_type_suffix_start = ctx->func_ret_type_suffix_end = NULL;
 }
 
-// Skip trailing declarator parts (attrs, array dims, param lists) until '{' or ';'.
-// Returns the token at which scanning stopped (the '{', ';', EOF, or first non-suffix token).
+// Skip trailing declarator parts (attrs, array dims, param lists) until '{' or ';'
 static Token *skip_declarator_suffix(Token *tok) {
 	while (tok && tok->kind != TK_EOF && !equal(tok, "{") && !equal(tok, ";")) {
 		if (tok->tag & TT_ATTR)
@@ -415,7 +409,7 @@ static const char *get_tmp_dir(void) {
 	return buf;
 }
 
-#define match_ch _equal_1 // Alias: identical to _equal_1 (single-char token comparison)
+#define match_ch _equal_1
 
 static inline bool is_identifier_like(Token *tok) {
 	return tok->kind <= TK_KEYWORD; // TK_IDENT=0, TK_KEYWORD=1
@@ -453,7 +447,6 @@ static Token *skip_c23_attr(Token *tok) {
 	return skip_balanced(tok, '[', ']');
 }
 
-// Skip all attributes (GNU-style and C23-style [[...]])
 static Token *skip_all_attributes(Token *tok) {
 	while (tok && tok->kind != TK_EOF) {
 		if (tok->tag & TT_ATTR) tok = skip_gnu_attributes(tok);
@@ -477,7 +470,6 @@ static void out_buf_grow(void) {
 
 static void out_flush(void) {
 	if (oe_buf_checkpoint >= 0) {
-		// Speculative mode: grow buffer instead of flushing to preserve rollback ability
 		out_buf_grow();
 		return;
 	}
@@ -485,7 +477,6 @@ static void out_flush(void) {
 		fwrite(out_buf, 1, out_buf_pos, out_fp);
 		out_buf_pos = 0;
 	}
-	// Shrink back to static buffer if it was grown during speculation
 	if (out_buf != out_buf_static) {
 		free(out_buf);
 		out_buf = out_buf_static;
@@ -515,8 +506,7 @@ static void out_init(FILE *fp) {
 	out_fp = fp;
 	out_buf_pos = 0;
 	oe_buf_checkpoint = -1;
-	// Shrink back to static buffer if it was grown (e.g., by speculation
-	// in a previous call that was interrupted by longjmp error recovery).
+	// Shrink back to static buffer if grown during speculation
 	if (out_buf != out_buf_static) {
 		free(out_buf);
 		out_buf = out_buf_static;
@@ -580,7 +570,6 @@ static void collect_system_includes(void) {
 	}
 }
 
-// Emit diagnostic pragmas to suppress warnings from system headers.
 static void emit_system_header_diag_push(void) {
 	OUT_LIT("#pragma GCC diagnostic push\n"
 		"#pragma GCC diagnostic ignored \"-Wredundant-decls\"\n"
@@ -638,11 +627,9 @@ static void emit_system_includes(void) {
 	out_char('\n');
 }
 
-// Reset system include tracking
 static void system_includes_reset(void) {
-	// Keys are the same arena-allocated pointers in system_include_list
+	// Keys are arena strings in system_include_list
 	hashmap_zero(&system_includes);
-	// system_include_list and its strings are arena-allocated; just reset pointers.
 	system_include_list = NULL;
 	ctx->system_include_count = 0;
 	system_include_capacity = 0;
@@ -706,15 +693,13 @@ static void defer_add(Token *defer_keyword, Token *start, Token *end) {
 	scope->had_control_exit = false;
 }
 
-// Find innermost switch scope index, or -1 if not in a switch
 static int find_switch_scope(void) {
 	for (int d = ctx->defer_depth - 1; d >= 0; d--)
 		if (defer_stack[d].is_switch) return d;
 	return -1;
 }
 
-// Mark that control flow exited (break/return/goto) in the innermost switch scope.
-// Only mark if the exit is unconditional (not inside an if/while/for block).
+// Mark unconditional control exit in the innermost switch scope
 static void mark_switch_control_exit(void) {
 	if (ctrl.pending || ctx->conditional_block_depth > 0) return;
 	int sd = find_switch_scope();
@@ -737,8 +722,7 @@ static bool needs_space(Token *prev, Token *tok) {
 	       (a == '/' && b == '*') || (a == '*' && b == '/');
 }
 
-// Check if 'tok' is inside a parenthesized context (e.g., __attribute__((cleanup(defer)))).
-// Prevents 'defer' from being treated as a keyword when used as an identifier in attributes.
+// Check if 'tok' is inside an attribute (prevents 'defer' from being treated as keyword)
 static bool is_inside_attribute(Token *tok) {
 	if (!last_emitted || (!equal(last_emitted, "(") && !equal(last_emitted, ","))) return false;
 	int depth = 0;
@@ -749,7 +733,7 @@ static bool is_inside_attribute(Token *tok) {
 	return false;
 }
 
-// Cold path: emit C23 float suffix normalization (rare, <1% of tokens)
+// Cold path: emit C23 float suffix normalization
 static bool __attribute__((noinline)) emit_tok_special(Token *tok) {
 	if (tok->kind != TK_NUM) return false;
 	const char *replacement;
@@ -766,27 +750,22 @@ static bool __attribute__((noinline)) emit_tok_special(Token *tok) {
 static Token *find_struct_body_brace(Token *tok);
 static void parse_enum_constants(Token *tok, int scope_depth);
 
-// Emit a single token with appropriate spacing
 static void emit_tok(Token *tok) {
-	// Get file info — cache to avoid repeated indexing for consecutive tokens
 	File *f = tok_file(tok);
 
-	// Skip system header include content when not flattening
 	if (__builtin_expect(!FEAT(F_FLATTEN) && f->is_system && f->is_include_entry, 0)) return;
 
-	// Check if we need a #line directive BEFORE emitting the token
 	bool need_line = false;
 	char *tok_fname = NULL;
 	int line_no = 0;
 
 	if (FEAT(F_LINE_DIR)) {
 		line_no = tok->line_no;
-		tok_fname = f->name; // always interned — pointer compare is safe
+		tok_fname = f->name;
 		need_line = (ctx->last_filename != tok_fname) || (f->is_system != ctx->last_system_header) ||
 			    (line_no != ctx->last_line_no && line_no != ctx->last_line_no + 1);
 	}
 
-	// Spacing: BOL gets newline, otherwise check for #line or token-merge space
 	if (tok_at_bol(tok) || need_line) out_char('\n');
 	else if ((tok->flags & TF_HAS_SPACE) || needs_space(last_emitted, tok))
 		out_char(' ');
@@ -826,24 +805,19 @@ static void emit_tok(Token *tok) {
 	last_emitted = tok;
 }
 
-// Emit tokens from start up to (but not including) end
 static void emit_range(Token *start, Token *end) {
 	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = t->next) emit_tok(t);
 }
 
-// Emit a deferred token range with feature processing (zero-init, raw, orelse).
-// Unlike emit_range, this processes tokens through the transpilation pipeline
-// so that Prism features work correctly inside defer blocks.
+// Like emit_range but processes zero-init/raw/orelse inside defer blocks.
 static void emit_deferred_range(Token *start, Token *end) {
 	bool saved_stmt_start = ctx->at_stmt_start;
 	ControlFlow saved_ctrl = ctrl;
 	ctrl = (ControlFlow){0};
 
-	// Determine initial stmt_start based on whether body is braced
 	ctx->at_stmt_start = true;
 
 	for (Token *t = start; t && t != end && t->kind != TK_EOF;) {
-		// Zero-init / raw / orelse at statement start
 		if (ctx->at_stmt_start && FEAT(F_ZEROINIT)) {
 			Token *next = try_zero_init_decl(t);
 			if (next) {
@@ -854,7 +828,6 @@ static void emit_deferred_range(Token *start, Token *end) {
 		}
 		ctx->at_stmt_start = false;
 
-		// Track structural tokens for statement boundaries
 		if (t->tag & TT_STRUCTURAL) {
 			emit_tok(t);
 			t = t->next;
@@ -889,14 +862,12 @@ static void emit_defers_ex(DeferEmitMode mode, int stop_depth) {
 	}
 }
 
-// Check if defers exist in scopes from current depth down to stop_depth (or boundary).
-// mode: DEFER_ALL=any active, DEFER_BREAK=to loop/switch, DEFER_CONTINUE=to loop, DEFER_TO_DEPTH=to depth
 static bool has_defers_for(DeferEmitMode mode, int stop_depth) {
 	for (int d = ctx->defer_depth - 1; d >= 0; d--) {
 		if (mode == DEFER_TO_DEPTH && d < stop_depth) break;
 		if (defer_stack[d].count > 0) return true;
 		if (mode == DEFER_BREAK && (defer_stack[d].is_loop || defer_stack[d].is_switch))
-			return false; // Hit boundary without finding defers
+			return false;
 		if (mode == DEFER_CONTINUE && defer_stack[d].is_loop) return false;
 	}
 	return false;
@@ -915,7 +886,6 @@ static void label_table_add(char *name, int name_len, int scope_depth, Token *to
 	info->scope_depth = scope_depth;
 	info->tok = tok;
 	info->block_open = block_open;
-	// Store scope_depth + 1 so 0 (NULL) means "not found"
 	hashmap_put(&label_table.name_map, name, name_len, (void *)(intptr_t)(scope_depth + 1));
 }
 
@@ -924,21 +894,11 @@ static int label_table_lookup(char *name, int name_len) {
 	return val ? (int)(intptr_t)val - 1 : -1;
 }
 
-// Typedef tracking for zero-init
 static void typedef_table_reset(void) {
-	// entries array is arena-allocated; just reset pointers.
 	typedef_table.entries = NULL;
 	typedef_table.count = 0;
 	typedef_table.capacity = 0;
-	typedef_table.bloom = 0;
 	hashmap_zero(&typedef_table.name_map);
-}
-
-// Helper to get current index for a name from the hash map (-1 if not found)
-// Bloom filter hash: constant-time from length + first/last byte → bit position (0-63)
-static inline uint64_t typedef_bloom_bit(char *name, int len) {
-	unsigned h = (unsigned)len ^ ((unsigned char)name[0] * 7) ^ ((unsigned char)name[len - 1] * 31);
-	return 1ULL << (h & 63);
 }
 
 static int typedef_get_index(char *name, int len) {
@@ -946,22 +906,19 @@ static int typedef_get_index(char *name, int len) {
 	return val ? (int)(intptr_t)val - 1 : -1;
 }
 
-// Helper to update hash map with new index for a name
 static void typedef_set_index(char *name, int len, int index) {
-	// Store index+1 so that 0 (NULL) means "not found"
 	hashmap_put(&typedef_table.name_map, name, len, (void *)(intptr_t)(index + 1));
 }
 
 static void
 typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool is_vla, bool is_void) {
-	// Skip duplicate typedef re-definitions at the same scope (valid C11 §6.7/3).
-	// Prevents table bloat in unity builds with repeated typedef declarations.
+	// Skip duplicate re-definitions at the same scope (valid C11 §6.7/3).
 	if (kind == TDK_TYPEDEF) {
 		int existing = typedef_get_index(name, len);
 		if (existing >= 0) {
 			TypedefEntry *prev = &typedef_table.entries[existing];
 			if (prev->scope_depth == scope_depth && !prev->is_shadow && !prev->is_enum_const)
-				return; // Benign re-definition — already registered
+				return;
 		}
 	}
 
@@ -978,24 +935,20 @@ typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool i
 	e->scope_depth = scope_depth;
 	e->is_vla = (kind == TDK_TYPEDEF || kind == TDK_VLA_VAR) ? is_vla : false;
 	e->is_void = (kind == TDK_TYPEDEF) ? is_void : false;
-	e->is_const = false; // Set by caller when needed (e.g., parse_typedef_declaration)
-	e->is_shadow = (kind == TDK_SHADOW || kind == TDK_ENUM_CONST); // Enum consts also shadow typedefs
+	e->is_const = false;
+	e->is_shadow = (kind == TDK_SHADOW || kind == TDK_ENUM_CONST);
 	e->is_enum_const = (kind == TDK_ENUM_CONST);
 	e->is_vla_var = (kind == TDK_VLA_VAR);
 	e->prev_index = typedef_get_index(name, len);
 	typedef_set_index(name, len, new_index);
 }
 
-// Called when exiting a scope - removes typedefs defined at or above given depth.
-// Uses >= instead of == for resilience: if a deeper scope's entries weren't cleaned up
-// (e.g., missed phantom pop, macro edge case), they get swept up here rather than
-// permanently blocking the stack. In normal operation, entries are monotonically
-// non-decreasing in depth, so >= behaves identically to ==.
+// Removes typedefs at or above given depth. Uses >= for resilience against
+// missed phantom pops; in normal operation, entries are monotonically non-decreasing.
 static void typedef_pop_scope(int scope_depth) {
 	while (typedef_table.count > 0 &&
 	       typedef_table.entries[typedef_table.count - 1].scope_depth >= scope_depth) {
 		TypedefEntry *e = &typedef_table.entries[typedef_table.count - 1];
-		// Restore hash map to point to previous entry (or remove if none)
 		if (e->prev_index >= 0) typedef_set_index(e->name, e->len, e->prev_index);
 		else
 			hashmap_delete(&typedef_table.name_map, e->name, e->len);
@@ -1003,17 +956,12 @@ static void typedef_pop_scope(int scope_depth) {
 	}
 }
 
-// Parse enum body and register constants as shadows for any matching typedefs.
-// Enum constants are visible in the enclosing scope, so they shadow typedefs.
-// Also register all enum constants for VLA array size detection.
-// tok should point to the opening '{' of the enum body.
-// scope_depth is the scope where the enum constants become visible.
+// Register enum constants as typedef shadows. tok points to opening '{'.
 static void parse_enum_constants(Token *tok, int scope_depth) {
 	if (!tok || !equal(tok, "{")) return;
 	tok = tok->next; // Skip '{'
 
 	while (tok && tok->kind != TK_EOF && !equal(tok, "}")) {
-		// Skip GCC/C23 attributes to prevent registering attribute parameters as enum constants
 		if (tok->tag & TT_ATTR) {
 			tok = skip_gnu_attributes(tok);
 			continue;
@@ -1023,15 +971,12 @@ static void parse_enum_constants(Token *tok, int scope_depth) {
 			continue;
 		}
 
-		// Each enum constant is: IDENTIFIER or IDENTIFIER = expr
 		if (is_valid_varname(tok)) {
 			typedef_add_enum_const(tok->loc, tok->len, scope_depth);
 			tok = tok->next;
 
-			// Skip = expr if present
 			if (tok && equal(tok, "=")) {
 				tok = tok->next;
-				// Skip expression until ',' or '}'
 				int depth = 0;
 				while (tok && tok->kind != TK_EOF) {
 					if (tok->flags & TF_OPEN) depth++;
@@ -1045,7 +990,6 @@ static void parse_enum_constants(Token *tok, int scope_depth) {
 				}
 			}
 
-			// Skip comma
 			if (tok && equal(tok, ",")) tok = tok->next;
 		} else {
 			tok = tok->next;
@@ -1053,7 +997,6 @@ static void parse_enum_constants(Token *tok, int scope_depth) {
 	}
 }
 
-// Helper: look up a typedef entry by token, or NULL if not found/not identifier
 static TypedefEntry *typedef_lookup(Token *tok) {
 	if (!is_identifier_like(tok)) return NULL;
 	int idx = typedef_get_index(tok->loc, tok->len);
@@ -1093,9 +1036,7 @@ static Token *find_boundary_comma(Token *tok) {
 			// If not, this is a comma operator, not a declarator separator.
 			Token *n = tok->next;
 			if (!n) continue;
-			// '(' can start a grouped declarator like (*name), but (TYPE)expr is a cast.
-			// Reject '(' when the token inside is a type keyword or known typedef.
-			if (match_ch(n, '(')) {
+		if (match_ch(n, '(')) {
 				Token *inside = n->next;
 				if (inside && !(inside->tag & (TT_TYPE | TT_SUE | TT_TYPEOF | TT_QUALIFIER))
 				    && !is_typedef_like(inside) && !is_c23_attr(inside))
@@ -1103,24 +1044,16 @@ static Token *find_boundary_comma(Token *tok) {
 			} else if (match_ch(n, '*') || (n->tag & TT_QUALIFIER)) {
 				return tok;
 			} else if (equal(n, "_Pragma") || is_c23_attr(n)) {
-				// _Pragma("...") or [[attr]] can appear between declarators;
-				// treat the comma as a declarator boundary.
 				return tok;
 			} else if (is_valid_varname(n) && !(n->tag & (TT_TYPE | TT_SUE | TT_TYPEOF))) {
 				if (n->next && match_ch(n->next, '(')) {
-					// name( — could be a function call (comma operator) or
-					// a function prototype declaration (declarator separator).
-					// Peek inside: if the first token is a type keyword,
-					// it's a prototype, so treat comma as declarator boundary.
 					Token *inside = n->next->next;
 					if (inside &&
 					    (inside->tag & (TT_TYPE | TT_SUE | TT_TYPEOF | TT_QUALIFIER)))
 						return tok;
-					// else: likely a function call — continue searching
 				} else
 					return tok;
 			}
-			// else: comma operator — continue searching
 		}
 		else if (depth == 0 && match_ch(tok, ';')) return NULL;
 	}
@@ -1133,29 +1066,24 @@ static inline bool is_typedef_heuristic(Token *tok) {
 	return tok->loc[0] == '_' && tok->loc[1] == '_' && !(tok->next && equal(tok->next, "("));
 }
 
-// Check if token is a known typedef or looks like a system typedef (e.g., size_t, __rlim_t)
+// Known typedef or system typedef heuristic (e.g., size_t, __rlim_t)
 static bool is_typedef_like(Token *tok) {
 	if (!is_identifier_like(tok)) return false;
 	if (is_known_typedef(tok)) return true;
-	// Before falling back to the _t / __ heuristic, check if a shadow was
-	// registered for this name (variable declared with a heuristic-type name).
+	// Check if a shadow was registered (variable with a heuristic-type name).
 	TypedefEntry *e = typedef_lookup(tok);
 	if (e && (e->is_shadow || e->is_vla_var)) return false;
 	return is_typedef_heuristic(tok);
 }
 
-// Given a struct/union/enum keyword, find its opening brace if it has a body.
-// Handles: "struct {", "struct name {", "struct __attribute__((packed)) name {"
-// Returns the '{' token, or NULL if no body (e.g., "struct name;" or "struct name var;")
+// Find opening brace of a struct/union/enum body, or NULL if no body.
 static Token *find_struct_body_brace(Token *tok) {
 	Token *t = tok->next;
 	while (t && t->kind != TK_EOF) {
-		// Skip _Pragma(...) operator sequences (macro-expanded pragmas)
 		if (equal(t, "_Pragma") && t->next && equal(t->next, "(")) {
 			t = skip_pragma_operators(t);
 			continue;
 		}
-		// Skip preprocessor-expanded _Pragma (becomes #pragma TK_PREP_DIR)
 		if (t->kind == TK_PREP_DIR) {
 			t = t->next;
 			continue;
@@ -1174,10 +1102,9 @@ static Token *find_struct_body_brace(Token *tok) {
 static bool walker_next(TokenWalker *w) {
 	if (!w->tok || w->tok->kind == TK_EOF) return false;
 
-	// Track braces — update depth but still return token to caller
 	if (match_ch(w->tok, '{')) w->depth++;
 	else if (match_ch(w->tok, '}')) {
-		if (w->depth <= w->initial_depth) return false; // End of region
+		if (w->depth <= w->initial_depth) return false;
 		w->depth--;
 	}
 
@@ -1185,12 +1112,11 @@ static bool walker_next(TokenWalker *w) {
 }
 
 static inline void walker_advance(TokenWalker *w) {
-	// Track ternary '?' operators before advancing
 	if (match_ch(w->tok, '?')) w->ternary_depth++;
 
 	w->prev = w->tok;
 	
-	// Skip struct/union/enum bodies entirely in one hop
+	// Skip struct/union/enum bodies
 	if (w->tok->tag & TT_SUE) {
 		Token *brace = find_struct_body_brace(w->tok);
 		if (brace) {
@@ -1209,76 +1135,54 @@ static inline void walker_advance(TokenWalker *w) {
 	w->tok = w->tok->next;
 }
 
-// Check if current token is a goto label (identifier followed by ':').
-// Filters out: '::', ternary '?:', case/default, bitfields in struct bodies.
+// Check if token is a goto label (ident followed by ':'), filtering ternary/case/bitfields.
 static Token *walker_check_label(TokenWalker *w) {
 	if (!is_identifier_like(w->tok)) return NULL;
 	Token *t = skip_all_attributes(w->tok->next);
 	if (!t || !equal(t, ":")) return NULL;
-	if (t->next && equal(t->next, ":")) return NULL;		     // :: scope resolution
-	if (w->prev && equal(w->prev, "?")) return NULL;		     // ternary (simple)
-	if (w->ternary_depth > 0) { w->ternary_depth--; return NULL; }	     // ternary (with cast/parens)
-	if (w->prev && (w->prev->tag & (TT_CASE | TT_DEFAULT))) return NULL; // switch case
+	if (t->next && equal(t->next, ":")) return NULL;
+	if (w->prev && equal(w->prev, "?")) return NULL;
+	if (w->ternary_depth > 0) { w->ternary_depth--; return NULL; }
+	if (w->prev && (w->prev->tag & (TT_CASE | TT_DEFAULT))) return NULL;
 	return w->tok;
 }
 
 // ============================================================================
 
-// Register a function as a longjmp wrapper (calls longjmp/siglongjmp/etc.)
 static void register_longjmp_wrapper(char *name, int len) {
 	hashmap_put(&longjmp_wrapper_map, name, len, (void *)1);
 }
 
-// Check if a function is a known longjmp wrapper
 static bool is_longjmp_wrapper(char *name, int len) {
 	return hashmap_get(&longjmp_wrapper_map, name, len) != NULL;
 }
 
-// Pre-scan all top-level function bodies to register direct longjmp wrappers.
-// This makes forward-declared wrappers visible to scan_labels_in_function
-// during the main transpilation pass.  Only registers functions whose bodies
-// directly contain setjmp/longjmp/siglongjmp calls (TT_SPECIAL_FN tokens).
-// scan_labels_in_function then checks the wrapper map to detect one level of
-// indirect calls (A calls wrapper B which calls longjmp).  Deeper transitive
-// chains are intentionally not tracked — they would poison the wrapper map
-// in self-hosted builds where error_tok → longjmp propagates everywhere.
+// Pre-scan top-level function bodies to register direct longjmp wrappers.
+// Only registers functions whose bodies directly contain TT_SPECIAL_FN tokens.
+// Deeper transitive chains are not tracked to avoid poisoning in self-hosted builds.
 static void prescan_longjmp_wrappers(Token *tok) {
 	int depth = 0;
-	Token *func_name = NULL; // Function name (identifier before top-level '(')
+	Token *func_name = NULL;
 	Token *prev = NULL;
 	for (Token *t = tok; t && t->kind != TK_EOF; t = t->next) {
 		if (depth == 0) {
-			// Track function name: identifier before '(' at top-level
 			if (is_identifier_like(t) && t->next && equal(t->next, "(") &&
 			    !(t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_ATTR)))
 				func_name = t;
-			// Detect function definition: ')' or K&R params followed by '{'
 			if (equal(t, "{") && prev && (equal(prev, ")") ||
 			    (func_name && is_identifier_like(prev)))) {
-				// Scan function body for direct longjmp/siglongjmp calls only
-				if (func_name) {
-					bool has_longjmp = false;
-					int bd = 1;
-					for (Token *b = t->next; b && b->kind != TK_EOF; b = b->next) {
-						if (equal(b, "{")) bd++;
-						else if (equal(b, "}")) { if (--bd <= 0) break; }
-						if ((b->tag & TT_SPECIAL_FN) && !equal(b, "vfork")) {
-							has_longjmp = true;
-							break;
-						}
-					}
-					if (has_longjmp)
-						register_longjmp_wrapper(func_name->loc, func_name->len);
-				}
-				// Skip function body
-				depth = 1;
+				// Scan function body for longjmp calls
+				bool has_longjmp = false;
+				int bd = 1;
 				for (Token *b = t->next; b && b->kind != TK_EOF; b = b->next) {
-					if (equal(b, "{")) depth++;
-					else if (equal(b, "}")) {
-						if (--depth <= 0) { t = b; break; }
-					}
+					if (equal(b, "{")) bd++;
+					else if (equal(b, "}")) { if (--bd <= 0) { t = b; break; } }
+					if (func_name && !has_longjmp &&
+					    (b->tag & TT_SPECIAL_FN) && !equal(b, "vfork"))
+						has_longjmp = true;
 				}
-				depth = 0;
+				if (has_longjmp)
+					register_longjmp_wrapper(func_name->loc, func_name->len);
 				func_name = NULL;
 				prev = t;
 				continue;
@@ -1291,17 +1195,8 @@ static void prescan_longjmp_wrappers(Token *tok) {
 	}
 }
 
-// Scan a function body for labels and record their scope depths
-// Also detects setjmp/longjmp/pthread_exit/vfork and inline asm usage
-// tok should point to the opening '{' of the function body
-//
-// Detection includes both direct calls to setjmp/longjmp family functions
-// and indirect calls through known wrapper functions that were previously
-// observed to contain longjmp/siglongjmp/etc.
-//
-// Performance: this is a hot function (~77K tokens scanned per run).
-// Uses a two-phase approach: quick pre-scan for goto/setjmp/vfork/asm,
-// then full label scan only if the function contains goto statements.
+// Scan function body for labels and detect setjmp/longjmp/vfork/asm.
+// Two-phase: quick pre-scan for goto/setjmp/vfork/asm, then full label scan if needed.
 static void scan_labels_in_function(Token *tok) {
 	label_table.count = 0;
 	hashmap_zero(&label_table.name_map);
@@ -1310,8 +1205,7 @@ static void scan_labels_in_function(Token *tok) {
 	ctx->current_func_has_vfork = false;
 	if (!tok || !equal(tok, "{")) return;
 
-	// Track the most recent '{' at each depth so labels know their enclosing block.
-	// Max depth 256 should cover any reasonable function nesting.
+	// Track most recent '{' at each depth for label block_open tracking.
 	#define BLOCK_STACK_MAX 256
 	Token *block_stack[BLOCK_STACK_MAX];
 	block_stack[0] = NULL;
@@ -1320,7 +1214,6 @@ static void scan_labels_in_function(Token *tok) {
 	TokenWalker w;
 	walker_init(&w, tok->next, 1);
 	while (walker_next(&w)) {
-		// Track block-open braces for each depth
 		if (match_ch(w.tok, '{') && w.depth < BLOCK_STACK_MAX)
 			block_stack[w.depth] = w.tok;
 
@@ -1331,7 +1224,6 @@ static void scan_labels_in_function(Token *tok) {
 		}
 		if (tg & TT_ASM) ctx->current_func_has_asm = true;
 
-		// Check for indirect longjmp via known wrapper functions
 		if (!ctx->current_func_has_setjmp &&
 		    is_identifier_like(w.tok) && w.tok->next && equal(w.tok->next, "(") &&
 		    is_longjmp_wrapper(w.tok->loc, w.tok->len)) {
@@ -1349,34 +1241,61 @@ static void scan_labels_in_function(Token *tok) {
 }
 
 // Quick pre-check: is this a variable declaration (not a function decl or stmt expr)?
-// Uses parse_declarator(skip mode) for the heavy lifting, avoiding a separate scan.
 static bool is_var_declaration(Token *type_end) {
 	DeclResult decl = parse_declarator(type_end, false);
 	if (!decl.var_name || !decl.end) return false;
 
 	// Statement expression initializer: type name = ({...})
-	// For single-declarator stmt-expr decls, the main loop handles scope/defer processing.
-	// For multi-declarator decls (e.g. int a = ({...}), b;), we still need to process
-	// subsequent declarators for zero-init, so skip past the stmt-expr and check for ',' or ';'.
+	// For multi-declarator decls, skip past the stmt-expr and check for ','.
 	if (equal(decl.end, "=")) {
 		Token *after_eq = decl.end->next;
 		if (after_eq && equal(after_eq, "(") && after_eq->next && equal(after_eq->next, "{")) {
-			// Skip past the balanced (...) of the statement expression
 			Token *after_stmt_expr = skip_balanced(after_eq, '(', ')');
-			// Skip trailing attributes
 			while (after_stmt_expr && after_stmt_expr->kind != TK_EOF &&
 			       (after_stmt_expr->tag & TT_ATTR))
 				after_stmt_expr = skip_gnu_attributes(after_stmt_expr);
 			return equal(after_stmt_expr, ",");
 		}
-		return true; // Regular initializer (not stmt expr)
+		return true;
 	}
 
 	return equal(decl.end, ",") || equal(decl.end, ";");
 }
 
-// Check if token after 'raw' indicates 'raw' is being used as an identifier, not the keyword
-// Returns true if 'raw' is followed by something that makes it look like a declaration
+static inline bool is_orelse_keyword(Token *tok) {
+	return (tok->tag & TT_ORELSE) && !is_known_typedef(tok) &&
+	       !(last_emitted && (last_emitted->tag & TT_MEMBER));
+}
+
+// Emit type tokens, optionally stripping const and struct/enum bodies.
+static void emit_type_stripped(Token *start, Token *end, bool strip_const) {
+	for (Token *t = start; t != end; t = t->next) {
+		if (strip_const && (t->tag & TT_CONST)) continue;
+		if (equal(t, "{")) { t = skip_balanced(t, '{', '}'); if (t == end) break; }
+		emit_tok(t);
+	}
+}
+
+static inline bool is_file_storage_keyword(Token *tok) {
+	return equal(tok, "extern") || equal(tok, "typedef") ||
+	       equal(tok, "static") || equal(tok, "_Thread_local") || equal(tok, "thread_local");
+}
+
+// Emit expression tokens to ';', stop token, or 'orelse' (if check_orelse).
+static Token *emit_expr_to_stop(Token *tok, Token *stop, bool check_orelse) {
+	int depth = 0;
+	while (tok->kind != TK_EOF) {
+		if (tok->flags & TF_OPEN) depth++;
+		else if (tok->flags & TF_CLOSE) depth--;
+		else if (depth == 0 && (equal(tok, ";") || (stop && tok == stop))) break;
+		if (check_orelse && depth == 0 && is_orelse_keyword(tok)) break;
+		emit_tok(tok);
+		tok = tok->next;
+	}
+	return tok;
+}
+
+// Returns true if 'raw' is followed by a declaration context (type keyword, typedef, *, etc.)
 static bool is_raw_declaration_context(Token *after_raw) {
 	while (is_c23_attr(after_raw)) after_raw = skip_c23_attr(after_raw);
 	after_raw = skip_pragma_operators(after_raw);
@@ -1385,12 +1304,8 @@ static bool is_raw_declaration_context(Token *after_raw) {
 			     equal(after_raw, "*") || (after_raw->tag & (TT_QUALIFIER | TT_SUE)));
 }
 
-
-// Check if a forward goto to a same-depth label requires exiting the current scope
-// (i.e. the label is in a sibling block, not the same block).
-// Returns the number of scope levels the path dips below the starting depth (0 = same scope).
-// This is needed because the depth-based defer model can't distinguish sibling scopes at the
-// same depth — a goto from {defer A; goto L;} to {L:} must still emit A.
+// Forward goto scope exit count: how many levels the path dips below starting depth.
+// Needed because depth-based defer can't distinguish sibling scopes.
 static int forward_goto_scope_exits(Token *after_goto_label, char *label_name, int label_len) {
 	int depth = 0;
 	int min_depth = 0;
@@ -1405,10 +1320,8 @@ static int forward_goto_scope_exits(Token *after_goto_label, char *label_name, i
 		if (is_identifier_like(t) && t->len == label_len &&
 		    !memcmp(t->loc, label_name, label_len)) {
 			Token *n = t->next;
-			// Skip GNU and C23 attributes between label name and ':'
 			n = skip_all_attributes(n);
 			if (n && equal(n, ":") && !(n->next && equal(n->next, ":"))) {
-				// Filter out ternary ?: (prev is '?' or inside ternary with cast/parens)
 				if (prev && equal(prev, "?")) continue;
 				if (ternary_depth > 0) { ternary_depth--; continue; }
 				return -min_depth;
@@ -1419,14 +1332,11 @@ static int forward_goto_scope_exits(Token *after_goto_label, char *label_name, i
 	return 0; // label not found (backward goto or end of function)
 }
 
-// Check if a backward goto (label before goto) requires exiting scopes.
-// Scans from the label token forward to goto_tok, tracking brace depth.
-// Returns the number of scope levels the path dips below the starting depth.
+// Backward goto scope exit count: scans from label to goto_tok tracking brace depth.
 static int backward_goto_scope_exits(Token *goto_tok, char *label_name, int label_len) {
 	for (int i = 0; i < label_table.count; i++) {
 		LabelInfo *info = &label_table.labels[i];
 		if (info->name_len == label_len && !memcmp(info->name, label_name, label_len)) {
-			// Only process backward gotos (label before goto in source)
 			if (info->tok->loc >= goto_tok->loc) return 0;
 			int depth = 0, min_depth = 0;
 			for (Token *t = info->tok; t && t != goto_tok && t->kind != TK_EOF; t = t->next) {
@@ -1441,23 +1351,15 @@ static int backward_goto_scope_exits(Token *goto_tok, char *label_name, int labe
 	return 0;
 }
 
-// Check if a backward goto re-enters a block past declarations that would be
-// zero-init'd. Scans from the label's enclosing block's '{' to the label,
-// looking for variable declarations at the label's depth.
-// Only flags when the goto is OUTSIDE the label's block (re-entry), not when
-// the goto loops backward within the same block.
+// Check if backward goto re-enters a block past zero-init declarations.
 // Returns the first skipped declaration token, or NULL if safe.
 static Token *backward_goto_skips_decl(Token *goto_tok, char *label_name, int label_len) {
 	if (!FEAT(F_ZEROINIT | F_DEFER)) return NULL;
 	for (int i = 0; i < label_table.count; i++) {
 		LabelInfo *info = &label_table.labels[i];
 		if (info->name_len != label_len || memcmp(info->name, label_name, label_len)) continue;
-		// Only backward gotos (label before goto in source)
 		if (info->tok->loc >= goto_tok->loc) return NULL;
-		// Need the block_open token to find declarations.
-		// Labels at depth > 0 with NULL block_open lost tracking because
-		// brace depth exceeded the block_stack limit in scan_labels_in_function.
-		// Conservatively reject the goto to prevent bypassing zero-init.
+		// NULL block_open at depth > 0 means tracking limit exceeded.
 		if (!info->block_open) {
 			if (info->scope_depth > 0)
 				error_tok(goto_tok,
@@ -1468,17 +1370,13 @@ static Token *backward_goto_skips_decl(Token *goto_tok, char *label_name, int la
 			return NULL;
 		}
 
-		// Check if the goto is inside the same block as the label.
-		// If so, it's a simple backward loop within the same scope — safe,
-		// because the declarations were initialized on first entry.
+		// Check if goto is inside the label's block (backward loop = safe).
 		Token *block_close = skip_balanced(info->block_open, '{', '}');
 		if (block_close && goto_tok->loc < block_close->loc &&
 		    goto_tok->loc > info->block_open->loc)
-			return NULL; // goto is inside the same block — no re-entry
+			return NULL;
 
-		// The goto is outside the label's block — it re-enters past declarations.
-		// Scan from block_open->next to info->tok for variable declarations
-		// at depth 0 relative to the block (i.e. the label's immediate scope).
+		// Goto re-enters the block — scan for declarations at depth 0.
 		Token *found_decl = NULL;
 		int depth = 0;
 		bool is_stmt_start = true;
@@ -1487,18 +1385,12 @@ static Token *backward_goto_skips_decl(Token *goto_tok, char *label_name, int la
 			if (match_ch(t, '}')) { depth--; is_stmt_start = true; continue; }
 			if (match_ch(t, ';') || match_ch(t, ':')) { is_stmt_start = true; continue; }
 
-			// Only check declarations at depth 0 (same scope as label)
-			if (depth == 0 && is_stmt_start) {
+					if (depth == 0 && is_stmt_start) {
 				Token *s = t;
-				// Skip 'raw' prefix
 				if (equal(s, "raw") && !is_known_typedef(s)) s = s->next;
-				// Skip _Pragma
 				if (s && equal(s, "_Pragma") && s->next && equal(s->next, "("))
 					s = skip_pragma_operators(s);
-				// Skip static/extern/typedef/thread_local (not skippable by goto)
-				if (s && !equal(s, "extern") && !equal(s, "typedef") &&
-				    !equal(s, "static") && !equal(s, "_Thread_local") &&
-				    !equal(s, "thread_local")) {
+				if (s && !is_file_storage_keyword(s)) {
 					TypeSpecResult type = parse_type_specifier(s);
 					if (type.saw_type && is_var_declaration(type.end)) {
 						found_decl = t;
@@ -1551,8 +1443,7 @@ goto_skips_check(Token *goto_tok, char *label_name, int label_len, bool check_de
 				if (t && !equal(t, ";")) {
 					Token *s = t;
 					if (equal(s, "raw") && !is_known_typedef(s)) s = s->next;
-					if (s && !equal(s, "extern") && !equal(s, "typedef") &&
-					    !equal(s, "static")) {
+					if (s && !is_file_storage_keyword(s)) {
 						TypeSpecResult type = parse_type_specifier(s);
 						if (type.saw_type && is_var_declaration(type.end)) {
 							if (!active_decl || w.depth + 1 <= decl_depth) {
@@ -1614,14 +1505,10 @@ goto_skips_check(Token *goto_tok, char *label_name, int label_len, bool check_de
 				has_raw = true;
 				t = t->next;
 			}
-			// Skip _Pragma(...) sequences that may precede a declaration
 			if (t && t->len == 7 && equal(t, "_Pragma") && t->next && equal(t->next, "("))
 				t = skip_pragma_operators(t);
-			// static/thread_local variables have static/thread storage duration —
-			// always initialized before program/thread startup. Jumping over
-			// them with goto is safe (C11 §6.2.4¶3, C23 §6.2.4¶4).
-			if (!equal(t, "extern") && !equal(t, "typedef") && !equal(t, "static") &&
-			    !equal(t, "_Thread_local") && !equal(t, "thread_local")) {
+			// static/thread_local: always initialized before startup, safe to jump over.
+			if (!is_file_storage_keyword(t)) {
 				TypeSpecResult type = parse_type_specifier(t);
 				if (type.saw_type && is_var_declaration(type.end)) {
 					if (!has_raw && (!active_decl || w.depth <= decl_depth)) {
@@ -1632,7 +1519,6 @@ goto_skips_check(Token *goto_tok, char *label_name, int label_len, bool check_de
 			}
 		}
 
-		// Label detection
 		if (is_identifier_like(w.tok) && w.tok->len == label_len &&
 		    !memcmp(w.tok->loc, label_name, label_len)) {
 			Token *label = walker_check_label(&w);
@@ -1650,14 +1536,11 @@ goto_skips_check(Token *goto_tok, char *label_name, int label_len, bool check_de
 	return r;
 }
 
-// Check if tokens between after_paren and brace form K&R parameter declarations.
-// K&R pattern: type ident [, ident]* ; ... repeated until {
-// Example: int func(a, b) int a; int b; {
+// K&R parameter declarations: type ident [, ident]* ; ... repeated until {
 static bool is_knr_params(Token *after_paren, Token *brace) {
 	Token *t = after_paren;
 	bool saw_any = false;
 	while (t && t != brace && t->kind != TK_EOF) {
-		// Each K&R declaration starts with a type specifier
 		TypeSpecResult type = parse_type_specifier(t);
 		if (!type.saw_type) return false;
 		t = type.end;
@@ -1676,7 +1559,6 @@ static bool is_knr_params(Token *after_paren, Token *brace) {
 	return saw_any && t == brace;
 }
 
-// Skip function specifiers/qualifiers/attributes that can precede a type
 static Token *skip_func_specifiers(Token *tok) {
 	Token *next;
 	while (tok && tok->kind != TK_EOF) {
@@ -1688,8 +1570,7 @@ static Token *skip_func_specifiers(Token *tok) {
 	return tok;
 }
 
-// Check if token starts a void function declaration
-// Handles: void func(, static void func(, __attribute__((...)) void func(, etc.
+// Check if token starts a void function declaration.
 static bool is_void_function_decl(Token *tok) {
 	tok = skip_func_specifiers(tok);
 	if (!tok) return false;
@@ -1706,14 +1587,14 @@ static bool is_void_function_decl(Token *tok) {
 		return false;
 	}
 
-	if (tok && equal(tok, "*")) return false; // void* is a pointer type, not a void function
+	if (tok && equal(tok, "*")) return false;
 
 	tok = skip_func_specifiers(tok);
 
 	// Handle simple case: void foo()
 	if (tok && is_valid_varname(tok) && tok->next && equal(tok->next, "(")) return true;
 
-	// Handle parenthesized case: void (foo)() or void (__attr foo)()
+	// Parenthesized case: void (foo)() or void (__attr foo)()
 	if (tok && equal(tok, "(")) {
 		Token *inner = tok->next;
 		while (inner && inner->kind != TK_EOF && (inner->tag & TT_ATTR)) {
@@ -1728,13 +1609,9 @@ static bool is_void_function_decl(Token *tok) {
 	return false;
 }
 
-// Capture the return type of a non-void function declaration.
-// Sets ctx->func_ret_type_start and ctx->func_ret_type_end so that
-// emit_ret_type() can replay the type tokens instead of __auto_type.
-// Returns true if a valid function declaration was recognized.
+// Capture non-void function return type for defer return variable.
 static bool try_capture_func_return_type(Token *tok) {
 	// Skip storage class specifiers, function specifiers, and attributes.
-	// These are NOT part of the return type for variable declarations.
 	while (tok && tok->kind != TK_EOF) {
 		if ((tok->tag & (TT_SKIP_DECL | TT_INLINE)) || 
 		    equal(tok, "_Noreturn") || equal(tok, "noreturn")) {
@@ -1753,15 +1630,11 @@ static bool try_capture_func_return_type(Token *tok) {
 
 	Token *type_start = tok;
 
-	// void return type — not captured (handled by current_func_returns_void).
-	// BUT: void (*func(...))(args) returns a function pointer, not void.
-	// Only skip if void is followed by a simple name (not * or parens).
+	// void return type — not captured unless it's void* or void(complex_decl).
 	if (equal(tok, "void") || is_void_typedef(tok)) {
 		Token *after_void = tok->next;
-		// void* is a pointer type, void( starts a complex declarator — both non-void returns
 		if (after_void && !equal(after_void, "*") && !equal(after_void, "("))
 			return false;
-		// void* and void( fall through to the type parser below
 	}
 	if (tok->tag & TT_TYPEOF) {
 		Token *t = tok->next;
@@ -1776,14 +1649,10 @@ static bool try_capture_func_return_type(Token *tok) {
 
 	tok = type.end;
 
-	// Reject anonymous struct/union/enum return types.
-	// In C, each anonymous struct definition creates a unique type.
-	// Re-emitting the tokens for _Prism_ret_N would create a second,
-	// incompatible type, causing "incompatible types" errors.
-	// Fall through to __auto_type for these cases.
+	// Reject anonymous struct/union/enum — re-emitting creates a second incompatible type.
 	if (type.is_struct) {
 		for (Token *t = type_start; t && t != tok && t->kind != TK_EOF; t = t->next)
-			if (equal(t, "{")) return false; // Contains struct/union/enum body — anonymous type
+			if (equal(t, "{")) return false;
 	}
 
 	// Skip pointer decorations and qualifiers: *, const, volatile, restrict
@@ -1803,9 +1672,7 @@ static bool try_capture_func_return_type(Token *tok) {
 		return true;
 	}
 
-	// Complex declarator: TYPE (* FUNCNAME(PARAMS))(ARGS) or TYPE (* FUNCNAME(PARAMS))[N]
-	// Also handles deeper nesting: TYPE (*(*FUNCNAME(PARAMS))(ARGS))[N]
-	// The function name is inside a (possibly nested) parenthesized declarator group.
+	// Complex declarator: TYPE (* FUNCNAME(PARAMS))(ARGS) or deeper nesting.
 	if (tok && equal(tok, "(")) {
 		Token *outer_open = tok;
 		Token *inner = tok->next;
@@ -1815,7 +1682,7 @@ static bool try_capture_func_return_type(Token *tok) {
 			equal(inner, "__restrict__") || (inner->tag & TT_ATTR))) {
 			inner = (inner->tag & TT_ATTR) ? skip_gnu_attributes(inner) : inner->next;
 		}
-		// Recurse through nested parenthesized declarator groups
+		// Recurse through nested declarator groups
 		while (inner && equal(inner, "(")) {
 			inner = inner->next;
 			while (inner && inner->kind != TK_EOF &&
@@ -1828,7 +1695,6 @@ static bool try_capture_func_return_type(Token *tok) {
 		if (inner && is_valid_varname(inner) && inner->next && equal(inner->next, "(")) {
 			Token *after_params = skip_balanced(inner->next, '(', ')');
 			if (after_params && equal(after_params, ")")) {
-				// Compute suffix end from the outermost declarator group
 				Token *decl_end = skip_balanced(outer_open, '(', ')');
 				decl_end = skip_declarator_suffix(decl_end);
 				ctx->func_ret_type_start = type_start;
@@ -1843,8 +1709,7 @@ static bool try_capture_func_return_type(Token *tok) {
 	return false;
 }
 
-// Emit the captured return type for defer return variable declaration.
-// Complex declarators (function pointers, array pointers) get a typedef.
+// Emit captured return type. Complex declarators get a typedef.
 // Falls back to __auto_type (GCC/Clang) or void* (MSVC) if capture failed.
 static void emit_ret_type(void) {
 	if (ctx->func_ret_type_start && ctx->func_ret_type_end) {
@@ -1873,44 +1738,35 @@ static void emit_ret_type(void) {
 	}
 }
 
-// Check if an array dimension (from '[' to matching ']') contains a VLA expression.
-// Simple rule: any identifier that isn't a type/enum constant, or appears after
-// member access (./->) is a runtime variable → VLA. sizeof/alignof/offsetof
-// arguments are skipped (always constant) except sizeof(VLA_Typedef).
+// Check if array dimension contains a VLA expression (runtime variable).
+// sizeof/alignof/offsetof args are skipped except sizeof(VLA_Typedef).
 static bool array_size_is_vla(Token *open_bracket) {
 	Token *tok = open_bracket->next;
 
 	while (tok && tok->kind != TK_EOF && !equal(tok, "]")) {
-		if (equal(tok, "[")) // Check, then skip nested brackets
+		if (equal(tok, "["))
 		{
 			if (array_size_is_vla(tok)) return true;
 			tok = skip_balanced(tok, '[', ']');
 			continue;
 		}
 
-		// _Generic(...) — may select a runtime expression (e.g., _Generic(1, int: x, ...)).
-		// At the token level it's undecidable whether results are constants or variables,
-		// so conservatively assume VLA to prevent fatal = {0} on a variable-length array.
+		// _Generic: conservatively assume VLA (runtime vs constant undecidable at token level).
 		if (tok->tag & TT_GENERIC) {
-			return true; // Safe fallback: assume VLA to prevent fatal = {0} compile crash
+			return true;
 		}
 
-		// _Pragma(...) or preprocessor-expanded #pragma — skip over without evaluating
 		if (equal(tok, "_Pragma")) { tok = skip_pragma_operators(tok); continue; }
 		if (tok->kind == TK_PREP_DIR) { tok = tok->next; continue; }
 
-		// sizeof/alignof — skip argument, but check for VLA typedef and VLA inner types
+		// sizeof/alignof: skip argument but check for VLA typedef and inner VLA types.
 		if (equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof")) {
 			bool is_sizeof = equal(tok, "sizeof");
 			tok = tok->next;
 			if (tok && equal(tok, "(")) {
 				Token *end = skip_balanced(tok, '(', ')');
 				if (is_sizeof) {
-					// Scan the entire sizeof(...) contents for VLA usage.
-					// Skip enum bodies — their constants are compile-time and
-					// aren't registered yet during speculative scanning.
-					// Track prev_inner to distinguish array dimensions (int[x])
-					// from expression indexing (ptr[x]) — same guard as typeof.
+					// Scan sizeof(...) for VLA usage; skip enum bodies and track prev for array vs index.
 					Token *prev_inner = tok;
 					for (Token *inner = tok->next; inner && inner != end; prev_inner = inner, inner = inner->next) {
 						if (equal(inner, "enum")) {
@@ -1930,12 +1786,7 @@ static bool array_size_is_vla(Token *open_bracket) {
 						    array_size_is_vla(inner)) {
 							return true;
 						}
-						// Detect function calls returning VLA pointers:
-						// sizeof(*func(n)) or sizeof(func(n)->m) etc.
-						// If a non-type identifier is followed by '(' (a function call),
-						// and the call is dereferenced (preceded by '*', or followed
-						// by '[' or '->'), and the arguments contain non-constant
-						// runtime identifiers, conservatively treat as VLA.
+						// Detect function calls returning VLA pointers (e.g. sizeof(*func(n))).
 						if (is_valid_varname(inner) && !is_type_keyword(inner) &&
 						    !is_known_typedef(inner) && !is_known_enum_const(inner) &&
 						    inner->next && inner != end && equal(inner->next, "(")) {
@@ -1944,7 +1795,6 @@ static bool array_size_is_vla(Token *open_bracket) {
 							    (call_end && call_end != end &&
 							     (equal(call_end, "[") || equal(call_end, "->") || equal(call_end, ".")));
 							if (is_deref) {
-								// Scan call arguments for runtime variables
 								for (Token *a = inner->next->next; a && a != call_end; a = a->next) {
 									if (is_valid_varname(a) && !is_known_enum_const(a) &&
 									    !is_type_keyword(a)) {
@@ -1952,37 +1802,31 @@ static bool array_size_is_vla(Token *open_bracket) {
 									}
 								}
 							}
-							// Advance past the call
 							prev_inner = inner;
 							inner = call_end;
 							if (!inner || inner == end) break;
 						}
 					}
 				}
-				tok = end; // Used safely for both sizeof and alignof!
-				// If it's a compound literal (type){init}, skip the initializer block too
+				tok = end;
 				if (tok && equal(tok, "{"))
 					tok = skip_balanced(tok, '{', '}');
 			} else if (tok && !equal(tok, "]")) {
-				// Unparenthesized sizeof/alignof: e.g. "sizeof x", "sizeof *p"
-				// Skip prefix unary operators (including chained sizeof/alignof)
+				// Unparenthesized sizeof/alignof: skip prefix unary ops
 				while (tok && !equal(tok, "]") &&
 				       (equal(tok, "*") || equal(tok, "&") || equal(tok, "!") ||
 				        equal(tok, "~") || equal(tok, "++") || equal(tok, "--") ||
 				        equal(tok, "+") || equal(tok, "-") ||
 				        equal(tok, "sizeof") || equal(tok, "_Alignof") || equal(tok, "alignof")))
 					tok = tok->next;
-				// Skip _Pragma(...) or preprocessor-expanded #pragma between operator and operand
 				while (tok && !equal(tok, "]")) {
 					if (equal(tok, "_Pragma")) { tok = skip_pragma_operators(tok); continue; }
 					if (tok->kind == TK_PREP_DIR) { tok = tok->next; continue; }
 					break;
 				}
-				// Skip primary token (respect balanced parens and compound literals)
 				if (tok && !equal(tok, "]")) {
 					if (equal(tok, "(")) {
 						tok = skip_balanced(tok, '(', ')');
-						// If it's a compound literal (type){init}, skip the initializer block too
 						if (tok && equal(tok, "{"))
 							tok = skip_balanced(tok, '{', '}');
 					}
@@ -1991,7 +1835,6 @@ static bool array_size_is_vla(Token *open_bracket) {
 						tok = tok->next;
 					}
 				}
-				// Skip postfix: .member, ->member, [subscript]
 				while (tok && !equal(tok, "]")) {
 					if (equal(tok, ".") || equal(tok, "->")) {
 						tok = tok->next;
@@ -2005,13 +1848,10 @@ static bool array_size_is_vla(Token *open_bracket) {
 			continue;
 		}
 
-		// offsetof — GCC treats as VLA in array bounds
 		if (equal(tok, "offsetof") || equal(tok, "__builtin_offsetof")) return true;
 
-		// Member access operators — non-ICE (pointer/struct dereference)
 		if (equal(tok, "->") || equal(tok, ".")) return true;
 
-		// Non-constant identifier → VLA
 		if (is_valid_varname(tok) && !is_known_enum_const(tok) && !is_type_keyword(tok)) return true;
 
 		tok = tok->next;
@@ -2019,7 +1859,6 @@ static bool array_size_is_vla(Token *open_bracket) {
 	return false;
 }
 
-// Scan a delimited region for VLA array dimensions.
 static bool scan_for_vla(Token *tok, const char *open, const char *close) {
 	if (open && (!tok || !equal(tok, open))) return false;
 	if (open) tok = tok->next;
@@ -2086,9 +1925,7 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 		}
 	}
 
-	// Check if the base type is a pointer (directly or through a pointer typedef).
-	// Needed so that const pointer typedefs are flagged for safe const-stripping
-	// in orelse (the arithmetic trick (type)0 + 0 fails for pointer-to-incomplete-type).
+	// Check if base type is a pointer (for safe const-stripping in orelse).
 	bool base_is_ptr = false;
 	bool base_is_array = false;
 	for (Token *bt = type_start; bt && bt != type_spec.end; bt = bt->next) {
@@ -2101,19 +1938,13 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 	while (tok && !equal(tok, ";") && tok->kind != TK_EOF) {
 		DeclResult decl = parse_declarator(tok, false);
 		if (decl.var_name) {
-			// A typedef is void only if the base type is void AND the declarator
-			// is plain (no pointer, array, or function pointer indirection)
+			// A typedef is void only if base is void and declarator is plain
 			bool is_void =
 			    base_is_void && !decl.is_pointer && !decl.is_array && !decl.is_func_ptr;
-			// A typedef is const only if the base type has const AND the declarator
-			// is plain (pointer typedefs are not const — the pointer itself is mutable)
+			// A typedef is const only if base has const and declarator is plain
 			bool is_const =
 			    base_is_const && !decl.is_pointer && !decl.is_array && !decl.is_func_ptr;
-			// A typedef is a pointer type if the declarator has an explicit pointer
-			// or function pointer, or the base type resolves to a pointer through
-			// another typedef.  Arrays are NOT included: they decay to pointers in
-			// expressions but (arr_t)0 is a constraint violation (cast to array type),
-			// so marking them as pointers would break the &*(type)0 const-stripping trick.
+			// Pointer if declarator has ptr/fptr or base is ptr. Not arrays (cast constraint violation).
 			bool is_ptr =
 			    decl.is_pointer || decl.is_func_ptr || base_is_ptr;
 			typedef_add(decl.var_name->loc, decl.var_name->len, scope_depth, is_vla, is_void);
@@ -2129,7 +1960,6 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 		}
 		tok = decl.end ? decl.end : tok->next;
 
-		// Skip to comma or semicolon (past any initializer)
 		while (tok && !equal(tok, ",") && !equal(tok, ";") && tok->kind != TK_EOF) {
 			if (equal(tok, "(")) tok = skip_balanced(tok, '(', ')');
 			else if (equal(tok, "["))
@@ -2151,8 +1981,6 @@ static bool is_type_keyword(Token *tok) {
 	return is_typedef_like(tok);
 }
 
-// Check if token can be used as a variable name in a declarator.
-// Identifiers and prism keywords (raw, defer, orelse) which are only special at declaration start.
 static inline bool is_valid_varname(Token *tok) {
 	return tok->kind == TK_IDENT || equal(tok, "raw") || equal(tok, "defer") || equal(tok, "orelse");
 }
@@ -2171,8 +1999,7 @@ static Token *skip_pragma_operators(Token *tok) {
 	return tok;
 }
 
-// Parse type specifier: qualifiers, type keywords, struct/union/enum, typeof, _Atomic, etc.
-// Returns info about the type and position after it
+// Parse type specifier: qualifiers, type keywords, struct/union/enum, typeof, _Atomic.
 static TypeSpecResult parse_type_specifier(Token *tok) {
 	TypeSpecResult r = { .end = tok };
 
@@ -2180,19 +2007,18 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 	while ((tok->tag & TT_QUALIFIER) || (is_type = is_type_keyword(tok)) || is_c23_attr(tok)
 	       || tok->kind == TK_PREP_DIR
 	       || (equal(tok, "_Pragma") && tok->next && equal(tok->next, "("))) {
-		bool had_type = r.saw_type; // Was a type already seen before this iteration?
+		bool had_type = r.saw_type;
 		uint32_t tag = tok->tag;
 
-		// Track qualifiers via tag bits
 		if (tag & TT_QUALIFIER) {
 			if (tag & TT_VOLATILE) r.has_volatile = true;
 			if (tag & TT_REGISTER) r.has_register = true;
 			if (tag & TT_CONST) r.has_const = true;
 			if (tag & TT_TYPE) {
 				if (equal(tok, "auto"))
-					r.saw_type = true; // C23 type-inferred auto
+					r.saw_type = true;
 				else
-					r.has_atomic = true; // _Atomic qualifier
+					r.has_atomic = true;
 			}
 		}
 
@@ -2203,16 +2029,13 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			continue;
 		}
 
-		// _Pragma(...) can appear between qualifiers/type keywords in macro expansions.
-		// Skip it transparently so it doesn't break type specifier parsing.
-		// Source-level _Pragma("...") tokens:
+		// _Pragma: skip transparently between qualifiers/type keywords.
 		if (equal(tok, "_Pragma") && tok->next && equal(tok->next, "(")) {
 			tok = skip_pragma_operators(tok);
 			r.end = tok;
 			is_type = false;
 			continue;
 		}
-		// Preprocessor-expanded _Pragma becomes #pragma (TK_PREP_DIR):
 		if (tok->kind == TK_PREP_DIR) {
 			tok = tok->next;
 			r.end = tok;
@@ -2220,8 +2043,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			continue;
 		}
 
-		// _Atomic as a bare qualifier (not _Atomic(type)) should not count
-		// as a type specifier — it only qualifies the following type.
+		// Bare _Atomic (not _Atomic(type)) is only a qualifier, not a type specifier.
 		if (is_type && (tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE)
 		    && !(tok->next && equal(tok->next, "(")))
 			is_type = false;
@@ -2315,7 +2137,6 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			continue;
 		}
 
-		// _BitInt(N), _Alignas(N)/alignas(N), __attribute__((...)) — skip token + balanced paren
 		if (tag & (TT_BITINT | TT_ATTR | TT_ALIGNAS)) {
 			if (tag & TT_BITINT) r.saw_type = true;
 			tok = tok->next;
@@ -2324,12 +2145,9 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			continue;
 		}
 
-		// User-defined typedef or system typedef (pthread_mutex_t, etc.)
 		int tflags = typedef_flags(tok);
 		if ((tflags & TDF_TYPEDEF) || is_typedef_like(tok)) {
-			// After a concrete type (int, struct foo, typeof(...), etc.),
-			// a typedef name is a declarator — not part of the type specifier.
-			// E.g., "int T[n];" where T shadows a typedef: type=int, var=T[n].
+			// After a concrete type, a typedef name is a declarator, not part of the type.
 			if (had_type) break;
 			r.is_typedef = true;
 			if (tflags & TDF_VLA) r.is_vla = true;
@@ -2363,8 +2181,7 @@ static inline char close_for(char c) {
 	return c == '(' ? ')' : c == '[' ? ']' : '}';
 }
 
-// Walk a balanced token group. When emit=true, emits all tokens; when false, skips.
-// Works for (), [], {}, and __attribute__((...)). Returns position after closing delimiter.
+// Walk a balanced token group between matching delimiters, optionally emitting.
 static Token *walk_balanced(Token *tok, bool emit) {
 	char open_c = tok_open_ch(tok);
 	char close_c = close_for(open_c);
@@ -2404,18 +2221,14 @@ static inline Token *decl_array_dims(Token *t, bool emit, bool *vla) {
 	return t;
 }
 
-// Unified declarator parser. When emit=true, emits tokens while parsing.
-// When emit=false, only advances without output (replaces old skip_declarator).
+// Unified declarator parser. emit=true emits tokens, emit=false only advances.
 static DeclResult parse_declarator(Token *tok, bool emit) {
 	DeclResult r = { .end = tok };
 
-	// Pointer modifiers and qualifiers (with depth limit for safety)
 	int ptr_depth = 0;
 	while (equal(tok, "*") || (tok->tag & TT_QUALIFIER) || equal(tok, "_Pragma") ||
 	       tok->kind == TK_PREP_DIR) {
-		// Preprocessor-expanded _Pragma becomes #pragma (TK_PREP_DIR) — emit and skip
 		if (tok->kind == TK_PREP_DIR) { decl_emit(tok, emit); tok = tok->next; continue; }
-		// Source-level _Pragma("...") — emit when emitting, skip when scanning
 		if (equal(tok, "_Pragma")) {
 			if (emit) {
 				emit_tok(tok);
@@ -2428,7 +2241,7 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 		}
 		if (equal(tok, "*")) {
 			r.is_pointer = true;
-			r.is_const = false; // Reset: const after a new '*' applies to this pointer level
+			r.is_const = false;
 			if (++ptr_depth > 1024) {
 				warn_tok(tok,
 					 "pointer depth exceeds 1024; zero-initialization skipped for this "
@@ -2446,12 +2259,9 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 		tok = tok->next;
 	}
 
-	// Parenthesized declarator: (*name), (*name)[N], (*(*name)(args))[N]
 	int nested_paren = 0;
 	if (equal(tok, "(")) {
 		Token *peek = tok->next;
-		// Skip __attribute__((...)) before '*' in parenthesized declarators
-		// e.g. int (__attribute__((unused)) *p);
 		while (peek && (peek->tag & TT_ATTR)) {
 			peek = peek->next;
 			if (peek && equal(peek, "(")) peek = skip_balanced(peek, '(', ')');
@@ -2466,12 +2276,11 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 		nested_paren = 1;
 		r.has_paren = true;
 
-		// Handle nesting: (*(*(*name)...
 		while (equal(tok, "*") || (tok->tag & TT_QUALIFIER) || equal(tok, "(")) {
 			if (equal(tok, "*")) {
 				r.is_pointer = true;
 				r.paren_pointer = true;
-				r.is_const = false; // Reset: const after a new '*' applies to this level
+				r.is_const = false;
 			} else if (r.is_pointer && (tok->tag & TT_CONST))
 				r.is_const = true;
 			if (equal(tok, "(")) {
@@ -2502,21 +2311,18 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 	decl_emit(tok, emit);
 	tok = tok->next;
 
-	// Skip __attribute__ and C23 [[...]] attributes after variable name
 	while (tok && tok->kind != TK_EOF) {
 		if (tok->tag & TT_ATTR) tok = decl_attr(tok, emit);
 		else if (is_c23_attr(tok)) tok = decl_balanced(tok, emit);
 		else break;
 	}
 
-	// Array dims inside parens: (*name[N])
 	if (r.has_paren && equal(tok, "[")) {
 		r.is_array = true;
 		r.paren_array = true;
 		tok = decl_array_dims(tok, emit, &r.is_vla);
 	}
 
-	// Close nested parens, handling function args or array dims at each level
 	while (r.has_paren && nested_paren > 0) {
 		while (equal(tok, "(") || equal(tok, "[")) {
 			if (equal(tok, "(")) tok = decl_balanced(tok, emit);
@@ -2535,23 +2341,20 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 		nested_paren--;
 	}
 
-	// Function pointer: (*name)(args)
 	if (equal(tok, "(")) {
 		if (!r.has_paren) {
-			r.end = NULL; // Regular function declaration
+			r.end = NULL;
 			return r;
 		}
 		r.is_func_ptr = true;
 		tok = decl_balanced(tok, emit);
 	}
 
-	// Array dimensions outside parens
 	if (equal(tok, "[")) {
 		r.is_array = true;
 		tok = decl_array_dims(tok, emit, &r.is_vla);
 	}
 
-	// Skip __attribute__, C23 [[...]] attrs, and asm() before initializer or end of declarator
 	while (tok && tok->kind != TK_EOF) {
 		if (tok->tag & TT_ATTR) tok = decl_attr(tok, emit);
 		else if (is_c23_attr(tok)) tok = decl_balanced(tok, emit);
@@ -2568,8 +2371,7 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 	return r;
 }
 
-// Emit first declarator raw (no = 0), then add = 0 to subsequent declarators
-// if they lack an initializer (unless file_storage). Emits trailing ';'.
+// Emit first declarator raw, then zero-init subsequent uninitialised declarators.
 static Token *emit_raw_first_then_zeroinit_rest(Token *tok, bool file_storage) {
 	int depth = 0;
 	while (tok && tok->kind != TK_EOF) {
@@ -2598,46 +2400,23 @@ static Token *emit_raw_first_then_zeroinit_rest(Token *tok, bool file_storage) {
 	return tok;
 }
 
-// Handle 'raw' after storage class: "static raw int x;"
-static Token *handle_storage_raw(Token *storage_tok) {
-	Token *p = storage_tok->next;
-	while (p) {
-		Token *next = skip_all_attributes(p);
-		if (next != p) p = next;
-		else if (equal(p, "_Pragma")) p = skip_pragma_operators(p);
-		else break;
-	}
-	if (!p || !equal(p, "raw") || is_known_typedef(p)) return NULL;
-	bool is_file_storage = equal(storage_tok, "extern") || equal(storage_tok, "static");
-	emit_range(storage_tok, p);
-	return emit_raw_first_then_zeroinit_rest(p->next, is_file_storage);
-}
-
-// Emit zeroing for typeof/atomic/VLA variables (pure C99, no <string.h> needed)
+// Emit memset/byte-loop zeroing for typeof/atomic/VLA variables.
 static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool has_const) {
 	const char *vol = has_volatile ? "volatile " : "";
 	int vol_len = has_volatile ? 9 : 0;
 	for (int i = 0; i < count; i++) {
-		// Use memset() instead of a byte-by-byte loop for better codegen.
-		// The volatile path still needs a byte loop (memset drops volatile semantics).
+		// memset for non-volatile; byte loop for volatile (memset drops volatile).
 		if (has_volatile) {
 			OUT_LIT(" { ");
 			out_str(vol, vol_len);
-			// Use unique names to avoid shadowing user variables
-			// const typeof: cast through (void *) to drop const before volatile char *
-			if (has_const) {
-				OUT_LIT("char *_Prism_p_");
-				out_uint(ctx->ret_counter);
-				OUT_LIT(" = (");
-				out_str(vol, vol_len);
+			OUT_LIT("char *_Prism_p_");
+			out_uint(ctx->ret_counter);
+			OUT_LIT(" = (");
+			out_str(vol, vol_len);
+			if (has_const)
 				OUT_LIT("char *)(void *)&");
-			} else {
-				OUT_LIT("char *_Prism_p_");
-				out_uint(ctx->ret_counter);
-				OUT_LIT(" = (");
-				out_str(vol, vol_len);
+			else
 				OUT_LIT("char *)&");
-			}
 			out_str(vars[i]->loc, vars[i]->len);
 			OUT_LIT("; for (unsigned long _Prism_i_");
 			out_uint(ctx->ret_counter);
@@ -2654,8 +2433,6 @@ static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool
 			OUT_LIT("] = 0; }");
 			ctx->ret_counter++;
 		} else {
-			// const typeof: cast through (void *) to drop const qualifier.
-			// Safe during initialization before first read.
 			if (has_const)
 				OUT_LIT(" memset((void *)&");
 			else
@@ -2669,10 +2446,6 @@ static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool
 }
 
 // Register typedef shadows and VLA variables for function parameters.
-// Walks the parameter list between open_paren and close_paren.
-// In each parameter declaration, the last identifier before ',' or ')' at depth 0
-// is the parameter name. If it shadows a typedef, register it at depth 1 (function body).
-// If any bracket dimension in the parameter type is variable-length, register as VLA var.
 static void register_param_shadows(Token *open_paren, Token *close_paren) {
 	if (!open_paren || !close_paren) return;
 	Token *last_ident = NULL;
@@ -2695,8 +2468,7 @@ static void register_param_shadows(Token *open_paren, Token *close_paren) {
 			if (last_ident) {
 				if (is_known_typedef(last_ident) || is_typedef_heuristic(last_ident))
 					typedef_add_shadow(last_ident->loc, last_ident->len, 1);
-				// Check if the parameter type has any VLA dimension (e.g. int (*p)[n]).
-				// Scan brackets in this parameter's tokens for non-constant expressions.
+				// Check for VLA dimensions in parameter type.
 				Token *end = t->next == close_paren ? close_paren : t;
 				for (Token *s = param_start; s && s != end && s->kind != TK_EOF; s = s->next) {
 					if (equal(s, "[") && array_size_is_vla(s)) {
@@ -2766,6 +2538,34 @@ static void re_emit_type_specifier(Token *type_start, Token *type_end) {
 	}
 }
 
+// Emit break/continue with defer handling. Returns next token.
+static Token *emit_break_continue_defer(Token *tok) {
+	bool is_break = tok->tag & TT_BREAK;
+	mark_switch_control_exit();
+	if (FEAT(F_DEFER) && control_flow_has_defers(is_break))
+		emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
+	out_char(' '); out_str(tok->loc, tok->len); out_char(';');
+	tok = tok->next;
+	if (equal(tok, ";")) tok = tok->next;
+	return tok;
+}
+
+// Emit goto with defer handling. Returns next token.
+static Token *emit_goto_defer(Token *tok) {
+	mark_switch_control_exit();
+	tok = tok->next;
+	if (FEAT(F_DEFER) && is_identifier_like(tok)) {
+		int td = label_table_lookup(tok->loc, tok->len);
+		if (td < 0) td = ctx->defer_depth;
+		if (goto_has_defers(td)) emit_goto_defers(td);
+	}
+	OUT_LIT(" goto ");
+	if (is_identifier_like(tok)) { out_str(tok->loc, tok->len); tok = tok->next; }
+	out_char(';');
+	if (equal(tok, ";")) tok = tok->next;
+	return tok;
+}
+
 // const + fallback orelse: roll back speculative output, re-emit with temp variable.
 // MSVC-compatible: instead of "const T x = val ?: fallback;",
 // emit: "T _Prism_oe_N = (val); if (!_Prism_oe_N) _Prism_oe_N = (fallback); const T x = _Prism_oe_N;"
@@ -2779,29 +2579,19 @@ static Token *handle_const_orelse_fallback(Token *tok,
 					   Token *type_start,
 					   TypeSpecResult *type,
 					   Token *stop_comma) {
-	// Roll back to before type+declarator+initializer emission
-	// Always safe: buffer grows instead of flushing during speculation.
+	// Roll back speculative output.
 	out_buf_pos = oe_buf_checkpoint;
 	last_emitted = NULL;
 
 	unsigned oe_id = ctx->ret_counter++;
 
-	// Emit temp variable: "T _Prism_oe_N = (val);"
-	// The temp must be mutable for chained orelse re-assignment.
-	// For non-pointer types: strip 'const' from the type specifier (it makes the variable const).
-	// For pointer types: keep type-specifier 'const' (it qualifies the pointed-to type, not the pointer).
-	// For function pointers: strip 'const' — it qualifies the return type, not the pointer variable,
-	// and keeping it creates an incompatible function pointer type (e.g. const int(*)(int) vs int(*)(int)).
-	// Declarator-level const (e.g. *const) is stripped from the temp's declarator prefix
-	// so the temp variable remains mutable for chained orelse re-assignment.
-	// For complex declarators (e.g. function pointers), emit both the prefix
-	// (before var_name) and suffix (after var_name, like )(int)) around the temp name.
+	// Emit mutable temp: strip const from type (except pointer types where it qualifies pointee).
+	// Function pointers: strip const (it qualifies return type, not the pointer variable).
+	// Declarator-level const (e.g. *const) also stripped for mutability.
 	bool strip_type_const = !decl->is_pointer || decl->is_func_ptr;
 
-	// Check if any type token is a const typedef (e.g., typedef const int cint).
-	// Explicit const tokens are stripped by the loop below, but const baked into
-	// a typedef token (which has no TT_CONST tag) silently makes the temp immutable.
-	// Fix: use __typeof__((type)0 + 0) to strip const via arithmetic promotion.
+	// Detect const typedefs (const baked into typedef, no TT_CONST tag).
+	// Use __typeof__((type)0 + 0) to strip const via arithmetic promotion.
 	bool has_const_typedef = false;
 	if (strip_type_const) {
 		for (Token *t = type_start; t != type->end; t = t->next)
@@ -2809,10 +2599,7 @@ static Token *handle_const_orelse_fallback(Token *tok,
 	}
 
 	if (has_const_typedef) {
-		// Check if the const typedef resolves to a pointer type.
-		// For pointer-to-incomplete-type, the arithmetic trick ((type)0 + 0)
-		// is a constraint violation. Use __typeof__(&*(type)0) instead:
-		// &* cancels out (C11 6.5.3.2/3) but strips top-level pointer const.
+		// Pointer-to-incomplete: use &* trick instead of arithmetic.
 		bool const_td_is_ptr = false;
 		bool const_td_is_array = false;
 		for (Token *t = type_start; t != type->end; t = t->next) {
@@ -2821,69 +2608,38 @@ static Token *handle_const_orelse_fallback(Token *tok,
 		}
 
 		if (const_td_is_ptr) {
-			// Pointer to possibly incomplete type: &* strips top-level const safely
 			OUT_LIT(" __typeof__(&*(");
-			for (Token *t = type_start; t != type->end; t = t->next) {
-				if (strip_type_const && (t->tag & TT_CONST)) continue;
-				if (equal(t, "{")) { t = skip_balanced(t, '{', '}'); if (t == type->end) break; }
-				emit_tok(t);
-			}
+			emit_type_stripped(type_start, type->end, strip_type_const);
 			OUT_LIT(")0)");
 		} else if (const_td_is_array) {
-			// Array type: (arr_t)0 is a constraint violation (cast to array type).
-			// Use __typeof__(*(0 ? (arr_t*)0 : (arr_t*)0)) to yield the element
-			// type through pointer decay without ever casting a scalar to an array.
 			OUT_LIT(" __typeof__(*(0 ? (");
-			for (Token *t = type_start; t != type->end; t = t->next) {
-				if (strip_type_const && (t->tag & TT_CONST)) continue;
-				if (equal(t, "{")) { t = skip_balanced(t, '{', '}'); if (t == type->end) break; }
-				emit_tok(t);
-			}
+			emit_type_stripped(type_start, type->end, strip_type_const);
 			OUT_LIT("*)0 : (");
-			for (Token *t = type_start; t != type->end; t = t->next) {
-				if (strip_type_const && (t->tag & TT_CONST)) continue;
-				if (equal(t, "{")) { t = skip_balanced(t, '{', '}'); if (t == type->end) break; }
-				emit_tok(t);
-			}
+			emit_type_stripped(type_start, type->end, strip_type_const);
 			OUT_LIT("*)0))");
 		} else {
-			// Scalar type: use arithmetic promotion to strip const from typedef:
-			// __typeof__((cint)0 + 0) produces 'int' instead of 'const int'
 			OUT_LIT(" __typeof__((");
-			for (Token *t = type_start; t != type->end; t = t->next) {
-				if (strip_type_const && (t->tag & TT_CONST)) continue;
-				if (equal(t, "{")) { t = skip_balanced(t, '{', '}'); if (t == type->end) break; }
-				emit_tok(t);
-			}
+			emit_type_stripped(type_start, type->end, strip_type_const);
 			OUT_LIT(")0 + 0)");
 		}
 	} else {
-		for (Token *t = type_start; t != type->end; t = t->next) {
-			if (strip_type_const && (t->tag & TT_CONST)) continue; // skip const for mutable temp
-			if (equal(t, "{")) { t = skip_balanced(t, '{', '}'); if (t == type->end) break; }
-			emit_tok(t);
-		}
+		emit_type_stripped(type_start, type->end, strip_type_const);
 	}
-	// Emit declarator prefix, stripping const qualifiers so the temp is mutable.
+	// Emit declarator prefix, stripping const for mutability.
 	for (Token *t = decl_start; t != decl->var_name; t = t->next) {
-		if (t->tag & TT_CONST) continue; // skip const for mutable temp
+		if (t->tag & TT_CONST) continue;
 		emit_tok(t);
 	}
 	
 	OUT_LIT(" _Prism_oe_");
 	out_uint(oe_id);
-	// Emit declarator suffix (e.g. )(int) for function pointers, [N] for arrays)
 	emit_range(decl->var_name->next, decl->end);
 	OUT_LIT(" = (");
 	emit_range(val_start, orelse_tok);
 	OUT_LIT(");");
 
-	// Emit fallback assignment(s): "if (!_Prism_oe_N) _Prism_oe_N = (fallback);"
-	// Handles chained orelse by looping: each 'orelse' adds another if-assignment.
-	// When the last chain link is control flow (return/break/continue/goto),
-	// emit it as a block instead of an invalid assignment.
+	// Emit fallback: chained orelse adds if-assignments; control flow gets a block.
 	for (;;) {
-		// Check if this link is a control flow action (not a fallback value)
 		if (tok->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) {
 			OUT_LIT(" if (!_Prism_oe_");
 			out_uint(oe_id);
@@ -2891,41 +2647,17 @@ static Token *handle_const_orelse_fallback(Token *tok,
 			if (tok->tag & TT_RETURN) {
 				mark_switch_control_exit();
 				tok = tok->next;
-				tok = emit_return_body(tok);
+				tok = emit_return_body(tok, NULL);
 			} else if (tok->tag & (TT_BREAK | TT_CONTINUE)) {
-				bool is_break = tok->tag & TT_BREAK;
-				mark_switch_control_exit();
-				if (FEAT(F_DEFER) && control_flow_has_defers(is_break))
-					emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
-				out_char(' ');
-				out_str(tok->loc, tok->len);
-				out_char(';');
-				tok = tok->next;
-				if (equal(tok, ";")) tok = tok->next;
+				tok = emit_break_continue_defer(tok);
 			} else if (tok->tag & TT_GOTO) {
-				mark_switch_control_exit();
-				tok = tok->next;
-				if (FEAT(F_DEFER) && is_identifier_like(tok)) {
-					int td = label_table_lookup(tok->loc, tok->len);
-					if (td < 0) td = ctx->defer_depth;
-					if (goto_has_defers(td)) emit_goto_defers(td);
-				}
-				OUT_LIT(" goto ");
-				if (is_identifier_like(tok)) {
-					out_str(tok->loc, tok->len);
-					tok = tok->next;
-				}
-				out_char(';');
-				if (equal(tok, ";")) tok = tok->next;
+				tok = emit_goto_defer(tok);
 			}
 			OUT_LIT(" }");
 			break;
 		}
 
-		// Use ternary instead of if-assignment to preserve compound literal
-		// lifetime. Per C99 §6.5.2.5, a compound literal inside an unbraced
-		// if body has its lifetime scoped to that implicit block, causing
-		// dangling pointers. Ternary keeps the literal in the enclosing block.
+		// Ternary instead of if-assignment to preserve compound literal lifetime.
 		OUT_LIT(" _Prism_oe_");
 		out_uint(oe_id);
 		OUT_LIT(" = _Prism_oe_");
@@ -2942,11 +2674,9 @@ static Token *handle_const_orelse_fallback(Token *tok,
 				fdepth--;
 			else if (fdepth == 0 && (equal(tok, ";") || (stop_comma && tok == stop_comma)))
 				break;
-			// Detect chained orelse at depth 0
-			if (fdepth == 0 && (tok->tag & TT_ORELSE) && !is_known_typedef(tok) &&
-			    !(last_emitted && (last_emitted->tag & TT_MEMBER))) {
+			if (fdepth == 0 && is_orelse_keyword(tok)) {
 				chained = true;
-				tok = tok->next; // skip 'orelse'
+				tok = tok->next;
 				break;
 			}
 			if (equal(tok, "(") && tok->next && equal(tok->next, "{"))
@@ -2969,62 +2699,35 @@ static Token *handle_const_orelse_fallback(Token *tok,
 	return tok;
 }
 
-// Process all declarators in a declaration and emit with zero-init
-// Returns token after declaration, or NULL on failure
+// Process all declarators in a declaration and emit with zero-init.
 static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw, Token *type_start) {
 	Token **typeof_vars = NULL;
 	int typeof_var_count = 0;
 	int typeof_var_cap = 0;
 	ctx->active_typeof_vars = NULL; // Track for longjmp safety
-	int original_oe_checkpoint = oe_buf_checkpoint; // Detect orelse commits
+	int original_oe_checkpoint = oe_buf_checkpoint;
 
 	while (tok && tok->kind != TK_EOF) {
-		Token *decl_start = tok; // Save start of current declarator for rollback
+		Token *decl_start = tok;
 		int buf_pos_before_decl = out_buf_pos;
 		DeclResult decl = parse_declarator(tok, true);
 		if (!decl.end || !decl.var_name) {
-			// Rollback any tokens emitted by parse_declarator before it failed,
-			// so the caller can re-emit the original tokens without duplication.
-			// Always safe: buffer grows instead of flushing during speculation.
+			// Rollback emitted tokens; buffer grows without flushing during speculation.
 			if (buf_pos_before_decl <= out_buf_pos) out_buf_pos = buf_pos_before_decl;
-			// If orelse already committed output (checkpoint moved forward),
-			// returning NULL would cause try_zero_init_decl to "rollback"
-			// to the post-orelse checkpoint and the main loop would
-			// re-process the same tokens, hitting the consumed orelse.
-			// Instead, emit remaining tokens as a raw declaration.
-			// The type specifier was already re-emitted before this
-			// declarator iteration, so just emit the raw tokens.
-			if (oe_buf_checkpoint != original_oe_checkpoint) {
-				while (tok && tok->kind != TK_EOF && !equal(tok, ";")) {
-					emit_tok(tok);
-					tok = tok->next;
-				}
-				if (tok && equal(tok, ";")) {
-					emit_tok(tok);
-					tok = tok->next;
-				}
-				emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile, type->has_const);
-				ctx->active_typeof_vars = NULL;
-				return tok;
-			}
+			// If orelse committed output, emit rest as raw instead of rolling back.
+			if (oe_buf_checkpoint != original_oe_checkpoint)
+				goto emit_raw_remainder;
 			ctx->active_typeof_vars = NULL;
 			return NULL;
 		}
 
 		tok = decl.end;
 
-		// Determine effective VLA status (excluding typeof - handled specially)
-		// paren_pointer indicates '*' inside parenthesized declarators (e.g. int (*p)[n]).
-		// For pure pointers to VLAs, suppress VLA init (the pointer itself isn't variable-length).
-		// But if the declarator also has array dims inside the parens (e.g. int (*p[m])[n] —
-		// array of pointers), the array dimension m makes the variable an actual VLA.
+		// Effective VLA: paren_pointer suppresses VLA unless paren_array is also set.
 		bool effective_vla = (decl.is_vla && (!decl.paren_pointer || decl.paren_array)) || (type->is_vla && !decl.is_pointer);
-		bool is_vla_type = decl.is_vla || type->is_vla; // Track type identity separately for VLA registration
+		bool is_vla_type = decl.is_vla || type->is_vla;
 
-		// For typeof declarations, use memset instead of = 0 or = {0}
-		// Also for atomic aggregates: Clang doesn't support _Atomic aggregate init syntax
-		// Also for VLAs: can't use = {0}, so memset at runtime (sizeof evaluates to runtime size)
-		// But NOT for register variables (can't take address) or volatile (needs volatile semantics)
+		// typeof/atomic aggregate/VLA: use memset (can't use = 0 or = {0})
 		bool is_aggregate =
 		    decl.is_array || ((type->is_struct || type->is_typedef) && !decl.is_pointer);
 		bool needs_memset = !decl.has_init && !is_raw && (!decl.is_pointer || decl.is_array) &&
@@ -3033,13 +2736,10 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 		// Add zero initializer if needed (for non-memset types)
 		if (!decl.has_init && !effective_vla && !is_raw && !needs_memset) {
-			// register + _Atomic aggregate: can't memset (register prevents &)
-			// and can't = {0} (Clang rejects _Atomic aggregate initializers).
-			// Skip zero-init entirely.
+			// register + _Atomic aggregate: no safe zero-init path.
 			if (type->has_register && type->has_atomic && is_aggregate)
-				; // skip — no safe zero-init path
-			else if (is_aggregate ||
-			    type->has_typeof) // typeof: always use {0} (unknown underlying type)
+				;
+			else if (is_aggregate || type->has_typeof)
 				OUT_LIT(" = {0}");
 			else
 				OUT_LIT(" = 0");
@@ -3063,16 +2763,14 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					depth--;
 				else if (depth == 0 && (equal(tok, ",") || equal(tok, ";")))
 					break;
-				// Detect 'orelse' at depth 0 in initializer
+			// Detect 'orelse' at depth 0 in initializer
 				if (FEAT(F_ORELSE) && depth == 0 && (tok->tag & TT_ORELSE) &&
 				    !is_known_typedef(tok) &&
 				    !(last_emitted && (last_emitted->tag & TT_MEMBER))) {
 					hit_orelse = true;
 					break;
 				}
-				// Catch orelse buried inside parentheses/braces — expansion
-				// only works at statement level; emitting it raw produces
-				// invalid C and silently bypasses the safety guardrail.
+				// orelse inside parens/braces: error (only works at statement level).
 				if (FEAT(F_ORELSE) && depth > 0 && (tok->tag & TT_ORELSE) &&
 				    !is_known_typedef(tok) &&
 				    !(last_emitted && (last_emitted->tag & TT_MEMBER)))
@@ -3087,7 +2785,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 				if (ctrl.for_init)
 					error_tok(tok, "orelse cannot be used in for-loop initializers");
 
-				// Detect struct/union value (not enum — enums are integer types)
+				// Detect struct/union value (not enum)
 				bool type_is_sue_not_enum = type->is_struct;
 				if (type_is_sue_not_enum) {
 					for (Token *t = type_start; t && t != type->end; t = t->next) {
@@ -3099,9 +2797,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					}
 				}
 
-				// For function pointers, type-level const qualifies the return type,
-				// not the pointer variable — the variable is still mutable.
-				// Also detect const baked into a typedef (e.g., typedef const int cint).
+				// For function pointers, type-level const qualifies return type, not the variable.
 				bool has_const_qual = (type->has_const && !decl.is_func_ptr) || decl.is_const;
 				if (!has_const_qual && !decl.is_func_ptr && !decl.is_pointer) {
 					for (Token *t = type_start; t && t != type->end; t = t->next)
@@ -3118,14 +2814,13 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 						  decl.var_name->len,
 						  decl.var_name->loc);
 
-				// Peek at action after 'orelse' to detect fallback (non-control-flow) orelse
 				Token *peek_action = tok->next;
 				bool is_orelse_fallback =
 				    peek_action &&
 				    !(peek_action->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
 				    !equal(peek_action, "{") && !equal(peek_action, ";");
 
-				// const + fallback orelse: use temp variable to avoid GNU ternary ?: extension
+				// const + fallback orelse: temp variable approach (avoids GNU ternary)
 				if (has_const_qual && is_orelse_fallback) {
 					if (is_struct_val)
 						error_tok(tok,
@@ -3157,7 +2852,6 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					if (equal(tok, ";")) tok = tok->next;
 					end_statement_after_semicolon();
 
-					// Handle remaining declarators after comma
 					if (stop_comma && equal(tok, ",")) {
 						tok = tok->next;
 						oe_buf_checkpoint = out_buf_pos;
@@ -3178,12 +2872,12 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 				tok = tok->next; // skip 'orelse'
 
-				// Error on missing action: "int x = val orelse;" is malformed
+				// Error on missing action
 				if (equal(tok, ";")) error_tok(tok, "expected statement after 'orelse'");
 
 				Token *stop_comma = find_boundary_comma(tok);
 
-				// Struct/union value orelse — error (already computed type_is_sue_not_enum above)
+				// Struct/union value orelse — error
 				bool is_struct_value =
 				    type_is_sue_not_enum && !decl.is_pointer && !decl.is_array;
 				if (is_struct_value)
@@ -3193,9 +2887,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 				tok = emit_orelse_action(
 				    tok, decl.var_name, has_const_qual, stop_comma);
 
-				// Continue processing remaining declarators after comma
 				if (stop_comma && equal(tok, ",")) {
-					tok = tok->next; // skip comma
+					tok = tok->next;
 					oe_buf_checkpoint = out_buf_pos;
 					re_emit_type_specifier(type_start, type->end);
 					is_raw = false;
@@ -3218,37 +2911,35 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			tok = tok->next;
 			is_raw = false; // raw applies to first declarator only
 		} else {
-			// If orelse already committed output, emit remaining raw
-			if (oe_buf_checkpoint != original_oe_checkpoint) {
-				while (tok && tok->kind != TK_EOF && !equal(tok, ";")) {
-					emit_tok(tok);
-					tok = tok->next;
-				}
-				if (tok && equal(tok, ";")) {
-					emit_tok(tok);
-					tok = tok->next;
-				}
-				emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile, type->has_const);
-				ctx->active_typeof_vars = NULL;
-				return tok;
-			}
+			if (oe_buf_checkpoint != original_oe_checkpoint)
+				goto emit_raw_remainder;
 			ctx->active_typeof_vars = NULL;
 			return NULL;
 		}
 	}
 
+emit_raw_remainder:
+	if (oe_buf_checkpoint != original_oe_checkpoint) {
+		while (tok && tok->kind != TK_EOF && !equal(tok, ";")) {
+			emit_tok(tok);
+			tok = tok->next;
+		}
+		if (tok && equal(tok, ";")) {
+			emit_tok(tok);
+			tok = tok->next;
+		}
+		emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile, type->has_const);
+		ctx->active_typeof_vars = NULL;
+		return tok;
+	}
 	ctx->active_typeof_vars = NULL;
 	return NULL;
 }
 
 // Register shadows for file-scope _t/__* variable declarations.
-// Prevents the typedef heuristic from misidentifying them as types.
-// Only called at ctx->defer_depth == 0. Uses a conservative type-specifier
-// scan that avoids is_typedef_heuristic (chicken-and-egg problem).
 static void register_toplevel_shadows(Token *tok) {
 	if (tok->kind >= TK_STR) return;
 
-	// Skip storage class / function specifiers / attributes
 	Token *t = tok;
 	while (t && t->kind != TK_EOF) {
 		if (t->tag & TT_TYPEDEF) return;
@@ -3259,12 +2950,12 @@ static void register_toplevel_shadows(Token *tok) {
 	}
 	if (!t || t->kind == TK_EOF) return;
 
-	// Must start with a real type keyword or known typedef
+	// Must start with a type keyword or known typedef
 	if (!(t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT)) &&
 	    !is_known_typedef(t))
 		return;
 
-	// Advance past type specifier (only unambiguous type tokens)
+	// Advance past type specifier
 	while (t && t->kind != TK_EOF) {
 		if (t->tag & (TT_TYPE | TT_QUALIFIER)) t = t->next;
 		else if (t->tag & TT_SUE) {
@@ -3308,12 +2999,7 @@ static void register_toplevel_shadows(Token *tok) {
 	}
 }
 
-// Try to handle a declaration with zero-init
-// Supports multi-declarators like: int a, b, *c, d[10];
-// Returns the token after the declaration if handled, NULL otherwise
-//
-// SAFETY: If we see a type but fail to parse the declarator, we emit a warning
-// to alert the user that zero-init may have been skipped.
+// Try to handle a declaration with zero-init. Returns token after declaration, or NULL.
 static Token *try_zero_init_decl(Token *tok) {
 	if (!FEAT(F_ZEROINIT) || ctx->defer_depth <= 0 || ctx->struct_depth > 0) return NULL;
 
@@ -3321,20 +3007,16 @@ static Token *try_zero_init_decl(Token *tok) {
 	    TK_STR) // Fast reject: strings, numbers, prep directives, EOF can't start a declaration
 		return NULL;
 
-	// Check for "switch skip hole" - declarations directly in switch body
-	// without braces can have their initialization skipped by case jumps.
-	// This catches both: before first case label, and between case labels.
+	// Declarations in switch body without braces can be skipped by case jumps.
 	bool in_switch_scope_unbraced = ctx->defer_depth > 0 && defer_stack[ctx->defer_depth - 1].is_switch;
 
 	Token *warn_loc = tok;
 	Token *pragma_start = tok;
 
-	// Skip leading attributes and pragmas
 	while (is_c23_attr(tok)) tok = skip_c23_attr(tok);
 	tok = skip_pragma_operators(tok);
 	Token *start = tok;
 
-	// Check for 'raw' keyword
 	bool is_raw = false;
 	Token *raw_tok = NULL;
 	if (equal(tok, "raw") && !is_known_typedef(tok)) {
@@ -3345,19 +3027,14 @@ static Token *try_zero_init_decl(Token *tok) {
 		if (is_raw_declaration_context(after_raw)) {
 			is_raw = true;
 			raw_tok = tok;
-			// Preserve C23 attrs between 'raw' and the type for emission,
-			// but advance tok past them so fast-reject sees the type keyword.
-			start = tok->next; // right after 'raw' (includes attrs)
-			tok = after_raw;   // at the type keyword (past attrs)
-			// Only reset pragma_start when no C23 attrs preceded raw
+			start = tok->next;
+			tok = after_raw;
 			if (pragma_start == raw_tok) pragma_start = start;
 			warn_loc = after_raw;
 		}
 	}
 
-	// If 'raw' not found directly, probe past qualifiers, attributes, and
-	// storage classes to find it. When found, emit prefix and rest (skipping
-	// 'raw') and short-circuit — raw declarations need no zero-init processing.
+	// Probe past qualifiers/attrs/storage to find 'raw' after prefix.
 	if (!is_raw) {
 		Token *probe = start;
 		while (probe && probe->kind != TK_EOF) {
@@ -3366,7 +3043,8 @@ static Token *try_zero_init_decl(Token *tok) {
 			if (probe->tag & TT_QUALIFIER) { probe = probe->next; continue; }
 			if (equal(probe, "_Pragma")) { probe = skip_pragma_operators(probe); continue; }
 			if (probe->kind == TK_PREP_DIR) { probe = probe->next; continue; }
-			if (equal(probe, "_Thread_local")) { probe = probe->next; continue; }
+			if (equal(probe, "_Thread_local") || equal(probe, "static") ||
+			    equal(probe, "extern") || (probe->tag & TT_TYPEDEF)) { probe = probe->next; continue; }
 			break;
 		}
 		if (probe && equal(probe, "raw") && !is_known_typedef(probe)) {
@@ -3384,7 +3062,7 @@ static Token *try_zero_init_decl(Token *tok) {
 		}
 	}
 
-	if (tok->tag & TT_SKIP_DECL) // Storage class specifiers
+	if (tok->tag & TT_SKIP_DECL) // Storage class specifiers, control flow, etc.
 	{
 		if (is_raw) {
 			bool has_file_storage = false;
@@ -3394,25 +3072,16 @@ static Token *try_zero_init_decl(Token *tok) {
 				has_file_storage = true;
 			return emit_raw_first_then_zeroinit_rest(start, has_file_storage);
 		}
-		if (equal(tok, "static") || equal(tok, "extern") || (tok->tag & TT_TYPEDEF)) {
-			Token *result = handle_storage_raw(tok);
-			if (result) return result;
-		}
 		return NULL;
 	}
 
-	// Fast reject: if token has no declaration-start tag and isn't a typedef, skip parse_type_specifier
 	if (!(tok->tag & TT_DECL_START) && !is_typedef_like(tok)) return NULL;
 
-	// Parse type specifier
 	TypeSpecResult type = parse_type_specifier(tok);
 	if (!type.saw_type) return NULL;
 
-	// Validate declaration structure
 	if (!is_var_declaration(type.end)) {
-		// Detect GNU nested function definitions: type name(params) { ... }
-		// These break defer/return tracking since the inner function body
-		// shares the outer function's defer stack and return type.
+		// Detect GNU nested function definitions (break defer/return tracking).
 		if (FEAT(F_DEFER)) {
 			Token *p = type.end;
 			while (p && (equal(p, "*") || (p->tag & TT_QUALIFIER) || (p->tag & TT_ATTR))) {
@@ -3425,7 +3094,6 @@ static Token *try_zero_init_decl(Token *tok) {
 					after_name = skip_gnu_attributes(after_name);
 				if (after_name && equal(after_name, "(")) {
 					Token *after_params = skip_balanced(after_name, '(', ')');
-					// Skip trailing attributes/asm between ')' and '{'
 					while (after_params && ((after_params->tag & TT_ATTR) || (after_params->tag & TT_ASM))) {
 						if (after_params->tag & TT_ASM) { after_params = after_params->next; }
 						else after_params = skip_gnu_attributes(after_params);
@@ -3437,14 +3105,13 @@ static Token *try_zero_init_decl(Token *tok) {
 							  "functions using defer/zeroinit — move the function outside "
 							  "or use a function pointer");
 					// K&R-style: type name(a, b) int a; int b; { ... }
-					// Look for '{' past K&R parameter declarations.
 					if (after_params && !equal(after_params, "{")) {
 						Token *maybe_brace = after_params;
 						while (maybe_brace && maybe_brace->kind != TK_EOF &&
 						       !equal(maybe_brace, "{") && !equal(maybe_brace, "}") &&
 						       !equal(maybe_brace, ";"))
 							maybe_brace = maybe_brace->next;
-						// Allow scanning through K&R decls (which end with ';')
+						// Allow scanning through K&R decls (ending with ';')
 						if (maybe_brace && equal(maybe_brace, ";")) {
 							while (maybe_brace && maybe_brace->kind != TK_EOF &&
 							       !equal(maybe_brace, "{") && !equal(maybe_brace, "}"))
@@ -3463,7 +3130,6 @@ static Token *try_zero_init_decl(Token *tok) {
 		return NULL;
 	}
 
-	// Error if in switch scope without braces
 	if (in_switch_scope_unbraced && !is_raw) {
 		error_tok(warn_loc,
 			  "variable declaration directly in switch body without braces. "
@@ -3471,7 +3137,6 @@ static Token *try_zero_init_decl(Token *tok) {
 			  "or use 'raw' to suppress zero-init.");
 	}
 
-	// Check for enum bodies to register constants before emitting
 	if (type.is_struct) {
 		for (Token *t = start; t && t != type.end; t = t->next) {
 			if (equal(t, "enum")) {
@@ -3482,22 +3147,15 @@ static Token *try_zero_init_decl(Token *tok) {
 		}
 	}
 
-	// Emit pragmas and type
-	// Flush buffer before setting checkpoint so speculative output (during
-	// declarator parsing and possible const+fallback orelse) begins cleanly.
-	// During speculation, the buffer grows instead of flushing, ensuring
-	// rollback is always safe.
+	// Flush before checkpoint so speculative output + rollback is safe.
 	out_flush();
 	oe_buf_checkpoint = out_buf_pos;
 
-	// Braceless control body (e.g. "else int *x = p orelse return -1;"): wrap
-	// in braces because orelse expands to multiple statements. The open brace
-	// is inside the speculative buffer so it rolls back cleanly on failure.
+	// Braceless control body: wrap in braces (orelse expands to multiple stmts).
 	bool brace_wrap = ctrl.pending && ctrl.parens_just_closed;
 	if (brace_wrap) OUT_LIT(" {");
 
 	if (raw_tok && pragma_start != start) {
-		// C23 attrs preceded 'raw' — emit attrs (up to raw_tok), skip raw
 		emit_range(pragma_start, raw_tok);
 	} else if (pragma_start != start) {
 		emit_range(pragma_start, start);
@@ -3507,9 +3165,7 @@ static Token *try_zero_init_decl(Token *tok) {
 	Token *result = process_declarators(type.end, &type, is_raw, start);
 	if (result && brace_wrap) OUT_LIT(" }");
 	if (!result && oe_buf_checkpoint >= 0) {
-		// Rollback all emitted output (type specifier + partial declarator)
-		// so the caller's main loop can re-emit the original tokens.
-		// Always safe: buffer grows instead of flushing during speculation.
+		// Rollback speculative output.
 		out_buf_pos = oe_buf_checkpoint;
 		last_emitted = NULL;
 	}
@@ -3519,9 +3175,7 @@ static Token *try_zero_init_decl(Token *tok) {
 	return result;
 }
 
-// Emit an expression until semicolon, tracking depth for statement expressions.
-// Handles zero-init for declarations inside statement expressions.
-// Returns the token after the expression (the semicolon, or EOF).
+// Emit expression to semicolon, handling zero-init in statement expressions.
 static Token *emit_expr_to_semicolon(Token *tok) {
 	int depth = 0;
 	int ternary_depth = 0;
@@ -3594,8 +3248,7 @@ static Token *handle_defer_keyword(Token *tok) {
 		if (ctx->defer_depth == stmt_expr_levels[i])
 			error_tok(tok,
 				  "defer cannot be at top level of statement expression; wrap in a block");
-	// setjmp/longjmp safety: detects direct calls and indirect calls through
-	// known wrapper functions (registered by longjmp_wrapper_map).
+	// setjmp/longjmp/vfork/asm safety checks
 	if (ctx->current_func_has_setjmp)
 		error_tok(tok, "defer cannot be used in functions that call setjmp/longjmp/pthread_exit");
 	if (ctx->current_func_has_vfork)
@@ -3614,28 +3267,22 @@ static Token *handle_defer_keyword(Token *tok) {
 	if (stmt_end->kind == TK_EOF || !equal(stmt_end, ";"))
 		error_tok(defer_keyword, "unterminated defer statement; expected ';'");
 
-	// Validate: no bare control-flow keywords, no unbracketed multi-line spans
 	int bd = 0, pd = 0, bkd = 0;
 
-	// Track loop/switch nesting inside defer block for break/continue validation.
-	// break is safe inside a nested loop or switch; continue is safe inside a nested loop.
+	// Track loop/switch nesting for break/continue validation.
 	int inner_loop_depth = 0;
 	int inner_switch_depth = 0;
-	// scope_type_at_depth records what kind of scope (loop/switch) was opened at
-	// each brace depth. This fixes nested switch-inside-loop (or vice versa):
-	// a scalar would be overwritten by the inner scope, "forgetting" the outer.
-	uint8_t scope_type_at_depth[4096] = {0}; // 1 = loop, 2 = switch
+	// scope_type_at_depth: 1=loop, 2=switch; fixes nested switch-inside-loop.
+	uint8_t scope_type_at_depth[4096] = {0};
 
-	// State machine for detecting loop/switch body entry
-	bool pk_is_loop = false;      // true for for/while, false for switch
-	int pk_paren = 0;	      // paren depth for condition (for/while/switch)
-	bool pk_tracking = false;     // currently tracking condition parens
-	bool pk_body_next = false;    // condition ended, next token starts body
-	bool pk_do_body = false;      // after 'do', next { starts loop body
-	bool pk_skip_body = false;    // do-while's 'while' — skip body detection
-	bool prev_was_rbrace = false; // previous token was '}' (for do-while detection)
+	bool pk_is_loop = false;
+	int pk_paren = 0;
+	bool pk_tracking = false;
+	bool pk_body_next = false;
+	bool pk_do_body = false;
+	bool pk_skip_body = false;
+	bool prev_was_rbrace = false;
 
-	// Braceless loop/switch body tracking (approximate for rare edge cases)
 	int braceless_loop_n = 0;
 	int braceless_switch_n = 0;
 	int braceless_bd = -1;
@@ -3647,8 +3294,6 @@ static Token *handle_defer_keyword(Token *tok) {
 			error_tok(defer_keyword,
 				  "defer statement spans multiple lines without ';' - add semicolon");
 
-		// --- Loop/switch body entry detection (runs before brace tracking) ---
-		// Check if this token enters a loop/switch body (braced or braceless)
 		if (pk_body_next || pk_do_body) {
 			if (equal(t, "{")) {
 				int new_bd = bd + 1;
@@ -3661,7 +3306,6 @@ static Token *handle_defer_keyword(Token *tok) {
 				pk_body_next = false;
 				pk_do_body = false;
 			} else {
-				// Braceless body (e.g. for (...) break;)
 				if (pk_is_loop || pk_do_body) {
 					inner_loop_depth++;
 					braceless_loop_n++;
@@ -3675,10 +3319,8 @@ static Token *handle_defer_keyword(Token *tok) {
 			}
 		}
 
-		// Detect loop/switch keywords inside the defer block
 		if (bd > 0 && t->kind == TK_KEYWORD) {
 			if ((t->tag & TT_LOOP) && !prev_was_rbrace) {
-				// for/while/do — but skip do-while's 'while' (preceded by '}')
 				if (equal(t, "do")) {
 					pk_do_body = true;
 					pk_is_loop = true;
@@ -3694,7 +3336,6 @@ static Token *handle_defer_keyword(Token *tok) {
 			}
 		}
 
-		// Track condition parens for for/while/switch
 		if (pk_tracking) {
 			if (equal(t, "(")) pk_paren++;
 			else if (equal(t, ")")) {
@@ -3707,7 +3348,6 @@ static Token *handle_defer_keyword(Token *tok) {
 			}
 		}
 
-		// --- Brace/paren/bracket tracking ---
 		if (equal(t, "{")) bd++;
 		else if (equal(t, "}")) {
 			if (bd < 4096 && bd > 0) {
@@ -3716,23 +3356,6 @@ static Token *handle_defer_keyword(Token *tok) {
 				scope_type_at_depth[bd] = 0;
 			}
 			bd--;
-			// End braceless body when '}' returns to the braceless depth.
-			// E.g., while(1) if(cond) { break; } else { break; }
-			// The braced if/else arms are child scopes; when the last '}' brings
-			// bd back to braceless_bd and no 'else' follows, the statement is done.
-			if (braceless_bd >= 0 && bd == braceless_bd && !(t->next && equal(t->next, "else"))) {
-				if (braceless_loop_n > 0) {
-					inner_loop_depth -= braceless_loop_n;
-					if (inner_loop_depth < 0) inner_loop_depth = 0;
-					braceless_loop_n = 0;
-				}
-				if (braceless_switch_n > 0) {
-					inner_switch_depth -= braceless_switch_n;
-					if (inner_switch_depth < 0) inner_switch_depth = 0;
-					braceless_switch_n = 0;
-				}
-				braceless_bd = -1;
-			}
 		} else if (equal(t, "("))
 			pd++;
 		else if (equal(t, ")"))
@@ -3742,10 +3365,9 @@ static Token *handle_defer_keyword(Token *tok) {
 		else if (equal(t, "]"))
 			bkd--;
 
-		// Braceless body end detection: ';' at the exact entry depth closes braceless bodies.
-		// Don't close when 'else' follows — it continues an if/else compound statement.
-		if (equal(t, ";") && pd == 0 && bkd == 0 && braceless_bd >= 0 && bd == braceless_bd
-		    && !(t->next && equal(t->next, "else"))) {
+		// Braceless body end: '}' or ';' at entry depth, unless 'else' follows.
+		if (braceless_bd >= 0 && bd == braceless_bd && pd == 0 && bkd == 0 &&
+		    (equal(t, "}") || equal(t, ";")) && !(t->next && equal(t->next, "else"))) {
 			if (braceless_loop_n > 0) {
 				inner_loop_depth -= braceless_loop_n;
 				if (inner_loop_depth < 0) inner_loop_depth = 0;
@@ -3768,7 +3390,6 @@ static Token *handle_defer_keyword(Token *tok) {
 				  "defer statement appears to be missing ';' (found '%.*s' keyword inside)",
 				  t->len,
 				  t->loc);
-		// Nested defer is never valid
 		if (!at_top && (t->tag & TT_DEFER) && !is_known_typedef(t) && !equal(t->next, ":") &&
 		    !(t->next && (t->next->tag & TT_ASSIGN)))
 			error_tok(defer_keyword, "nested defer is not supported");
@@ -3783,17 +3404,15 @@ static Token *handle_defer_keyword(Token *tok) {
 	return tok;
 }
 
-// Check if a return expression is void (void function or explicit (void) cast)
 static inline bool is_void_return(Token *tok) {
 	return ctx->current_func_returns_void || (equal(tok, "(") && tok->next && equal(tok->next, "void") &&
 						  tok->next->next && equal(tok->next->next, ")"));
 }
 
-// Emit return statement body with optional defer cleanup.
-// tok points to first token after 'return'. Returns updated tok.
-static Token *emit_return_body(Token *tok) {
+// Emit return body with defer cleanup. tok = first token after 'return'.
+static Token *emit_return_body(Token *tok, Token *stop) {
 	bool active = FEAT(F_DEFER) && has_active_defers();
-	bool is_empty = match_ch(tok, ';');
+	bool is_empty = match_ch(tok, ';') || (stop && tok == stop);
 
 	if (active) {
 		if (is_empty) {
@@ -3806,7 +3425,10 @@ static Token *emit_return_body(Token *tok) {
 				OUT_LIT(" _Prism_ret_"); out_uint(ctx->ret_counter); OUT_LIT(" = (");
 			} else OUT_LIT(" (");
 
-			tok = emit_expr_to_semicolon(tok);
+			if (stop)
+				tok = emit_expr_to_stop(tok, stop, false);
+			else
+				tok = emit_expr_to_semicolon(tok);
 			OUT_LIT(");");
 			emit_all_defers();
 
@@ -3816,7 +3438,13 @@ static Token *emit_return_body(Token *tok) {
 		}
 	} else {
 		OUT_LIT(" return");
-		if (!is_empty) { out_char(' '); tok = emit_expr_to_semicolon(tok); }
+		if (!is_empty) {
+			out_char(' ');
+			if (stop)
+				tok = emit_expr_to_stop(tok, stop, false);
+			else
+				tok = emit_expr_to_semicolon(tok);
+		}
 		out_char(';');
 	}
 
@@ -3824,10 +3452,7 @@ static Token *emit_return_body(Token *tok) {
 	return tok;
 }
 
-// Emit orelse action: the fallback part after 'orelse'.
-// For declaration orelse: var_name is the variable, has_const from type/decl.
-// For bare expression orelse: var_name is NULL (condition already emitted).
-// Calls end_statement_after_semicolon() internally for non-block cases.
+// Emit orelse action (fallback after 'orelse').
 static inline void orelse_open(Token *var_name) {
 	if (var_name) {
 		OUT_LIT(" if (!");
@@ -3838,7 +3463,6 @@ static inline void orelse_open(Token *var_name) {
 }
 
 static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma) {
-	// Block orelse: '{' handled by caller
 	if (equal(tok, "{")) {
 		if (var_name) {
 			OUT_LIT(" if (!");
@@ -3849,111 +3473,21 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
 		return tok;
 	}
 
-	// Return orelse
-	if (tok->tag & TT_RETURN) {
-		mark_switch_control_exit();
-		tok = tok->next;
+	if (tok->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) {
+		uint64_t tag = tok->tag;
+		if (tag & TT_RETURN) {
+			mark_switch_control_exit();
+			tok = tok->next;
+		}
 		orelse_open(var_name);
-		if (stop_comma) {
-			// Multi-declarator context: emit return body stopping at the declarator comma
-			bool has_defers = FEAT(F_DEFER) && has_active_defers();
-			bool at_end = equal(tok, ";") || tok == stop_comma;
-			if (has_defers) {
-				if (at_end) {
-					emit_all_defers();
-					OUT_LIT(" return;");
-				} else {
-					bool is_void = is_void_return(tok);
-					if (!is_void) {
-						out_char(' ');
-						emit_ret_type();
-						OUT_LIT(" _Prism_ret_");
-						out_uint(ctx->ret_counter);
-						OUT_LIT(" = (");
-					} else
-						OUT_LIT(" (");
-					int rd = 0;
-					while (tok->kind != TK_EOF && tok != stop_comma) {
-						if (tok->flags & TF_OPEN) rd++;
-						else if (tok->flags & TF_CLOSE)
-							rd--;
-						else if (rd == 0 && equal(tok, ";"))
-							break;
-						emit_tok(tok);
-						tok = tok->next;
-					}
-					OUT_LIT(");");
-					emit_all_defers();
-					if (!is_void) {
-						OUT_LIT(" return _Prism_ret_");
-						out_uint(ctx->ret_counter++);
-					} else
-						OUT_LIT(" return");
-					out_char(';');
-				}
-			} else {
-				OUT_LIT(" return");
-				if (!at_end) {
-					out_char(' ');
-					int rd = 0;
-					while (tok->kind != TK_EOF && tok != stop_comma) {
-						if (tok->flags & TF_OPEN) rd++;
-						else if (tok->flags & TF_CLOSE)
-							rd--;
-						else if (rd == 0 && equal(tok, ";"))
-							break;
-						emit_tok(tok);
-						tok = tok->next;
-					}
-				}
-				out_char(';');
-			}
-			if (equal(tok, ";")) tok = tok->next;
-		} else
-			tok = emit_return_body(tok);
+		if (tag & TT_RETURN) tok = emit_return_body(tok, stop_comma);
+		else if (tag & (TT_BREAK | TT_CONTINUE)) tok = emit_break_continue_defer(tok);
+		else tok = emit_goto_defer(tok);
 		OUT_LIT(" }");
 		end_statement_after_semicolon();
 		return tok;
 	}
 
-	// Break/continue orelse
-	if (tok->tag & (TT_BREAK | TT_CONTINUE)) {
-		bool is_break = tok->tag & TT_BREAK;
-		mark_switch_control_exit();
-		orelse_open(var_name);
-		if (FEAT(F_DEFER) && control_flow_has_defers(is_break))
-			emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
-		out_char(' ');
-		out_str(tok->loc, tok->len);
-		OUT_LIT("; }");
-		tok = tok->next;
-		if (equal(tok, ";")) tok = tok->next;
-		end_statement_after_semicolon();
-		return tok;
-	}
-
-	// Goto orelse
-	if (tok->tag & TT_GOTO) {
-		mark_switch_control_exit();
-		orelse_open(var_name);
-		tok = tok->next;
-		if (FEAT(F_DEFER) && is_identifier_like(tok)) {
-			int td = label_table_lookup(tok->loc, tok->len);
-			if (td < 0) td = ctx->defer_depth;
-			if (goto_has_defers(td)) emit_goto_defers(td);
-		}
-		OUT_LIT(" goto ");
-		if (is_identifier_like(tok)) {
-			out_str(tok->loc, tok->len);
-			tok = tok->next;
-		}
-		OUT_LIT("; }");
-		if (equal(tok, ";")) tok = tok->next;
-		end_statement_after_semicolon();
-		return tok;
-	}
-
-	// Fallback: assignment
 	if (!var_name) error_tok(tok, "orelse fallback requires an assignment target (use a declaration)");
 	if (has_const) error_tok(tok, "orelse fallback cannot reassign a const-qualified variable");
 	OUT_LIT(" if (!");
@@ -3970,10 +3504,9 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
 			break;
 		// Chained orelse: "x = a orelse b orelse c" → close this assignment,
 		// then recursively handle the next orelse on the same variable.
-		if (fdepth == 0 && (tok->tag & TT_ORELSE) && !is_known_typedef(tok) &&
-		    !(last_emitted && (last_emitted->tag & TT_MEMBER))) {
+		if (fdepth == 0 && is_orelse_keyword(tok)) {
 			out_char(';');
-			tok = tok->next; // skip 'orelse'
+			tok = tok->next;
 			if (equal(tok, ";"))
 				error_tok(tok, "expected statement after 'orelse'");
 			return emit_orelse_action(tok, var_name, has_const, stop_comma);
@@ -3997,7 +3530,7 @@ static Token *handle_return_defer(Token *tok) {
 	if (!has_active_defers()) return NULL;
 	tok = tok->next; // skip 'return'
 	OUT_LIT(" {");
-	tok = emit_return_body(tok);
+	tok = emit_return_body(tok, NULL);
 	OUT_LIT(" }");
 	end_statement_after_semicolon();
 	return tok;
@@ -4010,12 +3543,8 @@ static Token *handle_break_continue_defer(Token *tok) {
 	mark_switch_control_exit();
 	if (!control_flow_has_defers(is_break)) return NULL;
 	OUT_LIT(" {");
-	emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
-	out_char(' ');
-	out_str(tok->loc, tok->len);
-	OUT_LIT("; }");
-	tok = tok->next;
-	if (equal(tok, ";")) tok = tok->next;
+	tok = emit_break_continue_defer(tok);
+	OUT_LIT(" }");
 	end_statement_after_semicolon();
 	return tok;
 }
@@ -4028,8 +3557,15 @@ static void report_goto_skips_decl(Token *skipped_decl, Token *label_tok) {
 		error_tok(skipped_decl, msg, label_tok->len, label_tok->loc);
 }
 
-// Handle 'goto': defer cleanup + zeroinit safety checks.
-// Returns next token if fully handled, or NULL to let normal emit proceed.
+static void check_goto_decl_safety(GotoSkipResult *skip, Token *goto_tok, Token *label_tok) {
+	if (skip->skipped_decl) report_goto_skips_decl(skip->skipped_decl, label_tok);
+	else {
+		Token *back_decl = backward_goto_skips_decl(goto_tok, label_tok->loc, label_tok->len);
+		if (back_decl) report_goto_skips_decl(back_decl, label_tok);
+	}
+}
+
+// Handle 'goto': defer cleanup + zeroinit safety checks
 static Token *handle_goto_keyword(Token *tok) {
 	Token *goto_tok = tok;
 	tok = tok->next;
@@ -4037,13 +3573,12 @@ static Token *handle_goto_keyword(Token *tok) {
 	if (FEAT(F_DEFER)) {
 		mark_switch_control_exit();
 
-		if (equal(tok, "*")) // Computed goto
-		{
+		if (equal(tok, "*")) {
 			if (has_active_defers())
 				error_tok(goto_tok,
 					  "computed goto cannot be used with active defer statements");
 			emit_tok(goto_tok);
-			return tok; // let main loop emit '*' and rest
+			return tok;
 		}
 
 		if (is_identifier_like(tok)) {
@@ -4055,28 +3590,19 @@ static Token *handle_goto_keyword(Token *tok) {
 				else
 					error_tok(skip.skipped_defer, msg, tok->len, tok->loc);
 			}
-			if (skip.skipped_decl) report_goto_skips_decl(skip.skipped_decl, tok);
-
-			// Backward goto: check if re-entering a block past declarations
-			if (!skip.skipped_decl) {
-				Token *back_decl = backward_goto_skips_decl(goto_tok, tok->loc, tok->len);
-				if (back_decl) report_goto_skips_decl(back_decl, tok);
-			}
+			check_goto_decl_safety(&skip, goto_tok, tok);
 
 			int target_depth = label_table_lookup(tok->loc, tok->len);
 			bool label_found = (target_depth >= 0);
 			if (target_depth < 0) target_depth = ctx->defer_depth;
 
-			// Sibling scope fix: if goto exits its current scope to reach a
-			// same-depth label in a sibling block, adjust target_depth so
-			// the current scope's defers are emitted.
+			// Adjust target_depth for sibling-scope gotos so defers are emitted
 			if (target_depth >= ctx->defer_depth) {
 				int exits = forward_goto_scope_exits(tok->next, tok->loc, tok->len);
 				if (exits > 0) {
 					target_depth = ctx->defer_depth - exits;
 					if (target_depth < 0) target_depth = 0;
 				} else if (label_found) {
-					// Backward goto to sibling scope
 					exits = backward_goto_scope_exits(goto_tok, tok->loc, tok->len);
 					if (exits > 0) {
 						target_depth = ctx->defer_depth - exits;
@@ -4100,7 +3626,6 @@ static Token *handle_goto_keyword(Token *tok) {
 				return tok;
 			}
 		}
-		// No defers — emit goto, let main loop handle the rest
 		emit_tok(goto_tok);
 		return tok;
 	}
@@ -4108,12 +3633,7 @@ static Token *handle_goto_keyword(Token *tok) {
 	// Zeroinit-only goto safety
 	if (FEAT(F_ZEROINIT) && is_identifier_like(tok)) {
 		GotoSkipResult skip = goto_skips_check(goto_tok, tok->loc, tok->len, false, true);
-		if (skip.skipped_decl) report_goto_skips_decl(skip.skipped_decl, tok);
-		// Backward goto: check if re-entering a block past declarations
-		if (!skip.skipped_decl) {
-			Token *back_decl = backward_goto_skips_decl(goto_tok, tok->loc, tok->len);
-			if (back_decl) report_goto_skips_decl(back_decl, tok);
-		}
+		check_goto_decl_safety(&skip, goto_tok, tok);
 	}
 	emit_tok(goto_tok);
 	return tok;
@@ -4127,11 +3647,10 @@ static void handle_case_default(Token *tok) {
 	bool is_default = (tok->tag & TT_DEFAULT) && ctx->generic_paren_depth == 0;
 	if (is_default) {
 		Token *t = skip_all_attributes(tok->next);
-		if (!t || !equal(t, ":")) return; // Not a switch label
+		if (!t || !equal(t, ":")) return;
 	}
 	if (!is_case && !is_default) return;
 
-	// Check for defer fallthrough and clear defers (single pass)
 	for (int d = ctx->defer_depth - 1; d >= sd; d--) {
 		if (defer_stack[d].count > 0 && !defer_stack[d].had_control_exit)
 			error_tok(defer_stack[d].entries[0].defer_kw,
@@ -4142,10 +3661,7 @@ static void handle_case_default(Token *tok) {
 		defer_stack[d].had_control_exit = false;
 	}
 
-	// Check for case/default label inside a nested block scope.
-	// A jump to this label enters the block mid-body, skipping zero-init'd
-	// variable declarations above it in an enclosing block.
-	// Only check when zeroinit is active and the label is deeper than switch+1.
+	// case/default inside nested block may bypass zero-init'd declarations
 	if (FEAT(F_ZEROINIT) && ctx->defer_depth > sd + 1) {
 		for (int d = sd + 1; d < ctx->defer_depth; d++) {
 			if (defer_stack[d].has_zeroinit_decl) {
@@ -4159,8 +3675,6 @@ static void handle_case_default(Token *tok) {
 	defer_stack[sd].seen_case_label = true;
 }
 
-// Handle struct/union/enum body opening: emit to '{', push scope.
-// Returns next token if handled, or NULL if no body follows.
 static Token *handle_sue_body(Token *tok) {
 	bool is_enum = equal(tok, "enum");
 	Token *brace = find_struct_body_brace(tok);
@@ -4168,7 +3682,7 @@ static Token *handle_sue_body(Token *tok) {
 
 	if (is_enum) parse_enum_constants(brace, ctx->defer_depth);
 	emit_range(tok, brace);
-	emit_tok(brace); // emit '{'
+	emit_tok(brace);
 	tok = brace->next;
 	ctx->struct_depth++;
 	defer_push_scope(false);
@@ -4178,7 +3692,7 @@ static Token *handle_sue_body(Token *tok) {
 }
 
 static Token *handle_open_brace(Token *tok) {
-	// Compound literal inside control parens, or after condition (before body)
+	// Compound literal inside control parens or before body
 	if (ctrl.pending && (ctrl.paren_depth > 0 || !ctrl.parens_just_closed)) {
 		emit_tok(tok);
 		ctrl.brace_depth++;
@@ -4239,9 +3753,7 @@ static inline void argv_builder_add(ArgvBuilder *ab, const char *arg) {
 	ab->data[ab->count] = NULL;
 }
 
-// Build a copy of 'environ' with CC and PRISM_CC removed.
-// Cached: built once, reused for all child processes.
-// Caller must NOT free() the returned array.
+// Build a copy of 'environ' with CC and PRISM_CC removed (cached)
 static char **build_clean_environ(void) {
 	if (cached_clean_env) return cached_clean_env;
 	int n = 0;
@@ -4268,8 +3780,7 @@ static int wait_for_child(pid_t pid) {
 	return -1;
 }
 
-// Run a command and wait for it to complete
-// Returns exit status, or -1 on error
+// Run a command and wait for completion; returns exit status or -1
 // Windows: defined in windows.c via _spawnvp
 #ifndef _WIN32
 static int run_command(char **argv) {
@@ -4285,12 +3796,8 @@ static int run_command(char **argv) {
 }
 #endif
 
-// Unified temp file creation with optional suffix (e.g., ".c" → suffix_len=2)
-// If source_adjacent is non-NULL, tries to create file next to that source file first,
-// then falls back to TMPDIR if the source directory is not writable (e.g., read-only
-// mounts, git submodules, system directories).
-// Returns 0 on success, -1 on failure. Path written to buf.
-// Uses mkstemps on all platforms (Windows shim provided by windows.c).
+// Create temp file with optional suffix. If source_adjacent is set, tries
+// to create next to that file first, falls back to TMPDIR.
 static int
 make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len, const char *source_adjacent) {
 	int n;
@@ -4311,7 +3818,7 @@ make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len, co
 				return 0;
 			}
 		}
-		// Source directory not writable — fall back to TMPDIR
+		// Source directory not writable, fall back to TMPDIR
 		const char *base = slash ? slash + 1 : source_adjacent;
 		n = snprintf(buf, bufsize, "%s.%s.XXXXXX.c", get_tmp_dir(), base);
 		suffix_len = 2;
@@ -4342,35 +3849,33 @@ static bool cc_is_msvc(const char *cc) {
 }
 #endif
 
-// Build preprocessor argv into an ArgvBuilder.
-// Shared between pipe-based and file-based preprocessor paths.
+// Build preprocessor argv (shared between pipe and file paths)
 static void build_pp_argv(ArgvBuilder *ab, const char *input_file) {
 	const char *cc = ctx->extra_compiler ? ctx->extra_compiler : PRISM_DEFAULT_CC;
 	argv_builder_add(ab, cc);
 	argv_builder_add(ab, "-E");
-	argv_builder_add(ab, "-w"); // suppress warnings (linker flags passed through are harmless)
+	argv_builder_add(ab, "-w");
 
-	for (int i = 0; i < ctx->extra_compiler_flags_count; i++) // compiler flags
+	for (int i = 0; i < ctx->extra_compiler_flags_count; i++)
 		argv_builder_add(ab, ctx->extra_compiler_flags[i]);
 
-	for (int i = 0; i < ctx->extra_include_count; i++) // include paths
+	for (int i = 0; i < ctx->extra_include_count; i++)
 	{
 		argv_builder_add(ab, "-I");
 		argv_builder_add(ab, ctx->extra_include_paths[i]);
 	}
 
-	for (int i = 0; i < ctx->extra_define_count; i++) // defines
+	for (int i = 0; i < ctx->extra_define_count; i++)
 	{
 		argv_builder_add(ab, "-D");
 		argv_builder_add(ab, ctx->extra_defines[i]);
 	}
 
-	// Add prism-specific macros
 	argv_builder_add(ab, "-D__PRISM__=1");
 	if (FEAT(F_DEFER)) argv_builder_add(ab, "-D__PRISM_DEFER__=1");
 	if (FEAT(F_ZEROINIT)) argv_builder_add(ab, "-D__PRISM_ZEROINIT__=1");
 
-	// Add standard feature test macros for POSIX/GNU compatibility (unless user already defined them)
+	// Add POSIX/GNU feature test macros unless user already defined them
 #ifndef _WIN32
 	{
 		bool user_has_posix = false, user_has_gnu = false;
@@ -4391,7 +3896,7 @@ static void build_pp_argv(ArgvBuilder *ab, const char *input_file) {
 	}
 #endif
 
-	for (int i = 0; i < ctx->extra_force_include_count; i++) // force-includes
+	for (int i = 0; i < ctx->extra_force_include_count; i++)
 	{
 		argv_builder_add(ab, cc_is_msvc(ab->data[0]) ? "/FI" : "-include");
 		argv_builder_add(ab, ctx->extra_force_includes[i]);
@@ -4400,25 +3905,21 @@ static void build_pp_argv(ArgvBuilder *ab, const char *input_file) {
 	argv_builder_add(ab, input_file);
 }
 
-// Run system preprocessor (cc -E) via pipe — no temp files.
-// Returns a malloc'd NUL-terminated buffer with preprocessed output, or NULL on failure.
-// Caller must free() the buffer.
+// Run system preprocessor (cc -E) via pipe, returns malloc'd output or NULL
 static char *preprocess_with_cc(const char *input_file) {
 	ArgvBuilder ab;
 	argv_builder_init(&ab);
 	build_pp_argv(&ab, input_file);
 	char **argv = argv_builder_finish(&ab);
 
-	// Set up pipe: child writes preprocessed output to stdout, we read from pipe
+	// Set up pipe: child writes preprocessed output, we read it
 	int pipefd[2];
 	if (pipe(pipefd) == -1) {
 		perror("pipe");
 		return NULL;
 	}
 
-	// Capture preprocessor stderr to a temp file so we can show diagnostics
-	// on failure, while still avoiding deadlock (parent only reads stdout pipe;
-	// stderr goes to a file the OS buffers independently).
+	// Capture preprocessor stderr to a temp file for diagnostics on failure
 	char pp_stderr_path[256] = "";
 	{
 		const char *tmpdir = getenv(TMPDIR_ENVVAR);
@@ -4428,7 +3929,7 @@ static char *preprocess_with_cc(const char *input_file) {
 		int fd = mkstemp(pp_stderr_path);
 		if (fd >= 0) close(fd);
 		else
-			pp_stderr_path[0] = '\0'; // Fall back to /dev/null
+			pp_stderr_path[0] = '\0';
 	}
 	posix_spawn_file_actions_t fa;
 	posix_spawn_file_actions_init(&fa);
@@ -4450,7 +3951,7 @@ static char *preprocess_with_cc(const char *input_file) {
 		return NULL;
 	}
 
-	// Parent: read all preprocessed output from pipe
+	// Read all preprocessed output from pipe
 	size_t cap = 8192, len = 0;
 	char *buf = malloc(cap);
 	if (!buf) {
@@ -4477,8 +3978,7 @@ static char *preprocess_with_cc(const char *input_file) {
 	close(pipefd[0]);
 	buf[len] = '\0';
 
-	// Right-size buffer to reduce heap fragmentation in repeated use (lib mode).
-	// The buffer often has significant slack from the doubling growth strategy.
+	// Right-size buffer to reduce heap fragmentation
 	if (len + 1 < cap) {
 		char *fitted = realloc(buf, len + 1);
 		if (fitted) buf = fitted;
@@ -4487,7 +3987,7 @@ static char *preprocess_with_cc(const char *input_file) {
 	int status;
 	waitpid(pid, &status, 0);
 	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-		// Print captured preprocessor stderr so the user sees the actual error
+		// Show captured preprocessor stderr on failure
 		if (pp_stderr_path[0]) {
 			FILE *ef = fopen(pp_stderr_path, "r");
 			if (ef) {
@@ -4505,7 +4005,7 @@ static char *preprocess_with_cc(const char *input_file) {
 	return buf;
 }
 
-// ── Shared helpers for transpile_tokens (called from both fast and slow paths) ──
+// Shared helpers for transpile_tokens
 
 static inline void track_ctrl_paren_open(void) {
 	ctrl.paren_depth++;
@@ -4522,9 +4022,7 @@ static inline void track_ctrl_paren_close(void) {
 	if (ctrl.paren_depth == 0) {
 		ctrl.for_init = false;
 		ctrl.parens_just_closed = true;
-		// Mark next token as statement start for braceless control flow bodies.
-		// Without this, "if (x) get() orelse break;" fails because the body
-		// token never gets at_stmt_start=true (only braced bodies did via handle_open_brace).
+		// Mark next token as stmt start for braceless control-flow bodies
 		ctx->at_stmt_start = true;
 	}
 }
@@ -4543,11 +4041,7 @@ static inline void track_generic_paren(Token *tok) {
 		ctx->generic_paren_depth--;
 }
 
-// Scan ahead for 'orelse' at depth 0 in a bare expression.
-// Returns the orelse token, or NULL if not found before ';' or unbalanced close.
-// Note: This does NOT stop at commas — in a bare expression context,
-// commas are part of the C comma operator, not declarator separators.
-// Multi-declarator orelse is handled separately by process_declarators.
+// Scan ahead for 'orelse' at depth 0 in a bare expression
 static Token *find_bare_orelse(Token *tok) {
 	int depth = 0;
 	Token *prev = NULL;
@@ -4565,14 +4059,11 @@ static Token *find_bare_orelse(Token *tok) {
 	return NULL;
 }
 
-// Core transpile: emit transformed tokens to an already-opened FILE*.
-// Handles the main transpilation loop, system headers, and cleanup.
-// The caller has already preprocessed and tokenized the input.
+// Core transpile: emit transformed tokens to an already-opened FILE*
 static int transpile_tokens(Token *tok, FILE *fp) {
 	out_init(fp);
 
-	if (FEAT(F_FLATTEN)) // Suppress warnings for inlined system header content.
-	{
+	if (FEAT(F_FLATTEN)) {
 		emit_system_header_diag_push();
 		out_char('\n');
 	}
@@ -4581,8 +4072,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 	typedef_table_reset();
 	system_includes_reset();
 
-	// Pre-scan all function bodies for longjmp calls so forward-declared
-	// wrappers are visible during the main transpilation pass.
+	// Pre-scan for longjmp calls for forward-declared wrappers
 	if (FEAT(F_DEFER))
 		prescan_longjmp_wrappers(tok);
 
@@ -4591,16 +4081,15 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		emit_system_includes();
 	}
 
-	bool next_func_returns_void = false;	// Track void functions at top level
-	bool next_func_ret_captured = false;	// Track if return type was already captured
-	Token *prev_toplevel_tok = NULL;	// Track previous token at top level for function detection
-	Token *last_toplevel_paren = NULL;	// Track last ')' at top level for K&R detection
-	Token *last_toplevel_open_paren = NULL; // Track matching '(' for param shadow detection
-	Token *func_name_before_paren = NULL;	// Track function name (token before top-level '(')
-	int toplevel_paren_depth = 0;		// Depth counter for top-level paren tracking
-	int ternary_depth = 0;			// Depth counter for ? : operators
+	bool next_func_returns_void = false;
+	bool next_func_ret_captured = false;
+	Token *prev_toplevel_tok = NULL;
+	Token *last_toplevel_paren = NULL;
+	Token *last_toplevel_open_paren = NULL;
+	Token *func_name_before_paren = NULL;
+	int toplevel_paren_depth = 0;
+	int ternary_depth = 0;
 
-	// Walk tokens and emit
 	while (tok->kind != TK_EOF) {
 		Token *next;
 		uint32_t tag = tok->tag;
@@ -4616,7 +4105,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		}                                                                                            \
 	}
 
-// Track top-level parentheses for function detection (used in fast and slow paths)
+// Track top-level parentheses for function detection
 #define TRACK_TOPLEVEL_PAREN(tok)                                                                            \
 	if (ctx->defer_depth == 0) {                                                                         \
 		if (match_ch(tok, '(')) {                                                                    \
@@ -4634,10 +4123,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		prev_toplevel_tok = tok;                                                                     \
 	}
 
-		// ── Fast path: untagged tokens with no stmt-start processing ──
-		// Most tokens (~70-80%) are plain identifiers, numbers, or operators without
-		// any tag bits set and not at statement start. Skip all dispatch and emit directly.
-		// Structural punctuation ({, }, ;, :) has TT_STRUCTURAL set, so it falls through.
+		// Fast path: untagged tokens not at statement start (~70-80% of tokens)
 		if (__builtin_expect(!tag && !ctx->at_stmt_start, 1)) {
 			if (__builtin_expect(ctrl.pending && tok->len == 1, 0)) {
 				char c = tok->shortcut;
@@ -4652,38 +4138,29 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			continue;
 		}
 
-		// Slower path: statement-start processing and tagged tokens
+		// Slow path: statement-start processing and tagged tokens
 
 		// Track typedefs (must precede zero-init check)
-		// For-init typedefs (e.g., for (typedef int T;;)) must be registered at
-		// defer_depth + 1 so they're scoped to the for statement and cleaned up
-		// when the loop body's '}' or braceless semicolon pops that depth.
+		// For-init typedefs registered at defer_depth+1 for loop-scoped cleanup
 		if (ctx->at_stmt_start && ctx->struct_depth == 0) {
 			if (tag & TT_TYPEDEF) {
 				parse_typedef_declaration(tok, ctx->defer_depth + (ctrl.for_init ? 1 : 0));
 			} else if (equal(tok, "raw") && tok->next && (tok->next->tag & TT_TYPEDEF)) {
-				// raw typedef — register the typedef and skip 'raw' token
 				parse_typedef_declaration(tok->next, ctx->defer_depth + (ctrl.for_init ? 1 : 0));
-				tok = tok->next; // skip 'raw', continue from 'typedef'
+				tok = tok->next;
 				continue;
 			}
 		}
 
-		// Register shadows for file-scope variable declarations with _t / __ names.
-		// Prevents the typedef heuristic from misinterpreting these as types
-		// when they're used inside function bodies with defer/zeroinit.
-		// Skip when last_toplevel_paren is set: we're between a function's ')'
-		// and its '{', where K&R parameter declarations live. Registering those
-		// as global shadows would permanently poison the typedef table.
+		// Register shadows for file-scope _t/__ variable declarations
+		// to prevent typedef heuristic misidentification.
+		// Skip between function ')' and '{' (K&R parameter declarations).
 		if (ctx->at_stmt_start && ctx->defer_depth == 0 && ctx->struct_depth == 0 &&
 		    !(tag & TT_TYPEDEF) && !last_toplevel_paren)
 			register_toplevel_shadows(tok);
 
-		// Zero-init declarations at statement start
-		// Skip structural tokens ({, }, ;, :) — they never start declarations
-		// and are dispatched below. Without this guard, find_bare_orelse scans
-		// the entire brace block for '{' after for(...), touching arena pages
-		// that cause RSS growth on musl ARM64 under QEMU.
+		// Zero-init declarations at statement start.
+		// Skip structural tokens to avoid scanning brace blocks (RSS growth on musl ARM64).
 		if (ctx->at_stmt_start && !(tag & TT_STRUCTURAL) &&
 		    (!ctrl.pending || ctrl.for_init || ctrl.parens_just_closed)) {
 			next = try_zero_init_decl(tok);
@@ -4693,15 +4170,9 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				continue;
 			}
 
-			// Bare expression orelse
-			// Skip if the statement starts with a keyword that introduces a
-			// sub-statement or label (if/for/while/switch/case/default/return/
-			// break/continue/goto) — those are handled by tagged dispatch.
-			// Without this guard, find_bare_orelse scans across keywords and
-			// their sub-structures, sweeping them into the if(!(...)) condition:
-			// - "return get() orelse break;" → "if(!(return get())) { break; }"
-			// - "case 1: val orelse break;" → "if(!(case 1: val)) { break; }"
-			// - "if (c) val orelse break;" → "if(!(if (c) val)) { break; }"
+			// Bare expression orelse.
+			// Skip keywords that introduce sub-statements or labels
+			// to avoid sweeping them into the if(!(...)) condition.
 			if (FEAT(F_ORELSE) && ctx->defer_depth > 0 && ctx->struct_depth == 0 &&
 			    !(tok->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO |
 					  TT_CASE | TT_DEFAULT | TT_IF | TT_LOOP | TT_SWITCH))) {
@@ -4709,14 +4180,12 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				if (orelse_tok) {
 					if (ctrl.for_init)
 						error_tok(tok, "orelse cannot be used in for-loop initializers");
-					if (tok->tag & TT_ORELSE && !is_known_typedef(tok))
+					if (is_orelse_keyword(tok))
 						error_tok(tok, "expected expression before 'orelse'");
-					// Wrap in braces to prevent C's dangling-else from
-					// binding an outer else to orelse's generated if.
+					// Wrap in braces to prevent dangling-else binding
 					OUT_LIT(" {");
 
-					// For bare assign fallback (x = p orelse fb;), find the
-					// assignment target so we can re-emit it for the fallback.
+					// Find assignment target for re-emit in fallback
 					Token *bare_lhs_start = tok;
 					Token *bare_assign_eq = NULL;
 					{
@@ -4731,9 +4200,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 						}
 					}
 
-					// Safety check: if the LHS contains side effects (++, --, or
-					// function calls), re-emitting it for the fallback body would
-					// double-evaluate those effects. Error with a helpful message.
+					// Error if LHS has side effects (double evaluation)
 					if (bare_assign_eq) {
 						for (Token *s = bare_lhs_start; s != bare_assign_eq; s = s->next) {
 							if (equal(s, "++") || equal(s, "--"))
@@ -4748,37 +4215,29 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 						}
 					}
 
-					// Pre-scan: check if the fallback (after orelse) is a bare
-					// value expression (not control flow, block, or empty).
+					// Check if fallback is a bare value (not control flow or block)
 					Token *after_orelse = orelse_tok->next;
 					bool is_bare_fallback = bare_assign_eq && after_orelse &&
 						!(after_orelse->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
 						!equal(after_orelse, "{") && !equal(after_orelse, ";");
 
-					// Hoist TK_PREP_DIR tokens (from _Pragma) before
-					// the if wrapper — they are invalid inside parens.
+					// Hoist TK_PREP_DIR tokens before the if wrapper (invalid inside parens)
 					for (Token *s = tok; s != orelse_tok; s = s->next) {
 						if (s->kind == TK_PREP_DIR) { emit_tok(s); out_char('\n'); }
 					}
 
 					if (is_bare_fallback) {
-						// Bare assign with fallback value: use ternary to
-						// preserve compound literal lifetime. Per C99 §6.5.2.5,
-						// a compound literal inside an unbraced if body has its
-						// lifetime scoped to that implicit block, causing dangling
-						// pointers. Ternary keeps the literal in the enclosing block.
+						// Use ternary to preserve compound literal lifetime (C99 §6.5.2.5)
 						// Emit: LHS = (LHS = val) ? LHS : (fallback);
 						out_char(' ');
-						for (Token *t = bare_lhs_start; t != bare_assign_eq; t = t->next)
-							emit_tok(t);
+						emit_range(bare_lhs_start, bare_assign_eq);
 						OUT_LIT(" = (");
 						for (Token *t = bare_lhs_start; t != orelse_tok; t = t->next) {
 							if (t->kind == TK_PREP_DIR) continue;
 							emit_tok(t);
 						}
 						OUT_LIT(") ?");
-						for (Token *t = bare_lhs_start; t != bare_assign_eq; t = t->next)
-							emit_tok(t);
+						emit_range(bare_lhs_start, bare_assign_eq);
 						OUT_LIT(" : (");
 						tok = orelse_tok->next; // skip 'orelse'
 						int fd = 0;
@@ -4786,19 +4245,14 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 							if (tok->flags & TF_OPEN) fd++;
 							else if (tok->flags & TF_CLOSE) fd--;
 							else if (fd == 0 && (equal(tok, ";") || equal(tok, ","))) break;
-							// Chained orelse: close current ternary, start new one.
-							// x = a orelse b orelse c → ...? x : (b); x = x ? x : (c);
-							if (fd == 0 && (tok->tag & TT_ORELSE) && !is_known_typedef(tok) &&
-							    !(last_emitted && (last_emitted->tag & TT_MEMBER))) {
+							// Chained orelse: close current ternary, start new one
+							if (fd == 0 && is_orelse_keyword(tok)) {
 								OUT_LIT(");");
-								for (Token *t = bare_lhs_start; t != bare_assign_eq; t = t->next)
-									emit_tok(t);
+								emit_range(bare_lhs_start, bare_assign_eq);
 								OUT_LIT(" =");
-								for (Token *t = bare_lhs_start; t != bare_assign_eq; t = t->next)
-									emit_tok(t);
+								emit_range(bare_lhs_start, bare_assign_eq);
 								OUT_LIT(" ?");
-								for (Token *t = bare_lhs_start; t != bare_assign_eq; t = t->next)
-									emit_tok(t);
+								emit_range(bare_lhs_start, bare_assign_eq);
 								OUT_LIT(" : (");
 								tok = tok->next; // skip 'orelse'
 								continue;
@@ -4821,7 +4275,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					tok = tok->next;
 				}
 				OUT_LIT("))");
-				tok = tok->next; // skip 'orelse'
+				tok = tok->next;
 
 					if (equal(tok, ";"))
 						error_tok(tok, "expected statement after 'orelse'");
@@ -4829,9 +4283,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					bool is_block_action = equal(tok, "{");
 					tok = emit_orelse_action(tok, NULL, false, NULL);
 					if (is_block_action) {
-						// Block orelse: '{' returns to main loop for
-						// full pipeline processing. Record the level
-						// so handle_close_brace emits the guard '}'.
+						// Record level so handle_close_brace emits the guard '}'
 						ARENA_ENSURE_CAP(&ctx->main_arena,
 								 orelse_guard_levels,
 								 ctx->orelse_guard_count + 1,
@@ -4849,8 +4301,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		}
 		ctx->at_stmt_start = false;
 
-		if (tag & TT_NORETURN_FN) // Noreturn function warning
-		{
+		if (tag & TT_NORETURN_FN) {
 			if (tok->next && equal(tok->next, "(")) {
 				mark_switch_control_exit();
 				if (FEAT(F_DEFER) && has_active_defers())
@@ -4864,9 +4315,9 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			}
 		}
 
-		// ── Tag-dependent dispatch (skip entirely for untagged tokens like punctuation) ──
+		// Tag-dependent dispatch
 		if (tag) {
-			// ── Keyword dispatch (defer, return, break/continue, goto) ──
+			// Keyword dispatch
 
 			if (__builtin_expect(tag & TT_DEFER, 0) && ctx->generic_paren_depth == 0)
 				DISPATCH(handle_defer_keyword);
@@ -4877,7 +4328,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			if (__builtin_expect((tag & TT_GOTO) && FEAT(F_DEFER | F_ZEROINIT), 0))
 				DISPATCH(handle_goto_keyword);
 
-			// ── Control-flow flag setting (loop, switch, if/else) ──
+			// Control-flow flag setting
 
 			if (tag & TT_LOOP) {
 				if (FEAT(F_DEFER)) {
@@ -4922,11 +4373,9 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 		} // end if (tag)
 
-		// _Generic paren tracking (only active inside _Generic expressions)
 		if (__builtin_expect(ctx->generic_paren_depth > 0, 0)) track_generic_paren(tok);
 
 		// Void function detection and return type capture at top level
-		// Fast-reject: only enter for tokens that could plausibly start a function
 		if (ctx->defer_depth == 0 &&
 		    (tag & (TT_TYPE | TT_QUALIFIER | TT_SKIP_DECL | TT_ATTR | TT_INLINE) ||
 		     equal(tok, "_Pragma") ||
@@ -4942,11 +4391,10 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		if (tag & TT_SUE) // struct/union/enum body
 			DISPATCH(handle_sue_body);
 
-		// Structural punctuation dispatch: { } ; :
-		// TT_STRUCTURAL is set on { } ; :
+		// Structural punctuation: { } ; :
 		if (tag & TT_STRUCTURAL) {
 			if (match_ch(tok, '{')) {
-				// First check: function definition detection at top level
+				// Function definition detection at top level
 				if (ctx->defer_depth == 0 && FEAT(F_DEFER)) {
 					bool is_func_def = false;
 					if (prev_toplevel_tok && equal(prev_toplevel_tok, ")"))
@@ -4973,9 +4421,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					next_func_ret_captured = false;
 					last_toplevel_paren = NULL;
 				}
-				// Always reset K&R tracking when entering a brace at file scope,
-				// even if defer is disabled — otherwise the shadow table guard
-				// (!last_toplevel_paren) stays false for the rest of the file.
+				// Reset K&R tracking at file scope to avoid stale shadow table guard
 				if (ctx->defer_depth == 0)
 					last_toplevel_paren = NULL;
 				tok = handle_open_brace(tok);
@@ -4984,9 +4430,6 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			if (match_ch(tok, '}')) {
 				tok = handle_close_brace(tok);
 				// Reset per-function flags when leaving a function body
-				// (defer_depth returns to 0). This prevents stale flags
-				// from the previous function bleeding into the next one
-				// if the function-definition detection fails to fire.
 				if (ctx->defer_depth == 0) {
 					ctx->current_func_has_setjmp = false;
 					ctx->current_func_has_vfork = false;
@@ -4994,7 +4437,6 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				}
 				continue;
 			}
-			// ; and :
 			char c = tok->loc[0];
 			if (c == ';') {
 				if (ctrl.pending) track_ctrl_semicolon();
@@ -5010,9 +4452,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			if (c == ':') {
 				if (ternary_depth > 0) {
 					ternary_depth--;
-					// fall through to default emit
 				} else if (ctx->generic_paren_depth > 0) {
-					// _Generic association colon — not a label
 				} else if (last_emitted &&
 				           (is_identifier_like(last_emitted) || last_emitted->kind == TK_NUM) &&
 				           ctx->struct_depth == 0 && ctx->defer_depth > 0) {
@@ -5022,10 +4462,8 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					continue;
 				}
 			}
-			// ':' that isn't a label — fall through to default emit
 		}
 
-		// Preprocessor directives
 		if (__builtin_expect(tok->kind == TK_PREP_DIR, 0)) {
 			emit_tok(tok);
 			tok = tok->next;
@@ -5033,7 +4471,6 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			continue;
 		}
 
-		// Paren tracking for control flow (parens without TT_STRUCTURAL are ( and ))
 		if (ctrl.pending && tok->len == 1) {
 			char c = tok->loc[0];
 			if (c == '(') track_ctrl_paren_open();
@@ -5041,27 +4478,20 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				track_ctrl_paren_close();
 		}
 
-		// Track previous token at top level for function detection
 		TRACK_TOPLEVEL_PAREN(tok);
 
-		// Warn on unprocessed 'orelse' — likely used in a context where it cannot
-		// be handled (inside parentheses, return expression, etc.)
-		// Skip inside struct/union/enum bodies where 'orelse' may be a field name,
-		// and after '.' or '->' where it's a member access (e.g. kf.orelse).
-		if (__builtin_expect((tag & TT_ORELSE) && FEAT(F_ORELSE) && !is_known_typedef(tok) &&
-				     ctx->struct_depth == 0 &&
-				     !(last_emitted && (last_emitted->tag & TT_MEMBER)), 0))
+		// Warn on unprocessed 'orelse' in unsupported context
+		if (__builtin_expect(FEAT(F_ORELSE) && is_orelse_keyword(tok) &&
+				     ctx->struct_depth == 0, 0))
 			error_tok(tok,
 				  "'orelse' cannot be used here (it must appear at the "
 				  "statement level in a declaration or bare expression)");
 
-		// Default: emit token as-is
 		emit_tok(tok);
 		tok = tok->next;
 	}
 
-	if (FEAT(F_FLATTEN)) // Close diagnostic pragma in flattening mode
-	{
+	if (FEAT(F_FLATTEN)) {
 		out_char('\n');
 		emit_system_header_diag_pop();
 	}
@@ -5071,23 +4501,16 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 	return 1;
 }
 
-// Preprocess + tokenize + transpile to a file path.
-// This is the original interface used by the CLI and library API.
 static int transpile(char *input_file, char *output_file) {
-	// Ensure keyword map is initialized before allocating preprocessor buffer.
-	// If init fails (OOM → longjmp in lib mode), we haven't allocated pp_buf yet.
 	if (!ctx->keyword_map.capacity) init_keyword_map();
 
-	// Run system preprocessor via pipe — no temp files
 	char *pp_buf = preprocess_with_cc(input_file);
 	if (!pp_buf) {
 		fprintf(stderr, "Preprocessing failed for: %s\n", input_file);
 		return 0;
 	}
 
-	// Tokenize directly from the in-memory buffer (takes ownership of pp_buf)
 	Token *tok = tokenize_buffer(input_file, pp_buf);
-	// pp_buf is now owned by the tokenizer (freed in tokenizer_teardown)
 
 	if (!tok) {
 		fprintf(stderr, "Failed to tokenize preprocessed output\n");
@@ -5116,12 +4539,10 @@ PRISM_API void prism_reset(void) {
 	typedef_table_reset();
 	tokenizer_teardown(false);
 
-	// defer_stack and entries are arena-allocated; just reset pointers.
 	defer_stack = NULL;
 	ctx->defer_depth = 0;
 	defer_stack_capacity = 0;
 
-	// label_table.labels is arena-allocated.
 	hashmap_zero(&label_table.name_map);
 	label_table.labels = NULL;
 	label_table.count = 0;
@@ -5129,7 +4550,6 @@ PRISM_API void prism_reset(void) {
 
 	system_includes_reset();
 
-	// stmt_expr_levels is arena-allocated; just reset pointers.
 	stmt_expr_levels = NULL;
 	ctx->stmt_expr_count = 0;
 	stmt_expr_capacity = 0;
@@ -5144,7 +4564,6 @@ PRISM_API void prism_reset(void) {
 	}
 }
 
-// Apply PrismFeatures to the global context
 static void apply_features(PrismFeatures features) {
 	ctx->features = features_to_bits(features);
 	ctx->extra_compiler = features.compiler;
@@ -5166,7 +4585,6 @@ static void error_recovery_init(void) {
 	ctx->error_jmp_set = true;
 }
 
-// Build a PrismResult from the error state after longjmp, then clean up.
 static PrismResult error_recovery_result(void) {
 	ctx->error_jmp_set = false;
 	PrismResult r = {.status = PRISM_ERR_SYNTAX,
@@ -5185,7 +4603,6 @@ static PrismResult error_recovery_result(void) {
 }
 #endif
 
-// Transpile tokens to an in-memory buffer and return a PrismResult.
 static PrismResult transpile_to_result(Token *tok) {
 	PrismResult result = {0};
 	size_t memlen = 0;
@@ -5262,9 +4679,7 @@ cleanup:
 }
 
 #ifdef PRISM_LIB_MODE
-// Transpile already-preprocessed source text (no fork/exec of cc -E).
-// The caller retains ownership of `source`; it is copied internally.
-// `filename` is used only for diagnostics and may be NULL.
+// Transpile already-preprocessed source text (no cc -E)
 PRISM_API PrismResult prism_transpile_source(const char *source, const char *filename,
                                              PrismFeatures features) {
 	prism_ctx_init();
@@ -5309,12 +4724,8 @@ src_cleanup:
 
 #ifndef PRISM_LIB_MODE
 
-// Transpile a single source file and pipe the output directly to the compiler.
-// No temp files for transpiled output. The compiler reads from stdin.
-// compile_argv must contain the full argv for the compiler (without input file — uses stdin via "-").
-// Returns the compiler's exit status, or -1 on error.
+// Transpile and pipe output directly to the compiler (no temp files)
 static int transpile_and_compile(char *input_file, char **compile_argv, bool verbose) {
-	// Preprocess via pipe
 	char *pp_buf = preprocess_with_cc(input_file);
 	if (!pp_buf) {
 		fprintf(stderr, "Preprocessing failed for: %s\n", input_file);
@@ -5328,7 +4739,6 @@ static int transpile_and_compile(char *input_file, char **compile_argv, bool ver
 		return -1;
 	}
 
-	// Set up pipe: prism writes transpiled output → compiler reads from stdin
 	int pipefd[2];
 	if (pipe(pipefd) == -1) {
 		perror("pipe");
@@ -5342,7 +4752,6 @@ static int transpile_and_compile(char *input_file, char **compile_argv, bool ver
 		fprintf(stderr, "\n");
 	}
 
-	// Set up file actions: child stdin ← pipe read end
 	posix_spawn_file_actions_t fa;
 	posix_spawn_file_actions_init(&fa);
 	posix_spawn_file_actions_addclose(&fa, pipefd[1]);
@@ -5362,7 +4771,6 @@ static int transpile_and_compile(char *input_file, char **compile_argv, bool ver
 		return -1;
 	}
 
-	// Parent: write transpiled output to pipe
 	FILE *fp = fdopen(pipefd[1], "w");
 	if (!fp) {
 		close(pipefd[1]);
@@ -5372,7 +4780,6 @@ static int transpile_and_compile(char *input_file, char **compile_argv, bool ver
 	}
 
 	transpile_tokens(tok, fp);
-	// out_close() inside transpile_tokens closes fp → closes pipe → EOF to compiler
 
 	return wait_for_child(pid);
 }
@@ -5394,7 +4801,6 @@ static noreturn void die(char *message) {
 	exit(1);
 }
 
-// Windows: defined in windows.c via GetModuleFileNameA
 #ifndef _WIN32
 static bool get_self_exe_path(char *buf, size_t bufsize) {
 #if defined(__APPLE__)
@@ -5450,7 +4856,6 @@ static void check_path_shadow(const char *install_path) {
 	}
 	pclose(fp);
 	if (first_hit[0] && strcmp(first_hit, install_path) != 0) {
-		// Resolve symlinks for both paths before comparing
 		char resolved_hit[PATH_MAX], resolved_install[PATH_MAX];
 		char *rh = realpath(first_hit, resolved_hit);
 		char *ri = realpath(install_path, resolved_install);
@@ -5469,13 +4874,11 @@ static int install(char *self_path) {
 	const char *install_path = get_install_path();
 	printf("[prism] Installing to %s...\n", install_path);
 
-	// Ensure the install directory exists (windows.c creates %LOCALAPPDATA%\prism, unix no-op)
 	if (!ensure_install_dir(install_path)) {
 		fprintf(stderr, "[prism] Failed to create install directory\n");
 		return 1;
 	}
 
-	// Resolve self_path to actual executable path only if the given path doesn't exist
 	char resolved_path[PATH_MAX];
 	struct stat st;
 	if (stat(self_path, &st) != 0 && get_self_exe_path(resolved_path, sizeof(resolved_path)))
@@ -5486,7 +4889,6 @@ static int install(char *self_path) {
 		return 0;
 	}
 
-	// Try direct copy first (avoids sudo if we have permission)
 	FILE *input = fopen(self_path, "rb");
 	FILE *output = input ? fopen(install_path, "wb") : NULL;
 
@@ -5504,7 +4906,7 @@ static int install(char *self_path) {
 		fclose(output);
 		chmod(install_path, 0755); // no-op on Windows (shimmed)
 		printf("[prism] Installed!\n");
-		// On Windows, add install directory to user PATH if not already there
+		// Add install directory to user PATH on Windows
 		{
 			char dir[PATH_MAX];
 			strncpy(dir, install_path, PATH_MAX - 1);
@@ -5584,13 +4986,9 @@ static bool str_startswith(const char *s, const char *prefix) {
 	return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
-// Check if the system compiler is clang.
-// On macOS, cc/gcc are always Apple Clang (hardlinked, not symlinked,
-// so realpath doesn't help).  On other platforms, check the basename.
+// Check if the system compiler is clang
 static bool cc_is_clang(const char *cc) {
 #ifdef __APPLE__
-	// On macOS, the default "cc" is always Apple Clang.
-	// Only return false if the user explicitly set a non-clang compiler.
 	if (!cc || !*cc || strcmp(cc, "cc") == 0 || strcmp(cc, "gcc") == 0) return true;
 #endif
 	if (!cc || !*cc) return false;
@@ -5629,10 +5027,9 @@ static void print_help(void) {
 }
 
 static Cli cli_parse(int argc, char **argv) {
-	bool passthrough = false; // -E passthrough detected inline
+	bool passthrough = false;
 	Cli cli = {.features = prism_defaults()};
 
-	// Get compiler from environment (avoid infinite recursion if CC=prism)
 	char *env_cc = getenv("PRISM_CC");
 	if (!env_cc || !*env_cc || is_prism_cc(env_cc)) {
 		env_cc = getenv("CC");
@@ -5644,27 +5041,24 @@ static Cli cli_parse(int argc, char **argv) {
 		char *a = argv[i];
 
 		if (a[0] == '-' &&
-		    a[1] !=
-			'\0') // Fast path: Reject prism flag prefixes first, then fall through to CC passthrough immediately.
+		a[1] !=
+			'\0')
 		{
-			char c1 = a[1]; // Single-letter flags that need special handling
+			char c1 = a[1];
 
-			if (c1 == 'o') // -o: intercept output path
-			{
+			if (c1 == 'o') {
 				if (a[2]) cli.output = a + 2;
 				else if (i + 1 < argc) cli.output = argv[++i];
 				continue;
 			}
 
-			if (c1 == 'c' && !a[2]) // -c: track compile-only
-			{
+			if (c1 == 'c' && !a[2]) {
 				cli.compile_only = true;
 				CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
 				continue;
 			}
 
-			if (c1 == 'E' && !a[2]) // -E: passthrough mode
-			{
+			if (c1 == 'E' && !a[2]) {
 				passthrough = true;
 				CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
 				continue;
@@ -5675,8 +5069,7 @@ static Cli cli_parse(int argc, char **argv) {
 				exit(0);
 			}
 
-			if (c1 == '-') // -- prefix: prism options
-			{
+			if (c1 == '-') {
 				if (!strcmp(a, "--help")) {print_help(); exit(0);}
 				if (!strcmp(a, "--version")) { printf("prism %s\n", PRISM_VERSION); exit(0);}
 				if (str_startswith(a, "--prism-cc=")) { cli.cc = a + 11; continue; }
@@ -5687,8 +5080,7 @@ static Cli cli_parse(int argc, char **argv) {
 				continue;
 			}
 
-			if (c1 == 'f') // check for prism feature flags, else CC passthrough
-			{
+			if (c1 == 'f') {
 				if (!strcmp(a, "-fno-defer")) { cli.features.defer = false; continue; }
 				if (!strcmp(a, "-fno-zeroinit")) { cli.features.zeroinit = false; continue; }
 				if (!strcmp(a, "-fno-orelse")) { cli.features.orelse = false; continue; }
@@ -5697,13 +5089,10 @@ static Cli cli_parse(int argc, char **argv) {
 				if (!strcmp(a, "-fflatten-headers")) { cli.features.flatten_headers = true; continue; }
 				if (!strcmp(a, "-fno-flatten-headers")) { cli.features.flatten_headers = false; continue; }
 				
-				// Not a prism -f flag — pass through
 				CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
 				continue;
 			}
 
-			// All other -X flags (e.g. -D, -I, -W, -g, -O, -m, -std, -l, -L, -s, etc.)
-			// are CC passthrough — skip all prism checks entirely
 			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
 			continue;
 		}
@@ -5712,29 +5101,24 @@ static Cli cli_parse(int argc, char **argv) {
 		if (!strcmp(a, "transpile")) { cli.mode = CLI_EMIT; continue; }
 		if (!strcmp(a, "install")) { cli.mode = CLI_INSTALL; continue; }
 
-		// Source files (.c/.i) — transpile unless -E passthrough
 		if ((has_ext(a, ".c") || has_ext(a, ".i")) && !passthrough) {
 			CLI_PUSH(cli.sources, cli.source_count, cli.source_cap, a);
 			continue;
 		}
 
-		CLI_PUSH(cli.cc_args,
-			 cli.cc_arg_count,
-			 cli.cc_arg_cap,
-			 a); // pass through to CC (object files, libraries, etc.)
+		CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
 	}
 
 	return cli;
 }
 
 static void add_warn_suppress(ArgvBuilder *ab, bool clang, bool msvc) {
-	if (msvc) // suppress common transpiler-generated warnings
-	{
-		argv_builder_add(ab, "/wd4100"); // unreferenced formal parameter
-		argv_builder_add(ab, "/wd4189"); // local variable initialized but not referenced
-		argv_builder_add(ab, "/wd4244"); // possible loss of data (implicit narrowing)
-		argv_builder_add(ab, "/wd4267"); // conversion from 'size_t' to 'int'
-		argv_builder_add(ab, "/wd4068"); // unknown pragma (GCC diagnostic pragmas)
+	if (msvc) {
+		argv_builder_add(ab, "/wd4100");
+		argv_builder_add(ab, "/wd4189");
+		argv_builder_add(ab, "/wd4244");
+		argv_builder_add(ab, "/wd4267");
+		argv_builder_add(ab, "/wd4068");
 		return;
 	}
 	static const char *w[] = {
@@ -5909,25 +5293,19 @@ static int compile_sources(Cli *cli) {
 	char temp_exe[PATH_MAX];
 	make_run_temp(temp_exe, sizeof(temp_exe), cli->mode);
 
-	// Use GCC linemarker format when -fpreprocessed will be passed to the compiler
 	use_linemarkers = FEAT(F_FLATTEN) && !clang && !msvc;
 
 	if (cli->source_count == 1 && !msvc) {
-		// Single source: pipe-based transpile+compile (no temp files)
-		// MSVC cl.exe cannot read C from stdin, so it always uses the temp-file path below.
 		ArgvBuilder ab;
 		argv_builder_init(&ab);
 		argv_builder_add(&ab, compiler);
 
-		// Tell cc the input is already preprocessed (flatten mode).
-		// Clang does not support -fpreprocessed.
 		argv_builder_add(&ab, "-x");
 		argv_builder_add(&ab, "c");
 		if (FEAT(F_FLATTEN) && !clang) argv_builder_add(&ab, "-fpreprocessed");
 		argv_builder_add(&ab, "-");
 
-		if (cli->cc_arg_count > 0) // Reset language so subsequent args aren't forced to C.
-		{
+		if (cli->cc_arg_count > 0) {
 			argv_builder_add(&ab, "-x");
 			argv_builder_add(&ab, "none");
 		}
@@ -5941,7 +5319,6 @@ static int compile_sources(Cli *cli) {
 		if (cli->verbose) fprintf(stderr, "[prism] Transpiling %s (pipe → cc)\n", cli->sources[0]);
 		status = transpile_and_compile((char *)cli->sources[0], argv_cc, cli->verbose);
 	} else {
-		// Multi-source: transpile to temp files, then compile together
 		char **temps = calloc(cli->source_count, sizeof(char *));
 		if (!temps) die("Out of memory");
 
@@ -6005,7 +5382,6 @@ static int compile_sources(Cli *cli) {
 
 int main(int argc, char **argv) {
 #ifndef _WIN32
-	// Ignore SIGPIPE so that pipe writes return EPIPE instead of killing the process.
 	signal(SIGPIPE, SIG_IGN);
 #endif
 	int status = 0;
@@ -6058,8 +5434,6 @@ int main(int argc, char **argv) {
 	else
 		status = compile_sources(&cli);
 
-	// free(cli.sources); OS takes care of cleanup...
-	// free(cli.cc_args);
 	return status;
 }
 
