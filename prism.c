@@ -111,6 +111,7 @@ typedef struct {
 	Token *end;	   // First token after the type specifier
 	bool saw_type;	   // True if a type was recognized
 	bool is_struct;	   // True if struct/union/enum type
+	bool is_enum;	   // True if enum type specifically
 	bool is_typedef;   // True if user-defined typedef
 	bool is_vla;	   // True if VLA typedef or struct with VLA member
 	bool has_typeof;   // True if typeof/typeof_unqual (cannot determine VLA at transpile-time)
@@ -118,6 +119,7 @@ typedef struct {
 	bool has_register; // True if register storage class
 	bool has_volatile; // True if volatile qualifier
 	bool has_const;	   // True if const qualifier
+	bool has_void;	   // True if void or void typedef
 } TypeSpecResult;
 
 typedef enum {
@@ -292,12 +294,12 @@ static Token *emit_expr_to_semicolon(Token *tok);
 static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma);
 static Token *emit_return_body(Token *tok, Token *stop);
 static Token *try_zero_init_decl(Token *tok);
-static Token *skip_pragma_operators(Token *tok);
+static Token *decl_noise(Token *tok, bool emit);
+static Token *walk_balanced(Token *tok, bool emit);
+#define skip_noise(tok) decl_noise(tok, false)
 static inline void out_char(char c);
 static inline void out_str(const char *s, int len);
-static Token *skip_balanced(Token *tok, char open, char close);
-static Token *skip_gnu_attributes(Token *tok);
-static Token *skip_c23_attr(Token *tok);
+#define skip_balanced(tok, o, c) walk_balanced((tok), false)
 static bool cc_is_msvc(const char *cc);
 
 // Emit space-separated token range [start, end). First token has no leading space.
@@ -316,14 +318,10 @@ static inline void clear_func_ret_type(void) {
 // Skip trailing declarator parts (attrs, array dims, param lists) until '{' or ';'
 static Token *skip_declarator_suffix(Token *tok) {
 	while (tok && tok->kind != TK_EOF && !match_ch(tok, '{') && !match_ch(tok, ';')) {
-		if (tok->tag & TT_ATTR)
-			tok = skip_gnu_attributes(tok);
-		else if (is_c23_attr(tok))
-			tok = skip_c23_attr(tok);
-		else if (tok->flags & TF_OPEN)
-			tok = tok->match ? tok->match->next : tok;
-		else
-			break;
+		Token *next = skip_noise(tok);
+		if (next != tok) { tok = next; continue; }
+		if (tok->flags & TF_OPEN) tok = walk_balanced(tok, false);
+		else break;
 	}
 	return tok;
 }
@@ -406,33 +404,7 @@ static Token *skip_to_semicolon(Token *tok) {
 	return tok;
 }
 
-static inline Token *skip_balanced(Token *tok, char open, char close) {
-	(void)open; (void)close;
-	return tok->match ? tok->match->next : tok;
-}
 
-// Skip GNU/MSVC-style attributes: __attribute__((...)), __declspec(...)
-static Token *skip_gnu_attributes(Token *tok) {
-	while (tok && (tok->tag & TT_ATTR)) {
-		tok = tok->next;
-		if (tok && match_ch(tok, '(')) tok = tok->match->next;
-	}
-	return tok;
-}
-
-// Skip a single C23 [[ ... ]] attribute. Assumes tok is at first '['.
-static inline Token *skip_c23_attr(Token *tok) {
-	return tok->match->next;
-}
-
-static Token *skip_all_attributes(Token *tok) {
-	while (tok && tok->kind != TK_EOF) {
-		if (tok->tag & TT_ATTR) tok = skip_gnu_attributes(tok);
-		else if (is_c23_attr(tok)) tok = skip_c23_attr(tok);
-		else break;
-	}
-	return tok;
-}
 
 static void out_buf_grow(void) {
 	out_buf_cap *= 2;
@@ -712,7 +684,6 @@ static bool is_inside_attribute(Token *tok) {
 
 // Cold path: emit C23 float suffix normalization
 static bool __attribute__((noinline)) emit_tok_special(Token *tok) {
-	if (tok->kind != TK_NUM) return false;
 	const char *replacement;
 	int suffix_len = get_extended_float_suffix(tok->loc, tok->len, &replacement);
 	if (suffix_len > 0) {
@@ -890,11 +861,11 @@ static void typedef_set_index(char *name, int len, int index) {
 static void
 typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool is_vla, bool is_void) {
 	// Skip duplicate re-definitions at the same scope (valid C11 §6.7/3).
-	if (kind == TDK_TYPEDEF) {
+	if (kind == TDK_TYPEDEF || kind == TDK_ENUM_CONST) {
 		int existing = typedef_get_index(name, len);
 		if (existing >= 0) {
 			TypedefEntry *prev = &typedef_table.entries[existing];
-			if (prev->scope_depth == scope_depth && !prev->is_shadow && !prev->is_enum_const)
+			if (prev->scope_depth == scope_depth && !prev->is_shadow)
 				return;
 		}
 	}
@@ -939,14 +910,8 @@ static void parse_enum_constants(Token *tok, int scope_depth) {
 	tok = tok->next; // Skip '{'
 
 	while (tok && tok->kind != TK_EOF && !match_ch(tok, '}')) {
-		if (tok->tag & TT_ATTR) {
-			tok = skip_gnu_attributes(tok);
-			continue;
-		}
-		if (is_c23_attr(tok)) {
-			tok = skip_c23_attr(tok);
-			continue;
-		}
+		Token *next = skip_noise(tok);
+		if (next != tok) { tok = next; continue; }
 
 		if (is_valid_varname(tok)) {
 			typedef_add_enum_const(tok->loc, tok->len, scope_depth);
@@ -1012,9 +977,7 @@ static Token *find_boundary_comma(Token *tok) {
 					if (inside && !(inside->tag & (TT_TYPE | TT_SUE | TT_TYPEOF | TT_QUALIFIER))
 					    && !is_typedef_like(inside) && !is_c23_attr(inside))
 						return tok;
-				} else if (match_ch(n, '*') || (n->tag & TT_QUALIFIER)) {
-					return tok;
-				} else if (equal(n, "_Pragma") || is_c23_attr(n)) {
+				} else if (match_ch(n, '*') || (n->tag & TT_QUALIFIER) || (n->tag & TT_ATTR) || is_c23_attr(n)) {
 					return tok;
 				} else if (is_valid_varname(n) && !(n->tag & (TT_TYPE | TT_SUE | TT_TYPEOF))) {
 					if (n->next && match_ch(n->next, '(')) {
@@ -1052,21 +1015,11 @@ static bool is_typedef_like(Token *tok) {
 static Token *find_struct_body_brace(Token *tok) {
 	Token *t = tok->next;
 	while (t && t->kind != TK_EOF) {
-		if (equal(t, "_Pragma") && t->next && match_ch(t->next, '(')) {
-			t = skip_pragma_operators(t);
-			continue;
-		}
-		if (t->kind == TK_PREP_DIR) {
-			t = t->next;
-			continue;
-		}
+		Token *next = skip_noise(t);
+		if (next != t) { t = next; continue; }
 		if (is_valid_varname(t) || (t->tag & TT_QUALIFIER)) {
 			t = t->next;
-		} else {
-			Token *next = skip_all_attributes(t);
-			if (next == t) break;
-			t = next;
-		}
+		} else break;
 	}
 	return (t && match_ch(t, '{')) ? t : NULL;
 }
@@ -1088,7 +1041,7 @@ static inline Token *skip_sue_generic(Token *tok) {
 // Check if tok is a goto label (ident : not :: not case/default/ternary).
 static inline Token *check_label(Token *tok, Token *prev, int *ternary_depth) {
 	if (!is_identifier_like(tok)) return NULL;
-	Token *t = skip_all_attributes(tok->next);
+	Token *t = skip_noise(tok->next);
 	if (!t || !match_ch(t, ':')) return NULL;
 	if (t->next && match_ch(t->next, ':')) return NULL;
 	if (prev && match_ch(prev, '?')) return NULL;
@@ -1148,7 +1101,7 @@ static bool is_var_declaration(Token *type_end) {
 			Token *after_stmt_expr = skip_balanced(after_eq, '(', ')');
 			while (after_stmt_expr && after_stmt_expr->kind != TK_EOF &&
 			       (after_stmt_expr->tag & TT_ATTR))
-				after_stmt_expr = skip_gnu_attributes(after_stmt_expr);
+				after_stmt_expr = skip_noise(after_stmt_expr);
 			return match_ch(after_stmt_expr, ',');
 		}
 		return true;
@@ -1166,7 +1119,24 @@ static inline bool is_orelse_keyword(Token *tok) {
 static void emit_type_stripped(Token *start, Token *end, bool strip_const) {
 	for (Token *t = start; t != end; t = t->next) {
 		if (strip_const && (t->tag & TT_CONST)) continue;
-		if (match_ch(t, '{')) { t = skip_balanced(t, '{', '}'); if (t == end) break; }
+		if (match_ch(t, '{')) {
+			Token *kw = NULL;
+			for (Token *s = start; s != t; s = s->next)
+				if (s->tag & TT_SUE) kw = s;
+			bool keep = false;
+			if (kw && !is_enum_kw(kw)) {
+				keep = true;
+				for (Token *u = kw->next; u && u != t; u = u->next) {
+					if (is_valid_varname(u) && !(u->tag & (TT_QUALIFIER | TT_ATTR | TT_TYPEOF))) {
+						keep = false; break;
+					}
+				}
+			}
+			if (!keep) {
+				t = walk_balanced(t, false);
+				if (t == end) break;
+			}
+		}
 		emit_tok(t);
 	}
 }
@@ -1174,8 +1144,6 @@ static void emit_type_stripped(Token *start, Token *end, bool strip_const) {
 static inline bool is_file_storage_keyword(Token *tok) {
 	return tok->tag & (TT_STORAGE | TT_TYPEDEF);
 }
-
-static Token *walk_balanced(Token *tok, bool emit);
 
 // Emit expression tokens to ';', stop token, or 'orelse' (if check_orelse).
 static Token *emit_expr_to_stop(Token *tok, Token *stop, bool check_orelse) {
@@ -1191,9 +1159,7 @@ static Token *emit_expr_to_stop(Token *tok, Token *stop, bool check_orelse) {
 
 // Returns true if 'raw' is followed by a declaration context (type keyword, typedef, *, etc.)
 static bool is_raw_declaration_context(Token *after_raw) {
-	while (is_c23_attr(after_raw)) after_raw = skip_c23_attr(after_raw);
-	after_raw = skip_pragma_operators(after_raw);
-	while (after_raw && after_raw->kind == TK_PREP_DIR) after_raw = after_raw->next;
+	after_raw = skip_noise(after_raw);
 	return after_raw && (is_type_keyword(after_raw) || is_known_typedef(after_raw) ||
 			     match_ch(after_raw, '*') || (after_raw->tag & (TT_QUALIFIER | TT_SUE)));
 }
@@ -1235,7 +1201,7 @@ static Token *backward_goto_skips_decl(Token *goto_tok, LabelInfo *info) {
 		if (is_stmt_start) {
 			Token *s = t;
 			if ((s->flags & TF_RAW) && !is_known_typedef(s)) s = s->next;
-			if (s && equal(s, "_Pragma")) s = skip_pragma_operators(s);
+			if (s) s = skip_noise(s);
 			if (s && !is_file_storage_keyword(s)) {
 				TypeSpecResult type = parse_type_specifier(s);
 				if (type.saw_type && is_var_declaration(type.end)) return t;
@@ -1281,7 +1247,7 @@ static GotoSkipResult goto_skips_check(Token *goto_tok, LabelInfo *info, bool ch
 			Token *s = tok;
 			bool has_raw = false;
 			if ((s->flags & TF_RAW) && !is_known_typedef(s)) { has_raw = true; s = s->next; }
-			if (s && equal(s, "_Pragma")) s = skip_pragma_operators(s);
+			if (s) s = skip_noise(s);
 			if (s && !is_file_storage_keyword(s)) {
 				TypeSpecResult type = parse_type_specifier(s);
 				if (type.saw_type && is_var_declaration(type.end)) {
@@ -1322,154 +1288,85 @@ static bool is_knr_params(Token *after_paren, Token *brace) {
 	return saw_any && t == brace;
 }
 
-static Token *skip_func_specifiers(Token *tok) {
-	Token *next;
+static Token *skip_pointers(Token *tok, bool *is_void) {
 	while (tok && tok->kind != TK_EOF) {
-		if (tok->tag & (TT_QUALIFIER | TT_SKIP_DECL | TT_INLINE)) tok = tok->next;
-		else if (equal(tok, "_Pragma")) tok = skip_pragma_operators(tok);
-		else if ((next = skip_all_attributes(tok)) != tok) tok = next;
-		else break;
+		Token *next = skip_noise(tok);
+		if (next != tok) { tok = next; continue; }
+		if (match_ch(tok, '*') || (tok->tag & TT_QUALIFIER)) {
+			tok = tok->next;
+			if (is_void) *is_void = false;
+		} else break;
 	}
 	return tok;
 }
 
-// Check if token starts a void function declaration.
-static bool is_void_function_decl(Token *tok) {
-	tok = skip_func_specifiers(tok);
-	if (!tok) return false;
-
-	if (tok->tag & TT_TYPEOF) {
-		Token *t = tok->next;
-		if (t && match_ch(t, '(') && t->next && equal(t->next, "void") && t->next->next && match_ch(t->next->next, ')'))
-			tok = t->next->next->next;
-		else
-			return false;
-	} else if (equal(tok, "void") || is_void_typedef(tok)) {
-		tok = tok->next;
-	} else {
-		return false;
-	}
-
-	if (tok && match_ch(tok, '*')) return false;
-
-	tok = skip_func_specifiers(tok);
-
-	// Handle simple case: void foo()
-	if (tok && is_valid_varname(tok) && tok->next && match_ch(tok->next, '(')) return true;
-
-	// Parenthesized case: void (foo)() or void (__attr foo)()
-	if (tok && match_ch(tok, '(')) {
-		Token *inner = tok->next;
-		while (inner && inner->kind != TK_EOF && (inner->tag & TT_ATTR)) {
-			inner = skip_gnu_attributes(inner);
-		}
-		if (inner && is_valid_varname(inner) && inner->next && match_ch(inner->next, ')')) {
-			Token *after = inner->next->next;
-			return after && match_ch(after, '(');
-		}
-	}
-
-	return false;
-}
-
-// Capture non-void function return type for defer return variable.
-static bool try_capture_func_return_type(Token *tok) {
-	// Skip storage class specifiers, function specifiers, and attributes.
+// Captures function return type. Returns 1 if void function, 2 if captured, 0 if not function.
+static int capture_function_return_type(Token *tok) {
 	while (tok && tok->kind != TK_EOF) {
-		if ((tok->tag & (TT_SKIP_DECL | TT_INLINE)) || 
-		    equal(tok, "_Noreturn") || equal(tok, "noreturn")) {
-			tok = tok->next;
-			continue;
+		if ((tok->tag & (TT_SKIP_DECL | TT_INLINE)) || equal(tok, "_Noreturn") || equal(tok, "noreturn")) {
+			tok = tok->next; continue;
 		}
-		if (equal(tok, "_Pragma")) {
-			tok = skip_pragma_operators(tok);
-			continue;
-		}
-		Token *next = skip_all_attributes(tok);
+		Token *next = skip_noise(tok);
 		if (next == tok) break;
 		tok = next;
 	}
-	if (!tok || tok->kind == TK_EOF) return false;
+	if (!tok || tok->kind == TK_EOF) return 0;
 
 	Token *type_start = tok;
+	bool is_void = false;
 
-	// void return type — not captured unless it's void* or void(complex_decl).
 	if (equal(tok, "void") || is_void_typedef(tok)) {
-		Token *after_void = tok->next;
-		if (after_void && !match_ch(after_void, '*') && !match_ch(after_void, '('))
-			return false;
-	}
-	if (tok->tag & TT_TYPEOF) {
+		Token *after = skip_noise(tok->next);
+		if (after && !match_ch(after, '*') && !match_ch(after, '(')) is_void = true;
+	} else if (tok->tag & TT_TYPEOF) {
 		Token *t = tok->next;
-		if (t && match_ch(t, '(') && t->next && equal(t->next, "void") && t->next->next &&
-		    match_ch(t->next->next, ')'))
-			return false;
+		if (t && match_ch(t, '(') && t->next && equal(t->next, "void") && t->next->next && match_ch(t->next->next, ')')) {
+			Token *after = skip_noise(t->next->next->next);
+			if (after && !match_ch(after, '*') && !match_ch(after, '(')) is_void = true;
+		}
 	}
 
-	// Parse the type specifier (int, struct Foo, size_t, typeof(...), etc.)
 	TypeSpecResult type = parse_type_specifier(tok);
-	if (!type.saw_type) return false;
-
+	if (!type.saw_type) return 0;
 	tok = type.end;
 
-	// Reject anonymous struct/union/enum — re-emitting creates a second incompatible type.
 	if (type.is_struct) {
 		for (Token *t = type_start; t && t != tok && t->kind != TK_EOF; t = t->next)
-			if (match_ch(t, '{')) return false;
+			if (match_ch(t, '{')) return 0;
 	}
 
-	// Skip pointer decorations and qualifiers: *, const, volatile, restrict
-	while (tok && tok->kind != TK_EOF &&
-	       (match_ch(tok, '*') || (tok->tag & TT_QUALIFIER) ||
-		equal(tok, "restrict") || equal(tok, "__restrict") || equal(tok, "__restrict__")))
-		tok = tok->next;
+	tok = skip_pointers(tok, &is_void);
 
-	// Skip any trailing attributes between pointer/qualifiers and name
-	tok = skip_all_attributes(tok);
-
-	// Simple case: function name followed by (
 	if (tok && is_valid_varname(tok) && tok->next && match_ch(tok->next, '(')) {
+		if (is_void) return 1;
 		ctx->func_ret_type_start = type_start;
 		ctx->func_ret_type_end = tok;
 		ctx->func_ret_type_suffix_start = ctx->func_ret_type_suffix_end = NULL;
-		return true;
+		return 2;
 	}
 
-	// Complex declarator: TYPE (* FUNCNAME(PARAMS))(ARGS) or deeper nesting.
 	if (tok && match_ch(tok, '(')) {
 		Token *outer_open = tok;
-		Token *inner = tok->next;
-		while (inner && inner->kind != TK_EOF &&
-		       (match_ch(inner, '*') || (inner->tag & (TT_CONST | TT_VOLATILE)) ||
-			equal(inner, "restrict") || equal(inner, "__restrict") ||
-			equal(inner, "__restrict__") || (inner->tag & TT_ATTR))) {
-			inner = (inner->tag & TT_ATTR) ? skip_gnu_attributes(inner) : inner->next;
-		}
-		// Recurse through nested declarator groups
+		Token *inner = skip_pointers(tok->next, &is_void);
+		
 		while (inner && match_ch(inner, '(')) {
-			inner = inner->next;
-			while (inner && inner->kind != TK_EOF &&
-			       (match_ch(inner, '*') || (inner->tag & (TT_CONST | TT_VOLATILE)) ||
-				equal(inner, "restrict") || equal(inner, "__restrict") ||
-				equal(inner, "__restrict__") || (inner->tag & TT_ATTR))) {
-				inner = (inner->tag & TT_ATTR) ? skip_gnu_attributes(inner) : inner->next;
-			}
+			inner = skip_pointers(inner->next, NULL);
 		}
 		if (inner && is_valid_varname(inner) && inner->next && match_ch(inner->next, '(')) {
 			Token *after_params = skip_balanced(inner->next, '(', ')');
 			if (after_params && match_ch(after_params, ')')) {
 				Token *decl_end = skip_balanced(outer_open, '(', ')');
 				decl_end = skip_declarator_suffix(decl_end);
+				if (is_void) return 1;
 				ctx->func_ret_type_start = type_start;
 				ctx->func_ret_type_end = inner;
 				ctx->func_ret_type_suffix_start = after_params;
 				ctx->func_ret_type_suffix_end = decl_end;
-				return true;
+				return 2;
 			}
 		}
 	}
-
-	return false;
+	return 0;
 }
 
 // Emit captured return type. Complex declarators get a typedef.
@@ -1515,8 +1412,8 @@ static bool array_size_is_vla(Token *open_bracket) {
 			continue;
 		}
 		if (tok->tag & TT_GENERIC) return true;
-		if (equal(tok, "_Pragma")) { tok = skip_pragma_operators(tok); continue; }
-		if (tok->kind == TK_PREP_DIR) { tok = tok->next; continue; }
+		Token *next = skip_noise(tok);
+		if (next != tok) { tok = next; continue; }
 
 		// sizeof/alignof: skip argument but check for VLA typedef and inner VLA types.
 		if (is_sizeof_like(tok)) {
@@ -1566,13 +1463,16 @@ static bool array_size_is_vla(Token *open_bracket) {
 					tok = skip_balanced(tok, '{', '}');
 			} else if (tok != close) {
 				// Unparenthesized sizeof/alignof: skip prefix ops, pragmas, operand, postfix.
-				while (tok != close &&
-				       (match_ch(tok, '*') || match_ch(tok, '&') || match_ch(tok, '!') ||
-				        match_ch(tok, '~') || equal(tok, "++") || equal(tok, "--") ||
-				        match_ch(tok, '+') || match_ch(tok, '-') ||
-				        is_sizeof_like(tok) || equal(tok, "_Pragma") || tok->kind == TK_PREP_DIR)) {
-					if (equal(tok, "_Pragma")) { tok = skip_pragma_operators(tok); continue; }
-					tok = tok->next;
+				while (tok != close) {
+					Token *next = skip_noise(tok);
+					if (next != tok) { tok = next; continue; }
+					if (match_ch(tok, '*') || match_ch(tok, '&') || match_ch(tok, '!') ||
+					    match_ch(tok, '~') || equal(tok, "++") || equal(tok, "--") ||
+					    match_ch(tok, '+') || match_ch(tok, '-') || is_sizeof_like(tok)) {
+						tok = tok->next;
+						continue;
+					}
+					break;
 				}
 				if (tok != close) {
 					if (tok->flags & TF_OPEN) {
@@ -1585,7 +1485,7 @@ static bool array_size_is_vla(Token *open_bracket) {
 					}
 				}
 				while (tok != close) {
-					if (match_ch(tok, '.') || equal(tok, "->")) {
+					if (tok->tag & TT_MEMBER) {
 						tok = tok->next;
 						if (tok != close) tok = tok->next;
 					} else if (tok->flags & TF_OPEN)
@@ -1596,8 +1496,7 @@ static bool array_size_is_vla(Token *open_bracket) {
 			continue;
 		}
 
-		if (equal(tok, "offsetof") || equal(tok, "__builtin_offsetof")) return true;
-		if (equal(tok, "->") || match_ch(tok, '.')) return true;
+		if (tok->tag & TT_MEMBER) return true;
 		if (is_valid_varname(tok) && !is_known_enum_const(tok) && !is_type_keyword(tok)) return true;
 		tok = tok->next;
 	}
@@ -1645,38 +1544,12 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 	}
 
 	// Check if the base type is void (or a typedef alias for void).
-	// Scan tokens from type_start to tok for 'void' keyword or known void typedef.
-	// excludes struct/union/enum, typeof, _Atomic(...), function pointers.
-	bool base_is_void = false;
-	Token *t = type_start;
-	while (t && t != tok) {
-		if (t->tag & TT_TYPEOF) {
-			t = t->next;
-			if (t && match_ch(t, '(')) t = skip_balanced(t, '(', ')');
-		} else if (t->tag & TT_SUE) {
-			Token *brace = find_struct_body_brace(t);
-			if (brace) t = skip_balanced(brace, '{', '}');
-			else t = t->next;
-		} else if ((t->tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE) && t->next && match_ch(t->next, '(')) {
-			t = skip_balanced(t->next, '(', ')');
-		} else if (t->tag & (TT_BITINT | TT_ATTR | TT_ALIGNAS)) {
-			t = t->next;
-			if (t && match_ch(t, '(')) t = skip_balanced(t, '(', ')');
-		} else if (is_c23_attr(t)) {
-			t = skip_c23_attr(t);
-		} else if (equal(t, "void") || is_void_typedef(t)) {
-			base_is_void = true;
-			break;
-		} else {
-			t = t->next;
-		}
-	}
+	bool base_is_void = type_spec.has_void;
 
 	// Check if base type is a pointer (for safe const-stripping in orelse).
 	bool base_is_ptr = false;
 	bool base_is_array = false;
 	for (Token *bt = type_start; bt && bt != type_spec.end; bt = bt->next) {
-		if (match_ch(bt, '*')) { base_is_ptr = true; break; }
 		if (is_ptr_typedef(bt)) { base_is_ptr = true; break; }
 		if (is_array_typedef(bt)) { base_is_array = true; break; }
 	}
@@ -1729,19 +1602,27 @@ static bool is_type_keyword(Token *tok) {
 }
 
 static inline bool is_valid_varname(Token *tok) {
-	return tok->kind == TK_IDENT || is_raw(tok) || equal(tok, "defer") || equal(tok, "orelse");
+	return tok->kind == TK_IDENT || (tok->flags & TF_RAW) || (tok->tag & (TT_DEFER | TT_ORELSE));
 }
 
 // ============================================================================
 // Zero-init declaration parsing helpers
 // ============================================================================
 
-// Skip _Pragma(...) operator sequences (C99 6.10.9)
-// _Pragma is equivalent to #pragma but can appear in macro expansions
-// Returns the token after all _Pragma(...) sequences
-static Token *skip_pragma_operators(Token *tok) {
-	while (tok && equal(tok, "_Pragma") && tok->next && match_ch(tok->next, '(')) {
-		tok = skip_balanced(tok->next, '(', ')'); // skip _Pragma and (...)
+static Token *decl_noise(Token *tok, bool emit) {
+	while (tok && tok->kind != TK_EOF) {
+		if (tok->tag & TT_ATTR) {
+			if (emit) emit_tok(tok);
+			tok = tok->next;
+			if (tok && match_ch(tok, '(')) tok = walk_balanced(tok, emit);
+		} else if (is_c23_attr(tok)) {
+			tok = walk_balanced(tok, emit);
+		} else if (tok->kind == TK_PREP_DIR) {
+			if (emit) emit_tok(tok);
+			tok = tok->next;
+		} else {
+			break;
+		}
 	}
 	return tok;
 }
@@ -1750,44 +1631,26 @@ static Token *skip_pragma_operators(Token *tok) {
 static TypeSpecResult parse_type_specifier(Token *tok) {
 	TypeSpecResult r = { .end = tok };
 
-	bool is_type = false;
-	while ((tok->tag & TT_QUALIFIER) || (is_type = is_type_keyword(tok)) || is_c23_attr(tok)
-	       || tok->kind == TK_PREP_DIR
-	       || (equal(tok, "_Pragma") && tok->next && match_ch(tok->next, '('))) {
-		bool had_type = r.saw_type;
+	while (tok && tok->kind != TK_EOF) {
+		Token *next = skip_noise(tok);
+		if (next != tok) { tok = next; r.end = tok; continue; }
+
 		uint32_t tag = tok->tag;
+		bool is_type = is_type_keyword(tok);
+		if (!(tag & TT_QUALIFIER) && !is_type && !(tag & (TT_BITINT | TT_ALIGNAS))) break;
+		
+		if (equal(tok, "void") || is_void_typedef(tok)) r.has_void = true;
+		
+		bool had_type = r.saw_type;
 
 		if (tag & TT_QUALIFIER) {
 			if (tag & TT_VOLATILE) r.has_volatile = true;
 			if (tag & TT_REGISTER) r.has_register = true;
 			if (tag & TT_CONST) r.has_const = true;
 			if (tag & TT_TYPE) {
-				if (equal(tok, "auto"))
-					r.saw_type = true;
-				else
-					r.has_atomic = true;
+				if (equal(tok, "auto")) r.saw_type = true;
+				else r.has_atomic = true;
 			}
-		}
-
-		if (is_c23_attr(tok)) {
-			tok = skip_c23_attr(tok);
-			r.end = tok;
-			is_type = false;
-			continue;
-		}
-
-		// _Pragma: skip transparently between qualifiers/type keywords.
-		if (equal(tok, "_Pragma") && tok->next && match_ch(tok->next, '(')) {
-			tok = skip_pragma_operators(tok);
-			r.end = tok;
-			is_type = false;
-			continue;
-		}
-		if (tok->kind == TK_PREP_DIR) {
-			tok = tok->next;
-			r.end = tok;
-			is_type = false;
-			continue;
 		}
 
 		// Bare _Atomic (not _Atomic(type)) is only a qualifier, not a type specifier.
@@ -1815,20 +1678,14 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 		// struct/union/enum
 		if (tag & TT_SUE) {
 			r.is_struct = true;
+			if (tok->shortcut == 'e') r.is_enum = true;
 			r.saw_type = true;
 			tok = tok->next;
 			while (tok && tok->kind != TK_EOF) {
-				if (equal(tok, "_Pragma") && tok->next && match_ch(tok->next, '(')) {
-					tok = skip_pragma_operators(tok);
-					continue;
-				}
-				if (tok->kind == TK_PREP_DIR) { tok = tok->next; continue; }
+				Token *next = skip_noise(tok);
+				if (next != tok) { tok = next; continue; }
 				if (tok->tag & TT_QUALIFIER) tok = tok->next;
-				else {
-					Token *next = skip_all_attributes(tok);
-					if (next == tok) break;
-					tok = next;
-				}
+				else break;
 			}
 			if (tok && is_valid_varname(tok)) tok = tok->next;
 			if (tok && match_ch(tok, '{')) {
@@ -1922,6 +1779,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 // Walk a balanced token group between matching delimiters, optionally emitting.
 static Token *walk_balanced(Token *tok, bool emit) {
 	Token *end = tok->match;
+	if (!end) return tok->next;
 	if (emit) {
 		for (Token *t = tok; t != end->next && t->kind != TK_EOF; t = t->next)
 			emit_tok(t);
@@ -1933,21 +1791,10 @@ static inline void decl_emit(Token *t, bool emit) {
 	if (emit) emit_tok(t);
 }
 
-static inline Token *decl_balanced(Token *t, bool emit) {
-	return emit ? walk_balanced(t, true) : t->match->next;
-}
-
-static inline Token *decl_attr(Token *t, bool emit) {
-	if (emit) emit_tok(t);
-	t = t->next;
-	if (t && match_ch(t, '(')) t = emit ? walk_balanced(t, true) : t->match->next;
-	return t;
-}
-
 static inline Token *decl_array_dims(Token *t, bool emit, bool *vla) {
 	while (match_ch(t, '[')) {
 		if (array_size_is_vla(t)) *vla = true;
-		t = decl_balanced(t, emit);
+		t = walk_balanced(t, emit);
 	}
 	return t;
 }
@@ -1955,130 +1802,76 @@ static inline Token *decl_array_dims(Token *t, bool emit, bool *vla) {
 // Unified declarator parser. emit=true emits tokens, emit=false only advances.
 static DeclResult parse_declarator(Token *tok, bool emit) {
 	DeclResult r = { .end = tok };
-
 	int ptr_depth = 0;
-	while (match_ch(tok, '*') || (tok->tag & TT_QUALIFIER) || equal(tok, "_Pragma") ||
-	       tok->kind == TK_PREP_DIR) {
-		if (tok->kind == TK_PREP_DIR) { decl_emit(tok, emit); tok = tok->next; continue; }
-		if (equal(tok, "_Pragma")) {
-			if (emit) {
-				emit_tok(tok);
-				tok = tok->next;
-				if (tok && match_ch(tok, '(')) tok = walk_balanced(tok, true);
-			} else {
-				tok = skip_pragma_operators(tok);
-			}
-			continue;
-		}
+
+	while (tok && tok->kind != TK_EOF) {
+		Token *next = decl_noise(tok, emit);
+		if (next != tok) { tok = next; continue; }
+
 		if (match_ch(tok, '*')) {
-			r.is_pointer = true;
-			r.is_const = false;
+			r.is_pointer = true; r.is_const = false;
 			if (++ptr_depth > 1024) {
-				warn_tok(tok,
-					 "pointer depth exceeds 1024; zero-initialization skipped for this "
-					 "declaration");
-				r.end = NULL;
-				return r;
+				warn_tok(tok, "pointer depth exceeds 1024; zero-initialization skipped");
+				r.end = NULL; return r;
 			}
-		} else if (r.is_pointer && (tok->tag & TT_CONST))
-			r.is_const = true;
-		if (tok->tag & TT_ATTR) {
-			tok = decl_attr(tok, emit);
-			continue;
-		}
-		decl_emit(tok, emit);
-		tok = tok->next;
+			decl_emit(tok, emit); tok = tok->next;
+		} else if (tok->tag & TT_QUALIFIER) {
+			if (r.is_pointer && (tok->tag & TT_CONST)) r.is_const = true;
+			decl_emit(tok, emit); tok = tok->next;
+		} else break;
 	}
 
 	int nested_paren = 0;
 	if (match_ch(tok, '(')) {
-		Token *peek = tok->next;
-		while (peek && (peek->tag & TT_ATTR)) {
-			peek = peek->next;
-			if (peek && match_ch(peek, '(')) peek = skip_balanced(peek, '(', ')');
-		}
+		Token *peek = skip_noise(tok->next);
 		if (!match_ch(peek, '*') && !match_ch(peek, '(') && !is_valid_varname(peek)) {
-			r.end = NULL;
-			return r;
+			r.end = NULL; return r;
 		}
+		decl_emit(tok, emit); tok = tok->next;
+		nested_paren = 1; r.has_paren = true;
 
-		decl_emit(tok, emit);
-		tok = tok->next;
-		nested_paren = 1;
-		r.has_paren = true;
+		while (tok && tok->kind != TK_EOF) {
+			Token *next = decl_noise(tok, emit);
+			if (next != tok) { tok = next; continue; }
 
-		while (match_ch(tok, '*') || (tok->tag & TT_QUALIFIER) || match_ch(tok, '(')) {
 			if (match_ch(tok, '*')) {
-				r.is_pointer = true;
-				r.paren_pointer = true;
-				r.is_const = false;
-			} else if (r.is_pointer && (tok->tag & TT_CONST))
-				r.is_const = true;
-			if (match_ch(tok, '(')) {
-				if (++nested_paren > 1024) {
-					warn_tok(tok,
-						 "declarator parenthesization depth exceeds 1024; "
-						 "zero-initialization skipped");
-					r.end = NULL;
-					return r;
-				}
-			}
-			if (tok->tag & TT_ATTR) {
-				tok = decl_attr(tok, emit);
-				continue;
-			}
-			decl_emit(tok, emit);
-			tok = tok->next;
+				r.is_pointer = true; r.paren_pointer = true; r.is_const = false;
+				decl_emit(tok, emit); tok = tok->next;
+			} else if (tok->tag & TT_QUALIFIER) {
+				if (r.is_pointer && (tok->tag & TT_CONST)) r.is_const = true;
+				decl_emit(tok, emit); tok = tok->next;
+			} else if (match_ch(tok, '(')) {
+				if (++nested_paren > 1024) { warn_tok(tok, "parenthesization depth exceeds 1024"); r.end = NULL; return r; }
+				decl_emit(tok, emit); tok = tok->next;
+			} else break;
 		}
 	}
 
-	if (!is_valid_varname(tok)) // Must have identifier
-	{
-		r.end = NULL;
-		return r;
-	}
-
+	if (!is_valid_varname(tok)) { r.end = NULL; return r; }
 	r.var_name = tok;
-	decl_emit(tok, emit);
-	tok = tok->next;
+	decl_emit(tok, emit); tok = tok->next;
 
-	while (tok && tok->kind != TK_EOF) {
-		if (tok->tag & TT_ATTR) tok = decl_attr(tok, emit);
-		else if (is_c23_attr(tok)) tok = decl_balanced(tok, emit);
-		else break;
-	}
+	tok = decl_noise(tok, emit);
 
 	if (r.has_paren && match_ch(tok, '[')) {
-		r.is_array = true;
-		r.paren_array = true;
+		r.is_array = true; r.paren_array = true;
 		tok = decl_array_dims(tok, emit, &r.is_vla);
 	}
 
 	while (r.has_paren && nested_paren > 0) {
 		while (match_ch(tok, '(') || match_ch(tok, '[')) {
-			if (match_ch(tok, '(')) tok = decl_balanced(tok, emit);
-			else {
-				r.is_array = true;
-				r.paren_array = true;
-				tok = decl_array_dims(tok, emit, &r.is_vla);
-			}
+			if (match_ch(tok, '(')) tok = walk_balanced(tok, emit);
+			else { r.is_array = true; r.paren_array = true; tok = decl_array_dims(tok, emit, &r.is_vla); }
 		}
-		if (!match_ch(tok, ')')) {
-			r.end = NULL;
-			return r;
-		}
-		decl_emit(tok, emit);
-		tok = tok->next;
+		if (!match_ch(tok, ')')) { r.end = NULL; return r; }
+		decl_emit(tok, emit); tok = tok->next;
 		nested_paren--;
 	}
 
 	if (match_ch(tok, '(')) {
-		if (!r.has_paren) {
-			r.end = NULL;
-			return r;
-		}
+		if (!r.has_paren) { r.end = NULL; return r; }
 		r.is_func_ptr = true;
-		tok = decl_balanced(tok, emit);
+		tok = walk_balanced(tok, emit);
 	}
 
 	if (match_ch(tok, '[')) {
@@ -2087,18 +1880,16 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 	}
 
 	while (tok && tok->kind != TK_EOF) {
-		if (tok->tag & TT_ATTR) tok = decl_attr(tok, emit);
-		else if (is_c23_attr(tok)) tok = decl_balanced(tok, emit);
-		else if (tok->tag & TT_ASM) {
-			if (emit) emit_tok(tok);
-			tok = tok->next;
-			if (tok && match_ch(tok, '(')) tok = decl_balanced(tok, emit);
+		Token *next = decl_noise(tok, emit);
+		if (next != tok) { tok = next; continue; }
+		if (tok->tag & TT_ASM) {
+			decl_emit(tok, emit); tok = tok->next;
+			if (tok && match_ch(tok, '(')) tok = walk_balanced(tok, emit);
 		} else break;
 	}
 
 	r.has_init = match_ch(tok, '=');
 	r.end = tok;
-
 	return r;
 }
 
@@ -2226,39 +2017,7 @@ static inline void register_decl_shadows(Token *var_name, bool effective_vla) {
 	if (effective_vla && var_name) typedef_add_vla_var(var_name->loc, var_name->len, depth);
 }
 
-// Re-emit type specifier tokens, skipping struct/union/enum bodies
-// to avoid redefinition errors (e.g. enum constant redeclaration).
-// Exception: anonymous struct/union bodies (no tag name between keyword
-// and '{') must be preserved — stripping them produces an incomplete type
-// like bare 'struct' which is always wrong.
-static void re_emit_type_specifier(Token *type_start, Token *type_end) {
-	for (Token *t = type_start; t != type_end; t = t->next) {
-		if (match_ch(t, '{')) {
-			// Find the nearest struct/union/enum keyword before this brace.
-			Token *kw = NULL;
-			for (Token *s = type_start; s != t; s = s->next)
-				if (s->tag & TT_SUE)
-					kw = s;
-			// For anonymous struct/union (no tag name between keyword and brace),
-			// keep the body so the type remains complete.
-			bool keep = false;
-			if (kw && !is_enum_kw(kw)) {
-				keep = true;
-				for (Token *u = kw->next; u && u != t; u = u->next) {
-					if (is_valid_varname(u) && !(u->tag & (TT_QUALIFIER | TT_ATTR | TT_TYPEOF))) {
-						keep = false; // tag name found — safe to strip body
-						break;
-					}
-				}
-			}
-			if (!keep) {
-				t = skip_balanced(t, '{', '}');
-				if (t == type_end) break;
-			}
-		}
-		emit_tok(t);
-	}
-}
+
 
 // Emit break/continue with defer handling. Returns next token.
 static Token *emit_break_continue_defer(Token *tok) {
@@ -2423,10 +2182,8 @@ static Token *handle_const_orelse_fallback(Token *tok,
 
 // Process all declarators in a declaration and emit with zero-init.
 static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw, Token *type_start) {
-	Token **typeof_vars = NULL;
+	Token *typeof_vars[128];
 	int typeof_var_count = 0;
-	int typeof_var_cap = 0;
-	ctx->active_typeof_vars = NULL; // Track for longjmp safety
 	int original_oe_checkpoint = oe_buf_checkpoint;
 
 	while (tok && tok->kind != TK_EOF) {
@@ -2439,7 +2196,6 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			// If orelse committed output, emit rest as raw instead of rolling back.
 			if (oe_buf_checkpoint != original_oe_checkpoint)
 				goto emit_raw_remainder;
-			ctx->active_typeof_vars = NULL;
 			return NULL;
 		}
 
@@ -2468,11 +2224,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		}
 
 		// Track typeof variables for memset emission (dynamic, no hard limit)
-		if (needs_memset) {
-			ARENA_ENSURE_CAP(
-			    &ctx->main_arena, typeof_vars, typeof_var_count + 1, typeof_var_cap, 8, Token *);
+		if (needs_memset && typeof_var_count < 128) {
 			typeof_vars[typeof_var_count++] = decl.var_name;
-			ctx->active_typeof_vars = typeof_vars; // Update tracking after potential realloc
 		}
 
 		// Emit initializer if present
@@ -2511,17 +2264,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					error_tok(tok, "orelse cannot be used in for-loop initializers");
 
 				// Detect struct/union value (not enum)
-				bool type_is_sue_not_enum = type->is_struct;
-				if (type_is_sue_not_enum) {
-					for (Token *t = type_start; t && t != type->end; t = t->next) {
-						if (is_enum_kw(t)) {
-							type_is_sue_not_enum = false;
-							break;
-						}
-						if (t->tag & TT_SUE) break;
-					}
-				}
-
+			bool type_is_sue_not_enum = type->is_struct && !type->is_enum;
 				// For function pointers, type-level const qualifies return type, not the variable.
 				bool has_const_qual = (type->has_const && !decl.is_func_ptr) || decl.is_const;
 				if (!has_const_qual && !decl.is_func_ptr && !decl.is_pointer) {
@@ -2580,11 +2323,10 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					if (stop_comma && match_ch(tok, ',')) {
 						tok = tok->next;
 						oe_buf_checkpoint = out_buf_pos;
-						re_emit_type_specifier(type_start, type->end);
+						emit_type_stripped(type_start, type->end, false);
 						is_raw = false;
 						continue;
 					}
-					ctx->active_typeof_vars = NULL;
 					return tok;
 				}
 
@@ -2615,11 +2357,10 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 				if (stop_comma && match_ch(tok, ',')) {
 					tok = tok->next;
 					oe_buf_checkpoint = out_buf_pos;
-					re_emit_type_specifier(type_start, type->end);
+					emit_type_stripped(type_start, type->end, false);
 					is_raw = false;
 					continue;
 				}
-				ctx->active_typeof_vars = NULL;
 				return tok;
 			}
 		}
@@ -2629,7 +2370,6 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		if (match_ch(tok, ';')) {
 			emit_tok(tok);
 			emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile, type->has_const);
-			ctx->active_typeof_vars = NULL;
 			return tok->next;
 		} else if (match_ch(tok, ',')) {
 			emit_tok(tok);
@@ -2638,7 +2378,6 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		} else {
 			if (oe_buf_checkpoint != original_oe_checkpoint)
 				goto emit_raw_remainder;
-			ctx->active_typeof_vars = NULL;
 			return NULL;
 		}
 	}
@@ -2654,55 +2393,30 @@ emit_raw_remainder:
 			tok = tok->next;
 		}
 		emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile, type->has_const);
-		ctx->active_typeof_vars = NULL;
 		return tok;
 	}
-	ctx->active_typeof_vars = NULL;
 	return NULL;
 }
 
 // Register shadows for file-scope _t/__* variable declarations.
 static void register_toplevel_shadows(Token *tok) {
 	if (tok->kind >= TK_STR) return;
-
-	Token *t = tok;
-	while (t && t->kind != TK_EOF) {
-		if (t->tag & TT_TYPEDEF) return;
-		if (t->tag & (TT_SKIP_DECL | TT_INLINE)) t = t->next;
-		else if (t->tag & TT_ATTR) t = skip_gnu_attributes(t);
-		else if (is_c23_attr(t)) t = skip_c23_attr(t);
-		else break;
-	}
-	if (!t || t->kind == TK_EOF) return;
-
-	// Must start with a type keyword or known typedef
-	if (!(t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT)) &&
-	    !is_known_typedef(t))
-		return;
-
-	// Advance past type specifier
-	while (t && t->kind != TK_EOF) {
-		if (t->tag & (TT_TYPE | TT_QUALIFIER)) t = t->next;
-		else if (t->tag & TT_SUE) {
-			t = t->next;
-			if (t && (t->tag & (TT_ATTR | TT_QUALIFIER))) {
-				t = t->next;
-				if (t && match_ch(t, '(')) t = skip_balanced(t, '(', ')');
-			}
-			if (t && is_valid_varname(t)) t = t->next;
-			if (t && match_ch(t, '{')) t = skip_balanced(t, '{', '}');
+	while (tok && tok->kind != TK_EOF) {
+		if (tok->tag & TT_TYPEDEF) return;
+		if (tok->tag & (TT_SKIP_DECL | TT_INLINE)) tok = tok->next;
+		else {
+			Token *next = skip_noise(tok);
+			if (next == tok) break;
+			tok = next;
 		}
-		else if (t->tag & (TT_TYPEOF | TT_ATTR | TT_BITINT | TT_ALIGNAS)) {
-			t = t->next;
-			if (t && match_ch(t, '(')) t = skip_balanced(t, '(', ')');
-		}
-		else if (is_c23_attr(t)) t = skip_c23_attr(t);
-		else if (is_known_typedef(t)) t = t->next;
-		else break;
 	}
-	if (!t || t->kind == TK_EOF) return;
+	if (!tok || tok->kind == TK_EOF) return;
+	if (!(tok->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT)) && !is_known_typedef(tok)) return;
 
-	// Scan declarator(s), register shadows for _t/__* names
+	TypeSpecResult type = parse_type_specifier(tok);
+	if (!type.saw_type) return;
+
+	Token *t = type.end;
 	while (t && !match_ch(t, ';') && t->kind != TK_EOF) {
 		DeclResult decl = parse_declarator(t, false);
 		if (!decl.var_name || !decl.end) break;
@@ -2712,10 +2426,10 @@ static void register_toplevel_shadows(Token *tok) {
 			typedef_add_shadow(decl.var_name->loc, decl.var_name->len, 0);
 
 		t = decl.end;
-		if (match_ch(t, '=')) { // skip initializer
+		if (match_ch(t, '=')) {
 			t = t->next;
 			while (t && t->kind != TK_EOF) {
-				if (t->flags & TF_OPEN) { t = t->match->next; continue; }
+				if (t->flags & TF_OPEN) { t = walk_balanced(t, false); continue; }
 				if (match_ch(t, ',') || match_ch(t, ';')) break;
 				t = t->next;
 			}
@@ -2738,17 +2452,13 @@ static Token *try_zero_init_decl(Token *tok) {
 	Token *warn_loc = tok;
 	Token *pragma_start = tok;
 
-	while (is_c23_attr(tok)) tok = skip_c23_attr(tok);
-	tok = skip_pragma_operators(tok);
+	tok = skip_noise(tok);
 	Token *start = tok;
 
 	bool is_raw = false;
 	Token *raw_tok = NULL;
 	if ((tok->flags & TF_RAW) && !is_known_typedef(tok)) {
-		Token *after_raw = tok->next;
-		while (is_c23_attr(after_raw)) after_raw = skip_c23_attr(after_raw);
-		after_raw = skip_pragma_operators(after_raw);
-		while (after_raw && after_raw->kind == TK_PREP_DIR) after_raw = after_raw->next;
+		Token *after_raw = skip_noise(tok->next);
 		if (is_raw_declaration_context(after_raw)) {
 			is_raw = true;
 			raw_tok = tok;
@@ -2763,19 +2473,14 @@ static Token *try_zero_init_decl(Token *tok) {
 	if (!is_raw) {
 		Token *probe = start;
 		while (probe && probe->kind != TK_EOF) {
-			Token *next = skip_all_attributes(probe);
+			Token *next = skip_noise(probe);
 			if (next != probe) { probe = next; continue; }
 			if (probe->tag & TT_QUALIFIER) { probe = probe->next; continue; }
-			if (equal(probe, "_Pragma")) { probe = skip_pragma_operators(probe); continue; }
-			if (probe->kind == TK_PREP_DIR) { probe = probe->next; continue; }
 			if ((probe->tag & (TT_STORAGE | TT_TYPEDEF))) { probe = probe->next; continue; }
 			break;
 		}
 		if (probe && (probe->flags & TF_RAW) && !is_known_typedef(probe)) {
-			Token *after_raw = probe->next;
-			while (is_c23_attr(after_raw)) after_raw = skip_c23_attr(after_raw);
-			after_raw = skip_pragma_operators(after_raw);
-			while (after_raw && after_raw->kind == TK_PREP_DIR) after_raw = after_raw->next;
+			Token *after_raw = skip_noise(probe->next);
 			if (is_raw_declaration_context(after_raw)) {
 				bool has_file_storage = false;
 				for (Token *s = pragma_start; s != probe; s = s->next)
@@ -2809,18 +2514,17 @@ static Token *try_zero_init_decl(Token *tok) {
 		if (FEAT(F_DEFER)) {
 			Token *p = type.end;
 			while (p && (match_ch(p, '*') || (p->tag & TT_QUALIFIER) || (p->tag & TT_ATTR))) {
-				if (p->tag & TT_ATTR) { p = p->next; if (p && match_ch(p, '(')) p = skip_balanced(p, '(', ')'); continue; }
+				Token *np = skip_noise(p);
+				if (np != p) { p = np; continue; }
 				p = p->next;
 			}
 			if (p && is_valid_varname(p)) {
-				Token *after_name = p->next;
-				while (after_name && (after_name->tag & TT_ATTR))
-					after_name = skip_gnu_attributes(after_name);
+				Token *after_name = skip_noise(p->next);
 				if (after_name && match_ch(after_name, '(')) {
 					Token *after_params = skip_balanced(after_name, '(', ')');
 					while (after_params && ((after_params->tag & TT_ATTR) || (after_params->tag & TT_ASM))) {
 						if (after_params->tag & TT_ASM) { after_params = after_params->next; }
-						else after_params = skip_gnu_attributes(after_params);
+						else after_params = skip_noise(after_params);
 						if (after_params && match_ch(after_params, '(')) after_params = skip_balanced(after_params, '(', ')');
 					}
 					if (after_params && match_ch(after_params, '{'))
@@ -2859,16 +2563,6 @@ static Token *try_zero_init_decl(Token *tok) {
 			  "variable declaration directly in switch body without braces. "
 			  "Wrap in braces: 'case N: { int x; ... }' to ensure safe zero-initialization, "
 			  "or use 'raw' to suppress zero-init.");
-	}
-
-	if (type.is_struct) {
-		for (Token *t = start; t && t != type.end; t = t->next) {
-			if (is_enum_kw(t)) {
-				Token *brace = find_struct_body_brace(t);
-				if (brace && brace != type.end) parse_enum_constants(brace, ctx->defer_depth);
-				break;
-			}
-		}
 	}
 
 	// Flush before checkpoint so speculative output + rollback is safe.
@@ -3377,7 +3071,7 @@ static void handle_case_default(Token *tok) {
 	bool is_case = tok->tag & TT_CASE;
 	bool is_default = (tok->tag & TT_DEFAULT) && ctx->generic_paren_depth == 0;
 	if (is_default) {
-		Token *t = skip_all_attributes(tok->next);
+		Token *t = skip_noise(tok->next);
 		if (!t || !match_ch(t, ':')) return;
 	}
 	if (!is_case && !is_default) return;
@@ -3407,11 +3101,9 @@ static void handle_case_default(Token *tok) {
 }
 
 static Token *handle_sue_body(Token *tok) {
-	bool is_enum = is_enum_kw(tok);
 	Token *brace = find_struct_body_brace(tok);
 	if (!brace) return NULL;
 
-	if (is_enum) parse_enum_constants(brace, ctx->defer_depth);
 	emit_range(tok, brace);
 	emit_tok(brace);
 	tok = brace->next;
@@ -4092,14 +3784,10 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		// Void function detection and return type capture at top level
 		if (ctx->defer_depth == 0 &&
 		    (tag & (TT_TYPE | TT_QUALIFIER | TT_SKIP_DECL | TT_ATTR | TT_INLINE) ||
-		     equal(tok, "_Pragma") ||
 		     (is_identifier_like(tok) && (is_void_typedef(tok) || is_known_typedef(tok))))) {
-			if (is_void_function_decl(tok)) next_func_returns_void = true;
-			else if (!next_func_ret_captured &&
-				 (tag & (TT_TYPE | TT_QUALIFIER | TT_ATTR | TT_INLINE) ||
-				  equal(tok, "_Pragma") ||
-				  (is_identifier_like(tok) && is_known_typedef(tok))))
-				next_func_ret_captured = try_capture_func_return_type(tok);
+			int ret = capture_function_return_type(tok);
+			if (ret == 1) next_func_returns_void = true;
+			else if (ret == 2) next_func_ret_captured = true;
 		}
 
 		if (tag & TT_SUE) // struct/union/enum body
@@ -4298,11 +3986,6 @@ static PrismResult error_recovery_result(void) {
 			 .error_msg = strdup(ctx->error_msg[0] ? ctx->error_msg : "Unknown error"),
 			 .error_line = ctx->error_line,
 			 .error_col = ctx->error_col};
-	if (ctx->active_temp_output[0]) {
-		remove(ctx->active_temp_output);
-		ctx->active_temp_output[0] = '\0';
-	}
-	ctx->active_typeof_vars = NULL;
 	if (out_fp) { fclose(out_fp); out_fp = NULL; }
 	if (ctx->active_membuf) { free(ctx->active_membuf); ctx->active_membuf = NULL; }
 	prism_reset();

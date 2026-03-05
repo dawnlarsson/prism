@@ -310,9 +310,7 @@ typedef struct PrismContext {
 	Token *func_ret_type_end;	   // Function name token (exclusive end of return type range)
 	Token *func_ret_type_suffix_start; // For complex declarators: closing ')' after func params
 	Token *func_ret_type_suffix_end;   // For complex declarators: token after suffix (exclusive)
-	void *active_typeof_vars;   // process_declarators arena alloc; cleared on longjmp recovery
 #ifdef PRISM_LIB_MODE
-	char active_temp_output[PATH_MAX];
 	char *active_membuf;	       // open_memstream buffer; freed on longjmp recovery
 	uint32_t keyword_map_features; // features used when keyword_map was built
 #endif
@@ -828,10 +826,14 @@ static void init_keyword_map(void) {
 	    {"__attribute__", TT_ATTR | TT_QUALIFIER, true},
 	    {"__attribute", TT_ATTR | TT_QUALIFIER, true},
 	    {"__declspec", TT_ATTR | TT_QUALIFIER, true},
+	    {"_Pragma", TT_ATTR, true},
 	    {"__extension__", 0, true},
 	    {"__builtin_va_list", 0, true},
 	    {"__builtin_va_arg", 0, true},
-	    {"__builtin_offsetof", 0, true},
+	    {"__builtin_offsetof", 0, true, TF_SIZEOF},
+	    {"offsetof", 0, true, TF_SIZEOF},
+	    {"__restrict", TT_QUALIFIER, true},
+	    {"__restrict__", TT_QUALIFIER, true},
 	    {"__builtin_types_compatible_p", 0, true},
 	    {"defer", TT_DEFER, true},
 	    {"orelse", TT_ORELSE, true},
@@ -1444,6 +1446,8 @@ static Token *tokenize(File *file) {
 		for (Token *t = head.next; t && t->kind != TK_EOF; t = t->next) {
 			if (t->flags & TF_OPEN) {
 				if (sp < 4096) stack[sp++] = t;
+				if (t->shortcut == '[' && t->next && t->next->shortcut == '[' && (t->next->flags & TF_OPEN))
+					t->flags |= TF_C23_ATTR;
 			} else if (t->flags & TF_CLOSE) {
 				if (sp > 0) {
 					Token *open = stack[--sp];
@@ -1451,12 +1455,6 @@ static Token *tokenize(File *file) {
 					t->match = open;
 				}
 			}
-		}
-		// Tag C23 attributes: first '[' of [[ ... ]]
-		for (Token *t = head.next; t && t->kind != TK_EOF; t = t->next) {
-			if (t->shortcut == '[' && (t->flags & TF_OPEN) &&
-			    t->next && t->next->shortcut == '[' && (t->next->flags & TF_OPEN))
-				t->flags |= TF_C23_ATTR;
 		}
 
 		// Pre-scan function bodies: tag '{' with TT_SPECIAL_FN / TT_ASM / TT_NORETURN_FN(=vfork).
