@@ -141,17 +141,7 @@ typedef struct {
 	Token *stmt, *end, *defer_kw;
 } DeferEntry;
 
-typedef enum {
-	SCOPE_BLOCK,       // { ... } block scope
-	SCOPE_FOR_PAREN,   // for( ... ) — first ';' ends init, not stmt
-	SCOPE_CTRL_PAREN,  // if/while/switch( ... )
-	SCOPE_GENERIC,     // _Generic( ... )
-	SCOPE_TERNARY,     // ? ... : — popped on matching ':'
-} ScopeKind;
-
 typedef struct {
-	ScopeKind kind;
-	Token *close_tok;  // for paren/generic scopes: the matching ')'
 	DeferEntry *entries;
 	int count;
 	int capacity;
@@ -166,7 +156,7 @@ typedef struct {
 	bool has_zeroinit_decl; // true if a zero-init'd variable declaration was emitted in this scope
 	bool is_stmt_expr;     // true if this scope is a GNU statement expression
 	bool is_orelse_guard;  // true if this scope is an orelse fallback block
-} ScopeNode;
+} DeferScope;
 
 // Result of goto skip analysis — both defer and decl checked in a single walk
 typedef struct {
@@ -192,7 +182,7 @@ typedef struct {
 typedef struct {
 	char *name; // Points into token stream (no alloc needed)
 	int len;
-	int scope_depth;    // Scope where defined (aligns with ctx->block_depth)
+	int scope_depth;    // Scope where defined (aligns with ctx->defer_depth)
 	bool is_vla;	    // True if typedef refers to a VLA type
 	bool is_void;	    // True if typedef resolves to void (e.g., typedef void Void)
 	bool is_const;	    // True if typedef includes const (e.g., typedef const int cint)
@@ -226,8 +216,19 @@ typedef struct {
 	bool compile_only;
 } Cli;
 
-// Control flow scope flags
+// Control flow state
 enum { NS_LOOP = 1, NS_SWITCH = 2, NS_CONDITIONAL = 4 };
+
+typedef struct {
+	int paren_depth;
+	int brace_depth;
+	uint8_t next_scope; // NS_LOOP | NS_SWITCH | NS_CONDITIONAL
+	bool pending;
+	bool parens_just_closed;
+	bool for_init;
+	bool await_for_paren;
+	bool pending_orelse_guard; // signals handle_open_brace to tag the next scope
+} ControlFlow;
 
 typedef struct {
 	char **data;
@@ -258,6 +259,8 @@ static char **cached_clean_env = NULL;
 static char **system_include_list; // Ordered list of includes
 static int system_include_capacity = 0;
 
+
+static ControlFlow ctrl = {0};
 static LabelTable label_table;
 
 
@@ -268,14 +271,17 @@ static Token *last_emitted = NULL;
 static int cached_file_idx = -1;
 static File *cached_file = NULL;
 
-static char out_buf[OUT_BUF_SIZE];
+static char out_buf_static[OUT_BUF_SIZE];
+static char *out_buf = out_buf_static;
 static int out_buf_pos = 0;
+static int out_buf_cap = OUT_BUF_SIZE;
+static int oe_buf_checkpoint = -1;   // Output buffer checkpoint for speculative rollback
 static bool use_linemarkers = false; // true = GCC linemarker "# N", false = C99 "#line N"
 
 static TypedefTable typedef_table;
 
-static ScopeNode *scope_stack = NULL;
-static int scope_stack_capacity = 0;
+static DeferScope *defer_stack = NULL;
+static int defer_stack_capacity = 0;
 
 // Forward declarations (only for functions used before their definition)
 static DeclResult parse_declarator(Token *tok, bool emit);
@@ -294,7 +300,6 @@ static inline void out_char(char c);
 static inline void out_str(const char *s, int len);
 #define skip_balanced(tok, o, c) walk_balanced((tok), false)
 static bool cc_is_msvc(const char *cc);
-static inline void ctrl_reset(void);
 
 // Emit space-separated token range [start, end). First token has no leading space.
 static inline void emit_token_range(Token *start, Token *end) {
@@ -320,9 +325,15 @@ static Token *skip_declarator_suffix(Token *tok) {
 	return tok;
 }
 
+static inline void control_flow_reset(void) {
+	ctrl = (ControlFlow){0};
+}
+
 static void reset_transpiler_state(void) {
-	ctx->scope_depth = 0;
-	ctx->block_depth = 0;
+	ctx->defer_depth = 0;
+	ctx->struct_depth = 0;
+	ctx->conditional_block_depth = 0;
+	ctx->generic_paren_depth = 0;
 	ctx->last_line_no = 0;
 	ctx->ret_counter = 0;
 	clear_func_ret_type();
@@ -333,7 +344,7 @@ static void reset_transpiler_state(void) {
 	ctx->current_func_has_asm = false;
 	ctx->current_func_has_vfork = false;
 	ctx->at_stmt_start = true;
-	ctrl_reset();
+	control_flow_reset();
 	last_emitted = NULL;
 	cached_file_idx = -1;
 	cached_file = NULL;
@@ -343,8 +354,8 @@ static void reset_transpiler_state(void) {
 	// dangling. Without clearing them, ARENA_ENSURE_CAP would skip allocation
 	// (thinking capacity is sufficient) and write through dangling pointers,
 	// corrupting token data in the reused arena blocks.
-	scope_stack = NULL;
-	scope_stack_capacity = 0;
+	defer_stack = NULL;
+	defer_stack_capacity = 0;
 	label_table.labels = NULL;
 	label_table.count = 0;
 	label_table.capacity = 0;
@@ -394,23 +405,45 @@ static Token *skip_to_semicolon(Token *tok) {
 
 
 
+static void out_buf_grow(void) {
+	out_buf_cap *= 2;
+	if (out_buf == out_buf_static) {
+		out_buf = malloc(out_buf_cap);
+		if (!out_buf) error("out of memory");
+		memcpy(out_buf, out_buf_static, out_buf_pos);
+	} else {
+		out_buf = realloc(out_buf, out_buf_cap);
+		if (!out_buf) error("out of memory");
+	}
+}
+
 static void out_flush(void) {
+	if (oe_buf_checkpoint >= 0) {
+		out_buf_grow();
+		return;
+	}
 	if (out_buf_pos > 0) {
 		fwrite(out_buf, 1, out_buf_pos, out_fp);
 		out_buf_pos = 0;
 	}
+	if (out_buf != out_buf_static) {
+		free(out_buf);
+		out_buf = out_buf_static;
+		out_buf_cap = OUT_BUF_SIZE;
+	}
 }
 
 static inline void out_char(char c) {
-	if (__builtin_expect(out_buf_pos >= OUT_BUF_SIZE, 0)) out_flush();
+	if (__builtin_expect(out_buf_pos >= out_buf_cap, 0)) out_flush();
 	out_buf[out_buf_pos++] = c;
 }
 
 static inline void out_str(const char *s, int len) {
 	if (__builtin_expect(len <= 0, 0)) return;
-	if (__builtin_expect(out_buf_pos + len >= OUT_BUF_SIZE, 0)) {
-		if (len >= OUT_BUF_SIZE) { out_flush(); fwrite(s, 1, len, out_fp); return; }
-		out_flush();
+	while (__builtin_expect(out_buf_pos + len >= out_buf_cap, 0)) {
+		if (oe_buf_checkpoint >= 0) out_buf_grow();
+		else if (len >= out_buf_cap) { out_flush(); fwrite(s, 1, len, out_fp); return; }
+		else out_flush();
 	}
 	memcpy(out_buf + out_buf_pos, s, len);
 	out_buf_pos += len;
@@ -421,6 +454,13 @@ static inline void out_str(const char *s, int len) {
 static void out_init(FILE *fp) {
 	out_fp = fp;
 	out_buf_pos = 0;
+	oe_buf_checkpoint = -1;
+	// Shrink back to static buffer if grown during speculation
+	if (out_buf != out_buf_static) {
+		free(out_buf);
+		out_buf = out_buf_static;
+		out_buf_cap = OUT_BUF_SIZE;
+	}
 }
 
 static void out_close(void) {
@@ -546,122 +586,54 @@ static void system_includes_reset(void) {
 	system_include_capacity = 0;
 }
 
-// ── Transitional state (replaces ControlFlow struct) ──
-// These flags track the gap between seeing a control keyword and opening its body.
-static uint8_t pending_scope_flags;   // NS_LOOP | NS_SWITCH | NS_CONDITIONAL
-static bool pending_ctrl;             // control keyword seen, awaiting body
-static bool pending_for_paren;        // 'for' seen, waiting for '('
-static bool parens_just_closed;       // control paren just closed (ready for body)
-static bool pending_orelse_guard;     // tag next scope as orelse guard
-
-static inline void ctrl_reset(void) {
-	pending_ctrl = false;
-	pending_for_paren = false;
-	parens_just_closed = false;
-	pending_scope_flags = 0;
-	pending_orelse_guard = false;
-}
-
-// ── Scope stack queries ──
-
-static inline ScopeKind scope_top_kind(void) {
-	return ctx->scope_depth > 0 ? scope_stack[ctx->scope_depth - 1].kind : SCOPE_BLOCK;
-}
-
-static inline ScopeNode *scope_block_top(void) {
-	for (int i = ctx->scope_depth - 1; i >= 0; i--)
-		if (scope_stack[i].kind == SCOPE_BLOCK) return &scope_stack[i];
-	return NULL;
-}
-
-static inline bool in_for_init(void) {
-	return ctx->scope_depth > 0 && scope_stack[ctx->scope_depth - 1].kind == SCOPE_FOR_PAREN;
-}
-
-static inline bool in_ctrl_paren(void) {
-	for (int i = ctx->scope_depth - 1; i >= 0; i--) {
-		ScopeKind k = scope_stack[i].kind;
-		if (k == SCOPE_BLOCK) return false;
-		if (k == SCOPE_FOR_PAREN || k == SCOPE_CTRL_PAREN) return true;
-	}
-	return false;
-}
-
-static inline bool in_struct_body(void) {
-	for (int i = ctx->scope_depth - 1; i >= 0; i--)
-		if (scope_stack[i].kind == SCOPE_BLOCK && scope_stack[i].is_struct) return true;
-	return false;
-}
-
-static inline bool in_generic(void) {
-	for (int i = ctx->scope_depth - 1; i >= 0; i--)
-		if (scope_stack[i].kind == SCOPE_GENERIC) return true;
-	return false;
-}
-
-static inline bool in_conditional_block(void) {
-	for (int i = ctx->scope_depth - 1; i >= 0; i--)
-		if (scope_stack[i].kind == SCOPE_BLOCK && scope_stack[i].is_conditional) return true;
-	return false;
-}
-
 static void end_statement_after_semicolon(void) {
 	ctx->at_stmt_start = true;
-	if (pending_ctrl && !in_ctrl_paren()) {
+	ctrl.for_init = false; // Semicolon ends init clause
+	if (ctrl.pending && ctrl.paren_depth == 0) {
 		// Pop phantom scopes for braceless control bodies ending via break/continue/return/goto.
 		// For-init variables (e.g., "for (int T = 0; ...)  break;") are registered at
-		// block_depth + 1 but never get a matching '}' pop. Without this, the shadow
+		// defer_depth + 1 but never get a matching '}' pop. Without this, the shadow
 		// persists and corrupts subsequent typedef lookups (ghost shadow bug).
-		typedef_pop_scope(ctx->block_depth + 1);
-		ctrl_reset();
+		typedef_pop_scope(ctx->defer_depth + 1);
+		control_flow_reset();
 	}
 }
 
-static void scope_push_kind(ScopeKind kind, bool consume_flags, Token *close_tok) {
+static void defer_push_scope(bool consume_flags) {
 	// Guard against pathologically deep nesting (e.g., fuzz input with thousands of '{')
-	if (ctx->scope_depth >= 4096) error("brace nesting depth exceeds 4096");
-	int old_cap = scope_stack_capacity;
+	if (ctx->defer_depth >= 4096) error("brace nesting depth exceeds 4096");
+	int old_cap = defer_stack_capacity;
 	ARENA_ENSURE_CAP(&ctx->main_arena,
-			 scope_stack,
-			 ctx->scope_depth + 1,
-			 scope_stack_capacity,
+			 defer_stack,
+			 ctx->defer_depth + 1,
+			 defer_stack_capacity,
 			 INITIAL_ARRAY_CAP,
-			 ScopeNode);
-	for (int i = old_cap; i < scope_stack_capacity; i++) scope_stack[i] = (ScopeNode){0};
-	ScopeNode *s = &scope_stack[ctx->scope_depth];
+			 DeferScope);
+	for (int i = old_cap; i < defer_stack_capacity; i++) defer_stack[i] = (DeferScope){0};
+	DeferScope *s = &defer_stack[ctx->defer_depth];
 	DeferEntry *prev_entries = s->entries;
 	int prev_cap = s->capacity;
-	*s = (ScopeNode){.kind = kind, .close_tok = close_tok,
-			 .entries = prev_entries, .capacity = prev_cap};
-	if (kind == SCOPE_BLOCK) {
-		if (consume_flags) {
-			s->is_loop = pending_scope_flags & NS_LOOP;
-			s->is_switch = pending_scope_flags & NS_SWITCH;
-			s->is_conditional = pending_scope_flags & NS_CONDITIONAL;
-			pending_scope_flags = 0;
-		}
-		ctx->block_depth++;
+	*s = (DeferScope){.entries = prev_entries, .capacity = prev_cap};
+	if (consume_flags) {
+		s->is_loop = ctrl.next_scope & NS_LOOP;
+		s->is_switch = ctrl.next_scope & NS_SWITCH;
+		s->is_conditional = ctrl.next_scope & NS_CONDITIONAL;
+		if (ctrl.next_scope & NS_CONDITIONAL) ctx->conditional_block_depth++;
+		ctrl.next_scope = 0;
 	}
-	ctx->scope_depth++;
+	ctx->defer_depth++;
 }
 
-// Convenience wrapper — all existing callers push SCOPE_BLOCK
-static inline void scope_push(bool consume_flags) {
-	scope_push_kind(SCOPE_BLOCK, consume_flags, NULL);
-}
-
-static void scope_pop(void) {
-	if (ctx->scope_depth > 0) {
-		ctx->scope_depth--;
-		ScopeNode *s = &scope_stack[ctx->scope_depth];
-		if (s->kind == SCOPE_BLOCK)
-			ctx->block_depth--;
+static void defer_pop_scope(void) {
+	if (ctx->defer_depth > 0) {
+		ctx->defer_depth--;
+		if (defer_stack[ctx->defer_depth].is_conditional) ctx->conditional_block_depth--;
 	}
 }
 
 static void defer_add(Token *defer_keyword, Token *start, Token *end) {
-	if (ctx->block_depth <= 0) error_tok(start, "defer outside of any scope");
-	ScopeNode *scope = scope_block_top();
+	if (ctx->defer_depth <= 0) error_tok(start, "defer outside of any scope");
+	DeferScope *scope = &defer_stack[ctx->defer_depth - 1];
 	ARENA_ENSURE_CAP(&ctx->main_arena,
 			 scope->entries,
 			 scope->count + 1,
@@ -673,16 +645,16 @@ static void defer_add(Token *defer_keyword, Token *start, Token *end) {
 }
 
 static int find_switch_scope(void) {
-	for (int d = ctx->scope_depth - 1; d >= 0; d--)
-		if (scope_stack[d].kind == SCOPE_BLOCK && scope_stack[d].is_switch) return d;
+	for (int d = ctx->defer_depth - 1; d >= 0; d--)
+		if (defer_stack[d].is_switch) return d;
 	return -1;
 }
 
 // Mark unconditional control exit in the innermost switch scope
 static void mark_switch_control_exit(void) {
-	if (pending_ctrl || in_conditional_block()) return;
+	if (ctrl.pending || ctx->conditional_block_depth > 0) return;
 	int sd = find_switch_scope();
-	if (sd >= 0) scope_stack[sd].had_control_exit = true;
+	if (sd >= 0) defer_stack[sd].had_control_exit = true;
 }
 
 static bool needs_space(Token *prev, Token *tok) {
@@ -775,7 +747,7 @@ static void emit_tok(Token *tok) {
 	// mistake them for runtime variables.
 	if (__builtin_expect(tok->tag & TT_SUE, 0) && is_enum_kw(tok)) {
 		Token *brace = find_struct_body_brace(tok);
-		if (brace) parse_enum_constants(brace, ctx->block_depth);
+		if (brace) parse_enum_constants(brace, ctx->defer_depth);
 	}
 
 	out_str(tok->loc, tok->len);
@@ -789,12 +761,8 @@ static void emit_range(Token *start, Token *end) {
 // Like emit_range but processes zero-init/raw/orelse inside defer blocks.
 static void emit_deferred_range(Token *start, Token *end) {
 	bool saved_stmt_start = ctx->at_stmt_start;
-	bool saved_pending_ctrl = pending_ctrl;
-	bool saved_parens_just_closed = parens_just_closed;
-	uint8_t saved_scope_flags = pending_scope_flags;
-	pending_ctrl = false;
-	parens_just_closed = false;
-	pending_scope_flags = 0;
+	ControlFlow saved_ctrl = ctrl;
+	ctrl = (ControlFlow){0};
 
 	ctx->at_stmt_start = true;
 
@@ -821,39 +789,35 @@ static void emit_deferred_range(Token *start, Token *end) {
 	}
 
 	ctx->at_stmt_start = saved_stmt_start;
-	pending_ctrl = saved_pending_ctrl;
-	parens_just_closed = saved_parens_just_closed;
-	pending_scope_flags = saved_scope_flags;
+	ctrl = saved_ctrl;
 }
 
 static void emit_defers_ex(DeferEmitMode mode, int stop_depth) {
-	if (ctx->block_depth <= 0) return;
+	if (ctx->defer_depth <= 0) return;
 
-	for (int d = ctx->scope_depth - 1; d >= 0; d--) {
-		if (scope_stack[d].kind != SCOPE_BLOCK) continue;
+	for (int d = ctx->defer_depth - 1; d >= 0; d--) {
+		if (mode == DEFER_SCOPE && d < ctx->defer_depth - 1) break;
 		if (mode == DEFER_TO_DEPTH && d < stop_depth) break;
 
-		ScopeNode *scope = &scope_stack[d];
+		DeferScope *scope = &defer_stack[d];
 		for (int i = scope->count - 1; i >= 0; i--) {
 			out_char(' ');
 			emit_deferred_range(scope->entries[i].stmt, scope->entries[i].end);
 			out_char(';');
 		}
 
-		if (mode == DEFER_SCOPE) break;
 		if (mode == DEFER_BREAK && (scope->is_loop || scope->is_switch)) break;
 		if (mode == DEFER_CONTINUE && scope->is_loop) break;
 	}
 }
 
 static bool has_defers_for(DeferEmitMode mode, int stop_depth) {
-	for (int d = ctx->scope_depth - 1; d >= 0; d--) {
-		if (scope_stack[d].kind != SCOPE_BLOCK) continue;
+	for (int d = ctx->defer_depth - 1; d >= 0; d--) {
 		if (mode == DEFER_TO_DEPTH && d < stop_depth) break;
-		if (scope_stack[d].count > 0) return true;
-		if (mode == DEFER_BREAK && (scope_stack[d].is_loop || scope_stack[d].is_switch))
+		if (defer_stack[d].count > 0) return true;
+		if (mode == DEFER_BREAK && (defer_stack[d].is_loop || defer_stack[d].is_switch))
 			return false;
-		if (mode == DEFER_CONTINUE && scope_stack[d].is_loop) return false;
+		if (mode == DEFER_CONTINUE && defer_stack[d].is_loop) return false;
 	}
 	return false;
 }
@@ -936,7 +900,7 @@ static void typedef_pop_scope(int scope_depth) {
 		TypedefEntry *e = &typedef_table.entries[typedef_table.count - 1];
 		if (e->prev_index >= 0) typedef_set_index(e->name, e->len, e->prev_index);
 		else
-			hashmap_put(&typedef_table.name_map, e->name, e->len, NULL);
+			hashmap_delete(&typedef_table.name_map, e->name, e->len);
 		typedef_table.count--;
 	}
 }
@@ -1259,7 +1223,7 @@ static GotoSkipResult goto_skips_check(Token *goto_tok, LabelInfo *info, bool ch
 	if (start && match_ch(start, ';')) start = start->next;
 
 	Token *active_defer = NULL, *active_decl = NULL;
-	int scope_depth = -1, decl_depth = -1, depth = 0;
+	int defer_depth = -1, decl_depth = -1, depth = 0;
 	bool is_stmt_start = true;
 
 	for (Token *tok = start; tok && tok != info->tok && tok->kind != TK_EOF; ) {
@@ -1268,7 +1232,7 @@ static GotoSkipResult goto_skips_check(Token *goto_tok, LabelInfo *info, bool ch
 			depth++; is_stmt_start = true; tok = tok->next; continue;
 		}
 		if (match_ch(tok, '}')) {
-			if (active_defer && depth <= scope_depth) { active_defer = NULL; scope_depth = -1; }
+			if (active_defer && depth <= defer_depth) { active_defer = NULL; defer_depth = -1; }
 			if (active_decl && depth <= decl_depth) { active_decl = NULL; decl_depth = -1; }
 			depth--; is_stmt_start = true; tok = tok->next; continue;
 		}
@@ -1277,7 +1241,7 @@ static GotoSkipResult goto_skips_check(Token *goto_tok, LabelInfo *info, bool ch
 		}
 
 		if (check_defer && (tok->tag & TT_DEFER) && !is_known_typedef(tok)) {
-			if (depth <= 0 && (!active_defer || depth <= scope_depth)) { active_defer = tok; scope_depth = depth; }
+			if (depth <= 0 && (!active_defer || depth <= defer_depth)) { active_defer = tok; defer_depth = depth; }
 		}
 
 		if (check_decl && is_stmt_start && !(tok->tag & TT_LOOP)) {
@@ -1350,11 +1314,22 @@ static int capture_function_return_type(Token *tok) {
 	if (!tok || tok->kind == TK_EOF) return 0;
 
 	Token *type_start = tok;
-	
+
+	bool is_void = false;
+
+	if (equal(tok, "void") || is_void_typedef(tok)) {
+		Token *after = skip_noise(tok->next);
+		if (after && !match_ch(after, '*') && !match_ch(after, '(')) is_void = true;
+	} else if (tok->tag & TT_TYPEOF) {
+		Token *t = tok->next;
+		if (t && match_ch(t, '(') && t->next && equal(t->next, "void") && t->next->next && match_ch(t->next->next, ')')) {
+			Token *after = skip_noise(t->next->next->next);
+			if (after && !match_ch(after, '*') && !match_ch(after, '(')) is_void = true;
+		}
+	}
+
 	TypeSpecResult type = parse_type_specifier(tok);
 	if (!type.saw_type) return 0;
-	
-	bool is_void = type.has_void;
 	tok = type.end;
 
 	if (type.is_struct) {
@@ -1454,7 +1429,7 @@ static bool array_size_is_vla(Token *open_bracket) {
 						if (is_enum_kw(inner)) {
 							Token *brace = find_struct_body_brace(inner);
 							if (brace) {
-								parse_enum_constants(brace, ctx->block_depth);
+								parse_enum_constants(brace, ctx->defer_depth);
 								inner = skip_balanced(brace, '{', '}');
 								if (inner == end) break;
 								continue;
@@ -1832,21 +1807,22 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 	DeclResult r = { .end = tok };
 	int ptr_depth = 0;
 
-#define DECL_EAT_PTRS(extra_ptr_action)						\
-	while (tok && tok->kind != TK_EOF) {					\
-		Token *_n = decl_noise(tok, emit);				\
-		if (_n != tok) { tok = _n; continue; }				\
-		if (match_ch(tok, '*')) {					\
-			r.is_pointer = true; r.is_const = false; extra_ptr_action; \
-			if (++ptr_depth > 1024) { warn_tok(tok, "pointer depth exceeds 1024; zero-initialization skipped"); r.end = NULL; return r; } \
-			decl_emit(tok, emit); tok = tok->next;			\
-		} else if (tok->tag & TT_QUALIFIER) {				\
-			if (r.is_pointer && (tok->tag & TT_CONST)) r.is_const = true; \
-			decl_emit(tok, emit); tok = tok->next;			\
-		} else break;							\
-	}
+	while (tok && tok->kind != TK_EOF) {
+		Token *next = decl_noise(tok, emit);
+		if (next != tok) { tok = next; continue; }
 
-	DECL_EAT_PTRS((void)0)
+		if (match_ch(tok, '*')) {
+			r.is_pointer = true; r.is_const = false;
+			if (++ptr_depth > 1024) {
+				warn_tok(tok, "pointer depth exceeds 1024; zero-initialization skipped");
+				r.end = NULL; return r;
+			}
+			decl_emit(tok, emit); tok = tok->next;
+		} else if (tok->tag & TT_QUALIFIER) {
+			if (r.is_pointer && (tok->tag & TT_CONST)) r.is_const = true;
+			decl_emit(tok, emit); tok = tok->next;
+		} else break;
+	}
 
 	int nested_paren = 0;
 	if (match_ch(tok, '(')) {
@@ -1857,14 +1833,22 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 		decl_emit(tok, emit); tok = tok->next;
 		nested_paren = 1; r.has_paren = true;
 
-		DECL_EAT_PTRS(r.paren_pointer = true)
-		while (match_ch(tok, '(')) {
-			if (++nested_paren > 1024) { warn_tok(tok, "parenthesization depth exceeds 1024"); r.end = NULL; return r; }
-			decl_emit(tok, emit); tok = tok->next;
-			DECL_EAT_PTRS(r.paren_pointer = true)
+		while (tok && tok->kind != TK_EOF) {
+			Token *next = decl_noise(tok, emit);
+			if (next != tok) { tok = next; continue; }
+
+			if (match_ch(tok, '*')) {
+				r.is_pointer = true; r.paren_pointer = true; r.is_const = false;
+				decl_emit(tok, emit); tok = tok->next;
+			} else if (tok->tag & TT_QUALIFIER) {
+				if (r.is_pointer && (tok->tag & TT_CONST)) r.is_const = true;
+				decl_emit(tok, emit); tok = tok->next;
+			} else if (match_ch(tok, '(')) {
+				if (++nested_paren > 1024) { warn_tok(tok, "parenthesization depth exceeds 1024"); r.end = NULL; return r; }
+				decl_emit(tok, emit); tok = tok->next;
+			} else break;
 		}
 	}
-#undef DECL_EAT_PTRS
 
 	if (!is_valid_varname(tok)) { r.end = NULL; return r; }
 	r.var_name = tok;
@@ -1978,43 +1962,59 @@ static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool
 }
 
 // Register typedef shadows and VLA variables for function parameters.
-static inline void register_one_param(Token *ident, Token *param_start, Token *end) {
-	if (!ident) return;
-	if (is_known_typedef(ident) || is_typedef_heuristic(ident))
-		typedef_add_shadow(ident->loc, ident->len, 1);
-	for (Token *s = param_start; s && s != end && s->kind != TK_EOF; s = s->next)
-		if (match_ch(s, '[') && array_size_is_vla(s))
-			{ typedef_add_vla_var(ident->loc, ident->len, 1); break; }
-}
 static void register_param_shadows(Token *open_paren, Token *close_paren) {
 	if (!open_paren || !close_paren) return;
 	Token *last_ident = NULL;
-	Token *param_start = open_paren->next;
+	Token *param_start = open_paren->next; // start of current parameter tokens
+	int depth = 0;
+	int ident_depth = -1;              // depth where last_ident was captured
+	bool seen_close_after_ident = false; // ')' closed back to ident_depth or shallower
 	for (Token *t = open_paren->next; t && t != close_paren && t->kind != TK_EOF; t = t->next) {
-		if (t->flags & TF_OPEN) {
-			if (!last_ident && match_ch(t, '(') && t->match)
-				for (Token *s = t->next; s != t->match; s = s->next) {
-					if (s->flags & TF_OPEN) { s = s->match ? s->match : s; continue; }
-					if (is_valid_varname(s) && !(s->tag & (TT_QUALIFIER|TT_TYPE|TT_SUE|TT_TYPEOF|TT_ATTR)))
-						last_ident = s;
-				}
-			if (t->match) t = t->match;
-			continue;
+		if (t->flags & TF_OPEN) depth++;
+		else if (t->flags & TF_CLOSE) {
+			depth--;
+			if (last_ident && depth <= ident_depth) seen_close_after_ident = true;
 		}
-		if (is_valid_varname(t) && !(t->tag & (TT_QUALIFIER|TT_TYPE|TT_SUE|TT_TYPEOF|TT_ATTR)))
+		else if (!seen_close_after_ident && is_valid_varname(t) &&
+			 !(t->tag & (TT_QUALIFIER | TT_TYPE | TT_SUE | TT_TYPEOF | TT_ATTR))) {
 			last_ident = t;
-		if (match_ch(t, ',') || t->next == close_paren) {
-			register_one_param(last_ident, param_start, t->next == close_paren ? close_paren : t);
-			param_start = t->next;
+			ident_depth = depth;
+		}
+		if (depth == 0 && (match_ch(t, ',') || t->next == close_paren)) {
+			if (last_ident) {
+				if (is_known_typedef(last_ident) || is_typedef_heuristic(last_ident))
+					typedef_add_shadow(last_ident->loc, last_ident->len, 1);
+				// Check for VLA dimensions in parameter type.
+				Token *end = t->next == close_paren ? close_paren : t;
+				for (Token *s = param_start; s && s != end && s->kind != TK_EOF; s = s->next) {
+					if (match_ch(s, '[') && array_size_is_vla(s)) {
+						typedef_add_vla_var(last_ident->loc, last_ident->len, 1);
+						break;
+					}
+				}
+			}
+			param_start = t->next; // next parameter starts after ','
 			last_ident = NULL;
+			ident_depth = -1;
+			seen_close_after_ident = false;
 		}
 	}
-	register_one_param(last_ident, param_start, close_paren);
+	// Handle last parameter (if close_paren was hit without trailing comma)
+	if (last_ident) {
+		if (is_known_typedef(last_ident) || is_typedef_heuristic(last_ident))
+			typedef_add_shadow(last_ident->loc, last_ident->len, 1);
+		for (Token *s = param_start; s && s != close_paren && s->kind != TK_EOF; s = s->next) {
+			if (match_ch(s, '[') && array_size_is_vla(s)) {
+				typedef_add_vla_var(last_ident->loc, last_ident->len, 1);
+				break;
+			}
+		}
+	}
 }
 
 // Register typedef shadows and VLA variables for a declarator
 static inline void register_decl_shadows(Token *var_name, bool effective_vla) {
-	int depth = ctx->block_depth + (in_for_init() ? 1 : 0);
+	int depth = ctx->defer_depth + (ctrl.for_init ? 1 : 0);
 	if (is_known_typedef(var_name) || is_typedef_heuristic(var_name))
 		typedef_add_shadow(var_name->loc, var_name->len, depth);
 	if (effective_vla && var_name) typedef_add_vla_var(var_name->loc, var_name->len, depth);
@@ -2040,7 +2040,7 @@ static Token *emit_goto_defer(Token *tok) {
 	tok = tok->next;
 	if (FEAT(F_DEFER) && is_identifier_like(tok)) {
 		int td = label_table_lookup(tok->loc, tok->len);
-		if (td < 0) td = ctx->block_depth;
+		if (td < 0) td = ctx->defer_depth;
 		if (goto_has_defers(td)) emit_goto_defers(td);
 	}
 	OUT_LIT(" goto ");
@@ -2063,6 +2063,10 @@ static Token *handle_const_orelse_fallback(Token *tok,
 					   Token *type_start,
 					   TypeSpecResult *type,
 					   Token *stop_comma) {
+	// Roll back speculative output.
+	out_buf_pos = oe_buf_checkpoint;
+	last_emitted = NULL;
+
 	unsigned oe_id = ctx->ret_counter++;
 
 	// Emit mutable temp: strip const from type (except pointer types where it qualifies pointee).
@@ -2179,160 +2183,37 @@ static Token *handle_const_orelse_fallback(Token *tok,
 	return tok;
 }
 
-static void check_orelse_in_parens(Token *open) {
-	Token *close = open->match;
-	for (Token *pi = open, *t = open->next; t != close; pi = t, t = t->next)
-		if ((t->tag & TT_ORELSE) && !is_known_typedef(t) && !(pi->tag & TT_MEMBER))
-			error_tok(t, "'orelse' cannot be used inside parentheses "
-				  "(it must appear at the top level of a declaration)");
-}
-
 // Process all declarators in a declaration and emit with zero-init.
-static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw, Token *type_start,
-				  Token *pragma_start, Token *raw_tok, bool brace_wrap) {
+static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw, Token *type_start) {
 	Token *typeof_vars[128];
 	int typeof_var_count = 0;
-	bool first_decl = true;
-	bool need_type_emit = false; // Set after orelse comma — deferred to after next lookahead
+	int original_oe_checkpoint = oe_buf_checkpoint;
 
 	while (tok && tok->kind != TK_EOF) {
 		Token *decl_start = tok;
-
-		// Step 1: Non-emitting lookahead
-		DeclResult decl = parse_declarator(tok, false);
+		int buf_pos_before_decl = out_buf_pos;
+		DeclResult decl = parse_declarator(tok, true);
 		if (!decl.end || !decl.var_name) {
-			if (!first_decl) {
-				if (need_type_emit)
-					emit_type_stripped(type_start, type->end, false);
-				goto emit_raw_bail;
-			}
+			// Rollback emitted tokens; buffer grows without flushing during speculation.
+			if (buf_pos_before_decl <= out_buf_pos) out_buf_pos = buf_pos_before_decl;
+			// If orelse committed output, emit rest as raw instead of rolling back.
+			if (oe_buf_checkpoint != original_oe_checkpoint)
+				goto emit_raw_remainder;
 			return NULL;
 		}
 
-		// Step 2: If initializer exists, scan for orelse + const fallback pattern
-		bool is_const_orelse_fallback = false;
-		Token *scan_orelse_tok = NULL;
-		if (decl.has_init && FEAT(F_ORELSE)) {
-			Token *scan = decl.end->next; // skip '='
-			Token *prev_scan = NULL;
-			while (scan && scan->kind != TK_EOF) {
-				if (scan->flags & TF_OPEN) {
-					check_orelse_in_parens(scan);
-					prev_scan = scan->match;
-					scan = scan->match->next;
-					continue;
-				}
-				if (match_ch(scan, ',') || match_ch(scan, ';')) break;
-				if ((scan->tag & TT_ORELSE) && !is_known_typedef(scan) &&
-				    !(prev_scan && (prev_scan->tag & TT_MEMBER))) {
-					scan_orelse_tok = scan;
-					break;
-				}
-				prev_scan = scan;
-				scan = scan->next;
-			}
+		tok = decl.end;
 
-			if (scan_orelse_tok) {
-				bool has_const_qual = (type->has_const && !decl.is_func_ptr) || decl.is_const;
-				if (!has_const_qual && !decl.is_func_ptr && !decl.is_pointer) {
-					for (Token *t = type_start; t && t != type->end; t = t->next)
-						if (is_const_typedef(t)) { has_const_qual = true; break; }
-				}
-
-				Token *peek_action = scan_orelse_tok->next;
-				bool is_fallback = peek_action &&
-				    !(peek_action->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
-				    !match_ch(peek_action, '{') && !match_ch(peek_action, ';');
-
-				is_const_orelse_fallback = has_const_qual && is_fallback;
-			}
-		}
-
-		// Deferred type emission from orelse comma continuation
-		if (need_type_emit) {
-			if (!is_const_orelse_fallback)
-				emit_type_stripped(type_start, type->end, false);
-			need_type_emit = false;
-		}
-
-		// Step 3: Emit base type for first declarator
-		if (first_decl) {
-			if (brace_wrap) OUT_LIT(" {");
-			if (!is_const_orelse_fallback) {
-				if (raw_tok && pragma_start != type_start) {
-					emit_range(pragma_start, raw_tok);
-				} else if (pragma_start != type_start) {
-					emit_range(pragma_start, type_start);
-				}
-				emit_range(type_start, type->end);
-			}
-			first_decl = false;
-		}
-
-		// Step 4: Emit declarator & initializer
+		// Effective VLA: paren_pointer suppresses VLA unless paren_array is also set.
 		bool effective_vla = (decl.is_vla && (!decl.paren_pointer || decl.paren_array)) || (type->is_vla && !decl.is_pointer);
 		bool is_vla_type = decl.is_vla || type->is_vla;
+
+		// typeof/atomic aggregate/VLA: use memset (can't use = 0 or = {0})
 		bool is_aggregate =
 		    decl.is_array || ((type->is_struct || type->is_typedef) && !decl.is_pointer);
 		bool needs_memset = !decl.has_init && !is_raw && (!decl.is_pointer || decl.is_array) &&
 				    !type->has_register &&
 				    (type->has_typeof || (type->has_atomic && is_aggregate) || effective_vla);
-
-		if (is_const_orelse_fallback) {
-			// const + fallback orelse: handle_const_orelse_fallback emits its own base type
-			Token *orelse_tok = scan_orelse_tok;
-			Token *val_start = decl.end->next; // First value token after '='
-
-			bool type_is_sue_not_enum = type->is_struct && !type->is_enum;
-			bool is_struct_val = type_is_sue_not_enum && !decl.is_pointer && !decl.is_array;
-			if (is_struct_val)
-				error_tok(orelse_tok,
-					  "orelse fallback on const struct is not supported; "
-					  "use a control flow action (return/break/goto) or "
-					  "remove const");
-
-			// Array address is never NULL — orelse can never trigger
-			if (decl.is_array && !decl.is_pointer)
-				error_tok(decl.var_name,
-					  "orelse on array variable '%.*s' will never trigger "
-					  "(array address is never NULL); remove the orelse clause",
-					  decl.var_name->len,
-					  decl.var_name->loc);
-
-			register_decl_shadows(decl.var_name, is_vla_type);
-			tok = orelse_tok->next; // skip 'orelse'
-
-			Token *stop_comma = find_boundary_comma(tok);
-
-			tok = handle_const_orelse_fallback(tok,
-							   orelse_tok,
-							   val_start,
-							   decl_start,
-							   &decl,
-							   type_start,
-							   type,
-							   stop_comma);
-
-			emit_typeof_memsets(
-			    typeof_vars, typeof_var_count, type->has_volatile, type->has_const);
-			typeof_var_count = 0;
-
-			if (match_ch(tok, ';')) tok = tok->next;
-			end_statement_after_semicolon();
-
-			if (stop_comma && match_ch(tok, ',')) {
-				tok = tok->next;
-				need_type_emit = true;
-				is_raw = false;
-				continue;
-			}
-			if (brace_wrap) OUT_LIT(" }");
-			return tok;
-		}
-
-		// Normal path: emit declarator
-		parse_declarator(decl_start, true);
-		tok = decl.end;
 
 		// Add zero initializer if needed (for non-memset types)
 		if (!decl.has_init && !effective_vla && !is_raw && !needs_memset) {
@@ -2355,7 +2236,16 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			bool hit_orelse = false;
 			while (tok->kind != TK_EOF) {
 				if (tok->flags & TF_OPEN) {
-					if (FEAT(F_ORELSE)) check_orelse_in_parens(tok);
+					// orelse inside parens/braces: error (only works at statement level).
+					if (FEAT(F_ORELSE)) {
+						Token *close = tok->match;
+						for (Token *pi = tok, *inner = tok->next; inner != close; pi = inner, inner = inner->next)
+							if ((inner->tag & TT_ORELSE) && !is_known_typedef(inner) &&
+							    !(pi->tag & TT_MEMBER))
+								error_tok(inner,
+									  "'orelse' cannot be used inside parentheses "
+									  "(it must appear at the top level of a declaration)");
+					}
 					tok = walk_balanced(tok, true);
 					continue;
 				}
@@ -2373,11 +2263,11 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			}
 
 			if (hit_orelse) {
-				if (in_for_init())
+				if (ctrl.for_init)
 					error_tok(tok, "orelse cannot be used in for-loop initializers");
 
 				// Detect struct/union value (not enum)
-				bool type_is_sue_not_enum = type->is_struct && !type->is_enum;
+			bool type_is_sue_not_enum = type->is_struct && !type->is_enum;
 				// For function pointers, type-level const qualifies return type, not the variable.
 				bool has_const_qual = (type->has_const && !decl.is_func_ptr) || decl.is_const;
 				if (!has_const_qual && !decl.is_func_ptr && !decl.is_pointer) {
@@ -2394,6 +2284,54 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 						  "(array address is never NULL); remove the orelse clause",
 						  decl.var_name->len,
 						  decl.var_name->loc);
+
+				Token *peek_action = tok->next;
+				bool is_orelse_fallback =
+				    peek_action &&
+				    !(peek_action->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
+				    !match_ch(peek_action, '{') && !match_ch(peek_action, ';');
+
+				// const + fallback orelse: temp variable approach (avoids GNU ternary)
+				if (has_const_qual && is_orelse_fallback) {
+					if (is_struct_val)
+						error_tok(tok,
+							  "orelse fallback on const struct is not supported; "
+							  "use a control flow action (return/break/goto) or "
+							  "remove const");
+
+					Token *orelse_tok = tok;
+					Token *val_start = decl.end->next; // First value token after '='
+
+					register_decl_shadows(decl.var_name, is_vla_type);
+					tok = orelse_tok->next; // skip 'orelse'
+
+					Token *stop_comma = find_boundary_comma(tok);
+
+					tok = handle_const_orelse_fallback(tok,
+									   orelse_tok,
+									   val_start,
+									   decl_start,
+									   &decl,
+									   type_start,
+									   type,
+									   stop_comma);
+
+					emit_typeof_memsets(
+					    typeof_vars, typeof_var_count, type->has_volatile, type->has_const);
+					typeof_var_count = 0;
+
+					if (match_ch(tok, ';')) tok = tok->next;
+					end_statement_after_semicolon();
+
+					if (stop_comma && match_ch(tok, ',')) {
+						tok = tok->next;
+						oe_buf_checkpoint = out_buf_pos;
+						emit_type_stripped(type_start, type->end, false);
+						is_raw = false;
+						continue;
+					}
+					return tok;
+				}
 
 				out_char(';');
 
@@ -2421,11 +2359,11 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 				if (stop_comma && match_ch(tok, ',')) {
 					tok = tok->next;
-					need_type_emit = true;
+					oe_buf_checkpoint = out_buf_pos;
+					emit_type_stripped(type_start, type->end, false);
 					is_raw = false;
 					continue;
 				}
-				if (brace_wrap) OUT_LIT(" }");
 				return tok;
 			}
 		}
@@ -2435,25 +2373,32 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		if (match_ch(tok, ';')) {
 			emit_tok(tok);
 			emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile, type->has_const);
-			if (brace_wrap) OUT_LIT(" }");
 			return tok->next;
 		} else if (match_ch(tok, ',')) {
 			emit_tok(tok);
 			tok = tok->next;
 			is_raw = false; // raw applies to first declarator only
 		} else {
-			if (!first_decl) goto emit_raw_bail;
+			if (oe_buf_checkpoint != original_oe_checkpoint)
+				goto emit_raw_remainder;
 			return NULL;
 		}
 	}
-	return NULL;
 
-emit_raw_bail:
-	while (tok && tok->kind != TK_EOF && !match_ch(tok, ';')) { emit_tok(tok); tok = tok->next; }
-	if (tok && match_ch(tok, ';')) { emit_tok(tok); tok = tok->next; }
-	emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile, type->has_const);
-	if (brace_wrap) OUT_LIT(" }");
-	return tok;
+emit_raw_remainder:
+	if (oe_buf_checkpoint != original_oe_checkpoint) {
+		while (tok && tok->kind != TK_EOF && !match_ch(tok, ';')) {
+			emit_tok(tok);
+			tok = tok->next;
+		}
+		if (tok && match_ch(tok, ';')) {
+			emit_tok(tok);
+			tok = tok->next;
+		}
+		emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile, type->has_const);
+		return tok;
+	}
+	return NULL;
 }
 
 // Register shadows for file-scope _t/__* variable declarations.
@@ -2496,23 +2441,16 @@ static void register_toplevel_shadows(Token *tok) {
 	}
 }
 
-static bool has_storage_in(Token *from, Token *to) {
-	for (Token *s = from; s && s != to; s = s->next)
-		if (s->tag & TT_STORAGE) return true;
-	return false;
-}
-
 // Try to handle a declaration with zero-init. Returns token after declaration, or NULL.
 static Token *try_zero_init_decl(Token *tok) {
-	if (!FEAT(F_ZEROINIT) || ctx->block_depth <= 0 || in_struct_body()) return NULL;
+	if (!FEAT(F_ZEROINIT) || ctx->defer_depth <= 0 || ctx->struct_depth > 0) return NULL;
 
 	if (tok->kind >=
 	    TK_STR) // Fast reject: strings, numbers, prep directives, EOF can't start a declaration
 		return NULL;
 
 	// Declarations in switch body without braces can be skipped by case jumps.
-	ScopeNode *_bt = scope_block_top();
-	bool in_switch_scope_unbraced = _bt && _bt->is_switch;
+	bool in_switch_scope_unbraced = ctx->defer_depth > 0 && defer_stack[ctx->defer_depth - 1].is_switch;
 
 	Token *warn_loc = tok;
 	Token *pragma_start = tok;
@@ -2547,8 +2485,11 @@ static Token *try_zero_init_decl(Token *tok) {
 		if (probe && (probe->flags & TF_RAW) && !is_known_typedef(probe)) {
 			Token *after_raw = skip_noise(probe->next);
 			if (is_raw_declaration_context(after_raw)) {
+				bool has_file_storage = false;
+				for (Token *s = pragma_start; s != probe; s = s->next)
+					if (s->tag & TT_STORAGE) { has_file_storage = true; break; }
 				emit_range(pragma_start, probe);
-				return emit_raw_first_then_zeroinit_rest(after_raw, has_storage_in(pragma_start, probe));
+				return emit_raw_first_then_zeroinit_rest(after_raw, has_file_storage);
 			}
 		}
 	}
@@ -2556,7 +2497,9 @@ static Token *try_zero_init_decl(Token *tok) {
 	if (tok->tag & TT_SKIP_DECL) // Storage class specifiers, control flow, etc.
 	{
 		if (is_raw) {
-			bool has_file_storage = has_storage_in(pragma_start, start);
+			bool has_file_storage = false;
+			for (Token *s = pragma_start; s && s != start; s = s->next)
+				if (s->tag & TT_STORAGE) { has_file_storage = true; break; }
 			if (!has_file_storage && tok && (tok->tag & TT_STORAGE))
 				has_file_storage = true;
 			return emit_raw_first_then_zeroinit_rest(start, has_file_storage);
@@ -2572,27 +2515,46 @@ static Token *try_zero_init_decl(Token *tok) {
 	if (!is_var_declaration(type.end)) {
 		// Detect GNU nested function definitions (break defer/return tracking).
 		if (FEAT(F_DEFER)) {
-			DeclResult decl = parse_declarator(type.end, false);
-			if (decl.var_name) {
-				Token *p = skip_noise(decl.var_name->next);
-				if (p && match_ch(p, '(') && p->match) {
-					Token *a = p->match->next;
-					while (a && (a->tag & (TT_ATTR | TT_ASM))) {
-						a = (a->tag & TT_ASM) ? a->next : skip_noise(a);
-						if (a && match_ch(a, '(') && a->match) a = a->match->next;
+			Token *p = type.end;
+			while (p && (match_ch(p, '*') || (p->tag & TT_QUALIFIER) || (p->tag & TT_ATTR))) {
+				Token *np = skip_noise(p);
+				if (np != p) { p = np; continue; }
+				p = p->next;
+			}
+			if (p && is_valid_varname(p)) {
+				Token *after_name = skip_noise(p->next);
+				if (after_name && match_ch(after_name, '(')) {
+					Token *after_params = skip_balanced(after_name, '(', ')');
+					while (after_params && ((after_params->tag & TT_ATTR) || (after_params->tag & TT_ASM))) {
+						if (after_params->tag & TT_ASM) { after_params = after_params->next; }
+						else after_params = skip_noise(after_params);
+						if (after_params && match_ch(after_params, '(')) after_params = skip_balanced(after_params, '(', ')');
 					}
-					bool nested = a && match_ch(a, '{');
-					if (!nested && a) { // K&R: type name(a,b) int a; int b; { ... }
-						Token *b = a;
-						while (b && b->kind != TK_EOF && !match_ch(b, '{') && !match_ch(b, '}'))
-							b = (b->flags & TF_OPEN && b->match) ? b->match->next : b->next;
-						nested = b && match_ch(b, '{') && is_knr_params(p->match->next, b);
-					}
-					if (nested)
-						error_tok(decl.var_name,
+					if (after_params && match_ch(after_params, '{'))
+						error_tok(p,
 							  "nested function definitions are not supported inside "
 							  "functions using defer/zeroinit — move the function outside "
 							  "or use a function pointer");
+					// K&R-style: type name(a, b) int a; int b; { ... }
+					if (after_params && !match_ch(after_params, '{')) {
+						Token *maybe_brace = after_params;
+						while (maybe_brace && maybe_brace->kind != TK_EOF &&
+						       !match_ch(maybe_brace, '{') && !match_ch(maybe_brace, '}') &&
+						       !match_ch(maybe_brace, ';'))
+							maybe_brace = maybe_brace->next;
+						// Allow scanning through K&R decls (ending with ';')
+						if (maybe_brace && match_ch(maybe_brace, ';')) {
+							while (maybe_brace && maybe_brace->kind != TK_EOF &&
+							       !match_ch(maybe_brace, '{') && !match_ch(maybe_brace, '}'))
+								maybe_brace = maybe_brace->next;
+						}
+						if (maybe_brace && match_ch(maybe_brace, '{') &&
+						    is_knr_params(after_params, maybe_brace))
+							error_tok(p,
+								  "nested function definitions are not supported inside "
+								  "functions using defer/zeroinit — move the function outside "
+								  "or use a function pointer");
+					}
 				}
 			}
 		}
@@ -2606,14 +2568,31 @@ static Token *try_zero_init_decl(Token *tok) {
 			  "or use 'raw' to suppress zero-init.");
 	}
 
-	// Braceless control body: wrap in braces (orelse expands to multiple stmts).
-	bool brace_wrap = pending_ctrl && parens_just_closed;
+	// Flush before checkpoint so speculative output + rollback is safe.
+	out_flush();
+	oe_buf_checkpoint = out_buf_pos;
 
-	Token *result = process_declarators(type.end, &type, is_raw, start, pragma_start, raw_tok, brace_wrap);
-	if (result && !is_raw && ctx->block_depth > 0) {
-		ScopeNode *bt = scope_block_top();
-		if (bt) bt->has_zeroinit_decl = true;
+	// Braceless control body: wrap in braces (orelse expands to multiple stmts).
+	bool brace_wrap = ctrl.pending && ctrl.parens_just_closed;
+	if (brace_wrap) OUT_LIT(" {");
+
+	if (raw_tok && pragma_start != start) {
+		emit_range(pragma_start, raw_tok);
+	} else if (pragma_start != start) {
+		emit_range(pragma_start, start);
 	}
+	emit_range(start, type.end);
+
+	Token *result = process_declarators(type.end, &type, is_raw, start);
+	if (result && brace_wrap) OUT_LIT(" }");
+	if (!result && oe_buf_checkpoint >= 0) {
+		// Rollback speculative output.
+		out_buf_pos = oe_buf_checkpoint;
+		last_emitted = NULL;
+	}
+	oe_buf_checkpoint = -1;
+	if (result && !is_raw && ctx->defer_depth > 0)
+		defer_stack[ctx->defer_depth - 1].has_zeroinit_decl = true;
 	return result;
 }
 
@@ -2652,41 +2631,30 @@ static Token *emit_expr_to_semicolon(Token *tok) {
 		}
 
 		emit_tok(tok);
-
-		if (match_ch(tok, '{') || match_ch(tok, ';') || match_ch(tok, '}'))
-			expr_at_stmt_start = true;
-		else if (match_ch(tok, ':') && ternary_depth > 0) {
-			ternary_depth--;
-			expr_at_stmt_start = false;
-		} else if (match_ch(tok, ':') && ternary_depth <= 0)
-			expr_at_stmt_start = true;
-		else
-			expr_at_stmt_start = false;
-
 		tok = tok->next;
+
+		if (last_emitted &&
+		    (match_ch(last_emitted, '{') || match_ch(last_emitted, ';') || match_ch(last_emitted, '}')))
+			expr_at_stmt_start = true;
+		else if (last_emitted && match_ch(last_emitted, ':') && ternary_depth <= 0)
+			expr_at_stmt_start = true;
+		else {
+			if (last_emitted && match_ch(last_emitted, ':') && ternary_depth > 0) ternary_depth--;
+			expr_at_stmt_start = false;
+		}
 	}
 	return tok;
 }
 
 // Validate control flow keywords inside defer blocks are safe
-// Recursively validate control flow inside defer blocks using structural skipping
-static void validate_defer_body(Token *tok, Token *end, bool in_loop, bool in_switch) {
-	for (; tok && tok != end && tok->kind != TK_EOF; tok = tok->next) {
-		if (tok->flags & TF_OPEN) {
-			if (match_ch(tok, '{')) validate_defer_body(tok->next, tok->match, in_loop, in_switch);
-			tok = tok->match ? tok->match : tok; continue;
-		}
-		if (tok->kind != TK_KEYWORD) continue;
-		if (tok->tag & TT_LOOP) in_loop = true;
-		else if (tok->tag & TT_SWITCH) in_switch = true;
-		else if (tok->tag & TT_RETURN) error_tok(tok, "'return' inside defer block bypasses remaining defers");
-		else if ((tok->tag & TT_GOTO) && !is_known_typedef(tok)) error_tok(tok, "'goto' inside defer block could bypass remaining defers");
-		else if ((tok->tag & TT_BREAK) && !in_loop && !in_switch) error_tok(tok, "'break' inside defer block bypasses remaining defers");
-		else if ((tok->tag & TT_CONTINUE) && !in_loop) error_tok(tok, "'continue' inside defer block bypasses remaining defers");
-		else if ((tok->tag & TT_DEFER) && !is_known_typedef(tok) &&
-			 !match_ch(tok->next, ':') && !(tok->next && (tok->next->tag & TT_ASSIGN)))
-			error_tok(tok, "nested defer is not supported");
-	}
+static void validate_defer_control_flow(Token *t, int inner_loop_depth, int inner_switch_depth) {
+	if (t->tag & TT_RETURN) error_tok(t, "'return' inside defer block bypasses remaining defers");
+	if ((t->tag & TT_GOTO) && !is_known_typedef(t))
+		error_tok(t, "'goto' inside defer block could bypass remaining defers");
+	if ((t->tag & TT_BREAK) && inner_loop_depth == 0 && inner_switch_depth == 0)
+		error_tok(t, "'break' inside defer block bypasses remaining defers");
+	if ((t->tag & TT_CONTINUE) && inner_loop_depth == 0)
+		error_tok(t, "'continue' inside defer block bypasses remaining defers");
 }
 
 // Handle 'defer' keyword: validate context, record deferred statement.
@@ -2696,16 +2664,16 @@ static Token *handle_defer_keyword(Token *tok) {
 	// Distinguish struct field, label, goto target, variable assignment, attribute usage
 	if (match_ch(tok->next, ':') || (last_emitted && (last_emitted->tag & (TT_MEMBER | TT_GOTO))) ||
 	    (last_emitted && (is_type_keyword(last_emitted) || (last_emitted->tag & TT_TYPEDEF))) ||
-	    is_known_typedef(tok) || (tok->next && (tok->next->tag & TT_ASSIGN)) || in_struct_body() ||
+	    is_known_typedef(tok) || (tok->next && (tok->next->tag & TT_ASSIGN)) || ctx->struct_depth > 0 ||
 	    is_inside_attribute(tok))
 		return NULL;
 
 	// Context validation
-	if (in_ctrl_paren())
+	if (ctrl.pending && ctrl.paren_depth > 0)
 		error_tok(tok, "defer cannot appear inside control statement parentheses");
-	if (pending_ctrl && !in_ctrl_paren())
+	if (ctrl.pending && ctrl.paren_depth == 0)
 		error_tok(tok, "defer requires braces in control statements (braceless has no scope)");
-	if (scope_block_top() && scope_block_top()->is_stmt_expr)
+	if (ctx->defer_depth > 0 && defer_stack[ctx->defer_depth - 1].is_stmt_expr)
 		error_tok(tok,
 			  "defer cannot be at top level of statement expression; wrap in a block");
 	// setjmp/longjmp/vfork/asm safety checks
@@ -2715,12 +2683,9 @@ static Token *handle_defer_keyword(Token *tok) {
 		error_tok(tok, "defer cannot be used in functions that call vfork()");
 	if (ctx->current_func_has_asm)
 		error_tok(tok, "defer cannot be used in functions containing inline assembly");
-	for (int d = ctx->scope_depth - 1; d >= 0; d--) {
-		if (scope_stack[d].kind != SCOPE_BLOCK) continue;
-		if (scope_stack[d].is_switch)
+	for (int d = ctx->defer_depth - 1; d >= 0; d--)
+		if (defer_stack[d].is_switch && ctx->defer_depth - 1 == d)
 			error_tok(tok, "defer in switch case requires braces");
-		break;  // only check innermost block
-	}
 
 	Token *defer_keyword = tok;
 	tok = tok->next;
@@ -2730,15 +2695,136 @@ static Token *handle_defer_keyword(Token *tok) {
 	if (stmt_end->kind == TK_EOF || !match_ch(stmt_end, ';'))
 		error_tok(defer_keyword, "unterminated defer statement; expected ';'");
 
-	// Validate inner control flow (returns, missing semicolons, breaks outside loops)
-	if (stmt_start && stmt_start->kind == TK_KEYWORD &&
-	    (stmt_start->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO | TT_IF | TT_LOOP |
-				TT_SWITCH | TT_CASE | TT_DEFAULT | TT_DEFER)))
-		error_tok(defer_keyword,
-			  "defer statement appears to be missing ';' (found '%.*s' keyword inside)",
-			  stmt_start->len, stmt_start->loc);
+	int bd = 0, pd = 0, bkd = 0;
 
-	validate_defer_body(stmt_start, stmt_end, false, false);
+	// Track loop/switch nesting for break/continue validation.
+	int inner_loop_depth = 0;
+	int inner_switch_depth = 0;
+	// scope_type_at_depth: 1=loop, 2=switch; fixes nested switch-inside-loop.
+	uint8_t scope_type_at_depth[4096] = {0};
+
+	bool pk_is_loop = false;
+	int pk_paren = 0;
+	bool pk_tracking = false;
+	bool pk_body_next = false;
+	bool pk_do_body = false;
+	bool pk_skip_body = false;
+	bool prev_was_rbrace = false;
+
+	int braceless_loop_n = 0;
+	int braceless_switch_n = 0;
+	int braceless_bd = -1;
+
+	for (Token *t = stmt_start; t != stmt_end && t->kind != TK_EOF; t = t->next) {
+		bool at_top = (bd == 0 && pd == 0 && bkd == 0);
+		if (t != stmt_start && tok_at_bol(t) && at_top && !match_ch(t, '{') && !match_ch(t, '(') &&
+		    !match_ch(t, '['))
+			error_tok(defer_keyword,
+				  "defer statement spans multiple lines without ';' - add semicolon");
+
+		if (pk_body_next || pk_do_body) {
+			if (match_ch(t, '{')) {
+				int new_bd = bd + 1;
+				bool is_loop = pk_is_loop || pk_do_body;
+					if (new_bd < 4096) scope_type_at_depth[new_bd] = is_loop ? 1 : 2;
+				
+				if (is_loop) inner_loop_depth++;
+				else inner_switch_depth++;
+				
+				pk_body_next = false;
+				pk_do_body = false;
+			} else {
+				if (pk_is_loop || pk_do_body) {
+					inner_loop_depth++;
+					braceless_loop_n++;
+				} else {
+					inner_switch_depth++;
+					braceless_switch_n++;
+				}
+				braceless_bd = bd;
+				pk_body_next = false;
+				pk_do_body = false;
+			}
+		}
+
+		if (bd > 0 && t->kind == TK_KEYWORD) {
+			if ((t->tag & TT_LOOP) && !prev_was_rbrace) {
+				if (equal(t, "do")) {
+					pk_do_body = true;
+					pk_is_loop = true;
+				} else {
+					pk_tracking = true;
+					pk_is_loop = true;
+					pk_paren = 0;
+				}
+			} else if (t->tag & TT_SWITCH) {
+				pk_tracking = true;
+				pk_is_loop = false;
+				pk_paren = 0;
+			}
+		}
+
+		if (pk_tracking) {
+			if (match_ch(t, '(')) pk_paren++;
+			else if (match_ch(t, ')')) {
+				pk_paren--;
+				if (pk_paren <= 0) {
+					if (!pk_skip_body) pk_body_next = true;
+					pk_tracking = false;
+					pk_skip_body = false;
+				}
+			}
+		}
+
+		if (match_ch(t, '{')) bd++;
+		else if (match_ch(t, '}')) {
+			if (bd < 4096 && bd > 0) {
+				if (scope_type_at_depth[bd] == 1 && inner_loop_depth > 0) inner_loop_depth--;
+				else if (scope_type_at_depth[bd] == 2 && inner_switch_depth > 0) inner_switch_depth--;
+				scope_type_at_depth[bd] = 0;
+			}
+			bd--;
+		} else if (match_ch(t, '('))
+			pd++;
+		else if (match_ch(t, ')'))
+			pd--;
+		else if (match_ch(t, '['))
+			bkd++;
+		else if (match_ch(t, ']'))
+			bkd--;
+
+		// Braceless body end: '}' or ';' at entry depth, unless 'else' follows.
+		if (braceless_bd >= 0 && bd == braceless_bd && pd == 0 && bkd == 0 &&
+		    (match_ch(t, '}') || match_ch(t, ';')) && !(t->next && equal(t->next, "else"))) {
+			if (braceless_loop_n > 0) {
+				inner_loop_depth -= braceless_loop_n;
+				if (inner_loop_depth < 0) inner_loop_depth = 0;
+				braceless_loop_n = 0;
+			}
+			if (braceless_switch_n > 0) {
+				inner_switch_depth -= braceless_switch_n;
+				if (inner_switch_depth < 0) inner_switch_depth = 0;
+				braceless_switch_n = 0;
+			}
+			braceless_bd = -1;
+		}
+
+		prev_was_rbrace = match_ch(t, '}');
+
+		if (at_top && t->kind == TK_KEYWORD &&
+		    (t->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO | TT_IF | TT_LOOP | TT_SWITCH |
+			       TT_CASE | TT_DEFAULT | TT_DEFER)))
+			error_tok(defer_keyword,
+				  "defer statement appears to be missing ';' (found '%.*s' keyword inside)",
+				  t->len,
+				  t->loc);
+		if (!at_top && (t->tag & TT_DEFER) && !is_known_typedef(t) && !match_ch(t->next, ':') &&
+		    !(t->next && (t->next->tag & TT_ASSIGN)))
+			error_tok(defer_keyword, "nested defer is not supported");
+		if (!at_top && t->kind == TK_KEYWORD &&
+		    (t->tag & (TT_RETURN | TT_GOTO | TT_BREAK | TT_CONTINUE)))
+			validate_defer_control_flow(t, inner_loop_depth, inner_switch_depth);
+	}
 
 	defer_add(defer_keyword, stmt_start, stmt_end);
 	tok = (stmt_end->kind != TK_EOF) ? stmt_end->next : stmt_end;
@@ -2906,14 +2992,6 @@ static void check_goto_decl_safety(GotoSkipResult *skip, Token *goto_tok, Token 
 	}
 }
 
-static LabelInfo *label_find(Token *tok) {
-	for (int i = 0; i < label_table.count; i++)
-		if (label_table.labels[i].name_len == tok->len &&
-		    !memcmp(label_table.labels[i].name, tok->loc, tok->len))
-			return &label_table.labels[i];
-	return NULL;
-}
-
 // Handle 'goto': defer cleanup + zeroinit safety checks
 static Token *handle_goto_keyword(Token *tok) {
 	Token *goto_tok = tok;
@@ -2930,7 +3008,11 @@ static Token *handle_goto_keyword(Token *tok) {
 		}
 
 		if (is_identifier_like(tok)) {
-			LabelInfo *info = label_find(tok);
+			int lidx = -1;
+			for (int i = 0; i < label_table.count; i++) {
+				if (label_table.labels[i].name_len == tok->len && !memcmp(label_table.labels[i].name, tok->loc, tok->len)) { lidx = i; break; }
+			}
+			LabelInfo *info = lidx >= 0 ? &label_table.labels[lidx] : NULL;
 
 			GotoSkipResult skip = goto_skips_check(goto_tok, info, true, true);
 			if (skip.skipped_defer) {
@@ -2940,15 +3022,15 @@ static Token *handle_goto_keyword(Token *tok) {
 			}
 			check_goto_decl_safety(&skip, goto_tok, tok, info);
 
-			int target_depth = info ? info->scope_depth : ctx->block_depth;
+			int target_depth = info ? info->scope_depth : ctx->defer_depth;
 
-			if (target_depth >= ctx->block_depth) {
+			if (target_depth >= ctx->defer_depth) {
 				int exits = 0;
 				if (info && info->tok->loc > goto_tok->loc) exits = goto_scope_exits(goto_tok, info->tok);
 				else if (info) exits = goto_scope_exits(info->tok, goto_tok);
 
 				if (exits > 0) {
-					target_depth = ctx->block_depth - exits;
+					target_depth = ctx->defer_depth - exits;
 					if (target_depth < 0) target_depth = 0;
 				}
 			}
@@ -2973,7 +3055,11 @@ static Token *handle_goto_keyword(Token *tok) {
 	}
 
 	if (FEAT(F_ZEROINIT) && is_identifier_like(tok)) {
-		LabelInfo *info = label_find(tok);
+		int lidx = -1;
+		for (int i = 0; i < label_table.count; i++) {
+			if (label_table.labels[i].name_len == tok->len && !memcmp(label_table.labels[i].name, tok->loc, tok->len)) { lidx = i; break; }
+		}
+		LabelInfo *info = lidx >= 0 ? &label_table.labels[lidx] : NULL;
 		GotoSkipResult skip = goto_skips_check(goto_tok, info, false, true);
 		check_goto_decl_safety(&skip, goto_tok, tok, info);
 	}
@@ -2986,29 +3072,27 @@ static void handle_case_default(Token *tok) {
 	int sd = find_switch_scope();
 	if (sd < 0) return;
 	bool is_case = tok->tag & TT_CASE;
-	bool is_default = (tok->tag & TT_DEFAULT) && !in_generic();
+	bool is_default = (tok->tag & TT_DEFAULT) && ctx->generic_paren_depth == 0;
 	if (is_default) {
 		Token *t = skip_noise(tok->next);
 		if (!t || !match_ch(t, ':')) return;
 	}
 	if (!is_case && !is_default) return;
 
-	for (int d = ctx->scope_depth - 1; d >= sd; d--) {
-		if (scope_stack[d].kind != SCOPE_BLOCK) continue;
-		if (scope_stack[d].count > 0 && !scope_stack[d].had_control_exit)
-			error_tok(scope_stack[d].entries[0].defer_kw,
+	for (int d = ctx->defer_depth - 1; d >= sd; d--) {
+		if (defer_stack[d].count > 0 && !defer_stack[d].had_control_exit)
+			error_tok(defer_stack[d].entries[0].defer_kw,
 				  "defer skipped by switch fallthrough at %s:%d",
 				  tok_file(tok)->name,
 				  tok_line_no(tok));
-		scope_stack[d].count = 0;
-		scope_stack[d].had_control_exit = false;
+		defer_stack[d].count = 0;
+		defer_stack[d].had_control_exit = false;
 	}
 
 	// case/default inside nested block may bypass zero-init'd declarations
-	if (FEAT(F_ZEROINIT) && ctx->scope_depth > sd + 1) {
-		for (int d = sd + 1; d < ctx->scope_depth; d++) {
-			if (scope_stack[d].kind != SCOPE_BLOCK) continue;
-			if (scope_stack[d].has_zeroinit_decl) {
+	if (FEAT(F_ZEROINIT) && ctx->defer_depth > sd + 1) {
+		for (int d = sd + 1; d < ctx->defer_depth; d++) {
+			if (defer_stack[d].has_zeroinit_decl) {
 				error_tok(tok,
 					  "case/default label inside a nested block within a switch may bypass "
 					  "zero-initialization (move the label to the switch body or wrap in its own block)");
@@ -3016,7 +3100,7 @@ static void handle_case_default(Token *tok) {
 		}
 	}
 
-	scope_stack[sd].seen_case_label = true;
+	defer_stack[sd].seen_case_label = true;
 }
 
 static Token *handle_sue_body(Token *tok) {
@@ -3026,50 +3110,56 @@ static Token *handle_sue_body(Token *tok) {
 	emit_range(tok, brace);
 	emit_tok(brace);
 	tok = brace->next;
-	scope_push(false);
-	scope_stack[ctx->scope_depth - 1].is_struct = true;
+	ctx->struct_depth++;
+	defer_push_scope(false);
+	defer_stack[ctx->defer_depth - 1].is_struct = true;
 	ctx->at_stmt_start = true;
 	return tok;
 }
 
 static Token *handle_open_brace(Token *tok) {
 	// Compound literal inside control parens or before body
-	if (pending_ctrl && (in_ctrl_paren() || !parens_just_closed)) {
+	if (ctrl.pending && (ctrl.paren_depth > 0 || !ctrl.parens_just_closed)) {
 		emit_tok(tok);
+		ctrl.brace_depth++;
 		return tok->next;
 	}
-	if (pending_ctrl && !(pending_scope_flags & NS_SWITCH)) pending_scope_flags |= NS_CONDITIONAL;
-	bool orelse_guard = pending_orelse_guard;
-	// Consume pending state but keep scope flags for scope_push
-	pending_ctrl = false;
-	pending_for_paren = false;
-	parens_just_closed = false;
-	pending_orelse_guard = false;
+	if (ctrl.pending && !(ctrl.next_scope & NS_SWITCH)) ctrl.next_scope |= NS_CONDITIONAL;
+	bool orelse_guard = ctrl.pending_orelse_guard;
+	ctrl = (ControlFlow){.next_scope = ctrl.next_scope};
 
 	// Evaluate BEFORE emit_tok
 	bool is_stmt_expr = last_emitted && match_ch(last_emitted, '(');
 
 	emit_tok(tok);
 	tok = tok->next;
-	scope_push(true);
+	defer_push_scope(true);
 
 	// Tag the newly created scope directly
-	if (is_stmt_expr) scope_stack[ctx->scope_depth - 1].is_stmt_expr = true;
-	if (orelse_guard) scope_stack[ctx->scope_depth - 1].is_orelse_guard = true;
+	if (is_stmt_expr) defer_stack[ctx->defer_depth - 1].is_stmt_expr = true;
+	if (orelse_guard) defer_stack[ctx->defer_depth - 1].is_orelse_guard = true;
 
 	ctx->at_stmt_start = true;
 	return tok;
 }
 
 static Token *handle_close_brace(Token *tok) {
-	typedef_pop_scope(ctx->block_depth);
-	if (FEAT(F_DEFER) && ctx->scope_depth > 0 && scope_stack[ctx->scope_depth - 1].count > 0)
+	// Compound literal close inside control parens
+	if (ctrl.pending && ctrl.paren_depth > 0 && ctrl.brace_depth > 0) {
+		ctrl.brace_depth--;
+		emit_tok(tok);
+		return tok->next;
+	}
+	if (ctx->defer_depth > 0 && defer_stack[ctx->defer_depth - 1].is_struct && ctx->struct_depth > 0)
+		ctx->struct_depth--;
+	typedef_pop_scope(ctx->defer_depth);
+	if (FEAT(F_DEFER) && ctx->defer_depth > 0 && defer_stack[ctx->defer_depth - 1].count > 0)
 		emit_defers(DEFER_SCOPE);
 
 	// Check guard BEFORE popping the scope
-	bool close_guard = ctx->scope_depth > 0 && scope_stack[ctx->scope_depth - 1].is_orelse_guard;
+	bool close_guard = ctx->defer_depth > 0 && defer_stack[ctx->defer_depth - 1].is_orelse_guard;
 
-	scope_pop();
+	defer_pop_scope();
 	emit_tok(tok);
 
 	// Close dangling-else guard brace if flagged
@@ -3343,63 +3433,38 @@ static char *preprocess_with_cc(const char *input_file) {
 
 // Shared helpers for transpile_tokens
 
-static inline void track_ctrl_paren_open(Token *tok) {
-	ScopeKind k;
-	if (pending_for_paren) {
-		k = SCOPE_FOR_PAREN;
-		pending_for_paren = false;
-	} else {
-		k = SCOPE_CTRL_PAREN;
+static inline void track_ctrl_paren_open(void) {
+	ctrl.paren_depth++;
+	ctrl.parens_just_closed = false;
+	if (ctrl.await_for_paren) {
+		ctrl.for_init = true;
+		ctx->at_stmt_start = true;
+		ctrl.await_for_paren = false;
 	}
-	parens_just_closed = false;
-	Token *close = tok->match;  // parse.c linked matching ')'
-	scope_push_kind(k, false, close);
-	ctx->at_stmt_start = (k == SCOPE_FOR_PAREN);
 }
 
 static inline void track_ctrl_paren_close(void) {
-	// Pop paren scopes down to and including the matching one
-	while (ctx->scope_depth > 0) {
-		ScopeKind k = scope_stack[ctx->scope_depth - 1].kind;
-		if (k == SCOPE_FOR_PAREN || k == SCOPE_CTRL_PAREN) {
-			scope_pop();
-			break;
-		}
-		if (k == SCOPE_TERNARY) scope_pop(); // pop stale ternaries
-		else break;
+	ctrl.paren_depth--;
+	if (ctrl.paren_depth == 0) {
+		ctrl.for_init = false;
+		ctrl.parens_just_closed = true;
+		// Mark next token as stmt start for braceless control-flow bodies
+		ctx->at_stmt_start = true;
 	}
-	parens_just_closed = true;
-	ctx->at_stmt_start = true;
 }
 
 static inline void track_ctrl_semicolon(void) {
-	if (in_for_init()) {
-		// First ';' in for-init: pop FOR_PAREN, push CTRL_PAREN (for condition/update)
-		scope_pop();
-		// Re-push as CTRL_PAREN so second ';' triggers end_statement
-		// Actually: the 2nd semicolon is still inside parens, so we just downgrade
-		// No — for(init; cond; update) has parens not semicolons controlling it.
-		// in_for_init returns false now. That's correct.
-		// But we need to stay inside a ctrl paren scope so ';' doesn't end the statement
-		scope_push_kind(SCOPE_CTRL_PAREN, false, NULL);
-	} else if (!in_ctrl_paren()) {
-		typedef_pop_scope(ctx->block_depth + 1);
-		ctrl_reset();
+	if (ctrl.paren_depth == 1 && ctrl.for_init && ctrl.brace_depth == 0) ctrl.for_init = false;
+	else if (ctrl.paren_depth == 0) {
+		typedef_pop_scope(ctx->defer_depth + 1);
+		control_flow_reset();
 	}
 }
 
-static inline void push_generic_scope(Token *tok) {
-	Token *close = tok->match;
-	scope_push_kind(SCOPE_GENERIC, false, close);
-}
-
-static inline void pop_generic_scope(void) {
-	while (ctx->scope_depth > 0) {
-		ScopeKind k = scope_stack[ctx->scope_depth - 1].kind;
-		if (k == SCOPE_GENERIC) { scope_pop(); break; }
-		if (k == SCOPE_TERNARY) scope_pop();
-		else break;
-	}
+static inline void track_generic_paren(Token *tok) {
+	if (match_ch(tok, '(')) ctx->generic_paren_depth++;
+	else if (match_ch(tok, ')'))
+		ctx->generic_paren_depth--;
 }
 
 // Scan ahead for 'orelse' at depth 0 in a bare expression
@@ -3441,13 +3506,13 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 	Token *last_toplevel_paren = NULL;
 	Token *last_toplevel_open_paren = NULL;
 	int toplevel_paren_depth = 0;
+	int ternary_depth = 0;
 
 	while (tok->kind != TK_EOF) {
 		Token *next;
 		uint32_t tag = tok->tag;
 
-		if (tok->len == 1 && tok->shortcut == '?')
-			scope_push_kind(SCOPE_TERNARY, false, NULL);
+		if (tok->len == 1 && tok->shortcut == '?') ternary_depth++;
 
 #define DISPATCH(handler)                                                                                    \
 	{                                                                                                    \
@@ -3460,7 +3525,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 // Track top-level parentheses for function detection
 #define TRACK_TOPLEVEL_PAREN(tok)                                                                            \
-	if (ctx->block_depth == 0) {                                                                         \
+	if (ctx->defer_depth == 0) {                                                                         \
 		if (match_ch(tok, '(')) {                                                                    \
 			if (toplevel_paren_depth == 0) {                                                     \
 				last_toplevel_open_paren = tok;                                              \
@@ -3477,16 +3542,13 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 		// Fast path: untagged tokens not at statement start (~70-80% of tokens)
 		if (__builtin_expect(!tag && !ctx->at_stmt_start, 1)) {
-			if (__builtin_expect(pending_ctrl && tok->len == 1, 0)) {
+			if (__builtin_expect(ctrl.pending && tok->len == 1, 0)) {
 				char c = tok->shortcut;
-				if (c == '(') track_ctrl_paren_open(tok);
+				if (c == '(') track_ctrl_paren_open();
 				else if (c == ')')
 					track_ctrl_paren_close();
 			}
-			if (__builtin_expect(in_generic(), 0)) {
-				if (match_ch(tok, '(')) push_generic_scope(tok);
-				else if (match_ch(tok, ')')) pop_generic_scope();
-			}
+			if (__builtin_expect(ctx->generic_paren_depth > 0, 0)) track_generic_paren(tok);
 			TRACK_TOPLEVEL_PAREN(tok);
 			emit_tok(tok);
 			tok = tok->next;
@@ -3496,12 +3558,12 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		// Slow path: statement-start processing and tagged tokens
 
 		// Track typedefs (must precede zero-init check)
-		// For-init typedefs registered at block_depth+1 for loop-scoped cleanup
-		if (ctx->at_stmt_start && !in_struct_body()) {
+		// For-init typedefs registered at defer_depth+1 for loop-scoped cleanup
+		if (ctx->at_stmt_start && ctx->struct_depth == 0) {
 			if (tag & TT_TYPEDEF) {
-				parse_typedef_declaration(tok, ctx->block_depth + (in_for_init() ? 1 : 0));
+				parse_typedef_declaration(tok, ctx->defer_depth + (ctrl.for_init ? 1 : 0));
 			} else if (is_raw(tok) && tok->next && (tok->next->tag & TT_TYPEDEF)) {
-				parse_typedef_declaration(tok->next, ctx->block_depth + (in_for_init() ? 1 : 0));
+				parse_typedef_declaration(tok->next, ctx->defer_depth + (ctrl.for_init ? 1 : 0));
 				tok = tok->next;
 				continue;
 			}
@@ -3510,14 +3572,14 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		// Register shadows for file-scope _t/__ variable declarations
 		// to prevent typedef heuristic misidentification.
 		// Skip between function ')' and '{' (K&R parameter declarations).
-		if (ctx->at_stmt_start && ctx->block_depth == 0 && !in_struct_body() &&
+		if (ctx->at_stmt_start && ctx->defer_depth == 0 && ctx->struct_depth == 0 &&
 		    !(tag & TT_TYPEDEF) && !last_toplevel_paren)
 			register_toplevel_shadows(tok);
 
 		// Zero-init declarations at statement start.
 		// Skip structural tokens to avoid scanning brace blocks (RSS growth on musl ARM64).
 		if (ctx->at_stmt_start && !(tag & TT_STRUCTURAL) &&
-		    (!pending_ctrl || in_for_init() || parens_just_closed)) {
+		    (!ctrl.pending || ctrl.for_init || ctrl.parens_just_closed)) {
 			next = try_zero_init_decl(tok);
 			if (next) {
 				tok = next;
@@ -3528,12 +3590,12 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			// Bare expression orelse.
 			// Skip keywords that introduce sub-statements or labels
 			// to avoid sweeping them into the if(!(...)) condition.
-			if (FEAT(F_ORELSE) && ctx->block_depth > 0 && !in_struct_body() &&
+			if (FEAT(F_ORELSE) && ctx->defer_depth > 0 && ctx->struct_depth == 0 &&
 			    !(tok->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO |
 					  TT_CASE | TT_DEFAULT | TT_IF | TT_LOOP | TT_SWITCH))) {
 				Token *orelse_tok = find_bare_orelse(tok);
 				if (orelse_tok) {
-					if (in_for_init())
+					if (ctrl.for_init)
 						error_tok(tok, "orelse cannot be used in for-loop initializers");
 					if (is_orelse_keyword(tok))
 						error_tok(tok, "expected expression before 'orelse'");
@@ -3638,7 +3700,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					bool is_block_action = match_ch(tok, '{');
 					tok = emit_orelse_action(tok, NULL, false, NULL);
 					if (is_block_action) {
-						pending_orelse_guard = true;
+						ctrl.pending_orelse_guard = true;
 					} else {
 						OUT_LIT(" }");
 					}
@@ -3666,7 +3728,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		if (tag) {
 			// Keyword dispatch
 
-			if (__builtin_expect(tag & TT_DEFER, 0) && !in_generic())
+			if (__builtin_expect(tag & TT_DEFER, 0) && ctx->generic_paren_depth == 0)
 				DISPATCH(handle_defer_keyword);
 			if (__builtin_expect(FEAT(F_DEFER) && (tag & TT_RETURN), 0))
 				DISPATCH(handle_return_defer);
@@ -3679,22 +3741,22 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 			if (tag & TT_LOOP) {
 				if (FEAT(F_DEFER)) {
-					pending_scope_flags |= NS_LOOP;
-					pending_ctrl = true;
-					if (equal(tok, "do")) parens_just_closed = true;
+					ctrl.next_scope |= NS_LOOP;
+					ctrl.pending = true;
+					if (equal(tok, "do")) ctrl.parens_just_closed = true;
 				}
 				if (equal(tok, "for") && FEAT(F_DEFER | F_ZEROINIT)) {
-					pending_ctrl = true;
-					pending_for_paren = true;
+					ctrl.pending = true;
+					ctrl.await_for_paren = true;
 				}
 			}
 
-			if ((tag & TT_GENERIC) && !in_generic()) {
+			if ((tag & TT_GENERIC) && ctx->generic_paren_depth == 0) {
 				emit_tok(tok);
 				last_emitted = tok;
 				tok = tok->next;
 				if (tok && match_ch(tok, '(')) {
-					push_generic_scope(tok);
+					ctx->generic_paren_depth = 1;
 					emit_tok(tok);
 					last_emitted = tok;
 					tok = tok->next;
@@ -3703,14 +3765,14 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			}
 
 			if (FEAT(F_DEFER) && (tag & TT_SWITCH)) {
-				pending_scope_flags |= NS_SWITCH;
-				pending_ctrl = true;
+				ctrl.next_scope |= NS_SWITCH;
+				ctrl.pending = true;
 			}
 
 			if (tag & TT_IF) {
-				pending_ctrl = true;
+				ctrl.pending = true;
 				if (equal(tok, "else")) {
-					parens_just_closed = true;
+					ctrl.parens_just_closed = true;
 					ctx->at_stmt_start = true;
 				}
 			}
@@ -3720,13 +3782,10 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 		} // end if (tag)
 
-		if (__builtin_expect(in_generic(), 0)) {
-			if (match_ch(tok, '(')) push_generic_scope(tok);
-			else if (match_ch(tok, ')')) pop_generic_scope();
-		}
+		if (__builtin_expect(ctx->generic_paren_depth > 0, 0)) track_generic_paren(tok);
 
 		// Void function detection and return type capture at top level
-		if (ctx->block_depth == 0 &&
+		if (ctx->defer_depth == 0 &&
 		    (tag & (TT_TYPE | TT_QUALIFIER | TT_SKIP_DECL | TT_ATTR | TT_INLINE) ||
 		     (is_identifier_like(tok) && (is_void_typedef(tok) || is_known_typedef(tok))))) {
 			int ret = capture_function_return_type(tok);
@@ -3741,7 +3800,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		if (tag & TT_STRUCTURAL) {
 			if (match_ch(tok, '{')) {
 				// Function definition detection at top level
-				if (ctx->block_depth == 0 && FEAT(F_DEFER)) {
+				if (ctx->defer_depth == 0 && FEAT(F_DEFER)) {
 					bool is_func_def = false;
 					if (prev_toplevel_tok && match_ch(prev_toplevel_tok, ')'))
 						is_func_def = true;
@@ -3768,7 +3827,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					last_toplevel_paren = NULL;
 				}
 				// Reset K&R tracking at file scope to avoid stale shadow table guard
-				if (ctx->block_depth == 0)
+				if (ctx->defer_depth == 0)
 					last_toplevel_paren = NULL;
 				tok = handle_open_brace(tok);
 				continue;
@@ -3776,7 +3835,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			if (match_ch(tok, '}')) {
 				tok = handle_close_brace(tok);
 				// Reset per-function flags when leaving a function body
-				if (ctx->block_depth == 0) {
+				if (ctx->defer_depth == 0) {
 					ctx->current_func_has_setjmp = false;
 					ctx->current_func_has_vfork = false;
 					ctx->current_func_has_asm = false;
@@ -3785,9 +3844,9 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			}
 			char c = tok->loc[0];
 			if (c == ';') {
-				if (in_ctrl_paren() || in_for_init()) track_ctrl_semicolon();
-				else end_statement_after_semicolon();
-				if (ctx->block_depth == 0) {
+				if (ctrl.pending) track_ctrl_semicolon();
+				if (!ctrl.pending) end_statement_after_semicolon();
+				if (ctx->defer_depth == 0) {
 					next_func_returns_void = false;
 					next_func_ret_captured = false;
 				}
@@ -3796,12 +3855,12 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				continue;
 			}
 			if (c == ':') {
-				if (scope_top_kind() == SCOPE_TERNARY) {
-					scope_pop();
-				} else if (in_generic()) {
+				if (ternary_depth > 0) {
+					ternary_depth--;
+				} else if (ctx->generic_paren_depth > 0) {
 				} else if (last_emitted &&
 				           (is_identifier_like(last_emitted) || last_emitted->kind == TK_NUM) &&
-				           !in_struct_body() && ctx->block_depth > 0) {
+				           ctx->struct_depth == 0 && ctx->defer_depth > 0) {
 					emit_tok(tok);
 					tok = tok->next;
 					ctx->at_stmt_start = true;
@@ -3817,9 +3876,9 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			continue;
 		}
 
-		if (pending_ctrl && tok->len == 1) {
+		if (ctrl.pending && tok->len == 1) {
 			char c = tok->loc[0];
-			if (c == '(') track_ctrl_paren_open(tok);
+			if (c == '(') track_ctrl_paren_open();
 			else if (c == ')')
 				track_ctrl_paren_close();
 		}
@@ -3828,7 +3887,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 		// Warn on unprocessed 'orelse' in unsupported context
 		if (__builtin_expect(FEAT(F_ORELSE) && is_orelse_keyword(tok) &&
-				     !in_struct_body(), 0))
+				     ctx->struct_depth == 0, 0))
 			error_tok(tok,
 				  "'orelse' cannot be used here (it must appear at the "
 				  "statement level in a declaration or bare expression)");
@@ -3848,7 +3907,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 }
 
 static int transpile(char *input_file, char *output_file) {
-	ensure_keyword_cache();
+	if (!ctx->keyword_map.capacity) init_keyword_map();
 
 	char *pp_buf = preprocess_with_cc(input_file);
 	if (!pp_buf) {
@@ -3885,10 +3944,9 @@ PRISM_API void prism_reset(void) {
 	typedef_table_reset();
 	tokenizer_teardown(false);
 
-	scope_stack = NULL;
-	ctx->scope_depth = 0;
-	ctx->block_depth = 0;
-	scope_stack_capacity = 0;
+	defer_stack = NULL;
+	ctx->defer_depth = 0;
+	defer_stack_capacity = 0;
 
 	hashmap_zero(&label_table.name_map);
 	label_table.labels = NULL;
@@ -3987,7 +4045,7 @@ PRISM_API PrismResult prism_transpile_file(const char *input_file, PrismFeatures
 #endif
 
 	apply_features(features);
-	ensure_keyword_cache();
+	if (!ctx->keyword_map.capacity) init_keyword_map();
 
 	Token *tok;
 	char *pp_buf = preprocess_with_cc((char *)input_file);
@@ -4033,7 +4091,7 @@ PRISM_API PrismResult prism_transpile_source(const char *source, const char *fil
 	if (setjmp(ctx->error_jmp) != 0) return error_recovery_result();
 
 	apply_features(features);
-	ensure_keyword_cache();
+	if (!ctx->keyword_map.capacity) init_keyword_map();
 
 	Token *tok;
 	char *buf;
@@ -4506,17 +4564,6 @@ static void add_output_flags(ArgvBuilder *ab, const Cli *cli, const char *temp_e
 	}
 }
 
-static void argv_add_output(ArgvBuilder *ab, const char *out, bool msvc) {
-	if (msvc) {
-		static char flag[PATH_MAX + 8];
-		snprintf(flag, sizeof(flag), "/Fe:%s", out);
-		argv_builder_add(ab, flag);
-	} else {
-		argv_builder_add(ab, "-o");
-		argv_builder_add(ab, out);
-	}
-}
-
 static void make_run_temp(char *buf, size_t size, CliMode mode) {
 	buf[0] = '\0';
 	if (mode != CLI_RUN) return;
@@ -4534,7 +4581,16 @@ static int passthrough_cc(const Cli *cli) {
 	argv_builder_init(&ab);
 	argv_builder_add(&ab, compiler);
 	for (int i = 0; i < cli->cc_arg_count; i++) argv_builder_add(&ab, cli->cc_args[i]);
-	if (cli->output) argv_add_output(&ab, cli->output, msvc);
+	if (cli->output) {
+		if (msvc) {
+			static char fe_flag[PATH_MAX + 8];
+			snprintf(fe_flag, sizeof(fe_flag), "/Fe:%s", cli->output);
+			argv_builder_add(&ab, fe_flag);
+		} else {
+			argv_builder_add(&ab, "-o");
+			argv_builder_add(&ab, cli->output);
+		}
+	}
 	char **pass = argv_builder_finish(&ab);
 	if (cli->verbose) verbose_argv(pass);
 	int st = run_command(pass);
@@ -4608,7 +4664,14 @@ static int install_from_source(Cli *cli) {
 	argv_builder_add(&ab, msvc ? "/O2" : "-O2");
 	for (int i = 0; i < cli->source_count; i++) argv_builder_add(&ab, temps[i]);
 	for (int i = 0; i < cli->cc_arg_count; i++) argv_builder_add(&ab, cli->cc_args[i]);
-	argv_add_output(&ab, temp_bin, msvc);
+	if (msvc) {
+		static char fe_flag[PATH_MAX + 8];
+		snprintf(fe_flag, sizeof(fe_flag), "/Fe:%s", temp_bin);
+		argv_builder_add(&ab, fe_flag);
+	} else {
+		argv_builder_add(&ab, "-o");
+		argv_builder_add(&ab, temp_bin);
+	}
 	char **argv_cc = argv_builder_finish(&ab);
 	if (cli->verbose) verbose_argv(argv_cc);
 
