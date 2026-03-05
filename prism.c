@@ -553,6 +553,7 @@ static bool pending_ctrl;             // control keyword seen, awaiting body
 static bool pending_for_paren;        // 'for' seen, waiting for '('
 static bool parens_just_closed;       // control paren just closed (ready for body)
 static bool pending_orelse_guard;     // tag next scope as orelse guard
+static int ctrl_brace_depth;          // compound literal braces inside control parens
 
 static inline void ctrl_reset(void) {
 	pending_ctrl = false;
@@ -560,6 +561,7 @@ static inline void ctrl_reset(void) {
 	parens_just_closed = false;
 	pending_scope_flags = 0;
 	pending_orelse_guard = false;
+	ctrl_brace_depth = 0;
 }
 
 // ── Scope stack queries ──
@@ -654,8 +656,9 @@ static void scope_pop(void) {
 	if (ctx->scope_depth > 0) {
 		ctx->scope_depth--;
 		ScopeNode *s = &scope_stack[ctx->scope_depth];
-		if (s->kind == SCOPE_BLOCK)
+		if (s->kind == SCOPE_BLOCK) {
 			ctx->block_depth--;
+		}
 	}
 }
 
@@ -3036,6 +3039,7 @@ static Token *handle_open_brace(Token *tok) {
 	// Compound literal inside control parens or before body
 	if (pending_ctrl && (in_ctrl_paren() || !parens_just_closed)) {
 		emit_tok(tok);
+		ctrl_brace_depth++;
 		return tok->next;
 	}
 	if (pending_ctrl && !(pending_scope_flags & NS_SWITCH)) pending_scope_flags |= NS_CONDITIONAL;
@@ -3062,6 +3066,15 @@ static Token *handle_open_brace(Token *tok) {
 }
 
 static Token *handle_close_brace(Token *tok) {
+	// Compound literal close inside control parens
+	if (pending_ctrl && in_ctrl_paren() && ctrl_brace_depth > 0) {
+		ctrl_brace_depth--;
+		emit_tok(tok);
+		return tok->next;
+	}
+	// Pop stale non-BLOCK scopes (leaked ternary/ctrl/generic scopes)
+	while (ctx->scope_depth > 0 && scope_stack[ctx->scope_depth - 1].kind != SCOPE_BLOCK)
+		scope_pop();
 	typedef_pop_scope(ctx->block_depth);
 	if (FEAT(F_DEFER) && ctx->scope_depth > 0 && scope_stack[ctx->scope_depth - 1].count > 0)
 		emit_defers(DEFER_SCOPE);
@@ -3365,8 +3378,7 @@ static inline void track_ctrl_paren_close(void) {
 			scope_pop();
 			break;
 		}
-		if (k == SCOPE_TERNARY) scope_pop(); // pop stale ternaries
-		else break;
+		break;
 	}
 	parens_just_closed = true;
 	ctx->at_stmt_start = true;
@@ -3397,8 +3409,7 @@ static inline void pop_generic_scope(void) {
 	while (ctx->scope_depth > 0) {
 		ScopeKind k = scope_stack[ctx->scope_depth - 1].kind;
 		if (k == SCOPE_GENERIC) { scope_pop(); break; }
-		if (k == SCOPE_TERNARY) scope_pop();
-		else break;
+		break;
 	}
 }
 
@@ -3441,13 +3452,14 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 	Token *last_toplevel_paren = NULL;
 	Token *last_toplevel_open_paren = NULL;
 	int toplevel_paren_depth = 0;
+	int ternary_depth = 0;
 
 	while (tok->kind != TK_EOF) {
 		Token *next;
 		uint32_t tag = tok->tag;
 
 		if (tok->len == 1 && tok->shortcut == '?')
-			scope_push_kind(SCOPE_TERNARY, false, NULL);
+			ternary_depth++;
 
 #define DISPATCH(handler)                                                                                    \
 	{                                                                                                    \
@@ -3796,8 +3808,8 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				continue;
 			}
 			if (c == ':') {
-				if (scope_top_kind() == SCOPE_TERNARY) {
-					scope_pop();
+				if (ternary_depth > 0) {
+					ternary_depth--;
 				} else if (in_generic()) {
 				} else if (last_emitted &&
 				           (is_identifier_like(last_emitted) || last_emitted->kind == TK_NUM) &&
