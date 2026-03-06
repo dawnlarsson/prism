@@ -147,7 +147,6 @@ typedef enum {
 } ScopeKind;
 
 typedef struct {
-	Token *close_tok;  // for paren/generic scopes: the matching ')'
 	DeferEntry *entries;
 	int count;
 	int capacity;
@@ -157,7 +156,6 @@ typedef struct {
 	bool had_control_exit : 1; // true if unconditional break/return/goto/continue was seen
 				   // NOTE: only set on switch scopes (by mark_switch_control_exit)
 	bool is_conditional : 1;
-	bool seen_case_label : 1; // true if case/default label seen in this switch scope (for zero-init safety)
 	bool is_struct : 1;
 	bool has_zeroinit_decl : 1;
 	bool is_stmt_expr : 1;
@@ -252,8 +250,6 @@ static LabelTable label_table;
 // Token emission - user-space buffered output for minimal syscall overhead
 static FILE *out_fp;
 static Token *last_emitted = NULL;
-static int cached_file_idx = -1;
-static File *cached_file = NULL;
 
 static char out_buf[OUT_BUF_SIZE];
 static int out_buf_pos = 0;
@@ -323,8 +319,6 @@ static void reset_transpiler_state(void) {
 	ctx->at_stmt_start = true;
 	ctrl_reset();
 	last_emitted = NULL;
-	cached_file_idx = -1;
-	cached_file = NULL;
 
 	// Reset arena-allocated arrays to prevent stale pointers after arena_reset.
 	// After tokenizer_teardown(false) resets the arena, these pointers become
@@ -606,7 +600,7 @@ static void end_statement_after_semicolon(void) {
 	}
 }
 
-static void scope_push_kind(ScopeKind kind, bool consume_flags, Token *close_tok) {
+static void scope_push_kind(ScopeKind kind, bool consume_flags) {
 	// Guard against pathologically deep nesting (e.g., fuzz input with thousands of '{')
 	if (ctx->scope_depth >= 4096) error("brace nesting depth exceeds 4096");
 	int old_cap = scope_stack_capacity;
@@ -620,7 +614,7 @@ static void scope_push_kind(ScopeKind kind, bool consume_flags, Token *close_tok
 	ScopeNode *s = &scope_stack[ctx->scope_depth];
 	DeferEntry *prev_entries = s->entries;
 	int prev_cap = s->capacity;
-	*s = (ScopeNode){.kind = kind, .close_tok = close_tok,
+	*s = (ScopeNode){.kind = kind,
 			 .entries = prev_entries, .capacity = prev_cap};
 	if (kind == SCOPE_BLOCK) {
 		if (consume_flags) {
@@ -636,7 +630,7 @@ static void scope_push_kind(ScopeKind kind, bool consume_flags, Token *close_tok
 
 // Convenience wrapper — all existing callers push SCOPE_BLOCK
 static inline void scope_push(bool consume_flags) {
-	scope_push_kind(SCOPE_BLOCK, consume_flags, NULL);
+	scope_push_kind(SCOPE_BLOCK, consume_flags);
 }
 
 static void scope_pop(void) {
@@ -2369,9 +2363,6 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					for (Token *t = type_start; t && t != type->end; t = t->next)
 						if (is_const_typedef(t)) { has_const_qual = true; break; }
 				}
-				bool is_struct_val =
-				    type_is_sue_not_enum && !decl.is_pointer && !decl.is_array;
-
 				// Array address is never NULL — orelse can never trigger
 				if (decl.is_array && !decl.is_pointer)
 					error_tok(decl.var_name,
@@ -3001,7 +2992,6 @@ static void handle_case_default(Token *tok) {
 		}
 	}
 
-	scope_stack[sd].seen_case_label = true;
 }
 
 static Token *handle_sue_body(Token *tok) {
@@ -3332,7 +3322,7 @@ static char *preprocess_with_cc(const char *input_file) {
 
 // Shared helpers for transpile_tokens
 
-static inline void track_ctrl_paren_open(Token *tok) {
+static inline void track_ctrl_paren_open(void) {
 	ScopeKind k;
 	if (pending_for_paren) {
 		k = SCOPE_FOR_PAREN;
@@ -3341,8 +3331,7 @@ static inline void track_ctrl_paren_open(Token *tok) {
 		k = SCOPE_CTRL_PAREN;
 	}
 	parens_just_closed = false;
-	Token *close = tok->match;  // parse.c linked matching ')'
-	scope_push_kind(k, false, close);
+	scope_push_kind(k, false);
 	ctx->at_stmt_start = (k == SCOPE_FOR_PAREN);
 }
 
@@ -3369,16 +3358,11 @@ static inline void track_ctrl_semicolon(void) {
 		// No — for(init; cond; update) has parens not semicolons controlling it.
 		// in_for_init returns false now. That's correct.
 		// But we need to stay inside a ctrl paren scope so ';' doesn't end the statement
-		scope_push_kind(SCOPE_CTRL_PAREN, false, NULL);
+		scope_push_kind(SCOPE_CTRL_PAREN, false);
 	} else if (!in_ctrl_paren()) {
 		typedef_pop_scope(ctx->block_depth + 1);
 		ctrl_reset();
 	}
-}
-
-static inline void push_generic_scope(Token *tok) {
-	Token *close = tok->match;
-	scope_push_kind(SCOPE_GENERIC, false, close);
 }
 
 static inline void pop_generic_scope(void) {
@@ -3452,12 +3436,12 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		if (__builtin_expect(!tag && !ctx->at_stmt_start, 1)) {
 			if (__builtin_expect(pending_ctrl && tok->len == 1, 0)) {
 				char c = tok->shortcut;
-				if (c == '(') track_ctrl_paren_open(tok);
+				if (c == '(') track_ctrl_paren_open();
 				else if (c == ')')
 					track_ctrl_paren_close();
 			}
 			if (__builtin_expect(in_generic(), 0)) {
-				if (match_ch(tok, '(')) push_generic_scope(tok);
+				if (match_ch(tok, '(')) scope_push_kind(SCOPE_GENERIC, false);
 				else if (match_ch(tok, ')')) pop_generic_scope();
 			}
 			if (ctx->block_depth == 0) {
@@ -3677,7 +3661,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				last_emitted = tok;
 				tok = tok->next;
 				if (tok && match_ch(tok, '(')) {
-					push_generic_scope(tok);
+					scope_push_kind(SCOPE_GENERIC, false);
 					emit_tok(tok);
 					last_emitted = tok;
 					tok = tok->next;
@@ -3704,7 +3688,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		} // end if (tag)
 
 		if (__builtin_expect(in_generic(), 0)) {
-			if (match_ch(tok, '(')) push_generic_scope(tok);
+			if (match_ch(tok, '(')) scope_push_kind(SCOPE_GENERIC, false);
 			else if (match_ch(tok, ')')) pop_generic_scope();
 		}
 
@@ -3802,7 +3786,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 		if (pending_ctrl && tok->len == 1) {
 			char c = tok->loc[0];
-			if (c == '(') track_ctrl_paren_open(tok);
+			if (c == '(') track_ctrl_paren_open();
 			else if (c == ')')
 				track_ctrl_paren_close();
 		}

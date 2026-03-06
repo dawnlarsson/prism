@@ -521,13 +521,6 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val) {
 	map->used++;
 }
 
-static void __attribute__((unused)) hashmap_clear(HashMap *map) {
-	free(map->buckets);
-	map->buckets = NULL;
-	map->capacity = 0;
-	map->used = 0;
-}
-
 // Reset entries without freeing the bucket array
 static void hashmap_zero(HashMap *map) {
 	if (map->buckets) memset(map->buckets, 0, (size_t)map->capacity * sizeof(HashEntry));
