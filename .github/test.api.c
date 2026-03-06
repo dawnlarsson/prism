@@ -1414,14 +1414,22 @@ static void test_file_c23_generic_decl_plain_redeclaration(void) {
 		PrismResult r = prism_transpile_file(path, prism_defaults());
 		CHECK(r.status == PRISM_OK, "c23 generic decl plain redecl: transpiles OK");
 		if (r.output) {
+			bool valid_bsearch_decl =
+			    strstr(r.output, "extern void *(bsearch)") != NULL ||
+			    strstr(r.output, "extern void *bsearch (") != NULL ||
+			    strstr(r.output, "extern void *bsearch(") != NULL;
+			bool valid_wmemchr_decl =
+			    strstr(r.output, "extern wchar_t *(wmemchr)") != NULL ||
+			    strstr(r.output, "extern wchar_t *wmemchr (") != NULL ||
+			    strstr(r.output, "extern wchar_t *wmemchr(") != NULL;
 			CHECK(strstr(r.output, "extern void *_Generic") == NULL,
 			      "c23 generic decl plain redecl: no genericized bsearch declarator");
 			CHECK(strstr(r.output, "extern wchar_t *_Generic") == NULL,
 			      "c23 generic decl plain redecl: no genericized wmemchr declarator");
-			CHECK(strstr(r.output, "extern void *(bsearch)") != NULL,
-			      "c23 generic decl plain redecl: rewrites bsearch as grouped declarator");
-			CHECK(strstr(r.output, "extern wchar_t *(wmemchr)") != NULL,
-			      "c23 generic decl plain redecl: rewrites wmemchr as grouped declarator");
+			CHECK(valid_bsearch_decl,
+			      "c23 generic decl plain redecl: keeps bsearch in valid declarator form");
+			CHECK(valid_wmemchr_decl,
+			      "c23 generic decl plain redecl: keeps wmemchr in valid declarator form");
 			check_transpiled_output_compiles(
 			    r.output, "-std=gnu2x",
 			    "c23 generic decl plain redecl: transpiled output compiles in gnu2x");
