@@ -4101,8 +4101,15 @@ static bool get_self_exe_path(char *buf, size_t bufsize) {
 static const char *get_install_path(void) { return INSTALL_PATH; }
 
 static bool ensure_install_dir(const char *p) {
-	(void)p;
-	return true;
+	char dir[PATH_MAX];
+	strncpy(dir, p, PATH_MAX - 1);
+	dir[PATH_MAX - 1] = '\0';
+	char *sep = strrchr(dir, '/');
+	if (sep) *sep = '\0';
+	struct stat st;
+	if (stat(dir, &st) == 0) return true;
+	mkdir(dir, 0755);
+	return stat(dir, &st) == 0;
 }
 
 static void add_to_user_path(const char *dir) {
