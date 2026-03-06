@@ -1242,27 +1242,16 @@ static GotoSkipResult goto_skips_check(Token *goto_tok, LabelInfo *info, bool ch
 	return r;
 }
 
-// K&R parameter declarations: type ident [, ident]* ; ... repeated until {
-static bool is_knr_params(Token *after_paren, Token *brace) {
-	Token *t = after_paren;
-	bool saw_any = false;
-	while (t && t != brace && t->kind != TK_EOF) {
-		TypeSpecResult type = parse_type_specifier(t);
-		if (!type.saw_type) return false;
-		t = type.end;
-		bool saw_ident = false;
-		while (t && t != brace && !match_ch(t, ';')) {
-			DeclResult decl = parse_declarator(t, false);
-			if (!decl.var_name) return false;
-			saw_ident = true;
-			t = decl.end;
-			if (t && match_ch(t, ',')) t = tok_next(t);
-		}
-		if (!saw_ident || !match_ch(t, ';')) return false;
-		t = tok_next(t);
-		saw_any = true;
+// Legacy K&R C parameter detection (slow path heuristic).
+static bool is_knr_params(Token *start, Token *brace) {
+	if (!start || start == brace || match_ch(start, ';'))
+		return false;
+	bool saw_semi = false;
+	for (Token *t = start; t && t != brace && t->kind != TK_EOF; t = tok_next(t)) {
+		if (match_ch(t, ';')) saw_semi = true;
+		if (t->flags & TF_OPEN) t = tok_match(t) ? tok_match(t) : t; // skip groups safely
 	}
-	return saw_any && t == brace;
+	return saw_semi;
 }
 
 static Token *skip_pointers(Token *tok, bool *is_void) {
@@ -3074,6 +3063,23 @@ static int run_command(char **argv) {
 	}
 	return wait_for_child(pid);
 }
+
+// Like run_command but suppresses stderr (for probe attempts)
+static int run_command_quiet(char **argv) {
+	char **env = build_clean_environ();
+	if (!env) return -1;
+	posix_spawn_file_actions_t actions;
+	posix_spawn_file_actions_init(&actions);
+	int devnull = open("/dev/null", O_WRONLY);
+	if (devnull >= 0)
+		posix_spawn_file_actions_adddup2(&actions, devnull, STDERR_FILENO);
+	pid_t pid;
+	int err = posix_spawnp(&pid, argv[0], &actions, NULL, argv, env);
+	posix_spawn_file_actions_destroy(&actions);
+	if (devnull >= 0) close(devnull);
+	if (err) return -1;
+	return wait_for_child(pid);
+}
 #endif
 
 // Create temp file with optional suffix. If source_adjacent is set, tries
@@ -4148,8 +4154,7 @@ static int install(char *self_path) {
 	printf("[prism] Installing to %s...\n", install_path);
 
 	if (!ensure_install_dir(install_path)) {
-		fprintf(stderr, "[prism] Failed to create install directory\n");
-		return 1;
+		goto use_sudo;
 	}
 
 	char resolved_path[PATH_MAX];
@@ -4205,7 +4210,7 @@ use_sudo:;
 	{
 		// Try without escalation first (works if already root)
 		const char *argv_cp[] = {"cp", self_path, install_path, NULL};
-		if (run_command((char **)argv_cp) == 0) {
+		if (run_command_quiet((char **)argv_cp) == 0) {
 			const char *argv_chmod[] = {"chmod", "+x", install_path, NULL};
 			run_command((char **)argv_chmod);
 		} else {

@@ -261,15 +261,18 @@ typedef struct {
 	size_t default_block_size;
 } Arena;
 
+typedef struct {
+	bool at_bol;
+	bool has_space;
+	int line_no;
+} TokState;
+
 typedef struct PrismContext {
 	Arena main_arena;
 	File *current_file;
 	File **input_files;
 	int input_file_count;
 	int input_file_capacity;
-	bool at_bol;
-	bool has_space;
-	int tok_line_no; // Current line number during tokenization
 
 #ifdef PRISM_LIB_MODE
 	jmp_buf error_jmp;
@@ -942,11 +945,11 @@ static char *skip_line_comment(char *p) {
 	}
 }
 
-static char *skip_block_comment(char *p) {
+static char *skip_block_comment(char *p, TokState *ts) {
 	// Byte-at-a-time until aligned
 	while ((uintptr_t)p & 7) {
 		if (*p == '\0') error_at(p, "unclosed block comment");
-		if (*p == '\n') { ctx->tok_line_no++; ctx->at_bol = true; }
+		if (*p == '\n') { ts->line_no++; ts->at_bol = true; }
 		if (p[0] == '*' && p[1] == '/') return p + 2;
 		p++;
 	}
@@ -960,7 +963,7 @@ static char *skip_block_comment(char *p) {
 			// Interesting bytes in this chunk — scan byte by byte
 			for (int i = 0; i < 8; i++) {
 				if (p[i] == '\0') error_at(p + i, "unclosed block comment");
-				if (p[i] == '\n') { ctx->tok_line_no++; ctx->at_bol = true; }
+				if (p[i] == '\n') { ts->line_no++; ts->at_bol = true; }
 				if (p[i] == '*' && p[i + 1] == '/') return p + i + 2;
 			}
 		}
@@ -980,7 +983,7 @@ static char *string_literal_end(char *p) {
 }
 
 // Scan C++11/C23 raw string literal: R"delim(content)delim"
-static char *raw_string_literal_end(char *p) {
+static char *raw_string_literal_end(char *p, TokState *ts) {
 	char *delim_start = p + 1;
 	char *paren = delim_start;
 	while (*paren && *paren != '(' && *paren != ')' && *paren != '\\' && *paren != ' ' &&
@@ -993,7 +996,7 @@ static char *raw_string_literal_end(char *p) {
 	char *content = paren + 1;
 	// Search for )delimiter"
 	for (char *q = content; *q; q++) {
-		if (*q == '\n') ctx->tok_line_no++;
+		if (*q == '\n') ts->line_no++;
 		if (*q == ')' && (delim_len == 0 || strncmp(q + 1, delim_start, delim_len) == 0) &&
 		    q[1 + delim_len] == '"') {
 			return q + 1 + delim_len + 1;
@@ -1003,38 +1006,38 @@ static char *raw_string_literal_end(char *p) {
 	error_at(p, "unclosed raw string literal");
 }
 
-static inline __attribute__((always_inline)) Token *new_token(TokenKind kind, char *start, char *end) {
+static inline __attribute__((always_inline)) Token *new_token(TokenKind kind, char *start, char *end, TokState *ts) {
 	Token *tok = pool_alloc_token();
 	tok->kind = kind;
 	tok->len = end - start;
 	tok->next_idx = 0;
 	tok->tag = 0;
 	tok->match_idx = 0;
-	tok->flags = (ctx->at_bol ? TF_AT_BOL : 0) | (ctx->has_space ? TF_HAS_SPACE : 0);
+	tok->flags = (ts->at_bol ? TF_AT_BOL : 0) | (ts->has_space ? TF_HAS_SPACE : 0);
 	TokenCold *c = tok_cold(tok);
 	c->loc_offset = (uint32_t)(start - ctx->current_file->contents);
 	{
-		long long ln = (long long)ctx->tok_line_no + ctx->current_file->line_delta;
+		long long ln = (long long)ts->line_no + ctx->current_file->line_delta;
 		int clamped = ln > 0x0FFFFF ? 0x0FFFFF : (ln < -0x100000 ? -0x100000 : (int)ln);
 		c->line_no = clamped;
 	}
 	c->file_idx = ctx->current_file->file_no;
-	ctx->at_bol = ctx->has_space = false;
+	ts->at_bol = ts->has_space = false;
 	return tok;
 }
 
-static Token *read_string_literal(char *start, char *quote) {
+static Token *read_string_literal(char *start, char *quote, TokState *ts) {
 	char *end = string_literal_end(quote + 1);
-	return new_token(TK_STR, start, end + 1);
+	return new_token(TK_STR, start, end + 1, ts);
 }
 
-static Token *read_raw_string_literal(char *start, char *quote) {
-	char *end = raw_string_literal_end(quote);
+static Token *read_raw_string_literal(char *start, char *quote, TokState *ts) {
+	char *end = raw_string_literal_end(quote, ts);
 	if (!end) error_at(start, "invalid raw string literal");
-	return new_token(TK_STR, start, end);
+	return new_token(TK_STR, start, end, ts);
 }
 
-static Token *read_char_literal(char *start, char *quote) {
+static Token *read_char_literal(char *start, char *quote, TokState *ts) {
 	char *p = quote + 1;
 	if (*p == '\0') error_at(start, "unclosed char literal");
 	for (; *p != '\''; p++) {
@@ -1044,7 +1047,7 @@ static Token *read_char_literal(char *start, char *quote) {
 			if (*p == '\0') error_at(p, "unclosed char literal");
 		}
 	}
-	return new_token(TK_NUM, start, p + 1);
+	return new_token(TK_NUM, start, p + 1, ts);
 }
 
 // Check for C23 extended float suffix; returns suffix length to strip (0 if none)
@@ -1276,34 +1279,32 @@ static Token *tokenize(File *file) {
 		else first_idx = _ni; \
 		cur_idx = _ni; \
 	} while(0)
-	ctx->at_bol = true;
-	ctx->has_space = false;
-	ctx->tok_line_no = 1;
+	TokState ts = {true, false, 1};
 
 	bool in_system_include = false;
 
 	while (*p) {
-		if (ctx->at_bol && *p == '#') {
+		if (ts.at_bol && *p == '#') {
 			char *directive_start = p;
 			char *after =
-			    scan_line_directive(p, base_file, &ctx->tok_line_no, &in_system_include);
+			    scan_line_directive(p, base_file, &ts.line_no, &in_system_include);
 			if (after) {
 				p = after;
-				ctx->at_bol = true;
-				ctx->has_space = false;
+				ts.at_bol = true;
+				ts.has_space = false;
 				continue;
 			}
 
 			while (*p &&
 			       *p != '\n')
 				p++;
-			LINK(new_token(TK_PREP_DIR, directive_start, p));
+			LINK(new_token(TK_PREP_DIR, directive_start, p, &ts));
 			tok_set_at_bol(&token_pool[cur_idx], true);
 			if (*p == '\n') {
 				p++;
-				ctx->tok_line_no++;
-				ctx->at_bol = true;
-				ctx->has_space = false;
+				ts.line_no++;
+				ts.at_bol = true;
+				ts.has_space = false;
 			}
 			continue;
 		}
@@ -1311,21 +1312,21 @@ static Token *tokenize(File *file) {
 		if (p[0] == '/' && p[1] == '/')
 		{
 			p = skip_line_comment(p + 2);
-			ctx->has_space = true;
+			ts.has_space = true;
 			continue;
 		}
 		if (p[0] == '/' && p[1] == '*')
 		{
-			p = skip_block_comment(p + 2);
-			ctx->has_space = true;
+			p = skip_block_comment(p + 2, &ts);
+			ts.has_space = true;
 			continue;
 		}
 		if (*p == '\n')
 		{
 			p++;
-			ctx->tok_line_no++;
-			ctx->at_bol = true;
-			ctx->has_space = false;
+			ts.line_no++;
+			ts.at_bol = true;
+			ts.has_space = false;
 			continue;
 		}
 		if (is_space(*p))
@@ -1333,14 +1334,14 @@ static Token *tokenize(File *file) {
 			do {
 				p++;
 			} while (is_space(*p));
-			ctx->has_space = true;
+			ts.has_space = true;
 			continue;
 		}
 		if (IS_DIGIT(*p) || (*p == '.' && IS_DIGIT(p[1]))) {
 			char *start = p;
 			bool is_float;
 			p = scan_pp_number(p, &is_float);
-			Token *t = new_token(TK_NUM, start, p);
+			Token *t = new_token(TK_NUM, start, p, &ts);
 			LINK(t);
 			if (is_float) t->flags |= TF_IS_FLOAT;
 			else if (!(start[0] == '0' && (start[1] == 'x' || start[1] == 'X' ||
@@ -1355,7 +1356,7 @@ static Token *tokenize(File *file) {
 				      : ((p[0] == 'L' || p[0] == 'u' || p[0] == 'U') && p[1] == 'R') ? 1
 												     : -1;
 			if (raw_pfx >= 0 && p[raw_pfx] == 'R' && p[raw_pfx + 1] == '"') {
-				Token *nt = read_raw_string_literal(p, p + raw_pfx + 1);
+				Token *nt = read_raw_string_literal(p, p + raw_pfx + 1, &ts);
 				LINK(nt);
 				p += nt->len;
 				continue;
@@ -1363,7 +1364,7 @@ static Token *tokenize(File *file) {
 		}
 		if (*p == '"')
 		{
-			Token *nt = read_string_literal(p, p);
+			Token *nt = read_string_literal(p, p, &ts);
 			LINK(nt);
 			p += nt->len;
 			continue;
@@ -1372,27 +1373,27 @@ static Token *tokenize(File *file) {
 		    ((p[0] == 'u' || p[0] == 'U' || p[0] == 'L') && p[1] == '"')) {
 			char *start = p;
 			p += (p[0] == 'u' && p[1] == '8') ? 2 : 1;
-			Token *nt = read_string_literal(start, p);
+			Token *nt = read_string_literal(start, p, &ts);
 			LINK(nt);
 			p = start + nt->len;
 			continue;
 		}
 		if (*p == '\'')
 		{
-			Token *nt = read_char_literal(p, p);
+			Token *nt = read_char_literal(p, p, &ts);
 			LINK(nt);
 			p += nt->len;
 			continue;
 		}
 		if ((p[0] == 'u' || p[0] == 'U' || p[0] == 'L') && p[1] == '\'') {
-			Token *nt = read_char_literal(p, p + 1);
+			Token *nt = read_char_literal(p, p + 1, &ts);
 			LINK(nt);
 			p += nt->len;
 			continue;
 		}
 		int ident_len = read_ident(p);
 		if (ident_len) {
-			Token *t = new_token(TK_IDENT, p, p + ident_len);
+			Token *t = new_token(TK_IDENT, p, p + ident_len, &ts);
 			LINK(t);
 				uintptr_t kw = keyword_lookup(p, ident_len);
 			if (kw) {
@@ -1409,7 +1410,7 @@ static Token *tokenize(File *file) {
 		int punct_len = read_punct(p);
 		if (punct_len) {
 			int abs_len = punct_len < 0 ? -punct_len : punct_len;
-			Token *t = new_token(TK_PUNCT, p, p + abs_len);
+			Token *t = new_token(TK_PUNCT, p, p + abs_len, &ts);
 			LINK(t);
 			if (punct_len < 0) {
 				char *norm;
@@ -1438,7 +1439,7 @@ static Token *tokenize(File *file) {
 		error_at(p, "invalid token");
 	}
 
-	LINK(new_token(TK_EOF, p, p));
+	LINK(new_token(TK_EOF, p, p, &ts));
 	#undef LINK
 
 	Token *first = first_idx ? &token_pool[first_idx] : NULL;
