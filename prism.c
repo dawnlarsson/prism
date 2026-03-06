@@ -18,6 +18,7 @@
 #include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
 #include <fcntl.h>
 
 #define INSTALL_PATH "/usr/local/bin/prism"

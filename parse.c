@@ -125,6 +125,7 @@ typedef struct {
 	char *name;
 	char *contents;
 	size_t contents_len;
+	size_t mmap_size;
 	int file_no;
 	int line_delta;
 	bool owns_contents;
@@ -577,8 +578,13 @@ static char *intern_filename(const char *name) {
 }
 
 static void free_file_contents(File *f) {
-	if (!f) return;
-	if (f->contents && f->owns_contents) free(f->contents);
+	if (!f || !f->contents) return;
+#ifdef _WIN32
+	if (f->mmap_size) { UnmapViewOfFile(f->contents); f->contents = NULL; return; }
+#else
+	if (f->mmap_size) { munmap(f->contents, f->mmap_size); f->contents = NULL; return; }
+#endif
+	if (f->owns_contents) free(f->contents);
 }
 
 static inline File *tok_file(Token *tok) {
@@ -1548,37 +1554,64 @@ static Token *tokenize_buffer(char *name, char *buf) {
 Token *tokenize_file(char *path) {
 	ensure_keyword_cache();
 
-	FILE *fp = fopen(path, "r");
-	if (!fp) return NULL;
-
-	if (fseek(fp, 0, SEEK_END) != 0) {
-		fclose(fp);
+#ifdef _WIN32
+	HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+				   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hFile == INVALID_HANDLE_VALUE) return NULL;
+	DWORD file_size = GetFileSize(hFile, NULL);
+	if (file_size == INVALID_FILE_SIZE || file_size == 0) {
+		CloseHandle(hFile);
+		if (file_size == 0) {
+			char *buf = malloc(1);
+			if (!buf) return NULL;
+			buf[0] = '\0';
+			File *file = new_file(path, ctx->input_file_count, buf);
+			add_input_file(file);
+			return tokenize(file);
+		}
 		return NULL;
 	}
-	long raw_size = ftell(fp);
-	if (raw_size < 0) {
-		fclose(fp);
-		return NULL;
-	}
-	size_t size = (size_t)raw_size;
-	if (fseek(fp, 0, SEEK_SET) != 0) {
-		fclose(fp);
-		return NULL;
-	}
-
-	char *buf = malloc(size + 1);
-	if (!buf) {
-		fclose(fp);
-		return NULL;
-	}
-	size_t nread = fread(buf, 1, size, fp);
-	buf[nread] = '\0';
-	fclose(fp);
-
+	HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_WRITECOPY, 0, file_size + 1, NULL);
+	if (!hMap) { CloseHandle(hFile); return NULL; }
+	char *buf = MapViewOfFile(hMap, FILE_MAP_COPY, 0, 0, file_size + 1);
+	CloseHandle(hMap);
+	CloseHandle(hFile);
+	if (!buf) return NULL;
+	buf[file_size] = '\0';
 	File *file = new_file(path, ctx->input_file_count, buf);
+	file->mmap_size = file_size + 1;
+	file->owns_contents = false;
 	add_input_file(file);
-
 	return tokenize(file);
+#else
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) return NULL;
+	struct stat st;
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+		close(fd);
+		return NULL;
+	}
+	size_t size = (size_t)st.st_size;
+	if (size == 0) {
+		close(fd);
+		char *buf = malloc(1);
+		if (!buf) return NULL;
+		buf[0] = '\0';
+		File *file = new_file(path, ctx->input_file_count, buf);
+		add_input_file(file);
+		return tokenize(file);
+	}
+	// MAP_PRIVATE gives copy-on-write (tokenizer patches digraphs in-place)
+	char *buf = mmap(NULL, size + 1, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+	close(fd);
+	if (buf == MAP_FAILED) return NULL;
+	buf[size] = '\0';
+	File *file = new_file(path, ctx->input_file_count, buf);
+	file->mmap_size = size + 1;
+	file->owns_contents = false;
+	add_input_file(file);
+	return tokenize(file);
+#endif
 }
 
 // full=false: reset for reuse; full=true: free everything
