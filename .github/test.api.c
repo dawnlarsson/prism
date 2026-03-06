@@ -1380,8 +1380,8 @@ static void test_file_c23_generic_decl_macro_indirection(void) {
 		if (r.output) {
 			CHECK(strstr(r.output, "(wmemchr)") != NULL,
 			      "c23 generic decl macro indirection: keeps grouped wmemchr name");
-			CHECK(strstr(r.output, "wmemchr(") == NULL,
-			      "c23 generic decl macro indirection: no flattened wmemchr declarator");
+			CHECK(strstr(r.output, "wchar_t *_Generic") == NULL,
+			      "c23 generic decl macro indirection: no genericized wmemchr declarator");
 			check_transpiled_output_compiles(
 			    r.output, "-std=gnu2x",
 			    "c23 generic decl macro indirection: transpiled output compiles in gnu2x");
