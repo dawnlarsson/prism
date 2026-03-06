@@ -197,16 +197,19 @@ enum {
 	(TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_INLINE | TT_ALIGNAS | TT_SKIP_DECL | TT_ATTR)
 
 struct Token {
-	uint32_t loc_offset;  // Byte offset from File->contents
+	uint32_t tag;         // TT_* bitmask - token classification
 	uint32_t next_idx;    // Token pool index (0 = NULL)
 	uint32_t match_idx;   // Token pool index (0 = NULL)
-	uint32_t tag;         // TT_* bitmask - token classification
-	int32_t  line_no : 21;
-	uint32_t kind : 3;
-	uint32_t flags : 8;
 	uint16_t len;
-	uint16_t file_idx;
-}; // 24 bytes
+	uint8_t  kind;
+	uint8_t  flags;
+}; // 16 bytes — hot path only
+
+typedef struct {
+	uint32_t loc_offset;  // Byte offset from File->contents
+	int32_t  line_no : 21;
+	uint32_t file_idx : 11;
+} TokenCold; // 8 bytes — error/debug path
 
 typedef struct {
 	char *key;  // upper 16 bits = keylen, lower 48 = pointer
@@ -325,8 +328,9 @@ static inline bool is_digraph_loc(char *loc) {
 
 static PrismContext *ctx = NULL;
 
-// Token pool: flat array for index-based linking (pointer compression)
-static Token *token_pool = NULL;
+// Token pools: parallel hot/cold arrays for cache-optimal access
+static Token *token_pool = NULL;      // Hot: tag, next_idx, match_idx, len, kind, flags
+static TokenCold *token_cold = NULL;  // Cold: loc_offset, line_no, file_idx
 static uint32_t token_count = 1; // 0 reserved as NULL sentinel
 static uint32_t token_cap = 0;
 
@@ -437,6 +441,9 @@ static void token_pool_ensure(size_t need) {
 	Token *p = realloc(token_pool, new_cap * sizeof(Token));
 	if (!p) error("out of memory allocating token pool");
 	token_pool = p;
+	TokenCold *c = realloc(token_cold, new_cap * sizeof(TokenCold));
+	if (!c) error("out of memory allocating token cold pool");
+	token_cold = c;
 	token_cap = (uint32_t)new_cap;
 }
 
@@ -447,9 +454,15 @@ static inline Token *pool_alloc_token(void) {
 	return &token_pool[token_count++];
 }
 
+// Accessor: get cold data for a token
+static inline TokenCold *tok_cold(Token *tok) {
+	return &token_cold[tok - token_pool];
+}
+
 // Accessor: resolve token -> source location pointer
 static inline char *tok_loc(Token *tok) {
-	return ctx->input_files[tok->file_idx]->contents + tok->loc_offset;
+	TokenCold *c = tok_cold(tok);
+	return ctx->input_files[c->file_idx]->contents + c->loc_offset;
 }
 
 // Accessor: resolve next_idx -> Token*
@@ -566,12 +579,14 @@ static void free_file_contents(File *f) {
 }
 
 static inline File *tok_file(Token *tok) {
-	if (!tok || tok->file_idx >= ctx->input_file_count) return ctx->current_file;
-	return ctx->input_files[tok->file_idx];
+	if (!tok) return ctx->current_file;
+	TokenCold *c = tok_cold(tok);
+	if (c->file_idx >= (uint32_t)ctx->input_file_count) return ctx->current_file;
+	return ctx->input_files[c->file_idx];
 }
 
 static int tok_line_no(Token *tok) {
-	return tok->line_no;
+	return tok_cold(tok)->line_no;
 }
 
 #ifdef PRISM_LIB_MODE
@@ -991,18 +1006,19 @@ static char *raw_string_literal_end(char *p) {
 static inline __attribute__((always_inline)) Token *new_token(TokenKind kind, char *start, char *end) {
 	Token *tok = pool_alloc_token();
 	tok->kind = kind;
-	tok->loc_offset = (uint32_t)(start - ctx->current_file->contents);
 	tok->len = end - start;
 	tok->next_idx = 0;
 	tok->tag = 0;
 	tok->match_idx = 0;
+	tok->flags = (ctx->at_bol ? TF_AT_BOL : 0) | (ctx->has_space ? TF_HAS_SPACE : 0);
+	TokenCold *c = tok_cold(tok);
+	c->loc_offset = (uint32_t)(start - ctx->current_file->contents);
 	{
 		long long ln = (long long)ctx->tok_line_no + ctx->current_file->line_delta;
 		int clamped = ln > 0x0FFFFF ? 0x0FFFFF : (ln < -0x100000 ? -0x100000 : (int)ln);
-		tok->line_no = clamped;
+		c->line_no = clamped;
 	}
-	tok->file_idx = ctx->current_file->file_no;
-	tok->flags = (ctx->at_bol ? TF_AT_BOL : 0) | (ctx->has_space ? TF_HAS_SPACE : 0);
+	c->file_idx = ctx->current_file->file_no;
 	ctx->at_bol = ctx->has_space = false;
 	return tok;
 }
@@ -1573,7 +1589,9 @@ void tokenizer_teardown(bool full) {
 		arena_free(&ctx->main_arena);
 		memset(keyword_cache, 0, sizeof(keyword_cache));
 		free(token_pool);
+		free(token_cold);
 		token_pool = NULL;
+		token_cold = NULL;
 		token_count = 1;
 		token_cap = 0;
 	} else {

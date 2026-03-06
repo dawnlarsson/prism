@@ -691,7 +691,7 @@ static void emit_tok(Token *tok) {
 	int line_no = 0;
 
 	if (FEAT(F_LINE_DIR)) {
-		line_no = tok->line_no;
+		line_no = tok_cold(tok)->line_no;
 		tok_fname = f->name;
 		need_line = (ctx->last_filename != tok_fname) || (f->is_system != ctx->last_system_header) ||
 			    (line_no != ctx->last_line_no && line_no != ctx->last_line_no + 1);
@@ -4196,18 +4196,37 @@ use_sudo:;
 	return 1;
 #else
 	{
-		const char *argv_rm[] = {"sudo", "rm", "-f", install_path, NULL};
-		run_command((char **)argv_rm);
+		// Try without escalation first (works if already root)
+		const char *argv_cp[] = {"cp", self_path, install_path, NULL};
+		if (run_command((char **)argv_cp) == 0) {
+			const char *argv_chmod[] = {"chmod", "+x", install_path, NULL};
+			run_command((char **)argv_chmod);
+		} else {
+			const char *escalate = NULL;
+			if (access("/usr/bin/sudo", X_OK) == 0 || access("/bin/sudo", X_OK) == 0)
+				escalate = "sudo";
+			else if (access("/usr/bin/doas", X_OK) == 0 || access("/bin/doas", X_OK) == 0)
+				escalate = "doas";
 
-		const char *argv_cp[] = {"sudo", "cp", self_path, install_path, NULL};
-		int status = run_command((char **)argv_cp);
-		if (status != 0) {
-			fprintf(stderr, "Failed to install\n");
-			return 1;
+			if (!escalate) {
+				fprintf(stderr, "[prism] Permission denied and neither sudo nor doas found.\n"
+						"  Install as root or copy manually:\n"
+						"    cp %s %s && chmod +x %s\n", self_path, install_path, install_path);
+				return 1;
+			}
+
+			const char *argv_rm[] = {escalate, "rm", "-f", install_path, NULL};
+			run_command((char **)argv_rm);
+
+			const char *argv_ecp[] = {escalate, "cp", self_path, install_path, NULL};
+			if (run_command((char **)argv_ecp) != 0) {
+				fprintf(stderr, "Failed to install\n");
+				return 1;
+			}
+
+			const char *argv_chmod[] = {escalate, "chmod", "+x", install_path, NULL};
+			run_command((char **)argv_chmod);
 		}
-
-		const char *argv_chmod[] = {"sudo", "chmod", "+x", install_path, NULL};
-		run_command((char **)argv_chmod);
 	}
 #endif
 
