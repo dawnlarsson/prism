@@ -122,10 +122,10 @@ typedef struct ArenaBlock ArenaBlock;
 
 typedef struct {
 	char *name;
-	int file_no;
 	char *contents;
-	size_t contents_len;
 	char *display_name;
+	size_t contents_len;
+	int file_no;
 	int line_delta;
 	bool owns_contents;
 	bool is_system;
@@ -200,19 +200,19 @@ struct Token {
 	char *loc;
 	Token *next;
 	Token *match; // Linked matching delimiter (open↔close)
-	int len;
 	int line_no; // Cached line number (computed once during tokenization)
-	TokenKind kind;
-	int file_idx;
+	uint8_t kind;
+	uint32_t tag;	  // TT_* bitmask - token classification
+	uint16_t len;
+	uint16_t file_idx;
 	uint8_t flags;
 	uint8_t shortcut; // First byte of token (tok->loc[0]), avoids pointer chase
-	uint32_t tag;	  // TT_* bitmask - token classification
 };
 
 typedef struct {
 	char *key;
-	int keylen;
 	void *val;
+	int keylen;
 } HashEntry;
 
 typedef struct {
@@ -224,8 +224,8 @@ typedef struct {
 // O(1) keyword lookup by hash slot
 typedef struct {
 	char *name;
-	uint8_t len;
 	uintptr_t value;
+	uint8_t len;
 } KeywordEntry;
 
 static KeywordEntry keyword_cache[256];
@@ -269,8 +269,6 @@ typedef struct PrismContext {
 	bool at_bol;
 	bool has_space;
 	int tok_line_no; // Current line number during tokenization
-	HashMap filename_intern_map;
-	HashMap file_view_cache;
 
 #ifdef PRISM_LIB_MODE
 	jmp_buf error_jmp;
@@ -311,12 +309,6 @@ typedef struct PrismContext {
 	uint32_t keyword_cache_features; // features used when keyword_cache was built
 #endif
 } PrismContext;
-
-typedef struct {
-	char *filename; // Interned filename (pointer comparison valid)
-	int line_delta;
-	uint8_t flags; // is_system (bit 0), is_include_entry (bit 1)
-} FileViewKey;
 
 // Digraph normalization targets (static storage for token loc pointers)
 static char digraph_norm_bracket_open[] = "[";
@@ -529,7 +521,7 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val) {
 	map->used++;
 }
 
-static void hashmap_clear(HashMap *map) {
+static void __attribute__((unused)) hashmap_clear(HashMap *map) {
 	free(map->buckets);
 	map->buckets = NULL;
 	map->capacity = 0;
@@ -543,45 +535,12 @@ static void hashmap_zero(HashMap *map) {
 }
 
 static char *intern_filename(const char *name) {
-	if (!name) return NULL;
-	size_t slen = strlen(name);
-	int len = slen > (size_t)INT_MAX ? INT_MAX : (int)slen;
-	char *existing = hashmap_get(&ctx->filename_intern_map, (char *)name, len);
-	if (existing) return existing;
-	char *interned = arena_strdup(&ctx->main_arena, name);
-	hashmap_put(&ctx->filename_intern_map, interned, len, interned);
-	return interned;
-}
-
-static File *find_cached_file_view(char *filename, int line_delta, bool is_system, bool is_include_entry) {
-	FileViewKey key;
-	memset(&key, 0, sizeof(key));
-	key.filename = filename;
-	key.line_delta = line_delta;
-	key.flags = (is_system ? 1 : 0) | (is_include_entry ? 2 : 0);
-	return hashmap_get(&ctx->file_view_cache, (char *)&key, sizeof(key));
-}
-
-static void
-cache_file_view(char *filename, int line_delta, bool is_system, bool is_include_entry, File *file) {
-	FileViewKey *stored_key = arena_alloc(&ctx->main_arena, sizeof(FileViewKey));
-	stored_key->filename = filename;
-	stored_key->line_delta = line_delta;
-	stored_key->flags = (is_system ? 1 : 0) | (is_include_entry ? 2 : 0);
-	hashmap_put(&ctx->file_view_cache, (char *)stored_key, sizeof(FileViewKey), file);
+	return name ? arena_strdup(&ctx->main_arena, name) : NULL;
 }
 
 static void free_file_contents(File *f) {
 	if (!f) return;
 	if (f->contents && f->owns_contents) free(f->contents);
-}
-
-static void free_filename_intern_map(void) {
-	hashmap_zero(&ctx->filename_intern_map);
-}
-
-static void free_file_view_cache(void) {
-	hashmap_zero(&ctx->file_view_cache);
 }
 
 static inline File *tok_file(Token *tok) {
@@ -846,7 +805,7 @@ static void init_keyword_map(void) {
 		val |= (uintptr_t)entries[i].extra_flags << KW_FLAGS_SHIFT;
 		unsigned slot = KEYWORD_HASH(entries[i].name, len);
 		while (keyword_cache[slot & 255].name) slot++;
-		keyword_cache[slot & 255] = (KeywordEntry){entries[i].name, len, val};
+		keyword_cache[slot & 255] = (KeywordEntry){.name = entries[i].name, .value = val, .len = len};
 	}
 #ifdef PRISM_LIB_MODE
 	ctx->keyword_cache_features = ctx->features;
@@ -1097,14 +1056,8 @@ static void add_input_file(File *file) {
 
 static File *
 new_file_view(const char *name, File *base, int line_delta, bool is_system, bool is_include_entry) {
-	char *interned_name = intern_filename(name ? name : base->name);
-
-	File *cached = find_cached_file_view(interned_name, line_delta, is_system, is_include_entry);
-	if (cached) return cached;
-
 	File *file = arena_alloc(&ctx->main_arena, sizeof(File));
-
-	file->name = interned_name;
+	file->name = intern_filename(name ? name : base->name);
 	file->display_name = file->name;
 	file->file_no = ctx->input_file_count;
 	file->contents = base->contents;
@@ -1112,10 +1065,7 @@ new_file_view(const char *name, File *base, int line_delta, bool is_system, bool
 	file->line_delta = line_delta;
 	file->is_system = is_system;
 	file->is_include_entry = is_include_entry;
-
-	cache_file_view(interned_name, line_delta, is_system, is_include_entry, file);
 	add_input_file(file);
-
 	return file;
 }
 
@@ -1421,7 +1371,8 @@ static Token *tokenize(File *file) {
 		// Also propagate TT_SPECIAL_FN to indirect longjmp wrappers (one level).
 		// Function body heuristic: depth-0 '{' preceded by ')'.
 		{
-			HashMap wrapper_map = {0};
+			Token *wrappers[32];
+			int wrapper_count = 0;
 			Token *func_name = NULL;
 			for (Token *t = head.next; t && t->kind != TK_EOF; t = t->next) {
 				if (t->kind <= TK_KEYWORD && t->next &&
@@ -1440,7 +1391,7 @@ static Token *tokenize(File *file) {
 						if (b->tag & TT_ASM) t->tag |= TT_ASM;
 					}
 					if (func_name && (t->tag & TT_SPECIAL_FN))
-						hashmap_put(&wrapper_map, func_name->loc, func_name->len, (void *)1);
+						if (wrapper_count < 32) wrappers[wrapper_count++] = func_name;
 					func_name = NULL;
 					t = end;
 				}
@@ -1454,20 +1405,23 @@ static Token *tokenize(File *file) {
 					func_name = t;
 				if (t->shortcut == '{' && (t->flags & TF_OPEN) && t->match) {
 					Token *end = t->match;
-					if (!(t->tag & TT_SPECIAL_FN) && wrapper_map.used) {
+					if (!(t->tag & TT_SPECIAL_FN) && wrapper_count) {
 						for (Token *b = t->next; b != end; b = b->next)
 							if (b->kind == TK_IDENT && b->next &&
-							    b->next->shortcut == '(' &&
-							    hashmap_get(&wrapper_map, b->loc, b->len)) {
-								t->tag |= TT_SPECIAL_FN;
-								break;
+							    b->next->shortcut == '(') {
+								for (int w = 0; w < wrapper_count; w++)
+									if (b->len == wrappers[w]->len &&
+									    !memcmp(b->loc, wrappers[w]->loc, b->len)) {
+										t->tag |= TT_SPECIAL_FN;
+										goto wrapper_done;
+									}
 							}
+						wrapper_done:;
 					}
 					func_name = NULL;
 					t = end;
 				}
 			}
-			hashmap_clear(&wrapper_map);
 		}
 	}
 
@@ -1535,13 +1489,9 @@ void tokenizer_teardown(bool full) {
 	}
 	if (full) {
 		arena_free(&ctx->main_arena);
-		hashmap_clear(&ctx->file_view_cache);
-		hashmap_clear(&ctx->filename_intern_map);
 		memset(keyword_cache, 0, sizeof(keyword_cache));
 	} else {
 		arena_reset(&ctx->main_arena);
-		free_file_view_cache();
-		free_filename_intern_map();
 	}
 	ctx->input_files = NULL;
 	ctx->input_file_count = 0;

@@ -68,27 +68,24 @@
 #define typedef_add_enum_const(name, len, depth)                                                             \
 	typedef_add_entry(name, len, depth, TDK_ENUM_CONST, false, false)
 #define typedef_add_vla_var(name, len, depth) typedef_add_entry(name, len, depth, TDK_VLA_VAR, true, false)
-#define argv_builder_init(ab) (*(ab) = (ArgvBuilder){0})
-#define argv_builder_finish(ab) ((ab)->data)
 
 typedef struct {
+	// Preprocessor configuration (optional - can be left NULL/0 for defaults)
+	const char *compiler;
+	const char **include_paths; // -I paths
+	const char **defines; // -D macros
+	const char **compiler_flags; // Additional flags (-std=c99, -m32, etc.)
+	const char **force_includes; // -include files
+	int include_count;
+	int define_count;
+	int compiler_flags_count;
+	int force_include_count;
 	bool defer;
 	bool zeroinit;
 	bool line_directives;
-	bool warn_safety;     // If true, safety checks warn instead of error
-	bool flatten_headers; // If true, include flattened system headers (default: true)
-	bool orelse;	      // If true, enable orelse keyword (default: true)
-
-	// Preprocessor configuration (optional - can be left NULL/0 for defaults)
-	const char *compiler;	    // Compiler to use (default: "cc")
-	const char **include_paths; // -I paths
-	int include_count;
-	const char **defines; // -D macros
-	int define_count;
-	const char **compiler_flags; // Additional flags (-std=c99, -m32, etc.)
-	int compiler_flags_count;
-	const char **force_includes; // -include files
-	int force_include_count;
+	bool warn_safety;
+	bool flatten_headers;
+	bool orelse;
 } PrismFeatures;
 
 typedef enum {
@@ -99,27 +96,27 @@ typedef enum {
 } PrismStatus;
 
 typedef struct {
-	PrismStatus status;
 	char *output; // transpiled C (caller frees with prism_free)
-	size_t output_len;
 	char *error_msg; // error message (NULL on success)
+	size_t output_len;
 	int error_line;
 	int error_col;
+	PrismStatus status;
 } PrismResult;
 
 typedef struct {
-	Token *end;	   // First token after the type specifier
-	bool saw_type;	   // True if a type was recognized
-	bool is_struct;	   // True if struct/union/enum type
-	bool is_enum;	   // True if enum type specifically
-	bool is_typedef;   // True if user-defined typedef
-	bool is_vla;	   // True if VLA typedef or struct with VLA member
-	bool has_typeof;   // True if typeof/typeof_unqual (cannot determine VLA at transpile-time)
-	bool has_atomic;   // True if _Atomic qualifier/specifier present
-	bool has_register; // True if register storage class
-	bool has_volatile; // True if volatile qualifier
-	bool has_const;	   // True if const qualifier
-	bool has_void;	   // True if void or void typedef
+	Token *end;		  // First token after the type specifier
+	bool saw_type : 1;	  // True if a type was recognized
+	bool is_struct : 1;
+	bool is_enum : 1;
+	bool is_typedef : 1;
+	bool is_vla : 1;
+	bool has_typeof : 1;
+	bool has_atomic : 1;
+	bool has_register : 1;
+	bool has_volatile : 1;
+	bool has_const : 1;
+	bool has_void : 1;	  // True if void or void typedef
 } TypeSpecResult;
 
 typedef enum {
@@ -150,25 +147,23 @@ typedef enum {
 } ScopeKind;
 
 typedef struct {
-	ScopeKind kind;
 	Token *close_tok;  // for paren/generic scopes: the matching ')'
 	DeferEntry *entries;
 	int count;
 	int capacity;
-	bool is_loop;	       // true if this scope is a for/while/do loop
-	bool is_switch;
-	bool had_control_exit; // true if unconditional break/return/goto/continue was seen
-			       // NOTE: only set on switch scopes (by mark_switch_control_exit)
-	bool
-	    is_conditional; // true if this scope is an if/while/for block (for tracking conditional control exits)
-	bool seen_case_label; // true if case/default label seen in this switch scope (for zero-init safety)
-	bool is_struct;	      // true if this scope is a struct/union/enum body
-	bool has_zeroinit_decl; // true if a zero-init'd variable declaration was emitted in this scope
-	bool is_stmt_expr;     // true if this scope is a GNU statement expression
-	bool is_orelse_guard;  // true if this scope is an orelse fallback block
+	uint8_t kind;
+	bool is_loop : 1;
+	bool is_switch : 1;
+	bool had_control_exit : 1; // true if unconditional break/return/goto/continue was seen
+				   // NOTE: only set on switch scopes (by mark_switch_control_exit)
+	bool is_conditional : 1;
+	bool seen_case_label : 1; // true if case/default label seen in this switch scope (for zero-init safety)
+	bool is_struct : 1;
+	bool has_zeroinit_decl : 1;
+	bool is_stmt_expr : 1;
+	bool is_orelse_guard : 1;
 } ScopeNode;
 
-// Result of goto skip analysis — both defer and decl checked in a single walk
 typedef struct {
 	Token *skipped_defer;
 	Token *skipped_decl;
@@ -186,22 +181,21 @@ typedef struct {
 	LabelInfo *labels;
 	int count;
 	int capacity;
-	HashMap name_map; // For O(1) lookups by name
 } LabelTable;
 
 typedef struct {
 	char *name; // Points into token stream (no alloc needed)
 	int len;
-	int scope_depth;    // Scope where defined (aligns with ctx->block_depth)
-	bool is_vla;	    // True if typedef refers to a VLA type
-	bool is_void;	    // True if typedef resolves to void (e.g., typedef void Void)
-	bool is_const;	    // True if typedef includes const (e.g., typedef const int cint)
-	bool is_ptr;	    // True if typedef resolves to a pointer type (e.g., typedef int *ptr)
-	bool is_array;      // True if typedef resolves to an array type (e.g., typedef int arr_t[5])
-	bool is_shadow;	    // True if this entry shadows a typedef (variable with same name)
-	bool is_enum_const; // True if this is an enum constant (compile-time constant)
-	bool is_vla_var;    // True if this is a VLA variable (not a typedef, but needs VLA tracking)
-	int prev_index;	    // Index of previous entry with same name (-1 if none), for hash map chaining
+	int scope_depth;	    // Scope where defined (aligns with ctx->block_depth)
+	int prev_index;		    // Index of previous entry with same name (-1 if none), for hash map chaining
+	bool is_vla : 1;
+	bool is_void : 1;
+	bool is_const : 1;
+	bool is_ptr : 1;
+	bool is_array : 1;
+	bool is_shadow : 1;
+	bool is_enum_const : 1;
+	bool is_vla_var : 1;
 } TypedefEntry;
 
 typedef struct {
@@ -214,14 +208,14 @@ typedef struct {
 typedef enum { CLI_DEFAULT, CLI_RUN, CLI_EMIT, CLI_INSTALL } CliMode;
 
 typedef struct {
-	CliMode mode;
 	PrismFeatures features;
 	const char **sources;
-	int source_count, source_cap;
 	const char **cc_args;
-	int cc_arg_count, cc_arg_cap;
 	const char *output;
 	const char *cc;
+	int source_count, source_cap;
+	int cc_arg_count, cc_arg_cap;
+	CliMode mode;
 	bool verbose;
 	bool compile_only;
 } Cli;
@@ -229,24 +223,19 @@ typedef struct {
 // Control flow scope flags
 enum { NS_LOOP = 1, NS_SWITCH = 2, NS_CONDITIONAL = 4 };
 
-typedef struct {
-	char **data;
-	int count, capacity;
-} ArgvBuilder;
-
 // Declarator parsing result
 typedef struct {
-	Token *end;	  // First token after declarator
+	Token *end;		  // First token after declarator
 	Token *var_name;
-	bool is_pointer;
-	bool is_array;
-	bool is_vla;		// Has variable-length array dimension
-	bool is_func_ptr;
-	bool has_paren;
-	bool paren_pointer;	// Has pointer (*) inside parenthesized declarator
-	bool paren_array;	// Has array dimension inside parenthesized declarator
-	bool has_init;
-	bool is_const;		// Has const qualifier on declarator (e.g. * const)
+	bool is_pointer : 1;
+	bool is_array : 1;
+	bool is_vla : 1;
+	bool is_func_ptr : 1;
+	bool has_paren : 1;
+	bool paren_pointer : 1;	  // Has pointer (*) inside parenthesized declarator
+	bool paren_array : 1;
+	bool has_init : 1;
+	bool is_const : 1;
 } DeclResult;
 
 static bool struct_body_contains_vla(Token *);
@@ -259,8 +248,6 @@ static char **system_include_list; // Ordered list of includes
 static int system_include_capacity = 0;
 
 static LabelTable label_table;
-
-
 
 // Token emission - user-space buffered output for minimal syscall overhead
 static FILE *out_fp;
@@ -294,6 +281,7 @@ static inline void out_char(char c);
 static inline void out_str(const char *s, int len);
 #define skip_balanced(tok, o, c) walk_balanced((tok), false)
 static bool cc_is_msvc(const char *cc);
+static LabelInfo *label_find(Token *tok);
 static inline void ctrl_reset(void);
 
 // Emit space-separated token range [start, end). First token has no leading space.
@@ -348,7 +336,6 @@ static void reset_transpiler_state(void) {
 	label_table.labels = NULL;
 	label_table.count = 0;
 	label_table.capacity = 0;
-	hashmap_zero(&label_table.name_map);
 
 }
 
@@ -874,12 +861,6 @@ static void label_table_add(char *name, int name_len, int scope_depth, Token *to
 	info->scope_depth = scope_depth;
 	info->tok = tok;
 	info->block_open = block_open;
-	hashmap_put(&label_table.name_map, name, name_len, (void *)(intptr_t)(scope_depth + 1));
-}
-
-static int label_table_lookup(char *name, int name_len) {
-	void *val = hashmap_get(&label_table.name_map, name, name_len);
-	return val ? (int)(intptr_t)val - 1 : -1;
 }
 
 static void typedef_table_reset(void) {
@@ -1093,7 +1074,6 @@ static inline Token *check_label(Token *tok, Token *prev, int *ternary_depth) {
 // Scan function body for labels. All flags read from brace tags set by parse.c.
 static void scan_labels_in_function(Token *tok) {
 	label_table.count = 0;
-	hashmap_zero(&label_table.name_map);
 	ctx->current_func_has_setjmp = false;
 	ctx->current_func_has_asm = false;
 	ctx->current_func_has_vfork = false;
@@ -1833,6 +1813,7 @@ static inline Token *decl_array_dims(Token *t, bool emit, bool *vla) {
 // Unified declarator parser. emit=true emits tokens, emit=false only advances.
 static DeclResult parse_declarator(Token *tok, bool emit) {
 	DeclResult r = { .end = tok };
+	bool is_vla = false;
 	int ptr_depth = 0;
 
 #define DECL_EAT_PTRS(extra_ptr_action)						\
@@ -1877,13 +1858,13 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 
 	if (r.has_paren && match_ch(tok, '[')) {
 		r.is_array = true; r.paren_array = true;
-		tok = decl_array_dims(tok, emit, &r.is_vla);
+		tok = decl_array_dims(tok, emit, &is_vla);
 	}
 
 	while (r.has_paren && nested_paren > 0) {
 		while (match_ch(tok, '(') || match_ch(tok, '[')) {
 			if (match_ch(tok, '(')) tok = walk_balanced(tok, emit);
-			else { r.is_array = true; r.paren_array = true; tok = decl_array_dims(tok, emit, &r.is_vla); }
+			else { r.is_array = true; r.paren_array = true; tok = decl_array_dims(tok, emit, &is_vla); }
 		}
 		if (!match_ch(tok, ')')) { r.end = NULL; return r; }
 		decl_emit(tok, emit); tok = tok->next;
@@ -1898,7 +1879,7 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 
 	if (match_ch(tok, '[')) {
 		r.is_array = true;
-		tok = decl_array_dims(tok, emit, &r.is_vla);
+		tok = decl_array_dims(tok, emit, &is_vla);
 	}
 
 	while (tok && tok->kind != TK_EOF) {
@@ -1911,6 +1892,7 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 	}
 
 	r.has_init = match_ch(tok, '=');
+	r.is_vla = is_vla;
 	r.end = tok;
 	return r;
 }
@@ -2042,8 +2024,8 @@ static Token *emit_goto_defer(Token *tok) {
 	mark_switch_control_exit();
 	tok = tok->next;
 	if (FEAT(F_DEFER) && is_identifier_like(tok)) {
-		int td = label_table_lookup(tok->loc, tok->len);
-		if (td < 0) td = ctx->block_depth;
+		LabelInfo *info = label_find(tok);
+		int td = info ? info->scope_depth : ctx->block_depth;
 		if (goto_has_defers(td)) emit_goto_defers(td);
 	}
 	OUT_LIT(" goto ");
@@ -3093,13 +3075,6 @@ static Token *handle_close_brace(Token *tok) {
 	return tok;
 }
 
-static inline void argv_builder_add(ArgvBuilder *ab, const char *arg) {
-	ARENA_ENSURE_CAP(&ctx->main_arena, ab->data, ab->count + 2, ab->capacity, 64, char *);
-	ab->data[ab->count] = arena_strdup(&ctx->main_arena, arg);
-	ab->count++;
-	ab->data[ab->count] = NULL;
-}
-
 // Build a copy of 'environ' with CC and PRISM_CC removed (cached)
 static char **build_clean_environ(void) {
 	if (cached_clean_env) return cached_clean_env;
@@ -3197,30 +3172,30 @@ static bool cc_is_msvc(const char *cc) {
 #endif
 
 // Build preprocessor argv (shared between pipe and file paths)
-static void build_pp_argv(ArgvBuilder *ab, const char *input_file) {
+static void build_pp_argv(const char **args, int *argc, const char *input_file) {
 	const char *cc = ctx->extra_compiler ? ctx->extra_compiler : PRISM_DEFAULT_CC;
-	argv_builder_add(ab, cc);
-	argv_builder_add(ab, "-E");
-	argv_builder_add(ab, "-w");
+	args[(*argc)++] = cc;
+	args[(*argc)++] = "-E";
+	args[(*argc)++] = "-w";
 
 	for (int i = 0; i < ctx->extra_compiler_flags_count; i++)
-		argv_builder_add(ab, ctx->extra_compiler_flags[i]);
+		args[(*argc)++] = ctx->extra_compiler_flags[i];
 
 	for (int i = 0; i < ctx->extra_include_count; i++)
 	{
-		argv_builder_add(ab, "-I");
-		argv_builder_add(ab, ctx->extra_include_paths[i]);
+		args[(*argc)++] = "-I";
+		args[(*argc)++] = ctx->extra_include_paths[i];
 	}
 
 	for (int i = 0; i < ctx->extra_define_count; i++)
 	{
-		argv_builder_add(ab, "-D");
-		argv_builder_add(ab, ctx->extra_defines[i]);
+		args[(*argc)++] = "-D";
+		args[(*argc)++] = ctx->extra_defines[i];
 	}
 
-	argv_builder_add(ab, "-D__PRISM__=1");
-	if (FEAT(F_DEFER)) argv_builder_add(ab, "-D__PRISM_DEFER__=1");
-	if (FEAT(F_ZEROINIT)) argv_builder_add(ab, "-D__PRISM_ZEROINIT__=1");
+	args[(*argc)++] = "-D__PRISM__=1";
+	if (FEAT(F_DEFER)) args[(*argc)++] = "-D__PRISM_DEFER__=1";
+	if (FEAT(F_ZEROINIT)) args[(*argc)++] = "-D__PRISM_ZEROINIT__=1";
 
 	// Add POSIX/GNU feature test macros unless user already defined them
 #ifndef _WIN32
@@ -3238,26 +3213,27 @@ static void build_pp_argv(ArgvBuilder *ab, const char *input_file) {
 			if (strncmp(f, "-D_GNU_SOURCE", 13) == 0 || strncmp(f, "-U_GNU_SOURCE", 13) == 0)
 				user_has_gnu = true;
 		}
-		if (!user_has_posix) argv_builder_add(ab, "-D_POSIX_C_SOURCE=200809L");
-		if (!user_has_gnu) argv_builder_add(ab, "-D_GNU_SOURCE");
+		if (!user_has_posix) args[(*argc)++] = "-D_POSIX_C_SOURCE=200809L";
+		if (!user_has_gnu) args[(*argc)++] = "-D_GNU_SOURCE";
 	}
 #endif
 
 	for (int i = 0; i < ctx->extra_force_include_count; i++)
 	{
-		argv_builder_add(ab, cc_is_msvc(ab->data[0]) ? "/FI" : "-include");
-		argv_builder_add(ab, ctx->extra_force_includes[i]);
+		args[(*argc)++] = cc_is_msvc(args[0]) ? "/FI" : "-include";
+		args[(*argc)++] = ctx->extra_force_includes[i];
 	}
 
-	argv_builder_add(ab, input_file);
+	args[(*argc)++] = input_file;
+	args[*argc] = NULL;
 }
 
 // Run system preprocessor (cc -E) via pipe, returns malloc'd output or NULL
 static char *preprocess_with_cc(const char *input_file) {
-	ArgvBuilder ab;
-	argv_builder_init(&ab);
-	build_pp_argv(&ab, input_file);
-	char **argv = argv_builder_finish(&ab);
+	const char *args[512];
+	int argc = 0;
+	build_pp_argv(args, &argc, input_file);
+	char **argv = (char **)args;
 
 	// Set up pipe: child writes preprocessed output, we read it
 	int pipefd[2];
@@ -3470,22 +3446,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		}                                                                                            \
 	}
 
-// Track top-level parentheses for function detection
-#define TRACK_TOPLEVEL_PAREN(tok)                                                                            \
-	if (ctx->block_depth == 0) {                                                                         \
-		if (match_ch(tok, '(')) {                                                                    \
-			if (toplevel_paren_depth == 0) {                                                     \
-				last_toplevel_open_paren = tok;                                              \
-			}                                                                                    \
-			toplevel_paren_depth++;                                                              \
-		} else if (match_ch(tok, ')')) {                                                             \
-			if (--toplevel_paren_depth <= 0) {                                                   \
-				toplevel_paren_depth = 0;                                                    \
-				last_toplevel_paren = tok;                                                   \
-			}                                                                                    \
-		}                                                                                            \
-		prev_toplevel_tok = tok;                                                                     \
-	}
+// Track top-level parentheses for function detection — inlined at each use site
 
 		// Fast path: untagged tokens not at statement start (~70-80% of tokens)
 		if (__builtin_expect(!tag && !ctx->at_stmt_start, 1)) {
@@ -3499,7 +3460,17 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				if (match_ch(tok, '(')) push_generic_scope(tok);
 				else if (match_ch(tok, ')')) pop_generic_scope();
 			}
-			TRACK_TOPLEVEL_PAREN(tok);
+			if (ctx->block_depth == 0) {
+				if (match_ch(tok, '(')) {
+					if (toplevel_paren_depth++ == 0) last_toplevel_open_paren = tok;
+				} else if (match_ch(tok, ')')) {
+					if (--toplevel_paren_depth <= 0) {
+						toplevel_paren_depth = 0;
+						last_toplevel_paren = tok;
+					}
+				}
+				prev_toplevel_tok = tok;
+			}
 			emit_tok(tok);
 			tok = tok->next;
 			continue;
@@ -3836,7 +3807,17 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				track_ctrl_paren_close();
 		}
 
-		TRACK_TOPLEVEL_PAREN(tok);
+		if (ctx->block_depth == 0) {
+			if (match_ch(tok, '(')) {
+				if (toplevel_paren_depth++ == 0) last_toplevel_open_paren = tok;
+			} else if (match_ch(tok, ')')) {
+				if (--toplevel_paren_depth <= 0) {
+					toplevel_paren_depth = 0;
+					last_toplevel_paren = tok;
+				}
+			}
+			prev_toplevel_tok = tok;
+		}
 
 		// Warn on unprocessed 'orelse' in unsupported context
 		if (__builtin_expect(FEAT(F_ORELSE) && is_orelse_keyword(tok) &&
@@ -3902,7 +3883,6 @@ PRISM_API void prism_reset(void) {
 	ctx->block_depth = 0;
 	scope_stack_capacity = 0;
 
-	hashmap_zero(&label_table.name_map);
 	label_table.labels = NULL;
 	label_table.count = 0;
 	label_table.capacity = 0;
@@ -4134,18 +4114,6 @@ static int transpile_and_compile(char *input_file, char **compile_argv, bool ver
 	return wait_for_child(pid);
 }
 
-static char **build_argv(const char *first, ...) {
-	ArgvBuilder ab;
-	argv_builder_init(&ab);
-	if (first) argv_builder_add(&ab, first);
-	va_list ap;
-	va_start(ap, first);
-	const char *arg;
-	while ((arg = va_arg(ap, const char *)) != NULL) argv_builder_add(&ab, arg);
-	va_end(ap);
-	return argv_builder_finish(&ab);
-}
-
 static noreturn void die(char *message) {
 	fprintf(stderr, "%s\n", message);
 	exit(1);
@@ -4280,18 +4248,18 @@ use_sudo:;
 	return 1;
 #else
 	{
-		char **argv = build_argv("sudo", "rm", "-f", install_path, NULL);
-		run_command(argv);
+		const char *argv_rm[] = {"sudo", "rm", "-f", install_path, NULL};
+		run_command((char **)argv_rm);
 
-		argv = build_argv("sudo", "cp", self_path, install_path, NULL);
-		int status = run_command(argv);
+		const char *argv_cp[] = {"sudo", "cp", self_path, install_path, NULL};
+		int status = run_command((char **)argv_cp);
 		if (status != 0) {
 			fprintf(stderr, "Failed to install\n");
 			return 1;
 		}
 
-		argv = build_argv("sudo", "chmod", "+x", install_path, NULL);
-		run_command(argv);
+		const char *argv_chmod[] = {"sudo", "chmod", "+x", install_path, NULL};
+		run_command((char **)argv_chmod);
 	}
 #endif
 
@@ -4462,13 +4430,13 @@ static Cli cli_parse(int argc, char **argv) {
 	return cli;
 }
 
-static void add_warn_suppress(ArgvBuilder *ab, bool clang, bool msvc) {
+static void add_warn_suppress(const char **args, int *argc, bool clang, bool msvc) {
 	if (msvc) {
-		argv_builder_add(ab, "/wd4100");
-		argv_builder_add(ab, "/wd4189");
-		argv_builder_add(ab, "/wd4244");
-		argv_builder_add(ab, "/wd4267");
-		argv_builder_add(ab, "/wd4068");
+		args[(*argc)++] = "/wd4100";
+		args[(*argc)++] = "/wd4189";
+		args[(*argc)++] = "/wd4244";
+		args[(*argc)++] = "/wd4267";
+		args[(*argc)++] = "/wd4068";
 		return;
 	}
 	static const char *w[] = {
@@ -4479,9 +4447,9 @@ static void add_warn_suppress(ArgvBuilder *ab, bool clang, bool msvc) {
 	    "-Wno-unused-variable",
 	    "-Wno-unused-parameter",
 	};
-	for (int i = 0; i < (int)(sizeof(w) / sizeof(*w)); i++) argv_builder_add(ab, w[i]);
-	if (clang) argv_builder_add(ab, "-Wno-unknown-warning-option");
-	else argv_builder_add(ab, "-Wno-logical-op");
+	for (int i = 0; i < (int)(sizeof(w) / sizeof(*w)); i++) args[(*argc)++] = w[i];
+	if (clang) args[(*argc)++] = "-Wno-unknown-warning-option";
+	else args[(*argc)++] = "-Wno-logical-op";
 }
 
 static void verbose_argv(char **args) {
@@ -4490,7 +4458,7 @@ static void verbose_argv(char **args) {
 	fprintf(stderr, "\n");
 }
 
-static void add_output_flags(ArgvBuilder *ab, const Cli *cli, const char *temp_exe, bool msvc) {
+static void add_output_flags(const char **args, int *argc, const Cli *cli, const char *temp_exe, bool msvc) {
 	static char defobj[PATH_MAX];
 	const char *out = NULL;
 
@@ -4511,21 +4479,21 @@ static void add_output_flags(ArgvBuilder *ab, const Cli *cli, const char *temp_e
 		static char flag[PATH_MAX + 8]; // cl.exe: /Fe:exe or /Fo:obj
 		if (cli->compile_only) snprintf(flag, sizeof(flag), "/Fo:%s", out);
 		else snprintf(flag, sizeof(flag), "/Fe:%s", out);
-		argv_builder_add(ab, flag);
+		args[(*argc)++] = flag;
 	} else {
-		argv_builder_add(ab, "-o");
-		argv_builder_add(ab, out);
+		args[(*argc)++] = "-o";
+		args[(*argc)++] = out;
 	}
 }
 
-static void argv_add_output(ArgvBuilder *ab, const char *out, bool msvc) {
+static void argv_add_output(const char **args, int *argc, const char *out, bool msvc) {
 	if (msvc) {
 		static char flag[PATH_MAX + 8];
 		snprintf(flag, sizeof(flag), "/Fe:%s", out);
-		argv_builder_add(ab, flag);
+		args[(*argc)++] = flag;
 	} else {
-		argv_builder_add(ab, "-o");
-		argv_builder_add(ab, out);
+		args[(*argc)++] = "-o";
+		args[(*argc)++] = out;
 	}
 }
 
@@ -4542,14 +4510,14 @@ static void make_run_temp(char *buf, size_t size, CliMode mode) {
 static int passthrough_cc(const Cli *cli) {
 	const char *compiler = get_real_cc(cli->cc);
 	bool msvc = cc_is_msvc(compiler);
-	ArgvBuilder ab;
-	argv_builder_init(&ab);
-	argv_builder_add(&ab, compiler);
-	for (int i = 0; i < cli->cc_arg_count; i++) argv_builder_add(&ab, cli->cc_args[i]);
-	if (cli->output) argv_add_output(&ab, cli->output, msvc);
-	char **pass = argv_builder_finish(&ab);
-	if (cli->verbose) verbose_argv(pass);
-	int st = run_command(pass);
+	const char *args[512];
+	int argc = 0;
+	args[argc++] = compiler;
+	for (int i = 0; i < cli->cc_arg_count; i++) args[argc++] = cli->cc_args[i];
+	if (cli->output) argv_add_output(args, &argc, cli->output, msvc);
+	args[argc] = NULL;
+	if (cli->verbose) verbose_argv((char **)args);
+	int st = run_command((char **)args);
 	return st;
 }
 
@@ -4614,17 +4582,17 @@ static int install_from_source(Cli *cli) {
 	char **temps = transpile_sources_to_temps(cli, true);
 	if (!temps) return 1;
 
-	ArgvBuilder ab;
-	argv_builder_init(&ab);
-	argv_builder_add(&ab, cc);
-	argv_builder_add(&ab, msvc ? "/O2" : "-O2");
-	for (int i = 0; i < cli->source_count; i++) argv_builder_add(&ab, temps[i]);
-	for (int i = 0; i < cli->cc_arg_count; i++) argv_builder_add(&ab, cli->cc_args[i]);
-	argv_add_output(&ab, temp_bin, msvc);
-	char **argv_cc = argv_builder_finish(&ab);
-	if (cli->verbose) verbose_argv(argv_cc);
+	const char *args[512];
+	int argc = 0;
+	args[argc++] = cc;
+	args[argc++] = msvc ? "/O2" : "-O2";
+	for (int i = 0; i < cli->source_count; i++) args[argc++] = temps[i];
+	for (int i = 0; i < cli->cc_arg_count; i++) args[argc++] = cli->cc_args[i];
+	argv_add_output(args, &argc, temp_bin, msvc);
+	args[argc] = NULL;
+	if (cli->verbose) verbose_argv((char **)args);
 
-	int status = run_command(argv_cc);
+	int status = run_command((char **)args);
 	cleanup_temps(temps, cli->source_count);
 	if (status != 0) return 1;
 
@@ -4644,41 +4612,41 @@ static int compile_sources(Cli *cli) {
 	use_linemarkers = FEAT(F_FLATTEN) && !clang && !msvc;
 
 	if (cli->source_count == 1 && !msvc) {
-		ArgvBuilder ab;
-		argv_builder_init(&ab);
-		argv_builder_add(&ab, compiler);
-		argv_builder_add(&ab, "-x");
-		argv_builder_add(&ab, "c");
-		if (FEAT(F_FLATTEN) && !clang) argv_builder_add(&ab, "-fpreprocessed");
-		argv_builder_add(&ab, "-");
+		const char *args[512];
+		int argc = 0;
+		args[argc++] = compiler;
+		args[argc++] = "-x";
+		args[argc++] = "c";
+		if (FEAT(F_FLATTEN) && !clang) args[argc++] = "-fpreprocessed";
+		args[argc++] = "-";
 		if (cli->cc_arg_count > 0) {
-			argv_builder_add(&ab, "-x");
-			argv_builder_add(&ab, "none");
+			args[argc++] = "-x";
+			args[argc++] = "none";
 		}
-		for (int i = 0; i < cli->cc_arg_count; i++) argv_builder_add(&ab, cli->cc_args[i]);
-		add_warn_suppress(&ab, clang, false);
-		add_output_flags(&ab, cli, temp_exe, false);
-		char **argv_cc = argv_builder_finish(&ab);
+		for (int i = 0; i < cli->cc_arg_count; i++) args[argc++] = cli->cc_args[i];
+		add_warn_suppress(args, &argc, clang, false);
+		add_output_flags(args, &argc, cli, temp_exe, false);
+		args[argc] = NULL;
 
 		if (cli->verbose) fprintf(stderr, "[prism] Transpiling %s (pipe → cc)\n", cli->sources[0]);
-		status = transpile_and_compile((char *)cli->sources[0], argv_cc, cli->verbose);
+		status = transpile_and_compile((char *)cli->sources[0], (char **)args, cli->verbose);
 	} else {
 		char **temps = transpile_sources_to_temps(cli, false);
 		if (!temps) die("Transpilation failed");
 
-		ArgvBuilder ab;
-		argv_builder_init(&ab);
-		argv_builder_add(&ab, compiler);
-		if (FEAT(F_FLATTEN) && !clang && !msvc) argv_builder_add(&ab, "-fpreprocessed");
-		for (int i = 0; i < cli->source_count; i++) argv_builder_add(&ab, temps[i]);
-		if (FEAT(F_FLATTEN) && !clang && !msvc) argv_builder_add(&ab, "-fno-preprocessed");
-		for (int i = 0; i < cli->cc_arg_count; i++) argv_builder_add(&ab, cli->cc_args[i]);
-		add_warn_suppress(&ab, clang, msvc);
-		add_output_flags(&ab, cli, temp_exe, msvc);
-		char **argv_cc = argv_builder_finish(&ab);
+		const char *args[512];
+		int argc = 0;
+		args[argc++] = compiler;
+		if (FEAT(F_FLATTEN) && !clang && !msvc) args[argc++] = "-fpreprocessed";
+		for (int i = 0; i < cli->source_count; i++) args[argc++] = temps[i];
+		if (FEAT(F_FLATTEN) && !clang && !msvc) args[argc++] = "-fno-preprocessed";
+		for (int i = 0; i < cli->cc_arg_count; i++) args[argc++] = cli->cc_args[i];
+		add_warn_suppress(args, &argc, clang, msvc);
+		add_output_flags(args, &argc, cli, temp_exe, msvc);
+		args[argc] = NULL;
 
-		if (cli->verbose) verbose_argv(argv_cc);
-		status = run_command(argv_cc);
+		if (cli->verbose) verbose_argv((char **)args);
+		status = run_command((char **)args);
 		cleanup_temps(temps, cli->source_count);
 	}
 
@@ -4688,7 +4656,7 @@ static int compile_sources(Cli *cli) {
 	}
 
 	if (cli->mode == CLI_RUN) {
-		char **run = build_argv(temp_exe, NULL);
+		char *run[] = {temp_exe, NULL};
 		if (cli->verbose) fprintf(stderr, "[prism] Running %s\n", temp_exe);
 		status = run_command(run);
 		remove(temp_exe);
