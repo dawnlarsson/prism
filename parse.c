@@ -30,9 +30,12 @@
 #define __attribute__(x)
 #endif
 
-#define TOMBSTONE ((void *)-1)
+#define TOMBSTONE ((char *)1)
+#define TAG_KEY(ptr, len)   ((char *)((uintptr_t)(ptr) | ((uintptr_t)(uint16_t)(len) << 48)))
+#define UNTAG_KEY(k)        ((char *)((uintptr_t)(k) & 0x0000FFFFFFFFFFFFULL))
+#define KEY_LEN(k)          ((int)((uintptr_t)(k) >> 48))
 #define ENTRY_MATCHES(ent, k, kl)                                                                            \
-	((ent)->key && (ent)->key != TOMBSTONE && (ent)->keylen == (kl) && !memcmp((ent)->key, (k), (kl)))
+	((ent)->key && UNTAG_KEY((ent)->key) != TOMBSTONE && KEY_LEN((ent)->key) == (kl) && !memcmp(UNTAG_KEY((ent)->key), (k), (kl)))
 #define IS_DIGIT(c) ((unsigned)(c) - '0' < 10u)
 #define IS_ALPHA(c) (((unsigned)((c) | 0x20) - 'a') < 26u || (c) == '_' || (c) == '$')
 #define IS_ALNUM(c) (IS_DIGIT(c) || IS_ALPHA(c))
@@ -46,8 +49,6 @@
 #else
 #define ARENA_ALIGN (__alignof__(long double))
 #endif
-
-#define TOKEN_ALLOC_SIZE (((int)sizeof(Token) + (ARENA_ALIGN - 1)) & ~(ARENA_ALIGN - 1))
 
 #define equal(                                                                                                                     \
     tok,                                                                                                                           \
@@ -196,22 +197,20 @@ enum {
 	(TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_INLINE | TT_ALIGNAS | TT_SKIP_DECL | TT_ATTR)
 
 struct Token {
-	char *loc;
-	Token *next;
-	Token *match; // Linked matching delimiter (open↔close)
-	int line_no; // Cached line number (computed once during tokenization)
-	uint8_t kind;
-	uint32_t tag;	  // TT_* bitmask - token classification
+	uint32_t loc_offset;  // Byte offset from File->contents
+	uint32_t next_idx;    // Token pool index (0 = NULL)
+	uint32_t match_idx;   // Token pool index (0 = NULL)
+	uint32_t tag;         // TT_* bitmask - token classification
+	int32_t  line_no : 21;
+	uint32_t kind : 3;
+	uint32_t flags : 8;
 	uint16_t len;
 	uint16_t file_idx;
-	uint8_t flags;
-	uint8_t shortcut; // First byte of token (tok->loc[0]), avoids pointer chase
-};
+}; // 24 bytes
 
 typedef struct {
-	char *key;
+	char *key;  // upper 16 bits = keylen, lower 48 = pointer
 	void *val;
-	int keylen;
 } HashEntry;
 
 typedef struct {
@@ -326,6 +325,11 @@ static inline bool is_digraph_loc(char *loc) {
 
 static PrismContext *ctx = NULL;
 
+// Token pool: flat array for index-based linking (pointer compression)
+static Token *token_pool = NULL;
+static uint32_t token_count = 1; // 0 reserved as NULL sentinel
+static uint32_t token_cap = 0;
+
 static noreturn void error(char *fmt, ...);
 static void hashmap_put(HashMap *map, char *key, int keylen, void *val);
 
@@ -426,15 +430,41 @@ static void prism_ctx_init(void) {
 	ctx->at_stmt_start = true;
 }
 
-static inline Token *arena_alloc_token(void) {
-	Arena *arena = &ctx->main_arena;
-	ArenaBlock *blk = arena->current;
-	if (__builtin_expect(blk && blk->used + TOKEN_ALLOC_SIZE <= blk->capacity, 1)) {
-		Token *tok = (Token *)(blk->data + blk->used);
-		blk->used += TOKEN_ALLOC_SIZE;
-		return tok;
-	}
-	return arena_alloc_uninit(arena, sizeof(Token));
+static void token_pool_ensure(size_t need) {
+	if (need <= token_cap) return;
+	size_t new_cap = token_cap ? token_cap * 2 : 65536;
+	while (new_cap < need) new_cap *= 2;
+	Token *p = realloc(token_pool, new_cap * sizeof(Token));
+	if (!p) error("out of memory allocating token pool");
+	token_pool = p;
+	token_cap = (uint32_t)new_cap;
+}
+
+static inline Token *pool_alloc_token(void) {
+	if (__builtin_expect(token_count < token_cap, 1))
+		return &token_pool[token_count++];
+	token_pool_ensure(token_count + 1);
+	return &token_pool[token_count++];
+}
+
+// Accessor: resolve token -> source location pointer
+static inline char *tok_loc(Token *tok) {
+	return ctx->input_files[tok->file_idx]->contents + tok->loc_offset;
+}
+
+// Accessor: resolve next_idx -> Token*
+static inline Token *tok_next(Token *tok) {
+	return tok->next_idx ? &token_pool[tok->next_idx] : NULL;
+}
+
+// Accessor: resolve match_idx -> Token*
+static inline Token *tok_match(Token *tok) {
+	return tok->match_idx ? &token_pool[tok->match_idx] : NULL;
+}
+
+// Convert Token* to pool index (0 for NULL)
+static inline uint32_t tok_idx(Token *tok) {
+	return tok ? (uint32_t)(tok - token_pool) : 0;
 }
 
 // Fast multiply-mix hash (~2-4x faster than FNV-1a for short strings)
@@ -479,7 +509,8 @@ static void hashmap_resize(HashMap *map, int newcap) {
 	if (!new_map.buckets) error("out of memory resizing hashmap");
 	for (int i = 0; i < map->capacity; i++) {
 		HashEntry *ent = &map->buckets[i];
-		if (ent->key && ent->key != TOMBSTONE) hashmap_put(&new_map, ent->key, ent->keylen, ent->val);
+		if (ent->key && UNTAG_KEY(ent->key) != TOMBSTONE)
+			hashmap_put(&new_map, UNTAG_KEY(ent->key), KEY_LEN(ent->key), ent->val);
 	}
 	free(map->buckets);
 	*map = new_map;
@@ -514,8 +545,7 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val) {
 	if (first_empty < 0) error("hashmap_put: no empty slot found (internal error)");
 
 	HashEntry *ent = &map->buckets[first_empty];
-	ent->key = key;
-	ent->keylen = keylen;
+	ent->key = TAG_KEY(key, keylen);
 	ent->val = val;
 	map->used++;
 }
@@ -536,7 +566,7 @@ static void free_file_contents(File *f) {
 }
 
 static inline File *tok_file(Token *tok) {
-	if (!tok || tok->file_idx < 0 || tok->file_idx >= ctx->input_file_count) return ctx->current_file;
+	if (!tok || tok->file_idx >= ctx->input_file_count) return ctx->current_file;
 	return ctx->input_files[tok->file_idx];
 }
 
@@ -637,7 +667,7 @@ noreturn void error_tok(Token *tok, const char *fmt, ...) {
 		lib_error_jump(tok_line_no(tok));
 	}
 #endif
-	verror_at(f->name, f->contents, tok_line_no(tok), tok->loc, fmt, ap);
+	verror_at(f->name, f->contents, tok_line_no(tok), tok_loc(tok), fmt, ap);
 	va_end(ap);
 	exit(1);
 }
@@ -651,22 +681,24 @@ static void warn_tok(Token *tok, const char *fmt, ...) {
 	va_list ap;
 	va_start(ap, fmt);
 	File *f = tok_file(tok);
-	verror_at(f->name, f->contents, tok_line_no(tok), tok->loc, fmt, ap);
+	verror_at(f->name, f->contents, tok_line_no(tok), tok_loc(tok), fmt, ap);
 	va_end(ap);
 #endif
 }
 
 static inline bool equal_n(Token *tok, const char *op, size_t len) {
-	return tok->len == (int)len && tok->shortcut == (uint8_t)op[0] &&
-	       !memcmp(tok->loc + 1, op + 1, len - 1);
+	char *loc = tok_loc(tok);
+	return tok->len == (int)len && (uint8_t)loc[0] == (uint8_t)op[0] &&
+	       !memcmp(loc + 1, op + 1, len - 1);
 }
 
 static inline bool _equal_1(Token *tok, char c) {
-	return tok->len == 1 && tok->shortcut == (uint8_t)c;
+	return tok->len == 1 && (uint8_t)tok_loc(tok)[0] == (uint8_t)c;
 }
 
 static inline bool _equal_2(Token *tok, const char *s) {
-	return tok->len == 2 && tok->loc[0] == s[0] && tok->loc[1] == s[1];
+	char *loc = tok_loc(tok);
+	return tok->len == 2 && loc[0] == s[0] && loc[1] == s[1];
 }
 
 static inline uintptr_t keyword_lookup(char *key, int keylen) {
@@ -870,20 +902,55 @@ static bool is_space(char c) {
 	return c == ' ' || c == '\t' || c == '\f' || c == '\r' || c == '\v';
 }
 
+// SWAR: test if any byte in a 64-bit word is zero
+#define SWAR_HAS_ZERO(v) (((v) - 0x0101010101010101ULL) & ~(v) & 0x8080808080808080ULL)
+// SWAR: test if any byte in a 64-bit word matches 'c' (broadcast c to all bytes first)
+#define SWAR_BROADCAST(c) (0x0101010101010101ULL * (uint8_t)(c))
+
 static char *skip_line_comment(char *p) {
-	for (; *p && *p != '\n'; p++);
-	return p;
+	// Byte-at-a-time until aligned
+	while ((uintptr_t)p & 7) {
+		if (*p == '\0' || *p == '\n') return p;
+		p++;
+	}
+	// Process 8 bytes at a time
+	uint64_t nl_mask = SWAR_BROADCAST('\n');
+	for (;;) {
+		uint64_t v;
+		memcpy(&v, p, 8);
+		if (SWAR_HAS_ZERO(v) || SWAR_HAS_ZERO(v ^ nl_mask)) {
+			// Found a NUL or newline in this chunk — find exact position
+			for (int i = 0; i < 8; i++)
+				if (p[i] == '\0' || p[i] == '\n') return p + i;
+		}
+		p += 8;
+	}
 }
 
 static char *skip_block_comment(char *p) {
-	for (; *p; p++) {
-		if (*p == '\n') {
-			ctx->tok_line_no++;
-			ctx->at_bol = true;
-		}
+	// Byte-at-a-time until aligned
+	while ((uintptr_t)p & 7) {
+		if (*p == '\0') error_at(p, "unclosed block comment");
+		if (*p == '\n') { ctx->tok_line_no++; ctx->at_bol = true; }
 		if (p[0] == '*' && p[1] == '/') return p + 2;
+		p++;
 	}
-	error_at(p, "unclosed block comment");
+	// Process 8 bytes at a time - skip chunks with no NUL, newline, or asterisk
+	uint64_t nl_mask = SWAR_BROADCAST('\n');
+	uint64_t star_mask = SWAR_BROADCAST('*');
+	for (;;) {
+		uint64_t v;
+		memcpy(&v, p, 8);
+		if (SWAR_HAS_ZERO(v) || SWAR_HAS_ZERO(v ^ nl_mask) || SWAR_HAS_ZERO(v ^ star_mask)) {
+			// Interesting bytes in this chunk — scan byte by byte
+			for (int i = 0; i < 8; i++) {
+				if (p[i] == '\0') error_at(p + i, "unclosed block comment");
+				if (p[i] == '\n') { ctx->tok_line_no++; ctx->at_bol = true; }
+				if (p[i] == '*' && p[i + 1] == '/') return p + i + 2;
+			}
+		}
+		p += 8;
+	}
 }
 
 static char *string_literal_end(char *p) {
@@ -922,20 +989,20 @@ static char *raw_string_literal_end(char *p) {
 }
 
 static inline __attribute__((always_inline)) Token *new_token(TokenKind kind, char *start, char *end) {
-	Token *tok = arena_alloc_token();
+	Token *tok = pool_alloc_token();
 	tok->kind = kind;
-	tok->loc = start;
+	tok->loc_offset = (uint32_t)(start - ctx->current_file->contents);
 	tok->len = end - start;
-	tok->next = NULL;
+	tok->next_idx = 0;
 	tok->tag = 0;
-	tok->match = NULL;
+	tok->match_idx = 0;
 	{
 		long long ln = (long long)ctx->tok_line_no + ctx->current_file->line_delta;
-		tok->line_no = ln > INT_MAX ? INT_MAX : (ln < INT_MIN ? INT_MIN : (int)ln);
+		int clamped = ln > 0x0FFFFF ? 0x0FFFFF : (ln < -0x100000 ? -0x100000 : (int)ln);
+		tok->line_no = clamped;
 	}
 	tok->file_idx = ctx->current_file->file_no;
 	tok->flags = (ctx->at_bol ? TF_AT_BOL : 0) | (ctx->has_space ? TF_HAS_SPACE : 0);
-	tok->shortcut = (uint8_t)*start;
 	ctx->at_bol = ctx->has_space = false;
 	return tok;
 }
@@ -1002,7 +1069,8 @@ static int get_extended_float_suffix(const char *p, int len, const char **replac
 }
 
 static inline void classify_punct(Token *t) {
-	char c = t->loc[0];
+	char *loc = tok_loc(t);
+	char c = loc[0];
 	if (t->len == 1) {
 		if (c == '=' || c == '[') t->tag = TT_ASSIGN;
 		else if (c == '.')
@@ -1013,7 +1081,7 @@ static inline void classify_punct(Token *t) {
 		else if (c == ')' || c == ']' || c == '}')
 			t->flags |= TF_CLOSE;
 	} else if (t->len == 2) {
-		char c2 = t->loc[1];
+		char c2 = loc[1];
 		if (c2 == '=' && c != '!' && c != '<' && c != '>' && c != '=') t->tag = TT_ASSIGN;
 		else if (c == '+' && c2 == '+')
 			t->tag = TT_ASSIGN;
@@ -1021,7 +1089,7 @@ static inline void classify_punct(Token *t) {
 			t->tag = TT_ASSIGN;
 		else if (c == '-' && c2 == '>')
 			t->tag = TT_MEMBER;
-	} else if (t->len == 3 && t->loc[2] == '=' && (c == '<' || c == '>') && t->loc[1] == c)
+	} else if (t->len == 3 && loc[2] == '=' && (c == '<' || c == '>') && loc[1] == c)
 		t->tag = TT_ASSIGN;
 }
 
@@ -1181,8 +1249,17 @@ static Token *tokenize(File *file) {
 	ctx->current_file = file;
 	char *p = file->contents;
 
-	Token head = {};
-	Token *cur = &head;
+	// Pre-allocate token pool based on input size
+	token_pool_ensure(token_count + file->contents_len / 2 + 4096);
+
+	uint32_t first_idx = 0;
+	uint32_t cur_idx = 0;
+	#define LINK(nt) do { \
+		uint32_t _ni = tok_idx(nt); \
+		if (cur_idx) token_pool[cur_idx].next_idx = _ni; \
+		else first_idx = _ni; \
+		cur_idx = _ni; \
+	} while(0)
 	ctx->at_bol = true;
 	ctx->has_space = false;
 	ctx->tok_line_no = 1;
@@ -1204,8 +1281,8 @@ static Token *tokenize(File *file) {
 			while (*p &&
 			       *p != '\n')
 				p++;
-			cur = cur->next = new_token(TK_PREP_DIR, directive_start, p);
-			tok_set_at_bol(cur, true);
+			LINK(new_token(TK_PREP_DIR, directive_start, p));
+			tok_set_at_bol(&token_pool[cur_idx], true);
 			if (*p == '\n') {
 				p++;
 				ctx->tok_line_no++;
@@ -1247,7 +1324,8 @@ static Token *tokenize(File *file) {
 			char *start = p;
 			bool is_float;
 			p = scan_pp_number(p, &is_float);
-			Token *t = cur = cur->next = new_token(TK_NUM, start, p);
+			Token *t = new_token(TK_NUM, start, p);
+			LINK(t);
 			if (is_float) t->flags |= TF_IS_FLOAT;
 			else if (!(start[0] == '0' && (start[1] == 'x' || start[1] == 'X' ||
 						       start[1] == 'b' || start[1] == 'B')) &&
@@ -1261,39 +1339,45 @@ static Token *tokenize(File *file) {
 				      : ((p[0] == 'L' || p[0] == 'u' || p[0] == 'U') && p[1] == 'R') ? 1
 												     : -1;
 			if (raw_pfx >= 0 && p[raw_pfx] == 'R' && p[raw_pfx + 1] == '"') {
-				cur = cur->next = read_raw_string_literal(p, p + raw_pfx + 1);
-				p += cur->len;
+				Token *nt = read_raw_string_literal(p, p + raw_pfx + 1);
+				LINK(nt);
+				p += nt->len;
 				continue;
 			}
 		}
 		if (*p == '"')
 		{
-			cur = cur->next = read_string_literal(p, p);
-			p += cur->len;
+			Token *nt = read_string_literal(p, p);
+			LINK(nt);
+			p += nt->len;
 			continue;
 		}
 		if ((p[0] == 'u' && p[1] == '8' && p[2] == '"') ||
 		    ((p[0] == 'u' || p[0] == 'U' || p[0] == 'L') && p[1] == '"')) {
 			char *start = p;
 			p += (p[0] == 'u' && p[1] == '8') ? 2 : 1;
-			cur = cur->next = read_string_literal(start, p);
-			p = start + cur->len;
+			Token *nt = read_string_literal(start, p);
+			LINK(nt);
+			p = start + nt->len;
 			continue;
 		}
 		if (*p == '\'')
 		{
-			cur = cur->next = read_char_literal(p, p);
-			p += cur->len;
+			Token *nt = read_char_literal(p, p);
+			LINK(nt);
+			p += nt->len;
 			continue;
 		}
 		if ((p[0] == 'u' || p[0] == 'U' || p[0] == 'L') && p[1] == '\'') {
-			cur = cur->next = read_char_literal(p, p + 1);
-			p += cur->len;
+			Token *nt = read_char_literal(p, p + 1);
+			LINK(nt);
+			p += nt->len;
 			continue;
 		}
 		int ident_len = read_ident(p);
 		if (ident_len) {
-			Token *t = cur = cur->next = new_token(TK_IDENT, p, p + ident_len);
+			Token *t = new_token(TK_IDENT, p, p + ident_len);
+			LINK(t);
 				uintptr_t kw = keyword_lookup(p, ident_len);
 			if (kw) {
 				if (kw & KW_MARKER) {
@@ -1309,7 +1393,8 @@ static Token *tokenize(File *file) {
 		int punct_len = read_punct(p);
 		if (punct_len) {
 			int abs_len = punct_len < 0 ? -punct_len : punct_len;
-			Token *t = cur = cur->next = new_token(TK_PUNCT, p, p + abs_len);
+			Token *t = new_token(TK_PUNCT, p, p + abs_len);
+			LINK(t);
 			if (punct_len < 0) {
 				char *norm;
 				switch (abs_len == 4 ? '%' : p[0]) {
@@ -1325,9 +1410,10 @@ static Token *tokenize(File *file) {
 					break;
 				default: norm = p; break;
 				}
-				t->loc = norm;
+				// Patch source buffer in place for digraph normalization
+				p[0] = norm[0];
+				if (abs_len == 4) p[1] = norm[1]; // %:%: -> ##
 				t->len = (abs_len == 4) ? 2 : 1;
-				t->shortcut = (uint8_t)norm[0];
 			}
 			classify_punct(t);
 			p += abs_len;
@@ -1336,23 +1422,27 @@ static Token *tokenize(File *file) {
 		error_at(p, "invalid token");
 	}
 
-	cur = cur->next = new_token(TK_EOF, p, p);
+	LINK(new_token(TK_EOF, p, p));
+	#undef LINK
+
+	Token *first = first_idx ? &token_pool[first_idx] : NULL;
 
 	// Link matching delimiters: connect every TF_OPEN to its TF_CLOSE via tok->match.
 	// Also detect C23 [[ ... ]] attributes and tag the first '[' with TF_C23_ATTR.
 	{
 		Token *stack[4096];
 		int sp = 0;
-		for (Token *t = head.next; t && t->kind != TK_EOF; t = t->next) {
+		for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
 			if (t->flags & TF_OPEN) {
 				if (sp < 4096) stack[sp++] = t;
-				if (t->shortcut == '[' && t->next && t->next->shortcut == '[' && (t->next->flags & TF_OPEN))
+				Token *tn = tok_next(t);
+				if (tok_loc(t)[0] == '[' && tn && tok_loc(tn)[0] == '[' && (tn->flags & TF_OPEN))
 					t->flags |= TF_C23_ATTR;
 			} else if (t->flags & TF_CLOSE) {
 				if (sp > 0) {
 					Token *open = stack[--sp];
-					open->match = t;
-					t->match = open;
+					open->match_idx = tok_idx(t);
+					t->match_idx = tok_idx(open);
 				}
 			}
 		}
@@ -1364,16 +1454,17 @@ static Token *tokenize(File *file) {
 			Token *wrappers[32];
 			int wrapper_count = 0;
 			Token *func_name = NULL;
-			for (Token *t = head.next; t && t->kind != TK_EOF; t = t->next) {
-				if (t->kind <= TK_KEYWORD && t->next &&
-				    t->next->shortcut == '(' && (t->next->flags & TF_OPEN) &&
+			for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
+				Token *tn = tok_next(t);
+				if (t->kind <= TK_KEYWORD && tn &&
+				    tok_loc(tn)[0] == '(' && (tn->flags & TF_OPEN) &&
 				    !(t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_ATTR)))
 					func_name = t;
-				if (t->shortcut == '{' && (t->flags & TF_OPEN) && t->match) {
-					Token *end = t->match;
-					for (Token *b = t->next; b != end; b = b->next) {
+				if (tok_loc(t)[0] == '{' && (t->flags & TF_OPEN) && t->match_idx) {
+					Token *end = tok_match(t);
+					for (Token *b = tok_next(t); b != end; b = tok_next(b)) {
 						if (b->tag & TT_SPECIAL_FN) {
-							if (b->shortcut == 'v' && b->len == 5)
+							if (tok_loc(b)[0] == 'v' && b->len == 5)
 								t->tag |= TT_NORETURN_FN;
 							else
 								t->tag |= TT_SPECIAL_FN;
@@ -1388,20 +1479,21 @@ static Token *tokenize(File *file) {
 			}
 			// Pass 2: propagate to functions that call a wrapper.
 			func_name = NULL;
-			for (Token *t = head.next; t && t->kind != TK_EOF; t = t->next) {
-				if (t->kind <= TK_KEYWORD && t->next &&
-				    t->next->shortcut == '(' && (t->next->flags & TF_OPEN) &&
+			for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
+				Token *tn = tok_next(t);
+				if (t->kind <= TK_KEYWORD && tn &&
+				    tok_loc(tn)[0] == '(' && (tn->flags & TF_OPEN) &&
 				    !(t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_ATTR)))
 					func_name = t;
-				if (t->shortcut == '{' && (t->flags & TF_OPEN) && t->match) {
-					Token *end = t->match;
+				if (tok_loc(t)[0] == '{' && (t->flags & TF_OPEN) && t->match_idx) {
+					Token *end = tok_match(t);
 					if (!(t->tag & TT_SPECIAL_FN) && wrapper_count) {
-						for (Token *b = t->next; b != end; b = b->next)
-							if (b->kind == TK_IDENT && b->next &&
-							    b->next->shortcut == '(') {
+						for (Token *b = tok_next(t); b != end; b = tok_next(b))
+							if (b->kind == TK_IDENT && tok_next(b) &&
+							    tok_loc(tok_next(b))[0] == '(') {
 								for (int w = 0; w < wrapper_count; w++)
 									if (b->len == wrappers[w]->len &&
-									    !memcmp(b->loc, wrappers[w]->loc, b->len)) {
+									    !memcmp(tok_loc(b), tok_loc(wrappers[w]), b->len)) {
 										t->tag |= TT_SPECIAL_FN;
 										goto wrapper_done;
 									}
@@ -1415,7 +1507,7 @@ static Token *tokenize(File *file) {
 		}
 	}
 
-	return head.next;
+	return first;
 }
 
 static void ensure_keyword_cache(void) {
@@ -1480,8 +1572,13 @@ void tokenizer_teardown(bool full) {
 	if (full) {
 		arena_free(&ctx->main_arena);
 		memset(keyword_cache, 0, sizeof(keyword_cache));
+		free(token_pool);
+		token_pool = NULL;
+		token_count = 1;
+		token_cap = 0;
 	} else {
 		arena_reset(&ctx->main_arena);
+		token_count = 1; // Reset pool index but keep allocation
 	}
 	ctx->input_files = NULL;
 	ctx->input_file_count = 0;
