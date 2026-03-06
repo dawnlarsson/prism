@@ -147,9 +147,7 @@ typedef enum {
 } ScopeKind;
 
 typedef struct {
-	DeferEntry *entries;
-	int count;
-	int capacity;
+	int defer_start_idx;
 	uint8_t kind;
 	bool is_loop : 1;
 	bool is_switch : 1;
@@ -174,12 +172,6 @@ typedef struct {
 	Token *tok;
 	Token *block_open; // The '{' that opens the label's immediate scope
 } LabelInfo;
-
-typedef struct {
-	LabelInfo *labels;
-	int count;
-	int capacity;
-} LabelTable;
 
 typedef struct {
 	char *name; // Points into token stream (no alloc needed)
@@ -245,7 +237,8 @@ static char **cached_clean_env = NULL;
 static char **system_include_list; // Ordered list of includes
 static int system_include_capacity = 0;
 
-static LabelTable label_table;
+static LabelInfo label_table[128];
+static int label_count = 0;
 
 // Token emission - user-space buffered output for minimal syscall overhead
 static FILE *out_fp;
@@ -257,8 +250,9 @@ static bool use_linemarkers = false; // true = GCC linemarker "# N", false = C99
 
 static TypedefTable typedef_table;
 
-static ScopeNode *scope_stack = NULL;
-static int scope_stack_capacity = 0;
+static ScopeNode scope_stack[4096];
+static DeferEntry defer_stack[2048];
+static int defer_count = 0;
 
 // Forward declarations (only for functions used before their definition)
 static DeclResult parse_declarator(Token *tok, bool emit);
@@ -325,11 +319,8 @@ static void reset_transpiler_state(void) {
 	// dangling. Without clearing them, ARENA_ENSURE_CAP would skip allocation
 	// (thinking capacity is sufficient) and write through dangling pointers,
 	// corrupting token data in the reused arena blocks.
-	scope_stack = NULL;
-	scope_stack_capacity = 0;
-	label_table.labels = NULL;
-	label_table.count = 0;
-	label_table.capacity = 0;
+	label_count = 0;
+	defer_count = 0;
 
 }
 
@@ -603,19 +594,9 @@ static void end_statement_after_semicolon(void) {
 static void scope_push_kind(ScopeKind kind, bool consume_flags) {
 	// Guard against pathologically deep nesting (e.g., fuzz input with thousands of '{')
 	if (ctx->scope_depth >= 4096) error("brace nesting depth exceeds 4096");
-	int old_cap = scope_stack_capacity;
-	ARENA_ENSURE_CAP(&ctx->main_arena,
-			 scope_stack,
-			 ctx->scope_depth + 1,
-			 scope_stack_capacity,
-			 INITIAL_ARRAY_CAP,
-			 ScopeNode);
-	for (int i = old_cap; i < scope_stack_capacity; i++) scope_stack[i] = (ScopeNode){0};
 	ScopeNode *s = &scope_stack[ctx->scope_depth];
-	DeferEntry *prev_entries = s->entries;
-	int prev_cap = s->capacity;
-	*s = (ScopeNode){.kind = kind,
-			 .entries = prev_entries, .capacity = prev_cap};
+	*s = (ScopeNode){.kind = kind};
+	s->defer_start_idx = defer_count;
 	if (kind == SCOPE_BLOCK) {
 		if (consume_flags) {
 			s->is_loop = pending_scope_flags & NS_LOOP;
@@ -645,15 +626,9 @@ static void scope_pop(void) {
 
 static void defer_add(Token *defer_keyword, Token *start, Token *end) {
 	if (ctx->block_depth <= 0) error_tok(start, "defer outside of any scope");
-	ScopeNode *scope = scope_block_top();
-	ARENA_ENSURE_CAP(&ctx->main_arena,
-			 scope->entries,
-			 scope->count + 1,
-			 scope->capacity,
-			 INITIAL_ARRAY_CAP,
-			 DeferEntry);
-	scope->entries[scope->count++] = (DeferEntry){start, end, defer_keyword};
-	scope->had_control_exit = false;
+	if (defer_count >= 2048) error_tok(start, "too many defers");
+	defer_stack[defer_count++] = (DeferEntry){start, end, defer_keyword};
+	scope_block_top()->had_control_exit = false;
 }
 
 static int find_switch_scope(void) {
@@ -813,16 +788,18 @@ static void emit_deferred_range(Token *start, Token *end) {
 static void emit_defers_ex(DeferEmitMode mode, int stop_depth) {
 	if (ctx->block_depth <= 0) return;
 
+	int current_defer = defer_count - 1;
 	for (int d = ctx->scope_depth - 1; d >= 0; d--) {
 		if (scope_stack[d].kind != SCOPE_BLOCK) continue;
 		if (mode == DEFER_TO_DEPTH && d < stop_depth) break;
 
 		ScopeNode *scope = &scope_stack[d];
-		for (int i = scope->count - 1; i >= 0; i--) {
+		for (int i = current_defer; i >= scope->defer_start_idx; i--) {
 			out_char(' ');
-			emit_deferred_range(scope->entries[i].stmt, scope->entries[i].end);
+			emit_deferred_range(defer_stack[i].stmt, defer_stack[i].end);
 			out_char(';');
 		}
+		current_defer = scope->defer_start_idx - 1;
 
 		if (mode == DEFER_SCOPE) break;
 		if (mode == DEFER_BREAK && (scope->is_loop || scope->is_switch)) break;
@@ -834,7 +811,7 @@ static bool has_defers_for(DeferEmitMode mode, int stop_depth) {
 	for (int d = ctx->scope_depth - 1; d >= 0; d--) {
 		if (scope_stack[d].kind != SCOPE_BLOCK) continue;
 		if (mode == DEFER_TO_DEPTH && d < stop_depth) break;
-		if (scope_stack[d].count > 0) return true;
+		if (defer_count > scope_stack[d].defer_start_idx) return true;
 		if (mode == DEFER_BREAK && (scope_stack[d].is_loop || scope_stack[d].is_switch))
 			return false;
 		if (mode == DEFER_CONTINUE && scope_stack[d].is_loop) return false;
@@ -843,18 +820,9 @@ static bool has_defers_for(DeferEmitMode mode, int stop_depth) {
 }
 
 static void label_table_add(char *name, int name_len, int scope_depth, Token *tok, Token *block_open) {
-	ARENA_ENSURE_CAP(&ctx->main_arena,
-			 label_table.labels,
-			 label_table.count + 1,
-			 label_table.capacity,
-			 INITIAL_ARRAY_CAP,
-			 LabelInfo);
-	LabelInfo *info = &label_table.labels[label_table.count++];
-	info->name = name;
-	info->name_len = name_len;
-	info->scope_depth = scope_depth;
-	info->tok = tok;
-	info->block_open = block_open;
+	if (label_count >= 128) return;
+	LabelInfo *info = &label_table[label_count++];
+	info->name = name; info->name_len = name_len; info->scope_depth = scope_depth; info->tok = tok; info->block_open = block_open;
 }
 
 static void typedef_table_reset(void) {
@@ -1067,7 +1035,7 @@ static inline Token *check_label(Token *tok, Token *prev, int *ternary_depth) {
 
 // Scan function body for labels. All flags read from brace tags set by parse.c.
 static void scan_labels_in_function(Token *tok) {
-	label_table.count = 0;
+	label_count = 0;
 	ctx->current_func_has_setjmp = false;
 	ctx->current_func_has_asm = false;
 	ctx->current_func_has_vfork = false;
@@ -2883,10 +2851,10 @@ static void check_goto_decl_safety(GotoSkipResult *skip, Token *goto_tok, Token 
 }
 
 static LabelInfo *label_find(Token *tok) {
-	for (int i = 0; i < label_table.count; i++)
-		if (label_table.labels[i].name_len == tok->len &&
-		    !memcmp(label_table.labels[i].name, tok->loc, tok->len))
-			return &label_table.labels[i];
+	for (int i = 0; i < label_count; i++)
+		if (label_table[i].name_len == tok->len &&
+		    !memcmp(label_table[i].name, tok->loc, tok->len))
+			return &label_table[i];
 	return NULL;
 }
 
@@ -2971,12 +2939,12 @@ static void handle_case_default(Token *tok) {
 
 	for (int d = ctx->scope_depth - 1; d >= sd; d--) {
 		if (scope_stack[d].kind != SCOPE_BLOCK) continue;
-		if (scope_stack[d].count > 0 && !scope_stack[d].had_control_exit)
-			error_tok(scope_stack[d].entries[0].defer_kw,
+		if (defer_count > scope_stack[d].defer_start_idx && !scope_stack[d].had_control_exit)
+			error_tok(defer_stack[scope_stack[d].defer_start_idx].defer_kw,
 				  "defer skipped by switch fallthrough at %s:%d",
 				  tok_file(tok)->name,
 				  tok_line_no(tok));
-		scope_stack[d].count = 0;
+		defer_count = scope_stack[d].defer_start_idx;
 		scope_stack[d].had_control_exit = false;
 	}
 
@@ -3048,8 +3016,13 @@ static Token *handle_close_brace(Token *tok) {
 	while (ctx->scope_depth > 0 && scope_stack[ctx->scope_depth - 1].kind != SCOPE_BLOCK)
 		scope_pop();
 	typedef_pop_scope(ctx->block_depth);
-	if (FEAT(F_DEFER) && ctx->scope_depth > 0 && scope_stack[ctx->scope_depth - 1].count > 0)
-		emit_defers(DEFER_SCOPE);
+	if (FEAT(F_DEFER) && ctx->scope_depth > 0) {
+		ScopeNode *s = &scope_stack[ctx->scope_depth - 1];
+		if (defer_count > s->defer_start_idx) {
+			emit_defers(DEFER_SCOPE);
+			defer_count = s->defer_start_idx;
+		}
+	}
 
 	// Check guard BEFORE popping the scope
 	bool close_guard = ctx->scope_depth > 0 && scope_stack[ctx->scope_depth - 1].is_orelse_guard;
@@ -3862,14 +3835,10 @@ PRISM_API void prism_reset(void) {
 	typedef_table_reset();
 	tokenizer_teardown(false);
 
-	scope_stack = NULL;
 	ctx->scope_depth = 0;
 	ctx->block_depth = 0;
-	scope_stack_capacity = 0;
 
-	label_table.labels = NULL;
-	label_table.count = 0;
-	label_table.capacity = 0;
+	label_count = 0;
 
 	system_includes_reset();
 

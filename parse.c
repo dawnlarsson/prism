@@ -123,7 +123,6 @@ typedef struct ArenaBlock ArenaBlock;
 typedef struct {
 	char *name;
 	char *contents;
-	char *display_name;
 	size_t contents_len;
 	int file_no;
 	int line_delta;
@@ -1029,7 +1028,6 @@ static inline void classify_punct(Token *t) {
 static File *new_file(char *name, int file_no, char *contents) {
 	File *file = arena_alloc(&ctx->main_arena, sizeof(File));
 	file->name = intern_filename(name);
-	file->display_name = file->name;
 	file->file_no = file_no;
 	file->contents = contents;
 	file->contents_len = strlen(contents);
@@ -1051,7 +1049,6 @@ static File *
 new_file_view(const char *name, File *base, int line_delta, bool is_system, bool is_include_entry) {
 	File *file = arena_alloc(&ctx->main_arena, sizeof(File));
 	file->name = intern_filename(name ? name : base->name);
-	file->display_name = file->name;
 	file->file_no = ctx->input_file_count;
 	file->contents = base->contents;
 	file->contents_len = base->contents_len;
