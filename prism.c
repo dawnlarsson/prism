@@ -1,13 +1,6 @@
 #define PRISM_VERSION "0.118.0"
 
-#ifdef _WIN32
-#define PRISM_DEFAULT_CC "cl"
-#define EXE_SUFFIX ".exe"
-#define TMPDIR_ENVVAR "TEMP"
-#define TMPDIR_ENVVAR_ALT "TMP"
-#define TMPDIR_FALLBACK ".\\"
-#define FIND_EXE_CMD "where prism.exe 2>nul"
-#else
+#ifndef _WIN32
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -36,6 +29,9 @@
 #endif
 
 #include "parse.c"
+
+static int run_command(char **argv);
+static int run_command_quiet(char **argv);
 
 #define match_ch _equal_1
 
@@ -346,7 +342,7 @@ static const char *get_tmp_dir(void) {
 	if (!t || !*t) t = getenv(TMPDIR_ENVVAR_ALT);
 #endif
 	if (!t || !*t) return TMPDIR_FALLBACK;
-	
+
 	size_t len = strlen(t);
 	snprintf(buf, sizeof(buf), "%s%s", t, (t[len - 1] == '/' || t[len - 1] == '\\') ? "" : "/");
 	return buf;
@@ -1560,6 +1556,63 @@ static bool is_type_keyword(Token *tok) {
 
 static inline bool is_valid_varname(Token *tok) {
 	return tok->kind == TK_IDENT || (tok->flags & TF_RAW) || (tok->tag & (TT_DEFER | TT_ORELSE));
+}
+
+static bool is_decl_prefix_token(Token *tok) {
+	if (!tok) return false;
+	if (match_ch(tok, '*') || match_ch(tok, ')')) return true;
+	if (tok->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_SKIP_DECL | TT_ATTR |
+			TT_INLINE | TT_STORAGE | TT_TYPEOF | TT_BITINT))
+		return true;
+	return is_typedef_like(tok);
+}
+
+static bool params_look_like_decls(Token *open) {
+	Token *close = tok_match(open);
+	if (!close) return false;
+
+	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			if (tok_match(t)) t = tok_match(t);
+			continue;
+		}
+		if (t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT |
+			      TT_ATTR | TT_STORAGE))
+			return true;
+		if (is_typedef_like(t)) return true;
+	}
+
+	return false;
+}
+
+static bool generic_decl_rewrite_target(Token *generic_tok, Token **name_out,
+					Token **params_open_out,
+					Token **params_close_out,
+					Token **next_out) {
+	Token *open = tok_next(generic_tok);
+	if (!open || !match_ch(open, '(') || !tok_match(open)) return false;
+
+	Token *close = tok_match(open);
+	Token *after = skip_noise(tok_next(close));
+	if (!after) return false;
+	if (!(match_ch(after, ';') || match_ch(after, ',') || (after->tag & TT_ATTR) ||
+	      is_c23_attr(after)))
+		return false;
+
+	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
+		Token *call_open = skip_noise(tok_next(t));
+		if (!is_valid_varname(t) || !call_open || !match_ch(call_open, '(') || !tok_match(call_open))
+			continue;
+		if (!params_look_like_decls(call_open)) continue;
+
+		*name_out = t;
+		*params_open_out = call_open;
+		*params_close_out = tok_match(call_open);
+		*next_out = after;
+		return true;
+	}
+
+	return false;
 }
 
 // ============================================================================
@@ -3050,14 +3103,25 @@ static int wait_for_child(pid_t pid) {
 	return -1;
 }
 
-// Run a command and wait for completion; returns exit status or -1
-// Windows: defined in windows.c via _spawnvp
-#ifndef _WIN32
-static int run_command(char **argv) {
+static int spawn_command(char **argv, bool quiet_stderr) {
 	char **env = build_clean_environ();
 	if (!env) return -1;
+	posix_spawn_file_actions_t actions;
+	posix_spawn_file_actions_t *actions_ptr = NULL;
+	int devnull = -1;
+
+	if (quiet_stderr) {
+		posix_spawn_file_actions_init(&actions);
+		devnull = open("/dev/null", O_WRONLY);
+		if (devnull >= 0)
+			posix_spawn_file_actions_adddup2(&actions, devnull, STDERR_FILENO);
+		actions_ptr = &actions;
+	}
+
 	pid_t pid;
-	int err = posix_spawnp(&pid, argv[0], NULL, NULL, argv, env);
+	int err = posix_spawnp(&pid, argv[0], actions_ptr, NULL, argv, env);
+	if (actions_ptr) posix_spawn_file_actions_destroy(actions_ptr);
+	if (devnull >= 0) close(devnull);
 	if (err) {
 		fprintf(stderr, "posix_spawnp: %s: %s\n", argv[0], strerror(err));
 		return -1;
@@ -3065,21 +3129,16 @@ static int run_command(char **argv) {
 	return wait_for_child(pid);
 }
 
+// Run a command and wait for completion; returns exit status or -1
+// Windows: defined in windows.c via _spawnvp
+#ifndef _WIN32
+static int run_command(char **argv) {
+	return spawn_command(argv, false);
+}
+
 // Like run_command but suppresses stderr (for probe attempts)
 static int run_command_quiet(char **argv) {
-	char **env = build_clean_environ();
-	if (!env) return -1;
-	posix_spawn_file_actions_t actions;
-	posix_spawn_file_actions_init(&actions);
-	int devnull = open("/dev/null", O_WRONLY);
-	if (devnull >= 0)
-		posix_spawn_file_actions_adddup2(&actions, devnull, STDERR_FILENO);
-	pid_t pid;
-	int err = posix_spawnp(&pid, argv[0], &actions, NULL, argv, env);
-	posix_spawn_file_actions_destroy(&actions);
-	if (devnull >= 0) close(devnull);
-	if (err) return -1;
-	return wait_for_child(pid);
+	return spawn_command(argv, true);
 }
 #endif
 
@@ -3124,6 +3183,12 @@ static const char *path_basename(const char *path) {
 		if (*p == '/' || *p == '\\') base = p + 1;
 	}
 	return base;
+}
+
+static const char **alloc_argv(int count) {
+	const char **args = calloc((size_t)count, sizeof(*args));
+	if (!args) error("out of memory");
+	return args;
 }
 
 #ifndef _WIN32
@@ -3195,7 +3260,9 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file) 
 
 // Run system preprocessor (cc -E) via pipe, returns malloc'd output or NULL
 static char *preprocess_with_cc(const char *input_file) {
-	const char *args[512];
+	int argcap = 16 + ctx->extra_compiler_flags_count + ctx->extra_include_count * 2 +
+		     ctx->extra_define_count * 2 + ctx->extra_force_include_count * 2;
+	const char **args = alloc_argv(argcap);
 	int argc = 0;
 	build_pp_argv(args, &argc, input_file);
 	char **argv = (char **)args;
@@ -3204,6 +3271,7 @@ static char *preprocess_with_cc(const char *input_file) {
 	int pipefd[2];
 	if (pipe(pipefd) == -1) {
 		perror("pipe");
+		free((void *)args);
 		return NULL;
 	}
 
@@ -3238,6 +3306,7 @@ static char *preprocess_with_cc(const char *input_file) {
 	if (err) {
 		fprintf(stderr, "posix_spawnp: %s\n", strerror(err));
 		close(pipefd[0]);
+		free((void *)args);
 		return NULL;
 	}
 
@@ -3247,6 +3316,7 @@ static char *preprocess_with_cc(const char *input_file) {
 	if (!buf) {
 		close(pipefd[0]);
 		waitpid(pid, NULL, 0);
+		free((void *)args);
 		return NULL;
 	}
 
@@ -3260,6 +3330,7 @@ static char *preprocess_with_cc(const char *input_file) {
 				free(buf);
 				close(pipefd[0]);
 				waitpid(pid, NULL, 0);
+				free((void *)args);
 				return NULL;
 			}
 			buf = tmp;
@@ -3288,9 +3359,11 @@ static char *preprocess_with_cc(const char *input_file) {
 			unlink(pp_stderr_path);
 		}
 		free(buf);
+		free((void *)args);
 		return NULL;
 	}
 	if (pp_stderr_path[0]) unlink(pp_stderr_path);
+	free((void *)args);
 
 	return buf;
 }
@@ -3632,6 +3705,26 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			}
 
 			if ((tag & TT_GENERIC) && !in_generic()) {
+				if (ctx->block_depth == 0 && is_decl_prefix_token(last_emitted)) {
+					Token *name = NULL;
+					Token *params_open = NULL;
+					Token *params_close = NULL;
+					Token *after = NULL;
+					if (generic_decl_rewrite_target(tok, &name, &params_open, &params_close,
+									&after)) {
+						out_char('(');
+						out_str(tok_loc(name), name->len);
+						out_char(')');
+						emit_range(params_open, tok_next(params_close));
+						if (ctx->block_depth == 0) {
+							last_toplevel_open_paren = params_open;
+							last_toplevel_paren = params_close;
+							prev_toplevel_tok = params_close;
+						}
+						tok = after;
+						continue;
+					}
+				}
 				emit_tok(tok);
 				last_emitted = tok;
 				tok = tok_next(tok);
@@ -4087,7 +4180,7 @@ static bool get_self_exe_path(char *buf, size_t bufsize) {
 		return true;
 	}
 #elif defined(__FreeBSD__) || defined(__DragonFly__)
-	int mib = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+	int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
 	size_t len = bufsize;
 	if (sysctl(mib, 4, buf, &len, NULL, 0) == 0) return true;
 #else
@@ -4102,9 +4195,7 @@ static bool get_self_exe_path(char *buf, size_t bufsize) {
 #endif
 	return false;
 }
-#endif
 
-#ifndef _WIN32
 static const char *get_install_path(void) { return INSTALL_PATH; }
 
 static bool ensure_install_dir(const char *p) {
@@ -4185,7 +4276,6 @@ static int install(char *self_path) {
 		fclose(output);
 		chmod(install_path, 0755); // no-op on Windows (shimmed)
 		printf("[prism] Installed!\n");
-		// Add install directory to user PATH on Windows
 		{
 			char dir[PATH_MAX];
 			strncpy(dir, install_path, PATH_MAX - 1);
@@ -4209,7 +4299,6 @@ use_sudo:;
 	return 1;
 #else
 	{
-		// Try without escalation first (works if already root)
 		const char *argv_cp[] = {"cp", self_path, install_path, NULL};
 		if (run_command_quiet((char **)argv_cp) == 0) {
 			const char *argv_chmod[] = {"chmod", "+x", install_path, NULL};
@@ -4438,38 +4527,29 @@ static void verbose_argv(char **args) {
 	fprintf(stderr, "\n");
 }
 
-static void add_output_flags(const char **args, int *argc, const Cli *cli, const char *temp_exe, bool msvc) {
+static const char *cli_output_path(const Cli *cli, const char *temp_exe, bool msvc) {
 	static char defobj[PATH_MAX];
-	const char *out = NULL;
 
-	if (cli->mode == CLI_RUN) out = temp_exe;
-	else if (cli->output)
-		out = cli->output;
-	else if (cli->compile_only && cli->source_count == 1) {
+	if (cli->mode == CLI_RUN) return temp_exe;
+	if (cli->output) return cli->output;
+	if (cli->compile_only && cli->source_count == 1) {
 		const char *base = path_basename(cli->sources[0]);
 		snprintf(defobj, sizeof(defobj), "%s", base);
 		char *dot = strrchr(defobj, '.');
 		if (dot) snprintf(dot, sizeof(defobj) - (dot - defobj), "%s", msvc ? ".obj" : ".o");
-		out = defobj;
+		return defobj;
 	}
+	return NULL;
+}
 
+
+static void argv_add_output(const char **args, int *argc, const char *out, bool msvc, bool compile_only) {
 	if (!out) return;
 
 	if (msvc) {
 		static char flag[PATH_MAX + 8]; // cl.exe: /Fe:exe or /Fo:obj
-		if (cli->compile_only) snprintf(flag, sizeof(flag), "/Fo:%s", out);
+		if (compile_only) snprintf(flag, sizeof(flag), "/Fo:%s", out);
 		else snprintf(flag, sizeof(flag), "/Fe:%s", out);
-		args[(*argc)++] = flag;
-	} else {
-		args[(*argc)++] = "-o";
-		args[(*argc)++] = out;
-	}
-}
-
-static void argv_add_output(const char **args, int *argc, const char *out, bool msvc) {
-	if (msvc) {
-		static char flag[PATH_MAX + 8];
-		snprintf(flag, sizeof(flag), "/Fe:%s", out);
 		args[(*argc)++] = flag;
 	} else {
 		args[(*argc)++] = "-o";
@@ -4490,15 +4570,24 @@ static void make_run_temp(char *buf, size_t size, CliMode mode) {
 static int passthrough_cc(const Cli *cli) {
 	const char *compiler = get_real_cc(cli->cc);
 	bool msvc = cc_is_msvc(compiler);
-	const char *args[512];
+	const char **args = alloc_argv(cli->cc_arg_count + 8);
 	int argc = 0;
 	args[argc++] = compiler;
 	for (int i = 0; i < cli->cc_arg_count; i++) args[argc++] = cli->cc_args[i];
-	if (cli->output) argv_add_output(args, &argc, cli->output, msvc);
+	argv_add_output(args, &argc, cli->output, msvc, false);
 	args[argc] = NULL;
 	if (cli->verbose) verbose_argv((char **)args);
 	int st = run_command((char **)args);
+	free((void *)args);
 	return st;
+}
+
+static void cleanup_temp_range(char **temps, int count) {
+	for (int i = 0; i < count; i++) {
+		remove(temps[i]);
+		free(temps[i]);
+	}
+	free(temps);
 }
 
 static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
@@ -4516,8 +4605,7 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 				fprintf(stderr, "%s:%d:%d: error: %s\n", cli->sources[i],
 					result.error_line, result.error_col,
 					result.error_msg ? result.error_msg : "transpilation failed");
-				for (int j = 0; j <= i; j++) { remove(temps[j]); free(temps[j]); }
-				free(temps);
+				cleanup_temp_range(temps, i + 1);
 				return NULL;
 			}
 			FILE *f = fopen(temps[i], "w");
@@ -4533,8 +4621,7 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 			if (cli->verbose)
 				fprintf(stderr, "[prism] Transpiling %s -> %s\n", cli->sources[i], temps[i]);
 			if (!transpile((char *)cli->sources[i], temps[i])) {
-				for (int j = 0; j <= i; j++) { remove(temps[j]); free(temps[j]); }
-				free(temps);
+				cleanup_temp_range(temps, i + 1);
 				return NULL;
 			}
 		}
@@ -4543,8 +4630,7 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 }
 
 static void cleanup_temps(char **temps, int count) {
-	for (int i = 0; i < count; i++) { remove(temps[i]); free(temps[i]); }
-	free(temps);
+	cleanup_temp_range(temps, count);
 }
 
 static int install_from_source(Cli *cli) {
@@ -4562,17 +4648,18 @@ static int install_from_source(Cli *cli) {
 	char **temps = transpile_sources_to_temps(cli, true);
 	if (!temps) return 1;
 
-	const char *args[512];
+	const char **args = alloc_argv(cli->source_count + cli->cc_arg_count + 8);
 	int argc = 0;
 	args[argc++] = cc;
 	args[argc++] = msvc ? "/O2" : "-O2";
 	for (int i = 0; i < cli->source_count; i++) args[argc++] = temps[i];
 	for (int i = 0; i < cli->cc_arg_count; i++) args[argc++] = cli->cc_args[i];
-	argv_add_output(args, &argc, temp_bin, msvc);
+	argv_add_output(args, &argc, temp_bin, msvc, false);
 	args[argc] = NULL;
 	if (cli->verbose) verbose_argv((char **)args);
 
 	int status = run_command((char **)args);
+	free((void *)args);
 	cleanup_temps(temps, cli->source_count);
 	if (status != 0) return 1;
 
@@ -4592,7 +4679,7 @@ static int compile_sources(Cli *cli) {
 	use_linemarkers = FEAT(F_FLATTEN) && !clang && !msvc;
 
 	if (cli->source_count == 1 && !msvc) {
-		const char *args[512];
+		const char **args = alloc_argv(cli->cc_arg_count + 20);
 		int argc = 0;
 		args[argc++] = compiler;
 		args[argc++] = "-x";
@@ -4605,16 +4692,17 @@ static int compile_sources(Cli *cli) {
 		}
 		for (int i = 0; i < cli->cc_arg_count; i++) args[argc++] = cli->cc_args[i];
 		add_warn_suppress(args, &argc, clang, false);
-		add_output_flags(args, &argc, cli, temp_exe, false);
+		argv_add_output(args, &argc, cli_output_path(cli, temp_exe, false), false, cli->compile_only);
 		args[argc] = NULL;
 
 		if (cli->verbose) fprintf(stderr, "[prism] Transpiling %s (pipe → cc)\n", cli->sources[0]);
 		status = transpile_and_compile((char *)cli->sources[0], (char **)args, cli->verbose);
+		free((void *)args);
 	} else {
 		char **temps = transpile_sources_to_temps(cli, false);
 		if (!temps) die("Transpilation failed");
 
-		const char *args[512];
+		const char **args = alloc_argv(cli->source_count + cli->cc_arg_count + 20);
 		int argc = 0;
 		args[argc++] = compiler;
 		if (FEAT(F_FLATTEN) && !clang && !msvc) args[argc++] = "-fpreprocessed";
@@ -4622,11 +4710,12 @@ static int compile_sources(Cli *cli) {
 		if (FEAT(F_FLATTEN) && !clang && !msvc) args[argc++] = "-fno-preprocessed";
 		for (int i = 0; i < cli->cc_arg_count; i++) args[argc++] = cli->cc_args[i];
 		add_warn_suppress(args, &argc, clang, msvc);
-		add_output_flags(args, &argc, cli, temp_exe, msvc);
+		argv_add_output(args, &argc, cli_output_path(cli, temp_exe, msvc), msvc, cli->compile_only);
 		args[argc] = NULL;
 
 		if (cli->verbose) verbose_argv((char **)args);
 		status = run_command((char **)args);
+		free((void *)args);
 		cleanup_temps(temps, cli->source_count);
 	}
 
@@ -4675,7 +4764,7 @@ int main(int argc, char **argv) {
 					die("Transpilation failed");
 				continue;
 			}
-#ifdef _WIN32
+		#ifdef _WIN32
 			char temp[PATH_MAX];
 			if (make_temp_file(temp, sizeof(temp), NULL, 0, cli.sources[i]) < 0)
 				die("Failed to create temp file");
@@ -4690,9 +4779,9 @@ int main(int argc, char **argv) {
 				fclose(f);
 			}
 			remove(temp);
-#else
+		#else
 			if (!transpile((char *)cli.sources[i], "/dev/stdout")) die("Transpilation failed");
-#endif
+		#endif
 		}
 	} else if (cli.source_count == 0)
 		status = passthrough_cc(&cli);

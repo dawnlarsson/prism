@@ -286,6 +286,109 @@ static void test_memory_leak_stress(void) {
 	printf("[PASS] completed %d stress iterations\n", iterations);
 }
 
+#ifndef _WIN32
+static int run_exec_argv(char *const argv[]) {
+	pid_t pid = fork();
+	if (pid < 0) return -1;
+	if (pid == 0) {
+		execvp(argv[0], argv);
+		_exit(127);
+	}
+
+	int status = 0;
+	if (waitpid(pid, &status, 0) < 0) return -1;
+	if (!WIFEXITED(status)) return -1;
+	return WEXITSTATUS(status);
+}
+
+static void check_transpiled_output_compiles(const char *output, const char *stdflag,
+					 const char *name) {
+	char *out_path = create_temp_file(output);
+	CHECK(out_path != NULL, "write transpiled output");
+	if (!out_path) return;
+
+	int status = -1;
+	const char *cc = getenv("CC");
+	if (!cc || !*cc) cc = "cc";
+	char *argv[] = {(char *)cc, (char *)stdflag, "-fsyntax-only", out_path, NULL};
+	status = run_exec_argv(argv);
+	CHECK_EQ(status, 0, name);
+	unlink(out_path);
+	free(out_path);
+}
+#endif
+
+static void test_cli_large_passthrough_argv(void) {
+	printf("\n--- CLI Large Passthrough Argv ---\n");
+
+#ifdef _WIN32
+	passed++;
+	total++;
+	printf("[PASS] cli large argv regression skipped on Windows\n");
+#else
+	char tmpdir[] = "/tmp/prism_cli_argv_XXXXXX";
+	char *dir = mkdtemp(tmpdir);
+	CHECK(dir != NULL, "create temp dir for cli argv regression");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX];
+	char empty_src[PATH_MAX];
+	char empty_obj[PATH_MAX];
+	char output_obj[PATH_MAX];
+	enum { OBJ_REPEAT = 640 };
+	char **argv = NULL;
+	int status = -1;
+	const char *cc = getenv("CC");
+	if (!cc || !*cc) cc = "cc";
+
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism_cli_test", dir);
+	snprintf(empty_src, sizeof(empty_src), "%s/empty.c", dir);
+	snprintf(empty_obj, sizeof(empty_obj), "%s/empty.o", dir);
+	snprintf(output_obj, sizeof(output_obj), "%s/out.o", dir);
+
+	FILE *f = fopen(empty_src, "w");
+	CHECK(f != NULL, "create empty source for cli argv regression");
+	if (f) {
+		fputs("/* empty translation unit */\n", f);
+		fclose(f);
+
+		char *build_prism[] = {(char *)cc, "prism.c", "-O0", "-g", "-o", prism_bin, NULL};
+		status = run_exec_argv(build_prism);
+		CHECK_EQ(status, 0, "build prism binary for cli argv regression");
+
+		if (status == 0) {
+			char *build_obj[] = {(char *)cc, "-c", empty_src, "-o", empty_obj, NULL};
+			status = run_exec_argv(build_obj);
+			CHECK_EQ(status, 0, "build empty object for cli argv regression");
+		}
+
+		if (status == 0) {
+			argv = calloc((size_t)OBJ_REPEAT + 6, sizeof(*argv));
+			CHECK(argv != NULL, "allocate cli argv regression command");
+			if (argv) {
+				argv[0] = prism_bin;
+				argv[1] = "-r";
+				argv[2] = "-o";
+				argv[3] = output_obj;
+				for (int i = 0; i < OBJ_REPEAT; i++) argv[4 + i] = empty_obj;
+				argv[4 + OBJ_REPEAT] = NULL;
+
+				status = run_exec_argv(argv);
+				CHECK_EQ(status, 0, "large passthrough argv exits cleanly");
+				CHECK(access(output_obj, F_OK) == 0,
+				      "large passthrough argv produced output");
+			}
+		}
+	}
+	free(argv);
+	remove(output_obj);
+	remove(empty_obj);
+	remove(empty_src);
+	remove(prism_bin);
+	rmdir(dir);
+#endif
+}
+
 static void test_unicode_digraph_lib(void) {
 	printf("\n--- Unicode/Digraph Lib Tests ---\n");
 
@@ -1109,6 +1212,225 @@ static void test_generic_defer_passthrough(void) {
 		      "generic defer: _Generic preserved in output");
 	}
 	prism_free(&r);
+}
+
+static void test_generic_decl_parenthesized_passthrough(void) {
+	printf("\n--- _Generic Parenthesized Decl Passthrough ---\n");
+
+	const char *code =
+	    "#include <stddef.h>\n"
+	    "#include <wchar.h>\n"
+	    "#define __glibc_const_generic(PTR, CTYPE, CALL) \\\n"
+	    "    _Generic(0 ? (PTR) : (void *)1, const void *: (CTYPE)(CALL), default: CALL)\n"
+	    "#define bsearch(KEY, BASE, NMEMB, SIZE, COMPAR) \\\n"
+	    "    __glibc_const_generic((BASE), const void *, bsearch(KEY, BASE, NMEMB, SIZE, COMPAR))\n"
+	    "#define wmemchr(S, C, N) \\\n"
+	    "    __glibc_const_generic((S), const wchar_t *, wmemchr(S, C, N))\n"
+	    "extern void *(bsearch)(const void *key, const void *base, size_t nmemb, size_t size,\n"
+	    "                       int (*compar)(const void *, const void *));\n"
+	    "extern wchar_t *(wmemchr)(const wchar_t *s, wchar_t c, size_t n);\n";
+
+	PrismResult r = prism_transpile_source(code, "generic_decl_passthrough.c", prism_defaults());
+	CHECK(r.status == PRISM_OK, "generic decl passthrough: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "extern void *(bsearch)(") != NULL,
+		      "generic decl passthrough: keeps grouped bsearch name");
+		CHECK(strstr(r.output, "extern wchar_t *(wmemchr)(") != NULL,
+		      "generic decl passthrough: keeps grouped wmemchr name");
+		CHECK(strstr(r.output, "extern void *bsearch(") == NULL,
+		      "generic decl passthrough: does not flatten bsearch declarator");
+		CHECK(strstr(r.output, "extern wchar_t *wmemchr(") == NULL,
+		      "generic decl passthrough: does not flatten wmemchr declarator");
+	}
+	prism_free(&r);
+}
+
+static void test_file_c23_generic_decl_parentheses(void) {
+	printf("\n--- C23 Generic Decl Parentheses ---\n");
+
+#ifdef _WIN32
+	passed++;
+	total++;
+	printf("[PASS] C23 generic decl regression skipped on Windows\n");
+#else
+	const char *code =
+	    "#include <stdlib.h>\n"
+	    "#include <wchar.h>\n"
+	    "#define _GL_EXTERN_C extern\n"
+	    "#define _GL_FUNCDECL_SYS_NAME(func) (func)\n"
+	    "_GL_EXTERN_C void *_GL_FUNCDECL_SYS_NAME(bsearch)\n"
+	    "  (const void *key, const void *base, size_t nmemb, size_t size,\n"
+	    "   int (*compar)(const void *, const void *));\n"
+	    "_GL_EXTERN_C wchar_t *_GL_FUNCDECL_SYS_NAME(wmemchr)\n"
+	    "  (const wchar_t *s, wchar_t c, size_t n);\n"
+	    "int main(void) { return 0; }\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "c23 generic decl: create temp file");
+	if (path) {
+		PrismResult r = prism_transpile_file(path, prism_defaults());
+		CHECK(r.status == PRISM_OK, "c23 generic decl: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "extern void *(bsearch)") != NULL,
+			      "c23 generic decl: keeps grouped bsearch name in file path");
+			CHECK(strstr(r.output, "extern wchar_t *(wmemchr)") != NULL,
+			      "c23 generic decl: keeps grouped wmemchr name in file path");
+			CHECK(strstr(r.output, "extern void *bsearch(") == NULL,
+			      "c23 generic decl: no flattened bsearch in file path");
+			CHECK(strstr(r.output, "extern wchar_t *wmemchr(") == NULL,
+			      "c23 generic decl: no flattened wmemchr in file path");
+			check_transpiled_output_compiles(
+			    r.output, "-std=gnu2x",
+			    "c23 generic decl: transpiled output compiles in gnu2x");
+		}
+		prism_free(&r);
+		unlink(path);
+		free(path);
+	}
+#endif
+}
+
+static void test_file_c23_generic_decl_macro_layers(void) {
+	printf("\n--- C23 Generic Decl Macro Layers ---\n");
+
+#ifdef _WIN32
+	passed++;
+	total++;
+	printf("[PASS] C23 generic decl macro layers skipped on Windows\n");
+#else
+	const char *code =
+	    "#include <stddef.h>\n"
+	    "#include <wchar.h>\n"
+	    "#define _GL_EXTERN_C_FUNC\n"
+	    "#define _GL_FUNCDECL_SYS_NAME(func) (func)\n"
+	    "#define _GL_FUNCDECL_SYS(func, rettype, parameters, ...) \\\n"
+	    "  _GL_EXTERN_C_FUNC __VA_ARGS__ rettype _GL_FUNCDECL_SYS_NAME(func) parameters\n"
+	    "#define _GL_ARG_NONNULL(args) __attribute__((nonnull args))\n"
+	    "#define _GL_ATTRIBUTE_NOTHROW __attribute__((nothrow))\n"
+	    "#define __glibc_const_generic(PTR,CTYPE,CALL) \\\n"
+	    "  _Generic(0 ? (PTR) : (void *)1, const void *: (CTYPE)(CALL), default: CALL)\n"
+	    "#define bsearch(KEY,BASE,NMEMB,SIZE,COMPAR) \\\n"
+	    "  __glibc_const_generic((BASE), const void *, bsearch(KEY, BASE, NMEMB, SIZE, COMPAR))\n"
+	    "#define wmemchr(S,C,N) \\\n"
+	    "  __glibc_const_generic((S), const wchar_t *, wmemchr(S, C, N))\n"
+	    "_GL_FUNCDECL_SYS (bsearch, void *,\n"
+	    "                  (const void *key, const void *base, size_t nmemb, size_t size,\n"
+	    "                   int (*compar) (const void *, const void *)),\n"
+	    "                  _GL_ARG_NONNULL ((5)))\n"
+	    "                  _GL_ATTRIBUTE_NOTHROW;\n"
+	    "_GL_FUNCDECL_SYS (wmemchr, wchar_t *,\n"
+	    "                  (const wchar_t *s, wchar_t c, size_t n),\n"
+	    "                  _GL_ARG_NONNULL ((1)))\n"
+	    "                  _GL_ATTRIBUTE_NOTHROW;\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "c23 generic decl macro layers: create temp file");
+	if (path) {
+		PrismResult r = prism_transpile_file(path, prism_defaults());
+		CHECK(r.status == PRISM_OK, "c23 generic decl macro layers: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "(bsearch)") != NULL,
+			      "c23 generic decl macro layers: keeps grouped bsearch name");
+			CHECK(strstr(r.output, "(wmemchr)") != NULL,
+			      "c23 generic decl macro layers: keeps grouped wmemchr name");
+			CHECK(strstr(r.output, "__attribute__((nonnull") != NULL ||
+			          strstr(r.output, "__attribute__ ((__nonnull__") != NULL,
+			      "c23 generic decl macro layers: attribute survives preprocessing");
+			check_transpiled_output_compiles(
+			    r.output, "-std=gnu2x",
+			    "c23 generic decl macro layers: transpiled output compiles in gnu2x");
+		}
+		prism_free(&r);
+		unlink(path);
+		free(path);
+	}
+#endif
+}
+
+static void test_file_c23_generic_decl_macro_indirection(void) {
+	printf("\n--- C23 Generic Decl Macro Indirection ---\n");
+
+#ifdef _WIN32
+	passed++;
+	total++;
+	printf("[PASS] C23 generic decl macro indirection skipped on Windows\n");
+#else
+	const char *code =
+	    "#include <stddef.h>\n"
+	    "#include <wchar.h>\n"
+	    "#define _GL_EXTERN_C_FUNC\n"
+	    "#define _GL_FUNCDECL_SYS_NAME(func) (func)\n"
+	    "#define _GL_FUNCDECL_SYS_1(func, rettype, parameters, ...) \\\n"
+	    "  _GL_EXTERN_C_FUNC __VA_ARGS__ rettype _GL_FUNCDECL_SYS_NAME(func) parameters\n"
+	    "#define _GL_FUNCDECL_SYS(func, rettype, parameters, ...) \\\n"
+	    "  _GL_FUNCDECL_SYS_1(func, rettype, parameters, __VA_ARGS__)\n"
+	    "#define _GL_ARG_NONNULL(args) __attribute__((nonnull args))\n"
+	    "#define _GL_ATTRIBUTE_NOTHROW __attribute__((nothrow))\n"
+	    "#define __glibc_const_generic(PTR,CTYPE,CALL) \\\n"
+	    "  _Generic(0 ? (PTR) : (void *)1, const void *: (CTYPE)(CALL), default: CALL)\n"
+	    "#define wmemchr(S,C,N) \\\n"
+	    "  __glibc_const_generic((S), const wchar_t *, wmemchr(S, C, N))\n"
+	    "_GL_FUNCDECL_SYS (wmemchr, wchar_t *,\n"
+	    "                  (const wchar_t *s, wchar_t c, size_t n),\n"
+	    "                  _GL_ARG_NONNULL ((1)))\n"
+	    "                  _GL_ATTRIBUTE_NOTHROW;\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "c23 generic decl macro indirection: create temp file");
+	if (path) {
+		PrismResult r = prism_transpile_file(path, prism_defaults());
+		CHECK(r.status == PRISM_OK, "c23 generic decl macro indirection: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "(wmemchr)") != NULL,
+			      "c23 generic decl macro indirection: keeps grouped wmemchr name");
+			CHECK(strstr(r.output, "wmemchr(") == NULL,
+			      "c23 generic decl macro indirection: no flattened wmemchr declarator");
+			check_transpiled_output_compiles(
+			    r.output, "-std=gnu2x",
+			    "c23 generic decl macro indirection: transpiled output compiles in gnu2x");
+		}
+		prism_free(&r);
+		unlink(path);
+		free(path);
+	}
+#endif
+}
+
+static void test_file_c23_generic_decl_plain_redeclaration(void) {
+	printf("\n--- C23 Generic Decl Plain Redeclaration ---\n");
+
+#ifdef _WIN32
+	passed++;
+	total++;
+	printf("[PASS] C23 generic decl plain redeclaration skipped on Windows\n");
+#else
+	const char *code =
+	    "#include <stdlib.h>\n"
+	    "#include <wchar.h>\n"
+	    "extern void *bsearch (const void *__key, const void *__base, size_t __nmemb, size_t __size,\n"
+	    "                      int (*__compare) (const void *, const void *));\n"
+	    "extern wchar_t *wmemchr (const wchar_t *__s, wchar_t __wc, size_t __n);\n"
+	    "int main(void) { return 0; }\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "c23 generic decl plain redecl: create temp file");
+	if (path) {
+		PrismResult r = prism_transpile_file(path, prism_defaults());
+		CHECK(r.status == PRISM_OK, "c23 generic decl plain redecl: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "extern void *_Generic") == NULL,
+			      "c23 generic decl plain redecl: no genericized bsearch declarator");
+			CHECK(strstr(r.output, "extern wchar_t *_Generic") == NULL,
+			      "c23 generic decl plain redecl: no genericized wmemchr declarator");
+			CHECK(strstr(r.output, "extern void *(bsearch)") != NULL,
+			      "c23 generic decl plain redecl: rewrites bsearch as grouped declarator");
+			CHECK(strstr(r.output, "extern wchar_t *(wmemchr)") != NULL,
+			      "c23 generic decl plain redecl: rewrites wmemchr as grouped declarator");
+			check_transpiled_output_compiles(
+			    r.output, "-std=gnu2x",
+			    "c23 generic decl plain redecl: transpiled output compiles in gnu2x");
+		}
+		prism_free(&r);
+		unlink(path);
+		free(path);
+	}
+#endif
 }
 
 static void test_raw_c23_attr_interleave(void) {
@@ -1974,6 +2296,11 @@ void run_api_tests(void) {
 	test_fnptr_return_type_capture();
 	test_nested_fnptr_return_type();
 	test_generic_defer_passthrough();
+	test_generic_decl_parenthesized_passthrough();
+	test_file_c23_generic_decl_parentheses();
+	test_file_c23_generic_decl_macro_layers();
+	test_file_c23_generic_decl_macro_indirection();
+	test_file_c23_generic_decl_plain_redeclaration();
 	test_raw_c23_attr_interleave();
 	test_c23_auto_orelse();
 	test_line_directive_escaped_quote();
@@ -2007,6 +2334,7 @@ void run_api_tests(void) {
 	test_ghost_enum_fnptr_param();
 	test_bare_orelse_comma_boundary();
 	test_c23_attr_label_defer();
+	test_cli_large_passthrough_argv();
 
 	test_memory_leak_stress();
 }

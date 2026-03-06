@@ -3,6 +3,13 @@
 #ifndef PRISM_WINDOWS_C
 #define PRISM_WINDOWS_C
 
+#define PRISM_DEFAULT_CC "cl"
+#define EXE_SUFFIX ".exe"
+#define TMPDIR_ENVVAR "TEMP"
+#define TMPDIR_ENVVAR_ALT "TMP"
+#define TMPDIR_FALLBACK ".\\"
+#define FIND_EXE_CMD "where prism.exe 2>nul"
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <io.h>
@@ -490,7 +497,6 @@ static pid_t waitpid(pid_t pid, int *status, int options) {
 	if (status) *status = (int)exit_code;
 	return pid;
 }
-
 // Resolve the path to the currently running executable
 static bool get_self_exe_path(char *buf, size_t bufsize) {
 	DWORD len = GetModuleFileNameA(NULL, buf, (DWORD)bufsize);
