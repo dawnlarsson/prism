@@ -1106,10 +1106,23 @@ static void emit_type_stripped(Token *start, Token *end, bool strip_const) {
 				if (s->tag & TT_SUE) kw = s;
 			bool keep = false;
 			if (kw && !is_enum_kw(kw)) {
-				keep = true;
+				// Preserve braces for compound literals such as
+				// `typeof((struct S){1})`, where the struct tag is wrapped by an
+				// outer parenthesized type and this brace is the initializer, not
+				// the struct body.
 				for (Token *u = tok_next(kw); u && u != t; u = tok_next(u)) {
-					if (is_valid_varname(u) && !(u->tag & (TT_QUALIFIER | TT_ATTR | TT_TYPEOF))) {
-						keep = false; break;
+					if (match_ch(u, ')') && tok_match(u) && tok_loc(tok_match(u)) < tok_loc(kw)) {
+						keep = true;
+						break;
+					}
+				}
+				if (!keep) {
+					keep = true;
+					for (Token *u = tok_next(kw); u && u != t; u = tok_next(u)) {
+						if (is_valid_varname(u) && !(u->tag & (TT_QUALIFIER | TT_ATTR | TT_TYPEOF))) {
+							keep = false;
+							break;
+						}
 					}
 				}
 			}

@@ -1549,10 +1549,14 @@ static void test_typeof_memset_split_before_initializer(void) {
 		CHECK(strstr(transpile_result.output,
 			     "typeof((struct S){1}) a; memset(&a, 0, sizeof(a));") != NULL,
 		      "typeof memset split: first declarator split and zeroed eagerly");
+		CHECK(strstr(transpile_result.output, "typeof((struct S){1}) b = a;") != NULL,
+		      "typeof memset split: preserved compound literal type for later declarator");
 		CHECK(strstr(transpile_result.output, "b = a;") != NULL,
 		      "typeof memset split: later initializer still reads prior variable");
 		CHECK(strstr(transpile_result.output, "b = a; memset(&a, 0, sizeof(a));") == NULL,
 		      "typeof memset split: no late memset after dependent initializer");
+		CHECK(strstr(transpile_result.output, "typeof((struct S)) b = a;") == NULL,
+		      "typeof memset split: no broken cast-like type re-emission");
 	}
 	prism_free(&transpile_result);
 }
