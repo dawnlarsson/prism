@@ -1120,6 +1120,33 @@ static inline void classify_punct(Token *t) {
 		t->tag = TT_ASSIGN;
 }
 
+static inline bool delimiters_match(Token *open, Token *close) {
+	char a = tok_loc(open)[0], b = tok_loc(close)[0];
+	return a == '(' ? b == ')' : b == a + 2;
+}
+
+static inline bool tok_name_eq(Token *a, Token *b) {
+	return a->len == b->len && memcmp(tok_loc(a), tok_loc(b), a->len) == 0;
+}
+
+static Token *find_wrapper_callee(Token *body) {
+	Token *end = tok_match(body);
+	if (!end) return NULL;
+
+	Token *tok = tok_next(body);
+	while (tok && tok != end && tok_loc(tok)[0] == ';') tok = tok_next(tok);
+	if (tok && tok != end && (tok->tag & TT_RETURN)) tok = tok_next(tok);
+	while (tok && tok != end && tok_loc(tok)[0] == ';') tok = tok_next(tok);
+
+	if (!tok || tok == end || tok->kind != TK_IDENT) return NULL;
+	Token *open = tok_next(tok);
+	if (!open || tok_loc(open)[0] != '(' || !tok_match(open)) return NULL;
+
+	Token *after = tok_next(tok_match(open));
+	while (after && after != end && tok_loc(after)[0] == ';') after = tok_next(after);
+	return after == end ? tok : NULL;
+}
+
 static File *new_file(char *name, int file_no, char *contents) {
 	File *file = arena_alloc(&ctx->main_arena, sizeof(File));
 	file->name = intern_filename(name);
@@ -1465,21 +1492,32 @@ static Token *tokenize(File *file) {
 				if (tok_loc(t)[0] == '[' && tn && tok_loc(tn)[0] == '[' && (tn->flags & TF_OPEN))
 					t->flags |= TF_C23_ATTR;
 			} else if (t->flags & TF_CLOSE) {
-				if (sp > 0) {
-					Token *open = stack[--sp];
-					open->match_idx = tok_idx(t);
-					t->match_idx = tok_idx(open);
-				}
+				if (sp == 0) error_tok(t, "unmatched closing delimiter");
+				Token *open = stack[--sp];
+				if (!delimiters_match(open, t))
+					error_tok(t,
+						  "mismatched closing delimiter '%c' for opener '%c'",
+						  tok_loc(t)[0],
+						  tok_loc(open)[0]);
+				open->match_idx = tok_idx(t);
+				t->match_idx = tok_idx(open);
 			}
 		}
+		if (sp > 0)
+			error_tok(stack[sp - 1], "unclosed delimiter '%c'", tok_loc(stack[sp - 1])[0]);
 
 		// Pre-scan function bodies: tag '{' with TT_SPECIAL_FN / TT_ASM / TT_NORETURN_FN(=vfork).
-		// Also propagate TT_SPECIAL_FN to indirect longjmp wrappers (one level).
+		// Propagate special-function taint transitively through wrapper chains.
 		// Function body heuristic: depth-0 '{' preceded by ')'.
 		{
-			Token **wrappers = NULL;
-			int wrapper_count = 0;
-			int wrapper_capacity = 0;
+			typedef struct {
+				Token *name;
+				Token *body;
+			} FunctionScan;
+
+			FunctionScan *functions = NULL;
+			int function_count = 0;
+			int function_capacity = 0;
 			Token *func_name = NULL;
 			for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
 				if (is_potential_func_name(t))
@@ -1495,42 +1533,69 @@ static Token *tokenize(File *file) {
 						}
 						if (b->tag & TT_ASM) t->tag |= TT_ASM;
 					}
-					if (func_name && (t->tag & TT_SPECIAL_FN))
-						{
-							ARENA_ENSURE_CAP(&ctx->main_arena,
-								 wrappers,
-								 wrapper_count + 1,
-								 wrapper_capacity,
+					if (func_name) {
+						ARENA_ENSURE_CAP(&ctx->main_arena,
+								 functions,
+								 function_count + 1,
+								 function_capacity,
 								 32,
-								 Token *);
-							wrappers[wrapper_count++] = func_name;
-						}
+								 FunctionScan);
+						functions[function_count++] = (FunctionScan){.name = func_name, .body = t};
+					}
 					func_name = NULL;
 					t = end;
 				}
 			}
-			// Pass 2: propagate to functions that call a wrapper.
-			func_name = NULL;
-			for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
-				if (is_potential_func_name(t))
-					func_name = t;
-				if (tok_loc(t)[0] == '{' && (t->flags & TF_OPEN) && t->match_idx) {
-					Token *end = tok_match(t);
-					if (!(t->tag & TT_SPECIAL_FN) && wrapper_count) {
-						for (Token *b = tok_next(t); b != end; b = tok_next(b))
-							if (b->kind == TK_IDENT && tok_next(b) &&
-							    tok_loc(tok_next(b))[0] == '(') {
-								for (int w = 0; w < wrapper_count; w++)
-									if (b->len == wrappers[w]->len &&
-									    !memcmp(tok_loc(b), tok_loc(wrappers[w]), b->len)) {
-										t->tag |= TT_SPECIAL_FN;
-										goto wrapper_done;
-									}
-							}
-						wrapper_done:;
+
+			// Precompute wrapper callee tokens and resolve to function indices.
+			uint32_t *wrapper_taint = NULL;
+			int *callee_idx = NULL;
+			if (function_count > 0) {
+				wrapper_taint = arena_alloc(&ctx->main_arena, (size_t)function_count * sizeof(*wrapper_taint));
+				callee_idx = arena_alloc(&ctx->main_arena, (size_t)function_count * sizeof(*callee_idx));
+				for (int i = 0; i < function_count; i++) {
+					callee_idx[i] = -1;
+					Token *callee = find_wrapper_callee(functions[i].body);
+					if (!callee) continue;
+					if (callee->tag & (TT_SPECIAL_FN | TT_NORETURN_FN)) {
+						wrapper_taint[i] = callee->tag & (TT_SPECIAL_FN | TT_NORETURN_FN);
+						continue;
 					}
-					func_name = NULL;
-					t = end;
+					for (int j = 0; j < function_count; j++) {
+						if (tok_name_eq(callee, functions[j].name)) {
+							callee_idx[i] = j;
+							break;
+						}
+					}
+				}
+			}
+
+			// Fixed-point: propagate taint through wrapper chains.
+			bool changed;
+			do {
+				changed = false;
+				for (int i = 0; i < function_count; i++) {
+					if (wrapper_taint[i] || callee_idx[i] < 0) continue;
+					if (wrapper_taint[callee_idx[i]]) {
+						wrapper_taint[i] = wrapper_taint[callee_idx[i]];
+						changed = true;
+					}
+				}
+			} while (changed);
+
+			// Apply taint to callers of tainted wrappers.
+			for (int i = 0; i < function_count; i++) {
+				Token *body = functions[i].body;
+				if (body->tag & (TT_SPECIAL_FN | TT_NORETURN_FN)) continue;
+				Token *end = tok_match(body);
+				for (Token *b = tok_next(body); b != end; b = tok_next(b)) {
+					if (b->kind != TK_IDENT || !tok_next(b) || tok_loc(tok_next(b))[0] != '(')
+						continue;
+					for (int j = 0; j < function_count; j++) {
+						if (!wrapper_taint[j]) continue;
+						if (!tok_name_eq(b, functions[j].name)) continue;
+						body->tag |= wrapper_taint[j];
+					}
 				}
 			}
 		}

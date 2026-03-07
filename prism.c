@@ -2763,25 +2763,83 @@ static Token *emit_expr_to_semicolon(Token *tok) {
 	return tok;
 }
 
-// Validate control flow keywords inside defer blocks are safe
-// Recursively validate control flow inside defer blocks using structural skipping
-static void validate_defer_body(Token *tok, Token *end, bool in_loop, bool in_switch) {
-	for (; tok && tok != end && tok->kind != TK_EOF; tok = tok_next(tok)) {
-		if (tok->flags & TF_OPEN) {
-			if (match_ch(tok, '{')) validate_defer_body(tok_next(tok), tok_match(tok), in_loop, in_switch);
-			tok = tok_match(tok) ? tok_match(tok) : tok; continue;
+// Validate control flow keywords inside defer blocks are safe.
+// Validation is statement-structured so loop/switch scope does not leak across siblings.
+static inline Token *skip_defer_control_head(Token *tok) {
+	tok = skip_noise(tok);
+	if (tok && match_ch(tok, '(') && tok_match(tok)) return tok_next(tok_match(tok));
+	return tok;
+}
+
+static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch) {
+	tok = skip_noise(tok);
+	if (!tok || tok->kind == TK_EOF) return tok;
+
+	if (match_ch(tok, '{')) {
+		Token *end = tok_match(tok);
+		for (tok = skip_noise(tok_next(tok)); tok && tok != end && tok->kind != TK_EOF; tok = skip_noise(tok)) {
+			Token *next = validate_defer_statement(tok, in_loop, in_switch);
+			if (next == tok) break;
+			tok = next;
 		}
-		if (tok->kind != TK_KEYWORD) continue;
-		if (tok->tag & TT_LOOP) in_loop = true;
-		else if (tok->tag & TT_SWITCH) in_switch = true;
-		else if (tok->tag & TT_RETURN) error_tok(tok, "'return' inside defer block bypasses remaining defers");
-		else if ((tok->tag & TT_GOTO) && !is_known_typedef(tok)) error_tok(tok, "'goto' inside defer block could bypass remaining defers");
-		else if ((tok->tag & TT_BREAK) && !in_loop && !in_switch) error_tok(tok, "'break' inside defer block bypasses remaining defers");
-		else if ((tok->tag & TT_CONTINUE) && !in_loop) error_tok(tok, "'continue' inside defer block bypasses remaining defers");
-		else if ((tok->tag & TT_DEFER) && !is_known_typedef(tok) &&
-			 !match_ch(tok_next(tok), ':') && !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN)))
+		return end ? tok_next(end) : tok;
+	}
+
+	if (equal(tok, "if")) {
+		Token *after_then = validate_defer_statement(skip_defer_control_head(tok_next(tok)), in_loop, in_switch);
+		Token *else_tok = skip_noise(after_then);
+		if (else_tok && equal(else_tok, "else"))
+			return validate_defer_statement(tok_next(else_tok), in_loop, in_switch);
+		return after_then;
+	}
+
+	if (tok->tag & (TT_CASE | TT_DEFAULT)) {
+		while (tok && tok->kind != TK_EOF && !match_ch(tok, ':')) {
+			if (tok->flags & TF_OPEN) tok = tok_match(tok) ? tok_next(tok_match(tok)) : tok_next(tok);
+			else tok = tok_next(tok);
+		}
+		return tok && match_ch(tok, ':') ? validate_defer_statement(tok_next(tok), in_loop, in_switch) : tok;
+	}
+
+	if (tok->tag & TT_SWITCH)
+		return validate_defer_statement(skip_defer_control_head(tok_next(tok)), in_loop, true);
+
+	if (tok->tag & TT_LOOP) {
+		if (equal(tok, "do")) {
+			tok = validate_defer_statement(tok_next(tok), true, in_switch);
+			Token *w = skip_noise(tok);
+			if (w && equal(w, "while")) {
+				tok = skip_defer_control_head(tok_next(w));
+				tok = skip_noise(tok);
+				if (tok && match_ch(tok, ';')) tok = tok_next(tok);
+			}
+			return tok;
+		}
+		return validate_defer_statement(skip_defer_control_head(tok_next(tok)), true, in_switch);
+	}
+
+	if (tok->flags & TF_OPEN) return tok_match(tok) ? tok_next(tok_match(tok)) : tok_next(tok);
+
+	// Labeled statement: ident ':' <stmt>
+	if (tok->kind == TK_IDENT && tok_next(tok) && match_ch(tok_next(tok), ':'))
+		return validate_defer_statement(tok_next(tok_next(tok)), in_loop, in_switch);
+
+	if (tok->kind == TK_KEYWORD) {
+		if (tok->tag & TT_RETURN)
+			error_tok(tok, "'return' inside defer block bypasses remaining defers");
+		if ((tok->tag & TT_GOTO) && !is_known_typedef(tok))
+			error_tok(tok, "'goto' inside defer block could bypass remaining defers");
+		if ((tok->tag & TT_BREAK) && !in_loop && !in_switch)
+			error_tok(tok, "'break' inside defer block bypasses remaining defers");
+		if ((tok->tag & TT_CONTINUE) && !in_loop)
+			error_tok(tok, "'continue' inside defer block bypasses remaining defers");
+		if ((tok->tag & TT_DEFER) && !is_known_typedef(tok) &&
+		    !match_ch(tok_next(tok), ':') && !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN)))
 			error_tok(tok, "nested defer is not supported");
 	}
+
+	Token *semi = skip_to_semicolon(tok);
+	return (semi && semi->kind != TK_EOF) ? tok_next(semi) : semi;
 }
 
 // Handle 'defer' keyword: validate context, record deferred statement.
@@ -2833,7 +2891,7 @@ static Token *handle_defer_keyword(Token *tok) {
 			  "defer statement appears to be missing ';' (found '%.*s' keyword inside)",
 			  stmt_start->len, tok_loc(stmt_start));
 
-	validate_defer_body(stmt_start, stmt_end, false, false);
+	validate_defer_statement(stmt_start, false, false);
 
 	defer_add(defer_keyword, stmt_start, stmt_end);
 	tok = (stmt_end->kind != TK_EOF) ? tok_next(stmt_end) : stmt_end;

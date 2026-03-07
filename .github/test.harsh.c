@@ -145,6 +145,73 @@ static void test_harsh_many_special_wrappers(void) {
     free(src);
 }
 
+static void test_harsh_defer_control_scope_leaks(void) {
+    const char *bad[] = {
+        "int f(void) { { defer { for (;;) { break; } break; }; return 0; } }\n",
+        "int f(void) { { defer { for (;;) { break; } continue; }; return 0; } }\n",
+        "int f(int x) { { defer { switch (x) { default: break; } break; }; return 0; } }\n",
+        "int f(void) { { defer { do { continue; } while (0); continue; }; return 0; } }\n",
+    };
+
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        PrismResult r = prism_transpile_source(bad[i], "harsh_defer_scope_leak.c", prism_defaults());
+        char name[96];
+        snprintf(name,
+                 sizeof(name),
+                 "harsh defer scope leak: bad case %zu rejected",
+                 i + 1);
+        CHECK(r.status != PRISM_OK, name);
+        prism_free(&r);
+    }
+}
+
+static void test_harsh_multihop_special_wrapper_propagation(void) {
+    PrismResult r = prism_transpile_source(
+        "int setjmp(void *);\n"
+        "void *jb;\n"
+        "void w0(void) { setjmp(jb); }\n"
+        "void w1(void) { w0(); }\n"
+        "void w2(void) { w1(); }\n"
+        "int f(void) { defer (void)0; w2(); return 0; }\n",
+        "harsh_multihop_wrapper.c", prism_defaults());
+
+    CHECK(r.status != PRISM_OK,
+          "harsh multihop wrapper propagation: defer blocked through wrapper chain");
+    prism_free(&r);
+
+    r = prism_transpile_source(
+        "int vfork(void);\n"
+        "void w0(void) { vfork(); }\n"
+        "void w1(void) { w0(); }\n"
+        "void w2(void) { w1(); }\n"
+        "int f(void) { defer (void)0; w2(); return 0; }\n",
+        "harsh_multihop_vfork_wrapper.c", prism_defaults());
+
+    CHECK(r.status != PRISM_OK,
+          "harsh multihop wrapper propagation: defer blocked through vfork wrapper chain");
+    prism_free(&r);
+}
+
+static void test_harsh_mismatched_delimiters_rejected(void) {
+    const char *bad[] = {
+        "int f(void) { int x = (1]; return x; }\n",
+        "int f(void) { defer { int x = (1]; }; return 0; }\n",
+        "int f(void) { int x = (1; return x; }\n",
+        "int f(void) { ] return 0; }\n",
+    };
+
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        PrismResult r = prism_transpile_source(bad[i], "harsh_mismatched_delims.c", prism_defaults());
+        char name[96];
+        snprintf(name,
+                 sizeof(name),
+                 "harsh mismatched delimiters: bad case %zu rejected",
+                 i + 1);
+        CHECK(r.status != PRISM_OK, name);
+        prism_free(&r);
+    }
+}
+
 void run_harsh_review_tests(void) {
     test_harsh_vla_sizeof_side_effect();
     test_harsh_stmt_expr_in_vla();
@@ -155,4 +222,7 @@ void run_harsh_review_tests(void) {
     test_harsh_many_labels_goto_safety();
     test_harsh_delimiter_overflow();
     test_harsh_many_special_wrappers();
+    test_harsh_defer_control_scope_leaks();
+    test_harsh_multihop_special_wrapper_propagation();
+    test_harsh_mismatched_delimiters_rejected();
 }
