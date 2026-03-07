@@ -93,6 +93,15 @@ typedef int mode_t;
 #ifndef S_IWUSR
 #define S_IWUSR _S_IWRITE
 #endif
+#ifndef S_IWGRP
+#define S_IWGRP 0
+#endif
+#ifndef S_IWOTH
+#define S_IWOTH 0
+#endif
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
 
 #define strdup _strdup
 #define fileno _fileno

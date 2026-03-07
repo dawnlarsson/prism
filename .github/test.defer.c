@@ -1804,17 +1804,18 @@ static void test_scope_type_at_depth_overflow(void) {
 	// inner_loop_depth gets incremented on '{' but not decremented on '}',
 	// causing permanent skew. With the expanded 4096-element array, depths
 	// up to 4095 are handled correctly.
-	// Build code with 300 nested braces inside defer + for loop body.
+	// Build code with 200 nested braces inside defer + for loop body.
+	// Keep under clang's default -fbracket-depth=256 after transpilation.
 	char code[16384];
 	int pos = 0;
 	pos += snprintf(code + pos, sizeof(code) - pos,
 	    "int main(void) {\n"
 	    "    defer (void)0;\n"
 	    "    for (int i = 0; i < 1; i++) {\n");
-	for (int i = 0; i < 300; i++)
+	for (int i = 0; i < 200; i++)
 		pos += snprintf(code + pos, sizeof(code) - pos, "{\n");
 	pos += snprintf(code + pos, sizeof(code) - pos, "(void)0;\n");
-	for (int i = 0; i < 300; i++)
+	for (int i = 0; i < 200; i++)
 		pos += snprintf(code + pos, sizeof(code) - pos, "}\n");
 	pos += snprintf(code + pos, sizeof(code) - pos,
 	    "    }\n"
