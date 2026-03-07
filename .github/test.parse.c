@@ -6336,6 +6336,11 @@ static void test_bug_r2_ptr_return(void) {
 }
 
 static void test_bug_r1_readonly_dir(void) {
+	if (getuid() == 0) {
+		passed++; total++;
+		printf("  [SKIP] bug_r1: read-only dir test (running as root)\n");
+		return;
+	}
 	char dir_template[] = "/tmp/prism_readonly_dir_XXXXXX";
 	char *dir = mkdtemp(dir_template);
 	CHECK(dir != NULL, "bug_r1: create read-only temp dir");
