@@ -230,9 +230,18 @@ void test_raw_keyword_static(void) {
 extern int some_external_var;
 
 void test_raw_keyword_extern_decl(void) {
-	// This just tests that 'raw extern' parses correctly
-	// We can't easily test runtime behavior of extern
-	CHECK(1, "raw extern declaration compiles");
+	PrismResult result = prism_transpile_source(
+	    "raw extern int some_external_var;\n"
+	    "int *addr(void) { return &some_external_var; }\n",
+	    "raw_extern_decl.c", prism_defaults());
+	CHECK_EQ(result.status, PRISM_OK, "raw extern declaration transpiles");
+	if (result.output) {
+		CHECK(strstr(result.output, "some_external_var =") == NULL,
+		      "raw extern declaration does not gain initializer");
+		CHECK(strstr(result.output, "some_external_var") != NULL,
+		      "raw extern declaration preserves referenced symbol");
+	}
+	prism_free(&result);
 }
 
 void test_raw_mixed_usage(void) {
@@ -371,13 +380,18 @@ void test_raw_keyword_after_static(void) {
 }
 
 void test_raw_keyword_after_extern(void) {
-	// raw after extern - similar pattern
-	extern raw int test_raw_extern_var;
-	// Can't check value of extern, just verify it compiles
-	(void)test_raw_extern_var;
-	printf("[PASS] extern raw int: compiles correctly\n");
-	passed++;
-	total++;
+	PrismResult result = prism_transpile_source(
+	    "extern raw int test_raw_extern_var;\n"
+	    "int read_it(void) { return test_raw_extern_var; }\n",
+	    "raw_after_extern.c", prism_defaults());
+	CHECK_EQ(result.status, PRISM_OK, "extern raw int transpiles");
+	if (result.output) {
+		CHECK(strstr(result.output, "test_raw_extern_var =") == NULL,
+		      "extern raw int does not gain initializer");
+		CHECK(strstr(result.output, "test_raw_extern_var") != NULL,
+		      "extern raw int symbol preserved");
+	}
+	prism_free(&result);
 }
 
 int test_raw_extern_var = 42;

@@ -431,11 +431,18 @@ void test_qualified_complex_decl(void) {
 extern int extern_var; // declaration only, no init
 
 void test_extern_not_initialized(void) {
-	// This test passes if it compiles - extern should not get = 0 added
-	// We can't actually test the value without defining it somewhere
-	printf("[PASS] extern declaration not initialized (compiled OK)\n");
-	passed++;
-	total++;
+	PrismResult result = prism_transpile_source(
+	    "extern int extern_var;\n"
+	    "int *addr(void) { return &extern_var; }\n",
+	    "extern_decl_no_init.c", prism_defaults());
+	CHECK_EQ(result.status, PRISM_OK, "extern declaration transpiles");
+	if (result.output) {
+		CHECK(strstr(result.output, "extern_var =") == NULL,
+		      "extern declaration does not gain initializer");
+		CHECK(strstr(result.output, "extern int extern_var") != NULL,
+		      "extern declaration preserved in output");
+	}
+	prism_free(&result);
 }
 
 // Test that typedef declarations are NOT zero-initialized
@@ -443,9 +450,17 @@ void test_typedef_not_initialized(void) {
 	typedef int MyInt; // This should not become "typedef int MyInt = 0;"
 	MyInt x;
 	CHECK_EQ(x, 0, "variable of typedef type zero-init");
-	printf("[PASS] typedef declaration not initialized (compiled OK)\n");
-	passed++;
-	total++;
+	PrismResult result = prism_transpile_source(
+	    "typedef int MyInt;\n"
+	    "MyInt x;\n"
+	    "int main(void) { return x; }\n",
+	    "typedef_decl_no_init.c", prism_defaults());
+	CHECK_EQ(result.status, PRISM_OK, "typedef declaration transpiles");
+	if (result.output) {
+		CHECK(strstr(result.output, "typedef int MyInt =") == NULL,
+		      "typedef declaration does not gain initializer");
+	}
+	prism_free(&result);
 }
 
 void test_for_init_zeroinit(void) {
@@ -463,10 +478,6 @@ void test_for_init_zeroinit(void) {
 		sum += a + b; // both should start at 0
 	}
 	CHECK(sum == (0 + 0) + (1 + 1), "for init multiple decls zero-init");
-
-	printf("[PASS] for init declaration (compiled OK)\n");
-	passed++;
-	total++;
 }
 
 /*
@@ -776,9 +787,21 @@ void test_switch_scope_leak(void) {
 	}
 	CHECK_EQ(result, 0, "switch scope: variable in case block is zero-init");
 
-	printf("[PASS] switch scope leak protection (unsafe pattern now errors)\n");
-	passed++;
-	total++;
+	PrismResult parse_result = prism_transpile_source(
+	    "void f(void) {\n"
+	    "    switch (1) {\n"
+	    "    int z;\n"
+	    "    case 1:\n"
+	    "        (void)z;\n"
+	    "        break;\n"
+	    "    }\n"
+	    "}\n",
+	    "switch_scope_leak_reject.c", prism_defaults());
+	CHECK(parse_result.status != PRISM_OK,
+	      "switch scope leak protection: unsafe pattern rejected");
+	CHECK(parse_result.error_msg && strstr(parse_result.error_msg, "switch body"),
+	      "switch scope leak protection: error explains switch body hazard");
+	prism_free(&parse_result);
 }
 
 typedef int SizeofTestType;
@@ -1864,7 +1887,26 @@ void test_pragma_survives_transpile(void) {
 #pragma GCC diagnostic ignored "-Wunused-variable"
 	int unused_pragma_test_var;
 #pragma GCC diagnostic pop
-	CHECK(1, "pragma survives transpilation");
+	CHECK_EQ(unused_pragma_test_var, 0, "pragma survives transpilation runtime zeroinit");
+
+	PrismResult result = prism_transpile_source(
+	    "void f(void) {\n"
+	    "#pragma GCC diagnostic push\n"
+	    "#pragma GCC diagnostic ignored \"-Wunused-variable\"\n"
+	    "int unused_pragma_test_var;\n"
+	    "#pragma GCC diagnostic pop\n"
+	    "}\n",
+	    "pragma_survives_transpile.c", prism_defaults());
+	CHECK_EQ(result.status, PRISM_OK, "pragma survives transpilation output OK");
+	if (result.output) {
+		CHECK(strstr(result.output, "#pragma GCC diagnostic push") != NULL,
+		      "pragma survives transpilation: push preserved");
+		CHECK(strstr(result.output, "#pragma GCC diagnostic pop") != NULL,
+		      "pragma survives transpilation: pop preserved");
+		CHECK(strstr(result.output, "int unused_pragma_test_var = 0;") != NULL,
+		      "pragma survives transpilation: zeroinit preserved through pragma");
+	}
+	prism_free(&result);
 }
 
 void test_defer_switch_goto_out(void) {

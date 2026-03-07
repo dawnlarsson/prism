@@ -1124,20 +1124,15 @@ static int _ocop_side = 0;
 static void _ocop_side_fn(void) { _ocop_side = 1; }
 
 static void test_orelse_comma_operator_fallback(void) {
-	total++;
 	_ocop_side = 0;
 	// The comma in 'orelse _ocop_get_ptr(), _ocop_side_fn()' must be treated as
 	// a comma operator (not a declaration separator) because _ocop_side_fn is
 	// followed by '('.  Without the fix, find_boundary_comma would split this
 	// into two garbled declarations.
 	int *x = _ocop_get_null() orelse _ocop_get_ptr(), _ocop_side_fn();
-	if (x && *x == 42 && _ocop_side) {
-		passed++;
-		printf("[PASS] %s\n", __func__);
-	} else {
-		printf("[FAIL] %s: x=%p *x=%d side=%d\n", __func__,
-		       (void *)x, x ? *x : -1, _ocop_side);
-	}
+	CHECK(x != NULL, "orelse comma operator: fallback produced pointer");
+	CHECK(x && *x == 42, "orelse comma operator: fallback value preserved");
+	CHECK(_ocop_side == 1, "orelse comma operator: comma side effect ran");
 }
 
 static int _occc_get_zero(void) { return 0; }
@@ -1145,19 +1140,13 @@ static int _occc_fallback(void) { return 77; }
 static int _occc_status = 99;
 
 static void test_orelse_comma_cast_fallback(void) {
-	total++;
 	// A cast '(int)status' after comma must not be mistaken for a declarator.
 	// Without the fix, '(' followed by a type keyword was treated as a
 	// grouped-declarator start, breaking the fallback expression.
 	// Note: comma operator binds weaker than assignment, so
 	// 'x = fallback(), (int)status' assigns fallback() to x and discards the cast.
 	int x = _occc_get_zero() orelse _occc_fallback(), (int)_occc_status;
-	if (x == 77) {
-		passed++;
-		printf("[PASS] %s\n", __func__);
-	} else {
-		printf("[FAIL] %s: x=%d expected 77\n", __func__, x);
-	}
+	CHECK_EQ(x, 77, "orelse comma cast: fallback expression preserved");
 }
 
 static void test_orelse_comma_decl_fallback(void) {
@@ -1200,6 +1189,105 @@ void test_orelse_bare_comma_not_swallowed(void) {
 	x = _bare_comma_get() orelse _bare_comma_fb(), y = 2;
 	CHECK_EQ(x, 42, "bare orelse comma: x gets fallback");
 	CHECK_EQ(y, 2, "bare orelse comma: y = 2 always executes");
+}
+
+static void check_orelse_transpile_rejects(const char *code,
+					   const char *file_name,
+					   const char *name,
+					   const char *needle) {
+	PrismResult result = prism_transpile_source(code, file_name, prism_defaults());
+	CHECK(result.status != PRISM_OK, name);
+	if (result.error_msg && needle) {
+		CHECK(strstr(result.error_msg, needle) != NULL,
+		      "orelse negative: error mentions expected keyword");
+	}
+	prism_free(&result);
+}
+
+static void test_orelse_parenthesized_rejected(void) {
+	check_orelse_transpile_rejects(
+	    "int get(void) { return 0; }\n"
+	    "void f(void) {\n"
+	    "    int x = (get() orelse 0);\n"
+	    "    (void)x;\n"
+	    "}\n",
+	    "orelse_parenthesized_reject.c",
+	    "orelse parenthesized: rejected",
+	    "parenthes");
+}
+
+static void test_orelse_for_init_rejected(void) {
+	check_orelse_transpile_rejects(
+	    "int get(void) { return 0; }\n"
+	    "void f(void) {\n"
+	    "    for (int x = get() orelse 1; x < 3; x++) { }\n"
+	    "}\n",
+	    "orelse_for_init_reject.c",
+	    "orelse for-init: rejected",
+	    "for-loop initializers");
+}
+
+static void test_orelse_missing_action_rejected(void) {
+	check_orelse_transpile_rejects(
+	    "int get(void) { return 0; }\n"
+	    "void f(void) {\n"
+	    "    int x = get() orelse;\n"
+	    "    (void)x;\n"
+	    "}\n",
+	    "orelse_missing_action_reject.c",
+	    "orelse missing action: rejected",
+	    "expected statement");
+}
+
+static void test_orelse_bare_fallback_requires_target(void) {
+	check_orelse_transpile_rejects(
+	    "int get(void) { return 0; }\n"
+	    "void f(void) {\n"
+	    "    get() orelse 42;\n"
+	    "}\n",
+	    "orelse_bare_target_reject.c",
+	    "orelse bare fallback target: rejected",
+	    "assignment target");
+}
+
+static void test_orelse_struct_value_rejected(void) {
+	check_orelse_transpile_rejects(
+	    "struct Pair { int x; int y; };\n"
+	    "struct Pair get_pair(void);\n"
+	    "struct Pair fallback_pair(void);\n"
+	    "void f(void) {\n"
+	    "    struct Pair p = get_pair() orelse fallback_pair();\n"
+	    "    (void)p;\n"
+	    "}\n",
+	    "orelse_struct_value_reject.c",
+	    "orelse struct value: rejected",
+	    "struct/union");
+}
+
+#ifdef __GNUC__
+static void test_orelse_stmt_expr_fallback_rejected(void) {
+	check_orelse_transpile_rejects(
+	    "int get(void) { return 0; }\n"
+	    "void f(void) {\n"
+	    "    int x = get() orelse ({ 42; });\n"
+	    "    (void)x;\n"
+	    "}\n",
+	    "orelse_stmt_expr_reject.c",
+	    "orelse stmt expr fallback: rejected",
+	    "statement expressions");
+}
+#endif
+
+static void test_orelse_bare_assign_compound_side_effect_rejected(void) {
+	check_orelse_transpile_rejects(
+	    "#include <stdlib.h>\n"
+	    "int *get(void) { return NULL; }\n"
+	    "void f(int *arr, int *i) {\n"
+	    "    arr[*i += 1] = (int)(long)get() orelse 42;\n"
+	    "}\n",
+	    "orelse_compound_side_effect_reject.c",
+	    "orelse compound side effect: rejected",
+	    "double evaluation");
 }
 
 
@@ -1698,6 +1786,15 @@ void run_orelse_tests(void) {
 	test_orelse_comma_decl_fallback();
 
 	test_orelse_bare_comma_not_swallowed();
+	test_orelse_parenthesized_rejected();
+	test_orelse_for_init_rejected();
+	test_orelse_missing_action_rejected();
+	test_orelse_bare_fallback_requires_target();
+	test_orelse_struct_value_rejected();
+#ifdef __GNUC__
+	test_orelse_stmt_expr_fallback_rejected();
+#endif
+	test_orelse_bare_assign_compound_side_effect_rejected();
 	test_prism_oe_temp_var_namespace_collision();
 	test_const_typedef_breaks_orelse_temp();
 	test_anon_struct_orelse_type_corruption();

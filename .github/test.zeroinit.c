@@ -898,7 +898,23 @@ void test_zeroinit_torture_stmt_expr(void) {
 		N;
 	})];
 	(void)arr; // Suppress unused warning
-	CHECK(1, "torture: stmt expr in array size (compiles)");
+
+	PrismResult transpile_result = prism_transpile_source(
+	    "void f(void) {\n"
+	    "    int arr[({ enum { N = 5 }; N; })];\n"
+	    "    (void)arr;\n"
+	    "}\n",
+	    "stmt_expr_array_size.c", prism_defaults());
+	CHECK_EQ(transpile_result.status, PRISM_OK, "torture: stmt expr in array size transpiles");
+	if (transpile_result.output) {
+		CHECK(strstr(transpile_result.output, "int arr[({ enum { N = 5 }; N; })];") != NULL,
+		      "torture: stmt expr array size preserved");
+		CHECK(strstr(transpile_result.output, "memset(&arr, 0, sizeof(arr));") != NULL,
+		      "torture: stmt expr array size gets VLA memset");
+		CHECK(strstr(transpile_result.output, "arr = {0}") == NULL,
+		      "torture: stmt expr array size avoids illegal brace init");
+	}
+	prism_free(&transpile_result);
 }
 #endif
 
@@ -1389,7 +1405,21 @@ void test_typeof_register_fnptr_vla_param(void) {
 	int x = 5;
 	register typeof( void (*)(int[x]) ) fn_ptr;
 	(void)sizeof(fn_ptr);
-	CHECK(1, "register typeof fn-ptr with VLA param compiles");
+
+	PrismResult transpile_result = prism_transpile_source(
+	    "void f(int x) {\n"
+	    "    register typeof(void (*)(int[x])) fn_ptr;\n"
+	    "    (void)sizeof(fn_ptr);\n"
+	    "}\n",
+	    "register_fnptr_vla.c", prism_defaults());
+	CHECK_EQ(transpile_result.status, PRISM_OK, "register typeof fn-ptr with VLA param transpiles");
+	if (transpile_result.output) {
+		CHECK(strstr(transpile_result.output, "register typeof(void (*)(int[x])) fn_ptr = {0};") != NULL,
+		      "register typeof fn-ptr with VLA param: brace zero-init preserved");
+		CHECK(strstr(transpile_result.output, "memset(&fn_ptr") == NULL,
+		      "register typeof fn-ptr with VLA param: no illegal register memset");
+	}
+	prism_free(&transpile_result);
 #endif
 }
 
@@ -1407,7 +1437,23 @@ void test_typeof_register_vla_bug(void) {
 	int n = 10;
 	register typeof(int[n]) val;
 	(void)sizeof(val);
-	CHECK(1, "register typeof VLA compilation fails");
+
+	PrismResult transpile_result = prism_transpile_source(
+	    "void f(int n) {\n"
+	    "    register typeof(int[n]) val;\n"
+	    "    (void)sizeof(val);\n"
+	    "}\n",
+	    "register_typeof_vla.c", prism_defaults());
+	CHECK_EQ(transpile_result.status, PRISM_OK, "register typeof VLA transpiles");
+	if (transpile_result.output) {
+		CHECK(strstr(transpile_result.output, "register typeof(int[n]) val;") != NULL,
+		      "register typeof VLA: declaration preserved");
+		CHECK(strstr(transpile_result.output, "memset(&val") == NULL,
+		      "register typeof VLA: no illegal register memset");
+		CHECK(strstr(transpile_result.output, "val = {0}") == NULL,
+		      "register typeof VLA: no bogus brace init emitted");
+	}
+	prism_free(&transpile_result);
 #endif
 }
 
@@ -1415,7 +1461,23 @@ void test_atomic_register_struct_bug(void) {
 #if !defined(__TINYC__)
 	register _Atomic struct S_bug { int x, y; } s1;
 	(void)s1;
-	CHECK(1, "register _Atomic struct compilation fails");
+
+	PrismResult transpile_result = prism_transpile_source(
+	    "void f(void) {\n"
+	    "    register _Atomic struct S_bug { int x, y; } s1;\n"
+	    "    (void)s1;\n"
+	    "}\n",
+	    "register_atomic_struct.c", prism_defaults());
+	CHECK_EQ(transpile_result.status, PRISM_OK, "register _Atomic struct transpiles");
+	if (transpile_result.output) {
+		CHECK(strstr(transpile_result.output, "register _Atomic struct S_bug { int x, y; } s1;") != NULL,
+		      "register _Atomic struct: declaration preserved");
+		CHECK(strstr(transpile_result.output, "memset(&s1") == NULL,
+		      "register _Atomic struct: no illegal register memset");
+		CHECK(strstr(transpile_result.output, "s1 = {0}") == NULL,
+		      "register _Atomic struct: no bogus brace init emitted");
+	}
+	prism_free(&transpile_result);
 #endif
 }
 
@@ -1425,7 +1487,24 @@ void test_const_typeof_vla_bug(void) {
 	int vla[n];
 	const typeof(vla) val;
 	(void)val;
-	CHECK(1, "const typeof VLA compilation fails");
+
+	PrismResult transpile_result = prism_transpile_source(
+	    "void f(int n) {\n"
+	    "    int vla[n];\n"
+	    "    const typeof(vla) val;\n"
+	    "    (void)val;\n"
+	    "}\n",
+	    "const_typeof_vla.c", prism_defaults());
+	CHECK_EQ(transpile_result.status, PRISM_OK, "const typeof VLA transpiles");
+	if (transpile_result.output) {
+		CHECK(strstr(transpile_result.output, "int vla[n]; memset(&vla, 0, sizeof(vla));") != NULL,
+		      "const typeof VLA: VLA source gets memset");
+		CHECK(strstr(transpile_result.output, "const typeof(vla) val; memset((void *)&val, 0, sizeof(val));") != NULL,
+		      "const typeof VLA: const array gets casted memset");
+		CHECK(strstr(transpile_result.output, "val = {0}") == NULL,
+		      "const typeof VLA: no illegal brace init emitted");
+	}
+	prism_free(&transpile_result);
 #endif
 }
 
@@ -1434,8 +1513,74 @@ void test_const_typeof_atomic_struct_bug(void) {
 	_Atomic struct S2_bug { int x, y; } s1;
 	const typeof(s1) s2;
 	(void)s1; (void)s2;
-	CHECK(1, "const typeof _Atomic struct compilation fails");
+
+	PrismResult transpile_result = prism_transpile_source(
+	    "void f(void) {\n"
+	    "    _Atomic struct S2_bug { int x, y; } s1;\n"
+	    "    const typeof(s1) s2;\n"
+	    "    (void)s1; (void)s2;\n"
+	    "}\n",
+	    "const_typeof_atomic_struct.c", prism_defaults());
+	CHECK_EQ(transpile_result.status, PRISM_OK, "const typeof _Atomic struct transpiles");
+	if (transpile_result.output) {
+		CHECK(strstr(transpile_result.output, "_Atomic struct S2_bug { int x, y; } s1; memset(&s1, 0, sizeof(s1));") != NULL,
+		      "const typeof _Atomic struct: source object gets memset");
+		CHECK(strstr(transpile_result.output, "const typeof(s1) s2; memset((void *)&s2, 0, sizeof(s2));") != NULL,
+		      "const typeof _Atomic struct: const copy gets casted memset");
+		CHECK(strstr(transpile_result.output, "s2 = {0}") == NULL,
+		      "const typeof _Atomic struct: no bogus brace init emitted");
+	}
+	prism_free(&transpile_result);
 #endif
+}
+
+static void test_typeof_memset_split_before_initializer(void) {
+	printf("\n--- Typeof Memset Split Before Initializer ---\n");
+
+	PrismResult transpile_result = prism_transpile_source(
+	    "struct S { int x; };\n"
+	    "void f(void) {\n"
+	    "    typeof((struct S){1}) a, b = a;\n"
+	    "    (void)b;\n"
+	    "}\n",
+	    "typeof_memset_split.c", prism_defaults());
+	CHECK_EQ(transpile_result.status, PRISM_OK, "typeof memset split: transpiles");
+	if (transpile_result.output) {
+		CHECK(strstr(transpile_result.output,
+			     "typeof((struct S){1}) a; memset(&a, 0, sizeof(a));") != NULL,
+		      "typeof memset split: first declarator split and zeroed eagerly");
+		CHECK(strstr(transpile_result.output, "b = a;") != NULL,
+		      "typeof memset split: later initializer still reads prior variable");
+		CHECK(strstr(transpile_result.output, "b = a; memset(&a, 0, sizeof(a));") == NULL,
+		      "typeof memset split: no late memset after dependent initializer");
+	}
+	prism_free(&transpile_result);
+}
+
+static void test_typeof_memset_queue_over_128(void) {
+	printf("\n--- Typeof Memset Queue Over 128 ---\n");
+
+	char *code = malloc(8192);
+	CHECK(code != NULL, "typeof memset queue: allocate source buffer");
+	if (!code) return;
+
+	size_t off = 0;
+	off += snprintf(code + off, 8192 - off, "void f(int n) {\n    typeof(int[n]) ");
+	for (int i = 0; i < 129 && off < 8192; i++)
+		off += snprintf(code + off, 8192 - off, "a%d%s", i, (i == 128) ? ";\n" : ", ");
+	off += snprintf(code + off, 8192 - off, "    (void)a0;\n    (void)a128;\n}\n");
+
+	PrismResult transpile_result = prism_transpile_source(
+	    code, "typeof_memset_queue_129.c", prism_defaults());
+	CHECK_EQ(transpile_result.status, PRISM_OK, "typeof memset queue: transpiles");
+	if (transpile_result.output) {
+		CHECK(strstr(transpile_result.output, "memset(&a127, 0, sizeof(a127));") != NULL,
+		      "typeof memset queue: penultimate queued var still zeroed");
+		CHECK(strstr(transpile_result.output, "memset(&a128, 0, sizeof(a128));") != NULL,
+		      "typeof memset queue: 129th var still zeroed");
+	}
+	prism_free(&transpile_result);
+	free(code);
 }
 
 static void test_sizeof_unparenthesized_not_vla(void) {
@@ -1813,6 +1958,8 @@ void run_zeroinit_tests(void) {
 	test_atomic_register_struct_bug();
 	test_const_typeof_vla_bug();
 	test_const_typeof_atomic_struct_bug();
+	test_typeof_memset_split_before_initializer();
+	test_typeof_memset_queue_over_128();
 
 	test_sizeof_unparenthesized_not_vla();
 	test_sizeof_unary_prefix_not_vla();

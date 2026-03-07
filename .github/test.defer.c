@@ -1441,21 +1441,147 @@ target:
 	CHECK_LOG("C", "goto forward skipping defer block");
 }
 
-void test_defer_goto_into_scope(void) {
-	log_reset();
-	int i = 0;
-	goto target;
-	{
-		defer log_append("D");
-	target:
-		log_append("1");
-		if (i == 0) {
-			i = 1;
-			goto target;
-		}
-	}
-	CHECK_LOG("11D", "goto into block with defer");
+static void check_defer_transpile_rejects(const char *code,
+					  const char *file_name,
+					  const char *name,
+					  const char *needle) {
+	PrismResult result = prism_transpile_source(code, file_name, prism_defaults());
+	CHECK(result.status != PRISM_OK, name);
+	if (result.error_msg && needle)
+		CHECK(strstr(result.error_msg, needle) != NULL,
+		      "defer negative: error mentions expected keyword");
+	prism_free(&result);
 }
+
+static int run_command_status(const char *cmd) {
+	int status = system(cmd);
+	if (status == -1) return -1;
+	if (!WIFEXITED(status)) return -1;
+	return WEXITSTATUS(status);
+}
+
+static void check_transpiled_output_compiles_and_runs(const char *output,
+					      const char *compile_name,
+					      const char *run_name) {
+	char *src_path = create_temp_file(output);
+	CHECK(src_path != NULL, "defer compile helper: create temp source");
+	if (!src_path) return;
+
+	char bin_template[] = "/tmp/prism_defer_exec_XXXXXX";
+	int bin_fd = mkstemp(bin_template);
+	CHECK(bin_fd >= 0, "defer compile helper: reserve temp binary path");
+	if (bin_fd < 0) {
+		unlink(src_path);
+		free(src_path);
+		return;
+	}
+	close(bin_fd);
+	unlink(bin_template);
+
+	char compile_cmd[PATH_MAX * 2 + 64];
+	snprintf(compile_cmd, sizeof(compile_cmd),
+		 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin_template, src_path);
+	CHECK_EQ(run_command_status(compile_cmd), 0, compile_name);
+	if (access(bin_template, X_OK) == 0)
+		CHECK_EQ(run_command_status(bin_template), 0, run_name);
+
+	unlink(bin_template);
+	unlink(src_path);
+	free(src_path);
+}
+
+void test_defer_goto_into_scope_rejected(void) {
+	check_defer_transpile_rejects(
+	    "void f(void) {\n"
+	    "    goto target;\n"
+	    "    {\n"
+	    "        defer (void)0;\n"
+	    "    target:\n"
+	    "        (void)0;\n"
+	    "    }\n"
+	    "}\n",
+	    "defer_goto_into_scope.c",
+	    "goto into defer scope rejected",
+	    "skip over this defer");
+}
+
+void test_defer_in_ctrl_paren_rejected(void) {
+	check_defer_transpile_rejects(
+	    "int main(void) { for (; defer 0;) {} return 0; }\n",
+	    "defer_ctrl_paren_reject.c",
+	    "defer in control parens rejected",
+	    "control statement parentheses");
+}
+
+void test_defer_braceless_control_rejected(void) {
+	check_defer_transpile_rejects(
+	    "int main(void) { if (1) defer (void)0; return 0; }\n",
+	    "defer_braceless_control_reject.c",
+	    "defer in braceless control rejected",
+	    "requires braces");
+}
+
+#ifdef __GNUC__
+void test_defer_stmt_expr_top_level_rejected(void) {
+	check_defer_transpile_rejects(
+	    "int f(void) { return ({ defer (void)0; 1; }); }\n",
+	    "defer_stmt_expr_top_level_reject.c",
+	    "top-level stmt expr defer rejected",
+	    "statement expression");
+}
+
+void test_defer_computed_goto_rejected(void) {
+	check_defer_transpile_rejects(
+	    "int f(void) {\n"
+	    "    void *label = &&out;\n"
+	    "    defer (void)0;\n"
+	    "    goto *label;\n"
+	    "out:\n"
+	    "    return 0;\n"
+	    "}\n",
+	    "defer_computed_goto_reject.c",
+	    "computed goto with defer rejected",
+	    "computed goto");
+}
+
+void test_defer_asm_rejected(void) {
+	check_defer_transpile_rejects(
+	    "void f(void) {\n"
+	    "    __asm__(\"nop\");\n"
+	    "    defer (void)0;\n"
+	    "}\n",
+	    "defer_asm_reject.c",
+	    "defer with asm rejected",
+	    "inline assembly");
+}
+#endif
+
+void test_defer_setjmp_rejected(void) {
+	check_defer_transpile_rejects(
+	    "#include <setjmp.h>\n"
+	    "static jmp_buf buf;\n"
+	    "void f(void) {\n"
+	    "    defer (void)0;\n"
+	    "    if (setjmp(buf)) return;\n"
+	    "}\n",
+	    "defer_setjmp_reject.c",
+	    "defer with setjmp rejected",
+	    "setjmp");
+}
+
+#ifndef _WIN32
+void test_defer_vfork_rejected(void) {
+	check_defer_transpile_rejects(
+	    "#include <unistd.h>\n"
+	    "void f(void) {\n"
+	    "    (void)vfork();\n"
+	    "    defer (void)0;\n"
+	    "}\n",
+	    "defer_vfork_reject.c",
+	    "defer with vfork rejected",
+	    "vfork");
+}
+#endif
 
 static void _c23_attr_label_helper(void) {
 	log_reset();
@@ -1565,35 +1691,11 @@ static void test_gnu_nested_func_breaks_outer_defer(void) {
 
 	PrismFeatures features = prism_defaults();
 	PrismResult result = prism_transpile_file(path, features);
-	// Either: (a) transpile succeeds and the output is correct (inner's return
-	// does NOT trigger outer's defer), or (b) transpiler errors on nested function.
-	// Currently the transpiler silently produces wrong code.
-	if (result.status == PRISM_OK && result.output) {
-		// If it transpiles, the inner return must NOT reference outer's defer.
-		// Check that _Prism_ret only appears for outer's return, not inner's.
-		// The inner function's return should be a plain "return x * 2;".
-		const char *inner_body = strstr(result.output, "int inner(int x)");
-		CHECK(inner_body != NULL, "nested func: inner function present in output");
-		if (inner_body) {
-			// Find the closing brace of inner function
-			const char *inner_ret = strstr(inner_body, "return");
-			CHECK(inner_ret != NULL, "nested func: inner has return statement");
-			if (inner_ret) {
-				// The inner return should NOT trigger outer's defers
-				// (no _Prism_ret or defer emission between "return" and inner's "}")
-				const char *after_ret = inner_ret + 6; // skip "return"
-				const char *semi = strchr(after_ret, ';');
-				// Check there's no defer emission in the inner return
-				CHECK(strstr(inner_body, "(void)0;") == NULL ||
-				      strstr(inner_body, "_Prism_ret") == NULL,
-				      "nested func: inner return must not trigger outer defer");
-			}
-		}
-	} else {
-		// If it errors, that's an acceptable fix (rejecting nested functions with defer)
-		CHECK(result.status != PRISM_OK,
-		      "nested func: should error when nested function is inside defer scope");
-	}
+	CHECK(result.status != PRISM_OK,
+	      "nested func: reject nested function inside defer scope");
+	if (result.error_msg)
+		CHECK(strstr(result.error_msg, "nested function") != NULL,
+		      "nested func: error mentions nested function");
 
 	prism_free(&result);
 	unlink(path);
@@ -1725,11 +1827,12 @@ static void test_scope_type_at_depth_overflow(void) {
 	PrismFeatures features = prism_defaults();
 	PrismResult result = prism_transpile_file(path, features);
 	CHECK_EQ(result.status, PRISM_OK, "scope depth overflow: transpiles OK");
-
-	// The output should compile as valid C (no corrupted control flow).
-	// If inner_loop_depth is permanently skewed, break/continue handling
-	// would emit incorrect gotos.
 	CHECK(result.output != NULL, "scope depth overflow: output not NULL");
+	if (result.output)
+		check_transpiled_output_compiles_and_runs(
+		    result.output,
+		    "scope depth overflow: transpiled output compiles",
+		    "scope depth overflow: transpiled output runs");
 
 	prism_free(&result);
 	unlink(path);
@@ -1868,11 +1971,22 @@ void run_defer_tests(void) {
 	test_defer_sibling_goto_lifo_bug();
 
 	test_defer_goto_forward();
-	test_defer_goto_into_scope();
+	test_defer_goto_into_scope_rejected();
 
 	test_defer_backward_goto_sibling();
 
 	test_defer_goto_c23_attr_label();
+	test_defer_in_ctrl_paren_rejected();
+	test_defer_braceless_control_rejected();
+#ifdef __GNUC__
+	test_defer_stmt_expr_top_level_rejected();
+	test_defer_computed_goto_rejected();
+	test_defer_asm_rejected();
+#endif
+	test_defer_setjmp_rejected();
+#ifndef _WIN32
+	test_defer_vfork_rejected();
+#endif
 	test_auto_type_fallback_requires_gnu_extensions();
 	test_ternary_cast_corrupts_label_detection();
 	test_gnu_nested_func_breaks_outer_defer();

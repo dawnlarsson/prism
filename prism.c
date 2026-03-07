@@ -1089,6 +1089,13 @@ static inline bool is_orelse_keyword(Token *tok) {
 	       !(last_emitted && (last_emitted->tag & TT_MEMBER));
 }
 
+static inline bool is_assignment_operator_token(Token *tok) {
+	return match_ch(tok, '=') || equal(tok, "+=") || equal(tok, "-=") ||
+	       equal(tok, "*=") || equal(tok, "/=") || equal(tok, "%=") ||
+	       equal(tok, "<<=") || equal(tok, ">>=") || equal(tok, "&=") ||
+	       equal(tok, "^=") || equal(tok, "|=");
+}
+
 // Emit type tokens, optionally stripping const and struct/enum bodies.
 static void emit_type_stripped(Token *start, Token *end, bool strip_const) {
 	for (Token *t = start; t != end; t = tok_next(t)) {
@@ -1214,7 +1221,10 @@ static GotoSkipResult goto_skips_check(Token *goto_tok, LabelInfo *info, bool ch
 		}
 
 		if (check_defer && (tok->tag & TT_DEFER) && !is_known_typedef(tok)) {
-			if (depth <= 0 && (!active_defer || depth <= scope_depth)) { active_defer = tok; scope_depth = depth; }
+			if (!active_defer || depth <= scope_depth) {
+				active_defer = tok;
+				scope_depth = depth;
+			}
 		}
 
 		if (check_decl && is_stmt_start && !(tok->tag & TT_LOOP)) {
@@ -1608,6 +1618,33 @@ static bool generic_decl_rewrite_target(Token *generic_tok, Token **name_out,
 		*name_out = t;
 		*params_open_out = call_open;
 		*params_close_out = tok_match(call_open);
+		*next_out = after;
+		return true;
+	}
+
+	return false;
+}
+
+static bool generic_member_rewrite_target(Token *generic_tok, Token **name_out,
+					  Token **args_open_out,
+					  Token **args_close_out,
+					  Token **next_out) {
+	Token *open = tok_next(generic_tok);
+	if (!open || !match_ch(open, '(') || !tok_match(open)) return false;
+
+	Token *close = tok_match(open);
+	Token *after = skip_noise(tok_next(close));
+	if (!after) return false;
+
+	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
+		Token *call_open = skip_noise(tok_next(t));
+		if (!is_valid_varname(t) || !call_open || !match_ch(call_open, '(') || !tok_match(call_open))
+			continue;
+		if (params_look_like_decls(call_open)) continue;
+
+		*name_out = t;
+		*args_open_out = call_open;
+		*args_close_out = tok_match(call_open);
 		*next_out = after;
 		return true;
 	}
@@ -2330,7 +2367,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 				OUT_LIT(" = 0");
 		}
 
-		// Track typeof variables for memset emission (dynamic, no hard limit)
+		// Queue delayed memsets until the declaration can be safely split.
 		if (needs_memset && typeof_var_count < 128) {
 			typeof_vars[typeof_var_count++] = decl.var_name;
 		}
@@ -2420,8 +2457,32 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			if (brace_wrap) OUT_LIT(" }");
 			return tok_next(tok);
 		} else if (match_ch(tok, ',')) {
+			bool split_decl = false;
+			Token *next_decl_tok = tok_next(tok);
+
+			// Delayed memset zeroing must happen before a later declarator's
+			// initializer can read earlier variables, and before the fixed queue fills.
+			if (typeof_var_count > 0 && !in_for_init()) {
+				DeclResult next_decl = parse_declarator(next_decl_tok, false);
+				if (typeof_var_count >= 128 || (next_decl.end && next_decl.var_name && next_decl.has_init))
+					split_decl = true;
+			}
+
+			if (split_decl) {
+				out_char(';');
+				emit_typeof_memsets(typeof_vars,
+						   typeof_var_count,
+						   type->has_volatile,
+						   type->has_const);
+				typeof_var_count = 0;
+				tok = next_decl_tok;
+				need_type_emit = true;
+				is_raw = false;
+				continue;
+			}
+
 			emit_tok(tok);
-			tok = tok_next(tok);
+			tok = next_decl_tok;
 			is_raw = false; // raw applies to first declarator only
 		} else {
 			if (!first_decl) goto emit_raw_bail;
@@ -2875,6 +2936,7 @@ static Token *handle_break_continue_defer(Token *tok) {
 
 // Report goto skipping over a variable declaration (warn or error based on FEAT(F_WARN_SAFETY))
 static void report_goto_skips_decl(Token *skipped_decl, Token *label_tok) {
+	if (!FEAT(F_ZEROINIT)) return;
 	const char *msg = "goto '%.*s' would skip over this variable declaration (bypasses zero-init)";
 	if (FEAT(F_WARN_SAFETY)) warn_tok(skipped_decl, msg, label_tok->len, tok_loc(label_tok));
 	else error_tok(skipped_decl, msg, label_tok->len, tok_loc(label_tok));
@@ -3305,6 +3367,7 @@ static char *preprocess_with_cc(const char *input_file) {
 
 	if (err) {
 		fprintf(stderr, "posix_spawnp: %s\n", strerror(err));
+		if (pp_stderr_path[0]) unlink(pp_stderr_path);
 		close(pipefd[0]);
 		free((void *)args);
 		return NULL;
@@ -3573,6 +3636,10 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					// Error if LHS has side effects (double evaluation)
 					if (bare_assign_eq) {
 						for (Token *s = bare_lhs_start; s != bare_assign_eq; s = tok_next(s)) {
+							if (is_assignment_operator_token(s))
+								error_tok(s, "orelse fallback on assignment with side effects "
+									  "in the target expression (double evaluation); "
+									  "use a temporary variable instead");
 							if (equal(s, "++") || equal(s, "--"))
 								error_tok(s, "orelse fallback on assignment with side effects "
 									  "in the target expression (double evaluation); "
@@ -3705,6 +3772,20 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			}
 
 			if ((tag & TT_GENERIC) && !in_generic()) {
+				if (last_emitted && (match_ch(last_emitted, '.') || equal(last_emitted, "->"))) {
+					Token *name = NULL;
+					Token *args_open = NULL;
+					Token *args_close = NULL;
+					Token *after = NULL;
+					if (generic_member_rewrite_target(tok, &name, &args_open, &args_close,
+									  &after)) {
+						emit_tok(name);
+						emit_range(args_open, tok_next(args_close));
+						last_emitted = args_close;
+						tok = after;
+						continue;
+					}
+				}
 				if (ctx->block_depth == 0 && is_decl_prefix_token(last_emitted)) {
 					Token *name = NULL;
 					Token *params_open = NULL;

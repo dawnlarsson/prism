@@ -1,4 +1,8 @@
 
+#ifndef _WIN32
+#include <dirent.h>
+#endif
+
 static void test_basic_transpile(void) {
 	printf("\n--- Basic Transpile Tests ---\n");
 
@@ -301,20 +305,126 @@ static int run_exec_argv(char *const argv[]) {
 	return WEXITSTATUS(status);
 }
 
-static void check_transpiled_output_compiles(const char *output, const char *stdflag,
-					 const char *name) {
+static int run_exec_argv_capture(char *const argv[], const char *stdout_path,
+					 const char *stderr_path) {
+	pid_t pid = fork();
+	if (pid < 0) return -1;
+	if (pid == 0) {
+		if (stdout_path) {
+			FILE *f = fopen(stdout_path, "w");
+			if (!f) _exit(126);
+			dup2(fileno(f), STDOUT_FILENO);
+			fclose(f);
+		}
+		if (stderr_path) {
+			FILE *f = fopen(stderr_path, "w");
+			if (!f) _exit(126);
+			dup2(fileno(f), STDERR_FILENO);
+			fclose(f);
+		}
+		execvp(argv[0], argv);
+		_exit(127);
+	}
+
+	int status = 0;
+	if (waitpid(pid, &status, 0) < 0) return -1;
+	if (!WIFEXITED(status)) return -1;
+	return WEXITSTATUS(status);
+}
+
+static bool shell_word_ok(const char *word) {
+	if (!word || !*word) return false;
+	return strpbrk(word, " \t\n") == NULL;
+}
+
+static bool compiler_available(const char *cc) {
+	if (!shell_word_ok(cc)) return false;
+	char *argv[] = {(char *)cc, "--version", NULL};
+	int status = run_exec_argv(argv);
+	return status != -1 && status != 127;
+}
+
+static void check_transpiled_output_compiles_with(const char *output, const char *cc,
+						     const char *stdflag, const char *name) {
 	char *out_path = create_temp_file(output);
 	CHECK(out_path != NULL, "write transpiled output");
 	if (!out_path) return;
 
-	int status = -1;
-	const char *cc = getenv("CC");
-	if (!cc || !*cc) cc = "cc";
 	char *argv[] = {(char *)cc, (char *)stdflag, "-fsyntax-only", out_path, NULL};
-	status = run_exec_argv(argv);
-	CHECK_EQ(status, 0, name);
+	CHECK_EQ(run_exec_argv(argv), 0, name);
 	unlink(out_path);
 	free(out_path);
+}
+
+static void check_transpiled_output_compiles(const char *output, const char *stdflag,
+					 const char *name) {
+	const char *cc = getenv("CC");
+	if (!shell_word_ok(cc)) cc = "cc";
+	check_transpiled_output_compiles_with(output, cc, stdflag, name);
+}
+
+static void check_transpiled_output_compiles_matrix(const char *output, const char *name_prefix) {
+	const char *env_cc = getenv("CC");
+	const char *compilers[] = {env_cc, "cc", "gcc", "clang"};
+	const char *stdflags[] = {"-std=gnu11", "-std=gnu17", "-std=gnu2x"};
+	bool saw_compiler = false;
+
+	for (size_t i = 0; i < sizeof(compilers) / sizeof(compilers[0]); i++) {
+		const char *cc = compilers[i];
+		bool duplicate = false;
+
+		if (!shell_word_ok(cc)) continue;
+		for (size_t j = 0; j < i; j++) {
+			if (compilers[j] && strcmp(compilers[j], cc) == 0) {
+				duplicate = true;
+				break;
+			}
+		}
+		if (duplicate || !compiler_available(cc)) continue;
+
+		saw_compiler = true;
+		for (size_t j = 0; j < sizeof(stdflags) / sizeof(stdflags[0]); j++) {
+			char name[160];
+			snprintf(name, sizeof(name), "%s: %s %s", name_prefix, cc, stdflags[j]);
+			check_transpiled_output_compiles_with(output, cc, stdflags[j], name);
+		}
+	}
+
+	CHECK(saw_compiler, "compile matrix: at least one compiler available");
+}
+
+static void transpile_and_compile_matrix(const char *code, const char *filename,
+					 const char *transpile_name,
+					 const char *compile_name) {
+	PrismResult r = prism_transpile_source(code, filename, prism_defaults());
+	CHECK(r.status == PRISM_OK, transpile_name);
+	if (r.output) check_transpiled_output_compiles_matrix(r.output, compile_name);
+	prism_free(&r);
+}
+
+#ifndef _WIN32
+static int count_named_entries_with_prefix(const char *dir_path, const char *prefix) {
+	DIR *dir = opendir(dir_path);
+	if (!dir) return -1;
+
+	int count = 0;
+	struct dirent *ent;
+	while ((ent = readdir(dir)) != NULL) {
+		if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+		if (strncmp(ent->d_name, prefix, strlen(prefix)) == 0) count++;
+	}
+	closedir(dir);
+	return count;
+}
+#endif
+
+static bool build_test_prism_binary(const char *prism_bin, const char *name) {
+	const char *cc = getenv("CC");
+	if (!shell_word_ok(cc)) cc = "cc";
+	char *argv[] = {(char *)cc, "prism.c", "-O0", "-g", "-o", (char *)prism_bin, NULL};
+	int status = run_exec_argv(argv);
+	CHECK_EQ(status, 0, name);
+	return status == 0;
 }
 #endif
 
@@ -385,6 +495,295 @@ static void test_cli_large_passthrough_argv(void) {
 	remove(empty_obj);
 	remove(empty_src);
 	remove(prism_bin);
+	rmdir(dir);
+#endif
+}
+
+static void test_cli_missing_input_file(void) {
+	printf("\n--- CLI Missing Input File ---\n");
+
+#ifdef _WIN32
+	passed++;
+	total++;
+	printf("[PASS] cli missing input skipped on Windows\n");
+#else
+	char tmpdir[] = "/tmp/prism_cli_missing_XXXXXX";
+	char *dir = mkdtemp(tmpdir);
+	char prism_bin[PATH_MAX];
+	char output_bin[PATH_MAX];
+	char *argv[] = {prism_bin, "-o", output_bin, "/definitely/missing/prism_input.c", NULL};
+	int status = -1;
+
+	CHECK(dir != NULL, "create temp dir for missing input regression");
+	if (!dir) return;
+
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism_cli_test", dir);
+	snprintf(output_bin, sizeof(output_bin), "%s/missing.out", dir);
+
+	if (build_test_prism_binary(prism_bin, "build prism binary for missing input regression")) {
+		status = run_exec_argv(argv);
+		CHECK(status != 0, "missing input exits non-zero");
+		CHECK(access(output_bin, F_OK) != 0, "missing input leaves no output file");
+	}
+
+	remove(prism_bin);
+	rmdir(dir);
+#endif
+}
+
+static void test_cli_unknown_flag_fails_cleanly(void) {
+	printf("\n--- CLI Unknown Flag Fails Cleanly ---\n");
+
+#ifdef _WIN32
+	passed++;
+	total++;
+	printf("[PASS] cli unknown flag skipped on Windows\n");
+#else
+	char tmpdir[] = "/tmp/prism_cli_flag_XXXXXX";
+	char *dir = mkdtemp(tmpdir);
+	char prism_bin[PATH_MAX];
+	char *argv[] = {prism_bin, "--definitely-unknown", NULL};
+	int status = -1;
+
+	CHECK(dir != NULL, "create temp dir for unknown flag regression");
+	if (!dir) return;
+
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism_cli_test", dir);
+	if (build_test_prism_binary(prism_bin, "build prism binary for unknown flag regression")) {
+		status = run_exec_argv(argv);
+		CHECK(status != 0, "unknown flag exits non-zero");
+	}
+
+	remove(prism_bin);
+	rmdir(dir);
+#endif
+}
+
+static void test_cli_paths_with_spaces(void) {
+	printf("\n--- CLI Paths With Spaces ---\n");
+
+#ifdef _WIN32
+	passed++;
+	total++;
+	printf("[PASS] cli paths with spaces skipped on Windows\n");
+#else
+	char tmpdir[] = "/tmp/prism_cli_spaces_XXXXXX";
+	char *dir = mkdtemp(tmpdir);
+	char prism_bin[PATH_MAX];
+	char src_path[PATH_MAX];
+	char out_path[PATH_MAX];
+	int status = -1;
+
+	CHECK(dir != NULL, "create temp dir for spaced path regression");
+	if (!dir) return;
+
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism_cli_test", dir);
+	snprintf(src_path, sizeof(src_path), "%s/input file.c", dir);
+	snprintf(out_path, sizeof(out_path), "%s/output file", dir);
+
+	if (build_test_prism_binary(prism_bin, "build prism binary for spaced path regression")) {
+		FILE *f = fopen(src_path, "w");
+		CHECK(f != NULL, "create spaced input file");
+		if (f) {
+			fputs("int main(void) { return 0; }\n", f);
+			fclose(f);
+
+			char *argv[] = {prism_bin, "-o", out_path, src_path, NULL};
+			status = run_exec_argv(argv);
+			CHECK_EQ(status, 0, "paths with spaces exit cleanly");
+			CHECK(access(out_path, F_OK) == 0, "paths with spaces produce output");
+		}
+	}
+
+	remove(out_path);
+	remove(src_path);
+	remove(prism_bin);
+	rmdir(dir);
+#endif
+}
+
+static void test_cli_no_zeroinit_suppresses_bypass_warning(void) {
+	printf("\n--- CLI No Zeroinit Suppresses Bypass Warning ---\n");
+
+#ifdef _WIN32
+	passed++;
+	total++;
+	printf("[PASS] cli no-zeroinit warning regression skipped on Windows\n");
+#else
+	char tmpdir[] = "/tmp/prism_cli_warn_XXXXXX";
+	char *dir = mkdtemp(tmpdir);
+	char prism_bin[PATH_MAX];
+	char src_path[PATH_MAX];
+	char obj_path[PATH_MAX];
+	char stderr_path[PATH_MAX];
+	char stdout_path[PATH_MAX];
+	int status = -1;
+
+	CHECK(dir != NULL, "create temp dir for no-zeroinit warning regression");
+	if (!dir) return;
+
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism_cli_test", dir);
+	snprintf(src_path, sizeof(src_path), "%s/warn.c", dir);
+	snprintf(obj_path, sizeof(obj_path), "%s/warn.o", dir);
+	snprintf(stderr_path, sizeof(stderr_path), "%s/warn.stderr", dir);
+	snprintf(stdout_path, sizeof(stdout_path), "%s/warn.stdout", dir);
+
+	if (build_test_prism_binary(prism_bin,
+		    "build prism binary for no-zeroinit warning regression")) {
+		FILE *f = fopen(src_path, "w");
+		CHECK(f != NULL, "create no-zeroinit warning source");
+		if (f) {
+			fputs("void f(int c) {\n"
+			      "    if (c) goto out;\n"
+			      "    int x;\n"
+			      "out:\n"
+			      "    (void)0;\n"
+			      "}\n", f);
+			fclose(f);
+
+			char *argv[] = {prism_bin, "-fno-zeroinit", "-fno-safety", "-c", "-o",
+					obj_path, src_path, NULL};
+			status = run_exec_argv_capture(argv, stdout_path, stderr_path);
+			CHECK_EQ(status, 0, "no-zeroinit warning regression exits cleanly");
+			CHECK(access(obj_path, F_OK) == 0,
+			      "no-zeroinit warning regression produced object");
+
+			FILE *err = fopen(stderr_path, "r");
+			CHECK(err != NULL, "open captured stderr for no-zeroinit warning regression");
+			if (err) {
+				char buf[1024] = {0};
+				size_t n = fread(buf, 1, sizeof(buf) - 1, err);
+				buf[n] = '\0';
+				fclose(err);
+				CHECK(strstr(buf, "bypasses zero-init") == NULL,
+				      "no-zeroinit warning regression: no bypass warning emitted");
+			}
+		}
+	}
+
+	remove(stdout_path);
+	remove(stderr_path);
+	remove(obj_path);
+	remove(src_path);
+	remove(prism_bin);
+	rmdir(dir);
+#endif
+}
+
+static void test_compile_matrix_smoke(void) {
+	printf("\n--- Compile Matrix Smoke ---\n");
+
+#ifdef _WIN32
+	passed++;
+	total++;
+	printf("[PASS] compile matrix smoke skipped on Windows\n");
+#else
+	const char *code =
+	    "int main(void) {\n"
+	    "    int x;\n"
+	    "    { defer x = 7; }\n"
+	    "    return x;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "compile_matrix_smoke.c", prism_defaults());
+	CHECK(r.status == PRISM_OK, "compile matrix smoke: transpiles OK");
+	if (r.output) {
+		check_transpiled_output_compiles_matrix(r.output,
+			    "compile matrix smoke: transpiled output compiles");
+	}
+	prism_free(&r);
+#endif
+}
+
+static void test_compile_matrix_feature_corpus(void) {
+	printf("\n--- Compile Matrix Feature Corpus ---\n");
+
+#ifdef _WIN32
+	passed++;
+	total++;
+	printf("[PASS] compile matrix feature corpus skipped on Windows\n");
+#else
+	transpile_and_compile_matrix(
+	    "int fallback = 7;\n"
+	    "int choose(int *p) {\n"
+	    "    int *q = p orelse return fallback;\n"
+	    "    return *q;\n"
+	    "}\n",
+	    "compile_matrix_orelse.c", "compile matrix corpus: orelse transpiles",
+	    "compile matrix corpus: orelse compiles");
+
+	transpile_and_compile_matrix(
+	    "int f(int n) {\n"
+	    "    int out;\n"
+	    "    {\n"
+	    "        defer out = n + 1;\n"
+	    "    }\n"
+	    "    return out;\n"
+	    "}\n",
+	    "compile_matrix_defer.c", "compile matrix corpus: defer transpiles",
+	    "compile matrix corpus: defer compiles");
+
+	transpile_and_compile_matrix(
+	    "int g(void) {\n"
+	    "    raw int scratch[4];\n"
+	    "    int sum;\n"
+	    "    for (int i = 0; i < 4; i++) scratch[i] = i;\n"
+	    "    for (int i = 0; i < 4; i++) sum += scratch[i];\n"
+	    "    return sum;\n"
+	    "}\n",
+	    "compile_matrix_raw.c", "compile matrix corpus: raw transpiles",
+	    "compile matrix corpus: raw compiles");
+#endif
+}
+
+static void test_preprocess_spawn_failure_cleans_stderr_temp(void) {
+	printf("\n--- Preprocess Spawn Failure Cleanup ---\n");
+
+#ifdef _WIN32
+	passed++;
+	total++;
+	printf("[PASS] preprocess spawn cleanup skipped on Windows\n");
+#else
+	char tmpdir[] = "/tmp/prism_pp_cleanup_XXXXXX";
+	char *dir = mkdtemp(tmpdir);
+	CHECK(dir != NULL, "create temp dir for preprocess cleanup regression");
+	if (!dir) return;
+
+	char src_path[PATH_MAX];
+	snprintf(src_path, sizeof(src_path), "%s/input.c", dir);
+	FILE *f = fopen(src_path, "w");
+	CHECK(f != NULL, "create preprocess cleanup source");
+	if (f) {
+		fputs("int main(void) { return 0; }\n", f);
+		fclose(f);
+
+		int before = count_named_entries_with_prefix(dir, "prism_pp_err_");
+		CHECK(before == 0, "preprocess cleanup: no stale stderr temp before run");
+
+		const char *old_tmpdir = getenv("TMPDIR");
+		char *saved_tmpdir = old_tmpdir ? strdup(old_tmpdir) : NULL;
+		CHECK(old_tmpdir == NULL || saved_tmpdir != NULL,
+		      "preprocess cleanup: save prior TMPDIR when set");
+
+		setenv("TMPDIR", dir, 1);
+		PrismFeatures features = prism_defaults();
+		features.compiler = "/definitely/missing/prism-cc";
+		PrismResult r = prism_transpile_file(src_path, features);
+		CHECK(r.status == PRISM_ERR_IO, "preprocess cleanup: missing compiler returns IO error");
+		CHECK(r.error_msg != NULL, "preprocess cleanup: missing compiler reports error");
+		prism_free(&r);
+
+		int after = count_named_entries_with_prefix(dir, "prism_pp_err_");
+		CHECK(after == 0, "preprocess cleanup: no leaked stderr temp after spawn failure");
+
+		if (saved_tmpdir) {
+			setenv("TMPDIR", saved_tmpdir, 1);
+			free(saved_tmpdir);
+		} else {
+			unsetenv("TMPDIR");
+		}
+	}
+
+	remove(src_path);
 	rmdir(dir);
 #endif
 }
@@ -521,10 +920,7 @@ static void test_double_free_protection(void) {
 
 	prism_free(&result);
 	CHECK(result.output == NULL, "second free safe");
-
-	passed++;
-	total++;
-	printf("[PASS] double prism_free() is safe\n");
+	CHECK(result.error_msg == NULL, "second free keeps error_msg NULL");
 
 	unlink(path);
 	free(path);
@@ -1441,6 +1837,46 @@ static void test_file_c23_generic_decl_plain_redeclaration(void) {
 #endif
 }
 
+static void test_c23_generic_member_macro_indirection(void) {
+	printf("\n--- C23 Generic Member Macro Indirection ---\n");
+
+#ifdef _WIN32
+	passed++;
+	total++;
+	printf("[PASS] C23 generic member macro indirection skipped on Windows\n");
+#else
+	const char *code =
+	    "#include <string.h>\n"
+	    "struct Util {\n"
+	    "    char *(*strstr)(const char *, const char *);\n"
+	    "};\n"
+	    "static struct Util util;\n"
+	    "#define CALL_UTIL(x) util.x\n"
+	    "int f(const char *s) {\n"
+	    "    return CALL_UTIL(strstr)(s, \"x\") != NULL;\n"
+	    "}\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "c23 generic member macro: create temp file");
+	if (path) {
+		PrismResult r = prism_transpile_file(path, prism_defaults());
+		CHECK(r.status == PRISM_OK, "c23 generic member macro: transpiles OK");
+		if (r.output) {
+			const char *member_ret = strstr(r.output, "return util.");
+			CHECK(strstr(r.output, "util._Generic") == NULL,
+			      "c23 generic member macro: no genericized member access");
+			CHECK(member_ret != NULL && strstr(member_ret, "strstr (") != NULL,
+			      "c23 generic member macro: keeps member call form");
+			check_transpiled_output_compiles(
+			    r.output, "-std=gnu2x",
+			    "c23 generic member macro: transpiled output compiles in gnu2x");
+		}
+		prism_free(&r);
+		unlink(path);
+		free(path);
+	}
+#endif
+}
+
 static void test_raw_c23_attr_interleave(void) {
 	printf("\n--- Raw C23 Attr Interleave ---\n");
 
@@ -2309,6 +2745,7 @@ void run_api_tests(void) {
 	test_file_c23_generic_decl_macro_layers();
 	test_file_c23_generic_decl_macro_indirection();
 	test_file_c23_generic_decl_plain_redeclaration();
+	test_c23_generic_member_macro_indirection();
 	test_raw_c23_attr_interleave();
 	test_c23_auto_orelse();
 	test_line_directive_escaped_quote();
@@ -2343,6 +2780,13 @@ void run_api_tests(void) {
 	test_bare_orelse_comma_boundary();
 	test_c23_attr_label_defer();
 	test_cli_large_passthrough_argv();
+	test_cli_missing_input_file();
+	test_cli_unknown_flag_fails_cleanly();
+	test_cli_paths_with_spaces();
+	test_cli_no_zeroinit_suppresses_bypass_warning();
+	test_compile_matrix_smoke();
+	test_compile_matrix_feature_corpus();
+	test_preprocess_spawn_failure_cleans_stderr_temp();
 
 	test_memory_leak_stress();
 }
