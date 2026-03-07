@@ -348,6 +348,13 @@ static const char *get_tmp_dir(void) {
 	return buf;
 }
 
+static bool dir_has_write_bits(const char *path) {
+	struct stat st;
+	if (stat(path, &st) != 0) return true;
+	if (!S_ISDIR(st.st_mode)) return false;
+	return (st.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)) != 0;
+}
+
 static inline bool is_identifier_like(Token *tok) {
 	return tok->kind <= TK_KEYWORD; // TK_IDENT=0, TK_KEYWORD=1
 }
@@ -3225,18 +3232,29 @@ make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len, co
 	if (source_adjacent) {
 		const char *slash = strrchr(source_adjacent, '/');
 		const char *bslash = strrchr(source_adjacent, '\\');
+		char dir_path[PATH_MAX];
 		if (bslash && (!slash || bslash > slash)) slash = bslash;
 		if (slash) {
 			int dir_len = (int)(slash - source_adjacent);
-			n = snprintf(buf, bufsize, "%.*s/.%s.XXXXXX.c", dir_len, source_adjacent, slash + 1);
-		} else
-			n = snprintf(buf, bufsize, ".%s.XXXXXX.c", source_adjacent);
-		suffix_len = 2;
-		if (n >= 0 && (size_t)n < bufsize) {
-			int fd = mkstemps(buf, suffix_len);
-			if (fd >= 0) {
-				close(fd);
-				return 0;
+			if ((size_t)dir_len >= sizeof(dir_path)) return -1;
+			memcpy(dir_path, source_adjacent, (size_t)dir_len);
+			dir_path[dir_len] = '\0';
+		} else {
+			strcpy(dir_path, ".");
+		}
+		if (dir_has_write_bits(dir_path)) {
+			if (slash) {
+				int dir_len = (int)(slash - source_adjacent);
+				n = snprintf(buf, bufsize, "%.*s/.%s.XXXXXX.c", dir_len, source_adjacent, slash + 1);
+			} else
+				n = snprintf(buf, bufsize, ".%s.XXXXXX.c", source_adjacent);
+			suffix_len = 2;
+			if (n >= 0 && (size_t)n < bufsize) {
+				int fd = mkstemps(buf, suffix_len);
+				if (fd >= 0) {
+					close(fd);
+					return 0;
+				}
 			}
 		}
 		// Source directory not writable, fall back to TMPDIR

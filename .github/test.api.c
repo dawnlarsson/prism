@@ -1862,9 +1862,12 @@ static void test_c23_generic_member_macro_indirection(void) {
 		CHECK(r.status == PRISM_OK, "c23 generic member macro: transpiles OK");
 		if (r.output) {
 			const char *member_ret = strstr(r.output, "return util.");
+			bool valid_member_form =
+			    member_ret != NULL &&
+			    (strstr(member_ret, "strstr(") != NULL || strstr(member_ret, "strstr (") != NULL);
 			CHECK(strstr(r.output, "util._Generic") == NULL,
 			      "c23 generic member macro: no genericized member access");
-			CHECK(member_ret != NULL && strstr(member_ret, "strstr (") != NULL,
+			CHECK(valid_member_form,
 			      "c23 generic member macro: keeps member call form");
 			check_transpiled_output_compiles(
 			    r.output, "-std=gnu2x",
