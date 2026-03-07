@@ -234,8 +234,9 @@ static char **cached_clean_env = NULL;
 static char **system_include_list; // Ordered list of includes
 static int system_include_capacity = 0;
 
-static LabelInfo label_table[128];
+static LabelInfo *label_table = NULL;
 static int label_count = 0;
+static int label_capacity = 0;
 
 // Token emission - user-space buffered output for minimal syscall overhead
 static FILE *out_fp;
@@ -247,9 +248,26 @@ static bool use_linemarkers = false; // true = GCC linemarker "# N", false = C99
 
 static TypedefTable typedef_table;
 
+typedef struct {
+	uint8_t scope_flags;
+	bool pending;
+	bool pending_for_paren;
+	bool parens_just_closed;
+	bool pending_orelse_guard;
+	int brace_depth;
+} CtrlState;
+
+typedef struct {
+	Token *prev_tok;
+	Token *last_paren;
+	Token *last_open_paren;
+	int paren_depth;
+} ToplevelState;
+
 static ScopeNode scope_stack[4096];
 static DeferEntry defer_stack[2048];
 static int defer_count = 0;
+static CtrlState ctrl_state;
 
 // Forward declarations (only for functions used before their definition)
 static DeclResult parse_declarator(Token *tok, bool emit);
@@ -316,7 +334,9 @@ static void reset_transpiler_state(void) {
 	// dangling. Without clearing them, ARENA_ENSURE_CAP would skip allocation
 	// (thinking capacity is sufficient) and write through dangling pointers,
 	// corrupting token data in the reused arena blocks.
+	label_table = NULL;
 	label_count = 0;
+	label_capacity = 0;
 	defer_count = 0;
 
 }
@@ -522,22 +542,8 @@ static void system_includes_reset(void) {
 	system_include_capacity = 0;
 }
 
-// ── Transitional state (replaces ControlFlow struct) ──
-// These flags track the gap between seeing a control keyword and opening its body.
-static uint8_t pending_scope_flags;   // NS_LOOP | NS_SWITCH | NS_CONDITIONAL
-static bool pending_ctrl;             // control keyword seen, awaiting body
-static bool pending_for_paren;        // 'for' seen, waiting for '('
-static bool parens_just_closed;       // control paren just closed (ready for body)
-static bool pending_orelse_guard;     // tag next scope as orelse guard
-static int ctrl_brace_depth;          // compound literal braces inside control parens
-
 static inline void ctrl_reset(void) {
-	pending_ctrl = false;
-	pending_for_paren = false;
-	parens_just_closed = false;
-	pending_scope_flags = 0;
-	pending_orelse_guard = false;
-	ctrl_brace_depth = 0;
+	ctrl_state = (CtrlState){0};
 }
 
 // ── Scope stack queries ──
@@ -585,7 +591,7 @@ static inline bool in_conditional_block(void) {
 
 static void end_statement_after_semicolon(void) {
 	ctx->at_stmt_start = true;
-	if (pending_ctrl && !in_ctrl_paren()) {
+	if (ctrl_state.pending && !in_ctrl_paren()) {
 		// Pop phantom scopes for braceless control bodies ending via break/continue/return/goto.
 		// For-init variables (e.g., "for (int T = 0; ...)  break;") are registered at
 		// block_depth + 1 but never get a matching '}' pop. Without this, the shadow
@@ -603,10 +609,10 @@ static void scope_push_kind(ScopeKind kind, bool consume_flags) {
 	s->defer_start_idx = defer_count;
 	if (kind == SCOPE_BLOCK) {
 		if (consume_flags) {
-			s->is_loop = pending_scope_flags & NS_LOOP;
-			s->is_switch = pending_scope_flags & NS_SWITCH;
-			s->is_conditional = pending_scope_flags & NS_CONDITIONAL;
-			pending_scope_flags = 0;
+			s->is_loop = ctrl_state.scope_flags & NS_LOOP;
+			s->is_switch = ctrl_state.scope_flags & NS_SWITCH;
+			s->is_conditional = ctrl_state.scope_flags & NS_CONDITIONAL;
+			ctrl_state.scope_flags = 0;
 		}
 		ctx->block_depth++;
 	}
@@ -638,7 +644,7 @@ static int find_switch_scope(void) {
 
 // Mark unconditional control exit in the innermost switch scope
 static void mark_switch_control_exit(void) {
-	if (pending_ctrl || in_conditional_block()) return;
+	if (ctrl_state.pending || in_conditional_block()) return;
 	int sd = find_switch_scope();
 	if (sd >= 0) scope_stack[sd].had_control_exit = true;
 }
@@ -747,12 +753,13 @@ static void emit_range(Token *start, Token *end) {
 // Like emit_range but processes zero-init/raw/orelse inside defer blocks.
 static void emit_deferred_range(Token *start, Token *end) {
 	bool saved_stmt_start = ctx->at_stmt_start;
-	bool saved_pending_ctrl = pending_ctrl;
-	bool saved_parens_just_closed = parens_just_closed;
-	uint8_t saved_scope_flags = pending_scope_flags;
-	pending_ctrl = false;
-	parens_just_closed = false;
-	pending_scope_flags = 0;
+	CtrlState saved_ctrl = ctrl_state;
+	ctrl_state.pending = false;
+	ctrl_state.pending_for_paren = false;
+	ctrl_state.parens_just_closed = false;
+	ctrl_state.scope_flags = 0;
+	ctrl_state.pending_orelse_guard = false;
+	ctrl_state.brace_depth = 0;
 
 	ctx->at_stmt_start = true;
 
@@ -779,9 +786,7 @@ static void emit_deferred_range(Token *start, Token *end) {
 	}
 
 	ctx->at_stmt_start = saved_stmt_start;
-	pending_ctrl = saved_pending_ctrl;
-	parens_just_closed = saved_parens_just_closed;
-	pending_scope_flags = saved_scope_flags;
+	ctrl_state = saved_ctrl;
 }
 
 static void emit_defers_ex(DeferEmitMode mode, int stop_depth) {
@@ -819,7 +824,12 @@ static bool has_defers_for(DeferEmitMode mode, int stop_depth) {
 }
 
 static void label_table_add(char *name, int name_len, int scope_depth, Token *tok, Token *block_open) {
-	if (label_count >= 128) return;
+	ARENA_ENSURE_CAP(&ctx->main_arena,
+			 label_table,
+			 label_count + 1,
+			 label_capacity,
+			 128,
+			 LabelInfo);
 	LabelInfo *info = &label_table[label_count++];
 	info->name = name; info->name_len = name_len; info->scope_depth = scope_depth; info->tok = tok; info->block_open = block_open;
 }
@@ -2229,6 +2239,105 @@ static void check_orelse_in_parens(Token *open) {
 				  "(it must appear at the top level of a declaration)");
 }
 
+typedef struct {
+	Token *orelse_tok;
+	bool is_const_fallback;
+} OrelseInitInfo;
+
+typedef struct {
+	Token *stop_comma;
+	bool has_const_qual;
+	bool is_struct_value;
+} OrelseDeclTargetInfo;
+
+static bool has_effective_const_qual(Token *type_start, TypeSpecResult *type, DeclResult *decl) {
+	bool has_const_qual = (type->has_const && !decl->is_func_ptr) || decl->is_const;
+	if (!has_const_qual && !decl->is_func_ptr && !decl->is_pointer) {
+		for (Token *t = type_start; t && t != type->end; t = tok_next(t))
+			if (is_const_typedef(t)) { has_const_qual = true; break; }
+	}
+	return has_const_qual;
+}
+
+static inline void reject_orelse_array_target(DeclResult *decl) {
+	if (decl->is_array && !decl->is_pointer)
+		error_tok(decl->var_name,
+			  "orelse on array variable '%.*s' will never trigger "
+			  "(array address is never NULL); remove the orelse clause",
+			  decl->var_name->len,
+			  tok_loc(decl->var_name));
+}
+
+static inline bool is_decl_struct_value(TypeSpecResult *type, DeclResult *decl) {
+	return type->is_struct && !type->is_enum && !decl->is_pointer && !decl->is_array;
+}
+
+static inline void reject_orelse_in_for_init(Token *tok) {
+	if (in_for_init())
+		error_tok(tok, "orelse cannot be used in for-loop initializers");
+}
+
+static inline void require_orelse_action(Token *tok, Token *stop_comma) {
+	if (match_ch(tok, ';') || (stop_comma && tok == stop_comma))
+		error_tok(tok, "expected statement after 'orelse'");
+}
+
+static inline void flush_typeof_memsets(Token **vars, int *count, TypeSpecResult *type) {
+	emit_typeof_memsets(vars, *count, type->has_volatile, type->has_const);
+	*count = 0;
+}
+
+static OrelseDeclTargetInfo analyze_decl_orelse_target(Token *tok,
+					       Token *type_start,
+					       TypeSpecResult *type,
+					       DeclResult *decl) {
+	OrelseDeclTargetInfo info = {
+		.stop_comma = find_boundary_comma(tok),
+		.has_const_qual = has_effective_const_qual(type_start, type, decl),
+		.is_struct_value = is_decl_struct_value(type, decl),
+	};
+	reject_orelse_array_target(decl);
+	require_orelse_action(tok, info.stop_comma);
+	return info;
+}
+
+static OrelseInitInfo scan_decl_orelse(Token *decl_end,
+					       Token *type_start,
+					       TypeSpecResult *type,
+					       DeclResult *decl) {
+	OrelseInitInfo info = {0};
+	if (!decl->has_init || !FEAT(F_ORELSE)) return info;
+
+	Token *scan = tok_next(decl_end);
+	Token *prev_scan = NULL;
+	while (scan && scan->kind != TK_EOF) {
+		if (scan->flags & TF_OPEN) {
+			check_orelse_in_parens(scan);
+			prev_scan = tok_match(scan);
+			scan = tok_next(tok_match(scan));
+			continue;
+		}
+		if (match_ch(scan, ',') || match_ch(scan, ';')) break;
+		if ((scan->tag & TT_ORELSE) && !is_known_typedef(scan) &&
+		    !(prev_scan && (prev_scan->tag & TT_MEMBER))) {
+			info.orelse_tok = scan;
+			break;
+		}
+		prev_scan = scan;
+		scan = tok_next(scan);
+	}
+
+	if (info.orelse_tok) {
+		Token *action = tok_next(info.orelse_tok);
+		bool is_fallback = action &&
+		    !(action->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
+		    !match_ch(action, '{') && !match_ch(action, ';');
+		info.is_const_fallback = has_effective_const_qual(type_start, type, decl) && is_fallback;
+	}
+
+	return info;
+}
+
 // Process all declarators in a declaration and emit with zero-init.
 static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw, Token *type_start,
 				  Token *pragma_start, Token *raw_tok, bool brace_wrap) {
@@ -2252,43 +2361,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		}
 
 		// Step 2: If initializer exists, scan for orelse + const fallback pattern
-		bool is_const_orelse_fallback = false;
-		Token *scan_orelse_tok = NULL;
-		if (decl.has_init && FEAT(F_ORELSE)) {
-			Token *scan = tok_next(decl.end); // skip '='
-			Token *prev_scan = NULL;
-			while (scan && scan->kind != TK_EOF) {
-				if (scan->flags & TF_OPEN) {
-					check_orelse_in_parens(scan);
-					prev_scan = tok_match(scan);
-					scan = tok_next(tok_match(scan));
-					continue;
-				}
-				if (match_ch(scan, ',') || match_ch(scan, ';')) break;
-				if ((scan->tag & TT_ORELSE) && !is_known_typedef(scan) &&
-				    !(prev_scan && (prev_scan->tag & TT_MEMBER))) {
-					scan_orelse_tok = scan;
-					break;
-				}
-				prev_scan = scan;
-				scan = tok_next(scan);
-			}
-
-			if (scan_orelse_tok) {
-				bool has_const_qual = (type->has_const && !decl.is_func_ptr) || decl.is_const;
-				if (!has_const_qual && !decl.is_func_ptr && !decl.is_pointer) {
-					for (Token *t = type_start; t && t != type->end; t = tok_next(t))
-						if (is_const_typedef(t)) { has_const_qual = true; break; }
-				}
-
-				Token *peek_action = tok_next(scan_orelse_tok);
-				bool is_fallback = peek_action &&
-				    !(peek_action->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
-				    !match_ch(peek_action, '{') && !match_ch(peek_action, ';');
-
-				is_const_orelse_fallback = has_const_qual && is_fallback;
-			}
-		}
+		OrelseInitInfo orelse_info = scan_decl_orelse(decl.end, type_start, type, &decl);
+		bool is_const_orelse_fallback = orelse_info.is_const_fallback;
 
 		// Deferred type emission from orelse comma continuation
 		if (need_type_emit) {
@@ -2322,29 +2396,18 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 		if (is_const_orelse_fallback) {
 			// const + fallback orelse: handle_const_orelse_fallback emits its own base type
-			Token *orelse_tok = scan_orelse_tok;
+			Token *orelse_tok = orelse_info.orelse_tok;
 			Token *val_start = tok_next(decl.end); // First value token after '='
+			tok = tok_next(orelse_tok); // skip 'orelse'
+			OrelseDeclTargetInfo target = analyze_decl_orelse_target(tok, type_start, type, &decl);
 
-			bool type_is_sue_not_enum = type->is_struct && !type->is_enum;
-			bool is_struct_val = type_is_sue_not_enum && !decl.is_pointer && !decl.is_array;
-			if (is_struct_val)
+			if (target.is_struct_value)
 				error_tok(orelse_tok,
 					  "orelse fallback on const struct is not supported; "
 					  "use a control flow action (return/break/goto) or "
 					  "remove const");
 
-			// Array address is never NULL — orelse can never trigger
-			if (decl.is_array && !decl.is_pointer)
-				error_tok(decl.var_name,
-					  "orelse on array variable '%.*s' will never trigger "
-					  "(array address is never NULL); remove the orelse clause",
-					  decl.var_name->len,
-					  tok_loc(decl.var_name));
-
 			register_decl_shadows(decl.var_name, is_vla_type);
-			tok = tok_next(orelse_tok); // skip 'orelse'
-
-			Token *stop_comma = find_boundary_comma(tok);
 
 			tok = handle_const_orelse_fallback(tok,
 							   orelse_tok,
@@ -2353,16 +2416,14 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 							   &decl,
 							   type_start,
 							   type,
-							   stop_comma);
+							   target.stop_comma);
 
-			emit_typeof_memsets(
-			    typeof_vars, typeof_var_count, type->has_volatile, type->has_const);
-			typeof_var_count = 0;
+			flush_typeof_memsets(typeof_vars, &typeof_var_count, type);
 
 			if (match_ch(tok, ';')) tok = tok_next(tok);
 			end_statement_after_semicolon();
 
-			if (stop_comma && match_ch(tok, ',')) {
+			if (target.stop_comma && match_ch(tok, ',')) {
 				tok = tok_next(tok);
 				need_type_emit = true;
 				is_raw = false;
@@ -2415,50 +2476,25 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			}
 
 			if (hit_orelse) {
-				if (in_for_init())
-					error_tok(tok, "orelse cannot be used in for-loop initializers");
-
-				// Detect struct/union value (not enum)
-				bool type_is_sue_not_enum = type->is_struct && !type->is_enum;
-				// For function pointers, type-level const qualifies return type, not the variable.
-				bool has_const_qual = (type->has_const && !decl.is_func_ptr) || decl.is_const;
-				if (!has_const_qual && !decl.is_func_ptr && !decl.is_pointer) {
-					for (Token *t = type_start; t && t != type->end; t = tok_next(t))
-						if (is_const_typedef(t)) { has_const_qual = true; break; }
-				}
-				// Array address is never NULL — orelse can never trigger
-				if (decl.is_array && !decl.is_pointer)
-					error_tok(decl.var_name,
-						  "orelse on array variable '%.*s' will never trigger "
-						  "(array address is never NULL); remove the orelse clause",
-						  decl.var_name->len,
-						  tok_loc(decl.var_name));
+				reject_orelse_in_for_init(tok);
 
 				out_char(';');
 
-				emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile, type->has_const);
-				typeof_var_count = 0; // reset for remaining declarators
+				flush_typeof_memsets(typeof_vars, &typeof_var_count, type);
 
 				register_decl_shadows(decl.var_name, is_vla_type);
 
 				tok = tok_next(tok); // skip 'orelse'
+				OrelseDeclTargetInfo target = analyze_decl_orelse_target(tok, type_start, type, &decl);
 
-				// Error on missing action
-				if (match_ch(tok, ';')) error_tok(tok, "expected statement after 'orelse'");
-
-				Token *stop_comma = find_boundary_comma(tok);
-
-				// Struct/union value orelse — error
-				bool is_struct_value =
-				    type_is_sue_not_enum && !decl.is_pointer && !decl.is_array;
-				if (is_struct_value)
+				if (target.is_struct_value)
 					error_tok(decl.var_name,
 						  "orelse on struct/union values is not supported (memcmp "
 						  "cannot reliably detect zero due to padding)");
 				tok = emit_orelse_action(
-				    tok, decl.var_name, has_const_qual, stop_comma);
+				    tok, decl.var_name, target.has_const_qual, target.stop_comma);
 
-				if (stop_comma && match_ch(tok, ',')) {
+				if (target.stop_comma && match_ch(tok, ',')) {
 					tok = tok_next(tok);
 					need_type_emit = true;
 					is_raw = false;
@@ -2473,7 +2509,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 		if (match_ch(tok, ';')) {
 			emit_tok(tok);
-			emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile, type->has_const);
+			flush_typeof_memsets(typeof_vars, &typeof_var_count, type);
 			if (brace_wrap) OUT_LIT(" }");
 			return tok_next(tok);
 		} else if (match_ch(tok, ',')) {
@@ -2490,11 +2526,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 			if (split_decl) {
 				out_char(';');
-				emit_typeof_memsets(typeof_vars,
-						   typeof_var_count,
-						   type->has_volatile,
-						   type->has_const);
-				typeof_var_count = 0;
+				flush_typeof_memsets(typeof_vars, &typeof_var_count, type);
 				tok = next_decl_tok;
 				need_type_emit = true;
 				is_raw = false;
@@ -2514,7 +2546,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 emit_raw_bail:
 	while (tok && tok->kind != TK_EOF && !match_ch(tok, ';')) { emit_tok(tok); tok = tok_next(tok); }
 	if (tok && match_ch(tok, ';')) { emit_tok(tok); tok = tok_next(tok); }
-	emit_typeof_memsets(typeof_vars, typeof_var_count, type->has_volatile, type->has_const);
+	flush_typeof_memsets(typeof_vars, &typeof_var_count, type);
 	if (brace_wrap) OUT_LIT(" }");
 	return tok;
 }
@@ -2670,7 +2702,7 @@ static Token *try_zero_init_decl(Token *tok) {
 	}
 
 	// Braceless control body: wrap in braces (orelse expands to multiple stmts).
-	bool brace_wrap = pending_ctrl && parens_just_closed;
+	bool brace_wrap = ctrl_state.pending && ctrl_state.parens_just_closed;
 
 	Token *result = process_declarators(type.end, &type, is_raw, start, pragma_start, raw_tok, brace_wrap);
 	if (result && !is_raw && ctx->block_depth > 0) {
@@ -2766,7 +2798,7 @@ static Token *handle_defer_keyword(Token *tok) {
 	// Context validation
 	if (in_ctrl_paren())
 		error_tok(tok, "defer cannot appear inside control statement parentheses");
-	if (pending_ctrl && !in_ctrl_paren())
+	if (ctrl_state.pending && !in_ctrl_paren())
 		error_tok(tok, "defer requires braces in control statements (braceless has no scope)");
 	if (scope_block_top() && scope_block_top()->is_stmt_expr)
 		error_tok(tok,
@@ -2868,6 +2900,8 @@ static inline void orelse_open(Token *var_name) {
 }
 
 static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma) {
+	require_orelse_action(tok, stop_comma);
+
 	if (match_ch(tok, '{')) {
 		if (var_name) {
 			OUT_LIT(" if (!");
@@ -2915,8 +2949,6 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
 		if (is_orelse_keyword(tok)) {
 			out_char(';');
 			tok = tok_next(tok);
-			if (match_ch(tok, ';'))
-				error_tok(tok, "expected statement after 'orelse'");
 			return emit_orelse_action(tok, var_name, has_const, stop_comma);
 		}
 		emit_tok(tok);
@@ -3097,18 +3129,18 @@ static Token *handle_sue_body(Token *tok) {
 
 static Token *handle_open_brace(Token *tok) {
 	// Compound literal inside control parens or before body
-	if (pending_ctrl && (in_ctrl_paren() || !parens_just_closed)) {
+	if (ctrl_state.pending && (in_ctrl_paren() || !ctrl_state.parens_just_closed)) {
 		emit_tok(tok);
-		ctrl_brace_depth++;
+		ctrl_state.brace_depth++;
 		return tok_next(tok);
 	}
-	if (pending_ctrl && !(pending_scope_flags & NS_SWITCH)) pending_scope_flags |= NS_CONDITIONAL;
-	bool orelse_guard = pending_orelse_guard;
+	if (ctrl_state.pending && !(ctrl_state.scope_flags & NS_SWITCH)) ctrl_state.scope_flags |= NS_CONDITIONAL;
+	bool orelse_guard = ctrl_state.pending_orelse_guard;
 	// Consume pending state but keep scope flags for scope_push
-	pending_ctrl = false;
-	pending_for_paren = false;
-	parens_just_closed = false;
-	pending_orelse_guard = false;
+	ctrl_state.pending = false;
+	ctrl_state.pending_for_paren = false;
+	ctrl_state.parens_just_closed = false;
+	ctrl_state.pending_orelse_guard = false;
 
 	// Evaluate BEFORE emit_tok
 	bool is_stmt_expr = last_emitted && match_ch(last_emitted, '(');
@@ -3127,8 +3159,8 @@ static Token *handle_open_brace(Token *tok) {
 
 static Token *handle_close_brace(Token *tok) {
 	// Compound literal close inside control parens
-	if (pending_ctrl && in_ctrl_paren() && ctrl_brace_depth > 0) {
-		ctrl_brace_depth--;
+	if (ctrl_state.pending && in_ctrl_paren() && ctrl_state.brace_depth > 0) {
+		ctrl_state.brace_depth--;
 		emit_tok(tok);
 		return tok_next(tok);
 	}
@@ -3466,13 +3498,13 @@ static char *preprocess_with_cc(const char *input_file) {
 
 static inline void track_ctrl_paren_open(void) {
 	ScopeKind k;
-	if (pending_for_paren) {
+	if (ctrl_state.pending_for_paren) {
 		k = SCOPE_FOR_PAREN;
-		pending_for_paren = false;
+		ctrl_state.pending_for_paren = false;
 	} else {
 		k = SCOPE_CTRL_PAREN;
 	}
-	parens_just_closed = false;
+	ctrl_state.parens_just_closed = false;
 	scope_push_kind(k, false);
 	ctx->at_stmt_start = (k == SCOPE_FOR_PAREN);
 }
@@ -3487,7 +3519,7 @@ static inline void track_ctrl_paren_close(void) {
 		}
 		break;
 	}
-	parens_just_closed = true;
+	ctrl_state.parens_just_closed = true;
 	ctx->at_stmt_start = true;
 }
 
@@ -3513,6 +3545,45 @@ static inline void pop_generic_scope(void) {
 		if (k == SCOPE_GENERIC) { scope_pop(); break; }
 		break;
 	}
+}
+
+static inline void track_generic_token(Token *tok) {
+	if (!in_generic()) return;
+	if (match_ch(tok, '(')) scope_push_kind(SCOPE_GENERIC, false);
+	else if (match_ch(tok, ')')) pop_generic_scope();
+}
+
+static inline void toplevel_track_token(ToplevelState *state, Token *tok) {
+	if (ctx->block_depth != 0) return;
+	if (match_ch(tok, '(')) {
+		if (state->paren_depth++ == 0) state->last_open_paren = tok;
+	} else if (match_ch(tok, ')')) {
+		if (--state->paren_depth <= 0) {
+			state->paren_depth = 0;
+			state->last_paren = tok;
+		}
+	}
+	state->prev_tok = tok;
+}
+
+static inline void toplevel_set_paren_pair(ToplevelState *state, Token *open, Token *close) {
+	state->last_open_paren = open;
+	state->last_paren = close;
+	state->prev_tok = close;
+}
+
+static inline void toplevel_clear_last_paren(ToplevelState *state) {
+	state->last_paren = NULL;
+}
+
+static inline void track_common_token_state(Token *tok, ToplevelState *state) {
+	if (__builtin_expect(ctrl_state.pending && tok->len == 1, 0)) {
+		char c = tok_loc(tok)[0];
+		if (c == '(') track_ctrl_paren_open();
+		else if (c == ')') track_ctrl_paren_close();
+	}
+	track_generic_token(tok);
+	toplevel_track_token(state, tok);
 }
 
 // Scan ahead for 'orelse' at depth 0 in a bare expression
@@ -3550,10 +3621,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 	bool next_func_returns_void = false;
 	bool next_func_ret_captured = false;
-	Token *prev_toplevel_tok = NULL;
-	Token *last_toplevel_paren = NULL;
-	Token *last_toplevel_open_paren = NULL;
-	int toplevel_paren_depth = 0;
+	ToplevelState toplevel = {0};
 	int ternary_depth = 0;
 
 	while (tok->kind != TK_EOF) {
@@ -3572,31 +3640,9 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		}                                                                                            \
 	}
 
-// Track top-level parentheses for function detection — inlined at each use site
-
 		// Fast path: untagged tokens not at statement start (~70-80% of tokens)
 		if (__builtin_expect(!tag && !ctx->at_stmt_start, 1)) {
-			if (__builtin_expect(pending_ctrl && tok->len == 1, 0)) {
-				char c = tok_loc(tok)[0];
-				if (c == '(') track_ctrl_paren_open();
-				else if (c == ')')
-					track_ctrl_paren_close();
-			}
-			if (__builtin_expect(in_generic(), 0)) {
-				if (match_ch(tok, '(')) scope_push_kind(SCOPE_GENERIC, false);
-				else if (match_ch(tok, ')')) pop_generic_scope();
-			}
-			if (ctx->block_depth == 0) {
-				if (match_ch(tok, '(')) {
-					if (toplevel_paren_depth++ == 0) last_toplevel_open_paren = tok;
-				} else if (match_ch(tok, ')')) {
-					if (--toplevel_paren_depth <= 0) {
-						toplevel_paren_depth = 0;
-						last_toplevel_paren = tok;
-					}
-				}
-				prev_toplevel_tok = tok;
-			}
+			track_common_token_state(tok, &toplevel);
 			emit_tok(tok);
 			tok = tok_next(tok);
 			continue;
@@ -3620,13 +3666,13 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		// to prevent typedef heuristic misidentification.
 		// Skip between function ')' and '{' (K&R parameter declarations).
 		if (ctx->at_stmt_start && ctx->block_depth == 0 && !in_struct_body() &&
-		    !(tag & TT_TYPEDEF) && !last_toplevel_paren)
+		    !(tag & TT_TYPEDEF) && !toplevel.last_paren)
 			register_toplevel_shadows(tok);
 
 		// Zero-init declarations at statement start.
 		// Skip structural tokens to avoid scanning brace blocks (RSS growth on musl ARM64).
 		if (ctx->at_stmt_start && !(tag & TT_STRUCTURAL) &&
-		    (!pending_ctrl || in_for_init() || parens_just_closed)) {
+		    (!ctrl_state.pending || in_for_init() || ctrl_state.parens_just_closed)) {
 			next = try_zero_init_decl(tok);
 			if (next) {
 				tok = next;
@@ -3642,8 +3688,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					  TT_CASE | TT_DEFAULT | TT_IF | TT_LOOP | TT_SWITCH))) {
 				Token *orelse_tok = find_bare_orelse(tok);
 				if (orelse_tok) {
-					if (in_for_init())
-						error_tok(tok, "orelse cannot be used in for-loop initializers");
+					reject_orelse_in_for_init(tok);
 					if (is_orelse_keyword(tok))
 						error_tok(tok, "expected expression before 'orelse'");
 					// Wrap in braces to prevent dangling-else binding
@@ -3745,13 +3790,12 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				OUT_LIT("))");
 				tok = tok_next(tok);
 
-					if (match_ch(tok, ';'))
-						error_tok(tok, "expected statement after 'orelse'");
+					require_orelse_action(tok, NULL);
 
 					bool is_block_action = match_ch(tok, '{');
 					tok = emit_orelse_action(tok, NULL, false, NULL);
 					if (is_block_action) {
-						pending_orelse_guard = true;
+						ctrl_state.pending_orelse_guard = true;
 					} else {
 						OUT_LIT(" }");
 					}
@@ -3792,13 +3836,13 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 			if (tag & TT_LOOP) {
 				if (FEAT(F_DEFER)) {
-					pending_scope_flags |= NS_LOOP;
-					pending_ctrl = true;
-					if (equal(tok, "do")) parens_just_closed = true;
+					ctrl_state.scope_flags |= NS_LOOP;
+					ctrl_state.pending = true;
+					if (equal(tok, "do")) ctrl_state.parens_just_closed = true;
 				}
 				if (equal(tok, "for") && FEAT(F_DEFER | F_ZEROINIT)) {
-					pending_ctrl = true;
-					pending_for_paren = true;
+					ctrl_state.pending = true;
+					ctrl_state.pending_for_paren = true;
 				}
 			}
 
@@ -3829,9 +3873,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 						out_char(')');
 						emit_range(params_open, tok_next(params_close));
 						if (ctx->block_depth == 0) {
-							last_toplevel_open_paren = params_open;
-							last_toplevel_paren = params_close;
-							prev_toplevel_tok = params_close;
+							toplevel_set_paren_pair(&toplevel, params_open, params_close);
 						}
 						tok = after;
 						continue;
@@ -3850,14 +3892,14 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			}
 
 			if (FEAT(F_DEFER) && (tag & TT_SWITCH)) {
-				pending_scope_flags |= NS_SWITCH;
-				pending_ctrl = true;
+				ctrl_state.scope_flags |= NS_SWITCH;
+				ctrl_state.pending = true;
 			}
 
 			if (tag & TT_IF) {
-				pending_ctrl = true;
+				ctrl_state.pending = true;
 				if (equal(tok, "else")) {
-					parens_just_closed = true;
+					ctrl_state.parens_just_closed = true;
 					ctx->at_stmt_start = true;
 				}
 			}
@@ -3867,10 +3909,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 		} // end if (tag)
 
-		if (__builtin_expect(in_generic(), 0)) {
-			if (match_ch(tok, '(')) scope_push_kind(SCOPE_GENERIC, false);
-			else if (match_ch(tok, ')')) pop_generic_scope();
-		}
+		track_generic_token(tok);
 
 		// Void function detection and return type capture at top level
 		if (ctx->block_depth == 0 &&
@@ -3890,20 +3929,20 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				// Function definition detection at top level
 				if (ctx->block_depth == 0 && FEAT(F_DEFER)) {
 					bool is_func_def = false;
-					if (prev_toplevel_tok && match_ch(prev_toplevel_tok, ')'))
+					if (toplevel.prev_tok && match_ch(toplevel.prev_tok, ')'))
 						is_func_def = true;
-					else if (last_toplevel_paren &&
-						 is_knr_params(tok_next(last_toplevel_paren), tok))
+					else if (toplevel.last_paren &&
+						 is_knr_params(tok_next(toplevel.last_paren), tok))
 						is_func_def = true;
-					else if (last_toplevel_paren) {
+					else if (toplevel.last_paren) {
 						// Skip attrs, array dims, param lists between ')' and '{'
-						Token *after = skip_declarator_suffix(tok_next(last_toplevel_paren));
+						Token *after = skip_declarator_suffix(tok_next(toplevel.last_paren));
 						if (after == tok) is_func_def = true;
 					}
 					if (is_func_def) {
 						scan_labels_in_function(tok);
-						register_param_shadows(last_toplevel_open_paren,
-								       last_toplevel_paren);
+						register_param_shadows(toplevel.last_open_paren,
+								       toplevel.last_paren);
 						ctx->current_func_returns_void = next_func_returns_void;
 						if (next_func_returns_void || !next_func_ret_captured)
 							clear_func_ret_type();
@@ -3912,11 +3951,11 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					}
 					next_func_returns_void = false;
 					next_func_ret_captured = false;
-					last_toplevel_paren = NULL;
+					toplevel_clear_last_paren(&toplevel);
 				}
 				// Reset K&R tracking at file scope to avoid stale shadow table guard
 				if (ctx->block_depth == 0)
-					last_toplevel_paren = NULL;
+					toplevel_clear_last_paren(&toplevel);
 				tok = handle_open_brace(tok);
 				continue;
 			}
@@ -3964,24 +4003,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			continue;
 		}
 
-		if (pending_ctrl && tok->len == 1) {
-			char c = tok_loc(tok)[0];
-			if (c == '(') track_ctrl_paren_open();
-			else if (c == ')')
-				track_ctrl_paren_close();
-		}
-
-		if (ctx->block_depth == 0) {
-			if (match_ch(tok, '(')) {
-				if (toplevel_paren_depth++ == 0) last_toplevel_open_paren = tok;
-			} else if (match_ch(tok, ')')) {
-				if (--toplevel_paren_depth <= 0) {
-					toplevel_paren_depth = 0;
-					last_toplevel_paren = tok;
-				}
-			}
-			prev_toplevel_tok = tok;
-		}
+		track_common_token_state(tok, &toplevel);
 
 		// Warn on unprocessed 'orelse' in unsupported context
 		if (__builtin_expect(FEAT(F_ORELSE) && is_orelse_keyword(tok) &&
@@ -4045,7 +4067,9 @@ PRISM_API void prism_reset(void) {
 	ctx->scope_depth = 0;
 	ctx->block_depth = 0;
 
+	label_table = NULL;
 	label_count = 0;
+	label_capacity = 0;
 
 	system_includes_reset();
 
@@ -4639,6 +4663,17 @@ static void verbose_argv(char **args) {
 	fprintf(stderr, "\n");
 }
 
+typedef struct {
+	const char *compiler;
+	bool clang;
+	bool msvc;
+	const char *output;
+	bool compile_only;
+	bool optimize;
+	bool suppress_warnings;
+	bool use_preprocessed;
+} TempCompilePlan;
+
 static const char *cli_output_path(const Cli *cli, const char *temp_exe, bool msvc) {
 	static char defobj[PATH_MAX];
 
@@ -4702,6 +4737,36 @@ static void cleanup_temp_range(char **temps, int count) {
 	free(temps);
 }
 
+static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count,
+					 const TempCompilePlan *plan) {
+	const char **args = alloc_argv(temp_count + cli->cc_arg_count + 24);
+	int argc = 0;
+	args[argc++] = plan->compiler;
+	if (plan->optimize) args[argc++] = plan->msvc ? "/O2" : "-O2";
+	if (plan->use_preprocessed) args[argc++] = "-fpreprocessed";
+	for (int i = 0; i < temp_count; i++) args[argc++] = temps[i];
+	if (plan->use_preprocessed) args[argc++] = "-fno-preprocessed";
+	for (int i = 0; i < cli->cc_arg_count; i++) args[argc++] = cli->cc_args[i];
+	if (plan->suppress_warnings)
+		add_warn_suppress(args, &argc, plan->clang, plan->msvc);
+	argv_add_output(args, &argc, plan->output, plan->msvc, plan->compile_only);
+	args[argc] = NULL;
+
+	if (cli->verbose) verbose_argv((char **)args);
+	int status = run_command((char **)args);
+	free((void *)args);
+	return status;
+}
+
+static const char *resolve_install_compiler(const Cli *cli) {
+	const char *cc = get_real_cc(cli->cc ? cli->cc : getenv("PRISM_CC"));
+	if (!cc || (strcmp(cc, "cc") == 0 && !cli->cc)) {
+		cc = getenv("CC");
+		if (cc) cc = get_real_cc(cc);
+	}
+	return cc ? cc : PRISM_DEFAULT_CC;
+}
+
 static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 	char **temps = calloc(cli->source_count, sizeof(char *));
 	if (!temps) die("Out of memory");
@@ -4741,38 +4806,24 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 	return temps;
 }
 
-static void cleanup_temps(char **temps, int count) {
-	cleanup_temp_range(temps, count);
-}
-
 static int install_from_source(Cli *cli) {
 	char temp_bin[PATH_MAX];
 	snprintf(temp_bin, sizeof(temp_bin), "%sprism_install_%d" EXE_SUFFIX, get_tmp_dir(), getpid());
 
-	const char *cc = get_real_cc(cli->cc ? cli->cc : getenv("PRISM_CC"));
-	if (!cc || (strcmp(cc, "cc") == 0 && !cli->cc)) {
-		cc = getenv("CC");
-		if (cc) cc = get_real_cc(cc);
-	}
-	if (!cc) cc = PRISM_DEFAULT_CC;
+	const char *cc = resolve_install_compiler(cli);
 	bool msvc = cc_is_msvc(cc);
 
 	char **temps = transpile_sources_to_temps(cli, true);
 	if (!temps) return 1;
 
-	const char **args = alloc_argv(cli->source_count + cli->cc_arg_count + 8);
-	int argc = 0;
-	args[argc++] = cc;
-	args[argc++] = msvc ? "/O2" : "-O2";
-	for (int i = 0; i < cli->source_count; i++) args[argc++] = temps[i];
-	for (int i = 0; i < cli->cc_arg_count; i++) args[argc++] = cli->cc_args[i];
-	argv_add_output(args, &argc, temp_bin, msvc, false);
-	args[argc] = NULL;
-	if (cli->verbose) verbose_argv((char **)args);
-
-	int status = run_command((char **)args);
-	free((void *)args);
-	cleanup_temps(temps, cli->source_count);
+	TempCompilePlan plan = {
+		.compiler = cc,
+		.msvc = msvc,
+		.output = temp_bin,
+		.optimize = true,
+	};
+	int status = run_temp_compile_plan(cli, temps, cli->source_count, &plan);
+	cleanup_temp_range(temps, cli->source_count);
 	if (status != 0) return 1;
 
 	int result = install(temp_bin);
@@ -4814,21 +4865,17 @@ static int compile_sources(Cli *cli) {
 		char **temps = transpile_sources_to_temps(cli, false);
 		if (!temps) die("Transpilation failed");
 
-		const char **args = alloc_argv(cli->source_count + cli->cc_arg_count + 20);
-		int argc = 0;
-		args[argc++] = compiler;
-		if (FEAT(F_FLATTEN) && !clang && !msvc) args[argc++] = "-fpreprocessed";
-		for (int i = 0; i < cli->source_count; i++) args[argc++] = temps[i];
-		if (FEAT(F_FLATTEN) && !clang && !msvc) args[argc++] = "-fno-preprocessed";
-		for (int i = 0; i < cli->cc_arg_count; i++) args[argc++] = cli->cc_args[i];
-		add_warn_suppress(args, &argc, clang, msvc);
-		argv_add_output(args, &argc, cli_output_path(cli, temp_exe, msvc), msvc, cli->compile_only);
-		args[argc] = NULL;
-
-		if (cli->verbose) verbose_argv((char **)args);
-		status = run_command((char **)args);
-		free((void *)args);
-		cleanup_temps(temps, cli->source_count);
+		TempCompilePlan plan = {
+			.compiler = compiler,
+			.clang = clang,
+			.msvc = msvc,
+			.output = cli_output_path(cli, temp_exe, msvc),
+			.compile_only = cli->compile_only,
+			.suppress_warnings = true,
+			.use_preprocessed = FEAT(F_FLATTEN) && !clang && !msvc,
+		};
+		status = run_temp_compile_plan(cli, temps, cli->source_count, &plan);
+		cleanup_temp_range(temps, cli->source_count);
 	}
 
 	if (status != 0) {

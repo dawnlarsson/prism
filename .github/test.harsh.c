@@ -81,6 +81,70 @@ static void test_harsh_error_recovery_barrage(void) {
     prism_free(&ok);
 }
 
+static void test_harsh_many_labels_goto_safety(void) {
+    size_t cap = 32768;
+    char *src = malloc(cap);
+    size_t len = 0;
+
+    CHECK(src != NULL, "harsh many labels: allocate source buffer");
+    if (!src) return;
+
+    len += snprintf(src + len, cap - len, "int f(void) { goto L129; defer (void)0;\n");
+    for (int i = 0; i < 130; i++)
+        len += snprintf(src + len, cap - len, "L%d: ;\n", i);
+    len += snprintf(src + len, cap - len, "return 0; }\n");
+
+    PrismResult r = prism_transpile_source(src, "harsh_many_labels.c", prism_defaults());
+    CHECK(r.status != PRISM_OK,
+          "harsh many labels: goto safety still enforced past 128 labels");
+    prism_free(&r);
+    free(src);
+}
+
+static void test_harsh_delimiter_overflow(void) {
+    const int depth = 4100;
+    size_t cap = (size_t)depth * 2 + 128;
+    char *src = malloc(cap);
+    size_t len = 0;
+
+    CHECK(src != NULL, "harsh delimiter overflow: allocate source buffer");
+    if (!src) return;
+
+    len += snprintf(src + len, cap - len, "int f(void) { int x = ");
+    for (int i = 0; i < depth; i++) src[len++] = '(';
+    src[len++] = '0';
+    for (int i = 0; i < depth; i++) src[len++] = ')';
+    len += snprintf(src + len, cap - len, "; return x; }\n");
+
+    PrismResult r = prism_transpile_source(src, "harsh_delim_overflow.c", prism_defaults());
+    CHECK(r.status != PRISM_OK,
+          "harsh delimiter overflow: excessive nesting rejected cleanly");
+    prism_free(&r);
+    free(src);
+}
+
+static void test_harsh_many_special_wrappers(void) {
+    size_t cap = 32768;
+    char *src = malloc(cap);
+    size_t len = 0;
+
+    CHECK(src != NULL, "harsh wrapper propagation: allocate source buffer");
+    if (!src) return;
+
+    len += snprintf(src + len, cap - len, "int setjmp(void *); void *jb;\n");
+    for (int i = 0; i < 40; i++)
+        len += snprintf(src + len, cap - len, "void w%d(void) { setjmp(jb); }\n", i);
+    len += snprintf(src + len,
+                    cap - len,
+                    "int f(void) { defer (void)0; w39(); return 0; }\n");
+
+    PrismResult r = prism_transpile_source(src, "harsh_many_wrappers.c", prism_defaults());
+    CHECK(r.status != PRISM_OK,
+          "harsh wrapper propagation: defer still blocked past 32 wrappers");
+    prism_free(&r);
+    free(src);
+}
+
 void run_harsh_review_tests(void) {
     test_harsh_vla_sizeof_side_effect();
     test_harsh_stmt_expr_in_vla();
@@ -88,4 +152,7 @@ void run_harsh_review_tests(void) {
     test_harsh_macro_defer_eval();
     test_harsh_generic_decl_noise();
     test_harsh_error_recovery_barrage();
+    test_harsh_many_labels_goto_safety();
+    test_harsh_delimiter_overflow();
+    test_harsh_many_special_wrappers();
 }

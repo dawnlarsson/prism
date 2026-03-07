@@ -603,20 +603,23 @@ static noreturn void lib_error_jump(int line) {
 	ctx->error_line = line;
 	longjmp(ctx->error_jmp, 1);
 }
+
+static inline bool lib_error_enabled(void) {
+	return ctx && ctx->error_jmp_set;
+}
+
+static noreturn void lib_errorf(int line, const char *fmt, va_list ap) {
+	vsnprintf(ctx->error_msg, sizeof(ctx->error_msg), fmt, ap);
+	lib_error_jump(line);
+}
 #endif
 
 static noreturn void error(char *fmt, ...) {
-#ifdef PRISM_LIB_MODE
-	if (ctx && ctx->error_jmp_set) {
-		va_list ap;
-		va_start(ap, fmt);
-		vsnprintf(ctx->error_msg, sizeof(ctx->error_msg), fmt, ap);
-		va_end(ap);
-		lib_error_jump(0);
-	}
-#endif
 	va_list ap;
 	va_start(ap, fmt);
+#ifdef PRISM_LIB_MODE
+	if (lib_error_enabled()) lib_errorf(0, fmt, ap);
+#endif
 	vfprintf(stderr, fmt, ap);
 	fprintf(stderr, "\n");
 	va_end(ap);
@@ -656,14 +659,10 @@ noreturn void error_at(char *loc, char *fmt, ...) {
 	va_list ap;
 	va_start(ap, fmt);
 #ifdef PRISM_LIB_MODE
-	if (ctx->error_jmp_set) {
-		int line = ctx->current_file && ctx->current_file->contents && !is_digraph_loc(loc)
-			       ? count_lines(ctx->current_file->contents, loc)
-			       : 0;
-		vsnprintf(ctx->error_msg, sizeof(ctx->error_msg), fmt, ap);
-		va_end(ap);
-		lib_error_jump(line);
-	}
+	int line = ctx->current_file && ctx->current_file->contents && !is_digraph_loc(loc)
+		       ? count_lines(ctx->current_file->contents, loc)
+		       : 0;
+	if (lib_error_enabled()) lib_errorf(line, fmt, ap);
 #endif
 	if (ctx->current_file)
 		verror_at(ctx->current_file->name,
@@ -685,11 +684,7 @@ noreturn void error_tok(Token *tok, const char *fmt, ...) {
 	va_start(ap, fmt);
 	File *f = tok_file(tok);
 #ifdef PRISM_LIB_MODE
-	if (ctx->error_jmp_set) {
-		vsnprintf(ctx->error_msg, sizeof(ctx->error_msg), fmt, ap);
-		va_end(ap);
-		lib_error_jump(tok_line_no(tok));
-	}
+	if (lib_error_enabled()) lib_errorf(tok_line_no(tok), fmt, ap);
 #endif
 	verror_at(f->name, f->contents, tok_line_no(tok), tok_loc(tok), fmt, ap);
 	va_end(ap);
@@ -734,6 +729,13 @@ static inline uintptr_t keyword_lookup(char *key, int keylen) {
 		if (ent->len == keylen && !memcmp(ent->name, key, keylen)) return ent->value;
 	}
 	return 0;
+}
+
+static inline bool is_potential_func_name(Token *tok) {
+	Token *next = tok_next(tok);
+	return tok->kind <= TK_KEYWORD && next && tok_loc(next)[0] == '(' &&
+	       (next->flags & TF_OPEN) &&
+	       !(tok->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_ATTR));
 }
 
 static void init_keyword_map(void) {
@@ -1457,7 +1459,8 @@ static Token *tokenize(File *file) {
 		int sp = 0;
 		for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
 			if (t->flags & TF_OPEN) {
-				if (sp < 4096) stack[sp++] = t;
+				if (sp >= 4096) error_tok(t, "delimiter nesting exceeds 4096");
+				stack[sp++] = t;
 				Token *tn = tok_next(t);
 				if (tok_loc(t)[0] == '[' && tn && tok_loc(tn)[0] == '[' && (tn->flags & TF_OPEN))
 					t->flags |= TF_C23_ATTR;
@@ -1474,14 +1477,12 @@ static Token *tokenize(File *file) {
 		// Also propagate TT_SPECIAL_FN to indirect longjmp wrappers (one level).
 		// Function body heuristic: depth-0 '{' preceded by ')'.
 		{
-			Token *wrappers[32];
+			Token **wrappers = NULL;
 			int wrapper_count = 0;
+			int wrapper_capacity = 0;
 			Token *func_name = NULL;
 			for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
-				Token *tn = tok_next(t);
-				if (t->kind <= TK_KEYWORD && tn &&
-				    tok_loc(tn)[0] == '(' && (tn->flags & TF_OPEN) &&
-				    !(t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_ATTR)))
+				if (is_potential_func_name(t))
 					func_name = t;
 				if (tok_loc(t)[0] == '{' && (t->flags & TF_OPEN) && t->match_idx) {
 					Token *end = tok_match(t);
@@ -1495,7 +1496,15 @@ static Token *tokenize(File *file) {
 						if (b->tag & TT_ASM) t->tag |= TT_ASM;
 					}
 					if (func_name && (t->tag & TT_SPECIAL_FN))
-						if (wrapper_count < 32) wrappers[wrapper_count++] = func_name;
+						{
+							ARENA_ENSURE_CAP(&ctx->main_arena,
+								 wrappers,
+								 wrapper_count + 1,
+								 wrapper_capacity,
+								 32,
+								 Token *);
+							wrappers[wrapper_count++] = func_name;
+						}
 					func_name = NULL;
 					t = end;
 				}
@@ -1503,10 +1512,7 @@ static Token *tokenize(File *file) {
 			// Pass 2: propagate to functions that call a wrapper.
 			func_name = NULL;
 			for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
-				Token *tn = tok_next(t);
-				if (t->kind <= TK_KEYWORD && tn &&
-				    tok_loc(tn)[0] == '(' && (tn->flags & TF_OPEN) &&
-				    !(t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_ATTR)))
+				if (is_potential_func_name(t))
 					func_name = t;
 				if (tok_loc(t)[0] == '{' && (t->flags & TF_OPEN) && t->match_idx) {
 					Token *end = tok_match(t);
