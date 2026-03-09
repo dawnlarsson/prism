@@ -1498,6 +1498,15 @@ static void test_orelse_bare_assign_double_eval(void) {
 	free(path);
 }
 
+static void test_orelse_vla_fallback_double_eval(void) {
+	int i = 0;
+	int arr[(++i) orelse 5];
+
+	CHECK_EQ(i, 1, "orelse VLA fallback: side effect evaluated once");
+	CHECK_EQ((int)(sizeof(arr) / sizeof(arr[0])), 1,
+		 "orelse VLA fallback: nonzero lhs keeps original bound");
+}
+
 static void test_const_opaque_ptr_orelse(void) {
 	printf("\n--- Const Opaque Pointer Constraint Violation ---\n");
 
@@ -1921,6 +1930,7 @@ void run_orelse_tests(void) {
 	test_anon_struct_orelse_type_corruption();
 	test_compound_literal_orelse_lifetime();
 	test_orelse_bare_assign_double_eval();
+	test_orelse_vla_fallback_double_eval();
 	test_const_opaque_ptr_orelse();
 	test_array_typedef_is_ptr_orelse();
 	test_pragma_absorbed_into_orelse_condition();

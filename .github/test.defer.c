@@ -1840,6 +1840,36 @@ static void test_scope_type_at_depth_overflow(void) {
 	free(path);
 }
 
+static void test_defer_void_parens_return_bug(void) {
+        printf("\n--- Void Function Return Parens Bug ---\n");
+
+        const char *code =
+            "#include <stdio.h>\n"
+            "void void_helper(void) {}\n"
+            "void (func_with_parens)(void) {\n"
+            "    defer printf(\"test\\n\");\n"
+            "    return void_helper();\n"
+            "}\n"
+            "int main() {\n"
+            "    func_with_parens();\n"
+            "    return 0;\n"
+            "}\n";
+
+        char *path = create_temp_file(code);
+        PrismResult result = prism_transpile_file(path, prism_defaults());
+        CHECK_EQ(result.status, PRISM_OK, "void with parens: transpiles OK");
+
+        if (result.output) {
+                check_transpiled_output_compiles_and_runs(
+                    result.output,
+                    "void with parens: compiles without void deduction failure",
+                    "void with parens: runs successfully");
+        }
+        prism_free(&result);
+        unlink(path);
+        free(path);
+}
+
 static void test_fno_defer_shadow_leak(void) {
 	printf("\n--- -fno-defer Shadow Leak ---\n");
 
@@ -1996,4 +2026,4 @@ void run_defer_tests(void) {
 	test_braceless_body_semicolon_trap();
 	test_scope_type_at_depth_overflow();
 	test_fno_defer_shadow_leak();
-}
+        test_defer_void_parens_return_bug();}

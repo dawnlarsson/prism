@@ -1373,17 +1373,28 @@ static int capture_function_return_type(Token *tok) {
 		while (inner && match_ch(inner, '(')) {
 			inner = skip_pointers(tok_next(inner), NULL);
 		}
-		if (inner && is_valid_varname(inner) && tok_next(inner) && match_ch(tok_next(inner), '(')) {
-			Token *after_params = skip_balanced(tok_next(inner), '(', ')');
-			if (after_params && match_ch(after_params, ')')) {
-				Token *decl_end = skip_balanced(outer_open, '(', ')');
-				decl_end = skip_declarator_suffix(decl_end);
-				if (is_void) return 1;
-				ctx->func_ret_type_start = type_start;
-				ctx->func_ret_type_end = inner;
-				ctx->func_ret_type_suffix_start = after_params;
-				ctx->func_ret_type_suffix_end = decl_end;
-				return 2;
+		if (inner && is_valid_varname(inner) && tok_next(inner)) {
+			if (match_ch(tok_next(inner), '(')) {
+				Token *after_params = skip_balanced(tok_next(inner), '(', ')');
+				if (after_params && match_ch(after_params, ')')) {
+					Token *decl_end = skip_balanced(outer_open, '(', ')');
+					decl_end = skip_declarator_suffix(decl_end);
+					if (is_void) return 1;
+					ctx->func_ret_type_start = type_start;
+					ctx->func_ret_type_end = inner;
+					ctx->func_ret_type_suffix_start = after_params;
+					ctx->func_ret_type_suffix_end = decl_end;
+					return 2;
+				}
+			} else if (tok_next(inner) == tok_match(outer_open)) {
+				Token *params = tok_next(tok_next(inner));
+				if (params && match_ch(params, '(')) {
+					if (is_void) return 1;
+					ctx->func_ret_type_start = type_start;
+					ctx->func_ret_type_end = inner;
+					ctx->func_ret_type_suffix_start = ctx->func_ret_type_suffix_end = NULL;
+					return 2;
+				}
 			}
 		}
 	}
@@ -1931,14 +1942,31 @@ static Token *walk_balanced_orelse(Token *tok) {
 	// Emit: OPEN (LHS) ? (LHS) : (RHS) CLOSE
 	Token *lhs_start = tok_next(tok);    // first token after [ or (
 	Token *rhs_start = tok_next(orelse_found); // first token after orelse
+	bool is_bracket = match_ch(tok, '[');
 	emit_tok(tok); // emit [ or (
-	OUT_LIT(" (");
-	emit_token_range(lhs_start, orelse_found);
-	OUT_LIT(") ? (");
-	emit_token_range(lhs_start, orelse_found);
-	OUT_LIT(") : (");
-	emit_token_range(rhs_start, end);
-	OUT_LIT(")");
+	if (is_bracket) {
+		// VLA context: use statement expression to avoid double evaluation
+		unsigned oe = ctx->ret_counter++;
+		OUT_LIT(" ({ __auto_type _Prism_oe_");
+		out_uint(oe);
+		OUT_LIT(" = (");
+		emit_token_range(lhs_start, orelse_found);
+		OUT_LIT("); _Prism_oe_");
+		out_uint(oe);
+		OUT_LIT(" ? _Prism_oe_");
+		out_uint(oe);
+		OUT_LIT(" : (");
+		emit_token_range(rhs_start, end);
+		OUT_LIT("); })");
+	} else {
+		OUT_LIT(" (");
+		emit_token_range(lhs_start, orelse_found);
+		OUT_LIT(") ? (");
+		emit_token_range(lhs_start, orelse_found);
+		OUT_LIT(") : (");
+		emit_token_range(rhs_start, end);
+		OUT_LIT(")");
+	}
 	emit_tok(end); // emit ] or )
 	return tok_next(end);
 }
