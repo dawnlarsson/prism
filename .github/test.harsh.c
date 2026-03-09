@@ -81,6 +81,18 @@ static void test_harsh_error_recovery_barrage(void) {
     prism_free(&ok);
 }
 
+static void test_harsh_orelse_typedef_union_value_rejected(void) {
+    PrismResult r = prism_transpile_source(
+        "typedef union { int x; long y; } U;\n"
+        "U make(void) { U u = { .x = 1 }; return u; }\n"
+        "int main(void) { U u = make() orelse return 1; return u.x; }\n",
+        "harsh_orelse_typedef_union_value.c", prism_defaults());
+
+    CHECK(r.status != PRISM_OK,
+          "harsh orelse typedef union value: rejected before emitting invalid scalar test");
+    prism_free(&r);
+}
+
 static void test_harsh_many_labels_goto_safety(void) {
     size_t cap = 32768;
     char *src = malloc(cap);
@@ -218,6 +230,7 @@ void run_harsh_review_tests(void) {
     test_harsh_goto_escape_sizeof_defer();
     test_harsh_macro_defer_eval();
     test_harsh_generic_decl_noise();
+    test_harsh_orelse_typedef_union_value_rejected();
     test_harsh_error_recovery_barrage();
     test_harsh_many_labels_goto_safety();
     test_harsh_delimiter_overflow();

@@ -1279,17 +1279,41 @@ static void test_orelse_stmt_expr_fallback_rejected(void) {
 #endif
 
 static void test_orelse_bare_assign_compound_side_effect_rejected(void) {
-	check_orelse_transpile_rejects(
-	    "#include <stdlib.h>\n"
-	    "int *get(void) { return NULL; }\n"
-	    "void f(int *arr, int *i) {\n"
-	    "    arr[*i += 1] = (int)(long)get() orelse 42;\n"
-	    "}\n",
-	    "orelse_compound_side_effect_reject.c",
-	    "orelse compound side effect: rejected",
-	    "double evaluation");
+        check_orelse_transpile_rejects(
+            "int g = 0;\n"
+            "int *f(void) { g++; return 0; }\n"
+            "void test(void) {\n"
+            "    int *p;\n"
+            "    p += f() orelse 0;\n"
+            "}\n",
+            "orelse_bare_assign_compound_reject.c",
+            "orelse bare assignment compound: rejected",
+            "bare assignment with 'orelse' cannot use compound operators");
 }
 
+static void test_orelse_parenthesized_array_size_rejected(void) {
+        check_orelse_transpile_rejects(
+            "void test(void) {\n"
+            "    int *p = 0;\n"
+            "    int x[p orelse return];\n"
+            "}\n",
+            "orelse_parenthesized_array_size_reject.c",
+            "orelse inside array size: rejected",
+            "orelse"
+        );
+}
+
+static void test_orelse_parenthesized_typeof_rejected(void) {
+        check_orelse_transpile_rejects(
+            "void test(void) {\n"
+            "    int *p = 0;\n"
+            "    __typeof__(p orelse return) x;\n"
+            "}\n",
+            "orelse_parenthesized_typeof_reject.c",
+            "orelse inside typeof: rejected",
+            "orelse"
+        );
+}
 
 static void test_prism_oe_temp_var_namespace_collision(void) {
 	printf("\n--- Temp Variable Namespace Collision (_prism_oe_) ---\n");
@@ -1500,7 +1524,6 @@ static void test_const_opaque_ptr_orelse(void) {
 
 	PrismFeatures features = prism_defaults();
 	PrismResult result = prism_transpile_file(path, features);
-
 	CHECK_EQ(result.status, PRISM_OK, "const opaque ptr: transpiles OK");
 	CHECK(result.output != NULL, "const opaque ptr: output not NULL");
 
@@ -1578,9 +1601,9 @@ static void test_pragma_absorbed_into_orelse_condition(void) {
 	const char *pragma_pos = strstr(result.output, "#pragma GCC diagnostic push");
 	const char *if_pos = strstr(result.output, "if (!(");
 	CHECK(pragma_pos != NULL, "pragma orelse: #pragma present in output");
-	CHECK(if_pos != NULL, "pragma orelse: if (!( present in output");
+	CHECK(if_pos != NULL, "pragma orelse: if !( present in output");
 	CHECK(pragma_pos < if_pos,
-	      "pragma orelse: #pragma appears before if (!( (hoisted out of condition)");
+	      "pragma orelse: #pragma appears before if !( (hoisted out of condition)");
 
 	prism_free(&result);
 	unlink(path);
@@ -1614,10 +1637,6 @@ static void test_array_typedef_const_orelse_ternary(void) {
 	// to extract the element type safely.
 	CHECK(strstr(result.output, "carr_t") != NULL || strstr(result.output, "arr_t") != NULL,
 	      "arr_td const orelse: type name appears in output");
-
-	prism_free(&result);
-	unlink(path);
-	free(path);
 }
 
 static void test_bare_orelse_compound_literal_ternary(void) {
@@ -1639,17 +1658,13 @@ static void test_bare_orelse_compound_literal_ternary(void) {
 	CHECK_EQ(result.status, PRISM_OK, "bare orelse compound: transpiles OK");
 	CHECK(result.output != NULL, "bare orelse compound: output not NULL");
 
-	// The fallback should use an if-based pattern to avoid volatile double evaluation.
-	CHECK(strstr(result.output, "if (!") != NULL,
-	      "bare orelse compound: uses if-based fallback pattern");
+	// The fallback should use a comma-operator ternary to avoid block-scoping.
+	CHECK(strstr(result.output, ", (!") != NULL,
+	      "bare orelse compound: uses comma-operator fallback pattern");
 	// The compound literal should appear in the output
 	CHECK(strstr(result.output, "(int[]){1, 2, 3}") != NULL ||
 	      strstr(result.output, "(int[]){ 1, 2, 3 }") != NULL,
 	      "bare orelse compound: compound literal present in output");
-
-	prism_free(&result);
-	unlink(path);
-	free(path);
 }
 
 static void test_chained_bare_orelse(void) {
@@ -1674,18 +1689,14 @@ static void test_chained_bare_orelse(void) {
 	// The output must NOT contain the literal "orelse" keyword — that's not valid C.
 	CHECK(strstr(result.output, "orelse") == NULL,
 	      "chained bare orelse: no raw 'orelse' keyword in C output");
-	// Should produce two if-based fallback expressions for the chain
-	const char *first_if = strstr(result.output, "if (!");
-	CHECK(first_if != NULL, "chained bare orelse: first if-based fallback present");
-	const char *second_if = first_if ? strstr(first_if + 4, "if (!") : NULL;
-	CHECK(second_if != NULL, "chained bare orelse: second if-based fallback for chain");
+	// Should produce two comma-operator ternary fallbacks for the chain
+	const char *first_ternary = strstr(result.output, ", (!");
+	CHECK(first_ternary != NULL, "chained bare orelse: first comma-ternary fallback present");
+	const char *second_ternary = first_ternary ? strstr(first_ternary + 4, ", (!") : NULL;
+	CHECK(second_ternary != NULL, "chained bare orelse: second comma-ternary fallback for chain");
 	// The compound literal should survive in the output
 	CHECK(strstr(result.output, "(int[]){42}") != NULL,
 	      "chained bare orelse: compound literal preserved");
-
-	prism_free(&result);
-	unlink(path);
-	free(path);
 }
 
 static void test_decl_orelse_ternary_lifetime(void) {
@@ -1715,6 +1726,82 @@ static void test_decl_orelse_ternary_lifetime(void) {
 	      "decl ternary lifetime: no if-based pattern (would kill literal)");
 	CHECK(strstr(result.output, "(int[]){1, 2, 3}") != NULL,
 	      "decl ternary lifetime: compound literal preserved");
+}
+
+static void test_bare_orelse_compound_literal_no_block_scope(void) {
+	printf("\n--- Bare orelse Compound Literal Not Trapped in Block Scope ---\n");
+
+	// When bare assignment uses orelse with a compound literal,
+	// wrapping in { ... } kills the literal at the closing brace.
+	// The output must NOT scope the compound literal inside an artificial block.
+	const char *code =
+	    "int *get(void);\n"
+	    "void test(void) {\n"
+	    "    int *p;\n"
+	    "    p = get() orelse (int[]){1, 2, 3};\n"
+	    "    *p;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "bare orelse no block: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "bare orelse no block: transpiles OK");
+	CHECK(result.output != NULL, "bare orelse no block: output not NULL");
+
+	// The compound literal must not be scoped inside an artificial { ... } block.
+	// If the output contains "); }" after the compound literal on the same line,
+	// that means the literal is inside an artificial block and dies at the closing brace.
+	const char *compound = strstr(result.output, "(int[]){1, 2, 3}");
+	CHECK(compound != NULL, "bare orelse no block: compound literal present");
+	if (compound) {
+		// Find the end of the line containing the compound literal
+		const char *eol = strchr(compound, '\n');
+		if (!eol) eol = compound + strlen(compound);
+		// If "; }" appears between compound and the newline, the literal
+		// is inside an artificial block scope and will die at the closing brace.
+		bool block_trapped = false;
+		for (const char *s = compound; s < eol - 2; s++) {
+			if (s[0] == ';' && s[1] == ' ' && s[2] == '}') {
+				block_trapped = true;
+				break;
+			}
+		}
+		CHECK(!block_trapped,
+		      "bare orelse no block: compound literal not trapped in artificial { } block");
+	}
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_bare_orelse_void_ternary_mismatch(void) {
+	printf("\n--- Bare orelse Void Ternary ISO Compliance ---\n");
+
+	// The bare orelse comma-operator emits (!p ? (p = fallback) : (void)0).
+	// ISO C (§6.5.15.3): if one ternary branch is void, both must be void.
+	// Without (void) cast on the assignment branch, -Wpedantic errors.
+	const char *code =
+	    "int *get(void);\n"
+	    "void test(void) {\n"
+	    "    int *p;\n"
+	    "    p = get() orelse (int[]){1, 2, 3};\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "void ternary: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "void ternary: transpiles OK");
+	CHECK(result.output != NULL, "void ternary: output not NULL");
+
+	// Both branches of the ternary must be void.
+	// The assignment branch must be cast: (void)(p = (...))
+	CHECK(strstr(result.output, "(void)(") != NULL,
+	      "void ternary: assignment branch cast to (void) for ISO compliance");
 
 	prism_free(&result);
 	unlink(path);
@@ -1827,6 +1914,8 @@ void run_orelse_tests(void) {
 	test_orelse_stmt_expr_fallback_rejected();
 #endif
 	test_orelse_bare_assign_compound_side_effect_rejected();
+	test_orelse_parenthesized_array_size_rejected();
+	test_orelse_parenthesized_typeof_rejected();
 	test_prism_oe_temp_var_namespace_collision();
 	test_const_typedef_breaks_orelse_temp();
 	test_anon_struct_orelse_type_corruption();
@@ -1839,4 +1928,7 @@ void run_orelse_tests(void) {
 	test_bare_orelse_compound_literal_ternary();
 	test_chained_bare_orelse();
 	test_decl_orelse_ternary_lifetime();
+	test_bare_orelse_compound_literal_no_block_scope();
+	test_bare_orelse_void_ternary_mismatch();
 }
+

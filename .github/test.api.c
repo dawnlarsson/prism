@@ -3089,7 +3089,26 @@ static void test_msvc_typeof_vla_no_builtin_memset(void) {
 	prism_free(&r);
 }
 
+static void test_typeof_orelse_leak(void) {
+printf("\n--- Typeof Orelse Bug Tests ---\n");
+const char *code =
+    "void test(int *a, int *b) {\n"
+    "    typeof(a orelse b) x;\n"
+    "    int y[a orelse b];\n"
+    "}\n";
+PrismFeatures feat = prism_defaults();
+PrismResult r = prism_transpile_source(code, "bug_typeof.c", feat);
+
+CHECK_EQ(r.status, PRISM_OK, "bug typeof orelse: transpilation runs without error");
+if (r.output) {
+CHECK(strstr(r.output, "orelse") == NULL,
+      "bug typeof orelse: transpiler must not leak raw orelse into generated C code");
+}
+prism_free(&r);
+}
+
 void run_api_tests(void) {
+test_typeof_orelse_leak();
 	printf("\n=== API TESTS ===\n");
 
 	test_lib_defaults();
