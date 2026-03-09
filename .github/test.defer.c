@@ -1905,8 +1905,54 @@ static void test_fno_defer_shadow_leak(void) {
 	free(path);
 }
 
+static void test_defer_in_comma_expr_bug(void) {
+        check_defer_transpile_rejects(
+            "int main(void) { int x = (defer (void)0, 1); return x; }\n",
+            "defer_in_comma_reject.c",
+            "defer in comma expression rejected",
+            "cannot be at top level"); 
+}
+
+static void test_defer_varname_return_value_dropped(void) {
+	/* BUG: register_decl_shadows only shadows names matching
+	 * is_typedef_heuristic(), so 'int defer = 5;' does not register 'defer'
+	 * as a shadow.  In the return statement, handle_defer_keyword fires,
+	 * consuming 'defer' as the start of a deferred statement and emitting
+	 * 'return ;' — the return value is silently lost. */
+	const char *code =
+	    "int f(void) {\n"
+	    "    int defer = 5;\n"
+	    "    return defer;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_varname_return.c", prism_defaults());
+	/* If the bug is present, output contains 'return ;' */
+	CHECK(r.output == NULL || strstr(r.output, "return ;") == NULL,
+	      "BUG defer-varname: 'return defer;' must not become 'return ;'");
+	prism_free(&r);
+}
+
+static void test_defer_body_bare_orelse_return_not_rejected(void) {
+	/* BUG: validate_defer_statement calls skip_to_semicolon for statements
+	 * that don't start with a keyword (like 'get() orelse return;'), so the
+	 * 'return' inside the bare-orelse action is never seen.
+	 * emit_deferred_range also has no bare-orelse processing.
+	 * Result: 'get() orelse return;' is emitted verbatim into the deferred
+	 * block — it is not valid C and is not rejected by the transpiler. */
+	check_defer_transpile_rejects(
+	    "int *get(void);\n"
+	    "void f(void) {\n"
+	    "    defer {\n"
+	    "        get() orelse return;\n"
+	    "    };\n"
+	    "}\n",
+	    "defer_bare_orelse_return.c",
+	    "BUG defer-bare-orelse: 'return' inside defer via orelse must be rejected",
+	    NULL);
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
+        test_defer_in_comma_expr_bug();
 
 	test_defer_basic();
 	test_defer_lifo();
@@ -2026,4 +2072,7 @@ void run_defer_tests(void) {
 	test_braceless_body_semicolon_trap();
 	test_scope_type_at_depth_overflow();
 	test_fno_defer_shadow_leak();
-        test_defer_void_parens_return_bug();}
+        test_defer_void_parens_return_bug();
+	test_defer_varname_return_value_dropped();
+	test_defer_body_bare_orelse_return_not_rejected();
+}

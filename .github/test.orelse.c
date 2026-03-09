@@ -1817,6 +1817,68 @@ static void test_bare_orelse_void_ternary_mismatch(void) {
 	free(path);
 }
 
+static void test_orelse_in_decl_ternary_garbled(void) {
+	/* BUG: 'orelse' inside a ternary true-branch in a decl initializer
+	 * produces garbled output: scan_decl_orelse has no ternary-depth tracking,
+	 * so it finds the orelse inside 'cond ? val orelse action : other' and
+	 * splits the initializer there.  The ternary colon ends up inside the
+	 * generated 'if (!p) { return -1 : (int *)0; }' — invalid C. */
+	const char *code =
+	    "int *get(void);\n"
+	    "int fn(int c) {\n"
+	    "    int *p = c ? get() orelse return -1 : (int *)0;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "orelse_ternary_decl.c", prism_defaults());
+	int garbled = r.output != NULL && strstr(r.output, " -1 : (int") != NULL;
+	CHECK(!garbled, "BUG orelse-in-ternary: ternary colon must not end up inside if block");
+	prism_free(&r);
+}
+
+static void test_orelse_ident_as_varname(void) {
+	/* BUG: register_decl_shadows only shadows names matching is_typedef_heuristic()
+	 * so a variable named 'orelse' is never shadowed.  Subsequent use of the
+	 * variable in an expression fires is_orelse_keyword() → spurious error. */
+	const char *code =
+	    "int f(void) {\n"
+	    "    int orelse = 5;\n"
+	    "    int x = orelse;\n"
+	    "    return x;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "orelse_varname.c", prism_defaults());
+	CHECK(r.status == PRISM_OK,
+	      "BUG orelse-varname: variable named 'orelse' should transpile without error");
+	prism_free(&r);
+}
+
+static void test_orelse_after_label_sweeps_label_into_cond(void) {
+	/* BUG: find_bare_orelse scans from stmt_start (the label token) without
+	 * stopping at the ':' boundary.  The label gets pulled into the generated
+	 * 'if (!( label:\n expr))' condition — invalid C (labels cannot appear
+	 * inside expressions). */
+	const char *code =
+	    "void *get(void);\n"
+	    "void f(void) {\n"
+	    "    void *p;\n"
+	    "try_again:\n"
+	    "    p = get() orelse goto try_again;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "orelse_label.c", prism_defaults());
+	int label_in_cond = 0;
+	if (r.output) {
+		const char *cond_start = strstr(r.output, "if (!(");
+		if (cond_start) {
+			const char *cond_end = strstr(cond_start, "))");
+			const char *label   = strstr(cond_start, "try_again:");
+			if (label && cond_end && label < cond_end)
+				label_in_cond = 1;
+		}
+	}
+	CHECK(!label_in_cond,
+	      "BUG orelse-after-label: label must not appear inside if(!(...)) condition");
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -1940,5 +2002,9 @@ void run_orelse_tests(void) {
 	test_decl_orelse_ternary_lifetime();
 	test_bare_orelse_compound_literal_no_block_scope();
 	test_bare_orelse_void_ternary_mismatch();
+
+	test_orelse_in_decl_ternary_garbled();
+	test_orelse_ident_as_varname();
+	test_orelse_after_label_sweeps_label_into_cond();
 }
 

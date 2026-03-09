@@ -1107,7 +1107,7 @@ static bool is_var_declaration(Token *type_end) {
 }
 
 static inline bool is_orelse_keyword(Token *tok) {
-	return (tok->tag & TT_ORELSE) && !is_known_typedef(tok) &&
+	return (tok->tag & TT_ORELSE) && !is_known_typedef(tok) && !typedef_lookup(tok) &&
 	       !(last_emitted && (last_emitted->tag & TT_MEMBER));
 }
 
@@ -1918,7 +1918,7 @@ static Token *walk_balanced_orelse(Token *tok) {
 	Token *prev = tok;
 	for (Token *t = tok_next(tok); t && t != end; t = tok_next(t)) {
 		if (t->flags & TF_OPEN) { prev = tok_match(t); t = tok_match(t); continue; }
-		if ((t->tag & TT_ORELSE) && !is_known_typedef(t) &&
+		if ((t->tag & TT_ORELSE) && !is_known_typedef(t) && !typedef_lookup(t) &&
 		    !(prev && (prev->tag & TT_MEMBER))) {
 			orelse_found = t;
 			break;
@@ -2167,7 +2167,8 @@ static void register_param_shadows(Token *open_paren, Token *close_paren) {
 // Register typedef shadows and VLA variables for a declarator
 static inline void register_decl_shadows(Token *var_name, bool effective_vla) {
 	int depth = ctx->block_depth + (in_for_init() ? 1 : 0);
-	if (is_known_typedef(var_name) || is_typedef_heuristic(var_name))
+	if (is_known_typedef(var_name) || is_typedef_heuristic(var_name) ||
+	    (var_name->tag & (TT_DEFER | TT_ORELSE)))
 		typedef_add_shadow(tok_loc(var_name), var_name->len, depth);
 	if (effective_vla && var_name) typedef_add_vla_var(tok_loc(var_name), var_name->len, depth);
 }
@@ -2340,10 +2341,15 @@ static Token *handle_const_orelse_fallback(Token *tok,
 
 static void check_orelse_in_parens(Token *open) {
 	Token *close = tok_match(open);
-	for (Token *pi = open, *t = tok_next(open); t != close; pi = t, t = tok_next(t))
-		if ((t->tag & TT_ORELSE) && !is_known_typedef(t) && !(pi->tag & TT_MEMBER))
+	for (Token *pi = open, *t = tok_next(open); t != close; pi = t, t = tok_next(t)) {
+		if ((t->tag & TT_ORELSE) && !is_known_typedef(t) && !typedef_lookup(t) && !(pi->tag & TT_MEMBER))
 			error_tok(t, "'orelse' cannot be used inside parentheses "
 				  "(it must appear at the top level of a declaration)");
+		if (FEAT(F_DEFER) && (t->tag & TT_DEFER) && !is_known_typedef(t) && !typedef_lookup(t) &&
+		    !match_ch(tok_next(t), ':') && !(pi->tag & (TT_MEMBER | TT_GOTO)) &&
+		    !(is_type_keyword(pi) || (pi->tag & TT_TYPEDEF)) && !(tok_next(t) && (tok_next(t)->tag & TT_ASSIGN)))
+			error_tok(t, "defer cannot be at top level of a parenthesized expression");
+	}
 }
 
 typedef struct {
@@ -2417,6 +2423,7 @@ static OrelseInitInfo scan_decl_orelse(Token *decl_end,
 
 	Token *scan = tok_next(decl_end);
 	Token *prev_scan = NULL;
+	int ternary = 0;
 	while (scan && scan->kind != TK_EOF) {
 		if (scan->flags & TF_OPEN) {
 			check_orelse_in_parens(scan);
@@ -2425,8 +2432,10 @@ static OrelseInitInfo scan_decl_orelse(Token *decl_end,
 			continue;
 		}
 		if (match_ch(scan, ',') || match_ch(scan, ';')) break;
-		if ((scan->tag & TT_ORELSE) && !is_known_typedef(scan) &&
-		    !(prev_scan && (prev_scan->tag & TT_MEMBER))) {
+		if (match_ch(scan, '?')) { ternary++; prev_scan = scan; scan = tok_next(scan); continue; }
+		if (match_ch(scan, ':') && ternary > 0) { ternary--; prev_scan = scan; scan = tok_next(scan); continue; }
+		if ((scan->tag & TT_ORELSE) && !is_known_typedef(scan) && !typedef_lookup(scan) &&
+		    !(prev_scan && (prev_scan->tag & TT_MEMBER)) && ternary == 0) {
 			info.orelse_tok = scan;
 			break;
 		}
@@ -2583,6 +2592,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		// Emit initializer if present
 		if (decl.has_init) {
 			bool hit_orelse = false;
+			int init_ternary = 0;
 			while (tok->kind != TK_EOF) {
 				if (tok->flags & TF_OPEN) {
 					if (FEAT(F_ORELSE)) check_orelse_in_parens(tok);
@@ -2591,10 +2601,14 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 				}
 				if (match_ch(tok, ',') || match_ch(tok, ';'))
 					break;
+				if (match_ch(tok, '?')) { init_ternary++; emit_tok(tok); tok = tok_next(tok); continue; }
+				if (match_ch(tok, ':') && init_ternary > 0) { init_ternary--; emit_tok(tok); tok = tok_next(tok); continue; }
 			// Detect 'orelse' at depth 0 in initializer
 				if (FEAT(F_ORELSE) && (tok->tag & TT_ORELSE) &&
-				    !is_known_typedef(tok) &&
+				    !is_known_typedef(tok) && !typedef_lookup(tok) &&
 				    !(last_emitted && (last_emitted->tag & TT_MEMBER))) {
+					if (init_ternary > 0)
+						error_tok(tok, "'orelse' cannot be used inside a ternary expression");
 					hit_orelse = true;
 					break;
 				}
@@ -2970,6 +2984,25 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch)
 			error_tok(tok, "nested defer is not supported");
 	}
 
+	// Scan for orelse with forbidden control flow before skipping
+	if (FEAT(F_ORELSE)) {
+		for (Token *s = tok; s && s->kind != TK_EOF && !match_ch(s, ';'); s = tok_next(s)) {
+			if (s->flags & TF_OPEN) { s = tok_match(s); continue; }
+			if ((s->tag & TT_ORELSE) && !is_known_typedef(s) && !typedef_lookup(s)) {
+				Token *act = tok_next(s);
+				if (act && (act->tag & TT_RETURN))
+					error_tok(act, "'return' inside defer block bypasses remaining defers");
+				if (act && (act->tag & TT_GOTO) && !is_known_typedef(act))
+					error_tok(act, "'goto' inside defer block could bypass remaining defers");
+				if (act && (act->tag & TT_BREAK) && !in_loop && !in_switch)
+					error_tok(act, "'break' inside defer block bypasses remaining defers");
+				if (act && (act->tag & TT_CONTINUE) && !in_loop)
+					error_tok(act, "'continue' inside defer block bypasses remaining defers");
+				break;
+			}
+		}
+	}
+
 	Token *semi = skip_to_semicolon(tok);
 	return (semi && semi->kind != TK_EOF) ? tok_next(semi) : semi;
 }
@@ -2981,7 +3014,8 @@ static Token *handle_defer_keyword(Token *tok) {
 	// Distinguish struct field, label, goto target, variable assignment, attribute usage
 	if (match_ch(tok_next(tok), ':') || (last_emitted && (last_emitted->tag & (TT_MEMBER | TT_GOTO))) ||
 	    (last_emitted && (is_type_keyword(last_emitted) || (last_emitted->tag & TT_TYPEDEF))) ||
-	    is_known_typedef(tok) || (tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN)) || in_struct_body() ||
+	    is_known_typedef(tok) || typedef_lookup(tok) ||
+	    (tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN)) || in_struct_body() ||
 	    is_inside_attribute(tok))
 		return NULL;
 
@@ -3865,12 +3899,15 @@ static inline void track_common_token_state(Token *tok, ToplevelState *state) {
 // Scan ahead for 'orelse' at depth 0 in a bare expression
 static Token *find_bare_orelse(Token *tok) {
 	Token *prev = NULL;
+	int ternary = 0;
 	for (Token *s = tok; s->kind != TK_EOF; s = tok_next(s)) {
 		if (s->flags & TF_OPEN) { prev = tok_match(s); s = tok_match(s); continue; }
 		if (s->flags & TF_CLOSE) return NULL;
 		if (match_ch(s, ';')) return NULL;
-		if ((s->tag & TT_ORELSE) && !is_known_typedef(s) &&
-		    !(prev && (prev->tag & TT_MEMBER)))
+		if (match_ch(s, '?')) { ternary++; prev = s; continue; }
+		if (match_ch(s, ':') && ternary > 0) { ternary--; prev = s; continue; }
+		if ((s->tag & TT_ORELSE) && !is_known_typedef(s) && !typedef_lookup(s) &&
+		    !(prev && (prev->tag & TT_MEMBER)) && ternary == 0)
 			return s;
 		prev = s;
 	}
@@ -3962,11 +3999,24 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			if (FEAT(F_ORELSE) && ctx->block_depth > 0 && !in_struct_body() &&
 			    !(tok->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO |
 					  TT_CASE | TT_DEFAULT | TT_IF | TT_LOOP | TT_SWITCH))) {
-				Token *orelse_tok = find_bare_orelse(tok);
+				// Skip past label if current token is ident followed by ':'
+				Token *orelse_scan_start = tok;
+				Token *label_end = NULL;
+				if (is_identifier_like(tok) && tok_next(tok) && match_ch(tok_next(tok), ':')) {
+					label_end = tok_next(tok_next(tok));
+					orelse_scan_start = label_end;
+				}
+				Token *orelse_tok = find_bare_orelse(orelse_scan_start);
 				if (orelse_tok) {
 					reject_orelse_in_for_init(tok);
 					if (is_orelse_keyword(tok))
 						error_tok(tok, "expected expression before 'orelse'");
+					// Emit label before orelse processing
+					if (label_end) {
+						emit_tok(tok);       // label ident
+						emit_tok(tok_next(tok)); // ':'
+						tok = label_end;
+					}
 
 					// Find assignment target for re-emit in fallback
 					Token *bare_lhs_start = tok;
