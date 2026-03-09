@@ -1497,9 +1497,9 @@ void test_const_typeof_vla_bug(void) {
 	    "const_typeof_vla.c", prism_defaults());
 	CHECK_EQ(transpile_result.status, PRISM_OK, "const typeof VLA transpiles");
 	if (transpile_result.output) {
-		CHECK(strstr(transpile_result.output, "int vla[n]; memset(&vla, 0, sizeof(vla));") != NULL,
+		CHECK(strstr(transpile_result.output, "int vla[n]; __builtin_memset(&vla, 0, sizeof(vla));") != NULL,
 		      "const typeof VLA: VLA source gets memset");
-		CHECK(strstr(transpile_result.output, "const typeof(vla) val; memset((void *)&val, 0, sizeof(val));") != NULL,
+		CHECK(strstr(transpile_result.output, "const typeof(vla) val; __builtin_memset((void *)&val, 0, sizeof(val));") != NULL,
 		      "const typeof VLA: const array gets casted memset");
 		CHECK(strstr(transpile_result.output, "val = {0}") == NULL,
 		      "const typeof VLA: no illegal brace init emitted");
@@ -1523,9 +1523,9 @@ void test_const_typeof_atomic_struct_bug(void) {
 	    "const_typeof_atomic_struct.c", prism_defaults());
 	CHECK_EQ(transpile_result.status, PRISM_OK, "const typeof _Atomic struct transpiles");
 	if (transpile_result.output) {
-		CHECK(strstr(transpile_result.output, "_Atomic struct S2_bug { int x, y; } s1; memset(&s1, 0, sizeof(s1));") != NULL,
+		CHECK(strstr(transpile_result.output, "_Atomic struct S2_bug { int x, y; } s1; __builtin_memset(&s1, 0, sizeof(s1));") != NULL,
 		      "const typeof _Atomic struct: source object gets memset");
-		CHECK(strstr(transpile_result.output, "const typeof(s1) s2; memset((void *)&s2, 0, sizeof(s2));") != NULL,
+		CHECK(strstr(transpile_result.output, "const typeof(s1) s2; __builtin_memset((void *)&s2, 0, sizeof(s2));") != NULL,
 		      "const typeof _Atomic struct: const copy gets casted memset");
 		CHECK(strstr(transpile_result.output, "s2 = {0}") == NULL,
 		      "const typeof _Atomic struct: no bogus brace init emitted");
@@ -1547,7 +1547,7 @@ static void test_typeof_memset_split_before_initializer(void) {
 	CHECK_EQ(transpile_result.status, PRISM_OK, "typeof memset split: transpiles");
 	if (transpile_result.output) {
 		CHECK(strstr(transpile_result.output,
-			     "typeof((struct S){1}) a; memset(&a, 0, sizeof(a));") != NULL,
+			     "typeof((struct S){1}) a; __builtin_memset(&a, 0, sizeof(a));") != NULL,
 		      "typeof memset split: first declarator split and zeroed eagerly");
 		CHECK(strstr(transpile_result.output, "typeof((struct S){1}) b = a;") != NULL,
 		      "typeof memset split: preserved compound literal type for later declarator");

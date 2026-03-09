@@ -990,6 +990,63 @@ static void test_raw_prep_dir_pragma(void) {
 	free(path);
 }
 
+static void test_raw_multi_decl_array_aggregate(void) {
+	printf("\n--- raw Multi-Decl Array/Struct Uses = {0} ---\n");
+
+	const char *code =
+	    "void test(void) {\n"
+	    "    const raw int x, y[5];\n"
+	    "    volatile raw int a, b[3];\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "raw array aggregate: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "raw array aggregate: transpiles OK");
+	CHECK(result.output != NULL, "raw array aggregate: output not NULL");
+
+	// Arrays must get = {0}, not = 0 (which is invalid C for arrays)
+	CHECK(strstr(result.output, "y[5] = {0}") != NULL,
+	      "raw array aggregate: y[5] = {0} (not = 0)");
+	CHECK(strstr(result.output, "b[3] = {0}") != NULL,
+	      "raw array aggregate: b[3] = {0} (not = 0)");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_raw_multi_decl_vla_memset(void) {
+	printf("\n--- raw Multi-Decl VLA Uses memset ---\n");
+
+	const char *code =
+	    "void test(int n) {\n"
+	    "    const raw int x, vla[n];\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "raw vla memset: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "raw vla memset: transpiles OK");
+	CHECK(result.output != NULL, "raw vla memset: output not NULL");
+
+	// VLAs cannot be initialized with = {0}; they must get memset.
+	CHECK(strstr(result.output, "vla[n] = {0}") == NULL,
+	      "raw vla memset: no = {0} on VLA (constraint violation)");
+	CHECK(strstr(result.output, "vla[n] = 0") == NULL,
+	      "raw vla memset: no = 0 on VLA");
+	CHECK(strstr(result.output, "memset") != NULL,
+	      "raw vla memset: uses memset for VLA zero-init");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
 void run_raw_tests(void) {
 	printf("\n=== RAW KEYWORD TESTS ===\n");
 
@@ -1083,4 +1140,6 @@ void run_raw_tests(void) {
 	test_raw_static_multi_decl_consistency();
 	test_raw_extern_no_initializer();
 	test_raw_prep_dir_pragma();
+	test_raw_multi_decl_array_aggregate();
+	test_raw_multi_decl_vla_memset();
 }

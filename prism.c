@@ -230,6 +230,8 @@ static bool typedef_contains_vla(Token *);
 
 extern char **environ;
 static char **cached_clean_env = NULL;
+static volatile sig_atomic_t signal_temp_registered = 0;
+static char signal_temp_path[PATH_MAX];
 
 static char **system_include_list; // Ordered list of includes
 static int system_include_capacity = 0;
@@ -1385,7 +1387,8 @@ static void emit_ret_type(void) {
 		}
 	} else {
 		if (cc_is_msvc(ctx->extra_compiler))
-			OUT_LIT("void *");
+			error("defer in function with unresolvable return type is not "
+			      "supported for MSVC; use a named struct or typedef");
 		else
 			OUT_LIT("__auto_type");
 	}
@@ -1965,20 +1968,10 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 }
 
 // Emit first declarator raw, then zero-init subsequent uninitialised declarators.
-static Token *emit_raw_first_then_zeroinit_rest(Token *tok, bool file_storage) {
-	while (tok && tok->kind != TK_EOF && !match_ch(tok, ',') && !match_ch(tok, ';')) {
+static Token *emit_raw_verbatim_to_semicolon(Token *tok) {
+	while (tok && tok->kind != TK_EOF && !match_ch(tok, ';')) {
 		if (tok->flags & TF_OPEN) tok = walk_balanced(tok, true);
 		else { emit_tok(tok); tok = tok_next(tok); }
-	}
-	while (tok && match_ch(tok, ',')) {
-		emit_tok(tok); tok = tok_next(tok);
-		bool has_init = false;
-		while (tok && tok->kind != TK_EOF && !match_ch(tok, ',') && !match_ch(tok, ';')) {
-			if (match_ch(tok, '=')) has_init = true;
-			if (tok->flags & TF_OPEN) tok = walk_balanced(tok, true);
-			else { emit_tok(tok); tok = tok_next(tok); }
-		}
-		if (!has_init && !file_storage) OUT_LIT(" = 0");
 	}
 	if (tok && match_ch(tok, ';')) { emit_tok(tok); tok = tok_next(tok); }
 	return tok;
@@ -1988,9 +1981,10 @@ static Token *emit_raw_first_then_zeroinit_rest(Token *tok, bool file_storage) {
 static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool has_const) {
 	const char *vol = has_volatile ? "volatile " : "";
 	int vol_len = has_volatile ? 9 : 0;
+	bool use_loop = has_volatile || cc_is_msvc(ctx->extra_compiler);
 	for (int i = 0; i < count; i++) {
-		// memset for non-volatile; byte loop for volatile (memset drops volatile).
-		if (has_volatile) {
+		// Byte loop for volatile (memset drops volatile) and MSVC (no __builtin_memset).
+		if (use_loop) {
 			OUT_LIT(" { ");
 			out_str(vol, vol_len);
 			OUT_LIT("char *_Prism_p_");
@@ -2002,7 +1996,7 @@ static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool
 			else
 				OUT_LIT("char *)&");
 			out_str(tok_loc(vars[i]), vars[i]->len);
-			OUT_LIT("; for (unsigned long _Prism_i_");
+			OUT_LIT("; for (unsigned long long _Prism_i_");
 			out_uint(ctx->ret_counter);
 			OUT_LIT(" = 0; _Prism_i_");
 			out_uint(ctx->ret_counter);
@@ -2018,9 +2012,9 @@ static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool
 			ctx->ret_counter++;
 		} else {
 			if (has_const)
-				OUT_LIT(" memset((void *)&");
+				OUT_LIT(" __builtin_memset((void *)&");
 			else
-				OUT_LIT(" memset(&");
+				OUT_LIT(" __builtin_memset(&");
 			out_str(tok_loc(vars[i]), vars[i]->len);
 			OUT_LIT(", 0, sizeof(");
 			out_str(tok_loc(vars[i]), vars[i]->len);
@@ -2114,6 +2108,7 @@ static Token *handle_const_orelse_fallback(Token *tok,
 					   DeclResult *decl,
 					   Token *type_start,
 					   TypeSpecResult *type,
+					   Token *pragma_start,
 					   Token *stop_comma) {
 	unsigned oe_id = ctx->ret_counter++;
 
@@ -2139,6 +2134,8 @@ static Token *handle_const_orelse_fallback(Token *tok,
 			if (is_array_typedef(t)) { const_td_is_array = true; break; }
 		}
 
+		if (pragma_start != type_start)
+			emit_range(pragma_start, type_start);
 		if (const_td_is_ptr) {
 			OUT_LIT(" __typeof__(&*(");
 			emit_type_stripped(type_start, type->end, strip_type_const);
@@ -2155,6 +2152,8 @@ static Token *handle_const_orelse_fallback(Token *tok,
 			OUT_LIT(")0 + 0)");
 		}
 	} else {
+		if (pragma_start != type_start)
+			emit_range(pragma_start, type_start);
 		emit_type_stripped(type_start, type->end, strip_type_const);
 	}
 	// Emit declarator prefix, stripping const for mutability.
@@ -2222,6 +2221,8 @@ static Token *handle_const_orelse_fallback(Token *tok,
 	}
 
 	// Emit final const declaration: "const T declarator = _Prism_oe_N;"
+	if (pragma_start != type_start)
+		emit_range(pragma_start, type_start);
 	emit_range(type_start, type->end);
 	parse_declarator(decl_start, true);
 
@@ -2260,7 +2261,7 @@ static bool has_effective_const_qual(Token *type_start, TypeSpecResult *type, De
 }
 
 static inline void reject_orelse_array_target(DeclResult *decl) {
-	if (decl->is_array && !decl->is_pointer)
+	if (decl->is_array && !decl->paren_pointer)
 		error_tok(decl->var_name,
 			  "orelse on array variable '%.*s' will never trigger "
 			  "(array address is never NULL); remove the orelse clause",
@@ -2366,8 +2367,15 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 		// Deferred type emission from orelse comma continuation
 		if (need_type_emit) {
-			if (!is_const_orelse_fallback)
+			if (!is_const_orelse_fallback) {
+				if (pragma_start != type_start) {
+					if (raw_tok)
+						emit_range(pragma_start, raw_tok);
+					else
+						emit_range(pragma_start, type_start);
+				}
 				emit_type_stripped(type_start, type->end, false);
+			}
 			need_type_emit = false;
 		}
 
@@ -2416,6 +2424,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 							   &decl,
 							   type_start,
 							   type,
+							   pragma_start,
 							   target.stop_comma);
 
 			flush_typeof_memsets(typeof_vars, &typeof_var_count, type);
@@ -2642,8 +2651,14 @@ static Token *try_zero_init_decl(Token *tok) {
 		if (probe && (probe->flags & TF_RAW) && !is_known_typedef(probe)) {
 			Token *after_raw = skip_noise(tok_next(probe));
 			if (is_raw_declaration_context(after_raw)) {
-				emit_range(pragma_start, probe);
-				return emit_raw_first_then_zeroinit_rest(after_raw, has_storage_in(pragma_start, probe));
+				if (has_storage_in(pragma_start, probe)) {
+					emit_range(pragma_start, probe);
+					return emit_raw_verbatim_to_semicolon(after_raw);
+				}
+				is_raw = true;
+				raw_tok = probe;
+				start = after_raw;
+				tok = after_raw;
 			}
 		}
 	}
@@ -2651,10 +2666,9 @@ static Token *try_zero_init_decl(Token *tok) {
 	if (tok->tag & TT_SKIP_DECL) // Storage class specifiers, control flow, etc.
 	{
 		if (is_raw) {
-			bool has_file_storage = has_storage_in(pragma_start, start);
-			if (!has_file_storage && tok && (tok->tag & TT_STORAGE))
-				has_file_storage = true;
-			return emit_raw_first_then_zeroinit_rest(start, has_file_storage);
+			// File-storage raw (static/extern/thread_local): emit verbatim.
+			// No zero-init needed — C guarantees zero-init for file/static storage.
+			return emit_raw_verbatim_to_semicolon(start);
 		}
 		return NULL;
 	}
@@ -2878,6 +2892,21 @@ static Token *handle_defer_keyword(Token *tok) {
 	Token *defer_keyword = tok;
 	tok = tok_next(tok);
 	Token *stmt_start = tok;
+
+	// Block defer: defer { ... } with optional trailing semicolon
+	if (match_ch(stmt_start, '{') && tok_match(stmt_start)) {
+		Token *close = tok_match(stmt_start);
+		Token *after = tok_next(close);
+		Token *stmt_end = after;  // exclusive boundary — emits up to but not including
+		validate_defer_statement(stmt_start, false, false);
+		defer_add(defer_keyword, stmt_start, stmt_end);
+		tok = after;
+		// Consume optional trailing semicolon
+		if (tok && match_ch(tok, ';')) tok = tok_next(tok);
+		end_statement_after_semicolon();
+		return tok;
+	}
+
 	Token *stmt_end = skip_to_semicolon(tok);
 
 	if (stmt_end->kind == TK_EOF || !match_ch(stmt_end, ';'))
@@ -2987,11 +3016,13 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
 
 	if (!var_name) error_tok(tok, "orelse fallback requires an assignment target (use a declaration)");
 	if (has_const) error_tok(tok, "orelse fallback cannot reassign a const-qualified variable");
-	OUT_LIT(" if (!");
+	out_char(' ');
 	out_str(tok_loc(var_name), var_name->len);
-	OUT_LIT(") ");
+	OUT_LIT(" = ");
 	out_str(tok_loc(var_name), var_name->len);
-	OUT_LIT(" =");
+	OUT_LIT(" ? ");
+	out_str(tok_loc(var_name), var_name->len);
+	OUT_LIT(" :");
 	while (tok->kind != TK_EOF) {
 		if (tok->flags & TF_OPEN) {
 			if (match_ch(tok, '(') && tok_next(tok) && match_ch(tok_next(tok), '{'))
@@ -3374,20 +3405,69 @@ static const char **alloc_argv(int count) {
 	return args;
 }
 
+// Extract the first whitespace-delimited token from a CC string.
+// e.g. "ccache gcc" -> "ccache", "gcc -m32" -> "gcc"
+static const char *cc_executable(const char *cc) {
+	if (!cc || !*cc) return cc;
+	const char *p = cc;
+	while (*p && *p != ' ' && *p != '\t') p++;
+	if (*p == '\0') return cc;
+	size_t len = (size_t)(p - cc);
+	static char buf[PATH_MAX];
+	if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+	memcpy(buf, cc, len);
+	buf[len] = '\0';
+	return buf;
+}
+
+// Split a CC string like "gcc -m32" or "ccache clang" into argv tokens.
+// Inserts all tokens into args[*argc] and advances *argc.
+static void cc_split_into_argv(const char **args, int *argc, const char *cc, char **out_dup) {
+	if (out_dup) *out_dup = NULL;
+	if (!cc || !*cc) return;
+	char *dup = strdup(cc);
+	if (!dup) { args[(*argc)++] = cc; return; }
+	char *p = dup;
+	while (*p) {
+		while (*p == ' ' || *p == '\t') p++;
+		if (!*p) break;
+		char *start = p;
+		while (*p && *p != ' ' && *p != '\t') p++;
+		if (*p) *p++ = '\0';
+		args[(*argc)++] = start;
+	}
+	if (out_dup) *out_dup = dup;
+}
+
+// Count extra tokens in a CC string (tokens beyond the first).
+static int cc_extra_arg_count(const char *cc) {
+	if (!cc || !*cc) return 0;
+	int count = 0;
+	const char *p = cc;
+	while (*p == ' ' || *p == '\t') p++;
+	while (*p && *p != ' ' && *p != '\t') p++;
+	while (*p) {
+		while (*p == ' ' || *p == '\t') p++;
+		if (!*p) break;
+		count++;
+		while (*p && *p != ' ' && *p != '\t') p++;
+	}
+	return count;
+}
+
 #ifndef _WIN32
 static bool cc_is_msvc(const char *cc) {
 	if (!cc || !*cc) return false;
-	const char *base = cc;
-	for (const char *p = cc; *p; p++)
-		if (*p == '/' || *p == '\\') base = p + 1;
+	const char *exe = cc_executable(cc);
+	const char *base = path_basename(exe);
 	return (strcasecmp(base, "cl") == 0 || strcasecmp(base, "cl.exe") == 0);
 }
 #endif
 
 // Build preprocessor argv (shared between pipe and file paths)
-static void build_pp_argv(const char **args, int *argc, const char *input_file) {
+static void build_pp_argv(const char **args, int *argc, const char *input_file, char **out_cc_dup) {
 	const char *cc = ctx->extra_compiler ? ctx->extra_compiler : PRISM_DEFAULT_CC;
-	args[(*argc)++] = cc;
+	cc_split_into_argv(args, argc, cc, out_cc_dup);
 	args[(*argc)++] = "-E";
 	args[(*argc)++] = "-w";
 
@@ -3443,23 +3523,26 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file) 
 
 // Run system preprocessor (cc -E) via pipe, returns malloc'd output or NULL
 static char *preprocess_with_cc(const char *input_file) {
-	int argcap = 16 + ctx->extra_compiler_flags_count + ctx->extra_include_count * 2 +
+	const char *pp_cc = ctx->extra_compiler ? ctx->extra_compiler : PRISM_DEFAULT_CC;
+	int argcap = 16 + cc_extra_arg_count(pp_cc) + ctx->extra_compiler_flags_count + ctx->extra_include_count * 2 +
 		     ctx->extra_define_count * 2 + ctx->extra_force_include_count * 2;
 	const char **args = alloc_argv(argcap);
 	int argc = 0;
-	build_pp_argv(args, &argc, input_file);
+	char *cc_dup = NULL;
+	build_pp_argv(args, &argc, input_file, &cc_dup);
 	char **argv = (char **)args;
 
 	// Set up pipe: child writes preprocessed output, we read it
 	int pipefd[2];
 	if (pipe(pipefd) == -1) {
 		perror("pipe");
+		free(cc_dup);
 		free((void *)args);
 		return NULL;
 	}
 
 	// Capture preprocessor stderr to a temp file for diagnostics on failure
-	char pp_stderr_path[256] = "";
+	char pp_stderr_path[PATH_MAX] = "";
 	{
 		const char *tmpdir = getenv(TMPDIR_ENVVAR);
 #ifdef TMPDIR_ENVVAR_ALT
@@ -3490,6 +3573,7 @@ static char *preprocess_with_cc(const char *input_file) {
 		fprintf(stderr, "posix_spawnp: %s\n", strerror(err));
 		if (pp_stderr_path[0]) unlink(pp_stderr_path);
 		close(pipefd[0]);
+		free(cc_dup);
 		free((void *)args);
 		return NULL;
 	}
@@ -3500,6 +3584,7 @@ static char *preprocess_with_cc(const char *input_file) {
 	if (!buf) {
 		close(pipefd[0]);
 		waitpid(pid, NULL, 0);
+		free(cc_dup);
 		free((void *)args);
 		return NULL;
 	}
@@ -3514,6 +3599,7 @@ static char *preprocess_with_cc(const char *input_file) {
 				free(buf);
 				close(pipefd[0]);
 				waitpid(pid, NULL, 0);
+				free(cc_dup);
 				free((void *)args);
 				return NULL;
 			}
@@ -3523,11 +3609,23 @@ static char *preprocess_with_cc(const char *input_file) {
 	close(pipefd[0]);
 	buf[len] = '\0';
 
-	// Right-size buffer to reduce heap fragmentation
-	if (len + 1 < cap) {
-		char *fitted = realloc(buf, len + 1);
+	// Detect null bytes in preprocessor output (would silently truncate tokenization)
+	if (strlen(buf) < len) {
+		fprintf(stderr, "error: preprocessor output contains null bytes\n");
+		free(buf);
+		if (pp_stderr_path[0]) unlink(pp_stderr_path);
+		waitpid(pid, NULL, 0);
+		free(cc_dup);
+		free((void *)args);
+		return NULL;
+	}
+
+	// Right-size buffer with 8-byte padding for SWAR comment scanning
+	if (len + 8 < cap) {
+		char *fitted = realloc(buf, len + 8);
 		if (fitted) buf = fitted;
 	}
+	memset(buf + len, 0, 8);
 
 	int status;
 	waitpid(pid, &status, 0);
@@ -3543,10 +3641,12 @@ static char *preprocess_with_cc(const char *input_file) {
 			unlink(pp_stderr_path);
 		}
 		free(buf);
+		free(cc_dup);
 		free((void *)args);
 		return NULL;
 	}
 	if (pp_stderr_path[0]) unlink(pp_stderr_path);
+	free(cc_dup);
 	free((void *)args);
 
 	return buf;
@@ -3798,33 +3898,31 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					}
 
 					if (is_bare_fallback) {
-						// Use ternary to preserve compound literal lifetime (C99 §6.5.2.5)
-						// Emit: LHS = (LHS = val) ? LHS : (fallback);
+						// Emit: LHS = val; if (!LHS) LHS = (fallback);
 						out_char(' ');
-						emit_range(bare_lhs_start, bare_assign_eq);
-						OUT_LIT(" = (");
 						for (Token *t = bare_lhs_start; t != orelse_tok; t = tok_next(t)) {
 							if (t->kind == TK_PREP_DIR) continue;
 							emit_tok(t);
 						}
-						OUT_LIT(") ?");
+						out_char(';');
+						OUT_LIT(" if (!");
 						emit_range(bare_lhs_start, bare_assign_eq);
-						OUT_LIT(" : (");
+						OUT_LIT(") ");
+						emit_range(bare_lhs_start, bare_assign_eq);
+						OUT_LIT(" = (");
 						tok = tok_next(orelse_tok); // skip 'orelse'
 						int fd = 0;
 						while (tok->kind != TK_EOF) {
 							if (tok->flags & TF_OPEN) fd++;
 							else if (tok->flags & TF_CLOSE) fd--;
 							else if (fd == 0 && (match_ch(tok, ';') || match_ch(tok, ','))) break;
-							// Chained orelse: close current ternary, start new one
+							// Chained orelse
 							if (fd == 0 && is_orelse_keyword(tok)) {
-								OUT_LIT(");");
+								OUT_LIT("); if (!");
 								emit_range(bare_lhs_start, bare_assign_eq);
-								OUT_LIT(" =");
+								OUT_LIT(") ");
 								emit_range(bare_lhs_start, bare_assign_eq);
-								OUT_LIT(" ?");
-								emit_range(bare_lhs_start, bare_assign_eq);
-								OUT_LIT(" : (");
+								OUT_LIT(" = (");
 								tok = tok_next(tok); // skip 'orelse'
 								continue;
 							}
@@ -4271,12 +4369,15 @@ PRISM_API PrismResult prism_transpile_source(const char *source, const char *fil
 
 	Token *tok;
 	char *buf;
-	buf = strdup(source);
+	size_t src_len = strlen(source);
+	buf = malloc(src_len + 8);
 	if (!buf) {
 		result.status = PRISM_ERR_IO;
 		result.error_msg = strdup("Out of memory");
 		goto src_cleanup;
 	}
+	memcpy(buf, source, src_len);
+	memset(buf + src_len, 0, 8);
 
 	tok = tokenize_buffer((char *)fname, buf);
 	if (!tok) {
@@ -4533,7 +4634,8 @@ use_sudo:;
 
 static bool is_prism_cc(const char *cc) {
 	if (!cc || !*cc) return false;
-	const char *base = path_basename(cc);
+	const char *exe = cc_executable(cc);
+	const char *base = path_basename(exe);
 	if (strncmp(base, "prism", 5) == 0) {
 		char next = base[5];
 		if (next == '\0' || next == ' ' || next == '.') return true;
@@ -4543,10 +4645,11 @@ static bool is_prism_cc(const char *cc) {
 
 static const char *get_real_cc(const char *cc) {
 	if (!cc || !*cc || is_prism_cc(cc)) return PRISM_DEFAULT_CC;
-	if (!strpbrk(cc, "/\\")) return cc;
+	const char *exe = cc_executable(cc);
+	if (!strpbrk(exe, "/\\")) return cc;
 
 	char cc_real[PATH_MAX], self_real[PATH_MAX];
-	if (get_self_exe_path(self_real, sizeof(self_real)) && realpath(cc, cc_real))
+	if (get_self_exe_path(self_real, sizeof(self_real)) && realpath(exe, cc_real))
 		if (strcmp(cc_real, self_real) == 0) return PRISM_DEFAULT_CC;
 
 	return cc;
@@ -4573,7 +4676,8 @@ static bool cc_is_clang(const char *cc) {
 	if (!cc || !*cc || strcmp(cc, "cc") == 0 || strcmp(cc, "gcc") == 0) return true;
 #endif
 	if (!cc || !*cc) return false;
-	const char *base = path_basename(cc);
+	const char *exe = cc_executable(cc);
+	const char *base = path_basename(exe);
 	return strncmp(base, "clang", 5) == 0;
 }
 
@@ -4774,10 +4878,11 @@ static void make_run_temp(char *buf, size_t size, CliMode mode) {
 
 static int passthrough_cc(const Cli *cli) {
 	const char *compiler = get_real_cc(cli->cc);
+	int cc_extra = cc_extra_arg_count(compiler);
 	bool msvc = cc_is_msvc(compiler);
-	const char **args = alloc_argv(cli->cc_arg_count + 8);
+	const char **args = alloc_argv(cli->cc_arg_count + cc_extra + 8);
 	int argc = 0;
-	args[argc++] = compiler;
+	cc_split_into_argv(args, &argc, compiler, NULL);
 	for (int i = 0; i < cli->cc_arg_count; i++) args[argc++] = cli->cc_args[i];
 	argv_add_output(args, &argc, cli->output, msvc, false);
 	args[argc] = NULL;
@@ -4797,9 +4902,10 @@ static void cleanup_temp_range(char **temps, int count) {
 
 static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count,
 					 const TempCompilePlan *plan) {
-	const char **args = alloc_argv(temp_count + cli->cc_arg_count + 24);
+	int cc_extra = cc_extra_arg_count(plan->compiler);
+	const char **args = alloc_argv(temp_count + cli->cc_arg_count + cc_extra + 24);
 	int argc = 0;
-	args[argc++] = plan->compiler;
+	cc_split_into_argv(args, &argc, plan->compiler, NULL);
 	if (plan->optimize) args[argc++] = plan->msvc ? "/O2" : "-O2";
 	if (plan->use_preprocessed) args[argc++] = "-fpreprocessed";
 	for (int i = 0; i < temp_count; i++) args[argc++] = temps[i];
@@ -4840,6 +4946,7 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 				fprintf(stderr, "%s:%d:%d: error: %s\n", cli->sources[i],
 					result.error_line, result.error_col,
 					result.error_msg ? result.error_msg : "transpilation failed");
+				prism_free(&result);
 				cleanup_temp_range(temps, i + 1);
 				return NULL;
 			}
@@ -4892,17 +4999,23 @@ static int install_from_source(Cli *cli) {
 static int compile_sources(Cli *cli) {
 	int status = 0;
 	const char *compiler = get_real_cc(cli->cc);
+	int cc_extra = cc_extra_arg_count(compiler);
 	bool clang = cc_is_clang(compiler);
 	bool msvc = cc_is_msvc(compiler);
 	char temp_exe[PATH_MAX];
 	make_run_temp(temp_exe, sizeof(temp_exe), cli->mode);
 
+	if (temp_exe[0]) {
+		memcpy(signal_temp_path, temp_exe, sizeof(signal_temp_path));
+		signal_temp_registered = 1;
+	}
+
 	use_linemarkers = FEAT(F_FLATTEN) && !clang && !msvc;
 
 	if (cli->source_count == 1 && !msvc) {
-		const char **args = alloc_argv(cli->cc_arg_count + 20);
+		const char **args = alloc_argv(cli->cc_arg_count + cc_extra + 20);
 		int argc = 0;
-		args[argc++] = compiler;
+		cc_split_into_argv(args, &argc, compiler, NULL);
 		args[argc++] = "-x";
 		args[argc++] = "c";
 		if (FEAT(F_FLATTEN) && !clang) args[argc++] = "-fpreprocessed";
@@ -4938,6 +5051,7 @@ static int compile_sources(Cli *cli) {
 
 	if (status != 0) {
 		if (temp_exe[0]) remove(temp_exe);
+		signal_temp_registered = 0;
 		return status;
 	}
 
@@ -4948,12 +5062,22 @@ static int compile_sources(Cli *cli) {
 		remove(temp_exe);
 	}
 
+	signal_temp_registered = 0;
 	return status;
+}
+
+static void signal_cleanup_handler(int sig) {
+	if (signal_temp_registered && signal_temp_path[0])
+		unlink(signal_temp_path);
+	signal(sig, SIG_DFL);
+	raise(sig);
 }
 
 int main(int argc, char **argv) {
 #ifndef _WIN32
 	signal(SIGPIPE, SIG_IGN);
+	signal(SIGINT, signal_cleanup_handler);
+	signal(SIGTERM, signal_cleanup_handler);
 #endif
 	int status = 0;
 	prism_ctx_init();

@@ -1633,25 +1633,26 @@ Token *tokenize_file(char *path) {
 	if (file_size == INVALID_FILE_SIZE || file_size == 0) {
 		CloseHandle(hFile);
 		if (file_size == 0) {
-			char *buf = malloc(1);
+			char *buf = malloc(8);
 			if (!buf) return NULL;
-			buf[0] = '\0';
+			memset(buf, 0, 8);
 			File *file = new_file(path, ctx->input_file_count, buf);
 			add_input_file(file);
 			return tokenize(file);
 		}
 		return NULL;
 	}
-	HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_WRITECOPY, 0, file_size + 1, NULL);
-	if (!hMap) { CloseHandle(hFile); return NULL; }
-	char *buf = MapViewOfFile(hMap, FILE_MAP_COPY, 0, 0, file_size + 1);
-	CloseHandle(hMap);
+	char *buf = malloc((size_t)file_size + 8);
+	if (!buf) { CloseHandle(hFile); return NULL; }
+	DWORD bytes_read = 0;
+	if (!ReadFile(hFile, buf, file_size, &bytes_read, NULL) || bytes_read != file_size) {
+		free(buf);
+		CloseHandle(hFile);
+		return NULL;
+	}
 	CloseHandle(hFile);
-	if (!buf) return NULL;
-	buf[file_size] = '\0';
+	memset(buf + file_size, 0, 8);
 	File *file = new_file(path, ctx->input_file_count, buf);
-	file->mmap_size = file_size + 1;
-	file->owns_contents = false;
 	add_input_file(file);
 	return tokenize(file);
 #else
@@ -1665,21 +1666,25 @@ Token *tokenize_file(char *path) {
 	size_t size = (size_t)st.st_size;
 	if (size == 0) {
 		close(fd);
-		char *buf = malloc(1);
+		char *buf = malloc(8);
 		if (!buf) return NULL;
-		buf[0] = '\0';
+		memset(buf, 0, 8);
 		File *file = new_file(path, ctx->input_file_count, buf);
 		add_input_file(file);
 		return tokenize(file);
 	}
-	// MAP_PRIVATE gives copy-on-write (tokenizer patches digraphs in-place)
-	char *buf = mmap(NULL, size + 1, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+	// malloc + read with 8-byte padding for safe SWAR comment scanning
+	char *buf = malloc(size + 8);
+	if (!buf) { close(fd); return NULL; }
+	size_t total = 0;
+	while (total < size) {
+		ssize_t n = read(fd, buf + total, size - total);
+		if (n <= 0) { free(buf); close(fd); return NULL; }
+		total += (size_t)n;
+	}
 	close(fd);
-	if (buf == MAP_FAILED) return NULL;
-	buf[size] = '\0';
+	memset(buf + size, 0, 8);
 	File *file = new_file(path, ctx->input_file_count, buf);
-	file->mmap_size = size + 1;
-	file->owns_contents = false;
 	add_input_file(file);
 	return tokenize(file);
 #endif

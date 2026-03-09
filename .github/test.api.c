@@ -164,6 +164,163 @@ static void test_sequential_transpilations(void) {
 	}
 }
 
+static void test_swar_comment_buffer_safety(void) {
+	printf("\n--- SWAR Comment Buffer Safety ---\n");
+
+	/* Source ending in a line comment with no trailing newline */
+	const char *code_line = "int x = 1; // comment";
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code_line, "swar_line.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "swar line comment: transpiles OK");
+	prism_free(&r);
+
+	/* Source ending in a block comment */
+	const char *code_block = "int x = 1; /* comment */";
+	r = prism_transpile_source(code_block, "swar_block.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "swar block comment: transpiles OK");
+	prism_free(&r);
+
+	/* File-based: page-boundary-aligned file ending in a comment */
+	char big[4096 + 1];
+	memset(big, ' ', sizeof(big) - 1);
+	/* Place a line comment near the end so SWAR scans up to the boundary */
+	memcpy(big + 4080, "// end comment", 14);
+	big[4094] = '\n';
+	big[4095] = '\0';
+	char *path = create_temp_file(big);
+	if (path) {
+		Token *tok = tokenize_file(path);
+		CHECK(tok != NULL, "swar page boundary: tokenizes OK");
+		tokenizer_teardown(false);
+		unlink(path);
+		free(path);
+	}
+}
+
+static void test_cc_split_argv_no_leak(void) {
+	printf("\n--- CC Split Argv No Leak ---\n");
+
+	/* Verify out_dup captures the strdup'd buffer */
+	const char *args[8] = {0};
+	int argc = 0;
+	char *dup = NULL;
+	cc_split_into_argv(args, &argc, "gcc -Wall -O2", &dup);
+	CHECK_EQ(argc, 3, "cc split leak: three tokens");
+	CHECK(dup != NULL, "cc split leak: out_dup captured");
+	CHECK(strcmp(args[0], "gcc") == 0, "cc split leak: first is 'gcc'");
+	CHECK(strcmp(args[1], "-Wall") == 0, "cc split leak: second is '-Wall'");
+	CHECK(strcmp(args[2], "-O2") == 0, "cc split leak: third is '-O2'");
+	free(dup);
+
+	/* Verify NULL out_dup is safe (CLI callers) */
+	const char *args2[8] = {0};
+	int argc2 = 0;
+	cc_split_into_argv(args2, &argc2, "clang", NULL);
+	CHECK_EQ(argc2, 1, "cc split null out_dup: one token");
+	CHECK(strcmp(args2[0], "clang") == 0, "cc split null out_dup: correct");
+}
+
+static void test_cc_executable_no_leak(void) {
+	printf("\n--- CC Executable No Leak ---\n");
+
+	/* cc_executable with spaces returns static buffer — no malloc */
+	const char *r1 = cc_executable("gcc -m32");
+	CHECK(strcmp(r1, "gcc") == 0, "cc_executable: extracts gcc");
+
+	/* Calling again overwrites the static buffer (expected) */
+	const char *r2 = cc_executable("clang -O2 -Wall");
+	CHECK(strcmp(r2, "clang") == 0, "cc_executable: extracts clang");
+
+	/* No space returns input pointer directly */
+	const char *r3 = cc_executable("cc");
+	CHECK(r3 != NULL && strcmp(r3, "cc") == 0, "cc_executable: no-space passthrough");
+
+	/* cc_is_msvc with spaces — no leak */
+	CHECK(cc_is_msvc("cl -nologo") == true, "cc_is_msvc: cl with args");
+	CHECK(cc_is_msvc("ccache gcc") == false, "cc_is_msvc: ccache gcc not msvc");
+
+	/* Repeated calls to cc_is_msvc — formerly leaked per call */
+	for (int i = 0; i < 100; i++) {
+		bool m = cc_is_msvc("cl.exe /nologo /W4");
+		CHECK(m == true, "cc_is_msvc: repeated call stable");
+	}
+}
+
+static void test_defer_block_no_swallow(void) {
+	printf("\n--- Defer Block No Swallow ---\n");
+
+	PrismFeatures feat = prism_defaults();
+
+	/* Block defer without trailing semicolon must not swallow next statement */
+	const char *code_no_semi =
+	    "int printf(const char *, ...);\n"
+	    "void test(void) {\n"
+	    "    defer {\n"
+	    "        printf(\"deferred\\n\");\n"
+	    "    }\n"
+	    "    printf(\"normal\\n\");\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code_no_semi, "defer_block.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "defer block no semi: transpiles OK");
+	if (r.output) {
+		/* "normal" must appear in normal flow, before the deferred block emission */
+		char *normal = strstr(r.output, "printf(\"normal");
+		char *deferred = strstr(r.output, "printf(\"deferred");
+		CHECK(normal != NULL, "defer block no semi: normal printf present");
+		CHECK(deferred != NULL, "defer block no semi: deferred printf present");
+		if (normal && deferred)
+			CHECK(normal < deferred,
+			      "defer block no semi: normal executes before deferred");
+	}
+	prism_free(&r);
+
+	/* Block defer WITH trailing semicolon must produce identical output */
+	const char *code_with_semi =
+	    "int printf(const char *, ...);\n"
+	    "void test(void) {\n"
+	    "    defer {\n"
+	    "        printf(\"deferred\\n\");\n"
+	    "    };\n"
+	    "    printf(\"normal\\n\");\n"
+	    "}\n";
+	PrismResult r2 = prism_transpile_source(code_with_semi, "defer_semi.c", feat);
+	CHECK_EQ(r2.status, PRISM_OK, "defer block with semi: transpiles OK");
+	if (r.output && r2.output)
+		CHECK(strcmp(r.output, r2.output) == 0,
+		      "defer block: with/without semi produce identical output");
+	prism_free(&r2);
+}
+
+static void test_typeof_memset_size_t_counter(void) {
+	printf("\n--- Typeof Memset size_t Counter ---\n");
+
+	const char *code =
+	    "void f(int n) {\n"
+	    "    volatile typeof(int[n]) vla;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "size_t_counter.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "size_t counter: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "unsigned long long _Prism_i_") != NULL,
+		      "size_t counter: uses unsigned long long for loop counter");
+		CHECK(strstr(r.output, "size_t _Prism_i_") == NULL,
+		      "size_t counter: no size_t counter (avoids stddef.h dep)");
+	}
+	prism_free(&r);
+
+	/* MSVC path should also use size_t */
+	feat.compiler = "cl";
+	r = prism_transpile_source(code, "size_t_msvc.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "size_t counter msvc: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "unsigned long long _Prism_i_") != NULL,
+		      "size_t counter msvc: uses unsigned long long for loop counter");
+	}
+	prism_free(&r);
+}
+
 static void test_memory_leak_stress(void) {
 	printf("\n--- Memory Leak Stress Test ---\n");
 
@@ -1954,12 +2111,11 @@ static void test_cross_compile_msvc_ret_type(void) {
 	PrismFeatures feat = prism_defaults();
 	feat.compiler = "cl";
 	PrismResult r = prism_transpile_source(code, "cross_msvc.c", feat);
-	CHECK(r.status == PRISM_OK, "cross-compile msvc: transpiles OK");
-	if (r.output) {
-		CHECK(strstr(r.output, "__auto_type") == NULL,
-		      "cross-compile msvc: no __auto_type emitted");
-		CHECK(strstr(r.output, "void *") != NULL,
-		      "cross-compile msvc: uses void * for ret type");
+	CHECK(r.status != PRISM_OK, "cross-compile msvc: rejects anonymous struct ret with defer");
+	CHECK(r.error_msg != NULL, "cross-compile msvc: error message present");
+	if (r.error_msg) {
+		CHECK(strstr(r.error_msg, "MSVC") != NULL || strstr(r.error_msg, "named struct") != NULL,
+		      "cross-compile msvc: error mentions MSVC or named struct");
 	}
 	prism_free(&r);
 }
@@ -2053,9 +2209,9 @@ static void test_orelse_backtrack_desync(void) {
 	if (r.output) {
 		CHECK(strstr(r.output, "orelse") == NULL,
 		      "orelse backtrack desync: orelse consumed");
-		// The orelse expansion should produce an if-check for a
-		CHECK(strstr(r.output, "if (!") != NULL,
-		      "orelse backtrack desync: orelse expanded to if-check");
+		// The orelse expansion should produce a ternary for a
+		CHECK(strstr(r.output, "a = a ?") != NULL,
+		      "orelse backtrack desync: orelse expanded to ternary");
 		// Function prototype must appear as a separate declaration
 		CHECK(strstr(r.output, "int f(void);") != NULL,
 		      "orelse backtrack desync: prototype preserved");
@@ -2732,6 +2888,207 @@ static void test_c23_attr_label_defer(void) {
 	prism_free(&r);
 }
 
+// --- Regression tests for confirmed issues ---
+
+static void test_cc_splitting(void) {
+	printf("\n--- CC Splitting ---\n");
+
+	// cc_executable extracts the first token
+	CHECK(strcmp(cc_executable("gcc"), "gcc") == 0,
+	      "cc split: simple compiler unchanged");
+	CHECK(strcmp(cc_executable("gcc -m32"), "gcc") == 0,
+	      "cc split: extracts first token from 'gcc -m32'");
+	CHECK(strcmp(cc_executable("ccache gcc"), "ccache") == 0,
+	      "cc split: extracts first token from 'ccache gcc'");
+	CHECK(strcmp(cc_executable("/usr/bin/gcc -Wall -O2"), "/usr/bin/gcc") == 0,
+	      "cc split: extracts path from multi-arg CC");
+
+	// cc_extra_arg_count returns extra arguments beyond the first
+	CHECK_EQ(cc_extra_arg_count("gcc"), 0, "cc split: no extras for simple CC");
+	CHECK_EQ(cc_extra_arg_count("gcc -m32"), 1, "cc split: one extra for 'gcc -m32'");
+	CHECK_EQ(cc_extra_arg_count("ccache gcc -O2"), 2, "cc split: two extras for 'ccache gcc -O2'");
+
+	// cc_split_into_argv populates argv correctly
+	const char *args[8] = {0};
+	int argc = 0;
+	char *cc_dup = NULL;
+	cc_split_into_argv(args, &argc, "gcc -m32", &cc_dup);
+	CHECK_EQ(argc, 2, "cc split argv: two tokens from 'gcc -m32'");
+	CHECK(strcmp(args[0], "gcc") == 0, "cc split argv: first is 'gcc'");
+	CHECK(strcmp(args[1], "-m32") == 0, "cc split argv: second is '-m32'");
+	free(cc_dup);
+}
+
+static void test_attribute_preserved_on_orelse_split(void) {
+	printf("\n--- Attribute Preserved on Orelse Split ---\n");
+
+	const char *code =
+	    "int *get(void);\n"
+	    "void test(void) {\n"
+	    "    __attribute__((aligned(8))) int *a = get() orelse 0, *b = get() orelse 0;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "attr_split.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "attr orelse split: transpiles OK");
+	if (r.output) {
+		// Find 'b' declaration — it must also have the attribute
+		char *b_decl = strstr(r.output, "* b");
+		if (!b_decl) b_decl = strstr(r.output, "*b");
+		CHECK(b_decl != NULL, "attr orelse split: b declaration present");
+		if (b_decl) {
+			// Attribute must appear before b in the output
+			char *attr = strstr(r.output, "__attribute__");
+			char *attr2 = attr ? strstr(attr + 1, "__attribute__") : NULL;
+			CHECK(attr2 != NULL && attr2 < b_decl,
+			      "attr orelse split: attribute appears before second declarator");
+		}
+	}
+	prism_free(&r);
+}
+
+static void test_volatile_orelse_no_double_eval(void) {
+	printf("\n--- Volatile Orelse No Double Eval ---\n");
+
+	const char *code =
+	    "volatile int *get_val(void);\n"
+	    "void test(void) {\n"
+	    "    volatile int *hw_register;\n"
+	    "    hw_register = get_val() orelse 0;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "volatile_orelse.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "volatile orelse: transpiles OK");
+	if (r.output) {
+		// Must use if-based pattern, not ternary (which causes double volatile read)
+		CHECK(strstr(r.output, "if (!") != NULL,
+		      "volatile orelse: uses if-based fallback");
+		// The ternary pattern "? hw_register" would mean a double read
+		CHECK(strstr(r.output, "? hw_register") == NULL,
+		      "volatile orelse: no ternary double-read pattern");
+	}
+	prism_free(&r);
+}
+
+static void test_builtin_memset_for_typeof_vla(void) {
+	printf("\n--- Builtin Memset for Typeof VLA ---\n");
+
+	const char *code =
+	    "void f(int n) {\n"
+	    "    typeof(int[n]) vla;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "builtin_memset.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "builtin memset: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "__builtin_memset(&vla") != NULL,
+		      "builtin memset: emits __builtin_memset for VLA zero-init");
+	}
+	prism_free(&r);
+}
+
+static void test_const_orelse_attr_preserved(void) {
+	printf("\n--- Const Orelse Attr Preserved ---\n");
+
+	const char *code =
+	    "int *get(void);\n"
+	    "void test(void) {\n"
+	    "    __attribute__((aligned(8))) const int *x = get() orelse 0;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "const_attr.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "const orelse attr: transpiles OK");
+	if (r.output) {
+		// The attribute must appear on the mutable temp
+		char *temp = strstr(r.output, "_Prism_oe_");
+		CHECK(temp != NULL, "const orelse attr: temp variable emitted");
+		if (temp) {
+			// Find the line containing the temp - attribute must precede it
+			char *attr = strstr(r.output, "__attribute__((aligned(8)))");
+			CHECK(attr != NULL && attr < temp,
+			      "const orelse attr: attribute on temp declaration");
+		}
+		// The attribute must also appear on the final const declaration
+		char *final_const = strstr(r.output, "const int *x =");
+		if (final_const) {
+			char *attr2 = NULL;
+			// Search backwards from final_const for the nearest __attribute__
+			for (char *p = final_const - 1; p >= r.output; p--) {
+				if (strncmp(p, "__attribute__", 13) == 0) { attr2 = p; break; }
+			}
+			CHECK(attr2 != NULL, "const orelse attr: attribute on final const declaration");
+		}
+	}
+	prism_free(&r);
+}
+
+static void test_array_of_pointers_orelse_rejected(void) {
+	printf("\n--- Array-of-Pointers Orelse Rejected ---\n");
+
+	PrismFeatures feat = prism_defaults();
+
+	/* int *arr[5] is an array — orelse must be rejected */
+	const char *code_arr_of_ptr =
+	    "int **get(void);\n"
+	    "void f(void) {\n"
+	    "    int *arr[5] = get() orelse 0;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code_arr_of_ptr, "arr_ptr.c", feat);
+	CHECK(r.status != PRISM_OK, "array-of-pointers orelse: rejected");
+	CHECK(r.error_msg != NULL, "array-of-pointers orelse: has error");
+	if (r.error_msg)
+		CHECK(strstr(r.error_msg, "array") != NULL &&
+		          strstr(r.error_msg, "never") != NULL,
+		      "array-of-pointers orelse: error mentions array never NULL");
+	prism_free(&r);
+
+	/* int (*ptr)[5] is a pointer-to-array — orelse must be allowed */
+	const char *code_ptr_to_arr =
+	    "int (*get_arr(void))[5];\n"
+	    "void f(void) {\n"
+	    "    int (*ptr)[5] = get_arr() orelse 0;\n"
+	    "}\n";
+	r = prism_transpile_source(code_ptr_to_arr, "ptr_arr.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "pointer-to-array orelse: accepted");
+	if (r.output)
+		CHECK(strstr(r.output, "ptr = ptr ?") != NULL,
+		      "pointer-to-array orelse: emits ternary null check");
+	prism_free(&r);
+}
+
+static void test_msvc_typeof_vla_no_builtin_memset(void) {
+	printf("\n--- MSVC Typeof VLA No __builtin_memset ---\n");
+
+	const char *code =
+	    "void f(int n) {\n"
+	    "    typeof(int[n]) vla;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	feat.compiler = "cl";
+	PrismResult r = prism_transpile_source(code, "msvc_memset.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "msvc typeof vla: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "__builtin_memset") == NULL,
+		      "msvc typeof vla: no __builtin_memset emitted");
+		CHECK(strstr(r.output, "_Prism_p_") != NULL,
+		      "msvc typeof vla: uses byte-loop pattern");
+	}
+	prism_free(&r);
+
+	/* Non-MSVC must still use __builtin_memset */
+	feat.compiler = NULL;
+	r = prism_transpile_source(code, "gcc_memset.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "gcc typeof vla: transpiles OK");
+	if (r.output)
+		CHECK(strstr(r.output, "__builtin_memset") != NULL,
+		      "gcc typeof vla: uses __builtin_memset");
+	prism_free(&r);
+}
+
 void run_api_tests(void) {
 	printf("\n=== API TESTS ===\n");
 
@@ -2801,6 +3158,23 @@ void run_api_tests(void) {
 	test_compile_matrix_smoke();
 	test_compile_matrix_feature_corpus();
 	test_preprocess_spawn_failure_cleans_stderr_temp();
+
+	test_cc_splitting();
+	test_attribute_preserved_on_orelse_split();
+	test_volatile_orelse_no_double_eval();
+	test_builtin_memset_for_typeof_vla();
+	test_const_orelse_attr_preserved();
+
+	test_array_of_pointers_orelse_rejected();
+	test_msvc_typeof_vla_no_builtin_memset();
+
+	test_swar_comment_buffer_safety();
+	test_cc_split_argv_no_leak();
+
+	test_cc_executable_no_leak();
+
+	test_defer_block_no_swallow();
+	test_typeof_memset_size_t_counter();
 
 	test_memory_leak_stress();
 }

@@ -1639,10 +1639,9 @@ static void test_bare_orelse_compound_literal_ternary(void) {
 	CHECK_EQ(result.status, PRISM_OK, "bare orelse compound: transpiles OK");
 	CHECK(result.output != NULL, "bare orelse compound: output not NULL");
 
-	// The fallback should use a ternary (? :) to keep the compound literal alive.
-	// It must NOT use "if (!(" for the bare fallback path.
-	CHECK(strstr(result.output, "?") != NULL,
-	      "bare orelse compound: uses ternary (?) to preserve compound literal lifetime");
+	// The fallback should use an if-based pattern to avoid volatile double evaluation.
+	CHECK(strstr(result.output, "if (!") != NULL,
+	      "bare orelse compound: uses if-based fallback pattern");
 	// The compound literal should appear in the output
 	CHECK(strstr(result.output, "(int[]){1, 2, 3}") != NULL ||
 	      strstr(result.output, "(int[]){ 1, 2, 3 }") != NULL,
@@ -1675,14 +1674,47 @@ static void test_chained_bare_orelse(void) {
 	// The output must NOT contain the literal "orelse" keyword — that's not valid C.
 	CHECK(strstr(result.output, "orelse") == NULL,
 	      "chained bare orelse: no raw 'orelse' keyword in C output");
-	// Should produce two ternary expressions for the chain
-	const char *first_q = strstr(result.output, "?");
-	CHECK(first_q != NULL, "chained bare orelse: first ternary (?) present");
-	const char *second_q = first_q ? strstr(first_q + 1, "?") : NULL;
-	CHECK(second_q != NULL, "chained bare orelse: second ternary (?) for chain");
+	// Should produce two if-based fallback expressions for the chain
+	const char *first_if = strstr(result.output, "if (!");
+	CHECK(first_if != NULL, "chained bare orelse: first if-based fallback present");
+	const char *second_if = first_if ? strstr(first_if + 4, "if (!") : NULL;
+	CHECK(second_if != NULL, "chained bare orelse: second if-based fallback for chain");
 	// The compound literal should survive in the output
 	CHECK(strstr(result.output, "(int[]){42}") != NULL,
 	      "chained bare orelse: compound literal preserved");
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+static void test_decl_orelse_ternary_lifetime(void) {
+	printf("\n--- Decl orelse Ternary Preserves Compound Literal Lifetime ---\n");
+
+	const char *code =
+	    "int *get(void);\n"
+	    "void test(void) {\n"
+	    "    int *p = get() orelse (int[]){1, 2, 3};\n"
+	    "    (void)p;\n"
+	    "}\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "decl ternary lifetime: create temp file");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "decl ternary lifetime: transpiles OK");
+	CHECK(result.output != NULL, "decl ternary lifetime: output not NULL");
+
+	// Must use ternary (var = var ? var : fallback) to keep compound literal
+	// in the enclosing block scope. The old if(!var) var = fallback; pattern
+	// scoped the literal to the if-body, destroying it immediately.
+	CHECK(strstr(result.output, "p = p ? p :") != NULL,
+	      "decl ternary lifetime: uses ternary for fallback");
+	CHECK(strstr(result.output, "if (!p)") == NULL,
+	      "decl ternary lifetime: no if-based pattern (would kill literal)");
+	CHECK(strstr(result.output, "(int[]){1, 2, 3}") != NULL,
+	      "decl ternary lifetime: compound literal preserved");
 
 	prism_free(&result);
 	unlink(path);
@@ -1806,4 +1838,5 @@ void run_orelse_tests(void) {
 	test_array_typedef_const_orelse_ternary();
 	test_bare_orelse_compound_literal_ternary();
 	test_chained_bare_orelse();
+	test_decl_orelse_ternary_lifetime();
 }
