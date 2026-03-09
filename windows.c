@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <share.h>
 #include <errno.h>
+#include <signal.h>
 
 // Must be included BEFORE GCC-ism macros (especially noreturn) to avoid
 // poisoning system headers like <setjmp.h> and <stdlib.h>.

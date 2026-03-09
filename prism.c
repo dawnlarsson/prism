@@ -4882,12 +4882,14 @@ static int passthrough_cc(const Cli *cli) {
 	bool msvc = cc_is_msvc(compiler);
 	const char **args = alloc_argv(cli->cc_arg_count + cc_extra + 8);
 	int argc = 0;
-	cc_split_into_argv(args, &argc, compiler, NULL);
+	char *cc_dup = NULL;
+	cc_split_into_argv(args, &argc, compiler, &cc_dup);
 	for (int i = 0; i < cli->cc_arg_count; i++) args[argc++] = cli->cc_args[i];
 	argv_add_output(args, &argc, cli->output, msvc, false);
 	args[argc] = NULL;
 	if (cli->verbose) verbose_argv((char **)args);
 	int st = run_command((char **)args);
+	free(cc_dup);
 	free((void *)args);
 	return st;
 }
@@ -4905,7 +4907,8 @@ static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count,
 	int cc_extra = cc_extra_arg_count(plan->compiler);
 	const char **args = alloc_argv(temp_count + cli->cc_arg_count + cc_extra + 24);
 	int argc = 0;
-	cc_split_into_argv(args, &argc, plan->compiler, NULL);
+	char *cc_dup = NULL;
+	cc_split_into_argv(args, &argc, plan->compiler, &cc_dup);
 	if (plan->optimize) args[argc++] = plan->msvc ? "/O2" : "-O2";
 	if (plan->use_preprocessed) args[argc++] = "-fpreprocessed";
 	for (int i = 0; i < temp_count; i++) args[argc++] = temps[i];
@@ -4918,6 +4921,7 @@ static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count,
 
 	if (cli->verbose) verbose_argv((char **)args);
 	int status = run_command((char **)args);
+	free(cc_dup);
 	free((void *)args);
 	return status;
 }
@@ -5015,7 +5019,8 @@ static int compile_sources(Cli *cli) {
 	if (cli->source_count == 1 && !msvc) {
 		const char **args = alloc_argv(cli->cc_arg_count + cc_extra + 20);
 		int argc = 0;
-		cc_split_into_argv(args, &argc, compiler, NULL);
+		char *cc_dup = NULL;
+		cc_split_into_argv(args, &argc, compiler, &cc_dup);
 		args[argc++] = "-x";
 		args[argc++] = "c";
 		if (FEAT(F_FLATTEN) && !clang) args[argc++] = "-fpreprocessed";
@@ -5031,6 +5036,7 @@ static int compile_sources(Cli *cli) {
 
 		if (cli->verbose) fprintf(stderr, "[prism] Transpiling %s (pipe → cc)\n", cli->sources[0]);
 		status = transpile_and_compile((char *)cli->sources[0], (char **)args, cli->verbose);
+		free(cc_dup);
 		free((void *)args);
 	} else {
 		char **temps = transpile_sources_to_temps(cli, false);
