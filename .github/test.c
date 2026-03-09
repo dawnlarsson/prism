@@ -105,6 +105,7 @@ static bool is_emulated(void) {
 	if (getenv("PRISM_EMULATED")) return true;
 #if defined(__aarch64__) || defined(__arm__) || defined(__riscv) || \
     defined(__s390x__) || defined(__mips__) || defined(__powerpc__)
+	/* User-mode QEMU: host cpuinfo leaks x86 fields into non-x86 process */
 	FILE *f = fopen("/proc/cpuinfo", "r");
 	if (f) {
 		char line[256];
@@ -116,6 +117,18 @@ static bool is_emulated(void) {
 			}
 		}
 		fclose(f);
+	}
+	/* System-mode QEMU: device tree advertises the virtual machine */
+	f = fopen("/sys/firmware/devicetree/base/compatible", "rb");
+	if (f) {
+		char buf[256];
+		size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+		fclose(f);
+		buf[n] = 0;
+		for (size_t i = 0; i < n; i++)
+			if (buf[i] == 0) buf[i] = ' ';
+		if (strstr(buf, "qemu") || strstr(buf, "virt"))
+			return true;
 	}
 #endif
 #endif
