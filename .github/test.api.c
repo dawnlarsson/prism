@@ -3253,6 +3253,71 @@ static void test_cli_dep_flags_passthrough(void) {
 	unlink(prism_bin);
 	rmdir(dir);
 }
+
+static void test_version_shows_backend_cc(void) {
+	printf("\n--- Version Shows Backend CC (assembler detection regression) ---\n");
+
+	// The Linux kernel's scripts/cc-version.sh and scripts/as-version.sh
+	// probe the compiler via `$CC --version` and look for "clang" on the
+	// first line.  If prism only prints "prism <ver>" without the backend
+	// CC info, the kernel cannot identify the assembler and fails with
+	// "unknown assembler invoked".
+
+	char tmpdir[] = "/tmp/prism_ver_XXXXXX";
+	char *dir = mkdtemp(tmpdir);
+	CHECK(dir != NULL, "version cc: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], stdout_path[PATH_MAX];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	snprintf(stdout_path, sizeof(stdout_path), "%s/ver.out", dir);
+
+	if (!build_test_prism_binary(prism_bin, "version cc: build prism binary")) {
+		rmdir(dir);
+		return;
+	}
+
+	// Test 1: `prism --version` first line must contain the backend CC version string
+	{
+		char *argv[] = {prism_bin, "--version", NULL};
+		int st = run_exec_argv_capture(argv, stdout_path, NULL);
+		CHECK_EQ(st, 0, "version cc: --version exits 0");
+
+		FILE *f = fopen(stdout_path, "r");
+		char line[512] = {0};
+		if (f) { fgets(line, sizeof(line), f); fclose(f); }
+		// Must start with "prism "
+		CHECK(strncmp(line, "prism ", 6) == 0, "version cc: starts with 'prism '");
+		// Must contain a parenthesized backend CC identifier (e.g. "(Apple clang ...)" or "(gcc ...)")
+		CHECK(strchr(line, '(') != NULL && strchr(line, ')') != NULL,
+		      "version cc: contains parenthesized backend CC info");
+		// The kernel specifically greps for "clang" — on macOS the backend is always clang
+#ifdef __APPLE__
+		CHECK(strstr(line, "clang") != NULL,
+		      "version cc: first line contains 'clang' (kernel cc-version.sh compat)");
+#endif
+		unlink(stdout_path);
+	}
+
+	// Test 2: `-fintegrated-as` must be accepted (passed through to backend CC)
+	// The kernel passes this flag when CC_IS_CLANG is detected; prism must not reject it.
+	{
+		char src_path[PATH_MAX];
+		snprintf(src_path, sizeof(src_path), "%s/empty.c", dir);
+		FILE *f = fopen(src_path, "w");
+		if (f) { fputs("/* empty */\n", f); fclose(f); }
+		char obj_path[PATH_MAX];
+		snprintf(obj_path, sizeof(obj_path), "%s/empty.o", dir);
+		char *argv[] = {prism_bin, "-fintegrated-as", "-c", src_path, "-o", obj_path, NULL};
+		int st = run_exec_argv(argv);
+		CHECK_EQ(st, 0, "version cc: -fintegrated-as accepted");
+		unlink(obj_path);
+		unlink(src_path);
+	}
+
+	unlink(prism_bin);
+	rmdir(dir);
+}
 #endif
 
 void run_api_tests(void) {
@@ -3346,6 +3411,7 @@ test_typeof_orelse_leak();
 #ifndef _WIN32
 	test_cli_dep_flags_routing();
 	test_cli_dep_flags_passthrough();
+	test_version_shows_backend_cc();
 #endif
 
 	test_memory_leak_stress();

@@ -4908,6 +4908,39 @@ static bool cc_is_clang(const char *cc) {
 	return strncmp(base, "clang", 5) == 0;
 }
 
+#ifndef _WIN32
+// Capture the first line of a command's stdout. Returns 0 on success.
+static int capture_first_line(char **argv, char *buf, size_t bufsize) {
+	int pipefd[2];
+	if (pipe(pipefd) != 0) return -1;
+	char **env = build_clean_environ();
+	if (!env) { close(pipefd[0]); close(pipefd[1]); return -1; }
+	posix_spawn_file_actions_t actions;
+	posix_spawn_file_actions_init(&actions);
+	posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+	posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+	int devnull = open("/dev/null", O_WRONLY);
+	if (devnull >= 0) {
+		posix_spawn_file_actions_adddup2(&actions, devnull, STDERR_FILENO);
+		posix_spawn_file_actions_addclose(&actions, devnull);
+	}
+	pid_t pid;
+	int err = posix_spawnp(&pid, argv[0], &actions, NULL, argv, env);
+	posix_spawn_file_actions_destroy(&actions);
+	close(pipefd[1]);
+	if (devnull >= 0) close(devnull);
+	if (err) { close(pipefd[0]); buf[0] = '\0'; return -1; }
+	ssize_t n = read(pipefd[0], buf, bufsize - 1);
+	close(pipefd[0]);
+	waitpid(pid, NULL, 0);
+	if (n <= 0) { buf[0] = '\0'; return -1; }
+	buf[n] = '\0';
+	char *nl = strchr(buf, '\n');
+	if (nl) *nl = '\0';
+	return 0;
+}
+#endif
+
 static void print_help(void) {
 	printf("Prism v%s - Robust C transpiler\n\n"
 	       "Usage: prism [options] source.c... [-o output]\n\n"
@@ -4983,7 +5016,18 @@ static Cli cli_parse(int argc, char **argv) {
 
 			if (c1 == '-') {
 				if (!strcmp(a, "--help")) {print_help(); exit(0);}
-				if (!strcmp(a, "--version")) { printf("prism %s\n", PRISM_VERSION); exit(0);}
+				if (!strcmp(a, "--version")) {
+					const char *real_cc = get_real_cc(cli.cc);
+#ifndef _WIN32
+					char cc_line[256];
+					char *vargs[] = {(char *)real_cc, "--version", NULL};
+					if (capture_first_line(vargs, cc_line, sizeof(cc_line)) == 0 && cc_line[0])
+						printf("prism %s (%s)\n", PRISM_VERSION, cc_line);
+					else
+#endif
+						printf("prism %s\n", PRISM_VERSION);
+					exit(0);
+				}
 				if (str_startswith(a, "--prism-cc=")) { cli.cc = a + 11; continue; }
 				if (!strcmp(a, "--prism-verbose")) { cli.verbose = true; continue; }
 				if (str_startswith(a, "--prism-emit=")) { cli.mode = CLI_EMIT; cli.output = a + 13; continue; }
