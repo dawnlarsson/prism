@@ -3107,6 +3107,154 @@ CHECK(strstr(r.output, "orelse") == NULL,
 prism_free(&r);
 }
 
+#ifndef _WIN32
+static long file_size(const char *path) {
+	struct stat st;
+	if (stat(path, &st) != 0) return -1;
+	return (long)st.st_size;
+}
+
+static void test_cli_dep_flags_routing(void) {
+	printf("\n--- CLI Dependency Flag Routing ---\n");
+
+	char tmpdir[] = "/tmp/prism_depflag_XXXXXX";
+	char *dir = mkdtemp(tmpdir);
+	CHECK(dir != NULL, "dep flags: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], src_path[PATH_MAX], obj_path[PATH_MAX];
+	char dep_wp[PATH_MAX], dep_standalone[PATH_MAX];
+
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	snprintf(src_path, sizeof(src_path), "%s/input.c", dir);
+	snprintf(obj_path, sizeof(obj_path), "%s/input.o", dir);
+	snprintf(dep_wp, sizeof(dep_wp), "%s/wp.d", dir);
+	snprintf(dep_standalone, sizeof(dep_standalone), "%s/standalone.d", dir);
+
+	FILE *f = fopen(src_path, "w");
+	CHECK(f != NULL, "dep flags: create source file");
+	if (!f) { rmdir(dir); return; }
+	fputs("#include <stdio.h>\nint main(void){return 0;}\n", f);
+	fclose(f);
+
+	if (!build_test_prism_binary(prism_bin, "dep flags: build prism binary")) {
+		unlink(src_path);
+		rmdir(dir);
+		return;
+	}
+
+	// Test 1: -Wp,-MMD,<path> must produce a non-empty .d file.
+	// BUG: Prism used to forward -Wp,-MMD to the backend compiler alongside
+	// -fpreprocessed, which skips preprocessing and produces empty .d files.
+	{
+		char wp_flag[PATH_MAX + 16];
+		snprintf(wp_flag, sizeof(wp_flag), "-Wp,-MMD,%s", dep_wp);
+		char *argv[] = {prism_bin, "-c", wp_flag, "-o", obj_path, src_path, NULL};
+		int st = run_exec_argv(argv);
+		CHECK_EQ(st, 0, "dep flags: -Wp,-MMD compiles OK");
+		CHECK(file_size(dep_wp) > 0, "dep flags: -Wp,-MMD produces non-empty .d file");
+
+		// Verify the dep file references the original source, not a temp/pipe
+		if (file_size(dep_wp) > 0) {
+			FILE *df = fopen(dep_wp, "r");
+			char buf[2048] = {0};
+			if (df) { fread(buf, 1, sizeof(buf) - 1, df); fclose(df); }
+			CHECK(strstr(buf, "input.c") != NULL,
+			      "dep flags: -Wp,-MMD dep file references source");
+		}
+		unlink(dep_wp);
+		unlink(obj_path);
+	}
+
+	// Test 2: standalone -MMD -MF <path>
+	{
+		char *argv[] = {prism_bin, "-c", "-MMD", "-MF", dep_standalone,
+				"-o", obj_path, src_path, NULL};
+		int st = run_exec_argv(argv);
+		CHECK_EQ(st, 0, "dep flags: -MMD -MF compiles OK");
+		CHECK(file_size(dep_standalone) > 0,
+		      "dep flags: -MMD -MF produces non-empty .d file");
+		unlink(dep_standalone);
+		unlink(obj_path);
+	}
+
+	// Test 3: -Wp,-MD (not -MMD) — includes system headers in dep output
+	{
+		char wp_md_flag[PATH_MAX + 16];
+		snprintf(wp_md_flag, sizeof(wp_md_flag), "-Wp,-MD,%s", dep_wp);
+		char *argv[] = {prism_bin, "-c", wp_md_flag, "-o", obj_path, src_path, NULL};
+		int st = run_exec_argv(argv);
+		CHECK_EQ(st, 0, "dep flags: -Wp,-MD compiles OK");
+		if (file_size(dep_wp) > 0) {
+			FILE *df = fopen(dep_wp, "r");
+			char buf[4096] = {0};
+			if (df) { fread(buf, 1, sizeof(buf) - 1, df); fclose(df); }
+			CHECK(strstr(buf, "stdio.h") != NULL,
+			      "dep flags: -Wp,-MD dep file includes system headers");
+		}
+		unlink(dep_wp);
+		unlink(obj_path);
+	}
+
+	unlink(src_path);
+	unlink(prism_bin);
+	rmdir(dir);
+}
+
+static void test_cli_dep_flags_passthrough(void) {
+	printf("\n--- CLI Dependency Flags Passthrough (.S) ---\n");
+
+	char tmpdir[] = "/tmp/prism_deppt_XXXXXX";
+	char *dir = mkdtemp(tmpdir);
+	CHECK(dir != NULL, "dep passthrough: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], src_path[PATH_MAX], obj_path[PATH_MAX], dep_path[PATH_MAX];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	snprintf(src_path, sizeof(src_path), "%s/input.S", dir);
+	snprintf(obj_path, sizeof(obj_path), "%s/input.o", dir);
+	snprintf(dep_path, sizeof(dep_path), "%s/input.d", dir);
+
+	FILE *f = fopen(src_path, "w");
+	CHECK(f != NULL, "dep passthrough: create .S file");
+	if (!f) { rmdir(dir); return; }
+	fputs(".text\n.globl _start\n_start:\n    nop\n", f);
+	fclose(f);
+
+	if (!build_test_prism_binary(prism_bin, "dep passthrough: build prism binary")) {
+		unlink(src_path);
+		rmdir(dir);
+		return;
+	}
+
+	// Test: -Wp,-MMD,<path> on a .S file must produce a non-empty .d file.
+	// BUG: dep flags were intercepted into dep_args but passthrough_cc only
+	// forwarded cc_args, so .d files were never generated for assembly.
+	{
+		char wp_flag[PATH_MAX + 16];
+		snprintf(wp_flag, sizeof(wp_flag), "-Wp,-MMD,%s", dep_path);
+		char *argv[] = {prism_bin, "-c", wp_flag, "-o", obj_path, src_path, NULL};
+		int st = run_exec_argv(argv);
+		CHECK_EQ(st, 0, "dep passthrough: -Wp,-MMD .S compiles OK");
+		CHECK(file_size(dep_path) > 0,
+		      "dep passthrough: -Wp,-MMD .S produces non-empty .d file");
+		if (file_size(dep_path) > 0) {
+			FILE *df = fopen(dep_path, "r");
+			char buf[2048] = {0};
+			if (df) { fread(buf, 1, sizeof(buf) - 1, df); fclose(df); }
+			CHECK(strstr(buf, "input") != NULL,
+			      "dep passthrough: .d file references source");
+		}
+		unlink(dep_path);
+		unlink(obj_path);
+	}
+
+	unlink(src_path);
+	unlink(prism_bin);
+	rmdir(dir);
+}
+#endif
+
 void run_api_tests(void) {
 test_typeof_orelse_leak();
 	printf("\n=== API TESTS ===\n");
@@ -3194,6 +3342,11 @@ test_typeof_orelse_leak();
 
 	test_defer_block_no_swallow();
 	test_typeof_memset_size_t_counter();
+
+#ifndef _WIN32
+	test_cli_dep_flags_routing();
+	test_cli_dep_flags_passthrough();
+#endif
 
 	test_memory_leak_stress();
 }

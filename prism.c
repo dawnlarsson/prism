@@ -199,10 +199,12 @@ typedef struct {
 	PrismFeatures features;
 	const char **sources;
 	const char **cc_args;
+	const char **dep_args;  // dependency-generation flags (routed to preprocessor only)
 	const char *output;
 	const char *cc;
 	int source_count, source_cap;
 	int cc_arg_count, cc_arg_cap;
+	int dep_arg_count, dep_arg_cap;
 	CliMode mode;
 	bool verbose;
 	bool compile_only;
@@ -3626,6 +3628,9 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 	for (int i = 0; i < ctx->extra_compiler_flags_count; i++)
 		args[(*argc)++] = ctx->extra_compiler_flags[i];
 
+	for (int i = 0; i < ctx->dep_flags_count; i++)
+		args[(*argc)++] = ctx->dep_flags[i];
+
 	for (int i = 0; i < ctx->extra_include_count; i++)
 	{
 		args[(*argc)++] = "-I";
@@ -3676,8 +3681,8 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 // Run system preprocessor (cc -E) via pipe, returns malloc'd output or NULL
 static char *preprocess_with_cc(const char *input_file) {
 	const char *pp_cc = ctx->extra_compiler ? ctx->extra_compiler : PRISM_DEFAULT_CC;
-	int argcap = 16 + cc_extra_arg_count(pp_cc) + ctx->extra_compiler_flags_count + ctx->extra_include_count * 2 +
-		     ctx->extra_define_count * 2 + ctx->extra_force_include_count * 2;
+	int argcap = 16 + cc_extra_arg_count(pp_cc) + ctx->extra_compiler_flags_count + ctx->dep_flags_count +
+		     ctx->extra_include_count * 2 + ctx->extra_define_count * 2 + ctx->extra_force_include_count * 2;
 	const char **args = alloc_argv(argcap);
 	int argc = 0;
 	char *cc_dup = NULL;
@@ -5000,6 +5005,32 @@ static Cli cli_parse(int argc, char **argv) {
 				continue;
 			}
 
+			// Dependency-generation flags: route to preprocessor only.
+			// With -fpreprocessed the backend skips preprocessing, so
+			// these flags would produce empty .d files if forwarded.
+			if (c1 == 'M') {
+				// -MD, -MMD, -MP (no argument)
+				if (!strcmp(a, "-MD") || !strcmp(a, "-MMD") || !strcmp(a, "-MP")) {
+					CLI_PUSH(cli.dep_args, cli.dep_arg_count, cli.dep_arg_cap, a);
+					continue;
+				}
+				// -MF <file>, -MT <target>, -MQ <target> (consume next arg)
+				if ((!strcmp(a, "-MF") || !strcmp(a, "-MT") || !strcmp(a, "-MQ")) && i + 1 < argc) {
+					CLI_PUSH(cli.dep_args, cli.dep_arg_count, cli.dep_arg_cap, a);
+					CLI_PUSH(cli.dep_args, cli.dep_arg_count, cli.dep_arg_cap, argv[++i]);
+					continue;
+				}
+			}
+			if (c1 == 'W' && a[2] == 'p' && a[3] == ',') {
+				// -Wp,-MD,... / -Wp,-MMD,... / -Wp,-MF,... etc.
+				if (strstr(a + 4, "-MD") || strstr(a + 4, "-MMD") ||
+				    strstr(a + 4, "-MF") || strstr(a + 4, "-MT") ||
+				    strstr(a + 4, "-MQ") || strstr(a + 4, "-MP")) {
+					CLI_PUSH(cli.dep_args, cli.dep_arg_count, cli.dep_arg_cap, a);
+					continue;
+				}
+			}
+
 			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
 			continue;
 		}
@@ -5102,10 +5133,11 @@ static int passthrough_cc(const Cli *cli) {
 	const char *compiler = get_real_cc(cli->cc);
 	int cc_extra = cc_extra_arg_count(compiler);
 	bool msvc = cc_is_msvc(compiler);
-	const char **args = alloc_argv(cli->cc_arg_count + cc_extra + 8);
+	const char **args = alloc_argv(cli->cc_arg_count + cli->dep_arg_count + cc_extra + 8);
 	int argc = 0;
 	char *cc_dup = NULL;
 	cc_split_into_argv(args, &argc, compiler, &cc_dup);
+	for (int i = 0; i < cli->dep_arg_count; i++) args[argc++] = cli->dep_args[i];
 	for (int i = 0; i < cli->cc_arg_count; i++) args[argc++] = cli->cc_args[i];
 	argv_add_output(args, &argc, cli->output, msvc, false);
 	args[argc] = NULL;
@@ -5320,6 +5352,8 @@ int main(int argc, char **argv) {
 	ctx->extra_compiler = get_real_cc(cli.cc);
 	ctx->extra_compiler_flags = cli.cc_args;
 	ctx->extra_compiler_flags_count = cli.cc_arg_count;
+	ctx->dep_flags = cli.dep_args;
+	ctx->dep_flags_count = cli.dep_arg_count;
 
 	if (cli.mode == CLI_INSTALL)
 		status = cli.source_count > 0 ? install_from_source(&cli) : install(argv[0]);

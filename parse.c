@@ -292,6 +292,8 @@ typedef struct PrismContext {
 	int extra_define_count;
 	const char **extra_force_includes;
 	int extra_force_include_count;
+	const char **dep_flags;    // -Wp,-MMD, -MD, -MF etc. (preprocessor-only)
+	int dep_flags_count;
 	int scope_depth;
 	int block_depth;
 	bool current_func_returns_void;
