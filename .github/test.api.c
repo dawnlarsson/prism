@@ -3321,6 +3321,73 @@ static void test_version_shows_backend_cc(void) {
 	unlink(prism_bin);
 	rmdir(dir);
 }
+
+static void test_cli_split_D_flag_not_source(void) {
+	printf("\n--- CLI Split -D Flag Not Treated as Source ---\n");
+
+	// When -D is passed as a separate argument from its value, the value
+	// (e.g. KBUILD_MODFILE=.../foo.c) must not be treated as a source file.
+	// Bug: the kernel passes -D KBUILD_MODFILE="arch/.../vgettimeofday.c"
+	// and prism mistakenly tried to transpile the value as a .c file.
+
+	char tmpdir[] = "/tmp/prism_splitD_XXXXXX";
+	char *dir = mkdtemp(tmpdir);
+	CHECK(dir != NULL, "split -D: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], src_path[PATH_MAX], obj_path[PATH_MAX];
+	char stdout_path[PATH_MAX], stderr_path[PATH_MAX];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	snprintf(src_path, sizeof(src_path), "%s/input.c", dir);
+	snprintf(obj_path, sizeof(obj_path), "%s/input.o", dir);
+	snprintf(stdout_path, sizeof(stdout_path), "%s/out.txt", dir);
+	snprintf(stderr_path, sizeof(stderr_path), "%s/err.txt", dir);
+
+	FILE *f = fopen(src_path, "w");
+	CHECK(f != NULL, "split -D: create source file");
+	if (!f) { rmdir(dir); return; }
+	fputs("int main(void){return 0;}\n", f);
+	fclose(f);
+
+	if (!build_test_prism_binary(prism_bin, "split -D: build prism binary")) {
+		unlink(src_path);
+		rmdir(dir);
+		return;
+	}
+
+	// Test 1: split -D with .c in value must compile, not treat value as source
+	{
+		char *argv[] = {prism_bin, "-D", "KBUILD_MODFILE=arch/arm64/kernel/vdso/vgettimeofday.c",
+				"-c", src_path, "-o", obj_path, NULL};
+		int st = run_exec_argv_capture(argv, stdout_path, stderr_path);
+		CHECK_EQ(st, 0, "split -D: -D <value.c> compiles OK");
+		unlink(obj_path);
+	}
+
+	// Test 2: split -I with .c in path
+	{
+		char *argv[] = {prism_bin, "-I", "/nonexistent/path/ending.c",
+				"-c", src_path, "-o", obj_path, NULL};
+		int st = run_exec_argv(argv);
+		CHECK_EQ(st, 0, "split -D: -I <path.c> compiles OK");
+		unlink(obj_path);
+	}
+
+	// Test 3: split -U with .c in macro name
+	{
+		char *argv[] = {prism_bin, "-U", "SOMETHING.c",
+				"-c", src_path, "-o", obj_path, NULL};
+		int st = run_exec_argv(argv);
+		CHECK_EQ(st, 0, "split -D: -U <name.c> compiles OK");
+		unlink(obj_path);
+	}
+
+	unlink(stdout_path);
+	unlink(stderr_path);
+	unlink(src_path);
+	unlink(prism_bin);
+	rmdir(dir);
+}
 #endif
 
 void run_api_tests(void) {
@@ -3415,6 +3482,7 @@ test_typeof_orelse_leak();
 	test_cli_dep_flags_routing();
 	test_cli_dep_flags_passthrough();
 	test_version_shows_backend_cc();
+	test_cli_split_D_flag_not_source();
 #endif
 
 	test_memory_leak_stress();

@@ -5076,6 +5076,12 @@ static Cli cli_parse(int argc, char **argv) {
 			}
 
 			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
+			// CC flags that accept a separate next argument: forward both.
+			// Without this, the next arg (e.g. a -D value ending in ".c")
+			// would be misidentified as a source file.
+			if (i + 1 < argc && !a[2] && (c1 == 'D' || c1 == 'I' || c1 == 'U' ||
+			    c1 == 'x' || c1 == 'L' || c1 == 'l' || c1 == 'T'))
+				CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, argv[++i]);
 			continue;
 		}
 
