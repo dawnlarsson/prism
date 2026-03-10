@@ -33,9 +33,11 @@ Requires Visual Studio Build Tools with the **Desktop development with C++** wor
 
 > **Note:** Prism builds and runs natively on Windows. The transpiler output is GCC/Clang-first — features like `__auto_type` in `defer` return values are not yet MSVC-compatible. Use `CC=gcc` or `CC=clang` as the backend compiler on Windows for full transpiled-code support.
 
-## Demo projects
+## Prism Projects
 ### [Terminal File Explorer](https://github.com/dawnlarsson/explore)
 [<img width="1113" height="412" alt="image 105 (2)" src="https://github.com/user-attachments/assets/88c9e447-7153-4ad0-ab7e-fd9fedbb3f88" />](https://github.com/dawnlarsson/explore)
+
+### [Refract - Linux Kernel & Distro](https://github.com/dawnlarsson/refract)
 
 ## Defer
 
