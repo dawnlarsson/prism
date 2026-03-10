@@ -3269,6 +3269,7 @@ static void test_version_shows_backend_cc(void) {
 	if (!dir) return;
 
 	char prism_bin[PATH_MAX], stdout_path[PATH_MAX];
+	bool backend_is_clang = false;
 	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
 	snprintf(stdout_path, sizeof(stdout_path), "%s/ver.out", dir);
 
@@ -3296,12 +3297,14 @@ static void test_version_shows_backend_cc(void) {
 		CHECK(strstr(line, "clang") != NULL,
 		      "version cc: first line contains 'clang' (kernel cc-version.sh compat)");
 #endif
+		backend_is_clang = strstr(line, "clang") != NULL;
 		unlink(stdout_path);
 	}
 
 	// Test 2: `-fintegrated-as` must be accepted (passed through to backend CC)
-	// The kernel passes this flag when CC_IS_CLANG is detected; prism must not reject it.
-	{
+	// The kernel passes this flag only when CC_IS_CLANG is detected, so this
+	// only applies when the backend is Clang.  GCC rejects the flag.
+	if (backend_is_clang) {
 		char src_path[PATH_MAX];
 		snprintf(src_path, sizeof(src_path), "%s/empty.c", dir);
 		FILE *f = fopen(src_path, "w");
@@ -3310,7 +3313,7 @@ static void test_version_shows_backend_cc(void) {
 		snprintf(obj_path, sizeof(obj_path), "%s/empty.o", dir);
 		char *argv[] = {prism_bin, "-fintegrated-as", "-c", src_path, "-o", obj_path, NULL};
 		int st = run_exec_argv(argv);
-		CHECK_EQ(st, 0, "version cc: -fintegrated-as accepted");
+		CHECK_EQ(st, 0, "version cc: -fintegrated-as accepted (clang backend)");
 		unlink(obj_path);
 		unlink(src_path);
 	}
