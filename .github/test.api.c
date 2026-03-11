@@ -3382,6 +3382,35 @@ static void test_cli_split_D_flag_not_source(void) {
 		unlink(obj_path);
 	}
 
+	// Test 4: -include with .c file must be treated as forced include, not source
+	// The kernel VDSO build passes -include lib/vdso/gettimeofday.c
+	{
+		char inc_path[PATH_MAX];
+		snprintf(inc_path, sizeof(inc_path), "%s/forced.c", dir);
+		FILE *fi = fopen(inc_path, "w");
+		if (fi) { fputs("/* forced include */\n", fi); fclose(fi); }
+		char *argv[] = {prism_bin, "-include", inc_path, "-DFOO=1",
+				"-c", src_path, "-o", obj_path, NULL};
+		int st = run_exec_argv_capture(argv, stdout_path, stderr_path);
+		CHECK_EQ(st, 0, "split -D: -include <file.c> compiles OK");
+		unlink(obj_path);
+		unlink(inc_path);
+	}
+
+	// Test 5: -include with .c file at end of argv
+	{
+		char inc_path[PATH_MAX];
+		snprintf(inc_path, sizeof(inc_path), "%s/forced2.c", dir);
+		FILE *fi = fopen(inc_path, "w");
+		if (fi) { fputs("/* forced include */\n", fi); fclose(fi); }
+		char *argv[] = {prism_bin, "-c", src_path, "-o", obj_path,
+				"-include", inc_path, NULL};
+		int st = run_exec_argv_capture(argv, stdout_path, stderr_path);
+		CHECK_EQ(st, 0, "split -D: -include <file.c> at end of argv compiles OK");
+		unlink(obj_path);
+		unlink(inc_path);
+	}
+
 	unlink(stdout_path);
 	unlink(stderr_path);
 	unlink(src_path);
@@ -3389,6 +3418,494 @@ static void test_cli_split_D_flag_not_source(void) {
 	rmdir(dir);
 }
 #endif
+
+static void test_cli_parse_unit(void) {
+	printf("\n--- CLI Parse Unit Tests ---\n");
+
+	// 1. Basic .c source detection
+	{
+		char *argv[] = {"prism", "foo.c", NULL};
+		Cli cli = cli_parse(2, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: .c file → source");
+		CHECK(cli.cc_arg_count == 0, "cli: no cc_args for plain source");
+		cli_free(&cli);
+	}
+
+	// 2. .i file is source
+	{
+		char *argv[] = {"prism", "foo.i", NULL};
+		Cli cli = cli_parse(2, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: .i file → source");
+		cli_free(&cli);
+	}
+
+	// 3. .o file → cc_args
+	{
+		char *argv[] = {"prism", "foo.o", NULL};
+		Cli cli = cli_parse(2, argv);
+		CHECK_EQ(cli.source_count, 0, "cli: .o file → not source");
+		CHECK_EQ(cli.cc_arg_count, 1, "cli: .o file → cc_args");
+		cli_free(&cli);
+	}
+
+	// 4. Split -D with .c value
+	{
+		char *argv[] = {"prism", "-D", "FOO=bar.c", "real.c", NULL};
+		Cli cli = cli_parse(4, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: split -D .c value not source");
+		CHECK_EQ(cli.cc_arg_count, 2, "cli: -D and value forwarded");
+		cli_free(&cli);
+	}
+
+	// 5. Joined -D: -DFOO=bar.c → single cc_arg
+	{
+		char *argv[] = {"prism", "-DFOO=bar.c", "real.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: joined -D .c not source");
+		CHECK_EQ(cli.cc_arg_count, 1, "cli: joined -D single cc_arg");
+		cli_free(&cli);
+	}
+
+	// 6. Split -I with .c-like path
+	{
+		char *argv[] = {"prism", "-I", "/path/to/dir.c", "real.c", NULL};
+		Cli cli = cli_parse(4, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: split -I .c path not source");
+		CHECK_EQ(cli.cc_arg_count, 2, "cli: -I and path forwarded");
+		cli_free(&cli);
+	}
+
+	// 7. -include with .c file
+	{
+		char *argv[] = {"prism", "-include", "header.c", "real.c", NULL};
+		Cli cli = cli_parse(4, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: -include .c not source");
+		CHECK_EQ(cli.cc_arg_count, 2, "cli: -include and arg forwarded");
+		cli_free(&cli);
+	}
+
+	// 8. -isystem with .c path
+	{
+		char *argv[] = {"prism", "-isystem", "/usr/include.c", "real.c", NULL};
+		Cli cli = cli_parse(4, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: -isystem .c not source");
+		CHECK_EQ(cli.cc_arg_count, 2, "cli: -isystem and arg forwarded");
+		cli_free(&cli);
+	}
+
+	// 9. -o split
+	{
+		char *argv[] = {"prism", "-o", "out.o", "foo.c", NULL};
+		Cli cli = cli_parse(4, argv);
+		CHECK(cli.output && !strcmp(cli.output, "out.o"), "cli: -o split output");
+		CHECK_EQ(cli.source_count, 1, "cli: source after -o split");
+		cli_free(&cli);
+	}
+
+	// 10. -o joined
+	{
+		char *argv[] = {"prism", "-oout.o", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK(cli.output && !strcmp(cli.output, "out.o"), "cli: -o joined output");
+		cli_free(&cli);
+	}
+
+	// 11. -c sets compile_only and forwards
+	{
+		char *argv[] = {"prism", "-c", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK(cli.compile_only, "cli: -c sets compile_only");
+		bool found = false;
+		for (int j = 0; j < cli.cc_arg_count; j++)
+			if (!strcmp(cli.cc_args[j], "-c")) found = true;
+		CHECK(found, "cli: -c forwarded to cc_args");
+		cli_free(&cli);
+	}
+
+	// 12. -E sets passthrough; subsequent .c not treated as source
+	{
+		char *argv[] = {"prism", "-E", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK(cli.passthrough, "cli: -E sets passthrough");
+		CHECK_EQ(cli.source_count, 0, "cli: -E no sources");
+		CHECK_EQ(cli.cc_arg_count, 2, "cli: -E and foo.c in cc_args");
+		cli_free(&cli);
+	}
+
+	// 13. Prism feature flags consumed (not forwarded)
+	{
+		char *argv[] = {"prism", "-fno-defer", "-fno-zeroinit", "-fno-orelse",
+				"-fno-line-directives", "-fno-safety", "-fflatten-headers", "foo.c", NULL};
+		Cli cli = cli_parse(8, argv);
+		CHECK(!cli.features.defer, "cli: -fno-defer");
+		CHECK(!cli.features.zeroinit, "cli: -fno-zeroinit");
+		CHECK(!cli.features.orelse, "cli: -fno-orelse");
+		CHECK(!cli.features.line_directives, "cli: -fno-line-directives");
+		CHECK(cli.features.warn_safety, "cli: -fno-safety → warn_safety");
+		CHECK(cli.features.flatten_headers, "cli: -fflatten-headers");
+		CHECK_EQ(cli.cc_arg_count, 0, "cli: prism flags not forwarded");
+		cli_free(&cli);
+	}
+
+	// 14. Non-prism -f flags forwarded
+	{
+		char *argv[] = {"prism", "-fPIC", "-fintegrated-as", "foo.c", NULL};
+		Cli cli = cli_parse(4, argv);
+		CHECK_EQ(cli.cc_arg_count, 2, "cli: -fPIC -fintegrated-as forwarded");
+		cli_free(&cli);
+	}
+
+	// 15. --prism-cc=
+	{
+		char *argv[] = {"prism", "--prism-cc=clang-15", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK(cli.cc && !strcmp(cli.cc, "clang-15"), "cli: --prism-cc= sets cc");
+		cli_free(&cli);
+	}
+
+	// 16. --prism-verbose
+	{
+		char *argv[] = {"prism", "--prism-verbose", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK(cli.verbose, "cli: --prism-verbose");
+		cli_free(&cli);
+	}
+
+	// 17. --help
+	{
+		char *argv[] = {"prism", "--help", NULL};
+		Cli cli = cli_parse(2, argv);
+		CHECK_EQ(cli.action, CLI_ACT_HELP, "cli: --help action");
+		cli_free(&cli);
+	}
+
+	// 18. -h
+	{
+		char *argv[] = {"prism", "-h", NULL};
+		Cli cli = cli_parse(2, argv);
+		CHECK_EQ(cli.action, CLI_ACT_HELP, "cli: -h action");
+		cli_free(&cli);
+	}
+
+	// 19. --version
+	{
+		char *argv[] = {"prism", "--version", NULL};
+		Cli cli = cli_parse(2, argv);
+		CHECK_EQ(cli.action, CLI_ACT_VERSION, "cli: --version action");
+		cli_free(&cli);
+	}
+
+	// 20. Commands: run, transpile, install
+	{
+		char *argv[] = {"prism", "run", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK_EQ(cli.mode, CLI_RUN, "cli: run mode");
+		CHECK_EQ(cli.source_count, 1, "cli: source after run");
+		cli_free(&cli);
+	}
+	{
+		char *argv[] = {"prism", "transpile", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK_EQ(cli.mode, CLI_EMIT, "cli: transpile mode");
+		cli_free(&cli);
+	}
+	{
+		char *argv[] = {"prism", "install", NULL};
+		Cli cli = cli_parse(2, argv);
+		CHECK_EQ(cli.mode, CLI_INSTALL, "cli: install mode");
+		cli_free(&cli);
+	}
+
+	// 21. Dep flags → dep_args
+	{
+		char *argv[] = {"prism", "-MD", "-MF", "deps.d", "foo.c", NULL};
+		Cli cli = cli_parse(5, argv);
+		CHECK_EQ(cli.dep_arg_count, 3, "cli: dep args -MD -MF deps.d");
+		CHECK(cli.dep_arg_count >= 1 && !strcmp(cli.dep_args[0], "-MD"), "cli: dep[0] = -MD");
+		CHECK(cli.dep_arg_count >= 2 && !strcmp(cli.dep_args[1], "-MF"), "cli: dep[1] = -MF");
+		CHECK(cli.dep_arg_count >= 3 && !strcmp(cli.dep_args[2], "deps.d"), "cli: dep[2] = deps.d");
+		CHECK_EQ(cli.cc_arg_count, 0, "cli: dep flags not in cc_args");
+		CHECK_EQ(cli.source_count, 1, "cli: source after dep flags");
+		cli_free(&cli);
+	}
+
+	// 22. -Wp,-MMD,deps.d → dep_args
+	{
+		char *argv[] = {"prism", "-Wp,-MMD,deps.d", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK_EQ(cli.dep_arg_count, 1, "cli: -Wp dep flag → dep_args");
+		CHECK_EQ(cli.cc_arg_count, 0, "cli: -Wp dep not in cc_args");
+		cli_free(&cli);
+	}
+
+	// 23. Unknown --long flag → cc_args
+	{
+		char *argv[] = {"prism", "--sysroot=/usr", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK_EQ(cli.cc_arg_count, 1, "cli: unknown --flag → cc_args");
+		CHECK(cli.cc_arg_count >= 1 && !strcmp(cli.cc_args[0], "--sysroot=/usr"), "cli: --sysroot value");
+		cli_free(&cli);
+	}
+
+	// 24. Standalone flags don't eat next arg: -v, -g, -S, -w
+	{
+		char *argv[] = {"prism", "-v", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK_EQ(cli.cc_arg_count, 1, "cli: -v alone");
+		CHECK_EQ(cli.source_count, 1, "cli: foo.c not eaten by -v");
+		cli_free(&cli);
+	}
+	{
+		char *argv[] = {"prism", "-g", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK_EQ(cli.cc_arg_count, 1, "cli: -g alone");
+		CHECK_EQ(cli.source_count, 1, "cli: foo.c not eaten by -g");
+		cli_free(&cli);
+	}
+	{
+		char *argv[] = {"prism", "-S", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK_EQ(cli.cc_arg_count, 1, "cli: -S alone");
+		CHECK_EQ(cli.source_count, 1, "cli: foo.c not eaten by -S");
+		cli_free(&cli);
+	}
+	{
+		char *argv[] = {"prism", "-w", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK_EQ(cli.cc_arg_count, 1, "cli: -w alone");
+		CHECK_EQ(cli.source_count, 1, "cli: foo.c not eaten by -w");
+		cli_free(&cli);
+	}
+
+	// 25. Mixed flags and sources
+	{
+		char *argv[] = {"prism", "-Wall", "file1.c", "-O2", "file2.c", "-o", "out", NULL};
+		Cli cli = cli_parse(7, argv);
+		CHECK_EQ(cli.source_count, 2, "cli: mixed two sources");
+		CHECK(cli.source_count >= 1 && !strcmp(cli.sources[0], "file1.c"), "cli: mixed src[0]");
+		CHECK(cli.source_count >= 2 && !strcmp(cli.sources[1], "file2.c"), "cli: mixed src[1]");
+		CHECK(cli.output && !strcmp(cli.output, "out"), "cli: mixed output");
+		bool wall = false, o2 = false;
+		for (int j = 0; j < cli.cc_arg_count; j++) {
+			if (!strcmp(cli.cc_args[j], "-Wall")) wall = true;
+			if (!strcmp(cli.cc_args[j], "-O2")) o2 = true;
+		}
+		CHECK(wall, "cli: -Wall forwarded");
+		CHECK(o2, "cli: -O2 forwarded");
+		cli_free(&cli);
+	}
+
+	// 26. -Wl,-rpath,/foo.c → cc_args not source
+	{
+		char *argv[] = {"prism", "-Wl,-rpath,/foo.c", "real.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: -Wl .c not source");
+		CHECK_EQ(cli.cc_arg_count, 1, "cli: -Wl forwarded");
+		cli_free(&cli);
+	}
+
+	// 27. -target (multi-char flag taking arg)
+	{
+		char *argv[] = {"prism", "-target", "aarch64-linux-gnu", "foo.c", NULL};
+		Cli cli = cli_parse(4, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: source after -target");
+		CHECK_EQ(cli.cc_arg_count, 2, "cli: -target and value");
+		cli_free(&cli);
+	}
+
+	// 28. --prism-emit=path
+	{
+		char *argv[] = {"prism", "--prism-emit=out.c", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK_EQ(cli.mode, CLI_EMIT, "cli: --prism-emit= sets emit");
+		CHECK(cli.output && !strcmp(cli.output, "out.c"), "cli: --prism-emit= output");
+		cli_free(&cli);
+	}
+
+	// 29. --prism-emit without =
+	{
+		char *argv[] = {"prism", "--prism-emit", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK_EQ(cli.mode, CLI_EMIT, "cli: --prism-emit sets emit");
+		cli_free(&cli);
+	}
+
+	// 30. -fno-flatten-headers overrides -fflatten-headers
+	{
+		char *argv[] = {"prism", "-fflatten-headers", "-fno-flatten-headers", "foo.c", NULL};
+		Cli cli = cli_parse(4, argv);
+		CHECK(!cli.features.flatten_headers, "cli: -fno-flatten-headers overrides");
+		cli_free(&cli);
+	}
+
+	// 31. Empty argv
+	{
+		char *argv[] = {"prism", NULL};
+		Cli cli = cli_parse(1, argv);
+		CHECK_EQ(cli.source_count, 0, "cli: empty no sources");
+		CHECK_EQ(cli.cc_arg_count, 0, "cli: empty no cc_args");
+		CHECK_EQ(cli.action, CLI_ACT_NONE, "cli: empty no action");
+		cli_free(&cli);
+	}
+
+	// 32. Multiple sources
+	{
+		char *argv[] = {"prism", "a.c", "b.c", "c.c", NULL};
+		Cli cli = cli_parse(4, argv);
+		CHECK_EQ(cli.source_count, 3, "cli: three sources");
+		cli_free(&cli);
+	}
+
+	// 33. All dep flags: -MMD -MP -MT -MQ
+	{
+		char *argv[] = {"prism", "-MMD", "-MP", "-MT", "tgt.o", "-MQ", "q.o", "foo.c", NULL};
+		Cli cli = cli_parse(8, argv);
+		CHECK_EQ(cli.dep_arg_count, 6, "cli: 6 dep args");
+		CHECK_EQ(cli.source_count, 1, "cli: source after full dep");
+		cli_free(&cli);
+	}
+
+	// 34. -U split with .c-like value
+	{
+		char *argv[] = {"prism", "-U", "MACRO.c", "real.c", NULL};
+		Cli cli = cli_parse(4, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: -U split .c not source");
+		CHECK_EQ(cli.cc_arg_count, 2, "cli: -U and value");
+		cli_free(&cli);
+	}
+
+	// 35. -x split
+	{
+		char *argv[] = {"prism", "-x", "c", "foo.c", NULL};
+		Cli cli = cli_parse(4, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: source after -x c");
+		CHECK_EQ(cli.cc_arg_count, 2, "cli: -x and value");
+		cli_free(&cli);
+	}
+
+	// 36. -L and -l split with .c-like values
+	{
+		char *argv[] = {"prism", "-L", "/lib/path.c", "-l", "mylib.c", "real.c", NULL};
+		Cli cli = cli_parse(6, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: -L -l .c not source");
+		CHECK_EQ(cli.cc_arg_count, 4, "cli: -L path -l lib forwarded");
+		cli_free(&cli);
+	}
+
+	// 37. cli_free on zeroed Cli
+	{
+		Cli cli = {0};
+		cli_free(&cli);  // must not crash
+		CHECK(true, "cli: cli_free on zero Cli");
+	}
+
+	// 38. --help stops parsing (no sources gathered after)
+	{
+		char *argv[] = {"prism", "--help", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK_EQ(cli.action, CLI_ACT_HELP, "cli: --help early return");
+		CHECK_EQ(cli.source_count, 0, "cli: nothing after --help");
+		cli_free(&cli);
+	}
+
+	// 39. --version stops parsing
+	{
+		char *argv[] = {"prism", "--version", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK_EQ(cli.action, CLI_ACT_VERSION, "cli: --version early return");
+		CHECK_EQ(cli.source_count, 0, "cli: nothing after --version");
+		cli_free(&cli);
+	}
+
+	// 40. -arch (multi-char, takes arg)
+	{
+		char *argv[] = {"prism", "-arch", "arm64", "foo.c", NULL};
+		Cli cli = cli_parse(4, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: source after -arch arm64");
+		CHECK_EQ(cli.cc_arg_count, 2, "cli: -arch and arm64");
+		cli_free(&cli);
+	}
+
+	// 41. -T split (linker script)
+	{
+		char *argv[] = {"prism", "-T", "script.ld", "foo.c", NULL};
+		Cli cli = cli_parse(4, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: source after -T script");
+		CHECK_EQ(cli.cc_arg_count, 2, "cli: -T and script");
+		cli_free(&cli);
+	}
+
+	// 42. -imacros with .c file
+	{
+		char *argv[] = {"prism", "-imacros", "defs.c", "real.c", NULL};
+		Cli cli = cli_parse(4, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: -imacros .c not source");
+		CHECK_EQ(cli.cc_arg_count, 2, "cli: -imacros forwarded");
+		cli_free(&cli);
+	}
+
+	// 43. -Xlinker takes arg
+	{
+		char *argv[] = {"prism", "-Xlinker", "--as-needed", "foo.c", NULL};
+		Cli cli = cli_parse(4, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: source after -Xlinker");
+		CHECK_EQ(cli.cc_arg_count, 2, "cli: -Xlinker and arg");
+		cli_free(&cli);
+	}
+
+	// 44. Multiple split -D flags
+	{
+		char *argv[] = {"prism", "-D", "A=1", "-D", "B=2", "-D", "C=file.c", "real.c", NULL};
+		Cli cli = cli_parse(8, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: multi -D one source");
+		CHECK_EQ(cli.cc_arg_count, 6, "cli: 3x -D pairs");
+		cli_free(&cli);
+	}
+
+	// 45. Kernel-style: -DKBUILD_MODFILE=...vgettimeofday.c
+	{
+		char *argv[] = {"prism", "-D",
+				"KBUILD_MODFILE=\"arch/arm64/kernel/vdso/vgettimeofday.c\"",
+				"-c", "real.c", "-o", "out.o", NULL};
+		Cli cli = cli_parse(7, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: kernel -D .c not source");
+		CHECK(cli.source_count >= 1 && !strcmp(cli.sources[0], "real.c"), "cli: kernel source = real.c");
+		cli_free(&cli);
+	}
+
+	// 46. -o at end with no value (edge case)
+	{
+		char *argv[] = {"prism", "foo.c", "-o", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK(cli.output == NULL, "cli: -o at end with no value");
+		cli_free(&cli);
+	}
+
+	// 47. Defaults preserved when no prism flags given
+	{
+		char *argv[] = {"prism", "foo.c", NULL};
+		Cli cli = cli_parse(2, argv);
+		CHECK(cli.features.defer, "cli: default defer=true");
+		CHECK(cli.features.zeroinit, "cli: default zeroinit=true");
+		CHECK(cli.features.orelse, "cli: default orelse=true");
+		CHECK(cli.features.line_directives, "cli: default line_directives=true");
+		CHECK(!cli.features.warn_safety, "cli: default warn_safety=false");
+		CHECK(cli.features.flatten_headers, "cli: default flatten_headers=true");
+		cli_free(&cli);
+	}
+
+	// 48. Source files come out in argv order
+	{
+		char *argv[] = {"prism", "z.c", "a.c", "m.c", NULL};
+		Cli cli = cli_parse(4, argv);
+		CHECK_EQ(cli.source_count, 3, "cli: ordered 3 sources");
+		CHECK(cli.source_count >= 3 &&
+		      !strcmp(cli.sources[0], "z.c") &&
+		      !strcmp(cli.sources[1], "a.c") &&
+		      !strcmp(cli.sources[2], "m.c"), "cli: source order preserved");
+		cli_free(&cli);
+	}
+}
 
 void run_api_tests(void) {
 test_typeof_orelse_leak();
@@ -3484,6 +4001,8 @@ test_typeof_orelse_leak();
 	test_version_shows_backend_cc();
 	test_cli_split_D_flag_not_source();
 #endif
+
+	test_cli_parse_unit();
 
 	test_memory_leak_stress();
 }

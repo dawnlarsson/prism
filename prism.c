@@ -194,6 +194,7 @@ typedef struct {
 } TypedefTable;
 
 typedef enum { CLI_DEFAULT, CLI_RUN, CLI_EMIT, CLI_INSTALL } CliMode;
+typedef enum { CLI_ACT_NONE, CLI_ACT_HELP, CLI_ACT_VERSION } CliAction;
 
 typedef struct {
 	PrismFeatures features;
@@ -206,8 +207,10 @@ typedef struct {
 	int cc_arg_count, cc_arg_cap;
 	int dep_arg_count, dep_arg_cap;
 	CliMode mode;
+	CliAction action;
 	bool verbose;
 	bool compile_only;
+	bool passthrough;
 } Cli;
 
 // Control flow scope flags
@@ -4622,6 +4625,144 @@ src_cleanup:
 }
 #endif // PRISM_LIB_MODE
 
+// --- CLI parsing (available in both lib mode and binary mode) ---
+
+#define CLI_PUSH(arr, cnt, cap, item)                                                                        \
+	do {                                                                                                 \
+		ENSURE_ARRAY_CAP(arr, (cnt) + 1, cap, 16, __typeof__(*(arr)));                               \
+		(arr)[(cnt)++] = (item);                                                                     \
+	} while (0)
+
+static inline bool has_ext(const char *f, const char *ext) {
+	size_t fl = strlen(f), el = strlen(ext);
+	return fl >= el && !strcmp(f + fl - el, ext);
+}
+
+static bool str_startswith(const char *s, const char *prefix) {
+	return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+// Does a flag need to consume the next argv element?
+// Single-char: blacklist the few standalone flags; default = takes arg.
+// Multi-char: whitelist the known split-argument flags.
+static bool cc_flag_takes_arg(const char *a) {
+	if (a[0] != '-' || !a[1]) return false;
+	if (!a[2]) {
+		switch (a[1]) {
+		case 'c': case 'E': case 'S': case 'v': case 'w': case 's':
+		case 'g': case 'H': case 'P': case 'p': case 'r': case 'C':
+		case 'h': case 'Q':
+			return false;
+		default:
+			return true;
+		}
+	}
+	return !strcmp(a, "-include") || !strcmp(a, "-isystem") ||
+	       !strcmp(a, "-idirafter") || !strcmp(a, "-imacros") ||
+	       !strcmp(a, "-iquote") || !strcmp(a, "-iprefix") ||
+	       !strcmp(a, "-iwithprefix") || !strcmp(a, "-iwithprefixbefore") ||
+	       !strcmp(a, "-Xlinker") || !strcmp(a, "-Xpreprocessor") ||
+	       !strcmp(a, "-Xassembler") || !strcmp(a, "-target") ||
+	       !strcmp(a, "-arch");
+}
+
+// Is this a dependency-generation flag that should go to the preprocessor only?
+// Returns 0 (not dep), 1 (standalone), or 2 (consumes next arg).
+static int dep_flag_kind(const char *a) {
+	if (a[1] == 'M') {
+		if (!strcmp(a, "-MD") || !strcmp(a, "-MMD") || !strcmp(a, "-MP")) return 1;
+		if (!strcmp(a, "-MF") || !strcmp(a, "-MT") || !strcmp(a, "-MQ")) return 2;
+	}
+	if (a[1] == 'W' && a[2] == 'p' && a[3] == ',') {
+		const char *v = a + 4;
+		if (strstr(v, "-MD") || strstr(v, "-MMD") || strstr(v, "-MF") ||
+		    strstr(v, "-MT") || strstr(v, "-MQ") || strstr(v, "-MP"))
+			return 1;
+	}
+	return 0;
+}
+
+// Pure CLI parser — no side effects (no exit/print). Caller handles actions.
+static Cli cli_parse(int argc, char **argv) {
+	Cli cli = {.features = prism_defaults()};
+
+	for (int i = 1; i < argc; i++) {
+		char *a = argv[i];
+
+		// -- Non-flag arguments --
+		if (a[0] != '-' || !a[1]) {
+			if (!strcmp(a, "run"))       { cli.mode = CLI_RUN; continue; }
+			if (!strcmp(a, "transpile")) { cli.mode = CLI_EMIT; continue; }
+			if (!strcmp(a, "install"))   { cli.mode = CLI_INSTALL; continue; }
+			if (!cli.passthrough && (has_ext(a, ".c") || has_ext(a, ".i"))) {
+				CLI_PUSH(cli.sources, cli.source_count, cli.source_cap, a);
+				continue;
+			}
+			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
+			continue;
+		}
+
+		// -- Output --
+		if (a[1] == 'o' && a[1]) {
+			cli.output = a[2] ? a + 2 : (i + 1 < argc ? argv[++i] : NULL);
+			continue;
+		}
+
+		// -- Prism's own flags (consumed, not forwarded) --
+		if (a[1] == '-') {
+			if (!strcmp(a, "--help"))               { cli.action = CLI_ACT_HELP; return cli; }
+			if (!strcmp(a, "--version"))            { cli.action = CLI_ACT_VERSION; return cli; }
+			if (str_startswith(a, "--prism-cc="))   { cli.cc = a + 11; continue; }
+			if (!strcmp(a, "--prism-verbose"))       { cli.verbose = true; continue; }
+			if (str_startswith(a, "--prism-emit=")) { cli.mode = CLI_EMIT; cli.output = a + 13; continue; }
+			if (!strcmp(a, "--prism-emit"))          { cli.mode = CLI_EMIT; continue; }
+			// fall through to forward
+		} else if (a[1] == 'h' && !a[2]) {
+			cli.action = CLI_ACT_HELP; return cli;
+		} else if (a[1] == 'c' && !a[2]) {
+			cli.compile_only = true;
+			// also forward -c to CC
+		} else if (a[1] == 'E' && !a[2]) {
+			cli.passthrough = true;
+			// also forward -E to CC
+		} else if (a[1] == 'f') {
+			if (!strcmp(a, "-fno-defer"))            { cli.features.defer = false; continue; }
+			if (!strcmp(a, "-fno-zeroinit"))         { cli.features.zeroinit = false; continue; }
+			if (!strcmp(a, "-fno-orelse"))           { cli.features.orelse = false; continue; }
+			if (!strcmp(a, "-fno-line-directives"))  { cli.features.line_directives = false; continue; }
+			if (!strcmp(a, "-fno-safety"))           { cli.features.warn_safety = true; continue; }
+			if (!strcmp(a, "-fflatten-headers"))     { cli.features.flatten_headers = true; continue; }
+			if (!strcmp(a, "-fno-flatten-headers"))  { cli.features.flatten_headers = false; continue; }
+			// fall through to forward
+		} else {
+			// Dependency-generation flags → preprocessor only
+			int dk = dep_flag_kind(a);
+			if (dk) {
+				CLI_PUSH(cli.dep_args, cli.dep_arg_count, cli.dep_arg_cap, a);
+				if (dk == 2 && i + 1 < argc)
+					CLI_PUSH(cli.dep_args, cli.dep_arg_count, cli.dep_arg_cap, argv[++i]);
+				continue;
+			}
+		}
+
+		// -- Forward to CC --
+		CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
+		if (i + 1 < argc && cc_flag_takes_arg(a))
+			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, argv[++i]);
+	}
+
+	return cli;
+}
+
+static void cli_free(Cli *cli) {
+	free(cli->sources);
+	free(cli->cc_args);
+	free(cli->dep_args);
+	cli->sources = NULL;
+	cli->cc_args = NULL;
+	cli->dep_args = NULL;
+}
+
 #ifndef PRISM_LIB_MODE
 
 // Transpile and pipe output directly to the compiler (no temp files)
@@ -4882,21 +5023,6 @@ static const char *get_real_cc(const char *cc) {
 	return cc;
 }
 
-#define CLI_PUSH(arr, cnt, cap, item)                                                                        \
-	do {                                                                                                 \
-		ENSURE_ARRAY_CAP(arr, (cnt) + 1, cap, 16, __typeof__(*(arr)));                               \
-		(arr)[(cnt)++] = (item);                                                                     \
-	} while (0)
-
-static inline bool has_ext(const char *f, const char *ext) {
-	size_t fl = strlen(f), el = strlen(ext);
-	return fl >= el && !strcmp(f + fl - el, ext);
-}
-
-static bool str_startswith(const char *s, const char *prefix) {
-	return strncmp(s, prefix, strlen(prefix)) == 0;
-}
-
 // Check if the system compiler is clang
 static bool cc_is_clang(const char *cc) {
 #ifdef __APPLE__
@@ -4969,135 +5095,6 @@ static void print_help(void) {
 	       "https://github.com/dawnlarsson/prism\n",
 	       PRISM_VERSION,
 	       get_install_path());
-}
-
-static Cli cli_parse(int argc, char **argv) {
-	bool passthrough = false;
-	Cli cli = {.features = prism_defaults()};
-
-	char *env_cc = getenv("PRISM_CC");
-	if (!env_cc || !*env_cc || is_prism_cc(env_cc)) {
-		env_cc = getenv("CC");
-		if (is_prism_cc(env_cc)) env_cc = NULL;
-	}
-	cli.cc = (env_cc && *env_cc) ? env_cc : PRISM_DEFAULT_CC;
-
-	for (int i = 1; i < argc; i++) {
-		char *a = argv[i];
-
-		if (a[0] == '-' &&
-		a[1] !=
-			'\0')
-		{
-			char c1 = a[1];
-
-			if (c1 == 'o') {
-				if (a[2]) cli.output = a + 2;
-				else if (i + 1 < argc) cli.output = argv[++i];
-				continue;
-			}
-
-			if (c1 == 'c' && !a[2]) {
-				cli.compile_only = true;
-				CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
-				continue;
-			}
-
-			if (c1 == 'E' && !a[2]) {
-				passthrough = true;
-				CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
-				continue;
-			}
-
-			if (c1 == 'h' && !a[2]) {
-				print_help();
-				exit(0);
-			}
-
-			if (c1 == '-') {
-				if (!strcmp(a, "--help")) {print_help(); exit(0);}
-				if (!strcmp(a, "--version")) {
-					const char *real_cc = get_real_cc(cli.cc);
-#ifndef _WIN32
-					char cc_line[256];
-					char *vargs[] = {(char *)real_cc, "--version", NULL};
-					if (capture_first_line(vargs, cc_line, sizeof(cc_line)) == 0 && cc_line[0])
-						printf("prism %s (%s)\n", PRISM_VERSION, cc_line);
-					else
-#endif
-						printf("prism %s\n", PRISM_VERSION);
-					exit(0);
-				}
-				if (str_startswith(a, "--prism-cc=")) { cli.cc = a + 11; continue; }
-				if (!strcmp(a, "--prism-verbose")) { cli.verbose = true; continue; }
-				if (str_startswith(a, "--prism-emit=")) { cli.mode = CLI_EMIT; cli.output = a + 13; continue; }
-				if (!strcmp(a, "--prism-emit")) { cli.mode = CLI_EMIT; continue; }
-				CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
-				continue;
-			}
-
-			if (c1 == 'f') {
-				if (!strcmp(a, "-fno-defer")) { cli.features.defer = false; continue; }
-				if (!strcmp(a, "-fno-zeroinit")) { cli.features.zeroinit = false; continue; }
-				if (!strcmp(a, "-fno-orelse")) { cli.features.orelse = false; continue; }
-				if (!strcmp(a, "-fno-line-directives")) { cli.features.line_directives = false; continue; }
-				if (!strcmp(a, "-fno-safety")) { cli.features.warn_safety = true; continue; }
-				if (!strcmp(a, "-fflatten-headers")) { cli.features.flatten_headers = true; continue; }
-				if (!strcmp(a, "-fno-flatten-headers")) { cli.features.flatten_headers = false; continue; }
-				
-				CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
-				continue;
-			}
-
-			// Dependency-generation flags: route to preprocessor only.
-			// With -fpreprocessed the backend skips preprocessing, so
-			// these flags would produce empty .d files if forwarded.
-			if (c1 == 'M') {
-				// -MD, -MMD, -MP (no argument)
-				if (!strcmp(a, "-MD") || !strcmp(a, "-MMD") || !strcmp(a, "-MP")) {
-					CLI_PUSH(cli.dep_args, cli.dep_arg_count, cli.dep_arg_cap, a);
-					continue;
-				}
-				// -MF <file>, -MT <target>, -MQ <target> (consume next arg)
-				if ((!strcmp(a, "-MF") || !strcmp(a, "-MT") || !strcmp(a, "-MQ")) && i + 1 < argc) {
-					CLI_PUSH(cli.dep_args, cli.dep_arg_count, cli.dep_arg_cap, a);
-					CLI_PUSH(cli.dep_args, cli.dep_arg_count, cli.dep_arg_cap, argv[++i]);
-					continue;
-				}
-			}
-			if (c1 == 'W' && a[2] == 'p' && a[3] == ',') {
-				// -Wp,-MD,... / -Wp,-MMD,... / -Wp,-MF,... etc.
-				if (strstr(a + 4, "-MD") || strstr(a + 4, "-MMD") ||
-				    strstr(a + 4, "-MF") || strstr(a + 4, "-MT") ||
-				    strstr(a + 4, "-MQ") || strstr(a + 4, "-MP")) {
-					CLI_PUSH(cli.dep_args, cli.dep_arg_count, cli.dep_arg_cap, a);
-					continue;
-				}
-			}
-
-			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
-			// CC flags that accept a separate next argument: forward both.
-			// Without this, the next arg (e.g. a -D value ending in ".c")
-			// would be misidentified as a source file.
-			if (i + 1 < argc && !a[2] && (c1 == 'D' || c1 == 'I' || c1 == 'U' ||
-			    c1 == 'x' || c1 == 'L' || c1 == 'l' || c1 == 'T'))
-				CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, argv[++i]);
-			continue;
-		}
-
-		if (!strcmp(a, "run")) { cli.mode = CLI_RUN; continue; }
-		if (!strcmp(a, "transpile")) { cli.mode = CLI_EMIT; continue; }
-		if (!strcmp(a, "install")) { cli.mode = CLI_INSTALL; continue; }
-
-		if ((has_ext(a, ".c") || has_ext(a, ".i")) && !passthrough) {
-			CLI_PUSH(cli.sources, cli.source_count, cli.source_cap, a);
-			continue;
-		}
-
-		CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
-	}
-
-	return cli;
 }
 
 static void add_warn_suppress(const char **args, int *argc, bool clang, bool msvc) {
@@ -5398,6 +5395,32 @@ int main(int argc, char **argv) {
 	}
 
 	Cli cli = cli_parse(argc, argv);
+
+	// Handle help/version actions (cli_parse sets these without side effects)
+	if (cli.action == CLI_ACT_HELP) { print_help(); return 0; }
+	if (cli.action == CLI_ACT_VERSION) {
+		const char *real_cc = get_real_cc(cli.cc);
+#ifndef _WIN32
+		char cc_line[256];
+		char *vargs[] = {(char *)real_cc, "--version", NULL};
+		if (capture_first_line(vargs, cc_line, sizeof(cc_line)) == 0 && cc_line[0])
+			printf("prism %s (%s)\n", PRISM_VERSION, cc_line);
+		else
+#endif
+			printf("prism %s\n", PRISM_VERSION);
+		return 0;
+	}
+
+	// Resolve CC (env vars checked here, not in cli_parse, to keep it pure)
+	if (!cli.cc) {
+		char *env_cc = getenv("PRISM_CC");
+		if (!env_cc || !*env_cc || is_prism_cc(env_cc)) {
+			env_cc = getenv("CC");
+			if (is_prism_cc(env_cc)) env_cc = NULL;
+		}
+		cli.cc = (env_cc && *env_cc) ? env_cc : PRISM_DEFAULT_CC;
+	}
+
 	ctx->features = features_to_bits(cli.features);
 	ctx->extra_compiler = get_real_cc(cli.cc);
 	ctx->extra_compiler_flags = cli.cc_args;
