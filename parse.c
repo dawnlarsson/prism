@@ -311,6 +311,9 @@ typedef struct PrismContext {
 	Token *func_ret_type_end;	   // Function name token (exclusive end of return type range)
 	Token *func_ret_type_suffix_start; // For complex declarators: closing ')' after func params
 	Token *func_ret_type_suffix_end;   // For complex declarators: token after suffix (exclusive)
+	unsigned bracket_oe_ids[16];       // Pre-assigned temp IDs for bracket orelse hoisting
+	int bracket_oe_count;              // Count of hoisted bracket orelse temps
+	int bracket_oe_next;               // Next temp to consume during emit
 #ifdef PRISM_LIB_MODE
 	char *active_membuf;	       // open_memstream buffer; freed on longjmp recovery
 	uint32_t keyword_cache_features; // features used when keyword_cache was built

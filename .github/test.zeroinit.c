@@ -1887,6 +1887,50 @@ static void test_func_returned_vla_sizeof(void) {
 	free(path);
 }
 
+static void test_c23_if_initializer_zeroinit_dropped(void) {
+	/* FIX: Prism now treats if/switch opening parens like for() parens
+	 * so that C23 initializer declarations get proper zero-initialization.
+	 * Scalars get = 0, VLAs get an error (same as for-init). */
+
+	/* --- VLA inside if-initializer: rejected (can't inject memset) --- */
+	const char *vla_code =
+	    "void f(int n) {\n"
+	    "    if (int arr[n]; n > 0) { (void)arr; }\n"
+	    "}\n";
+	PrismResult r1 = prism_transpile_source(vla_code, "c23_if_vla.c", prism_defaults());
+	CHECK(r1.status != PRISM_OK,
+	      "c23-if-vla-zeroinit: VLA in if-initializer must be rejected");
+	prism_free(&r1);
+
+	/* --- Scalar inside if-initializer: gets = 0 --- */
+	const char *scalar_code =
+	    "void g(void) {\n"
+	    "    if (int x; 1) { (void)x; }\n"
+	    "}\n";
+	PrismResult r2 = prism_transpile_source(scalar_code, "c23_if_scalar.c", prism_defaults());
+	CHECK(r2.status == PRISM_OK && r2.output,
+	      "c23-if-scalar-zeroinit: if-initializer scalar compiles");
+	if (r2.output) {
+		CHECK(strstr(r2.output, "int x = 0") || strstr(r2.output, "int x =0"),
+		      "c23-if-scalar-zeroinit: scalar in if-initializer gets = 0");
+	}
+	prism_free(&r2);
+
+	/* --- Scalar inside switch-initializer: gets = 0 --- */
+	const char *switch_code =
+	    "void h(void) {\n"
+	    "    switch (int x; x) { default: (void)x; break; }\n"
+	    "}\n";
+	PrismResult r3 = prism_transpile_source(switch_code, "c23_switch_scalar.c", prism_defaults());
+	CHECK(r3.status == PRISM_OK && r3.output,
+	      "c23-switch-scalar-zeroinit: switch-initializer scalar compiles");
+	if (r3.output) {
+		CHECK(strstr(r3.output, "int x = 0") || strstr(r3.output, "int x =0"),
+		      "c23-switch-scalar-zeroinit: scalar in switch-initializer gets = 0");
+	}
+	prism_free(&r3);
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -1975,4 +2019,5 @@ void run_zeroinit_tests(void) {
 	test_vla_sizeof_paren_bracket();
 	test_paren_pointer_vla_masking();
 	test_func_returned_vla_sizeof();
+	test_c23_if_initializer_zeroinit_dropped();
 }

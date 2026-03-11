@@ -1469,6 +1469,71 @@ static void test_compound_literal_orelse_lifetime(void) {
 	free(path);
 }
 
+static void test_orelse_deref_funcptr_call_double_eval(void) {
+	/* BUG: The side-effect detection heuristic for orelse bare
+	 * assignments only catches function calls matching
+	 * is_valid_varname(s) + tok_next(s) == '('.  Indirect calls
+	 * like (*(&fp))() start with '(' not an identifier, so they
+	 * bypass detection entirely.  The transpiled output evaluates
+	 * the function pointer call 3 times instead of 1. */
+	const char *code =
+	    "typedef int (*fn_t)(void);\n"
+	    "void f(int *arr, fn_t fp) {\n"
+	    "    arr[(*(&fp))()] = 0 orelse 99;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "orelse_deref_fp.c", prism_defaults());
+	/* Must either reject (side-effectful LHS) or emit code that calls
+	 * the function pointer at most once. */
+	if (r.status == PRISM_OK && r.output) {
+		/* Count occurrences of the call pattern in the output */
+		int count = 0;
+		const char *p = r.output;
+		while ((p = strstr(p, "(*(&fp))()")) != NULL) { count++; p++; }
+		CHECK(count <= 1,
+		      "BUG orelse-deref-fp: indirect call (*(&fp))() evaluated multiple times");
+	} else {
+		/* Rejection is also acceptable. */
+		CHECK(1, "BUG orelse-deref-fp: indirect call (*(&fp))() evaluated multiple times");
+	}
+	prism_free(&r);
+}
+
+static void test_orelse_const_funcptr_return_type_stripped(void) {
+	/* BUG: handle_const_orelse_fallback sets
+	 *   strip_type_const = !decl->is_pointer || decl->is_func_ptr
+	 * For function pointers this strips ALL const from the type
+	 * specifier, including const that qualifies the return type's
+	 * pointee (e.g. "const char *").  The mutable temp gets type
+	 * char *(*)(void) instead of const char *(*)(void), causing
+	 * incompatible pointer type errors. */
+	const char *code =
+	    "const char *(*get_str)(void);\n"
+	    "const char *(*get_other)(void);\n"
+	    "void f(void) {\n"
+	    "    const char *(* const fp)(void) = get_str orelse get_other;\n"
+	    "    (void)fp;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "orelse_const_fp.c", prism_defaults());
+	CHECK(r.status == PRISM_OK, "orelse const fp: transpilation succeeds");
+	if (r.status == PRISM_OK && r.output) {
+		/* The mutable temp must preserve 'const char *' in the return type,
+		 * not strip it to 'char *'. */
+		const char *p = r.output;
+		bool found_stripped = false;
+		while ((p = strstr(p, "char *(* _Prism_oe_")) != NULL) {
+			if (p == r.output || (p >= r.output + 6 &&
+			    memcmp(p - 6, "const ", 6) != 0)) {
+				found_stripped = true;
+				break;
+			}
+			p++;
+		}
+		CHECK(!found_stripped,
+		      "BUG orelse-const-fp: const stripped from return type of func ptr temp");
+	}
+	prism_free(&r);
+}
+
 static void test_orelse_bare_assign_double_eval(void) {
 	printf("\n--- orelse Bare Assignment Double Evaluation ---\n");
 
@@ -1667,9 +1732,10 @@ static void test_bare_orelse_compound_literal_ternary(void) {
 	CHECK_EQ(result.status, PRISM_OK, "bare orelse compound: transpiles OK");
 	CHECK(result.output != NULL, "bare orelse compound: output not NULL");
 
-	// The fallback should use a comma-operator ternary to avoid block-scoping.
-	CHECK(strstr(result.output, ", (!") != NULL,
-	      "bare orelse compound: uses comma-operator fallback pattern");
+	// The fallback should use an if-based pattern to avoid double-reads on volatile
+	// targets while keeping compound literals in the enclosing block scope.
+	CHECK(strstr(result.output, "if (!") != NULL,
+	      "bare orelse compound: uses if-based fallback pattern");
 	// The compound literal should appear in the output
 	CHECK(strstr(result.output, "(int[]){1, 2, 3}") != NULL ||
 	      strstr(result.output, "(int[]){ 1, 2, 3 }") != NULL,
@@ -1698,11 +1764,11 @@ static void test_chained_bare_orelse(void) {
 	// The output must NOT contain the literal "orelse" keyword — that's not valid C.
 	CHECK(strstr(result.output, "orelse") == NULL,
 	      "chained bare orelse: no raw 'orelse' keyword in C output");
-	// Should produce two comma-operator ternary fallbacks for the chain
-	const char *first_ternary = strstr(result.output, ", (!");
-	CHECK(first_ternary != NULL, "chained bare orelse: first comma-ternary fallback present");
-	const char *second_ternary = first_ternary ? strstr(first_ternary + 4, ", (!") : NULL;
-	CHECK(second_ternary != NULL, "chained bare orelse: second comma-ternary fallback for chain");
+	// Should produce two if-based fallbacks for the chain
+	const char *first_if = strstr(result.output, "if (!");
+	CHECK(first_if != NULL, "chained bare orelse: first if-based fallback present");
+	const char *second_if = first_if ? strstr(first_if + 5, "if (!") : NULL;
+	CHECK(second_if != NULL, "chained bare orelse: second if-based fallback for chain");
 	// The compound literal should survive in the output
 	CHECK(strstr(result.output, "(int[]){42}") != NULL,
 	      "chained bare orelse: compound literal preserved");
@@ -1807,10 +1873,11 @@ static void test_bare_orelse_void_ternary_mismatch(void) {
 	CHECK_EQ(result.status, PRISM_OK, "void ternary: transpiles OK");
 	CHECK(result.output != NULL, "void ternary: output not NULL");
 
-	// Both branches of the ternary must be void.
-	// The assignment branch must be cast: (void)(p = (...))
-	CHECK(strstr(result.output, "(void)(") != NULL,
-	      "void ternary: assignment branch cast to (void) for ISO compliance");
+	// The if-based pattern avoids the ternary void mismatch entirely.
+	// Instead of (void) casts in comma-ternary, we now use:
+	// if (!p) p = (fallback);
+	CHECK(strstr(result.output, "if (!") != NULL,
+	      "void ternary: uses if-based pattern (no void cast needed)");
 
 	prism_free(&result);
 	unlink(path);
@@ -1914,6 +1981,153 @@ static void test_orelse_after_label_sweeps_label_into_cond(void) {
 	}
 	CHECK(!label_in_cond,
 	      "BUG orelse-after-label: label must not appear inside if(!(...)) condition");
+	prism_free(&r);
+}
+
+/* Bracket orelse must not emit GNU statement expressions or __auto_type.
+ * The output should be portable standard C using hoisted long long temps. */
+static void test_orelse_msvc_array_bracket_stmt_expr(void) {
+	const char *code =
+	    "int n;\n"
+	    "void test(void) {\n"
+	    "    int arr[n orelse 1];\n"
+	    "    (void)arr;\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	feat.compiler = "cl.exe";
+	PrismResult r = prism_transpile_source(code, "msvc_bracket_orelse.c", feat);
+	CHECK(r.status == PRISM_OK,
+	      "bracket orelse: transpiles OK for any compiler");
+	if (r.output) {
+		CHECK(strstr(r.output, "__auto_type") == NULL,
+		      "bracket orelse: no __auto_type in output");
+		CHECK(strstr(r.output, "({") == NULL,
+		      "bracket orelse: no statement expression in output");
+		CHECK(strstr(r.output, "long long _Prism_oe_") != NULL,
+		      "bracket orelse: uses hoisted long long temp");
+	}
+	prism_free(&r);
+}
+
+// ---- Audit-reported bug probes ----
+// These tests must FAIL until the underlying bugs are fixed.
+
+// Bug: orelse inside a struct body (e.g. inside typeof()) is silently
+// passed through verbatim — the literal word "orelse" appears in the
+// transpiled output, causing downstream compiler failures.
+static void test_orelse_struct_body_typeof_passthrough(void) {
+	const char *code =
+	    "int get_hw_id(void) { return 0; }\n"
+	    "struct Device {\n"
+	    "    typeof(get_hw_id() orelse 0) id;\n"
+	    "};\n";
+	PrismResult r = prism_transpile_source(code, "struct_typeof_orelse.c", prism_defaults());
+	// The transpiler should either reject this with an error OR properly
+	// transform the orelse.  It must NOT pass "orelse" through verbatim.
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "orelse") == NULL,
+		      "BUG struct-body-typeof: literal 'orelse' must not appear in output");
+	} else {
+		// If it errors, that's an acceptable resolution.
+		CHECK(r.status != PRISM_OK,
+		      "struct-body-typeof orelse: rejected by transpiler (acceptable)");
+	}
+	prism_free(&r);
+}
+
+// Bug: volatile declaration orelse emits "r = r ? r : fb" which reads
+// the volatile variable twice (once for condition, once for true-branch
+// value).  The intent is a single conditional assignment.
+static void test_orelse_volatile_decl_double_read(void) {
+	const char *code =
+	    "int get(void) { return 0; }\n"
+	    "void f(void) {\n"
+	    "    volatile int r = get() orelse 1;\n"
+	    "    (void)r;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "volatile_decl_orelse.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "volatile decl orelse: transpiles OK");
+	if (r.output) {
+		// "r = r ? r :" reads r twice — condition + true branch.
+		// A correct transformation would read r only once (e.g. if (!r) r = 1;).
+		CHECK(strstr(r.output, "r = r ? r :") == NULL,
+		      "BUG volatile-decl-orelse: must not double-read volatile var via ternary");
+	}
+	prism_free(&r);
+}
+
+// Bug: bare expression orelse with a compound-literal fallback on a
+// volatile target uses the comma-ternary pattern which re-reads the
+// volatile for the condition check after assignment.
+// "r = get(), (!r ? (void)(r = fb) : (void)0)" performs: write r,
+// then read r -- the read may see a different value on hardware-mapped
+// volatile registers.  The transpiler should either reject volatile
+// targets with compound-literal orelse, or use a temp variable.
+static void test_orelse_volatile_bare_compound_literal(void) {
+	const char *code =
+	    "struct Reg { int val; };\n"
+	    "struct Reg *get_reg(void) { return 0; }\n"
+	    "void f(void) {\n"
+	    "    volatile struct Reg *r;\n"
+	    "    r = get_reg() orelse &(struct Reg){0};\n"
+	    "    (void)r;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "volatile_bare_compound.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "volatile bare compound orelse: transpiles OK");
+	if (r.output) {
+		// The comma-ternary "r = get_reg(), (!r ?" writes then reads the
+		// volatile.  A safe version would use a temp or the if-based path.
+		CHECK(strstr(r.output, ", (!") == NULL,
+		      "BUG volatile-bare-compound-orelse: comma-ternary re-reads volatile");
+	}
+	prism_free(&r);
+}
+
+// Bug: "int extern x = get() orelse 1;" bypasses try_zero_init_decl
+// because parse_type_specifier stops at "extern" (no TT_QUALIFIER).
+// The bare-expression orelse handler then treats the whole prefix as an
+// expression, emitting garbage like "if (! int extern x) int extern x = 1;".
+// The transpiler must either reject or cleanly handle out-of-order storage
+// class specifiers that lack TT_QUALIFIER (extern, _Thread_local).
+static void test_orelse_out_of_order_storage_class(void) {
+	const char *code =
+	    "int get(void) { return 0; }\n"
+	    "void f(void) {\n"
+	    "    int extern x = get() orelse 1;\n"
+	    "    (void)x;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "out_of_order_extern.c", prism_defaults());
+	// The transpiler should either reject with an error or produce
+	// valid C.  It must NOT emit "if (! int extern x)" garbage.
+	if (r.status == PRISM_OK && r.output) {
+		// The garbage pattern emits the type specifier inside an if-condition:
+		// "int extern x)" as part of "if (!int extern x)".
+		CHECK(strstr(r.output, "int extern x)") == NULL,
+		      "BUG out-of-order-storage: must not emit 'if (! int extern x)' garbage");
+	} else {
+		CHECK(r.status != PRISM_OK,
+		      "out-of-order-storage orelse: rejected by transpiler (acceptable)");
+	}
+	prism_free(&r);
+}
+
+// Bug: typeof(int[x orelse 1]) — orelse inside [] brackets within typeof()
+// is at depth 1 relative to the outer parens.  walk_balanced_orelse only
+// scanned depth 0, skipping [] groups entirely via TF_OPEN.  The raw orelse
+// keyword passed through to the downstream compiler.
+static void test_orelse_typeof_nested_bracket(void) {
+	const char *code =
+	    "int get_n(void) { return 0; }\n"
+	    "void f(void) {\n"
+	    "    typeof(int[get_n() orelse 1]) arr;\n"
+	    "    (void)arr;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "typeof_nested_bracket.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "typeof nested bracket orelse: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "orelse") == NULL,
+		      "BUG typeof-nested-bracket: literal 'orelse' must not appear in output");
+	}
 	prism_free(&r);
 }
 
@@ -2046,5 +2260,16 @@ void run_orelse_tests(void) {
 	test_orelse_after_label_sweeps_label_into_cond();
 	test_chained_orelse_in_typeof();
 	test_orelse_leak_in_expr_parens();
+	test_orelse_deref_funcptr_call_double_eval();
+	test_orelse_const_funcptr_return_type_stripped();
+
+	test_orelse_msvc_array_bracket_stmt_expr();
+
+	// Audit-reported bug probes (should FAIL until fixed)
+	test_orelse_struct_body_typeof_passthrough();
+	test_orelse_volatile_decl_double_read();
+	test_orelse_volatile_bare_compound_literal();
+	test_orelse_out_of_order_storage_class();
+	test_orelse_typeof_nested_bracket();
 }
 

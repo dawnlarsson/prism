@@ -277,14 +277,32 @@ static DeferEntry defer_stack[2048];
 static int defer_count = 0;
 static CtrlState ctrl_state;
 
+// Track variables that shadow a name captured by a defer in an enclosing scope.
+// The shadow is only dangerous if a control-flow exit pastes the defer while the
+// shadowing variable is still in scope.  We record the shadow at declaration time
+// and check at every exit point that actually emits defers.
+typedef struct {
+	char *name;
+	int len;
+	int block_depth;   // scope depth where the shadowing variable was declared
+	Token *var_tok;    // for error reporting
+	int defer_idx;     // which defer it conflicts with
+} DeferShadow;
+
+#define MAX_DEFER_SHADOWS 256
+static DeferShadow defer_shadows[MAX_DEFER_SHADOWS];
+static int defer_shadow_count = 0;
+
 // Forward declarations (only for functions used before their definition)
 static DeclResult parse_declarator(Token *tok, bool emit);
 static bool is_type_keyword(Token *tok);
 static inline bool is_valid_varname(Token *tok);
 static void typedef_pop_scope(int scope_depth);
+static void defer_shadow_pop_scope(int leaving_block_depth);
+static void check_defer_shadow_at_exit(DeferEmitMode mode, int stop_depth);
 static TypeSpecResult parse_type_specifier(Token *tok);
 static Token *emit_expr_to_semicolon(Token *tok);
-static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma);
+static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bool has_volatile, Token *stop_comma);
 static Token *emit_return_body(Token *tok, Token *stop);
 static Token *try_zero_init_decl(Token *tok);
 static Token *decl_noise(Token *tok, bool emit);
@@ -347,6 +365,7 @@ static void reset_transpiler_state(void) {
 	label_count = 0;
 	label_capacity = 0;
 	defer_count = 0;
+	defer_shadow_count = 0;
 
 }
 
@@ -633,6 +652,7 @@ static void scope_pop(void) {
 		ctx->scope_depth--;
 		ScopeNode *s = &scope_stack[ctx->scope_depth];
 		if (s->kind == SCOPE_BLOCK) {
+			defer_shadow_pop_scope(ctx->block_depth);
 			ctx->block_depth--;
 		}
 	}
@@ -801,6 +821,10 @@ static void emit_deferred_range(Token *start, Token *end) {
 static void emit_defers_ex(DeferEmitMode mode, int stop_depth) {
 	if (ctx->block_depth <= 0) return;
 
+	// For control-flow exits (not end-of-scope), verify no live shadow conflicts.
+	if (mode != DEFER_SCOPE)
+		check_defer_shadow_at_exit(mode, stop_depth);
+
 	int current_defer = defer_count - 1;
 	for (int d = ctx->scope_depth - 1; d >= 0; d--) {
 		if (scope_stack[d].kind != SCOPE_BLOCK) continue;
@@ -830,6 +854,74 @@ static bool has_defers_for(DeferEmitMode mode, int stop_depth) {
 		if (mode == DEFER_CONTINUE && scope_stack[d].is_loop) return false;
 	}
 	return false;
+}
+
+// Record that declaring var_name shadows a name captured by a defer in an
+// enclosing scope.  The actual error is deferred until a control-flow exit
+// (return/goto/break/continue) pastes the defer while the shadow is live.
+// Shadowing is safe when the inner variable goes out of scope before any
+// such exit (normal block end always pops the shadow first).
+static void check_defer_var_shadow(Token *var_name) {
+	if (!FEAT(F_DEFER) || defer_count == 0) return;
+	ScopeNode *blk = scope_block_top();
+	if (!blk) return;
+	int outer_defer_end = blk->defer_start_idx;
+	if (outer_defer_end <= 0) return;
+	char *name = tok_loc(var_name);
+	int nlen = var_name->len;
+	for (int i = 0; i < outer_defer_end; i++) {
+		for (Token *t = defer_stack[i].stmt; t && t != defer_stack[i].end && t->kind != TK_EOF;
+		     t = tok_next(t)) {
+			if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
+			    t->len == nlen && !memcmp(tok_loc(t), name, nlen)) {
+				if (defer_shadow_count < MAX_DEFER_SHADOWS)
+					defer_shadows[defer_shadow_count++] = (DeferShadow){
+						.name = name, .len = nlen,
+						.block_depth = ctx->block_depth,
+						.var_tok = var_name,
+						.defer_idx = i,
+					};
+				return;
+			}
+		}
+	}
+}
+
+// Pop defer shadows when leaving a scope (block_depth is about to decrease).
+static void defer_shadow_pop_scope(int leaving_block_depth) {
+	while (defer_shadow_count > 0 &&
+	       defer_shadows[defer_shadow_count - 1].block_depth >= leaving_block_depth)
+		defer_shadow_count--;
+}
+
+// Check if any currently-live defer shadow conflicts with the defers that are
+// about to be pasted.  Called at return/goto/break/continue — anywhere
+// emit_defers_ex will paste defer bodies while inner variables are still live.
+static void check_defer_shadow_at_exit(DeferEmitMode mode, int stop_depth) {
+	if (defer_shadow_count == 0) return;
+	// Determine which defer indices will be pasted by this exit.
+	// Walk scopes the same way emit_defers_ex does, collecting the range.
+	int min_defer_idx = defer_count; // exclusive upper bound not needed; just track min
+	for (int d = ctx->scope_depth - 1; d >= 0; d--) {
+		if (scope_stack[d].kind != SCOPE_BLOCK) continue;
+		if (mode == DEFER_TO_DEPTH && d < stop_depth) break;
+		if (scope_stack[d].defer_start_idx < min_defer_idx)
+			min_defer_idx = scope_stack[d].defer_start_idx;
+		if (mode == DEFER_BREAK &&
+		    (scope_stack[d].is_loop || scope_stack[d].is_switch)) break;
+		if (mode == DEFER_CONTINUE && scope_stack[d].is_loop) break;
+	}
+	if (min_defer_idx >= defer_count) return; // no defers will be pasted
+	for (int si = 0; si < defer_shadow_count; si++) {
+		DeferShadow *sh = &defer_shadows[si];
+		if (sh->defer_idx >= min_defer_idx && sh->defer_idx < defer_count)
+			error_tok(sh->var_tok,
+				  "variable '%.*s' shadows a name captured by defer "
+				  "in an enclosing scope and a control-flow exit "
+				  "(return/goto/break/continue) would paste the "
+				  "defer while the shadow is live",
+				  sh->len, sh->name);
+	}
 }
 
 static void label_table_add(char *name, int name_len, int scope_depth, Token *tok, Token *block_open) {
@@ -1407,7 +1499,7 @@ static int capture_function_return_type(Token *tok) {
 }
 
 // Emit captured return type. Complex declarators get a typedef.
-// Falls back to __auto_type (GCC/Clang) or void* (MSVC) if capture failed.
+// Errors if capture failed (cannot resolve return type portably).
 static void emit_ret_type(void) {
 	if (ctx->func_ret_type_start && ctx->func_ret_type_end) {
 		if (ctx->func_ret_type_suffix_start) {
@@ -1428,11 +1520,8 @@ static void emit_ret_type(void) {
 			emit_token_range(ctx->func_ret_type_start, ctx->func_ret_type_end);
 		}
 	} else {
-		if (cc_is_msvc(ctx->extra_compiler))
-			error("defer in function with unresolvable return type is not "
-			      "supported for MSVC; use a named struct or typedef");
-		else
-			OUT_LIT("__auto_type");
+		error("defer in function with unresolvable return type; "
+		      "use a named struct or typedef");
 	}
 }
 
@@ -1761,7 +1850,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 
 		uint32_t tag = tok->tag;
 		bool is_type = is_type_keyword(tok);
-		if (!(tag & TT_QUALIFIER) && !is_type && !(tag & (TT_BITINT | TT_ALIGNAS))) break;
+		if (!(tag & (TT_QUALIFIER | TT_STORAGE)) && !is_type && !(tag & (TT_BITINT | TT_ALIGNAS))) break;
 		
 		if (equal(tok, "void") || is_void_typedef(tok)) r.has_void = true;
 		
@@ -1940,6 +2029,58 @@ static void emit_token_range_orelse(Token *start, Token *end) {
 	OUT_LIT(")");
 }
 
+// Check if a declarator's array brackets contain orelse at depth 0.
+static bool declarator_has_bracket_orelse(Token *start, Token *end) {
+	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
+		if (!match_ch(t, '[')) continue;
+		Token *close = tok_match(t);
+		if (!close) continue;
+		Token *prev = t;
+		for (Token *s = tok_next(t); s && s != close; s = tok_next(s)) {
+			if (s->flags & TF_OPEN) { prev = tok_match(s); s = tok_match(s); continue; }
+			if ((s->tag & TT_ORELSE) && !is_known_typedef(s) && !typedef_lookup(s) &&
+			    !(prev && (prev->tag & TT_MEMBER)))
+				return true;
+			prev = s;
+		}
+		t = close;
+	}
+	return false;
+}
+
+// Pre-scan a declarator for bracket orelse, emit hoisted temp declarations.
+// Each bracket orelse gets: long long _Prism_oe_ID = (LHS);
+static void emit_bracket_orelse_temps(Token *start, Token *end) {
+	ctx->bracket_oe_count = 0;
+	ctx->bracket_oe_next = 0;
+	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
+		if (!match_ch(t, '[')) continue;
+		Token *close = tok_match(t);
+		if (!close) continue;
+		Token *orelse_found = NULL;
+		Token *prev = t;
+		for (Token *s = tok_next(t); s && s != close; s = tok_next(s)) {
+			if (s->flags & TF_OPEN) { prev = tok_match(s); s = tok_match(s); continue; }
+			if ((s->tag & TT_ORELSE) && !is_known_typedef(s) && !typedef_lookup(s) &&
+			    !(prev && (prev->tag & TT_MEMBER))) {
+				orelse_found = s;
+				break;
+			}
+			prev = s;
+		}
+		if (!orelse_found) { t = close; continue; }
+		if (ctx->bracket_oe_count >= 16) break;
+		unsigned oe = ctx->ret_counter++;
+		ctx->bracket_oe_ids[ctx->bracket_oe_count++] = oe;
+		OUT_LIT(" long long _Prism_oe_");
+		out_uint(oe);
+		OUT_LIT(" = (");
+		emit_token_range(tok_next(t), orelse_found);
+		OUT_LIT(");");
+		t = close;
+	}
+}
+
 static Token *walk_balanced_orelse(Token *tok) {
 	Token *end = tok_match(tok);
 	if (!end) { emit_tok(tok); return tok_next(tok); }
@@ -1956,9 +2097,16 @@ static Token *walk_balanced_orelse(Token *tok) {
 		prev = t;
 	}
 	if (!orelse_found) {
-		// No orelse — emit normally
-		for (Token *t = tok; t != tok_next(end) && t->kind != TK_EOF; t = tok_next(t))
+		// No orelse at depth 0 — but nested brackets may contain orelse.
+		// Use orelse-aware emission for nested '[' groups.
+		for (Token *t = tok; t != tok_next(end) && t->kind != TK_EOF;) {
+			if (t != tok && t != end && match_ch(t, '[') && (t->flags & TF_OPEN) && tok_match(t)) {
+				t = walk_balanced_orelse(t);
+				continue;
+			}
 			emit_tok(t);
+			t = tok_next(t);
+		}
 		return tok_next(end);
 	}
 	// Reject control-flow actions inside brackets/typeof
@@ -1974,20 +2122,26 @@ static Token *walk_balanced_orelse(Token *tok) {
 	Token *rhs_start = tok_next(orelse_found); // first token after orelse
 	bool is_bracket = match_ch(tok, '[');
 	emit_tok(tok); // emit [ or (
-	if (is_bracket) {
-		// VLA context: use statement expression to avoid double evaluation
-		unsigned oe = ctx->ret_counter++;
-		OUT_LIT(" ({ __auto_type _Prism_oe_");
-		out_uint(oe);
-		OUT_LIT(" = (");
-		emit_token_range(lhs_start, orelse_found);
-		OUT_LIT("); _Prism_oe_");
+	if (is_bracket && ctx->bracket_oe_next < ctx->bracket_oe_count) {
+		// Use pre-hoisted temp variable (emitted before the declaration)
+		unsigned oe = ctx->bracket_oe_ids[ctx->bracket_oe_next++];
+		OUT_LIT(" _Prism_oe_");
 		out_uint(oe);
 		OUT_LIT(" ? _Prism_oe_");
 		out_uint(oe);
 		OUT_LIT(" : (");
 		emit_token_range_orelse(rhs_start, end);
-		OUT_LIT("); })");
+		OUT_LIT(")");
+	} else if (is_bracket) {
+		// Fallback for brackets not covered by pre-hoisting (e.g. function params):
+		// emit ternary with LHS duplication (no statement expression)
+		OUT_LIT(" (");
+		emit_token_range(lhs_start, orelse_found);
+		OUT_LIT(") ? (");
+		emit_token_range(lhs_start, orelse_found);
+		OUT_LIT(") : (");
+		emit_token_range_orelse(rhs_start, end);
+		OUT_LIT(")");
 	} else {
 		OUT_LIT(" (");
 		emit_token_range(lhs_start, orelse_found);
@@ -2250,9 +2404,9 @@ static Token *handle_const_orelse_fallback(Token *tok,
 	unsigned oe_id = ctx->ret_counter++;
 
 	// Emit mutable temp: strip const from type (except pointer types where it qualifies pointee).
-	// Function pointers: strip const (it qualifies return type, not the pointer variable).
-	// Declarator-level const (e.g. *const) also stripped for mutability.
-	bool strip_type_const = !decl->is_pointer || decl->is_func_ptr;
+	// Function pointers: return-type const lives in the type specifier and must be preserved;
+	// the declarator-level const (e.g. *const between parens) is stripped below.
+	bool strip_type_const = !decl->is_pointer && !decl->is_func_ptr;
 
 	// Detect const typedefs (const baked into typedef, no TT_CONST tag).
 	// Use __typeof__((type)0 + 0) to strip const via arithmetic promotion.
@@ -2511,6 +2665,11 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		OrelseInitInfo orelse_info = scan_decl_orelse(decl.end, type_start, type, &decl);
 		bool is_const_orelse_fallback = orelse_info.is_const_fallback;
 
+		// Step 2b: Pre-hoist bracket orelse temps (before type emission)
+		bool has_bo = FEAT(F_ORELSE) && declarator_has_bracket_orelse(decl_start, decl.end);
+		if (has_bo)
+			emit_bracket_orelse_temps(decl_start, decl.end);
+
 		// Deferred type emission from orelse comma continuation
 		if (need_type_emit) {
 			if (!is_const_orelse_fallback) {
@@ -2607,9 +2766,9 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		if (needs_memset) {
 			if (in_for_init())
 				error_tok(decl.var_name,
-					  "VLA or typeof variable in for-loop initializer "
+					  "VLA or typeof variable in for/if/switch initializer "
 					  "cannot be safely zero-initialized; move the "
-					  "declaration before the loop");
+					  "declaration before the statement");
 			ARENA_ENSURE_CAP(&ctx->main_arena,
 					 typeof_vars,
 					 typeof_var_count + 1,
@@ -2663,7 +2822,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 						  "orelse on struct/union values is not supported (memcmp "
 						  "cannot reliably detect zero due to padding)");
 				tok = emit_orelse_action(
-				    tok, decl.var_name, target.has_const_qual, target.stop_comma);
+				    tok, decl.var_name, target.has_const_qual, type->has_volatile, target.stop_comma);
 
 				if (target.stop_comma && match_ch(tok, ',')) {
 					tok = tok_next(tok);
@@ -2676,6 +2835,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			}
 		}
 
+		check_defer_var_shadow(decl.var_name);
 		register_decl_shadows(decl.var_name, is_vla_type);
 
 		if (match_ch(tok, ';')) {
@@ -2692,6 +2852,14 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			if (typeof_var_count > 0 && !in_for_init()) {
 				DeclResult next_decl = parse_declarator(next_decl_tok, false);
 				if (next_decl.end && next_decl.var_name && next_decl.has_init)
+					split_decl = true;
+			}
+
+			// Split when the next declarator has bracket orelse, so
+			// hoisted temps appear between the declarations.
+			if (!split_decl && FEAT(F_ORELSE) && !in_for_init()) {
+				DeclResult next_decl = parse_declarator(next_decl_tok, false);
+				if (next_decl.end && declarator_has_bracket_orelse(next_decl_tok, next_decl.end))
 					split_decl = true;
 			}
 
@@ -3000,7 +3168,8 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch)
 
 	// Labeled statement: ident ':' <stmt>
 	if (tok->kind == TK_IDENT && tok_next(tok) && match_ch(tok_next(tok), ':'))
-		return validate_defer_statement(tok_next(tok_next(tok)), in_loop, in_switch);
+		error_tok(tok, "labels inside defer blocks produce duplicate labels "
+			  "when the defer body is copied to multiple exit points");
 
 	if (tok->kind == TK_KEYWORD) {
 		if (tok->tag & TT_RETURN)
@@ -3170,7 +3339,7 @@ static inline void orelse_open(Token *var_name) {
 		OUT_LIT(" {");
 }
 
-static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, Token *stop_comma) {
+static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bool has_volatile, Token *stop_comma) {
 	require_orelse_action(tok, stop_comma);
 
 	if (match_ch(tok, '{')) {
@@ -3200,13 +3369,25 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
 
 	if (!var_name) error_tok(tok, "orelse fallback requires an assignment target (use a declaration)");
 	if (has_const) error_tok(tok, "orelse fallback cannot reassign a const-qualified variable");
-	out_char(' ');
-	out_str(tok_loc(var_name), var_name->len);
-	OUT_LIT(" = ");
-	out_str(tok_loc(var_name), var_name->len);
-	OUT_LIT(" ? ");
-	out_str(tok_loc(var_name), var_name->len);
-	OUT_LIT(" :");
+
+	if (has_volatile) {
+		// Volatile: use if-based pattern to avoid double-read.
+		// "var = var ? var : fb" reads volatile twice (condition + true branch).
+		// "if (!var) var = fb;" reads only once (condition).
+		OUT_LIT(" if (!");
+		out_str(tok_loc(var_name), var_name->len);
+		OUT_LIT(") ");
+		out_str(tok_loc(var_name), var_name->len);
+		OUT_LIT(" =");
+	} else {
+		out_char(' ');
+		out_str(tok_loc(var_name), var_name->len);
+		OUT_LIT(" = ");
+		out_str(tok_loc(var_name), var_name->len);
+		OUT_LIT(" ? ");
+		out_str(tok_loc(var_name), var_name->len);
+		OUT_LIT(" :");
+	}
 	while (tok->kind != TK_EOF) {
 		if (tok->flags & TF_OPEN) {
 			if (match_ch(tok, '(') && tok_next(tok) && match_ch(tok_next(tok), '{'))
@@ -3222,7 +3403,7 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, To
 		if (is_orelse_keyword(tok)) {
 			out_char(';');
 			tok = tok_next(tok);
-			return emit_orelse_action(tok, var_name, has_const, stop_comma);
+			return emit_orelse_action(tok, var_name, has_const, has_volatile, stop_comma);
 		}
 		emit_tok(tok);
 		tok = tok_next(tok);
@@ -4087,6 +4268,14 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 								error_tok(s, "orelse fallback on assignment with a function call "
 									  "in the target expression (double evaluation); "
 									  "use a temporary variable instead");
+							// Indirect calls: (expr)() — paren group followed by (
+							if (match_ch(s, '(') && (s->flags & TF_OPEN) && tok_match(s) &&
+							    tok_match(s) != bare_assign_eq && tok_next(tok_match(s)) &&
+							    tok_next(tok_match(s)) != bare_assign_eq &&
+							    match_ch(tok_next(tok_match(s)), '('))
+								error_tok(s, "orelse fallback on assignment with an indirect call "
+									  "in the target expression (double evaluation); "
+									  "use a temporary variable instead");
 						}
 					}
 
@@ -4103,9 +4292,10 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 					if (is_bare_fallback) {
 						// Detect compound literals in fallback (contain '{'):
-						// must use comma-ternary to preserve their scope lifetime.
-						// Otherwise use brace-wrapped if-based pattern (avoids
-						// double evaluation — safe for volatile-qualified variables).
+						// Use brace-free if-based pattern to preserve compound
+						// literal scope lifetime in the enclosing block AND
+						// avoid double evaluation (safe for volatile targets).
+						// Non-compound fallbacks use brace-wrapped if-based pattern.
 						// Scan the entire expression (including chained orelse) for '{'.
 						bool fallback_has_compound_literal = false;
 						{
@@ -4121,15 +4311,17 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 						// Hoist pre-processor directives
 						out_char(' ');
 						if (fallback_has_compound_literal) {
-							// Comma-ternary: LHS = rhs, (!t ? (void)(t = (fb)) : (void)0);
-							// Preserves compound literal scope in the enclosing block.
+							// Brace-free if: LHS = rhs; if (!t) t = (fb);
+							// Preserves compound literal scope in the enclosing block
+							// and reads the target only once (volatile-safe).
 							for (Token *t = bare_lhs_start; t != orelse_tok; t = tok_next(t)) {
 								if (t->kind == TK_PREP_DIR) continue;
 								emit_tok(t);
 							}
-							OUT_LIT(", (!");
+							out_char(';');
+							OUT_LIT(" if (!");
 							emit_range(bare_lhs_start, bare_assign_eq);
-							OUT_LIT(" ? (void)(");
+							OUT_LIT(")");
 							emit_range(bare_lhs_start, bare_assign_eq);
 							OUT_LIT(" = (");
 							tok = tok_next(orelse_tok);
@@ -4139,9 +4331,9 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 								else if (tok->flags & TF_CLOSE) fd--;
 								else if (fd == 0 && (match_ch(tok, ';') || match_ch(tok, ','))) break;
 								if (fd == 0 && is_orelse_keyword(tok)) {
-									OUT_LIT(")) : (void)0), (!");
+									OUT_LIT("); if (!");
 									emit_range(bare_lhs_start, bare_assign_eq);
-									OUT_LIT(" ? (void)(");
+									OUT_LIT(")");
 									emit_range(bare_lhs_start, bare_assign_eq);
 									OUT_LIT(" = (");
 									tok = tok_next(tok);
@@ -4150,7 +4342,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 								emit_tok(tok);
 								tok = tok_next(tok);
 							}
-							OUT_LIT(")) : (void)0);");
+							OUT_LIT(");");
 						} else {
 							// If-based: { LHS = rhs; if (!t) t = (fb); }
 							// Safe for volatile — no double evaluation.
@@ -4206,7 +4398,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					require_orelse_action(tok, NULL);
 
 					bool is_block_action = match_ch(tok, '{');
-					tok = emit_orelse_action(tok, NULL, false, NULL);
+					tok = emit_orelse_action(tok, NULL, false, false, NULL);
 					if (is_block_action) {
 						ctrl_state.pending_orelse_guard = true;
 					} else {
@@ -4309,11 +4501,21 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				ctrl_state.pending = true;
 			}
 
+			// C23 if/switch initializers: if(int x; cond) / switch(int x; x)
+			// Treat the open paren like for() so at_stmt_start is set and
+			// zero-init / typedef tracking fires on the initializer decl.
+			if ((tag & TT_SWITCH) && FEAT(F_DEFER | F_ZEROINIT)) {
+				ctrl_state.pending = true;
+				ctrl_state.pending_for_paren = true;
+			}
+
 			if (tag & TT_IF) {
 				ctrl_state.pending = true;
 				if (equal(tok, "else")) {
 					ctrl_state.parens_just_closed = true;
 					ctx->at_stmt_start = true;
+				} else if (FEAT(F_DEFER | F_ZEROINIT)) {
+					ctrl_state.pending_for_paren = true;
 				}
 			}
 
@@ -4417,6 +4619,20 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		}
 
 		track_common_token_state(tok, &toplevel);
+
+		// Reject unprocessed 'orelse' inside typeof expressions in struct bodies.
+		// Struct field names like "bool orelse;" are legitimate and handled below,
+		// but orelse inside typeof(expr orelse fallback) would pass through verbatim.
+		if (__builtin_expect(FEAT(F_ORELSE) && in_struct_body() && (tok->tag & TT_TYPEOF), 0)) {
+			Token *paren = tok_next(tok);
+			if (paren && match_ch(paren, '(') && tok_match(paren)) {
+				for (Token *s = tok_next(paren); s && s != tok_match(paren); s = tok_next(s))
+					if (is_orelse_keyword(s))
+						error_tok(s,
+							  "'orelse' inside typeof in a struct/union body "
+							  "cannot be transformed; use the resolved type directly");
+			}
+		}
 
 		// Warn on unprocessed 'orelse' in unsupported context
 		if (__builtin_expect(FEAT(F_ORELSE) && is_orelse_keyword(tok) &&

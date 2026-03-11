@@ -1602,7 +1602,7 @@ void test_defer_goto_c23_attr_label(void) {
 
 
 static void test_auto_type_fallback_requires_gnu_extensions(void) {
-	printf("\n--- __auto_type Fallback Requires GNU Extensions ---\n");
+	printf("\n--- Unresolvable Return Type With Defer Rejected ---\n");
 
 	const char *code =
 	    "#include <stdio.h>\n"
@@ -1617,19 +1617,13 @@ static void test_auto_type_fallback_requires_gnu_extensions(void) {
 
 	PrismFeatures features = prism_defaults();
 	PrismResult result = prism_transpile_file(path, features);
-	CHECK_EQ(result.status, PRISM_OK, "auto_type fallback: transpiles OK");
-	CHECK(result.output != NULL, "auto_type fallback: output not NULL");
-
-	// __auto_type is the only correct approach for anonymous struct returns with defer.
-	// Each anonymous struct definition creates a unique type in C, so __typeof__ and
-	// re-emitting the struct tokens would both produce incompatible types.
-	// __auto_type uses the reserved __ prefix and works in all C standard modes
-	// (including -std=c99 and -std=c11) with GCC and Clang.
-	CHECK(strstr(result.output, "__auto_type") != NULL,
-	      "auto_type fallback: anonymous struct return with defer should use __auto_type");
-	// Verify the defer is still emitted correctly
-	CHECK(strstr(result.output, "printf") != NULL,
-	      "auto_type fallback: deferred printf should be present in output");
+	// Anonymous struct return types with defer cannot be captured portably.
+	// The transpiler now rejects this for all compilers (no __auto_type fallback).
+	CHECK(result.status != PRISM_OK,
+	      "anonymous struct return with defer: rejected (use a named type)");
+	if (result.error_msg)
+		CHECK(strstr(result.error_msg, "unresolvable return type") != NULL,
+		      "error message mentions unresolvable return type");
 
 	prism_free(&result);
 	unlink(path);
@@ -1931,6 +1925,76 @@ static void test_defer_varname_return_value_dropped(void) {
 	prism_free(&r);
 }
 
+static void test_defer_label_duplication_bug(void) {
+	/* BUG: validate_defer_statement allows labeled statements inside
+	 * defer blocks.  When the defer body is copy-pasted to each exit
+	 * point (return, fall-through), any labels inside the block are
+	 * duplicated, causing the downstream C compiler to hard-fail with
+	 * "duplicate label" errors. */
+	const char *code =
+	    "int f(int x) {\n"
+	    "    defer { my_label: x++; }\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_label_dup.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		/* If transpilation succeeded, the label must not appear more than once. */
+		const char *first = strstr(r.output, "my_label:");
+		const char *second = first ? strstr(first + 1, "my_label:") : NULL;
+		CHECK(second == NULL,
+		      "BUG defer-label-dup: label inside defer pasted to multiple exit points");
+	} else {
+		/* Rejection is also acceptable (label banned inside defer). */
+		CHECK(1, "BUG defer-label-dup: label inside defer pasted to multiple exit points");
+	}
+	prism_free(&r);
+}
+
+static void test_defer_variable_shadowing_binds_wrong_scope(void) {
+	/* FIX: Prism copy-pastes defer token streams to each exit point.
+	 * When a captured variable is shadowed in an inner scope, the pasted
+	 * defer body would bind to the wrong variable (UAF / double-free).
+	 * Prism now rejects the shadowing declaration at compile time. */
+	const char *code =
+	    "void tracked_free(void *p);\n"
+	    "int f(void) {\n"
+	    "    void *ptr = (void*)111;\n"
+	    "    defer tracked_free(ptr);\n"
+	    "    {\n"
+	    "        void *ptr = (void*)222;\n"
+	    "        return 0;\n"
+	    "    }\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_shadow_uaf.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "defer-shadow-uaf: shadowing a defer-captured variable must be rejected");
+	CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
+	      "defer-shadow-uaf: error message mentions 'shadows'");
+	prism_free(&r);
+}
+
+static void test_defer_safe_shadow_no_exit(void) {
+	/* Safe shadow: inner scope redeclares a defer-captured variable but
+	 * never exits the outer scope (no return/goto/break/continue).
+	 * The inner variable goes out of scope at }, and the defer at end-of-
+	 * outer-block correctly binds to the outer variable.  This must compile. */
+	const char *code =
+	    "void use(int x);\n"
+	    "void f(void) {\n"
+	    "    int count = 0;\n"
+	    "    defer use(count);\n"
+	    "    for (int i = 0; i < 10; i++) {\n"
+	    "        int count = i * 2;\n"
+	    "        use(count);\n"
+	    "    }\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_safe_shadow.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "defer-safe-shadow: safe shadow without control-flow exit must compile");
+	prism_free(&r);
+}
+
 static void test_defer_body_bare_orelse_return_not_rejected(void) {
 	/* BUG: validate_defer_statement calls skip_to_semicolon for statements
 	 * that don't start with a keyword (like 'get() orelse return;'), so the
@@ -2075,4 +2139,7 @@ void run_defer_tests(void) {
         test_defer_void_parens_return_bug();
 	test_defer_varname_return_value_dropped();
 	test_defer_body_bare_orelse_return_not_rejected();
+	test_defer_label_duplication_bug();
+	test_defer_variable_shadowing_binds_wrong_scope();
+	test_defer_safe_shadow_no_exit();
 }
