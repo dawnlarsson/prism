@@ -3905,6 +3905,35 @@ static void test_cli_parse_unit(void) {
 		      !strcmp(cli.sources[2], "m.c"), "cli: source order preserved");
 		cli_free(&cli);
 	}
+
+	// 49. Standalone -O, -W, -M, -d don't swallow next arg
+	{
+		char *argv[] = {"prism", "-O", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: foo.c not eaten by -O");
+		CHECK_EQ(cli.cc_arg_count, 1, "cli: -O alone");
+		cli_free(&cli);
+	}
+	{
+		char *argv[] = {"prism", "-W", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: foo.c not eaten by -W");
+		CHECK_EQ(cli.cc_arg_count, 1, "cli: -W alone");
+		cli_free(&cli);
+	}
+	{
+		char *argv[] = {"prism", "-M", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: foo.c not eaten by -M");
+		cli_free(&cli);
+	}
+	{
+		char *argv[] = {"prism", "-d", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK_EQ(cli.source_count, 1, "cli: foo.c not eaten by -d");
+		CHECK_EQ(cli.cc_arg_count, 1, "cli: -d alone");
+		cli_free(&cli);
+	}
 }
 
 void run_api_tests(void) {

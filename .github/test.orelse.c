@@ -1851,6 +1851,44 @@ static void test_orelse_ident_as_varname(void) {
 	prism_free(&r);
 }
 
+static void test_chained_orelse_in_typeof(void) {
+	/* BUG: walk_balanced_orelse finds the first orelse and rewrites it into a
+	 * ternary, but emit_token_range emits the RHS as raw tokens.
+	 * If the RHS contains another orelse, it is passed through untransformed,
+	 * producing invalid C like: (a) ? (a) : (b orelse c). */
+	const char *code =
+	    "void f(void) {\n"
+	    "    int a = 0, b = 5, c = 10;\n"
+	    "    typeof(a orelse b orelse c) x;\n"
+	    "    (void)x;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "chained_or_else_typeof.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "chained orelse typeof: transpiles OK");
+	CHECK(r.output != NULL, "chained orelse typeof: output not NULL");
+	CHECK(strstr(r.output, "orelse") == NULL,
+	      "BUG chained-orelse-typeof: no raw 'orelse' in C output");
+	prism_free(&r);
+}
+
+static void test_orelse_leak_in_expr_parens(void) {
+	/* BUG: emit_expr_to_semicolon steps over (...) using walk_balanced,
+	 * which has no orelse awareness.  When emit_expr_to_semicolon is
+	 * invoked for a return body with active defers, orelse inside parens
+	 * is emitted raw to the output — bypassing the catch-all check. */
+	const char *code =
+	    "int f(int x) { return x; }\n"
+	    "int g(void) {\n"
+	    "    int a = 0, b = 5;\n"
+	    "    defer { a = 0; }\n"
+	    "    return f((a orelse b));\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "orelse_leak_expr.c", prism_defaults());
+	int leaked = (r.status == PRISM_OK && r.output && strstr(r.output, "orelse") != NULL);
+	CHECK(!leaked,
+	      "BUG orelse-leak-expr: orelse inside parens in return+defer must be rejected, not emitted raw");
+	prism_free(&r);
+}
+
 static void test_orelse_after_label_sweeps_label_into_cond(void) {
 	/* BUG: find_bare_orelse scans from stmt_start (the label token) without
 	 * stopping at the ':' boundary.  The label gets pulled into the generated
@@ -2006,5 +2044,7 @@ void run_orelse_tests(void) {
 	test_orelse_in_decl_ternary_garbled();
 	test_orelse_ident_as_varname();
 	test_orelse_after_label_sweeps_label_into_cond();
+	test_chained_orelse_in_typeof();
+	test_orelse_leak_in_expr_parens();
 }
 

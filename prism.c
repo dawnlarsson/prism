@@ -1915,6 +1915,31 @@ static Token *walk_balanced(Token *tok, bool emit) {
 
 // Walk a balanced group, transforming any top-level orelse into a ternary.
 // Rejects orelse with control-flow action; transforms value fallback to (LHS) ? (LHS) : (RHS).
+
+// Like emit_token_range but rewrites orelse → ternary within the flat range.
+static void emit_token_range_orelse(Token *start, Token *end) {
+	Token *orelse = NULL;
+	Token *prev = NULL;
+	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) { prev = tok_match(t); t = tok_match(t); continue; }
+		if ((t->tag & TT_ORELSE) && !is_known_typedef(t) && !typedef_lookup(t) &&
+		    !(prev && (prev->tag & TT_MEMBER))) {
+			orelse = t;
+			break;
+		}
+		prev = t;
+	}
+	if (!orelse) { emit_token_range(start, end); return; }
+	Token *rhs = tok_next(orelse);
+	OUT_LIT("(");
+	emit_token_range(start, orelse);
+	OUT_LIT(") ? (");
+	emit_token_range(start, orelse);
+	OUT_LIT(") : (");
+	emit_token_range_orelse(rhs, end);
+	OUT_LIT(")");
+}
+
 static Token *walk_balanced_orelse(Token *tok) {
 	Token *end = tok_match(tok);
 	if (!end) { emit_tok(tok); return tok_next(tok); }
@@ -1961,7 +1986,7 @@ static Token *walk_balanced_orelse(Token *tok) {
 		OUT_LIT(" ? _Prism_oe_");
 		out_uint(oe);
 		OUT_LIT(" : (");
-		emit_token_range(rhs_start, end);
+		emit_token_range_orelse(rhs_start, end);
 		OUT_LIT("); })");
 	} else {
 		OUT_LIT(" (");
@@ -1969,7 +1994,7 @@ static Token *walk_balanced_orelse(Token *tok) {
 		OUT_LIT(") ? (");
 		emit_token_range(lhs_start, orelse_found);
 		OUT_LIT(") : (");
-		emit_token_range(rhs_start, end);
+		emit_token_range_orelse(rhs_start, end);
 		OUT_LIT(")");
 	}
 	emit_tok(end); // emit ] or )
@@ -2876,6 +2901,8 @@ static Token *emit_expr_to_semicolon(Token *tok) {
 				emit_tok(tok);
 				tok = tok_next(tok);
 			} else {
+				if (FEAT(F_ORELSE) && match_ch(tok, '('))
+					check_orelse_in_parens(tok);
 				tok = walk_balanced(tok, true);
 			}
 			expr_at_stmt_start = false;
@@ -4651,7 +4678,7 @@ static bool cc_flag_takes_arg(const char *a) {
 		switch (a[1]) {
 		case 'c': case 'E': case 'S': case 'v': case 'w': case 's':
 		case 'g': case 'H': case 'P': case 'p': case 'r': case 'C':
-		case 'h': case 'Q':
+		case 'h': case 'Q': case 'O': case 'W': case 'M': case 'd':
 			return false;
 		default:
 			return true;
@@ -5464,6 +5491,7 @@ int main(int argc, char **argv) {
 	else
 		status = compile_sources(&cli);
 
+	// cli_free(&cli); // not needed as os reclaims all resources anyway
 	return status;
 }
 
