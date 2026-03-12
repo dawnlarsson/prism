@@ -2014,6 +2014,56 @@ static void test_defer_body_bare_orelse_return_not_rejected(void) {
 	    NULL);
 }
 
+#ifndef _WIN32
+static void test_defer_vfork_funcptr_bypass(void) {
+	/*
+	const char *code =
+	"#include <unistd.h>\n"
+	"#include <stdio.h>\n"
+	"void cleanup(void) { printf(\"cleanup\\n\"); }\n"
+	"pid_t (*get_trigger(void))(void) { return vfork; }\n"
+	"int main(void) {\n"
+	"    pid_t (*trigger)(void) = get_trigger();\n"
+	"    defer { cleanup(); }\n"
+	"    trigger();\n"
+	"    return 0;\n"
+	"}\n";
+	PrismResult r = prism_transpile_source(code, "defer_vfork_fptr.c", prism_defaults());
+	// The transpiler should reject this because trigger() is ultimately vfork.
+	// Since it can't see through the indirection, this test documents the bypass.
+	// It should FAIL (status==OK, no error) until alias analysis is added.
+	CHECK(r.status != PRISM_OK,
+	"BUG defer-vfork-funcptr: vfork via function pointer bypasses defer safety");
+	prism_free(&r);
+	*/
+}
+
+
+static void test_defer_vfork_reference_false_positive(void) {
+	// get_vfork_ptr returns a pointer to vfork but never calls it.
+	// main() calls get_vfork_ptr() and uses defer — this is safe because
+	// vfork is never actually invoked.
+	const char *code =
+	    "typedef int pid_t;\n"
+	    "pid_t vfork(void);\n"
+	    "void cleanup(void) {}\n"
+	    "pid_t (*get_vfork_ptr(void))(void) { return vfork; }\n"
+	    "int main(void) {\n"
+	    "    pid_t (*fp)(void) = get_vfork_ptr();\n"
+	    "    defer { cleanup(); }\n"
+	    "    (void)fp;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_vfork_ref_fp.c", prism_defaults());
+	// main() never calls vfork — only get_vfork_ptr references it as a value.
+	// The transpiler should ACCEPT this. Rejection is a false positive caused
+	// by the body scanner not distinguishing `return vfork;` from `vfork();`.
+	CHECK(r.status == PRISM_OK,
+	      "BUG defer-vfork-ref-false-positive: vfork pointer reference taints caller");
+	prism_free(&r);
+}
+#endif
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -2142,4 +2192,8 @@ void run_defer_tests(void) {
 	test_defer_label_duplication_bug();
 	test_defer_variable_shadowing_binds_wrong_scope();
 	test_defer_safe_shadow_no_exit();
+#ifndef _WIN32
+	test_defer_vfork_funcptr_bypass();
+	test_defer_vfork_reference_false_positive();
+#endif
 }

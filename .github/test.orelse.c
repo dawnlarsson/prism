@@ -2111,6 +2111,87 @@ static void test_orelse_out_of_order_storage_class(void) {
 	prism_free(&r);
 }
 
+// Bug: bracket orelse (e.g. int (*p)[n orelse 1] = NULL) in a for-loop
+// initializer with has_init=true bypasses the needs_memset guard.
+// emit_bracket_orelse_temps injects a hoisted "long long _Prism_oe_N = ...;"
+// into the for-loop header, producing two type specifiers in one init clause
+// which is a hard syntax error.
+static void test_orelse_for_init_bracket_orelse_bypass(void) {
+	const char *code =
+	    "void f(int n) {\n"
+	    "    for (int (*arr)[n orelse 1] = 0; n > 0; n--)\n"
+	    "        (void)arr;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "for_bracket_orelse.c", prism_defaults());
+	// Must either reject with an error OR produce valid C.
+	// It must NOT inject "long long ... ; int (*arr)" into one for-init.
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "long long") == NULL ||
+		      strstr(r.output, "for") == NULL,
+		      "BUG for-init-bracket-orelse: must not hoist temp into for-loop header");
+	} else {
+		CHECK(r.status != PRISM_OK,
+		      "for-init-bracket-orelse: rejected by transpiler (acceptable)");
+	}
+	prism_free(&r);
+}
+
+// Bug: "static int x = get_val() orelse 5" is fast-rejected by
+// TT_SKIP_DECL in try_zero_init_decl, so it falls to the bare-assignment
+// scanner which emits "if (!static int x) static int x = (5);" — garbage.
+static void test_orelse_static_decl_bare_assignment_collapse(void) {
+	const char *code =
+	    "int get_val(void) { return 0; }\n"
+	    "void f(void) {\n"
+	    "    static int x = get_val() orelse 5;\n"
+	    "    (void)x;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "static_decl_orelse.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		// Must not emit "static int x" inside an if-condition.
+		// The garbage pattern is: "if (!\nstatic int x)\nstatic int x = ( 5);"
+		// Check for the bare-assignment rewrite signature: "= ( 5)" with
+		// the space-padded fallback value, which only the bare scanner emits.
+		CHECK(strstr(r.output, "= ( 5)") == NULL,
+		      "BUG static-decl-orelse: must not emit bare-assignment 'if (! static int x)' garbage");
+	} else {
+		CHECK(r.status != PRISM_OK,
+		      "static-decl-orelse: rejected by transpiler (acceptable)");
+	}
+	prism_free(&r);
+}
+
+// Bug: bracket_oe_ids[16] buffer silently breaks the loop at count >= 16.
+// The 17th bracket-orelse dimension falls back to legacy ternary emission
+// which double-evaluates the LHS expression.  A function call with side
+// effects in the 17th dimension is evaluated twice.
+static void test_orelse_bracket_oe_buffer_exhaustion(void) {
+	const char *code =
+	    "int get_dim(void) { static int c = 0; return ++c; }\n"
+	    "void f(int n) {\n"
+	    "    int arr[n orelse 1][n orelse 1][n orelse 1][n orelse 1]\n"
+	    "           [n orelse 1][n orelse 1][n orelse 1][n orelse 1]\n"
+	    "           [n orelse 1][n orelse 1][n orelse 1][n orelse 1]\n"
+	    "           [n orelse 1][n orelse 1][n orelse 1][n orelse 1]\n"
+	    "           [get_dim() orelse 1];\n"
+	    "    (void)arr;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "bracket_oe_overflow.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		// If it succeeds, the 17th dimension must NOT double-evaluate.
+		// Double-eval signature: "(get_dim ( )) ? (get_dim ( )) :" — the
+		// function name appears twice in one ternary.
+		CHECK(strstr(r.output, "(get_dim") == NULL ||
+		      strstr(strstr(r.output, "(get_dim") + 1, "(get_dim") == NULL,
+		      "BUG bracket-oe-overflow: 17th dimension must not double-evaluate get_dim()");
+	} else {
+		// Hard error on overflow is also acceptable.
+		CHECK(r.status != PRISM_OK,
+		      "bracket-oe-overflow: rejected by transpiler (acceptable)");
+	}
+	prism_free(&r);
+}
+
 // Bug: typeof(int[x orelse 1]) — orelse inside [] brackets within typeof()
 // is at depth 1 relative to the outer parens.  walk_balanced_orelse only
 // scanned depth 0, skipping [] groups entirely via TF_OPEN.  The raw orelse
@@ -2271,5 +2352,10 @@ void run_orelse_tests(void) {
 	test_orelse_volatile_bare_compound_literal();
 	test_orelse_out_of_order_storage_class();
 	test_orelse_typeof_nested_bracket();
+
+	// Audit round 2 bug probes (should FAIL until fixed)
+	test_orelse_for_init_bracket_orelse_bypass();
+	test_orelse_static_decl_bare_assignment_collapse();
+	test_orelse_bracket_oe_buffer_exhaustion();
 }
 

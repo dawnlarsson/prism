@@ -114,6 +114,7 @@ typedef struct {
 	bool has_volatile : 1;
 	bool has_const : 1;
 	bool has_void : 1;	  // True if void or void typedef
+	bool has_extern : 1;
 } TypeSpecResult;
 
 typedef enum {
@@ -366,6 +367,10 @@ static void reset_transpiler_state(void) {
 	label_capacity = 0;
 	defer_count = 0;
 	defer_shadow_count = 0;
+	ctx->bracket_oe_ids = NULL;
+	ctx->bracket_oe_count = 0;
+	ctx->bracket_oe_cap = 0;
+	ctx->bracket_oe_next = 0;
 
 }
 
@@ -1203,6 +1208,15 @@ static bool is_var_declaration(Token *type_end) {
 	return match_ch(decl.end, ',') || match_ch(decl.end, ';');
 }
 
+// Like is_var_declaration but only matches declarations WITHOUT an initializer
+// (i.e., declarations where zeroinit would add = 0).
+static bool is_uninit_var_declaration(Token *type_end) {
+	DeclResult decl = parse_declarator(type_end, false);
+	if (!decl.var_name || !decl.end) return false;
+	if (decl.has_init) return false;
+	return match_ch(decl.end, ',') || match_ch(decl.end, ';');
+}
+
 static inline bool is_orelse_keyword(Token *tok) {
 	return (tok->tag & TT_ORELSE) && !is_known_typedef(tok) && !typedef_lookup(tok) &&
 	       !(last_emitted && (last_emitted->tag & TT_MEMBER));
@@ -1340,7 +1354,7 @@ static Token *backward_goto_skips_decl(Token *goto_tok, LabelInfo *info) {
 			if (s) s = skip_noise(s);
 			if (s && !is_file_storage_keyword(s)) {
 				TypeSpecResult type = parse_type_specifier(s);
-				if (type.saw_type && is_var_declaration(type.end)) return t;
+				if (type.saw_type && is_uninit_var_declaration(type.end)) return t;
 			}
 		}
 		is_stmt_start = false;
@@ -1389,7 +1403,7 @@ static GotoSkipResult goto_skips_check(Token *goto_tok, LabelInfo *info, bool ch
 			if (s) s = skip_noise(s);
 			if (s && !is_file_storage_keyword(s)) {
 				TypeSpecResult type = parse_type_specifier(s);
-				if (type.saw_type && is_var_declaration(type.end)) {
+				if (type.saw_type && is_uninit_var_declaration(type.end)) {
 					if (!has_raw && (!active_decl || depth <= decl_depth)) {
 						active_decl = tok; decl_depth = depth;
 					}
@@ -1856,6 +1870,8 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 		
 		bool had_type = r.saw_type;
 
+		if ((tag & TT_STORAGE) && equal(tok, "extern")) r.has_extern = true;
+
 		if (tag & TT_QUALIFIER) {
 			if (tag & TT_VOLATILE) r.has_volatile = true;
 			if (tag & TT_REGISTER) r.has_register = true;
@@ -2069,7 +2085,8 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 			prev = s;
 		}
 		if (!orelse_found) { t = close; continue; }
-		if (ctx->bracket_oe_count >= 16) break;
+		ARENA_ENSURE_CAP(&ctx->main_arena, ctx->bracket_oe_ids, ctx->bracket_oe_count,
+				 ctx->bracket_oe_cap, 16, unsigned);
 		unsigned oe = ctx->ret_counter++;
 		ctx->bracket_oe_ids[ctx->bracket_oe_count++] = oe;
 		OUT_LIT(" long long _Prism_oe_");
@@ -2667,8 +2684,14 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 		// Step 2b: Pre-hoist bracket orelse temps (before type emission)
 		bool has_bo = FEAT(F_ORELSE) && declarator_has_bracket_orelse(decl_start, decl.end);
-		if (has_bo)
+		if (has_bo) {
+			if (in_for_init())
+				error_tok(decl_start,
+					  "bracket orelse in VLA dimensions cannot be used in "
+					  "for-loop initializers (hoisted temps would create "
+					  "multiple declarations); move the declaration before the loop");
 			emit_bracket_orelse_temps(decl_start, decl.end);
+		}
 
 		// Deferred type emission from orelse comma continuation
 		if (need_type_emit) {
@@ -2752,7 +2775,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		tok = decl.end;
 
 		// Add zero initializer if needed (for non-memset types)
-		if (!decl.has_init && !effective_vla && !is_raw && !needs_memset) {
+		if (!decl.has_init && !effective_vla && !is_raw && !needs_memset && !type->has_extern) {
 			// register + _Atomic aggregate: no safe zero-init path.
 			if (type->has_register && type->has_atomic && is_aggregate)
 				;
@@ -2792,6 +2815,18 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					break;
 				if (match_ch(tok, '?')) { init_ternary++; emit_tok(tok); tok = tok_next(tok); continue; }
 				if (match_ch(tok, ':') && init_ternary > 0) { init_ternary--; emit_tok(tok); tok = tok_next(tok); continue; }
+			// _Generic member rewrite: struct.strstr() → _Generic after '.'
+				if ((tok->tag & TT_GENERIC) && last_emitted &&
+				    (match_ch(last_emitted, '.') || equal(last_emitted, "->"))) {
+					Token *name = NULL, *args_open = NULL, *args_close = NULL, *after = NULL;
+					if (generic_member_rewrite_target(tok, &name, &args_open, &args_close, &after)) {
+						emit_tok(name);
+						emit_range(args_open, tok_next(args_close));
+						last_emitted = args_close;
+						tok = after;
+						continue;
+					}
+				}
 			// Detect 'orelse' at depth 0 in initializer
 				if (FEAT(F_ORELSE) && (tok->tag & TT_ORELSE) &&
 				    !is_known_typedef(tok) && !typedef_lookup(tok) &&
@@ -2993,7 +3028,7 @@ static Token *try_zero_init_decl(Token *tok) {
 		}
 	}
 
-	if (tok->tag & TT_SKIP_DECL) // Storage class specifiers, control flow, etc.
+	if ((tok->tag & TT_SKIP_DECL) && !(tok->tag & TT_STORAGE)) // Control flow, etc. (not storage class)
 	{
 		if (is_raw) {
 			// File-storage raw (static/extern/thread_local): emit verbatim.
@@ -4212,9 +4247,12 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			// Bare expression orelse.
 			// Skip keywords that introduce sub-statements or labels
 			// to avoid sweeping them into the if(!(...)) condition.
+			// Also skip storage class specifiers and typedef — those are
+			// declarations, not bare expressions.
 			if (FEAT(F_ORELSE) && ctx->block_depth > 0 && !in_struct_body() &&
 			    !(tok->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO |
-					  TT_CASE | TT_DEFAULT | TT_IF | TT_LOOP | TT_SWITCH))) {
+					  TT_CASE | TT_DEFAULT | TT_IF | TT_LOOP | TT_SWITCH |
+					  TT_STORAGE | TT_TYPEDEF))) {
 				// Skip past label if current token is ident followed by ':'
 				Token *orelse_scan_start = tok;
 				Token *label_end = NULL;
@@ -4466,7 +4504,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 						continue;
 					}
 				}
-				if (ctx->block_depth == 0 && is_decl_prefix_token(last_emitted)) {
+				if (is_decl_prefix_token(last_emitted)) {
 					Token *name = NULL;
 					Token *params_open = NULL;
 					Token *params_close = NULL;
@@ -4479,6 +4517,12 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 						emit_range(params_open, tok_next(params_close));
 						if (ctx->block_depth == 0) {
 							toplevel_set_paren_pair(&toplevel, params_open, params_close);
+						}
+						// Emit any __attribute__ / [[...]] between _Generic(...) close and 'after'
+						Token *gen_close = tok_match(tok_next(tok));
+						for (Token *a = tok_next(gen_close); a && a != after; a = tok_next(a)) {
+							emit_tok(a);
+							last_emitted = a;
 						}
 						tok = after;
 						continue;
@@ -5487,7 +5531,8 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 		if (use_lib_api) {
 			temps[i] = malloc(PATH_MAX);
 			if (!temps[i]) die("Out of memory");
-			snprintf(temps[i], PATH_MAX, "%sprism_install_%d_%d.c", get_tmp_dir(), getpid(), i);
+			if (make_temp_file(temps[i], PATH_MAX, NULL, 0, cli->sources[i]) < 0)
+				die("Failed to create temp file");
 
 			PrismResult result = prism_transpile_file(cli->sources[i], cli->features);
 			if (result.status != PRISM_OK) {
@@ -5521,7 +5566,11 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 
 static int install_from_source(Cli *cli) {
 	char temp_bin[PATH_MAX];
-	snprintf(temp_bin, sizeof(temp_bin), "%sprism_install_%d" EXE_SUFFIX, get_tmp_dir(), getpid());
+	int suffix_len = (int)strlen(EXE_SUFFIX);
+	snprintf(temp_bin, sizeof(temp_bin), "%sprism_inst_.XXXXXX%s", get_tmp_dir(), EXE_SUFFIX);
+	int fd = suffix_len > 0 ? mkstemps(temp_bin, suffix_len) : mkstemp(temp_bin);
+	if (fd < 0) die("Failed to create temp file");
+	close(fd);
 
 	const char *cc = resolve_install_compiler(cli);
 	bool msvc = cc_is_msvc(cc);

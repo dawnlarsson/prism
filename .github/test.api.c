@@ -1525,7 +1525,7 @@ static void test_deep_struct_nesting_walker(void) {
 	                "    };\n"
 	                "    if (flag)\n"
 	                "        goto done;\n"
-	                "    int val = 42;\n"
+	                "    int val;\n"
 	                "    done:\n"
 	                "    (void)0;\n"
 	                "}\n"
@@ -2040,6 +2040,70 @@ static void test_c23_generic_member_macro_indirection(void) {
 			check_transpiled_output_compiles(
 			    r.output, "-std=gnu2x",
 			    "c23 generic member macro: transpiled output compiles in gnu2x");
+		}
+		prism_free(&r);
+		unlink(path);
+		free(path);
+	}
+#endif
+}
+
+/* BUG: coreutils/gnulib build failure on GCC 15+ (ISO C N3322).
+ *
+ * After preprocessing with GCC 15 in C23 mode, bare `bsearch`, `memchr`,
+ * `strchr` etc. tokens in redeclarations are expanded to `_Generic(...)`
+ * by glibc's C23 type-generic macros.  Prism rewrites these back to
+ * parenthesized declarators at file scope (block_depth == 0), but NOT
+ * inside function bodies (block_depth > 0).
+ *
+ * Coreutils code (and gnulib-generated wrappers) frequently use local
+ * extern redeclarations inside functions.  These leak `_Generic` into
+ * the transpiled output, causing downstream compile failures:
+ *
+ *   error: expected identifier or '(' before '_Generic'
+ *
+ * Root cause: generic_decl_rewrite_target is guarded by
+ *   ctx->block_depth == 0 && is_decl_prefix_token(last_emitted)
+ * but local extern decls have block_depth > 0.
+ */
+static void test_file_c23_n3322_local_extern_generic_leak(void) {
+	printf("\n--- BUG C23 N3322 Local Extern _Generic Leak ---\n");
+
+#ifdef _WIN32
+	passed++;
+	total++;
+	printf("[PASS] n3322 local extern: skipped on Windows\n");
+#else
+	/* Local extern redeclarations of C23 type-generic functions
+	 * inside a function body — the exact pattern from coreutils. */
+	const char *code =
+	    "#include <stdlib.h>\n"
+	    "#include <string.h>\n"
+	    "void foo(void) {\n"
+	    "    extern void *bsearch(const void *key, const void *base,\n"
+	    "                         size_t nmemb, size_t size,\n"
+	    "                         int (*compar)(const void *, const void *));\n"
+	    "    extern void *memchr(const void *s, int c, size_t n);\n"
+	    "    extern char *strchr(const char *s, int c);\n"
+	    "    (void)bsearch; (void)memchr; (void)strchr;\n"
+	    "}\n"
+	    "int main(void) { return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "BUG n3322 local extern: create temp file");
+	if (path) {
+		PrismResult r = prism_transpile_file(path, prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "BUG n3322 local extern: transpiles OK");
+		if (r.output) {
+			/* _Generic must NOT appear in declaration context.
+			 * Currently block_depth>0 bypasses the rewrite. */
+			CHECK(strstr(r.output, "_Generic") == NULL,
+			      "BUG n3322-local-extern: _Generic leaks into local extern decl (block_depth>0 bypass)");
+
+			check_transpiled_output_compiles(
+			    r.output, "-std=gnu2x",
+			    "BUG n3322-local-extern: transpiled output compiles in gnu2x");
 		}
 		prism_free(&r);
 		unlink(path);
@@ -3936,6 +4000,263 @@ static void test_cli_parse_unit(void) {
 	}
 }
 
+#ifndef _WIN32
+static void test_coreutils_gnulib_generic_decl_leak(void) {
+	printf("\n--- Coreutils gnulib _Generic decl leak ---\n");
+
+	const char *code =
+	    "#include <stdlib.h>\n"
+	    "#include <string.h>\n"
+	    "#include <wchar.h>\n"
+	    "\n"
+	    "/* gnulib ./lib/stdlib.h:807 pattern */\n"
+	    "extern void *bsearch (const void *__key, const void *__base,\n"
+	    "                      size_t __nmemb, size_t __size,\n"
+	    "                      int (*__compar)(const void *, const void *))\n"
+	    "    __attribute__ ((__nonnull__ (1, 2, 5)));\n"
+	    "\n"
+	    "/* gnulib ./lib/string.h patterns */\n"
+	    "extern void *memchr (const void *__s, int __c, size_t __n)\n"
+	    "    __attribute__ ((__pure__));\n"
+	    "extern char *strchr (const char *__s, int __c)\n"
+	    "    __attribute__ ((__pure__));\n"
+	    "\n"
+	    "/* gnulib ./lib/wchar.h:841 pattern */\n"
+	    "extern wchar_t *wmemchr (const wchar_t *__s, wchar_t __wc, size_t __n)\n"
+	    "    __attribute__ ((__pure__));\n"
+	    "\n"
+	    "/* local extern redeclarations inside function bodies (coreutils uses this) */\n"
+	    "void foo(void) {\n"
+	    "    extern void *bsearch (const void *key, const void *base,\n"
+	    "                          size_t nmemb, size_t size,\n"
+	    "                          int (*compar)(const void *, const void *));\n"
+	    "    extern void *memchr (const void *s, int c, size_t n);\n"
+	    "    extern char *strchr (const char *s, int c);\n"
+	    "    extern wchar_t *wmemchr (const wchar_t *s, wchar_t wc, size_t n);\n"
+	    "    (void)bsearch; (void)memchr; (void)strchr; (void)wmemchr;\n"
+	    "}\n"
+	    "int main(void) { return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "gnulib-generic: create temp file");
+	if (!path) return;
+
+	PrismResult r = prism_transpile_file(path, prism_defaults());
+	CHECK(r.status == PRISM_OK, "gnulib-generic: transpiles OK");
+	if (r.output) {
+		/* _Generic must not appear anywhere in declaration context */
+		CHECK(strstr(r.output, "_Generic") == NULL,
+		      "gnulib-generic: no _Generic in output");
+
+		/* file-scope rewrites: must produce (funcname)(params) */
+		CHECK(strstr(r.output, "*(bsearch)") != NULL ||
+		      strstr(r.output, "* (bsearch)") != NULL,
+		      "gnulib-generic: file-scope bsearch rewritten");
+		CHECK(strstr(r.output, "*(memchr)") != NULL ||
+		      strstr(r.output, "* (memchr)") != NULL,
+		      "gnulib-generic: file-scope memchr rewritten");
+		CHECK(strstr(r.output, "*(strchr)") != NULL ||
+		      strstr(r.output, "* (strchr)") != NULL,
+		      "gnulib-generic: file-scope strchr rewritten");
+		CHECK(strstr(r.output, "*(wmemchr)") != NULL ||
+		      strstr(r.output, "* (wmemchr)") != NULL,
+		      "gnulib-generic: file-scope wmemchr rewritten");
+
+		/* __attribute__ after _Generic(...) must be preserved, not dropped */
+		CHECK(strstr(r.output, "__nonnull__") != NULL,
+		      "gnulib-generic: __attribute__ preserved after rewrite");
+		CHECK(strstr(r.output, "__pure__") != NULL,
+		      "gnulib-generic: __pure__ attribute preserved after rewrite");
+
+		/* compile-validation: the output must compile with gnu2x */
+		check_transpiled_output_compiles(
+		    r.output, "-std=gnu2x",
+		    "gnulib-generic: transpiled output compiles in gnu2x");
+		check_transpiled_output_compiles(
+		    r.output, "-std=gnu17",
+		    "gnulib-generic: transpiled output compiles in gnu17");
+	}
+	prism_free(&r);
+	unlink(path);
+	free(path);
+}
+#endif
+
+static void test_binutils_gprofng_regressions(void) {
+	printf("\n--- Binutils gprofng Regression Tests ---\n");
+
+	PrismFeatures features = prism_defaults();
+
+	// Bug 1: extern declarations must NOT get zeroinit'd.
+	// extern char **environ; inside a function body was getting = 0 added.
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    extern char **environ;\n"
+		    "    (void)environ;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		char *path = create_temp_file(code);
+		CHECK(path != NULL, "extern zeroinit: create temp");
+		PrismResult r = prism_transpile_file(path, features);
+		CHECK_EQ(r.status, PRISM_OK, "extern zeroinit: transpile OK");
+		CHECK(r.output != NULL, "extern zeroinit: has output");
+		if (r.output) {
+			CHECK(strstr(r.output, "extern char **environ") != NULL,
+			      "extern zeroinit: environ preserved");
+			// Must NOT have 'environ = 0' or 'environ = {0}'
+			CHECK(strstr(r.output, "environ = 0") == NULL &&
+			          strstr(r.output, "environ = {0}") == NULL,
+			      "extern zeroinit: no initializer added");
+		}
+		prism_free(&r);
+		unlink(path);
+		free(path);
+	}
+
+	// Bug 2: _Generic member rewrite must work inside declaration initializers.
+	// When zeroinit processes a declaration, the initializer emission loop
+	// must also apply the _Generic member rewrite (struct.func pattern).
+	{
+		const char *code =
+		    "struct utils { char *(*strstr)(const char *, const char *); };\n"
+		    "extern struct utils util_funcs;\n"
+		    "void f(void) {\n"
+		    "    const char *p = util_funcs.strstr(\"hello\", \"ell\");\n"
+		    "    (void)p;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		char *path = create_temp_file(code);
+		CHECK(path != NULL, "generic member init: create temp");
+		PrismResult r = prism_transpile_file(path, features);
+		CHECK_EQ(r.status, PRISM_OK, "generic member init: transpile OK");
+		// Output must compile (no _Generic leak in member position)
+		if (r.output)
+			CHECK(strstr(r.output, "_Generic") == NULL,
+			      "generic member init: no _Generic in output");
+		prism_free(&r);
+		unlink(path);
+		free(path);
+	}
+
+	// Bug 3: goto skip check must NOT flag declarations with initializers.
+	// Only uninitialized declarations (where zeroinit adds = 0) should be
+	// flagged.
+	{
+		const char *code =
+		    "void f(int flag) {\n"
+		    "    if (flag) goto done;\n"
+		    "    int x = 42;\n"
+		    "    (void)x;\n"
+		    "    done: (void)0;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		char *path = create_temp_file(code);
+		CHECK(path != NULL, "goto skip init: create temp");
+		PrismResult r = prism_transpile_file(path, features);
+		CHECK_EQ(r.status, PRISM_OK, "goto skip init: accepted (has initializer)");
+		prism_free(&r);
+		unlink(path);
+		free(path);
+	}
+
+	// Verify goto skip still rejects uninitialized decls.
+	{
+		const char *code =
+		    "void f(int flag) {\n"
+		    "    if (flag) goto done;\n"
+		    "    int x;\n"
+		    "    (void)x;\n"
+		    "    done: (void)0;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		char *path = create_temp_file(code);
+		CHECK(path != NULL, "goto skip uninit: create temp");
+		PrismResult r = prism_transpile_file(path, features);
+		CHECK(r.status != PRISM_OK, "goto skip uninit: rejected (no initializer)");
+		prism_free(&r);
+		unlink(path);
+		free(path);
+	}
+}
+
+// fopen("w") does not use O_EXCL — it follows symlinks and truncates any
+// existing file.  Because the path is fully determined by the PID (which
+// is predictable), a local attacker can pre-create a symlink at the
+// predicted path pointing to an arbitrary file.  If prism runs as root
+// (e.g. `sudo prism install ext.c`), the target file is overwritten with
+// transpiled C, destroying it.
+//
+// The !use_lib_api branch correctly uses make_temp_file() (mkstemp/O_EXCL).
+// install_from_source's temp_bin path has the same pattern.
+#ifndef _WIN32
+static void test_install_temp_predictable_symlink_hijack(void) {
+	// Verify the fix: transpile_sources_to_temps (use_lib_api=true) and
+	// install_from_source now use make_temp_file() / mkstemp instead of
+	// predictable getpid()-based paths + fopen("w").
+	//
+	// mkstemp atomically creates files with O_CREAT|O_EXCL, generating
+	// unpredictable names.  A pre-placed symlink cannot hijack the path.
+
+	// 1) make_temp_file must generate unpredictable paths (no getpid pattern)
+	char path[512];
+	int rc = make_temp_file(path, sizeof(path), NULL, 0, "/tmp/dummy_source.c");
+	CHECK(rc == 0, "install-temp-symlink: make_temp_file succeeds");
+	if (rc != 0) return;
+
+	char pid_pattern[32];
+	snprintf(pid_pattern, sizeof(pid_pattern), "_%d_", getpid());
+	CHECK(strstr(path, pid_pattern) == NULL,
+	      "install-temp-symlink: temp path is not predictable (no PID)");
+	unlink(path);
+
+	// 2) A pre-placed symlink at a predictable path cannot hijack mkstemp.
+	//    Place a symlink at the old vulnerable pattern and verify mkstemp
+	//    does NOT follow it (it generates a different random name).
+	char target_path[256], attack_path[256];
+	snprintf(target_path, sizeof(target_path), "%sprism_test_sentinel_%d.txt",
+		 get_tmp_dir(), getpid());
+	snprintf(attack_path, sizeof(attack_path), "%sprism_install_%d_%d.c",
+		 get_tmp_dir(), getpid(), 0);
+
+	FILE *f = fopen(target_path, "w");
+	if (!f) { CHECK(0, "install-temp-symlink: could not create target"); return; }
+	fputs("SENTINEL", f);
+	fclose(f);
+
+	unlink(attack_path);
+	if (symlink(target_path, attack_path) != 0) {
+		unlink(target_path);
+		CHECK(0, "install-temp-symlink: could not create symlink");
+		return;
+	}
+
+	// Use the safe make_temp_file — verify it creates a *different* file,
+	// not following the symlink at the old predictable location.
+	char safe_path[512];
+	rc = make_temp_file(safe_path, sizeof(safe_path), NULL, 0, "/tmp/dummy_source.c");
+	CHECK(rc == 0, "install-temp-symlink: safe make_temp_file succeeds");
+	if (rc == 0) {
+		CHECK(strcmp(safe_path, attack_path) != 0,
+		      "install-temp-symlink: mkstemp path differs from predictable attack path");
+		// Write through the safe path and verify target was not corrupted.
+		f = fopen(safe_path, "w");
+		if (f) { fputs("SAFE", f); fclose(f); }
+
+		char buf[64] = {0};
+		f = fopen(target_path, "r");
+		if (f) { fread(buf, 1, sizeof(buf) - 1, f); fclose(f); }
+
+		CHECK(strcmp(buf, "SENTINEL") == 0,
+		      "install-temp-symlink: symlink target not corrupted via safe path");
+		unlink(safe_path);
+	}
+
+	unlink(attack_path);
+	unlink(target_path);
+}
+#endif
+
 void run_api_tests(void) {
 test_typeof_orelse_leak();
 	printf("\n=== API TESTS ===\n");
@@ -3965,6 +4286,7 @@ test_typeof_orelse_leak();
 	test_file_c23_generic_decl_macro_indirection();
 	test_file_c23_generic_decl_plain_redeclaration();
 	test_c23_generic_member_macro_indirection();
+	test_file_c23_n3322_local_extern_generic_leak();
 	test_raw_c23_attr_interleave();
 	test_c23_auto_orelse();
 	test_line_directive_escaped_quote();
@@ -4029,6 +4351,9 @@ test_typeof_orelse_leak();
 	test_cli_dep_flags_passthrough();
 	test_version_shows_backend_cc();
 	test_cli_split_D_flag_not_source();
+	test_coreutils_gnulib_generic_decl_leak();
+	test_binutils_gprofng_regressions();
+	test_install_temp_predictable_symlink_hijack();
 #endif
 
 	test_cli_parse_unit();

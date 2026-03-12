@@ -311,8 +311,9 @@ typedef struct PrismContext {
 	Token *func_ret_type_end;	   // Function name token (exclusive end of return type range)
 	Token *func_ret_type_suffix_start; // For complex declarators: closing ')' after func params
 	Token *func_ret_type_suffix_end;   // For complex declarators: token after suffix (exclusive)
-	unsigned bracket_oe_ids[16];       // Pre-assigned temp IDs for bracket orelse hoisting
+	unsigned *bracket_oe_ids;              // Pre-assigned temp IDs for bracket orelse hoisting (dynamic)
 	int bracket_oe_count;              // Count of hoisted bracket orelse temps
+	int bracket_oe_cap;                // Capacity of bracket_oe_ids array
 	int bracket_oe_next;               // Next temp to consume during emit
 #ifdef PRISM_LIB_MODE
 	char *active_membuf;	       // open_memstream buffer; freed on longjmp recovery
@@ -1531,9 +1532,13 @@ static Token *tokenize(File *file) {
 					Token *end = tok_match(t);
 					for (Token *b = tok_next(t); b != end; b = tok_next(b)) {
 						if (b->tag & TT_SPECIAL_FN) {
-							if (tok_loc(b)[0] == 'v' && b->len == 5)
-								t->tag |= TT_NORETURN_FN;
-							else
+							if (tok_loc(b)[0] == 'v' && b->len == 5) {
+								// Only taint if vfork is actually called: vfork()
+								// A bare reference (return vfork; / &vfork) is safe.
+								Token *nx = tok_next(b);
+								if (nx && nx != end && tok_loc(nx)[0] == '(')
+									t->tag |= TT_NORETURN_FN;
+							} else
 								t->tag |= TT_SPECIAL_FN;
 						}
 						if (b->tag & TT_ASM) t->tag |= TT_ASM;
@@ -1588,21 +1593,39 @@ static Token *tokenize(File *file) {
 				}
 			} while (changed);
 
-			// Apply taint to callers of tainted wrappers.
-			for (int i = 0; i < function_count; i++) {
-				Token *body = functions[i].body;
-				if (body->tag & (TT_SPECIAL_FN | TT_NORETURN_FN)) continue;
-				Token *end = tok_match(body);
-				for (Token *b = tok_next(body); b != end; b = tok_next(b)) {
-					if (b->kind != TK_IDENT || !tok_next(b) || tok_loc(tok_next(b))[0] != '(')
-						continue;
-					for (int j = 0; j < function_count; j++) {
-						if (!wrapper_taint[j]) continue;
-						if (!tok_name_eq(b, functions[j].name)) continue;
-						body->tag |= wrapper_taint[j];
+			// Apply taint to callers of tainted functions.
+			// Propagate vfork taint (TT_NORETURN_FN) transitively through
+			// call chains: if function A calls function B, and B's body
+			// contains vfork (or B is a wrapper of vfork), A gets tainted.
+			// Also propagate wrapper_taint for setjmp/asm wrappers (single pass).
+			// Use fixed-point iteration for vfork since it must cross
+			// non-wrapper boundaries (e.g. vfork returned as function pointer).
+			do {
+				changed = false;
+				for (int i = 0; i < function_count; i++) {
+					Token *body = functions[i].body;
+					if (body->tag & (TT_SPECIAL_FN | TT_NORETURN_FN)) continue;
+					Token *end = tok_match(body);
+					for (Token *b = tok_next(body); b != end; b = tok_next(b)) {
+						if (b->kind != TK_IDENT || !tok_next(b) || tok_loc(tok_next(b))[0] != '(')
+							continue;
+						for (int j = 0; j < function_count; j++) {
+							if (!tok_name_eq(b, functions[j].name)) continue;
+							// Wrapper taint (setjmp/vfork wrappers)
+							if (wrapper_taint[j] && !(body->tag & wrapper_taint[j])) {
+								body->tag |= wrapper_taint[j];
+								changed = true;
+							}
+							// Direct vfork taint from body scan
+							uint32_t vfork_taint = functions[j].body->tag & TT_NORETURN_FN;
+							if (vfork_taint && !(body->tag & TT_NORETURN_FN)) {
+								body->tag |= TT_NORETURN_FN;
+								changed = true;
+							}
+						}
 					}
 				}
-			}
+			} while (changed);
 		}
 	}
 
