@@ -1785,21 +1785,43 @@ static bool generic_decl_rewrite_target(Token *generic_tok, Token **name_out,
 	Token *close = tok_match(open);
 	Token *after = skip_noise(tok_next(close));
 	if (!after) return false;
-	if (!(match_ch(after, ';') || match_ch(after, ',') || (after->tag & TT_ATTR) ||
-	      is_c23_attr(after)))
-		return false;
 
-	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
-		Token *call_open = skip_noise(tok_next(t));
-		if (!is_valid_varname(t) || !call_open || !match_ch(call_open, '(') || !tok_match(call_open))
-			continue;
-		if (!params_look_like_decls(call_open)) continue;
+	// Pattern 1: _Generic(...name(decl-params)...) ;/attr
+	if (match_ch(after, ';') || match_ch(after, ',') || (after->tag & TT_ATTR) ||
+	    is_c23_attr(after)) {
+		for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
+			Token *call_open = skip_noise(tok_next(t));
+			if (!is_valid_varname(t) || !call_open || !match_ch(call_open, '(') || !tok_match(call_open))
+				continue;
+			if (!params_look_like_decls(call_open)) continue;
 
-		*name_out = t;
-		*params_open_out = call_open;
-		*params_close_out = tok_match(call_open);
-		*next_out = after;
-		return true;
+			*name_out = t;
+			*params_open_out = call_open;
+			*params_close_out = tok_match(call_open);
+			*next_out = after;
+			return true;
+		}
+	}
+
+	// Pattern 2: _Generic(...(cast)name)(decl-params) ;/attr
+	// glibc-style: function name inside _Generic, params follow outside.
+	if (match_ch(after, '(') && tok_match(after) && params_look_like_decls(after)) {
+		Token *ext_close = tok_match(after);
+		Token *after_ext = skip_noise(tok_next(ext_close));
+		if (after_ext && (match_ch(after_ext, ';') || match_ch(after_ext, ',') ||
+		    (after_ext->tag & TT_ATTR) || is_c23_attr(after_ext))) {
+			Token *found = NULL;
+			for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
+				if (is_valid_varname(t)) found = t;
+			}
+			if (found) {
+				*name_out = found;
+				*params_open_out = after;
+				*params_close_out = ext_close;
+				*next_out = after_ext;
+				return true;
+			}
+		}
 	}
 
 	return false;
@@ -4518,9 +4540,13 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 						if (ctx->block_depth == 0) {
 							toplevel_set_paren_pair(&toplevel, params_open, params_close);
 						}
-						// Emit any __attribute__ / [[...]] between _Generic(...) close and 'after'
+						// Emit any __attribute__ / [[...]] between construct end and 'after'.
+						// For Pattern 2 (params outside _Generic), skip past the already-emitted params.
 						Token *gen_close = tok_match(tok_next(tok));
-						for (Token *a = tok_next(gen_close); a && a != after; a = tok_next(a)) {
+						Token *scan_start = gen_close;
+						Token *after_gen = skip_noise(tok_next(gen_close));
+						if (after_gen == params_open) scan_start = params_close;
+						for (Token *a = tok_next(scan_start); a && a != after; a = tok_next(a)) {
 							emit_tok(a);
 							last_emitted = a;
 						}
