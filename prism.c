@@ -239,8 +239,14 @@ extern char **environ;
 static char **cached_clean_env = NULL;
 static volatile sig_atomic_t signal_temp_registered = 0;
 static char signal_temp_path[PATH_MAX];
+#if defined(_MSC_VER)
+// MSVC volatile has acquire/release semantics on x86/x64
+#define signal_temp_store(val) (signal_temp_registered = (val))
+#define signal_temp_load()     (signal_temp_registered)
+#else
 #define signal_temp_store(val) __atomic_store_n(&signal_temp_registered, (val), __ATOMIC_RELEASE)
 #define signal_temp_load()     __atomic_load_n(&signal_temp_registered, __ATOMIC_ACQUIRE)
+#endif
 
 static char **system_include_list; // Ordered list of includes
 static int system_include_capacity = 0;
