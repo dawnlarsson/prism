@@ -2198,9 +2198,8 @@ static void test_orelse_bracket_oe_buffer_exhaustion(void) {
 // keyword passed through to the downstream compiler.
 static void test_orelse_typeof_nested_bracket(void) {
 	const char *code =
-	    "int get_n(void) { return 0; }\n"
-	    "void f(void) {\n"
-	    "    typeof(int[get_n() orelse 1]) arr;\n"
+	    "void f(int n) {\n"
+	    "    typeof(int[n orelse 1]) arr;\n"
 	    "    (void)arr;\n"
 	    "}\n";
 	PrismResult r = prism_transpile_source(code, "typeof_nested_bracket.c", prism_defaults());

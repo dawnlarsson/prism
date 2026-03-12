@@ -31,11 +31,8 @@
 #endif
 
 #define TOMBSTONE ((char *)1)
-#define TAG_KEY(ptr, len)   ((char *)((uintptr_t)(ptr) | ((uintptr_t)(uint16_t)(len) << 48)))
-#define UNTAG_KEY(k)        ((char *)((uintptr_t)(k) & 0x0000FFFFFFFFFFFFULL))
-#define KEY_LEN(k)          ((int)((uintptr_t)(k) >> 48))
 #define ENTRY_MATCHES(ent, k, kl)                                                                            \
-	((ent)->key && UNTAG_KEY((ent)->key) != TOMBSTONE && KEY_LEN((ent)->key) == (kl) && !memcmp(UNTAG_KEY((ent)->key), (k), (kl)))
+	((ent)->key && (ent)->key != TOMBSTONE && (ent)->key_len == (kl) && !memcmp((ent)->key, (k), (kl)))
 #define IS_DIGIT(c) ((unsigned)(c) - '0' < 10u)
 #define IS_ALPHA(c) (((unsigned)((c) | 0x20) - 'a') < 26u || (c) == '_' || (c) == '$')
 #define IS_ALNUM(c) (IS_DIGIT(c) || IS_ALPHA(c))
@@ -71,6 +68,7 @@
 			size_t new_cap =                                                                     \
 			    (cap) == 0 ? ((init_cap) > 0 ? (size_t)(init_cap) : 1) : (size_t)(cap) * 2;      \
 			while (new_cap < (size_t)(count)) new_cap *= 2;                                      \
+			if (new_cap > SIZE_MAX / sizeof(T)) error("allocation overflow");                    \
 			T *tmp = realloc((arr), sizeof(T) * new_cap);                                        \
 			if (!tmp) {                                                                          \
 				error("out of memory");                                                      \
@@ -87,6 +85,7 @@
 			size_t new_cap =                                                                     \
 			    old_cap == 0 ? ((init_cap) > 0 ? (size_t)(init_cap) : 1) : old_cap * 2;          \
 			while (new_cap < (size_t)(count)) new_cap *= 2;                                      \
+			if (new_cap > SIZE_MAX / sizeof(T)) error("allocation overflow");                    \
 			(arr) = arena_realloc((arena), (arr), sizeof(T) * old_cap, sizeof(T) * new_cap);     \
 			(cap) = new_cap;                                                                     \
 		}                                                                                            \
@@ -201,10 +200,10 @@ struct Token {
 	uint32_t tag;         // TT_* bitmask - token classification
 	uint32_t next_idx;    // Token pool index (0 = NULL)
 	uint32_t match_idx;   // Token pool index (0 = NULL)
-	uint16_t len;
+	uint32_t len;         // Token length in bytes (must handle >65535 for large literals)
 	uint8_t  kind;
 	uint8_t  flags;
-}; // 16 bytes — hot path only
+}; // 20 bytes — hot path only
 
 typedef struct {
 	uint32_t loc_offset;  // Byte offset from File->contents
@@ -213,8 +212,9 @@ typedef struct {
 } TokenCold; // 8 bytes — error/debug path
 
 typedef struct {
-	char *key;  // upper 16 bits = keylen, lower 48 = pointer
+	char *key;
 	void *val;
+	uint16_t key_len;
 } HashEntry;
 
 typedef struct {
@@ -448,6 +448,8 @@ static void token_pool_ensure(size_t need) {
 	if (need <= token_cap) return;
 	size_t new_cap = token_cap ? token_cap * 2 : 65536;
 	while (new_cap < need) new_cap *= 2;
+	if (new_cap > (uint32_t)-1 || new_cap > SIZE_MAX / sizeof(Token))
+		error("token pool capacity exceeded");
 	Token *p = realloc(token_pool, new_cap * sizeof(Token));
 	if (!p) error("out of memory allocating token pool");
 	token_pool = p;
@@ -458,6 +460,8 @@ static void token_pool_ensure(size_t need) {
 }
 
 static inline Token *pool_alloc_token(void) {
+	if (token_count == UINT32_MAX)
+		error("maximum token limit reached");
 	if (__builtin_expect(token_count < token_cap, 1))
 		return &token_pool[token_count++];
 	token_pool_ensure(token_count + 1);
@@ -532,8 +536,8 @@ static void hashmap_resize(HashMap *map, int newcap) {
 	if (!new_map.buckets) error("out of memory resizing hashmap");
 	for (int i = 0; i < map->capacity; i++) {
 		HashEntry *ent = &map->buckets[i];
-		if (ent->key && UNTAG_KEY(ent->key) != TOMBSTONE)
-			hashmap_put(&new_map, UNTAG_KEY(ent->key), KEY_LEN(ent->key), ent->val);
+		if (ent->key && ent->key != TOMBSTONE)
+			hashmap_put(&new_map, ent->key, ent->key_len, ent->val);
 	}
 	free(map->buckets);
 	*map = new_map;
@@ -568,7 +572,8 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val) {
 	if (first_empty < 0) error("hashmap_put: no empty slot found (internal error)");
 
 	HashEntry *ent = &map->buckets[first_empty];
-	ent->key = TAG_KEY(key, keylen);
+	ent->key = key;
+	ent->key_len = keylen;
 	ent->val = val;
 	map->used++;
 }
@@ -1534,10 +1539,16 @@ static Token *tokenize(File *file) {
 						if (b->tag & TT_SPECIAL_FN) {
 							if (tok_loc(b)[0] == 'v' && b->len == 5) {
 								// Only taint if vfork is actually called: vfork()
+								// Also catch (vfork)() where next tok is ')' then '('.
 								// A bare reference (return vfork; / &vfork) is safe.
 								Token *nx = tok_next(b);
 								if (nx && nx != end && tok_loc(nx)[0] == '(')
 									t->tag |= TT_NORETURN_FN;
+								else if (nx && nx != end && tok_loc(nx)[0] == ')') {
+									Token *nx2 = tok_next(nx);
+									if (nx2 && nx2 != end && tok_loc(nx2)[0] == '(')
+										t->tag |= TT_NORETURN_FN;
+								}
 							} else
 								t->tag |= TT_SPECIAL_FN;
 						}

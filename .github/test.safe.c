@@ -2506,6 +2506,32 @@ static void test_large_string_output(void) {
 	CHECK(count == 4095, "large string content intact");
 }
 
+static void test_token_pool_resize_stress(void) {
+	/* Regression: token_pool_ensure used to store capacity as (uint32_t)new_cap
+	 * without overflow checking.  This test generates a large input that
+	 * forces multiple pool resize operations and verifies the transpiler
+	 * handles it correctly.  We generate ~200 typedef + function combos
+	 * to produce a significant token count. */
+	char *code = malloc(128 * 1024);
+	CHECK(code != NULL, "token-pool-resize: alloc code buffer");
+	if (!code) return;
+	int off = 0;
+	for (int i = 0; i < 200; i++) {
+		off += snprintf(code + off, 128 * 1024 - off,
+			"typedef struct { int f%d; char c%d; long l%d; } S%d;\n"
+			"S%d make_%d(void) { S%d s; s.f%d = %d; s.c%d = 0; s.l%d = 0; return s; }\n",
+			i, i, i, i, i, i, i, i, i, i, i);
+	}
+	off += snprintf(code + off, 128 * 1024 - off,
+		"int main(void) { return make_0().f0; }\n");
+	PrismResult r = prism_transpile_source(code, "token_pool_resize.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "token-pool-resize: large input forcing multiple pool resizes");
+	CHECK(r.output_len > 0, "token-pool-resize: output is non-empty");
+	prism_free(&r);
+	free(code);
+}
+
 
 static void test_struct_depth_beyond_64(void) {
 	// Exercise struct nesting that stays valid even if bitmask can't track depth >= 64
@@ -2949,6 +2975,33 @@ static void test_c23_attr_label_forward_goto(void) {
 	free(path);
 }
 
+static void test_switch_inner_loop_break_no_false_exit(void) {
+	/* Regression: break/continue inside a loop nested in a switch case
+	   must not falsely mark the switch scope as having a control exit.
+	   The defer runs at block close, so fallthrough is permitted here,
+	   but mark_switch_control_exit must still not set had_control_exit
+	   (correctness of internal state). Verify the code is accepted and
+	   the loop-break appears in the output (targets the loop, not switch). */
+	const char *code =
+	    "void f(int x) {\n"
+	    "    switch (x) {\n"
+	    "    case 1: {\n"
+	    "        defer { (void)0; }\n"
+	    "        while (1) { break; }\n"
+	    "    }\n"
+	    "    case 2:\n"
+	    "        break;\n"
+	    "    }\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "switch_loop_break.c", prism_defaults());
+	CHECK(r.status == PRISM_OK, "switch inner-loop break accepted (defer runs at block close)");
+	if (r.output) {
+		CHECK(strstr(r.output, "while") != NULL,
+		      "switch inner-loop break: output contains the while loop");
+	}
+	prism_free(&r);
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -3149,6 +3202,7 @@ void run_safe_tests(void) {
 
 	/* Hardening */
 	test_large_string_output();
+	test_token_pool_resize_stress();
 	test_struct_depth_beyond_64();
 	test_orelse_sequential_bare();
 	test_zeroinit_after_line_directives();
@@ -3168,4 +3222,5 @@ void run_safe_tests(void) {
 	test_forward_declared_longjmp_blind_spot();
 	test_deep_nesting_goto_bypass();
 	test_c23_attr_label_forward_goto();
+	test_switch_inner_loop_break_no_false_exit();
 }

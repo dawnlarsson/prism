@@ -6608,6 +6608,43 @@ static void expect_parse_rejects(const char *code, const char *file_name,
 	prism_free(&result);
 }
 
+static void test_hashmap_struct_entry_regression(void) {
+	/* Regression: hashmap entries used to pack the key length into the top
+	 * 16 bits of the pointer (TAG_KEY/UNTAG_KEY), which breaks on ARM64 MTE
+	 * and any platform with >48-bit virtual addresses.  After the fix,
+	 * HashEntry stores key_len as a separate uint16_t field.  This test
+	 * exercises many typedefs with varying name lengths to stress the
+	 * hashmap lookup/resize paths with the new struct layout. */
+	char code[4096];
+	int off = 0;
+	/* Generate 100 typedefs with names of lengths 1..10 */
+	for (int i = 0; i < 100; i++) {
+		char name[32];
+		int nlen = (i % 10) + 1;
+		for (int j = 0; j < nlen; j++) name[j] = 'a' + (j + i) % 26;
+		name[nlen] = '\0';
+		off += snprintf(code + off, sizeof(code) - off,
+			"typedef int t_%s_%d;\n", name, i);
+	}
+	/* Use some of them in declarations */
+	off += snprintf(code + off, sizeof(code) - off,
+		"void f(void) {\n");
+	for (int i = 0; i < 100; i += 10) {
+		char name[32];
+		int nlen = (i % 10) + 1;
+		for (int j = 0; j < nlen; j++) name[j] = 'a' + (j + i) % 26;
+		name[nlen] = '\0';
+		off += snprintf(code + off, sizeof(code) - off,
+			"    t_%s_%d v%d;\n    (void)v%d;\n", name, i, i, i);
+	}
+	off += snprintf(code + off, sizeof(code) - off, "}\n");
+
+	PrismResult r = prism_transpile_source(code, "hashmap_regression.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "hashmap-struct-entry: many typedefs with varying key lengths");
+	prism_free(&r);
+}
+
 static void test_negative_parse_corpus(void) {
 	printf("\n--- Negative Parse Corpus ---\n");
 
@@ -6639,6 +6676,61 @@ static void test_negative_parse_corpus(void) {
 	    "}\n",
 	    "neg_array_orelse.c", "negative corpus: array orelse rejected", "array");
 }
+
+static void test_large_token_no_truncation(void) {
+	/* Regression: Token.len was uint16_t, so tokens > 65535 bytes
+	   caused silent overflow — infinite loops or truncated output.
+	   Generate a string literal of 66000 chars (token ~66002 bytes). */
+	enum { STR_CHARS = 66000 };
+	size_t code_len = STR_CHARS + 256;
+	char *code = malloc(code_len);
+	int off = snprintf(code, code_len,
+		"void f(void) { const char *s = \"");
+	memset(code + off, 'A', STR_CHARS);
+	off += STR_CHARS;
+	off += snprintf(code + off, code_len - off, "\"; (void)s; }\n");
+
+	PrismResult result = prism_transpile_source(code, "large_token.c",
+						    prism_defaults());
+	CHECK_EQ(result.status, PRISM_OK, "large token (>65535 bytes) transpiles");
+	if (result.output) {
+		/* Output must contain the full string — not truncated */
+		size_t out_len = strlen(result.output);
+		CHECK(out_len > STR_CHARS, "large token output not truncated");
+	}
+	prism_free(&result);
+	free(code);
+}
+
+static void test_typeof_vla_orelse_side_effect_rejected(void) {
+	/* Regression: typeof(int[n++ orelse 10]) duplicated n++ in the ternary.
+	   For VLAs, typeof evaluates the dimension expression at runtime,
+	   causing the side effect to fire twice.  The transpiler must reject
+	   orelse with side-effect LHS inside typeof array brackets. */
+	expect_parse_rejects(
+	    "void f(int n) { typeof(int[n++ orelse 10]) arr; (void)arr; }\n",
+	    "typeof_vla_side_effect.c",
+	    "typeof VLA orelse with side-effect LHS rejected",
+	    "side effect");
+}
+
+#ifdef __GNUC__
+static void test_asm_in_orelse_lhs_rejected(void) {
+	/* Regression: asm in a statement expression in the bare-orelse LHS
+	   bypassed the side-effect scanner because asm is a keyword,
+	   not a valid varname.  The transpiler duplicated the LHS,
+	   causing asm to execute twice. */
+	expect_parse_rejects(
+	    "void f(void) {\n"
+	    "    int arr[4];\n"
+	    "    int val;\n"
+	    "    arr[({ __asm__ volatile(\"nop\"); 0; })] = val orelse 42;\n"
+	    "}\n",
+	    "asm_orelse_lhs.c",
+	    "asm in bare-orelse LHS rejected",
+	    "asm");
+}
+#endif
 
 void run_parse_tests(void) {
 	printf("\n=== PARSE TESTS ===\n");
@@ -7053,5 +7145,11 @@ void run_parse_tests(void) {
 	test_pragma_breaks_type_specifier();
 	test_pragma_struct_body_parsing();
 	test_knr_param_shadow_no_poison();
+	test_hashmap_struct_entry_regression();
 	test_negative_parse_corpus();
+	test_large_token_no_truncation();
+	test_typeof_vla_orelse_side_effect_rejected();
+#ifdef __GNUC__
+	test_asm_in_orelse_lhs_rejected();
+#endif
 }

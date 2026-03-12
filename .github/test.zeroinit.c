@@ -1508,6 +1508,27 @@ void test_const_typeof_vla_bug(void) {
 #endif
 }
 
+void test_typedef_typeof_vla_zeroinit(void) {
+#ifdef __GNUC__
+	// typedef typeof(char[n]) should be recognized as VLA and get memset
+	PrismResult r = prism_transpile_source(
+	    "void f(int n) {\n"
+	    "    typedef typeof(char[n]) dyn_buf_t;\n"
+	    "    dyn_buf_t buf;\n"
+	    "    (void)buf;\n"
+	    "}\n",
+	    "typedef_typeof_vla.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "typedef typeof(char[n]) transpiles");
+	if (r.output) {
+		CHECK(strstr(r.output, "memset") != NULL,
+		      "typedef typeof VLA: gets memset (not brace init)");
+		CHECK(strstr(r.output, "buf = {0}") == NULL,
+		      "typedef typeof VLA: no illegal brace init");
+	}
+	prism_free(&r);
+#endif
+}
+
 void test_const_typeof_atomic_struct_bug(void) {
 #if !defined(__TINYC__)
 	_Atomic struct S2_bug { int x, y; } s1;
@@ -2003,6 +2024,7 @@ void run_zeroinit_tests(void) {
 	test_sizeof_inline_enum_not_vla();
 
 	test_typeof_register_vla_bug();
+	test_typedef_typeof_vla_zeroinit();
 	test_atomic_register_struct_bug();
 	test_const_typeof_vla_bug();
 	test_const_typeof_atomic_struct_bug();

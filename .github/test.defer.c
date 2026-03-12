@@ -1530,6 +1530,44 @@ void test_defer_stmt_expr_top_level_rejected(void) {
 	    "statement expression");
 }
 
+void test_defer_stmt_expr_return_bypass(void) {
+	// A return inside a GNU statement expression inside a defer body should
+	// be rejected — it bypasses remaining defers just like a bare return.
+	check_defer_transpile_rejects(
+	    "int f(void) {\n"
+	    "    defer {\n"
+	    "        int status = ({\n"
+	    "            if (1) return -1;\n"
+	    "            0;\n"
+	    "        });\n"
+	    "        (void)status;\n"
+	    "    }\n"
+	    "    return 0;\n"
+	    "}\n",
+	    "defer_stmt_expr_return_bypass.c",
+	    "defer stmt-expr return bypass rejected",
+	    "return");
+}
+
+void test_defer_stmt_expr_goto_bypass(void) {
+	// A goto inside a GNU statement expression inside a defer body should
+	// also be rejected.
+	check_defer_transpile_rejects(
+	    "void f(void) {\n"
+	    "    defer {\n"
+	    "        int status = ({\n"
+	    "            if (1) goto bail;\n"
+	    "            0;\n"
+	    "        });\n"
+	    "        (void)status;\n"
+	    "    }\n"
+	    "    bail: (void)0;\n"
+	    "}\n",
+	    "defer_stmt_expr_goto_bypass.c",
+	    "defer stmt-expr goto bypass rejected",
+	    "goto");
+}
+
 void test_defer_computed_goto_rejected(void) {
 	check_defer_transpile_rejects(
 	    "int f(void) {\n"
@@ -1995,6 +2033,72 @@ static void test_defer_safe_shadow_no_exit(void) {
 	prism_free(&r);
 }
 
+static void test_defer_shadow_struct_member_false_positive(void) {
+	/* BUG: check_defer_var_shadow matches identifiers by string alone,
+	 * without checking if the token follows a member-access operator
+	 * (. or ->).  If a defer body contains device->x (a struct member),
+	 * declaring 'int x' in an inner scope falsely triggers a shadow
+	 * conflict even though the defer never captures a standalone 'x'. */
+	const char *code =
+	    "typedef struct { int x; } Device;\n"
+	    "void *alloc(int);\n"
+	    "void release(void *);\n"
+	    "void f(void) {\n"
+	    "    Device *dev = alloc(sizeof(Device));\n"
+	    "    dev->x = 42;\n"
+	    "    defer { dev->x = 0; release(dev); }\n"
+	    "    {\n"
+	    "        int x = 10;\n"
+	    "        (void)x;\n"
+	    "        return;\n"
+	    "    }\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_shadow_member.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "defer-shadow-member: struct member in defer must not trigger false shadow");
+	prism_free(&r);
+}
+
+static void test_defer_shadow_overflow_silent_drop(void) {
+	/* BUG: register_decl_shadow silently drops entry #257 when the static
+	 * defer_shadows[256] array is full.  If a break/continue only unwinds
+	 * defers that the dropped shadow refers to, check_defer_shadow_at_exit
+	 * cannot see the conflict and the transpiled code silently operates on
+	 * the wrong (shadowed) variable.
+	 *
+	 * Repro: 256 outer defers capture v0..v255; one loop defer captures
+	 * v256.  An inner scope shadows all 257 variables and breaks.  The
+	 * break unwinds only the loop defer (v256), but shadow entry #257
+	 * was dropped so the error is missed. */
+	char buf[65536];
+	int off = 0;
+	off += snprintf(buf + off, sizeof(buf) - off, "void test(void) {\n");
+	for (int i = 0; i < 256; i++)
+		off += snprintf(buf + off, sizeof(buf) - off,
+		    "  int v%d = 0; defer v%d++;\n", i, i);
+	off += snprintf(buf + off, sizeof(buf) - off,
+	    "  int v256 = 0;\n"
+	    "  for (int _i = 0; _i < 1; _i++) {\n"
+	    "    defer v256++;\n"
+	    "    {\n");
+	for (int i = 0; i < 256; i++)
+		off += snprintf(buf + off, sizeof(buf) - off,
+		    "      int v%d = 1;\n", i);
+	off += snprintf(buf + off, sizeof(buf) - off,
+	    "      int v256 = 1;\n"
+	    "      break;\n"
+	    "    }\n"
+	    "  }\n"
+	    "}\n");
+	PrismResult r = prism_transpile_source(buf, "defer_shadow_overflow.c",
+	                                       prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "defer-shadow-overflow: 257th shadow must not be silently dropped");
+	CHECK(r.error_msg && strstr(r.error_msg, "shadow"),
+	      "defer-shadow-overflow: error message mentions 'shadow'");
+	prism_free(&r);
+}
+
 static void test_defer_body_bare_orelse_return_not_rejected(void) {
 	/* BUG: validate_defer_statement calls skip_to_semicolon for statements
 	 * that don't start with a keyword (like 'get() orelse return;'), so the
@@ -2015,6 +2119,23 @@ static void test_defer_body_bare_orelse_return_not_rejected(void) {
 }
 
 #ifndef _WIN32
+static void test_defer_paren_vfork_bypass(void) {
+	// (vfork)() is equivalent to vfork() but bypasses the strict `vfork(` check
+	const char *code =
+	    "typedef int pid_t;\n"
+	    "pid_t vfork(void);\n"
+	    "void cleanup(void);\n"
+	    "int f(void) {\n"
+	    "    defer { cleanup(); }\n"
+	    "    pid_t pid = (vfork)();\n"
+	    "    return pid;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_paren_vfork.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "defer-paren-vfork: (vfork)() must be rejected like vfork()");
+	prism_free(&r);
+}
+
 static void test_defer_vfork_funcptr_bypass(void) {
 	/*
 	const char *code =
@@ -2171,6 +2292,8 @@ void run_defer_tests(void) {
 	test_defer_braceless_control_rejected();
 #ifdef __GNUC__
 	test_defer_stmt_expr_top_level_rejected();
+	test_defer_stmt_expr_return_bypass();
+	test_defer_stmt_expr_goto_bypass();
 	test_defer_computed_goto_rejected();
 	test_defer_asm_rejected();
 #endif
@@ -2192,7 +2315,10 @@ void run_defer_tests(void) {
 	test_defer_label_duplication_bug();
 	test_defer_variable_shadowing_binds_wrong_scope();
 	test_defer_safe_shadow_no_exit();
+	test_defer_shadow_struct_member_false_positive();
+	test_defer_shadow_overflow_silent_drop();
 #ifndef _WIN32
+	test_defer_paren_vfork_bypass();
 	test_defer_vfork_funcptr_bypass();
 	test_defer_vfork_reference_false_positive();
 #endif

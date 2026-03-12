@@ -239,6 +239,8 @@ extern char **environ;
 static char **cached_clean_env = NULL;
 static volatile sig_atomic_t signal_temp_registered = 0;
 static char signal_temp_path[PATH_MAX];
+#define signal_temp_store(val) __atomic_store_n(&signal_temp_registered, (val), __ATOMIC_RELEASE)
+#define signal_temp_load()     __atomic_load_n(&signal_temp_registered, __ATOMIC_ACQUIRE)
 
 static char **system_include_list; // Ordered list of includes
 static int system_include_capacity = 0;
@@ -676,11 +678,19 @@ static int find_switch_scope(void) {
 	return -1;
 }
 
-// Mark unconditional control exit in the innermost switch scope
-static void mark_switch_control_exit(void) {
+// Mark unconditional control exit in the innermost switch scope.
+// If loop_targetable is true (break/continue), skip if a loop scope
+// sits between the current position and the switch scope, since the
+// break/continue targets the loop, not the switch.
+static void mark_switch_control_exit(bool loop_targetable) {
 	if (ctrl_state.pending || in_conditional_block()) return;
 	int sd = find_switch_scope();
-	if (sd >= 0) scope_stack[sd].had_control_exit = true;
+	if (sd < 0) return;
+	if (loop_targetable) {
+		for (int d = ctx->scope_depth - 1; d > sd; d--)
+			if (scope_stack[d].is_loop) return;
+	}
+	scope_stack[sd].had_control_exit = true;
 }
 
 static bool needs_space(Token *prev, Token *tok) {
@@ -875,12 +885,16 @@ static void check_defer_var_shadow(Token *var_name) {
 	char *name = tok_loc(var_name);
 	int nlen = var_name->len;
 	for (int i = 0; i < outer_defer_end; i++) {
+		Token *prev = NULL;
 		for (Token *t = defer_stack[i].stmt; t && t != defer_stack[i].end && t->kind != TK_EOF;
-		     t = tok_next(t)) {
+		     prev = t, t = tok_next(t)) {
 			if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
+			    !(prev && (prev->tag & TT_MEMBER)) &&
 			    t->len == nlen && !memcmp(tok_loc(t), name, nlen)) {
-				if (defer_shadow_count < MAX_DEFER_SHADOWS)
-					defer_shadows[defer_shadow_count++] = (DeferShadow){
+				if (defer_shadow_count >= MAX_DEFER_SHADOWS)
+					error_tok(var_name, "too many shadowed variables in defer scope; limit is %d",
+						  MAX_DEFER_SHADOWS);
+				defer_shadows[defer_shadow_count++] = (DeferShadow){
 						.name = name, .len = nlen,
 						.block_depth = ctx->block_depth,
 						.var_tok = var_name,
@@ -1675,7 +1689,7 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 	TypeSpecResult type_spec = parse_type_specifier(tok);
 	tok = type_spec.end; // Skip the base type
 
-	bool is_vla = typedef_contains_vla(typedef_start);
+	bool is_vla = type_spec.is_vla || typedef_contains_vla(typedef_start);
 
 	// Check if the base type has const — either explicit tokens or from a const typedef.
 	bool base_is_const = type_spec.has_const;
@@ -2172,7 +2186,24 @@ static Token *walk_balanced_orelse(Token *tok) {
 		emit_token_range_orelse(rhs_start, end);
 		OUT_LIT(")");
 	} else if (is_bracket) {
-		// Fallback for brackets not covered by pre-hoisting (e.g. function params):
+		// Fallback for brackets not covered by pre-hoisting (e.g. typeof):
+		// Reject if LHS has side effects — duplication would fire them twice.
+		for (Token *s = lhs_start; s && s != orelse_found && s->kind != TK_EOF; s = tok_next(s)) {
+			if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; continue; }
+			if (equal(s, "++") || equal(s, "--"))
+				error_tok(s, "'orelse' in array dimension / typeof with side effect "
+					  "in the LHS (would be evaluated twice); "
+					  "hoist the expression to a variable first");
+			if (is_assignment_operator_token(s))
+				error_tok(s, "'orelse' in array dimension / typeof with side effect "
+					  "in the LHS (would be evaluated twice); "
+					  "hoist the expression to a variable first");
+			if (is_valid_varname(s) && !is_type_keyword(s) && tok_next(s) &&
+			    tok_next(s) != orelse_found && match_ch(tok_next(s), '('))
+				error_tok(s, "'orelse' in array dimension / typeof with side effect "
+					  "in the LHS (would be evaluated twice); "
+					  "hoist the expression to a variable first");
+		}
 		// emit ternary with LHS duplication (no statement expression)
 		OUT_LIT(" (");
 		emit_token_range(lhs_start, orelse_found);
@@ -2401,7 +2432,7 @@ static inline void register_decl_shadows(Token *var_name, bool effective_vla) {
 // Emit break/continue with defer handling. Returns next token.
 static Token *emit_break_continue_defer(Token *tok) {
 	bool is_break = tok->tag & TT_BREAK;
-	mark_switch_control_exit();
+	mark_switch_control_exit(true);
 	if (FEAT(F_DEFER) && control_flow_has_defers(is_break))
 		emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
 	out_char(' '); out_str(tok_loc(tok), tok->len); out_char(';');
@@ -2412,7 +2443,7 @@ static Token *emit_break_continue_defer(Token *tok) {
 
 // Emit goto with defer handling. Returns next token.
 static Token *emit_goto_defer(Token *tok) {
-	mark_switch_control_exit();
+	mark_switch_control_exit(false);
 	tok = tok_next(tok);
 	if (FEAT(F_DEFER) && is_identifier_like(tok)) {
 		LabelInfo *info = label_find(tok);
@@ -2506,7 +2537,7 @@ static Token *handle_const_orelse_fallback(Token *tok,
 			out_uint(oe_id);
 			OUT_LIT(") {");
 			if (tok->tag & TT_RETURN) {
-				mark_switch_control_exit();
+				mark_switch_control_exit(false);
 				tok = tok_next(tok);
 				tok = emit_return_body(tok, NULL);
 			} else if (tok->tag & (TT_BREAK | TT_CONTINUE)) {
@@ -3221,7 +3252,15 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch)
 		return validate_defer_statement(skip_defer_control_head(tok_next(tok)), true, in_switch);
 	}
 
-	if (tok->flags & TF_OPEN) return tok_match(tok) ? tok_next(tok_match(tok)) : tok_next(tok);
+	if (tok->flags & TF_OPEN) {
+		// GNU statement expression ({...}): validate the inner block recursively
+		if (match_ch(tok, '(') && tok_next(tok) && match_ch(tok_next(tok), '{')) {
+			Token *inner_brace = tok_next(tok);
+			validate_defer_statement(inner_brace, in_loop, in_switch);
+			return tok_match(tok) ? tok_next(tok_match(tok)) : tok_next(tok);
+		}
+		return tok_match(tok) ? tok_next(tok_match(tok)) : tok_next(tok);
+	}
 
 	// Labeled statement: ident ':' <stmt>
 	if (tok->kind == TK_IDENT && tok_next(tok) && match_ch(tok_next(tok), ':'))
@@ -3261,6 +3300,16 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch)
 		}
 	}
 
+	// Catch-all: walk to semicolon, recursively validating any GNU statement
+	// expressions ({...}) encountered along the way.
+	for (Token *s = tok; s && s->kind != TK_EOF && !match_ch(s, ';'); s = tok_next(s)) {
+		if (s->flags & TF_OPEN) {
+			if (match_ch(s, '(') && tok_next(s) && match_ch(tok_next(s), '{'))
+				validate_defer_statement(tok_next(s), in_loop, in_switch);
+			s = tok_match(s) ? tok_match(s) : s;
+			continue;
+		}
+	}
 	Token *semi = skip_to_semicolon(tok);
 	return (semi && semi->kind != TK_EOF) ? tok_next(semi) : semi;
 }
@@ -3412,7 +3461,7 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bo
 	if (tok->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) {
 		uint64_t tag = tok->tag;
 		if (tag & TT_RETURN) {
-			mark_switch_control_exit();
+			mark_switch_control_exit(false);
 			tok = tok_next(tok);
 		}
 		orelse_open(var_name);
@@ -3474,7 +3523,7 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bo
 // Handle 'return' with active defers: save expr, emit defers, then return.
 // Returns next token if handled, or NULL to let normal emit proceed.
 static Token *handle_return_defer(Token *tok) {
-	mark_switch_control_exit();
+	mark_switch_control_exit(false);
 	if (!has_active_defers()) return NULL;
 	tok = tok_next(tok); // skip 'return'
 	OUT_LIT(" {");
@@ -3488,7 +3537,7 @@ static Token *handle_return_defer(Token *tok) {
 // Returns next token if handled, or NULL.
 static Token *handle_break_continue_defer(Token *tok) {
 	bool is_break = tok->tag & TT_BREAK;
-	mark_switch_control_exit();
+	mark_switch_control_exit(true);
 	if (!control_flow_has_defers(is_break)) return NULL;
 	OUT_LIT(" {");
 	tok = emit_break_continue_defer(tok);
@@ -3527,7 +3576,7 @@ static Token *handle_goto_keyword(Token *tok) {
 	tok = tok_next(tok);
 
 	if (FEAT(F_DEFER)) {
-		mark_switch_control_exit();
+		mark_switch_control_exit(false);
 
 		if (match_ch(tok, '*')) {
 			if (has_active_defers())
@@ -4323,6 +4372,10 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 								error_tok(s, "orelse fallback on assignment with side effects "
 									  "in the target expression (double evaluation); "
 									  "use a temporary variable instead");
+							if (s->tag & TT_ASM)
+								error_tok(s, "orelse fallback on assignment with inline asm "
+									  "in the target expression (double evaluation); "
+									  "use a temporary variable instead");
 							if (is_valid_varname(s) && !is_type_keyword(s) && tok_next(s) &&
 							    tok_next(s) != bare_assign_eq && match_ch(tok_next(s), '('))
 								error_tok(s, "orelse fallback on assignment with a function call "
@@ -4472,7 +4525,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 		if (tag & TT_NORETURN_FN) {
 			if (tok_next(tok) && match_ch(tok_next(tok), '(')) {
-				mark_switch_control_exit();
+				mark_switch_control_exit(false);
 				if (FEAT(F_DEFER) && has_active_defers())
 					fprintf(stderr,
 						"%s:%d: warning: '%.*s' called with active defers (defers "
@@ -5629,8 +5682,9 @@ static int compile_sources(Cli *cli) {
 	make_run_temp(temp_exe, sizeof(temp_exe), cli->mode);
 
 	if (temp_exe[0]) {
+		signal_temp_store(0);
 		memcpy(signal_temp_path, temp_exe, sizeof(signal_temp_path));
-		signal_temp_registered = 1;
+		signal_temp_store(1);
 	}
 
 	use_linemarkers = FEAT(F_FLATTEN) && !clang && !msvc;
@@ -5676,7 +5730,7 @@ static int compile_sources(Cli *cli) {
 
 	if (status != 0) {
 		if (temp_exe[0]) remove(temp_exe);
-		signal_temp_registered = 0;
+		signal_temp_store(0);
 		return status;
 	}
 
@@ -5687,12 +5741,12 @@ static int compile_sources(Cli *cli) {
 		remove(temp_exe);
 	}
 
-	signal_temp_registered = 0;
+	signal_temp_store(0);
 	return status;
 }
 
 static void signal_cleanup_handler(int sig) {
-	if (signal_temp_registered && signal_temp_path[0])
+	if (signal_temp_load() && signal_temp_path[0])
 		unlink(signal_temp_path);
 	signal(sig, SIG_DFL);
 	raise(sig);
