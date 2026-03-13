@@ -2165,6 +2165,45 @@ static void test_orelse_static_decl_bare_assignment_collapse(void) {
 // The 17th bracket-orelse dimension falls back to legacy ternary emission
 // which double-evaluates the LHS expression.  A function call with side
 // effects in the 17th dimension is evaluated twice.
+static void test_typeof_implicit_const_orelse(void) {
+	/* BUG: typeof(const_var) carries implicit const, making orelse temp read-only.
+	 * Both `const typeof(x) y = 0 orelse 10` and `typeof(x) y = 0 orelse 10`
+	 * (where x is const) produced uncompilable output.
+	 * Fix: detect typeof in type and strip const via __typeof__((T)0 + 0). */
+
+	/* Variant 1: explicit const + typeof(const_var) */
+	const char *code1 =
+	    "void f(void) {\n"
+	    "    const int x = 0;\n"
+	    "    const typeof(x) y = 0 orelse 10;\n"
+	    "    (void)y;\n"
+	    "}\n";
+	PrismResult r1 = prism_transpile_source(code1, "typeof_const1.c", prism_defaults());
+	CHECK(r1.status == PRISM_OK && r1.output,
+	      "typeof-implicit-const-1: transpiles OK");
+	if (r1.output) {
+		CHECK(!strstr(r1.output, "typeof(x) _Prism_oe") || strstr(r1.output, "__typeof__"),
+		      "typeof-implicit-const-1: const stripped from orelse temp");
+	}
+	prism_free(&r1);
+
+	/* Variant 2: bare typeof(const_var) without explicit const */
+	const char *code2 =
+	    "void g(void) {\n"
+	    "    const int x = 0;\n"
+	    "    typeof(x) y = 0 orelse 10;\n"
+	    "    (void)y;\n"
+	    "}\n";
+	PrismResult r2 = prism_transpile_source(code2, "typeof_const2.c", prism_defaults());
+	CHECK(r2.status == PRISM_OK && r2.output,
+	      "typeof-implicit-const-2: transpiles OK");
+	if (r2.output) {
+		CHECK(strstr(r2.output, "__typeof__") || strstr(r2.output, "typeof_unqual"),
+		      "typeof-implicit-const-2: uses const-stripping typeof wrapper");
+	}
+	prism_free(&r2);
+}
+
 static void test_orelse_bracket_oe_buffer_exhaustion(void) {
 	const char *code =
 	    "int get_dim(void) { static int c = 0; return ++c; }\n"
@@ -2356,5 +2395,8 @@ void run_orelse_tests(void) {
 	test_orelse_for_init_bracket_orelse_bypass();
 	test_orelse_static_decl_bare_assignment_collapse();
 	test_orelse_bracket_oe_buffer_exhaustion();
+
+	// Audit round 3
+	test_typeof_implicit_const_orelse();
 }
 

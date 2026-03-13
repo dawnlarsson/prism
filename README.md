@@ -5,7 +5,7 @@
 
 Prism is a lightweight and very fast transpiler that makes C safer without changing how you write it.
 
-- **3039 tests** — edge cases, control flow, nightmares, trying hard to break Prism
+- **3083 tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Proper transpiler** — tracks typedefs, respects scope, catches unsafe patterns
 - **Opt-out features** — Disable parts of the transpiler, like zero-init, with CLI flags
@@ -13,7 +13,7 @@ Prism is a lightweight and very fast transpiler that makes C safer without chang
 - **Single Repo** — 7k lines, zero dependencies, easy to audit
 
 Prism is a proper transpiler, not a preprocessor macro.
-* **Track Types:** It parses `typedef`s to distinguish pointer declarations from multiplication (the "lexer hack"), ensuring correct zero-initialization.
+* **Track Types:** A pre-scan pass registers every `typedef`, `enum` constant, and tag at file scope into a symbol table *before* transpilation begins — no heuristics, no suffix guessing. If it wasn't declared, it's not a type.
 * **Respect Scope:** It understands braces `{}`, statement expressions `({ ... })`, and switch-case fallthrough, ensuring `defer` fires exactly when it should.
 * **Detect Errors:** It catches unsafe patterns (like jumping into a scope with `goto`) before they become runtime bugs.
 
@@ -141,7 +141,7 @@ void example() {
 }
 ```
 
-**Typedef tracking:** Prism parses headers to recognize `size_t`, `uint8_t`, `FILE *`, `pthread_mutex_t`, etc. This distinguishes `size_t x;` (declaration → initialize) from `size_t * x;` (expression → don't touch).
+**Typedef tracking:** Before transpilation, Prism pre-scans the preprocessed token stream to build a complete symbol table of all file-scope `typedef`s, `enum` constants, and tags. This is deterministic — `size_t`, `pthread_mutex_t`, and every other typedef from system headers are resolved by name lookup, not pattern matching. This distinguishes `size_t x;` (declaration → initialize) from `size_t * x;` (expression → don't touch).
 
 **VLA support:** Variable-length arrays get `memset` at runtime.
 

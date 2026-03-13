@@ -9,6 +9,7 @@
 #endif
 #include <signal.h>
 #include <spawn.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
@@ -239,14 +240,38 @@ extern char **environ;
 static char **cached_clean_env = NULL;
 static volatile sig_atomic_t signal_temp_registered = 0;
 static char signal_temp_path[PATH_MAX];
+
+// Transpiled temp file tracking for signal cleanup.
+// Fixed-size ring; entries are PATH_MAX-sized C strings.
+#define SIGNAL_TEMPS_MAX 64
+static char signal_temps[SIGNAL_TEMPS_MAX][PATH_MAX];
+static volatile sig_atomic_t signal_temps_count = 0;
+
 #if defined(_MSC_VER)
 // MSVC volatile has acquire/release semantics on x86/x64
 #define signal_temp_store(val) (signal_temp_registered = (val))
 #define signal_temp_load()     (signal_temp_registered)
+#define signal_temps_store(val) (signal_temps_count = (val))
+#define signal_temps_load()     (signal_temps_count)
 #else
 #define signal_temp_store(val) __atomic_store_n(&signal_temp_registered, (val), __ATOMIC_RELEASE)
 #define signal_temp_load()     __atomic_load_n(&signal_temp_registered, __ATOMIC_ACQUIRE)
+#define signal_temps_store(val) __atomic_store_n(&signal_temps_count, (val), __ATOMIC_RELEASE)
+#define signal_temps_load()     __atomic_load_n(&signal_temps_count, __ATOMIC_ACQUIRE)
 #endif
+
+static void signal_temps_register(const char *path) {
+	int n = signal_temps_load();
+	if (n >= SIGNAL_TEMPS_MAX) return;
+	size_t len = strlen(path);
+	if (len >= PATH_MAX) return;
+	memcpy(signal_temps[n], path, len + 1);
+	signal_temps_store(n + 1);
+}
+
+static void signal_temps_clear(void) {
+	signal_temps_store(0);
+}
 
 static char **system_include_list; // Ordered list of includes
 static int system_include_capacity = 0;
@@ -1114,20 +1139,17 @@ static Token *find_boundary_comma(Token *tok) {
 	return NULL;
 }
 
+// Strict type resolution: a token is a type only if it was explicitly registered
+// in the symbol table by the declaration pre-scan or inline parse_typedef_declaration.
+// No heuristics — if it's not in the table, it's not a type. Period.
 static inline bool is_typedef_heuristic(Token *tok) {
-	if (tok->kind != TK_IDENT || tok->len < 2) return false;
-	if (tok_loc(tok)[tok->len - 2] == '_' && tok_loc(tok)[tok->len - 1] == 't') return true;
-	return tok_loc(tok)[0] == '_' && tok_loc(tok)[1] == '_' && !(tok_next(tok) && match_ch(tok_next(tok), '('));
+	(void)tok;
+	return false;
 }
 
-// Known typedef or system typedef heuristic (e.g., size_t, __rlim_t)
 static bool is_typedef_like(Token *tok) {
 	if (!is_identifier_like(tok)) return false;
-	if (is_known_typedef(tok)) return true;
-	// Check if a shadow was registered (variable with a heuristic-type name).
-	TypedefEntry *e = typedef_lookup(tok);
-	if (e && (e->is_shadow || e->is_vla_var)) return false;
-	return is_typedef_heuristic(tok);
+	return is_known_typedef(tok);
 }
 
 // Find opening brace of a struct/union/enum body, or NULL if no body.
@@ -1674,6 +1696,7 @@ static bool struct_body_contains_vla(Token *brace) {
 		}
 		if ((t->flags & TF_OPEN) && !match_ch(t, '[')) { t = tok_match(t); continue; }
 		if (match_ch(t, '[') && array_size_is_vla(t)) return true;
+		if (is_identifier_like(t) && is_vla_typedef(t)) return true;
 	}
 	return false;
 }
@@ -1958,10 +1981,17 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 				if (tok->tag & TT_QUALIFIER) tok = tok_next(tok);
 				else break;
 			}
-			if (tok && is_valid_varname(tok)) tok = tok_next(tok);
+			Token *sue_tag = NULL;
+			if (tok && is_valid_varname(tok)) { sue_tag = tok; tok = tok_next(tok); }
 			if (tok && match_ch(tok, '{')) {
-				if (struct_body_contains_vla(tok)) r.is_vla = true;
+				if (struct_body_contains_vla(tok)) {
+					r.is_vla = true;
+					if (sue_tag)
+						typedef_add_vla_var(tok_loc(sue_tag), sue_tag->len, ctx->block_depth);
+				}
 				tok = skip_balanced(tok, '{', '}');
+			} else if (sue_tag && is_vla_typedef(sue_tag)) {
+				r.is_vla = true;
 			}
 			r.end = tok;
 			continue;
@@ -2484,12 +2514,15 @@ static Token *handle_const_orelse_fallback(Token *tok,
 	// the declarator-level const (e.g. *const between parens) is stripped below.
 	bool strip_type_const = !decl->is_pointer && !decl->is_func_ptr;
 
-	// Detect const typedefs (const baked into typedef, no TT_CONST tag).
+	// Detect const typedefs (const baked into typedef, no TT_CONST tag)
+	// or typeof expressions (typeof(const_var) carries implicit const).
 	// Use __typeof__((type)0 + 0) to strip const via arithmetic promotion.
 	bool has_const_typedef = false;
 	if (strip_type_const) {
-		for (Token *t = type_start; t != type->end; t = tok_next(t))
+		for (Token *t = type_start; t != type->end; t = tok_next(t)) {
 			if (is_const_typedef(t)) { has_const_typedef = true; break; }
+			if (t->tag & TT_TYPEOF) { has_const_typedef = true; break; }
+		}
 	}
 
 	if (has_const_typedef) {
@@ -2625,6 +2658,11 @@ typedef struct {
 
 static bool has_effective_const_qual(Token *type_start, TypeSpecResult *type, DeclResult *decl) {
 	bool has_const_qual = (type->has_const && !decl->is_func_ptr) || decl->is_const;
+	// typeof() may carry implicit const from its argument (e.g. typeof(const_var)).
+	// Route through the const-stripping path to be safe; the __typeof__((T)0 + 0)
+	// wrapper is a no-op for non-const types.
+	if (type->has_typeof && !decl->is_func_ptr && !decl->is_pointer)
+		has_const_qual = true;
 	if (!has_const_qual && !decl->is_func_ptr && !decl->is_pointer) {
 		for (Token *t = type_start; t && t != type->end; t = tok_next(t))
 			if (is_const_typedef(t)) { has_const_qual = true; break; }
@@ -3163,7 +3201,7 @@ static Token *emit_expr_to_semicolon(Token *tok) {
 				emit_tok(tok);
 				tok = tok_next(tok);
 			} else {
-				if (FEAT(F_ORELSE) && match_ch(tok, '('))
+					if (FEAT(F_ORELSE) && (match_ch(tok, '(') || match_ch(tok, '[')))
 					check_orelse_in_parens(tok);
 				tok = walk_balanced(tok, true);
 			}
@@ -3908,9 +3946,16 @@ static void cc_split_into_argv(const char **args, int *argc, const char *cc, cha
 	while (*p) {
 		while (*p == ' ' || *p == '\t') p++;
 		if (!*p) break;
+		char quote = 0;
+		if (*p == '\'' || *p == '"') { quote = *p++; }
 		char *start = p;
-		while (*p && *p != ' ' && *p != '\t') p++;
-		if (*p) *p++ = '\0';
+		if (quote) {
+			while (*p && *p != quote) p++;
+			if (*p) *p++ = '\0';
+		} else {
+			while (*p && *p != ' ' && *p != '\t') p++;
+			if (*p) *p++ = '\0';
+		}
 		args[(*argc)++] = start;
 	}
 	if (out_dup) *out_dup = dup;
@@ -4023,6 +4068,7 @@ static char *preprocess_with_cc(const char *input_file) {
 
 	// Capture preprocessor stderr to a temp file for diagnostics on failure
 	char pp_stderr_path[PATH_MAX] = "";
+	int pp_stderr_fd = -1;
 	{
 		const char *tmpdir = getenv(TMPDIR_ENVVAR);
 #ifdef TMPDIR_ENVVAR_ALT
@@ -4030,9 +4076,8 @@ static char *preprocess_with_cc(const char *input_file) {
 #endif
 		if (!tmpdir || !*tmpdir) tmpdir = TMPDIR_FALLBACK;
 		snprintf(pp_stderr_path, sizeof pp_stderr_path, "%s/prism_pp_err_XXXXXX", tmpdir);
-		int fd = mkstemp(pp_stderr_path);
-		if (fd >= 0) close(fd);
-		else
+		pp_stderr_fd = mkstemp(pp_stderr_path);
+		if (pp_stderr_fd < 0)
 			pp_stderr_path[0] = '\0';
 	}
 	posix_spawn_file_actions_t fa;
@@ -4040,13 +4085,17 @@ static char *preprocess_with_cc(const char *input_file) {
 	posix_spawn_file_actions_addclose(&fa, pipefd[0]);
 	posix_spawn_file_actions_adddup2(&fa, pipefd[1], STDOUT_FILENO);
 	posix_spawn_file_actions_addclose(&fa, pipefd[1]);
-	posix_spawn_file_actions_addopen(
-	    &fa, STDERR_FILENO, pp_stderr_path[0] ? pp_stderr_path : "/dev/null", O_WRONLY | O_TRUNC, 0644);
+	if (pp_stderr_fd >= 0)
+		posix_spawn_file_actions_adddup2(&fa, pp_stderr_fd, STDERR_FILENO);
+	else
+		posix_spawn_file_actions_addopen(
+		    &fa, STDERR_FILENO, "/dev/null", O_WRONLY | O_TRUNC, 0644);
 
 	char **env = build_clean_environ();
 	pid_t pid;
 	int err = posix_spawnp(&pid, argv[0], &fa, NULL, argv, env);
 	posix_spawn_file_actions_destroy(&fa);
+	if (pp_stderr_fd >= 0) close(pp_stderr_fd);
 	close(pipefd[1]);
 
 	if (err) {
@@ -4070,7 +4119,8 @@ static char *preprocess_with_cc(const char *input_file) {
 	}
 
 	ssize_t n;
-	while ((n = read(pipefd[0], buf + len, cap - len - 1)) > 0) {
+	while ((n = read(pipefd[0], buf + len, cap - len - 1)) > 0 || (n == -1 && errno == EINTR)) {
+		if (n == -1) continue;
 		len += (size_t)n;
 		if (len + 1 >= cap) {
 			cap *= 2;
@@ -4242,6 +4292,159 @@ static Token *find_bare_orelse(Token *tok) {
 	return NULL;
 }
 
+// ── Pre-scan: strict file-scope declaration registration ──
+//
+// Walk the entire token stream at file scope (brace depth 0) before
+// transpilation begins.  Register every typedef name, enum constant,
+// and struct/union/enum tag so that the symbol table is fully populated
+// before any expression context needs to resolve
+//
+// We deliberately ignore function bodies (skip matched '{' … '}' at depth > 0)
+// because inner-scope typedefs are registered during transpilation by
+// parse_typedef_declaration, which tracks scope depth correctly.
+
+static void prescan_file_scope_declarations(Token *tok) {
+	bool at_stmt_start = true;
+	int brace_depth = 0;
+
+	while (tok && tok->kind != TK_EOF) {
+		// Track brace depth — only process depth 0 (file scope)
+		if (match_ch(tok, '{')) {
+			brace_depth++;
+			// At depth 1 (struct/union/enum body at file scope), we continue
+			// scanning to register enum constants.
+			if (brace_depth == 1) {
+				at_stmt_start = true;
+				tok = tok_next(tok);
+				continue;
+			}
+			// Skip function bodies and deeper nested scopes entirely
+			if (tok_match(tok)) {
+				tok = tok_next(tok_match(tok));
+				brace_depth--;
+			} else {
+				tok = tok_next(tok);
+			}
+			at_stmt_start = true;
+			continue;
+		}
+		if (match_ch(tok, '}')) {
+			brace_depth--;
+			if (brace_depth < 0) brace_depth = 0;
+			at_stmt_start = true;
+			tok = tok_next(tok);
+			continue;
+		}
+
+		// Only care about file scope (brace_depth 0) and
+		// depth 1 for struct/union/enum body contents (enum constants).
+		if (brace_depth > 1) {
+			if (tok->flags & TF_OPEN && tok_match(tok))
+				tok = tok_next(tok_match(tok));
+			else
+				tok = tok_next(tok);
+			continue;
+		}
+
+		// Inside struct/union/enum body (depth 1): register enum constants
+		if (brace_depth == 1) {
+			if (is_enum_kw(tok)) {
+				Token *brace = find_struct_body_brace(tok);
+				if (brace) {
+					parse_enum_constants(brace, 0);
+					tok = tok_next(tok_match(brace));
+					continue;
+				}
+			}
+			if (tok->flags & TF_OPEN && tok_match(tok))
+				tok = tok_next(tok_match(tok));
+			else
+				tok = tok_next(tok);
+			continue;
+		}
+
+		// File scope (depth 0): statement-start dispatch
+		if (match_ch(tok, ';')) {
+			at_stmt_start = true;
+			tok = tok_next(tok);
+			continue;
+		}
+		if (tok->kind == TK_PREP_DIR) {
+			at_stmt_start = true;
+			tok = tok_next(tok);
+			continue;
+		}
+
+		if (!at_stmt_start) {
+			tok = tok_next(tok);
+			continue;
+		}
+
+		// Skip noise (attributes, C23 [[...]], pragmas)
+		Token *clean = skip_noise(tok);
+		if (clean != tok) { tok = clean; continue; }
+
+		// Skip storage/inline/noreturn specifiers before type
+		if ((tok->tag & (TT_STORAGE | TT_INLINE)) || equal(tok, "_Noreturn") || equal(tok, "noreturn") ||
+		    equal(tok, "__extension__")) {
+			tok = tok_next(tok);
+			continue;
+		}
+
+		// Skip 'raw' keyword (Prism extension)
+		if ((tok->flags & TF_RAW) && !is_known_typedef(tok)) {
+			tok = tok_next(tok);
+			continue;
+		}
+
+		// == typedef declaration ==
+		if (tok->tag & TT_TYPEDEF) {
+			parse_typedef_declaration(tok, 0);
+			while (tok && tok->kind != TK_EOF && !match_ch(tok, ';')) {
+				if (tok->flags & TF_OPEN && tok_match(tok))
+					tok = tok_next(tok_match(tok));
+				else
+					tok = tok_next(tok);
+			}
+			if (tok && match_ch(tok, ';')) tok = tok_next(tok);
+			at_stmt_start = true;
+			continue;
+		}
+
+		// == struct/union/enum with body ==
+		if (tok->tag & TT_SUE) {
+			bool is_enum = is_enum_kw(tok);
+			Token *brace = find_struct_body_brace(tok);
+			if (brace) {
+				if (is_enum)
+					parse_enum_constants(brace, 0);
+				tok = tok_next(tok);
+				at_stmt_start = false;
+				continue;
+			}
+			tok = tok_next(tok);
+			at_stmt_start = false;
+			continue;
+		}
+
+		// == _Static_assert — skip to semicolon ==
+		if (equal(tok, "_Static_assert") || equal(tok, "static_assert")) {
+			while (tok && tok->kind != TK_EOF && !match_ch(tok, ';')) {
+				if (tok->flags & TF_OPEN && tok_match(tok))
+					tok = tok_next(tok_match(tok));
+				else
+					tok = tok_next(tok);
+			}
+			if (tok && match_ch(tok, ';')) tok = tok_next(tok);
+			at_stmt_start = true;
+			continue;
+		}
+
+		at_stmt_start = false;
+		tok = tok_next(tok);
+	}
+}
+
 // Core transpile: emit transformed tokens to an already-opened FILE*
 static int transpile_tokens(Token *tok, FILE *fp) {
 	out_init(fp);
@@ -4254,6 +4457,11 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 	reset_transpiler_state();
 	typedef_table_reset();
 	system_includes_reset();
+
+	// Pre-scan: register all file-scope typedefs, enum constants, and
+	// struct/union/enum tags before transpilation begins.  This replaces
+	// the old suffix/prefix heuristic with deterministic symbol resolution.
+	prescan_file_scope_declarations(tok);
 
 	if (!FEAT(F_FLATTEN)) {
 		collect_system_includes();
@@ -5573,6 +5781,7 @@ static void cleanup_temp_range(char **temps, int count) {
 		free(temps[i]);
 	}
 	free(temps);
+	signal_temps_clear();
 }
 
 static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count,
@@ -5611,6 +5820,7 @@ static const char *resolve_install_compiler(const Cli *cli) {
 static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 	char **temps = calloc(cli->source_count, sizeof(char *));
 	if (!temps) die("Out of memory");
+	signal_temps_clear();
 
 	for (int i = 0; i < cli->source_count; i++) {
 		if (use_lib_api) {
@@ -5618,7 +5828,7 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 			if (!temps[i]) die("Out of memory");
 			if (make_temp_file(temps[i], PATH_MAX, NULL, 0, cli->sources[i]) < 0)
 				die("Failed to create temp file");
-
+			signal_temps_register(temps[i]);
 			PrismResult result = prism_transpile_file(cli->sources[i], cli->features);
 			if (result.status != PRISM_OK) {
 				fprintf(stderr, "%s:%d:%d: error: %s\n", cli->sources[i],
@@ -5638,6 +5848,7 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 			if (!temps[i]) die("Out of memory");
 			if (make_temp_file(temps[i], 512, NULL, 0, cli->sources[i]) < 0)
 				die("Failed to create temp file");
+			signal_temps_register(temps[i]);
 			if (cli->verbose)
 				fprintf(stderr, "[prism] Transpiling %s -> %s\n", cli->sources[i], temps[i]);
 			if (!transpile((char *)cli->sources[i], temps[i])) {
@@ -5754,6 +5965,9 @@ static int compile_sources(Cli *cli) {
 static void signal_cleanup_handler(int sig) {
 	if (signal_temp_load() && signal_temp_path[0])
 		unlink(signal_temp_path);
+	int n = signal_temps_load();
+	for (int i = 0; i < n; i++)
+		unlink(signal_temps[i]);
 	signal(sig, SIG_DFL);
 	raise(sig);
 }

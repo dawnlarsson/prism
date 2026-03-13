@@ -1908,6 +1908,45 @@ static void test_func_returned_vla_sizeof(void) {
 	free(path);
 }
 
+static void test_vla_typedef_struct_tag_memset(void) {
+	/* BUG: struct S { vlax buf; }; struct S s; emitted = {0} instead of memset
+	 * because struct_body_contains_vla only scanned inline bodies.
+	 * When struct S is referenced by tag without a body, the VLA info was lost. */
+
+	/* Separate definition and variable declaration */
+	const char *code1 =
+	    "void f(int n) {\n"
+	    "    typedef int vlax[n];\n"
+	    "    struct S { vlax buf; };\n"
+	    "    struct S s;\n"
+	    "}\n";
+	PrismResult r1 = prism_transpile_source(code1, "vla_td_struct.c", prism_defaults());
+	CHECK(r1.status == PRISM_OK && r1.output,
+	      "vla-typedef-struct-tag: transpiles OK");
+	if (r1.output) {
+		CHECK(strstr(r1.output, "memset"),
+		      "vla-typedef-struct-tag: separate decl uses memset");
+		CHECK(!strstr(r1.output, "struct S s = {0}"),
+		      "vla-typedef-struct-tag: no = {0} for VLA struct");
+	}
+	prism_free(&r1);
+
+	/* Inline definition (should still work too) */
+	const char *code2 =
+	    "void g(int n) {\n"
+	    "    typedef int vlax[n];\n"
+	    "    struct S { vlax buf; } s;\n"
+	    "}\n";
+	PrismResult r2 = prism_transpile_source(code2, "vla_td_inline.c", prism_defaults());
+	CHECK(r2.status == PRISM_OK && r2.output,
+	      "vla-typedef-struct-inline: transpiles OK");
+	if (r2.output) {
+		CHECK(strstr(r2.output, "memset"),
+		      "vla-typedef-struct-inline: inline decl uses memset");
+	}
+	prism_free(&r2);
+}
+
 static void test_c23_if_initializer_zeroinit_dropped(void) {
 	/* FIX: Prism now treats if/switch opening parens like for() parens
 	 * so that C23 initializer declarations get proper zero-initialization.
@@ -2042,4 +2081,5 @@ void run_zeroinit_tests(void) {
 	test_paren_pointer_vla_masking();
 	test_func_returned_vla_sizeof();
 	test_c23_if_initializer_zeroinit_dropped();
+	test_vla_typedef_struct_tag_memset();
 }
