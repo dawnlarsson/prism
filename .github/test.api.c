@@ -4482,6 +4482,171 @@ static void test_orelse_bracket_leak_in_return_defer(void) {
 	prism_free(&r);
 }
 
+// Bug: When the user passes -x objective-c, compile_sources constructs:
+//   cc -x c - -x none -x objective-c ...
+// The user's -x flag ends up AFTER stdin (-), so it has no effect.
+// The pipe language must use the user's -x value, not hardcoded "c".
+static void test_cli_x_lang_pipe_ordering(void) {
+	printf("\n--- CLI -x language pipe ordering ---\n");
+
+	char tmpdir[] = "/tmp/prism_xlang_XXXXXX";
+	char *dir = mkdtemp(tmpdir);
+	CHECK(dir != NULL, "x lang: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], src_path[PATH_MAX], stderr_path[PATH_MAX];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	snprintf(src_path, sizeof(src_path), "%s/input.c", dir);
+	snprintf(stderr_path, sizeof(stderr_path), "%s/stderr.txt", dir);
+
+	FILE *f = fopen(src_path, "w");
+	CHECK(f != NULL, "x lang: create source file");
+	if (!f) { rmdir(dir); return; }
+	fputs("int main(void){return 0;}\n", f);
+	fclose(f);
+
+	if (!build_test_prism_binary(prism_bin, "x lang: build prism binary")) {
+		unlink(src_path); rmdir(dir); return;
+	}
+
+	// Run with --prism-verbose -x objective-c and capture stderr
+	{
+		char *argv[] = {prism_bin, "--prism-verbose", "-x", "objective-c",
+				"-fsyntax-only", src_path, NULL};
+		run_exec_argv_capture(argv, NULL, stderr_path);
+
+		FILE *ef = fopen(stderr_path, "r");
+		char buf[4096] = {0};
+		if (ef) { fread(buf, 1, sizeof(buf) - 1, ef); fclose(ef); }
+
+		// The verbose output must show "-x objective-c -" (user's language before stdin),
+		// NOT "-x c - ... -x objective-c" (user's language after stdin, useless).
+		bool has_correct_order = strstr(buf, "-x objective-c -") != NULL;
+		bool has_wrong_order = strstr(buf, "-x c -") != NULL;
+		CHECK(has_correct_order, "x lang: pipe uses user's -x language");
+		CHECK(!has_wrong_order, "x lang: pipe does NOT use hardcoded -x c");
+		unlink(stderr_path);
+	}
+
+	unlink(src_path);
+	unlink(prism_bin);
+	rmdir(dir);
+}
+
+// Bug: collect_system_includes uses pointer comparison (==) instead of strcmp
+// for deduplication. Since intern_filename allocates fresh copies, the same
+// header path gets different pointers and is emitted multiple times.
+static void test_noflat_include_dedup(void) {
+	printf("\n--- Non-flatten #include deduplication ---\n");
+
+	const char *code =
+		"#include <stdio.h>\n"
+		"#include <stdlib.h>\n"
+		"int main(void) { return 0; }\n";
+
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "dedup: create temp file");
+	if (!path) return;
+
+	PrismFeatures features = prism_defaults();
+	features.flatten_headers = false;
+	PrismResult result = prism_transpile_file(path, features);
+	CHECK_EQ(result.status, PRISM_OK, "dedup: transpile OK");
+
+	if (result.output) {
+		// Count unique and total #include lines
+		int total_includes = 0;
+		int dup_includes = 0;
+
+		// Collect all #include paths
+		const char *p = result.output;
+		const char *include_paths[4096];
+		int include_count = 0;
+
+		while ((p = strstr(p, "#include \"")) != NULL) {
+			p += 10; // skip #include "
+			const char *end = strchr(p, '"');
+			if (!end) break;
+			int len = (int)(end - p);
+			total_includes++;
+
+			// Check for duplicate
+			bool is_dup = false;
+			for (int i = 0; i < include_count; i++) {
+				const char *prev = include_paths[i];
+				const char *prev_end = strchr(prev, '"');
+				if (prev_end && (prev_end - prev) == len && !memcmp(prev, p, (size_t)len)) {
+					is_dup = true;
+					dup_includes++;
+					break;
+				}
+			}
+			if (!is_dup && include_count < 4096) {
+				include_paths[include_count++] = p;
+			}
+			p = end + 1;
+		}
+
+		CHECK(dup_includes == 0,
+		      "dedup: no duplicate #include directives in non-flatten output");
+		if (dup_includes > 0) {
+			printf("  (total=%d unique=%d duplicates=%d)\n",
+			       total_includes, include_count, dup_includes);
+		}
+	}
+
+	prism_free(&result);
+	unlink(path);
+	free(path);
+}
+
+// Bug: cc_is_clang fails to detect clang when the compiler command is "cc" or
+// "gcc" on non-Apple platforms (or /usr/bin/gcc on Apple which IS clang).
+// This causes -fpreprocessed to be incorrectly passed to clang, which doesn't
+// support it, failing with: "cc: error: unknown argument '-fpreprocessed'"
+static void test_fpreprocessed_not_passed_to_clang(void) {
+	printf("\n--- -fpreprocessed not passed to clang ---\n");
+
+	char tmpdir[] = "/tmp/prism_fpp_XXXXXX";
+	char *dir = mkdtemp(tmpdir);
+	CHECK(dir != NULL, "fpreprocessed: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], src_path[PATH_MAX], stderr_path[PATH_MAX];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	snprintf(src_path, sizeof(src_path), "%s/input.c", dir);
+	snprintf(stderr_path, sizeof(stderr_path), "%s/stderr.txt", dir);
+
+	FILE *f = fopen(src_path, "w");
+	CHECK(f != NULL, "fpreprocessed: create source file");
+	if (!f) { rmdir(dir); return; }
+	fputs("int main(void){return 0;}\n", f);
+	fclose(f);
+
+	if (!build_test_prism_binary(prism_bin, "fpreprocessed: build prism binary")) {
+		unlink(src_path); rmdir(dir); return;
+	}
+
+	// /usr/bin/gcc on macOS is actually clang — it must not get -fpreprocessed
+	if (compiler_available("/usr/bin/gcc")) {
+		char *argv[] = {prism_bin, "--prism-verbose", "--prism-cc=/usr/bin/gcc",
+				"-c", "-o", "/dev/null", src_path, NULL};
+		run_exec_argv_capture(argv, NULL, stderr_path);
+
+		FILE *ef = fopen(stderr_path, "r");
+		char buf[4096] = {0};
+		if (ef) { fread(buf, 1, sizeof(buf) - 1, ef); fclose(ef); }
+
+		CHECK(strstr(buf, "-fpreprocessed") == NULL,
+		      "fpreprocessed: not passed when compiler is clang disguised as gcc");
+		unlink(stderr_path);
+	}
+
+	unlink(src_path);
+	unlink(prism_bin);
+	rmdir(dir);
+}
+
 void run_api_tests(void) {
 test_typeof_orelse_leak();
 	printf("\n=== API TESTS ===\n");
@@ -4581,7 +4746,11 @@ test_typeof_orelse_leak();
 	test_install_temp_predictable_symlink_hijack();
 	test_pp_stderr_toctou_fd_not_closed();
 	test_preprocess_read_eintr_resilience();
+	test_cli_x_lang_pipe_ordering();
+	test_fpreprocessed_not_passed_to_clang();
 #endif
+
+	test_noflat_include_dedup();
 
 	test_cc_split_quoting_bypass();
 	test_orelse_bracket_leak_in_return_defer();

@@ -531,7 +531,7 @@ static void collect_system_includes(void) {
 		if (!is_reincludable_header(f->name)) {
 			bool found = false;
 			for (int j = 0; j < ctx->system_include_count; j++) {
-				if (system_include_list[j] == f->name) { found = true; break; }
+				if (strcmp(system_include_list[j], f->name) == 0) { found = true; break; }
 			}
 			if (found) continue;
 		}
@@ -5604,6 +5604,9 @@ static const char *get_real_cc(const char *cc) {
 }
 
 // Check if the system compiler is clang
+#ifndef _WIN32
+static int capture_first_line(char **argv, char *buf, size_t bufsize);
+#endif
 static bool cc_is_clang(const char *cc) {
 #ifdef __APPLE__
 	if (!cc || !*cc || strcmp(cc, "cc") == 0 || strcmp(cc, "gcc") == 0) return true;
@@ -5611,7 +5614,19 @@ static bool cc_is_clang(const char *cc) {
 	if (!cc || !*cc) return false;
 	const char *exe = cc_executable(cc);
 	const char *base = path_basename(exe);
-	return strncmp(base, "clang", 5) == 0;
+	if (strncmp(base, "clang", 5) == 0) return true;
+#ifndef _WIN32
+	// Probe: on many systems (Termux, FreeBSD, some Linux distros),
+	// "cc" or "gcc" is actually clang behind a symlink.
+	char ver[256];
+	char *argv[] = {(char *)exe, "--version", NULL};
+	if (capture_first_line(argv, ver, sizeof(ver)) == 0) {
+		// clang --version outputs "... clang ..." on the first line
+		for (char *p = ver; *p; p++) *p = (char)tolower((unsigned char)*p);
+		if (strstr(ver, "clang")) return true;
+	}
+#endif
+	return false;
 }
 
 #ifndef _WIN32
@@ -5907,19 +5922,34 @@ static int compile_sources(Cli *cli) {
 	use_linemarkers = FEAT(F_FLATTEN) && !clang && !msvc;
 
 	if (cli->source_count == 1 && !msvc) {
+		// Extract user-specified -x <lang> from cc_args (if any) for the pipe language.
+		// Without this, -x objective-c ends up after stdin and has no effect.
+		const char *pipe_lang = "c";
+		int x_flag_idx = -1;
+		for (int i = 0; i < cli->cc_arg_count - 1; i++) {
+			if (strcmp(cli->cc_args[i], "-x") == 0) {
+				pipe_lang = cli->cc_args[i + 1];
+				x_flag_idx = i;
+				break;
+			}
+		}
+
 		const char **args = alloc_argv(cli->cc_arg_count + cc_extra + 20);
 		int argc = 0;
 		char *cc_dup = NULL;
 		cc_split_into_argv(args, &argc, compiler, &cc_dup);
 		args[argc++] = "-x";
-		args[argc++] = "c";
+		args[argc++] = pipe_lang;
 		if (FEAT(F_FLATTEN) && !clang) args[argc++] = "-fpreprocessed";
 		args[argc++] = "-";
 		if (cli->cc_arg_count > 0) {
 			args[argc++] = "-x";
 			args[argc++] = "none";
 		}
-		for (int i = 0; i < cli->cc_arg_count; i++) args[argc++] = cli->cc_args[i];
+		for (int i = 0; i < cli->cc_arg_count; i++) {
+			if (i == x_flag_idx) { i++; continue; } // skip extracted -x <lang>
+			args[argc++] = cli->cc_args[i];
+		}
 		add_warn_suppress(args, &argc, clang, false);
 		argv_add_output(args, &argc, cli_output_path(cli, temp_exe, false), false, cli->compile_only);
 		args[argc] = NULL;
