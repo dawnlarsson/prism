@@ -1467,8 +1467,8 @@ static void check_transpiled_output_compiles_and_runs(const char *output,
 	CHECK(src_path != NULL, "defer compile helper: create temp source");
 	if (!src_path) return;
 
-	char bin_template[] = "/tmp/prism_defer_exec_XXXXXX";
-	int bin_fd = mkstemp(bin_template);
+	char bin_template[PATH_MAX];
+	int bin_fd = test_mkstemp(bin_template, "prism_defer_exec_");
 	CHECK(bin_fd >= 0, "defer compile helper: reserve temp binary path");
 	if (bin_fd < 0) {
 		unlink(src_path);

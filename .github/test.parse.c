@@ -6341,8 +6341,8 @@ static void test_bug_r1_readonly_dir(void) {
 		printf("  [SKIP] bug_r1: read-only dir test (running as root)\n");
 		return;
 	}
-	char dir_template[] = "/tmp/prism_readonly_dir_XXXXXX";
-	char *dir = mkdtemp(dir_template);
+	char dir_template[PATH_MAX];
+	char *dir = test_mkdtemp(dir_template, "prism_readonly_dir_");
 	CHECK(dir != NULL, "bug_r1: create read-only temp dir");
 	if (!dir) return;
 

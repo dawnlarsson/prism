@@ -594,8 +594,8 @@ static void test_cli_large_passthrough_argv(void) {
 	total++;
 	printf("[PASS] cli large argv regression skipped on Windows\n");
 #else
-	char tmpdir[] = "/tmp/prism_cli_argv_XXXXXX";
-	char *dir = mkdtemp(tmpdir);
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_cli_argv_");
 	CHECK(dir != NULL, "create temp dir for cli argv regression");
 	if (!dir) return;
 
@@ -665,8 +665,8 @@ static void test_cli_missing_input_file(void) {
 	total++;
 	printf("[PASS] cli missing input skipped on Windows\n");
 #else
-	char tmpdir[] = "/tmp/prism_cli_missing_XXXXXX";
-	char *dir = mkdtemp(tmpdir);
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_cli_missing_");
 	char prism_bin[PATH_MAX];
 	char output_bin[PATH_MAX];
 	char *argv[] = {prism_bin, "-o", output_bin, "/definitely/missing/prism_input.c", NULL};
@@ -697,8 +697,8 @@ static void test_cli_unknown_flag_fails_cleanly(void) {
 	total++;
 	printf("[PASS] cli unknown flag skipped on Windows\n");
 #else
-	char tmpdir[] = "/tmp/prism_cli_flag_XXXXXX";
-	char *dir = mkdtemp(tmpdir);
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_cli_flag_");
 	char prism_bin[PATH_MAX];
 	char *argv[] = {prism_bin, "--definitely-unknown", NULL};
 	int status = -1;
@@ -725,8 +725,8 @@ static void test_cli_paths_with_spaces(void) {
 	total++;
 	printf("[PASS] cli paths with spaces skipped on Windows\n");
 #else
-	char tmpdir[] = "/tmp/prism_cli_spaces_XXXXXX";
-	char *dir = mkdtemp(tmpdir);
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_cli_spaces_");
 	char prism_bin[PATH_MAX];
 	char src_path[PATH_MAX];
 	char out_path[PATH_MAX];
@@ -768,8 +768,8 @@ static void test_cli_no_zeroinit_suppresses_bypass_warning(void) {
 	total++;
 	printf("[PASS] cli no-zeroinit warning regression skipped on Windows\n");
 #else
-	char tmpdir[] = "/tmp/prism_cli_warn_XXXXXX";
-	char *dir = mkdtemp(tmpdir);
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_cli_warn_");
 	char prism_bin[PATH_MAX];
 	char src_path[PATH_MAX];
 	char obj_path[PATH_MAX];
@@ -901,8 +901,8 @@ static void test_preprocess_spawn_failure_cleans_stderr_temp(void) {
 	total++;
 	printf("[PASS] preprocess spawn cleanup skipped on Windows\n");
 #else
-	char tmpdir[] = "/tmp/prism_pp_cleanup_XXXXXX";
-	char *dir = mkdtemp(tmpdir);
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_pp_cleanup_");
 	CHECK(dir != NULL, "create temp dir for preprocess cleanup regression");
 	if (!dir) return;
 
@@ -3182,8 +3182,8 @@ static long file_size(const char *path) {
 static void test_cli_dep_flags_routing(void) {
 	printf("\n--- CLI Dependency Flag Routing ---\n");
 
-	char tmpdir[] = "/tmp/prism_depflag_XXXXXX";
-	char *dir = mkdtemp(tmpdir);
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_depflag_");
 	CHECK(dir != NULL, "dep flags: create temp dir");
 	if (!dir) return;
 
@@ -3269,8 +3269,8 @@ static void test_cli_dep_flags_routing(void) {
 static void test_cli_dep_flags_passthrough(void) {
 	printf("\n--- CLI Dependency Flags Passthrough (.S) ---\n");
 
-	char tmpdir[] = "/tmp/prism_deppt_XXXXXX";
-	char *dir = mkdtemp(tmpdir);
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_deppt_");
 	CHECK(dir != NULL, "dep passthrough: create temp dir");
 	if (!dir) return;
 
@@ -3328,8 +3328,8 @@ static void test_version_shows_backend_cc(void) {
 	// CC info, the kernel cannot identify the assembler and fails with
 	// "unknown assembler invoked".
 
-	char tmpdir[] = "/tmp/prism_ver_XXXXXX";
-	char *dir = mkdtemp(tmpdir);
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_ver_");
 	CHECK(dir != NULL, "version cc: create temp dir");
 	if (!dir) return;
 
@@ -3395,8 +3395,8 @@ static void test_cli_split_D_flag_not_source(void) {
 	// Bug: the kernel passes -D KBUILD_MODFILE="arch/.../vgettimeofday.c"
 	// and prism mistakenly tried to transpile the value as a .c file.
 
-	char tmpdir[] = "/tmp/prism_splitD_XXXXXX";
-	char *dir = mkdtemp(tmpdir);
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_splitD_");
 	CHECK(dir != NULL, "split -D: create temp dir");
 	if (!dir) return;
 
@@ -4489,8 +4489,8 @@ static void test_orelse_bracket_leak_in_return_defer(void) {
 static void test_cli_x_lang_pipe_ordering(void) {
 	printf("\n--- CLI -x language pipe ordering ---\n");
 
-	char tmpdir[] = "/tmp/prism_xlang_XXXXXX";
-	char *dir = mkdtemp(tmpdir);
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_xlang_");
 	CHECK(dir != NULL, "x lang: create temp dir");
 	if (!dir) return;
 
@@ -4519,9 +4519,11 @@ static void test_cli_x_lang_pipe_ordering(void) {
 		char buf[4096] = {0};
 		if (ef) { fread(buf, 1, sizeof(buf) - 1, ef); fclose(ef); }
 
-		// The verbose output must show "-x objective-c -" (user's language before stdin),
+		// The verbose output must show "-x objective-c" before stdin (-),
 		// NOT "-x c - ... -x objective-c" (user's language after stdin, useless).
-		bool has_correct_order = strstr(buf, "-x objective-c -") != NULL;
+		// On non-clang compilers, -fpreprocessed may appear between the language and stdin.
+		bool has_correct_order = strstr(buf, "-x objective-c -") != NULL ||
+		                         strstr(buf, "-x objective-c -fpreprocessed -") != NULL;
 		bool has_wrong_order = strstr(buf, "-x c -") != NULL;
 		CHECK(has_correct_order, "x lang: pipe uses user's -x language");
 		CHECK(!has_wrong_order, "x lang: pipe does NOT use hardcoded -x c");
@@ -4607,8 +4609,8 @@ static void test_noflat_include_dedup(void) {
 static void test_fpreprocessed_not_passed_to_clang(void) {
 	printf("\n--- -fpreprocessed not passed to clang ---\n");
 
-	char tmpdir[] = "/tmp/prism_fpp_XXXXXX";
-	char *dir = mkdtemp(tmpdir);
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_fpp_");
 	CHECK(dir != NULL, "fpreprocessed: create temp dir");
 	if (!dir) return;
 
@@ -4627,8 +4629,20 @@ static void test_fpreprocessed_not_passed_to_clang(void) {
 		unlink(src_path); rmdir(dir); return;
 	}
 
-	// /usr/bin/gcc on macOS is actually clang — it must not get -fpreprocessed
+	// /usr/bin/gcc on macOS is actually clang — it must not get -fpreprocessed.
+	// On Linux, /usr/bin/gcc may be real gcc — probe first.
 	if (compiler_available("/usr/bin/gcc")) {
+		char ver_path[PATH_MAX];
+		snprintf(ver_path, sizeof(ver_path), "%s/gcc_ver.txt", dir);
+		char *ver_argv[] = {"/usr/bin/gcc", "--version", NULL};
+		run_exec_argv_capture(ver_argv, ver_path, NULL);
+		FILE *vf = fopen(ver_path, "r");
+		char verbuf[512] = {0};
+		if (vf) { fread(verbuf, 1, sizeof(verbuf) - 1, vf); fclose(vf); }
+		unlink(ver_path);
+		for (char *p = verbuf; *p; p++) *p = (char)tolower((unsigned char)*p);
+		bool gcc_is_clang = strstr(verbuf, "clang") != NULL;
+
 		char *argv[] = {prism_bin, "--prism-verbose", "--prism-cc=/usr/bin/gcc",
 				"-c", "-o", "/dev/null", src_path, NULL};
 		run_exec_argv_capture(argv, NULL, stderr_path);
@@ -4637,8 +4651,13 @@ static void test_fpreprocessed_not_passed_to_clang(void) {
 		char buf[4096] = {0};
 		if (ef) { fread(buf, 1, sizeof(buf) - 1, ef); fclose(ef); }
 
-		CHECK(strstr(buf, "-fpreprocessed") == NULL,
-		      "fpreprocessed: not passed when compiler is clang disguised as gcc");
+		if (gcc_is_clang) {
+			CHECK(strstr(buf, "-fpreprocessed") == NULL,
+			      "fpreprocessed: not passed when compiler is clang disguised as gcc");
+		} else {
+			CHECK(strstr(buf, "-fpreprocessed") != NULL,
+			      "fpreprocessed: correctly passed when compiler is real gcc");
+		}
 		unlink(stderr_path);
 	}
 

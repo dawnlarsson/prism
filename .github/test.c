@@ -68,9 +68,18 @@ static void log_append(const char *s) {
 		}                                                                                            \
 	} while (0)
 
+static const char *test_tmp_dir(void) {
+	static char buf[PATH_MAX];
+	const char *t = getenv("TMPDIR");
+	if (!t || !*t) t = "/tmp";
+	size_t len = strlen(t);
+	snprintf(buf, sizeof(buf), "%s%s", t, (t[len - 1] == '/') ? "" : "/");
+	return buf;
+}
+
 static char *create_temp_file(const char *content) {
-	char *path = malloc(64);
-	snprintf(path, 64, "/tmp/prism_test_XXXXXX.c");
+	char *path = malloc(PATH_MAX);
+	snprintf(path, PATH_MAX, "%sprism_test_XXXXXX.c", test_tmp_dir());
 	int fd = mkstemps(path, 2);
 	if (fd < 0) {
 		free(path);
@@ -79,6 +88,19 @@ static char *create_temp_file(const char *content) {
 	write(fd, content, strlen(content));
 	close(fd);
 	return path;
+}
+
+// mkdtemp helper that respects $TMPDIR. Writes into caller's buffer.
+// Usage: char tmpdir[PATH_MAX]; test_mkdtemp(tmpdir, "prism_foo_");
+static char *test_mkdtemp(char *buf, const char *prefix) {
+	snprintf(buf, PATH_MAX, "%s%sXXXXXX", test_tmp_dir(), prefix);
+	return mkdtemp(buf);
+}
+
+// mkstemp helper that respects $TMPDIR. Writes into caller's buffer.
+static int test_mkstemp(char *buf, const char *prefix) {
+	snprintf(buf, PATH_MAX, "%s%sXXXXXX", test_tmp_dir(), prefix);
+	return mkstemp(buf);
 }
 
 static long get_memory_usage_kb(void) {

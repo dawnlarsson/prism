@@ -5347,6 +5347,12 @@ static void cli_free(Cli *cli) {
 
 // Transpile and pipe output directly to the compiler (no temp files)
 static int transpile_and_compile(char *input_file, char **compile_argv, bool verbose) {
+	if (verbose) {
+		fprintf(stderr, "[prism] ");
+		for (int i = 0; compile_argv[i]; i++) fprintf(stderr, "%s ", compile_argv[i]);
+		fprintf(stderr, "\n");
+	}
+
 	char *pp_buf = preprocess_with_cc(input_file);
 	if (!pp_buf) {
 		fprintf(stderr, "Preprocessing failed for: %s\n", input_file);
@@ -5365,12 +5371,6 @@ static int transpile_and_compile(char *input_file, char **compile_argv, bool ver
 		perror("pipe");
 		tokenizer_teardown(false);
 		return -1;
-	}
-
-	if (verbose) {
-		fprintf(stderr, "[prism] ");
-		for (int i = 0; compile_argv[i]; i++) fprintf(stderr, "%s ", compile_argv[i]);
-		fprintf(stderr, "\n");
 	}
 
 	posix_spawn_file_actions_t fa;
@@ -5439,7 +5439,18 @@ static bool get_self_exe_path(char *buf, size_t bufsize) {
 	return false;
 }
 
-static const char *get_install_path(void) { return INSTALL_PATH; }
+static const char *get_install_path(void) {
+#ifndef _WIN32
+	// Termux: $PREFIX/bin is the user-writable bin directory
+	const char *prefix = getenv("PREFIX");
+	if (prefix && *prefix) {
+		static char buf[PATH_MAX];
+		snprintf(buf, sizeof(buf), "%s/bin/prism", prefix);
+		return buf;
+	}
+#endif
+	return INSTALL_PATH;
+}
 
 static bool ensure_install_dir(const char *p) {
 	char dir[PATH_MAX];
@@ -5548,9 +5559,19 @@ use_sudo:;
 			run_command((char **)argv_chmod);
 		} else {
 			const char *escalate = NULL;
-			if (access("/usr/bin/sudo", X_OK) == 0 || access("/bin/sudo", X_OK) == 0)
+			const char *prefix = getenv("PREFIX");
+			char sudo_path[PATH_MAX], doas_path[PATH_MAX];
+			if (prefix && *prefix) {
+				snprintf(sudo_path, sizeof(sudo_path), "%s/bin/sudo", prefix);
+				snprintf(doas_path, sizeof(doas_path), "%s/bin/doas", prefix);
+			} else {
+				sudo_path[0] = doas_path[0] = '\0';
+			}
+			if (access("/usr/bin/sudo", X_OK) == 0 || access("/bin/sudo", X_OK) == 0 ||
+			    (sudo_path[0] && access(sudo_path, X_OK) == 0))
 				escalate = "sudo";
-			else if (access("/usr/bin/doas", X_OK) == 0 || access("/bin/doas", X_OK) == 0)
+			else if (access("/usr/bin/doas", X_OK) == 0 || access("/bin/doas", X_OK) == 0 ||
+				 (doas_path[0] && access(doas_path, X_OK) == 0))
 				escalate = "doas";
 
 			if (!escalate) {
