@@ -252,6 +252,8 @@ static volatile sig_atomic_t signal_temps_count = 0;
 #define signal_temp_load()     __atomic_load_n(&signal_temp_registered, __ATOMIC_ACQUIRE)
 #define signal_temps_store(val) __atomic_store_n(&signal_temps_count, (val), __ATOMIC_RELEASE)
 #define signal_temps_load()     __atomic_load_n(&signal_temps_count, __ATOMIC_ACQUIRE)
+#define cached_env_load()       __atomic_load_n(&cached_clean_env, __ATOMIC_ACQUIRE)
+#define cached_env_store(val)   __atomic_store_n(&cached_clean_env, (val), __ATOMIC_RELEASE)
 #endif
 
 static void signal_temps_register(const char *path) {
@@ -3790,7 +3792,7 @@ static Token *handle_close_brace(Token *tok) {
 
 // Build a copy of 'environ' with CC and PRISM_CC removed (cached, thread-safe)
 static char **build_clean_environ(void) {
-	char **env = __atomic_load_n(&cached_clean_env, __ATOMIC_ACQUIRE);
+	char **env = cached_env_load();
 	if (env) return env;
 	int n = 0;
 	for (char **e = environ; *e; e++) n++;
@@ -3802,7 +3804,7 @@ static char **build_clean_environ(void) {
 	}
 	env[j] = NULL;
 	// If another thread raced us, we leak a small allocation — acceptable.
-	__atomic_store_n(&cached_clean_env, env, __ATOMIC_RELEASE);
+	cached_env_store(env);
 	return env;
 }
 
