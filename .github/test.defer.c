@@ -2236,6 +2236,30 @@ void test_defer_shadow_in_for_init(void) {
 	    "shadows");
 }
 
+static void test_defer_fnptr_return_type_overwrite(void) {
+	/* BUG: capture_function_return_type is called on every type token at
+	   block_depth 0. For void (*signal_fn(int, void(*func)(int)))(int),
+	   the 'void' in the func parameter re-triggers capture and overwrites
+	   the correct return type with a broken one (no suffix). The defer
+	   return-value temp then gets the wrong type, producing invalid C. */
+	PrismResult r = prism_transpile_source(
+	    "void cleanup(void);\n"
+	    "void (*signal_fn(int sig, void (*func)(int)))(int) {\n"
+	    "    defer cleanup();\n"
+	    "    return func;\n"
+	    "}\n",
+	    "defer_fnptr_return_type.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "defer fnptr return type: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "typedef") != NULL,
+		      "defer fnptr return type: generates typedef for complex return");
+		CHECK(strstr(r.output, "_Prism_ret_t_") != NULL,
+		      "defer fnptr return type: uses named typedef");
+	}
+	prism_free(&r);
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -2381,4 +2405,5 @@ void run_defer_tests(void) {
 	test_defer_vfork_funcptr_bypass();
 	test_defer_vfork_reference_false_positive();
 #endif
+	test_defer_fnptr_return_type_overwrite();
 }

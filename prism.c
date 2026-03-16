@@ -3075,9 +3075,11 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 		// Add zero initializer if needed (for non-memset types)
 		if (!decl.has_init && !effective_vla && !is_raw && !needs_memset && !type->has_extern) {
-			// register + _Atomic aggregate: no safe zero-init path.
 			if (type->has_register && type->has_atomic && is_aggregate)
-				;
+				error_tok(decl.var_name,
+					  "'register _Atomic' aggregate cannot be safely "
+					  "zero-initialized; remove 'register' or use 'raw' "
+					  "to opt out of automatic initialization");
 			else if (is_aggregate || type->has_typeof)
 				OUT_LIT(" = {0}");
 			else
@@ -5508,7 +5510,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		track_generic_token(tok);
 
 		// Void function detection and return type capture at top level
-		if (ctx->block_depth == 0 &&
+		if (ctx->block_depth == 0 && !next_func_ret_captured && !next_func_returns_void &&
 		    (tag & (TT_TYPE | TT_QUALIFIER | TT_SKIP_DECL | TT_ATTR | TT_INLINE) ||
 		     (is_identifier_like(tok) && (is_void_typedef(tok) || is_known_typedef(tok))))) {
 			int ret = capture_function_return_type(tok);

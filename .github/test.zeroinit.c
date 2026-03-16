@@ -1468,24 +1468,15 @@ void test_typeof_register_vla_bug(void) {
 #ifndef _MSC_VER
 void test_atomic_register_struct_bug(void) {
 #if !defined(__TINYC__)
-	register _Atomic struct S_bug { int x, y; } s1;
-	(void)s1;
-
+	/* register + _Atomic aggregate must be rejected, not silently uninitialized */
 	PrismResult transpile_result = prism_transpile_source(
 	    "void f(void) {\n"
 	    "    register _Atomic struct S_bug { int x, y; } s1;\n"
 	    "    (void)s1;\n"
 	    "}\n",
 	    "register_atomic_struct.c", prism_defaults());
-	CHECK_EQ(transpile_result.status, PRISM_OK, "register _Atomic struct transpiles");
-	if (transpile_result.output) {
-		CHECK(strstr(transpile_result.output, "register _Atomic struct S_bug { int x, y; } s1;") != NULL,
-		      "register _Atomic struct: declaration preserved");
-		CHECK(strstr(transpile_result.output, "memset(&s1") == NULL,
-		      "register _Atomic struct: no illegal register memset");
-		CHECK(strstr(transpile_result.output, "s1 = {0}") == NULL,
-		      "register _Atomic struct: no bogus brace init emitted");
-	}
+	CHECK(transpile_result.status != PRISM_OK,
+	      "register _Atomic struct: must be rejected");
 	prism_free(&transpile_result);
 #endif
 }
@@ -2003,6 +1994,24 @@ static void test_c23_if_initializer_zeroinit_dropped(void) {
 	prism_free(&r3);
 }
 
+void test_register_atomic_aggregate_must_error(void) {
+#ifndef _MSC_VER
+	/* register + _Atomic aggregate cannot be safely zero-initialized:
+	   = {0} is illegal on _Atomic, memset is illegal on register.
+	   The transpiler must reject this with a hard error instead of
+	   silently leaving the variable uninitialized. */
+	PrismResult r = prism_transpile_source(
+	    "void f(void) {\n"
+	    "    register _Atomic struct { int a; } x;\n"
+	    "    (void)x;\n"
+	    "}\n",
+	    "register_atomic_aggregate_error.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "register _Atomic aggregate: must be rejected (not silently uninitialized)");
+	prism_free(&r);
+#endif
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -2104,4 +2113,5 @@ void run_zeroinit_tests(void) {
 	test_func_returned_vla_sizeof();
 	test_c23_if_initializer_zeroinit_dropped();
 	test_vla_typedef_struct_tag_memset();
+	test_register_atomic_aggregate_must_error();
 }
