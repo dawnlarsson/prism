@@ -5318,7 +5318,11 @@ static Cli cli_parse(int argc, char **argv) {
 		char *a = argv[i];
 
 		// -- Non-flag arguments --
+#ifdef _WIN32
 		if (a[0] != '-' && a[0] != '/') {
+#else
+		if (a[0] != '-' || !a[1]) {
+#endif
 			if (!strcmp(a, "run"))       { cli.mode = CLI_RUN; continue; }
 			if (!strcmp(a, "transpile")) { cli.mode = CLI_EMIT; continue; }
 			if (!strcmp(a, "install"))   { cli.mode = CLI_INSTALL; continue; }
@@ -5330,6 +5334,7 @@ static Cli cli_parse(int argc, char **argv) {
 			continue;
 		}
 
+#ifdef _WIN32
 		// -- MSVC-style flags (start with /) --
 		if (a[0] == '/') {
 			// /Fe:output or /Fe output — MSVC output name
@@ -5345,6 +5350,7 @@ static Cli cli_parse(int argc, char **argv) {
 			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
 			continue;
 		}
+#endif
 
 		// -- Output --
 		if (a[1] == 'o' && a[1]) {

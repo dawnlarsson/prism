@@ -195,9 +195,20 @@ jobs:
         with:
           platforms: arm64
 
+      - name: Query System Resources
+        id: resources
+        run: |
+          CPUS=$(nproc)
+          MEM=$(grep MemTotal /proc/meminfo | awk '{printf "%.0f", $2/1024}')
+          echo "cpus=$CPUS" >> $GITHUB_OUTPUT
+          echo "memory=${MEM}m" >> $GITHUB_OUTPUT
+          echo "Runner: ${CPUS} CPUs, ${MEM}MB RAM"
+
       - name: Build and Test in Alpine ARM64
         run: |
           docker run --rm --platform linux/arm64 \
+            --cpus ${{ steps.resources.outputs.cpus }} \
+            --memory ${{ steps.resources.outputs.memory }} \
             -v ${{ github.workspace }}:/workspace \
             -w /workspace \
             alpine:latest sh -c '
@@ -234,9 +245,20 @@ jobs:
         with:
           platforms: riscv64
 
+      - name: Query System Resources
+        id: resources
+        run: |
+          CPUS=$(nproc)
+          MEM=$(grep MemTotal /proc/meminfo | awk '{printf "%.0f", $2/1024}')
+          echo "cpus=$CPUS" >> $GITHUB_OUTPUT
+          echo "memory=${MEM}m" >> $GITHUB_OUTPUT
+          echo "Runner: ${CPUS} CPUs, ${MEM}MB RAM"
+
       - name: Build and Test in Alpine RISC-V
         run: |
           docker run --rm --platform linux/riscv64 \
+            --cpus ${{ steps.resources.outputs.cpus }} \
+            --memory ${{ steps.resources.outputs.memory }} \
             -v ${{ github.workspace }}:/workspace \
             -w /workspace \
             alpine:edge sh -c '
