@@ -322,6 +322,17 @@ typedef struct PrismContext {
 	int bracket_oe_cap;                // Capacity of bracket_oe_ids array
 	int bracket_oe_next;               // Next temp to consume during emit
 
+	// Pre-hoisted plain dimension temps for VLA eval-order preservation
+	unsigned *bracket_dim_ids;         // Temp IDs for non-orelse brackets (0 = not hoisted)
+	int bracket_dim_count;             // Count of pre-hoisted dimension temps
+	int bracket_dim_cap;
+	int bracket_dim_next;              // Next dim temp to consume during emit
+
+	// Source-file #define directives consumed by cc -E, for non-flatten reconstruction
+	char **source_defines;             // Array of "NAME=VALUE" or "NAME" strings (malloc'd)
+	int source_define_count;
+	int source_define_cap;
+
 	// Token pools: parallel hot/cold arrays for cache-optimal access
 	Token *tp_pool;        // Hot: tag, next_idx, match_idx, len, kind, flags
 	TokenCold *tp_cold;    // Cold: loc_offset, line_no, file_idx

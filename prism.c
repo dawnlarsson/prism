@@ -242,8 +242,9 @@ static volatile sig_atomic_t signal_temp_registered = 0;
 static char signal_temp_path[PATH_MAX];
 
 // Transpiled temp file tracking for signal cleanup.
-// Fixed-size ring; entries are PATH_MAX-sized C strings.
-#define SIGNAL_TEMPS_MAX 64
+// Fixed-size array; entries are PATH_MAX-sized C strings.
+// 256 entries (1 MB) covers any realistic invocation.
+#define SIGNAL_TEMPS_MAX 256
 static char signal_temps[SIGNAL_TEMPS_MAX][PATH_MAX];
 static volatile sig_atomic_t signal_temps_count = 0;
 
@@ -252,17 +253,22 @@ static volatile sig_atomic_t signal_temps_count = 0;
 #define signal_temp_load()     __atomic_load_n(&signal_temp_registered, __ATOMIC_ACQUIRE)
 #define signal_temps_store(val) __atomic_store_n(&signal_temps_count, (val), __ATOMIC_RELEASE)
 #define signal_temps_load()     __atomic_load_n(&signal_temps_count, __ATOMIC_ACQUIRE)
+#define signal_temps_cas(expected, desired) \
+	__atomic_compare_exchange_n(&signal_temps_count, (expected), (desired), \
+				    false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
 #define cached_env_load()       __atomic_load_n(&cached_clean_env, __ATOMIC_ACQUIRE)
 #define cached_env_store(val)   __atomic_store_n(&cached_clean_env, (val), __ATOMIC_RELEASE)
 #endif
 
 static void signal_temps_register(const char *path) {
-	int n = signal_temps_load();
-	if (n >= SIGNAL_TEMPS_MAX) return;
 	size_t len = strlen(path);
 	if (len >= PATH_MAX) return;
+	sig_atomic_t n;
+	do {
+		n = signal_temps_load();
+		if (n >= SIGNAL_TEMPS_MAX) return;
+	} while (!signal_temps_cas(&n, n + 1));
 	memcpy(signal_temps[n], path, len + 1);
-	signal_temps_store(n + 1);
 }
 
 static void signal_temps_clear(void) {
@@ -559,25 +565,46 @@ static void emit_system_header_diag_pop(void) {
 	OUT_LIT("#pragma GCC diagnostic pop\n");
 }
 
+// Emit a single define from a "NAME=VALUE" or "NAME" string (guarded by #ifndef)
+static void emit_define_guarded(const char *def) {
+	const char *eq = strchr(def, '=');
+	int name_len = eq ? (int)(eq - def) : (int)strlen(def);
+	if (name_len <= 0) return;
+	OUT_LIT("#ifndef ");
+	out_str(def, name_len);
+	OUT_LIT("\n#define ");
+	out_str(def, name_len);
+	if (eq) {
+		OUT_LIT(" ");
+		out_str(eq + 1, strlen(eq + 1));
+	}
+	OUT_LIT("\n#endif\n");
+}
+
 // Emit collected #include directives with necessary feature test macros
 static void emit_system_includes(void) {
 	if (ctx->system_include_count == 0) return;
 
-	// Emit user-specified defines (take priority over built-in feature test macros)
-	for (int i = 0; i < ctx->extra_define_count; i++) {
-		const char *def = ctx->extra_defines[i];
-		const char *eq = strchr(def, '=');
-		int name_len = eq ? (int)(eq - def) : (int)strlen(def);
-		OUT_LIT("#ifndef ");
-		out_str(def, name_len);
-		OUT_LIT("\n#define ");
-		out_str(def, name_len);
-		if (eq) {
-			OUT_LIT(" ");
-			out_str(eq + 1, strlen(eq + 1));
+	// Emit user-specified API defines (take priority over built-in feature test macros)
+	for (int i = 0; i < ctx->extra_define_count; i++)
+		emit_define_guarded(ctx->extra_defines[i]);
+
+	// Emit CLI -D flags from extra_compiler_flags (these are passed to cc -E
+	// but lost from un-flattened output unless re-emitted here)
+	for (int i = 0; i < ctx->extra_compiler_flags_count; i++) {
+		const char *f = ctx->extra_compiler_flags[i];
+		if (f[0] == '-' && f[1] == 'D') {
+			// -DFOO or -DFOO=bar (no space)
+			if (f[2]) emit_define_guarded(f + 2);
+			// -D FOO (space-separated): next arg is the define
+			else if (i + 1 < ctx->extra_compiler_flags_count)
+				emit_define_guarded(ctx->extra_compiler_flags[++i]);
 		}
-		OUT_LIT("\n#endif\n");
 	}
+
+	// Emit source-file defines that were consumed by the preprocessor
+	for (int i = 0; i < ctx->source_define_count; i++)
+		emit_define_guarded(ctx->source_defines[i]);
 
 	// Emit built-in feature test macros (guarded to not override user defines)
 	OUT_LIT("#if !defined(_WIN32)\n"
@@ -1814,6 +1841,58 @@ static bool params_look_like_decls(Token *open) {
 	return false;
 }
 
+// Check whether a _Generic's type associations resolve to distinct function
+// names.  When every branch targets the same identifier (glibc C23 pattern),
+// folding the _Generic onto that name is safe.  When branches name different
+// functions (user type-dispatch), folding would erase the dispatch.
+// Returns true when at least two branches name *different* identifiers.
+static bool generic_has_distinct_targets(Token *open) {
+	Token *close = tok_match(open);
+	if (!close) return false;
+
+	// Skip past the controlling expression (everything before the first
+	// ',' at depth 0).
+	Token *assoc_start = NULL;
+	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			if (tok_match(t)) t = tok_match(t);
+			continue;
+		}
+		if (match_ch(t, ',')) { assoc_start = tok_next(t); break; }
+	}
+	if (!assoc_start) return false;
+
+	// Walk the association list.  After each ':' at depth 0, find the
+	// first identifier (skipping casts / parens).  Collect branch names.
+	const char *first_name = NULL;
+	int first_len = 0;
+	for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			if (tok_match(t)) t = tok_match(t);
+			continue;
+		}
+		if (!match_ch(t, ':')) continue;
+		// Scan forward for first identifier, skipping nested parens.
+		for (Token *b = tok_next(t); b && b != close; b = tok_next(b)) {
+			if (b->flags & TF_OPEN) {
+				if (tok_match(b)) b = tok_match(b);
+				continue;
+			}
+			if (match_ch(b, ',')) break; // next association
+			if (!is_valid_varname(b)) continue;
+			if (!first_name) {
+				first_name = tok_loc(b);
+				first_len = b->len;
+			} else if (b->len != first_len ||
+				   memcmp(tok_loc(b), first_name, first_len) != 0) {
+				return true; // distinct target found
+			}
+			break;
+		}
+	}
+	return false;
+}
+
 static bool generic_decl_rewrite_target(Token *generic_tok, Token **name_out,
 					Token **params_open_out,
 					Token **params_close_out,
@@ -1824,6 +1903,9 @@ static bool generic_decl_rewrite_target(Token *generic_tok, Token **name_out,
 	Token *close = tok_match(open);
 	Token *after = skip_noise(tok_next(close));
 	if (!after) return false;
+
+	// Multi-branch _Generic with distinct targets has real type dispatch.
+	if (generic_has_distinct_targets(open)) return false;
 
 	// Pattern 1: _Generic(...name(decl-params)...) ;/attr
 	if (match_ch(after, ';') || match_ch(after, ',') || (after->tag & TT_ATTR) ||
@@ -1876,6 +1958,9 @@ static bool generic_member_rewrite_target(Token *generic_tok, Token **name_out,
 	Token *close = tok_match(open);
 	Token *after = skip_noise(tok_next(close));
 	if (!after) return false;
+
+	// Multi-branch _Generic with distinct targets has real type dispatch.
+	if (generic_has_distinct_targets(open)) return false;
 
 	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
 		Token *call_open = skip_noise(tok_next(t));
@@ -2134,13 +2219,25 @@ static bool declarator_has_bracket_orelse(Token *start, Token *end) {
 
 // Pre-scan a declarator for bracket orelse, emit hoisted temp declarations.
 // Each bracket orelse gets: long long _Prism_oe_ID = (LHS);
+// When orelse appears in a later bracket, preceding non-orelse brackets
+// are also hoisted to preserve C99 left-to-right VLA evaluation order.
 static void emit_bracket_orelse_temps(Token *start, Token *end) {
 	ctx->bracket_oe_count = 0;
 	ctx->bracket_oe_next = 0;
+	ctx->bracket_dim_count = 0;
+	ctx->bracket_dim_next = 0;
+
+	// Phase 1: collect all brackets and identify which have orelse
+	typedef struct { Token *open; Token *close; Token *orelse; } BracketInfo;
+	BracketInfo brackets[32];
+	int bracket_count = 0;
+	bool any_orelse = false;
+
 	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
 		if (!match_ch(t, '[')) continue;
 		Token *close = tok_match(t);
 		if (!close) continue;
+		if (bracket_count >= 32) break;
 		Token *orelse_found = NULL;
 		Token *prev = t;
 		for (Token *s = tok_next(t); s && s != close; s = tok_next(s)) {
@@ -2152,17 +2249,56 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 			}
 			prev = s;
 		}
-		if (!orelse_found) { t = close; continue; }
-		ARENA_ENSURE_CAP(&ctx->main_arena, ctx->bracket_oe_ids, ctx->bracket_oe_count,
-				 ctx->bracket_oe_cap, 16, unsigned);
-		unsigned oe = ctx->ret_counter++;
-		ctx->bracket_oe_ids[ctx->bracket_oe_count++] = oe;
-		OUT_LIT(" long long _Prism_oe_");
-		out_uint(oe);
-		OUT_LIT(" = (");
-		emit_token_range(tok_next(t), orelse_found);
-		OUT_LIT(");");
+		brackets[bracket_count++] = (BracketInfo){t, close, orelse_found};
+		if (orelse_found) any_orelse = true;
 		t = close;
+	}
+
+	if (!any_orelse) return;
+
+	// Phase 2: find the first bracket with orelse
+	int first_orelse_idx = 0;
+	for (int i = 0; i < bracket_count; i++) {
+		if (brackets[i].orelse) { first_orelse_idx = i; break; }
+	}
+
+	// Phase 3: emit temps in left-to-right order.
+	// Non-orelse brackets that precede the first orelse bracket get dimension temps
+	// to preserve evaluation order.
+	for (int i = 0; i < bracket_count; i++) {
+		if (brackets[i].orelse) {
+			// Orelse bracket: hoist LHS
+			ARENA_ENSURE_CAP(&ctx->main_arena, ctx->bracket_oe_ids, ctx->bracket_oe_count,
+					 ctx->bracket_oe_cap, 16, unsigned);
+			unsigned oe = ctx->ret_counter++;
+			ctx->bracket_oe_ids[ctx->bracket_oe_count++] = oe;
+			OUT_LIT(" long long _Prism_oe_");
+			out_uint(oe);
+			OUT_LIT(" = (");
+			emit_token_range(tok_next(brackets[i].open), brackets[i].orelse);
+			OUT_LIT(");");
+		} else if (i < first_orelse_idx) {
+			// Non-orelse bracket that precedes an orelse bracket:
+			// hoist to preserve eval order. Only needed for non-empty VLA dims.
+			Token *dim_start = tok_next(brackets[i].open);
+			Token *dim_end = brackets[i].close;
+			// Skip empty brackets (e.g. [])
+			if (dim_start == dim_end) {
+				ARENA_ENSURE_CAP(&ctx->main_arena, ctx->bracket_dim_ids,
+						 ctx->bracket_dim_count, ctx->bracket_dim_cap, 16, unsigned);
+				ctx->bracket_dim_ids[ctx->bracket_dim_count++] = 0; // 0 = not hoisted
+				continue;
+			}
+			ARENA_ENSURE_CAP(&ctx->main_arena, ctx->bracket_dim_ids,
+					 ctx->bracket_dim_count, ctx->bracket_dim_cap, 16, unsigned);
+			unsigned dim = ctx->ret_counter++;
+			ctx->bracket_dim_ids[ctx->bracket_dim_count++] = dim;
+			OUT_LIT(" long long _Prism_dim_");
+			out_uint(dim);
+			OUT_LIT(" = (");
+			emit_token_range(dim_start, dim_end);
+			OUT_LIT(");");
+		}
 	}
 }
 
@@ -2182,8 +2318,18 @@ static Token *walk_balanced_orelse(Token *tok) {
 		prev = t;
 	}
 	if (!orelse_found) {
-		// No orelse at depth 0 — but nested brackets may contain orelse.
-		// Use orelse-aware emission for nested '[' groups.
+		// No orelse at depth 0. Check if this bracket was pre-hoisted as a dim temp.
+		if (match_ch(tok, '[') && ctx->bracket_dim_next < ctx->bracket_dim_count) {
+			unsigned dim = ctx->bracket_dim_ids[ctx->bracket_dim_next++];
+			if (dim != 0) {
+				emit_tok(tok); // emit [
+				OUT_LIT(" _Prism_dim_");
+				out_uint(dim);
+				emit_tok(end); // emit ]
+				return tok_next(end);
+			}
+		}
+		// No pre-hoisted dim — emit normally with nested orelse awareness.
 		for (Token *t = tok; t != tok_next(end) && t->kind != TK_EOF;) {
 			if (t != tok && t != end && match_ch(t, '[') && (t->flags & TF_OPEN) && tok_match(t)) {
 				t = walk_balanced_orelse(t);
@@ -2220,8 +2366,8 @@ static Token *walk_balanced_orelse(Token *tok) {
 	} else if (is_bracket) {
 		// Fallback for brackets not covered by pre-hoisting (e.g. typeof):
 		// Reject if LHS has side effects — duplication would fire them twice.
+		// Walk ALL tokens including those inside parens (no TF_OPEN skip).
 		for (Token *s = lhs_start; s && s != orelse_found && s->kind != TK_EOF; s = tok_next(s)) {
-			if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; continue; }
 			if (equal(s, "++") || equal(s, "--"))
 				error_tok(s, "'orelse' in array dimension / typeof with side effect "
 					  "in the LHS (would be evaluated twice); "
@@ -2230,10 +2376,19 @@ static Token *walk_balanced_orelse(Token *tok) {
 				error_tok(s, "'orelse' in array dimension / typeof with side effect "
 					  "in the LHS (would be evaluated twice); "
 					  "hoist the expression to a variable first");
-			if (is_valid_varname(s) && !is_type_keyword(s) && tok_next(s) &&
-			    tok_next(s) != orelse_found && match_ch(tok_next(s), '('))
-				error_tok(s, "'orelse' in array dimension / typeof with side effect "
-					  "in the LHS (would be evaluated twice); "
+			// Function call: name followed by '(' — including inside parens
+			if (is_valid_varname(s) && !is_type_keyword(s)) {
+				Token *after_s = tok_next(s);
+				if (after_s && after_s != orelse_found && match_ch(after_s, '('))
+					error_tok(s, "'orelse' in array dimension / typeof with side effect "
+						  "in the LHS (would be evaluated twice); "
+						  "hoist the expression to a variable first");
+			}
+			// Dereference of volatile: '*' before an identifier (conservative)
+			if (match_ch(s, '*') && tok_next(s) && is_valid_varname(tok_next(s)) &&
+			    !is_type_keyword(tok_next(s)) && tok_next(s) != orelse_found)
+				error_tok(s, "'orelse' in array dimension / typeof with pointer "
+					  "dereference in the LHS (could read volatile twice); "
 					  "hoist the expression to a variable first");
 		}
 		// emit ternary with LHS duplication (no statement expression)
@@ -2523,6 +2678,8 @@ static Token *handle_const_orelse_fallback(Token *tok,
 
 	if (has_const_typedef) {
 		// Pointer-to-incomplete: use &* trick instead of arithmetic.
+		// (T)0+0 fails for pointers to incomplete types (sizeof unknown).
+		// &*(T)0 safely strips const via &* cancellation in typeof context.
 		bool const_td_is_ptr = false;
 		bool const_td_is_array = false;
 		for (Token *t = type_start; t != type->end; t = tok_next(t)) {
@@ -2778,11 +2935,12 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		// Step 2b: Pre-hoist bracket orelse temps (before type emission)
 		bool has_bo = FEAT(F_ORELSE) && declarator_has_bracket_orelse(decl_start, decl.end);
 		if (has_bo) {
-			if (in_for_init())
+			if (in_ctrl_paren())
 				error_tok(decl_start,
 					  "bracket orelse in VLA dimensions cannot be used in "
-					  "for-loop initializers (hoisted temps would create "
-					  "multiple declarations); move the declaration before the loop");
+					  "control statement conditions (hoisted temps would "
+					  "inject invalid syntax); move the declaration before "
+					  "the statement");
 			emit_bracket_orelse_temps(decl_start, decl.end);
 		}
 
@@ -3860,6 +4018,7 @@ static int run_command_quiet(char **argv) {
 
 // Create temp file with optional suffix. If source_adjacent is set, tries
 // to create next to that file first, falls back to TMPDIR.
+// Returns the open fd (>= 0) on success, -1 on failure. Caller must close.
 static int
 make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len, const char *source_adjacent) {
 	int n;
@@ -3885,10 +4044,8 @@ make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len, co
 			suffix_len = 2;
 			if (n >= 0 && (size_t)n < bufsize) {
 				int fd = mkstemps(buf, suffix_len);
-				if (fd >= 0) {
-					close(fd);
-					return 0;
-				}
+				if (fd >= 0)
+					return fd;
 			}
 		}
 		// Source directory not writable, fall back to TMPDIR
@@ -3899,9 +4056,7 @@ make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len, co
 		n = snprintf(buf, bufsize, "%s%s", get_tmp_dir(), prefix ? prefix : "prism_tmp");
 	if (n < 0 || (size_t)n >= bufsize) return -1;
 	int fd = suffix_len > 0 ? mkstemps(buf, suffix_len) : mkstemp(buf);
-	if (fd < 0) return -1;
-	close(fd);
-	return 0;
+	return fd;
 }
 
 static const char *path_basename(const char *path) {
@@ -4072,8 +4227,92 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 	args[*argc] = NULL;
 }
 
+// Pre-scan source file for #define directives that appear before any #include.
+// These ABI-altering macros (e.g. _FILE_OFFSET_BITS, _LARGEFILE_SOURCE) are
+// consumed by cc -E and lost from un-flattened output unless we capture them.
+static void collect_source_defines(const char *input_file) {
+	ctx->source_define_count = 0;
+	if (!input_file || FEAT(F_FLATTEN)) return;
+
+	FILE *f = fopen(input_file, "r");
+	if (!f) return;
+
+	char line[1024];
+	bool in_continuation = false;
+	while (fgets(line, sizeof(line), f)) {
+		// If previous line ended with '\', this is a continuation
+		if (in_continuation) {
+			char *end = line + strlen(line);
+			while (end > line && (end[-1] == '\n' || end[-1] == '\r')) end--;
+			in_continuation = (end > line && end[-1] == '\\');
+			continue;
+		}
+		// Skip whitespace
+		char *p = line;
+		while (*p == ' ' || *p == '\t') p++;
+		if (*p != '#') {
+			// Skip blank lines and comments
+			if (*p == '\n' || *p == '\0' || (p[0] == '/' && (p[1] == '/' || p[1] == '*')))
+				continue;
+			// Non-preprocessor, non-blank line — stop scanning
+			break;
+		}
+		p++; // skip '#'
+		while (*p == ' ' || *p == '\t') p++;
+		if (strncmp(p, "include", 7) == 0) break; // #include reached — stop
+
+		if (strncmp(p, "define", 6) == 0 && (p[6] == ' ' || p[6] == '\t')) {
+			p += 6;
+			while (*p == ' ' || *p == '\t') p++;
+			// Extract "NAME VALUE" → "NAME=VALUE"
+			char *name_start = p;
+			while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '(') p++;
+			int name_len = (int)(p - name_start);
+			if (name_len <= 0) goto check_continuation;
+			// Skip function-like macros (not ABI defines)
+			if (*p == '(') goto check_continuation;
+			while (*p == ' ' || *p == '\t') p++;
+			char *val_start = p;
+			// Trim trailing newline/whitespace/continuation
+			char *end = val_start + strlen(val_start);
+			while (end > val_start && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t'))
+				end--;
+			// Strip trailing backslash (continuation) — we only capture the first line's value
+			if (end > val_start && end[-1] == '\\') end--;
+			while (end > val_start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+			int val_len = (int)(end - val_start);
+
+			// Build "NAME=VALUE" or "NAME" string
+			int total = name_len + (val_len > 0 ? 1 + val_len : 0) + 1;
+			char *def = malloc(total);
+			if (!def) goto check_continuation;
+			memcpy(def, name_start, name_len);
+			if (val_len > 0) {
+				def[name_len] = '=';
+				memcpy(def + name_len + 1, val_start, val_len);
+				def[name_len + 1 + val_len] = '\0';
+			} else {
+				def[name_len] = '\0';
+			}
+
+			ARENA_ENSURE_CAP(&ctx->main_arena, ctx->source_defines,
+					 ctx->source_define_count, ctx->source_define_cap,
+					 8, char *);
+			ctx->source_defines[ctx->source_define_count++] = def;
+		}
+		// Check if this preprocessor directive has a continuation
+	check_continuation: {
+			char *end = line + strlen(line);
+			while (end > line && (end[-1] == '\n' || end[-1] == '\r')) end--;
+			in_continuation = (end > line && end[-1] == '\\');
+		}
+	}
+	fclose(f);
+}
+
 // Run system preprocessor (cc -E) via pipe, returns malloc'd output or NULL
 static char *preprocess_with_cc(const char *input_file) {
+	collect_source_defines(input_file);
 	const char *pp_cc = ctx->extra_compiler ? ctx->extra_compiler : PRISM_DEFAULT_CC;
 	int argcap = 16 + cc_extra_arg_count(pp_cc) + ctx->extra_compiler_flags_count + ctx->dep_flags_count +
 		     ctx->extra_include_count * 2 + ctx->extra_define_count * 2 + ctx->extra_force_include_count * 2;
@@ -4983,6 +5222,21 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 		track_common_token_state(tok, &toplevel);
 
+		// Struct body: process orelse inside array dimension brackets.
+		// try_zero_init_decl skips struct bodies, so bracket orelse would
+		// pass through to emit_tok verbatim.  Route through walk_balanced_orelse
+		// which handles the orelse→ternary transformation for dimensions.
+		if (__builtin_expect(FEAT(F_ORELSE) && in_struct_body() &&
+				     match_ch(tok, '[') && (tok->flags & TF_OPEN) && tok_match(tok), 0)) {
+			bool has_oe = false;
+			for (Token *s = tok_next(tok); s && s != tok_match(tok); s = tok_next(s))
+				if (is_orelse_keyword(s)) { has_oe = true; break; }
+			if (has_oe) {
+				tok = walk_balanced_orelse(tok);
+				continue;
+			}
+		}
+
 		// Reject unprocessed 'orelse' inside typeof expressions in struct bodies.
 		// Struct field names like "bool orelse;" are legitimate and handled below,
 		// but orelse inside typeof(expr orelse fallback) would pass through verbatim.
@@ -5044,15 +5298,41 @@ static int transpile(char *input_file, char *output_file) {
 	return transpile_tokens(tok, fp);
 }
 
+// Like transpile() but writes to an already-open FILE* (takes ownership, closes on finish).
+static int transpile_to_fp(char *input_file, FILE *fp) {
+	ensure_keyword_cache();
+
+	char *pp_buf = preprocess_with_cc(input_file);
+	if (!pp_buf) {
+		fprintf(stderr, "Preprocessing failed for: %s\n", input_file);
+		fclose(fp);
+		return 0;
+	}
+
+	Token *tok = tokenize_buffer(input_file, pp_buf);
+
+	if (!tok) {
+		fprintf(stderr, "Failed to tokenize preprocessed output\n");
+		tokenizer_teardown(false);
+		fclose(fp);
+		return 0;
+	}
+
+	return transpile_tokens(tok, fp);
+}
+
 // Transpile a source file and write the result to stdout.
 // On Windows, transpiles to a temp file and copies it out (no /dev/stdout).
 // On POSIX, transpiles directly to /dev/stdout.
 static int transpile_to_stdout(char *input_file) {
 #ifdef _WIN32
 	char temp[PATH_MAX];
-	if (make_temp_file(temp, sizeof(temp), NULL, 0, input_file) < 0)
+	int fd = make_temp_file(temp, sizeof(temp), NULL, 0, input_file);
+	if (fd < 0)
 		return 0;
-	if (!transpile(input_file, temp)) {
+	FILE *wfp = fdopen(fd, "w");
+	if (!wfp) { close(fd); return 0; }
+	if (!transpile_to_fp(input_file, wfp)) {
 		remove(temp);
 		return 0;
 	}
@@ -6028,7 +6308,8 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 		if (use_lib_api) {
 			temps[i] = malloc(PATH_MAX);
 			if (!temps[i]) die("Out of memory");
-			if (make_temp_file(temps[i], PATH_MAX, NULL, 0, cli->sources[i]) < 0)
+			int fd = make_temp_file(temps[i], PATH_MAX, NULL, 0, cli->sources[i]);
+			if (fd < 0)
 				die("Failed to create temp file");
 			signal_temps_register(temps[i]);
 			PrismResult result = prism_transpile_file(cli->sources[i], cli->features);
@@ -6037,23 +6318,27 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 					result.error_line, result.error_col,
 					result.error_msg ? result.error_msg : "transpilation failed");
 				prism_free(&result);
+				close(fd);
 				cleanup_temp_range(temps, i + 1);
 				return NULL;
 			}
-			FILE *f = fopen(temps[i], "w");
-			if (!f) { prism_free(&result); die("Failed to create temp file"); }
+			FILE *f = fdopen(fd, "w");
+			if (!f) { prism_free(&result); close(fd); die("Failed to create temp file"); }
 			fwrite(result.output, 1, result.output_len, f);
 			fclose(f);
 			prism_free(&result);
 		} else {
 			temps[i] = malloc(512);
 			if (!temps[i]) die("Out of memory");
-			if (make_temp_file(temps[i], 512, NULL, 0, cli->sources[i]) < 0)
+			int fd = make_temp_file(temps[i], 512, NULL, 0, cli->sources[i]);
+			if (fd < 0)
 				die("Failed to create temp file");
 			signal_temps_register(temps[i]);
 			if (cli->verbose)
 				fprintf(stderr, "[prism] Transpiling %s -> %s\n", cli->sources[i], temps[i]);
-			if (!transpile((char *)cli->sources[i], temps[i])) {
+			FILE *wfp = fdopen(fd, "w");
+			if (!wfp) { close(fd); die("Failed to open temp file"); }
+			if (!transpile_to_fp((char *)cli->sources[i], wfp)) {
 				cleanup_temp_range(temps, i + 1);
 				return NULL;
 			}

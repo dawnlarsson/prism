@@ -45,6 +45,9 @@ typedef int mode_t;
 #define signal_temp_load()     (signal_temp_registered)
 #define signal_temps_store(val) (signal_temps_count = (val))
 #define signal_temps_load()     (signal_temps_count)
+#define signal_temps_cas(expected, desired) \
+	(InterlockedCompareExchange((volatile LONG *)&signal_temps_count, \
+				    (LONG)(desired), (LONG)(*(expected))) == (LONG)(*(expected)))
 // MSVC volatile has acquire/release on x86/x64 — sufficient for cached_clean_env init-once.
 #define cached_env_load()       (cached_clean_env)
 #define cached_env_store(val)   (cached_clean_env = (val))

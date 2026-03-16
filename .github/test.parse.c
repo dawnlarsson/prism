@@ -6419,8 +6419,10 @@ static void test_bug_r1_readonly_dir(void) {
 
 	CHECK_EQ(chmod(dir, 0555), 0, "bug_r1: make source dir read-only");
 	if (access(src_path, F_OK) == 0) {
-		CHECK_EQ(make_temp_file(temp_path, sizeof(temp_path), NULL, 0, src_path), 0,
+		int fd = make_temp_file(temp_path, sizeof(temp_path), NULL, 0, src_path);
+		CHECK(fd >= 0,
 			 "bug_r1: temp creation falls back when source dir is read-only");
+		if (fd >= 0) close(fd);
 		CHECK(strncmp(temp_path, dir, strlen(dir)) != 0,
 		      "bug_r1: temp path not created inside read-only dir");
 		remove(temp_path);

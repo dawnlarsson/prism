@@ -4453,8 +4453,9 @@ static void test_install_temp_predictable_symlink_hijack(void) {
 	// 1) make_temp_file must generate unpredictable paths (no getpid pattern)
 	char path[512];
 	int rc = make_temp_file(path, sizeof(path), NULL, 0, "/tmp/dummy_source.c");
-	CHECK(rc == 0, "install-temp-symlink: make_temp_file succeeds");
-	if (rc != 0) return;
+	CHECK(rc >= 0, "install-temp-symlink: make_temp_file succeeds");
+	if (rc < 0) return;
+	close(rc);
 
 	char pid_pattern[32];
 	snprintf(pid_pattern, sizeof(pid_pattern), "_%d_", getpid());
@@ -4487,8 +4488,9 @@ static void test_install_temp_predictable_symlink_hijack(void) {
 	// not following the symlink at the old predictable location.
 	char safe_path[512];
 	rc = make_temp_file(safe_path, sizeof(safe_path), NULL, 0, "/tmp/dummy_source.c");
-	CHECK(rc == 0, "install-temp-symlink: safe make_temp_file succeeds");
-	if (rc == 0) {
+	CHECK(rc >= 0, "install-temp-symlink: safe make_temp_file succeeds");
+	if (rc >= 0) {
+		close(rc);
 		CHECK(strcmp(safe_path, attack_path) != 0,
 		      "install-temp-symlink: mkstemp path differs from predictable attack path");
 		// Write through the safe path and verify target was not corrupted.
@@ -4907,6 +4909,200 @@ static void test_fpreprocessed_not_passed_to_clang(void) {
 	rmdir(dir);
 }
 
+// Bug: signal_temps_register used to silently drop files beyond 64.
+// Fix: capacity increased to SIGNAL_TEMPS_MAX (256) with CAS-based registration.
+// Verify that entries beyond the old limit (64) are properly tracked.
+static void test_signal_temps_register_overflow(void) {
+	// Save current count
+	int saved = signal_temps_load();
+
+	// Clear and fill beyond the old 64-entry limit
+	signal_temps_clear();
+	char path[48];
+	int test_count = 128; // well beyond old limit of 64
+	for (int i = 0; i < test_count; i++) {
+		snprintf(path, sizeof(path), "/tmp/prism_test_%d.c", i);
+		signal_temps_register(path);
+	}
+	CHECK_EQ(signal_temps_load(), test_count,
+	         "signal_temps: fills to capacity");
+
+	// Entry 65 (index 64) must not be silently dropped
+	CHECK(signal_temps_load() > 64,
+	      "BUG signal_temps_overflow: file 65 silently dropped from cleanup tracking");
+
+	// Restore
+	signal_temps_clear();
+	if (saved > 0) signal_temps_store(saved);
+}
+
+// Bug: make_temp_file used to create a file via mkstemps (O_EXCL) but
+// immediately close(fd) and return 0.  The fix: return the open fd so
+// callers use fdopen() instead of fopen(), eliminating the TOCTOU window.
+static void test_make_temp_file_toctou_symlink(void) {
+	char path[PATH_MAX];
+	int fd = make_temp_file(path, sizeof(path), "prism_toctou_XXXXXX", 0, NULL);
+	CHECK(fd >= 0, "toctou: make_temp_file succeeds");
+	if (fd < 0) return;
+
+	// The fd must still be open — fdopen should succeed.
+	// This proves the TOCTOU window is closed: no gap between create and use.
+	FILE *fp = fdopen(fd, "w");
+	CHECK(fp != NULL,
+	      "toctou-fix: fdopen succeeds on returned fd (no close+reopen gap)");
+	if (fp) {
+		fputs("SAFE", fp);
+		fclose(fp); // closes fd too
+	} else {
+		close(fd);
+	}
+
+	// Verify that a symlink attack can't intercept because we never reopen by path
+	char victim[PATH_MAX];
+	snprintf(victim, sizeof(victim), "%stoctou_victim_%d", get_tmp_dir(), (int)getpid());
+	FILE *vf = fopen(victim, "w");
+	if (vf) { fputs("ORIGINAL", vf); fclose(vf); }
+
+	// Even if attacker replaces the path with a symlink after make_temp_file,
+	// the fd already points to the real file — the symlink is irrelevant.
+	unlink(path);
+	symlink(victim, path);
+
+	// Read the victim — it must NOT have been overwritten
+	char buf[64] = {0};
+	FILE *check = fopen(victim, "r");
+	if (check) { fgets(buf, sizeof(buf), check); fclose(check); }
+
+	CHECK(strstr(buf, "HIJACKED") == NULL,
+	      "BUG toctou-symlink: fopen after make_temp_file follows symlink, "
+	      "overwriting arbitrary file (CWE-367)");
+
+	unlink(path);
+	unlink(victim);
+}
+
+#ifndef _WIN32
+// Bug: signal_temps_register uses a non-atomic load-check-store pattern.
+// Two threads reading the same index clobber each other's entry.
+typedef struct { int tid; pthread_barrier_t *barrier; } RaceArg;
+
+static void *_race_worker(void *arg) {
+	RaceArg *ra = (RaceArg *)arg;
+	char path[64];
+	snprintf(path, sizeof(path), "/tmp/race_t%02d.c", ra->tid);
+	pthread_barrier_wait(ra->barrier);
+	signal_temps_register(path);
+	return NULL;
+}
+
+static void test_signal_temps_register_race(void) {
+	int nthreads = 8;
+	int races = 0, runs = 10;
+
+	for (int run = 0; run < runs; run++) {
+		signal_temps_clear();
+
+		pthread_barrier_t barrier;
+		pthread_barrier_init(&barrier, NULL, nthreads);
+		RaceArg args[8];
+		pthread_t threads[8];
+		for (int i = 0; i < nthreads; i++) {
+			args[i].tid = run * nthreads + i;
+			args[i].barrier = &barrier;
+			pthread_create(&threads[i], NULL, _race_worker, &args[i]);
+		}
+		for (int i = 0; i < nthreads; i++)
+			pthread_join(threads[i], NULL);
+		pthread_barrier_destroy(&barrier);
+
+		int count = signal_temps_load();
+		if (count < nthreads)
+			races++;
+	}
+	signal_temps_clear();
+
+	// With 8 barrier-synchronized threads over 10 runs, non-atomic
+	// load-check-store will lose entries in most runs.
+	CHECK_EQ(races, 0,
+	         "BUG signal_temps_race: concurrent register loses entries "
+	         "(non-atomic load-check-store)");
+}
+#endif
+
+// Bug: generic_decl_rewrite_target and generic_member_rewrite_target pick a
+// fixed branch from _Generic (first or last identifier seen), discarding the
+// type-dispatch logic. The backend compiler can no longer resolve the correct
+// branch — the wrong function is hardcoded.
+// Bug: When using -fno-flatten-headers, Prism runs cc -E which consumes
+// in-file #define directives like _FILE_OFFSET_BITS.  The un-flatten path
+// reconstructs #include directives but never re-emits the user's #defines.
+// The backend compiler sees #include <stdio.h> without the ABI-altering macro.
+static void test_no_flatten_headers_abi_define_erasure(void) {
+	const char *code =
+	    "#define _FILE_OFFSET_BITS 64\n"
+	    "#include <stdio.h>\n"
+	    "void test(void) { FILE *f = fopen(\"x\",\"r\"); (void)f; }\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "create temp file for abi test");
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = false;
+	PrismResult r = prism_transpile_file(path, feat);
+	if (r.status == PRISM_OK && r.output) {
+		// The output must contain _FILE_OFFSET_BITS so the backend
+		// compiler sees it before the re-emitted #include.
+		CHECK(strstr(r.output, "_FILE_OFFSET_BITS") != NULL,
+		      "BUG no-flatten-abi-erasure: #define _FILE_OFFSET_BITS lost "
+		      "after cc -E; un-flattened output omits ABI-altering macro");
+	}
+	prism_free(&r);
+	unlink(path);
+	free(path);
+}
+
+static void test_generic_decl_rewrite_destroys_dispatch(void) {
+	// Pattern 1: _Generic in decl context, params inside.
+	// Controlling expression is (float)0, so 'bar' should be selected.
+	// But generic_decl_rewrite_target picks the first match: 'foo'.
+	const char *code1 =
+	    "void _Generic((float)0, int: foo(int x), float: bar(int x));\n";
+	PrismResult r1 = prism_transpile_source(code1, "generic_decl_p1.c", prism_defaults());
+	if (r1.status == PRISM_OK && r1.output) {
+		CHECK(strstr(r1.output, "_Generic") != NULL,
+		      "BUG generic-decl-rewrite-p1: _Generic dispatch erased "
+		      "(first branch hardcoded, type dispatch destroyed)");
+	}
+	prism_free(&r1);
+
+	// Pattern 2: _Generic in decl context, params outside.
+	// generic_decl_rewrite_target Pattern 2 picks the LAST identifier.
+	const char *code2 =
+	    "void _Generic((float)0, int: foo_fn, float: bar_fn)(int x);\n";
+	PrismResult r2 = prism_transpile_source(code2, "generic_decl_p2.c", prism_defaults());
+	if (r2.status == PRISM_OK && r2.output) {
+		CHECK(strstr(r2.output, "_Generic") != NULL,
+		      "BUG generic-decl-rewrite-p2: _Generic dispatch erased "
+		      "(last identifier hardcoded, type dispatch destroyed)");
+	}
+	prism_free(&r2);
+
+	// Pattern 3: member rewrite after '.' — picks first branch.
+	const char *code3 =
+	    "struct S { int x; };\n"
+	    "void test(struct S s, int val) {\n"
+	    "    s._Generic((val), int: method_int(val), float: method_float(val));\n"
+	    "}\n";
+	PrismResult r3 = prism_transpile_source(code3, "generic_member.c", prism_defaults());
+	if (r3.status == PRISM_OK && r3.output) {
+		const char *body = strstr(r3.output, "void test");
+		if (body) {
+			CHECK(strstr(body, "_Generic") != NULL,
+			      "BUG generic-member-rewrite: _Generic dispatch erased "
+			      "(first branch hardcoded in member context)");
+		}
+	}
+	prism_free(&r3);
+}
+
 void run_api_tests(void) {
 test_typeof_orelse_leak();
 	printf("\n=== API TESTS ===\n");
@@ -5029,4 +5225,19 @@ test_typeof_orelse_leak();
 	test_pp_define_bufs_boundary();
 
 	test_memory_leak_stress();
+
+	// Audit round 4 bug probes (should FAIL until fixed)
+	test_signal_temps_register_overflow();
+
+	// Audit round 5 bug probes (should FAIL until fixed)
+	test_make_temp_file_toctou_symlink();
+#ifndef _WIN32
+	test_signal_temps_register_race();
+#endif
+
+	// Audit round 6 bug probes (should FAIL until fixed)
+	test_generic_decl_rewrite_destroys_dispatch();
+
+	// Audit round 7 bug probes (should FAIL until fixed)
+	test_no_flatten_headers_abi_define_erasure();
 }

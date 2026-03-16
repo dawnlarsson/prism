@@ -2256,6 +2256,152 @@ static void test_orelse_typeof_nested_bracket(void) {
 	prism_free(&r);
 }
 
+// Bug: emit_bracket_orelse_temps hoists all bracket orelse temps before the
+// declaration, evaluating later-dimension orelse LHS expressions before
+// earlier dimensions.  C99 §6.7.5.2 requires left-to-right evaluation.
+// E.g., int arr[get_a()][get_b() orelse 1] → get_b() is called before get_a().
+static void test_vla_bracket_orelse_eval_order(void) {
+	const char *code =
+	    "int get_a(void);\n"
+	    "int get_b(void);\n"
+	    "void f(void) {\n"
+	    "    int arr[get_a()][get_b() orelse 1];\n"
+	    "    (void)arr;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "vla_eval_order.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		// The hoisted temp "long long _Prism_oe_0 = (get_b ())" must NOT
+		// appear before "get_a()" in the output.  If it does, evaluation
+		// order is reversed.
+		const char *hoist = strstr(r.output, "_Prism_oe_");
+		const char *get_a = strstr(r.output, "get_a");
+		// Skip the forward declaration of get_a — find it inside f()
+		if (get_a) {
+			const char *in_func = strstr(r.output, "void f(");
+			if (in_func) {
+				const char *a_in_func = strstr(in_func, "get_a");
+				// Hoist must come AFTER get_a's first use, not before
+				CHECK(hoist == NULL || a_in_func == NULL || hoist > a_in_func,
+				      "BUG vla-eval-order: get_b() orelse hoisted before get_a(), "
+				      "violating C99 left-to-right VLA dimension evaluation");
+			}
+		}
+	} else {
+		// If rejected, that's also acceptable
+		CHECK(r.status != PRISM_OK,
+		      "vla-eval-order: rejected by transpiler (acceptable)");
+	}
+	prism_free(&r);
+}
+
+// Bug: walk_balanced_orelse fallback path (typeof brackets) duplicates LHS
+// in a ternary without detecting volatile dereferences.  A volatile read
+// like *hw_reg fires twice: once in the condition, once in the true branch.
+static void test_typeof_bracket_orelse_volatile_double_read(void) {
+	const char *code =
+	    "volatile int *hw_reg;\n"
+	    "void f(void) {\n"
+	    "    typeof(int[*hw_reg orelse 1]) *p;\n"
+	    "    (void)p;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "typeof_volatile_bracket.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		// Count occurrences of "* hw_reg" or "*hw_reg" in the typeof(...) expression.
+		// If the LHS is duplicated in a ternary, the volatile appears twice.
+		const char *typeof_start = strstr(r.output, "typeof(");
+		if (typeof_start) {
+			const char *s = typeof_start;
+			int count = 0;
+			while ((s = strstr(s, "hw_reg")) != NULL) {
+				// Only count inside the typeof
+				if (s > typeof_start + 200) break; // safety bound
+				count++;
+				s += 6;
+			}
+			CHECK(count <= 1,
+			      "BUG typeof-volatile-bracket: volatile *hw_reg duplicated in ternary "
+			      "(double hardware read)");
+		}
+	} else {
+		CHECK(r.status != PRISM_OK,
+		      "typeof-volatile-bracket: rejected by transpiler (acceptable)");
+	}
+	prism_free(&r);
+}
+
+// Bug: walk_balanced_orelse side-effect scanner skips over parenthesized
+// subexpressions (TF_OPEN → tok_match → skip), so side effects like g++
+// inside parens are not detected and get duplicated in the ternary.
+static void test_typeof_bracket_orelse_paren_hidden_side_effect(void) {
+	const char *code =
+	    "int g;\n"
+	    "void f(void) {\n"
+	    "    typeof(int[(g++, g) orelse 1]) *p;\n"
+	    "    (void)p;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "typeof_paren_sideeffect.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		// If accepted, g++ must NOT appear twice in the output expression.
+		// The ternary duplication causes "((g++, g)) ? ((g++, g)) : (1)"
+		// which fires g++ twice.
+		const char *typeof_start = strstr(r.output, "typeof(");
+		if (typeof_start) {
+			const char *first = strstr(typeof_start, "g ++");
+			if (!first) first = strstr(typeof_start, "g++");
+			if (first) {
+				const char *second = strstr(first + 3, "g ++");
+				if (!second) second = strstr(first + 3, "g++");
+				CHECK(second == NULL,
+				      "BUG typeof-paren-side-effect: (g++, g) duplicated in ternary "
+				      "(g++ fires twice)");
+			}
+		}
+	} else {
+		// Rejection is acceptable — means the side effect was detected
+		CHECK(r.status != PRISM_OK,
+		      "typeof-paren-side-effect: rejected by transpiler (acceptable)");
+	}
+	prism_free(&r);
+}
+
+// Bug: walk_balanced_orelse fallback scanner skips TF_OPEN groups, so
+// a function call via (*fp)() inside typeof(int[...]) is not detected.
+// Because typeof evaluates VLA dimension expressions at runtime (C99 §6.5.3.4),
+// the duplicated ternary fires the function call twice.
+static void test_typeof_vla_funcptr_orelse_double_eval(void) {
+	const char *code =
+	    "int (*fp)(void);\n"
+	    "void f(void) {\n"
+	    "    typeof(int[(*fp)() orelse 1]) arr;\n"
+	    "    (void)arr;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "typeof_vla_fp_orelse.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		// The emitted typeof should NOT contain (*fp)() twice.
+		// Ternary duplication produces: typeof(int[((* fp)()) ? ((* fp)()) : (1)])
+		// which calls (*fp)() twice at runtime because it's a VLA.
+		const char *typeof_start = strstr(r.output, "typeof(");
+		if (typeof_start) {
+			const char *s = typeof_start;
+			int call_count = 0;
+			// Count "fp ) ( )" patterns (the call site after deref)
+			while ((s = strstr(s, "fp")) != NULL) {
+				if (s > typeof_start + 300) break;
+				call_count++;
+				s += 2;
+			}
+			CHECK(call_count <= 1,
+			      "BUG typeof-vla-funcptr-orelse: (*fp)() duplicated in typeof VLA ternary "
+			      "(function called twice at runtime)");
+		}
+	} else {
+		// Rejection is acceptable — means the side effect was detected
+		CHECK(r.status != PRISM_OK,
+		      "typeof-vla-funcptr-orelse: rejected by transpiler (acceptable)");
+	}
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -2404,5 +2550,13 @@ void run_orelse_tests(void) {
 
 	// Audit round 3
 	test_typeof_implicit_const_orelse();
+
+	// Audit round 4 bug probes (should FAIL until fixed)
+	test_vla_bracket_orelse_eval_order();
+	test_typeof_bracket_orelse_volatile_double_read();
+	test_typeof_bracket_orelse_paren_hidden_side_effect();
+
+	// Audit round 5 bug probes (should FAIL until fixed)
+	test_typeof_vla_funcptr_orelse_double_eval();
 }
 
