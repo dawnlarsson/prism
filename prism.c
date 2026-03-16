@@ -267,22 +267,22 @@ static void signal_temps_clear(void) {
 	signal_temps_store(0);
 }
 
-static char **system_include_list; // Ordered list of includes
-static int system_include_capacity = 0;
+static PRISM_THREAD_LOCAL char **system_include_list; // Ordered list of includes
+static PRISM_THREAD_LOCAL int system_include_capacity = 0;
 
-static LabelInfo *label_table = NULL;
-static int label_count = 0;
-static int label_capacity = 0;
+static PRISM_THREAD_LOCAL LabelInfo *label_table = NULL;
+static PRISM_THREAD_LOCAL int label_count = 0;
+static PRISM_THREAD_LOCAL int label_capacity = 0;
 
 // Token emission - user-space buffered output for minimal syscall overhead
-static FILE *out_fp;
-static Token *last_emitted = NULL;
+static PRISM_THREAD_LOCAL FILE *out_fp;
+static PRISM_THREAD_LOCAL Token *last_emitted = NULL;
 
-static char out_buf[OUT_BUF_SIZE];
-static int out_buf_pos = 0;
-static bool use_linemarkers = false; // true = GCC linemarker "# N", false = C99 "#line N"
+static PRISM_THREAD_LOCAL char out_buf[OUT_BUF_SIZE];
+static PRISM_THREAD_LOCAL int out_buf_pos = 0;
+static PRISM_THREAD_LOCAL bool use_linemarkers = false; // true = GCC linemarker "# N", false = C99 "#line N"
 
-static TypedefTable typedef_table;
+static PRISM_THREAD_LOCAL TypedefTable typedef_table;
 
 typedef struct {
 	uint8_t scope_flags;
@@ -300,10 +300,10 @@ typedef struct {
 	int paren_depth;
 } ToplevelState;
 
-static ScopeNode scope_stack[4096];
-static DeferEntry defer_stack[2048];
-static int defer_count = 0;
-static CtrlState ctrl_state;
+static PRISM_THREAD_LOCAL ScopeNode scope_stack[4096];
+static PRISM_THREAD_LOCAL DeferEntry defer_stack[2048];
+static PRISM_THREAD_LOCAL int defer_count = 0;
+static PRISM_THREAD_LOCAL CtrlState ctrl_state;
 
 // Track variables that shadow a name captured by a defer in an enclosing scope.
 // The shadow is only dangerous if a control-flow exit pastes the defer while the
@@ -318,8 +318,8 @@ typedef struct {
 } DeferShadow;
 
 #define MAX_DEFER_SHADOWS 256
-static DeferShadow defer_shadows[MAX_DEFER_SHADOWS];
-static int defer_shadow_count = 0;
+static PRISM_THREAD_LOCAL DeferShadow defer_shadows[MAX_DEFER_SHADOWS];
+static PRISM_THREAD_LOCAL int defer_shadow_count = 0;
 
 // Forward declarations (only for functions used before their definition)
 static DeclResult parse_declarator(Token *tok, bool emit);
@@ -416,7 +416,7 @@ static uint32_t features_to_bits(PrismFeatures f) {
 }
 
 static const char *get_tmp_dir(void) {
-	static char buf[PATH_MAX];
+	static PRISM_THREAD_LOCAL char buf[PATH_MAX];
 	const char *t = getenv(TMPDIR_ENVVAR);
 #ifdef TMPDIR_ENVVAR_ALT
 	if (!t || !*t) t = getenv(TMPDIR_ENVVAR_ALT);
@@ -3788,19 +3788,21 @@ static Token *handle_close_brace(Token *tok) {
 	return tok;
 }
 
-// Build a copy of 'environ' with CC and PRISM_CC removed (cached)
+// Build a copy of 'environ' with CC and PRISM_CC removed (cached, thread-safe)
 static char **build_clean_environ(void) {
-	if (cached_clean_env) return cached_clean_env;
+	char **env = __atomic_load_n(&cached_clean_env, __ATOMIC_ACQUIRE);
+	if (env) return env;
 	int n = 0;
 	for (char **e = environ; *e; e++) n++;
-	char **env = malloc((n + 1) * sizeof(char *));
+	env = malloc((n + 1) * sizeof(char *));
 	if (!env) return NULL;
 	int j = 0;
 	for (char **e = environ; *e; e++) {
 		if (strncmp(*e, "CC=", 3) != 0 && strncmp(*e, "PRISM_CC=", 9) != 0) env[j++] = *e;
 	}
 	env[j] = NULL;
-	cached_clean_env = env;
+	// If another thread raced us, we leak a small allocation — acceptable.
+	__atomic_store_n(&cached_clean_env, env, __ATOMIC_RELEASE);
 	return env;
 }
 
@@ -3922,7 +3924,7 @@ static const char *cc_executable(const char *cc) {
 	while (*p && *p != ' ' && *p != '\t') p++;
 	if (*p == '\0') return cc;
 	size_t len = (size_t)(p - cc);
-	static char buf[PATH_MAX];
+	static PRISM_THREAD_LOCAL char buf[PATH_MAX];
 	if (len >= sizeof(buf)) len = sizeof(buf) - 1;
 	memcpy(buf, cc, len);
 	buf[len] = '\0';
@@ -4008,20 +4010,21 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 
 	if (msvc) {
 		// MSVC: /D concatenated with macro
-		static char pp_define_bufs[64][256];
+		static PRISM_THREAD_LOCAL char pp_define_bufs[64][256];
 		int buf_idx = 0;
-		for (int i = 0; i < ctx->extra_define_count && buf_idx < 64; i++) {
+		// Reserve 3 slots for __PRISM__, __PRISM_DEFER__, __PRISM_ZEROINIT__
+		for (int i = 0; i < ctx->extra_define_count && buf_idx < 61; i++) {
 			snprintf(pp_define_bufs[buf_idx], sizeof(pp_define_bufs[buf_idx]),
 				 "/D%s", ctx->extra_defines[i]);
 			args[(*argc)++] = pp_define_bufs[buf_idx++];
 		}
 		snprintf(pp_define_bufs[buf_idx], sizeof(pp_define_bufs[buf_idx]), "/D__PRISM__=1");
 		args[(*argc)++] = pp_define_bufs[buf_idx++];
-		if (FEAT(F_DEFER) && buf_idx < 64) {
+		if (FEAT(F_DEFER)) {
 			snprintf(pp_define_bufs[buf_idx], sizeof(pp_define_bufs[buf_idx]), "/D__PRISM_DEFER__=1");
 			args[(*argc)++] = pp_define_bufs[buf_idx++];
 		}
-		if (FEAT(F_ZEROINIT) && buf_idx < 64) {
+		if (FEAT(F_ZEROINIT)) {
 			snprintf(pp_define_bufs[buf_idx], sizeof(pp_define_bufs[buf_idx]), "/D__PRISM_ZEROINIT__=1");
 			args[(*argc)++] = pp_define_bufs[buf_idx++];
 		}
@@ -5094,6 +5097,36 @@ PRISM_API void prism_reset(void) {
 	}
 }
 
+// Free all per-thread resources. Call once per thread when done with Prism.
+// After this call, the thread must call prism_ctx_init() again to reuse Prism.
+PRISM_API void prism_thread_cleanup(void) {
+	if (!ctx) return;
+
+	if (out_fp) { out_flush(); fclose(out_fp); out_fp = NULL; }
+	out_buf_pos = 0;
+
+	tokenizer_teardown(true);
+
+	// Free heap-allocated typedef hashmap buckets
+	free(typedef_table.name_map.buckets);
+	memset(&typedef_table, 0, sizeof(typedef_table));
+
+	// Reset all TLS statics so a subsequent prism_ctx_init() starts clean
+	system_include_list = NULL;
+	system_include_capacity = 0;
+	label_table = NULL;
+	label_count = 0;
+	label_capacity = 0;
+	last_emitted = NULL;
+	use_linemarkers = false;
+	defer_count = 0;
+	defer_shadow_count = 0;
+	memset(&ctrl_state, 0, sizeof(ctrl_state));
+
+	free(ctx);
+	ctx = NULL;
+}
+
 static void apply_features(PrismFeatures features) {
 	ctx->features = features_to_bits(features);
 	ctx->extra_compiler = features.compiler;
@@ -5514,7 +5547,7 @@ static const char *get_install_path(void) {
 	// Termux: $PREFIX/bin is the user-writable bin directory
 	const char *prefix = getenv("PREFIX");
 	if (prefix && *prefix) {
-		static char buf[PATH_MAX];
+		static PRISM_THREAD_LOCAL char buf[PATH_MAX];
 		snprintf(buf, sizeof(buf), "%s/bin/prism", prefix);
 		return buf;
 	}
@@ -5864,9 +5897,9 @@ typedef struct {
 	bool use_preprocessed;
 } TempCompilePlan;
 
-// Returns pointer to a static buffer — not reentrant.
+// Returns pointer to a thread-local buffer.
 static const char *cli_output_path(const Cli *cli, const char *temp_exe, bool msvc) {
-	static char defobj[PATH_MAX];
+	static PRISM_THREAD_LOCAL char defobj[PATH_MAX];
 
 	if (cli->mode == CLI_RUN) return temp_exe;
 	if (cli->output) return cli->output;
@@ -5885,7 +5918,7 @@ static void argv_add_output(const char **args, int *argc, const char *out, bool 
 	if (!out) return;
 
 	if (msvc) {
-		static char flag[PATH_MAX + 8]; // cl.exe: /Fe:exe or /Fo:obj
+		static PRISM_THREAD_LOCAL char flag[PATH_MAX + 8]; // cl.exe: /Fe:exe or /Fo:obj
 		if (compile_only) snprintf(flag, sizeof(flag), "/Fo:%s", out);
 		else snprintf(flag, sizeof(flag), "/Fe:%s", out);
 		args[(*argc)++] = flag;

@@ -5,12 +5,12 @@
 
 Prism is a lightweight and very fast transpiler that makes C safer without changing how you write it.
 
-- **3096 tests** — edge cases, control flow, nightmares, trying hard to break Prism
+- **3121 tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Proper transpiler** — tracks typedefs, respects scope, catches unsafe patterns
 - **Opt-out features** — Disable parts of the transpiler, like zero-init, with CLI flags
 - **Drop-in overlay** — Use `CC=prism` in any build system — GCC-compatible flags pass through automatically
-- **Single Repo** — 7k lines, zero dependencies, easy to audit
+- **Single Repo** — zero dependencies, easy to audit, only need a C compiler
 
 Prism is a proper transpiler, not a preprocessor macro.
 * **Track Types:** A pre-scan pass registers every `typedef`, `enum` constant, and tag at file scope into a symbol table *before* transpilation begins — no heuristics, no suffix guessing. If it wasn't declared, it's not a type.
@@ -407,8 +407,6 @@ PrismFeatures prism_defaults(void);
 PrismResult   prism_transpile_file(const char *path, PrismFeatures features);
 void          prism_free(PrismResult *r);
 ```
-
-**Note:** Library mode is currently limited and **not thread-safe**. The transpiler uses global state internally. Call from a single thread only, or protect with a mutex.
 
 # Repo
 Apache 2.0 license (c) Dawn Larsson 2026

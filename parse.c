@@ -1,6 +1,14 @@
 // parse.c - C tokenizer. Expects preprocessed input (cc -E).
 // Based on https://github.com/rui314/chibicc (MIT License)
 
+// Thread-local storage qualifier: all per-invocation mutable state uses this
+// for thread safety. Each thread gets its own copy.
+#if defined(_MSC_VER)
+#define PRISM_THREAD_LOCAL __declspec(thread)
+#else
+#define PRISM_THREAD_LOCAL _Thread_local
+#endif
+
 #ifdef _WIN32
 #include "windows.c"
 #else
@@ -230,8 +238,6 @@ typedef struct {
 	uint8_t len;
 } KeywordEntry;
 
-static KeywordEntry keyword_cache[256];
-
 enum // Feature flags
 {
 	F_DEFER = 1,
@@ -315,34 +321,51 @@ typedef struct PrismContext {
 	int bracket_oe_count;              // Count of hoisted bracket orelse temps
 	int bracket_oe_cap;                // Capacity of bracket_oe_ids array
 	int bracket_oe_next;               // Next temp to consume during emit
+
+	// Token pools: parallel hot/cold arrays for cache-optimal access
+	Token *tp_pool;        // Hot: tag, next_idx, match_idx, len, kind, flags
+	TokenCold *tp_cold;    // Cold: loc_offset, line_no, file_idx
+	uint32_t tp_count;     // Next free index. 0 reserved as NULL sentinel.
+	uint32_t tp_cap;
+
+	// Keyword cache: O(1) lookup by hash slot
+	KeywordEntry kw_cache[256];
+	uint32_t keyword_cache_features; // features used when keyword_cache was built
+
+	// Digraph normalization targets (per-context for token loc comparison)
+	char dg_bracket_open[2];
+	char dg_bracket_close[2];
+	char dg_brace_open[2];
+	char dg_brace_close[2];
+	char dg_hash[2];
+	char dg_paste[3];
+
 #ifdef PRISM_LIB_MODE
 	char *active_membuf;	       // open_memstream buffer; freed on longjmp recovery
-	uint32_t keyword_cache_features; // features used when keyword_cache was built
 #endif
 } PrismContext;
 
-// Digraph normalization targets (static storage for token loc pointers)
-static char digraph_norm_bracket_open[] = "[";
-static char digraph_norm_bracket_close[] = "]";
-static char digraph_norm_brace_open[] = "{";
-static char digraph_norm_brace_close[] = "}";
-static char digraph_norm_hash[] = "#";
-static char digraph_norm_paste[] = "##";
+static PRISM_THREAD_LOCAL PrismContext *ctx = NULL;
 
 // True if loc points to a digraph normalization buffer (not the source buffer)
 static inline bool is_digraph_loc(char *loc) {
-	return loc == digraph_norm_bracket_open || loc == digraph_norm_bracket_close ||
-	       loc == digraph_norm_brace_open || loc == digraph_norm_brace_close ||
-	       loc == digraph_norm_hash || loc == digraph_norm_paste;
+	return loc == ctx->dg_bracket_open || loc == ctx->dg_bracket_close ||
+	       loc == ctx->dg_brace_open || loc == ctx->dg_brace_close ||
+	       loc == ctx->dg_hash || loc == ctx->dg_paste;
 }
 
-static PrismContext *ctx = NULL;
-
-// Token pools: parallel hot/cold arrays for cache-optimal access
-static Token *token_pool = NULL;      // Hot: tag, next_idx, match_idx, len, kind, flags
-static TokenCold *token_cold = NULL;  // Cold: loc_offset, line_no, file_idx
-static uint32_t token_count = 1; // 0 reserved as NULL sentinel
-static uint32_t token_cap = 0;
+// Convenience accessors for per-context state (go through thread-local ctx)
+#define token_pool  (ctx->tp_pool)
+#define token_cold  (ctx->tp_cold)
+#define token_count (ctx->tp_count)
+#define token_cap   (ctx->tp_cap)
+#define keyword_cache (ctx->kw_cache)
+#define digraph_norm_bracket_open  (ctx->dg_bracket_open)
+#define digraph_norm_bracket_close (ctx->dg_bracket_close)
+#define digraph_norm_brace_open    (ctx->dg_brace_open)
+#define digraph_norm_brace_close   (ctx->dg_brace_close)
+#define digraph_norm_hash          (ctx->dg_hash)
+#define digraph_norm_paste         (ctx->dg_paste)
 
 static noreturn void error(char *fmt, ...);
 static void hashmap_put(HashMap *map, char *key, int keylen, void *val);
@@ -434,14 +457,25 @@ static void arena_free(Arena *arena) {
 
 static void prism_ctx_init(void) {
 	if (ctx) return;
-	ctx = calloc(1, sizeof(PrismContext));
-	if (!ctx) {
+	PrismContext *c = calloc(1, sizeof(PrismContext));
+	if (!c) {
 		fprintf(stderr, "prism: out of memory\n");
 		exit(1);
 	}
-	ctx->main_arena.default_block_size = ARENA_DEFAULT_BLOCK_SIZE;
-	ctx->features = F_DEFER | F_ZEROINIT | F_LINE_DIR | F_FLATTEN | F_ORELSE;
-	ctx->at_stmt_start = true;
+	c->main_arena.default_block_size = ARENA_DEFAULT_BLOCK_SIZE;
+	c->features = F_DEFER | F_ZEROINIT | F_LINE_DIR | F_FLATTEN | F_ORELSE;
+	c->at_stmt_start = true;
+	c->tp_count = 1; // 0 reserved as NULL sentinel
+
+	// Initialize digraph normalization buffers
+	memcpy(c->dg_bracket_open, "[", 2);
+	memcpy(c->dg_bracket_close, "]", 2);
+	memcpy(c->dg_brace_open, "{", 2);
+	memcpy(c->dg_brace_close, "}", 2);
+	memcpy(c->dg_hash, "#", 2);
+	memcpy(c->dg_paste, "##", 3);
+
+	ctx = c;
 }
 
 static void token_pool_ensure(size_t need) {
@@ -881,9 +915,7 @@ static void init_keyword_map(void) {
 		while (keyword_cache[slot & 255].name) slot++;
 		keyword_cache[slot & 255] = (KeywordEntry){.name = entries[i].name, .value = val, .len = len};
 	}
-#ifdef PRISM_LIB_MODE
 	ctx->keyword_cache_features = ctx->features;
-#endif
 }
 
 static int read_ident(char *start) {
@@ -1658,9 +1690,7 @@ static Token *tokenize(File *file) {
 
 static void ensure_keyword_cache(void) {
 	if (!keyword_cache[0].name && !keyword_cache[1].name) init_keyword_map();
-#ifdef PRISM_LIB_MODE
 	else if (ctx->keyword_cache_features != ctx->features) init_keyword_map();
-#endif
 }
 
 static Token *tokenize_buffer(char *name, char *buf) {

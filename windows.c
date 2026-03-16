@@ -159,11 +159,12 @@ typedef int mode_t;
 // On fclose, *bufp and *sizep are updated.  Windows has no equivalent,
 // so we back the stream with a temp file and intercept fclose to read
 // the contents into a malloc'd buffer.
+// Thread-local storage for per-thread memstream state.
 
-static FILE *win32_memstream_fp;
-static char **win32_memstream_bufp;
-static size_t *win32_memstream_sizep;
-static char win32_memstream_path[MAX_PATH];
+static PRISM_THREAD_LOCAL FILE *win32_memstream_fp;
+static PRISM_THREAD_LOCAL char **win32_memstream_bufp;
+static PRISM_THREAD_LOCAL size_t *win32_memstream_sizep;
+static PRISM_THREAD_LOCAL char win32_memstream_path[MAX_PATH];
 
 // Grab the real CRT fclose BEFORE we macro-redirect it.
 static int (*win32_real_fclose)(FILE *) = fclose;
@@ -687,9 +688,8 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 }
 
 // Get the platform install path: %LOCALAPPDATA%\prism\prism.exe
-// Returns pointer to a static buffer — not reentrant.
 static const char *get_install_path(void) {
-	static char path[MAX_PATH];
+	static PRISM_THREAD_LOCAL char path[MAX_PATH];
 	if (path[0]) return path;
 	DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", path, MAX_PATH);
 	if (len == 0 || len >= MAX_PATH - 20) {

@@ -2,6 +2,7 @@
 #ifndef _WIN32
 #include <dirent.h>
 #include <sys/time.h>
+#include <pthread.h>
 #endif
 
 static void test_basic_transpile(void) {
@@ -320,6 +321,246 @@ static void test_typeof_memset_size_t_counter(void) {
 		      "size_t counter msvc: uses unsigned long long for loop counter");
 	}
 	prism_free(&r);
+}
+
+// ── Thread Safety Tests ──
+
+// Test: prism_thread_cleanup() followed by prism_ctx_init() works on the same
+// thread — no dangling pointers, clean state, successful re-transpilation.
+static void test_thread_cleanup_reinit_cycle(void) {
+	printf("\n--- Thread Cleanup + Reinit Cycle ---\n");
+
+	PrismFeatures features = prism_defaults();
+	const char *src = "int main(void) { int x; return 0; }\n";
+
+	// First transpile
+	PrismResult r1 = prism_transpile_source(src, "cycle1.c", features);
+	CHECK_EQ(r1.status, PRISM_OK, "cycle: first transpile OK");
+	CHECK(r1.output != NULL && r1.output_len > 0, "cycle: first output valid");
+	prism_free(&r1);
+
+	// Full cleanup — frees ctx, token pools, typedef hashmap, everything
+	prism_thread_cleanup();
+
+	// Reinit on the same thread
+	prism_ctx_init();
+
+	// Second transpile must work identically
+	PrismResult r2 = prism_transpile_source(src, "cycle2.c", features);
+	CHECK_EQ(r2.status, PRISM_OK, "cycle: second transpile after cleanup OK");
+	CHECK(r2.output != NULL && r2.output_len > 0, "cycle: second output valid");
+	CHECK(strstr(r2.output, "= {0}") != NULL || strstr(r2.output, "= 0") != NULL,
+	      "cycle: zero-init preserved after reinit");
+	prism_free(&r2);
+	prism_reset();
+}
+
+// Test: double prism_thread_cleanup() doesn't crash.
+static void test_thread_cleanup_idempotent(void) {
+	printf("\n--- Thread Cleanup Idempotent ---\n");
+
+	PrismFeatures features = prism_defaults();
+	PrismResult r = prism_transpile_source("int main(void) { return 0; }\n", "idem.c", features);
+	prism_free(&r);
+
+	prism_thread_cleanup();
+	prism_thread_cleanup(); // second call on NULL ctx — must not crash
+
+	// Recover for the rest of the test suite
+	prism_ctx_init();
+
+	r = prism_transpile_source("int f(void) { return 1; }\n", "idem2.c", features);
+	CHECK_EQ(r.status, PRISM_OK, "idempotent: transpile after double cleanup OK");
+	prism_free(&r);
+	prism_reset();
+}
+
+#ifndef _WIN32
+// Worker data for concurrent transpilation tests.
+typedef struct {
+	const char *source;
+	const char *filename;
+	PrismFeatures features;
+	PrismResult result;
+	int iterations;
+} ThreadWork;
+
+static void *thread_transpile_worker(void *arg) {
+	ThreadWork *w = (ThreadWork *)arg;
+	prism_ctx_init();
+	for (int i = 0; i < w->iterations; i++) {
+		PrismResult r = prism_transpile_source(w->source, w->filename, w->features);
+		if (i < w->iterations - 1) {
+			prism_free(&r);
+			prism_reset();
+		} else {
+			w->result = r; // keep last result for caller to inspect
+		}
+	}
+	prism_thread_cleanup();
+	return NULL;
+}
+
+// Test: two threads transpiling different sources simultaneously
+// produce correct, isolated outputs.
+static void test_concurrent_transpile_isolation(void) {
+	printf("\n--- Concurrent Transpile Isolation ---\n");
+
+	const char *src_a =
+	    "typedef struct { int ax; int ay; } PointA;\n"
+	    "int func_a(void) {\n"
+	    "    PointA p;\n"
+	    "    { defer p.ax = 1; }\n"
+	    "    return p.ax;\n"
+	    "}\n";
+
+	const char *src_b =
+	    "typedef struct { double bx; double by; } VecB;\n"
+	    "int func_b(void) {\n"
+	    "    VecB v;\n"
+	    "    { defer v.bx = 2.0; }\n"
+	    "    return (int)v.bx;\n"
+	    "}\n";
+
+	PrismFeatures features = prism_defaults();
+	features.line_directives = false; // cleaner output comparison
+
+	ThreadWork wa = {.source = src_a, .filename = "thread_a.c", .features = features, .iterations = 10};
+	ThreadWork wb = {.source = src_b, .filename = "thread_b.c", .features = features, .iterations = 10};
+
+	pthread_t ta, tb;
+	int ra = pthread_create(&ta, NULL, thread_transpile_worker, &wa);
+	int rb = pthread_create(&tb, NULL, thread_transpile_worker, &wb);
+	CHECK(ra == 0 && rb == 0, "concurrent: threads created");
+
+	pthread_join(ta, NULL);
+	pthread_join(tb, NULL);
+
+	CHECK_EQ(wa.result.status, PRISM_OK, "concurrent: thread A transpile OK");
+	CHECK_EQ(wb.result.status, PRISM_OK, "concurrent: thread B transpile OK");
+
+	// Thread A's output must reference PointA, not VecB
+	CHECK(strstr(wa.result.output, "PointA") != NULL, "concurrent: thread A has PointA");
+	CHECK(strstr(wa.result.output, "VecB") == NULL, "concurrent: thread A has no VecB");
+
+	// Thread B's output must reference VecB, not PointA
+	CHECK(strstr(wb.result.output, "VecB") != NULL, "concurrent: thread B has VecB");
+	CHECK(strstr(wb.result.output, "PointA") == NULL, "concurrent: thread B has no PointA");
+
+	// Both must have defer expansion
+	CHECK(strstr(wa.result.output, "p.ax = 1") != NULL, "concurrent: thread A defer expanded");
+	CHECK(strstr(wb.result.output, "v.bx = 2.0") != NULL, "concurrent: thread B defer expanded");
+
+	prism_free(&wa.result);
+	prism_free(&wb.result);
+}
+
+// Test: two threads with different feature flags produce correctly diverging output.
+static void test_concurrent_feature_isolation(void) {
+	printf("\n--- Concurrent Feature Flag Isolation ---\n");
+
+	const char *src =
+	    "int func(void) {\n"
+	    "    int x;\n"
+	    "    return x;\n"
+	    "}\n";
+
+	PrismFeatures feat_zi = prism_defaults();
+	feat_zi.zeroinit = true;
+	feat_zi.defer = false;
+	feat_zi.line_directives = false;
+
+	PrismFeatures feat_nozi = prism_defaults();
+	feat_nozi.zeroinit = false;
+	feat_nozi.defer = false;
+	feat_nozi.line_directives = false;
+
+	ThreadWork wa = {.source = src, .filename = "feat_a.c", .features = feat_zi, .iterations = 5};
+	ThreadWork wb = {.source = src, .filename = "feat_b.c", .features = feat_nozi, .iterations = 5};
+
+	pthread_t ta, tb;
+	pthread_create(&ta, NULL, thread_transpile_worker, &wa);
+	pthread_create(&tb, NULL, thread_transpile_worker, &wb);
+
+	pthread_join(ta, NULL);
+	pthread_join(tb, NULL);
+
+	CHECK_EQ(wa.result.status, PRISM_OK, "feature iso: zeroinit thread OK");
+	CHECK_EQ(wb.result.status, PRISM_OK, "feature iso: no-zeroinit thread OK");
+
+	// Thread A (zeroinit enabled) must have zero-init
+	CHECK(strstr(wa.result.output, "= 0") != NULL || strstr(wa.result.output, "= {0}") != NULL,
+	      "feature iso: zeroinit thread applied init");
+
+	// Thread B (zeroinit disabled) must NOT have zero-init
+	CHECK(strstr(wb.result.output, "= 0") == NULL && strstr(wb.result.output, "= {0}") == NULL,
+	      "feature iso: no-zeroinit thread has no init");
+
+	prism_free(&wa.result);
+	prism_free(&wb.result);
+}
+
+// Test: repeated cleanup/reinit cycles on worker threads with no memory growth.
+static void test_thread_cleanup_then_reuse_stress(void) {
+	printf("\n--- Thread Cleanup/Reuse Stress ---\n");
+
+	const char *src =
+	    "typedef struct { int v[16]; } Big;\n"
+	    "int work(void) {\n"
+	    "    Big b;\n"
+	    "    { defer b.v[0] = 0; }\n"
+	    "    for (int i; i < 16; i++) b.v[i] = i;\n"
+	    "    return b.v[0];\n"
+	    "}\n";
+
+	PrismFeatures features = prism_defaults();
+	features.line_directives = false;
+
+	// Do 50 full cleanup/reinit cycles on a worker thread
+	ThreadWork w = {.source = src, .filename = "reuse.c", .features = features, .iterations = 50};
+	pthread_t t;
+	pthread_create(&t, NULL, thread_transpile_worker, &w);
+	pthread_join(t, NULL);
+
+	CHECK_EQ(w.result.status, PRISM_OK, "reuse stress: 50 iterations OK");
+	CHECK(w.result.output != NULL && w.result.output_len > 0, "reuse stress: final output valid");
+	CHECK(strstr(w.result.output, "b.v[0] = 0") != NULL, "reuse stress: defer present in final output");
+
+	prism_free(&w.result);
+}
+
+#endif // _WIN32
+
+// Test: pp_define_bufs boundary — 61+ user -D flags don't corrupt the mandatory
+// __PRISM__ / __PRISM_DEFER__ / __PRISM_ZEROINIT__ defines.
+static void test_pp_define_bufs_boundary(void) {
+	printf("\n--- pp_define_bufs Boundary ---\n");
+
+	PrismFeatures features = prism_defaults();
+	features.defer = true;
+	features.zeroinit = true;
+
+	// Build 62 user defines (exceeds the old 64-slot limit)
+	const char *defs[62];
+	for (int i = 0; i < 62; i++) defs[i] = "PRISM_DUMMY=1";
+
+	features.defines = defs;
+	features.define_count = 62;
+
+	// This source uses __PRISM_DEFER__ and __PRISM_ZEROINIT__ which are
+	// injected by the preprocessor -D flags. If the bufs overflowed,
+	// these defines would be missing and the source wouldn't get features.
+	const char *src = "int f(void) { int x; return x; }\n";
+	PrismResult r = prism_transpile_source(src, "boundary.c", features);
+	CHECK_EQ(r.status, PRISM_OK, "define boundary: transpile OK");
+	// Zero-init should still work even with 62 user defines
+	CHECK(r.output != NULL, "define boundary: output exists");
+	if (r.output) {
+		CHECK(strstr(r.output, "= 0") != NULL || strstr(r.output, "= {0}") != NULL,
+		      "define boundary: zero-init still applied with 62 user -D flags");
+	}
+	prism_free(&r);
+	prism_reset();
 }
 
 static void test_memory_leak_stress(void) {
@@ -4776,6 +5017,16 @@ test_typeof_orelse_leak();
 	test_cc_split_quoting_bypass();
 	test_orelse_bracket_leak_in_return_defer();
 	test_cli_parse_unit();
+
+#ifndef _WIN32
+	test_thread_cleanup_reinit_cycle();
+	test_thread_cleanup_idempotent();
+	test_concurrent_transpile_isolation();
+	test_concurrent_feature_isolation();
+	test_thread_cleanup_then_reuse_stress();
+#endif
+
+	test_pp_define_bufs_boundary();
 
 	test_memory_leak_stress();
 }
