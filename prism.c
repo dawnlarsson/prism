@@ -848,6 +848,13 @@ static void emit_range(Token *start, Token *end) {
 	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) emit_tok(t);
 }
 
+// Like emit_range but skips TK_PREP_DIR tokens (for generated expressions
+// where preprocessor directives would be invalid, e.g. inside if-conditions).
+static void emit_range_no_prep(Token *start, Token *end) {
+	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t))
+		if (t->kind != TK_PREP_DIR) emit_tok(t);
+}
+
 // Like emit_range but processes zero-init/raw/orelse inside defer blocks.
 static void emit_deferred_range(Token *start, Token *end) {
 	bool saved_stmt_start = ctx->at_stmt_start;
@@ -2202,6 +2209,7 @@ static void emit_token_range_orelse(Token *start, Token *end) {
 static bool declarator_has_bracket_orelse(Token *start, Token *end) {
 	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
 		if (!match_ch(t, '[')) continue;
+		if (t->flags & TF_C23_ATTR) { t = tok_match(t); continue; }
 		Token *close = tok_match(t);
 		if (!close) continue;
 		Token *prev = t;
@@ -2235,6 +2243,7 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 
 	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
 		if (!match_ch(t, '[')) continue;
+		if (t->flags & TF_C23_ATTR) { t = tok_match(t); continue; }
 		Token *close = tok_match(t);
 		if (!close) continue;
 		if (bracket_count >= 32) break;
@@ -2277,9 +2286,9 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 			OUT_LIT(" = (");
 			emit_token_range(tok_next(brackets[i].open), brackets[i].orelse);
 			OUT_LIT(");");
-		} else if (i < first_orelse_idx) {
-			// Non-orelse bracket that precedes an orelse bracket:
-			// hoist to preserve eval order. Only needed for non-empty VLA dims.
+		} else {
+			// Non-orelse bracket in a declarator with orelse brackets:
+			// hoist to preserve left-to-right VLA evaluation order.
 			Token *dim_start = tok_next(brackets[i].open);
 			Token *dim_end = brackets[i].close;
 			// Skip empty brackets (e.g. [])
@@ -2377,7 +2386,8 @@ static Token *walk_balanced_orelse(Token *tok) {
 					  "in the LHS (would be evaluated twice); "
 					  "hoist the expression to a variable first");
 			// Function call: name followed by '(' — including inside parens
-			if (is_valid_varname(s) && !is_type_keyword(s)) {
+			// Also catch subscript calls like funcs[0]() where ']' precedes '('
+			if ((is_valid_varname(s) && !is_type_keyword(s)) || match_ch(s, ']')) {
 				Token *after_s = tok_next(s);
 				if (after_s && after_s != orelse_found && match_ch(after_s, '('))
 					error_tok(s, "'orelse' in array dimension / typeof with side effect "
@@ -4232,6 +4242,8 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 // consumed by cc -E and lost from un-flattened output unless we capture them.
 static void collect_source_defines(const char *input_file) {
 	ctx->source_define_count = 0;
+	ctx->source_defines = NULL;
+	ctx->source_define_cap = 0;
 	if (!input_file || FEAT(F_FLATTEN)) return;
 
 	FILE *f = fopen(input_file, "r");
@@ -4903,38 +4915,72 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 						// Hoist pre-processor directives
 						out_char(' ');
 						if (fallback_has_compound_literal) {
-							// Brace-free if: LHS = rhs; if (!t) t = (fb);
-							// Preserves compound literal scope in the enclosing block
-							// and reads the target only once (volatile-safe).
+							// Single-expression ternary for compound literals:
+							// (LHS = RHS) ? (void)0 : (void)(LHS = (fb));
+							// Preserves compound literal scope in the enclosing
+							// block (no artificial { } that would kill it), and
+							// is a single statement (safe in unbraced if/else).
+							OUT_LIT("(");
 							for (Token *t = bare_lhs_start; t != orelse_tok; t = tok_next(t)) {
 								if (t->kind == TK_PREP_DIR) continue;
 								emit_tok(t);
 							}
-							out_char(';');
-							OUT_LIT(" if (!");
-							emit_range(bare_lhs_start, bare_assign_eq);
-							OUT_LIT(")");
-							emit_range(bare_lhs_start, bare_assign_eq);
-							OUT_LIT(" = (");
+							OUT_LIT(") ? (void)0 : ");
 							tok = tok_next(orelse_tok);
 							int fd = 0;
+							// Check if this is the last orelse in the chain
+							bool has_chain = false;
+							{
+								Token *peek = tok;
+								int pd = 0;
+								while (peek->kind != TK_EOF) {
+									if (peek->flags & TF_OPEN) pd++;
+									else if (peek->flags & TF_CLOSE) pd--;
+									else if (pd == 0 && (match_ch(peek, ';') || match_ch(peek, ','))) break;
+									if (pd == 0 && is_orelse_keyword(peek)) { has_chain = true; break; }
+									peek = tok_next(peek);
+								}
+							}
+							if (!has_chain) {
+								OUT_LIT("(void)(");
+							} else {
+								OUT_LIT("(");
+							}
+							emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+							OUT_LIT(" = (");
 							while (tok->kind != TK_EOF) {
 								if (tok->flags & TF_OPEN) fd++;
 								else if (tok->flags & TF_CLOSE) fd--;
 								else if (fd == 0 && (match_ch(tok, ';') || match_ch(tok, ','))) break;
 								if (fd == 0 && is_orelse_keyword(tok)) {
-									OUT_LIT("); if (!");
-									emit_range(bare_lhs_start, bare_assign_eq);
-									OUT_LIT(")");
-									emit_range(bare_lhs_start, bare_assign_eq);
-									OUT_LIT(" = (");
+									OUT_LIT(")) ? (void)0 : ");
 									tok = tok_next(tok);
+									// Check for more orelse in the chain
+									has_chain = false;
+									{
+										Token *peek = tok;
+										int pd2 = 0;
+										while (peek->kind != TK_EOF) {
+											if (peek->flags & TF_OPEN) pd2++;
+											else if (peek->flags & TF_CLOSE) pd2--;
+											else if (pd2 == 0 && (match_ch(peek, ';') || match_ch(peek, ','))) break;
+											if (pd2 == 0 && is_orelse_keyword(peek)) { has_chain = true; break; }
+											peek = tok_next(peek);
+										}
+									}
+									if (!has_chain) {
+										OUT_LIT("(void)(");
+									} else {
+										OUT_LIT("(");
+									}
+									emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+									OUT_LIT(" = (");
 									continue;
 								}
 								emit_tok(tok);
 								tok = tok_next(tok);
 							}
-							OUT_LIT(");");
+							OUT_LIT("));");
 						} else {
 							// If-based: { LHS = rhs; if (!t) t = (fb); }
 							// Safe for volatile — no double evaluation.
@@ -4946,9 +4992,9 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 							}
 							out_char(';');
 							OUT_LIT(" if (!");
-							emit_range(bare_lhs_start, bare_assign_eq);
+							emit_range_no_prep(bare_lhs_start, bare_assign_eq);
 							OUT_LIT(")");
-							emit_range(bare_lhs_start, bare_assign_eq);
+							emit_range_no_prep(bare_lhs_start, bare_assign_eq);
 							OUT_LIT(" = (");
 							tok = tok_next(orelse_tok);
 							int fd = 0;
@@ -4958,9 +5004,9 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 								else if (fd == 0 && (match_ch(tok, ';') || match_ch(tok, ','))) break;
 								if (fd == 0 && is_orelse_keyword(tok)) {
 									OUT_LIT("); if (!");
-									emit_range(bare_lhs_start, bare_assign_eq);
+									emit_range_no_prep(bare_lhs_start, bare_assign_eq);
 									OUT_LIT(")");
-									emit_range(bare_lhs_start, bare_assign_eq);
+									emit_range_no_prep(bare_lhs_start, bare_assign_eq);
 									OUT_LIT(" = (");
 									tok = tok_next(tok);
 									continue;

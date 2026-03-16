@@ -4981,7 +4981,7 @@ static void test_make_temp_file_toctou_symlink(void) {
 	unlink(victim);
 }
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 // Bug: signal_temps_register uses a non-atomic load-check-store pattern.
 // Two threads reading the same index clobber each other's entry.
 typedef struct { int tid; pthread_barrier_t *barrier; } RaceArg;
@@ -5037,6 +5037,38 @@ static void test_signal_temps_register_race(void) {
 // in-file #define directives like _FILE_OFFSET_BITS.  The un-flatten path
 // reconstructs #include directives but never re-emits the user's #defines.
 // The backend compiler sees #include <stdio.h> without the ABI-altering macro.
+// Bug: When compiling multiple files, tokenizer_teardown(false) resets the arena
+// but does not clear ctx->source_defines / ctx->source_define_cap.  On the second
+// file, collect_source_defines writes through a dangling pointer into reused arena
+// memory, which tokenize_buffer then overwrites with File structs.  The result is
+// that emit_define_guarded dereferences garbage (e.g. the filename) as a macro name.
+static void test_multifile_arena_use_after_reset(void) {
+	const char *code_a = "#define BUG1_MAGIC_A 42\nint get_a(void) { return 42; }\n";
+	const char *code_b = "#define BUG1_MAGIC_B 99\nint get_b(void) { return 99; }\n";
+	char *path_a = create_temp_file(code_a);
+	char *path_b = create_temp_file(code_b);
+	CHECK(path_a && path_b, "create temp files for arena-reset test");
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = false;
+	// Transpile file A first — this populates source_defines on the arena
+	PrismResult ra = prism_transpile_file(path_a, feat);
+	prism_free(&ra);
+	// Transpile file B — arena was reset at end of file A, but source_defines
+	// pointer and cap were not cleared.  collect_source_defines writes through
+	// the dangling pointer, then tokenize_buffer overwrites it.
+	PrismResult rb = prism_transpile_file(path_b, feat);
+	if (rb.status == PRISM_OK && rb.output) {
+		CHECK(strstr(rb.output, "BUG1_MAGIC_B") != NULL,
+		      "BUG multifile-arena-use-after-reset: second file's #define lost "
+		      "(source_defines corrupted by arena reuse after tokenizer_teardown)");
+	} else {
+		CHECK(0, "BUG multifile-arena-use-after-reset: second file transpilation failed");
+	}
+	prism_free(&rb);
+	unlink(path_a); free(path_a);
+	unlink(path_b); free(path_b);
+}
+
 static void test_no_flatten_headers_abi_define_erasure(void) {
 	const char *code =
 	    "#define _FILE_OFFSET_BITS 64\n"
@@ -5230,8 +5262,10 @@ test_typeof_orelse_leak();
 	test_signal_temps_register_overflow();
 
 	// Audit round 5 bug probes (should FAIL until fixed)
-	test_make_temp_file_toctou_symlink();
 #ifndef _WIN32
+	test_make_temp_file_toctou_symlink();
+#endif
+#if !defined(_WIN32) && !defined(__APPLE__)
 	test_signal_temps_register_race();
 #endif
 
@@ -5240,4 +5274,9 @@ test_typeof_orelse_leak();
 
 	// Audit round 7 bug probes (should FAIL until fixed)
 	test_no_flatten_headers_abi_define_erasure();
+
+	// Audit round 8 bug probes (should FAIL until fixed)
+#ifndef _WIN32
+	test_multifile_arena_use_after_reset();
+#endif
 }

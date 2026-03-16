@@ -1738,10 +1738,11 @@ static void test_bare_orelse_compound_literal_ternary(void) {
 	CHECK_EQ(result.status, PRISM_OK, "bare orelse compound: transpiles OK");
 	CHECK(result.output != NULL, "bare orelse compound: output not NULL");
 
-	// The fallback should use an if-based pattern to avoid double-reads on volatile
-	// targets while keeping compound literals in the enclosing block scope.
-	CHECK(strstr(result.output, "if (!") != NULL,
-	      "bare orelse compound: uses if-based fallback pattern");
+	// The fallback should use either an if-based pattern or a single-expression
+	// ternary to keep compound literals in the enclosing block scope.
+	CHECK(strstr(result.output, "if (!") != NULL ||
+	      strstr(result.output, "(void)0") != NULL,
+	      "bare orelse compound: uses if-based or ternary fallback pattern");
 	// The compound literal should appear in the output
 	CHECK(strstr(result.output, "(int[]){1, 2, 3}") != NULL ||
 	      strstr(result.output, "(int[]){ 1, 2, 3 }") != NULL,
@@ -1770,11 +1771,25 @@ static void test_chained_bare_orelse(void) {
 	// The output must NOT contain the literal "orelse" keyword — that's not valid C.
 	CHECK(strstr(result.output, "orelse") == NULL,
 	      "chained bare orelse: no raw 'orelse' keyword in C output");
-	// Should produce two if-based fallbacks for the chain
-	const char *first_if = strstr(result.output, "if (!");
-	CHECK(first_if != NULL, "chained bare orelse: first if-based fallback present");
-	const char *second_if = first_if ? strstr(first_if + 5, "if (!") : NULL;
-	CHECK(second_if != NULL, "chained bare orelse: second if-based fallback for chain");
+	// Should produce two fallback stages for the chain (if-based or ternary)
+	bool has_if_chain = false;
+	{
+		const char *first_if = strstr(result.output, "if (!");
+		if (first_if) {
+			const char *second_if = strstr(first_if + 5, "if (!");
+			if (second_if) has_if_chain = true;
+		}
+	}
+	bool has_ternary_chain = false;
+	{
+		const char *first_t = strstr(result.output, "(void)0");
+		if (first_t) {
+			const char *second_t = strstr(first_t + 7, "(void)0");
+			if (second_t) has_ternary_chain = true;
+		}
+	}
+	CHECK(has_if_chain || has_ternary_chain,
+	      "chained bare orelse: two fallback stages present in chain");
 	// The compound literal should survive in the output
 	CHECK(strstr(result.output, "(int[]){42}") != NULL,
 	      "chained bare orelse: compound literal preserved");
@@ -1879,11 +1894,12 @@ static void test_bare_orelse_void_ternary_mismatch(void) {
 	CHECK_EQ(result.status, PRISM_OK, "void ternary: transpiles OK");
 	CHECK(result.output != NULL, "void ternary: output not NULL");
 
-	// The if-based pattern avoids the ternary void mismatch entirely.
-	// Instead of (void) casts in comma-ternary, we now use:
-	// if (!p) p = (fallback);
-	CHECK(strstr(result.output, "if (!") != NULL,
-	      "void ternary: uses if-based pattern (no void cast needed)");
+	// The emission pattern avoids the old comma-ternary void mismatch
+	// by using either an if-based pattern or a single-expression ternary
+	// with proper (void) casts.
+	CHECK(strstr(result.output, "if (!") != NULL ||
+	      strstr(result.output, "(void)0") != NULL,
+	      "void ternary: uses if-based or ternary pattern (no mismatch)");
 
 	prism_free(&result);
 	unlink(path);
@@ -2402,6 +2418,212 @@ static void test_typeof_vla_funcptr_orelse_double_eval(void) {
 	prism_free(&r);
 }
 
+// Bug: emit_bracket_orelse_temps only hoists non-orelse dimensions that
+// precede the FIRST orelse index.  When orelses are interleaved
+// (e.g. [a() orelse 1][b()][c() orelse 1]), dimensions between two orelses
+// are not hoisted, causing evaluation order a(), c(), b() instead of a(), b(), c().
+static void test_vla_interleaved_orelse_eval_order(void) {
+	const char *code =
+	    "int get_a(void);\n"
+	    "int get_b(void);\n"
+	    "int get_c(void);\n"
+	    "void f(void) {\n"
+	    "    int arr[get_a() orelse 1][get_b()][get_c() orelse 1];\n"
+	    "    (void)arr;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "interleave_vla.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		const char *in_func = strstr(r.output, "void f(");
+		if (in_func) {
+			// get_b must be hoisted to a _Prism_dim_ temp variable
+			// to preserve left-to-right evaluation order.
+			// If no dim temp exists, get_b() is left in the array decl
+			// and evaluated AFTER the hoisted orelse temps (wrong order).
+			const char *dim = strstr(in_func, "_Prism_dim_");
+			CHECK(dim != NULL,
+			      "BUG vla-interleaved-orelse: get_b() not hoisted between two "
+			      "orelse dims; eval order is a(),c(),b() instead of a(),b(),c()");
+		}
+	} else {
+		CHECK(r.status != PRISM_OK,
+		      "vla-interleaved-orelse: rejected by transpiler (acceptable)");
+	}
+	prism_free(&r);
+}
+
+// Bug: walk_balanced_orelse side-effect scanner checks for function calls by
+// looking for identifier+'(' or ')'+')'.  It completely misses function
+// pointers invoked via array subscript: funcs[0]().  The token before '(' is
+// ']', which is neither an identifier nor ')'.  The expression is duplicated
+// in the ternary fallback, calling the function twice.
+static void test_typeof_funcptr_array_orelse_double_eval(void) {
+	const char *code =
+	    "typedef int (*fn_t)(void);\n"
+	    "void f(fn_t *funcs) {\n"
+	    "    typeof(int[funcs[0]() orelse 1]) *p;\n"
+	    "    (void)p;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "funcptr_array.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		const char *typeof_start = strstr(r.output, "typeof(");
+		if (typeof_start) {
+			const char *s = typeof_start;
+			int call_count = 0;
+			while ((s = strstr(s, "funcs")) != NULL && s < typeof_start + 400) {
+				call_count++;
+				s += 5;
+			}
+			CHECK(call_count <= 1,
+			      "BUG typeof-funcptr-array-orelse: funcs[0]() duplicated in "
+			      "typeof ternary (side-effect scanner missed ']' before '(')");
+		}
+	} else {
+		// Rejection is acceptable — means the side effect was detected
+		CHECK(r.status != PRISM_OK,
+		      "typeof-funcptr-array-orelse: rejected by transpiler (acceptable)");
+	}
+	prism_free(&r);
+}
+
+// Bug: emit_bracket_orelse_temps uses match_ch(t, '[') to find array
+// dimensions but does not check TF_C23_ATTR.  A C23 [[ ... ]] attribute
+// between array dimensions is treated as a preceding non-orelse bracket
+// and hoisted into a _Prism_dim_ temp, producing garbage like:
+//   long long _Prism_dim_1 = ([ gnu :: aligned ( 8 ) ]);
+static void test_c23_attr_bracket_orelse_dim_hoist(void) {
+	const char *code =
+	    "int get_size(void);\n"
+	    "void f(void) {\n"
+	    "    int arr[2][[gnu::aligned(8)]][get_size() orelse 1];\n"
+	    "    (void)arr;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "c23attr_dim.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		// The [[]] attribute must NOT be hoisted as a dimension temp.
+		// If it is, we'll see _Prism_dim_ containing the attribute guts.
+		const char *dim = strstr(r.output, "_Prism_dim_");
+		if (dim) {
+			// A _Prism_dim_ for the real [2] dimension is fine.
+			// But there must be at most ONE _Prism_dim_ (the real dim).
+			// If the attribute bracket was also hoisted, there will be two.
+			const char *second = strstr(dim + 11, "_Prism_dim_");
+			CHECK(second == NULL,
+			      "BUG c23-attr-bracket-orelse: C23 [[]] attribute hoisted "
+			      "as dimension temp by emit_bracket_orelse_temps");
+		}
+	}
+	prism_free(&r);
+}
+
+// Bug: bare orelse with compound literal fallback inside an unbraced if/else
+// emits multiple statements without wrapping braces.  The `else` attaches
+// to the inner `if (!x)` instead of the outer `if (cond)`.
+//
+// Expected: the compound-literal bare orelse path wraps in { ... } so that
+// the outer `else` binds correctly.
+static void test_bare_orelse_compound_literal_unbraced_if(void) {
+	const char *code =
+	    "int get(void);\n"
+	    "void other(void);\n"
+	    "void f(int cond) {\n"
+	    "    int x;\n"
+	    "    if (cond)\n"
+	    "        x = get() orelse (int){42};\n"
+	    "    else\n"
+	    "        other();\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "compound_unbraced.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		// The else keyword must be preceded by a closing brace from a
+		// wrapper block, not by a bare semicolon.  If we see ";\nelse"
+		// or "; else" (ignoring whitespace), the compound-literal path
+		// failed to wrap its multi-statement expansion.
+		const char *e = strstr(r.output, "else");
+		if (e) {
+			// Walk backwards from 'else' over whitespace to find what
+			// precedes it.  Must be '}' (brace-wrapped) or ';' from a
+			// single-expression ternary — not a bare ';' after an
+			// unmatched if(!).
+			const char *p = e - 1;
+			while (p > r.output && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+				p--;
+			// With the ternary pattern, the statement ends with ';' and
+			// is a valid single statement for unbraced if/else.
+			// Verify there's no bare multi-statement 'if (!' before else.
+			bool has_bare_inner_if = false;
+			{
+				const char *ifp = strstr(r.output, "if (!");
+				if (ifp && ifp < e) {
+					// Check if the if(!) is inside braces
+					int braces = 0;
+					for (const char *c = r.output; c < ifp; c++) {
+						if (*c == '{') braces++;
+						else if (*c == '}') braces--;
+					}
+					// If we found if(!) in the compound literal section
+					// without a preceding '{', that's a bare multi-stmt
+					const char *outer_if = strstr(r.output, "if (cond");
+					if (!outer_if) outer_if = strstr(r.output, "if(cond");
+					if (outer_if && ifp > outer_if) {
+						// Check for wrapping braces between outer if and inner if
+						int inner_braces = 0;
+						for (const char *c = outer_if; c < ifp; c++) {
+							if (*c == '{') inner_braces++;
+							else if (*c == '}') inner_braces--;
+						}
+						if (inner_braces <= 0) has_bare_inner_if = true;
+					}
+				}
+			}
+			CHECK(!has_bare_inner_if,
+			      "BUG bare-orelse-compound-literal-unbraced-if: compound-literal "
+			      "fallback emits unwrapped statements; else binds to inner if");
+		}
+	}
+	prism_free(&r);
+}
+
+// Bug: emit_range does not filter TK_PREP_DIR tokens.  When a preprocessor
+// directive (e.g. #line) sits between the bare-orelse LHS tokens and the
+// assignment operator, emit_range copies it verbatim into the generated
+// `if (!expr)` condition, producing invalid C.
+//
+// Expected: the condition in the generated `if (! ...)` should contain no
+// preprocessor directives.
+static void test_bare_orelse_emit_range_prep_dir_leak(void) {
+	const char *code =
+	    "int get(void);\n"
+	    "void f(int *arr) {\n"
+	    "    arr[0]\n"
+	    "#line 10 \"expanded.h\"\n"
+	    "    = get() orelse 42;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "prepdir_leak.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		// Find the generated if-condition that tests the LHS.
+		const char *ifp = strstr(r.output, "if (!");
+		if (ifp) {
+			// Scan from `if (!` to the closing `)` for the leaked
+			// source-level directive text.  Synthetic #line markers
+			// emitted by emit_tok for line tracking are harmless
+			// (processed by the compiler before parsing), but an
+			// actual #line 10 "expanded.h" TK_PREP_DIR token
+			// embedded inline would be invalid.
+			const char *s = ifp;
+			const char *end = strchr(s, ')');
+			if (!end) end = s + 200;
+			int found_leak = 0;
+			for (const char *c = s; c < end - 10; c++) {
+				if (strncmp(c, "expanded.h", 10) == 0) { found_leak = 1; break; }
+			}
+			CHECK(!found_leak,
+			      "BUG bare-orelse-emit-range-prep-dir-leak: preprocessor "
+			      "directive leaked into if-condition via emit_range");
+		}
+	}
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -2558,5 +2780,14 @@ void run_orelse_tests(void) {
 
 	// Audit round 5 bug probes (should FAIL until fixed)
 	test_typeof_vla_funcptr_orelse_double_eval();
+
+	// Audit round 6 bug probes (should FAIL until fixed)
+	test_vla_interleaved_orelse_eval_order();
+	test_typeof_funcptr_array_orelse_double_eval();
+
+	// Audit round 7 bug probes (should FAIL until fixed)
+	test_bare_orelse_compound_literal_unbraced_if();
+	test_bare_orelse_emit_range_prep_dir_leak();
+	test_c23_attr_bracket_orelse_dim_hoist();
 }
 
