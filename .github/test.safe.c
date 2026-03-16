@@ -2730,7 +2730,7 @@ static void test_goto_over_for_init_bug(void) {
 		x += i;
 	}
 skip_for:
-	CHECK_EQ(x, 1, "BUG: goto over for-init should not be rejected");
+	CHECK_EQ(x, 1, "goto over for-init should not be rejected");
 }
 
 static void test_goto_over_for_init_braceless_bug(void) {
@@ -2740,7 +2740,7 @@ static void test_goto_over_for_init_braceless_bug(void) {
 	for (int i = 0; i < 5; i++)
 		x += i;
 skip_for2:
-	CHECK_EQ(x, 1, "BUG: goto over braceless for-init should not be rejected");
+	CHECK_EQ(x, 1, "goto over braceless for-init should not be rejected");
 }
 
 static void test_goto_over_multiple_for_init_bug(void) {
@@ -2754,7 +2754,7 @@ static void test_goto_over_multiple_for_init_bug(void) {
 		x += j;
 	}
 skip_all:
-	CHECK_EQ(x, 1, "BUG: goto over multiple for-inits should not be rejected");
+	CHECK_EQ(x, 1, "goto over multiple for-inits should not be rejected");
 }
 
 static void run_goto_over_for_init_bug_tests(void) {

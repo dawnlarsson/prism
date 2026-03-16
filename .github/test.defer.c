@@ -1971,7 +1971,7 @@ static void test_defer_varname_return_value_dropped(void) {
 	PrismResult r = prism_transpile_source(code, "defer_varname_return.c", prism_defaults());
 	/* If the bug is present, output contains 'return ;' */
 	CHECK(r.output == NULL || strstr(r.output, "return ;") == NULL,
-	      "BUG defer-varname: 'return defer;' must not become 'return ;'");
+	      "defer-varname: 'return defer;' must not become 'return ;'");
 	prism_free(&r);
 }
 
@@ -1992,10 +1992,10 @@ static void test_defer_label_duplication_bug(void) {
 		const char *first = strstr(r.output, "my_label:");
 		const char *second = first ? strstr(first + 1, "my_label:") : NULL;
 		CHECK(second == NULL,
-		      "BUG defer-label-dup: label inside defer pasted to multiple exit points");
+		      "defer-label-dup: label inside defer pasted to multiple exit points");
 	} else {
 		/* Rejection is also acceptable (label banned inside defer). */
-		CHECK(1, "BUG defer-label-dup: label inside defer pasted to multiple exit points");
+		CHECK(1, "defer-label-dup: label inside defer pasted to multiple exit points");
 	}
 	prism_free(&r);
 }
@@ -2126,7 +2126,7 @@ static void test_defer_body_bare_orelse_return_not_rejected(void) {
 	    "    };\n"
 	    "}\n",
 	    "defer_bare_orelse_return.c",
-	    "BUG defer-bare-orelse: 'return' inside defer via orelse must be rejected",
+	    "defer-bare-orelse: 'return' inside defer via orelse must be rejected",
 	    NULL);
 }
 
@@ -2166,7 +2166,7 @@ static void test_defer_vfork_funcptr_bypass(void) {
 	// Since it can't see through the indirection, this test documents the bypass.
 	// It should FAIL (status==OK, no error) until alias analysis is added.
 	CHECK(r.status != PRISM_OK,
-	"BUG defer-vfork-funcptr: vfork via function pointer bypasses defer safety");
+	"defer-vfork-funcptr: vfork via function pointer bypasses defer safety");
 	prism_free(&r);
 	*/
 }
@@ -2192,10 +2192,49 @@ static void test_defer_vfork_reference_false_positive(void) {
 	// The transpiler should ACCEPT this. Rejection is a false positive caused
 	// by the body scanner not distinguishing `return vfork;` from `vfork();`.
 	CHECK(r.status == PRISM_OK,
-	      "BUG defer-vfork-ref-false-positive: vfork pointer reference taints caller");
+	      "defer-vfork-ref-false-positive: vfork pointer reference taints caller");
 	prism_free(&r);
 }
 #endif
+
+void test_defer_backward_goto_into_scope_rejected(void) {
+	// Backward goto into a scope with defer should be rejected.
+	// Without this check, the defer cleanup fires on re-entry via goto,
+	// even though the defer's setup (e.g. malloc) was skipped → double-free.
+	check_defer_transpile_rejects(
+	    "void do_work(int *p);\n"
+	    "void *malloc(unsigned long);\n"
+	    "void free(void *);\n"
+	    "void f(void) {\n"
+	    "    {\n"
+	    "        int *p = malloc(10);\n"
+	    "        defer free(p);\n"
+	    "    target:\n"
+	    "        do_work(p);\n"
+	    "    }\n"
+	    "    goto target;\n"
+	    "}\n",
+	    "defer_backward_goto_into_scope.c",
+	    "backward goto into defer scope rejected",
+	    "skip over this defer");
+}
+
+void test_defer_shadow_in_for_init(void) {
+	// A variable declared in a for-init that shadows a name captured
+	// by an outer defer must be rejected when the for body contains an exit.
+	check_defer_transpile_rejects(
+	    "void foo(int);\n"
+	    "void f(void) {\n"
+	    "    int x = 1;\n"
+	    "    defer foo(x);\n"
+	    "    for (int x = 0; x < 10; x++) {\n"
+	    "        if (x == 3) return;\n"
+	    "    }\n"
+	    "}\n",
+	    "defer_shadow_for_init.c",
+	    "defer shadow in for-init rejected",
+	    "shadows");
+}
 
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
@@ -2300,6 +2339,8 @@ void run_defer_tests(void) {
 
 	test_defer_goto_forward();
 	test_defer_goto_into_scope_rejected();
+	test_defer_backward_goto_into_scope_rejected();
+	test_defer_shadow_in_for_init();
 
 	test_defer_backward_goto_sibling();
 

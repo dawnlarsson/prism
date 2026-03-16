@@ -1490,10 +1490,10 @@ static void test_orelse_deref_funcptr_call_double_eval(void) {
 		const char *p = r.output;
 		while ((p = strstr(p, "(*(&fp))()")) != NULL) { count++; p++; }
 		CHECK(count <= 1,
-		      "BUG orelse-deref-fp: indirect call (*(&fp))() evaluated multiple times");
+		      "orelse-deref-fp: indirect call (*(&fp))() evaluated multiple times");
 	} else {
 		/* Rejection is also acceptable. */
-		CHECK(1, "BUG orelse-deref-fp: indirect call (*(&fp))() evaluated multiple times");
+		CHECK(1, "orelse-deref-fp: indirect call (*(&fp))() evaluated multiple times");
 	}
 	prism_free(&r);
 }
@@ -1529,7 +1529,7 @@ static void test_orelse_const_funcptr_return_type_stripped(void) {
 			p++;
 		}
 		CHECK(!found_stripped,
-		      "BUG orelse-const-fp: const stripped from return type of func ptr temp");
+		      "orelse-const-fp: const stripped from return type of func ptr temp");
 	}
 	prism_free(&r);
 }
@@ -1920,7 +1920,7 @@ static void test_orelse_in_decl_ternary_garbled(void) {
 	    "}\n";
 	PrismResult r = prism_transpile_source(code, "orelse_ternary_decl.c", prism_defaults());
 	int garbled = r.output != NULL && strstr(r.output, " -1 : (int") != NULL;
-	CHECK(!garbled, "BUG orelse-in-ternary: ternary colon must not end up inside if block");
+	CHECK(!garbled, "orelse-in-ternary: ternary colon must not end up inside if block");
 	prism_free(&r);
 }
 
@@ -1936,7 +1936,7 @@ static void test_orelse_ident_as_varname(void) {
 	    "}\n";
 	PrismResult r = prism_transpile_source(code, "orelse_varname.c", prism_defaults());
 	CHECK(r.status == PRISM_OK,
-	      "BUG orelse-varname: variable named 'orelse' should transpile without error");
+	      "orelse-varname: variable named 'orelse' should transpile without error");
 	prism_free(&r);
 }
 
@@ -1955,7 +1955,7 @@ static void test_chained_orelse_in_typeof(void) {
 	CHECK_EQ(r.status, PRISM_OK, "chained orelse typeof: transpiles OK");
 	CHECK(r.output != NULL, "chained orelse typeof: output not NULL");
 	CHECK(strstr(r.output, "orelse") == NULL,
-	      "BUG chained-orelse-typeof: no raw 'orelse' in C output");
+	      "chained-orelse-typeof: no raw 'orelse' in C output");
 	prism_free(&r);
 }
 
@@ -1974,7 +1974,7 @@ static void test_orelse_leak_in_expr_parens(void) {
 	PrismResult r = prism_transpile_source(code, "orelse_leak_expr.c", prism_defaults());
 	int leaked = (r.status == PRISM_OK && r.output && strstr(r.output, "orelse") != NULL);
 	CHECK(!leaked,
-	      "BUG orelse-leak-expr: orelse inside parens in return+defer must be rejected, not emitted raw");
+	      "orelse-leak-expr: orelse inside parens in return+defer must be rejected, not emitted raw");
 	prism_free(&r);
 }
 
@@ -2002,7 +2002,7 @@ static void test_orelse_after_label_sweeps_label_into_cond(void) {
 		}
 	}
 	CHECK(!label_in_cond,
-	      "BUG orelse-after-label: label must not appear inside if(!(...)) condition");
+	      "orelse-after-label: label must not appear inside if(!(...)) condition");
 	prism_free(&r);
 }
 
@@ -2048,7 +2048,7 @@ static void test_orelse_struct_body_typeof_passthrough(void) {
 	// transform the orelse.  It must NOT pass "orelse" through verbatim.
 	if (r.status == PRISM_OK && r.output) {
 		CHECK(strstr(r.output, "orelse") == NULL,
-		      "BUG struct-body-typeof: literal 'orelse' must not appear in output");
+		      "struct-body-typeof: literal 'orelse' must not appear in output");
 	} else {
 		// If it errors, that's an acceptable resolution.
 		CHECK(r.status != PRISM_OK,
@@ -2073,7 +2073,7 @@ static void test_orelse_volatile_decl_double_read(void) {
 		// "r = r ? r :" reads r twice — condition + true branch.
 		// A correct transformation would read r only once (e.g. if (!r) r = 1;).
 		CHECK(strstr(r.output, "r = r ? r :") == NULL,
-		      "BUG volatile-decl-orelse: must not double-read volatile var via ternary");
+		      "volatile-decl-orelse: must not double-read volatile var via ternary");
 	}
 	prism_free(&r);
 }
@@ -2100,7 +2100,7 @@ static void test_orelse_volatile_bare_compound_literal(void) {
 		// The comma-ternary "r = get_reg(), (!r ?" writes then reads the
 		// volatile.  A safe version would use a temp or the if-based path.
 		CHECK(strstr(r.output, ", (!") == NULL,
-		      "BUG volatile-bare-compound-orelse: comma-ternary re-reads volatile");
+		      "volatile-bare-compound-orelse: comma-ternary re-reads volatile");
 	}
 	prism_free(&r);
 }
@@ -2125,7 +2125,7 @@ static void test_orelse_out_of_order_storage_class(void) {
 		// The garbage pattern emits the type specifier inside an if-condition:
 		// "int extern x)" as part of "if (!int extern x)".
 		CHECK(strstr(r.output, "int extern x)") == NULL,
-		      "BUG out-of-order-storage: must not emit 'if (! int extern x)' garbage");
+		      "out-of-order-storage: must not emit 'if (! int extern x)' garbage");
 	} else {
 		CHECK(r.status != PRISM_OK,
 		      "out-of-order-storage orelse: rejected by transpiler (acceptable)");
@@ -2150,7 +2150,7 @@ static void test_orelse_for_init_bracket_orelse_bypass(void) {
 	if (r.status == PRISM_OK && r.output) {
 		CHECK(strstr(r.output, "long long") == NULL ||
 		      strstr(r.output, "for") == NULL,
-		      "BUG for-init-bracket-orelse: must not hoist temp into for-loop header");
+		      "for-init-bracket-orelse: must not hoist temp into for-loop header");
 	} else {
 		CHECK(r.status != PRISM_OK,
 		      "for-init-bracket-orelse: rejected by transpiler (acceptable)");
@@ -2175,7 +2175,7 @@ static void test_orelse_static_decl_bare_assignment_collapse(void) {
 		// Check for the bare-assignment rewrite signature: "= ( 5)" with
 		// the space-padded fallback value, which only the bare scanner emits.
 		CHECK(strstr(r.output, "= ( 5)") == NULL,
-		      "BUG static-decl-orelse: must not emit bare-assignment 'if (! static int x)' garbage");
+		      "static-decl-orelse: must not emit bare-assignment 'if (! static int x)' garbage");
 	} else {
 		CHECK(r.status != PRISM_OK,
 		      "static-decl-orelse: rejected by transpiler (acceptable)");
@@ -2244,7 +2244,7 @@ static void test_orelse_bracket_oe_buffer_exhaustion(void) {
 		// function name appears twice in one ternary.
 		CHECK(strstr(r.output, "(get_dim") == NULL ||
 		      strstr(strstr(r.output, "(get_dim") + 1, "(get_dim") == NULL,
-		      "BUG bracket-oe-overflow: 17th dimension must not double-evaluate get_dim()");
+		      "bracket-oe-overflow: 17th dimension must not double-evaluate get_dim()");
 	} else {
 		// Hard error on overflow is also acceptable.
 		CHECK(r.status != PRISM_OK,
@@ -2267,7 +2267,7 @@ static void test_orelse_typeof_nested_bracket(void) {
 	CHECK_EQ(r.status, PRISM_OK, "typeof nested bracket orelse: transpiles OK");
 	if (r.output) {
 		CHECK(strstr(r.output, "orelse") == NULL,
-		      "BUG typeof-nested-bracket: literal 'orelse' must not appear in output");
+		      "typeof-nested-bracket: literal 'orelse' must not appear in output");
 	}
 	prism_free(&r);
 }
@@ -2298,7 +2298,7 @@ static void test_vla_bracket_orelse_eval_order(void) {
 				const char *a_in_func = strstr(in_func, "get_a");
 				// Hoist must come AFTER get_a's first use, not before
 				CHECK(hoist == NULL || a_in_func == NULL || hoist > a_in_func,
-				      "BUG vla-eval-order: get_b() orelse hoisted before get_a(), "
+				      "vla-eval-order: get_b() orelse hoisted before get_a(), "
 				      "violating C99 left-to-right VLA dimension evaluation");
 			}
 		}
@@ -2335,7 +2335,7 @@ static void test_typeof_bracket_orelse_volatile_double_read(void) {
 				s += 6;
 			}
 			CHECK(count <= 1,
-			      "BUG typeof-volatile-bracket: volatile *hw_reg duplicated in ternary "
+			      "typeof-volatile-bracket: volatile *hw_reg duplicated in ternary "
 			      "(double hardware read)");
 		}
 	} else {
@@ -2368,7 +2368,7 @@ static void test_typeof_bracket_orelse_paren_hidden_side_effect(void) {
 				const char *second = strstr(first + 3, "g ++");
 				if (!second) second = strstr(first + 3, "g++");
 				CHECK(second == NULL,
-				      "BUG typeof-paren-side-effect: (g++, g) duplicated in ternary "
+				      "typeof-paren-side-effect: (g++, g) duplicated in ternary "
 				      "(g++ fires twice)");
 			}
 		}
@@ -2407,7 +2407,7 @@ static void test_typeof_vla_funcptr_orelse_double_eval(void) {
 				s += 2;
 			}
 			CHECK(call_count <= 1,
-			      "BUG typeof-vla-funcptr-orelse: (*fp)() duplicated in typeof VLA ternary "
+			      "typeof-vla-funcptr-orelse: (*fp)() duplicated in typeof VLA ternary "
 			      "(function called twice at runtime)");
 		}
 	} else {
@@ -2441,7 +2441,7 @@ static void test_vla_interleaved_orelse_eval_order(void) {
 			// and evaluated AFTER the hoisted orelse temps (wrong order).
 			const char *dim = strstr(in_func, "_Prism_dim_");
 			CHECK(dim != NULL,
-			      "BUG vla-interleaved-orelse: get_b() not hoisted between two "
+			      "vla-interleaved-orelse: get_b() not hoisted between two "
 			      "orelse dims; eval order is a(),c(),b() instead of a(),b(),c()");
 		}
 	} else {
@@ -2474,7 +2474,7 @@ static void test_typeof_funcptr_array_orelse_double_eval(void) {
 				s += 5;
 			}
 			CHECK(call_count <= 1,
-			      "BUG typeof-funcptr-array-orelse: funcs[0]() duplicated in "
+			      "typeof-funcptr-array-orelse: funcs[0]() duplicated in "
 			      "typeof ternary (side-effect scanner missed ']' before '(')");
 		}
 	} else {
@@ -2508,7 +2508,7 @@ static void test_c23_attr_bracket_orelse_dim_hoist(void) {
 			// If the attribute bracket was also hoisted, there will be two.
 			const char *second = strstr(dim + 11, "_Prism_dim_");
 			CHECK(second == NULL,
-			      "BUG c23-attr-bracket-orelse: C23 [[]] attribute hoisted "
+			      "c23-attr-bracket-orelse: C23 [[]] attribute hoisted "
 			      "as dimension temp by emit_bracket_orelse_temps");
 		}
 	}
@@ -2576,7 +2576,7 @@ static void test_bare_orelse_compound_literal_unbraced_if(void) {
 				}
 			}
 			CHECK(!has_bare_inner_if,
-			      "BUG bare-orelse-compound-literal-unbraced-if: compound-literal "
+			      "bare-orelse-compound-literal-unbraced-if: compound-literal "
 			      "fallback emits unwrapped statements; else binds to inner if");
 		}
 	}
@@ -2617,8 +2617,54 @@ static void test_bare_orelse_emit_range_prep_dir_leak(void) {
 				if (strncmp(c, "expanded.h", 10) == 0) { found_leak = 1; break; }
 			}
 			CHECK(!found_leak,
-			      "BUG bare-orelse-emit-range-prep-dir-leak: preprocessor "
+			      "bare-orelse-emit-range-prep-dir-leak: preprocessor "
 			      "directive leaked into if-condition via emit_range");
+		}
+	}
+	prism_free(&r);
+}
+
+static void test_block_orelse_breaks_else_binding(void) {
+	/* BUG: block-form bare orelse emits { if (!(...)) { ... } } but the
+	 * user's trailing semicolon remains in the token stream, producing
+	 * "} ;" which acts as an empty statement, severing if/else binding.
+	 * The downstream C compiler fails with "'else' without previous 'if'". */
+	const char *code =
+	    "int do_init(void);\n"
+	    "void log_msg(void);\n"
+	    "void continue_work(void);\n"
+	    "void f(int cond) {\n"
+	    "    if (cond)\n"
+	    "        do_init() orelse { log_msg(); return; };\n"
+	    "    else\n"
+	    "        continue_work();\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "block_orelse_else.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "block-orelse-else: transpilation succeeds");
+	if (r.status == PRISM_OK && r.output) {
+		/* The trailing ';' after the orelse guard close must not appear
+		 * as a bare statement between '}' and 'else'. Find standalone
+		 * 'else' keyword (not the 'else' inside 'orelse'). */
+		const char *e = r.output;
+		const char *found_else = NULL;
+		while ((e = strstr(e, "else")) != NULL) {
+			/* Skip if part of 'orelse' */
+			if (e > r.output && *(e - 1) != ' ' && *(e - 1) != '\n' &&
+			    *(e - 1) != '\t' && *(e - 1) != '}' && *(e - 1) != ';') {
+				e += 4;
+				continue;
+			}
+			found_else = e;
+			break;
+		}
+		if (found_else) {
+			const char *p = found_else - 1;
+			while (p > r.output && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+				p--;
+			/* Before 'else', we should see '}' (guard close), not ';'. */
+			CHECK(*p != ';',
+			      "block-orelse-else: trailing semicolon severs else binding");
 		}
 	}
 	prism_free(&r);
@@ -2789,5 +2835,8 @@ void run_orelse_tests(void) {
 	test_bare_orelse_compound_literal_unbraced_if();
 	test_bare_orelse_emit_range_prep_dir_leak();
 	test_c23_attr_bracket_orelse_dim_hoist();
+
+	// Audit round 8: block-form orelse else binding
+	test_block_orelse_breaks_else_binding();
 }
 

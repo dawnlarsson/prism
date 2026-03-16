@@ -2332,20 +2332,20 @@ static void test_file_c23_n3322_local_extern_generic_leak(void) {
 	    "int main(void) { return 0; }\n";
 
 	char *path = create_temp_file(code);
-	CHECK(path != NULL, "BUG n3322 local extern: create temp file");
+	CHECK(path != NULL, "n3322 local extern: create temp file");
 	if (path) {
 		PrismResult r = prism_transpile_file(path, prism_defaults());
 		CHECK(r.status == PRISM_OK,
-		      "BUG n3322 local extern: transpiles OK");
+		      "n3322 local extern: transpiles OK");
 		if (r.output) {
 			/* _Generic must NOT appear in declaration context.
 			 * Currently block_depth>0 bypasses the rewrite. */
 			CHECK(strstr(r.output, "_Generic") == NULL,
-			      "BUG n3322-local-extern: _Generic leaks into local extern decl (block_depth>0 bypass)");
+			      "n3322-local-extern: _Generic leaks into local extern decl (block_depth>0 bypass)");
 
 			check_transpiled_output_compiles(
 			    r.output, "-std=gnu2x",
-			    "BUG n3322-local-extern: transpiled output compiles in gnu2x");
+			    "n3322-local-extern: transpiled output compiles in gnu2x");
 		}
 		prism_free(&r);
 		unlink(path);
@@ -4929,7 +4929,7 @@ static void test_signal_temps_register_overflow(void) {
 
 	// Entry 65 (index 64) must not be silently dropped
 	CHECK(signal_temps_load() > 64,
-	      "BUG signal_temps_overflow: file 65 silently dropped from cleanup tracking");
+	      "signal_temps_overflow: file 65 silently dropped from cleanup tracking");
 
 	// Restore
 	signal_temps_clear();
@@ -4974,7 +4974,7 @@ static void test_make_temp_file_toctou_symlink(void) {
 	if (check) { fgets(buf, sizeof(buf), check); fclose(check); }
 
 	CHECK(strstr(buf, "HIJACKED") == NULL,
-	      "BUG toctou-symlink: fopen after make_temp_file follows symlink, "
+	      "toctou-symlink: fopen after make_temp_file follows symlink, "
 	      "overwriting arbitrary file (CWE-367)");
 
 	unlink(path);
@@ -5024,7 +5024,7 @@ static void test_signal_temps_register_race(void) {
 	// With 8 barrier-synchronized threads over 10 runs, non-atomic
 	// load-check-store will lose entries in most runs.
 	CHECK_EQ(races, 0,
-	         "BUG signal_temps_race: concurrent register loses entries "
+	         "signal_temps_race: concurrent register loses entries "
 	         "(non-atomic load-check-store)");
 }
 #endif
@@ -5059,10 +5059,10 @@ static void test_multifile_arena_use_after_reset(void) {
 	PrismResult rb = prism_transpile_file(path_b, feat);
 	if (rb.status == PRISM_OK && rb.output) {
 		CHECK(strstr(rb.output, "BUG1_MAGIC_B") != NULL,
-		      "BUG multifile-arena-use-after-reset: second file's #define lost "
+		      "multifile-arena-use-after-reset: second file's #define lost "
 		      "(source_defines corrupted by arena reuse after tokenizer_teardown)");
 	} else {
-		CHECK(0, "BUG multifile-arena-use-after-reset: second file transpilation failed");
+		CHECK(0, "multifile-arena-use-after-reset: second file transpilation failed");
 	}
 	prism_free(&rb);
 	unlink(path_a); free(path_a);
@@ -5083,7 +5083,7 @@ static void test_no_flatten_headers_abi_define_erasure(void) {
 		// The output must contain _FILE_OFFSET_BITS so the backend
 		// compiler sees it before the re-emitted #include.
 		CHECK(strstr(r.output, "_FILE_OFFSET_BITS") != NULL,
-		      "BUG no-flatten-abi-erasure: #define _FILE_OFFSET_BITS lost "
+		      "no-flatten-abi-erasure: #define _FILE_OFFSET_BITS lost "
 		      "after cc -E; un-flattened output omits ABI-altering macro");
 	}
 	prism_free(&r);
@@ -5100,7 +5100,7 @@ static void test_generic_decl_rewrite_destroys_dispatch(void) {
 	PrismResult r1 = prism_transpile_source(code1, "generic_decl_p1.c", prism_defaults());
 	if (r1.status == PRISM_OK && r1.output) {
 		CHECK(strstr(r1.output, "_Generic") != NULL,
-		      "BUG generic-decl-rewrite-p1: _Generic dispatch erased "
+		      "generic-decl-rewrite-p1: _Generic dispatch erased "
 		      "(first branch hardcoded, type dispatch destroyed)");
 	}
 	prism_free(&r1);
@@ -5112,7 +5112,7 @@ static void test_generic_decl_rewrite_destroys_dispatch(void) {
 	PrismResult r2 = prism_transpile_source(code2, "generic_decl_p2.c", prism_defaults());
 	if (r2.status == PRISM_OK && r2.output) {
 		CHECK(strstr(r2.output, "_Generic") != NULL,
-		      "BUG generic-decl-rewrite-p2: _Generic dispatch erased "
+		      "generic-decl-rewrite-p2: _Generic dispatch erased "
 		      "(last identifier hardcoded, type dispatch destroyed)");
 	}
 	prism_free(&r2);
@@ -5128,7 +5128,7 @@ static void test_generic_decl_rewrite_destroys_dispatch(void) {
 		const char *body = strstr(r3.output, "void test");
 		if (body) {
 			CHECK(strstr(body, "_Generic") != NULL,
-			      "BUG generic-member-rewrite: _Generic dispatch erased "
+			      "generic-member-rewrite: _Generic dispatch erased "
 			      "(first branch hardcoded in member context)");
 		}
 	}

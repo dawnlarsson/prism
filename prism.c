@@ -341,6 +341,7 @@ static Token *emit_expr_to_semicolon(Token *tok);
 static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bool has_volatile, Token *stop_comma);
 static Token *emit_return_body(Token *tok, Token *stop);
 static Token *try_zero_init_decl(Token *tok);
+static Token *find_bare_orelse(Token *tok);
 static Token *decl_noise(Token *tok, bool emit);
 static Token *walk_balanced(Token *tok, bool emit);
 static Token *walk_balanced_orelse(Token *tok);
@@ -582,8 +583,21 @@ static void emit_define_guarded(const char *def) {
 }
 
 // Emit collected #include directives with necessary feature test macros
-static void emit_system_includes(void) {
-	if (ctx->system_include_count == 0) return;
+// Emit defines that were consumed by cc -E and need to be re-emitted
+// in non-flatten mode.  Called unconditionally (even without system includes)
+// so ABI-altering macros like _FILE_OFFSET_BITS are preserved.
+static void emit_consumed_defines(void) {
+	bool any = ctx->extra_define_count > 0 || ctx->source_define_count > 0;
+
+	// Check for CLI -D flags in compiler_flags
+	if (!any) {
+		for (int i = 0; i < ctx->extra_compiler_flags_count; i++) {
+			const char *f = ctx->extra_compiler_flags[i];
+			if (f[0] == '-' && f[1] == 'D') { any = true; break; }
+		}
+	}
+
+	if (!any && ctx->system_include_count == 0) return;
 
 	// Emit user-specified API defines (take priority over built-in feature test macros)
 	for (int i = 0; i < ctx->extra_define_count; i++)
@@ -611,6 +625,12 @@ static void emit_system_includes(void) {
 		"#ifndef _POSIX_C_SOURCE\n#define _POSIX_C_SOURCE 200809L\n#endif\n"
 		"#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n"
 		"#endif\n\n");
+}
+
+static void emit_system_includes(void) {
+	emit_consumed_defines();
+
+	if (ctx->system_include_count == 0) return;
 
 	emit_system_header_diag_push();
 
@@ -855,44 +875,9 @@ static void emit_range_no_prep(Token *start, Token *end) {
 		if (t->kind != TK_PREP_DIR) emit_tok(t);
 }
 
-// Like emit_range but processes zero-init/raw/orelse inside defer blocks.
-static void emit_deferred_range(Token *start, Token *end) {
-	bool saved_stmt_start = ctx->at_stmt_start;
-	CtrlState saved_ctrl = ctrl_state;
-	ctrl_state.pending = false;
-	ctrl_state.pending_for_paren = false;
-	ctrl_state.parens_just_closed = false;
-	ctrl_state.scope_flags = 0;
-	ctrl_state.pending_orelse_guard = false;
-	ctrl_state.brace_depth = 0;
-
-	ctx->at_stmt_start = true;
-
-	for (Token *t = start; t && t != end && t->kind != TK_EOF;) {
-		if (ctx->at_stmt_start && FEAT(F_ZEROINIT)) {
-			Token *next = try_zero_init_decl(t);
-			if (next) {
-				t = next;
-				ctx->at_stmt_start = true;
-				continue;
-			}
-		}
-		ctx->at_stmt_start = false;
-
-		if (t->tag & TT_STRUCTURAL) {
-			emit_tok(t);
-			t = tok_next(t);
-			ctx->at_stmt_start = true;
-			continue;
-		}
-
-		emit_tok(t);
-		t = tok_next(t);
-	}
-
-	ctx->at_stmt_start = saved_stmt_start;
-	ctrl_state = saved_ctrl;
-}
+// Forward declarations — implementations below find_bare_orelse.
+static Token *emit_deferred_bare_orelse(Token *t, Token *end);
+static void emit_deferred_range(Token *start, Token *end);
 
 static void emit_defers_ex(DeferEmitMode mode, int stop_depth) {
 	if (ctx->block_depth <= 0) return;
@@ -942,6 +927,8 @@ static void check_defer_var_shadow(Token *var_name) {
 	ScopeNode *blk = scope_block_top();
 	if (!blk) return;
 	int outer_defer_end = blk->defer_start_idx;
+	if (in_for_init() && outer_defer_end <= 0)
+		outer_defer_end = defer_count;
 	if (outer_defer_end <= 0) return;
 	char *name = tok_loc(var_name);
 	int nlen = var_name->len;
@@ -957,7 +944,7 @@ static void check_defer_var_shadow(Token *var_name) {
 						  MAX_DEFER_SHADOWS);
 				defer_shadows[defer_shadow_count++] = (DeferShadow){
 						.name = name, .len = nlen,
-						.block_depth = ctx->block_depth,
+						.block_depth = ctx->block_depth + (in_for_init() ? 1 : 0),
 						.var_tok = var_name,
 						.defer_idx = i,
 					};
@@ -1430,6 +1417,23 @@ static Token *backward_goto_skips_decl(Token *goto_tok, LabelInfo *info) {
 			}
 		}
 		is_stmt_start = false;
+	}
+	return NULL;
+}
+
+static Token *backward_goto_skips_defer(Token *goto_tok, LabelInfo *info) {
+	if (!FEAT(F_DEFER) || !info || tok_loc(info->tok) >= tok_loc(goto_tok)) return NULL;
+
+	if (!info->block_open) return NULL;
+
+	Token *block_close = tok_match(info->block_open);
+	if (block_close && tok_loc(goto_tok) < tok_loc(block_close) && tok_loc(goto_tok) > tok_loc(info->block_open))
+		return NULL;
+
+	for (Token *t = tok_next(info->block_open); t && t != info->tok && t->kind != TK_EOF; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) { t = tok_match(t); continue; }
+		if ((t->tag & TT_DEFER) && !is_known_typedef(t))
+			return t;
 	}
 	return NULL;
 }
@@ -2172,8 +2176,42 @@ static Token *walk_balanced(Token *tok, bool emit) {
 	Token *end = tok_match(tok);
 	if (!end) return tok_next(tok);
 	if (emit) {
-		for (Token *t = tok; t != tok_next(end) && t->kind != TK_EOF; t = tok_next(t))
+		for (Token *t = tok; t != tok_next(end) && t->kind != TK_EOF;) {
+			// Statement expression ({...}): recurse with processing
+			if ((t->flags & TF_OPEN) && t != tok && match_ch(t, '(') &&
+			    tok_next(t) && match_ch(tok_next(t), '{')) {
+				emit_tok(t); // '('
+				Token *se_end = tok_match(t);
+				Token *inner = tok_next(t); // '{'
+				int bd = 0;
+				bool ss = false;
+				while (inner && inner != se_end && inner->kind != TK_EOF) {
+					if (match_ch(inner, '{')) { bd++; ss = true; }
+					else if (match_ch(inner, '}')) bd--;
+					if (ss && FEAT(F_ZEROINIT)) {
+						Token *next = try_zero_init_decl(inner);
+						if (next) { inner = next; ss = true; continue; }
+						ss = false;
+					}
+					if (inner->tag & TT_STRUCTURAL) ss = true;
+					// Strip raw keyword
+					if (__builtin_expect((inner->flags & TF_RAW) && !is_known_typedef(inner), 0)) {
+						Token *after_raw = skip_noise(tok_next(inner));
+						if (is_raw_declaration_context(after_raw)) {
+							inner = tok_next(inner);
+							continue;
+						}
+					}
+					emit_tok(inner);
+					inner = tok_next(inner);
+				}
+				if (se_end) { emit_tok(se_end); t = tok_next(se_end); } // ')'
+				else t = inner;
+				continue;
+			}
 			emit_tok(t);
+			t = tok_next(t);
+		}
 	}
 	return tok_next(end);
 }
@@ -3801,6 +3839,13 @@ static Token *handle_goto_keyword(Token *tok) {
 				const char *msg = "goto '%.*s' would skip over this defer statement";
 				if (FEAT(F_WARN_SAFETY)) warn_tok(skip.skipped_defer, msg, tok->len, tok_loc(tok));
 				else error_tok(skip.skipped_defer, msg, tok->len, tok_loc(tok));
+			} else {
+				Token *back_defer = backward_goto_skips_defer(goto_tok, info);
+				if (back_defer) {
+					const char *msg = "goto '%.*s' would skip over this defer statement";
+					if (FEAT(F_WARN_SAFETY)) warn_tok(back_defer, msg, tok->len, tok_loc(tok));
+					else error_tok(back_defer, msg, tok->len, tok_loc(tok));
+				}
 			}
 			check_goto_decl_safety(&skip, goto_tok, tok, info);
 
@@ -3951,7 +3996,13 @@ static Token *handle_close_brace(Token *tok) {
 	emit_tok(tok);
 
 	// Close dangling-else guard brace if flagged
-	if (close_guard) OUT_LIT(" }");
+	if (close_guard) {
+		OUT_LIT(" }");
+		// Consume the user's trailing ';' after 'orelse { ... };' to prevent
+		// it from becoming a bare empty statement that severs if/else binding.
+		if (tok_next(tok) && match_ch(tok_next(tok), ';'))
+			tok = tok_next(tok);
+	}
 
 	tok = tok_next(tok);
 	ctx->at_stmt_start = true;
@@ -4241,6 +4292,9 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 // These ABI-altering macros (e.g. _FILE_OFFSET_BITS, _LARGEFILE_SOURCE) are
 // consumed by cc -E and lost from un-flattened output unless we capture them.
 static void collect_source_defines(const char *input_file) {
+	// Free any previously-allocated define strings from a prior call
+	for (int i = 0; i < ctx->source_define_count; i++)
+		free(ctx->source_defines[i]);
 	ctx->source_define_count = 0;
 	ctx->source_defines = NULL;
 	ctx->source_define_cap = 0;
@@ -4567,6 +4621,285 @@ static Token *find_bare_orelse(Token *tok) {
 		prev = s;
 	}
 	return NULL;
+}
+
+// ── Deferred range processing (implementation) ──
+// emit_deferred_bare_orelse + emit_deferred_range.
+// Placed here because they depend on find_bare_orelse, is_known_typedef,
+// is_raw_declaration_context, and other helpers defined above.
+
+// Process a bare expression orelse inside a deferred range.
+// Returns the token after the statement, or NULL if no orelse was found.
+static Token *emit_deferred_bare_orelse(Token *t, Token *end) {
+	Token *orelse_tok = find_bare_orelse(t);
+	if (!orelse_tok || (end && tok_loc(orelse_tok) >= tok_loc(end)))
+		return NULL;
+
+	if (is_orelse_keyword(t))
+		error_tok(t, "expected expression before 'orelse'");
+
+	// Find assignment target (= at depth 0 before orelse)
+	Token *bare_lhs_start = t;
+	Token *bare_assign_eq = NULL;
+	{
+		int sd = 0;
+		for (Token *s = t; s != orelse_tok; s = tok_next(s)) {
+			if (s->flags & TF_OPEN) sd++;
+			else if (s->flags & TF_CLOSE) sd--;
+			else if (sd == 0 && is_assignment_operator_token(s)) {
+				if (!match_ch(s, '='))
+					error_tok(s, "bare assignment with 'orelse' cannot use compound operators "
+						  "(e.g. +=, -=); use a plain '=' assignment");
+				bare_assign_eq = s;
+				break;
+			}
+		}
+	}
+
+	// Error if LHS has side effects (double evaluation)
+	if (bare_assign_eq) {
+		for (Token *s = bare_lhs_start; s != bare_assign_eq; s = tok_next(s)) {
+			if (is_assignment_operator_token(s))
+				error_tok(s, "orelse fallback on assignment with side effects "
+					  "in the target expression (double evaluation); "
+					  "use a temporary variable instead");
+			if (equal(s, "++") || equal(s, "--"))
+				error_tok(s, "orelse fallback on assignment with side effects "
+					  "in the target expression (double evaluation); "
+					  "use a temporary variable instead");
+			if (s->tag & TT_ASM)
+				error_tok(s, "orelse fallback on assignment with inline asm "
+					  "in the target expression (double evaluation); "
+					  "use a temporary variable instead");
+			if (is_valid_varname(s) && !is_type_keyword(s) && tok_next(s) &&
+			    tok_next(s) != bare_assign_eq && match_ch(tok_next(s), '('))
+				error_tok(s, "orelse fallback on assignment with a function call "
+					  "in the target expression (double evaluation); "
+					  "use a temporary variable instead");
+			if (match_ch(s, '(') && (s->flags & TF_OPEN) && tok_match(s) &&
+			    tok_match(s) != bare_assign_eq && tok_next(tok_match(s)) &&
+			    tok_next(tok_match(s)) != bare_assign_eq &&
+			    match_ch(tok_next(tok_match(s)), '('))
+				error_tok(s, "orelse fallback on assignment with an indirect call "
+					  "in the target expression (double evaluation); "
+					  "use a temporary variable instead");
+		}
+	}
+
+	Token *after_orelse = tok_next(orelse_tok);
+	bool is_bare_fallback = bare_assign_eq && after_orelse &&
+		!(after_orelse->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
+		!match_ch(after_orelse, '{') && !match_ch(after_orelse, ';');
+
+	// Hoist preprocessor directives before the wrapper
+	for (Token *s = t; s != orelse_tok; s = tok_next(s)) {
+		if (s->kind == TK_PREP_DIR) { emit_tok(s); out_char('\n'); }
+	}
+
+	if (is_bare_fallback) {
+		// Detect compound literals in fallback
+		bool fallback_has_compound_literal = false;
+		{
+			int sd = 0;
+			for (Token *s = after_orelse; s && s->kind != TK_EOF; s = tok_next(s)) {
+				if (s->flags & TF_OPEN) sd++;
+				else if (s->flags & TF_CLOSE) sd--;
+				else if (sd == 0 && match_ch(s, ';')) break;
+				if (match_ch(s, '{')) { fallback_has_compound_literal = true; break; }
+			}
+		}
+
+		out_char(' ');
+		if (fallback_has_compound_literal) {
+			// Ternary: (LHS = RHS) ? (void)0 : (void)(LHS = (fb));
+			OUT_LIT("(");
+			for (Token *s = bare_lhs_start; s != orelse_tok; s = tok_next(s)) {
+				if (s->kind == TK_PREP_DIR) continue;
+				emit_tok(s);
+			}
+			OUT_LIT(") ? (void)0 : ");
+			t = after_orelse;
+			int fd = 0;
+			bool has_chain = false;
+			{
+				Token *peek = t;
+				int pd = 0;
+				while (peek->kind != TK_EOF) {
+					if (peek->flags & TF_OPEN) pd++;
+					else if (peek->flags & TF_CLOSE) pd--;
+					else if (pd == 0 && match_ch(peek, ';')) break;
+					if (pd == 0 && is_orelse_keyword(peek)) { has_chain = true; break; }
+					peek = tok_next(peek);
+				}
+			}
+			OUT_LIT(has_chain ? "(" : "(void)(");
+			emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+			OUT_LIT(" = (");
+			while (t->kind != TK_EOF) {
+				if (t->flags & TF_OPEN) fd++;
+				else if (t->flags & TF_CLOSE) fd--;
+				else if (fd == 0 && match_ch(t, ';')) break;
+				if (fd == 0 && is_orelse_keyword(t)) {
+					OUT_LIT(")) ? (void)0 : ");
+					t = tok_next(t);
+					has_chain = false;
+					{
+						Token *peek = t;
+						int pd2 = 0;
+						while (peek->kind != TK_EOF) {
+							if (peek->flags & TF_OPEN) pd2++;
+							else if (peek->flags & TF_CLOSE) pd2--;
+							else if (pd2 == 0 && match_ch(peek, ';')) break;
+							if (pd2 == 0 && is_orelse_keyword(peek)) { has_chain = true; break; }
+							peek = tok_next(peek);
+						}
+					}
+					OUT_LIT(has_chain ? "(" : "(void)(");
+					emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+					OUT_LIT(" = (");
+					continue;
+				}
+				emit_tok(t);
+				t = tok_next(t);
+			}
+			OUT_LIT("));");
+		} else {
+			// If-based: { LHS = RHS; if (!LHS) LHS = (fb); }
+			OUT_LIT("{");
+			out_char(' ');
+			for (Token *s = bare_lhs_start; s != orelse_tok; s = tok_next(s)) {
+				if (s->kind == TK_PREP_DIR) continue;
+				emit_tok(s);
+			}
+			out_char(';');
+			OUT_LIT(" if (!");
+			emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+			OUT_LIT(")");
+			emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+			OUT_LIT(" = (");
+			t = after_orelse;
+			int fd = 0;
+			while (t->kind != TK_EOF) {
+				if (t->flags & TF_OPEN) fd++;
+				else if (t->flags & TF_CLOSE) fd--;
+				else if (fd == 0 && match_ch(t, ';')) break;
+				if (fd == 0 && is_orelse_keyword(t)) {
+					OUT_LIT("); if (!");
+					emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+					OUT_LIT(")");
+					emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+					OUT_LIT(" = (");
+					t = tok_next(t);
+					continue;
+				}
+				emit_tok(t);
+				t = tok_next(t);
+			}
+			OUT_LIT("); }");
+		}
+		if (match_ch(t, ';')) t = tok_next(t);
+		return t;
+	}
+
+	// Non-bare fallback (block action or no assignment)
+	OUT_LIT(" {");
+	OUT_LIT(" if (!(");
+	while (t != orelse_tok) {
+		if (t->kind == TK_PREP_DIR) { t = tok_next(t); continue; }
+		emit_tok(t);
+		t = tok_next(t);
+	}
+	OUT_LIT("))");
+	t = after_orelse;
+
+	if (match_ch(t, ';'))
+		error_tok(t, "expected statement after 'orelse'");
+
+	if (match_ch(t, '{')) {
+		// Block action: emit inner block tokens
+		Token *bclose = tok_match(t);
+		emit_tok(t); t = tok_next(t);
+		while (t && t != bclose && t->kind != TK_EOF) {
+			emit_tok(t); t = tok_next(t);
+		}
+		if (t == bclose) { emit_tok(t); t = tok_next(t); }
+	} else if (bare_assign_eq) {
+		// Value fallback without is_bare_fallback shouldn't reach here,
+		// but handle gracefully: emit as simple reassignment
+		emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+		OUT_LIT(" = (");
+		while (t->kind != TK_EOF && !match_ch(t, ';')) {
+			emit_tok(t); t = tok_next(t);
+		}
+		OUT_LIT(");");
+	} else {
+		error_tok(orelse_tok, "orelse fallback requires an assignment target (use a declaration)");
+	}
+	OUT_LIT(" }");
+	if (match_ch(t, ';')) t = tok_next(t);
+	return t;
+}
+
+// Like emit_range but processes zero-init/raw/orelse inside defer blocks.
+static void emit_deferred_range(Token *start, Token *end) {
+	bool saved_stmt_start = ctx->at_stmt_start;
+	CtrlState saved_ctrl = ctrl_state;
+	ctrl_state.pending = false;
+	ctrl_state.pending_for_paren = false;
+	ctrl_state.parens_just_closed = false;
+	ctrl_state.scope_flags = 0;
+	ctrl_state.pending_orelse_guard = false;
+	ctrl_state.brace_depth = 0;
+
+	ctx->at_stmt_start = true;
+
+	for (Token *t = start; t && t != end && t->kind != TK_EOF;) {
+		if (ctx->at_stmt_start && FEAT(F_ZEROINIT)) {
+			Token *next = try_zero_init_decl(t);
+			if (next) {
+				t = next;
+				ctx->at_stmt_start = true;
+				continue;
+			}
+		}
+
+		// Bare expression orelse at statement start
+		if (ctx->at_stmt_start && FEAT(F_ORELSE) &&
+		    !(t->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO |
+				TT_CASE | TT_DEFAULT | TT_IF | TT_LOOP | TT_SWITCH |
+				TT_STORAGE | TT_TYPEDEF))) {
+			Token *next = emit_deferred_bare_orelse(t, end);
+			if (next) {
+				t = next;
+				ctx->at_stmt_start = true;
+				continue;
+			}
+		}
+
+		ctx->at_stmt_start = false;
+
+		// Strip raw keyword (same as main loop catch-all)
+		if (__builtin_expect((t->flags & TF_RAW) && !is_known_typedef(t), 0)) {
+			Token *after_raw = skip_noise(tok_next(t));
+			if (is_raw_declaration_context(after_raw)) {
+				t = tok_next(t);
+				continue;
+			}
+		}
+
+		if (t->tag & TT_STRUCTURAL) {
+			emit_tok(t);
+			t = tok_next(t);
+			ctx->at_stmt_start = true;
+			continue;
+		}
+
+		emit_tok(t);
+		t = tok_next(t);
+	}
+
+	ctx->at_stmt_start = saved_stmt_start;
+	ctrl_state = saved_ctrl;
 }
 
 // ── Pre-scan: strict file-scope declaration registration ──
@@ -5304,6 +5637,17 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				  "'orelse' cannot be used here (it must appear at the "
 				  "statement level in a declaration or bare expression)");
 
+		// Strip 'raw' keyword where try_zero_init_decl does not run
+		// (file scope, struct body).  The keyword is semantically a no-op
+		// in those contexts but must not leak into the C output.
+		if (__builtin_expect((tok->flags & TF_RAW) && !is_known_typedef(tok), 0)) {
+			Token *after_raw = skip_noise(tok_next(tok));
+			if (is_raw_declaration_context(after_raw)) {
+				tok = tok_next(tok);
+				continue;
+			}
+		}
+
 		emit_tok(tok);
 		tok = tok_next(tok);
 	}
@@ -5314,6 +5658,15 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 	}
 
 	out_close();
+
+	// Free malloc'd source_define strings before arena reset makes
+	// the pointer array unreachable, then clear stale pointers.
+	for (int i = 0; i < ctx->source_define_count; i++)
+		free(ctx->source_defines[i]);
+	ctx->source_defines = NULL;
+	ctx->source_define_count = 0;
+	ctx->source_define_cap = 0;
+
 	tokenizer_teardown(false);
 	return 1;
 }
@@ -5407,6 +5760,14 @@ PRISM_API void prism_free(PrismResult *r) {
 
 PRISM_API void prism_reset(void) {
 	typedef_table_reset();
+
+	// Free malloc'd source_define strings before arena reset
+	for (int i = 0; i < ctx->source_define_count; i++)
+		free(ctx->source_defines[i]);
+	ctx->source_defines = NULL;
+	ctx->source_define_count = 0;
+	ctx->source_define_cap = 0;
+
 	tokenizer_teardown(false);
 
 	ctx->scope_depth = 0;
