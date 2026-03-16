@@ -21,6 +21,9 @@
 #include <errno.h>
 #include <signal.h>
 
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "user32.lib")
+
 // Must be included BEFORE GCC-ism macros (especially noreturn) to avoid
 // poisoning system headers like <setjmp.h> and <stdlib.h>.
 #include <stdio.h>
@@ -35,6 +38,13 @@
 typedef SSIZE_T ssize_t;
 typedef intptr_t pid_t;
 typedef int mode_t;
+
+// MSVC volatile has acquire/release semantics on x86/x64, so plain
+// reads/writes are sufficient for signal_temp_* atomics.
+#define signal_temp_store(val) (signal_temp_registered = (val))
+#define signal_temp_load()     (signal_temp_registered)
+#define signal_temps_store(val) (signal_temps_count = (val))
+#define signal_temps_load()     (signal_temps_count)
 
 // MSVC doesn't have these — define them away or provide equivalents.
 #define __attribute__(x)
@@ -87,6 +97,15 @@ typedef int mode_t;
 #ifndef O_EXCL
 #define O_EXCL _O_EXCL
 #endif
+#ifndef O_RDONLY
+#define O_RDONLY _O_RDONLY
+#endif
+#ifndef O_RDWR
+#define O_RDWR _O_RDWR
+#endif
+#ifndef O_TRUNC
+#define O_TRUNC _O_TRUNC
+#endif
 
 #ifndef S_IRUSR
 #define S_IRUSR _S_IREAD
@@ -100,8 +119,20 @@ typedef int mode_t;
 #ifndef S_IWOTH
 #define S_IWOTH 0
 #endif
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#endif
 #ifndef S_ISDIR
 #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+
+#ifndef X_OK
+#define X_OK 0 // Windows has no execute permission bit; check existence instead
+#endif
+
+// POSIX signals not available on Windows
+#ifndef SIGPIPE
+#define SIGPIPE 13 // define but never raised on Windows
 #endif
 
 #define strdup _strdup
@@ -113,6 +144,13 @@ typedef int mode_t;
 #define close _close
 #define popen _popen
 #define pclose _pclose
+#define dup2 _dup2
+#define write _write
+#define fstat _fstat
+#define strcasecmp _stricmp
+#define mkdir(path, mode) _mkdir(path)
+#define chmod(path, mode) ((void)(path), (void)(mode), 0)
+#define open prism_posix_open_
 // Redirect read() calls to our wrapper via macro.
 // Using a unique name avoids conflicting with MSVC ucrt's read() declaration.
 #define read prism_posix_read_
@@ -203,6 +241,23 @@ static ssize_t prism_posix_read_(int fd, void *buf, size_t count) {
 	return (ssize_t)_read(fd, buf, to_read);
 }
 
+// POSIX open() shim: maps /dev/null to NUL and calls _open with _O_BINARY
+static int prism_posix_open_(const char *path, int oflag, ...) {
+	va_list ap;
+	int mode = 0;
+	if (oflag & _O_CREAT) {
+		va_start(ap, oflag);
+		mode = va_arg(ap, int);
+		va_end(ap);
+	}
+	// Map /dev/null -> NUL
+	const char *winpath = path;
+	if (strcmp(path, "/dev/null") == 0) winpath = "NUL";
+	if (oflag & _O_CREAT)
+		return _open(winpath, oflag | _O_BINARY, mode);
+	return _open(winpath, oflag | _O_BINARY);
+}
+
 // tries up to 10000 unique names with randomized template + _sopen_s
 // suffix_len: number of chars after the X's (e.g. 2 for ".c" in "foo.XXXXXX.c")
 static int mkstemps(char *tmpl, int suffix_len) {
@@ -254,11 +309,37 @@ static int mkstemp(char *tmpl) {
 	return mkstemps(tmpl, 0);
 }
 
-// No-op on Windows
-static int chmod(const char *path, mode_t mode) {
-	(void)path;
-	(void)mode;
-	return 0;
+static char *mkdtemp(char *tmpl) {
+	static const char chars[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+	size_t len = strlen(tmpl);
+
+	size_t x_end = len;
+	size_t x_start = x_end;
+	while (x_start > 0 && tmpl[x_start - 1] == 'X') x_start--;
+	size_t x_count = x_end - x_start;
+
+	LARGE_INTEGER perf_counter;
+	QueryPerformanceCounter(&perf_counter);
+	unsigned int seed = (unsigned int)_getpid() ^ (unsigned int)GetTickCount() ^
+			    (unsigned int)perf_counter.LowPart;
+
+	for (int attempt = 0; attempt < 10000; attempt++) {
+		char try_buf[MAX_PATH];
+		if (len >= MAX_PATH) { errno = ENAMETOOLONG; return NULL; }
+		memcpy(try_buf, tmpl, len + 1);
+		unsigned int attempt_seed = seed ^ ((unsigned int)attempt * 2654435761u);
+		for (size_t i = x_start; i < x_start + x_count; i++) {
+			attempt_seed = attempt_seed * 1103515245 + 12345;
+			try_buf[i] = chars[(attempt_seed >> 16) % (sizeof(chars) - 1)];
+		}
+		if (_mkdir(try_buf) == 0) {
+			memcpy(tmpl, try_buf, len + 1);
+			return tmpl;
+		}
+		if (errno != EEXIST) return NULL;
+	}
+	errno = EEXIST;
+	return NULL;
 }
 
 /* Stub: Windows callers use get_self_exe_path() via GetModuleFileNameA instead */
@@ -516,11 +597,17 @@ static bool get_self_exe_path(char *buf, size_t bufsize) {
 // Detect whether the compiler is MSVC cl.exe
 static bool cc_is_msvc(const char *cc) {
 	if (!cc || !*cc) return false;
-	const char *fwd = strrchr(cc, '/');
-	const char *bck = strrchr(cc, '\\');
-	if (bck && (!fwd || bck > fwd)) fwd = bck;
-	const char *base = fwd ? fwd + 1 : cc;
-	return (_stricmp(base, "cl") == 0 || _stricmp(base, "cl.exe") == 0);
+	while (*cc == ' ') cc++;
+	// Find end of command (before args)
+	const char *cmd_end = cc;
+	while (*cmd_end && *cmd_end != ' ') cmd_end++;
+	// Find last path separator within command only (not in /flag args)
+	const char *base = cc;
+	for (const char *p = cc; p < cmd_end; p++)
+		if (*p == '/' || *p == '\\') base = p + 1;
+	size_t len = (size_t)(cmd_end - base);
+	return ((len == 2 && _strnicmp(base, "cl", 2) == 0) ||
+	        (len == 6 && _strnicmp(base, "cl.exe", 6) == 0));
 }
 
 // Run a command and wait for it to complete.
@@ -530,7 +617,77 @@ static int run_command(char **argv) {
 	return (int)status;
 }
 
+// Like run_command but suppresses stderr (for probe attempts)
+static int run_command_quiet(char **argv) {
+	// Save original stderr
+	int orig_stderr = _dup(STDERR_FILENO);
+	if (orig_stderr < 0) return run_command(argv); // fallback
+
+	// Redirect stderr to NUL
+	int nul_fd = -1;
+	errno_t err = _sopen_s(&nul_fd, "NUL", _O_WRONLY, _SH_DENYNO, 0);
+	if (err != 0 || nul_fd < 0) {
+		_close(orig_stderr);
+		return run_command(argv);
+	}
+	_dup2(nul_fd, STDERR_FILENO);
+	_close(nul_fd);
+
+	intptr_t status = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
+
+	// Restore stderr
+	_dup2(orig_stderr, STDERR_FILENO);
+	_close(orig_stderr);
+	return (int)status;
+}
+
+// Capture the first line of a command's stdout. Returns 0 on success.
+static int capture_first_line(char **argv, char *buf, size_t bufsize) {
+	buf[0] = '\0';
+
+	// Build command line for _popen with proper escaping
+	char cmdline[4096];
+	int pos = 0;
+	for (int i = 0; argv[i]; i++) {
+		if (i > 0 && (size_t)pos < sizeof(cmdline) - 1) cmdline[pos++] = ' ';
+		const char *s = argv[i];
+		int needs_quote = (s[0] == '\0' || strchr(s, ' ') || strchr(s, '\t') || strchr(s, '"'));
+		if (needs_quote && (size_t)pos < sizeof(cmdline) - 1) cmdline[pos++] = '"';
+		for (; *s && (size_t)pos < sizeof(cmdline) - 4; s++) {
+			if (*s == '"') {
+				cmdline[pos++] = '\\';
+				if ((size_t)pos < sizeof(cmdline) - 4) cmdline[pos++] = '"';
+			} else {
+				cmdline[pos++] = *s;
+			}
+		}
+		if (needs_quote && (size_t)pos < sizeof(cmdline) - 1) cmdline[pos++] = '"';
+	}
+	// Redirect stderr to NUL
+	const char *suffix = " 2>NUL";
+	size_t slen = strlen(suffix);
+	if ((size_t)pos + slen < sizeof(cmdline)) {
+		memcpy(cmdline + pos, suffix, slen);
+		pos += (int)slen;
+	}
+	cmdline[pos] = '\0';
+
+	FILE *fp = _popen(cmdline, "r");
+	if (!fp) return -1;
+
+	if (fgets(buf, (int)bufsize, fp)) {
+		size_t len = strlen(buf);
+		if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
+		len = strlen(buf);
+		if (len > 0 && buf[len - 1] == '\r') buf[len - 1] = '\0';
+	}
+	int rc = _pclose(fp);
+	if (buf[0]) return 0;
+	return (rc != 0) ? rc : -1;
+}
+
 // Get the platform install path: %LOCALAPPDATA%\prism\prism.exe
+// Returns pointer to a static buffer — not reentrant.
 static const char *get_install_path(void) {
 	static char path[MAX_PATH];
 	if (path[0]) return path;
@@ -565,16 +722,60 @@ static bool ensure_install_dir(const char *install_path) {
 	return CreateDirectoryA(dir, NULL) != 0;
 }
 
-// Add a directory to the user's PATH via setx (persistent)
+// Check if 'dir' appears as a complete semicolon-delimited segment in 'path'.
+static bool path_contains_dir(const char *path, const char *dir) {
+	if (!path || !dir) return false;
+	size_t dir_len = strlen(dir);
+	if (dir_len == 0) return false;
+	for (const char *p = path; ; ) {
+		const char *found = strstr(p, dir);
+		if (!found) return false;
+		bool at_start = (found == path || found[-1] == ';');
+		bool at_end = (found[dir_len] == '\0' || found[dir_len] == ';');
+		if (at_start && at_end) return true;
+		p = found + 1;
+	}
+}
+
+// Add a directory to the user's PATH via the registry (persistent)
 static void add_to_user_path(const char *dir) {
 	// Check if dir is already in PATH
 	char *path_env = getenv("PATH");
-	if (path_env && strstr(path_env, dir)) return; // Already in PATH
+	if (path_contains_dir(path_env, dir)) return; // Already in PATH
 
-	// Use setx to persistently add to user PATH
-	char cmd[MAX_PATH * 2];
-	snprintf(cmd, sizeof(cmd), "setx PATH \"%%PATH%%;%s\" >nul 2>&1", dir);
-	system(cmd);
+	// Read current user PATH from registry
+	HKEY hKey;
+	if (RegOpenKeyExA(HKEY_CURRENT_USER, "Environment", 0, KEY_READ | KEY_WRITE, &hKey) != ERROR_SUCCESS)
+		return;
+
+	char current[8192];
+	DWORD size = sizeof(current) - 1;
+	DWORD type = REG_EXPAND_SZ;
+	LONG rc = RegQueryValueExA(hKey, "Path", NULL, &type, (BYTE *)current, &size);
+	if (rc != ERROR_SUCCESS || size == 0) {
+		current[0] = '\0';
+		size = 0;
+	} else {
+		current[size] = '\0';
+	}
+
+	// Check again in registry value
+	if (path_contains_dir(current, dir)) { RegCloseKey(hKey); return; }
+
+	// Append ;dir
+	char newpath[8192];
+	if (current[0])
+		snprintf(newpath, sizeof(newpath), "%s;%s", current, dir);
+	else
+		snprintf(newpath, sizeof(newpath), "%s", dir);
+
+	RegSetValueExA(hKey, "Path", 0, REG_EXPAND_SZ, (const BYTE *)newpath, (DWORD)(strlen(newpath) + 1));
+	RegCloseKey(hKey);
+
+	// Notify other programs of the environment change
+	SendMessageTimeoutA(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)"Environment",
+			    SMTO_ABORTIFHUNG, 5000, NULL);
+
 	fprintf(stderr,
 		"[prism] Added '%s' to your PATH (restart your terminal to use 'prism' directly).\n",
 		dir);

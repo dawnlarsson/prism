@@ -1,3 +1,4 @@
+#ifndef _MSC_VER
 static void test_harsh_vla_sizeof_side_effect(void) {
     int x = 0;
     int sz = (int)sizeof(int[++x]);
@@ -20,6 +21,7 @@ static void test_harsh_goto_escape_sizeof_defer(void) {
 out:
     CHECK(x == 1 && flags == 0, "goto escapes sizeof and runs outer defer");
 }
+#endif
 
 #define BRUTAL_DEFER(y) defer y++; defer y++; defer y++; defer y++;
 
@@ -225,9 +227,11 @@ static void test_harsh_mismatched_delimiters_rejected(void) {
 }
 
 void run_harsh_review_tests(void) {
+#ifndef _MSC_VER
     test_harsh_vla_sizeof_side_effect();
     test_harsh_stmt_expr_in_vla();
     test_harsh_goto_escape_sizeof_defer();
+#endif
     test_harsh_macro_defer_eval();
     test_harsh_generic_decl_noise();
     test_harsh_orelse_typedef_union_value_rejected();

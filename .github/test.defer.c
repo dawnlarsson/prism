@@ -55,6 +55,7 @@ end:
 	CHECK_LOG("1CBA2", "defer nested scopes with goto");
 }
 
+#ifndef _MSC_VER
 static void _c23_attr_goto_helper(void) [[gnu::cold]] {
 	log_reset();
 	{
@@ -72,6 +73,7 @@ void test_defer_goto_c23_attr(void) {
 	_c23_attr_goto_helper();
 	CHECK_LOG("D2D1E", "defer goto with C23 attr on func");
 }
+#endif
 
 void test_defer_break(void) {
 	log_reset();
@@ -1009,6 +1011,7 @@ void test_switch_negative_cases(void) {
 	CHECK_LOG("bBE", "switch with negative case values and defer");
 }
 
+#ifndef _MSC_VER
 void test_switch_stmt_expr_defer(void) {
 	log_reset();
 	switch (1) {
@@ -1057,6 +1060,7 @@ void test_switch_in_stmt_expr_in_switch(void) {
 	log_append("E");
 	CHECK_LOG("IXOE", "switch in stmt expr in switch");
 }
+#endif
 
 void test_switch_triple_sequential(void) {
 	log_reset();
@@ -1453,6 +1457,7 @@ static void check_defer_transpile_rejects(const char *code,
 	prism_free(&result);
 }
 
+#ifndef _WIN32
 static int run_command_status(const char *cmd) {
 	int status = system(cmd);
 	if (status == -1) return -1;
@@ -1489,6 +1494,7 @@ static void check_transpiled_output_compiles_and_runs(const char *output,
 	unlink(src_path);
 	free(src_path);
 }
+#endif
 
 void test_defer_goto_into_scope_rejected(void) {
 	check_defer_transpile_rejects(
@@ -1621,6 +1627,7 @@ void test_defer_vfork_rejected(void) {
 }
 #endif
 
+#ifndef _MSC_VER
 static void _c23_attr_label_helper(void) {
 	log_reset();
 	{
@@ -1637,6 +1644,7 @@ void test_defer_goto_c23_attr_label(void) {
 	_c23_attr_label_helper();
 	CHECK_LOG("BDE", "goto to C23 attributed label fires defer");
 }
+#endif
 
 
 static void test_auto_type_fallback_requires_gnu_extensions(void) {
@@ -1861,11 +1869,13 @@ static void test_scope_type_at_depth_overflow(void) {
 	PrismResult result = prism_transpile_file(path, features);
 	CHECK_EQ(result.status, PRISM_OK, "scope depth overflow: transpiles OK");
 	CHECK(result.output != NULL, "scope depth overflow: output not NULL");
+#ifndef _WIN32
 	if (result.output)
 		check_transpiled_output_compiles_and_runs(
 		    result.output,
 		    "scope depth overflow: transpiled output compiles",
 		    "scope depth overflow: transpiled output runs");
+#endif
 
 	prism_free(&result);
 	unlink(path);
@@ -1892,10 +1902,12 @@ static void test_defer_void_parens_return_bug(void) {
         CHECK_EQ(result.status, PRISM_OK, "void with parens: transpiles OK");
 
         if (result.output) {
+#ifndef _WIN32
                 check_transpiled_output_compiles_and_runs(
                     result.output,
                     "void with parens: compiles without void deduction failure",
                     "void with parens: runs successfully");
+#endif
         }
         prism_free(&result);
         unlink(path);
@@ -2196,7 +2208,9 @@ void run_defer_tests(void) {
 	CHECK_LOG("1A", "defer with return");
 	CHECK_EQ(ret, 42, "defer return value preserved");
 	test_defer_goto_out();
+#ifndef _MSC_VER
 	test_defer_goto_c23_attr();
+#endif
 	test_defer_nested_scopes();
 	test_defer_break();
 	test_defer_continue();
@@ -2261,8 +2275,10 @@ void run_defer_tests(void) {
 	test_switch_nested_inner_defer();
 	test_switch_do_while_0();
 	test_switch_negative_cases();
+#ifndef _MSC_VER
 	test_switch_stmt_expr_defer();
 	test_switch_in_stmt_expr_in_switch();
+#endif
 	test_switch_triple_sequential();
 	test_duffs_device_braced_defers();
 	test_duffs_device_all_entries();
@@ -2287,7 +2303,9 @@ void run_defer_tests(void) {
 
 	test_defer_backward_goto_sibling();
 
+#ifndef _MSC_VER
 	test_defer_goto_c23_attr_label();
+#endif
 	test_defer_in_ctrl_paren_rejected();
 	test_defer_braceless_control_rejected();
 #ifdef __GNUC__

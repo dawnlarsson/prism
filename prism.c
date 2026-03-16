@@ -247,13 +247,7 @@ static char signal_temp_path[PATH_MAX];
 static char signal_temps[SIGNAL_TEMPS_MAX][PATH_MAX];
 static volatile sig_atomic_t signal_temps_count = 0;
 
-#if defined(_MSC_VER)
-// MSVC volatile has acquire/release semantics on x86/x64
-#define signal_temp_store(val) (signal_temp_registered = (val))
-#define signal_temp_load()     (signal_temp_registered)
-#define signal_temps_store(val) (signal_temps_count = (val))
-#define signal_temps_load()     (signal_temps_count)
-#else
+#ifndef signal_temp_store // Windows: defined in windows.c
 #define signal_temp_store(val) __atomic_store_n(&signal_temp_registered, (val), __ATOMIC_RELEASE)
 #define signal_temp_load()     __atomic_load_n(&signal_temp_registered, __ATOMIC_ACQUIRE)
 #define signal_temps_store(val) __atomic_store_n(&signal_temps_count, (val), __ATOMIC_RELEASE)
@@ -509,9 +503,7 @@ static void out_line(int line_no, const char *file) {
 	OUT_LIT(" \"");
 	for (const char *p = file; *p; p++) {
 		char c = *p;
-#ifdef _WIN32
-		if (c == '\\') c = '/'; // normalize backslashes for MSVC C4129
-#endif
+		if (c == '\\') c = '/'; // normalize backslashes (MSVC C4129, harmless on POSIX)
 		if (c == '"' || c == '\\') out_char('\\');
 		out_char(c);
 	}
@@ -546,6 +538,7 @@ static void collect_system_includes(void) {
 }
 
 static void emit_system_header_diag_push(void) {
+	if (cc_is_msvc(ctx->extra_compiler)) return; // MSVC doesn't understand #pragma GCC
 	OUT_LIT("#pragma GCC diagnostic push\n"
 		"#pragma GCC diagnostic ignored \"-Wredundant-decls\"\n"
 		"#pragma GCC diagnostic ignored \"-Wstrict-prototypes\"\n"
@@ -560,6 +553,7 @@ static void emit_system_header_diag_push(void) {
 }
 
 static void emit_system_header_diag_pop(void) {
+	if (cc_is_msvc(ctx->extra_compiler)) return;
 	OUT_LIT("#pragma GCC diagnostic pop\n");
 }
 
@@ -3989,9 +3983,16 @@ static bool cc_is_msvc(const char *cc) {
 // Build preprocessor argv (shared between pipe and file paths)
 static void build_pp_argv(const char **args, int *argc, const char *input_file, char **out_cc_dup) {
 	const char *cc = ctx->extra_compiler ? ctx->extra_compiler : PRISM_DEFAULT_CC;
+	bool msvc = cc_is_msvc(cc);
 	cc_split_into_argv(args, argc, cc, out_cc_dup);
-	args[(*argc)++] = "-E";
-	args[(*argc)++] = "-w";
+
+	if (msvc) {
+		args[(*argc)++] = "/E";          // preprocess to stdout
+		args[(*argc)++] = "/nologo";
+	} else {
+		args[(*argc)++] = "-E";
+		args[(*argc)++] = "-w";
+	}
 
 	for (int i = 0; i < ctx->extra_compiler_flags_count; i++)
 		args[(*argc)++] = ctx->extra_compiler_flags[i];
@@ -4001,23 +4002,43 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 
 	for (int i = 0; i < ctx->extra_include_count; i++)
 	{
-		args[(*argc)++] = "-I";
+		args[(*argc)++] = msvc ? "/I" : "-I";
 		args[(*argc)++] = ctx->extra_include_paths[i];
 	}
 
-	for (int i = 0; i < ctx->extra_define_count; i++)
-	{
-		args[(*argc)++] = "-D";
-		args[(*argc)++] = ctx->extra_defines[i];
+	if (msvc) {
+		// MSVC: /D concatenated with macro
+		static char pp_define_bufs[64][256];
+		int buf_idx = 0;
+		for (int i = 0; i < ctx->extra_define_count && buf_idx < 64; i++) {
+			snprintf(pp_define_bufs[buf_idx], sizeof(pp_define_bufs[buf_idx]),
+				 "/D%s", ctx->extra_defines[i]);
+			args[(*argc)++] = pp_define_bufs[buf_idx++];
+		}
+		snprintf(pp_define_bufs[buf_idx], sizeof(pp_define_bufs[buf_idx]), "/D__PRISM__=1");
+		args[(*argc)++] = pp_define_bufs[buf_idx++];
+		if (FEAT(F_DEFER) && buf_idx < 64) {
+			snprintf(pp_define_bufs[buf_idx], sizeof(pp_define_bufs[buf_idx]), "/D__PRISM_DEFER__=1");
+			args[(*argc)++] = pp_define_bufs[buf_idx++];
+		}
+		if (FEAT(F_ZEROINIT) && buf_idx < 64) {
+			snprintf(pp_define_bufs[buf_idx], sizeof(pp_define_bufs[buf_idx]), "/D__PRISM_ZEROINIT__=1");
+			args[(*argc)++] = pp_define_bufs[buf_idx++];
+		}
+	} else {
+		for (int i = 0; i < ctx->extra_define_count; i++)
+		{
+			args[(*argc)++] = "-D";
+			args[(*argc)++] = ctx->extra_defines[i];
+		}
+		args[(*argc)++] = "-D__PRISM__=1";
+		if (FEAT(F_DEFER)) args[(*argc)++] = "-D__PRISM_DEFER__=1";
+		if (FEAT(F_ZEROINIT)) args[(*argc)++] = "-D__PRISM_ZEROINIT__=1";
 	}
 
-	args[(*argc)++] = "-D__PRISM__=1";
-	if (FEAT(F_DEFER)) args[(*argc)++] = "-D__PRISM_DEFER__=1";
-	if (FEAT(F_ZEROINIT)) args[(*argc)++] = "-D__PRISM_ZEROINIT__=1";
-
-	// Add POSIX/GNU feature test macros unless user already defined them
+	// Add POSIX/GNU feature test macros on non-Windows, non-MSVC
 #ifndef _WIN32
-	{
+	if (!msvc) {
 		bool user_has_posix = false, user_has_gnu = false;
 		for (int i = 0; i < ctx->extra_define_count; i++) {
 			if (strncmp(ctx->extra_defines[i], "_POSIX_C_SOURCE", 15) == 0) user_has_posix = true;
@@ -4038,7 +4059,7 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 
 	for (int i = 0; i < ctx->extra_force_include_count; i++)
 	{
-		args[(*argc)++] = cc_is_msvc(args[0]) ? "/FI" : "-include";
+		args[(*argc)++] = msvc ? "/FI" : "-include";
 		args[(*argc)++] = ctx->extra_force_includes[i];
 	}
 
@@ -5018,6 +5039,33 @@ static int transpile(char *input_file, char *output_file) {
 	return transpile_tokens(tok, fp);
 }
 
+// Transpile a source file and write the result to stdout.
+// On Windows, transpiles to a temp file and copies it out (no /dev/stdout).
+// On POSIX, transpiles directly to /dev/stdout.
+static int transpile_to_stdout(char *input_file) {
+#ifdef _WIN32
+	char temp[PATH_MAX];
+	if (make_temp_file(temp, sizeof(temp), NULL, 0, input_file) < 0)
+		return 0;
+	if (!transpile(input_file, temp)) {
+		remove(temp);
+		return 0;
+	}
+	FILE *f = fopen(temp, "r");
+	if (f) {
+		char buf[4096];
+		size_t n;
+		while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+			fwrite(buf, 1, n, stdout);
+		fclose(f);
+	}
+	remove(temp);
+	return 1;
+#else
+	return transpile(input_file, "/dev/stdout");
+#endif
+}
+
 // LIBRARY API
 
 PRISM_API void prism_free(PrismResult *r) {
@@ -5270,7 +5318,7 @@ static Cli cli_parse(int argc, char **argv) {
 		char *a = argv[i];
 
 		// -- Non-flag arguments --
-		if (a[0] != '-' || !a[1]) {
+		if (a[0] != '-' && a[0] != '/') {
 			if (!strcmp(a, "run"))       { cli.mode = CLI_RUN; continue; }
 			if (!strcmp(a, "transpile")) { cli.mode = CLI_EMIT; continue; }
 			if (!strcmp(a, "install"))   { cli.mode = CLI_INSTALL; continue; }
@@ -5278,6 +5326,22 @@ static Cli cli_parse(int argc, char **argv) {
 				CLI_PUSH(cli.sources, cli.source_count, cli.source_cap, a);
 				continue;
 			}
+			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
+			continue;
+		}
+
+		// -- MSVC-style flags (start with /) --
+		if (a[0] == '/') {
+			// /Fe:output or /Fe output — MSVC output name
+			if (strncmp(a, "/Fe:", 4) == 0) { cli.output = a + 4; continue; }
+			if (strncmp(a, "/Fe", 3) == 0 && a[3]) { cli.output = a + 3; continue; }
+			if (strcmp(a, "/Fe") == 0 && i + 1 < argc) { cli.output = argv[++i]; continue; }
+			// /Fo:output — MSVC object output
+			if (strncmp(a, "/Fo:", 4) == 0) { cli.output = a + 4; cli.compile_only = true; continue; }
+			if (strncmp(a, "/Fo", 3) == 0 && a[3]) { cli.output = a + 3; cli.compile_only = true; continue; }
+			// /c — compile only (no link)
+			if (strcmp(a, "/c") == 0) { cli.compile_only = true; }
+			// Forward all /flags to CC
 			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
 			continue;
 		}
@@ -5478,10 +5542,35 @@ static void check_path_shadow(const char *install_path) {
 	if (fgets(first_hit, sizeof(first_hit), fp)) {
 		size_t len = strlen(first_hit);
 		if (len > 0 && first_hit[len - 1] == '\n') first_hit[len - 1] = '\0';
+		len = strlen(first_hit);
+		if (len > 0 && first_hit[len - 1] == '\r') first_hit[len - 1] = '\0';
 	}
+	// On Windows, `where` finds the CWD first. If the first hit is in the
+	// current directory, skip it and check the next result instead.
+	char resolved_hit[PATH_MAX], resolved_install[PATH_MAX];
+#ifdef _WIN32
+	char cwd[PATH_MAX];
+	if (first_hit[0] && _getcwd(cwd, sizeof(cwd))) {
+		char first_dir[PATH_MAX];
+		strncpy(first_dir, first_hit, sizeof(first_dir) - 1);
+		first_dir[sizeof(first_dir) - 1] = '\0';
+		char *sep = strrchr(first_dir, '\\');
+		if (!sep) sep = strrchr(first_dir, '/');
+		if (sep) *sep = '\0';
+		if (_stricmp(first_dir, cwd) == 0) {
+			// First hit is in CWD — try the next line
+			first_hit[0] = '\0';
+			if (fgets(first_hit, sizeof(first_hit), fp)) {
+				size_t len = strlen(first_hit);
+				if (len > 0 && first_hit[len - 1] == '\n') first_hit[len - 1] = '\0';
+				len = strlen(first_hit);
+				if (len > 0 && first_hit[len - 1] == '\r') first_hit[len - 1] = '\0';
+			}
+		}
+	}
+#endif
 	pclose(fp);
 	if (first_hit[0] && strcmp(first_hit, install_path) != 0) {
-		char resolved_hit[PATH_MAX], resolved_install[PATH_MAX];
 		char *rh = realpath(first_hit, resolved_hit);
 		char *ri = realpath(install_path, resolved_install);
 		if (rh && ri && strcmp(rh, ri) == 0) return; // Same file via symlink — no shadow
@@ -5516,6 +5605,21 @@ static int install(char *self_path) {
 	FILE *input = fopen(self_path, "rb");
 	FILE *output = input ? fopen(install_path, "wb") : NULL;
 
+#ifdef _WIN32
+	// ERROR_SHARING_VIOLATION (32): the installed exe is currently running.
+	// On Windows you can't overwrite a running exe, but you CAN rename it.
+	char old_path[PATH_MAX];
+	old_path[0] = '\0';
+	if (input && !output && GetLastError() == ERROR_SHARING_VIOLATION) {
+		snprintf(old_path, sizeof(old_path), "%s.old", install_path);
+		remove(old_path); // remove any leftover from a previous update
+		if (MoveFileA(install_path, old_path))
+			output = fopen(install_path, "wb");
+		else
+			old_path[0] = '\0'; // rename failed, will fall through to error
+	}
+#endif
+
 	if (input && output) {
 		char buffer[4096];
 		size_t bytes;
@@ -5529,6 +5633,9 @@ static int install(char *self_path) {
 		fclose(input);
 		fclose(output);
 		chmod(install_path, 0755); // no-op on Windows (shimmed)
+#ifdef _WIN32
+		if (old_path[0]) remove(old_path); // clean up renamed old exe
+#endif
 		printf("[prism] Installed!\n");
 		{
 			char dir[PATH_MAX];
@@ -5549,7 +5656,12 @@ static int install(char *self_path) {
 
 use_sudo:;
 #ifdef _WIN32
-	fprintf(stderr, "[prism] Failed to install (run as Administrator?)\n");
+	{
+		DWORD err = GetLastError();
+		fprintf(stderr, "[prism] Failed to install to %s (error %lu).\n", install_path, err);
+		fprintf(stderr, "[prism] Try running as Administrator, or copy manually:\n");
+		fprintf(stderr, "  copy \"%s\" \"%s\"\n", self_path, install_path);
+	}
 	return 1;
 #else
 	{
@@ -5625,9 +5737,7 @@ static const char *get_real_cc(const char *cc) {
 }
 
 // Check if the system compiler is clang
-#ifndef _WIN32
 static int capture_first_line(char **argv, char *buf, size_t bufsize);
-#endif
 static bool cc_is_clang(const char *cc) {
 #ifdef __APPLE__
 	if (!cc || !*cc || strcmp(cc, "cc") == 0 || strcmp(cc, "gcc") == 0) return true;
@@ -5636,17 +5746,13 @@ static bool cc_is_clang(const char *cc) {
 	const char *exe = cc_executable(cc);
 	const char *base = path_basename(exe);
 	if (strncmp(base, "clang", 5) == 0) return true;
-#ifndef _WIN32
-	// Probe: on many systems (Termux, FreeBSD, some Linux distros),
-	// "cc" or "gcc" is actually clang behind a symlink.
+	// Probe: on many systems "cc" or "gcc" is actually clang behind a symlink.
 	char ver[256];
-	char *argv[] = {(char *)exe, "--version", NULL};
-	if (capture_first_line(argv, ver, sizeof(ver)) == 0) {
-		// clang --version outputs "... clang ..." on the first line
+	char *probe_argv[] = {(char *)exe, "--version", NULL};
+	if (capture_first_line(probe_argv, ver, sizeof(ver)) == 0) {
 		for (char *p = ver; *p; p++) *p = (char)tolower((unsigned char)*p);
 		if (strstr(ver, "clang")) return true;
 	}
-#endif
 	return false;
 }
 
@@ -5752,6 +5858,7 @@ typedef struct {
 	bool use_preprocessed;
 } TempCompilePlan;
 
+// Returns pointer to a static buffer — not reentrant.
 static const char *cli_output_path(const Cli *cli, const char *temp_exe, bool msvc) {
 	static char defobj[PATH_MAX];
 
@@ -5814,6 +5921,23 @@ static int passthrough_cc(const Cli *cli) {
 static void cleanup_temp_range(char **temps, int count) {
 	for (int i = 0; i < count; i++) {
 		remove(temps[i]);
+#ifdef _WIN32
+		// MSVC places .obj in the CWD using the input file's basename.
+		// Compute that path and remove it.
+		{
+			const char *base = temps[i];
+			for (const char *p = temps[i]; *p; p++)
+				if (*p == '/' || *p == '\\') base = p + 1;
+			char obj_path[PATH_MAX];
+			strncpy(obj_path, base, sizeof(obj_path) - 1);
+			obj_path[sizeof(obj_path) - 1] = '\0';
+			char *dot = strrchr(obj_path, '.');
+			if (dot && (size_t)(dot - obj_path) < sizeof(obj_path) - 5) {
+				strcpy(dot, ".obj");
+				remove(obj_path);
+			}
+		}
+#endif
 		free(temps[i]);
 	}
 	free(temps);
@@ -5827,6 +5951,7 @@ static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count,
 	int argc = 0;
 	char *cc_dup = NULL;
 	cc_split_into_argv(args, &argc, plan->compiler, &cc_dup);
+	if (plan->msvc) args[argc++] = "/nologo";
 	if (plan->optimize) args[argc++] = plan->msvc ? "/O2" : "-O2";
 	if (plan->use_preprocessed) args[argc++] = "-fpreprocessed";
 	for (int i = 0; i < temp_count; i++) args[argc++] = temps[i];
@@ -5915,6 +6040,7 @@ static int install_from_source(Cli *cli) {
 		.msvc = msvc,
 		.output = temp_bin,
 		.optimize = true,
+		.suppress_warnings = true,
 	};
 	int status = run_temp_compile_plan(cli, temps, cli->source_count, &plan);
 	cleanup_temp_range(temps, cli->source_count);
@@ -6024,11 +6150,9 @@ static void signal_cleanup_handler(int sig) {
 }
 
 int main(int argc, char **argv) {
-#ifndef _WIN32
-	signal(SIGPIPE, SIG_IGN);
 	signal(SIGINT, signal_cleanup_handler);
 	signal(SIGTERM, signal_cleanup_handler);
-#endif
+	signal(SIGPIPE, SIG_IGN); // no-op on Windows (SIGPIPE defined but never raised)
 	int status = 0;
 	prism_ctx_init();
 
@@ -6043,13 +6167,11 @@ int main(int argc, char **argv) {
 	if (cli.action == CLI_ACT_HELP) { print_help(); return 0; }
 	if (cli.action == CLI_ACT_VERSION) {
 		const char *real_cc = get_real_cc(cli.cc);
-#ifndef _WIN32
 		char cc_line[256];
 		char *vargs[] = {(char *)real_cc, "--version", NULL};
 		if (capture_first_line(vargs, cc_line, sizeof(cc_line)) == 0 && cc_line[0])
 			printf("prism %s (%s)\n", PRISM_VERSION, cc_line);
 		else
-#endif
 			printf("prism %s\n", PRISM_VERSION);
 		return 0;
 	}
@@ -6083,24 +6205,8 @@ int main(int argc, char **argv) {
 					die("Transpilation failed");
 				continue;
 			}
-		#ifdef _WIN32
-			char temp[PATH_MAX];
-			if (make_temp_file(temp, sizeof(temp), NULL, 0, cli.sources[i]) < 0)
-				die("Failed to create temp file");
-			if (!transpile((char *)cli.sources[i], temp)) {
-				remove(temp);
+			if (!transpile_to_stdout((char *)cli.sources[i]))
 				die("Transpilation failed");
-			}
-			FILE *f = fopen(temp, "r");
-			if (f) {
-				int c;
-				while ((c = fgetc(f)) != EOF) putchar(c);
-				fclose(f);
-			}
-			remove(temp);
-		#else
-			if (!transpile((char *)cli.sources[i], "/dev/stdout")) die("Transpilation failed");
-		#endif
 		}
 	} else if (cli.source_count == 0)
 		status = passthrough_cc(&cli);

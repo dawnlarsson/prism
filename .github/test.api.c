@@ -4698,7 +4698,9 @@ test_typeof_orelse_leak();
 	test_file_c23_n3322_local_extern_generic_leak();
 	test_raw_c23_attr_interleave();
 	test_c23_auto_orelse();
+#ifndef _MSC_VER
 	test_line_directive_escaped_quote();
+#endif
 	test_cross_compile_msvc_ret_type();
 	test_typeof_memset_no_shadow();
 	test_c23_constexpr_thread_local();

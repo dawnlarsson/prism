@@ -21,7 +21,7 @@ Prism is a proper transpiler, not a preprocessor macro.
 
 ### Linux / macOS
 ```sh
-cc prism.c -flto -s -O3 -o /tmp/prism && /tmp/prism install && rm /tmp/prism
+cc prism.c -flto -s -O3 -o prism && ./prism install
 ```
 
 ### Windows (MSVC)
@@ -30,8 +30,6 @@ Open a **Developer Command Prompt** (or run `vcvars64.bat`) and build:
 cl /Fe:prism.exe prism.c /O2 /D_CRT_SECURE_NO_WARNINGS /nologo
 ```
 Requires Visual Studio Build Tools with the **Desktop development with C++** workload.
-
-> **Note:** Prism builds and runs natively on Windows. The transpiler output is GCC/Clang-first — features like `__auto_type` in `defer` return values are not yet MSVC-compatible. Use `CC=gcc` or `CC=clang` as the backend compiler on Windows for full transpiled-code support.
 
 ## Prism Projects
 ### [Terminal File Explorer](https://github.com/dawnlarsson/explore)

@@ -11,7 +11,9 @@
 #include <string.h>
 #include <stdint.h>
 #include <stddef.h>
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
 
 static char log_buffer[1024];
 static int log_pos = 0;
@@ -71,9 +73,18 @@ static void log_append(const char *s) {
 static const char *test_tmp_dir(void) {
 	static char buf[PATH_MAX];
 	const char *t = getenv("TMPDIR");
+#ifdef _WIN32
+	if (!t || !*t) t = getenv("TEMP");
+	if (!t || !*t) t = getenv("TMP");
+	if (!t || !*t) t = ".";
+	size_t len = strlen(t);
+	char sep = '\\';
+	snprintf(buf, sizeof(buf), "%s%s", t, (t[len - 1] == '\\' || t[len - 1] == '/') ? "" : "\\");
+#else
 	if (!t || !*t) t = "/tmp";
 	size_t len = strlen(t);
 	snprintf(buf, sizeof(buf), "%s%s", t, (t[len - 1] == '/') ? "" : "/");
+#endif
 	return buf;
 }
 

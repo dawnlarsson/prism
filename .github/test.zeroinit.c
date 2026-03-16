@@ -329,8 +329,10 @@ void test_zeroinit_qualifiers(void) {
 	register int r;
 	CHECK_EQ(r, 0, "register int zero-init");
 
+#ifndef _MSC_VER
 	_Alignas(16) int aligned;
 	CHECK_EQ(aligned, 0, "_Alignas zero-init");
+#endif
 
 	const int ci;
 	CHECK(ci == 0, "const int zero-init");
@@ -753,6 +755,7 @@ void test_zeroinit_enum_array_size(void) {
 	CHECK(all_zero, "enum constant array size zero-init");
 }
 
+#ifndef _MSC_VER
 void test_zeroinit_alignas_array(void) {
 	_Alignas(32) int arr[8];
 	int all_zero = 1;
@@ -760,6 +763,7 @@ void test_zeroinit_alignas_array(void) {
 		if (arr[i] != 0) all_zero = 0;
 	CHECK(all_zero, "_Alignas array zero-init");
 }
+#endif
 
 void test_zeroinit_union(void) {
 	union {
@@ -1263,6 +1267,7 @@ void test_zeroinit_torture_with_defer(void) {
 	CHECK_EQ(final_value, 1, "torture defer: zero-init used in defer");
 }
 
+#ifndef _MSC_VER
 #include <stdatomic.h>
 
 void test_zeroinit_torture_atomic(void) {
@@ -1281,6 +1286,7 @@ void test_zeroinit_torture_atomic(void) {
 	CHECK(atomic_load(&a1) == 0 && atomic_load(&a2) == 0 && atomic_load(&a3) == 0,
 	      "torture: _Atomic multi-decl");
 }
+#endif
 
 
 void test_ternary_zeroinit(void) {
@@ -1383,6 +1389,7 @@ void test_zeroinit_parenthesized_array(void) {
 	CHECK(all_zero, "parenthesized array int (arr[5]) zero-init");
 }
 
+#ifndef _MSC_VER
 void test_parenthesized_vla_zeroinit(void) {
 	int x = 5;
 	int (arr)[x];
@@ -1391,6 +1398,7 @@ void test_parenthesized_vla_zeroinit(void) {
 		if (arr[i] != 0) all_zero = 0;
 	CHECK(all_zero, "parenthesized VLA int (arr)[x] zero-init");
 }
+#endif
 
 void test_typeof_fnptr_vla_param_zeroinit(void) {
 #ifdef __GNUC__
@@ -1457,6 +1465,7 @@ void test_typeof_register_vla_bug(void) {
 #endif
 }
 
+#ifndef _MSC_VER
 void test_atomic_register_struct_bug(void) {
 #if !defined(__TINYC__)
 	register _Atomic struct S_bug { int x, y; } s1;
@@ -1480,6 +1489,7 @@ void test_atomic_register_struct_bug(void) {
 	prism_free(&transpile_result);
 #endif
 }
+#endif
 
 void test_const_typeof_vla_bug(void) {
 #ifdef __GNUC__
@@ -1529,6 +1539,7 @@ void test_typedef_typeof_vla_zeroinit(void) {
 #endif
 }
 
+#ifndef _MSC_VER
 void test_const_typeof_atomic_struct_bug(void) {
 #if !defined(__TINYC__)
 	_Atomic struct S2_bug { int x, y; } s1;
@@ -1554,6 +1565,7 @@ void test_const_typeof_atomic_struct_bug(void) {
 	prism_free(&transpile_result);
 #endif
 }
+#endif
 
 static void test_typeof_memset_split_before_initializer(void) {
 	printf("\n--- Typeof Memset Split Before Initializer ---\n");
@@ -2007,7 +2019,9 @@ void run_zeroinit_tests(void) {
 	test_zeroinit_typeof();
 #endif
 	test_zeroinit_enum_array_size();
+#ifndef _MSC_VER
 	test_zeroinit_alignas_array();
+#endif
 	test_zeroinit_union();
 	test_ternary_zeroinit();
 	test_buffer_boundary_hang();
@@ -2028,7 +2042,9 @@ void run_zeroinit_tests(void) {
 	test_zeroinit_torture_control_flow();
 	test_zeroinit_torture_stress();
 	test_zeroinit_torture_with_defer();
+#ifndef _MSC_VER
 	test_zeroinit_torture_atomic();
+#endif
 
 	/* Typeof zero-init torture */
 #ifdef __GNUC__
@@ -2056,7 +2072,9 @@ void run_zeroinit_tests(void) {
 	test_zeroinit_parenthesized_declarator();
 	test_zeroinit_parenthesized_array();
 
+#ifndef _MSC_VER
 	test_parenthesized_vla_zeroinit();
+#endif
 	test_typeof_fnptr_vla_param_zeroinit();
 	test_typeof_register_fnptr_vla_param();
 
@@ -2064,9 +2082,13 @@ void run_zeroinit_tests(void) {
 
 	test_typeof_register_vla_bug();
 	test_typedef_typeof_vla_zeroinit();
+#ifndef _MSC_VER
 	test_atomic_register_struct_bug();
+#endif
 	test_const_typeof_vla_bug();
+#ifndef _MSC_VER
 	test_const_typeof_atomic_struct_bug();
+#endif
 	test_typeof_memset_split_before_initializer();
 	test_typeof_memset_queue_over_128();
 

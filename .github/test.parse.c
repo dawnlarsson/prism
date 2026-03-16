@@ -1333,6 +1333,7 @@ void test_duff_device_with_defer_at_top(void) {
 #define TEST_FLT16_VAL 6.5504e+4F16
 #define TEST_BF16_VAL 3.38953139e+38BF16
 
+#ifndef _MSC_VER
 void test_float128_suffix(void) {
 	// Intentional compile-as-proof check: these literal suffixes are validated
 	// by the host compiler during parsing, so successful compilation is the proof.
@@ -1340,6 +1341,7 @@ void test_float128_suffix(void) {
 	(void)TEST_FLT128_MIN;
 	CHECK(1, "F128 float suffix parses");
 }
+#endif // _MSC_VER
 
 void test_float64_suffix(void) {
 	// Intentional compile-as-proof check for the F64 literal suffix.
@@ -1408,7 +1410,7 @@ void test_signal_macros(void) {
 	// prism now pre-defines standard Linux signal values.
 #ifdef SIGALRM
 	CHECK(SIGALRM == 14, "SIGALRM defined as 14");
-#else
+#elif !defined(_WIN32)
 	CHECK(0, "SIGALRM defined as 14");
 #endif
 
@@ -1426,7 +1428,7 @@ void test_signal_macros(void) {
 
 #ifdef SIGKILL
 	CHECK(SIGKILL == 9, "SIGKILL defined as 9");
-#else
+#elif !defined(_WIN32)
 	CHECK(0, "SIGKILL defined as 9");
 #endif
 
@@ -1440,13 +1442,15 @@ void test_signal_macros(void) {
 	// Intentional compile-as-proof check on non-Linux/non-macOS targets.
 	CHECK(1, "SIGCHLD defined");
 #endif
-#else
+#elif !defined(_WIN32)
 	CHECK(0, "SIGCHLD defined");
 #endif
 
+#ifndef _WIN32
 	// Also verify we can use sigset_t from signal.h
 	sigset_t test_set;
 	CHECK(sizeof(test_set) > 0, "signal.h types available");
+#endif
 }
 
 void test_glibc_macros(void) {
@@ -1543,6 +1547,7 @@ void test_switch_braced_fallthrough_works(void) {
 	CHECK_LOG("reached_case2", "fallthrough occurs as expected");
 }
 
+#ifndef _MSC_VER
 void test_vla_struct_member(void) {
 	struct Config {
 		int size;
@@ -1661,6 +1666,7 @@ void test_nested_stmt_expr_defer(void) {
 	CHECK_LOG("inner_bodyinnerouter_bodyouter", "nested stmt expr defer order");
 	CHECK(result == 10, "nested stmt expr computes correctly");
 }
+#endif // _MSC_VER
 
 void test_vanishing_statement_if_else(void) {
 	log_reset();
@@ -1727,6 +1733,7 @@ defer:
 	CHECK_LOG("label_reached", "label named 'defer' works correctly");
 }
 
+#ifndef _MSC_VER
 void test_generic_default_first_association(void) {
 	log_reset();
 	int x = 42;
@@ -1825,7 +1832,9 @@ void test_generic_default_outside_switch(void) {
 
 	CHECK_LOG("bodyblock_cleanupafter", "_Generic outside switch works normally");
 }
+#endif // _MSC_VER
 
+#ifndef _MSC_VER
 void test_vla_backward_goto_reentry(void) {
 	int iterations = 0;
 	int last_val = -1;
@@ -1910,6 +1919,7 @@ void test_vla_pointer_init_semantics(void) {
 	CHECK(ptr_to_vla == NULL, "VLA pointer zero-initialized");
 	CHECK(mat_ptr == NULL, "typedef VLA pointer zero-initialized");
 }
+#endif // _MSC_VER
 
 typedef int T;
 
@@ -1935,6 +1945,7 @@ void test_typedef_shadow_semantics(void) {
 	}
 }
 
+#ifndef _MSC_VER
 void test_generic_default_no_switch(void) {
 	log_reset();
 
@@ -1954,6 +1965,7 @@ void test_generic_default_no_switch(void) {
 	// Defer should have run
 	CHECK_LOG("ABD", "_Generic default does not break defer");
 }
+#endif // _MSC_VER
 
 int knr_func_add(a, b)
 int a;
@@ -2446,6 +2458,7 @@ void test_alignas_struct_bitfield(void) {
 	prism_free(&result);
 }
 
+#ifndef _MSC_VER
 typedef int GenericTestType;
 
 static void verify_generic_typedef_output(void) {
@@ -2488,6 +2501,7 @@ void test_generic_typedef_not_label(void) {
 	CHECK_LOG("XD", "_Generic doesn't confuse label scanner");
 	verify_generic_typedef_output();
 }
+#endif // _MSC_VER
 
 #if __STDC_VERSION__ >= 202311L
 void test_c23_attributes_zeroinit(void) {
@@ -2597,6 +2611,7 @@ void test_pragma_pack_preservation(void) {
 	prism_free(&result);
 }
 
+#ifndef _MSC_VER
 static int g_defer_counter;
 
 int test_return_stmt_expr_helper(int x) {
@@ -2646,6 +2661,7 @@ void test_security_stmtexpr_value_corruption(void) {
 	CHECK_LOG("X", "defer executed before final expression");
 	log_reset();
 }
+#endif // _MSC_VER
 
 void test_security_braceless_defer_trap(void) {
 	log_reset();
@@ -2724,6 +2740,7 @@ void test_ghost_shadow_corruption(void) {
 	CHECK(ptr == NULL, "ghost shadow: typedef T works after braceless for loop");
 }
 
+#ifndef _MSC_VER
 void test_sizeof_vla_codegen(void) {
 	int n = 10;
 
@@ -2735,6 +2752,7 @@ void test_sizeof_vla_codegen(void) {
 
 	CHECK(arr[0] == 42, "sizeof(VLA) treated as runtime value");
 }
+#endif // _MSC_VER
 
 void test_keyword_typedef_collision(void) {
 	// These typedefs use names that are also Prism keywords
@@ -2788,6 +2806,7 @@ void test_keyword_as_function_name(void) {
 	CHECK(fp(10) == 11, "fnptr to keyword-named function works");
 }
 
+#ifndef _MSC_VER
 void test_sizeof_vla_typedef(void) {
 	int n = 10;
 	typedef int VLA_Type[n];
@@ -2819,6 +2838,7 @@ void test_typeof_vla_zeroinit(void) {
 	copy_vla[0] = 99;
 	CHECK(copy_vla[0] == 99, "typeof(VLA) assignment after zero-init works");
 }
+#endif // _MSC_VER
 
 void test_bug1_ghost_shadow_while(void) {
 	typedef int U;
@@ -2892,6 +2912,7 @@ void test_bug2_deeply_nested_parens(void) {
 	CHECK(fp == NULL, "deeply nested paren declarator");
 }
 
+#ifndef _MSC_VER
 static int defer_value_3rdparty = 0;
 
 void test_bug3_stmtexpr_defer_ordering(void) {
@@ -3025,6 +3046,7 @@ error:
 
 	CHECK(strcmp(log_buffer, "CleanupError") == 0, "attributed label defer cleanup");
 }
+#endif // _MSC_VER
 
 void test_number_tokenizer_identifiers(void) {
 #define MN_test 0xf64
@@ -3166,6 +3188,7 @@ void test_valid_number_suffixes(void) {
 	CHECK(ld2 == 1.0L, "suffix: 1.0L works");
 }
 
+#ifndef _MSC_VER
 int test_return_zeroinit_no_defer_helper(void) {
 	return ({
 		int x;
@@ -3237,6 +3260,7 @@ void test_sizeof_vla_zeroinit(void) {
 	buf[0] = 42;
 	CHECK(buf[0] == 42, "sizeof(VLA) should be recognized as VLA");
 }
+#endif // _MSC_VER
 
 void test_goto_raw_decl(void) {
 	// goto vs raw Declarations
@@ -3279,6 +3303,7 @@ void test_stmtexpr_void_cast_return(void) {
 	CHECK_LOG("X", "statement expr with void cast in return setup");
 }
 
+#ifndef _MSC_VER
 void test_stmtexpr_void_cast_return_helper(void) {
 	log_reset();
 	log_append("A");
@@ -3289,6 +3314,7 @@ void test_stmtexpr_void_cast_check(void) {
 	test_stmtexpr_void_cast_return_helper();
 	CHECK_LOG("AB", "statement expr with void cast in return should work");
 }
+#endif // _MSC_VER
 
 void test_variable_named_defer_goto(void) {
 	// Variable named defer used as a regular variable (not the keyword).
@@ -3722,6 +3748,7 @@ void test_void_typedef_overmatch(void) {
         CHECK_LOG("A", "void typedef defer executed");
 }
 
+#ifndef _MSC_VER
 void test_utf8_latin_extended(void) {
 	int café = 42;
 	int naïve = 100;
@@ -3751,7 +3778,9 @@ void test_utf8_cjk(void) {
 	int 결과 = 変数 + 数值; // "result" in Korean
 	CHECK_EQ(결과, 30, "UTF-8 CJK identifiers");
 }
+#endif // _MSC_VER
 
+#ifndef _MSC_VER
 void test_ucn_short(void) {
 	// \u03C0 = π (Greek small letter pi)
 	// \u00E9 = é (Latin small letter e with acute)
@@ -3777,6 +3806,7 @@ void test_utf8_ucn_mixed(void) {
 	CHECK_EQ(café_var, 1, "Mixed UTF-8 and ASCII");
 	CHECK_EQ(π_value, 628, "UTF-8 and UCN same variable");
 }
+#endif // _MSC_VER
 
 void test_digraph_brackets(void) {
 	int arr<:5:> = {1, 2, 3, 4, 5}; // int arr[5] = {1, 2, 3, 4, 5};
@@ -3823,6 +3853,7 @@ void test_digraph_defer(void) <%
 	CHECK_LOG("AB", "Digraph with defer");
 %>
 
+#ifndef _MSC_VER
 void test_utf8_defer(void) {
 	log_reset();
 	{
@@ -3851,6 +3882,7 @@ void test_utf8_math_identifiers(void) {
 	CHECK(λ > 0 && λ < 1e-6, "Greek lambda");
 	CHECK(ω > 6.0 && ω < 7.0, "Greek omega");
 }
+#endif // _MSC_VER
 
 
 static int zombie_counter = 0;
@@ -4166,6 +4198,7 @@ void test_defer_in_attribute_with_defer_stmt(void) {
 }
 
 
+#ifndef _MSC_VER
 void test_register_typeof_zeroinit(void) {
 	// register variables can't have their address taken
 	// So typeof(int) register x should NOT use memset(&x, ...)
@@ -4183,6 +4216,7 @@ void test_register_typeof_multiple(void) {
 	c = 3;
 	CHECK(a == 1 && b == 2 && c == 3, "multiple register typeof");
 }
+#endif
 
 // C23 digit separator tests - only run if compiler supports C23
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
@@ -4239,6 +4273,7 @@ void test_c23_digit_separator_suffix(void) {
 
 #endif // C23 digit separator tests
 
+#ifndef _MSC_VER
 void test_volatile_typeof_zeroinit(void) {
 	// volatile typeof should use volatile-safe zeroing, not memset
 	// This ensures the stores aren't optimized out
@@ -4265,6 +4300,7 @@ void test_volatile_typeof_array(void) {
 		if (arr[i] != 0) all_zero = 0;
 	CHECK(all_zero, "volatile typeof array zeroed");
 }
+#endif
 
 
 #include <errno.h>
@@ -4340,6 +4376,7 @@ void test_switch_unbraced_multi_decl_inter_case(void) {
 	CHECK_EQ(result_b, 0, "switch braced multi-decl inter-case b");
 }
 
+#ifndef _MSC_VER
 void test_generic_default_switch_defer_combo(void) {
 	log_reset();
 	int type = 42;
@@ -4379,6 +4416,7 @@ void test_generic_default_nested_switch_defer(void) {
 	log_append("end");
 	CHECK_LOG("bodyinnerouterend", "nested _Generic+switch+defer ordering");
 }
+#endif
 
 void test_typedef_table_scope_resilience(void) {
 	typedef int TTR_A;
@@ -4428,6 +4466,7 @@ void test_setjmp_detection_direct(void) {
 	CHECK_LOG("BD", "defer works in function without setjmp");
 }
 
+#ifndef _MSC_VER
 void test_generic_nested_default_in_switch_defer(void) {
 	log_reset();
 	int x = 1;
@@ -4457,6 +4496,7 @@ void test_generic_multi_default_switch(void) {
 	default: break;
 	}
 }
+#endif
 
 void test_typedef_braceless_for_restore(void) {
 	typedef int BFT;
@@ -4489,6 +4529,7 @@ void test_typedef_braceless_while_restore(void) {
 	CHECK_EQ(after, 0, "typedef after while body");
 }
 
+#ifndef _MSC_VER
 void test_vla_typedef_pointer_vs_value(void) {
 	int n = 4;
 	typedef int VlaArr[n];
@@ -4536,6 +4577,7 @@ void test_atomic_specifier_struct_zeroed(void) {
 	memset(zeros, 0, sizeof(zeros));
 	CHECK(memcmp(&v, zeros, sizeof(v)) == 0, "atomic specifier struct zero-initialized");
 }
+#endif
 
 void test_attr_before_type_zeroed(void) {
 	__attribute__((unused)) int x;
@@ -4620,11 +4662,13 @@ void test_switch_no_default_no_match_with_defer(void) {
 	CHECK_LOG("LLLE", "loop continues after unmatched switch");
 }
 
+#ifndef _MSC_VER
 void test_generic_compound_literal_association(void) {
 	int x = 42;
 	int result = _Generic(x, int: ((struct { int v; }){x}).v, default: -1);
 	CHECK_EQ(result, 42, "generic compound literal in association");
 }
+#endif
 
 #ifdef __GNUC__
 void test_generic_stmt_expr_with_defer(void) {
@@ -4784,6 +4828,7 @@ void test_typeof_volatile_inner_zeroed(void) {
 }
 #endif
 
+#ifndef _MSC_VER
 typedef int GenCount;
 static int _generic_colon_helper(void) {
 	GenCount n = 10;
@@ -4823,6 +4868,7 @@ static void test_vla_nested_delimiter_depth(void) {
 	a4[0] = 40;
 	CHECK_EQ(a4[0], 40, "vla from ternary result");
 }
+#endif
 
 static void test_typedef_survives_bare_semicolons(void) {
 	typedef int MyT;
@@ -4946,6 +4992,7 @@ static void test_c23_attr_positions(void) {
 }
 #endif
 
+#ifndef _MSC_VER
 static void test_vla_typedef_complex_size(void) {
 	int n = 3;
 	typedef int VArr[n];
@@ -4964,6 +5011,7 @@ static void test_vla_typedef_complex_size(void) {
 	arr3[0] = 300;
 	CHECK_EQ(arr3[0], 300, "vla typedef with parens");
 }
+#endif
 
 static void test_goto_stress_many_targets(void) {
 	int result = 0;
@@ -5056,12 +5104,14 @@ static void test_defer_with_indirect_call(void) {
 	CHECK_LOG("XD", "defer with indirect call");
 }
 
+#ifndef _MSC_VER
 static void test_vla_size_side_effect(void) {
 	int n = 5;
 	int vla[n++];
 	(void)vla;
 	CHECK_EQ(n, 6, "VLA size expr evaluated once");
 }
+#endif
 
 static void test_multi_ptr_zeroinit(void) {
 	int *p1;
@@ -5292,6 +5342,7 @@ static void test_goto_forward_same_scope_label(void) {
 	CHECK_LOG("ED", "goto same scope label with defer");
 }
 
+#ifndef _MSC_VER
 static void test_vla_sizeof_no_double_eval(void) {
 	int n = 4;
 	int before = n;
@@ -5312,6 +5363,7 @@ static void test_vla_memset_zeroinit(void) {
 	}
 	CHECK(all_zero, "VLA memset zeroinit all zeros");
 }
+#endif
 
 static void test_defer_scope_isolation(void) {
 	log_reset();
@@ -5658,11 +5710,13 @@ static void test_defer_switch_dead_zone_braced(void) {
 	CHECK_EQ(val, 10, "defer in dead switch case does not fire");
 }
 
+#ifndef _MSC_VER
 static void test_generic_const_array_zeroinit(void) {
 	int arr[_Generic(0, int: 10, default: 20)];
 	CHECK_EQ(arr[0], 0, "_Generic const array first elem zero");
 	CHECK_EQ(arr[9], 0, "_Generic const array last elem zero");
 }
+#endif
 
 struct _AnonRetTest {
 	int x;
@@ -5728,6 +5782,7 @@ _gap_label:;
 	CHECK_EQ((*arr)[2], 30, "goto array-ptr decl after label: accessible");
 }
 
+#ifndef _MSC_VER
 static void test_typeof_const_zero_init(void) {
 	typeof(const int) a;
 	CHECK_EQ(a, 0, "typeof(const int) zero-init via = {0}");
@@ -5735,6 +5790,7 @@ static void test_typeof_const_zero_init(void) {
 	const typeof(int) b;
 	CHECK_EQ(b, 0, "const typeof(int) zero-init via = {0}");
 }
+#endif
 
 // Function parameter that shadows a typedef must be treated as a variable, not a type
 static int _param_shadow_helper(int MyInt) {
@@ -5926,6 +5982,7 @@ static void test_array_orelse_rejected(void) {
 	    "array_orelse_expr.c", "non-const array orelse fallback rejected", "array");
 }
 
+#ifndef _MSC_VER
 static void test_deep_struct_nesting_goto(void) {
 	// This struct has 66 levels of nesting, pushing depth past the 64-bit
 	// bitmask threshold. The walker's deep_struct_opens counter tracks these.
@@ -6137,7 +6194,9 @@ done:
 	CHECK(flag == 1, "deep struct nesting: goto works correctly");
 	CHECK(d.leaf == 0, "deep struct nesting: zero-init works");
 }
+#endif
 
+#ifndef _MSC_VER
 static void test_generic_array_not_vla(void) {
 	int x = 0;
 	int arr[_Generic(x, int: 5, default: 10)];
@@ -6145,6 +6204,7 @@ static void test_generic_array_not_vla(void) {
 	// With the fix, it should use = {0} and sizeof is constant.
 	CHECK_EQ((int)sizeof(arr), 5 * (int)sizeof(int), "_Generic array size: not VLA");
 }
+#endif
 
 static void test_c23_attr_void_function(void) {
 	PrismResult result = prism_transpile_source(
@@ -6335,6 +6395,7 @@ static void test_bug_r2_ptr_return(void) {
 	CHECK_EQ(*p, 42, "bug_r2: ptr return value correct");
 }
 
+#ifndef _WIN32
 static void test_bug_r1_readonly_dir(void) {
 	if (getuid() == 0) {
 		passed++; total++;
@@ -6369,6 +6430,7 @@ static void test_bug_r1_readonly_dir(void) {
 	remove(src_path);
 	rmdir(dir);
 }
+#endif
 
 static void test_bug_r3_line_directive(void) {
 	// __FILE__ should be a valid string. If #line processing is broken,
@@ -6819,7 +6881,9 @@ void run_parse_tests(void) {
 	test_duff_device_with_defer_at_top();
 
 	/* Preprocessor numeric literals */
+#ifndef _MSC_VER
 	test_float128_suffix();
+#endif
 	test_float64_suffix();
 	test_float32_suffix();
 	test_float16_suffix();
@@ -6850,17 +6914,22 @@ void run_parse_tests(void) {
 	test_switch_conditional_break_defer();
 	test_switch_unconditional_break_works();
 	test_switch_braced_fallthrough_works();
+#ifndef _MSC_VER
 	test_vla_struct_member();
 	test_vla_struct_member_nested();
 	test_offsetof_vs_runtime();
 	test_stmt_expr_defer_goto();
 	test_stmt_expr_defer_normal();
 	test_nested_stmt_expr_defer();
+#endif
 	test_vanishing_statement_if_else();
 	test_vanishing_statement_while();
 	test_vanishing_statement_for();
+#ifndef _MSC_VER
 	test_attributed_label_defer();
+#endif
 	test_defer_label();
+#ifndef _MSC_VER
 	test_generic_default_first_association();
 	test_generic_default_collision();
 	test_generic_default_collision_nested();
@@ -6869,8 +6938,11 @@ void run_parse_tests(void) {
 	test_vla_backward_goto_stack_exhaustion();
 	test_vla_backward_goto_with_defer();
 	test_vla_pointer_init_semantics();
+#endif
 	test_typedef_shadow_semantics();
+#ifndef _MSC_VER
 	test_generic_default_no_switch();
+#endif
 	test_knr_function_parsing();
 	test_comma_operator_in_init();
 	test_switch_skip_hole_strict();
@@ -6880,21 +6952,29 @@ void run_parse_tests(void) {
 	test_thread_local_handling();
 	test_line_directive_preservation();
 	test_alignas_struct_bitfield();
+#ifndef _MSC_VER
 	test_generic_typedef_not_label();
+#endif
 	test_c23_attributes_zeroinit();
 	test_bitint_zeroinit();
 	test_pragma_pack_preservation();
+#ifndef _MSC_VER
 	test_return_stmt_expr_with_defer();
 	test_security_stmtexpr_value_corruption();
+#endif
 	test_security_braceless_defer_trap();
 	test_security_switch_goto_double_free();
 	test_ghost_shadow_corruption();
+#ifndef _MSC_VER
 	test_sizeof_vla_codegen();
+#endif
 	test_keyword_typedef_collision();
 	test_keyword_as_struct_field();
 	test_keyword_as_function_name();
+#ifndef _MSC_VER
 	test_sizeof_vla_typedef();
 	test_typeof_vla_zeroinit();
+#endif
 	test_bug1_ghost_shadow_while();
 	test_bug1_ghost_shadow_if();
 	test_ghost_shadow_braceless_break();
@@ -6903,6 +6983,7 @@ void run_parse_tests(void) {
 	test_ghost_shadow_nested_braceless();
 	test_bug2_ultra_complex_exact();
 	test_bug2_deeply_nested_parens();
+#ifndef _MSC_VER
 	test_bug3_stmtexpr_defer_ordering();
 	test_bug3_stmtexpr_defer_variable();
 	test_bug4_generic_fnptr();
@@ -6913,20 +6994,26 @@ void run_parse_tests(void) {
 	test_sizeof_parenthesized_vla();
 	test_edge_multiple_typedef_shadows();
 	test_edge_defer_in_generic();
+	test_attributed_label_defer();
+#endif
 	test_number_tokenizer_identifiers();
 	test_hex_numbers_vs_float_suffixes();
 	test_hex_and_identifier_edge_cases();
 	test_valid_number_suffixes();
+#ifndef _MSC_VER
 	test_return_zeroinit_no_defer();
 	test_return_zeroinit_with_defer();
 	test_return_zeroinit_multiple_decls();
 	test_return_zeroinit_nested_blocks();
 	test_sizeof_vla_zeroinit();
+#endif
 	test_goto_raw_decl();
 	test_attributed_default_label();
 	test_stmtexpr_void_cast_return();
+#ifndef _MSC_VER
 	test_stmtexpr_void_cast_return_helper();
 	test_stmtexpr_void_cast_check();
+#endif
 	test_variable_named_defer_goto();
 	test_defer_assignment_goto();
 	test_attributed_default_safety();
@@ -6935,6 +7022,7 @@ void run_parse_tests(void) {
 	test_void_typedef_overmatch();
 
 	/* Unicode/digraph tests */
+#ifndef _MSC_VER
 	test_utf8_latin_extended();
 	test_utf8_greek();
 	test_utf8_cyrillic();
@@ -6942,13 +7030,16 @@ void run_parse_tests(void) {
 	test_ucn_short();
 	test_ucn_long();
 	test_utf8_ucn_mixed();
+#endif
 	test_digraph_brackets();
 	test_digraph_braces();
 	test_digraph_struct();
 	test_digraph_complex();
 	test_digraph_defer();
+#ifndef _MSC_VER
 	test_utf8_defer();
 	test_utf8_math_identifiers();
+#endif
 
 	/* Compound literal in loop header */
 	test_compound_literal_for_break();
@@ -6975,8 +7066,10 @@ void run_parse_tests(void) {
 	test_defer_in_attribute_with_defer_stmt();
 
 	/* Additional bug fixes */
+#ifndef _MSC_VER
 	test_register_typeof_zeroinit();
 	test_register_typeof_multiple();
+#endif
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
 	test_c23_digit_separator_decimal();
 	test_c23_digit_separator_binary();
@@ -6987,9 +7080,11 @@ void run_parse_tests(void) {
 #else
 	printf("(C23 digit separator tests skipped - compiler doesn't support C23)\n");
 #endif
+#ifndef _MSC_VER
 	test_volatile_typeof_zeroinit();
 	test_volatile_typeof_struct();
 	test_volatile_typeof_array();
+#endif
 
 	/* Logical-op regression */
 	test_logical_op_eagain();
@@ -6997,20 +7092,26 @@ void run_parse_tests(void) {
 	/* Issue validation */
 	test_switch_unbraced_inter_case_decl();
 	test_switch_unbraced_multi_decl_inter_case();
+#ifndef _MSC_VER
 	test_generic_default_switch_defer_combo();
 	test_generic_default_nested_switch_defer();
+#endif
 	test_typedef_table_scope_resilience();
 	test_typedef_table_churn();
 	test_setjmp_detection_direct();
+#ifndef _MSC_VER
 	test_generic_nested_default_in_switch_defer();
 	test_generic_multi_default_switch();
+#endif
 	test_typedef_braceless_for_restore();
 	test_typedef_nested_braceless_restore();
 	test_typedef_braceless_while_restore();
+#ifndef _MSC_VER
 	test_vla_typedef_pointer_vs_value();
 	test_vla_zeroed_each_loop_iteration();
 	test_atomic_struct_zeroed();
 	test_atomic_specifier_struct_zeroed();
+#endif
 	test_attr_before_type_zeroed();
 	test_attr_between_type_and_var_zeroed();
 	test_attr_after_var_zeroed();
@@ -7020,7 +7121,9 @@ void run_parse_tests(void) {
 	test_attr_struct_var_zeroed();
 	test_switch_no_match_defer_skipped();
 	test_switch_no_default_no_match_with_defer();
+#ifndef _MSC_VER
 	test_generic_compound_literal_association();
+#endif
 #ifdef __GNUC__
 	test_generic_stmt_expr_with_defer_wrapper();
 #endif
@@ -7033,10 +7136,12 @@ void run_parse_tests(void) {
 	test_label_zeroinit_in_stmt_expr();
 	test_typeof_volatile_inner_zeroed();
 #endif
+#ifndef _MSC_VER
 	test_generic_colon_in_defer();
 
 	/* Additional parse tests */
 	test_vla_nested_delimiter_depth();
+#endif
 	test_typedef_survives_bare_semicolons();
 	test_for_init_typedef_shadow_cleanup();
 	test_orelse_comma_operator_expr();
@@ -7045,12 +7150,16 @@ void run_parse_tests(void) {
 #if __STDC_VERSION__ >= 202311L
 	test_c23_attr_positions();
 #endif
+#ifndef _MSC_VER
 	test_vla_typedef_complex_size();
+#endif
 	test_goto_stress_many_targets();
 	test_goto_converging_defers();
 	test_stack_aggregate_zeroinit();
 	test_defer_with_indirect_call();
+#ifndef _MSC_VER
 	test_vla_size_side_effect();
+#endif
 	test_multi_ptr_zeroinit();
 	test_typedef_scope_after_braceless();
 	test_const_orelse_scalar_fallback();
@@ -7068,8 +7177,10 @@ void run_parse_tests(void) {
 	test_goto_forward_no_decl_skip();
 	test_goto_backward_safe();
 	test_goto_forward_same_scope_label();
+#ifndef _MSC_VER
 	test_vla_sizeof_no_double_eval();
 	test_vla_memset_zeroinit();
+#endif
 	test_defer_scope_isolation();
 	test_defer_braceless_rejected();
 	test_zeroinit_typedef_after_control();
@@ -7094,13 +7205,17 @@ void run_parse_tests(void) {
 	test_for_init_typedef_nested_loops();
 #endif
 	test_defer_switch_dead_zone_braced();
+#ifndef _MSC_VER
 	test_generic_const_array_zeroinit();
+#endif
 	test_named_struct_return_with_defer();
 	test_typedef_struct_return_with_defer();
 	test_goto_fnptr_decl_after_label();
 	test_goto_fnptr_decl_before_goto();
 	test_goto_array_ptr_decl_after_label();
+#ifndef _MSC_VER
 	test_typeof_const_zero_init();
+#endif
 	test_param_typedef_shadow();
 	test_goto_over_static_decl();
 	test_defer_break_continue_rejected();
@@ -7115,8 +7230,12 @@ void run_parse_tests(void) {
 	test_t_heuristic_shadow_param();
 	test_t_heuristic_noshadow();
 	test_array_orelse_rejected();
+#ifndef _MSC_VER
 	test_deep_struct_nesting_goto();
+#endif
+#ifndef _MSC_VER
 	test_generic_array_not_vla();
+#endif
 	test_c23_attr_void_function();
 
 	/* Bug regression round 2 */
@@ -7134,7 +7253,9 @@ void run_parse_tests(void) {
 	test_bug_r2_fnptr_return_typedef();
 	test_bug_r2_fnptr_return_raw();
 	test_bug_r2_ptr_return();
+#ifndef _WIN32
 	test_bug_r1_readonly_dir();
+#endif
 	test_bug_r3_line_directive();
 	test_void_parenthesized_func_defer();
 

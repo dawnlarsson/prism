@@ -354,6 +354,7 @@ void test_raw_multi_decl(void) {
 	CHECK(a == 1 && b == 2, "raw multi-declaration compiles");
 }
 
+#ifndef _MSC_VER // C++ raw string literals (R"(...)") not supported in MSVC C mode
 void test_raw_string_literals(void) {
 	// Test 1: Basic raw string with backslashes
 	const char *path = R"(C:\Path\To\File)";
@@ -372,6 +373,7 @@ Line 3)";
 	const char *escaped = R"(\n\t\r\0)";
 	CHECK(strcmp(escaped, "\\n\\t\\r\\0") == 0, "raw string doesn't interpret escapes");
 }
+#endif // _MSC_VER raw string literals
 
 void test_raw_keyword_after_static(void) {
 	// raw after static - this was the bug: 'raw' was not consumed
@@ -402,6 +404,7 @@ void test_raw_keyword_before_static(void) {
 	CHECK_EQ(raw_before_static, 0, "raw static int: raw consumed, no zero-init");
 }
 
+#ifndef _MSC_VER // C++ raw string literal tests
 void test_raw_string_basic(void) {
 	// C23 raw string literal with newlines
 	const char *json = R"(
@@ -611,6 +614,7 @@ void test_raw_string_html_template(void) {
 	CHECK(strstr(html, "<script>") != NULL, "raw HTML script");
 	CHECK(strstr(html, "\\\"World\\\"") != NULL, "raw HTML JS string");
 }
+#endif // _MSC_VER raw string tests
 
 void test_raw_as_function_pointer_var(void) {
 	int (*raw)(const char *) = (int (*)(const char *))strlen;
@@ -632,6 +636,7 @@ void test_raw_struct_field_access(void) {
 	CHECK_EQ(s.raw, 77, "raw as struct field access");
 }
 
+#ifndef _MSC_VER
 void test_raw_vla_skips_zeroinit(void) {
 	int n = 4;
 	int sum = 0;
@@ -642,6 +647,7 @@ void test_raw_vla_skips_zeroinit(void) {
 	}
 	CHECK_EQ(sum, 3, "raw VLA in loop compiles and runs");
 }
+#endif
 
 typedef int *_RawIntPtr;
 
@@ -736,6 +742,7 @@ static void test_switch_raw_var_in_body(void) {
 	CHECK_EQ(result, 20, "switch raw var in body");
 }
 
+#ifndef _MSC_VER // raw string delimiter tests
 static void test_raw_string_max_delimiter(void) {
 	const char *s = R"ABCDEFGHIJKLMNOP(hello raw)ABCDEFGHIJKLMNOP";
 	CHECK(strcmp(s, "hello raw") == 0, "raw string 16-char delimiter");
@@ -750,8 +757,10 @@ static void test_raw_string_16_char_delimiter(void) {
 	const char *s = R"1234567890ABCDEF(sixteen char delim)1234567890ABCDEF";
 	CHECK(strcmp(s, "sixteen char delim") == 0, "raw string exactly 16-char delimiter");
 }
+#endif // _MSC_VER
 
 
+#ifndef _MSC_VER
 void test_raw_c23_attribute(void) {
     [[maybe_unused]] raw int x;
     x = 10;
@@ -763,12 +772,15 @@ void test_raw_gnu_attribute(void) {
     y = 20;
     CHECK_EQ(y, 20, "raw with GNU attribute");
 }
+#endif // _MSC_VER
 
+#ifndef _MSC_VER
 void test_raw_atomic(void) {
     _Atomic raw int z;
     z = 30;
     CHECK_EQ(z, 30, "raw with _Atomic");
 }
+#endif
 
 void test_raw_qualifier_order(void) {
     volatile raw int a;
@@ -785,11 +797,13 @@ void test_raw_register(void) {
     CHECK_EQ(c, 60, "raw with register");
 }
 
+#ifndef _MSC_VER
 void test_raw_thread_local(void) {
     static _Thread_local raw int d;
     d = 70;
     CHECK_EQ(d, 70, "raw with _Thread_local");
 }
+#endif // _MSC_VER
 
 
 static void test_raw_multi_declarator_second_var_uninitialized(void) {
@@ -981,8 +995,9 @@ static void test_raw_prep_dir_pragma(void) {
 	// int x should NOT have = 0 (raw suppresses zero-init)
 	CHECK(strstr(result.output, "= 0") == NULL && strstr(result.output, "= {0}") == NULL,
 	      "raw prep_dir: no zero-init (raw suppression active through pragma)");
-	// The pragma should still be present
-	CHECK(strstr(result.output, "#pragma pack(push,1)") != NULL,
+	// The pragma should still be present (MSVC emits __pragma instead of #pragma)
+	CHECK(strstr(result.output, "#pragma pack(push,1)") != NULL ||
+	      strstr(result.output, "__pragma(pack(push,1))") != NULL,
 	      "raw prep_dir: #pragma pack preserved in output");
 
 	prism_free(&result);
@@ -1062,7 +1077,9 @@ void run_raw_tests(void) {
 	test_raw_keyword_after_extern();
 	test_raw_keyword_before_static();
 	test_raw_mixed_usage();
+#ifndef _MSC_VER
 	test_raw_vla_skips_zeroinit();
+#endif
 	test_raw_star_ptr_decl();
 	test_switch_raw_var_in_body();
 
@@ -1102,6 +1119,7 @@ void run_raw_tests(void) {
 	test_goto_keyword_label_zeroinit();
 
 	// Raw string literals (R"(...)")
+#ifndef _MSC_VER
 	test_raw_string_literals();
 	test_raw_string_basic();
 	test_raw_string_with_backslash();
@@ -1127,13 +1145,20 @@ void run_raw_tests(void) {
 	test_raw_string_max_delimiter();
 	test_raw_string_near_max_delimiter();
 	test_raw_string_16_char_delimiter();
+#endif
 
+#ifndef _MSC_VER
 	test_raw_c23_attribute();
 	test_raw_gnu_attribute();
+#endif
+#ifndef _MSC_VER
 	test_raw_atomic();
+#endif
 	test_raw_qualifier_order();
 	test_raw_register();
+#ifndef _MSC_VER
 	test_raw_thread_local();
+#endif
 	test_raw_multi_declarator_second_var_uninitialized();
 	test_static_const_raw_ordering();
 	test_raw_typedef_blinds_type_tracker();

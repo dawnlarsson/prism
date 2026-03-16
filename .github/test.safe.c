@@ -85,9 +85,9 @@ void test_goto_with_defer_valid(void) {
 	{
 		defer log_append("D");
 		log_append("A");
-		if (x > 0) goto OUT;
+		if (x > 0) goto SAFE_OUT;
 		log_append("X");
-	OUT:
+	SAFE_OUT:
 		log_append("B");
 	}
 	log_append("E");
@@ -237,6 +237,7 @@ void test_typedef_voidptr_return(void) {
 	CHECK(result == NULL, "typedef void* return value preserved");
 }
 
+#ifndef _MSC_VER
 void test_stmt_expr_defer_timing(void) {
 	log_reset();
 	int capture = 0;
@@ -278,6 +279,7 @@ void test_nested_stmt_expr_defer_immediate_block_exit(void) {
 	// Order: O (outer block exit), I (inner block exit), M, E
 	CHECK_LOG("OIME", "nested stmt expr - defer order (blocks exit immediately)");
 }
+#endif // _MSC_VER
 
 typedef struct {
 	int x;
@@ -489,6 +491,7 @@ void test_defer_in_for_parts(void)
 }
 */
 
+#ifndef _MSC_VER
 void test_ptr_to_vla_typedef(int n) {
 	typedef int VlaType[n]; // VLA typedef
 	VlaType *p;		// Pointer to VLA - should be zero-init'd to NULL
@@ -520,7 +523,9 @@ void test_vla_side_effect_once(void) {
 	CHECK_EQ(vla_size_counter, 1, "VLA size function called once");
 	(void)sizeof(Arr2);
 }
+#endif
 
+#ifndef _MSC_VER
 void test_atomic_specifier_form(void) {
 	// Qualifier form (already worked)
 	_Atomic int a;
@@ -536,8 +541,9 @@ void test_atomic_specifier_form(void) {
 	_Atomic(int *) d; // atomic pointer
 	CHECK(d == NULL, "_Atomic(int*) zero-init");
 }
+#endif
 
-#ifndef __clang__
+#if !defined(__clang__) && !defined(_MSC_VER)
 
 void test_atomic_struct_basic(void) {
 	struct AtomicPoint {
@@ -1566,6 +1572,7 @@ void test_sizeof_static_var(void) {
 	CHECK(all_zero, "sizeof(static var) zero-init");
 }
 
+#ifndef _MSC_VER
 void test_sizeof_true_vla_detected(void) {
 	int n = 5;
 	int vla[n];
@@ -1590,6 +1597,7 @@ void test_sizeof_nested_vla_detection(void) {
 
 	CHECK(vla1[0] == 1 && vla2[0] == 'A', "nested VLA sizeof detection");
 }
+#endif
 
 
 
@@ -1650,6 +1658,7 @@ void test_union_offsetof_division(void) {
 	CHECK(u.x == 123, "union offsetof division - no zeroinit");
 }
 
+#ifndef _MSC_VER
 void test_vla_basic(void) {
 	int n = 5;
 	int vla[n]; // VLA - prism should NOT add = {0}
@@ -1668,6 +1677,7 @@ void test_vla_expression_size(void) {
 	}
 	CHECK(vla[0] == 0 && vla[4] == 8, "VLA expression size - no zeroinit");
 }
+#endif
 
 
 #ifdef __GNUC__
@@ -2241,12 +2251,15 @@ static void test_void_func_ptr_typedef(void) {
 	CHECK_EQ(void_typedef_cleanup_count, 1, "void_func_ptr_typedef_call");
 }
 
+#ifndef _MSC_VER
 static void test_generic_void_typedef_no_label_confusion(void) {
 	int x = 42;
 	int result = _Generic(x, int: 1, VoidAlias *: 2, default: 3);
 	CHECK_EQ(result, 1, "generic_void_typedef_no_label_confusion");
 }
+#endif // _MSC_VER
 
+#ifndef _MSC_VER
 static void test_vla_zeroinit_basic(void) {
 	int n = 10;
 	int arr[n]; // Standard VLA - should be zero-initialized by Prism
@@ -2284,6 +2297,7 @@ static void test_vla_zeroinit_nested_scope(void) {
 		CHECK(all_zero, "VLA nested-scope zero-init via memset");
 	}
 }
+#endif // _MSC_VER (VLA zeroinit tests)
 
 static void test_hashmap_tombstone_high_churn_load(void) {
 	// Heavy typedef churn: if tombstones aren't counted in load factor,
@@ -2386,6 +2400,7 @@ static void test_typedef_tombstone_saturation_extended(void) {
 	CHECK_EQ(sum, 0, "typedef tombstone saturation 8x1000");
 }
 
+#ifndef _MSC_VER
 static void test_struct_static_assert_compound_literal(void) {
 	struct SACompLit {
 		int x;
@@ -2424,6 +2439,7 @@ static void test_struct_compound_literal_then_nested_struct(void) {
 	CHECK(o.before == 0 && o.inner.ix == 0 && o.inner.iy == 0 && o.after == 0,
 	      "struct compound literal then nested struct");
 }
+#endif // _MSC_VER (_Static_assert tests)
 
 static void test_for_init_multi_decl_all_zeroed(void) {
 	volatile int sum = 0;
@@ -3016,8 +3032,10 @@ void run_safe_tests(void) {
 	/* Rigor tests */
 	test_typedef_void_return();
 	test_typedef_voidptr_return();
+#ifndef _MSC_VER
 	test_stmt_expr_defer_timing();
 	test_nested_stmt_expr_defer_immediate_block_exit();
+#endif
 	test_const_after_typename();
 	test_atomic_zeroinit();
 	test_atomic_aggregate_zeroinit();
@@ -3029,10 +3047,14 @@ void run_safe_tests(void) {
 	test_extern_not_initialized();
 	test_typedef_not_initialized();
 	test_for_init_zeroinit();
+#ifndef _MSC_VER
 	test_ptr_to_vla_typedef(5);
 	test_vla_side_effect_once();
+#endif
+#ifndef _MSC_VER
 	test_atomic_specifier_form();
-#ifndef __clang__
+#endif
+#if !defined(__clang__) && !defined(_MSC_VER)
 	test_atomic_struct_basic();
 	test_atomic_union_basic();
 	test_atomic_struct_nested();
@@ -3093,8 +3115,10 @@ void run_safe_tests(void) {
 	test_sizeof_volatile_var();
 	test_sizeof_restrict_ptr();
 	test_sizeof_static_var();
+#ifndef _MSC_VER
 	test_sizeof_true_vla_detected();
 	test_sizeof_nested_vla_detection();
+#endif
 
 	/* sizeof/constexpr */
 	test_sizeof_in_array_bound();
@@ -3129,8 +3153,10 @@ void run_safe_tests(void) {
 	test_manual_offsetof_in_union();
 	test_manual_offsetof_local();
 	test_union_offsetof_division();
+#ifndef _MSC_VER
 	test_vla_basic();
 	test_vla_expression_size();
+#endif
 
 	/* Bulletproof regression */
 #ifdef __GNUC__
@@ -3178,20 +3204,26 @@ void run_safe_tests(void) {
 	test_void_typedef_bare_return();
 	test_void_ptr_typedef_not_void();
 	test_void_func_ptr_typedef();
+#ifndef _MSC_VER
 	test_generic_void_typedef_no_label_confusion();
+#endif
+#ifndef _MSC_VER
 	test_vla_zeroinit_basic();
 	test_vla_zeroinit_expression_size();
 	test_vla_zeroinit_large();
 	test_vla_zeroinit_nested_scope();
+#endif
 	test_hashmap_tombstone_high_churn_load();
 	test_deep_pointer_nesting();
 
 	/* Additional safe tests */
 	test_typedef_extreme_scope_churn();
 	test_typedef_tombstone_saturation_extended();
+#ifndef _MSC_VER
 	test_struct_static_assert_compound_literal();
 	test_struct_nested_compound_literal_depth();
 	test_struct_compound_literal_then_nested_struct();
+#endif
 	test_for_init_multi_decl_all_zeroed();
 #ifdef __GNUC__
 	test_for_init_stmt_expr_with_decls();

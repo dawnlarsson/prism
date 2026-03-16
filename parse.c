@@ -750,8 +750,12 @@ static inline bool is_potential_func_name(Token *tok) {
 }
 
 static void init_keyword_map(void) {
+#if defined(_MSC_VER)
+#pragma warning(push)
+#else
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#endif
 	static struct {
 		char *name;
 		uint32_t tag;
@@ -809,6 +813,10 @@ static void init_keyword_map(void) {
 	    {"__int128_t", TT_TYPE, true},
 	    {"__uint128", TT_TYPE, true},
 	    {"__uint128_t", TT_TYPE, true},
+	    {"__int8", TT_TYPE, true},
+	    {"__int16", TT_TYPE, true},
+	    {"__int32", TT_TYPE, true},
+	    {"__int64", TT_TYPE, true},
 	    {"typeof_unqual", TT_TYPE | TT_TYPEOF, true},
 	    {"auto", TT_QUALIFIER | TT_TYPE, true},
 	    {"register", TT_QUALIFIER | TT_REGISTER, true},
@@ -825,6 +833,7 @@ static void init_keyword_map(void) {
 	    {"__attribute", TT_ATTR | TT_QUALIFIER, true},
 	    {"__declspec", TT_ATTR | TT_QUALIFIER, true},
 	    {"_Pragma", TT_ATTR, true},
+	    {"__pragma", TT_ATTR, true},
 	    {"__extension__", 0, true},
 	    {"__builtin_va_list", 0, true},
 	    {"__builtin_va_arg", 0, true},
@@ -857,7 +866,11 @@ static void init_keyword_map(void) {
 	    {"savectx", TT_SPECIAL_FN, false},
 	    {"vfork", TT_SPECIAL_FN, false},
 	};
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#else
 #pragma GCC diagnostic pop
+#endif
 
 	memset(keyword_cache, 0, sizeof(keyword_cache));
 	for (size_t i = 0; i < sizeof(entries) / sizeof(*entries); i++) {
