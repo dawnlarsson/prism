@@ -7,15 +7,15 @@ Prism is a lightweight and very fast transpiler that makes C safer without chang
 
 - **3136 tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
-- **Proper transpiler** — tracks typedefs, respects scope, catches unsafe patterns
+- **Two-pass transpiler** — full semantic analysis before a single byte is emitted
 - **Opt-out features** — Disable parts of the transpiler, like zero-init, with CLI flags
 - **Drop-in overlay** — Use `CC=prism` in any build system — GCC-compatible flags pass through automatically
 - **Single Repo** — zero dependencies, easy to audit, only need a C compiler
 
 Prism is a proper transpiler, not a preprocessor macro.
-* **Track Types:** A pre-scan pass registers every `typedef`, `enum` constant, and tag at file scope into a symbol table *before* transpilation begins — no heuristics, no suffix guessing. If it wasn't declared, it's not a type.
-* **Respect Scope:** It understands braces `{}`, statement expressions `({ ... })`, and switch-case fallthrough, ensuring `defer` fires exactly when it should.
-* **Detect Errors:** It catches unsafe patterns (like jumping into a scope with `goto`) before they become runtime bugs.
+* **Track Types:** Pass 1 walks every token at every depth, registering every `typedef`, `enum` constant, parameter shadow, and VLA tag into an immutable symbol table — no heuristics, no suffix guessing. If it wasn't declared, it's not a type
+* **Respect Scope:** A full scope tree maps every `{`/`}` pair with parent links and classification (loop, switch, conditional, function body, statement expression). `defer` fires exactly when it should — no state machines in the emitter
+* **Detect Errors Early:** A CFG verifier checks every `goto`→label and `switch`→`case` pair against defers and declarations **before** code generation starts. If your code is unsafe, Prism errors before writing a single byte
 
 ## Quick Start
 
@@ -139,7 +139,7 @@ void example() {
 }
 ```
 
-**Typedef tracking:** Before transpilation, Prism pre-scans the preprocessed token stream to build a complete symbol table of all file-scope `typedef`s, `enum` constants, and tags. This is deterministic — `size_t`, `pthread_mutex_t`, and every other typedef from system headers are resolved by name lookup, not pattern matching. This distinguishes `size_t x;` (declaration → initialize) from `size_t * x;` (expression → don't touch).
+**Typedef tracking:** Before code generation, Pass 1 walks the entire preprocessed token stream at all depths — not just file scope — to build a complete, immutable symbol table of every `typedef`, `enum` constant, parameter shadow, and VLA tag. This is deterministic — `size_t`, `pthread_mutex_t`, and every other typedef from system headers are resolved by name lookup, not pattern matching. This distinguishes `size_t x;` (declaration → initialize) from `size_t * x;` (expression → don't touch).
 
 **VLA support:** Variable-length arrays get `memset` at runtime.
 
@@ -270,10 +270,10 @@ struct Vec2 *p = get_vec2() orelse return -1;  // OK — pointer is scalar
 **Opt-out:** `prism -fno-orelse src.c`
 
 ## Safety Enforcement
-Prism acts as a static analysis tool, turning common C pitfalls into compile-time errors.
+Prism acts as a static analysis tool, turning common C pitfalls into compile-time errors — all before a single byte of output is emitted.
 
 ### No Uninitialized Jumps
-Standard C allows `goto` to skip variable initialization, leading to undefined behavior. Prism performs a single-pass dominator analysis to forbid this:
+Standard C allows `goto` to skip variable initialization, leading to undefined behavior. Prism's CFG verifier checks every `goto`→label pair in an O(N) linear sweep:
 
 ```c
 // THIS WILL FAIL TO COMPILE
@@ -284,6 +284,21 @@ skip:
     printf("%d", x);
 }
 // Error: goto 'skip' would skip over variable declaration 'x'
+```
+
+The same analysis covers `switch`/`case` — jumping from one case into a nested block that has zero-initialized declarations or active defers is rejected:
+
+```c
+void bad_switch(int n) {
+    switch (n) {
+        case 1: {
+            defer cleanup();
+            // ...
+        }
+        case 2:  // Error: defer skipped by switch fallthrough
+            break;
+    }
+}
 ```
 
 ### Defer in Forbidden Contexts
@@ -345,7 +360,7 @@ Not:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v0.119.0 - Robust C transpiler
+Prism v0.120.0 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 
@@ -407,6 +422,28 @@ PrismFeatures prism_defaults(void);
 PrismResult   prism_transpile_file(const char *path, PrismFeatures features);
 void          prism_free(PrismResult *r);
 ```
+
+## Architecture
+
+Prism processes C in two passes. Pass 1 performs full semantic analysis and catches all errors. Pass 2 is a near-pure code generator that reads Pass 1's immutable artifacts — no type table mutations, no speculative token walking, no mid-emit errors.
+
+| Phase | What it does |
+|---|---|
+| **Pass 0** — Tokenizer | Tokenize, delimiter-match, keyword-tag, build setjmp/vfork/asm taint graph per function |
+| **Pass 1A** — Scope Tree | Walk all tokens, assign scope IDs, build parent chain, classify each `{` (loop/switch/conditional/function/struct) |
+| **Pass 1B** — Type Registration | Full-depth `typedef`, `enum`, VLA tag registration at all scopes — symbol table frozen after this point |
+| **Pass 1C** — Shadow Table | Record every variable that shadows a typedef, with scope ID and token index for temporally-correct lookup |
+| **Pass 1D** — CFG Collection | Per-function arrays of labels, gotos, defers, declarations, switch/case entries |
+| **Pass 1E** — Return Type Capture | Record each function's return type range and void/setjmp/vfork/asm flags |
+| **Pass 1F** — Defer Validation | Reject forbidden patterns inside defer bodies (return, goto, break, continue, nested stmt-expr) |
+| **Pass 1G** — Braceless Tagging | Mark control keywords whose braceless body contains Prism keywords needing brace injection |
+| **Pass 1H** — Orelse Classification | Classify orelse in brackets and declaration initializers; reject at file scope |
+| **Phase 2A** — CFG Verification | O(N) snapshot-and-sweep: verify every goto→label and switch→case pair against defers and declarations |
+| **Pass 2** — Code Generation | Emit transformed C. Reads immutable scope tree, typedef table, shadow table. No type mutations, no safety checks |
+
+**Key invariant:** Every semantic error is raised before Pass 2 emits its first byte. If code generation starts, it runs to completion.
+
+see `.github/SPEC.md` for full breakdown.
 
 # Repo
 Apache 2.0 license (c) Dawn Larsson 2026

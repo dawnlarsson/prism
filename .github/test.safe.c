@@ -2926,18 +2926,16 @@ static void test_forward_declared_longjmp_blind_spot(void) {
 static void test_deep_nesting_goto_bypass(void) {
 	printf("\n--- 256-Depth Guardrail Bypass ---\n");
 
-	// Labels at brace depth > 256 lose their block_open tracking,
-	// causing backward_goto_skips_decl to silently return NULL.
-	// This allows goto to jump backward past variable declarations
-	// without triggering the zero-init safety check.
-	// Build code with 300 nested braces, a declaration, then a label.
+	// Phase 2A scope tree handles any depth (up to 4096).
+	// Verify that backward goto past an uninitialized declaration
+	// at depth 301 is correctly rejected (no depth-limit blind spot).
 	char code[8192];
 	int pos = 0;
 	pos += snprintf(code + pos, sizeof(code) - pos, "int main(void) {\n");
 	for (int i = 0; i < 300; i++)
 		pos += snprintf(code + pos, sizeof(code) - pos, "{\n");
 	pos += snprintf(code + pos, sizeof(code) - pos,
-	    "int x = 0;\n"
+	    "int x;\n"
 	    "label: ;\n"
 	    "(void)x;\n");
 	for (int i = 0; i < 300; i++)

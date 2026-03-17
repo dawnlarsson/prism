@@ -336,6 +336,7 @@ typedef struct PrismContext {
 	// Token pools: parallel hot/cold arrays for cache-optimal access
 	Token *tp_pool;        // Hot: tag, next_idx, match_idx, len, kind, flags
 	TokenCold *tp_cold;    // Cold: loc_offset, line_no, file_idx
+	uint8_t *pass1_ann;    // Per-token Pass 1 annotations (parallel to tp_pool)
 	uint32_t tp_count;     // Next free index. 0 reserved as NULL sentinel.
 	uint32_t tp_cap;
 
@@ -350,6 +351,26 @@ typedef struct PrismContext {
 	char dg_brace_close[2];
 	char dg_hash[2];
 	char dg_paste[3];
+
+	// Pass 1 infrastructure (scope tree + per-function metadata)
+	// Stored as void* because the struct definitions live in prism.c (after #include "parse.c")
+	void *p1_scope_tree;       // ScopeInfo[] — flat array indexed by scope_id
+	uint16_t p1_scope_count;
+	uint16_t p1_scope_cap;
+	void *p1_func_meta;        // FuncMeta[] — one per function definition
+	int p1_func_meta_count;
+	int p1_func_meta_cap;
+
+	// Pass 1 shadow table: variable declarations that shadow typedefs
+	void *p1_shadow_entries;   // P1ShadowEntry[] — shadow chain per name
+	int p1_shadow_count;
+	int p1_shadow_cap;
+	HashMap p1_shadow_map;     // name → (index+1) into p1_shadow_entries
+
+	// Pass 1 per-function entries: labels, gotos, defers, decls, switches, cases
+	void *p1_func_entries;     // P1FuncEntry[] — flat combined array
+	int p1_func_entry_count;
+	int p1_func_entry_cap;
 
 #ifdef PRISM_LIB_MODE
 	char *active_membuf;	       // open_memstream buffer; freed on longjmp recovery
@@ -368,6 +389,7 @@ static inline bool is_digraph_loc(char *loc) {
 // Convenience accessors for per-context state (go through thread-local ctx)
 #define token_pool  (ctx->tp_pool)
 #define token_cold  (ctx->tp_cold)
+#define p1_ann      (ctx->pass1_ann)
 #define token_count (ctx->tp_count)
 #define token_cap   (ctx->tp_cap)
 #define keyword_cache (ctx->kw_cache)
@@ -501,6 +523,10 @@ static void token_pool_ensure(size_t need) {
 	TokenCold *c = realloc(token_cold, new_cap * sizeof(TokenCold));
 	if (!c) error("out of memory allocating token cold pool");
 	token_cold = c;
+	uint8_t *a = realloc(p1_ann, new_cap * sizeof(uint8_t));
+	if (!a) error("out of memory allocating pass1 annotations");
+	memset(a + token_cap, 0, (new_cap - token_cap) * sizeof(uint8_t));
+	p1_ann = a;
 	token_cap = (uint32_t)new_cap;
 }
 
@@ -1793,8 +1819,10 @@ void tokenizer_teardown(bool full) {
 		memset(keyword_cache, 0, sizeof(keyword_cache));
 		free(token_pool);
 		free(token_cold);
+		free(p1_ann);
 		token_pool = NULL;
 		token_cold = NULL;
+		p1_ann = NULL;
 		token_count = 1;
 		token_cap = 0;
 	} else {
