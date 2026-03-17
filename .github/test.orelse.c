@@ -2500,17 +2500,19 @@ static void test_c23_attr_bracket_orelse_dim_hoist(void) {
 	PrismResult r = prism_transpile_source(code, "c23attr_dim.c", prism_defaults());
 	if (r.status == PRISM_OK && r.output) {
 		// The [[]] attribute must NOT be hoisted as a dimension temp.
-		// If it is, we'll see _Prism_dim_ containing the attribute guts.
-		const char *dim = strstr(r.output, "_Prism_dim_");
-		if (dim) {
-			// A _Prism_dim_ for the real [2] dimension is fine.
-			// But there must be at most ONE _Prism_dim_ (the real dim).
-			// If the attribute bracket was also hoisted, there will be two.
-			const char *second = strstr(dim + 11, "_Prism_dim_");
-			CHECK(second == NULL,
-			      "c23-attr-bracket-orelse: C23 [[]] attribute hoisted "
-			      "as dimension temp by emit_bracket_orelse_temps");
+		// If it is, we'll see attribute guts (e.g. "aligned") inside a
+		// _Prism_dim_ hoisted expression.  Count distinct _Prism_dim_
+		// definitions: "long long _Prism_dim_".  Only the real [2] dim
+		// should be hoisted; the attribute bracket must not add another.
+		int dim_defs = 0;
+		const char *p = r.output;
+		while ((p = strstr(p, "long long _Prism_dim_")) != NULL) {
+			dim_defs++;
+			p += 20;
 		}
+		CHECK(dim_defs <= 1,
+		      "c23-attr-bracket-orelse: C23 [[]] attribute hoisted "
+		      "as dimension temp by emit_bracket_orelse_temps");
 	}
 	prism_free(&r);
 }
@@ -2620,6 +2622,103 @@ static void test_bare_orelse_emit_range_prep_dir_leak(void) {
 			      "bare-orelse-emit-range-prep-dir-leak: preprocessor "
 			      "directive leaked into if-condition via emit_range");
 		}
+	}
+	prism_free(&r);
+}
+
+static void test_nested_bracket_orelse_dim_id_misalignment(void) {
+	// BUG: emit_bracket_orelse_temps collects only top-level brackets.
+	// When a non-orelse bracket contains a nested bracket (e.g. sizeof(int[2])),
+	// walk_balanced_orelse recurses into the nested bracket and consumes a
+	// bracket_dim_id meant for the NEXT top-level bracket.
+	// Result: sizeof(int[2]) becomes sizeof(int[a_fn()]) in the emitted code,
+	// and the second dimension [a_fn()] is not replaced by its hoisted temp.
+	const char *code =
+	    "int n_fn(void) { return 3; }\n"
+	    "int a_fn(void) { return 2; }\n"
+	    "void f(void) {\n"
+	    "    int arr[(int)sizeof(int[2])][a_fn()][n_fn() orelse 1];\n"
+	    "    (void)arr;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "nested_bracket_dim.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		const char *in_func = strstr(r.output, "void f(");
+		if (in_func) {
+			// The nested [2] inside sizeof must NOT be replaced by _Prism_dim_.
+			// If it is, the literal '2' disappears and gets substituted with
+			// the hoisted value of a_fn() — completely wrong semantics.
+			const char *sizeof_start = strstr(in_func, "sizeof");
+			if (sizeof_start) {
+				// Find the closing paren of sizeof(...)
+				const char *end = sizeof_start + 200;
+				const char *dim_in_sizeof = NULL;
+				for (const char *p = sizeof_start; p < end && *p; p++) {
+					if (*p == ')') break;
+					if (p[0] == '_' && p[1] == 'P' && !memcmp(p, "_Prism_dim_", 11)) {
+						dim_in_sizeof = p;
+						break;
+					}
+				}
+				CHECK(dim_in_sizeof == NULL,
+				      "nested-bracket-orelse: _Prism_dim_ leaked into sizeof() — "
+				      "walk_balanced_orelse consumed a dim ID from a nested bracket");
+			}
+			// The [a_fn()] dimension must be replaced by its _Prism_dim_ temp,
+			// not left as a raw call (which double-evaluates a_fn()).
+			const char *arr_decl = strstr(in_func, "int arr[");
+			if (arr_decl) {
+				int afn_count = 0;
+				for (const char *p = arr_decl; p < arr_decl + 300 && *p && *p != ';'; p++)
+					if (p[0] == 'a' && p[1] == '_' && p[2] == 'f' && p[3] == 'n')
+						afn_count++;
+				CHECK(afn_count == 0,
+				      "nested-bracket-orelse: a_fn() not replaced by dim temp in "
+				      "array declaration (double evaluation)");
+			}
+		}
+	} else {
+		CHECK(r.status != PRISM_OK,
+		      "nested-bracket-orelse: rejected by transpiler (acceptable)");
+	}
+	prism_free(&r);
+}
+
+static void test_file_scope_struct_brace_orelse_bypass(void) {
+	// BUG: p1_classify_bracket_orelse uses brace_depth == 0 to detect
+	// file scope.  A struct definition body at file scope increments
+	// brace_depth, so orelse inside an array dimension within the struct
+	// body bypasses the file-scope error.  It falls through to the inline
+	// ternary path: [(n) ? (n) : (1)] — double evaluation.
+	// This should be rejected with the same error as bare file-scope
+	// bracket orelse.
+	const char *code =
+	    "int n;\n"
+	    "struct S {\n"
+	    "    int data[n orelse 1];\n"
+	    "};\n"
+	    "int main(void) { return 0; }\n";
+	PrismResult r = prism_transpile_source(code, "struct_brace_orelse.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		// If it passed, check for double evaluation (the ternary fallback)
+		const char *arr = strstr(r.output, "data[");
+		if (arr) {
+			// Count occurrences of 'n' in the bracket expression
+			// The ternary (n) ? (n) : (1) has 'n' twice
+			int n_count = 0;
+			for (const char *p = arr; *p && *p != ']'; p++)
+				if (p[0] == 'n' && (p[1] == ')' || p[1] == ' '))
+					n_count++;
+			CHECK(n_count <= 1,
+			      "file-scope-struct-orelse: orelse in struct body array dim "
+			      "produced double-evaluation ternary instead of being rejected");
+		}
+		// Alternatively: it should have been rejected entirely
+		CHECK(0, "file-scope-struct-orelse: orelse inside struct body at file scope "
+		      "was silently accepted (brace_depth fooled the file-scope check)");
+	} else {
+		// Correctly rejected
+		CHECK(r.status != PRISM_OK,
+		      "file-scope-struct-orelse: correctly rejected");
 	}
 	prism_free(&r);
 }
@@ -2838,5 +2937,9 @@ void run_orelse_tests(void) {
 
 	// Audit round 8: block-form orelse else binding
 	test_block_orelse_breaks_else_binding();
+
+	// Audit round 9: architecture-level bug probes (should FAIL until fixed)
+	test_nested_bracket_orelse_dim_id_misalignment();
+	test_file_scope_struct_brace_orelse_bypass();
 }
 

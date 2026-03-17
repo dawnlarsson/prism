@@ -2236,6 +2236,50 @@ void test_defer_shadow_in_for_init(void) {
 	    "shadows");
 }
 
+static void test_cfg_hash_table_saturation_bypass(void) {
+	// BUG: p1_verify_cfg's label hash table is capped at 8192 slots.
+	// When a function has >8192 labels, late-inserted labels are silently
+	// dropped (open-addressing probe exhausts without finding empty slot).
+	// A backward goto to a dropped label gets li=-1, misclassified as
+	// forward, queued in fwd[], never resolved → CFG check bypassed.
+	//
+	// Baseline: backward goto from outer scope into inner scope with
+	// defer is rejected.  With 9000+ filler labels, the same pattern
+	// silently passes because 'target' is dropped from the hash.
+
+	// Build source: 9000 filler labels, then { defer ...; target: }, then goto
+	int n = 9000;
+	size_t cap = (size_t)n * 40 + 512;
+	char *code = malloc(cap);
+	if (!code) { CHECK(0, "cfg-hash-sat: malloc"); return; }
+	int pos = 0;
+	pos += snprintf(code + pos, cap - pos, "#include <stdio.h>\n");
+	pos += snprintf(code + pos, cap - pos, "void f(int x) {\n");
+	for (int i = 1; i <= n; i++)
+		pos += snprintf(code + pos, cap - pos, "filler_%d: (void)0;\n", i);
+	pos += snprintf(code + pos, cap - pos,
+		"{\n"
+		"  defer printf(\"inner cleanup\");\n"
+		"  target: (void)0;\n"
+		"}\n");
+	for (int i = 1; i <= n; i++)
+		pos += snprintf(code + pos, cap - pos, "goto filler_%d;\n", i);
+	pos += snprintf(code + pos, cap - pos,
+		"if (x) goto target;\n"
+		"}\n"
+		"int main(void) { return 0; }\n");
+
+	PrismResult r = prism_transpile_source(code, "cfg_hash_sat.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "cfg-hash-saturation: backward goto into defer scope must be "
+	      "rejected even with >8192 labels (hash table overflow)");
+	if (r.status != PRISM_OK && r.error_msg)
+		CHECK(strstr(r.error_msg, "skip over this defer") != NULL,
+		      "cfg-hash-saturation: error mentions defer skip");
+	prism_free(&r);
+	free(code);
+}
+
 static void test_defer_fnptr_return_type_overwrite(void) {
 	/* BUG: capture_function_return_type is called on every type token at
 	   block_depth 0. For void (*signal_fn(int, void(*func)(int)))(int),
@@ -2406,4 +2450,7 @@ void run_defer_tests(void) {
 	test_defer_vfork_reference_false_positive();
 #endif
 	test_defer_fnptr_return_type_overwrite();
+
+	// Audit round 9: hash table saturation CFG bypass
+	test_cfg_hash_table_saturation_bypass();
 }

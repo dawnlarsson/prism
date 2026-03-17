@@ -189,7 +189,6 @@ typedef struct {
 
 // Per-token Pass 1 annotation flags (stored in pass1_ann[])
 enum {
-	P1_NEEDS_BRACE_WRAP  = 1 << 0, // Braceless control body needs { } injection
 	P1_SCOPE_LOOP        = 1 << 1, // This '{' opens a loop body
 	P1_SCOPE_SWITCH      = 1 << 2, // This '{' opens a switch body
 	P1_SCOPE_CONDITIONAL = 1 << 3, // This '{' opens a conditional body
@@ -2228,7 +2227,7 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 			if (dim_start == dim_end) {
 				ARENA_ENSURE_CAP(&ctx->main_arena, ctx->bracket_dim_ids,
 						 ctx->bracket_dim_count, ctx->bracket_dim_cap, 16, unsigned);
-				ctx->bracket_dim_ids[ctx->bracket_dim_count++] = 0; // 0 = not hoisted
+				ctx->bracket_dim_ids[ctx->bracket_dim_count++] = (unsigned)-1; // sentinel = not hoisted
 				continue;
 			}
 			ARENA_ENSURE_CAP(&ctx->main_arena, ctx->bracket_dim_ids,
@@ -2263,7 +2262,7 @@ static Token *walk_balanced_orelse(Token *tok) {
 		// No orelse at depth 0. Check if this bracket was pre-hoisted as a dim temp.
 		if (match_ch(tok, '[') && ctx->bracket_dim_next < ctx->bracket_dim_count) {
 			unsigned dim = ctx->bracket_dim_ids[ctx->bracket_dim_next++];
-			if (dim != 0) {
+			if (dim != (unsigned)-1) {
 				emit_tok(tok); // emit [
 				OUT_LIT(" _Prism_dim_");
 				out_uint(dim);
@@ -4762,145 +4761,6 @@ static void p1_build_scope_tree(Token *start) {
 	}
 }
 
-// ── Phase 1G helper: scan one braceless body statement, detecting Prism keywords ──
-//
-// Recursive descent: parses exactly one C statement to determine body extent.
-// Returns the token after the body. Sets *found if any Prism keyword
-// (defer, orelse, raw) is found in the body.
-
-static Token *p1_scan_body_stmt(Token *tok, bool *found) {
-	if (!tok || tok->kind == TK_EOF) return tok;
-
-	// Braced body: scan inside for Prism keywords
-	if (match_ch(tok, '{')) {
-		Token *end = tok_match(tok);
-		if (end) {
-			Token *prev_s = NULL;
-			for (Token *s = tok_next(tok); s && s != end && s->kind != TK_EOF; prev_s = s, s = tok_next(s)) {
-				if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; prev_s = s; continue; }
-				if (prev_s && (prev_s->tag & (TT_GOTO | TT_MEMBER))) continue;
-				if (((s->tag & TT_DEFER) || (s->tag & TT_ORELSE)) && !is_known_typedef(s))
-					*found = true;
-			}
-			return tok_next(end);
-		}
-		return tok;
-	}
-
-	// if: condition + then-body [+ else-body]
-	if (tok->tag & TT_IF) {
-		tok = tok_next(tok);
-		if (tok && match_ch(tok, '(') && tok_match(tok))
-			tok = tok_next(tok_match(tok));
-		tok = p1_scan_body_stmt(tok, found);
-		Token *n = tok;
-		while (n && n->kind != TK_EOF) {
-			Token *c = skip_noise(n);
-			if (c != n) { n = c; continue; }
-			break;
-		}
-		if (n && (n->tag & TT_IF) && tok_loc(n)[0] == 'e') {
-			tok = tok_next(n);
-			tok = p1_scan_body_stmt(tok, found);
-		}
-		return tok;
-	}
-
-	// for/while (not do)
-	if ((tok->tag & TT_LOOP) && tok_loc(tok)[0] != 'd') {
-		tok = tok_next(tok);
-		if (tok && match_ch(tok, '(') && tok_match(tok))
-			tok = tok_next(tok_match(tok));
-		return p1_scan_body_stmt(tok, found);
-	}
-
-	// do ... while (...)
-	if ((tok->tag & TT_LOOP) && tok_loc(tok)[0] == 'd') {
-		tok = tok_next(tok);
-		tok = p1_scan_body_stmt(tok, found);
-		Token *w = tok;
-		while (w && w->kind != TK_EOF) {
-			Token *c = skip_noise(w);
-			if (c != w) { w = c; continue; }
-			break;
-		}
-		if (w && equal(w, "while")) {
-			tok = tok_next(w);
-			if (tok && match_ch(tok, '(') && tok_match(tok))
-				tok = tok_next(tok_match(tok));
-			if (tok && match_ch(tok, ';'))
-				tok = tok_next(tok);
-		}
-		return tok;
-	}
-
-	// switch
-	if (tok->tag & TT_SWITCH) {
-		tok = tok_next(tok);
-		if (tok && match_ch(tok, '(') && tok_match(tok))
-			tok = tok_next(tok_match(tok));
-		return p1_scan_body_stmt(tok, found);
-	}
-
-	// Simple statement: scan to ';' with balanced delimiters
-	Token *prev_s = NULL;
-	for (Token *s = tok; s && !match_ch(s, ';') && s->kind != TK_EOF; prev_s = s, s = tok_next(s)) {
-		if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; prev_s = s; continue; }
-		// Skip Prism keywords used as goto labels or struct member names
-		if (prev_s && (prev_s->tag & (TT_GOTO | TT_MEMBER))) continue;
-		if ((s->tag & TT_DEFER) || (s->tag & TT_ORELSE))
-			{ *found = true; continue; }
-		// 'raw' only counts as Prism keyword at statement start (first token),
-		// not when used as variable/label name in expressions.
-		if ((s->flags & TF_RAW) && !is_known_typedef(s) && s == tok)
-			*found = true;
-	}
-	while (tok && !match_ch(tok, ';') && tok->kind != TK_EOF) {
-		if (tok->flags & TF_OPEN) tok = tok_match(tok) ? tok_next(tok_match(tok)) : tok_next(tok);
-		else tok = tok_next(tok);
-	}
-	if (tok && match_ch(tok, ';'))
-		tok = tok_next(tok);
-	return tok;
-}
-
-// Check a control keyword followed by optional (...) condition.
-// If the body is braceless and contains Prism keywords, set P1_NEEDS_BRACE_WRAP
-// on the control keyword.
-static void p1_check_braceless(Token *ctrl_kw) {
-	Token *body = tok_next(ctrl_kw);
-
-	// 'do' has no condition before body
-	if ((ctrl_kw->tag & TT_LOOP) && tok_loc(ctrl_kw)[0] == 'd') {
-		// body is right after 'do'
-	} else if ((ctrl_kw->tag & TT_IF) && tok_loc(ctrl_kw)[0] == 'e') {
-		// 'else' — body is right after 'else'
-	} else {
-		// Skip condition (...)
-		while (body && body->kind != TK_EOF) {
-			Token *c = skip_noise(body);
-			if (c != body) { body = c; continue; }
-			break;
-		}
-		if (body && match_ch(body, '(') && tok_match(body))
-			body = tok_next(tok_match(body));
-	}
-
-	while (body && body->kind != TK_EOF) {
-		Token *c = skip_noise(body);
-		if (c != body) { body = c; continue; }
-		break;
-	}
-
-	if (!body || body->kind == TK_EOF || match_ch(body, '{'))
-		return; // braced body or EOF — no wrap needed
-
-	bool found = false;
-	p1_scan_body_stmt(body, &found);
-	if (found)
-		tok_ann(ctrl_kw) |= P1_NEEDS_BRACE_WRAP;
-}
-
 // ── Phase 1B: Full-depth typedef + enum registration ──
 //
 // Walk ALL tokens at ALL depths to build the complete typedef table before
@@ -4939,6 +4799,20 @@ static void p1_full_depth_prescan(Token *tok) {
 	bool p1d_saw_raw = false;  // Phase 2A: track 'raw' keyword preceding declaration
 
 	while (tok && tok->kind != TK_EOF) {
+		// == Phase 1H inline: classify bracket orelse ==
+		if (FEAT(F_ORELSE) && match_ch(tok, '[') && tok_match(tok)) {
+			Token *close = tok_match(tok);
+			for (Token *s = tok_next(tok); s && s != close && s->kind != TK_EOF; s = tok_next(s)) {
+				if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; continue; }
+				if ((s->tag & TT_ORELSE) && !is_known_typedef(s) && !typedef_lookup(s)) {
+					if (p1d_cur_func < 0)
+						error_tok(s, "orelse inside array dimension at file scope is not allowed "
+							  "(cannot hoist temporary variable outside a function body)");
+					tok_ann(s) |= P1_OE_BRACKET;
+				}
+			}
+		}
+
 		if (match_ch(tok, '{')) {
 			// Advance past any scope IDs consumed by braces that were
 			// skipped (e.g., inside typedef bodies or non-stmt-start TF_OPEN).
@@ -5389,12 +5263,6 @@ uint16_t sid = next_scope_id++;
 			continue;
 		}
 
-		// == Phase 1G: braceless control flow pre-tagging ==
-		if (p1d_cur_func >= 0 &&
-		    (tok->tag & (TT_LOOP | TT_IF | TT_SWITCH))) {
-			p1_check_braceless(tok);
-		}
-
 		// == Phase 1D: collect labels, gotos, defers, cases inside function bodies ==
 		if (p1d_cur_func >= 0) {
 			uint16_t cur_sid = scope_depth_local < 4096 ?
@@ -5559,36 +5427,6 @@ uint16_t sid = next_scope_id++;
 	}
 }
 
-// ── Phase 1H helper: classify orelse tokens inside bracket expressions ──
-//
-// Walk all tokens looking for '[' with a matching ']'. For each bracket
-// pair, scan inside for orelse tokens and mark them as P1_OE_BRACKET.
-// File-scope guard: bracket orelse requires hoisting a temp variable
-// statement, which is illegal outside a function body. Reject early.
-
-static void p1_classify_bracket_orelse(Token *tok) {
-	int brace_depth = 0;
-	while (tok && tok->kind != TK_EOF) {
-		if (match_ch(tok, '{')) { brace_depth++; tok = tok_next(tok); continue; }
-		if (match_ch(tok, '}')) { if (brace_depth > 0) brace_depth--; tok = tok_next(tok); continue; }
-		if (match_ch(tok, '[') && tok_match(tok)) {
-			Token *close = tok_match(tok);
-			for (Token *s = tok_next(tok); s && s != close && s->kind != TK_EOF; s = tok_next(s)) {
-				if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; continue; }
-				if ((s->tag & TT_ORELSE) && !is_known_typedef(s) && !typedef_lookup(s)) {
-					if (brace_depth == 0)
-						error_tok(s, "orelse inside array dimension at file scope is not allowed "
-							  "(cannot hoist temporary variable outside a function body)");
-					tok_ann(s) |= P1_OE_BRACKET;
-				}
-			}
-			tok = tok_next(close);
-			continue;
-		}
-		tok = tok_next(tok);
-	}
-}
-
 // Phase 2A: Verify goto→label and switch→case pairs against defers/decls.
 // O(N) snapshot-and-sweep: one linear pass per function, no nested O(N) scans.
 // Runs before Pass 2 — all CFG errors raised before any byte is emitted.
@@ -5679,9 +5517,9 @@ static void p1_verify_cfg(void) {
 		int defer_n = 0, decl_n = 0;
 
 		// Label hash: open-addressing, power-of-2 size, maps name → entry index.
-		// Size is next power of 2 ≥ 2×cnt, clamped to [64, 8192].
+		// Size is next power of 2 ≥ 2×cnt, minimum 64.
 		int hash_sz = 64;
-		while (hash_sz < cnt * 2 && hash_sz < 8192) hash_sz <<= 1;
+		while (hash_sz < cnt * 2) hash_sz <<= 1;
 		int *label_hash = arena_alloc(&ctx->main_arena, (size_t)hash_sz * sizeof(int));
 		memset(label_hash, 0xFF, (size_t)hash_sz * sizeof(int)); // -1 = empty
 		int hash_mask = hash_sz - 1;
@@ -5852,11 +5690,8 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 	// Phase 1B: Full-depth typedef + enum registration (all scopes)
 	// Also runs Phase 1C (shadow), 1D (labels/gotos/defers/decls),
-	// 1E (return type), 1F (defer validation), 1G (braceless tagging)
+	// 1E (return type), 1F (defer validation), 1H (bracket orelse)
 	p1_full_depth_prescan(tok);
-
-	// Phase 1H: classify orelse in bracket expressions (needs typedef table)
-	p1_classify_bracket_orelse(tok);
 
 	// Phase 2A: verify goto→label pairs against defers/decls
 	p1_verify_cfg();
