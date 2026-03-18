@@ -7,7 +7,7 @@
 
 Prism is a lightweight and very fast transpiler that makes C safer without changing how you write it.
 
-→ [dawning.dev/prism](https://dawning.dev/prism) for the full product page
+→ [dawning.dev/prism](https://dawning.dev/prism)
 
 - **3136 tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
