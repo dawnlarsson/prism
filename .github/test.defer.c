@@ -2304,6 +2304,31 @@ static void test_defer_fnptr_return_type_overwrite(void) {
 	prism_free(&r);
 }
 
+static void test_braceless_switch_defer_false_positive(void) {
+	/* BUG: braceless switch (no braces around body) had no P1K_SWITCH entry,
+	   so case/default labels saw sw_sid=0, causing ALL preceding defers in
+	   the function to be flagged as "skipped by switch fallthrough". */
+	PrismResult r = prism_transpile_source(
+	    "void cleanup(void);\n"
+	    "void f(int x) { defer cleanup(); switch (x) default: break; }\n",
+	    "braceless_switch_defer.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "braceless-switch-defer: no false positive error");
+	prism_free(&r);
+
+	/* Sequential defer + braceless switch with case */
+	r = prism_transpile_source(
+	    "void cleanup(void);\n"
+	    "void g(int x) {\n"
+	    "    defer cleanup();\n"
+	    "    switch (x) case 1: x++;\n"
+	    "}\n",
+	    "braceless_switch_case_defer.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "braceless-switch-case-defer: no false positive error");
+	prism_free(&r);
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -2453,4 +2478,7 @@ void run_defer_tests(void) {
 
 	// Audit round 9: hash table saturation CFG bypass
 	test_cfg_hash_table_saturation_bypass();
+
+	// Audit round 12: braceless switch false positive
+	test_braceless_switch_defer_false_positive();
 }

@@ -6661,6 +6661,82 @@ static void test_knr_param_shadow_no_poison(void) {
 	free(path);
 }
 
+// Bug: for-loop initializer shadow scope bounded to ')' instead of loop body end.
+// A variable that shadows a typedef in the for-init is not recognized as a
+// variable inside the body, so T * x is misinterpreted as a pointer declaration.
+static void test_for_init_typedef_shadow_body_scope(void) {
+	const char *code =
+	    "typedef int T;\n"
+	    "void f(void) {\n"
+	    "    int x;\n"
+	    "    for (int T = 0; T < 10; T++) {\n"
+	    "        T * x;\n"
+	    "    }\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "for_init_shadow.c", prism_defaults());
+	CHECK(r.status == PRISM_OK, "for-init typedef shadow: transpile succeeds");
+	if (r.status == PRISM_OK && r.output) {
+		// T * x must NOT get zero-init (= 0) — it's a multiplication, not a declaration.
+		CHECK(strstr(r.output, "= 0") == NULL || strstr(r.output, "T * x = 0") == NULL,
+		      "for-init typedef shadow: T * x not treated as ptr decl in body");
+	}
+	prism_free(&r);
+}
+
+// Bug: braceless for body scanner stops at first ';', so if-else in
+// a braceless for body has the else branch outside the shadow scope.
+// typedef int T; for (int T=0;..;T++) if(c) x=T; else T*x;
+// The 'T*x' in the else branch must NOT be treated as a declaration.
+static void test_for_init_shadow_ifelse_body(void) {
+	const char *code =
+	    "typedef int T;\n"
+	    "int x;\n"
+	    "void f(int c) {\n"
+	    "    for (int T = 0; T < 10; T++)\n"
+	    "        if (c)\n"
+	    "            x = T;\n"
+	    "        else\n"
+	    "            T * x;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "for_ifelse_shadow.c", prism_defaults());
+	CHECK(r.status == PRISM_OK, "for-init if-else shadow: transpile succeeds");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "T * x = 0") == NULL,
+		      "for-init if-else shadow: T*x in else not treated as ptr decl");
+	}
+	prism_free(&r);
+}
+
+// Bug: goto into/out of GNU statement expressions is not rejected.
+// This is undefined behavior per GCC documentation.
+static void test_goto_into_stmt_expr_rejected(void) {
+	const char *code =
+	    "void f(void) {\n"
+	    "    goto inner;\n"
+	    "    int x = ({ inner: 42; });\n"
+	    "    (void)x;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "goto_into_stmtexpr.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "goto into stmt-expr: rejected (UB per GCC docs)");
+	prism_free(&r);
+}
+
+static void test_goto_out_of_stmt_expr_rejected(void) {
+	// Jumping OUT of a stmt-expr is supported by GCC/Clang and commonly used
+	// with defer idioms. Only jumping IN is UB.
+	const char *code =
+	    "void f(void) {\n"
+	    "    int x = ({ goto out; 42; });\n"
+	    "    (void)x;\n"
+	    "    out: ;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "goto_out_stmtexpr.c", prism_defaults());
+	CHECK(r.status == PRISM_OK,
+	      "goto out of stmt-expr: allowed (supported by GCC/Clang)");
+	prism_free(&r);
+}
+
 static void expect_parse_rejects(const char *code, const char *file_name,
 				 const char *name, const char *needle) {
 	PrismResult result = prism_transpile_source(code, file_name, prism_defaults());
@@ -7274,5 +7350,13 @@ void run_parse_tests(void) {
 	test_typeof_vla_orelse_side_effect_rejected();
 #ifdef __GNUC__
 	test_asm_in_orelse_lhs_rejected();
+#endif
+
+	// Audit round 10: for-init scope + stmt-expr goto
+	test_for_init_typedef_shadow_body_scope();
+	test_for_init_shadow_ifelse_body();
+#ifdef __GNUC__
+	test_goto_into_stmt_expr_rejected();
+	test_goto_out_of_stmt_expr_rejected();
 #endif
 }

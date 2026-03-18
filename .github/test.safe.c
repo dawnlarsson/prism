@@ -3016,6 +3016,99 @@ static void test_switch_inner_loop_break_no_false_exit(void) {
 	prism_free(&r);
 }
 
+// Bug: raw int x, y; — Phase 1D keeps p1d_saw_raw=true for y,
+// but Pass 2 clears is_raw on comma. CFG verifier thinks y is raw
+// (safe to skip) while Pass 2 emits y = 0 (skipped by goto → uninit).
+static void test_raw_comma_desync_goto_bypass(void) {
+	printf("\n--- raw Comma Desync Goto Bypass ---\n");
+
+	const char *code =
+	    "int main(void) {\n"
+	    "    goto skip;\n"
+	    "    raw int x, y;\n"
+	    "    skip: return 0;\n"
+	    "}\n";
+
+	PrismResult r = prism_transpile_source(code, "raw_comma_desync.c", prism_defaults());
+	// y is NOT raw in Pass 2 — it gets = 0, so goto skipping it is unsafe.
+	// The CFG verifier must reject this.
+	CHECK(r.status != PRISM_OK,
+	      "raw comma desync: goto past non-raw y must be rejected");
+	prism_free(&r);
+}
+
+// Bug: e->decl.is_vla = type.is_vla || decl.is_array — flags fixed-size
+// arrays as VLAs. raw int x[5]; + goto should be allowed (not a VLA).
+static void test_fixed_array_not_vla_with_raw(void) {
+	printf("\n--- Fixed Array Not VLA With raw ---\n");
+
+	const char *code =
+	    "int main(void) {\n"
+	    "    goto skip;\n"
+	    "    raw int x[5];\n"
+	    "    skip: return 0;\n"
+	    "}\n";
+
+	PrismResult r = prism_transpile_source(code, "fixed_array_raw.c", prism_defaults());
+	// x[5] is a fixed-size array + raw: safe to skip, no VLA.
+	CHECK(r.status == PRISM_OK,
+	      "fixed array raw: goto past raw fixed array must be accepted (not a VLA)");
+	prism_free(&r);
+}
+
+// Bug: -fno-safety downgraded VLA skip violations to warnings.
+// SPEC says VLA skip violations must remain hard errors regardless of -fno-safety.
+static void test_vla_skip_hard_error_with_fno_safety(void) {
+	printf("\n--- VLA Skip Hard Error With -fno-safety ---\n");
+
+	const char *code =
+	    "void f(int n) {\n"
+	    "    goto skip;\n"
+	    "    int arr[n];\n"
+	    "    skip: (void)0;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	feat.warn_safety = true;
+	PrismResult r = prism_transpile_source(code, "vla_fno_safety.c", feat);
+	// VLA skip must be a hard error even with -fno-safety
+	CHECK(r.status != PRISM_OK,
+	      "VLA skip must be hard error even with -fno-safety");
+	prism_free(&r);
+}
+
+// Bug: Phase 1C backward walk from '{' to find parameter list '(...)' does not
+// skip GNU __attribute__((...)) between ')' and '{'. If a parameter shadows a
+// typedef, the shadow is not registered and the typedef name is parsed as a type
+// inside the function body — emitting spurious zero-init like `mytype z = {0};`.
+static void test_gnu_attr_param_shadow(void) {
+	printf("\n--- GNU Attr Param Shadow ---\n");
+
+	// mytype (param) shadows typedef mytype. Inside the body, `mytype z;`
+	// must be treated as expression `mytype` + undeclared `z` (NOT as a
+	// declaration of type mytype), so zero-init must NOT appear.
+	const char *code =
+	    "typedef int mytype;\n"
+	    "void f(mytype mytype) __attribute__((noinline)) {\n"
+	    "    mytype z;\n"
+	    "    (void)z;\n"
+	    "}\n"
+	    "int main(void) { f(42); return 0; }\n";
+
+	PrismResult r = prism_transpile_source(code, "gnu_attr_shadow.c", prism_defaults());
+	CHECK(r.status == PRISM_OK,
+	      "gnu attr param shadow: transpilation must succeed");
+	if (r.output) {
+		// If shadow works: `mytype` is a variable, so `mytype z;` is NOT a
+		// declaration — no zero-init should be emitted.
+		// If shadow fails: `mytype` is a type, so `mytype z = {0};` appears.
+		CHECK(strstr(r.output, "z = {0}") == NULL &&
+		      strstr(r.output, "z = 0") == NULL,
+		      "gnu attr param shadow: mytype must shadow typedef (no zero-init for z)");
+	}
+	prism_free(&r);
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -3253,4 +3346,10 @@ void run_safe_tests(void) {
 	test_deep_nesting_goto_bypass();
 	test_c23_attr_label_forward_goto();
 	test_switch_inner_loop_break_no_false_exit();
+	test_raw_comma_desync_goto_bypass();
+	test_fixed_array_not_vla_with_raw();
+	test_vla_skip_hard_error_with_fno_safety();
+#ifdef __GNUC__
+	test_gnu_attr_param_shadow();
+#endif
 }

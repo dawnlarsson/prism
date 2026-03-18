@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3075 tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3097 tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -67,12 +67,12 @@ Flag definitions:
 
 | Flag | Bit | Meaning |
 |---|---|---|
-| `P1_NEEDS_BRACE_WRAP` | 0 | Braceless control body needs `{` `}` injection |
 | `P1_SCOPE_LOOP` | 1 | This `{` opens a loop body |
 | `P1_SCOPE_SWITCH` | 2 | This `{` opens a switch body |
 | `P1_SCOPE_CONDITIONAL` | 3 | This `{` opens a conditional body |
 | `P1_OE_BRACKET` | 4 | `orelse` inside array dimension brackets `[…]` |
 | `P1_OE_DECL_INIT` | 5 | `orelse` inside a declaration initializer |
+| `P1_IS_DECL` | 6 | Phase 1D: token starts a variable declaration |
 
 **Cache discipline:** Pass 2 only reads `pass1_ann` when a token's tag matches `TT_STRUCTURAL`, `TT_IF|TT_LOOP|TT_SWITCH`, or `TT_ORELSE`. The fast path (~70–80% of tokens) never touches the array.
 
@@ -177,8 +177,13 @@ Walks all tokens. On every `{`, assigns a new `scope_id`, records `parent_id` fr
 | `) {` where `(` preceded by `if` | `is_conditional` |
 | `else {` | `is_conditional` |
 | `({` | `is_stmt_expr` |
-| `struct`/`union`/`enum` body | `is_struct` |
+| `struct`/`union`/`enum` keyword (or tag name preceded by `TT_SUE`) `{` | `is_struct` |
+| `) {` where `(` preceded by `__attribute__`/`TT_ATTR` — walk further back past balanced parens and attributes to find the real keyword | Inherits classification from the real keyword (`is_loop`, `is_switch`, etc., or `is_struct` when `TT_SUE` found) |
+| Named struct with attributes: `struct __attribute__((packed)) Name {` | `is_struct` (look-behind skips balanced parens and `TT_ATTR` tokens) |
 | File-scope `{` preceded by `)` (function def) | `is_func_body` |
+| File-scope `{` preceded by `]` (array-returning function, e.g., `int (*fn(void))[5] {`) or `;` (K&R function def) | `is_func_body` |
+
+**C23 attribute backward walk:** When walking backward to find `prev`, the loop skips `]]` C23 attributes by checking `tok_match(])->flags & TF_C23_ATTR` (the `TF_C23_ATTR` flag is set on the opening `[`, not the closing `]`). This ensures `void f(void) [[gnu::cold]] {` correctly finds `)` as `prev` and classifies it as `is_func_body`.
 
 Writes `P1_SCOPE_LOOP`, `P1_SCOPE_SWITCH`, `P1_SCOPE_CONDITIONAL` flags to `pass1_ann` on the `{` token.
 
@@ -230,6 +235,12 @@ For every variable declaration at every depth, if the declared name collides wit
 
 **Function parameter scope:** When Phase 1 encounters a function body `{` (is_func_body), parameter declarations from the preceding `(…)` are registered as shadows scoped to the function body. For forward declarations (prototypes ending with `;`), parameter shadows are registered scoped to the prototype's parameter list range.
 
+**Attribute skipping during parameter list discovery:** The backward walk from `{` (or `;` for prototypes) to find the parameter list `(…)` skips GNU `__attribute__((...))` (detected via `TT_ATTR` tag on the preceding keyword) and C23 `[[...]]` attributes (detected via `TF_C23_ATTR` flag on the matching `[`). This ensures `void f(int T) __attribute__((noinline)) {` and `void f(int T) [[gnu::cold]] {` correctly identify the parameter list.
+
+**For-init scope:** Variables declared in `for`-init (e.g., `for (int T = 0; …)`) are shadowed for the entire loop body (through the closing `}` or braceless statement end), not just through the `)`. This matches C99 §6.8.5p3: the for-init declaration's scope extends to the end of the loop body.
+
+**Braceless body detection:** The for-init body end is determined by `skip_one_stmt()`, a recursive helper that correctly handles all C statement forms: braced `{…}`, `if (…) stmt [else stmt]`, `for`/`while`/`switch (…) stmt`, `do stmt while (…);`, and simple `expr;`. This prevents if-else branches from prematurely terminating the shadow scope (e.g., `for (int T=0;…) if(c) x=T; else T*x;` — the else branch is within T's shadow scope).
+
 ---
 
 ### 3.4 Phase 1D — Per-Function CFG Collection
@@ -244,14 +255,14 @@ For each function body, collects `P1FuncEntry` items into the global `p1_entries
 | `P1K_GOTO` | Target label name, scope_id, token_index |
 | `P1K_DEFER` | scope_id, token_index |
 | `P1K_DECL` | scope_id, token_index, `has_init`, `is_vla`, `has_raw` |
-| `P1K_SWITCH` | scope_id, token_index |
+| `P1K_SWITCH` | scope_id, token_index (braced switches use Phase 1A scope_id; braceless switches use a synthetic scope_id beyond `scope_tree_count`) |
 | `P1K_CASE` | scope_id, token_index, `switch_scope_id` |
 
 **Detection sites:** Labels and gotos are detected both at statement-start positions and inside braceless control flow (e.g., `if (c) goto L;`).
 
-**VLA tracking:** `is_vla` is set for Variable Length Arrays. Jumping past a VLA is always dangerous regardless of `has_init`, because it bypasses implicit stack allocation.
+**VLA tracking:** `is_vla` on `P1FuncEntry.decl` is set when either the base type is a VLA typedef (`type.is_vla`) or the declaration itself has variable-length array dimensions (`decl.is_vla`). This covers both `typedef int T[n]; T x;` and direct `int x[n];` forms. Jumping past a VLA is always dangerous regardless of `has_init` or `has_raw`, because it bypasses implicit stack allocation.
 
-**has_raw:** Declarations marked `raw` set `has_raw = true`. The CFG verifier skips these for forward goto checks (skipping an uninitialized `raw` variable is safe).
+**has_raw:** Declarations marked `raw` set `has_raw = true`. In multi-declarator statements (`raw int x, y;`), `p1d_saw_raw` is reset on commas — only the first declarator receives `has_raw = true` (matching Pass 2's behavior). The CFG verifier skips `has_raw` declarations for goto checks, **except VLAs** — `raw` on a VLA does not exempt it.
 
 **FuncMeta linkage:** Each `FuncMeta` records `entry_start` and `entry_count`, indexing into `p1_entries[]`.
 
@@ -290,28 +301,9 @@ Rejected patterns inside defer bodies:
 
 ---
 
-### 3.7 Phase 1G — Braceless Control Pre-Tagging
+### 3.7 Phase 1G — Orelse Pre-Classification
 
-**Functions:** `p1_check_braceless`, `p1_scan_body_stmt`
-
-When Phase 1 sees `if`/`for`/`while`/`do`/`else`/`switch`, it skips the `(…)` condition and checks the body. If the body is not preceded by `{`, a recursive descent scanner (`p1_scan_body_stmt`) walks the braceless statement. If any Prism keyword (`defer`, `orelse`, `raw`) or uninitialized declaration appears in the braceless body, `P1_NEEDS_BRACE_WRAP` is set on the control keyword token.
-
-**Braceless body boundary parsing** (recursive descent on keyword tags):
-
-- `{` → braced body, skip to matching `}` via `match_idx`
-- `if` → parse `(…)`, recurse for then-body, check for `else`, recurse for else-body
-- `for`/`while` → parse `(…)`, recurse for body
-- `do` → recurse for body, consume `while (…)` and `;`
-- `switch` → parse `(…)`, recurse for body
-- Otherwise → scan to `;` with balanced delimiters
-
-Pass 2 checks the flag at the `{`/`;` insertion point and emits wrapping braces.
-
----
-
-### 3.8 Phase 1H — Orelse Pre-Classification
-
-**Function:** `p1_classify_bracket_orelse`
+**Function:** inline in `p1_full_depth_prescan`
 
 Walks all tokens looking for `[…]` pairs containing `orelse`. Marks them with `P1_OE_BRACKET` on `pass1_ann`.
 
@@ -335,7 +327,7 @@ Runs after all Phase 1 sub-phases complete. For each function's `P1FuncEntry[]` 
 
 1. Build a label hash table (open-addressing, power-of-2) mapping label names to their entry index.
 
-2. Maintain watermark arrays `wm_defer[]` and `wm_decl[]` indexed by scope_id. As the sweep encounters `P1K_DEFER` and `P1K_DECL` entries, it records their position in the entry array.
+2. Maintain watermark arrays `wm_defer[]` and `wm_decl[]` indexed by entry array position. As the sweep encounters `P1K_DEFER` and `P1K_DECL` entries, it appends them to `defer_list`/`decl_list` and records the current list lengths in the watermark arrays. Separate switch watermark arrays (`sw_defer_wm[]`, `sw_decl_wm[]`) are indexed by `scope_id` for O(1) lookup from case entries.
 
 3. **Forward goto:** When a `P1K_GOTO` is encountered and its target label has not yet been seen, add it to a pending forward-goto list. When the target `P1K_LABEL` is reached, resolve by checking all `P1K_DEFER` and `P1K_DECL` entries between the goto and label positions. If any dangerous entry's scope is an ancestor-or-self of the label's scope, error.
 
@@ -343,23 +335,28 @@ Runs after all Phase 1 sub-phases complete. For each function's `P1FuncEntry[]` 
 
 5. **Switch/case:** On `P1K_SWITCH`, snapshot the current watermarks. On `P1K_CASE`, compare current state against the switch's snapshot. Defers in ancestor-or-self scopes that were not active at the switch entry → error (defer skipped by fallthrough). Zero-initialized declarations in nested blocks → error (case bypasses initialization).
 
+6. **Statement-expression boundary:** Gotos into a GNU statement expression are rejected. When resolving a forward or backward goto, if the target label is inside a `is_stmt_expr` scope and the goto is not within that same statement expression (checked via `scope_stmt_expr_ancestor`), a hard error is raised. Gotos *out of* a statement expression are allowed (GCC/Clang support this and Prism's defer+goto idioms rely on it).
+
 ### Checked violations
 
 | Violation | Severity |
 |---|---|
 | Forward goto skips over `defer` | Error (or warning with `-fno-safety`) |
 | Forward goto skips over uninitialized declaration | Error (or warning with `-fno-safety`) |
-| Forward goto skips over VLA declaration | Error (always, regardless of `-fno-safety`) |
-| Backward goto enters scope containing `defer` | Error (or warning) |
+| Forward goto skips over VLA declaration | **Always error** (VLA skip is UB regardless of `-fno-safety`) |
+| Backward goto enters scope containing `defer` | Error (or warning with `-fno-safety`) |
 | Backward goto enters scope containing uninitialized declaration | Error (or warning) |
+| Backward goto enters scope containing VLA declaration | **Always error** (VLA skip is UB regardless of `-fno-safety`) |
 | Switch/case skips `defer` via fallthrough | Error (or warning) |
 | Switch/case bypasses zero-initialized declaration in nested block | Error (or warning) |
 
-Forward gotos past `raw`-marked declarations are skipped (safe — no initialization to bypass).
+Forward gotos past `raw`-marked declarations are skipped (safe — no initialization to bypass), **except VLAs** — `raw` on a VLA does not exempt it because jumping past a VLA bypasses implicit stack allocation regardless of initialization.
 
 ### Complexity
 
 O(N) per function where N is the number of `P1FuncEntry` items, plus O(depth) for `scope_is_ancestor_or_self` checks.
+
+**Arena management:** Per-function temporary allocations (label hash table, watermark arrays, forward-goto list) are reclaimed after each function via `arena_mark`/`arena_restore`, preventing O(total_entries) memory accumulation across all functions in a translation unit.
 
 ---
 
@@ -382,7 +379,7 @@ Tokens with tag bits or at statement boundaries are dispatched to handlers:
 | `handle_open_brace` | `{` | Push scope. Read `P1_SCOPE_*` from `pass1_ann` for classification. Handle compound-literal-in-ctrl-paren, orelse guard, stmt_expr detection. |
 | `handle_close_brace` | `}` | Pop scopes, emit defers (LIFO), handle orelse guard close (consume trailing `;` to prevent dangling-else). |
 | `try_zero_init_decl` | Statement start, type keyword/typedef | Parse declaration, insert `= {0}` or `= 0` or `memset` call. |
-| `scan_labels_in_function` | Function body `{` | Build per-function label table for defer cleanup depth calculation in `handle_goto_keyword`. |
+| `p1_label_find` | `TT_GOTO` dispatch | Query Phase 1D `p1_entries` array for label scope depth; no separate label table needed. |
 | Orelse handlers | `TT_ORELSE` | Multiple handlers for bracket, decl-init, block, bare-assign, bare-action, bare-compound forms. |
 | FuncMeta lookup | Function body `{` | Read `FuncMeta[next_func_idx]` for return type and taint flags. |
 
@@ -458,11 +455,11 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 | Bracket (array dim) | `int buf[n orelse 1]` | Temp variable hoisted before declaration |
 | Decl-init | `int x = f() orelse 0;` | Expanded with temp and null check |
 
-**Side-effect protection:** Bracket orelse in VLA/typeof contexts rejects expressions with side effects (`++`, `--`, `=`, volatile reads, function calls) to prevent double evaluation.
+**Side-effect protection:** Bracket orelse in VLA/typeof contexts rejects expressions with side effects (`++`, `--`, `=`, volatile reads, function calls) to prevent double evaluation. Function-call detection recognizes both `ident(` and `)(`  (parenthesized call) patterns.
 
 **File-scope guard:** Bracket orelse at file scope (brace_depth == 0) is a hard error — hoisting a temp variable requires a statement context.
 
-**Invalid contexts:** Orelse inside struct bodies, typeof (in some forms), ternary, for-init control parens — errored in Pass 1.
+**Invalid contexts:** Orelse inside struct bodies, typeof in struct/union bodies, ternary, for-init control parens — errored in Phase 1. The typeof-in-struct check runs during `p1_full_depth_prescan` using the scope tree's `is_struct` flag, before any Pass 2 output is written.
 
 **Feature flag:** `-fno-orelse` disables.
 
@@ -493,7 +490,9 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 **Semantics:** Opts out of zero-initialization for a specific variable. The `raw` keyword is stripped from the output. The resulting declaration is emitted without an initializer.
 
-**Safety interaction:** `raw`-marked variables can be safely jumped over by `goto` — the CFG verifier skips them in forward goto checks.
+**Multi-declarator scope:** `raw` applies only to the **first** declarator in a comma-separated declaration. In `raw int x, y;`, only `x` opts out of zero-initialization; `y` is still zero-initialized. Both Phase 1D (`p1d_saw_raw` reset on `,`) and Pass 2 (`is_raw` reset on `,`) enforce this.
+
+**Safety interaction:** `raw`-marked variables can be safely jumped over by `goto` — the CFG verifier skips them in forward goto checks, **except VLAs** where `raw` does not exempt the declaration.
 
 **Scope:** Works at block scope, file scope, and in struct bodies (stripped silently).
 
@@ -657,7 +656,7 @@ These are inherently runtime and cannot move to Pass 1:
 - **`ret_counter`** — monotonic during emit
 - **Line directive / whitespace emission** — tied to output position
 - **Bare-expression orelse classification** — requires expression boundary parsing; safe because symbol table is immutable
-- **`scan_labels_in_function`** — builds per-function label table for `handle_goto_keyword` defer cleanup depth calculation (the Phase 1D arrays serve CFG verification, not defer emission)
+- **`p1_label_find`** — queries the immutable Phase 1D `p1_entries` array for label scope depth; `handle_goto_keyword` reads CFG artifacts directly with no separate label scan
 
 ---
 

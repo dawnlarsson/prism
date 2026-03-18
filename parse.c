@@ -302,10 +302,7 @@ typedef struct PrismContext {
 	int dep_flags_count;
 	int scope_depth;
 	int block_depth;
-	bool current_func_returns_void;
-	bool current_func_has_setjmp;
-	bool current_func_has_asm;
-	bool current_func_has_vfork;
+
 
 	bool last_system_header;
 	int last_line_no;
@@ -475,6 +472,20 @@ static char *arena_strdup(Arena *arena, const char *s) {
 static void arena_reset(Arena *arena) {
 	for (ArenaBlock *b = arena->head; b; b = b->next) b->used = 0;
 	arena->current = arena->head;
+}
+
+typedef struct { ArenaBlock *block; size_t used; } ArenaMark;
+
+static ArenaMark arena_mark(Arena *arena) {
+	return (ArenaMark){ arena->current, arena->current ? arena->current->used : 0 };
+}
+
+static void arena_restore(Arena *arena, ArenaMark mark) {
+	// Reset all blocks after the saved block, then restore saved position.
+	for (ArenaBlock *b = mark.block ? mark.block->next : arena->head; b; b = b->next)
+		b->used = 0;
+	arena->current = mark.block;
+	if (mark.block) mark.block->used = mark.used;
 }
 
 static void arena_free(Arena *arena) {

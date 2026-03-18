@@ -2769,6 +2769,117 @@ static void test_block_orelse_breaks_else_binding(void) {
 	prism_free(&r);
 }
 
+// Bug: walk_balanced_orelse side-effect check misses ')' followed by '(' as
+// a function call pattern. (f)() or (get_fn())() bypasses the double-eval
+// rejection and the function call is duplicated in the ternary fallback.
+static void test_typeof_paren_funcall_orelse_double_eval(void) {
+	const char *code =
+	    "int get42(void);\n"
+	    "void f(void) {\n"
+	    "    typeof((get42)() orelse 1) x;\n"
+	    "    (void)x;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "typeof_paren_call.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		// Count how many times 'get42' appears in the typeof expression.
+		// The ternary fallback duplicates it: typeof(((get42)()) ? ((get42)()) : (1))
+		const char *typeof_start = strstr(r.output, "typeof(");
+		if (typeof_start) {
+			const char *s = typeof_start;
+			int call_count = 0;
+			while ((s = strstr(s, "get42")) != NULL) {
+				if (s > typeof_start + 200) break;
+				call_count++;
+				s += 5;
+			}
+			CHECK(call_count <= 1,
+			      "typeof-paren-funcall-orelse: (get42)() duplicated in ternary");
+		} else {
+			CHECK(0, "typeof-paren-funcall-orelse: typeof not found in output");
+		}
+	} else {
+		// Rejection is also acceptable — means the side effect was detected
+		CHECK(r.status != PRISM_OK,
+		      "typeof-paren-funcall-orelse: rejected by transpiler (acceptable)");
+	}
+	prism_free(&r);
+}
+
+// Bug: struct __attribute__((packed)) Name { typeof(x orelse y) z; }
+// The look-behind in Phase 1A sees ')' before 'Name', not 'struct',
+// so is_struct is never set and the typeof-orelse check is bypassed.
+static void test_typeof_orelse_attributed_struct(void) {
+	const char *code =
+	    "int get_val(void) { return 42; }\n"
+	    "struct __attribute__((packed)) Sensor {\n"
+	    "    typeof(get_val() orelse 0) reading;\n"
+	    "};\n";
+	PrismResult r = prism_transpile_source(code, "typeof_attr_struct.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "orelse") == NULL,
+		      "attributed-struct-typeof: literal 'orelse' must not appear in output");
+	} else {
+		CHECK(r.status != PRISM_OK,
+		      "attributed-struct-typeof: rejected by transpiler (acceptable)");
+	}
+	prism_free(&r);
+}
+
+static void test_typeof_orelse_cast(void) {
+	/* BUG: check_orelse_in_parens rejected orelse inside typeof()
+	   when used in a cast expression like (typeof(x orelse 0)) 42. */
+	PrismResult r = prism_transpile_source(
+	    "int f(int *x) { int b = (typeof(*x orelse 0)) 42; return b; }\n",
+	    "typeof_oe_cast.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "typeof-orelse-cast: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "orelse") == NULL,
+		      "typeof-orelse-cast: no literal 'orelse' in output");
+		CHECK(strstr(r.output, "typeof") != NULL,
+		      "typeof-orelse-cast: typeof preserved");
+	}
+	prism_free(&r);
+}
+
+static void test_bracket_orelse_in_prototype(void) {
+	/* BUG: orelse inside bracket dimension of a function prototype
+	   parameter was rejected by the generic 'orelse cannot be used here'
+	   catch-all because try_zero_init_decl returns NULL for prototypes. */
+	PrismResult r = prism_transpile_source(
+	    "void outer(void) {\n"
+	    "    int n = 5;\n"
+	    "    void inner(int n, int a[n orelse 1]);\n"
+	    "}\n",
+	    "bracket_oe_proto.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "bracket-orelse-proto: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "orelse") == NULL,
+		      "bracket-orelse-proto: no literal 'orelse' in output");
+	}
+	prism_free(&r);
+}
+
+static void test_nested_typeof_orelse_leak(void) {
+	/* BUG: walk_balanced_orelse's no-orelse fallback loop only checked for
+	   nested [ brackets, not nested typeof.  typeof(typeof(x orelse y) *)
+	   would emit the inner orelse verbatim to the backend. */
+	PrismResult r = prism_transpile_source(
+	    "int f(int *x, int *y) {\n"
+	    "    int b = (typeof( typeof(*x orelse 0) * )) y;\n"
+	    "    return *b;\n"
+	    "}\n",
+	    "nested_typeof_oe.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "nested-typeof-orelse: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "orelse") == NULL,
+		      "nested-typeof-orelse: no literal 'orelse' in output");
+	}
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -2941,5 +3052,16 @@ void run_orelse_tests(void) {
 	// Audit round 9: architecture-level bug probes (should FAIL until fixed)
 	test_nested_bracket_orelse_dim_id_misalignment();
 	test_file_scope_struct_brace_orelse_bypass();
+
+	// Audit round 10: parenthesized function call bypass
+	test_typeof_paren_funcall_orelse_double_eval();
+
+	// Audit round 11: attributed struct typeof-orelse bypass
+	test_typeof_orelse_attributed_struct();
+
+	// Audit round 12: typeof orelse in cast, bracket orelse in prototype
+	test_typeof_orelse_cast();
+	test_bracket_orelse_in_prototype();
+	test_nested_typeof_orelse_leak();
 }
 
