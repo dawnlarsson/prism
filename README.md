@@ -1,9 +1,13 @@
 ![Prism Banner](https://github.com/user-attachments/assets/051187c2-decd-497e-9beb-b74031eb84ed)
 
+![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-3136_passing-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
+
 ## Robust C by default
 **A dialect of C with `defer`, `orelse`, and automatic zero-initialization.**
 
 Prism is a lightweight and very fast transpiler that makes C safer without changing how you write it.
+
+→ [dawning.dev/prism](https://dawning.dev/prism) for the full product page
 
 - **3136 tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
@@ -31,7 +35,9 @@ cl /Fe:prism.exe prism.c /O2 /D_CRT_SECURE_NO_WARNINGS /nologo
 ```
 Requires Visual Studio Build Tools with the **Desktop development with C++** workload.
 
-## Prism Projects
+## Built with Prism
+Real codebases written using Prism as the compiler.
+
 ### [Terminal File Explorer](https://github.com/dawnlarsson/explore)
 [<img width="1113" height="412" alt="image 105 (2)" src="https://github.com/user-attachments/assets/88c9e447-7153-4ad0-ab7e-fd9fedbb3f88" />](https://github.com/dawnlarsson/explore)
 
@@ -444,6 +450,12 @@ Prism processes C in two passes. Pass 1 performs full semantic analysis and catc
 **Key invariant:** Every semantic error is raised before Pass 2 emits its first byte. If code generation starts, it runs to completion.
 
 see `.github/SPEC.md` for full breakdown.
+
+## get in touch
+
+available for consulting work in compiler engineering, systems programming, and C codebase hardening.
+
+→ dawn@dawn.day · [dawning.dev](https://dawning.dev)
 
 # Repo
 Apache 2.0 license (c) Dawn Larsson 2026
