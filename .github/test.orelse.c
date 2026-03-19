@@ -2861,6 +2861,129 @@ static void test_bracket_orelse_in_prototype(void) {
 	prism_free(&r);
 }
 
+static void test_bracket_orelse_vla_decl_fno_zeroinit(void) {
+	// BUG: emit_bracket_orelse_temps is only reachable through
+	// process_declarators, which is only called when FEAT(F_ZEROINIT) is set.
+	// With -fno-zeroinit, declarations with bracket orelse in VLA dimensions
+	// fall through to the fallback '[' handler at the top of the main loop,
+	// which calls walk_balanced_orelse WITHOUT pre-hoisted temps.
+	// For function-call LHS, this fires reject_orelse_side_effects → error.
+	// For simple variable LHS, it silently double-evaluates via inline ternary.
+	// CORRECT behavior: bracket orelse should work independently of zeroinit
+	// (it only needs to emit a long long temp, not perturb zeroinit semantics).
+	PrismFeatures features = prism_defaults();
+	features.zeroinit = false;
+
+	// Case 1: function-call LHS with -fno-zeroinit should succeed (hoisted temp)
+	PrismResult r = prism_transpile_source(
+	    "int n_fn(void) { return 5; }\n"
+	    "void f(void) { int arr[n_fn() orelse 4]; (void)arr; }\n"
+	    "int main(void) { return 0; }\n",
+	    "bracket_oe_fno_zi.c", features);
+	CHECK(r.status == PRISM_OK,
+	      "bracket-orelse-fno-zeroinit: VLA decl with call LHS must succeed "
+	      "(feature gate desync: F_ORELSE should work without F_ZEROINIT)");
+	if (r.status == PRISM_OK && r.output) {
+		// Must use the hoisted temp variable, not bare inline ternary
+		CHECK(strstr(r.output, "_Prism_oe_") != NULL,
+		      "bracket-orelse-fno-zeroinit: must emit hoisted _Prism_oe_ temp, "
+		      "not fall back to double-evaluating inline ternary");
+	}
+	prism_free(&r);
+
+	// Case 2: simple var LHS with -fno-zeroinit should also use hoisted temp
+	r = prism_transpile_source(
+	    "extern int n;\n"
+	    "void g(void) { int arr[n orelse 4]; (void)arr; }\n"
+	    "int main(void) { return 0; }\n",
+	    "bracket_oe_fno_zi_var.c", features);
+	CHECK(r.status == PRISM_OK,
+	      "bracket-orelse-fno-zeroinit: VLA decl with var LHS must succeed");
+	if (r.status == PRISM_OK && r.output) {
+		// n must appear exactly once in the array dimension, not twice (no double-eval)
+		const char *fn = strstr(r.output, "void g(");
+		if (fn) {
+			const char *arr = strstr(fn, "int arr[");
+			if (arr) {
+				int n_count = 0;
+				for (const char *p = arr + 8; *p && *p != ']' && *p != ';'; p++) {
+					if (p[0] == 'n' && (p[1] == ' ' || p[1] == ')' || p[1] == '?'))
+						n_count++;
+				}
+				CHECK(n_count <= 1,
+				      "bracket-orelse-fno-zeroinit: 'n' appears more than once "
+				      "in dimension (double-evaluation due to missing temp hoisting)");
+			}
+		}
+	}
+	prism_free(&r);
+}
+
+static void test_enum_member_orelse_passthrough(void) {
+	// BUG: orelse inside an enum constant value expression is silently
+	// passed through as literal "orelse" text in the C output.
+	// In Pass 2, when processing enum bodies (which are treated as struct
+	// bodies), the "unprocessed orelse" error check at line ~6274 is gated
+	// by `!in_struct_body()`, which returns true for enum bodies.
+	// Result: orelse reaches the downstream C compiler verbatim → compile error.
+	// Prism must REJECT orelse in enum constant expressions; enum constants
+	// must be compile-time integer constants, so orelse makes no semantic sense.
+	PrismResult r = prism_transpile_source(
+	    "extern int base_val;\n"
+	    "enum E { A = 1, B = base_val orelse 10, C = 3 };\n"
+	    "int main(void) { return 0; }\n",
+	    "enum_orelse.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		// Bug present: orelse leaked into output as literal text
+		CHECK(strstr(r.output, "orelse") == NULL,
+		      "enum-member-orelse: literal 'orelse' must not appear in output "
+		      "(enum constant expressions cannot use orelse; Prism must reject)");
+	}
+	// Correct behavior: rejected with an informative error.
+	// If r.status != PRISM_OK this path is fine; the test passes.
+	prism_free(&r);
+}
+
+static void test_initializer_brace_orelse_wrong_transform(void) {
+	// BUG: orelse inside compound/struct/array initializer braces { ... }
+	// fires the bare-expression orelse transform when FEAT(F_ZEROINIT) is
+	// disabled.  The root cause: handle_open_brace() sets is_struct=false for
+	// initializer braces (they're not struct definitions), so in_struct_body()
+	// returns false inside the initializer, allowing the bare-expr scanner to
+	// fire on designated-initializer tokens like ".x = get_val() orelse 10".
+	// When the bare-orelse transform fires, it emits a ternary:
+	//   ( .x = get_val()) ? (void)0 : (void)( .x = ( 10 };
+	// which is catastrophically corrupted C — closing brace of the initializer
+	// is consumed mid-ternary, orphaning the rest of the function body.
+	// Correct: Prism must reject orelse inside initializer braces.
+	PrismFeatures features = prism_defaults();
+	features.zeroinit = false;
+
+	PrismResult r = prism_transpile_source(
+	    "int get_val(void);\n"
+	    "struct S { int x; };\n"
+	    "void f(void) {\n"
+	    "    struct S s = { .x = get_val() orelse 10 };\n"
+	    "    (void)s.x;\n"
+	    "}\n"
+	    "int main(void) { return 0; }\n",
+	    "initializer_orelse_fno_zi.c", features);
+	if (r.status == PRISM_OK && r.output) {
+		// Bug signature: bare-orelse ternary transform fires inside the
+		// initializer body, injecting `? (void)0 :` into the initializer
+		// expression and corrupting the output (mismatched braces/parens)
+		const char *fn = strstr(r.output, "void f(");
+		if (fn) {
+			CHECK(strstr(fn, "(void)0 :") == NULL,
+			      "initializer-orelse-fno-zeroinit: bare-orelse ternary "
+			      "'(void)0 :' must not appear inside struct initializer body "
+			      "(in_struct_body() returns false for initializer braces, "
+			      "causing fire of bare-orelse transform and corrupt output)");
+		}
+	}
+	prism_free(&r);
+}
+
 static void test_nested_typeof_orelse_leak(void) {
 	/* BUG: walk_balanced_orelse's no-orelse fallback loop only checked for
 	   nested [ brackets, not nested typeof.  typeof(typeof(x orelse y) *)
@@ -3063,5 +3186,10 @@ void run_orelse_tests(void) {
 	test_typeof_orelse_cast();
 	test_bracket_orelse_in_prototype();
 	test_nested_typeof_orelse_leak();
+
+	// Audit round 13: feature-flag desync and enum/initializer orelse bypass
+	test_bracket_orelse_vla_decl_fno_zeroinit();
+	test_enum_member_orelse_passthrough();
+	test_initializer_brace_orelse_wrong_transform();
 }
 

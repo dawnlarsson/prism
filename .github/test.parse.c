@@ -6748,6 +6748,36 @@ static void expect_parse_rejects(const char *code, const char *file_name,
 	prism_free(&result);
 }
 
+static void test_gnu_initializer_field_phony_label(void) {
+	// BUG: Phase 1D label detection fires for every at_stmt_start=true token.
+	// A GNU C old-style struct initializer uses `field: value` syntax inside
+	// initializer braces.  After the opening `{`, at_stmt_start is set to true.
+	// The `fld` token followed by `:` is then indistinguishable from a C label
+	// to Phase 1D and is registered as a P1K_LABEL entry in p1_entries[].
+	// A subsequent `goto fld` resolves to this phony label instead of reporting
+	// "label not found", so Prism silently accepts code where the goto target
+	// is not a real statement label — only discovered when the downstream
+	// C compiler fails with "label 'fld' used but not defined".
+	PrismResult r = prism_transpile_source(
+	    "void f(void) {\n"
+	    "    struct S { int fld; } s = { fld: 99 };\n"
+	    "    goto fld;\n"
+	    "}\n"
+	    "int main(void) { return 0; }\n",
+	    "gnu_init_phony_label.c", prism_defaults());
+	// Prism must REJECT: 'goto fld' has no real C label 'fld:' in scope.
+	// The 'fld:' inside the initializer is a GNU C designated initializer,
+	// not a C label.  Phase 1D must not register it as a jump target.
+	CHECK(r.status != PRISM_OK,
+	      "gnu-init-phony-label: goto to GNU C initializer field designator "
+	      "must be rejected by Prism (Phase 1D wrongly registers it as C label)");
+	if (r.error_msg)
+		CHECK(strstr(r.error_msg, "not found") != NULL ||
+		      strstr(r.error_msg, "undefined") != NULL,
+		      "gnu-init-phony-label: error must say label was not found");
+	prism_free(&r);
+}
+
 static void test_hashmap_struct_entry_regression(void) {
 	/* Regression: hashmap entries used to pack the key length into the top
 	 * 16 bits of the pointer (TAG_KEY/UNTAG_KEY), which breaks on ARM64 MTE
@@ -7358,5 +7388,10 @@ void run_parse_tests(void) {
 #ifdef __GNUC__
 	test_goto_into_stmt_expr_rejected();
 	test_goto_out_of_stmt_expr_rejected();
+#endif
+
+	// Audit round 13: GNU C initializer field phony label
+#ifdef __GNUC__
+	test_gnu_initializer_field_phony_label();
 #endif
 }

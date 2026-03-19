@@ -160,6 +160,7 @@ typedef struct {
 	bool has_zeroinit_decl : 1;
 	bool is_stmt_expr : 1;
 	bool is_orelse_guard : 1;
+	bool is_enum : 1;      // set when is_struct=true and scope is an enum body
 } ScopeNode;
 
 typedef struct {
@@ -213,6 +214,7 @@ typedef struct {
 	bool is_func_body : 1;
 	bool is_stmt_expr : 1;
 	bool is_conditional : 1;
+	bool is_init : 1;     // initializer brace: = { ... } — not a compound statement
 } ScopeInfo;
 
 // Per-function metadata collected during Pass 1.
@@ -832,6 +834,16 @@ static inline bool in_ctrl_paren(void) {
 static inline bool in_struct_body(void) {
 	for (int i = ctx->scope_depth - 1; i >= 0; i--)
 		if (scope_stack[i].kind == SCOPE_BLOCK && scope_stack[i].is_struct) return true;
+	return false;
+}
+
+/* Returns true when the innermost enclosing struct-like scope is an enum body.
+ * Used to fire the 'unprocessed orelse' error inside enum constant expressions:
+ * orelse is not a compile-time constant and must not silently pass through. */
+static inline bool in_enum_body(void) {
+	for (int i = ctx->scope_depth - 1; i >= 0; i--)
+		if (scope_stack[i].kind == SCOPE_BLOCK && scope_stack[i].is_struct)
+			return scope_stack[i].is_enum;
 	return false;
 }
 
@@ -2894,7 +2906,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		bool effective_vla = (decl.is_vla && (!decl.paren_pointer || decl.paren_array)) || (type->is_vla && !decl.is_pointer);
 		bool is_aggregate =
 		    decl.is_array || ((type->is_struct || type->is_typedef) && !decl.is_pointer);
-		bool needs_memset = !decl.has_init && !is_raw && (!decl.is_pointer || decl.is_array) &&
+		// Only queue memset when zeroinit feature is enabled
+		bool needs_memset = FEAT(F_ZEROINIT) && !decl.has_init && !is_raw && (!decl.is_pointer || decl.is_array) &&
 				    !type->has_register &&
 				    (type->has_typeof || (type->has_atomic && is_aggregate) || effective_vla);
 
@@ -2941,7 +2954,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		tok = decl.end;
 
 		// Add zero initializer if needed (for non-memset types)
-		if (!decl.has_init && !effective_vla && !is_raw && !needs_memset && !type->has_extern) {
+		if (FEAT(F_ZEROINIT) && !decl.has_init && !effective_vla && !is_raw && !needs_memset && !type->has_extern) {
 			if (type->has_register && type->has_atomic && is_aggregate)
 				error_tok(decl.var_name,
 					  "'register _Atomic' aggregate cannot be safely "
@@ -3097,7 +3110,23 @@ static bool has_storage_in(Token *from, Token *to) {
 
 // Try to handle a declaration with zero-init. Returns token after declaration, or NULL.
 static Token *try_zero_init_decl(Token *tok) {
-	if (!FEAT(F_ZEROINIT) || ctx->block_depth <= 0 || in_struct_body()) return NULL;
+	if (ctx->block_depth <= 0 || in_struct_body()) return NULL;
+	/* Always skip when both features are off. When only F_ORELSE is on (no
+	 * F_ZEROINIT), proceed only if a P1_OE_BRACKET-annotated token is present
+	 * in the current declaration — bracket orelse hoisting needs
+	 * emit_bracket_orelse_temps which is only reachable via process_declarators. */
+	if (!FEAT(F_ZEROINIT) && !FEAT(F_ORELSE)) return NULL;
+	if (!FEAT(F_ZEROINIT)) {
+		/* Only proceed if there is a P1_OE_BRACKET-annotated orelse token in
+		 * this declaration.  The annotation is set inside [...] brackets, so
+		 * we must NOT skip balanced groups here — scan every token up to ';'. */
+		bool has_bo = false;
+		for (Token *s = tok; s && s->kind != TK_EOF; s = tok_next(s)) {
+			if (match_ch(s, ';') || match_ch(s, '{')) break;
+			if (tok_ann(s) & P1_OE_BRACKET) { has_bo = true; break; }
+		}
+		if (!has_bo) return NULL;
+	}
 
 	if (tok->kind >=
 	    TK_STR) // Fast reject: strings, numbers, prep directives, EOF can't start a declaration
@@ -3200,7 +3229,7 @@ static Token *try_zero_init_decl(Token *tok) {
 		}
 	}
 
-	if (in_switch_scope_unbraced && !is_raw) {
+	if (FEAT(F_ZEROINIT) && in_switch_scope_unbraced && !is_raw) {
 		error_tok(warn_loc,
 			  "variable declaration directly in switch body without braces. "
 			  "Wrap in braces: 'case N: { int x; ... }' to ensure safe zero-initialization, "
@@ -3704,6 +3733,9 @@ static void handle_case_default(Token *tok) {
 }
 
 static Token *handle_sue_body(Token *tok) {
+	/* Save the keyword (struct/union/enum) before tok is modified by
+	 * find_struct_body_brace/emit_range below. */
+	bool is_enum = is_enum_kw(tok);
 	Token *brace = find_struct_body_brace(tok);
 	if (!brace) return NULL;
 
@@ -3712,6 +3744,12 @@ static Token *handle_sue_body(Token *tok) {
 	tok = tok_next(brace);
 	scope_push_kind(SCOPE_BLOCK);
 	scope_stack[ctx->scope_depth - 1].is_struct = true;
+	/* Mark enum bodies so in_enum_body() can distinguish them from struct/union
+	 * bodies.  Both get is_struct=true (to suppress the bare-orelse transform),
+	 * but only enum bodies trigger the 'unprocessed orelse' error — orelse in
+	 * an enum constant expression is invalid (must be compile-time constant). */
+	if (is_enum)
+		scope_stack[ctx->scope_depth - 1].is_enum = true;
 	ctx->at_stmt_start = true;
 	return tok;
 }
@@ -3732,6 +3770,13 @@ static Token *handle_open_brace(Token *tok) {
 
 	// Evaluate BEFORE emit_tok
 	bool is_stmt_expr = last_emitted && match_ch(last_emitted, '(');
+	/* Initializer brace: '= {'.  Tag as is_struct so that in_struct_body()
+	 * returns true, suppressing the bare-expression orelse transform firing
+	 * on designated initializer tokens like '.x = val orelse fallback'.
+	 * With F_ZEROINIT, try_zero_init_decl handles the whole declaration
+	 * before the main loop sees these tokens.  With F_ZEROINIT off, this
+	 * tag ensures orelse produces a clear error instead of corrupted output. */
+	bool is_initializer = last_emitted && match_ch(last_emitted, '=');
 
 	uint8_t ann = tok_ann(tok);
 	emit_tok(tok); tok = tok_next(tok);
@@ -3744,6 +3789,7 @@ static Token *handle_open_brace(Token *tok) {
 	s->is_conditional = ann & P1_SCOPE_CONDITIONAL;
 	if (is_stmt_expr) s->is_stmt_expr = true;
 	if (orelse_guard) s->is_orelse_guard = true;
+	if (is_initializer) s->is_struct = true;
 
 	ctx->at_stmt_start = true;
 	return tok;
@@ -4739,6 +4785,19 @@ static void p1_build_scope_tree(Token *start) {
 			if (prev && match_ch(prev, '('))
 				si->is_stmt_expr = true;
 
+			// Initializer brace: a '{' that is not a compound-statement body.
+			// Detected by immediately preceding '=' (direct init), or by being
+			// nested inside an already-classified initializer scope (nested init).
+			if (!si->is_func_body && !si->is_loop && !si->is_switch &&
+			    !si->is_conditional && !si->is_struct && !si->is_stmt_expr) {
+				if (prev && match_ch(prev, '=')) {
+					si->is_init = true;
+				} else if (depth > 0 && scope_stack_local[depth] < scope_tree_count &&
+				           scope_tree[scope_stack_local[depth]].is_init) {
+					si->is_init = true;
+				}
+			}
+
 			// Write scope classification to pass1_ann
 			uint8_t ann = 0;
 			if (si->is_loop) ann |= P1_SCOPE_LOOP;
@@ -4962,6 +5021,7 @@ static void p1_full_depth_prescan(Token *tok) {
 	uint16_t p1d_braceless_next_sid = scope_tree_count; // synthetic scope IDs for braceless switches
 	Token *p1d_prev = NULL;   // previous non-whitespace token (for label detection)
 	bool p1d_saw_raw = false;  // Phase 1D: track 'raw' keyword preceding declaration
+	int p1d_init_brace_depth = 0; // depth of initializer braces (= { ... }); labels suppressed inside
 
 	while (tok && tok->kind != TK_EOF) {
 		// Pop braceless switches whose body has ended
@@ -5074,6 +5134,10 @@ uint16_t sid = next_scope_id++;
 			if (scope_depth_local < 4096)
 				scope_stack_local[scope_depth_local] = sid;
 
+			// Track initializer brace depth: suppress label detection inside '= { ... }'
+			if (sid < scope_tree_count && scope_tree[sid].is_init)
+				p1d_init_brace_depth++;
+
 			// Update scope range for typedef_add_entry
 			if (sid < scope_tree_count) {
 				td_scope_open = scope_tree[sid].open_tok_idx;
@@ -5094,6 +5158,13 @@ uint16_t sid = next_scope_id++;
 				if (p1d_switch_end[p1d_switch_top - 1] == 0 &&
 				    p1d_switch_stack[p1d_switch_top - 1] == closing_sid)
 					p1d_switch_top--;
+			}
+
+			// Decrement initializer-brace depth before popping the scope
+			if (p1d_init_brace_depth > 0 && scope_depth_local < 4096) {
+				uint16_t csid = scope_stack_local[scope_depth_local];
+				if (csid < scope_tree_count && scope_tree[csid].is_init)
+					p1d_init_brace_depth--;
 			}
 
 			if (brace_depth > 0) {
@@ -5412,7 +5483,8 @@ uint16_t sid = next_scope_id++;
 				if (colon && match_ch(colon, ':') &&
 				    !(tok_next(colon) && match_ch(tok_next(colon), ':')) &&
 				    !(p1d_prev && match_ch(p1d_prev, '?')) &&
-				    !(tok->tag & (TT_CASE | TT_DEFAULT))) {
+				    !(tok->tag & (TT_CASE | TT_DEFAULT)) &&
+				    p1d_init_brace_depth == 0) { // not inside initializer braces
 					if (p1d_ternary_depth > 0) {
 						p1d_ternary_depth--;
 					} else {
@@ -6269,9 +6341,12 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			}
 		}
 
-		// Warn on unprocessed 'orelse' in unsupported context
+		// Warn on unprocessed 'orelse' in unsupported context.
+		// Also fires inside enum bodies (in_enum_body() returns true):
+		// enum constant expressions must be compile-time constants, so orelse
+		// there is always invalid and must not silently leak to the backend.
 		if (__builtin_expect(FEAT(F_ORELSE) && is_orelse_keyword(tok) &&
-				     !in_struct_body(), 0))
+				     (!in_struct_body() || in_enum_body()), 0))
 			error_tok(tok,
 				  "'orelse' cannot be used here (it must appear at the "
 				  "statement level in a declaration or bare expression)");
