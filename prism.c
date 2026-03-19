@@ -3385,6 +3385,17 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch)
 	return (semi && semi->kind != TK_EOF) ? tok_next(semi) : semi;
 }
 
+// Check if 'defer' appears inside an attribute context: __attribute__((..., defer, ...))
+static inline bool is_inside_attribute(Token *tok) {
+	if (!last_emitted || (!match_ch(last_emitted, '(') && !match_ch(last_emitted, ',')))
+		return false;
+	for (Token *t = tok; t && t->kind != TK_EOF && !match_ch(t, ';') && !match_ch(t, '{'); t = tok_next(t)) {
+		if (t->flags & TF_OPEN) { t = tok_match(t); continue; }
+		if (match_ch(t, ')')) return true;
+	}
+	return false;
+}
+
 // Handle 'defer' keyword: validate context, record deferred statement.
 // Returns next token after the defer statement, or NULL if tok is not a valid defer.
 static Token *handle_defer_keyword(Token *tok) {
@@ -3395,10 +3406,7 @@ static Token *handle_defer_keyword(Token *tok) {
 	    typedef_lookup(tok) ||
 	    (tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN)) || in_struct_body() ||
 	    /* attribute context: defer inside __attribute__((...)) */
-	    (last_emitted && (match_ch(last_emitted, '(') || match_ch(last_emitted, ',')) &&
-	     ({bool _a=false; for (Token *_t=tok; _t && _t->kind!=TK_EOF && !match_ch(_t,';') && !match_ch(_t,'{'); _t=tok_next(_t)) {
-		     if (_t->flags & TF_OPEN) { _t=tok_match(_t); continue; }
-		     if (match_ch(_t,')')) { _a=true; break; } } _a;})))
+	    is_inside_attribute(tok))
 		return NULL;
 
 	// Context validation
