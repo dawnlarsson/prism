@@ -6778,6 +6778,42 @@ static void test_gnu_initializer_field_phony_label(void) {
 	prism_free(&r);
 }
 
+static void test_msvc_line_directive_no_flag3_leaks_system_headers(void) {
+	/* BUG: scan_line_directive() in parse.c sets is_system=true only when
+	 * the GCC numeric line-directive flag '3' is present:  # N "file" 1 3
+	 *
+	 * MSVC's preprocessor (cl.exe /E) emits: #line N "file"  (no flags at all).
+	 * Without flag 3, is_system stays false and is_include_entry stays false.
+	 *
+	 * emit_tok() suppresses tokens from system headers only when BOTH flags are
+	 * true:  if (!FEAT(F_FLATTEN) && f->is_system && f->is_include_entry) return;
+	 *
+	 * When is_system=false (MSVC path), the guard is NEVER triggered, so ALL
+	 * content from MSVC-preprocessed system headers is emitted verbatim into
+	 * the transpiled output, defeating -fno-flatten-headers entirely.
+	 *
+	 * Fix: detect MSVC-style #line N "path" by checking whether the filename
+	 * contains known system paths (e.g., "Program Files", "Windows Kits",
+	 * or the /usr/include prefix on Linux) when no numeric flags are present,
+	 * or support the MSVC-specific #pragma detect_mismatch as a source hint. */
+	const char *msvc_pp =
+	    "#line 1 \"/usr/include/stdio.h\"\n"
+	    "int MSVC_LEAKED_SYSTEM_SYM(void);\n" /* system-header content */
+	    "#line 5 \"user.c\"\n"
+	    "int user_fn(void) { return 0; }\n";
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = 0; /* non-flatten: system-include tokens must be suppressed */
+	PrismResult r = prism_transpile_source(msvc_pp, "user.c", feat);
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "MSVC_LEAKED_SYSTEM_SYM") == NULL,
+		      "msvc-line-no-flag3: system header content must be suppressed "
+		      "in non-flatten mode (scan_line_directive only detects GCC flag "
+		      "'3'; MSVC #line N \"file\" has no flags so is_system stays false "
+		      "and all system-include tokens leak into the output)");
+	}
+	prism_free(&r);
+}
+
 static void test_hashmap_struct_entry_regression(void) {
 	/* Regression: hashmap entries used to pack the key length into the top
 	 * 16 bits of the pointer (TAG_KEY/UNTAG_KEY), which breaks on ARM64 MTE
@@ -6901,6 +6937,42 @@ static void test_asm_in_orelse_lhs_rejected(void) {
 	    "asm");
 }
 #endif
+
+
+
+// Bug 15: K&R function parameter declarations sit between ')' and '{'.
+// Phase 1E param-shadow registration checks match_ch(prev_tok, ')') — finds
+// ';' instead (end of "int param_name;") and silently bails.  Result: a param
+// name that shadows a global typedef is NOT registered as a shadow, so inside
+// the function body the typedef remains active and any declaration using that
+// name gets zero-initialised as if it were a plain local variable.
+static void test_knr_param_typedef_shadow_bypass_zeroinit(void) {
+        PrismFeatures f = prism_defaults();
+        // "some_t" is both a global typedef and the K&R parameter name.
+        // Inside the body "some_t b;" is an expression statement (some_t is the
+        // parameter, not the typedef), so zeroinit must NOT fire on "b".
+        // With the bug, the shadow is not registered, "some_t" stays as typedef,
+        // and Prism zero-inits "b" with "= {0}".
+        const char *src =
+                "typedef int some_t;\n"
+                "int f(some_t)\n"
+                "int some_t;\n"
+                "{ some_t b; return some_t + b; }\n";
+        PrismResult r = prism_transpile_source(src, "knr_shadow.c", f);
+        // BUG (round 15): Phase 1E param-shadow registration uses
+        // match_ch(prev_tok, ')') but K&R param decls end in ';' before the
+        // body '{'.  Shadow not registered → 'some_t' stays as typedef inside
+        // body → 'some_t b;' treated as declaration → b zero-inited with {0}.
+        // The test asserts CORRECT behavior: no spurious zero-init injection.
+        // This FAILS until fixed.
+        bool zeroinit_injected = r.output && strstr(r.output, "= {0}") != NULL;
+        CHECK(!zeroinit_injected,
+              "BUG15: K&R param typedef shadow bypass: 'some_t b' inside K&R "
+              "body must NOT be zero-inited — 'some_t' is the param variable, "
+              "not the typedef (shadow registration skipped: prev_tok is ';' "
+              "not ')')" );
+        prism_free(&r);
+}
 
 void run_parse_tests(void) {
 	printf("\n=== PARSE TESTS ===\n");
@@ -7394,4 +7466,10 @@ void run_parse_tests(void) {
 #ifdef __GNUC__
 	test_gnu_initializer_field_phony_label();
 #endif
+
+	// Audit round 14: MSVC-style #line no-flag3 system header leak
+	test_msvc_line_directive_no_flag3_leaks_system_headers();
+
+        // Audit round 15: K&R param typedef shadow bypass mis-zeroinit
+        test_knr_param_typedef_shadow_bypass_zeroinit();
 }

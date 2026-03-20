@@ -225,6 +225,7 @@ typedef struct {
 	Token *ret_type_suffix_start;  // For complex declarators: closing ')'
 	Token *ret_type_suffix_end;    // Token after suffix (exclusive)
 	bool returns_void;
+	bool has_computed_goto;    // Function contains a computed goto (*ptr)
 	int entry_start;           // Start index into p1_entries[] for this function
 	int entry_count;           // Number of P1FuncEntry items for this function
 	uint64_t defer_name_bloom; // Bloom filter of identifier names in defer bodies
@@ -2635,7 +2636,11 @@ static Token *handle_const_orelse_fallback(Token *tok,
 		} else {
 			OUT_LIT(" __typeof__((");
 			emit_type_stripped(type_start, type->end, strip_type_const);
-			OUT_LIT(")0 + 0)");
+			// Cast result is a prvalue — const is stripped by cast, no
+			// arithmetic needed.  The old ")0 + 0)" trick caused GCC to
+			// apply integer promotion to _BitInt(N<32), widening the temp
+			// type to int and silently truncating the value on assignment.
+			OUT_LIT(")0)");
 		}
 	} else {
 		if (pragma_start != type_start)
@@ -4130,9 +4135,10 @@ static void collect_source_defines(const char *input_file) {
 	FILE *f = fopen(input_file, "r");
 	if (!f) return;
 
-	char line[1024];
+	char *line = NULL;
+	size_t line_cap = 0;
 	bool in_continuation = false;
-	while (fgets(line, sizeof(line), f)) {
+	while (getline(&line, &line_cap, f) >= 0) {
 		// If previous line ended with '\', this is a continuation
 		if (in_continuation) {
 			char *end = line + strlen(line);
@@ -4200,6 +4206,7 @@ static void collect_source_defines(const char *input_file) {
 			in_continuation = (end > line && end[-1] == '\\');
 		}
 	}
+	free(line);
 	fclose(f);
 }
 
@@ -4480,6 +4487,29 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 
 	if (!is_bare_fallback)
 		return NULL;  // caller handles non-bare fallback
+
+	// Reject if the LHS contains preprocessor conditionals (#ifdef/#else/etc.).
+	// emit_range_no_prep emits C tokens from ALL branches of a conditional,
+	// producing invalid concatenated code like "target_x86 target_arm = ...".
+	// We cannot statically evaluate which branch is active, so error here.
+	if (bare_assign_eq) {
+		for (Token *s = bare_lhs_start; s != bare_assign_eq; s = tok_next(s)) {
+			if (s->kind != TK_PREP_DIR) continue;
+			const char *dp = tok_loc(s);
+			if (*dp == '#') dp++;
+			while (*dp == ' ' || *dp == '\t') dp++;
+			if (strncmp(dp, "ifdef", 5) == 0 || strncmp(dp, "ifndef", 6) == 0 ||
+			    strncmp(dp, "elif",  4) == 0 || strncmp(dp, "else",   4) == 0 ||
+			    strncmp(dp, "endif", 5) == 0 ||
+			    (strncmp(dp, "if", 2) == 0 && (dp[2]==' '||dp[2]=='\t'||dp[2]=='(')))
+				error_tok(orelse_tok,
+					  "bare orelse assignment cannot be used when the target "
+					  "expression spans preprocessor conditionals — the "
+					  "transpiler would emit tokens from all branches, "
+					  "producing invalid C; use a temporary variable or "
+					  "move the #ifdef outside the expression");
+		}
+	}
 
 	// Hoist preprocessor directives before the wrapper
 	for (Token *s = t; s != orelse_tok; s = tok_next(s)) {
@@ -5102,8 +5132,20 @@ uint16_t sid = next_scope_id++;
 					td_scope_open = scope_tree[sid].open_tok_idx;
 					td_scope_close = scope_tree[sid].close_tok_idx;
 				}
-				// Walk backward from '{' to find the parameter list '(...)'
+				// Walk backward from '{' to find the parameter list '(...)'.
+				// Normal (prototype-style) functions: prev_tok is ')'.
+				// K&R functions: prev_tok is ';' (end of last param declaration
+				// like "int a;"); scan further back to find the identifier-list ')'.
 				Token *prev_tok = p1_find_prev_skipping_attrs(tok_idx(tok) - 1);
+				if (prev_tok && match_ch(prev_tok, ';')) {
+					// K&R: search backward past param-type declarations for ')'
+					for (uint32_t pi = tok_idx(prev_tok); pi > 0; pi--) {
+						Token *pt = &token_pool[pi - 1];
+						if (pt->kind == TK_PREP_DIR) continue;
+						if (match_ch(pt, '{') || match_ch(pt, '}')) { prev_tok = NULL; break; }
+						if (match_ch(pt, ')') && tok_match(pt)) { prev_tok = pt; break; }
+					}
+				}
 				if (prev_tok && match_ch(prev_tok, ')') && tok_match(prev_tok))
 					p1_register_param_shadows(tok_match(prev_tok), prev_tok,
 								  sid, brace_depth + 1, true);
@@ -5259,6 +5301,10 @@ uint16_t sid = next_scope_id++;
 					e->label.name = tok_loc(target);
 					e->label.len = target->len;
 				}
+				// Computed goto (goto *expr): cannot verify target statically.
+				if ((tok->tag & TT_GOTO) && !is_known_typedef(tok) &&
+				    tok_next(tok) && match_ch(tok_next(tok), '*'))
+					func_meta[p1d_cur_func].has_computed_goto = true;
 				if ((tok->tag & TT_DEFER) && !is_known_typedef(tok) &&
 				    !(p1d_prev && (p1d_prev->tag & TT_GOTO)) &&
 				    tok_next(tok) && !match_ch(tok_next(tok), ':') &&
@@ -5508,6 +5554,10 @@ uint16_t sid = next_scope_id++;
 				e->label.name = tok_loc(target);
 				e->label.len = target->len;
 			}
+			// Computed goto (goto *expr): cannot verify target statically.
+			if ((tok->tag & TT_GOTO) && !is_known_typedef(tok) &&
+			    tok_next(tok) && match_ch(tok_next(tok), '*'))
+				func_meta[p1d_cur_func].has_computed_goto = true;
 
 			// Defer detection
 			if ((tok->tag & TT_DEFER) && !is_known_typedef(tok) &&
@@ -5805,6 +5855,20 @@ static void p1_verify_cfg(void) {
 	for (int fi = 0; fi < func_meta_count; fi++) {
 		FuncMeta *fm = &func_meta[fi];
 		if (fm->entry_count == 0) continue;
+
+		// Computed gotos cannot be verified statically: they could jump
+		// into any label, bypassing defers or zeroinit.  If the function
+		// contains both a computed goto and any defers or zeroinit-tracked
+		// declarations, reject it up front.
+		if (fm->has_computed_goto && FEAT(F_DEFER)) {
+			P1FuncEntry *ents = &p1_entries[fm->entry_start];
+			for (int i = 0; i < fm->entry_count; i++) {
+				if (ents[i].kind == P1K_DEFER)
+					error_tok(fm->body_open, "computed goto cannot be used in a "
+						  "function that contains defer statements — the "
+						  "jump target cannot be verified at compile time");
+			}
+		}
 
 		ArenaMark mark = arena_mark(&ctx->main_arena);
 

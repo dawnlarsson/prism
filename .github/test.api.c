@@ -5069,6 +5069,52 @@ static void test_multifile_arena_use_after_reset(void) {
 	unlink(path_b); free(path_b);
 }
 
+static void test_collect_source_defines_long_line_truncation(void) {
+	/* BUG: collect_source_defines() uses fgets(line, 1024, f) to scan for
+	 * pre-include #define directives.  When a #define line exceeds 1023 bytes,
+	 * fgets() stops at the buffer limit and returns without consuming the
+	 * newline.  The next fgets() call reads the remainder of that long line as
+	 * a brand-new "line".  That continuation chunk starts mid-value (not '#'),
+	 * so the scanner hits its "Non-preprocessor, non-blank line -- stop
+	 * scanning" break.  Every #define that follows the long line is SILENTLY
+	 * DROPPED and never re-emitted in the transpiled output header, corrupting
+	 * ABI-altering flags (e.g. _FILE_OFFSET_BITS) as seen by the backend
+	 * compiler.
+	 *
+	 * Fix: replace fgets with POSIX getline (or a realloc loop) to guarantee
+	 * full logical lines are captured before evaluating continuations. */
+	size_t cap = 1300;
+	char *code = malloc(cap);
+	CHECK(code != NULL, "long-line-truncation: malloc"); if (!code) return;
+	/* Line 1: "#define LONGMAC " + 1010 'X' bytes + '\n' = 1026 bytes total.
+	 * fgets reads only 1023 bytes before stopping (1023 chars + NUL).
+	 * The next fgets call sees the remaining "XXX\n" — no '#' — scan stops. */
+	int n = 0;
+	n += snprintf(code + n, cap - n, "#define LONGMAC ");
+	for (int i = 0; i < 1010 && n < (int)cap - 2; i++) code[n++] = 'X';
+	n += snprintf(code + n, cap - n,
+		      "\n#define ABI_FLAG 42\n"
+		      "#include <stdint.h>\n"
+		      "int v = ABI_FLAG;\n");
+	char *path = create_temp_file(code); free(code);
+	CHECK(path != NULL, "long-line-truncation: create temp file");
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = false; /* run collect_source_defines path */
+	PrismResult r = prism_transpile_file(path, feat);
+	if (r.status == PRISM_OK && r.output) {
+		/* ABI_FLAG must appear in the re-emitted defines header so the
+		 * backend compiler sees it.  If it is absent the fgets truncation
+		 * bug dropped it from collect_source_defines. */
+		CHECK(strstr(r.output, "ABI_FLAG") != NULL,
+		      "long-line-truncation: #define after >1023-byte line must be "
+		      "re-emitted in output (fgets(1024) splits the long line; "
+		      "the remainder is misread as a non-'#' line, scanner aborts, "
+		      "all subsequent defines are silently dropped)");
+	}
+	prism_free(&r);
+	unlink(path); free(path);
+}
+
 static void test_no_flatten_headers_abi_define_erasure(void) {
 	const char *code =
 	    "#define _FILE_OFFSET_BITS 64\n"
@@ -5279,4 +5325,7 @@ test_typeof_orelse_leak();
 #ifndef _WIN32
 	test_multifile_arena_use_after_reset();
 #endif
+
+	// Audit round 14 bug probes (should FAIL until fixed)
+	test_collect_source_defines_long_line_truncation();
 }

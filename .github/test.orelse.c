@@ -3003,6 +3003,84 @@ static void test_nested_typeof_orelse_leak(void) {
 	prism_free(&r);
 }
 
+static void test_bitint_const_typedef_orelse_wrong_temp_type(void) {
+	/* BUG: handle_const_orelse_fallback uses __typeof__((typedef)0 + 0) to
+	 * strip const from a typedef and produce a mutable temporary variable.
+	 * For _BitInt(N) where N < 32 (< int bit-width), GCC applies standard
+	 * integer promotion before the arithmetic:
+	 *   (_BitInt(8))0 + 0  ->  int (promoted from _BitInt(8)) + int  =  int
+	 * so __typeof__((_BitInt(8))0 + 0) evaluates to int (size 4), NOT _BitInt(8).
+	 *
+	 * The generated temp _Prism_oe_N therefore has type int, not _BitInt(8).
+	 * Assigning int back to a const _BitInt(8) variable silently truncates:
+	 * bits above bit 7 are discarded, corrupting any value from a fat source.
+	 *
+	 * The fix for C23-capable backends is to use typeof_unqual(expr) instead
+	 * of the arithmetic trick, since typeof_unqual strips qualifiers directly
+	 * without any arithmetic promotion.  For pre-C23 backends a typeof-pointer
+	 * deref trick avoids promotion entirely. */
+	PrismResult r = prism_transpile_source(
+	    "typedef const _BitInt(8) ConstBit8;\n"
+	    "_BitInt(8) get_val(void);\n"
+	    "void test(void) {\n"
+	    "    ConstBit8 x = get_val() orelse (_BitInt(8))42;\n"
+	    "    (void)x;\n"
+	    "}\n",
+	    "bitint8_const_orelse.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		/* The arithmetic +0 trick gives int for _BitInt(8) due to GCC
+		 * integer promotion.  The output must not use "(type)0 + 0" when
+		 * the underlying type is _BitInt(N<32). */
+		CHECK(strstr(r.output, "0 + 0") == NULL,
+		      "bitint-const-typedef-orelse: must not use arithmetic +0 "
+		      "__typeof__ trick for _BitInt types (GCC promotes _BitInt(N<32) "
+		      "to int before arithmetic, so __typeof__((_BitInt(8))0+0) == int, "
+		      "not _BitInt(8) -- temp gets wrong type, truncating the value)");
+	}
+	prism_free(&r);
+}
+
+
+
+// Bug 15: bare-orelse with #ifdef in the LHS — emit_range_no_prep skips
+// TK_PREP_DIR tokens but emits ALL C-token runs (both #ifdef and #else
+// branches), so the generated LHS becomes "target_x86 target_arm = ..." which
+// is invalid C.  ROOT: emit_bare_orelse_impl hoists directives but the per-
+// branch emit loops use continue on TK_PREP_DIR, letting both branches' idents
+// through unguarded.
+static void test_bare_orelse_ifdef_lhs_both_branches_concatenated(void) {
+        PrismFeatures f = prism_defaults();
+        const char *src =
+                "int target_x86;\n"
+                "int target_arm;\n"
+                "int *get_pointer(void);\n"
+                "int fallback;\n"
+                "void test(void) {\n"
+                "#ifdef __x86_64__\n"
+                "    target_x86\n"
+                "#else\n"
+                "    target_arm\n"
+                "#endif\n"
+                "    = get_pointer() orelse fallback;\n"
+                "}\n";
+        PrismResult r = prism_transpile_source(src, "orelse_ifdef_lhs.c", f);
+        // BUG (round 15): emit_range_no_prep skips TK_PREP_DIR but emits ALL
+        // C tokens from every #ifdef branch.  Both target_x86 and target_arm
+        // appear concatenated as the LHS — invalid C.  A correct transform
+        // keeps each branch's ident inside its own preprocessor conditional.
+        // The test asserts CORRECT behavior: only ONE of the two idents should
+        // appear in the orelse expansion (not both).  This FAILS until fixed.
+        bool both_present = r.output &&
+                strstr(r.output, "target_x86") &&
+                strstr(r.output, "target_arm");
+        // Correct: branches are separate, so not both appear in the expansion.
+        CHECK(!both_present,
+              "BUG15: bare-orelse #ifdef LHS: both target_x86 AND target_arm "
+              "present in output — emit_range_no_prep emits all branches' C "
+              "tokens, producing invalid concatenated LHS (should be conditional)");
+        prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -3191,5 +3269,10 @@ void run_orelse_tests(void) {
 	test_bracket_orelse_vla_decl_fno_zeroinit();
 	test_enum_member_orelse_passthrough();
 	test_initializer_brace_orelse_wrong_transform();
-}
 
+	// Audit round 14: _BitInt const-typedef orelse wrong temp type
+	test_bitint_const_typedef_orelse_wrong_temp_type();
+
+        // Audit round 15: bare-orelse LHS #ifdef concatenates both branches
+        test_bare_orelse_ifdef_lhs_both_branches_concatenated();
+}

@@ -1588,6 +1588,37 @@ void test_defer_computed_goto_rejected(void) {
 	    "computed goto");
 }
 
+static void test_computed_goto_forward_into_deferred_scope(void) {
+	/* BUG: computed goto (goto *ptr) forwards into a scope PAST its defer and
+	 * zeroinit entries.  Phase 1 CFG verifier (p1_verify_cfg) only records a
+	 * P1K_GOTO entry when tok_next(goto_tok) is identifier-like.  For a
+	 * computed goto the next token is '*', so the goto is NEVER inserted into
+	 * the P1 CFG array — it is completely invisible to CFG analysis.
+	 *
+	 * Phase 2 handle_goto_keyword() checks has_active_defers() only at the
+	 * GOTO SITE (no defers are live there), not whether the TARGET label sits
+	 * inside a scope whose defer/decl precede it.  So goto *ptr silently flies
+	 * past both the defer statement and the zero-init, producing broken C with
+	 * uninitialized reads and a missed cleanup — no rejection, no warning.
+	 */
+	check_defer_transpile_rejects(
+	    "void noop(int *p);\n"
+	    "void exploit(void) {\n"
+	    "    void *target = &&inside;\n"
+	    "    goto *target;\n"
+	    "    {\n"
+	    "        int secret;\n"
+	    "        defer noop(&secret);\n"
+	    "    inside:\n"
+	    "        noop(&secret);\n"
+	    "    }\n"
+	    "}\n",
+	    "computed_goto_forward_defer.c",
+	    "computed-goto-forward-defer: goto *ptr into scope past defer "
+	    "must be rejected (CFG verifier blind to computed gotos)",
+	    "computed goto");
+}
+
 void test_defer_asm_rejected(void) {
 	check_defer_transpile_rejects(
 	    "void f(void) {\n"
@@ -2447,6 +2478,8 @@ void run_defer_tests(void) {
 	test_defer_stmt_expr_return_bypass();
 	test_defer_stmt_expr_goto_bypass();
 	test_defer_computed_goto_rejected();
+	// Audit round 14: computed-goto forward-into-scope CFG bypass
+	test_computed_goto_forward_into_deferred_scope();
 	test_defer_asm_rejected();
 #endif
 	test_defer_setjmp_rejected();

@@ -1358,16 +1358,44 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
 		free(filename);
 		return NULL;
 	}
-
 	long long ld = (long long)(int)new_line - ((long long)directive_line + 1);
 	if (ld > INT_MAX) ld = INT_MAX;
 	if (ld < INT_MIN) ld = INT_MIN;
 	int line_delta = (int)ld;
-	File *view = new_file_view(filename ? filename : ctx->current_file->name,
-				   base_file,
-				   line_delta,
-				   is_system,
-				   *in_system_include);
+
+	// MSVC-style `#line N "file"` has no GCC-style flags (no 1/2/3).
+	// Infer system/user status from the filename path so non-flatten mode
+	// correctly suppresses content from system headers regardless of whether
+	// the preprocessor was GCC (flag 3) or MSVC (no flags).
+	//
+	// Declare view here (before any compound statement) so prism's transpilation
+	// does not wrap the later new_file_view() call in a short-lived {} scope that
+	// would leave ctx->current_file = view out of scope.
+	bool msvc_style = !is_entering && !is_returning;
+	File *view;
+	if (msvc_style && filename) {
+		const char *f = filename;
+		// Paths matching well-known system include roots are system headers.
+		if (strncmp(f, "/usr/include/", 13) == 0 ||
+		    strncmp(f, "/usr/local/include/", 19) == 0 ||
+		    strncmp(f, "/Library/", 9) == 0 ||
+		    strncmp(f, "/Applications/Xcode", 19) == 0 ||
+		    (strstr(f, "/lib/gcc/") && strstr(f, "/include/")) ||
+		    strstr(f, "Windows Kits") || strstr(f, "Program Files")) {
+			is_system = true;
+			*in_system_include = true;
+		} else if (*f == '/' || *f == '.') {
+			// Absolute non-system path or relative path — user file, exit system mode.
+			is_system = false;
+			*in_system_include = false;
+		}
+		// Otherwise (bare filename, unknown absolute path): preserve current state.
+	}
+	view = new_file_view(filename ? filename : ctx->current_file->name,
+			     base_file,
+			     line_delta,
+			     is_system,
+			     *in_system_include);
 	ctx->current_file = view;
 	free(filename);
 
