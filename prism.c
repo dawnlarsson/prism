@@ -6041,8 +6041,6 @@ static void p1_verify_cfg(void) {
 						P1FuncEntry *d = &ents[decl_list[di]];
 						if (!scope_is_ancestor_or_self(d->scope_id, ents[i].scope_id))
 							continue;
-						// Must be in a NESTED scope (deeper than switch body)
-						if (d->scope_id == sw_sid) continue;
 						if (d->scope_id > 0 && d->scope_id < scope_tree_count &&
 						    scope_tree[d->scope_id].close_tok_idx < ents[i].token_index)
 							continue;
@@ -7074,6 +7072,9 @@ static int install(char *self_path) {
 	old_path[0] = '\0';
 #endif
 
+	FILE *input = NULL;
+	FILE *output = NULL;
+
 	if (!ensure_install_dir(install_path)) {
 		goto use_sudo;
 	}
@@ -7086,8 +7087,8 @@ static int install(char *self_path) {
 		return 0;
 	}
 
-	FILE *input = fopen(self_path, "rb");
-	FILE *output = input ? fopen(install_path, "wb") : NULL;
+	input = fopen(self_path, "rb");
+	output = input ? fopen(install_path, "wb") : NULL;
 
 #ifdef _WIN32
 	// ERROR_SHARING_VIOLATION (32): the installed exe is currently running.
