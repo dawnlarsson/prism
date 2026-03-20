@@ -3109,6 +3109,73 @@ static void test_gnu_attr_param_shadow(void) {
 	prism_free(&r);
 }
 
+// Bug: CFG verifier skips user-initialized declarations (has_init == true),
+// allowing goto/switch to jump over them. Jumping over `int x = 5;` leaves x
+// indeterminate — the exact vulnerability zero-init exists to prevent.
+static void test_goto_over_native_init(void) {
+	printf("\n--- Goto Over Native Init ---\n");
+
+	// Forward goto jumps over user-initialized variable — must be rejected.
+	const char *code =
+	    "void f(void) {\n"
+	    "    goto skip;\n"
+	    "    {\n"
+	    "        int key_length = 32;\n"
+	    "    skip:\n"
+	    "        (void)key_length;\n"
+	    "    }\n"
+	    "}\n"
+	    "int main(void) { f(); return 0; }\n";
+
+	PrismResult r = prism_transpile_source(code, "goto_native_init.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "goto over native init: must reject goto jumping over user-initialized var");
+	prism_free(&r);
+}
+
+static void test_switch_case_over_native_init(void) {
+	printf("\n--- Switch Case Over Native Init ---\n");
+
+	// case 2 jumps over user-initialized key_length in nested block — must be rejected.
+	const char *code =
+	    "void f(int status) {\n"
+	    "    switch (status) {\n"
+	    "        case 1: {\n"
+	    "            int key_length = 32;\n"
+	    "        case 2:\n"
+	    "            (void)key_length;\n"
+	    "        }\n"
+	    "    }\n"
+	    "}\n"
+	    "int main(void) { f(2); return 0; }\n";
+
+	PrismResult r = prism_transpile_source(code, "switch_native_init.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "switch over native init: must reject case label bypassing user-initialized var");
+	prism_free(&r);
+}
+
+// raw exempts the check — user explicitly opted out of safety.
+static void test_goto_over_raw_native_init(void) {
+	printf("\n--- Goto Over raw Native Init ---\n");
+
+	const char *code =
+	    "void f(void) {\n"
+	    "    goto skip;\n"
+	    "    {\n"
+	    "        raw int key_length = 32;\n"
+	    "    skip:\n"
+	    "        (void)key_length;\n"
+	    "    }\n"
+	    "}\n"
+	    "int main(void) { f(); return 0; }\n";
+
+	PrismResult r = prism_transpile_source(code, "goto_raw_native_init.c", prism_defaults());
+	CHECK(r.status == PRISM_OK,
+	      "goto over raw native init: raw must exempt user-initialized var from check");
+	prism_free(&r);
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -3349,6 +3416,9 @@ void run_safe_tests(void) {
 	test_raw_comma_desync_goto_bypass();
 	test_fixed_array_not_vla_with_raw();
 	test_vla_skip_hard_error_with_fno_safety();
+	test_goto_over_native_init();
+	test_switch_case_over_native_init();
+	test_goto_over_raw_native_init();
 #ifdef __GNUC__
 	test_gnu_attr_param_shadow();
 #endif

@@ -4391,9 +4391,9 @@ static void test_binutils_gprofng_regressions(void) {
 		free(path);
 	}
 
-	// Bug 3: goto skip check must NOT flag declarations with initializers.
-	// Only uninitialized declarations (where zeroinit adds = 0) should be
-	// flagged.
+	// goto skip check must flag declarations with initializers too.
+	// Jumping over `int x = 42;` leaves x indeterminate — the same
+	// class of bug as jumping over zeroinit.  Use `raw` to opt out.
 	{
 		const char *code =
 		    "void f(int flag) {\n"
@@ -4406,7 +4406,7 @@ static void test_binutils_gprofng_regressions(void) {
 		char *path = create_temp_file(code);
 		CHECK(path != NULL, "goto skip init: create temp");
 		PrismResult r = prism_transpile_file(path, features);
-		CHECK_EQ(r.status, PRISM_OK, "goto skip init: accepted (has initializer)");
+		CHECK(r.status != PRISM_OK, "goto skip init: rejected (has initializer)");
 		prism_free(&r);
 		unlink(path);
 		free(path);

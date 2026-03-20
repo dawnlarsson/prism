@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3097 tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3120 tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -125,9 +125,9 @@ P1FuncEntry {
     token_index  : uint32_t
     tok          : Token*
     union {
-        label  { name, len }                     — for P1K_LABEL, P1K_GOTO
-        decl   { has_init, is_vla, has_raw }     — for P1K_DECL
-        kase   { switch_scope_id }               — for P1K_CASE
+        label  { name, len }                                      — for P1K_LABEL, P1K_GOTO
+        decl   { has_init, is_vla, has_raw, is_static_storage }    — for P1K_DECL
+        kase   { switch_scope_id }                                 — for P1K_CASE
     }
 }
 ```
@@ -254,7 +254,7 @@ For each function body, collects `P1FuncEntry` items into the global `p1_entries
 | `P1K_LABEL` | Label name, scope_id, token_index |
 | `P1K_GOTO` | Target label name, scope_id, token_index |
 | `P1K_DEFER` | scope_id, token_index |
-| `P1K_DECL` | scope_id, token_index, `has_init`, `is_vla`, `has_raw` |
+| `P1K_DECL` | scope_id, token_index, `has_init`, `is_vla`, `has_raw`, `is_static_storage` |
 | `P1K_SWITCH` | scope_id, token_index (braced switches use Phase 1A scope_id; braceless switches use a synthetic scope_id beyond `scope_tree_count`) |
 | `P1K_CASE` | scope_id, token_index, `switch_scope_id` |
 
@@ -263,6 +263,10 @@ For each function body, collects `P1FuncEntry` items into the global `p1_entries
 **VLA tracking:** `is_vla` on `P1FuncEntry.decl` is set when either the base type is a VLA typedef (`type.is_vla`) or the declaration itself has variable-length array dimensions (`decl.is_vla`). This covers both `typedef int T[n]; T x;` and direct `int x[n];` forms. Jumping past a VLA is always dangerous regardless of `has_init` or `has_raw`, because it bypasses implicit stack allocation.
 
 **has_raw:** Declarations marked `raw` set `has_raw = true`. In multi-declarator statements (`raw int x, y;`), `p1d_saw_raw` is reset on commas — only the first declarator receives `has_raw = true` (matching Pass 2's behavior). The CFG verifier skips `has_raw` declarations for goto checks, **except VLAs** — `raw` on a VLA does not exempt it.
+
+**is_static_storage:** Set when the declaration has `static`, `extern`, `_Thread_local`, or `thread_local` storage class. The prescan tracks this via `p1d_saw_static` (set when skipping `TT_STORAGE` tokens before the type specifier, and also checked via `type.has_static` / `type.has_extern` from `parse_type_specifier`). The CFG verifier exempts static-storage declarations from goto/switch checks because their initialization occurs at program/thread startup, not at the declaration point.
+
+**CFG verifier declaration check:** The verifier flags ANY declaration jumped over by goto or case fallthrough, whether user-initialized (`int x = 5;`) or Prism-initialized (`int x;`). Jumping over a user-initialized variable leaves it indeterminate — the same vulnerability as jumping over a zero-initialized one. Exempt: `has_raw` (user opted out), `is_static_storage` (initialization not at declaration point). VLAs are always flagged regardless of other flags.
 
 **FuncMeta linkage:** Each `FuncMeta` records `entry_start` and `entry_count`, indexing into `p1_entries[]`.
 
@@ -333,7 +337,7 @@ Runs after all Phase 1 sub-phases complete. For each function's `P1FuncEntry[]` 
 
 4. **Backward goto:** When a `P1K_GOTO` targets a label already seen, check entries in `[0, wm_defer[label_index])` range. The scope-close check uses `label->token_index` (not the goto's token_index) because the goto jumps into the scope containing the label.
 
-5. **Switch/case:** On `P1K_SWITCH`, snapshot the current watermarks. On `P1K_CASE`, compare current state against the switch's snapshot. Defers in ancestor-or-self scopes that were not active at the switch entry → error (defer skipped by fallthrough). Zero-initialized declarations in nested blocks → error (case bypasses initialization).
+5. **Switch/case:** On `P1K_SWITCH`, snapshot the current watermarks. On `P1K_CASE`, compare current state against the switch's snapshot. Defers in ancestor-or-self scopes that were not active at the switch entry → error (defer skipped by fallthrough). Declarations in nested blocks (regardless of whether user-initialized or Prism-initialized) → error (case bypasses initialization), unless the declaration has `raw` or static storage duration.
 
 6. **Statement-expression boundary:** Gotos into a GNU statement expression are rejected. When resolving a forward or backward goto, if the target label is inside a `is_stmt_expr` scope and the goto is not within that same statement expression (checked via `scope_stmt_expr_ancestor`), a hard error is raised. Gotos *out of* a statement expression are allowed (GCC/Clang support this and Prism's defer+goto idioms rely on it).
 
@@ -342,15 +346,15 @@ Runs after all Phase 1 sub-phases complete. For each function's `P1FuncEntry[]` 
 | Violation | Severity |
 |---|---|
 | Forward goto skips over `defer` | Error (or warning with `-fno-safety`) |
-| Forward goto skips over uninitialized declaration | Error (or warning with `-fno-safety`) |
+| Forward goto skips over variable declaration | Error (or warning with `-fno-safety`) |
 | Forward goto skips over VLA declaration | **Always error** (VLA skip is UB regardless of `-fno-safety`) |
 | Backward goto enters scope containing `defer` | Error (or warning with `-fno-safety`) |
-| Backward goto enters scope containing uninitialized declaration | Error (or warning) |
+| Backward goto enters scope containing variable declaration | Error (or warning) |
 | Backward goto enters scope containing VLA declaration | **Always error** (VLA skip is UB regardless of `-fno-safety`) |
 | Switch/case skips `defer` via fallthrough | Error (or warning) |
-| Switch/case bypasses zero-initialized declaration in nested block | Error (or warning) |
+| Switch/case bypasses variable declaration in nested block | Error (or warning) |
 
-Forward gotos past `raw`-marked declarations are skipped (safe — no initialization to bypass), **except VLAs** — `raw` on a VLA does not exempt it because jumping past a VLA bypasses implicit stack allocation regardless of initialization.
+Forward gotos past `raw`-marked declarations are skipped (safe — user explicitly opted out of initialization safety), **except VLAs** — `raw` on a VLA does not exempt it because jumping past a VLA bypasses implicit stack allocation regardless of initialization. Declarations with static storage duration (`static`, `extern`, `_Thread_local`, `thread_local`) are also exempt — their initialization occurs at program/thread startup, not at the declaration point, so jumping past them does not leave the variable indeterminate.
 
 ### Complexity
 

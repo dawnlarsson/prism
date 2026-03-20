@@ -119,6 +119,7 @@ typedef struct {
 	bool has_const : 1;
 	bool has_void : 1;	  // True if void or void typedef
 	bool has_extern : 1;
+	bool has_static : 1;
 } TypeSpecResult;
 
 typedef enum {
@@ -258,7 +259,7 @@ typedef struct {
 	Token *tok;
 	union {
 		struct { char *name; int len; } label;     // P1K_LABEL, P1K_GOTO
-		struct { bool has_init; bool is_vla; bool has_raw; } decl; // P1K_DECL
+		struct { bool has_init; bool is_vla; bool has_raw; bool is_static_storage; } decl; // P1K_DECL
 		struct { uint16_t switch_scope_id; } kase;   // P1K_CASE
 	};
 } P1FuncEntry;
@@ -1950,6 +1951,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 		bool had_type = r.saw_type;
 
 		if ((tag & TT_STORAGE) && equal(tok, "extern")) r.has_extern = true;
+		if ((tag & TT_STORAGE) && equal(tok, "static")) r.has_static = true;
 
 		if (tag & TT_QUALIFIER) {
 			if (tag & TT_VOLATILE) r.has_volatile = true;
@@ -5051,6 +5053,7 @@ static void p1_full_depth_prescan(Token *tok) {
 	uint16_t p1d_braceless_next_sid = scope_tree_count; // synthetic scope IDs for braceless switches
 	Token *p1d_prev = NULL;   // previous non-whitespace token (for label detection)
 	bool p1d_saw_raw = false;  // Phase 1D: track 'raw' keyword preceding declaration
+	bool p1d_saw_static = false; // Phase 1D: track static/extern storage class preceding declaration
 	int p1d_init_brace_depth = 0; // depth of initializer braces (= { ... }); labels suppressed inside
 
 	while (tok && tok->kind != TK_EOF) {
@@ -5188,6 +5191,7 @@ uint16_t sid = next_scope_id++;
 
 			at_stmt_start = true;
 			p1d_saw_raw = false;
+			p1d_saw_static = false;
 			p1d_ternary_depth = 0;
 			tok = tok_next(tok);
 			continue;
@@ -5240,6 +5244,7 @@ uint16_t sid = next_scope_id++;
 
 			at_stmt_start = true;
 			p1d_saw_raw = false;
+			p1d_saw_static = false;
 			p1d_ternary_depth = 0;
 			p1d_prev = tok;
 			tok = tok_next(tok);
@@ -5249,6 +5254,7 @@ uint16_t sid = next_scope_id++;
 		if (match_ch(tok, ';')) {
 			at_stmt_start = true;
 			p1d_saw_raw = false;
+			p1d_saw_static = false;
 			p1d_ternary_depth = 0;
 			p1d_prev = tok;
 			if (brace_depth == 0) {
@@ -5278,6 +5284,7 @@ uint16_t sid = next_scope_id++;
 		if (tok->kind == TK_PREP_DIR) {
 			at_stmt_start = true;
 			p1d_saw_raw = false;
+			p1d_saw_static = false;
 			if (brace_depth == 0)
 				file_scope_stmt_start = tok_next(tok);
 			tok = tok_next(tok);
@@ -5372,6 +5379,8 @@ uint16_t sid = next_scope_id++;
 		// Skip storage/inline/noreturn specifiers before type
 		if ((tok->tag & (TT_STORAGE | TT_INLINE)) || equal(tok, "_Noreturn") || equal(tok, "noreturn") ||
 		    equal(tok, "__extension__")) {
+			if (tok->tag & TT_STORAGE)
+				p1d_saw_static = true;
 			tok = tok_next(tok);
 			continue;
 		}
@@ -5716,6 +5725,7 @@ uint16_t sid = next_scope_id++;
 						e->decl.has_init = has_init;
 						e->decl.is_vla = type.is_vla || decl.is_vla;
 						e->decl.has_raw = p1d_saw_raw;
+						e->decl.is_static_storage = p1d_saw_static || type.has_static || type.has_extern;
 					}
 
 					if (has_init) {
@@ -5826,7 +5836,7 @@ static void cfg_check_range(P1FuncEntry *ents,
 				uint32_t close = scope_tree[d->scope_id].close_tok_idx;
 				if (close < label->token_index) continue;
 			}
-			if ((!d->decl.has_init || d->decl.is_vla) && (!d->decl.has_raw || d->decl.is_vla)) {
+			if ((!d->decl.has_raw && !d->decl.is_static_storage) || d->decl.is_vla) {
 				bad_decl = d->tok;
 				bad_decl_is_vla = d->decl.is_vla;
 				break;
@@ -5841,7 +5851,7 @@ static void cfg_check_range(P1FuncEntry *ents,
 		const char *msg = bad_decl_is_vla
 			? "goto '%.*s' would skip over this VLA declaration"
 			: "goto '%.*s' would skip over this variable declaration "
-			  "(bypasses zero-init)";
+			  "(bypasses initialization)";
 		if (bad_decl_is_vla)
 			error_tok(bad_decl, msg, label->label.len, label->label.name);
 		else
@@ -6036,8 +6046,7 @@ static void p1_verify_cfg(void) {
 						if (d->scope_id > 0 && d->scope_id < scope_tree_count &&
 						    scope_tree[d->scope_id].close_tok_idx < ents[i].token_index)
 							continue;
-						if (d->decl.has_init && !d->decl.is_vla) continue;
-						if (d->decl.has_raw && !d->decl.is_vla) continue;
+						if ((d->decl.has_raw || d->decl.is_static_storage) && !d->decl.is_vla) continue;
 						error_tok(ents[i].tok,
 							  "case/default label inside a nested block within a switch "
 							  "may bypass zero-initialization (move the label to the "
