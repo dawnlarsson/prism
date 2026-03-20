@@ -265,6 +265,33 @@ static int prism_posix_open_(const char *path, int oflag, ...) {
 	return _open(winpath, oflag | _O_BINARY);
 }
 
+// POSIX getline() shim: reads a full line into a malloc'd buffer.
+static ssize_t getline(char **lineptr, size_t *n, FILE *stream) {
+	if (!lineptr || !n || !stream) { errno = EINVAL; return -1; }
+	size_t pos = 0;
+	int c;
+	if (!*lineptr || *n == 0) {
+		*n = 128;
+		char *tmp = (char *)realloc(*lineptr, *n);
+		if (!tmp) return -1;
+		*lineptr = tmp;
+	}
+	while ((c = fgetc(stream)) != EOF) {
+		if (pos + 2 > *n) {
+			size_t new_n = *n * 2;
+			char *tmp = (char *)realloc(*lineptr, new_n);
+			if (!tmp) return -1;
+			*lineptr = tmp;
+			*n = new_n;
+		}
+		(*lineptr)[pos++] = (char)c;
+		if (c == '\n') break;
+	}
+	if (pos == 0) return -1;
+	(*lineptr)[pos] = '\0';
+	return (ssize_t)pos;
+}
+
 // tries up to 10000 unique names with randomized template + _sopen_s
 // suffix_len: number of chars after the X's (e.g. 2 for ".c" in "foo.XXXXXX.c")
 static int mkstemps(char *tmpl, int suffix_len) {
