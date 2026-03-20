@@ -556,9 +556,10 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 
 	HANDLE hResult = INVALID_HANDLE_VALUE;
 	char *cmdline = win32_argv_to_cmdline(argv);
+	BOOL ok = FALSE;
 	if (!cmdline) goto cleanup;
 
-	BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+	ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
 	free(cmdline);
 
 	if (!ok) fprintf(stderr, "CreateProcess failed for '%s': error %lu\n", argv[0], GetLastError());
