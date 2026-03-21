@@ -172,7 +172,7 @@ enum {
 	TT_ASSIGN = 1 << 5,	  // Assignment or compound assignment operator (=, +=, ++, --, [)
 	TT_MEMBER = 1 << 6,	  // Member access operator (. or ->)
 	TT_LOOP = 1 << 7,	  // Loop keyword (for, while, do)
-	TT_STORAGE = 1 << 8,	  // Storage class: extern, static, _Thread_local, thread_local
+	TT_STORAGE = 1 << 8,	  // Storage class: extern, static, _Thread_local, thread_local, __thread
 	TT_ASM = 1 << 9,	  // Inline assembly (asm, __asm__, __asm)
 	TT_INLINE = 1 << 10,	  // inline, __inline, __inline__
 	TT_NORETURN_FN = 1 << 11, // Noreturn function identifier (exit, abort, etc.)
@@ -881,6 +881,7 @@ static void init_keyword_map(void) {
 	    {"__inline", TT_INLINE, true},
 	    {"__inline__", TT_INLINE, true},
 	    {"_Thread_local", TT_STORAGE, true},
+	    {"__thread", TT_STORAGE, true},
 	    {"constexpr", TT_QUALIFIER | TT_SKIP_DECL, true},
 	    {"thread_local", TT_QUALIFIER | TT_SKIP_DECL | TT_STORAGE, true},
 	    {"void", TT_TYPE, true},
@@ -946,6 +947,11 @@ static void init_keyword_map(void) {
 	    {"_longjmp", TT_SPECIAL_FN, false},
 	    {"sigsetjmp", TT_SPECIAL_FN, false},
 	    {"siglongjmp", TT_SPECIAL_FN, false},
+	    {"__sigsetjmp", TT_SPECIAL_FN, false},
+	    {"__siglongjmp", TT_SPECIAL_FN, false},
+	    {"__setjmp", TT_SPECIAL_FN, false},
+	    {"__longjmp", TT_SPECIAL_FN, false},
+	    {"__longjmp_chk", TT_SPECIAL_FN, false},
 	    {"pthread_exit", TT_SPECIAL_FN, false},
 	    {"__builtin_setjmp", TT_SPECIAL_FN, false},
 	    {"__builtin_longjmp", TT_SPECIAL_FN, false},

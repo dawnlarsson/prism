@@ -1644,6 +1644,65 @@ void test_defer_setjmp_rejected(void) {
 	    "setjmp");
 }
 
+// Bug: glibc expands sigsetjmp to __sigsetjmp after preprocessing.
+// Prism must reject defer in functions calling these internal variants.
+void test_defer_glibc_sigsetjmp_rejected(void) {
+	// __sigsetjmp: glibc internal for sigsetjmp
+	check_defer_transpile_rejects(
+	    "int __sigsetjmp(void *env, int savesigs);\n"
+	    "void f(void) {\n"
+	    "    defer (void)0;\n"
+	    "    __sigsetjmp((void*)0, 0);\n"
+	    "}\n",
+	    "defer_glibc_sigsetjmp.c",
+	    "defer with __sigsetjmp rejected",
+	    "setjmp");
+
+	// __siglongjmp: glibc internal for siglongjmp
+	check_defer_transpile_rejects(
+	    "void __siglongjmp(void *env, int val);\n"
+	    "void f(void) {\n"
+	    "    defer (void)0;\n"
+	    "    __siglongjmp((void*)0, 1);\n"
+	    "}\n",
+	    "defer_glibc_siglongjmp.c",
+	    "defer with __siglongjmp rejected",
+	    "setjmp");
+
+	// __setjmp: BSD/musl internal
+	check_defer_transpile_rejects(
+	    "int __setjmp(void *env);\n"
+	    "void f(void) {\n"
+	    "    defer (void)0;\n"
+	    "    __setjmp((void*)0);\n"
+	    "}\n",
+	    "defer_glibc___setjmp.c",
+	    "defer with __setjmp rejected",
+	    "setjmp");
+
+	// __longjmp: glibc/musl internal
+	check_defer_transpile_rejects(
+	    "void __longjmp(void *env, int val);\n"
+	    "void f(void) {\n"
+	    "    defer (void)0;\n"
+	    "    __longjmp((void*)0, 1);\n"
+	    "}\n",
+	    "defer_glibc___longjmp.c",
+	    "defer with __longjmp rejected",
+	    "setjmp");
+
+	// __longjmp_chk: glibc fortified variant
+	check_defer_transpile_rejects(
+	    "void __longjmp_chk(void *env, int val);\n"
+	    "void f(void) {\n"
+	    "    defer (void)0;\n"
+	    "    __longjmp_chk((void*)0, 1);\n"
+	    "}\n",
+	    "defer_glibc___longjmp_chk.c",
+	    "defer with __longjmp_chk rejected",
+	    "setjmp");
+}
+
 #ifndef _WIN32
 void test_defer_vfork_rejected(void) {
 	check_defer_transpile_rejects(
@@ -2483,6 +2542,7 @@ void run_defer_tests(void) {
 	test_defer_asm_rejected();
 #endif
 	test_defer_setjmp_rejected();
+	test_defer_glibc_sigsetjmp_rejected();
 #ifndef _WIN32
 	test_defer_vfork_rejected();
 #endif

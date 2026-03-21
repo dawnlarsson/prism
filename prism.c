@@ -3333,14 +3333,15 @@ static void validate_defer_control_flow(Token *t, bool in_loop, bool in_switch) 
 		error_tok(t, "'continue' inside defer block bypasses remaining defers");
 }
 
-static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch) {
+static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch, int depth) {
+	if (depth >= 4096) error_tok(tok, "braceless control flow nesting depth exceeds 4096");
 	tok = skip_noise(tok);
 	if (!tok || tok->kind == TK_EOF) return tok;
 
 	if (match_ch(tok, '{')) {
 		Token *end = tok_match(tok);
 		for (tok = skip_noise(tok_next(tok)); tok && tok != end && tok->kind != TK_EOF; tok = skip_noise(tok)) {
-			Token *next = validate_defer_statement(tok, in_loop, in_switch);
+			Token *next = validate_defer_statement(tok, in_loop, in_switch, depth);
 			if (next == tok) break;
 			tok = next;
 		}
@@ -3348,10 +3349,10 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch)
 	}
 
 	if (equal(tok, "if")) {
-		Token *after_then = validate_defer_statement(skip_defer_control_head(tok_next(tok)), in_loop, in_switch);
+		Token *after_then = validate_defer_statement(skip_defer_control_head(tok_next(tok)), in_loop, in_switch, depth + 1);
 		Token *else_tok = skip_noise(after_then);
 		if (else_tok && equal(else_tok, "else"))
-			return validate_defer_statement(tok_next(else_tok), in_loop, in_switch);
+			return validate_defer_statement(tok_next(else_tok), in_loop, in_switch, depth + 1);
 		return after_then;
 	}
 
@@ -3360,15 +3361,15 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch)
 			if (tok->flags & TF_OPEN) tok = tok_match(tok) ? tok_next(tok_match(tok)) : tok_next(tok);
 			else tok = tok_next(tok);
 		}
-		return tok && match_ch(tok, ':') ? validate_defer_statement(tok_next(tok), in_loop, in_switch) : tok;
+		return tok && match_ch(tok, ':') ? validate_defer_statement(tok_next(tok), in_loop, in_switch, depth + 1) : tok;
 	}
 
 	if (tok->tag & TT_SWITCH)
-		return validate_defer_statement(skip_defer_control_head(tok_next(tok)), in_loop, true);
+		return validate_defer_statement(skip_defer_control_head(tok_next(tok)), in_loop, true, depth + 1);
 
 	if (tok->tag & TT_LOOP) {
 		if (equal(tok, "do")) {
-			tok = validate_defer_statement(tok_next(tok), true, in_switch);
+			tok = validate_defer_statement(tok_next(tok), true, in_switch, depth + 1);
 			Token *w = skip_noise(tok);
 			if (w && equal(w, "while")) {
 				tok = skip_defer_control_head(tok_next(w));
@@ -3377,14 +3378,14 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch)
 			}
 			return tok;
 		}
-		return validate_defer_statement(skip_defer_control_head(tok_next(tok)), true, in_switch);
+		return validate_defer_statement(skip_defer_control_head(tok_next(tok)), true, in_switch, depth + 1);
 	}
 
 	if (tok->flags & TF_OPEN) {
 		// GNU statement expression ({...}): validate the inner block recursively
 		if (match_ch(tok, '(') && tok_next(tok) && match_ch(tok_next(tok), '{')) {
 			Token *inner_brace = tok_next(tok);
-			validate_defer_statement(inner_brace, in_loop, in_switch);
+			validate_defer_statement(inner_brace, in_loop, in_switch, depth + 1);
 			return tok_match(tok) ? tok_next(tok_match(tok)) : tok_next(tok);
 		}
 		return tok_match(tok) ? tok_next(tok_match(tok)) : tok_next(tok);
@@ -3419,7 +3420,7 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch)
 	for (Token *s = tok; s && s->kind != TK_EOF && !match_ch(s, ';'); s = tok_next(s)) {
 		if (s->flags & TF_OPEN) {
 			if (match_ch(s, '(') && tok_next(s) && match_ch(tok_next(s), '{'))
-				validate_defer_statement(tok_next(s), in_loop, in_switch);
+				validate_defer_statement(tok_next(s), in_loop, in_switch, depth + 1);
 			s = tok_match(s) ? tok_match(s) : s;
 			continue;
 		}
@@ -4148,7 +4149,14 @@ static void collect_source_defines(const char *input_file) {
 	char *line = NULL;
 	size_t line_cap = 0;
 	bool in_continuation = false;
+	bool in_block_comment = false;
 	while (getline(&line, &line_cap, f) >= 0) {
+		// Track multi-line block comments
+		if (in_block_comment) {
+			if (strstr(line, "*/"))
+				in_block_comment = false;
+			continue;
+		}
 		// If previous line ended with '\', this is a continuation
 		if (in_continuation) {
 			char *end = line + strlen(line);
@@ -4161,8 +4169,13 @@ static void collect_source_defines(const char *input_file) {
 		while (*p == ' ' || *p == '\t') p++;
 		if (*p != '#') {
 			// Skip blank lines and comments
-			if (*p == '\n' || *p == '\0' || (p[0] == '/' && (p[1] == '/' || p[1] == '*')))
+			if (*p == '\n' || *p == '\0' || (p[0] == '/' && p[1] == '/'))
 				continue;
+			if (p[0] == '/' && p[1] == '*') {
+				if (!strstr(p + 2, "*/"))
+					in_block_comment = true;
+				continue;
+			}
 			// Non-preprocessor, non-blank line — stop scanning
 			break;
 		}
@@ -4870,7 +4883,8 @@ static void p1_build_scope_tree(Token *start) {
 // the statement (typically the closing `;`, `}`, or end of a do-while).
 // Handles if-else, for, while, do-while, switch, braced, and simple statements.
 // Returns NULL if the statement end cannot be determined.
-static Token *skip_one_stmt(Token *tok) {
+static Token *skip_one_stmt(Token *tok, int depth) {
+	if (depth >= 4096) error_tok(tok, "braceless control flow nesting depth exceeds 4096");
 	while (tok && tok->kind == TK_PREP_DIR) tok = tok_next(tok);
 	if (!tok || tok->kind == TK_EOF) return NULL;
 
@@ -4881,17 +4895,17 @@ static Token *skip_one_stmt(Token *tok) {
 	// 'if' / 'else'
 	if (tok->tag & TT_IF) {
 		if (tok_loc(tok)[0] == 'e') // 'else': skip body
-			return skip_one_stmt(tok_next(tok));
+			return skip_one_stmt(tok_next(tok), depth + 1);
 		// 'if': skip '(...)' then body, check for 'else'
 		Token *p = tok_next(tok);
 		while (p && p->kind == TK_PREP_DIR) p = tok_next(p);
 		if (p && match_ch(p, '(') && tok_match(p)) {
-			Token *end = skip_one_stmt(tok_next(tok_match(p)));
+			Token *end = skip_one_stmt(tok_next(tok_match(p)), depth + 1);
 			if (!end) return NULL;
 			Token *n = tok_next(end);
 			while (n && n->kind == TK_PREP_DIR) n = tok_next(n);
 			if (n && (n->tag & TT_IF) && tok_loc(n)[0] == 'e')
-				return skip_one_stmt(tok_next(n));
+				return skip_one_stmt(tok_next(n), depth + 1);
 			return end;
 		}
 		return NULL;
@@ -4902,13 +4916,13 @@ static Token *skip_one_stmt(Token *tok) {
 		Token *p = tok_next(tok);
 		while (p && p->kind == TK_PREP_DIR) p = tok_next(p);
 		if (p && match_ch(p, '(') && tok_match(p))
-			return skip_one_stmt(tok_next(tok_match(p)));
+			return skip_one_stmt(tok_next(tok_match(p)), depth + 1);
 		return NULL;
 	}
 
 	// 'do': body then 'while' '(...)' ';'
 	if ((tok->tag & TT_LOOP) && tok_loc(tok)[0] == 'd') {
-		Token *end = skip_one_stmt(tok_next(tok));
+		Token *end = skip_one_stmt(tok_next(tok), depth + 1);
 		if (!end) return NULL;
 		Token *w = tok_next(end);
 		while (w && w->kind == TK_PREP_DIR) w = tok_next(w);
@@ -5345,7 +5359,7 @@ uint16_t sid = next_scope_id++;
 				    tok_next(tok) && !match_ch(tok_next(tok), ':') &&
 				    !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN))) {
 					p1_try_alloc_defer(tok, cur_sid, p1d_cur_func);
-					validate_defer_statement(tok_next(tok), false, false);
+					validate_defer_statement(tok_next(tok), false, false, 0);
 				}
 			}
 
@@ -5521,7 +5535,7 @@ uint16_t sid = next_scope_id++;
 					Token *body_start = tok_next(for_close);
 					while (body_start && body_start->kind == TK_PREP_DIR)
 						body_start = tok_next(body_start);
-					Token *stmt_end = skip_one_stmt(body_start);
+					Token *stmt_end = skip_one_stmt(body_start, 0);
 					if (stmt_end)
 						body_end_idx = tok_idx(stmt_end);
 				}
@@ -5633,7 +5647,7 @@ uint16_t sid = next_scope_id++;
 		    !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN))) {
 			// Defer bodies always start with in_loop=false, in_switch=false:
 			// break/continue inside a defer must not affect the enclosing loop.
-			validate_defer_statement(tok_next(tok), false, false);
+			validate_defer_statement(tok_next(tok), false, false, 0);
 
 			// Phase 1F: populate defer name bloom filter for O(1) shadow checks.
 			// Walk the defer body and hash each non-member identifier.
@@ -5789,7 +5803,7 @@ uint16_t sid = next_scope_id++;
 					if (p1d_switch_top >= 256)
 						error_tok(tok, "switch nesting depth exceeds 256");
 					p1d_switch_stack[p1d_switch_top] = synth_sid;
-					Token *end = skip_one_stmt(body);
+					Token *end = skip_one_stmt(body, 0);
 					p1d_switch_end[p1d_switch_top] = end ? tok_idx(end) : UINT32_MAX;
 					p1d_switch_top++;
 				}

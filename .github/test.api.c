@@ -5078,6 +5078,66 @@ static void test_multifile_arena_use_after_reset(void) {
 	unlink(path_b); free(path_b);
 }
 
+static void test_collect_source_defines_block_comment_leak(void) {
+	/* BUG: collect_source_defines() has no state machine for multi-line
+	 * block comments.  It skips lines *starting* with /*, but when a block
+	 * comment spans multiple lines, a #define on a subsequent line inside
+	 * the comment is scraped as if it were active code.
+	 *
+	 * Example:
+	 *   /\* Legacy config:
+	 *   #define _FILE_OFFSET_BITS 32
+	 *   *\/
+	 * Prism extracts _FILE_OFFSET_BITS=32 and injects it into the output,
+	 * silently mutating the ABI of the compiled program. */
+	const char *code =
+	    "/* Legacy config:\n"
+	    "#define _FILE_OFFSET_BITS 32\n"
+	    "*/\n"
+	    "#include <stdio.h>\n"
+	    "int main(void) { return 0; }\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "block-comment-leak: create temp file");
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = false; /* run collect_source_defines path */
+	PrismResult r = prism_transpile_file(path, feat);
+	if (r.status == PRISM_OK && r.output) {
+		/* The define is inside a comment — it must NOT appear in output */
+		CHECK(strstr(r.output, "_FILE_OFFSET_BITS") == NULL,
+		      "block-comment-leak: #define inside /* ... */ block comment "
+		      "was scraped and re-emitted — resurrects commented-out ABI "
+		      "config");
+	}
+	prism_free(&r);
+	unlink(path); free(path);
+}
+
+static void test_braceless_nesting_depth_limit(void) {
+	/* BUG: skip_one_stmt() and validate_defer_statement() use direct C
+	 * recursion for braceless control flow (if/for/while/switch without
+	 * braces).  The brace depth cap (4096) only guards '{' nesting.
+	 * Deeply nested braceless if-chains blow the call stack.
+	 *
+	 * Fix: both functions now take a depth parameter and error at 4096. */
+	size_t cap = 200000;
+	char *code = malloc(cap);
+	CHECK(code != NULL, "braceless-depth: malloc"); if (!code) return;
+	int n = 0;
+	n += snprintf(code + n, cap - n, "void f(int x) {\n  switch (x)\n");
+	for (int i = 0; i < 5000 && n < (int)cap - 30; i++)
+		n += snprintf(code + n, cap - n, "    if (1)\n");
+	n += snprintf(code + n, cap - n, "      x = 0;\n}\n");
+	PrismResult r = prism_transpile_source(code, "deep_braceless.c", prism_defaults());
+	free(code);
+	/* Must get an error (depth exceeded), not a segfault */
+	CHECK(r.status != PRISM_OK,
+	      "braceless-depth: 5000 nested braceless ifs must be rejected");
+	if (r.error_msg)
+		CHECK(strstr(r.error_msg, "nesting depth") != NULL,
+		      "braceless-depth: error must mention nesting depth");
+	prism_free(&r);
+}
+
 static void test_collect_source_defines_long_line_truncation(void) {
 	/* BUG: collect_source_defines() uses fgets(line, 1024, f) to scan for
 	 * pre-include #define directives.  When a #define line exceeds 1023 bytes,
@@ -5337,4 +5397,8 @@ test_typeof_orelse_leak();
 
 	// Audit round 14 bug probes (should FAIL until fixed)
 	test_collect_source_defines_long_line_truncation();
+
+	// Audit round 16 bug probes (should FAIL until fixed)
+	test_collect_source_defines_block_comment_leak();
+	test_braceless_nesting_depth_limit();
 }

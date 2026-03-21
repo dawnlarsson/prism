@@ -266,7 +266,7 @@ For each function body, collects `P1FuncEntry` items into the global `p1_entries
 
 **has_raw:** Declarations marked `raw` set `has_raw = true`. In multi-declarator statements (`raw int x, y;`), `p1d_saw_raw` is reset on commas — only the first declarator receives `has_raw = true` (matching Pass 2's behavior). The CFG verifier skips `has_raw` declarations for goto checks, **except VLAs** — `raw` on a VLA does not exempt it.
 
-**is_static_storage:** Set when the declaration has `static`, `extern`, `_Thread_local`, or `thread_local` storage class. The prescan tracks this via `p1d_saw_static` (set when skipping `TT_STORAGE` tokens before the type specifier, and also checked via `type.has_static` / `type.has_extern` from `parse_type_specifier`). The CFG verifier exempts static-storage declarations from goto/switch checks because their initialization occurs at program/thread startup, not at the declaration point.
+**is_static_storage:** Set when the declaration has `static`, `extern`, `_Thread_local`, `thread_local`, or `__thread` (GNU extension) storage class. The prescan tracks this via `p1d_saw_static` (set when skipping `TT_STORAGE` tokens before the type specifier, and also checked via `type.has_static` / `type.has_extern` from `parse_type_specifier`). The CFG verifier exempts static-storage declarations from goto/switch checks because their initialization occurs at program/thread startup, not at the declaration point.
 
 **CFG verifier declaration check:** The verifier flags ANY declaration jumped over by goto or case fallthrough, whether user-initialized (`int x = 5;`) or Prism-initialized (`int x;`). Jumping over a user-initialized variable leaves it indeterminate — the same vulnerability as jumping over a zero-initialized one. Exempt: `has_raw` (user opted out), `is_static_storage` (initialization not at declaration point). VLAs are always flagged regardless of other flags.
 
@@ -303,7 +303,7 @@ Rejected patterns inside defer bodies:
 - `break` / `continue` (since `in_loop=false, in_switch=false`, these always error)
 - Recurses into GNU statement expressions `({…})` — `return`/`goto`/`break`/`continue` inside a stmt-expr in a defer body is rejected
 
-**Forbidden function contexts:** Defer in functions that use `setjmp`/`longjmp`, `vfork`, or inline assembly is rejected via `FuncMeta.has_setjmp`/`.has_vfork`/`.has_asm`.
+**Forbidden function contexts:** Defer in functions that use `setjmp`/`longjmp`, `vfork`, or inline assembly is rejected via `FuncMeta.has_setjmp`/`.has_vfork`/`.has_asm`. The `TT_SPECIAL_FN` taint covers all standard and implementation-internal variants that survive preprocessing: `setjmp`, `_setjmp`, `__setjmp`, `__sigsetjmp`, `longjmp`, `_longjmp`, `__longjmp`, `__siglongjmp`, `__longjmp_chk`, `sigsetjmp`, `siglongjmp`, `__builtin_setjmp`, `__builtin_longjmp`, `__builtin_setjmp_receive`, `pthread_exit`, `savectx`.
 
 ---
 
@@ -356,7 +356,7 @@ Runs after all Phase 1 sub-phases complete. For each function's `P1FuncEntry[]` 
 | Switch/case skips `defer` via fallthrough | Error (or warning) |
 | Switch/case bypasses variable declaration in nested block | Error (or warning) |
 
-Forward gotos past `raw`-marked declarations are skipped (safe — user explicitly opted out of initialization safety), **except VLAs** — `raw` on a VLA does not exempt it because jumping past a VLA bypasses implicit stack allocation regardless of initialization. Declarations with static storage duration (`static`, `extern`, `_Thread_local`, `thread_local`) are also exempt — their initialization occurs at program/thread startup, not at the declaration point, so jumping past them does not leave the variable indeterminate.
+Forward gotos past `raw`-marked declarations are skipped (safe — user explicitly opted out of initialization safety), **except VLAs** — `raw` on a VLA does not exempt it because jumping past a VLA bypasses implicit stack allocation regardless of initialization. Declarations with static storage duration (`static`, `extern`, `_Thread_local`, `thread_local`, `__thread`) are also exempt — their initialization occurs at program/thread startup, not at the declaration point, so jumping past them does not leave the variable indeterminate.
 
 ### Complexity
 

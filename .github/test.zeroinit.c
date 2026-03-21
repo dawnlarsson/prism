@@ -2068,6 +2068,45 @@ void test_register_atomic_aggregate_must_error(void) {
 #endif
 }
 
+#ifndef _MSC_VER
+void test_gnu_thread_storage_class(void) {
+	/* __thread is a GNU storage class specifier equivalent to _Thread_local.
+	   It survives preprocessing verbatim (unlike sigsetjmp→__sigsetjmp).
+	   Prism must recognise __thread as TT_STORAGE so that:
+	   1. file-scope __thread variables are not redundantly zero-initialized
+	   2. static __thread in function scope does not get zero-init
+	   3. goto-over-__thread is exempt from CFG errors (static storage) */
+
+	/* __thread at file scope — must NOT get zero-init */
+	PrismResult r1 = prism_transpile_source(
+	    "__thread int x;\n"
+	    "int main(void) { return x; }\n",
+	    "gnu_thread_file_scope.c", prism_defaults());
+	CHECK(r1.status == PRISM_OK && r1.output, "gnu-__thread-file-scope: transpiles OK");
+	if (r1.output) {
+		CHECK(!strstr(r1.output, "= 0") && !strstr(r1.output, "= {0}") &&
+		      !strstr(r1.output, "memset"),
+		      "gnu-__thread-file-scope: no redundant zero-init");
+	}
+	prism_free(&r1);
+
+	/* static __thread in function scope — must NOT get zero-init */
+	PrismResult r2 = prism_transpile_source(
+	    "void f(void) {\n"
+	    "    static __thread int y;\n"
+	    "    (void)y;\n"
+	    "}\n",
+	    "gnu_thread_static_func.c", prism_defaults());
+	CHECK(r2.status == PRISM_OK && r2.output, "gnu-__thread-static-func: transpiles OK");
+	if (r2.output) {
+		CHECK(!strstr(r2.output, "= 0") && !strstr(r2.output, "= {0}") &&
+		      !strstr(r2.output, "memset"),
+		      "gnu-__thread-static-func: no redundant zero-init");
+	}
+	prism_free(&r2);
+}
+#endif
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -2171,4 +2210,7 @@ void run_zeroinit_tests(void) {
 	test_vla_typedef_struct_tag_memset();
 	test_register_atomic_aggregate_must_error();
 	test_static_vars_no_redundant_zeroinit();
+#ifdef __GNUC__
+	test_gnu_thread_storage_class();
+#endif
 }
