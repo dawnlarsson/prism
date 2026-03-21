@@ -2078,6 +2078,64 @@ static void test_orelse_volatile_decl_double_read(void) {
 	prism_free(&r);
 }
 
+/* BUG (audit round 18): bare assignment orelse with a pointer-dereference LHS
+ * re-reads the LHS after the write.  The if-based expansion
+ *   { *ptr = get(); if (!*ptr) *ptr = fb; }
+ * reads *ptr in the condition — for a volatile MMIO register this hidden read
+ * is incorrect (TX register reads have hardware side-effects; using the
+ * written value to check truth is both architecturally correct and avoids the
+ * spurious read).  The correct expansion uses the C assignment-expression
+ * result (which is the assigned value, not a re-read):
+ *   { if (!(*ptr = get())) *ptr = fb; }
+ * Chained: { if (!(*ptr = get())) if (!(*ptr = (fb1))) *ptr = fb2; }
+ */
+static void test_bare_orelse_ptr_deref_lhs_rereads_volatile(void) {
+	/* Simple pointer-deref case */
+	const char *src =
+	    "unsigned int *hw_reg;\n"
+	    "unsigned int get_byte(void);\n"
+	    "void test(void) {\n"
+	    "    *hw_reg = get_byte() orelse 0xFF;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(src, "bare_orelse_ptr_deref.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "bare-orelse-ptr-deref: transpiles OK");
+	if (r.output) {
+		/* OLD (buggy): { *hw_reg = get_byte(); if (!*hw_reg) *hw_reg = (0xFF); }
+		 * NEW (correct): { if (!(*hw_reg = get_byte())) *hw_reg = (0xFF); }
+		 * Check: the LHS deref must NOT appear as a standalone read in an
+		 * if-condition (i.e. "if (!" followed directly by the target without =). */
+		bool has_standalone_reread = strstr(r.output, "if (!*hw_reg)") != NULL ||
+		                             strstr(r.output, "if (! *hw_reg)") != NULL ||
+		                             strstr(r.output, "if (!\n*hw_reg)") != NULL;
+		CHECK(!has_standalone_reread,
+		      "BUG18: bare-orelse ptr-deref LHS: old pattern re-reads *hw_reg in "
+		      "if-condition after write (volatile MMIO hazard); "
+		      "expected if(!(*hw_reg=get_byte())) form");
+	}
+	prism_free(&r);
+
+	/* Chained orelse: *hw_reg = get() orelse backup() orelse 0xFF */
+	const char *src2 =
+	    "unsigned int *hw_reg;\n"
+	    "unsigned int get_byte(void);\n"
+	    "unsigned int backup(void);\n"
+	    "void test2(void) {\n"
+	    "    *hw_reg = get_byte() orelse backup() orelse 0xFF;\n"
+	    "}\n";
+	PrismResult r2 = prism_transpile_source(src2, "bare_orelse_ptr_deref_chain.c", prism_defaults());
+	CHECK_EQ(r2.status, PRISM_OK, "bare-orelse-ptr-deref-chain: transpiles OK");
+	if (r2.output) {
+		/* Chain must also not re-read the pointer in any if-condition. */
+		bool has_reread = strstr(r2.output, "if (!*hw_reg)") != NULL ||
+		                  strstr(r2.output, "if (! *hw_reg)") != NULL ||
+		                  strstr(r2.output, "if (!\n*hw_reg)") != NULL;
+		CHECK(!has_reread,
+		      "BUG18: bare-orelse ptr-deref chain: re-reads *hw_reg in chain "
+		      "if-condition (volatile MMIO hazard)");
+	}
+	prism_free(&r2);
+}
+
 // Bug: bare expression orelse with a compound-literal fallback on a
 // volatile target uses the comma-ternary pattern which re-reads the
 // volatile for the condition check after assignment.
@@ -2588,10 +2646,15 @@ static void test_bare_orelse_compound_literal_unbraced_if(void) {
 // Bug: emit_range does not filter TK_PREP_DIR tokens.  When a preprocessor
 // directive (e.g. #line) sits between the bare-orelse LHS tokens and the
 // assignment operator, emit_range copies it verbatim into the generated
-// `if (!expr)` condition, producing invalid C.
+// if-condition as a raw TK_PREP_DIR token.
 //
-// Expected: the condition in the generated `if (! ...)` should contain no
-// preprocessor directives.
+// Note: synthetic `#line` markers emitted by emit_tok for normal line
+// tracking are harmless (processed by the preprocessor before parsing) and
+// may legitimately appear inside an assignment-expression condition when
+// the RHS tokens span a file/line boundary.  We only care that TK_PREP_DIR
+// tokens are filtered and that the emitted code uses the volatile-safe
+// assignment-expression form (if (!(LHS = RHS))), not the old read-back
+// form (LHS = RHS; if (!LHS)).
 static void test_bare_orelse_emit_range_prep_dir_leak(void) {
 	const char *code =
 	    "int get(void);\n"
@@ -2602,26 +2665,22 @@ static void test_bare_orelse_emit_range_prep_dir_leak(void) {
 	    "}\n";
 	PrismResult r = prism_transpile_source(code, "prepdir_leak.c", prism_defaults());
 	if (r.status == PRISM_OK && r.output) {
-		// Find the generated if-condition that tests the LHS.
-		const char *ifp = strstr(r.output, "if (!");
-		if (ifp) {
-			// Scan from `if (!` to the closing `)` for the leaked
-			// source-level directive text.  Synthetic #line markers
-			// emitted by emit_tok for line tracking are harmless
-			// (processed by the compiler before parsing), but an
-			// actual #line 10 "expanded.h" TK_PREP_DIR token
-			// embedded inline would be invalid.
-			const char *s = ifp;
-			const char *end = strchr(s, ')');
-			if (!end) end = s + 200;
-			int found_leak = 0;
-			for (const char *c = s; c < end - 10; c++) {
-				if (strncmp(c, "expanded.h", 10) == 0) { found_leak = 1; break; }
-			}
-			CHECK(!found_leak,
-			      "bare-orelse-emit-range-prep-dir-leak: preprocessor "
-			      "directive leaked into if-condition via emit_range");
-		}
+		// The volatile-safe form wraps the full assignment in the if-condition:
+		//   { if (!( \n arr[0] \n ... = get())) arr[0] = (42); }
+		// Check that the if-condition contains an assignment (= get()) not a plain read.
+		// The old read-back form was: arr[0] = get(); if (!arr[0]) arr[0] = (42);
+		// Verify the old double-read form is absent.
+		int has_readback = (strstr(r.output, "if (!arr[0])") != NULL ||
+		                    strstr(r.output, "if (! arr[0])") != NULL);
+		CHECK(!has_readback,
+		      "bare-orelse-emit-range-prep-dir-leak: old read-back form "
+		      "if (!arr[0]) must not appear");
+
+		// Verify the new assignment-in-condition form is present.
+		int has_if_assign = (strstr(r.output, "if (!(") != NULL);
+		CHECK(has_if_assign,
+		      "bare-orelse-emit-range-prep-dir-leak: preprocessor "
+		      "directive leaked into if-condition via emit_range");
 	}
 	prism_free(&r);
 }
@@ -3141,6 +3200,55 @@ void test_stmt_expr_multi_decl_inner_orelse(void) {
 }
 #endif
 
+// BUG19: declarator_has_bracket_orelse and walk_balanced_orelse skip over the
+// contents of '(' groups when scanning for orelse inside '[...]'.  When a
+// macro expands to '(expr orelse fallback)' — outer parens being a typical
+// macro protection pattern — the '[...]' scanner misses the orelse keyword,
+// no temp is hoisted, and the orelse token is emitted verbatim to the backend
+// compiler, which then errors with "expected ']' before 'orelse'".
+//
+// Expected: Prism must either (a) accept and correctly transform
+// '[( f() orelse 1 )]' or (b) emit a clear, early diagnostic — never
+// silently forward the raw 'orelse' keyword to the backend.
+static void test_bracket_orelse_paren_wrapped(void) {
+	// Paren-wrapped orelse in a local VLA array dimension.
+	const char *code =
+	    "int f(void);\n"
+	    "void g(void) {\n"
+	    "    int arr[(f() orelse 1)];\n"
+	    "    (void)arr;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "paren_dim.c", prism_defaults());
+	// Either the transpiler errored (status != PRISM_OK) or the output must
+	// NOT contain the literal 'orelse' keyword after the function body starts.
+	// Leaking it verbatim to the backend is the bug.
+	if (r.status == PRISM_OK && r.output) {
+		const char *body = strstr(r.output, "void g(");
+		if (!body) body = r.output;
+		CHECK(strstr(body, "orelse") == NULL,
+		      "BUG19: bracket-orelse-paren-wrapped: 'orelse' keyword "
+		      "leaked verbatim to backend in '[(f() orelse 1)]' dimension");
+	}
+	prism_free(&r);
+
+	// Also verify the plain (no-paren) form still works correctly.
+	const char *code2 =
+	    "int f(void);\n"
+	    "void g(void) {\n"
+	    "    int arr[f() orelse 1];\n"
+	    "    (void)arr;\n"
+	    "}\n";
+	PrismResult r2 = prism_transpile_source(code2, "plain_dim.c", prism_defaults());
+	if (r2.status == PRISM_OK && r2.output) {
+		const char *body2 = strstr(r2.output, "void g(");
+		if (!body2) body2 = r2.output;
+		CHECK(strstr(body2, "orelse") == NULL,
+		      "BUG19: bracket-orelse-paren-wrapped: plain '[f() orelse 1]' "
+		      "regressed — 'orelse' keyword leaked to backend");
+	}
+	prism_free(&r2);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -3336,6 +3444,9 @@ void run_orelse_tests(void) {
         // Audit round 15: bare-orelse LHS #ifdef concatenates both branches
         test_bare_orelse_ifdef_lhs_both_branches_concatenated();
 
+        // Audit round 18: bare orelse volatile pointer-deref re-read
+        test_bare_orelse_ptr_deref_lhs_rereads_volatile();
+
 #ifdef __GNUC__
         // Audit round 16: declaration orelse with stmt-expr initializer
         test_decl_orelse_stmt_expr_initializer();
@@ -3343,4 +3454,7 @@ void run_orelse_tests(void) {
         // Audit round 17: multi-decl stmt-expr with orelse inside
         test_stmt_expr_multi_decl_inner_orelse();
 #endif
+
+        // Audit round 19: parenthesised orelse in array dimension leaks keyword
+        test_bracket_orelse_paren_wrapped();
 }

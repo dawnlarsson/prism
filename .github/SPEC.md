@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3164 tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3251 tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -415,6 +415,8 @@ Defers execute in LIFO order at scope exit — whether via `return`, `break`, `c
 
 For `goto`: the handler looks up the target label's scope depth, then emits defers from the current scope level down to the target's level.
 
+`goto_scope_exits` counts brace-depth exits between a goto and its target label by scanning the token stream and counting only `{` / `}` tokens. Parentheses `(` `)` and brackets `[` `]` are intentionally excluded \u2014 they delimit expressions, not scopes. Counting them would miscalculate the scope-exit count for any goto whose token range happens to contain unmatched paren or bracket tokens (e.g. due to macro-expanded constructs). The call is guarded by `target_depth >= ctx->block_depth`, so it only fires when a same-depth or shallower label is the target.
+
 For `return`: emits all defers from the current scope to function scope. Uses `ret_counter` to generate unique labels for cleanup blocks.
 
 `emit_deferred_range` handles defer bodies, including bare orelse and raw stripping within deferred code. `emit_deferred_bare_orelse` handles the case where a bare orelse expression appears inside a defer body.
@@ -435,7 +437,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 **Scope exit triggers:** `}`, `return`, `break`, `continue`, `goto`.
 
-**Statement expression interaction:** Defers inside `({…})` fire at the inner scope boundary, not the outer.
+**Statement expression interaction:** Defers inside `({…})` fire at the inner scope boundary, not the outer.  `defer` at the direct top level of a statement expression is rejected; it must be wrapped in a nested block.  Additionally, if that nested block is the **last statement** of the statement expression, the defer emission would overwrite the expression's return value, so Prism rejects this pattern too — the defer block must not be the last statement (add a final expression after it).
 
 **Switch fallthrough:** Defers between cases are reset — they don't double-fire on fallthrough (verified by Phase 2A).
 
@@ -446,6 +448,8 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 - `return`, `goto` inside defer body — error
 - `break`, `continue` inside defer body — error (defer body is not a loop/switch context)
 - Computed goto (`goto *ptr`) with active defers — error
+- `defer` at the top level of a GNU statement expression — error (use a nested block)
+- A block containing `defer` as the **last statement** of a GNU statement expression — error. `handle_close_brace` emits defers after the last expression, overwriting the expression's return value (void defers → compile error; non-void defers → silent wrong-value assignment). Without an expression parser there is no safe transformation; the user must place the defer block before the final expression rather than as the last statement.
 
 **Feature flag:** `-fno-defer` disables.
 
@@ -461,14 +465,18 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 | Form | Example | Transformation |
 |---|---|---|
-| Control flow | `x = f() orelse return -1;` | `x = f(); if (!x) return -1;` (with defer cleanup) |
-| Block | `x = f() orelse { log(); return -1; }` | `x = f(); if (!x) { log(); return -1; }` |
-| Fallback value | `x = f() orelse "default"` | `x = f(); if (!x) x = "default";` |
-| Bare expression | `do_init() orelse return -1;` | `if (!(do_init())) return -1;` |
-| Bare assignment | `x = f() orelse return -1;` | `x = f(); if (!x) return -1;` |
+| Control flow | `x = f() orelse return -1;` | `{ if (!(x = f())) { return -1; } }` (with defer cleanup) |
+| Block | `x = f() orelse { log(); return -1; }` | `{ if (!(x = f())) { log(); return -1; } }` |
+| Fallback value | `x = f() orelse 0` | `{ if (!(x = f())) x = (0); }` |
+| Bare expression | `do_init() orelse return -1;` | `{ if (!(do_init())) { return -1; } }` |
 | Bracket (array dim) | `int buf[n orelse 1]` | Temp variable hoisted before declaration |
+| Paren-wrapped bracket | `int buf[(n orelse 1)]` | Outer parens stripped; same hoisting as plain bracket form |
 | Decl-init | `int x = f() orelse 0;` | Expanded with temp and null check |
 | Stmt-expr decl-init | `int x = ({...}) orelse 0;` | `int x = ({...}); x = x ? x : 0;` |
+
+**Paren-wrapped bracket orelse:** `int arr[(f() orelse 1)]` — the outer `(...)` is a common macro-protection pattern (e.g. `#define DIM (f() orelse 1)`). When the parentheses span the *entire* bracket content, Prism strips them and applies the standard hoisting transformation. Deeper wrapping or partial wrapping (e.g. `[(f() orelse 1) + 2]`) is caught as a hard error with a diagnostic suggesting removal of the outer parens.
+
+**Volatile safety:** All forms that include an assignment in the condition use the C assignment-expression value — `(LHS = expr)` yields `expr`'s value without re-reading `LHS`. This makes bare orelse safe for volatile pointer-dereference targets such as MMIO registers: `*uart_tx = get_byte() orelse 0xFF` emits `{ if (!(*uart_tx = get_byte())) *uart_tx = (0xFF); }` with no hidden re-read of the register. Compound-literal fallbacks use a `(LHS = RHS) ? (void)0 : (void)(LHS = (fb))` ternary (same safety property).
 
 **Side-effect protection:** Bracket orelse in VLA/typeof contexts rejects expressions with side effects (`++`, `--`, `=`, volatile reads, function calls) to prevent double evaluation. Function-call detection recognizes both `ident(` and `)(`  (parenthesized call) patterns.
 
@@ -525,7 +533,9 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 ### 6.7 Statement expressions
 
-GNU statement expressions `({…})` are supported. They get their own scope in the scope tree (`is_stmt_expr = true`). Defers, declarations, and zero-initialization work correctly inside them. `walk_balanced` detects `({` patterns (including when called directly on a stmt-expr `(`) and processes inner blocks with `try_zero_init_decl` + raw stripping + orelse transformation.
+GNU statement expressions `({…})` are supported. They get their own scope in the scope tree (`is_stmt_expr = true`). Declarations and zero-initialization work correctly inside them. `walk_balanced` detects `({` patterns (including when called directly on a stmt-expr `(`) and processes inner blocks with `try_zero_init_decl` + raw stripping + orelse transformation.
+
+**Defer constraint:** A block containing `defer` must not be the last statement of the statement expression (the defer emission would overwrite the expression's return value). Prism detects this at `}` close time: if the parent scope is `is_stmt_expr` and the next non-noise token after `}` is `}` (the stmt-expr close), it emits a hard error pointing to the `defer` keyword.  The user must place the defer block before the final expression: `int fd = ({ int r; { defer cleanup(); r = work(); } r; });` or restructure without a statement expression.
 
 **Multi-declarator stmt-expr:** `int x = ({ int tmp = f() orelse 0; tmp; }), y = 5;` — when the comma after a stmt-expr initializer forces `process_declarators`, `check_orelse_in_parens` skips stmt-expr boundaries (bails early for `({` patterns), and `walk_balanced` processes the inner content with full scope handling.
 

@@ -1,15 +1,13 @@
 ![Prism Banner](https://github.com/user-attachments/assets/051187c2-decd-497e-9beb-b74031eb84ed)
 
-![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-3133_passing-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
+![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-3251_passing-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
 
 ## Robust C by default
 **A dialect of C with `defer`, `orelse`, and automatic zero-initialization.**
 
 Prism is a lightweight and very fast transpiler that makes C safer without changing how you write it.
 
-→ [dawning.dev/prism](https://dawning.dev/prism)
-
-- **3133 tests** — edge cases, control flow, nightmares, trying hard to break Prism
+- **3251 tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Two-pass transpiler** — full semantic analysis before a single byte is emitted
 - **Opt-out features** — Disable parts of the transpiler, like zero-init, with CLI flags
@@ -451,9 +449,9 @@ Prism processes C in two passes. Pass 1 performs full semantic analysis and catc
 
 see `.github/SPEC.md` for full breakdown.
 
-## get in touch
+## Get in touch
 
-available for consulting work in compiler engineering, systems programming, and C codebase hardening.
+available for consulting work, (design, branding, engineering / software)
 
 → dawn@dawn.day · [dawning.dev](https://dawning.dev)
 

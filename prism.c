@@ -1424,12 +1424,18 @@ static bool is_raw_declaration_context(Token *after_raw) {
 
 // Count net scope exits (brace depths) between start and end.
 static int goto_scope_exits(Token *start, Token *end) {
+	// Count only brace-scope exits: '{' increments, '}' decrements.
+	// Parentheses '(' / ')' and brackets '[' / ']' are intentionally
+	// excluded — they are delimiters for expressions, not scopes.
+	// Counting them would cause spurious defer-flush when a goto or
+	// label sits inside a parenthesized expression at the same brace depth.
 	int depth = 0, min_depth = 0;
 	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
-		if (t->flags & TF_OPEN) {
-			if (tok_loc(end) > tok_loc(tok_match(t))) { t = tok_match(t); continue; }
+		if (match_ch(t, '{')) {
+			Token *m = tok_match(t);
+			if (m && tok_loc(end) > tok_loc(m)) { t = m; continue; }
 			depth++;
-		} else if (t->flags & TF_CLOSE) {
+		} else if (match_ch(t, '}')) {
 			if (--depth < min_depth) min_depth = depth;
 		}
 	}
@@ -2229,7 +2235,21 @@ static bool declarator_has_bracket_orelse(Token *start, Token *end) {
 		if (!close) continue;
 		Token *prev = t;
 		for (Token *s = tok_next(t); s && s != close; s = tok_next(s)) {
-			if (s->flags & TF_OPEN) { prev = tok_match(s); s = tok_match(s); continue; }
+			if (s->flags & TF_OPEN) {
+				// Also check inside a single '(' group for paren-wrapped orelse.
+				// Handles macro-expanded dimensions: #define DIM (f() orelse 1).
+				// Only when the '(' covers the entire bracket content.
+				if (match_ch(s, '(')) {
+					Token *pp = tok_match(s);
+					if (pp && tok_next(pp) == close) {
+						for (Token *p = tok_next(s); p && p != pp; p = tok_next(p)) {
+							if (p->flags & TF_OPEN) { p = tok_match(p) ? tok_match(p) : p; continue; }
+							if ((p->tag & TT_ORELSE) && !typedef_lookup(p)) return true;
+						}
+					}
+				}
+				prev = tok_match(s); s = tok_match(s); continue;
+			}
 			if ((s->tag & TT_ORELSE) && !typedef_lookup(s) &&
 			    !(prev && (prev->tag & TT_MEMBER)))
 				return true;
@@ -2250,8 +2270,10 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 	ctx->bracket_dim_count = 0;
 	ctx->bracket_dim_next = 0;
 
-	// Phase 1: collect all brackets and identify which have orelse
-	typedef struct { Token *open; Token *close; Token *orelse; } BracketInfo;
+	// Phase 1: collect all brackets and identify which have orelse.
+	// paren_open: non-NULL when orelse is inside a single '(' group that covers
+	// the entire bracket content — e.g. [(f() orelse 1)] from macro expansion.
+	typedef struct { Token *open; Token *close; Token *orelse; Token *paren_open; } BracketInfo;
 	BracketInfo brackets[32];
 	int bracket_count = 0;
 	bool any_orelse = false;
@@ -2263,9 +2285,26 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 		if (!close) continue;
 		if (bracket_count >= 32) break;
 		Token *orelse_found = NULL;
+		Token *paren_open_found = NULL;
 		Token *prev = t;
 		for (Token *s = tok_next(t); s && s != close; s = tok_next(s)) {
-			if (s->flags & TF_OPEN) { prev = tok_match(s); s = tok_match(s); continue; }
+			if (s->flags & TF_OPEN) {
+				// Check inside '(' for paren-wrapped orelse (macro expansion pattern).
+				// Only applies when the '(' covers the entire bracket content.
+				if (match_ch(s, '(')) {
+					Token *pp = tok_match(s);
+					if (pp && tok_next(pp) == close) {
+						for (Token *p = tok_next(s); p && p != pp; p = tok_next(p)) {
+							if (p->flags & TF_OPEN) { p = tok_match(p) ? tok_match(p) : p; continue; }
+							if ((p->tag & TT_ORELSE) && !typedef_lookup(p)) {
+								orelse_found = p; paren_open_found = s; break;
+							}
+						}
+					}
+				}
+				if (orelse_found) break;
+				prev = tok_match(s); s = tok_match(s); continue;
+			}
 			if ((s->tag & TT_ORELSE) && !typedef_lookup(s) &&
 			    !(prev && (prev->tag & TT_MEMBER))) {
 				orelse_found = s;
@@ -2273,7 +2312,7 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 			}
 			prev = s;
 		}
-		brackets[bracket_count++] = (BracketInfo){t, close, orelse_found};
+		brackets[bracket_count++] = (BracketInfo){t, close, orelse_found, paren_open_found};
 		if (orelse_found) any_orelse = true;
 		t = close;
 	}
@@ -2293,7 +2332,11 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 			OUT_LIT(" long long _Prism_oe_");
 			out_uint(oe);
 			OUT_LIT(" = (");
-			emit_token_range(tok_next(brackets[i].open), brackets[i].orelse);
+			// For paren-wrapped orelse, emit LHS from inside the '(' (skip the outer paren).
+			emit_token_range(
+				brackets[i].paren_open ? tok_next(brackets[i].paren_open)
+				                       : tok_next(brackets[i].open),
+				brackets[i].orelse);
 			OUT_LIT(");");
 		} else {
 			// Non-orelse bracket in a declarator with orelse brackets:
@@ -2323,11 +2366,28 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 static Token *walk_balanced_orelse(Token *tok) {
 	Token *end = tok_match(tok);
 	if (!end) { emit_tok(tok); return tok_next(tok); }
-	// Scan for orelse inside at depth 0 relative to the outer delimiters
+	// Scan for orelse inside at depth 0 relative to the outer delimiters.
+	// For '[' groups, also check one level inside a '(' that spans the entire
+	// bracket content (handles macro-expanded dimensions: [(f() orelse 1)]).
 	Token *orelse_found = NULL;
+	Token *paren_open = NULL;
 	Token *prev = tok;
 	for (Token *t = tok_next(tok); t && t != end; t = tok_next(t)) {
-		if (t->flags & TF_OPEN) { prev = tok_match(t); t = tok_match(t); continue; }
+		if (t->flags & TF_OPEN) {
+			if (match_ch(tok, '[') && match_ch(t, '(')) {
+				Token *pp = tok_match(t);
+				if (pp && tok_next(pp) == end) {
+					for (Token *p = tok_next(t); p && p != pp; p = tok_next(p)) {
+						if (p->flags & TF_OPEN) { p = tok_match(p) ? tok_match(p) : p; continue; }
+						if ((p->tag & TT_ORELSE) && !typedef_lookup(p)) {
+							orelse_found = p; paren_open = t; break;
+						}
+					}
+				}
+			}
+			if (orelse_found) break;
+			prev = tok_match(t); t = tok_match(t); continue;
+		}
 		if ((t->tag & TT_ORELSE) && !typedef_lookup(t) &&
 		    !(prev && (prev->tag & TT_MEMBER))) {
 			orelse_found = t;
@@ -2361,6 +2421,13 @@ static Token *walk_balanced_orelse(Token *tok) {
 				t = walk_balanced_orelse(t);
 				continue;
 			}
+			// Defense-in-depth: if an 'orelse' token reaches here it was not caught by
+			// the depth-0 scan above — likely wrapped in parens deeper than one level.
+			// Emit a clear diagnostic instead of forwarding the keyword to the backend.
+			if ((t->tag & TT_ORELSE) && !typedef_lookup(t))
+				error_tok(t, "'orelse' inside array dimension could not be transformed; "
+					   "if wrapped in outer parentheses, remove them: "
+					   "use '[f() orelse 1]' not '[(f() orelse 1)]'");
 			emit_tok(t); t = tok_next(t);
 		}
 		return tok_next(end);
@@ -2374,8 +2441,11 @@ static Token *walk_balanced_orelse(Token *tok) {
 		error_tok(orelse_found, "'orelse' block form cannot be used inside "
 			  "array dimensions or typeof expressions");
 	// Emit: OPEN (LHS) ? (LHS) : (RHS) CLOSE
-	Token *lhs_start = tok_next(tok);    // first token after [ or (
-	Token *rhs_start = tok_next(orelse_found); // first token after orelse
+	// For paren-wrapped orelse (e.g. [(f() orelse 1)]), strip the outer parens:
+	// LHS comes from inside the '(', RHS ends before its closing ')'.
+	Token *lhs_start = paren_open ? tok_next(paren_open) : tok_next(tok);
+	Token *rhs_start = tok_next(orelse_found);
+	Token *rhs_end   = paren_open ? tok_match(paren_open) : end;
 	bool is_bracket = match_ch(tok, '[');
 	emit_tok(tok); // emit [ or (
 	if (is_bracket && ctx->bracket_oe_next < ctx->bracket_oe_count) {
@@ -2386,7 +2456,7 @@ static Token *walk_balanced_orelse(Token *tok) {
 		OUT_LIT(" ? _Prism_oe_");
 		out_uint(oe);
 		OUT_LIT(" : (");
-		emit_token_range_orelse(rhs_start, end);
+		emit_token_range_orelse(rhs_start, rhs_end);
 		OUT_LIT(")");
 	} else {
 		reject_orelse_side_effects(lhs_start, orelse_found,
@@ -2400,7 +2470,7 @@ static Token *walk_balanced_orelse(Token *tok) {
 		OUT_LIT(") ? (");
 		emit_token_range(lhs_start, orelse_found);
 		OUT_LIT(") : (");
-		emit_token_range_orelse(rhs_start, end);
+		emit_token_range_orelse(rhs_start, rhs_end);
 		OUT_LIT(")");
 	}
 	emit_tok(end); // emit ] or )
@@ -3846,6 +3916,28 @@ static Token *handle_close_brace(Token *tok) {
 	if (FEAT(F_DEFER) && ctx->scope_depth > 0) {
 		ScopeNode *s = &scope_stack[ctx->scope_depth - 1];
 		if (defer_count > s->defer_start_idx) {
+			// Detect: this block is the last statement of an enclosing
+			// GNU statement expression.  Emitting defers here places the
+			// defer call AFTER the last C expression in LIFO order,
+			// overwriting the statement expression's return value with
+			// the defer's result type (void for free/cleanup → compile
+			// error; int for counter++ → silent wrong-value assignment).
+			// Without an expression parser we cannot safely capture the
+			// last expression into a temp, so reject unconditionally.
+			// Detection: parent scope is is_stmt_expr AND the next
+			// non-noise token after this '}' is '}' (stmt_expr close).
+			if (ctx->scope_depth >= 2 &&
+			    scope_stack[ctx->scope_depth - 2].is_stmt_expr) {
+				Token *nxt = skip_noise(tok_next(tok));
+				if (nxt && match_ch(nxt, '}'))
+					error_tok(defer_stack[s->defer_start_idx].defer_kw,
+						  "defer inside a block that is the last "
+						  "statement of a statement expression "
+						  "would corrupt the expression's return "
+						  "value; ensure the last statement of the "
+						  "statement expression is outside the "
+						  "defer block");
+			}
 			emit_defers(DEFER_SCOPE);
 			defer_count = s->defer_start_idx;
 		}
@@ -4657,37 +4749,59 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 			}
 			OUT_LIT("));");
 		} else {
-			// If-based: { LHS = RHS; if (!LHS) LHS = (fb); }
+			// If-based (volatile-safe): assignment-result check avoids re-reading LHS.
+			// Single:    { if (!(LHS = RHS)) LHS = (fb); }
+			// Chain N=2: { if (!(LHS = RHS)) if (!(LHS = (fb1))) LHS = (fb2); }
+			// The C assignment expression `LHS = x` yields x's value without a
+			// re-read of LHS, making this safe for volatile pointer-dereference
+			// targets such as MMIO registers (*uart_tx = get_byte() orelse 0xFF).
+			// Intermediate chain links are each wrapped in an additional if-condition
+			// so that only the first truthy result is used (the if nesting avoids
+			// evaluating subsequent links when an earlier one succeeds).
 			OUT_LIT("{");
-			out_char(' ');
+			OUT_LIT(" if (!(");
 			for (Token *s = bare_lhs_start; s != orelse_tok; s = tok_next(s)) {
 				if (s->kind == TK_PREP_DIR) continue;
 				emit_tok(s);
 			}
-			out_char(';');
-			OUT_LIT(" if (!");
-			emit_range_no_prep(bare_lhs_start, bare_assign_eq);
-			OUT_LIT(")");
-			emit_range_no_prep(bare_lhs_start, bare_assign_eq);
-			OUT_LIT(" = (");
+			OUT_LIT("))");
 			t = after_orelse;
 			int fd = 0;
-			while (t->kind != TK_EOF) {
-				if (t->flags & TF_OPEN) fd++;
-				else if (t->flags & TF_CLOSE) fd--;
-				else if (fd == 0 && BARE_IS_END(t)) break;
-				if (fd == 0 && is_orelse_keyword(t)) {
-					OUT_LIT("); if (!");
-					emit_range_no_prep(bare_lhs_start, bare_assign_eq);
-					OUT_LIT(")");
+			while (true) {
+				bool is_last = !orelse_has_chain(t, comma_term);
+				if (is_last) {
+					// Final (or only) fallback: unconditional assignment.
 					emit_range_no_prep(bare_lhs_start, bare_assign_eq);
 					OUT_LIT(" = (");
-					t = tok_next(t);
-					continue;
+					fd = 0;
+					while (t->kind != TK_EOF) {
+						if (t->flags & TF_OPEN) fd++;
+						else if (t->flags & TF_CLOSE) fd--;
+						else if (fd == 0 && BARE_IS_END(t)) break;
+						emit_tok(t); t = tok_next(t);
+					}
+					OUT_LIT("); }");
+					break;
 				}
-				emit_tok(t); t = tok_next(t);
+				// Intermediate: nest the fallback as the condition of another if,
+				// so the next link executes only when this one yields a falsy value.
+				// Emits: if (!(LHS = (fb_i))) — 3 closing ')' at end.
+				OUT_LIT(" if (!(");
+				emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+				OUT_LIT(" = (");
+				fd = 0;
+				while (t->kind != TK_EOF) {
+					if (t->flags & TF_OPEN) fd++;
+					else if (t->flags & TF_CLOSE) fd--;
+					else if (fd == 0 && BARE_IS_END(t)) break;
+					if (fd == 0 && is_orelse_keyword(t)) {
+						t = tok_next(t);
+						break;
+					}
+					emit_tok(t); t = tok_next(t);
+				}
+				OUT_LIT(")))"); // close (fb_i), !(...), and if(
 			}
-			OUT_LIT("); }");
 		}
 		if (match_ch(t, ';') || (comma_term && match_ch(t, ','))) t = tok_next(t);
 	#undef BARE_IS_END
@@ -5170,7 +5284,24 @@ static void p1_full_depth_prescan(Token *tok) {
 		if (FEAT(F_ORELSE) && match_ch(tok, '[') && tok_match(tok)) {
 			Token *close = tok_match(tok);
 			for (Token *s = tok_next(tok); s && s != close && s->kind != TK_EOF; s = tok_next(s)) {
-				if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; continue; }
+				if (s->flags & TF_OPEN) {
+					// Also annotate orelse inside a single '(' covering the whole bracket.
+					if (match_ch(s, '(')) {
+						Token *pp = tok_match(s);
+						if (pp && tok_next(pp) == close) {
+							for (Token *p = tok_next(s); pp && p && p != pp; p = tok_next(p)) {
+								if (p->flags & TF_OPEN) { p = tok_match(p) ? tok_match(p) : p; continue; }
+								if ((p->tag & TT_ORELSE) && !typedef_lookup(p)) {
+									if (p1d_cur_func < 0)
+										error_tok(p, "orelse inside array dimension at file scope is not allowed "
+											       "(cannot hoist temporary variable outside a function body)");
+									tok_ann(p) |= P1_OE_BRACKET;
+								}
+							}
+						}
+					}
+					s = tok_match(s) ? tok_match(s) : s; continue;
+				}
 				if ((s->tag & TT_ORELSE) && !typedef_lookup(s)) {
 					if (p1d_cur_func < 0)
 						error_tok(s, "orelse inside array dimension at file scope is not allowed "

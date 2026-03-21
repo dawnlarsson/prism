@@ -1536,6 +1536,37 @@ void test_defer_stmt_expr_top_level_rejected(void) {
 	    "statement expression");
 }
 
+static void test_defer_stmt_expr_nested_block_last_stmt_corrupts(void) {
+	/* BUG (audit round 16): a nested block containing defer is the LAST
+	 * statement of a GNU statement expression.  handle_close_brace emits
+	 * defers in LIFO order after the last C expression, placing the defer
+	 * call after the intended return value.  For void defers (free/cleanup)
+	 * this produces "void value not ignored" compile errors.  For non-void
+	 * defers (counter++, x--) it silently assigns the wrong value:
+	 *
+	 *   int f(void) { return ({ { defer cleanup(); work(); } }); }
+	 *   → emits: return ({ { work(); cleanup(); } });
+	 *   → f() returns void (cleanup result), NOT work() result.
+	 *
+	 * Since recovering the last expression requires a full expression parser
+	 * (which Prism intentionally omits), Prism must reject this pattern.
+	 */
+	check_defer_transpile_rejects(
+	    "void cleanup(void);\n"
+	    "int work(void);\n"
+	    "int f(void) {\n"
+	    "    return ({\n"
+	    "        {\n"
+	    "            defer cleanup();\n"
+	    "            work();\n"
+	    "        }\n"
+	    "    });\n"
+	    "}\n",
+	    "defer_stmt_expr_nested_last.c",
+	    "defer in nested block that is last stmt of stmt_expr corrupts value",
+	    "statement expression");
+}
+
 void test_defer_stmt_expr_return_bypass(void) {
 	// A return inside a GNU statement expression inside a defer body should
 	// be rejected — it bypasses remaining defers just like a bare return.
@@ -2534,6 +2565,7 @@ void run_defer_tests(void) {
 	test_defer_braceless_control_rejected();
 #ifdef __GNUC__
 	test_defer_stmt_expr_top_level_rejected();
+	test_defer_stmt_expr_nested_block_last_stmt_corrupts();
 	test_defer_stmt_expr_return_bypass();
 	test_defer_stmt_expr_goto_bypass();
 	test_defer_computed_goto_rejected();
