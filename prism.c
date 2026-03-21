@@ -2120,8 +2120,10 @@ static Token *walk_balanced(Token *tok, bool emit) {
 	if (!end) return tok_next(tok);
 	if (emit) {
 		for (Token *t = tok; t != tok_next(end) && t->kind != TK_EOF;) {
-			// Statement expression ({...}): recurse with processing
-			if ((t->flags & TF_OPEN) && t != tok && match_ch(t, '(') &&
+			// Statement expression ({...}): recurse with processing.
+			// Detects both nested stmt-exprs (t != tok) and the case
+			// where walk_balanced is called directly on a stmt-expr '('.
+			if ((t->flags & TF_OPEN) && match_ch(t, '(') &&
 			    tok_next(t) && match_ch(tok_next(t), '{')) {
 				emit_tok(t); // '('
 				Token *se_end = tok_match(t);
@@ -2739,12 +2741,24 @@ static Token *handle_const_orelse_fallback(Token *tok,
 
 static void check_orelse_in_parens(Token *open) {
 	Token *close = tok_match(open);
+	// Statement expressions ({ ... }): orelse inside is at its own
+	// declaration scope, not at the paren top level — skip entirely.
+	if (match_ch(open, '(') && tok_next(open) && match_ch(tok_next(open), '{') && close)
+		return;
 	for (Token *pi = open, *t = tok_next(open); t != close; pi = t, t = tok_next(t)) {
 		// Skip typeof/typeof_unqual contents — orelse inside typeof is
 		// handled separately by the typeof orelse path in walk_balanced.
 		if ((t->tag & TT_TYPEOF) && tok_next(t) && match_ch(tok_next(t), '(') &&
 		    tok_match(tok_next(t))) {
 			t = tok_match(tok_next(t)); // skip past typeof(...)
+			continue;
+		}
+		// Skip statement expression boundaries ({ ... }) — orelse inside
+		// a stmt-expr is at its own declaration scope, not at the paren
+		// top level.  Jump to the matching ')' of the '(' that opens it.
+		if (match_ch(t, '(') && tok_next(t) && match_ch(tok_next(t), '{') &&
+		    tok_match(t)) {
+			t = tok_match(t);
 			continue;
 		}
 		if ((t->tag & TT_ORELSE) && !typedef_lookup(t) && !(pi->tag & TT_MEMBER))
@@ -6654,9 +6668,11 @@ PRISM_API void prism_thread_cleanup(void) {
 
 	tokenizer_teardown(true);
 
-	// Free heap-allocated typedef hashmap buckets
+	// Free heap-allocated hashmap buckets
 	free(typedef_table.name_map.buckets);
 	memset(&typedef_table, 0, sizeof(typedef_table));
+	free(p1_shadow_map.buckets);
+	memset(&p1_shadow_map, 0, sizeof(p1_shadow_map));
 
 	// Reset all TLS statics so a subsequent prism_ctx_init() starts clean
 	system_include_list = NULL;

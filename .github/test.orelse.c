@@ -3113,6 +3113,32 @@ void test_decl_orelse_stmt_expr_initializer(void) {
 	}
 	prism_free(&r);
 }
+
+void test_stmt_expr_multi_decl_inner_orelse(void) {
+	/* int x = ({ int tmp = f() orelse 0; tmp; }), y = 5;
+	   The comma after the stmt-expr forces process_declarators, which calls
+	   check_orelse_in_parens on the outer '('.  The inner orelse is valid
+	   (top-level of the inner declaration) and must NOT be rejected. */
+	PrismResult r = prism_transpile_source(
+	    "int f(void);\n"
+	    "void test(void) {\n"
+	    "    int x = ({\n"
+	    "        int temp = f() orelse 0;\n"
+	    "        temp;\n"
+	    "    }), y = 5;\n"
+	    "    (void)x; (void)y;\n"
+	    "}\n",
+	    "stmtexpr_multi_inner_orelse.c", prism_defaults());
+	CHECK(r.status == PRISM_OK && r.output,
+	      "stmt-expr-multi-decl-inner-orelse: transpiles OK");
+	if (r.output) {
+		CHECK(!strstr(r.output, "cannot be used inside parentheses"),
+		      "stmt-expr-multi-decl-inner-orelse: no false orelse-in-parens error");
+		CHECK(strstr(r.output, "int x") && strstr(r.output, "y"),
+		      "stmt-expr-multi-decl-inner-orelse: both declarations present");
+	}
+	prism_free(&r);
+}
 #endif
 
 void run_orelse_tests(void) {
@@ -3313,5 +3339,8 @@ void run_orelse_tests(void) {
 #ifdef __GNUC__
         // Audit round 16: declaration orelse with stmt-expr initializer
         test_decl_orelse_stmt_expr_initializer();
+
+        // Audit round 17: multi-decl stmt-expr with orelse inside
+        test_stmt_expr_multi_decl_inner_orelse();
 #endif
 }

@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3152 tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3164 tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -525,7 +525,9 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 ### 6.7 Statement expressions
 
-GNU statement expressions `({…})` are supported. They get their own scope in the scope tree (`is_stmt_expr = true`). Defers, declarations, and zero-initialization work correctly inside them. `walk_balanced` detects `({` patterns inside balanced groups and processes inner blocks with `try_zero_init_decl` + raw stripping.
+GNU statement expressions `({…})` are supported. They get their own scope in the scope tree (`is_stmt_expr = true`). Defers, declarations, and zero-initialization work correctly inside them. `walk_balanced` detects `({` patterns (including when called directly on a stmt-expr `(`) and processes inner blocks with `try_zero_init_decl` + raw stripping + orelse transformation.
+
+**Multi-declarator stmt-expr:** `int x = ({ int tmp = f() orelse 0; tmp; }), y = 5;` — when the comma after a stmt-expr initializer forces `process_declarators`, `check_orelse_in_parens` skips stmt-expr boundaries (bails early for `({` patterns), and `walk_balanced` processes the inner content with full scope handling.
 
 ---
 
@@ -613,8 +615,18 @@ Compile with `-DPRISM_LIB_MODE` to produce a library (excludes CLI `main()`).
 ```c
 PrismFeatures prism_defaults(void);
 PrismResult   prism_transpile_file(const char *path, PrismFeatures features);
+PrismResult   prism_transpile_source(const char *source, const char *filename,
+                                      PrismFeatures features);
 void          prism_free(PrismResult *r);
+void          prism_reset(void);
+void          prism_thread_cleanup(void);
 ```
+
+`prism_transpile_source` transpiles already-preprocessed source text without invoking `cc -E`. Useful for IDE integrations that preprocess separately.
+
+`prism_reset` reclaims all arena-allocated structures. Called automatically on error recovery.
+
+`prism_thread_cleanup` frees thread-local hash table buckets. Must be called before a thread exits to avoid leaks in long-lived host processes.
 
 `PrismFeatures` struct fields: `compiler`, `include_paths`, `defines`, `compiler_flags`, `force_includes` (with respective counts), plus boolean feature flags (`defer`, `zeroinit`, `line_directives`, `warn_safety`, `flatten_headers`, `orelse`).
 

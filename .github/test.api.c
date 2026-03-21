@@ -375,6 +375,41 @@ static void test_thread_cleanup_idempotent(void) {
 	prism_reset();
 }
 
+// Bug: prism_thread_cleanup freed typedef_table.name_map.buckets but not
+// p1_shadow_map.buckets, leaking the shadow hashmap allocation.
+static void test_thread_cleanup_shadow_map_leak(void) {
+	printf("\n--- Thread Cleanup Shadow Map Leak ---\n");
+
+	PrismFeatures features = prism_defaults();
+	// Source with shadowed variables to populate p1_shadow_map
+	const char *src =
+	    "int f(void) {\n"
+	    "    int x = 1;\n"
+	    "    {\n"
+	    "        int x = 2;\n"  // shadows outer x
+	    "        {\n"
+	    "            int x = 3;\n"  // shadows again
+	    "        }\n"
+	    "    }\n"
+	    "    return x;\n"
+	    "}\n";
+
+	// Transpile to populate shadow map, then full cleanup + reinit cycle
+	for (int i = 0; i < 3; i++) {
+		PrismResult r = prism_transpile_source(src, "shadow_leak.c", features);
+		CHECK_EQ(r.status, PRISM_OK, "shadow-map-leak: transpile OK");
+		prism_free(&r);
+		prism_thread_cleanup();
+		prism_ctx_init();
+	}
+
+	// Final transpile to verify clean state
+	PrismResult r = prism_transpile_source(src, "shadow_leak_final.c", features);
+	CHECK_EQ(r.status, PRISM_OK, "shadow-map-leak: final transpile after cycles OK");
+	prism_free(&r);
+	prism_reset();
+}
+
 #ifndef _WIN32
 // Worker data for concurrent transpilation tests.
 typedef struct {
@@ -5529,6 +5564,7 @@ test_typeof_orelse_leak();
 #ifndef _WIN32
 	test_thread_cleanup_reinit_cycle();
 	test_thread_cleanup_idempotent();
+	test_thread_cleanup_shadow_map_leak();
 	test_concurrent_transpile_isolation();
 	test_concurrent_feature_isolation();
 	test_thread_cleanup_then_reuse_stress();

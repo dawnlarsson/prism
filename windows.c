@@ -498,6 +498,11 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 	HANDLE hStdOut = GetStdHandle(STD_OUTPUT_HANDLE);
 	HANDLE hStdErr = GetStdHandle(STD_ERROR_HANDLE);
 	HANDLE hNul = INVALID_HANDLE_VALUE;
+	// Track which handles were explicitly redirected by file actions.
+	// Only redirected handles need SetHandleInformation — touching
+	// process-global standard handles is a thread-safety hazard in
+	// PRISM_LIB_MODE (concurrent prism_transpile_file calls).
+	bool redirected_in = false, redirected_out = false, redirected_err = false;
 
 	if (fa) {
 		si.dwFlags |= STARTF_USESTDHANDLES;
@@ -506,11 +511,11 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 			if (a->kind == SPAWN_ACT_DUP2) {
 				// Convert C fd to Win32 HANDLE
 				HANDLE h = (HANDLE)_get_osfhandle(a->src_fd);
-				if (a->fd == STDOUT_FILENO) hStdOut = h;
+				if (a->fd == STDOUT_FILENO) { hStdOut = h; redirected_out = true; }
 				else if (a->fd == STDIN_FILENO)
-					hStdIn = h;
+					{ hStdIn = h; redirected_in = true; }
 				else if (a->fd == STDERR_FILENO)
-					hStdErr = h;
+					{ hStdErr = h; redirected_err = true; }
 			} else if (a->kind == SPAWN_ACT_OPEN) {
 				// Only case used: open /dev/null on stderr
 				// Map /dev/null → NUL
@@ -526,9 +531,9 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 						   0,
 						   NULL);
 				if (hNul == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
-				if (a->fd == STDERR_FILENO) hStdErr = hNul;
+				if (a->fd == STDERR_FILENO) { hStdErr = hNul; redirected_err = true; }
 				else if (a->fd == STDOUT_FILENO)
-					hStdOut = hNul;
+					{ hStdOut = hNul; redirected_out = true; }
 			}
 			// SPAWN_ACT_CLOSE: handled by the caller manually, not by this function
 		}
@@ -537,18 +542,20 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 		si.hStdError = hStdErr;
 	}
 
-	// Make pipe handles inheritable, saving original flags for cleanup
+	// Make redirected handles inheritable, saving original flags for cleanup.
+	// Only touch handles explicitly set by file actions — process-global
+	// standard handles must not be modified (thread-safety).
 	DWORD orig_in_flags = 0, orig_out_flags = 0, orig_err_flags = 0;
 	if (si.dwFlags & STARTF_USESTDHANDLES) {
-		if (hStdIn != INVALID_HANDLE_VALUE) {
+		if (redirected_in && hStdIn != INVALID_HANDLE_VALUE) {
 			GetHandleInformation(hStdIn, &orig_in_flags);
 			SetHandleInformation(hStdIn, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
 		}
-		if (hStdOut != INVALID_HANDLE_VALUE) {
+		if (redirected_out && hStdOut != INVALID_HANDLE_VALUE) {
 			GetHandleInformation(hStdOut, &orig_out_flags);
 			SetHandleInformation(hStdOut, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
 		}
-		if (hStdErr != INVALID_HANDLE_VALUE) {
+		if (redirected_err && hStdErr != INVALID_HANDLE_VALUE) {
 			GetHandleInformation(hStdErr, &orig_err_flags);
 			SetHandleInformation(hStdErr, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
 		}
@@ -569,15 +576,15 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 	}
 
 cleanup:
-	// Restore original handle inheritance flags
+	// Restore original handle inheritance flags (only for redirected handles)
 	if (si.dwFlags & STARTF_USESTDHANDLES) {
-		if (hStdIn != INVALID_HANDLE_VALUE)
+		if (redirected_in && hStdIn != INVALID_HANDLE_VALUE)
 			SetHandleInformation(
 			    hStdIn, HANDLE_FLAG_INHERIT, orig_in_flags & HANDLE_FLAG_INHERIT);
-		if (hStdOut != INVALID_HANDLE_VALUE)
+		if (redirected_out && hStdOut != INVALID_HANDLE_VALUE)
 			SetHandleInformation(
 			    hStdOut, HANDLE_FLAG_INHERIT, orig_out_flags & HANDLE_FLAG_INHERIT);
-		if (hStdErr != INVALID_HANDLE_VALUE)
+		if (redirected_err && hStdErr != INVALID_HANDLE_VALUE)
 			SetHandleInformation(
 			    hStdErr, HANDLE_FLAG_INHERIT, orig_err_flags & HANDLE_FLAG_INHERIT);
 	}
