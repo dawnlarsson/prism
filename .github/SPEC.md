@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3133 tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3152 tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -47,9 +47,11 @@ Identifiers and keywords are tagged with `TT_*` bitmask flags during tokenizatio
 
 `TT_TYPE`, `TT_QUALIFIER`, `TT_SUE` (struct/union/enum), `TT_SKIP_DECL`, `TT_ATTR`, `TT_ASSIGN`, `TT_MEMBER`, `TT_LOOP`, `TT_STORAGE`, `TT_ASM`, `TT_INLINE`, `TT_NORETURN_FN`, `TT_SPECIAL_FN`, `TT_CONST`, `TT_RETURN`, `TT_BREAK`, `TT_CONTINUE`, `TT_GOTO`, `TT_CASE`, `TT_DEFAULT`, `TT_DEFER`, `TT_GENERIC`, `TT_SWITCH`, `TT_IF`, `TT_TYPEDEF`, `TT_VOLATILE`, `TT_REGISTER`, `TT_TYPEOF`, `TT_BITINT`, `TT_ALIGNAS`, `TT_ORELSE`, `TT_STRUCTURAL`.
 
+GNU extension `__auto_type` is tagged `TT_TYPE | TT_TYPEOF` so that declaration detection and goto-over-decl checking treat it identically to `typeof`/`__typeof__`.
+
 ### Taint graph
 
-The tokenizer builds per-function taint flags (`has_setjmp`, `has_vfork`, `has_asm`) stored on the opening `{` token's tag bits. These are later transferred to `FuncMeta`.
+The tokenizer builds per-function taint flags (`has_setjmp`, `has_vfork`, `has_asm`) stored on the opening `{` token's tag bits (`TT_SPECIAL_FN`, `TT_NORETURN_FN`, `TT_ASM`). These remain on the token and are read directly via `func_meta[idx].body_open->tag` — they are **not** transferred to `FuncMeta` fields.
 
 ---
 
@@ -91,6 +93,8 @@ ScopeInfo {
     is_func_body   : bool :1     — depth-1 '{' of a function definition
     is_stmt_expr   : bool :1     — GNU statement expression ({...})
     is_conditional : bool :1
+    is_init        : bool :1     — initializer brace: = { ... } (not a compound statement)
+    is_enum        : bool :1     — set when is_struct=true and the keyword is 'enum'
 }
 ```
 
@@ -106,13 +110,14 @@ FuncMeta {
     ret_type_suffix_start  : Token*
     ret_type_suffix_end    : Token*
     returns_void           : bool
-    has_setjmp             : bool
-    has_vfork              : bool
-    has_asm                : bool
-    entry_start            : int     — start index into p1_entries[]
-    entry_count            : int     — count of P1FuncEntry items
+    has_computed_goto      : bool     — function contains computed goto (*ptr)
+    entry_start            : int      — start index into p1_entries[]
+    entry_count            : int      — count of P1FuncEntry items
+    defer_name_bloom       : uint64_t — FNV-1a bloom filter of identifiers in defer bodies
 }
 ```
+
+**Taint flags:** `has_setjmp`/`has_vfork`/`has_asm` are NOT stored in `FuncMeta`. They are tag bits (`TT_SPECIAL_FN`, `TT_NORETURN_FN`, `TT_ASM`) on the function body's opening `{` token, set by the tokenizer during taint-graph construction. Checked at defer-allocation time via `func_meta[idx].body_open->tag`.
 
 Lookup during Pass 2: linear scan by `body_open` pointer (typically < 100 functions per TU).
 
@@ -184,6 +189,8 @@ Walks all tokens. On every `{`, assigns a new `scope_id`, records `parent_id` fr
 | Named struct with attributes: `struct __attribute__((packed)) Name {` | `is_struct` (look-behind skips balanced parens and `TT_ATTR` tokens) |
 | File-scope `{` preceded by `)` (function def) | `is_func_body` |
 | File-scope `{` preceded by `]` (array-returning function, e.g., `int (*fn(void))[5] {`) or `;` (K&R function def) | `is_func_body` |
+| `= {` (initializer brace) | `is_init` (also inherits `is_init` from parent scope for nested initializers) |
+| `enum` keyword (or tag name preceded by enum `TT_SUE`) `{` | `is_struct` + `is_enum` |
 
 **C23 attribute backward walk:** When walking backward to find `prev`, the loop skips `]]` C23 attributes by checking `tok_match(])->flags & TF_C23_ATTR` (the `TF_C23_ATTR` flag is set on the opening `[`, not the closing `]`). This ensures `void f(void) [[gnu::cold]] {` correctly finds `)` as `prev` and classifies it as `is_func_body`.
 
@@ -283,7 +290,8 @@ At each file-scope function body `{`, captures the return type token range and f
 - `ret_type_start` / `ret_type_end` — token range for the return type
 - `ret_type_suffix_start` / `ret_type_suffix_end` — for complex declarators (function pointers, arrays)
 - `returns_void` — whether the function returns `void`
-- `has_setjmp`, `has_vfork`, `has_asm` — transferred from the taint flags on the `{` token's tag
+
+Taint flags (`TT_SPECIAL_FN`, `TT_NORETURN_FN`, `TT_ASM`) remain on the `body_open` token's tag and are read directly — they are not copied into FuncMeta fields.
 
 Pass 2 reads `FuncMeta` at function body entry.
 
@@ -313,11 +321,11 @@ Rejected patterns inside defer bodies:
 
 Walks all tokens looking for `[…]` pairs containing `orelse`. Marks them with `P1_OE_BRACKET` on `pass1_ann`.
 
-**File-scope guard:** If `P1_OE_BRACKET` occurs at brace_depth == 0 (file scope), a hard error is raised. Bracket orelse requires hoisting a temp variable statement, which is illegal at file scope (e.g., `void process(int buf[1 orelse 2]);` at depth 0).
+**File-scope guard:** If `P1_OE_BRACKET` occurs outside any function body (`p1d_cur_func < 0`), a hard error is raised. Bracket orelse requires hoisting a temp variable statement, which is illegal outside a function body (e.g., `void process(int buf[1 orelse 2]);` at file scope).
 
 **Declaration-init classification:** `P1_OE_DECL_INIT` is set during initializer scanning in Phase 1C+1D when a declaration's initializer contains `orelse`.
 
-**Invalid context rejection (Phase 1):** Orelse inside `struct` bodies, inside `typeof`, inside certain invalid contexts is caught and errored.
+**Invalid context rejection (Phase 1):** Orelse inside `struct`/`union` bodies, inside `enum` bodies (enum constants must be compile-time integer constants), inside `typeof`, inside certain invalid contexts is caught and errored.
 
 **Bare-expression orelse** (`OE_BARE_ASSIGN`, `OE_BARE_ACTION`, `OE_BARE_COMPOUND`) is classified at emit time in Pass 2. This is safe because the symbol table is immutable.
 
@@ -413,7 +421,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 ### Defer-variable shadow checking
 
-`check_defer_var_shadow` detects when a newly-declared variable name appears in an active defer body — this would silently capture the wrong variable at cleanup time.
+`check_defer_var_shadow` detects when a newly-declared variable name appears in an active defer body — this would silently capture the wrong variable at cleanup time. Uses `FuncMeta.defer_name_bloom` (a 64-bit FNV-1a bloom filter of all identifier names in defer bodies) for an O(1) fast-reject before the O(N×M) body walk — eliminates the walk in the common case when no name matches.
 
 ---
 
@@ -466,7 +474,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 **File-scope guard:** Bracket orelse at file scope (brace_depth == 0) is a hard error — hoisting a temp variable requires a statement context.
 
-**Invalid contexts:** Orelse inside struct bodies, typeof in struct/union bodies, ternary, for-init control parens — errored in Phase 1. The typeof-in-struct check runs during `p1_full_depth_prescan` using the scope tree's `is_struct` flag, before any Pass 2 output is written.
+**Invalid contexts:** Orelse inside struct/union bodies, enum bodies (compile-time constant context), typeof in struct/union bodies, ternary, for-init control parens — errored in Phase 1. The typeof-in-struct check runs during `p1_full_depth_prescan` using the scope tree's `is_struct` flag; the enum check uses `is_enum` on the scope tree, before any Pass 2 output is written.
 
 **Feature flag:** `-fno-orelse` disables.
 
@@ -509,7 +517,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 ### 6.5 Computed goto
 
-`goto *<expr>` is supported. If active defers are present when a computed goto is executed, a hard error is raised (defer cleanup cannot be determined for an indirect jump target).
+`goto *<expr>` is supported. `FuncMeta.has_computed_goto` is set during Phase 1D when `goto *` is detected. During Phase 2A (`p1_verify_cfg`), if a function contains both a computed goto and any `P1K_DEFER` entries, a hard error is raised (defer cleanup cannot be determined for an indirect jump target).
 
 ### 6.6 _Generic
 

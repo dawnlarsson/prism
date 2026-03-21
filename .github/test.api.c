@@ -5250,6 +5250,171 @@ static void test_generic_decl_rewrite_destroys_dispatch(void) {
 	prism_free(&r3);
 }
 
+static void test_collect_source_defines_continuation_line(void) {
+	/* BUG: collect_source_defines() strips the trailing backslash from a
+	 * continuation-line #define and captures only the first physical line's
+	 * value.  For:
+	 *
+	 *   #define _FILE_OFFSET_BITS \
+	 *       64
+	 *
+	 * It emits "#define _FILE_OFFSET_BITS" (no value), which in C means
+	 * the macro is defined but expands to nothing — silently changing
+	 * _FILE_OFFSET_BITS from 64 to a valueless define, corrupting ABI. */
+	const char *code =
+	    "#define _FILE_OFFSET_BITS \\\n"
+	    "    64\n"
+	    "#include <stdio.h>\n"
+	    "int main(void) { return 0; }\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "continuation-line: create temp file");
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = false; /* run collect_source_defines path */
+	PrismResult r = prism_transpile_file(path, feat);
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "_FILE_OFFSET_BITS 64") != NULL,
+		      "continuation-line: #define with backslash continuation "
+		      "must preserve the value from the next line (got valueless "
+		      "define, silently corrupts ABI)");
+	}
+	prism_free(&r);
+	unlink(path); free(path);
+}
+
+static void test_collect_source_defines_multi_continuation(void) {
+	/* Multi-line continuation: the value spans 3+ physical lines.
+	 * Tests that the name isn't lost (use-after-free via getline realloc)
+	 * and that all continuation chunks are joined. */
+	const char *code =
+	    "#define MULTI_VAL (1 \\\n"
+	    "    | 2 \\\n"
+	    "    | 4)\n"
+	    "#include <stdio.h>\n"
+	    "int main(void) { return 0; }\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "multi-continuation: create temp file");
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = false;
+	PrismResult r = prism_transpile_file(path, feat);
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "MULTI_VAL (1 | 2 | 4)") != NULL,
+		      "multi-continuation: #define with multiple backslash "
+		      "continuation lines must preserve all value chunks");
+	}
+	prism_free(&r);
+	unlink(path); free(path);
+}
+
+#ifdef __GNUC__
+static void test_auto_type_goto_bypass(void) {
+	/* BUG: __auto_type is not in the keyword map, so the tokenizer assigns
+	 * TK_IDENT with no tag.  Phase 1D never registers it as P1K_DECL.
+	 * The CFG verifier fails to catch goto jumping over an __auto_type
+	 * declaration — a safety hole. */
+	const char *code =
+	    "int f(int c) {\n"
+	    "    if (c) goto skip;\n"
+	    "    __auto_type x = 42;\n"
+	    "    skip:\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "auto_type_goto.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "auto-type-goto-bypass: goto over __auto_type decl must be rejected");
+	prism_free(&r);
+}
+#endif
+
+static void test_c23_attr_skip_one_stmt_scope_leak(void) {
+	/* BUG: skip_one_stmt doesn't skip C23 [[attr]] or __attribute__((...))
+	 * before checking for '{'.  When the body of a braceless for-loop is
+	 * [[maybe_unused]] { ... }, skip_one_stmt falls to the simple-statement
+	 * scanner, walks past the block, and returns the ';' of the NEXT
+	 * statement.  This bloats the for-init shadow scope, hiding a typedef
+	 * that should be visible after the loop. */
+	const char *code =
+	    "typedef int i;\n"
+	    "void do_work(void);\n"
+	    "void f(int n) {\n"
+	    "    for (int i = 0; i < n; i++)\n"
+	    "        [[maybe_unused]] { do_work(); }\n"
+	    "    i target;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "attr_scope.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "i target = {0}") != NULL,
+		      "c23-attr-scope-leak: 'i target;' after attributed for-body "
+		      "must be zero-inited (typedef 'i' must not be shadowed)");
+	}
+	prism_free(&r);
+}
+
+static void test_stmtexpr_in_initializer_zeroinit(void) {
+	/* BUG: in_struct_body() walks past stmt-expr boundaries.  At file
+	 * scope, '= {' sets is_struct on the initializer scope.  A stmt-expr
+	 * ({ }) inside pushes its own scope, but in_struct_body() walks past it
+	 * and finds is_struct on the outer scope, suppressing zero-init.
+	 * Variables inside the stmt-expr are on the stack, NOT file-scope —
+	 * they won't be zero-initialized by the loader. */
+	const char *code =
+	    "struct S { int val; };\n"
+	    "struct S s = { .val = ({\n"
+	    "    int fd_tmp;\n"
+	    "    fd_tmp;\n"
+	    "}) };\n";
+	PrismResult r = prism_transpile_source(code, "stmtexpr_zi.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "fd_tmp = 0") != NULL,
+		      "stmtexpr-in-init-zeroinit: local var inside stmt-expr "
+		      "inside file-scope initializer must be zero-initialized");
+	}
+	prism_free(&r);
+}
+
+static void test_stmtexpr_in_initializer_defer_raw_leak(void) {
+	/* BUG: same in_struct_body() boundary issue causes handle_defer_keyword
+	 * to return NULL inside a stmt-expr in a file-scope initializer.  defer
+	 * is emitted raw to the backend, causing a compilation failure. */
+	const char *code =
+	    "void cleanup(void);\n"
+	    "struct S { int val; };\n"
+	    "struct S s = { .val = ({\n"
+	    "    defer cleanup();\n"
+	    "    42;\n"
+	    "}) };\n";
+	PrismResult r = prism_transpile_source(code, "stmtexpr_defer.c", prism_defaults());
+	/* After fix: in_struct_body() respects stmt-expr boundary, so defer is
+	 * actually dispatched and hits the "defer at top of stmt-expr" error.
+	 * Either way, raw 'defer' must never appear in output. */
+	bool has_raw_defer = (r.status == PRISM_OK && r.output && strstr(r.output, "defer"));
+	CHECK(!has_raw_defer,
+	      "stmtexpr-in-init-defer: 'defer' must not leak raw into "
+	      "output inside stmt-expr in file-scope initializer");
+	prism_free(&r);
+}
+
+static void test_braceless_for_defer_shadow_leak(void) {
+	/* BUG: for-init shadows are registered at block_depth+1. With braced
+	 * loops, scope_pop() cleans them up at '}'. With braceless loops, no
+	 * scope is pushed/popped, so the shadow leaks into the outer block.
+	 * A subsequent return/goto hits check_defer_shadow_at_exit and throws
+	 * a spurious fatal error on valid code. */
+	const char *code =
+	    "void do_work(void);\n"
+	    "void test(void) {\n"
+	    "    int x = 1;\n"
+	    "    defer printf(\"%d\\n\", x);\n"
+	    "    for (int x = 0; x < 10; x++)\n"
+	    "        do_work();\n"
+	    "    return;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_shadow.c", prism_defaults());
+	CHECK(r.status == PRISM_OK,
+	      "braceless-for-defer-shadow-leak: braceless for-init shadow "
+	      "must not leak past loop end and cause spurious error on return");
+	prism_free(&r);
+}
+
 void run_api_tests(void) {
 test_typeof_orelse_leak();
 	printf("\n=== API TESTS ===\n");
@@ -5401,4 +5566,21 @@ test_typeof_orelse_leak();
 	// Audit round 16 bug probes (should FAIL until fixed)
 	test_collect_source_defines_block_comment_leak();
 	test_braceless_nesting_depth_limit();
+
+	// Audit round 17 bug probes
+	test_collect_source_defines_continuation_line();
+	test_collect_source_defines_multi_continuation();
+#ifdef __GNUC__
+	test_auto_type_goto_bypass();
+#endif
+
+	// Audit round 18 bug probes
+	test_c23_attr_skip_one_stmt_scope_leak();
+
+	// Audit round 19 bug probes
+	test_stmtexpr_in_initializer_zeroinit();
+	test_stmtexpr_in_initializer_defer_raw_leak();
+
+	// Audit round 20 bug probes
+	test_braceless_for_defer_shadow_leak();
 }

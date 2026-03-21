@@ -838,8 +838,10 @@ static inline bool in_ctrl_paren(void) {
 }
 
 static inline bool in_struct_body(void) {
-	for (int i = ctx->scope_depth - 1; i >= 0; i--)
+	for (int i = ctx->scope_depth - 1; i >= 0; i--) {
+		if (scope_stack[i].is_stmt_expr) return false;
 		if (scope_stack[i].kind == SCOPE_BLOCK && scope_stack[i].is_struct) return true;
+	}
 	return false;
 }
 
@@ -847,9 +849,11 @@ static inline bool in_struct_body(void) {
  * Used to fire the 'unprocessed orelse' error inside enum constant expressions:
  * orelse is not a compile-time constant and must not silently pass through. */
 static inline bool in_enum_body(void) {
-	for (int i = ctx->scope_depth - 1; i >= 0; i--)
+	for (int i = ctx->scope_depth - 1; i >= 0; i--) {
+		if (scope_stack[i].is_stmt_expr) return false;
 		if (scope_stack[i].kind == SCOPE_BLOCK && scope_stack[i].is_struct)
 			return scope_stack[i].is_enum;
+	}
 	return false;
 }
 
@@ -869,6 +873,11 @@ static inline bool in_conditional_block(void) {
 static void end_statement_after_semicolon(void) {
 	ctx->at_stmt_start = true;
 	if (ctrl_state.pending && !in_ctrl_paren()) {
+		// Pop for-init shadows registered at block_depth+1 that would
+		// normally be cleaned up by scope_pop on a braced body's '}'.
+		while (defer_shadow_count > 0 &&
+		       defer_shadows[defer_shadow_count - 1].block_depth > ctx->block_depth)
+			defer_shadow_count--;
 		ctrl_reset();
 	}
 }
@@ -4193,22 +4202,73 @@ static void collect_source_defines(const char *input_file) {
 			if (name_len <= 0) goto check_continuation;
 			// Skip function-like macros (not ABI defines)
 			if (*p == '(') goto check_continuation;
+			// Save the name now — getline() below may realloc 'line'
+			char *saved_name = malloc(name_len + 1);
+			if (!saved_name) goto check_continuation;
+			memcpy(saved_name, name_start, name_len);
+			saved_name[name_len] = '\0';
+
 			while (*p == ' ' || *p == '\t') p++;
 			char *val_start = p;
 			// Trim trailing newline/whitespace/continuation
 			char *end = val_start + strlen(val_start);
 			while (end > val_start && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t'))
 				end--;
-			// Strip trailing backslash (continuation) — we only capture the first line's value
-			if (end > val_start && end[-1] == '\\') end--;
+			bool has_continuation = (end > val_start && end[-1] == '\\');
+			if (has_continuation) end--;
 			while (end > val_start && (end[-1] == ' ' || end[-1] == '\t')) end--;
 			int val_len = (int)(end - val_start);
+
+			// If the value has continuation lines, buffer them
+			// E.g. #define FOO \<newline>    64
+			char *full_val = NULL;
+			int full_val_len = 0;
+			if (has_continuation) {
+				// Start with whatever was on the first line
+				size_t cap = (val_len > 0 ? val_len : 0) + 256;
+				full_val = malloc(cap);
+				if (!full_val) { free(saved_name); goto check_continuation; }
+				if (val_len > 0) {
+					memcpy(full_val, val_start, val_len);
+					full_val_len = val_len;
+				}
+				// Read continuation lines (may realloc 'line')
+				while (getline(&line, &line_cap, f) >= 0) {
+					char *lp = line;
+					while (*lp == ' ' || *lp == '\t') lp++;
+					char *le = lp + strlen(lp);
+					while (le > lp && (le[-1] == '\n' || le[-1] == '\r' || le[-1] == ' ' || le[-1] == '\t'))
+						le--;
+					bool more = (le > lp && le[-1] == '\\');
+					if (more) le--;
+					while (le > lp && (le[-1] == ' ' || le[-1] == '\t')) le--;
+					int chunk = (int)(le - lp);
+					if (chunk > 0) {
+						size_t need = full_val_len + 1 + chunk + 1;
+						if (need > cap) {
+							cap = need * 2;
+							char *tmp = realloc(full_val, cap);
+							if (!tmp) { free(full_val); full_val = NULL; break; }
+							full_val = tmp;
+						}
+						if (full_val_len > 0) full_val[full_val_len++] = ' ';
+						memcpy(full_val + full_val_len, lp, chunk);
+						full_val_len += chunk;
+					}
+					if (!more) break;
+				}
+				if (full_val) {
+					val_start = full_val;
+					val_len = full_val_len;
+				}
+			}
 
 			// Build "NAME=VALUE" or "NAME" string
 			int total = name_len + (val_len > 0 ? 1 + val_len : 0) + 1;
 			char *def = malloc(total);
-			if (!def) goto check_continuation;
-			memcpy(def, name_start, name_len);
+			if (!def) { free(full_val); free(saved_name); goto check_continuation; }
+			memcpy(def, saved_name, name_len);
+			free(saved_name);
 			if (val_len > 0) {
 				def[name_len] = '=';
 				memcpy(def + name_len + 1, val_start, val_len);
@@ -4216,6 +4276,7 @@ static void collect_source_defines(const char *input_file) {
 			} else {
 				def[name_len] = '\0';
 			}
+			free(full_val);
 
 			ARENA_ENSURE_CAP(&ctx->main_arena, ctx->source_defines,
 					 ctx->source_define_count, ctx->source_define_cap,
@@ -4886,6 +4947,7 @@ static void p1_build_scope_tree(Token *start) {
 static Token *skip_one_stmt(Token *tok, int depth) {
 	if (depth >= 4096) error_tok(tok, "braceless control flow nesting depth exceeds 4096");
 	while (tok && tok->kind == TK_PREP_DIR) tok = tok_next(tok);
+	tok = skip_noise(tok); // skip C23 [[attr]] and __attribute__((...))
 	if (!tok || tok->kind == TK_EOF) return NULL;
 
 	// Braced compound statement

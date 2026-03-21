@@ -913,6 +913,7 @@ static void init_keyword_map(void) {
 	    {"typeof", TT_TYPE | TT_TYPEOF, true},
 	    {"__typeof__", TT_TYPE | TT_TYPEOF, true},
 	    {"__typeof", TT_TYPE | TT_TYPEOF, true},
+	    {"__auto_type", TT_TYPE | TT_TYPEOF, true},
 	    {"_BitInt", TT_TYPE | TT_BITINT, true},
 	    {"asm", TT_SKIP_DECL | TT_ASM, true},
 	    {"__asm__", TT_SKIP_DECL | TT_ASM, true},
