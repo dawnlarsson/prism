@@ -3674,7 +3674,7 @@ static void test_cli_split_D_flag_not_source(void) {
 	{
 		char *argv[] = {prism_bin, "-I", "/nonexistent/path/ending.c",
 				"-c", src_path, "-o", obj_path, NULL};
-		int st = run_exec_argv(argv);
+		int st = run_exec_argv_capture(argv, stdout_path, stderr_path);
 		CHECK_EQ(st, 0, "split -D: -I <path.c> compiles OK");
 		unlink(obj_path);
 	}
@@ -3683,7 +3683,7 @@ static void test_cli_split_D_flag_not_source(void) {
 	{
 		char *argv[] = {prism_bin, "-U", "SOMETHING.c",
 				"-c", src_path, "-o", obj_path, NULL};
-		int st = run_exec_argv(argv);
+		int st = run_exec_argv_capture(argv, stdout_path, stderr_path);
 		CHECK_EQ(st, 0, "split -D: -U <name.c> compiles OK");
 		unlink(obj_path);
 	}
@@ -4642,8 +4642,17 @@ static void test_preprocess_read_eintr_resilience(void) {
 		free(path);
 	}
 
-	// Stop timer and restore
+	// Stop timer and restore.  A SIGALRM may already be queued when we
+	// disarm the timer.  If we restored the old handler (SIG_DFL) first,
+	// the pending signal would terminate the process (exit code 142).
+	// Fix: set SIG_IGN (drops any pending signal), stop the timer, then
+	// safely restore the original handler.
 	{
+		struct sigaction ign_sa = {0};
+		ign_sa.sa_handler = SIG_IGN;
+		sigemptyset(&ign_sa.sa_mask);
+		sigaction(SIGALRM, &ign_sa, NULL);
+
 		struct itimerval zero_itv;
 		memset(&zero_itv, 0, sizeof(zero_itv));
 		setitimer(ITIMER_REAL, &zero_itv, NULL);

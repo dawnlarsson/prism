@@ -319,6 +319,11 @@ typedef struct PrismContext {
 	int bracket_oe_cap;                // Capacity of bracket_oe_ids array
 	int bracket_oe_next;               // Next temp to consume during emit
 
+	// Reusable typeof/VLA memset variable queue (hoisted from process_declarators)
+	Token **typeof_vars;
+	int typeof_var_count;
+	int typeof_var_cap;
+
 	// Pre-hoisted plain dimension temps for VLA eval-order preservation
 	unsigned *bracket_dim_ids;         // Temp IDs for non-orelse brackets (0 = not hoisted)
 	int bracket_dim_count;             // Count of pre-hoisted dimension temps
@@ -577,7 +582,7 @@ static inline uint32_t tok_idx(Token *tok) {
 }
 
 // Fast multiply-mix hash (~2-4x faster than FNV-1a for short strings)
-static inline uint64_t fast_hash(char *s, int len) {
+static inline uint64_t fast_hash(char *s, uint32_t len) {
 	uint64_t a = 0, b = 0;
 	if (len >= 8) {
 		memcpy(&a, s, 8);

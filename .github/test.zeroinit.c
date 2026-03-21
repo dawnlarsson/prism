@@ -1994,6 +1994,62 @@ static void test_c23_if_initializer_zeroinit_dropped(void) {
 	prism_free(&r3);
 }
 
+void test_static_vars_no_redundant_zeroinit(void) {
+	/* C guarantees static and _Thread_local variables are zero-initialized
+	   by the loader/runtime.  Prism must NOT emit = 0, = {0}, or memset
+	   for such variables — especially memset, which would re-zero the
+	   variable on every function call, destroying static semantics. */
+
+	/* 1. static int — must NOT get '= 0' */
+	PrismResult r1 = prism_transpile_source(
+	    "void f(void) {\n"
+	    "    static int x;\n"
+	    "    (void)x;\n"
+	    "}\n",
+	    "static_int_no_zeroinit.c", prism_defaults());
+	CHECK(r1.status == PRISM_OK && r1.output, "static-int: transpiles OK");
+	if (r1.output) {
+		CHECK(!strstr(r1.output, "= 0") && !strstr(r1.output, "={0}") &&
+		      !strstr(r1.output, "= {0}") && !strstr(r1.output, "memset"),
+		      "static-int: no redundant zero-init emitted");
+	}
+	prism_free(&r1);
+
+	/* 2. static array — must NOT get '= {0}' */
+	PrismResult r2 = prism_transpile_source(
+	    "void f(void) {\n"
+	    "    static char buf[10];\n"
+	    "    (void)buf;\n"
+	    "}\n",
+	    "static_array_no_zeroinit.c", prism_defaults());
+	CHECK(r2.status == PRISM_OK && r2.output, "static-array: transpiles OK");
+	if (r2.output) {
+		CHECK(!strstr(r2.output, "= {0}") && !strstr(r2.output, "={0}") &&
+		      !strstr(r2.output, "memset"),
+		      "static-array: no redundant zero-init emitted");
+	}
+	prism_free(&r2);
+
+#ifdef __GNUC__
+	/* 3. CRITICAL: static typeof(int) — must NOT get memset (would reset
+	   the variable on every function call, breaking static semantics) */
+	PrismResult r3 = prism_transpile_source(
+	    "void f(void) {\n"
+	    "    static typeof(int) x;\n"
+	    "    (void)x;\n"
+	    "}\n",
+	    "static_typeof_nozero.c", prism_defaults());
+	CHECK(r3.status == PRISM_OK && r3.output, "static-typeof: transpiles OK");
+	if (r3.output) {
+		CHECK(!strstr(r3.output, "__builtin_memset"),
+		      "static-typeof: no memset on static variable (would reset on every call)");
+		CHECK(!strstr(r3.output, "= 0") && !strstr(r3.output, "= {0}"),
+		      "static-typeof: no redundant zero-init emitted");
+	}
+	prism_free(&r3);
+#endif
+}
+
 void test_register_atomic_aggregate_must_error(void) {
 #ifndef _MSC_VER
 	/* register + _Atomic aggregate cannot be safely zero-initialized:
@@ -2114,4 +2170,5 @@ void run_zeroinit_tests(void) {
 	test_c23_if_initializer_zeroinit_dropped();
 	test_vla_typedef_struct_tag_memset();
 	test_register_atomic_aggregate_must_error();
+	test_static_vars_no_redundant_zeroinit();
 }

@@ -2920,28 +2920,33 @@ static void test_bracket_orelse_vla_decl_fno_zeroinit(void) {
 }
 
 static void test_enum_member_orelse_passthrough(void) {
-	// BUG: orelse inside an enum constant value expression is silently
-	// passed through as literal "orelse" text in the C output.
-	// In Pass 2, when processing enum bodies (which are treated as struct
-	// bodies), the "unprocessed orelse" error check at line ~6274 is gated
-	// by `!in_struct_body()`, which returns true for enum bodies.
-	// Result: orelse reaches the downstream C compiler verbatim → compile error.
-	// Prism must REJECT orelse in enum constant expressions; enum constants
-	// must be compile-time integer constants, so orelse makes no semantic sense.
+	// orelse inside an enum constant value expression must be rejected.
+	// Enum constants must be compile-time integer constants.
+	// This MUST be caught in Phase 1 (before any Pass 2 output) to preserve
+	// the two-pass invariant: every semantic error fires before emission.
 	PrismResult r = prism_transpile_source(
 	    "extern int base_val;\n"
 	    "enum E { A = 1, B = base_val orelse 10, C = 3 };\n"
 	    "int main(void) { return 0; }\n",
 	    "enum_orelse.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "enum-member-orelse: rejected (orelse cannot appear in enum constants)");
 	if (r.status == PRISM_OK && r.output) {
-		// Bug present: orelse leaked into output as literal text
 		CHECK(strstr(r.output, "orelse") == NULL,
 		      "enum-member-orelse: literal 'orelse' must not appear in output "
 		      "(enum constant expressions cannot use orelse; Prism must reject)");
 	}
-	// Correct behavior: rejected with an informative error.
-	// If r.status != PRISM_OK this path is fine; the test passes.
 	prism_free(&r);
+
+	// Minimal case: orelse directly in enum body
+	PrismResult r2 = prism_transpile_source(
+	    "enum E { A = 1 orelse 2 };\n",
+	    "enum_orelse_minimal.c", prism_defaults());
+	CHECK(r2.status != PRISM_OK,
+	      "enum-member-orelse-minimal: rejected before emission (Phase 1)");
+	CHECK(r2.output == NULL || r2.output_len == 0,
+	      "enum-member-orelse-minimal: no output emitted (two-pass invariant)");
+	prism_free(&r2);
 }
 
 static void test_initializer_brace_orelse_wrong_transform(void) {
@@ -3080,6 +3085,35 @@ static void test_bare_orelse_ifdef_lhs_both_branches_concatenated(void) {
               "tokens, producing invalid concatenated LHS (should be conditional)");
         prism_free(&r);
 }
+
+#ifdef __GNUC__
+void test_decl_orelse_stmt_expr_initializer(void) {
+	/* int x = ({...}) orelse N; — declaration with statement-expression
+	   initializer and orelse.  Must produce valid C: the stmt-expr is
+	   evaluated once (in the assignment), and the orelse fallback uses
+	   an if-check on the variable, not a ternary re-evaluation. */
+	PrismResult r = prism_transpile_source(
+	    "int do_thing(void);\n"
+	    "void f(void) {\n"
+	    "    int x = ({ do_thing(); 1; }) orelse 0;\n"
+	    "    (void)x;\n"
+	    "}\n",
+	    "decl_orelse_stmtexpr.c", prism_defaults());
+	CHECK(r.status == PRISM_OK && r.output,
+	      "decl-orelse-stmtexpr: transpiles OK");
+	if (r.output) {
+		/* The output must NOT contain 'int x)' or 'if (! int' — those
+		   are signs of the bare-orelse handler mangling a declaration. */
+		CHECK(!strstr(r.output, "int x)") && !strstr(r.output, "if (! int") &&
+		      !strstr(r.output, "if (!\\nint"),
+		      "decl-orelse-stmtexpr: no garbled bare-orelse output");
+		/* The output MUST have an assignment to x from the stmt-expr. */
+		CHECK(strstr(r.output, "int x"),
+		      "decl-orelse-stmtexpr: declaration of x is present");
+	}
+	prism_free(&r);
+}
+#endif
 
 void run_orelse_tests(void) {
 	test_orelse_return_null();
@@ -3275,4 +3309,9 @@ void run_orelse_tests(void) {
 
         // Audit round 15: bare-orelse LHS #ifdef concatenates both branches
         test_bare_orelse_ifdef_lhs_both_branches_concatenated();
+
+#ifdef __GNUC__
+        // Audit round 16: declaration orelse with stmt-expr initializer
+        test_decl_orelse_stmt_expr_initializer();
+#endif
 }

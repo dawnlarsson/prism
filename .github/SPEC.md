@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3120 tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3133 tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -158,6 +158,8 @@ Stored in a flat array with a hashmap keyed on name. Supports multiple shadows p
 | `p1_entries[]` | `ARENA_ENSURE_CAP` | `arena_reset()` |
 | `p1_shadow_entries[]` | `ARENA_ENSURE_CAP` | `arena_reset()` |
 | `p1_shadow_map.buckets` | `malloc` | `prism_thread_cleanup()` |
+| `typeof_vars[]` | `ARENA_ENSURE_CAP` (ctx, reused) | `arena_reset()` |
+| `bracket_oe_ids[]` | `ARENA_ENSURE_CAP` (ctx, reused) | `arena_reset()` |
 
 All arena-allocated structures are automatically reclaimed by `prism_reset()` → `arena_reset()` on any `error_tok()` that `longjmp`s out.
 
@@ -458,6 +460,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 | Bare assignment | `x = f() orelse return -1;` | `x = f(); if (!x) return -1;` |
 | Bracket (array dim) | `int buf[n orelse 1]` | Temp variable hoisted before declaration |
 | Decl-init | `int x = f() orelse 0;` | Expanded with temp and null check |
+| Stmt-expr decl-init | `int x = ({...}) orelse 0;` | `int x = ({...}); x = x ? x : 0;` |
 
 **Side-effect protection:** Bracket orelse in VLA/typeof contexts rejects expressions with side effects (`++`, `--`, `=`, volatile reads, function calls) to prevent double evaluation. Function-call detection recognizes both `ident(` and `)(`  (parenthesized call) patterns.
 
@@ -481,6 +484,8 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 | Typedef-hidden VLA (`T x;` where T is VLA) | `T x; memset(x, 0, sizeof(x));` |
 
 **Scope:** Only inside function bodies (`block_depth > 0`). Not at file scope. Not inside struct/union/enum definitions.
+
+**Storage class exclusions:** Variables with `static`, `extern`, `_Thread_local`, or `thread_local` storage class are **not** zero-initialized. C guarantees these are zero-initialized by the loader (static/extern) or runtime (_Thread_local/thread_local). Emitting `= 0` for static locals would move them from `.bss` to `.data`; emitting `memset` would re-zero them on every function entry, breaking static semantics.
 
 **Typedef awareness:** Uses the immutable typedef table to distinguish `size_t x;` (declaration → initialize) from `size_t * x;` (could be expression → don't touch). Tracks `is_aggregate` to handle struct typedefs that need `= {0}` instead of `= 0`.
 
@@ -535,6 +540,19 @@ When `warn_safety` is enabled (`-fno-safety`), CFG violations (goto skipping def
 In `PRISM_LIB_MODE`, `error_tok` triggers `longjmp(ctx->error_jmp)` instead of `exit(1)`. All arena-allocated structures are reclaimed by `arena_reset()`. `pass1_ann` survives arena resets (same lifecycle as token pool).
 
 ---
+
+---
+
+## 7.1 Implementation Limits
+
+| Limit | Value | Error |
+|---|---|---|
+| Scope count (scope_id) | 65,534 | `scope tree: too many scopes (>65534)` |
+| Brace nesting depth | 4,096 | `brace nesting depth exceeds 4096` |
+| Switch nesting depth | 256 | `switch nesting depth exceeds 256` |
+| Braceless switch synthetic scopes | Limited by remaining scope_id range | `too many scopes + braceless switches (>65535)` |
+
+These limits are enforced with hard errors. Exceeding any limit halts transpilation.
 
 ## 8. CLI Modes
 
@@ -667,7 +685,7 @@ These are inherently runtime and cannot move to Pass 1:
 ## 14. Invariants
 
 1. **Immutable symbol table:** After Phase 1B completes, the typedef table is frozen. Pass 2 performs zero mutations to the typedef table, scope tree, `pass1_ann`, or `func_meta`.
-2. **All errors before emission:** Every `error_tok` call from semantic analysis fires during Pass 1 or Phase 2A. Pass 2 contains no safety-check `error_tok` calls.
+2. **All errors before emission:** Every user-triggerable `error_tok` call from semantic analysis fires during Pass 1 or Phase 2A, before Pass 2 emits its first byte. Pass 2 contains defensive `error_tok` calls in `process_declarators`, `emit_bare_orelse_impl`, `handle_defer_keyword`, etc. that serve as unreachable-by-design assertions — they guard against internal inconsistencies that would indicate a Pass 1 gap, not against user input that should have been caught earlier.
 3. **O(N) CFG verification:** `p1_verify_cfg` is guaranteed linear in the number of P1FuncEntry items per function. No O(N²) pairwise scans.
 4. **Delimiter matching completeness:** Every `(`, `[`, `{` has a `match_idx`. Every `)`, `]`, `}` points back. No unmatched delimiters survive tokenization.
 5. **Self-host fixed point:** Stage 1 and Stage 2 transpiled C output is identical.

@@ -216,6 +216,7 @@ typedef struct {
 	bool is_stmt_expr : 1;
 	bool is_conditional : 1;
 	bool is_init : 1;     // initializer brace: = { ... } — not a compound statement
+	bool is_enum : 1;     // set when is_struct=true and the keyword is 'enum'
 } ScopeInfo;
 
 // Per-function metadata collected during Pass 1.
@@ -559,6 +560,9 @@ static void reset_transpiler_state(void) {
 	ctx->bracket_oe_count = 0;
 	ctx->bracket_oe_cap = 0;
 	ctx->bracket_oe_next = 0;
+	ctx->typeof_vars = NULL;
+	ctx->typeof_var_count = 0;
+	ctx->typeof_var_cap = 0;
 
 	// Reset Pass 1 arena-allocated structures
 	ctx->p1_scope_tree = NULL;
@@ -2845,9 +2849,7 @@ static OrelseInitInfo scan_decl_orelse(Token *decl_end,
 // Process all declarators in a declaration and emit with zero-init.
 static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw, Token *type_start,
 				  Token *pragma_start, Token *raw_tok, bool brace_wrap) {
-	Token **typeof_vars = NULL;
-	int typeof_var_count = 0;
-	int typeof_var_cap = 0;
+	ctx->typeof_var_count = 0; // Reset count; reuse arena-allocated array across calls
 	bool first_decl = true;
 	bool need_type_emit = false; // Set after orelse comma — deferred to after next lookahead
 
@@ -2913,9 +2915,10 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		bool effective_vla = (decl.is_vla && (!decl.paren_pointer || decl.paren_array)) || (type->is_vla && !decl.is_pointer);
 		bool is_aggregate =
 		    decl.is_array || ((type->is_struct || type->is_typedef) && !decl.is_pointer);
-		// Only queue memset when zeroinit feature is enabled
+		// Only queue memset when zeroinit feature is enabled.
+		// Static/extern variables are zero-initialized by the loader — skip.
 		bool needs_memset = FEAT(F_ZEROINIT) && !decl.has_init && !is_raw && (!decl.is_pointer || decl.is_array) &&
-				    !type->has_register &&
+				    !type->has_register && !type->has_static && !type->has_extern &&
 				    (type->has_typeof || (type->has_atomic && is_aggregate) || effective_vla);
 
 		if (is_const_orelse_fallback) {
@@ -2941,7 +2944,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 							   pragma_start,
 							   target.stop_comma);
 
-			flush_typeof_memsets(typeof_vars, &typeof_var_count, type);
+			flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type);
 
 			if (match_ch(tok, ';')) tok = tok_next(tok);
 			end_statement_after_semicolon();
@@ -2961,7 +2964,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		tok = decl.end;
 
 		// Add zero initializer if needed (for non-memset types)
-		if (FEAT(F_ZEROINIT) && !decl.has_init && !effective_vla && !is_raw && !needs_memset && !type->has_extern) {
+		if (FEAT(F_ZEROINIT) && !decl.has_init && !effective_vla && !is_raw && !needs_memset && !type->has_extern && !type->has_static) {
 			if (type->has_register && type->has_atomic && is_aggregate)
 				error_tok(decl.var_name,
 					  "'register _Atomic' aggregate cannot be safely "
@@ -2981,12 +2984,12 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					  "cannot be safely zero-initialized; move the "
 					  "declaration before the statement");
 			ARENA_ENSURE_CAP(&ctx->main_arena,
-					 typeof_vars,
-					 typeof_var_count + 1,
-					 typeof_var_cap,
+					 ctx->typeof_vars,
+					 ctx->typeof_var_count + 1,
+					 ctx->typeof_var_cap,
 					 128,
 					 Token *);
-			typeof_vars[typeof_var_count++] = decl.var_name;
+			ctx->typeof_vars[ctx->typeof_var_count++] = decl.var_name;
 		}
 
 		// Emit initializer if present
@@ -3032,7 +3035,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 				out_char(';');
 
-				flush_typeof_memsets(typeof_vars, &typeof_var_count, type);
+				flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type);
 
 				tok = tok_next(tok); // skip 'orelse'
 				OrelseDeclTargetInfo target = analyze_decl_orelse_target(tok, type_start, type, &decl);
@@ -3059,7 +3062,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 		if (match_ch(tok, ';')) {
 			emit_tok(tok);
-			flush_typeof_memsets(typeof_vars, &typeof_var_count, type);
+			flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type);
 			if (brace_wrap) OUT_LIT(" }");
 			return tok_next(tok);
 		} else if (match_ch(tok, ',')) {
@@ -3068,7 +3071,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 			// Delayed memset zeroing must happen before a later declarator's
 			// initializer can read earlier variables, and before the fixed queue fills.
-			if (typeof_var_count > 0 && !in_for_init()) {
+			if (ctx->typeof_var_count > 0 && !in_for_init()) {
 				DeclResult next_decl = parse_declarator(next_decl_tok, false);
 				if (next_decl.end && next_decl.var_name && next_decl.has_init)
 					split_decl = true;
@@ -3084,7 +3087,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 			if (split_decl) {
 				out_char(';');
-				flush_typeof_memsets(typeof_vars, &typeof_var_count, type);
+				flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type);
 				tok = next_decl_tok;
 				need_type_emit = true;
 				is_raw = false;
@@ -3104,7 +3107,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 emit_raw_bail:
 	while (tok && tok->kind != TK_EOF && !match_ch(tok, ';')) { emit_tok(tok); tok = tok_next(tok); }
 	if (tok && match_ch(tok, ';')) { emit_tok(tok); tok = tok_next(tok); }
-	flush_typeof_memsets(typeof_vars, &typeof_var_count, type);
+	flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type);
 	if (brace_wrap) OUT_LIT(" }");
 	return tok;
 }
@@ -3222,6 +3225,8 @@ static Token *try_zero_init_decl(Token *tok) {
 
 	// Single-declarator statement-expression initializers (int x = ({...});)
 	// are emitted verbatim — process_declarators' orelse scanner can't handle ({}).
+	// Exception: if orelse follows the stmt-expr, process_declarators handles
+	// it correctly via its initializer orelse path (assign + if-check, no double eval).
 	{
 		DeclResult probe = parse_declarator(type.end, false);
 		if (!probe.var_name || !probe.end) return NULL;
@@ -3230,7 +3235,9 @@ static Token *try_zero_init_decl(Token *tok) {
 			if (aeq && match_ch(aeq, '(') && tok_next(aeq) &&
 			    match_ch(tok_next(aeq), '{') && tok_match(aeq)) {
 				Token *after_se = tok_next(tok_match(aeq));
-				if (!after_se || !match_ch(after_se, ','))
+				bool is_orelse = after_se && (after_se->tag & TT_ORELSE) &&
+						 !typedef_lookup(after_se);
+				if (!after_se || (!match_ch(after_se, ',') && !is_orelse))
 					return NULL;
 			}
 		}
@@ -3860,7 +3867,8 @@ static char **build_clean_environ(void) {
 
 static int wait_for_child(pid_t pid) {
 	int status;
-	if (waitpid(pid, &status, 0) == -1) {
+	while (waitpid(pid, &status, 0) == -1) {
+		if (errno == EINTR) continue;
 		perror("waitpid");
 		return -1;
 	}
@@ -4325,7 +4333,7 @@ static char *preprocess_with_cc(const char *input_file) {
 	memset(buf + len, 0, 8);
 
 	int status;
-	waitpid(pid, &status, 0);
+	while (waitpid(pid, &status, 0) == -1 && errno == EINTR) {}
 	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
 		// Show captured preprocessor stderr on failure
 		if (pp_stderr_path[0]) {
@@ -4780,8 +4788,10 @@ static void p1_build_scope_tree(Token *start) {
 							si->is_switch = true;
 						else if (kw->tag & TT_IF)
 							si->is_conditional = true;
-						else if (kw->tag & TT_SUE)
+						else if (kw->tag & TT_SUE) {
 							si->is_struct = true;
+							if (is_enum_kw(kw)) si->is_enum = true;
+						}
 					}
 					// Function body: file-scope '{' preceded by ')' with no control keyword
 					if (depth == 0 && !si->is_loop && !si->is_switch && !si->is_conditional
@@ -4792,6 +4802,7 @@ static void p1_build_scope_tree(Token *start) {
 					si->is_conditional = true;
 				} else if (prev->tag & TT_SUE) {
 					si->is_struct = true;
+					if (is_enum_kw(prev)) si->is_enum = true;
 				} else if (prev->kind == TK_IDENT && !(prev->tag & (TT_TYPE|TT_QUALIFIER|TT_LOOP|TT_SWITCH|TT_IF|TT_STORAGE))) {
 					// Named struct/union/enum: 'struct Name {' or
 					// 'struct __attribute__((packed)) Name {'
@@ -4803,7 +4814,10 @@ static void p1_build_scope_tree(Token *start) {
 							si2 = tok_idx(tok_match(st)); continue;
 						}
 						if (st->tag & TT_ATTR) continue;
-						if (st->tag & TT_SUE) { si->is_struct = true; }
+						if (st->tag & TT_SUE) {
+							si->is_struct = true;
+							if (is_enum_kw(st)) si->is_enum = true;
+						}
 						break;
 					}
 				} else if (depth == 0 && (match_ch(prev, ']') || match_ch(prev, ';'))) {
@@ -5050,7 +5064,7 @@ static void p1_full_depth_prescan(Token *tok) {
 	uint16_t p1d_switch_stack[256];
 	uint32_t p1d_switch_end[256]; // 0 = braced (pop at }), >0 = braceless body end token idx
 	int p1d_switch_top = 0;
-	uint16_t p1d_braceless_next_sid = scope_tree_count; // synthetic scope IDs for braceless switches
+	uint32_t p1d_braceless_next_sid = scope_tree_count; // synthetic scope IDs for braceless switches
 	Token *p1d_prev = NULL;   // previous non-whitespace token (for label detection)
 	bool p1d_saw_raw = false;  // Phase 1D: track 'raw' keyword preceding declaration
 	bool p1d_saw_static = false; // Phase 1D: track static/extern storage class preceding declaration
@@ -5074,6 +5088,18 @@ static void p1_full_depth_prescan(Token *tok) {
 					tok_ann(s) |= P1_OE_BRACKET;
 				}
 			}
+		}
+
+		// Phase 1: reject orelse in enum constant expressions early,
+		// before any Pass 2 output is written.  Enum constants must be
+		// compile-time integer constants, so orelse makes no semantic sense.
+		if (FEAT(F_ORELSE) && (tok->tag & TT_ORELSE) && !typedef_lookup(tok)) {
+			uint16_t cur_sid = scope_depth_local < 4096 ?
+				scope_stack_local[scope_depth_local] : 0;
+			if (cur_sid < scope_tree_count && scope_tree[cur_sid].is_enum)
+				error_tok(tok,
+					  "'orelse' cannot be used here (it must appear at the "
+					  "statement level in a declaration or bare expression)");
 		}
 
 		// Phase 1: reject orelse inside typeof in struct/union bodies early,
@@ -5167,7 +5193,9 @@ uint16_t sid = next_scope_id++;
 
 			// Phase 1D: track switch scope for case label association
 			if (p1d_cur_func >= 0 && sid < scope_tree_count &&
-			    scope_tree[sid].is_switch && p1d_switch_top < 256) {
+			    scope_tree[sid].is_switch) {
+				if (p1d_switch_top >= 256)
+					error_tok(tok, "switch nesting depth exceeds 256");
 				p1_alloc(P1K_SWITCH, sid, tok);
 				p1d_switch_stack[p1d_switch_top] = sid;
 				p1d_switch_end[p1d_switch_top] = 0; // braced: popped at }
@@ -5754,14 +5782,16 @@ uint16_t sid = next_scope_id++;
 				Token *body = tok_next(tok_match(p));
 				while (body && body->kind == TK_PREP_DIR) body = tok_next(body);
 				if (body && !match_ch(body, '{')) {
-					uint16_t synth_sid = p1d_braceless_next_sid++;
-					p1_alloc(P1K_SWITCH, synth_sid, tok);
-					if (p1d_switch_top < 256) {
-						p1d_switch_stack[p1d_switch_top] = synth_sid;
-						Token *end = skip_one_stmt(body);
-						p1d_switch_end[p1d_switch_top] = end ? tok_idx(end) : UINT32_MAX;
-						p1d_switch_top++;
-					}
+					uint32_t synth_sid = p1d_braceless_next_sid++;
+					if (synth_sid > UINT16_MAX)
+						error_tok(tok, "too many scopes + braceless switches (>65535)");
+					p1_alloc(P1K_SWITCH, (uint16_t)synth_sid, tok);
+					if (p1d_switch_top >= 256)
+						error_tok(tok, "switch nesting depth exceeds 256");
+					p1d_switch_stack[p1d_switch_top] = synth_sid;
+					Token *end = skip_one_stmt(body);
+					p1d_switch_end[p1d_switch_top] = end ? tok_idx(end) : UINT32_MAX;
+					p1d_switch_top++;
 				}
 			}
 		}
@@ -6085,7 +6115,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 	// Phase 1B: Full-depth typedef + enum registration (all scopes)
 	// Also runs Phase 1C (shadow), 1D (labels/gotos/defers/decls),
-	// 1E (return type), 1F (defer validation), 1H (bracket orelse)
+	// 1E (return type), 1F (defer validation), 1G (orelse pre-classification)
 	p1_full_depth_prescan(tok);
 
 	// Phase 2A: verify goto→label pairs against defers/decls
@@ -7577,7 +7607,20 @@ static int compile_sources(Cli *cli) {
 		args[argc++] = pipe_lang;
 		if (FEAT(F_FLATTEN) && !clang) args[argc++] = "-fpreprocessed";
 		args[argc++] = "-";
-		if (cli->cc_arg_count > 0) {
+		// Emit -x none to reset language before any positional file args
+		// (object files, libraries) so they aren't misinterpreted as C source.
+		// Skip if cc_args are all flags — clang warns about -x none after
+		// the last input file.
+		bool need_x_none = false;
+		for (int i = 0; i < cli->cc_arg_count; i++) {
+			if (i == x_flag_idx) { i++; continue; }
+			const char *a = cli->cc_args[i];
+			if (a[0] != '-') { need_x_none = true; break; }
+			// skip flags whose next arg is a value, not a file
+			if (strcmp(a, "-o") == 0 || strcmp(a, "-MF") == 0 ||
+			    strcmp(a, "-MQ") == 0 || strcmp(a, "-MT") == 0) { i++; continue; }
+		}
+		if (need_x_none) {
 			args[argc++] = "-x";
 			args[argc++] = "none";
 		}

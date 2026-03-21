@@ -1,6 +1,6 @@
 ![Prism Banner](https://github.com/user-attachments/assets/051187c2-decd-497e-9beb-b74031eb84ed)
 
-![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-3136_passing-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
+![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-3133_passing-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
 
 ## Robust C by default
 **A dialect of C with `defer`, `orelse`, and automatic zero-initialization.**
@@ -9,7 +9,7 @@ Prism is a lightweight and very fast transpiler that makes C safer without chang
 
 → [dawning.dev/prism](https://dawning.dev/prism)
 
-- **3136 tests** — edge cases, control flow, nightmares, trying hard to break Prism
+- **3133 tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Two-pass transpiler** — full semantic analysis before a single byte is emitted
 - **Opt-out features** — Disable parts of the transpiler, like zero-init, with CLI flags
@@ -115,8 +115,9 @@ Defers execute in **LIFO order** (last defer runs first) at scope exit — wheth
 - Statement expressions `({ ... })` — defers fire at inner scope, not outer
 - `switch` fallthrough — defers don't double-fire between cases  
 - Nested loops — `break`/`continue` unwind the correct scope
+- Computed goto — `goto *ptr` with active defers is a hard error
 
-**Forbidden patterns:** Functions using `setjmp`/`longjmp`, `vfork`, or inline assembly are rejected to prevent resource leaks from non-local jumps.
+**Forbidden patterns:** Functions using `setjmp`/`longjmp`/`pthread_exit`, `vfork`, or inline assembly are rejected to prevent resource leaks from non-local jumps.
 
 **Opt-out:** `prism -fno-defer src.c`
 
@@ -168,7 +169,7 @@ void example() {
 - Performance-critical inner loops where zeroing is measurable overhead
 - Interfacing with APIs that fully initialize the data
 
-**Safety interaction:** Variables marked `raw` can be safely jumped over by `goto` — since they're not initialized anyway, skipping them isn't undefined behavior.
+**Safety interaction:** Variables marked `raw` can be safely jumped over by `goto` — since they're not initialized anyway, skipping them isn't undefined behavior. Exception: `raw` on a VLA does not exempt it from the goto check, because jumping past a VLA bypasses implicit stack allocation regardless of initialization.
 
 ```c
 void allowed() {
@@ -431,7 +432,7 @@ void          prism_free(PrismResult *r);
 
 ## Architecture
 
-Prism processes C in two passes. Pass 1 performs full semantic analysis and catches all errors. Pass 2 is a near-pure code generator that reads Pass 1's immutable artifacts — no type table mutations, no speculative token walking, no mid-emit errors.
+Prism processes C in two passes. Pass 1 performs full semantic analysis and catches all user-triggerable errors. Pass 2 is a near-pure code generator that reads Pass 1's immutable artifacts — no type table mutations, no speculative token walking. Defensive assertions in Pass 2 guard against internal consistency violations but are not reachable from valid or invalid user input.
 
 | Phase | What it does |
 |---|---|
@@ -442,8 +443,7 @@ Prism processes C in two passes. Pass 1 performs full semantic analysis and catc
 | **Pass 1D** — CFG Collection | Per-function arrays of labels, gotos, defers, declarations, switch/case entries |
 | **Pass 1E** — Return Type Capture | Record each function's return type range and void/setjmp/vfork/asm flags |
 | **Pass 1F** — Defer Validation | Reject forbidden patterns inside defer bodies (return, goto, break, continue, nested stmt-expr) |
-| **Pass 1G** — Braceless Tagging | Mark control keywords whose braceless body contains Prism keywords needing brace injection |
-| **Pass 1H** — Orelse Classification | Classify orelse in brackets and declaration initializers; reject at file scope |
+| **Pass 1G** — Orelse Pre-Classification | Classify orelse in brackets and declaration initializers; reject in enum bodies and at file scope |
 | **Phase 2A** — CFG Verification | O(N) snapshot-and-sweep: verify every goto→label and switch→case pair against defers and declarations |
 | **Pass 2** — Code Generation | Emit transformed C. Reads immutable scope tree, typedef table, shadow table. No type mutations, no safety checks |
 
