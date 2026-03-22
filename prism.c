@@ -356,7 +356,12 @@ static void signal_temps_register(const char *path) {
 	sig_atomic_t n;
 	do {
 		n = signal_temps_load();
-		if (n >= SIGNAL_TEMPS_MAX) return;
+		if (n >= SIGNAL_TEMPS_MAX) {
+			fprintf(stderr, "prism: warning: temp file tracking full (%d); "
+				"'%s' won't be cleaned on signal\n",
+				SIGNAL_TEMPS_MAX, path);
+			return;
+		}
 	} while (!signal_temps_cas(&n, n + 1));
 	memcpy(signal_temps[n], path, len + 1);
 }
@@ -2348,6 +2353,13 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 				ARENA_ENSURE_CAP(&ctx->main_arena, ctx->bracket_dim_ids,
 						 ctx->bracket_dim_count, ctx->bracket_dim_cap, 16, unsigned);
 				ctx->bracket_dim_ids[ctx->bracket_dim_count++] = (unsigned)-1; // sentinel = not hoisted
+				continue;
+			}
+			// Skip single numeric literal — no side effects, no reordering risk
+			if (tok_next(dim_start) == dim_end && dim_start->kind == TK_NUM) {
+				ARENA_ENSURE_CAP(&ctx->main_arena, ctx->bracket_dim_ids,
+						 ctx->bracket_dim_count, ctx->bracket_dim_cap, 16, unsigned);
+				ctx->bracket_dim_ids[ctx->bracket_dim_count++] = (unsigned)-1;
 				continue;
 			}
 			ARENA_ENSURE_CAP(&ctx->main_arena, ctx->bracket_dim_ids,
@@ -6664,11 +6676,10 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		}
 
 		// Warn on unprocessed 'orelse' in unsupported context.
-		// Also fires inside enum bodies (in_enum_body() returns true):
-		// enum constant expressions must be compile-time constants, so orelse
-		// there is always invalid and must not silently leak to the backend.
-		if (__builtin_expect(FEAT(F_ORELSE) && is_orelse_keyword(tok) &&
-				     (!in_struct_body() || in_enum_body()), 0))
+		// Fires in all contexts: struct/union bodies, enum bodies, file scope,
+		// etc.  Valid orelse inside typeof() and bracket dimensions is already
+		// consumed by walk_balanced_orelse before reaching this point.
+		if (__builtin_expect(FEAT(F_ORELSE) && is_orelse_keyword(tok), 0))
 			error_tok(tok,
 				  "'orelse' cannot be used here (it must appear at the "
 				  "statement level in a declaration or bare expression)");
@@ -6845,6 +6856,8 @@ static PrismResult error_recovery_result(void) {
 			 .error_msg = strdup(ctx->error_msg[0] ? ctx->error_msg : "Unknown error"),
 			 .error_line = ctx->error_line,
 			 .error_col = ctx->error_col};
+	// IMPORTANT: fclose must precede free — POSIX open_memstream only
+	// updates active_membuf after fclose/fflush.  Swapping leaks the buffer.
 	if (out_fp) { fclose(out_fp); out_fp = NULL; }
 	if (ctx->active_membuf) { free(ctx->active_membuf); ctx->active_membuf = NULL; }
 	prism_reset();

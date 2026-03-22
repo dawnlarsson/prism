@@ -3249,6 +3249,29 @@ static void test_bracket_orelse_paren_wrapped(void) {
 	prism_free(&r2);
 }
 
+/* Bug: 'orelse' inside a struct/union member declaration (NOT in brackets or
+   typeof) leaks through all guards and is emitted raw to the backend compiler.
+   try_zero_init_decl returns NULL inside struct bodies, the bare-orelse handler
+   skips struct bodies, and the catch-all error exempts in_struct_body().
+   Expected: PRISM_OK == false (transpiler should reject this). */
+static void test_struct_member_orelse_leak(void) {
+	printf("\n--- Struct Member orelse Leak ---\n");
+	const char *code =
+	    "struct MyStruct {\n"
+	    "    int x orelse 0;\n"
+	    "};\n"
+	    "int main(void) { return 0; }\n";
+	PrismResult r = prism_transpile_source(code, "struct_member_orelse.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(!strstr(r.output, "orelse"),
+		      "struct-member-orelse: literal 'orelse' must not appear in output");
+	} else {
+		CHECK(r.status != PRISM_OK,
+		      "struct-member-orelse: correctly rejected");
+	}
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -3457,4 +3480,7 @@ void run_orelse_tests(void) {
 
         // Audit round 19: parenthesised orelse in array dimension leaks keyword
         test_bracket_orelse_paren_wrapped();
+
+	// Audit round 20: struct member orelse leak
+	test_struct_member_orelse_leak();
 }

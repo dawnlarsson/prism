@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3251 tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3252+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -480,9 +480,14 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 **Side-effect protection:** Bracket orelse in VLA/typeof contexts rejects expressions with side effects (`++`, `--`, `=`, volatile reads, function calls) to prevent double evaluation. Function-call detection recognizes both `ident(` and `)(`  (parenthesized call) patterns.
 
+**Constant dimension optimization:** When hoisting preceding bracket dimensions to preserve C99 left-to-right evaluation order, single numeric literal dimensions (e.g., `[5]`) are left in-place rather than hoisted to a temp variable — they have no side effects and cannot be reordered.
+
 **File-scope guard:** Bracket orelse at file scope (brace_depth == 0) is a hard error — hoisting a temp variable requires a statement context.
 
-**Invalid contexts:** Orelse inside struct/union bodies, enum bodies (compile-time constant context), typeof in struct/union bodies, ternary, for-init control parens — errored in Phase 1. The typeof-in-struct check runs during `p1_full_depth_prescan` using the scope tree's `is_struct` flag; the enum check uses `is_enum` on the scope tree, before any Pass 2 output is written.
+**Invalid contexts:** Detected at two stages:
+
+- **Phase 1 (early rejection):** Bracket orelse at file scope, orelse inside enum bodies (compile-time constant context), typeof-orelse inside struct/union bodies. The typeof-in-struct check runs during `p1_full_depth_prescan` using the scope tree's `is_struct` flag; the enum check uses `is_enum` on the scope tree.
+- **Pass 2 catch-all:** Any `orelse` token that survives to the main emit loop without being consumed by a handler (bracket, decl-init, bare, typeof, walk_balanced) is **unconditionally** rejected with a hard error. This catches orelse in struct/union member declarations, ternary contexts, for-init control parens, and any other unsupported position. No context exemptions — bracket/typeof orelse is fully consumed before reaching the catch-all, so it never fires on valid uses.
 
 **Feature flag:** `-fno-orelse` disables.
 
