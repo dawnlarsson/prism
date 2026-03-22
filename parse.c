@@ -1878,6 +1878,7 @@ void tokenizer_teardown(bool full) {
 		token_cap = 0;
 	} else {
 		arena_reset(&ctx->main_arena);
+		if (p1_ann) memset(p1_ann, 0, token_count * sizeof(uint8_t));
 		token_count = 1; // Reset pool index but keep allocation
 	}
 	ctx->input_files = NULL;

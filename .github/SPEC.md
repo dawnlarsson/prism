@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3182+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3190+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -63,7 +63,7 @@ Pass 1 is a series of phases executed sequentially. Each phase augments the data
 
 #### pass1_ann (parallel annotation array)
 
-A `uint8_t` array parallel to the token pool. Indexed by token pool index via the `tok_ann(tok)` macro. Allocated alongside the token pool (realloc'd in `token_pool_ensure`). Freed by `tokenizer_teardown(true)`.
+A `uint8_t` array parallel to the token pool. Indexed by token pool index via the `tok_ann(tok)` macro. Allocated alongside the token pool (realloc'd in `token_pool_ensure`). Freed by `tokenizer_teardown(true)`. Zeroed by `tokenizer_teardown(false)` (library-mode reuse) via `memset(p1_ann, 0, token_count)` before the pool index is reset — this prevents stale `|=`-applied flags (`P1_IS_DECL`, `P1_OE_BRACKET`, `P1_OE_DECL_INIT`) from leaking across consecutive `prism_transpile_*()` calls.
 
 Flag definitions:
 
@@ -268,6 +268,8 @@ For each function body, collects `P1FuncEntry` items into the global `p1_entries
 | `P1K_CASE` | scope_id, token_index, `switch_scope_id` |
 
 **Detection sites:** Labels and gotos are detected both at statement-start positions and inside braceless control flow (e.g., `if (c) goto L;`).
+
+**For-init / if-switch-init declarations:** `p1_scan_init_shadows` also allocates `P1K_DECL` entries for variables declared in C99 for-init clauses (`for (int i = 0; ...)`) and C23 if/switch initializers (`if (int x = f(); x > 0)`). The scope_id assigned to these entries is the **body scope** (the `{` following the `)` of the control statement), not the enclosing scope. This ensures the CFG verifier catches gotos that jump *into* the loop/if/switch body past the init declaration, while still allowing gotos that jump *over* the entire control statement (where the variable is no longer in scope). For braceless bodies (no `{`), no `P1K_DECL` entry is registered because there is no scope_id in the scope tree.
 
 **VLA tracking:** `is_vla` on `P1FuncEntry.decl` is set when either the base type is a VLA typedef (`type.is_vla`) or the declaration itself has variable-length array dimensions (`decl.is_vla`). This covers both `typedef int T[n]; T x;` and direct `int x[n];` forms. Jumping past a VLA is always dangerous regardless of `has_init` or `has_raw`, because it bypasses implicit stack allocation.
 
@@ -518,7 +520,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 **Syntax:** `raw <type> <name>;`
 
-**Semantics:** Opts out of zero-initialization for a specific variable. The `raw` keyword is stripped from the output. The resulting declaration is emitted without an initializer.
+**Semantics:** Opts out of zero-initialization for a specific variable. The `raw` keyword is stripped from the output. The resulting declaration is emitted without an initializer. Consecutive `raw` keywords (e.g. `raw raw int x;` from macro expansion) are handled gracefully: `is_raw_declaration_context()` recognizes `TF_RAW` as a valid successor, and each stripping site (`try_zero_init_decl`, `walk_balanced` stmt-start, file-scope loop) skips all consecutive `raw` tokens before the type.
 
 **Multi-declarator scope:** `raw` applies only to the **first** declarator in a comma-separated declaration. In `raw int x, y;`, only `x` opts out of zero-initialization; `y` is still zero-initialized. Both Phase 1D (`p1d_saw_raw` reset on `,`) and Pass 2 (`is_raw` reset on `,`) enforce this.
 
@@ -538,7 +540,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 ### 6.7 Statement expressions
 
-GNU statement expressions `({…})` are supported. They get their own scope in the scope tree (`is_stmt_expr = true`). Declarations and zero-initialization work correctly inside them. `walk_balanced` detects `({` patterns (including when called directly on a stmt-expr `(`) and processes inner blocks with `try_zero_init_decl` + raw stripping + orelse transformation.
+GNU statement expressions `({…})` are supported. They get their own scope in the scope tree (`is_stmt_expr = true`). Declarations and zero-initialization work correctly inside them. `walk_balanced` detects `({` patterns (including when called directly on a stmt-expr `(`) and processes inner blocks with full keyword dispatch (defer, goto, return/break/continue), `try_zero_init_decl`, raw stripping, and orelse transformation. The inner loop's `itag` variable uses `uint32_t` (matching `Token.tag`'s width) to avoid truncation of high-bit tags like `TT_DEFER` (1<<20), `TT_GOTO` (1<<17), and `TT_ORELSE` (1<<30). `walk_balanced_orelse` (used for array dimensions when `F_ORELSE` is enabled) also detects `({` patterns in its no-orelse emit path and routes them through `walk_balanced` for full transpilation.
 
 **Defer constraint:** A block containing `defer` must not be the last statement of the statement expression (the defer emission would overwrite the expression's return value). Prism detects this at `}` close time: if the parent scope is `is_stmt_expr` and the next non-noise token after `}` is `}` (the stmt-expr close), it emits a hard error pointing to the `defer` keyword.  The user must place the defer block before the final expression: `int fd = ({ int r; { defer cleanup(); r = work(); } r; });` or restructure without a statement expression.
 

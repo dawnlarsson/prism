@@ -3364,6 +3364,8 @@ void test_attributed_default_safety(void) {
 }
 
 void test_for_loop_goto_bypass(void) {
+	// goto into for-body past the init-clause bypasses the declaration of i.
+	// The init var has indeterminate value — same as goto past a block decl.
 	PrismResult result = prism_transpile_source(
 	    "int main(void) {\n"
 	    "    goto entry;\n"
@@ -3374,8 +3376,7 @@ void test_for_loop_goto_bypass(void) {
 	    "    return 0;\n"
 	    "}\n",
 	    "for_loop_goto_bypass.c", prism_defaults());
-	CHECK_EQ(result.status, PRISM_OK, "for loop goto into body transpiles");
-	CHECK(result.error_msg == NULL, "for loop goto into body has no error");
+	CHECK(result.status != PRISM_OK, "for loop goto into body: rejected (bypasses init)");
 	prism_free(&result);
 }
 

@@ -1424,7 +1424,8 @@ static Token *emit_expr_to_stop(Token *tok, Token *stop, bool check_orelse) {
 static bool is_raw_declaration_context(Token *after_raw) {
 	after_raw = skip_noise(after_raw);
 	return after_raw && (is_type_keyword(after_raw) || is_known_typedef(after_raw) ||
-			     match_ch(after_raw, '*') || (after_raw->tag & (TT_QUALIFIER | TT_SUE)));
+			     match_ch(after_raw, '*') || (after_raw->tag & (TT_QUALIFIER | TT_SUE)) ||
+			     ((after_raw->flags & TF_RAW) && !is_known_typedef(after_raw)));
 }
 
 // Count net scope exits (brace depths) between start and end.
@@ -2156,7 +2157,7 @@ static Token *walk_balanced(Token *tok, bool emit) {
 						continue;
 					}
 					// Control-flow keyword dispatch (defer cleanup)
-					uint16_t itag = inner->tag;
+					uint32_t itag = inner->tag;
 					if (itag) {
 						if (__builtin_expect(itag & TT_DEFER, 0) && !in_generic()) {
 							Token *next = handle_defer_keyword(inner);
@@ -2423,6 +2424,13 @@ static Token *walk_balanced_orelse(Token *tok) {
 		for (Token *t = tok; t != tok_next(end) && t->kind != TK_EOF;) {
 			if (t != tok && t != end && match_ch(t, '[') && (t->flags & TF_OPEN) && tok_match(t)) {
 				t = walk_balanced_orelse(t);
+				continue;
+			}
+			// GNU statement expression ({...}): route through walk_balanced which
+			// handles zero-init, defer, goto, raw stripping, etc.
+			if (t != tok && t != end && (t->flags & TF_OPEN) && match_ch(t, '(') &&
+			    tok_next(t) && match_ch(tok_next(t), '{')) {
+				t = walk_balanced(t, true);
 				continue;
 			}
 			// Nested typeof with potential orelse: route through orelse-aware walker
@@ -3264,7 +3272,13 @@ static Token *try_zero_init_decl(Token *tok) {
 		if (is_raw_declaration_context(after_raw)) {
 			is_raw = true;
 			raw_tok = tok;
-			start = tok_next(tok);
+			// Skip chain of consecutive raw keywords (raw raw raw ... type)
+			Token *last_raw = tok;
+			while (after_raw && (after_raw->flags & TF_RAW) && !is_known_typedef(after_raw)) {
+				last_raw = after_raw;
+				after_raw = skip_noise(tok_next(after_raw));
+			}
+			start = tok_next(last_raw);
 			tok = after_raw;
 			if (pragma_start == raw_tok) pragma_start = start;
 			warn_loc = after_raw;
@@ -3284,13 +3298,19 @@ static Token *try_zero_init_decl(Token *tok) {
 		if (probe && (probe->flags & TF_RAW) && !is_known_typedef(probe)) {
 			Token *after_raw = skip_noise(tok_next(probe));
 			if (is_raw_declaration_context(after_raw)) {
-				if (has_storage_in(pragma_start, probe)) {
-					emit_range(pragma_start, probe);
-					return emit_raw_verbatim_to_semicolon(after_raw);
+				// Skip chain of consecutive raw keywords
+				Token *last_raw = probe;
+				while (after_raw && (after_raw->flags & TF_RAW) && !is_known_typedef(after_raw)) {
+					last_raw = after_raw;
+					after_raw = skip_noise(tok_next(after_raw));
+				}
+				if (has_storage_in(pragma_start, last_raw)) {
+					emit_range(pragma_start, last_raw);
+					return emit_raw_verbatim_to_semicolon(tok_next(last_raw));
 				}
 				is_raw = true;
 				raw_tok = probe;
-				start = after_raw;
+				start = tok_next(last_raw);
 				tok = after_raw;
 			}
 		}
@@ -5208,15 +5228,23 @@ static Token *find_init_semicolon(Token *open, Token *close) {
 }
 
 // Scan for-init / if-switch-init declarations and register shadows.
+// body_sid: scope_id of the body following the control statement (for CFG
+// verifier P1K_DECL entries). 0 means don't register P1K_DECL (braceless body
+// or not inside a function).
 static void p1_scan_init_shadows(Token *open, Token *init_end,
-    uint32_t scope_close_idx, uint16_t cur_sid, int brace_depth)
+    uint32_t scope_close_idx, uint16_t cur_sid, int brace_depth,
+    uint16_t body_sid)
 {
 	Token *init_tok = tok_next(open);
-	if (init_tok && (init_tok->flags & TF_RAW) && !is_known_typedef(init_tok))
+	bool saw_raw = false;
+	if (init_tok && (init_tok->flags & TF_RAW) && !is_known_typedef(init_tok)) {
+		saw_raw = true;
 		init_tok = tok_next(init_tok);
+	}
 	if (!init_tok || !(init_tok->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT) ||
 	    is_known_typedef(init_tok)))
 		return;
+	bool saw_static = init_tok->tag & TT_STORAGE;
 	uint32_t saved_open = td_scope_open;
 	uint32_t saved_close = td_scope_close;
 	td_scope_open = tok_idx(open);
@@ -5231,6 +5259,17 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 			if (is_known_typedef(decl.var_name) ||
 			    (decl.var_name->tag & (TT_DEFER | TT_ORELSE)))
 				p1_register_shadow(decl.var_name, cur_sid, brace_depth);
+
+			// Phase 1D: register CFG entry for goto-skip-decl detection
+			if (body_sid > 0) {
+				bool has_init = match_ch(decl.end, '=');
+				P1FuncEntry *e = p1_alloc(P1K_DECL, body_sid, decl.var_name);
+				e->decl.has_init = has_init;
+				e->decl.is_vla = type.is_vla || decl.is_vla;
+				e->decl.has_raw = saw_raw;
+				e->decl.is_static_storage = saw_static || type.has_static || type.has_extern;
+			}
+
 			t = decl.end;
 			if (match_ch(t, '=')) {
 				t = tok_next(t);
@@ -5755,11 +5794,11 @@ uint16_t sid = next_scope_id++;
 				Token *for_close = tok_match(for_open);
 				// C99 §6.8.5p3: for-init scope extends to the entire loop body.
 				uint32_t body_end_idx = tok_idx(for_close);
+				Token *body_start_for = tok_next(for_close);
+				while (body_start_for && body_start_for->kind == TK_PREP_DIR)
+					body_start_for = tok_next(body_start_for);
 				{
-					Token *body_start = tok_next(for_close);
-					while (body_start && body_start->kind == TK_PREP_DIR)
-						body_start = tok_next(body_start);
-					Token *stmt_end = skip_one_stmt(body_start, 0);
+					Token *stmt_end = skip_one_stmt(body_start_for, 0);
 					if (stmt_end)
 						body_end_idx = tok_idx(stmt_end);
 				}
@@ -5767,7 +5806,18 @@ uint16_t sid = next_scope_id++;
 				if (for_init_end) {
 					uint16_t cur_sid = scope_depth_local < 4096 ?
 						scope_stack_local[scope_depth_local] : 0;
-					p1_scan_init_shadows(for_open, for_init_end, body_end_idx, cur_sid, brace_depth);
+					// Find body scope_id for braced bodies (Phase 1A already built scope_tree)
+					uint16_t body_sid = 0;
+					if (body_start_for && match_ch(body_start_for, '{')) {
+						uint32_t body_tok_idx = tok_idx(body_start_for);
+						for (uint16_t si = 1; si < scope_tree_count; si++) {
+							if (scope_tree[si].open_tok_idx == body_tok_idx) {
+								body_sid = si; break;
+							}
+						}
+					}
+					p1_scan_init_shadows(for_open, for_init_end, body_end_idx, cur_sid, brace_depth,
+							     body_sid);
 				}
 			}
 		}
@@ -5787,7 +5837,21 @@ uint16_t sid = next_scope_id++;
 				if (is_init_end) {
 					uint16_t cur_sid = scope_depth_local < 4096 ?
 						scope_stack_local[scope_depth_local] : 0;
-					p1_scan_init_shadows(is_open, is_init_end, tok_idx(is_close), cur_sid, brace_depth);
+					// Find body scope_id for braced bodies
+					uint16_t body_sid = 0;
+					Token *body_start_is = tok_next(is_close);
+					while (body_start_is && body_start_is->kind == TK_PREP_DIR)
+						body_start_is = tok_next(body_start_is);
+					if (body_start_is && match_ch(body_start_is, '{')) {
+						uint32_t body_tok_idx = tok_idx(body_start_is);
+						for (uint16_t si = 1; si < scope_tree_count; si++) {
+							if (scope_tree[si].open_tok_idx == body_tok_idx) {
+								body_sid = si; break;
+							}
+						}
+					}
+					p1_scan_init_shadows(is_open, is_init_end, tok_idx(is_close), cur_sid, brace_depth,
+							     body_sid);
 				}
 			}
 		}
@@ -6701,6 +6765,8 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			Token *after_raw = skip_noise(tok_next(tok));
 			if (is_raw_declaration_context(after_raw)) {
 				tok = tok_next(tok);
+				while (tok && (tok->flags & TF_RAW) && !is_known_typedef(tok))
+					tok = tok_next(tok);
 				continue;
 			}
 		}

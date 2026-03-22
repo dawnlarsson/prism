@@ -5450,6 +5450,139 @@ static void test_braceless_for_defer_shadow_leak(void) {
 	prism_free(&r);
 }
 
+static void test_walk_balanced_itag_truncation(void) {
+	/* BUG: walk_balanced stmt-expr inner loop stores inner->tag in uint16_t
+	 * itag. TT_DEFER=1<<20, TT_GOTO=1<<17, TT_ORELSE=1<<30 — all above
+	 * 16 bits. The truncation silently zeroes them, so keyword dispatch
+	 * never fires. defer/goto/orelse inside stmt-exprs in array dimensions
+	 * leak raw to the backend compiler. */
+	const char *code =
+	    "void cleanup(void);\n"
+	    "void f(void) {\n"
+	    "    int arr[ ({ int n = 0; { defer cleanup(); n = 5; } n; }) ];\n"
+	    "    (void)arr;\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	feat.orelse = false; /* isolate walk_balanced path */
+	PrismResult r = prism_transpile_source(code, "itag_trunc.c", feat);
+	bool has_raw_defer = (r.status == PRISM_OK && r.output &&
+	                      strstr(r.output, "defer"));
+	CHECK(!has_raw_defer,
+	      "walk-balanced-itag-truncation: defer must not leak raw inside "
+	      "stmt-expr in array dimension (uint16_t tag truncation)");
+	prism_free(&r);
+}
+
+static void test_walk_balanced_orelse_stmtexpr(void) {
+	/* BUG: walk_balanced_orelse (used when F_ORELSE is enabled) does not
+	 * detect or process GNU statement expressions ({...}) at all. Tokens
+	 * inside such expressions are emitted verbatim — zero-init, defer,
+	 * and raw stripping all fail. */
+	const char *code =
+	    "void f(void) {\n"
+	    "    int arr[ ({ int n; n = 5; n; }) ];\n"
+	    "    (void)arr;\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	/* orelse enabled (default) — exercises walk_balanced_orelse */
+	PrismResult r = prism_transpile_source(code, "oe_stmtexpr.c", feat);
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "n = 0") != NULL,
+		      "walk-balanced-orelse-stmtexpr: local var inside stmt-expr "
+		      "in array dim must be zero-initialized when orelse enabled");
+	} else {
+		CHECK(0, "walk-balanced-orelse-stmtexpr: transpile failed");
+	}
+	prism_free(&r);
+}
+
+static void test_goto_over_for_init_decl(void) {
+	/* BUG: p1_scan_init_shadows tags for-init declarations with P1_IS_DECL
+	 * but never calls p1_alloc(P1K_DECL, ...).  The CFG verifier does not
+	 * see them, so a goto that jumps over a for-init declaration into the
+	 * loop body is not rejected — the variable has stack garbage. */
+	const char *code =
+	    "void f(void) {\n"
+	    "    goto skip;\n"
+	    "    for (int i = 0; i < 10; i++) {\n"
+	    "        skip:\n"
+	    "        (void)i;\n"
+	    "    }\n"
+	    "}\n"
+	    "int main(void) { return 0; }\n";
+	PrismResult r = prism_transpile_source(code, "for_init_cfg.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "goto-over-for-init-decl: goto that jumps over for-init "
+	      "declaration into loop body must be rejected");
+	prism_free(&r);
+}
+
+static void test_p1_ann_dirty_state_leak(void) {
+	/* BUG: tokenizer_teardown(false) resets token_count but leaves p1_ann
+	 * untouched.  On the next transpile the |= operations (P1_IS_DECL,
+	 * P1_OE_BRACKET, P1_OE_DECL_INIT) OR into stale bits from the
+	 * previous file, causing ghost annotations on unrelated tokens. */
+	PrismFeatures f = prism_defaults();
+
+	/* File 1: has a local declaration — Phase 1 writes P1_IS_DECL */
+	const char *src1 =
+	    "void f(void) {\n"
+	    "    int x = 42;\n"
+	    "    (void)x;\n"
+	    "}\n";
+	PrismResult r1 = prism_transpile_source(src1, "dirty1.c", f);
+	CHECK_EQ(r1.status, PRISM_OK, "p1_ann-dirty: file1 transpiles OK");
+	prism_free(&r1);
+
+	prism_reset();
+
+	/* After prism_reset(), p1_ann should be zeroed for all previously-used
+	 * slots.  The token pool was reused (token_count reset to 1, token_cap
+	 * and p1_ann allocation preserved).  Check that no stale bytes remain
+	 * in the range that file1 occupied. */
+	int stale = 0;
+	for (uint32_t i = 1; i < 50 && i < token_cap; i++) {
+		if (p1_ann[i]) stale++;
+	}
+	CHECK(stale == 0,
+	      "p1_ann-dirty: p1_ann must be clean after prism_reset() "
+	      "(found stale annotations in reusable slots)");
+	prism_reset();
+}
+
+static void test_raw_raw_double_qualifier(void) {
+	/* BUG: `raw raw int x;` — is_raw_declaration_context sees the second
+	 * `raw` as an unknown identifier (not a type keyword), returns false,
+	 * and the first `raw` is emitted verbatim into the C output. */
+	PrismFeatures f = prism_defaults();
+
+	/* Inside function body (walk_balanced stmt-start path) */
+	const char *src1 = "void f(void) { raw raw int x = 1; (void)x; }\n";
+	PrismResult r1 = prism_transpile_source(src1, "dblraw_body.c", f);
+	CHECK_EQ(r1.status, PRISM_OK, "raw-raw: body transpile OK");
+	if (r1.output) {
+		/* Look for "raw" as a standalone token in the code, not in
+		 * #line directive filenames.  Check the actual decl line. */
+		CHECK(strstr(r1.output, "raw int") == NULL &&
+		      strstr(r1.output, "raw raw") == NULL,
+		      "raw-raw: 'raw' keyword must not leak into C output (body)");
+	}
+	prism_free(&r1);
+	prism_reset();
+
+	/* At file scope */
+	const char *src2 = "raw raw int g = 5;\n";
+	PrismResult r2 = prism_transpile_source(src2, "dblraw_file.c", f);
+	CHECK_EQ(r2.status, PRISM_OK, "raw-raw: file-scope transpile OK");
+	if (r2.output) {
+		CHECK(strstr(r2.output, "raw int") == NULL &&
+		      strstr(r2.output, "raw raw") == NULL,
+		      "raw-raw: 'raw' keyword must not leak into C output (file scope)");
+	}
+	prism_free(&r2);
+	prism_reset();
+}
+
 void run_api_tests(void) {
 test_typeof_orelse_leak();
 	printf("\n=== API TESTS ===\n");
@@ -5619,4 +5752,13 @@ test_typeof_orelse_leak();
 
 	// Audit round 20 bug probes
 	test_braceless_for_defer_shadow_leak();
+
+	// Audit round 21 bug probes
+	test_walk_balanced_itag_truncation();
+	test_walk_balanced_orelse_stmtexpr();
+	test_goto_over_for_init_decl();
+
+	// Audit round 22 bug probes
+	test_p1_ann_dirty_state_leak();
+	test_raw_raw_double_qualifier();
 }
