@@ -3831,6 +3831,11 @@ static Token *handle_goto_keyword(Token *tok) {
 
 static void handle_case_default(Token *tok) {
 	if (!FEAT(F_DEFER)) return;
+	// Braceless switch: ctrl_state.pending is still active, meaning no
+	// SCOPE_BLOCK was pushed for this switch.  find_switch_scope() would
+	// leak through to an enclosing braced switch and corrupt its defer
+	// stack.  Braceless bodies can't contain defers, so just bail out.
+	if (ctrl_state.pending && ctrl_state.parens_just_closed) return;
 	int sd = find_switch_scope();
 	if (sd < 0) return;
 	bool is_case = tok->tag & TT_CASE;
@@ -6133,12 +6138,17 @@ static void p1_verify_cfg(void) {
 		// into any label, bypassing defers or zeroinit.  If the function
 		// contains both a computed goto and any defers or zeroinit-tracked
 		// declarations, reject it up front.
-		if (fm->has_computed_goto && FEAT(F_DEFER)) {
+		if (fm->has_computed_goto && FEAT(F_DEFER | F_ZEROINIT)) {
 			P1FuncEntry *ents = &p1_entries[fm->entry_start];
 			for (int i = 0; i < fm->entry_count; i++) {
-				if (ents[i].kind == P1K_DEFER)
+				if (ents[i].kind == P1K_DEFER && FEAT(F_DEFER))
 					error_tok(fm->body_open, "computed goto cannot be used in a "
 						  "function that contains defer statements — the "
+						  "jump target cannot be verified at compile time");
+				if (ents[i].kind == P1K_DECL && FEAT(F_ZEROINIT) &&
+				    !ents[i].decl.has_raw && !ents[i].decl.is_static_storage)
+					error_tok(fm->body_open, "computed goto cannot be used in a "
+						  "function that contains zero-initialized declarations — the "
 						  "jump target cannot be verified at compile time");
 			}
 		}

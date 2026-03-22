@@ -2450,6 +2450,34 @@ static void test_braceless_switch_defer_false_positive(void) {
 	prism_free(&r);
 }
 
+// BUG: braceless inner switch's case label triggers handle_case_default
+// which calls find_switch_scope → finds enclosing BRACED switch (the only
+// one with a SCOPE_BLOCK), and incorrectly resets the defer stack for that
+// outer switch, silently dropping defers registered between the outer case
+// and the braceless inner switch.
+static void test_braceless_switch_defer_drop(void) {
+	PrismResult r = prism_transpile_source(
+	    "void cleanup(void);\n"
+	    "void f(int x, int y) {\n"
+	    "    switch (x) {\n"
+	    "        case 1:\n"
+	    "            {\n"
+	    "                defer cleanup();\n"
+	    "                switch (y) case 2: y++;\n"
+	    "            }\n"
+	    "            break;\n"
+	    "        case 3:\n"
+	    "            break;\n"
+	    "    }\n"
+	    "}\n",
+	    "braceless_switch_defer_drop.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "braceless-switch-defer-drop: transpiles OK");
+	CHECK(r.output && strstr(r.output, "cleanup()") != NULL,
+	      "braceless-switch-defer-drop: defer cleanup() not silently dropped");
+	prism_free(&r);
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -2606,4 +2634,7 @@ void run_defer_tests(void) {
 
 	// Audit round 12: braceless switch false positive
 	test_braceless_switch_defer_false_positive();
+
+	// Audit round 13: braceless switch inside braced switch drops defers
+	test_braceless_switch_defer_drop();
 }

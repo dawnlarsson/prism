@@ -2107,6 +2107,30 @@ void test_gnu_thread_storage_class(void) {
 }
 #endif
 
+// BUG: computed goto + zeroinit declarations bypasses initialization.
+// The CFG verifier only checked computed_goto + F_DEFER, not F_ZEROINIT.
+// A computed goto can jump past `int x = 0;` leaving x with stack garbage.
+static void test_computed_goto_zeroinit_bypass(void) {
+	PrismResult r = prism_transpile_source(
+	    "void f(int choice) {\n"
+	    "    void *table[] = {&&a, &&b};\n"
+	    "    goto *table[choice];\n"
+	    "a:;\n"
+	    "    int x;\n"
+	    "    x = 42;\n"
+	    "    return;\n"
+	    "b:\n"
+	    "    return;\n"
+	    "}\n",
+	    "computed_goto_zeroinit.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "computed-goto-zeroinit: must reject (bypass zero-init)");
+	if (r.status != PRISM_OK && r.error_msg)
+		CHECK(strstr(r.error_msg, "computed goto") != NULL,
+		      "computed-goto-zeroinit: error mentions computed goto");
+	prism_free(&r);
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -2213,4 +2237,5 @@ void run_zeroinit_tests(void) {
 #ifdef __GNUC__
 	test_gnu_thread_storage_class();
 #endif
+	test_computed_goto_zeroinit_bypass();
 }

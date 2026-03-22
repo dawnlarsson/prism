@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3252+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3182+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -335,7 +335,7 @@ Walks all tokens looking for `[…]` pairs containing `orelse`. Marks them with 
 
 **Function:** `p1_verify_cfg`
 
-Runs after all Phase 1 sub-phases complete. For each function's `P1FuncEntry[]` array, performs an O(N) linear sweep with label hash table and monotonic watermark arrays.
+Runs after all Phase 1 sub-phases complete. Gated by `F_DEFER | F_ZEROINIT` — skipped entirely when neither feature is enabled. For each function's `P1FuncEntry[]` array, performs an O(N) linear sweep with label hash table and monotonic watermark arrays.
 
 ### Algorithm
 
@@ -389,7 +389,7 @@ Tokens with tag bits or at statement boundaries are dispatched to handlers:
 | Handler | Trigger | Action |
 |---|---|---|
 | `handle_goto_keyword` | `TT_GOTO` | Emit defer cleanup (LIFO unwinding to target label depth), emit `goto`. Safety checks are in Phase 2A. |
-| `handle_case_default` | `TT_CASE` / `TT_DEFAULT` | Reset defer stack to switch scope level. Error checks are in Phase 2A. |
+| `handle_case_default` | `TT_CASE` / `TT_DEFAULT` | Bail out early if `ctrl_state.pending && parens_just_closed` (braceless switch body — no `SCOPE_BLOCK` was pushed, so `find_switch_scope()` would leak to an enclosing braced switch). Otherwise, reset defer stack to switch scope level. Error checks are in Phase 2A. |
 | `handle_open_brace` | `{` | Push scope. Read `P1_SCOPE_*` from `pass1_ann` for classification. Handle compound-literal-in-ctrl-paren, orelse guard, stmt_expr detection. |
 | `handle_close_brace` | `}` | Pop scopes, emit defers (LIFO), handle orelse guard close (consume trailing `;` to prevent dangling-else). |
 | `try_zero_init_decl` | Statement start, type keyword/typedef | Parse declaration, insert `= {0}` or `= 0` or `memset` call. |
@@ -447,7 +447,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 - Functions using inline `asm` — error
 - `return`, `goto` inside defer body — error
 - `break`, `continue` inside defer body — error (defer body is not a loop/switch context)
-- Computed goto (`goto *ptr`) with active defers — error
+- Computed goto (`goto *ptr`) with active defers or zero-initialized declarations — error
 - `defer` at the top level of a GNU statement expression — error (use a nested block)
 - A block containing `defer` as the **last statement** of a GNU statement expression — error. `handle_close_brace` emits defers after the last expression, overwriting the expression's return value (void defers → compile error; non-void defers → silent wrong-value assignment). Without an expression parser there is no safe transformation; the user must place the defer block before the final expression rather than as the last statement.
 
@@ -530,7 +530,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 ### 6.5 Computed goto
 
-`goto *<expr>` is supported. `FuncMeta.has_computed_goto` is set during Phase 1D when `goto *` is detected. During Phase 2A (`p1_verify_cfg`), if a function contains both a computed goto and any `P1K_DEFER` entries, a hard error is raised (defer cleanup cannot be determined for an indirect jump target).
+`goto *<expr>` is supported. `FuncMeta.has_computed_goto` is set during Phase 1D when `goto *` is detected. During Phase 2A (`p1_verify_cfg`), if a function contains both a computed goto and either (a) any `P1K_DEFER` entries (when `F_DEFER` is enabled) or (b) any non-`raw`, non-static-storage `P1K_DECL` entries (when `F_ZEROINIT` is enabled), a hard error is raised — the jump target cannot be verified at compile time, so defer cleanup or zero-initialization could be bypassed.
 
 ### 6.6 _Generic
 
