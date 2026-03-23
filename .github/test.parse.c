@@ -378,6 +378,19 @@ void test_bitfield_zeroinit(void) {
 
 	CHECK(bool_bits.flag1 == 0 && bool_bits.flag2 == 0 && bool_bits.count == 0,
 	      "_Bool bitfield zero-init");
+
+	// Anonymous bitfield using a typedef name as the type specifier.
+	// Prism must NOT shadow the typedef when it's the type in an anon bitfield.
+	typedef unsigned int bf_u32;
+	typedef struct {
+		bf_u32 : 5;        // anon bitfield — bf_u32 is the TYPE, not field name
+		bf_u32 flag : 1;   // named bitfield — bf_u32 must still be recognized as type
+		bf_u32 value : 26;
+	} bf_hw_reg_t;
+	bf_hw_reg_t bfr;
+	bf_u32 bfx;
+	CHECK(bfr.flag == 0 && bfr.value == 0 && bfx == 0,
+	      "anon bitfield typedef type not poisoned");
 }
 
 void test_anonymous_struct(void) {

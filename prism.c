@@ -368,6 +368,9 @@ static void signal_temps_register(const char *path) {
 }
 
 static void signal_temps_clear(void) {
+	sig_atomic_t n = signal_temps_load();
+	for (int i = 0; i < n; i++)
+		signal_temps[i][0] = '\0';
 	signal_temps_store(0);
 }
 
@@ -2077,21 +2080,29 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 				// or references to known VLA variables.
 				// Only treat '[' as an array dimension if it follows a type keyword,
 				// typedef, pointer, or another ']' — not an expression like arr[x].
-				// Track paren depth: if depth > 1, we're inside a nested (...)
-				// such as a function pointer parameter list, so ignore VLAs there.
-				int typeof_paren_depth = 1;
+				// Check at all paren depths: parenthesized types like
+				// typeof((int[n])) must still detect the VLA.
+				// Skip function-pointer parameter lists: '(' preceded by ')'
+				// starts a fn param list where [n] describes the parameter,
+				// not the outer type (e.g. typeof(void(*)(int[n]))).
 				Token *prev = tok; // '(' itself
+				int fn_skip = 0;
 				for (Token *t = tok_next(tok); t && t != end; prev = t, t = tok_next(t)) {
-					if (match_ch(t, '(')) typeof_paren_depth++;
-					else if (match_ch(t, ')')) typeof_paren_depth--;
-					if (typeof_paren_depth == 1 && match_ch(t, '[') &&
+					if (match_ch(t, '(')) {
+						if (fn_skip > 0) fn_skip++;
+						else if (match_ch(prev, ')')) fn_skip = 1;
+					} else if (match_ch(t, ')')) {
+						if (fn_skip > 0) fn_skip--;
+					}
+					if (fn_skip > 0) continue;
+					if (match_ch(t, '[') &&
 					    (is_type_keyword(prev) || is_known_typedef(prev) ||
 					     match_ch(prev, ']') || match_ch(prev, '*')) &&
 					    array_size_is_vla(t)) {
 						r.is_vla = true;
 						break;
 					}
-					if (typeof_paren_depth == 1 && is_identifier_like(t) && (typedef_flags(t) & TDF_VLA)) {
+					if (is_identifier_like(t) && (typedef_flags(t) & TDF_VLA)) {
 						r.is_vla = true;
 						break;
 					}
@@ -5791,6 +5802,23 @@ uint16_t sid = next_scope_id++;
 							if (nxt && (match_ch(nxt, ';') || match_ch(nxt, ',') ||
 							    match_ch(nxt, ':') || match_ch(nxt, '[') ||
 							    match_ch(nxt, '='))) {
+								// Anonymous bitfield: T : width — m is the type, not a field name.
+								// Only shadow if a type specifier precedes m in this member.
+								if (match_ch(nxt, ':')) {
+									bool has_type = false;
+									for (uint32_t pi = tok_idx(m); pi > tok_idx(tok); pi--) {
+										Token *pt = &token_pool[pi - 1];
+										if (pt->kind == TK_PREP_DIR) continue;
+										if (match_ch(pt, ';') || match_ch(pt, ',') || match_ch(pt, '{') || match_ch(pt, '}'))
+											break;
+										if (pt->tag & TT_QUALIFIER) continue;
+										if (match_ch(pt, ')') && tok_match(pt)) { pi = tok_idx(tok_match(pt)) + 1; continue; }
+										if (match_ch(pt, ']') && tok_match(pt)) { pi = tok_idx(tok_match(pt)) + 1; continue; }
+										has_type = true;
+										break;
+									}
+									if (!has_type) { m = tok_next(m); continue; }
+								}
 								TYPEDEF_ADD_IDX(typedef_add_shadow(tok_loc(m), m->len, brace_depth + 1), m);
 							}
 						}
@@ -8069,7 +8097,8 @@ static void signal_cleanup_handler(int sig) {
 		unlink(signal_temp_path);
 	int n = signal_temps_load();
 	for (int i = 0; i < n; i++)
-		unlink(signal_temps[i]);
+		if (signal_temps[i][0] != '\0')
+			unlink(signal_temps[i]);
 	signal(sig, SIG_DFL);
 	raise(sig);
 }

@@ -3077,6 +3077,28 @@ static void test_vla_skip_hard_error_with_fno_safety(void) {
 	prism_free(&r);
 }
 
+// Bug: typeof((int[n])) — inner parens push typeof_paren_depth to 2,
+// blinding the VLA-in-typeof detection in parse_type_specifier.
+// Result: goto-over-typeof-VLA is downgraded from hard error to warning
+// under -fno-safety because the P1K_DECL entry lacks is_vla=true.
+static void test_typeof_paren_vla_skip_hard_error(void) {
+	printf("\n--- typeof Paren VLA Skip Hard Error ---\n");
+
+	const char *code =
+	    "void f(int n) {\n"
+	    "    goto skip;\n"
+	    "    typeof((int[n])) arr;\n"
+	    "    skip: (void)0;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	feat.warn_safety = true;
+	PrismResult r = prism_transpile_source(code, "typeof_vla_paren.c", feat);
+	CHECK(r.status != PRISM_OK,
+	      "typeof((int[n])) VLA skip must be hard error with -fno-safety");
+	prism_free(&r);
+}
+
 // Bug: Phase 1C backward walk from '{' to find parameter list '(...)' does not
 // skip GNU __attribute__((...)) between ')' and '{'. If a parameter shadows a
 // typedef, the shadow is not registered and the typedef name is parsed as a type
@@ -3248,6 +3270,24 @@ static void test_raw_raw_vla_forinit_cfg_blind(void) {
 	CHECK(r.status != PRISM_OK,
 	      "raw raw VLA for-init: goto into body must be caught (VLA skip)");
 	prism_free(&r);
+}
+
+// Bug: signal_temps_clear() only resets the counter but doesn't zero the path
+// buffers.  If a SIGINT arrives in the race window between CAS (counter++) and
+// memcpy (path write), the signal handler would unlink stale paths from a
+// previous compilation cycle.
+static void test_signal_temps_clear_zeroes_paths(void) {
+	signal_temps_register("/tmp/prism_test_signal_race_dummy");
+	int n = signal_temps_load();
+	CHECK(n >= 1, "signal_temps_register incremented counter");
+	CHECK(signal_temps[n - 1][0] != '\0', "signal_temps entry written");
+
+	signal_temps_clear();
+	CHECK(signal_temps_load() == 0, "signal_temps_clear reset counter");
+	// The path buffer MUST be zeroed so the signal handler won't unlink
+	// stale entries during the TOCTOU race window.
+	CHECK(signal_temps[n - 1][0] == '\0',
+	      "signal_temps_clear zeroes path buffers (TOCTOU fix)");
 }
 
 void run_safe_tests(void) {
@@ -3490,6 +3530,7 @@ void run_safe_tests(void) {
 	test_raw_comma_desync_goto_bypass();
 	test_fixed_array_not_vla_with_raw();
 	test_vla_skip_hard_error_with_fno_safety();
+	test_typeof_paren_vla_skip_hard_error();
 	test_goto_over_native_init();
 	test_switch_case_over_native_init();
 	test_goto_over_raw_native_init();
@@ -3502,4 +3543,7 @@ void run_safe_tests(void) {
 
 	// Audit round 25: braceless for-init CFG bypass
 	test_braceless_forinit_cfg_bypass();
+
+	// Audit round 26: signal cleanup TOCTOU race
+	test_signal_temps_clear_zeroes_paths();
 }
