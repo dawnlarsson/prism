@@ -6555,7 +6555,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			if (FEAT(F_ORELSE) && ctx->block_depth > 0 && !in_struct_body() &&
 			    !(tok->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO |
 					  TT_CASE | TT_DEFAULT | TT_IF | TT_LOOP | TT_SWITCH |
-					  TT_STORAGE | TT_TYPEDEF))) {
+					  TT_STORAGE | TT_TYPEDEF | TT_DEFER))) {
 				// Skip past label if current token is ident followed by ':'
 				Token *orelse_scan_start = tok;
 				Token *label_end = NULL;
@@ -8060,7 +8060,7 @@ int main(int argc, char **argv) {
 	Cli cli = cli_parse(argc, argv);
 
 	// Handle help/version actions (cli_parse sets these without side effects)
-	if (cli.action == CLI_ACT_HELP) { print_help(); return 0; }
+	if (cli.action == CLI_ACT_HELP) { print_help(); cli_free(&cli); return 0; }
 	if (cli.action == CLI_ACT_VERSION) {
 		const char *real_cc = get_real_cc(cli.cc);
 		char cc_line[256];
@@ -8069,6 +8069,7 @@ int main(int argc, char **argv) {
 			printf("prism %s (%s)\n", PRISM_VERSION, cc_line);
 		else
 			printf("prism %s\n", PRISM_VERSION);
+		cli_free(&cli);
 		return 0;
 	}
 
@@ -8109,6 +8110,7 @@ int main(int argc, char **argv) {
 	else
 		status = compile_sources(&cli);
 
+	cli_free(&cli);
 	return status;
 }
 

@@ -3327,6 +3327,80 @@ static void test_bare_orelse_comma_lhs_depth0_double_eval(void) {
 	prism_free(&r);
 }
 
+/*
+ * BUG5: defer body side-effects bleed into orelse side-effect checker.
+ *
+ * When `defer { result += 1000; }` appears BEFORE `int v = get() orelse 10;`
+ * in the same scope, the orelse checker sees the `+=` from the defer body and
+ * falsely rejects with "side effect in the target expression (double
+ * evaluation)".  The defer body executes at scope exit, NOT at the orelse
+ * expression site — its side-effects are irrelevant to double-eval analysis.
+ *
+ * Swapping the order (orelse before defer) works, proving the checker is
+ * scanning tokens from earlier in the scope that belong to defer bodies.
+ */
+static void test_defer_before_orelse_same_scope_false_reject(void) {
+	/* Case 1: defer { x += N; } before orelse — hard reject (exit 1) */
+	{
+		const char *src =
+		    "int get(void);\n"
+		    "void fn(void) {\n"
+		    "    unsigned result = 0;\n"
+		    "    {\n"
+		    "        defer { result += 1000; }\n"
+		    "        int v = get() orelse 10;\n"
+		    "        result += (unsigned)v;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(src, "defer_before_orelse.c",
+						       prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "BUG5: defer { x += N; } before orelse in same scope must "
+		      "not be rejected (defer body side-effects are not orelse "
+		      "double-eval candidates)");
+		prism_free(&r);
+	}
+	/* Case 2: defer { fn(); } before orelse — false warning */
+	{
+		const char *src =
+		    "int get(void);\n"
+		    "void cleanup(void);\n"
+		    "void fn(void) {\n"
+		    "    unsigned result = 0;\n"
+		    "    {\n"
+		    "        defer { cleanup(); }\n"
+		    "        int v = get() orelse 10;\n"
+		    "        result += (unsigned)v;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(src, "defer_fn_before_orelse.c",
+						       prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "BUG5b: defer { fn(); } before orelse in same scope must "
+		      "not be rejected (defer body function calls are not orelse "
+		      "double-eval candidates)");
+		prism_free(&r);
+	}
+	/* Case 3: sanity — same code with orelse BEFORE defer MUST work */
+	{
+		const char *src =
+		    "int get(void);\n"
+		    "void fn(void) {\n"
+		    "    unsigned result = 0;\n"
+		    "    {\n"
+		    "        int v = get() orelse 10;\n"
+		    "        result += (unsigned)v;\n"
+		    "        defer { result += 1000; }\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(src, "orelse_before_defer.c",
+						       prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "BUG5-sanity: orelse before defer in same scope must work");
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -3543,4 +3617,7 @@ void run_orelse_tests(void) {
 	// and bare-orelse comma-LHS depth-0 double-eval (BUG4) — should FAIL until fixed
 	test_decl_init_orelse_fno_zeroinit_wrong_transform();
 	test_bare_orelse_comma_lhs_depth0_double_eval();
+
+	// Audit round 22: defer-before-orelse false rejection (BUG5)
+	test_defer_before_orelse_same_scope_false_reject();
 }

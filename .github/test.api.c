@@ -5658,6 +5658,55 @@ static void test_raw_raw_double_qualifier(void) {
 	prism_reset();
 }
 
+#ifndef _WIN32
+static void test_cli_main_leak_asan(void) {
+	printf("\n--- CLI Main Leak (ASan/LSan) ---\n");
+
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_clileak_");
+	CHECK(dir != NULL, "create temp dir for cli_free leak test");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX];
+	char src_file[PATH_MAX];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism_leak", dir);
+	snprintf(src_file, sizeof(src_file), "%s/trivial.c", dir);
+
+	/* Trivial source file — just needs to trigger CLI_PUSH in cli_parse */
+	FILE *f = fopen(src_file, "w");
+	CHECK(f != NULL, "create trivial source for cli_free leak test");
+	if (!f) { rmdir(dir); return; }
+	fputs("int main(void){return 0;}\n", f);
+	fclose(f);
+
+	/* Build prism with ASan+LSan — skip if compiler lacks support */
+	const char *cc = getenv("CC");
+	if (!shell_word_ok(cc)) cc = "cc";
+	char *build_argv[] = {(char *)cc, "prism.c", "-O1", "-g",
+		"-fsanitize=address,leak", "-fno-omit-frame-pointer",
+		"-o", prism_bin, NULL};
+	int status = run_exec_argv(build_argv);
+	if (status != 0) {
+		printf("[SKIP] ASan+LSan build unavailable\n");
+		passed++; total++;
+		remove(src_file);
+		rmdir(dir);
+		return;
+	}
+
+	/* prism transpile <file>: exercises the CLI_PUSH → sources allocation
+	   path.  If main() forgets cli_free, LSan reports a leak (exit 23). */
+	char *run_argv[] = {prism_bin, "transpile", src_file, NULL};
+	status = run_exec_argv(run_argv);
+	CHECK_EQ(status, 0,
+		 "cli_free leak: ASan+LSan prism transpile must exit 0 (no leaks)");
+
+	remove(prism_bin);
+	remove(src_file);
+	rmdir(dir);
+}
+#endif
+
 void run_api_tests(void) {
 test_typeof_orelse_leak();
 	printf("\n=== API TESTS ===\n");
@@ -5837,4 +5886,9 @@ test_typeof_orelse_leak();
 	// Audit round 22 bug probes
 	test_p1_ann_dirty_state_leak();
 	test_raw_raw_double_qualifier();
+
+	// Audit round 23 bug probes
+#ifndef _WIN32
+	test_cli_main_leak_asan();
+#endif
 }
