@@ -6975,6 +6975,87 @@ static void test_knr_param_typedef_shadow_bypass_zeroinit(void) {
         prism_free(&r);
 }
 
+// Audit round 17: skip_one_stmt label-fallthrough for-init shadow bleed
+//
+// BUG: skip_one_stmt() has no handler for case/default/ident labels.  When the
+// function is called on a braceless switch body that begins with a label, it
+// falls through to the "simple statement" scanner.  That scanner ignores the
+// braced compound attached to the label (its depth counter goes 1→0 at the
+// closing '}') and then keeps scanning at pd==0, returning the FIRST ';' it
+// finds after the braced body — which is outside the switch entirely.
+//
+// Consequence for for-init shadows:
+//   for (int T = 0; ...) switch(x) case 0: { ; }
+//                                           ^^^^^
+//   skip_one_stmt called on 'case' returns ';' of next line PAST the loop,
+//   so td_scope_close for the shadow of 'T' is set too far.  Any declaration
+//   with the same name as the typedef T that appears after the loop but before
+//   that far semicolon is still inside the shadow — is_known_typedef(T) returns
+//   false — zeroinit is silently dropped.
+static void test_skip_one_stmt_case_braced_for_init_shadow_bleed(void) {
+	/* 'align_t' is a typedef.  Inside the for-loop header, a new variable
+	   also named 'align_t' shadows the typedef.  That shadow must expire at
+	   the end of the for-loop body ('}'of case body).  After the loop,
+	   'align_t result;' must be treated as a typedef-named declaration and
+	   receive zeroinit (= {0}).
+	   With the bug the shadow extends to the ';' of 'align_t result;' itself,
+	   suppressing the typedef look-up and dropping zeroinit. */
+	const char *code =
+	    "typedef int align_t;\n"
+	    "void fn(int x) {\n"
+	    "    for (int align_t = 0; align_t < x; align_t++)\n"
+	    "        switch (align_t)\n"
+	    "            case 0: { ; }\n"
+	    "    align_t result;\n"
+	    "    (void)result;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "skip_one_stmt_case_shadow.c",
+	                                       prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "skip_one_stmt-case-shadow-bleed: transpiles without error");
+	/* Shadow must have expired: 'align_t result' gets zeroinit.
+	   This CHECK FAILS until skip_one_stmt handles case/default labels. */
+	const char *decl_pos = r.output ? strstr(r.output, "align_t result") : NULL;
+	bool zeroinit = decl_pos != NULL &&
+	                (strstr(decl_pos, "= {0}") != NULL ||
+	                 strstr(decl_pos, "= 0;") != NULL);
+	CHECK(zeroinit,
+	      "BUG (audit-17): skip_one_stmt case-label shadow bleed — "
+	      "'align_t result' after for-loop MUST get zeroinit (= {0}); "
+	      "shadow wrongly extends past loop body into the declaration");
+	prism_free(&r);
+}
+
+// Same bug via 'default: { }' — skip_one_stmt returns NULL (no ';' at pd==0
+// after the closing '}' if the switch is the last for-body statement), giving
+// p1d_switch_end = UINT32_MAX.  The braceless switch is never popped from
+// Phase 1D's stack; the for-init shadow extends for the rest of the function.
+static void test_skip_one_stmt_default_braced_for_init_shadow_bleed(void) {
+	const char *code =
+	    "typedef int elem_t;\n"
+	    "void fn(int n) {\n"
+	    "    for (int elem_t = 0; elem_t < n; elem_t++)\n"
+	    "        switch (elem_t)\n"
+	    "            default: { ; }\n"
+	    "    elem_t out;\n"
+	    "    (void)out;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "skip_one_stmt_default_shadow.c",
+	                                       prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "skip_one_stmt-default-shadow-bleed: transpiles without error");
+	const char *decl_pos = r.output ? strstr(r.output, "elem_t out") : NULL;
+	bool zeroinit = decl_pos != NULL &&
+	                (strstr(decl_pos, "= {0}") != NULL ||
+	                 strstr(decl_pos, "= 0;") != NULL);
+	CHECK(zeroinit,
+	      "BUG (audit-17): skip_one_stmt default-label shadow bleed — "
+	      "'elem_t out' after for-loop MUST get zeroinit (= {0}); "
+	      "default: { } braceless body gives p1d_switch_end=UINT32_MAX, "
+	      "shadow bleeds for remainder of function");
+	prism_free(&r);
+}
+
 void run_parse_tests(void) {
 	printf("\n=== PARSE TESTS ===\n");
 
@@ -7473,4 +7554,8 @@ void run_parse_tests(void) {
 
         // Audit round 15: K&R param typedef shadow bypass mis-zeroinit
         test_knr_param_typedef_shadow_bypass_zeroinit();
+
+	// Audit round 17: skip_one_stmt label-fallthrough for-init shadow bleed
+	test_skip_one_stmt_case_braced_for_init_shadow_bleed();
+	test_skip_one_stmt_default_braced_for_init_shadow_bleed();
 }

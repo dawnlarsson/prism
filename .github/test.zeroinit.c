@@ -2131,6 +2131,65 @@ static void test_computed_goto_zeroinit_bypass(void) {
 	prism_free(&r);
 }
 
+// Audit round 21: BUG5 — C23 if/switch init-statement shadow scope expires
+// too early.  p1_scan_init_shadows is called with scope_close_idx =
+// tok_idx(is_close) — the position of the ')' that closes the init-statement
+// paren.  This means the shadow only covers tokens up to and including ')';
+// everything inside the if-body has a token index AFTER that position, so the
+// shadow is invisible there.
+//
+// Contrast with the for-loop init path which calls skip_one_stmt(body_start)
+// to extend scope_close_idx past the entire loop body.
+//
+// Symptom: if a C23 if-init variable shadows a typedef name in the outer scope,
+// the shadow does NOT suppress the typedef inside the if-body.  Declarations
+// that use the typedef name inside the body are incorrectly processed by
+// try_zero_init_decl, applying zeroinit to 'T x;' when T should be opaque
+// (it is a variable in scope, not a type — any 'T x;' in the body is a
+// C language error that Prism should preserve verbatim, not silently zeroinit).
+//
+//   typedef int T;
+//   void fn(int c) { if (int T = 0; c) { T x; } }
+//
+// BUG: emits 'T x = {0}' (zeroinit applied despite shadow)
+// CORRECT: shadow suppresses the typedef → Prism sees 'T x;' as a non-decl
+//          and emits it verbatim (downstream C compiler will reject it as expected)
+static void test_c23_if_init_shadow_underscopes_body(void) {
+	const char *src =
+	    "typedef int T;\n"
+	    "void fn(int c) { if (int T = 0; c) { T x; (void)x; } }\n";
+	PrismResult r = prism_transpile_source(src, "c23_if_init_shadow.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "BUG5: c23-if-init-shadow: transpiles OK");
+	if (r.output) {
+		/* BUG: shadow expires at ')' so T is still a typedef inside the body.
+		 * try_zero_init_decl fires on 'T x' and emits 'T x = ...' (zeroinit).
+		 * Correct: shadow covers body → T is a variable → 'T x;' is verbatim. */
+		CHECK(strstr(r.output, "T x = ") == NULL,
+		      "BUG5: c23-if-init-shadow: 'T x' in body must not get zeroinit "
+		      "— C23 if-init shadow scope_close_idx is set to tok_idx(is_close) "
+		      "which is the ')' position, NOT the end of the body; the shadow "
+		      "is invisible to all tokens inside the if-body, so the outer "
+		      "typedef T leaks back in and try_zero_init_decl incorrectly "
+		      "zeroinits 'T x;' (produces 'T x = {0}' or 'T x = 0')");
+	}
+	prism_free(&r);
+
+	/* Same bug with switch init-statement */
+	const char *src2 =
+	    "typedef int T;\n"
+	    "void fn(int c) { switch (int T = 0; c) { case 0: { T x; (void)x; } break; } }\n";
+	PrismResult r2 = prism_transpile_source(src2, "c23_switch_init_shadow.c", prism_defaults());
+	CHECK_EQ(r2.status, PRISM_OK,
+		 "BUG5: c23-switch-init-shadow: transpiles OK");
+	if (r2.output) {
+		CHECK(strstr(r2.output, "T x = ") == NULL,
+		      "BUG5: c23-switch-init-shadow: 'T x' in body must not get zeroinit "
+		      "(same scope_close_idx truncation as if-init variant)");
+	}
+	prism_free(&r2);
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -2238,4 +2297,8 @@ void run_zeroinit_tests(void) {
 	test_gnu_thread_storage_class();
 #endif
 	test_computed_goto_zeroinit_bypass();
+
+	// Audit round 21: C23 if/switch init-statement shadow scope expires at ')'
+	// before the if-body — typedef bleeds back into body (BUG5) — should FAIL until fixed
+	test_c23_if_init_shadow_underscopes_body();
 }

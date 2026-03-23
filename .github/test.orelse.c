@@ -3272,6 +3272,61 @@ static void test_struct_member_orelse_leak(void) {
 	prism_free(&r);
 }
 
+// Audit round 21: BUG3 — -fno-zeroinit + declarator-initializer orelse
+// try_zero_init_decl's !F_ZEROINIT fast-path only gates on P1_OE_BRACKET.
+// P1_OE_DECL_INIT (orelse inside '= expr') is never checked, so it returns
+// NULL.  The bare-assign orelse path then fires with the type keyword as the
+// LHS start, producing a duplicate type-named declaration in the fallback:
+//   int x = f() orelse 0;
+// emits: { if (!( int x = f())) int x = ( 0); }
+// which declares x twice and is not valid C.
+static void test_decl_init_orelse_fno_zeroinit_wrong_transform(void) {
+	PrismFeatures features = prism_defaults();
+	features.zeroinit = false;
+	PrismResult r = prism_transpile_source(
+	    "int f(void);\n"
+	    "void fn(void) { int x = f() orelse 0; (void)x; }\n",
+	    "decl_init_orelse_fno_zi.c", features);
+	CHECK_EQ(r.status, PRISM_OK,
+		 "BUG3: decl-init-orelse fno-zeroinit: should transpile OK");
+	if (r.output) {
+		/* BUG: bare-assign path emits duplicate type-named declaration.
+		 * The fallback 'int x = ( 0)' re-declares x inside the if-body,
+		 * which is invalid C (duplicate declaration in same scope). */
+		CHECK(strstr(r.output, "int x = ( 0)") == NULL,
+		      "BUG3: decl-init-orelse fno-zeroinit: output must not contain "
+		      "duplicate 'int x = ( 0)' — bare-assign path fires with type keyword "
+		      "as LHS start, emitting invalid C with two 'int x' declarations; "
+		      "try_zero_init_decl must also check P1_OE_DECL_INIT when F_ZEROINIT=false");
+	}
+	prism_free(&r);
+}
+
+// Audit round 21: BUG4 — comma operator at depth 0 in bare-assign orelse LHS.
+// reject_orelse_side_effects checks ++/--, compound-assign, asm, function calls,
+// and pointer derefs, but NOT for a comma operator at depth 0 between the
+// LHS start and the assignment '='.  A comma at depth 0 means the left side of
+// the comma expression is a throw-away sub-expression that will be evaluated
+// twice: once in the if-condition and once in the fallback arm.
+//   status_reg, out = f() orelse 0;
+// emits: { if (!( status_reg, out = f())) status_reg, out = ( 0); }
+// status_reg (volatile) is read twice — must instead be rejected as double-eval.
+static void test_bare_orelse_comma_lhs_depth0_double_eval(void) {
+	const char *src =
+	    "extern volatile int status_reg;\n"
+	    "int out;\n"
+	    "int f(void);\n"
+	    "void fn(void) { status_reg, out = f() orelse 0; }\n";
+	PrismResult r = prism_transpile_source(src, "comma_lhs_orelse.c", prism_defaults());
+	/* CORRECT: reject — comma at depth 0 before '=' causes double-eval of
+	 * everything left of the comma (here: a volatile read of status_reg). */
+	CHECK(r.status != PRISM_OK,
+	      "BUG4: bare-orelse-comma-lhs: comma at depth-0 before '=' must be "
+	      "rejected as double-eval side-effect (reject_orelse_side_effects "
+	      "is missing a depth-0 comma check; status_reg is read twice)");
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -3483,4 +3538,9 @@ void run_orelse_tests(void) {
 
 	// Audit round 20: struct member orelse leak
 	test_struct_member_orelse_leak();
+
+	// Audit round 21: decl-init orelse fno-zeroinit wrong transform (BUG3)
+	// and bare-orelse comma-LHS depth-0 double-eval (BUG4) — should FAIL until fixed
+	test_decl_init_orelse_fno_zeroinit_wrong_transform();
+	test_bare_orelse_comma_lhs_depth0_double_eval();
 }

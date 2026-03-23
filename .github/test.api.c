@@ -199,6 +199,81 @@ static void test_swar_comment_buffer_safety(void) {
 	}
 }
 
+static void test_preprocess_swar_padding_boundary(void) {
+	printf("\n--- Preprocess SWAR Padding Boundary ---\n");
+	/*
+	 * Regression: heap-buffer-overflow in preprocess_with_cc when preprocessed
+	 * output length == 2^n-1.  Old code:
+	 *   if (len + 8 < cap) { fitted = realloc(buf, len+8); if (fitted) buf=fitted; }
+	 *   memset(buf + len, 0, 8);
+	 * When len+8 >= cap (i.e. len in [cap-8 .. cap-1]) the realloc was skipped and
+	 * memset wrote up to 7 bytes past the end of the allocation.
+	 * Fix: always realloc to len+8, fail hard if that realloc fails.
+	 *
+	 * The bug was found by the differential fuzzer (seed 14916383875687713010) with
+	 * a 37 KB csmith program whose preprocessed output was exactly 262143 bytes.
+	 *
+	 * We reproduce with the smallest affected boundary 2^13-1=8191.  cc -E overhead
+	 * is measured at runtime so the test is portable across gcc versions and systems.
+	 */
+#ifdef _WIN32
+	printf("[PASS] preprocess swar padding boundary (skipped on Windows)\n");
+	passed++; total++;
+#else
+	/* Measure pp overhead: spawn cc -E on an empty .c file, count bytes. */
+	char probe[PATH_MAX + 2];
+	snprintf(probe, sizeof(probe) - 2, "%sprism_pp_bnd_XXXXXX", get_tmp_dir());
+	int tfd = mkstemp(probe);
+	CHECK(tfd >= 0, "pp boundary: mkstemp");
+	if (tfd < 0) return;
+	close(tfd);
+	/* cc needs .c extension to recognise C source without -x */
+	char probe_c[PATH_MAX + 4];
+	snprintf(probe_c, sizeof(probe_c), "%s.c", probe);
+	unlink(probe_c);
+	rename(probe, probe_c);
+
+	char cmd[PATH_MAX + 64];
+	snprintf(cmd, sizeof(cmd), "cc -E '%s' 2>/dev/null | wc -c", probe_c);
+
+	/* Empty file overhead */
+	{ FILE *f = fopen(probe_c, "w"); if (f) fclose(f); }
+	FILE *pp = popen(cmd, "r");
+	int overhead = 0;
+	if (pp) { fscanf(pp, " %d", &overhead); pclose(pp); }
+
+	/* Single-char declaration overhead */
+	{ FILE *f = fopen(probe_c, "w"); if (f) { fputs("const char s[] = \"X\";\n", f); fclose(f); } }
+	pp = popen(cmd, "r");
+	int total1 = 0;
+	if (pp) { fscanf(pp, " %d", &total1); pclose(pp); }
+
+	int decl_cost = total1 - overhead; /* bytes added by the declaration minus the 1 'X' */
+	int target = 8191;                  /* 2^13 - 1 */
+	int n_chars = target - overhead - decl_cost + 1; /* A-chars needed */
+
+	int calibrated = overhead > 0 && total1 > overhead && n_chars > 0 && n_chars < 16384;
+	CHECK(calibrated, "pp boundary: overhead calibration sane");
+	if (!calibrated) { unlink(probe_c); return; }
+
+	/* Write the boundary file: const char s[] = \"AAA...\" with n_chars A's */
+	FILE *f = fopen(probe_c, "w");
+	CHECK(f != NULL, "pp boundary: write boundary file");
+	if (!f) { unlink(probe_c); return; }
+	fputs("const char s[] = \"", f);
+	for (int i = 0; i < n_chars; i++) fputc('A', f);
+	fputs("\";\n", f);
+	fclose(f);
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_file(probe_c, feat);
+	CHECK(r.status == PRISM_OK,
+	      "pp boundary 2^13-1=8191: no heap overflow (memset SWAR padding)");
+	prism_free(&r);
+	unlink(probe_c);
+#endif
+}
+
 static void test_cc_split_argv_no_leak(void) {
 	printf("\n--- CC Split Argv No Leak ---\n");
 
@@ -5667,6 +5742,7 @@ test_typeof_orelse_leak();
 	test_msvc_typeof_vla_no_builtin_memset();
 
 	test_swar_comment_buffer_safety();
+	test_preprocess_swar_padding_boundary();
 	test_cc_split_argv_no_leak();
 
 	test_cc_executable_no_leak();

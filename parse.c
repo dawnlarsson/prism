@@ -455,6 +455,11 @@ static void *arena_alloc_uninit(Arena *arena, size_t size) {
 }
 
 static void *arena_alloc(Arena *arena, size_t size) {
+	// GCC VRP hint: size is always a valid positive allocation, never a
+	// sign-extended negative int.  Suppresses -Wstringop-overflow false
+	// positives that appear when arena_alloc is inlined into p1_verify_cfg
+	// and GCC concludes (size_t)signed_int could wrap.
+	if (size > (size_t)PTRDIFF_MAX) __builtin_unreachable();
 	void *ptr = arena_alloc_uninit(arena, size);
 	memset(ptr, 0, size);
 	return ptr;

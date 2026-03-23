@@ -1325,7 +1325,20 @@ static void reject_orelse_side_effects(Token *start, Token *end,
 				       const char *ctx_msg, const char *advice,
 				       bool check_asm, bool check_volatile_deref,
 				       bool check_indirect_call) {
+	int pd = 0;
 	for (Token *s = start; s && s != end && s->kind != TK_EOF; s = tok_next(s)) {
+		/* Track paren/bracket depth for the depth-0 comma check below. */
+		if (s->flags & TF_OPEN) { pd++; goto next_checks; }
+		if (s->flags & TF_CLOSE) { pd--; goto next_checks; }
+		/* A comma operator at depth 0 means the left sub-expression is a
+		 * throw-away side-effect that will be evaluated twice — once in the
+		 * if-condition and once in the fallback assignment arm. */
+		if (pd == 0 && match_ch(s, ','))
+			error_tok(s, "%s with comma operator at top level (the "
+				  "left-hand sub-expression before ',' is evaluated "
+				  "twice — double evaluation of volatile reads or "
+				  "other side effects) %s", ctx_msg, advice);
+		next_checks:
 		if (equal(s, "++") || equal(s, "--") || is_assignment_operator_token(s))
 			error_tok(s, "%s with side effect %s", ctx_msg, advice);
 		if (check_asm && (s->tag & TT_ASM))
@@ -3240,13 +3253,17 @@ static Token *try_zero_init_decl(Token *tok) {
 	 * emit_bracket_orelse_temps which is only reachable via process_declarators. */
 	if (!FEAT(F_ZEROINIT) && !FEAT(F_ORELSE)) return NULL;
 	if (!FEAT(F_ZEROINIT)) {
-		/* Only proceed if there is a P1_OE_BRACKET-annotated orelse token in
-		 * this declaration.  The annotation is set inside [...] brackets, so
-		 * we must NOT skip balanced groups here — scan every token up to ';'. */
+		/* Only proceed if there is a P1_OE_BRACKET- or P1_OE_DECL_INIT-
+		 * annotated orelse token in this declaration.
+		 * P1_OE_BRACKET: orelse inside [...] array-dimension brackets.
+		 * P1_OE_DECL_INIT: orelse inside '= expr' declaration initializer.
+		 * Both require process_declarators to expand them; without this
+		 * gate the bare-assign orelse path fires with the type keyword as
+		 * the LHS start, emitting a duplicate declaration (invalid C). */
 		bool has_bo = false;
 		for (Token *s = tok; s && s->kind != TK_EOF; s = tok_next(s)) {
 			if (match_ch(s, ';') || match_ch(s, '{')) break;
-			if (tok_ann(s) & P1_OE_BRACKET) { has_bo = true; break; }
+			if (tok_ann(s) & (P1_OE_BRACKET | P1_OE_DECL_INIT)) { has_bo = true; break; }
 		}
 		if (!has_bo) return NULL;
 	}
@@ -4542,10 +4559,20 @@ static char *preprocess_with_cc(const char *input_file) {
 		return NULL;
 	}
 
-	// Right-size buffer with 8-byte padding for SWAR comment scanning
-	if (len + 8 < cap) {
+	// Right-size buffer to exactly len+8 bytes for SWAR comment scanning.
+	// The doubling loop guarantees cap >= len+1 but NOT cap >= len+8; when
+	// len == cap-1 the old conditional skip caused a 7-byte heap overflow.
+	{
 		char *fitted = realloc(buf, len + 8);
-		if (fitted) buf = fitted;
+		if (!fitted) {
+			free(buf);
+			if (pp_stderr_path[0]) unlink(pp_stderr_path);
+			waitpid(pid, NULL, 0);
+			free(cc_dup);
+			free((void *)args);
+			return NULL;
+		}
+		buf = fitted;
 	}
 	memset(buf + len, 0, 8);
 
@@ -5161,6 +5188,21 @@ static Token *skip_one_stmt(Token *tok, int depth) {
 				while (a && a->kind == TK_PREP_DIR) a = tok_next(a);
 				if (a && match_ch(a, ';')) return a;
 			}
+		}
+		return NULL;
+	}
+
+	// 'case' / 'default' label: skip label expr + ':', recurse on body.
+	// Without this, the 'simple statement' fallback scans for ';' at depth 0
+	// and walks past the closing '}' of a braced case body into the next
+	// statement, making for-init shadows bleed past the loop.
+	if ((tok->tag & (TT_CASE | TT_DEFAULT)) && !is_known_typedef(tok)) {
+		int ld = 0;
+		for (Token *s = tok_next(tok); s && s->kind != TK_EOF; s = tok_next(s)) {
+			if (s->flags & TF_OPEN) { ld++; continue; }
+			if (s->flags & TF_CLOSE) { ld--; continue; }
+			if (ld == 0 && match_ch(s, ':'))
+				return skip_one_stmt(tok_next(s), depth + 1);
 		}
 		return NULL;
 	}
@@ -5850,7 +5892,17 @@ uint16_t sid = next_scope_id++;
 							}
 						}
 					}
-					p1_scan_init_shadows(is_open, is_init_end, tok_idx(is_close), cur_sid, brace_depth,
+					/* Extend scope_close_idx past the if/switch body so the
+					 * init-statement shadow covers the entire body, not just
+					 * up to ')'.  Mirrors the for-loop init path which calls
+					 * skip_one_stmt to reach body_end_idx. */
+					uint32_t body_end_idx = tok_idx(is_close);
+					{
+						Token *stmt_end = skip_one_stmt(body_start_is, 0);
+						if (stmt_end)
+							body_end_idx = tok_idx(stmt_end);
+					}
+					p1_scan_init_shadows(is_open, is_init_end, body_end_idx, cur_sid, brace_depth,
 							     body_sid);
 				}
 			}
@@ -6221,6 +6273,7 @@ static void p1_verify_cfg(void) {
 
 		P1FuncEntry *ents = &p1_entries[fm->entry_start];
 		int cnt = fm->entry_count;
+		if (cnt < 0) cnt = 0; // GCC VRP guard: entry_count is always ≥ 0
 
 		// Arena-allocate per-function temporary arrays (reclaimed at loop end).
 		int *defer_list = arena_alloc(&ctx->main_arena, (size_t)cnt * sizeof(int));
