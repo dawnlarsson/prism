@@ -260,7 +260,8 @@ typedef struct {
 	Token *tok;
 	union {
 		struct { char *name; int len; } label;     // P1K_LABEL, P1K_GOTO
-		struct { bool has_init; bool is_vla; bool has_raw; bool is_static_storage; } decl; // P1K_DECL
+		struct { bool has_init; bool is_vla; bool has_raw; bool is_static_storage;
+			 uint32_t body_close_idx; } decl; // P1K_DECL
 		struct { uint16_t switch_scope_id; } kase;   // P1K_CASE
 	};
 } P1FuncEntry;
@@ -2203,6 +2204,19 @@ static Token *walk_balanced(Token *tok, bool emit) {
 							continue;
 						}
 					}
+					// Bare expression orelse at statement start
+					if (ctx->at_stmt_start && FEAT(F_ORELSE) &&
+					    !(inner->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO |
+							    TT_CASE | TT_DEFAULT | TT_IF | TT_LOOP | TT_SWITCH |
+							    TT_STORAGE | TT_TYPEDEF))) {
+						Token *next = emit_deferred_orelse(inner, se_end);
+						if (next) { inner = next; ctx->at_stmt_start = true; continue; }
+					}
+					// Catch unprocessed orelse before it leaks to output
+					if (__builtin_expect(FEAT(F_ORELSE) && is_orelse_keyword(inner), 0))
+						error_tok(inner,
+							  "'orelse' cannot be used here (it must appear at the "
+							  "statement level in a declaration or bare expression)");
 					ctx->at_stmt_start = false;
 					emit_tok(inner); inner = tok_next(inner);
 				}
@@ -5282,7 +5296,7 @@ static Token *find_init_semicolon(Token *open, Token *close) {
 // or not inside a function).
 static void p1_scan_init_shadows(Token *open, Token *init_end,
     uint32_t scope_close_idx, uint16_t cur_sid, int brace_depth,
-    uint16_t body_sid)
+    uint16_t body_sid, uint32_t body_close_idx)
 {
 	Token *init_tok = tok_next(open);
 	bool saw_raw = false;
@@ -5310,13 +5324,17 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 				p1_register_shadow(decl.var_name, cur_sid, brace_depth);
 
 			// Phase 1D: register CFG entry for goto-skip-decl detection
-			if (body_sid > 0) {
-				bool has_init = match_ch(decl.end, '=');
-				P1FuncEntry *e = p1_alloc(P1K_DECL, body_sid, decl.var_name);
-				e->decl.has_init = has_init;
-				e->decl.is_vla = type.is_vla || decl.is_vla;
-				e->decl.has_raw = saw_raw;
-				e->decl.is_static_storage = saw_static || type.has_static || type.has_extern;
+			{
+				uint16_t eff_sid = body_sid > 0 ? body_sid : cur_sid;
+				if (eff_sid > 0) {
+					bool has_init = match_ch(decl.end, '=');
+					P1FuncEntry *e = p1_alloc(P1K_DECL, eff_sid, decl.var_name);
+					e->decl.has_init = has_init;
+					e->decl.is_vla = type.is_vla || decl.is_vla;
+					e->decl.has_raw = saw_raw;
+					e->decl.is_static_storage = saw_static || type.has_static || type.has_extern;
+					e->decl.body_close_idx = body_sid > 0 ? 0 : body_close_idx;
+				}
 			}
 
 			t = decl.end;
@@ -5866,7 +5884,7 @@ uint16_t sid = next_scope_id++;
 						}
 					}
 					p1_scan_init_shadows(for_open, for_init_end, body_end_idx, cur_sid, brace_depth,
-							     body_sid);
+							     body_sid, body_end_idx);
 				}
 			}
 		}
@@ -5910,7 +5928,7 @@ uint16_t sid = next_scope_id++;
 							body_end_idx = tok_idx(stmt_end);
 					}
 					p1_scan_init_shadows(is_open, is_init_end, body_end_idx, cur_sid, brace_depth,
-							     body_sid);
+							     body_sid, body_end_idx);
 				}
 			}
 		}
@@ -6223,9 +6241,13 @@ static void cfg_check_range(P1FuncEntry *ents,
 				continue;
 			if (!is_forward && scope_is_ancestor_or_self(d->scope_id, g->scope_id))
 				continue;
-			if (d->scope_id > 0 && d->scope_id < scope_tree_count) {
-				uint32_t close = scope_tree[d->scope_id].close_tok_idx;
-				if (close < label->token_index) continue;
+			{
+				uint32_t close = 0;
+				if (d->decl.body_close_idx > 0)
+					close = d->decl.body_close_idx;
+				else if (d->scope_id > 0 && d->scope_id < scope_tree_count)
+					close = scope_tree[d->scope_id].close_tok_idx;
+				if (close > 0 && close < label->token_index) continue;
 			}
 			if ((!d->decl.has_raw && !d->decl.is_static_storage) || d->decl.is_vla) {
 				bad_decl = d->tok;

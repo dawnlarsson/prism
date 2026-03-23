@@ -3460,6 +3460,51 @@ static void test_typeof_const_struct_orelse_invalid_cast(void) {
 	}
 }
 
+// Bug: walk_balanced's stmt-expr inner loop lacks orelse handling.
+// An orelse inside a stmt-expr that's inside an aggregate initializer
+// or other walk_balanced context leaks "orelse" literal to the output,
+// breaking GCC/Clang compilation.
+static void test_walk_balanced_orelse_stmtexpr_leak(void) {
+	printf("\n--- walk_balanced orelse stmt-expr leak ---\n");
+
+	// orelse inside stmt-expr inside aggregate: should be transpiled or rejected.
+	const char *code_agg =
+	    "int get_val(void);\n"
+	    "void f(void) {\n"
+	    "    int arr[] = { ({ get_val() orelse 0; }) };\n"
+	    "    (void)arr;\n"
+	    "}\n"
+	    "int main(void) { return 0; }\n";
+	PrismResult r1 = prism_transpile_source(code_agg, "wb_aggr_stmtexpr.c", prism_defaults());
+	// Either transpile successfully without "orelse" in output, or error cleanly.
+	if (r1.status == PRISM_OK) {
+		CHECK(r1.output && !strstr(r1.output, "orelse"),
+		      "walk_balanced orelse: stmt-expr in aggregate must not leak 'orelse' literal");
+	} else {
+		// A clean error is also acceptable (rejecting unsupported context).
+		CHECK(1, "walk_balanced orelse: stmt-expr in aggregate rejected cleanly");
+	}
+	prism_free(&r1);
+
+	// orelse inside stmt-expr at top level (int x = ({...})) already works.
+	// Verify it still works as a regression test.
+	const char *code_toplevel =
+	    "int do_work(void);\n"
+	    "int f(void) {\n"
+	    "    int x = ({ do_work() orelse return -1; 0; });\n"
+	    "    return x;\n"
+	    "}\n"
+	    "int main(void) { return 0; }\n";
+	PrismResult r2 = prism_transpile_source(code_toplevel, "wb_toplevel_stmtexpr.c", prism_defaults());
+	if (r2.status == PRISM_OK) {
+		CHECK(r2.output && !strstr(r2.output, "orelse"),
+		      "walk_balanced orelse: stmt-expr at top level must not leak 'orelse' literal");
+	} else {
+		CHECK(0, "walk_balanced orelse: stmt-expr at top level should transpile OK");
+	}
+	prism_free(&r2);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -3682,4 +3727,7 @@ void run_orelse_tests(void) {
 
 	// Audit round 23: typeof const struct orelse value fallback (BUG6)
 	test_typeof_const_struct_orelse_invalid_cast();
+
+	// Audit round 25: walk_balanced orelse blind spot
+	test_walk_balanced_orelse_stmtexpr_leak();
 }

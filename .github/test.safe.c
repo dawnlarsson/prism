@@ -3176,6 +3176,55 @@ static void test_goto_over_raw_native_init(void) {
 	prism_free(&r);
 }
 
+// Bug: braceless for/if/switch bodies have no scope_id in scope_tree,
+// so p1_scan_init_shadows never creates a P1K_DECL entry (body_sid == 0).
+// The CFG verifier is completely blind to init-declared variables in
+// braceless control flow.
+static void test_braceless_forinit_cfg_bypass(void) {
+	printf("\n--- Braceless for-init CFG bypass ---\n");
+
+	// Forward goto into braceless for-body skips init variable.
+	// Non-VLA, non-raw: should trigger "bypasses initialization".
+	const char *code_nonvla =
+	    "void f(void) {\n"
+	    "    goto inside;\n"
+	    "    for (int x = 42;;)\n"
+	    "        inside: break;\n"
+	    "}\n"
+	    "int main(void) { return 0; }\n";
+	PrismResult r1 = prism_transpile_source(code_nonvla, "braceless_for_cfg1.c", prism_defaults());
+	CHECK(r1.status != PRISM_OK,
+	      "braceless for-init: goto into braceless body must catch init skip");
+	prism_free(&r1);
+
+	// raw VLA in braceless for-init: VLA skip should still be caught.
+	const char *code_vla =
+	    "void f(int n) {\n"
+	    "    goto inside;\n"
+	    "    for (raw int arr[n];;)\n"
+	    "        inside: break;\n"
+	    "}\n"
+	    "int main(void) { return 0; }\n";
+	PrismResult r2 = prism_transpile_source(code_vla, "braceless_for_cfg2.c", prism_defaults());
+	CHECK(r2.status != PRISM_OK,
+	      "braceless for-init: raw VLA in braceless body must catch VLA skip");
+	prism_free(&r2);
+
+	// Control: a goto that jumps OVER (not into) the for-statement is OK.
+	const char *code_over =
+	    "void f(void) {\n"
+	    "    goto past;\n"
+	    "    for (int x = 42;;)\n"
+	    "        break;\n"
+	    "    past: ;\n"
+	    "}\n"
+	    "int main(void) { return 0; }\n";
+	PrismResult r3 = prism_transpile_source(code_over, "braceless_for_cfg3.c", prism_defaults());
+	CHECK_EQ(r3.status, PRISM_OK,
+	         "braceless for-init: goto past entire statement must be accepted");
+	prism_free(&r3);
+}
+
 // Bug: p1_scan_init_shadows uses if instead of while for raw keywords.
 // Two consecutive raw tokens (e.g. from macro expansion) cause early return,
 // so no P1K_DECL is created and the CFG verifier is blind to the VLA.
@@ -3450,4 +3499,7 @@ void run_safe_tests(void) {
 
 	// Audit round 24: raw raw VLA for-init CFG blindness
 	test_raw_raw_vla_forinit_cfg_blind();
+
+	// Audit round 25: braceless for-init CFG bypass
+	test_braceless_forinit_cfg_bypass();
 }
