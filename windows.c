@@ -57,6 +57,7 @@ typedef int mode_t;
 #define __builtin_expect(expr, val) (expr)
 #define __builtin_constant_p(x) 0
 #define __builtin_strlen(s) strlen(s)
+#define __builtin_unreachable() __assume(0)
 #define __typeof__(x) const char * // only used for CLI_PUSH's array elem type
 #define __alignof__(x) __alignof(x)
 
