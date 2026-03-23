@@ -2478,6 +2478,50 @@ static void test_braceless_switch_defer_drop(void) {
 	prism_free(&r);
 }
 
+// Bug: check_defer_var_shadow does a flat scan of defer body tokens without
+// tracking brace depth. A variable declared inside an inner { } block within
+// the defer body matches the outer declaration name, producing a false positive.
+static void test_defer_shadow_inner_block_false_positive(void) {
+	printf("\n--- Defer shadow inner-block false positive ---\n");
+
+	// The defer body has { int tmp = 1; } in an inner block.
+	// Declaring tmp in a subsequent scope should NOT be flagged as a shadow
+	// because the defer-internal tmp is local and can't conflict.
+	const char *code =
+	    "void f(void) {\n"
+	    "    defer {\n"
+	    "        { int tmp = 1; (void)tmp; }\n"
+	    "    }\n"
+	    "    {\n"
+	    "        int tmp = 2;\n"
+	    "        (void)tmp;\n"
+	    "        return;\n"
+	    "    }\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_shadow_inner_block.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "defer-shadow-inner-block: inner { int tmp; } in defer must not flag outer tmp");
+	prism_free(&r);
+
+	// Verify that a real shadow (tmp used at the top level of the defer body)
+	// is still caught.
+	const char *code_real =
+	    "int g(void);\n"
+	    "void f2(void) {\n"
+	    "    int tmp = g();\n"
+	    "    defer { (void)tmp; }\n"
+	    "    {\n"
+	    "        int tmp = 99;\n"
+	    "        (void)tmp;\n"
+	    "        return;\n"
+	    "    }\n"
+	    "}\n";
+	PrismResult r2 = prism_transpile_source(code_real, "defer_shadow_real.c", prism_defaults());
+	CHECK(r2.status != PRISM_OK,
+	      "defer-shadow-real: top-level tmp in defer must still be caught");
+	prism_free(&r2);
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -2637,4 +2681,7 @@ void run_defer_tests(void) {
 
 	// Audit round 13: braceless switch inside braced switch drops defers
 	test_braceless_switch_defer_drop();
+
+	// Audit round 24: defer shadow inner-block false positive
+	test_defer_shadow_inner_block_false_positive();
 }

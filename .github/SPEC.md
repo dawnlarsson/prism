@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3190+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3217+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -166,7 +166,7 @@ Stored in a flat array with a hashmap keyed on name. Supports multiple shadows p
 | `typeof_vars[]` | `ARENA_ENSURE_CAP` (ctx, reused) | `arena_reset()` |
 | `bracket_oe_ids[]` | `ARENA_ENSURE_CAP` (ctx, reused) | `arena_reset()` |
 
-All arena-allocated structures are automatically reclaimed by `prism_reset()` → `arena_reset()` on any `error_tok()` that `longjmp`s out.
+All arena-allocated structures are automatically reclaimed by `prism_reset()` → `arena_reset()` on any `error_tok()` that `longjmp`s out. `arena_alloc_uninit` has an overflow guard: `size > SIZE_MAX - (ARENA_ALIGN - 1)` is rejected before the alignment addition, preventing wrap-around to a tiny allocation.
 
 ---
 
@@ -269,7 +269,7 @@ For each function body, collects `P1FuncEntry` items into the global `p1_entries
 
 **Detection sites:** Labels and gotos are detected both at statement-start positions and inside braceless control flow (e.g., `if (c) goto L;`).
 
-**For-init / if-switch-init declarations:** `p1_scan_init_shadows` also allocates `P1K_DECL` entries for variables declared in C99 for-init clauses (`for (int i = 0; ...)`) and C23 if/switch initializers (`if (int x = f(); x > 0)`). The scope_id assigned to these entries is the **body scope** (the `{` following the `)` of the control statement), not the enclosing scope. This ensures the CFG verifier catches gotos that jump *into* the loop/if/switch body past the init declaration, while still allowing gotos that jump *over* the entire control statement (where the variable is no longer in scope). For braceless bodies (no `{`), no `P1K_DECL` entry is registered because there is no scope_id in the scope tree.
+**For-init / if-switch-init declarations:** `p1_scan_init_shadows` also allocates `P1K_DECL` entries for variables declared in C99 for-init clauses (`for (int i = 0; ...)`) and C23 if/switch initializers (`if (int x = f(); x > 0)`). The scope_id assigned to these entries is the **body scope** (the `{` following the `)` of the control statement), not the enclosing scope. This ensures the CFG verifier catches gotos that jump *into* the loop/if/switch body past the init declaration, while still allowing gotos that jump *over* the entire control statement (where the variable is no longer in scope). For braceless bodies (no `{`), no `P1K_DECL` entry is registered because there is no scope_id in the scope tree. Consecutive `raw` keywords (e.g. from macro expansion like `raw raw int arr[n]`) are handled by a `while` loop, matching the pattern in `try_zero_init_decl`.
 
 **VLA tracking:** `is_vla` on `P1FuncEntry.decl` is set when either the base type is a VLA typedef (`type.is_vla`) or the declaration itself has variable-length array dimensions (`decl.is_vla`). This covers both `typedef int T[n]; T x;` and direct `int x[n];` forms. Jumping past a VLA is always dangerous regardless of `has_init` or `has_raw`, because it bypasses implicit stack allocation.
 
@@ -425,7 +425,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 ### Defer-variable shadow checking
 
-`check_defer_var_shadow` detects when a newly-declared variable name appears in an active defer body — this would silently capture the wrong variable at cleanup time. Uses `FuncMeta.defer_name_bloom` (a 64-bit FNV-1a bloom filter of all identifier names in defer bodies) for an O(1) fast-reject before the O(N×M) body walk — eliminates the walk in the common case when no name matches.
+`check_defer_var_shadow` detects when a newly-declared variable name appears in an active defer body — this would silently capture the wrong variable at cleanup time. Uses `FuncMeta.defer_name_bloom` (a 64-bit FNV-1a bloom filter of all identifier names in defer bodies) for an O(1) fast-reject before the O(N×M) body walk — eliminates the walk in the common case when no name matches. The body walk tracks brace depth: identifiers inside nested `{ }` blocks within the defer body (depth > 1) are skipped, since they are local declarations that cannot conflict with outer-scope variables. This avoids false positives for patterns like `defer { { int tmp = 1; } }` where the inner `tmp` is purely internal to the defer body.
 
 ---
 
@@ -461,7 +461,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 **Semantics:** Evaluates the expression. If the result is falsy (`!value` is true), executes the action. Works with any scalar type where `!value` is meaningful (pointers, integers, floats).
 
-**Limitation:** Does not support struct/union values (no whole-struct zero check). Struct/union pointers work. Typedeffed structs pass through Prism and fail at the backend compiler.
+**Limitation:** Does not support struct/union values (no whole-struct zero check). Struct/union pointers work. Typedeffed structs pass through Prism and fail at the backend compiler. `typeof(const struct S)` and `typeof(aggregate_typedef)` are detected by `parse_type_specifier` (sets `is_struct` when `TT_SUE` or `TDF_AGGREGATE` appears inside the `typeof` expression) and rejected for value-fallback orelse. Opaque `typeof(variable)` where the variable's type is an aggregate cannot be detected at the token level — the backend compiler reports a clear error (`used type ... where arithmetic type is required`).
 
 **Forms:**
 

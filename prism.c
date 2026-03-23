@@ -1092,8 +1092,12 @@ static void check_defer_var_shadow(Token *var_name) {
 		return;
 	for (int i = 0; i < outer_defer_end; i++) {
 		Token *prev = NULL;
+		int brace_depth = 0;
 		for (Token *t = defer_stack[i].stmt; t && t != defer_stack[i].end && t->kind != TK_EOF;
 		     prev = t, t = tok_next(t)) {
+			if (match_ch(t, '{')) { brace_depth++; continue; }
+			if (match_ch(t, '}')) { brace_depth--; continue; }
+			if (brace_depth > 1) continue;  // skip inner blocks
 			if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
 			    !(prev && (prev->tag & TT_MEMBER)) &&
 			    t->len == nlen && !memcmp(tok_loc(t), name, nlen)) {
@@ -2065,6 +2069,8 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 						// _Atomic is TT_QUALIFIER | TT_TYPE
 						if ((t->tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE))
 							r.has_atomic = true;
+						if (t->tag & TT_SUE) r.is_struct = true;
+						if (typedef_flags(t) & TDF_AGGREGATE) r.is_struct = true;
 					}
 				// Detect VLA inside typeof: array dimensions with runtime variables,
 				// or references to known VLA variables.
@@ -3056,9 +3062,10 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 			if (target.is_struct_value)
 				error_tok(orelse_tok,
-					  "orelse fallback on const struct is not supported; "
-					  "use a control flow action (return/break/goto) or "
-					  "remove const");
+					  "orelse value fallback on const/typeof aggregate "
+					  "is not supported; use a control flow action "
+					  "(return/break/goto), typeof_unqual, or an "
+					  "explicit type name");
 
 			tok = handle_const_orelse_fallback(tok,
 							   orelse_tok,
@@ -5279,7 +5286,7 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 {
 	Token *init_tok = tok_next(open);
 	bool saw_raw = false;
-	if (init_tok && (init_tok->flags & TF_RAW) && !is_known_typedef(init_tok)) {
+	while (init_tok && (init_tok->flags & TF_RAW) && !is_known_typedef(init_tok)) {
 		saw_raw = true;
 		init_tok = tok_next(init_tok);
 	}

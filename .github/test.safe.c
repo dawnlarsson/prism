@@ -3176,6 +3176,31 @@ static void test_goto_over_raw_native_init(void) {
 	prism_free(&r);
 }
 
+// Bug: p1_scan_init_shadows uses if instead of while for raw keywords.
+// Two consecutive raw tokens (e.g. from macro expansion) cause early return,
+// so no P1K_DECL is created and the CFG verifier is blind to the VLA.
+static void test_raw_raw_vla_forinit_cfg_blind(void) {
+	printf("\n--- raw raw VLA for-init CFG blindness ---\n");
+
+	// goto jumps INTO the for-body, skipping the VLA allocation in init.
+	// With a single raw the error fires; with raw raw the CFG is blind.
+	const char *code =
+	    "void f(int n) {\n"
+	    "    goto inside;\n"
+	    "    for (raw raw int arr[n]; ; ) {\n"
+	    "        inside:\n"
+	    "        arr[0] = 42;\n"
+	    "        break;\n"
+	    "    }\n"
+	    "}\n"
+	    "int main(void) { return 0; }\n";
+
+	PrismResult r = prism_transpile_source(code, "rawraw_vla_cfg.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "raw raw VLA for-init: goto into body must be caught (VLA skip)");
+	prism_free(&r);
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -3422,4 +3447,7 @@ void run_safe_tests(void) {
 #ifdef __GNUC__
 	test_gnu_attr_param_shadow();
 #endif
+
+	// Audit round 24: raw raw VLA for-init CFG blindness
+	test_raw_raw_vla_forinit_cfg_blind();
 }

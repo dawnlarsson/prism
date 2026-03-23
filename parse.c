@@ -447,6 +447,7 @@ static void arena_ensure(Arena *arena, size_t size) {
 
 static void *arena_alloc_uninit(Arena *arena, size_t size) {
 	if (size == 0) size = 1;
+	if (size > SIZE_MAX - (ARENA_ALIGN - 1)) error("arena_alloc: size overflow");
 	size = (size + (ARENA_ALIGN - 1)) & ~(size_t)(ARENA_ALIGN - 1);
 	arena_ensure(arena, size);
 	void *ptr = arena->current->data + arena->current->used;
