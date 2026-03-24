@@ -1689,10 +1689,10 @@ static void test_prism_p_temp_var_namespace_collision(void) {
 	PrismResult result = prism_transpile_file(path, features);
 	CHECK_EQ(result.status, PRISM_OK, "prism_p collision: transpiles OK");
 
-	// After fix: generated temps use reserved _Prism_p_ prefix, not _prism_p_.
-	// User's _prism_p_0 should coexist with generated _Prism_p_0.
-	CHECK(strstr(result.output, "_Prism_p_") != NULL || strstr(result.output, "_Prism_i_") != NULL,
-	      "prism_p collision: transpiler should use reserved _Prism_ prefix for volatile memset temps");
+	// After fix: generated temps use reserved __prism_p_ prefix, not _prism_p_.
+	// User's _prism_p_0 should coexist with generated __prism_p_0.
+	CHECK(strstr(result.output, "__prism_p_") != NULL || strstr(result.output, "__prism_i_") != NULL,
+	      "prism_p collision: transpiler should use reserved __prism_ prefix for volatile memset temps");
 	CHECK(strstr(result.output, "volatile char *_prism_p_") == NULL,
 	      "prism_p collision: generated volatile memset temp must not use _prism_p_ prefix");
 
@@ -2190,6 +2190,48 @@ static void test_c23_if_init_shadow_underscopes_body(void) {
 	prism_free(&r2);
 }
 
+// Audit round 28: C23 if-init shadow scope amputated before else branch.
+// skip_one_stmt(body_start_is) is called on the '{' of the true-branch body,
+// which matches to its '}' and stops — it never looks for an else clause.
+// This causes scope_close_idx to end at the true-branch '}', so the init
+// shadow expires before the else block.  Any typedef or variable declared in
+// the init-statement becomes invisible in the else branch, violating C23
+// §6.8.4.1 which requires the scope to extend through both branches.
+static void test_c23_if_init_shadow_else_scope(void) {
+	/* Variable declared in if-init shadows outer typedef.
+	 * The shadow must cover both the true-branch AND the else-branch. */
+	const char *src =
+	    "typedef int T;\n"
+	    "void fn(int c) {\n"
+	    "    if (int T = 0; c) {\n"
+	    "        T x; (void)x;\n"
+	    "    } else {\n"
+	    "        T y; (void)y;\n"
+	    "    }\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(src, "c23_if_else_scope.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "c23-if-init-else-scope: transpiles OK");
+	if (r.output) {
+		/* True branch: shadow covers body, T is a variable → no zeroinit */
+		CHECK(strstr(r.output, "T x = ") == NULL,
+		      "c23-if-init-else-scope: true branch must not zeroinit "
+		      "(shadow covers if-body)");
+		/* Else branch: shadow must ALSO cover else body → no zeroinit.
+		 * BUG: skip_one_stmt on '{' returns at '}' of true-branch,
+		 * scope_close_idx does not extend to else → shadow expires →
+		 * outer typedef T leaks back → zeroinit fires on 'T y;'. */
+		CHECK(strstr(r.output, "T y = ") == NULL,
+		      "c23-if-init-else-scope: else branch must not zeroinit "
+		      "— if-init shadow scope_close_idx ends at true-branch '}'; "
+		      "skip_one_stmt called on '{' matches to '}' and never "
+		      "peeks ahead for 'else'; shadow is invisible in else body");
+	}
+	prism_free(&r);
+
+	/* Same bug with switch (no else, but verify it doesn't regress) */
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -2301,4 +2343,7 @@ void run_zeroinit_tests(void) {
 	// Audit round 21: C23 if/switch init-statement shadow scope expires at ')'
 	// before the if-body — typedef bleeds back into body (BUG5) — should FAIL until fixed
 	test_c23_if_init_shadow_underscopes_body();
+
+	// Audit round 28: C23 if-init shadow scope amputated before else branch
+	test_c23_if_init_shadow_else_scope();
 }

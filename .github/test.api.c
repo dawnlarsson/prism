@@ -380,9 +380,9 @@ static void test_typeof_memset_size_t_counter(void) {
 	PrismResult r = prism_transpile_source(code, "size_t_counter.c", feat);
 	CHECK_EQ(r.status, PRISM_OK, "size_t counter: transpiles OK");
 	if (r.output) {
-		CHECK(strstr(r.output, "unsigned long long _Prism_i_") != NULL,
+		CHECK(strstr(r.output, "unsigned long long __prism_i_") != NULL,
 		      "size_t counter: uses unsigned long long for loop counter");
-		CHECK(strstr(r.output, "size_t _Prism_i_") == NULL,
+		CHECK(strstr(r.output, "size_t __prism_i_") == NULL,
 		      "size_t counter: no size_t counter (avoids stddef.h dep)");
 	}
 	prism_free(&r);
@@ -392,7 +392,7 @@ static void test_typeof_memset_size_t_counter(void) {
 	r = prism_transpile_source(code, "size_t_msvc.c", feat);
 	CHECK_EQ(r.status, PRISM_OK, "size_t counter msvc: transpiles OK");
 	if (r.output) {
-		CHECK(strstr(r.output, "unsigned long long _Prism_i_") != NULL,
+		CHECK(strstr(r.output, "unsigned long long __prism_i_") != NULL,
 		      "size_t counter msvc: uses unsigned long long for loop counter");
 	}
 	prism_free(&r);
@@ -2552,10 +2552,10 @@ static void test_typeof_memset_no_shadow(void) {
 	PrismResult r = prism_transpile_source(code, "typeof_shadow.c", feat);
 	CHECK(r.status == PRISM_OK, "typeof memset shadow: transpiles OK");
 	if (r.output) {
-		CHECK(strstr(r.output, "_Prism_p_") != NULL,
-		      "typeof memset shadow: uses _prism_p_ prefix");
-		CHECK(strstr(r.output, "_Prism_i_") != NULL,
-		      "typeof memset shadow: uses _prism_i_ prefix");
+		CHECK(strstr(r.output, "__prism_p_") != NULL,
+		      "typeof memset shadow: uses __prism_p_ prefix");
+		CHECK(strstr(r.output, "__prism_i_") != NULL,
+		      "typeof memset shadow: uses __prism_i_ prefix");
 		// Make sure the old bare _p / _i loop vars are not emitted
 		// (user's own _p/_i assignments are fine, but the memset loop
 		// must not add another bare 'char *_p' or 'unsigned long _i').
@@ -3490,7 +3490,7 @@ static void test_msvc_typeof_vla_no_builtin_memset(void) {
 	if (r.output) {
 		CHECK(strstr(r.output, "__builtin_memset") == NULL,
 		      "msvc typeof vla: no __builtin_memset emitted");
-		CHECK(strstr(r.output, "_Prism_p_") != NULL,
+		CHECK(strstr(r.output, "__prism_p_") != NULL,
 		      "msvc typeof vla: uses byte-loop pattern");
 	}
 	prism_free(&r);

@@ -2666,7 +2666,7 @@ static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool
 		if (use_loop) {
 			OUT_LIT(" { ");
 			out_str(vol, vol_len);
-			OUT_LIT("char *_Prism_p_");
+			OUT_LIT("char *__prism_p_");
 			out_uint(ctx->ret_counter);
 			OUT_LIT(" = (");
 			out_str(vol, vol_len);
@@ -2675,17 +2675,17 @@ static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool
 			else
 				OUT_LIT("char *)&");
 			out_str(tok_loc(vars[i]), vars[i]->len);
-			OUT_LIT("; for (unsigned long long _Prism_i_");
+			OUT_LIT("; for (unsigned long long __prism_i_");
 			out_uint(ctx->ret_counter);
-			OUT_LIT(" = 0; _Prism_i_");
+			OUT_LIT(" = 0; __prism_i_");
 			out_uint(ctx->ret_counter);
 			OUT_LIT(" < sizeof(");
 			out_str(tok_loc(vars[i]), vars[i]->len);
-			OUT_LIT("); _Prism_i_");
+			OUT_LIT("); __prism_i_");
 			out_uint(ctx->ret_counter);
-			OUT_LIT("++) _Prism_p_");
+			OUT_LIT("++) __prism_p_");
 			out_uint(ctx->ret_counter);
-			OUT_LIT("[_Prism_i_");
+			OUT_LIT("[__prism_i_");
 			out_uint(ctx->ret_counter);
 			OUT_LIT("] = 0; }");
 			ctx->ret_counter++;
@@ -5997,6 +5997,19 @@ uint16_t sid = next_scope_id++;
 						Token *stmt_end = skip_one_stmt(body_start_is, 0);
 						if (stmt_end)
 							body_end_idx = tok_idx(stmt_end);
+						/* C23 §6.8.4.1: if-init scope extends through
+						 * the else branch.  skip_one_stmt on '{' only
+						 * matches to '}' — peek ahead for 'else'. */
+						if (stmt_end && (tok->tag & TT_IF)) {
+							Token *n = tok_next(stmt_end);
+							while (n && n->kind == TK_PREP_DIR)
+								n = tok_next(n);
+							if (n && (n->tag & TT_IF) && tok_loc(n)[0] == 'e') {
+								Token *else_end = skip_one_stmt(tok_next(n), 0);
+								if (else_end)
+									body_end_idx = tok_idx(else_end);
+							}
+						}
 					}
 					p1_scan_init_shadows(is_open, is_init_end, body_end_idx, cur_sid, brace_depth,
 							     body_sid, body_end_idx);
