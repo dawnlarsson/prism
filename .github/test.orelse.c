@@ -1337,10 +1337,10 @@ static void test_prism_oe_temp_var_namespace_collision(void) {
 	PrismResult result = prism_transpile_file(path, features);
 	CHECK_EQ(result.status, PRISM_OK, "prism_oe collision: transpiles OK");
 
-	// After fix: generated temps use reserved _Prism_oe_ prefix, not _prism_oe_.
-	// User's _prism_oe_0 should coexist with generated _Prism_oe_0.
-	CHECK(strstr(result.output, "_Prism_oe_") != NULL,
-	      "prism_oe collision: transpiler should use reserved _Prism_ prefix for generated temps");
+	// After fix: generated temps use reserved __prism_oe_ prefix, not _prism_oe_.
+	// User's _prism_oe_0 should coexist with generated __prism_oe_0.
+	CHECK(strstr(result.output, "__prism_oe_") != NULL,
+	      "prism_oe collision: transpiler should use __prism_ prefix for generated temps");
 	// Verify no generated variable uses the user-accessible _prism_oe_ prefix
 	// (only user's own code should contain _prism_oe_0)
 	const char *gen = strstr(result.output, " _prism_oe_");
@@ -1355,7 +1355,7 @@ static void test_prism_oe_temp_var_namespace_collision(void) {
 		gen = strstr(gen + 1, " _prism_oe_");
 	}
 	CHECK(!gen_uses_old_prefix,
-	      "prism_oe collision: generated temp must use _Prism_ prefix, not _prism_");
+	      "prism_oe collision: generated temp must use __prism_ prefix, not _prism_");
 
 	prism_free(&result);
 	unlink(path);
@@ -1385,10 +1385,10 @@ static void test_const_typedef_breaks_orelse_temp(void) {
 	// The transpiled output must compile without errors.
 	// If the temp variable retains the const from the typedef,
 	// the reassignment "temp = 5;" will fail to compile.
-	// The fix should either use _Prism_oe_N pattern with a non-const temp
+	// The fix should either use __prism_oe_N pattern with a non-const temp
 	// or otherwise ensure the fallback assignment is valid.
-	CHECK(strstr(result.output, "_Prism_oe") != NULL,
-	      "const typedef orelse: should use _Prism_oe temp (typedef has hidden const)");
+	CHECK(strstr(result.output, "__prism_oe") != NULL,
+	      "const typedef orelse: should use __prism_oe temp (typedef has hidden const)");
 
 	prism_free(&result);
 	unlink(path);
@@ -1459,9 +1459,9 @@ static void test_compound_literal_orelse_lifetime(void) {
 
 	// The fallback assignment must use ternary, not an unbraced if-body,
 	// to keep the compound literal in the enclosing block scope.
-	CHECK(strstr(result.output, "if (!_Prism_oe_") == NULL,
+	CHECK(strstr(result.output, "if (!__prism_oe_") == NULL,
 	      "compound lit orelse: no if-assignment (lifetime-destroying pattern)");
-	CHECK(strstr(result.output, "? _Prism_oe_") != NULL,
+	CHECK(strstr(result.output, "? __prism_oe_") != NULL,
 	      "compound lit orelse: uses ternary to preserve compound literal lifetime");
 
 	prism_free(&result);
@@ -1520,7 +1520,7 @@ static void test_orelse_const_funcptr_return_type_stripped(void) {
 		 * not strip it to 'char *'. */
 		const char *p = r.output;
 		bool found_stripped = false;
-		while ((p = strstr(p, "char *(* _Prism_oe_")) != NULL) {
+		while ((p = strstr(p, "char *(* __prism_oe_")) != NULL) {
 			if (p == r.output || (p >= r.output + 6 &&
 			    memcmp(p - 6, "const ", 6) != 0)) {
 				found_stripped = true;
@@ -2025,7 +2025,7 @@ static void test_orelse_msvc_array_bracket_stmt_expr(void) {
 		      "bracket orelse: no __auto_type in output");
 		CHECK(strstr(r.output, "({") == NULL,
 		      "bracket orelse: no statement expression in output");
-		CHECK(strstr(r.output, "long long _Prism_oe_") != NULL,
+		CHECK(strstr(r.output, "long long __prism_oe_") != NULL,
 		      "bracket orelse: uses hoisted long long temp");
 	}
 	prism_free(&r);
@@ -2193,7 +2193,7 @@ static void test_orelse_out_of_order_storage_class(void) {
 
 // Bug: bracket orelse (e.g. int (*p)[n orelse 1] = NULL) in a for-loop
 // initializer with has_init=true bypasses the needs_memset guard.
-// emit_bracket_orelse_temps injects a hoisted "long long _Prism_oe_N = ...;"
+// emit_bracket_orelse_temps injects a hoisted "long long __prism_oe_N = ...;"
 // into the for-loop header, producing two type specifiers in one init clause
 // which is a hard syntax error.
 static void test_orelse_for_init_bracket_orelse_bypass(void) {
@@ -2344,10 +2344,10 @@ static void test_vla_bracket_orelse_eval_order(void) {
 	    "}\n";
 	PrismResult r = prism_transpile_source(code, "vla_eval_order.c", prism_defaults());
 	if (r.status == PRISM_OK && r.output) {
-		// The hoisted temp "long long _Prism_oe_0 = (get_b ())" must NOT
+		// The hoisted temp "long long __prism_oe_0 = (get_b ())" must NOT
 		// appear before "get_a()" in the output.  If it does, evaluation
 		// order is reversed.
-		const char *hoist = strstr(r.output, "_Prism_oe_");
+		const char *hoist = strstr(r.output, "__prism_oe_");
 		const char *get_a = strstr(r.output, "get_a");
 		// Skip the forward declaration of get_a — find it inside f()
 		if (get_a) {
@@ -2493,11 +2493,11 @@ static void test_vla_interleaved_orelse_eval_order(void) {
 	if (r.status == PRISM_OK && r.output) {
 		const char *in_func = strstr(r.output, "void f(");
 		if (in_func) {
-			// get_b must be hoisted to a _Prism_dim_ temp variable
+			// get_b must be hoisted to a __prism_dim_ temp variable
 			// to preserve left-to-right evaluation order.
 			// If no dim temp exists, get_b() is left in the array decl
 			// and evaluated AFTER the hoisted orelse temps (wrong order).
-			const char *dim = strstr(in_func, "_Prism_dim_");
+			const char *dim = strstr(in_func, "__prism_dim_");
 			CHECK(dim != NULL,
 			      "vla-interleaved-orelse: get_b() not hoisted between two "
 			      "orelse dims; eval order is a(),c(),b() instead of a(),b(),c()");
@@ -2546,8 +2546,8 @@ static void test_typeof_funcptr_array_orelse_double_eval(void) {
 // Bug: emit_bracket_orelse_temps uses match_ch(t, '[') to find array
 // dimensions but does not check TF_C23_ATTR.  A C23 [[ ... ]] attribute
 // between array dimensions is treated as a preceding non-orelse bracket
-// and hoisted into a _Prism_dim_ temp, producing garbage like:
-//   long long _Prism_dim_1 = ([ gnu :: aligned ( 8 ) ]);
+// and hoisted into a __prism_dim_ temp, producing garbage like:
+//   long long __prism_dim_1 = ([ gnu :: aligned ( 8 ) ]);
 static void test_c23_attr_bracket_orelse_dim_hoist(void) {
 	const char *code =
 	    "int get_size(void);\n"
@@ -2559,12 +2559,12 @@ static void test_c23_attr_bracket_orelse_dim_hoist(void) {
 	if (r.status == PRISM_OK && r.output) {
 		// The [[]] attribute must NOT be hoisted as a dimension temp.
 		// If it is, we'll see attribute guts (e.g. "aligned") inside a
-		// _Prism_dim_ hoisted expression.  Count distinct _Prism_dim_
-		// definitions: "long long _Prism_dim_".  Only the real [2] dim
+		// __prism_dim_ hoisted expression.  Count distinct __prism_dim_
+		// definitions: "long long __prism_dim_".  Only the real [2] dim
 		// should be hoisted; the attribute bracket must not add another.
 		int dim_defs = 0;
 		const char *p = r.output;
-		while ((p = strstr(p, "long long _Prism_dim_")) != NULL) {
+		while ((p = strstr(p, "long long __prism_dim_")) != NULL) {
 			dim_defs++;
 			p += 20;
 		}
@@ -2703,7 +2703,7 @@ static void test_nested_bracket_orelse_dim_id_misalignment(void) {
 	if (r.status == PRISM_OK && r.output) {
 		const char *in_func = strstr(r.output, "void f(");
 		if (in_func) {
-			// The nested [2] inside sizeof must NOT be replaced by _Prism_dim_.
+			// The nested [2] inside sizeof must NOT be replaced by __prism_dim_.
 			// If it is, the literal '2' disappears and gets substituted with
 			// the hoisted value of a_fn() — completely wrong semantics.
 			const char *sizeof_start = strstr(in_func, "sizeof");
@@ -2713,16 +2713,16 @@ static void test_nested_bracket_orelse_dim_id_misalignment(void) {
 				const char *dim_in_sizeof = NULL;
 				for (const char *p = sizeof_start; p < end && *p; p++) {
 					if (*p == ')') break;
-					if (p[0] == '_' && p[1] == 'P' && !memcmp(p, "_Prism_dim_", 11)) {
+					if (p[0] == '_' && p[1] == 'P' && !memcmp(p, "__prism_dim_", 11)) {
 						dim_in_sizeof = p;
 						break;
 					}
 				}
 				CHECK(dim_in_sizeof == NULL,
-				      "nested-bracket-orelse: _Prism_dim_ leaked into sizeof() — "
+				      "nested-bracket-orelse: __prism_dim_ leaked into sizeof() — "
 				      "walk_balanced_orelse consumed a dim ID from a nested bracket");
 			}
-			// The [a_fn()] dimension must be replaced by its _Prism_dim_ temp,
+			// The [a_fn()] dimension must be replaced by its __prism_dim_ temp,
 			// not left as a raw call (which double-evaluates a_fn()).
 			const char *arr_decl = strstr(in_func, "int arr[");
 			if (arr_decl) {
@@ -2944,8 +2944,8 @@ static void test_bracket_orelse_vla_decl_fno_zeroinit(void) {
 	      "(feature gate desync: F_ORELSE should work without F_ZEROINIT)");
 	if (r.status == PRISM_OK && r.output) {
 		// Must use the hoisted temp variable, not bare inline ternary
-		CHECK(strstr(r.output, "_Prism_oe_") != NULL,
-		      "bracket-orelse-fno-zeroinit: must emit hoisted _Prism_oe_ temp, "
+		CHECK(strstr(r.output, "__prism_oe_") != NULL,
+		      "bracket-orelse-fno-zeroinit: must emit hoisted __prism_oe_ temp, "
 		      "not fall back to double-evaluating inline ternary");
 	}
 	prism_free(&r);
@@ -3075,7 +3075,7 @@ static void test_bitint_const_typedef_orelse_wrong_temp_type(void) {
 	 *   (_BitInt(8))0 + 0  ->  int (promoted from _BitInt(8)) + int  =  int
 	 * so __typeof__((_BitInt(8))0 + 0) evaluates to int (size 4), NOT _BitInt(8).
 	 *
-	 * The generated temp _Prism_oe_N therefore has type int, not _BitInt(8).
+	 * The generated temp __prism_oe_N therefore has type int, not _BitInt(8).
 	 * Assigning int back to a const _BitInt(8) variable silently truncates:
 	 * bits above bit 7 are discarded, corrupting any value from a fat source.
 	 *
@@ -3522,6 +3522,55 @@ static void test_typeof_orelse_in_sizeof_expr(void) {
 	prism_free(&r);
 }
 
+static void test_bracket_orelse_namespace_collision_noflat(void) {
+	/* BUG: Prism previously generated temporary variables named _Prism_oe_N
+	 * for VLA bracket orelse.  The _Prism prefix is in the ISO C reserved
+	 * namespace (_[A-Z]...).  In non-flatten mode, collect_source_defines
+	 * re-emits user-defined macros from the original source into the
+	 * transpiled output header.  If a source file defines
+	 * #define _Prism_oe_0 42, the re-emitted macro collided with the
+	 * generated variable names.
+	 *
+	 * Fix: renamed generated temporaries to __prism_oe_N (lowercase, __
+	 * prefix) to avoid _[A-Z] reserved namespace collisions. */
+	const char *code =
+	    "#define _Prism_oe_0 42\n"
+	    "#include <stdint.h>\n"
+	    "int get(void) { return 2; }\n"
+	    "int main(void) {\n"
+	    "    int arr[get() orelse 5];\n"
+	    "    arr[0] = 1;\n"
+	    "    return arr[0];\n"
+	    "}\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "namespace-collision: create temp file");
+	if (!path) return;
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = false;
+	PrismResult r = prism_transpile_file(path, feat);
+	if (r.status == PRISM_OK && r.output) {
+		/* The old bug: collect_source_defines re-emits #define _Prism_oe_0 42,
+		 * and the generated variable was also _Prism_oe_0 → collision.
+		 * After renaming to __prism_oe_0, the re-emitted macro should NOT
+		 * appear as a generated variable name. */
+		bool has_reemit = strstr(r.output, "#define _Prism_oe_0 42") != NULL;
+		CHECK(has_reemit, "namespace-collision: user macro '#define _Prism_oe_0 42' "
+		      "re-emitted in non-flatten output");
+		bool has_old_gen = strstr(r.output, "long long _Prism_oe_0 =") != NULL ||
+		                   strstr(r.output, "long long _Prism_oe_0=") != NULL;
+		CHECK(!has_old_gen, "namespace-collision: generated var must NOT use "
+		      "old _Prism_oe_0 name");
+		bool has_new_gen = strstr(r.output, "__prism_oe_") != NULL;
+		CHECK(has_new_gen, "namespace-collision: generated var must use "
+		      "new __prism_oe_ prefix (old _Prism_oe_0 name no longer "
+		      "collides with generated __prism_oe_0 variable)");
+	} else {
+		CHECK(0, "namespace-collision: transpilation failed unexpectedly");
+	}
+	prism_free(&r);
+	unlink(path); free(path);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -3750,4 +3799,7 @@ void run_orelse_tests(void) {
 
 	// Audit round 26: typeof orelse in sizeof / cast expressions
 	test_typeof_orelse_in_sizeof_expr();
+
+	// Audit round 27: namespace pollution — __prism_oe_N collides with user macros
+	test_bracket_orelse_namespace_collision_noflat();
 }

@@ -1570,10 +1570,10 @@ static int capture_function_return_type(Token *tok) {
 static void emit_ret_type(void) {
 	if (ctx->func_ret_type_start && ctx->func_ret_type_end) {
 		if (ctx->func_ret_type_suffix_start) {
-			// typedef PREFIX _Prism_ret_t_N SUFFIX; _Prism_ret_t_N
+			// typedef PREFIX __prism_ret_t_N SUFFIX; __prism_ret_t_N
 			OUT_LIT("typedef ");
 			emit_token_range(ctx->func_ret_type_start, ctx->func_ret_type_end);
-			OUT_LIT(" _Prism_ret_t_");
+			OUT_LIT(" __prism_ret_t_");
 			out_uint(ctx->ret_counter);
 			for (Token *t = ctx->func_ret_type_suffix_start;
 			     t && t != ctx->func_ret_type_suffix_end && t->kind != TK_EOF;
@@ -1581,7 +1581,7 @@ static void emit_ret_type(void) {
 				out_char(' ');
 				out_str(tok_loc(t), t->len);
 			}
-			OUT_LIT("; _Prism_ret_t_");
+			OUT_LIT("; __prism_ret_t_");
 			out_uint(ctx->ret_counter);
 		} else {
 			emit_token_range(ctx->func_ret_type_start, ctx->func_ret_type_end);
@@ -2313,7 +2313,7 @@ static bool declarator_has_bracket_orelse(Token *start, Token *end) {
 }
 
 // Pre-scan a declarator for bracket orelse, emit hoisted temp declarations.
-// Each bracket orelse gets: long long _Prism_oe_ID = (LHS);
+// Each bracket orelse gets: long long __prism_oe_ID = (LHS);
 // When orelse appears in a later bracket, preceding non-orelse brackets
 // are also hoisted to preserve C99 left-to-right VLA evaluation order.
 static void emit_bracket_orelse_temps(Token *start, Token *end) {
@@ -2381,7 +2381,7 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 					 ctx->bracket_oe_cap, 16, unsigned);
 			unsigned oe = ctx->ret_counter++;
 			ctx->bracket_oe_ids[ctx->bracket_oe_count++] = oe;
-			OUT_LIT(" long long _Prism_oe_");
+			OUT_LIT(" long long __prism_oe_");
 			out_uint(oe);
 			OUT_LIT(" = (");
 			// For paren-wrapped orelse, emit LHS from inside the '(' (skip the outer paren).
@@ -2413,7 +2413,7 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 					 ctx->bracket_dim_count, ctx->bracket_dim_cap, 16, unsigned);
 			unsigned dim = ctx->ret_counter++;
 			ctx->bracket_dim_ids[ctx->bracket_dim_count++] = dim;
-			OUT_LIT(" long long _Prism_dim_");
+			OUT_LIT(" long long __prism_dim_");
 			out_uint(dim);
 			OUT_LIT(" = (");
 			emit_token_range(dim_start, dim_end);
@@ -2460,7 +2460,7 @@ static Token *walk_balanced_orelse(Token *tok) {
 			unsigned dim = ctx->bracket_dim_ids[ctx->bracket_dim_next++];
 			if (dim != (unsigned)-1) {
 				emit_tok(tok); // emit [
-				OUT_LIT(" _Prism_dim_");
+				OUT_LIT(" __prism_dim_");
 				out_uint(dim);
 				emit_tok(end); // emit ]
 				return tok_next(end);
@@ -2518,9 +2518,9 @@ static Token *walk_balanced_orelse(Token *tok) {
 	if (is_bracket && ctx->bracket_oe_next < ctx->bracket_oe_count) {
 		// Use pre-hoisted temp variable (emitted before the declaration)
 		unsigned oe = ctx->bracket_oe_ids[ctx->bracket_oe_next++];
-		OUT_LIT(" _Prism_oe_");
+		OUT_LIT(" __prism_oe_");
 		out_uint(oe);
-		OUT_LIT(" ? _Prism_oe_");
+		OUT_LIT(" ? __prism_oe_");
 		out_uint(oe);
 		OUT_LIT(" : (");
 		emit_token_range_orelse(rhs_start, rhs_end);
@@ -2734,7 +2734,7 @@ static Token *emit_goto_defer(Token *tok) {
 
 // const + fallback orelse: roll back speculative output, re-emit with temp variable.
 // MSVC-compatible: instead of "const T x = val ?: fallback;",
-// emit: "T _Prism_oe_N = (val); if (!_Prism_oe_N) _Prism_oe_N = (fallback); const T x = _Prism_oe_N;"
+// emit: "T __prism_oe_N = (val); if (!__prism_oe_N) __prism_oe_N = (fallback); const T x = __prism_oe_N;"
 // Handles chained orelse naturally: each chain link adds another if-assignment on the temp.
 // Returns token after fallback expression (at ';' or boundary comma).
 static Token *handle_const_orelse_fallback(Token *tok,
@@ -2807,7 +2807,7 @@ static Token *handle_const_orelse_fallback(Token *tok,
 		emit_tok(t);
 	}
 	
-	OUT_LIT(" _Prism_oe_");
+	OUT_LIT(" __prism_oe_");
 	out_uint(oe_id);
 	emit_range(tok_next(decl->var_name), decl->end);
 	OUT_LIT(" = (");
@@ -2817,7 +2817,7 @@ static Token *handle_const_orelse_fallback(Token *tok,
 	// Emit fallback: chained orelse adds if-assignments; control flow gets a block.
 	for (;;) {
 		if (tok->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) {
-			OUT_LIT(" if (!_Prism_oe_");
+			OUT_LIT(" if (!__prism_oe_");
 			out_uint(oe_id);
 			OUT_LIT(") {");
 			if (tok->tag & TT_RETURN) {
@@ -2834,11 +2834,11 @@ static Token *handle_const_orelse_fallback(Token *tok,
 		}
 
 		// Ternary instead of if-assignment to preserve compound literal lifetime.
-		OUT_LIT(" _Prism_oe_");
+		OUT_LIT(" __prism_oe_");
 		out_uint(oe_id);
-		OUT_LIT(" = _Prism_oe_");
+		OUT_LIT(" = __prism_oe_");
 		out_uint(oe_id);
-		OUT_LIT(" ? _Prism_oe_");
+		OUT_LIT(" ? __prism_oe_");
 		out_uint(oe_id);
 		OUT_LIT(" : (");
 
@@ -2864,13 +2864,13 @@ static Token *handle_const_orelse_fallback(Token *tok,
 		if (!chained) break;
 	}
 
-	// Emit final const declaration: "const T declarator = _Prism_oe_N;"
+	// Emit final const declaration: "const T declarator = __prism_oe_N;"
 	if (pragma_start != type_start)
 		emit_range(pragma_start, type_start);
 	emit_range(type_start, type->end);
 	parse_declarator(decl_start, true);
 
-	OUT_LIT(" = _Prism_oe_");
+	OUT_LIT(" = __prism_oe_");
 	out_uint(oe_id);
 	out_char(';');
 	return tok;
@@ -3702,7 +3702,7 @@ static Token *emit_return_body(Token *tok, Token *stop) {
 			bool is_void = is_void_return(tok);
 			if (!is_void) {
 				out_char(' '); emit_ret_type();
-				OUT_LIT(" _Prism_ret_"); out_uint(ctx->ret_counter); OUT_LIT(" = (");
+				OUT_LIT(" __prism_ret_"); out_uint(ctx->ret_counter); OUT_LIT(" = (");
 			} else OUT_LIT(" (");
 
 			if (stop)
@@ -3712,7 +3712,7 @@ static Token *emit_return_body(Token *tok, Token *stop) {
 			OUT_LIT(");");
 			emit_all_defers();
 
-			if (!is_void) { OUT_LIT(" return _Prism_ret_"); out_uint(ctx->ret_counter++); }
+			if (!is_void) { OUT_LIT(" return __prism_ret_"); out_uint(ctx->ret_counter++); }
 			else OUT_LIT(" return");
 			out_char(';');
 		}
@@ -4354,6 +4354,7 @@ static void collect_source_defines(const char *input_file) {
 	size_t line_cap = 0;
 	bool in_continuation = false;
 	bool in_block_comment = false;
+	int cond_depth = 0; // #if/#ifdef/#ifndef nesting depth
 	while (getline(&line, &line_cap, f) >= 0) {
 		// Track multi-line block comments
 		if (in_block_comment) {
@@ -4384,8 +4385,31 @@ static void collect_source_defines(const char *input_file) {
 			break;
 		}
 		p++; // skip '#'
-		while (*p == ' ' || *p == '\t') p++;
+		while (*p == ' ' || *p == '\t' || (p[0] == '/' && p[1] == '*')) {
+			if (p[0] == '/' && p[1] == '*') {
+				char *end = strstr(p + 2, "*/");
+				if (!end) goto check_continuation; // unterminated block comment
+				p = end + 2;
+			} else
+				p++;
+		}
 		if (strncmp(p, "include", 7) == 0) break; // #include reached — stop
+
+		// Track #if/#ifdef/#ifndef/#elif/#else/#endif nesting
+		if (strncmp(p, "ifdef", 5) == 0 || strncmp(p, "ifndef", 6) == 0 ||
+		    (strncmp(p, "if", 2) == 0 && (p[2] == ' ' || p[2] == '\t' || p[2] == '('))) {
+			cond_depth++;
+			goto check_continuation;
+		}
+		if (strncmp(p, "endif", 5) == 0) {
+			if (cond_depth > 0) cond_depth--;
+			goto check_continuation;
+		}
+		if (strncmp(p, "else", 4) == 0 || strncmp(p, "elif", 4) == 0)
+			goto check_continuation;
+
+		// Only extract defines at unconditional scope (cond_depth == 0)
+		if (cond_depth > 0) goto check_continuation;
 
 		if (strncmp(p, "define", 6) == 0 && (p[6] == ' ' || p[6] == '\t')) {
 			p += 6;

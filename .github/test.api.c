@@ -1991,8 +1991,8 @@ static void test_fnptr_return_type_capture(void) {
 		if (result.output) {
 			CHECK(strstr(result.output, "__auto_type") == NULL,
 			      "bug_r2: fnptr return has no __auto_type");
-			CHECK(strstr(result.output, "_Prism_ret") != NULL,
-			      "bug_r2: fnptr return has _prism_ret (captured type)");
+			CHECK(strstr(result.output, "__prism_ret") != NULL,
+			      "bug_r2: fnptr return has __prism_ret (captured type)");
 		}
 		prism_free(&result);
 		unlink(path);
@@ -2086,7 +2086,7 @@ static void test_nested_fnptr_return_type(void) {
 	if (r.output) {
 		CHECK(strstr(r.output, "__auto_type") == NULL,
 		      "nested fnptr ret: no __auto_type (type captured)");
-		CHECK(strstr(r.output, "_Prism_ret_t_") != NULL,
+		CHECK(strstr(r.output, "__prism_ret_t_") != NULL,
 		      "nested fnptr ret: has typedef for return type");
 	}
 	prism_free(&r);
@@ -2837,7 +2837,7 @@ static void test_pragma_return_type_capture(void) {
 	if (r.output) {
 		// If return type was captured correctly, the defer variable should use "int"
 		// not __auto_type or void*
-		CHECK(strstr(r.output, "int _Prism_ret") != NULL,
+		CHECK(strstr(r.output, "int __prism_ret") != NULL,
 		      "pragma ret: exact return type captured");
 	}
 	prism_free(&r);
@@ -3419,7 +3419,7 @@ static void test_const_orelse_attr_preserved(void) {
 	CHECK_EQ(r.status, PRISM_OK, "const orelse attr: transpiles OK");
 	if (r.output) {
 		// The attribute must appear on the mutable temp
-		char *temp = strstr(r.output, "_Prism_oe_");
+		char *temp = strstr(r.output, "__prism_oe_");
 		CHECK(temp != NULL, "const orelse attr: temp variable emitted");
 		if (temp) {
 			// Find the line containing the temp - attribute must precede it
@@ -5707,6 +5707,87 @@ static void test_cli_main_leak_asan(void) {
 }
 #endif
 
+static void test_collect_source_defines_comment_in_directive(void) {
+	/* BUG: collect_source_defines() skips '#' then whitespace, then checks
+	 * strncmp(p, "define", 6).  The C standard (§6.10) allows comments
+	 * between '#' and the directive name:  # /<star> <star>/ define FOO 42
+	 * is valid C preprocessing.  GCC/Clang accept it.  But the scanner
+	 * sees '/' after '#', fails the "define" check, and falls through to
+	 * check_continuation — the define is silently dropped.  In non-flatten
+	 * mode, this means ABI-altering macros can vanish from the re-emitted
+	 * header, silently corrupting struct layouts. */
+	const char *code =
+	    "# /* */ define MY_COMMENT_MACRO 99\n"
+	    "#include <stdint.h>\n"
+	    "int v = MY_COMMENT_MACRO;\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "comment-in-directive: create temp file");
+	if (!path) return;
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = false;
+	PrismResult r = prism_transpile_file(path, feat);
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "MY_COMMENT_MACRO") != NULL,
+		      "comment-in-directive: '# /* */ define FOO VAL' must be "
+		      "re-emitted (C standard allows comments between # and "
+		      "directive name; collect_source_defines silently drops it)");
+	} else {
+		CHECK(0, "comment-in-directive: transpilation failed unexpectedly");
+	}
+	prism_free(&r);
+	unlink(path); free(path);
+}
+
+static void test_collect_source_defines_ifdef_both_branches_extracted(void) {
+	/* BUG: collect_source_defines() is a raw text scanner with no
+	 * conditional-compilation awareness.  When it encounters:
+	 *   #ifdef _WIN32
+	 *   #define PLAT 1
+	 *   #else
+	 *   #define PLAT 2
+	 *   #endif
+	 * it extracts BOTH defines unconditionally.  emit_define_guarded()
+	 * wraps each in #ifndef, so the FIRST extracted value always wins
+	 * regardless of which branch the preprocessor actually took.
+	 * On Linux, the preprocessor chose PLAT=2, but the re-emitted output
+	 * emits PLAT=1 first (guarded by #ifndef), so the backend compiler
+	 * sees PLAT=1 → wrong value → silent ABI or logic mismatch. */
+	const char *code =
+	    "#ifdef _WIN32\n"
+	    "#define PLAT_IFDEF_BUG 1\n"
+	    "#else\n"
+	    "#define PLAT_IFDEF_BUG 2\n"
+	    "#endif\n"
+	    "#include <stdint.h>\n"
+	    "int v = PLAT_IFDEF_BUG;\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "ifdef-both-branches: create temp file");
+	if (!path) return;
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = false;
+	PrismResult r = prism_transpile_file(path, feat);
+	if (r.status == PRISM_OK && r.output) {
+		/* Count how many times PLAT_IFDEF_BUG appears in #define lines.
+		 * If collect_source_defines extracts both branches, there will
+		 * be two #define PLAT_IFDEF_BUG lines (each inside #ifndef). */
+		int define_count = 0;
+		const char *p = r.output;
+		while ((p = strstr(p, "#define PLAT_IFDEF_BUG")) != NULL) {
+			define_count++;
+			p += 21;
+		}
+		CHECK(define_count <= 1,
+		      "ifdef-both-branches: #ifdef/#else defines must not BOTH "
+		      "be extracted (collect_source_defines has no conditional "
+		      "compilation awareness; both branch values re-emitted; "
+		      "first #ifndef guard wins → wrong value for backend)");
+	} else {
+		CHECK(0, "ifdef-both-branches: transpilation failed unexpectedly");
+	}
+	prism_free(&r);
+	unlink(path); free(path);
+}
+
 void run_api_tests(void) {
 test_typeof_orelse_leak();
 	printf("\n=== API TESTS ===\n");
@@ -5891,4 +5972,8 @@ test_typeof_orelse_leak();
 #ifndef _WIN32
 	test_cli_main_leak_asan();
 #endif
+
+	// Audit round 27: collect_source_defines comment-in-directive + ifdef branches
+	test_collect_source_defines_comment_in_directive();
+	test_collect_source_defines_ifdef_both_branches_extracted();
 }

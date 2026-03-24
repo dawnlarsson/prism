@@ -2419,7 +2419,7 @@ static void test_defer_fnptr_return_type_overwrite(void) {
 	if (r.output) {
 		CHECK(strstr(r.output, "typedef") != NULL,
 		      "defer fnptr return type: generates typedef for complex return");
-		CHECK(strstr(r.output, "_Prism_ret_t_") != NULL,
+		CHECK(strstr(r.output, "__prism_ret_t_") != NULL,
 		      "defer fnptr return type: uses named typedef");
 	}
 	prism_free(&r);
@@ -2546,6 +2546,78 @@ static void test_defer_in_generic_stmt_expr(void) {
 	CHECK(strstr(r.output, "cleanup()"),
 	      "cleanup() must be emitted by defer expansion inside _Generic stmt-expr");
 	prism_free(&r);
+}
+
+static void test_defer_user_noreturn_no_warning(void) {
+	/* BUG: Prism detects hardcoded noreturn functions (abort, exit, _Exit,
+	 * quick_exit, thrd_exit, __builtin_trap, __builtin_unreachable) via
+	 * TT_NORETURN_FN and warns when they're called with active defers.
+	 * But user-defined noreturn functions declared with _Noreturn,
+	 * __attribute__((noreturn)), or [[noreturn]] are NOT recognized.
+	 * If a developer writes:
+	 *   _Noreturn void my_panic(const char *msg);
+	 *   void f(void) { defer cleanup(); my_panic("fatal"); }
+	 * Prism silently accepts this without warning, even though defers will
+	 * never run.  This is dangerous in safety-critical / kernel code where
+	 * defer is relied upon for resource cleanup.
+	 *
+	 * The test captures stderr from lib-mode transpilation and verifies
+	 * that calling a _Noreturn-declared function with active defers
+	 * produces the same warning as calling abort(). */
+
+	/* Baseline: abort() with active defer DOES warn */
+	const char *code_abort =
+	    "void cleanup(void);\n"
+	    "void f(void) {\n"
+	    "    defer cleanup();\n"
+	    "    abort();\n"
+	    "}\n";
+	int pipefd[2];
+	pipe(pipefd);
+	int saved = dup(STDERR_FILENO);
+	dup2(pipefd[1], STDERR_FILENO);
+	PrismResult r1 = prism_transpile_source(code_abort, "abort_warn.c",
+						prism_defaults());
+	fflush(stderr);
+	dup2(saved, STDERR_FILENO);
+	close(saved);
+	close(pipefd[1]);
+	char buf[4096];
+	int n = read(pipefd[0], buf, sizeof(buf) - 1);
+	buf[n > 0 ? n : 0] = '\0';
+	close(pipefd[0]);
+	CHECK(r1.status == PRISM_OK, "noreturn-warn: abort transpile succeeds");
+	CHECK(n > 0 && strstr(buf, "warning") != NULL,
+	      "noreturn-warn: abort() with defer produces warning (baseline)");
+	prism_free(&r1);
+
+	/* Bug case: _Noreturn function with active defer gets NO warning */
+	const char *code_noreturn =
+	    "_Noreturn void my_panic(void);\n"
+	    "void cleanup(void);\n"
+	    "void f(void) {\n"
+	    "    defer cleanup();\n"
+	    "    my_panic();\n"
+	    "}\n";
+	pipe(pipefd);
+	saved = dup(STDERR_FILENO);
+	dup2(pipefd[1], STDERR_FILENO);
+	PrismResult r2 = prism_transpile_source(code_noreturn, "noreturn_warn.c",
+						prism_defaults());
+	fflush(stderr);
+	dup2(saved, STDERR_FILENO);
+	close(saved);
+	close(pipefd[1]);
+	n = read(pipefd[0], buf, sizeof(buf) - 1);
+	buf[n > 0 ? n : 0] = '\0';
+	close(pipefd[0]);
+	CHECK(r2.status == PRISM_OK, "noreturn-warn: _Noreturn transpile succeeds");
+	CHECK(n > 0 && strstr(buf, "warning") != NULL,
+	      "noreturn-warn: _Noreturn user function with active defer must "
+	      "warn ('_Noreturn void my_panic()' is not in hardcoded "
+	      "TT_NORETURN_FN list; Phase 1 body scanner ignores _Noreturn / "
+	      "__attribute__((noreturn)) specifiers on declarations)");
+	prism_free(&r2);
 }
 
 void run_defer_tests(void) {
@@ -2713,4 +2785,9 @@ void run_defer_tests(void) {
 
 	// Audit round 30: in_generic() scope leak
 	test_defer_in_generic_stmt_expr();
+
+	// Audit round 27: user-defined _Noreturn function with defer gets no warning
+#ifndef _WIN32
+	test_defer_user_noreturn_no_warning();
+#endif
 }

@@ -1779,6 +1779,78 @@ static Token *tokenize(File *file) {
 		}
 	}
 
+	// Phase: detect user-defined noreturn functions from declarations.
+	// Scan file-scope tokens for _Noreturn, noreturn, [[noreturn]],
+	// or __attribute__((noreturn)) / __attribute__((__noreturn__)).
+	// When a noreturn specifier is found before a function declaration,
+	// tag all occurrences of that function name with TT_NORETURN_FN.
+	{
+		for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
+			bool is_noreturn = false;
+			Token *scan_start = t;
+
+			// _Noreturn or noreturn keyword
+			if (t->kind <= TK_KEYWORD &&
+			    (equal(t, "_Noreturn") || equal(t, "noreturn")))
+				is_noreturn = true;
+
+			// [[noreturn]] — C23 attribute
+			if (tok_loc(t)[0] == '[' && (t->flags & TF_C23_ATTR) && t->match_idx) {
+				Token *inner = tok_next(t);
+				if (inner && tok_loc(inner)[0] == '[') {
+					Token *attr = tok_next(inner);
+					if (attr && attr->kind == TK_IDENT &&
+					    (equal(attr, "noreturn") || equal(attr, "_Noreturn")))
+						is_noreturn = true;
+				}
+			}
+
+			// __attribute__((noreturn)) or __attribute__((__noreturn__))
+			if (t->kind <= TK_KEYWORD && equal(t, "__attribute__")) {
+				Token *p1 = tok_next(t);
+				if (p1 && tok_loc(p1)[0] == '(') {
+					Token *p2 = tok_next(p1);
+					if (p2 && tok_loc(p2)[0] == '(') {
+						Token *attr = tok_next(p2);
+						if (attr && attr->kind == TK_IDENT &&
+						    (equal(attr, "noreturn") || equal(attr, "__noreturn__")))
+							is_noreturn = true;
+					}
+				}
+			}
+
+			if (!is_noreturn) continue;
+
+			// Found noreturn annotation.  Look forward for function name:
+			// the last TK_IDENT before the first depth-0 '(' before ';' or '{'.
+			Token *fn_name = NULL;
+			for (Token *s = scan_start; s && s->kind != TK_EOF; s = tok_next(s)) {
+				char ch = tok_loc(s)[0];
+				if (ch == ';' || ch == '{') break;
+				if (s->kind == TK_IDENT && tok_next(s) &&
+				    tok_loc(tok_next(s))[0] == '(') {
+					// Skip known type/qualifier keywords
+					if (s->tag & (TT_SKIP_DECL | TT_INLINE | TT_QUALIFIER |
+						       TT_TYPE | TT_STORAGE))
+						continue;
+					if (equal(s, "_Noreturn") || equal(s, "noreturn") ||
+					    equal(s, "__attribute__") || equal(s, "void") ||
+					    equal(s, "__typeof__") || equal(s, "typeof"))
+						continue;
+					fn_name = s;
+					break;
+				}
+			}
+			if (!fn_name) continue;
+
+			// Tag all occurrences of this function name with TT_NORETURN_FN
+			for (Token *s = first; s && s->kind != TK_EOF; s = tok_next(s)) {
+				if (s->kind == TK_IDENT && tok_name_eq(s, fn_name))
+					s->tag |= TT_NORETURN_FN;
+			}
+		}
+	}
+
 	return first;
 }
 
