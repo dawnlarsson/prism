@@ -3571,6 +3571,92 @@ static void test_bracket_orelse_namespace_collision_noflat(void) {
 	unlink(path); free(path);
 }
 
+static void test_compound_literal_orelse_if_inside_init(void) {
+	/* BUG: Compound literal with orelse in designated initializer:
+	 *   call_func((struct S){ .a = f() orelse 1, .b = 10 });
+	 * Prism doesn't classify compound literal braces as struct/init scope.
+	 * The '{' is preceded by ')' (compound literal cast close-paren), not
+	 * '=' (initializer) or struct keyword.  So in_struct_body() returns
+	 * false, and the bare-expression orelse transform fires on '.a = f()
+	 * orelse 1', injecting an 'if' block inside the initializer list.
+	 * Output: call_func((struct S){ { if (!( .a = f())) .a = ( 1); } .b = 10 });
+	 * This is catastrophically invalid C. */
+	PrismResult r = prism_transpile_source(
+	    "struct S { int a; int b; };\n"
+	    "int f(void) { return 42; }\n"
+	    "void call_func(struct S s);\n"
+	    "void test(void) {\n"
+	    "    call_func((struct S){ .a = f() orelse 1, .b = 10 });\n"
+	    "}\n",
+	    "compound_literal_orelse.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		const char *fn = strstr(r.output, "void test(");
+		if (fn) {
+			/* Bug signature: bare-orelse if() block injected inside
+			 * the compound literal initializer list. */
+			CHECK(strstr(fn, "if (!(") == NULL &&
+			      strstr(fn, "if(!(") == NULL,
+			      "compound-literal-orelse: 'if(!(...)' must not appear "
+			      "inside compound literal initializer (bare-orelse transform "
+			      "fires because compound literal braces aren't classified as "
+			      "struct/init scope)");
+		} else {
+			CHECK(0, "compound-literal-orelse: test() function not found in output");
+		}
+	} else if (r.status != PRISM_OK && r.error_msg) {
+		/* An error diagnostic rejecting orelse inside compound literal
+		 * is also an acceptable outcome (better than corrupt output). */
+		CHECK(1, "compound-literal-orelse: rejected with error (acceptable)");
+	} else {
+		CHECK(0, "compound-literal-orelse: unexpected failure");
+	}
+	prism_free(&r);
+}
+
+static void test_typeof_vla_volatile_double_read(void) {
+	/* BUG: typeof(int[volatile_var orelse 1]) produces an inline ternary:
+	 *   typeof(int[ (volatile_var) ? (volatile_var) : (1)]) arr;
+	 * The volatile variable is read TWICE (condition + value).
+	 *
+	 * For regular VLA declarations, Prism hoists to a temp:
+	 *   long long __prism_oe_0 = (volatile_var);
+	 *   int arr[__prism_oe_0 ? __prism_oe_0 : (1)];
+	 * — only one read.  But for typeof, the bracket orelse is
+	 * processed by walk_balanced_orelse's inline ternary path
+	 * (no pre-hoisted temp), causing double volatile evaluation.
+	 *
+	 * reject_orelse_side_effects catches *ptr dereference and
+	 * function calls, but NOT direct volatile variable reads. */
+	PrismResult r = prism_transpile_source(
+	    "volatile int hw_reg = 42;\n"
+	    "void f(void) {\n"
+	    "    typeof(int[hw_reg orelse 1]) arr;\n"
+	    "    (void)arr;\n"
+	    "}\n",
+	    "typeof_vla_volatile.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		const char *fn = strstr(r.output, "void f(");
+		if (fn) {
+			/* Bug signature: '(hw_reg) ? (hw_reg)' — LHS duplicated
+			 * in ternary condition + value arm. */
+			bool double_read = strstr(fn, "(hw_reg) ? (hw_reg)") != NULL ||
+			                   strstr(fn, "(hw_reg)?(hw_reg)") != NULL;
+			CHECK(!double_read,
+			      "typeof-vla-volatile: volatile variable must not be read "
+			      "twice in typeof VLA ternary (walk_balanced_orelse inline "
+			      "path doesn't hoist to temp for typeof brackets)");
+		} else {
+			CHECK(0, "typeof-vla-volatile: f() function not found in output");
+		}
+	} else if (r.status != PRISM_OK && r.error_msg) {
+		/* An error rejecting volatile orelse in typeof is acceptable. */
+		CHECK(1, "typeof-vla-volatile: rejected with error (acceptable)");
+	} else {
+		CHECK(0, "typeof-vla-volatile: unexpected failure");
+	}
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -3802,4 +3888,10 @@ void run_orelse_tests(void) {
 
 	// Audit round 27: namespace pollution — __prism_oe_N collides with user macros
 	test_bracket_orelse_namespace_collision_noflat();
+
+	// Audit round 28: compound literal orelse + typeof VLA volatile double-read
+	test_compound_literal_orelse_if_inside_init();
+#ifdef __GNUC__
+	test_typeof_vla_volatile_double_read();
+#endif
 }

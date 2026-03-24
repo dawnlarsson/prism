@@ -5788,6 +5788,69 @@ static void test_collect_source_defines_ifdef_both_branches_extracted(void) {
 	unlink(path); free(path);
 }
 
+static void test_collect_source_defines_after_code_line(void) {
+	/* BUG: collect_source_defines() scans the source file line-by-line and
+	 * breaks the scan on the first non-preprocessor, non-blank, non-comment
+	 * line.  If an ABI-altering #define appears AFTER a typedef, global
+	 * variable, or any other code line, the scanner stops before reaching
+	 * it.  The define is consumed by cc -E (affecting preprocessor output),
+	 * but NOT captured for re-emission in non-flatten mode.
+	 *
+	 * Result: the transpiled output is missing the ABI define.  When the
+	 * output is compiled by the backend, the missing define can change
+	 * struct layouts, type sizes (e.g. off_t 32→64-bit), or feature
+	 * availability — a silent ABI mismatch.
+	 *
+	 * Test: place #define _FILE_OFFSET_BITS 64 after a typedef line.
+	 * Control: same define before the typedef is captured correctly. */
+	const char *buggy_code =
+	    "typedef int myint;\n"
+	    "#define _FILE_OFFSET_BITS 64\n"
+	    "#include <stdint.h>\n"
+	    "myint x = 0;\n";
+	char *buggy_path = create_temp_file(buggy_code);
+	CHECK(buggy_path != NULL, "source-define-after-code: create buggy temp file");
+	if (!buggy_path) return;
+
+	const char *control_code =
+	    "#define _FILE_OFFSET_BITS 64\n"
+	    "typedef int myint;\n"
+	    "#include <stdint.h>\n"
+	    "myint x = 0;\n";
+	char *control_path = create_temp_file(control_code);
+	CHECK(control_path != NULL, "source-define-after-code: create control temp file");
+	if (!control_path) { unlink(buggy_path); free(buggy_path); return; }
+
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = false;
+
+	/* Control: define at top → should be re-emitted. */
+	PrismResult rc = prism_transpile_file(control_path, feat);
+	bool control_has_define = (rc.status == PRISM_OK && rc.output &&
+	                           strstr(rc.output, "_FILE_OFFSET_BITS") != NULL);
+	CHECK(control_has_define,
+	      "source-define-after-code: control case (define at top) must "
+	      "re-emit _FILE_OFFSET_BITS in non-flatten output");
+	prism_free(&rc);
+
+	/* Buggy: define after typedef → should also be re-emitted. */
+	PrismResult rb = prism_transpile_file(buggy_path, feat);
+	if (rb.status == PRISM_OK && rb.output) {
+		bool has_define = strstr(rb.output, "_FILE_OFFSET_BITS") != NULL;
+		CHECK(has_define,
+		      "source-define-after-code: _FILE_OFFSET_BITS must be "
+		      "re-emitted even when placed after a typedef line "
+		      "(collect_source_defines stops scanning at first "
+		      "non-preprocessor line, losing ABI-altering macros)");
+	} else {
+		CHECK(0, "source-define-after-code: transpilation failed unexpectedly");
+	}
+	prism_free(&rb);
+
+	unlink(buggy_path); free(buggy_path);
+	unlink(control_path); free(control_path);
+}
+
 void run_api_tests(void) {
 test_typeof_orelse_leak();
 	printf("\n=== API TESTS ===\n");
@@ -5976,4 +6039,7 @@ test_typeof_orelse_leak();
 	// Audit round 27: collect_source_defines comment-in-directive + ifdef branches
 	test_collect_source_defines_comment_in_directive();
 	test_collect_source_defines_ifdef_both_branches_extracted();
+
+        // Audit round 28: collect_source_defines scan cutoff at non-preprocessor line
+        test_collect_source_defines_after_code_line();
 }

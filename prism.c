@@ -200,6 +200,7 @@ enum {
 	P1_OE_BRACKET        = 1 << 4, // orelse inside array dimension brackets
 	P1_OE_DECL_INIT      = 1 << 5, // orelse inside declaration initializer
 	P1_IS_DECL           = 1 << 6, // Phase 1D: token starts a variable declaration
+	P1_SCOPE_INIT        = 1 << 7, // This '{' opens an initializer (compound literal, = {...})
 };
 
 #define tok_ann(t) (p1_ann[tok_idx(t)])
@@ -2532,13 +2533,22 @@ static Token *walk_balanced_orelse(Token *tok) {
 					  "in the LHS (would be evaluated twice); "
 					  "hoist the expression to a variable first",
 					  false, is_bracket, false);
-		OUT_LIT(" (");
+		// Use statement expression to evaluate LHS exactly once,
+		// preventing double evaluation of volatile reads or side effects
+		// that sneak past reject_orelse_side_effects (e.g. bare volatile
+		// variable reads in typeof VLA dimensions).
+		unsigned oe = ctx->ret_counter++;
+		OUT_LIT(" ({long long __prism_oe_");
+		out_uint(oe);
+		OUT_LIT(" = (");
 		emit_token_range(lhs_start, orelse_found);
-		OUT_LIT(") ? (");
-		emit_token_range(lhs_start, orelse_found);
-		OUT_LIT(") : (");
+		OUT_LIT("); __prism_oe_");
+		out_uint(oe);
+		OUT_LIT(" ? __prism_oe_");
+		out_uint(oe);
+		OUT_LIT(" : (");
 		emit_token_range_orelse(rhs_start, rhs_end);
-		OUT_LIT(")");
+		OUT_LIT("); })");
 	}
 	emit_tok(end); // emit ] or )
 	return tok_next(end);
@@ -3986,7 +3996,7 @@ static Token *handle_open_brace(Token *tok) {
 	s->is_conditional = ann & P1_SCOPE_CONDITIONAL;
 	if (is_stmt_expr) s->is_stmt_expr = true;
 	if (orelse_guard) s->is_orelse_guard = true;
-	if (is_initializer) s->is_struct = true;
+	if (is_initializer || (ann & P1_SCOPE_INIT)) s->is_struct = true;
 
 	ctx->at_stmt_start = true;
 	return tok;
@@ -4381,8 +4391,10 @@ static void collect_source_defines(const char *input_file) {
 					in_block_comment = true;
 				continue;
 			}
-			// Non-preprocessor, non-blank line — stop scanning
-			break;
+			// Non-preprocessor, non-blank line — skip and continue
+			// scanning for ABI-altering defines that may appear after
+			// code lines (e.g. typedef or global declarations)
+			continue;
 		}
 		p++; // skip '#'
 		while (*p == ' ' || *p == '\t' || (p[0] == '/' && p[1] == '*')) {
@@ -5122,6 +5134,11 @@ static void p1_build_scope_tree(Token *start) {
 					if (depth == 0 && !si->is_loop && !si->is_switch && !si->is_conditional
 					    && !si->is_struct)
 						si->is_func_body = true;
+					// Compound literal: inner-scope ')' + '{' with no
+					// control keyword (e.g. (struct S){.a = 1})
+					if (depth > 0 && !si->is_loop && !si->is_switch && !si->is_conditional
+					    && !si->is_struct && !si->is_func_body)
+						si->is_init = true;
 				} else if ((prev->tag & TT_IF) && tok_loc(prev)[0] == 'e') {
 					// 'else' keyword (TT_IF covers both if and else; 'e' distinguishes)
 					si->is_conditional = true;
@@ -5174,6 +5191,7 @@ static void p1_build_scope_tree(Token *start) {
 			if (si->is_loop) ann |= P1_SCOPE_LOOP;
 			if (si->is_switch) ann |= P1_SCOPE_SWITCH;
 			if (si->is_conditional) ann |= P1_SCOPE_CONDITIONAL;
+			if (si->is_init) ann |= P1_SCOPE_INIT;
 			p1_ann[tidx] = ann;
 
 			scope_tree_count++;
