@@ -2635,11 +2635,11 @@ static void test_orelse_backtrack_desync(void) {
 	prism_free(&r);
 }
 
-static void test_orelse_nested_paren_rejected(void) {
-	printf("\n--- Orelse Nested Paren Rejected ---\n");
+static void test_orelse_nested_paren_accepted(void) {
+	printf("\n--- Orelse Paren-Wrapped Accepted ---\n");
 
-	// orelse inside parentheses cannot be expanded to statement-level
-	// if-checks. Must produce a clear error, not silently emit invalid C.
+	// Paren-wrapped orelse in declaration initializers is accepted
+	// (macro hygiene pattern: #define GET(x) (f(x) orelse 0)).
 	const char *code =
 	    "int get(void) { return 0; }\n"
 	    "void f(void) {\n"
@@ -2647,13 +2647,11 @@ static void test_orelse_nested_paren_rejected(void) {
 	    "}\n";
 
 	PrismFeatures feat = prism_defaults();
-	PrismResult r = prism_transpile_source(code, "paren_orelse.c", feat);
-	CHECK(r.status != PRISM_OK, "orelse nested paren: rejected");
-	if (r.error_msg) {
-		CHECK(strstr(r.error_msg, "orelse") != NULL,
-		      "orelse nested paren: error mentions orelse");
-		CHECK(strstr(r.error_msg, "parenthes") != NULL,
-		      "orelse nested paren: error mentions parentheses");
+	PrismResult r = prism_transpile_source(code, "paren_wrap.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "orelse paren wrap: accepted");
+	if (r.output) {
+		CHECK(strstr(r.output, " orelse ") == NULL,
+		      "orelse paren wrap: keyword transformed away");
 	}
 	prism_free(&r);
 }
@@ -5165,12 +5163,12 @@ static void test_signal_temps_ready_flag(void) {
 	CHECK(signal_temps[0][0] != '\0', "signal-ready: slot 0 has path data");
 
 	// The ready flag must be set (slot is safe to read by signal handler)
-	CHECK(signal_temps_ready[0] != 0,
+	CHECK(signal_temps_ready_load(0) != 0,
 	      "signal-ready: slot 0 ready flag set after memcpy "
 	      "(prevents TOCTOU unlink of partial path)");
 
 	signal_temps_clear();
-	CHECK(signal_temps_ready[0] == 0,
+	CHECK(signal_temps_ready_load(0) == 0,
 	      "signal-ready: ready flag cleared after signal_temps_clear");
 
 	if (saved > 0) signal_temps_store(saved);
@@ -5917,7 +5915,7 @@ test_typeof_orelse_leak();
 	test_typeof_memset_no_shadow();
 	test_c23_constexpr_thread_local();
 	test_orelse_backtrack_desync();
-	test_orelse_nested_paren_rejected();
+	test_orelse_nested_paren_accepted();
 	test_vla_var_not_typedef();
 	test_orelse_typedef_cast_comma();
 	test_atomic_typedef_qualifier();

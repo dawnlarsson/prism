@@ -6882,12 +6882,18 @@ static void test_negative_parse_corpus(void) {
 	    "}\n",
 	    "neg_if_defer.c", "negative corpus: braceless defer rejected", "defer");
 
-	expect_parse_rejects(
-	    "int get(void) { return 0; }\n"
-	    "void f(void) {\n"
-	    "    int x = (get() orelse 0);\n"
-	    "}\n",
-	    "neg_paren_orelse.c", "negative corpus: parenthesized orelse rejected", "orelse");
+	// Paren-wrapped orelse in declaration initializers is now accepted
+	// (macro hygiene). Verify it transpiles successfully.
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get(void) { return 0; }\n"
+		    "void f(void) {\n"
+		    "    int x = (get() orelse 0);\n"
+		    "}\n",
+		    "paren_wrap_ok.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "positive corpus: parenthesized orelse accepted");
+		prism_free(&r);
+	}
 
 	expect_parse_rejects(
 	    "int main(void) {\n"

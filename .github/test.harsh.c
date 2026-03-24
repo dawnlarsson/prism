@@ -66,7 +66,6 @@ static void test_harsh_error_recovery_barrage(void) {
     const char *bad[] = {
         "int main(void) { for (; defer 0;) {} return 0; }\n",
         "int main(void) { if (1) defer (void)0; return 0; }\n",
-        "int get(void) { return 0; }\nvoid f(void) { int x = (get() orelse 0); }\n",
     };
 
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {

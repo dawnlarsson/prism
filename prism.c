@@ -351,6 +351,8 @@ static volatile sig_atomic_t signal_temps_count = 0;
 				    false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
 #define cached_env_load()       __atomic_load_n(&cached_clean_env, __ATOMIC_ACQUIRE)
 #define cached_env_store(val)   __atomic_store_n(&cached_clean_env, (val), __ATOMIC_RELEASE)
+#define signal_temps_ready_store(idx, val) __atomic_store_n(&signal_temps_ready[(idx)], (val), __ATOMIC_RELEASE)
+#define signal_temps_ready_load(idx)       __atomic_load_n(&signal_temps_ready[(idx)], __ATOMIC_ACQUIRE)
 #endif
 
 static void signal_temps_register(const char *path) {
@@ -367,13 +369,13 @@ static void signal_temps_register(const char *path) {
 		}
 	} while (!signal_temps_cas(&n, n + 1));
 	memcpy(signal_temps[n], path, len + 1);
-	__atomic_store_n(&signal_temps_ready[n], 1, __ATOMIC_RELEASE);
+	signal_temps_ready_store(n, 1);
 }
 
 static void signal_temps_clear(void) {
 	sig_atomic_t n = signal_temps_load();
 	for (int i = 0; i < n; i++) {
-		__atomic_store_n(&signal_temps_ready[i], 0, __ATOMIC_RELEASE);
+		signal_temps_ready_store(i, 0);
 		memset(signal_temps[i], 0, PATH_MAX);
 	}
 	signal_temps_store(0);
@@ -1104,6 +1106,7 @@ static void check_defer_var_shadow(Token *var_name) {
 	for (int i = 0; i < outer_defer_end; i++) {
 		Token *prev = NULL;
 		int brace_depth = 0;
+		int paren_depth = 0;
 		int decl_depth = -1; // brace depth where name is locally declared (-1 = not local)
 		bool in_decl = false; // true when scanning tokens after a type keyword (declaration context)
 		int decl_bd = 0; // brace depth where in_decl was set
@@ -1117,9 +1120,13 @@ static void check_defer_var_shadow(Token *var_name) {
 				if (in_decl && brace_depth < decl_bd) in_decl = false;
 				continue;
 			}
+			if (match_ch(t, '(') || match_ch(t, '[')) { paren_depth++; continue; }
+			if (match_ch(t, ')') || match_ch(t, ']')) { paren_depth--; continue; }
 			if (match_ch(t, ';')) { in_decl = false; continue; }
-			// Track declaration context: type keywords, qualifiers, SUE tags
-			if (brace_depth > 1 &&
+			// Track declaration context: type keywords, qualifiers, SUE tags.
+			// Only at paren_depth 0 — type keywords inside casts like
+			// (struct X *) must not set in_decl (they're not declarations).
+			if (brace_depth > 1 && paren_depth == 0 &&
 			    (is_type_keyword(t) || (t->tag & (TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_TYPEDEF)))) {
 				in_decl = true;
 				decl_bd = brace_depth;
@@ -3020,6 +3027,48 @@ static OrelseInitInfo scan_decl_orelse(Token *decl_end,
 	int ternary = 0;
 	while (scan && scan->kind != TK_EOF) {
 		if (scan->flags & TF_OPEN) {
+			// Paren group that spans the rest of the initializer and
+			// contains orelse: unwrap the parens so the orelse is found
+			// at depth 0 (macro hygiene: #define GET(x) (f(x) orelse 0)).
+			if (match_ch(scan, '(') && tok_match(scan)) {
+				Token *close = tok_match(scan);
+				Token *after_close = tok_next(close);
+				if (!after_close || match_ch(after_close, ',') || match_ch(after_close, ';') || after_close->kind == TK_EOF) {
+					bool has_inner_orelse = false;
+					for (Token *inner = tok_next(scan); inner && inner != close; inner = tok_next(inner)) {
+						if ((inner->tag & TT_ORELSE) && !typedef_lookup(inner)) {
+							has_inner_orelse = true;
+							break;
+						}
+						if (inner->flags & TF_OPEN) {
+							inner = tok_match(inner) ? tok_match(inner) : inner;
+							continue;
+						}
+					}
+					if (has_inner_orelse) {
+						// Unlink '(' from the stream
+						if (prev_scan)
+							prev_scan->next_idx = scan->next_idx;
+						else
+							decl_end->next_idx = scan->next_idx;
+						scan->flags &= ~TF_OPEN;
+						// Unlink ')' from the stream
+						Token *before_close = scan;
+						for (Token *t = tok_next(scan); t && t != close; ) {
+							if (t->flags & TF_OPEN) {
+								Token *m = tok_match(t);
+								if (m) { before_close = m; t = tok_next(m); continue; }
+							}
+							before_close = t;
+							t = tok_next(t);
+						}
+						before_close->next_idx = close->next_idx;
+						// Continue scanning from first inner token (parens removed)
+						scan = tok_next(scan);
+						continue;
+					}
+				}
+			}
 			check_orelse_in_parens(scan);
 			prev_scan = tok_match(scan);
 			scan = tok_next(tok_match(scan));
@@ -6274,7 +6323,23 @@ uint16_t sid = next_scope_id++;
 							// Phase 1G: mark orelse in decl initializer
 							if ((t->tag & TT_ORELSE) && !typedef_lookup(t))
 								tok_ann(t) |= P1_OE_DECL_INIT;
-							if (t->flags & TF_OPEN) { t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t); continue; }
+							if (t->flags & TF_OPEN) {
+								// Look one level into paren group that
+								// spans the rest of the initializer for
+								// orelse (macro hygiene pattern).
+								Token *m = tok_match(t);
+								if (m && match_ch(t, '(')) {
+									Token *am = tok_next(m);
+									if (!am || match_ch(am, ',') || match_ch(am, ';') || am->kind == TK_EOF) {
+										for (Token *inner = tok_next(t); inner && inner != m; inner = tok_next(inner)) {
+											if ((inner->tag & TT_ORELSE) && !typedef_lookup(inner))
+												tok_ann(inner) |= P1_OE_DECL_INIT;
+											if (inner->flags & TF_OPEN) { inner = tok_match(inner) ? tok_match(inner) : inner; continue; }
+										}
+									}
+								}
+								t = m ? tok_next(m) : tok_next(t); continue;
+							}
 							t = tok_next(t);
 						}
 					}
@@ -8220,8 +8285,7 @@ static void signal_cleanup_handler(int sig) {
 		unlink(signal_temp_path);
 	int n = signal_temps_load();
 	for (int i = 0; i < n; i++)
-		if (__atomic_load_n(&signal_temps_ready[i], __ATOMIC_ACQUIRE) &&
-		    signal_temps[i][0] != '\0')
+		if (signal_temps_ready_load(i) && signal_temps[i][0] != '\0')
 			unlink(signal_temps[i]);
 	signal(sig, SIG_DFL);
 	raise(sig);

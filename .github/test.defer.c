@@ -2649,6 +2649,38 @@ static void test_defer_shadow_deref_bypass(void) {
 	prism_free(&r);
 }
 
+// Audit round 31: casts like (struct X *) inside nested defer blocks set
+// in_decl=true which persists past ')', causing subsequent identifier uses
+// to be misclassified as local declarations — shadow goes undetected.
+static void test_defer_shadow_cast_bypass(void) {
+	printf("\n--- Defer shadow cast bypass ---\n");
+
+	// The defer body uses 'ptr' only at brace_depth > 1, after a cast.
+	// (struct Node *) sets in_decl=true, which persists past ')' and
+	// causes 'ptr' to be misclassified as a local declaration.
+	const char *code =
+	    "struct Node;\n"
+	    "void release(struct Node *p);\n"
+	    "int f(void) {\n"
+	    "    struct Node *ptr = 0;\n"
+	    "    defer {\n"
+	    "        if (1) {\n"
+	    "            release((struct Node *)ptr);\n"
+	    "        }\n"
+	    "    }\n"
+	    "    {\n"
+	    "        struct Node *ptr = 0;\n"
+	    "        return 1;\n"
+	    "    }\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_shadow_cast.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "defer-shadow-cast: cast (struct Node *) must not blind shadow detection");
+	CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
+	      "defer-shadow-cast: error message mentions 'shadows'");
+	prism_free(&r);
+}
+
 // Audit round 30: comma-separated declarators in nested defer blocks cause
 // false-positive shadow errors (prev is ',' which isn't a type keyword).
 static void test_defer_shadow_comma_decl_false_positive(void) {
@@ -2887,4 +2919,7 @@ void run_defer_tests(void) {
 	// Audit round 30: * dereference bypass + comma multi-decl false positive
 	test_defer_shadow_deref_bypass();
 	test_defer_shadow_comma_decl_false_positive();
+
+	// Audit round 31: cast blinds shadow checker
+	test_defer_shadow_cast_bypass();
 }

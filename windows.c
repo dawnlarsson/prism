@@ -51,6 +51,8 @@ typedef int mode_t;
 // MSVC volatile has acquire/release on x86/x64 — sufficient for cached_clean_env init-once.
 #define cached_env_load()       (cached_clean_env)
 #define cached_env_store(val)   (cached_clean_env = (val))
+#define signal_temps_ready_store(idx, val) (signal_temps_ready[(idx)] = (val))
+#define signal_temps_ready_load(idx)       (signal_temps_ready[(idx)])
 
 // MSVC doesn't have these — define them away or provide equivalents.
 #define __attribute__(x)

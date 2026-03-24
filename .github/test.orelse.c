@@ -1205,15 +1205,19 @@ static void check_orelse_transpile_rejects(const char *code,
 }
 
 static void test_orelse_parenthesized_rejected(void) {
-	check_orelse_transpile_rejects(
+	// Paren-wrapped orelse in declaration initializers is now accepted
+	// (macro hygiene pattern: #define GET(x) (f(x) orelse 0)).
+	PrismResult result = prism_transpile_source(
 	    "int get(void) { return 0; }\n"
 	    "void f(void) {\n"
 	    "    int x = (get() orelse 0);\n"
 	    "    (void)x;\n"
 	    "}\n",
-	    "orelse_parenthesized_reject.c",
-	    "orelse parenthesized: rejected",
-	    "parenthes");
+	    "paren_wrap_accept.c",
+	    prism_defaults());
+	CHECK_EQ(result.status, PRISM_OK,
+	    "orelse parenthesized: accepted (macro hygiene)");
+	prism_free(&result);
 }
 
 static void test_orelse_for_init_rejected(void) {
@@ -3685,6 +3689,28 @@ static void test_typeof_pointer_orelse_type_corruption(void) {
 	prism_free(&r);
 }
 
+// Audit round 31: paren-wrapped orelse in declaration initializers is rejected
+// with "'orelse' cannot be used inside parentheses" even though wrapping in
+// parens is standard C macro hygiene: #define GET(x) (try(x) orelse 0)
+static void test_paren_wrapped_decl_orelse(void) {
+	printf("\n--- Paren-wrapped declaration orelse ---\n");
+
+	const char *code =
+	    "int try_lock(void);\n"
+	    "void f(void) {\n"
+	    "    int l = (try_lock() orelse 0);\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "paren_decl_wrap.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "paren-decl-orelse: paren-wrapped orelse must be accepted");
+	CHECK(r.output != NULL, "paren-decl-orelse: output not NULL");
+	// The orelse must be transformed — the keyword should not appear in output
+	if (r.output)
+		CHECK(strstr(r.output, " orelse ") == NULL,
+		      "paren-decl-orelse: orelse keyword must be transformed away");
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -3925,4 +3951,7 @@ void run_orelse_tests(void) {
 
 	// Audit round 30: typeof pointer orelse generates long long temp
 	test_typeof_pointer_orelse_type_corruption();
+
+	// Audit round 31: paren-wrapped orelse in declaration initializers
+	test_paren_wrapped_decl_orelse();
 }
