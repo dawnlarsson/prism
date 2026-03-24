@@ -5148,6 +5148,33 @@ static void test_signal_temps_register_race(void) {
 }
 #endif
 
+// Audit round 29: signal_temps_register has a TOCTOU window between the CAS
+// (reserving a slot) and the memcpy (writing the path).  A signal arriving in
+// that gap could see an empty or partial path.  The fix adds a ready flag that
+// the handler checks before unlinking.  This test verifies the flag works:
+// register a path, then check that the slot is both non-empty AND ready.
+static void test_signal_temps_ready_flag(void) {
+	printf("\n--- signal_temps ready flag ---\n");
+	int saved = signal_temps_load();
+	signal_temps_clear();
+
+	signal_temps_register("/tmp/prism_ready_test.c");
+	CHECK_EQ(signal_temps_load(), 1, "signal-ready: one entry registered");
+
+	// The slot must be non-empty
+	CHECK(signal_temps[0][0] != '\0', "signal-ready: slot 0 has path data");
+
+	// The ready flag must be set (slot is safe to read by signal handler)
+	CHECK(signal_temps_ready[0] != 0,
+	      "signal-ready: slot 0 ready flag set after memcpy "
+	      "(prevents TOCTOU unlink of partial path)");
+
+	signal_temps_clear();
+	CHECK(signal_temps_ready[0] == 0,
+	      "signal-ready: ready flag cleared after signal_temps_clear");
+
+	if (saved > 0) signal_temps_store(saved);
+}
 // Bug: generic_decl_rewrite_target and generic_member_rewrite_target pick a
 // fixed branch from _Generic (first or last identifier seen), discarding the
 // type-dispatch logic. The backend compiler can no longer resolve the correct
@@ -6042,4 +6069,7 @@ test_typeof_orelse_leak();
 
         // Audit round 28: collect_source_defines scan cutoff at non-preprocessor line
         test_collect_source_defines_after_code_line();
+
+	// Audit round 29: signal_temps ready flag prevents TOCTOU partial-path unlink
+	test_signal_temps_ready_flag();
 }

@@ -1062,6 +1062,28 @@ static void test_raw_multi_decl_vla_memset(void) {
 	free(path);
 }
 
+// Audit round 29: is_raw_declaration_context misses TT_STORAGE, TT_INLINE,
+// TT_TYPEDEF — 'raw' leaks literally into output for extern, inline,
+// _Thread_local, and typedef.
+static void test_raw_storage_class_leak(void) {
+	printf("\n--- raw Storage-Class Keyword Leakage ---\n");
+
+	const char *code =
+	    "raw extern int global_counter;\n"
+	    "raw inline int helper(int x) { return x + 1; }\n"
+	    "int main(void) { return helper(global_counter); }\n";
+
+	PrismResult r = prism_transpile_source(code, "storage_leak.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "raw-storage-leak: transpiles OK");
+	CHECK(r.output != NULL, "raw-storage-leak: output not NULL");
+	// Check the actual declaration lines — 'raw' must not appear as a token
+	CHECK(strstr(r.output, "raw extern") == NULL && strstr(r.output, "raw inline") == NULL,
+	      "raw-storage-leak: 'raw' keyword must be stripped from output (leaked with extern/inline)");
+	CHECK(strstr(r.output, "extern int global_counter") != NULL,
+	      "raw-storage-leak: extern declaration preserved");
+	prism_free(&r);
+}
+
 void run_raw_tests(void) {
 	printf("\n=== RAW KEYWORD TESTS ===\n");
 
@@ -1167,4 +1189,7 @@ void run_raw_tests(void) {
 	test_raw_prep_dir_pragma();
 	test_raw_multi_decl_array_aggregate();
 	test_raw_multi_decl_vla_memset();
+
+	// Audit round 29: raw leaks on extern, inline, typedef, _Thread_local
+	test_raw_storage_class_leak();
 }

@@ -338,6 +338,7 @@ static char signal_temp_path[PATH_MAX];
 // 256 entries (1 MB) covers any realistic invocation.
 #define SIGNAL_TEMPS_MAX 256
 static char signal_temps[SIGNAL_TEMPS_MAX][PATH_MAX];
+static volatile sig_atomic_t signal_temps_ready[SIGNAL_TEMPS_MAX];
 static volatile sig_atomic_t signal_temps_count = 0;
 
 #ifndef signal_temp_store // Windows: defined in windows.c
@@ -366,12 +367,15 @@ static void signal_temps_register(const char *path) {
 		}
 	} while (!signal_temps_cas(&n, n + 1));
 	memcpy(signal_temps[n], path, len + 1);
+	__atomic_store_n(&signal_temps_ready[n], 1, __ATOMIC_RELEASE);
 }
 
 static void signal_temps_clear(void) {
 	sig_atomic_t n = signal_temps_load();
-	for (int i = 0; i < n; i++)
+	for (int i = 0; i < n; i++) {
+		__atomic_store_n(&signal_temps_ready[i], 0, __ATOMIC_RELEASE);
 		memset(signal_temps[i], 0, PATH_MAX);
+	}
 	signal_temps_store(0);
 }
 
@@ -1100,14 +1104,28 @@ static void check_defer_var_shadow(Token *var_name) {
 	for (int i = 0; i < outer_defer_end; i++) {
 		Token *prev = NULL;
 		int brace_depth = 0;
+		int decl_depth = -1; // brace depth where name is locally declared (-1 = not local)
 		for (Token *t = defer_stack[i].stmt; t && t != defer_stack[i].end && t->kind != TK_EOF;
 		     prev = t, t = tok_next(t)) {
 			if (match_ch(t, '{')) { brace_depth++; continue; }
-			if (match_ch(t, '}')) { brace_depth--; continue; }
-			if (brace_depth > 1) continue;  // skip inner blocks
+			if (match_ch(t, '}')) {
+				brace_depth--;
+				if (decl_depth >= 0 && brace_depth < decl_depth)
+					decl_depth = -1; // local var went out of scope
+				continue;
+			}
 			if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
 			    !(prev && (prev->tag & TT_MEMBER)) &&
 			    t->len == nlen && !memcmp(tok_loc(t), name, nlen)) {
+				// At depth > 1: skip if name is locally declared in this block
+				if (brace_depth > 1 && decl_depth >= 0 && brace_depth >= decl_depth)
+					continue;
+				if (brace_depth > 1 && prev &&
+				    (is_type_keyword(prev) || match_ch(prev, '*') ||
+				     (prev->tag & (TT_QUALIFIER | TT_SUE)))) {
+					decl_depth = brace_depth;
+					continue;
+				}
 				if (defer_shadow_count >= MAX_DEFER_SHADOWS)
 					error_tok(var_name, "too many shadowed variables in defer scope; limit is %d",
 						  MAX_DEFER_SHADOWS);
@@ -1448,7 +1466,8 @@ static Token *emit_expr_to_stop(Token *tok, Token *stop, bool check_orelse) {
 static bool is_raw_declaration_context(Token *after_raw) {
 	after_raw = skip_noise(after_raw);
 	return after_raw && (is_type_keyword(after_raw) || is_known_typedef(after_raw) ||
-			     match_ch(after_raw, '*') || (after_raw->tag & (TT_QUALIFIER | TT_SUE)) ||
+			     match_ch(after_raw, '*') ||
+			     (after_raw->tag & (TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_INLINE | TT_TYPEDEF)) ||
 			     ((after_raw->flags & TF_RAW) && !is_known_typedef(after_raw)));
 }
 
@@ -8189,7 +8208,8 @@ static void signal_cleanup_handler(int sig) {
 		unlink(signal_temp_path);
 	int n = signal_temps_load();
 	for (int i = 0; i < n; i++)
-		if (signal_temps[i][0] != '\0')
+		if (__atomic_load_n(&signal_temps_ready[i], __ATOMIC_ACQUIRE) &&
+		    signal_temps[i][0] != '\0')
 			unlink(signal_temps[i]);
 	signal(sig, SIG_DFL);
 	raise(sig);

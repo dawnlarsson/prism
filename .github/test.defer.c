@@ -2620,6 +2620,37 @@ static void test_defer_user_noreturn_no_warning(void) {
 	prism_free(&r2);
 }
 
+// Audit round 29: brace_depth > 1 skip in check_defer_var_shadow causes
+// captured variables used only inside nested blocks of the defer body to
+// be missed, allowing silent shadowing + wrong-variable binding.
+static void test_defer_shadow_depth_bypass(void) {
+	printf("\n--- Defer shadow depth > 1 bypass ---\n");
+
+	// The defer body uses 'resource' only inside if (1) { ... } — at
+	// brace_depth 2.  The old brace_depth > 1 skip misses this, so
+	// an inner-scope shadow + return silently binds the wrong variable.
+	const char *code =
+	    "void release(int *p);\n"
+	    "int f(void) {\n"
+	    "    int resource = 1;\n"
+	    "    defer {\n"
+	    "        if (1) {\n"
+	    "            release(&resource);\n"
+	    "        }\n"
+	    "    }\n"
+	    "    {\n"
+	    "        int resource = 99;\n"
+	    "        return 0;\n"
+	    "    }\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_shadow_depth.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "defer-shadow-depth: captured var at brace_depth > 1 must be detected");
+	CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
+	      "defer-shadow-depth: error message mentions 'shadows'");
+	prism_free(&r);
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -2790,4 +2821,7 @@ void run_defer_tests(void) {
 #ifndef _WIN32
 	test_defer_user_noreturn_no_warning();
 #endif
+
+	// Audit round 29: brace_depth > 1 skip bypasses captured vars in nested blocks
+	test_defer_shadow_depth_bypass();
 }
