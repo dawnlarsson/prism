@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3236+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3281+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -317,7 +317,7 @@ Rejected patterns inside defer bodies:
 - `break` / `continue` (since `in_loop=false, in_switch=false`, these always error)
 - Recurses into GNU statement expressions `({…})` — `return`/`goto`/`break`/`continue` inside a stmt-expr in a defer body is rejected
 
-**Forbidden function contexts:** Defer in functions that use `setjmp`/`longjmp`, `vfork`, or inline assembly is rejected via `FuncMeta.has_setjmp`/`.has_vfork`/`.has_asm`. The `TT_SPECIAL_FN` taint covers all standard and implementation-internal variants that survive preprocessing: `setjmp`, `_setjmp`, `__setjmp`, `__sigsetjmp`, `longjmp`, `_longjmp`, `__longjmp`, `__siglongjmp`, `__longjmp_chk`, `sigsetjmp`, `siglongjmp`, `__builtin_setjmp`, `__builtin_longjmp`, `__builtin_setjmp_receive`, `pthread_exit`, `savectx`.
+**Forbidden function contexts:** Defer in functions that use `setjmp`/`longjmp`, `vfork`, or inline assembly is rejected via `TT_SPECIAL_FN`/`TT_NORETURN_FN`/`TT_ASM` tag bits on the function body's opening `{` token (checked as `func_meta[idx].body_open->tag`). The `TT_SPECIAL_FN` taint covers all standard and implementation-internal variants that survive preprocessing: `setjmp`, `_setjmp`, `__setjmp`, `__sigsetjmp`, `longjmp`, `_longjmp`, `__longjmp`, `__siglongjmp`, `__longjmp_chk`, `sigsetjmp`, `siglongjmp`, `__builtin_setjmp`, `__builtin_longjmp`, `__builtin_setjmp_receive`, `pthread_exit`, `savectx`. Detection is token-name-based: even bare references like `void (*fp)(jmp_buf, int) = longjmp;` taint the function because the `longjmp` token retains its `TT_SPECIAL_FN` tag. The only undetectable bypass is a function pointer passed from another translation unit (cross-TU indirect call), which is inherent to single-TU static analysis.
 
 ---
 
@@ -628,6 +628,12 @@ Multiple `.c` files are each transpiled independently and passed to CC. Assembly
 
 `compile_sources` extracts the user's `-x <lang>` from cc_args and uses it as the pipe language instead of hardcoded `"c"`.
 
+### Non-flatten define re-emission
+
+When `-fno-flatten-headers` is active, Prism runs `cc -E` which consumes in-file `#define` directives. The transpiled output reconstructs `#include` directives but must also re-emit the user's `#define`s that appeared before the first `#include`. `collect_source_defines` scans the original source file (raw text, not tokens) and extracts unconditional, non-function-like `#define NAME VALUE` directives. These are re-emitted as `#ifndef NAME` / `#define NAME VALUE` / `#endif` guards by `emit_consumed_defines` before any `#include` directives.
+
+The scanner handles: multi-line block comments (tracked via `in_block_comment`), line continuations (`\` at end of line), inline block comments between `#` and the directive name, `#ifdef`/`#ifndef`/`#endif` nesting (only extracts at `cond_depth == 0`), multi-line continuation values, and `#define`s that follow block comment closings on the same line.
+
 ---
 
 ## 9. Library Mode
@@ -735,3 +741,13 @@ These are inherently runtime and cannot move to Pass 1:
 5. **Self-host fixed point:** Stage 1 and Stage 2 transpiled C output is identical.
 6. **Arena safety:** All arena-allocated Pass 1 structures are reclaimed on `longjmp` error recovery. No dangling pointers after `arena_reset()`.
 7. **Signal cleanup safety:** `signal_temps_clear()` zeroes the **entire** buffer (`memset`, `PATH_MAX` bytes) of every registered path slot before resetting the counter. `signal_cleanup_handler` skips entries where `signal_temps[i][0] == '\0'`. This eliminates the TOCTOU race between `signal_temps_register`'s CAS (counter increment) and `memcpy` (path write): if a signal arrives during `memcpy`, partially written data is followed by zeroes (from the prior `memset`), so the handler sees at worst a truncated — but never fabricated — path. Previous behavior (zeroing only byte 0) left stale path data in bytes 1..N, which could reconstruct a prior cycle's path if `memcpy` was interrupted after writing just the first byte.
+
+---
+
+## 15. Known Limitations and Caveats
+
+1. **Struct padding bytes and `= {0}`:** Prism emits `= {0}` for aggregate zero-initialization. The C standard guarantees all *members* are zeroed but does not mandate that *padding bytes* between members are zeroed. In practice, GCC and Clang emit `memset`/`bzero` for `= {0}` at all optimization levels, zeroing the entire aggregate including padding. However, code that copies raw struct bytes across trust boundaries (e.g., `copy_to_user` in kernel contexts) should use explicit `memset(&s, 0, sizeof(s))` via `raw` + manual initialization to guarantee no padding infoleak. This is a C language limitation, not a Prism deficiency.
+
+2. **Indirect call taint bypass (cross-TU):** The `setjmp`/`longjmp`/`vfork` taint detection is token-name-based: any appearance of a tainted identifier (even as a bare reference like `= longjmp`) taints the enclosing function. However, a function pointer to `longjmp` passed from another translation unit (e.g., via a `void (*)(jmp_buf, int)` parameter) is undetectable by single-TU static analysis. This is an inherent limitation shared with all C static analyzers that operate on individual translation units.
+
+3. **Bitfield zero-initialization:** Bitfield member declarations (`int x : 4;`) inside struct/union bodies are not individually zero-initialized — `try_zero_init_decl` correctly skips when `in_struct_body()` is true (bitfield syntax `int x : 4 = 0;` is invalid C). Bitfields are zeroed implicitly when the parent struct variable receives `= {0}`. This is working as designed.

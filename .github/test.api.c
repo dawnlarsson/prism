@@ -5876,6 +5876,67 @@ static void test_collect_source_defines_after_code_line(void) {
 	unlink(control_path); free(control_path);
 }
 
+static void test_collect_source_defines_block_comment_end_same_line(void) {
+	/* BUG: collect_source_defines() tracks multi-line block comments with
+	 * in_block_comment.  When it finds the end-of-comment marker on a
+	 * line, it clears in_block_comment and then does 'continue', skipping
+	 * the rest of that line.  If a #define appears after the closing
+	 * comment on the same line, it is silently dropped.
+	 *
+	 * The C preprocessor (translation phase 3) replaces comments with a
+	 * single space, so  [end-comment] #define FOO 1  has FOO as the first
+	 * non-ws token after the directive '#' -- a valid macro.  The same
+	 * problem exists for single-line block comments starting at column 0:
+	 * the non-preprocessor-line handler sees '/' and does 'continue'
+	 * after detecting the closed comment.
+	 *
+	 * Impact: ABI-altering macros like _FILE_OFFSET_BITS placed after a
+	 * closing block comment vanish from non-flatten re-emission. */
+
+	/* Case 1: multi-line block comment ending on same line as #define */
+	const char *multi_code =
+	    "/* multi\n"
+	    "line comment */ #define MULTILINE_END_DEFINE 777\n"
+	    "#include <stdint.h>\n"
+	    "int x = MULTILINE_END_DEFINE;\n";
+	char *multi_path = create_temp_file(multi_code);
+	CHECK(multi_path != NULL, "block-comment-end-sameline: create multi temp file");
+	if (!multi_path) return;
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = false;
+	PrismResult rm = prism_transpile_file(multi_path, feat);
+	if (rm.status == PRISM_OK && rm.output) {
+		CHECK(strstr(rm.output, "MULTILINE_END_DEFINE") != NULL,
+		      "block-comment-end-sameline: #define after closing of "
+		      "multi-line block comment must be re-emitted "
+		      "(collect_source_defines continue skips rest of line)");
+	} else {
+		CHECK(0, "block-comment-end-sameline: multi-line case transpilation failed");
+	}
+	prism_free(&rm);
+	unlink(multi_path); free(multi_path);
+
+	/* Case 2: single-line block comment on same line as #define */
+	const char *single_code =
+	    "/* single line comment */ #define SINGLE_COMMENT_DEFINE 888\n"
+	    "#include <stdint.h>\n"
+	    "int y = SINGLE_COMMENT_DEFINE;\n";
+	char *single_path = create_temp_file(single_code);
+	CHECK(single_path != NULL, "block-comment-end-sameline: create single temp file");
+	if (!single_path) return;
+	PrismResult rs = prism_transpile_file(single_path, feat);
+	if (rs.status == PRISM_OK && rs.output) {
+		CHECK(strstr(rs.output, "SINGLE_COMMENT_DEFINE") != NULL,
+		      "block-comment-end-sameline: #define after closed comment on "
+		      "same line must be re-emitted (non-preprocessor-line "
+		      "handler continue skips rest of line after closed comment)");
+	} else {
+		CHECK(0, "block-comment-end-sameline: single-line case transpilation failed");
+	}
+	prism_free(&rs);
+	unlink(single_path); free(single_path);
+}
+
 void run_api_tests(void) {
 test_typeof_orelse_leak();
 	printf("\n=== API TESTS ===\n");
@@ -6070,4 +6131,7 @@ test_typeof_orelse_leak();
 
 	// Audit round 29: signal_temps ready flag prevents TOCTOU partial-path unlink
 	test_signal_temps_ready_flag();
+
+	// Audit round 30: collect_source_defines block comment end same-line define
+	test_collect_source_defines_block_comment_end_same_line();
 }

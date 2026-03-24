@@ -4446,11 +4446,18 @@ static void collect_source_defines(const char *input_file) {
 	bool in_block_comment = false;
 	int cond_depth = 0; // #if/#ifdef/#ifndef nesting depth
 	while (getline(&line, &line_cap, f) >= 0) {
+		char *p = line;
 		// Track multi-line block comments
 		if (in_block_comment) {
-			if (strstr(line, "*/"))
-				in_block_comment = false;
-			continue;
+			char *end = strstr(line, "*/");
+			if (!end) continue;
+			in_block_comment = false;
+			// A #define may follow */ on the same line — fall through
+			// to the normal '#' check with p pointing past the comment.
+			p = end + 2;
+			while (*p == ' ' || *p == '\t') p++;
+			if (*p != '#') continue;
+			goto have_hash;
 		}
 		// If previous line ended with '\', this is a continuation
 		if (in_continuation) {
@@ -4460,22 +4467,26 @@ static void collect_source_defines(const char *input_file) {
 			continue;
 		}
 		// Skip whitespace
-		char *p = line;
 		while (*p == ' ' || *p == '\t') p++;
 		if (*p != '#') {
 			// Skip blank lines and comments
 			if (*p == '\n' || *p == '\0' || (p[0] == '/' && p[1] == '/'))
 				continue;
 			if (p[0] == '/' && p[1] == '*') {
-				if (!strstr(p + 2, "*/"))
-					in_block_comment = true;
-				continue;
+				char *close = strstr(p + 2, "*/");
+				if (!close) { in_block_comment = true; continue; }
+				// Comment closes on same line — check rest for '#'
+				p = close + 2;
+				while (*p == ' ' || *p == '\t') p++;
+				if (*p != '#') continue;
+				goto have_hash;
 			}
 			// Non-preprocessor, non-blank line — skip and continue
 			// scanning for ABI-altering defines that may appear after
 			// code lines (e.g. typedef or global declarations)
 			continue;
 		}
+	have_hash:
 		p++; // skip '#'
 		while (*p == ' ' || *p == '\t' || (p[0] == '/' && p[1] == '*')) {
 			if (p[0] == '/' && p[1] == '*') {
