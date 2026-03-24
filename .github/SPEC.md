@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3222+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3236+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -242,7 +242,7 @@ For every variable declaration at every depth, if the declared name collides wit
 
 **Temporal ordering:** Shadows are token-order-dependent. A variable named `T` declared at token index 500 only shadows the typedef `T` for lookups at index ≥ 500 within the shadow's scope range.
 
-**Function parameter scope:** When Phase 1 encounters a function body `{` (is_func_body), parameter declarations from the preceding `(…)` are registered as shadows scoped to the function body. For forward declarations (prototypes ending with `;`), parameter shadows are registered scoped to the prototype's parameter list range.
+**Function parameter scope:** When Phase 1 encounters a function body `{` (is_func_body), parameter declarations from the preceding `(…)` are registered as shadows scoped to the function body. For forward declarations (prototypes ending with `;`), parameter shadows are registered scoped to the prototype's parameter list range. **Unnamed function pointer parameter safety:** `p1_register_param_shadows` only scans the first nested `(` group per parameter for declarator names (e.g., `(*cb)` in `int (*cb)(int a, int b)`). After scanning one `(` group, subsequent `(` groups (which contain inner parameter type lists) are skipped. This prevents phantom shadow registration from inner parameter names of unnamed function pointer parameters (e.g., `int (*)(int a, int b)` must not shadow `b` for the outer function scope).
 
 **Attribute skipping during parameter list discovery:** The backward walk from `{` (or `;` for prototypes) to find the parameter list `(…)` skips GNU `__attribute__((...))` (detected via `TT_ATTR` tag on the preceding keyword) and C23 `[[...]]` attributes (detected via `TF_C23_ATTR` flag on the matching `[`). This ensures `void f(int T) __attribute__((noinline)) {` and `void f(int T) [[gnu::cold]] {` correctly identify the parameter list.
 
@@ -326,6 +326,8 @@ Rejected patterns inside defer bodies:
 **Function:** inline in `p1_full_depth_prescan`
 
 Walks all tokens looking for `[…]` pairs containing `orelse`. Marks them with `P1_OE_BRACKET` on `pass1_ann`.
+
+**Control-flow rejection (Phase 1G):** When an `orelse` token is found inside `[…]`, Phase 1G peeks at the next token. If it is a control-flow keyword (`return`, `break`, `continue`, `goto`) or `{` (block form), a hard error is raised immediately — before Pass 2 emits any output. Pass 2's `walk_balanced_orelse` retains the same checks as defense-in-depth assertions (unreachable by design).
 
 **File-scope guard:** If `P1_OE_BRACKET` occurs outside any function body (`p1d_cur_func < 0`), a hard error is raised. Bracket orelse requires hoisting a temp variable statement, which is illegal outside a function body (e.g., `void process(int buf[1 orelse 2]);` at file scope).
 
@@ -492,8 +494,9 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 **Invalid contexts:** Detected at two stages:
 
-- **Phase 1 (early rejection):** Bracket orelse at file scope, orelse inside enum bodies (compile-time constant context), typeof-orelse inside struct/union bodies. The typeof-in-struct check runs during `p1_full_depth_prescan` using the scope tree's `is_struct` flag; the enum check uses `is_enum` on the scope tree.
+- **Phase 1 (early rejection):** Bracket orelse at file scope, bracket orelse with control-flow actions (return/goto/break/continue) or block form, orelse inside enum bodies (compile-time constant context), typeof-orelse inside struct/union bodies. The typeof-in-struct check runs during `p1_full_depth_prescan` using the scope tree's `is_struct` flag; the enum check uses `is_enum` on the scope tree.
 - **Pass 2 catch-all:** Any `orelse` token that survives to the main emit loop without being consumed by a handler (bracket, decl-init, bare, typeof, walk_balanced) is **unconditionally** rejected with a hard error. This catches orelse in struct/union member declarations, ternary contexts, for-init control parens, and any other unsupported position. No context exemptions — bracket/typeof orelse is fully consumed before reaching the catch-all, so it never fires on valid uses.
+- **Pass 2 typeof dispatch:** `typeof(expr orelse fallback)` outside declaration contexts (e.g., inside `sizeof()`, casts) is caught by a `TT_TYPEOF` handler in the main emit loop that routes through `walk_balanced_orelse`, ensuring the inner orelse is transformed before the catch-all fires.
 
 **Feature flag:** `-fno-orelse` disables.
 
@@ -731,4 +734,4 @@ These are inherently runtime and cannot move to Pass 1:
 4. **Delimiter matching completeness:** Every `(`, `[`, `{` has a `match_idx`. Every `)`, `]`, `}` points back. No unmatched delimiters survive tokenization.
 5. **Self-host fixed point:** Stage 1 and Stage 2 transpiled C output is identical.
 6. **Arena safety:** All arena-allocated Pass 1 structures are reclaimed on `longjmp` error recovery. No dangling pointers after `arena_reset()`.
-7. **Signal cleanup safety:** `signal_temps_clear()` zeroes the first byte of every registered path buffer before resetting the counter. `signal_cleanup_handler` skips entries where `signal_temps[i][0] == '\0'`. This eliminates the TOCTOU race between `signal_temps_register`'s CAS (counter increment) and `memcpy` (path write): if a signal arrives in that window, the handler sees a zeroed buffer and skips it instead of unlinking stale data from a prior compilation cycle.
+7. **Signal cleanup safety:** `signal_temps_clear()` zeroes the **entire** buffer (`memset`, `PATH_MAX` bytes) of every registered path slot before resetting the counter. `signal_cleanup_handler` skips entries where `signal_temps[i][0] == '\0'`. This eliminates the TOCTOU race between `signal_temps_register`'s CAS (counter increment) and `memcpy` (path write): if a signal arrives during `memcpy`, partially written data is followed by zeroes (from the prior `memset`), so the handler sees at worst a truncated — but never fabricated — path. Previous behavior (zeroing only byte 0) left stale path data in bytes 1..N, which could reconstruct a prior cycle's path if `memcpy` was interrupted after writing just the first byte.

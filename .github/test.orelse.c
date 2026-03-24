@@ -3505,6 +3505,23 @@ static void test_walk_balanced_orelse_stmtexpr_leak(void) {
 	prism_free(&r2);
 }
 
+// Bug: typeof(expr orelse fallback) outside a declaration context (e.g. in a
+// cast or sizeof) hits the catch-all error instead of being routed through
+// walk_balanced_orelse.
+static void test_typeof_orelse_in_sizeof_expr(void) {
+	const char *code =
+	    "int *ptr;\n"
+	    "unsigned long f(void) {\n"
+	    "    return sizeof(typeof(ptr orelse (int*)0));\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "typeof_oe_sizeof.c", prism_defaults());
+	CHECK(r.status == PRISM_OK,
+	      "typeof orelse in sizeof: must transpile OK (not a catch-all error)");
+	CHECK(r.output && !strstr(r.output, "orelse"),
+	      "typeof orelse in sizeof: 'orelse' must not leak to output");
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -3730,4 +3747,7 @@ void run_orelse_tests(void) {
 
 	// Audit round 25: walk_balanced orelse blind spot
 	test_walk_balanced_orelse_stmtexpr_leak();
+
+	// Audit round 26: typeof orelse in sizeof / cast expressions
+	test_typeof_orelse_in_sizeof_expr();
 }

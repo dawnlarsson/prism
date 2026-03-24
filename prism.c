@@ -370,7 +370,7 @@ static void signal_temps_register(const char *path) {
 static void signal_temps_clear(void) {
 	sig_atomic_t n = signal_temps_load();
 	for (int i = 0; i < n; i++)
-		signal_temps[i][0] = '\0';
+		memset(signal_temps[i], 0, PATH_MAX);
 	signal_temps_store(0);
 }
 
@@ -867,8 +867,10 @@ static inline bool in_enum_body(void) {
 }
 
 static inline bool in_generic(void) {
-	for (int i = ctx->scope_depth - 1; i >= 0; i--)
+	for (int i = ctx->scope_depth - 1; i >= 0; i--) {
 		if (scope_stack[i].kind == SCOPE_GENERIC) return true;
+		if (scope_stack[i].kind == SCOPE_BLOCK) return false;
+	}
 	return false;
 }
 
@@ -2496,7 +2498,8 @@ static Token *walk_balanced_orelse(Token *tok) {
 		}
 		return tok_next(end);
 	}
-	// Reject control-flow actions inside brackets/typeof
+	// Defense-in-depth: control-flow actions are rejected in Phase 1G;
+	// these checks are unreachable-by-design assertions.
 	Token *action = tok_next(orelse_found);
 	if (action && (action->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)))
 		error_tok(orelse_found, "'orelse' with control flow cannot be used inside "
@@ -5260,14 +5263,16 @@ static void p1_register_param_shadows(Token *open, Token *close,
 	for (Token *t = tok_next(open); t && t != close && t->kind != TK_EOF; ) {
 		Token *param_start = t;
 		Token *last_ident = NULL;
+		bool scanned_inner_paren = false;
 		while (t && t != close && !match_ch(t, ',') && t->kind != TK_EOF) {
 			if (t->flags & TF_OPEN) {
-				if (!last_ident && match_ch(t, '(') && tok_match(t))
+				if (!last_ident && !scanned_inner_paren && match_ch(t, '(') && tok_match(t))
 					for (Token *s = tok_next(t); s != tok_match(t); s = tok_next(s)) {
 						if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; continue; }
 						if (is_valid_varname(s) && !(s->tag & (TT_QUALIFIER|TT_TYPE|TT_SUE|TT_TYPEOF|TT_ATTR)))
 							last_ident = s;
 					}
+				if (match_ch(t, '(')) scanned_inner_paren = true;
 				t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t);
 				continue;
 			}
@@ -5429,6 +5434,13 @@ static void p1_full_depth_prescan(Token *tok) {
 									if (p1d_cur_func < 0)
 										error_tok(p, "orelse inside array dimension at file scope is not allowed "
 											       "(cannot hoist temporary variable outside a function body)");
+									Token *act = tok_next(p);
+									if (act && (act->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)))
+										error_tok(p, "'orelse' with control flow cannot be used inside "
+											      "array dimensions or typeof expressions");
+									if (act && match_ch(act, '{'))
+										error_tok(p, "'orelse' block form cannot be used inside "
+											      "array dimensions or typeof expressions");
 									tok_ann(p) |= P1_OE_BRACKET;
 								}
 							}
@@ -5440,6 +5452,13 @@ static void p1_full_depth_prescan(Token *tok) {
 					if (p1d_cur_func < 0)
 						error_tok(s, "orelse inside array dimension at file scope is not allowed "
 							  "(cannot hoist temporary variable outside a function body)");
+					Token *act = tok_next(s);
+					if (act && (act->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)))
+						error_tok(s, "'orelse' with control flow cannot be used inside "
+							     "array dimensions or typeof expressions");
+					if (act && match_ch(act, '{'))
+						error_tok(s, "'orelse' block form cannot be used inside "
+							     "array dimensions or typeof expressions");
 					tok_ann(s) |= P1_OE_BRACKET;
 				}
 			}
@@ -6843,6 +6862,24 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		}
 
 		track_common_token_state(tok);
+
+		// Process orelse inside typeof() that was not handled by
+		// try_zero_init_decl (e.g. sizeof(typeof(x orelse 0)), casts).
+		// Route through walk_balanced_orelse for inline ternary transformation.
+		if (__builtin_expect(FEAT(F_ORELSE) &&
+				     (tok->tag & TT_TYPEOF) && tok_next(tok) &&
+				     match_ch(tok_next(tok), '(') && tok_match(tok_next(tok)), 0)) {
+			Token *paren = tok_next(tok);
+			Token *pclose = tok_match(paren);
+			bool has_oe = false;
+			for (Token *s = tok_next(paren); s && s != pclose; s = tok_next(s))
+				if (is_orelse_keyword(s)) { has_oe = true; break; }
+			if (has_oe) {
+				emit_tok(tok);                // typeof keyword
+				tok = walk_balanced_orelse(paren); // ( ... )
+				continue;
+			}
+		}
 
 		// Process orelse inside array dimension brackets that were not
 		// handled by try_zero_init_decl (struct bodies, function prototypes,

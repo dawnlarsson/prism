@@ -2522,6 +2522,32 @@ static void test_defer_shadow_inner_block_false_positive(void) {
 	prism_free(&r2);
 }
 
+// Audit round 30: in_generic() pierces SCOPE_BLOCK — defer leaks raw
+static void test_defer_in_generic_stmt_expr(void) {
+	printf("\n--- Defer inside _Generic stmt-expr ---\n");
+
+	// defer inside a block within a stmt-expr inside _Generic must be
+	// transformed, not leaked raw.  in_generic() used to scan the full
+	// scope stack, piercing SCOPE_BLOCK boundaries and suppressing
+	// handle_defer_keyword dispatch.
+	const char *code =
+	    "void cleanup(void);\n"
+	    "int bar(int);\n"
+	    "void foo(void) {\n"
+	    "    bar(_Generic(1, int: ({ int r; { defer cleanup(); r = 42; } r; })));\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "generic_stmtexpr.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "defer inside _Generic stmt-expr must not be rejected");
+	// The output must NOT contain the raw 'defer' keyword.
+	CHECK(!strstr(r.output, "defer"),
+	      "defer keyword must not leak raw into output inside _Generic stmt-expr");
+	// cleanup() must appear in the output (emitted by defer expansion).
+	CHECK(strstr(r.output, "cleanup()"),
+	      "cleanup() must be emitted by defer expansion inside _Generic stmt-expr");
+	prism_free(&r);
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -2684,4 +2710,7 @@ void run_defer_tests(void) {
 
 	// Audit round 24: defer shadow inner-block false positive
 	test_defer_shadow_inner_block_false_positive();
+
+	// Audit round 30: in_generic() scope leak
+	test_defer_in_generic_stmt_expr();
 }

@@ -3290,6 +3290,69 @@ static void test_signal_temps_clear_zeroes_paths(void) {
 	      "signal_temps_clear zeroes path buffers (TOCTOU fix)");
 }
 
+// Bug: signal_temps_clear() only zeroes byte 0 of each buffer, leaving stale
+// data in bytes 1..PATH_MAX-1. If signal_temps_register's memcpy is interrupted
+// by a signal after writing only the first byte, the signal handler reconstructs
+// a stale path (new byte 0 + old bytes 1..N) and calls unlink() on it.
+static void test_signal_temps_clear_full_buffer(void) {
+	const char *old_path = "/tmp/prism_old_file_XXXXXX.c";
+	signal_temps_register(old_path);
+	int n = signal_temps_load();
+	CHECK(n >= 1, "signal_temps_register incremented counter");
+
+	signal_temps_clear();
+
+	// After clear, the ENTIRE buffer must be zeroed — not just byte 0.
+	// If only byte 0 is zeroed, bytes 1..N still contain the old path.
+	// Simulating a partial memcpy (only first byte written) must NOT
+	// reconstruct the old path.
+	int stale_bytes = 0;
+	size_t len = strlen(old_path);
+	for (size_t i = 1; i <= len; i++) {
+		if (signal_temps[n - 1][i] != '\0')
+			stale_bytes++;
+	}
+	CHECK(stale_bytes == 0,
+	      "signal_temps_clear zeroes full buffer (no stale path data)");
+}
+
+// Bug: p1_register_param_shadows digs into inner parameter lists of unnamed
+// function pointer parameters.  void f(int (*)(int a, int b)) registers 'b'
+// as a shadow for the outer function, poisoning any typedef named 'b'.
+static void test_unnamed_fnptr_param_shadow_leak(void) {
+	const char *code =
+	    "typedef int b;\n"
+	    "void register_callback(int (*)(int a, int b)) {\n"
+	    "    b my_var;\n"
+	    "    (void)my_var;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "fnptr_shadow.c", prism_defaults());
+	CHECK(r.status == PRISM_OK, "unnamed fnptr param shadow: transpile OK");
+	CHECK(r.output && strstr(r.output, "b my_var = {0}"),
+	      "unnamed fnptr param shadow: typedef 'b' must not be shadowed by "
+	      "inner param name — 'b my_var' must be zero-initialized");
+	prism_free(&r);
+}
+
+// Bug: bracket orelse with control flow (return/goto/break) is rejected only
+// during Pass 2 (inside walk_balanced_orelse), violating the spec invariant
+// "every semantic error before Pass 2 emits its first byte".
+// This must be caught in Phase 1G when P1_OE_BRACKET is annotated.
+static void test_bracket_orelse_ctrlflow_pass1_error(void) {
+	const char *code =
+	    "int n;\n"
+	    "void f(void) {\n"
+	    "    int arr[n orelse return];\n"
+	    "    (void)arr;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "bracket_oe_cf.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "bracket orelse control flow: must be rejected");
+	CHECK(r.error_msg && strstr(r.error_msg, "control flow"),
+	      "bracket orelse control flow: error message mentions control flow");
+	prism_free(&r);
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -3546,4 +3609,13 @@ void run_safe_tests(void) {
 
 	// Audit round 26: signal cleanup TOCTOU race
 	test_signal_temps_clear_zeroes_paths();
+
+	// Audit round 27: signal cleanup stale data race (full buffer clear)
+	test_signal_temps_clear_full_buffer();
+
+	// Audit round 28: unnamed fn ptr parameter shadow leak
+	test_unnamed_fnptr_param_shadow_leak();
+
+	// Audit round 29: bracket orelse control flow - Pass 1 error timing
+	test_bracket_orelse_ctrlflow_pass1_error();
 }
