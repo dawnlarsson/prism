@@ -2620,6 +2620,65 @@ static void test_defer_user_noreturn_no_warning(void) {
 	prism_free(&r2);
 }
 
+// Audit round 30: match_ch(prev, '*') misclassifies pointer dereference as
+// a local declaration inside nested defer blocks, bypassing shadow detection.
+static void test_defer_shadow_deref_bypass(void) {
+	printf("\n--- Defer shadow * dereference bypass ---\n");
+
+	const char *code =
+	    "int *get_lock(void);\n"
+	    "int *get_dummy(void);\n"
+	    "int f(int condition) {\n"
+	    "    int *target_lock = get_lock();\n"
+	    "    defer {\n"
+	    "        {\n"
+	    "            *target_lock = 0;\n"
+	    "        }\n"
+	    "    }\n"
+	    "    if (condition) {\n"
+	    "        int *target_lock = get_dummy();\n"
+	    "        return *target_lock;\n"
+	    "    }\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_shadow_deref.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "defer-shadow-deref: *target_lock dereference must not suppress shadow detection");
+	CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
+	      "defer-shadow-deref: error message mentions 'shadows'");
+	prism_free(&r);
+}
+
+// Audit round 30: comma-separated declarators in nested defer blocks cause
+// false-positive shadow errors (prev is ',' which isn't a type keyword).
+static void test_defer_shadow_comma_decl_false_positive(void) {
+	printf("\n--- Defer shadow comma-decl false positive ---\n");
+
+	// The defer body locally declares 'int a = 1, b = 2;' in a nested block.
+	// 'b' at the top level is used only inside that declaration.
+	// A later 'int b = 99; return;' must NOT trigger a shadow error
+	// because the defer's 'b' is local to the inner block.
+	const char *code =
+	    "void use(int x);\n"
+	    "void f(void) {\n"
+	    "    int b = 10;\n"
+	    "    defer {\n"
+	    "        {\n"
+	    "            int a = 1, b = 2;\n"
+	    "            use(a + b);\n"
+	    "        }\n"
+	    "    }\n"
+	    "    {\n"
+	    "        int b = 99;\n"
+	    "        return;\n"
+	    "    }\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_shadow_comma.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "defer-shadow-comma: 'int a, b' in nested defer block must not false-positive");
+	prism_free(&r);
+}
+
 // Audit round 29: brace_depth > 1 skip in check_defer_var_shadow causes
 // captured variables used only inside nested blocks of the defer body to
 // be missed, allowing silent shadowing + wrong-variable binding.
@@ -2824,4 +2883,8 @@ void run_defer_tests(void) {
 
 	// Audit round 29: brace_depth > 1 skip bypasses captured vars in nested blocks
 	test_defer_shadow_depth_bypass();
+
+	// Audit round 30: * dereference bypass + comma multi-decl false positive
+	test_defer_shadow_deref_bypass();
+	test_defer_shadow_comma_decl_false_positive();
 }

@@ -3657,6 +3657,34 @@ static void test_typeof_vla_volatile_double_read(void) {
 	prism_free(&r);
 }
 
+// Audit round 30: walk_balanced_orelse inline path uses 'long long' for the
+// statement-expression temp variable, which corrupts typeof() on pointer types.
+// typeof(p orelse q) where p/q are int* generates:
+//   typeof( ({long long __prism_oe_0 = (p); ...}) )
+// causing pointer-to-integer conversion and type mismatch.
+static void test_typeof_pointer_orelse_type_corruption(void) {
+	printf("\n--- typeof pointer orelse type corruption ---\n");
+
+	const char *code =
+	    "int fallback;\n"
+	    "void f(void) {\n"
+	    "    int *p = 0;\n"
+	    "    int *q = &fallback;\n"
+	    "    typeof(p orelse q) safe_ptr;\n"
+	    "    safe_ptr = q;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "typeof_ptr_oe.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "typeof-ptr-orelse: transpiles OK");
+	CHECK(r.output != NULL, "typeof-ptr-orelse: output not NULL");
+
+	// The temp variable must NOT be 'long long' — it would corrupt pointer types
+	CHECK(strstr(r.output, "long long __prism_oe") == NULL,
+	      "typeof-ptr-orelse: statement-expression temp must not use 'long long' "
+	      "(corrupts pointer/struct types in typeof)");
+
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -3894,4 +3922,7 @@ void run_orelse_tests(void) {
 #ifdef __GNUC__
 	test_typeof_vla_volatile_double_read();
 #endif
+
+	// Audit round 30: typeof pointer orelse generates long long temp
+	test_typeof_pointer_orelse_type_corruption();
 }

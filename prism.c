@@ -1105,6 +1105,8 @@ static void check_defer_var_shadow(Token *var_name) {
 		Token *prev = NULL;
 		int brace_depth = 0;
 		int decl_depth = -1; // brace depth where name is locally declared (-1 = not local)
+		bool in_decl = false; // true when scanning tokens after a type keyword (declaration context)
+		int decl_bd = 0; // brace depth where in_decl was set
 		for (Token *t = defer_stack[i].stmt; t && t != defer_stack[i].end && t->kind != TK_EOF;
 		     prev = t, t = tok_next(t)) {
 			if (match_ch(t, '{')) { brace_depth++; continue; }
@@ -1112,6 +1114,15 @@ static void check_defer_var_shadow(Token *var_name) {
 				brace_depth--;
 				if (decl_depth >= 0 && brace_depth < decl_depth)
 					decl_depth = -1; // local var went out of scope
+				if (in_decl && brace_depth < decl_bd) in_decl = false;
+				continue;
+			}
+			if (match_ch(t, ';')) { in_decl = false; continue; }
+			// Track declaration context: type keywords, qualifiers, SUE tags
+			if (brace_depth > 1 &&
+			    (is_type_keyword(t) || (t->tag & (TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_TYPEDEF)))) {
+				in_decl = true;
+				decl_bd = brace_depth;
 				continue;
 			}
 			if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
@@ -1120,9 +1131,8 @@ static void check_defer_var_shadow(Token *var_name) {
 				// At depth > 1: skip if name is locally declared in this block
 				if (brace_depth > 1 && decl_depth >= 0 && brace_depth >= decl_depth)
 					continue;
-				if (brace_depth > 1 && prev &&
-				    (is_type_keyword(prev) || match_ch(prev, '*') ||
-				     (prev->tag & (TT_QUALIFIER | TT_SUE)))) {
+				// Name appears in a declaration context (after type keyword / comma)
+				if (brace_depth > 1 && in_decl) {
 					decl_depth = brace_depth;
 					continue;
 				}
@@ -2556,8 +2566,10 @@ static Token *walk_balanced_orelse(Token *tok) {
 		// preventing double evaluation of volatile reads or side effects
 		// that sneak past reject_orelse_side_effects (e.g. bare volatile
 		// variable reads in typeof VLA dimensions).
+		// Use __auto_type to preserve the original type (pointers, structs, etc.)
+		// instead of hardcoding 'long long' which corrupts non-integer types.
 		unsigned oe = ctx->ret_counter++;
-		OUT_LIT(" ({long long __prism_oe_");
+		OUT_LIT(" ({__auto_type __prism_oe_");
 		out_uint(oe);
 		OUT_LIT(" = (");
 		emit_token_range(lhs_start, orelse_found);
