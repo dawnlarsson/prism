@@ -211,7 +211,8 @@ struct Token {
 	uint32_t len;         // Token length in bytes (must handle >65535 for large literals)
 	uint8_t  kind;
 	uint8_t  flags;
-}; // 20 bytes — hot path only
+	uint8_t  ann;         // Pass 1 annotation flags (P1_SCOPE_*, P1_OE_*, P1_IS_DECL)
+}; // 20 bytes (19 used + 1 padding)
 
 typedef struct {
 	uint32_t loc_offset;  // Byte offset from File->contents
@@ -339,7 +340,6 @@ typedef struct PrismContext {
 	// Token pools: parallel hot/cold arrays for cache-optimal access
 	Token *tp_pool;        // Hot: tag, next_idx, match_idx, len, kind, flags
 	TokenCold *tp_cold;    // Cold: loc_offset, line_no, file_idx
-	uint8_t *pass1_ann;    // Per-token Pass 1 annotations (parallel to tp_pool)
 	uint32_t tp_count;     // Next free index. 0 reserved as NULL sentinel.
 	uint32_t tp_cap;
 
@@ -392,7 +392,6 @@ static inline bool is_digraph_loc(char *loc) {
 // Convenience accessors for per-context state (go through thread-local ctx)
 #define token_pool  (ctx->tp_pool)
 #define token_cold  (ctx->tp_cold)
-#define p1_ann      (ctx->pass1_ann)
 #define token_count (ctx->tp_count)
 #define token_cap   (ctx->tp_cap)
 #define keyword_cache (ctx->kw_cache)
@@ -546,10 +545,6 @@ static void token_pool_ensure(size_t need) {
 	TokenCold *c = realloc(token_cold, new_cap * sizeof(TokenCold));
 	if (!c) error("out of memory allocating token cold pool");
 	token_cold = c;
-	uint8_t *a = realloc(p1_ann, new_cap * sizeof(uint8_t));
-	if (!a) error("out of memory allocating pass1 annotations");
-	memset(a + token_cap, 0, (new_cap - token_cap) * sizeof(uint8_t));
-	p1_ann = a;
 	token_cap = (uint32_t)new_cap;
 }
 
@@ -1145,6 +1140,7 @@ static inline __attribute__((always_inline)) Token *new_token(TokenKind kind, ch
 	tok->tag = 0;
 	tok->match_idx = 0;
 	tok->flags = (ts->at_bol ? TF_AT_BOL : 0) | (ts->has_space ? TF_HAS_SPACE : 0);
+	tok->ann = 0;
 	TokenCold *c = tok_cold(tok);
 	c->loc_offset = (uint32_t)(start - ctx->current_file->contents);
 	{
@@ -1949,15 +1945,12 @@ void tokenizer_teardown(bool full) {
 		memset(keyword_cache, 0, sizeof(keyword_cache));
 		free(token_pool);
 		free(token_cold);
-		free(p1_ann);
 		token_pool = NULL;
 		token_cold = NULL;
-		p1_ann = NULL;
 		token_count = 1;
 		token_cap = 0;
 	} else {
 		arena_reset(&ctx->main_arena);
-		if (p1_ann) memset(p1_ann, 0, token_count * sizeof(uint8_t));
 		token_count = 1; // Reset pool index but keep allocation
 	}
 	ctx->input_files = NULL;

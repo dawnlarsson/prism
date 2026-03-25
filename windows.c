@@ -346,39 +346,6 @@ static int mkstemp(char *tmpl) {
 	return mkstemps(tmpl, 0);
 }
 
-static char *mkdtemp(char *tmpl) {
-	static const char chars[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-	size_t len = strlen(tmpl);
-
-	size_t x_end = len;
-	size_t x_start = x_end;
-	while (x_start > 0 && tmpl[x_start - 1] == 'X') x_start--;
-	size_t x_count = x_end - x_start;
-
-	LARGE_INTEGER perf_counter;
-	QueryPerformanceCounter(&perf_counter);
-	unsigned int seed = (unsigned int)_getpid() ^ (unsigned int)GetTickCount() ^
-			    (unsigned int)perf_counter.LowPart;
-
-	for (int attempt = 0; attempt < 10000; attempt++) {
-		char try_buf[MAX_PATH];
-		if (len >= MAX_PATH) { errno = ENAMETOOLONG; return NULL; }
-		memcpy(try_buf, tmpl, len + 1);
-		unsigned int attempt_seed = seed ^ ((unsigned int)attempt * 2654435761u);
-		for (size_t i = x_start; i < x_start + x_count; i++) {
-			attempt_seed = attempt_seed * 1103515245 + 12345;
-			try_buf[i] = chars[(attempt_seed >> 16) % (sizeof(chars) - 1)];
-		}
-		if (_mkdir(try_buf) == 0) {
-			memcpy(tmpl, try_buf, len + 1);
-			return tmpl;
-		}
-		if (errno != EEXIST) return NULL;
-	}
-	errno = EEXIST;
-	return NULL;
-}
-
 /* Stub: Windows callers use get_self_exe_path() via GetModuleFileNameA instead */
 static ssize_t readlink(const char *path, char *buf, size_t bufsize) {
 	(void)path;

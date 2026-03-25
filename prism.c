@@ -203,7 +203,7 @@ enum {
 	P1_SCOPE_INIT        = 1 << 7, // This '{' opens an initializer (compound literal, = {...})
 };
 
-#define tok_ann(t) (p1_ann[tok_idx(t)])
+#define tok_ann(t) ((t)->ann)
 
 // Scope tree: flat array indexed by scope_id, one entry per '{' in the TU.
 typedef struct {
@@ -2009,10 +2009,12 @@ static bool generic_has_distinct_targets(Token *open) {
 	return false;
 }
 
-static bool generic_decl_rewrite_target(Token *generic_tok, Token **name_out,
-					Token **params_open_out,
-					Token **params_close_out,
-					Token **next_out) {
+// Shared preamble for _Generic rewriters: validate structure, check for multi-branch
+// dispatch, and skip the controlling expression to find the association list start.
+// Returns false if the _Generic is not rewritable.
+static bool generic_rewrite_preamble(Token *generic_tok, Token **open_out,
+				     Token **close_out, Token **after_out,
+				     Token **assoc_start_out) {
 	Token *open = tok_next(generic_tok);
 	if (!open || !match_ch(open, '(') || !tok_match(open)) return false;
 
@@ -2020,10 +2022,8 @@ static bool generic_decl_rewrite_target(Token *generic_tok, Token **name_out,
 	Token *after = skip_noise(tok_next(close));
 	if (!after) return false;
 
-	// Multi-branch _Generic with distinct targets has real type dispatch.
 	if (generic_has_distinct_targets(open)) return false;
 
-	// Skip the controlling expression (everything before first ',' at depth 0).
 	Token *assoc_start = NULL;
 	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
 		if (t->flags & TF_OPEN) {
@@ -2033,6 +2033,21 @@ static bool generic_decl_rewrite_target(Token *generic_tok, Token **name_out,
 		if (match_ch(t, ',')) { assoc_start = tok_next(t); break; }
 	}
 	if (!assoc_start) return false;
+
+	*open_out = open;
+	*close_out = close;
+	*after_out = after;
+	*assoc_start_out = assoc_start;
+	return true;
+}
+
+static bool generic_decl_rewrite_target(Token *generic_tok, Token **name_out,
+					Token **params_open_out,
+					Token **params_close_out,
+					Token **next_out) {
+	Token *open, *close, *after, *assoc_start;
+	if (!generic_rewrite_preamble(generic_tok, &open, &close, &after, &assoc_start))
+		return false;
 
 	// Pattern 1: _Generic(...name(decl-params)...) ;/attr
 	if (match_ch(after, ';') || match_ch(after, ',') || (after->tag & TT_ATTR) ||
@@ -2052,7 +2067,6 @@ static bool generic_decl_rewrite_target(Token *generic_tok, Token **name_out,
 	}
 
 	// Pattern 2: _Generic(...(cast)name)(decl-params) ;/attr
-	// glibc-style: function name inside _Generic, params follow outside.
 	if (match_ch(after, '(') && tok_match(after) && params_look_like_decls(after)) {
 		Token *ext_close = tok_match(after);
 		Token *after_ext = skip_noise(tok_next(ext_close));
@@ -2079,26 +2093,9 @@ static bool generic_member_rewrite_target(Token *generic_tok, Token **name_out,
 					  Token **args_open_out,
 					  Token **args_close_out,
 					  Token **next_out) {
-	Token *open = tok_next(generic_tok);
-	if (!open || !match_ch(open, '(') || !tok_match(open)) return false;
-
-	Token *close = tok_match(open);
-	Token *after = skip_noise(tok_next(close));
-	if (!after) return false;
-
-	// Multi-branch _Generic with distinct targets has real type dispatch.
-	if (generic_has_distinct_targets(open)) return false;
-
-	// Skip the controlling expression (everything before first ',' at depth 0).
-	Token *assoc_start = NULL;
-	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
-		if (t->flags & TF_OPEN) {
-			if (tok_match(t)) t = tok_match(t);
-			continue;
-		}
-		if (match_ch(t, ',')) { assoc_start = tok_next(t); break; }
-	}
-	if (!assoc_start) return false;
+	Token *open, *close, *after, *assoc_start;
+	if (!generic_rewrite_preamble(generic_tok, &open, &close, &after, &assoc_start))
+		return false;
 
 	for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
 		Token *call_open = skip_noise(tok_next(t));
@@ -4693,7 +4690,7 @@ static void collect_source_defines(const char *input_file) {
 		if (strncmp(p, "ifdef", 5) == 0 || strncmp(p, "ifndef", 6) == 0 ||
 		    (strncmp(p, "if", 2) == 0 && (p[2] == ' ' || p[2] == '\t' || p[2] == '('))) {
 			if (cond_depth < COND_STACK_MAX) {
-				cond_stack[cond_depth] = (typeof(cond_stack[0])){0};
+				memset(&cond_stack[cond_depth], 0, sizeof(cond_stack[0]));
 				cond_stack[cond_depth].opening = make_dir_line(p, dir_text_len);
 				cond_stack[cond_depth].extractable = !dir_has_continuation;
 			}
@@ -5568,7 +5565,7 @@ static void p1_build_scope_tree(Token *start) {
 			if (si->is_switch) ann |= P1_SCOPE_SWITCH;
 			if (si->is_conditional) ann |= P1_SCOPE_CONDITIONAL;
 			if (si->is_init) ann |= P1_SCOPE_INIT;
-			p1_ann[tidx] = ann;
+			token_pool[tidx].ann = ann;
 
 			scope_tree_count++;
 			depth++;

@@ -34,6 +34,7 @@ Defined in `parse.c`. Produces a flat pool of `Token` structs.
 | `len` | `uint32_t` | Byte length of the token text |
 | `kind` | `uint8_t` | `TK_IDENT`, `TK_KEYWORD`, `TK_PUNCT`, `TK_STR`, `TK_NUM`, `TK_PREP_DIR`, `TK_EOF` |
 | `flags` | `uint8_t` | `TF_AT_BOL`, `TF_HAS_SPACE`, `TF_IS_FLOAT`, `TF_OPEN`, `TF_CLOSE`, `TF_C23_ATTR`, `TF_RAW`, `TF_SIZEOF` |
+| `ann` | `uint8_t` | Pass 1 annotation flags (`P1_SCOPE_*`, `P1_OE_*`, `P1_IS_DECL`). Zeroed by `new_token()` on allocation. |
 
 Cold path data (`TokenCold`, separate array): `loc_offset`, `line_no` (21-bit), `file_idx` (11-bit).
 
@@ -61,9 +62,9 @@ Pass 1 is a series of phases executed sequentially. Each phase augments the data
 
 ### 3.0 Infrastructure
 
-#### pass1_ann (parallel annotation array)
+#### Token annotation field (`ann`)
 
-A `uint8_t` array parallel to the token pool. Indexed by token pool index via the `tok_ann(tok)` macro. Allocated alongside the token pool (realloc'd in `token_pool_ensure`). Freed by `tokenizer_teardown(true)`. Zeroed by `tokenizer_teardown(false)` (library-mode reuse) via `memset(p1_ann, 0, token_count)` before the pool index is reset — this prevents stale `|=`-applied flags (`P1_IS_DECL`, `P1_OE_BRACKET`, `P1_OE_DECL_INIT`) from leaking across consecutive `prism_transpile_*()` calls.
+The `uint8_t ann` field in the Token struct stores Pass 1 annotation flags. Accessed via the `tok_ann(tok)` macro (expands to `(tok)->ann`). Zeroed by `new_token()` on allocation — this prevents stale `|=`-applied flags (`P1_IS_DECL`, `P1_OE_BRACKET`, `P1_OE_DECL_INIT`) from leaking across consecutive `prism_transpile_*()` calls when the token pool is reused.
 
 Flag definitions:
 
@@ -75,8 +76,9 @@ Flag definitions:
 | `P1_OE_BRACKET` | 4 | `orelse` inside array dimension brackets `[…]` |
 | `P1_OE_DECL_INIT` | 5 | `orelse` inside a declaration initializer |
 | `P1_IS_DECL` | 6 | Phase 1D: token starts a variable declaration |
+| `P1_SCOPE_INIT` | 7 | This `{` opens an initializer (compound literal, `= {...}`) |
 
-**Cache discipline:** Pass 2 only reads `pass1_ann` when a token's tag matches `TT_STRUCTURAL`, `TT_IF|TT_LOOP|TT_SWITCH`, or `TT_ORELSE`. The fast path (~70–80% of tokens) never touches the array.
+**Cache discipline:** Pass 2 only reads `tok->ann` when a token's tag matches `TT_STRUCTURAL`, `TT_IF|TT_LOOP|TT_SWITCH`, or `TT_ORELSE`. The fast path (~70–80% of tokens) never reads the annotation.
 
 #### Scope tree
 
@@ -157,7 +159,7 @@ Stored in a flat array with a hashmap keyed on name. Supports multiple shadows p
 
 | Array | Allocation | Freed by |
 |---|---|---|
-| `pass1_ann[]` | `realloc` | `tokenizer_teardown(true)` |
+| `Token.ann` | Inline in token pool | `tokenizer_teardown(true)` (frees token pool) |
 | `scope_tree[]` | `ARENA_ENSURE_CAP` | `arena_reset()` |
 | `func_meta[]` | `ARENA_ENSURE_CAP` | `arena_reset()` |
 | `p1_entries[]` | `ARENA_ENSURE_CAP` | `arena_reset()` |
@@ -194,7 +196,7 @@ Walks all tokens. On every `{`, assigns a new `scope_id`, records `parent_id` fr
 
 **C23 attribute backward walk:** When walking backward to find `prev`, the loop skips `]]` C23 attributes by checking `tok_match(])->flags & TF_C23_ATTR` (the `TF_C23_ATTR` flag is set on the opening `[`, not the closing `]`). This ensures `void f(void) [[gnu::cold]] {` correctly finds `)` as `prev` and classifies it as `is_func_body`.
 
-Writes `P1_SCOPE_LOOP`, `P1_SCOPE_SWITCH`, `P1_SCOPE_CONDITIONAL` flags to `pass1_ann` on the `{` token.
+Writes `P1_SCOPE_LOOP`, `P1_SCOPE_SWITCH`, `P1_SCOPE_CONDITIONAL`, `P1_SCOPE_INIT` flags to the `{` token's `ann` field.
 
 ---
 
@@ -325,7 +327,7 @@ Rejected patterns inside defer bodies:
 
 **Function:** inline in `p1_full_depth_prescan`
 
-Walks all tokens looking for `[…]` pairs containing `orelse`. Marks them with `P1_OE_BRACKET` on `pass1_ann`.
+Walks all tokens looking for `[…]` pairs containing `orelse`. Marks them with `P1_OE_BRACKET` on the token's `ann` field.
 
 **Control-flow rejection (Phase 1G):** When an `orelse` token is found inside `[…]`, Phase 1G peeks at the next token. If it is a control-flow keyword (`return`, `break`, `continue`, `goto`) or `{` (block form), a hard error is raised immediately — before Pass 2 emits any output. Pass 2's `walk_balanced_orelse` retains the same checks as defense-in-depth assertions (unreachable by design).
 
@@ -388,7 +390,7 @@ A sequential token walk. Emits transformed C.
 
 ### Fast path
 
-Tokens with no `tag` bits set and `!at_stmt_start` (~70–80% of tokens) are emitted directly via `emit_tok`. This path never reads `pass1_ann`.
+Tokens with no `tag` bits set and `!at_stmt_start` (~70–80% of tokens) are emitted directly via `emit_tok`. This path never reads `tok->ann`.
 
 ### Slow path dispatch
 
@@ -398,7 +400,7 @@ Tokens with tag bits or at statement boundaries are dispatched to handlers:
 |---|---|---|
 | `handle_goto_keyword` | `TT_GOTO` | Emit defer cleanup (LIFO unwinding to target label depth), emit `goto`. Safety checks are in Phase 2A. |
 | `handle_case_default` | `TT_CASE` / `TT_DEFAULT` | Bail out early if `ctrl_state.pending && parens_just_closed` (braceless switch body — no `SCOPE_BLOCK` was pushed, so `find_switch_scope()` would leak to an enclosing braced switch). Otherwise, reset defer stack to switch scope level. Error checks are in Phase 2A. |
-| `handle_open_brace` | `{` | Push scope. Read `P1_SCOPE_*` from `pass1_ann` for classification. Handle compound-literal-in-ctrl-paren, orelse guard, stmt_expr detection. |
+| `handle_open_brace` | `{` | Push scope. Read `P1_SCOPE_*` from `tok->ann` for classification. Handle compound-literal-in-ctrl-paren, orelse guard, stmt_expr detection. |
 | `handle_close_brace` | `}` | Pop scopes, emit defers (LIFO), handle orelse guard close (consume trailing `;` to prevent dangling-else). |
 | `try_zero_init_decl` | Statement start, type keyword/typedef | Parse declaration, insert `= {0}` or `= 0` or `memset` call. |
 | `p1_label_find` | `TT_GOTO` dispatch | Query Phase 1D `p1_entries` array for label scope depth; no separate label table needed. |
@@ -573,7 +575,7 @@ When `warn_safety` is enabled (`-fno-safety`), CFG violations (goto skipping def
 
 ### longjmp error recovery (library mode)
 
-In `PRISM_LIB_MODE`, `error_tok` triggers `longjmp(ctx->error_jmp)` instead of `exit(1)`. All arena-allocated structures are reclaimed by `arena_reset()`. `pass1_ann` survives arena resets (same lifecycle as token pool).
+In `PRISM_LIB_MODE`, `error_tok` triggers `longjmp(ctx->error_jmp)` instead of `exit(1)`. All arena-allocated structures are reclaimed by `arena_reset()`. Token annotations (`ann` field) survive arena resets (same lifecycle as token pool).
 
 ---
 
@@ -719,7 +721,7 @@ Pass 2 is a near-pure code generator. It does not:
 - Validate defer bodies (`validate_defer_statement` runs only in Phase 1F)
 - Track return type state machines (`FuncMeta` provides return type data at function body entry)
 - Register ghost enums during emit (`emit_tok` does not call `parse_enum_constants`)
-- Read `CtrlState.scope_flags` (scope classification comes from `P1_SCOPE_*` in `pass1_ann`)
+- Read `CtrlState.scope_flags` (scope classification comes from `P1_SCOPE_*` in `tok->ann`)
 
 ### What stays in Pass 2
 
@@ -738,7 +740,7 @@ These are inherently runtime and cannot move to Pass 1:
 
 ## 14. Invariants
 
-1. **Immutable symbol table:** After Phase 1B completes, the typedef table is frozen. Pass 2 performs zero mutations to the typedef table, scope tree, `pass1_ann`, or `func_meta`.
+1. **Immutable symbol table:** After Phase 1B completes, the typedef table is frozen. Pass 2 performs zero mutations to the typedef table, scope tree, token annotations (`ann`), or `func_meta`.
 2. **All errors before emission:** Every user-triggerable `error_tok` call from semantic analysis fires during Pass 1 or Phase 2A, before Pass 2 emits its first byte. Pass 2 contains defensive `error_tok` calls in `process_declarators`, `emit_bare_orelse_impl`, `handle_defer_keyword`, etc. that serve as unreachable-by-design assertions — they guard against internal inconsistencies that would indicate a Pass 1 gap, not against user input that should have been caught earlier.
 3. **O(N) CFG verification:** `p1_verify_cfg` is guaranteed linear in the number of P1FuncEntry items per function. No O(N²) pairwise scans.
 4. **Delimiter matching completeness:** Every `(`, `[`, `{` has a `match_idx`. Every `)`, `]`, `}` points back. No unmatched delimiters survive tokenization.

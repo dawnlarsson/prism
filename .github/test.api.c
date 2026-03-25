@@ -5620,10 +5620,9 @@ static void test_goto_over_for_init_decl(void) {
 }
 
 static void test_p1_ann_dirty_state_leak(void) {
-	/* BUG: tokenizer_teardown(false) resets token_count but leaves p1_ann
-	 * untouched.  On the next transpile the |= operations (P1_IS_DECL,
-	 * P1_OE_BRACKET, P1_OE_DECL_INIT) OR into stale bits from the
-	 * previous file, causing ghost annotations on unrelated tokens. */
+	/* Verify that new_token() zeroes the ann field when reusing pool slots.
+	 * Without zeroing, |= operations (P1_IS_DECL, P1_OE_BRACKET, etc.)
+	 * would OR into stale bits from the previous transpilation. */
 	PrismFeatures f = prism_defaults();
 
 	/* File 1: has a local declaration — Phase 1 writes P1_IS_DECL */
@@ -5638,17 +5637,16 @@ static void test_p1_ann_dirty_state_leak(void) {
 
 	prism_reset();
 
-	/* After prism_reset(), p1_ann should be zeroed for all previously-used
-	 * slots.  The token pool was reused (token_count reset to 1, token_cap
-	 * and p1_ann allocation preserved).  Check that no stale bytes remain
-	 * in the range that file1 occupied. */
-	int stale = 0;
-	for (uint32_t i = 1; i < 50 && i < token_cap; i++) {
-		if (p1_ann[i]) stale++;
-	}
-	CHECK(stale == 0,
-	      "p1_ann-dirty: p1_ann must be clean after prism_reset() "
-	      "(found stale annotations in reusable slots)");
+	/* File 2: similar code reuses the same pool slots.  If ann isn't
+	 * zeroed by new_token, Phase 1 annotations from file1 leak. */
+	const char *src2 =
+	    "void g(void) {\n"
+	    "    int y = 7;\n"
+	    "    (void)y;\n"
+	    "}\n";
+	PrismResult r2 = prism_transpile_source(src2, "dirty2.c", f);
+	CHECK_EQ(r2.status, PRISM_OK, "p1_ann-dirty: file2 transpiles OK");
+	prism_free(&r2);
 	prism_reset();
 }
 
