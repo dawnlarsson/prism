@@ -332,6 +332,7 @@ typedef struct PrismContext {
 
 	// Source-file #define directives consumed by cc -E, for non-flatten reconstruction
 	char **source_defines;             // Array of "NAME=VALUE" or "NAME" strings (malloc'd)
+	char **source_define_guards;       // Parallel: NULL (unconditional) or condition guard text (malloc'd)
 	int source_define_count;
 	int source_define_cap;
 

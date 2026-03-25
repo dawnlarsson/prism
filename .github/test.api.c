@@ -5766,19 +5766,17 @@ static void test_collect_source_defines_comment_in_directive(void) {
 }
 
 static void test_collect_source_defines_ifdef_both_branches_extracted(void) {
-	/* BUG: collect_source_defines() is a raw text scanner with no
-	 * conditional-compilation awareness.  When it encounters:
+	/* Conditional defines are now extracted WITH their preprocessor guards.
+	 * When it encounters:
 	 *   #ifdef _WIN32
 	 *   #define PLAT 1
 	 *   #else
 	 *   #define PLAT 2
 	 *   #endif
-	 * it extracts BOTH defines unconditionally.  emit_define_guarded()
-	 * wraps each in #ifndef, so the FIRST extracted value always wins
-	 * regardless of which branch the preprocessor actually took.
-	 * On Linux, the preprocessor chose PLAT=2, but the re-emitted output
-	 * emits PLAT=1 first (guarded by #ifndef), so the backend compiler
-	 * sees PLAT=1 → wrong value → silent ABI or logic mismatch. */
+	 * it extracts BOTH defines, each wrapped in its guard branch
+	 * (#ifdef _WIN32 for the first, #ifdef _WIN32/#else for the second).
+	 * The backend compiler re-evaluates the same condition, so only the
+	 * correct branch's define is active. */
 	const char *code =
 	    "#ifdef _WIN32\n"
 	    "#define PLAT_IFDEF_BUG 1\n"
@@ -5794,20 +5792,14 @@ static void test_collect_source_defines_ifdef_both_branches_extracted(void) {
 	feat.flatten_headers = false;
 	PrismResult r = prism_transpile_file(path, feat);
 	if (r.status == PRISM_OK && r.output) {
-		/* Count how many times PLAT_IFDEF_BUG appears in #define lines.
-		 * If collect_source_defines extracts both branches, there will
-		 * be two #define PLAT_IFDEF_BUG lines (each inside #ifndef). */
-		int define_count = 0;
-		const char *p = r.output;
-		while ((p = strstr(p, "#define PLAT_IFDEF_BUG")) != NULL) {
-			define_count++;
-			p += 21;
-		}
-		CHECK(define_count <= 1,
-		      "ifdef-both-branches: #ifdef/#else defines must not BOTH "
-		      "be extracted (collect_source_defines has no conditional "
-		      "compilation awareness; both branch values re-emitted; "
-		      "first #ifndef guard wins → wrong value for backend)");
+		/* Both branches should be present, each inside its own guard.
+		 * The #ifdef _WIN32 guard ensures only the correct value is
+		 * active during backend compilation. */
+		CHECK(strstr(r.output, "#define PLAT_IFDEF_BUG") != NULL,
+		      "ifdef-both-branches: at least one conditional define "
+		      "must be re-emitted (with guard)");
+		CHECK(strstr(r.output, "#ifdef _WIN32") != NULL,
+		      "ifdef-both-branches: #ifdef _WIN32 guard must be present");
 	} else {
 		CHECK(0, "ifdef-both-branches: transpilation failed unexpectedly");
 	}
@@ -6075,6 +6067,60 @@ static void test_collect_source_defines_continuation_splice_space(void) {
 	unlink(path); free(path);
 }
 
+static void test_collect_source_defines_conditional_guard_preserved(void) {
+	/* BUG: collect_source_defines() skips ALL defines at cond_depth > 0.
+	 * This means #ifdef __APPLE__ / #define _DARWIN_C_SOURCE / #endif
+	 * is lost from non-flatten output.  The backend compiler re-processes
+	 * #include directives without seeing _DARWIN_C_SOURCE, causing ABI
+	 * mismatch (headers expose different prototypes). Fix: extract
+	 * conditional defines and wrap them in their original guards. */
+	const char *code =
+	    "#ifdef __APPLE__\n"
+	    "#define COND_GUARD_TEST_MAC 42\n"
+	    "#endif\n"
+	    "#ifndef __APPLE__\n"
+	    "#define COND_GUARD_TEST_LIN 99\n"
+	    "#endif\n"
+	    "#include <stddef.h>\n"
+	    "int v;\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "cond-guard: create temp file");
+	if (!path) return;
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = false;
+	PrismResult r = prism_transpile_file(path, feat);
+	CHECK_EQ(r.status, PRISM_OK, "cond-guard: transpiles OK");
+	if (r.output) {
+		/* On macOS: __APPLE__ is defined, so _MAC define should be
+		 * re-emitted (guarded by #ifdef __APPLE__). The _LIN define
+		 * should also be emitted (guarded by #ifndef __APPLE__) but
+		 * the guard makes it inactive on macOS. Both defines MUST
+		 * appear in the output with their guards. */
+		int mac_count = 0, lin_count = 0;
+		const char *p = r.output;
+		while ((p = strstr(p, "COND_GUARD_TEST_MAC")) != NULL) { mac_count++; p += 19; }
+		p = r.output;
+		while ((p = strstr(p, "COND_GUARD_TEST_LIN")) != NULL) { lin_count++; p += 19; }
+		/* The define must appear at least once — it was previously
+		 * dropped because cond_depth > 0 skipped it entirely. */
+		CHECK(mac_count >= 1,
+		      "cond-guard: #ifdef __APPLE__ define must be re-emitted "
+		      "(was previously dropped by cond_depth > 0 skip)");
+		CHECK(lin_count >= 1,
+		      "cond-guard: #ifndef __APPLE__ define must be re-emitted "
+		      "(was previously dropped by cond_depth > 0 skip)");
+		/* The guard must be present to prevent wrong-platform activation */
+		CHECK(strstr(r.output, "#ifdef __APPLE__") != NULL,
+		      "cond-guard: #ifdef __APPLE__ guard must be preserved");
+		CHECK(strstr(r.output, "#ifndef __APPLE__") != NULL,
+		      "cond-guard: #ifndef __APPLE__ guard must be preserved");
+	} else {
+		CHECK(0, "cond-guard: output is NULL");
+	}
+	prism_free(&r);
+	unlink(path); free(path);
+}
+
 void run_api_tests(void) {
 test_typeof_orelse_leak();
 	printf("\n=== API TESTS ===\n");
@@ -6283,4 +6329,7 @@ test_typeof_orelse_leak();
 	// _Generic member distinct target mutilation
 	test_collect_source_defines_continuation_splice_space();
 	test_generic_member_distinct_target_mutilation();
+
+	// Audit round 40: conditional define preservation with guards
+	test_collect_source_defines_conditional_guard_preserved();
 }

@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3285+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3344+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -347,7 +347,7 @@ Runs after all Phase 1 sub-phases complete. Gated by `F_DEFER | F_ZEROINIT` — 
 
 ### Algorithm
 
-1. Build a label hash table (open-addressing, power-of-2) mapping label names to their entry index.
+1. Build a label hash table (open-addressing, power-of-2) mapping label names to their entry index. During insertion, duplicate labels (same name appearing twice in the same function) are detected and rejected with a hard error.
 
 2. Maintain watermark arrays `wm_defer[]` and `wm_decl[]` indexed by entry array position. As the sweep encounters `P1K_DEFER` and `P1K_DECL` entries, it appends them to `defer_list`/`decl_list` and records the current list lengths in the watermark arrays. Separate switch watermark arrays (`sw_defer_wm[]`, `sw_decl_wm[]`) are indexed by `scope_id` for O(1) lookup from case entries.
 
@@ -632,9 +632,11 @@ Multiple `.c` files are each transpiled independently and passed to CC. Assembly
 
 ### Non-flatten define re-emission
 
-When `-fno-flatten-headers` is active, Prism runs `cc -E` which consumes in-file `#define` directives. The transpiled output reconstructs `#include` directives but must also re-emit the user's `#define`s that appeared before the first `#include`. `collect_source_defines` scans the original source file (raw text, not tokens) and extracts unconditional, non-function-like `#define NAME VALUE` directives. These are re-emitted as `#ifndef NAME` / `#define NAME VALUE` / `#endif` guards by `emit_consumed_defines` before any `#include` directives.
+When `-fno-flatten-headers` is active, Prism runs `cc -E` which consumes in-file `#define` directives. The transpiled output reconstructs `#include` directives but must also re-emit the user's `#define`s that appeared before the first `#include`. `collect_source_defines` scans the original source file (raw text, not tokens) and extracts non-function-like `#define NAME VALUE` directives, both unconditional and conditional. These are re-emitted as `#ifndef NAME` / `#define NAME VALUE` / `#endif` guards by `emit_consumed_defines` before any `#include` directives.
 
-The scanner handles: multi-line block comments (tracked via `in_block_comment`), line continuations (`\` at end of line), inline block comments between `#` and the directive name, `#ifdef`/`#ifndef`/`#endif` nesting (only extracts at `cond_depth == 0`), multi-line continuation values, and `#define`s that follow block comment closings on the same line.
+**Conditional guard extraction:** Defines inside `#ifdef`/`#ifndef`/`#if`/`#elif`/`#else` blocks are extracted along with their enclosing preprocessor guard text. A condition stack (max depth 32) tracks each nesting level's opening directive (e.g., `#ifdef __APPLE__\n`) and current branch directive (e.g., `#else\n`). When a `#define` is found inside conditional blocks, `emit_consumed_defines` wraps it in the reconstructed guard (concatenation of all active condition stack entries' opening/branch text) followed by matching `#endif` lines. This preserves platform-gated defines like `#ifdef __APPLE__ / #define _DARWIN_C_SOURCE / #endif`.
+
+The scanner handles: multi-line block comments (tracked via `in_block_comment`), line continuations (`\` at end of line), inline block comments between `#` and the directive name, `#ifdef`/`#ifndef`/`#if`/`#elif`/`#else`/`#endif` nesting with condition stack tracking, multi-line continuation values, and `#define`s that follow block comment closings on the same line.
 
 ---
 

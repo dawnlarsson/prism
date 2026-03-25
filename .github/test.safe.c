@@ -3377,6 +3377,29 @@ static void test_vla_masked_by_scalar_fno_safety(void) {
 	prism_free(&r);
 }
 
+static void test_duplicate_label_detection(void) {
+	printf("\n--- Duplicate Label Detection ---\n");
+
+	/* Duplicate labels are invalid C (constraint violation 6.8.1).
+	 * The CFG verifier uses a hash map keyed by label name, so a
+	 * duplicate silently overwrites the first entry's slot.  This
+	 * could cause goto safety checks to analyze against the wrong
+	 * label.  Prism should detect the duplicate and error. */
+	const char *code =
+	    "void f(void) {\n"
+	    "    goto L;\n"
+	    "L: ;\n"
+	    "L: ;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "dup_label.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "dup-label: duplicate label must be rejected");
+	if (r.error_msg)
+		CHECK(strstr(r.error_msg, "duplicate label") != NULL,
+		      "dup-label: error message mentions 'duplicate label'");
+	prism_free(&r);
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -3645,4 +3668,7 @@ void run_safe_tests(void) {
 
 	// Audit round 34: scalar before VLA masks VLA hard error under -fno-safety
 	test_vla_masked_by_scalar_fno_safety();
+
+        // Audit round 40: duplicate label detection in CFG verifier
+        test_duplicate_label_detection();
 }

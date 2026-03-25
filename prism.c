@@ -795,8 +795,30 @@ static void emit_consumed_defines(void) {
 	}
 
 	// Emit source-file defines that were consumed by the preprocessor
-	for (int i = 0; i < ctx->source_define_count; i++)
+	for (int i = 0; i < ctx->source_define_count; i++) {
+		const char *guard = ctx->source_define_guards ? ctx->source_define_guards[i] : NULL;
+		if (guard) {
+			out_str(guard, strlen(guard));
+		}
 		emit_define_guarded(ctx->source_defines[i]);
+		if (guard) {
+			// Count opening directives (#if/#ifdef/#ifndef) to determine
+			// how many #endif lines to emit.
+			int depth = 0;
+			const char *gp = guard;
+			while (*gp) {
+				if (*gp == '#') {
+					const char *d = gp + 1;
+					while (*d == ' ' || *d == '\t') d++;
+					if (d[0] == 'i' && d[1] == 'f') depth++;
+				}
+				while (*gp && *gp != '\n') gp++;
+				if (*gp) gp++;
+			}
+			for (int d = 0; d < depth; d++)
+				OUT_LIT("#endif\n");
+		}
+	}
 
 	// Emit built-in feature test macros (guarded to not override user defines)
 	OUT_LIT("#if !defined(_WIN32)\n"
@@ -4577,9 +4599,12 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 // These ABI-altering macros (e.g. _FILE_OFFSET_BITS, _LARGEFILE_SOURCE) are
 // consumed by cc -E and lost from un-flattened output unless we capture them.
 static inline void free_source_defines(void) {
-	for (int i = 0; i < ctx->source_define_count; i++)
+	for (int i = 0; i < ctx->source_define_count; i++) {
 		free(ctx->source_defines[i]);
+		free(ctx->source_define_guards[i]);
+	}
 	ctx->source_defines = NULL;
+	ctx->source_define_guards = NULL;
 	ctx->source_define_count = 0;
 	ctx->source_define_cap = 0;
 }
@@ -4597,8 +4622,25 @@ static void collect_source_defines(const char *input_file) {
 	bool in_block_comment = false;
 	bool in_hash_block_comment = false; // block comment started between # and directive name
 	int cond_depth = 0; // #if/#ifdef/#ifndef nesting depth
+
+	// Condition stack: tracks raw directive text at each nesting level
+	// for re-emitting conditional defines with their original guards.
+#define COND_STACK_MAX 32
+	struct {
+		char *opening;       // e.g. "#ifdef __APPLE__\n"
+		char *branches;      // accumulated "#else\n" or "#elif EXPR\n" text (NULL initially)
+		int branches_len;
+		int branches_cap;
+		bool extractable;    // false if opening/branch had continuation (multi-line expr)
+	} cond_stack[COND_STACK_MAX];
+	memset(cond_stack, 0, sizeof(cond_stack));
+
 	while (getline(&line, &line_cap, f) >= 0) {
 		char *p = line;
+		char *line_end;
+		bool dir_has_continuation;
+		char *dir_text_end;
+		int dir_text_len;
 		// Track multi-line block comments
 		if (in_block_comment) {
 			char *end = strstr(line, "*/");
@@ -4654,25 +4696,96 @@ static void collect_source_defines(const char *input_file) {
 			} else
 				p++;
 		}
-	parse_directive:
+	parse_directive: ;
+		// Check if this directive line has a continuation (multi-line expression)
+		line_end = p + strlen(p);
+		while (line_end > p && (line_end[-1] == '\n' || line_end[-1] == '\r')) line_end--;
+		dir_has_continuation = (line_end > p && line_end[-1] == '\\');
+
+		// Capture raw directive text: "#directive args" (trimmed, no continuation backslash)
+		dir_text_end = line_end;
+		if (dir_has_continuation) dir_text_end--;
+		while (dir_text_end > p && (dir_text_end[-1] == ' ' || dir_text_end[-1] == '\t')) dir_text_end--;
+		dir_text_len = (int)(dir_text_end - p);
+
 		// Track #if/#ifdef/#ifndef/#elif/#else/#endif nesting
 		if (strncmp(p, "ifdef", 5) == 0 || strncmp(p, "ifndef", 6) == 0 ||
 		    (strncmp(p, "if", 2) == 0 && (p[2] == ' ' || p[2] == '\t' || p[2] == '('))) {
+			if (cond_depth < COND_STACK_MAX) {
+				// Build "#directive text\n"
+				char *text = malloc(1 + dir_text_len + 2);
+				if (text) {
+					text[0] = '#';
+					memcpy(text + 1, p, dir_text_len);
+					text[1 + dir_text_len] = '\n';
+					text[1 + dir_text_len + 1] = '\0';
+				}
+				cond_stack[cond_depth].opening = text;
+				cond_stack[cond_depth].branches = NULL;
+				cond_stack[cond_depth].branches_len = 0;
+				cond_stack[cond_depth].branches_cap = 0;
+				cond_stack[cond_depth].extractable = !dir_has_continuation;
+			}
 			cond_depth++;
 			goto check_continuation;
 		}
 		if (strncmp(p, "endif", 5) == 0) {
-			if (cond_depth > 0) cond_depth--;
+			if (cond_depth > 0) {
+				cond_depth--;
+				if (cond_depth < COND_STACK_MAX) {
+					free(cond_stack[cond_depth].opening);
+					free(cond_stack[cond_depth].branches);
+					cond_stack[cond_depth].opening = NULL;
+					cond_stack[cond_depth].branches = NULL;
+				}
+			}
 			goto check_continuation;
 		}
-		if (strncmp(p, "else", 4) == 0 || strncmp(p, "elif", 4) == 0)
+		if (strncmp(p, "else", 4) == 0 || strncmp(p, "elif", 4) == 0) {
+			if (cond_depth > 0 && cond_depth <= COND_STACK_MAX) {
+				int d = cond_depth - 1;
+				char *branch_line = malloc(1 + dir_text_len + 2);
+				if (branch_line) {
+					branch_line[0] = '#';
+					memcpy(branch_line + 1, p, dir_text_len);
+					branch_line[1 + dir_text_len] = '\n';
+					branch_line[1 + dir_text_len + 1] = '\0';
+					int blen = 1 + dir_text_len + 1;
+					int need = cond_stack[d].branches_len + blen + 1;
+					if (need > cond_stack[d].branches_cap) {
+						int nc = need * 2;
+						char *nb = realloc(cond_stack[d].branches, nc);
+						if (nb) { cond_stack[d].branches = nb; cond_stack[d].branches_cap = nc; }
+					}
+					if (cond_stack[d].branches && cond_stack[d].branches_cap >= need) {
+						memcpy(cond_stack[d].branches + cond_stack[d].branches_len,
+						       branch_line, blen);
+						cond_stack[d].branches_len += blen;
+						cond_stack[d].branches[cond_stack[d].branches_len] = '\0';
+					}
+					free(branch_line);
+				}
+				if (dir_has_continuation) cond_stack[d].extractable = false;
+			}
 			goto check_continuation;
+		}
 
 		// Only break on #include at unconditional scope
 		if (strncmp(p, "include", 7) == 0 && cond_depth == 0) break;
 
-		// Only extract defines at unconditional scope (cond_depth == 0)
-		if (cond_depth > 0) goto check_continuation;
+		// Skip defines inside conditions that have multi-line expressions
+		// or are too deeply nested for our stack.
+		if (cond_depth > COND_STACK_MAX) goto check_continuation;
+		if (cond_depth > 0) {
+			bool can_extract = true;
+			for (int d = 0; d < cond_depth; d++) {
+				if (!cond_stack[d].extractable || !cond_stack[d].opening) {
+					can_extract = false;
+					break;
+				}
+			}
+			if (!can_extract) goto check_continuation;
+		}
 
 		if (strncmp(p, "define", 6) == 0 && (p[6] == ' ' || p[6] == '\t')) {
 			p += 6;
@@ -4765,9 +4878,42 @@ static void collect_source_defines(const char *input_file) {
 			}
 			free(full_val);
 
+			// Build guard text from condition stack (NULL if unconditional)
+			char *guard = NULL;
+			if (cond_depth > 0) {
+				int glen = 0;
+				for (int d = 0; d < cond_depth; d++) {
+					glen += (int)strlen(cond_stack[d].opening);
+					if (cond_stack[d].branches)
+						glen += cond_stack[d].branches_len;
+				}
+				guard = malloc(glen + 1);
+				if (guard) {
+					int pos = 0;
+					for (int d = 0; d < cond_depth; d++) {
+						int olen = (int)strlen(cond_stack[d].opening);
+						memcpy(guard + pos, cond_stack[d].opening, olen);
+						pos += olen;
+						if (cond_stack[d].branches) {
+							memcpy(guard + pos, cond_stack[d].branches,
+							       cond_stack[d].branches_len);
+							pos += cond_stack[d].branches_len;
+						}
+					}
+					guard[pos] = '\0';
+				}
+			}
+
+			int old_cap = ctx->source_define_cap;
 			ARENA_ENSURE_CAP(&ctx->main_arena, ctx->source_defines,
 					 ctx->source_define_count, ctx->source_define_cap,
 					 8, char *);
+			if ((int)ctx->source_define_cap != old_cap)
+				ctx->source_define_guards = arena_realloc(&ctx->main_arena,
+					ctx->source_define_guards,
+					sizeof(char *) * old_cap,
+					sizeof(char *) * ctx->source_define_cap);
+			ctx->source_define_guards[ctx->source_define_count] = guard;
 			ctx->source_defines[ctx->source_define_count++] = def;
 		}
 		// Check if this preprocessor directive has a continuation
@@ -4776,6 +4922,11 @@ static void collect_source_defines(const char *input_file) {
 			while (end > line && (end[-1] == '\n' || end[-1] == '\r')) end--;
 			in_continuation = (end > line && end[-1] == '\\');
 		}
+	}
+	// Clean up condition stack (in case file ended without matching #endif)
+	for (int d = 0; d < cond_depth && d < COND_STACK_MAX; d++) {
+		free(cond_stack[d].opening);
+		free(cond_stack[d].branches);
 	}
 	free(line);
 	fclose(f);
@@ -6727,6 +6878,14 @@ static void p1_verify_cfg(void) {
 			for (int probe = 0; probe < hash_sz; probe++) {
 				int slot = (h + probe) & hash_mask;
 				if (label_hash[slot] < 0) { label_hash[slot] = i; break; }
+				// Detect duplicate label (same name already in hash)
+				P1FuncEntry *existing = &ents[label_hash[slot]];
+				if (existing->kind == P1K_LABEL &&
+				    existing->label.len == ents[i].label.len &&
+				    !memcmp(existing->label.name, ents[i].label.name,
+					    existing->label.len))
+					error_tok(ents[i].tok, "duplicate label '%.*s'",
+						  ents[i].label.len, ents[i].label.name);
 			}
 		}
 
