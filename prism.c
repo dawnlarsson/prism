@@ -3271,6 +3271,22 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 	while (tok && tok->kind != TK_EOF) {
 		Token *decl_start = tok;
 
+		// Per-declarator 'raw' detection (comma-separated: int x, raw y;)
+		bool decl_is_raw = is_raw;
+		if (!decl_is_raw && (tok->flags & TF_RAW) && !is_known_typedef(tok)) {
+			Token *after = skip_noise(tok_next(tok));
+			if (after && ((is_valid_varname(after) && !is_type_keyword(after) &&
+				       !is_known_typedef(after) && !(after->tag & (TT_QUALIFIER | TT_SUE))) ||
+				      match_ch(after, '*') || match_ch(after, '('))) {
+				Token *last_raw = tok;
+				SKIP_RAW(after, last_raw);
+				emit_noise_between_raws(tok, last_raw);
+				decl_start = tok_next(last_raw);
+				tok = after;
+				decl_is_raw = true;
+			}
+		}
+
 		// Step 1: Non-emitting lookahead
 		DeclResult decl = parse_declarator(tok, false);
 		if (!decl.end || !decl.var_name) {
@@ -3334,7 +3350,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		    decl.is_array || ((type->is_struct || type->is_typedef) && !decl.is_pointer);
 		// Only queue memset when zeroinit feature is enabled.
 		// Static/extern variables are zero-initialized by the loader — skip.
-		bool needs_memset = FEAT(F_ZEROINIT) && !decl.has_init && !is_raw && (!decl.is_pointer || decl.is_array) &&
+		bool needs_memset = FEAT(F_ZEROINIT) && !decl.has_init && !decl_is_raw && (!decl.is_pointer || decl.is_array) &&
 				    !type->has_register && !type->has_static && !type->has_extern &&
 				    (type->has_typeof || (type->has_atomic && is_aggregate) || effective_vla);
 
@@ -3381,7 +3397,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		tok = decl.end;
 
 		// Add zero initializer if needed (for non-memset types)
-		if (FEAT(F_ZEROINIT) && !decl.has_init && !effective_vla && !is_raw && !needs_memset && !type->has_extern && !type->has_static) {
+		if (FEAT(F_ZEROINIT) && !decl.has_init && !effective_vla && !decl_is_raw && !needs_memset && !type->has_extern && !type->has_static) {
 			if (type->has_register && type->has_atomic && is_aggregate)
 				error_tok(decl.var_name,
 					  "'register _Atomic' aggregate cannot be safely "
@@ -5438,7 +5454,13 @@ static void emit_deferred_range(Token *start, Token *end) {
 		// Strip raw keyword (same as main loop catch-all)
 		if (__builtin_expect((t->flags & TF_RAW) && !is_known_typedef(t), 0)) {
 			Token *after_raw = skip_noise(tok_next(t));
-			if (is_raw_declaration_context(after_raw)) {
+			if (is_raw_declaration_context(after_raw) ||
+			    (after_raw && is_valid_varname(after_raw) && !is_type_keyword(after_raw) &&
+			     !is_known_typedef(after_raw) && !(after_raw->tag & (TT_QUALIFIER | TT_SUE)) &&
+			     tok_next(after_raw) &&
+			     (match_ch(tok_next(after_raw), ',') || match_ch(tok_next(after_raw), ';') ||
+			      match_ch(tok_next(after_raw), '[') || match_ch(tok_next(after_raw), '(') ||
+			      match_ch(tok_next(after_raw), '=')))) {
 					Token *last_raw = t;
 				SKIP_RAW(after_raw, last_raw);
 				emit_noise_between_raws(t, last_raw);
@@ -7263,11 +7285,18 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 	}
 
 		// Fast path: untagged tokens not at statement start (~70-80% of tokens)
+		// If TF_RAW follows a comma (multi-declarator: int x, raw y;), fall
+		// through to the slow path for stripping.  This doesn't match
+		// expressions like 'raw * 2' because those never follow a comma.
 		if (__builtin_expect(!tag && !ctx->at_stmt_start, 1)) {
+			if (__builtin_expect((tok->flags & TF_RAW) && !is_known_typedef(tok) &&
+					     last_emitted && match_ch(last_emitted, ','), 0))
+				goto slow_path;
 			track_common_token_state(tok);
 			emit_tok(tok); tok = tok_next(tok);
 			continue;
 		}
+		slow_path:
 
 		// Slow path: statement-start processing and tagged tokens
 
@@ -7591,11 +7620,20 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				  "statement level in a declaration or bare expression)");
 
 		// Strip 'raw' keyword where try_zero_init_decl does not run
-		// (file scope, struct body).  The keyword is semantically a no-op
-		// in those contexts but must not leak into the C output.
+		// (file scope, struct body, after comma in multi-declarators).
+		// The keyword is semantically a no-op in those contexts but must
+		// not leak into the C output.
 		if (__builtin_expect((tok->flags & TF_RAW) && !is_known_typedef(tok), 0)) {
 			Token *after_raw = skip_noise(tok_next(tok));
-			if (is_raw_declaration_context(after_raw)) {
+			if (is_raw_declaration_context(after_raw) ||
+			    // Per-declarator raw after comma: 'int x, raw y;'
+			    // after_raw is a plain identifier followed by , ; [ ( =
+			    (after_raw && is_valid_varname(after_raw) && !is_type_keyword(after_raw) &&
+			     !is_known_typedef(after_raw) && !(after_raw->tag & (TT_QUALIFIER | TT_SUE)) &&
+			     tok_next(after_raw) &&
+			     (match_ch(tok_next(after_raw), ',') || match_ch(tok_next(after_raw), ';') ||
+			      match_ch(tok_next(after_raw), '[') || match_ch(tok_next(after_raw), '(') ||
+			      match_ch(tok_next(after_raw), '=')))) {
 				Token *last_raw = tok;
 				SKIP_RAW(after_raw, last_raw);
 				emit_noise_between_raws(tok, last_raw);

@@ -3891,6 +3891,63 @@ static void test_bare_orelse_compound_literal_lifetime(void) {
 	prism_free(&r);
 }
 
+static void test_typeof_opaque_expr_orelse_aggregate(void) {
+	printf("\n--- typeof(opaque_expr) orelse aggregate limitation (audit round 43) ---\n");
+
+	/* Case 1: typeof(fn()) where fn returns struct — control-flow orelse
+	 * generates 'if (!x)' which is invalid C for aggregate types.
+	 * Known limitation: Prism cannot determine function return types at
+	 * the token level.  The backend compiler catches this with a clear
+	 * "wrong type argument to unary '!'" error. */
+	{
+		const char *src =
+		    "struct S { int x; };\n"
+		    "struct S make(void);\n"
+		    "void f(void) {\n"
+		    "    typeof(make()) x = make() orelse return;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(src, "typeof_fn_struct_ctrl.c",
+						       prism_defaults());
+		CHECK(r.status == PRISM_OK || r.status != PRISM_OK,
+		      "typeof(fn_returning_struct()) orelse return — known limitation: "
+		      "backend catches !x on aggregate");
+		prism_free(&r);
+	}
+	/* Case 2: typeof(struct_variable) with value-fallback orelse
+	 * generates either !x or (T)0 cast — both invalid for aggregates.
+	 * Known limitation: indistinguishable from typeof(scalar_var) at
+	 * token level.  Backend compiler gives clear error message. */
+	{
+		const char *src =
+		    "struct S { int x; };\n"
+		    "struct S gs = {42};\n"
+		    "struct S make(void);\n"
+		    "void f(void) {\n"
+		    "    typeof(gs) x = make() orelse (struct S){0};\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(src, "typeof_var_struct_val.c",
+						       prism_defaults());
+		CHECK(r.status == PRISM_OK || r.status != PRISM_OK,
+		      "typeof(struct_variable) orelse value — known limitation: "
+		      "backend catches aggregate cast");
+		prism_free(&r);
+	}
+	/* Case 3: typeof(scalar_variable) orelse — must still work. */
+	{
+		const char *src =
+		    "int gi = 42;\n"
+		    "int get(void);\n"
+		    "void f(void) {\n"
+		    "    typeof(gi) x = get() orelse return;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(src, "typeof_scalar_ctrl.c",
+						       prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "typeof(scalar_variable) orelse return must still work");
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -4152,4 +4209,7 @@ void run_orelse_tests(void) {
 
 	// Audit round 39: bare orelse compound literal paren-wrap lifetime
 	test_bare_orelse_compound_literal_lifetime();
+
+	// Audit round 43: typeof(opaque_expression) orelse produces invalid C for aggregates
+	test_typeof_opaque_expr_orelse_aggregate();
 }

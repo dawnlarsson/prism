@@ -1064,6 +1064,94 @@ static void test_raw_multi_decl_vla_memset(void) {
 	free(path);
 }
 
+// Audit round 43: per-declarator 'raw' after comma in multi-declarator list.
+// 'int a, raw b;' should zero-init a but not b, and strip the raw keyword.
+static void test_raw_per_declarator_comma(void) {
+	printf("\n--- raw per-declarator after comma (audit round 43) ---\n");
+
+	// Case 1: simple scalar
+	{
+		const char *src =
+		    "void f(void) {\n"
+		    "    int a, raw b;\n"
+		    "    (void)a; (void)b;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(src, "raw_comma1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-comma scalar: transpiles OK");
+		CHECK(strstr(r.output, " raw ") == NULL,
+		      "raw-comma scalar: 'raw' keyword must be stripped");
+		CHECK(strstr(r.output, "a = 0") != NULL,
+		      "raw-comma scalar: a must be zero-initialized");
+		// b should NOT have = 0 (it's raw)
+		const char *b_loc = strstr(r.output, ", b");
+		CHECK(b_loc != NULL, "raw-comma scalar: b must appear after comma");
+		CHECK(strstr(b_loc, "b = 0") == NULL,
+		      "raw-comma scalar: b must NOT be zero-initialized (raw)");
+		prism_free(&r);
+	}
+	// Case 2: raw pointer after comma
+	{
+		const char *src =
+		    "void f(void) {\n"
+		    "    int x, raw *p;\n"
+		    "    (void)x; (void)p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(src, "raw_comma2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-comma pointer: transpiles OK");
+		CHECK(strstr(r.output, " raw ") == NULL,
+		      "raw-comma pointer: 'raw' keyword must be stripped");
+		CHECK(strstr(r.output, "x = 0") != NULL,
+		      "raw-comma pointer: x must be zero-initialized");
+		prism_free(&r);
+	}
+	// Case 3: variable named 'raw' after comma (must NOT be stripped)
+	{
+		const char *src =
+		    "void f(void) {\n"
+		    "    int x, raw;\n"
+		    "    (void)x; (void)raw;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(src, "raw_comma3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-comma varname: transpiles OK");
+		CHECK(strstr(r.output, "raw = 0") != NULL,
+		      "raw-comma varname: variable named 'raw' must be zero-initialized");
+		prism_free(&r);
+	}
+	// Case 4: raw with explicit initializer after comma
+	{
+		const char *src =
+		    "void f(void) {\n"
+		    "    int a, raw b = 5;\n"
+		    "    (void)a; (void)b;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(src, "raw_comma4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-comma init: transpiles OK");
+		CHECK(strstr(r.output, " raw ") == NULL,
+		      "raw-comma init: 'raw' keyword must be stripped");
+		CHECK(strstr(r.output, "b = 5") != NULL,
+		      "raw-comma init: explicit initializer preserved");
+		prism_free(&r);
+	}
+	// Case 5: file scope — raw should be stripped (no zero-init there anyway)
+	{
+		const char *src = "int x, raw y;\n";
+		PrismResult r = prism_transpile_source(src, "raw_comma5.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-comma file-scope: transpiles OK");
+		CHECK(strstr(r.output, " raw ") == NULL,
+		      "raw-comma file-scope: 'raw' keyword must be stripped");
+		prism_free(&r);
+	}
+	// Case 6: struct body — raw should be stripped
+	{
+		const char *src = "struct S { int a, raw b; };\n";
+		PrismResult r = prism_transpile_source(src, "raw_comma6.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-comma struct-body: transpiles OK");
+		CHECK(strstr(r.output, " raw ") == NULL,
+		      "raw-comma struct-body: 'raw' keyword must be stripped");
+		prism_free(&r);
+	}
+}
+
 // Audit round 29: is_raw_declaration_context misses TT_STORAGE, TT_INLINE,
 // TT_TYPEDEF — 'raw' leaks literally into output for extern, inline,
 // _Thread_local, and typedef.
@@ -1294,6 +1382,9 @@ void run_raw_tests(void) {
 	test_raw_prep_dir_pragma();
 	test_raw_multi_decl_array_aggregate();
 	test_raw_multi_decl_vla_memset();
+
+	// Audit round 43: per-declarator raw after comma
+	test_raw_per_declarator_comma();
 
 	// Audit round 29: raw leaks on extern, inline, typedef, _Thread_local
 	test_raw_storage_class_leak();

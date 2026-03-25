@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3349+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3369+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -540,7 +540,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 **Semantics:** Opts out of zero-initialization for a specific variable. The `raw` keyword is stripped from the output. The resulting declaration is emitted without an initializer. Consecutive `raw` keywords (e.g. `raw raw int x;` from macro expansion) are handled gracefully: `is_raw_declaration_context()` recognizes `TF_RAW` as a valid successor, and each stripping site (`try_zero_init_decl`, `walk_balanced` stmt-start, file-scope loop) skips all consecutive `raw` tokens before the type.
 
-**Multi-declarator scope:** `raw` applies to **all** declarators in a comma-separated declaration. In `raw int x, y;`, both `x` and `y` opt out of zero-initialization (output: `int x, y;`). Neither Phase 1D (`p1d_saw_raw` persists across commas) nor Pass 2 (`is_raw` never reset on commas) resets the raw flag between declarators.
+**Multi-declarator scope:** `raw` applies to **all** declarators when used as a prefix (`raw int x, y;`). Both `x` and `y` opt out. **Per-declarator raw** is also supported: in `int a, raw b;`, only `b` opts out while `a` gets zero-initialized. `process_declarators` detects `TF_RAW` after comma and sets `decl_is_raw` per-declarator. At file scope and struct body, the raw stripping catch-all uses `last_emitted` comma detection to route `raw` tokens from the fast path to the slow path for stripping.
 
 **Safety interaction:** `raw`-marked variables can be safely jumped over by `goto` — the CFG verifier skips them in forward goto checks, **except VLAs** where `raw` does not exempt the declaration.
 
