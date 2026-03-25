@@ -1742,9 +1742,10 @@ static void test_bare_orelse_compound_literal_ternary(void) {
 	CHECK_EQ(result.status, PRISM_OK, "bare orelse compound: transpiles OK");
 	CHECK(result.output != NULL, "bare orelse compound: output not NULL");
 
-	// The fallback should use either an if-based pattern or a single-expression
-	// ternary to keep compound literals in the enclosing block scope.
-	CHECK(strstr(result.output, "if (!") != NULL ||
+	// The fallback should use a ternary on the temp variable to keep compound
+	// literals in the enclosing block scope (not an if-body block scope).
+	CHECK(strstr(result.output, "? __prism_oe_") != NULL ||
+	      strstr(result.output, "if (!") != NULL ||
 	      strstr(result.output, "(void)0") != NULL,
 	      "bare orelse compound: uses if-based or ternary fallback pattern");
 	// The compound literal should appear in the output
@@ -1775,7 +1776,15 @@ static void test_chained_bare_orelse(void) {
 	// The output must NOT contain the literal "orelse" keyword — that's not valid C.
 	CHECK(strstr(result.output, "orelse") == NULL,
 	      "chained bare orelse: no raw 'orelse' keyword in C output");
-	// Should produce two fallback stages for the chain (if-based or ternary)
+	// Should produce two fallback stages for the chain (ternary on temp)
+	bool has_ternary_temp_chain = false;
+	{
+		const char *first_t = strstr(result.output, "? __prism_oe_");
+		if (first_t) {
+			const char *second_t = strstr(first_t + 13, "? __prism_oe_");
+			if (second_t) has_ternary_temp_chain = true;
+		}
+	}
 	bool has_if_chain = false;
 	{
 		const char *first_if = strstr(result.output, "if (!");
@@ -1784,15 +1793,7 @@ static void test_chained_bare_orelse(void) {
 			if (second_if) has_if_chain = true;
 		}
 	}
-	bool has_ternary_chain = false;
-	{
-		const char *first_t = strstr(result.output, "(void)0");
-		if (first_t) {
-			const char *second_t = strstr(first_t + 7, "(void)0");
-			if (second_t) has_ternary_chain = true;
-		}
-	}
-	CHECK(has_if_chain || has_ternary_chain,
+	CHECK(has_ternary_temp_chain || has_if_chain,
 	      "chained bare orelse: two fallback stages present in chain");
 	// The compound literal should survive in the output
 	CHECK(strstr(result.output, "(int[]){42}") != NULL,
@@ -1898,10 +1899,11 @@ static void test_bare_orelse_void_ternary_mismatch(void) {
 	CHECK_EQ(result.status, PRISM_OK, "void ternary: transpiles OK");
 	CHECK(result.output != NULL, "void ternary: output not NULL");
 
-	// The emission pattern avoids the old comma-ternary void mismatch
-	// by using either an if-based pattern or a single-expression ternary
-	// with proper (void) casts.
-	CHECK(strstr(result.output, "if (!") != NULL ||
+	// The emission pattern uses a ternary on the temp variable.
+	// This avoids both the void-mismatch issue and the compound literal
+	// lifetime issue.
+	CHECK(strstr(result.output, "? __prism_oe_") != NULL ||
+	      strstr(result.output, "if (!") != NULL ||
 	      strstr(result.output, "(void)0") != NULL,
 	      "void ternary: uses if-based or ternary pattern (no mismatch)");
 
@@ -3858,6 +3860,37 @@ static void test_bracket_orelse_local_struct_rejected(void) {
 	    "struct");
 }
 
+// Bug: bare-orelse temp-based path uses if (!tmp) tmp = (fb); which creates a
+// selection-statement block scope (C11 6.8.4p3).  Compound literals inside the
+// if-body have their lifetime end at the semicolon, producing a dangling pointer.
+// Paren-wrapping the fallback (&(struct D){1}) bypasses detection entirely since
+// the braces are never checked at depth>0.  The fix must use ternary assignment
+// (matching handle_const_orelse_fallback) to keep compound literals in the
+// enclosing block scope.
+static void test_bare_orelse_compound_literal_lifetime(void) {
+	printf("\n--- bare orelse compound literal paren-wrap lifetime (audit round 39) ---\n");
+
+	const char *code =
+	    "struct D { int x; };\n"
+	    "struct D *get(void);\n"
+	    "void f(void) {\n"
+	    "    struct D *ptr;\n"
+	    "    ptr = get() orelse (&(struct D){1});\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "bare_cl_lifetime.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "bare-orelse-cl-lifetime: transpiles OK");
+	if (r.output) {
+		// Must use ternary, not if-assignment
+		CHECK(strstr(r.output, "if (!__prism_oe_") == NULL,
+		      "bare-orelse-cl-lifetime: no if-assignment (lifetime-destroying pattern)");
+		CHECK(strstr(r.output, "? __prism_oe_") != NULL ||
+		      strstr(r.output, "?__prism_oe_") != NULL ||
+		      strstr(r.output, "? (") != NULL,
+		      "bare-orelse-cl-lifetime: uses ternary to preserve compound literal lifetime");
+	}
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -4116,4 +4149,7 @@ void run_orelse_tests(void) {
 
 	// Audit round 38: bracket orelse in local struct array dim must be rejected
 	test_bracket_orelse_local_struct_rejected();
+
+	// Audit round 39: bare orelse compound literal paren-wrap lifetime
+	test_bare_orelse_compound_literal_lifetime();
 }

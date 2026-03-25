@@ -3375,8 +3375,10 @@ static void test_volatile_orelse_no_double_eval(void) {
 	PrismResult r = prism_transpile_source(code, "volatile_orelse.c", feat);
 	CHECK_EQ(r.status, PRISM_OK, "volatile orelse: transpiles OK");
 	if (r.output) {
-		// Must use if-based pattern, not ternary (which causes double volatile read)
-		CHECK(strstr(r.output, "if (!") != NULL,
+		// Must use temp-based pattern (single write to LHS).
+		// Ternary on __prism_oe_ temp is fine (non-volatile local).
+		CHECK(strstr(r.output, "? __prism_oe_") != NULL ||
+		      strstr(r.output, "if (!") != NULL,
 		      "volatile orelse: uses if-based fallback");
 		// The ternary pattern "? hw_register" would mean a double read
 		CHECK(strstr(r.output, "? hw_register") == NULL,
@@ -5994,6 +5996,28 @@ static void test_generic_controlling_expr_mutilation(void) {
 	prism_free(&r);
 }
 
+// Bug: generic_has_distinct_targets compares only the first identifier after ':'
+// in each branch.  obj.handle_int vs obj.handle_float both start with 'obj',
+// so the function returns false (not distinct).  generic_member_rewrite_target
+// then finds handle_int( as the call target and emits obj.handle_int(42),
+// silently dropping the float branch and destroying type dispatch.
+static void test_generic_member_distinct_target_mutilation(void) {
+	const char *code =
+	    "struct D { int (*handle_int)(int); float (*handle_float)(float); };\n"
+	    "struct D obj;\n"
+	    "int r = obj._Generic((int)0, int: obj.handle_int(42), float: obj.handle_float(99));\n";
+	PrismResult r = prism_transpile_source(code, "generic_member.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "generic-member-mutilation: transpile succeeds");
+	if (r.output) {
+		// The _Generic must NOT be rewritten — branches target different members
+		CHECK(strstr(r.output, "handle_float") != NULL,
+		      "generic-member-mutilation: handle_float must survive (type dispatch not destroyed)");
+		CHECK(strstr(r.output, "_Generic") != NULL,
+		      "generic-member-mutilation: _Generic must be preserved (branches are distinct)");
+	}
+	prism_free(&r);
+}
+
 // Bug: block comment spanning #-to-directive in collect_source_defines
 // does not set in_block_comment = true before goto check_continuation,
 // so the continuation line with the actual directive is silently dropped.
@@ -6015,6 +6039,37 @@ static void test_collect_source_defines_split_block_comment(void) {
 		      "be re-emitted (in_block_comment not set before goto check_continuation)");
 	} else {
 		CHECK(0, "split-block-comment: transpilation failed");
+	}
+	prism_free(&r);
+	unlink(path); free(path);
+}
+
+// Bug: collect_source_defines joins continuation lines with an injected space,
+// violating C standard Phase 2 line splicing.  0xFFFF\<NL>FFFF must become
+// 0xFFFFFFFF, not 0xFFFF FFFF.
+static void test_collect_source_defines_continuation_splice_space(void) {
+	const char *code =
+	    "#define IO_MASK 0xFFFF\\\n"
+	    "FFFF\n"
+	    "#define SPACED_TOK val1 \\\n"
+	    "    val2\n"
+	    "#include <stddef.h>\n"
+	    "size_t x;\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "continuation-splice: create temp file");
+	if (!path) return;
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = false;
+	PrismResult r = prism_transpile_file(path, feat);
+	CHECK_EQ(r.status, PRISM_OK, "continuation-splice: transpiles OK");
+	if (r.output) {
+		// The spliced token 0xFFFF+FFFF must be re-emitted without space
+		CHECK(strstr(r.output, "0xFFFFFFFF") != NULL,
+		      "continuation-splice: spliced hex re-emitted as single token (0xFFFFFFFF)");
+		CHECK(strstr(r.output, "0xFFFF FFFF") == NULL,
+		      "continuation-splice: no space-corrupted token (0xFFFF FFFF)");
+	} else {
+		CHECK(0, "continuation-splice: output is NULL");
 	}
 	prism_free(&r);
 	unlink(path); free(path);
@@ -6223,4 +6278,9 @@ test_typeof_orelse_leak();
 	test_collect_source_defines_disabled_include_abi_drop();
 	test_generic_controlling_expr_mutilation();
 	test_collect_source_defines_split_block_comment();
+
+	// Audit round 39: continuation splice space corruption,
+	// _Generic member distinct target mutilation
+	test_collect_source_defines_continuation_splice_space();
+	test_generic_member_distinct_target_mutilation();
 }

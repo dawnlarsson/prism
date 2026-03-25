@@ -1952,6 +1952,9 @@ static bool generic_has_distinct_targets(Token *open) {
 		}
 		if (!match_ch(t, ':')) continue;
 		// Scan forward for first identifier, skipping nested parens.
+		// Walk past member-access chains (obj.member, ptr->member) so
+		// obj.handle_int vs obj.handle_float compare "handle_int"/"handle_float",
+		// not "obj"/"obj".
 		for (Token *b = tok_next(t); b && b != close; b = tok_next(b)) {
 			if (b->flags & TF_OPEN) {
 				if (tok_match(b)) b = tok_match(b);
@@ -1959,6 +1962,12 @@ static bool generic_has_distinct_targets(Token *open) {
 			}
 			if (match_ch(b, ',')) break; // next association
 			if (!is_valid_varname(b)) continue;
+			// Walk past .member / ->member chains to the terminal identifier.
+			while (b && tok_next(b) && tok_next(b) != close &&
+			       (match_ch(tok_next(b), '.') || equal(tok_next(b), "->")) &&
+			       tok_next(tok_next(b)) && is_valid_varname(tok_next(tok_next(b)))) {
+				b = tok_next(tok_next(b));
+			}
 			if (!first_name) {
 				first_name = tok_loc(b);
 				first_len = b->len;
@@ -4689,6 +4698,7 @@ static void collect_source_defines(const char *input_file) {
 				end--;
 			bool has_continuation = (end > val_start && end[-1] == '\\');
 			if (has_continuation) end--;
+			bool prev_had_ws = (end > val_start && (end[-1] == ' ' || end[-1] == '\t'));
 			while (end > val_start && (end[-1] == ' ' || end[-1] == '\t')) end--;
 			int val_len = (int)(end - val_start);
 
@@ -4708,12 +4718,14 @@ static void collect_source_defines(const char *input_file) {
 				// Read continuation lines (may realloc 'line')
 				while (getline(&line, &line_cap, f) >= 0) {
 					char *lp = line;
+					bool cur_leading_ws = (*lp == ' ' || *lp == '\t');
 					while (*lp == ' ' || *lp == '\t') lp++;
 					char *le = lp + strlen(lp);
 					while (le > lp && (le[-1] == '\n' || le[-1] == '\r' || le[-1] == ' ' || le[-1] == '\t'))
 						le--;
 					bool more = (le > lp && le[-1] == '\\');
 					if (more) le--;
+					bool cur_trailing_ws = (le > lp && (le[-1] == ' ' || le[-1] == '\t'));
 					while (le > lp && (le[-1] == ' ' || le[-1] == '\t')) le--;
 					int chunk = (int)(le - lp);
 					if (chunk > 0) {
@@ -4724,10 +4736,12 @@ static void collect_source_defines(const char *input_file) {
 							if (!tmp) { free(full_val); full_val = NULL; break; }
 							full_val = tmp;
 						}
-						if (full_val_len > 0) full_val[full_val_len++] = ' ';
+						if (full_val_len > 0 && (prev_had_ws || cur_leading_ws))
+							full_val[full_val_len++] = ' ';
 						memcpy(full_val + full_val_len, lp, chunk);
 						full_val_len += chunk;
 					}
+					prev_had_ws = cur_trailing_ws;
 					if (!more) break;
 				}
 				if (full_val) {
@@ -5128,8 +5142,10 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 		} else {
 			// Temp-based (volatile-safe, single-write): evaluate RHS into a temp,
 			// apply fallback chain to the temp, write LHS exactly once.
-			// Single:    { __typeof__(RHS) __prism_oe_N = (RHS); if (!__prism_oe_N) __prism_oe_N = (fb); LHS = __prism_oe_N; }
-			// Chain N=2: { __typeof__(RHS) __prism_oe_N = (RHS); if (!__prism_oe_N) { __prism_oe_N = (fb1); if (!__prism_oe_N) __prism_oe_N = (fb2); } LHS = __prism_oe_N; }
+			// Single:    { __typeof__(RHS) __prism_oe_N = (RHS); __prism_oe_N = __prism_oe_N ? __prism_oe_N : (fb); LHS = __prism_oe_N; }
+			// Chain N=2: { __typeof__(RHS) __prism_oe_N = (RHS); __prism_oe_N = __prism_oe_N ? __prism_oe_N : (fb1); __prism_oe_N = __prism_oe_N ? __prism_oe_N : (fb2); LHS = __prism_oe_N; }
+			// Uses ternary instead of if-assignment to keep compound literals
+			// in the enclosing block scope (C11 6.5.2.5p5, 6.8.4p3).
 			// This guarantees LHS is written exactly once, preventing double-write
 			// to volatile MMIO registers.
 			unsigned oe_id = ctx->ret_counter++;
@@ -5147,60 +5163,32 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 				if (s->kind == TK_PREP_DIR) continue;
 				emit_tok(s);
 			}
-			OUT_LIT("); if (!__prism_oe_");
-			out_uint(oe_id);
-			OUT_LIT(")");
+			OUT_LIT(");");
 			t = after_orelse;
 			int fd = 0;
 			while (true) {
 				bool is_last = !orelse_has_chain(t, comma_term);
-				if (is_last) {
-					// Final (or only) fallback: assign to temp.
-					OUT_LIT(" __prism_oe_");
-					out_uint(oe_id);
-					OUT_LIT(" = (");
-					fd = 0;
-					while (t->kind != TK_EOF) {
-						if (t->flags & TF_OPEN) fd++;
-						else if (t->flags & TF_CLOSE) fd--;
-						else if (fd == 0 && BARE_IS_END(t)) break;
-						emit_tok(t); t = tok_next(t);
-					}
-					OUT_LIT(");");
-					break;
-				}
-				// Intermediate: nest inside if for chain.
-				OUT_LIT(" { __prism_oe_");
+				// Ternary instead of if-assignment to preserve compound literal lifetime.
+				OUT_LIT(" __prism_oe_");
 				out_uint(oe_id);
-				OUT_LIT(" = (");
+				OUT_LIT(" = __prism_oe_");
+				out_uint(oe_id);
+				OUT_LIT(" ? __prism_oe_");
+				out_uint(oe_id);
+				OUT_LIT(" : (");
 				fd = 0;
 				while (t->kind != TK_EOF) {
 					if (t->flags & TF_OPEN) fd++;
 					else if (t->flags & TF_CLOSE) fd--;
 					else if (fd == 0 && BARE_IS_END(t)) break;
-					if (fd == 0 && is_orelse_keyword(t)) {
+					if (!is_last && fd == 0 && is_orelse_keyword(t)) {
 						t = tok_next(t);
 						break;
 					}
 					emit_tok(t); t = tok_next(t);
 				}
-				OUT_LIT("); if (!__prism_oe_");
-				out_uint(oe_id);
-				OUT_LIT(")");
-			}
-			// Close any intermediate chain braces
-			// (each intermediate adds one '{')
-			{
-				Token *scan = after_orelse;
-				int fds = 0;
-				while (scan && scan != t) {
-					if (scan->flags & TF_OPEN) fds++;
-					else if (scan->flags & TF_CLOSE) fds--;
-					if (fds == 0 && is_orelse_keyword(scan) && scan != orelse_tok) {
-						OUT_LIT(" }");
-					}
-					scan = tok_next(scan);
-				}
+				OUT_LIT(");");
+				if (is_last) break;
 			}
 			// Write LHS exactly once
 			OUT_LIT(" ");
