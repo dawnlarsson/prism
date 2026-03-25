@@ -3948,6 +3948,76 @@ static void test_typeof_opaque_expr_orelse_aggregate(void) {
 	}
 }
 
+static void test_orelse_funcptr_param_bracket_leak(void) {
+	printf("\n--- orelse in funcptr param bracket leak (audit round 40) ---\n");
+
+	/* BUG: orelse inside brackets of a function-pointer parameter type inside
+	 * a function body leaks raw 'orelse' into C output.  Phase 1G annotates
+	 * the orelse with P1_OE_BRACKET, but Pass 2 never consumes the annotation
+	 * because the bracket is part of a function-pointer type parameter list,
+	 * not a local VLA declaration.  The emitted C contains the Prism keyword
+	 * 'orelse' verbatim — the backend C compiler will reject it as an
+	 * undeclared identifier.
+	 *
+	 * Root cause: Phase 1G classifies ALL brackets with orelse regardless of
+	 * context.  It should reject orelse inside brackets that are part of
+	 * prototype/function-pointer parameter types, since these brackets are
+	 * declarative (specifying array parameter sizes), not allocating VLAs.
+	 */
+
+	/* Case 1: function pointer declaration inside function body */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get(void);\n"
+		    "void outer(void) {\n"
+		    "    void (*fp)(int arr[get() orelse 1]);\n"
+		    "}\n",
+		    "funcptr_param_orelse_leak.c", prism_defaults());
+		/* Must either reject with error OR produce output without 'orelse' */
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "funcptr-param-bracket-orelse: 'orelse' must not leak into C output "
+			      "(function-pointer parameter brackets are not local VLA allocations)");
+		} else {
+			CHECK(r.status != PRISM_OK,
+			      "funcptr-param-bracket-orelse: must be rejected if not transformable");
+		}
+		prism_free(&r);
+	}
+
+	/* Case 2: prototype inside function body (not funcptr) */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get(void);\n"
+		    "void outer(void) {\n"
+		    "    void inner(int arr[get() orelse 1]);\n"
+		    "}\n",
+		    "local_proto_orelse_leak.c", prism_defaults());
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "local-proto-bracket-orelse: 'orelse' must not leak into C output");
+		} else {
+			CHECK(r.status != PRISM_OK,
+			      "local-proto-bracket-orelse: must be rejected if not transformable");
+		}
+		prism_free(&r);
+	}
+
+	/* Case 3: control-flow orelse in funcptr param bracket */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get(void);\n"
+		    "void outer(void) {\n"
+		    "    void (*fp)(int arr[get() orelse return]);\n"
+		    "}\n",
+		    "funcptr_param_orelse_ctrl.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "funcptr-param-bracket-orelse-return: control flow orelse in "
+		      "parameter bracket dims makes no sense — must reject");
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -4212,4 +4282,7 @@ void run_orelse_tests(void) {
 
 	// Audit round 43: typeof(opaque_expression) orelse produces invalid C for aggregates
 	test_typeof_opaque_expr_orelse_aggregate();
+
+	// Audit round 40: orelse in funcptr/prototype param bracket leaks raw keyword
+	test_orelse_funcptr_param_bracket_leak();
 }

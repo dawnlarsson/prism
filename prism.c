@@ -2796,7 +2796,10 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 
 	while (r.has_paren && nested_paren > 0) {
 		while (match_ch(tok, '(') || match_ch(tok, '[')) {
-			if (match_ch(tok, '(')) tok = walk_balanced(tok, emit);
+			if (match_ch(tok, '(')) {
+				if (emit && FEAT(F_ORELSE)) tok = walk_balanced_orelse(tok);
+				else tok = walk_balanced(tok, emit);
+			}
 			else { r.is_array = true; r.paren_array = true; tok = decl_array_dims(tok, emit, &is_vla); }
 		}
 		if (!match_ch(tok, ')')) { r.end = NULL; return r; }
@@ -2807,7 +2810,8 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 	if (match_ch(tok, '(')) {
 		if (!r.has_paren) { r.end = NULL; return r; }
 		r.is_func_ptr = true;
-		tok = walk_balanced(tok, emit);
+		if (emit && FEAT(F_ORELSE)) tok = walk_balanced_orelse(tok);
+		else tok = walk_balanced(tok, emit);
 	}
 
 	if (match_ch(tok, '[')) {
@@ -4127,15 +4131,21 @@ static Token *handle_goto_keyword(Token *tok) {
 	if (FEAT(F_DEFER)) {
 		mark_switch_control_exit(false);
 
-		if (match_ch(tok, '*')) {
+		// Skip C23 attributes between goto and target: goto [[attr]] *ptr;
+		Token *after_attrs = skip_noise(tok);
+
+		if (match_ch(after_attrs, '*')) {
 			if (has_active_defers())
 				error_tok(goto_tok, "computed goto cannot be used with active defer statements");
 			emit_tok(goto_tok);
+			while (tok != after_attrs) {
+				emit_tok(tok); tok = tok_next(tok);
+			}
 			return tok;
 		}
 
-		if (is_identifier_like(tok)) {
-			P1LabelResult info = p1_label_find(tok, current_func_idx);
+		if (is_identifier_like(after_attrs)) {
+			P1LabelResult info = p1_label_find(after_attrs, current_func_idx);
 
 			int target_depth = info.tok ? info.scope_depth : ctx->block_depth;
 
@@ -4154,6 +4164,10 @@ static Token *handle_goto_keyword(Token *tok) {
 				OUT_LIT(" {");
 				emit_goto_defers(target_depth);
 				OUT_LIT(" goto");
+				// Emit any C23 attributes
+				while (tok != after_attrs) {
+					emit_tok(tok); tok = tok_next(tok);
+				}
 				emit_tok(tok); tok = tok_next(tok);
 				if (match_ch(tok, ';')) {
 					emit_tok(tok); tok = tok_next(tok);
@@ -6235,8 +6249,9 @@ uint16_t sid = next_scope_id++;
 					e->label.len = target->len;
 				}
 				// Computed goto (goto *expr): cannot verify target statically.
+				// Skip C23 attributes between goto and *: goto [[attr]] *ptr;
 				if ((tok->tag & TT_GOTO) && !is_known_typedef(tok) &&
-				    tok_next(tok) && match_ch(tok_next(tok), '*'))
+				    tok_next(tok) && match_ch(skip_noise(tok_next(tok)), '*'))
 					func_meta[p1d_cur_func].has_computed_goto = true;
 				if ((tok->tag & TT_DEFER) && !is_known_typedef(tok) &&
 				    !(p1d_prev && (p1d_prev->tag & TT_GOTO)) &&
@@ -6555,8 +6570,9 @@ uint16_t sid = next_scope_id++;
 				e->label.len = target->len;
 			}
 			// Computed goto (goto *expr): cannot verify target statically.
+			// Skip C23 attributes between goto and *: goto [[attr]] *ptr;
 			if ((tok->tag & TT_GOTO) && !is_known_typedef(tok) &&
-			    tok_next(tok) && match_ch(tok_next(tok), '*'))
+			    tok_next(tok) && match_ch(skip_noise(tok_next(tok)), '*'))
 				func_meta[p1d_cur_func].has_computed_goto = true;
 
 			// Defer detection

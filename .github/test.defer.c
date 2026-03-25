@@ -3011,6 +3011,96 @@ static void test_defer_stmt_expr_double_nested_block_bypass(void) {
 	    "statement expression");
 }
 
+static void test_c23_attr_computed_goto_defer_bypass(void) {
+	printf("\n--- C23 attributed computed goto defer bypass (audit round 40) ---\n");
+
+	/* BUG: goto [[gnu::nomerge]] *ptr; bypasses computed goto detection in
+	 * BOTH Phase 1D (has_computed_goto flag) and Pass 2 (handle_goto_keyword).
+	 *
+	 * Phase 1D checks:  tok_next(goto) == '*'  → match_ch fails on '['
+	 * Pass 2 checks:    tok_next(goto) == '*'  → match_ch fails on '['
+	 *
+	 * Result: has_computed_goto is never set, so the CFG verifier does not
+	 * reject the function.  In Pass 2, handle_goto_keyword falls through to
+	 * identifier-goto handling, sees '[', and emits 'goto' without checking
+	 * has_active_defers().  Active defers are NOT emitted before the jump.
+	 *
+	 * The C23 attribute [[...]] between goto and * is a valid C23 statement
+	 * attribute.  GCC and Clang accept goto [[attr]] *ptr; as a computed
+	 * goto with a statement attribute.
+	 */
+
+	/* Case 1: normal computed goto + defer → correctly rejected */
+	check_defer_transpile_rejects(
+	    "void cleanup(int *p) { (void)p; }\n"
+	    "void f(void) {\n"
+	    "    int x = 0;\n"
+	    "    defer cleanup(&x);\n"
+	    "    void *target = &&done;\n"
+	    "    goto *target;\n"
+	    "done:\n"
+	    "    return;\n"
+	    "}\n",
+	    "c23_attr_goto_baseline.c",
+	    "c23-attr-goto-baseline: plain 'goto *target' with defer is rejected",
+	    "computed goto");
+
+	/* Case 2: C23 attributed computed goto + defer → MUST ALSO be rejected */
+	check_defer_transpile_rejects(
+	    "void cleanup(int *p) { (void)p; }\n"
+	    "void f(void) {\n"
+	    "    int x = 0;\n"
+	    "    defer cleanup(&x);\n"
+	    "    void *target = &&done;\n"
+	    "    goto [[gnu::nomerge]] *target;\n"
+	    "done:\n"
+	    "    return;\n"
+	    "}\n",
+	    "c23_attr_goto_bypass.c",
+	    "c23-attr-goto-bypass: 'goto [[attr]] *target' with defer must be "
+	    "rejected (C23 attribute must not blind computed goto detection)",
+	    "computed goto");
+
+	/* Case 3: C23 attributed computed goto WITHOUT defer and WITHOUT zeroinit
+	 * → should succeed (no defers to protect, no zeroinit concern) */
+	{
+		PrismFeatures feat = prism_defaults();
+		feat.defer = false;
+		feat.zeroinit = false;
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    void *target = &&done;\n"
+		    "    goto [[gnu::nomerge]] *target;\n"
+		    "done:\n"
+		    "    return;\n"
+		    "}\n",
+		    "c23_attr_goto_no_defer.c", feat);
+		CHECK(r.status == PRISM_OK,
+		      "c23-attr-goto-no-defer: attributed computed goto without defer/zeroinit must succeed");
+		prism_free(&r);
+	}
+
+	/* Case 4: C23 attributed plain goto + defer → should succeed
+	 * (not computed, normal label goto is fine with defer) */
+	{
+		PrismFeatures feat = prism_defaults();
+		feat.warn_safety = false;
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(int *p) { (void)p; }\n"
+		    "void f(void) {\n"
+		    "    int x = 0;\n"
+		    "    defer cleanup(&x);\n"
+		    "    goto [[gnu::nomerge]] done;\n"
+		    "done:\n"
+		    "    return;\n"
+		    "}\n",
+		    "c23_attr_goto_label.c", feat);
+		CHECK(r.status == PRISM_OK,
+		      "c23-attr-goto-label: attributed label goto with defer must succeed");
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -3207,4 +3297,7 @@ void run_defer_tests(void) {
 
 	// Audit round 38: double-nested block in stmt-expr bypasses scope_depth-2 check
 	test_defer_stmt_expr_double_nested_block_bypass();
+
+	// Audit round 40: C23 attribute on computed goto bypasses CFG + defer checks
+	test_c23_attr_computed_goto_defer_bypass();
 }
