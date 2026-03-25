@@ -5766,17 +5766,7 @@ static void test_collect_source_defines_comment_in_directive(void) {
 }
 
 static void test_collect_source_defines_ifdef_both_branches_extracted(void) {
-	/* Conditional defines are now extracted WITH their preprocessor guards.
-	 * When it encounters:
-	 *   #ifdef _WIN32
-	 *   #define PLAT 1
-	 *   #else
-	 *   #define PLAT 2
-	 *   #endif
-	 * it extracts BOTH defines, each wrapped in its guard branch
-	 * (#ifdef _WIN32 for the first, #ifdef _WIN32/#else for the second).
-	 * The backend compiler re-evaluates the same condition, so only the
-	 * correct branch's define is active. */
+	/* Both #ifdef branches extracted, each wrapped in its guard. */
 	const char *code =
 	    "#ifdef _WIN32\n"
 	    "#define PLAT_IFDEF_BUG 1\n"
@@ -6068,12 +6058,7 @@ static void test_collect_source_defines_continuation_splice_space(void) {
 }
 
 static void test_collect_source_defines_conditional_guard_preserved(void) {
-	/* BUG: collect_source_defines() skips ALL defines at cond_depth > 0.
-	 * This means #ifdef __APPLE__ / #define _DARWIN_C_SOURCE / #endif
-	 * is lost from non-flatten output.  The backend compiler re-processes
-	 * #include directives without seeing _DARWIN_C_SOURCE, causing ABI
-	 * mismatch (headers expose different prototypes). Fix: extract
-	 * conditional defines and wrap them in their original guards. */
+	/* Conditional defines inside #ifdef/#ifndef are extracted with guards. */
 	const char *code =
 	    "#ifdef __APPLE__\n"
 	    "#define COND_GUARD_TEST_MAC 42\n"
@@ -6091,29 +6076,14 @@ static void test_collect_source_defines_conditional_guard_preserved(void) {
 	PrismResult r = prism_transpile_file(path, feat);
 	CHECK_EQ(r.status, PRISM_OK, "cond-guard: transpiles OK");
 	if (r.output) {
-		/* On macOS: __APPLE__ is defined, so _MAC define should be
-		 * re-emitted (guarded by #ifdef __APPLE__). The _LIN define
-		 * should also be emitted (guarded by #ifndef __APPLE__) but
-		 * the guard makes it inactive on macOS. Both defines MUST
-		 * appear in the output with their guards. */
-		int mac_count = 0, lin_count = 0;
-		const char *p = r.output;
-		while ((p = strstr(p, "COND_GUARD_TEST_MAC")) != NULL) { mac_count++; p += 19; }
-		p = r.output;
-		while ((p = strstr(p, "COND_GUARD_TEST_LIN")) != NULL) { lin_count++; p += 19; }
-		/* The define must appear at least once — it was previously
-		 * dropped because cond_depth > 0 skipped it entirely. */
-		CHECK(mac_count >= 1,
-		      "cond-guard: #ifdef __APPLE__ define must be re-emitted "
-		      "(was previously dropped by cond_depth > 0 skip)");
-		CHECK(lin_count >= 1,
-		      "cond-guard: #ifndef __APPLE__ define must be re-emitted "
-		      "(was previously dropped by cond_depth > 0 skip)");
-		/* The guard must be present to prevent wrong-platform activation */
+		CHECK(strstr(r.output, "COND_GUARD_TEST_MAC") != NULL,
+		      "cond-guard: __APPLE__ guarded define re-emitted");
+		CHECK(strstr(r.output, "COND_GUARD_TEST_LIN") != NULL,
+		      "cond-guard: !__APPLE__ guarded define re-emitted");
 		CHECK(strstr(r.output, "#ifdef __APPLE__") != NULL,
-		      "cond-guard: #ifdef __APPLE__ guard must be preserved");
+		      "cond-guard: #ifdef guard preserved");
 		CHECK(strstr(r.output, "#ifndef __APPLE__") != NULL,
-		      "cond-guard: #ifndef __APPLE__ guard must be preserved");
+		      "cond-guard: #ifndef guard preserved");
 	} else {
 		CHECK(0, "cond-guard: output is NULL");
 	}
