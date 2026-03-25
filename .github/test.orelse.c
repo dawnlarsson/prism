@@ -3778,6 +3778,58 @@ static void test_bare_orelse_volatile_compound_literal_nested(void) {
 	prism_free(&r);
 }
 
+// Bug: when a braceless control statement (if/while/for) wraps a declaration
+// with bracket orelse, the brace_wrap opening '{' is emitted AFTER the hoisted
+// bracket temps, detaching the actual declaration from the control flow.
+static void test_braceless_ctrl_bracket_orelse_detach(void) {
+	printf("\n--- Braceless ctrl bracket orelse detach ---\n");
+
+	const char *code =
+	    "int get_size(void);\n"
+	    "void test(int is_admin) {\n"
+	    "    if (is_admin)\n"
+	    "        int buf[get_size() orelse 1024];\n"
+	    "}\n";
+
+	PrismResult r = prism_transpile_source(code, "braceless_bo.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "braceless-ctrl-bo: transpile succeeds");
+	if (r.output) {
+		// The hoisted temp must be INSIDE the brace wrapper.
+		// Buggy:  if (is_admin) long long __prism_oe_0 = ...; { int buf[...]; }
+		// Correct: if (is_admin) { long long __prism_oe_0 = ...; int buf[...]; }
+		CHECK(strstr(r.output, ") { long long __prism_oe") ||
+		      strstr(r.output, ") {long long __prism_oe"),
+		      "braceless-ctrl-bo: brace_wrap '{' must precede hoisted bracket temps");
+		CHECK(!strstr(r.output, ") long long __prism_oe"),
+		      "braceless-ctrl-bo: hoisted temp must not appear before opening brace");
+	}
+	prism_free(&r);
+}
+
+// Bug: handle_const_orelse_fallback uses emit_range for the declarator suffix
+// (array dims etc.), which blindly copies tokens without transforming bracket
+// orelse.  For const pointer-to-VLA: const int (*p)[n orelse 1] = get() orelse 0;
+// the temp gets raw 'orelse' in its dimensions.
+static void test_const_fallback_bracket_orelse_leak(void) {
+	printf("\n--- Const-fallback bracket orelse leak ---\n");
+
+	const char *code =
+	    "int n;\n"
+	    "void *get(void);\n"
+	    "void test(void) {\n"
+	    "    const int (*ptr)[n orelse 1] = get() orelse (void*)0;\n"
+	    "}\n";
+
+	PrismResult r = prism_transpile_source(code, "const_bo_leak.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "const-bo-leak: transpile succeeds");
+	if (r.output) {
+		CHECK(!strstr(r.output, "orelse"),
+		      "const-bo-leak: raw 'orelse' must not appear in output "
+		      "(bracket orelse in const-fallback temp dims must be transformed)");
+	}
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -4027,4 +4079,10 @@ void run_orelse_tests(void) {
 
 	// Audit round 35: compound literal inside function args must not trigger ternary fallback
 	test_bare_orelse_volatile_compound_literal_nested();
+
+	// Audit round 35b: braceless control-flow brace_wrap must enclose bracket orelse temps
+	test_braceless_ctrl_bracket_orelse_detach();
+
+	// Audit round 35b: const-fallback must not leak raw orelse in bracket dimensions
+	test_const_fallback_bracket_orelse_leak();
 }

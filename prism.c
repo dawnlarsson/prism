@@ -1985,10 +1985,21 @@ static bool generic_decl_rewrite_target(Token *generic_tok, Token **name_out,
 	// Multi-branch _Generic with distinct targets has real type dispatch.
 	if (generic_has_distinct_targets(open)) return false;
 
+	// Skip the controlling expression (everything before first ',' at depth 0).
+	Token *assoc_start = NULL;
+	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			if (tok_match(t)) t = tok_match(t);
+			continue;
+		}
+		if (match_ch(t, ',')) { assoc_start = tok_next(t); break; }
+	}
+	if (!assoc_start) return false;
+
 	// Pattern 1: _Generic(...name(decl-params)...) ;/attr
 	if (match_ch(after, ';') || match_ch(after, ',') || (after->tag & TT_ATTR) ||
 	    is_c23_attr(after)) {
-		for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
+		for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
 			Token *call_open = skip_noise(tok_next(t));
 			if (!is_valid_varname(t) || !call_open || !match_ch(call_open, '(') || !tok_match(call_open))
 				continue;
@@ -2010,7 +2021,7 @@ static bool generic_decl_rewrite_target(Token *generic_tok, Token **name_out,
 		if (after_ext && (match_ch(after_ext, ';') || match_ch(after_ext, ',') ||
 		    (after_ext->tag & TT_ATTR) || is_c23_attr(after_ext))) {
 			Token *found = NULL;
-			for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
+			for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
 				if (is_valid_varname(t)) found = t;
 			}
 			if (found) {
@@ -2040,7 +2051,18 @@ static bool generic_member_rewrite_target(Token *generic_tok, Token **name_out,
 	// Multi-branch _Generic with distinct targets has real type dispatch.
 	if (generic_has_distinct_targets(open)) return false;
 
+	// Skip the controlling expression (everything before first ',' at depth 0).
+	Token *assoc_start = NULL;
 	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			if (tok_match(t)) t = tok_match(t);
+			continue;
+		}
+		if (match_ch(t, ',')) { assoc_start = tok_next(t); break; }
+	}
+	if (!assoc_start) return false;
+
+	for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
 		Token *call_open = skip_noise(tok_next(t));
 		if (!is_valid_varname(t) || !call_open || !match_ch(call_open, '(') || !tok_match(call_open))
 			continue;
@@ -2934,7 +2956,18 @@ static Token *handle_const_orelse_fallback(Token *tok,
 	
 	OUT_LIT(" __prism_oe_");
 	out_uint(oe_id);
-	emit_range(tok_next(decl->var_name), decl->end);
+	// Emit declarator suffix (array dims, parens, etc.) transforming bracket orelse.
+	{
+		Token *t = tok_next(decl->var_name);
+		while (t && t != decl->end && t->kind != TK_EOF) {
+			if (match_ch(t, '[') && !(t->flags & TF_C23_ATTR)) {
+				t = walk_balanced_orelse(t);
+			} else {
+				emit_tok(t);
+				t = tok_next(t);
+			}
+		}
+	}
 	OUT_LIT(" = (");
 	emit_range(val_start, orelse_tok);
 	OUT_LIT(");");
@@ -3200,6 +3233,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 		// Step 2b: Pre-hoist bracket orelse temps (before type emission)
 		bool has_bo = FEAT(F_ORELSE) && declarator_has_bracket_orelse(decl_start, decl.end);
+		bool brace_opened = false;
 		if (has_bo) {
 			if (in_ctrl_paren())
 				error_tok(decl_start,
@@ -3207,6 +3241,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					  "control statement conditions (hoisted temps would "
 					  "inject invalid syntax); move the declaration before "
 					  "the statement");
+			if (first_decl && brace_wrap) { OUT_LIT(" {"); brace_opened = true; }
 			emit_bracket_orelse_temps(decl_start, decl.end);
 		}
 
@@ -3226,7 +3261,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 		// Step 3: Emit base type for first declarator
 		if (first_decl) {
-			if (brace_wrap) OUT_LIT(" {");
+			if (brace_wrap && !brace_opened) OUT_LIT(" {");
 			if (!is_const_orelse_fallback) {
 				if (raw_tok && pragma_start != type_start) {
 					emit_range(pragma_start, raw_tok);
@@ -4538,6 +4573,7 @@ static void collect_source_defines(const char *input_file) {
 	size_t line_cap = 0;
 	bool in_continuation = false;
 	bool in_block_comment = false;
+	bool in_hash_block_comment = false; // block comment started between # and directive name
 	int cond_depth = 0; // #if/#ifdef/#ifndef nesting depth
 	while (getline(&line, &line_cap, f) >= 0) {
 		char *p = line;
@@ -4550,6 +4586,12 @@ static void collect_source_defines(const char *input_file) {
 			// to the normal '#' check with p pointing past the comment.
 			p = end + 2;
 			while (*p == ' ' || *p == '\t') p++;
+			if (in_hash_block_comment) {
+				// The '#' was already consumed on a previous line;
+				// resume directive parsing directly.
+				in_hash_block_comment = false;
+				goto parse_directive;
+			}
 			if (*p != '#') continue;
 			goto have_hash;
 		}
@@ -4585,13 +4627,12 @@ static void collect_source_defines(const char *input_file) {
 		while (*p == ' ' || *p == '\t' || (p[0] == '/' && p[1] == '*')) {
 			if (p[0] == '/' && p[1] == '*') {
 				char *end = strstr(p + 2, "*/");
-				if (!end) goto check_continuation; // unterminated block comment
+				if (!end) { in_block_comment = true; in_hash_block_comment = true; goto check_continuation; } // unterminated block comment
 				p = end + 2;
 			} else
 				p++;
 		}
-		if (strncmp(p, "include", 7) == 0) break; // #include reached — stop
-
+	parse_directive:
 		// Track #if/#ifdef/#ifndef/#elif/#else/#endif nesting
 		if (strncmp(p, "ifdef", 5) == 0 || strncmp(p, "ifndef", 6) == 0 ||
 		    (strncmp(p, "if", 2) == 0 && (p[2] == ' ' || p[2] == '\t' || p[2] == '('))) {
@@ -4604,6 +4645,9 @@ static void collect_source_defines(const char *input_file) {
 		}
 		if (strncmp(p, "else", 4) == 0 || strncmp(p, "elif", 4) == 0)
 			goto check_continuation;
+
+		// Only break on #include at unconditional scope
+		if (strncmp(p, "include", 7) == 0 && cond_depth == 0) break;
 
 		// Only extract defines at unconditional scope (cond_depth == 0)
 		if (cond_depth > 0) goto check_continuation;

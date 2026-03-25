@@ -5937,6 +5937,89 @@ static void test_collect_source_defines_block_comment_end_same_line(void) {
 	unlink(single_path); free(single_path);
 }
 
+// Bug: collect_source_defines breaks on #include even inside #if 0 blocks.
+// The #include check fires before cond_depth is evaluated, so a disabled
+// #include <windows.h> aborts the scanner, dropping all ABI macros below it.
+static void test_collect_source_defines_disabled_include_abi_drop(void) {
+	const char *code =
+	    "#if 0\n"
+	    "#include <windows.h>\n"
+	    "#endif\n"
+	    "#define _FILE_OFFSET_BITS 64\n"
+	    "#include <stdint.h>\n"
+	    "int v;\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "disabled-include-abi-drop: create temp file");
+	if (!path) return;
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = false;
+	PrismResult r = prism_transpile_file(path, feat);
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "_FILE_OFFSET_BITS") != NULL,
+		      "disabled-include-abi-drop: _FILE_OFFSET_BITS must be "
+		      "re-emitted (#include inside #if 0 must not abort scanner)");
+	} else {
+		CHECK(0, "disabled-include-abi-drop: transpilation failed");
+	}
+	prism_free(&r);
+	unlink(path); free(path);
+}
+
+// Bug: generic_member_rewrite_target and generic_decl_rewrite_target scan
+// from tok_next(open) which includes the controlling expression.  If the
+// controlling expression is a function call like get_state(1), it matches
+// as "valid varname followed by (" and gets extracted as the target branch.
+static void test_generic_controlling_expr_mutilation(void) {
+	// Single-target _Generic with function call in controlling expr
+	const char *code =
+	    "struct Obj { int type; };\n"
+	    "int handle(int x);\n"
+	    "int get_hardware_state(int id);\n"
+	    "void test(struct Obj *obj) {\n"
+	    "    obj._Generic(get_hardware_state(1), int: handle, float: handle)(42);\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "generic_ctrl_expr.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "generic-ctrl-mutilation: transpile succeeds");
+	if (r.output) {
+		// The output must call handle(42), NOT get_hardware_state(1)(42)
+		const char *body = strstr(r.output, "void test");
+		if (body) {
+			CHECK(!strstr(body, "get_hardware_state(1)(42)"),
+			      "generic-ctrl-mutilation: controlling expression must not be "
+			      "extracted as the branch target (type-dispatch logic destroyed)");
+			CHECK(strstr(body, "handle") != NULL,
+			      "generic-ctrl-mutilation: branch target 'handle' must appear in output");
+		}
+	}
+	prism_free(&r);
+}
+
+// Bug: block comment spanning #-to-directive in collect_source_defines
+// does not set in_block_comment = true before goto check_continuation,
+// so the continuation line with the actual directive is silently dropped.
+static void test_collect_source_defines_split_block_comment(void) {
+	const char *code =
+	    "# /* multiline\n"
+	    "comment */ define SPLIT_BLOCK_DEF 1\n"
+	    "#include <stdint.h>\n"
+	    "int v;\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "split-block-comment: create temp file");
+	if (!path) return;
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = false;
+	PrismResult r = prism_transpile_file(path, feat);
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "SPLIT_BLOCK_DEF") != NULL,
+		      "split-block-comment: #define after split block comment must "
+		      "be re-emitted (in_block_comment not set before goto check_continuation)");
+	} else {
+		CHECK(0, "split-block-comment: transpilation failed");
+	}
+	prism_free(&r);
+	unlink(path); free(path);
+}
+
 void run_api_tests(void) {
 test_typeof_orelse_leak();
 	printf("\n=== API TESTS ===\n");
@@ -6134,4 +6217,10 @@ test_typeof_orelse_leak();
 
 	// Audit round 30: collect_source_defines block comment end same-line define
 	test_collect_source_defines_block_comment_end_same_line();
+
+	// Audit round 36: disabled #include ABI drop, _Generic ctrl expr mutilation,
+	// split block comment in_block_comment flag
+	test_collect_source_defines_disabled_include_abi_drop();
+	test_generic_controlling_expr_mutilation();
+	test_collect_source_defines_split_block_comment();
 }
