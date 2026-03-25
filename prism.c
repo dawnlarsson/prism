@@ -509,6 +509,40 @@ static uint16_t scope_stmt_expr_ancestor(uint16_t scope_id) {
 	return 0;
 }
 
+// Phase 1: check if a defer in scope 'sid' is inside a chain of closing braces
+// leading to a statement expression.  The defer cleanup code would be emitted at
+// the inner '}', but the result flows up through a chain of '}' tokens to become
+// the stmt-expr's value, corrupting it.
+static void p1_check_defer_stmt_expr_chain(Token *defer_tok, uint16_t sid) {
+	while (sid > 0 && sid < scope_tree_count) {
+		uint16_t pid = scope_tree[sid].parent_id;
+		if (pid == 0 || pid >= scope_tree_count) break;
+		// Walk tokens from this scope's '}' to parent's '}':
+		// if only trivial tokens (';', labels) in between, it's a chain.
+		Token *t = tok_next(&token_pool[scope_tree[sid].close_tok_idx]);
+		Token *parent_close = &token_pool[scope_tree[pid].close_tok_idx];
+		bool only_trivial = true;
+		while (t && t != parent_close && t->kind != TK_EOF) {
+			if (match_ch(t, ';') || match_ch(t, '}')) { t = tok_next(t); continue; }
+			if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
+			    tok_next(t) && match_ch(tok_next(t), ':'))
+				{ t = tok_next(tok_next(t)); continue; }
+			only_trivial = false;
+			break;
+		}
+		if (!only_trivial) break;
+		if (scope_tree[pid].is_stmt_expr)
+			error_tok(defer_tok,
+				  "defer inside a block that is the last "
+				  "statement of a statement expression "
+				  "would corrupt the expression's return "
+				  "value; ensure the last statement of the "
+				  "statement expression is outside the "
+				  "defer block");
+		sid = pid;
+	}
+}
+
 // Phase 1C: record a variable declaration that shadows a typedef name.
 static void p1_add_shadow(char *name, int len, uint16_t scope_id, uint32_t token_index) {
 	ARENA_ENSURE_CAP(&ctx->main_arena, ctx->p1_shadow_entries,
@@ -6166,6 +6200,7 @@ uint16_t sid = next_scope_id++;
 						error_tok(tok, "defer cannot be at top level of statement expression; wrap in a block");
 					if (cur_sid < scope_tree_count && scope_tree[cur_sid].is_switch)
 						error_tok(tok, "defer in switch case requires braces");
+					p1_check_defer_stmt_expr_chain(tok, cur_sid);
 					p1_try_alloc_defer(tok, cur_sid, p1d_cur_func);
 					validate_defer_statement(tok_next(tok), false, false, 0);
 				}
@@ -6193,6 +6228,7 @@ uint16_t sid = next_scope_id++;
 				if (match_ch(tok, '(') || match_ch(tok, '[')) {
 					Token *group_end = tok_match(tok);
 					bool has_stmt_expr = false;
+					Token *prev_inner = NULL;
 					for (Token *inner = tok_next(tok); inner && inner != group_end; inner = tok_next(inner)) {
 						if (is_enum_kw(inner)) {
 							Token *brace = find_struct_body_brace(inner);
@@ -6204,6 +6240,16 @@ uint16_t sid = next_scope_id++;
 						    match_ch(tok_next(inner), '{')) {
 							has_stmt_expr = true;
 						}
+						// Detect defer inside control-flow condition parens
+						if (p1d_cur_func >= 0 && p1d_prev_saved &&
+						    (p1d_prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
+						    (inner->tag & TT_DEFER) && !is_known_typedef(inner) &&
+						    !(prev_inner && (prev_inner->tag & TT_MEMBER)) &&
+						    tok_next(inner) && !match_ch(tok_next(inner), ':') &&
+						    !(tok_next(inner) && (tok_next(inner)->tag & TT_ASSIGN)) &&
+						    tok_next(inner)->kind == TK_IDENT)
+							error_tok(inner, "defer cannot appear inside control statement parentheses");
+						prev_inner = inner;
 					}
 					// If there's a nested stmt expr, don't skip — let the
 					// main loop process tokens one by one so Phase 1D
@@ -6508,6 +6554,7 @@ uint16_t sid = next_scope_id++;
 					error_tok(tok, "defer cannot be at top level of statement expression; wrap in a block");
 				if (dsid < scope_tree_count && scope_tree[dsid].is_switch)
 					error_tok(tok, "defer in switch case requires braces");
+				p1_check_defer_stmt_expr_chain(tok, dsid);
 			}
 			// Unterminated / keyword heuristic (non-block defer)
 			{
@@ -6674,10 +6721,19 @@ uint16_t sid = next_scope_id++;
 
 					if (has_init) {
 						bool decl_has_orelse = false;
+						Token *prev_init_tok = NULL;
 						t = tok_next(t);
 						while (t && !match_ch(t, ',') && !match_ch(t, ';') && t->kind != TK_EOF) {
 							// Phase 1G: mark orelse in decl initializer
 							if ((t->tag & TT_ORELSE) && !typedef_lookup(t)) {
+								// Validate structural position: preceding token must end an expression
+								if (prev_init_tok &&
+								    !match_ch(prev_init_tok, ')') && !match_ch(prev_init_tok, ']') &&
+								    !match_ch(prev_init_tok, '}') &&
+								    prev_init_tok->kind != TK_IDENT && prev_init_tok->kind != TK_KEYWORD &&
+								    prev_init_tok->kind != TK_NUM && prev_init_tok->kind != TK_STR)
+									error_tok(t, "'orelse' cannot be used here (it must appear at the "
+										  "statement level in a declaration or bare expression)");
 								tok_ann(t) |= P1_OE_DECL_INIT;
 								decl_has_orelse = true;
 							}
@@ -6689,17 +6745,27 @@ uint16_t sid = next_scope_id++;
 								if (m && match_ch(t, '(')) {
 									Token *am = tok_next(m);
 									if (!am || match_ch(am, ',') || match_ch(am, ';') || am->kind == TK_EOF) {
+										Token *prev_inner = NULL;
 										for (Token *inner = tok_next(t); inner && inner != m; inner = tok_next(inner)) {
 											if ((inner->tag & TT_ORELSE) && !typedef_lookup(inner)) {
+												if (prev_inner &&
+												    !match_ch(prev_inner, ')') && !match_ch(prev_inner, ']') &&
+												    prev_inner->kind != TK_IDENT && prev_inner->kind != TK_KEYWORD &&
+												    prev_inner->kind != TK_NUM && prev_inner->kind != TK_STR)
+													error_tok(inner, "'orelse' cannot be used here (it must appear at the "
+														  "statement level in a declaration or bare expression)");
 												tok_ann(inner) |= P1_OE_DECL_INIT;
 												decl_has_orelse = true;
 											}
-											if (inner->flags & TF_OPEN) { inner = tok_match(inner) ? tok_match(inner) : inner; continue; }
+											if (inner->flags & TF_OPEN) { inner = tok_match(inner) ? tok_match(inner) : inner; prev_inner = inner; continue; }
+											prev_inner = inner;
 										}
 									}
 								}
+								prev_init_tok = m ? m : t;
 								t = m ? tok_next(m) : tok_next(t); continue;
 							}
+							prev_init_tok = t;
 							t = tok_next(t);
 						}
 
@@ -8711,11 +8777,19 @@ static int compile_sources(Cli *cli) {
 
 static void signal_cleanup_handler(int sig) {
 	if (signal_temp_load() && signal_temp_path[0])
+#ifdef _WIN32
+		DeleteFileA(signal_temp_path);
+#else
 		unlink(signal_temp_path);
+#endif
 	int n = signal_temps_load();
 	for (int i = 0; i < n; i++)
 		if (signal_temps_ready_load(i) && signal_temps[i][0] != '\0')
+#ifdef _WIN32
+			DeleteFileA(signal_temps[i]);
+#else
 			unlink(signal_temps[i]);
+#endif
 	signal(sig, SIG_DFL);
 	raise(sig);
 }
