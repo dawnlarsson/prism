@@ -2451,6 +2451,7 @@ static Token *walk_balanced(Token *tok, bool emit) {
 // Rejects orelse with control-flow action; transforms value fallback to (LHS) ? (LHS) : (RHS).
 
 // Like emit_token_range but rewrites orelse → ternary within the flat range.
+// Recurses into () and [] groups so nested orelse is never emitted raw.
 static void emit_token_range_orelse(Token *start, Token *end) {
 	Token *orelse = NULL;
 	Token *prev = NULL;
@@ -2463,12 +2464,32 @@ static void emit_token_range_orelse(Token *start, Token *end) {
 		}
 		prev = t;
 	}
-	if (!orelse) { emit_token_range(start, end); return; }
+	if (!orelse) {
+		// No top-level orelse. Walk tokens, recursing into balanced
+		// groups to catch orelse nested inside function args, etc.
+		for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
+			if (t != start) out_char(' ');
+			if ((t->flags & TF_OPEN) && (match_ch(t, '(') || match_ch(t, '['))) {
+				Token *close = tok_match(t);
+				if (close && close != end) {
+					OUT_TOK(t);
+					out_char(' ');
+					emit_token_range_orelse(tok_next(t), close);
+					out_char(' ');
+					OUT_TOK(close);
+					t = close;
+					continue;
+				}
+			}
+			OUT_TOK(t);
+		}
+		return;
+	}
 	Token *rhs = tok_next(orelse);
 	OUT_LIT("(");
-	emit_token_range(start, orelse);
+	emit_token_range_orelse(start, orelse);
 	OUT_LIT(") ? (");
-	emit_token_range(start, orelse);
+	emit_token_range_orelse(start, orelse);
 	OUT_LIT(") : (");
 	emit_token_range_orelse(rhs, end);
 	OUT_LIT(")");
@@ -2564,7 +2585,7 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 			out_uint(oe);
 			OUT_LIT(" = (");
 			// For paren-wrapped orelse, emit LHS from inside the '(' (skip the outer paren).
-			emit_token_range(
+			emit_token_range_orelse(
 				brackets[i].paren_open ? tok_next(brackets[i].paren_open)
 				                       : tok_next(brackets[i].open),
 				brackets[i].orelse);
@@ -2595,7 +2616,7 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 			OUT_LIT(" long long __prism_dim_");
 			out_uint(dim);
 			OUT_LIT(" = (");
-			emit_token_range(dim_start, dim_end);
+			emit_token_range_orelse(dim_start, dim_end);
 			OUT_LIT(");");
 		}
 	}
@@ -2715,7 +2736,7 @@ static Token *walk_balanced_orelse(Token *tok) {
 		OUT_LIT(" ({__auto_type __prism_oe_");
 		out_uint(oe);
 		OUT_LIT(" = (");
-		emit_token_range(lhs_start, orelse_found);
+		emit_token_range_orelse(lhs_start, orelse_found);
 		OUT_LIT("); __prism_oe_");
 		out_uint(oe);
 		OUT_LIT(" ? __prism_oe_");
@@ -3780,6 +3801,19 @@ static void validate_defer_control_flow(Token *t, bool in_loop, bool in_switch) 
 		error_tok(t, "'continue' inside defer block bypasses remaining defers");
 }
 
+static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch, int depth);
+
+// Flat-scan a balanced () or [] group for hidden GNU statement expressions ({...}).
+// Walks all tokens inside open..close looking for the two-token '(' '{' signature;
+// catches stmt-exprs at arbitrary nesting depth without recursive group descent.
+static void defer_scan_hidden_stmt_exprs(Token *open, bool in_loop, bool in_switch, int depth) {
+	Token *end = tok_match(open);
+	if (!end) return;
+	for (Token *t = tok_next(open); t && t != end && t->kind != TK_EOF; t = tok_next(t))
+		if (match_ch(t, '(') && tok_next(t) && match_ch(tok_next(t), '{'))
+			validate_defer_statement(tok_next(t), in_loop, in_switch, depth + 1);
+}
+
 static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch, int depth) {
 	if (depth >= 4096) error_tok(tok, "braceless control flow nesting depth exceeds 4096");
 	tok = skip_noise(tok);
@@ -3805,8 +3839,11 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 
 	if (tok->tag & (TT_CASE | TT_DEFAULT)) {
 		while (tok && tok->kind != TK_EOF && !match_ch(tok, ':')) {
-			if (tok->flags & TF_OPEN) tok = tok_match(tok) ? tok_next(tok_match(tok)) : tok_next(tok);
-			else tok = tok_next(tok);
+			if (tok->flags & TF_OPEN) {
+				if (match_ch(tok, '(') || match_ch(tok, '['))
+					defer_scan_hidden_stmt_exprs(tok, in_loop, in_switch, depth);
+				tok = tok_match(tok) ? tok_next(tok_match(tok)) : tok_next(tok);
+			} else tok = tok_next(tok);
 		}
 		return tok && match_ch(tok, ':') ? validate_defer_statement(tok_next(tok), in_loop, in_switch, depth + 1) : tok;
 	}
@@ -3835,7 +3872,9 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 			validate_defer_statement(inner_brace, in_loop, in_switch, depth + 1);
 			return tok_match(tok) ? tok_next(tok_match(tok)) : tok_next(tok);
 		}
-		return tok_match(tok) ? tok_next(tok_match(tok)) : tok_next(tok);
+		// ( or [ starting a statement (e.g. cast prefix, compound literal):
+		// fall through to catch-all which scans the full expression to ';'
+		// for hidden stmt-exprs like (void)({return;0;}).
 	}
 
 	// Labeled statement: ident ':' <stmt>
@@ -3872,6 +3911,8 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 		if (s->flags & TF_OPEN) {
 			if (match_ch(s, '(') && tok_next(s) && match_ch(tok_next(s), '{'))
 				validate_defer_statement(tok_next(s), in_loop, in_switch, depth + 1);
+			else if (match_ch(s, '(') || match_ch(s, '[') || match_ch(s, '{'))
+				defer_scan_hidden_stmt_exprs(s, in_loop, in_switch, depth);
 			s = tok_match(s) ? tok_match(s) : s;
 			continue;
 		}
@@ -6677,6 +6718,7 @@ uint16_t sid = next_scope_id++;
 			    !is_known_typedef(type.end)) {
 				Token *after_raw = skip_noise(tok_next(type.end));
 				if (after_raw && is_raw_declaration_context(after_raw)) {
+					p1d_saw_raw = true;
 					p1d_type_tok = after_raw;
 					type = parse_type_specifier(after_raw);
 				}

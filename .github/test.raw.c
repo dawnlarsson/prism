@@ -1277,6 +1277,74 @@ static void test_raw_consecutive_attr_struct_body(void) {
 	prism_free(&r2);
 }
 
+static void test_raw_qualifier_prefix_goto_desync(void) {
+	printf("\n--- raw qualifier prefix goto desync (audit round 44) ---\n");
+
+	/* BUG: Phase 1D's main loop only set p1d_saw_raw when it directly
+	 * encountered a TF_RAW token.  When 'raw' appeared after qualifiers
+	 * (e.g. 'const raw int x'), the declaration detector fired on 'const'
+	 * first, so the main loop never reached 'raw'.  The forward-probe
+	 * correctly re-parsed the type but forgot to set p1d_saw_raw, causing
+	 * the CFG verifier to think the declaration was NOT raw and falsely
+	 * rejecting goto-over-decl. */
+
+	/* Case 1: const raw int */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    goto skip;\n"
+		    "    const raw int x;\n"
+		    "    skip:;\n"
+		    "}\n",
+		    "raw_const_goto.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "const-raw-int-goto: goto over const raw int must be allowed");
+		prism_free(&r);
+	}
+
+	/* Case 2: volatile raw int */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    goto skip;\n"
+		    "    volatile raw int x;\n"
+		    "    skip:;\n"
+		    "}\n",
+		    "raw_volatile_goto.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "volatile-raw-int-goto: goto over volatile raw int must be allowed");
+		prism_free(&r);
+	}
+
+	/* Case 3: _Atomic raw int */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    goto skip;\n"
+		    "    _Atomic raw int x;\n"
+		    "    skip:;\n"
+		    "}\n",
+		    "raw_atomic_goto.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "_Atomic-raw-int-goto: goto over _Atomic raw int must be allowed");
+		prism_free(&r);
+	}
+
+	/* Case 4: control — plain const int (no raw) must still be rejected */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    goto skip;\n"
+		    "    const int x;\n"
+		    "    skip:;\n"
+		    "}\n",
+		    "const_no_raw_goto.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "const-int-goto: goto over const int (no raw) must be rejected");
+		prism_free(&r);
+	}
+}
+
 void run_raw_tests(void) {
 	printf("\n=== RAW KEYWORD TESTS ===\n");
 
@@ -1397,4 +1465,7 @@ void run_raw_tests(void) {
 
 	// Audit round 38: consecutive raw with interleaved attrs in struct body
 	test_raw_consecutive_attr_struct_body();
+
+	// Audit round 44: raw after qualifier prefix desync with CFG verifier
+	test_raw_qualifier_prefix_goto_desync();
 }

@@ -3101,6 +3101,100 @@ static void test_c23_attr_computed_goto_defer_bypass(void) {
 	}
 }
 
+/* BUG: validate_defer_statement's catch-all loop only detected GNU statement
+ * expressions ({...}) when '(' was immediately followed by '{'.  A stmt-expr
+ * nested inside function arguments, array indices, _Generic, or arithmetic
+ * (e.g. printf("%d", ({return;0;}))) was invisible because the outer '('
+ * group was skipped as a balanced unit.  This allowed smuggling return/goto/
+ * break/continue into defer bodies, silently bypassing resource cleanup.
+ *
+ * Root cause: the TF_OPEN handler and catch-all both checked
+ *     match_ch(tok_next(s), '{')
+ * which is false when the stmt-expr is not the first thing inside the parens.
+ *
+ * Fix: flat-scan inside () and [] groups for the '(' '{' two-token signature,
+ * which catches stmt-exprs at arbitrary nesting depth.
+ */
+static void test_defer_stmt_expr_smuggled_in_args(void) {
+	printf("\n--- defer stmt-expr smuggled in function args (audit round 40) ---\n");
+
+	/* Case 1: return smuggled via function argument */
+	check_defer_transpile_rejects(
+	    "void f(void) {\n"
+	    "    defer {\n"
+	    "        printf(\"%d\\n\", ({ return; 0; }));\n"
+	    "    }\n"
+	    "}\n",
+	    "defer_stmtexpr_funcarg.c",
+	    "defer stmt-expr in funcarg: return must be rejected",
+	    "return");
+
+	/* Case 2: goto smuggled via array index */
+	check_defer_transpile_rejects(
+	    "void f(void) {\n"
+	    "    int arr[10];\n"
+	    "    defer arr[({ goto skip; 0; })] = 1;\n"
+	    "    skip: ;\n"
+	    "}\n",
+	    "defer_stmtexpr_arrayidx.c",
+	    "defer stmt-expr in array index: goto must be rejected",
+	    "goto");
+
+	/* Case 3: break smuggled via _Generic */
+	check_defer_transpile_rejects(
+	    "void f(void) {\n"
+	    "    for (int i = 0; i < 10; i++) {\n"
+	    "        defer _Generic(({ break; 0; }), int: 0);\n"
+	    "    }\n"
+	    "}\n",
+	    "defer_stmtexpr_generic.c",
+	    "defer stmt-expr in _Generic: break must be rejected",
+	    "break");
+
+	/* Case 4: return smuggled via deeply nested arithmetic */
+	check_defer_transpile_rejects(
+	    "void f(void) {\n"
+	    "    defer {\n"
+	    "        int x = (1 + (2 * ({ return; 3; })));\n"
+	    "    }\n"
+	    "}\n",
+	    "defer_stmtexpr_nested_arith.c",
+	    "defer stmt-expr nested in arithmetic: return must be rejected",
+	    "return");
+
+	/* Case 5: continue smuggled via cast expression */
+	check_defer_transpile_rejects(
+	    "void f(void) {\n"
+	    "    while (1) {\n"
+	    "        defer (void)({ continue; 0; });\n"
+	    "    }\n"
+	    "}\n",
+	    "defer_stmtexpr_cast.c",
+	    "defer stmt-expr in cast: continue must be rejected",
+	    "continue");
+
+	/* Case 6: return smuggled via comma expr in parens */
+	check_defer_transpile_rejects(
+	    "void f(void) {\n"
+	    "    defer {\n"
+	    "        int x = (0, ({ return; 1; }));\n"
+	    "        (void)x;\n"
+	    "    }\n"
+	    "}\n",
+	    "defer_stmtexpr_comma.c",
+	    "defer stmt-expr in comma expr: return must be rejected",
+	    "return");
+
+	/* Control: direct stmt-expr still caught */
+	check_defer_transpile_rejects(
+	    "void f(void) {\n"
+	    "    defer ({ return; 0; });\n"
+	    "}\n",
+	    "defer_stmtexpr_direct.c",
+	    "defer direct stmt-expr: return still rejected",
+	    "return");
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -3300,4 +3394,7 @@ void run_defer_tests(void) {
 
 	// Audit round 40: C23 attribute on computed goto bypasses CFG + defer checks
 	test_c23_attr_computed_goto_defer_bypass();
+
+	// Audit round 40: stmt-expr smuggled inside function args/array indices/casts
+	test_defer_stmt_expr_smuggled_in_args();
 }

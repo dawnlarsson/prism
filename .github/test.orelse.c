@@ -3948,6 +3948,75 @@ static void test_typeof_opaque_expr_orelse_aggregate(void) {
 	}
 }
 
+static void test_bracket_orelse_dim_hoisting_bypass(void) {
+	printf("\n--- bracket orelse dimension hoisting bypass ---\n");
+
+	/* BUG: emit_bracket_orelse_temps used emit_token_range to emit hoisted
+	 * dimension tokens. This is a raw emitter that bypasses orelse→ternary
+	 * transformation. If a non-orelse dimension contains orelse inside a ()
+	 * group (e.g. function call arg), the raw 'orelse' keyword leaks into
+	 * the output C code. */
+
+	/* Case 1: orelse in function call arg inside non-orelse dim */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get_n(int);\n"
+		    "int foo(void);\n"
+		    "int get_offset(void);\n"
+		    "void f(void) {\n"
+		    "    int buf[ get_n(foo() orelse 5) + 1 ][ get_offset() orelse 1 ];\n"
+		    "    (void)buf;\n"
+		    "}\n",
+		    "bracket_dim_hoist_bypass.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "bracket-dim-hoist: nested orelse transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "bracket-dim-hoist: no raw 'orelse' in C output");
+			CHECK(strstr(r.output, "__prism_dim_") != NULL,
+			      "bracket-dim-hoist: non-orelse dim is hoisted");
+		}
+		prism_free(&r);
+	}
+
+	/* Case 2: orelse inside orelse-bracket LHS function call */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get_n(int);\n"
+		    "int foo(void);\n"
+		    "void f(void) {\n"
+		    "    int buf[ get_n(foo() orelse 5) orelse 1 ];\n"
+		    "    (void)buf;\n"
+		    "}\n",
+		    "bracket_lhs_hoist_bypass.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "bracket-lhs-hoist: nested orelse in LHS transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "bracket-lhs-hoist: no raw 'orelse' in C output");
+		prism_free(&r);
+	}
+
+	/* Case 3: multiple nested orelse in different dims */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int a(int);\n"
+		    "int b(void);\n"
+		    "int c(void);\n"
+		    "void f(void) {\n"
+		    "    int buf[ a(b() orelse 2) + 1 ][ c() orelse 3 ];\n"
+		    "    (void)buf;\n"
+		    "}\n",
+		    "bracket_multi_nested_oe.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "bracket-multi-nested: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "bracket-multi-nested: no raw 'orelse' in C output");
+		prism_free(&r);
+	}
+}
+
 static void test_orelse_funcptr_param_bracket_leak(void) {
 	printf("\n--- orelse in funcptr param bracket leak (audit round 40) ---\n");
 
@@ -4285,4 +4354,7 @@ void run_orelse_tests(void) {
 
 	// Audit round 40: orelse in funcptr/prototype param bracket leaks raw keyword
 	test_orelse_funcptr_param_bracket_leak();
+
+	// Audit round 44: bracket orelse dimension hoisting bypasses orelse transformation
+	test_bracket_orelse_dim_hoisting_bypass();
 }
