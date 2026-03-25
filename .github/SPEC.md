@@ -52,7 +52,7 @@ GNU extension `__auto_type` is tagged `TT_TYPE | TT_TYPEOF` so that declaration 
 
 ### Taint graph
 
-The tokenizer builds per-function taint flags (`has_setjmp`, `has_vfork`, `has_asm`) stored on the opening `{` token's tag bits (`TT_SPECIAL_FN`, `TT_NORETURN_FN`, `TT_ASM`). These remain on the token and are read directly via `func_meta[idx].body_open->tag` — they are **not** transferred to `FuncMeta` fields.
+The tokenizer builds per-function taint flags (`has_setjmp`, `has_vfork`, `has_asm_goto`) stored on the opening `{` token's tag bits (`TT_SPECIAL_FN`, `TT_NORETURN_FN`, `TT_ASM`). These remain on the token and are read directly via `func_meta[idx].body_open->tag` — they are **not** transferred to `FuncMeta` fields. The `TT_ASM` taint fires only for `asm goto` — the tokenizer scans between the `asm` keyword and `(` for a `TT_GOTO` token. Regular `asm` (volatile, inline) is safe and does not taint.
 
 ---
 
@@ -119,7 +119,7 @@ FuncMeta {
 }
 ```
 
-**Taint flags:** `has_setjmp`/`has_vfork`/`has_asm` are NOT stored in `FuncMeta`. They are tag bits (`TT_SPECIAL_FN`, `TT_NORETURN_FN`, `TT_ASM`) on the function body's opening `{` token, set by the tokenizer during taint-graph construction. Checked at defer-allocation time via `func_meta[idx].body_open->tag`.
+**Taint flags:** `has_setjmp`/`has_vfork`/`has_asm_goto` are NOT stored in `FuncMeta`. They are tag bits (`TT_SPECIAL_FN`, `TT_NORETURN_FN`, `TT_ASM`) on the function body's opening `{` token, set by the tokenizer during taint-graph construction. Checked at defer-allocation time via `func_meta[idx].body_open->tag`.
 
 Lookup during Pass 2: linear scan by `body_open` pointer (typically < 100 functions per TU).
 
@@ -299,6 +299,8 @@ At each file-scope function body `{`, captures the return type token range and f
 - `ret_type_suffix_start` / `ret_type_suffix_end` — for complex declarators (function pointers, arrays)
 - `returns_void` — whether the function returns `void`
 
+**K&R function fallback:** K&R-style parameter declarations (e.g., `void f(a) int a; {`) reset `file_scope_stmt_start` at each `;`. If the initial `capture_function_return_type(file_scope_stmt_start)` fails (returns 0), Phase 1E walks backward from `{` past K&R parameter declarations (`;`-separated) to find the actual parameter list `)`, then backward from that `(` to find the real declaration start, and retries capture.
+
 Taint flags (`TT_SPECIAL_FN`, `TT_NORETURN_FN`, `TT_ASM`) remain on the `body_open` token's tag and are read directly — they are not copied into FuncMeta fields.
 
 Pass 2 reads `FuncMeta` at function body entry.
@@ -319,7 +321,7 @@ Rejected patterns inside defer bodies:
 - `break` / `continue` (since `in_loop=false, in_switch=false`, these always error)
 - Recurses into GNU statement expressions `({…})` — `return`/`goto`/`break`/`continue` inside a stmt-expr in a defer body is rejected
 
-**Forbidden function contexts:** Defer in functions that use `setjmp`/`longjmp`, `vfork`, or inline assembly is rejected via `TT_SPECIAL_FN`/`TT_NORETURN_FN`/`TT_ASM` tag bits on the function body's opening `{` token (checked as `func_meta[idx].body_open->tag`). The `TT_SPECIAL_FN` taint covers all standard and implementation-internal variants that survive preprocessing: `setjmp`, `_setjmp`, `__setjmp`, `__sigsetjmp`, `longjmp`, `_longjmp`, `__longjmp`, `__siglongjmp`, `__longjmp_chk`, `sigsetjmp`, `siglongjmp`, `__builtin_setjmp`, `__builtin_longjmp`, `__builtin_setjmp_receive`, `pthread_exit`, `savectx`. Detection is token-name-based: even bare references like `void (*fp)(jmp_buf, int) = longjmp;` taint the function because the `longjmp` token retains its `TT_SPECIAL_FN` tag. The only undetectable bypass is a function pointer passed from another translation unit (cross-TU indirect call), which is inherent to single-TU static analysis.
+**Forbidden function contexts:** Defer in functions that use `setjmp`/`longjmp`, `vfork`, or `asm goto` (computed labels inside assembly) is rejected via `TT_SPECIAL_FN`/`TT_NORETURN_FN`/`TT_ASM` tag bits on the function body's opening `{` token (checked as `func_meta[idx].body_open->tag`). The `TT_SPECIAL_FN` taint covers all standard and implementation-internal variants that survive preprocessing: `setjmp`, `_setjmp`, `__setjmp`, `__sigsetjmp`, `longjmp`, `_longjmp`, `__longjmp`, `__siglongjmp`, `__longjmp_chk`, `sigsetjmp`, `siglongjmp`, `__builtin_setjmp`, `__builtin_longjmp`, `__builtin_setjmp_receive`, `pthread_exit`, `savectx`. Detection is token-name-based: even bare references like `void (*fp)(jmp_buf, int) = longjmp;` taint the function because the `longjmp` token retains its `TT_SPECIAL_FN` tag. The only undetectable bypass is a function pointer passed from another translation unit (cross-TU indirect call), which is inherent to single-TU static analysis.
 
 ---
 
@@ -360,6 +362,10 @@ Runs after all Phase 1 sub-phases complete. Gated by `F_DEFER | F_ZEROINIT` — 
 5. **Switch/case:** On `P1K_SWITCH`, snapshot the current watermarks. On `P1K_CASE`, compare current state against the switch's snapshot. Defers in ancestor-or-self scopes that were not active at the switch entry → error (defer skipped by fallthrough). Declarations in nested blocks (regardless of whether user-initialized or Prism-initialized) → error (case bypasses initialization), unless the declaration has `raw` or static storage duration.
 
 6. **Statement-expression boundary:** Gotos into a GNU statement expression are rejected. When resolving a forward or backward goto, if the target label is inside a `is_stmt_expr` scope and the goto is not within that same statement expression (checked via `scope_stmt_expr_ancestor`), a hard error is raised. Gotos *out of* a statement expression are allowed (GCC/Clang support this and Prism's defer+goto idioms rely on it).
+
+7. **Computed goto:** If `has_computed_goto` is set and the function has `P1K_DEFER` entries (when `F_DEFER`) or non-`raw`, non-static-storage `P1K_DECL` entries (when `F_ZEROINIT`), hard error — the jump target cannot be verified at compile time.
+
+8. **Unresolvable return type:** If the function has `P1K_DEFER` entries and does not return `void` but has no captured return type (`ret_type_start == NULL`), hard error. Anonymous struct return types (e.g., `struct { int x; } f() { defer ...; }`) cannot be spelled in a `typedef` for the defer cleanup temp variable. The user must use a named struct or typedef.
 
 ### Checked violations
 
@@ -456,10 +462,11 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 **Forbidden contexts:**
 - Functions using `setjmp`/`longjmp` — error
 - Functions using `vfork` — error (including `(vfork)()` paren-wrapped pattern)
-- Functions using inline `asm` — error
+- Functions using `asm goto` — error (regular `asm` is safe)
 - `return`, `goto` inside defer body — error
 - `break`, `continue` inside defer body — error (defer body is not a loop/switch context)
 - Computed goto (`goto *ptr`) with active defers or zero-initialized declarations — error
+- Functions with unresolvable return type (anonymous struct return) when using `defer` — error
 - `defer` at the top level of a GNU statement expression — error (use a nested block)
 - A block containing `defer` as the **last statement** of a GNU statement expression — error. `handle_close_brace` emits defers after the last expression, overwriting the expression's return value (void defers → compile error; non-void defers → silent wrong-value assignment). Without an expression parser there is no safe transformation; the user must place the defer block before the final expression rather than as the last statement.
 
@@ -553,7 +560,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 GNU statement expressions `({…})` are supported. They get their own scope in the scope tree (`is_stmt_expr = true`). Declarations and zero-initialization work correctly inside them. `walk_balanced` detects `({` patterns (including when called directly on a stmt-expr `(`) and processes inner blocks with full keyword dispatch (defer, goto, return/break/continue), `try_zero_init_decl`, raw stripping, and orelse transformation (via `emit_deferred_orelse` at stmt-start with a catch-all `error_tok` for unprocessed orelse tokens, preventing literal "orelse" from leaking to the C output). The inner loop's `itag` variable uses `uint32_t` (matching `Token.tag`'s width) to avoid truncation of high-bit tags like `TT_DEFER` (1<<20), `TT_GOTO` (1<<17), and `TT_ORELSE` (1<<30). `walk_balanced_orelse` (used for array dimensions when `F_ORELSE` is enabled) also detects `({` patterns in its no-orelse emit path and routes them through `walk_balanced` for full transpilation.
 
-**Defer constraint:** A block containing `defer` must not be the last statement of the statement expression (the defer emission would overwrite the expression's return value). Prism detects this at `}` close time: if the parent scope is `is_stmt_expr` and the next non-noise token after `}` is `}` (the stmt-expr close), it emits a hard error pointing to the `defer` keyword.  The user must place the defer block before the final expression: `int fd = ({ int r; { defer cleanup(); r = work(); } r; });` or restructure without a statement expression.
+**Defer constraint:** A block containing `defer` must not be the last statement of the statement expression (the defer emission would overwrite the expression's return value). Prism detects this during Phase 1D's prescan walk via `p1_check_defer_stmt_expr_chain`, which walks the scope tree parent chain from the defer's scope, checking if only trivial tokens (`;`, labels, preprocessor directives, attributes with balanced parens) separate each scope close. If the chain reaches a `is_stmt_expr` scope, a hard error is raised before Pass 2 begins. Pass 2's `handle_close_brace` retains the same check as defense-in-depth (fires at `}` close time when the parent scope is `is_stmt_expr` and the next non-noise token after `}` is `}`).  The user must place the defer block before the final expression: `int fd = ({ int r; { defer cleanup(); r = work(); } r; });` or restructure without a statement expression.
 
 **Multi-declarator stmt-expr:** `int x = ({ int tmp = f() orelse 0; tmp; }), y = 5;` — when the comma after a stmt-expr initializer forces `process_declarators`, `check_orelse_in_parens` skips stmt-expr boundaries (bails early for `({` patterns), and `walk_balanced` processes the inner content with full scope handling.
 

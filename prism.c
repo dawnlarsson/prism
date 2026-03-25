@@ -524,6 +524,12 @@ static void p1_check_defer_stmt_expr_chain(Token *defer_tok, uint16_t sid) {
 		bool only_trivial = true;
 		while (t && t != parent_close && t->kind != TK_EOF) {
 			if (match_ch(t, ';') || match_ch(t, '}')) { t = tok_next(t); continue; }
+			if (t->kind == TK_PREP_DIR) { t = tok_next(t); continue; }
+			if (t->tag & TT_ATTR) {
+				t = tok_next(t);
+				if (t && match_ch(t, '(')) t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t);
+				continue;
+			}
 			if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
 			    tok_next(t) && match_ch(tok_next(t), ':'))
 				{ t = tok_next(tok_next(t)); continue; }
@@ -5891,38 +5897,27 @@ static void p1_full_depth_prescan(Token *tok) {
 			bool in_struct = bo_sid > 0 && bo_sid < scope_tree_count && scope_tree[bo_sid].is_struct;
 			bool found_oe = false;
 			for (Token *s = tok_next(tok); s && s != close && s->kind != TK_EOF; s = tok_next(s)) {
-				if (s->flags & TF_OPEN) {
-					// Also annotate orelse inside a single '(' covering the whole bracket.
-					if (match_ch(s, '(')) {
-						Token *pp = tok_match(s);
-						if (pp && tok_next(pp) == close) {
-							for (Token *p = tok_next(s); pp && p && p != pp; p = tok_next(p)) {
-								if (p->flags & TF_OPEN) { p = tok_match(p) ? tok_match(p) : p; continue; }
-								if ((p->tag & TT_ORELSE) && !typedef_lookup(p)) {
-									if (p1d_cur_func < 0)
-										error_tok(p, "orelse inside array dimension at file scope is not allowed "
-											       "(cannot hoist temporary variable outside a function body)");
-									if (in_struct)
-										error_tok(p, "orelse inside array dimension in a struct/union body "
-											       "cannot be transformed (statement expressions are not "
-											       "allowed in struct/union definitions)");
-									validate_bracket_orelse(p);
-									tok_ann(p) |= P1_OE_BRACKET;
-									found_oe = true;
-								}
-							}
-						}
-					}
-					s = tok_match(s) ? tok_match(s) : s; continue;
-				}
 				if ((s->tag & TT_ORELSE) && !typedef_lookup(s)) {
 					if (p1d_cur_func < 0)
 						error_tok(s, "orelse inside array dimension at file scope is not allowed "
-							  "(cannot hoist temporary variable outside a function body)");
+							       "(cannot hoist temporary variable outside a function body)");
 					if (in_struct)
 						error_tok(s, "orelse inside array dimension in a struct/union body "
-							  "cannot be transformed (statement expressions are not "
-							  "allowed in struct/union definitions)");
+							       "cannot be transformed (statement expressions are not "
+							       "allowed in struct/union definitions)");
+					// Check if orelse is transformable: it must be at depth 0
+					// inside [...] or inside exactly one level of (...) that
+					// spans the entire bracket content. Deeper nesting
+					// (e.g. [((expr orelse val))]) is not supported.
+					int paren_depth = 0;
+					for (Token *p = tok_next(tok); p && p != s; p = tok_next(p)) {
+						if (match_ch(p, '(')) paren_depth++;
+						else if (match_ch(p, ')')) paren_depth--;
+					}
+					if (paren_depth > 1)
+						error_tok(s, "'orelse' inside array dimension could not be transformed; "
+							     "if wrapped in outer parentheses, remove them: "
+							     "use '[f() orelse 1]' not '[(f() orelse 1)]'");
 					validate_bracket_orelse(s);
 					tok_ann(s) |= P1_OE_BRACKET;
 					found_oe = true;
@@ -5980,8 +5975,40 @@ uint16_t sid = next_scope_id++;
 			// Phase 1E: function body detection at file scope
 			if (brace_depth == 0 && sid < scope_tree_count &&
 			    scope_tree[sid].is_func_body) {
-				// Capture return type from the declaration start
+				// Capture return type from the declaration start.
+				// K&R param declarations (e.g. "void f(a) int a; {")
+				// reset file_scope_stmt_start at each ";", so if
+				// capture fails, walk backward from '{' past K&R
+				// declarations to find the actual function start.
 				int ret = capture_function_return_type(file_scope_stmt_start);
+				if (ret == 0) {
+					Token *prev = p1_find_prev_skipping_attrs(tok_idx(tok) - 1);
+					if (prev && match_ch(prev, ';')) {
+						for (uint32_t pi = tok_idx(prev); pi > 0; pi--) {
+							Token *pt = &token_pool[pi - 1];
+							if (pt->kind == TK_PREP_DIR) continue;
+							if (match_ch(pt, '{') || match_ch(pt, '}'))
+								break;
+							if (match_ch(pt, ')') && tok_match(pt)) {
+								prev = pt;
+								break;
+							}
+						}
+					}
+					if (prev && match_ch(prev, ')') && tok_match(prev)) {
+						// Found param list — scan backward for declaration start
+						Token *open = tok_match(prev);
+						for (uint32_t pi = tok_idx(open); pi > 0; pi--) {
+							Token *pt = &token_pool[pi - 1];
+							if (pt->kind == TK_PREP_DIR) continue;
+							if (match_ch(pt, '{') || match_ch(pt, '}') ||
+							    match_ch(pt, ';'))
+								break;
+							file_scope_stmt_start = pt;
+						}
+						ret = capture_function_return_type(file_scope_stmt_start);
+					}
+				}
 				p1e_ret_void = (ret == 1);
 				p1e_ret_captured = (ret == 2);
 
@@ -6974,6 +7001,19 @@ static void p1_verify_cfg(void) {
 					error_tok(fm->body_open, "computed goto cannot be used in a "
 						  "function that contains zero-initialized declarations — the "
 						  "jump target cannot be verified at compile time");
+			}
+		}
+
+		// Check for defer in function with unresolvable return type.
+		// Anonymous structs cannot be spelled in a separate declaration,
+		// so Prism cannot generate the temp variable for defer cleanup.
+		if (FEAT(F_DEFER) && !fm->returns_void && !fm->ret_type_start) {
+			P1FuncEntry *ents = &p1_entries[fm->entry_start];
+			for (int i = 0; i < fm->entry_count; i++) {
+				if (ents[i].kind == P1K_DEFER)
+					error_tok(fm->body_open,
+						  "defer in function with unresolvable return type; "
+						  "use a named struct or typedef");
 			}
 		}
 
@@ -8777,19 +8817,11 @@ static int compile_sources(Cli *cli) {
 
 static void signal_cleanup_handler(int sig) {
 	if (signal_temp_load() && signal_temp_path[0])
-#ifdef _WIN32
-		DeleteFileA(signal_temp_path);
-#else
 		unlink(signal_temp_path);
-#endif
 	int n = signal_temps_load();
 	for (int i = 0; i < n; i++)
 		if (signal_temps_ready_load(i) && signal_temps[i][0] != '\0')
-#ifdef _WIN32
-			DeleteFileA(signal_temps[i]);
-#else
 			unlink(signal_temps[i]);
-#endif
 	signal(sig, SIG_DFL);
 	raise(sig);
 }
