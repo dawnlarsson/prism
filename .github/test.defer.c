@@ -1653,12 +1653,13 @@ static void test_computed_goto_forward_into_deferred_scope(void) {
 void test_defer_asm_rejected(void) {
 	check_defer_transpile_rejects(
 	    "void f(void) {\n"
-	    "    __asm__(\"nop\");\n"
+	    "    __asm__ goto(\"\" : : : : lbl);\n"
 	    "    defer (void)0;\n"
+	    "lbl:;\n"
 	    "}\n",
 	    "defer_asm_reject.c",
-	    "defer with asm rejected",
-	    "inline assembly");
+	    "defer with asm goto rejected",
+	    "asm goto");
 }
 #endif
 

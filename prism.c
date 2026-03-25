@@ -5806,7 +5806,7 @@ static void p1_try_alloc_defer(Token *tok, uint16_t cur_sid, int func_idx) {
 	if (btag & TT_NORETURN_FN)
 		error_tok(tok, "defer cannot be used in functions that call vfork()");
 	if (btag & TT_ASM)
-		error_tok(tok, "defer cannot be used in functions containing inline assembly");
+		error_tok(tok, "defer cannot be used in functions containing asm goto");
 	p1_alloc(P1K_DEFER, cur_sid, tok);
 }
 
@@ -5842,6 +5842,7 @@ static void p1_full_depth_prescan(Token *tok) {
 	bool p1d_saw_raw = false;  // Phase 1D: track 'raw' keyword preceding declaration
 	bool p1d_saw_static = false; // Phase 1D: track static/extern storage class preceding declaration
 	int p1d_init_brace_depth = 0; // depth of initializer braces (= { ... }); labels suppressed inside
+	bool p1d_ctrl_pending = false; // true when next stmt is braceless control flow body
 
 	while (tok && tok->kind != TK_EOF) {
 		// Pop braceless switches whose body has ended
@@ -5921,6 +5922,16 @@ static void p1_full_depth_prescan(Token *tok) {
 								  "cannot be transformed; use the resolved type directly");
 				}
 			}
+		}
+
+		// Phase 1: reject orelse in struct/union bodies (not inside typeof
+		// or bracket dims, which are already handled above).
+		if (FEAT(F_ORELSE) && (tok->tag & TT_ORELSE) && !typedef_lookup(tok)) {
+			uint16_t cur_sid = CUR_SID();
+			if (cur_sid < scope_tree_count && scope_tree[cur_sid].is_struct)
+				error_tok(tok,
+					  "'orelse' cannot be used here (it must appear at the "
+					  "statement level in a declaration or bare expression)");
 		}
 
 		if (match_ch(tok, '{')) {
@@ -6025,6 +6036,7 @@ uint16_t sid = next_scope_id++;
 			p1d_saw_raw = false;
 			p1d_saw_static = false;
 			p1d_ternary_depth = 0;
+			p1d_ctrl_pending = false;
 			tok = tok_next(tok);
 			continue;
 		}
@@ -6076,6 +6088,7 @@ uint16_t sid = next_scope_id++;
 			p1d_saw_raw = false;
 			p1d_saw_static = false;
 			p1d_ternary_depth = 0;
+			p1d_ctrl_pending = false;
 			p1d_prev = tok;
 			tok = tok_next(tok);
 			continue;
@@ -6086,6 +6099,7 @@ uint16_t sid = next_scope_id++;
 			p1d_saw_raw = false;
 			p1d_saw_static = false;
 			p1d_ternary_depth = 0;
+			p1d_ctrl_pending = false;
 			p1d_prev = tok;
 			if (brace_depth == 0) {
 				// Phase 1C: C99 prototype parameter scope (§6.2.1p4).
@@ -6145,6 +6159,13 @@ uint16_t sid = next_scope_id++;
 				    !(p1d_prev && (p1d_prev->tag & TT_GOTO)) &&
 				    tok_next(tok) && !match_ch(tok_next(tok), ':') &&
 				    !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN))) {
+					// Context validation (moved from Pass 2 handle_defer_keyword)
+					if (p1d_ctrl_pending)
+						error_tok(tok, "defer requires braces in control statements (braceless has no scope)");
+					if (cur_sid < scope_tree_count && scope_tree[cur_sid].is_stmt_expr)
+						error_tok(tok, "defer cannot be at top level of statement expression; wrap in a block");
+					if (cur_sid < scope_tree_count && scope_tree[cur_sid].is_switch)
+						error_tok(tok, "defer in switch case requires braces");
 					p1_try_alloc_defer(tok, cur_sid, p1d_cur_func);
 					validate_defer_statement(tok_next(tok), false, false, 0);
 				}
@@ -6194,8 +6215,10 @@ uint16_t sid = next_scope_id++;
 				}
 				tok = tok_next(tok_match(tok));
 				// After control-flow condition (...), token is stmt start
-				if (p1d_prev_saved && (p1d_prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)))
+				if (p1d_prev_saved && (p1d_prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH))) {
 					at_stmt_start = true;
+					p1d_ctrl_pending = true;
+				}
 			} else
 				tok = tok_next(tok);
 			continue;
@@ -6476,6 +6499,30 @@ uint16_t sid = next_scope_id++;
 		if ((tok->tag & TT_DEFER) && !is_known_typedef(tok) &&
 		    tok_next(tok) && !match_ch(tok_next(tok), ':') &&
 		    !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN))) {
+			// Context validation (moved from Pass 2 handle_defer_keyword)
+			if (p1d_cur_func >= 0) {
+				uint16_t dsid = CUR_SID();
+				if (p1d_ctrl_pending)
+					error_tok(tok, "defer requires braces in control statements (braceless has no scope)");
+				if (dsid < scope_tree_count && scope_tree[dsid].is_stmt_expr)
+					error_tok(tok, "defer cannot be at top level of statement expression; wrap in a block");
+				if (dsid < scope_tree_count && scope_tree[dsid].is_switch)
+					error_tok(tok, "defer in switch case requires braces");
+			}
+			// Unterminated / keyword heuristic (non-block defer)
+			{
+				Token *body = tok_next(tok);
+				if (body && !match_ch(body, '{')) {
+					Token *semi = skip_to_semicolon(body);
+					if (semi->kind == TK_EOF || !match_ch(semi, ';'))
+						error_tok(tok, "unterminated defer statement; expected ';'");
+					if (body->kind == TK_KEYWORD &&
+					    (body->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO | TT_IF | TT_LOOP |
+							  TT_SWITCH | TT_CASE | TT_DEFAULT | TT_DEFER)))
+						error_tok(tok, "defer statement appears to be missing ';' (found '%.*s' keyword inside)",
+							  body->len, tok_loc(body));
+				}
+			}
 			// Defer bodies always start with in_loop=false, in_switch=false:
 			// break/continue inside a defer must not affect the enclosing loop.
 			validate_defer_statement(tok_next(tok), false, false, 0);
@@ -6660,6 +6707,10 @@ uint16_t sid = next_scope_id++;
 						// (moved from Pass 2 analyze_decl_orelse_target / process_declarators
 						// to satisfy the invariant: all semantic errors before emission)
 						if (decl_has_orelse && FEAT(F_ORELSE)) {
+							if (brace_depth == 0)
+								error_tok(decl.var_name,
+									  "'orelse' cannot be used in file-scope initializers "
+									  "(requires runtime fallback code)");
 							if (decl.is_array && !decl.paren_pointer)
 								error_tok(decl.var_name,
 									  "orelse on array variable '%.*s' will never trigger "
@@ -6704,10 +6755,10 @@ uint16_t sid = next_scope_id++;
 
 		// 'else' and 'do' create statement boundaries without parens
 		if ((tok->tag & TT_IF) && tok_loc(tok)[0] == 'e') {
-			p1d_prev = tok; tok = tok_next(tok); at_stmt_start = true; continue;
+			p1d_prev = tok; tok = tok_next(tok); at_stmt_start = true; p1d_ctrl_pending = true; continue;
 		}
 		if ((tok->tag & TT_LOOP) && tok_loc(tok)[0] == 'd') {
-			p1d_prev = tok; tok = tok_next(tok); at_stmt_start = true; continue;
+			p1d_prev = tok; tok = tok_next(tok); at_stmt_start = true; p1d_ctrl_pending = true; continue;
 		}
 
 		// Phase 1D: validate bare orelse in expression statements

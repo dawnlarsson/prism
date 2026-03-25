@@ -1688,7 +1688,12 @@ static Token *tokenize(File *file) {
 							} else
 								t->tag |= TT_SPECIAL_FN;
 						}
-						if (b->tag & TT_ASM) t->tag |= TT_ASM;
+						if (b->tag & TT_ASM) {
+							// Only taint for asm goto — can jump to labels, bypassing defer.
+							// Regular asm (volatile, inline) is safe.
+							for (Token *ag = tok_next(b); ag && ag != end && tok_loc(ag)[0] != '('; ag = tok_next(ag))
+								if (ag->tag & TT_GOTO) { t->tag |= TT_ASM; break; }
+						}
 					}
 					if (func_name) {
 						ARENA_ENSURE_CAP(&ctx->main_arena,
