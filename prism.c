@@ -3796,6 +3796,10 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 			if (s->flags & TF_OPEN) { s = tok_match(s); continue; }
 			if ((s->tag & TT_ORELSE) && !typedef_lookup(s)) {
 				Token *act = tok_next(s);
+				// Phase 1F: reject empty orelse action (orelse ;)
+				// Moved from Pass 2 emit_deferred_orelse.
+				if (act && match_ch(act, ';'))
+					error_tok(s, "expected statement after 'orelse'");
 				validate_defer_control_flow(act, in_loop, in_switch);
 				break;
 			}
@@ -6571,6 +6575,16 @@ uint16_t sid = next_scope_id++;
 						p1d_annotated = true;
 					}
 
+					// Phase 1D: reject unbraced declaration in switch body
+					// (moved from Pass 2 try_zero_init_decl to satisfy
+					// the invariant: all semantic errors before emission)
+					if (FEAT(F_ZEROINIT) && brace_depth > 0 && !p1d_saw_raw &&
+					    cur_sid < scope_tree_count && scope_tree[cur_sid].is_switch)
+						error_tok(p1d_type_tok,
+							  "variable declaration directly in switch body without braces. "
+							  "Wrap in braces: 'case N: { int x; ... }' to ensure safe zero-initialization, "
+							  "or use 'raw' to suppress zero-init.");
+
 					// Phase 1C: shadow detection
 					if (is_known_typedef(decl.var_name) ||
 					    (decl.var_name->tag & (TT_DEFER | TT_ORELSE))) {
@@ -6596,12 +6610,30 @@ uint16_t sid = next_scope_id++;
 						e->decl.is_static_storage = p1d_saw_static || type.has_static || type.has_extern;
 					}
 
+					// Phase 1D: reject register _Atomic aggregate
+					// (moved from Pass 2 process_declarators to satisfy
+					// the invariant: all semantic errors before emission)
+					if (FEAT(F_ZEROINIT) && brace_depth > 0 && !has_init && !p1d_saw_raw &&
+					    !type.has_extern && !type.has_static &&
+					    type.has_register && type.has_atomic) {
+						bool p1_is_aggregate = decl.is_array ||
+							((type.is_struct || type.is_typedef) && !decl.is_pointer);
+						if (p1_is_aggregate)
+							error_tok(decl.var_name,
+								  "'register _Atomic' aggregate cannot be safely "
+								  "zero-initialized; remove 'register' or use 'raw' "
+								  "to opt out of automatic initialization");
+					}
+
 					if (has_init) {
+						bool decl_has_orelse = false;
 						t = tok_next(t);
 						while (t && !match_ch(t, ',') && !match_ch(t, ';') && t->kind != TK_EOF) {
 							// Phase 1G: mark orelse in decl initializer
-							if ((t->tag & TT_ORELSE) && !typedef_lookup(t))
+							if ((t->tag & TT_ORELSE) && !typedef_lookup(t)) {
 								tok_ann(t) |= P1_OE_DECL_INIT;
+								decl_has_orelse = true;
+							}
 							if (t->flags & TF_OPEN) {
 								// Look one level into paren group that
 								// spans the rest of the initializer for
@@ -6611,8 +6643,10 @@ uint16_t sid = next_scope_id++;
 									Token *am = tok_next(m);
 									if (!am || match_ch(am, ',') || match_ch(am, ';') || am->kind == TK_EOF) {
 										for (Token *inner = tok_next(t); inner && inner != m; inner = tok_next(inner)) {
-											if ((inner->tag & TT_ORELSE) && !typedef_lookup(inner))
+											if ((inner->tag & TT_ORELSE) && !typedef_lookup(inner)) {
 												tok_ann(inner) |= P1_OE_DECL_INIT;
+												decl_has_orelse = true;
+											}
 											if (inner->flags & TF_OPEN) { inner = tok_match(inner) ? tok_match(inner) : inner; continue; }
 										}
 									}
@@ -6620,6 +6654,22 @@ uint16_t sid = next_scope_id++;
 								t = m ? tok_next(m) : tok_next(t); continue;
 							}
 							t = tok_next(t);
+						}
+
+						// Phase 1D: reject orelse on array/struct declarations
+						// (moved from Pass 2 analyze_decl_orelse_target / process_declarators
+						// to satisfy the invariant: all semantic errors before emission)
+						if (decl_has_orelse && FEAT(F_ORELSE)) {
+							if (decl.is_array && !decl.paren_pointer)
+								error_tok(decl.var_name,
+									  "orelse on array variable '%.*s' will never trigger "
+									  "(array address is never NULL); remove the orelse clause",
+									  decl.var_name->len,
+									  tok_loc(decl.var_name));
+							if (type.is_struct && !type.is_enum && !decl.is_pointer && !decl.is_array)
+								error_tok(decl.var_name,
+									  "orelse on struct/union values is not supported "
+									  "(memcmp cannot reliably detect zero due to padding)");
 						}
 					}
 					if (t && match_ch(t, ',')) { t = tok_next(t); } else break;
@@ -6658,6 +6708,34 @@ uint16_t sid = next_scope_id++;
 		}
 		if ((tok->tag & TT_LOOP) && tok_loc(tok)[0] == 'd') {
 			p1d_prev = tok; tok = tok_next(tok); at_stmt_start = true; continue;
+		}
+
+		// Phase 1D: validate bare orelse in expression statements
+		// (moved from Pass 2 emit_bare_orelse_impl / emit_orelse_action
+		// to satisfy the invariant: all semantic errors before emission)
+		if (at_stmt_start && FEAT(F_ORELSE) && p1d_cur_func >= 0 && brace_depth > 0) {
+			Token *bare_oe = find_bare_orelse(tok);
+			if (bare_oe && !(tok_ann(bare_oe) & (P1_OE_BRACKET | P1_OE_DECL_INIT))) {
+				int sd = 0;
+				bool has_eq = false;
+				for (Token *s = tok; s != bare_oe; s = tok_next(s)) {
+					if (s->flags & TF_OPEN) { sd++; continue; }
+					if (s->flags & TF_CLOSE) { sd--; continue; }
+					if (sd == 0 && is_assignment_operator_token(s)) {
+						if (!match_ch(s, '='))
+							error_tok(s, "bare assignment with 'orelse' cannot use compound operators "
+								  "(e.g. +=, -=); use a plain '=' assignment");
+						has_eq = true;
+						break;
+					}
+				}
+				Token *after_oe = tok_next(bare_oe);
+				if (after_oe && !has_eq &&
+				    !(after_oe->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
+				    !match_ch(after_oe, '{') && !match_ch(after_oe, ';'))
+					error_tok(after_oe, "orelse fallback requires an assignment target "
+						  "(use a declaration)");
+			}
 		}
 
 		at_stmt_start = false;

@@ -3400,6 +3400,54 @@ static void test_duplicate_label_detection(void) {
 	prism_free(&r);
 }
 
+// Audit round 41: register _Atomic aggregate must error in Phase 1,
+// not during Pass 2 emission (invariant: all semantic errors before output).
+static void test_register_atomic_aggregate_phase1(void) {
+	printf("\n--- register _Atomic aggregate: Phase 1 error ---\n");
+#ifndef _MSC_VER
+	const char *code =
+	    "void g(void) { int y; }\n"
+	    "void f(void) { register _Atomic struct { int a; } x; (void)x; }\n";
+	PrismResult r = prism_transpile_source(code, "reg_atomic_p1.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "register-atomic-agg: must be rejected");
+	CHECK(r.error_msg && strstr(r.error_msg, "register"),
+	      "register-atomic-agg: error mentions 'register'");
+	prism_free(&r);
+#endif
+}
+
+// Audit round 41: switch body unbraced decl must error in Phase 1,
+// not during Pass 2 emission.
+static void test_switch_unbraced_decl_phase1(void) {
+	printf("\n--- switch unbraced decl: Phase 1 error ---\n");
+	const char *code =
+	    "void g(void) { int y; }\n"
+	    "void f(int x) { switch(x) { case 1: int z; (void)z; break; } }\n";
+	PrismResult r = prism_transpile_source(code, "switch_unbraced_p1.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "switch-unbraced-decl: must be rejected");
+	CHECK(r.error_msg && (strstr(r.error_msg, "switch") || strstr(r.error_msg, "braces")),
+	      "switch-unbraced-decl: error mentions switch or braces");
+	prism_free(&r);
+}
+
+// Audit round 41: orelse with empty action in defer body must error in Phase 1.
+static void test_orelse_empty_action_in_defer_phase1(void) {
+	printf("\n--- orelse empty action in defer: Phase 1 error ---\n");
+	const char *code =
+	    "int *get(void);\n"
+	    "void f(void) {\n"
+	    "    defer {\n"
+	    "        int *p = get() orelse;\n"
+	    "    };\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "oe_empty_defer_p1.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "orelse-empty-defer: must be rejected");
+	prism_free(&r);
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -3671,4 +3719,9 @@ void run_safe_tests(void) {
 
         // Audit round 40: duplicate label detection in CFG verifier
         test_duplicate_label_detection();
+
+        // Audit round 41: move semantic errors from Pass 2 to Phase 1
+        test_register_atomic_aggregate_phase1();
+        test_switch_unbraced_decl_phase1();
+        test_orelse_empty_action_in_defer_phase1();
 }

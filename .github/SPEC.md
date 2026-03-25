@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3344+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3349+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -279,7 +279,7 @@ For each function body, collects `P1FuncEntry` items into the global `p1_entries
 
 **typeof VLA detection:** Inside `parse_type_specifier`, VLA array dimensions inside `typeof(...)` are detected by scanning for `[` preceded by a type keyword, typedef, `]`, or `*`, followed by a runtime-variable size (`array_size_is_vla`). Parenthesized types like `typeof((int[n]))` are detected at all paren depths. However, function-pointer parameter lists are skipped: a `(` preceded by `)` signals a function parameter list (e.g., `typeof(void(*)(int[n]))`), and `[n]` inside such lists describes parameter dimensions, not the outer type. This prevents false VLA flags on function pointers — important because `register` storage class variables cannot have their address taken, making memset-based zero-init illegal for them.
 
-**has_raw:** Declarations marked `raw` set `has_raw = true`. In multi-declarator statements (`raw int x, y;`), `p1d_saw_raw` is reset on commas — only the first declarator receives `has_raw = true` (matching Pass 2's behavior). The CFG verifier skips `has_raw` declarations for goto checks, **except VLAs** — `raw` on a VLA does not exempt it.
+**has_raw:** Declarations marked `raw` set `has_raw = true`. In multi-declarator statements (`raw int x, y;`), `p1d_saw_raw` persists across commas — **all** declarators receive `has_raw = true` (matching Pass 2's behavior, where `is_raw` is also never reset on commas). The CFG verifier skips `has_raw` declarations for goto checks, **except VLAs** — `raw` on a VLA does not exempt it.
 
 **is_static_storage:** Set when the declaration has `static`, `extern`, `_Thread_local`, `thread_local`, or `__thread` (GNU extension) storage class. The prescan tracks this via `p1d_saw_static` (set when skipping `TT_STORAGE` tokens before the type specifier, and also checked via `type.has_static` / `type.has_extern` from `parse_type_specifier`). The CFG verifier exempts static-storage declarations from goto/switch checks because their initialization occurs at program/thread startup, not at the declaration point.
 
@@ -533,7 +533,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 **Semantics:** Opts out of zero-initialization for a specific variable. The `raw` keyword is stripped from the output. The resulting declaration is emitted without an initializer. Consecutive `raw` keywords (e.g. `raw raw int x;` from macro expansion) are handled gracefully: `is_raw_declaration_context()` recognizes `TF_RAW` as a valid successor, and each stripping site (`try_zero_init_decl`, `walk_balanced` stmt-start, file-scope loop) skips all consecutive `raw` tokens before the type.
 
-**Multi-declarator scope:** `raw` applies only to the **first** declarator in a comma-separated declaration. In `raw int x, y;`, only `x` opts out of zero-initialization; `y` is still zero-initialized. Both Phase 1D (`p1d_saw_raw` reset on `,`) and Pass 2 (`is_raw` reset on `,`) enforce this.
+**Multi-declarator scope:** `raw` applies to **all** declarators in a comma-separated declaration. In `raw int x, y;`, both `x` and `y` opt out of zero-initialization (output: `int x, y;`). Neither Phase 1D (`p1d_saw_raw` persists across commas) nor Pass 2 (`is_raw` never reset on commas) resets the raw flag between declarators.
 
 **Safety interaction:** `raw`-marked variables can be safely jumped over by `goto` — the CFG verifier skips them in forward goto checks, **except VLAs** where `raw` does not exempt the declaration.
 
@@ -741,7 +741,7 @@ These are inherently runtime and cannot move to Pass 1:
 ## 14. Invariants
 
 1. **Immutable symbol table:** After Phase 1B completes, the typedef table is frozen. Pass 2 performs zero mutations to the typedef table, scope tree, token annotations (`ann`), or `func_meta`.
-2. **All errors before emission:** Every user-triggerable `error_tok` call from semantic analysis fires during Pass 1 or Phase 2A, before Pass 2 emits its first byte. Pass 2 contains defensive `error_tok` calls in `process_declarators`, `emit_bare_orelse_impl`, `handle_defer_keyword`, etc. that serve as unreachable-by-design assertions — they guard against internal inconsistencies that would indicate a Pass 1 gap, not against user input that should have been caught earlier.
+2. **All errors before emission:** Every user-triggerable `error_tok` call from semantic analysis fires during Pass 1 or Phase 2A, before Pass 2 emits its first byte, with one documented exception: `check_defer_shadow_at_exit` requires runtime scope-stack state that only exists during Pass 2 control-flow exit emission. Pass 2 contains additional defensive `error_tok` calls in `process_declarators`, `emit_bare_orelse_impl`, `emit_orelse_action`, etc. that serve as unreachable-by-design assertions — they guard against internal inconsistencies that would indicate a Pass 1 gap, not against user input that should have been caught earlier. Phase 1D detects: array orelse, struct value orelse, compound-assign bare orelse, and bare orelse without assignment target. The preprocessor boundary check in `emit_bare_orelse_impl` is unreachable because the tokenizer evaluates `#ifdef`/`#if` conditionals, excluding dead-branch tokens.
 3. **O(N) CFG verification:** `p1_verify_cfg` is guaranteed linear in the number of P1FuncEntry items per function. No O(N²) pairwise scans.
 4. **Delimiter matching completeness:** Every `(`, `[`, `{` has a `match_idx`. Every `)`, `]`, `}` points back. No unmatched delimiters survive tokenization.
 5. **Self-host fixed point:** Stage 1 and Stage 2 transpiled C output is identical.
