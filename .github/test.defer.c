@@ -2742,6 +2742,59 @@ static void test_defer_shadow_depth_bypass(void) {
 	prism_free(&r);
 }
 
+static void test_defer_shadow_enum_bypass(void) {
+	printf("\n--- Defer shadow enum constant bypass ---\n");
+
+	// Enum constants declared inside an inner scope shadow a variable
+	// captured in a defer body.  check_defer_var_shadow is only called
+	// from process_declarators (variable declarations), never from
+	// parse_enum_constants, so the enum constant is invisible to it.
+	const char *code =
+	    "void cleanup(int v);\n"
+	    "int f(int condition) {\n"
+	    "    int status = 42;\n"
+	    "    defer cleanup(status);\n"
+	    "    if (condition) {\n"
+	    "        enum { status = -12 };\n"
+	    "        return 0;\n"
+	    "    }\n"
+	    "    return 1;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_shadow_enum.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "defer-shadow-enum: enum constant must not silently shadow captured var");
+	CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
+	      "defer-shadow-enum: error message mentions 'shadows'");
+	prism_free(&r);
+}
+
+static void test_defer_shadow_typedef_bypass(void) {
+	printf("\n--- Defer shadow typedef bypass ---\n");
+
+	// A local typedef with the same name as a variable captured in a
+	// defer body silently changes sizeof(x) from sizeof(int) to
+	// sizeof(double).  parse_typedef_declaration never calls
+	// check_defer_var_shadow.
+	const char *code =
+	    "void log_size(int sz);\n"
+	    "int f(void) {\n"
+	    "    int x = 42;\n"
+	    "    defer log_size(sizeof(x));\n"
+	    "    {\n"
+	    "        typedef double x;\n"
+	    "        x val;\n"
+	    "        (void)val;\n"
+	    "        return 0;\n"
+	    "    }\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_shadow_typedef.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "defer-shadow-typedef: typedef must not silently shadow captured var");
+	CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
+	      "defer-shadow-typedef: error message mentions 'shadows'");
+	prism_free(&r);
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -2922,4 +2975,8 @@ void run_defer_tests(void) {
 
 	// Audit round 31: cast blinds shadow checker
 	test_defer_shadow_cast_bypass();
+
+	// Audit round 32: enum constant + typedef shadow defer captures
+	test_defer_shadow_enum_bypass();
+	test_defer_shadow_typedef_bypass();
 }

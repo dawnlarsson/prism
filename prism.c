@@ -1158,6 +1158,58 @@ static void check_defer_var_shadow(Token *var_name) {
 	}
 }
 
+// Check enum constants and typedef names for defer-captured-variable shadowing.
+// Called from Pass 2 at statement-start for enum definitions and typedef declarations
+// that bypass process_declarators (and thus check_defer_var_shadow).
+static void check_enum_typedef_defer_shadow(Token *tok) {
+	if (!FEAT(F_DEFER) || defer_count == 0 || ctx->block_depth <= 0) return;
+
+	// --- enum { name1. name2, ... } ---
+	if (tok->tag & TT_SUE) {
+		Token *t = tok_next(tok);
+		// skip optional tag name
+		if (t && (t->kind == TK_IDENT || t->kind == TK_KEYWORD) && !match_ch(tok_next(t), ';'))
+			t = tok_next(t);
+		if (!t || !match_ch(t, '{')) return;
+		// only applies to 'enum', not struct/union (which don't introduce names)
+		if (!equal(tok, "enum")) return;
+		Token *end = tok_match(t);
+		if (!end) return;
+		t = tok_next(t); // skip {
+		while (t && t != end && t->kind != TK_EOF) {
+			if (t->kind == TK_IDENT || t->kind == TK_KEYWORD) {
+				check_defer_var_shadow(t);
+				// skip to next comma or end
+				while (t && t != end && t->kind != TK_EOF && !match_ch(t, ','))
+					t = tok_next(t);
+				if (t && match_ch(t, ',')) t = tok_next(t);
+			} else {
+				t = tok_next(t);
+			}
+		}
+		return;
+	}
+
+	// --- typedef <type> <name> ; ---
+	if (tok->tag & TT_TYPEDEF) {
+		Token *type_start = tok_next(tok);
+		if (!type_start) return;
+		TypeSpecResult type = parse_type_specifier(type_start);
+		if (!type.saw_type) return;
+		Token *t = type.end;
+		while (t && t->kind != TK_EOF && !match_ch(t, ';')) {
+			DeclResult decl = parse_declarator(t, false);
+			if (decl.var_name)
+				check_defer_var_shadow(decl.var_name);
+			if (!decl.end) break;
+			t = decl.end;
+			if (match_ch(t, ',')) t = tok_next(t);
+			else break;
+		}
+		return;
+	}
+}
+
 // Check if any currently-live defer shadow conflicts with the defers that are
 // about to be pasted.  Called at return/goto/break/continue — anywhere
 // emit_defers_ex will paste defer bodies while inner variables are still live.
@@ -6784,6 +6836,10 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				ctx->at_stmt_start = true;
 				continue;
 			}
+
+			// Enum definitions and typedef declarations bypass
+			// process_declarators — check their names against active defers.
+			check_enum_typedef_defer_shadow(tok);
 
 			// Bare expression orelse.
 			// Skip keywords that introduce sub-statements or labels
