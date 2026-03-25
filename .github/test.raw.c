@@ -1113,6 +1113,42 @@ static void test_raw_comma_list_all_declarators(void) {
 	prism_free(&r);
 }
 
+// Bug: consecutive raw keywords with interleaved attributes (e.g. from macro
+// expansion: raw __attribute__((cold)) raw int x;) causes the attribute to be
+// silently deleted. skip_noise jumps over the attribute between raw tokens,
+// and start is set past the last raw, losing the interleaved noise tokens.
+static void test_raw_consecutive_attr_preserved(void) {
+	printf("\n--- raw consecutive: interleaved attribute preserved ---\n");
+
+	// GNU __attribute__ between consecutive raw keywords
+	const char *code1 =
+	    "void test(void) {\n"
+	    "    raw __attribute__((unused)) raw int x;\n"
+	    "    (void)x;\n"
+	    "}\n";
+	PrismResult r1 = prism_transpile_source(code1, "raw_attr_gnu.c", prism_defaults());
+	CHECK_EQ(r1.status, PRISM_OK, "raw-attr-gnu: transpile succeeds");
+	if (r1.output) {
+		CHECK(strstr(r1.output, "__attribute__") != NULL,
+		      "raw-attr-gnu: __attribute__((unused)) must not be deleted");
+	}
+	prism_free(&r1);
+
+	// C23 [[...]] attribute between consecutive raw keywords
+	const char *code2 =
+	    "void test(void) {\n"
+	    "    raw [[deprecated]] raw int x;\n"
+	    "    (void)x;\n"
+	    "}\n";
+	PrismResult r2 = prism_transpile_source(code2, "raw_attr_c23.c", prism_defaults());
+	CHECK_EQ(r2.status, PRISM_OK, "raw-attr-c23: transpile succeeds");
+	if (r2.output) {
+		CHECK(strstr(r2.output, "deprecated") != NULL,
+		      "raw-attr-c23: [[deprecated]] attribute must not be deleted");
+	}
+	prism_free(&r2);
+}
+
 void run_raw_tests(void) {
 	printf("\n=== RAW KEYWORD TESTS ===\n");
 
@@ -1224,4 +1260,7 @@ void run_raw_tests(void) {
 
 	// Audit round 33: raw must apply to all declarators in comma-list
 	test_raw_comma_list_all_declarators();
+
+	// Audit round 34: consecutive raw with interleaved attributes must preserve attrs
+	test_raw_consecutive_attr_preserved();
 }

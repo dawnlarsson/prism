@@ -3748,6 +3748,36 @@ static void test_bare_orelse_volatile_double_write(void) {
 	prism_free(&r);
 }
 
+// Bug: fallback_has_compound_literal sees '{' inside nested parentheses
+// (e.g. &(struct Data){ .code = 1 } inside a function call) and forces
+// the unsafe ternary path, re-enabling the volatile double-write pattern.
+// The '{' must only count at scope-depth 0 (outside all parens).
+static void test_bare_orelse_volatile_compound_literal_nested(void) {
+	printf("\n--- Bare orelse volatile compound-literal nested ---\n");
+
+	const char *code =
+	    "typedef struct { int code; } Data;\n"
+	    "void log_error(const Data *d);\n"
+	    "volatile int *uart_tx;\n"
+	    "int get_byte(void);\n"
+	    "void test(void) {\n"
+	    "    *uart_tx = get_byte() orelse log_error(&(Data){ .code = 1 });\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "volatile_compound_nested.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "compound-literal-nested: transpile succeeds");
+	if (r.output) {
+		int write_count = 0;
+		const char *p = r.output;
+		while ((p = strstr(p, "*uart_tx =")) != NULL) { write_count++; p += 10; }
+		p = r.output;
+		while ((p = strstr(p, "*uart_tx=")) != NULL) { write_count++; p += 9; }
+		CHECK(write_count <= 1,
+		      "compound-literal-nested: must not write to volatile LHS more than "
+		      "once (nested compound literal must not trigger ternary fallback)");
+	}
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -3994,4 +4024,7 @@ void run_orelse_tests(void) {
 
 	// Audit round 33: bare orelse volatile double-write (MMIO-killing)
 	test_bare_orelse_volatile_double_write();
+
+	// Audit round 35: compound literal inside function args must not trigger ternary fallback
+	test_bare_orelse_volatile_compound_literal_nested();
 }

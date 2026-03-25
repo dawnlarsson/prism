@@ -2877,6 +2877,110 @@ static void test_defer_stmt_expr_empty_stmt_bypass(void) {
 	}
 }
 
+// Bug: typeof(x) inside a nested block in a defer body sets in_decl = true,
+// then when 'x' is encountered inside the typeof parens, it's treated as a
+// local declaration target. This poisons decl_depth, causing a later
+// 'int x = 5;' in the same block to be skipped by the shadow checker.
+static void test_defer_typeof_shadow_bypass(void) {
+	printf("\n--- Defer typeof Shadow Bypass ---\n");
+
+	// typeof(x) in nested defer block must not poison shadow detection for x
+	const char *code =
+	    "int test(void) {\n"
+	    "    int x = 10;\n"
+	    "    defer {\n"
+	    "        {\n"
+	    "            typeof(x) tmp = x;\n"
+	    "            (void)tmp;\n"
+	    "        }\n"
+	    "    }\n"
+	    "    {\n"
+	    "        int x = 5;\n"
+	    "        if (x > 3) return x;\n"
+	    "    }\n"
+	    "    return 0;\n"
+	    "}\n"
+	    "int main(void) { test(); return 0; }\n";
+
+	PrismResult r = prism_transpile_source(code, "typeof_shadow.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "typeof(x) in defer must not blind shadow detection for 'x'");
+	prism_free(&r);
+
+	// Also test __typeof__ variant
+	const char *code2 =
+	    "int test(void) {\n"
+	    "    int x = 10;\n"
+	    "    defer {\n"
+	    "        {\n"
+	    "            __typeof__(x) tmp = x;\n"
+	    "            (void)tmp;\n"
+	    "        }\n"
+	    "    }\n"
+	    "    {\n"
+	    "        int x = 5;\n"
+	    "        if (x > 3) return x;\n"
+	    "    }\n"
+	    "    return 0;\n"
+	    "}\n"
+	    "int main(void) { test(); return 0; }\n";
+
+	PrismResult r2 = prism_transpile_source(code2, "dunder_typeof_shadow.c", prism_defaults());
+	CHECK(r2.status != PRISM_OK,
+	      "__typeof__(x) in defer must not blind shadow detection for 'x'");
+	prism_free(&r2);
+}
+
+// Bug: check_enum_typedef_defer_shadow's comma-scan loop inside enum body
+// does not skip over balanced groups (parens). An enum constant with a
+// complex initializer like STATE_A = (0, x) has a comma inside parens;
+// the scanner stops at that inner comma, then the next iteration picks up
+// the identifier 'x' as if it were a new enum constant name, causing a
+// false-positive defer shadow error.
+static void test_defer_enum_initializer_comma(void) {
+	printf("\n--- Enum Initializer Comma ---\n");
+
+	// x appears inside enum initializer parens, NOT as an enum constant name
+	const char *code =
+	    "int test(void) {\n"
+	    "    int x = 10;\n"
+	    "    defer { (void)x; }\n"
+	    "    {\n"
+	    "        enum {\n"
+	    "            HW_INIT = (0, 1),\n"
+	    "            HW_READY\n"
+	    "        };\n"
+	    "        return HW_READY;\n"
+	    "    }\n"
+	    "}\n"
+	    "int main(void) { return test(); }\n";
+
+	PrismResult r = prism_transpile_source(code, "enum_comma.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "enum initializer with comma in parens must not hallucinate shadow");
+	prism_free(&r);
+
+	// Harder case: identifier inside parens matches the deferred variable
+	const char *code2 =
+	    "int test(void) {\n"
+	    "    int x = 10;\n"
+	    "    defer { (void)x; }\n"
+	    "    {\n"
+	    "        enum {\n"
+	    "            HW_INIT = (0, x),\n"
+	    "            HW_READY\n"
+	    "        };\n"
+	    "        return HW_READY;\n"
+	    "    }\n"
+	    "}\n"
+	    "int main(void) { return test(); }\n";
+
+	PrismResult r2 = prism_transpile_source(code2, "enum_comma2.c", prism_defaults());
+	CHECK_EQ(r2.status, PRISM_OK,
+	         "identifier inside enum initializer parens must not trigger false shadow");
+	prism_free(&r2);
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -3064,4 +3168,10 @@ void run_defer_tests(void) {
 
 	// Audit round 33: empty statement / label between blocks defeats stmt-expr defer check
 	test_defer_stmt_expr_empty_stmt_bypass();
+
+	// Audit round 34: typeof(x) inside nested defer block poisons shadow detection
+	test_defer_typeof_shadow_bypass();
+
+	// Audit round 35: enum initializer with parens-wrapped comma hallucinates shadow
+	test_defer_enum_initializer_comma();
 }

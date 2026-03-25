@@ -1139,7 +1139,8 @@ static void check_defer_var_shadow(Token *var_name) {
 				if (brace_depth > 1 && decl_depth >= 0 && brace_depth >= decl_depth)
 					continue;
 				// Name appears in a declaration context (after type keyword / comma)
-				if (brace_depth > 1 && in_decl) {
+				// but NOT inside parens (typeof/sizeof/cast argument is not a decl target)
+				if (brace_depth > 1 && in_decl && paren_depth == 0) {
 					decl_depth = brace_depth;
 					continue;
 				}
@@ -1179,9 +1180,15 @@ static void check_enum_typedef_defer_shadow(Token *tok) {
 		while (t && t != end && t->kind != TK_EOF) {
 			if (t->kind == TK_IDENT || t->kind == TK_KEYWORD) {
 				check_defer_var_shadow(t);
-				// skip to next comma or end
-				while (t && t != end && t->kind != TK_EOF && !match_ch(t, ','))
+				// skip to next comma or end (skip balanced groups so commas
+				// inside initializer parens don't split prematurely)
+				while (t && t != end && t->kind != TK_EOF && !match_ch(t, ',')) {
+					if (t->flags & TF_OPEN) {
+						t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t);
+						continue;
+					}
 					t = tok_next(t);
+				}
 				if (t && match_ch(t, ',')) t = tok_next(t);
 			} else {
 				t = tok_next(t);
@@ -2746,6 +2753,24 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 	return r;
 }
 
+// Emit noise tokens (attributes, prep dirs) interleaved between consecutive raw keywords.
+// Walks from tok_next(first_raw) up to last_raw (exclusive), emitting non-TF_RAW tokens.
+static void emit_noise_between_raws(Token *first_raw, Token *last_raw) {
+	if (first_raw == last_raw) return;
+	for (Token *t = tok_next(first_raw); t && t != last_raw && t->kind != TK_EOF; t = tok_next(t)) {
+		if (t->flags & TF_RAW) continue;
+		if ((t->flags & TF_OPEN) && tok_match(t)) {
+			// Balanced group (C23 attr [[...]], GNU attr((...))): walk & emit
+			Token *m = tok_match(t);
+			for (Token *u = t; u && u != tok_next(m) && u->kind != TK_EOF; u = tok_next(u))
+				emit_tok(u);
+			t = m;
+		} else {
+			emit_tok(t);
+		}
+	}
+}
+
 // Emit first declarator raw, then zero-init subsequent uninitialised declarators.
 static Token *emit_raw_verbatim_to_semicolon(Token *tok) {
 	while (tok && tok->kind != TK_EOF && !match_ch(tok, ';')) {
@@ -3468,6 +3493,7 @@ static Token *try_zero_init_decl(Token *tok) {
 				last_raw = after_raw;
 				after_raw = skip_noise(tok_next(after_raw));
 			}
+			emit_noise_between_raws(tok, last_raw);
 			start = tok_next(last_raw);
 			tok = after_raw;
 			if (pragma_start == raw_tok) pragma_start = start;
@@ -3495,11 +3521,13 @@ static Token *try_zero_init_decl(Token *tok) {
 					after_raw = skip_noise(tok_next(after_raw));
 				}
 				if (has_storage_in(pragma_start, last_raw)) {
-					emit_range(pragma_start, last_raw);
+					emit_range(pragma_start, probe);
+					emit_noise_between_raws(probe, last_raw);
 					return emit_raw_verbatim_to_semicolon(tok_next(last_raw));
 				}
 				is_raw = true;
 				raw_tok = probe;
+				emit_noise_between_raws(probe, last_raw);
 				start = tok_next(last_raw);
 				tok = after_raw;
 			}
@@ -5005,7 +5033,7 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 				if (s->flags & TF_OPEN) sd++;
 				else if (s->flags & TF_CLOSE) sd--;
 				else if (sd == 0 && BARE_IS_END(s)) break;
-				if (match_ch(s, '{')) { fallback_has_compound_literal = true; break; }
+				if (sd == 0 && match_ch(s, '{')) { fallback_has_compound_literal = true; break; }
 			}
 		}
 
@@ -6554,9 +6582,16 @@ static void cfg_check_range(P1FuncEntry *ents,
 				if (close > 0 && close < label->token_index) continue;
 			}
 			if ((!d->decl.has_raw && !d->decl.is_static_storage) || d->decl.is_vla) {
-				bad_decl = d->tok;
-				bad_decl_is_vla = d->decl.is_vla;
-				break;
+				if (d->decl.is_vla) {
+					bad_decl = d->tok;
+					bad_decl_is_vla = true;
+					break; // VLA is always a hard error; no need to scan further
+				}
+				if (!bad_decl) {
+					bad_decl = d->tok;
+					bad_decl_is_vla = false;
+				}
+				// Continue scanning — a later VLA must not be masked by a scalar
 			}
 		}
 	}

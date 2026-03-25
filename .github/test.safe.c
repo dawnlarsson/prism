@@ -3355,6 +3355,28 @@ static void test_bracket_orelse_ctrlflow_pass1_error(void) {
 	prism_free(&r);
 }
 
+// Bug: If goto skips over a scalar variable AND a VLA, the verifier loop
+// breaks on the scalar (first match). Under -fno-safety the scalar is just a
+// warning, and the VLA hard error is completely masked.
+static void test_vla_masked_by_scalar_fno_safety(void) {
+	printf("\n--- VLA Masked By Scalar Under -fno-safety ---\n");
+
+	const char *code =
+	    "void f(int n) {\n"
+	    "    goto skip;\n"
+	    "    int x = 42;\n"
+	    "    int vla[n];\n"
+	    "    skip: (void)0;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	feat.warn_safety = true;
+	PrismResult r = prism_transpile_source(code, "vla_masked.c", feat);
+	CHECK(r.status != PRISM_OK,
+	      "scalar+VLA skip: VLA must still be hard error under -fno-safety");
+	prism_free(&r);
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -3620,4 +3642,7 @@ void run_safe_tests(void) {
 
 	// Audit round 29: bracket orelse control flow - Pass 1 error timing
 	test_bracket_orelse_ctrlflow_pass1_error();
+
+	// Audit round 34: scalar before VLA masks VLA hard error under -fno-safety
+	test_vla_masked_by_scalar_fno_safety();
 }
