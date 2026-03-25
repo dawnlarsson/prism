@@ -1149,6 +1149,46 @@ static void test_raw_consecutive_attr_preserved(void) {
 	prism_free(&r2);
 }
 
+// Audit round 38: The struct body regression.
+// try_zero_init_decl bails out inside struct bodies, so raw keywords fall
+// through to the main loop catch-all.  The catch-all's while loop only
+// advances on TF_RAW tokens, so interleaved attributes (between consecutive
+// raws) cause the second raw to NOT be consumed — it leaks into C output.
+// The fix applied in round 34 (emit_noise_between_raws) was only added to
+// try_zero_init_decl, not to the catch-all handler.
+static void test_raw_consecutive_attr_struct_body(void) {
+	printf("\n--- raw consecutive attr in struct body (audit round 38) ---\n");
+
+	// GNU __attribute__ between consecutive raw keywords inside struct
+	const char *code1 =
+	    "struct S { raw __attribute__((cold)) raw int x; };\n";
+	PrismResult r1 = prism_transpile_source(code1, "struct_attr_gnu.c", prism_defaults());
+	CHECK_EQ(r1.status, PRISM_OK, "raw-struct-attr-gnu: transpile succeeds");
+	if (r1.output) {
+		CHECK(strstr(r1.output, "__attribute__") != NULL,
+		      "raw-struct-attr-gnu: attribute must be preserved");
+		// Look for ' raw ' with word boundaries to avoid matching filenames
+		const char *line = strstr(r1.output, "struct S");
+		CHECK(line == NULL || strstr(line, " raw ") == NULL,
+		      "raw-struct-attr-gnu: raw keyword must not leak into C output");
+	}
+	prism_free(&r1);
+
+	// C23 [[...]] attribute between consecutive raw keywords inside struct
+	const char *code2 =
+	    "struct S { raw [[deprecated]] raw int x; };\n";
+	PrismResult r2 = prism_transpile_source(code2, "struct_attr_c23.c", prism_defaults());
+	CHECK_EQ(r2.status, PRISM_OK, "raw-struct-attr-c23: transpile succeeds");
+	if (r2.output) {
+		CHECK(strstr(r2.output, "deprecated") != NULL,
+		      "raw-struct-attr-c23: [[deprecated]] must be preserved");
+		const char *line2 = strstr(r2.output, "struct S");
+		CHECK(line2 == NULL || strstr(line2, " raw ") == NULL,
+		      "raw-struct-attr-c23: raw keyword must not leak into C output");
+	}
+	prism_free(&r2);
+}
+
 void run_raw_tests(void) {
 	printf("\n=== RAW KEYWORD TESTS ===\n");
 
@@ -1263,4 +1303,7 @@ void run_raw_tests(void) {
 
 	// Audit round 34: consecutive raw with interleaved attributes must preserve attrs
 	test_raw_consecutive_attr_preserved();
+
+	// Audit round 38: consecutive raw with interleaved attrs in struct body
+	test_raw_consecutive_attr_struct_body();
 }

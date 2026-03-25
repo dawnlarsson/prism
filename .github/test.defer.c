@@ -2981,6 +2981,35 @@ static void test_defer_enum_initializer_comma(void) {
 	prism_free(&r2);
 }
 
+// Audit round 38: double-nested block defer in stmt-expr bypasses detection.
+// The check at handle_close_brace only looks at scope_depth-2 for is_stmt_expr.
+// A double-nested block places the stmt_expr scope at depth-3, so the check
+// doesn't fire.  The defer cleanup call (void) becomes the last expression in
+// the statement expression → "void value not ignored as it ought to be".
+static void test_defer_stmt_expr_double_nested_block_bypass(void) {
+	printf("\n--- defer stmt-expr double-nested block bypass (audit round 38) ---\n");
+
+	const char *code =
+	    "void cleanup(void);\n"
+	    "int work(void);\n"
+	    "int f(void) {\n"
+	    "    return ({\n"
+	    "        int y = 1;\n"
+	    "        {\n"
+	    "            {\n"
+	    "                defer cleanup();\n"
+	    "                y = work();\n"
+	    "            }\n"
+	    "        }\n"
+	    "    });\n"
+	    "}\n";
+	check_defer_transpile_rejects(
+	    code,
+	    "defer_stmt_expr_double_nested.c",
+	    "defer in double-nested block that is last stmt of stmt_expr must be rejected",
+	    "statement expression");
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -3174,4 +3203,7 @@ void run_defer_tests(void) {
 
 	// Audit round 35: enum initializer with parens-wrapped comma hallucinates shadow
 	test_defer_enum_initializer_comma();
+
+	// Audit round 38: double-nested block in stmt-expr bypasses scope_depth-2 check
+	test_defer_stmt_expr_double_nested_block_bypass();
 }

@@ -443,6 +443,7 @@ static Token *find_bare_orelse(Token *tok);
 static Token *decl_noise(Token *tok, bool emit);
 static Token *walk_balanced(Token *tok, bool emit);
 static Token *walk_balanced_orelse(Token *tok);
+static void emit_noise_between_raws(Token *first_raw, Token *last_raw);
 #define skip_noise(tok) decl_noise(tok, false)
 static inline void out_char(char c);
 static inline void out_str(const char *s, int len);
@@ -2331,7 +2332,13 @@ static Token *walk_balanced(Token *tok, bool emit) {
 					if (__builtin_expect((inner->flags & TF_RAW) && !is_known_typedef(inner), 0)) {
 						Token *after_raw = skip_noise(tok_next(inner));
 						if (is_raw_declaration_context(after_raw)) {
-							inner = tok_next(inner);
+							Token *last_raw = inner;
+							while (after_raw && (after_raw->flags & TF_RAW) && !is_known_typedef(after_raw)) {
+								last_raw = after_raw;
+								after_raw = skip_noise(tok_next(after_raw));
+							}
+							emit_noise_between_raws(inner, last_raw);
+							inner = tok_next(last_raw);
 							continue;
 						}
 					}
@@ -4214,37 +4221,43 @@ static Token *handle_close_brace(Token *tok) {
 			// error; int for counter++ → silent wrong-value assignment).
 			// Without an expression parser we cannot safely capture the
 			// last expression into a temp, so reject unconditionally.
-			// Detection: parent scope is is_stmt_expr AND the effective
-			// next structural token after this '}' is '}' (stmt_expr
-			// close). Skip past empty statements (';') and labels
-			// ('ident:') which otherwise defeat the detection.
-			if (ctx->scope_depth >= 2 &&
-			    scope_stack[ctx->scope_depth - 2].is_stmt_expr) {
+			// Detection: walk up the scope stack to find any ancestor
+			// stmt_expr.  At each level, verify the next structural
+			// token after the current '}' is another '}' (possibly
+			// separated by empty stmts ';' and labels 'id:'), forming
+			// a chain of closing braces up to the stmt_expr scope.
+			{
 				Token *nxt = skip_noise(tok_next(tok));
-				// Walk past empty stmts and labels to find the real next block-level token
-				while (nxt) {
-					if (match_ch(nxt, ';')) {
-						nxt = skip_noise(tok_next(nxt));
-						continue;
-					}
-					// Label: "ident :" — skip both tokens
-					if (nxt->kind == TK_IDENT || nxt->kind == TK_KEYWORD) {
-						Token *after = skip_noise(tok_next(nxt));
-						if (after && match_ch(after, ':')) {
-							nxt = skip_noise(tok_next(after));
+				for (int depth = ctx->scope_depth - 2; depth >= 0; depth--) {
+					// Walk past empty stmts and labels to find the real next block-level token
+					Token *probe = nxt;
+					while (probe) {
+						if (match_ch(probe, ';')) {
+							probe = skip_noise(tok_next(probe));
 							continue;
 						}
+						if (probe->kind == TK_IDENT || probe->kind == TK_KEYWORD) {
+							Token *after = skip_noise(tok_next(probe));
+							if (after && match_ch(after, ':')) {
+								probe = skip_noise(tok_next(after));
+								continue;
+							}
+						}
+						break;
 					}
-					break;
+					if (!probe || !match_ch(probe, '}'))
+						break; // not a chain of closing braces
+					if (scope_stack[depth].is_stmt_expr)
+						error_tok(defer_stack[s->defer_start_idx].defer_kw,
+							  "defer inside a block that is the last "
+							  "statement of a statement expression "
+							  "would corrupt the expression's return "
+							  "value; ensure the last statement of the "
+							  "statement expression is outside the "
+							  "defer block");
+					// Continue upward: the next '}' closes scope_stack[depth]
+					nxt = skip_noise(tok_next(probe));
 				}
-				if (nxt && match_ch(nxt, '}'))
-					error_tok(defer_stack[s->defer_start_idx].defer_kw,
-						  "defer inside a block that is the last "
-						  "statement of a statement expression "
-						  "would corrupt the expression's return "
-						  "value; ensure the last statement of the "
-						  "statement expression is outside the "
-						  "defer block");
 			}
 			emit_defers(DEFER_SCOPE);
 			defer_count = s->defer_start_idx;
@@ -5283,7 +5296,13 @@ static void emit_deferred_range(Token *start, Token *end) {
 		if (__builtin_expect((t->flags & TF_RAW) && !is_known_typedef(t), 0)) {
 			Token *after_raw = skip_noise(tok_next(t));
 			if (is_raw_declaration_context(after_raw)) {
-				t = tok_next(t);
+				Token *last_raw = t;
+				while (after_raw && (after_raw->flags & TF_RAW) && !is_known_typedef(after_raw)) {
+					last_raw = after_raw;
+					after_raw = skip_noise(tok_next(after_raw));
+				}
+				emit_noise_between_raws(t, last_raw);
+				t = tok_next(last_raw);
 				continue;
 			}
 		}
@@ -5722,6 +5741,9 @@ static void p1_full_depth_prescan(Token *tok) {
 		// == Phase 1G inline: classify bracket orelse ==
 		if (FEAT(F_ORELSE) && match_ch(tok, '[') && tok_match(tok)) {
 			Token *close = tok_match(tok);
+			uint16_t bo_sid = scope_depth_local < 4096 ?
+				scope_stack_local[scope_depth_local] : 0;
+			bool in_struct = bo_sid > 0 && bo_sid < scope_tree_count && scope_tree[bo_sid].is_struct;
 			for (Token *s = tok_next(tok); s && s != close && s->kind != TK_EOF; s = tok_next(s)) {
 				if (s->flags & TF_OPEN) {
 					// Also annotate orelse inside a single '(' covering the whole bracket.
@@ -5734,6 +5756,10 @@ static void p1_full_depth_prescan(Token *tok) {
 									if (p1d_cur_func < 0)
 										error_tok(p, "orelse inside array dimension at file scope is not allowed "
 											       "(cannot hoist temporary variable outside a function body)");
+									if (in_struct)
+										error_tok(p, "orelse inside array dimension in a struct/union body "
+											       "cannot be transformed (statement expressions are not "
+											       "allowed in struct/union definitions)");
 									Token *act = tok_next(p);
 									if (act && (act->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)))
 										error_tok(p, "'orelse' with control flow cannot be used inside "
@@ -5752,6 +5778,10 @@ static void p1_full_depth_prescan(Token *tok) {
 					if (p1d_cur_func < 0)
 						error_tok(s, "orelse inside array dimension at file scope is not allowed "
 							  "(cannot hoist temporary variable outside a function body)");
+					if (in_struct)
+						error_tok(s, "orelse inside array dimension in a struct/union body "
+							  "cannot be transformed (statement expressions are not "
+							  "allowed in struct/union definitions)");
 					Token *act = tok_next(s);
 					if (act && (act->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)))
 						error_tok(s, "'orelse' with control flow cannot be used inside "
@@ -7251,9 +7281,15 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		if (__builtin_expect((tok->flags & TF_RAW) && !is_known_typedef(tok), 0)) {
 			Token *after_raw = skip_noise(tok_next(tok));
 			if (is_raw_declaration_context(after_raw)) {
-				tok = tok_next(tok);
-				while (tok && (tok->flags & TF_RAW) && !is_known_typedef(tok))
-					tok = tok_next(tok);
+				// Walk consecutive raw keywords, emit interleaved noise
+				// (attributes, prep dirs) between them.
+				Token *last_raw = tok;
+				while (after_raw && (after_raw->flags & TF_RAW) && !is_known_typedef(after_raw)) {
+					last_raw = after_raw;
+					after_raw = skip_noise(tok_next(after_raw));
+				}
+				emit_noise_between_raws(tok, last_raw);
+				tok = tok_next(last_raw);
 				continue;
 			}
 		}

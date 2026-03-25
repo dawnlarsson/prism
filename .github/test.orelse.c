@@ -3830,6 +3830,34 @@ static void test_const_fallback_bracket_orelse_leak(void) {
 	prism_free(&r);
 }
 
+// Audit round 38: bracket orelse inside local struct array dimension.
+// p1d_cur_func >= 0 lets Phase 1G allow the orelse, but try_zero_init_decl
+// bails in struct bodies → the catch-all routes to walk_balanced_orelse which
+// falls back to a GNU statement expression ({ __auto_type ... }) inside the
+// array dimension.  Clang rejects VLA in struct fields entirely; GCC accepts
+// the extension but the generated __auto_type-in-struct-dim is non-portable
+// and inconsistent with the existing typeof-orelse-in-struct rejection.
+// Prism should emit a clean error, just like for typeof orelse in struct bodies.
+static void test_bracket_orelse_local_struct_rejected(void) {
+	printf("\n--- bracket orelse in local struct array dim (audit round 38) ---\n");
+
+	const char *code =
+	    "extern int n;\n"
+	    "void foo(void) {\n"
+	    "    struct S {\n"
+	    "        int arr[n orelse 1];\n"
+	    "    };\n"
+	    "    struct S s;\n"
+	    "    (void)s;\n"
+	    "}\n";
+
+	check_orelse_transpile_rejects(
+	    code,
+	    "bracket_orelse_local_struct.c",
+	    "bracket orelse in local struct array dim must be rejected",
+	    "struct");
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -4085,4 +4113,7 @@ void run_orelse_tests(void) {
 
 	// Audit round 35b: const-fallback must not leak raw orelse in bracket dimensions
 	test_const_fallback_bracket_orelse_leak();
+
+	// Audit round 38: bracket orelse in local struct array dim must be rejected
+	test_bracket_orelse_local_struct_rejected();
 }
