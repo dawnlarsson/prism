@@ -3255,7 +3255,6 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			if (target.stop_comma && match_ch(tok, ',')) {
 				tok = tok_next(tok);
 				need_type_emit = true;
-				is_raw = false;
 				continue;
 			}
 			if (brace_wrap) OUT_LIT(" }");
@@ -3353,7 +3352,6 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 				if (target.stop_comma && match_ch(tok, ',')) {
 					tok = tok_next(tok);
 					need_type_emit = true;
-					is_raw = false;
 					continue;
 				}
 				if (brace_wrap) OUT_LIT(" }");
@@ -3393,13 +3391,11 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 				flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type);
 				tok = next_decl_tok;
 				need_type_emit = true;
-				is_raw = false;
 				continue;
 			}
 
 			emit_tok(tok);
 			tok = next_decl_tok;
-			is_raw = false; // raw applies to first declarator only
 		} else {
 			if (!first_decl) goto emit_raw_bail;
 			return NULL;
@@ -4155,11 +4151,29 @@ static Token *handle_close_brace(Token *tok) {
 			// error; int for counter++ → silent wrong-value assignment).
 			// Without an expression parser we cannot safely capture the
 			// last expression into a temp, so reject unconditionally.
-			// Detection: parent scope is is_stmt_expr AND the next
-			// non-noise token after this '}' is '}' (stmt_expr close).
+			// Detection: parent scope is is_stmt_expr AND the effective
+			// next structural token after this '}' is '}' (stmt_expr
+			// close). Skip past empty statements (';') and labels
+			// ('ident:') which otherwise defeat the detection.
 			if (ctx->scope_depth >= 2 &&
 			    scope_stack[ctx->scope_depth - 2].is_stmt_expr) {
 				Token *nxt = skip_noise(tok_next(tok));
+				// Walk past empty stmts and labels to find the real next block-level token
+				while (nxt) {
+					if (match_ch(nxt, ';')) {
+						nxt = skip_noise(tok_next(nxt));
+						continue;
+					}
+					// Label: "ident :" — skip both tokens
+					if (nxt->kind == TK_IDENT || nxt->kind == TK_KEYWORD) {
+						Token *after = skip_noise(tok_next(nxt));
+						if (after && match_ch(after, ':')) {
+							nxt = skip_noise(tok_next(after));
+							continue;
+						}
+					}
+					break;
+				}
 				if (nxt && match_ch(nxt, '}'))
 					error_tok(defer_stack[s->defer_start_idx].defer_kw,
 						  "defer inside a block that is the last "
@@ -5027,29 +5041,38 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 			}
 			OUT_LIT("));");
 		} else {
-			// If-based (volatile-safe): assignment-result check avoids re-reading LHS.
-			// Single:    { if (!(LHS = RHS)) LHS = (fb); }
-			// Chain N=2: { if (!(LHS = RHS)) if (!(LHS = (fb1))) LHS = (fb2); }
-			// The C assignment expression `LHS = x` yields x's value without a
-			// re-read of LHS, making this safe for volatile pointer-dereference
-			// targets such as MMIO registers (*uart_tx = get_byte() orelse 0xFF).
-			// Intermediate chain links are each wrapped in an additional if-condition
-			// so that only the first truthy result is used (the if nesting avoids
-			// evaluating subsequent links when an earlier one succeeds).
-			OUT_LIT("{");
-			OUT_LIT(" if (!(");
-			for (Token *s = bare_lhs_start; s != orelse_tok; s = tok_next(s)) {
+			// Temp-based (volatile-safe, single-write): evaluate RHS into a temp,
+			// apply fallback chain to the temp, write LHS exactly once.
+			// Single:    { __typeof__(RHS) __prism_oe_N = (RHS); if (!__prism_oe_N) __prism_oe_N = (fb); LHS = __prism_oe_N; }
+			// Chain N=2: { __typeof__(RHS) __prism_oe_N = (RHS); if (!__prism_oe_N) { __prism_oe_N = (fb1); if (!__prism_oe_N) __prism_oe_N = (fb2); } LHS = __prism_oe_N; }
+			// This guarantees LHS is written exactly once, preventing double-write
+			// to volatile MMIO registers.
+			unsigned oe_id = ctx->ret_counter++;
+			OUT_LIT("{ __typeof__(");
+			// Emit RHS tokens for typeof
+			for (Token *s = tok_next(bare_assign_eq); s != orelse_tok; s = tok_next(s)) {
 				if (s->kind == TK_PREP_DIR) continue;
 				emit_tok(s);
 			}
-			OUT_LIT("))");
+			OUT_LIT(") __prism_oe_");
+			out_uint(oe_id);
+			OUT_LIT(" = (");
+			// Emit RHS tokens for initialization
+			for (Token *s = tok_next(bare_assign_eq); s != orelse_tok; s = tok_next(s)) {
+				if (s->kind == TK_PREP_DIR) continue;
+				emit_tok(s);
+			}
+			OUT_LIT("); if (!__prism_oe_");
+			out_uint(oe_id);
+			OUT_LIT(")");
 			t = after_orelse;
 			int fd = 0;
 			while (true) {
 				bool is_last = !orelse_has_chain(t, comma_term);
 				if (is_last) {
-					// Final (or only) fallback: unconditional assignment.
-					emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+					// Final (or only) fallback: assign to temp.
+					OUT_LIT(" __prism_oe_");
+					out_uint(oe_id);
 					OUT_LIT(" = (");
 					fd = 0;
 					while (t->kind != TK_EOF) {
@@ -5058,14 +5081,12 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 						else if (fd == 0 && BARE_IS_END(t)) break;
 						emit_tok(t); t = tok_next(t);
 					}
-					OUT_LIT("); }");
+					OUT_LIT(");");
 					break;
 				}
-				// Intermediate: nest the fallback as the condition of another if,
-				// so the next link executes only when this one yields a falsy value.
-				// Emits: if (!(LHS = (fb_i))) — 3 closing ')' at end.
-				OUT_LIT(" if (!(");
-				emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+				// Intermediate: nest inside if for chain.
+				OUT_LIT(" { __prism_oe_");
+				out_uint(oe_id);
 				OUT_LIT(" = (");
 				fd = 0;
 				while (t->kind != TK_EOF) {
@@ -5078,8 +5099,30 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 					}
 					emit_tok(t); t = tok_next(t);
 				}
-				OUT_LIT(")))"); // close (fb_i), !(...), and if(
+				OUT_LIT("); if (!__prism_oe_");
+				out_uint(oe_id);
+				OUT_LIT(")");
 			}
+			// Close any intermediate chain braces
+			// (each intermediate adds one '{')
+			{
+				Token *scan = after_orelse;
+				int fds = 0;
+				while (scan && scan != t) {
+					if (scan->flags & TF_OPEN) fds++;
+					else if (scan->flags & TF_CLOSE) fds--;
+					if (fds == 0 && is_orelse_keyword(scan) && scan != orelse_tok) {
+						OUT_LIT(" }");
+					}
+					scan = tok_next(scan);
+				}
+			}
+			// Write LHS exactly once
+			OUT_LIT(" ");
+			emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+			OUT_LIT(" = __prism_oe_");
+			out_uint(oe_id);
+			OUT_LIT("; }");
 		}
 		if (match_ch(t, ';') || (comma_term && match_ch(t, ','))) t = tok_next(t);
 	#undef BARE_IS_END
@@ -6406,7 +6449,7 @@ uint16_t sid = next_scope_id++;
 							t = tok_next(t);
 						}
 					}
-					if (t && match_ch(t, ',')) { p1d_saw_raw = false; t = tok_next(t); } else break;
+					if (t && match_ch(t, ',')) { t = tok_next(t); } else break;
 				}
 			}
 		}

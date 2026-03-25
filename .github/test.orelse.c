@@ -2680,9 +2680,11 @@ static void test_bare_orelse_emit_range_prep_dir_leak(void) {
 		      "bare-orelse-emit-range-prep-dir-leak: old read-back form "
 		      "if (!arr[0]) must not appear");
 
-		// Verify the new assignment-in-condition form is present.
-		int has_if_assign = (strstr(r.output, "if (!(") != NULL);
-		CHECK(has_if_assign,
+		// Verify volatile-safe form: either the temp-based pattern (__prism_oe_)
+		// or the assignment-in-condition form (if (!().
+		int has_safe_form = (strstr(r.output, "__prism_oe_") != NULL ||
+		                     strstr(r.output, "if (!(") != NULL);
+		CHECK(has_safe_form,
 		      "bare-orelse-emit-range-prep-dir-leak: preprocessor "
 		      "directive leaked into if-condition via emit_range");
 	}
@@ -3711,6 +3713,41 @@ static void test_paren_wrapped_decl_orelse(void) {
 	prism_free(&r);
 }
 
+// Bug: bare orelse with volatile pointer dereference on LHS emits double-write.
+// *uart_tx = get_byte() orelse 0xFF  emits:
+//   { if (!(*uart_tx = get_byte())) *uart_tx = (0xFF); }
+// When get_byte() returns 0, this writes 0 then 0xFF to *uart_tx. For MMIO
+// registers, each write triggers hardware state machines — double-write is fatal.
+// The correct output must evaluate the RHS into a temp and write LHS exactly once.
+static void test_bare_orelse_volatile_double_write(void) {
+	printf("\n--- Bare orelse volatile double-write ---\n");
+
+	const char *code =
+	    "volatile int *uart_tx;\n"
+	    "int get_byte(void);\n"
+	    "void test(void) {\n"
+	    "    *uart_tx = get_byte() orelse 0xFF;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "volatile_double_write.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "volatile-double-write: transpile succeeds");
+	if (r.output) {
+		// The output must NOT assign to *uart_tx more than once.
+		// Count occurrences of "*uart_tx =" (the double-write pattern).
+		// The buggy output is: if (!(*uart_tx = get_byte())) *uart_tx = (0xFF);
+		// which has TWO writes to the volatile pointer dereference.
+		int write_count = 0;
+		const char *p = r.output;
+		while ((p = strstr(p, "*uart_tx =")) != NULL) { write_count++; p += 10; }
+		// Also check the newline variant
+		p = r.output;
+		while ((p = strstr(p, "*uart_tx=")) != NULL) { write_count++; p += 9; }
+		CHECK(write_count <= 1,
+		      "volatile-double-write: must not write to volatile LHS more than "
+		      "once (MMIO double-write is a hardware-killing pattern)");
+	}
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -3954,4 +3991,7 @@ void run_orelse_tests(void) {
 
 	// Audit round 31: paren-wrapped orelse in declaration initializers
 	test_paren_wrapped_decl_orelse();
+
+	// Audit round 33: bare orelse volatile double-write (MMIO-killing)
+	test_bare_orelse_volatile_double_write();
 }

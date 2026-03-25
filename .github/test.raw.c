@@ -829,8 +829,8 @@ static void test_raw_multi_declarator_second_var_uninitialized(void) {
 	                  strstr(result.output, "y = {0}") != NULL;
 
 	CHECK(!x_has_init, "raw multi-decl: x is raw (no init) as expected");
-	CHECK(y_has_init,
-	      "raw multi-decl: y should be zero-initialized (raw should bind per-variable, not per-declaration)");
+	CHECK(!y_has_init,
+	      "raw multi-decl: y is also raw (raw applies to entire declarator list)");
 
 	prism_free(&result);
 	unlink(path);
@@ -931,9 +931,9 @@ static void test_raw_static_multi_decl_consistency(void) {
 	// extern: no = 0 (would turn declaration into definition — linker bomb)
 	CHECK(strstr(result.output, "extern int a, b;") != NULL,
 	      "raw extern multi-decl: extern has no = 0 (would be linker bomb)");
-	// local: d gets = 0 (automatic storage needs explicit zero-init)
-	CHECK(strstr(result.output, "d = 0") != NULL,
-	      "raw local multi-decl: local d gets = 0 (automatic storage)");
+	// local: both c and d are raw (no = 0)
+	CHECK(strstr(result.output, "c = 0") == NULL && strstr(result.output, "d = 0") == NULL,
+	      "raw local multi-decl: raw applies to all locals (no = 0)");
 
 	prism_free(&result);
 	unlink(path);
@@ -1022,11 +1022,13 @@ static void test_raw_multi_decl_array_aggregate(void) {
 	CHECK_EQ(result.status, PRISM_OK, "raw array aggregate: transpiles OK");
 	CHECK(result.output != NULL, "raw array aggregate: output not NULL");
 
-	// Arrays must get = {0}, not = 0 (which is invalid C for arrays)
-	CHECK(strstr(result.output, "y[5] = {0}") != NULL,
-	      "raw array aggregate: y[5] = {0} (not = 0)");
-	CHECK(strstr(result.output, "b[3] = {0}") != NULL,
-	      "raw array aggregate: b[3] = {0} (not = 0)");
+	// With raw applying to all declarators, y[5] and b[3] should NOT get zeroinit
+	CHECK(strstr(result.output, "y[5] = {0}") == NULL &&
+	      strstr(result.output, "y[5] ={0}") == NULL,
+	      "raw array aggregate: y[5] must NOT have = {0} (raw applies to all)");
+	CHECK(strstr(result.output, "b[3] = {0}") == NULL &&
+	      strstr(result.output, "b[3] ={0}") == NULL,
+	      "raw array aggregate: b[3] must NOT have = {0} (raw applies to all)");
 
 	prism_free(&result);
 	unlink(path);
@@ -1049,13 +1051,13 @@ static void test_raw_multi_decl_vla_memset(void) {
 	CHECK_EQ(result.status, PRISM_OK, "raw vla memset: transpiles OK");
 	CHECK(result.output != NULL, "raw vla memset: output not NULL");
 
-	// VLAs cannot be initialized with = {0}; they must get memset.
+	// With raw applying to all declarators, vla[n] should NOT get zeroinit
 	CHECK(strstr(result.output, "vla[n] = {0}") == NULL,
-	      "raw vla memset: no = {0} on VLA (constraint violation)");
+	      "raw vla memset: no = {0} on VLA (raw applies to all)");
 	CHECK(strstr(result.output, "vla[n] = 0") == NULL,
-	      "raw vla memset: no = 0 on VLA");
-	CHECK(strstr(result.output, "memset") != NULL,
-	      "raw vla memset: uses memset for VLA zero-init");
+	      "raw vla memset: no = 0 on VLA (raw applies to all)");
+	CHECK(strstr(result.output, "memset") == NULL,
+	      "raw vla memset: no memset on VLA (raw applies to all)");
 
 	prism_free(&result);
 	unlink(path);
@@ -1081,6 +1083,33 @@ static void test_raw_storage_class_leak(void) {
 	      "raw-storage-leak: 'raw' keyword must be stripped from output (leaked with extern/inline)");
 	CHECK(strstr(r.output, "extern int global_counter") != NULL,
 	      "raw-storage-leak: extern declaration preserved");
+	prism_free(&r);
+}
+
+// Bug: `raw int a, b, c;` only applies raw to the first declarator (a).
+// b and c get zero-initialized despite the raw prefix, because Pass 1
+// resets p1d_saw_raw on commas and Pass 2 resets is_raw after the first
+// declarator. In C, prefix keywords (const, static, extern) apply to the
+// entire declarator list. raw should behave the same way.
+static void test_raw_comma_list_all_declarators(void) {
+	printf("\n--- raw comma-list applies to all declarators ---\n");
+
+	const char *code =
+	    "void test(void) {\n"
+	    "    raw int a, b, c;\n"
+	    "    (void)a; (void)b; (void)c;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "raw_comma_list.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "raw-comma-list: transpile succeeds");
+	if (r.output) {
+		// None of a, b, c should be zero-initialized
+		CHECK(strstr(r.output, "b = 0") == NULL && strstr(r.output, "b ={0}") == NULL &&
+		      strstr(r.output, "b= 0") == NULL,
+		      "raw-comma-list: b must not be zero-initialized");
+		CHECK(strstr(r.output, "c = 0") == NULL && strstr(r.output, "c ={0}") == NULL &&
+		      strstr(r.output, "c= 0") == NULL,
+		      "raw-comma-list: c must not be zero-initialized");
+	}
 	prism_free(&r);
 }
 
@@ -1192,4 +1221,7 @@ void run_raw_tests(void) {
 
 	// Audit round 29: raw leaks on extern, inline, typedef, _Thread_local
 	test_raw_storage_class_leak();
+
+	// Audit round 33: raw must apply to all declarators in comma-list
+	test_raw_comma_list_all_declarators();
 }

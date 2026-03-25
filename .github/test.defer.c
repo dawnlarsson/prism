@@ -2795,6 +2795,88 @@ static void test_defer_shadow_typedef_bypass(void) {
 	prism_free(&r);
 }
 
+// Bug: The check for "defer at end of stmt-expr" only fires when the next
+// non-noise token after the inner block's closing '}' is the outer '}' of
+// the stmt-expr. An empty statement (;) or label between the two braces
+// defeats the detection. The defer then emits after the last expression in
+// the inner block, overwriting the stmt-expr's return value with the defer's
+// result type (void → compile error, non-void → silent wrong value).
+static void test_defer_stmt_expr_empty_stmt_bypass(void) {
+	printf("\n--- defer stmt-expr empty-statement bypass ---\n");
+
+	// Variant 1: empty statement between inner } and outer }
+	{
+		const char *code =
+		    "void cleanup(void);\n"
+		    "int work(void);\n"
+		    "void test(void) {\n"
+		    "    int x = ({\n"
+		    "        int r = work();\n"
+		    "        { defer cleanup(); r; }\n"
+		    "        ;\n"
+		    "    });\n"
+		    "    (void)x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "stmtexpr_empty_bypass.c", prism_defaults());
+		// Must either reject with error or produce output where cleanup()
+		// does NOT appear after "r;" in the last block (overwriting return value).
+		if (r.status == PRISM_OK && r.output) {
+			// If it compiled, the defer must NOT have been pasted after the
+			// expression r inside the inner block. Search for pattern:
+			// "r; cleanup()" or "r;\ncleanup()" which indicates corruption.
+			char *inner = r.output ? strstr(r.output, "r;") : NULL;
+			bool corrupted = false;
+			if (inner) {
+				// Check if cleanup() follows r; within the same block
+				char *after_r = inner + 2;
+				while (*after_r == ' ' || *after_r == '\n' || *after_r == '\t') after_r++;
+				if (strncmp(after_r, "cleanup()", 9) == 0)
+					corrupted = true;
+			}
+			CHECK(!corrupted,
+			      "stmtexpr-empty-bypass: defer must not paste cleanup() after "
+			      "the return expression (void overwrite corrupts stmt-expr value)");
+		} else {
+			CHECK(r.status != PRISM_OK,
+			      "stmtexpr-empty-bypass: rejection is acceptable");
+		}
+		prism_free(&r);
+	}
+
+	// Variant 2: label between inner } and outer }
+	{
+		const char *code =
+		    "void cleanup(void);\n"
+		    "int work(void);\n"
+		    "void test(void) {\n"
+		    "    int x = ({\n"
+		    "        int r = work();\n"
+		    "        { defer cleanup(); r; }\n"
+		    "    end_expr:\n"
+		    "    });\n"
+		    "    (void)x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "stmtexpr_label_bypass.c", prism_defaults());
+		if (r.status == PRISM_OK && r.output) {
+			char *inner = r.output ? strstr(r.output, "r;") : NULL;
+			bool corrupted = false;
+			if (inner) {
+				char *after_r = inner + 2;
+				while (*after_r == ' ' || *after_r == '\n' || *after_r == '\t') after_r++;
+				if (strncmp(after_r, "cleanup()", 9) == 0)
+					corrupted = true;
+			}
+			CHECK(!corrupted,
+			      "stmtexpr-label-bypass: defer must not paste cleanup() after "
+			      "the return expression (void overwrite corrupts stmt-expr value)");
+		} else {
+			CHECK(r.status != PRISM_OK,
+			      "stmtexpr-label-bypass: rejection is acceptable");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -2979,4 +3061,7 @@ void run_defer_tests(void) {
 	// Audit round 32: enum constant + typedef shadow defer captures
 	test_defer_shadow_enum_bypass();
 	test_defer_shadow_typedef_bypass();
+
+	// Audit round 33: empty statement / label between blocks defeats stmt-expr defer check
+	test_defer_stmt_expr_empty_stmt_bypass();
 }

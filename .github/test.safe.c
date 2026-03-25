@@ -3019,6 +3019,9 @@ static void test_switch_inner_loop_break_no_false_exit(void) {
 // Bug: raw int x, y; — Phase 1D keeps p1d_saw_raw=true for y,
 // but Pass 2 clears is_raw on comma. CFG verifier thinks y is raw
 // (safe to skip) while Pass 2 emits y = 0 (skipped by goto → uninit).
+// UPDATE: raw now applies to ALL declarators in a comma-list (matching
+// const/static/extern behavior), so y IS raw in both passes, and goto
+// skipping it is safe (no zeroinit emitted → no skip violation).
 static void test_raw_comma_desync_goto_bypass(void) {
 	printf("\n--- raw Comma Desync Goto Bypass ---\n");
 
@@ -3030,10 +3033,9 @@ static void test_raw_comma_desync_goto_bypass(void) {
 	    "}\n";
 
 	PrismResult r = prism_transpile_source(code, "raw_comma_desync.c", prism_defaults());
-	// y is NOT raw in Pass 2 — it gets = 0, so goto skipping it is unsafe.
-	// The CFG verifier must reject this.
-	CHECK(r.status != PRISM_OK,
-	      "raw comma desync: goto past non-raw y must be rejected");
+	// Both x and y are raw — goto past them is safe (no zeroinit to skip).
+	CHECK(r.status == PRISM_OK,
+	      "raw comma desync: goto past all-raw declarators is safe");
 	prism_free(&r);
 }
 
