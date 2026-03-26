@@ -2232,6 +2232,60 @@ static void test_c23_if_init_shadow_else_scope(void) {
 	/* Same bug with switch (no else, but verify it doesn't regress) */
 }
 
+// Bug: typedef void func_t(int); func_t my_func; — parse_declarator sees
+// my_func as a plain variable (no trailing parens). process_declarators applies
+// zero-init (= {0} or memset), which is invalid for function declarations.
+// Function POINTER typedefs must remain correctly zeroed.
+static void test_func_typedef_zeroinit(void) {
+	// Case 1: void function typedef
+	{
+		const char *code =
+		    "typedef void func_t(int);\n"
+		    "void test(void) {\n"
+		    "    func_t my_func;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "fntd1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "func-typedef-zeroinit: transpile succeeds");
+		if (r.output) {
+			CHECK(strstr(r.output, "= {0}") == NULL && strstr(r.output, "= 0") == NULL
+			      && strstr(r.output, "memset") == NULL,
+			      "func-typedef-zeroinit: function declaration must not be zero-initialized");
+		}
+		prism_free(&r);
+	}
+	// Case 2: int-returning function typedef
+	{
+		const char *code =
+		    "typedef int getter_t(void);\n"
+		    "void test(void) {\n"
+		    "    getter_t get_value;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "fntd2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "func-typedef-int: transpile succeeds");
+		if (r.output) {
+			CHECK(strstr(r.output, "= {0}") == NULL && strstr(r.output, "= 0") == NULL
+			      && strstr(r.output, "memset") == NULL,
+			      "func-typedef-int: function declaration must not be zero-initialized");
+		}
+		prism_free(&r);
+	}
+	// Case 3: function POINTER typedef must STILL be zeroed (regression guard)
+	{
+		const char *code =
+		    "typedef int (*fn_ptr_t)(void);\n"
+		    "void test(void) {\n"
+		    "    fn_ptr_t fp;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "fntd3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "func-ptr-typedef: transpile succeeds");
+		if (r.output) {
+			CHECK(strstr(r.output, "= {0}") != NULL || strstr(r.output, "= 0") != NULL,
+			      "func-ptr-typedef: function pointer must still be zero-initialized");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -2346,4 +2400,7 @@ void run_zeroinit_tests(void) {
 
 	// Audit round 28: C23 if-init shadow scope amputated before else branch
 	test_c23_if_init_shadow_else_scope();
+
+	// Audit round 42: function typedef zero-init
+	test_func_typedef_zeroinit();
 }

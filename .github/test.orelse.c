@@ -4249,6 +4249,76 @@ static void test_orelse_void_ptr_typedef_deref(void) {
 	prism_free(&r);
 }
 
+// Bug: emit_bare_orelse_impl inner emit_tok loops bypass walk_balanced,
+// so statement expressions containing defer/orelse/goto leak as raw text.
+// Covers: fallback tokens, RHS tokens, and compound-literal ternary path.
+static void test_bare_orelse_stmtexpr_defer_leak(void) {
+	// Case 1: defer in stmt-expr fallback (temp-based path)
+	{
+		const char *code =
+		    "int get(void);\n"
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    int x;\n"
+		    "    x = get() orelse ({ { defer cleanup(); } 1; });\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "oe_sel1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "bare-orelse-stmtexpr-defer: transpile succeeds");
+		if (r.output) {
+			// Find the function body to avoid matching #line directive filenames
+			const char *fn = strstr(r.output, "void f(");
+			CHECK(fn != NULL, "bare-orelse-stmtexpr-defer: function found");
+			if (fn) {
+				CHECK(strstr(fn, " defer ") == NULL && strstr(fn, "\tdefer ") == NULL,
+				      "bare-orelse-stmtexpr-defer: 'defer' must not leak as raw text in fallback");
+			}
+		}
+		prism_free(&r);
+	}
+	// Case 2: defer in stmt-expr RHS (before orelse)
+	{
+		const char *code =
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    int x;\n"
+		    "    int y;\n"
+		    "    x = ({ { defer cleanup(); } y; }) orelse 42;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "oe_sel2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "bare-orelse-stmtexpr-rhs: transpile succeeds");
+		if (r.output) {
+			const char *fn = strstr(r.output, "void f(");
+			CHECK(fn != NULL, "bare-orelse-stmtexpr-rhs: function found");
+			if (fn) {
+				CHECK(strstr(fn, " defer ") == NULL && strstr(fn, "\tdefer ") == NULL,
+				      "bare-orelse-stmtexpr-rhs: 'defer' must not leak in RHS stmt-expr");
+			}
+		}
+		prism_free(&r);
+	}
+	// Case 3: defer in stmt-expr inside compound-literal fallback (ternary path)
+	{
+		const char *code =
+		    "int get(void);\n"
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    int x;\n"
+		    "    x = get() orelse (int){ ({ { defer cleanup(); } 1; }) };\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "oe_sel3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "bare-orelse-stmtexpr-compound: transpile succeeds");
+		if (r.output) {
+			const char *fn = strstr(r.output, "void f(");
+			CHECK(fn != NULL, "bare-orelse-stmtexpr-compound: function found");
+			if (fn) {
+				CHECK(strstr(fn, " defer ") == NULL && strstr(fn, "\tdefer ") == NULL,
+				      "bare-orelse-stmtexpr-compound: 'defer' must not leak in compound-lit fallback");
+			}
+		}
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -4530,4 +4600,7 @@ void run_orelse_tests(void) {
 
 	// Audit round 41: void* pointer typedef orelse emits &*(void*)0 constraint violation
 	test_orelse_void_ptr_typedef_deref();
+
+	// Audit round 42: bare orelse emit_tok loops bypass walk_balanced for stmt-exprs
+	test_bare_orelse_stmtexpr_defer_leak();
 }

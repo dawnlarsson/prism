@@ -181,6 +181,7 @@ typedef struct {
 	bool is_enum_const : 1;
 	bool is_vla_var : 1;
 	bool is_aggregate : 1;
+	bool is_func : 1;
 } TypedefEntry;
 
 typedef struct {
@@ -1419,7 +1420,7 @@ static TypedefEntry *typedef_lookup(Token *tok) {
 }
 
 // Typedef query flags (single lookup, check multiple properties)
-enum { TDF_TYPEDEF = 1, TDF_VLA = 2, TDF_VOID = 4, TDF_ENUM_CONST = 8, TDF_CONST = 16, TDF_PTR = 32, TDF_ARRAY = 64, TDF_AGGREGATE = 128 };
+enum { TDF_TYPEDEF = 1, TDF_VLA = 2, TDF_VOID = 4, TDF_ENUM_CONST = 8, TDF_CONST = 16, TDF_PTR = 32, TDF_ARRAY = 64, TDF_AGGREGATE = 128, TDF_FUNC = 256 };
 
 static inline int typedef_flags(Token *tok) {
 	TypedefEntry *e = typedef_lookup(tok);
@@ -1429,7 +1430,8 @@ static inline int typedef_flags(Token *tok) {
 	if (e->is_vla_var) return TDF_VLA;
 	return TDF_TYPEDEF | (e->is_vla ? TDF_VLA : 0) | (e->is_void ? TDF_VOID : 0) |
 	       (e->is_const ? TDF_CONST : 0) | (e->is_ptr ? TDF_PTR : 0) |
-	       (e->is_array ? TDF_ARRAY : 0) | (e->is_aggregate ? TDF_AGGREGATE : 0);
+	       (e->is_array ? TDF_ARRAY : 0) | (e->is_aggregate ? TDF_AGGREGATE : 0) |
+	       (e->is_func ? TDF_FUNC : 0);
 }
 
 #define is_known_typedef(tok) (typedef_flags(tok) & TDF_TYPEDEF)
@@ -1439,6 +1441,7 @@ static inline int typedef_flags(Token *tok) {
 #define is_const_typedef(tok) (typedef_flags(tok) & TDF_CONST)
 #define is_ptr_typedef(tok) (typedef_flags(tok) & TDF_PTR)
 #define is_array_typedef(tok) (typedef_flags(tok) & TDF_ARRAY)
+#define is_func_typedef(tok) (typedef_flags(tok) & TDF_FUNC)
 
 static Token *find_boundary_comma(Token *tok) {
 	while (tok->kind != TK_EOF) {
@@ -1951,6 +1954,13 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 					added->is_array = true;
 				if (type_spec.is_struct && !type_spec.is_enum && !decl.is_pointer && !decl.is_func_ptr)
 					added->is_aggregate = true;
+				// Function type: parse_declarator returns end=NULL when
+				// the name is followed by '(' without has_paren.
+				if (!decl.end) {
+					Token *after_name = skip_noise(tok_next(decl.var_name));
+					if (after_name && match_ch(after_name, '('))
+						added->is_func = true;
+				}
 			}
 		}
 		tok = decl.end ? decl.end : tok_next(tok);
@@ -2033,6 +2043,7 @@ static bool generic_has_distinct_targets(Token *open) {
 		// Walk past member-access chains (obj.member, ptr->member) so
 		// obj.handle_int vs obj.handle_float compare "handle_int"/"handle_float",
 		// not "obj"/"obj".
+		bool found_ident = false;
 		for (Token *b = tok_next(t); b && b != close; b = tok_next(b)) {
 			if (b->flags & TF_OPEN) {
 				if (tok_match(b)) b = tok_match(b);
@@ -2040,6 +2051,7 @@ static bool generic_has_distinct_targets(Token *open) {
 			}
 			if (match_ch(b, ',')) break; // next association
 			if (!is_valid_varname(b)) continue;
+			found_ident = true;
 			// Walk past .member / ->member chains to the terminal identifier.
 			while (b && tok_next(b) && tok_next(b) != close &&
 			       (match_ch(tok_next(b), '.') || equal(tok_next(b), "->")) &&
@@ -2054,6 +2066,27 @@ static bool generic_has_distinct_targets(Token *open) {
 				return true; // distinct target found
 			}
 			break;
+		}
+		// No identifier at depth 0 — could be a literal like
+		// `default: 0` or a wrapped call like `(const void*)(bsearch(...))`.
+		// Deep-scan all tokens including inside balanced groups: if NO
+		// non-type identifier exists at any depth, it is a literal-only
+		// target and genuinely distinct.
+		if (!found_ident) {
+			bool has_real_ident = false;
+			int depth = 0;
+			for (Token *d = tok_next(t); d && d != close; d = tok_next(d)) {
+				if (d->flags & TF_OPEN) depth++;
+				else if (d->flags & TF_CLOSE) depth--;
+				if (depth == 0 && match_ch(d, ',')) break;
+				if (is_valid_varname(d) &&
+				    !(d->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE |
+						TT_STORAGE | TT_ATTR | TT_TYPEOF | TT_BITINT))) {
+					has_real_ident = true;
+					break;
+				}
+			}
+			if (!has_real_ident) return true;
 		}
 	}
 	return false;
@@ -3399,10 +3432,17 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		bool effective_vla = (decl.is_vla && (!decl.paren_pointer || decl.paren_array)) || (type->is_vla && !decl.is_pointer);
 		bool is_aggregate =
 		    decl.is_array || ((type->is_struct || type->is_typedef) && !decl.is_pointer);
+		// Function types (via typedef) cannot be initialized — skip zero-init entirely.
+		bool is_func_type = false;
+		if (!decl.is_pointer && !decl.is_array && !decl.is_func_ptr) {
+			for (Token *ft = type_start; ft && ft != type->end; ft = tok_next(ft)) {
+				if (is_func_typedef(ft)) { is_func_type = true; break; }
+			}
+		}
 		// Only queue memset when zeroinit feature is enabled.
 		// Static/extern variables are zero-initialized by the loader — skip.
 		bool needs_memset = FEAT(F_ZEROINIT) && !decl.has_init && !decl_is_raw && (!decl.is_pointer || decl.is_array) &&
-				    !type->has_register && !type->has_static && !type->has_extern &&
+				    !type->has_register && !type->has_static && !type->has_extern && !is_func_type &&
 				    (type->has_typeof || (type->has_atomic && is_aggregate) || effective_vla);
 
 		if (is_const_orelse_fallback) {
@@ -3448,7 +3488,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		tok = decl.end;
 
 		// Add zero initializer if needed (for non-memset types)
-		if (FEAT(F_ZEROINIT) && !decl.has_init && !effective_vla && !decl_is_raw && !needs_memset && !type->has_extern && !type->has_static) {
+		if (FEAT(F_ZEROINIT) && !decl.has_init && !effective_vla && !decl_is_raw && !needs_memset && !type->has_extern && !type->has_static && !is_func_type) {
 			if (type->has_register && type->has_atomic && is_aggregate)
 				error_tok(decl.var_name,
 					  "'register _Atomic' aggregate cannot be safely "
@@ -5400,6 +5440,9 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 			OUT_LIT("(");
 			for (Token *s = bare_lhs_start; s != orelse_tok; s = tok_next(s)) {
 				if (s->kind == TK_PREP_DIR) continue;
+				if ((s->flags & TF_OPEN) && (match_ch(s, '(') || match_ch(s, '['))) {
+					walk_balanced(s, true); s = tok_match(s); continue;
+				}
 				emit_tok(s);
 			}
 			OUT_LIT(") ? (void)0 : ");
@@ -5410,6 +5453,9 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 			emit_range_no_prep(bare_lhs_start, bare_assign_eq);
 			OUT_LIT(" = (");
 			while (t->kind != TK_EOF) {
+				if ((t->flags & TF_OPEN) && (match_ch(t, '(') || match_ch(t, '['))) {
+					t = walk_balanced(t, true); continue;
+				}
 				if (t->flags & TF_OPEN) fd++;
 				else if (t->flags & TF_CLOSE) fd--;
 				else if (fd == 0 && BARE_IS_END(t)) break;
@@ -5439,6 +5485,9 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 			// Emit RHS tokens for typeof
 			for (Token *s = tok_next(bare_assign_eq); s != orelse_tok; s = tok_next(s)) {
 				if (s->kind == TK_PREP_DIR) continue;
+				if ((s->flags & TF_OPEN) && (match_ch(s, '(') || match_ch(s, '['))) {
+					walk_balanced(s, true); s = tok_match(s); continue;
+				}
 				emit_tok(s);
 			}
 			OUT_LIT(") __prism_oe_");
@@ -5447,6 +5496,9 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 			// Emit RHS tokens for initialization
 			for (Token *s = tok_next(bare_assign_eq); s != orelse_tok; s = tok_next(s)) {
 				if (s->kind == TK_PREP_DIR) continue;
+				if ((s->flags & TF_OPEN) && (match_ch(s, '(') || match_ch(s, '['))) {
+					walk_balanced(s, true); s = tok_match(s); continue;
+				}
 				emit_tok(s);
 			}
 			OUT_LIT(");");
@@ -5464,6 +5516,9 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 				OUT_LIT(" : (");
 				fd = 0;
 				while (t->kind != TK_EOF) {
+					if ((t->flags & TF_OPEN) && (match_ch(t, '(') || match_ch(t, '['))) {
+						t = walk_balanced(t, true); continue;
+					}
 					if (t->flags & TF_OPEN) fd++;
 					else if (t->flags & TF_CLOSE) fd--;
 					else if (fd == 0 && BARE_IS_END(t)) break;

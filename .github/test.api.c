@@ -6089,6 +6089,49 @@ static void test_collect_source_defines_conditional_guard_preserved(void) {
 	unlink(path); free(path);
 }
 
+// Bug: generic_has_distinct_targets skips non-identifier association targets
+// (e.g. default: 0), falsely concluding all branches target the same function.
+// In N3322 declaration context, this silently folds _Generic to the one named
+// function, erasing the non-identifier branch entirely.
+static void test_generic_nonident_target_fold(void) {
+	// Pattern 2: _Generic(...)(decl-params) ; — N3322 redeclaration
+	const char *code =
+	    "void *bsearch(const void *, const void *,\n"
+	    "    unsigned long, unsigned long,\n"
+	    "    int (*)(const void *, const void *));\n"
+	    "extern void *\n"
+	    "_Generic((__builtin_constant_p(0)),\n"
+	    "    _Bool: bsearch,\n"
+	    "    default: 0)\n"
+	    "(const void *, const void *, unsigned long, unsigned long,\n"
+	    " int (*)(const void *, const void *));\n";
+	PrismResult r = prism_transpile_source(code, "gn_fold.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "generic-nonident-fold: transpile succeeds");
+	if (r.output) {
+		CHECK(strstr(r.output, "_Generic") != NULL,
+		      "generic-nonident-fold: _Generic must be preserved (default:0 is distinct from bsearch)");
+	}
+	prism_free(&r);
+
+	// Pattern 1: _Generic(...name(decl-params)...) ;
+	const char *code2 =
+	    "void *bsearch(const void *, const void *,\n"
+	    "    unsigned long, unsigned long,\n"
+	    "    int (*)(const void *, const void *));\n"
+	    "extern void *\n"
+	    "_Generic((__builtin_constant_p(0)),\n"
+	    "    _Bool: bsearch(const void *, const void *, unsigned long,\n"
+	    "                   unsigned long, int (*)(const void *, const void *)),\n"
+	    "    default: 0);\n";
+	r = prism_transpile_source(code2, "gn_fold2.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "generic-nonident-fold-p1: transpile succeeds");
+	if (r.output) {
+		CHECK(strstr(r.output, "_Generic") != NULL,
+		      "generic-nonident-fold-p1: _Generic must be preserved (default:0 is distinct)");
+	}
+	prism_free(&r);
+}
+
 void run_api_tests(void) {
 test_typeof_orelse_leak();
 	printf("\n=== API TESTS ===\n");
@@ -6297,6 +6340,9 @@ test_typeof_orelse_leak();
 	// _Generic member distinct target mutilation
 	test_collect_source_defines_continuation_splice_space();
 	test_generic_member_distinct_target_mutilation();
+
+	// Audit round 42: _Generic non-identifier target (default: 0) fold
+	test_generic_nonident_target_fold();
 
 	// Audit round 40: conditional define preservation with guards
 	test_collect_source_defines_conditional_guard_preserved();
