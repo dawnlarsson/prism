@@ -1611,11 +1611,15 @@ static void test_const_opaque_ptr_orelse(void) {
 	CHECK_EQ(result.status, PRISM_OK, "const opaque ptr: transpiles OK");
 	CHECK(result.output != NULL, "const opaque ptr: output not NULL");
 
-	// The output should use &* trick, not + 0 (which would fail for incomplete type)
-	CHECK(strstr(result.output, "&*(") != NULL,
-	      "const opaque ptr: uses &* to strip const (safe for incomplete types)");
+	// The output should use (T)0 cast (rvalue strips const), not &* (deref may
+	// violate constraints for void*) and not + 0 (fails for incomplete types).
+	CHECK(strstr(result.output, "&*(") == NULL,
+	      "const opaque ptr: no &* deref (avoids void* constraint violation)");
 	CHECK(strstr(result.output, ")0 + 0)") == NULL,
 	      "const opaque ptr: does NOT use + 0 (would be constraint violation)");
+	// Verify the cast approach is used instead
+	CHECK(strstr(result.output, ")0)") != NULL,
+	      "const opaque ptr: uses (T)0 cast to strip const");
 
 	prism_free(&result);
 	unlink(path);
@@ -4184,6 +4188,67 @@ static void test_vla_star_dim_hoisting(void) {
 	}
 }
 
+// Audit round 41: orelse bare assignment emits __typeof__ unconditionally.
+// MSVC (cl.exe) does not support __typeof__, only C23 typeof under /std:clatest.
+// The zeroinit path already detects cc_is_msvc and uses a byte-loop instead of
+// __builtin_memset, but orelse has no MSVC-specific alternative for __typeof__.
+static void test_orelse_msvc_typeof_emission(void) {
+	printf("\n--- orelse MSVC __typeof__ emission (audit round 41) ---\n");
+
+	const char *code =
+	    "int get(void) { return 0; }\n"
+	    "void f(void) {\n"
+	    "    int x;\n"
+	    "    x = get() orelse 42;\n"
+	    "}\n";
+
+	// With compiler="cl" (MSVC), the output should NOT contain __typeof__
+	PrismFeatures feat = prism_defaults();
+	feat.compiler = "cl";
+	PrismResult r = prism_transpile_source(code, "msvc_bare_oe.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "msvc bare oe typeof: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "__typeof__") == NULL,
+		      "msvc bare oe typeof: no __typeof__ in MSVC output");
+	}
+	prism_free(&r);
+}
+
+// Audit round 41: handle_const_orelse_fallback emits __typeof__(&*(type)0) for
+// pointer typedefs with baked-in const. When the base type resolves to void*,
+// this dereferences void* — a constraint violation under C99 §6.5.3.2p2.
+// GCC/Clang tolerate it as an extension, but it's standards-non-conforming.
+static void test_orelse_void_ptr_typedef_deref(void) {
+	printf("\n--- orelse void* pointer typedef &* deref (audit round 41) ---\n");
+
+	// typedef void * vp; typedef const vp cvp;
+	// cvp = void * const → pointer is const, base is void
+	// handle_const_orelse_fallback sees const_td_is_ptr=true →
+	// emits __typeof__(&*(cvp)0) which dereferences void*
+	const char *code =
+	    "typedef void * vp;\n"
+	    "typedef const vp cvp;\n"
+	    "vp get(void) { return (void*)0; }\n"
+	    "void f(void) {\n"
+	    "    cvp x = get() orelse (vp)1;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "voidp_deref.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "void* ptr deref: transpiles OK");
+	if (r.output) {
+		// The &* trick on a void pointer typedef is a constraint violation.
+		// Output should use a safe alternative (direct cast to void*) instead
+		// of __typeof__(&*(cvp)0) which dereferences void*.
+		bool has_deref = strstr(r.output, "&*(") != NULL;
+		// Check specifically for &* combined with void-pointer typedef
+		bool has_typeof_deref = strstr(r.output, "__typeof__(&*(") != NULL;
+		CHECK(!has_typeof_deref,
+		      "void* ptr deref: no __typeof__(&*(...)) on void pointer typedef");
+	}
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -4459,4 +4524,10 @@ void run_orelse_tests(void) {
 	test_typedef_array_orelse_escape();
 	test_anon_struct_split_invalid();
 	test_vla_star_dim_hoisting();
+
+	// Audit round 41: MSVC orelse emits __typeof__ (MSVC-incompatible)
+	test_orelse_msvc_typeof_emission();
+
+	// Audit round 41: void* pointer typedef orelse emits &*(void*)0 constraint violation
+	test_orelse_void_ptr_typedef_deref();
 }

@@ -716,6 +716,16 @@ static inline void out_str(const char *s, int len) {
 
 #define OUT_LIT(s) out_str(s, sizeof(s) - 1)
 
+// Emit __typeof__ (GNU) or typeof (C23/MSVC).
+// MSVC does not support __typeof__; C23 typeof is available under /std:clatest.
+static inline void emit_typeof_keyword(void) {
+	const char *cc = ctx->extra_compiler ? ctx->extra_compiler : PRISM_DEFAULT_CC;
+	if (cc_is_msvc(cc))
+		OUT_LIT("typeof");
+	else
+		OUT_LIT("__typeof__");
+}
+
 static void out_close(void) {
 	if (out_fp) {
 		out_flush();
@@ -2999,9 +3009,11 @@ static Token *handle_const_orelse_fallback(Token *tok,
 	}
 
 	if (has_const_typedef) {
-		// Pointer-to-incomplete: use &* trick instead of arithmetic.
+		// Pointer-to-incomplete: use cast-to-rvalue instead of arithmetic.
 		// (T)0+0 fails for pointers to incomplete types (sizeof unknown).
-		// &*(T)0 safely strips const via &* cancellation in typeof context.
+		// (T)0 cast produces a prvalue — const is stripped by rvalue conversion.
+		// The old &*(T)0 trick dereferences void* which is a constraint violation
+		// under C99 §6.5.3.2p2 (GCC/Clang tolerate it, but it's non-conforming).
 		bool const_td_is_ptr = false;
 		bool const_td_is_array = false;
 		for (Token *t = type_start; t != type->end; t = tok_next(t)) {
@@ -3012,17 +3024,19 @@ static Token *handle_const_orelse_fallback(Token *tok,
 		if (pragma_start != type_start)
 			emit_range(pragma_start, type_start);
 		if (const_td_is_ptr) {
-			OUT_LIT(" __typeof__(&*(");
+			// Cast to rvalue strips const from pointer level.
+			// Safe for all pointer types including void* (no dereference).
+			out_char(' '); emit_typeof_keyword(); OUT_LIT("((");
 			emit_type_stripped(type_start, type->end, strip_type_const);
 			OUT_LIT(")0)");
 		} else if (const_td_is_array) {
-			OUT_LIT(" __typeof__(*(0 ? (");
+			out_char(' '); emit_typeof_keyword(); OUT_LIT("(*(0 ? (");
 			emit_type_stripped(type_start, type->end, strip_type_const);
 			OUT_LIT("*)0 : (");
 			emit_type_stripped(type_start, type->end, strip_type_const);
 			OUT_LIT("*)0))");
 		} else {
-			OUT_LIT(" __typeof__((");
+			out_char(' '); emit_typeof_keyword(); OUT_LIT("((");
 			emit_type_stripped(type_start, type->end, strip_type_const);
 			// Cast result is a prvalue — const is stripped by cast, no
 			// arithmetic needed.  The old ")0 + 0)" trick caused GCC to
@@ -3764,15 +3778,12 @@ static Token *emit_expr_to_semicolon(Token *tok) {
 	bool expr_at_stmt_start = false;
 	while (tok->kind != TK_EOF) {
 		// Skip matched (...) / [...] groups — no declarations inside.
-		// Exception: statement expressions ({...}) need inner zero-init processing.
+		// Statement expressions ({...}): route through walk_balanced which
+		// has the full keyword dispatcher (defer, goto, orelse, zeroinit).
 		if ((match_ch(tok, '(') || match_ch(tok, '[')) && tok_match(tok)) {
-			if (match_ch(tok, '(') && tok_next(tok) && match_ch(tok_next(tok), '{')) {
-				emit_tok(tok); tok = tok_next(tok);
-			} else {
-					if (FEAT(F_ORELSE) && (match_ch(tok, '(') || match_ch(tok, '[')))
-					check_orelse_in_parens(tok);
-				tok = walk_balanced(tok, true);
-			}
+				if (FEAT(F_ORELSE) && (match_ch(tok, '(') || match_ch(tok, '[')))
+				check_orelse_in_parens(tok);
+			tok = walk_balanced(tok, true);
 			expr_at_stmt_start = false;
 			continue;
 		}
@@ -5424,7 +5435,7 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 			// This guarantees LHS is written exactly once, preventing double-write
 			// to volatile MMIO registers.
 			unsigned oe_id = ctx->ret_counter++;
-			OUT_LIT("{ __typeof__(");
+			OUT_LIT("{ "); emit_typeof_keyword(); out_char('(');
 			// Emit RHS tokens for typeof
 			for (Token *s = tok_next(bare_assign_eq); s != orelse_tok; s = tok_next(s)) {
 				if (s->kind == TK_PREP_DIR) continue;

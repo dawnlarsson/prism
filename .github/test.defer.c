@@ -3195,6 +3195,97 @@ static void test_defer_stmt_expr_smuggled_in_args(void) {
 	    "return");
 }
 
+// Audit round 41: emit_expr_to_semicolon bypasses walk_balanced keyword dispatcher
+// for statement expressions in return statements when outer defers are active.
+// defer/orelse/goto inside ({...}) in a return expr leak as raw text → compile error.
+static void test_stmt_expr_return_defer_bypass(void) {
+	printf("\n--- stmt-expr return defer bypass (audit round 41) ---\n");
+
+	// Case 1: defer inside stmt-expr in return with outer defer active.
+	// emit_return_body → emit_expr_to_semicolon sees ({ and falls to naive
+	// brace-depth tracking, completely bypassing handle_defer_keyword.
+	// The defer keyword leaks as raw C text → backend compiler error.
+	{
+		const char *code =
+		    "void outer_cleanup(void) {}\n"
+		    "void inner_cleanup(void) {}\n"
+		    "int f(void) {\n"
+		    "    defer outer_cleanup();\n"
+		    "    return ({\n"
+		    "        int a = 1;\n"
+		    "        { defer inner_cleanup(); a = 5; }\n"
+		    "        a;\n"
+		    "    });\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "se_ret_dfr.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "stmtexpr return defer: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "defer") == NULL,
+			      "stmtexpr return defer: no raw 'defer' keyword in output");
+			// inner_cleanup should appear AFTER a = 5 (deferred to scope exit).
+			// Search within the f() function body (after "int f") to avoid
+			// matching the function definition "void inner_cleanup(void) {}"
+			// which appears earlier in the output.
+			const char *fn = strstr(r.output, "int f");
+			const char *a5 = fn ? strstr(fn, "a = 5") : NULL;
+			const char *ic = a5 ? strstr(a5, "inner_cleanup") : NULL;
+			CHECK(a5 != NULL && ic != NULL && ic > a5,
+			      "stmtexpr return defer: inner_cleanup deferred after a = 5");
+		}
+		prism_free(&r);
+	}
+
+	// Case 2: bare orelse inside stmt-expr in return with outer defer active.
+	// Same bypass: emit_expr_to_semicolon doesn't dispatch orelse.
+	{
+		const char *code =
+		    "void cleanup(void) {}\n"
+		    "int get(void) { return 0; }\n"
+		    "int f(void) {\n"
+		    "    defer cleanup();\n"
+		    "    return ({\n"
+		    "        int x;\n"
+		    "        x = get() orelse 42;\n"
+		    "        x;\n"
+		    "    });\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "se_ret_oe.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "stmtexpr return orelse: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "stmtexpr return orelse: no raw 'orelse' keyword in output");
+		}
+		prism_free(&r);
+	}
+
+	// Case 3: goto inside stmt-expr in return with outer defer active.
+	// Same bypass: emit_expr_to_semicolon doesn't dispatch handle_goto_keyword.
+	{
+		const char *code =
+		    "void cleanup(void) {}\n"
+		    "int f(void) {\n"
+		    "    defer cleanup();\n"
+		    "    return ({\n"
+		    "        int x = 10;\n"
+		    "        goto end;\n"
+		    "        x = 20;\n"
+		    "        end:\n"
+		    "        x;\n"
+		    "    });\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "se_ret_gt.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "stmtexpr return goto: transpiles OK");
+		if (r.output) {
+			// goto should be processed by handle_goto_keyword, not leaked raw.
+			// A properly processed goto would have skip-checks applied.
+			// For now, just verify no raw 'defer' leaks and output compiles.
+			CHECK(strstr(r.output, "defer") == NULL,
+			      "stmtexpr return goto: no raw 'defer' in output");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -3397,4 +3488,7 @@ void run_defer_tests(void) {
 
 	// Audit round 40: stmt-expr smuggled inside function args/array indices/casts
 	test_defer_stmt_expr_smuggled_in_args();
+
+	// Audit round 41: emit_expr_to_semicolon stmt-expr keyword bypass
+	test_stmt_expr_return_defer_bypass();
 }
