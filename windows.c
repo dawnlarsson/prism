@@ -144,6 +144,20 @@ typedef int mode_t;
 #define SIGPIPE 13 // define but never raised on Windows
 #endif
 
+// sigprocmask stubs — Windows doesn't deliver asynchronous POSIX signals,
+// so the TOCTOU window between temp creation and registration is harmless.
+// These stubs let make_temp_file_registered compile unchanged.
+#ifndef SIG_BLOCK
+#define SIG_BLOCK   0
+#define SIG_SETMASK 2
+typedef unsigned long sigset_t;
+static inline int sigemptyset(sigset_t *s) { *s = 0; return 0; }
+static inline int sigaddset(sigset_t *s, int sig) { (void)s; (void)sig; return 0; }
+static inline int sigprocmask(int how, const sigset_t *set, sigset_t *old) {
+	(void)how; (void)set; (void)old; return 0;
+}
+#endif
+
 #define strdup _strdup
 #define fileno _fileno
 #define fdopen _fdopen

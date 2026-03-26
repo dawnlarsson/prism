@@ -4087,6 +4087,103 @@ static void test_orelse_funcptr_param_bracket_leak(void) {
 	}
 }
 
+// Audit round 45: typedef-concealed array orelse escape
+static void test_typedef_array_orelse_escape(void) {
+	printf("\n--- typedef array orelse escape ---\n");
+
+	/* Typedef-concealed array must be rejected like a plain array. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "typedef int arr_t[5];\n"
+		    "int *fallback(void);\n"
+		    "void f(void) { arr_t x = {0} orelse fallback(); }\n",
+		    "typedef_arr_orelse.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "typedef-array-orelse: must reject orelse on array typedef");
+		prism_free(&r);
+	}
+	/* const-qualified typedef array also rejected. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "typedef int arr_t[5];\n"
+		    "int *fallback(void);\n"
+		    "void f(void) { const arr_t x = {0} orelse fallback(); }\n",
+		    "typedef_arr_orelse_const.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "typedef-array-orelse-const: const-qualified array still rejected");
+		prism_free(&r);
+	}
+	/* Pointer typedef must still be accepted. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "typedef int *ptr_t;\n"
+		    "int *fallback(void);\n"
+		    "void f(void) { ptr_t x = 0 orelse fallback(); }\n",
+		    "typedef_ptr_orelse.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "typedef-ptr-orelse: pointer typedef accepted");
+		prism_free(&r);
+	}
+}
+
+// Audit round 45: anonymous struct/union declaration split produces incompatible types
+static void test_anon_struct_split_invalid(void) {
+	printf("\n--- anon struct split invalid ---\n");
+
+	/* Anonymous struct with bracket orelse triggering split_decl
+	   must be rejected because re-emitting the body creates a second
+	   incompatible anonymous type. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int ff(void);\n"
+		    "void f(void) { struct { int x; } a, b[ff() orelse 1]; }\n",
+		    "anon_struct_split.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "anon-struct-split: must reject split with anonymous struct");
+		prism_free(&r);
+	}
+	/* Anonymous union variant. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int ff(void);\n"
+		    "void f(void) { union { int x; float y; } a, b[ff() orelse 1]; }\n",
+		    "anon_union_split.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "anon-union-split: must reject split with anonymous union");
+		prism_free(&r);
+	}
+	/* Named struct split — must succeed. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int ff(void);\n"
+		    "void f(void) { struct S { int x; } a, b[ff() orelse 1]; }\n",
+		    "named_struct_split.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "named-struct-split: named struct split accepted");
+		prism_free(&r);
+	}
+}
+
+// Audit round 45: [*] VLA unspecified dim hoisted as invalid expression
+static void test_vla_star_dim_hoisting(void) {
+	printf("\n--- [*] VLA dim hoisting ---\n");
+
+	/* [*] in a dimension alongside bracket orelse must not be hoisted
+	   to __prism_dim_N = (*), which is invalid C. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) { int arr[n orelse 1][*]; }\n",
+		    "vla_star_hoist.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "vla-star-hoist: transpiles without error");
+		if (r.output) {
+			CHECK(strstr(r.output, "= (*") == NULL,
+			      "vla-star-hoist: [*] not hoisted into invalid assignment");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -4357,4 +4454,9 @@ void run_orelse_tests(void) {
 
 	// Audit round 44: bracket orelse dimension hoisting bypasses orelse transformation
 	test_bracket_orelse_dim_hoisting_bypass();
+
+	// Audit round 45: typedef array orelse escape + anon struct split + [*] VLA hoisting
+	test_typedef_array_orelse_escape();
+	test_anon_struct_split_invalid();
+	test_vla_star_dim_hoisting();
 }

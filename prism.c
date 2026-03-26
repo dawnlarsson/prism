@@ -2609,6 +2609,13 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 				ctx->bracket_dim_ids[ctx->bracket_dim_count++] = (unsigned)-1;
 				continue;
 			}
+			// Skip [*] — VLA unspecified size in prototypes, not a hoistable expression
+			if (tok_next(dim_start) == dim_end && match_ch(dim_start, '*')) {
+				ARENA_ENSURE_CAP(&ctx->main_arena, ctx->bracket_dim_ids,
+						 ctx->bracket_dim_count, ctx->bracket_dim_cap, 16, unsigned);
+				ctx->bracket_dim_ids[ctx->bracket_dim_count++] = (unsigned)-1;
+				continue;
+			}
 			ARENA_ENSURE_CAP(&ctx->main_arena, ctx->bracket_dim_ids,
 					 ctx->bracket_dim_count, ctx->bracket_dim_cap, 16, unsigned);
 			unsigned dim = ctx->ret_counter++;
@@ -3195,7 +3202,12 @@ static OrelseDeclTargetInfo analyze_decl_orelse_target(Token *tok,
 		.has_const_qual = has_effective_const_qual(type_start, type, decl),
 		.is_struct_value = type->is_struct && !type->is_enum && !decl->is_pointer && !decl->is_array,
 	};
-	if (decl->is_array && !decl->paren_pointer)
+	bool base_is_array = decl->is_array && !decl->paren_pointer;
+	if (!base_is_array && !decl->is_pointer && !decl->paren_pointer) {
+		for (Token *t = type_start; t && t != type->end; t = tok_next(t))
+			if (is_array_typedef(t)) { base_is_array = true; break; }
+	}
+	if (base_is_array)
 		error_tok(decl->var_name,
 			  "orelse on array variable '%.*s' will never trigger "
 			  "(array address is never NULL); remove the orelse clause",
@@ -3543,6 +3555,22 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			}
 
 			if (split_decl) {
+				// Splitting a declaration with an anonymous struct/union/enum
+				// re-emits the body, producing two incompatible anonymous types.
+				if (type->is_struct && !type->is_enum) {
+					for (Token *t = type_start; t && t != type->end; t = tok_next(t)) {
+						if (t->tag & TT_SUE) {
+							Token *after = tok_next(t);
+							while (after && after->kind == TK_PREP_DIR) after = tok_next(after);
+							if (after && match_ch(after, '{'))
+								error_tok(next_decl_tok,
+									  "bracket orelse / zero-init requiring declaration split "
+									  "cannot be used with anonymous struct/union; "
+									  "add a tag name or use a typedef");
+							break;
+						}
+					}
+				}
 				out_char(';');
 				flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type);
 				tok = next_decl_tok;
@@ -4510,6 +4538,27 @@ make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len, co
 		n = snprintf(buf, bufsize, "%s%s", get_tmp_dir(), prefix ? prefix : "prism_tmp");
 	if (n < 0 || (size_t)n >= bufsize) return -1;
 	int fd = suffix_len > 0 ? mkstemps(buf, suffix_len) : mkstemp(buf);
+	return fd;
+}
+
+// Create a temp file and atomically register it for signal cleanup.
+// Blocks SIGINT/SIGTERM across the creation+registration boundary so that
+// a signal arriving between mkstemps() and signal_temps_register() cannot
+// orphan the inode.
+static int
+make_temp_file_registered(char *buf, size_t bufsize, const char *prefix,
+			  int suffix_len, const char *source_adjacent) {
+	sigset_t mask, oldmask;
+	sigemptyset(&mask);
+	sigaddset(&mask, SIGINT);
+	sigaddset(&mask, SIGTERM);
+	sigprocmask(SIG_BLOCK, &mask, &oldmask);
+
+	int fd = make_temp_file(buf, bufsize, prefix, suffix_len, source_adjacent);
+	if (fd >= 0)
+		signal_temps_register(buf);
+
+	sigprocmask(SIG_SETMASK, &oldmask, NULL);
 	return fd;
 }
 
@@ -7753,7 +7802,7 @@ static int transpile(char *input_file, char *output_file) {
 static int transpile_to_stdout(char *input_file) {
 #ifdef _WIN32
 	char temp[PATH_MAX];
-	int fd = make_temp_file(temp, sizeof(temp), NULL, 0, input_file);
+	int fd = make_temp_file_registered(temp, sizeof(temp), NULL, 0, input_file);
 	if (fd < 0)
 		return 0;
 	FILE *wfp = fdopen(fd, "w");
@@ -8741,10 +8790,9 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 		if (use_lib_api) {
 			temps[i] = malloc(PATH_MAX);
 			if (!temps[i]) die("Out of memory");
-			int fd = make_temp_file(temps[i], PATH_MAX, NULL, 0, cli->sources[i]);
+			int fd = make_temp_file_registered(temps[i], PATH_MAX, NULL, 0, cli->sources[i]);
 			if (fd < 0)
 				die("Failed to create temp file");
-			signal_temps_register(temps[i]);
 			PrismResult result = prism_transpile_file(cli->sources[i], cli->features);
 			if (result.status != PRISM_OK) {
 				fprintf(stderr, "%s:%d:%d: error: %s\n", cli->sources[i],
@@ -8763,10 +8811,9 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 		} else {
 			temps[i] = malloc(512);
 			if (!temps[i]) die("Out of memory");
-			int fd = make_temp_file(temps[i], 512, NULL, 0, cli->sources[i]);
+			int fd = make_temp_file_registered(temps[i], 512, NULL, 0, cli->sources[i]);
 			if (fd < 0)
 				die("Failed to create temp file");
-			signal_temps_register(temps[i]);
 			if (cli->verbose)
 				fprintf(stderr, "[prism] Transpiling %s -> %s\n", cli->sources[i], temps[i]);
 			FILE *wfp = fdopen(fd, "w");
