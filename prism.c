@@ -9057,6 +9057,13 @@ static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count,
 	char *cc_dup = NULL;
 	cc_split_into_argv(args, &argc, plan->compiler, &cc_dup);
 	if (plan->msvc) args[argc++] = "/nologo";
+	if (plan->msvc) {
+		// Prism emits typeof() for bare orelse; MSVC needs /std:clatest for C23 typeof.
+		bool has_std = false;
+		for (int i = 0; i < cli->cc_arg_count; i++)
+			if (strncmp(cli->cc_args[i], "/std:", 5) == 0) { has_std = true; break; }
+		if (!has_std) args[argc++] = "/std:clatest";
+	}
 	if (plan->optimize) args[argc++] = plan->msvc ? "/O2" : "-O2";
 	if (plan->use_preprocessed) args[argc++] = "-fpreprocessed";
 	for (int i = 0; i < temp_count; i++) args[argc++] = temps[i];

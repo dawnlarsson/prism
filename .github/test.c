@@ -168,6 +168,7 @@ static bool is_emulated(void) {
 	return false;
 }
 
+#include "test.windows.c"
 
 #include "test.safe.c"
 #include "test.raw.c"
@@ -180,6 +181,8 @@ static bool is_emulated(void) {
 
 int main(void) {
 	printf("=== PRISM TEST SUITE ===\n");
+	
+	run_windows_tests();
 
 	run_safe_tests();
 	run_raw_tests();

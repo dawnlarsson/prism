@@ -216,8 +216,8 @@ struct Token {
 
 typedef struct {
 	uint32_t loc_offset;  // Byte offset from File->contents
-	int32_t  line_no : 21;
-	uint32_t file_idx : 11;
+	int32_t  line_no : 18;
+	uint32_t file_idx : 14;
 } TokenCold; // 8 bytes — error/debug path
 
 typedef struct {
@@ -1145,7 +1145,7 @@ static inline __attribute__((always_inline)) Token *new_token(TokenKind kind, ch
 	c->loc_offset = (uint32_t)(start - ctx->current_file->contents);
 	{
 		long long ln = (long long)ts->line_no + ctx->current_file->line_delta;
-		int clamped = ln > 0x0FFFFF ? 0x0FFFFF : (ln < -0x100000 ? -0x100000 : (int)ln);
+		int clamped = ln > 0x1FFFF ? 0x1FFFF : (ln < -0x20000 ? -0x20000 : (int)ln);
 		c->line_no = clamped;
 	}
 	c->file_idx = ctx->current_file->file_no;
@@ -1399,8 +1399,10 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
 		    strstr(f, "Windows Kits") || strstr(f, "Program Files")) {
 			is_system = true;
 			*in_system_include = true;
-		} else if (*f == '/' || *f == '.') {
-			// Absolute non-system path or relative path — user file, exit system mode.
+		} else if (*f == '/' || *f == '.' ||
+		           (f[0] && f[1] == ':')) {
+			// Absolute non-system path, relative path, or Windows drive letter
+			// path (e.g., C:\Users\...) — user file, exit system mode.
 			is_system = false;
 			*in_system_include = false;
 		}
