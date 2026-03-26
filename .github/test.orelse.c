@@ -2272,7 +2272,7 @@ static void test_typeof_implicit_const_orelse(void) {
 	CHECK(r1.status == PRISM_OK && r1.output,
 	      "typeof-implicit-const-1: transpiles OK");
 	if (r1.output) {
-		CHECK(!strstr(r1.output, "typeof(x) _Prism_oe") || strstr(r1.output, "__typeof__"),
+		CHECK(!strstr(r1.output, "typeof(x) _Prism_oe") || strstr(r1.output, "__typeof__") || strstr(r1.output, "typeof_unqual"),
 		      "typeof-implicit-const-1: const stripped from orelse temp");
 	}
 	prism_free(&r1);

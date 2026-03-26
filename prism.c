@@ -3063,6 +3063,16 @@ static Token *handle_const_orelse_fallback(Token *tok,
 	}
 
 	if (has_const_typedef) {
+		const char *cc = ctx->extra_compiler ? ctx->extra_compiler : PRISM_DEFAULT_CC;
+		if (cc_is_msvc(cc)) {
+			// MSVC's typeof does not strip const from cast-to-rvalue,
+			// so use typeof_unqual directly (available with /std:clatest).
+			if (pragma_start != type_start)
+				emit_range(pragma_start, type_start);
+			OUT_LIT(" typeof_unqual(");
+			emit_type_stripped(type_start, type->end, strip_type_const);
+			out_char(')');
+		} else {
 		// Pointer-to-incomplete: use cast-to-rvalue instead of arithmetic.
 		// (T)0+0 fails for pointers to incomplete types (sizeof unknown).
 		// (T)0 cast produces a prvalue — const is stripped by rvalue conversion.
@@ -3097,6 +3107,7 @@ static Token *handle_const_orelse_fallback(Token *tok,
 			// apply integer promotion to _BitInt(N<32), widening the temp
 			// type to int and silently truncating the value on assignment.
 			OUT_LIT(")0)");
+		}
 		}
 	} else {
 		if (pragma_start != type_start)
