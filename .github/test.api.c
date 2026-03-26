@@ -5250,12 +5250,8 @@ static void test_collect_source_defines_block_comment_leak(void) {
 }
 
 static void test_braceless_nesting_depth_limit(void) {
-	/* BUG: skip_one_stmt() and validate_defer_statement() use direct C
-	 * recursion for braceless control flow (if/for/while/switch without
-	 * braces).  The brace depth cap (4096) only guards '{' nesting.
-	 * Deeply nested braceless if-chains blow the call stack.
-	 *
-	 * Fix: both functions now take a depth parameter and error at 4096. */
+	/* skip_one_stmt() is now iterative — no more stack overflow on deep
+	 * braceless control flow.  5000 nested braceless ifs must succeed. */
 	size_t cap = 200000;
 	char *code = malloc(cap);
 	CHECK(code != NULL, "braceless-depth: malloc"); if (!code) return;
@@ -5266,12 +5262,8 @@ static void test_braceless_nesting_depth_limit(void) {
 	n += snprintf(code + n, cap - n, "      x = 0;\n}\n");
 	PrismResult r = prism_transpile_source(code, "deep_braceless.c", prism_defaults());
 	free(code);
-	/* Must get an error (depth exceeded), not a segfault */
-	CHECK(r.status != PRISM_OK,
-	      "braceless-depth: 5000 nested braceless ifs must be rejected");
-	if (r.error_msg)
-		CHECK(strstr(r.error_msg, "nesting depth") != NULL,
-		      "braceless-depth: error must mention nesting depth");
+	CHECK_EQ(r.status, PRISM_OK,
+	      "braceless-depth: 5000 nested braceless ifs must be accepted (iterative skip)");
 	prism_free(&r);
 }
 
@@ -6132,6 +6124,84 @@ static void test_generic_nonident_target_fold(void) {
 	prism_free(&r);
 }
 
+static void test_cond_stack_deep_nesting_silent_drop(void) {
+	/* BUG: collect_source_defines uses a fixed cond_stack[32].  A #define at
+	 * #ifdef depth > 32 is silently skipped — the ABI-altering macro is lost
+	 * from the transpiled output in non-flatten mode.
+	 *
+	 * Fix: dynamically grow cond_stack via realloc. */
+	size_t cap = 32000;
+	char *code = malloc(cap);
+	CHECK(code != NULL, "cond-depth-33: malloc"); if (!code) return;
+	int n = 0;
+	for (int i = 1; i <= 33; i++)
+		n += snprintf(code + n, cap - n, "#ifdef A%d\n", i);
+	n += snprintf(code + n, cap - n, "#define DEEP_NESTED_ABI_DEFINE 1\n");
+	for (int i = 0; i < 33; i++)
+		n += snprintf(code + n, cap - n, "#endif\n");
+	n += snprintf(code + n, cap - n, "#include <stddef.h>\nint v;\n");
+	char *path = create_temp_file(code);
+	free(code);
+	CHECK(path != NULL, "cond-depth-33: create temp file"); if (!path) return;
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = false;
+	PrismResult r = prism_transpile_file(path, feat);
+	CHECK_EQ(r.status, PRISM_OK, "cond-depth-33: transpiles OK");
+	if (r.output)
+		CHECK(strstr(r.output, "DEEP_NESTED_ABI_DEFINE") != NULL,
+		      "cond-depth-33: define at depth 33 must NOT be silently dropped");
+	else
+		CHECK(0, "cond-depth-33: output is NULL");
+	prism_free(&r);
+	unlink(path); free(path);
+}
+
+static void test_defer_shadow_limit_dynamic(void) {
+	/* BUG: defer_shadows is a fixed array of MAX_DEFER_SHADOWS=256.
+	 * Exceeding it produces a hard error.  For auto-generated code with
+	 * many typedefs and massive defer blocks, 256 can be hit.
+	 *
+	 * Fix: defer_shadows should grow dynamically via realloc. */
+	size_t cap = 256000;
+	char *code = malloc(cap);
+	CHECK(code != NULL, "defer-shadow-260: malloc"); if (!code) return;
+	int n = 0;
+	for (int i = 0; i < 260; i++)
+		n += snprintf(code + n, cap - n, "typedef int mytype%d;\n", i);
+	n += snprintf(code + n, cap - n, "void f(void) {\n  defer {\n");
+	for (int i = 0; i < 260; i++)
+		n += snprintf(code + n, cap - n, "    mytype%d v%d = 0; (void)v%d;\n", i, i, i);
+	n += snprintf(code + n, cap - n, "  }\n  {\n");
+	for (int i = 0; i < 260; i++)
+		n += snprintf(code + n, cap - n, "    int mytype%d = %d; (void)mytype%d;\n", i, i, i);
+	n += snprintf(code + n, cap - n, "  }\n}\n");
+	PrismResult r = prism_transpile_source(code, "defer_shadow_260.c", prism_defaults());
+	free(code);
+	CHECK_EQ(r.status, PRISM_OK,
+		 "defer-shadow-260: >256 shadows must not be a hard limit");
+	prism_free(&r);
+}
+
+static void test_skip_one_stmt_deep_iterative(void) {
+	/* BUG: skip_one_stmt uses C-level recursion.  A for-loop with >4096
+	 * braceless nested ifs errors out.
+	 *
+	 * Fix: convert skip_one_stmt to an iterative loop. */
+	size_t cap = 300000;
+	char *code = malloc(cap);
+	CHECK(code != NULL, "skip-stmt-5k: malloc"); if (!code) return;
+	int n = 0;
+	n += snprintf(code + n, cap - n, "void f(void) {\n  for (int i = 0; i < 10; i++)\n");
+	for (int i = 0; i < 5000; i++)
+		n += snprintf(code + n, cap - n, "    if (1)\n");
+	n += snprintf(code + n, cap - n, "      i = 0;\n}\n");
+	PrismResult r = prism_transpile_source(code, "deep_skip.c", prism_defaults());
+	free(code);
+	CHECK_EQ(r.status, PRISM_OK,
+		 "skip-stmt-5k: 5000 braceless nested ifs must not hit recursion limit");
+	prism_free(&r);
+}
+
 void run_api_tests(void) {
 test_typeof_orelse_leak();
 	printf("\n=== API TESTS ===\n");
@@ -6346,4 +6416,9 @@ test_typeof_orelse_leak();
 
 	// Audit round 40: conditional define preservation with guards
 	test_collect_source_defines_conditional_guard_preserved();
+
+	// Audit round 44: hardcoded resource limits
+	test_cond_stack_deep_nesting_silent_drop();
+	test_defer_shadow_limit_dynamic();
+	test_skip_one_stmt_deep_iterative();
 }

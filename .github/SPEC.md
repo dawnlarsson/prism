@@ -250,7 +250,7 @@ For every variable declaration at every depth, if the declared name collides wit
 
 **For-init scope:** Variables declared in `for`-init (e.g., `for (int T = 0; …)`) are shadowed for the entire loop body (through the closing `}` or braceless statement end), not just through the `)`. This matches C99 §6.8.5p3: the for-init declaration's scope extends to the end of the loop body.
 
-**Braceless body detection:** The for-init body end is determined by `skip_one_stmt()`, a recursive helper that correctly handles all C statement forms: braced `{…}`, `if (…) stmt [else stmt]`, `for`/`while`/`switch (…) stmt`, `do stmt while (…);`, and simple `expr;`. This prevents if-else branches from prematurely terminating the shadow scope (e.g., `for (int T=0;…) if(c) x=T; else T*x;` — the else branch is within T's shadow scope).
+**Braceless body detection:** The for-init body end is determined by `skip_one_stmt()`, an iterative helper that correctly handles all C statement forms: braced `{…}`, `if (…) stmt [else stmt]`, `for`/`while`/`switch (…) stmt`, `do stmt while (…);`, and simple `expr;`. This prevents if-else branches from prematurely terminating the shadow scope (e.g., `for (int T=0;…) if(c) x=T; else T*x;` — the else branch is within T's shadow scope).
 
 **Struct/union body scan (typedef declarations):** When a `typedef` contains a `struct`/`union` body (`typedef struct { … } name;`), Phase 1 scans the body for field names that shadow typedefs. A token `m` followed by `;`, `,`, `:`, `[`, or `=` where `m` is a known typedef triggers a shadow. **Anonymous bitfield exemption:** When the next token is `:` (bitfield width), a backward walk checks whether a type specifier (any token beyond qualifiers and attributes) precedes `m`. If no type precedes `m`, then `m` is the type specifier itself in an anonymous bitfield (`T : width;`), not a field name — no shadow is registered. This prevents typedef poisoning from patterns like `uint32_t : 5;` in hardware register definitions.
 
@@ -347,7 +347,7 @@ Walks all tokens looking for `[…]` pairs containing `orelse`. Marks them with 
 
 **Function:** `p1_verify_cfg`
 
-Runs after all Phase 1 sub-phases complete. Gated by `F_DEFER | F_ZEROINIT` — skipped entirely when neither feature is enabled. For each function's `P1FuncEntry[]` array, performs an O(N) linear sweep with label hash table and monotonic watermark arrays.
+Runs after all Phase 1 sub-phases complete. Gated by `F_DEFER | F_ZEROINIT` — skipped entirely when neither feature is enabled. For each function's `P1FuncEntry[]` array, performs an O(N) linear sweep with label hash table and monotonic watermark arrays. The label hash table is allocated before `arena_mark` so it persists in `FuncMeta` for O(1) label lookup in Pass 2; only the watermark arrays and forward-goto list are reclaimed via `arena_restore`.
 
 ### Algorithm
 
@@ -355,7 +355,7 @@ Runs after all Phase 1 sub-phases complete. Gated by `F_DEFER | F_ZEROINIT` — 
 
 2. Maintain watermark arrays `wm_defer[]` and `wm_decl[]` indexed by entry array position. As the sweep encounters `P1K_DEFER` and `P1K_DECL` entries, it appends them to `defer_list`/`decl_list` and records the current list lengths in the watermark arrays. Separate switch watermark arrays (`sw_defer_wm[]`, `sw_decl_wm[]`) are indexed by `scope_id` for O(1) lookup from case entries.
 
-3. **Forward goto:** When a `P1K_GOTO` is encountered and its target label has not yet been seen, add it to a pending forward-goto list. When the target `P1K_LABEL` is reached, resolve by checking all `P1K_DEFER` and `P1K_DECL` entries between the goto and label positions. If any dangerous entry's scope is an ancestor-or-self of the label's scope, error.
+3. **Forward goto:** When a `P1K_GOTO` is encountered and its target label has not yet been seen, add it to a forward-goto hash table (separate-chaining, keyed by label name). When the target `P1K_LABEL` is reached, resolve by looking up the hash chain for O(1) amortized resolution, then checking all `P1K_DEFER` and `P1K_DECL` entries between the goto and label positions. If any dangerous entry's scope is an ancestor-or-self of the label's scope, error. Scope exits are pre-computed via `scope_block_exits` (O(depth) LCA tree walk) and stored in `P1FuncEntry.label.exits` for O(1) retrieval in Pass 2.
 
 4. **Backward goto:** When a `P1K_GOTO` targets a label already seen, check entries in `[0, wm_defer[label_index])` range. The scope-close check uses `label->token_index` (not the goto's token_index) because the goto jumps into the scope containing the label.
 
@@ -386,7 +386,7 @@ Forward gotos past `raw`-marked declarations are skipped (safe — user explicit
 
 O(N) per function where N is the number of `P1FuncEntry` items, plus O(depth) for `scope_is_ancestor_or_self` checks.
 
-**Arena management:** Per-function temporary allocations (label hash table, watermark arrays, forward-goto list) are reclaimed after each function via `arena_mark`/`arena_restore`, preventing O(total_entries) memory accumulation across all functions in a translation unit.
+**Arena management:** Per-function temporary allocations (watermark arrays, forward-goto list) are reclaimed after each function via `arena_mark`/`arena_restore`, preventing O(total_entries) memory accumulation across all functions in a translation unit. The label hash table is allocated **before** `arena_mark` and persists in `FuncMeta.label_hash` for O(1) label lookup in Pass 2.
 
 ---
 
@@ -409,7 +409,7 @@ Tokens with tag bits or at statement boundaries are dispatched to handlers:
 | `handle_open_brace` | `{` | Push scope. Read `P1_SCOPE_*` from `tok->ann` for classification. Handle compound-literal-in-ctrl-paren, orelse guard, stmt_expr detection. |
 | `handle_close_brace` | `}` | Pop scopes, emit defers (LIFO), handle orelse guard close (consume trailing `;` to prevent dangling-else). |
 | `try_zero_init_decl` | Statement start, type keyword/typedef | Parse declaration, insert `= {0}` or `= 0` or `memset` call. |
-| `p1_label_find` | `TT_GOTO` dispatch | Query Phase 1D `p1_entries` array for label scope depth; no separate label table needed. |
+| `p1_label_find` | `TT_GOTO` dispatch | O(1) label lookup via `FuncMeta.label_hash` (persisted from Phase 2A); falls back to linear scan if no hash. |
 | Orelse handlers | `TT_ORELSE` | Multiple handlers for bracket, decl-init, block, bare-assign, bare-action, bare-compound forms. |
 | FuncMeta lookup | Function body `{` | Read `FuncMeta[next_func_idx]` for return type and taint flags. |
 
@@ -431,7 +431,7 @@ Defers execute in LIFO order at scope exit — whether via `return`, `break`, `c
 
 For `goto`: the handler looks up the target label's scope depth, then emits defers from the current scope level down to the target's level.
 
-`goto_scope_exits` counts brace-depth exits between a goto and its target label by scanning the token stream and counting only `{` / `}` tokens. Parentheses `(` `)` and brackets `[` `]` are intentionally excluded \u2014 they delimit expressions, not scopes. Counting them would miscalculate the scope-exit count for any goto whose token range happens to contain unmatched paren or bracket tokens (e.g. due to macro-expanded constructs). The call is guarded by `target_depth >= ctx->block_depth`, so it only fires when a same-depth or shallower label is the target.
+Scope exits between a goto and its target label are pre-computed during Phase 2A via `scope_block_exits` (an O(depth) LCA tree walk on the scope tree) and stored in `P1FuncEntry.label.exits`. Pass 2 retrieves these via `p1_goto_exits` using a monotonic cursor through the goto entries (O(1) amortized). This replaces the former `goto_scope_exits` O(N) token-stream scan.
 
 For `return`: emits all defers from the current scope to function scope. Uses `ret_counter` to generate unique labels for cleanup blocks.
 
@@ -643,7 +643,7 @@ Multiple `.c` files are each transpiled independently and passed to CC. Assembly
 
 When `-fno-flatten-headers` is active, Prism runs `cc -E` which consumes in-file `#define` directives. The transpiled output reconstructs `#include` directives but must also re-emit the user's `#define`s that appeared before the first `#include`. `collect_source_defines` scans the original source file (raw text, not tokens) and extracts non-function-like `#define NAME VALUE` directives, both unconditional and conditional. These are re-emitted as `#ifndef NAME` / `#define NAME VALUE` / `#endif` guards by `emit_consumed_defines` before any `#include` directives.
 
-**Conditional guard extraction:** Defines inside `#ifdef`/`#ifndef`/`#if`/`#elif`/`#else` blocks are extracted along with their enclosing preprocessor guard text. A condition stack (max depth 32) tracks each nesting level's opening directive (e.g., `#ifdef __APPLE__\n`) and current branch directive (e.g., `#else\n`). When a `#define` is found inside conditional blocks, `emit_consumed_defines` wraps it in the reconstructed guard (concatenation of all active condition stack entries' opening/branch text) followed by matching `#endif` lines. This preserves platform-gated defines like `#ifdef __APPLE__ / #define _DARWIN_C_SOURCE / #endif`.
+**Conditional guard extraction:** Defines inside `#ifdef`/`#ifndef`/`#if`/`#elif`/`#else` blocks are extracted along with their enclosing preprocessor guard text. A dynamically grown condition stack tracks each nesting level's opening directive (e.g., `#ifdef __APPLE__\n`) and current branch directive (e.g., `#else\n`). When a `#define` is found inside conditional blocks, `emit_consumed_defines` wraps it in the reconstructed guard (concatenation of all active condition stack entries' opening/branch text) followed by matching `#endif` lines. This preserves platform-gated defines like `#ifdef __APPLE__ / #define _DARWIN_C_SOURCE / #endif`.
 
 The scanner handles: multi-line block comments (tracked via `in_block_comment`), line continuations (`\` at end of line), inline block comments between `#` and the directive name, `#ifdef`/`#ifndef`/`#if`/`#elif`/`#else`/`#endif` nesting with condition stack tracking, multi-line continuation values, and `#define`s that follow block comment closings on the same line.
 
@@ -741,7 +741,7 @@ These are inherently runtime and cannot move to Pass 1:
 - **`ret_counter`** — monotonic during emit
 - **Line directive / whitespace emission** — tied to output position
 - **Bare-expression orelse classification** — requires expression boundary parsing; safe because symbol table is immutable
-- **`p1_label_find`** — queries the immutable Phase 1D `p1_entries` array for label scope depth; `handle_goto_keyword` reads CFG artifacts directly with no separate label scan
+- **`p1_label_find`** — O(1) label lookup via `FuncMeta.label_hash` (open-addressing hash table persisted from Phase 2A); `handle_goto_keyword` reads pre-computed scope exits via `p1_goto_exits`
 
 ---
 

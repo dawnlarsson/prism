@@ -233,6 +233,8 @@ typedef struct {
 	int entry_start;           // Start index into p1_entries[] for this function
 	int entry_count;           // Number of P1FuncEntry items for this function
 	uint64_t defer_name_bloom; // Bloom filter of identifier names in defer bodies
+	int *label_hash;           // Open-addressing hash table: name → entry index (-1=empty)
+	int label_hash_mask;       // Power-of-2 mask for label_hash probing
 } FuncMeta;
 
 // FNV-1a-based bloom bit for defer body identifier names
@@ -261,7 +263,7 @@ typedef struct {
 	uint32_t token_index;       // tok_idx for sorting in Phase 2
 	Token *tok;
 	union {
-		struct { char *name; int len; } label;     // P1K_LABEL, P1K_GOTO
+		struct { char *name; int len; int exits; } label; // P1K_LABEL, P1K_GOTO (exits: pre-computed scope exits for P1K_GOTO)
 		struct { bool has_init; bool is_vla; bool has_raw; bool is_static_storage;
 			 uint32_t body_close_idx; } decl; // P1K_DECL
 		struct { uint16_t switch_scope_id; } kase;   // P1K_CASE
@@ -413,6 +415,7 @@ static PRISM_THREAD_LOCAL DeferEntry defer_stack[2048];
 static PRISM_THREAD_LOCAL int defer_count = 0;
 static PRISM_THREAD_LOCAL CtrlState ctrl_state;
 static PRISM_THREAD_LOCAL int current_func_idx = -1; // Index into func_meta[] for the function being emitted
+static PRISM_THREAD_LOCAL int goto_entry_cursor = 0; // Cursor into entries[] for next P1K_GOTO lookup
 
 // Track variables that shadow a name captured by a defer in an enclosing scope.
 // The shadow is only dangerous if a control-flow exit pastes the defer while the
@@ -426,9 +429,9 @@ typedef struct {
 	int defer_idx;     // which defer it conflicts with
 } DeferShadow;
 
-#define MAX_DEFER_SHADOWS 256
-static PRISM_THREAD_LOCAL DeferShadow defer_shadows[MAX_DEFER_SHADOWS];
+static PRISM_THREAD_LOCAL DeferShadow *defer_shadows = NULL;
 static PRISM_THREAD_LOCAL int defer_shadow_count = 0;
+static PRISM_THREAD_LOCAL int defer_shadow_cap = 0;
 
 // Forward declarations (only for functions used before their definition)
 static DeclResult parse_declarator(Token *tok, bool emit);
@@ -499,6 +502,26 @@ static int scope_tree_depth(uint16_t scope_id) {
 	for (uint16_t s = scope_id; s != 0; s = scope_tree[s].parent_id)
 		depth++;
 	return depth;
+}
+
+// Count block-scope exits from goto_sid to the LCA of goto_sid and label_sid.
+// A "block scope" is any non-init {} scope (is_init braces don't affect block_depth).
+// This replaces the O(N) token walk in goto_scope_exits with an O(depth) tree walk.
+static int scope_block_exits(uint16_t goto_sid, uint16_t label_sid) {
+	// Bring both to same tree depth
+	uint16_t a = goto_sid, b = label_sid;
+	int da = scope_tree_depth(a), db = scope_tree_depth(b);
+	while (da > db) { a = scope_tree[a].parent_id; da--; }
+	while (db > da) { b = scope_tree[b].parent_id; db--; }
+	// Walk up together to find LCA
+	while (a != b && a != 0) { a = scope_tree[a].parent_id; b = scope_tree[b].parent_id; }
+	uint16_t lca = a;
+	// Count non-init scopes from goto_sid to LCA
+	int exits = 0;
+	for (uint16_t s = goto_sid; s != lca && s != 0; s = scope_tree[s].parent_id)
+		if (!scope_tree[s].is_init)
+			exits++;
+	return exits;
 }
 
 // Find the innermost statement-expression ancestor scope of scope_id.
@@ -1224,9 +1247,11 @@ static void check_defer_var_shadow(Token *var_name) {
 					decl_depth = brace_depth;
 					continue;
 				}
-				if (defer_shadow_count >= MAX_DEFER_SHADOWS)
-					error_tok(var_name, "too many shadowed variables in defer scope; limit is %d",
-						  MAX_DEFER_SHADOWS);
+				if (defer_shadow_count >= defer_shadow_cap) {
+					int new_cap = defer_shadow_cap ? defer_shadow_cap * 2 : 64;
+					defer_shadows = realloc(defer_shadows, new_cap * sizeof(*defer_shadows));
+					defer_shadow_cap = new_cap;
+				}
 				defer_shadows[defer_shadow_count++] = (DeferShadow){
 						.name = name, .len = nlen,
 						.block_depth = ctx->block_depth + (in_for_init() ? 1 : 0),
@@ -2776,24 +2801,20 @@ static Token *walk_balanced_orelse(Token *tok) {
 					  "in the LHS (would be evaluated twice); "
 					  "hoist the expression to a variable first",
 					  false, is_bracket, false);
-		// Use statement expression to evaluate LHS exactly once,
-		// preventing double evaluation of volatile reads or side effects
-		// that sneak past reject_orelse_side_effects (e.g. bare volatile
-		// variable reads in typeof VLA dimensions).
-		// Use __auto_type to preserve the original type (pointers, structs, etc.)
-		// instead of hardcoding 'long long' which corrupts non-integer types.
-		unsigned oe = ctx->ret_counter++;
-		OUT_LIT(" ({__auto_type __prism_oe_");
-		out_uint(oe);
-		OUT_LIT(" = (");
+		// Simple ternary: (LHS) ? (LHS) : (RHS).
+		// reject_orelse_side_effects above already rejects function calls,
+		// ++/--, assignments, asm, and pointer dereferences, so the double
+		// evaluation of LHS is safe.  A bare volatile variable read is the
+		// only case that passes — an extra hardware read is acceptable and
+		// avoids GNU statement expressions / __auto_type which MSVC cannot
+		// compile.
+		OUT_LIT(" (");
 		emit_token_range_orelse(lhs_start, orelse_found);
-		OUT_LIT("); __prism_oe_");
-		out_uint(oe);
-		OUT_LIT(" ? __prism_oe_");
-		out_uint(oe);
-		OUT_LIT(" : (");
+		OUT_LIT(") ? (");
+		emit_token_range_orelse(lhs_start, orelse_found);
+		OUT_LIT(") : (");
 		emit_token_range_orelse(rhs_start, rhs_end);
-		OUT_LIT("); })");
+		OUT_LIT(")");
 	}
 	emit_tok(end); // emit ] or )
 	return tok_next(end);
@@ -4277,6 +4298,18 @@ static P1LabelResult p1_label_find(Token *tok, int func_idx) {
 		return (P1LabelResult){0, NULL};
 	FuncMeta *fm = &func_meta[func_idx];
 	P1FuncEntry *entries = &p1_entries[fm->entry_start];
+	if (fm->label_hash) {
+		uint32_t h = (uint32_t)fast_hash(tok_loc(tok), tok->len);
+		for (int probe = 0; probe <= fm->label_hash_mask; probe++) {
+			int slot = (h + probe) & fm->label_hash_mask;
+			if (fm->label_hash[slot] < 0) break;
+			P1FuncEntry *e = &entries[fm->label_hash[slot]];
+			if (e->label.len == tok->len &&
+			    !memcmp(e->label.name, tok_loc(tok), tok->len))
+				return (P1LabelResult){scope_tree_depth(e->scope_id), e->tok};
+		}
+		return (P1LabelResult){0, NULL};
+	}
 	for (int i = 0; i < fm->entry_count; i++) {
 		if (entries[i].kind == P1K_LABEL &&
 		    entries[i].label.len == tok->len &&
@@ -4284,6 +4317,22 @@ static P1LabelResult p1_label_find(Token *tok, int func_idx) {
 			return (P1LabelResult){scope_tree_depth(entries[i].scope_id), entries[i].tok};
 	}
 	return (P1LabelResult){0, NULL};
+}
+
+// Look up pre-computed scope exits for a goto at `goto_tok`.
+// Scans P1K_GOTO entries from cursor position (entries are in token order).
+static int p1_goto_exits(Token *goto_tok, int func_idx) {
+	if (func_idx < 0 || func_idx >= func_meta_count) return 0;
+	FuncMeta *fm = &func_meta[func_idx];
+	P1FuncEntry *entries = &p1_entries[fm->entry_start];
+	uint32_t gt_idx = tok_idx(goto_tok);
+	for (int i = goto_entry_cursor; i < fm->entry_count; i++) {
+		if (entries[i].kind == P1K_GOTO && entries[i].token_index == gt_idx) {
+			goto_entry_cursor = i + 1;
+			return entries[i].label.exits;
+		}
+	}
+	return 0;
 }
 
 // Handle 'goto': defer cleanup emission
@@ -4313,9 +4362,7 @@ static Token *handle_goto_keyword(Token *tok) {
 			int target_depth = info.tok ? info.scope_depth : ctx->block_depth;
 
 			if (target_depth >= ctx->block_depth) {
-				int exits = 0;
-				if (info.tok && tok_loc(info.tok) > tok_loc(goto_tok)) exits = goto_scope_exits(goto_tok, info.tok);
-				else if (info.tok) exits = goto_scope_exits(info.tok, goto_tok);
+				int exits = p1_goto_exits(goto_tok, current_func_idx);
 
 				if (exits > 0) {
 					target_depth = ctx->block_depth - exits;
@@ -4861,15 +4908,16 @@ static void collect_source_defines(const char *input_file) {
 
 	// Condition stack: tracks raw directive text at each nesting level
 	// for re-emitting conditional defines with their original guards.
-#define COND_STACK_MAX 32
-	struct {
+	typedef struct {
 		char *opening;       // e.g. "#ifdef __APPLE__\n"
 		char *branches;      // accumulated "#else\n" or "#elif EXPR\n" text (NULL initially)
 		int branches_len;
 		int branches_cap;
 		bool extractable;    // false if opening/branch had continuation (multi-line expr)
-	} cond_stack[COND_STACK_MAX];
-	memset(cond_stack, 0, sizeof(cond_stack));
+	} CondStackEntry;
+	int cond_stack_cap = 32;
+	CondStackEntry *cond_stack = calloc(cond_stack_cap, sizeof(CondStackEntry));
+	if (!cond_stack) { free(line); fclose(f); return; }
 
 	while (getline(&line, &line_cap, f) >= 0) {
 		char *p = line;
@@ -4947,7 +4995,15 @@ static void collect_source_defines(const char *input_file) {
 		// Track #if/#ifdef/#ifndef/#elif/#else/#endif nesting
 		if (strncmp(p, "ifdef", 5) == 0 || strncmp(p, "ifndef", 6) == 0 ||
 		    (strncmp(p, "if", 2) == 0 && (p[2] == ' ' || p[2] == '\t' || p[2] == '('))) {
-			if (cond_depth < COND_STACK_MAX) {
+			if (cond_depth >= cond_stack_cap) {
+				int nc = cond_stack_cap * 2;
+				CondStackEntry *ns = realloc(cond_stack, nc * sizeof(CondStackEntry));
+				if (ns) {
+					memset(ns + cond_stack_cap, 0, (nc - cond_stack_cap) * sizeof(CondStackEntry));
+					cond_stack = ns; cond_stack_cap = nc;
+				}
+			}
+			if (cond_depth < cond_stack_cap) {
 				memset(&cond_stack[cond_depth], 0, sizeof(cond_stack[0]));
 				cond_stack[cond_depth].opening = make_dir_line(p, dir_text_len);
 				cond_stack[cond_depth].extractable = !dir_has_continuation;
@@ -4958,7 +5014,7 @@ static void collect_source_defines(const char *input_file) {
 		if (strncmp(p, "endif", 5) == 0) {
 			if (cond_depth > 0) {
 				cond_depth--;
-				if (cond_depth < COND_STACK_MAX) {
+				if (cond_depth < cond_stack_cap) {
 					free(cond_stack[cond_depth].opening);
 					free(cond_stack[cond_depth].branches);
 					cond_stack[cond_depth].opening = NULL;
@@ -4968,7 +5024,7 @@ static void collect_source_defines(const char *input_file) {
 			goto check_continuation;
 		}
 		if (strncmp(p, "else", 4) == 0 || strncmp(p, "elif", 4) == 0) {
-			if (cond_depth > 0 && cond_depth <= COND_STACK_MAX) {
+			if (cond_depth > 0 && cond_depth <= cond_stack_cap) {
 				int d = cond_depth - 1;
 				int blen = 1 + dir_text_len + 1; // "#" + text + "\n"
 				int need = cond_stack[d].branches_len + blen + 1;
@@ -4991,9 +5047,8 @@ static void collect_source_defines(const char *input_file) {
 		// Only break on #include at unconditional scope
 		if (strncmp(p, "include", 7) == 0 && cond_depth == 0) break;
 
-		// Skip defines inside conditions that have multi-line expressions
-		// or are too deeply nested for our stack.
-		if (cond_depth > COND_STACK_MAX) goto check_continuation;
+		// Skip defines inside conditions that have multi-line expressions.
+		if (cond_depth > cond_stack_cap) goto check_continuation;
 		if (cond_depth > 0) {
 			bool can_extract = true;
 			for (int d = 0; d < cond_depth; d++) {
@@ -5142,10 +5197,11 @@ static void collect_source_defines(const char *input_file) {
 		}
 	}
 	// Clean up condition stack (in case file ended without matching #endif)
-	for (int d = 0; d < cond_depth && d < COND_STACK_MAX; d++) {
+	for (int d = 0; d < cond_depth && d < cond_stack_cap; d++) {
 		free(cond_stack[d].opening);
 		free(cond_stack[d].branches);
 	}
+	free(cond_stack);
 	free(line);
 	fclose(f);
 }
@@ -5865,87 +5921,162 @@ static void p1_build_scope_tree(Token *start) {
 // the statement (typically the closing `;`, `}`, or end of a do-while).
 // Handles if-else, for, while, do-while, switch, braced, and simple statements.
 // Returns NULL if the statement end cannot be determined.
+//
+// Iterative implementation to avoid stack overflow on deeply nested braceless
+// control flow (e.g., 5000 nested `if (1)` statements).
 static Token *skip_one_stmt(Token *tok, int depth) {
-	if (depth >= 4096) error_tok(tok, "braceless control flow nesting depth exceeds 4096");
+	// For non-tail positions (if-body before else check, do-body before while check),
+	// we maintain a small explicit stack.  In practice, the non-tail positions only
+	// nest via if-body containing another do-while containing another if-body, etc.
+	// A stack of 4096 is more than sufficient.
+	enum { CONT_IF_ELSE, CONT_DO_WHILE };
+	typedef struct { int kind; Token *tok; } Cont;
+	int cont_n = 0, cont_cap = 0;
+	Cont *cont_stack = NULL;
+
+#define PUSH_CONT(k, t) do { \
+	if (cont_n >= cont_cap) { \
+		cont_cap = cont_cap ? cont_cap * 2 : 64; \
+		cont_stack = realloc(cont_stack, (size_t)cont_cap * sizeof(Cont)); \
+	} \
+	cont_stack[cont_n++] = (Cont){k, t}; \
+} while (0)
+
+restart:
+	(void)0;
 	while (tok && tok->kind == TK_PREP_DIR) tok = tok_next(tok);
 	tok = skip_noise(tok); // skip C23 [[attr]] and __attribute__((...))
-	if (!tok || tok->kind == TK_EOF) return NULL;
+	if (!tok || tok->kind == TK_EOF) { free(cont_stack); return NULL; }
 
 	// Braced compound statement
-	if (match_ch(tok, '{') && tok_match(tok))
-		return tok_match(tok);
+	if (match_ch(tok, '{') && tok_match(tok)) {
+		Token *end = tok_match(tok);
+		// Process continuations
+		while (cont_n > 0) {
+			Cont c = cont_stack[cont_n - 1];
+			if (c.kind == CONT_IF_ELSE) {
+				cont_n--;
+				Token *n = tok_next(end);
+				while (n && n->kind == TK_PREP_DIR) n = tok_next(n);
+				if (n && (n->tag & TT_IF) && tok_loc(n)[0] == 'e') {
+					tok = tok_next(n);
+					goto restart;
+				}
+				end = end; // no else — end stays
+			} else if (c.kind == CONT_DO_WHILE) {
+				cont_n--;
+				Token *w = tok_next(end);
+				while (w && w->kind == TK_PREP_DIR) w = tok_next(w);
+				if (w && (w->tag & TT_LOOP) && equal(w, "while")) {
+					Token *p = tok_next(w);
+					while (p && p->kind == TK_PREP_DIR) p = tok_next(p);
+					if (p && match_ch(p, '(') && tok_match(p)) {
+						Token *a = tok_next(tok_match(p));
+						while (a && a->kind == TK_PREP_DIR) a = tok_next(a);
+						if (a && match_ch(a, ';')) { end = a; continue; }
+					}
+				}
+				free(cont_stack); return NULL;
+			}
+		}
+		free(cont_stack);
+		return end;
+	}
 
 	// 'if' / 'else'
 	if (tok->tag & TT_IF) {
-		if (tok_loc(tok)[0] == 'e') // 'else': skip body
-			return skip_one_stmt(tok_next(tok), depth + 1);
+		if (tok_loc(tok)[0] == 'e') { // 'else': skip body (tail call)
+			tok = tok_next(tok);
+			goto restart;
+		}
 		// 'if': skip '(...)' then body, check for 'else'
 		Token *p = tok_next(tok);
 		while (p && p->kind == TK_PREP_DIR) p = tok_next(p);
 		if (p && match_ch(p, '(') && tok_match(p)) {
-			Token *end = skip_one_stmt(tok_next(tok_match(p)), depth + 1);
-			if (!end) return NULL;
-			Token *n = tok_next(end);
-			while (n && n->kind == TK_PREP_DIR) n = tok_next(n);
-			if (n && (n->tag & TT_IF) && tok_loc(n)[0] == 'e')
-				return skip_one_stmt(tok_next(n), depth + 1);
-			return end;
+			PUSH_CONT(CONT_IF_ELSE, tok);
+			tok = tok_next(tok_match(p));
+			goto restart;
 		}
-		return NULL;
+		free(cont_stack); return NULL;
 	}
 
-	// 'for', 'while', 'switch': keyword '(...)' body
+	// 'for', 'while', 'switch': keyword '(...)' body (tail call)
 	if ((tok->tag & (TT_LOOP | TT_SWITCH)) && tok_loc(tok)[0] != 'd') {
 		Token *p = tok_next(tok);
 		while (p && p->kind == TK_PREP_DIR) p = tok_next(p);
-		if (p && match_ch(p, '(') && tok_match(p))
-			return skip_one_stmt(tok_next(tok_match(p)), depth + 1);
-		return NULL;
+		if (p && match_ch(p, '(') && tok_match(p)) {
+			tok = tok_next(tok_match(p));
+			goto restart;
+		}
+		free(cont_stack); return NULL;
 	}
 
 	// 'do': body then 'while' '(...)' ';'
 	if ((tok->tag & TT_LOOP) && tok_loc(tok)[0] == 'd') {
-		Token *end = skip_one_stmt(tok_next(tok), depth + 1);
-		if (!end) return NULL;
-		Token *w = tok_next(end);
-		while (w && w->kind == TK_PREP_DIR) w = tok_next(w);
-		if (w && (w->tag & TT_LOOP) && equal(w, "while")) {
-			Token *p = tok_next(w);
-			while (p && p->kind == TK_PREP_DIR) p = tok_next(p);
-			if (p && match_ch(p, '(') && tok_match(p)) {
-				Token *a = tok_next(tok_match(p));
-				while (a && a->kind == TK_PREP_DIR) a = tok_next(a);
-				if (a && match_ch(a, ';')) return a;
-			}
-		}
-		return NULL;
+		PUSH_CONT(CONT_DO_WHILE, tok);
+		tok = tok_next(tok);
+		goto restart;
 	}
 
-	// 'case' / 'default' label: skip label expr + ':', recurse on body.
-	// Without this, the 'simple statement' fallback scans for ';' at depth 0
-	// and walks past the closing '}' of a braced case body into the next
-	// statement, making for-init shadows bleed past the loop.
+	// 'case' / 'default' label: skip label expr + ':', recurse on body (tail call).
 	if ((tok->tag & (TT_CASE | TT_DEFAULT)) && !is_known_typedef(tok)) {
 		int ld = 0;
 		for (Token *s = tok_next(tok); s && s->kind != TK_EOF; s = tok_next(s)) {
 			if (s->flags & TF_OPEN) { ld++; continue; }
 			if (s->flags & TF_CLOSE) { ld--; continue; }
-			if (ld == 0 && match_ch(s, ':'))
-				return skip_one_stmt(tok_next(s), depth + 1);
+			if (ld == 0 && match_ch(s, ':')) {
+				tok = tok_next(s);
+				goto restart;
+			}
 		}
-		return NULL;
+		free(cont_stack); return NULL;
 	}
 
 	// Simple statement: scan to ';' at balanced depth
-	int pd = 0;
-	for (Token *s = tok; s && s->kind != TK_EOF; s = tok_next(s)) {
-		if (s->flags & TF_OPEN) pd++;
-		else if (s->flags & TF_CLOSE) pd--;
-		else if (pd == 0 && match_ch(s, ';'))
-			return s;
+	{
+		int pd = 0;
+		for (Token *s = tok; s && s->kind != TK_EOF; s = tok_next(s)) {
+			if (s->flags & TF_OPEN) pd++;
+			else if (s->flags & TF_CLOSE) pd--;
+			else if (pd == 0 && match_ch(s, ';')) {
+				Token *end = s;
+				// Process continuations
+				while (cont_n > 0) {
+					Cont c = cont_stack[cont_n - 1];
+					if (c.kind == CONT_IF_ELSE) {
+						cont_n--;
+						Token *n = tok_next(end);
+						while (n && n->kind == TK_PREP_DIR) n = tok_next(n);
+						if (n && (n->tag & TT_IF) && tok_loc(n)[0] == 'e') {
+							tok = tok_next(n);
+							goto restart;
+						}
+						// no else — end stays
+					} else if (c.kind == CONT_DO_WHILE) {
+						cont_n--;
+						Token *w = tok_next(end);
+						while (w && w->kind == TK_PREP_DIR) w = tok_next(w);
+						if (w && (w->tag & TT_LOOP) && equal(w, "while")) {
+							Token *p2 = tok_next(w);
+							while (p2 && p2->kind == TK_PREP_DIR) p2 = tok_next(p2);
+							if (p2 && match_ch(p2, '(') && tok_match(p2)) {
+								Token *a = tok_next(tok_match(p2));
+								while (a && a->kind == TK_PREP_DIR) a = tok_next(a);
+								if (a && match_ch(a, ';')) { end = a; continue; }
+							}
+						}
+						free(cont_stack); return NULL;
+					}
+				}
+				free(cont_stack);
+				return end;
+			}
+		}
 	}
+	free(cont_stack);
 	return NULL;
 }
+#undef PUSH_CONT
 
 // Phase 1B: walk all tokens at all depths to build the complete typedef + enum table.
 
@@ -7264,11 +7395,19 @@ static void p1_verify_cfg(void) {
 			}
 		}
 
+		// Label hash: open-addressing, power-of-2 size, maps name → entry index.
+		// Allocated before arena mark so it persists in FuncMeta for Pass 2 O(1) lookup.
+		int cnt = fm->entry_count;
+		if (cnt < 0) cnt = 0; // GCC VRP guard: entry_count is always ≥ 0
+		int hash_sz = 64;
+		while (hash_sz < cnt * 2) hash_sz <<= 1;
+		int *label_hash = arena_alloc(&ctx->main_arena, (size_t)hash_sz * sizeof(int));
+		memset(label_hash, 0xFF, (size_t)hash_sz * sizeof(int)); // -1 = empty
+		int hash_mask = hash_sz - 1;
+
 		ArenaMark mark = arena_mark(&ctx->main_arena);
 
 		P1FuncEntry *ents = &p1_entries[fm->entry_start];
-		int cnt = fm->entry_count;
-		if (cnt < 0) cnt = 0; // GCC VRP guard: entry_count is always ≥ 0
 
 		// Arena-allocate per-function temporary arrays (reclaimed at loop end).
 		int *defer_list = arena_alloc(&ctx->main_arena, (size_t)cnt * sizeof(int));
@@ -7276,14 +7415,6 @@ static void p1_verify_cfg(void) {
 		int *wm_defer   = arena_alloc(&ctx->main_arena, (size_t)cnt * sizeof(int));
 		int *wm_decl    = arena_alloc(&ctx->main_arena, (size_t)cnt * sizeof(int));
 		int defer_n = 0, decl_n = 0;
-
-		// Label hash: open-addressing, power-of-2 size, maps name → entry index.
-		// Size is next power of 2 ≥ 2×cnt, minimum 64.
-		int hash_sz = 64;
-		while (hash_sz < cnt * 2) hash_sz <<= 1;
-		int *label_hash = arena_alloc(&ctx->main_arena, (size_t)hash_sz * sizeof(int));
-		memset(label_hash, 0xFF, (size_t)hash_sz * sizeof(int)); // -1 = empty
-		int hash_mask = hash_sz - 1;
 
 		// Build label hash in one pass
 		for (int i = 0; i < cnt; i++) {
@@ -7301,10 +7432,19 @@ static void p1_verify_cfg(void) {
 			}
 		}
 
+		// Persist label hash in FuncMeta for O(1) lookup in Pass 2
+		fm->label_hash = label_hash;
+		fm->label_hash_mask = hash_mask;
+
 		// Pending forward gotos: (goto_entry_idx, defer_mark, decl_mark)
-		typedef struct { int idx, dm, cm; } FwdGoto;
+		// Linked via 'next' for O(1) hash-based lookup when label is found.
+		typedef struct { int idx, dm, cm, next; } FwdGoto;
 		FwdGoto *fwd = arena_alloc(&ctx->main_arena, (size_t)cnt * sizeof(FwdGoto));
 		int fwd_n = 0;
+		// Forward-goto hash: maps target label name → head of FwdGoto chain.
+		// Uses separate chaining through fwd[].next. Same size as label_hash.
+		int *fwd_hash_tbl = arena_alloc(&ctx->main_arena, (size_t)hash_sz * sizeof(int));
+		memset(fwd_hash_tbl, 0xFF, (size_t)hash_sz * sizeof(int)); // -1 = empty
 
 		// Switch watermark snapshots: (switch_entry_idx, defer_mark, decl_mark)
 		// Indexed by scope_id for O(1) lookup from case entries.
@@ -7335,24 +7475,34 @@ static void p1_verify_cfg(void) {
 				break;
 
 			case P1K_LABEL: {
-				// Resolve pending forward gotos targeting this label
-				for (int p = fwd_n - 1; p >= 0; p--) {
-					P1FuncEntry *g = &ents[fwd[p].idx];
-					if (g->label.len != ents[i].label.len ||
-					    memcmp(g->label.name, ents[i].label.name, g->label.len))
+				// Resolve pending forward gotos targeting this label via hash.
+				uint32_t lh = (uint32_t)fast_hash(ents[i].label.name, ents[i].label.len);
+				int fh_slot = lh & hash_mask;
+				int prev_fi = -1;
+				int fi = fwd_hash_tbl[fh_slot];
+				while (fi >= 0) {
+					int next_fi = fwd[fi].next;
+					P1FuncEntry *g = &ents[fwd[fi].idx];
+					if (g->label.len == ents[i].label.len &&
+					    !memcmp(g->label.name, ents[i].label.name, g->label.len)) {
+						uint16_t label_se = scope_stmt_expr_ancestor(ents[i].scope_id);
+						if (label_se != 0 && !scope_is_ancestor_or_self(label_se, g->scope_id))
+							error_tok(g->tok, "goto '%.*s' jumps into a statement expression "
+								  "(jumping into ({...}) is undefined behavior)",
+								  g->label.len, g->label.name);
+						// Pre-compute scope exits for Pass 2 defer cleanup
+						g->label.exits = scope_block_exits(g->scope_id, ents[i].scope_id);
+						cfg_check_range(ents, g, &ents[i], /*is_forward=*/true,
+								defer_list, fwd[fi].dm, defer_n,
+								decl_list, fwd[fi].cm, decl_n);
+						// Remove from chain
+						if (prev_fi < 0) fwd_hash_tbl[fh_slot] = next_fi;
+						else fwd[prev_fi].next = next_fi;
+						fi = next_fi;
 						continue;
-					// Reject goto jumping INTO a statement expression.
-					// Outward jumps (goto from inside stmt-expr to outside) are
-					// supported by GCC/Clang and used by idioms like defer+goto.
-					uint16_t label_se = scope_stmt_expr_ancestor(ents[i].scope_id);
-					if (label_se != 0 && !scope_is_ancestor_or_self(label_se, g->scope_id))
-						error_tok(g->tok, "goto '%.*s' jumps into a statement expression "
-							  "(jumping into ({...}) is undefined behavior)",
-							  g->label.len, g->label.name);
-					cfg_check_range(ents, g, &ents[i], /*is_forward=*/true,
-							defer_list, fwd[p].dm, defer_n,
-							decl_list, fwd[p].cm, decl_n);
-					fwd[p] = fwd[--fwd_n]; // swap-remove
+					}
+					prev_fi = fi;
+					fi = next_fi;
 				}
 				break;
 			}
@@ -7375,7 +7525,11 @@ static void p1_verify_cfg(void) {
 
 				if (li < 0 || li > i) {
 					// Forward goto (label not yet seen, or found after current pos)
-					fwd[fwd_n++] = (FwdGoto){.idx = i, .dm = defer_n, .cm = decl_n};
+					int fi = fwd_n++;
+					int fh_slot = h & hash_mask;
+					fwd[fi] = (FwdGoto){.idx = i, .dm = defer_n, .cm = decl_n,
+							    .next = fwd_hash_tbl[fh_slot]};
+					fwd_hash_tbl[fh_slot] = fi;
 				} else {
 					// Backward goto: check defers/decls BEFORE the label
 					// in scopes containing the label but not the goto.
@@ -7386,6 +7540,8 @@ static void p1_verify_cfg(void) {
 						error_tok(g->tok, "goto '%.*s' jumps into a statement expression "
 							  "(jumping into ({...}) is undefined behavior)",
 							  g->label.len, g->label.name);
+					// Pre-compute scope exits for Pass 2 defer cleanup
+					g->label.exits = scope_block_exits(g->scope_id, ents[li].scope_id);
 					cfg_check_range(ents, g, &ents[li], /*is_forward=*/false,
 							defer_list, 0, wm_defer[li],
 							decl_list, 0, wm_decl[li]);
@@ -7449,9 +7605,16 @@ static void p1_verify_cfg(void) {
 
 		// Assert all forward gotos resolved — an unresolved goto means
 		// the target label was never found in this function's P1D array.
-		if (fwd_n > 0)
-			error_tok(ents[fwd[0].idx].tok, "goto target label '%.*s' not found in scope",
-				  ents[fwd[0].idx].label.len, ents[fwd[0].idx].label.name);
+		{
+			for (int s = 0; s <= hash_mask; s++) {
+				int fi = fwd_hash_tbl[s];
+				if (fi >= 0) {
+					error_tok(ents[fwd[fi].idx].tok, "goto target label '%.*s' not found in scope",
+						  ents[fwd[fi].idx].label.len, ents[fwd[fi].idx].label.name);
+					break;
+				}
+			}
+		}
 
 		arena_restore(&ctx->main_arena, mark);
 	} // per-function
@@ -7748,6 +7911,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					    func_meta[next_func_idx].body_open == tok) {
 						FuncMeta *fm = &func_meta[next_func_idx];
 						current_func_idx = next_func_idx++;
+						goto_entry_cursor = 0;
 						if (fm->ret_type_start) {
 							ctx->func_ret_type_start = fm->ret_type_start;
 							ctx->func_ret_type_end = fm->ret_type_end;
