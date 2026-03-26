@@ -2286,6 +2286,38 @@ static void test_func_typedef_zeroinit(void) {
 	}
 }
 
+// Audit round 44: ternary in case label vs skip_one_stmt shadow scope.
+// skip_one_stmt's case/default scanner confuses the ternary `:` with the
+// label `:` in `case 1 ? 2 : 3:`, overshooting the for-loop body boundary.
+// The for-init shadow extends past the loop, hiding the typedef and
+// bypassing zeroinit for `T *p;` (treated as expression `T * p;`).
+static void test_ternary_case_label_shadow_leak(void) {
+	printf("\n--- ternary in case label shadow leak (audit round 44) ---\n");
+
+	// For-init variable `T` scoped to the for loop.  After the loop,
+	// `T` is the outer typedef, so `T *p;` is a pointer declaration
+	// and must be zero-initialized.
+	const char *code =
+	    "typedef int T;\n"
+	    "void f(int c) {\n"
+	    "    for (T T = 0; T < 1; T++)\n"
+	    "        switch(c) case 1 ? 2 : 3: {\n"
+	    "            break;\n"
+	    "        }\n"
+	    "    T *p;\n"
+	    "    (void)p;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "ternary_case_shadow.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "ternary-case-shadow: transpile succeeds");
+	if (r.output) {
+		CHECK(strstr(r.output, "T *p = 0") != NULL ||
+		      strstr(r.output, "T * p = 0") != NULL,
+		      "ternary-case-shadow: T *p must be zero-initialized (not treated as expression)");
+	}
+	prism_free(&r);
+}
+
 // Audit round 43: typeof(func) alias; must not emit __builtin_memset.
 // has_typeof in needs_memset forces memset for all typeof-typed locals,
 // but function declarations cannot be memset'd — runtime segfault/linker error.
@@ -2469,4 +2501,7 @@ void run_zeroinit_tests(void) {
 
 	// Audit round 43: typeof function declaration memset trap
 	test_typeof_func_decl_memset();
+
+	// Audit round 44: ternary in case label shadow leak
+	test_ternary_case_label_shadow_leak();
 }

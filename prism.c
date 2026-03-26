@@ -6020,11 +6020,13 @@ restart:
 
 	// 'case' / 'default' label: skip label expr + ':', recurse on body (tail call).
 	if ((tok->tag & (TT_CASE | TT_DEFAULT)) && !is_known_typedef(tok)) {
-		int ld = 0;
+		int ld = 0, td = 0;
 		for (Token *s = tok_next(tok); s && s->kind != TK_EOF; s = tok_next(s)) {
 			if (s->flags & TF_OPEN) { ld++; continue; }
 			if (s->flags & TF_CLOSE) { ld--; continue; }
+			if (ld == 0 && match_ch(s, '?')) { td++; continue; }
 			if (ld == 0 && match_ch(s, ':')) {
+				if (td > 0) { td--; continue; }
 				tok = tok_next(s);
 				goto restart;
 			}
@@ -6929,12 +6931,14 @@ uint16_t sid = next_scope_id++;
 				e->kase.switch_scope_id = sw_sid;
 				// Advance past 'case N:' or 'default:' so next token is at stmt start.
 				Token *ct = tok_next(tok);
-				while (ct && !match_ch(ct, ':') && !match_ch(ct, ';') &&
-				       !match_ch(ct, '{') && ct->kind != TK_EOF) {
+				int td = 0;
+				while (ct && ct->kind != TK_EOF) {
+					if (match_ch(ct, ';') || match_ch(ct, '{')) break;
 					if (ct->flags & TF_OPEN && tok_match(ct))
-						ct = tok_next(tok_match(ct));
-					else
-						ct = tok_next(ct);
+						{ ct = tok_next(tok_match(ct)); continue; }
+					if (match_ch(ct, '?')) { td++; ct = tok_next(ct); continue; }
+					if (match_ch(ct, ':')) { if (td > 0) { td--; ct = tok_next(ct); continue; } break; }
+					ct = tok_next(ct);
 				}
 				if (ct && match_ch(ct, ':')) {
 					p1d_prev = ct;
@@ -7657,6 +7661,22 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 	int ternary_depth = 0;
 
 	while (tok->kind != TK_EOF) {
+		// Non-flatten mode: skip system header tokens entirely.
+		// emit_tok() suppresses their output, but transformation handlers
+		// (try_zero_init_decl, orelse, etc.) use OUT_LIT which is not
+		// suppressed.  Skip before any processing to also avoid
+		// block_depth / scope_stack pollution from system header braces.
+		if (!FEAT(F_FLATTEN)) {
+			File *f = tok_file(tok);
+			if (f->is_system && f->is_include_entry) {
+				if (next_func_idx < func_meta_count &&
+				    func_meta[next_func_idx].body_open == tok)
+					next_func_idx++;
+				tok = tok_next(tok);
+				continue;
+			}
+		}
+
 		Token *next;
 		uint32_t tag = tok->tag;
 
