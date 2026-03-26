@@ -2286,6 +2286,69 @@ static void test_func_typedef_zeroinit(void) {
 	}
 }
 
+// Audit round 43: typeof(func) alias; must not emit __builtin_memset.
+// has_typeof in needs_memset forces memset for all typeof-typed locals,
+// but function declarations cannot be memset'd — runtime segfault/linker error.
+static void test_typeof_func_decl_memset(void) {
+	printf("\n--- typeof function declaration memset trap (audit round 43) ---\n");
+
+	// Case 1: typeof(void_func) alias; — must not memset a function.
+	{
+		const char *code =
+		    "void my_func(int x) { (void)x; }\n"
+		    "void wrapper(void) {\n"
+		    "    typeof(my_func) another_func;\n"
+		    "    (void)another_func;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "typeof_fn_decl.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "typeof-func-memset: typeof(func) declaration transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "__builtin_memset") == NULL,
+			      "typeof-func-memset: must not emit memset for function declaration");
+		}
+		prism_free(&r);
+	}
+
+	// Case 2: typeof(int_func) alias; — same for non-void return type.
+	{
+		const char *code =
+		    "int getter(void) { return 42; }\n"
+		    "void wrapper(void) {\n"
+		    "    typeof(getter) another_getter;\n"
+		    "    (void)another_getter;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "typeof_fn_decl2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "typeof-func-memset-int: typeof(func) declaration transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "__builtin_memset") == NULL,
+			      "typeof-func-memset-int: must not emit memset for function declaration");
+		}
+		prism_free(&r);
+	}
+
+	// Regression guard: typeof(struct_var) must still be zero-initialized.
+	{
+		const char *code =
+		    "struct S { int x; int y; };\n"
+		    "struct S global_s;\n"
+		    "void wrapper(void) {\n"
+		    "    typeof(global_s) local_s;\n"
+		    "    (void)local_s;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "typeof_struct_zi.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "typeof-struct-zeroinit: typeof(struct) still zero-initialized");
+		if (r.output) {
+			// Should have some form of zeroinit (= {0} or memset)
+			CHECK(strstr(r.output, "= {0}") != NULL || strstr(r.output, "memset") != NULL,
+			      "typeof-struct-zeroinit: typeof(struct) var gets zero-init");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -2403,4 +2466,7 @@ void run_zeroinit_tests(void) {
 
 	// Audit round 42: function typedef zero-init
 	test_func_typedef_zeroinit();
+
+	// Audit round 43: typeof function declaration memset trap
+	test_typeof_func_decl_memset();
 }

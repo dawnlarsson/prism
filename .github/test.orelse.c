@@ -4319,6 +4319,40 @@ static void test_bare_orelse_stmtexpr_defer_leak(void) {
 	}
 }
 
+// Audit round 43: typeof(expr orelse fallback) at file scope leaks a
+// statement expression ({...}) which is illegal outside a function body.
+// Phase 1G catches bracket-orelse at file scope but misses typeof-orelse.
+static void test_typeof_orelse_file_scope_leak(void) {
+	printf("\n--- typeof + orelse file scope leak (audit round 43) ---\n");
+
+	// Case 1: typeof(x orelse 42) at file scope — simple variable LHS.
+	{
+		const char *code =
+		    "int x;\n"
+		    "typeof(x orelse 42) global_var;\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "typeof_oe_fscope.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "typeof-orelse-filescope: typeof(x orelse 42) at file scope must be rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "file scope") != NULL,
+			      "typeof-orelse-filescope: error mentions 'file scope'");
+		prism_free(&r);
+	}
+
+	// Case 2: typeof(int[n orelse 1]) at file scope — bracket orelse inside typeof.
+	{
+		const char *code =
+		    "int n;\n"
+		    "typeof(int[n orelse 1]) *global_ptr;\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "typeof_oe_fscope2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "typeof-orelse-filescope-bracket: typeof(int[n orelse 1]) at file scope must be rejected");
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -4603,4 +4637,7 @@ void run_orelse_tests(void) {
 
 	// Audit round 42: bare orelse emit_tok loops bypass walk_balanced for stmt-exprs
 	test_bare_orelse_stmtexpr_defer_leak();
+
+	// Audit round 43: typeof + orelse at file scope leaks statement expression
+	test_typeof_orelse_file_scope_leak();
 }

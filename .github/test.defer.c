@@ -3286,6 +3286,69 @@ static void test_stmt_expr_return_defer_bypass(void) {
 	}
 }
 
+// Audit round 43: compound literal ctrl_state desync in braceless control flow.
+// After `for (...) (struct S){i};`, the `(struct S)` parens trigger
+// track_ctrl_paren_close → parens_just_closed = true.  handle_open_brace
+// then treats `{` as the control body brace (clears ctrl_state.pending).
+// end_statement_after_semicolon never fires → for-init shadow not cleaned.
+static void test_compound_literal_ctrl_state_desync(void) {
+	printf("\n--- compound literal ctrl_state desync (audit round 43) ---\n");
+
+	// Case 1: braceless for + compound literal body + defer shadow.
+	// The for-init `int i` shadows `i` captured by defer.
+	// After the for-loop, shadow must be cleaned up properly.
+	{
+		const char *code =
+		    "struct S { int x; };\n"
+		    "void cleanup(int *p);\n"
+		    "void f(void) {\n"
+		    "    int i = 99;\n"
+		    "    defer cleanup(&i);\n"
+		    "    for (int i = 0; i < 1; i++)\n"
+		    "        (struct S){i};\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "cl_desync.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "compound-lit-ctrl-desync: braceless for + compound literal body transpiles OK");
+		prism_free(&r);
+	}
+
+	// Case 2: braceless for + compound literal body + defer shadow + explicit return.
+	// If the shadow leaks, check_defer_shadow_at_exit may false-positive.
+	{
+		const char *code =
+		    "struct S { int x; };\n"
+		    "void cleanup(int *p);\n"
+		    "void f(void) {\n"
+		    "    int i = 99;\n"
+		    "    defer cleanup(&i);\n"
+		    "    for (int i = 0; i < 1; i++)\n"
+		    "        (struct S){i};\n"
+		    "    return;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "cl_desync_ret.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "compound-lit-ctrl-desync: return after for + compound literal must not false-positive");
+		prism_free(&r);
+	}
+
+	// Case 3: braceless while + compound literal (cast-style).
+	{
+		const char *code =
+		    "void cleanup(int *p);\n"
+		    "void f(void) {\n"
+		    "    int x = 1;\n"
+		    "    defer cleanup(&x);\n"
+		    "    while (x)\n"
+		    "        (int){x};\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "cl_desync_while.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "compound-lit-ctrl-desync: braceless while + compound literal transpiles OK");
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -3491,4 +3554,7 @@ void run_defer_tests(void) {
 
 	// Audit round 41: emit_expr_to_semicolon stmt-expr keyword bypass
 	test_stmt_expr_return_defer_bypass();
+
+	// Audit round 43: compound literal ctrl_state desync shadow leak
+	test_compound_literal_ctrl_state_desync();
 }

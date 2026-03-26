@@ -3438,6 +3438,49 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			for (Token *ft = type_start; ft && ft != type->end; ft = tok_next(ft)) {
 				if (is_func_typedef(ft)) { is_func_type = true; break; }
 			}
+			// typeof(known_function) also produces a function type.
+			// Detect by finding a single bare identifier inside typeof
+			// parens and matching it against defined function names.
+			if (!is_func_type && type->has_typeof) {
+				for (Token *ft = type_start; ft && ft != type->end; ft = tok_next(ft)) {
+					if (!(ft->tag & TT_TYPEOF)) continue;
+					Token *paren = tok_next(ft);
+					if (!paren || !match_ch(paren, '(') || !tok_match(paren)) break;
+					Token *inner = tok_next(paren);
+					Token *close = tok_match(paren);
+					// Single bare identifier inside typeof()?
+					if (!inner || inner == close || tok_next(inner) != close) break;
+					if (!is_valid_varname(inner)) break;
+					if (inner->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)) break;
+					// Check func_meta for a defined function with this name.
+					for (int fi = 0; fi < func_meta_count; fi++) {
+						Token *fn = func_meta[fi].ret_type_end;
+						// For void functions, ret_type_end is NULL.
+						// Extract name by walking backward from body_open.
+						if (!fn) {
+							uint32_t bi = tok_idx(func_meta[fi].body_open);
+							for (uint32_t j = bi; j > 0; j--) {
+								Token *bt = &token_pool[j - 1];
+								if (bt->kind == TK_PREP_DIR) continue;
+								if (match_ch(bt, ')') && tok_match(bt)) {
+									j = tok_idx(tok_match(bt)) + 1;
+									continue;
+								}
+								if (is_valid_varname(bt) && !(bt->tag & (TT_ATTR | TT_TYPE | TT_QUALIFIER | TT_SUE))) {
+									fn = bt;
+								}
+								break;
+							}
+						}
+						if (fn && fn->len == inner->len &&
+						    memcmp(tok_loc(fn), tok_loc(inner), inner->len) == 0) {
+							is_func_type = true;
+							break;
+						}
+					}
+					break;
+				}
+			}
 		}
 		// Only queue memset when zeroinit feature is enabled.
 		// Static/extern variables are zero-initialized by the loader — skip.
@@ -4357,7 +4400,7 @@ static Token *handle_sue_body(Token *tok) {
 
 static Token *handle_open_brace(Token *tok) {
 	// Compound literal inside control parens or before body
-	if (ctrl_state.pending && (in_ctrl_paren() || !ctrl_state.parens_just_closed)) {
+	if (ctrl_state.pending && (in_ctrl_paren() || !ctrl_state.parens_just_closed || (tok_ann(tok) & P1_SCOPE_INIT))) {
 		emit_tok(tok);
 		ctrl_state.brace_depth++;
 		return tok_next(tok);
@@ -6141,6 +6184,15 @@ static void p1_full_depth_prescan(Token *tok) {
 							error_tok(s,
 								  "'orelse' inside typeof in a struct/union body "
 								  "cannot be transformed; use the resolved type directly");
+				}
+			}
+			if (p1d_cur_func < 0) {
+				Token *paren = tok_next(tok);
+				if (paren && match_ch(paren, '(') && tok_match(paren)) {
+					for (Token *s = tok_next(paren); s && s != tok_match(paren); s = tok_next(s))
+						if ((s->tag & TT_ORELSE) && !typedef_lookup(s))
+							error_tok(s,
+								  "'orelse' inside typeof at file scope is not allowed");
 				}
 			}
 		}
