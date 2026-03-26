@@ -619,7 +619,7 @@ static void test_defer_loop_continue(void) {
 	CHECK_EQ(freed, 6, "loop continue: all 6 defers ran");
 }
 
-static void test_defer_nested_scopes(void) {
+static void test_defer_nested_scopes_win(void) {
 	printf("\n--- Defer: Nested Scopes with Win Resources ---\n");
 	log_reset();
 
@@ -1102,7 +1102,7 @@ void run_windows_tests(void) {
 	test_defer_loop_continue();
 
 	// Nested
-	test_defer_nested_scopes();
+	test_defer_nested_scopes_win();
 
 	// API queries
 	test_win_api_queries();
