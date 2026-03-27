@@ -1631,11 +1631,17 @@ static Token *tokenize(File *file) {
 	// Link matching delimiters: connect every TF_OPEN to its TF_CLOSE via tok->match.
 	// Also detect C23 [[ ... ]] attributes and tag the first '[' with TF_C23_ATTR.
 	{
-		Token *stack[4096];
+		int stack_cap = 256;
+		Token **stack = malloc(stack_cap * sizeof(Token *));
+		if (!stack) error("out of memory");
 		int sp = 0;
 		for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
 			if (t->flags & TF_OPEN) {
-				if (sp >= 4096) error_tok(t, "delimiter nesting exceeds 4096");
+				if (sp >= stack_cap) {
+					stack_cap *= 2;
+					stack = realloc(stack, stack_cap * sizeof(Token *));
+					if (!stack) error("out of memory");
+				}
 				stack[sp++] = t;
 				Token *tn = tok_next(t);
 				if (tok_loc(t)[0] == '[' && tn && tok_loc(tn)[0] == '[' && (tn->flags & TF_OPEN))
@@ -1654,6 +1660,7 @@ static Token *tokenize(File *file) {
 		}
 		if (sp > 0)
 			error_tok(stack[sp - 1], "unclosed delimiter '%c'", tok_loc(stack[sp - 1])[0]);
+		free(stack);
 
 		// Pre-scan function bodies: tag '{' with TT_SPECIAL_FN / TT_ASM / TT_NORETURN_FN(=vfork).
 		// Propagate special-function taint transitively through wrapper chains.
@@ -1676,17 +1683,13 @@ static Token *tokenize(File *file) {
 					for (Token *b = tok_next(t); b != end; b = tok_next(b)) {
 						if (b->tag & TT_SPECIAL_FN) {
 							if (tok_loc(b)[0] == 'v' && b->len == 5) {
-								// Only taint if vfork is actually called: vfork()
-								// Also catch (vfork)() where next tok is ')' then '('.
-								// A bare reference (return vfork; / &vfork) is safe.
-								Token *nx = tok_next(b);
-								if (nx && nx != end && tok_loc(nx)[0] == '(')
-									t->tag |= TT_NORETURN_FN;
-								else if (nx && nx != end && tok_loc(nx)[0] == ')') {
-									Token *nx2 = tok_next(nx);
-									if (nx2 && nx2 != end && tok_loc(nx2)[0] == '(')
-										t->tag |= TT_NORETURN_FN;
-								}
+								// Taint on any appearance of vfork in the
+								// function body.  A bare reference like
+								// `fp = vfork; fp();` bypasses the old
+								// call-site-only check.  The false-positive
+								// cost (can't use defer in a function that
+								// merely returns &vfork) is negligible.
+								t->tag |= TT_NORETURN_FN;
 							} else
 								t->tag |= TT_SPECIAL_FN;
 						}

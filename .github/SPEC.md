@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3369+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3474+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -461,7 +461,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 **Forbidden contexts:**
 - Functions using `setjmp`/`longjmp` — error
-- Functions using `vfork` — error (including `(vfork)()` paren-wrapped pattern)
+- Functions using `vfork` — error (any appearance of the `vfork` identifier in the function body, including bare references like `fp = vfork`)
 - Functions using `asm goto` — error (regular `asm` is safe)
 - `return`, `goto` inside defer body — error
 - `break`, `continue` inside defer body — error (defer body is not a loop/switch context)
@@ -761,6 +761,6 @@ These are inherently runtime and cannot move to Pass 1:
 
 1. **Struct padding bytes and `= {0}`:** Prism emits `= {0}` for aggregate zero-initialization. The C standard guarantees all *members* are zeroed but does not mandate that *padding bytes* between members are zeroed. In practice, GCC and Clang emit `memset`/`bzero` for `= {0}` at all optimization levels, zeroing the entire aggregate including padding. However, code that copies raw struct bytes across trust boundaries (e.g., `copy_to_user` in kernel contexts) should use explicit `memset(&s, 0, sizeof(s))` via `raw` + manual initialization to guarantee no padding infoleak. This is a C language limitation, not a Prism deficiency.
 
-2. **Indirect call taint bypass (cross-TU):** The `setjmp`/`longjmp`/`vfork` taint detection is token-name-based: any appearance of a tainted identifier (even as a bare reference like `= longjmp`) taints the enclosing function. However, a function pointer to `longjmp` passed from another translation unit (e.g., via a `void (*)(jmp_buf, int)` parameter) is undetectable by single-TU static analysis. This is an inherent limitation shared with all C static analyzers that operate on individual translation units.
+2. **Indirect call taint bypass (cross-TU):** The `setjmp`/`longjmp`/`vfork` taint detection is token-name-based: any appearance of a tainted identifier (even as a bare reference like `= longjmp` or `fp = vfork`) taints the enclosing function, and taint propagates transitively to callers. However, a function pointer to `longjmp` passed from another translation unit (e.g., via a `void (*)(jmp_buf, int)` parameter) is undetectable by single-TU static analysis. A function that merely returns or stores `vfork` as a value will also taint its callers even if the pointer is never invoked — this is an accepted false positive that closes intra-TU aliasing attacks. This is an inherent limitation shared with all C static analyzers that operate on individual translation units.
 
 3. **Bitfield zero-initialization:** Bitfield member declarations (`int x : 4;`) inside struct/union bodies are not individually zero-initialized — `try_zero_init_decl` correctly skips when `in_struct_body()` is true (bitfield syntax `int x : 4 = 0;` is invalid C). Bitfields are zeroed implicitly when the parent struct variable receives `= {0}`. This is working as designed.

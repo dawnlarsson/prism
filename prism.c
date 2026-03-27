@@ -154,8 +154,6 @@ typedef struct {
 	uint8_t kind;
 	bool is_loop : 1;
 	bool is_switch : 1;
-	bool had_control_exit : 1; // true if unconditional break/return/goto/continue was seen
-				   // NOTE: only set on switch scopes (by mark_switch_control_exit)
 	bool is_conditional : 1;
 	bool is_struct : 1;
 	bool has_zeroinit_decl : 1;
@@ -410,8 +408,10 @@ typedef struct {
 	int brace_depth;
 } CtrlState;
 
-static PRISM_THREAD_LOCAL ScopeNode scope_stack[4096];
-static PRISM_THREAD_LOCAL DeferEntry defer_stack[2048];
+static PRISM_THREAD_LOCAL ScopeNode *scope_stack = NULL;
+static PRISM_THREAD_LOCAL int scope_stack_cap = 0;
+static PRISM_THREAD_LOCAL DeferEntry *defer_stack = NULL;
+static PRISM_THREAD_LOCAL int defer_stack_cap = 0;
 static PRISM_THREAD_LOCAL int defer_count = 0;
 static PRISM_THREAD_LOCAL CtrlState ctrl_state;
 static PRISM_THREAD_LOCAL int current_func_idx = -1; // Index into func_meta[] for the function being emitted
@@ -432,6 +432,10 @@ typedef struct {
 static PRISM_THREAD_LOCAL DeferShadow *defer_shadows = NULL;
 static PRISM_THREAD_LOCAL int defer_shadow_count = 0;
 static PRISM_THREAD_LOCAL int defer_shadow_cap = 0;
+
+// MSVC /D define buffers (dynamically allocated, freed in prism_thread_cleanup)
+static PRISM_THREAD_LOCAL char **pp_define_bufs = NULL;
+static PRISM_THREAD_LOCAL int pp_define_bufs_cap = 0;
 
 // Forward declarations (only for functions used before their definition)
 static DeclResult parse_declarator(Token *tok, bool emit);
@@ -1010,8 +1014,7 @@ static void end_statement_after_semicolon(void) {
 }
 
 static void scope_push_kind(ScopeKind kind) {
-	// Guard against pathologically deep nesting (e.g., fuzz input with thousands of '{')
-	if (ctx->scope_depth >= 4096) error("brace nesting depth exceeds 4096");
+	ENSURE_ARRAY_CAP(scope_stack, ctx->scope_depth + 1, scope_stack_cap, 256, ScopeNode);
 	ScopeNode *s = &scope_stack[ctx->scope_depth];
 	*s = (ScopeNode){.kind = kind};
 	s->defer_start_idx = defer_count;
@@ -1035,9 +1038,8 @@ static void scope_pop(void) {
 
 static void defer_add(Token *defer_keyword, Token *start, Token *end) {
 	if (ctx->block_depth <= 0) error_tok(start, "defer outside of any scope");
-	if (defer_count >= 2048) error_tok(start, "too many defers");
+	ENSURE_ARRAY_CAP(defer_stack, defer_count + 1, defer_stack_cap, 64, DeferEntry);
 	defer_stack[defer_count++] = (DeferEntry){start, end, defer_keyword};
-	scope_block_top()->had_control_exit = false;
 }
 
 static int find_switch_scope(void) {
@@ -1046,20 +1048,6 @@ static int find_switch_scope(void) {
 	return -1;
 }
 
-// Mark unconditional control exit in the innermost switch scope.
-// If loop_targetable is true (break/continue), skip if a loop scope
-// sits between the current position and the switch scope, since the
-// break/continue targets the loop, not the switch.
-static void mark_switch_control_exit(bool loop_targetable) {
-	if (ctrl_state.pending || in_conditional_block()) return;
-	int sd = find_switch_scope();
-	if (sd < 0) return;
-	if (loop_targetable) {
-		for (int d = ctx->scope_depth - 1; d > sd; d--)
-			if (scope_stack[d].is_loop) return;
-	}
-	scope_stack[sd].had_control_exit = true;
-}
 
 static bool needs_space(Token *prev, Token *tok) {
 	if (!prev || tok_at_bol(tok)) return false;
@@ -2600,7 +2588,9 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 	// paren_open: non-NULL when orelse is inside a single '(' group that covers
 	// the entire bracket content — e.g. [(f() orelse 1)] from macro expansion.
 	typedef struct { Token *open; Token *close; Token *orelse; Token *paren_open; } BracketInfo;
-	BracketInfo brackets[32];
+	int bracket_cap = 16;
+	BracketInfo *brackets = malloc(bracket_cap * sizeof(BracketInfo));
+	if (!brackets) error("out of memory");
 	int bracket_count = 0;
 	bool any_orelse = false;
 
@@ -2609,7 +2599,11 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 		if (t->flags & TF_C23_ATTR) { t = tok_match(t); continue; }
 		Token *close = tok_match(t);
 		if (!close) continue;
-		if (bracket_count >= 32) break;
+		if (bracket_count >= bracket_cap) {
+			bracket_cap *= 2;
+			brackets = realloc(brackets, bracket_cap * sizeof(BracketInfo));
+			if (!brackets) error("out of memory");
+		}
 		Token *orelse_found = NULL;
 		Token *paren_open_found = NULL;
 		Token *prev = t;
@@ -2643,7 +2637,7 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 		t = close;
 	}
 
-	if (!any_orelse) return;
+	if (!any_orelse) { free(brackets); return; }
 
 	// Emit temps in left-to-right order.
 	// Non-orelse brackets that precede the first orelse bracket get dimension temps
@@ -2701,6 +2695,7 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 			OUT_LIT(");");
 		}
 	}
+	free(brackets);
 }
 
 static Token *walk_balanced_orelse(Token *tok) {
@@ -3011,7 +3006,6 @@ static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool
 // Emit break/continue with defer handling. Returns next token.
 static Token *emit_break_continue_defer(Token *tok) {
 	bool is_break = tok->tag & TT_BREAK;
-	mark_switch_control_exit(true);
 	if (FEAT(F_DEFER) && control_flow_has_defers(is_break))
 		emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
 	out_char(' '); OUT_TOK(tok); out_char(';');
@@ -3022,7 +3016,6 @@ static Token *emit_break_continue_defer(Token *tok) {
 
 // Emit goto with defer handling. Returns next token.
 static Token *emit_goto_defer(Token *tok) {
-	mark_switch_control_exit(false);
 	tok = tok_next(tok);
 	if (FEAT(F_DEFER) && is_identifier_like(tok)) {
 		P1LabelResult info = p1_label_find(tok, current_func_idx);
@@ -3150,7 +3143,6 @@ static Token *handle_const_orelse_fallback(Token *tok,
 			out_uint(oe_id);
 			OUT_LIT(") {");
 			if (tok->tag & TT_RETURN) {
-				mark_switch_control_exit(false);
 				tok = tok_next(tok);
 				tok = emit_return_body(tok, NULL);
 			} else if (tok->tag & (TT_BREAK | TT_CONTINUE)) {
@@ -4222,7 +4214,6 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bo
 	if (tok->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) {
 		uint64_t tag = tok->tag;
 		if (tag & TT_RETURN) {
-			mark_switch_control_exit(false);
 			tok = tok_next(tok);
 		}
 		if (var_name) {
@@ -4289,7 +4280,6 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bo
 // Returns next token if handled, or NULL to let normal emit proceed.
 static Token *handle_control_exit_defer(Token *tok) {
 	if (tok->tag & TT_RETURN) {
-		mark_switch_control_exit(false);
 		if (!has_active_defers()) return NULL;
 		tok = tok_next(tok);
 		OUT_LIT(" {");
@@ -4297,7 +4287,6 @@ static Token *handle_control_exit_defer(Token *tok) {
 		OUT_LIT(" }");
 	} else {
 		bool is_break = tok->tag & TT_BREAK;
-		mark_switch_control_exit(true);
 		if (!control_flow_has_defers(is_break)) return NULL;
 		OUT_LIT(" {");
 		tok = emit_break_continue_defer(tok);
@@ -4357,8 +4346,6 @@ static Token *handle_goto_keyword(Token *tok) {
 	tok = tok_next(tok);
 
 	if (FEAT(F_DEFER)) {
-		mark_switch_control_exit(false);
-
 		// Skip C23 attributes between goto and target: goto [[attr]] *ptr;
 		Token *after_attrs = skip_noise(tok);
 
@@ -4435,7 +4422,6 @@ static void handle_case_default(Token *tok) {
 	for (int d = ctx->scope_depth - 1; d >= sd; d--) {
 		if (scope_stack[d].kind != SCOPE_BLOCK) continue;
 		defer_count = scope_stack[d].defer_start_idx;
-		scope_stack[d].had_control_exit = false;
 	}
 }
 
@@ -4853,22 +4839,45 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 
 	if (msvc) {
 		// MSVC: /D concatenated with macro
-		static PRISM_THREAD_LOCAL char pp_define_bufs[64][256];
+		int needed = ctx->extra_define_count + 3; // +3 for __PRISM__, __PRISM_DEFER__, __PRISM_ZEROINIT__
+		if (needed > pp_define_bufs_cap) {
+			int old_cap = pp_define_bufs_cap;
+			pp_define_bufs_cap = needed > 64 ? needed : 64;
+			pp_define_bufs = realloc(pp_define_bufs, pp_define_bufs_cap * sizeof(char *));
+			if (!pp_define_bufs) error("out of memory");
+			for (int i = old_cap; i < pp_define_bufs_cap; i++)
+				pp_define_bufs[i] = NULL;
+		}
 		int buf_idx = 0;
-		// Reserve 3 slots for __PRISM__, __PRISM_DEFER__, __PRISM_ZEROINIT__
-		for (int i = 0; i < ctx->extra_define_count && buf_idx < 61; i++) {
-			snprintf(pp_define_bufs[buf_idx], sizeof(pp_define_bufs[buf_idx]),
-				 "/D%s", ctx->extra_defines[i]);
+		for (int i = 0; i < ctx->extra_define_count; i++) {
+			int len = snprintf(NULL, 0, "/D%s", ctx->extra_defines[i]) + 1;
+			pp_define_bufs[buf_idx] = realloc(pp_define_bufs[buf_idx], len);
+			if (!pp_define_bufs[buf_idx]) error("out of memory");
+			snprintf(pp_define_bufs[buf_idx], len, "/D%s", ctx->extra_defines[i]);
 			args[(*argc)++] = pp_define_bufs[buf_idx++];
 		}
-		snprintf(pp_define_bufs[buf_idx], sizeof(pp_define_bufs[buf_idx]), "/D__PRISM__=1");
-		args[(*argc)++] = pp_define_bufs[buf_idx++];
+		{
+			const char *s = "/D__PRISM__=1";
+			int len = (int)strlen(s) + 1;
+			pp_define_bufs[buf_idx] = realloc(pp_define_bufs[buf_idx], len);
+			if (!pp_define_bufs[buf_idx]) error("out of memory");
+			memcpy(pp_define_bufs[buf_idx], s, len);
+			args[(*argc)++] = pp_define_bufs[buf_idx++];
+		}
 		if (FEAT(F_DEFER)) {
-			snprintf(pp_define_bufs[buf_idx], sizeof(pp_define_bufs[buf_idx]), "/D__PRISM_DEFER__=1");
+			const char *s = "/D__PRISM_DEFER__=1";
+			int len = (int)strlen(s) + 1;
+			pp_define_bufs[buf_idx] = realloc(pp_define_bufs[buf_idx], len);
+			if (!pp_define_bufs[buf_idx]) error("out of memory");
+			memcpy(pp_define_bufs[buf_idx], s, len);
 			args[(*argc)++] = pp_define_bufs[buf_idx++];
 		}
 		if (FEAT(F_ZEROINIT)) {
-			snprintf(pp_define_bufs[buf_idx], sizeof(pp_define_bufs[buf_idx]), "/D__PRISM_ZEROINIT__=1");
+			const char *s = "/D__PRISM_ZEROINIT__=1";
+			int len = (int)strlen(s) + 1;
+			pp_define_bufs[buf_idx] = realloc(pp_define_bufs[buf_idx], len);
+			if (!pp_define_bufs[buf_idx]) error("out of memory");
+			memcpy(pp_define_bufs[buf_idx], s, len);
 			args[(*argc)++] = pp_define_bufs[buf_idx++];
 		}
 	} else {
@@ -5568,10 +5577,10 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 		{
 			int sd = 0;
 			for (Token *s = after_orelse; s && s->kind != TK_EOF; s = tok_next(s)) {
+				if (sd == 0 && match_ch(s, '{')) { fallback_has_compound_literal = true; break; }
 				if (s->flags & TF_OPEN) sd++;
 				else if (s->flags & TF_CLOSE) sd--;
 				else if (sd == 0 && BARE_IS_END(s)) break;
-				if (sd == 0 && match_ch(s, '{')) { fallback_has_compound_literal = true; break; }
 			}
 		}
 
@@ -5647,14 +5656,29 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 			int fd = 0;
 			while (true) {
 				bool is_last = !orelse_has_chain(t, comma_term);
-				// Ternary instead of if-assignment to preserve compound literal lifetime.
-				OUT_LIT(" __prism_oe_");
-				out_uint(oe_id);
-				OUT_LIT(" = __prism_oe_");
-				out_uint(oe_id);
-				OUT_LIT(" ? __prism_oe_");
-				out_uint(oe_id);
-				OUT_LIT(" : (");
+				if (is_last) {
+					// Final link: assign directly to LHS to preserve
+					// usual arithmetic conversions (C11 6.5.15p5).
+					// Avoids truncation when fallback type is wider
+					// than __typeof__(RHS).
+					OUT_LIT(" ");
+					emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+					OUT_LIT(" = __prism_oe_");
+					out_uint(oe_id);
+					OUT_LIT(" ? __prism_oe_");
+					out_uint(oe_id);
+					OUT_LIT(" : (");
+				} else {
+					// Intermediate link: assign to temp for next
+					// iteration's truthiness check.
+					OUT_LIT(" __prism_oe_");
+					out_uint(oe_id);
+					OUT_LIT(" = __prism_oe_");
+					out_uint(oe_id);
+					OUT_LIT(" ? __prism_oe_");
+					out_uint(oe_id);
+					OUT_LIT(" : (");
+				}
 				fd = 0;
 				while (t->kind != TK_EOF) {
 					if ((t->flags & TF_OPEN) && (match_ch(t, '(') || match_ch(t, '['))) {
@@ -5672,12 +5696,7 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 				OUT_LIT(");");
 				if (is_last) break;
 			}
-			// Write LHS exactly once
-			OUT_LIT(" ");
-			emit_range_no_prep(bare_lhs_start, bare_assign_eq);
-			OUT_LIT(" = __prism_oe_");
-			out_uint(oe_id);
-			OUT_LIT("; }");
+			OUT_LIT(" }");
 		}
 		if (match_ch(t, ';') || (comma_term && match_ch(t, ','))) t = tok_next(t);
 	#undef BARE_IS_END
@@ -5802,7 +5821,9 @@ static void p1_build_scope_tree(Token *start) {
 	ctx->p1_scope_tree = NULL;
 
 	// Stack for tracking current scope_id at each brace depth
-	uint16_t scope_stack_local[4096];
+	int p1a_stack_cap = 256;
+	uint16_t *scope_stack_local = malloc(p1a_stack_cap * sizeof(uint16_t));
+	if (!scope_stack_local) error("out of memory");
 	scope_stack_local[0] = 0; // file scope
 	int depth = 0;
 
@@ -5946,8 +5967,11 @@ static void p1_build_scope_tree(Token *start) {
 
 			scope_tree_count++;
 			depth++;
-			if (depth >= 4096)
-				error_tok(t, "brace nesting depth exceeds 4096");
+			if (depth >= p1a_stack_cap) {
+				p1a_stack_cap *= 2;
+				scope_stack_local = realloc(scope_stack_local, p1a_stack_cap * sizeof(uint16_t));
+				if (!scope_stack_local) error("out of memory");
+			}
 			scope_stack_local[depth] = sid;
 			continue;
 		}
@@ -5957,6 +5981,7 @@ static void p1_build_scope_tree(Token *start) {
 			continue;
 		}
 	}
+	free(scope_stack_local);
 }
 
 // Skip a single C statement starting at `tok`, returning the last token of
@@ -6271,10 +6296,12 @@ static void p1_full_depth_prescan(Token *tok) {
 	bool p1e_ret_captured = false;
 
 	// Phase 1F: scope_id stack for determining in_loop/in_switch context
-	uint16_t scope_stack_local[4096];
+	int p1d_scope_cap = 256;
+	uint16_t *scope_stack_local = malloc(p1d_scope_cap * sizeof(uint16_t));
+	if (!scope_stack_local) error("out of memory");
 	scope_stack_local[0] = 0; // file scope
 	int scope_depth_local = 0;
-#define CUR_SID() (scope_depth_local < 4096 ? scope_stack_local[scope_depth_local] : 0)
+#define CUR_SID() (scope_stack_local[scope_depth_local])
 
 	// Phase 3A: initialize scope range for file-scope typedef registration
 	td_scope_open = 0;
@@ -6284,8 +6311,10 @@ static void p1_full_depth_prescan(Token *tok) {
 	int p1d_cur_func = -1;    // index into func_meta[], -1 when outside functions
 	int p1d_ternary_depth = 0;
 	// Switch scope stack: track innermost switch scope_id for case label association
-	uint16_t p1d_switch_stack[256];
-	uint32_t p1d_switch_end[256]; // 0 = braced (pop at }), >0 = braceless body end token idx
+	int p1d_switch_cap = 64;
+	uint16_t *p1d_switch_stack = malloc(p1d_switch_cap * sizeof(uint16_t));
+	uint32_t *p1d_switch_end = malloc(p1d_switch_cap * sizeof(uint32_t));
+	if (!p1d_switch_stack || !p1d_switch_end) error("out of memory");
 	int p1d_switch_top = 0;
 	uint32_t p1d_braceless_next_sid = scope_tree_count; // synthetic scope IDs for braceless switches
 	Token *p1d_prev = NULL;   // previous non-whitespace token (for label detection)
@@ -6489,8 +6518,12 @@ uint16_t sid = next_scope_id++;
 			// Phase 1D: track switch scope for case label association
 			if (p1d_cur_func >= 0 && sid < scope_tree_count &&
 			    scope_tree[sid].is_switch) {
-				if (p1d_switch_top >= 256)
-					error_tok(tok, "switch nesting depth exceeds 256");
+				if (p1d_switch_top >= p1d_switch_cap) {
+					p1d_switch_cap *= 2;
+					p1d_switch_stack = realloc(p1d_switch_stack, p1d_switch_cap * sizeof(uint16_t));
+					p1d_switch_end = realloc(p1d_switch_end, p1d_switch_cap * sizeof(uint32_t));
+					if (!p1d_switch_stack || !p1d_switch_end) error("out of memory");
+				}
 				p1_alloc(P1K_SWITCH, sid, tok);
 				p1d_switch_stack[p1d_switch_top] = sid;
 				p1d_switch_end[p1d_switch_top] = 0; // braced: popped at }
@@ -6499,8 +6532,12 @@ uint16_t sid = next_scope_id++;
 
 			brace_depth++;
 			scope_depth_local++;
-			if (scope_depth_local < 4096)
-				scope_stack_local[scope_depth_local] = sid;
+			if (scope_depth_local >= p1d_scope_cap) {
+				p1d_scope_cap *= 2;
+				scope_stack_local = realloc(scope_stack_local, p1d_scope_cap * sizeof(uint16_t));
+				if (!scope_stack_local) error("out of memory");
+			}
+			scope_stack_local[scope_depth_local] = sid;
 
 			// Track initializer brace depth: suppress label detection inside '= { ... }'
 			if (sid < scope_tree_count && scope_tree[sid].is_init)
@@ -6530,7 +6567,7 @@ uint16_t sid = next_scope_id++;
 			}
 
 			// Decrement initializer-brace depth before popping the scope
-			if (p1d_init_brace_depth > 0 && scope_depth_local < 4096) {
+			if (p1d_init_brace_depth > 0) {
 				uint16_t csid = scope_stack_local[scope_depth_local];
 				if (csid < scope_tree_count && scope_tree[csid].is_init)
 					p1d_init_brace_depth--;
@@ -7260,8 +7297,12 @@ uint16_t sid = next_scope_id++;
 					if (synth_sid > UINT16_MAX)
 						error_tok(tok, "too many scopes + braceless switches (>65535)");
 					p1_alloc(P1K_SWITCH, (uint16_t)synth_sid, tok);
-					if (p1d_switch_top >= 256)
-						error_tok(tok, "switch nesting depth exceeds 256");
+					if (p1d_switch_top >= p1d_switch_cap) {
+						p1d_switch_cap *= 2;
+						p1d_switch_stack = realloc(p1d_switch_stack, p1d_switch_cap * sizeof(uint16_t));
+						p1d_switch_end = realloc(p1d_switch_end, p1d_switch_cap * sizeof(uint32_t));
+						if (!p1d_switch_stack || !p1d_switch_end) error("out of memory");
+					}
 					p1d_switch_stack[p1d_switch_top] = synth_sid;
 					Token *end = skip_one_stmt(body, 0);
 					p1d_switch_end[p1d_switch_top] = end ? tok_idx(end) : UINT32_MAX;
@@ -7310,6 +7351,9 @@ uint16_t sid = next_scope_id++;
 		p1d_prev = tok;
 		tok = tok_next(tok);
 	}
+	free(scope_stack_local);
+	free(p1d_switch_stack);
+	free(p1d_switch_end);
 }
 
 // Phase 2A: Verify goto→label and switch→case pairs against defers/decls.
@@ -7838,7 +7882,6 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 		if (tag & TT_NORETURN_FN) {
 			if (tok_next(tok) && match_ch(tok_next(tok), '(')) {
-				mark_switch_control_exit(false);
 				if (FEAT(F_DEFER) && has_active_defers())
 					fprintf(stderr,
 						"%s:%d: warning: '%.*s' called with active defers (defers "
@@ -8221,6 +8264,11 @@ PRISM_API void prism_thread_cleanup(void) {
 	use_linemarkers = false;
 	defer_count = 0;
 	defer_shadow_count = 0;
+	free(scope_stack); scope_stack = NULL; scope_stack_cap = 0;
+	free(defer_stack); defer_stack = NULL; defer_stack_cap = 0;
+	free(defer_shadows); defer_shadows = NULL; defer_shadow_cap = 0;
+	for (int i = 0; i < pp_define_bufs_cap; i++) free(pp_define_bufs[i]);
+	free(pp_define_bufs); pp_define_bufs = NULL; pp_define_bufs_cap = 0;
 	memset(&ctrl_state, 0, sizeof(ctrl_state));
 
 	free(ctx);

@@ -2271,33 +2271,54 @@ static void test_defer_paren_vfork_bypass(void) {
 }
 
 static void test_defer_vfork_funcptr_bypass(void) {
-	/*
+	// Intra-TU vfork aliasing: vfork returned via function pointer.
+	// The aggressive token-level taint now catches any vfork reference
+	// in a function body, so get_trigger is tainted and main inherits
+	// the taint via transitive propagation.
 	const char *code =
-	"#include <unistd.h>\n"
-	"#include <stdio.h>\n"
-	"void cleanup(void) { printf(\"cleanup\\n\"); }\n"
-	"pid_t (*get_trigger(void))(void) { return vfork; }\n"
-	"int main(void) {\n"
-	"    pid_t (*trigger)(void) = get_trigger();\n"
-	"    defer { cleanup(); }\n"
-	"    trigger();\n"
-	"    return 0;\n"
-	"}\n";
+	    "typedef int pid_t;\n"
+	    "pid_t vfork(void);\n"
+	    "void cleanup(void);\n"
+	    "pid_t (*get_trigger(void))(void) { return vfork; }\n"
+	    "int main(void) {\n"
+	    "    pid_t (*trigger)(void) = get_trigger();\n"
+	    "    defer { cleanup(); }\n"
+	    "    (void)trigger;\n"
+	    "    return 0;\n"
+	    "}\n";
 	PrismResult r = prism_transpile_source(code, "defer_vfork_fptr.c", prism_defaults());
-	// The transpiler should reject this because trigger() is ultimately vfork.
-	// Since it can't see through the indirection, this test documents the bypass.
-	// It should FAIL (status==OK, no error) until alias analysis is added.
 	CHECK(r.status != PRISM_OK,
-	"defer-vfork-funcptr: vfork via function pointer bypasses defer safety");
+	      "defer-vfork-funcptr: vfork via function pointer must be rejected");
 	prism_free(&r);
-	*/
+}
+
+static void test_defer_vfork_local_alias_bypass(void) {
+	// Direct intra-function aliasing: fp = vfork; fp();
+	// This was the original attack vector that bypassed the old
+	// call-site-only (vfork followed by '(') detection.
+	const char *code =
+	    "typedef int pid_t;\n"
+	    "pid_t vfork(void);\n"
+	    "void cleanup(void);\n"
+	    "void test(void) {\n"
+	    "    defer { cleanup(); }\n"
+	    "    pid_t (*stealth)(void) = vfork;\n"
+	    "    if (stealth() == 0) return;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_vfork_alias.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "defer-vfork-local-alias: fp=vfork;fp() must be rejected");
+	prism_free(&r);
 }
 
 
 static void test_defer_vfork_reference_false_positive(void) {
 	// get_vfork_ptr returns a pointer to vfork but never calls it.
-	// main() calls get_vfork_ptr() and uses defer — this is safe because
-	// vfork is never actually invoked.
+	// main() calls get_vfork_ptr() and uses defer — this is safe in
+	// theory, but the token-level taint scanner taints any function
+	// whose body mentions vfork (to block intra-TU fp aliasing attacks
+	// like `fp = vfork; fp();`).  Transitive propagation then taints
+	// main().  This is an accepted false positive.
 	const char *code =
 	    "typedef int pid_t;\n"
 	    "pid_t vfork(void);\n"
@@ -2310,11 +2331,10 @@ static void test_defer_vfork_reference_false_positive(void) {
 	    "    return 0;\n"
 	    "}\n";
 	PrismResult r = prism_transpile_source(code, "defer_vfork_ref_fp.c", prism_defaults());
-	// main() never calls vfork — only get_vfork_ptr references it as a value.
-	// The transpiler should ACCEPT this. Rejection is a false positive caused
-	// by the body scanner not distinguishing `return vfork;` from `vfork();`.
-	CHECK(r.status == PRISM_OK,
-	      "defer-vfork-ref-false-positive: vfork pointer reference taints caller");
+	// Expected: rejected.  The aggressive vfork taint catches bare vfork
+	// references to prevent function-pointer aliasing bypasses.
+	CHECK(r.status != PRISM_OK,
+	      "defer-vfork-ref-false-positive: vfork reference must taint transitively");
 	prism_free(&r);
 }
 #endif
@@ -3497,6 +3517,7 @@ void run_defer_tests(void) {
 	test_defer_paren_vfork_bypass();
 	test_defer_vfork_funcptr_bypass();
 	test_defer_vfork_reference_false_positive();
+	test_defer_vfork_local_alias_bypass();
 #endif
 	test_defer_fnptr_return_type_overwrite();
 

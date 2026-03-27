@@ -1787,7 +1787,7 @@ static void test_chained_bare_orelse(void) {
 	// The output must NOT contain the literal "orelse" keyword — that's not valid C.
 	CHECK(strstr(result.output, "orelse") == NULL,
 	      "chained bare orelse: no raw 'orelse' keyword in C output");
-	// Should produce two fallback stages for the chain (ternary on temp)
+	// Should produce two fallback stages for the chain
 	bool has_ternary_temp_chain = false;
 	{
 		const char *first_t = strstr(result.output, "? __prism_oe_");
@@ -1804,7 +1804,15 @@ static void test_chained_bare_orelse(void) {
 			if (second_if) has_if_chain = true;
 		}
 	}
-	CHECK(has_ternary_temp_chain || has_if_chain,
+	bool has_void0_chain = false;
+	{
+		const char *first_v = strstr(result.output, "(void)0");
+		if (first_v) {
+			const char *second_v = strstr(first_v + 7, "(void)0");
+			if (second_v) has_void0_chain = true;
+		}
+	}
+	CHECK(has_ternary_temp_chain || has_if_chain || has_void0_chain,
 	      "chained bare orelse: two fallback stages present in chain");
 	// The compound literal should survive in the output
 	CHECK(strstr(result.output, "(int[]){42}") != NULL,
@@ -4352,6 +4360,74 @@ static void test_typeof_orelse_file_scope_leak(void) {
 	}
 }
 
+static void test_bare_orelse_temp_type_truncation(void) {
+	printf("\n--- Bare orelse Temp-Type Truncation (audit round 46) ---\n");
+
+	// Bug: emit_bare_orelse_impl declared __typeof__(RHS) temp, then
+	// assigned the wider fallback back into it, silently truncating.
+	// Fix: final link assigns directly to LHS, preserving usual
+	// arithmetic conversions.
+	const char *code =
+	    "int get_fail(void) { return 0; }\n"
+	    "int main(void) {\n"
+	    "    long long result;\n"
+	    "    result = get_fail() orelse 0x1234567890LL;\n"
+	    "    return !(result == 0x1234567890LL);\n"
+	    "}\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "orelse-temp-trunc: create temp file");
+
+	PrismFeatures f = prism_defaults();
+	PrismResult r = prism_transpile_file(path, f);
+	CHECK_EQ(r.status, PRISM_OK, "orelse-temp-trunc: transpiles OK");
+
+	// The transpiled output must assign fallback directly to LHS, not
+	// back into the RHS-typed temp.  Check for "result = __prism_oe_"
+	// (direct LHS assignment in the ternary) instead of the truncating
+	// pattern "__prism_oe_N = __prism_oe_N ? ... ; result = __prism_oe_N;".
+	CHECK(r.output != NULL, "orelse-temp-trunc: output not NULL");
+	CHECK(strstr(r.output, "result = __prism_oe_") != NULL,
+	      "orelse-temp-trunc: final assignment goes directly to LHS");
+
+	prism_free(&r);
+	unlink(path);
+	free(path);
+}
+
+static void test_bare_orelse_compound_literal_detection(void) {
+	printf("\n--- Bare orelse Compound Literal Detection (audit round 46) ---\n");
+
+	// Bug: compound literal detection incremented depth on { (TF_OPEN)
+	// before checking sd==0, so (int[]){1,2,3} was never detected.
+	// Fix: check for { at sd==0 before depth increment.
+	const char *code =
+	    "int *get(void);\n"
+	    "void test(void) {\n"
+	    "    int *p;\n"
+	    "    p = get() orelse (int[]){1, 2, 3};\n"
+	    "    (void)*p;\n"
+	    "}\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "orelse-cl-detect: create temp file");
+
+	PrismFeatures f = prism_defaults();
+	PrismResult r = prism_transpile_file(path, f);
+	CHECK_EQ(r.status, PRISM_OK, "orelse-cl-detect: transpiles OK");
+	CHECK(r.output != NULL, "orelse-cl-detect: output not NULL");
+
+	// The compound literal path must be used (ternary with (void)0, no
+	// block wrapper { }).  Check for the (void)0 pattern and absence of
+	// __prism_oe_ temp.
+	CHECK(strstr(r.output, "(void)0") != NULL,
+	      "orelse-cl-detect: compound literal ternary path used");
+	CHECK(strstr(r.output, "__prism_oe_") == NULL,
+	      "orelse-cl-detect: no temp variable (compound literal path)");
+
+	prism_free(&r);
+	unlink(path);
+	free(path);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -4639,4 +4715,8 @@ void run_orelse_tests(void) {
 
 	// Audit round 43: typeof + orelse at file scope leaks statement expression
 	test_typeof_orelse_file_scope_leak();
+
+	// Audit round 46: temp-type truncation + compound literal detection
+	test_bare_orelse_temp_type_truncation();
+	test_bare_orelse_compound_literal_detection();
 }

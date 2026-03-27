@@ -130,8 +130,8 @@ static void test_harsh_delimiter_overflow(void) {
     len += snprintf(src + len, cap - len, "; return x; }\n");
 
     PrismResult r = prism_transpile_source(src, "harsh_delim_overflow.c", prism_defaults());
-    CHECK(r.status != PRISM_OK,
-          "harsh delimiter overflow: excessive nesting rejected cleanly");
+    CHECK(r.status == PRISM_OK,
+          "harsh delimiter overflow: excessive nesting handled dynamically");
     prism_free(&r);
     free(src);
 }
