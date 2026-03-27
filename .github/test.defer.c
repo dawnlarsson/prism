@@ -3393,6 +3393,34 @@ static void test_compound_literal_ctrl_state_desync(void) {
 	}
 }
 
+#ifdef __GNUC__
+static void test_defer_shadow_stmt_expr_bypass(void) {
+	printf("\n--- Defer shadow stmt-expr init bypass (audit round 48) ---\n");
+
+	// BUG: try_zero_init_decl returns NULL for single-declarator
+	// statement-expression initializers (int x = ({...});).  This bypasses
+	// process_declarators and thus check_defer_var_shadow.  The inner
+	// 'target' silently hijacks the name captured by the outer defer.
+	const char *code =
+	    "void cleanup(int *p);\n"
+	    "int f(void) {\n"
+	    "    int target = 1;\n"
+	    "    defer cleanup(&target);\n"
+	    "    {\n"
+	    "        int target = ({ 3; });\n"
+	    "        (void)target;\n"
+	    "        return 0;\n"
+	    "    }\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_shadow_stmtexpr.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "defer-shadow-stmt-expr: stmt-expr init must not bypass shadow check");
+	CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
+	      "defer-shadow-stmt-expr: error message mentions 'shadows'");
+	prism_free(&r);
+}
+#endif
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -3605,4 +3633,9 @@ void run_defer_tests(void) {
 
 	// Audit round 47: nested stmt-expr in defer exponential blowup
 	test_defer_nested_stmt_expr_perf();
+
+#ifdef __GNUC__
+	// Audit round 48: stmt-expr init bypasses defer shadow check
+	test_defer_shadow_stmt_expr_bypass();
+#endif
 }

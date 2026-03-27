@@ -3861,8 +3861,12 @@ static Token *try_zero_init_decl(Token *tok) {
 				Token *after_se = tok_next(tok_match(aeq));
 				bool is_orelse = after_se && (after_se->tag & TT_ORELSE) &&
 						 !typedef_lookup(after_se);
-				if (!after_se || (!match_ch(after_se, ',') && !is_orelse))
+				if (!after_se || (!match_ch(after_se, ',') && !is_orelse)) {
+					// Bail out to verbatim emit, but still check
+					// defer shadow — process_declarators won't run.
+					check_defer_var_shadow(probe.var_name);
 					return NULL;
+				}
 			}
 		}
 	}

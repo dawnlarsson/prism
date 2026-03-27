@@ -6204,6 +6204,41 @@ static void test_skip_one_stmt_deep_iterative(void) {
 	prism_free(&r);
 }
 
+static void test_taint_propagation_perf(void) {
+	/* BUG: taint propagation's inner loop uses O(N) linear scan with
+	 * memcmp to resolve function call targets.  With N functions each
+	 * making M calls, the fixed-point loop costs O(N*M*N) per iteration.
+	 *
+	 * Fix: use HashMap for O(1) function name lookup. */
+	int N = 5000;
+	size_t cap = (size_t)N * 200 + 256;
+	char *code = malloc(cap);
+	CHECK(code != NULL, "taint-perf: malloc"); if (!code) return;
+	int n = 0;
+	for (int i = 0; i < N; i++)
+		n += snprintf(code + n, cap - n, "void fn_%d(void);\n", i);
+	for (int i = 0; i < N; i++) {
+		n += snprintf(code + n, cap - n, "void fn_%d(void) {", i);
+		for (int j = 0; j < 10; j++)
+			n += snprintf(code + n, cap - n, " fn_%d();", (i * 7 + j * 13) % N);
+		n += snprintf(code + n, cap - n, " }\n");
+	}
+	n += snprintf(code + n, cap - n, "int main(void) { fn_0(); return 0; }\n");
+	struct timespec t0, t1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	PrismResult r = prism_transpile_source(code, "taint_perf.c", prism_defaults());
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	free(code);
+	double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+	CHECK_EQ(r.status, PRISM_OK,
+		 "taint-perf: 5000 functions with 10 calls each transpiles OK");
+	CHECK(elapsed < 2.0,
+	      "taint-perf: 5000-function taint propagation completes in <2s");
+	if (elapsed >= 2.0)
+		printf("  (elapsed: %.3f s)\n", elapsed);
+	prism_free(&r);
+}
+
 void run_api_tests(void) {
 test_typeof_orelse_leak();
 	printf("\n=== API TESTS ===\n");
@@ -6423,4 +6458,7 @@ test_typeof_orelse_leak();
 	test_cond_stack_deep_nesting_silent_drop();
 	test_defer_shadow_limit_dynamic();
 	test_skip_one_stmt_deep_iterative();
+
+	// Audit round 48: taint propagation O(N^2) function lookup
+	test_taint_propagation_perf();
 }

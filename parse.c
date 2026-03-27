@@ -1715,11 +1715,18 @@ static Token *tokenize(File *file) {
 			}
 
 			// Precompute wrapper callee tokens and resolve to function indices.
+			// Build O(1) name→index map for function lookups.
 			uint32_t *wrapper_taint = NULL;
 			int *callee_idx = NULL;
+			HashMap func_map = {0};
 			if (function_count > 0) {
 				wrapper_taint = arena_alloc(&ctx->main_arena, (size_t)function_count * sizeof(*wrapper_taint));
 				callee_idx = arena_alloc(&ctx->main_arena, (size_t)function_count * sizeof(*callee_idx));
+				for (int i = 0; i < function_count; i++) {
+					hashmap_put(&func_map, tok_loc(functions[i].name),
+						    functions[i].name->len,
+						    (void *)(intptr_t)(i + 1));
+				}
 				for (int i = 0; i < function_count; i++) {
 					callee_idx[i] = -1;
 					Token *callee = find_wrapper_callee(functions[i].body);
@@ -1728,12 +1735,8 @@ static Token *tokenize(File *file) {
 						wrapper_taint[i] = callee->tag & (TT_SPECIAL_FN | TT_NORETURN_FN);
 						continue;
 					}
-					for (int j = 0; j < function_count; j++) {
-						if (tok_name_eq(callee, functions[j].name)) {
-							callee_idx[i] = j;
-							break;
-						}
-					}
+					void *v = hashmap_get(&func_map, tok_loc(callee), callee->len);
+					if (v) callee_idx[i] = (int)(intptr_t)v - 1;
 				}
 			}
 
@@ -1766,23 +1769,24 @@ static Token *tokenize(File *file) {
 					for (Token *b = tok_next(body); b != end; b = tok_next(b)) {
 						if (b->kind != TK_IDENT || !tok_next(b) || tok_loc(tok_next(b))[0] != '(')
 							continue;
-						for (int j = 0; j < function_count; j++) {
-							if (!tok_name_eq(b, functions[j].name)) continue;
-							// Wrapper taint (setjmp/vfork wrappers)
-							if (wrapper_taint[j] && !(body->tag & wrapper_taint[j])) {
-								body->tag |= wrapper_taint[j];
-								changed = true;
-							}
-							// Direct vfork taint from body scan
-							uint32_t vfork_taint = functions[j].body->tag & TT_NORETURN_FN;
-							if (vfork_taint && !(body->tag & TT_NORETURN_FN)) {
-								body->tag |= TT_NORETURN_FN;
-								changed = true;
-							}
+						void *v = hashmap_get(&func_map, tok_loc(b), b->len);
+						if (!v) continue;
+						int j = (int)(intptr_t)v - 1;
+						// Wrapper taint (setjmp/vfork wrappers)
+						if (wrapper_taint[j] && !(body->tag & wrapper_taint[j])) {
+							body->tag |= wrapper_taint[j];
+							changed = true;
+						}
+						// Direct vfork taint from body scan
+						uint32_t vfork_taint = functions[j].body->tag & TT_NORETURN_FN;
+						if (vfork_taint && !(body->tag & TT_NORETURN_FN)) {
+							body->tag |= TT_NORETURN_FN;
+							changed = true;
 						}
 					}
 				}
 			} while (changed);
+			free(func_map.buckets);
 		}
 	}
 
