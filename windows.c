@@ -12,6 +12,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h>
 #include <io.h>
 #include <direct.h>
 #include <process.h>
@@ -23,6 +24,7 @@
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "shell32.lib")
 
 // Must be included BEFORE GCC-ism macros (especially noreturn) to avoid
 // poisoning system headers like <setjmp.h> and <stdlib.h>.
@@ -233,6 +235,85 @@ static int win32_fclose_wrapper(FILE *fp) {
 
 #define fclose(fp) win32_fclose_wrapper(fp)
 
+// fopen shim: try wide-char API so non-ASCII (UTF-8) paths work.
+// Falls back to plain fopen if the path is pure ASCII.
+static FILE *(*win32_real_fopen)(const char *, const char *) = fopen;
+static FILE *win32_fopen_utf8(const char *path, const char *mode) {
+	wchar_t wpath[MAX_PATH], wmode[16];
+	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, MAX_PATH);
+	if (wn > 0) {
+		MultiByteToWideChar(CP_UTF8, 0, mode, -1, wmode, 16);
+		FILE *fp = _wfopen(wpath, wmode);
+		if (fp) return fp;
+	}
+	return win32_real_fopen(path, mode);
+}
+#define fopen(path, mode) win32_fopen_utf8(path, mode)
+
+// stat shim: try wide-char API for non-ASCII paths.
+static int win32_stat_utf8(const char *path, struct _stat *st) {
+	wchar_t wpath[MAX_PATH];
+	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, MAX_PATH);
+	if (wn > 0) {
+		int r = _wstat(wpath, (struct _stat *)st);
+		if (r == 0) return 0;
+	}
+	return _stat(path, st);
+}
+#define stat(path, st) win32_stat_utf8(path, (struct _stat *)(st))
+
+// access shim: try wide-char API for non-ASCII paths.
+static int win32_access_utf8(const char *path, int mode) {
+	wchar_t wpath[MAX_PATH];
+	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, MAX_PATH);
+	if (wn > 0) {
+		int r = _waccess(wpath, mode);
+		if (r == 0) return 0;
+	}
+	return _access(path, mode);
+}
+#undef access
+#define access win32_access_utf8
+
+// unlink shim: try wide-char API for non-ASCII paths.
+static int win32_unlink_utf8(const char *path) {
+	wchar_t wpath[MAX_PATH];
+	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, MAX_PATH);
+	if (wn > 0) {
+		int r = _wunlink(wpath);
+		if (r == 0) return 0;
+	}
+	return _unlink(path);
+}
+#undef unlink
+#define unlink win32_unlink_utf8
+
+// Convert argv from the system ANSI codepage to UTF-8 using GetCommandLineW.
+// This lets Prism handle non-ASCII source paths on Windows.
+// Returns a malloc'd argv array (and strings); caller must free.
+static void win32_utf8_argv(int *argc_out, char ***argv_out) {
+	int wargc;
+	LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+	if (!wargv) return;
+
+	char **argv = (char **)calloc((size_t)wargc + 1, sizeof(char *));
+	if (!argv) { LocalFree(wargv); return; }
+
+	for (int i = 0; i < wargc; i++) {
+		int needed = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+		argv[i] = (char *)malloc((size_t)needed);
+		if (argv[i])
+			WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, argv[i], needed, NULL, NULL);
+		else
+			argv[i] = _strdup("");
+	}
+	argv[wargc] = NULL;
+	LocalFree(wargv);
+
+	*argc_out = wargc;
+	*argv_out = argv;
+}
+
 #define SPAWN_ACTION_MAX 8
 
 typedef enum { SPAWN_ACT_CLOSE, SPAWN_ACT_DUP2, SPAWN_ACT_OPEN } SpawnActionKind;
@@ -346,8 +427,14 @@ static int mkstemps(char *tmpl, int suffix_len) {
 			try_buf[i] = chars[(attempt_seed >> 16) % (sizeof(chars) - 1)];
 		}
 		int fd;
-		errno_t err = _sopen_s(
-		    &fd, try_buf, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
+		// Use wide-char API so non-ASCII paths (e.g. Unicode directories) work.
+		wchar_t wtry[MAX_PATH];
+		int wlen = MultiByteToWideChar(CP_UTF8, 0, try_buf, -1, wtry, MAX_PATH);
+		if (wlen <= 0)
+			wlen = MultiByteToWideChar(CP_ACP, 0, try_buf, -1, wtry, MAX_PATH);
+		if (wlen <= 0) continue;
+		errno_t err = _wsopen_s(
+		    &fd, wtry, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
 		if (err == 0 && fd >= 0) {
 			memcpy(tmpl, try_buf, len + 1);
 			return fd;
@@ -358,6 +445,37 @@ static int mkstemps(char *tmpl, int suffix_len) {
 
 static int mkstemp(char *tmpl) {
 	return mkstemps(tmpl, 0);
+}
+
+static char *mkdtemp(char *tmpl) {
+	static const char chars[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+	size_t len = strlen(tmpl);
+	size_t x_end = len;
+	size_t x_start = x_end;
+	while (x_start > 0 && tmpl[x_start - 1] == 'X') x_start--;
+	size_t x_count = x_end - x_start;
+
+	LARGE_INTEGER perf_counter;
+	QueryPerformanceCounter(&perf_counter);
+	unsigned int seed = (unsigned int)_getpid() ^ (unsigned int)GetTickCount() ^
+	                    (unsigned int)perf_counter.LowPart;
+
+	for (int attempt = 0; attempt < 10000; attempt++) {
+		char try_buf[MAX_PATH];
+		if (len >= MAX_PATH) { errno = ENAMETOOLONG; return NULL; }
+		memcpy(try_buf, tmpl, len + 1);
+		unsigned int attempt_seed = seed ^ ((unsigned int)attempt * 2654435761u);
+		for (size_t i = x_start; i < x_start + x_count; i++) {
+			attempt_seed = attempt_seed * 1103515245 + 12345;
+			try_buf[i] = chars[(attempt_seed >> 16) % (sizeof(chars) - 1)];
+		}
+		if (CreateDirectoryA(try_buf, NULL)) {
+			memcpy(tmpl, try_buf, len + 1);
+			return tmpl;
+		}
+		if (GetLastError() != ERROR_ALREADY_EXISTS) return NULL;
+	}
+	return NULL;
 }
 
 /* Stub: Windows callers use get_self_exe_path() via GetModuleFileNameA instead */
@@ -550,7 +668,23 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 	BOOL ok = FALSE;
 	if (!cmdline) goto cleanup;
 
-	ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+	// Use CreateProcessW so UTF-8 paths (converted by win32_utf8_argv) work.
+	{
+		int wlen = MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, NULL, 0);
+		wchar_t *wcmdline = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+		if (wcmdline) {
+			MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, wcmdline, wlen);
+			STARTUPINFOW siw;
+			memset(&siw, 0, sizeof(siw));
+			siw.cb = sizeof(siw);
+			siw.dwFlags = si.dwFlags;
+			siw.hStdInput = si.hStdInput;
+			siw.hStdOutput = si.hStdOutput;
+			siw.hStdError = si.hStdError;
+			ok = CreateProcessW(NULL, wcmdline, NULL, NULL, TRUE, 0, NULL, NULL, &siw, &pi);
+			free(wcmdline);
+		}
+	}
 	free(cmdline);
 
 	if (!ok) fprintf(stderr, "CreateProcess failed for '%s': error %lu\n", argv[0], GetLastError());
@@ -621,15 +755,24 @@ static bool get_self_exe_path(char *buf, size_t bufsize) {
 }
 
 // Detect whether the compiler is MSVC cl.exe
+// Handles quoted paths like "C:\Program Files\...\cl.exe" /nologo
 static bool cc_is_msvc(const char *cc) {
 	if (!cc || !*cc) return false;
 	while (*cc == ' ') cc++;
-	// Find end of command (before args)
-	const char *cmd_end = cc;
-	while (*cmd_end && *cmd_end != ' ') cmd_end++;
-	// Find last path separator within command only (not in /flag args)
-	const char *base = cc;
-	for (const char *p = cc; p < cmd_end; p++)
+	// Find the end of the command token (before args), respecting quotes
+	const char *cmd_start = cc;
+	const char *cmd_end;
+	if (*cc == '"') {
+		cmd_start = cc + 1; // skip opening quote
+		cmd_end = strchr(cmd_start, '"');
+		if (!cmd_end) cmd_end = cmd_start + strlen(cmd_start);
+	} else {
+		cmd_end = cc;
+		while (*cmd_end && *cmd_end != ' ' && *cmd_end != '\t') cmd_end++;
+	}
+	// Find last path separator within command only
+	const char *base = cmd_start;
+	for (const char *p = cmd_start; p < cmd_end; p++)
 		if (*p == '/' || *p == '\\') base = p + 1;
 	size_t len = (size_t)(cmd_end - base);
 	return ((len == 2 && _strnicmp(base, "cl", 2) == 0) ||
@@ -638,9 +781,15 @@ static bool cc_is_msvc(const char *cc) {
 
 // Run a command and wait for it to complete.
 // Returns exit status, or -1 on error.
+// Uses CreateProcess with proper quoting so paths with spaces work.
 static int run_command(char **argv) {
-	intptr_t status = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
-	return (int)status;
+	HANDLE hp = win32_spawn_with_actions(argv, NULL, NULL);
+	if (hp == INVALID_HANDLE_VALUE) return -1;
+	WaitForSingleObject(hp, INFINITE);
+	DWORD exit_code = 1;
+	GetExitCodeProcess(hp, &exit_code);
+	CloseHandle(hp);
+	return (int)exit_code;
 }
 
 // Like run_command but suppresses stderr (for probe attempts)
@@ -659,12 +808,12 @@ static int run_command_quiet(char **argv) {
 	_dup2(nul_fd, STDERR_FILENO);
 	_close(nul_fd);
 
-	intptr_t status = _spawnvp(_P_WAIT, argv[0], (const char *const *)argv);
+	int status = run_command(argv);
 
 	// Restore stderr
 	_dup2(orig_stderr, STDERR_FILENO);
 	_close(orig_stderr);
-	return (int)status;
+	return status;
 }
 
 // Capture the first line of a command's stdout. Returns 0 on success.

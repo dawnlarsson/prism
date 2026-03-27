@@ -1,6 +1,5 @@
 // Windows-specific test suite for Prism C transpiler.
 // Exercises defer, orelse, zero-init, and raw with Windows SDK APIs.
-// Run with: prism run .github/test.windows.c
 //
 // Requirements: Windows, MSVC (cl.exe), Desktop development with C++ workload.
 
@@ -983,34 +982,14 @@ static void test_interleaved_flow(void) {
 	CHECK_EQ(interleaved_flow(99), 999, "interleaved: mode default");
 }
 
-// Bug 1: Multi-word return types were truncated in defer.
-// "unsigned long long foo()" with defer would capture only "long" as the
-// return type, producing an incorrect _Prism_ret_t typedef.
 static unsigned long long multiword_ret_with_defer(int x) {
 	defer (void)0;
 	return (unsigned long long)x * 1000000ULL;
 }
 
-// Bug 2: __int8/__int16/__int32/__int64 not recognized as types.
-// MSVC-specific integer types need to be in the keyword table for zero-init
-// and orelse to work.
 static __int32 get_int32_val(void) { return 42; }
 static __int64 get_int64_val(void) { return 9999999999LL; }
 
-// Bug 3: MSVC calling conventions (__cdecl, __stdcall) leak into _Prism_ret.
-// Functions declared with calling conventions and using defer get the
-// calling convention keyword baked into the return type typedef.
-// KNOWN BUG — not yet fixed upstream. Test omitted.
-
-// Bug 5: __pragma not registered as TT_ATTR — MSVC preprocessor emits
-// __pragma(pack(push, 8)) inline in declarations. Without TT_ATTR, skip_noise
-// couldn't skip it, corrupting the prescan pass. This is implicitly tested by
-// including <stdio.h> (which emits __pragma), but the typedef+orelse test below
-// directly exercises the parse path that was broken.
-
-// Bug 6: Typedef flag corruption — when typedef_add() skipped a duplicate
-// re-registration during the transpile pass, the flag-setting code wrote
-// is_aggregate on the wrong (last-added) entry, corrupting user typedefs.
 typedef int MyTestInt;
 typedef unsigned long long MyTestULL;
 static MyTestInt get_myint(void) { return 77; }
@@ -1068,15 +1047,176 @@ static void test_msvc_regressions(void) {
 	}
 }
 
+static void test_spaces_in_paths(void) {
+	printf("\n--- Bug Regression: Paths with Spaces ---\n");
+
+	// win32_argv_to_cmdline must quote args that contain spaces
+	{
+		char *argv_test[] = { "cl.exe", "/c", "src with spaces\\hello.c", "/Fo:out dir\\hello.obj", NULL };
+		char *cmdline = win32_argv_to_cmdline(argv_test);
+		CHECK(cmdline != NULL, "argv_to_cmdline returned non-NULL");
+		// The arg with spaces must be quoted
+		CHECK(strstr(cmdline, "\"src with spaces\\hello.c\"") != NULL,
+		      "argv_to_cmdline quotes arg with spaces");
+		CHECK(strstr(cmdline, "\"/Fo:out dir\\hello.obj\"") != NULL,
+		      "argv_to_cmdline quotes output arg with spaces");
+		free(cmdline);
+	}
+
+	// Simple args without spaces should NOT be quoted
+	{
+		char *argv_simple[] = { "cl.exe", "/c", "hello.c", NULL };
+		char *cmdline = win32_argv_to_cmdline(argv_simple);
+		CHECK(cmdline != NULL, "argv_to_cmdline simple non-NULL");
+		CHECK(strstr(cmdline, "\"hello.c\"") == NULL,
+		      "argv_to_cmdline does not quote simple arg");
+		free(cmdline);
+	}
+
+	// End-to-end: compile a file inside a directory with spaces
+	{
+		char tmpdir[PATH_MAX];
+		if (!test_mkdtemp(tmpdir, "prism_spaces_")) {
+			printf("  SKIP: could not create temp dir\n");
+			return;
+		}
+		// Create "sub dir" inside tmpdir
+		char subdir[PATH_MAX];
+		snprintf(subdir, sizeof(subdir), "%s\\sub dir", tmpdir);
+		CreateDirectoryA(subdir, NULL);
+
+		// Write a minimal C file inside the spaced directory
+		char srcpath[PATH_MAX];
+		snprintf(srcpath, sizeof(srcpath), "%s\\test.c", subdir);
+		FILE *f = fopen(srcpath, "w");
+		CHECK(f != NULL, "spaces: create source file");
+		if (f) { fprintf(f, "int main(void){return 0;}\n"); fclose(f); }
+
+		// Compile it using run_command (exercises CreateProcess quoting)
+		char outpath[PATH_MAX];
+		snprintf(outpath, sizeof(outpath), "%s\\test.exe", subdir);
+		char fe_flag[PATH_MAX];
+		snprintf(fe_flag, sizeof(fe_flag), "/Fe:%s", outpath);
+		char *cc_argv[] = { "cl.exe", "/nologo", fe_flag, srcpath, NULL };
+		int rc = run_command(cc_argv);
+		CHECK_EQ(rc, 0, "spaces: compile in dir with spaces succeeds");
+		CHECK(access(outpath, 0) == 0, "spaces: output exe exists");
+
+		// Cleanup
+		unlink(outpath);
+		// Remove .obj that cl.exe may produce in cwd or subdir
+		char objpath[PATH_MAX];
+		snprintf(objpath, sizeof(objpath), "%s\\test.obj", subdir);
+		unlink(objpath);
+		unlink(srcpath);
+		RemoveDirectoryA(subdir);
+		RemoveDirectoryA(tmpdir);
+	}
+}
+
+static void test_unicode_paths(void) {
+	printf("\n--- Bug Regression: Non-ASCII (Unicode) Paths ---\n");
+
+	// mkstemps with a non-ASCII directory
+	{
+		char tmpdir[PATH_MAX];
+		if (!test_mkdtemp(tmpdir, "prism_uni_")) {
+			printf("  SKIP: could not create temp dir\n");
+			return;
+		}
+		// Create a subdirectory with Japanese characters
+		char unidir[PATH_MAX];
+		snprintf(unidir, sizeof(unidir), "%s\\\xe3\x83\x86\xe3\x82\xb9\xe3\x83\x88", tmpdir);
+
+		// Use wide API to create directory (since ANSI CreateDirectoryA may fail)
+		wchar_t wunidir[MAX_PATH];
+		MultiByteToWideChar(CP_UTF8, 0, unidir, -1, wunidir, MAX_PATH);
+		CreateDirectoryW(wunidir, NULL);
+
+		// Try mkstemps inside the Unicode directory
+		char tmpl[PATH_MAX];
+		snprintf(tmpl, sizeof(tmpl), "%s\\prism_XXXXXX.c", unidir);
+		int fd = mkstemps(tmpl, 2);
+		CHECK(fd >= 0, "unicode: mkstemps in non-ASCII dir succeeds");
+		if (fd >= 0) {
+			const char *src = "int main(void){return 0;}\n";
+			write(fd, src, (unsigned)strlen(src));
+			close(fd);
+
+			// Verify fopen also works on the non-ASCII path
+			FILE *f = fopen(tmpl, "r");
+			CHECK(f != NULL, "unicode: fopen non-ASCII path");
+			if (f) fclose(f);
+
+			unlink(tmpl);
+		}
+
+		// Cleanup
+		RemoveDirectoryW(wunidir);
+		RemoveDirectoryA(tmpdir);
+	}
+}
+
+static void test_quoted_cc_parsing(void) {
+	printf("\n--- Bug Regression: Quoted CC Parsing ---\n");
+
+	// cc_is_msvc: unquoted cl.exe
+	CHECK(cc_is_msvc("cl") == true, "cc_is_msvc(\"cl\")");
+	CHECK(cc_is_msvc("cl.exe") == true, "cc_is_msvc(\"cl.exe\")");
+	CHECK(cc_is_msvc("CL.EXE") == true, "cc_is_msvc(\"CL.EXE\") case-insensitive");
+
+	// cc_is_msvc: path without spaces
+	CHECK(cc_is_msvc("C:\\MSVC\\bin\\cl.exe") == true,
+	      "cc_is_msvc with backslash path");
+
+	// cc_is_msvc: quoted path with spaces (the bug scenario)
+	CHECK(cc_is_msvc("\"C:\\Program Files\\MSVC\\bin\\cl.exe\"") == true,
+	      "cc_is_msvc quoted path with spaces");
+	CHECK(cc_is_msvc("\"C:\\Program Files\\MSVC\\bin\\cl.exe\" /nologo") == true,
+	      "cc_is_msvc quoted path with spaces + args");
+
+	// cc_is_msvc: non-MSVC compilers
+	CHECK(cc_is_msvc("gcc") == false, "cc_is_msvc(\"gcc\")");
+	CHECK(cc_is_msvc("\"C:\\Program Files\\gcc\\bin\\gcc.exe\"") == false,
+	      "cc_is_msvc quoted gcc path");
+	CHECK(cc_is_msvc(NULL) == false, "cc_is_msvc(NULL)");
+	CHECK(cc_is_msvc("") == false, "cc_is_msvc(\"\")");
+
+	// cc_executable: extract compiler path from quoted CC string
+	{
+		const char *exe;
+
+		exe = cc_executable("cl.exe");
+		CHECK(strcmp(exe, "cl.exe") == 0, "cc_executable simple");
+
+		exe = cc_executable("\"C:\\Program Files\\MSVC\\cl.exe\" /nologo");
+		CHECK(strcmp(exe, "C:\\Program Files\\MSVC\\cl.exe") == 0,
+		      "cc_executable quoted with spaces");
+
+		exe = cc_executable("gcc -m32");
+		CHECK(strcmp(exe, "gcc") == 0, "cc_executable with flags");
+	}
+
+	// cc_extra_arg_count: count args beyond compiler
+	{
+		CHECK_EQ(cc_extra_arg_count("cl.exe"), 0,
+		         "cc_extra_arg_count no extras");
+		CHECK_EQ(cc_extra_arg_count("\"C:\\Program Files\\cl.exe\" /nologo"), 1,
+		         "cc_extra_arg_count quoted + 1 extra");
+		CHECK_EQ(cc_extra_arg_count("\"C:\\Program Files\\cl.exe\" /nologo /W4"), 2,
+		         "cc_extra_arg_count quoted + 2 extras");
+		CHECK_EQ(cc_extra_arg_count("gcc -m32"), 1,
+		         "cc_extra_arg_count unquoted + 1 extra");
+	}
+}
+
 void run_windows_tests(void) {
 	printf("=== PRISM WINDOWS TEST SUITE ===\n");
 
-	// Zero-init
 	test_zeroinit_win_types();
 	test_zeroinit_win_structs();
 	test_zeroinit_win_arrays();
 
-	// Defer with Windows resources
 	test_defer_heap();
 	test_defer_virtual_memory();
 	test_defer_file_handle();
@@ -1086,57 +1226,30 @@ void run_windows_tests(void) {
 	test_defer_critical_section();
 	test_defer_multi_resource();
 	test_defer_early_return();
-
-	// Orelse
-	test_orelse_win_apis();
-
-	// Combined patterns
-	test_combined_patterns();
-
-	// Raw
-	test_raw_win_types();
-
-	// Defer in loops
 	test_defer_loop_alloc();
 	test_defer_loop_break();
 	test_defer_loop_continue();
-
-	// Nested
 	test_defer_nested_scopes_win();
-
-	// API queries
-	test_win_api_queries();
-
-	// Threads
+	test_defer_switch();
+	test_defer_mmap();
+	test_defer_stress();
+	test_goto_defer();
 	test_defer_thread();
 
-	// Extreme combined
+	test_raw_win_types();
+	test_orelse_win_apis();
+	test_wide_string_apis();
+	test_win_api_queries();
+	test_spaces_in_paths();
+	test_unicode_paths();
+	test_quoted_cc_parsing();
+	
+	test_combined_patterns();
 	test_extreme_combined();
 
-	// Switch
-	test_defer_switch();
-
-	// Memory-mapped files
-	test_defer_mmap();
-
-	// Wide strings
-	test_wide_string_apis();
-
-	// Stress
-	test_defer_stress();
-
-	// Goto cleanup
-	test_goto_defer();
-
-	// Interleaved
 	test_interleaved_flow();
 
-	// MSVC regression tests
 	test_msvc_regressions();
-
-	printf("\n========================================\n");
-	printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);
-	printf("========================================\n");
 
 	return (failed == 0) ? 0 : 1;
 }

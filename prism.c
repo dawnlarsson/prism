@@ -4735,13 +4735,25 @@ static const char **alloc_argv(int count) {
 
 // Extract the first whitespace-delimited token from a CC string.
 // e.g. "ccache gcc" -> "ccache", "gcc -m32" -> "gcc"
+// Handles quoted paths: "\"C:\\Program Files\\cl.exe\" /nologo" -> "C:\\Program Files\\cl.exe"
 static const char *cc_executable(const char *cc) {
 	if (!cc || !*cc) return cc;
 	const char *p = cc;
+	while (*p == ' ' || *p == '\t') p++;
+	static PRISM_THREAD_LOCAL char buf[PATH_MAX];
+	if (*p == '"') {
+		p++; // skip opening quote
+		const char *end = strchr(p, '"');
+		if (!end) end = p + strlen(p);
+		size_t len = (size_t)(end - p);
+		if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+		memcpy(buf, p, len);
+		buf[len] = '\0';
+		return buf;
+	}
 	while (*p && *p != ' ' && *p != '\t') p++;
 	if (*p == '\0') return cc;
 	size_t len = (size_t)(p - cc);
-	static PRISM_THREAD_LOCAL char buf[PATH_MAX];
 	if (len >= sizeof(buf)) len = sizeof(buf) - 1;
 	memcpy(buf, cc, len);
 	buf[len] = '\0';
@@ -4775,17 +4787,31 @@ static void cc_split_into_argv(const char **args, int *argc, const char *cc, cha
 }
 
 // Count extra tokens in a CC string (tokens beyond the first).
+// Handles quoted first token: "\"C:\\Program Files\\cl.exe\" /nologo" has 1 extra.
 static int cc_extra_arg_count(const char *cc) {
 	if (!cc || !*cc) return 0;
 	int count = 0;
 	const char *p = cc;
 	while (*p == ' ' || *p == '\t') p++;
-	while (*p && *p != ' ' && *p != '\t') p++;
+	// Skip the first token (possibly quoted)
+	if (*p == '"') {
+		p++; // skip opening quote
+		while (*p && *p != '"') p++;
+		if (*p == '"') p++; // skip closing quote
+	} else {
+		while (*p && *p != ' ' && *p != '\t') p++;
+	}
 	while (*p) {
 		while (*p == ' ' || *p == '\t') p++;
 		if (!*p) break;
 		count++;
-		while (*p && *p != ' ' && *p != '\t') p++;
+		if (*p == '"') {
+			p++;
+			while (*p && *p != '"') p++;
+			if (*p == '"') p++;
+		} else {
+			while (*p && *p != ' ' && *p != '\t') p++;
+		}
 	}
 	return count;
 }
@@ -9295,6 +9321,9 @@ static void signal_cleanup_handler(int sig) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+	win32_utf8_argv(&argc, &argv);
+#endif
 	signal(SIGINT, signal_cleanup_handler);
 	signal(SIGTERM, signal_cleanup_handler);
 	signal(SIGPIPE, SIG_IGN); // no-op on Windows (SIGPIPE defined but never raised)
