@@ -1624,6 +1624,15 @@ static void emit_type_stripped(Token *start, Token *end, bool strip_const) {
 			t = walk_balanced_orelse(t);
 			continue;
 		}
+		// _BitInt/_Alignas: defense-in-depth — orelse rejected in
+		// parse_type_specifier (Phase 1 primary), catch leaks here.
+		if (FEAT(F_ORELSE) && (t->tag & (TT_BITINT | TT_ALIGNAS)) &&
+		    tok_next(t) && match_ch(tok_next(t), '(')) {
+			emit_tok(t);
+			t = tok_next(t);
+			t = walk_balanced_orelse(t);
+			continue;
+		}
 		if (match_ch(t, '{')) {
 			Token *kw = NULL;
 			for (Token *s = start; s != t; s = tok_next(s))
@@ -2416,8 +2425,19 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 
 		if (tag & (TT_BITINT | TT_ATTR | TT_ALIGNAS)) {
 			if (tag & TT_BITINT) r.saw_type = true;
+			Token *kw = tok;
 			tok = tok_next(tok);
-			if (tok && match_ch(tok, '(')) tok = skip_balanced(tok, '(', ')');
+			if (tok && match_ch(tok, '(')) {
+				if (FEAT(F_ORELSE) && (kw->tag & (TT_BITINT | TT_ALIGNAS))) {
+					Token *close = tok_match(tok);
+					for (Token *s = tok_next(tok); s && s != close; s = tok_next(s))
+						if ((s->tag & TT_ORELSE) && !typedef_lookup(s))
+							error_tok(s, "'orelse' cannot be used inside %s "
+								  "(requires a compile-time constant expression)",
+								  (kw->tag & TT_BITINT) ? "_BitInt()" : "_Alignas()");
+				}
+				tok = skip_balanced(tok, '(', ')');
+			}
 			r.end = tok;
 			continue;
 		}
@@ -2592,6 +2612,11 @@ static void emit_token_range_orelse(Token *start, Token *end) {
 		return;
 	}
 	Token *rhs = tok_next(orelse);
+	reject_orelse_side_effects(start, orelse,
+				  "'orelse' in array dimension / typeof",
+				  "in a chained 'orelse' (would be evaluated twice); "
+				  "hoist the expression to a variable first",
+				  false, true, false);
 	OUT_LIT("(");
 	emit_token_range_orelse(start, orelse);
 	OUT_LIT(") ? (");
@@ -6486,7 +6511,11 @@ static void p1_full_depth_prescan(Token *tok) {
 			uint16_t bo_sid = CUR_SID();
 			bool in_struct = bo_sid > 0 && bo_sid < scope_tree_count && scope_tree[bo_sid].is_struct;
 			bool found_oe = false;
+			Token *prev_d0_oe = NULL;
+			int oe_depth = 0;
 			for (Token *s = tok_next(tok); s && s != close && s->kind != TK_EOF; s = tok_next(s)) {
+				if (s->flags & TF_OPEN) oe_depth++;
+				if (s->flags & TF_CLOSE) oe_depth--;
 				if ((s->tag & TT_ORELSE) && !typedef_lookup(s)) {
 					if (p1d_cur_func < 0)
 						error_tok(s, "orelse inside array dimension at file scope is not allowed "
@@ -6509,6 +6538,15 @@ static void p1_full_depth_prescan(Token *tok) {
 							     "if wrapped in outer parentheses, remove them: "
 							     "use '[f() orelse 1]' not '[(f() orelse 1)]'");
 					validate_bracket_orelse(s);
+					if (oe_depth == 0 && prev_d0_oe)
+						reject_orelse_side_effects(
+							tok_next(prev_d0_oe), s,
+							"'orelse' in array dimension",
+							"in a chained 'orelse' (would be "
+							"evaluated twice); hoist the "
+							"expression to a variable first",
+							false, true, false);
+					if (oe_depth == 0) prev_d0_oe = s;
 					tok_ann(s) |= P1_OE_BRACKET;
 					found_oe = true;
 				}

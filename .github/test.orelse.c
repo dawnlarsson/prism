@@ -3962,13 +3962,17 @@ static void test_typeof_opaque_expr_orelse_aggregate(void) {
 static void test_bracket_orelse_dim_hoisting_bypass(void) {
 	printf("\n--- bracket orelse dimension hoisting bypass ---\n");
 
-	/* BUG: emit_bracket_orelse_temps used emit_token_range to emit hoisted
-	 * dimension tokens. This is a raw emitter that bypasses orelse→ternary
-	 * transformation. If a non-orelse dimension contains orelse inside a ()
-	 * group (e.g. function call arg), the raw 'orelse' keyword leaks into
-	 * the output C code. */
+	/* BUG (original): emit_bracket_orelse_temps used emit_token_range to emit
+	 * hoisted dimension tokens, leaking raw 'orelse' into C output.
+	 * BUG (audit round 52): emit_token_range_orelse duplicated orelse LHS into
+	 * ternary without side-effect checking. Function calls inside nested orelse
+	 * (e.g. foo() orelse 5 inside get_n()) were called twice.
+	 * FIX: reject_orelse_side_effects now fires inside emit_token_range_orelse.
+	 * Code with function calls in nested bracket orelses is rejected — user
+	 * must hoist to a local variable. */
 
-	/* Case 1: orelse in function call arg inside non-orelse dim */
+	/* Case 1: orelse in function call arg inside non-orelse dim — rejected
+	 * because foo() would be duplicated in ternary (double eval) */
 	{
 		PrismResult r = prism_transpile_source(
 		    "int get_n(int);\n"
@@ -3979,18 +3983,12 @@ static void test_bracket_orelse_dim_hoisting_bypass(void) {
 		    "    (void)buf;\n"
 		    "}\n",
 		    "bracket_dim_hoist_bypass.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		      "bracket-dim-hoist: nested orelse transpiles OK");
-		if (r.output) {
-			CHECK(strstr(r.output, "orelse") == NULL,
-			      "bracket-dim-hoist: no raw 'orelse' in C output");
-			CHECK(strstr(r.output, "__prism_dim_") != NULL,
-			      "bracket-dim-hoist: non-orelse dim is hoisted");
-		}
+		CHECK(r.status != PRISM_OK,
+		      "bracket-dim-hoist: nested orelse with call rejected (double eval)");
 		prism_free(&r);
 	}
 
-	/* Case 2: orelse inside orelse-bracket LHS function call */
+	/* Case 2: orelse inside orelse-bracket LHS function call — rejected */
 	{
 		PrismResult r = prism_transpile_source(
 		    "int get_n(int);\n"
@@ -4000,15 +3998,12 @@ static void test_bracket_orelse_dim_hoisting_bypass(void) {
 		    "    (void)buf;\n"
 		    "}\n",
 		    "bracket_lhs_hoist_bypass.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		      "bracket-lhs-hoist: nested orelse in LHS transpiles OK");
-		if (r.output)
-			CHECK(strstr(r.output, "orelse") == NULL,
-			      "bracket-lhs-hoist: no raw 'orelse' in C output");
+		CHECK(r.status != PRISM_OK,
+		      "bracket-lhs-hoist: nested orelse with call rejected (double eval)");
 		prism_free(&r);
 	}
 
-	/* Case 3: multiple nested orelse in different dims */
+	/* Case 3: multiple nested orelse in different dims — rejected */
 	{
 		PrismResult r = prism_transpile_source(
 		    "int a(int);\n"
@@ -4019,11 +4014,8 @@ static void test_bracket_orelse_dim_hoisting_bypass(void) {
 		    "    (void)buf;\n"
 		    "}\n",
 		    "bracket_multi_nested_oe.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		      "bracket-multi-nested: transpiles OK");
-		if (r.output)
-			CHECK(strstr(r.output, "orelse") == NULL,
-			      "bracket-multi-nested: no raw 'orelse' in C output");
+		CHECK(r.status != PRISM_OK,
+		      "bracket-multi-nested: nested orelse with call rejected (double eval)");
 		prism_free(&r);
 	}
 }
@@ -4625,6 +4617,169 @@ static void test_bare_orelse_chained_intermediate_truncation(void) {
 	}
 }
 
+// Audit round 52: chained orelse inside bracket/typeof duplicates
+// intermediate LHS into ternary without side-effect checking.
+// emit_token_range_orelse emits (LHS) ? (LHS) : (RHS) — any function
+// call, ++/--, or assignment in LHS is evaluated twice.
+static void test_chained_bracket_typeof_orelse_double_eval(void) {
+	printf("\n--- Chained bracket/typeof orelse double-eval (audit round 52) ---\n");
+
+	// Sub-test 1: chained bracket orelse with function call → must reject
+	{
+		const char *code =
+		    "int get_size(void);\n"
+		    "void f(void) {\n"
+		    "    int arr[0 orelse get_size() orelse 10];\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "chain_bracket_de1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "chain-bracket-double-eval: get_size() in chain rejected");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: chained typeof orelse with function call → must reject
+	{
+		const char *code =
+		    "int get_val(void);\n"
+		    "void f(void) {\n"
+		    "    typeof(0 orelse get_val() orelse 10) x = 42;\n"
+		    "    (void)x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "chain_typeof_de1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "chain-typeof-double-eval: get_val() in chain rejected");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: chained bracket orelse with ++ → must reject
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int n = 0;\n"
+		    "    int arr[0 orelse ++n orelse 10];\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "chain_bracket_de2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "chain-bracket-double-eval: ++n in chain rejected");
+		prism_free(&r);
+	}
+
+	// Sub-test 4: safe chain (all variables, no side effects) → must accept
+	{
+		const char *code =
+		    "#include <stdio.h>\n"
+		    "int main(void) {\n"
+		    "    int a = 0, b = 5, c = 10;\n"
+		    "    int arr[a orelse b orelse c];\n"
+		    "    printf(\"%zu\\n\", sizeof(arr)/sizeof(arr[0]));\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "chain_bracket_safe.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "chain-bracket-safe: variable-only chain accepted");
+		if (r.output)
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "chain-bracket-safe: no raw orelse in output");
+		prism_free(&r);
+	}
+
+	// Sub-test 5: 3-link bracket chain with function call in middle → must reject
+	{
+		const char *code =
+		    "int mid(void);\n"
+		    "void f(void) {\n"
+		    "    int arr[0 orelse mid() orelse 0 orelse 10];\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "chain_bracket_de3.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "chain-bracket-double-eval: mid() in 3-link chain rejected");
+		prism_free(&r);
+	}
+
+	// Sub-test 6: single bracket orelse with function call → must accept
+	// (LHS is hoisted to temp — no duplication)
+	{
+		const char *code =
+		    "int get_n(void);\n"
+		    "void f(void) {\n"
+		    "    int arr[get_n() orelse 10];\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "single_bracket_ok.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "single-bracket-orelse: function call LHS accepted (hoisted)");
+		if (r.output)
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "single-bracket-orelse: no raw orelse in output");
+		prism_free(&r);
+	}
+}
+
+// Audit round 52: _BitInt(N) and _Alignas(N) leaked raw orelse into C output
+// because parse_type_specifier did skip_balanced over their parenthesized
+// arguments and emit_type_stripped dumped them verbatim.
+static void test_bitint_alignas_orelse_leak(void) {
+	printf("\n--- _BitInt/_Alignas orelse firewall bypass (audit round 52) ---\n");
+
+	// Sub-test 1: _BitInt(1 orelse 8) → must reject
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    _BitInt(1 orelse 8) x = 0;\n"
+		    "    (void)x;\n"
+		    "}\n",
+		    "bitint_orelse.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "bitint-orelse: _BitInt(1 orelse 8) rejected");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: _Alignas(1 orelse 16) → must reject
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    _Alignas(1 orelse 16) int y = 0;\n"
+		    "    (void)y;\n"
+		    "}\n",
+		    "alignas_orelse.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "alignas-orelse: _Alignas(1 orelse 16) rejected");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: C23 lowercase alignas(1 orelse 16) → must reject
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    alignas(1 orelse 16) int y = 0;\n"
+		    "    (void)y;\n"
+		    "}\n",
+		    "alignas_lower_orelse.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "alignas-lower-orelse: alignas(1 orelse 16) rejected");
+		prism_free(&r);
+	}
+
+	// Sub-test 4: valid _Alignas(16) → must accept (no false positive)
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    _Alignas(16) int y = 0;\n"
+		    "    (void)y;\n"
+		    "}\n",
+		    "alignas_ok.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "alignas-ok: _Alignas(16) accepted");
+		if (r.output)
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "alignas-ok: no raw orelse in output");
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -4922,4 +5077,10 @@ void run_orelse_tests(void) {
 
 	// Audit round 50: chained orelse intermediate truncation
 	test_bare_orelse_chained_intermediate_truncation();
+
+	// Audit round 52: chained bracket/typeof orelse double evaluation
+	test_chained_bracket_typeof_orelse_double_eval();
+
+	// Audit round 52: _BitInt/_Alignas orelse firewall bypass
+	test_bitint_alignas_orelse_leak();
 }
