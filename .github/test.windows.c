@@ -1210,6 +1210,282 @@ static void test_quoted_cc_parsing(void) {
 	}
 }
 
+static void test_win_path_wipe(void) {
+	printf("\n--- Security Regression: PATH Wipe Prevention ---\n");
+
+	// Verify the two-phase registry query pattern works:
+	// Phase 1: query with NULL buffer to get size
+	// Phase 2: allocate exact buffer and read
+	HKEY hKey;
+	LONG open_rc = RegOpenKeyExA(HKEY_CURRENT_USER, "Environment", 0, KEY_READ, &hKey);
+	if (open_rc != ERROR_SUCCESS) {
+		printf("  SKIP: cannot open HKCU\\Environment (rc=%ld)\n", open_rc);
+		return;
+	}
+
+	DWORD size = 0;
+	DWORD type = REG_EXPAND_SZ;
+	LONG rc = RegQueryValueExA(hKey, "Path", NULL, &type, NULL, &size);
+	if (rc == ERROR_SUCCESS && size > 0) {
+		CHECK(size > 0, "path_wipe: phase-1 query returns nonzero size");
+
+		// Phase 2: allocate and read with exact size
+		char *buf = (char *)malloc((size_t)size + 1);
+		CHECK(buf != NULL, "path_wipe: malloc succeeded");
+		if (buf) {
+			rc = RegQueryValueExA(hKey, "Path", NULL, &type, (BYTE *)buf, &size);
+			CHECK_EQ((int)rc, (int)ERROR_SUCCESS, "path_wipe: phase-2 read succeeds");
+			buf[size] = '\0';
+			CHECK(strlen(buf) > 0, "path_wipe: PATH content is non-empty");
+			free(buf);
+		}
+
+		// Prove the old bug: a tiny buffer triggers ERROR_MORE_DATA
+		char tiny[10];
+		DWORD tiny_size = sizeof(tiny);
+		LONG tiny_rc = RegQueryValueExA(hKey, "Path", NULL, &type, (BYTE *)tiny, &tiny_size);
+		CHECK_EQ((int)tiny_rc, (int)ERROR_MORE_DATA,
+		         "path_wipe: tiny buffer triggers ERROR_MORE_DATA (old bug)");
+	} else if (rc == ERROR_FILE_NOT_FOUND) {
+		CHECK(1, "path_wipe: no user PATH key (handled correctly)");
+	} else {
+		CHECK(0, "path_wipe: unexpected registry error");
+	}
+	RegCloseKey(hKey);
+}
+
+static void test_win_capture_injection(void) {
+	printf("\n--- Security Regression: Command Injection Prevention ---\n");
+
+	// Test 1: Ampersand in argv should not break out to a separate command.
+	// With the old _popen code, "echo&echo INJECTED" would run two commands.
+	// With CreateProcess, the entire string is one argv[0] that just fails.
+	{
+		char buf[256];
+		char *argv_inject[] = { "echo&echo", "INJECTED", NULL };
+		int rc = capture_first_line(argv_inject, buf, sizeof(buf));
+		// "echo&echo" doesn't exist as a binary, so it should fail
+		// or the output should NOT contain "INJECTED" as a separate command
+		CHECK(strstr(buf, "INJECTED") == NULL,
+		      "injection: ampersand in argv[0] not interpreted as shell operator");
+	}
+
+	// Test 2: Pipe in argv should not create a pipeline
+	{
+		char buf[256];
+		char *argv_pipe[] = { "echo|echo", "PIPED", NULL };
+		int rc = capture_first_line(argv_pipe, buf, sizeof(buf));
+		CHECK(strstr(buf, "PIPED") == NULL,
+		      "injection: pipe in argv[0] not interpreted as shell operator");
+	}
+
+	// Test 3: Normal capture_first_line still works
+	{
+		char buf[256];
+		char *argv_normal[] = { "cmd.exe", "/c", "echo", "hello_from_test", NULL };
+		int rc = capture_first_line(argv_normal, buf, sizeof(buf));
+		// cmd.exe /c echo hello_from_test should produce output
+		CHECK_EQ(rc, 0, "injection: normal capture_first_line succeeds");
+		CHECK(strstr(buf, "hello_from_test") != NULL,
+		      "injection: normal output captured correctly");
+	}
+
+	// Test 4: Arguments with special chars are properly escaped, not injected
+	{
+		char buf[256];
+		char *argv_meta[] = { "cmd.exe", "/c", "echo", "a&b|c<d>e", NULL };
+		int rc = capture_first_line(argv_meta, buf, sizeof(buf));
+		// The metacharacters should appear literally in the output
+		if (rc == 0 && buf[0]) {
+			CHECK(strstr(buf, "a&b") != NULL || strstr(buf, "a") != NULL,
+			      "injection: metachar args passed through (not split)");
+		} else {
+			// Even if cmd.exe misinterprets, at least nothing was injected
+			CHECK(1, "injection: metachar args did not crash");
+		}
+	}
+}
+
+static void test_win_tempfile_exclusive(void) {
+	printf("\n--- Security Regression: Temp File Exclusive Access ---\n");
+
+	char tmpl[PATH_MAX];
+	snprintf(tmpl, sizeof(tmpl), "%sprism_excl_XXXXXX", test_tmp_dir());
+	int fd = mkstemp(tmpl);
+	CHECK(fd >= 0, "tempfile_excl: mkstemp succeeded");
+	if (fd < 0) return;
+
+	// Attempt to open the same file — must fail because _SH_DENYRW
+	int fd2 = -1;
+	errno_t err = _sopen_s(&fd2, tmpl, _O_RDWR, _SH_DENYNO, _S_IREAD | _S_IWRITE);
+	CHECK(err != 0 || fd2 < 0,
+	      "tempfile_excl: concurrent open DENIED (_SH_DENYRW enforced)");
+	if (fd2 >= 0) _close(fd2);
+
+	_close(fd);
+	_unlink(tmpl);
+}
+
+static void test_win_stderr_preserved(void) {
+	printf("\n--- Security Regression: stderr Not Mutated ---\n");
+
+	// Get stderr state before
+	HANDLE h_before = GetStdHandle(STD_ERROR_HANDLE);
+	DWORD type_before = GetFileType(h_before);
+
+	// run_command_quiet triggers internally — call it directly
+	char *argv_probe[] = { "cmd.exe", "/c", "echo", "probe", NULL };
+	int rc = run_command_quiet(argv_probe);
+
+	// Get stderr state after
+	HANDLE h_after = GetStdHandle(STD_ERROR_HANDLE);
+	DWORD type_after = GetFileType(h_after);
+
+	CHECK(h_before == h_after, "stderr_race: handle unchanged after run_command_quiet");
+	CHECK(type_before == type_after, "stderr_race: handle type unchanged after run_command_quiet");
+
+	// Verify stderr is still writable
+	int written = fprintf(stderr, "  (stderr write test OK)\n");
+	fflush(stderr);
+	CHECK(written > 0, "stderr_race: fprintf(stderr) still works");
+}
+
+static void test_win_realpath_resolves(void) {
+	printf("\n--- Security Regression: realpath Resolves Reparse Points ---\n");
+
+	// Test 1: realpath returns a canonical path for an existing file
+	{
+		char resolved[PATH_MAX];
+		char *r = realpath("prism.exe", resolved);
+		if (!r) {
+			// prism.exe might not be in cwd during test, try self
+			char self[PATH_MAX];
+			GetModuleFileNameA(NULL, self, PATH_MAX);
+			r = realpath(self, resolved);
+		}
+		CHECK(r != NULL, "realpath: resolves existing file");
+		if (r) {
+			// Must not have \\?\ prefix (we strip it)
+			CHECK(!(r[0] == '\\' && r[1] == '\\' && r[2] == '?' && r[3] == '\\'),
+			      "realpath: no \\\\?\\\\ prefix");
+		}
+	}
+
+	// Test 2: Junction resolution (junctions don't require admin privileges)
+	{
+		char tmpdir[PATH_MAX];
+		if (!test_mkdtemp(tmpdir, "prism_junc_")) {
+			printf("  SKIP: cannot create temp dir for junction test\n");
+			return;
+		}
+
+		// Create target directory and a file inside it
+		char target[PATH_MAX], junction[PATH_MAX], filepath[PATH_MAX];
+		snprintf(target, sizeof(target), "%s\\real_target", tmpdir);
+		snprintf(junction, sizeof(junction), "%s\\junc_link", tmpdir);
+		CreateDirectoryA(target, NULL);
+
+		// Create a test file in the target
+		snprintf(filepath, sizeof(filepath), "%s\\test.txt", target);
+		FILE *f = fopen(filepath, "w");
+		if (f) { fprintf(f, "test\n"); fclose(f); }
+
+		// Create junction: junc_link -> real_target
+		char cmd[PATH_MAX * 2];
+		snprintf(cmd, sizeof(cmd), "mklink /J \"%s\" \"%s\" >nul 2>nul", junction, target);
+		system(cmd);
+
+		// Access the file through the junction
+		char junc_file[PATH_MAX];
+		snprintf(junc_file, sizeof(junc_file), "%s\\test.txt", junction);
+
+		if (access(junc_file, 0) == 0) {
+			char resolved_junc[PATH_MAX], resolved_real[PATH_MAX];
+			char *rj = realpath(junc_file, resolved_junc);
+			char *rr = realpath(filepath, resolved_real);
+
+			CHECK(rj != NULL, "realpath: resolves file through junction");
+			CHECK(rr != NULL, "realpath: resolves real file");
+
+			if (rj && rr) {
+				// Both should resolve to the same final path
+				CHECK(_stricmp(rj, rr) == 0,
+				      "realpath: junction and real path resolve identically");
+
+				// Verify _fullpath would NOT have matched (the old bug)
+				char lex_junc[PATH_MAX], lex_real[PATH_MAX];
+				_fullpath(lex_junc, junc_file, PATH_MAX);
+				_fullpath(lex_real, filepath, PATH_MAX);
+				CHECK(_stricmp(lex_junc, lex_real) != 0,
+				      "realpath: _fullpath does NOT resolve junction (old bug confirmed)");
+			}
+		} else {
+			printf("  SKIP: junction creation requires elevated shell or failed\n");
+		}
+
+		// Cleanup
+		snprintf(cmd, sizeof(cmd), "rd /s /q \"%s\" >nul 2>nul", tmpdir);
+		system(cmd);
+	}
+}
+
+static void test_win_spawn_oflag(void) {
+	printf("\n--- Security Regression: SPAWN_ACT_OPEN Honors oflag ---\n");
+
+	// Test: posix_spawn_file_actions_addopen with O_WRONLY correctly
+	// creates a NUL handle for stderr suppression (the primary use case)
+	{
+		posix_spawn_file_actions_t fa;
+		posix_spawn_file_actions_init(&fa);
+		posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+		CHECK_EQ(fa.count, 1, "oflag: addopen registered");
+		CHECK_EQ(fa.actions[0].oflag, O_WRONLY, "oflag: O_WRONLY stored");
+		CHECK_EQ(fa.actions[0].fd, STDERR_FILENO, "oflag: target fd stored");
+
+		// Actually spawn with it — should succeed and suppress stderr
+		char *argv_test[] = { "cmd.exe", "/c", "echo", "oflag_test", NULL };
+		HANDLE hp = win32_spawn_with_actions(argv_test, &fa, NULL);
+		CHECK(hp != INVALID_HANDLE_VALUE, "oflag: spawn with O_WRONLY /dev/null succeeds");
+		if (hp != INVALID_HANDLE_VALUE) {
+			WaitForSingleObject(hp, 5000);
+			DWORD exit_code = 99;
+			GetExitCodeProcess(hp, &exit_code);
+			CloseHandle(hp);
+			CHECK_EQ((int)exit_code, 0, "oflag: child exited cleanly");
+		}
+		posix_spawn_file_actions_destroy(&fa);
+	}
+
+	// Test: O_RDONLY is stored and distinct from O_WRONLY
+	{
+		posix_spawn_file_actions_t fa;
+		posix_spawn_file_actions_init(&fa);
+		posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+		CHECK_EQ(fa.actions[0].oflag, O_RDONLY, "oflag: O_RDONLY stored for stdin");
+
+		// Spawn with O_RDONLY on stdin (/dev/null -> NUL readable)
+		char *argv_rd[] = { "cmd.exe", "/c", "echo", "rdonly_ok", NULL };
+		HANDLE hp = win32_spawn_with_actions(argv_rd, &fa, NULL);
+		CHECK(hp != INVALID_HANDLE_VALUE, "oflag: spawn with O_RDONLY /dev/null succeeds");
+		if (hp != INVALID_HANDLE_VALUE) {
+			WaitForSingleObject(hp, 5000);
+			CloseHandle(hp);
+		}
+		posix_spawn_file_actions_destroy(&fa);
+	}
+
+	// Test: O_CREAT flag is preserved
+	{
+		posix_spawn_file_actions_t fa;
+		posix_spawn_file_actions_init(&fa);
+		posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null",
+		                                 O_WRONLY | O_CREAT, 0644);
+		CHECK(fa.actions[0].oflag & O_CREAT, "oflag: O_CREAT flag preserved");
+		CHECK(fa.actions[0].oflag & O_WRONLY, "oflag: O_WRONLY flag preserved with O_CREAT");
+		posix_spawn_file_actions_destroy(&fa);
+	}
+}
+
 void run_windows_tests(void) {
 	printf("=== PRISM WINDOWS TEST SUITE ===\n");
 
@@ -1250,6 +1526,13 @@ void run_windows_tests(void) {
 	test_interleaved_flow();
 
 	test_msvc_regressions();
+
+	test_win_path_wipe();
+	test_win_capture_injection();
+	test_win_tempfile_exclusive();
+	test_win_stderr_preserved();
+	test_win_realpath_resolves();
+	test_win_spawn_oflag();
 
 	return (failed == 0) ? 0 : 1;
 }

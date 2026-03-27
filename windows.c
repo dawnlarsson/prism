@@ -336,8 +336,37 @@ static int pipe(int pipefd[2]) {
 	return _pipe(pipefd, 65536, _O_BINARY);
 }
 
+// POSIX realpath: resolve symlinks/reparse points and canonicalize.
+// _fullpath is purely lexical; we must use GetFinalPathNameByHandleA
+// to resolve Junctions and Symlinks on NTFS.
 static char *realpath(const char *path, char *resolved) {
-	return _fullpath(resolved, path, PATH_MAX);
+	if (!path) { errno = EINVAL; return NULL; }
+	char *out = resolved ? resolved : (char *)malloc(PATH_MAX);
+	if (!out) return NULL;
+
+	HANDLE h = CreateFileA(path, 0, /* no access needed */
+			       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			       NULL, OPEN_EXISTING,
+			       FILE_FLAG_BACKUP_SEMANTICS, /* required for directories */
+			       NULL);
+	if (h == INVALID_HANDLE_VALUE) {
+		// Fall back to _fullpath for paths that don't yet exist on disk
+		char *r = _fullpath(out, path, PATH_MAX);
+		if (!r && !resolved) free(out);
+		return r;
+	}
+	DWORD len = GetFinalPathNameByHandleA(h, out, PATH_MAX, FILE_NAME_NORMALIZED);
+	CloseHandle(h);
+	if (len == 0 || len >= PATH_MAX) {
+		if (!resolved) free(out);
+		errno = ENAMETOOLONG;
+		return NULL;
+	}
+	// Strip the \\?\\ prefix if present
+	if (len >= 4 && out[0] == '\\' && out[1] == '\\' && out[2] == '?' && out[3] == '\\') {
+		memmove(out, out + 4, len - 4 + 1);
+	}
+	return out;
 }
 
 // MSVC _read takes unsigned int for count, returns int
@@ -434,7 +463,7 @@ static int mkstemps(char *tmpl, int suffix_len) {
 			wlen = MultiByteToWideChar(CP_ACP, 0, try_buf, -1, wtry, MAX_PATH);
 		if (wlen <= 0) continue;
 		errno_t err = _wsopen_s(
-		    &fd, wtry, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
+		    &fd, wtry, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY, _SH_DENYRW, _S_IREAD | _S_IWRITE);
 		if (err == 0 && fd >= 0) {
 			memcpy(tmpl, try_buf, len + 1);
 			return fd;
@@ -619,23 +648,43 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 				else if (a->fd == STDERR_FILENO)
 					{ hStdErr = h; redirected_err = true; }
 			} else if (a->kind == SPAWN_ACT_OPEN) {
-				// Only case used: open /dev/null on stderr
 				// Map /dev/null → NUL
 				const char *winpath = a->path;
 				if (strcmp(winpath, "/dev/null") == 0) winpath = "NUL";
 
+				// Translate POSIX oflag to Win32 access/disposition
+				DWORD access_flags = 0;
+				DWORD disposition = OPEN_EXISTING;
+				if ((a->oflag & O_RDWR) == O_RDWR)
+					access_flags = GENERIC_READ | GENERIC_WRITE;
+				else if (a->oflag & O_WRONLY)
+					access_flags = GENERIC_WRITE;
+				else
+					access_flags = GENERIC_READ;
+				if (a->oflag & O_CREAT) {
+					if (a->oflag & O_EXCL)
+						disposition = CREATE_NEW;
+					else if (a->oflag & O_TRUNC)
+						disposition = CREATE_ALWAYS;
+					else
+						disposition = OPEN_ALWAYS;
+				} else if (a->oflag & O_TRUNC)
+					disposition = TRUNCATE_EXISTING;
+
 				SECURITY_ATTRIBUTES sa_nul = {sizeof(sa_nul), NULL, TRUE};
 				hNul = CreateFileA(winpath,
-						   GENERIC_WRITE,
+						   access_flags,
 						   FILE_SHARE_READ | FILE_SHARE_WRITE,
 						   &sa_nul,
-						   OPEN_EXISTING,
+						   disposition,
 						   0,
 						   NULL);
 				if (hNul == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
 				if (a->fd == STDERR_FILENO) { hStdErr = hNul; redirected_err = true; }
 				else if (a->fd == STDOUT_FILENO)
 					{ hStdOut = hNul; redirected_out = true; }
+				else if (a->fd == STDIN_FILENO)
+					{ hStdIn = hNul; redirected_in = true; }
 			}
 			// SPAWN_ACT_CLOSE: handled by the caller manually, not by this function
 		}
@@ -792,73 +841,88 @@ static int run_command(char **argv) {
 	return (int)exit_code;
 }
 
-// Like run_command but suppresses stderr (for probe attempts)
+// Like run_command but suppresses stderr (for probe attempts).
+// Uses posix_spawn_file_actions to redirect stderr only in the child,
+// avoiding process-global fd mutation (thread-safe for PRISM_LIB_MODE).
 static int run_command_quiet(char **argv) {
-	// Save original stderr
-	int orig_stderr = _dup(STDERR_FILENO);
-	if (orig_stderr < 0) return run_command(argv); // fallback
+	posix_spawn_file_actions_t fa;
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
 
-	// Redirect stderr to NUL
-	int nul_fd = -1;
-	errno_t err = _sopen_s(&nul_fd, "NUL", _O_WRONLY, _SH_DENYNO, 0);
-	if (err != 0 || nul_fd < 0) {
-		_close(orig_stderr);
-		return run_command(argv);
-	}
-	_dup2(nul_fd, STDERR_FILENO);
-	_close(nul_fd);
+	HANDLE hp = win32_spawn_with_actions(argv, &fa, NULL);
+	posix_spawn_file_actions_destroy(&fa);
+	if (hp == INVALID_HANDLE_VALUE) return -1;
 
-	int status = run_command(argv);
-
-	// Restore stderr
-	_dup2(orig_stderr, STDERR_FILENO);
-	_close(orig_stderr);
-	return status;
+	WaitForSingleObject(hp, INFINITE);
+	DWORD exit_code = 1;
+	GetExitCodeProcess(hp, &exit_code);
+	CloseHandle(hp);
+	return (int)exit_code;
 }
 
 // Capture the first line of a command's stdout. Returns 0 on success.
+// Uses CreateProcess + pipe instead of _popen to avoid cmd.exe injection.
 static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 	buf[0] = '\0';
 
-	// Build command line for _popen with proper escaping
-	char cmdline[4096];
-	int pos = 0;
-	for (int i = 0; argv[i]; i++) {
-		if (i > 0 && (size_t)pos < sizeof(cmdline) - 1) cmdline[pos++] = ' ';
-		const char *s = argv[i];
-		int needs_quote = (s[0] == '\0' || strchr(s, ' ') || strchr(s, '\t') || strchr(s, '"'));
-		if (needs_quote && (size_t)pos < sizeof(cmdline) - 1) cmdline[pos++] = '"';
-		for (; *s && (size_t)pos < sizeof(cmdline) - 4; s++) {
-			if (*s == '"') {
-				cmdline[pos++] = '\\';
-				if ((size_t)pos < sizeof(cmdline) - 4) cmdline[pos++] = '"';
-			} else {
-				cmdline[pos++] = *s;
-			}
-		}
-		if (needs_quote && (size_t)pos < sizeof(cmdline) - 1) cmdline[pos++] = '"';
-	}
-	// Redirect stderr to NUL
-	const char *suffix = " 2>NUL";
-	size_t slen = strlen(suffix);
-	if ((size_t)pos + slen < sizeof(cmdline)) {
-		memcpy(cmdline + pos, suffix, slen);
-		pos += (int)slen;
-	}
-	cmdline[pos] = '\0';
+	// Build a properly escaped command line (no cmd.exe shell involved)
+	char *cmdline = win32_argv_to_cmdline(argv);
+	if (!cmdline) return -1;
 
-	FILE *fp = _popen(cmdline, "r");
-	if (!fp) return -1;
-
-	if (fgets(buf, (int)bufsize, fp)) {
-		size_t len = strlen(buf);
-		if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
-		len = strlen(buf);
-		if (len > 0 && buf[len - 1] == '\r') buf[len - 1] = '\0';
+	// Create a pipe for the child's stdout
+	SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+	HANDLE hReadPipe, hWritePipe;
+	if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
+		free(cmdline);
+		return -1;
 	}
-	int rc = _pclose(fp);
+	// The read end should not be inherited by the child
+	SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+	// Open NUL for stderr suppression
+	SECURITY_ATTRIBUTES sa_nul = {sizeof(sa_nul), NULL, TRUE};
+	HANDLE hNul = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+				   &sa_nul, OPEN_EXISTING, 0, NULL);
+
+	STARTUPINFOA si;
+	PROCESS_INFORMATION pi;
+	memset(&si, 0, sizeof(si));
+	si.cb = sizeof(si);
+	si.dwFlags = STARTF_USESTDHANDLES;
+	si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+	si.hStdOutput = hWritePipe;
+	si.hStdError = (hNul != INVALID_HANDLE_VALUE) ? hNul : GetStdHandle(STD_ERROR_HANDLE);
+	memset(&pi, 0, sizeof(pi));
+
+	BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+	free(cmdline);
+	CloseHandle(hWritePipe); // Close write end in parent so reads will EOF
+	if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
+
+	if (!ok) {
+		CloseHandle(hReadPipe);
+		return -1;
+	}
+
+	// Read the first line from the pipe
+	size_t pos = 0;
+	char ch;
+	DWORD nread;
+	while (pos + 1 < bufsize && ReadFile(hReadPipe, &ch, 1, &nread, NULL) && nread == 1) {
+		if (ch == '\n') break;
+		if (ch != '\r') buf[pos++] = ch;
+	}
+	buf[pos] = '\0';
+	CloseHandle(hReadPipe);
+
+	WaitForSingleObject(pi.hProcess, INFINITE);
+	DWORD exit_code = 1;
+	GetExitCodeProcess(pi.hProcess, &exit_code);
+	CloseHandle(pi.hProcess);
+	CloseHandle(pi.hThread);
+
 	if (buf[0]) return 0;
-	return (rc != 0) ? rc : -1;
+	return (exit_code != 0) ? (int)exit_code : -1;
 }
 
 // Get the platform install path: %LOCALAPPDATA%\prism\prism.exe
@@ -922,28 +986,43 @@ static void add_to_user_path(const char *dir) {
 	if (RegOpenKeyExA(HKEY_CURRENT_USER, "Environment", 0, KEY_READ | KEY_WRITE, &hKey) != ERROR_SUCCESS)
 		return;
 
-	char current[8192];
-	DWORD size = sizeof(current) - 1;
+	// Query size first, then allocate dynamically (PATH can be up to 32767 bytes)
+	DWORD size = 0;
 	DWORD type = REG_EXPAND_SZ;
-	LONG rc = RegQueryValueExA(hKey, "Path", NULL, &type, (BYTE *)current, &size);
-	if (rc != ERROR_SUCCESS || size == 0) {
-		current[0] = '\0';
-		size = 0;
-	} else {
+	LONG rc = RegQueryValueExA(hKey, "Path", NULL, &type, NULL, &size);
+	char *current = NULL;
+	if (rc == ERROR_SUCCESS && size > 0) {
+		current = (char *)malloc((size_t)size + 1);
+		if (!current) { RegCloseKey(hKey); return; }
+		rc = RegQueryValueExA(hKey, "Path", NULL, &type, (BYTE *)current, &size);
+		if (rc != ERROR_SUCCESS) { free(current); RegCloseKey(hKey); return; }
 		current[size] = '\0';
+	} else if (rc == ERROR_FILE_NOT_FOUND) {
+		current = (char *)calloc(1, 1); // empty string
+		if (!current) { RegCloseKey(hKey); return; }
+	} else {
+		// Genuine error (access denied, etc.) — abort, do NOT wipe PATH
+		RegCloseKey(hKey);
+		return;
 	}
 
 	// Check again in registry value
-	if (path_contains_dir(current, dir)) { RegCloseKey(hKey); return; }
+	if (path_contains_dir(current, dir)) { free(current); RegCloseKey(hKey); return; }
 
 	// Append ;dir
-	char newpath[8192];
-	if (current[0])
-		snprintf(newpath, sizeof(newpath), "%s;%s", current, dir);
+	size_t cur_len = strlen(current);
+	size_t dir_len = strlen(dir);
+	size_t new_len = cur_len + 1 + dir_len + 1; // ";" + dir + NUL
+	char *newpath = (char *)malloc(new_len);
+	if (!newpath) { free(current); RegCloseKey(hKey); return; }
+	if (cur_len > 0)
+		snprintf(newpath, new_len, "%s;%s", current, dir);
 	else
-		snprintf(newpath, sizeof(newpath), "%s", dir);
+		snprintf(newpath, new_len, "%s", dir);
+	free(current);
 
 	RegSetValueExA(hKey, "Path", 0, REG_EXPAND_SZ, (const BYTE *)newpath, (DWORD)(strlen(newpath) + 1));
+	free(newpath);
 	RegCloseKey(hKey);
 
 	// Notify other programs of the environment change
