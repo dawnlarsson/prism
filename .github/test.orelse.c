@@ -1617,9 +1617,9 @@ static void test_const_opaque_ptr_orelse(void) {
 	      "const opaque ptr: no &* deref (avoids void* constraint violation)");
 	CHECK(strstr(result.output, ")0 + 0)") == NULL,
 	      "const opaque ptr: does NOT use + 0 (would be constraint violation)");
-	// Verify the cast approach is used instead
-	CHECK(strstr(result.output, ")0)") != NULL,
-	      "const opaque ptr: uses (T)0 cast to strip const");
+	// Verify either the cast approach (GCC) or typeof_unqual (MSVC) is used
+	CHECK(strstr(result.output, ")0)") != NULL || strstr(result.output, "typeof_unqual") != NULL,
+	      "const opaque ptr: uses (T)0 cast or typeof_unqual to strip const");
 
 	prism_free(&result);
 	unlink(path);
@@ -1686,12 +1686,19 @@ static void test_pragma_absorbed_into_orelse_condition(void) {
 
 	// The #pragma should NOT appear between "if (!(" and "))"
 	// Check that #pragma appears BEFORE "if (!(" in the output
+#ifdef _WIN32
+	// MSVC converts _Pragma("...") to __pragma(...) which is function-like
+	// and valid inside parentheses — no hoisting needed, just check presence
+	CHECK(strstr(result.output, "__pragma(GCC diagnostic push)") != NULL,
+	      "pragma orelse: __pragma present in output");
+#else
 	const char *pragma_pos = strstr(result.output, "#pragma GCC diagnostic push");
 	const char *if_pos = strstr(result.output, "if (!(");
 	CHECK(pragma_pos != NULL, "pragma orelse: #pragma present in output");
 	CHECK(if_pos != NULL, "pragma orelse: if !( present in output");
 	CHECK(pragma_pos < if_pos,
 	      "pragma orelse: #pragma appears before if !( (hoisted out of condition)");
+#endif
 
 	prism_free(&result);
 	unlink(path);

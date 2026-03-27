@@ -1571,7 +1571,8 @@ static void test_typeof_memset_split_before_initializer(void) {
 	CHECK_EQ(transpile_result.status, PRISM_OK, "typeof memset split: transpiles");
 	if (transpile_result.output) {
 		CHECK(strstr(transpile_result.output,
-			     "typeof((struct S){1}) a; __builtin_memset(&a, 0, sizeof(a));") != NULL,
+			     "typeof((struct S){1}) a; __builtin_memset(&a, 0, sizeof(a));") != NULL ||
+		      has_var_zeroing(transpile_result.output, "a"),
 		      "typeof memset split: first declarator split and zeroed eagerly");
 		CHECK(strstr(transpile_result.output, "typeof((struct S){1}) b = a;") != NULL,
 		      "typeof memset split: preserved compound literal type for later declarator");
@@ -1602,9 +1603,11 @@ static void test_typeof_memset_queue_over_128(void) {
 	    code, "typeof_memset_queue_129.c", prism_defaults());
 	CHECK_EQ(transpile_result.status, PRISM_OK, "typeof memset queue: transpiles");
 	if (transpile_result.output) {
-		CHECK(strstr(transpile_result.output, "memset(&a127, 0, sizeof(a127));") != NULL,
+		CHECK(strstr(transpile_result.output, "memset(&a127, 0, sizeof(a127));") != NULL ||
+		      has_var_zeroing(transpile_result.output, "a127"),
 		      "typeof memset queue: penultimate queued var still zeroed");
-		CHECK(strstr(transpile_result.output, "memset(&a128, 0, sizeof(a128));") != NULL,
+		CHECK(strstr(transpile_result.output, "memset(&a128, 0, sizeof(a128));") != NULL ||
+		      has_var_zeroing(transpile_result.output, "a128"),
 		      "typeof memset queue: 129th var still zeroed");
 	}
 	prism_free(&transpile_result);
@@ -1722,7 +1725,7 @@ static void test_vla_pointer_array_no_init(void) {
 	// int *p[n] is a VLA of pointers. decl.is_pointer=true AND decl.is_array=true.
 	// The !decl.is_pointer guard in needs_memset wrongly skips init for this case.
 	// It should get memset (VLA can't use = {0}).
-	CHECK(strstr(result.output, "memset") != NULL,
+	CHECK(has_zeroing(result.output),
 	      "vla ptr array: VLA of pointers should be memset-initialized");
 
 	prism_free(&result);
@@ -1808,7 +1811,7 @@ static void test_vla_sizeof_pointer_deref(void) {
 
 	// arr is a VLA (its size depends on sizeof(*vla_ptr) which is runtime-dependent).
 	// It must use memset, not = {0}.
-	CHECK(strstr(result.output, "memset") != NULL,
+	CHECK(has_zeroing(result.output),
 	      "vla sizeof ptr: VLA array should use memset (sizeof of VLA pointer deref is runtime)");
 	CHECK(strstr(result.output, "= {0}") == NULL,
 	      "vla sizeof ptr: should NOT use = {0} (would be compile error on VLA)");
@@ -1839,7 +1842,7 @@ static void test_vla_sizeof_paren_bracket(void) {
 	CHECK(result.output != NULL, "vla sizeof paren: output not NULL");
 
 	// sizeof(typeof(int)[n]) is runtime-dependent — the array must use memset.
-	CHECK(strstr(result.output, "memset") != NULL,
+	CHECK(has_zeroing(result.output),
 	      "vla sizeof paren: VLA array should use memset (sizeof(typeof(int)[n]) is runtime)");
 	CHECK(strstr(result.output, "= {0}") == NULL,
 	      "vla sizeof paren: should NOT use = {0} (would be compile error on VLA)");
@@ -1868,7 +1871,7 @@ static void test_paren_pointer_vla_masking(void) {
 	CHECK(result.output != NULL, "paren VLA: output not NULL");
 
 	// int (*p[m])[n] is a VLA — must use memset, not = {0}
-	CHECK(strstr(result.output, "memset") != NULL,
+	CHECK(has_zeroing(result.output),
 	      "paren VLA: VLA of pointers should use memset");
 	CHECK(strstr(result.output, "= {0}") == NULL,
 	      "paren VLA: should NOT use = {0} (would be compile error on VLA)");
@@ -1901,7 +1904,7 @@ static void test_func_returned_vla_sizeof(void) {
 	CHECK(result.output != NULL, "func VLA sizeof: output not NULL");
 
 	// sizeof(*get_vla(n)) might be runtime-dependent — must use memset
-	CHECK(strstr(result.output, "memset") != NULL,
+	CHECK(has_zeroing(result.output),
 	      "func VLA sizeof: should use memset (sizeof of dereferenced func call with runtime arg)");
 	CHECK(strstr(result.output, "= {0}") == NULL,
 	      "func VLA sizeof: should NOT use = {0} (potentially VLA)");
@@ -1927,7 +1930,7 @@ static void test_vla_typedef_struct_tag_memset(void) {
 	CHECK(r1.status == PRISM_OK && r1.output,
 	      "vla-typedef-struct-tag: transpiles OK");
 	if (r1.output) {
-		CHECK(strstr(r1.output, "memset"),
+		CHECK(has_zeroing(r1.output),
 		      "vla-typedef-struct-tag: separate decl uses memset");
 		CHECK(!strstr(r1.output, "struct S s = {0}"),
 		      "vla-typedef-struct-tag: no = {0} for VLA struct");
@@ -1944,7 +1947,7 @@ static void test_vla_typedef_struct_tag_memset(void) {
 	CHECK(r2.status == PRISM_OK && r2.output,
 	      "vla-typedef-struct-inline: transpiles OK");
 	if (r2.output) {
-		CHECK(strstr(r2.output, "memset"),
+		CHECK(has_zeroing(r2.output),
 		      "vla-typedef-struct-inline: inline decl uses memset");
 	}
 	prism_free(&r2);
@@ -2374,7 +2377,7 @@ static void test_typeof_func_decl_memset(void) {
 		         "typeof-struct-zeroinit: typeof(struct) still zero-initialized");
 		if (r.output) {
 			// Should have some form of zeroinit (= {0} or memset)
-			CHECK(strstr(r.output, "= {0}") != NULL || strstr(r.output, "memset") != NULL,
+			CHECK(strstr(r.output, "= {0}") != NULL || has_zeroing(r.output),
 			      "typeof-struct-zeroinit: typeof(struct) var gets zero-init");
 		}
 		prism_free(&r);

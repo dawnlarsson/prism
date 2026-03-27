@@ -1961,7 +1961,7 @@ static void test_lib_generic_array_not_vla(void) {
 		if (result.output) {
 			// _Generic in array bounds is conservatively treated as VLA
 			// to prevent fatal = {0} when a branch selects a runtime var.
-			CHECK(strstr(result.output, "memset") != NULL,
+			CHECK(has_zeroing(result.output),
 			      "_Generic array: uses memset (conservative VLA)");
 			CHECK(strstr(result.output, "= {0}") == NULL,
 			      "_Generic array: no brace-init (would fail if VLA)");
@@ -2675,7 +2675,7 @@ static void test_vla_var_not_typedef(void) {
 		CHECK(r.status == PRISM_OK, "vla mul: transpiles OK");
 		if (r.output) {
 			// The multiplication must survive as-is, not become "x * y = 0;"
-			CHECK(strstr(r.output, "= 0") == NULL,
+			CHECK(strstr(r.output, "x * y = 0") == NULL,
 			      "vla mul: no spurious zero-init");
 			CHECK(strstr(r.output, "x * y") != NULL,
 			      "vla mul: multiplication preserved");
@@ -2698,7 +2698,7 @@ static void test_vla_var_not_typedef(void) {
 		PrismResult r = prism_transpile_source(code, "vla_shadow.c", feat);
 		CHECK(r.status == PRISM_OK, "vla shadow: transpiles OK");
 		if (r.output) {
-			CHECK(strstr(r.output, "= 0") == NULL,
+			CHECK(strstr(r.output, "T * p = 0") == NULL,
 			      "vla shadow: no spurious zero-init");
 			CHECK(strstr(r.output, "T * p") != NULL,
 			      "vla shadow: multiplication preserved");
@@ -2909,7 +2909,7 @@ static void test_vla_heuristic_zombie(void) {
 	CHECK(r.status == PRISM_OK, "vla zombie: transpiles OK");
 	if (r.output) {
 		// size_t * y must be multiplication, not a pointer declaration
-		CHECK(strstr(r.output, "= 0") == NULL,
+		CHECK(strstr(r.output, "size_t * y = 0") == NULL,
 		      "vla zombie: no spurious zero-init");
 		CHECK(strstr(r.output, "size_t * y") != NULL,
 		      "vla zombie: multiplication preserved");
@@ -2952,7 +2952,7 @@ static void test_sizeof_vla_var_not_skipped(void) {
 	PrismResult r = prism_transpile_source(code, "sizeof_vla_var.c", feat);
 	CHECK(r.status == PRISM_OK, "sizeof vla var: transpiles OK");
 	if (r.output) {
-		CHECK(strstr(r.output, "memset(&arr") != NULL,
+		CHECK(has_var_zeroing(r.output, "arr"),
 		      "sizeof vla var: arr gets memset (is VLA)");
 		CHECK(strstr(r.output, "arr[sizeof vla] = {0}") == NULL,
 		      "sizeof vla var: no brace-init (would fail to compile)");
@@ -2997,7 +2997,7 @@ static void test_subscript_vla_in_brackets(void) {
 	PrismResult r = prism_transpile_source(code, "subscript_vla.c", feat);
 	CHECK(r.status == PRISM_OK, "subscript vla: transpiles OK");
 	if (r.output) {
-		CHECK(strstr(r.output, "memset") != NULL,
+		CHECK(has_zeroing(r.output),
 		      "subscript vla: gets memset (is VLA)");
 		CHECK(strstr(r.output, "= {0}") == NULL,
 		      "subscript vla: no brace-init");
@@ -3147,7 +3147,7 @@ static void test_pointer_to_vla_sizeof_erasure(void) {
 	PrismResult r = prism_transpile_source(code, "ptr_vla_sizeof.c", feat);
 	CHECK(r.status == PRISM_OK, "ptr-to-VLA sizeof: transpiles OK");
 	if (r.output) {
-		CHECK(strstr(r.output, "memset(&arr") != NULL,
+		CHECK(has_var_zeroing(r.output, "arr"),
 		      "ptr-to-VLA sizeof: arr gets memset (is VLA)");
 		CHECK(strstr(r.output, "arr[sizeof *p] = {0}") == NULL,
 		      "ptr-to-VLA sizeof: no brace-init (would fail to compile)");
@@ -3169,7 +3169,7 @@ static void test_generic_vla_black_hole(void) {
 	PrismResult r = prism_transpile_source(code, "generic_vla.c", feat);
 	CHECK(r.status == PRISM_OK, "_Generic VLA: transpiles OK");
 	if (r.output) {
-		CHECK(strstr(r.output, "memset(&arr") != NULL,
+		CHECK(has_var_zeroing(r.output, "arr"),
 		      "_Generic VLA: arr gets memset (is VLA)");
 		CHECK(strstr(r.output, "= {0}") == NULL,
 		      "_Generic VLA: no brace-init (would fail to compile)");
@@ -3399,8 +3399,10 @@ static void test_builtin_memset_for_typeof_vla(void) {
 	PrismResult r = prism_transpile_source(code, "builtin_memset.c", feat);
 	CHECK_EQ(r.status, PRISM_OK, "builtin memset: transpiles OK");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_memset(&vla") != NULL,
-		      "builtin memset: emits __builtin_memset for VLA zero-init");
+		// GCC uses __builtin_memset; MSVC (default cc=cl) uses byte loop.
+		CHECK(strstr(r.output, "__builtin_memset(&vla") != NULL ||
+		      strstr(r.output, "__prism_p_") != NULL,
+		      "builtin memset: emits __builtin_memset or byte loop for VLA zero-init");
 	}
 	prism_free(&r);
 }
@@ -3496,7 +3498,7 @@ static void test_msvc_typeof_vla_no_builtin_memset(void) {
 	prism_free(&r);
 
 	/* Non-MSVC must still use __builtin_memset */
-	feat.compiler = NULL;
+	feat.compiler = "cc";
 	r = prism_transpile_source(code, "gcc_memset.c", feat);
 	CHECK_EQ(r.status, PRISM_OK, "gcc typeof vla: transpiles OK");
 	if (r.output)

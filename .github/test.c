@@ -70,6 +70,19 @@ static void log_append(const char *s) {
 		}                                                                                            \
 	} while (0)
 
+// Detect whether transpiler output uses memset (GCC) or byte loop (MSVC).
+// MSVC has no __builtin_memset; prism uses __prism_p_ byte loops on MSVC.
+static bool has_zeroing(const char *output) {
+	return strstr(output, "memset") != NULL || strstr(output, "__prism_p_") != NULL;
+}
+static bool has_var_zeroing(const char *output, const char *var) {
+	char pattern[128];
+	snprintf(pattern, sizeof(pattern), "memset(&%s", var);
+	if (strstr(output, pattern)) return true;
+	snprintf(pattern, sizeof(pattern), "char *)&%s;", var);
+	return strstr(output, pattern) != NULL;
+}
+
 static const char *test_tmp_dir(void) {
 	static char buf[PATH_MAX];
 	const char *t = getenv("TMPDIR");

@@ -740,11 +740,17 @@ static inline void out_str(const char *s, int len) {
 
 #define OUT_LIT(s) out_str(s, sizeof(s) - 1)
 
+// Check if the effective compiler is MSVC, falling back to PRISM_DEFAULT_CC
+// when no compiler is explicitly set (e.g. prism_defaults() leaves it NULL).
+static inline bool target_is_msvc(void) {
+	const char *cc = ctx->extra_compiler ? ctx->extra_compiler : PRISM_DEFAULT_CC;
+	return cc_is_msvc(cc);
+}
+
 // Emit __typeof__ (GNU) or typeof (C23/MSVC).
 // MSVC does not support __typeof__; C23 typeof is available under /std:clatest.
 static inline void emit_typeof_keyword(void) {
-	const char *cc = ctx->extra_compiler ? ctx->extra_compiler : PRISM_DEFAULT_CC;
-	if (cc_is_msvc(cc))
+	if (target_is_msvc())
 		OUT_LIT("typeof");
 	else
 		OUT_LIT("__typeof__");
@@ -805,7 +811,7 @@ static void collect_system_includes(void) {
 }
 
 static void emit_system_header_diag_push(void) {
-	if (cc_is_msvc(ctx->extra_compiler)) return; // MSVC doesn't understand #pragma GCC
+	if (target_is_msvc()) return; // MSVC doesn't understand #pragma GCC
 	OUT_LIT("#pragma GCC diagnostic push\n"
 		"#pragma GCC diagnostic ignored \"-Wredundant-decls\"\n"
 		"#pragma GCC diagnostic ignored \"-Wstrict-prototypes\"\n"
@@ -820,7 +826,7 @@ static void emit_system_header_diag_push(void) {
 }
 
 static void emit_system_header_diag_pop(void) {
-	if (cc_is_msvc(ctx->extra_compiler)) return;
+	if (target_is_msvc()) return;
 	OUT_LIT("#pragma GCC diagnostic pop\n");
 }
 
@@ -2958,7 +2964,7 @@ static Token *emit_raw_verbatim_to_semicolon(Token *tok) {
 static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool has_const) {
 	const char *vol = has_volatile ? "volatile " : "";
 	int vol_len = has_volatile ? 9 : 0;
-	bool use_loop = has_volatile || cc_is_msvc(ctx->extra_compiler);
+	bool use_loop = has_volatile || target_is_msvc();
 	for (int i = 0; i < count; i++) {
 		// Byte loop for volatile (memset drops volatile) and MSVC (no __builtin_memset).
 		if (use_loop) {
@@ -3063,8 +3069,7 @@ static Token *handle_const_orelse_fallback(Token *tok,
 	}
 
 	if (has_const_typedef) {
-		const char *cc = ctx->extra_compiler ? ctx->extra_compiler : PRISM_DEFAULT_CC;
-		if (cc_is_msvc(cc)) {
+		if (target_is_msvc()) {
 			// MSVC's typeof does not strip const from cast-to-rvalue,
 			// so use typeof_unqual directly (available with /std:clatest).
 			if (pragma_start != type_start)
