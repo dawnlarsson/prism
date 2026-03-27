@@ -1570,6 +1570,48 @@ static void reject_orelse_side_effects(Token *start, Token *end,
 	}
 }
 
+// Reject bare orelse when the RHS contains a cast or compound literal with
+// a variably-modified type (VLA pointer cast).  __typeof__(RHS) evaluates
+// the operand at runtime for VM types (ISO C11 §6.7.2.5), causing the
+// RHS expression (including function calls and side-effects) to execute
+// twice: once inside typeof and once in the initializer.
+//
+// Detection: scan RHS for any parenthesized type expression containing
+// array brackets [dim] with a non-constant dimension (identifier that
+// isn't a type keyword).  Covers (T(*)[n])expr and (T[n]){...}.
+static void reject_bare_orelse_vla_cast(Token *rhs_start, Token *rhs_end,
+					Token *orelse_tok) {
+	for (Token *s = rhs_start; s && s != rhs_end && s->kind != TK_EOF; s = tok_next(s)) {
+		if (!match_ch(s, '(') || !(s->flags & TF_OPEN)) continue;
+		Token *inner = tok_next(s);
+		if (!inner || inner == rhs_end) continue;
+		// Cast/compound-literal check: first meaningful token must be a type
+		if (!(inner->tag & (TT_TYPE | TT_SUE | TT_TYPEOF | TT_QUALIFIER))
+		    && !is_known_typedef(inner))
+			continue;
+		Token *cast_close = tok_match(s);
+		if (!cast_close) continue;
+		// Scan inside cast parens for [dim] with non-constant dim
+		for (Token *t = inner; t && t != cast_close; t = tok_next(t)) {
+			if (!match_ch(t, '[') || !(t->flags & TF_OPEN)) continue;
+			Token *bc = tok_match(t);
+			if (!bc) continue;
+			for (Token *d = tok_next(t); d && d != bc; d = tok_next(d)) {
+				if (d->kind == TK_IDENT && !is_type_keyword(d))
+					error_tok(orelse_tok,
+						  "bare orelse with a VLA-type cast in the RHS "
+						  "causes double evaluation — 'typeof(RHS)' "
+						  "evaluates the operand at runtime for variably-"
+						  "modified types (ISO C11 6.7.2.5); hoist the "
+						  "cast result to a temporary variable before "
+						  "the orelse expression");
+			}
+		}
+		// Skip past this paren group
+		s = cast_close;
+	}
+}
+
 // Emit type tokens, optionally stripping const and struct/enum bodies.
 static void emit_type_stripped(Token *start, Token *end, bool strip_const) {
 	Token *t = start;
@@ -5553,6 +5595,10 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 		!(after_orelse->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
 		!match_ch(after_orelse, '{') && !match_ch(after_orelse, ';');
 
+	// Defense-in-depth: VLA cast in RHS (Phase 1D is primary check)
+	if (is_bare_fallback)
+		reject_bare_orelse_vla_cast(tok_next(bare_assign_eq), orelse_tok, orelse_tok);
+
 	if (!is_bare_fallback)
 		return NULL;  // caller handles non-bare fallback
 
@@ -5633,14 +5679,25 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 			}
 			OUT_LIT("));");
 		} else {
-			// Temp-based (volatile-safe, single-write): evaluate RHS into a temp,
-			// apply fallback chain to the temp, write LHS exactly once.
-			// Single:    { __typeof__(RHS) __prism_oe_N = (RHS); __prism_oe_N = __prism_oe_N ? __prism_oe_N : (fb); LHS = __prism_oe_N; }
-			// Chain N=2: { __typeof__(RHS) __prism_oe_N = (RHS); __prism_oe_N = __prism_oe_N ? __prism_oe_N : (fb1); __prism_oe_N = __prism_oe_N ? __prism_oe_N : (fb2); LHS = __prism_oe_N; }
-			// Uses ternary instead of if-assignment to keep compound literals
-			// in the enclosing block scope (C11 6.5.2.5p5, 6.8.4p3).
-			// This guarantees LHS is written exactly once, preventing double-write
-			// to volatile MMIO registers.
+			// Temp-based (volatile-safe, single-write, truncation-safe):
+			// Evaluates RHS into a __typeof__ temp, writes LHS exactly once.
+			//
+			// Single link: ternary assignment preserves compound literal
+			// lifetime (C11 6.5.2.5p5) and volatile single-write semantics.
+			//   { typeof(a) t0=(a); LHS = t0 ? t0 : (fb); }
+			//
+			// Chained: nested if/else with per-link __typeof__ temps.
+			// Each intermediate fallback gets its own temp to prevent
+			// narrowing truncation when fallback types are wider.
+			// Last link uses ternary for compound literal lifetime.
+			//   { typeof(a) t0=(a); if(t0){LHS=t0;}else{
+			//     typeof(b) t1=(b); LHS = t1 ? t1 : (c); } }
+			//
+			// SAFETY: VLA casts in the RHS are rejected in Phase 1D
+			// (reject_bare_orelse_vla_cast).  __typeof__(RHS) evaluates the
+			// operand at runtime for variably-modified types (C11 6.7.2.5),
+			// which would cause double evaluation.  Phase 1D ensures this
+			// path is never reached with a VLA-cast RHS.
 			unsigned oe_id = ctx->ret_counter++;
 			OUT_LIT("{ "); emit_typeof_keyword(); out_char('(');
 			// Emit RHS tokens for typeof
@@ -5664,33 +5721,16 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 			}
 			OUT_LIT(");");
 			t = after_orelse;
-			int fd = 0;
-			while (true) {
-				bool is_last = !orelse_has_chain(t, comma_term);
-				if (is_last) {
-					// Final link: assign directly to LHS to preserve
-					// usual arithmetic conversions (C11 6.5.15p5).
-					// Avoids truncation when fallback type is wider
-					// than __typeof__(RHS).
-					OUT_LIT(" ");
-					emit_range_no_prep(bare_lhs_start, bare_assign_eq);
-					OUT_LIT(" = __prism_oe_");
-					out_uint(oe_id);
-					OUT_LIT(" ? __prism_oe_");
-					out_uint(oe_id);
-					OUT_LIT(" : (");
-				} else {
-					// Intermediate link: assign to temp for next
-					// iteration's truthiness check.
-					OUT_LIT(" __prism_oe_");
-					out_uint(oe_id);
-					OUT_LIT(" = __prism_oe_");
-					out_uint(oe_id);
-					OUT_LIT(" ? __prism_oe_");
-					out_uint(oe_id);
-					OUT_LIT(" : (");
-				}
-				fd = 0;
+			if (!orelse_has_chain(t, comma_term)) {
+				// Single link: ternary (volatile-safe, CL-safe).
+				OUT_LIT(" ");
+				emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+				OUT_LIT(" = __prism_oe_");
+				out_uint(oe_id);
+				OUT_LIT(" ? __prism_oe_");
+				out_uint(oe_id);
+				OUT_LIT(" : (");
+				int fd = 0;
 				while (t->kind != TK_EOF) {
 					if ((t->flags & TF_OPEN) && (match_ch(t, '(') || match_ch(t, '['))) {
 						t = walk_balanced(t, true); continue;
@@ -5698,14 +5738,84 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 					if (t->flags & TF_OPEN) fd++;
 					else if (t->flags & TF_CLOSE) fd--;
 					else if (fd == 0 && BARE_IS_END(t)) break;
-					if (!is_last && fd == 0 && is_orelse_keyword(t)) {
-						t = tok_next(t);
-						break;
-					}
 					emit_tok(t); t = tok_next(t);
 				}
 				OUT_LIT(");");
-				if (is_last) break;
+			} else {
+				// Chained: nested if/else with per-link temps to
+				// prevent intermediate truncation.
+				int nest = 0;
+				while (true) {
+					bool is_last = !orelse_has_chain(t, comma_term);
+					if (is_last) {
+						// Last link: ternary preserves CL lifetime
+						// and usual arithmetic conversions.
+						OUT_LIT(" ");
+						emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+						OUT_LIT(" = __prism_oe_");
+						out_uint(oe_id);
+						OUT_LIT(" ? __prism_oe_");
+						out_uint(oe_id);
+						OUT_LIT(" : (");
+						int fd = 0;
+						while (t->kind != TK_EOF) {
+							if ((t->flags & TF_OPEN) && (match_ch(t, '(') || match_ch(t, '['))) {
+								t = walk_balanced(t, true); continue;
+							}
+							if (t->flags & TF_OPEN) fd++;
+							else if (t->flags & TF_CLOSE) fd--;
+							else if (fd == 0 && BARE_IS_END(t)) break;
+							emit_tok(t); t = tok_next(t);
+						}
+						OUT_LIT(");");
+						break;
+					}
+					// Intermediate link: if/else with new typed temp.
+					OUT_LIT(" if (__prism_oe_");
+					out_uint(oe_id);
+					OUT_LIT(") { ");
+					emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+					OUT_LIT(" = __prism_oe_");
+					out_uint(oe_id);
+					OUT_LIT("; } else { ");
+					nest++;
+					Token *fb_start = t;
+					Token *fb_orelse = NULL;
+					{
+						int fd = 0;
+						for (Token *s = t; s->kind != TK_EOF; s = tok_next(s)) {
+							if ((s->flags & TF_OPEN) && (match_ch(s, '(') || match_ch(s, '['))) {
+								s = tok_match(s); continue;
+							}
+							if (s->flags & TF_OPEN) fd++;
+							else if (s->flags & TF_CLOSE) fd--;
+							else if (fd == 0 && BARE_IS_END(s)) break;
+							if (fd == 0 && is_orelse_keyword(s)) { fb_orelse = s; break; }
+						}
+					}
+					oe_id = ctx->ret_counter++;
+					emit_typeof_keyword(); out_char('(');
+					for (Token *s = fb_start; s != fb_orelse; s = tok_next(s)) {
+						if (s->kind == TK_PREP_DIR) continue;
+						if ((s->flags & TF_OPEN) && (match_ch(s, '(') || match_ch(s, '['))) {
+							walk_balanced(s, true); s = tok_match(s); continue;
+						}
+						emit_tok(s);
+					}
+					OUT_LIT(") __prism_oe_");
+					out_uint(oe_id);
+					OUT_LIT(" = (");
+					for (Token *s = fb_start; s != fb_orelse; s = tok_next(s)) {
+						if (s->kind == TK_PREP_DIR) continue;
+						if ((s->flags & TF_OPEN) && (match_ch(s, '(') || match_ch(s, '['))) {
+							walk_balanced(s, true); s = tok_match(s); continue;
+						}
+						emit_tok(s);
+					}
+					OUT_LIT(");");
+					t = tok_next(fb_orelse);
+				}
+				for (int i = 0; i < nest; i++) OUT_LIT(" }");
 			}
 			OUT_LIT(" }");
 		}
@@ -7340,6 +7450,7 @@ uint16_t sid = next_scope_id++;
 			if (bare_oe && !(tok_ann(bare_oe) & (P1_OE_BRACKET | P1_OE_DECL_INIT))) {
 				int sd = 0;
 				bool has_eq = false;
+				Token *eq_tok = NULL;
 				for (Token *s = tok; s != bare_oe; s = tok_next(s)) {
 					if (s->flags & TF_OPEN) { sd++; continue; }
 					if (s->flags & TF_CLOSE) { sd--; continue; }
@@ -7348,8 +7459,18 @@ uint16_t sid = next_scope_id++;
 							error_tok(s, "bare assignment with 'orelse' cannot use compound operators "
 								  "(e.g. +=, -=); use a plain '=' assignment");
 						has_eq = true;
+						eq_tok = s;
 						break;
 					}
+				}
+				// VLA cast in RHS → typeof(RHS) double evaluation
+				if (has_eq && eq_tok) {
+					Token *after_oe = tok_next(bare_oe);
+					bool is_value_fb = after_oe &&
+					    !(after_oe->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
+					    !match_ch(after_oe, '{') && !match_ch(after_oe, ';');
+					if (is_value_fb)
+						reject_bare_orelse_vla_cast(tok_next(eq_tok), bare_oe, bare_oe);
 				}
 				Token *after_oe = tok_next(bare_oe);
 				if (after_oe && !has_eq &&

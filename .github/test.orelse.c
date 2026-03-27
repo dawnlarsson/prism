@@ -4428,6 +4428,203 @@ static void test_bare_orelse_compound_literal_detection(void) {
 	free(path);
 }
 
+static void test_bare_orelse_typeof_vla_cast_double_eval(void) {
+	printf("\n--- Bare orelse typeof VLA cast double evaluation (audit round 49) ---\n");
+
+	// Bug: emit_bare_orelse_impl emitted __typeof__(RHS) temp = (RHS);
+	// When RHS contains a VLA cast like (int(*)[n])get_chunk(16), the result
+	// type int(*)[n] is variably modified, so __typeof__ evaluates its operand
+	// at runtime (ISO C11 6.7.2.5). This causes get_chunk() to be called twice
+	// and n to be evaluated twice. Fix: reject VLA casts in bare orelse RHS
+	// in Phase 1D; user must hoist the cast result to a temp variable.
+
+	// Sub-test 1: VLA pointer cast with function call — must be rejected
+	{
+		const char *code =
+		    "void *get_chunk(int size);\n"
+		    "void f(int n) {\n"
+		    "    void *ptr;\n"
+		    "    ptr = (int(*)[n])get_chunk(n * 4) orelse NULL;\n"
+		    "    (void)ptr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vla_cast_double1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "vla-cast-double-eval: must be rejected");
+		CHECK(r.error_msg != NULL, "vla-cast-double-eval: error message present");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "VLA") != NULL,
+			      "vla-cast-double-eval: error mentions VLA");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: VLA cast with side-effect dimension (n++) — must be rejected
+	{
+		const char *code =
+		    "void *get_chunk(int size);\n"
+		    "void f(int n) {\n"
+		    "    void *ptr;\n"
+		    "    ptr = (int(*)[n++])get_chunk(16) orelse NULL;\n"
+		    "    (void)ptr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vla_cast_double2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "vla-cast-n++: must be rejected");
+		CHECK(r.error_msg != NULL, "vla-cast-n++: error message present");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "VLA") != NULL,
+			      "vla-cast-n++: error mentions VLA");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: Fixed-size cast (int(*)[5]) — must NOT be rejected
+	{
+		const char *code =
+		    "void *get_chunk(int size);\n"
+		    "void f(void) {\n"
+		    "    void *ptr;\n"
+		    "    ptr = (int(*)[5])get_chunk(20) orelse NULL;\n"
+		    "    (void)ptr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "fixed_cast_ok.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "fixed-cast-orelse: valid (no VLA)");
+		prism_free(&r);
+	}
+
+	// Sub-test 4: Regular pointer cast (no brackets) — must NOT be rejected
+	{
+		const char *code =
+		    "void *get_chunk(int size);\n"
+		    "void f(void) {\n"
+		    "    int *ptr;\n"
+		    "    ptr = (int*)get_chunk(20) orelse NULL;\n"
+		    "    (void)ptr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ptr_cast_ok.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "ptr-cast-orelse: valid (no VLA)");
+		prism_free(&r);
+	}
+
+	// Sub-test 5: VLA cast in action orelse (not value fallback) — must be fine
+	// because action orelse uses if-based pattern, no typeof
+	{
+		const char *code =
+		    "void *get_chunk(int size);\n"
+		    "void f(int n) {\n"
+		    "    void *ptr;\n"
+		    "    ptr = (int(*)[n])get_chunk(16) orelse return;\n"
+		    "    (void)ptr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vla_action_ok.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "vla-cast-action-orelse: valid (action orelse uses if, no typeof)");
+		prism_free(&r);
+	}
+}
+
+static void test_bare_orelse_chained_intermediate_truncation(void) {
+	printf("\n--- Bare orelse Chained Intermediate Truncation (audit round 50) ---\n");
+
+	// Bug: chained orelse (a orelse b orelse c) used a single
+	// __typeof__(RHS) temp for all links. Intermediate fallbacks
+	// wider than the initial RHS were truncated when stored in the
+	// narrow temp. Fix: each link gets its own __typeof__ temp via
+	// nested if/else blocks.
+
+	// Sub-test 1: short -> int -> long long chain — must have separate temps
+	{
+		const char *code =
+		    "short get_short(void) { return 0; }\n"
+		    "int get_int(void) { return 2000000000; }\n"
+		    "long long get_ll(void) { return 1; }\n"
+		    "void f(void) {\n"
+		    "    long long val;\n"
+		    "    val = get_short() orelse get_int() orelse get_ll();\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "chain_trunc1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "chain-trunc-3link: transpiles OK");
+		CHECK(r.output != NULL, "chain-trunc-3link: output not NULL");
+		// Must have two separate temps (nested if/else structure)
+		CHECK(strstr(r.output, "__prism_oe_0") != NULL,
+		      "chain-trunc-3link: first temp exists");
+		CHECK(strstr(r.output, "__prism_oe_1") != NULL,
+		      "chain-trunc-3link: second temp exists (separate from first)");
+		// Must NOT have the old truncating pattern where the same temp
+		// is reused for the intermediate link
+		CHECK(strstr(r.output, "__prism_oe_0 = __prism_oe_0 ?") == NULL,
+		      "chain-trunc-3link: no self-assignment ternary (old truncating pattern)");
+		// Must have if-based structure
+		CHECK(strstr(r.output, "if (__prism_oe_0)") != NULL,
+		      "chain-trunc-3link: uses if-based dispatch");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: 4-link chain — char -> short -> int -> long long
+	{
+		const char *code =
+		    "char get_char(void) { return 0; }\n"
+		    "short get_short(void) { return 0; }\n"
+		    "int get_int(void) { return 0; }\n"
+		    "long long get_ll(void) { return 9000000000LL; }\n"
+		    "void f(void) {\n"
+		    "    long long val;\n"
+		    "    val = get_char() orelse get_short() orelse get_int() orelse get_ll();\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "chain_trunc4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "chain-trunc-4link: transpiles OK");
+		CHECK(r.output != NULL, "chain-trunc-4link: output not NULL");
+		// Must have three separate temps for 4-link chain (last link assigns directly)
+		CHECK(strstr(r.output, "__prism_oe_0") != NULL,
+		      "chain-trunc-4link: first temp");
+		CHECK(strstr(r.output, "__prism_oe_1") != NULL,
+		      "chain-trunc-4link: second temp");
+		CHECK(strstr(r.output, "__prism_oe_2") != NULL,
+		      "chain-trunc-4link: third temp");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: single orelse (no chain) — regression guard
+	{
+		const char *code =
+		    "short get_short(void) { return 0; }\n"
+		    "void f(void) {\n"
+		    "    long long val;\n"
+		    "    val = get_short() orelse 999LL;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "chain_single.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "chain-trunc-single: transpiles OK");
+		CHECK(r.output != NULL, "chain-trunc-single: output not NULL");
+		// Single orelse: one temp, ternary assignment (preserves CL
+		// lifetime and volatile single-write semantics)
+		CHECK(strstr(r.output, "__prism_oe_0") != NULL,
+		      "chain-trunc-single: temp exists");
+		CHECK(strstr(r.output, "? __prism_oe_0") != NULL,
+		      "chain-trunc-single: ternary dispatch (single link)");
+		prism_free(&r);
+	}
+
+	// Sub-test 4: intermediate typeof gets correct type (wider intermediate fallback)
+	{
+		const char *code =
+		    "short get_short(void) { return 0; }\n"
+		    "int get_int(void) { return 42; }\n"
+		    "long long get_ll(void) { return 999; }\n"
+		    "void f(void) {\n"
+		    "    long long val;\n"
+		    "    val = get_short() orelse get_int() orelse get_ll();\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "chain_mid.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "chain-trunc-mid: transpiles OK");
+		CHECK(r.output != NULL, "chain-trunc-mid: output not NULL");
+		// The intermediate fallback (get_int()) must get its own typeof temp,
+		// not be assigned into the short temp from get_short().
+		// Check for typeof(get_int()) pattern in output.
+		CHECK(strstr(r.output, "get_int()") != NULL,
+		      "chain-trunc-mid: intermediate fallback emitted");
+		// Two separate temps must exist
+		CHECK(strstr(r.output, "__prism_oe_1") != NULL,
+		      "chain-trunc-mid: separate temp for intermediate");
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -4719,4 +4916,10 @@ void run_orelse_tests(void) {
 	// Audit round 46: temp-type truncation + compound literal detection
 	test_bare_orelse_temp_type_truncation();
 	test_bare_orelse_compound_literal_detection();
+
+	// Audit round 49: typeof VLA cast double evaluation
+	test_bare_orelse_typeof_vla_cast_double_eval();
+
+	// Audit round 50: chained orelse intermediate truncation
+	test_bare_orelse_chained_intermediate_truncation();
 }

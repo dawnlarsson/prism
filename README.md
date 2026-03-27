@@ -261,16 +261,20 @@ Struct and union **pointers** work fine:
 struct Vec2 *p = get_vec2() orelse return -1;  // OK — pointer is scalar
 ```
 
-> **Note:** This protection only works for explicit `struct` / `union` keywords.
-> If the struct is hidden behind a `typedef`, Prism has no way to detect it
-> (it does not have a full type-checker). The code will be emitted and the
-> backend C compiler will report a less helpful error such as
-> *"used struct type value where scalar is required"*.
+> **Note:** Prism detects struct/union types through explicit keywords
+> (`struct S`, `union U`) *and* through typedefs that alias aggregates.
+> However, when `typeof()` is applied to an **opaque expression** — a
+> variable name or function call whose type cannot be determined from
+> tokens alone — Prism cannot detect the aggregate nature:
 >
 > ```c
-> typedef struct { int x, y; } Vec2;
-> Vec2 v = make_vec2() orelse return -1;  // Passes Prism, fails at CC
+> struct S make(void);
+> typeof(make()) v = make() orelse return -1;  // Passes Prism, fails at CC
 > ```
+>
+> The backend compiler catches these with a clear error such as
+> *"wrong type argument to unary '!'"* or
+> *"used type where arithmetic type is required"*.
 
 **Opt-out:** `prism -fno-orelse src.c`
 

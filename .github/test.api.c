@@ -6249,6 +6249,64 @@ static void test_taint_propagation_perf(void) {
 	prism_free(&r);
 }
 
+static void test_ifdef_in_orelse_lib_rejected(void) {
+	printf("\n--- #ifdef-in-orelse library mode rejection ---\n");
+
+	/* Case 1: #ifdef in LHS (init expression) — must be rejected */
+	{
+		const char *src =
+		    "void init(void) {\n"
+		    "    int status = \n"
+		    "#ifdef TARGET_ARM\n"
+		    "        42\n"
+		    "#else\n"
+		    "        99\n"
+		    "#endif\n"
+		    "        orelse return;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(src, "ifdef_lhs.c",
+						       prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "#ifdef spanning orelse LHS must be rejected in library mode");
+		prism_free(&r);
+	}
+	/* Case 2: simple orelse without #ifdef — must succeed */
+	{
+		const char *src =
+		    "int f(void);\n"
+		    "void g(void) {\n"
+		    "    int x = f() orelse return;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(src, "no_ifdef.c",
+						       prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "simple orelse without #ifdef must succeed");
+		prism_free(&r);
+	}
+	/* Case 3: #ifdef in fallback only — valid (ternary output) */
+	{
+		const char *src =
+		    "int f(void);\n"
+		    "void g(void) {\n"
+		    "    int x = f() orelse\n"
+		    "#ifdef DEBUG\n"
+		    "        -1\n"
+		    "#else\n"
+		    "        0\n"
+		    "#endif\n"
+		    "    ;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(src, "ifdef_fb.c",
+						       prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "#ifdef in orelse fallback only must succeed");
+		if (r.status == PRISM_OK && r.output)
+			CHECK(!strstr(r.output, "orelse"),
+			      "#ifdef fallback output must not leak 'orelse' literal");
+		prism_free(&r);
+	}
+}
+
 void run_api_tests(void) {
 test_typeof_orelse_leak();
 	printf("\n=== API TESTS ===\n");
@@ -6471,4 +6529,7 @@ test_typeof_orelse_leak();
 
 	// Audit round 48: taint propagation O(N^2) function lookup
 	test_taint_propagation_perf();
+
+	// Audit round 49: library mode #ifdef-in-orelse rejection
+	test_ifdef_in_orelse_lib_rejected();
 }
