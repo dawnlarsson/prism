@@ -3429,8 +3429,10 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		Token *decl_start = tok;
 
 		// Per-declarator 'raw' detection (comma-separated: int x, raw y;)
+		// Also handles redundant per-declarator raw when is_raw is already set
+		// (raw int x, raw y; — second 'raw' must be consumed to prevent leak).
 		bool decl_is_raw = is_raw;
-		if (!decl_is_raw && (tok->flags & TF_RAW) && !is_known_typedef(tok)) {
+		if ((tok->flags & TF_RAW) && !is_known_typedef(tok)) {
 			Token *after = skip_noise(tok_next(tok));
 			if (after && ((is_valid_varname(after) && !is_type_keyword(after) &&
 				       !is_known_typedef(after) && !(after->tag & (TT_QUALIFIER | TT_SUE))) ||
@@ -3448,8 +3450,14 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		DeclResult decl = parse_declarator(tok, false);
 		if (!decl.end || !decl.var_name) {
 			if (!first_decl) {
-				if (need_type_emit)
+				if (need_type_emit) {
+					if (type->has_typeof && type->is_vla)
+						error_tok(tok, "multi-declarator typeof with variable-length "
+							  "array requires declaration split which would "
+							  "double-evaluate the type specifier; declare "
+							  "each variable on a separate line");
 					emit_type_stripped(type_start, type->end, false);
+				}
 				goto emit_raw_bail;
 			}
 			return NULL;
@@ -3475,6 +3483,13 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 		// Deferred type emission from orelse comma continuation
 		if (need_type_emit) {
+			// Splitting a typeof VLA re-emits the type specifier, causing
+			// the VLA dimension to be evaluated twice (ISO C11 §6.7.2.5).
+			if (type->has_typeof && type->is_vla)
+				error_tok(decl_start, "multi-declarator typeof with variable-length "
+					  "array requires declaration split which would "
+					  "double-evaluate the type specifier; declare "
+					  "each variable on a separate line");
 			if (!is_const_orelse_fallback) {
 				if (pragma_start != type_start) {
 					if (raw_tok)
@@ -6360,6 +6375,19 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 		tok_ann(init_tok) |= P1_IS_DECL;
 		Token *t = type.end;
 		while (t && t != init_end && t->kind != TK_EOF) {
+			// Per-declarator 'raw' skip (for(int x, raw y; ...))
+			bool decl_raw = saw_raw;
+			if ((t->flags & TF_RAW) && !is_known_typedef(t)) {
+				Token *after = skip_noise(tok_next(t));
+				if (after && ((is_valid_varname(after) && !is_type_keyword(after) &&
+					       !is_known_typedef(after) && !(after->tag & (TT_QUALIFIER | TT_SUE))) ||
+					      match_ch(after, '*') || match_ch(after, '('))) {
+					while ((after->flags & TF_RAW) && !is_known_typedef(after))
+						after = skip_noise(tok_next(after));
+					t = after;
+					decl_raw = true;
+				}
+			}
 			DeclResult decl = parse_declarator(t, false);
 			if (!decl.var_name || !decl.end) break;
 			if (is_known_typedef(decl.var_name) ||
@@ -6374,7 +6402,7 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 					P1FuncEntry *e = p1_alloc(P1K_DECL, eff_sid, decl.var_name);
 					e->decl.has_init = has_init;
 					e->decl.is_vla = type.is_vla || decl.is_vla;
-					e->decl.has_raw = saw_raw;
+					e->decl.has_raw = decl_raw;
 					e->decl.is_static_storage = saw_static || type.has_static || type.has_extern;
 					e->decl.body_close_idx = body_sid > 0 ? 0 : body_close_idx;
 				}
@@ -7231,6 +7259,19 @@ uint16_t sid = next_scope_id++;
 				bool p1d_annotated = false;
 				Token *t = type.end;
 				while (t && !match_ch(t, ';') && !match_ch(t, '{') && t->kind != TK_EOF) {
+					// Per-declarator 'raw' skip (int x, raw arr[n];)
+					bool p1d_decl_raw = p1d_saw_raw;
+					if ((t->flags & TF_RAW) && !is_known_typedef(t)) {
+						Token *after = skip_noise(tok_next(t));
+						if (after && ((is_valid_varname(after) && !is_type_keyword(after) &&
+							       !is_known_typedef(after) && !(after->tag & (TT_QUALIFIER | TT_SUE))) ||
+							      match_ch(after, '*') || match_ch(after, '('))) {
+							while ((after->flags & TF_RAW) && !is_known_typedef(after))
+								after = skip_noise(tok_next(after));
+							t = after;
+							p1d_decl_raw = true;
+						}
+					}
 					DeclResult decl = parse_declarator(t, false);
 					if (!decl.var_name || !decl.end) {
 						// Detect GNU nested function definitions
@@ -7283,7 +7324,7 @@ uint16_t sid = next_scope_id++;
 					// Phase 1D: reject unbraced declaration in switch body
 					// (moved from Pass 2 try_zero_init_decl to satisfy
 					// the invariant: all semantic errors before emission)
-					if (FEAT(F_ZEROINIT) && brace_depth > 0 && !p1d_saw_raw &&
+					if (FEAT(F_ZEROINIT) && brace_depth > 0 && !p1d_decl_raw &&
 					    cur_sid < scope_tree_count && scope_tree[cur_sid].is_switch)
 						error_tok(p1d_type_tok,
 							  "variable declaration directly in switch body without braces. "
@@ -7311,14 +7352,14 @@ uint16_t sid = next_scope_id++;
 						P1FuncEntry *e = p1_alloc(P1K_DECL, cur_sid, decl.var_name);
 						e->decl.has_init = has_init;
 						e->decl.is_vla = type.is_vla || decl.is_vla;
-						e->decl.has_raw = p1d_saw_raw;
+						e->decl.has_raw = p1d_decl_raw;
 						e->decl.is_static_storage = p1d_saw_static || type.has_static || type.has_extern;
 					}
 
 					// Phase 1D: reject register _Atomic aggregate
 					// (moved from Pass 2 process_declarators to satisfy
 					// the invariant: all semantic errors before emission)
-					if (FEAT(F_ZEROINIT) && brace_depth > 0 && !has_init && !p1d_saw_raw &&
+					if (FEAT(F_ZEROINIT) && brace_depth > 0 && !has_init && !p1d_decl_raw &&
 					    !type.has_extern && !type.has_static &&
 					    type.has_register && type.has_atomic) {
 						bool p1_is_aggregate = decl.is_array ||

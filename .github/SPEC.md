@@ -564,6 +564,8 @@ GNU statement expressions `({…})` are supported. They get their own scope in t
 
 **Multi-declarator stmt-expr:** `int x = ({ int tmp = f() orelse 0; tmp; }), y = 5;` — when the comma after a stmt-expr initializer forces `process_declarators`, `check_orelse_in_parens` skips stmt-expr boundaries (bails early for `({` patterns), and `walk_balanced` processes the inner content with full scope handling.
 
+**Multi-declarator typeof VLA split restriction:** When `process_declarators` must split a multi-declarator statement (due to pending typeof memsets or bracket orelse in a subsequent declarator), it re-emits the type specifier for the new declaration. If the type specifier is `typeof(expr)` with a variably-modified type (`has_typeof && is_vla`), the VLA dimension expression would be evaluated a second time at runtime by the backend compiler (ISO C11 §6.7.2.5 — VM type specifiers are evaluated when the declaration is reached). This causes double evaluation of side effects (function calls, `++`, etc.) in the VLA dimension. Prism rejects such splits with a hard error: the user must declare each variable on a separate line. This also covers the orelse `stop_comma` continuation paths (const orelse fallback, orelse action). Anonymous struct/union splits are separately rejected because re-emitting the body produces two incompatible anonymous types.
+
 ---
 
 ## 7. Error Handling

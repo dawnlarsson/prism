@@ -1586,6 +1586,62 @@ static void test_typeof_memset_split_before_initializer(void) {
 	prism_free(&transpile_result);
 }
 
+static void test_typeof_vla_split_double_eval(void) {
+	printf("\n--- Typeof VLA Split Double Evaluation ---\n");
+
+	/* typeof(int[side_effect()]) arr, *p = 0;
+	 * Splitting re-emits the type specifier, causing the VLA dimension
+	 * (with side effects) to be evaluated twice (ISO C11 §6.7.2.5).
+	 * Prism must reject this with a clear error. */
+
+	/* Case 1: typeof VLA + memset split (typeof_var_count > 0, next has init) */
+	PrismResult r1 = prism_transpile_source(
+	    "void f(void) {\n"
+	    "    typeof(int[get_size()]) arr, *p = 0;\n"
+	    "    (void)arr; (void)p;\n"
+	    "}\n",
+	    "typeof_vla_split1.c", prism_defaults());
+	CHECK(r1.status != PRISM_OK, "typeof VLA memset split: must be rejected");
+	if (r1.error_msg)
+		CHECK(strstr(r1.error_msg, "typeof") != NULL,
+		      "typeof VLA memset split: error mentions typeof");
+	prism_free(&r1);
+
+	/* Case 2: typeof VLA + bracket orelse split */
+	PrismResult r2 = prism_transpile_source(
+	    "void f(void) {\n"
+	    "    typeof(int[get_size()]) arr, b[3 orelse 1];\n"
+	    "    (void)arr; (void)b;\n"
+	    "}\n",
+	    "typeof_vla_split2.c", prism_defaults());
+	CHECK(r2.status != PRISM_OK, "typeof VLA bracket orelse split: must be rejected");
+	if (r2.error_msg)
+		CHECK(strstr(r2.error_msg, "typeof") != NULL,
+		      "typeof VLA bracket orelse split: error mentions typeof");
+	prism_free(&r2);
+
+	/* Case 3: non-VLA typeof must NOT be rejected (no side effects in type spec) */
+	PrismResult r3 = prism_transpile_source(
+	    "struct S { int x; };\n"
+	    "void f(void) {\n"
+	    "    typeof((struct S){1}) a, b = a;\n"
+	    "    (void)b;\n"
+	    "}\n",
+	    "typeof_nonvla_split.c", prism_defaults());
+	CHECK(r3.status == PRISM_OK, "non-VLA typeof split: must be accepted");
+	prism_free(&r3);
+
+	/* Case 4: plain VLA (no typeof) must NOT be rejected (type spec is just 'int') */
+	PrismResult r4 = prism_transpile_source(
+	    "void f(int n) {\n"
+	    "    int arr[n], *p = 0;\n"
+	    "    (void)arr; (void)p;\n"
+	    "}\n",
+	    "plain_vla_split.c", prism_defaults());
+	CHECK(r4.status == PRISM_OK, "plain VLA split: must be accepted");
+	prism_free(&r4);
+}
+
 static void test_typeof_memset_queue_over_128(void) {
 	printf("\n--- Typeof Memset Queue Over 128 ---\n");
 
@@ -2471,6 +2527,7 @@ void run_zeroinit_tests(void) {
 	test_const_typeof_atomic_struct_bug();
 #endif
 	test_typeof_memset_split_before_initializer();
+	test_typeof_vla_split_double_eval();
 	test_typeof_memset_queue_over_128();
 
 	test_sizeof_unparenthesized_not_vla();

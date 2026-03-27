@@ -1345,6 +1345,69 @@ static void test_raw_qualifier_prefix_goto_desync(void) {
 	}
 }
 
+static void test_raw_per_declarator_vla_cfg_bypass(void) {
+	printf("\n--- raw per-declarator VLA CFG verifier bypass ---\n");
+
+	/* Case 1: raw int x, raw arr[n]; — statement-level raw + per-declarator raw
+	 * on VLA. The goto over the VLA MUST be caught even though both vars are raw,
+	 * because VLA bypass is always UB (ISO C99 §6.8.6.1p1). */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    goto skip;\n"
+		    "    raw int x, raw arr[n];\n"
+		    "    skip: arr[0] = 5;\n"
+		    "}\n",
+		    "raw_vla_cfg1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "raw-vla-cfg1: goto over per-declarator raw VLA must be rejected");
+		prism_free(&r);
+	}
+	/* Case 2: int x, raw arr[n]; — only per-declarator raw on VLA */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    goto skip;\n"
+		    "    int x, raw arr[n];\n"
+		    "    skip: arr[0] = 5;\n"
+		    "}\n",
+		    "raw_vla_cfg2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "raw-vla-cfg2: goto over per-declarator raw VLA must be rejected");
+		prism_free(&r);
+	}
+	/* Case 3: raw keyword must not leak to output in multi-decl */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    raw int x, raw y;\n"
+		    "    (void)x; (void)y;\n"
+		    "}\n",
+		    "raw_vla_cfg3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "raw-vla-cfg3: scalar raw multi-decl transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, " raw ") == NULL &&
+				strstr(r.output, ",raw ") == NULL &&
+				strstr(r.output, ", raw ") == NULL,
+			      "raw-vla-cfg3: per-declarator raw must not leak to output");
+		prism_free(&r);
+	}
+	/* Case 4: per-declarator raw on non-VLA — goto should be allowed */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    goto skip;\n"
+		    "    raw int x, raw y;\n"
+		    "    skip: (void)x; (void)y;\n"
+		    "}\n",
+		    "raw_vla_cfg4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "raw-vla-cfg4: goto over raw non-VLA scalars must be accepted");
+		prism_free(&r);
+	}
+}
+
 void run_raw_tests(void) {
 	printf("\n=== RAW KEYWORD TESTS ===\n");
 
@@ -1468,4 +1531,7 @@ void run_raw_tests(void) {
 
 	// Audit round 44: raw after qualifier prefix desync with CFG verifier
 	test_raw_qualifier_prefix_goto_desync();
+
+	// Audit round 51: per-declarator raw hiding VLA from CFG verifier
+	test_raw_per_declarator_vla_cfg_bypass();
 }
