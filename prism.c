@@ -1243,7 +1243,9 @@ static void check_defer_var_shadow(Token *var_name) {
 				}
 				if (defer_shadow_count >= defer_shadow_cap) {
 					int new_cap = defer_shadow_cap ? defer_shadow_cap * 2 : 64;
-					defer_shadows = realloc(defer_shadows, new_cap * sizeof(*defer_shadows));
+					void *tmp = realloc(defer_shadows, new_cap * sizeof(*defer_shadows));
+					if (!tmp) error("out of memory");
+					defer_shadows = tmp;
 					defer_shadow_cap = new_cap;
 				}
 				defer_shadows[defer_shadow_count++] = (DeferShadow){
@@ -3960,9 +3962,14 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 static void defer_scan_hidden_stmt_exprs(Token *open, bool in_loop, bool in_switch, int depth) {
 	Token *end = tok_match(open);
 	if (!end) return;
-	for (Token *t = tok_next(open); t && t != end && t->kind != TK_EOF; t = tok_next(t))
-		if (match_ch(t, '(') && tok_next(t) && match_ch(tok_next(t), '{'))
+	for (Token *t = tok_next(open); t && t != end && t->kind != TK_EOF; ) {
+		if (match_ch(t, '(') && tok_next(t) && match_ch(tok_next(t), '{')) {
 			validate_defer_statement(tok_next(t), in_loop, in_switch, depth + 1);
+			t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t);
+		} else {
+			t = tok_next(t);
+		}
+	}
 }
 
 static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch, int depth) {
@@ -6004,7 +6011,9 @@ static Token *skip_one_stmt(Token *tok, int depth) {
 #define PUSH_CONT(k, t) do { \
 	if (cont_n >= cont_cap) { \
 		cont_cap = cont_cap ? cont_cap * 2 : 64; \
-		cont_stack = realloc(cont_stack, (size_t)cont_cap * sizeof(Cont)); \
+		void *_tmp = realloc(cont_stack, (size_t)cont_cap * sizeof(Cont)); \
+		if (!_tmp) { free(cont_stack); error("out of memory"); } \
+		cont_stack = _tmp; \
 	} \
 	cont_stack[cont_n++] = (Cont){k, t}; \
 } while (0)

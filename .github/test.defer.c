@@ -3307,6 +3307,30 @@ static void test_stmt_expr_return_defer_bypass(void) {
 }
 
 // Audit round 43: compound literal ctrl_state desync in braceless control flow.
+// Audit round 47: nested stmt-exprs in defer must not cause exponential blowup.
+// defer_scan_hidden_stmt_exprs must skip past validated ({...}) groups.
+static void test_defer_nested_stmt_expr_perf(void) {
+	printf("\n--- nested stmt-expr in defer performance (audit round 47) ---\n");
+
+	// Generate deeply nested statement-expression code inside a defer block.
+	// Before the fix, depth 30 caused the transpiler to hang (>30s).
+	// After the fix, depth 200 completes in <0.1s.
+	const char *code =
+	    "int g;\n"
+	    "void f(void) {\n"
+	    "    defer { g = ({g = ({g = ({g = ({g = ({g = ({g = ({g = ({g = ({g = ({\n"
+	    "        g = ({g = ({g = ({g = ({g = ({g = ({g = ({g = ({g = ({g = ({\n"
+	    "        0;\n"
+	    "    });});});});});});});});});});\n"
+	    "    });});});});});});});});});});\n"
+	    "    ; };\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "fractal_defer.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "nested-stmt-expr-perf: depth-20 nested ({...}) in defer must not hang");
+	prism_free(&r);
+}
+
 // After `for (...) (struct S){i};`, the `(struct S)` parens trigger
 // track_ctrl_paren_close → parens_just_closed = true.  handle_open_brace
 // then treats `{` as the control body brace (clears ctrl_state.pending).
@@ -3578,4 +3602,7 @@ void run_defer_tests(void) {
 
 	// Audit round 43: compound literal ctrl_state desync shadow leak
 	test_compound_literal_ctrl_state_desync();
+
+	// Audit round 47: nested stmt-expr in defer exponential blowup
+	test_defer_nested_stmt_expr_perf();
 }
