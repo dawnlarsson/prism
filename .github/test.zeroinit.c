@@ -1603,8 +1603,8 @@ static void test_typeof_vla_split_double_eval(void) {
 	    "typeof_vla_split1.c", prism_defaults());
 	CHECK(r1.status != PRISM_OK, "typeof VLA memset split: must be rejected");
 	if (r1.error_msg)
-		CHECK(strstr(r1.error_msg, "typeof") != NULL,
-		      "typeof VLA memset split: error mentions typeof");
+		CHECK(strstr(r1.error_msg, "variably") != NULL || strstr(r1.error_msg, "VLA") != NULL,
+		      "typeof VLA memset split: error mentions variably-modified / VLA");
 	prism_free(&r1);
 
 	/* Case 2: typeof VLA + bracket orelse split */
@@ -1616,8 +1616,8 @@ static void test_typeof_vla_split_double_eval(void) {
 	    "typeof_vla_split2.c", prism_defaults());
 	CHECK(r2.status != PRISM_OK, "typeof VLA bracket orelse split: must be rejected");
 	if (r2.error_msg)
-		CHECK(strstr(r2.error_msg, "typeof") != NULL,
-		      "typeof VLA bracket orelse split: error mentions typeof");
+		CHECK(strstr(r2.error_msg, "variably") != NULL || strstr(r2.error_msg, "VLA") != NULL,
+		      "typeof VLA bracket orelse split: error mentions variably-modified / VLA");
 	prism_free(&r2);
 
 	/* Case 3: non-VLA typeof must NOT be rejected (no side effects in type spec) */

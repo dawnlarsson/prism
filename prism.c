@@ -2333,10 +2333,40 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			r.has_atomic = true;
 			tok = tok_next(tok);
 			Token *inner_start = tok_next(tok);
-			tok = skip_balanced(tok, '(', ')');
+			Token *end = walk_balanced(tok, false);
 			if (inner_start && (inner_start->tag & TT_SUE)) r.is_struct = true;
 			if (inner_start && is_identifier_like(inner_start) && is_known_typedef(inner_start))
 				r.is_typedef = true;
+			// Scan for VLAs inside _Atomic(...) — same pattern as typeof.
+			// _Atomic(int(*)[get_size()]) is a VM type (C11 §6.7.2.4);
+			// must set is_vla so split guards fire.
+			{
+				Token *prev_a = tok; // '(' itself
+				int fn_skip_a = 0;
+				for (Token *t = tok_next(tok); t && t != end; prev_a = t, t = tok_next(t)) {
+					if (t->tag & TT_TYPEOF) r.has_typeof = true;
+					if (match_ch(t, '(')) {
+						if (fn_skip_a > 0) fn_skip_a++;
+						else if (match_ch(prev_a, ')')) fn_skip_a = 1;
+					} else if (match_ch(t, ')')) {
+						if (fn_skip_a > 0) fn_skip_a--;
+					}
+					if (fn_skip_a > 0) continue;
+					if (match_ch(t, '[') &&
+					    (is_type_keyword(prev_a) || is_known_typedef(prev_a) ||
+					     match_ch(prev_a, ']') || match_ch(prev_a, '*') ||
+					     match_ch(prev_a, ')')) &&
+					    array_size_is_vla(t)) {
+						r.is_vla = true;
+						break;
+					}
+					if (is_identifier_like(t) && (typedef_flags(t) & TDF_VLA)) {
+						r.is_vla = true;
+						break;
+					}
+				}
+			}
+			tok = end;
 			r.end = tok;
 			continue;
 		}
@@ -2407,7 +2437,8 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 					if (fn_skip > 0) continue;
 					if (match_ch(t, '[') &&
 					    (is_type_keyword(prev) || is_known_typedef(prev) ||
-					     match_ch(prev, ']') || match_ch(prev, '*')) &&
+					     match_ch(prev, ']') || match_ch(prev, '*') ||
+					     match_ch(prev, ')')) &&
 					    array_size_is_vla(t)) {
 						r.is_vla = true;
 						break;
@@ -3476,11 +3507,11 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		if (!decl.end || !decl.var_name) {
 			if (!first_decl) {
 				if (need_type_emit) {
-					if (type->has_typeof && type->is_vla)
-						error_tok(tok, "multi-declarator typeof with variable-length "
-							  "array requires declaration split which would "
-							  "double-evaluate the type specifier; declare "
-							  "each variable on a separate line");
+					if ((type->has_typeof || type->has_atomic) && type->is_vla)
+						error_tok(tok, "multi-declarator with variably-modified "
+							  "type specifier requires declaration split which "
+							  "would double-evaluate VLA size expressions; "
+							  "declare each variable on a separate line");
 					emit_type_stripped(type_start, type->end, false);
 				}
 				goto emit_raw_bail;
@@ -3510,11 +3541,11 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		if (need_type_emit) {
 			// Splitting a typeof VLA re-emits the type specifier, causing
 			// the VLA dimension to be evaluated twice (ISO C11 §6.7.2.5).
-			if (type->has_typeof && type->is_vla)
-				error_tok(decl_start, "multi-declarator typeof with variable-length "
-					  "array requires declaration split which would "
-					  "double-evaluate the type specifier; declare "
-					  "each variable on a separate line");
+			if ((type->has_typeof || type->has_atomic) && type->is_vla)
+				error_tok(decl_start, "multi-declarator with variably-modified "
+					  "type specifier requires declaration split which "
+					  "would double-evaluate VLA size expressions; "
+					  "declare each variable on a separate line");
 			if (!is_const_orelse_fallback) {
 				if (pragma_start != type_start) {
 					if (raw_tok)
@@ -3614,6 +3645,13 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					  "is not supported; use a control flow action "
 					  "(return/break/goto), typeof_unqual, or an "
 					  "explicit type name");
+
+			if (type->is_vla || decl.is_vla)
+				error_tok(orelse_tok,
+					  "orelse on a const-qualified variably-modified type "
+					  "would duplicate the type specifier, causing VLA "
+					  "size expressions to be evaluated twice; hoist the "
+					  "value to a non-const variable first");
 
 			tok = handle_const_orelse_fallback(tok,
 							   orelse_tok,

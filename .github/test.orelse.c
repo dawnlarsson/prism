@@ -3819,10 +3819,10 @@ static void test_braceless_ctrl_bracket_orelse_detach(void) {
 	prism_free(&r);
 }
 
-// Bug: handle_const_orelse_fallback uses emit_range for the declarator suffix
-// (array dims etc.), which blindly copies tokens without transforming bracket
-// orelse.  For const pointer-to-VLA: const int (*p)[n orelse 1] = get() orelse 0;
-// the temp gets raw 'orelse' in its dimensions.
+// Bug: handle_const_orelse_fallback duplicates the type specifier for the temp
+// and final declaration.  For variably-modified types (VLA dims), this causes
+// double evaluation of the size expressions (ISO C11 §6.7.2.5).
+// The fix rejects const VM-type orelse outright — user must hoist to non-const.
 static void test_const_fallback_bracket_orelse_leak(void) {
 	printf("\n--- Const-fallback bracket orelse leak ---\n");
 
@@ -3834,12 +3834,11 @@ static void test_const_fallback_bracket_orelse_leak(void) {
 	    "}\n";
 
 	PrismResult r = prism_transpile_source(code, "const_bo_leak.c", prism_defaults());
-	CHECK_EQ(r.status, PRISM_OK, "const-bo-leak: transpile succeeds");
-	if (r.output) {
-		CHECK(!strstr(r.output, "orelse"),
-		      "const-bo-leak: raw 'orelse' must not appear in output "
-		      "(bracket orelse in const-fallback temp dims must be transformed)");
-	}
+	CHECK(r.status != PRISM_OK,
+	      "const-bo-leak: const VLA orelse must be rejected (double eval)");
+	if (r.error_msg)
+		CHECK(strstr(r.error_msg, "variably") != NULL,
+		      "const-bo-leak: error mentions variably modified");
 	prism_free(&r);
 }
 
@@ -4780,6 +4779,160 @@ static void test_bitint_alignas_orelse_leak(void) {
 	}
 }
 
+static void test_const_vm_type_orelse_double_eval(void) {
+	printf("\n--- Const VM-type orelse double evaluation (handoff 9) ---\n");
+
+	// Bug: handle_const_orelse_fallback emits the type specifier TWICE —
+	// once for the mutable temp, once for the final const declaration.
+	// For Variably Modified types (ISO C11 §6.7.2.5), the C compiler evaluates
+	// VLA dimensions at runtime for EACH declaration, causing double evaluation
+	// of side-effectful size expressions.
+
+	// Sub-test 1: VLA in declarator suffix — const int (*ptr)[get_size()]
+	{
+		const char *code =
+		    "int get_size(void);\n"
+		    "void *fetch_data(void);\n"
+		    "void f(void) {\n"
+		    "    const int (*ptr)[get_size()] = fetch_data() orelse NULL;\n"
+		    "    (void)ptr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "const_vla_decl.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "const-vm-decl-orelse: VLA in declarator must be rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "variably") != NULL || strstr(r.error_msg, "VLA") != NULL,
+			      "const-vm-decl-orelse: error mentions variably modified / VLA");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: VLA in type specifier via typeof — const typeof(int[n]) *p
+	{
+		const char *code =
+		    "int *get_ptr(void);\n"
+		    "void f(int n) {\n"
+		    "    const typeof(int[n]) *p = get_ptr() orelse NULL;\n"
+		    "    (void)p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "const_typeof_vla.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "const-vm-typeof-orelse: typeof VLA must be rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "variably") != NULL || strstr(r.error_msg, "VLA") != NULL,
+			      "const-vm-typeof-orelse: error mentions variably modified / VLA");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: non-VLA const pointer — must NOT be rejected (no false positive)
+	{
+		const char *code =
+		    "int *get_ptr(void);\n"
+		    "void f(void) {\n"
+		    "    const int *p = get_ptr() orelse NULL;\n"
+		    "    (void)p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "const_nonvla.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "const-nonvla-orelse: non-VLA const accepted");
+		prism_free(&r);
+	}
+
+	// Sub-test 4: non-VLA const fixed-dim array pointer — must NOT be rejected
+	{
+		const char *code =
+		    "void *get_data(void);\n"
+		    "void f(void) {\n"
+		    "    const int (*p)[5] = get_data() orelse NULL;\n"
+		    "    (void)p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "const_fixeddim.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "const-fixeddim-orelse: fixed-dim const accepted");
+		prism_free(&r);
+	}
+}
+
+static void test_atomic_vm_type_split_double_eval(void) {
+	printf("\n--- _Atomic VM-type split double evaluation (handoff 10) ---\n");
+
+	// Bug: parse_type_specifier blindly skip_balanced over _Atomic(...)
+	// without scanning for VLAs. type->is_vla stays false.
+	// When a bracket orelse on a later declarator forces a split,
+	// the _Atomic VM type is duplicated, evaluating VLA dims twice.
+
+	// Sub-test 1: _Atomic(int(*)[get_size()]) with split — must be rejected
+	{
+		const char *code =
+		    "int get_size(void);\n"
+		    "void f(void) {\n"
+		    "    _Atomic(int(*)[get_size()]) a, b[1 orelse 2];\n"
+		    "    (void)a; (void)b;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "atomic_vla_split1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "atomic-vm-split: _Atomic VLA split must be rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "double") != NULL ||
+			      strstr(r.error_msg, "variably") != NULL ||
+			      strstr(r.error_msg, "VLA") != NULL,
+			      "atomic-vm-split: error mentions double eval / VLA");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: _Atomic(int(*)[n]) const orelse — must be rejected
+	{
+		const char *code =
+		    "void *get(void);\n"
+		    "void f(int n) {\n"
+		    "    const _Atomic(int(*)[n]) p = get() orelse NULL;\n"
+		    "    (void)p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "atomic_vla_const.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "atomic-vm-const-orelse: const _Atomic VLA orelse must be rejected");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: _Atomic(int *) non-VLA — must NOT be rejected (no false positive)
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    _Atomic(int *) a, b;\n"
+		    "    (void)a; (void)b;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "atomic_novla.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "atomic-novla: non-VLA _Atomic accepted");
+		prism_free(&r);
+	}
+
+	// Sub-test 4: _Atomic(int(*)[5]) fixed dim — must NOT be rejected
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    _Atomic(int(*)[5]) a, b[1 orelse 2];\n"
+		    "    (void)a; (void)b;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "atomic_fixeddim.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "atomic-fixeddim: fixed-dim _Atomic split accepted");
+		prism_free(&r);
+	}
+
+	// Sub-test 5: _Atomic with typeof VLA inside — must be rejected
+	{
+		const char *code =
+		    "void f(int n) {\n"
+		    "    _Atomic(typeof(int[n]) *) a, b[1 orelse 2];\n"
+		    "    (void)a; (void)b;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "atomic_typeof_vla.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "atomic-typeof-vla-split: _Atomic typeof VLA split must be rejected");
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -5083,4 +5236,7 @@ void run_orelse_tests(void) {
 
 	// Audit round 52: _BitInt/_Alignas orelse firewall bypass
 	test_bitint_alignas_orelse_leak();
+
+	test_const_vm_type_orelse_double_eval();
+	test_atomic_vm_type_split_double_eval();
 }
