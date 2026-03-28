@@ -3448,6 +3448,212 @@ static void test_orelse_empty_action_in_defer_phase1(void) {
 	prism_free(&r);
 }
 
+// case/default label jumping into a statement expression is UB.
+// The P1K_GOTO handler checks scope_stmt_expr_ancestor; P1K_CASE must too.
+static void test_case_label_into_stmt_expr(void) {
+	printf("\n--- case/default label into statement expression ---\n");
+
+	// Sub-test 1: case inside stmt-expr without any local declarations
+	// (no zero-init bypass to detect — only the stmt-expr structural violation)
+	{
+		const char *code =
+		    "int global_result;\n"
+		    "void test(int state) {\n"
+		    "    switch (state) {\n"
+		    "        case 0:\n"
+		    "            global_result = ({\n"
+		    "                case 1:\n"
+		    "                    42;\n"
+		    "            });\n"
+		    "            break;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "case_stmtexpr1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "case-into-stmtexpr: must be rejected (UB)");
+		CHECK(r.error_msg && strstr(r.error_msg, "statement expression"),
+		      "case-into-stmtexpr: error mentions statement expression");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: default label inside stmt-expr
+	{
+		const char *code =
+		    "int global_result;\n"
+		    "void test(int state) {\n"
+		    "    switch (state) {\n"
+		    "        case 0:\n"
+		    "            global_result = ({\n"
+		    "                default:\n"
+		    "                    99;\n"
+		    "            });\n"
+		    "            break;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "default_stmtexpr.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "default-into-stmtexpr: must be rejected (UB)");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: case NOT inside stmt-expr (control — should pass)
+	{
+		const char *code =
+		    "void test(int state) {\n"
+		    "    switch (state) {\n"
+		    "        case 0: break;\n"
+		    "        case 1: break;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "case_normal.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "case-normal: normal switch must pass");
+		prism_free(&r);
+	}
+
+	// Sub-test 4: both switch and case inside same stmt-expr (should pass)
+	{
+		const char *code =
+		    "void test(int state) {\n"
+		    "    int result = ({\n"
+		    "        int r;\n"
+		    "        switch (state) {\n"
+		    "            case 0: r = 10; break;\n"
+		    "            case 1: r = 20; break;\n"
+		    "            default: r = 0; break;\n"
+		    "        }\n"
+		    "        r;\n"
+		    "    });\n"
+		    "    (void)result;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "switch_in_stmtexpr.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "switch-in-stmtexpr: switch+case both inside same stmtexpr must pass");
+		prism_free(&r);
+	}
+}
+
+// Bug 5: Computed goto + VLA must be rejected even with raw keyword / zeroinit disabled.
+// VLA stack allocation is bypassed if a computed goto jumps past it → stack corruption.
+static void test_computed_goto_vla(void) {
+	printf("\n--- Computed Goto VLA ---\n");
+
+	// Sub-test 1: raw VLA + computed goto (was silently accepted before fix)
+	{
+		const char *code =
+		    "void test(int n) {\n"
+		    "    void *table[] = { &&label1 };\n"
+		    "    raw int vla[n];\n"
+		    "    goto *table[0];\n"
+		    "label1:\n"
+		    "    return;\n"
+		    "}\n";
+		PrismFeatures feat = prism_defaults();
+		feat.zeroinit = false;
+		PrismResult r = prism_transpile_source(code, "cgoto_raw_vla.c", feat);
+		CHECK(r.status != PRISM_OK,
+		      "computed goto + raw VLA: must be rejected (stack corruption)");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: non-raw VLA + computed goto with zeroinit enabled
+	{
+		const char *code =
+		    "void test(int n) {\n"
+		    "    void *table[] = { &&label1 };\n"
+		    "    int vla[n];\n"
+		    "    goto *table[0];\n"
+		    "label1:\n"
+		    "    return;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "cgoto_vla.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "computed goto + VLA: must be rejected");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: computed goto without VLA (raw fixed array) — should pass
+	{
+		const char *code =
+		    "void test(void) {\n"
+		    "    void *table[] = { &&label1 };\n"
+		    "    raw int arr[10];\n"
+		    "    goto *table[0];\n"
+		    "label1:\n"
+		    "    return;\n"
+		    "}\n";
+		PrismFeatures feat = prism_defaults();
+		feat.zeroinit = false;
+		PrismResult r = prism_transpile_source(code, "cgoto_no_vla.c", feat);
+		CHECK_EQ(r.status, PRISM_OK,
+			 "computed goto + raw fixed array: must pass");
+		prism_free(&r);
+	}
+}
+
+// Bug 6: Enum constant shadowed by parameter → VLA not detected → invalid = {0} init.
+static void test_enum_shadow_vla(void) {
+	printf("\n--- Enum Shadow VLA ---\n");
+
+	// Sub-test 1: parameter shadows enum constant used as array size
+	{
+		const char *code =
+		    "enum { SIZE = 10 };\n"
+		    "void test(int SIZE) {\n"
+		    "    int arr[SIZE];\n"
+		    "    arr[0] = 42;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "enum_shadow_vla.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "enum shadow VLA: transpilation must succeed");
+		if (r.output) {
+			CHECK(strstr(r.output, "arr[SIZE] = {0}") == NULL &&
+			      strstr(r.output, "arr [ SIZE ] = { 0 }") == NULL,
+			      "enum shadow VLA: must not emit = {0} for VLA (use memset)");
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "enum shadow VLA: must use memset for VLA zero-init");
+		}
+		prism_free(&r);
+	}
+
+	// Sub-test 2: local variable shadows enum constant
+	{
+		const char *code =
+		    "enum { COUNT = 5 };\n"
+		    "void test(void) {\n"
+		    "    int COUNT = 3;\n"
+		    "    int arr[COUNT];\n"
+		    "    arr[0] = 1;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "enum_shadow_local.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "enum shadow local VLA: transpilation must succeed");
+		if (r.output) {
+			CHECK(strstr(r.output, "arr[COUNT] = {0}") == NULL,
+			      "enum shadow local: must not emit = {0} for VLA");
+		}
+		prism_free(&r);
+	}
+
+	// Sub-test 3: no shadow (enum constant used directly) — control case
+	{
+		const char *code =
+		    "enum { SIZE = 10 };\n"
+		    "void test(void) {\n"
+		    "    int arr[SIZE];\n"
+		    "    arr[0] = 42;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "enum_no_shadow.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "enum no shadow: transpilation must succeed");
+		if (r.output) {
+			CHECK(strstr(r.output, "= {0}") != NULL || strstr(r.output, "= { 0 }") != NULL,
+			      "enum no shadow: fixed array must use = {0} init");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -3724,4 +3930,13 @@ void run_safe_tests(void) {
         test_register_atomic_aggregate_phase1();
         test_switch_unbraced_decl_phase1();
         test_orelse_empty_action_in_defer_phase1();
+
+        // case/default label jumping into statement expression
+        test_case_label_into_stmt_expr();
+
+        // Bug 5: computed goto + VLA stack corruption
+        test_computed_goto_vla();
+
+        // Bug 6: enum constant shadow → VLA not detected → invalid = {0}
+        test_enum_shadow_vla();
 }

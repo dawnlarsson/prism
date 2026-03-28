@@ -5315,6 +5315,83 @@ static void test_const_chained_orelse_block_action(void) {
 	prism_free(&r);
 }
 
+static void test_const_ptr_typedef_orelse_provenance(void) {
+	printf("\n--- const pointer typedef orelse provenance ---\n");
+
+	// Bug: typedef int * const CPtr; bakes const into the pointer level.
+	// is_const was computed as: base_is_const && !decl.is_pointer — always
+	// false for pointer typedefs. TDF_CONST stayed unset, so orelse emitted
+	// a direct assignment to a const variable (backend compile error).
+
+	// Sub-test 1: const pointer typedef with value fallback
+	{
+		const char *code =
+		    "typedef int * const CPtr;\n"
+		    "CPtr get_ptr(void);\n"
+		    "int dummy;\n"
+		    "void f(void) {\n"
+		    "    CPtr p = get_ptr() orelse &dummy;\n"
+		    "    (void)p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "const_ptr_td1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "const-ptr-typedef: transpiles OK");
+		CHECK(r.output != NULL, "const-ptr-typedef: output not NULL");
+		CHECK(strstr(r.output, "__prism_oe") != NULL,
+		      "const-ptr-typedef: must use mutable temp");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: const function pointer typedef with value fallback
+	{
+		const char *code =
+		    "typedef int (* const FPtr)(int);\n"
+		    "FPtr get_fp(void);\n"
+		    "int fallback_fn(int x) { return x; }\n"
+		    "void f(void) {\n"
+		    "    FPtr fp = get_fp() orelse fallback_fn;\n"
+		    "    (void)fp;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "const_fptr_td.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "const-fptr-typedef: transpiles OK");
+		CHECK(r.output != NULL, "const-fptr-typedef: output not NULL");
+		CHECK(strstr(r.output, "__prism_oe") != NULL,
+		      "const-fptr-typedef: must use mutable temp");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: non-const pointer typedef (control — should NOT use temp)
+	{
+		const char *code =
+		    "typedef int *Ptr;\n"
+		    "Ptr get_ptr(void);\n"
+		    "int dummy;\n"
+		    "void f(void) {\n"
+		    "    Ptr p = get_ptr() orelse &dummy;\n"
+		    "    (void)p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "nonconst_ptr_td.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "nonconst-ptr-typedef: transpiles OK");
+		// Non-const pointer typedef should use direct assignment, not temp
+		CHECK(strstr(r.output, "__prism_oe") == NULL,
+		      "nonconst-ptr-typedef: should NOT use mutable temp");
+		prism_free(&r);
+	}
+
+	// Sub-test 4: const pointer typedef with control flow action (should use if-guard)
+	{
+		const char *code =
+		    "typedef int * const CPtr;\n"
+		    "CPtr get_ptr(void);\n"
+		    "void f(void) {\n"
+		    "    CPtr p = get_ptr() orelse { return; };\n"
+		    "    (void)p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "const_ptr_td_action.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "const-ptr-typedef-action: transpiles OK");
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -5631,4 +5708,7 @@ void run_orelse_tests(void) {
 
 	// VLA typedef cast bypass in bare orelse
 	test_bare_orelse_vla_typedef_cast_bypass();
+
+	// const pointer typedef orelse provenance trap
+	test_const_ptr_typedef_orelse_provenance();
 }

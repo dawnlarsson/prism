@@ -2061,9 +2061,11 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 			// A typedef is void only if base is void and declarator is plain
 			bool is_void =
 			    base_is_void && !decl.is_pointer && !decl.is_array && !decl.is_func_ptr;
-			// A typedef is const only if base has const and declarator is plain
-			bool is_const =
-			    base_is_const && !decl.is_pointer && !decl.is_array && !decl.is_func_ptr;
+			// A typedef is const if the outermost level is const-qualified.
+			// For pointer/fptr typedefs, const comes from the declarator level
+			// (e.g. typedef int * const CPtr → is_const=true).
+			bool is_const = (decl.is_pointer || decl.is_func_ptr)
+			    ? decl.is_const : (base_is_const && !decl.is_array);
 			// Pointer if declarator has ptr/fptr or base is ptr. Not arrays (cast constraint violation).
 			bool is_ptr =
 			    decl.is_pointer || decl.is_func_ptr || base_is_ptr;
@@ -6480,6 +6482,7 @@ static void p1_register_param_shadows(Token *open, Token *close,
 			t = tok_next(t);
 		}
 		if (last_ident && (is_known_typedef(last_ident) ||
+		    is_known_enum_const(last_ident) ||
 		    (last_ident->tag & (TT_DEFER | TT_ORELSE))))
 			p1_register_shadow(last_ident, scope_id, brace_depth);
 		if (check_vla && last_ident) {
@@ -6558,6 +6561,7 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 			DeclResult decl = parse_declarator(t, false);
 			if (!decl.var_name || !decl.end) break;
 			if (is_known_typedef(decl.var_name) ||
+			    is_known_enum_const(decl.var_name) ||
 			    (decl.var_name->tag & (TT_DEFER | TT_ORELSE)))
 				p1_register_shadow(decl.var_name, cur_sid, brace_depth);
 
@@ -7513,6 +7517,7 @@ uint16_t sid = next_scope_id++;
 
 					// Phase 1C: shadow detection
 					if (is_known_typedef(decl.var_name) ||
+					    is_known_enum_const(decl.var_name) ||
 					    (decl.var_name->tag & (TT_DEFER | TT_ORELSE))) {
 						p1_register_shadow(decl.var_name, cur_sid, brace_depth);
 					}
@@ -7812,15 +7817,20 @@ static void p1_verify_cfg(void) {
 		// into any label, bypassing defers or zeroinit.  If the function
 		// contains both a computed goto and any defers or zeroinit-tracked
 		// declarations, reject it up front.
-		if (fm->has_computed_goto && FEAT(F_DEFER | F_ZEROINIT)) {
+		if (fm->has_computed_goto) {
 			P1FuncEntry *ents = &p1_entries[fm->entry_start];
 			for (int i = 0; i < fm->entry_count; i++) {
 				if (ents[i].kind == P1K_DEFER && FEAT(F_DEFER))
 					error_tok(fm->body_open, "computed goto cannot be used in a "
 						  "function that contains defer statements — the "
 						  "jump target cannot be verified at compile time");
+				if (ents[i].kind == P1K_DECL && ents[i].decl.is_vla)
+					error_tok(fm->body_open, "computed goto cannot be used in a "
+						  "function that contains variable-length arrays — the "
+						  "jump target cannot be verified at compile time");
 				if (ents[i].kind == P1K_DECL && FEAT(F_ZEROINIT) &&
-				    !ents[i].decl.has_raw && !ents[i].decl.is_static_storage)
+				    !ents[i].decl.has_raw && !ents[i].decl.is_static_storage &&
+				    !ents[i].decl.is_vla)
 					error_tok(fm->body_open, "computed goto cannot be used in a "
 						  "function that contains zero-initialized declarations — the "
 						  "jump target cannot be verified at compile time");
@@ -8007,6 +8017,17 @@ static void p1_verify_cfg(void) {
 				// Defer-fallthrough: any defer active now that wasn't at switch entry,
 				// in ancestor-or-self scope of the case → error.
 				uint16_t sw_sid = ents[i].kase.switch_scope_id;
+
+				// Reject case/default jumping into a statement expression.
+				// Mirrors the scope_stmt_expr_ancestor check in P1K_GOTO.
+				{
+					uint16_t case_se = scope_stmt_expr_ancestor(ents[i].scope_id);
+					if (case_se != 0 && !scope_is_ancestor_or_self(case_se, sw_sid))
+						error_tok(ents[i].tok,
+							  "case/default label inside a statement expression "
+							  "(jumping into ({...}) is undefined behavior)");
+				}
+
 				if (!sw_defer_wm || sw_sid >= sw_sz) break;
 				int sw_dm = sw_defer_wm[sw_sid];
 				int sw_cm = sw_decl_wm[sw_sid];
