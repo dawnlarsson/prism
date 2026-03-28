@@ -3495,6 +3495,59 @@ static void test_defer_orelse_block_zeroinit_bypass(void) {
 	}
 }
 
+// BUG60: emit_goto_defer was missing the p1_goto_exits depth adjustment.
+// When goto in orelse crossed sibling scopes, defer cleanup was skipped.
+static void test_orelse_goto_defer_sibling_scope(void) {
+	printf("\n--- BUG60: orelse goto defer sibling scope ---\n");
+
+	// BUG60a: goto in orelse crossing sibling scope with defer
+	{
+		const char *code =
+		    "void cleanup_a(void);\n"
+		    "int get_value(void);\n"
+		    "void f(void) {\n"
+		    "    {\n"
+		    "        defer cleanup_a();\n"
+		    "        int x = get_value() orelse goto end;\n"
+		    "        (void)x;\n"
+		    "    }\n"
+		    "    { end: (void)0; }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug60a.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "BUG60a: transpile succeeds");
+		if (r.output) {
+			// The goto in orelse must emit cleanup_a() before the goto
+			CHECK(strstr(r.output, "cleanup_a(); goto end") != NULL ||
+			      strstr(r.output, "cleanup_a();\ngoto end") != NULL,
+			      "BUG60a: goto in orelse must emit defer cleanup before jumping to sibling scope");
+		}
+		prism_free(&r);
+	}
+
+	// BUG60b: const orelse goto crossing sibling scope
+	{
+		const char *code =
+		    "void cleanup_b(void);\n"
+		    "int get_value(void);\n"
+		    "void f(void) {\n"
+		    "    {\n"
+		    "        defer cleanup_b();\n"
+		    "        const int x = get_value() orelse goto done;\n"
+		    "        (void)x;\n"
+		    "    }\n"
+		    "    { done: (void)0; }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug60b.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "BUG60b: transpile succeeds");
+		if (r.output) {
+			CHECK(strstr(r.output, "cleanup_b(); goto done") != NULL ||
+			      strstr(r.output, "cleanup_b();\ngoto done") != NULL,
+			      "BUG60b: const orelse goto must emit defer cleanup for sibling scope");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -3718,4 +3771,7 @@ void run_defer_tests(void) {
 
 	// BUG58: orelse block-form in defer bypasses zero-init/raw
 	test_defer_orelse_block_zeroinit_bypass();
+
+	// BUG60: goto in orelse missing p1_goto_exits defer cleanup
+	test_orelse_goto_defer_sibling_scope();
 }

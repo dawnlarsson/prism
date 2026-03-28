@@ -2440,6 +2440,91 @@ static void test_typeof_func_decl_memset(void) {
 	}
 }
 
+// BUG59: stmt-expr inside control-flow conditions (if/while/for) must
+// get zero-init processing.  Previously, handle_open_brace treated the
+// stmt-expr `{` as a compound literal inside ctrl parens, bypassing all
+// block-level processing (zero-init, raw, orelse, defer).
+static void test_stmt_expr_zeroinit_in_ctrl_cond(void) {
+	printf("\n--- BUG59: stmt-expr zero-init in ctrl conditions ---\n");
+
+	// BUG59a: if condition
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    if (({int x; x=42; x;})) { (void)0; }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug59a.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "BUG59a: transpile succeeds");
+		if (r.output)
+			CHECK(strstr(r.output, "int x = 0") != NULL,
+			      "BUG59a: int x inside stmt-expr in if() must be zero-initialized");
+		prism_free(&r);
+	}
+
+	// BUG59b: while condition
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    while (({int x; x=0; x;})) { break; }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug59b.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "BUG59b: transpile succeeds");
+		if (r.output)
+			CHECK(strstr(r.output, "int x = 0") != NULL,
+			      "BUG59b: int x inside stmt-expr in while() must be zero-initialized");
+		prism_free(&r);
+	}
+
+	// BUG59c: for condition
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    for (int i = 0; ({int x; x=(i<3); x;}); i++) { (void)i; }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug59c.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "BUG59c: transpile succeeds");
+		if (r.output)
+			CHECK(strstr(r.output, "int x = 0") != NULL,
+			      "BUG59c: int x inside stmt-expr in for() condition must be zero-initialized");
+		prism_free(&r);
+	}
+
+	// BUG59d: if-body after stmt-expr condition must still work normally
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    if (({int x; x=1; x;})) {\n"
+		    "        int y;\n"
+		    "        (void)y;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug59d.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "BUG59d: transpile succeeds");
+		if (r.output) {
+			CHECK(strstr(r.output, "int x = 0") != NULL,
+			      "BUG59d: stmt-expr var zero-initialized");
+			CHECK(strstr(r.output, "int y = 0") != NULL,
+			      "BUG59d: if-body var also zero-initialized");
+		}
+		prism_free(&r);
+	}
+
+	// BUG59e: compound literal in ctrl parens must NOT be treated as stmt-expr
+	{
+		const char *code =
+		    "#include <string.h>\n"
+		    "typedef struct { int x; } P;\n"
+		    "void f(void) {\n"
+		    "    P p;\n"
+		    "    if (memcmp(&p, &(P){1}, sizeof(P)) == 0) { (void)0; }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug59e.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG59e: compound literal in if() still transpiles correctly");
+		prism_free(&r);
+	}
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -2564,4 +2649,7 @@ void run_zeroinit_tests(void) {
 
 	// Audit round 44: ternary in case label shadow leak
 	test_ternary_case_label_shadow_leak();
+
+	// BUG59: stmt-expr zero-init inside control-flow conditions
+	test_stmt_expr_zeroinit_in_ctrl_cond();
 }

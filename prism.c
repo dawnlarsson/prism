@@ -160,6 +160,7 @@ typedef struct {
 	bool is_stmt_expr : 1;
 	bool is_orelse_guard : 1;
 	bool is_enum : 1;      // set when is_struct=true and scope is an enum body
+	bool is_ctrl_se : 1;   // stmt-expr inside ctrl parens (ctrl_state saved on ctrl_save_stack)
 } ScopeNode;
 
 typedef struct {
@@ -414,6 +415,8 @@ static PRISM_THREAD_LOCAL DeferEntry *defer_stack = NULL;
 static PRISM_THREAD_LOCAL int defer_stack_cap = 0;
 static PRISM_THREAD_LOCAL int defer_count = 0;
 static PRISM_THREAD_LOCAL CtrlState ctrl_state;
+static PRISM_THREAD_LOCAL CtrlState ctrl_save_stack[16]; // saved ctrl_state for stmt-expr inside ctrl parens
+static PRISM_THREAD_LOCAL int ctrl_save_depth = 0;
 static PRISM_THREAD_LOCAL int current_func_idx = -1; // Index into func_meta[] for the function being emitted
 static PRISM_THREAD_LOCAL int goto_entry_cursor = 0; // Cursor into entries[] for next P1K_GOTO lookup
 
@@ -641,6 +644,7 @@ static void reset_transpiler_state(void) {
 	ctx->last_system_header = false;
 	ctx->at_stmt_start = true;
 	ctrl_reset();
+	ctrl_save_depth = 0;
 	last_emitted = NULL;
 	current_func_idx = -1;
 
@@ -3155,11 +3159,20 @@ static Token *emit_break_continue_defer(Token *tok) {
 }
 
 // Emit goto with defer handling. Returns next token.
+static int p1_goto_exits(Token *goto_tok, int func_idx); // forward decl
 static Token *emit_goto_defer(Token *tok) {
+	Token *goto_tok = tok;
 	tok = tok_next(tok);
 	if (FEAT(F_DEFER) && is_identifier_like(tok)) {
 		P1LabelResult info = p1_label_find(tok, current_func_idx);
 		int td = info.tok ? info.scope_depth : ctx->block_depth;
+		if (td >= ctx->block_depth) {
+			int exits = p1_goto_exits(goto_tok, current_func_idx);
+			if (exits > 0) {
+				td = ctx->block_depth - exits;
+				if (td < 0) td = 0;
+			}
+		}
 		if (goto_has_defers(td)) emit_goto_defers(td);
 	}
 	OUT_LIT(" goto ");
@@ -4630,9 +4643,17 @@ static Token *handle_sue_body(Token *tok) {
 static Token *handle_open_brace(Token *tok) {
 	// Compound literal inside control parens or before body
 	if (ctrl_state.pending && (in_ctrl_paren() || !ctrl_state.parens_just_closed || (tok_ann(tok) & P1_SCOPE_INIT))) {
-		emit_tok(tok);
-		ctrl_state.brace_depth++;
-		return tok_next(tok);
+		// Statement expression ({...}) inside ctrl parens: not a compound literal.
+		// Save ctrl_state so it can be restored when this block closes.
+		if (last_emitted && match_ch(last_emitted, '(')) {
+			if (ctrl_save_depth < 16)
+				ctrl_save_stack[ctrl_save_depth++] = ctrl_state;
+			// Fall through to normal block processing
+		} else {
+			emit_tok(tok);
+			ctrl_state.brace_depth++;
+			return tok_next(tok);
+		}
 	}
 	bool orelse_guard = ctrl_state.pending_orelse_guard;
 	// Consume pending state
@@ -4661,6 +4682,9 @@ static Token *handle_open_brace(Token *tok) {
 	s->is_switch = ann & P1_SCOPE_SWITCH;
 	s->is_conditional = ann & P1_SCOPE_CONDITIONAL;
 	if (is_stmt_expr) s->is_stmt_expr = true;
+	if (is_stmt_expr && ctrl_save_depth > 0 &&
+	    ctrl_save_stack[ctrl_save_depth - 1].pending)
+		s->is_ctrl_se = true;
 	if (orelse_guard) s->is_orelse_guard = true;
 	if (is_initializer || (ann & P1_SCOPE_INIT)) s->is_struct = true;
 
@@ -4732,10 +4756,16 @@ static Token *handle_close_brace(Token *tok) {
 		}
 	}
 
-	// Check guard BEFORE popping the scope
+	// Check guard and ctrl_se BEFORE popping the scope
 	bool close_guard = ctx->scope_depth > 0 && scope_stack[ctx->scope_depth - 1].is_orelse_guard;
+	bool restore_ctrl = ctx->scope_depth > 0 && scope_stack[ctx->scope_depth - 1].is_ctrl_se;
 
 	scope_pop();
+
+	// Restore ctrl_state for stmt-expr that was inside ctrl parens
+	if (restore_ctrl && ctrl_save_depth > 0)
+		ctrl_state = ctrl_save_stack[--ctrl_save_depth];
+
 	emit_tok(tok);
 
 	// Close dangling-else guard brace if flagged
