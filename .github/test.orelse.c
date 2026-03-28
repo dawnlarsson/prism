@@ -4933,6 +4933,326 @@ static void test_atomic_vm_type_split_double_eval(void) {
 	}
 }
 
+// Audit round 53: cast-dereference bypasses reject_orelse_side_effects volatile
+// deref check.  The checker matches `* varname` but not `*(type *)expr` because
+// `*` is followed by `(`, not a variable name.  In bracket/typeof orelse the LHS
+// is emitted twice (ternary), so `*(volatile int *)0x4000` reads the MMIO
+// register twice — a hardware-visible double read.
+static void test_bracket_orelse_cast_deref_double_eval(void) {
+	// Sub-test 1: *(volatile int *)0x4000 in array dim orelse (BUG)
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int arr[*(volatile int *)(0x4000) orelse 1];\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "cast_deref_bracket1.c", prism_defaults());
+		if (r.status == PRISM_OK && r.output) {
+			// The ternary duplication produces:
+			//   int arr[(*(volatile int *)(0x4000)) ? (*(volatile int *)(0x4000)) : (1)];
+			// Count how many times the volatile deref appears.
+			int count = 0;
+			const char *s = r.output;
+			while ((s = strstr(s, "volatile")) != NULL) { count++; s += 8; }
+			CHECK(count <= 1,
+			      "BUG53a: *(volatile int*)0x4000 in bracket orelse: volatile "
+			      "deref duplicated in ternary (MMIO double read); "
+			      "reject_orelse_side_effects must catch *(cast)expr");
+		} else {
+			// Rejection is the CORRECT outcome — side effect detected
+			CHECK(r.status != PRISM_OK,
+			      "BUG53a: *(volatile int*)0x4000 bracket orelse correctly rejected");
+		}
+		prism_free(&r);
+	}
+
+	// Sub-test 2: *(int *)ptr in typeof orelse (same pattern, non-literal)
+	{
+		const char *code =
+		    "void f(char *ptr) {\n"
+		    "    typeof(int[*(int *)ptr orelse 1]) *p;\n"
+		    "    (void)p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "cast_deref_typeof1.c", prism_defaults());
+		if (r.status == PRISM_OK && r.output) {
+			const char *typeof_start = strstr(r.output, "typeof(");
+			if (typeof_start) {
+				int count = 0;
+				const char *s = typeof_start;
+				while ((s = strstr(s, "ptr")) != NULL) {
+					if (s > typeof_start + 300) break;
+					count++;
+					s += 3;
+				}
+				CHECK(count <= 1,
+				      "BUG53b: *(int *)ptr in typeof orelse: cast-deref "
+				      "duplicated in ternary (double read)");
+			}
+		} else {
+			CHECK(r.status != PRISM_OK,
+			      "BUG53b: *(int*)ptr typeof orelse correctly rejected");
+		}
+		prism_free(&r);
+	}
+
+	// Sub-test 3: *ptr (no cast) must still be caught — regression guard
+	{
+		const char *code =
+		    "void f(volatile int *hw) {\n"
+		    "    int arr[*hw orelse 1];\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "deref_nocast.c", prism_defaults());
+		// The existing check catches *varname, so this must be rejected
+		// OR if accepted, volatile must not be duplicated.
+		if (r.status == PRISM_OK && r.output) {
+			int count = 0;
+			const char *s = r.output;
+			while ((s = strstr(s, "hw")) != NULL) {
+				// skip "hw" in the declaration itself
+				if (s > r.output && *(s-1) == '*') count++;
+				s += 2;
+			}
+			CHECK(count <= 1,
+			      "BUG53c-regression: *hw deref must not be duplicated");
+		} else {
+			CHECK(r.status != PRISM_OK,
+			      "BUG53c-regression: *hw bracket orelse correctly rejected");
+		}
+		prism_free(&r);
+	}
+
+	// Sub-test 4: *(arr + offset) in chained bracket orelse — intermediate
+	// expression goes through emit_token_range_orelse which calls
+	// reject_orelse_side_effects with check_volatile_deref=true, but * is
+	// followed by ( so the *varname pattern doesn't match → bypass.
+	{
+		const char *code =
+		    "void f(volatile int *vals, int idx) {\n"
+		    "    int arr[0 orelse *(vals + idx) orelse 5];\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "deref_arith_chained.c", prism_defaults());
+		if (r.status == PRISM_OK && r.output) {
+			int count = 0;
+			const char *s = r.output;
+			while ((s = strstr(s, "vals")) != NULL) {
+				count++;
+				s += 4;
+			}
+			// Declaration + at most 1 use is fine; more than 2 means double-eval
+			CHECK(count <= 2,
+			      "BUG53d: *(vals+idx) in chained bracket orelse: "
+			      "deref duplicated in ternary (double read); "
+			      "reject_orelse_side_effects must catch *(expr)");
+		} else {
+			CHECK(r.status != PRISM_OK,
+			      "BUG53d: *(vals+idx) chained bracket orelse correctly rejected");
+		}
+		prism_free(&r);
+	}
+
+	// Sub-test 5: *(ptr) — parenthesized simple dereference
+	{
+		const char *code =
+		    "void f(volatile int *hw) {\n"
+		    "    int arr[*(hw) orelse 1];\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "deref_paren_simple.c", prism_defaults());
+		if (r.status == PRISM_OK && r.output) {
+			int count = 0;
+			const char *s = r.output;
+			while ((s = strstr(s, "hw")) != NULL) { count++; s += 2; }
+			CHECK(count <= 2,
+			      "BUG53e: *(hw) in bracket orelse: parenthesized deref "
+			      "duplicated in ternary; reject must catch *(varname)");
+		} else {
+			CHECK(r.status != PRISM_OK,
+			      "BUG53e: *(hw) bracket orelse correctly rejected");
+		}
+		prism_free(&r);
+	}
+}
+
+// Audit round 53: multiplication `*` falsely rejected as pointer dereference.
+// reject_orelse_side_effects matches `* varname` regardless of context — it
+// doesn't distinguish unary dereference `*ptr` from binary multiplication
+// `a * b`.  Expressions like `sizeof(int) * n`, `(a+b) * n`, and even plain
+// `n * n` are falsely rejected when used in typeof orelse or chained bracket
+// orelse contexts.
+static void test_orelse_multiply_false_positive(void) {
+	// Sub-test 1: sizeof(int) * n in typeof orelse — multiplication, not deref
+	{
+		const char *code =
+		    "void f(int n) {\n"
+		    "    typeof(int[sizeof(int) * n orelse 4]) *p;\n"
+		    "    (void)p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "mul_sizeof.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG54a: sizeof(int) * n in typeof orelse is multiplication, "
+		         "not pointer dereference — must not be rejected");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: _Alignof(int) * n — same pattern
+	{
+		const char *code =
+		    "void f(int n) {\n"
+		    "    typeof(int[_Alignof(int) * n orelse 4]) *p;\n"
+		    "    (void)p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "mul_alignof.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG54b: _Alignof(int) * n in typeof orelse is multiplication, "
+		         "not pointer dereference — must not be rejected");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: (a + b) * n — parenthesized expression times variable
+	{
+		const char *code =
+		    "void f(int a, int b, int n) {\n"
+		    "    typeof(int[(a + b) * n orelse 4]) *p;\n"
+		    "    (void)p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "mul_paren_expr.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG54c: (a+b) * n in typeof orelse is multiplication, "
+		         "not pointer dereference — must not be rejected");
+		prism_free(&r);
+	}
+
+	// Sub-test 4: n * n — simple variable multiplication
+	{
+		const char *code =
+		    "void f(int n) {\n"
+		    "    typeof(int[n * n orelse 4]) *p;\n"
+		    "    (void)p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "mul_nn.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG54d: n * n in typeof orelse is multiplication, "
+		         "not pointer dereference — must not be rejected");
+		prism_free(&r);
+	}
+
+	// Sub-test 5: chained bracket orelse with multiplication in intermediate
+	{
+		const char *code =
+		    "void f(int m, int n) {\n"
+		    "    int arr[m orelse sizeof(int) * n orelse 4];\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "mul_chain.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG54e: chained bracket orelse with sizeof(int) * n intermediate "
+		         "is multiplication, not pointer dereference");
+		prism_free(&r);
+	}
+
+	// Sub-test 6: bracket array dim — hoisted path should still work
+	{
+		const char *code =
+		    "void f(int n) {\n"
+		    "    int arr[sizeof(int) * n orelse 4];\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "mul_bracket.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG54f-regression: sizeof(int) * n in bracket orelse "
+		         "(hoisted path) must succeed");
+		prism_free(&r);
+	}
+
+	// Sub-test 7: actual dereference *ptr must STILL be caught (no regression)
+	{
+		const char *code =
+		    "void f(int *ptr) {\n"
+		    "    typeof(int[*ptr orelse 4]) *p;\n"
+		    "    (void)p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "deref_real.c", prism_defaults());
+		// Must be rejected (double volatile deref) OR produce single-eval output
+		if (r.status == PRISM_OK && r.output) {
+			const char *typeof_start = strstr(r.output, "typeof(");
+			if (typeof_start) {
+				int count = 0;
+				const char *s = typeof_start;
+				while ((s = strstr(s, "ptr")) != NULL) {
+					if (s > typeof_start + 300) break;
+					count++;
+					s += 3;
+				}
+				CHECK(count <= 1,
+				      "BUG54g-regression: *ptr deref must not be duplicated in ternary");
+			}
+		} else {
+			CHECK(r.status != PRISM_OK,
+			      "BUG54g-regression: *ptr in typeof orelse correctly rejected");
+		}
+		prism_free(&r);
+	}
+}
+
+// BUG56: reject_orelse_side_effects fires on the assignment target BEFORE
+// determining whether the orelse action is bare-fallback (needs double-eval
+// of LHS) or control-flow (evaluates LHS once via if-guard).
+// arr[i++] = get() orelse return; should produce:
+//   { if (!(arr[i++] = get())) { return; } }
+// which evaluates arr[i++] exactly once — no double-eval.
+static void test_orelse_sideeffect_false_positive_on_action(void) {
+	{
+		const char *code =
+		    "int get_resource(void);\n"
+		    "void f(int *arr) {\n"
+		    "    int i = 0;\n"
+		    "    arr[i++] = get_resource() orelse return;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "sideeffect_action1.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "BUG56a: arr[i++] = get() orelse return must not be rejected "
+		      "(LHS evaluated once in if-guard pattern)");
+		prism_free(&r);
+	}
+	{
+		const char *code =
+		    "int get_resource(void);\n"
+		    "void f(int *arr) {\n"
+		    "    int i = 0;\n"
+		    "    arr[i++] = get_resource() orelse { return; };\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "sideeffect_action2.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "BUG56b: arr[i++] = get() orelse { return; } must not be rejected");
+		prism_free(&r);
+	}
+}
+
+// BUG57: const chained orelse with block action at end of chain:
+// handle_const_orelse_fallback emits the block inside a ternary as a GNU
+// statement expression — produces non-portable code and invalid C if the
+// block doesn't return a value.
+static void test_const_chained_orelse_block_action(void) {
+	const char *code =
+	    "int get_a(void);\n"
+	    "int get_b(void);\n"
+	    "void log_error(const char *);\n"
+	    "void f(void) {\n"
+	    "    const int x = get_a() orelse get_b() orelse { log_error(\"failed\"); };\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "const_chain_block.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		// Must NOT contain statement-expression pattern "( {" in a ternary
+		CHECK(strstr(r.output, "? __prism_oe") == NULL ||
+		      strstr(r.output, ": ( {") == NULL,
+		      "BUG57: const chained orelse must not emit block as statement "
+		      "expression inside ternary — produces non-portable/invalid C");
+	}
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -5239,4 +5559,11 @@ void run_orelse_tests(void) {
 
 	test_const_vm_type_orelse_double_eval();
 	test_atomic_vm_type_split_double_eval();
+
+	test_bracket_orelse_cast_deref_double_eval();
+
+	test_orelse_multiply_false_positive();
+
+	test_orelse_sideeffect_false_positive_on_action();
+	test_const_chained_orelse_block_action();
 }

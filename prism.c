@@ -1534,6 +1534,7 @@ static void reject_orelse_side_effects(Token *start, Token *end,
 				       bool check_asm, bool check_volatile_deref,
 				       bool check_indirect_call) {
 	int pd = 0;
+	Token *prev_tok = NULL;
 	for (Token *s = start; s && s != end && s->kind != TK_EOF; s = tok_next(s)) {
 		/* Track paren/bracket depth for the depth-0 comma check below. */
 		if (s->flags & TF_OPEN) { pd++; goto next_checks; }
@@ -1563,10 +1564,49 @@ static void reject_orelse_side_effects(Token *start, Token *end,
 		    tok_match(s) != end && tok_next(tok_match(s)) &&
 		    tok_next(tok_match(s)) != end && match_ch(tok_next(tok_match(s)), '('))
 			error_tok(s, "%s with an indirect call %s", ctx_msg, advice);
-		if (check_volatile_deref && match_ch(s, '*') && tok_next(s) &&
-		    is_valid_varname(tok_next(s)) && !is_type_keyword(tok_next(s)) &&
-		    tok_next(s) != end)
-			error_tok(s, "%s with pointer dereference %s", ctx_msg, advice);
+		if (check_volatile_deref && match_ch(s, '*') && tok_next(s) && tok_next(s) != end) {
+			/* Disambiguate unary * (dereference) from binary *
+			 * (multiplication) by examining the previous token.
+			 * Binary * follows a value-producing token: ), ], ident,
+			 * number, or string literal.
+			 * Unary * follows an operator, opening delimiter, keyword,
+			 * or nothing (start of expression). */
+			bool is_mul = false;
+			if (prev_tok) {
+				if (prev_tok->kind == TK_NUM || prev_tok->kind == TK_STR)
+					is_mul = true;
+				else if (prev_tok->kind == TK_IDENT && !is_type_keyword(prev_tok))
+					is_mul = true;
+				else if (match_ch(prev_tok, ']'))
+					is_mul = true;
+				else if (match_ch(prev_tok, ')') && (prev_tok->flags & TF_CLOSE)) {
+					/* ) from a cast means unary *, ) from a value
+					 * expression means binary *.  Peek inside the
+					 * matching ( — if it starts with a type keyword
+					 * it's likely a cast, unless preceded by
+					 * sizeof/alignof/offsetof. */
+					Token *om = tok_match(prev_tok);
+					if (om) {
+						Token *fi = tok_next(om);
+						bool looks_cast = fi && (
+						    is_type_keyword(fi) ||
+						    (fi->tag & (TT_QUALIFIER | TT_SUE | TT_TYPEOF)));
+						if (looks_cast) {
+							uint32_t oi = tok_idx(om);
+							if (oi >= 2 &&
+							    token_pool[oi - 1].flags & TF_SIZEOF)
+								is_mul = true;
+						} else {
+							is_mul = true;
+						}
+					}
+				}
+			}
+			if (!is_mul)
+				error_tok(s, "%s with pointer dereference %s",
+					  ctx_msg, advice);
+		}
+		prev_tok = s;
 	}
 }
 
@@ -3251,6 +3291,15 @@ static Token *handle_const_orelse_fallback(Token *tok,
 				tok = emit_goto_defer(tok);
 			}
 			OUT_LIT(" }");
+			break;
+		}
+
+		// Block-form action: emit as if-block, not as ternary.
+		if (match_ch(tok, '{')) {
+			OUT_LIT(" if (!__prism_oe_");
+			out_uint(oe_id);
+			OUT_LIT(")");
+			tok = walk_balanced(tok, true);
 			break;
 		}
 
@@ -5660,18 +5709,21 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 	}
 
 	// Error if LHS has side effects (double evaluation)
-	if (bare_assign_eq) {
+	// Only applies to bare-fallback path (ternary pattern evaluates LHS
+	// twice); control-flow/block actions use if-guard (single eval of LHS).
+
+	Token *after_orelse = tok_next(orelse_tok);
+	bool is_bare_fallback = bare_assign_eq && after_orelse &&
+		!(after_orelse->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
+		!match_ch(after_orelse, '{') && !match_ch(after_orelse, ';');
+
+	if (bare_assign_eq && is_bare_fallback) {
 		reject_orelse_side_effects(bare_lhs_start, bare_assign_eq,
 					  "orelse fallback on assignment",
 					  "in the target expression (double evaluation); "
 					  "use a temporary variable instead",
 					  true, false, true);
 	}
-
-	Token *after_orelse = tok_next(orelse_tok);
-	bool is_bare_fallback = bare_assign_eq && after_orelse &&
-		!(after_orelse->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
-		!match_ch(after_orelse, '{') && !match_ch(after_orelse, ';');
 
 	// Defense-in-depth: VLA cast in RHS (Phase 1D is primary check)
 	if (is_bare_fallback)
@@ -5932,13 +5984,26 @@ static Token *emit_deferred_orelse(Token *t, Token *end) {
 	if (match_ch(t, ';'))
 		error_tok(t, "expected statement after 'orelse'");
 
-	if (match_ch(t, '{')) {
-		Token *bclose = tok_match(t);
-		emit_tok(t); t = tok_next(t);
-		while (t && t != bclose && t->kind != TK_EOF) {
+	if (t->tag & (TT_BREAK | TT_CONTINUE | TT_GOTO)) {
+		// Control-flow action: emit keyword to semicolon.
+		// (return is rejected by Phase 1F in defer bodies.)
+		while (t && t->kind != TK_EOF && !match_ch(t, ';')) {
 			emit_tok(t); t = tok_next(t);
 		}
-		if (t == bclose) { emit_tok(t); t = tok_next(t); }
+		if (match_ch(t, ';')) { emit_tok(t); t = tok_next(t); }
+	} else if (t->tag & TT_RETURN) {
+		// Defense-in-depth: Phase 1F rejects return in defer bodies.
+		while (t && t->kind != TK_EOF && !match_ch(t, ';')) {
+			emit_tok(t); t = tok_next(t);
+		}
+		if (match_ch(t, ';')) { emit_tok(t); t = tok_next(t); }
+	} else if (match_ch(t, '{')) {
+		Token *bclose = tok_match(t);
+		emit_tok(t); t = tok_next(t);
+		// Process block body through emit_deferred_range for zeroinit/raw/orelse
+		emit_deferred_range(t, bclose);
+		t = bclose;
+		if (t) { emit_tok(t); t = tok_next(t); }
 	} else {
 		error_tok(orelse_tok, "orelse fallback requires an assignment target (use a declaration)");
 	}

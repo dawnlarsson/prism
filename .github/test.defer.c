@@ -3421,6 +3421,80 @@ static void test_defer_shadow_stmt_expr_bypass(void) {
 }
 #endif
 
+// BUG55: orelse break inside a loop inside a defer body — Phase 1F correctly
+// permits break (in_loop context), but emit_deferred_orelse's non-bare path
+// only handles '{' blocks and errors on control-flow keywords like break.
+static void test_defer_orelse_break_in_loop(void) {
+	const char *code =
+	    "int get_val(int);\n"
+	    "void f(int *arr, int n) {\n"
+	    "    defer {\n"
+	    "        for (int i = 0; i < n; i++) {\n"
+	    "            arr[i] = get_val(i) orelse break;\n"
+	    "        }\n"
+	    "    };\n"
+	    "    arr[0] = 1;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_orelse_break.c", prism_defaults());
+	CHECK(r.status == PRISM_OK,
+	      "BUG55: orelse break inside defer body loop must not be rejected");
+	prism_free(&r);
+}
+
+// BUG58: orelse block-form in defer body emits verbatim — bypasses zero-init,
+// raw-stripping, and nested orelse processing.
+static void test_defer_orelse_block_zeroinit_bypass(void) {
+	{
+		const char *code =
+		    "int get_handle(void);\n"
+		    "void use(int);\n"
+		    "void f(void) {\n"
+		    "    defer {\n"
+		    "        get_handle() orelse {\n"
+		    "            int cleanup_buf;\n"
+		    "            use(cleanup_buf);\n"
+		    "        };\n"
+		    "    };\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "defer_orelse_block_zi.c", prism_defaults());
+		if (r.status == PRISM_OK && r.output) {
+			bool has_zeroinit = strstr(r.output, "cleanup_buf = 0") != NULL ||
+					    strstr(r.output, "memset") != NULL;
+			CHECK(has_zeroinit,
+			      "BUG58a: defer orelse block must apply zero-init to decls");
+		} else {
+			CHECK(r.status == PRISM_OK,
+			      "BUG58a: defer orelse block transpilation must succeed");
+		}
+		prism_free(&r);
+	}
+	{
+		const char *code =
+		    "int get_handle(void);\n"
+		    "void use(int);\n"
+		    "void f(void) {\n"
+		    "    defer {\n"
+		    "        get_handle() orelse {\n"
+		    "            raw int raw_val;\n"
+		    "            use(raw_val);\n"
+		    "        };\n"
+		    "    };\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "defer_orelse_block_raw.c", prism_defaults());
+		if (r.status == PRISM_OK && r.output) {
+			// Check for "raw int" or "raw " preceding a type keyword — the
+			// raw keyword itself should be stripped.  The variable name
+			// "raw_val" legitimately contains "raw" so check specifically.
+			CHECK(strstr(r.output, "raw int") == NULL,
+			      "BUG58b: defer orelse block must strip raw keyword");
+		} else {
+			CHECK(r.status == PRISM_OK,
+			      "BUG58b: defer orelse block transpilation must succeed");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -3638,4 +3712,10 @@ void run_defer_tests(void) {
 	// Audit round 48: stmt-expr init bypasses defer shadow check
 	test_defer_shadow_stmt_expr_bypass();
 #endif
+
+	// BUG55: orelse break inside defer body loop
+	test_defer_orelse_break_in_loop();
+
+	// BUG58: orelse block-form in defer bypasses zero-init/raw
+	test_defer_orelse_block_zeroinit_bypass();
 }
