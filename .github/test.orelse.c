@@ -5234,6 +5234,68 @@ static void test_orelse_sideeffect_false_positive_on_action(void) {
 // handle_const_orelse_fallback emits the block inside a ternary as a GNU
 // statement expression — produces non-portable code and invalid C if the
 // block doesn't return a value.
+static void test_bare_orelse_vla_typedef_cast_bypass(void) {
+	printf("\n--- Bare orelse VLA typedef cast bypass ---\n");
+
+	// Bug: reject_bare_orelse_vla_cast scans for '[' inside cast parens
+	// to detect VLA casts, but a typedef aliasing a VLA (e.g. typedef int
+	// VLA_Type[n]) contains no '[' inside the cast. The scanner sees
+	// (VLA_Type*) and approves it. emit_bare_orelse_impl then emits
+	// __typeof__((VLA_Type*)trigger()) which is a variably-modified type,
+	// causing typeof to evaluate trigger() at runtime — double evaluation.
+
+	// Sub-test 1: VLA typedef pointer cast — must be rejected
+	{
+		const char *code =
+		    "void *trigger(void);\n"
+		    "void f(int n) {\n"
+		    "    typedef int VLA_Type[n];\n"
+		    "    VLA_Type *ptr;\n"
+		    "    ptr = (VLA_Type *)trigger() orelse 0;\n"
+		    "    (void)ptr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vla_td_cast1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "vla-typedef-cast: must be rejected (VM type in typeof)");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "VLA") != NULL,
+			      "vla-typedef-cast: error mentions VLA");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: Non-VLA typedef pointer cast — must NOT be rejected
+	{
+		const char *code =
+		    "void *trigger(void);\n"
+		    "typedef int Fixed[10];\n"
+		    "void f(void) {\n"
+		    "    Fixed *ptr;\n"
+		    "    ptr = (Fixed *)trigger() orelse 0;\n"
+		    "    (void)ptr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "fixed_td_cast.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "fixed-typedef-cast: valid (not VLA)");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: VLA typedef without pointer (bare VLA_Type cast) — must be rejected
+	{
+		const char *code =
+		    "void *trigger(void);\n"
+		    "void f(int n) {\n"
+		    "    typedef int VLA_Type[n];\n"
+		    "    void *ptr;\n"
+		    "    ptr = (VLA_Type)trigger() orelse 0;\n"
+		    "    (void)ptr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vla_td_cast3.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "vla-typedef-bare-cast: must be rejected (VM type in typeof)");
+		prism_free(&r);
+	}
+}
+
 static void test_const_chained_orelse_block_action(void) {
 	const char *code =
 	    "int get_a(void);\n"
@@ -5566,4 +5628,7 @@ void run_orelse_tests(void) {
 
 	test_orelse_sideeffect_false_positive_on_action();
 	test_const_chained_orelse_block_action();
+
+	// VLA typedef cast bypass in bare orelse
+	test_bare_orelse_vla_typedef_cast_bypass();
 }

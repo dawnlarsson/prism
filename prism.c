@@ -1635,8 +1635,17 @@ static void reject_bare_orelse_vla_cast(Token *rhs_start, Token *rhs_end,
 			continue;
 		Token *cast_close = tok_match(s);
 		if (!cast_close) continue;
-		// Scan inside cast parens for [dim] with non-constant dim
+		// Scan inside cast parens for VLA typedef names or [dim] with
+		// non-constant dim
 		for (Token *t = inner; t && t != cast_close; t = tok_next(t)) {
+			if (is_identifier_like(t) && is_vla_typedef(t))
+				error_tok(orelse_tok,
+					  "bare orelse with a VLA-type cast in the RHS "
+					  "causes double evaluation — 'typeof(RHS)' "
+					  "evaluates the operand at runtime for variably-"
+					  "modified types (ISO C11 6.7.2.5); hoist the "
+					  "cast result to a temporary variable before "
+					  "the orelse expression");
 			if (!match_ch(t, '[') || !(t->flags & TF_OPEN)) continue;
 			Token *bc = tok_match(t);
 			if (!bc) continue;
@@ -3440,7 +3449,7 @@ static OrelseDeclTargetInfo analyze_decl_orelse_target(Token *tok,
 		.has_const_qual = has_effective_const_qual(type_start, type, decl),
 		.is_struct_value = type->is_struct && !type->is_enum && !decl->is_pointer && !decl->is_array,
 	};
-	bool base_is_array = decl->is_array && !decl->paren_pointer;
+	bool base_is_array = decl->is_array && (!decl->paren_pointer || decl->paren_array);
 	if (!base_is_array && !decl->is_pointer && !decl->paren_pointer) {
 		for (Token *t = type_start; t && t != type->end; t = tok_next(t))
 			if (is_array_typedef(t)) { base_is_array = true; break; }
@@ -3637,7 +3646,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		// Step 4: Emit declarator & initializer
 		bool effective_vla = (decl.is_vla && (!decl.paren_pointer || decl.paren_array)) || (type->is_vla && !decl.is_pointer);
 		bool is_aggregate =
-		    decl.is_array || ((type->is_struct || type->is_typedef) && !decl.is_pointer);
+		    (decl.is_array && (!decl.paren_pointer || decl.paren_array)) || ((type->is_struct || type->is_typedef) && !decl.is_pointer);
 		// Function types (via typedef) cannot be initialized — skip zero-init entirely.
 		bool is_func_type = false;
 		if (!decl.is_pointer && !decl.is_array && !decl.is_func_ptr) {
@@ -7533,7 +7542,7 @@ uint16_t sid = next_scope_id++;
 					if (FEAT(F_ZEROINIT) && brace_depth > 0 && !has_init && !p1d_decl_raw &&
 					    !type.has_extern && !type.has_static &&
 					    type.has_register && type.has_atomic) {
-						bool p1_is_aggregate = decl.is_array ||
+						bool p1_is_aggregate = (decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
 							((type.is_struct || type.is_typedef) && !decl.is_pointer);
 						if (p1_is_aggregate)
 							error_tok(decl.var_name,

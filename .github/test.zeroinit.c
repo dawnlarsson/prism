@@ -2440,6 +2440,61 @@ static void test_typeof_func_decl_memset(void) {
 	}
 }
 
+// BUG: pointer-to-array declarators like int (*p)[4] were treated as
+// aggregates because is_array was set (the [4] describes the pointed-to
+// type, not the variable itself). This caused = {0} instead of = 0.
+static void test_ptr_to_array_scalar_zeroinit(void) {
+	printf("\n--- Pointer-to-array scalar zero-init ---\n");
+
+	// int (*p)[4] is a pointer → should get = 0, not = {0}
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int (*p)[4];\n"
+		    "    (void)p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "pta1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "ptr-to-array: transpile OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "(*p)[4] = 0") != NULL,
+			      "ptr-to-array: must use = 0 (scalar pointer)");
+			CHECK(strstr(r.output, "= {0}") == NULL,
+			      "ptr-to-array: must NOT use = {0}");
+		}
+		prism_free(&r);
+	}
+
+	// int *arr[4] is an array → should get = {0}
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int *arr[4];\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "pta2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "array-of-ptrs: transpile OK");
+		if (r.output)
+			CHECK(strstr(r.output, "= {0}") != NULL,
+			      "array-of-ptrs: must use = {0}");
+		prism_free(&r);
+	}
+
+	// int (*(r[4])) — array with extra parens → should get = {0}
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int (*(r[4]));\n"
+		    "    (void)r;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "pta3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "paren-array: transpile OK");
+		if (r.output)
+			CHECK(strstr(r.output, "= {0}") != NULL,
+			      "paren-array: must use = {0} (still an array)");
+		prism_free(&r);
+	}
+}
+
 // BUG59: stmt-expr inside control-flow conditions (if/while/for) must
 // get zero-init processing.  Previously, handle_open_brace treated the
 // stmt-expr `{` as a compound literal inside ctrl parens, bypassing all
@@ -2652,4 +2707,7 @@ void run_zeroinit_tests(void) {
 
 	// BUG59: stmt-expr zero-init inside control-flow conditions
 	test_stmt_expr_zeroinit_in_ctrl_cond();
+
+	// Pointer-to-array scalar zero-init (= 0 not = {0})
+	test_ptr_to_array_scalar_zeroinit();
 }
