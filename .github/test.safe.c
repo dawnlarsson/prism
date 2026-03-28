@@ -3610,8 +3610,9 @@ static void test_enum_shadow_vla(void) {
 			CHECK(strstr(r.output, "arr[SIZE] = {0}") == NULL &&
 			      strstr(r.output, "arr [ SIZE ] = { 0 }") == NULL,
 			      "enum shadow VLA: must not emit = {0} for VLA (use memset)");
-			CHECK(strstr(r.output, "memset") != NULL,
-			      "enum shadow VLA: must use memset for VLA zero-init");
+			CHECK(strstr(r.output, "memset") != NULL ||
+			      strstr(r.output, "__prism_p_") != NULL,
+			      "enum shadow VLA: must use memset/byte-loop for VLA zero-init");
 		}
 		prism_free(&r);
 	}
