@@ -3548,6 +3548,99 @@ static void test_orelse_goto_defer_sibling_scope(void) {
 	}
 }
 
+// BUG61: Phase 1D defer detection false positives on variables/members named "defer"
+static void test_defer_name_false_positive(void) {
+	printf("\n--- BUG61: defer name false positive ---\n");
+
+	// BUG61a: variable named "defer" with goto — must NOT get phantom "goto skips defer"
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int defer = 42;\n"
+		    "    goto skip;\n"
+		    "    defer;\n"
+		    "skip:\n"
+		    "    (void)defer;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug61a.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG61a: variable named 'defer' must not create phantom P1K_DEFER");
+		prism_free(&r);
+	}
+
+	// BUG61b: struct member ".defer" with goto — must NOT get phantom "goto skips defer"
+	{
+		const char *code =
+		    "struct Cfg { int defer; int val; };\n"
+		    "void f(void) {\n"
+		    "    struct Cfg c = {0};\n"
+		    "    int x = 0;\n"
+		    "    goto skip;\n"
+		    "    x = c.defer + 1;\n"
+		    "skip:\n"
+		    "    (void)x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug61b.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG61b: struct member '.defer' must not create phantom P1K_DEFER");
+		prism_free(&r);
+	}
+
+	// BUG61c: arrow member "->defer" with goto
+	{
+		const char *code =
+		    "struct Kf { int defer; };\n"
+		    "void f(void) {\n"
+		    "    struct Kf k = {0};\n"
+		    "    struct Kf *p = &k;\n"
+		    "    int x = 0;\n"
+		    "    goto skip;\n"
+		    "    x = p->defer + 1;\n"
+		    "skip:\n"
+		    "    (void)x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug61c.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG61c: arrow member '->defer' must not create phantom P1K_DEFER");
+		prism_free(&r);
+	}
+
+	// BUG61d: enum constant named "defer" with goto
+	{
+		const char *code =
+		    "enum Actions { defer = 1, cancel = 2 };\n"
+		    "void f(void) {\n"
+		    "    int x = 0;\n"
+		    "    goto skip;\n"
+		    "    x = defer;\n"
+		    "skip:\n"
+		    "    (void)x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug61d.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG61d: enum constant named 'defer' must not create phantom P1K_DEFER");
+		prism_free(&r);
+	}
+
+	// BUG61e: member "defer" in setjmp function — must NOT false-trigger taint error
+	{
+		const char *code =
+		    "#include <setjmp.h>\n"
+		    "struct Kf { int defer; };\n"
+		    "void f(void) {\n"
+		    "    jmp_buf buf;\n"
+		    "    struct Kf kf = {0};\n"
+		    "    if (setjmp(buf)) return;\n"
+		    "    int x = kf.defer + 5;\n"
+		    "    (void)x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug61e.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG61e: '.defer' in setjmp function must not trigger taint error");
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -3774,4 +3867,7 @@ void run_defer_tests(void) {
 
 	// BUG60: goto in orelse missing p1_goto_exits defer cleanup
 	test_orelse_goto_defer_sibling_scope();
+
+	// BUG61: Phase 1D defer detection false positives on variables/members named "defer"
+	test_defer_name_false_positive();
 }

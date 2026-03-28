@@ -7004,8 +7004,8 @@ uint16_t sid = next_scope_id++;
 				if ((tok->tag & TT_GOTO) && !is_known_typedef(tok) &&
 				    tok_next(tok) && match_ch(skip_noise(tok_next(tok)), '*'))
 					func_meta[p1d_cur_func].has_computed_goto = true;
-				if ((tok->tag & TT_DEFER) && !is_known_typedef(tok) &&
-				    !(p1d_prev && (p1d_prev->tag & TT_GOTO)) &&
+				if ((tok->tag & TT_DEFER) && !typedef_lookup(tok) &&
+				    !(p1d_prev && (p1d_prev->tag & (TT_GOTO | TT_MEMBER))) &&
 				    tok_next(tok) && !match_ch(tok_next(tok), ':') &&
 				    !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN))) {
 					// Context validation (moved from Pass 2 handle_defer_keyword)
@@ -7058,7 +7058,7 @@ uint16_t sid = next_scope_id++;
 						// Detect defer inside control-flow condition parens
 						if (p1d_cur_func >= 0 && p1d_prev_saved &&
 						    (p1d_prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
-						    (inner->tag & TT_DEFER) && !is_known_typedef(inner) &&
+						    (inner->tag & TT_DEFER) && !typedef_lookup(inner) &&
 						    !(prev_inner && (prev_inner->tag & TT_MEMBER)) &&
 						    tok_next(inner) && !match_ch(tok_next(inner), ':') &&
 						    !(tok_next(inner) && (tok_next(inner)->tag & TT_ASSIGN)) &&
@@ -7327,7 +7327,7 @@ uint16_t sid = next_scope_id++;
 				func_meta[p1d_cur_func].has_computed_goto = true;
 
 			// Defer detection
-			if ((tok->tag & TT_DEFER) && !is_known_typedef(tok) &&
+			if ((tok->tag & TT_DEFER) && !typedef_lookup(tok) &&
 			    tok_next(tok) && !match_ch(tok_next(tok), ':') &&
 			    !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN))) {
 				p1_try_alloc_defer(tok, cur_sid, p1d_cur_func);
@@ -7360,7 +7360,7 @@ uint16_t sid = next_scope_id++;
 		}
 
 		// == Phase 1F: defer body validation ==
-		if ((tok->tag & TT_DEFER) && !is_known_typedef(tok) &&
+		if ((tok->tag & TT_DEFER) && !typedef_lookup(tok) &&
 		    tok_next(tok) && !match_ch(tok_next(tok), ':') &&
 		    !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN))) {
 			// Context validation (moved from Pass 2 handle_defer_keyword)
