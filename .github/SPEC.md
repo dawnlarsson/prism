@@ -79,7 +79,6 @@ Flag definitions:
 |---|---|---|
 | `P1_SCOPE_LOOP` | 1 | This `{` opens a loop body |
 | `P1_SCOPE_SWITCH` | 2 | This `{` opens a switch body |
-| `P1_SCOPE_CONDITIONAL` | 3 | This `{` opens a conditional body |
 | `P1_OE_BRACKET` | 4 | `orelse` inside array dimension brackets `[…]` |
 | `P1_OE_DECL_INIT` | 5 | `orelse` inside a declaration initializer |
 | `P1_IS_DECL` | 6 | Phase 1D: token starts a variable declaration |
@@ -203,7 +202,7 @@ Walks all tokens. On every `{`, assigns a new `scope_id`, records `parent_id` fr
 
 **C23 attribute backward walk:** When walking backward to find `prev`, the loop skips `]]` C23 attributes by checking `tok_match(])->flags & TF_C23_ATTR` (the `TF_C23_ATTR` flag is set on the opening `[`, not the closing `]`). This ensures `void f(void) [[gnu::cold]] {` correctly finds `)` as `prev` and classifies it as `is_func_body`.
 
-Writes `P1_SCOPE_LOOP`, `P1_SCOPE_SWITCH`, `P1_SCOPE_CONDITIONAL`, `P1_SCOPE_INIT` flags to the `{` token's `ann` field.
+Writes `P1_SCOPE_LOOP`, `P1_SCOPE_SWITCH`, `P1_SCOPE_INIT` flags to the `{` token's `ann` field.
 
 ---
 
@@ -444,7 +443,7 @@ Defers execute in LIFO order at scope exit — whether via `return`, `break`, `c
 
 For `goto`: the handler looks up the target label's scope depth, then emits defers from the current scope level down to the target's level.
 
-Scope exits between a goto and its target label are pre-computed during Phase 2A via `scope_block_exits` (an O(depth) LCA tree walk on the scope tree) and stored in `P1FuncEntry.label.exits`. Pass 2 retrieves these via `p1_goto_exits` using a monotonic cursor through the goto entries (O(1) amortized). This replaces the former `goto_scope_exits` O(N) token-stream scan.
+Scope exits between a goto and its target label are pre-computed during Phase 2A via `scope_block_exits` (an O(depth) LCA tree walk on the scope tree) and stored in `P1FuncEntry.label.exits`. Pass 2 retrieves these via `p1_goto_exits` using a monotonic cursor through the goto entries (O(1) amortized).
 
 For `return`: emits all defers from the current scope to function scope. Uses `ret_counter` to generate unique labels for cleanup blocks.
 
@@ -769,7 +768,7 @@ These are inherently runtime and cannot move to Pass 1:
 ## 14. Invariants
 
 1. **Immutable symbol table:** After Phase 1B completes, the typedef table is frozen. Pass 2 performs zero mutations to the typedef table, scope tree, token annotations (`ann`), or `func_meta`.
-2. **All errors before emission:** Every user-triggerable `error_tok` call from semantic analysis fires during Pass 1 or Phase 2A, before Pass 2 emits its first byte, with one documented exception: `check_defer_shadow_at_exit` requires runtime scope-stack state that only exists during Pass 2 control-flow exit emission. Same-block defer shadows (variable declared after a defer in the same scope) are detected immediately at declaration time in `check_defer_var_shadow` and do not rely on `check_defer_shadow_at_exit`. Pass 2 contains additional defensive `error_tok` calls in `process_declarators`, `emit_bare_orelse_impl`, `emit_orelse_action`, etc. that serve as unreachable-by-design assertions — they guard against internal inconsistencies that would indicate a Pass 1 gap, not against user input that should have been caught earlier. Phase 1D detects: array orelse, struct value orelse, compound-assign bare orelse, bare orelse without assignment target, and VLA-type cast in bare orelse RHS. The preprocessor boundary check in `emit_bare_orelse_impl` is unreachable because the tokenizer evaluates `#ifdef`/`#if` conditionals, excluding dead-branch tokens.
+2. **All errors before emission:** Every user-triggerable `error_tok` call from semantic analysis fires during Pass 1 or Phase 2A, before Pass 2 emits its first byte, with one documented exception: `check_defer_shadow_at_exit` requires runtime scope-stack state that only exists during Pass 2 control-flow exit emission. Same-block defer shadows (variable declared after a defer in the same scope) are detected immediately at declaration time in `check_defer_var_shadow` and do not rely on `check_defer_shadow_at_exit`. Pass 2 contains additional defensive `error_tok` calls in `process_declarators`, `emit_bare_orelse_impl`, `emit_orelse_action`, etc. that serve as unreachable-by-design assertions — they guard against internal inconsistencies that would indicate a Pass 1 gap, not against user input that should have been caught earlier. Phase 1D detects: array orelse, struct value orelse, compound-assign bare orelse, bare orelse without assignment target, and VLA-type cast in bare orelse RHS. The preprocessor boundary check in `emit_bare_orelse_impl` is unreachable in CLI mode (input arrives from `cc -E` with conditionals already resolved) but reachable in Library Mode (`prism_transpile_source`), where raw un-preprocessed source may contain `#ifdef`/`#if` tokens.
 3. **O(N) CFG verification:** `p1_verify_cfg` is guaranteed linear in the number of P1FuncEntry items per function. No O(N²) pairwise scans.
 4. **Delimiter matching completeness:** Every `(`, `[`, `{` has a `match_idx`. Every `)`, `]`, `}` points back. No unmatched delimiters survive tokenization.
 5. **Self-host fixed point:** Stage 1 and Stage 2 transpiled C output is identical.

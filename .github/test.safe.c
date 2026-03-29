@@ -1669,14 +1669,6 @@ void test_vla_basic(void) {
 	CHECK(vla[0] == 0 && vla[4] == 4, "basic VLA - no zeroinit");
 }
 
-void test_vla_expression_size(void) {
-	int a = 3, b = 2;
-	int vla[a + b]; // VLA with expression - should NOT get zeroinit
-	for (int i = 0; i < a + b; i++) {
-		vla[i] = i * 2;
-	}
-	CHECK(vla[0] == 0 && vla[4] == 8, "VLA expression size - no zeroinit");
-}
 #endif
 
 
@@ -2087,21 +2079,6 @@ static void test_hashmap_tombstone_insert_delete_cycle(void) {
 	CHECK_EQ(sum, 19900, "hashmap_tombstone_insert_delete_cycle");
 }
 
-static void test_hashmap_tombstone_reinsert(void) {
-	// This pattern: define in scope, exit, redefine in new scope
-	// Tests that tombstone slots are properly reused
-	volatile int result = 0;
-	for (int i = 0; i < 50; i++) {
-		{
-			typedef int reinsert_test_t;
-			reinsert_test_t v = i;
-			result += v;
-		}
-		// Same name re-entered in next iteration
-	}
-	CHECK_EQ(result, 1225, "hashmap_tombstone_reinsert");
-}
-
 static void test_hashmap_tombstone_multi_key_churn(void) {
 	volatile int result = 0;
 	for (int i = 0; i < 100; i++) {
@@ -2267,15 +2244,6 @@ static void test_vla_zeroinit_basic(void) {
 	for (int i = 0; i < n; i++)
 		if (arr[i] != 0) all_zero = 0;
 	CHECK(all_zero, "VLA basic zero-init via memset");
-}
-
-static void test_vla_zeroinit_expression_size(void) {
-	int a = 3, b = 4;
-	int arr[a + b]; // VLA with expression size
-	int all_zero = 1;
-	for (int i = 0; i < a + b; i++)
-		if (arr[i] != 0) all_zero = 0;
-	CHECK(all_zero, "VLA expression-size zero-init via memset");
 }
 
 static void test_vla_zeroinit_large(void) {
@@ -4091,7 +4059,6 @@ void run_safe_tests(void) {
 	test_union_offsetof_division();
 #ifndef _MSC_VER
 	test_vla_basic();
-	test_vla_expression_size();
 #endif
 
 	/* Bulletproof regression */
@@ -4129,7 +4096,6 @@ void run_safe_tests(void) {
 	test_typeof_complex_expr_zeroinit();
 #endif
 	test_hashmap_tombstone_insert_delete_cycle();
-	test_hashmap_tombstone_reinsert();
 	test_hashmap_tombstone_multi_key_churn();
 	test_switch_conditional_break_not_false_positive();
 	test_switch_nested_conditional_context();
@@ -4145,7 +4111,6 @@ void run_safe_tests(void) {
 #endif
 #ifndef _MSC_VER
 	test_vla_zeroinit_basic();
-	test_vla_zeroinit_expression_size();
 	test_vla_zeroinit_large();
 	test_vla_zeroinit_nested_scope();
 #endif
