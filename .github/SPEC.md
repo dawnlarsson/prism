@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3661+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3686+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -328,6 +328,8 @@ Rejected patterns inside defer bodies:
 - `break` / `continue` (since `in_loop=false, in_switch=false`, these always error)
 - Recurses into GNU statement expressions `({…})` — `return`/`goto`/`break`/`continue` inside a stmt-expr in a defer body is rejected
 
+**Case/default label scanning:** When `validate_defer_statement` encounters a `case` or `default` label, it scans forward to the terminating `:` using ternary depth tracking (`?` increments, `:` at `td > 0` decrements, `:` at `td == 0` terminates). This correctly handles `case 1 ? 2 : 3:` — matching the pattern used by Phase 1D and `skip_one_stmt`.
+
 **Forbidden function contexts:** Defer in functions that use `setjmp`/`longjmp`, `vfork`, or `asm goto` (computed labels inside assembly) is rejected via `TT_SPECIAL_FN`/`TT_NORETURN_FN`/`TT_ASM` tag bits on the function body's opening `{` token (checked as `func_meta[idx].body_open->tag`). The `TT_SPECIAL_FN` taint covers all standard and implementation-internal variants that survive preprocessing: `setjmp`, `_setjmp`, `__setjmp`, `__sigsetjmp`, `longjmp`, `_longjmp`, `__longjmp`, `__siglongjmp`, `__longjmp_chk`, `sigsetjmp`, `siglongjmp`, `__builtin_setjmp`, `__builtin_longjmp`, `__builtin_setjmp_receive`, `pthread_exit`, `savectx`. Detection is token-name-based: even bare references like `void (*fp)(jmp_buf, int) = longjmp;` taint the function because the `longjmp` token retains its `TT_SPECIAL_FN` tag. The only undetectable bypass is a function pointer passed from another translation unit (cross-TU indirect call), which is inherent to single-TU static analysis.
 
 ---
@@ -448,7 +450,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 ### Defer-variable shadow checking
 
-`check_defer_var_shadow` detects when a newly-declared variable name appears in an active defer body — this would silently capture the wrong variable at cleanup time. Uses `FuncMeta.defer_name_bloom` (a 64-bit FNV-1a bloom filter of all identifier names in defer bodies) for an O(1) fast-reject before the O(N×M) body walk — eliminates the walk in the common case when no name matches. The body walk tracks brace depth: identifiers inside nested `{ }` blocks within the defer body (depth > 1) are skipped, since they are local declarations that cannot conflict with outer-scope variables. This avoids false positives for patterns like `defer { { int tmp = 1; } }` where the inner `tmp` is purely internal to the defer body.
+`check_defer_var_shadow` detects when a newly-declared variable name appears in an active defer body — this would silently capture the wrong variable at cleanup time. Uses `FuncMeta.defer_name_bloom` (a 64-bit FNV-1a bloom filter of all identifier names in defer bodies) for an O(1) fast-reject before the O(N×M) body walk — eliminates the walk in the common case when no name matches. The body walk tracks brace depth: identifiers inside nested `{ }` blocks within the defer body (depth > 1) are skipped, since they are local declarations that cannot conflict with outer-scope variables. This avoids false positives for patterns like `defer { { int tmp = 1; } }` where the inner `tmp` is purely internal to the defer body. The scanner also tracks C99 for-init declarations (`for(TYPE name = ...)`) via `for_init_pd`/`for_name_hid`/`for_body_bd`: when a for-init variable matches the target name, all references to that name within the for scope (condition, increment, and body) are treated as local rather than captured, preventing false positives.
 
 `check_enum_typedef_defer_shadow` extends this protection to enum constants and typedef names. Called from the main Pass 2 loop at statement-start for enum definitions (`enum { name = val, ... }`) and typedef declarations (`typedef type name`), which bypass `process_declarators` and would otherwise evade shadow detection. Each introduced name is checked against active defer bodies via `check_defer_var_shadow`.
 

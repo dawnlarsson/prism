@@ -1212,19 +1212,44 @@ static void check_defer_var_shadow(Token *var_name) {
 		bool in_decl = false; // true when scanning tokens after a type keyword (declaration context)
 		bool was_in_decl = false; // true if a type keyword appeared in this statement (survives '=')
 		int decl_bd = 0; // brace depth where in_decl was set
+		int for_init_pd = -1; // paren depth inside active for-init; -1 = inactive
+		bool for_name_hid = false; // true if for-init declared our target name
+		int for_body_bd = -1; // brace depth at the for statement level
 		for (Token *t = defer_stack[i].stmt; t && t != defer_stack[i].end && t->kind != TK_EOF;
 		     prev = t, t = tok_next(t)) {
 			if (match_ch(t, '{')) { brace_depth++; continue; }
 			if (match_ch(t, '}')) {
 				brace_depth--;
+				if (for_name_hid && brace_depth == for_body_bd)
+					for_name_hid = false;
 				if (decl_depth >= 0 && brace_depth < decl_depth)
 					decl_depth = -1; // local var went out of scope
 				if (in_decl && brace_depth < decl_bd) in_decl = false;
 				continue;
 			}
-			if (match_ch(t, '(') || match_ch(t, '[')) { paren_depth++; continue; }
-			if (match_ch(t, ')') || match_ch(t, ']')) { paren_depth--; continue; }
-			if (match_ch(t, ';')) { in_decl = false; was_in_decl = false; continue; }
+			if (match_ch(t, '(') || match_ch(t, '[')) {
+				if (match_ch(t, '(') && prev && prev->kind == TK_KEYWORD &&
+				    (prev->tag & TT_LOOP) && prev->len == 3 &&
+				    !memcmp(tok_loc(prev), "for", 3))
+					for_init_pd = paren_depth + 1;
+				paren_depth++;
+				continue;
+			}
+			if (match_ch(t, ')') || match_ch(t, ']')) {
+				paren_depth--;
+				if (for_init_pd >= 0 && paren_depth < for_init_pd)
+					for_init_pd = -1;
+				continue;
+			}
+			if (match_ch(t, ';')) {
+				in_decl = false; was_in_decl = false;
+				if (for_init_pd >= 0 && paren_depth == for_init_pd)
+					for_init_pd = -1;
+				if (for_name_hid && for_init_pd < 0 && paren_depth == 0 &&
+				    brace_depth == for_body_bd)
+					for_name_hid = false;
+				continue;
+			}
 			// '=' transitions from declarator to initializer expression.
 			// RHS identifiers are references, not declaration targets.
 			if (paren_depth == 0 && match_ch(t, '=')) { in_decl = false; continue; }
@@ -1235,7 +1260,9 @@ static void check_defer_var_shadow(Token *var_name) {
 			// Track declaration context: type keywords, qualifiers, SUE tags.
 			// Only at paren_depth 0 — type keywords inside casts like
 			// (struct X *) must not set in_decl (they're not declarations).
-			if (brace_depth > 1 && paren_depth == 0 &&
+			// Exception: for-init context for(TYPE ...) at for_init_pd.
+			if (((brace_depth > 1 && paren_depth == 0) ||
+			     (for_init_pd >= 0 && paren_depth == for_init_pd)) &&
 			    (is_type_keyword(t) || (t->tag & (TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_TYPEDEF)))) {
 				in_decl = true;
 				was_in_decl = true;
@@ -1245,6 +1272,9 @@ static void check_defer_var_shadow(Token *var_name) {
 			if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
 			    !(prev && (prev->tag & TT_MEMBER)) &&
 			    t->len == nlen && !memcmp(tok_loc(t), name, nlen)) {
+				// For-init local: skip all occurrences within the for scope
+				if (for_name_hid)
+					continue;
 				// At depth > 1: skip if name is locally declared in this block
 				if (brace_depth > 1 && decl_depth >= 0 && brace_depth >= decl_depth)
 					continue;
@@ -1252,6 +1282,12 @@ static void check_defer_var_shadow(Token *var_name) {
 				// but NOT inside parens (typeof/sizeof/cast argument is not a decl target)
 				if (brace_depth > 1 && in_decl && paren_depth == 0) {
 					decl_depth = brace_depth;
+					continue;
+				}
+				// For-init declaration: mark name as hidden for the for scope
+				if (for_init_pd >= 0 && in_decl) {
+					for_name_hid = true;
+					for_body_bd = brace_depth;
 					continue;
 				}
 				if (defer_shadow_count >= defer_shadow_cap) {
@@ -4258,12 +4294,16 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 	}
 
 	if (tok->tag & (TT_CASE | TT_DEFAULT)) {
-		while (tok && tok->kind != TK_EOF && !match_ch(tok, ':')) {
+		int td = 0;
+		for (tok = tok_next(tok); tok && tok->kind != TK_EOF; tok = tok_next(tok)) {
 			if (tok->flags & TF_OPEN) {
 				if (match_ch(tok, '(') || match_ch(tok, '['))
 					defer_scan_hidden_stmt_exprs(tok, in_loop, in_switch, depth);
-				tok = tok_match(tok) ? tok_next(tok_match(tok)) : tok_next(tok);
-			} else tok = tok_next(tok);
+				tok = tok_match(tok) ? tok_match(tok) : tok;
+				continue;
+			}
+			if (match_ch(tok, '?')) { td++; continue; }
+			if (match_ch(tok, ':')) { if (td > 0) { td--; continue; } break; }
 		}
 		return tok && match_ch(tok, ':') ? validate_defer_statement(tok_next(tok), in_loop, in_switch, depth + 1) : tok;
 	}

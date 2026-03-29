@@ -4169,6 +4169,194 @@ static void test_defer_shadow_typedef_enum_bypass(void) {
 	}
 }
 
+// BUG73: validate_defer_statement case/default scanner lacks ternary depth
+// tracking: case EXPR ? X : Y: allows the ternary ':' to be misidentified
+// as the case label colon, causing the real body (after the label ':') to
+// escape Phase 1F validation. return/goto/break silently emitted.
+static void test_defer_case_ternary_desync(void) {
+	printf("\n--- BUG73: case ternary desync in validate_defer_statement ---\n");
+
+	// Sub-test 1: return after ternary case label must be caught
+	{
+		const char *code =
+		    "void f(int x) {\n"
+		    "    defer {\n"
+		    "        switch (x) {\n"
+		    "            case 1 ? 0 : 0:\n"
+		    "                return;\n"
+		    "        }\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug73a.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG73: return after ternary case label must be caught by Phase 1F");
+		CHECK(r.error_msg && strstr(r.error_msg, "return"),
+		      "BUG73: error mentions 'return'");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: goto after ternary case must also be caught
+	{
+		const char *code =
+		    "void f(int x) {\n"
+		    "    defer {\n"
+		    "        switch (x) {\n"
+		    "            case (1 ? 2 : 3):\n"
+		    "                goto end;\n"
+		    "        }\n"
+		    "    }\n"
+		    "    end: ;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug73b.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG73: goto after parenthesized ternary case must be caught");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: valid ternary in case without control flow — must succeed
+	{
+		const char *code =
+		    "#include <stdio.h>\n"
+		    "void f(int x) {\n"
+		    "    defer {\n"
+		    "        switch (x) {\n"
+		    "            case 1 ? 42 : 0:\n"
+		    "                printf(\"ok\\n\");\n"
+		    "                break;\n"
+		    "        }\n"
+		    "    }\n"
+		    "}\n"
+		    "int main(void) { f(42); return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "bug73c.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG73: valid ternary case without control flow must succeed");
+		prism_free(&r);
+	}
+
+	// Sub-test 4: nested ternary in case — both colons consumed before label
+	{
+		const char *code =
+		    "void f(int x) {\n"
+		    "    defer {\n"
+		    "        switch (x) {\n"
+		    "            case (1 ? (2 ? 3 : 4) : 5):\n"
+		    "                return;\n"
+		    "        }\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug73d.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG73: return after nested ternary case must be caught");
+		prism_free(&r);
+	}
+}
+
+// BUG74: check_defer_var_shadow false positive on for-init declarations.
+// for(int x = ...) inside a defer body at paren_depth > 0 was treated as a
+// captured reference instead of a local declaration, causing spurious shadow
+// errors when an outer variable with the same name was declared after the defer.
+static void test_defer_shadow_for_init_false_positive(void) {
+	printf("\n--- BUG74: defer shadow for-init false positive ---\n");
+
+	// Sub-test 1: for-init in defer body — must NOT false-positive
+	{
+		const char *code =
+		    "void use(int x);\n"
+		    "int f(void) {\n"
+		    "    defer {\n"
+		    "        for (int x = 0; x < 3; x++) {\n"
+		    "            use(x);\n"
+		    "        }\n"
+		    "    }\n"
+		    "    { int x = 99; (void)x; return 0; }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug74a.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG74: for-init in defer body must not false-positive on shadow");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: braceless for body — must NOT false-positive
+	{
+		const char *code =
+		    "void use(int x);\n"
+		    "int f(void) {\n"
+		    "    defer {\n"
+		    "        for (int x = 0; x < 3; x++)\n"
+		    "            use(x);\n"
+		    "    }\n"
+		    "    { int x = 99; (void)x; return 0; }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug74b.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG74: braceless for body must not false-positive");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: nested for with same name — must NOT false-positive
+	{
+		const char *code =
+		    "void use(int x);\n"
+		    "int f(void) {\n"
+		    "    defer {\n"
+		    "        for (int x = 0; x < 3; x++) {\n"
+		    "            for (int x = 0; x < 5; x++) {\n"
+		    "                use(x);\n"
+		    "            }\n"
+		    "        }\n"
+		    "    }\n"
+		    "    { int x = 99; (void)x; return 0; }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug74c.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG74: nested for-init same name must not false-positive");
+		prism_free(&r);
+	}
+
+	// Sub-test 4: genuine capture AFTER for loop — must still be caught
+	{
+		const char *code =
+		    "void use(int x);\n"
+		    "int f(void) {\n"
+		    "    int x = 42;\n"
+		    "    defer {\n"
+		    "        for (int x = 0; x < 3; x++) {\n"
+		    "            use(x);\n"
+		    "        }\n"
+		    "        use(x);\n"
+		    "    }\n"
+		    "    { int x = 99; (void)x; return 0; }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug74d.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG74: genuine capture after for loop must still be caught");
+		CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
+		      "BUG74: error mentions 'shadows'");
+		prism_free(&r);
+	}
+
+	// Sub-test 5: genuine capture INSIDE for body — must still be caught
+	{
+		const char *code =
+		    "void use(int x);\n"
+		    "int f(void) {\n"
+		    "    int y = 42;\n"
+		    "    defer {\n"
+		    "        for (int x = 0; x < 3; x++) {\n"
+		    "            use(y);\n"
+		    "        }\n"
+		    "    }\n"
+		    "    { int y = 99; (void)y; return 0; }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug74e.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG74: genuine capture inside for body must still be caught");
+		CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
+		      "BUG74: error mentions 'shadows'");
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -4423,4 +4611,10 @@ void run_defer_tests(void) {
 
 	// BUG72: typedef enum wrapping bypasses defer shadow check
 	test_defer_shadow_typedef_enum_bypass();
+
+	// BUG73: case ternary ?: desync in validate_defer_statement
+	test_defer_case_ternary_desync();
+
+	// BUG74: for-init declaration in defer body false positive shadow
+	test_defer_shadow_for_init_false_positive();
 }
