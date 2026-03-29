@@ -1197,14 +1197,29 @@ static void check_defer_var_shadow(Token *var_name) {
 	int outer_defer_end = blk->defer_start_idx;
 	if (in_for_init() && outer_defer_end <= 0)
 		outer_defer_end = defer_count;
-	if (outer_defer_end <= 0) return;
+	int same_block_start = blk->defer_start_idx; // defers in current block
+	if (outer_defer_end <= 0 && same_block_start >= defer_count) return;
 	char *name = tok_loc(var_name);
 	int nlen = var_name->len;
 	// Phase 1 bloom filter: skip if the name definitely doesn't appear in any defer body
 	if (current_func_idx >= 0 &&
 	    !(func_meta[current_func_idx].defer_name_bloom & defer_name_bloom_bit(name, nlen)))
 		return;
-	for (int i = 0; i < outer_defer_end; i++) {
+	// Scan range: enclosing-scope defers [0, outer_defer_end) plus
+	// same-block defers [same_block_start, defer_count).  Same-block
+	// shadows are unconditionally fatal: the variable is always live
+	// when the defer fires at block end.
+	for (int i = 0; i < defer_count; i++) {
+		if (i >= outer_defer_end && i < same_block_start)
+			continue; // skip gap between enclosing and same-block ranges
+		// Skip if the variable is declared inside this defer's own body
+		// (e.g., defer { char buf[16]; ... } — buf is local to the defer,
+		// not a shadowing outer declaration).
+		uint32_t var_idx = tok_idx(var_name);
+		uint32_t stmt_idx = tok_idx(defer_stack[i].stmt);
+		uint32_t end_idx = defer_stack[i].end ? tok_idx(defer_stack[i].end) : UINT32_MAX;
+		if (var_idx >= stmt_idx && var_idx < end_idx)
+			continue;
 		Token *prev = NULL;
 		int brace_depth = 0;
 		int paren_depth = 0;
@@ -1297,6 +1312,16 @@ static void check_defer_var_shadow(Token *var_name) {
 					defer_shadows = tmp;
 					defer_shadow_cap = new_cap;
 				}
+				// Same-block defers: the shadow is always live when
+				// the defer fires at block end — error immediately.
+				// Exception: for-init variables have implicit scope
+				// limited to the loop; they use deferred checking.
+				if (i >= same_block_start && !in_for_init())
+					error_tok(var_name,
+						  "variable '%.*s' shadows a name captured "
+						  "by a defer in the same scope; the defer "
+						  "body would bind to the shadowing variable",
+						  nlen, name);
 				defer_shadows[defer_shadow_count++] = (DeferShadow){
 						.name = name, .len = nlen,
 						.block_depth = ctx->block_depth + (in_for_init() ? 1 : 0),
@@ -7546,6 +7571,16 @@ uint16_t sid = next_scope_id++;
 			}
 			if (type.saw_type) {
 				bool p1d_annotated = false;
+				// Phase 1D: bound braceless control-flow body declarations.
+				// C23 labeled declarations (L: int x;) can serve as braceless
+				// if/while/for/do bodies.  The variable's scope ends at the
+				// statement semicolon, not the enclosing block's '}'.
+				uint32_t braceless_close_idx = 0;
+				if (p1d_ctrl_pending) {
+					Token *stmt_end = skip_one_stmt(p1d_type_tok, 0);
+					if (stmt_end)
+						braceless_close_idx = tok_idx(stmt_end);
+				}
 				Token *t = type.end;
 				while (t && !match_ch(t, ';') && !match_ch(t, '{') && t->kind != TK_EOF) {
 					// Per-declarator 'raw' skip (int x, raw arr[n];)
@@ -7644,6 +7679,7 @@ uint16_t sid = next_scope_id++;
 						e->decl.is_vla = type.is_vla || decl.is_vla;
 						e->decl.has_raw = p1d_decl_raw;
 						e->decl.is_static_storage = p1d_saw_static || type.has_static || type.has_extern;
+						e->decl.body_close_idx = braceless_close_idx;
 					}
 
 					// Phase 1D: reject register _Atomic aggregate

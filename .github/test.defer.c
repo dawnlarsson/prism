@@ -4255,6 +4255,80 @@ static void test_defer_case_ternary_desync(void) {
 // for(int x = ...) inside a defer body at paren_depth > 0 was treated as a
 // captured reference instead of a local declaration, causing spurious shadow
 // errors when an outer variable with the same name was declared after the defer.
+static void test_defer_same_block_shadow_hijack(void) {
+	printf("\n--- BUG75: same-block defer shadow hijack ---\n");
+
+	// Sub-test 1: same-block shadow — must be rejected (silent miscompilation)
+	{
+		const char *code =
+		    "void use(int x);\n"
+		    "int global_x = 1;\n"
+		    "void f(void) {\n"
+		    "    defer use(global_x);\n"
+		    "    int global_x = 2;\n"
+		    "    (void)global_x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug75a.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG75a: same-block defer shadow must be rejected");
+		CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
+		      "BUG75a: error mentions 'shadows'");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: same-block shadow with explicit return — must be rejected
+	{
+		const char *code =
+		    "void use(int x);\n"
+		    "int global_x = 1;\n"
+		    "int f(void) {\n"
+		    "    defer use(global_x);\n"
+		    "    int global_x = 2;\n"
+		    "    (void)global_x;\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug75b.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG75b: same-block shadow with return must be rejected");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: inner-block shadow (no exit) — must be ACCEPTED
+	// Inner variable goes out of scope at } before outer defer fires.
+	{
+		const char *code =
+		    "void use(int x);\n"
+		    "int global_x = 1;\n"
+		    "void f(void) {\n"
+		    "    defer use(global_x);\n"
+		    "    {\n"
+		    "        int global_x = 2;\n"
+		    "        (void)global_x;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug75c.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG75c: inner-block shadow without exit must be accepted");
+		prism_free(&r);
+	}
+
+	// Sub-test 4: same-block block-form defer — must be rejected
+	{
+		const char *code =
+		    "void use(int x);\n"
+		    "int global_x = 1;\n"
+		    "void f(void) {\n"
+		    "    defer { use(global_x); }\n"
+		    "    int global_x = 2;\n"
+		    "    (void)global_x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug75d.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG75d: same-block block-form defer shadow must be rejected");
+		prism_free(&r);
+	}
+}
+
 static void test_defer_shadow_for_init_false_positive(void) {
 	printf("\n--- BUG74: defer shadow for-init false positive ---\n");
 
@@ -4617,4 +4691,7 @@ void run_defer_tests(void) {
 
 	// BUG74: for-init declaration in defer body false positive shadow
 	test_defer_shadow_for_init_false_positive();
+
+	// BUG75: same-block defer shadow hijack (silent miscompilation)
+	test_defer_same_block_shadow_hijack();
 }

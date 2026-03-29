@@ -3883,6 +3883,77 @@ static void test_sizeof_vla_qualifier_blindspot(void) {
 	}
 }
 
+static void test_braceless_labeled_decl_cfg(void) {
+	printf("\n--- Braceless labeled-declaration CFG ---\n");
+
+	// Backward goto to label before VLA in braceless body.
+	// C11 §6.2.1p7: scope of vla begins AFTER its declarator.
+	// The label L_vla is before the declarator, so the goto
+	// destination is outside the VLA's scope.  Legal C.
+	{
+		const char *code =
+		    "void execute(int n) {\n"
+		    "    if (1)\n"
+		    "        L_vla: raw int vla[n];\n"
+		    "    goto L_vla;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "braceless_vla1.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "braceless labeled VLA: backward goto to label before declarator is legal");
+		prism_free(&r);
+	}
+
+	// Forward goto past already-dead braceless declaration.
+	// Part 1 (body_close_idx) bounds the lifetime to the semicolon,
+	// so the declaration is dead before End:.  Must be accepted.
+	{
+		const char *code =
+		    "void process(void) {\n"
+		    "    goto End;\n"
+		    "    if (1)\n"
+		    "        L_decl: int x;\n"
+		    "    End:\n"
+		    "    return;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "braceless_fwd1.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "braceless labeled decl: forward goto past dead scope must be accepted");
+		prism_free(&r);
+	}
+
+	// Braced labeled VLA: backward goto to label before VLA declarator.
+	// Same as braceless case — label is before scope of vla.  Legal C.
+	{
+		const char *code =
+		    "void ctrl(int n) {\n"
+		    "    if (1) {\n"
+		    "        L2: raw int vla[n];\n"
+		    "    }\n"
+		    "    goto L2;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "braceless_ctrl1.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "braced labeled VLA: backward goto to label before declarator is legal");
+		prism_free(&r);
+	}
+
+	// Control: labeled declaration in same scope without braceless — no false positive.
+	{
+		const char *code =
+		    "void same(void) {\n"
+		    "    L3: raw int x;\n"
+		    "    (void)x;\n"
+		    "    goto L3;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "braceless_ctrl2.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "labeled decl in same scope without braceless: backward goto must be accepted");
+		prism_free(&r);
+	}
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -4177,4 +4248,7 @@ void run_safe_tests(void) {
 
         // BUG68: sizeof VLA qualifier blindspot in array_size_is_vla
         test_sizeof_vla_qualifier_blindspot();
+
+        // Braceless labeled-declaration CFG lifetime
+        test_braceless_labeled_decl_cfg();
 }
