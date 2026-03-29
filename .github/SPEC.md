@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3474+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3661+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -53,6 +53,13 @@ GNU extension `__auto_type` is tagged `TT_TYPE | TT_TYPEOF` so that declaration 
 ### Taint graph
 
 The tokenizer builds per-function taint flags (`has_setjmp`, `has_vfork`, `has_asm_goto`) stored on the opening `{` token's tag bits (`TT_SPECIAL_FN`, `TT_NORETURN_FN`, `TT_ASM`). These remain on the token and are read directly via `func_meta[idx].body_open->tag` — they are **not** transferred to `FuncMeta` fields. The `TT_ASM` taint fires only for `asm goto` — the tokenizer scans between the `asm` keyword and `(` for a `TT_GOTO` token. Regular `asm` (volatile, inline) is safe and does not taint.
+
+**Noreturn attribute scanning:** After tokenization, the tokenizer scans all tokens for noreturn annotations and tags every occurrence of the function name with `TT_NORETURN_FN`. Three attribute syntaxes are recognized:
+
+- **`_Noreturn` / `noreturn` keyword:** Bare keyword check (`equal(t, "_Noreturn") || equal(t, "noreturn")`).
+- **C23 `[[noreturn]]` / `[[_Noreturn]]` / `[[__noreturn__]]`:** When a `[` token with `TF_C23_ATTR` is found, all `TK_IDENT` tokens between `[[` and `]]` are scanned for `noreturn`, `_Noreturn`, or `__noreturn__`. This handles namespaced forms (`[[gnu::noreturn]]`, `[[gnu::__noreturn__]]`) because the loop skips non-matching identifiers.
+- **GNU `__attribute__((noreturn))` / `__attribute__((__noreturn__))` / `__attribute__((cold, noreturn))`:** All `TK_IDENT` tokens between the inner `((` and matching `)` are scanned for `noreturn` or `__noreturn__`. This handles comma-separated attribute lists where noreturn is not the first attribute.
+- **MSVC `__declspec(noreturn)` / `__declspec(__noreturn__)`:** All `TK_IDENT` tokens between `(` and matching `)` are scanned for `noreturn` or `__noreturn__`.
 
 ---
 
@@ -277,7 +284,7 @@ For each function body, collects `P1FuncEntry` items into the global `p1_entries
 
 **VLA tracking:** `is_vla` on `P1FuncEntry.decl` is set when either the base type is a VLA typedef (`type.is_vla`) or the declaration itself has variable-length array dimensions (`decl.is_vla`). This covers both `typedef int T[n]; T x;` and direct `int x[n];` forms. Jumping past a VLA is always dangerous regardless of `has_init` or `has_raw`, because it bypasses implicit stack allocation.
 
-**typeof VLA detection:** Inside `parse_type_specifier`, VLA array dimensions inside `typeof(...)` are detected by scanning for `[` preceded by a type keyword, typedef, `]`, or `*`, followed by a runtime-variable size (`array_size_is_vla`). Parenthesized types like `typeof((int[n]))` are detected at all paren depths. However, function-pointer parameter lists are skipped: a `(` preceded by `)` signals a function parameter list (e.g., `typeof(void(*)(int[n]))`), and `[n]` inside such lists describes parameter dimensions, not the outer type. This prevents false VLA flags on function pointers — important because `register` storage class variables cannot have their address taken, making memset-based zero-init illegal for them.
+**typeof VLA detection:** Inside `parse_type_specifier`, VLA array dimensions inside `typeof(...)` are detected by scanning for `[` preceded by a valid type-context predecessor, followed by a runtime-variable size (`array_size_is_vla`). The predecessor check is consolidated in the `is_array_bracket_predecessor` helper, which accepts: type keywords, known typedefs, type qualifiers (`TT_QUALIFIER` — covers `const`, `volatile`, `restrict`, `_Atomic`), `]` (multi-dim), `*` (pointer), or `)` (paren-pointer grouping). Parenthesized types like `typeof((int[n]))` are detected at all paren depths. However, function-pointer parameter lists are skipped: a `(` preceded by `)` signals a function parameter list (e.g., `typeof(void(*)(int[n]))`), and `[n]` inside such lists describes parameter dimensions, not the outer type. This prevents false VLA flags on function pointers — important because `register` storage class variables cannot have their address taken, making memset-based zero-init illegal for them. The same `is_array_bracket_predecessor` check is used in the `_Atomic(...)` VLA scanning loop and in the `sizeof(...)` branch of `array_size_is_vla` (which detects VLA types inside sizeof expressions like `sizeof(int const [n])`).
 
 **has_raw:** Declarations marked `raw` set `has_raw = true`. In multi-declarator statements (`raw int x, y;`), `p1d_saw_raw` persists across commas — **all** declarators receive `has_raw = true` (matching Pass 2's behavior, where `is_raw` is also never reset on commas). The CFG verifier skips `has_raw` declarations for goto checks, **except VLAs** — `raw` on a VLA does not exempt it.
 
@@ -533,6 +540,8 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 **Typedef awareness:** Uses the immutable typedef table to distinguish `size_t x;` (declaration → initialize) from `size_t * x;` (could be expression → don't touch). Tracks `is_aggregate` to handle struct typedefs that need `= {0}` instead of `= 0`.
 
 **register _Atomic aggregate:** Rejected with an error — `_Atomic struct` with `register` storage class and zero-init would require a non-trivial store sequence.
+
+**Function-type exclusion:** `typeof(func_name)` where `func_name` is a function (not a function pointer) produces a function type — emitting `memset` on it writes to the `.text` segment (SIGSEGV). `process_declarators` detects function types via three mechanisms: (1) `is_func_typedef` scan of the type specifier for typedef'd function types; (2) `func_meta` scan matching the identifier inside `typeof(…)` against defined functions; (3) forward-declaration scan of `token_pool` at brace depth 0, detecting `ident(` patterns for functions only visible via forward declaration (not in `func_meta`). All three require a single bare identifier inside the `typeof(…)` parens. When detected, `is_func_type` is set and `needs_memset` evaluates to false.
 
 **Feature flag:** `-fno-zeroinit` disables.
 

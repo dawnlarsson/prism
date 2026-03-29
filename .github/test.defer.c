@@ -3641,6 +3641,534 @@ static void test_defer_name_false_positive(void) {
 	}
 }
 
+// BUG62: check_defer_var_shadow state machine doesn't reset in_decl on '='.
+// Variables on the RHS of an assignment inside a defer body are misclassified
+// as local declarations, hiding captured references from the shadow tracker.
+static void test_defer_shadow_rhs_assignment_bypass(void) {
+	printf("\n--- BUG62: defer shadow RHS assignment bypass ---\n");
+
+	// Sub-test 1: ptr on RHS of 'void *local = ptr;' in defer body.
+	// Outer block redeclares ptr — must be caught as shadow.
+	{
+		const char *code =
+		    "void tracked_free(void *p);\n"
+		    "void *my_alloc(int n);\n"
+		    "int f(void) {\n"
+		    "    void *ptr = my_alloc(1024);\n"
+		    "    defer {\n"
+		    "        {\n"
+		    "            void *local = ptr;\n"
+		    "            tracked_free(local);\n"
+		    "        }\n"
+		    "    }\n"
+		    "    {\n"
+		    "        void *ptr = my_alloc(16);\n"
+		    "        (void)ptr;\n"
+		    "        return 0;\n"
+		    "    }\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug62a.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG62a: ptr on RHS of assignment in defer body must be detected as captured");
+		CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
+		      "BUG62a: error message mentions 'shadows'");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: multi-declarator 'int a = 1, b = 2;' in defer body.
+	// 'b' is locally declared — outer 'int b' must NOT trigger shadow.
+	{
+		const char *code =
+		    "void use(int x);\n"
+		    "void f(void) {\n"
+		    "    int b = 10;\n"
+		    "    defer {\n"
+		    "        {\n"
+		    "            int a = 1, b = 2;\n"
+		    "            use(a + b);\n"
+		    "        }\n"
+		    "    }\n"
+		    "    {\n"
+		    "        int b = 99;\n"
+		    "        return;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug62b.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG62b: 'int a = 1, b = 2;' in nested defer block must not false-positive");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: ptr used in bare expression (not assignment) in defer body.
+	// This always worked but ensures the fix doesn't regress.
+	{
+		const char *code =
+		    "void tracked_free(void *p);\n"
+		    "void *my_alloc(int n);\n"
+		    "int f(void) {\n"
+		    "    void *ptr = my_alloc(64);\n"
+		    "    defer tracked_free(ptr);\n"
+		    "    {\n"
+		    "        void *ptr = my_alloc(16);\n"
+		    "        (void)ptr;\n"
+		    "        return 0;\n"
+		    "    }\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug62c.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG62c: bare ptr ref in defer body must still be caught");
+		prism_free(&r);
+	}
+}
+
+// BUG64: C23 attribute [[__noreturn__]] and [[gnu::__noreturn__]] are not
+// recognized by the tokenizer's noreturn scanner.  The scanner only checks
+// "noreturn" and "_Noreturn" inside [[...]], missing the double-underscore
+// GNU convention.  Functions with these attributes are silently accepted
+// when called with active defers, bypassing the noreturn warning.
+static void test_c23_attr_noreturn_dunder_blindspot(void) {
+	printf("\n--- BUG64: C23 attr [[__noreturn__]] blind spot ---\n");
+
+	// Sub-test 1: [[__noreturn__]] (non-namespaced, double-underscore)
+	{
+		const char *code =
+		    "[[__noreturn__]] void my_panic(void);\n"
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    defer cleanup();\n"
+		    "    my_panic();\n"
+		    "}\n";
+		int pipefd[2];
+		pipe(pipefd);
+		int saved = dup(STDERR_FILENO);
+		dup2(pipefd[1], STDERR_FILENO);
+		PrismResult r = prism_transpile_source(code, "bug64a.c", prism_defaults());
+		fflush(stderr);
+		dup2(saved, STDERR_FILENO);
+		close(saved);
+		close(pipefd[1]);
+		char buf[4096];
+		int n = read(pipefd[0], buf, sizeof(buf) - 1);
+		buf[n > 0 ? n : 0] = '\0';
+		close(pipefd[0]);
+		CHECK(r.status == PRISM_OK, "BUG64a: transpile succeeds");
+		CHECK(n > 0 && strstr(buf, "warning") != NULL,
+		      "BUG64a: [[__noreturn__]] must produce defer-bypass warning");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: [[gnu::__noreturn__]] (namespaced double-underscore)
+	{
+		const char *code =
+		    "[[gnu::__noreturn__]] void my_fatal(void);\n"
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    defer cleanup();\n"
+		    "    my_fatal();\n"
+		    "}\n";
+		int pipefd[2];
+		pipe(pipefd);
+		int saved = dup(STDERR_FILENO);
+		dup2(pipefd[1], STDERR_FILENO);
+		PrismResult r = prism_transpile_source(code, "bug64b.c", prism_defaults());
+		fflush(stderr);
+		dup2(saved, STDERR_FILENO);
+		close(saved);
+		close(pipefd[1]);
+		char buf[4096];
+		int n = read(pipefd[0], buf, sizeof(buf) - 1);
+		buf[n > 0 ? n : 0] = '\0';
+		close(pipefd[0]);
+		CHECK(r.status == PRISM_OK, "BUG64b: transpile succeeds");
+		CHECK(n > 0 && strstr(buf, "warning") != NULL,
+		      "BUG64b: [[gnu::__noreturn__]] must produce defer-bypass warning");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: [[noreturn]] (standard form) — must still work (regression guard)
+	{
+		const char *code =
+		    "[[noreturn]] void my_exit(void);\n"
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    defer cleanup();\n"
+		    "    my_exit();\n"
+		    "}\n";
+		int pipefd[2];
+		pipe(pipefd);
+		int saved = dup(STDERR_FILENO);
+		dup2(pipefd[1], STDERR_FILENO);
+		PrismResult r = prism_transpile_source(code, "bug64c.c", prism_defaults());
+		fflush(stderr);
+		dup2(saved, STDERR_FILENO);
+		close(saved);
+		close(pipefd[1]);
+		char buf[4096];
+		int n = read(pipefd[0], buf, sizeof(buf) - 1);
+		buf[n > 0 ? n : 0] = '\0';
+		close(pipefd[0]);
+		CHECK(r.status == PRISM_OK, "BUG64c: transpile succeeds");
+		CHECK(n > 0 && strstr(buf, "warning") != NULL,
+		      "BUG64c: [[noreturn]] must still produce warning (regression)");
+		prism_free(&r);
+	}
+}
+
+// BUG66: GNU __attribute__((cold, __noreturn__)) list truncation.
+// The scanner only checked the first attribute after (( — missed noreturn
+// when preceded by other attributes in a comma-separated list.
+// Also covers __declspec(__noreturn__) blind spot.
+static void test_gnu_attr_noreturn_list_blindspot(void) {
+	printf("\n--- BUG66: GNU attr list noreturn blind spot ---\n");
+
+	// Sub-test 1: __attribute__((cold, __noreturn__)) — noreturn not first
+	{
+		const char *code =
+		    "__attribute__((cold, __noreturn__)) void my_panic(void);\n"
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    defer cleanup();\n"
+		    "    my_panic();\n"
+		    "}\n";
+		int pipefd[2];
+		pipe(pipefd);
+		int saved = dup(STDERR_FILENO);
+		dup2(pipefd[1], STDERR_FILENO);
+		PrismResult r = prism_transpile_source(code, "bug66a.c", prism_defaults());
+		fflush(stderr);
+		dup2(saved, STDERR_FILENO);
+		close(saved);
+		close(pipefd[1]);
+		char buf[4096];
+		int n = read(pipefd[0], buf, sizeof(buf) - 1);
+		buf[n > 0 ? n : 0] = '\0';
+		close(pipefd[0]);
+		CHECK(r.status == PRISM_OK, "BUG66a: transpile succeeds");
+		CHECK(n > 0 && strstr(buf, "warning") != NULL,
+		      "BUG66a: __attribute__((cold, __noreturn__)) must warn");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: __attribute__((always_inline, noreturn)) — keyword form not first
+	{
+		const char *code =
+		    "__attribute__((always_inline, noreturn)) void my_abort(void);\n"
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    defer cleanup();\n"
+		    "    my_abort();\n"
+		    "}\n";
+		int pipefd[2];
+		pipe(pipefd);
+		int saved = dup(STDERR_FILENO);
+		dup2(pipefd[1], STDERR_FILENO);
+		PrismResult r = prism_transpile_source(code, "bug66b.c", prism_defaults());
+		fflush(stderr);
+		dup2(saved, STDERR_FILENO);
+		close(saved);
+		close(pipefd[1]);
+		char buf[4096];
+		int n = read(pipefd[0], buf, sizeof(buf) - 1);
+		buf[n > 0 ? n : 0] = '\0';
+		close(pipefd[0]);
+		CHECK(r.status == PRISM_OK, "BUG66b: transpile succeeds");
+		CHECK(n > 0 && strstr(buf, "warning") != NULL,
+		      "BUG66b: __attribute__((always_inline, noreturn)) must warn");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: __attribute__((noreturn, cold)) — noreturn first (regression)
+	{
+		const char *code =
+		    "__attribute__((noreturn, cold)) void my_exit(void);\n"
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    defer cleanup();\n"
+		    "    my_exit();\n"
+		    "}\n";
+		int pipefd[2];
+		pipe(pipefd);
+		int saved = dup(STDERR_FILENO);
+		dup2(pipefd[1], STDERR_FILENO);
+		PrismResult r = prism_transpile_source(code, "bug66c.c", prism_defaults());
+		fflush(stderr);
+		dup2(saved, STDERR_FILENO);
+		close(saved);
+		close(pipefd[1]);
+		char buf[4096];
+		int n = read(pipefd[0], buf, sizeof(buf) - 1);
+		buf[n > 0 ? n : 0] = '\0';
+		close(pipefd[0]);
+		CHECK(r.status == PRISM_OK, "BUG66c: transpile succeeds");
+		CHECK(n > 0 && strstr(buf, "warning") != NULL,
+		      "BUG66c: __attribute__((noreturn, cold)) must still warn");
+		prism_free(&r);
+	}
+
+	// Sub-test 4: __declspec(__noreturn__) — MSVC dunder form
+	{
+		const char *code =
+		    "__declspec(__noreturn__) void my_fatal(void);\n"
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    defer cleanup();\n"
+		    "    my_fatal();\n"
+		    "}\n";
+		int pipefd[2];
+		pipe(pipefd);
+		int saved = dup(STDERR_FILENO);
+		dup2(pipefd[1], STDERR_FILENO);
+		PrismResult r = prism_transpile_source(code, "bug66d.c", prism_defaults());
+		fflush(stderr);
+		dup2(saved, STDERR_FILENO);
+		close(saved);
+		close(pipefd[1]);
+		char buf[4096];
+		int n = read(pipefd[0], buf, sizeof(buf) - 1);
+		buf[n > 0 ? n : 0] = '\0';
+		close(pipefd[0]);
+		CHECK(r.status == PRISM_OK, "BUG66d: transpile succeeds");
+		CHECK(n > 0 && strstr(buf, "warning") != NULL,
+		      "BUG66d: __declspec(__noreturn__) must produce warning");
+		prism_free(&r);
+	}
+}
+
+static void test_defer_shadow_brace_init_comma_bypass(void) {
+	printf("\n--- BUG67: brace-initializer comma bypass in defer shadow check ---\n");
+
+	// Sub-test 1: brace initializer at depth > 1 referencing captured var.
+	// The comma inside { NULL, ptr } must NOT re-enter declaration context.
+	{
+		const char *code =
+		    "void *malloc(unsigned long);\n"
+		    "void free(void *);\n"
+		    "void f(void) {\n"
+		    "    int *ptr = (int*)malloc(1024);\n"
+		    "    defer {\n"
+		    "        {\n"
+		    "            void *arr[] = { (void*)0, ptr };\n"
+		    "            free(arr[1]);\n"
+		    "        }\n"
+		    "    }\n"
+		    "    {\n"
+		    "        int *ptr = (int*)malloc(16);\n"
+		    "        (void)ptr;\n"
+		    "        return;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug67a.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG67a: ptr in brace-init at depth > 1 must be detected as captured");
+		CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
+		      "BUG67a: error message mentions 'shadows'");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: multi-declarator comma at same depth must STILL work.
+	// 'int dummy = 0, ptr = 1;' locally declares ptr — no shadow error.
+	{
+		const char *code =
+		    "void *malloc(unsigned long);\n"
+		    "void free(void *);\n"
+		    "void f(void) {\n"
+		    "    int *ptr = (int*)malloc(1024);\n"
+		    "    defer {\n"
+		    "        {\n"
+		    "            int dummy = 0, ptr = 1;\n"
+		    "            (void)dummy; (void)ptr;\n"
+		    "        }\n"
+		    "    }\n"
+		    "    {\n"
+		    "        int *ptr = (int*)malloc(16);\n"
+		    "        (void)ptr;\n"
+		    "        return;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug67b.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "BUG67b: multi-decl comma at same depth must still work (ptr locally declared)");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: nested struct initializer with captured var inside values.
+	{
+		const char *code =
+		    "void *malloc(unsigned long);\n"
+		    "void free(void *);\n"
+		    "typedef struct { void *p; int n; } Pair;\n"
+		    "void f(void) {\n"
+		    "    void *ptr = malloc(1024);\n"
+		    "    defer {\n"
+		    "        {\n"
+		    "            Pair pairs[] = { { ptr, 1 }, { (void*)0, 0 } };\n"
+		    "            free(pairs[0].p);\n"
+		    "        }\n"
+		    "    }\n"
+		    "    {\n"
+		    "        void *ptr = malloc(16);\n"
+		    "        (void)ptr;\n"
+		    "        return;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug67c.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG67c: ptr in nested struct init must be detected as captured");
+		CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
+		      "BUG67c: error message mentions 'shadows'");
+		prism_free(&r);
+	}
+}
+
+// BUG71: (noreturn_fn)() with active defers skips warning because
+// the TT_NORETURN_FN lookahead required tok_next to be '('.
+static void test_paren_noreturn_warning_bypass(void) {
+	// Sub-test 1: (fatal_panic)() should produce the same warning as fatal_panic()
+	{
+		const char *code =
+		    "_Noreturn void fatal_panic(void);\n"
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    defer cleanup();\n"
+		    "    (fatal_panic)();\n"
+		    "}\n";
+		int pipefd[2];
+		pipe(pipefd);
+		int saved = dup(STDERR_FILENO);
+		dup2(pipefd[1], STDERR_FILENO);
+		PrismResult r = prism_transpile_source(code, "bug71a.c", prism_defaults());
+		fflush(stderr);
+		dup2(saved, STDERR_FILENO);
+		close(saved);
+		close(pipefd[1]);
+		char buf[4096];
+		int n = read(pipefd[0], buf, sizeof(buf) - 1);
+		buf[n > 0 ? n : 0] = '\0';
+		close(pipefd[0]);
+		CHECK(r.status == PRISM_OK, "BUG71a: transpiles OK");
+		CHECK(n > 0 && strstr(buf, "warning") != NULL,
+		      "BUG71a: (fatal_panic)() must warn about defers not running");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: control case — fatal_panic() (no parens) still warns
+	{
+		const char *code =
+		    "_Noreturn void fatal_panic(void);\n"
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    defer cleanup();\n"
+		    "    fatal_panic();\n"
+		    "}\n";
+		int pipefd[2];
+		pipe(pipefd);
+		int saved = dup(STDERR_FILENO);
+		dup2(pipefd[1], STDERR_FILENO);
+		PrismResult r = prism_transpile_source(code, "bug71b.c", prism_defaults());
+		fflush(stderr);
+		dup2(saved, STDERR_FILENO);
+		close(saved);
+		close(pipefd[1]);
+		char buf[4096];
+		int n = read(pipefd[0], buf, sizeof(buf) - 1);
+		buf[n > 0 ? n : 0] = '\0';
+		close(pipefd[0]);
+		CHECK(r.status == PRISM_OK, "BUG71b: transpiles OK");
+		CHECK(n > 0 && strstr(buf, "warning") != NULL,
+		      "BUG71b: fatal_panic() must still warn (regression guard)");
+		prism_free(&r);
+	}
+}
+
+// BUG71b: (setjmp_wrapper)() bypasses transitive taint propagation because
+// the ident( check requires tok_next to be '(' — ')' from the parens fails.
+static void test_paren_setjmp_wrapper_taint_bypass(void) {
+	// Sub-test 1: (my_setjmp_wrapper)() must taint the caller
+	{
+		const char *code =
+		    "#include <setjmp.h>\n"
+		    "void my_setjmp_wrapper(jmp_buf buf) {\n"
+		    "    setjmp(buf);\n"
+		    "}\n"
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    jmp_buf buf;\n"
+		    "    defer cleanup();\n"
+		    "    (my_setjmp_wrapper)(buf);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug71c.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG71c: defer in function calling (setjmp_wrapper)() must be rejected");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: control — my_setjmp_wrapper() (no parens) still errors
+	{
+		const char *code =
+		    "#include <setjmp.h>\n"
+		    "void my_setjmp_wrapper(jmp_buf buf) {\n"
+		    "    setjmp(buf);\n"
+		    "}\n"
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    jmp_buf buf;\n"
+		    "    defer cleanup();\n"
+		    "    my_setjmp_wrapper(buf);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug71d.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG71d: defer in function calling setjmp_wrapper() must be rejected (regression)");
+		prism_free(&r);
+	}
+}
+
+// BUG72: typedef enum { name = 0 } wrapping bypasses defer shadow check.
+// parse_type_specifier skips the enum body with skip_balanced, so
+// check_enum_typedef_defer_shadow's TT_TYPEDEF path never sees the constants.
+static void test_defer_shadow_typedef_enum_bypass(void) {
+	// Sub-test 1: typedef enum { ptr = 0 } must trigger shadow error
+	{
+		const char *code =
+		    "void cleanup(int *p);\n"
+		    "int *alloc(void);\n"
+		    "void f(void) {\n"
+		    "    int *ptr = alloc();\n"
+		    "    defer cleanup(ptr);\n"
+		    "    {\n"
+		    "        typedef enum { ptr = 0 } MyEnum;\n"
+		    "        return;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug72a.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG72: typedef enum constant must not silently shadow defer-captured var");
+		CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
+		      "BUG72: error message mentions 'shadows'");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: control — bare enum (no typedef) still catches shadow
+	{
+		const char *code =
+		    "void cleanup(int *p);\n"
+		    "int *alloc(void);\n"
+		    "void f(void) {\n"
+		    "    int *ptr = alloc();\n"
+		    "    defer cleanup(ptr);\n"
+		    "    {\n"
+		    "        enum { ptr = 0 };\n"
+		    "        return;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug72b.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG72: bare enum constant shadow must still be caught (regression)");
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -3870,4 +4398,29 @@ void run_defer_tests(void) {
 
 	// BUG61: Phase 1D defer detection false positives on variables/members named "defer"
 	test_defer_name_false_positive();
+
+	// BUG62: defer shadow RHS assignment bypass (check_defer_var_shadow state desync)
+	test_defer_shadow_rhs_assignment_bypass();
+
+	// BUG64: [[__noreturn__]] / [[gnu::__noreturn__]] C23 attr blind spot
+#ifndef _WIN32
+	test_c23_attr_noreturn_dunder_blindspot();
+#endif
+
+	// BUG66: __attribute__((cold, __noreturn__)) list truncation + __declspec
+#ifndef _WIN32
+	test_gnu_attr_noreturn_list_blindspot();
+#endif
+
+	// BUG67: brace-initializer comma bypass in check_defer_var_shadow
+	test_defer_shadow_brace_init_comma_bypass();
+
+	// BUG71: parenthesized noreturn call / wrapper call bypasses warning and taint
+#ifndef _WIN32
+	test_paren_noreturn_warning_bypass();
+	test_paren_setjmp_wrapper_taint_bypass();
+#endif
+
+	// BUG72: typedef enum wrapping bypasses defer shadow check
+	test_defer_shadow_typedef_enum_bypass();
 }

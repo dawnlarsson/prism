@@ -1767,7 +1767,7 @@ static Token *tokenize(File *file) {
 					if (body->tag & (TT_SPECIAL_FN | TT_NORETURN_FN)) continue;
 					Token *end = tok_match(body);
 					for (Token *b = tok_next(body); b != end; b = tok_next(b)) {
-						if (b->kind != TK_IDENT || !tok_next(b) || tok_loc(tok_next(b))[0] != '(')
+						if (b->kind != TK_IDENT)
 							continue;
 						void *v = hashmap_get(&func_map, tok_loc(b), b->len);
 						if (!v) continue;
@@ -1805,27 +1805,53 @@ static Token *tokenize(File *file) {
 			    (equal(t, "_Noreturn") || equal(t, "noreturn")))
 				is_noreturn = true;
 
-			// [[noreturn]] — C23 attribute
+			// [[noreturn]] / [[_Noreturn]] / [[__noreturn__]] — C23 attribute
+			// Also handles namespaced forms: [[gnu::noreturn]], [[gnu::__noreturn__]]
 			if (tok_loc(t)[0] == '[' && (t->flags & TF_C23_ATTR) && t->match_idx) {
 				Token *inner = tok_next(t);
 				if (inner && tok_loc(inner)[0] == '[') {
-					Token *attr = tok_next(inner);
-					if (attr && attr->kind == TK_IDENT &&
-					    (equal(attr, "noreturn") || equal(attr, "_Noreturn")))
-						is_noreturn = true;
+					Token *closing = &token_pool[t->match_idx];
+					for (Token *a = tok_next(inner); a && a < closing; a = tok_next(a)) {
+						if (a->kind == TK_IDENT &&
+						    (equal(a, "noreturn") || equal(a, "_Noreturn") ||
+						     equal(a, "__noreturn__"))) {
+							is_noreturn = true;
+							break;
+						}
+					}
 				}
 			}
 
 			// __attribute__((noreturn)) or __attribute__((__noreturn__))
+			// Handles comma-separated attribute lists: __attribute__((cold, noreturn))
 			if (t->kind <= TK_KEYWORD && equal(t, "__attribute__")) {
 				Token *p1 = tok_next(t);
 				if (p1 && tok_loc(p1)[0] == '(') {
 					Token *p2 = tok_next(p1);
-					if (p2 && tok_loc(p2)[0] == '(') {
-						Token *attr = tok_next(p2);
-						if (attr && attr->kind == TK_IDENT &&
-						    (equal(attr, "noreturn") || equal(attr, "__noreturn__")))
+					if (p2 && tok_loc(p2)[0] == '(' && p2->match_idx) {
+						Token *close = &token_pool[p2->match_idx];
+						for (Token *a = tok_next(p2); a && a < close; a = tok_next(a)) {
+							if (a->kind == TK_IDENT &&
+							    (equal(a, "noreturn") || equal(a, "__noreturn__"))) {
+								is_noreturn = true;
+								break;
+							}
+						}
+					}
+				}
+			}
+
+			// __declspec(noreturn) or __declspec(__noreturn__) — MSVC
+			if (t->kind <= TK_KEYWORD && equal(t, "__declspec")) {
+				Token *p1 = tok_next(t);
+				if (p1 && tok_loc(p1)[0] == '(' && p1->match_idx) {
+					Token *close = &token_pool[p1->match_idx];
+					for (Token *a = tok_next(p1); a && a < close; a = tok_next(a)) {
+						if (a->kind == TK_IDENT &&
+						    (equal(a, "noreturn") || equal(a, "__noreturn__"))) {
 							is_noreturn = true;
+							break;
+						}
 					}
 				}
 			}

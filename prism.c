@@ -1210,6 +1210,7 @@ static void check_defer_var_shadow(Token *var_name) {
 		int paren_depth = 0;
 		int decl_depth = -1; // brace depth where name is locally declared (-1 = not local)
 		bool in_decl = false; // true when scanning tokens after a type keyword (declaration context)
+		bool was_in_decl = false; // true if a type keyword appeared in this statement (survives '=')
 		int decl_bd = 0; // brace depth where in_decl was set
 		for (Token *t = defer_stack[i].stmt; t && t != defer_stack[i].end && t->kind != TK_EOF;
 		     prev = t, t = tok_next(t)) {
@@ -1223,13 +1224,21 @@ static void check_defer_var_shadow(Token *var_name) {
 			}
 			if (match_ch(t, '(') || match_ch(t, '[')) { paren_depth++; continue; }
 			if (match_ch(t, ')') || match_ch(t, ']')) { paren_depth--; continue; }
-			if (match_ch(t, ';')) { in_decl = false; continue; }
+			if (match_ch(t, ';')) { in_decl = false; was_in_decl = false; continue; }
+			// '=' transitions from declarator to initializer expression.
+			// RHS identifiers are references, not declaration targets.
+			if (paren_depth == 0 && match_ch(t, '=')) { in_decl = false; continue; }
+			// ',' after '=' re-enters declaration context for the next declarator.
+			// Only at the same brace depth as the declaration — commas inside
+			// brace initializers separate values, not declarators.
+			if (paren_depth == 0 && match_ch(t, ',') && was_in_decl && brace_depth == decl_bd) { in_decl = true; continue; }
 			// Track declaration context: type keywords, qualifiers, SUE tags.
 			// Only at paren_depth 0 — type keywords inside casts like
 			// (struct X *) must not set in_decl (they're not declarations).
 			if (brace_depth > 1 && paren_depth == 0 &&
 			    (is_type_keyword(t) || (t->tag & (TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_TYPEDEF)))) {
 				in_decl = true;
+				was_in_decl = true;
 				decl_bd = brace_depth;
 				continue;
 			}
@@ -1308,6 +1317,33 @@ static void check_enum_typedef_defer_shadow(Token *tok) {
 		if (!type_start) return;
 		TypeSpecResult type = parse_type_specifier(type_start);
 		if (!type.saw_type) return;
+		// parse_type_specifier skips enum bodies via skip_balanced.
+		// If the type contains an enum, scan its constants for shadows.
+		if (type.is_enum) {
+			for (Token *s = type_start; s && s != type.end; s = tok_next(s)) {
+				if (match_ch(s, '{')) {
+					Token *end = tok_match(s);
+					if (!end) break;
+					Token *e = tok_next(s);
+					while (e && e != end && e->kind != TK_EOF) {
+						if (e->kind == TK_IDENT || e->kind == TK_KEYWORD) {
+							check_defer_var_shadow(e);
+							while (e && e != end && e->kind != TK_EOF && !match_ch(e, ',')) {
+								if (e->flags & TF_OPEN) {
+									e = tok_match(e) ? tok_next(tok_match(e)) : tok_next(e);
+									continue;
+								}
+								e = tok_next(e);
+							}
+							if (e && match_ch(e, ',')) e = tok_next(e);
+						} else {
+							e = tok_next(e);
+						}
+					}
+					break;
+				}
+			}
+		}
 		Token *t = type.end;
 		while (t && t->kind != TK_EOF && !match_ch(t, ';')) {
 			DeclResult decl = parse_declarator(t, false);
@@ -1895,6 +1931,14 @@ static void emit_ret_type(void) {
 	}
 }
 
+// Check if a token can legally precede an array bracket '[' in a type context.
+// Used in VLA detection to distinguish type[dim] from other bracket uses.
+static inline bool is_array_bracket_predecessor(Token *t) {
+	return is_type_keyword(t) || is_known_typedef(t) ||
+	       (t->tag & TT_QUALIFIER) ||
+	       match_ch(t, ']') || match_ch(t, '*') || match_ch(t, ')');
+}
+
 // Check if array dimension contains a VLA expression (runtime variable).
 // sizeof/alignof/offsetof args are skipped except sizeof(VLA_Typedef).
 static bool array_size_is_vla(Token *open_bracket) {
@@ -1934,9 +1978,7 @@ static bool array_size_is_vla(Token *open_bracket) {
 						}
 						if (is_vla_typedef(inner)) return true;
 						if (match_ch(inner, '[') &&
-						    (is_type_keyword(prev_inner) || is_known_typedef(prev_inner) ||
-						     match_ch(prev_inner, ']') || match_ch(prev_inner, '*') ||
-						     match_ch(prev_inner, ')')) &&
+						    is_array_bracket_predecessor(prev_inner) &&
 						    array_size_is_vla(inner))
 							return true;
 						if (is_valid_varname(inner) && !is_type_keyword(inner) &&
@@ -2408,9 +2450,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 					}
 					if (fn_skip_a > 0) continue;
 					if (match_ch(t, '[') &&
-					    (is_type_keyword(prev_a) || is_known_typedef(prev_a) ||
-					     match_ch(prev_a, ']') || match_ch(prev_a, '*') ||
-					     match_ch(prev_a, ')')) &&
+					    is_array_bracket_predecessor(prev_a) &&
 					    array_size_is_vla(t)) {
 						r.is_vla = true;
 						break;
@@ -2491,9 +2531,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 					}
 					if (fn_skip > 0) continue;
 					if (match_ch(t, '[') &&
-					    (is_type_keyword(prev) || is_known_typedef(prev) ||
-					     match_ch(prev, ']') || match_ch(prev, '*') ||
-					     match_ch(prev, ')')) &&
+					    is_array_bracket_predecessor(prev) &&
 					    array_size_is_vla(t)) {
 						r.is_vla = true;
 						break;
@@ -2591,6 +2629,11 @@ static Token *walk_balanced(Token *tok, bool emit) {
 					}
 					if (match_ch(inner, ';')) {
 						end_statement_after_semicolon();
+						emit_tok(inner); inner = tok_next(inner);
+						continue;
+					}
+					// Preprocessor directives: emit and preserve at_stmt_start
+					if (__builtin_expect(inner->kind == TK_PREP_DIR, 0)) {
 						emit_tok(inner); inner = tok_next(inner);
 						continue;
 					}
@@ -3658,6 +3701,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			// typeof(known_function) also produces a function type.
 			// Detect by finding a single bare identifier inside typeof
 			// parens and matching it against defined function names.
+			char *typeof_ident_loc = NULL;
+			int typeof_ident_len = 0;
 			if (!is_func_type && type->has_typeof) {
 				for (Token *ft = type_start; ft && ft != type->end; ft = tok_next(ft)) {
 					if (!(ft->tag & TT_TYPEOF)) continue;
@@ -3669,6 +3714,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					if (!inner || inner == close || tok_next(inner) != close) break;
 					if (!is_valid_varname(inner)) break;
 					if (inner->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)) break;
+					typeof_ident_loc = tok_loc(inner);
+					typeof_ident_len = inner->len;
 					// Check func_meta for a defined function with this name.
 					for (int fi = 0; fi < func_meta_count; fi++) {
 						Token *fn = func_meta[fi].ret_type_end;
@@ -3696,6 +3743,24 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 						}
 					}
 					break;
+				}
+			}
+			// func_meta only has defined functions.  Also check for
+			// forward declarations at file scope: ident followed by '('.
+			if (!is_func_type && typeof_ident_loc) {
+				int bd = 0;
+				for (uint32_t ti = 1; ti < token_count && !is_func_type; ti++) {
+					Token *t = &token_pool[ti];
+					if (t->kind == TK_PREP_DIR) continue;
+					if (match_ch(t, '{')) { bd++; continue; }
+					if (match_ch(t, '}')) { if (bd > 0) bd--; continue; }
+					if (bd != 0) continue;
+					if (t->kind == TK_IDENT && t->len == typeof_ident_len &&
+					    !memcmp(tok_loc(t), typeof_ident_loc, typeof_ident_len)) {
+						Token *nx = tok_next(t);
+						if (nx && match_ch(nx, '('))
+							is_func_type = true;
+					}
 				}
 			}
 		}
@@ -7761,32 +7826,31 @@ static void cfg_check_range(P1FuncEntry *ents,
 		}
 	}
 
-	if (FEAT(F_ZEROINIT)) {
-		for (int di = decl_lo; di < decl_hi; di++) {
-			P1FuncEntry *d = &ents[decl_list[di]];
-			if (!scope_is_ancestor_or_self(d->scope_id, label->scope_id))
-				continue;
-			if (!is_forward && scope_is_ancestor_or_self(d->scope_id, g->scope_id))
-				continue;
-			{
-				uint32_t close = 0;
-				if (d->decl.body_close_idx > 0)
-					close = d->decl.body_close_idx;
-				else if (d->scope_id > 0 && d->scope_id < scope_tree_count)
-					close = scope_tree[d->scope_id].close_tok_idx;
-				if (close > 0 && close < label->token_index) continue;
-			}
-			if ((!d->decl.has_raw && !d->decl.is_static_storage) || d->decl.is_vla) {
-				if (d->decl.is_vla) {
-					bad_decl = d->tok;
-					bad_decl_is_vla = true;
-					break; // VLA is always a hard error; no need to scan further
-				}
-				if (!bad_decl) {
-					bad_decl = d->tok;
-					bad_decl_is_vla = false;
-				}
-				// Continue scanning — a later VLA must not be masked by a scalar
+	// VLA skip is always a hard error (C99/C11 6.8.6.1p1) regardless of
+	// feature flags.  Non-VLA declaration bypass only matters with zeroinit.
+	for (int di = decl_lo; di < decl_hi; di++) {
+		P1FuncEntry *d = &ents[decl_list[di]];
+		if (!scope_is_ancestor_or_self(d->scope_id, label->scope_id))
+			continue;
+		if (!is_forward && scope_is_ancestor_or_self(d->scope_id, g->scope_id))
+			continue;
+		{
+			uint32_t close = 0;
+			if (d->decl.body_close_idx > 0)
+				close = d->decl.body_close_idx;
+			else if (d->scope_id > 0 && d->scope_id < scope_tree_count)
+				close = scope_tree[d->scope_id].close_tok_idx;
+			if (close > 0 && close < label->token_index) continue;
+		}
+		if (d->decl.is_vla) {
+			bad_decl = d->tok;
+			bad_decl_is_vla = true;
+			break;
+		}
+		if (FEAT(F_ZEROINIT) && !d->decl.has_raw && !d->decl.is_static_storage) {
+			if (!bad_decl) {
+				bad_decl = d->tok;
+				bad_decl_is_vla = false;
 			}
 		}
 	}
@@ -7807,11 +7871,21 @@ static void cfg_check_range(P1FuncEntry *ents,
 }
 
 static void p1_verify_cfg(void) {
-	if (!FEAT(F_DEFER | F_ZEROINIT)) return;
 
 	for (int fi = 0; fi < func_meta_count; fi++) {
 		FuncMeta *fm = &func_meta[fi];
 		if (fm->entry_count == 0) continue;
+
+		// Fast path: if neither defer nor zeroinit is enabled, we only
+		// need CFG verification for VLA declarations.  Scan entries
+		// to check if any VLA exists; if not, skip this function.
+		if (!FEAT(F_DEFER | F_ZEROINIT)) {
+			P1FuncEntry *ents = &p1_entries[fm->entry_start];
+			bool has_vla = false;
+			for (int i = 0; i < fm->entry_count; i++)
+				if (ents[i].kind == P1K_DECL && ents[i].decl.is_vla) { has_vla = true; break; }
+			if (!has_vla) continue;
+		}
 
 		// Computed gotos cannot be verified statically: they could jump
 		// into any label, bypassing defers or zeroinit.  If the function
@@ -8047,22 +8121,24 @@ static void p1_verify_cfg(void) {
 					}
 				}
 
-				// Zero-init bypass: decl in nested block scope deeper than
-				// switch body, active at case position → error.
-				if (FEAT(F_ZEROINIT)) {
-					for (int di = sw_cm; di < decl_n; di++) {
-						P1FuncEntry *d = &ents[decl_list[di]];
-						if (!scope_is_ancestor_or_self(d->scope_id, ents[i].scope_id))
-							continue;
-						if (d->scope_id > 0 && d->scope_id < scope_tree_count &&
-						    scope_tree[d->scope_id].close_tok_idx < ents[i].token_index)
-							continue;
-						if ((d->decl.has_raw || d->decl.is_static_storage) && !d->decl.is_vla) continue;
+				// Decl bypass: VLA skip is always fatal (C99/C11 6.8.6.1);
+				// non-VLA declaration bypass only with zeroinit.
+				for (int di = sw_cm; di < decl_n; di++) {
+					P1FuncEntry *d = &ents[decl_list[di]];
+					if (!scope_is_ancestor_or_self(d->scope_id, ents[i].scope_id))
+						continue;
+					if (d->scope_id > 0 && d->scope_id < scope_tree_count &&
+					    scope_tree[d->scope_id].close_tok_idx < ents[i].token_index)
+						continue;
+					if (d->decl.is_vla)
 						error_tok(ents[i].tok,
-							  "case/default label inside a nested block within a switch "
-							  "may bypass zero-initialization (move the label to the "
-							  "switch body or wrap in its own block)");
-					}
+							  "case/default label may bypass VLA declaration");
+					if (!FEAT(F_ZEROINIT)) continue;
+					if (d->decl.has_raw || d->decl.is_static_storage) continue;
+					error_tok(ents[i].tok,
+						  "case/default label inside a nested block within a switch "
+						  "may bypass zero-initialization (move the label to the "
+						  "switch body or wrap in its own block)");
 				}
 				break;
 			}
@@ -8257,16 +8333,14 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		ctx->at_stmt_start = false;
 
 		if (tag & TT_NORETURN_FN) {
-			if (tok_next(tok) && match_ch(tok_next(tok), '(')) {
-				if (FEAT(F_DEFER) && has_active_defers())
-					fprintf(stderr,
-						"%s:%d: warning: '%.*s' called with active defers (defers "
-						"will not run)\n",
-						tok_file(tok)->name,
-						tok_line_no(tok),
-						tok->len,
-						tok_loc(tok));
-			}
+			if (FEAT(F_DEFER) && has_active_defers())
+				fprintf(stderr,
+					"%s:%d: warning: '%.*s' referenced with active defers (defers "
+					"will not run if called)\n",
+					tok_file(tok)->name,
+					tok_line_no(tok),
+					tok->len,
+					tok_loc(tok));
 		}
 
 		// Tag-dependent dispatch

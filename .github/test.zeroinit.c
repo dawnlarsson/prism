@@ -2580,6 +2580,125 @@ static void test_stmt_expr_zeroinit_in_ctrl_cond(void) {
 	}
 }
 
+// BUG69: typeof(external_function) emits __builtin_memset on a function
+// declaration, corrupting the .text segment at runtime.
+static void test_typeof_extern_func_memset(void) {
+	printf("\n--- BUG69: typeof external function memset corruption ---\n");
+
+	// Sub-test 1: typeof(printf) — external function, forward-declared only.
+	{
+		const char *code =
+		    "int printf(const char *, ...);\n"
+		    "void f(void) {\n"
+		    "    typeof(printf) my_func;\n"
+		    "    (void)my_func;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug69a.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "BUG69a: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "__builtin_memset") == NULL &&
+			      strstr(r.output, "= {0}") == NULL,
+			      "BUG69a: typeof(printf) must NOT emit zero-init");
+		}
+		prism_free(&r);
+	}
+
+	// Sub-test 2: typeof(extern_struct_var) — external variable, not a function.
+	// Must STILL get zero-init.
+	{
+		const char *code =
+		    "typedef struct { int x; } S;\n"
+		    "extern S global;\n"
+		    "void f(void) {\n"
+		    "    typeof(global) copy;\n"
+		    "    (void)copy;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug69b.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "BUG69b: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "__builtin_memset") != NULL || has_zeroing(r.output),
+			      "BUG69b: typeof(extern_struct_var) must still get zero-init");
+		}
+		prism_free(&r);
+	}
+
+	// Sub-test 3: typeof(defined_func) — defined function (func_meta hit).
+	// Must not emit memset (regression guard for existing logic).
+	{
+		const char *code =
+		    "void helper(void) {}\n"
+		    "void f(void) {\n"
+		    "    typeof(helper) my_func;\n"
+		    "    (void)my_func;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug69c.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "BUG69c: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "__builtin_memset") == NULL,
+			      "BUG69c: typeof(defined_func) must not emit memset (regression)");
+		}
+		prism_free(&r);
+	}
+
+	// Sub-test 4: typeof(func_ptr_var) — function pointer variable.
+	// Function pointer IS a pointer — should NOT get typeof memset.
+	{
+		const char *code =
+		    "void (*callback)(int);\n"
+		    "void f(void) {\n"
+		    "    typeof(callback) local_cb;\n"
+		    "    (void)local_cb;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug69d.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "BUG69d: transpiles OK");
+		prism_free(&r);
+	}
+}
+
+// BUG70: #pragma inside a statement expression processed by walk_balanced
+// (e.g., inside array dimensions) clears at_stmt_start, skipping zero-init.
+static void test_stmt_expr_pragma_zeroinit_bypass(void) {
+	// Sub-test 1: pragma before declaration inside stmt-expr in array dim
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int arr[({ \n"
+		    "#pragma GCC diagnostic push\n"
+		    "        int x;\n"
+		    "        x + 1;\n"
+		    "    })];\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug70a.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "BUG70a: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "int x = 0") != NULL,
+			      "BUG70a: pragma in walk_balanced stmt-expr must not bypass zero-init");
+		}
+		prism_free(&r);
+	}
+
+	// Sub-test 2: #line directive (also TK_PREP_DIR) before declaration
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int arr[({ \n"
+		    "#line 42 \"test.c\"\n"
+		    "        int y;\n"
+		    "        y + 1;\n"
+		    "    })];\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bug70b.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "BUG70b: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "int y = 0") != NULL,
+			      "BUG70b: #line in walk_balanced stmt-expr must not bypass zero-init");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -2710,4 +2829,10 @@ void run_zeroinit_tests(void) {
 
 	// Pointer-to-array scalar zero-init (= 0 not = {0})
 	test_ptr_to_array_scalar_zeroinit();
+
+        // BUG69: typeof(external_function) memset corruption
+        test_typeof_extern_func_memset();
+
+	// BUG70: pragma in walk_balanced stmt-expr breaks at_stmt_start
+	test_stmt_expr_pragma_zeroinit_bypass();
 }
