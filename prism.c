@@ -1697,6 +1697,12 @@ static void reject_orelse_side_effects(Token *start, Token *end,
 				error_tok(s, "%s with pointer dereference %s",
 					  ctx_msg, advice);
 		}
+		if (check_volatile_deref && (s->tag & TT_MEMBER))
+			error_tok(s, "%s with member access operator %s",
+				  ctx_msg, advice);
+		if (check_volatile_deref && match_ch(s, '[') && (s->flags & TF_OPEN))
+			error_tok(s, "%s with array subscript %s",
+				  ctx_msg, advice);
 		prev_tok = s;
 	}
 }
@@ -6271,38 +6277,10 @@ restart:
 	if (!tok || tok->kind == TK_EOF) { free(cont_stack); return NULL; }
 
 	// Braced compound statement
+	Token *end = NULL;
 	if (match_ch(tok, '{') && tok_match(tok)) {
-		Token *end = tok_match(tok);
-		// Process continuations
-		while (cont_n > 0) {
-			Cont c = cont_stack[cont_n - 1];
-			if (c.kind == CONT_IF_ELSE) {
-				cont_n--;
-				Token *n = tok_next(end);
-				while (n && n->kind == TK_PREP_DIR) n = tok_next(n);
-				if (n && (n->tag & TT_IF) && tok_loc(n)[0] == 'e') {
-					tok = tok_next(n);
-					goto restart;
-				}
-				// no else — end stays
-			} else if (c.kind == CONT_DO_WHILE) {
-				cont_n--;
-				Token *w = tok_next(end);
-				while (w && w->kind == TK_PREP_DIR) w = tok_next(w);
-				if (w && (w->tag & TT_LOOP) && equal(w, "while")) {
-					Token *p = tok_next(w);
-					while (p && p->kind == TK_PREP_DIR) p = tok_next(p);
-					if (p && match_ch(p, '(') && tok_match(p)) {
-						Token *a = tok_next(tok_match(p));
-						while (a && a->kind == TK_PREP_DIR) a = tok_next(a);
-						if (a && match_ch(a, ';')) { end = a; continue; }
-					}
-				}
-				free(cont_stack); return NULL;
-			}
-		}
-		free(cont_stack);
-		return end;
+		end = tok_match(tok);
+		goto process_cont;
 	}
 
 	// 'if' / 'else'
@@ -6363,42 +6341,45 @@ restart:
 			if (s->flags & TF_OPEN) pd++;
 			else if (s->flags & TF_CLOSE) pd--;
 			else if (pd == 0 && match_ch(s, ';')) {
-				Token *end = s;
-				// Process continuations
-				while (cont_n > 0) {
-					Cont c = cont_stack[cont_n - 1];
-					if (c.kind == CONT_IF_ELSE) {
-						cont_n--;
-						Token *n = tok_next(end);
-						while (n && n->kind == TK_PREP_DIR) n = tok_next(n);
-						if (n && (n->tag & TT_IF) && tok_loc(n)[0] == 'e') {
-							tok = tok_next(n);
-							goto restart;
-						}
-						// no else — end stays
-					} else if (c.kind == CONT_DO_WHILE) {
-						cont_n--;
-						Token *w = tok_next(end);
-						while (w && w->kind == TK_PREP_DIR) w = tok_next(w);
-						if (w && (w->tag & TT_LOOP) && equal(w, "while")) {
-							Token *p2 = tok_next(w);
-							while (p2 && p2->kind == TK_PREP_DIR) p2 = tok_next(p2);
-							if (p2 && match_ch(p2, '(') && tok_match(p2)) {
-								Token *a = tok_next(tok_match(p2));
-								while (a && a->kind == TK_PREP_DIR) a = tok_next(a);
-								if (a && match_ch(a, ';')) { end = a; continue; }
-							}
-						}
-						free(cont_stack); return NULL;
-					}
-				}
-				free(cont_stack);
-				return end;
+				end = s;
+				goto process_cont;
 			}
 		}
 	}
 	free(cont_stack);
 	return NULL;
+
+process_cont:
+	// Process continuations (shared by braced and simple statement paths)
+	while (cont_n > 0) {
+		Cont c = cont_stack[cont_n - 1];
+		if (c.kind == CONT_IF_ELSE) {
+			cont_n--;
+			Token *n = tok_next(end);
+			while (n && n->kind == TK_PREP_DIR) n = tok_next(n);
+			if (n && (n->tag & TT_IF) && tok_loc(n)[0] == 'e') {
+				tok = tok_next(n);
+				goto restart;
+			}
+			// no else — end stays
+		} else if (c.kind == CONT_DO_WHILE) {
+			cont_n--;
+			Token *w = tok_next(end);
+			while (w && w->kind == TK_PREP_DIR) w = tok_next(w);
+			if (w && (w->tag & TT_LOOP) && equal(w, "while")) {
+				Token *p2 = tok_next(w);
+				while (p2 && p2->kind == TK_PREP_DIR) p2 = tok_next(p2);
+				if (p2 && match_ch(p2, '(') && tok_match(p2)) {
+					Token *a = tok_next(tok_match(p2));
+					while (a && a->kind == TK_PREP_DIR) a = tok_next(a);
+					if (a && match_ch(a, ';')) { end = a; continue; }
+				}
+			}
+			free(cont_stack); return NULL;
+		}
+	}
+	free(cont_stack);
+	return end;
 }
 #undef PUSH_CONT
 
@@ -6574,6 +6555,11 @@ static void p1_full_depth_prescan(Token *tok) {
 #define CUR_SID() (scope_stack_local[scope_depth_local])
 #define P1D_STMT_RESET() do { at_stmt_start = true; p1d_saw_raw = false; \
 	p1d_saw_static = false; p1d_ternary_depth = 0; p1d_ctrl_pending = false; } while(0)
+#define P1D_SWITCH_ENSURE_CAP() do { if (p1d_switch_top >= p1d_switch_cap) { \
+	p1d_switch_cap *= 2; \
+	p1d_switch_stack = realloc(p1d_switch_stack, p1d_switch_cap * sizeof(uint16_t)); \
+	p1d_switch_end = realloc(p1d_switch_end, p1d_switch_cap * sizeof(uint32_t)); \
+	if (!p1d_switch_stack || !p1d_switch_end) error("out of memory"); } } while(0)
 
 	// Phase 3A: initialize scope range for file-scope typedef registration
 	td_scope_open = 0;
@@ -6798,12 +6784,7 @@ uint16_t sid = next_scope_id++;
 			// Phase 1D: track switch scope for case label association
 			if (p1d_cur_func >= 0 && sid < scope_tree_count &&
 			    scope_tree[sid].is_switch) {
-				if (p1d_switch_top >= p1d_switch_cap) {
-					p1d_switch_cap *= 2;
-					p1d_switch_stack = realloc(p1d_switch_stack, p1d_switch_cap * sizeof(uint16_t));
-					p1d_switch_end = realloc(p1d_switch_end, p1d_switch_cap * sizeof(uint32_t));
-					if (!p1d_switch_stack || !p1d_switch_end) error("out of memory");
-				}
+				P1D_SWITCH_ENSURE_CAP();
 				p1_alloc(P1K_SWITCH, sid, tok);
 				p1d_switch_stack[p1d_switch_top] = sid;
 				p1d_switch_end[p1d_switch_top] = 0; // braced: popped at }
@@ -7590,12 +7571,7 @@ uint16_t sid = next_scope_id++;
 					if (synth_sid > UINT16_MAX)
 						error_tok(tok, "too many scopes + braceless switches (>65535)");
 					p1_alloc(P1K_SWITCH, (uint16_t)synth_sid, tok);
-					if (p1d_switch_top >= p1d_switch_cap) {
-						p1d_switch_cap *= 2;
-						p1d_switch_stack = realloc(p1d_switch_stack, p1d_switch_cap * sizeof(uint16_t));
-						p1d_switch_end = realloc(p1d_switch_end, p1d_switch_cap * sizeof(uint32_t));
-						if (!p1d_switch_stack || !p1d_switch_end) error("out of memory");
-					}
+					P1D_SWITCH_ENSURE_CAP();
 					p1d_switch_stack[p1d_switch_top] = synth_sid;
 					Token *end = skip_one_stmt(body);
 					p1d_switch_end[p1d_switch_top] = end ? tok_idx(end) : UINT32_MAX;

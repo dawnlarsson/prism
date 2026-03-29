@@ -5196,6 +5196,107 @@ static void test_orelse_multiply_false_positive(void) {
 	}
 }
 
+// BUG75: reject_orelse_side_effects checked unary * (pointer dereference)
+// but not -> (member access), . (dot access), or [] (array subscript).
+// All three implicitly dereference memory and produce double volatile reads
+// when the chained ternary evaluates LHS twice. ISO C11 §5.1.2.3p2:
+// accessing a volatile-qualified object is a side effect.
+static void test_orelse_member_subscript_volatile_double_eval(void) {
+	printf("\n--- orelse member/subscript volatile double-eval ---\n");
+
+	// Sub-test 1: -> in chained bracket orelse — must be rejected
+	{
+		const char *code =
+		    "struct HW { int status; };\n"
+		    "extern volatile struct HW *uart_reg;\n"
+		    "void f(void) {\n"
+		    "    int buf[ 0 orelse uart_reg->status orelse 1 ];\n"
+		    "    (void)buf;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vol_arrow.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG75a: -> in chained bracket orelse must be rejected "
+		      "(volatile double-read)");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: . in chained bracket orelse — must be rejected
+	{
+		const char *code =
+		    "struct S { int len; };\n"
+		    "void f(void) {\n"
+		    "    volatile struct S s;\n"
+		    "    int buf[ 0 orelse s.len orelse 1 ];\n"
+		    "    (void)buf;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vol_dot.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG75b: . in chained bracket orelse must be rejected "
+		      "(volatile double-read)");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: [] in chained bracket orelse — must be rejected
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    volatile int arr[5];\n"
+		    "    int buf[ 0 orelse arr[0] orelse 1 ];\n"
+		    "    (void)buf;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vol_subscript.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG75c: [] in chained bracket orelse must be rejected "
+		      "(volatile double-read)");
+		prism_free(&r);
+	}
+
+	// Sub-test 4: non-chained single bracket orelse with -> — must succeed
+	// (uses hoisted temp, no double-eval)
+	{
+		const char *code =
+		    "struct S { int len; };\n"
+		    "void f(struct S *p) {\n"
+		    "    int buf[ p->len orelse 1 ];\n"
+		    "    (void)buf;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "arrow_single.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "BUG75d: -> in single bracket orelse (hoisted temp) must "
+		      "succeed — no double-eval");
+		prism_free(&r);
+	}
+
+	// Sub-test 5: non-chained single bracket orelse with [] — must succeed
+	{
+		const char *code =
+		    "void f(int *arr) {\n"
+		    "    int buf[ arr[0] orelse 1 ];\n"
+		    "    (void)buf;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "subscript_single.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "BUG75e: [] in single bracket orelse (hoisted temp) must "
+		      "succeed — no double-eval");
+		prism_free(&r);
+	}
+
+	// Sub-test 6: -> in typeof orelse (ternary path) — must be rejected
+	{
+		const char *code =
+		    "struct S { int len; };\n"
+		    "void f(struct S *p) {\n"
+		    "    typeof(int[p->len orelse 1]) *q;\n"
+		    "    (void)q;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "arrow_typeof.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "BUG75f: -> in typeof orelse (ternary double-eval) must "
+		      "be rejected");
+		prism_free(&r);
+	}
+}
+
 // BUG56: reject_orelse_side_effects fires on the assignment target BEFORE
 // determining whether the orelse action is bare-fallback (needs double-eval
 // of LHS) or control-flow (evaluates LHS once via if-guard).
@@ -5704,6 +5805,7 @@ void run_orelse_tests(void) {
 	test_orelse_multiply_false_positive();
 
 	test_orelse_sideeffect_false_positive_on_action();
+	test_orelse_member_subscript_volatile_double_eval();
 	test_const_chained_orelse_block_action();
 
 	// VLA typedef cast bypass in bare orelse
