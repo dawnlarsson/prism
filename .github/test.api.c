@@ -6394,6 +6394,79 @@ static void test_collect_source_defines_midline_block_comment(void) {
 	}
 }
 
+/* Audit round 51a: raw string literal R"delim(...)delim" must not
+   confuse collect_source_defines into leaking defines hidden inside
+   the raw string body or losing defines after it. */
+static void test_collect_source_defines_raw_string_desync(void) {
+	printf("\n--- Raw String Desync in collect_source_defines ---\n");
+	/* Multi-line raw string containing /* and a #define.
+	   If collect_source_defines incorrectly extracts HIDDEN_RAW,
+	   it gets passed as -DHIDDEN_RAW=123 to the preprocessor,
+	   making the #ifdef block live and emitting 'leaked_marker'. */
+	{
+		char *path = create_temp_file(
+			"const char *s = R\"delim(/* fake comment\n"
+			"#define HIDDEN_RAW 123\n"
+			")delim\";\n"
+			"#define AFTER_RAW 42\n"
+			"#ifdef HIDDEN_RAW\n"
+			"int leaked_marker = HIDDEN_RAW;\n"
+			"#endif\n"
+			"int main(void) { return AFTER_RAW; }\n");
+		CHECK(path != NULL, "raw-desync: create temp file");
+		if (!path) return;
+
+		PrismFeatures feat = prism_defaults();
+		feat.flatten_headers = false;
+		PrismResult r = prism_transpile_file(path, feat);
+		CHECK_EQ(r.status, PRISM_OK, "raw-desync: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "leaked_marker") == NULL,
+			      "raw-desync: HIDDEN_RAW must NOT be extracted from raw string body");
+			CHECK(strstr(r.output, "42") != NULL,
+			      "raw-desync: AFTER_RAW must be extracted and expanded");
+		}
+		prism_free(&r);
+		unlink(path); free(path);
+	}
+}
+
+/* Audit round 51b: deeply nested brackets must not exhaust the C call
+   stack — walk_balanced_orelse uses an iterative explicit stack. */
+static void test_walk_balanced_orelse_deep_brackets(void) {
+	printf("\n--- Deep Bracket Nesting (walk_balanced_orelse) ---\n");
+	{
+		/* Build: int b=1; int x = a[b[b[...[0]...]]]; with 10000 levels */
+		int depth = 10000;
+		size_t cap = (size_t)depth * 4 + 256;
+		char *code = malloc(cap);
+		CHECK(code != NULL, "deep-bracket: alloc");
+		if (!code) return;
+		int n = snprintf(code, cap,
+			"int b = 1;\n"
+			"int x = a");
+		for (int i = 0; i < depth; i++)
+			n += snprintf(code + n, cap - (size_t)n, "[b");
+		n += snprintf(code + n, cap - (size_t)n, "[0]");
+		for (int i = 0; i < depth; i++)
+			n += snprintf(code + n, cap - (size_t)n, "]");
+		n += snprintf(code + n, cap - (size_t)n, ";\n"
+			"int main(void) { return 0; }\n");
+
+		char *path = create_temp_file(code);
+		free(code);
+		CHECK(path != NULL, "deep-bracket: create temp file");
+		if (!path) return;
+
+		PrismFeatures feat = prism_defaults();
+		PrismResult r = prism_transpile_file(path, feat);
+		CHECK_EQ(r.status, PRISM_OK,
+			 "deep-bracket: 10000-deep nesting must not crash");
+		prism_free(&r);
+		unlink(path); free(path);
+	}
+}
+
 void run_api_tests(void) {
 test_typeof_orelse_leak();
 	printf("\n=== API TESTS ===\n");
@@ -6622,4 +6695,8 @@ test_typeof_orelse_leak();
 
 	// Audit round 50: collect_source_defines mid-line block comment
 	test_collect_source_defines_midline_block_comment();
+
+	// Audit round 51: raw string desync + deep bracket nesting
+	test_collect_source_defines_raw_string_desync();
+	test_walk_balanced_orelse_deep_brackets();
 }

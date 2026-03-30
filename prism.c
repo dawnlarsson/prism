@@ -2927,10 +2927,58 @@ static Token *walk_balanced_orelse(Token *tok) {
 			}
 		}
 		// No pre-hoisted dim — emit normally with nested orelse awareness.
-		for (Token *t = tok; t != tok_next(end) && t->kind != TK_EOF;) {
+		// Iterative: use an explicit stack to avoid C call-stack exhaustion
+		// on deeply nested subscript expressions (e.g. a[b[c[...[0]...]]]).
+		typedef struct { Token *end; } WboFrame;
+		int wbo_n = 0, wbo_cap = 0;
+		WboFrame *wbo_stack = NULL;
+		Token *t = tok;
+	wbo_loop:
+		for (; t != tok_next(end) && t->kind != TK_EOF;) {
 			if (t != tok && t != end && match_ch(t, '[') && (t->flags & TF_OPEN) && tok_match(t)) {
-				t = walk_balanced_orelse(t);
-				continue;
+				// Instead of recursing, push current frame and enter inner bracket
+				Token *inner_end = tok_match(t);
+				// Scan inner bracket for orelse (same logic as top of function)
+				bool inner_has_orelse = false;
+				Token *ip = t;
+				for (Token *it = tok_next(t); it && it != inner_end; it = tok_next(it)) {
+					if (it->flags & TF_OPEN) { ip = tok_match(it); it = tok_match(it); continue; }
+					if ((it->tag & TT_ORELSE) && !typedef_lookup(it) &&
+					    !(ip && (ip->tag & TT_MEMBER))) {
+						inner_has_orelse = true; break;
+					}
+					ip = it;
+				}
+				if (inner_has_orelse) {
+					// Orelse found — must use full walk_balanced_orelse logic
+					// (the orelse path is bounded depth, safe to recurse once)
+					t = walk_balanced_orelse(t);
+					continue;
+				}
+				// No orelse in inner bracket — push frame, iterate into it
+				if (wbo_n >= wbo_cap) {
+					wbo_cap = wbo_cap ? wbo_cap * 2 : 64;
+					void *tmp = realloc(wbo_stack, (size_t)wbo_cap * sizeof(WboFrame));
+					if (!tmp) { free(wbo_stack); error_tok(t, "out of memory"); }
+					wbo_stack = tmp;
+				}
+				// Check for pre-hoisted dim on the inner bracket
+				if (ctx->bracket_dim_next < ctx->bracket_dim_count) {
+					unsigned dim = ctx->bracket_dim_ids[ctx->bracket_dim_next++];
+					if (dim != (unsigned)-1) {
+						emit_tok(t); // emit [
+						OUT_LIT(" __prism_dim_");
+						out_uint(dim);
+						emit_tok(inner_end); // emit ]
+						t = tok_next(inner_end);
+						continue;
+					}
+				}
+				// Save outer end, enter inner bracket
+				wbo_stack[wbo_n++] = (WboFrame){ .end = end };
+				tok = t; end = inner_end;
+				t = tok; // restart from inner [
+				goto wbo_loop;
 			}
 			// GNU statement expression ({...}): route through walk_balanced which
 			// handles zero-init, defer, goto, raw stripping, etc.
@@ -2944,8 +2992,36 @@ static Token *walk_balanced_orelse(Token *tok) {
 			    tok_next(t) && match_ch(tok_next(t), '(')) {
 				emit_tok(t);           // typeof keyword
 				t = tok_next(t);       // (
-				t = walk_balanced_orelse(t);
-				continue;
+				// typeof(...) — check for orelse inside
+				Token *typeof_end = tok_match(t);
+				if (typeof_end) {
+					bool has_orelse = false;
+					Token *tp = t;
+					for (Token *it = tok_next(t); it && it != typeof_end; it = tok_next(it)) {
+						if (it->flags & TF_OPEN) { tp = tok_match(it); it = tok_match(it); continue; }
+						if ((it->tag & TT_ORELSE) && !typedef_lookup(it) &&
+						    !(tp && (tp->tag & TT_MEMBER))) {
+							has_orelse = true; break;
+						}
+						tp = it;
+					}
+					if (has_orelse) {
+						// Orelse found — use full logic (bounded, safe to call)
+						t = walk_balanced_orelse(t);
+						continue;
+					}
+				}
+				// No orelse — push frame, iterate into typeof parens
+				if (wbo_n >= wbo_cap) {
+					wbo_cap = wbo_cap ? wbo_cap * 2 : 64;
+					void *tmp = realloc(wbo_stack, (size_t)wbo_cap * sizeof(WboFrame));
+					if (!tmp) { free(wbo_stack); error_tok(t, "out of memory"); }
+					wbo_stack = tmp;
+				}
+				wbo_stack[wbo_n++] = (WboFrame){ .end = end };
+				tok = t; end = typeof_end;
+				t = tok; // restart from (
+				goto wbo_loop;
 			}
 			// Defense-in-depth: if an 'orelse' token reaches here it was not caught by
 			// the depth-0 scan above — likely wrapped in parens deeper than one level.
@@ -2956,6 +3032,15 @@ static Token *walk_balanced_orelse(Token *tok) {
 					   "use '[f() orelse 1]' not '[(f() orelse 1)]'");
 			emit_tok(t); t = tok_next(t);
 		}
+		// Pop frame if any
+		if (wbo_n > 0) {
+			WboFrame f = wbo_stack[--wbo_n];
+			end = f.end;
+			// t is already at tok_next(old_end), which is the next token after
+			// the inner bracket/paren we just finished — continue the outer loop
+			goto wbo_loop;
+		}
+		free(wbo_stack);
 		return tok_next(end);
 	}
 	// Defense-in-depth: control-flow actions are rejected in Phase 1G;
@@ -5195,13 +5280,47 @@ static inline void free_source_defines(void) {
 }
 
 // Scan a line segment for an unclosed /* block comment outside
-// string/char literals. Returns true if the segment ends inside
-// an unterminated block comment.
-static bool has_unclosed_block_comment(const char *p) {
+// string/char/raw-string literals. Returns true if the segment ends
+// inside an unterminated block comment.
+// If raw_delim_out is non-NULL and the line ends inside an unclosed
+// raw string literal, *raw_delim_out receives a malloc'd copy of the
+// delimiter (empty string for R"(...)") and the function returns false.
+static bool has_unclosed_block_comment(const char *p, char **raw_delim_out) {
+	if (raw_delim_out) *raw_delim_out = NULL;
 	bool in_str = false, in_chr = false;
 	for (; *p && *p != '\n'; p++) {
 		if (in_str) { if (*p == '\\' && p[1]) p++; else if (*p == '"') in_str = false; continue; }
 		if (in_chr) { if (*p == '\\' && p[1]) p++; else if (*p == '\'') in_chr = false; continue; }
+		// Detect raw string literal prefixes: R" u8R" uR" UR" LR"
+		if (*p == 'R' && p[1] == '"') {
+			const char *q = p + 2;
+			const char *dstart = q;
+			while (*q && *q != '(' && *q != ')' && *q != '\\' && *q != ' ' &&
+			       *q != '\t' && *q != '\n' && (q - dstart) < 17) q++;
+			if (*q == '(') {
+				int dlen = (int)(q - dstart);
+				const char *content = q + 1;
+				for (const char *r = content; *r && *r != '\n'; r++) {
+					if (*r == ')' && (dlen == 0 || strncmp(r + 1, dstart, dlen) == 0) &&
+					    r[1 + dlen] == '"') {
+						p = r + 1 + dlen; // skip to closing "
+						goto raw_closed;
+					}
+				}
+				// Raw string not closed on this line
+				if (raw_delim_out) {
+					*raw_delim_out = malloc(dlen + 1);
+					if (*raw_delim_out) { memcpy(*raw_delim_out, dstart, dlen); (*raw_delim_out)[dlen] = '\0'; }
+				}
+				return false;
+			raw_closed:;
+				continue;
+			}
+		} else if ((*p == 'u' || *p == 'U' || *p == 'L') && !in_str && !in_chr) {
+			const char *rp = p;
+			if (*rp == 'u' && rp[1] == '8') rp += 2; else rp++;
+			if (*rp == 'R' && rp[1] == '"') { p = rp - 1; continue; } // will hit R" on next iter
+		}
 		if (*p == '"') { in_str = true; continue; }
 		if (*p == '\'') { in_chr = true; continue; }
 		if (p[0] == '/' && p[1] == '/') return false;
@@ -5226,6 +5345,9 @@ static void collect_source_defines(const char *input_file) {
 	bool in_continuation = false;
 	bool in_block_comment = false;
 	bool in_hash_block_comment = false; // block comment started between # and directive name
+	bool in_raw_string = false;  // inside a multi-line raw string literal
+	char *raw_delim = NULL;      // delimiter for the current raw string (malloc'd)
+	int raw_delim_len = 0;
 	int cond_depth = 0; // #if/#ifdef/#ifndef nesting depth
 
 	// Condition stack: tracks raw directive text at each nesting level
@@ -5265,6 +5387,38 @@ static void collect_source_defines(const char *input_file) {
 			if (*p != '#') continue;
 			goto have_hash;
 		}
+		// Track multi-line raw string literals (R"delim(...)delim")
+		if (in_raw_string) {
+			// Search for )delim" on this line
+			for (char *r = line; *r && *r != '\n'; r++) {
+				if (*r == ')' &&
+				    (raw_delim_len == 0 || strncmp(r + 1, raw_delim, raw_delim_len) == 0) &&
+				    r[1 + raw_delim_len] == '"') {
+					in_raw_string = false;
+					free(raw_delim); raw_delim = NULL; raw_delim_len = 0;
+					p = r + 2 + raw_delim_len;
+					goto after_raw_string_close;
+				}
+			}
+			continue; // entire line is inside raw string
+		after_raw_string_close:
+			while (*p == ' ' || *p == '\t') p++;
+			if (*p == '\n' || *p == '\0') continue;
+			// Rest of line may contain code/directives — fall through
+			if (*p == '#') goto have_hash;
+			// Check for block comment or another raw string on remainder
+			{
+				char *rd = NULL;
+				if (has_unclosed_block_comment(p, &rd)) {
+					in_block_comment = true;
+				} else if (rd) {
+					in_raw_string = true;
+					raw_delim = rd;
+					raw_delim_len = (int)strlen(rd);
+				}
+			}
+			continue;
+		}
 		// If previous line ended with '\', this is a continuation
 		if (in_continuation) {
 			char *end = line + strlen(line);
@@ -5285,16 +5439,22 @@ static void collect_source_defines(const char *input_file) {
 				p = close + 2;
 				while (*p == ' ' || *p == '\t') p++;
 				if (*p != '#') {
-					if (has_unclosed_block_comment(p))
+					char *rd = NULL;
+					if (has_unclosed_block_comment(p, &rd))
 						in_block_comment = true;
+					else if (rd) { in_raw_string = true; raw_delim = rd; raw_delim_len = (int)strlen(rd); }
 					continue;
 				}
 				goto have_hash;
 			}
 			// Non-preprocessor, non-blank line — scan for mid-line
-			// block comment that spans subsequent lines.
-			if (has_unclosed_block_comment(p))
-				in_block_comment = true;
+			// block comment or raw string that spans subsequent lines.
+			{
+				char *rd = NULL;
+				if (has_unclosed_block_comment(p, &rd))
+					in_block_comment = true;
+				else if (rd) { in_raw_string = true; raw_delim = rd; raw_delim_len = (int)strlen(rd); }
+			}
 			continue;
 		}
 	have_hash:
@@ -5523,9 +5683,12 @@ static void collect_source_defines(const char *input_file) {
 			in_continuation = (end > line && end[-1] == '\\');
 			// Directive lines may have trailing /* that opens a
 			// block comment spanning subsequent lines.
-			if (!in_continuation && !in_block_comment &&
-			    has_unclosed_block_comment(line))
-				in_block_comment = true;
+			if (!in_continuation && !in_block_comment && !in_raw_string) {
+				char *rd = NULL;
+				if (has_unclosed_block_comment(line, &rd))
+					in_block_comment = true;
+				else if (rd) { in_raw_string = true; raw_delim = rd; raw_delim_len = (int)strlen(rd); }
+			}
 		}
 	}
 	// Clean up condition stack (in case file ended without matching #endif)
@@ -5534,6 +5697,7 @@ static void collect_source_defines(const char *input_file) {
 		free(cond_stack[d].branches);
 	}
 	free(cond_stack);
+	free(raw_delim);
 	free(line);
 	fclose(f);
 }
