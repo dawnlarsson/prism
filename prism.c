@@ -5194,6 +5194,26 @@ static inline void free_source_defines(void) {
 	ctx->source_define_cap = 0;
 }
 
+// Scan a line segment for an unclosed /* block comment outside
+// string/char literals. Returns true if the segment ends inside
+// an unterminated block comment.
+static bool has_unclosed_block_comment(const char *p) {
+	bool in_str = false, in_chr = false;
+	for (; *p && *p != '\n'; p++) {
+		if (in_str) { if (*p == '\\' && p[1]) p++; else if (*p == '"') in_str = false; continue; }
+		if (in_chr) { if (*p == '\\' && p[1]) p++; else if (*p == '\'') in_chr = false; continue; }
+		if (*p == '"') { in_str = true; continue; }
+		if (*p == '\'') { in_chr = true; continue; }
+		if (p[0] == '/' && p[1] == '/') return false;
+		if (p[0] == '/' && p[1] == '*') {
+			const char *close = strstr(p + 2, "*/");
+			if (!close) return true;
+			p = close + 1;
+		}
+	}
+	return false;
+}
+
 static void collect_source_defines(const char *input_file) {
 	free_source_defines();
 	if (!input_file || FEAT(F_FLATTEN)) return;
@@ -5264,12 +5284,17 @@ static void collect_source_defines(const char *input_file) {
 				// Comment closes on same line — check rest for '#'
 				p = close + 2;
 				while (*p == ' ' || *p == '\t') p++;
-				if (*p != '#') continue;
+				if (*p != '#') {
+					if (has_unclosed_block_comment(p))
+						in_block_comment = true;
+					continue;
+				}
 				goto have_hash;
 			}
-			// Non-preprocessor, non-blank line — skip and continue
-			// scanning for ABI-altering defines that may appear after
-			// code lines (e.g. typedef or global declarations)
+			// Non-preprocessor, non-blank line — scan for mid-line
+			// block comment that spans subsequent lines.
+			if (has_unclosed_block_comment(p))
+				in_block_comment = true;
 			continue;
 		}
 	have_hash:
@@ -5496,6 +5521,11 @@ static void collect_source_defines(const char *input_file) {
 			char *end = line + strlen(line);
 			while (end > line && (end[-1] == '\n' || end[-1] == '\r')) end--;
 			in_continuation = (end > line && end[-1] == '\\');
+			// Directive lines may have trailing /* that opens a
+			// block comment spanning subsequent lines.
+			if (!in_continuation && !in_block_comment &&
+			    has_unclosed_block_comment(line))
+				in_block_comment = true;
 		}
 	}
 	// Clean up condition stack (in case file ended without matching #endif)
@@ -7744,23 +7774,32 @@ static void p1_verify_cfg(void) {
 		// into any label, bypassing defers or zeroinit.  If the function
 		// contains both a computed goto and any defers or zeroinit-tracked
 		// declarations, reject it up front.
-		if (fm->has_computed_goto) {
+		// asm goto has the same problem: jump targets are inside the
+		// assembly string and cannot be extracted by the token walker.
+		bool unverifiable_jump = fm->has_computed_goto ||
+			(fm->body_open->tag & TT_ASM);
+		if (unverifiable_jump) {
+			const char *jump_kind = fm->has_computed_goto
+				? "computed goto" : "asm goto";
 			P1FuncEntry *ents = &p1_entries[fm->entry_start];
 			for (int i = 0; i < fm->entry_count; i++) {
 				if (ents[i].kind == P1K_DEFER && FEAT(F_DEFER))
-					error_tok(fm->body_open, "computed goto cannot be used in a "
+					error_tok(fm->body_open, "%s cannot be used in a "
 						  "function that contains defer statements — the "
-						  "jump target cannot be verified at compile time");
+						  "jump target cannot be verified at compile time",
+						  jump_kind);
 				if (ents[i].kind == P1K_DECL && ents[i].decl.is_vla)
-					error_tok(fm->body_open, "computed goto cannot be used in a "
+					error_tok(fm->body_open, "%s cannot be used in a "
 						  "function that contains variable-length arrays — the "
-						  "jump target cannot be verified at compile time");
+						  "jump target cannot be verified at compile time",
+						  jump_kind);
 				if (ents[i].kind == P1K_DECL && FEAT(F_ZEROINIT) &&
 				    !ents[i].decl.has_raw && !ents[i].decl.is_static_storage &&
 				    !ents[i].decl.is_vla)
-					error_tok(fm->body_open, "computed goto cannot be used in a "
+					error_tok(fm->body_open, "%s cannot be used in a "
 						  "function that contains zero-initialized declarations — the "
-						  "jump target cannot be verified at compile time");
+						  "jump target cannot be verified at compile time",
+						  jump_kind);
 			}
 		}
 

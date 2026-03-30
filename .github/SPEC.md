@@ -375,7 +375,7 @@ Runs after all Phase 1 sub-phases complete. Gated by `F_DEFER | F_ZEROINIT` — 
 
 6. **Statement-expression boundary:** Gotos into a GNU statement expression are rejected. When resolving a forward or backward goto, if the target label is inside a `is_stmt_expr` scope and the goto is not within that same statement expression (checked via `scope_stmt_expr_ancestor`), a hard error is raised. Gotos *out of* a statement expression are allowed (GCC/Clang support this and Prism's defer+goto idioms rely on it).
 
-7. **Computed goto:** If `has_computed_goto` is set and the function has `P1K_DEFER` entries (when `F_DEFER`) or non-`raw`, non-static-storage `P1K_DECL` entries (when `F_ZEROINIT`), hard error — the jump target cannot be verified at compile time.
+7. **Computed goto / asm goto:** If `has_computed_goto` is set or the function body's opening `{` has `TT_ASM` (asm goto taint), and the function has `P1K_DEFER` entries (when `F_DEFER`) or VLA `P1K_DECL` entries or non-`raw`, non-static-storage `P1K_DECL` entries (when `F_ZEROINIT`), hard error — the jump target cannot be verified at compile time. `asm goto` labels are inside the assembly string and cannot be extracted by the token walker, making CFG verification impossible.
 
 8. **Unresolvable return type:** If the function has `P1K_DEFER` entries and does not return `void` but has no captured return type (`ret_type_start == NULL`), hard error. Anonymous struct return types (e.g., `struct { int x; } f() { defer ...; }`) cannot be spelled in a `typedef` for the defer cleanup temp variable. The user must use a named struct or typedef.
 
@@ -566,7 +566,7 @@ The scan covers two ranges: enclosing-scope defers `[0, blk->defer_start_idx)` a
 
 ### 6.5 Computed goto
 
-`goto *<expr>` is supported. `FuncMeta.has_computed_goto` is set during Phase 1D when `goto *` is detected. During Phase 2A (`p1_verify_cfg`), if a function contains both a computed goto and either (a) any `P1K_DEFER` entries (when `F_DEFER` is enabled) or (b) any non-`raw`, non-static-storage `P1K_DECL` entries (when `F_ZEROINIT` is enabled), a hard error is raised — the jump target cannot be verified at compile time, so defer cleanup or zero-initialization could be bypassed.
+`goto *<expr>` is supported. `FuncMeta.has_computed_goto` is set during Phase 1D when `goto *` is detected. `asm goto` is detected by the tokenizer which sets `TT_ASM` on the function body's opening `{` token. During Phase 2A (`p1_verify_cfg`), if a function contains either a computed goto or asm goto alongside (a) any `P1K_DEFER` entries (when `F_DEFER` is enabled) or (b) any VLA `P1K_DECL` entries or (c) any non-`raw`, non-static-storage `P1K_DECL` entries (when `F_ZEROINIT` is enabled), a hard error is raised — the jump target cannot be verified at compile time, so defer cleanup or zero-initialization could be bypassed.
 
 ### 6.6 _Generic
 
@@ -665,7 +665,7 @@ When `-fno-flatten-headers` is active, Prism runs `cc -E` which consumes in-file
 
 **Conditional guard extraction:** Defines inside `#ifdef`/`#ifndef`/`#if`/`#elif`/`#else` blocks are extracted along with their enclosing preprocessor guard text. A dynamically grown condition stack tracks each nesting level's opening directive (e.g., `#ifdef __APPLE__\n`) and current branch directive (e.g., `#else\n`). When a `#define` is found inside conditional blocks, `emit_consumed_defines` wraps it in the reconstructed guard (concatenation of all active condition stack entries' opening/branch text) followed by matching `#endif` lines. This preserves platform-gated defines like `#ifdef __APPLE__ / #define _DARWIN_C_SOURCE / #endif`.
 
-The scanner handles: multi-line block comments (tracked via `in_block_comment`), line continuations (`\` at end of line), inline block comments between `#` and the directive name, `#ifdef`/`#ifndef`/`#if`/`#elif`/`#else`/`#endif` nesting with condition stack tracking, multi-line continuation values, and `#define`s that follow block comment closings on the same line.
+The scanner handles: multi-line block comments (tracked via `in_block_comment`), mid-line block comment opens on non-directive and directive lines (detected via `has_unclosed_block_comment` which tracks string/char literal context to avoid false positives on `/*` inside string literals), line continuations (`\` at end of line), inline block comments between `#` and the directive name, `#ifdef`/`#ifndef`/`#if`/`#elif`/`#else`/`#endif` nesting with condition stack tracking, multi-line continuation values, and `#define`s that follow block comment closings on the same line.
 
 ---
 

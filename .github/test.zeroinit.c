@@ -2699,6 +2699,66 @@ static void test_stmt_expr_pragma_zeroinit_bypass(void) {
 	}
 }
 
+static void test_asm_goto_zeroinit_rejected(void) {
+	/* BUG: asm goto hides jump targets inside the assembly string.
+	   Prism's token walker skips asm parameters entirely and never
+	   extracts the labels, so no P1K_GOTO is recorded.  The CFG
+	   verifier was blind to asm goto jumps, allowing zeroinit'd
+	   declarations (VLA and non-VLA) to be bypassed.
+	   Fix: p1_verify_cfg checks TT_ASM on body_open alongside
+	   has_computed_goto. */
+	{
+		/* asm goto + VLA */
+		const char *code =
+		    "void f(int n) {\n"
+		    "    if (n) asm goto(\"jmp %l[out]\" : : : : out);\n"
+		    "    int vla[n];\n"
+		    "    return;\n"
+		    "out: vla[0] = 1;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "asm_goto_vla.c",
+						       prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "asm goto + VLA must be rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "asm goto") != NULL,
+			      "asm goto + VLA error must mention asm goto");
+		prism_free(&r);
+	}
+	{
+		/* asm goto + non-VLA zeroinit */
+		const char *code =
+		    "void f(int n) {\n"
+		    "    if (n) asm goto(\"jmp %l[out]\" : : : : out);\n"
+		    "    int x;\n"
+		    "    return;\n"
+		    "out: x = 1;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "asm_goto_zi.c",
+						       prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "asm goto + zeroinit must be rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "asm goto") != NULL,
+			      "asm goto + zeroinit error must mention asm goto");
+		prism_free(&r);
+	}
+	{
+		/* Regular asm (no goto) + zeroinit must still be allowed */
+		const char *code =
+		    "void f(void) {\n"
+		    "    int x;\n"
+		    "    asm volatile(\"nop\");\n"
+		    "    x = 1;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "asm_nogo.c",
+						       prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "regular asm (no goto) with zeroinit must be allowed");
+		prism_free(&r);
+	}
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -2835,4 +2895,7 @@ void run_zeroinit_tests(void) {
 
 	// BUG70: pragma in walk_balanced stmt-expr breaks at_stmt_start
 	test_stmt_expr_pragma_zeroinit_bypass();
+
+	// BUG: asm goto zeroinit CFG bypass
+	test_asm_goto_zeroinit_rejected();
 }
