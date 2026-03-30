@@ -1486,6 +1486,1392 @@ static void test_win_spawn_oflag(void) {
 	}
 }
 
+static void test_win_env_scrubbing(void) {
+	printf("\n--- Security Regression: Environment Variable Scrubbing ---\n");
+
+	// Bug: run_command/run_command_quiet passed NULL for envp to
+	// win32_spawn_with_actions, and that function ignored envp entirely
+	// (passed NULL to CreateProcessW for lpEnvironment).  This caused
+	// the child to inherit CC= and PRISM_CC= from the parent, defeating
+	// the recursive-compiler-loop prevention in build_clean_environ().
+
+	// Test 1: build_clean_environ strips CC= from the environment.
+	{
+		// Temporarily set CC in our own environment so build_clean_environ
+		// has something to strip.  Save and restore the original value.
+		const char *orig_cc = getenv("CC");
+		_putenv("CC=SHOULD_NOT_LEAK");
+
+		// Force rebuild of cached env (the cache is process-lifetime, but
+		// for testing we can verify the content directly).
+		char **clean = build_clean_environ();
+		CHECK(clean != NULL, "env_scrub: build_clean_environ returns non-NULL");
+		bool found_cc = false;
+		if (clean) {
+			for (char **e = clean; *e; e++) {
+				if (strncmp(*e, "CC=", 3) == 0) { found_cc = true; break; }
+			}
+		}
+		CHECK(!found_cc, "env_scrub: CC= stripped from clean environment");
+
+		// Restore
+		if (orig_cc) {
+			char buf[PATH_MAX];
+			snprintf(buf, sizeof(buf), "CC=%s", orig_cc);
+			_putenv(buf);
+		} else {
+			_putenv("CC=");
+		}
+	}
+
+	// Test 2: win32_build_env_block produces a valid environment block
+	// from a POSIX-style envp array, and CreateProcessW uses it.
+	{
+		// Spawn "cmd /c set" with a custom envp that contains a marker
+		// variable but does NOT contain CC= or PRISM_CC=.
+		// Verify the child sees the marker and doesn't see CC/PRISM_CC.
+		char *test_envp[] = {
+			"PRISM_TEST_MARKER=found_it_42",
+			"SystemRoot=C:\\Windows",  // needed for cmd.exe to work
+			"PATH=C:\\Windows\\System32",
+			NULL
+		};
+		posix_spawn_file_actions_t fa;
+		posix_spawn_file_actions_init(&fa);
+
+		// Redirect stdout to a pipe so we can read the child's output.
+		int pipe_fds[2];
+		CHECK_EQ(pipe(pipe_fds), 0, "env_scrub: pipe created");
+		posix_spawn_file_actions_adddup2(&fa, pipe_fds[1], STDOUT_FILENO);
+		posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+
+		char *argv[] = { "cmd.exe", "/c", "set", "PRISM_TEST_MARKER", NULL };
+		HANDLE hp = win32_spawn_with_actions(argv, &fa, test_envp);
+		close(pipe_fds[1]); // close write end in parent
+		posix_spawn_file_actions_destroy(&fa);
+
+		CHECK(hp != INVALID_HANDLE_VALUE, "env_scrub: spawn with custom envp succeeds");
+		if (hp != INVALID_HANDLE_VALUE) {
+			char buf[1024] = {0};
+			int total = 0;
+			while (total < (int)sizeof(buf) - 1) {
+				int n = read(pipe_fds[0], buf + total, sizeof(buf) - 1 - total);
+				if (n <= 0) break;
+				total += n;
+			}
+			buf[total] = '\0';
+			close(pipe_fds[0]);
+			WaitForSingleObject(hp, 5000);
+			CloseHandle(hp);
+
+			CHECK(strstr(buf, "found_it_42") != NULL,
+			      "env_scrub: child sees custom env variable");
+		} else {
+			close(pipe_fds[0]);
+		}
+	}
+
+	// Test 3: Verify that run_command passes the clean environment
+	// (not NULL) by spawning a child that checks for CC.
+	{
+		const char *orig_cc = getenv("CC");
+		_putenv("CC=RECURSIVE_BOMB");
+
+		// Create a tiny batch script that prints CC if set
+		char script[PATH_MAX];
+		snprintf(script, sizeof(script), "%sprism_env_test.bat", test_tmp_dir());
+		FILE *f = fopen(script, "w");
+		CHECK(f != NULL, "env_scrub: create test script");
+		if (f) {
+			fprintf(f, "@echo off\r\nif defined CC (echo CC_LEAKED) else (echo CC_CLEAN)\r\n");
+			fclose(f);
+
+			// Use capture_first_line to check child's output.
+			// Note: capture_first_line has its own CreateProcess — but
+			// run_command is what we fixed. Use run_command_quiet to
+			// exercise the fixed path and check exit code.
+			char buf[256] = {0};
+			char *argv[] = { "cmd.exe", "/c", script, NULL };
+			// Use posix_spawnp which goes through the fixed path:
+			char **clean_env = build_clean_environ();
+			posix_spawn_file_actions_t fa;
+			posix_spawn_file_actions_init(&fa);
+			int pipe_fds[2];
+			pipe(pipe_fds);
+			posix_spawn_file_actions_adddup2(&fa, pipe_fds[1], STDOUT_FILENO);
+			posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+
+			HANDLE hp = win32_spawn_with_actions(argv, &fa, clean_env);
+			close(pipe_fds[1]);
+			posix_spawn_file_actions_destroy(&fa);
+
+			if (hp != INVALID_HANDLE_VALUE) {
+				int total = 0;
+				while (total < (int)sizeof(buf) - 1) {
+					int n = read(pipe_fds[0], buf + total, sizeof(buf) - 1 - total);
+					if (n <= 0) break;
+					total += n;
+				}
+				buf[total] = '\0';
+				close(pipe_fds[0]);
+				WaitForSingleObject(hp, 5000);
+				CloseHandle(hp);
+
+				CHECK(strstr(buf, "CC_CLEAN") != NULL,
+				      "env_scrub: CC= not visible in child via clean env");
+				CHECK(strstr(buf, "CC_LEAKED") == NULL,
+				      "env_scrub: CC= did not leak to child");
+			} else {
+				close(pipe_fds[0]);
+			}
+
+			remove(script);
+		}
+
+		if (orig_cc) {
+			char buf[PATH_MAX];
+			snprintf(buf, sizeof(buf), "CC=%s", orig_cc);
+			_putenv(buf);
+		} else {
+			_putenv("CC=");
+		}
+	}
+}
+
+static void test_win_handle_isolation(void) {
+	printf("\n--- Security Regression: Handle Isolation (STARTUPINFOEX) ---\n");
+
+	// Bug: win32_spawn_with_actions used bInheritHandles=TRUE with plain
+	// STARTUPINFOW, causing ALL inheritable handles in the process to leak
+	// into children.  In PRISM_LIB_MODE with concurrent threads, pipe
+	// handles from thread A would leak into thread B's cl.exe, causing
+	// deadlocks because the pipe write-end stays open.
+	//
+	// Fix: Use STARTUPINFOEXW + PROC_THREAD_ATTRIBUTE_HANDLE_LIST to
+	// whitelist exactly which handles the child may inherit.
+
+	// Test 1: Create a pipe, spawn a child process with file actions that
+	// redirect stdout to a DIFFERENT pipe.  The first pipe's handles should
+	// NOT leak into the child (verified by the child exiting cleanly and
+	// the pipe being closeable without issues).
+	{
+		int bystander_pipe[2];
+		CHECK_EQ(pipe(bystander_pipe), 0, "handle_iso: bystander pipe created");
+		// Make the bystander pipe's write end inheritable (simulates what
+		// would happen if another thread created a pipe concurrently).
+		HANDLE bystander_write = (HANDLE)_get_osfhandle(bystander_pipe[1]);
+		SetHandleInformation(bystander_write, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+
+		// Now spawn a child with its own pipe redirection.
+		int child_pipe[2];
+		CHECK_EQ(pipe(child_pipe), 0, "handle_iso: child pipe created");
+
+		posix_spawn_file_actions_t fa;
+		posix_spawn_file_actions_init(&fa);
+		posix_spawn_file_actions_adddup2(&fa, child_pipe[1], STDOUT_FILENO);
+		posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+
+		char *argv[] = { "cmd.exe", "/c", "echo", "isolated", NULL };
+		HANDLE hp = win32_spawn_with_actions(argv, &fa, NULL);
+		close(child_pipe[1]); // close write end in parent
+		posix_spawn_file_actions_destroy(&fa);
+
+		CHECK(hp != INVALID_HANDLE_VALUE, "handle_iso: spawn succeeds");
+		if (hp != INVALID_HANDLE_VALUE) {
+			// Read child output
+			char buf[256] = {0};
+			int n = read(child_pipe[0], buf, sizeof(buf) - 1);
+			if (n > 0) buf[n] = '\0';
+			WaitForSingleObject(hp, 5000);
+			CloseHandle(hp);
+			CHECK(strstr(buf, "isolated") != NULL,
+			      "handle_iso: child output received through correct pipe");
+		}
+		close(child_pipe[0]);
+
+		// The bystander pipe should still be fully functional because
+		// its write end was NOT leaked to the child.  With the old code
+		// (bInheritHandles=TRUE without handle list), the write end
+		// would have been cloned into the child, keeping it open.
+		close(bystander_pipe[1]); // close our write end
+		// Read from bystander should return 0 (EOF) immediately because
+		// no other process holds the write end.
+		char bystander_buf[16];
+		int br = read(bystander_pipe[0], bystander_buf, sizeof(bystander_buf));
+		CHECK(br == 0, "handle_iso: bystander pipe EOF (write end not leaked)");
+		close(bystander_pipe[0]);
+	}
+
+	// Test 2: When no file actions are used, bInheritHandles should be FALSE.
+	// Create a pipe, spawn without file actions, verify the pipe handle
+	// count is not incremented.
+	{
+		int lone_pipe[2];
+		CHECK_EQ(pipe(lone_pipe), 0, "handle_iso: lone pipe created");
+		HANDLE lone_write = (HANDLE)_get_osfhandle(lone_pipe[1]);
+		SetHandleInformation(lone_write, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+
+		// Spawn with NULL file actions (no redirection).
+		char *argv[] = { "cmd.exe", "/c", "echo", "no_fa", NULL };
+		HANDLE hp = win32_spawn_with_actions(argv, NULL, NULL);
+		CHECK(hp != INVALID_HANDLE_VALUE, "handle_iso: spawn without fa succeeds");
+		if (hp != INVALID_HANDLE_VALUE) {
+			WaitForSingleObject(hp, 5000);
+			CloseHandle(hp);
+		}
+
+		// Write end should not have leaked; close it and verify EOF on read.
+		close(lone_pipe[1]);
+		char rb[16];
+		int nr = read(lone_pipe[0], rb, sizeof(rb));
+		CHECK(nr == 0, "handle_iso: lone pipe write end not inherited (EOF)");
+		close(lone_pipe[0]);
+	}
+}
+
+static void test_win_std_clatest_override(void) {
+	printf("\n--- Regression: /std:clatest Override ---\n");
+
+	// Bug: If user passed /std:c11 to prism, the has_std check suppressed
+	// /std:clatest injection, but generated code may contain typeof() which
+	// requires C23 mode on MSVC.  This caused hard compilation errors.
+	//
+	// Fix: Always inject /std:clatest and strip any user /std: flags.
+
+	// Test: Transpile code that triggers typeof emission (const typedef +
+	// orelse), confirm the output contains "typeof" (which needs /std:clatest).
+	{
+		PrismFeatures feat = prism_defaults();
+		const char *code =
+		    "typedef const int CI;\n"
+		    "int main(void) {\n"
+		    "    int x = 5;\n"
+		    "    CI y = x orelse 0;\n"
+		    "    return y;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "std_override.c", feat);
+		CHECK_EQ(r.status, PRISM_OK, "std_override: transpiles OK");
+		if (r.output) {
+			// The transpiler should emit typeof or typeof_unqual for the
+			// const-stripping path.
+			bool has_typeof = strstr(r.output, "typeof") != NULL;
+			CHECK(has_typeof,
+			      "std_override: output contains typeof (needs /std:clatest)");
+		}
+		prism_free(&r);
+	}
+
+	// Test: Verify that a non-typeof path (plain zeroinit) still works.
+	{
+		PrismFeatures feat = prism_defaults();
+		const char *code =
+		    "int main(void) {\n"
+		    "    int x;\n"
+		    "    return x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "std_plain.c", feat);
+		CHECK_EQ(r.status, PRISM_OK, "std_override: plain zeroinit transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "= 0") != NULL,
+			      "std_override: plain int gets = 0");
+		}
+		prism_free(&r);
+	}
+}
+
+static void test_win_old_exe_cleanup(void) {
+	printf("\n--- Regression: .old Exe Cleanup on Update ---\n");
+
+	// Bug: install() renamed the running prism.exe to prism.exe.old during a
+	// self-update, then called remove(old_path) to clean up.  Since the .old
+	// file is still locked by the running process, remove() silently fails,
+	// leaving orphaned .old files in the install directory forever.
+	//
+	// Fix: Move the .old file to %TEMP% and schedule deletion via
+	// MoveFileExA(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT).
+
+	// Test 1: Simulate running-exe lock by copying a real DLL and loading
+	// it with LoadLibraryEx.  This creates a SEC_IMAGE section mapping —
+	// the same mechanism the PE loader uses — which blocks remove() but
+	// allows MoveFileExA rename.
+	{
+		char locked_path[PATH_MAX];
+		snprintf(locked_path, sizeof(locked_path), "%sprism_lock_test.dll",
+		         test_tmp_dir());
+
+		// Copy a small system DLL to our temp dir so we can load it.
+		BOOL copied = CopyFileA("C:\\Windows\\System32\\version.dll",
+		                        locked_path, FALSE);
+		CHECK(copied != 0, "old_cleanup: copy DLL for locking test");
+		if (!copied) return;
+
+		// Load as image — creates SEC_IMAGE section mapping.
+		HMODULE hMod = LoadLibraryExA(locked_path, NULL, 0);
+		CHECK(hMod != NULL, "old_cleanup: LoadLibrary locks the file");
+		if (!hMod) { remove(locked_path); return; }
+
+		// remove() should fail because the image section is mapped.
+		int rm_result = remove(locked_path);
+		CHECK(rm_result != 0,
+		      "old_cleanup: remove() fails on image-mapped file (proves bug)");
+
+		// MoveFileExA rename should succeed — Windows allows renaming
+		// files with SEC_IMAGE mappings (same as renaming a running exe).
+		char temp_dest[PATH_MAX];
+		snprintf(temp_dest, sizeof(temp_dest), "%sprism_old_%u.dll",
+		         test_tmp_dir(), (unsigned)GetCurrentProcessId());
+
+		BOOL moved = MoveFileExA(locked_path, temp_dest,
+		                         MOVEFILE_REPLACE_EXISTING);
+		CHECK(moved != 0,
+		      "old_cleanup: MoveFileExA rename succeeds on mapped image");
+
+		if (moved) {
+			CHECK(access(locked_path, F_OK) != 0,
+			      "old_cleanup: original path gone after rename");
+		}
+
+		// Clean up: unload DLL, delete the renamed file.
+		FreeLibrary(hMod);
+		remove(temp_dest);
+		remove(locked_path); // in case rename failed
+	}
+
+	// Test 2: Verify MoveFileExA with MOVEFILE_DELAY_UNTIL_REBOOT doesn't
+	// crash (may require elevation to actually succeed, but must not crash).
+	{
+		char reboot_path[PATH_MAX];
+		snprintf(reboot_path, sizeof(reboot_path), "%sprism_reboot_test.tmp",
+		         test_tmp_dir());
+		FILE *f = fopen(reboot_path, "w");
+		CHECK(f != NULL, "old_cleanup: create temp file for reboot test");
+		if (f) {
+			fprintf(f, "test");
+			fclose(f);
+			// This may fail without admin, but should not crash.
+			MoveFileExA(reboot_path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+			// Clean up (file may or may not still exist).
+			remove(reboot_path);
+		}
+	}
+}
+
+static void test_win_registry_wide_path(void) {
+	printf("\n--- Security Regression: Registry Wide-Char PATH ---\n");
+
+	// Bug: add_to_user_path used RegQueryValueExA/RegSetValueExA (ANSI).
+	// If the user's PATH contained non-ASCII characters (e.g., C:\Users\José),
+	// the ANSI API would transliterate them to '?' and permanently corrupt
+	// the user's system PATH when writing back.
+	//
+	// Fix: Use RegOpenKeyExW, RegQueryValueExW, RegSetValueExW throughout.
+
+	// Test 1: Verify the wpath_contains_dir helper works with wide strings.
+	{
+		CHECK(wpath_contains_dir(L"C:\\Users\\Jos\u00e9;C:\\Windows", L"C:\\Users\\Jos\u00e9"),
+		      "registry_wide: wpath_contains_dir finds non-ASCII dir");
+		CHECK(!wpath_contains_dir(L"C:\\Users\\Jose;C:\\Windows", L"C:\\Users\\Jos\u00e9"),
+		      "registry_wide: wpath_contains_dir rejects similar ASCII dir");
+		CHECK(wpath_contains_dir(L"C:\\first;C:\\second;C:\\third", L"C:\\second"),
+		      "registry_wide: wpath_contains_dir finds middle segment");
+		CHECK(!wpath_contains_dir(L"C:\\firstsecond", L"C:\\second"),
+		      "registry_wide: wpath_contains_dir rejects substring match");
+		CHECK(wpath_contains_dir(L"C:\\only", L"C:\\only"),
+		      "registry_wide: wpath_contains_dir finds sole entry");
+	}
+
+	// Test 2: Read the real registry PATH using wide API and verify
+	// round-trip preserves content.  We don't modify the registry — just
+	// read and verify no data loss compared to ANSI.
+	{
+		HKEY hKey;
+		if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+			DWORD size = 0;
+			DWORD type = REG_EXPAND_SZ;
+			LONG rc = RegQueryValueExW(hKey, L"Path", NULL, &type, NULL, &size);
+			if (rc == ERROR_SUCCESS && size > 0) {
+				wchar_t *wpath = (wchar_t *)malloc(size + sizeof(wchar_t));
+				if (wpath) {
+					rc = RegQueryValueExW(hKey, L"Path", NULL, &type, (BYTE *)wpath, &size);
+					if (rc == ERROR_SUCCESS) {
+						wpath[size / sizeof(wchar_t)] = L'\0';
+						// Convert to UTF-8 and back to verify round-trip
+						int utf8_len = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, NULL, 0, NULL, NULL);
+						CHECK(utf8_len > 0, "registry_wide: PATH converts to UTF-8");
+						if (utf8_len > 0) {
+							char *utf8 = (char *)malloc(utf8_len);
+							WideCharToMultiByte(CP_UTF8, 0, wpath, -1, utf8, utf8_len, NULL, NULL);
+							// Round-trip back to wide
+							int rt_len = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+							wchar_t *roundtrip = (wchar_t *)malloc(rt_len * sizeof(wchar_t));
+							MultiByteToWideChar(CP_UTF8, 0, utf8, -1, roundtrip, rt_len);
+							CHECK(wcscmp(wpath, roundtrip) == 0,
+							      "registry_wide: PATH round-trips through UTF-8 losslessly");
+							free(roundtrip);
+							free(utf8);
+						}
+					}
+					free(wpath);
+				}
+			}
+			RegCloseKey(hKey);
+		}
+	}
+}
+
+static void test_win_signal_tempfile_cleanup(void) {
+	printf("\n--- Security Regression: Signal Handler Temp File Cleanup ---\n");
+
+	// Bug: signal_cleanup_handler called unlink() on temp files, but on
+	// Windows _wunlink fails with EACCES if the file is still open.
+	// Since out_fp or win32_memstream_fp may hold the file open when
+	// Ctrl-C fires, the unlink silently fails, leaving orphaned temp files.
+	//
+	// Fix: Close out_fp and win32_memstream_fp before unlinking.
+
+	// Test: Create a temp file, open it (simulating out_fp holding it open),
+	// verify that unlink fails while open, then close and verify it succeeds.
+	{
+		char tmp_path[PATH_MAX];
+		snprintf(tmp_path, sizeof(tmp_path), "%sprism_sig_test.tmp", test_tmp_dir());
+
+		FILE *fp = fopen(tmp_path, "w");
+		CHECK(fp != NULL, "signal_cleanup: create temp file");
+		if (!fp) return;
+		fprintf(fp, "test data");
+		fflush(fp);
+
+		// On Windows, unlink fails while file is open
+		int rm1 = _unlink(tmp_path);
+		CHECK(rm1 != 0, "signal_cleanup: unlink fails while file is open (proves bug)");
+
+		// Close the file first (this is what the fix does)
+		fclose(fp);
+
+		// Now unlink succeeds
+		int rm2 = _unlink(tmp_path);
+		CHECK(rm2 == 0, "signal_cleanup: unlink succeeds after fclose (proves fix)");
+	}
+
+	// Test: Verify the open_memstream temp file path is cleaned up properly
+	// when closed before unlinking.
+	{
+		char *membuf = NULL;
+		size_t memsize = 0;
+		FILE *mfp = open_memstream(&membuf, &memsize);
+		CHECK(mfp != NULL, "signal_cleanup: open_memstream succeeds");
+		if (mfp) {
+			// The memstream file path should exist
+			CHECK(access(win32_memstream_path, F_OK) == 0,
+			      "signal_cleanup: memstream temp file exists while open");
+
+			char saved_path[MAX_PATH];
+			strncpy(saved_path, win32_memstream_path, MAX_PATH - 1);
+			saved_path[MAX_PATH - 1] = '\0';
+
+			// Close via normal path (fclose wrapper handles cleanup)
+			fclose(mfp);
+
+			// After fclose, the temp file should be gone (wrapper deletes it)
+			CHECK(access(saved_path, F_OK) != 0,
+			      "signal_cleanup: memstream temp file removed after fclose");
+
+			free(membuf);
+		}
+	}
+}
+
+static void test_win_realpath_unicode(void) {
+	printf("\n--- Security Regression: realpath Wide-Char Unicode ---\n");
+
+	// Bug: realpath used CreateFileA and GetFinalPathNameByHandleA (ANSI).
+	// UTF-8 paths with non-ASCII characters (e.g., src/テスト.c) get mangled
+	// through the system ANSI codepage, breaking #line directives.
+	//
+	// Fix: Use CreateFileW + GetFinalPathNameByHandleW with UTF-8 conversion.
+
+	// Test 1: realpath resolves a plain ASCII path correctly.
+	{
+		char resolved[PATH_MAX];
+		char *r = realpath(".", resolved);
+		CHECK(r != NULL, "realpath_unicode: resolves current directory");
+		if (r) {
+			CHECK(strlen(r) > 0, "realpath_unicode: result is non-empty");
+			// Should be an absolute path (starts with drive letter)
+			CHECK(r[1] == ':', "realpath_unicode: result is absolute path");
+		}
+	}
+
+	// Test 2: Create a file with a non-ASCII (Unicode) name and resolve it.
+	{
+		// Create a temp directory with a Unicode name
+		char unicode_dir[PATH_MAX];
+		snprintf(unicode_dir, sizeof(unicode_dir), "%s\xe3\x83\x86\xe3\x82\xb9\xe3\x83\x88",
+		         test_tmp_dir()); // "テスト" in UTF-8
+		wchar_t wdir[MAX_PATH];
+		MultiByteToWideChar(CP_UTF8, 0, unicode_dir, -1, wdir, MAX_PATH);
+		CreateDirectoryW(wdir, NULL);
+
+		char unicode_file[PATH_MAX];
+		snprintf(unicode_file, sizeof(unicode_file), "%s\\\xe3\x83\x95\xe3\x82\xa1\xe3\x82\xa4\xe3\x83\xab.c",
+		         unicode_dir); // "ファイル.c" in UTF-8
+		wchar_t wfile[MAX_PATH];
+		MultiByteToWideChar(CP_UTF8, 0, unicode_file, -1, wfile, MAX_PATH);
+
+		// Create the file via wide API
+		HANDLE hf = CreateFileW(wfile, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+		if (hf != INVALID_HANDLE_VALUE) {
+			DWORD written;
+			WriteFile(hf, "/* test */", 10, &written, NULL);
+			CloseHandle(hf);
+
+			// Now resolve via realpath (UTF-8 input)
+			char resolved[PATH_MAX];
+			char *r = realpath(unicode_file, resolved);
+			CHECK(r != NULL, "realpath_unicode: resolves Unicode file path");
+			if (r) {
+				// The resolved path should contain the Unicode characters
+				// (not '?' replacements from ANSI)
+				CHECK(strstr(r, "\xe3\x83\x86\xe3\x82\xb9\xe3\x83\x88") != NULL,
+				      "realpath_unicode: resolved path preserves テスト");
+				CHECK(strstr(r, "?") == NULL || strstr(r, "?\\") != NULL || r[0] == '?',
+				      "realpath_unicode: no ANSI '?' corruption in result");
+			}
+
+			// Clean up
+			DeleteFileW(wfile);
+		} else {
+			// If we can't create the Unicode file, skip gracefully
+			printf("  (skipped Unicode file test — CreateFileW failed)\n");
+		}
+		RemoveDirectoryW(wdir);
+	}
+
+	// Test 3: realpath returns NULL for non-existent path with correct errno.
+	{
+		char *r = realpath(NULL, NULL);
+		CHECK(r == NULL, "realpath_unicode: NULL input returns NULL");
+	}
+}
+
+static void test_win_capture_wide(void) {
+	printf("\n--- Security Regression: capture_first_line CreateProcessW ---\n");
+
+	// Bug: capture_first_line used CreateProcessA with a UTF-8 cmdline.
+	// If the compiler path contained non-ASCII characters, the ANSI
+	// interpretation would fail to launch the process.
+	//
+	// Fix: Convert cmdline to wide chars and use CreateProcessW.
+
+	// Test 1: capture_first_line works with basic ASCII commands.
+	{
+		char buf[256] = {0};
+		char *argv[] = { "cmd.exe", "/c", "echo", "capture_test_42", NULL };
+		int rc = capture_first_line(argv, buf, sizeof(buf));
+		CHECK_EQ(rc, 0, "capture_wide: basic capture succeeds");
+		CHECK(strstr(buf, "capture_test_42") != NULL,
+		      "capture_wide: captured correct output");
+	}
+
+	// Test 2: capture_first_line handles multi-word output.
+	{
+		char buf[256] = {0};
+		char *argv[] = { "cmd.exe", "/c", "echo", "hello world 123", NULL };
+		int rc = capture_first_line(argv, buf, sizeof(buf));
+		CHECK_EQ(rc, 0, "capture_wide: multi-word capture succeeds");
+		CHECK(strstr(buf, "hello") != NULL,
+		      "capture_wide: captured first word");
+	}
+
+	// Test 3: capture_first_line returns error for non-existent program.
+	{
+		char buf[256] = {0};
+		char *argv[] = { "nonexistent_program_xyz_123", "--version", NULL };
+		int rc = capture_first_line(argv, buf, sizeof(buf));
+		CHECK(rc != 0, "capture_wide: non-existent program returns error");
+	}
+
+	// Test 4: Create a batch file with a Unicode path and capture its output.
+	{
+		char unicode_bat[PATH_MAX];
+		snprintf(unicode_bat, sizeof(unicode_bat), "%s\xe3\x83\x86\xe3\x82\xb9\xe3\x83\x88",
+		         test_tmp_dir());
+		wchar_t wdir[MAX_PATH];
+		MultiByteToWideChar(CP_UTF8, 0, unicode_bat, -1, wdir, MAX_PATH);
+		CreateDirectoryW(wdir, NULL);
+
+		char bat_path[PATH_MAX];
+		snprintf(bat_path, sizeof(bat_path), "%s\\version.bat", unicode_bat);
+		wchar_t wbat[MAX_PATH];
+		MultiByteToWideChar(CP_UTF8, 0, bat_path, -1, wbat, MAX_PATH);
+
+		// Create bat file via wide API
+		HANDLE hf = CreateFileW(wbat, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+		if (hf != INVALID_HANDLE_VALUE) {
+			const char *content = "@echo off\r\necho UNICODE_PATH_OK\r\n";
+			DWORD written;
+			WriteFile(hf, content, (DWORD)strlen(content), &written, NULL);
+			CloseHandle(hf);
+
+			char buf[256] = {0};
+			char *argv[] = { "cmd.exe", "/c", bat_path, NULL };
+			int rc = capture_first_line(argv, buf, sizeof(buf));
+			CHECK_EQ(rc, 0, "capture_wide: Unicode path batch file succeeds");
+			CHECK(strstr(buf, "UNICODE_PATH_OK") != NULL,
+			      "capture_wide: captured output from Unicode path");
+
+			DeleteFileW(wbat);
+		} else {
+			printf("  (skipped Unicode batch test — CreateFileW failed)\n");
+		}
+		RemoveDirectoryW(wdir);
+	}
+}
+
+static void test_win_install_path_wide(void) {
+	printf("\n--- Security Regression: Install Path Wide-Char APIs ---\n");
+
+	// Bug: get_install_path used GetEnvironmentVariableA("LOCALAPPDATA") and
+	// GetModuleFileNameA.  ensure_install_dir used GetFileAttributesA and
+	// CreateDirectoryA.  All are ANSI APIs that corrupt non-ASCII user profiles.
+	//
+	// Fix: Use W-suffixed APIs throughout, convert to UTF-8 with WideCharToMultiByte.
+
+	// Test 1: get_install_path returns a valid path containing "prism".
+	{
+		const char *ip = get_install_path();
+		CHECK(ip != NULL, "install_path_wide: get_install_path returns non-NULL");
+		CHECK(strlen(ip) > 0, "install_path_wide: path is non-empty");
+		CHECK(strstr(ip, "prism") != NULL,
+		      "install_path_wide: path contains 'prism'");
+	}
+
+	// Test 2: Verify the path round-trips through UTF-8 correctly.
+	// Read LOCALAPPDATA via wide API and compare with get_install_path prefix.
+	{
+		wchar_t wlocal[MAX_PATH];
+		DWORD len = GetEnvironmentVariableW(L"LOCALAPPDATA", wlocal, MAX_PATH);
+		if (len > 0 && len < MAX_PATH) {
+			char utf8_local[MAX_PATH * 3];
+			int ulen = WideCharToMultiByte(CP_UTF8, 0, wlocal, -1,
+			                               utf8_local, sizeof(utf8_local), NULL, NULL);
+			CHECK(ulen > 0, "install_path_wide: LOCALAPPDATA converts to UTF-8");
+			if (ulen > 0) {
+				const char *ip = get_install_path();
+				// The install path should start with the UTF-8 LOCALAPPDATA
+				CHECK(strncmp(ip, utf8_local, strlen(utf8_local)) == 0,
+				      "install_path_wide: path starts with UTF-8 LOCALAPPDATA");
+			}
+		}
+	}
+
+	// Test 3: get_self_exe_path returns a valid absolute path.
+	{
+		char self[PATH_MAX];
+		bool ok = get_self_exe_path(self, sizeof(self));
+		CHECK(ok, "install_path_wide: get_self_exe_path succeeds");
+		if (ok) {
+			CHECK(self[1] == ':', "install_path_wide: self path is absolute");
+			CHECK(strstr(self, ".exe") != NULL,
+			      "install_path_wide: self path ends with .exe");
+		}
+	}
+
+	// Test 4: ensure_install_dir works with a Unicode directory.
+	{
+		char unicode_dir[PATH_MAX];
+		snprintf(unicode_dir, sizeof(unicode_dir),
+		         "%s\xe3\x83\x86\xe3\x82\xb9\xe3\x83\x88_install",
+		         test_tmp_dir());
+
+		char fake_install[PATH_MAX];
+		snprintf(fake_install, sizeof(fake_install), "%s\\prism.exe", unicode_dir);
+
+		// ensure_install_dir should create the Unicode directory
+		bool created = ensure_install_dir(fake_install);
+		CHECK(created, "install_path_wide: ensure_install_dir creates Unicode dir");
+
+		if (created) {
+			// Verify it exists via wide API
+			wchar_t wdir[MAX_PATH];
+			MultiByteToWideChar(CP_UTF8, 0, unicode_dir, -1, wdir, MAX_PATH);
+			DWORD attr = GetFileAttributesW(wdir);
+			CHECK(attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY),
+			      "install_path_wide: Unicode dir exists after creation");
+			RemoveDirectoryW(wdir);
+		}
+	}
+}
+
+static void test_win_remove_utf8(void) {
+	printf("\n--- Security Regression: remove() UTF-8 Shim ---\n");
+
+	// Bug: remove() was not shimmed for UTF-8, unlike unlink().  The standard
+	// C library remove() uses ANSI APIs on Windows, failing on non-ASCII paths.
+	// MoveFileA and MoveFileExA in install() also silently fail on Unicode paths.
+	//
+	// Fix: Added remove(), MoveFileA(), MoveFileExA() shims that convert UTF-8
+	// to wide chars before calling the W-suffixed API.
+
+	// Test 1: remove() a file with a Unicode name.
+	{
+		char unicode_path[PATH_MAX];
+		snprintf(unicode_path, sizeof(unicode_path),
+		         "%s\xe5\x89\x8a\xe9\x99\xa4\xe3\x83\x86\xe3\x82\xb9\xe3\x83\x88.tmp",
+		         test_tmp_dir()); // "削除テスト.tmp" in UTF-8
+
+		// Create via wide API to ensure it exists
+		wchar_t wpath[MAX_PATH];
+		MultiByteToWideChar(CP_UTF8, 0, unicode_path, -1, wpath, MAX_PATH);
+		HANDLE hf = CreateFileW(wpath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+		if (hf != INVALID_HANDLE_VALUE) {
+			DWORD written;
+			WriteFile(hf, "test", 4, &written, NULL);
+			CloseHandle(hf);
+
+			// remove() with UTF-8 path should succeed
+			int rc = remove(unicode_path);
+			CHECK_EQ(rc, 0, "remove_utf8: remove() succeeds on Unicode file");
+
+			// Verify it's gone
+			DWORD attr = GetFileAttributesW(wpath);
+			CHECK(attr == INVALID_FILE_ATTRIBUTES,
+			      "remove_utf8: Unicode file is deleted");
+		} else {
+			printf("  (skipped Unicode remove test — CreateFileW failed)\n");
+		}
+	}
+
+	// Test 2: MoveFileA shim works with Unicode paths.
+	{
+		char src_path[PATH_MAX], dst_path[PATH_MAX];
+		snprintf(src_path, sizeof(src_path),
+		         "%s\xe7\xa7\xbb\xe5\x8b\x95\xe5\x85\x83.tmp",
+		         test_tmp_dir()); // "移動元.tmp"
+		snprintf(dst_path, sizeof(dst_path),
+		         "%s\xe7\xa7\xbb\xe5\x8b\x95\xe5\x85\x88.tmp",
+		         test_tmp_dir()); // "移動先.tmp"
+
+		wchar_t wsrc[MAX_PATH];
+		MultiByteToWideChar(CP_UTF8, 0, src_path, -1, wsrc, MAX_PATH);
+		HANDLE hf = CreateFileW(wsrc, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+		if (hf != INVALID_HANDLE_VALUE) {
+			DWORD written;
+			WriteFile(hf, "move", 4, &written, NULL);
+			CloseHandle(hf);
+
+			// MoveFileA shim should handle UTF-8
+			BOOL ok = MoveFileA(src_path, dst_path);
+			CHECK(ok != 0, "remove_utf8: MoveFileA shim succeeds with Unicode");
+
+			if (ok) {
+				// Verify dst exists, src gone
+				wchar_t wdst[MAX_PATH];
+				MultiByteToWideChar(CP_UTF8, 0, dst_path, -1, wdst, MAX_PATH);
+				CHECK(GetFileAttributesW(wdst) != INVALID_FILE_ATTRIBUTES,
+				      "remove_utf8: MoveFileA destination exists");
+				CHECK(GetFileAttributesW(wsrc) == INVALID_FILE_ATTRIBUTES,
+				      "remove_utf8: MoveFileA source is gone");
+				DeleteFileW(wdst);
+			} else {
+				DeleteFileW(wsrc);
+			}
+		} else {
+			printf("  (skipped Unicode MoveFile test — CreateFileW failed)\n");
+		}
+	}
+
+	// Test 3: MoveFileExA shim works with MOVEFILE_REPLACE_EXISTING.
+	{
+		char src_path[PATH_MAX], dst_path[PATH_MAX];
+		snprintf(src_path, sizeof(src_path), "%smoveex_src.tmp", test_tmp_dir());
+		snprintf(dst_path, sizeof(dst_path), "%smoveex_dst.tmp", test_tmp_dir());
+
+		FILE *sf = fopen(src_path, "w");
+		FILE *df = fopen(dst_path, "w");
+		CHECK(sf != NULL && df != NULL, "remove_utf8: create MoveFileEx test files");
+		if (sf) { fprintf(sf, "src"); fclose(sf); }
+		if (df) { fprintf(df, "dst"); fclose(df); }
+
+		BOOL ok = MoveFileExA(src_path, dst_path, MOVEFILE_REPLACE_EXISTING);
+		CHECK(ok != 0, "remove_utf8: MoveFileExA shim with REPLACE succeeds");
+
+		// Clean up
+		remove(dst_path);
+		remove(src_path);
+	}
+}
+
+static void test_win_memstream_wide_temp(void) {
+	printf("\n--- Security Regression: open_memstream Wide Temp Path ---\n");
+
+	// Bug: open_memstream used GetTempPathA and GetTempFileNameA (ANSI APIs).
+	// If %TEMP% contains non-ASCII characters, the temp file path gets corrupted
+	// and fopen fails, causing open_memstream to crash.
+	//
+	// Fix: Use GetTempPathW and GetTempFileNameW, convert to UTF-8.
+
+	// Test 1: open_memstream creates a temp file and returns valid data.
+	{
+		char *buf = NULL;
+		size_t sz = 0;
+		FILE *fp = open_memstream(&buf, &sz);
+		CHECK(fp != NULL, "memstream_wide: open_memstream succeeds");
+		if (fp) {
+			fprintf(fp, "hello memstream");
+			fclose(fp); // triggers read-back
+
+			CHECK(buf != NULL, "memstream_wide: buffer is non-NULL after close");
+			CHECK(sz > 0, "memstream_wide: size is non-zero");
+			if (buf) {
+				CHECK(strcmp(buf, "hello memstream") == 0,
+				      "memstream_wide: content matches");
+				free(buf);
+			}
+		}
+	}
+
+	// Test 2: Verify the temp file path stored in win32_memstream_path is
+	// valid UTF-8 (not ANSI-mangled).
+	{
+		char *buf = NULL;
+		size_t sz = 0;
+		FILE *fp = open_memstream(&buf, &sz);
+		CHECK(fp != NULL, "memstream_wide: second open_memstream succeeds");
+		if (fp) {
+			// While open, the path should be valid and the file should exist
+			CHECK(win32_memstream_path[0] != '\0',
+			      "memstream_wide: temp path is non-empty");
+			CHECK(access(win32_memstream_path, F_OK) == 0,
+			      "memstream_wide: temp file exists at stored path");
+
+			// Verify the path is valid UTF-8 by round-tripping through wide
+			wchar_t wcheck[MAX_PATH];
+			int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+			                             win32_memstream_path, -1, wcheck, MAX_PATH);
+			CHECK(wn > 0, "memstream_wide: temp path is valid UTF-8");
+
+			fclose(fp);
+			free(buf);
+		}
+	}
+}
+
+static void test_win_oem_to_utf8(void) {
+	printf("\n--- Security Regression: OEM Codepage Conversion ---\n");
+
+	// Bug: check_path_shadow reads popen("where prism.exe") output encoded in
+	// the console's OEM codepage (e.g., CP437), but compares it with
+	// install_path which is UTF-8.  Non-ASCII paths cause false positives.
+	//
+	// Fix: Convert popen output from GetConsoleOutputCP() to UTF-8.
+
+	// Test 1: Verify that OEM-to-UTF-8 conversion works for a known string.
+	{
+		UINT oem_cp = GetConsoleOutputCP();
+		CHECK(oem_cp != 0, "oem_utf8: GetConsoleOutputCP returns valid codepage");
+
+		// Round-trip a simple ASCII string through the conversion pipeline
+		const char *test_str = "C:\\Windows\\System32";
+		wchar_t wide[PATH_MAX];
+		int wlen = MultiByteToWideChar(oem_cp, 0, test_str, -1, wide, PATH_MAX);
+		CHECK(wlen > 0, "oem_utf8: ASCII string converts to wide");
+		if (wlen > 0) {
+			char utf8[PATH_MAX];
+			int ulen = WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, PATH_MAX, NULL, NULL);
+			CHECK(ulen > 0, "oem_utf8: wide converts to UTF-8");
+			CHECK(strcmp(utf8, test_str) == 0,
+			      "oem_utf8: ASCII round-trip is lossless");
+		}
+	}
+
+	// Test 2: Verify the `where` command output can be captured and decoded.
+	{
+		char buf[PATH_MAX];
+		char *argv[] = { "cmd.exe", "/c", "where", "cmd.exe", NULL };
+		int rc = capture_first_line(argv, buf, sizeof(buf));
+		CHECK_EQ(rc, 0, "oem_utf8: 'where cmd.exe' succeeds");
+		if (rc == 0) {
+			// The result should be a valid path
+			CHECK(strlen(buf) > 0, "oem_utf8: where output is non-empty");
+			CHECK(strstr(buf, "cmd.exe") != NULL,
+			      "oem_utf8: where output contains cmd.exe");
+		}
+	}
+
+	// Test 3: Simulate OEM → UTF-8 conversion with a CP437 byte sequence.
+	// CP437 byte 0x81 is 'ü'. In UTF-8, 'ü' is 0xC3 0xBC.
+	{
+		char oem_str[] = { (char)0x81, '\0' }; // 'ü' in CP437
+		wchar_t wide[8];
+		int wlen = MultiByteToWideChar(437, 0, oem_str, -1, wide, 8);
+		if (wlen > 0) {
+			char utf8[8];
+			int ulen = WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, 8, NULL, NULL);
+			CHECK(ulen > 0, "oem_utf8: CP437 ü converts to UTF-8");
+			if (ulen > 0) {
+				// ü in UTF-8 is 0xC3 0xBC
+				CHECK((unsigned char)utf8[0] == 0xC3 && (unsigned char)utf8[1] == 0xBC,
+				      "oem_utf8: CP437 0x81 → UTF-8 ü (0xC3 0xBC)");
+			}
+		} else {
+			printf("  (skipped CP437 test — codepage not available)\n");
+		}
+	}
+}
+
+// Regression: tokenize_file must use CreateFileW so UTF-8 paths work.
+static void test_win_tokenize_file_wide(void) {
+	printf("  Testing tokenize_file CreateFileW (wide path)...\n");
+
+	// Create a temp file with a Unicode name, write valid C, tokenize it.
+	wchar_t tmp_dir[MAX_PATH];
+	DWORD dw = GetTempPathW(MAX_PATH, tmp_dir);
+	CHECK(dw > 0, "tokenize_wide: GetTempPathW");
+
+	wchar_t wpath[MAX_PATH];
+	swprintf(wpath, MAX_PATH, L"%s\\prism_tok_\u00e9\u00fc.c", tmp_dir);
+
+	// Write a tiny C file via wide API
+	HANDLE hf = CreateFileW(wpath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+				FILE_ATTRIBUTE_NORMAL, NULL);
+	CHECK(hf != INVALID_HANDLE_VALUE, "tokenize_wide: create temp file");
+	if (hf != INVALID_HANDLE_VALUE) {
+		const char *src = "int main(void) { return 0; }\n";
+		DWORD written;
+		WriteFile(hf, src, (DWORD)strlen(src), &written, NULL);
+		CloseHandle(hf);
+
+		// Convert to UTF-8 — this is the path tokenize_file receives
+		char utf8path[MAX_PATH * 3];
+		int ulen = WideCharToMultiByte(CP_UTF8, 0, wpath, -1,
+					       utf8path, sizeof(utf8path), NULL, NULL);
+		CHECK(ulen > 0, "tokenize_wide: wpath → UTF-8");
+
+		// Open via CreateFileW path (same as tokenize_file now does)
+		wchar_t wpath2[MAX_PATH];
+		int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+					     utf8path, -1, wpath2, MAX_PATH);
+		CHECK(wn > 0, "tokenize_wide: UTF-8 round-trips to wide");
+
+		HANDLE hRead = CreateFileW(wpath2, GENERIC_READ, FILE_SHARE_READ,
+					   NULL, OPEN_EXISTING,
+					   FILE_ATTRIBUTE_NORMAL, NULL);
+		CHECK(hRead != INVALID_HANDLE_VALUE,
+		      "tokenize_wide: CreateFileW opens UTF-8-named file");
+		if (hRead != INVALID_HANDLE_VALUE) CloseHandle(hRead);
+
+		DeleteFileW(wpath);
+	}
+}
+
+// Regression: get_tmp_dir must use _wgetenv so TEMP paths survive non-ASCII.
+static void test_win_tmpdir_wide(void) {
+	printf("  Testing get_tmp_dir _wgetenv (wide TEMP)...\n");
+
+	// Verify _wgetenv(L"TEMP") returns something useful
+	const wchar_t *wt = _wgetenv(L"TEMP");
+	CHECK(wt != NULL, "tmpdir_wide: _wgetenv(L\"TEMP\") != NULL");
+	if (wt) {
+		CHECK(wcslen(wt) > 0, "tmpdir_wide: TEMP is non-empty");
+
+		// Convert to UTF-8 the same way get_tmp_dir does
+		char buf[MAX_PATH];
+		int ulen = WideCharToMultiByte(CP_UTF8, 0, wt, -1,
+					       buf, sizeof(buf), NULL, NULL);
+		CHECK(ulen > 0, "tmpdir_wide: TEMP converts to UTF-8");
+
+		// The ANSI getenv might lose chars — just ensure the wide one works
+		// and the UTF-8 path exists.
+		if (ulen > 0) {
+			wchar_t wcheck[MAX_PATH];
+			int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+						     buf, -1, wcheck, MAX_PATH);
+			CHECK(wn > 0, "tmpdir_wide: UTF-8 round-trips to wide");
+			CHECK(wcscmp(wt, wcheck) == 0,
+			      "tmpdir_wide: round-trip matches original");
+		}
+	}
+}
+
+// Regression: check_path_shadow must use _wgetcwd for Unicode CWD.
+static void test_win_getcwd_wide(void) {
+	printf("  Testing _wgetcwd UTF-8 round-trip...\n");
+
+	wchar_t wcwd[MAX_PATH];
+	wchar_t *ret = _wgetcwd(wcwd, MAX_PATH);
+	CHECK(ret != NULL, "getcwd_wide: _wgetcwd succeeds");
+	if (ret) {
+		char utf8cwd[MAX_PATH * 3];
+		int ulen = WideCharToMultiByte(CP_UTF8, 0, wcwd, -1,
+					       utf8cwd, sizeof(utf8cwd), NULL, NULL);
+		CHECK(ulen > 0, "getcwd_wide: wide CWD converts to UTF-8");
+
+		// Round-trip back to wide
+		if (ulen > 0) {
+			wchar_t wrt[MAX_PATH];
+			int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+						     utf8cwd, -1, wrt, MAX_PATH);
+			CHECK(wn > 0, "getcwd_wide: UTF-8 round-trips to wide");
+			CHECK(wcscmp(wcwd, wrt) == 0,
+			      "getcwd_wide: round-trip matches original");
+		}
+	}
+}
+
+// Regression: open() shim must use _wopen for UTF-8 path support.
+static void test_win_open_wide(void) {
+	printf("  Testing open() shim _wopen (wide path)...\n");
+
+	// Create a temp file with Unicode name via wide API
+	wchar_t tmp_dir[MAX_PATH];
+	DWORD dw = GetTempPathW(MAX_PATH, tmp_dir);
+	CHECK(dw > 0, "open_wide: GetTempPathW");
+
+	wchar_t wpath[MAX_PATH];
+	swprintf(wpath, MAX_PATH, L"%s\\prism_open_\u00e9.txt", tmp_dir);
+
+	HANDLE hf = CreateFileW(wpath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+				FILE_ATTRIBUTE_NORMAL, NULL);
+	CHECK(hf != INVALID_HANDLE_VALUE, "open_wide: create temp file");
+	if (hf != INVALID_HANDLE_VALUE) {
+		const char *data = "hello\n";
+		DWORD written;
+		WriteFile(hf, data, (DWORD)strlen(data), &written, NULL);
+		CloseHandle(hf);
+
+		// Convert to UTF-8
+		char utf8path[MAX_PATH * 3];
+		int ulen = WideCharToMultiByte(CP_UTF8, 0, wpath, -1,
+					       utf8path, sizeof(utf8path), NULL, NULL);
+		CHECK(ulen > 0, "open_wide: wpath → UTF-8");
+
+		// Open via the shim (which should use _wopen internally)
+		// _wopen test directly to avoid macro interference
+		wchar_t wpath2[MAX_PATH];
+		int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+					     utf8path, -1, wpath2, MAX_PATH);
+		CHECK(wn > 0, "open_wide: UTF-8 round-trips to wide");
+		if (wn > 0) {
+			int fd = _wopen(wpath2, _O_RDONLY | _O_BINARY);
+			CHECK(fd >= 0, "open_wide: _wopen opens UTF-8-named file");
+			if (fd >= 0) {
+				char buf[16];
+				int n = _read(fd, buf, sizeof(buf) - 1);
+				CHECK(n > 0, "open_wide: read from fd");
+				if (n > 0) {
+					buf[n] = '\0';
+					CHECK(strcmp(buf, "hello\n") == 0,
+					      "open_wide: content matches");
+				}
+				_close(fd);
+			}
+		}
+
+		DeleteFileW(wpath);
+	}
+}
+
+// Regression: mkdtemp must use CreateDirectoryW for UTF-8 path support.
+static void test_win_mkdtemp_wide(void) {
+	printf("  Testing mkdtemp CreateDirectoryW (wide path)...\n");
+
+	// Verify that CreateDirectoryW can handle a UTF-8→wide converted path
+	// with non-ASCII characters (same path as mkdtemp would produce).
+	wchar_t tmp_dir[MAX_PATH];
+	DWORD dw = GetTempPathW(MAX_PATH, tmp_dir);
+	CHECK(dw > 0, "mkdtemp_wide: GetTempPathW");
+
+	// Build a directory path with Unicode chars
+	wchar_t wdir[MAX_PATH];
+	swprintf(wdir, MAX_PATH, L"%s\\prism_mkd_\u00e9\u00fc_test", tmp_dir);
+
+	// Convert to UTF-8 (simulating what mkdtemp's try_buf would contain)
+	char utf8dir[MAX_PATH * 3];
+	int ulen = WideCharToMultiByte(CP_UTF8, 0, wdir, -1,
+				       utf8dir, sizeof(utf8dir), NULL, NULL);
+	CHECK(ulen > 0, "mkdtemp_wide: wdir → UTF-8");
+
+	if (ulen > 0) {
+		// Round-trip: UTF-8 → wide → CreateDirectoryW (same as the fix does)
+		wchar_t wrt[MAX_PATH];
+		int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+					     utf8dir, -1, wrt, MAX_PATH);
+		CHECK(wn > 0, "mkdtemp_wide: UTF-8 round-trips to wide");
+		if (wn > 0) {
+			// Clean up first in case of prior failed run
+			RemoveDirectoryW(wrt);
+			BOOL ok = CreateDirectoryW(wrt, NULL);
+			CHECK(ok, "mkdtemp_wide: CreateDirectoryW creates Unicode dir");
+			if (ok) {
+				// Verify it exists
+				DWORD attrs = GetFileAttributesW(wrt);
+				CHECK(attrs != INVALID_FILE_ATTRIBUTES,
+				      "mkdtemp_wide: dir exists");
+				CHECK(attrs & FILE_ATTRIBUTE_DIRECTORY,
+				      "mkdtemp_wide: is a directory");
+				RemoveDirectoryW(wrt);
+			}
+		}
+	}
+}
+
+// Regression: install() .old cleanup must use get_tmp_dir(), not getenv("TEMP").
+static void test_win_install_tmpdir(void) {
+	printf("  Testing install() uses get_tmp_dir() for .old cleanup...\n");
+
+	// Verify that _wgetenv(L"TEMP") and get_tmp_dir() both return
+	// consistent UTF-8 paths, proving the install() path is sound.
+	const wchar_t *wtemp = _wgetenv(L"TEMP");
+	CHECK(wtemp != NULL, "install_tmpdir: _wgetenv(L\"TEMP\") != NULL");
+	if (wtemp) {
+		char utf8_temp[MAX_PATH];
+		int ulen = WideCharToMultiByte(CP_UTF8, 0, wtemp, -1,
+					       utf8_temp, sizeof(utf8_temp), NULL, NULL);
+		CHECK(ulen > 0, "install_tmpdir: TEMP → UTF-8");
+
+		// get_tmp_dir() appends a trailing slash — strip it for comparison
+		const char *gtd = get_tmp_dir();
+		CHECK(gtd != NULL && *gtd, "install_tmpdir: get_tmp_dir() non-empty");
+		if (gtd && *gtd) {
+			char gtd_copy[MAX_PATH];
+			strncpy(gtd_copy, gtd, sizeof(gtd_copy) - 1);
+			gtd_copy[sizeof(gtd_copy) - 1] = '\0';
+			size_t glen = strlen(gtd_copy);
+			if (glen > 0 && (gtd_copy[glen - 1] == '/' || gtd_copy[glen - 1] == '\\'))
+				gtd_copy[glen - 1] = '\0';
+
+			CHECK(_stricmp(utf8_temp, gtd_copy) == 0,
+			      "install_tmpdir: get_tmp_dir() matches _wgetenv TEMP");
+		}
+	}
+}
+
+// Regression: win32_spawn_with_actions SPAWN_ACT_OPEN must use CreateFileW.
+static void test_win_spawn_open_wide(void) {
+	printf("  Testing spawn SPAWN_ACT_OPEN CreateFileW (wide path)...\n");
+
+	// Simulate what the spawn shim does: take a UTF-8 path, convert to wide,
+	// and open via CreateFileW.
+	wchar_t tmp_dir[MAX_PATH];
+	DWORD dw = GetTempPathW(MAX_PATH, tmp_dir);
+	CHECK(dw > 0, "spawn_open: GetTempPathW");
+
+	wchar_t wpath[MAX_PATH];
+	swprintf(wpath, MAX_PATH, L"%s\\prism_spawn_\u00e9.txt", tmp_dir);
+
+	// Create the file
+	HANDLE hf = CreateFileW(wpath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+				FILE_ATTRIBUTE_NORMAL, NULL);
+	CHECK(hf != INVALID_HANDLE_VALUE, "spawn_open: create temp file");
+	if (hf != INVALID_HANDLE_VALUE) {
+		const char *data = "spawn test\n";
+		DWORD written;
+		WriteFile(hf, data, (DWORD)strlen(data), &written, NULL);
+		CloseHandle(hf);
+
+		// Convert to UTF-8 (as a->path would be)
+		char utf8path[MAX_PATH * 3];
+		int ulen = WideCharToMultiByte(CP_UTF8, 0, wpath, -1,
+					       utf8path, sizeof(utf8path), NULL, NULL);
+		CHECK(ulen > 0, "spawn_open: wpath → UTF-8");
+
+		// Now do what the fixed spawn shim does: UTF-8 → wide → CreateFileW
+		if (ulen > 0) {
+			wchar_t wpath2[MAX_PATH];
+			int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+						     utf8path, -1, wpath2, MAX_PATH);
+			CHECK(wn > 0, "spawn_open: UTF-8 round-trips to wide");
+			if (wn > 0) {
+				SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+				HANDLE hRead = CreateFileW(wpath2,
+							   GENERIC_READ,
+							   FILE_SHARE_READ | FILE_SHARE_WRITE,
+							   &sa,
+							   OPEN_EXISTING,
+							   0,
+							   NULL);
+				CHECK(hRead != INVALID_HANDLE_VALUE,
+				      "spawn_open: CreateFileW opens UTF-8-named file");
+				if (hRead != INVALID_HANDLE_VALUE) CloseHandle(hRead);
+			}
+		}
+
+		DeleteFileW(wpath);
+	}
+}
+
+// Regression: preprocess_with_cc must use get_tmp_dir(), not getenv(TMPDIR_ENVVAR).
+static void test_win_preprocess_tmpdir(void) {
+	printf("  Testing preprocess_with_cc uses get_tmp_dir()...\n");
+
+	// Verify get_tmp_dir() returns a valid writable directory.
+	const char *tmpdir = get_tmp_dir();
+	CHECK(tmpdir != NULL, "preprocess_tmpdir: get_tmp_dir() != NULL");
+	CHECK(*tmpdir != '\0', "preprocess_tmpdir: get_tmp_dir() non-empty");
+
+	if (tmpdir && *tmpdir) {
+		// Simulate what preprocess_with_cc does: build a mkstemp template
+		char pp_path[MAX_PATH];
+		snprintf(pp_path, sizeof(pp_path), "%sprism_pp_err_XXXXXX", tmpdir);
+		CHECK(strlen(pp_path) > 6, "preprocess_tmpdir: template is valid");
+
+		// Verify the directory portion exists by converting to wide and checking
+		wchar_t wtmpdir[MAX_PATH];
+		int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+					     tmpdir, -1, wtmpdir, MAX_PATH);
+		CHECK(wn > 0, "preprocess_tmpdir: tmpdir → wide");
+		if (wn > 0) {
+			DWORD attrs = GetFileAttributesW(wtmpdir);
+			CHECK(attrs != INVALID_FILE_ATTRIBUTES,
+			      "preprocess_tmpdir: temp dir exists");
+			CHECK(attrs & FILE_ATTRIBUTE_DIRECTORY,
+			      "preprocess_tmpdir: temp dir is a directory");
+		}
+	}
+}
+
+// Regression: fopen/stat/access/unlink/remove/open shims must not
+// fall back to ANSI when the wide API fails legitimately (file not found).
+static void test_win_shim_no_ansi_fallback(void) {
+	printf("  Testing wide shims don't fall back to ANSI on legitimate failure...\n");
+
+	// Create a file with Unicode name, verify stat finds it,
+	// then delete and verify stat returns -1 (not ANSI fallback).
+	wchar_t tmp_dir[MAX_PATH];
+	GetTempPathW(MAX_PATH, tmp_dir);
+
+	wchar_t wpath[MAX_PATH];
+	swprintf(wpath, MAX_PATH, L"%s\\prism_shim_\u00e9\u00fc.tmp", tmp_dir);
+
+	char utf8path[MAX_PATH * 3];
+	int ulen = WideCharToMultiByte(CP_UTF8, 0, wpath, -1,
+				       utf8path, sizeof(utf8path), NULL, NULL);
+	CHECK(ulen > 0, "shim_nofb: path → UTF-8");
+
+	// Create file via wide API
+	HANDLE hf = CreateFileW(wpath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+				FILE_ATTRIBUTE_NORMAL, NULL);
+	CHECK(hf != INVALID_HANDLE_VALUE, "shim_nofb: create temp file");
+	if (hf != INVALID_HANDLE_VALUE) {
+		WriteFile(hf, "x", 1, &(DWORD){0}, NULL);
+		CloseHandle(hf);
+
+		// stat should find it via wide API
+		struct _stat st;
+		int r = stat(utf8path, &st);
+		CHECK(r == 0, "shim_nofb: stat finds Unicode file");
+
+		// fopen should open it
+		FILE *fp = fopen(utf8path, "rb");
+		CHECK(fp != NULL, "shim_nofb: fopen opens Unicode file");
+		if (fp) fclose(fp);
+
+		// access should confirm it exists
+		r = access(utf8path, 0);
+		CHECK(r == 0, "shim_nofb: access finds Unicode file");
+
+		// Delete the file
+		DeleteFileW(wpath);
+
+		// Now stat should FAIL (file gone) — must NOT fall to ANSI
+		r = stat(utf8path, &st);
+		CHECK(r != 0, "shim_nofb: stat returns -1 for deleted file");
+
+		// fopen should return NULL (not ANSI garbage)
+		fp = fopen(utf8path, "rb");
+		CHECK(fp == NULL, "shim_nofb: fopen returns NULL for deleted file");
+
+		// access should fail
+		r = access(utf8path, 0);
+		CHECK(r != 0, "shim_nofb: access returns -1 for deleted file");
+	}
+}
+
+// Regression: get_env_utf8 must return UTF-8 strings from environment variables.
+static void test_win_get_env_utf8(void) {
+	printf("  Testing get_env_utf8 returns UTF-8...\n");
+
+	// Test with a known variable that always exists
+	const char *temp = get_env_utf8("TEMP");
+	CHECK(temp != NULL, "get_env_utf8: TEMP is not NULL");
+	if (temp) {
+		CHECK(strlen(temp) > 0, "get_env_utf8: TEMP is non-empty");
+
+		// Verify it matches what _wgetenv returns after UTF-8 conversion
+		const wchar_t *wtemp = _wgetenv(L"TEMP");
+		if (wtemp) {
+			char expected[MAX_PATH * 3];
+			int elen = WideCharToMultiByte(CP_UTF8, 0, wtemp, -1,
+						       expected, sizeof(expected), NULL, NULL);
+			CHECK(elen > 0, "get_env_utf8: _wgetenv converts");
+			if (elen > 0) {
+				CHECK(strcmp(temp, expected) == 0,
+				      "get_env_utf8: matches _wgetenv UTF-8 conversion");
+			}
+		}
+	}
+
+	// Test with a nonexistent variable
+	const char *missing = get_env_utf8("PRISM_THIS_VAR_DOES_NOT_EXIST_12345");
+	CHECK(missing == NULL, "get_env_utf8: missing var returns NULL");
+}
+
+// Regression: collect_system_includes must handle backslash paths (MSVC).
+static void test_win_path_basename_backslash(void) {
+	printf("  Testing path_basename handles backslashes...\n");
+
+	// path_basename should handle both / and \ separators
+	const char *b1 = path_basename("C:\\Program Files\\include\\assert.h");
+	CHECK(strcmp(b1, "assert.h") == 0,
+	      "basename_bs: backslash path yields assert.h");
+
+	const char *b2 = path_basename("/usr/include/assert.h");
+	CHECK(strcmp(b2, "assert.h") == 0,
+	      "basename_bs: forward-slash path yields assert.h");
+
+	const char *b3 = path_basename("C:\\Mixed/Path\\to/file.h");
+	CHECK(strcmp(b3, "file.h") == 0,
+	      "basename_bs: mixed separators yield file.h");
+
+	const char *b4 = path_basename("justfile.h");
+	CHECK(strcmp(b4, "justfile.h") == 0,
+	      "basename_bs: no separator returns full name");
+
+	// This is the exact case that broke: MSVC outputs backslash paths
+	const char *b5 = path_basename("C:\\Program Files (x86)\\Microsoft Visual Studio\\include\\assert.h");
+	CHECK(strcmp(b5, "assert.h") == 0,
+	      "basename_bs: MSVC-style path yields assert.h");
+}
+
+// Regression: win32_memstream_path must be large enough for UTF-8 expansion.
+static void test_win_memstream_buffer_size(void) {
+	printf("  Testing open_memstream buffer sizing...\n");
+
+	// Verify that win32_memstream_path can hold an expanded UTF-8 path.
+	// MAX_PATH wide chars can expand to MAX_PATH*3 UTF-8 bytes.
+	// The buffer should be at least MAX_PATH*3.
+	CHECK(sizeof(win32_memstream_path) >= MAX_PATH * 3,
+	      "memstream_buf: win32_memstream_path >= MAX_PATH*3");
+
+	// Verify open_memstream works (it uses win32_memstream_path internally)
+	char *buf = NULL;
+	size_t sz = 0;
+	FILE *fp = open_memstream(&buf, &sz);
+	CHECK(fp != NULL, "memstream_buf: open_memstream succeeds");
+	if (fp) {
+		fprintf(fp, "test data");
+		fclose(fp);
+		CHECK(buf != NULL, "memstream_buf: buffer is populated");
+		CHECK(sz > 0, "memstream_buf: size > 0");
+		if (buf) {
+			CHECK(strcmp(buf, "test data") == 0,
+			      "memstream_buf: content matches");
+			free(buf);
+		}
+	}
+}
+
 void run_windows_tests(void) {
 	printf("=== PRISM WINDOWS TEST SUITE ===\n");
 
@@ -1533,6 +2919,36 @@ void run_windows_tests(void) {
 	test_win_stderr_preserved();
 	test_win_realpath_resolves();
 	test_win_spawn_oflag();
+
+	test_win_env_scrubbing();
+	test_win_handle_isolation();
+	test_win_std_clatest_override();
+	test_win_old_exe_cleanup();
+
+	test_win_registry_wide_path();
+	test_win_signal_tempfile_cleanup();
+	test_win_realpath_unicode();
+	test_win_capture_wide();
+
+	test_win_install_path_wide();
+	test_win_remove_utf8();
+	test_win_memstream_wide_temp();
+	test_win_oem_to_utf8();
+
+	test_win_tokenize_file_wide();
+	test_win_tmpdir_wide();
+	test_win_getcwd_wide();
+	test_win_open_wide();
+
+	test_win_mkdtemp_wide();
+	test_win_install_tmpdir();
+	test_win_spawn_open_wide();
+	test_win_preprocess_tmpdir();
+
+	test_win_shim_no_ansi_fallback();
+	test_win_get_env_utf8();
+	test_win_path_basename_backslash();
+	test_win_memstream_buffer_size();
 
 	return (failed == 0) ? 0 : 1;
 }

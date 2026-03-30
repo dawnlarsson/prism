@@ -29,6 +29,9 @@
 #define PRISM_API static
 #endif
 
+static char **build_clean_environ(void);
+static const char *path_basename(const char *path);
+
 #include "parse.c"
 
 static int run_command(char **argv);
@@ -693,6 +696,20 @@ static uint32_t features_to_bits(PrismFeatures f) {
 
 static const char *get_tmp_dir(void) {
 	static PRISM_THREAD_LOCAL char buf[PATH_MAX];
+#ifdef _WIN32
+	// Use _wgetenv to avoid ANSI codepage corruption of non-ASCII TEMP paths.
+	const wchar_t *wt = _wgetenv(L"TEMP");
+	if (!wt || !*wt) wt = _wgetenv(L"TMP");
+	if (!wt || !*wt) return TMPDIR_FALLBACK;
+	int ulen = WideCharToMultiByte(CP_UTF8, 0, wt, -1, buf, PATH_MAX - 2, NULL, NULL);
+	if (ulen <= 0) return TMPDIR_FALLBACK;
+	size_t len = strlen(buf);
+	if (len > 0 && buf[len - 1] != '/' && buf[len - 1] != '\\') {
+		buf[len] = '/';
+		buf[len + 1] = '\0';
+	}
+	return buf;
+#else
 	const char *t = getenv(TMPDIR_ENVVAR);
 #ifdef TMPDIR_ENVVAR_ALT
 	if (!t || !*t) t = getenv(TMPDIR_ENVVAR_ALT);
@@ -702,6 +719,7 @@ static const char *get_tmp_dir(void) {
 	size_t len = strlen(t);
 	snprintf(buf, sizeof(buf), "%s%s", t, (t[len - 1] == '/' || t[len - 1] == '\\') ? "" : "/");
 	return buf;
+#endif
 }
 
 static bool dir_has_write_bits(const char *path) {
@@ -802,8 +820,8 @@ static void collect_system_includes(void) {
 	for (int i = 0; i < ctx->input_file_count; i++) {
 		File *f = ctx->input_files[i];
 		if (!f->is_system || !f->is_include_entry || !f->name) continue;
-		const char *base = strrchr(f->name, '/');
-		if (strcmp(base ? base + 1 : f->name, "assert.h")) {
+		const char *base = path_basename(f->name);
+		if (strcmp(base, "assert.h")) {
 			bool found = false;
 			for (int j = 0; j < ctx->system_include_count; j++) {
 				if (strcmp(system_include_list[j], f->name) == 0) { found = true; break; }
@@ -5787,12 +5805,8 @@ static char *preprocess_with_cc(const char *input_file) {
 
 	// Capture preprocessor stderr to a temp file for diagnostics on failure
 	{
-		const char *tmpdir = getenv(TMPDIR_ENVVAR);
-#ifdef TMPDIR_ENVVAR_ALT
-		if (!tmpdir || !*tmpdir) tmpdir = getenv(TMPDIR_ENVVAR_ALT);
-#endif
-		if (!tmpdir || !*tmpdir) tmpdir = TMPDIR_FALLBACK;
-		snprintf(pp_stderr_path, sizeof pp_stderr_path, "%s/prism_pp_err_XXXXXX", tmpdir);
+		const char *tmpdir = get_tmp_dir();
+		snprintf(pp_stderr_path, sizeof pp_stderr_path, "%sprism_pp_err_XXXXXX", tmpdir);
 		pp_stderr_fd = mkstemp(pp_stderr_path);
 		if (pp_stderr_fd < 0)
 			pp_stderr_path[0] = '\0';
@@ -9324,21 +9338,47 @@ static void check_path_shadow(const char *install_path) {
 	char resolved_hit[PATH_MAX], resolved_install[PATH_MAX];
 #ifdef _WIN32
 	char cwd[PATH_MAX];
-	if (first_hit[0] && _getcwd(cwd, sizeof(cwd))) {
-		char first_dir[PATH_MAX];
-		strncpy(first_dir, first_hit, sizeof(first_dir) - 1);
-		first_dir[sizeof(first_dir) - 1] = '\0';
-		char *sep = strrchr(first_dir, '\\');
-		if (!sep) sep = strrchr(first_dir, '/');
-		if (sep) *sep = '\0';
-		if (_stricmp(first_dir, cwd) == 0) {
-			// First hit is in CWD — try the next line
-			first_hit[0] = '\0';
-			if (fgets(first_hit, sizeof(first_hit), fp)) {
-				size_t len = strlen(first_hit);
-				if (len > 0 && first_hit[len - 1] == '\n') first_hit[len - 1] = '\0';
-				len = strlen(first_hit);
-				if (len > 0 && first_hit[len - 1] == '\r') first_hit[len - 1] = '\0';
+	if (first_hit[0]) {
+		// Use _wgetcwd to get UTF-8 CWD (not ANSI-mangled).
+		wchar_t wcwd[PATH_MAX];
+		bool got_cwd = false;
+		if (_wgetcwd(wcwd, PATH_MAX)) {
+			int ulen = WideCharToMultiByte(CP_UTF8, 0, wcwd, -1, cwd, PATH_MAX, NULL, NULL);
+			got_cwd = (ulen > 0);
+		}
+		if (got_cwd) {
+			char first_dir[PATH_MAX];
+			strncpy(first_dir, first_hit, sizeof(first_dir) - 1);
+			first_dir[sizeof(first_dir) - 1] = '\0';
+			char *sep = strrchr(first_dir, '\\');
+			if (!sep) sep = strrchr(first_dir, '/');
+			if (sep) *sep = '\0';
+			if (_stricmp(first_dir, cwd) == 0) {
+				// First hit is in CWD — try the next line
+				first_hit[0] = '\0';
+				if (fgets(first_hit, sizeof(first_hit), fp)) {
+					size_t len = strlen(first_hit);
+					if (len > 0 && first_hit[len - 1] == '\n') first_hit[len - 1] = '\0';
+					len = strlen(first_hit);
+					if (len > 0 && first_hit[len - 1] == '\r') first_hit[len - 1] = '\0';
+				}
+			}
+		}
+	}
+	// popen output from cmd.exe is in the console's OEM codepage (e.g., CP437),
+	// not UTF-8.  Convert to UTF-8 so the comparison with install_path works
+	// even when the path contains non-ASCII characters.
+	if (first_hit[0]) {
+		UINT oem_cp = GetConsoleOutputCP();
+		if (oem_cp && oem_cp != CP_UTF8) {
+			wchar_t wide[PATH_MAX];
+			int wlen = MultiByteToWideChar(oem_cp, 0, first_hit, -1, wide, PATH_MAX);
+			if (wlen > 0) {
+				char utf8[PATH_MAX];
+				int ulen = WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, PATH_MAX, NULL, NULL);
+				if (ulen > 0) {
+					memcpy(first_hit, utf8, (size_t)ulen);
+				}
 			}
 		}
 	}
@@ -9414,7 +9454,29 @@ static int install(char *self_path) {
 		fclose(output);
 		chmod(install_path, 0755); // no-op on Windows (shimmed)
 #ifdef _WIN32
-		if (old_path[0]) remove(old_path); // clean up renamed old exe
+		// The .old exe is still locked by the running process, so remove()
+		// will silently fail.  Move it to %TEMP% and schedule deletion on
+		// next reboot so it doesn't accumulate in the install directory.
+		if (old_path[0]) {
+			if (!remove(old_path)) {
+				old_path[0] = '\0'; // successfully deleted
+			} else {
+				char temp_old[PATH_MAX];
+				const char *tmp = get_tmp_dir();
+				if (tmp && *tmp) {
+					snprintf(temp_old, sizeof(temp_old), "%sprism_old_%u.exe",
+						 tmp, (unsigned)GetCurrentProcessId());
+					if (MoveFileExA(old_path, temp_old,
+							MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+						MoveFileExA(temp_old, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+						old_path[0] = '\0';
+					}
+				}
+				// Fallback: schedule in-place deletion on reboot.
+				if (old_path[0])
+					MoveFileExA(old_path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+			}
+		}
 #endif
 		printf("[prism] Installed!\n");
 		{
@@ -9732,18 +9794,20 @@ static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count,
 	char *cc_dup = NULL;
 	cc_split_into_argv(args, &argc, plan->compiler, &cc_dup);
 	if (plan->msvc) args[argc++] = "/nologo";
-	if (plan->msvc) {
-		// Prism emits typeof() for bare orelse; MSVC needs /std:clatest for C23 typeof.
-		bool has_std = false;
-		for (int i = 0; i < cli->cc_arg_count; i++)
-			if (strncmp(cli->cc_args[i], "/std:", 5) == 0) { has_std = true; break; }
-		if (!has_std) args[argc++] = "/std:clatest";
-	}
+	// Prism may emit typeof()/typeof_unqual() which require C23 mode on MSVC.
+	// Always inject /std:clatest and strip any conflicting /std: from user args
+	// to prevent compilation failures (e.g. user passes /std:c11 but generated
+	// code uses typeof).
+	if (plan->msvc) args[argc++] = "/std:clatest";
 	if (plan->optimize) args[argc++] = plan->msvc ? "/O2" : "-O2";
 	if (plan->use_preprocessed) args[argc++] = "-fpreprocessed";
 	for (int i = 0; i < temp_count; i++) args[argc++] = temps[i];
 	if (plan->use_preprocessed) args[argc++] = "-fno-preprocessed";
-	for (int i = 0; i < cli->cc_arg_count; i++) args[argc++] = cli->cc_args[i];
+	for (int i = 0; i < cli->cc_arg_count; i++) {
+		// Skip user's /std: flags on MSVC — we already injected /std:clatest.
+		if (plan->msvc && strncmp(cli->cc_args[i], "/std:", 5) == 0) continue;
+		args[argc++] = cli->cc_args[i];
+	}
 	if (plan->suppress_warnings)
 		add_warn_suppress(args, &argc, plan->clang, plan->msvc);
 	argv_add_output(args, &argc, plan->output, plan->msvc, plan->compile_only);
@@ -9757,11 +9821,19 @@ static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count,
 }
 
 static const char *resolve_install_compiler(const Cli *cli) {
+#ifdef _WIN32
+	const char *cc = get_real_cc(cli->cc ? cli->cc : get_env_utf8("PRISM_CC"));
+	if (!cc || (strcmp(cc, "cc") == 0 && !cli->cc)) {
+		cc = get_env_utf8("CC");
+		if (cc) cc = get_real_cc(cc);
+	}
+#else
 	const char *cc = get_real_cc(cli->cc ? cli->cc : getenv("PRISM_CC"));
 	if (!cc || (strcmp(cc, "cc") == 0 && !cli->cc)) {
 		cc = getenv("CC");
 		if (cc) cc = get_real_cc(cc);
 	}
+#endif
 	return cc ? cc : PRISM_DEFAULT_CC;
 }
 
@@ -9943,6 +10015,16 @@ static int compile_sources(Cli *cli) {
 }
 
 static void signal_cleanup_handler(int sig) {
+#ifdef _WIN32
+	// On Windows, unlink/_wunlink fails with EACCES if the file is open.
+	// Close any open output/memstream files before attempting cleanup.
+	// Use the raw CRT fclose to avoid memstream wrapper logic in a signal handler.
+	if (out_fp) { fflush(out_fp); win32_real_fclose(out_fp); out_fp = NULL; }
+	if (win32_memstream_fp) {
+		win32_real_fclose(win32_memstream_fp);
+		win32_memstream_fp = NULL;
+	}
+#endif
 	if (signal_temp_load() && signal_temp_path[0])
 		unlink(signal_temp_path);
 	int n = signal_temps_load();
@@ -9986,11 +10068,19 @@ int main(int argc, char **argv) {
 
 	// Resolve CC (env vars checked here, not in cli_parse, to keep it pure)
 	if (!cli.cc) {
+#ifdef _WIN32
+		char *env_cc = (char *)get_env_utf8("PRISM_CC");
+		if (!env_cc || !*env_cc || is_prism_cc(env_cc)) {
+			env_cc = (char *)get_env_utf8("CC");
+			if (is_prism_cc(env_cc)) env_cc = NULL;
+		}
+#else
 		char *env_cc = getenv("PRISM_CC");
 		if (!env_cc || !*env_cc || is_prism_cc(env_cc)) {
 			env_cc = getenv("CC");
 			if (is_prism_cc(env_cc)) env_cc = NULL;
 		}
+#endif
 		cli.cc = (env_cc && *env_cc) ? env_cc : PRISM_DEFAULT_CC;
 	}
 

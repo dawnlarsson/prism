@@ -189,15 +189,18 @@ static inline int sigprocmask(int how, const sigset_t *set, sigset_t *old) {
 static PRISM_THREAD_LOCAL FILE *win32_memstream_fp;
 static PRISM_THREAD_LOCAL char **win32_memstream_bufp;
 static PRISM_THREAD_LOCAL size_t *win32_memstream_sizep;
-static PRISM_THREAD_LOCAL char win32_memstream_path[MAX_PATH];
+static PRISM_THREAD_LOCAL char win32_memstream_path[MAX_PATH * 3];
 
 // Grab the real CRT fclose BEFORE we macro-redirect it.
 static int (*win32_real_fclose)(FILE *) = fclose;
 
 static FILE *open_memstream(char **bufp, size_t *sizep) {
-	char tmpdir[MAX_PATH];
-	GetTempPathA(MAX_PATH, tmpdir);
-	GetTempFileNameA(tmpdir, "prm", 0, win32_memstream_path);
+	wchar_t wtmpdir[MAX_PATH], wtmpfile[MAX_PATH];
+	GetTempPathW(MAX_PATH, wtmpdir);
+	GetTempFileNameW(wtmpdir, L"prm", 0, wtmpfile);
+	// Convert wide temp path to UTF-8 for storage
+	WideCharToMultiByte(CP_UTF8, 0, wtmpfile, -1,
+			    win32_memstream_path, sizeof(win32_memstream_path), NULL, NULL);
 	FILE *fp = fopen(win32_memstream_path, "w+b");
 	if (!fp) return NULL;
 	*bufp = NULL;
@@ -217,7 +220,7 @@ static int win32_fclose_wrapper(FILE *fp) {
 		char *buf = (char *)malloc((size_t)pos + 1);
 		if (!buf) {
 			win32_real_fclose(fp);
-			remove(win32_memstream_path);
+			_unlink(win32_memstream_path);
 			errno = ENOMEM;
 			return EOF;
 		}
@@ -243,8 +246,7 @@ static FILE *win32_fopen_utf8(const char *path, const char *mode) {
 	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, MAX_PATH);
 	if (wn > 0) {
 		MultiByteToWideChar(CP_UTF8, 0, mode, -1, wmode, 16);
-		FILE *fp = _wfopen(wpath, wmode);
-		if (fp) return fp;
+		return _wfopen(wpath, wmode);
 	}
 	return win32_real_fopen(path, mode);
 }
@@ -254,10 +256,8 @@ static FILE *win32_fopen_utf8(const char *path, const char *mode) {
 static int win32_stat_utf8(const char *path, struct _stat *st) {
 	wchar_t wpath[MAX_PATH];
 	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, MAX_PATH);
-	if (wn > 0) {
-		int r = _wstat(wpath, (struct _stat *)st);
-		if (r == 0) return 0;
-	}
+	if (wn > 0)
+		return _wstat(wpath, (struct _stat *)st);
 	return _stat(path, st);
 }
 #define stat(path, st) win32_stat_utf8(path, (struct _stat *)(st))
@@ -266,10 +266,8 @@ static int win32_stat_utf8(const char *path, struct _stat *st) {
 static int win32_access_utf8(const char *path, int mode) {
 	wchar_t wpath[MAX_PATH];
 	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, MAX_PATH);
-	if (wn > 0) {
-		int r = _waccess(wpath, mode);
-		if (r == 0) return 0;
-	}
+	if (wn > 0)
+		return _waccess(wpath, mode);
 	return _access(path, mode);
 }
 #undef access
@@ -279,14 +277,61 @@ static int win32_access_utf8(const char *path, int mode) {
 static int win32_unlink_utf8(const char *path) {
 	wchar_t wpath[MAX_PATH];
 	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, MAX_PATH);
-	if (wn > 0) {
-		int r = _wunlink(wpath);
-		if (r == 0) return 0;
-	}
+	if (wn > 0)
+		return _wunlink(wpath);
 	return _unlink(path);
 }
 #undef unlink
 #define unlink win32_unlink_utf8
+
+// remove shim: delegates to the UTF-8 unlink shim so non-ASCII paths work.
+static int win32_remove_utf8(const char *path) {
+	wchar_t wpath[MAX_PATH];
+	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, MAX_PATH);
+	if (wn > 0)
+		return _wremove(wpath);
+	return remove(path);
+}
+#define remove(path) win32_remove_utf8(path)
+
+// getenv shim: use _wgetenv + WideCharToMultiByte to return UTF-8 strings.
+static const char *get_env_utf8(const char *name) {
+	wchar_t wname[256];
+	if (MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, 256) <= 0)
+		return getenv(name);
+	const wchar_t *wval = _wgetenv(wname);
+	if (!wval) return NULL;
+	static PRISM_THREAD_LOCAL char env_buf[MAX_PATH * 3];
+	int ulen = WideCharToMultiByte(CP_UTF8, 0, wval, -1, env_buf, sizeof(env_buf), NULL, NULL);
+	if (ulen <= 0) return getenv(name);
+	return env_buf;
+}
+
+// MoveFile shim: convert UTF-8 paths to wide chars for non-ASCII support.
+static BOOL win32_movefile_utf8(const char *src, const char *dst) {
+	wchar_t wsrc[MAX_PATH], wdst[MAX_PATH];
+	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, src, -1, wsrc, MAX_PATH) <= 0)
+		return MoveFileA(src, dst);
+	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, dst, -1, wdst, MAX_PATH) <= 0)
+		return MoveFileA(src, dst);
+	return MoveFileW(wsrc, wdst);
+}
+#define MoveFileA(src, dst) win32_movefile_utf8(src, dst)
+
+// MoveFileEx shim: convert UTF-8 paths to wide chars for non-ASCII support.
+static BOOL win32_movefileex_utf8(const char *src, const char *dst, DWORD flags) {
+	wchar_t wsrc[MAX_PATH];
+	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, src, -1, wsrc, MAX_PATH) <= 0)
+		return MoveFileExA(src, dst, flags);
+	if (dst) {
+		wchar_t wdst[MAX_PATH];
+		if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, dst, -1, wdst, MAX_PATH) <= 0)
+			return MoveFileExA(src, dst, flags);
+		return MoveFileExW(wsrc, wdst, flags);
+	}
+	return MoveFileExW(wsrc, NULL, flags);
+}
+#define MoveFileExA(src, dst, flags) win32_movefileex_utf8(src, dst, flags)
 
 // Convert argv from the system ANSI codepage to UTF-8 using GetCommandLineW.
 // This lets Prism handle non-ASCII source paths on Windows.
@@ -337,25 +382,46 @@ static int pipe(int pipefd[2]) {
 }
 
 // POSIX realpath: resolve symlinks/reparse points and canonicalize.
-// _fullpath is purely lexical; we must use GetFinalPathNameByHandleA
+// _fullpath is purely lexical; we must use GetFinalPathNameByHandleW
 // to resolve Junctions and Symlinks on NTFS.
+// Uses wide-char APIs throughout to handle UTF-8 paths correctly.
 static char *realpath(const char *path, char *resolved) {
 	if (!path) { errno = EINVAL; return NULL; }
 	char *out = resolved ? resolved : (char *)malloc(PATH_MAX);
 	if (!out) return NULL;
 
-	HANDLE h = CreateFileA(path, 0, /* no access needed */
+	// Convert UTF-8 path to wide chars
+	wchar_t wpath[MAX_PATH];
+	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, MAX_PATH);
+	if (wn <= 0) {
+		// Not valid UTF-8 or too long — try ANSI fallback
+		char *r = _fullpath(out, path, PATH_MAX);
+		if (!r && !resolved) free(out);
+		return r;
+	}
+
+	HANDLE h = CreateFileW(wpath, 0, /* no access needed */
 			       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 			       NULL, OPEN_EXISTING,
 			       FILE_FLAG_BACKUP_SEMANTICS, /* required for directories */
 			       NULL);
 	if (h == INVALID_HANDLE_VALUE) {
-		// Fall back to _fullpath for paths that don't yet exist on disk
-		char *r = _fullpath(out, path, PATH_MAX);
-		if (!r && !resolved) free(out);
-		return r;
+		// Fall back to _wfullpath for paths that don't yet exist on disk
+		wchar_t wout[PATH_MAX];
+		wchar_t *wr = _wfullpath(wout, wpath, PATH_MAX);
+		if (!wr) {
+			if (!resolved) free(out);
+			return NULL;
+		}
+		int utf8_len = WideCharToMultiByte(CP_UTF8, 0, wout, -1, out, PATH_MAX, NULL, NULL);
+		if (utf8_len <= 0) {
+			if (!resolved) free(out);
+			return NULL;
+		}
+		return out;
 	}
-	DWORD len = GetFinalPathNameByHandleA(h, out, PATH_MAX, FILE_NAME_NORMALIZED);
+	wchar_t wout[PATH_MAX];
+	DWORD len = GetFinalPathNameByHandleW(h, wout, PATH_MAX, FILE_NAME_NORMALIZED);
 	CloseHandle(h);
 	if (len == 0 || len >= PATH_MAX) {
 		if (!resolved) free(out);
@@ -363,8 +429,15 @@ static char *realpath(const char *path, char *resolved) {
 		return NULL;
 	}
 	// Strip the \\?\\ prefix if present
-	if (len >= 4 && out[0] == '\\' && out[1] == '\\' && out[2] == '?' && out[3] == '\\') {
-		memmove(out, out + 4, len - 4 + 1);
+	wchar_t *result_start = wout;
+	if (len >= 4 && wout[0] == L'\\' && wout[1] == L'\\' && wout[2] == L'?' && wout[3] == L'\\') {
+		result_start += 4;
+	}
+	// Convert wide result back to UTF-8
+	int utf8_len = WideCharToMultiByte(CP_UTF8, 0, result_start, -1, out, PATH_MAX, NULL, NULL);
+	if (utf8_len <= 0) {
+		if (!resolved) free(out);
+		return NULL;
 	}
 	return out;
 }
@@ -375,7 +448,7 @@ static ssize_t prism_posix_read_(int fd, void *buf, size_t count) {
 	return (ssize_t)_read(fd, buf, to_read);
 }
 
-// POSIX open() shim: maps /dev/null to NUL and calls _open with _O_BINARY
+// POSIX open() shim: maps /dev/null to NUL, converts UTF-8 paths to wide chars.
 static int prism_posix_open_(const char *path, int oflag, ...) {
 	va_list ap;
 	int mode = 0;
@@ -387,6 +460,15 @@ static int prism_posix_open_(const char *path, int oflag, ...) {
 	// Map /dev/null -> NUL
 	const char *winpath = path;
 	if (strcmp(path, "/dev/null") == 0) winpath = "NUL";
+	// Try wide-char API for UTF-8 path support
+	wchar_t wpath[MAX_PATH];
+	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, winpath, -1, wpath, MAX_PATH);
+	if (wn > 0) {
+		if (oflag & _O_CREAT)
+			return _wopen(wpath, oflag | _O_BINARY, mode);
+		return _wopen(wpath, oflag | _O_BINARY);
+	}
+	// Fallback to ANSI (path wasn't valid UTF-8)
 	if (oflag & _O_CREAT)
 		return _open(winpath, oflag | _O_BINARY, mode);
 	return _open(winpath, oflag | _O_BINARY);
@@ -498,7 +580,14 @@ static char *mkdtemp(char *tmpl) {
 			attempt_seed = attempt_seed * 1103515245 + 12345;
 			try_buf[i] = chars[(attempt_seed >> 16) % (sizeof(chars) - 1)];
 		}
-		if (CreateDirectoryA(try_buf, NULL)) {
+		wchar_t wtry[MAX_PATH];
+		int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, try_buf, -1, wtry, MAX_PATH);
+		BOOL ok;
+		if (wn > 0)
+			ok = CreateDirectoryW(wtry, NULL);
+		else
+			ok = CreateDirectoryA(try_buf, NULL);
+		if (ok) {
 			memcpy(tmpl, try_buf, len + 1);
 			return tmpl;
 		}
@@ -608,11 +697,35 @@ static char *win32_argv_to_cmdline(char **argv) {
 	return cmdline;
 }
 
+// Convert a POSIX-style envp array (NULL-terminated array of "KEY=VALUE" strings)
+// into a Windows environment block: NUL-separated entries, double-NUL terminated,
+// encoded as wide chars for CreateProcessW.  Returns NULL if envp is NULL (inherit
+// parent environment) or on allocation failure.  Caller must free the result.
+static wchar_t *win32_build_env_block(char **envp) {
+	if (!envp) return NULL;
+	// First pass: compute total wide-char length needed.
+	size_t total_wchars = 0;
+	for (char **e = envp; *e; e++) {
+		int wlen = MultiByteToWideChar(CP_UTF8, 0, *e, -1, NULL, 0);
+		if (wlen <= 0) wlen = 1;
+		total_wchars += (size_t)wlen; // includes NUL terminator (serves as separator)
+	}
+	total_wchars++; // final double-NUL
+	wchar_t *block = (wchar_t *)malloc(total_wchars * sizeof(wchar_t));
+	if (!block) return NULL;
+	wchar_t *p = block;
+	for (char **e = envp; *e; e++) {
+		int wlen = MultiByteToWideChar(CP_UTF8, 0, *e, -1, p, (int)(total_wchars - (size_t)(p - block)));
+		if (wlen <= 0) { *p++ = L'\0'; continue; }
+		p += wlen; // wlen includes the NUL separator
+	}
+	*p = L'\0'; // double-NUL terminator
+	return block;
+}
+
 // Resolve file actions into STARTUPINFO handle redirections
 // Returns HANDLE for the spawned process, or INVALID_HANDLE_VALUE on failure
 static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *fa, char **envp) {
-	(void)envp; // environment filtering handled separately on Windows
-
 	STARTUPINFOA si;
 	PROCESS_INFORMATION pi;
 	memset(&si, 0, sizeof(si));
@@ -672,13 +785,24 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 					disposition = TRUNCATE_EXISTING;
 
 				SECURITY_ATTRIBUTES sa_nul = {sizeof(sa_nul), NULL, TRUE};
-				hNul = CreateFileA(winpath,
-						   access_flags,
-						   FILE_SHARE_READ | FILE_SHARE_WRITE,
-						   &sa_nul,
-						   disposition,
-						   0,
-						   NULL);
+				wchar_t wpath[MAX_PATH];
+				int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, winpath, -1, wpath, MAX_PATH);
+				if (wn > 0)
+					hNul = CreateFileW(wpath,
+							   access_flags,
+							   FILE_SHARE_READ | FILE_SHARE_WRITE,
+							   &sa_nul,
+							   disposition,
+							   0,
+							   NULL);
+				else
+					hNul = CreateFileA(winpath,
+							   access_flags,
+							   FILE_SHARE_READ | FILE_SHARE_WRITE,
+							   &sa_nul,
+							   disposition,
+							   0,
+							   NULL);
 				if (hNul == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
 				if (a->fd == STDERR_FILENO) { hStdErr = hNul; redirected_err = true; }
 				else if (a->fd == STDOUT_FILENO)
@@ -693,44 +817,77 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 		si.hStdError = hStdErr;
 	}
 
-	// Make redirected handles inheritable, saving original flags for cleanup.
-	// Only touch handles explicitly set by file actions — process-global
-	// standard handles must not be modified (thread-safety).
-	DWORD orig_in_flags = 0, orig_out_flags = 0, orig_err_flags = 0;
-	if (si.dwFlags & STARTF_USESTDHANDLES) {
-		if (redirected_in && hStdIn != INVALID_HANDLE_VALUE) {
-			GetHandleInformation(hStdIn, &orig_in_flags);
-			SetHandleInformation(hStdIn, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-		}
-		if (redirected_out && hStdOut != INVALID_HANDLE_VALUE) {
-			GetHandleInformation(hStdOut, &orig_out_flags);
-			SetHandleInformation(hStdOut, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-		}
-		if (redirected_err && hStdErr != INVALID_HANDLE_VALUE) {
-			GetHandleInformation(hStdErr, &orig_err_flags);
-			SetHandleInformation(hStdErr, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-		}
-	}
-
 	HANDLE hResult = INVALID_HANDLE_VALUE;
 	char *cmdline = win32_argv_to_cmdline(argv);
+	// Build environment block from envp (NULL = inherit parent's environment).
+	wchar_t *env_block = win32_build_env_block(envp);
+	DWORD create_flags = env_block ? CREATE_UNICODE_ENVIRONMENT : 0;
 	BOOL ok = FALSE;
 	if (!cmdline) goto cleanup;
 
 	// Use CreateProcessW so UTF-8 paths (converted by win32_utf8_argv) work.
+	// When file actions redirect handles, use STARTUPINFOEX with an explicit
+	// handle list (PROC_THREAD_ATTRIBUTE_HANDLE_LIST) so that ONLY the
+	// specified handles are inherited.  This prevents thread-safety issues
+	// in PRISM_LIB_MODE where concurrent spawns would leak each other's
+	// pipe handles into unrelated child processes.
 	{
 		int wlen = MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, NULL, 0);
 		wchar_t *wcmdline = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
 		if (wcmdline) {
 			MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, wcmdline, wlen);
-			STARTUPINFOW siw;
-			memset(&siw, 0, sizeof(siw));
-			siw.cb = sizeof(siw);
-			siw.dwFlags = si.dwFlags;
-			siw.hStdInput = si.hStdInput;
-			siw.hStdOutput = si.hStdOutput;
-			siw.hStdError = si.hStdError;
-			ok = CreateProcessW(NULL, wcmdline, NULL, NULL, TRUE, 0, NULL, NULL, &siw, &pi);
+
+			if (si.dwFlags & STARTF_USESTDHANDLES) {
+				// Collect unique, valid handles for the whitelist.
+				HANDLE handle_list[3];
+				int handle_count = 0;
+				HANDLE candidates[3] = { hStdIn, hStdOut, hStdErr };
+				for (int i = 0; i < 3; i++) {
+					if (candidates[i] == INVALID_HANDLE_VALUE || candidates[i] == NULL)
+						continue;
+					bool dup = false;
+					for (int j = 0; j < handle_count; j++)
+						if (handle_list[j] == candidates[i]) { dup = true; break; }
+					if (!dup) handle_list[handle_count++] = candidates[i];
+				}
+
+				STARTUPINFOEXW six;
+				memset(&six, 0, sizeof(six));
+				six.StartupInfo.cb = sizeof(six);
+				six.StartupInfo.dwFlags = si.dwFlags;
+				six.StartupInfo.hStdInput = si.hStdInput;
+				six.StartupInfo.hStdOutput = si.hStdOutput;
+				six.StartupInfo.hStdError = si.hStdError;
+
+				SIZE_T attr_size = 0;
+				InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+				six.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
+				if (six.lpAttributeList &&
+				    InitializeProcThreadAttributeList(six.lpAttributeList, 1, 0, &attr_size) &&
+				    UpdateProcThreadAttribute(six.lpAttributeList, 0,
+							     PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+							     handle_list,
+							     (SIZE_T)handle_count * sizeof(HANDLE),
+							     NULL, NULL)) {
+					ok = CreateProcessW(NULL, wcmdline, NULL, NULL,
+							    TRUE,
+							    create_flags | EXTENDED_STARTUPINFO_PRESENT,
+							    env_block, NULL,
+							    &six.StartupInfo, &pi);
+				}
+				if (six.lpAttributeList) {
+					DeleteProcThreadAttributeList(six.lpAttributeList);
+					free(six.lpAttributeList);
+				}
+			} else {
+				// No handle redirection: don't inherit any handles.
+				STARTUPINFOW siw;
+				memset(&siw, 0, sizeof(siw));
+				siw.cb = sizeof(siw);
+				ok = CreateProcessW(NULL, wcmdline, NULL, NULL,
+						    FALSE, create_flags,
+						    env_block, NULL, &siw, &pi);
+			}
 			free(wcmdline);
 		}
 	}
@@ -743,18 +900,10 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 	}
 
 cleanup:
-	// Restore original handle inheritance flags (only for redirected handles)
-	if (si.dwFlags & STARTF_USESTDHANDLES) {
-		if (redirected_in && hStdIn != INVALID_HANDLE_VALUE)
-			SetHandleInformation(
-			    hStdIn, HANDLE_FLAG_INHERIT, orig_in_flags & HANDLE_FLAG_INHERIT);
-		if (redirected_out && hStdOut != INVALID_HANDLE_VALUE)
-			SetHandleInformation(
-			    hStdOut, HANDLE_FLAG_INHERIT, orig_out_flags & HANDLE_FLAG_INHERIT);
-		if (redirected_err && hStdErr != INVALID_HANDLE_VALUE)
-			SetHandleInformation(
-			    hStdErr, HANDLE_FLAG_INHERIT, orig_err_flags & HANDLE_FLAG_INHERIT);
-	}
+	// Handle inheritance flags are no longer toggled process-globally — the
+	// STARTUPINFOEX handle list restricts which handles the child inherits —
+	// so there is nothing to restore here.
+	free(env_block);
 	if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
 	return hResult;
 }
@@ -797,10 +946,14 @@ static pid_t waitpid(pid_t pid, int *status, int options) {
 	if (status) *status = (int)exit_code;
 	return pid;
 }
-// Resolve the path to the currently running executable
+// Resolve the path to the currently running executable.
+// Uses GetModuleFileNameW to handle non-ASCII install paths.
 static bool get_self_exe_path(char *buf, size_t bufsize) {
-	DWORD len = GetModuleFileNameA(NULL, buf, (DWORD)bufsize);
-	return (len > 0 && len < bufsize);
+	wchar_t wbuf[MAX_PATH];
+	DWORD len = GetModuleFileNameW(NULL, wbuf, MAX_PATH);
+	if (len == 0 || len >= MAX_PATH) return false;
+	int utf8_len = WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, buf, (int)bufsize, NULL, NULL);
+	return (utf8_len > 0);
 }
 
 // Detect whether the compiler is MSVC cl.exe
@@ -831,8 +984,11 @@ static bool cc_is_msvc(const char *cc) {
 // Run a command and wait for it to complete.
 // Returns exit status, or -1 on error.
 // Uses CreateProcess with proper quoting so paths with spaces work.
+// Passes a clean environment (CC= and PRISM_CC= scrubbed) to prevent
+// recursive compiler loops.
 static int run_command(char **argv) {
-	HANDLE hp = win32_spawn_with_actions(argv, NULL, NULL);
+	char **env = build_clean_environ();
+	HANDLE hp = win32_spawn_with_actions(argv, NULL, env);
 	if (hp == INVALID_HANDLE_VALUE) return -1;
 	WaitForSingleObject(hp, INFINITE);
 	DWORD exit_code = 1;
@@ -845,11 +1001,12 @@ static int run_command(char **argv) {
 // Uses posix_spawn_file_actions to redirect stderr only in the child,
 // avoiding process-global fd mutation (thread-safe for PRISM_LIB_MODE).
 static int run_command_quiet(char **argv) {
+	char **env = build_clean_environ();
 	posix_spawn_file_actions_t fa;
 	posix_spawn_file_actions_init(&fa);
 	posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
 
-	HANDLE hp = win32_spawn_with_actions(argv, &fa, NULL);
+	HANDLE hp = win32_spawn_with_actions(argv, &fa, env);
 	posix_spawn_file_actions_destroy(&fa);
 	if (hp == INVALID_HANDLE_VALUE) return -1;
 
@@ -869,11 +1026,19 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 	char *cmdline = win32_argv_to_cmdline(argv);
 	if (!cmdline) return -1;
 
+	// Convert command line from UTF-8 to wide chars for CreateProcessW
+	int wcmd_len = MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, NULL, 0);
+	if (wcmd_len <= 0) { free(cmdline); return -1; }
+	wchar_t *wcmdline = (wchar_t *)malloc(wcmd_len * sizeof(wchar_t));
+	if (!wcmdline) { free(cmdline); return -1; }
+	MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, wcmdline, wcmd_len);
+	free(cmdline);
+
 	// Create a pipe for the child's stdout
 	SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
 	HANDLE hReadPipe, hWritePipe;
 	if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
-		free(cmdline);
+		free(wcmdline);
 		return -1;
 	}
 	// The read end should not be inherited by the child
@@ -881,10 +1046,10 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 
 	// Open NUL for stderr suppression
 	SECURITY_ATTRIBUTES sa_nul = {sizeof(sa_nul), NULL, TRUE};
-	HANDLE hNul = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+	HANDLE hNul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
 				   &sa_nul, OPEN_EXISTING, 0, NULL);
 
-	STARTUPINFOA si;
+	STARTUPINFOW si;
 	PROCESS_INFORMATION pi;
 	memset(&si, 0, sizeof(si));
 	si.cb = sizeof(si);
@@ -894,8 +1059,8 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 	si.hStdError = (hNul != INVALID_HANDLE_VALUE) ? hNul : GetStdHandle(STD_ERROR_HANDLE);
 	memset(&pi, 0, sizeof(pi));
 
-	BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
-	free(cmdline);
+	BOOL ok = CreateProcessW(NULL, wcmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+	free(wcmdline);
 	CloseHandle(hWritePipe); // Close write end in parent so reads will EOF
 	if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
 
@@ -926,38 +1091,49 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 }
 
 // Get the platform install path: %LOCALAPPDATA%\prism\prism.exe
+// Uses wide-char APIs to handle non-ASCII user profile paths.
 static const char *get_install_path(void) {
-	static PRISM_THREAD_LOCAL char path[MAX_PATH];
+	static PRISM_THREAD_LOCAL char path[MAX_PATH * 3]; // UTF-8 may expand
 	if (path[0]) return path;
-	DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", path, MAX_PATH);
+	wchar_t wpath[MAX_PATH];
+	DWORD len = GetEnvironmentVariableW(L"LOCALAPPDATA", wpath, MAX_PATH);
 	if (len == 0 || len >= MAX_PATH - 20) {
 		// Fallback: install next to the running executable
-		if (GetModuleFileNameA(NULL, path, MAX_PATH)) return path;
+		DWORD mlen = GetModuleFileNameW(NULL, wpath, MAX_PATH);
+		if (mlen > 0 && mlen < MAX_PATH) {
+			WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, sizeof(path), NULL, NULL);
+			return path;
+		}
 		strcpy(path, "prism.exe");
 		return path;
 	}
-	// Append \prism\prism.exe
-	strcat(path, "\\prism\\prism.exe");
+	wcscat(wpath, L"\\prism\\prism.exe");
+	WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, sizeof(path), NULL, NULL);
 	return path;
 }
 
 // Ensure the install directory exists (create %LOCALAPPDATA%\prism)
+// Uses wide-char APIs to handle non-ASCII paths.
 static bool ensure_install_dir(const char *install_path) {
-	// Extract directory from install_path
-	char dir[MAX_PATH];
-	strncpy(dir, install_path, MAX_PATH - 1);
-	dir[MAX_PATH - 1] = '\0';
+	// Extract directory from install_path (UTF-8)
+	char dir[MAX_PATH * 3];
+	strncpy(dir, install_path, sizeof(dir) - 1);
+	dir[sizeof(dir) - 1] = '\0';
 	char *last_sep = strrchr(dir, '\\');
 	if (!last_sep) last_sep = strrchr(dir, '/');
 	if (last_sep) *last_sep = '\0';
 	else
 		return true; // No directory component
 
-	DWORD attr = GetFileAttributesA(dir);
+	wchar_t wdir[MAX_PATH];
+	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, dir, -1, wdir, MAX_PATH) <= 0)
+		return false;
+
+	DWORD attr = GetFileAttributesW(wdir);
 	if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
 		return true; // Already exists
 
-	return CreateDirectoryA(dir, NULL) != 0;
+	return CreateDirectoryW(wdir, NULL) != 0;
 }
 
 // Check if 'dir' appears as a complete semicolon-delimited segment in 'path'.
@@ -975,58 +1151,79 @@ static bool path_contains_dir(const char *path, const char *dir) {
 	}
 }
 
-// Add a directory to the user's PATH via the registry (persistent)
-static void add_to_user_path(const char *dir) {
-	// Check if dir is already in PATH
-	char *path_env = getenv("PATH");
-	if (path_contains_dir(path_env, dir)) return; // Already in PATH
+// Wide-char helper: check if wdir appears as a complete ;-delimited segment in wpath.
+static bool wpath_contains_dir(const wchar_t *wpath, const wchar_t *wdir) {
+	if (!wpath || !wdir) return false;
+	size_t dir_len = wcslen(wdir);
+	if (dir_len == 0) return false;
+	for (const wchar_t *p = wpath; ; ) {
+		const wchar_t *found = wcsstr(p, wdir);
+		if (!found) return false;
+		bool at_start = (found == wpath || found[-1] == L';');
+		bool at_end = (found[dir_len] == L'\0' || found[dir_len] == L';');
+		if (at_start && at_end) return true;
+		p = found + 1;
+	}
+}
 
-	// Read current user PATH from registry
+// Add a directory to the user's PATH via the registry (persistent).
+// Uses wide-char registry APIs to preserve non-ASCII characters in PATH.
+static void add_to_user_path(const char *dir) {
+	// Check if dir is already in the runtime PATH
+	char *path_env = getenv("PATH");
+	if (path_contains_dir(path_env, dir)) return;
+
+	// Convert dir from UTF-8 to wide chars
+	wchar_t wdir[MAX_PATH];
+	int wdir_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, dir, -1, wdir, MAX_PATH);
+	if (wdir_len <= 0) return;
+
+	// Open the user Environment key with the Wide API
 	HKEY hKey;
-	if (RegOpenKeyExA(HKEY_CURRENT_USER, "Environment", 0, KEY_READ | KEY_WRITE, &hKey) != ERROR_SUCCESS)
+	if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0, KEY_READ | KEY_WRITE, &hKey) != ERROR_SUCCESS)
 		return;
 
-	// Query size first, then allocate dynamically (PATH can be up to 32767 bytes)
+	// Query current PATH size (in bytes, including NUL)
 	DWORD size = 0;
 	DWORD type = REG_EXPAND_SZ;
-	LONG rc = RegQueryValueExA(hKey, "Path", NULL, &type, NULL, &size);
-	char *current = NULL;
+	LONG rc = RegQueryValueExW(hKey, L"Path", NULL, &type, NULL, &size);
+	wchar_t *current = NULL;
 	if (rc == ERROR_SUCCESS && size > 0) {
-		current = (char *)malloc((size_t)size + 1);
+		current = (wchar_t *)malloc((size_t)size + sizeof(wchar_t));
 		if (!current) { RegCloseKey(hKey); return; }
-		rc = RegQueryValueExA(hKey, "Path", NULL, &type, (BYTE *)current, &size);
+		rc = RegQueryValueExW(hKey, L"Path", NULL, &type, (BYTE *)current, &size);
 		if (rc != ERROR_SUCCESS) { free(current); RegCloseKey(hKey); return; }
-		current[size] = '\0';
+		current[size / sizeof(wchar_t)] = L'\0';
 	} else if (rc == ERROR_FILE_NOT_FOUND) {
-		current = (char *)calloc(1, 1); // empty string
+		current = (wchar_t *)calloc(1, sizeof(wchar_t));
 		if (!current) { RegCloseKey(hKey); return; }
 	} else {
-		// Genuine error (access denied, etc.) — abort, do NOT wipe PATH
 		RegCloseKey(hKey);
 		return;
 	}
 
-	// Check again in registry value
-	if (path_contains_dir(current, dir)) { free(current); RegCloseKey(hKey); return; }
+	// Check if already present in registry value
+	if (wpath_contains_dir(current, wdir)) { free(current); RegCloseKey(hKey); return; }
 
 	// Append ;dir
-	size_t cur_len = strlen(current);
-	size_t dir_len = strlen(dir);
-	size_t new_len = cur_len + 1 + dir_len + 1; // ";" + dir + NUL
-	char *newpath = (char *)malloc(new_len);
+	size_t cur_len = wcslen(current);
+	size_t new_len = cur_len + 1 + (wdir_len - 1) + 1; // cur + ';' + dir + NUL
+	wchar_t *newpath = (wchar_t *)malloc(new_len * sizeof(wchar_t));
 	if (!newpath) { free(current); RegCloseKey(hKey); return; }
 	if (cur_len > 0)
-		snprintf(newpath, new_len, "%s;%s", current, dir);
+		_snwprintf(newpath, new_len, L"%s;%s", current, wdir);
 	else
-		snprintf(newpath, new_len, "%s", dir);
+		_snwprintf(newpath, new_len, L"%s", wdir);
+	newpath[new_len - 1] = L'\0';
 	free(current);
 
-	RegSetValueExA(hKey, "Path", 0, REG_EXPAND_SZ, (const BYTE *)newpath, (DWORD)(strlen(newpath) + 1));
+	DWORD write_size = (DWORD)((wcslen(newpath) + 1) * sizeof(wchar_t));
+	RegSetValueExW(hKey, L"Path", 0, REG_EXPAND_SZ, (const BYTE *)newpath, write_size);
 	free(newpath);
 	RegCloseKey(hKey);
 
-	// Notify other programs of the environment change
-	SendMessageTimeoutA(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)"Environment",
+	// Notify other programs of the environment change (wide)
+	SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"Environment",
 			    SMTO_ABORTIFHUNG, 5000, NULL);
 
 	fprintf(stderr,

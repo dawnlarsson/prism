@@ -1909,7 +1909,14 @@ Token *tokenize_file(char *path) {
 	ensure_keyword_cache();
 
 #ifdef _WIN32
-	HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+	wchar_t wpath[MAX_PATH];
+	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, MAX_PATH);
+	HANDLE hFile;
+	if (wn > 0)
+		hFile = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, NULL,
+				   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	else
+		hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
 				   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (hFile == INVALID_HANDLE_VALUE) return NULL;
 	DWORD file_size = GetFileSize(hFile, NULL);
