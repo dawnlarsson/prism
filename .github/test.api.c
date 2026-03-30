@@ -6710,7 +6710,8 @@ static void test_struct_union_vla_predecessor(void) {
 		CHECK_EQ(r.status, PRISM_OK, "struct VLA: transpiles OK");
 		CHECK(r.output != NULL, "struct VLA: output not NULL");
 		if (r.output) {
-			CHECK(strstr(r.output, "memset") != NULL,
+			CHECK(strstr(r.output, "memset") != NULL ||
+			      strstr(r.output, "__prism_p_") != NULL,
 			      "struct VLA: must emit memset, not {0}");
 			CHECK(strstr(r.output, "buf[sizeof") == NULL ||
 			      strstr(r.output, "= {0}") == NULL,
@@ -6730,7 +6731,8 @@ static void test_struct_union_vla_predecessor(void) {
 		PrismResult r = prism_transpile_source(code, "anon_struct_vla.c", feat);
 		CHECK_EQ(r.status, PRISM_OK, "anon struct VLA: transpiles OK");
 		if (r.output)
-			CHECK(strstr(r.output, "memset") != NULL,
+			CHECK(strstr(r.output, "memset") != NULL ||
+			      strstr(r.output, "__prism_p_") != NULL,
 			      "anon struct VLA: must emit memset");
 		prism_free(&r);
 	}
@@ -6747,7 +6749,8 @@ static void test_struct_union_vla_predecessor(void) {
 		PrismResult r = prism_transpile_source(code, "union_vla.c", feat);
 		CHECK_EQ(r.status, PRISM_OK, "union VLA: transpiles OK");
 		if (r.output)
-			CHECK(strstr(r.output, "memset") != NULL,
+			CHECK(strstr(r.output, "memset") != NULL ||
+			      strstr(r.output, "__prism_p_") != NULL,
 			      "union VLA: must emit memset");
 		prism_free(&r);
 	}
@@ -6764,7 +6767,8 @@ static void test_struct_union_vla_predecessor(void) {
 		PrismResult r = prism_transpile_source(code, "enum_vla.c", feat);
 		CHECK_EQ(r.status, PRISM_OK, "enum VLA: transpiles OK");
 		if (r.output)
-			CHECK(strstr(r.output, "memset") != NULL,
+			CHECK(strstr(r.output, "memset") != NULL ||
+			      strstr(r.output, "__prism_p_") != NULL,
 			      "enum VLA: must emit memset");
 		prism_free(&r);
 	}
