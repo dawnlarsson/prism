@@ -3443,6 +3443,235 @@ static void test_const_orelse_attr_preserved(void) {
 	prism_free(&r);
 }
 
+static void test_const_raw_orelse(void) {
+	printf("\n--- Const Raw Orelse ---\n");
+
+	const char *code =
+	    "int f(void);\n"
+	    "void test(void) {\n"
+	    "    const raw int x = f() orelse 0;\n"
+	    "    (void)x;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "cro_test.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "const raw orelse: transpiles OK");
+	if (r.output) {
+		// Must use temp variable pattern (not assign to const)
+		CHECK(strstr(r.output, "__prism_oe_") != NULL,
+		      "const raw orelse: uses temp variable");
+		// raw keyword must not appear in output (check for ' raw ' to avoid filename matches)
+		CHECK(strstr(r.output, " raw ") == NULL,
+		      "const raw orelse: raw keyword stripped from output");
+		// Final declaration must be const
+		CHECK(strstr(r.output, "const int x =") != NULL,
+		      "const raw orelse: final declaration is const");
+	}
+	prism_free(&r);
+}
+
+static void test_comma_operator_orelse(void) {
+	printf("\n--- Comma Operator Orelse ---\n");
+
+	const char *code =
+	    "int *f(void);\n"
+	    "void test(void) {\n"
+	    "    int a, *b;\n"
+	    "    a = 1, b = f() orelse 0;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "comma_oe.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "comma orelse: transpiles OK");
+	if (r.output) {
+		/* a = 1 must appear unchanged — not swallowed into orelse LHS */
+		CHECK(strstr(r.output, "a = 1") != NULL,
+		      "comma orelse: a = 1 preserved");
+		/* The orelse temp must only wrap `b = f()`, not `a = 1, b = f()` */
+		CHECK(strstr(r.output, "__prism_oe_") != NULL,
+		      "comma orelse: uses temp variable for b");
+	}
+	prism_free(&r);
+}
+
+static void test_c23_if_init_in_defer_shadow(void) {
+	printf("\n--- C23 if/switch Initializer in Defer Shadow ---\n");
+
+	const char *code =
+	    "void test(void) {\n"
+	    "    defer {\n"
+	    "        if (int x = 1; x) { (void)x; }\n"
+	    "    }\n"
+	    "    int x = 5;\n"
+	    "    (void)x;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "c23_if_init_defer.c", feat);
+	CHECK_EQ(r.status, PRISM_OK,
+	         "c23 if-init in defer: must not false-positive shadow");
+	prism_free(&r);
+
+	/* switch initializer variant */
+	const char *code2 =
+	    "void test(void) {\n"
+	    "    defer {\n"
+	    "        switch (int y = 1; y) { default: break; }\n"
+	    "    }\n"
+	    "    int y = 5;\n"
+	    "    (void)y;\n"
+	    "}\n";
+
+	r = prism_transpile_source(code2, "c23_switch_init_defer.c", feat);
+	CHECK_EQ(r.status, PRISM_OK,
+	         "c23 switch-init in defer: must not false-positive shadow");
+	prism_free(&r);
+}
+
+static void test_raw_typedef_not_erased(void) {
+	printf("\n--- Raw Typedef Not Erased ---\n");
+
+	const char *code =
+	    "void test(void) {\n"
+	    "    raw typedef int my_int;\n"
+	    "    my_int x = 42;\n"
+	    "    (void)x;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "raw_typedef.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "raw typedef: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "typedef int my_int") != NULL,
+		      "raw typedef: typedef preserved in output");
+		CHECK(strstr(r.output, " raw ") == NULL,
+		      "raw typedef: raw keyword stripped");
+	}
+	prism_free(&r);
+}
+
+static void test_raw_no_double_emit(void) {
+	printf("\n--- Raw No Double Emit ---\n");
+
+	/* raw with C23 attribute must not emit the attribute twice */
+	const char *code =
+	    "void f(void) {\n"
+	    "    raw int x = 42;\n"
+	    "    (void)x;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "raw_double.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "raw no double emit: transpiles OK");
+	if (r.output) {
+		/* raw keyword must be stripped */
+		CHECK(strstr(r.output, " raw ") == NULL,
+		      "raw no double emit: raw keyword stripped");
+		/* int x = 42 must appear exactly once */
+		char *first = strstr(r.output, "int x");
+		CHECK(first != NULL, "raw no double emit: declaration present");
+		if (first)
+			CHECK(strstr(first + 1, "int x") == NULL,
+			      "raw no double emit: declaration not duplicated");
+	}
+	prism_free(&r);
+}
+
+static void test_enum_attr_no_phantom(void) {
+	printf("\n--- Enum Attributed Constant No Phantom ---\n");
+
+	/* C23 attribute on enum constant must not register the initializer
+	 * expression tokens as phantom enum constants in the symbol table. */
+	const char *code =
+	    "#define MY_VAL 42\n"
+	    "enum { A = 0, B [[deprecated]] = MY_VAL };\n"
+	    "void f(void) {\n"
+	    "    defer { int cleanup = A; (void)cleanup; }\n"
+	    "    int MY_VAL = 99;\n"
+	    "    (void)MY_VAL;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "enum_attr_phantom.c", feat);
+	CHECK_EQ(r.status, PRISM_OK,
+	         "enum attr: MY_VAL not registered as phantom enum const");
+	prism_free(&r);
+}
+
+static void test_generic_no_ghost_label(void) {
+	printf("\n--- _Generic No Ghost Label ---\n");
+
+	/* Two _Generic with same type association must not create duplicate labels */
+	const char *code =
+	    "void f(void) {\n"
+	    "    int a = _Generic(1, int: 10, float: 20);\n"
+	    "    int b = _Generic(2, int: 30, float: 40);\n"
+	    "    (void)a; (void)b;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "generic_ghost.c", feat);
+	CHECK_EQ(r.status, PRISM_OK,
+	         "_Generic: no duplicate ghost label error");
+	prism_free(&r);
+}
+
+static void test_bitfield_no_ghost_label(void) {
+	printf("\n--- Bitfield No Ghost Label ---\n");
+
+	const char *code =
+	    "void f(void) {\n"
+	    "    struct F { int x : 1; int y : 1; };\n"
+	    "    struct F fl = {0};\n"
+	    "    (void)fl;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "bitfield_ghost.c", feat);
+	CHECK_EQ(r.status, PRISM_OK,
+	         "bitfield: no ghost label error");
+	prism_free(&r);
+}
+
+static void test_ternary_before_label_no_swallow(void) {
+	printf("\n--- Ternary Before Real Label ---\n");
+
+	/* Numeric ternary followed by a real goto+label must not break */
+	const char *code =
+	    "void f(int c) {\n"
+	    "    int x = c ? 2 : 3;\n"
+	    "    goto done;\n"
+	    "done:\n"
+	    "    (void)x;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "ternary_label.c", feat);
+	CHECK_EQ(r.status, PRISM_OK,
+	         "ternary before label: label not swallowed");
+	prism_free(&r);
+}
+
+static void test_braceless_switch_in_stmt_expr(void) {
+	printf("\n--- Braceless Switch in Statement Expression ---\n");
+
+	const char *code =
+	    "void f(void) {\n"
+	    "    int x = ({\n"
+	    "        switch (1)\n"
+	    "            case 1: 0;\n"
+	    "        0;\n"
+	    "    });\n"
+	    "    (void)x;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "braceless_sw_se.c", feat);
+	CHECK_EQ(r.status, PRISM_OK,
+	         "braceless switch in stmt-expr: no OOB/false reject");
+	prism_free(&r);
+}
+
 static void test_array_of_pointers_orelse_rejected(void) {
 	printf("\n--- Array-of-Pointers Orelse Rejected ---\n");
 
@@ -5381,6 +5610,29 @@ static void test_generic_decl_rewrite_destroys_dispatch(void) {
 	prism_free(&r3);
 }
 
+static void test_collect_source_defines_comment_continuation(void) {
+	/* BUG: collect_source_defines() skips comment lines with continue,
+	 * bypassing the check_continuation block. A comment ending with \
+	 * should suppress the next line (it's a continuation of the comment),
+	 * but the missed check lets the next line be parsed as a fresh define. */
+	const char *code =
+	    "// disabled: \\\n"
+	    "#define ZOMBIE_MACRO 1\n"
+	    "int main(void) { return 0; }\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "comment-continuation: create temp file");
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = false;
+	PrismResult r = prism_transpile_file(path, feat);
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "ZOMBIE_MACRO") == NULL,
+		      "comment-continuation: #define after // comment \\ "
+		      "must not be extracted (it is part of the comment)");
+	}
+	prism_free(&r);
+	unlink(path); free(path);
+}
+
 static void test_collect_source_defines_continuation_line(void) {
 	/* BUG: collect_source_defines() strips the trailing backslash from a
 	 * continuation-line #define and captures only the first physical line's
@@ -6441,6 +6693,211 @@ static void test_collect_source_defines_raw_string_desync(void) {
 
 /* Audit round 51b: deeply nested brackets must not exhaust the C call
    stack — walk_balanced_orelse uses an iterative explicit stack. */
+static void test_struct_union_vla_predecessor(void) {
+	printf("\n--- Struct/Union VLA Bracket Predecessor ---\n");
+	PrismFeatures feat = prism_defaults();
+
+	/* sizeof(struct S [n]) inside array dim — must detect VLA, emit memset */
+	{
+		const char *code =
+		    "struct S { int a; };\n"
+		    "int main(void) {\n"
+		    "    int n = 3;\n"
+		    "    char buf[sizeof(struct S [n])];\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "struct_vla.c", feat);
+		CHECK_EQ(r.status, PRISM_OK, "struct VLA: transpiles OK");
+		CHECK(r.output != NULL, "struct VLA: output not NULL");
+		if (r.output) {
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "struct VLA: must emit memset, not {0}");
+			CHECK(strstr(r.output, "buf[sizeof") == NULL ||
+			      strstr(r.output, "= {0}") == NULL,
+			      "struct VLA: must not emit = {0}");
+		}
+		prism_free(&r);
+	}
+
+	/* anonymous struct { ... } [n] — } predecessor */
+	{
+		const char *code =
+		    "int main(void) {\n"
+		    "    int n = 3;\n"
+		    "    char buf[sizeof(struct { int x; } [n])];\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "anon_struct_vla.c", feat);
+		CHECK_EQ(r.status, PRISM_OK, "anon struct VLA: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "anon struct VLA: must emit memset");
+		prism_free(&r);
+	}
+
+	/* union U [n] */
+	{
+		const char *code =
+		    "union U { int a; float b; };\n"
+		    "int main(void) {\n"
+		    "    int n = 3;\n"
+		    "    char buf[sizeof(union U [n])];\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "union_vla.c", feat);
+		CHECK_EQ(r.status, PRISM_OK, "union VLA: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "union VLA: must emit memset");
+		prism_free(&r);
+	}
+
+	/* enum E [n] */
+	{
+		const char *code =
+		    "enum E { A, B, C };\n"
+		    "int main(void) {\n"
+		    "    int n = 3;\n"
+		    "    char buf[sizeof(enum E [n])];\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "enum_vla.c", feat);
+		CHECK_EQ(r.status, PRISM_OK, "enum VLA: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "enum VLA: must emit memset");
+		prism_free(&r);
+	}
+}
+
+static void test_typedef_nested_enum_registration(void) {
+	printf("\n--- Typedef Nested Enum Registration ---\n");
+	PrismFeatures feat = prism_defaults();
+
+	/* Consequence 1: enum const inside typedef struct must not be flagged as VLA */
+	{
+		const char *code =
+		    "typedef struct {\n"
+		    "    enum { N = 10 } e;\n"
+		    "} State;\n"
+		    "int main(void) {\n"
+		    "    raw int arr[N];\n"
+		    "    return arr[0];\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "nested_enum_vla.c", feat);
+		CHECK_EQ(r.status, PRISM_OK,
+		         "nested enum const: must not false-VLA (transpile OK)");
+		if (r.output)
+			CHECK(strstr(r.output, "arr[N]") != NULL,
+			      "nested enum const: arr[N] preserved in output");
+		prism_free(&r);
+	}
+
+	/* Consequence 2: enum const inside typedef struct must trigger defer shadow */
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int X = 42;\n"
+		    "    {\n"
+		    "        defer (void)X;\n"
+		    "        typedef struct {\n"
+		    "            enum { X = 1 } e;\n"
+		    "        } Thing;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "nested_enum_shadow.c", feat);
+		CHECK(r.status != PRISM_OK,
+		      "nested enum shadow: must be detected");
+		CHECK(r.error_msg != NULL,
+		      "nested enum shadow: error_msg not NULL");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "shadow") != NULL,
+			      "nested enum shadow: error mentions shadow");
+		prism_free(&r);
+	}
+
+	/* Deeper nesting: enum inside union inside typedef struct */
+	{
+		const char *code =
+		    "typedef struct {\n"
+		    "    union {\n"
+		    "        enum { M = 5 } val;\n"
+		    "        int raw;\n"
+		    "    } u;\n"
+		    "} Deep;\n"
+		    "int main(void) {\n"
+		    "    raw int arr[M];\n"
+		    "    return arr[0];\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "deep_nested_enum.c", feat);
+		CHECK_EQ(r.status, PRISM_OK,
+		         "deep nested enum const: must not false-VLA");
+		prism_free(&r);
+	}
+}
+
+static void test_attributed_enum_defer_shadow(void) {
+	printf("\n--- Attributed Enum Defer Shadow ---\n");
+
+	PrismFeatures feat = prism_defaults();
+
+	/* GNU __attribute__ before enum brace */
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int x = 1;\n"
+		    "    {\n"
+		    "        defer (void)x;\n"
+		    "        enum __attribute__((packed)) { x = 42 };\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "attr_enum_shadow.c", feat);
+		CHECK(r.status != PRISM_OK,
+		      "GNU attr enum: shadow must be detected");
+		CHECK(r.error_msg != NULL, "GNU attr enum: error_msg not NULL");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "shadow") != NULL,
+			      "GNU attr enum: error mentions shadow");
+		prism_free(&r);
+	}
+
+	/* C23 [[gnu::packed]] before enum brace */
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int x = 1;\n"
+		    "    {\n"
+		    "        defer (void)x;\n"
+		    "        enum [[gnu::packed]] { x = 42 };\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "c23_attr_enum_shadow.c", feat);
+		CHECK(r.status != PRISM_OK,
+		      "C23 attr enum: shadow must be detected");
+		CHECK(r.error_msg != NULL, "C23 attr enum: error_msg not NULL");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "shadow") != NULL,
+			      "C23 attr enum: error mentions shadow");
+		prism_free(&r);
+	}
+
+	/* Plain enum (control case — always worked) */
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int x = 1;\n"
+		    "    {\n"
+		    "        defer (void)x;\n"
+		    "        enum { x = 42 };\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_enum_shadow.c", feat);
+		CHECK(r.status != PRISM_OK,
+		      "plain enum: shadow must be detected");
+		prism_free(&r);
+	}
+}
+
 static void test_walk_balanced_orelse_deep_brackets(void) {
 	printf("\n--- Deep Bracket Nesting (walk_balanced_orelse) ---\n");
 	{
@@ -6554,6 +7011,16 @@ test_typeof_orelse_leak();
 	test_volatile_orelse_no_double_eval();
 	test_builtin_memset_for_typeof_vla();
 	test_const_orelse_attr_preserved();
+	test_const_raw_orelse();
+	test_comma_operator_orelse();
+	test_c23_if_init_in_defer_shadow();
+	test_raw_typedef_not_erased();
+	test_raw_no_double_emit();
+	test_enum_attr_no_phantom();
+	test_generic_no_ghost_label();
+	test_bitfield_no_ghost_label();
+	test_ternary_before_label_no_swallow();
+	test_braceless_switch_in_stmt_expr();
 
 	test_array_of_pointers_orelse_rejected();
 	test_msvc_typeof_vla_no_builtin_memset();
@@ -6630,6 +7097,7 @@ test_typeof_orelse_leak();
 	test_braceless_nesting_depth_limit();
 
 	// Audit round 17 bug probes
+	test_collect_source_defines_comment_continuation();
 	test_collect_source_defines_continuation_line();
 	test_collect_source_defines_multi_continuation();
 #ifdef __GNUC__
@@ -6707,4 +7175,13 @@ test_typeof_orelse_leak();
 	// Audit round 51: raw string desync + deep bracket nesting
 	test_collect_source_defines_raw_string_desync();
 	test_walk_balanced_orelse_deep_brackets();
+
+	// Audit round 52: attributed enum defer shadow bypass
+	test_attributed_enum_defer_shadow();
+
+	// Audit round 53: struct/union VLA bracket predecessor
+	test_struct_union_vla_predecessor();
+
+	// Audit round 54: typedef nested enum constant registration
+	test_typedef_nested_enum_registration();
 }

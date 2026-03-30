@@ -3332,12 +3332,12 @@ static void test_decl_init_orelse_fno_zeroinit_wrong_transform(void) {
 // Audit round 21: BUG4 — comma operator at depth 0 in bare-assign orelse LHS.
 // reject_orelse_side_effects checks ++/--, compound-assign, asm, function calls,
 // and pointer derefs, but NOT for a comma operator at depth 0 between the
-// LHS start and the assignment '='.  A comma at depth 0 means the left side of
-// the comma expression is a throw-away sub-expression that will be evaluated
-// twice: once in the if-condition and once in the fallback arm.
+// LHS start and the assignment '='.  A comma at depth 0 separates independent
+// sub-expressions; orelse only applies to the one after the last comma.
+// The prefix is emitted as a separate statement (comma → semicolon).
 //   status_reg, out = f() orelse 0;
-// emits: { if (!( status_reg, out = f())) status_reg, out = ( 0); }
-// status_reg (volatile) is read twice — must instead be rejected as double-eval.
+// emits: status_reg; { typeof(f()) t0=(f()); out = t0 ? t0 : (0); }
+// status_reg is read once — no double-eval concern.
 static void test_bare_orelse_comma_lhs_depth0_double_eval(void) {
 	const char *src =
 	    "extern volatile int status_reg;\n"
@@ -3345,12 +3345,11 @@ static void test_bare_orelse_comma_lhs_depth0_double_eval(void) {
 	    "int f(void);\n"
 	    "void fn(void) { status_reg, out = f() orelse 0; }\n";
 	PrismResult r = prism_transpile_source(src, "comma_lhs_orelse.c", prism_defaults());
-	/* CORRECT: reject — comma at depth 0 before '=' causes double-eval of
-	 * everything left of the comma (here: a volatile read of status_reg). */
-	CHECK(r.status != PRISM_OK,
-	      "BUG4: bare-orelse-comma-lhs: comma at depth-0 before '=' must be "
-	      "rejected as double-eval side-effect (reject_orelse_side_effects "
-	      "is missing a depth-0 comma check; status_reg is read twice)");
+	/* Comma splits the expression: status_reg is a separate statement,
+	 * out = f() orelse 0 is processed independently — no double-eval. */
+	CHECK(r.status == PRISM_OK,
+	      "BUG4: bare-orelse-comma-lhs: comma at depth-0 splits expression; "
+	      "prefix becomes separate statement, no double-eval");
 	prism_free(&r);
 }
 

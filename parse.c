@@ -1632,15 +1632,14 @@ static Token *tokenize(File *file) {
 	// Also detect C23 [[ ... ]] attributes and tag the first '[' with TF_C23_ATTR.
 	{
 		int stack_cap = 256;
-		Token **stack = malloc(stack_cap * sizeof(Token *));
-		if (!stack) error("out of memory");
+		Token **stack = arena_alloc_uninit(&ctx->main_arena, stack_cap * sizeof(Token *));
 		int sp = 0;
 		for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
 			if (t->flags & TF_OPEN) {
 				if (sp >= stack_cap) {
+					int old_cap = stack_cap;
 					stack_cap *= 2;
-					stack = realloc(stack, stack_cap * sizeof(Token *));
-					if (!stack) error("out of memory");
+					stack = arena_realloc(&ctx->main_arena, stack, old_cap * sizeof(Token *), stack_cap * sizeof(Token *));
 				}
 				stack[sp++] = t;
 				Token *tn = tok_next(t);
@@ -1660,7 +1659,6 @@ static Token *tokenize(File *file) {
 		}
 		if (sp > 0)
 			error_tok(stack[sp - 1], "unclosed delimiter '%c'", tok_loc(stack[sp - 1])[0]);
-		free(stack);
 
 		// Pre-scan function bodies: tag '{' with TT_SPECIAL_FN / TT_ASM / TT_NORETURN_FN(=vfork).
 		// Propagate special-function taint transitively through wrapper chains.
