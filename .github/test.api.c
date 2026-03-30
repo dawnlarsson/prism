@@ -6314,11 +6314,7 @@ static void test_collect_source_defines_midline_block_comment(void) {
 	   to the scanner, causing defines inside the comment to be
 	   extracted and re-emitted in the output. */
 	{
-		char path[256];
-		snprintf(path, sizeof path, "/tmp/test_midline_%d.c", getpid());
-		FILE *f = fopen(path, "w");
-		CHECK(f != NULL, "midline-comment: create temp file");
-		fputs(
+		char *path = create_temp_file(
 			"int x = 1; /* block comment spans lines\n"
 			"#define SHOULD_BE_HIDDEN 42\n"
 			"end of comment */\n"
@@ -6328,8 +6324,9 @@ static void test_collect_source_defines_midline_block_comment(void) {
 			"int main(void) {\n"
 			"    printf(\"%d\\n\", SHOULD_BE_VISIBLE);\n"
 			"    return 0;\n"
-			"}\n", f);
-		fclose(f);
+			"}\n");
+		CHECK(path != NULL, "midline-comment: create temp file");
+		if (!path) return;
 
 		PrismFeatures feat = prism_defaults();
 		feat.flatten_headers = false;
@@ -6343,23 +6340,20 @@ static void test_collect_source_defines_midline_block_comment(void) {
 			      "midline-comment: SHOULD_BE_HIDDEN must NOT be extracted (inside block comment)");
 		}
 		prism_free(&r);
-		remove(path);
+		unlink(path); free(path);
 	}
 	/* Same bug on a #define line with trailing block comment open */
 	{
-		char path[256];
-		snprintf(path, sizeof path, "/tmp/test_trailing_%d.c", getpid());
-		FILE *f = fopen(path, "w");
-		CHECK(f != NULL, "trailing-comment: create temp file");
-		fputs(
+		char *path = create_temp_file(
 			"#define COLOR_RED 1 /* Colors:\n"
 			"#define HIDDEN_COLOR 99\n"
 			"   end of comment */\n"
 			"#define COLOR_BLUE 3\n"
 			"\n"
 			"#include <stdio.h>\n"
-			"int main(void) { return 0; }\n", f);
-		fclose(f);
+			"int main(void) { return 0; }\n");
+		CHECK(path != NULL, "trailing-comment: create temp file");
+		if (!path) return;
 
 		PrismFeatures feat = prism_defaults();
 		feat.flatten_headers = false;
@@ -6373,21 +6367,18 @@ static void test_collect_source_defines_midline_block_comment(void) {
 			      "trailing-comment: HIDDEN_COLOR must NOT be extracted (inside block comment)");
 		}
 		prism_free(&r);
-		remove(path);
+		unlink(path); free(path);
 	}
 	/* String literal containing /* must NOT false-positive as comment */
 	{
-		char path[256];
-		snprintf(path, sizeof path, "/tmp/test_strlit_%d.c", getpid());
-		FILE *f = fopen(path, "w");
-		CHECK(f != NULL, "strlit-comment: create temp file");
-		fputs(
+		char *path = create_temp_file(
 			"#define FMT_PREFIX \"/* prefix: \"\n"
 			"#define IMPORTANT 42\n"
 			"\n"
 			"#include <stdio.h>\n"
-			"int main(void) { return 0; }\n", f);
-		fclose(f);
+			"int main(void) { return 0; }\n");
+		CHECK(path != NULL, "strlit-comment: create temp file");
+		if (!path) return;
 
 		PrismFeatures feat = prism_defaults();
 		feat.flatten_headers = false;
@@ -6399,7 +6390,7 @@ static void test_collect_source_defines_midline_block_comment(void) {
 			      "strlit-comment: IMPORTANT must NOT be lost (/* is inside string)");
 		}
 		prism_free(&r);
-		remove(path);
+		unlink(path); free(path);
 	}
 }
 
