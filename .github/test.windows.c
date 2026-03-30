@@ -2872,6 +2872,255 @@ static void test_win_memstream_buffer_size(void) {
 	}
 }
 
+// Regression: handles in PROC_THREAD_ATTRIBUTE_HANDLE_LIST must have
+// HANDLE_FLAG_INHERIT set, otherwise UpdateProcThreadAttribute returns
+// ERROR_INVALID_PARAMETER on some Windows versions.
+static void test_win_handle_inherit_flag(void) {
+	printf("  Testing handle inheritance flag for spawn...\n");
+
+	// Create a pipe for stdout redirection – the write end must get
+	// HANDLE_FLAG_INHERIT set by win32_spawn_with_actions.
+	HANDLE hReadPipe, hWritePipe;
+	SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, FALSE }; // NOT inheritable yet
+	BOOL created = CreatePipe(&hReadPipe, &hWritePipe, &sa, 0);
+	CHECK(created, "handle_inherit: CreatePipe succeeds");
+	if (!created) return;
+
+	// Simulate what win32_spawn_with_actions now does: set inheritance
+	BOOL ok = SetHandleInformation(hWritePipe, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+	CHECK(ok, "handle_inherit: SetHandleInformation succeeds");
+
+	DWORD flags = 0;
+	GetHandleInformation(hWritePipe, &flags);
+	CHECK((flags & HANDLE_FLAG_INHERIT) != 0,
+	      "handle_inherit: HANDLE_FLAG_INHERIT is set");
+
+	// Now test that UpdateProcThreadAttribute accepts this handle
+	SIZE_T attr_size = 0;
+	InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+	LPPROC_THREAD_ATTRIBUTE_LIST attrList =
+		(LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
+	CHECK(attrList != NULL, "handle_inherit: malloc attrList");
+	if (attrList) {
+		BOOL initOk = InitializeProcThreadAttributeList(attrList, 1, 0, &attr_size);
+		CHECK(initOk, "handle_inherit: InitializeProcThreadAttributeList");
+		if (initOk) {
+			HANDLE handle_list[1] = { hWritePipe };
+			BOOL updateOk = UpdateProcThreadAttribute(
+				attrList, 0,
+				PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+				handle_list, sizeof(HANDLE), NULL, NULL);
+			CHECK(updateOk, "handle_inherit: UpdateProcThreadAttribute succeeds");
+			DeleteProcThreadAttributeList(attrList);
+		}
+		free(attrList);
+	}
+	CloseHandle(hReadPipe);
+	CloseHandle(hWritePipe);
+}
+
+// Regression: build_clean_environ must filter CC= case-insensitively on Windows.
+static void test_win_env_case_insensitive(void) {
+	printf("  Testing case-insensitive env scrubbing...\n");
+
+	// On Windows, env vars are case-insensitive: cc=foo should be stripped
+	// just like CC=foo.  build_clean_environ uses _strnicmp on Windows.
+	// We can't easily call build_clean_environ directly because it caches,
+	// but we can verify _strnicmp behavior directly.
+	CHECK(_strnicmp("CC=clang", "CC=", 3) == 0,
+	      "case_env: CC= matches CC= (upper)");
+	CHECK(_strnicmp("cc=gcc", "CC=", 3) == 0,
+	      "case_env: cc= matches CC= (lower)");
+	CHECK(_strnicmp("Cc=msvc", "CC=", 3) == 0,
+	      "case_env: Cc= matches CC= (mixed)");
+	CHECK(_strnicmp("PRISM_CC=clang", "PRISM_CC=", 9) == 0,
+	      "case_env: PRISM_CC= matches (upper)");
+	CHECK(_strnicmp("prism_cc=gcc", "PRISM_CC=", 9) == 0,
+	      "case_env: prism_cc= matches (lower)");
+	CHECK(_strnicmp("PATH=foo", "CC=", 3) != 0,
+	      "case_env: PATH= does not match CC=");
+}
+
+// Regression: win32_build_env_block must produce a valid double-NUL terminated
+// block even when the environment is empty (zero entries).
+static void test_win_empty_env_block(void) {
+	printf("  Testing empty env block double-NUL...\n");
+
+	// An empty envp array: just a NULL terminator
+	char *empty_envp[] = { NULL };
+	wchar_t *block = win32_build_env_block(empty_envp);
+	CHECK(block != NULL, "empty_env: allocation succeeds");
+	if (block) {
+		// A valid empty environment block is L"\0\0" (two NUL wchars).
+		CHECK(block[0] == L'\0', "empty_env: first wchar is NUL");
+		CHECK(block[1] == L'\0', "empty_env: second wchar is NUL (double-NUL)");
+		free(block);
+	}
+
+	// Also test NULL envp returns NULL (inherit parent)
+	CHECK(win32_build_env_block(NULL) == NULL,
+	      "empty_env: NULL envp returns NULL");
+}
+
+// Regression: open_memstream must register its temp file for signal cleanup
+// so Ctrl-C doesn't leave stale prmXXXX.tmp files.
+static void test_win_memstream_signal_register(void) {
+	printf("  Testing open_memstream signal temp registration...\n");
+
+	char *buf = NULL;
+	size_t sz = 0;
+	FILE *fp = open_memstream(&buf, &sz);
+	CHECK(fp != NULL, "memstream_reg: open_memstream succeeds");
+	if (fp) {
+		// The temp file path should be registered in signal_temps[]
+		// Search for win32_memstream_path in the signal_temps array.
+		CHECK(strlen(win32_memstream_path) > 0,
+		      "memstream_reg: path is non-empty");
+
+		bool found = false;
+		sig_atomic_t n = signal_temps_load();
+		for (sig_atomic_t i = 0; i < n; i++) {
+			if (signal_temps_ready_load(i) &&
+			    strcmp(signal_temps[i], win32_memstream_path) == 0) {
+				found = true;
+				break;
+			}
+		}
+		CHECK(found, "memstream_reg: path registered in signal_temps");
+
+		fprintf(fp, "signal test");
+		fclose(fp);
+		if (buf) free(buf);
+	}
+}
+
+// Regression: capture_first_line must use STARTUPINFOEX with a handle whitelist
+// (PROC_THREAD_ATTRIBUTE_HANDLE_LIST) just like win32_spawn_with_actions, to
+// prevent leaking all inheritable handles into the probe child process.
+static void test_win_capture_handle_whitelist(void) {
+	printf("  Testing capture_first_line uses handle whitelist...\n");
+
+	// Create a pipe that should NOT be inherited by capture_first_line's child.
+	// If the old code (plain STARTUPINFOW + bInheritHandles=TRUE) were still
+	// in use, this pipe would leak.  With the new STARTUPINFOEX whitelist,
+	// only the explicitly listed handles are inherited.
+	HANDLE hRead, hWrite;
+	SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE }; // inheritable
+	BOOL created = CreatePipe(&hRead, &hWrite, &sa, 0);
+	CHECK(created, "capture_wl: CreatePipe for bystander pipe");
+	if (!created) return;
+
+	// Run capture_first_line with a trivial command.  If the bystander pipe
+	// leaks into the child, it won't directly fail here, but the test proves
+	// the code path compiles and runs with the new STARTUPINFOEX logic.
+	char buf[256];
+	char *argv[] = { "cmd.exe", "/c", "echo whitelist_ok", NULL };
+	int rc = capture_first_line(argv, buf, sizeof(buf));
+	CHECK(rc == 0, "capture_wl: capture_first_line succeeds");
+	if (rc == 0) {
+		CHECK(strcmp(buf, "whitelist_ok") == 0,
+		      "capture_wl: output is whitelist_ok");
+	}
+
+	// The bystander pipe should still be valid (not closed by child exit).
+	DWORD flags = 0;
+	BOOL info_ok = GetHandleInformation(hWrite, &flags);
+	CHECK(info_ok, "capture_wl: bystander pipe still valid after child");
+
+	CloseHandle(hRead);
+	CloseHandle(hWrite);
+}
+
+// Regression: win32_fclose_wrapper must use win32_unlink_utf8 (not raw _unlink)
+// to properly delete temp files with non-ASCII paths.
+static void test_win_fclose_uses_utf8_unlink(void) {
+	printf("  Testing fclose wrapper uses UTF-8 unlink shim...\n");
+
+	// open_memstream creates a temp file and stores it in win32_memstream_path.
+	// When we fclose it, the wrapper should call win32_unlink_utf8, which
+	// converts UTF-8 to wide before calling _wunlink.
+	char *buf = NULL;
+	size_t sz = 0;
+	FILE *fp = open_memstream(&buf, &sz);
+	CHECK(fp != NULL, "fclose_utf8: open_memstream succeeds");
+	if (fp) {
+		fprintf(fp, "test content for unlink");
+		// Note the path before fclose deletes it
+		char saved_path[4096];
+		strncpy(saved_path, win32_memstream_path, sizeof(saved_path) - 1);
+		saved_path[sizeof(saved_path) - 1] = '\0';
+
+		// Verify the temp file exists
+		struct _stat st;
+		int exists_before = (win32_stat_utf8(saved_path, &st) == 0);
+		CHECK(exists_before, "fclose_utf8: temp file exists before fclose");
+
+		fclose(fp);
+
+		// After fclose, the temp file should be deleted by win32_unlink_utf8
+		int exists_after = (win32_stat_utf8(saved_path, &st) == 0);
+		CHECK(!exists_after, "fclose_utf8: temp file deleted after fclose");
+
+		if (buf) free(buf);
+	}
+}
+
+// Regression: PATH_MAX must be large enough for UTF-8 expansion of Windows
+// wide-char paths.  MAX_PATH (260) wide chars can expand to 780 UTF-8 bytes.
+static void test_win_path_max_utf8_safe(void) {
+	printf("  Testing PATH_MAX is UTF-8-safe...\n");
+
+	// PATH_MAX should be at least MAX_PATH * 3 (780) to hold any possible
+	// UTF-8 expansion of a MAX_PATH wide-char path.  We set it to 4096.
+	CHECK(PATH_MAX >= MAX_PATH * 3,
+	      "path_max: PATH_MAX >= MAX_PATH * 3");
+	CHECK(PATH_MAX >= 4096,
+	      "path_max: PATH_MAX >= 4096");
+
+	// signal_temps entries should be large enough
+	CHECK(sizeof(signal_temps[0]) >= 4096,
+	      "path_max: signal_temps entry >= 4096 bytes");
+
+	// signal_temp_path should be large enough
+	CHECK(sizeof(signal_temp_path) >= 4096,
+	      "path_max: signal_temp_path >= 4096 bytes");
+}
+
+// Regression: signal_temps_register must accept long UTF-8 paths (>= 260 bytes).
+// Previously PATH_MAX was 260, silently dropping legitimate long paths.
+static void test_win_signal_register_long_path(void) {
+	printf("  Testing signal_temps_register accepts long UTF-8 paths...\n");
+
+	// Build a valid-looking path that's > 260 bytes but < 4096
+	char long_path[512];
+	memset(long_path, 0, sizeof(long_path));
+	strcpy(long_path, "C:\\Users\\");
+	// Pad with realistic directory components to exceed 260
+	for (int i = (int)strlen(long_path); i < 300; i++)
+		long_path[i] = (i % 10 == 0) ? '\\' : 'a';
+	strcat(long_path, "\\temp.tmp");
+
+	size_t len = strlen(long_path);
+	CHECK(len > 260, "sig_long: path exceeds old PATH_MAX of 260");
+	CHECK(len < PATH_MAX, "sig_long: path fits in new PATH_MAX");
+
+	// Register it — should NOT be silently dropped anymore
+	sig_atomic_t count_before = signal_temps_load();
+	signal_temps_register(long_path);
+	sig_atomic_t count_after = signal_temps_load();
+	CHECK(count_after == count_before + 1,
+	      "sig_long: path was registered (count incremented)");
+
+	// Verify the path is stored correctly
+	if (count_after > count_before) {
+		int idx = (int)(count_after - 1);
+		CHECK(signal_temps_ready_load(idx),
+		      "sig_long: entry marked ready");
+		CHECK(strcmp(signal_temps[idx], long_path) == 0,
+		      "sig_long: stored path matches");
+	}
+}
+
 void run_windows_tests(void) {
 	printf("=== PRISM WINDOWS TEST SUITE ===\n");
 
@@ -2949,6 +3198,16 @@ void run_windows_tests(void) {
 	test_win_get_env_utf8();
 	test_win_path_basename_backslash();
 	test_win_memstream_buffer_size();
+
+	test_win_handle_inherit_flag();
+	test_win_env_case_insensitive();
+	test_win_empty_env_block();
+	test_win_memstream_signal_register();
+
+	test_win_capture_handle_whitelist();
+	test_win_fclose_uses_utf8_unlink();
+	test_win_path_max_utf8_safe();
+	test_win_signal_register_long_path();
 
 	return (failed == 0) ? 0 : 1;
 }

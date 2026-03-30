@@ -31,6 +31,7 @@
 
 static char **build_clean_environ(void);
 static const char *path_basename(const char *path);
+static void signal_temps_register(const char *path);
 
 #include "parse.c"
 
@@ -5004,7 +5005,11 @@ static char **build_clean_environ(void) {
 	if (!env) return NULL;
 	int j = 0;
 	for (char **e = environ; *e; e++) {
+#ifdef _WIN32
+		if (_strnicmp(*e, "CC=", 3) != 0 && _strnicmp(*e, "PRISM_CC=", 9) != 0) env[j++] = *e;
+#else
 		if (strncmp(*e, "CC=", 3) != 0 && strncmp(*e, "PRISM_CC=", 9) != 0) env[j++] = *e;
+#endif
 	}
 	env[j] = NULL;
 	// If another thread raced us, we leak a small allocation — acceptable.

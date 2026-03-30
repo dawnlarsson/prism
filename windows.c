@@ -79,7 +79,7 @@ typedef int mode_t;
 #endif
 
 #ifndef PATH_MAX
-#define PATH_MAX MAX_PATH
+#define PATH_MAX 4096
 #endif
 
 #ifndef STDOUT_FILENO
@@ -201,6 +201,7 @@ static FILE *open_memstream(char **bufp, size_t *sizep) {
 	// Convert wide temp path to UTF-8 for storage
 	WideCharToMultiByte(CP_UTF8, 0, wtmpfile, -1,
 			    win32_memstream_path, sizeof(win32_memstream_path), NULL, NULL);
+	signal_temps_register(win32_memstream_path);
 	FILE *fp = fopen(win32_memstream_path, "w+b");
 	if (!fp) return NULL;
 	*bufp = NULL;
@@ -211,6 +212,8 @@ static FILE *open_memstream(char **bufp, size_t *sizep) {
 	return fp;
 }
 
+static int win32_unlink_utf8(const char *path);
+
 static int win32_fclose_wrapper(FILE *fp) {
 	if (fp && fp == win32_memstream_fp) {
 		fflush(fp);
@@ -220,7 +223,7 @@ static int win32_fclose_wrapper(FILE *fp) {
 		char *buf = (char *)malloc((size_t)pos + 1);
 		if (!buf) {
 			win32_real_fclose(fp);
-			_unlink(win32_memstream_path);
+			win32_unlink_utf8(win32_memstream_path);
 			errno = ENOMEM;
 			return EOF;
 		}
@@ -229,7 +232,7 @@ static int win32_fclose_wrapper(FILE *fp) {
 		*win32_memstream_bufp = buf;
 		*win32_memstream_sizep = nread;
 		int ret = win32_real_fclose(fp);
-		_unlink(win32_memstream_path);
+		win32_unlink_utf8(win32_memstream_path);
 		win32_memstream_fp = NULL;
 		return ret;
 	}
@@ -711,7 +714,8 @@ static wchar_t *win32_build_env_block(char **envp) {
 		total_wchars += (size_t)wlen; // includes NUL terminator (serves as separator)
 	}
 	total_wchars++; // final double-NUL
-	wchar_t *block = (wchar_t *)malloc(total_wchars * sizeof(wchar_t));
+	if (total_wchars < 2) total_wchars = 2; // empty env needs double-NUL
+	wchar_t *block = (wchar_t *)calloc(total_wchars, sizeof(wchar_t));
 	if (!block) return NULL;
 	wchar_t *p = block;
 	for (char **e = envp; *e; e++) {
@@ -848,7 +852,10 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 					bool dup = false;
 					for (int j = 0; j < handle_count; j++)
 						if (handle_list[j] == candidates[i]) { dup = true; break; }
-					if (!dup) handle_list[handle_count++] = candidates[i];
+					if (!dup) {
+						SetHandleInformation(candidates[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+						handle_list[handle_count++] = candidates[i];
+					}
 				}
 
 				STARTUPINFOEXW six;
@@ -1049,17 +1056,53 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 	HANDLE hNul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
 				   &sa_nul, OPEN_EXISTING, 0, NULL);
 
-	STARTUPINFOW si;
 	PROCESS_INFORMATION pi;
-	memset(&si, 0, sizeof(si));
-	si.cb = sizeof(si);
-	si.dwFlags = STARTF_USESTDHANDLES;
-	si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-	si.hStdOutput = hWritePipe;
-	si.hStdError = (hNul != INVALID_HANDLE_VALUE) ? hNul : GetStdHandle(STD_ERROR_HANDLE);
 	memset(&pi, 0, sizeof(pi));
 
-	BOOL ok = CreateProcessW(NULL, wcmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+	// Use STARTUPINFOEX with PROC_THREAD_ATTRIBUTE_HANDLE_LIST so only
+	// the pipe/NUL handles are inherited, not every inheritable handle
+	// in the process (which would leak concurrent PRISM_LIB_MODE pipes).
+	HANDLE candidates[3] = { GetStdHandle(STD_INPUT_HANDLE), hWritePipe,
+		(hNul != INVALID_HANDLE_VALUE) ? hNul : GetStdHandle(STD_ERROR_HANDLE) };
+	HANDLE handle_list[3];
+	int handle_count = 0;
+	for (int i = 0; i < 3; i++) {
+		if (candidates[i] == INVALID_HANDLE_VALUE || candidates[i] == NULL)
+			continue;
+		SetHandleInformation(candidates[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+		bool dup = false;
+		for (int j = 0; j < handle_count; j++)
+			if (handle_list[j] == candidates[i]) { dup = true; break; }
+		if (!dup) handle_list[handle_count++] = candidates[i];
+	}
+
+	STARTUPINFOEXW six;
+	memset(&six, 0, sizeof(six));
+	six.StartupInfo.cb = sizeof(six);
+	six.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+	six.StartupInfo.hStdInput = candidates[0];
+	six.StartupInfo.hStdOutput = hWritePipe;
+	six.StartupInfo.hStdError = candidates[2];
+
+	SIZE_T attr_size = 0;
+	InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+	six.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
+	BOOL ok = FALSE;
+	if (six.lpAttributeList &&
+	    InitializeProcThreadAttributeList(six.lpAttributeList, 1, 0, &attr_size) &&
+	    UpdateProcThreadAttribute(six.lpAttributeList, 0,
+				     PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+				     handle_list,
+				     (SIZE_T)handle_count * sizeof(HANDLE),
+				     NULL, NULL)) {
+		ok = CreateProcessW(NULL, wcmdline, NULL, NULL, TRUE,
+				    EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
+				    &six.StartupInfo, &pi);
+	}
+	if (six.lpAttributeList) {
+		DeleteProcThreadAttributeList(six.lpAttributeList);
+		free(six.lpAttributeList);
+	}
 	free(wcmdline);
 	CloseHandle(hWritePipe); // Close write end in parent so reads will EOF
 	if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
