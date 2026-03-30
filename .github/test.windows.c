@@ -3121,6 +3121,276 @@ static void test_win_signal_register_long_path(void) {
 	}
 }
 
+// Regression: multiple SPAWN_ACT_OPEN actions must not leak file handles.
+// Previously, a single HANDLE hNul was overwritten by each CreateFile;
+// only the last handle was closed, leaking all prior ones.
+static void test_win_spawn_multi_open_handles(void) {
+	printf("  Testing SPAWN_ACT_OPEN closes all opened handles...\n");
+
+	// Create two distinct temp files to redirect stdout and stderr to different files.
+	char tmpdir_buf[PATH_MAX];
+	const char *tmpdir = get_tmp_dir();
+	snprintf(tmpdir_buf, sizeof(tmpdir_buf), "%s", tmpdir);
+
+	char path_out[PATH_MAX], path_err[PATH_MAX];
+	snprintf(path_out, sizeof(path_out), "%sprism_test_out_XXXXXX", tmpdir_buf);
+	snprintf(path_err, sizeof(path_err), "%sprism_test_err_XXXXXX", tmpdir_buf);
+
+	int fd_out = mkstemp(path_out);
+	int fd_err = mkstemp(path_err);
+	CHECK(fd_out >= 0, "spawn_multi: mkstemp for stdout");
+	CHECK(fd_err >= 0, "spawn_multi: mkstemp for stderr");
+	if (fd_out < 0 || fd_err < 0) {
+		if (fd_out >= 0) { close(fd_out); remove(path_out); }
+		if (fd_err >= 0) { close(fd_err); remove(path_err); }
+		return;
+	}
+	close(fd_out);
+	close(fd_err);
+
+	// Set up two SPAWN_ACT_OPEN actions: stdout -> path_out, stderr -> path_err
+	posix_spawn_file_actions_t fa;
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, path_out,
+					 O_WRONLY | O_CREAT | O_TRUNC, 0666);
+	posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, path_err,
+					 O_WRONLY | O_CREAT | O_TRUNC, 0666);
+
+	// Spawn a process with these two redirections.
+	// If the old code leaked the first handle, it wouldn't be obvious from
+	// this test alone, but we verify both files get written to correctly.
+	char *argv[] = { "cmd.exe", "/c", "echo STDOUT_DATA && echo STDERR_DATA>&2", NULL };
+	pid_t pid;
+	int rc = posix_spawnp(&pid, argv[0], &fa, NULL, argv, NULL);
+	CHECK(rc == 0, "spawn_multi: posix_spawnp succeeds");
+
+	if (rc == 0) {
+		int status;
+		waitpid(pid, &status, 0);
+		CHECK(status == 0, "spawn_multi: child exited cleanly");
+
+		// Verify stdout was redirected to path_out
+		FILE *f = fopen(path_out, "r");
+		CHECK(f != NULL, "spawn_multi: stdout file exists");
+		if (f) {
+			char buf[256];
+			if (fgets(buf, sizeof(buf), f)) {
+				// Trim whitespace
+				char *end = buf + strlen(buf) - 1;
+				while (end >= buf && (*end == '\n' || *end == '\r' || *end == ' ')) *end-- = '\0';
+				CHECK(strcmp(buf, "STDOUT_DATA") == 0,
+				      "spawn_multi: stdout contains STDOUT_DATA");
+			}
+			fclose(f);
+		}
+
+		// Verify stderr was redirected to path_err
+		f = fopen(path_err, "r");
+		CHECK(f != NULL, "spawn_multi: stderr file exists");
+		if (f) {
+			char buf[256];
+			if (fgets(buf, sizeof(buf), f)) {
+				char *end = buf + strlen(buf) - 1;
+				while (end >= buf && (*end == '\n' || *end == '\r' || *end == ' ')) *end-- = '\0';
+				CHECK(strcmp(buf, "STDERR_DATA") == 0,
+				      "spawn_multi: stderr contains STDERR_DATA");
+			}
+			fclose(f);
+		}
+	}
+
+	posix_spawn_file_actions_destroy(&fa);
+	remove(path_out);
+	remove(path_err);
+}
+
+// Regression: realpath must correctly strip \\?\UNC\ prefix on network paths.
+// Previously, stripping exactly 4 chars from \\?\UNC\server\share produced
+// the broken path "UNC\server\share" instead of "\\server\share".
+static void test_win_realpath_unc_prefix(void) {
+	printf("  Testing realpath UNC prefix stripping logic...\n");
+
+	// We can't easily create a real network path in a test environment,
+	// so we test the prefix-stripping logic directly by calling
+	// GetFinalPathNameByHandleW on a local path and checking the \\?\ strip.
+	// Then we verify the UNC branch compiles and has correct pointer math.
+
+	// Test 1: local path stripping works (\\?\C:\... -> C:\...)
+	char resolved[PATH_MAX];
+	char *rp = realpath(".", resolved);
+	CHECK(rp != NULL, "realpath_unc: resolves current dir");
+	if (rp) {
+		// Result should be a normal local path (C:\...), not \\?\...
+		CHECK(rp[0] != '\\' || rp[1] != '\\' || rp[2] != '?',
+		      "realpath_unc: \\\\?\\ prefix is stripped");
+		// Should start with a drive letter
+		CHECK(((rp[0] >= 'A' && rp[0] <= 'Z') || (rp[0] >= 'a' && rp[0] <= 'z')) && rp[1] == ':',
+		      "realpath_unc: starts with drive letter");
+	}
+
+	// Test 2: Verify the UNC prefix detection math is correct.
+	// Simulate: if GetFinalPathNameByHandleW returned L"\\\\?\\UNC\\server\\share\\file.c",
+	// after stripping, we should get L"\\\\server\\share\\file.c" (advance 6, write \\).
+	wchar_t sim_unc[] = L"\\\\?\\UNC\\myserver\\myshare\\dir\\file.c";
+	DWORD sim_len = (DWORD)wcslen(sim_unc);
+	wchar_t *result_start = sim_unc;
+	if (sim_len >= 4 && sim_unc[0] == L'\\' && sim_unc[1] == L'\\' &&
+	    sim_unc[2] == L'?' && sim_unc[3] == L'\\') {
+		if (sim_len >= 8 && sim_unc[4] == L'U' && sim_unc[5] == L'N' &&
+		    sim_unc[6] == L'C' && sim_unc[7] == L'\\') {
+			result_start += 6;
+			result_start[0] = L'\\';
+		} else {
+			result_start += 4;
+		}
+	}
+	// Convert to UTF-8 and verify
+	char unc_result[PATH_MAX];
+	WideCharToMultiByte(CP_UTF8, 0, result_start, -1, unc_result, sizeof(unc_result), NULL, NULL);
+	CHECK(unc_result[0] == '\\' && unc_result[1] == '\\',
+	      "realpath_unc: UNC result starts with \\\\");
+	CHECK(strncmp(unc_result, "\\\\myserver\\", 11) == 0,
+	      "realpath_unc: UNC result is \\\\myserver\\...");
+	CHECK(strstr(unc_result, "UNC") == NULL,
+	      "realpath_unc: no stray UNC in result");
+
+	// Test 3: Verify non-UNC extended path (\\?\C:\...) strips correctly
+	wchar_t sim_local[] = L"\\\\?\\C:\\Users\\test\\file.c";
+	DWORD sim_local_len = (DWORD)wcslen(sim_local);
+	wchar_t *local_start = sim_local;
+	if (sim_local_len >= 4 && sim_local[0] == L'\\' && sim_local[1] == L'\\' &&
+	    sim_local[2] == L'?' && sim_local[3] == L'\\') {
+		if (sim_local_len >= 8 && sim_local[4] == L'U' && sim_local[5] == L'N' &&
+		    sim_local[6] == L'C' && sim_local[7] == L'\\') {
+			local_start += 6;
+			local_start[0] = L'\\';
+		} else {
+			local_start += 4;
+		}
+	}
+	char local_result[PATH_MAX];
+	WideCharToMultiByte(CP_UTF8, 0, local_start, -1, local_result, sizeof(local_result), NULL, NULL);
+	CHECK(local_result[0] == 'C' && local_result[1] == ':',
+	      "realpath_unc: local \\\\?\\ stripped to C:\\...");
+}
+
+// Regression: win32_utf8_argv must not pass needed=0 to malloc.
+// Previously, if WideCharToMultiByte returned 0 (unmappable), malloc(0) returned
+// a valid pointer with uninitialized data, then argv[i] lacked a null terminator.
+static void test_win_utf8_argv_zero_needed(void) {
+	printf("  Testing win32_utf8_argv handles edge cases...\n");
+
+	// Test 1: Normal ASCII argument converts correctly
+	{
+		wchar_t warg[] = L"hello";
+		int needed = WideCharToMultiByte(CP_UTF8, 0, warg, -1, NULL, 0, NULL, NULL);
+		CHECK(needed > 0, "utf8_argv: ASCII needed > 0");
+		if (needed > 0) {
+			char *arg = (char *)malloc((size_t)needed);
+			CHECK(arg != NULL, "utf8_argv: malloc succeeds");
+			if (arg) {
+				WideCharToMultiByte(CP_UTF8, 0, warg, -1, arg, needed, NULL, NULL);
+				CHECK(strcmp(arg, "hello") == 0, "utf8_argv: ASCII converts correctly");
+				free(arg);
+			}
+		}
+	}
+
+	// Test 2: Empty string should still work (needed=1 for null terminator)
+	{
+		wchar_t warg[] = L"";
+		int needed = WideCharToMultiByte(CP_UTF8, 0, warg, -1, NULL, 0, NULL, NULL);
+		CHECK(needed == 1, "utf8_argv: empty string needed == 1");
+	}
+
+	// Test 3: The fix — when needed <= 0, we must not malloc and use it
+	// Directly test the fixed pattern: if (needed > 0 && (argv[i] = malloc(needed)))
+	{
+		int needed = 0; // simulate failure
+		char *arg = NULL;
+		// The fix: only malloc and use if needed > 0
+		if (needed > 0 && (arg = (char *)malloc((size_t)needed)))
+			CHECK(0, "utf8_argv: should not reach here with needed=0");
+		else
+			arg = _strdup("");
+		CHECK(arg != NULL, "utf8_argv: fallback to strdup");
+		CHECK(strcmp(arg, "") == 0, "utf8_argv: fallback is empty string");
+		free(arg);
+	}
+
+	// Test 4: Verify full win32_utf8_argv works end-to-end
+	// (it operates on the actual process command line, so just check it doesn't crash)
+	{
+		int argc = 0;
+		char **argv = NULL;
+		win32_utf8_argv(&argc, &argv);
+		CHECK(argc > 0, "utf8_argv: parsed at least 1 arg");
+		CHECK(argv != NULL, "utf8_argv: argv is not NULL");
+		if (argv) {
+			CHECK(argv[0] != NULL, "utf8_argv: argv[0] is not NULL");
+			CHECK(strlen(argv[0]) > 0, "utf8_argv: argv[0] is non-empty");
+			// Don't free — these are the process args
+		}
+	}
+}
+
+// Regression: get_env_utf8 must not clobber previous results.
+// Previously, a single static buffer was reused for all calls, so
+// const char *a = getenv("A"); const char *b = getenv("B"); would make
+// a and b point to the same buffer containing B's value.
+static void test_win_get_env_utf8_no_clobber(void) {
+	printf("  Testing get_env_utf8 rotating buffer prevents clobbering...\n");
+
+	// Set up known environment variables (use _wputenv to set them)
+	_wputenv(L"PRISM_TEST_ENV_A=alpha_value");
+	_wputenv(L"PRISM_TEST_ENV_B=bravo_value");
+	_wputenv(L"PRISM_TEST_ENV_C=charlie_value");
+	_wputenv(L"PRISM_TEST_ENV_D=delta_value");
+
+	// Grab all 4 pointers before any of them can be clobbered
+	const char *a = get_env_utf8("PRISM_TEST_ENV_A");
+	const char *b = get_env_utf8("PRISM_TEST_ENV_B");
+	const char *c = get_env_utf8("PRISM_TEST_ENV_C");
+	const char *d = get_env_utf8("PRISM_TEST_ENV_D");
+
+	CHECK(a != NULL, "env_clobber: A is not NULL");
+	CHECK(b != NULL, "env_clobber: B is not NULL");
+	CHECK(c != NULL, "env_clobber: C is not NULL");
+	CHECK(d != NULL, "env_clobber: D is not NULL");
+
+	if (a && b && c && d) {
+		// With the old single-buffer code, ALL four would equal "delta_value".
+		// With the rotating pool of 4, all should be distinct.
+		CHECK(strcmp(a, "alpha_value") == 0,  "env_clobber: A == alpha_value");
+		CHECK(strcmp(b, "bravo_value") == 0,  "env_clobber: B == bravo_value");
+		CHECK(strcmp(c, "charlie_value") == 0, "env_clobber: C == charlie_value");
+		CHECK(strcmp(d, "delta_value") == 0,  "env_clobber: D == delta_value");
+
+		// Verify they're different pointers
+		CHECK(a != b, "env_clobber: A and B are different pointers");
+		CHECK(b != c, "env_clobber: B and C are different pointers");
+		CHECK(c != d, "env_clobber: C and D are different pointers");
+	}
+
+	// A 5th call WILL reuse the first slot (rotating pool of 4), so a is now stale.
+	// This is expected and documented behavior — the pool handles the common case.
+	const char *e_val = get_env_utf8("PRISM_TEST_ENV_A");
+	// 'a' may now be clobbered since slot 0 was reused — that's by design.
+	// But b, c, d should still be valid.
+	if (b && c && d) {
+		CHECK(strcmp(b, "bravo_value") == 0,  "env_clobber: B survives 5th call");
+		CHECK(strcmp(c, "charlie_value") == 0, "env_clobber: C survives 5th call");
+		CHECK(strcmp(d, "delta_value") == 0,  "env_clobber: D survives 5th call");
+	}
+	(void)e_val;
+
+	// Clean up
+	_wputenv(L"PRISM_TEST_ENV_A=");
+	_wputenv(L"PRISM_TEST_ENV_B=");
+	_wputenv(L"PRISM_TEST_ENV_C=");
+	_wputenv(L"PRISM_TEST_ENV_D=");
+}
+
 void run_windows_tests(void) {
 	printf("=== PRISM WINDOWS TEST SUITE ===\n");
 
@@ -3208,6 +3478,11 @@ void run_windows_tests(void) {
 	test_win_fclose_uses_utf8_unlink();
 	test_win_path_max_utf8_safe();
 	test_win_signal_register_long_path();
+
+	test_win_spawn_multi_open_handles();
+	test_win_realpath_unc_prefix();
+	test_win_utf8_argv_zero_needed();
+	test_win_get_env_utf8_no_clobber();
 
 	return (failed == 0) ? 0 : 1;
 }

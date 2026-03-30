@@ -1909,8 +1909,8 @@ Token *tokenize_file(char *path) {
 	ensure_keyword_cache();
 
 #ifdef _WIN32
-	wchar_t wpath[MAX_PATH];
-	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, MAX_PATH);
+	wchar_t wpath[PATH_MAX];
+	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, PATH_MAX);
 	HANDLE hFile;
 	if (wn > 0)
 		hFile = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, NULL,
@@ -1919,19 +1919,26 @@ Token *tokenize_file(char *path) {
 		hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
 				   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (hFile == INVALID_HANDLE_VALUE) return NULL;
-	DWORD file_size = GetFileSize(hFile, NULL);
-	if (file_size == INVALID_FILE_SIZE || file_size == 0) {
+	LARGE_INTEGER li_size;
+	if (!GetFileSizeEx(hFile, &li_size) || li_size.QuadPart < 0) {
 		CloseHandle(hFile);
-		if (file_size == 0) {
-			char *buf = malloc(8);
-			if (!buf) return NULL;
-			memset(buf, 0, 8);
-			File *file = new_file(path, ctx->input_file_count, buf);
-			add_input_file(file);
-			return tokenize(file);
-		}
 		return NULL;
 	}
+	if (li_size.QuadPart == 0) {
+		CloseHandle(hFile);
+		char *buf = malloc(8);
+		if (!buf) return NULL;
+		memset(buf, 0, 8);
+		File *file = new_file(path, ctx->input_file_count, buf);
+		add_input_file(file);
+		return tokenize(file);
+	}
+	if (li_size.QuadPart > 512LL * 1024 * 1024) {
+		CloseHandle(hFile);
+		fprintf(stderr, "error: file too large: %s\n", path);
+		return NULL;
+	}
+	DWORD file_size = (DWORD)li_size.QuadPart;
 	char *buf = malloc((size_t)file_size + 8);
 	if (!buf) { CloseHandle(hFile); return NULL; }
 	DWORD bytes_read = 0;
