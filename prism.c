@@ -818,16 +818,15 @@ static void out_line(int line_no, const char *file) {
 
 // Collect system headers by detecting actual #include entries (not macro expansions)
 static void collect_system_includes(void) {
+	HashMap include_map = {0};
 	for (int i = 0; i < ctx->input_file_count; i++) {
 		File *f = ctx->input_files[i];
 		if (!f->is_system || !f->is_include_entry || !f->name) continue;
 		const char *base = path_basename(f->name);
 		if (strcmp(base, "assert.h")) {
-			bool found = false;
-			for (int j = 0; j < ctx->system_include_count; j++) {
-				if (strcmp(system_include_list[j], f->name) == 0) { found = true; break; }
-			}
-			if (found) continue;
+			int len = (int)strlen(f->name);
+			if (hashmap_get(&include_map, f->name, len)) continue;
+			hashmap_put(&include_map, f->name, len, (void *)1);
 		}
 		ARENA_ENSURE_CAP(&ctx->main_arena,
 				 system_include_list,
@@ -837,6 +836,7 @@ static void collect_system_includes(void) {
 				 char *);
 		system_include_list[ctx->system_include_count++] = f->name;
 	}
+	free(include_map.buckets);
 }
 
 static void emit_system_header_diag_push(void) {
@@ -1631,10 +1631,7 @@ static inline bool is_orelse_keyword(Token *tok) {
 }
 
 static inline bool is_assignment_operator_token(Token *tok) {
-	return match_ch(tok, '=') || equal(tok, "+=") || equal(tok, "-=") ||
-	       equal(tok, "*=") || equal(tok, "/=") || equal(tok, "%=") ||
-	       equal(tok, "<<=") || equal(tok, ">>=") || equal(tok, "&=") ||
-	       equal(tok, "^=") || equal(tok, "|=");
+	return (tok->tag & TT_ASSIGN) && tok_loc(tok)[tok->len - 1] == '=';
 }
 
 // Reject side effects on the LHS of an orelse expression that would be duplicated.
@@ -2006,7 +2003,7 @@ static void emit_ret_type(void) {
 // Check if a token can legally precede an array bracket '[' in a type context.
 // Used in VLA detection to distinguish type[dim] from other bracket uses.
 static inline bool is_array_bracket_predecessor(Token *t, Token *prev2) {
-	return is_type_keyword(t) || is_known_typedef(t) ||
+	return is_type_keyword(t) ||
 	       (t->tag & TT_QUALIFIER) ||
 	       (prev2 && (prev2->tag & TT_SUE)) ||
 	       match_ch(t, ']') || match_ch(t, '*') || match_ch(t, ')') ||
@@ -6542,27 +6539,37 @@ static Token *skip_one_stmt(Token *tok) {
 	// For non-tail positions (if-body before else check, do-body before while check),
 	// we maintain a small explicit stack.  In practice, the non-tail positions only
 	// nest via if-body containing another do-while containing another if-body, etc.
-	// A stack of 4096 is more than sufficient.
+	// A small stack-local buffer covers the 99% case; heap fallback for deep nesting.
 	enum { CONT_IF_ELSE, CONT_DO_WHILE };
 	typedef struct { int kind; Token *tok; } Cont;
-	int cont_n = 0, cont_cap = 0;
-	Cont *cont_stack = NULL;
+	Cont local_stack[16];
+	int cont_n = 0, cont_cap = 16;
+	Cont *cont_stack = local_stack;
 
 #define PUSH_CONT(k, t) do { \
 	if (cont_n >= cont_cap) { \
-		cont_cap = cont_cap ? cont_cap * 2 : 64; \
-		void *_tmp = realloc(cont_stack, (size_t)cont_cap * sizeof(Cont)); \
-		if (!_tmp) { free(cont_stack); error("out of memory"); } \
-		cont_stack = _tmp; \
+		int new_cap = cont_cap * 2; \
+		if (cont_stack == local_stack) { \
+			cont_stack = malloc((size_t)new_cap * sizeof(Cont)); \
+			if (!cont_stack) error("out of memory"); \
+			memcpy(cont_stack, local_stack, (size_t)cont_n * sizeof(Cont)); \
+		} else { \
+			void *_tmp = realloc(cont_stack, (size_t)new_cap * sizeof(Cont)); \
+			if (!_tmp) { free(cont_stack); error("out of memory"); } \
+			cont_stack = _tmp; \
+		} \
+		cont_cap = new_cap; \
 	} \
 	cont_stack[cont_n++] = (Cont){k, t}; \
 } while (0)
+
+#define FREE_CONT() do { if (cont_stack != local_stack) free(cont_stack); } while (0)
 
 restart:
 	(void)0;
 	while (tok && tok->kind == TK_PREP_DIR) tok = tok_next(tok);
 	tok = skip_noise(tok); // skip C23 [[attr]] and __attribute__((...))
-	if (!tok || tok->kind == TK_EOF) { free(cont_stack); return NULL; }
+	if (!tok || tok->kind == TK_EOF) { FREE_CONT(); return NULL; }
 
 	// Braced compound statement
 	Token *end = NULL;
@@ -6585,7 +6592,7 @@ restart:
 			tok = tok_next(tok_match(p));
 			goto restart;
 		}
-		free(cont_stack); return NULL;
+		FREE_CONT(); return NULL;
 	}
 
 	// 'for', 'while', 'switch': keyword '(...)' body (tail call)
@@ -6596,7 +6603,7 @@ restart:
 			tok = tok_next(tok_match(p));
 			goto restart;
 		}
-		free(cont_stack); return NULL;
+		FREE_CONT(); return NULL;
 	}
 
 	// 'do': body then 'while' '(...)' ';'
@@ -6619,7 +6626,7 @@ restart:
 				goto restart;
 			}
 		}
-		free(cont_stack); return NULL;
+		FREE_CONT(); return NULL;
 	}
 
 	// Simple statement: scan to ';' at balanced depth
@@ -6634,7 +6641,7 @@ restart:
 			}
 		}
 	}
-	free(cont_stack);
+	FREE_CONT();
 	return NULL;
 
 process_cont:
@@ -6663,13 +6670,14 @@ process_cont:
 					if (a && match_ch(a, ';')) { end = a; continue; }
 				}
 			}
-			free(cont_stack); return NULL;
+			FREE_CONT(); return NULL;
 		}
 	}
-	free(cont_stack);
+	FREE_CONT();
 	return end;
 }
 #undef PUSH_CONT
+#undef FREE_CONT
 
 // Phase 1B: walk all tokens at all depths to build the complete typedef + enum table.
 
@@ -6729,8 +6737,13 @@ static Token *find_init_semicolon(Token *open, Token *close) {
 static uint16_t find_body_scope_id(Token *body_start) {
 	if (body_start && match_ch(body_start, '{')) {
 		uint32_t idx = tok_idx(body_start);
-		for (uint16_t si = 1; si < scope_tree_count; si++)
-			if (scope_tree[si].open_tok_idx == idx) return si;
+		int low = 1, high = (int)scope_tree_count - 1;
+		while (low <= high) {
+			int mid = low + (high - low) / 2;
+			if (scope_tree[mid].open_tok_idx == idx) return (uint16_t)mid;
+			if (scope_tree[mid].open_tok_idx < idx) low = mid + 1;
+			else high = mid - 1;
+		}
 	}
 	return 0;
 }

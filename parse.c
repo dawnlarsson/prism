@@ -55,6 +55,8 @@
 #define ARENA_ALIGN (__alignof__(long double))
 #endif
 
+// equal() is defined as an always_inline function after its helpers (_equal_1, _equal_2, equal_n)
+
 #define equal(                                                                                                                     \
     tok,                                                                                                                           \
     s) /* known-length strings of 1/2 bytes use branchless comparisons; others use memcmp. Runtime strings fall back to strlen. */ \
@@ -223,6 +225,7 @@ typedef struct {
 typedef struct {
 	char *key;
 	void *val;
+	uint32_t hash;
 	uint16_t key_len;
 } HashEntry;
 
@@ -467,6 +470,19 @@ static void *arena_alloc(Arena *arena, size_t size) {
 }
 
 static void *arena_realloc(Arena *arena, void *old, size_t old_size, size_t new_size) {
+	// In-place extension: if old is at the top of the current block, just grow it
+	if (old && arena->current) {
+		size_t aligned_old = (old_size + (ARENA_ALIGN - 1)) & ~(size_t)(ARENA_ALIGN - 1);
+		if ((char *)old + aligned_old == arena->current->data + arena->current->used) {
+			size_t aligned_new = (new_size + (ARENA_ALIGN - 1)) & ~(size_t)(ARENA_ALIGN - 1);
+			size_t diff = aligned_new - aligned_old;
+			if (arena->current->used + diff <= arena->current->capacity) {
+				arena->current->used += diff;
+				memset((char *)old + old_size, 0, new_size - old_size);
+				return old;
+			}
+		}
+	}
 	void *p = arena_alloc_uninit(arena, new_size);
 	if (old && old_size > 0) memcpy(p, old, old_size < new_size ? old_size : new_size);
 	if (new_size > old_size) memset((char *)p + old_size, 0, new_size - old_size);
@@ -611,10 +627,13 @@ static inline uint64_t fast_hash(char *s, uint32_t len) {
 static void *hashmap_get(HashMap *map, char *key, int keylen) {
 	if (!map->buckets) return NULL;
 	uint64_t hash = fast_hash(key, keylen);
+	uint32_t hash32 = (uint32_t)hash;
 	int mask = map->capacity - 1;
 	for (int i = 0; i <= mask; i++) {
 		HashEntry *ent = &map->buckets[(hash + i) & mask];
-		if (ENTRY_MATCHES(ent, key, keylen)) return ent->val;
+		if (ent->key && ent->key != TOMBSTONE && ent->hash == hash32 &&
+		    ent->key_len == (uint16_t)keylen && !memcmp(ent->key, key, keylen))
+			return ent->val;
 		if (!ent->key) return NULL;
 	}
 	return NULL;
@@ -623,10 +642,19 @@ static void *hashmap_get(HashMap *map, char *key, int keylen) {
 static void hashmap_resize(HashMap *map, int newcap) {
 	HashMap new_map = {.buckets = calloc(newcap, sizeof(HashEntry)), .capacity = newcap};
 	if (!new_map.buckets) error("out of memory resizing hashmap");
+	int new_mask = newcap - 1;
 	for (int i = 0; i < map->capacity; i++) {
 		HashEntry *ent = &map->buckets[i];
-		if (ent->key && ent->key != TOMBSTONE)
-			hashmap_put(&new_map, ent->key, ent->key_len, ent->val);
+		if (ent->key && ent->key != TOMBSTONE) {
+			uint64_t h = ent->hash;
+			int idx;
+			for (int j = 0;; j++) {
+				idx = (h + j) & new_mask;
+				if (!new_map.buckets[idx].key) break;
+			}
+			new_map.buckets[idx] = *ent;
+			new_map.used++;
+		}
 	}
 	free(map->buckets);
 	*map = new_map;
@@ -642,6 +670,7 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val) {
 	}
 
 	uint64_t hash = fast_hash(key, keylen);
+	uint32_t hash32 = (uint32_t)hash;
 	int mask = map->capacity - 1;
 	int first_empty = -1;
 
@@ -649,7 +678,8 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val) {
 		int idx = (hash + i) & mask;
 		HashEntry *ent = &map->buckets[idx];
 
-		if (ENTRY_MATCHES(ent, key, keylen)) {
+		if (ent->key && ent->key != TOMBSTONE && ent->hash == hash32 &&
+		    ent->key_len == (uint16_t)keylen && !memcmp(ent->key, key, keylen)) {
 			ent->val = val;
 			return;
 		}
@@ -663,6 +693,7 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val) {
 	HashEntry *ent = &map->buckets[first_empty];
 	ent->key = key;
 	ent->key_len = keylen;
+	ent->hash = hash32;
 	ent->val = val;
 	map->used++;
 }
