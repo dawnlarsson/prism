@@ -6936,9 +6936,11 @@ static void test_walk_balanced_orelse_deep_brackets(void) {
 	}
 }
 
-void run_api_tests(void) {
-test_typeof_orelse_leak();
-	printf("\n=== API TESTS ===\n");
+// Split into 4 groups for parallel execution.
+
+void run_api_tests_1(void) {
+	test_typeof_orelse_leak();
+	printf("\n=== API TESTS (group 1) ===\n");
 
 	test_lib_defaults();
 	test_basic_transpile();
@@ -7001,6 +7003,10 @@ test_typeof_orelse_leak();
 	test_ghost_enum_fnptr_param();
 	test_bare_orelse_comma_boundary();
 	test_c23_attr_label_defer();
+}
+
+void run_api_tests_2(void) {
+	printf("\n=== API TESTS (group 2) ===\n");
 	test_cli_large_passthrough_argv();
 	test_cli_missing_input_file();
 	test_cli_unknown_flag_fails_cleanly();
@@ -7037,7 +7043,10 @@ test_typeof_orelse_leak();
 
 	test_defer_block_no_swallow();
 	test_typeof_memset_size_t_counter();
+}
 
+void run_api_tests_3(void) {
+	printf("\n=== API TESTS (group 3) ===\n");
 #ifndef _WIN32
 	test_cli_dep_flags_routing();
 	test_cli_dep_flags_passthrough();
@@ -7071,10 +7080,8 @@ test_typeof_orelse_leak();
 
 	test_memory_leak_stress();
 
-	// Audit round 4 bug probes (should FAIL until fixed)
 	test_signal_temps_register_overflow();
 
-	// Audit round 5 bug probes (should FAIL until fixed)
 #ifndef _WIN32
 	test_make_temp_file_toctou_symlink();
 #endif
@@ -7082,25 +7089,20 @@ test_typeof_orelse_leak();
 	test_signal_temps_register_race();
 #endif
 
-	// Audit round 6 bug probes (should FAIL until fixed)
 	test_generic_decl_rewrite_destroys_dispatch();
-
-	// Audit round 7 bug probes (should FAIL until fixed)
 	test_no_flatten_headers_abi_define_erasure();
 
-	// Audit round 8 bug probes (should FAIL until fixed)
 #ifndef _WIN32
 	test_multifile_arena_use_after_reset();
 #endif
+}
 
-	// Audit round 14 bug probes (should FAIL until fixed)
+void run_api_tests_4(void) {
+	printf("\n=== API TESTS (group 4) ===\n");
 	test_collect_source_defines_long_line_truncation();
-
-	// Audit round 16 bug probes (should FAIL until fixed)
 	test_collect_source_defines_block_comment_leak();
 	test_braceless_nesting_depth_limit();
 
-	// Audit round 17 bug probes
 	test_collect_source_defines_comment_continuation();
 	test_collect_source_defines_continuation_line();
 	test_collect_source_defines_multi_continuation();
@@ -7108,84 +7110,41 @@ test_typeof_orelse_leak();
 	test_auto_type_goto_bypass();
 #endif
 
-	// Audit round 18 bug probes
 	test_c23_attr_skip_one_stmt_scope_leak();
-
-	// Audit round 19 bug probes
 	test_stmtexpr_in_initializer_zeroinit();
 	test_stmtexpr_in_initializer_defer_raw_leak();
-
-	// Audit round 20 bug probes
 	test_braceless_for_defer_shadow_leak();
-
-	// Audit round 21 bug probes
 	test_walk_balanced_itag_truncation();
 	test_walk_balanced_orelse_stmtexpr();
 	test_goto_over_for_init_decl();
-
-	// Audit round 22 bug probes
 	test_p1_ann_dirty_state_leak();
 	test_raw_raw_double_qualifier();
 
-	// Audit round 23 bug probes
 #ifndef _WIN32
 	test_cli_main_leak_asan();
 #endif
 
-	// Audit round 27: collect_source_defines comment-in-directive + ifdef branches
 	test_collect_source_defines_comment_in_directive();
 	test_collect_source_defines_ifdef_both_branches_extracted();
-
-        // Audit round 28: collect_source_defines scan cutoff at non-preprocessor line
-        test_collect_source_defines_after_code_line();
-
-	// Audit round 29: signal_temps ready flag prevents TOCTOU partial-path unlink
+	test_collect_source_defines_after_code_line();
 	test_signal_temps_ready_flag();
-
-	// Audit round 30: collect_source_defines block comment end same-line define
 	test_collect_source_defines_block_comment_end_same_line();
-
-	// Audit round 36: disabled #include ABI drop, _Generic ctrl expr mutilation,
-	// split block comment in_block_comment flag
 	test_collect_source_defines_disabled_include_abi_drop();
 	test_generic_controlling_expr_mutilation();
 	test_collect_source_defines_split_block_comment();
-
-	// Audit round 39: continuation splice space corruption,
-	// _Generic member distinct target mutilation
 	test_collect_source_defines_continuation_splice_space();
 	test_generic_member_distinct_target_mutilation();
-
-	// Audit round 42: _Generic non-identifier target (default: 0) fold
 	test_generic_nonident_target_fold();
-
-	// Audit round 40: conditional define preservation with guards
 	test_collect_source_defines_conditional_guard_preserved();
-
-	// Audit round 44: hardcoded resource limits
 	test_cond_stack_deep_nesting_silent_drop();
 	test_defer_shadow_limit_dynamic();
 	test_skip_one_stmt_deep_iterative();
-
-	// Audit round 48: taint propagation O(N^2) function lookup
 	test_taint_propagation_perf();
-
-	// Audit round 49: library mode #ifdef-in-orelse rejection
 	test_ifdef_in_orelse_lib_rejected();
-
-	// Audit round 50: collect_source_defines mid-line block comment
 	test_collect_source_defines_midline_block_comment();
-
-	// Audit round 51: raw string desync + deep bracket nesting
 	test_collect_source_defines_raw_string_desync();
 	test_walk_balanced_orelse_deep_brackets();
-
-	// Audit round 52: attributed enum defer shadow bypass
 	test_attributed_enum_defer_shadow();
-
-	// Audit round 53: struct/union VLA bracket predecessor
 	test_struct_union_vla_predecessor();
-
-	// Audit round 54: typedef nested enum constant registration
 	test_typedef_nested_enum_registration();
 }

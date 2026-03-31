@@ -180,6 +180,11 @@ static inline int sigprocmask(int how, const sigset_t *set, sigset_t *old) {
 // Using a unique name avoids conflicting with MSVC ucrt's read() declaration.
 #define read prism_posix_read_
 
+// WARNING: No system #includes may appear below this point.
+// The macros above (read, fclose, fopen, etc.) redirect standard library
+// names to Prism wrappers. A system header included after these macros
+// will have its struct members and function declarations corrupted.
+
 // POSIX open_memstream returns a FILE* that writes to a growing buffer.
 // On fclose, *bufp and *sizep are updated.  Windows has no equivalent,
 // so we back the stream with a temp file and intercept fclose to read
@@ -224,6 +229,7 @@ static int win32_fclose_wrapper(FILE *fp) {
 		if (!buf) {
 			win32_real_fclose(fp);
 			win32_unlink_utf8(win32_memstream_path);
+			signal_temps_unregister(win32_memstream_path);
 			errno = ENOMEM;
 			return EOF;
 		}
@@ -233,6 +239,7 @@ static int win32_fclose_wrapper(FILE *fp) {
 		*win32_memstream_sizep = nread;
 		int ret = win32_real_fclose(fp);
 		win32_unlink_utf8(win32_memstream_path);
+		signal_temps_unregister(win32_memstream_path);
 		win32_memstream_fp = NULL;
 		return ret;
 	}
@@ -306,7 +313,7 @@ static const char *get_env_utf8(const char *name) {
 	if (!wval) return NULL;
 	// Rotating pool of 4 buffers so sequential getenv calls don't clobber each other
 	static PRISM_THREAD_LOCAL char env_pool[4][PATH_MAX * 3];
-	static PRISM_THREAD_LOCAL int env_slot = 0;
+	static PRISM_THREAD_LOCAL unsigned int env_slot = 0;
 	char *env_buf = env_pool[env_slot++ & 3];
 	int ulen = WideCharToMultiByte(CP_UTF8, 0, wval, -1, env_buf, PATH_MAX * 3, NULL, NULL);
 	if (ulen <= 0) return getenv(name);
@@ -345,7 +352,7 @@ static BOOL win32_movefileex_utf8(const char *src, const char *dst, DWORD flags)
 static void win32_utf8_argv(int *argc_out, char ***argv_out) {
 	int wargc;
 	LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
-	if (!wargv) return;
+	if (!wargv) { *argc_out = 0; *argv_out = NULL; return; }
 
 	char **argv = (char **)calloc((size_t)wargc + 1, sizeof(char *));
 	if (!argv) { LocalFree(wargv); return; }

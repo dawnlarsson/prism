@@ -470,6 +470,7 @@ static void *arena_alloc(Arena *arena, size_t size) {
 }
 
 static void *arena_realloc(Arena *arena, void *old, size_t old_size, size_t new_size) {
+	if (new_size <= old_size) return old;
 	// In-place extension: if old is at the top of the current block, just grow it
 	if (old && arena->current) {
 		size_t aligned_old = (old_size + (ARENA_ALIGN - 1)) & ~(size_t)(ARENA_ALIGN - 1);

@@ -339,7 +339,7 @@ static char signal_temp_path[PATH_MAX];
 
 // Transpiled temp file tracking for signal cleanup.
 // Fixed-size array; entries are PATH_MAX-sized C strings.
-// 256 entries (1 MB) covers any realistic invocation.
+// 256 * PATH_MAX bytes total (typically 1 MB on POSIX).
 #define SIGNAL_TEMPS_MAX 256
 static char signal_temps[SIGNAL_TEMPS_MAX][PATH_MAX];
 static volatile sig_atomic_t signal_temps_ready[SIGNAL_TEMPS_MAX];
@@ -374,6 +374,17 @@ static void signal_temps_register(const char *path) {
 	} while (!signal_temps_cas(&n, n + 1));
 	memcpy(signal_temps[n], path, len + 1);
 	signal_temps_ready_store(n, 1);
+}
+
+static void signal_temps_unregister(const char *path) {
+	int n = signal_temps_load();
+	for (int i = 0; i < n; i++) {
+		if (signal_temps_ready_load(i) && strcmp(signal_temps[i], path) == 0) {
+			signal_temps_ready_store(i, 0);
+			signal_temps[i][0] = '\0';
+			return;
+		}
+	}
 }
 
 static void signal_temps_clear(void) {
@@ -10033,6 +10044,12 @@ static int compile_sources(Cli *cli) {
 }
 
 static void signal_cleanup_handler(int sig) {
+	// Note on async-signal-safety: on POSIX, only async-signal-safe
+	// functions are used here (unlink, signal, raise).  On Windows,
+	// fflush/fclose below are NOT async-signal-safe, but are required
+	// because Windows locks open files, preventing unlink.  Windows
+	// dispatches Ctrl-C on a separate thread, so the deadlock window
+	// is narrow; this is an accepted trade-off.
 #ifdef _WIN32
 	// On Windows, unlink/_wunlink fails with EACCES if the file is open.
 	// Close any open output/memstream files before attempting cleanup.

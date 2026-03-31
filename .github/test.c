@@ -13,13 +13,17 @@
 #include <stddef.h>
 #ifndef _WIN32
 #include <sys/resource.h>
+#include <pthread.h>
+#include <sys/time.h>
 #endif
 
-static char log_buffer[1024];
-static int log_pos = 0;
-static int passed = 0;
-static int failed = 0;
-static int total = 0;
+// Per-thread log buffer (used by defer tests to verify execution order)
+// and per-thread test counters for parallel suite execution.
+static _Thread_local char log_buffer[1024];
+static _Thread_local int log_pos = 0;
+static _Thread_local int passed = 0;
+static _Thread_local int failed = 0;
+static _Thread_local int total = 0;
 
 static void log_reset(void) {
 	log_buffer[0] = 0;
@@ -84,7 +88,7 @@ static bool has_var_zeroing(const char *output, const char *var) {
 }
 
 static const char *test_tmp_dir(void) {
-	static char buf[PATH_MAX];
+	static _Thread_local char buf[PATH_MAX];
 	const char *t = getenv("TMPDIR");
 #ifdef _WIN32
 	if (!t || !*t) t = getenv("TEMP");
@@ -192,23 +196,92 @@ static bool is_emulated(void) {
 #include "test.harsh.c"
 #include "test.api.c"
 
-int main(void) {
-	printf("=== PRISM TEST SUITE ===\n");
-	
-	run_windows_tests();
+typedef struct {
+	const char *name;
+	void (*func)(void);
+	int passed, failed, total;
+	double elapsed;
+} TestSuite;
 
-	run_safe_tests();
-	run_raw_tests();
-	run_defer_tests();
-	run_zeroinit_tests();
-	run_parse_tests();
-	run_orelse_tests();
-	run_harsh_review_tests();
-	run_api_tests();
+#ifndef _WIN32
+static void *suite_thread(void *arg) {
+	TestSuite *s = (TestSuite *)arg;
+	struct timeval st0, st1;
+	gettimeofday(&st0, NULL);
+	passed = failed = total = 0;
+	s->func();
+	s->passed = passed;
+	s->failed = failed;
+	s->total = total;
+	gettimeofday(&st1, NULL);
+	s->elapsed = (st1.tv_sec - st0.tv_sec) + (st1.tv_usec - st0.tv_usec) / 1e6;
+	prism_thread_cleanup();
+	return NULL;
+}
+#endif
+
+int main(void) {
+	TestSuite suites[] = {
+		{"windows",  run_windows_tests},
+		{"safe",     run_safe_tests},
+		{"raw",      run_raw_tests},
+		{"defer",    run_defer_tests},
+		{"zeroinit", run_zeroinit_tests},
+		{"parse",    run_parse_tests},
+		{"orelse",   run_orelse_tests},
+		{"harsh",    run_harsh_review_tests},
+		{"api_1",    run_api_tests_1},
+		{"api_2",    run_api_tests_2},
+		{"api_3",    run_api_tests_3},
+		{"api_4",    run_api_tests_4},
+	};
+	int n = sizeof(suites) / sizeof(suites[0]);
+
+	printf("=== PRISM TEST SUITE (%d suites, parallel) ===\n", n);
+
+#ifndef _WIN32
+	struct timeval t0, t1;
+	gettimeofday(&t0, NULL);
+
+	pthread_t threads[sizeof(suites) / sizeof(suites[0])];
+	for (int i = 0; i < n; i++)
+		pthread_create(&threads[i], NULL, suite_thread, &suites[i]);
+	for (int i = 0; i < n; i++)
+		pthread_join(threads[i], NULL);
+
+	gettimeofday(&t1, NULL);
+	double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_usec - t0.tv_usec) / 1e6;
+#else
+	// Windows: run serially
+	for (int i = 0; i < n; i++) {
+		passed = failed = total = 0;
+		suites[i].func();
+		suites[i].passed = passed;
+		suites[i].failed = failed;
+		suites[i].total = total;
+	}
+	double elapsed = 0;
+#endif
+
+	int total_pass = 0, total_fail = 0, total_tests = 0;
+	for (int i = 0; i < n; i++) {
+		total_pass += suites[i].passed;
+		total_fail += suites[i].failed;
+		total_tests += suites[i].total;
+	}
+
+	printf("\n--- Suite Timing ---\n");
+	for (int i = 0; i < n; i++)
+		printf("  %-10s %4d tests  %5.2fs\n", suites[i].name, suites[i].total, suites[i].elapsed);
 
 	printf("\n========================================\n");
-	printf("TOTAL: %d tests, %d passed, %d failed\n", total, passed, failed);
+	printf("TOTAL: %d tests, %d passed, %d failed", total_tests, total_pass, total_fail);
+#ifndef _WIN32
+	printf(" (%.2fs wall)\n", elapsed);
+#else
+	printf("\n");
+#endif
 	printf("========================================\n");
 
-	return (failed == 0) ? 0 : 1;
+	return (total_fail == 0) ? 0 : 1;
 }
