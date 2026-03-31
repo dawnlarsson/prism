@@ -64,12 +64,13 @@ static void log_append(const char *s) {
 
 #define CHECK_EQ(got, expected, name)                                                                        \
 	do {                                                                                                 \
+		int _got = (got), _exp = (expected);                                                         \
 		total++;                                                                                     \
-		if ((got) == (expected)) {                                                                   \
+		if (_got == _exp) {                                                                          \
 			printf("[PASS] %s\n", name);                                                         \
 			passed++;                                                                            \
 		} else {                                                                                     \
-			printf("[FAIL] %s: expected %d, got %d\n", name, (int)(expected), (int)(got));       \
+			printf("[FAIL] %s: expected %d, got %d\n", name, _exp, _got);                        \
 			failed++;                                                                            \
 		}                                                                                            \
 	} while (0)

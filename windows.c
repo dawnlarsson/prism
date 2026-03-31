@@ -218,6 +218,7 @@ static FILE *open_memstream(char **bufp, size_t *sizep) {
 }
 
 static int win32_unlink_utf8(const char *path);
+static void signal_temps_unregister(const char *path);
 
 static int win32_fclose_wrapper(FILE *fp) {
 	if (fp && fp == win32_memstream_fp) {
