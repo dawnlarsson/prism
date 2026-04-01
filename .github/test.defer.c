@@ -4471,6 +4471,92 @@ static void test_defer_vfork_member_no_reject(void) {
 	}
 }
 
+static void test_defer_shadow_braceless_for_ifelse(void) {
+	printf("\n--- BUG: braceless for-body if/else shadow false positive ---\n");
+
+	// Sub-test 1: if/else inside braceless for body
+	// The semicolon after the if-branch must NOT clear for_name_hid.
+	{
+		const char *code =
+		    "void use(int);\n"
+		    "void f(void) {\n"
+		    "    defer {\n"
+		    "        for (int x = 0; x < 10; x++)\n"
+		    "            if (x % 2 == 0)\n"
+		    "                use(x);\n"
+		    "            else\n"
+		    "                use(x);\n"
+		    "    }\n"
+		    "    int x = 42;\n"
+		    "    use(x);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "braceless_ifelse.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "braceless-for-ifelse: must not false-positive on for-init shadow");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: do/while inside braceless for body
+	// The } of the do-body must NOT clear for_name_hid before the while condition.
+	{
+		const char *code =
+		    "void use(int);\n"
+		    "void f(void) {\n"
+		    "    defer {\n"
+		    "        for (int x = 0; x < 10; x++)\n"
+		    "            do { use(x); } while (x < 5);\n"
+		    "    }\n"
+		    "    int x = 42;\n"
+		    "    use(x);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "braceless_dowhile.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "braceless-for-dowhile: must not false-positive on for-init shadow");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: genuine shadow AFTER braceless for body must still be caught
+	{
+		const char *code =
+		    "void use(int);\n"
+		    "void f(void) {\n"
+		    "    defer {\n"
+		    "        for (int x = 0; x < 10; x++)\n"
+		    "            use(x);\n"
+		    "        use(x);\n"
+		    "    }\n"
+		    "    int x = 42;\n"
+		    "    use(x);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "braceless_genuine.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "braceless-for-genuine: genuine shadow after for body must be caught");
+		prism_free(&r);
+	}
+
+	// Sub-test 4: nested for with if/else — both for-inits hide the name
+	{
+		const char *code =
+		    "void use(int);\n"
+		    "void f(void) {\n"
+		    "    defer {\n"
+		    "        for (int x = 0; x < 3; x++)\n"
+		    "            for (int y = 0; y < 3; y++)\n"
+		    "                if (y % 2)\n"
+		    "                    use(x);\n"
+		    "                else\n"
+		    "                    use(x);\n"
+		    "    }\n"
+		    "    int x = 42;\n"
+		    "    use(x);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "nested_for_ifelse.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "nested-for-ifelse: must not false-positive");
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -4737,4 +4823,7 @@ void run_defer_tests(void) {
 
 	// BUG: vfork member namespace pollution (os.vfork() / p->vfork())
 	test_defer_vfork_member_no_reject();
+
+	// BUG: braceless for-body if/else and do/while prematurely clears for_name_hid
+	test_defer_shadow_braceless_for_ifelse();
 }

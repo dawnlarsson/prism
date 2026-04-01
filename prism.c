@@ -1220,6 +1220,7 @@ static bool has_defers_for(DeferEmitMode mode, int stop_depth) {
 // (return/goto/break/continue) pastes the defer while the shadow is live.
 // Shadowing is safe when the inner variable goes out of scope before any
 // such exit (normal block end always pops the shadow first).
+static Token *skip_one_stmt(Token *tok); // forward declaration
 static void check_defer_var_shadow(Token *var_name) {
 	if (!FEAT(F_DEFER) || defer_count == 0) return;
 	ScopeNode *blk = scope_block_top();
@@ -1258,15 +1259,17 @@ static void check_defer_var_shadow(Token *var_name) {
 		bool was_in_decl = false; // true if a type keyword appeared in this statement (survives '=')
 		int decl_bd = 0; // brace depth where in_decl was set
 		int for_init_pd = -1; // paren depth inside active for-init; -1 = inactive
+		Token *for_header_open = NULL; // '(' of current for/while/if header
 		bool for_name_hid = false; // true if for-init declared our target name
-		int for_body_bd = -1; // brace depth at the for statement level
+		uint32_t for_body_end_idx = 0; // token index of for-body end (from skip_one_stmt)
 		for (Token *t = defer_stack[i].stmt; t && t != defer_stack[i].end && t->kind != TK_EOF;
 		     prev = t, t = tok_next(t)) {
+			// Check if we've passed the for-body end
+			if (for_name_hid && for_body_end_idx && tok_idx(t) > for_body_end_idx)
+				for_name_hid = false;
 			if (match_ch(t, '{')) { brace_depth++; continue; }
 			if (match_ch(t, '}')) {
 				brace_depth--;
-				if (for_name_hid && brace_depth == for_body_bd)
-					for_name_hid = false;
 				if (decl_depth >= 0 && brace_depth < decl_depth)
 					decl_depth = -1; // local var went out of scope
 				if (in_decl && brace_depth < decl_bd) in_decl = false;
@@ -1274,8 +1277,10 @@ static void check_defer_var_shadow(Token *var_name) {
 			}
 			if (match_ch(t, '(') || match_ch(t, '[')) {
 				if (match_ch(t, '(') && prev && prev->kind == TK_KEYWORD &&
-				    ((prev->tag & TT_LOOP) || (prev->tag & TT_IF) || (prev->tag & TT_SWITCH)))
+				    ((prev->tag & TT_LOOP) || (prev->tag & TT_IF) || (prev->tag & TT_SWITCH))) {
 					for_init_pd = paren_depth + 1;
+					for_header_open = t;
+				}
 				paren_depth++;
 				continue;
 			}
@@ -1289,9 +1294,6 @@ static void check_defer_var_shadow(Token *var_name) {
 				in_decl = false; was_in_decl = false;
 				if (for_init_pd >= 0 && paren_depth == for_init_pd)
 					for_init_pd = -1;
-				if (for_name_hid && for_init_pd < 0 && paren_depth == 0 &&
-				    brace_depth == for_body_bd)
-					for_name_hid = false;
 				continue;
 			}
 			// '=' transitions from declarator to initializer expression.
@@ -1331,7 +1333,13 @@ static void check_defer_var_shadow(Token *var_name) {
 				// For-init declaration: mark name as hidden for the for scope
 				if (for_init_pd >= 0 && in_decl) {
 					for_name_hid = true;
-					for_body_bd = brace_depth;
+					// Find the for-body end via skip_one_stmt
+					if (for_header_open && tok_match(for_header_open)) {
+						Token *body_end = skip_one_stmt(tok_next(tok_match(for_header_open)));
+						for_body_end_idx = body_end ? tok_idx(body_end) : 0;
+					} else {
+						for_body_end_idx = 0;
+					}
 					continue;
 				}
 				if (defer_shadow_count >= defer_shadow_cap) {
