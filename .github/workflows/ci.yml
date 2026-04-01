@@ -183,53 +183,40 @@ jobs:
       - name: Run Test Suite
         run: prism run .github/test.c
 
-  # Native arm64 build (GitHub ARM runner)
+  # Native arm64 build (GitHub ARM runner, Alpine via Docker)
   build-arm64:
     name: linux - arm64
     runs-on: ubuntu-24.04-arm
-    container: alpine:latest
     steps:
-      - name: Install Build Dependencies
-        run: apk add --no-cache gcc musl-dev git
-
       - uses: actions/checkout@v4
 
-      - name: Display System Info
+      - name: Build and Test in Alpine ARM64
         run: |
-          echo "OS: Alpine Linux"
-          echo "Architecture: $(uname -m)"
-          uname -a
-          gcc --version
-
-      - name: "Stage 0: Build with host compiler"
-        run: gcc -o /tmp/prism_stage0 prism.c
-
-      - name: "Stage 1: Prism builds itself"
-        run: /tmp/prism_stage0 prism.c -o /tmp/prism_stage1
-
-      - name: "Stage 2: Self-built Prism builds itself again"
-        run: /tmp/prism_stage1 prism.c -o /tmp/prism_stage2
-
-      - name: Install Stage 2
-        run: |
-          /tmp/prism_stage2 install
-          rm -f /tmp/prism_stage0 /tmp/prism_stage1 /tmp/prism_stage2
-
-      - name: Verify Installation
-        run: |
-          which prism
-          prism || true
-
-      - name: Test Build Functionality
-        run: |
-          cat <<EOF > test_hello.c
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            alpine:latest sh -c '
+              set -e
+              apk add --no-cache gcc musl-dev
+              echo "Architecture: $(uname -m)"
+              gcc --version
+              echo "=== Stage 0: Build with host compiler ==="
+              gcc -o /tmp/prism_stage0 prism.c
+              echo "=== Stage 1: Prism builds itself ==="
+              /tmp/prism_stage0 prism.c -o /tmp/prism_stage1
+              echo "=== Stage 2: Self-built Prism builds itself again ==="
+              /tmp/prism_stage1 prism.c -o /tmp/prism_stage2
+              /tmp/prism_stage2 install
+              rm -f /tmp/prism_stage0 /tmp/prism_stage1 /tmp/prism_stage2
+              which prism
+              prism || true
+              cat <<EOF > test_hello.c
           #include <stdio.h>
           int main() { printf("Hello from Alpine arm64!\n"); return 0; }
           EOF
-          prism test_hello.c
-
-      - name: Run Test Suite
-        run: prism run .github/test.c
+              prism test_hello.c
+              prism run .github/test.c
+            '
 
   build-riscv:
     name: linux - riscv64
