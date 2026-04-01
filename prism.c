@@ -3758,6 +3758,17 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		OrelseInitInfo orelse_info = scan_decl_orelse(decl.end, type_start, type, &decl);
 		bool is_const_orelse_fallback = orelse_info.is_const_fallback;
 
+		// Static/extern/thread-local initializers must be constant expressions
+		// (C11 §6.7.9p4). Orelse splits the declaration into a runtime
+		// assignment that re-executes on every function entry, destroying
+		// persistence semantics.
+		if (orelse_info.orelse_tok && (type->has_static || type->has_extern))
+			error_tok(orelse_info.orelse_tok,
+				  "'orelse' cannot be used in the initializer of a "
+				  "variable with static or thread storage duration "
+				  "(the runtime fallback check would re-execute on "
+				  "every function entry, destroying persistence)");
+
 		// Step 2b: Pre-hoist bracket orelse temps (before type emission)
 		bool has_bo = FEAT(F_ORELSE) && declarator_has_bracket_orelse(decl_start, decl.end);
 		bool brace_opened = false;

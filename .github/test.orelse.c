@@ -2245,6 +2245,7 @@ static void test_orelse_for_init_bracket_orelse_bypass(void) {
 // TT_SKIP_DECL in try_zero_init_decl, so it falls to the bare-assignment
 // scanner which emits "if (!static int x) static int x = (5);" — garbage.
 static void test_orelse_static_decl_bare_assignment_collapse(void) {
+	// static + orelse is now rejected (persistence semantics violation).
 	const char *code =
 	    "int get_val(void) { return 0; }\n"
 	    "void f(void) {\n"
@@ -2252,18 +2253,47 @@ static void test_orelse_static_decl_bare_assignment_collapse(void) {
 	    "    (void)x;\n"
 	    "}\n";
 	PrismResult r = prism_transpile_source(code, "static_decl_orelse.c", prism_defaults());
-	if (r.status == PRISM_OK && r.output) {
-		// Must not emit "static int x" inside an if-condition.
-		// The garbage pattern is: "if (!\nstatic int x)\nstatic int x = ( 5);"
-		// Check for the bare-assignment rewrite signature: "= ( 5)" with
-		// the space-padded fallback value, which only the bare scanner emits.
-		CHECK(strstr(r.output, "= ( 5)") == NULL,
-		      "static-decl-orelse: must not emit bare-assignment 'if (! static int x)' garbage");
-	} else {
-		CHECK(r.status != PRISM_OK,
-		      "static-decl-orelse: rejected by transpiler (acceptable)");
-	}
+	CHECK(r.status != PRISM_OK,
+	      "static-decl-orelse: rejected by transpiler");
+	if (r.error_msg)
+		CHECK(strstr(r.error_msg, "static or thread storage duration") != NULL,
+		      "static-decl-orelse: error mentions storage duration");
 	prism_free(&r);
+}
+
+static void test_orelse_static_persistence_rejection(void) {
+	// static with constant orelse: even constant values get split into
+	// runtime assignment that re-executes on every call, corrupting
+	// persistence when value transitions through 0.
+	check_orelse_transpile_rejects(
+	    "void f(void) {\n"
+	    "    static int x = 5 orelse 99;\n"
+	    "    (void)x;\n"
+	    "}\n",
+	    "static_const_orelse.c",
+	    "static-const-orelse: rejected",
+	    "static or thread storage duration");
+
+	// extern with orelse
+	check_orelse_transpile_rejects(
+	    "extern int x;\n"
+	    "void f(void) {\n"
+	    "    extern int y = 0 orelse 1;\n"
+	    "    (void)y;\n"
+	    "}\n",
+	    "extern_orelse.c",
+	    "extern-orelse: rejected",
+	    "static or thread storage duration");
+
+	// static thread_local with orelse
+	check_orelse_transpile_rejects(
+	    "void f(void) {\n"
+	    "    static _Thread_local int x = 0 orelse 1;\n"
+	    "    (void)x;\n"
+	    "}\n",
+	    "thread_local_orelse.c",
+	    "thread-local-orelse: rejected",
+	    "static or thread storage duration");
 }
 
 // Bug: bracket_oe_ids[16] buffer silently breaks the loop at count >= 16.
@@ -5761,6 +5791,7 @@ void run_orelse_tests(void) {
 	// Audit round 2 bug probes (should FAIL until fixed)
 	test_orelse_for_init_bracket_orelse_bypass();
 	test_orelse_static_decl_bare_assignment_collapse();
+	test_orelse_static_persistence_rejection();
 	test_orelse_bracket_oe_buffer_exhaustion();
 
 	// Audit round 3
