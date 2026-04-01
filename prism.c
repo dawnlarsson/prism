@@ -4449,6 +4449,8 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 				if (act && match_ch(act, ';'))
 					error_tok(s, "expected statement after 'orelse'");
 				validate_defer_control_flow(act, in_loop, in_switch);
+				if (act && match_ch(act, '{'))
+					validate_defer_statement(act, in_loop, in_switch, depth + 1);
 				break;
 			}
 		}
@@ -5453,11 +5455,11 @@ static void collect_source_defines(const char *input_file) {
 				char *rd = NULL;
 				if (has_unclosed_block_comment(p, &rd)) {
 					in_block_comment = true;
-				} else if (rd) {
+				} else if (rd && cond_depth == 0) {
 					in_raw_string = true;
 					raw_delim = rd;
 					raw_delim_len = (int)strlen(rd);
-				}
+				} else free(rd);
 			}
 			continue;
 		}
@@ -5484,18 +5486,23 @@ static void collect_source_defines(const char *input_file) {
 					char *rd = NULL;
 					if (has_unclosed_block_comment(p, &rd))
 						in_block_comment = true;
-					else if (rd) { in_raw_string = true; raw_delim = rd; raw_delim_len = (int)strlen(rd); }
+					else if (rd && cond_depth == 0) { in_raw_string = true; raw_delim = rd; raw_delim_len = (int)strlen(rd); }
+					else free(rd);
 					goto check_continuation;
 				}
 				goto have_hash;
 			}
 			// Non-preprocessor, non-blank line — scan for mid-line
 			// block comment or raw string that spans subsequent lines.
+			// Raw string detection suppressed inside #if/#ifdef blocks:
+			// the C preprocessor doesn't lex tokens in dead branches,
+			// so R"(...)" containing #endif would desync nesting.
 			{
 				char *rd = NULL;
 				if (has_unclosed_block_comment(p, &rd))
 					in_block_comment = true;
-				else if (rd) { in_raw_string = true; raw_delim = rd; raw_delim_len = (int)strlen(rd); }
+				else if (rd && cond_depth == 0) { in_raw_string = true; raw_delim = rd; raw_delim_len = (int)strlen(rd); }
+				else free(rd);
 			}
 			goto check_continuation;
 		}
@@ -5729,7 +5736,8 @@ static void collect_source_defines(const char *input_file) {
 				char *rd = NULL;
 				if (has_unclosed_block_comment(line, &rd))
 					in_block_comment = true;
-				else if (rd) { in_raw_string = true; raw_delim = rd; raw_delim_len = (int)strlen(rd); }
+				else if (rd && cond_depth == 0) { in_raw_string = true; raw_delim = rd; raw_delim_len = (int)strlen(rd); }
+				else free(rd);
 			}
 		}
 	}

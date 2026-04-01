@@ -1829,8 +1829,10 @@ static Token *tokenize(File *file) {
 	// Scan file-scope tokens for _Noreturn, noreturn, [[noreturn]],
 	// or __attribute__((noreturn)) / __attribute__((__noreturn__)).
 	// When a noreturn specifier is found before a function declaration,
-	// tag all occurrences of that function name with TT_NORETURN_FN.
+	// collect the function name into a hashmap, then do a single O(N)
+	// pass to tag all occurrences (replaces prior O(N*K) inner loop).
 	{
+		HashMap nr_map = {0};
 		for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
 			bool is_noreturn = false;
 			Token *scan_start = t;
@@ -1914,14 +1916,19 @@ static Token *tokenize(File *file) {
 				}
 			}
 			if (!fn_name) continue;
+			hashmap_put(&nr_map, tok_loc(fn_name), fn_name->len, (void *)1);
+		}
 
-			// Tag all occurrences of this function name with TT_NORETURN_FN
+		// Single O(N) pass to tag all occurrences of noreturn function names
+		if (nr_map.used > 0) {
 			for (Token *s = first; s && s->kind != TK_EOF; s = tok_next(s)) {
-				if (s->kind == TK_IDENT && tok_name_eq(s, fn_name) &&
-				    !(tok_idx(s) >= 1 && (token_pool[tok_idx(s) - 1].tag & TT_MEMBER)))
+				if (s->kind == TK_IDENT &&
+				    !(tok_idx(s) >= 1 && (token_pool[tok_idx(s) - 1].tag & TT_MEMBER)) &&
+				    hashmap_get(&nr_map, tok_loc(s), s->len))
 					s->tag |= TT_NORETURN_FN;
 			}
 		}
+		free(nr_map.buckets);
 	}
 
 	return first;
