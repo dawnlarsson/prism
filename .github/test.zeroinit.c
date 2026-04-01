@@ -2655,6 +2655,48 @@ static void test_typeof_extern_func_memset(void) {
 	}
 }
 
+// BUG: _Static_assert/sizeof at file scope confuses typeof func-type scanner.
+// The scanner sees `ident(` inside sizeof(ident(...)) and falsely flags it as
+// a function declaration, bypassing zero-init for function pointer variables.
+static void test_typeof_funcptr_static_assert_bypass(void) {
+	printf("\n--- typeof funcptr _Static_assert scanner bypass ---\n");
+	// Sub-test 1: _Static_assert(sizeof(funcptr_var(args))) at file scope
+	// must not trick the scanner into treating funcptr_var as a function.
+	{
+		const char *code =
+		    "int (*fake_func)(int);\n"
+		    "_Static_assert(sizeof(fake_func(1)) > 0, \"ok\");\n"
+		    "void f(void) {\n"
+		    "    typeof(fake_func) target;\n"
+		    "    (void)target;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "funcptr_sa.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "funcptr-static-assert: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "__builtin_memset") != NULL || has_zeroing(r.output),
+			      "funcptr-static-assert: typeof(funcptr) must get zero-init");
+		}
+		prism_free(&r);
+	}
+	// Sub-test 2: actual function (not pointer) must still be detected.
+	{
+		const char *code =
+		    "int real_func(int);\n"
+		    "_Static_assert(sizeof(real_func(1)) > 0, \"ok\");\n"
+		    "void f(void) {\n"
+		    "    typeof(real_func) alias;\n"
+		    "    (void)alias;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "func_sa.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "func-static-assert: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "__builtin_memset") == NULL,
+			      "func-static-assert: typeof(real_func) must NOT emit zero-init");
+		}
+		prism_free(&r);
+	}
+}
+
 // BUG70: #pragma inside a statement expression processed by walk_balanced
 // (e.g., inside array dimensions) clears at_stmt_start, skipping zero-init.
 static void test_stmt_expr_pragma_zeroinit_bypass(void) {
@@ -2933,6 +2975,9 @@ void run_zeroinit_tests(void) {
 
         // BUG69: typeof(external_function) memset corruption
         test_typeof_extern_func_memset();
+
+	// BUG: static_assert/sizeof confuses typeof func-type scanner
+	test_typeof_funcptr_static_assert_bypass();
 
 	// BUG70: pragma in walk_balanced stmt-expr breaks at_stmt_start
 	test_stmt_expr_pragma_zeroinit_bypass();

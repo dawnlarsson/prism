@@ -3873,6 +3873,19 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					if (match_ch(t, '{')) { bd++; continue; }
 					if (match_ch(t, '}')) { if (bd > 0) bd--; continue; }
 					if (bd != 0) continue;
+					// Skip balanced () after expression keywords that
+					// can invoke funcptrs at file scope without declaring
+					// a function: sizeof, _Alignof, _Static_assert, _Generic.
+					if (t->kind <= TK_KEYWORD &&
+					    (equal(t, "sizeof") || equal(t, "_Alignof") || equal(t, "alignof") ||
+					     equal(t, "_Static_assert") || equal(t, "static_assert") ||
+					     equal(t, "_Alignas") || equal(t, "alignas") || equal(t, "_Generic"))) {
+						Token *nx = tok_next(t);
+						if (nx && match_ch(nx, '(') && tok_match(nx)) {
+							ti = tok_idx(tok_match(nx));
+							continue;
+						}
+					}
 					if (t->kind == TK_IDENT && t->len == typeof_ident_len &&
 					    !memcmp(tok_loc(t), typeof_ident_loc, typeof_ident_len)) {
 						Token *nx = tok_next(t);
