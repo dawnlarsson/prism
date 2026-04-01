@@ -198,6 +198,7 @@ typedef struct {
 
 // Per-token Pass 1 annotation flags (stored in pass1_ann[])
 enum {
+	P1_IS_TYPEDEF        = 1 << 0, // Token resolves to a real typedef at this position
 	P1_SCOPE_LOOP        = 1 << 1, // This '{' opens a loop body
 	P1_SCOPE_SWITCH      = 1 << 2, // This '{' opens a switch body
 	P1_OE_BRACKET        = 1 << 4, // orelse inside array dimension brackets
@@ -434,6 +435,7 @@ static PRISM_THREAD_LOCAL int ctrl_save_depth = 0;
 static PRISM_THREAD_LOCAL int ctrl_save_cap = 0;
 static PRISM_THREAD_LOCAL int current_func_idx = -1; // Index into func_meta[] for the function being emitted
 static PRISM_THREAD_LOCAL int goto_entry_cursor = 0; // Cursor into entries[] for next P1K_GOTO lookup
+static PRISM_THREAD_LOCAL bool p1_typedef_annotated; // true after p1_annotate_typedefs(); enables O(1) is_known_typedef
 
 // Track variables that shadow a name captured by a defer in an enclosing scope.
 // The shadow is only dangerous if a control-flow exit pastes the defer while the
@@ -677,6 +679,7 @@ static void reset_transpiler_state(void) {
 	ctrl_save_depth = 0;
 	last_emitted = NULL;
 	current_func_idx = -1;
+	p1_typedef_annotated = false;
 
 	// Clear arena-allocated arrays — prevents dangling pointers after arena_reset.
 	defer_count = 0;
@@ -1589,7 +1592,14 @@ static inline int typedef_flags(Token *tok) {
 	       (e->is_func ? TDF_FUNC : 0);
 }
 
-#define is_known_typedef(tok) (typedef_flags(tok) & TDF_TYPEDEF)
+// After Pass 1 annotation, is_known_typedef becomes O(1) bit check.
+// During Pass 1 (before annotation), falls back to O(K) hash-and-walk.
+static inline bool _is_known_typedef(Token *tok) {
+	if (__builtin_expect(p1_typedef_annotated, 1))
+		return tok_ann(tok) & P1_IS_TYPEDEF;
+	return typedef_flags(tok) & TDF_TYPEDEF;
+}
+#define is_known_typedef(tok) _is_known_typedef(tok)
 #define is_vla_typedef(tok) (typedef_flags(tok) & TDF_VLA)
 #define is_void_typedef(tok) (typedef_flags(tok) & TDF_VOID)
 #define is_known_enum_const(tok) (typedef_flags(tok) & TDF_ENUM_CONST)
@@ -2693,6 +2703,7 @@ static Token *handle_defer_keyword(Token *tok);
 static Token *handle_control_exit_defer(Token *tok);
 static Token *handle_goto_keyword(Token *tok);
 static void end_statement_after_semicolon(void);
+static inline Token *try_process_stmt_token(Token *t, Token *end, Token **unreachable_tok);
 
 // Walk a balanced token group between matching delimiters, optionally emitting.
 static Token *walk_balanced(Token *tok, bool emit) {
@@ -2751,27 +2762,13 @@ static Token *walk_balanced(Token *tok, bool emit) {
 							if (next) { inner = next; continue; }
 						}
 					}
-					if (ctx->at_stmt_start && FEAT(F_ZEROINIT)) {
-						Token *next = try_zero_init_decl(inner);
-						if (next) { inner = next; continue; }
-					}
-					// Strip raw keyword
-					{ Token *r = try_strip_raw(inner); if (r) { inner = r; continue; } }
-					// Bare expression orelse at statement start
-					if (ctx->at_stmt_start && FEAT(F_ORELSE) &&
-					    !(inner->tag & TT_NON_EXPR_STMT)) {
-						Token *next = emit_deferred_orelse(inner, se_end);
-						if (next) { inner = next; ctx->at_stmt_start = true; continue; }
-					}
+					{ Token *next = try_process_stmt_token(inner, se_end, &wb_unreachable_tok);
+					  if (next) { inner = next; continue; } }
 					// Catch unprocessed orelse before it leaks to output
 					if (__builtin_expect(FEAT(F_ORELSE) && is_orelse_keyword(inner), 0))
 						error_tok(inner,
 							  "'orelse' cannot be used here (it must appear at the "
 							  "statement level in a declaration or bare expression)");
-					if (FEAT(F_AUTO_UNREACHABLE)) {
-						Token *nr = try_detect_noreturn_call(inner);
-						if (nr) wb_unreachable_tok = nr;
-					}
 					ctx->at_stmt_start = false;
 					emit_tok(inner); inner = tok_next(inner);
 				}
@@ -6259,6 +6256,25 @@ static Token *emit_deferred_orelse(Token *t, Token *end) {
 	return t;
 }
 
+// Shared token dispatch for walk_balanced stmt-expr and emit_deferred_range.
+// Returns next token if consumed, NULL if caller should emit_tok and advance.
+static inline Token *try_process_stmt_token(Token *t, Token *end, Token **unreachable_tok) {
+	if (ctx->at_stmt_start && FEAT(F_ZEROINIT)) {
+		Token *next = try_zero_init_decl(t);
+		if (next) return next;
+	}
+	if (ctx->at_stmt_start && FEAT(F_ORELSE) && !(t->tag & TT_NON_EXPR_STMT)) {
+		Token *next = emit_deferred_orelse(t, end);
+		if (next) { ctx->at_stmt_start = true; return next; }
+	}
+	{ Token *r = try_strip_raw(t); if (r) return r; }
+	if (FEAT(F_AUTO_UNREACHABLE)) {
+		Token *nr = try_detect_noreturn_call(t);
+		if (nr && nr != end) *unreachable_tok = nr;
+	}
+	return NULL;
+}
+
 // Like emit_range but processes zero-init/raw/orelse inside defer blocks.
 static void emit_deferred_range(Token *start, Token *end) {
 	bool saved_stmt_start = ctx->at_stmt_start;
@@ -6269,36 +6285,10 @@ static void emit_deferred_range(Token *start, Token *end) {
 	Token *dr_unreachable_tok = NULL;
 
 	for (Token *t = start; t && t != end && t->kind != TK_EOF;) {
-		if (ctx->at_stmt_start && FEAT(F_ZEROINIT)) {
-			Token *next = try_zero_init_decl(t);
-			if (next) {
-				t = next;
-				ctx->at_stmt_start = true;
-				continue;
-			}
-		}
-
-		// Bare expression orelse at statement start
-		if (ctx->at_stmt_start && FEAT(F_ORELSE) &&
-		    !(t->tag & TT_NON_EXPR_STMT)) {
-			Token *next = emit_deferred_orelse(t, end);
-			if (next) {
-				t = next;
-				ctx->at_stmt_start = true;
-				continue;
-			}
-		}
+		Token *next = try_process_stmt_token(t, end, &dr_unreachable_tok);
+		if (next) { t = next; continue; }
 
 		ctx->at_stmt_start = false;
-
-		// Auto-unreachable: detect noreturn call in deferred range
-		if (FEAT(F_AUTO_UNREACHABLE)) {
-			Token *nr = try_detect_noreturn_call(t);
-			if (nr && nr != end) dr_unreachable_tok = nr;
-		}
-
-		// Strip raw keyword (same as main loop catch-all)
-		{ Token *r = try_strip_raw(t); if (r) { t = r; continue; } }
 
 		if (t->tag & TT_STRUCTURAL) {
 			bool is_semi = (t->len == 1 && tok_loc(t)[0] == ';');
@@ -6493,89 +6483,51 @@ static void p1_build_scope_tree(Token *start) {
 // Skip a single C statement starting at `tok`, returning the last token of
 // the statement (typically the closing `;`, `}`, or end of a do-while).
 // Handles if-else, for, while, do-while, switch, braced, and simple statements.
-// Returns the last token (usually ';' or '}') of the single statement
-// starting at `tok`.  Used by Phase 1D to bound braceless control-flow scopes.
-// Returns NULL if the statement end cannot be determined.
-//
-// Iterative implementation to avoid stack overflow on deeply nested braceless
-// control flow (e.g., 5000 nested `if (1)` statements).
+// Uses tok_match for O(1) bracket jumps.  Tail positions use goto; only
+// if-body and do-body use true recursion (bounded by non-braced nesting depth).
 static Token *skip_one_stmt(Token *tok) {
-	// For non-tail positions (if-body before else check, do-body before while check),
-	// we maintain a small explicit stack.  In practice, the non-tail positions only
-	// nest via if-body containing another do-while containing another if-body, etc.
-	// A small stack-local buffer covers the 99% case; heap fallback for deep nesting.
-	enum { CONT_IF_ELSE, CONT_DO_WHILE };
-	typedef struct { int kind; Token *tok; } Cont;
-	Cont local_stack[16];
-	int cont_n = 0, cont_cap = 16;
-	Cont *cont_stack = local_stack;
-
-#define PUSH_CONT(k, t) do { \
-	if (cont_n >= cont_cap) { \
-		int new_cap = cont_cap * 2; \
-		if (cont_stack == local_stack) { \
-			cont_stack = malloc((size_t)new_cap * sizeof(Cont)); \
-			if (!cont_stack) error("out of memory"); \
-			memcpy(cont_stack, local_stack, (size_t)cont_n * sizeof(Cont)); \
-		} else { \
-			void *_tmp = realloc(cont_stack, (size_t)new_cap * sizeof(Cont)); \
-			if (!_tmp) { free(cont_stack); error("out of memory"); } \
-			cont_stack = _tmp; \
-		} \
-		cont_cap = new_cap; \
-	} \
-	cont_stack[cont_n++] = (Cont){k, t}; \
-} while (0)
-
-#define FREE_CONT() do { if (cont_stack != local_stack) free(cont_stack); } while (0)
-
 restart:
-	(void)0;
 	tok = skip_prep_dirs(tok);
-	tok = skip_noise(tok); // skip C23 [[attr]] and __attribute__((...))
-	if (!tok || tok->kind == TK_EOF) { FREE_CONT(); return NULL; }
+	tok = skip_noise(tok);
+	if (!tok || tok->kind == TK_EOF) return NULL;
 
-	// Braced compound statement
-	Token *end = NULL;
-	if (match_ch(tok, '{') && tok_match(tok)) {
-		end = tok_match(tok);
-		goto process_cont;
-	}
+	// Braced compound statement: O(1) via tok_match
+	if (match_ch(tok, '{'))
+		return tok_match(tok);
 
 	// 'if' / 'else'
 	if (tok->tag & TT_IF) {
-		if (tok_loc(tok)[0] == 'e') { // 'else': skip body (tail call)
-			tok = tok_next(tok);
-			goto restart;
-		}
-		// 'if': skip '(...)' then body, check for 'else'
+		if (tok_loc(tok)[0] == 'e') { tok = tok_next(tok); goto restart; }
 		Token *p = skip_prep_dirs(tok_next(tok));
-		if (p && match_ch(p, '(') && tok_match(p)) {
-			PUSH_CONT(CONT_IF_ELSE, tok);
-			tok = tok_next(tok_match(p));
-			goto restart;
-		}
-		FREE_CONT(); return NULL;
+		if (!p || !match_ch(p, '(') || !tok_match(p)) return NULL;
+		Token *end = skip_one_stmt(tok_next(tok_match(p)));
+		if (!end) return NULL;
+		Token *n = skip_prep_dirs(tok_next(end));
+		if (n && (n->tag & TT_IF) && tok_loc(n)[0] == 'e')
+			{ tok = tok_next(n); goto restart; }
+		return end;
 	}
 
-	// 'for', 'while', 'switch': keyword '(...)' body (tail call)
+	// 'for', 'while', 'switch': keyword '(...)' body
 	if ((tok->tag & (TT_LOOP | TT_SWITCH)) && tok_loc(tok)[0] != 'd') {
 		Token *p = skip_prep_dirs(tok_next(tok));
-		if (p && match_ch(p, '(') && tok_match(p)) {
-			tok = tok_next(tok_match(p));
-			goto restart;
-		}
-		FREE_CONT(); return NULL;
+		if (!p || !match_ch(p, '(') || !tok_match(p)) return NULL;
+		tok = tok_next(tok_match(p)); goto restart;
 	}
 
 	// 'do': body then 'while' '(...)' ';'
 	if ((tok->tag & TT_LOOP) && tok_loc(tok)[0] == 'd') {
-		PUSH_CONT(CONT_DO_WHILE, tok);
-		tok = tok_next(tok);
-		goto restart;
+		Token *end = skip_one_stmt(tok_next(tok));
+		if (!end) return NULL;
+		Token *w = skip_prep_dirs(tok_next(end));
+		if (!w || !(w->tag & TT_LOOP) || !equal(w, "while")) return NULL;
+		Token *p2 = skip_prep_dirs(tok_next(w));
+		if (!p2 || !match_ch(p2, '(') || !tok_match(p2)) return NULL;
+		Token *a = skip_prep_dirs(tok_next(tok_match(p2)));
+		return (a && match_ch(a, ';')) ? a : NULL;
 	}
 
-	// 'case' / 'default' label: skip label expr + ':', recurse on body (tail call).
+	// 'case' / 'default' label: skip expr + ':', recurse on body
 	if ((tok->tag & (TT_CASE | TT_DEFAULT)) && !is_known_typedef(tok)) {
 		int td = 0;
 		for (Token *s = tok_next(tok); s && s->kind != TK_EOF; s = tok_next(s)) {
@@ -6583,56 +6535,19 @@ restart:
 			if (match_ch(s, '?')) { td++; continue; }
 			if (match_ch(s, ':')) {
 				if (td > 0) { td--; continue; }
-				tok = tok_next(s);
-				goto restart;
+				tok = tok_next(s); goto restart;
 			}
 		}
-		FREE_CONT(); return NULL;
+		return NULL;
 	}
 
 	// Simple statement: scan to ';', skipping balanced groups via tok_match
-	{
-		for (Token *s = tok; s && s->kind != TK_EOF; s = tok_next(s)) {
-			if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; continue; }
-			if (match_ch(s, ';')) {
-				end = s;
-				goto process_cont;
-			}
-		}
+	for (Token *s = tok; s && s->kind != TK_EOF; s = tok_next(s)) {
+		if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; continue; }
+		if (match_ch(s, ';')) return s;
 	}
-	FREE_CONT();
 	return NULL;
-
-process_cont:
-	// Process continuations (shared by braced and simple statement paths)
-	while (cont_n > 0) {
-		Cont c = cont_stack[cont_n - 1];
-		if (c.kind == CONT_IF_ELSE) {
-			cont_n--;
-			Token *n = skip_prep_dirs(tok_next(end));
-			if (n && (n->tag & TT_IF) && tok_loc(n)[0] == 'e') {
-				tok = tok_next(n);
-				goto restart;
-			}
-			// no else — end stays
-		} else if (c.kind == CONT_DO_WHILE) {
-			cont_n--;
-			Token *w = skip_prep_dirs(tok_next(end));
-			if (w && (w->tag & TT_LOOP) && equal(w, "while")) {
-				Token *p2 = skip_prep_dirs(tok_next(w));
-				if (p2 && match_ch(p2, '(') && tok_match(p2)) {
-					Token *a = skip_prep_dirs(tok_next(tok_match(p2)));
-					if (a && match_ch(a, ';')) { end = a; continue; }
-				}
-			}
-			FREE_CONT(); return NULL;
-		}
-	}
-	FREE_CONT();
-	return end;
 }
-#undef PUSH_CONT
-#undef FREE_CONT
 
 // Phase 1B: walk all tokens at all depths to build the complete typedef + enum table.
 
@@ -6782,6 +6697,140 @@ static void p1_try_alloc_defer(Token *tok, uint16_t cur_sid, int func_idx) {
 	p1_alloc(P1K_DEFER, cur_sid, tok);
 }
 
+// Phase 1F: validate defer body and populate bloom filter.
+// Extracted from p1_full_depth_prescan to reduce main loop icache footprint.
+static void __attribute__((noinline))
+p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t cur_sid) {
+	// Context validation (moved from Pass 2 handle_defer_keyword)
+	if (p1d_cur_func >= 0) {
+		if (p1d_ctrl_pending)
+			error_tok(tok, "defer requires braces in control statements (braceless has no scope)");
+		if (cur_sid < scope_tree_count && scope_tree[cur_sid].is_stmt_expr)
+			error_tok(tok, "defer cannot be at top level of statement expression; wrap in a block");
+		if (cur_sid < scope_tree_count && scope_tree[cur_sid].is_switch)
+			error_tok(tok, "defer in switch case requires braces");
+		p1_check_defer_stmt_expr_chain(tok, cur_sid);
+	}
+	// Unterminated / keyword heuristic (non-block defer)
+	{
+		Token *body = tok_next(tok);
+		if (body && !match_ch(body, '{')) {
+			Token *semi = skip_to_semicolon(body);
+			if (semi->kind == TK_EOF || !match_ch(semi, ';'))
+				error_tok(tok, "unterminated defer statement; expected ';'");
+			if (body->kind == TK_KEYWORD &&
+			    (body->tag & (TT_NON_EXPR_STMT | TT_DEFER)))
+				error_tok(tok, "defer statement appears to be missing ';' (found '%.*s' keyword inside)",
+					  body->len, tok_loc(body));
+		}
+	}
+	validate_defer_statement(tok_next(tok), false, false, 0);
+
+	// Populate defer name bloom filter for O(1) shadow checks.
+	if (p1d_cur_func >= 0) {
+		Token *body = tok_next(tok);
+		Token *body_end = NULL;
+		if (body && match_ch(body, '{') && tok_match(body))
+			body_end = tok_match(body);
+		else if (body)
+			body_end = skip_to_semicolon(body);
+		if (body_end) {
+			Token *prev_t = NULL;
+			for (Token *t = body; t && t != body_end && t->kind != TK_EOF;
+			     prev_t = t, t = tok_next(t)) {
+				if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
+				    !(prev_t && (prev_t->tag & TT_MEMBER)))
+					func_meta[p1d_cur_func].defer_name_bloom |=
+						defer_name_bloom_bit(tok_loc(t), t->len);
+			}
+		}
+	}
+}
+
+// Phase 1G: classify bracket orelse inside [...] array dimensions.
+// Extracted from p1_full_depth_prescan to reduce main loop icache footprint.
+static void __attribute__((noinline))
+p1d_classify_bracket_orelse(Token *tok, uint16_t cur_sid, int p1d_cur_func) {
+	Token *close = tok_match(tok);
+	bool in_struct = cur_sid > 0 && cur_sid < scope_tree_count && scope_tree[cur_sid].is_struct;
+	bool found_oe = false;
+	Token *prev_d0_oe = NULL;
+	int oe_depth = 0;
+	for (Token *s = tok_next(tok); s && s != close && s->kind != TK_EOF; s = tok_next(s)) {
+		if (s->flags & TF_OPEN) oe_depth++;
+		if (s->flags & TF_CLOSE) oe_depth--;
+		if ((s->tag & TT_ORELSE) && !typedef_lookup(s)) {
+			if (p1d_cur_func < 0)
+				error_tok(s, "orelse inside array dimension at file scope is not allowed "
+					       "(cannot hoist temporary variable outside a function body)");
+			if (in_struct)
+				error_tok(s, "orelse inside array dimension in a struct/union body "
+					       "cannot be transformed (statement expressions are not "
+					       "allowed in struct/union definitions)");
+			int paren_depth = 0;
+			for (Token *p = tok_next(tok); p && p != s; p = tok_next(p)) {
+				if (match_ch(p, '(')) paren_depth++;
+				else if (match_ch(p, ')')) paren_depth--;
+			}
+			if (paren_depth > 1)
+				error_tok(s, "'orelse' inside array dimension could not be transformed; "
+					     "if wrapped in outer parentheses, remove them: "
+					     "use '[f() orelse 1]' not '[(f() orelse 1)]'");
+			validate_bracket_orelse(s);
+			if (oe_depth == 0 && prev_d0_oe)
+				reject_orelse_side_effects(
+					tok_next(prev_d0_oe), s,
+					"'orelse' in array dimension",
+					"in a chained 'orelse' (would be "
+					"evaluated twice); hoist the "
+					"expression to a variable first",
+					false, true, false);
+			if (oe_depth == 0) prev_d0_oe = s;
+			tok_ann(s) |= P1_OE_BRACKET;
+			found_oe = true;
+		}
+	}
+	if (found_oe) tok_ann(tok) |= P1_OE_BRACKET;
+}
+
+// Phase 1D: validate bare orelse in expression statements.
+// Extracted from p1_full_depth_prescan to reduce main loop icache footprint.
+static void __attribute__((noinline))
+p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
+	// Skip past depth-0 commas: orelse only applies to
+	// the sub-expression after the last comma operator.
+	Token *scan_start = tok;
+	{
+		Token *last_comma = NULL;
+		int cd = 0;
+		for (Token *s = tok; s != bare_oe; s = tok_next(s)) {
+			if (s->flags & TF_OPEN) cd++;
+			else if (s->flags & TF_CLOSE) cd--;
+			else if (cd == 0 && match_ch(s, ',')) last_comma = s;
+		}
+		if (last_comma) scan_start = tok_next(last_comma);
+	}
+	int sd = 0;
+	bool has_eq = false;
+	for (Token *s = scan_start; s != bare_oe; s = tok_next(s)) {
+		if (s->flags & TF_OPEN) { sd++; continue; }
+		if (s->flags & TF_CLOSE) { sd--; continue; }
+		if (sd == 0 && is_assignment_operator_token(s)) {
+			if (!match_ch(s, '='))
+				error_tok(s, "bare assignment with 'orelse' cannot use compound operators "
+					  "(e.g. +=, -=); use a plain '=' assignment");
+			has_eq = true;
+			break;
+		}
+	}
+	Token *after_oe = tok_next(bare_oe);
+	if (after_oe && !has_eq &&
+	    !(after_oe->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
+	    !match_ch(after_oe, '{') && !match_ch(after_oe, ';'))
+		error_tok(after_oe, "orelse fallback requires an assignment target "
+			  "(use a declaration)");
+}
+
 static void p1_full_depth_prescan(Token *tok) {
 	bool at_stmt_start = true;
 	int brace_depth = 0;
@@ -6832,53 +6881,8 @@ static void p1_full_depth_prescan(Token *tok) {
 			p1d_switch_top--;
 
 		// == Phase 1G inline: classify bracket orelse ==
-		if (FEAT(F_ORELSE) && match_ch(tok, '[') && tok_match(tok)) {
-			Token *close = tok_match(tok);
-			uint16_t bo_sid = CUR_SID();
-			bool in_struct = bo_sid > 0 && bo_sid < scope_tree_count && scope_tree[bo_sid].is_struct;
-			bool found_oe = false;
-			Token *prev_d0_oe = NULL;
-			int oe_depth = 0;
-			for (Token *s = tok_next(tok); s && s != close && s->kind != TK_EOF; s = tok_next(s)) {
-				if (s->flags & TF_OPEN) oe_depth++;
-				if (s->flags & TF_CLOSE) oe_depth--;
-				if ((s->tag & TT_ORELSE) && !typedef_lookup(s)) {
-					if (p1d_cur_func < 0)
-						error_tok(s, "orelse inside array dimension at file scope is not allowed "
-							       "(cannot hoist temporary variable outside a function body)");
-					if (in_struct)
-						error_tok(s, "orelse inside array dimension in a struct/union body "
-							       "cannot be transformed (statement expressions are not "
-							       "allowed in struct/union definitions)");
-					// Check if orelse is transformable: it must be at depth 0
-					// inside [...] or inside exactly one level of (...) that
-					// spans the entire bracket content. Deeper nesting
-					// (e.g. [((expr orelse val))]) is not supported.
-					int paren_depth = 0;
-					for (Token *p = tok_next(tok); p && p != s; p = tok_next(p)) {
-						if (match_ch(p, '(')) paren_depth++;
-						else if (match_ch(p, ')')) paren_depth--;
-					}
-					if (paren_depth > 1)
-						error_tok(s, "'orelse' inside array dimension could not be transformed; "
-							     "if wrapped in outer parentheses, remove them: "
-							     "use '[f() orelse 1]' not '[(f() orelse 1)]'");
-					validate_bracket_orelse(s);
-					if (oe_depth == 0 && prev_d0_oe)
-						reject_orelse_side_effects(
-							tok_next(prev_d0_oe), s,
-							"'orelse' in array dimension",
-							"in a chained 'orelse' (would be "
-							"evaluated twice); hoist the "
-							"expression to a variable first",
-							false, true, false);
-					if (oe_depth == 0) prev_d0_oe = s;
-					tok_ann(s) |= P1_OE_BRACKET;
-					found_oe = true;
-				}
-			}
-			if (found_oe) tok_ann(tok) |= P1_OE_BRACKET;
-		}
+		if (FEAT(F_ORELSE) && match_ch(tok, '[') && tok_match(tok))
+			p1d_classify_bracket_orelse(tok, CUR_SID(), p1d_cur_func);
 
 		// Phase 1: reject orelse in enum constant expressions and
 		// struct/union bodies early, before any Pass 2 output is written.
@@ -7455,56 +7459,8 @@ uint16_t sid = next_scope_id++;
 		// == Phase 1F: defer body validation ==
 		if ((tok->tag & TT_DEFER) && !typedef_lookup(tok) &&
 		    tok_next(tok) && !match_ch(tok_next(tok), ':') &&
-		    !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN))) {
-			// Context validation (moved from Pass 2 handle_defer_keyword)
-			if (p1d_cur_func >= 0) {
-				uint16_t dsid = CUR_SID();
-				if (p1d_ctrl_pending)
-					error_tok(tok, "defer requires braces in control statements (braceless has no scope)");
-				if (dsid < scope_tree_count && scope_tree[dsid].is_stmt_expr)
-					error_tok(tok, "defer cannot be at top level of statement expression; wrap in a block");
-				if (dsid < scope_tree_count && scope_tree[dsid].is_switch)
-					error_tok(tok, "defer in switch case requires braces");
-				p1_check_defer_stmt_expr_chain(tok, dsid);
-			}
-			// Unterminated / keyword heuristic (non-block defer)
-			{
-				Token *body = tok_next(tok);
-				if (body && !match_ch(body, '{')) {
-					Token *semi = skip_to_semicolon(body);
-					if (semi->kind == TK_EOF || !match_ch(semi, ';'))
-						error_tok(tok, "unterminated defer statement; expected ';'");
-					if (body->kind == TK_KEYWORD &&
-					    (body->tag & (TT_NON_EXPR_STMT | TT_DEFER)))
-						error_tok(tok, "defer statement appears to be missing ';' (found '%.*s' keyword inside)",
-							  body->len, tok_loc(body));
-				}
-			}
-			// Defer bodies always start with in_loop=false, in_switch=false:
-			// break/continue inside a defer must not affect the enclosing loop.
-			validate_defer_statement(tok_next(tok), false, false, 0);
-
-			// Phase 1F: populate defer name bloom filter for O(1) shadow checks.
-			// Walk the defer body and hash each non-member identifier.
-			if (p1d_cur_func >= 0) {
-				Token *body = tok_next(tok);
-				Token *body_end = NULL;
-				if (body && match_ch(body, '{') && tok_match(body))
-					body_end = tok_match(body);
-				else if (body)
-					body_end = skip_to_semicolon(body);
-				if (body_end) {
-					Token *prev_t = NULL;
-					for (Token *t = body; t && t != body_end && t->kind != TK_EOF;
-					     prev_t = t, t = tok_next(t)) {
-						if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
-						    !(prev_t && (prev_t->tag & TT_MEMBER)))
-							func_meta[p1d_cur_func].defer_name_bloom |=
-								defer_name_bloom_bit(tok_loc(t), t->len);
-					}
-				}
-			}
-		}
+		    !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN)))
+			p1d_validate_defer(tok, p1d_cur_func, p1d_ctrl_pending, CUR_SID());
 
 		// == Phase 1C + 1D: detect variable declarations ==
 		// Probe the statement as a potential declaration (read-only).
@@ -7753,46 +7709,10 @@ uint16_t sid = next_scope_id++;
 		}
 
 		// Phase 1D: validate bare orelse in expression statements
-		// (moved from Pass 2 emit_bare_orelse_impl / emit_orelse_action
-		// to satisfy the invariant: all semantic errors before emission)
 		if (at_stmt_start && FEAT(F_ORELSE) && p1d_cur_func >= 0 && brace_depth > 0) {
 			Token *bare_oe = find_bare_orelse(tok);
-			if (bare_oe && !(tok_ann(bare_oe) & (P1_OE_BRACKET | P1_OE_DECL_INIT))) {
-				// Skip past depth-0 commas: orelse only applies to
-				// the sub-expression after the last comma operator.
-				Token *scan_start = tok;
-				{
-					Token *last_comma = NULL;
-					int cd = 0;
-					for (Token *s = tok; s != bare_oe; s = tok_next(s)) {
-						if (s->flags & TF_OPEN) cd++;
-						else if (s->flags & TF_CLOSE) cd--;
-						else if (cd == 0 && match_ch(s, ',')) last_comma = s;
-					}
-					if (last_comma) scan_start = tok_next(last_comma);
-				}
-				int sd = 0;
-				bool has_eq = false;
-				Token *eq_tok = NULL;
-				for (Token *s = scan_start; s != bare_oe; s = tok_next(s)) {
-					if (s->flags & TF_OPEN) { sd++; continue; }
-					if (s->flags & TF_CLOSE) { sd--; continue; }
-					if (sd == 0 && is_assignment_operator_token(s)) {
-						if (!match_ch(s, '='))
-							error_tok(s, "bare assignment with 'orelse' cannot use compound operators "
-								  "(e.g. +=, -=); use a plain '=' assignment");
-						has_eq = true;
-						eq_tok = s;
-						break;
-					}
-				}
-				Token *after_oe = tok_next(bare_oe);
-				if (after_oe && !has_eq &&
-				    !(after_oe->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
-				    !match_ch(after_oe, '{') && !match_ch(after_oe, ';'))
-					error_tok(after_oe, "orelse fallback requires an assignment target "
-						  "(use a declaration)");
-			}
+			if (bare_oe && !(tok_ann(bare_oe) & (P1_OE_BRACKET | P1_OE_DECL_INIT)))
+				p1d_validate_bare_orelse(tok, bare_oe);
 		}
 
 		at_stmt_start = false;
@@ -8189,6 +8109,18 @@ static void p1_verify_cfg(void) {
 	} // per-function
 }
 
+// Walk all tokens once and bake P1_IS_TYPEDEF into tok->ann.
+// Called after all typedef registrations are complete (end of Pass 1).
+// Turns Pass 2's is_known_typedef() from O(K) hash-and-walk into O(1) bit test.
+static void p1_annotate_typedefs(void) {
+	for (uint32_t i = 1; i < token_count; i++) {
+		Token *t = &token_pool[i];
+		if (is_identifier_like(t) && (typedef_flags(t) & TDF_TYPEDEF))
+			tok_ann(t) |= P1_IS_TYPEDEF;
+	}
+	p1_typedef_annotated = true;
+}
+
 // Core transpile: emit transformed tokens to an already-opened FILE*
 static int transpile_tokens(Token *tok, FILE *fp) {
 	out_fp = fp;
@@ -8214,8 +8146,8 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 	// Phase 2A: verify goto→label pairs against defers/decls
 	p1_verify_cfg();
 
-	// Phase 3A: typedef table is now immutable — no reset needed.
-	// Pass 2 reads the table built by Phase 1B via range-based lookup.
+	// Phase 3A: typedef table is now immutable — bake O(1) typedef bits.
+	p1_annotate_typedefs();
 
 	if (!FEAT(F_FLATTEN)) {
 		collect_system_includes();
