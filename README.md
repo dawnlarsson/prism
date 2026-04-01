@@ -1,13 +1,13 @@
 ![Prism Banner](https://github.com/user-attachments/assets/051187c2-decd-497e-9beb-b74031eb84ed)
 
-![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-3795_passing-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
+![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-3872_passing-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
 
 ## Robust C by default
 **A dialect of C with `defer`, `orelse`, and automatic zero-initialization.**
 
 Prism is a lightweight and very fast transpiler that makes C safer without changing how you write it.
 
-- **3795 tests** — edge cases, control flow, nightmares, trying hard to break Prism
+- **3872 tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Two-pass transpiler** — full semantic analysis before a single byte is emitted
 - **Opt-out features** — Disable parts of the transpiler, like zero-init, with CLI flags
@@ -369,7 +369,7 @@ Not:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v1.0.0 - Robust C transpiler
+Prism v1.0.1 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 
@@ -386,6 +386,7 @@ Prism Flags (consumed, not passed to CC):
   -fno-safety           Safety checks warn instead of error
   -fflatten-headers     Flatten headers into single output
   -fno-flatten-headers  Disable header flattening
+  -fno-auto-unreachable Disable __builtin_unreachable after noreturn calls
   --prism-cc=<compiler> Use specific compiler
   --prism-verbose       Show commands
 

@@ -1,4 +1,4 @@
-#define PRISM_VERSION "1.0.0"
+#define PRISM_VERSION "1.0.1"
 
 #ifndef _WIN32
 #ifndef _GNU_SOURCE
@@ -91,6 +91,7 @@ typedef struct {
 	bool warn_safety;
 	bool flatten_headers;
 	bool orelse;
+	bool auto_unreachable;
 } PrismFeatures;
 
 typedef enum {
@@ -697,13 +698,15 @@ PRISM_API PrismFeatures prism_defaults(void) {
 			       .zeroinit = true,
 			       .line_directives = true,
 			       .flatten_headers = true,
-			       .orelse = true};
+			       .orelse = true,
+			       .auto_unreachable = true};
 }
 
 static uint32_t features_to_bits(PrismFeatures f) {
 	return (f.defer ? F_DEFER : 0) | (f.zeroinit ? F_ZEROINIT : 0) |
 	       (f.line_directives ? F_LINE_DIR : 0) | (f.warn_safety ? F_WARN_SAFETY : 0) |
-	       (f.flatten_headers ? F_FLATTEN : 0) | (f.orelse ? F_ORELSE : 0);
+	       (f.flatten_headers ? F_FLATTEN : 0) | (f.orelse ? F_ORELSE : 0) |
+	       (f.auto_unreachable ? F_AUTO_UNREACHABLE : 0);
 }
 
 static const char *get_tmp_dir(void) {
@@ -2685,6 +2688,7 @@ static Token *walk_balanced(Token *tok, bool emit) {
 				Token *se_end = tok_match(t);
 				Token *inner = tok_next(t); // '{'
 				bool saved_ss = ctx->at_stmt_start;
+				Token *wb_unreachable_tok = NULL;
 				while (inner && inner != se_end && inner->kind != TK_EOF) {
 					// Route braces through scope handlers (defer stack, scope push/pop)
 					if (match_ch(inner, '{')) {
@@ -2697,7 +2701,13 @@ static Token *walk_balanced(Token *tok, bool emit) {
 					}
 					if (match_ch(inner, ';')) {
 						end_statement_after_semicolon();
+						bool is_ur_target = (inner == wb_unreachable_tok);
 						emit_tok(inner); inner = tok_next(inner);
+						if (is_ur_target) {
+							if (target_is_msvc()) OUT_LIT(" __assume(0);");
+							else OUT_LIT(" __builtin_unreachable();");
+							wb_unreachable_tok = NULL;
+						}
 						continue;
 					}
 					// Preprocessor directives: emit and preserve at_stmt_start
@@ -2749,6 +2759,14 @@ static Token *walk_balanced(Token *tok, bool emit) {
 						error_tok(inner,
 							  "'orelse' cannot be used here (it must appear at the "
 							  "statement level in a declaration or bare expression)");
+					if (FEAT(F_AUTO_UNREACHABLE) && (inner->tag & TT_NORETURN_FN)) {
+						Token *nr_call = tok_next(inner);
+						if (nr_call && match_ch(nr_call, '(') && tok_match(nr_call)) {
+							Token *nr_after = tok_next(tok_match(nr_call));
+							if (nr_after && match_ch(nr_after, ';'))
+								wb_unreachable_tok = nr_after;
+						}
+					}
 					ctx->at_stmt_start = false;
 					emit_tok(inner); inner = tok_next(inner);
 				}
@@ -3986,6 +4004,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		}
 
 		// Emit initializer if present
+		Token *pd_unreachable_tok = NULL;
 		if (decl.has_init) {
 			bool hit_orelse = false;
 			int init_ternary = 0;
@@ -4020,6 +4039,14 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					hit_orelse = true;
 					break;
 				}
+				if (FEAT(F_AUTO_UNREACHABLE) && !in_ctrl_paren() && (tok->tag & TT_NORETURN_FN)) {
+					Token *nr_call = tok_next(tok);
+					if (nr_call && match_ch(nr_call, '(') && tok_match(nr_call)) {
+						Token *nr_after = tok_next(tok_match(nr_call));
+						if (nr_after && match_ch(nr_after, ';'))
+							pd_unreachable_tok = nr_after;
+					}
+				}
 				emit_tok(tok); tok = tok_next(tok);
 			}
 
@@ -4053,8 +4080,13 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		check_defer_var_shadow(decl.var_name);
 
 		if (match_ch(tok, ';')) {
+			bool is_ur = (tok == pd_unreachable_tok);
 			emit_tok(tok);
 			flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type);
+			if (is_ur) {
+				if (target_is_msvc()) OUT_LIT(" __assume(0);");
+				else OUT_LIT(" __builtin_unreachable();");
+			}
 			if (brace_wrap) OUT_LIT(" }");
 			return tok_next(tok);
 		} else if (match_ch(tok, ',')) {
@@ -6311,6 +6343,7 @@ static void emit_deferred_range(Token *start, Token *end) {
 	ctrl_reset();
 
 	ctx->at_stmt_start = true;
+	Token *dr_unreachable_tok = NULL;
 
 	for (Token *t = start; t && t != end && t->kind != TK_EOF;) {
 		if (ctx->at_stmt_start && FEAT(F_ZEROINIT)) {
@@ -6337,6 +6370,16 @@ static void emit_deferred_range(Token *start, Token *end) {
 
 		ctx->at_stmt_start = false;
 
+		// Auto-unreachable: detect noreturn call in deferred range
+		if (FEAT(F_AUTO_UNREACHABLE) && (t->tag & TT_NORETURN_FN)) {
+			Token *nr_call = tok_next(t);
+			if (nr_call && match_ch(nr_call, '(') && tok_match(nr_call)) {
+				Token *nr_after = tok_next(tok_match(nr_call));
+				if (nr_after && nr_after != end && match_ch(nr_after, ';'))
+					dr_unreachable_tok = nr_after;
+			}
+		}
+
 		// Strip raw keyword (same as main loop catch-all)
 		if (__builtin_expect((t->flags & TF_RAW) && !is_known_typedef(t), 0)) {
 			Token *after_raw = skip_noise(tok_next(t));
@@ -6356,7 +6399,16 @@ static void emit_deferred_range(Token *start, Token *end) {
 		}
 
 		if (t->tag & TT_STRUCTURAL) {
+			bool is_semi = (t->len == 1 && tok_loc(t)[0] == ';');
+			bool is_ur_target = is_semi && (t == dr_unreachable_tok);
 			emit_tok(t); t = tok_next(t);
+			if (is_ur_target) {
+				if (target_is_msvc())
+					OUT_LIT(" __assume(0);");
+				else
+					OUT_LIT(" __builtin_unreachable();");
+				dr_unreachable_tok = NULL;
+			}
 			ctx->at_stmt_start = true;
 			continue;
 		}
@@ -8392,6 +8444,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 	int next_func_idx = 0;
 	int ternary_depth = 0;
+	Token *pending_unreachable_tok = NULL;
 
 	while (tok->kind != TK_EOF) {
 		// Non-flatten mode: skip system header tokens entirely.
@@ -8518,6 +8571,16 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					tok_line_no(tok),
 					tok->len,
 					tok_loc(tok));
+			if (FEAT(F_AUTO_UNREACHABLE) && ctx->block_depth > 0 &&
+			    !in_ctrl_paren() &&
+			    !(ctrl_state.pending && ctrl_state.parens_just_closed)) {
+				Token *nr_call = tok_next(tok);
+				if (nr_call && match_ch(nr_call, '(') && tok_match(nr_call)) {
+					Token *nr_after = tok_next(tok_match(nr_call));
+					if (nr_after && match_ch(nr_after, ';'))
+						pending_unreachable_tok = nr_after;
+				}
+			}
 		}
 
 		// Tag-dependent dispatch
@@ -8670,7 +8733,15 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			if (c == ';') {
 				if (in_ctrl_paren() || in_for_init()) track_ctrl_semicolon();
 				else end_statement_after_semicolon();
+				bool is_unreachable_target = (tok == pending_unreachable_tok);
 				emit_tok(tok); tok = tok_next(tok);
+				if (is_unreachable_target) {
+					if (target_is_msvc())
+						OUT_LIT(" __assume(0);");
+					else
+						OUT_LIT(" __builtin_unreachable();");
+					pending_unreachable_tok = NULL;
+				}
 				continue;
 			}
 			if (c == ':') {
@@ -9194,6 +9265,7 @@ static Cli cli_parse(int argc, char **argv) {
 			if (!strcmp(a, "-fno-safety"))           { cli.features.warn_safety = true; continue; }
 			if (!strcmp(a, "-fflatten-headers"))     { cli.features.flatten_headers = true; continue; }
 			if (!strcmp(a, "-fno-flatten-headers"))  { cli.features.flatten_headers = false; continue; }
+			if (!strcmp(a, "-fno-auto-unreachable")) { cli.features.auto_unreachable = false; continue; }
 			// fall through to forward
 		} else {
 			// Dependency-generation flags → preprocessor only
@@ -9675,6 +9747,7 @@ static void print_help(void) {
 	       "  -fno-safety           Safety checks warn instead of error\n"
 	       "  -fflatten-headers     Flatten headers into single output\n"
 	       "  -fno-flatten-headers  Disable header flattening\n"
+	       "  -fno-auto-unreachable Disable __builtin_unreachable after noreturn calls\n"
 	       "  --prism-cc=<compiler> Use specific compiler\n"
 	       "  --prism-verbose       Show commands\n\n"
 	       "All other flags are passed through to CC.\n\n"

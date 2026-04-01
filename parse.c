@@ -249,7 +249,8 @@ enum // Feature flags
 	F_LINE_DIR = 4,
 	F_WARN_SAFETY = 8,
 	F_FLATTEN = 16,
-	F_ORELSE = 32
+	F_ORELSE = 32,
+	F_AUTO_UNREACHABLE = 64
 };
 
 struct ArenaBlock;

@@ -895,56 +895,6 @@ The `bounds(n)` annotation is superior: the function signature stays `int *arr` 
 
 ---
 
-## 11. Unreachable After Transitive Noreturn (`-fauto-unreachable`)
-
-**Problem:** When a function `cleanup_and_die()` always calls `exit()`, the compiler doesn't know it's noreturn — it generates an epilogue, preserves callee-saved registers, and keeps dead code after the call. Prism already performs transitive noreturn analysis and knows these functions never return, but that knowledge dies at the transpiler boundary.
-
-**Design:** After emitting a call to a function Prism has classified as transitively noreturn, inject `__builtin_unreachable()`. This propagates Prism's unique knowledge into the backend compiler.
-
-### Usage
-
-```c
-// Source:
-void fatal_error(const char *msg) {
-    fprintf(stderr, "FATAL: %s\n", msg);
-    exit(1);
-}
-
-void process(int *p) {
-    if (!p) fatal_error("null pointer");
-    // ... use p ...
-}
-
-// Emitted:
-void process(int *p) {
-    if (!p) { fatal_error("null pointer"); __builtin_unreachable(); }
-    // ... use p ...
-}
-```
-
-### What the backend gains
-
-With `__builtin_unreachable()` after the call:
-- The compiler knows `p != NULL` after the `if` — eliminates all subsequent null checks on `p`
-- Dead code after `fatal_error()` calls is provably unreachable
-- Function epilogue can be omitted on that path
-- The call to `fatal_error()` can use a tail-call (no need to preserve return address)
-
-### Why only Prism can do this
-
-GCC/Clang only know a function is noreturn if it's annotated with `_Noreturn`, `__attribute__((noreturn))`, or `[[noreturn]]`. If `fatal_error()` calls `exit()` in a different TU, the compiler can't see it. Even within the same TU, compilers don't propagate noreturn transitively through call chains.
-
-Prism's Phase 1 prescan already walks every function body and flags functions as transitively noreturn if all code paths end in a known noreturn call. This analysis is complete and conservative — if Prism says it's noreturn, it's noreturn.
-
-### Architecture fit
-
-- Transitive noreturn is already computed in Phase 1 and stored in `func_meta`
-- The injection point is trivial: after emitting a `TK_IDENT` + `(...)` call where `func_meta` has `is_noreturn`, emit `__builtin_unreachable();`
-- MSVC equivalent: `__assume(0)` — already handled by Prism's platform detection
-- Zero risk: if the function does somehow return (analysis bug), `__builtin_unreachable` is UB — but so is returning from a noreturn function. The analysis is conservative enough that this shouldn't happen.
-
----
-
 ## 12. Orelse Postcondition Injection
 
 **Problem:** After `int *p = malloc(100) orelse default_buf;`, the developer knows `p` is guaranteed non-null (orelse provides a fallback). But the backend compiler doesn't — it sees a ternary expression and can't prove the result is non-null. Every subsequent `if (!p)` check and null-pointer sanitizer branch is wasted.
@@ -1156,6 +1106,6 @@ The agonizing assembler directive fragmentation (.globl vs PUBLIC, .text vs .cod
 | Forward-only goto | Low (code quality) | High (CFG verifier has it) | Near zero | **8** |
 | Attribute normalization | None (convenience) | High (trivial) | Low | **9** |
 | Auto-static const arrays | High (eliminates hidden memcpy) | Very high (trivial token scan) | Low | **10** |
-| Unreachable after noreturn | Medium (dead code, missed tail-calls) | Very high (data already exists) | Near zero | **11** |
+| Unreachable after noreturn | ~~Medium~~ | ~~Very high~~ | ~~Near zero~~ | **DONE** |
 | Orelse postcondition | Low (missed optimizations) | Very high (orelse semantics) | Near zero | **12** |
 | Const-to-literal VLA demotion | Medium (wastes frame pointer GPR) | Very high (typedef table lookup) | Very low | **13** |

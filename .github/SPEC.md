@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
-**Version:** 0.120.0
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3686+ tests + self-host stage1==stage2).
+**Version:** 1.1.0
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (3855+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -583,6 +583,21 @@ GNU statement expressions `({…})` are supported. They get their own scope in t
 **Multi-declarator VM-type split restriction:** When `process_declarators` must split a multi-declarator statement (due to pending typeof memsets or bracket orelse in a subsequent declarator), it re-emits the type specifier for the new declaration. If the type specifier contains a variably-modified type — `typeof(expr)` with VLA dimensions (`has_typeof && is_vla`) or `_Atomic(type)` with VLA dimensions (`has_atomic && is_vla`) — the VLA dimension expression would be evaluated a second time at runtime by the backend compiler (ISO C11 §6.7.2.5 — VM type specifiers are evaluated when the declaration is reached). This causes double evaluation of side effects (function calls, `++`, etc.) in the VLA dimension. Prism rejects such splits with a hard error: the user must declare each variable on a separate line. The guard condition is `(type->has_typeof || type->has_atomic) && type->is_vla`. The `_Atomic(...)` VLA detection was added because `parse_type_specifier` now scans `_Atomic(...)` contents for VLA array dimensions (same pattern as the `typeof(...)` scan), including the `)` predecessor for parenthesized pointer types like `_Atomic(int(*)[n])`. This also covers the orelse `stop_comma` continuation paths (const orelse fallback, orelse action). Anonymous struct/union splits are separately rejected because re-emitting the body produces two incompatible anonymous types.
 
 **Const orelse VM-type restriction:** `handle_const_orelse_fallback` emits the type specifier twice — once for the mutable temporary and once for the final `const` declaration. When the type is variably-modified (`type->is_vla || decl.is_vla`), this forces the C compiler to evaluate VLA size expressions twice at runtime (ISO C11 §6.7.2.5). Prism rejects const-qualified VM-type orelse with a hard error: the user must hoist the value to a non-const variable first. This covers both VLA dimensions in the declarator suffix (e.g. `const int (*p)[get_size()]`) and in the type specifier via typeof (e.g. `const typeof(int[n]) *p`).
+
+### 6.4 Auto-Unreachable (`-fno-auto-unreachable`, default on)
+
+**Semantics:** After emitting a call to a function classified as noreturn, Prism injects `__builtin_unreachable();` (or `__assume(0);` for MSVC). This propagates Prism's transitive noreturn knowledge into the backend compiler, enabling tail-call optimization, dead code elimination, and register pressure relief.
+
+**Detection:** A function is noreturn if declared with `_Noreturn`, `noreturn`, `[[noreturn]]`, `__attribute__((noreturn))`, `__declspec(noreturn)`, or is a known builtin (`exit`, `abort`, `_Exit`, `_exit`, `quick_exit`, `__builtin_trap`, `__builtin_unreachable`, `thrd_exit`). All occurrences of the function name are tagged `TT_NORETURN_FN` during tokenization.
+
+**Injection rules:**
+1. The noreturn identifier must be followed by `(` (a call, not a pointer reference)
+2. The matching `)` must be followed by `;` (statement-level call, not a subexpression)
+3. Must be inside a function body (`block_depth > 0`)
+4. Must NOT be in a braceless control body (would create a multi-statement body without braces)
+5. The `__builtin_unreachable();` is emitted immediately after the `;`
+
+**Disable:** `-fno-auto-unreachable` or `features.auto_unreachable = false` in library mode.
 
 ---
 

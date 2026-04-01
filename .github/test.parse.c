@@ -7075,6 +7075,218 @@ static void test_skip_one_stmt_default_braced_for_init_shadow_bleed(void) {
 	prism_free(&r);
 }
 
+// ── Auto-unreachable tests ──
+
+static void test_auto_unreachable_basic(void) {
+	const char *code =
+	    "void f(void) {\n"
+	    "    exit(1);\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_basic.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: basic transpiles");
+	CHECK(r.output && strstr(r.output, "__builtin_unreachable()"),
+	      "auto-unreachable: __builtin_unreachable injected after exit()");
+	prism_free(&r);
+}
+
+static void test_auto_unreachable_user_noreturn(void) {
+	const char *code =
+	    "_Noreturn void my_panic(const char *msg);\n"
+	    "void f(void) {\n"
+	    "    my_panic(\"fatal\");\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_user.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: user noreturn transpiles");
+	CHECK(r.output && strstr(r.output, "__builtin_unreachable()"),
+	      "auto-unreachable: injected after user-declared _Noreturn function");
+	prism_free(&r);
+}
+
+static void test_auto_unreachable_no_inject_braceless(void) {
+	// Braceless if body — injection would create a syntax error
+	const char *code =
+	    "void f(int cond) {\n"
+	    "    if (cond) exit(1);\n"
+	    "    return;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_braceless.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: braceless if transpiles");
+	CHECK(r.output && !strstr(r.output, "__builtin_unreachable()"),
+	      "auto-unreachable: NOT injected in braceless control body");
+	prism_free(&r);
+}
+
+static void test_auto_unreachable_braced_if(void) {
+	const char *code =
+	    "void f(int cond) {\n"
+	    "    if (cond) { exit(1); }\n"
+	    "    return;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_braced.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: braced if transpiles");
+	CHECK(r.output && strstr(r.output, "__builtin_unreachable()"),
+	      "auto-unreachable: injected inside braced if body");
+	prism_free(&r);
+}
+
+static void test_auto_unreachable_disabled(void) {
+	const char *code =
+	    "void f(void) {\n"
+	    "    exit(1);\n"
+	    "}\n";
+	PrismFeatures feat = prism_defaults();
+	feat.auto_unreachable = false;
+	PrismResult r = prism_transpile_source(code, "unreachable_off.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: disabled transpiles");
+	CHECK(r.output && !strstr(r.output, "__builtin_unreachable()"),
+	      "auto-unreachable: NOT injected when -fno-auto-unreachable");
+	prism_free(&r);
+}
+
+static void test_auto_unreachable_no_inject_non_call(void) {
+	// exit used as a pointer reference, not a call
+	const char *code =
+	    "typedef void (*fn_t)(int);\n"
+	    "void f(void) {\n"
+	    "    fn_t fp = exit;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_ref.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: non-call reference transpiles");
+	CHECK(r.output && !strstr(r.output, "__builtin_unreachable()"),
+	      "auto-unreachable: NOT injected for non-call reference");
+	prism_free(&r);
+}
+
+static void test_auto_unreachable_no_inject_subexpr(void) {
+	// Noreturn call inside a comma expression — after ')' is ',' not ';'
+	const char *code =
+	    "void f(int cond) {\n"
+	    "    cond ? exit(1) : (void)0;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_subexpr.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: subexpr transpiles");
+	CHECK(r.output && !strstr(r.output, "__builtin_unreachable()"),
+	      "auto-unreachable: NOT injected when noreturn is in subexpression");
+	prism_free(&r);
+}
+
+static void test_auto_unreachable_stmtexpr_arg_premature(void) {
+	// Bug: boolean flag fires on first ';' inside statement expression argument
+	const char *code =
+	    "int do_something(void);\n"
+	    "void f(void) {\n"
+	    "    exit( ({ do_something(); 1; }) );\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_stmtexpr.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: stmt-expr arg transpiles");
+	// Must NOT inject inside the stmt-expr argument
+	CHECK(r.output && !strstr(r.output, "do_something(); __builtin_unreachable()"),
+	      "auto-unreachable: NOT injected inside stmt-expr argument");
+	// Must inject after the outer exit() call
+	CHECK(r.output && strstr(r.output, ") ; __builtin_unreachable()") != NULL ||
+	      (r.output && strstr(r.output, "}) ); __builtin_unreachable()") != NULL) ||
+	      (r.output && strstr(r.output, "); __builtin_unreachable()") != NULL),
+	      "auto-unreachable: injected after outer exit() call");
+	prism_free(&r);
+}
+
+static void test_auto_unreachable_for_init_no_inject(void) {
+	// Bug: noreturn call in for-init generates '; __builtin_unreachable()' in header
+	const char *code =
+	    "void f(void) {\n"
+	    "    for (exit(1); ; ) {}\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_forinit.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: for-init transpiles");
+	CHECK(r.output && !strstr(r.output, "__builtin_unreachable()"),
+	      "auto-unreachable: NOT injected in for-loop init/condition");
+	prism_free(&r);
+}
+
+static void test_auto_unreachable_defer_body(void) {
+	// Blind spot: noreturn call in defer body not processed by main loop
+	const char *code =
+	    "_Noreturn void die(const char *msg);\n"
+	    "void f(void) {\n"
+	    "    defer { die(\"cleanup failed\"); }\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_defer.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: defer body transpiles");
+	CHECK(r.output && strstr(r.output, "__builtin_unreachable()"),
+	      "auto-unreachable: injected inside defer body for user noreturn");
+	prism_free(&r);
+}
+
+static void test_auto_unreachable_orelse_action(void) {
+	// Orelse ternary: noreturn call is CONDITIONAL — must NOT inject.
+	// fatal() only runs when p is null; if p is non-null, execution continues.
+	const char *code =
+	    "_Noreturn void fatal(void);\n"
+	    "void f(void) {\n"
+	    "    int *ptr = malloc(100) orelse fatal();\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_orelse.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: orelse action transpiles");
+	CHECK(r.output && !strstr(r.output, "__builtin_unreachable()"),
+	      "auto-unreachable: NOT injected in orelse ternary (call is conditional)");
+	prism_free(&r);
+}
+
+static void test_auto_unreachable_orelse_block(void) {
+	// Orelse block form: noreturn inside if-guard body — SHOULD inject.
+	const char *code =
+	    "void f(void) {\n"
+	    "    int *ptr = malloc(100) orelse { exit(1); }\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_orelse_blk.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: orelse block transpiles");
+	CHECK(r.output && strstr(r.output, "__builtin_unreachable()"),
+	      "auto-unreachable: injected inside orelse block body");
+	prism_free(&r);
+}
+
+static void test_auto_unreachable_walk_balanced_stmtexpr(void) {
+	// Blind spot: walk_balanced's stmt-expr inner loop bypasses main dispatcher.
+	// Multi-declarator forces process_declarators → walk_balanced path.
+	const char *code =
+	    "void f(void) {\n"
+	    "    int x = ({ exit(1); 5; }), y = 0;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_wb_stmtexpr.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: walk_balanced stmt-expr transpiles");
+	CHECK(r.output && strstr(r.output, "__builtin_unreachable()"),
+	      "auto-unreachable: injected inside stmt-expr via walk_balanced");
+	prism_free(&r);
+}
+
+static void test_auto_unreachable_decl_init(void) {
+	// Blind spot: process_declarators has its own init loop that bypasses main dispatcher
+	const char *code =
+	    "_Noreturn void fatal_error(void);\n"
+	    "void f(void) {\n"
+	    "    int status = fatal_error();\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_decl_init.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: decl init transpiles");
+	CHECK(r.output && strstr(r.output, "__builtin_unreachable()"),
+	      "auto-unreachable: injected after noreturn call in declaration initializer");
+	prism_free(&r);
+}
+
+static void test_auto_unreachable_decl_init_for_no_inject(void) {
+	// Must NOT inject in for-loop init
+	const char *code =
+	    "_Noreturn void fatal_error(void);\n"
+	    "void f(void) {\n"
+	    "    for (int i = fatal_error(); ; ) {}\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_decl_for.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: decl-init for transpiles");
+	CHECK(r.output && !strstr(r.output, "__builtin_unreachable()"),
+	      "auto-unreachable: NOT injected in for-loop declaration init");
+	prism_free(&r);
+}
+
 void run_parse_tests(void) {
 	printf("\n=== PARSE TESTS ===\n");
 
@@ -7577,4 +7789,21 @@ void run_parse_tests(void) {
 	// Audit round 17: skip_one_stmt label-fallthrough for-init shadow bleed
 	test_skip_one_stmt_case_braced_for_init_shadow_bleed();
 	test_skip_one_stmt_default_braced_for_init_shadow_bleed();
+
+	// Auto-unreachable injection after noreturn calls
+	test_auto_unreachable_basic();
+	test_auto_unreachable_user_noreturn();
+	test_auto_unreachable_no_inject_braceless();
+	test_auto_unreachable_braced_if();
+	test_auto_unreachable_disabled();
+	test_auto_unreachable_no_inject_non_call();
+	test_auto_unreachable_no_inject_subexpr();
+	test_auto_unreachable_stmtexpr_arg_premature();
+	test_auto_unreachable_for_init_no_inject();
+	test_auto_unreachable_defer_body();
+	test_auto_unreachable_orelse_action();
+	test_auto_unreachable_orelse_block();
+	test_auto_unreachable_walk_balanced_stmtexpr();
+	test_auto_unreachable_decl_init();
+	test_auto_unreachable_decl_init_for_no_inject();
 }
