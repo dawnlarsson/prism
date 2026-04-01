@@ -3341,12 +3341,10 @@ static Token *emit_goto_defer(Token *tok) {
 	if (FEAT(F_DEFER) && is_identifier_like(tok)) {
 		P1LabelResult info = p1_label_find(tok, current_func_idx);
 		int td = info.tok ? info.scope_depth : ctx->block_depth;
-		if (td >= ctx->block_depth) {
-			int exits = p1_goto_exits(goto_tok, current_func_idx);
-			if (exits > 0) {
-				td = ctx->block_depth - exits;
-				if (td < 0) td = 0;
-			}
+		int exits = p1_goto_exits(goto_tok, current_func_idx);
+		if (exits > 0) {
+			td = ctx->block_depth - exits;
+			if (td < 0) td = 0;
 		}
 		if (goto_has_defers(td)) emit_goto_defers(td);
 	}
@@ -4786,13 +4784,10 @@ static Token *handle_goto_keyword(Token *tok) {
 
 			int target_depth = info.tok ? info.scope_depth : ctx->block_depth;
 
-			if (target_depth >= ctx->block_depth) {
-				int exits = p1_goto_exits(goto_tok, current_func_idx);
-
-				if (exits > 0) {
-					target_depth = ctx->block_depth - exits;
-					if (target_depth < 0) target_depth = 0;
-				}
+			int exits = p1_goto_exits(goto_tok, current_func_idx);
+			if (exits > 0) {
+				target_depth = ctx->block_depth - exits;
+				if (target_depth < 0) target_depth = 0;
 			}
 
 			if (goto_has_defers(target_depth)) {

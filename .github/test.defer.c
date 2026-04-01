@@ -1415,6 +1415,26 @@ void test_defer_sibling_goto_lifo_bug(void) {
 	CHECK_LOG("1ABC2", "goto to sibling block defers fire in LIFO order");
 }
 
+void test_defer_cross_branch_goto_nested(void) {
+	log_reset();
+	int i = 0;
+	{ // outer sibling 1
+		defer log_append("A");
+		{ // nested
+			defer log_append("B");
+			if (i == 0) { // deeply nested
+				i++;
+				goto L_cross;
+			}
+		}
+	}
+	{ // outer sibling 2
+		L_cross:
+		log_append("T");
+	}
+	CHECK_LOG("BAT", "cross-branch goto from nested scope fires all ancestor defers");
+}
+
 void test_defer_backward_goto_sibling(void) {
 	log_reset();
 	int visited = 0;
@@ -4657,6 +4677,7 @@ void run_defer_tests(void) {
 	test_defer_sibling_goto_bug();
 	test_defer_sibling_goto_multi_bug();
 	test_defer_sibling_goto_lifo_bug();
+	test_defer_cross_branch_goto_nested();
 
 	test_defer_goto_forward();
 	test_defer_goto_into_scope_rejected();
