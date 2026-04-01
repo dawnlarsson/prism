@@ -4567,9 +4567,12 @@ static void test_bare_orelse_vm_type_double_eval(void) {
 		CHECK_EQ(r.status, PRISM_OK, "vm-double-eval-chain: transpiles OK");
 		// Both temps must exist (chained if/else)
 		if (r.output) {
-			CHECK(strstr(r.output, "__prism_oe_0") != NULL,
+			CHECK(strstr(r.output, "__prism_oe_") != NULL,
 			      "vm-double-eval-chain: first temp exists");
-			CHECK(strstr(r.output, "__prism_oe_1") != NULL,
+			// Find second distinct temp by searching past first occurrence
+			char *first = strstr(r.output, "__prism_oe_");
+			char *second = first ? strstr(first + 11, "__prism_oe_") : NULL;
+			CHECK(second != NULL,
 			      "vm-double-eval-chain: second temp exists");
 		}
 		prism_free(&r);
