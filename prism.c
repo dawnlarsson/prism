@@ -4272,7 +4272,7 @@ static Token *try_zero_init_decl(Token *tok) {
 		}
 	}
 
-	if (FEAT(F_ZEROINIT) && in_switch_scope_unbraced && !is_raw) {
+	if (FEAT(F_ZEROINIT) && in_switch_scope_unbraced && !is_raw && !in_for_init()) {
 		error_tok(warn_loc,
 			  "variable declaration directly in switch body without braces. "
 			  "Wrap in braces: 'case N: { int x; ... }' to ensure safe zero-initialization, "
@@ -7770,6 +7770,7 @@ uint16_t sid = next_scope_id++;
 					// (moved from Pass 2 try_zero_init_decl to satisfy
 					// the invariant: all semantic errors before emission)
 					if (FEAT(F_ZEROINIT) && brace_depth > 0 && !p1d_decl_raw &&
+					    braceless_close_idx == 0 &&
 					    cur_sid < scope_tree_count && scope_tree[cur_sid].is_switch)
 						error_tok(p1d_type_tok,
 							  "variable declaration directly in switch body without braces. "
@@ -8327,9 +8328,15 @@ static void p1_verify_cfg(void) {
 					P1FuncEntry *d = &ents[decl_list[di]];
 					if (!scope_is_ancestor_or_self(d->scope_id, ents[i].scope_id))
 						continue;
-					if (d->scope_id > 0 && d->scope_id < scope_tree_count &&
-					    scope_tree[d->scope_id].close_tok_idx < ents[i].token_index)
-						continue;
+					{
+						uint32_t close = 0;
+						if (d->decl.body_close_idx > 0)
+							close = d->decl.body_close_idx;
+						else if (d->scope_id > 0 && d->scope_id < scope_tree_count)
+							close = scope_tree[d->scope_id].close_tok_idx;
+						if (close > 0 && close < ents[i].token_index)
+							continue;
+					}
 					if (d->decl.is_vla)
 						error_tok(ents[i].tok,
 							  "case/default label may bypass VLA declaration");

@@ -2759,6 +2759,47 @@ static void test_asm_goto_zeroinit_rejected(void) {
 	}
 }
 
+// BUG: CFG verifier P1K_CASE body_close_idx desync —
+// for-init declarations inside switch should not be rejected.
+static void test_switch_for_init_not_rejected(void) {
+	/* Braceless for-init inside switch case must be accepted:
+	   the variable is scoped to the for loop, not the switch body. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int state) {\n"
+		    "    switch (state) {\n"
+		    "    case 0:\n"
+		    "        for (int i = 0; i < 5; i++)\n"
+		    "            (void)i;\n"
+		    "    case 1:\n"
+		    "        break;\n"
+		    "    }\n"
+		    "}\n",
+		    "switch_for_init.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "switch-for-init: braceless for-init in case must be accepted");
+		prism_free(&r);
+	}
+	/* Genuine unbraced declaration in switch body must still be rejected. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int state) {\n"
+		    "    switch (state) {\n"
+		    "    case 0:\n"
+		    "        ;\n"
+		    "        int x;\n"
+		    "        (void)x;\n"
+		    "    case 1:\n"
+		    "        break;\n"
+		    "    }\n"
+		    "}\n",
+		    "switch_bare_decl.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "switch-bare-decl: unbraced decl in switch must still be rejected");
+		prism_free(&r);
+	}
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -2898,4 +2939,7 @@ void run_zeroinit_tests(void) {
 
 	// BUG: asm goto zeroinit CFG bypass
 	test_asm_goto_zeroinit_rejected();
+
+	// BUG: CFG verifier P1K_CASE body_close_idx desync
+	test_switch_for_init_not_rejected();
 }
