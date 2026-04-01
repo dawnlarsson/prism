@@ -6076,12 +6076,17 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 	if (!is_bare_fallback)
 		return NULL;  // caller handles non-bare fallback
 
-	// Reject if the LHS contains preprocessor conditionals (#ifdef/#else/etc.).
-	// emit_range_no_prep emits C tokens from ALL branches of a conditional,
-	// producing invalid concatenated code like "target_x86 target_arm = ...".
+	// Reject if the statement contains preprocessor conditionals (#ifdef/#else/etc.).
+	// emit_range_no_prep / emit_balanced_range skip TK_PREP_DIR tokens,
+	// producing concatenated code from ALL branches — silent miscompilation.
 	// We cannot statically evaluate which branch is active, so error here.
+	// Scan the entire statement: LHS, test expression, and fallback(s).
 	if (bare_assign_eq) {
-		for (Token *s = bare_lhs_start; s != bare_assign_eq; s = tok_next(s)) {
+		int sd = 0;
+		for (Token *s = bare_lhs_start; s && s->kind != TK_EOF; s = tok_next(s)) {
+			if (s->flags & TF_OPEN) sd++;
+			else if (s->flags & TF_CLOSE) sd--;
+			else if (sd == 0 && BARE_IS_END(s)) break;
 			if (s->kind != TK_PREP_DIR) continue;
 			const char *dp = tok_loc(s);
 			if (*dp == '#') dp++;
@@ -6091,7 +6096,7 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 			    strncmp(dp, "endif", 5) == 0 ||
 			    (strncmp(dp, "if", 2) == 0 && (dp[2]==' '||dp[2]=='\t'||dp[2]=='(')))
 				error_tok(orelse_tok,
-					  "bare orelse assignment cannot be used when the target "
+					  "bare orelse assignment cannot be used when the "
 					  "expression spans preprocessor conditionals — the "
 					  "transpiler would emit tokens from all branches, "
 					  "producing invalid C; use a temporary variable or "

@@ -5572,6 +5572,51 @@ static void test_const_ptr_typedef_orelse_provenance(void) {
 	}
 }
 
+static void test_bare_orelse_prepdir_fallback_concat(void) {
+	printf("\n--- BUG: prepdir in orelse fallback branch concatenation ---\n");
+
+	// BUG: #ifdef in fallback expression after orelse — emit_balanced_range
+	// skips TK_PREP_DIR, concatenating tokens from ALL branches.
+	// Must be rejected in lib mode.
+
+	// Sub-test 1: #ifdef in fallback expression
+	{
+		const char *code =
+		    "const char *get_url(void);\n"
+		    "void f(void) {\n"
+		    "    const char *url;\n"
+		    "    url = get_url()\n"
+		    "        orelse\n"
+		    "#ifdef USE_STAGING\n"
+		    "        \"https://staging.api.com\"\n"
+		    "#else\n"
+		    "        \"https://prod.api.com\"\n"
+		    "#endif\n"
+		    "        ;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "prepdir_fb.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "prepdir-fallback: #ifdef in fallback must be rejected");
+		CHECK(r.error_msg && strstr(r.error_msg, "preprocessor conditional"),
+		      "prepdir-fallback: error mentions preprocessor conditionals");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: no #ifdef — normal orelse still works
+	{
+		const char *code =
+		    "const char *get_url(void);\n"
+		    "void f(void) {\n"
+		    "    const char *url;\n"
+		    "    url = get_url() orelse \"fallback\";\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "prepdir_ok.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "prepdir-fallback: normal orelse without #ifdef still works");
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -5895,4 +5940,7 @@ void run_orelse_tests(void) {
 
 	// const pointer typedef orelse provenance trap
 	test_const_ptr_typedef_orelse_provenance();
+
+	// BUG: prepdir in orelse fallback branch concatenation (lib mode)
+	test_bare_orelse_prepdir_fallback_concat();
 }
