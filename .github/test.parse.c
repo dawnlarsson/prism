@@ -7290,6 +7290,55 @@ static void test_auto_unreachable_decl_init_for_no_inject(void) {
 	prism_free(&r);
 }
 
+static void test_auto_unreachable_member_dot_no_inject(void) {
+	// BUG: struct member named exit/abort/etc. falsely triggers unreachable
+	// injection because TT_NORETURN_FN is tagged context-free via keyword_cache.
+	const char *code =
+	    "struct sm { int (*exit)(int); void (*abort)(void); };\n"
+	    "void f(void) {\n"
+	    "    struct sm s = {0};\n"
+	    "    s.exit(0);\n"
+	    "    s.abort();\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_member_dot.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: member dot transpiles");
+	CHECK(r.output && !has_unreachable_marker(r.output),
+	      "auto-unreachable: NOT injected for s.exit() / s.abort() member access");
+	prism_free(&r);
+}
+
+static void test_auto_unreachable_member_arrow_no_inject(void) {
+	// Arrow member access: sm->exit() must NOT trigger unreachable
+	const char *code =
+	    "struct sm { int (*exit)(int); void (*abort)(void); };\n"
+	    "void f(struct sm *p) {\n"
+	    "    p->exit(0);\n"
+	    "    p->abort();\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_member_arrow.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: member arrow transpiles");
+	CHECK(r.output && !has_unreachable_marker(r.output),
+	      "auto-unreachable: NOT injected for p->exit() / p->abort() arrow access");
+	prism_free(&r);
+}
+
+static void test_auto_unreachable_user_noreturn_member_no_inject(void) {
+	// User-defined noreturn function name collides with struct member.
+	// The global tag loop in parse.c must skip member-preceded identifiers.
+	const char *code =
+	    "_Noreturn void die(void);\n"
+	    "struct wrap { void (*die)(void); };\n"
+	    "void f(struct wrap *w) {\n"
+	    "    w->die();\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_user_member.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: user noreturn member transpiles");
+	CHECK(r.output && !has_unreachable_marker(r.output),
+	      "auto-unreachable: NOT injected for w->die() member access "
+	      "(die is _Noreturn but w->die is a member)");
+	prism_free(&r);
+}
+
 void run_parse_tests(void) {
 	printf("\n=== PARSE TESTS ===\n");
 
@@ -7809,4 +7858,7 @@ void run_parse_tests(void) {
 	test_auto_unreachable_walk_balanced_stmtexpr();
 	test_auto_unreachable_decl_init();
 	test_auto_unreachable_decl_init_for_no_inject();
+	test_auto_unreachable_member_dot_no_inject();
+	test_auto_unreachable_member_arrow_no_inject();
+	test_auto_unreachable_user_noreturn_member_no_inject();
 }

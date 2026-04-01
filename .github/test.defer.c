@@ -4431,6 +4431,46 @@ static void test_defer_shadow_for_init_false_positive(void) {
 	}
 }
 
+static void test_defer_vfork_member_no_reject(void) {
+	printf("\n--- BUG: vfork member namespace pollution ---\n");
+	// BUG: struct member named 'vfork' falsely taints the function body,
+	// causing "defer cannot be used in functions that call vfork()" error.
+	// The vfork body scan in parse.c tagged TT_NORETURN_FN on the body '{'
+	// when it found 'vfork' without checking for member-access predecessor.
+
+	// Sub-test 1: dot member access
+	{
+		const char *code =
+		    "struct os { int (*vfork)(void); };\n"
+		    "int dummy(void) { return 0; }\n"
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    struct os os = { .vfork = dummy };\n"
+		    "    defer cleanup();\n"
+		    "    os.vfork();\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vfork_member_dot.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "vfork-member: os.vfork() must not reject defer");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: arrow member access
+	{
+		const char *code =
+		    "struct os { int (*vfork)(void); };\n"
+		    "void cleanup(void);\n"
+		    "void f(struct os *p) {\n"
+		    "    defer cleanup();\n"
+		    "    p->vfork();\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vfork_member_arrow.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "vfork-member: p->vfork() must not reject defer");
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -4694,4 +4734,7 @@ void run_defer_tests(void) {
 
 	// BUG75: same-block defer shadow hijack (silent miscompilation)
 	test_defer_same_block_shadow_hijack();
+
+	// BUG: vfork member namespace pollution (os.vfork() / p->vfork())
+	test_defer_vfork_member_no_reject();
 }

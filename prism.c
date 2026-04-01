@@ -2715,7 +2715,8 @@ static Token *walk_balanced(Token *tok, bool emit) {
 						error_tok(inner,
 							  "'orelse' cannot be used here (it must appear at the "
 							  "statement level in a declaration or bare expression)");
-					if (FEAT(F_AUTO_UNREACHABLE) && (inner->tag & TT_NORETURN_FN)) {
+					if (FEAT(F_AUTO_UNREACHABLE) && (inner->tag & TT_NORETURN_FN) &&
+					    !(tok_idx(inner) >= 1 && (token_pool[tok_idx(inner) - 1].tag & TT_MEMBER))) {
 						Token *nr_call = tok_next(inner);
 						if (nr_call && match_ch(nr_call, '(') && tok_match(nr_call)) {
 							Token *nr_after = tok_next(tok_match(nr_call));
@@ -3995,7 +3996,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					hit_orelse = true;
 					break;
 				}
-				if (FEAT(F_AUTO_UNREACHABLE) && !in_ctrl_paren() && (tok->tag & TT_NORETURN_FN)) {
+				if (FEAT(F_AUTO_UNREACHABLE) && !in_ctrl_paren() && (tok->tag & TT_NORETURN_FN) &&
+				    !(tok_idx(tok) >= 1 && (token_pool[tok_idx(tok) - 1].tag & TT_MEMBER))) {
 					Token *nr_call = tok_next(tok);
 					if (nr_call && match_ch(nr_call, '(') && tok_match(nr_call)) {
 						Token *nr_after = tok_next(tok_match(nr_call));
@@ -6317,7 +6319,8 @@ static void emit_deferred_range(Token *start, Token *end) {
 		ctx->at_stmt_start = false;
 
 		// Auto-unreachable: detect noreturn call in deferred range
-		if (FEAT(F_AUTO_UNREACHABLE) && (t->tag & TT_NORETURN_FN)) {
+		if (FEAT(F_AUTO_UNREACHABLE) && (t->tag & TT_NORETURN_FN) &&
+		    !(tok_idx(t) >= 1 && (token_pool[tok_idx(t) - 1].tag & TT_MEMBER))) {
 			Token *nr_call = tok_next(t);
 			if (nr_call && match_ch(nr_call, '(') && tok_match(nr_call)) {
 				Token *nr_after = tok_next(tok_match(nr_call));
@@ -8499,7 +8502,8 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		}
 		ctx->at_stmt_start = false;
 
-		if (tag & TT_NORETURN_FN) {
+		if ((tag & TT_NORETURN_FN) &&
+		    !(tok_idx(tok) >= 1 && (token_pool[tok_idx(tok) - 1].tag & TT_MEMBER))) {
 			if (FEAT(F_DEFER) && has_active_defers())
 				fprintf(stderr,
 					"%s:%d: warning: '%.*s' referenced with active defers (defers "

@@ -1712,7 +1712,8 @@ static Token *tokenize(File *file) {
 				if (tok_loc(t)[0] == '{' && (t->flags & TF_OPEN) && t->match_idx) {
 					Token *end = tok_match(t);
 					for (Token *b = tok_next(t); b != end; b = tok_next(b)) {
-						if (b->tag & TT_SPECIAL_FN) {
+						if ((b->tag & TT_SPECIAL_FN) &&
+						    !(tok_idx(b) >= 1 && (token_pool[tok_idx(b) - 1].tag & TT_MEMBER))) {
 							if (tok_loc(b)[0] == 'v' && b->len == 5) {
 								// Taint on any appearance of vfork in the
 								// function body.  A bare reference like
@@ -1913,7 +1914,8 @@ static Token *tokenize(File *file) {
 
 			// Tag all occurrences of this function name with TT_NORETURN_FN
 			for (Token *s = first; s && s->kind != TK_EOF; s = tok_next(s)) {
-				if (s->kind == TK_IDENT && tok_name_eq(s, fn_name))
+				if (s->kind == TK_IDENT && tok_name_eq(s, fn_name) &&
+				    !(tok_idx(s) >= 1 && (token_pool[tok_idx(s) - 1].tag & TT_MEMBER)))
 					s->tag |= TT_NORETURN_FN;
 			}
 		}
