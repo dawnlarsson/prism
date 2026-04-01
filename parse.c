@@ -217,7 +217,8 @@ struct Token {
 	uint8_t  kind;
 	uint8_t  flags;
 	uint8_t  ann;         // Pass 1 annotation flags (P1_SCOPE_*, P1_OE_*, P1_IS_DECL)
-}; // 20 bytes (19 used + 1 padding)
+	uint8_t  ch0;         // First source byte — avoids tok_loc() indirection in hot paths
+}; // 20 bytes (all used)
 
 typedef struct {
 	uint32_t loc_offset;  // Byte offset from File->contents
@@ -842,18 +843,17 @@ static void warn_tok(Token *tok, const char *fmt, ...) {
 }
 
 static inline bool equal_n(Token *tok, const char *op, size_t len) {
-	char *loc = tok_loc(tok);
-	return tok->len == (int)len && (uint8_t)loc[0] == (uint8_t)op[0] &&
-	       !memcmp(loc + 1, op + 1, len - 1);
+	return tok->len == (int)len && tok->ch0 == (uint8_t)op[0] &&
+	       !memcmp(tok_loc(tok) + 1, op + 1, len - 1);
 }
 
 static inline bool _equal_1(Token *tok, char c) {
-	return tok->len == 1 && (uint8_t)tok_loc(tok)[0] == (uint8_t)c;
+	return tok->len == 1 && tok->ch0 == (uint8_t)c;
 }
 
 static inline bool _equal_2(Token *tok, const char *s) {
-	char *loc = tok_loc(tok);
-	return tok->len == 2 && loc[0] == s[0] && loc[1] == s[1];
+	if (tok->len != 2 || tok->ch0 != (uint8_t)s[0]) return false;
+	return tok_loc(tok)[1] == s[1];
 }
 
 static inline uintptr_t keyword_lookup(char *key, int keylen) {
@@ -869,7 +869,7 @@ static inline uintptr_t keyword_lookup(char *key, int keylen) {
 
 static inline bool is_potential_func_name(Token *tok) {
 	Token *next = tok_next(tok);
-	return tok->kind <= TK_KEYWORD && next && tok_loc(next)[0] == '(' &&
+	return tok->kind <= TK_KEYWORD && next && next->ch0 == '(' &&
 	       (next->flags & TF_OPEN) &&
 	       !(tok->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_ATTR));
 }
@@ -1177,6 +1177,7 @@ static inline __attribute__((always_inline)) Token *new_token(TokenKind kind, ch
 	tok->match_idx = 0;
 	tok->flags = (ts->at_bol ? TF_AT_BOL : 0) | (ts->has_space ? TF_HAS_SPACE : 0);
 	tok->ann = 0;
+	tok->ch0 = (uint8_t)*start;
 	TokenCold *c = tok_cold(tok);
 	c->loc_offset = (uint32_t)(start - ctx->current_file->contents);
 	{
@@ -1276,7 +1277,7 @@ static inline void classify_punct(Token *t) {
 }
 
 static inline bool delimiters_match(Token *open, Token *close) {
-	char a = tok_loc(open)[0], b = tok_loc(close)[0];
+	char a = open->ch0, b = close->ch0;
 	return a == '(' ? b == ')' : b == a + 2;
 }
 
@@ -1289,16 +1290,16 @@ static Token *find_wrapper_callee(Token *body) {
 	if (!end) return NULL;
 
 	Token *tok = tok_next(body);
-	while (tok && tok != end && tok_loc(tok)[0] == ';') tok = tok_next(tok);
+	while (tok && tok != end && tok->ch0 == ';') tok = tok_next(tok);
 	if (tok && tok != end && (tok->tag & TT_RETURN)) tok = tok_next(tok);
-	while (tok && tok != end && tok_loc(tok)[0] == ';') tok = tok_next(tok);
+	while (tok && tok != end && tok->ch0 == ';') tok = tok_next(tok);
 
 	if (!tok || tok == end || tok->kind != TK_IDENT) return NULL;
 	Token *open = tok_next(tok);
-	if (!open || tok_loc(open)[0] != '(' || !tok_match(open)) return NULL;
+	if (!open || open->ch0 != '(' || !tok_match(open)) return NULL;
 
 	Token *after = tok_next(tok_match(open));
-	while (after && after != end && tok_loc(after)[0] == ';') after = tok_next(after);
+	while (after && after != end && after->ch0 == ';') after = tok_next(after);
 	return after == end ? tok : NULL;
 }
 
@@ -1651,6 +1652,7 @@ static Token *tokenize(File *file) {
 				p[0] = norm[0];
 				if (abs_len == 4) p[1] = norm[1]; // %:%: -> ##
 				t->len = (abs_len == 4) ? 2 : 1;
+				t->ch0 = (uint8_t)norm[0];
 			}
 			classify_punct(t);
 			p += abs_len;
@@ -1679,7 +1681,7 @@ static Token *tokenize(File *file) {
 				}
 				stack[sp++] = t;
 				Token *tn = tok_next(t);
-				if (tok_loc(t)[0] == '[' && tn && tok_loc(tn)[0] == '[' && (tn->flags & TF_OPEN))
+				if (t->ch0 == '[' && tn && tn->ch0 == '[' && (tn->flags & TF_OPEN))
 					t->flags |= TF_C23_ATTR;
 			} else if (t->flags & TF_CLOSE) {
 				if (sp == 0) error_tok(t, "unmatched closing delimiter");
@@ -1687,14 +1689,14 @@ static Token *tokenize(File *file) {
 				if (!delimiters_match(open, t))
 					error_tok(t,
 						  "mismatched closing delimiter '%c' for opener '%c'",
-						  tok_loc(t)[0],
-						  tok_loc(open)[0]);
+						  t->ch0,
+						  open->ch0);
 				open->match_idx = tok_idx(t);
 				t->match_idx = tok_idx(open);
 			}
 		}
 		if (sp > 0)
-			error_tok(stack[sp - 1], "unclosed delimiter '%c'", tok_loc(stack[sp - 1])[0]);
+			error_tok(stack[sp - 1], "unclosed delimiter '%c'", stack[sp - 1]->ch0);
 
 		// Pre-scan function bodies: tag '{' with TT_SPECIAL_FN / TT_ASM / TT_NORETURN_FN(=vfork).
 		// Propagate special-function taint transitively through wrapper chains.
@@ -1712,12 +1714,12 @@ static Token *tokenize(File *file) {
 			for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
 				if (is_potential_func_name(t))
 					func_name = t;
-				if (tok_loc(t)[0] == '{' && (t->flags & TF_OPEN) && t->match_idx) {
+				if (t->ch0 == '{' && (t->flags & TF_OPEN) && t->match_idx) {
 					Token *end = tok_match(t);
 					for (Token *b = tok_next(t); b != end; b = tok_next(b)) {
 						if ((b->tag & TT_SPECIAL_FN) &&
 						    !(tok_idx(b) >= 1 && (token_pool[tok_idx(b) - 1].tag & TT_MEMBER))) {
-							if (tok_loc(b)[0] == 'v' && b->len == 5) {
+							if (b->ch0 == 'v' && b->len == 5) {
 								// Taint on any appearance of vfork in the
 								// function body.  A bare reference like
 								// `fp = vfork; fp();` bypasses the old
@@ -1731,7 +1733,7 @@ static Token *tokenize(File *file) {
 						if (b->tag & TT_ASM) {
 							// Only taint for asm goto — can jump to labels, bypassing defer.
 							// Regular asm (volatile, inline) is safe.
-							for (Token *ag = tok_next(b); ag && ag != end && tok_loc(ag)[0] != '('; ag = tok_next(ag))
+							for (Token *ag = tok_next(b); ag && ag != end && ag->ch0 != '('; ag = tok_next(ag))
 								if (ag->tag & TT_GOTO) { t->tag |= TT_ASM; break; }
 						}
 					}
@@ -1795,6 +1797,19 @@ static Token *tokenize(File *file) {
 			// Also propagate wrapper_taint for setjmp/asm wrappers (single pass).
 			// Use fixed-point iteration for vfork since it must cross
 			// non-wrapper boundaries (e.g. vfork returned as function pointer).
+			bool has_taint = false;
+			for (int i = 0; i < function_count; i++) {
+				if (wrapper_taint[i] || (functions[i].body->tag & (TT_SPECIAL_FN | TT_NORETURN_FN))) {
+					has_taint = true;
+					break;
+				}
+			}
+			if (has_taint) {
+			uint64_t fn_bloom = 0;
+			for (int i = 0; i < function_count; i++) {
+				Token *n = functions[i].name;
+				fn_bloom |= 1ULL << (((unsigned)n->ch0 ^ n->len) & 63);
+			}
 			do {
 				changed = false;
 				for (int i = 0; i < function_count; i++) {
@@ -1803,6 +1818,8 @@ static Token *tokenize(File *file) {
 					Token *end = tok_match(body);
 					for (Token *b = tok_next(body); b != end; b = tok_next(b)) {
 						if (b->kind != TK_IDENT)
+							continue;
+						if (!(fn_bloom & (1ULL << (((unsigned)b->ch0 ^ b->len) & 63))))
 							continue;
 						void *v = hashmap_get(&func_map, tok_loc(b), b->len);
 						if (!v) continue;
@@ -1821,6 +1838,7 @@ static Token *tokenize(File *file) {
 					}
 				}
 			} while (changed);
+			} // has_taint
 			free(func_map.buckets);
 		}
 	}
@@ -1844,9 +1862,9 @@ static Token *tokenize(File *file) {
 
 			// [[noreturn]] / [[_Noreturn]] / [[__noreturn__]] — C23 attribute
 			// Also handles namespaced forms: [[gnu::noreturn]], [[gnu::__noreturn__]]
-			if (tok_loc(t)[0] == '[' && (t->flags & TF_C23_ATTR) && t->match_idx) {
+			if (t->ch0 == '[' && (t->flags & TF_C23_ATTR) && t->match_idx) {
 				Token *inner = tok_next(t);
-				if (inner && tok_loc(inner)[0] == '[') {
+				if (inner && inner->ch0 == '[') {
 					Token *closing = &token_pool[t->match_idx];
 					for (Token *a = tok_next(inner); a && a < closing; a = tok_next(a)) {
 						if (a->kind == TK_IDENT &&
@@ -1863,9 +1881,9 @@ static Token *tokenize(File *file) {
 			// Handles comma-separated attribute lists: __attribute__((cold, noreturn))
 			if (t->kind <= TK_KEYWORD && equal(t, "__attribute__")) {
 				Token *p1 = tok_next(t);
-				if (p1 && tok_loc(p1)[0] == '(') {
+				if (p1 && p1->ch0 == '(') {
 					Token *p2 = tok_next(p1);
-					if (p2 && tok_loc(p2)[0] == '(' && p2->match_idx) {
+					if (p2 && p2->ch0 == '(' && p2->match_idx) {
 						Token *close = &token_pool[p2->match_idx];
 						for (Token *a = tok_next(p2); a && a < close; a = tok_next(a)) {
 							if (a->kind == TK_IDENT &&
@@ -1881,7 +1899,7 @@ static Token *tokenize(File *file) {
 			// __declspec(noreturn) or __declspec(__noreturn__) — MSVC
 			if (t->kind <= TK_KEYWORD && equal(t, "__declspec")) {
 				Token *p1 = tok_next(t);
-				if (p1 && tok_loc(p1)[0] == '(' && p1->match_idx) {
+				if (p1 && p1->ch0 == '(' && p1->match_idx) {
 					Token *close = &token_pool[p1->match_idx];
 					for (Token *a = tok_next(p1); a && a < close; a = tok_next(a)) {
 						if (a->kind == TK_IDENT &&
@@ -1899,10 +1917,10 @@ static Token *tokenize(File *file) {
 			// the last TK_IDENT before the first depth-0 '(' before ';' or '{'.
 			Token *fn_name = NULL;
 			for (Token *s = scan_start; s && s->kind != TK_EOF; s = tok_next(s)) {
-				char ch = tok_loc(s)[0];
+				char ch = s->ch0;
 				if (ch == ';' || ch == '{') break;
 				if (s->kind == TK_IDENT && tok_next(s) &&
-				    tok_loc(tok_next(s))[0] == '(') {
+				    tok_next(s)->ch0 == '(') {
 					// Skip known type/qualifier keywords
 					if (s->tag & (TT_SKIP_DECL | TT_INLINE | TT_QUALIFIER |
 						       TT_TYPE | TT_STORAGE))
@@ -1921,8 +1939,15 @@ static Token *tokenize(File *file) {
 
 		// Single O(N) pass to tag all occurrences of noreturn function names
 		if (nr_map.used > 0) {
+			uint64_t nr_bloom = 0;
+			for (int i = 0; i < nr_map.capacity; i++) {
+				HashEntry *ent = &nr_map.buckets[i];
+				if (ent->key && ent->key != TOMBSTONE)
+					nr_bloom |= 1ULL << (((unsigned char)ent->key[0] ^ ent->key_len) & 63);
+			}
 			for (Token *s = first; s && s->kind != TK_EOF; s = tok_next(s)) {
 				if (s->kind == TK_IDENT &&
+				    (nr_bloom & (1ULL << (((unsigned)s->ch0 ^ s->len) & 63))) &&
 				    !(tok_idx(s) >= 1 && (token_pool[tok_idx(s) - 1].tag & TT_MEMBER)) &&
 				    hashmap_get(&nr_map, tok_loc(s), s->len))
 					s->tag |= TT_NORETURN_FN;

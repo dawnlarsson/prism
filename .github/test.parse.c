@@ -7339,6 +7339,30 @@ static void test_auto_unreachable_user_noreturn_member_no_inject(void) {
 	prism_free(&r);
 }
 
+// Regression test: deeply nested braceless for-init loops must transpile
+// in approximately linear time.  Before the fix, find_bare_orelse scanned
+// O(N) tokens per statement start, causing O(N^2) total.  With 2048 nested
+// for-loops, pre-fix took >0.5s; post-fix <0.05s.
+static void test_nested_for_init_linear_scaling(void) {
+	// Build source: int main(void) { for(int v0=0;;) for(int v1=0;;) ... return 0; }
+	int depth = 2048;
+	size_t cap = (size_t)depth * 30 + 128;
+	char *src = malloc(cap);
+	int pos = 0;
+	pos += snprintf(src + pos, cap - pos, "int main(void) {\n");
+	for (int i = 0; i < depth; i++)
+		pos += snprintf(src + pos, cap - pos, "for(int v%d=0;;)\n", i);
+	pos += snprintf(src + pos, cap - pos, "return 0;\n}\n");
+
+	PrismResult r = prism_transpile_source(src, "nested_for.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "nested for-init linear: 2048-deep braceless for transpiles");
+	CHECK(r.output != NULL,
+		 "nested for-init linear: output generated");
+	prism_free(&r);
+	free(src);
+}
+
 void run_parse_tests(void) {
 	printf("\n=== PARSE TESTS ===\n");
 
@@ -7861,4 +7885,7 @@ void run_parse_tests(void) {
 	test_auto_unreachable_member_dot_no_inject();
 	test_auto_unreachable_member_arrow_no_inject();
 	test_auto_unreachable_user_noreturn_member_no_inject();
+
+	// Deeply nested for-init quadratic fix
+	test_nested_for_init_linear_scaling();
 }
