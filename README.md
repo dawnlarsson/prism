@@ -3,9 +3,9 @@
 ![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-3895_passing-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
 
 ## Robust C by default
-**A dialect of C with `defer`, `orelse`, and automatic zero-initialization.**
+**A dialect of C with `defer`, `orelse`, automatic zero-initialization, and progressive optimization.**
 
-Prism is a lightweight and very fast transpiler that makes C safer without changing how you write it.
+Prism is a lightweight and very fast transpiler that makes C safer and faster without changing how you write it.
 
 - **3895 tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
@@ -332,6 +332,36 @@ Use `-fno-safety` to turn safety errors into warnings (for gradual adoption):
 prism -fno-safety legacy.c  # Compiles with warnings instead of errors
 ```
 
+## Auto-Unreachable
+
+Prism is not just a transpiler that adds explicit features — it is a progressive enhancement engine for standard C. Your binaries get smaller and faster automatically, without changing a single line of source.
+
+Prism tracks `_Noreturn`, `[[noreturn]]`, `__attribute__((noreturn))`, and standard library exit functions (`exit`, `abort`, `_Exit`, `quick_exit`) across your entire translation unit — including through transitive call chains. After every call to one of these functions, Prism silently injects `__builtin_unreachable()` (or `__assume(0)` on MSVC).
+
+```c
+void fatal(const char *msg) __attribute__((noreturn));
+
+int process(int *data) {
+    if (!data) fatal("null pointer");
+    // Without Prism: compiler doesn't know fatal() never returns.
+    //   It emits a branch, preserves registers, generates a dead path.
+    // With Prism: __builtin_unreachable() tells the backend this path is dead.
+    //   The compiler eliminates the dead code and optimizes the live path.
+    return data[0] + data[1];
+}
+```
+
+This feeds explicit control-flow termination data to the backend compiler, enabling:
+
+- **Dead-code elimination** — unreachable paths after noreturn calls are removed entirely
+- **Smaller functions** — unnecessary epilogues and stack cleanup are dropped
+- **Better register allocation** — the compiler knows which paths are live
+- **Improved branch prediction** — fewer branches means fewer mispredictions
+
+The optimization propagates transitively: if `wrapper()` calls `fatal()`, and Prism sees that `wrapper` always exits via a noreturn path, callers of `wrapper` benefit too.
+
+**Opt-out:** `prism -fno-auto-unreachable src.c`
+
 ## Multi-File & Passthrough
 
 Prism handles real-world build scenarios:
@@ -369,7 +399,7 @@ Not:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v1.0.1 - Robust C transpiler
+Prism v1.0.2 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 

@@ -1,8 +1,11 @@
-// parse.c - C tokenizer. Expects preprocessed input (cc -E).
-// Based on https://github.com/rui314/chibicc (MIT License)
-
+// Prism parse - C tokenizer. Expects preprocessed input (cc -E).
+//
 // Thread-local storage qualifier: all per-invocation mutable state uses this
 // for thread safety. Each thread gets its own copy.
+//
+// Originally based of https://github.com/rui314/chibicc (MIT License)
+//
+
 #if defined(_MSC_VER)
 #define PRISM_THREAD_LOCAL __declspec(thread)
 #else
