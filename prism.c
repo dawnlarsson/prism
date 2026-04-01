@@ -1740,51 +1740,7 @@ static void reject_orelse_side_effects(Token *start, Token *end,
 	}
 }
 
-// Reject bare orelse when the RHS contains a cast or compound literal with
-// a variably-modified type (VLA pointer cast).  __typeof__(RHS) evaluates
-// the operand at runtime for VM types (ISO C11 §6.7.2.5), causing the
-// RHS expression (including function calls and side-effects) to execute
-// twice: once inside typeof and once in the initializer.
-//
-// Detection: scan RHS for any parenthesized type expression containing
-// array brackets [dim] with a non-constant dimension (identifier that
-// isn't a type keyword).  Covers (T(*)[n])expr and (T[n]){...}.
-static void reject_bare_orelse_vla_cast(Token *rhs_start, Token *rhs_end,
-					Token *orelse_tok) {
-	static const char msg[] =
-		"bare orelse with a VLA-type cast in the RHS "
-		"causes double evaluation — 'typeof(RHS)' "
-		"evaluates the operand at runtime for variably-"
-		"modified types (ISO C11 6.7.2.5); hoist the "
-		"cast result to a temporary variable before "
-		"the orelse expression";
-	for (Token *s = rhs_start; s && s != rhs_end && s->kind != TK_EOF; s = tok_next(s)) {
-		if (!match_ch(s, '(') || !(s->flags & TF_OPEN)) continue;
-		Token *inner = tok_next(s);
-		if (!inner || inner == rhs_end) continue;
-		// Cast/compound-literal check: first meaningful token must be a type
-		if (!(inner->tag & (TT_TYPE | TT_SUE | TT_TYPEOF | TT_QUALIFIER))
-		    && !is_known_typedef(inner))
-			continue;
-		Token *cast_close = tok_match(s);
-		if (!cast_close) continue;
-		// Scan inside cast parens for VLA typedef names or [dim] with
-		// non-constant dim
-		for (Token *t = inner; t && t != cast_close; t = tok_next(t)) {
-			if (is_identifier_like(t) && is_vla_typedef(t))
-				error_tok(orelse_tok, msg);
-			if (!match_ch(t, '[') || !(t->flags & TF_OPEN)) continue;
-			Token *bc = tok_match(t);
-			if (!bc) continue;
-			for (Token *d = tok_next(t); d && d != bc; d = tok_next(d)) {
-				if (d->kind == TK_IDENT && !is_type_keyword(d))
-					error_tok(orelse_tok, msg);
-			}
-		}
-		// Skip past this paren group
-		s = cast_close;
-	}
-}
+
 
 // Emit type tokens, optionally stripping const and struct/enum bodies.
 static void emit_type_stripped(Token *start, Token *end, bool strip_const) {
@@ -6107,10 +6063,6 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 					  true, false, true);
 	}
 
-	// Defense-in-depth: VLA cast in RHS (Phase 1D is primary check)
-	if (is_bare_fallback)
-		reject_bare_orelse_vla_cast(tok_next(bare_assign_eq), orelse_tok, orelse_tok);
-
 	if (!is_bare_fallback)
 		return NULL;  // caller handles non-bare fallback
 
@@ -6185,28 +6137,22 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 			}
 			OUT_LIT("));");
 		} else {
-			// Temp-based (volatile-safe, single-write, truncation-safe):
-			// Evaluates RHS into a __typeof__ temp, writes LHS exactly once.
+			// Temp-based (volatile-safe, single-write):
+			// Evaluates RHS into a __typeof__(LHS) temp, writes LHS once.
 			//
-			// Single link: ternary assignment preserves compound literal
-			// lifetime (C11 6.5.2.5p5) and volatile single-write semantics.
-			//   { typeof(a) t0=(a); LHS = t0 ? t0 : (fb); }
+			// typeof(LHS) is used instead of typeof(RHS) to avoid
+			// double-evaluation when RHS yields a variably-modified
+			// type (C23 §6.7.2.5p3 / C11 §6.7.6.2p4): typeof(EXPR)
+			// evaluates its operand when the result type is VM.
+			// LHS is guaranteed side-effect-free by Phase 1D
+			// (reject_orelse_side_effects), so typeof(LHS) is safe.
 			//
-			// Chained: nested if/else with per-link __typeof__ temps.
-			// Each intermediate fallback gets its own temp to prevent
-			// narrowing truncation when fallback types are wider.
-			// Last link uses ternary for compound literal lifetime.
-			//   { typeof(a) t0=(a); if(t0){LHS=t0;}else{
-			//     typeof(b) t1=(b); LHS = t1 ? t1 : (c); } }
-			//
-			// SAFETY: VLA casts in the RHS are rejected in Phase 1D
-			// (reject_bare_orelse_vla_cast).  __typeof__(RHS) evaluates the
-			// operand at runtime for variably-modified types (C11 6.7.2.5),
-			// which would cause double evaluation.  Phase 1D ensures this
-			// path is never reached with a VLA-cast RHS.
+			// Single:  { typeof(LHS) t0=(a); LHS = t0 ? t0 : (fb); }
+			// Chained: { typeof(LHS) t0=(a); if(t0){LHS=t0;}else{
+			//            typeof(LHS) t1=(b); LHS = t1 ? t1 : (c); } }
 			unsigned oe_id = ctx->ret_counter++;
 			OUT_LIT("{ "); emit_typeof_keyword(); out_char('(');
-			emit_balanced_range(tok_next(bare_assign_eq), orelse_tok);
+			emit_range_no_prep(bare_lhs_start, bare_assign_eq);
 			OUT_LIT(") __prism_oe_");
 			out_uint(oe_id);
 			OUT_LIT(" = (");
@@ -6214,9 +6160,9 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 			OUT_LIT(");");
 			t = after_orelse;
 			{
-				// Chained: nested if/else with per-link temps to
-				// prevent intermediate truncation. Single link
-				// hits is_last immediately (nest stays 0, no-op).
+				// Chained: nested if/else with per-link LHS-typed
+				// temps. Single link hits is_last immediately
+				// (nest stays 0, no-op).
 				int nest = 0;
 				while (true) {
 					bool is_last = !orelse_has_chain(t, comma_term);
@@ -6268,7 +6214,7 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 					}
 					oe_id = ctx->ret_counter++;
 					emit_typeof_keyword(); out_char('(');
-					emit_balanced_range(fb_start, fb_orelse);
+					emit_range_no_prep(bare_lhs_start, bare_assign_eq);
 					OUT_LIT(") __prism_oe_");
 					out_uint(oe_id);
 					OUT_LIT(" = (");
@@ -7994,15 +7940,6 @@ uint16_t sid = next_scope_id++;
 						eq_tok = s;
 						break;
 					}
-				}
-				// VLA cast in RHS → typeof(RHS) double evaluation
-				if (has_eq && eq_tok) {
-					Token *after_oe = tok_next(bare_oe);
-					bool is_value_fb = after_oe &&
-					    !(after_oe->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
-					    !match_ch(after_oe, '{') && !match_ch(after_oe, ';');
-					if (is_value_fb)
-						reject_bare_orelse_vla_cast(tok_next(eq_tok), bare_oe, bare_oe);
 				}
 				Token *after_oe = tok_next(bare_oe);
 				if (after_oe && !has_eq &&

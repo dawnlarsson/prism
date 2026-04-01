@@ -4419,16 +4419,15 @@ static void test_bare_orelse_compound_literal_detection(void) {
 }
 
 static void test_bare_orelse_typeof_vla_cast_double_eval(void) {
-	printf("\n--- Bare orelse typeof VLA cast double evaluation (audit round 49) ---\n");
+	printf("\n--- Bare orelse VLA cast: safe via typeof(LHS) ---\n");
 
-	// Bug: emit_bare_orelse_impl emitted __typeof__(RHS) temp = (RHS);
-	// When RHS contains a VLA cast like (int(*)[n])get_chunk(16), the result
-	// type int(*)[n] is variably modified, so __typeof__ evaluates its operand
-	// at runtime (ISO C11 6.7.2.5). This causes get_chunk() to be called twice
-	// and n to be evaluated twice. Fix: reject VLA casts in bare orelse RHS
-	// in Phase 1D; user must hoist the cast result to a temp variable.
+	// Fixed: emit_bare_orelse_impl now uses __typeof__(LHS) instead of
+	// __typeof__(RHS).  VLA casts in the RHS are safe because the
+	// typeof operand is the side-effect-free LHS, and the RHS
+	// (including VLA casts and function calls) is evaluated only once
+	// in the initializer.  These tests now expect acceptance.
 
-	// Sub-test 1: VLA pointer cast with function call — must be rejected
+	// Sub-test 1: VLA pointer cast with function call — safe via typeof(LHS)
 	{
 		const char *code =
 		    "void *get_chunk(int size);\n"
@@ -4438,15 +4437,11 @@ static void test_bare_orelse_typeof_vla_cast_double_eval(void) {
 		    "    (void)ptr;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vla_cast_double1.c", prism_defaults());
-		CHECK(r.status != PRISM_OK, "vla-cast-double-eval: must be rejected");
-		CHECK(r.error_msg != NULL, "vla-cast-double-eval: error message present");
-		if (r.error_msg)
-			CHECK(strstr(r.error_msg, "VLA") != NULL,
-			      "vla-cast-double-eval: error mentions VLA");
+		CHECK_EQ(r.status, PRISM_OK, "vla-cast-double-eval: accepted (typeof(LHS) is safe)");
 		prism_free(&r);
 	}
 
-	// Sub-test 2: VLA cast with side-effect dimension (n++) — must be rejected
+	// Sub-test 2: VLA cast with side-effect dimension (n++) — safe via typeof(LHS)
 	{
 		const char *code =
 		    "void *get_chunk(int size);\n"
@@ -4456,11 +4451,7 @@ static void test_bare_orelse_typeof_vla_cast_double_eval(void) {
 		    "    (void)ptr;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vla_cast_double2.c", prism_defaults());
-		CHECK(r.status != PRISM_OK, "vla-cast-n++: must be rejected");
-		CHECK(r.error_msg != NULL, "vla-cast-n++: error message present");
-		if (r.error_msg)
-			CHECK(strstr(r.error_msg, "VLA") != NULL,
-			      "vla-cast-n++: error mentions VLA");
+		CHECK_EQ(r.status, PRISM_OK, "vla-cast-n++: accepted (typeof(LHS) is safe)");
 		prism_free(&r);
 	}
 
@@ -4505,6 +4496,97 @@ static void test_bare_orelse_typeof_vla_cast_double_eval(void) {
 		PrismResult r = prism_transpile_source(code, "vla_action_ok.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
 			 "vla-cast-action-orelse: valid (action orelse uses if, no typeof)");
+		prism_free(&r);
+	}
+}
+
+static void test_bare_orelse_vm_type_double_eval(void) {
+	printf("\n--- Bare orelse VM-type expression double-eval (typeof(LHS) fix) ---\n");
+
+	// Bug: bare orelse emitted __typeof__(RHS) temp = (RHS), which
+	// double-evaluates RHS when its C type is variably modified (VM).
+	// Per C23 §6.7.2.5p3, typeof(EXPR) evaluates its operand when
+	// the expression type is VM.  An array of VLA pointers subscripted
+	// with a function call (vla_ptrs[get_index()]) yields VM type
+	// int(*)[n], causing typeof to call get_index() a second time.
+	// Fix: use typeof(LHS) — the LHS is always a side-effect-free
+	// lvalue (enforced by reject_orelse_side_effects), so typeof(LHS)
+	// never triggers dangerous operand evaluation.
+
+	// Sub-test 1: VM-type RHS via VLA pointer array subscript — single eval
+	{
+		const char *code =
+		    "#include <stdio.h>\n"
+		    "int call_count = 0;\n"
+		    "int get_index(void) { return call_count++; }\n"
+		    "int main(void) {\n"
+		    "    int n = 5;\n"
+		    "    int target[5] = {0};\n"
+		    "    int (*vla_ptrs[2])[n];\n"
+		    "    vla_ptrs[0] = &target;\n"
+		    "    vla_ptrs[1] = &target;\n"
+		    "    int (*ptr)[n];\n"
+		    "    ptr = vla_ptrs[get_index()] orelse return 1;\n"
+		    "    if (call_count != 1) return 2;\n"
+		    "    (void)ptr;\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vm_double1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "vm-double-eval: transpiles OK");
+		// Verify output uses typeof(ptr) not typeof(vla_ptrs[...])
+		if (r.output) {
+			CHECK(strstr(r.output, "get_index") != NULL,
+			      "vm-double-eval: get_index in output");
+			// typeof must reference the LHS (ptr), not the RHS expression
+			char *typeof_pos = strstr(r.output, "__typeof__");
+			if (typeof_pos) {
+				CHECK(strstr(typeof_pos, "get_index") == NULL ||
+				      strstr(typeof_pos, "get_index") > strstr(typeof_pos, ")"),
+				      "vm-double-eval: typeof does NOT contain get_index (uses LHS)");
+			}
+		}
+		prism_free(&r);
+	}
+
+	// Sub-test 2: VM-type chained orelse — all temps use typeof(LHS)
+	{
+		const char *code =
+		    "int call_a = 0, call_b = 0;\n"
+		    "int get_a(void) { return call_a++; }\n"
+		    "int get_b(void) { return call_b++; }\n"
+		    "void f(int n) {\n"
+		    "    int target[5] = {0};\n"
+		    "    int (*vla_ptrs[2])[n];\n"
+		    "    vla_ptrs[0] = &target;\n"
+		    "    vla_ptrs[1] = &target;\n"
+		    "    int (*ptr)[n];\n"
+		    "    ptr = vla_ptrs[get_a()] orelse vla_ptrs[get_b()] orelse 0;\n"
+		    "    (void)ptr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vm_double2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "vm-double-eval-chain: transpiles OK");
+		// Both temps must exist (chained if/else)
+		if (r.output) {
+			CHECK(strstr(r.output, "__prism_oe_0") != NULL,
+			      "vm-double-eval-chain: first temp exists");
+			CHECK(strstr(r.output, "__prism_oe_1") != NULL,
+			      "vm-double-eval-chain: second temp exists");
+		}
+		prism_free(&r);
+	}
+
+	// Sub-test 3: Non-VM RHS still works (regression guard)
+	{
+		const char *code =
+		    "int *get_ptr(void);\n"
+		    "void f(void) {\n"
+		    "    int fallback = 0;\n"
+		    "    int *p;\n"
+		    "    p = get_ptr() orelse &fallback;\n"
+		    "    (void)p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "non_vm_ok.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "non-vm-bare-orelse: transpiles OK");
 		prism_free(&r);
 	}
 }
@@ -5335,16 +5417,14 @@ static void test_orelse_sideeffect_false_positive_on_action(void) {
 // statement expression — produces non-portable code and invalid C if the
 // block doesn't return a value.
 static void test_bare_orelse_vla_typedef_cast_bypass(void) {
-	printf("\n--- Bare orelse VLA typedef cast bypass ---\n");
+	printf("\n--- Bare orelse VLA typedef cast: safe via typeof(LHS) ---\n");
 
-	// Bug: reject_bare_orelse_vla_cast scans for '[' inside cast parens
-	// to detect VLA casts, but a typedef aliasing a VLA (e.g. typedef int
-	// VLA_Type[n]) contains no '[' inside the cast. The scanner sees
-	// (VLA_Type*) and approves it. emit_bare_orelse_impl then emits
-	// __typeof__((VLA_Type*)trigger()) which is a variably-modified type,
-	// causing typeof to evaluate trigger() at runtime — double evaluation.
+	// Previously: reject_bare_orelse_vla_cast scanned for '[' inside cast
+	// parens but missed VLA typedefs. Now fixed by using typeof(LHS) instead
+	// of typeof(RHS) — the VLA cast is only in the RHS initializer, evaluated
+	// once. These tests verify VLA typedef casts are accepted.
 
-	// Sub-test 1: VLA typedef pointer cast — must be rejected
+	// Sub-test 1: VLA typedef pointer cast — safe via typeof(LHS)
 	{
 		const char *code =
 		    "void *trigger(void);\n"
@@ -5355,11 +5435,8 @@ static void test_bare_orelse_vla_typedef_cast_bypass(void) {
 		    "    (void)ptr;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vla_td_cast1.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "vla-typedef-cast: must be rejected (VM type in typeof)");
-		if (r.error_msg)
-			CHECK(strstr(r.error_msg, "VLA") != NULL,
-			      "vla-typedef-cast: error mentions VLA");
+		CHECK_EQ(r.status, PRISM_OK,
+		      "vla-typedef-cast: accepted (typeof(LHS) is safe)");
 		prism_free(&r);
 	}
 
@@ -5379,7 +5456,7 @@ static void test_bare_orelse_vla_typedef_cast_bypass(void) {
 		prism_free(&r);
 	}
 
-	// Sub-test 3: VLA typedef without pointer (bare VLA_Type cast) — must be rejected
+	// Sub-test 3: VLA typedef without pointer (bare VLA_Type cast) — safe via typeof(LHS)
 	{
 		const char *code =
 		    "void *trigger(void);\n"
@@ -5390,8 +5467,8 @@ static void test_bare_orelse_vla_typedef_cast_bypass(void) {
 		    "    (void)ptr;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vla_td_cast3.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "vla-typedef-bare-cast: must be rejected (VM type in typeof)");
+		CHECK_EQ(r.status, PRISM_OK,
+		      "vla-typedef-bare-cast: accepted (typeof(LHS) is safe)");
 		prism_free(&r);
 	}
 }
@@ -5786,6 +5863,9 @@ void run_orelse_tests(void) {
 
 	// Audit round 49: typeof VLA cast double evaluation
 	test_bare_orelse_typeof_vla_cast_double_eval();
+
+	// VM-type bare orelse double-eval fix (typeof(LHS))
+	test_bare_orelse_vm_type_double_eval();
 
 	// Audit round 50: chained orelse intermediate truncation
 	test_bare_orelse_chained_intermediate_truncation();
