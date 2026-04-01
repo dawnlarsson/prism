@@ -6486,26 +6486,25 @@ static void p1_build_scope_tree(Token *start) {
 // Uses tok_match for O(1) bracket jumps.  Tail positions use goto; only
 // if-body and do-body use true recursion (bounded by non-braced nesting depth).
 static Token *skip_one_stmt(Token *tok) {
+	// if_depth tracks nested braceless 'if' chains iteratively to avoid
+	// stack overflow on deeply nested code (5000+ levels).  After the
+	// innermost body is resolved, unwind_if checks for 'else' at each level.
+	int if_depth = 0;
 restart:
 	tok = skip_prep_dirs(tok);
 	tok = skip_noise(tok);
 	if (!tok || tok->kind == TK_EOF) return NULL;
 
 	// Braced compound statement: O(1) via tok_match
-	if (match_ch(tok, '{'))
-		return tok_match(tok);
+	if (match_ch(tok, '{')) { tok = tok_match(tok); goto unwind_if; }
 
 	// 'if' / 'else'
 	if (tok->tag & TT_IF) {
 		if (tok_loc(tok)[0] == 'e') { tok = tok_next(tok); goto restart; }
 		Token *p = skip_prep_dirs(tok_next(tok));
 		if (!p || !match_ch(p, '(') || !tok_match(p)) return NULL;
-		Token *end = skip_one_stmt(tok_next(tok_match(p)));
-		if (!end) return NULL;
-		Token *n = skip_prep_dirs(tok_next(end));
-		if (n && (n->tag & TT_IF) && tok_loc(n)[0] == 'e')
-			{ tok = tok_next(n); goto restart; }
-		return end;
+		if_depth++;
+		tok = tok_next(tok_match(p)); goto restart;
 	}
 
 	// 'for', 'while', 'switch': keyword '(...)' body
@@ -6518,16 +6517,17 @@ restart:
 	// 'do': body then 'while' '(...)' ';'
 	if ((tok->tag & TT_LOOP) && tok_loc(tok)[0] == 'd') {
 		Token *end = skip_one_stmt(tok_next(tok));
-		if (!end) return NULL;
+		if (!end) { tok = NULL; goto unwind_if; }
 		Token *w = skip_prep_dirs(tok_next(end));
 		if (!w || !(w->tag & TT_LOOP) || !equal(w, "while")) return NULL;
 		Token *p2 = skip_prep_dirs(tok_next(w));
 		if (!p2 || !match_ch(p2, '(') || !tok_match(p2)) return NULL;
 		Token *a = skip_prep_dirs(tok_next(tok_match(p2)));
-		return (a && match_ch(a, ';')) ? a : NULL;
+		tok = (a && match_ch(a, ';')) ? a : NULL;
+		goto unwind_if;
 	}
 
-	// 'case' / 'default' label: skip expr + ':', recurse on body
+	// 'case' / 'default' label: skip expr + ':', tail-call on body
 	if ((tok->tag & (TT_CASE | TT_DEFAULT)) && !is_known_typedef(tok)) {
 		int td = 0;
 		for (Token *s = tok_next(tok); s && s->kind != TK_EOF; s = tok_next(s)) {
@@ -6544,9 +6544,20 @@ restart:
 	// Simple statement: scan to ';', skipping balanced groups via tok_match
 	for (Token *s = tok; s && s->kind != TK_EOF; s = tok_next(s)) {
 		if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; continue; }
-		if (match_ch(s, ';')) return s;
+		if (match_ch(s, ';')) { tok = s; goto unwind_if; }
 	}
 	return NULL;
+
+unwind_if:
+	while (if_depth > 0) {
+		if_depth--;
+		if (!tok) return NULL;
+		Token *n = skip_prep_dirs(tok_next(tok));
+		if (n && (n->tag & TT_IF) && tok_loc(n)[0] == 'e') {
+			tok = tok_next(n); goto restart;
+		}
+	}
+	return tok;
 }
 
 // Phase 1B: walk all tokens at all depths to build the complete typedef + enum table.
