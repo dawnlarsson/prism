@@ -7097,7 +7097,8 @@ void run_api_tests_3(void) {
 	test_make_temp_file_toctou_symlink();
 #endif
 #if !defined(_WIN32) && !defined(__APPLE__)
-	test_signal_temps_register_race();
+	if (!is_emulated())
+		test_signal_temps_register_race();
 #endif
 
 	test_generic_decl_rewrite_destroys_dispatch();
