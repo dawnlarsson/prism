@@ -4800,6 +4800,44 @@ static void test_defer_braceless_ctrl_orelse(void) {
 	}
 }
 
+// BUG87: shadowed 'defer' (variable/typedef named 'defer') suppresses block form
+static void test_defer_shadow_variable_block(void) {
+	// A local variable named 'defer' should not disable block form 'defer {}'
+	const char *code =
+	    "int log_count;\n"
+	    "void f(void) {\n"
+	    "    int defer = 5;\n"
+	    "    (void)defer;\n"
+	    "    defer { log_count++; }\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "shadow_defer_var.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "shadow-defer-var: variable named 'defer' must not suppress block form");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "log_count++") != NULL,
+		      "shadow-defer-var: defer body must be emitted");
+	}
+	prism_free(&r);
+}
+
+static void test_defer_shadow_typedef_block(void) {
+	// A typedef named 'defer' should not disable block form 'defer {}'
+	const char *code =
+	    "typedef int defer;\n"
+	    "int log_count;\n"
+	    "void f(void) {\n"
+	    "    defer { log_count++; }\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "shadow_defer_typedef.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "shadow-defer-typedef: typedef named 'defer' must not suppress block form");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "log_count++") != NULL,
+		      "shadow-defer-typedef: defer body must be emitted");
+	}
+	prism_free(&r);
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -5296,4 +5334,8 @@ void run_defer_tests(void) {
 		      "taint-fp-chain: error mentions vfork");
 		prism_free(&r);
 	}
+
+	// BUG87: shadowed 'defer' keyword suppression
+	test_defer_shadow_variable_block();
+	test_defer_shadow_typedef_block();
 }

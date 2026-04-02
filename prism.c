@@ -1751,9 +1751,52 @@ static Token *find_struct_body_brace(Token *tok) {
 
 // Quick pre-check: is this a variable declaration (not a function decl or stmt expr)?
 
+// Shadow-aware orelse keyword check for Phase 1: real typedefs suppress,
+// variable/enum shadows do not (they can't be type names).
+// Used in contexts where positional disambiguation is available (bracket
+// orelse, initializer scans, emit_token_range_orelse).
+static inline bool is_orelse_kw_shadow(Token *tok) {
+	if (!(tok->tag & TT_ORELSE)) return false;
+	TypedefEntry *te = typedef_lookup(tok);
+	return !te || te->is_shadow;
+}
+
+// Strict orelse keyword check: any typedef table match suppresses.
+// Used by find_bare_orelse and statement-level bare orelse detection where
+// positional disambiguation is unreliable (e.g. (void)orelse;).
+static inline bool is_orelse_kw(Token *tok) {
+	if (!(tok->tag & TT_ORELSE)) return false;
+	return !typedef_lookup(tok);
+}
+
+// When orelse has a shadow entry (variable/enum named 'orelse' in scope),
+// only treat as keyword if the preceding token ends an expression (infix
+// position).  In declarator-name position (after type/qualifier/*) or at
+// the start of a statement/paren group (prev==NULL/(/{), it's a name.
+static inline bool orelse_shadow_is_kw(Token *prev) {
+	if (!prev) return false;
+	if (prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE | TT_TYPEOF | TT_BITINT))
+		return false;
+	if (match_ch(prev, '*') || match_ch(prev, '(') || match_ch(prev, '[') ||
+	    match_ch(prev, '{') || match_ch(prev, ',') || match_ch(prev, '=') ||
+	    match_ch(prev, '?') || match_ch(prev, ':') || match_ch(prev, '!') ||
+	    match_ch(prev, '~') || match_ch(prev, '&') || match_ch(prev, '-') ||
+	    match_ch(prev, '+') || match_ch(prev, ';'))
+		return false;
+	return true;
+}
+
 static inline bool is_orelse_keyword(Token *tok) {
-	if (!(tok->tag & TT_ORELSE) || typedef_lookup(tok)) return false;
-	return !(last_emitted && (last_emitted->tag & TT_MEMBER));
+	if (!(tok->tag & TT_ORELSE)) return false;
+	if (last_emitted && (last_emitted->tag & TT_MEMBER)) return false;
+	// Shadow: in Pass 2, require last_emitted to be expression-ending
+	TypedefEntry *te = typedef_lookup(tok);
+	if (te && !te->is_shadow) return false;  // real typedef suppresses
+	if (te && te->is_shadow) {
+		if (!last_emitted) return false;
+		if (!orelse_shadow_is_kw(last_emitted)) return false;
+	}
+	return true;
 }
 
 static inline bool is_assignment_operator_token(Token *tok) {
@@ -2700,7 +2743,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 				if (FEAT(F_ORELSE) && (kw->tag & (TT_BITINT | TT_ALIGNAS))) {
 					Token *close = tok_match(tok);
 					for (Token *s = tok_next(tok); s && s != close; s = tok_next(s))
-						if ((s->tag & TT_ORELSE) && !typedef_lookup(s))
+						if (is_orelse_kw_shadow(s))
 							error_tok(s, "'orelse' cannot be used inside %s "
 								  "(requires a compile-time constant expression)",
 								  (kw->tag & TT_BITINT) ? "_BitInt()" : "_Alignas()");
@@ -2885,10 +2928,13 @@ static void emit_token_range_orelse(Token *start, Token *end) {
 	Token *prev = NULL;
 	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
 		if (t->flags & TF_OPEN) { prev = tok_match(t); t = tok_match(t); continue; }
-		if ((t->tag & TT_ORELSE) && !typedef_lookup(t) &&
+		if (is_orelse_kw_shadow(t) &&
 		    !(prev && (prev->tag & TT_MEMBER))) {
-			orelse = t;
-			break;
+			TypedefEntry *te = typedef_lookup(t);
+			if (!te || orelse_shadow_is_kw(prev)) {
+				orelse = t;
+				break;
+			}
 		}
 		prev = t;
 	}
@@ -2999,7 +3045,7 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 					if (pp && tok_next(pp) == close) {
 						for (Token *p = tok_next(s); p && p != pp; p = tok_next(p)) {
 							if (p->flags & TF_OPEN) { p = tok_match(p) ? tok_match(p) : p; continue; }
-							if ((p->tag & TT_ORELSE) && !typedef_lookup(p)) {
+							if (is_orelse_kw_shadow(p)) {
 								orelse_found = p; paren_open_found = s; break;
 							}
 						}
@@ -3008,7 +3054,7 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 				if (orelse_found) break;
 				prev = tok_match(s); s = tok_match(s); continue;
 			}
-			if ((s->tag & TT_ORELSE) && !typedef_lookup(s) &&
+			if (is_orelse_kw_shadow(s) &&
 			    !(prev && (prev->tag & TT_MEMBER))) {
 				orelse_found = s;
 				break;
@@ -3083,7 +3129,7 @@ static Token *walk_balanced_orelse(Token *tok) {
 				if (pp && tok_next(pp) == end) {
 					for (Token *p = tok_next(t); p && p != pp; p = tok_next(p)) {
 						if (p->flags & TF_OPEN) { p = tok_match(p) ? tok_match(p) : p; continue; }
-						if ((p->tag & TT_ORELSE) && !typedef_lookup(p)) {
+						if (is_orelse_kw_shadow(p)) {
 							orelse_found = p; paren_open = t; break;
 						}
 					}
@@ -3092,7 +3138,7 @@ static Token *walk_balanced_orelse(Token *tok) {
 			if (orelse_found) break;
 			prev = tok_match(t); t = tok_match(t); continue;
 		}
-		if ((t->tag & TT_ORELSE) && !typedef_lookup(t) &&
+		if (is_orelse_kw_shadow(t) &&
 		    !(prev && (prev->tag & TT_MEMBER))) {
 			orelse_found = t;
 			break;
@@ -3147,7 +3193,7 @@ static Token *walk_balanced_orelse(Token *tok) {
 			}
 			// Defense-in-depth: if an 'orelse' token reaches here it was not caught by
 			// the depth-0 scan above — likely wrapped in parens deeper than one level.
-			if ((t->tag & TT_ORELSE) && !typedef_lookup(t))
+			if (is_orelse_kw_shadow(t))
 				error_tok(t, "'orelse' inside array dimension could not be transformed; "
 					   "if wrapped in outer parentheses, remove them: "
 					   "use '[f() orelse 1]' not '[(f() orelse 1)]'");
@@ -3710,10 +3756,13 @@ static void check_orelse_in_parens(Token *open) {
 			t = tok_match(t);
 			continue;
 		}
-		if ((t->tag & TT_ORELSE) && !typedef_lookup(t) && !(pi->tag & TT_MEMBER))
-			error_tok(t, "'orelse' cannot be used inside parentheses "
-				  "(it must appear at the top level of a declaration)");
-		if (FEAT(F_DEFER) && (t->tag & TT_DEFER) && !typedef_lookup(t) &&
+		if (is_orelse_kw_shadow(t) && !(pi->tag & TT_MEMBER)) {
+			TypedefEntry *te = typedef_lookup(t);
+			if (!te || orelse_shadow_is_kw(pi))
+				error_tok(t, "'orelse' cannot be used inside parentheses "
+					  "(it must appear at the top level of a declaration)");
+		}
+		if (FEAT(F_DEFER) && (t->tag & TT_DEFER) && (!typedef_lookup(t) || match_ch(tok_next(t), '{')) &&
 		    !match_ch(tok_next(t), ':') && !(pi->tag & (TT_MEMBER | TT_GOTO)) &&
 		    !(is_type_keyword(pi) || (pi->tag & TT_TYPEDEF)) && !(tok_next(t) && (tok_next(t)->tag & TT_ASSIGN)))
 			error_tok(t, "defer cannot be at top level of a parenthesized expression");
@@ -3805,18 +3854,24 @@ static OrelseInitInfo scan_decl_orelse(Token *decl_end,
 				if (!after_close || match_ch(after_close, ',') || match_ch(after_close, ';') || after_close->kind == TK_EOF) {
 					bool has_inner_orelse = false;
 					bool has_depth0_comma = false;
+					Token *prev_inner = NULL;
 					for (Token *inner = tok_next(scan); inner && inner != close; inner = tok_next(inner)) {
-						if ((inner->tag & TT_ORELSE) && !typedef_lookup(inner)) {
-							has_inner_orelse = true;
-							break;
+						if (is_orelse_kw_shadow(inner)) {
+							TypedefEntry *te_in = typedef_lookup(inner);
+							if (!te_in || orelse_shadow_is_kw(prev_inner)) {
+								has_inner_orelse = true;
+								break;
+							}
 						}
 						if (match_ch(inner, ',')) {
 							has_depth0_comma = true;
 						}
 						if (inner->flags & TF_OPEN) {
 							inner = tok_match(inner) ? tok_match(inner) : inner;
+							prev_inner = inner;
 							continue;
 						}
+						prev_inner = inner;
 					}
 					if (has_inner_orelse && !has_depth0_comma) {
 						// Unlink '(' from the stream
@@ -3850,10 +3905,13 @@ static OrelseInitInfo scan_decl_orelse(Token *decl_end,
 		if (match_ch(scan, ',') || match_ch(scan, ';')) break;
 		if (match_ch(scan, '?')) { ternary++; prev_scan = scan; scan = tok_next(scan); continue; }
 		if (match_ch(scan, ':') && ternary > 0) { ternary--; prev_scan = scan; scan = tok_next(scan); continue; }
-		if ((scan->tag & TT_ORELSE) && !typedef_lookup(scan) &&
+		if (is_orelse_kw_shadow(scan) &&
 		    !(prev_scan && (prev_scan->tag & TT_MEMBER)) && ternary == 0) {
-			info.orelse_tok = scan;
-			break;
+			TypedefEntry *te_scan = typedef_lookup(scan);
+			if (!te_scan || orelse_shadow_is_kw(prev_scan)) {
+				info.orelse_tok = scan;
+				break;
+			}
 		}
 		prev_scan = scan; scan = tok_next(scan);
 	}
@@ -4146,9 +4204,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					if (after) { tok = after; continue; }
 				}
 			// Detect 'orelse' at depth 0 in initializer
-				if (FEAT(F_ORELSE) && (tok->tag & TT_ORELSE) &&
-				    !typedef_lookup(tok) &&
-				    !(last_emitted && (last_emitted->tag & TT_MEMBER))) {
+				if (FEAT(F_ORELSE) && is_orelse_keyword(tok)) {
 					if (init_ternary > 0)
 						error_tok(tok, "'orelse' cannot be used inside a ternary expression");
 					hit_orelse = true;
@@ -4399,8 +4455,7 @@ static Token *try_zero_init_decl(Token *tok) {
 			if (aeq && match_ch(aeq, '(') && tok_next(aeq) &&
 			    match_ch(tok_next(aeq), '{') && tok_match(aeq)) {
 				Token *after_se = tok_next(tok_match(aeq));
-				bool is_orelse = after_se && (after_se->tag & TT_ORELSE) &&
-						 !typedef_lookup(after_se);
+				bool is_orelse = after_se && is_orelse_keyword(after_se);
 				if (!after_se || (!match_ch(after_se, ',') && !is_orelse)) {
 					// Bail out to verbatim emit, but still check
 					// defer shadow — process_declarators won't run.
@@ -4605,7 +4660,7 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 	if (FEAT(F_ORELSE)) {
 		for (Token *s = tok; s && s->kind != TK_EOF && !match_ch(s, ';'); s = tok_next(s)) {
 			if (s->flags & TF_OPEN) { s = tok_match(s); continue; }
-			if ((s->tag & TT_ORELSE) && !typedef_lookup(s)) {
+			if (is_orelse_kw_shadow(s)) {
 				Token *act = tok_next(s);
 				// Phase 1F: reject empty orelse action (orelse ;)
 				// Moved from Pass 2 emit_deferred_orelse.
@@ -4653,7 +4708,7 @@ static Token *handle_defer_keyword(Token *tok) {
 	// Distinguish struct field, label, goto target, variable assignment, attribute usage
 	if (match_ch(tok_next(tok), ':') || (last_emitted && (last_emitted->tag & (TT_MEMBER | TT_GOTO))) ||
 	    (last_emitted && (is_type_keyword(last_emitted) || (last_emitted->tag & TT_TYPEDEF))) ||
-	    typedef_lookup(tok) ||
+	    (typedef_lookup(tok) && !match_ch(tok_next(tok), '{')) ||
 	    (tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN)) || in_struct_body() ||
 	    /* attribute context: defer inside __attribute__((...)) */
 	    is_inside_attribute(tok))
@@ -6183,7 +6238,7 @@ static Token *find_bare_orelse(Token *tok) {
 		if ((s->flags & TF_CLOSE) || match_ch(s, ';')) return NULL;
 		if (match_ch(s, '?')) { ternary++; prev = s; continue; }
 		if (match_ch(s, ':') && ternary > 0) { ternary--; prev = s; continue; }
-		if ((s->tag & TT_ORELSE) && !typedef_lookup(s) &&
+		if (is_orelse_kw(s) &&
 		    !(prev && (prev->tag & TT_MEMBER)) && ternary == 0)
 			return s;
 		prev = s;
@@ -7088,7 +7143,7 @@ p1d_classify_bracket_orelse(Token *tok, uint16_t cur_sid, int p1d_cur_func) {
 	for (Token *s = tok_next(tok); s && s != close && s->kind != TK_EOF; s = tok_next(s)) {
 		if (s->flags & TF_OPEN) oe_depth++;
 		if (s->flags & TF_CLOSE) oe_depth--;
-		if ((s->tag & TT_ORELSE) && !typedef_lookup(s)) {
+		if (is_orelse_kw_shadow(s)) {
 			if (p1d_cur_func < 0)
 				error_tok(s, "orelse inside array dimension at file scope is not allowed "
 					       "(cannot hoist temporary variable outside a function body)");
@@ -7488,7 +7543,7 @@ uint16_t sid = next_scope_id++;
 			if (p1d_cur_func >= 0) {
 				uint16_t cur_sid = CUR_SID();
 				p1d_record_goto(tok, cur_sid, p1d_cur_func);
-				if ((tok->tag & TT_DEFER) && !typedef_lookup(tok) &&
+				if ((tok->tag & TT_DEFER) && (!typedef_lookup(tok) || match_ch(tok_next(tok), '{')) &&
 				    !(p1d_prev && (p1d_prev->tag & (TT_GOTO | TT_MEMBER))) &&
 				    tok_next(tok) && !match_ch(tok_next(tok), ':') &&
 				    !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN))) {
@@ -7533,7 +7588,7 @@ uint16_t sid = next_scope_id++;
 						// Detect defer inside control-flow condition parens
 						if (p1d_cur_func >= 0 && p1d_prev_saved &&
 						    (p1d_prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
-						    (inner->tag & TT_DEFER) && !typedef_lookup(inner) &&
+						    (inner->tag & TT_DEFER) && (!typedef_lookup(inner) || match_ch(tok_next(inner), '{')) &&
 						    !(prev_inner && (prev_inner->tag & TT_MEMBER)) &&
 						    tok_next(inner) && !match_ch(tok_next(inner), ':') &&
 						    !(tok_next(inner) && (tok_next(inner)->tag & TT_ASSIGN)) &&
@@ -7786,7 +7841,7 @@ uint16_t sid = next_scope_id++;
 			p1d_record_goto(tok, cur_sid, p1d_cur_func);
 
 			// Defer detection
-			if ((tok->tag & TT_DEFER) && !typedef_lookup(tok) &&
+			if ((tok->tag & TT_DEFER) && (!typedef_lookup(tok) || match_ch(tok_next(tok), '{')) &&
 			    tok_next(tok) && !match_ch(tok_next(tok), ':') &&
 			    !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN))) {
 				p1_try_alloc_defer(tok, cur_sid, p1d_cur_func);
@@ -7819,7 +7874,7 @@ uint16_t sid = next_scope_id++;
 		}
 
 		// == Phase 1F: defer body validation ==
-		if ((tok->tag & TT_DEFER) && !typedef_lookup(tok) &&
+		if ((tok->tag & TT_DEFER) && (!typedef_lookup(tok) || match_ch(tok_next(tok), '{')) &&
 		    tok_next(tok) && !match_ch(tok_next(tok), ':') &&
 		    !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN)))
 			p1d_validate_defer(tok, p1d_cur_func, p1d_ctrl_pending, CUR_SID());
@@ -7973,7 +8028,17 @@ uint16_t sid = next_scope_id++;
 						t = tok_next(t);
 						while (t && !match_ch(t, ',') && !match_ch(t, ';') && t->kind != TK_EOF) {
 							// Phase 1G: mark orelse in decl initializer
-							if ((t->tag & TT_ORELSE) && !typedef_lookup(t)) {
+							if (is_orelse_kw_shadow(t)) {
+								// Shadow: only treat as keyword when preceded by expression-ending token
+								TypedefEntry *te_init = typedef_lookup(t);
+								if (te_init && te_init->is_shadow) {
+									bool pend = prev_init_tok &&
+									    (match_ch(prev_init_tok, ')') || match_ch(prev_init_tok, ']') ||
+									     match_ch(prev_init_tok, '}') ||
+									     prev_init_tok->kind == TK_IDENT || prev_init_tok->kind == TK_KEYWORD ||
+									     prev_init_tok->kind == TK_NUM || prev_init_tok->kind == TK_STR);
+									if (!pend) { prev_init_tok = t; t = tok_next(t); continue; }
+								}
 								// Validate structural position: preceding token must end an expression
 								if (prev_init_tok &&
 								    !match_ch(prev_init_tok, ')') && !match_ch(prev_init_tok, ']') &&
@@ -7995,7 +8060,15 @@ uint16_t sid = next_scope_id++;
 									if (!am || match_ch(am, ',') || match_ch(am, ';') || am->kind == TK_EOF) {
 										Token *prev_inner = NULL;
 										for (Token *inner = tok_next(t); inner && inner != m; inner = tok_next(inner)) {
-											if ((inner->tag & TT_ORELSE) && !typedef_lookup(inner)) {
+											if (is_orelse_kw_shadow(inner)) {
+												TypedefEntry *te_inner = typedef_lookup(inner);
+												if (te_inner && te_inner->is_shadow) {
+													bool pi_end = prev_inner &&
+													    (match_ch(prev_inner, ')') || match_ch(prev_inner, ']') ||
+													     prev_inner->kind == TK_IDENT || prev_inner->kind == TK_KEYWORD ||
+													     prev_inner->kind == TK_NUM || prev_inner->kind == TK_STR);
+													if (!pi_end) { prev_inner = inner; continue; }
+												}
 												if (prev_inner &&
 												    !match_ch(prev_inner, ')') && !match_ch(prev_inner, ']') &&
 												    prev_inner->kind != TK_IDENT && prev_inner->kind != TK_KEYWORD &&

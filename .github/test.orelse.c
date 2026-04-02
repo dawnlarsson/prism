@@ -6257,6 +6257,85 @@ void test_orelse_paren_comma_rejection(void) {
 	}
 }
 
+// BUG87: shadowed 'orelse' (variable/enum/typedef named 'orelse') disables the keyword
+static void test_orelse_shadow_variable(void) {
+	// A local variable named 'orelse' should not disable the orelse keyword
+	// for other variables in the same scope (infix position after ident/num).
+	{
+		const char *code =
+		    "int *get(void);\n"
+		    "void f(void) {\n"
+		    "    int orelse = 42;\n"
+		    "    int *p = get() orelse return;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "shadow_var.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "shadow-orelse-var: variable named 'orelse' must not suppress keyword");
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(strstr(r.output, "if (!p)") != NULL,
+			      "shadow-orelse-var: orelse must be expanded to null check");
+		}
+		prism_free(&r);
+	}
+	// Variable used in declaration initializer must work as variable
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int orelse = 42;\n"
+		    "    int x = orelse + 1;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "shadow_var_use.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "shadow-orelse-var-use: 'orelse' in expression must work as variable");
+		prism_free(&r);
+	}
+	// Variable as function call argument must not trigger orelse
+	{
+		const char *code =
+		    "void g(int);\n"
+		    "void f(void) {\n"
+		    "    int orelse = 42;\n"
+		    "    g(orelse);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "shadow_var_call.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "shadow-orelse-var-call: 'orelse' as function arg must work");
+		prism_free(&r);
+	}
+}
+
+static void test_orelse_shadow_enum(void) {
+	const char *code =
+	    "int *get(void);\n"
+	    "enum { orelse = 1 };\n"
+	    "void f(void) {\n"
+	    "    int *p = get() orelse return;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "shadow_enum.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "shadow-orelse-enum: enum constant named 'orelse' must not suppress keyword");
+	if (r.status == PRISM_OK && r.output) {
+		// Check that the declaration orelse was expanded (look for the orelse guard pattern)
+		CHECK(strstr(r.output, "if (!p)") != NULL,
+		      "shadow-orelse-enum: orelse must be expanded to null check");
+	}
+	prism_free(&r);
+}
+
+static void test_orelse_shadow_typedef(void) {
+	// typedef named 'orelse' — this is a REAL typedef, keyword should be suppressed
+	const char *code =
+	    "typedef int orelse;\n"
+	    "void f(void) {\n"
+	    "    orelse x = 5;\n"
+	    "    (void)x;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "shadow_typedef.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "shadow-orelse-typedef: typedef named 'orelse' must suppress keyword");
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -6616,4 +6695,9 @@ void run_orelse_tests(void) {
 
 	// BUG86: paren unlinking with comma expression
 	test_orelse_paren_comma_rejection();
+
+	// BUG87: shadowed 'orelse' keyword suppression
+	test_orelse_shadow_variable();
+	test_orelse_shadow_enum();
+	test_orelse_shadow_typedef();
 }
