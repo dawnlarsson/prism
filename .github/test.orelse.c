@@ -6021,6 +6021,47 @@ static void test_nested_bracket_orelse_no_quadratic(void) {
 	prism_free(&r);
 }
 
+// BUG80: bare orelse with comma operator in braceless control flow.
+// The comma split produces two statements, but braceless if/for/while/else
+// only captures the first — the orelse assignment leaks out of scope.
+// Fix: emit_bare_orelse_impl wraps in { } when brace_wrap is set.
+static int _bug80_if_helper(int cond) {
+	int status = -1;
+	if (cond)
+		(void)0, status = 0 orelse 1;
+	return status;
+}
+
+static int _bug80_while_helper(void) {
+	int x = -1;
+	int once = 1;
+	while (once)
+		once = 0, x = 5 orelse 99;
+	return x;
+}
+
+static int _bug80_else_helper(int cond) {
+	int status = -1;
+	if (cond)
+		status = 42;
+	else
+		(void)0, status = 0 orelse 1;
+	return status;
+}
+
+void test_bare_orelse_comma_braceless(void) {
+	// if: cond=1 → body runs, status = 0 orelse 1 = 1 (0 is falsy)
+	CHECK_EQ(_bug80_if_helper(1), 1, "BUG80: braceless if cond=1 orelse fires");
+	// if: cond=0 → body skipped, status stays -1
+	CHECK_EQ(_bug80_if_helper(0), -1, "BUG80: braceless if cond=0 body skipped");
+	// while: once=1 → body runs, x = 5 (truthy)
+	CHECK_EQ(_bug80_while_helper(), 5, "BUG80: braceless while comma orelse");
+	// else: cond=1 → if-branch, status=42
+	CHECK_EQ(_bug80_else_helper(1), 42, "BUG80: braceless else cond=1 if-branch");
+	// else: cond=0 → else-branch, status = 0 orelse 1 = 1
+	CHECK_EQ(_bug80_else_helper(0), 1, "BUG80: braceless else cond=0 orelse fires");
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -6363,4 +6404,7 @@ void run_orelse_tests(void) {
 
 	// BUG77: O(N^2) nested bracket orelse scanning
 	test_nested_bracket_orelse_no_quadratic();
+
+	// BUG80: bare orelse comma operator in braceless control flow
+	test_bare_orelse_comma_braceless();
 }

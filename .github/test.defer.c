@@ -4577,6 +4577,127 @@ static void test_defer_shadow_braceless_for_ifelse(void) {
 	}
 }
 
+// BUG78: scope_depth/block_depth type confusion in emit_defers_ex.
+// When non-SCOPE_BLOCK entries (SCOPE_CTRL_PAREN) are on the scope_stack,
+// the scope_stack index `d` diverges from block_depth. The old code compared
+// `d < stop_depth` where stop_depth is in block_depth units, causing
+// over-unwinding of defers for same-scope gotos inside stmt-exprs.
+static void test_scope_depth_overunwind(void) {
+	/* goto L is a forward jump WITHIN the same block inside a stmt-expr
+	 * that lives inside if(...). The SCOPE_CTRL_PAREN shifts scope indices.
+	 * The defer must fire exactly once (at scope exit), not at the goto. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int counter = 0;\n"
+		    "void f(void) {\n"
+		    "    if ( ({\n"
+		    "        {\n"
+		    "            defer { counter++; }\n"
+		    "            goto L;\n"
+		    "            L: ;\n"
+		    "        }\n"
+		    "        42;\n"
+		    "    }) ) {\n"
+		    "        (void)0;\n"
+		    "    }\n"
+		    "}\n",
+		    "bug78a.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "bug78-overunwind: transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			/* The goto should NOT be wrapped with defer cleanup
+			 * because it stays within the same scope. Count
+			 * occurrences of "counter++" — should be exactly 1
+			 * (the scope-exit defer), not 2 (goto + scope-exit). */
+			const char *fn = strstr(r.output, "void f(");
+			CHECK(fn != NULL, "bug78-overunwind: function found");
+			if (fn) {
+				int count = 0;
+				const char *p = fn;
+				while ((p = strstr(p, "counter++")) != NULL) {
+					count++;
+					p += 9;
+				}
+				CHECK_EQ(count, 1,
+				         "bug78-overunwind: defer fires once (not over-unwound)");
+			}
+		}
+		prism_free(&r);
+	}
+	/* Backward same-scope goto with SCOPE_CTRL_PAREN on stack */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int counter = 0;\n"
+		    "void f(void) {\n"
+		    "    if ( ({\n"
+		    "        {\n"
+		    "            defer { counter++; }\n"
+		    "            L: ;\n"
+		    "            static int j = 0;\n"
+		    "            if (!j) { j = 1; goto L; }\n"
+		    "        }\n"
+		    "        42;\n"
+		    "    }) ) {\n"
+		    "        (void)0;\n"
+		    "    }\n"
+		    "}\n",
+		    "bug78b.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "bug78-backward: transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			const char *fn = strstr(r.output, "void f(");
+			CHECK(fn != NULL, "bug78-backward: function found");
+			if (fn) {
+				int count = 0;
+				const char *p = fn;
+				while ((p = strstr(p, "counter++")) != NULL) {
+					count++;
+					p += 9;
+				}
+				CHECK_EQ(count, 1,
+				         "bug78-backward: defer fires once (not over-unwound)");
+			}
+		}
+		prism_free(&r);
+	}
+}
+
+// BUG79: emit_range_no_prep flat-loops tokens without routing stmt-exprs
+// through walk_balanced. A goto inside a stmt-expr in an orelse LHS
+// bypasses defer cleanup.
+static void test_emit_range_no_prep_stmtexpr_defer(void) {
+	PrismResult r = prism_transpile_source(
+	    "int counter = 0;\n"
+	    "void f(void) {\n"
+	    "    int target = 0;\n"
+	    "    {\n"
+	    "        defer { counter++; }\n"
+	    "        *({ goto skip; &target; }) = 1 orelse 2;\n"
+	    "        (void)target;\n"
+	    "    }\n"
+	    "    return;\n"
+	    "skip:\n"
+	    "    return;\n"
+	    "}\n",
+	    "bug79.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "bug79-lhs-stmtexpr: transpiles OK");
+	if (r.status == PRISM_OK && r.output) {
+		/* The goto in the LHS stmt-expr must have defer cleanup.
+		 * Find "goto skip" and check that "counter++" appears before it */
+		const char *fn = strstr(r.output, "void f(");
+		CHECK(fn != NULL, "bug79-lhs-stmtexpr: function found");
+		if (fn) {
+			const char *gs = strstr(fn, "goto skip");
+			const char *cleanup = strstr(fn, "counter++");
+			CHECK(gs != NULL, "bug79-lhs-stmtexpr: goto found");
+			CHECK(cleanup != NULL && cleanup < gs,
+			      "bug79-lhs-stmtexpr: defer cleanup before goto");
+		}
+	}
+	prism_free(&r);
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -4847,4 +4968,10 @@ void run_defer_tests(void) {
 
 	// BUG: braceless for-body if/else and do/while prematurely clears for_name_hid
 	test_defer_shadow_braceless_for_ifelse();
+
+	// BUG78: scope_depth/block_depth type confusion over-unwinds defers
+	test_scope_depth_overunwind();
+
+	// BUG79: emit_range_no_prep missing stmt-expr dispatch
+	test_emit_range_no_prep_stmtexpr_defer();
 }

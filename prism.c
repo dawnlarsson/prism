@@ -1201,8 +1201,13 @@ static void emit_range(Token *start, Token *end) {
 // Like emit_range but skips TK_PREP_DIR tokens (for generated expressions
 // where preprocessor directives would be invalid, e.g. inside if-conditions).
 static void emit_range_no_prep(Token *start, Token *end) {
-	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t))
-		if (t->kind != TK_PREP_DIR) emit_tok(t);
+	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
+		if (t->kind == TK_PREP_DIR) continue;
+		if (match_ch(t, '(') && tok_next(t) && match_ch(tok_next(t), '{') && tok_match(t)) {
+			walk_balanced(t, true); t = tok_match(t); continue;
+		}
+		emit_tok(t);
+	}
 }
 
 // Like emit_range_no_prep but walks balanced () and [] groups through
@@ -1218,7 +1223,7 @@ static void emit_balanced_range(Token *start, Token *end) {
 }
 
 // Forward declarations — implementations below find_bare_orelse.
-static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term);
+static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool brace_wrap);
 static Token *emit_deferred_orelse(Token *t, Token *end);
 static void emit_deferred_range(Token *start, Token *end);
 
@@ -1230,9 +1235,10 @@ static void emit_defers_ex(DeferEmitMode mode, int stop_depth) {
 		check_defer_shadow_at_exit(mode, stop_depth);
 
 	int current_defer = defer_count - 1;
+	int curr_bd = ctx->block_depth;
 	for (int d = ctx->scope_depth - 1; d >= 0; d--) {
 		if (scope_stack[d].kind != SCOPE_BLOCK) continue;
-		if (mode == DEFER_TO_DEPTH && d < stop_depth) break;
+		if (mode == DEFER_TO_DEPTH && curr_bd <= stop_depth) break;
 
 		ScopeNode *scope = &scope_stack[d];
 		for (int i = current_defer; i >= scope->defer_start_idx; i--) {
@@ -1241,6 +1247,7 @@ static void emit_defers_ex(DeferEmitMode mode, int stop_depth) {
 			out_char(';');
 		}
 		current_defer = scope->defer_start_idx - 1;
+		curr_bd--;
 
 		if (mode == DEFER_SCOPE) break;
 		if (mode == DEFER_BREAK && (scope->is_loop || scope->is_switch)) break;
@@ -1249,10 +1256,12 @@ static void emit_defers_ex(DeferEmitMode mode, int stop_depth) {
 }
 
 static bool has_defers_for(DeferEmitMode mode, int stop_depth) {
+	int curr_bd = ctx->block_depth;
 	for (int d = ctx->scope_depth - 1; d >= 0; d--) {
 		if (scope_stack[d].kind != SCOPE_BLOCK) continue;
-		if (mode == DEFER_TO_DEPTH && d < stop_depth) break;
+		if (mode == DEFER_TO_DEPTH && curr_bd <= stop_depth) break;
 		if (defer_count > scope_stack[d].defer_start_idx) return true;
+		curr_bd--;
 		if (mode == DEFER_BREAK && (scope_stack[d].is_loop || scope_stack[d].is_switch))
 			return false;
 		if (mode == DEFER_CONTINUE && scope_stack[d].is_loop) return false;
@@ -1486,11 +1495,13 @@ static void check_defer_shadow_at_exit(DeferEmitMode mode, int stop_depth) {
 	// Determine which defer indices will be pasted by this exit.
 	// Walk scopes the same way emit_defers_ex does, collecting the range.
 	int min_defer_idx = defer_count; // exclusive upper bound not needed; just track min
+	int curr_bd = ctx->block_depth;
 	for (int d = ctx->scope_depth - 1; d >= 0; d--) {
 		if (scope_stack[d].kind != SCOPE_BLOCK) continue;
-		if (mode == DEFER_TO_DEPTH && d < stop_depth) break;
+		if (mode == DEFER_TO_DEPTH && curr_bd <= stop_depth) break;
 		if (scope_stack[d].defer_start_idx < min_defer_idx)
 			min_defer_idx = scope_stack[d].defer_start_idx;
+		curr_bd--;
 		if (mode == DEFER_BREAK &&
 		    (scope_stack[d].is_loop || scope_stack[d].is_switch)) break;
 		if (mode == DEFER_CONTINUE && scope_stack[d].is_loop) break;
@@ -6028,7 +6039,7 @@ static bool orelse_has_chain(Token *start, bool comma_term) {
 // Returns the token after the statement, or NULL if no orelse was found.
 // `comma_term`: also treat ',' at depth 0 as statement terminator.
 // `end`: optional boundary (for deferred ranges).
-static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
+static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool brace_wrap) {
 	Token *orelse_tok = find_bare_orelse(t);
 	if (!orelse_tok || (end && tok_loc(orelse_tok) >= tok_loc(end)))
 		return NULL;
@@ -6038,33 +6049,26 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 
 	#define BARE_IS_END(s) (match_ch((s), ';') || (comma_term && match_ch((s), ',')))
 
-	// Skip past depth-0 commas before orelse — the comma operator separates
-	// independent sub-expressions and orelse only applies to the last one.
-	// Emit prefix tokens as a separate statement (comma → semicolon) because
-	// the orelse expansion may produce a block `{ ... }` which cannot appear
-	// after the comma operator.
+	// Find last depth-0 comma before orelse (search only — don't emit yet).
+	// Need to check is_bare_fallback before emitting, because if it's not
+	// bare we return NULL and the caller handles it differently.
+	Token *last_comma = NULL;
 	{
-		Token *last_comma = NULL;
 		int sd = 0;
 		for (Token *s = t; s != orelse_tok; s = tok_next(s)) {
 			if (s->flags & TF_OPEN) sd++;
 			else if (s->flags & TF_CLOSE) sd--;
-			else if (sd == 0 && match_ch(s, ',')) last_comma = s;
-		}
-		if (last_comma) {
-			for (Token *s = t; s != last_comma; s = tok_next(s))
-				emit_tok(s);
-			out_char(';');  // replace comma with semicolon
-			t = tok_next(last_comma);
+			else if (sd == 0 && comma_term && match_ch(s, ',')) last_comma = s;
 		}
 	}
+	Token *post_comma_t = last_comma ? tok_next(last_comma) : t;
 
 	// Find assignment target (= at depth 0 before orelse)
-	Token *bare_lhs_start = t;
+	Token *bare_lhs_start = post_comma_t;
 	Token *bare_assign_eq = NULL;
 	{
 		int sd = 0;
-		for (Token *s = t; s != orelse_tok; s = tok_next(s)) {
+		for (Token *s = post_comma_t; s != orelse_tok; s = tok_next(s)) {
 			if (s->flags & TF_OPEN) sd++;
 			else if (s->flags & TF_CLOSE) sd--;
 			else if (sd == 0 && is_assignment_operator_token(s)) {
@@ -6096,6 +6100,21 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 
 	if (!is_bare_fallback)
 		return NULL;  // caller handles non-bare fallback
+
+	// Now we know this is bare — safe to emit.
+	// Wrap in braces for braceless control-flow bodies (if/for/while/else
+	// without braces) so the expansion stays as a single compound statement.
+	if (brace_wrap) OUT_LIT(" {");
+
+	// Emit comma prefix as a separate statement (comma → semicolon).
+	// The orelse expansion may produce a block which cannot appear after
+	// the comma operator.
+	if (last_comma) {
+		for (Token *s = t; s != last_comma; s = tok_next(s))
+			emit_tok(s);
+		out_char(';');
+		t = post_comma_t;
+	}
 
 	// Reject if the statement contains preprocessor conditionals (#ifdef/#else/etc.).
 	// emit_range_no_prep / emit_balanced_range skip TK_PREP_DIR tokens,
@@ -6263,6 +6282,7 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term) {
 			OUT_LIT(" }");
 		}
 		if (match_ch(t, ';') || (comma_term && match_ch(t, ','))) t = tok_next(t);
+	if (brace_wrap) OUT_LIT(" }");
 	#undef BARE_IS_END
 	return t;
 }
@@ -6284,7 +6304,7 @@ static Token *emit_orelse_condition_wrap(Token *t, Token *orelse_tok) {
 // Wrapper for defer blocks: handles both bare and non-bare orelse.
 // Returns the token after the statement, or NULL if no orelse was found.
 static Token *emit_deferred_orelse(Token *t, Token *end) {
-	Token *result = emit_bare_orelse_impl(t, end, false);
+	Token *result = emit_bare_orelse_impl(t, end, false, false);
 	if (result) return result;
 
 	// Check for non-bare orelse (block/control-flow action)
@@ -8370,8 +8390,14 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 						tok = label_end;
 					}
 
+					// Braceless control flow: bare orelse can emit multiple
+					// statements (comma split + assignment), so needs braces.
+					// Non-bare (control-flow/block action) already wraps in
+					// { if (!(...)) ... } which is a single compound statement.
+					bool brace_wrap = ctrl_state.pending && ctrl_state.parens_just_closed;
+
 					// Try bare-fallback path (handled by shared impl)
-					Token *next = emit_bare_orelse_impl(tok, NULL, true);
+					Token *next = emit_bare_orelse_impl(tok, NULL, true, brace_wrap);
 					if (next) {
 						tok = next;
 						end_statement_after_semicolon();
