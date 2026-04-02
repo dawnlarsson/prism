@@ -2811,6 +2811,30 @@ static Token *walk_balanced(Token *tok, bool emit) {
 						error_tok(inner,
 							  "'orelse' cannot be used here (it must appear at the "
 							  "statement level in a declaration or bare expression)");
+					// Ctrl-flow keywords: track for braceless body at_stmt_start + brace_wrap
+					if (ctx->at_stmt_start && (inner->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
+					    !is_known_typedef(inner)) {
+						if (((inner->tag & TT_IF) && inner->ch0 == 'e') ||
+						    ((inner->tag & TT_LOOP) && inner->ch0 == 'd')) {
+							emit_tok(inner); inner = tok_next(inner);
+							ctrl_state.pending = true;
+							ctrl_state.parens_just_closed = true;
+							continue;
+						}
+						emit_tok(inner); inner = tok_next(inner);
+						if (inner && match_ch(inner, '(') && tok_match(inner)) {
+							Token *pclose = tok_match(inner);
+							while (inner && inner != se_end && inner->kind != TK_EOF) {
+								emit_tok(inner);
+								if (inner == pclose) { inner = tok_next(inner); break; }
+								inner = tok_next(inner);
+							}
+							ctrl_state.pending = true;
+							ctrl_state.parens_just_closed = true;
+							continue;
+						}
+						continue;
+					}
 					ctx->at_stmt_start = false;
 					emit_tok(inner); inner = tok_next(inner);
 				}
@@ -3540,12 +3564,83 @@ static Token *handle_const_orelse_fallback(Token *tok,
 			break;
 		}
 
-		// Block-form action: emit as if-block, not as ternary.
+		// Block-form action: emit as if-block with full scope management.
+		// walk_balanced emits verbatim, missing defer cleanup on return.
 		if (match_ch(tok, '{')) {
 			OUT_LIT(" if (!__prism_oe_");
 			out_uint(oe_id);
 			OUT_LIT(")");
-			tok = walk_balanced(tok, true);
+			Token *blk_close = tok_match(tok);
+			if (!blk_close) error_tok(tok, "unterminated orelse block");
+			CtrlState saved_ctrl = ctrl_state;
+			ctrl_reset();
+			tok = handle_open_brace(tok);
+			Token *oe_ur_tok = NULL;
+			while (tok && tok != blk_close && tok->kind != TK_EOF) {
+				if (match_ch(tok, '{')) { tok = handle_open_brace(tok); continue; }
+				if (match_ch(tok, '}')) { tok = handle_close_brace(tok); continue; }
+				if (match_ch(tok, ';')) {
+					end_statement_after_semicolon();
+					bool is_ur = (tok == oe_ur_tok);
+					emit_tok(tok); tok = tok_next(tok);
+					if (is_ur) { EMIT_UNREACHABLE(); oe_ur_tok = NULL; }
+					continue;
+				}
+				if (__builtin_expect(tok->kind == TK_PREP_DIR, 0)) {
+					emit_tok(tok); tok = tok_next(tok);
+					continue;
+				}
+				uint32_t itag = tok->tag;
+				if (itag) {
+					if (__builtin_expect(itag & TT_DEFER, 0) && !in_generic()) {
+						Token *next = handle_defer_keyword(tok);
+						if (next) { tok = next; continue; }
+					}
+					if (__builtin_expect(FEAT(F_DEFER) && (itag & (TT_RETURN | TT_BREAK | TT_CONTINUE)), 0)) {
+						Token *next = handle_control_exit_defer(tok);
+						if (next) { tok = next; continue; }
+					}
+					if (__builtin_expect((itag & TT_GOTO) && FEAT(F_DEFER | F_ZEROINIT), 0)) {
+						Token *next = handle_goto_keyword(tok);
+						if (next) { tok = next; continue; }
+					}
+				}
+				{ Token *next = try_process_stmt_token(tok, blk_close, &oe_ur_tok);
+				  if (next) { tok = next; continue; } }
+				if (__builtin_expect(FEAT(F_ORELSE) && is_orelse_keyword(tok), 0))
+					error_tok(tok, "'orelse' cannot be used here");
+				// Ctrl-flow keywords: track for braceless body at_stmt_start + brace_wrap
+				if (ctx->at_stmt_start && (tok->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
+				    !is_known_typedef(tok)) {
+					if (((tok->tag & TT_IF) && tok->ch0 == 'e') ||
+					    ((tok->tag & TT_LOOP) && tok->ch0 == 'd')) {
+						emit_tok(tok); tok = tok_next(tok);
+						ctrl_state.pending = true;
+						ctrl_state.parens_just_closed = true;
+						continue;
+					}
+					emit_tok(tok); tok = tok_next(tok);
+					if (tok && match_ch(tok, '(') && tok_match(tok)) {
+						Token *pclose = tok_match(tok);
+						while (tok && tok != blk_close && tok->kind != TK_EOF) {
+							emit_tok(tok);
+							if (tok == pclose) { tok = tok_next(tok); break; }
+							tok = tok_next(tok);
+						}
+						ctrl_state.pending = true;
+						ctrl_state.parens_just_closed = true;
+						continue;
+					}
+					continue;
+				}
+				ctx->at_stmt_start = false;
+				emit_tok(tok); tok = tok_next(tok);
+			}
+			tok = handle_close_brace(tok);
+			ctrl_state = saved_ctrl;
+			ctrl_state.pending = false;
+			ctrl_state.parens_just_closed = false;
+			end_statement_after_semicolon();
 			break;
 		}
 
@@ -3709,17 +3804,21 @@ static OrelseInitInfo scan_decl_orelse(Token *decl_end,
 				Token *after_close = tok_next(close);
 				if (!after_close || match_ch(after_close, ',') || match_ch(after_close, ';') || after_close->kind == TK_EOF) {
 					bool has_inner_orelse = false;
+					bool has_depth0_comma = false;
 					for (Token *inner = tok_next(scan); inner && inner != close; inner = tok_next(inner)) {
 						if ((inner->tag & TT_ORELSE) && !typedef_lookup(inner)) {
 							has_inner_orelse = true;
 							break;
+						}
+						if (match_ch(inner, ',')) {
+							has_depth0_comma = true;
 						}
 						if (inner->flags & TF_OPEN) {
 							inner = tok_match(inner) ? tok_match(inner) : inner;
 							continue;
 						}
 					}
-					if (has_inner_orelse) {
+					if (has_inner_orelse && !has_depth0_comma) {
 						// Unlink '(' from the stream
 						if (prev_scan)
 							prev_scan->next_idx = scan->next_idx;
@@ -4670,7 +4769,81 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bo
 			OUT_TOK(var_name);
 			out_char(')');
 		}
-		ctx->at_stmt_start = false;
+		// Process block inline with full scope management.
+		// Previously returned '{' for deferred processing, but that broke
+		// process_declarators (brace_wrap/stop_comma emitted before block).
+		Token *blk_close = tok_match(tok);
+		if (!blk_close) error_tok(tok, "unterminated orelse block");
+		CtrlState saved_ctrl = ctrl_state;
+		ctrl_reset();
+		tok = handle_open_brace(tok);
+		Token *oe_ur_tok = NULL;
+		while (tok && tok != blk_close && tok->kind != TK_EOF) {
+			if (match_ch(tok, '{')) { tok = handle_open_brace(tok); continue; }
+			if (match_ch(tok, '}')) { tok = handle_close_brace(tok); continue; }
+			if (match_ch(tok, ';')) {
+				end_statement_after_semicolon();
+				bool is_ur = (tok == oe_ur_tok);
+				emit_tok(tok); tok = tok_next(tok);
+				if (is_ur) { EMIT_UNREACHABLE(); oe_ur_tok = NULL; }
+				continue;
+			}
+			if (__builtin_expect(tok->kind == TK_PREP_DIR, 0)) {
+				emit_tok(tok); tok = tok_next(tok);
+				continue;
+			}
+			uint32_t itag = tok->tag;
+			if (itag) {
+				if (__builtin_expect(itag & TT_DEFER, 0) && !in_generic()) {
+					Token *next = handle_defer_keyword(tok);
+					if (next) { tok = next; continue; }
+				}
+				if (__builtin_expect(FEAT(F_DEFER) && (itag & (TT_RETURN | TT_BREAK | TT_CONTINUE)), 0)) {
+					Token *next = handle_control_exit_defer(tok);
+					if (next) { tok = next; continue; }
+				}
+				if (__builtin_expect((itag & TT_GOTO) && FEAT(F_DEFER | F_ZEROINIT), 0)) {
+					Token *next = handle_goto_keyword(tok);
+					if (next) { tok = next; continue; }
+				}
+			}
+			{ Token *next = try_process_stmt_token(tok, blk_close, &oe_ur_tok);
+			  if (next) { tok = next; continue; } }
+			if (__builtin_expect(FEAT(F_ORELSE) && is_orelse_keyword(tok), 0))
+				error_tok(tok, "'orelse' cannot be used here");
+			// Ctrl-flow keywords: track for braceless body at_stmt_start + brace_wrap
+			if (ctx->at_stmt_start && (tok->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
+			    !is_known_typedef(tok)) {
+				if (((tok->tag & TT_IF) && tok->ch0 == 'e') ||
+				    ((tok->tag & TT_LOOP) && tok->ch0 == 'd')) {
+					emit_tok(tok); tok = tok_next(tok);
+					ctrl_state.pending = true;
+					ctrl_state.parens_just_closed = true;
+					continue;
+				}
+				emit_tok(tok); tok = tok_next(tok);
+				if (tok && match_ch(tok, '(') && tok_match(tok)) {
+					Token *pclose = tok_match(tok);
+					while (tok && tok != blk_close && tok->kind != TK_EOF) {
+						emit_tok(tok);
+						if (tok == pclose) { tok = tok_next(tok); break; }
+						tok = tok_next(tok);
+					}
+					ctrl_state.pending = true;
+					ctrl_state.parens_just_closed = true;
+					continue;
+				}
+				continue;
+			}
+			ctx->at_stmt_start = false;
+			emit_tok(tok); tok = tok_next(tok);
+		}
+		tok = handle_close_brace(tok);
+		ctrl_state = saved_ctrl;
+		ctrl_state.pending = false;
+		ctrl_state.parens_just_closed = false;
+		end_statement_after_semicolon();
+		if (tok && match_ch(tok, ';')) tok = tok_next(tok);
 		return tok;
 	}
 
@@ -6364,22 +6537,66 @@ static void emit_deferred_range(Token *start, Token *end) {
 	ctrl_reset();
 
 	ctx->at_stmt_start = true;
+
+	// Track __builtin_unreachable() injection: suppress when inside a
+	// braceless control-flow body, since emit_deferred_range doesn't
+	// inject scope braces around braceless bodies.  Without this,
+	// `if(0) abort();` would emit `__builtin_unreachable()` after `;`
+	// but OUTSIDE the if-body, causing it to execute unconditionally.
 	Token *dr_unreachable_tok = NULL;
+	bool dr_braceless_body = false;
 
 	for (Token *t = start; t && t != end && t->kind != TK_EOF;) {
 		Token *next = try_process_stmt_token(t, end, &dr_unreachable_tok);
 		if (next) { t = next; continue; }
 
+		// Control-flow keywords: emit keyword (+ condition), mark
+		// next token as statement start so zeroinit/orelse fire
+		// in braceless bodies.
+		if (ctx->at_stmt_start) {
+			// else / do: no condition parens, body is next
+			if (((t->tag & TT_IF) && t->ch0 == 'e') ||
+			    ((t->tag & TT_LOOP) && t->ch0 == 'd')) {
+				emit_tok(t); t = tok_next(t);
+				dr_braceless_body = true;
+				ctrl_state.pending = true;
+				ctrl_state.parens_just_closed = true;
+				continue; // at_stmt_start stays true
+			}
+			// if / while / for / switch: emit keyword + balanced (...)
+			if ((t->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
+			    !is_known_typedef(t)) {
+				emit_tok(t); t = tok_next(t);
+				if (t && match_ch(t, '(') && tok_match(t)) {
+					Token *close = tok_match(t);
+					while (t && t != end && t->kind != TK_EOF) {
+						emit_tok(t);
+						if (t == close) { t = tok_next(t); break; }
+						t = tok_next(t);
+					}
+					dr_braceless_body = true;
+					ctrl_state.pending = true;
+					ctrl_state.parens_just_closed = true;
+					continue; // at_stmt_start stays true
+				}
+			}
+		}
+
 		ctx->at_stmt_start = false;
 
 		if (t->tag & TT_STRUCTURAL) {
 			bool is_semi = (t->len == 1 && t->ch0 == ';');
-			bool is_ur_target = is_semi && (t == dr_unreachable_tok);
+			bool is_ur_target = is_semi && !dr_braceless_body &&
+					    (t == dr_unreachable_tok);
 			emit_tok(t); t = tok_next(t);
 			if (is_ur_target) {
 				EMIT_UNREACHABLE();
 				dr_unreachable_tok = NULL;
 			}
+			// { or } clears braceless flag (braced body is scoped);
+			// ; ends the braceless body statement.
+			dr_braceless_body = false;
+			if (ctrl_state.pending) ctrl_reset();
 			ctx->at_stmt_start = true;
 			continue;
 		}
@@ -8426,13 +8643,8 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 					require_orelse_action(tok, NULL);
 
-					bool is_block_action = match_ch(tok, '{');
 					tok = emit_orelse_action(tok, NULL, false, false, NULL);
-					if (is_block_action) {
-						ctrl_state.pending_orelse_guard = true;
-					} else {
-						OUT_LIT(" }");
-					}
+					OUT_LIT(" }");
 					continue;
 				}
 			}

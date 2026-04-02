@@ -4698,6 +4698,108 @@ static void test_emit_range_no_prep_stmtexpr_defer(void) {
 	prism_free(&r);
 }
 
+// BUG81: emit_deferred_range did not track control-flow keywords,
+// so at_stmt_start was false for braceless if/else/for/while/do bodies
+// inside defer blocks.  orelse was emitted verbatim; zero-init was skipped.
+static void test_defer_braceless_ctrl_orelse(void) {
+	printf("\n--- BUG81: braceless ctrl-flow orelse/zeroinit in defer ---\n");
+	// orelse in braceless if body inside defer
+	{
+		PrismResult r = prism_transpile_source(
+		    "int f(void) {\n"
+		    "    int result = -1;\n"
+		    "    int zero = 0;\n"
+		    "    {\n"
+		    "        defer {\n"
+		    "            if (1)\n"
+		    "                result = *(&zero) orelse 99;\n"
+		    "        }\n"
+		    "    }\n"
+		    "    return result;\n"
+		    "}\n",
+		    "bug81_if.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "bug81-braceless-if: transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "bug81-braceless-if: no literal 'orelse' in output");
+			CHECK(strstr(r.output, "__prism_oe_") != NULL,
+			      "bug81-braceless-if: orelse temp generated");
+		}
+		prism_free(&r);
+	}
+	// orelse in else body inside defer
+	{
+		PrismResult r = prism_transpile_source(
+		    "int f(void) {\n"
+		    "    int result = -1;\n"
+		    "    int zero = 0;\n"
+		    "    {\n"
+		    "        defer {\n"
+		    "            if (0) result = 0;\n"
+		    "            else result = *(&zero) orelse 77;\n"
+		    "        }\n"
+		    "    }\n"
+		    "    return result;\n"
+		    "}\n",
+		    "bug81_else.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "bug81-braceless-else: transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "bug81-braceless-else: no literal 'orelse' in output");
+		}
+		prism_free(&r);
+	}
+	// orelse in braceless for body inside defer
+	{
+		PrismResult r = prism_transpile_source(
+		    "int f(void) {\n"
+		    "    int result = -1;\n"
+		    "    int zero = 0;\n"
+		    "    {\n"
+		    "        defer {\n"
+		    "            for (int i = 0; i < 1; i++)\n"
+		    "                result = *(&zero) orelse 55;\n"
+		    "        }\n"
+		    "    }\n"
+		    "    return result;\n"
+		    "}\n",
+		    "bug81_for.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "bug81-braceless-for: transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "bug81-braceless-for: no literal 'orelse' in output");
+		}
+		prism_free(&r);
+	}
+	// orelse in braceless do body inside defer
+	{
+		PrismResult r = prism_transpile_source(
+		    "int f(void) {\n"
+		    "    int result = -1;\n"
+		    "    int zero = 0;\n"
+		    "    {\n"
+		    "        defer {\n"
+		    "            do\n"
+		    "                result = *(&zero) orelse 11;\n"
+		    "            while (0);\n"
+		    "        }\n"
+		    "    }\n"
+		    "    return result;\n"
+		    "}\n",
+		    "bug81_do.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "bug81-braceless-do: transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "bug81-braceless-do: no literal 'orelse' in output");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -4974,6 +5076,205 @@ void run_defer_tests(void) {
 
 	// BUG79: emit_range_no_prep missing stmt-expr dispatch
 	test_emit_range_no_prep_stmtexpr_defer();
+
+	// BUG81: braceless ctrl-flow in defer body — orelse/zeroinit not processed
+	test_defer_braceless_ctrl_orelse();
+
+	// BUG82: __builtin_unreachable() leaks outside braceless if-body in defer
+	{
+		printf("\n--- BUG82: unreachable in braceless ctrl-flow defer ---\n");
+		// noreturn call in braceless if(0) inside defer body:
+		// __builtin_unreachable() must NOT appear outside the if-body
+		PrismResult r = prism_transpile_source(
+		    "_Noreturn void die(void);\n"
+		    "void f(void) {\n"
+		    "    defer {\n"
+		    "        if (0)\n"
+		    "            die();\n"
+		    "    }\n"
+		    "}\n",
+		    "bug82_braceless.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "bug82-braceless-unreachable: transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			// The output should NOT contain __builtin_unreachable
+			// because the noreturn call is in a braceless body
+			// and emit_deferred_range cannot inject scope braces.
+			const char *fn = strstr(r.output, "void f(");
+			CHECK(fn != NULL, "bug82: function found");
+			if (fn)
+				CHECK(strstr(fn, "__builtin_unreachable") == NULL &&
+				      strstr(fn, "__assume") == NULL,
+				      "bug82: no unreachable leak outside braceless if");
+		}
+		prism_free(&r);
+
+		// Top-level noreturn in defer body SHOULD still get unreachable
+		r = prism_transpile_source(
+		    "_Noreturn void die(void);\n"
+		    "void f(void) {\n"
+		    "    defer { die(); }\n"
+		    "}\n",
+		    "bug82_toplevel.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "bug82-toplevel: transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(strstr(r.output, "__builtin_unreachable") != NULL ||
+			      strstr(r.output, "__assume") != NULL,
+			      "bug82-toplevel: unreachable injected at top level");
+		}
+		prism_free(&r);
+	}
+
+	// BUG85: braceless ctrl-flow in defer body missing brace_wrap for multi-stmt expansion
+	{
+		printf("\n--- BUG85: braceless ctrl-flow brace_wrap in defer ---\n");
+		// typeof zeroinit in braceless if inside defer: memset must be inside braces
+		{
+			PrismResult r = prism_transpile_source(
+			    "void f(void) {\n"
+			    "    defer {\n"
+			    "        if (1)\n"
+			    "            typeof(int) x;\n"
+			    "        (void)0;\n"
+			    "    }\n"
+			    "}\n",
+			    "bug85_typeof_if.c", prism_defaults());
+			CHECK_EQ(r.status, PRISM_OK,
+			         "bug85-typeof-if: transpiles OK");
+			if (r.status == PRISM_OK && r.output) {
+				// The memset MUST be inside braces with the declaration
+				CHECK(strstr(r.output, "if (1) {") != NULL ||
+				      strstr(r.output, "if (1){") != NULL,
+				      "bug85-typeof-if: braceless if body wrapped in braces");
+				CHECK(has_zeroing(r.output),
+				      "bug85-typeof-if: memset generated");
+			}
+			prism_free(&r);
+		}
+		// typeof zeroinit in braceless for inside defer
+		{
+			PrismResult r = prism_transpile_source(
+			    "void f(void) {\n"
+			    "    defer {\n"
+			    "        for (int i = 0; i < 1; i++)\n"
+			    "            typeof(int) x;\n"
+			    "    }\n"
+			    "}\n",
+			    "bug85_typeof_for.c", prism_defaults());
+			CHECK_EQ(r.status, PRISM_OK,
+			         "bug85-typeof-for: transpiles OK");
+			if (r.status == PRISM_OK && r.output) {
+				const char *fn = strstr(r.output, "void f(");
+				CHECK(fn != NULL, "bug85-typeof-for: function found");
+				if (fn) {
+					CHECK(has_zeroing(fn),
+					      "bug85-typeof-for: memset generated");
+				}
+			}
+			prism_free(&r);
+		}
+		// typeof zeroinit in braceless else inside defer
+		{
+			PrismResult r = prism_transpile_source(
+			    "void f(void) {\n"
+			    "    defer {\n"
+			    "        if (0) (void)0;\n"
+			    "        else\n"
+			    "            typeof(int) x;\n"
+			    "    }\n"
+			    "}\n",
+			    "bug85_typeof_else.c", prism_defaults());
+			CHECK_EQ(r.status, PRISM_OK,
+			         "bug85-typeof-else: transpiles OK");
+			if (r.status == PRISM_OK && r.output) {
+				CHECK(has_zeroing(r.output),
+				      "bug85-typeof-else: memset generated");
+			}
+			prism_free(&r);
+		}
+		// orelse decl in braceless if inside defer: multi-stmt must be wrapped
+		{
+			PrismResult r = prism_transpile_source(
+			    "int *get_null(void);\n"
+			    "void f(void) {\n"
+			    "    defer {\n"
+			    "        if (1)\n"
+			    "            int *p = get_null() orelse 0;\n"
+			    "    }\n"
+			    "}\n",
+			    "bug85_orelse_if.c", prism_defaults());
+			CHECK_EQ(r.status, PRISM_OK,
+			         "bug85-orelse-if: transpiles OK");
+			if (r.status == PRISM_OK && r.output) {
+				const char *fn = strstr(r.output, "void f(");
+				CHECK(fn != NULL, "bug85-orelse-if: function found");
+				if (fn) {
+					CHECK(strstr(fn, "orelse") == NULL,
+					      "bug85-orelse-if: no literal orelse");
+					// Must have brace wrap for multi-stmt expansion
+					CHECK(strstr(fn, "if (1) {") != NULL ||
+					      strstr(fn, "if (1){") != NULL,
+					      "bug85-orelse-if: braceless body wrapped in braces");
+				}
+			}
+			prism_free(&r);
+		}
+	}
+
+	// BUG85b: orelse block mini-loop missing ctrl-flow keyword tracking
+	{
+		printf("\n--- BUG85b: ctrl-flow in orelse block body ---\n");
+		// typeof zeroinit in braceless if inside orelse block
+		{
+			PrismResult r = prism_transpile_source(
+			    "int *get_null(void);\n"
+			    "void f(void) {\n"
+			    "    int *p = get_null() orelse {\n"
+			    "        if (1)\n"
+			    "            typeof(int) x;\n"
+			    "        return;\n"
+			    "    };\n"
+			    "}\n",
+			    "bug85b_typeof_if.c", prism_defaults());
+			CHECK_EQ(r.status, PRISM_OK,
+			         "bug85b-typeof-if-orelse: transpiles OK");
+			if (r.status == PRISM_OK && r.output) {
+				const char *fn = strstr(r.output, "void f(");
+				CHECK(fn != NULL, "bug85b: function found");
+				if (fn) {
+					CHECK(has_zeroing(fn),
+					      "bug85b-typeof-if-orelse: memset generated for typeof");
+				}
+			}
+			prism_free(&r);
+		}
+		// orelse in braceless while inside orelse block
+		{
+			PrismResult r = prism_transpile_source(
+			    "int f(int *p);\n"
+			    "void g(void) {\n"
+			    "    int *q = (int*)(0) orelse {\n"
+			    "        while (0)\n"
+			    "            typeof(int) y;\n"
+			    "        return;\n"
+			    "    };\n"
+			    "    (void)q;\n"
+			    "}\n",
+			    "bug85b_while.c", prism_defaults());
+			CHECK_EQ(r.status, PRISM_OK,
+			         "bug85b-while-orelse: transpiles OK");
+			if (r.status == PRISM_OK && r.output) {
+				const char *fn = strstr(r.output, "void g(");
+				CHECK(fn != NULL, "bug85b-while: function found");
+				if (fn) {
+					CHECK(has_zeroing(fn),
+					      "bug85b-while-orelse: memset generated");
+				}
+			}
+			prism_free(&r);
+		}
+	}
 
 	// Taint propagation: non-wrapper deep chain via function pointer assignment
 	{

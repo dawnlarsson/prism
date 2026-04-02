@@ -6117,6 +6117,146 @@ static void test_bracket_orelse_prepdir_rejected(void) {
 	}
 }
 
+// BUG83: block-form orelse in declaration + braceless control body
+// Previously emitted brace_wrap '}' before the orelse block was processed,
+// producing invalid C like 'if (!x) } { ... }'.
+int *bug83_get_ptr(int which) {
+	static int bug83_val = 42;
+	return which ? &bug83_val : (void *)0;
+}
+
+int bug83_braceless_if(int cond) {
+	if (cond)
+		int *x = bug83_get_ptr(0) orelse { return 99; };
+	return 0;
+}
+
+int bug83_braceless_else(int cond) {
+	if (!cond) { /* nothing */ }
+	else
+		int *x = bug83_get_ptr(0) orelse { return 88; };
+	return 0;
+}
+
+int bug83_braceless_while(void) {
+	int count = 0;
+	while (count < 1)
+		int *x = bug83_get_ptr(count++) orelse { return 77; };
+	return count;
+}
+
+int bug83_multi_decl(void) {
+	int *x = bug83_get_ptr(0) orelse { return -1; }, y = 5;
+	return *x + y;
+}
+
+int bug83_multi_decl_nontrigger(void) {
+	int *x = bug83_get_ptr(1) orelse { return -1; }, y = 10;
+	return *x + y;
+}
+
+void test_orelse_block_braceless_ctrl(void) {
+	CHECK_EQ(bug83_braceless_if(1), 99,
+	         "BUG83: block orelse in braceless if triggers");
+	CHECK_EQ(bug83_braceless_if(0), 0,
+	         "BUG83: block orelse in braceless if skips");
+	CHECK_EQ(bug83_braceless_else(0), 0,
+	         "BUG83: block orelse in braceless else skips path");
+	CHECK_EQ(bug83_braceless_else(1), 88,
+	         "BUG83: block orelse in braceless else triggers");
+	CHECK_EQ(bug83_braceless_while(), 77,
+	         "BUG83: block orelse in braceless while triggers");
+}
+
+void test_orelse_block_multi_decl(void) {
+	CHECK_EQ(bug83_multi_decl(), -1,
+	         "BUG83: block orelse multi-decl null triggers");
+	CHECK_EQ(bug83_multi_decl_nontrigger(), 52,
+	         "BUG83: block orelse multi-decl non-null works");
+}
+
+// BUG83: block-form orelse with defer cleanup inside
+int bug83_with_defer(void) {
+	log_reset();
+	defer log_append("D");
+	int *x = bug83_get_ptr(0) orelse {
+		log_append("null");
+		return -1;
+	};
+	log_append("ok");
+	return *x;
+}
+
+void test_orelse_block_defer_cleanup(void) {
+	int r = bug83_with_defer();
+	CHECK_EQ(r, -1, "BUG83: block orelse defer return value");
+	CHECK_LOG("nullD", "BUG83: block orelse defer cleanup order");
+}
+
+// BUG84: const chained orelse block form skips defer cleanup on return.
+// walk_balanced emitted block verbatim; return bypassed defer stack.
+int *bug84_get_ptr(int which) {
+	static int bug84_val = 42;
+	return which ? &bug84_val : (void *)0;
+}
+
+int bug84_const_chain_block_defer(void) {
+	log_reset();
+	defer log_append("D");
+	const int *x = bug84_get_ptr(0) orelse bug84_get_ptr(0) orelse {
+		log_append("null");
+		return -1;
+	};
+	log_append("ok");
+	return *x;
+}
+
+void test_orelse_const_chain_block_defer(void) {
+	int r = bug84_const_chain_block_defer();
+	CHECK_EQ(r, -1, "BUG84: const chained block orelse return");
+	CHECK_LOG("nullD", "BUG84: const chained block orelse defers fire");
+}
+
+// BUG86: scan_decl_orelse paren unlinking corrupted comma expressions.
+// (counter++, get() orelse 0) unlinked the parens, exposing the comma
+// at depth 0, causing orelse to leak verbatim to output.
+void test_orelse_paren_comma_rejection(void) {
+	printf("\n--- BUG86: paren unlinking comma expression ---\n");
+	// orelse inside parens WITH comma: should be rejected (not silently corrupted)
+	{
+		PrismResult r = prism_transpile_source(
+		    "int *get(void);\n"
+		    "void f(void) {\n"
+		    "    int x = 0;\n"
+		    "    int *p = (x++, get() orelse 0);\n"
+		    "}\n",
+		    "bug86_comma.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
+		         "BUG86: orelse in paren with comma rejected");
+		if (r.status == PRISM_ERR_SYNTAX && r.error_msg) {
+			CHECK(strstr(r.error_msg, "parentheses") != NULL,
+			      "BUG86: error mentions parentheses");
+		}
+		prism_free(&r);
+	}
+	// orelse inside parens WITHOUT comma: should work (macro hygiene unwrapping)
+	{
+		PrismResult r = prism_transpile_source(
+		    "int *get(void);\n"
+		    "void f(void) {\n"
+		    "    int *p = (get() orelse 0);\n"
+		    "}\n",
+		    "bug86_no_comma.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "BUG86: orelse in paren without comma works");
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "BUG86: no literal orelse in output");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -6465,4 +6605,15 @@ void run_orelse_tests(void) {
 
 	// BUG: preprocessor conditionals inside bracket orelse (lib mode)
 	test_bracket_orelse_prepdir_rejected();
+
+	// BUG83: block orelse in braceless control body / multi-decl
+	test_orelse_block_braceless_ctrl();
+	test_orelse_block_multi_decl();
+	test_orelse_block_defer_cleanup();
+
+	// BUG84: const chained orelse block skips defer cleanup
+	test_orelse_const_chain_block_defer();
+
+	// BUG86: paren unlinking with comma expression
+	test_orelse_paren_comma_rejection();
 }
