@@ -7734,6 +7734,12 @@ uint16_t sid = next_scope_id++;
 								error_tok(decl.var_name,
 									  "'orelse' cannot be used in file-scope initializers "
 									  "(requires runtime fallback code)");
+							if (p1d_saw_static || type.has_static || type.has_extern)
+								error_tok(decl.var_name,
+									  "'orelse' cannot be used in the initializer of a "
+									  "variable with static or thread storage duration "
+									  "(the runtime fallback check would re-execute on "
+									  "every function entry, destroying persistence)");
 							if (decl.is_array && !decl.paren_pointer)
 								error_tok(decl.var_name,
 									  "orelse on array variable '%.*s' will never trigger "

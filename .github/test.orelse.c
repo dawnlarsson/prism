@@ -5719,6 +5719,75 @@ static void test_attr_bracket_orelse_queue_desync(void) {
 	}
 }
 
+static void test_static_raw_orelse_keyword_leak(void) {
+	printf("\n--- BUG: static/extern raw orelse keyword leak ---\n");
+
+	// BUG: `static raw int x = get_val() orelse 1;` leaks the orelse keyword
+	// verbatim into the C output.  Pass 2's try_zero_init_decl hits the
+	// has_storage_in fast path and calls emit_raw_verbatim_to_semicolon,
+	// bypassing process_declarators (and its static+orelse rejection).
+	// Phase 1D never checked for this combination.
+
+	// Sub-test 1: static raw orelse -> must reject
+	{
+		const char *code =
+		    "int get_val(void) { return 42; }\n"
+		    "void f(void) {\n"
+		    "    static raw int x = get_val() orelse 1;\n"
+		    "    (void)x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "static_raw_oe.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "static-raw-orelse: must be rejected (keyword would leak)");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "static") || strstr(r.error_msg, "storage"),
+			      "static-raw-orelse: error mentions storage duration");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: _Thread_local static raw orelse -> must reject
+	{
+		const char *code =
+		    "int get_val(void) { return 42; }\n"
+		    "void f(void) {\n"
+		    "    _Thread_local static raw int x = get_val() orelse 1;\n"
+		    "    (void)x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "tls_raw_oe.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "tls-raw-orelse: must be rejected (keyword would leak)");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: raw static (reversed) -> must also reject
+	// (This path already works via process_declarators, but verify it stays correct)
+	{
+		const char *code =
+		    "int get_val(void) { return 42; }\n"
+		    "void f(void) {\n"
+		    "    raw static int x = get_val() orelse 1;\n"
+		    "    (void)x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "raw_static_oe.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "raw-static-orelse: must be rejected");
+		prism_free(&r);
+	}
+
+	// Sub-test 4: static raw WITHOUT orelse -> must succeed (raw suppresses zeroinit only)
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    static raw int x = 42;\n"
+		    "    (void)x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "static_raw_ok.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "static-raw-no-orelse: must succeed");
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -6049,4 +6118,7 @@ void run_orelse_tests(void) {
 
 	// BUG: __attribute__ bracket desynchronizes orelse dim queue
 	test_attr_bracket_orelse_queue_desync();
+
+	// BUG: static/extern raw orelse keyword leak via verbatim bypass
+	test_static_raw_orelse_keyword_leak();
 }
