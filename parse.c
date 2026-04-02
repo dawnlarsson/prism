@@ -1805,39 +1805,51 @@ static Token *tokenize(File *file) {
 				}
 			}
 			if (has_taint) {
+			// Extract function-reference edges in a single pass over tokens.
+			// This avoids re-scanning all function bodies on each fixed-point
+			// iteration, reducing O(D*T) to O(T + D*E) where E = edge count.
+			typedef struct { int from, to; } TaintEdge;
+			TaintEdge *edges = NULL;
+			int edge_count = 0, edge_cap = 0;
 			uint64_t fn_bloom = 0;
 			for (int i = 0; i < function_count; i++) {
 				Token *n = functions[i].name;
 				fn_bloom |= 1ULL << (((unsigned)n->ch0 ^ n->len) & 63);
 			}
+			for (int i = 0; i < function_count; i++) {
+				Token *body = functions[i].body;
+				if (body->tag & (TT_SPECIAL_FN | TT_NORETURN_FN)) continue;
+				Token *end = tok_match(body);
+				for (Token *b = tok_next(body); b != end; b = tok_next(b)) {
+					if (b->kind != TK_IDENT) continue;
+					if (!(fn_bloom & (1ULL << (((unsigned)b->ch0 ^ b->len) & 63))))
+						continue;
+					void *v = hashmap_get(&func_map, tok_loc(b), b->len);
+					if (!v) continue;
+					int j = (int)(intptr_t)v - 1;
+					ENSURE_ARRAY_CAP(edges, edge_count + 1, edge_cap, 64, TaintEdge);
+					edges[edge_count++] = (TaintEdge){i, j};
+				}
+			}
+			// Fixed-point on extracted edges (no token re-scanning).
 			do {
 				changed = false;
-				for (int i = 0; i < function_count; i++) {
+				for (int e = 0; e < edge_count; e++) {
+					int i = edges[e].from, j = edges[e].to;
 					Token *body = functions[i].body;
 					if (body->tag & (TT_SPECIAL_FN | TT_NORETURN_FN)) continue;
-					Token *end = tok_match(body);
-					for (Token *b = tok_next(body); b != end; b = tok_next(b)) {
-						if (b->kind != TK_IDENT)
-							continue;
-						if (!(fn_bloom & (1ULL << (((unsigned)b->ch0 ^ b->len) & 63))))
-							continue;
-						void *v = hashmap_get(&func_map, tok_loc(b), b->len);
-						if (!v) continue;
-						int j = (int)(intptr_t)v - 1;
-						// Wrapper taint (setjmp/vfork wrappers)
-						if (wrapper_taint[j] && !(body->tag & wrapper_taint[j])) {
-							body->tag |= wrapper_taint[j];
-							changed = true;
-						}
-						// Direct vfork taint from body scan
-						uint32_t vfork_taint = functions[j].body->tag & TT_NORETURN_FN;
-						if (vfork_taint && !(body->tag & TT_NORETURN_FN)) {
-							body->tag |= TT_NORETURN_FN;
-							changed = true;
-						}
+					if (wrapper_taint[j] && !(body->tag & wrapper_taint[j])) {
+						body->tag |= wrapper_taint[j];
+						changed = true;
+					}
+					uint32_t vt = functions[j].body->tag & TT_NORETURN_FN;
+					if (vt && !(body->tag & TT_NORETURN_FN)) {
+						body->tag |= TT_NORETURN_FN;
+						changed = true;
 					}
 				}
 			} while (changed);
+			free(edges);
 			} // has_taint
 			free(func_map.buckets);
 		}

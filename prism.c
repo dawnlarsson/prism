@@ -6902,7 +6902,24 @@ p1d_classify_bracket_orelse(Token *tok, uint16_t cur_sid, int p1d_cur_func) {
 			found_oe = true;
 		}
 	}
-	if (found_oe) tok_ann(tok) |= P1_OE_BRACKET;
+	if (found_oe) {
+		for (Token *s = tok_next(tok); s && s != close && s->kind != TK_EOF; s = tok_next(s)) {
+			if (s->kind != TK_PREP_DIR) continue;
+			const char *dp = tok_loc(s);
+			if (*dp == '#') dp++;
+			while (*dp == ' ' || *dp == '\t') dp++;
+			if (strncmp(dp, "ifdef", 5) == 0 || strncmp(dp, "ifndef", 6) == 0 ||
+			    strncmp(dp, "elif",  4) == 0 || strncmp(dp, "else",   4) == 0 ||
+			    strncmp(dp, "endif", 5) == 0 ||
+			    (strncmp(dp, "if", 2) == 0 && (dp[2]==' '||dp[2]=='\t'||dp[2]=='(')))
+				error_tok(s, "'orelse' inside array dimension cannot be used when the "
+					    "dimension spans preprocessor conditionals — the "
+					    "transpiler would emit tokens from all branches, "
+					    "producing invalid C; "
+					    "use 'cc -E' preprocessing or a temporary variable");
+		}
+		tok_ann(tok) |= P1_OE_BRACKET;
+	}
 }
 
 // Phase 1D: validate bare orelse in expression statements.

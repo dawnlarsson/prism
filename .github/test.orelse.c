@@ -6062,6 +6062,61 @@ void test_bare_orelse_comma_braceless(void) {
 	CHECK_EQ(_bug80_else_helper(0), 1, "BUG80: braceless else cond=0 orelse fires");
 }
 
+static void test_bracket_orelse_prepdir_rejected(void) {
+	printf("\n--- BUG: prepdir inside bracket orelse rejection ---\n");
+
+	// Sub-test 1: #ifdef inside bracket orelse must be rejected (lib mode only)
+	{
+		const char *code =
+		    "int get_size(void);\n"
+		    "void f(void) {\n"
+		    "    int arr[\n"
+		    "#ifdef X\n"
+		    "    1\n"
+		    "#else\n"
+		    "    get_size()\n"
+		    "#endif\n"
+		    "    orelse 3];\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bracket_prepdir.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "bracket-orelse-prepdir: #ifdef in dimension must be rejected");
+		CHECK(r.error_msg && strstr(r.error_msg, "preprocessor"),
+		      "bracket-orelse-prepdir: error mentions preprocessor");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: #ifndef variant
+	{
+		const char *code =
+		    "int get_size(void);\n"
+		    "void f(void) {\n"
+		    "    int arr[\n"
+		    "#ifndef Y\n"
+		    "    get_size()\n"
+		    "#endif\n"
+		    "    orelse 3];\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bracket_prepdir2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "bracket-orelse-prepdir: #ifndef must also be rejected");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: no #ifdef — normal bracket orelse still works
+	{
+		const char *code =
+		    "int get_size(void);\n"
+		    "void f(void) {\n"
+		    "    int arr[get_size() orelse 3];\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bracket_no_prepdir.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "bracket-orelse-no-prepdir: transpiles OK");
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -6407,4 +6462,7 @@ void run_orelse_tests(void) {
 
 	// BUG80: bare orelse comma operator in braceless control flow
 	test_bare_orelse_comma_braceless();
+
+	// BUG: preprocessor conditionals inside bracket orelse (lib mode)
+	test_bracket_orelse_prepdir_rejected();
 }

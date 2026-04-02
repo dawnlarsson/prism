@@ -4974,4 +4974,25 @@ void run_defer_tests(void) {
 
 	// BUG79: emit_range_no_prep missing stmt-expr dispatch
 	test_emit_range_no_prep_stmtexpr_defer();
+
+	// Taint propagation: non-wrapper deep chain via function pointer assignment
+	{
+		printf("\n--- Taint propagation: non-wrapper fp chain ---\n");
+		// Depth-3 chain where each function assigns the previous to a fp
+		const char *code =
+		    "#include <unistd.h>\n"
+		    "void f0(void) { vfork(); }\n"
+		    "void f1(void) { void (*fp)(void) = f0; fp(); }\n"
+		    "void f2(void) { void (*fp)(void) = f1; fp(); }\n"
+		    "void f3(void) {\n"
+		    "    defer { (void)0; }\n"
+		    "    f2();\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "taint_fp_chain.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "taint-fp-chain: deep non-wrapper vfork chain must be rejected");
+		CHECK(r.error_msg && strstr(r.error_msg, "vfork"),
+		      "taint-fp-chain: error mentions vfork");
+		prism_free(&r);
+	}
 }
