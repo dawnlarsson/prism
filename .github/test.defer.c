@@ -4838,6 +4838,60 @@ static void test_defer_shadow_typedef_block(void) {
 	prism_free(&r);
 }
 
+// BUG88: check_defer_var_shadow false positive inside GNU statement expressions.
+// The scanner's paren_depth==0 guard prevents it from recognizing declarations
+// inside ({...}), so macro temporaries are falsely flagged as outer-scope captures.
+static void test_defer_shadow_stmt_expr_local_false_positive(void) {
+	printf("\n--- Defer shadow stmt-expr local false positive ---\n");
+	// Stmt-expr macro temp inside defer: _tmp_a is local to the stmt-expr,
+	// re-declaring _tmp_a in the outer scope must not trigger a false shadow error.
+	{
+		const char *code =
+		    "int main() {\n"
+		    "    int out = 0;\n"
+		    "    defer out = ({ typeof(10) _tmp_a = (10); typeof(20) _tmp_b = (20);\n"
+		    "                   _tmp_a > _tmp_b ? _tmp_a : _tmp_b; });\n"
+		    "    int _tmp_a = 5;\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "shadow_se_fp.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "defer-shadow-se-fp: stmt-expr local must not trigger false shadow");
+		prism_free(&r);
+	}
+	// Nested stmt-exprs: inner locals must not leak to outer scope
+	{
+		const char *code =
+		    "int main() {\n"
+		    "    int x = 0;\n"
+		    "    defer x = ({ int inner = ({ int deep = 1; deep; }); inner + 1; });\n"
+		    "    int deep = 99;\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "shadow_se_nested.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "defer-shadow-se-nested: nested stmt-expr locals must not trigger shadow");
+		prism_free(&r);
+	}
+	// Stmt-expr local that IS also used outside: must still catch real shadows
+	{
+		const char *code =
+		    "void cleanup(int *p);\n"
+		    "int f(void) {\n"
+		    "    int val = 1;\n"
+		    "    defer cleanup(&val);\n"
+		    "    {\n"
+		    "        int val = 2;\n"
+		    "        return val;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "shadow_se_real.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "defer-shadow-se-real: real shadow in inner block must still be caught");
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();
@@ -5338,4 +5392,7 @@ void run_defer_tests(void) {
 	// BUG87: shadowed 'defer' keyword suppression
 	test_defer_shadow_variable_block();
 	test_defer_shadow_typedef_block();
+
+	// BUG88: stmt-expr local false positive in defer shadow scanner
+	test_defer_shadow_stmt_expr_local_false_positive();
 }

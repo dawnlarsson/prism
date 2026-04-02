@@ -1,4 +1,4 @@
-#define PRISM_VERSION "1.0.2"
+#define PRISM_VERSION "1.0.3"
 
 #ifndef _WIN32
 #ifndef _GNU_SOURCE
@@ -1317,14 +1317,23 @@ static void check_defer_var_shadow(Token *var_name) {
 		Token *for_header_open = NULL; // '(' of current for/while/if header
 		bool for_name_hid = false; // true if for-init declared our target name
 		uint32_t for_body_end_idx = 0; // token index of for-body end (from skip_one_stmt)
+		int se_depth = 0; // stmt-expr nesting: how many ({...}) are active
+		int se_brace[8]; // brace_depth at each stmt-expr entry
 		for (Token *t = defer_stack[i].stmt; t && t != defer_stack[i].end && t->kind != TK_EOF;
 		     prev = t, t = tok_next(t)) {
 			// Check if we've passed the for-body end
 			if (for_name_hid && for_body_end_idx && tok_idx(t) > for_body_end_idx)
 				for_name_hid = false;
-			if (match_ch(t, '{')) { brace_depth++; continue; }
+			if (match_ch(t, '{')) {
+				if (prev && match_ch(prev, '(') && se_depth < 8)
+					se_brace[se_depth++] = brace_depth;
+				brace_depth++;
+				continue;
+			}
 			if (match_ch(t, '}')) {
 				brace_depth--;
+				if (se_depth > 0 && brace_depth == se_brace[se_depth - 1])
+					se_depth--;
 				if (decl_depth >= 0 && brace_depth < decl_depth)
 					decl_depth = -1; // local var went out of scope
 				if (in_decl && brace_depth < decl_bd) in_decl = false;
@@ -1353,16 +1362,16 @@ static void check_defer_var_shadow(Token *var_name) {
 			}
 			// '=' transitions from declarator to initializer expression.
 			// RHS identifiers are references, not declaration targets.
-			if (paren_depth == 0 && match_ch(t, '=')) { in_decl = false; continue; }
+			if (paren_depth == se_depth && match_ch(t, '=')) { in_decl = false; continue; }
 			// ',' after '=' re-enters declaration context for the next declarator.
 			// Only at the same brace depth as the declaration — commas inside
 			// brace initializers separate values, not declarators.
-			if (paren_depth == 0 && match_ch(t, ',') && was_in_decl && brace_depth == decl_bd) { in_decl = true; continue; }
+			if (paren_depth == se_depth && match_ch(t, ',') && was_in_decl && brace_depth == decl_bd) { in_decl = true; continue; }
 			// Track declaration context: type keywords, qualifiers, SUE tags.
 			// Only at paren_depth 0 — type keywords inside casts like
 			// (struct X *) must not set in_decl (they're not declarations).
 			// Exception: for-init context for(TYPE ...) at for_init_pd.
-			if (((brace_depth > 1 && paren_depth == 0) ||
+			if ((((brace_depth > 1 || se_depth > 0) && paren_depth == se_depth) ||
 			     (for_init_pd >= 0 && paren_depth == for_init_pd)) &&
 			    (is_type_keyword(t) || (t->tag & (TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_TYPEDEF)))) {
 				in_decl = true;
@@ -1377,11 +1386,11 @@ static void check_defer_var_shadow(Token *var_name) {
 				if (for_name_hid)
 					continue;
 				// At depth > 1: skip if name is locally declared in this block
-				if (brace_depth > 1 && decl_depth >= 0 && brace_depth >= decl_depth)
+				if ((brace_depth > 1 || se_depth > 0) && decl_depth >= 0 && brace_depth >= decl_depth)
 					continue;
 				// Name appears in a declaration context (after type keyword / comma)
 				// but NOT inside parens (typeof/sizeof/cast argument is not a decl target)
-				if (brace_depth > 1 && in_decl && paren_depth == 0) {
+				if ((brace_depth > 1 || se_depth > 0) && in_decl && paren_depth == se_depth) {
 					decl_depth = brace_depth;
 					continue;
 				}

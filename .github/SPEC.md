@@ -33,7 +33,7 @@ Defined in `parse.c`. Produces a flat pool of `Token` structs.
 | `match_idx` | `uint32_t` | Pool index of matching delimiter (0 = none) |
 | `len` | `uint32_t` | Byte length of the token text |
 | `kind` | `uint8_t` | `TK_IDENT`, `TK_KEYWORD`, `TK_PUNCT`, `TK_STR`, `TK_NUM`, `TK_PREP_DIR`, `TK_EOF` |
-| `flags` | `uint8_t` | `TF_AT_BOL`, `TF_HAS_SPACE`, `TF_IS_FLOAT`, `TF_OPEN`, `TF_CLOSE`, `TF_C23_ATTR`, `TF_RAW`, `TF_SIZEOF` |
+| `flags` | `uint8_t` | `TF_AT_BOL`, `TF_HAS_SPACE`, `TF_IS_FLOAT`, `TF_OPEN`, `TF_CLOSE`, `TF_C23_ATTR`, `TF_RAW`, `TF_SIZEOF` (also set on `__builtin_offsetof` and `offsetof`) |
 | `ann` | `uint8_t` | Pass 1 annotation flags (`P1_SCOPE_*`, `P1_OE_*`, `P1_IS_DECL`). Zeroed by `new_token()` on allocation. |
 
 Cold path data (`TokenCold`, separate array): `loc_offset`, `line_no` (21-bit), `file_idx` (11-bit).
@@ -77,8 +77,10 @@ Flag definitions:
 
 | Flag | Bit | Meaning |
 |---|---|---|
+| `P1_IS_TYPEDEF` | 0 | Token resolves to a real typedef at this position (baked by Phase 1 annotation pass) |
 | `P1_SCOPE_LOOP` | 1 | This `{` opens a loop body |
 | `P1_SCOPE_SWITCH` | 2 | This `{` opens a switch body |
+| `P1_HAS_ENTRY` | 3 | Token has any typedef-table entry (typedef, enum constant, shadow, or VLA variable) |
 | `P1_OE_BRACKET` | 4 | `orelse` inside array dimension brackets `[…]` |
 | `P1_OE_DECL_INIT` | 5 | `orelse` inside a declaration initializer |
 | `P1_IS_DECL` | 6 | Phase 1D: token starts a variable declaration |
@@ -108,6 +110,33 @@ ScopeInfo {
 
 Ancestor check (`scope_is_ancestor_or_self`): O(depth) walk up `parent_id` chain, typically < 10 hops.
 
+#### Pass 2 scope stack
+
+```
+ScopeKind enum:
+    SCOPE_BLOCK       — { ... } block scope
+    SCOPE_FOR_PAREN   — for( ... ) — first ';' ends init, not stmt
+    SCOPE_CTRL_PAREN  — if/while/switch( ... )
+    SCOPE_GENERIC     — _Generic( ... )
+    SCOPE_TERNARY     — ? ... : — popped on matching ':'
+```
+
+```
+ScopeNode {
+    defer_start_idx    : int       — index into defer stack at scope entry
+    kind               : uint8_t   — ScopeKind value
+    is_loop            : bool :1
+    is_switch          : bool :1
+    is_struct          : bool :1
+    has_zeroinit_decl  : bool :1   — scope contains at least one zero-initialized decl
+    is_stmt_expr       : bool :1   — GNU statement expression ({...})
+    is_orelse_guard     : bool :1   — orelse if-guard scope
+    is_ctrl_se         : bool :1   — stmt-expr inside ctrl parens (ctrl_state saved on ctrl_save_stack)
+}
+```
+
+The `scope_stack[]` is distinct from `scope_tree[]` (Phase 1A). The scope tree is a flat immutable array indexed by `scope_id`; the scope stack is a mutable LIFO stack driven by `{`/`}` during Pass 2 emission.
+
 #### Per-function metadata
 
 ```
@@ -122,6 +151,8 @@ FuncMeta {
     entry_start            : int      — start index into p1_entries[]
     entry_count            : int      — count of P1FuncEntry items
     defer_name_bloom       : uint64_t — FNV-1a bloom filter of identifiers in defer bodies
+    label_hash             : int*     — open-addressing hash table: name → entry index (-1=empty)
+    label_hash_mask        : int      — power-of-2 mask for label_hash probing
 }
 ```
 
@@ -138,8 +169,9 @@ P1FuncEntry {
     token_index  : uint32_t
     tok          : Token*
     union {
-        label  { name, len }                                      — for P1K_LABEL, P1K_GOTO
-        decl   { has_init, is_vla, has_raw, is_static_storage }    — for P1K_DECL
+        label  { name, len, exits }                                — for P1K_LABEL, P1K_GOTO (exits: pre-computed scope exits for P1K_GOTO)
+        decl   { has_init, is_vla, has_raw, is_static_storage,
+                 body_close_idx }                                  — for P1K_DECL (body_close_idx: braceless body end position, 0 = not braceless)
         kase   { switch_scope_id }                                 — for P1K_CASE
     }
 }
@@ -220,6 +252,7 @@ Each `TypedefEntry` records:
 - `token_index` — pool index of the declaration
 - `is_vla`, `is_void`, `is_const`, `is_ptr`, `is_array`, `is_aggregate` — type property flags
 - `is_shadow`, `is_enum_const`, `is_vla_var` — entry kind flags
+- `is_func` — set when the typedef resolves to a function type (used to suppress zero-init memset on function types)
 - `prev_index` — chain to previous entry for the same name
 
 **After Phase 1 completes, the typedef table is immutable.** No `typedef_add_entry` calls occur in Pass 2.
@@ -451,7 +484,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 ### Defer-variable shadow checking
 
-`check_defer_var_shadow` detects when a newly-declared variable name appears in an active defer body — this would silently capture the wrong variable at cleanup time. Uses `FuncMeta.defer_name_bloom` (a 64-bit FNV-1a bloom filter of all identifier names in defer bodies) for an O(1) fast-reject before the O(N×M) body walk — eliminates the walk in the common case when no name matches. The body walk tracks brace depth: identifiers inside nested `{ }` blocks within the defer body (depth > 1) are skipped, since they are local declarations that cannot conflict with outer-scope variables. This avoids false positives for patterns like `defer { { int tmp = 1; } }` where the inner `tmp` is purely internal to the defer body. The scanner also tracks C99 for-init declarations (`for(TYPE name = ...)`) via `for_init_pd`/`for_name_hid`/`for_body_bd`: when a for-init variable matches the target name, all references to that name within the for scope (condition, increment, and body) are treated as local rather than captured, preventing false positives.
+`check_defer_var_shadow` detects when a newly-declared variable name appears in an active defer body — this would silently capture the wrong variable at cleanup time. Uses `FuncMeta.defer_name_bloom` (a 64-bit FNV-1a bloom filter of all identifier names in defer bodies) for an O(1) fast-reject before the O(N×M) body walk — eliminates the walk in the common case when no name matches. The body walk tracks brace depth: identifiers inside nested `{ }` blocks within the defer body (depth > 1) are skipped, since they are local declarations that cannot conflict with outer-scope variables. This avoids false positives for patterns like `defer { { int tmp = 1; } }` where the inner `tmp` is purely internal to the defer body. GNU statement expressions `({...})` are tracked via `se_depth`/`se_brace[]`: when `({` is encountered, the scanner records the current brace depth and increments `se_depth`; declarations inside the statement expression are recognized as local (the `paren_depth == se_depth` check replaces the strict `paren_depth == 0` requirement), preventing false positives from hygienic macros like `SAFE_MAX(a, b)` that declare temporaries inside `({...})`. The scanner also tracks C99 for-init declarations (`for(TYPE name = ...)`) via `for_init_pd`/`for_name_hid`/`for_body_bd`: when a for-init variable matches the target name, all references to that name within the for scope (condition, increment, and body) are treated as local rather than captured, preventing false positives.
 
 The scan covers two ranges: enclosing-scope defers `[0, blk->defer_start_idx)` and same-block defers `[blk->defer_start_idx, defer_count)`. Enclosing-scope matches register a `DeferShadow` entry for deferred checking at control-flow exits (`check_defer_shadow_at_exit`). Same-block matches produce an immediate error — the shadowing variable is unconditionally live when the defer fires at block end, so no control-flow analysis is needed. For-init declarations are exempt from the same-block immediate error (they use deferred `DeferShadow` checking instead) because their implicit scope ends at the loop boundary. A token-index range guard (`var_idx ∈ [defer.stmt, defer.end)`) prevents false positives from declarations inside defer bodies matching against their own body (e.g., `defer { char buf[16]; ... }`).
 
@@ -526,6 +559,15 @@ The scan covers two ranges: enclosing-scope defers `[0, blk->defer_start_idx)` a
 
 **Feature flag:** `-fno-orelse` disables.
 
+**Keyword shadow disambiguation:** When the identifier `orelse` is shadowed by a variable, enum constant, or typedef name (`TT_ORELSE` tag co-exists with a typedef-table entry), four helper functions disambiguate:
+
+- `is_orelse_kw_shadow(tok)` — returns true when `tok` has `TT_ORELSE` AND has a typedef-table entry at that position (potential shadow conflict).
+- `is_orelse_kw(tok)` — returns true when `tok` has `TT_ORELSE` but is NOT shadowed (no typedef-table entry, or entry doesn't cover this token position). This is the fast path for unambiguous orelse keywords.
+- `orelse_shadow_is_kw(prev)` — given the token *before* the ambiguous `orelse`, returns true when context indicates keyword usage (not preceded by `TT_MEMBER` `.`/`->`, not preceded by value-producing tokens like `)`, `]`, identifiers, numbers that would make `orelse` an operand).
+- `is_orelse_keyword(tok)` — unified entry point: returns true if `tok` is an `orelse` keyword (either unambiguous via `is_orelse_kw`, or disambiguated via `orelse_shadow_is_kw` when shadowed). Uses `last_emitted` as the predecessor token for context checks.
+
+These helpers are used at 20+ call sites across Phase 1D prescan, Phase 1G orelse classification, and Pass 2 emit handlers to prevent variables/enums/typedefs named `orelse` from being misinterpreted as the keyword, and vice versa.
+
 ### 6.3 Zero-Initialization
 
 **Semantics:** All local variable declarations without an explicit initializer get one:
@@ -585,7 +627,7 @@ GNU statement expressions `({…})` are supported. They get their own scope in t
 
 **Const orelse VM-type restriction:** `handle_const_orelse_fallback` emits the type specifier twice — once for the mutable temporary and once for the final `const` declaration. When the type is variably-modified (`type->is_vla || decl.is_vla`), this forces the C compiler to evaluate VLA size expressions twice at runtime (ISO C11 §6.7.2.5). Prism rejects const-qualified VM-type orelse with a hard error: the user must hoist the value to a non-const variable first. This covers both VLA dimensions in the declarator suffix (e.g. `const int (*p)[get_size()]`) and in the type specifier via typeof (e.g. `const typeof(int[n]) *p`).
 
-### 6.4 Auto-Unreachable (`-fno-auto-unreachable`, default on)
+### 6.8 Auto-Unreachable (`-fno-auto-unreachable`, default on)
 
 **Semantics:** After emitting a call to a function classified as noreturn, Prism injects `__builtin_unreachable();` (or `__assume(0);` for MSVC). This propagates Prism's transitive noreturn knowledge into the backend compiler, enabling tail-call optimization, dead code elimination, and register pressure relief.
 
@@ -658,6 +700,7 @@ These limits are enforced with hard errors. Exceeding any limit halts transpilat
 | `-fno-safety` | Downgrade safety errors to warnings |
 | `-fflatten-headers` | Flatten system headers into single output |
 | `-fno-flatten-headers` | Disable header flattening |
+| `-fno-auto-unreachable` | Disable auto-unreachable injection after noreturn calls |
 | `--prism-cc=<compiler>` | Use specific compiler backend |
 | `--prism-verbose` | Show commands being executed |
 
@@ -707,7 +750,7 @@ void          prism_thread_cleanup(void);
 
 `prism_thread_cleanup` frees thread-local hash table buckets. Must be called before a thread exits to avoid leaks in long-lived host processes.
 
-`PrismFeatures` struct fields: `compiler`, `include_paths`, `defines`, `compiler_flags`, `force_includes` (with respective counts), plus boolean feature flags (`defer`, `zeroinit`, `line_directives`, `warn_safety`, `flatten_headers`, `orelse`).
+`PrismFeatures` struct fields: `compiler`, `include_paths`, `defines`, `compiler_flags`, `force_includes` (with respective counts), plus boolean feature flags (`defer`, `zeroinit`, `line_directives`, `warn_safety`, `flatten_headers`, `orelse`, `auto_unreachable`).
 
 `PrismResult` returns status (`PRISM_OK`, `PRISM_ERR_SYNTAX`, `PRISM_ERR_SEMANTIC`, `PRISM_ERR_IO`) and the transpiled source.
 
