@@ -5647,6 +5647,78 @@ static void test_bare_orelse_prepdir_fallback_concat(void) {
 	}
 }
 
+static void test_attr_bracket_orelse_queue_desync(void) {
+	printf("\n--- BUG: __attribute__ bracket desynchronizes dim queue ---\n");
+
+	// BUG: emit_bracket_orelse_temps scans the declarator range for '[' tokens
+	// but walks into GNU __attribute__((...)) balanced groups.  A '[' inside
+	// an attribute (e.g. sizeof(int[4]) in aligned()) is queued as a dim temp.
+	// Pass 2's parse_declarator calls decl_noise() which skips __attribute__
+	// entirely, so the attribute's bracket never consumes its queue slot.
+	// All subsequent real array dimensions read from the wrong queue position.
+
+	// Sub-test 1: __attribute__((aligned(sizeof(int[4])))) before VLA dims
+	{
+		const char *code =
+		    "int get_n(void) { return 3; }\n"
+		    "void f(int n) {\n"
+		    "    int arr __attribute__((aligned(sizeof(int[4])))) [n + 5] [n + 6] [n orelse 1];\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "attr_bracket_desync.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "attr-bracket-desync: transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			const char *fn = strstr(r.output, "void f(");
+			CHECK(fn != NULL, "attr-bracket-desync: found function");
+			if (fn) {
+				// __prism_dim_0 must hold n+5, __prism_dim_1 must hold n+6.
+				// The array must use [__prism_dim_0][__prism_dim_1] in order.
+				// If desync: [n + 5][__prism_dim_0] — dim_0 is n+5, not n+6.
+				const char *dim1 = strstr(fn, "__prism_dim_1");
+				CHECK(dim1 != NULL,
+				      "attr-bracket-desync: __prism_dim_1 must appear in output "
+				      "(second VLA dimension was not replaced)");
+				// Check that the array declaration uses dim_1 (not just dim_0 twice)
+				const char *arr = strstr(fn, "int arr");
+				if (arr) {
+					const char *dim1_in_arr = strstr(arr, "__prism_dim_1");
+					CHECK(dim1_in_arr != NULL && dim1_in_arr < arr + 300,
+					      "attr-bracket-desync: array must use __prism_dim_1 "
+					      "for second VLA dimension");
+				}
+			}
+		}
+		prism_free(&r);
+	}
+
+	// Sub-test 2: multiple attributes with brackets
+	{
+		const char *code =
+		    "void g(int n) {\n"
+		    "    int x __attribute__((aligned(sizeof(int[8])))) [n + 1] [n orelse 1];\n"
+		    "    (void)x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "attr_bracket_desync2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "attr-bracket-desync2: transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			const char *fn = strstr(r.output, "void g(");
+			if (fn) {
+				// [n + 1] should use __prism_dim_0, [n orelse 1] uses __prism_oe_.
+				// If desync: [n + 1] emits verbatim (consumed the -1 slot
+				// for [8]), and [n orelse 1] still works but dim_0 is orphaned.
+				const char *arr = strstr(fn, "int x");
+				if (arr) {
+					const char *dim0_in_arr = strstr(arr, "__prism_dim_0");
+					CHECK(dim0_in_arr != NULL && dim0_in_arr < arr + 200,
+					      "attr-bracket-desync2: first real dim must use "
+					      "__prism_dim_0 (not shifted by attribute bracket)");
+				}
+			}
+		}
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -5974,4 +6046,7 @@ void run_orelse_tests(void) {
 
 	// BUG: prepdir in orelse fallback branch concatenation (lib mode)
 	test_bare_orelse_prepdir_fallback_concat();
+
+	// BUG: __attribute__ bracket desynchronizes orelse dim queue
+	test_attr_bracket_orelse_queue_desync();
 }

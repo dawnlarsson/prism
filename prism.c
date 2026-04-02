@@ -2901,6 +2901,11 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 	bool any_orelse = false;
 
 	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
+		if (t->tag & TT_ATTR) {
+			Token *a = tok_next(t);
+			if (a && match_ch(a, '(') && tok_match(a)) t = tok_match(a);
+			continue;
+		}
 		if (!match_ch(t, '[')) continue;
 		if (t->flags & TF_C23_ATTR) { t = tok_match(t); continue; }
 		Token *close = tok_match(t);
