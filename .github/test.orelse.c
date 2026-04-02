@@ -5875,6 +5875,152 @@ static void test_init_cast_vla_orelse_crash(void) {
 	}
 }
 
+// BUG76: stmt-expr goto/return inside bracket orelse and const orelse
+// bypasses defer cleanup — emit_token_range_orelse and emit_range used
+// flat OUT_TOK/emit_tok loops that never invoked handle_goto_keyword.
+static void test_stmtexpr_goto_in_bracket_orelse_defer_bypass(void) {
+	/* Case 1: goto inside bracket orelse LHS stmt-expr must get defer cleanup */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int counter = 0;\n"
+		    "void f(void) {\n"
+		    "    {\n"
+		    "        defer { counter++; }\n"
+		    "        int arr[ ({ goto skip; 1; }) orelse 10 ];\n"
+		    "        (void)arr;\n"
+		    "    }\n"
+		    "    return;\n"
+		    "skip:\n"
+		    "    return;\n"
+		    "}\n",
+		    "bug76g.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "bug76-goto: transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			/* The goto must be wrapped with defer cleanup:
+			 * { counter++; goto skip; } or similar pattern */
+			const char *fn = strstr(r.output, "void f(");
+			CHECK(fn != NULL, "bug76-goto: function found");
+			if (fn) {
+				/* Look for counter++ BEFORE goto skip in the stmt-expr */
+				const char *oe_temp = strstr(fn, "__prism_oe_");
+				CHECK(oe_temp != NULL, "bug76-goto: orelse temp hoisted");
+				if (oe_temp) {
+					/* In the stmt-expr containing goto, defer cleanup
+					 * must appear (counter++) before the goto */
+					const char *goto_pos = strstr(oe_temp, "goto skip");
+					const char *cleanup = strstr(oe_temp, "counter++");
+					CHECK(goto_pos != NULL, "bug76-goto: goto found in output");
+					CHECK(cleanup != NULL && cleanup < goto_pos,
+					      "bug76-goto: defer cleanup emitted before goto");
+				}
+			}
+		}
+		prism_free(&r);
+	}
+
+	/* Case 2: return inside bracket orelse LHS stmt-expr must get defer cleanup */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int counter = 0;\n"
+		    "int f(void) {\n"
+		    "    defer { counter++; }\n"
+		    "    int arr[ ({ return 42; 1; }) orelse 10 ];\n"
+		    "    (void)arr;\n"
+		    "    return 0;\n"
+		    "}\n",
+		    "bug76r.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "bug76-return: transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			const char *fn = strstr(r.output, "int f(");
+			CHECK(fn != NULL, "bug76-return: function found");
+			if (fn) {
+				const char *oe_temp = strstr(fn, "__prism_oe_");
+				CHECK(oe_temp != NULL, "bug76-return: orelse temp hoisted");
+				if (oe_temp) {
+					/* Defer cleanup must be injected around the return */
+					const char *ret_pos = strstr(oe_temp, "return ");
+					const char *cleanup = strstr(oe_temp, "counter++");
+					CHECK(ret_pos != NULL, "bug76-return: return found in output");
+					CHECK(cleanup != NULL && cleanup < ret_pos,
+					      "bug76-return: defer cleanup emitted before return");
+				}
+			}
+		}
+		prism_free(&r);
+	}
+
+	/* Case 3: goto inside const orelse LHS stmt-expr must get defer cleanup */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int counter = 0;\n"
+		    "void f(void) {\n"
+		    "    {\n"
+		    "        defer { counter++; }\n"
+		    "        const int x = ({ goto bail; 42; }) orelse 99;\n"
+		    "        (void)x;\n"
+		    "    }\n"
+		    "    return;\n"
+		    "bail:\n"
+		    "    return;\n"
+		    "}\n",
+		    "bug76c.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "bug76-const-goto: transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			const char *fn = strstr(r.output, "void f(");
+			CHECK(fn != NULL, "bug76-const-goto: function found");
+			if (fn) {
+				const char *oe_temp = strstr(fn, "__prism_oe_");
+				CHECK(oe_temp != NULL, "bug76-const-goto: orelse temp hoisted");
+				if (oe_temp) {
+					const char *goto_pos = strstr(oe_temp, "goto");
+					const char *cleanup = strstr(oe_temp, "counter++");
+					CHECK(goto_pos != NULL, "bug76-const-goto: goto found");
+					CHECK(cleanup != NULL && cleanup < goto_pos,
+					      "bug76-const-goto: defer cleanup before goto");
+				}
+			}
+		}
+		prism_free(&r);
+	}
+}
+
+// BUG77: O(N^2) nested bracket orelse scanning — check_orelse_in_parens,
+// walk_balanced, and main emit loop rescanned nested [...] groups that had
+// no orelse, causing quadratic degradation on deep subscript chains.
+static void test_nested_bracket_orelse_no_quadratic(void) {
+	/* Generate arr[arr[arr[...[0]...]]] with 500 levels inside a function
+	 * call argument (parens trigger check_orelse_in_parens + walk_balanced).
+	 * Pre-fix: 500 levels caused measurable slowdown due to O(N^2).
+	 * Post-fix: linear scan, completes instantly. */
+	char code[64000];
+	int pos = 0;
+	pos += snprintf(code + pos, sizeof(code) - pos,
+	    "int arr[10];\n"
+	    "int use(int);\n"
+	    "void f(void) {\n"
+	    "    use(");
+	for (int i = 0; i < 500; i++)
+		pos += snprintf(code + pos, sizeof(code) - pos, "arr[");
+	pos += snprintf(code + pos, sizeof(code) - pos, "0");
+	for (int i = 0; i < 500; i++)
+		pos += snprintf(code + pos, sizeof(code) - pos, "]");
+	pos += snprintf(code + pos, sizeof(code) - pos,
+	    ");\n"
+	    "}\n");
+
+	PrismResult r = prism_transpile_source(code, "bug77_nested.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "bug77-nested-brackets: transpiles OK (no quadratic hang)");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "orelse") == NULL,
+		      "bug77-nested-brackets: no orelse in output");
+	}
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -6211,4 +6357,10 @@ void run_orelse_tests(void) {
 
 	// BUG: VLA orelse in cast inside declaration initializer false-positive crash
 	test_init_cast_vla_orelse_crash();
+
+	// BUG76: stmt-expr goto/return in bracket/const orelse bypasses defer cleanup
+	test_stmtexpr_goto_in_bracket_orelse_defer_bypass();
+
+	// BUG77: O(N^2) nested bracket orelse scanning
+	test_nested_bracket_orelse_no_quadratic();
 }

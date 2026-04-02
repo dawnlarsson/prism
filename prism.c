@@ -1186,7 +1186,16 @@ static void emit_tok(Token *tok) {
 }
 
 static void emit_range(Token *start, Token *end) {
-	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) emit_tok(t);
+	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
+		// Statement expression ({...}): route through walk_balanced
+		// which has the full keyword dispatcher (goto, return, defer).
+		if (match_ch(t, '(') && tok_next(t) && match_ch(tok_next(t), '{') && tok_match(t)) {
+			walk_balanced(t, true);
+			t = tok_match(t);
+			continue;
+		}
+		emit_tok(t);
+	}
 }
 
 // Like emit_range but skips TK_PREP_DIR tokens (for generated expressions
@@ -2811,6 +2820,12 @@ static Token *walk_balanced(Token *tok, bool emit) {
 					}
 				}
 				if (has_oe) { t = walk_balanced_orelse(t); continue; }
+				// No orelse — emit bracket contents verbatim (no nested
+				// orelse scan needed, avoiding O(N²) on nested brackets).
+				Token *bclose = tok_match(t);
+				while (t != bclose) { emit_tok(t); t = tok_next(t); }
+				emit_tok(t); t = tok_next(t);
+				continue;
 			}
 			// typeof with orelse inside: use orelse-aware walker
 			if (FEAT(F_ORELSE) && (t->tag & TT_TYPEOF) && tok_next(t) && match_ch(tok_next(t), '(')) {
@@ -2847,6 +2862,13 @@ static void emit_token_range_orelse(Token *start, Token *end) {
 		// groups to catch orelse nested inside function args, etc.
 		for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
 			if (t != start) out_char(' ');
+			// Statement expression ({...}): route through walk_balanced
+			// which has the full keyword dispatcher (goto, return, defer).
+			if (match_ch(t, '(') && tok_next(t) && match_ch(tok_next(t), '{') && tok_match(t)) {
+				walk_balanced(t, true);
+				t = tok_match(t);
+				continue;
+			}
 			if ((t->flags & TF_OPEN) && (match_ch(t, '(') || match_ch(t, '['))) {
 				Token *close = tok_match(t);
 				if (close && close != end) {
@@ -3563,7 +3585,9 @@ static void check_orelse_in_parens(Token *open) {
 					if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; }
 				}
 			}
-			if (has_oe) { t = tok_match(t); continue; }
+			// Skip bracket group unconditionally — either it has orelse
+			// (handled by walk_balanced_orelse) or it doesn't (nothing to do).
+			t = tok_match(t); continue;
 		}
 		// Skip typeof/typeof_unqual contents — orelse inside typeof is
 		// handled separately by the typeof orelse path in walk_balanced.
@@ -8585,8 +8609,10 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				     match_ch(tok, '[') && (tok->flags & TF_OPEN) && tok_match(tok), 0)) {
 			bool has_oe = tok_ann(tok) & P1_OE_BRACKET;
 			if (!has_oe)
-				for (Token *s = tok_next(tok); s && s != tok_match(tok); s = tok_next(s))
+				for (Token *s = tok_next(tok); s && s != tok_match(tok); s = tok_next(s)) {
 					if (is_orelse_keyword(s)) { has_oe = true; break; }
+					if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; }
+				}
 			if (has_oe) {
 				tok = walk_balanced_orelse(tok);
 				continue;
