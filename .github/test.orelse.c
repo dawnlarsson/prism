@@ -6336,6 +6336,22 @@ static void test_orelse_shadow_typedef(void) {
 	prism_free(&r);
 }
 
+// BUG92: chained assignment a = b = f() orelse 5 split-brain.
+// The bare orelse scanner must find the LAST = at depth 0, placing
+// the intermediate = in the LHS range so reject_orelse_side_effects
+// catches it.  Previously it found the FIRST =, leaving b=0.
+static void test_orelse_chained_assign_rejected(void) {
+	check_orelse_transpile_rejects(
+	    "int f(void) { return 0; }\n"
+	    "void test(void) {\n"
+	    "    int a, b;\n"
+	    "    a = b = f() orelse 5;\n"
+	    "}\n",
+	    "orelse_chained_assign.c",
+	    "BUG92: chained assignment orelse rejected",
+	    "side effect");
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -6700,4 +6716,7 @@ void run_orelse_tests(void) {
 	test_orelse_shadow_variable();
 	test_orelse_shadow_enum();
 	test_orelse_shadow_typedef();
+
+	// BUG92: chained assignment split-brain
+	test_orelse_chained_assign_rejected();
 }

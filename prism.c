@@ -6270,7 +6270,10 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 	}
 	Token *post_comma_t = last_comma ? tok_next(last_comma) : t;
 
-	// Find assignment target (= at depth 0 before orelse)
+	// Find assignment target (last = at depth 0 before orelse).
+	// Must find the LAST = so that chained assignments like
+	// a = b = f() orelse 5 are caught by reject_orelse_side_effects
+	// (the first = lands in the LHS range and triggers the error).
 	Token *bare_lhs_start = post_comma_t;
 	Token *bare_assign_eq = NULL;
 	{
@@ -6283,7 +6286,6 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 					error_tok(s, "bare assignment with 'orelse' cannot use compound operators "
 						  "(e.g. +=, -=); use a plain '=' assignment");
 				bare_assign_eq = s;
-				break;
 			}
 		}
 	}
@@ -7273,13 +7275,28 @@ static void p1_full_depth_prescan(Token *tok) {
 		       tok_idx(tok) > p1d_switch_end[p1d_switch_top - 1])
 			p1d_switch_top--;
 
-		// Phase 1: record file-scope function prototypes/definitions.
-		// Any ident followed by '(' at brace_depth==0 is a candidate.
-		// Used by Pass 2 to replace the O(N) token pool scan for typeof(func).
-		if (brace_depth == 0 && tok->kind == TK_IDENT) {
+		// Phase 1: record function prototypes/definitions.
+		// At brace_depth==0, any ident( is a file-scope prototype/def.
+		// At brace_depth>0, require a type keyword/qualifier before the
+		// ident to distinguish block-scope declarations (int add(int,int);)
+		// from function calls (fp(10)).  Without this, typeof(func)
+		// for block-scope-only forward declarations triggers spurious
+		// memset in process_declarators.
+		// Used by Pass 2 to avoid memset on typeof(func) declarations.
+		if (tok->kind == TK_IDENT) {
 			Token *nx = tok_next(tok);
-			if (nx && match_ch(nx, '('))
-				hashmap_put(&p1_func_proto_map, tok_loc(tok), tok->len, (void *)1);
+			if (nx && match_ch(nx, '(')) {
+				if (brace_depth == 0) {
+					hashmap_put(&p1_func_proto_map, tok_loc(tok), tok->len, (void *)1);
+				} else {
+					uint32_t ti = tok_idx(tok);
+					if (ti > 0) {
+						Token *prev = &token_pool[ti - 1];
+						if (prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE | TT_TYPEOF))
+							hashmap_put(&p1_func_proto_map, tok_loc(tok), tok->len, (void *)1);
+					}
+				}
+			}
 		}
 
 		// == Phase 1G inline: classify bracket orelse ==

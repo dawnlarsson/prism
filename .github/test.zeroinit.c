@@ -2962,6 +2962,28 @@ static void test_struct_body_stmt_expr_features(void) {
 	}
 }
 
+// BUG93: block-scope function prototype typeof memset.
+// A block-scope forward declaration like 'int add(int, int);' inside a
+// function body was not recorded in p1_func_proto_map (brace_depth > 0),
+// so typeof(add) triggered a spurious __builtin_memset on a function type.
+static void test_typeof_block_scope_func_proto(void) {
+	printf("\n--- BUG93: block-scope function proto typeof memset ---\n");
+	const char *code =
+	    "void f(void) {\n"
+	    "    int add(int, int);\n"
+	    "    typeof(add) my_func;\n"
+	    "    (void)my_func;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "bug93.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "BUG93: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "__builtin_memset") == NULL &&
+		      strstr(r.output, "= {0}") == NULL,
+		      "BUG93: typeof(block_scope_func) must NOT emit zero-init");
+	}
+	prism_free(&r);
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -3115,4 +3137,7 @@ void run_zeroinit_tests(void) {
 
 	// BUG91: skip_one_stmt label parsing
 	test_skip_one_stmt_label_parsing();
+
+	// BUG93: block-scope function prototype typeof memset
+	test_typeof_block_scope_func_proto();
 }
