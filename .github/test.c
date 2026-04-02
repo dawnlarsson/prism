@@ -169,6 +169,9 @@ static bool is_emulated(void) {
 		}
 		fclose(f);
 	}
+	/* Docker QEMU: /.dockerenv exists when running inside a container */
+	if (access("/.dockerenv", F_OK) == 0)
+		return true;
 	/* System-mode QEMU: device tree advertises the virtual machine */
 	f = fopen("/sys/firmware/devicetree/base/compatible", "rb");
 	if (f) {
