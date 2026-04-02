@@ -4892,6 +4892,37 @@ static void test_defer_shadow_stmt_expr_local_false_positive(void) {
 	}
 }
 
+// BUG90: braceless inner switch caused find_switch_scope to leak to outer switch,
+// resetting defer_count and silently wiping registered defers.
+static void test_braceless_switch_defer_wipe(void) {
+	printf("\n--- Braceless Switch Defer Wipe (BUG90) ---\n");
+
+	// Defer in outer switch must survive a braceless inner switch
+	{
+		PrismResult r = prism_transpile_source(
+		    "int result = 0;\n"
+		    "void test(int outer, int inner) {\n"
+		    "    switch (outer) {\n"
+		    "        case 0: {\n"
+		    "            defer { result = 42; }\n"
+		    "            switch (inner)\n"
+		    "                if (inner == 1) {\n"
+		    "                    case 1:\n"
+		    "                        break;\n"
+		    "                }\n"
+		    "        }\n"
+		    "    }\n"
+		    "}\n",
+		    "braceless_sw_defer.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "braceless-sw-defer: transpiles OK");
+		CHECK(r.output != NULL, "braceless-sw-defer: output not NULL");
+		// The defer body must appear in the output (not be wiped)
+		CHECK(strstr(r.output, "result = 42") != NULL,
+		      "braceless-sw-defer: defer must not be wiped by braceless inner switch");
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_bug();

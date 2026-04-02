@@ -1097,12 +1097,6 @@ static void defer_add(Token *defer_keyword, Token *start, Token *end) {
 	defer_stack[defer_count++] = (DeferEntry){start, end, defer_keyword};
 }
 
-static int find_switch_scope(void) {
-	for (int d = ctx->scope_depth - 1; d >= 0; d--)
-		if (scope_stack[d].kind == SCOPE_BLOCK && scope_stack[d].is_switch) return d;
-	return -1;
-}
-
 
 static bool needs_space(Token *prev, Token *tok) {
 	if (!prev || tok_at_bol(tok)) return false;
@@ -3549,10 +3543,8 @@ static Token *handle_const_orelse_fallback(Token *tok,
 		// The old &*(T)0 trick dereferences void* which is a constraint violation
 		// under C99 §6.5.3.2p2 (GCC/Clang tolerate it, but it's non-conforming).
 		bool const_td_is_ptr = false;
-		bool const_td_is_array = false;
 		for (Token *t = type_start; t != type->end; t = tok_next(t)) {
 			if (is_ptr_typedef(t)) { const_td_is_ptr = true; break; }
-			if (is_array_typedef(t)) { const_td_is_array = true; break; }
 		}
 
 		if (pragma_start != type_start)
@@ -3563,12 +3555,6 @@ static Token *handle_const_orelse_fallback(Token *tok,
 			out_char(' '); emit_typeof_keyword(); OUT_LIT("((");
 			emit_type_range(type_start, type->end, strip_type_const, true);
 			OUT_LIT(")0)");
-		} else if (const_td_is_array) {
-			out_char(' '); emit_typeof_keyword(); OUT_LIT("(*(0 ? (");
-			emit_type_range(type_start, type->end, strip_type_const, true);
-			OUT_LIT("*)0 : (");
-			emit_type_range(type_start, type->end, strip_type_const, true);
-			OUT_LIT("*)0))");
 		} else {
 			out_char(' '); emit_typeof_keyword(); OUT_LIT("((");
 			emit_type_range(type_start, type->end, strip_type_const, true);
@@ -5090,30 +5076,7 @@ static Token *handle_goto_keyword(Token *tok) {
 }
 
 static void handle_case_default(Token *tok) {
-	if (!FEAT(F_DEFER)) return;
-	// Braceless switch: ctrl_state.pending is still active, meaning no
-	// SCOPE_BLOCK was pushed for this switch.  find_switch_scope() would
-	// leak through to an enclosing braced switch and corrupt its defer
-	// stack.  Braceless bodies can't contain defers, so just bail out.
-	if (ctrl_state.pending && ctrl_state.parens_just_closed) return;
-	int sd = find_switch_scope();
-	if (sd < 0) return;
-	bool is_case = tok->tag & TT_CASE;
-	bool is_default = (tok->tag & TT_DEFAULT) && !in_generic();
-	if (is_default) {
-		Token *t = skip_noise(tok_next(tok));
-		if (!t || !match_ch(t, ':')) return;
-	}
-	if (!is_case && !is_default) return;
-
-	// Defer-fallthrough and zero-init-bypass errors are now caught by
-	// p1_verify_cfg (Phase 2A) before any code is emitted.  Pass 2 only
-	// needs to reset the defer stack to the switch scope level so that
-	// defers emitted in previous case arms don't bleed into the next one.
-	for (int d = ctx->scope_depth - 1; d >= sd; d--) {
-		if (scope_stack[d].kind != SCOPE_BLOCK) continue;
-		defer_count = scope_stack[d].defer_start_idx;
-	}
+	(void)tok; // defer-fallthrough is caught by p1_verify_cfg (Phase 2A)
 }
 
 static Token *handle_sue_body(Token *tok) {
@@ -6909,6 +6872,14 @@ restart:
 		Token *a = skip_prep_dirs(tok_next(tok_match(p2)));
 		tok = (a && match_ch(a, ';')) ? a : NULL;
 		goto unwind_if;
+	}
+
+	// User-defined label: ident ':' (not '::')
+	if (is_identifier_like(tok) && !(tok->tag & (TT_CASE | TT_DEFAULT | TT_TYPE | TT_QUALIFIER | TT_STORAGE))) {
+		Token *colon = skip_noise(tok_next(tok));
+		if (colon && match_ch(colon, ':') && !(tok_next(colon) && match_ch(tok_next(colon), ':'))) {
+			tok = tok_next(colon); goto restart;
+		}
 	}
 
 	// 'case' / 'default' label: skip expr + ':', tail-call on body

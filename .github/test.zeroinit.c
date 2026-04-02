@@ -2842,6 +2842,60 @@ static void test_switch_for_init_not_rejected(void) {
 	}
 }
 
+// BUG91: skip_one_stmt didn't handle user labels (L: stmt), causing it to
+// over-consume tokens past the labeled statement, extending variable scopes
+// and triggering false CFG verifier rejections.
+static void test_skip_one_stmt_label_parsing(void) {
+	printf("\n--- skip_one_stmt Label Parsing (BUG91) ---\n");
+
+	// Label before braceless if body in for loop
+	{
+		PrismResult r = prism_transpile_source(
+		    "void test(void) {\n"
+		    "    goto SAFE_TARGET;\n"
+		    "    for (int secret = 0; secret < 1; secret++)\n"
+		    "        L: if (1) { }\n"
+		    "    SAFE_TARGET: ;\n"
+		    "    int safe_var = 1;\n"
+		    "    (void)safe_var;\n"
+		    "}\n",
+		    "label_skip.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "label-skip: goto past labeled braceless for body must not be rejected");
+		prism_free(&r);
+	}
+
+	// Multiple chained labels
+	{
+		PrismResult r = prism_transpile_source(
+		    "void test(void) {\n"
+		    "    goto END;\n"
+		    "    for (int x = 0; x < 1; x++)\n"
+		    "        A: B: C: if (1) { }\n"
+		    "    END: ;\n"
+		    "}\n",
+		    "chain_label_skip.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "chain-label-skip: chained labels before braceless body must work");
+		prism_free(&r);
+	}
+
+	// Label before braced block in while loop
+	{
+		PrismResult r = prism_transpile_source(
+		    "void test(void) {\n"
+		    "    goto DONE;\n"
+		    "    while (0)\n"
+		    "        BODY: { }\n"
+		    "    DONE: ;\n"
+		    "}\n",
+		    "label_while_skip.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "label-while-skip: label before braced while body must work");
+		prism_free(&r);
+	}
+}
+
 // BUG89: emit_type_range stmt-expr bypass in struct bodies
 static void test_struct_body_stmt_expr_features(void) {
 	printf("\n--- Struct Body Statement Expression Features (BUG89) ---\n");
@@ -3058,4 +3112,7 @@ void run_zeroinit_tests(void) {
 #ifdef __GNUC__
 	test_struct_body_stmt_expr_features();
 #endif
+
+	// BUG91: skip_one_stmt label parsing
+	test_skip_one_stmt_label_parsing();
 }
