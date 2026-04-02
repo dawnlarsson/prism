@@ -1911,6 +1911,13 @@ static void emit_type_range(Token *start, Token *end, bool strip_const, bool str
 	int raw_depth = 0;
 	for (Token *t = start; t && t != end && t->kind != TK_EOF;) {
 		if (strip_const && (t->tag & TT_CONST)) { t = tok_next(t); continue; }
+		// Statement expression ({...}): route through walk_balanced
+		// which has the full keyword dispatcher (defer, goto, zeroinit).
+		if (match_ch(t, '(') && tok_next(t) && match_ch(tok_next(t), '{') && tok_match(t)) {
+			walk_balanced(t, true);
+			t = tok_next(tok_match(t));
+			continue;
+		}
 		if (match_ch(t, '{')) raw_depth++;
 		if (match_ch(t, '}')) raw_depth--;
 		if (raw_depth == 0 && (t->flags & TF_RAW) && !is_known_typedef(t)) {

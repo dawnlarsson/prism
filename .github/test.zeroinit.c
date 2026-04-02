@@ -2842,6 +2842,72 @@ static void test_switch_for_init_not_rejected(void) {
 	}
 }
 
+// BUG89: emit_type_range stmt-expr bypass in struct bodies
+static void test_struct_body_stmt_expr_features(void) {
+	printf("\n--- Struct Body Statement Expression Features (BUG89) ---\n");
+
+	// Test 1: zeroinit inside struct body statement expression (array size)
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    struct S { int x[({ int vla[n]; (void)vla; 1; })]; } obj;\n"
+		    "    (void)obj;\n"
+		    "}\n",
+		    "struct_se_zeroinit.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "struct-se-zeroinit: transpiles OK");
+		CHECK(r.output != NULL, "struct-se-zeroinit: output not NULL");
+		CHECK(strstr(r.output, "memset") != NULL,
+		      "struct-se-zeroinit: VLA inside struct stmt-expr must get memset");
+		prism_free(&r);
+	}
+
+	// Test 2: defer inside struct body statement expression
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    struct S { int x[({ { defer (void)0; } 1; })]; } obj;\n"
+		    "    (void)obj;\n"
+		    "}\n",
+		    "struct_se_dfr.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "struct-se-defer: transpiles OK");
+		CHECK(r.output != NULL, "struct-se-defer: output not NULL");
+		// Check that 'defer' keyword doesn't appear verbatim (skip #line directives)
+		{
+			const char *p = r.output;
+			bool found_defer = false;
+			while ((p = strstr(p, "defer")) != NULL) {
+				// Skip occurrences inside #line directives (filenames)
+				const char *line_start = p;
+				while (line_start > r.output && line_start[-1] != '\n') line_start--;
+				if (line_start[0] != '#') { found_defer = true; break; }
+				p += 5;
+			}
+			CHECK(!found_defer,
+			      "struct-se-defer: defer inside struct stmt-expr must be processed");
+		}
+		prism_free(&r);
+	}
+
+	// Test 3: raw keyword inside struct body statement expression
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    struct S { int x[({ raw int y = 1; y; })]; } obj;\n"
+		    "    (void)obj;\n"
+		    "}\n",
+		    "struct_se_raw.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "struct-se-raw: transpiles OK");
+		CHECK(r.output != NULL, "struct-se-raw: output not NULL");
+		// 'raw' keyword should be stripped (not emitted verbatim)
+		CHECK(strstr(r.output, "raw int y") == NULL,
+		      "struct-se-raw: raw keyword inside struct stmt-expr must be stripped");
+		// But the declaration itself should remain
+		CHECK(strstr(r.output, "int y = 1") != NULL,
+		      "struct-se-raw: declaration preserved after raw stripping");
+		prism_free(&r);
+	}
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -2987,4 +3053,9 @@ void run_zeroinit_tests(void) {
 
 	// BUG: CFG verifier P1K_CASE body_close_idx desync
 	test_switch_for_init_not_rejected();
+
+	// BUG89: emit_type_range stmt-expr bypass in struct bodies
+#ifdef __GNUC__
+	test_struct_body_stmt_expr_features();
+#endif
 }
