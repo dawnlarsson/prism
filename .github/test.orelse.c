@@ -5788,6 +5788,93 @@ static void test_static_raw_orelse_keyword_leak(void) {
 	}
 }
 
+/*
+ * BUG: VLA orelse inside a cast in a declaration initializer crashes with
+ * false-positive "'orelse' cannot be used inside parentheses".
+ *
+ * Root cause: process_declarators forces all initializer parens through
+ * check_orelse_in_parens → walk_balanced.  check_orelse_in_parens found
+ * orelse inside the brackets and rejected it; walk_balanced would emit it
+ * raw.  Both paths failed because Phase 1G never annotated the brackets
+ * (Phase 1D skipped the entire paren group).
+ *
+ * Fix: check_orelse_in_parens and walk_balanced now do runtime orelse
+ * detection inside brackets, falling back from the P1_OE_BRACKET
+ * annotation when it's absent.
+ */
+static void test_init_cast_vla_orelse_crash(void) {
+	/* Sub-test 1: bare expression cast (was already working) */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    void *ptr;\n"
+		    "    ptr = (int(*)[n orelse 1]) 0;\n"
+		    "}\n",
+		    "cast_vla_bare.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "cast-vla-orelse-bare: must succeed");
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "cast-vla-orelse-bare: orelse must not leak");
+		}
+		prism_free(&r);
+	}
+
+	/* Sub-test 2: declaration initializer cast (was crashing) */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    void *ptr = (int(*)[n orelse 1]) 0;\n"
+		    "}\n",
+		    "cast_vla_init.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "cast-vla-orelse-init: must succeed (was false-positive crash)");
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "cast-vla-orelse-init: orelse must not leak");
+			/* Verify the ternary transformation happened */
+			CHECK(strstr(r.output, "?") != NULL,
+			      "cast-vla-orelse-init: must contain ternary");
+		}
+		prism_free(&r);
+	}
+
+	/* Sub-test 3: sizeof with VLA cast in initializer */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    unsigned long sz = sizeof(int[n orelse 1]);\n"
+		    "    (void)sz;\n"
+		    "}\n",
+		    "sizeof_vla_init.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "sizeof-vla-orelse-init: must succeed");
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "sizeof-vla-orelse-init: orelse must not leak");
+		}
+		prism_free(&r);
+	}
+
+	/* Sub-test 4: both bare and init on same variable in same function */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    void *p;\n"
+		    "    p = (int(*)[n orelse 1]) 0;\n"
+		    "    void *q = (int(*)[n orelse 1]) 0;\n"
+		    "}\n",
+		    "cast_vla_both.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "cast-vla-orelse-both: must succeed");
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "cast-vla-orelse-both: orelse must not leak");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -6121,4 +6208,7 @@ void run_orelse_tests(void) {
 
 	// BUG: static/extern raw orelse keyword leak via verbatim bypass
 	test_static_raw_orelse_keyword_leak();
+
+	// BUG: VLA orelse in cast inside declaration initializer false-positive crash
+	test_init_cast_vla_orelse_crash();
 }

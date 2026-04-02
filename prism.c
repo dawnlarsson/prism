@@ -444,6 +444,7 @@ static PRISM_THREAD_LOCAL int current_func_idx = -1; // Index into func_meta[] f
 static PRISM_THREAD_LOCAL int goto_entry_cursor = 0; // Cursor into entries[] for next P1K_GOTO lookup
 static PRISM_THREAD_LOCAL bool p1_typedef_annotated; // true after p1_annotate_typedefs(); enables O(1) is_known_typedef
 static PRISM_THREAD_LOCAL bool p1_file_has_orelse;   // true if any TT_ORELSE token exists in token stream
+static PRISM_THREAD_LOCAL HashMap p1_func_proto_map;  // file-scope ident followed by '(' → (void*)1
 
 // Track variables that shadow a name captured by a defer in an enclosing scope.
 // The shadow is only dangerous if a control-flow exit pastes the defer while the
@@ -689,6 +690,7 @@ static void reset_transpiler_state(void) {
 	current_func_idx = -1;
 	p1_typedef_annotated = false;
 	p1_file_has_orelse = false;
+	hashmap_zero(&p1_func_proto_map);
 
 	// Clear arena-allocated arrays — prevents dangling pointers after arena_reset.
 	defer_count = 0;
@@ -2797,6 +2799,19 @@ static Token *walk_balanced(Token *tok, bool emit) {
 				else t = inner;
 				continue;
 			}
+			// Bracket orelse: dispatch to orelse-aware walker.
+			// Check annotation first, then runtime scan for brackets
+			// inside groups that Phase 1G never visited.
+			if (FEAT(F_ORELSE) && (t->flags & TF_OPEN) && match_ch(t, '[') && tok_match(t)) {
+				bool has_oe = !!(tok_ann(t) & P1_OE_BRACKET);
+				if (!has_oe) {
+					for (Token *s = tok_next(t); s && s != tok_match(t); s = tok_next(s)) {
+						if (is_orelse_keyword(s)) { has_oe = true; break; }
+						if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; }
+					}
+				}
+				if (has_oe) { t = walk_balanced_orelse(t); continue; }
+			}
 			// typeof with orelse inside: use orelse-aware walker
 			if (FEAT(F_ORELSE) && (t->tag & TT_TYPEOF) && tok_next(t) && match_ch(tok_next(t), '(')) {
 				emit_tok(t);           // typeof keyword
@@ -3536,6 +3551,20 @@ static void check_orelse_in_parens(Token *open) {
 	if (match_ch(open, '(') && tok_next(open) && match_ch(tok_next(open), '{') && close)
 		return;
 	for (Token *pi = open, *t = tok_next(open); t != close; pi = t, t = tok_next(t)) {
+		// Skip brackets containing orelse — these are VLA dimensions
+		// handled by walk_balanced_orelse.  Check annotation first
+		// (fast path), then fall back to runtime scan for brackets
+		// inside balanced groups that Phase 1G never visited.
+		if ((t->flags & TF_OPEN) && match_ch(t, '[') && tok_match(t)) {
+			bool has_oe = !!(tok_ann(t) & P1_OE_BRACKET);
+			if (!has_oe) {
+				for (Token *s = tok_next(t); s && s != tok_match(t); s = tok_next(s)) {
+					if (is_orelse_keyword(s)) { has_oe = true; break; }
+					if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; }
+				}
+			}
+			if (has_oe) { t = tok_match(t); continue; }
+		}
 		// Skip typeof/typeof_unqual contents — orelse inside typeof is
 		// handled separately by the typeof orelse path in walk_balanced.
 		if ((t->tag & TT_TYPEOF) && tok_next(t) && match_ch(tok_next(t), '(') &&
@@ -3872,35 +3901,10 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 				}
 			}
 			// func_meta only has defined functions.  Also check for
-			// forward declarations at file scope: ident followed by '('.
+			// forward declarations at file scope via Phase 1 hash map.
 			if (!is_func_type && typeof_ident_loc) {
-				int bd = 0;
-				for (uint32_t ti = 1; ti < token_count && !is_func_type; ti++) {
-					Token *t = &token_pool[ti];
-					if (t->kind == TK_PREP_DIR) continue;
-					if (match_ch(t, '{')) { bd++; continue; }
-					if (match_ch(t, '}')) { if (bd > 0) bd--; continue; }
-					if (bd != 0) continue;
-					// Skip balanced () after expression keywords that
-					// can invoke funcptrs at file scope without declaring
-					// a function: sizeof, _Alignof, _Static_assert, _Generic.
-					if (t->kind <= TK_KEYWORD &&
-					    (equal(t, "sizeof") || equal(t, "_Alignof") || equal(t, "alignof") ||
-					     equal(t, "_Static_assert") || equal(t, "static_assert") ||
-					     equal(t, "_Alignas") || equal(t, "alignas") || equal(t, "_Generic"))) {
-						Token *nx = tok_next(t);
-						if (nx && match_ch(nx, '(') && tok_match(nx)) {
-							ti = tok_idx(tok_match(nx));
-							continue;
-						}
-					}
-					if (t->kind == TK_IDENT && t->len == typeof_ident_len &&
-					    !memcmp(tok_loc(t), typeof_ident_loc, typeof_ident_len)) {
-						Token *nx = tok_next(t);
-						if (nx && match_ch(nx, '('))
-							is_func_type = true;
-					}
-				}
+				if (hashmap_get(&p1_func_proto_map, typeof_ident_loc, typeof_ident_len))
+					is_func_type = true;
 			}
 		}
 		// Only queue memset when zeroinit feature is enabled.
@@ -6949,6 +6953,15 @@ static void p1_full_depth_prescan(Token *tok) {
 		       tok_idx(tok) > p1d_switch_end[p1d_switch_top - 1])
 			p1d_switch_top--;
 
+		// Phase 1: record file-scope function prototypes/definitions.
+		// Any ident followed by '(' at brace_depth==0 is a candidate.
+		// Used by Pass 2 to replace the O(N) token pool scan for typeof(func).
+		if (brace_depth == 0 && tok->kind == TK_IDENT) {
+			Token *nx = tok_next(tok);
+			if (nx && match_ch(nx, '('))
+				hashmap_put(&p1_func_proto_map, tok_loc(tok), tok->len, (void *)1);
+		}
+
 		// == Phase 1G inline: classify bracket orelse ==
 		if (FEAT(F_ORELSE) && match_ch(tok, '[') && tok_match(tok))
 			p1d_classify_bracket_orelse(tok, CUR_SID(), p1d_cur_func);
@@ -8716,6 +8729,8 @@ PRISM_API void prism_thread_cleanup(void) {
 	memset(&typedef_table, 0, sizeof(typedef_table));
 	free(p1_shadow_map.buckets);
 	memset(&p1_shadow_map, 0, sizeof(p1_shadow_map));
+	free(p1_func_proto_map.buckets);
+	memset(&p1_func_proto_map, 0, sizeof(p1_func_proto_map));
 
 	// Reset all TLS statics so a subsequent prism_ctx_init() starts clean
 	system_include_list = NULL;
