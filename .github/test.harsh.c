@@ -225,6 +225,24 @@ static void test_harsh_mismatched_delimiters_rejected(void) {
     }
 }
 
+static void test_harsh_c23_attr_defer_stmt_expr_chain(void) {
+    /* BUG: p1_check_defer_stmt_expr_chain handled GNU __attribute__ but not
+     * C23 [[...]] attributes.  A [[...]] between the inner scope's '}' and
+     * the stmt-expr's '}' broke the chain walk, so Phase 1D silently missed
+     * the defer-in-stmt-expr violation (two-pass invariant violation). */
+    const char *bad[] = {
+        "int f(void) { return ({ int r = 0; { defer { r = 99; } r = 1; } [[gnu::cold]]; }); }\n",
+        "int f(void) { return ({ int r = 0; { defer { r = 99; } r = 1; } [[maybe_unused]]; }); }\n",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        PrismResult r = prism_transpile_source(bad[i], "harsh_c23_se.c", prism_defaults());
+        char name[96];
+        snprintf(name, sizeof(name), "harsh c23 attr defer stmt-expr: case %zu rejected", i + 1);
+        CHECK(r.status != PRISM_OK, name);
+        prism_free(&r);
+    }
+}
+
 void run_harsh_review_tests(void) {
 #ifndef _MSC_VER
     test_harsh_vla_sizeof_side_effect();
@@ -241,4 +259,5 @@ void run_harsh_review_tests(void) {
     test_harsh_defer_control_scope_leaks();
     test_harsh_multihop_special_wrapper_propagation();
     test_harsh_mismatched_delimiters_rejected();
+    test_harsh_c23_attr_defer_stmt_expr_chain();
 }

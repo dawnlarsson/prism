@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 1.0.3
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4003+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4040+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -468,7 +468,7 @@ Tokens with tag bits or at statement boundaries are dispatched to handlers:
 | `ret_counter` | Monotonic counter for generating unique defer-cleanup label names |
 | `block_depth` | Current block nesting depth |
 | Line directive state | Last emitted line number for `#line` directive deduplication |
-| `CtrlState` | Braceless control flow tracking: `pending`, `pending_for_paren`, `parens_just_closed`, `pending_orelse_guard`, `brace_depth` |
+| `CtrlState` | Braceless control flow tracking: `pending`, `pending_for_paren`, `parens_just_closed`, `brace_depth` |
 
 ### Defer emission
 
@@ -552,7 +552,7 @@ The scan covers two ranges: enclosing-scope defers `[0, blk->defer_start_idx)` a
 
 **Invalid contexts:** Detected at two stages:
 
-- **Phase 1 (early rejection):** Bracket orelse at file scope, bracket orelse with control-flow actions (return/goto/break/continue) or block form, orelse inside enum bodies (compile-time constant context), typeof-orelse inside struct/union bodies. The typeof-in-struct check runs during `p1_full_depth_prescan` using the scope tree's `is_struct` flag; the enum check uses `is_enum` on the scope tree.
+- **Phase 1 (early rejection):** Bracket orelse at file scope, bracket orelse with control-flow actions (return/goto/break/continue) or block form, orelse inside enum bodies (compile-time constant context), typeof-orelse inside struct/union bodies, empty orelse action (`orelse ;` — caught by `p1d_validate_bare_orelse` before the missing-target check), anonymous struct/union multi-declarator splits (when bracket orelse or typeof/VLA memset would force type re-emission). The typeof-in-struct check runs during `p1_full_depth_prescan` using the scope tree's `is_struct` flag; the enum check uses `is_enum` on the scope tree.
 - **Pass 2 (static/thread storage rejection):** `orelse` in the initializer of a `static`, `extern`, or `_Thread_local`/`thread_local` variable is rejected with a hard error. The orelse transformation splits the declaration into a runtime assignment that re-executes on every function entry, which destroys C's persistence semantics (C11 §6.7.9p4). The check runs in `process_declarators` immediately after `scan_decl_orelse` returns, before any code is emitted.
 - **Pass 2 catch-all:** Any `orelse` token that survives to the main emit loop without being consumed by a handler (bracket, decl-init, bare, typeof, walk_balanced) is **unconditionally** rejected with a hard error. This catches orelse in struct/union member declarations, ternary contexts, for-init control parens, and any other unsupported position. No context exemptions — bracket/typeof orelse is fully consumed before reaching the catch-all, so it never fires on valid uses.
 - **Pass 2 typeof dispatch:** `typeof(expr orelse fallback)` outside declaration contexts (e.g., inside `sizeof()`, casts) is caught by a `TT_TYPEOF` handler in the main emit loop that routes through `walk_balanced_orelse`, ensuring the inner orelse is transformed before the catch-all fires.
@@ -815,7 +815,7 @@ These are inherently runtime and cannot move to Pass 1:
 
 - **Scope stack push/pop** — driven by `{`/`}` during emit; timing drives defer cleanup
 - **Defer stack** — `defer_add` at keyword, `emit_defers` at `}`/return/break/continue/goto
-- **CtrlState** — braceless control-flow brace injection: `pending`, `pending_for_paren`, `parens_just_closed`, `pending_orelse_guard`, `brace_depth`. Tracking is inherently sequential and cannot move to Pass 1 without new infrastructure.
+- **CtrlState** — braceless control-flow brace injection: `pending`, `pending_for_paren`, `parens_just_closed`, `brace_depth`. Tracking is inherently sequential and cannot move to Pass 1 without new infrastructure.
 - **`at_stmt_start`** — inherently sequential
 - **`ret_counter`** — monotonic during emit
 - **Line directive / whitespace emission** — tied to output position
@@ -827,7 +827,7 @@ These are inherently runtime and cannot move to Pass 1:
 ## 14. Invariants
 
 1. **Immutable symbol table:** After Phase 1B completes, the typedef table is frozen. Pass 2 performs zero mutations to the typedef table, scope tree, token annotations (`ann`), or `func_meta`.
-2. **All errors before emission:** Every user-triggerable `error_tok` call from semantic analysis fires during Pass 1 or Phase 2A, before Pass 2 emits its first byte, with one documented exception: `check_defer_shadow_at_exit` requires runtime scope-stack state that only exists during Pass 2 control-flow exit emission. Same-block defer shadows (variable declared after a defer in the same scope) are detected immediately at declaration time in `check_defer_var_shadow` and do not rely on `check_defer_shadow_at_exit`. Pass 2 contains additional defensive `error_tok` calls in `process_declarators`, `emit_bare_orelse_impl`, `emit_orelse_action`, etc. that serve as unreachable-by-design assertions — they guard against internal inconsistencies that would indicate a Pass 1 gap, not against user input that should have been caught earlier. Phase 1D detects: array orelse, struct value orelse, compound-assign bare orelse, bare orelse without assignment target, VLA-type cast in bare orelse RHS, volatile dereference with compound-literal fallback, and preprocessor conditional spanning. The preprocessor boundary check (rejecting bare orelse assignments that span `#ifdef`/`#ifndef`/`#if`/`#elif`/`#else`/`#endif`) is the Phase 1D primary; the copy in `emit_bare_orelse_impl` is defense-in-depth. This check is unreachable in CLI mode (input arrives from `cc -E` with conditionals already resolved) but reachable in Library Mode (`prism_transpile_source`), where raw un-preprocessed source preserves conditional directive tokens.
+2. **All errors before emission:** Every user-triggerable `error_tok` call from semantic analysis fires during Pass 1 or Phase 2A, before Pass 2 emits its first byte, with one documented exception: `check_defer_shadow_at_exit` requires runtime scope-stack state that only exists during Pass 2 control-flow exit emission. Same-block defer shadows (variable declared after a defer in the same scope) are detected immediately at declaration time in `check_defer_var_shadow` and do not rely on `check_defer_shadow_at_exit`. Pass 2 contains additional defensive `error_tok` calls in `process_declarators`, `emit_bare_orelse_impl`, `emit_orelse_action`, etc. that serve as unreachable-by-design assertions — they guard against internal inconsistencies that would indicate a Pass 1 gap, not against user input that should have been caught earlier. Phase 1D detects: array orelse, struct value orelse, compound-assign bare orelse, bare orelse without assignment target, empty orelse action (`orelse ;`), anonymous struct/union multi-declarator split, VLA-type cast in bare orelse RHS, volatile dereference with compound-literal fallback, and preprocessor conditional spanning. The preprocessor boundary check (rejecting bare orelse assignments that span `#ifdef`/`#ifndef`/`#if`/`#elif`/`#else`/`#endif`) is the Phase 1D primary; the copy in `emit_bare_orelse_impl` is defense-in-depth. This check is unreachable in CLI mode (input arrives from `cc -E` with conditionals already resolved) but reachable in Library Mode (`prism_transpile_source`), where raw un-preprocessed source preserves conditional directive tokens.
 3. **O(N) CFG verification:** `p1_verify_cfg` is guaranteed linear in the number of P1FuncEntry items per function. No O(N²) pairwise scans.
 4. **Delimiter matching completeness:** Every `(`, `[`, `{` has a `match_idx`. Every `)`, `]`, `}` points back. No unmatched delimiters survive tokenization.
 5. **Self-host fixed point:** Stage 1 and Stage 2 transpiled C output is identical.

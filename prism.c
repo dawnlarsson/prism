@@ -603,6 +603,10 @@ static void p1_check_defer_stmt_expr_chain(Token *defer_tok, uint16_t sid) {
 				if (t && match_ch(t, '(')) t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t);
 				continue;
 			}
+			if (is_c23_attr(t)) {
+				t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t);
+				continue;
+			}
 			if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
 			    tok_next(t) && match_ch(tok_next(t), ':'))
 				{ t = tok_next(tok_next(t)); continue; }
@@ -1989,11 +1993,12 @@ static bool is_raw_declaration_context(Token *after_raw) {
 static bool is_raw_strip_context(Token *after_raw) {
 	if (is_raw_declaration_context(after_raw)) return true;
 	after_raw = skip_noise(after_raw);
+	Token *boundary = after_raw ? skip_noise(tok_next(after_raw)) : NULL;
 	return after_raw && is_valid_varname(after_raw) && !is_type_keyword(after_raw) &&
 	       !is_known_typedef(after_raw) && !(after_raw->tag & (TT_QUALIFIER | TT_SUE)) &&
-	       tok_next(after_raw) &&
-	       (match_ch(tok_next(after_raw), ',') || match_ch(tok_next(after_raw), ';') ||
-	        match_set(tok_next(after_raw), CH('[') | CH('(') | CH('=')));
+	       boundary &&
+	       (match_ch(boundary, ',') || match_ch(boundary, ';') ||
+	        match_set(boundary, CH('[') | CH('(') | CH('=')));
 }
 
 // Strip consecutive raw keywords at emit time: skip the raws, emit
@@ -6884,13 +6889,18 @@ static void p1_build_scope_tree(Token *start) {
 // Skip a single C statement starting at `tok`, returning the last token of
 // the statement (typically the closing `;`, `}`, or end of a do-while).
 // Handles if-else, for, while, do-while, switch, braced, and simple statements.
-// Uses tok_match for O(1) bracket jumps.  Tail positions use goto; only
-// if-body and do-body use true recursion (bounded by non-braced nesting depth).
+// Uses tok_match for O(1) bracket jumps.  Tail positions use goto; if-body
+// and do-body use iterative depth counters to avoid stack overflow.
 static Token *skip_one_stmt_impl(Token *tok, uint32_t *cache) {
 	// if_depth tracks nested braceless 'if' chains iteratively to avoid
 	// stack overflow on deeply nested code (5000+ levels).  After the
 	// innermost body is resolved, unwind_if checks for 'else' at each level.
 	int if_depth = 0;
+	// do_depth tracks nested braceless 'do' chains iteratively (same idea).
+	// do_if_save stores the if_depth at each do-entry so it can be restored
+	// when the do-body resolves and the while(...)  ; tail is processed.
+	int do_depth = 0;
+	int do_if_save[4096];
 	// Trail: record token indices visited at each restart so the caller's
 	// cache can be backfilled, turning repeated O(N) scans into O(1) hits.
 	uint32_t trail[256];
@@ -6928,17 +6938,13 @@ restart:
 		tok = tok_next(tok_match(p)); goto restart;
 	}
 
-	// 'do': body then 'while' '(...)' ';'
+	// 'do': save if_depth, reset, and process body iteratively
 	if ((tok->tag & TT_LOOP) && tok->ch0 == 'd') {
-		Token *end = skip_one_stmt_impl(tok_next(tok), cache);
-		if (!end) { tok = NULL; goto unwind_if; }
-		Token *w = skip_prep_dirs(tok_next(end));
-		if (!w || !(w->tag & TT_LOOP) || !equal(w, "while")) return NULL;
-		Token *p2 = skip_prep_dirs(tok_next(w));
-		if (!p2 || !match_ch(p2, '(') || !tok_match(p2)) return NULL;
-		Token *a = skip_prep_dirs(tok_next(tok_match(p2)));
-		tok = (a && match_ch(a, ';')) ? a : NULL;
-		goto unwind_if;
+		if (do_depth >= 4096) return NULL;
+		do_if_save[do_depth++] = if_depth;
+		if_depth = 0;
+		tn = 0;
+		tok = tok_next(tok); goto restart;
 	}
 
 	// User-defined label: ident ':' (not '::')
@@ -6991,6 +6997,20 @@ unwind_if:
 	if (cache && tok) {
 		uint32_t val = tok_idx(tok) + 1;
 		for (int i = 0; i < tn; i++) cache[trail[i]] = val;
+	}
+	// Unwind pending do-while: process 'while' '(...)' ';' tail
+	if (do_depth > 0) {
+		do_depth--;
+		if_depth = do_if_save[do_depth];
+		tn = 0;
+		if (!tok) goto unwind_if;
+		Token *w = skip_prep_dirs(tok_next(tok));
+		if (!w || !(w->tag & TT_LOOP) || !equal(w, "while")) { tok = NULL; goto unwind_if; }
+		Token *p2 = skip_prep_dirs(tok_next(w));
+		if (!p2 || !match_ch(p2, '(') || !tok_match(p2)) { tok = NULL; goto unwind_if; }
+		Token *a = skip_prep_dirs(tok_next(tok_match(p2)));
+		tok = (a && match_ch(a, ';')) ? a : NULL;
+		goto unwind_if;
 	}
 	return tok;
 }
@@ -7447,6 +7467,8 @@ p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
 		}
 	}
 	Token *after_oe = tok_next(bare_oe);
+	if (after_oe && match_ch(after_oe, ';'))
+		error_tok(after_oe, "expected statement after 'orelse'");
 	if (after_oe && !has_eq &&
 	    !(after_oe->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
 	    !match_ch(after_oe, '{') && !match_ch(after_oe, ';'))
@@ -8504,11 +8526,48 @@ uint16_t sid = next_scope_id++;
 					}
 
 					// Phase 1D: track whether this declarator would need
-					// typeof memset in Pass 2 (for VM type split detection)
-					if (p1d_vm_type && FEAT(F_ZEROINIT) && !has_init && !p1d_decl_raw &&
+					// typeof memset in Pass 2 (for split detection).
+					// Must mirror Pass 2's needs_memset condition — only
+					// typeof, _Atomic aggregate, and VLA types trigger memset;
+					// plain aggregates get inline = {0} (no split needed).
+					if (FEAT(F_ZEROINIT) && !has_init && !p1d_decl_raw &&
 					    !(p1d_saw_static || type.has_static || type.has_extern) &&
-					    !type.has_register && (!decl.is_pointer || decl.is_array))
+					    !type.has_register && (!decl.is_pointer || decl.is_array) &&
+					    (type.has_typeof || (type.has_atomic && type.is_struct) ||
+					     type.is_vla || decl.is_vla))
 						p1d_any_would_memset = true;
+
+					// Phase 1D: reject anonymous struct/union multi-declarator split
+					if (t && match_ch(t, ',') && brace_depth > 0 &&
+					    type.is_struct && !type.is_enum) {
+						bool is_anon = false;
+						for (Token *s = p1d_type_tok; s && s != type.end; s = tok_next(s)) {
+							if (s->tag & TT_SUE) {
+								Token *after = skip_prep_dirs(tok_next(s));
+								if (after && match_ch(after, '{'))
+									is_anon = true;
+								break;
+							}
+						}
+						if (is_anon) {
+							Token *next_t = tok_next(t);
+							bool nr = false;
+							next_t = p1_skip_decl_raw(next_t, &nr);
+							DeclResult nd = parse_declarator(next_t, false);
+							if (nd.var_name && nd.end) {
+								bool split = false;
+								if (p1d_any_would_memset && match_ch(nd.end, '='))
+									split = true;
+								if (!split && FEAT(F_ORELSE) && p1d_decl_has_bracket_orelse(next_t, nd.end))
+									split = true;
+								if (split)
+									error_tok(next_t,
+										  "bracket orelse / zero-init requiring declaration split "
+										  "cannot be used with anonymous struct/union; "
+										  "add a tag name or use a typedef");
+							}
+						}
+					}
 
 					// Phase 1D: reject VM type multi-declarator split
 					// (moved from Pass 2 process_declarators to satisfy

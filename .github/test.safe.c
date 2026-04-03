@@ -4529,6 +4529,143 @@ static void test_typeof_orelse_side_effect_phase1(void) {
 	}
 }
 
+static void test_anon_struct_split_phase1(void) {
+	printf("\n--- anonymous struct split Phase 1D ---\n");
+	// Bug: bracket orelse on anon struct multi-declarator
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    struct { int x; } a, b[1 orelse 2];\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "as1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK && r.error_msg && strstr(r.error_msg, "anonymous"),
+		      "anon struct bracket orelse split: rejected in Phase 1D");
+		prism_free(&r);
+	}
+	// Control: anon struct with inline = {0} (no split needed) → valid
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    struct { int x; } a, b = {1};\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "as2.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "anon struct inline zeroinit no split: valid");
+		prism_free(&r);
+	}
+	// Control: named struct multi-declarator → valid
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    struct S { int x; } a, b = {1};\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "as3.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "named struct multi-decl: valid");
+		prism_free(&r);
+	}
+	// Control: anon struct without split → valid
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    struct { int x; } a, b;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "as4.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "anon struct no split: valid");
+		prism_free(&r);
+	}
+}
+
+static void test_empty_orelse_action_phase1(void) {
+	printf("\n--- empty orelse action Phase 1D ---\n");
+	// Bug: bare orelse with empty action (semicolon)
+	{
+		const char *code =
+		    "int f(int x) {\n"
+		    "    x orelse ;\n"
+		    "    return x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "eoa1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK && r.error_msg && strstr(r.error_msg, "expected statement"),
+		      "empty orelse action: rejected in Phase 1D");
+		prism_free(&r);
+	}
+	// Control: orelse with valid action → valid
+	{
+		const char *code =
+		    "int f(int x) {\n"
+		    "    x orelse return 0;\n"
+		    "    return x;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "eoa2.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "orelse with return action: valid");
+		prism_free(&r);
+	}
+}
+
+static void test_defer_continue_execution_order(void) {
+	printf("\n--- defer + continue execution order ---\n");
+	log_reset();
+
+	for (int i = 0; i < 2; i++) {
+		defer log_append("D");
+		if (i == 0) {
+			log_append("C");
+			continue; // Must trigger 'D', THEN loop does i++
+		}
+		log_append("B");
+	}
+
+	// i=0: 'C', defer 'D', i++
+	// i=1: 'B', defer 'D', i++
+	CHECK_LOG("CDBD", "defer + continue execution order must precede loop increment");
+}
+
+static void test_interleaved_raw_multi_declarator(void) {
+	printf("\n--- interleaved raw multi-declarator ---\n");
+
+	// Dirty the stack
+	volatile char garbage[128];
+	memset((void *)garbage, 0xAA, sizeof(garbage));
+
+	// 'a' and 'c' must be 0. 'b' and 'd' are raw (uninitialized).
+	int a, raw b, c, raw d;
+
+	CHECK_EQ(a, 0, "interleaved raw: first variable must be zero-initialized");
+	CHECK_EQ(c, 0, "interleaved raw: variable after raw declarator must be zero-initialized");
+
+	// Suppress unused warnings
+	(void)b; (void)d; (void)garbage[0];
+}
+
+static void test_union_padding_zeroinit(void) {
+	printf("\n--- union padding zero-init ---\n");
+
+	union PaddedUnion {
+		char c;       // 1 byte
+		long long ll; // 8 bytes
+	};
+
+	// Dirty the stack region first
+	{
+		unsigned char dirty[sizeof(union PaddedUnion)];
+		memset(dirty, 0xFF, sizeof(dirty));
+		(void)dirty;
+	}
+
+	union PaddedUnion pu; // Prism emits = {0};
+
+	unsigned char *bytes = (unsigned char *)&pu;
+	int all_zero = 1;
+	for (size_t b = 0; b < sizeof(union PaddedUnion); b++) {
+		if (bytes[b] != 0) all_zero = 0;
+	}
+
+	CHECK(all_zero, "union padding bytes (beyond first member) must be zeroed");
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -4849,4 +4986,19 @@ void run_safe_tests(void) {
 
         // typeof orelse side-effect → Phase 1D
         test_typeof_orelse_side_effect_phase1();
+
+        // anonymous struct split → Phase 1D
+        test_anon_struct_split_phase1();
+
+        // empty orelse action → Phase 1D
+        test_empty_orelse_action_phase1();
+
+        // Execution: defer + continue evaluation order
+        test_defer_continue_execution_order();
+
+        // Execution: interleaved raw multi-declarator zero-init
+        test_interleaved_raw_multi_declarator();
+
+        // Execution: union padding zero-init
+        test_union_padding_zeroinit();
 }

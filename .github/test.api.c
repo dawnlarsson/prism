@@ -6467,6 +6467,45 @@ static void test_skip_one_stmt_deep_iterative(void) {
 	prism_free(&r);
 }
 
+static void test_skip_one_stmt_deep_do_iterative(void) {
+	/* BUG: skip_one_stmt_impl used true recursion for do-loop bodies.
+	 * 50,000+ nested braceless 'do' loops caused stack overflow (segfault).
+	 * Fix: convert do handler to iterative with do_depth counter. */
+	size_t cap = 1200000;
+	char *code = malloc(cap);
+	CHECK(code != NULL, "skip-stmt-do-5k: malloc"); if (!code) return;
+	int n = 0;
+	n += snprintf(code + n, cap - n, "void f(void) { for (int i = 0; i < 1; i++)\n");
+	for (int i = 0; i < 5000; i++)
+		n += snprintf(code + n, cap - n, "  do\n");
+	n += snprintf(code + n, cap - n, "    i = 0;\n");
+	for (int i = 0; i < 5000; i++)
+		n += snprintf(code + n, cap - n, "  while(0);\n");
+	n += snprintf(code + n, cap - n, "}\n");
+	PrismResult r = prism_transpile_source(code, "deep_do.c", prism_defaults());
+	free(code);
+	CHECK_EQ(r.status, PRISM_OK,
+		 "skip-stmt-do-5k: 5000 braceless nested do-while must not crash");
+	prism_free(&r);
+}
+
+static void test_raw_attr_boundary_skip_noise(void) {
+	/* BUG: is_raw_strip_context checked tok_next(after_raw) directly,
+	 * not through skip_noise().  GNU/C23 attributes between variable name
+	 * and boundary punctuation (;/,) caused the check to fail, leaking
+	 * the 'raw' keyword into transpiler output. */
+	PrismResult r = prism_transpile_source(
+		"struct S { int a; raw int b __attribute__((packed)); };\n",
+		"raw_attr_bn.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "raw attr boundary: transpile succeeds");
+	if (r.status == PRISM_OK) {
+		CHECK(!strstr(r.output, " raw "),
+		      "raw attr boundary: no 'raw' leak in output");
+	}
+	prism_free(&r);
+}
+
 static void test_taint_propagation_perf(void) {
 	/* BUG: taint propagation's inner loop uses O(N) linear scan with
 	 * memcmp to resolve function call targets.  With N functions each
@@ -7149,4 +7188,6 @@ void run_api_tests_4(void) {
 	test_attributed_enum_defer_shadow();
 	test_struct_union_vla_predecessor();
 	test_typedef_nested_enum_registration();
+	test_skip_one_stmt_deep_do_iterative();
+	test_raw_attr_boundary_skip_noise();
 }
