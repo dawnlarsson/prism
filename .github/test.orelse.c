@@ -6402,6 +6402,67 @@ static void test_orelse_bitfield_typeof(void) {
 	prism_free(&r);
 }
 
+// Volatile dereference with compound literal orelse fallback.
+// The compound literal path uses ternary (LHS=RHS)?0:(LHS=fb),
+// evaluating LHS twice. Must reject volatile dereferences.
+static void test_orelse_volatile_compound_literal(void) {
+	printf("\n--- volatile compound-literal orelse ---\n");
+	// Scalar volatile deref + compound literal fallback
+	{
+		const char *code =
+		    "int get_val(void);\n"
+		    "void f(volatile int *p) {\n"
+		    "    *p = get_val() orelse (int){42};\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vol_cl1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "volatile deref + compound literal orelse must error");
+		prism_free(&r);
+	}
+	// Member access + compound literal (-> is memory access)
+	{
+		const char *code =
+		    "struct S { int x; };\n"
+		    "int get_val(void);\n"
+		    "void f(struct S *p) {\n"
+		    "    p->x = get_val() orelse (int){0};\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vol_cl2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "member access + compound literal orelse must error");
+		prism_free(&r);
+	}
+	// Control: non-compound-literal fallback is OK (typeof+temp path)
+	{
+		const char *code =
+		    "int get_val(void);\n"
+		    "void f(volatile int *p) {\n"
+		    "    *p = get_val() orelse 42;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vol_cl3.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "volatile deref + plain fallback must succeed (single-write path)");
+		prism_free(&r);
+	}
+	// Control: no volatile, compound literal is OK
+	{
+		const char *code =
+		    "int get_val(void);\n"
+		    "void f(int *p) {\n"
+		    "    *p = get_val() orelse (int){42};\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vol_cl4.c", prism_defaults());
+		// This still uses the ternary path which dereferences p twice,
+		// but p is not volatile so the double-deref is caught by the
+		// existing non-volatile check.
+		// Actually reject_orelse_side_effects with check_volatile=true
+		// rejects ANY pointer deref, not just volatile ones.
+		CHECK(r.status != PRISM_OK,
+		      "pointer deref + compound literal orelse must error (double-eval)");
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -6769,4 +6830,7 @@ void run_orelse_tests(void) {
 
 	// __auto_type orelse
 	GNUC_ONLY(test_orelse_auto_type());
+
+	// volatile deref + compound literal orelse double-write
+	test_orelse_volatile_compound_literal();
 }

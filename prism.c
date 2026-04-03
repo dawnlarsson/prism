@@ -6403,6 +6403,16 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 				if (s->tag & TT_MEMBER) { lhs_has_member = true; break; }
 		}
 		if (fallback_has_compound_literal) {
+			// The compound literal ternary path evaluates LHS twice:
+			// (LHS = RHS) ? (void)0 : (void)(LHS = (fb))
+			// Reject volatile dereference in LHS — double bus write.
+			if (bare_assign_eq)
+				reject_orelse_side_effects(bare_lhs_start, bare_assign_eq,
+					"orelse compound-literal fallback on assignment",
+					"in the target expression (volatile double-write "
+					"with compound literal fallback); "
+					"use a temporary variable instead",
+					false, true, false);
 			// Ternary: (LHS = RHS) ? (void)0 : (void)(LHS = (fb));
 			OUT_LIT("(");
 			emit_balanced_range(bare_lhs_start, orelse_tok);
@@ -6955,6 +6965,15 @@ unwind_if:
 		if (!tok) return NULL;
 		Token *n = skip_prep_dirs(tok_next(tok));
 		if (n && (n->tag & TT_IF) && n->ch0 == 'e') {
+			// Cache true-branch trail entries NOW, before
+			// entering the else-branch.  Without this, the
+			// else-branch's end value poisons cache entries
+			// for tokens inside the true-branch.
+			if (cache && tok) {
+				uint32_t val = tok_idx(tok) + 1;
+				for (int i = 0; i < tn; i++) cache[trail[i]] = val;
+			}
+			tn = 0;
 			tok = tok_next(n); goto restart;
 		}
 	}
@@ -7262,6 +7281,7 @@ p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
 	}
 	int sd = 0;
 	bool has_eq = false;
+	Token *eq_tok = NULL;
 	for (Token *s = scan_start; s != bare_oe; s = tok_next(s)) {
 		if (s->flags & TF_OPEN) { sd++; continue; }
 		if (s->flags & TF_CLOSE) { sd--; continue; }
@@ -7270,7 +7290,7 @@ p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
 				error_tok(s, "bare assignment with 'orelse' cannot use compound operators "
 					  "(e.g. +=, -=); use a plain '=' assignment");
 			has_eq = true;
-			break;
+			eq_tok = s;
 		}
 	}
 	Token *after_oe = tok_next(bare_oe);
@@ -7279,6 +7299,32 @@ p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
 	    !match_ch(after_oe, '{') && !match_ch(after_oe, ';'))
 		error_tok(after_oe, "orelse fallback requires an assignment target "
 			  "(use a declaration)");
+
+	// Compound literal fallback + volatile dereference in LHS.
+	// The compound literal ternary path evaluates LHS twice:
+	// (LHS = RHS) ? (void)0 : (void)(LHS = fb)
+	// Reject if LHS has pointer deref, member access, or subscript
+	// AND the fallback contains a compound literal '{'.
+	if (has_eq && eq_tok && after_oe &&
+	    !(after_oe->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
+	    !match_ch(after_oe, '{') && !match_ch(after_oe, ';')) {
+		bool fb_has_cl = false;
+		{ int fd = 0;
+		  for (Token *s = after_oe; s && s->kind != TK_EOF; s = tok_next(s)) {
+			if (fd == 0 && match_ch(s, '{')) { fb_has_cl = true; break; }
+			if (s->flags & TF_OPEN) fd++;
+			else if (s->flags & TF_CLOSE) fd--;
+			else if (fd == 0 && (match_ch(s, ';') || match_ch(s, ','))) break;
+		  }
+		}
+		if (fb_has_cl)
+			reject_orelse_side_effects(scan_start, eq_tok,
+				"orelse compound-literal fallback on assignment",
+				"in the target expression (volatile double-write "
+				"with compound literal fallback); "
+				"use a temporary variable instead",
+				false, true, false);
+	}
 }
 
 static void p1_full_depth_prescan(Token *tok) {
@@ -7931,7 +7977,7 @@ uint16_t sid = next_scope_id++;
 				if (ct && match_ch(ct, ':')) {
 					p1d_prev = ct;
 					tok = tok_next(ct);
-					at_stmt_start = true;
+					P1D_STMT_RESET();
 					continue;
 				}
 			}

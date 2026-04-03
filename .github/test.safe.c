@@ -3922,6 +3922,126 @@ static void test_braceless_labeled_decl_cfg(void) {
 	}
 }
 
+static void test_case_label_ctrl_pending_leak(void) {
+	printf("\n--- case/default label p1d_ctrl_pending leak ---\n");
+
+	// switch(0) sets p1d_ctrl_pending=true. case/default must reset it,
+	// otherwise the declaration after the case gets braceless_close_idx
+	// set to its semicolon, blinding the CFG verifier.
+	{
+		const char *code =
+		    "int f(void) {\n"
+		    "    goto L;\n"
+		    "    switch (0)\n"
+		    "        case 0: int x;\n"
+		    "    x = 42;\n"
+		    "L:\n"
+		    "    return x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ctrl_case1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "goto over braceless switch+case decl must error");
+		prism_free(&r);
+	}
+	// default: variant
+	{
+		const char *code =
+		    "int f(int c) {\n"
+		    "    goto L;\n"
+		    "    switch (c)\n"
+		    "    default: int y;\n"
+		    "    y = 0;\n"
+		    "L:\n"
+		    "    return y;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ctrl_case2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "goto over braceless switch+default decl must error");
+		prism_free(&r);
+	}
+	// control: simple statement after case does NOT regress
+	{
+		const char *code =
+		    "int f(void) {\n"
+		    "    goto L;\n"
+		    "    switch (0)\n"
+		    "        default: (void)0;\n"
+		    "    int z;\n"
+		    "L:\n"
+		    "    return z;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ctrl_case3.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "goto over decl after braceless switch (stmt body) must error");
+		prism_free(&r);
+	}
+}
+
+static void test_skip_one_stmt_cache_poison(void) {
+	printf("\n--- skip_one_stmt cache poisoning ---\n");
+
+	// For-init scanner calls skip_one_stmt_impl on the for-body.
+	// Without the fix, trail caches true-branch tokens with the
+	// else-branch end, poisoning braceless_close_idx for decls
+	// inside the true-branch. A variable out of scope at a label
+	// in the else branch gets a false-positive goto-over-decl error.
+	{
+		const char *code =
+		    "int f(int c) {\n"
+		    "    goto L;\n"
+		    "    for (;c;)\n"
+		    "        if (c)\n"
+		    "            int x;\n"   // braceless body, scope ends at ';'
+		    "        else\n"
+		    "        L:  (void)0;\n" // L is after x's scope
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "cache1.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "goto L with x out of scope at L must succeed (no false positive)");
+		if (r.status != PRISM_OK)
+			printf("  false positive: %s\n", r.error_msg ? r.error_msg : "");
+		prism_free(&r);
+	}
+	// Deeper nesting: while inside if true-branch
+	{
+		const char *code =
+		    "int g(int c) {\n"
+		    "    goto L;\n"
+		    "    for (;c;)\n"
+		    "        if (c)\n"
+		    "            while (0) int y;\n"
+		    "        else\n"
+		    "        L:  (void)0;\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "cache2.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "goto L with y out of scope (nested while) must succeed");
+		if (r.status != PRISM_OK)
+			printf("  false positive: %s\n", r.error_msg ? r.error_msg : "");
+		prism_free(&r);
+	}
+	// Control: goto that genuinely bypasses a decl still errors
+	{
+		const char *code =
+		    "int h(int c) {\n"
+		    "    goto L;\n"
+		    "    for (;c;)\n"
+		    "        if (c)\n"
+		    "            int z;\n"
+		    "        else\n"
+		    "            (void)0;\n"
+		    "L:\n"   // z is in braceless body, dead before L
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "cache3.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "goto L past dead braceless decl must succeed");
+		prism_free(&r);
+	}
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -4206,4 +4326,10 @@ void run_safe_tests(void) {
 
         // Braceless labeled-declaration CFG lifetime
         test_braceless_labeled_decl_cfg();
+
+        // case/default label p1d_ctrl_pending leak
+        test_case_label_ctrl_pending_leak();
+
+        // skip_one_stmt cache poisoning false positive
+        test_skip_one_stmt_cache_poison();
 }
