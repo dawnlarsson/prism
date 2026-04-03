@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 1.0.3
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4040+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4127+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
