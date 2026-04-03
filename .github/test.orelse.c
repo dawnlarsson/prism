@@ -6519,6 +6519,69 @@ static void test_orelse_bare_pp_conditional(void) {
 	}
 }
 
+// BUG105: orelse inside ternary expression was only caught by Pass 2's
+// init_ternary check (process_declarators), not Phase 1D. For files
+// exceeding the 128KB output buffer, partial C was flushed to disk
+// before the Pass 2 error_tok fired, violating the two-pass invariant.
+// Fix: Phase 1D init scanner now tracks ternary depth (?/: pairs) and
+// rejects orelse when init_td > 0.
+static void test_orelse_in_ternary_phase1d(void) {
+	printf("\n--- orelse in ternary (Phase 1D rejection) ---\n");
+	// orelse inside ternary true-branch: must error, no partial output
+	{
+		const char *code =
+		    "int f(void);\n"
+		    "void test() {\n"
+		    "    int x = 1 ? f() orelse 5 : 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "tern_oe1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "orelse inside ternary true-branch must error");
+		CHECK(r.output == NULL || r.output[0] == '\0',
+		      "orelse inside ternary: no partial output (Phase 1 rejection)");
+		prism_free(&r);
+	}
+	// orelse inside nested ternary
+	{
+		const char *code =
+		    "int f(void);\n"
+		    "void test() {\n"
+		    "    int x = 1 ? 2 ? f() orelse 3 : 4 : 5;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "tern_oe2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "orelse inside nested ternary must error");
+		prism_free(&r);
+	}
+	// Control: orelse AFTER ternary (depth 0) must succeed
+	{
+		const char *code =
+		    "int f(void);\n"
+		    "void test() {\n"
+		    "    int x = 1 ? 0 : f() orelse 42;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "tern_oe3.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "orelse after ternary colon must succeed");
+		prism_free(&r);
+	}
+	// Control: orelse with action keyword inside ternary
+	{
+		const char *code =
+		    "int *get(void);\n"
+		    "int fn(int c) {\n"
+		    "    int *p = c ? get() orelse return -1 : (int *)0;\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "tern_oe4.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "orelse-return inside ternary must error");
+		CHECK(r.output == NULL || r.output[0] == '\0',
+		      "orelse-return inside ternary: no partial output");
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -6892,4 +6955,7 @@ void run_orelse_tests(void) {
 
 	// bare orelse spanning preprocessor conditionals (Phase 1D check)
 	test_orelse_bare_pp_conditional();
+
+	// orelse inside ternary expression rejected in Phase 1D (not Pass 2)
+	test_orelse_in_ternary_phase1d();
 }

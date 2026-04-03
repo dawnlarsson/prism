@@ -1,4 +1,4 @@
-#define PRISM_VERSION "1.0.3"
+#define PRISM_VERSION "1.0.4"
 
 #ifndef _WIN32
 #ifndef _GNU_SOURCE
@@ -8377,8 +8377,11 @@ uint16_t sid = next_scope_id++;
 						bool decl_has_orelse = false;
 						Token *p1d_first_orelse = NULL;
 						Token *prev_init_tok = NULL;
+						int init_td = 0;
 						t = tok_next(t);
 						while (t && !match_ch(t, ',') && !match_ch(t, ';') && t->kind != TK_EOF) {
+							if (match_ch(t, '?')) { init_td++; prev_init_tok = t; t = tok_next(t); continue; }
+							if (match_ch(t, ':') && init_td > 0) { init_td--; prev_init_tok = t; t = tok_next(t); continue; }
 							// Phase 1G: mark orelse in decl initializer
 							if (is_orelse_kw_shadow(t)) {
 								// Shadow: only treat as keyword when preceded by expression-ending token
@@ -8399,6 +8402,8 @@ uint16_t sid = next_scope_id++;
 								    prev_init_tok->kind != TK_NUM && prev_init_tok->kind != TK_STR)
 									error_tok(t, "'orelse' cannot be used here (it must appear at the "
 										  "statement level in a declaration or bare expression)");
+								if (init_td > 0)
+									error_tok(t, "'orelse' cannot be used inside a ternary expression");
 								tok_ann(t) |= P1_OE_DECL_INIT;
 								if (!p1d_first_orelse) p1d_first_orelse = t;
 								decl_has_orelse = true;
