@@ -4042,6 +4042,215 @@ static void test_skip_one_stmt_cache_poison(void) {
 	}
 }
 
+static void test_sizeof_commutative_vla_bypass(void) {
+	printf("\n--- sizeof commutative VLA bypass ---\n");
+
+	// Commutative subscript: sizeof(1[vla_param]) = sizeof(vla_param[1])
+	// Both yield a VLA-sized type. The commutative form bypassed detection
+	// because prev_inner was '[' (not '*') and tok_next was ']' (not '[').
+	{
+		const char *code =
+		    "void f(int n, int m, int p[n][m]) {\n"
+		    "    goto L;\n"
+		    "    raw int a[sizeof(1[p])];\n"
+		    "L:  a[0] = 1;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "comvla1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "commutative subscript sizeof(1[vla_param]) must be caught");
+		prism_free(&r);
+	}
+	// Pointer arithmetic: sizeof(*(1 + vla_param))
+	{
+		const char *code =
+		    "void f(int n, int m, int p[n][m]) {\n"
+		    "    goto L;\n"
+		    "    raw int a[sizeof(*(1 + p))];\n"
+		    "L:  a[0] = 1;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "comvla2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "pointer arithmetic sizeof(*(1 + vla_param)) must be caught");
+		prism_free(&r);
+	}
+	// Reverse arithmetic: sizeof(*(vla_param + 1))
+	{
+		const char *code =
+		    "void f(int n, int m, int p[n][m]) {\n"
+		    "    goto L;\n"
+		    "    raw int a[sizeof(*(p + 1))];\n"
+		    "L:  a[0] = 1;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "comvla3.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "reverse arithmetic sizeof(*(vla_param + 1)) must be caught");
+		prism_free(&r);
+	}
+	// Subtraction: sizeof(*(vla_param - 0))
+	{
+		const char *code =
+		    "void f(int n, int m, int p[n][m]) {\n"
+		    "    goto L;\n"
+		    "    raw int a[sizeof(*(p - 0))];\n"
+		    "L:  a[0] = 1;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "comvla4.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "subtraction sizeof(*(vla_param - 0)) must be caught");
+		prism_free(&r);
+	}
+	// Control: sizeof(vla_param) alone is constant (pointer decay)
+	{
+		const char *code =
+		    "void f(int n, int m, int p[n][m]) {\n"
+		    "    goto L;\n"
+		    "    raw int a[sizeof(p)];\n"
+		    "L:  a[0] = 1;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "comvla5.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "sizeof(vla_param) alone must be constant (no false positive)");
+		prism_free(&r);
+	}
+	// Normal form still caught (regression check)
+	{
+		const char *code =
+		    "void f(int n, int m, int p[n][m]) {\n"
+		    "    goto L;\n"
+		    "    raw int a[sizeof(p[0])];\n"
+		    "L:  a[0] = 1;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "comvla6.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "normal sizeof(vla_param[0]) must still be caught");
+		prism_free(&r);
+	}
+}
+
+// Bug: defer shadow same-block error fired during Pass 2 emission
+// (check_defer_var_shadow at L1416).  Hoisted to Phase 1D.
+static void test_defer_shadow_same_block_phase1(void) {
+	printf("\n--- defer shadow same-block Phase 1 ---\n");
+
+	// Attack vector: extern redeclaration after defer capture
+	{
+		const char *code =
+		    "int handle;\n"
+		    "void f(void) {\n"
+		    "    defer { handle = 0; }\n"
+		    "    extern int handle;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "dshad1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "extern after defer capture must be caught in Phase 1");
+		prism_free(&r);
+	}
+	// Variable declaration after defer capture
+	{
+		const char *code =
+		    "int val;\n"
+		    "void f(void) {\n"
+		    "    defer { val = 1; }\n"
+		    "    int val;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "dshad2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "local decl after defer capture must be caught in Phase 1");
+		prism_free(&r);
+	}
+	// Control: no-match (different name) must succeed
+	{
+		const char *code =
+		    "int val;\n"
+		    "void f(void) {\n"
+		    "    defer { val = 1; }\n"
+		    "    int other;\n"
+		    "    other = val;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "dshad3.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "different name must not trigger defer shadow");
+		prism_free(&r);
+	}
+	// Control: for-init local inside defer body must not cause false positive
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    defer { for (int i = 0; i < 1; i++) {} }\n"
+		    "    int i;\n"
+		    "    i = 0;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "dshad4.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "for-init name inside defer body is not a capture");
+		prism_free(&r);
+	}
+}
+
+// Bug: for-init VLA needing memset fired error during Pass 2 emission
+// (process_declarators L4207).  Hoisted to Phase 1D p1_scan_init_shadows.
+static void test_for_init_vla_memset_phase1(void) {
+	printf("\n--- for-init VLA memset Phase 1 ---\n");
+
+	// Attack vector: multi-declarator VLA in for-init
+	{
+		const char *code =
+		    "void f(int n) {\n"
+		    "    for (int i = 0, arr[n]; i < n; i++)\n"
+		    "        arr[i] = i;\n"
+		    "}\n"
+		    "int main(void) { f(5); return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "fivla1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "VLA in for-init must be caught in Phase 1");
+		prism_free(&r);
+	}
+	// Single VLA declarator in for-init
+	{
+		const char *code =
+		    "void f(int n) {\n"
+		    "    for (int arr[n];;) { break; }\n"
+		    "}\n"
+		    "int main(void) { f(5); return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "fivla2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "single VLA in for-init must be caught in Phase 1");
+		prism_free(&r);
+	}
+	// Control: VLA in for-init with initializer → OK (has_init)
+	// Actually, VLA cannot have an initializer in C. Skip this control.
+
+	// Control: non-VLA for-init must succeed
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    for (int i = 0; i < 10; i++) {}\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "fivla3.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "non-VLA for-init must succeed");
+		prism_free(&r);
+	}
+	// typeof in if-init (C23)
+	{
+		const char *code =
+		    "int g(void);\n"
+		    "void f(void) {\n"
+		    "    if (typeof(g()) x; x > 0) {}\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "fivla4.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "typeof in if-init must be caught in Phase 1");
+		prism_free(&r);
+	}
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -4332,4 +4541,13 @@ void run_safe_tests(void) {
 
         // skip_one_stmt cache poisoning false positive
         test_skip_one_stmt_cache_poison();
+
+        // sizeof commutative VLA bypass (stack corruption)
+        test_sizeof_commutative_vla_bypass();
+
+        // defer shadow same-block → Phase 1D
+        test_defer_shadow_same_block_phase1();
+
+        // for-init VLA memset → Phase 1D
+        test_for_init_vla_memset_phase1();
 }

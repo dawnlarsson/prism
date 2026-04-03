@@ -6463,6 +6463,62 @@ static void test_orelse_volatile_compound_literal(void) {
 	}
 }
 
+static void test_orelse_bare_pp_conditional(void) {
+	printf("\n--- bare orelse PP conditional (Phase 1D) ---\n");
+
+	// Library mode preserves #ifdef/#else/#endif as TK_PREP_DIR tokens.
+	// Bare orelse spanning preprocessor conditionals must be rejected
+	// in Phase 1D, not Pass 2. emit_range_no_prep would skip TK_PREP_DIR
+	// tokens, concatenating code from ALL branches — silent miscompilation.
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int x;\n"
+		    "    x = 1 orelse\n"
+		    "#ifdef FOO\n"
+		    "    2\n"
+		    "#else\n"
+		    "    3\n"
+		    "#endif\n"
+		    "    ;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ppbare1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "bare orelse spanning #ifdef/#else must error");
+		prism_free(&r);
+	}
+	// #if form
+	{
+		const char *code =
+		    "int get(void);\n"
+		    "void f(void) {\n"
+		    "    int x;\n"
+		    "    x = get() orelse\n"
+		    "#if 1\n"
+		    "    42\n"
+		    "#endif\n"
+		    "    ;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ppbare2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "bare orelse spanning #if must error");
+		prism_free(&r);
+	}
+	// Control: bare orelse without PP conditionals is OK
+	{
+		const char *code =
+		    "void *get(void);\n"
+		    "void f(void) {\n"
+		    "    void *x;\n"
+		    "    x = get() orelse (void*)0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ppbare3.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "bare orelse without PP conditionals must succeed");
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -6833,4 +6889,7 @@ void run_orelse_tests(void) {
 
 	// volatile deref + compound literal orelse double-write
 	test_orelse_volatile_compound_literal();
+
+	// bare orelse spanning preprocessor conditionals (Phase 1D check)
+	test_orelse_bare_pp_conditional();
 }

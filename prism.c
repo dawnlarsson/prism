@@ -2189,10 +2189,18 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 						int vla_fl = typedef_flags(inner) & (TDF_VLA | TDF_PARAM);
 						if (vla_fl & TDF_VLA) {
 							// Param arrays decay to pointers: sizeof(param) = sizeof(ptr) = constant.
-							// Only flag as VLA if dereferenced (* before, or [ after).
+							// Flag as VLA if any operator adjacent to param could derive a
+							// VLA-sized type: explicit deref (*param), subscript (param[i]),
+							// commutative subscript (i[param]), or pointer arithmetic (+/-).
+							// False positives only cause stricter goto checks; false negatives
+							// cause stack corruption.
 							if (!(vla_fl & TDF_PARAM)) return true;
-							bool deref = match_ch(prev_inner, '*') ||
-								(tok_next(inner) && tok_next(inner) != end && match_ch(tok_next(inner), '['));
+							Token *ni = tok_next(inner);
+							bool has_next = ni && ni != end;
+							bool deref = match_ch(prev_inner, '*') || match_ch(prev_inner, '[') ||
+								match_ch(prev_inner, '+') || match_ch(prev_inner, '-') ||
+								(has_next && (match_ch(ni, '[') || match_ch(ni, '+') ||
+								             match_ch(ni, '-') || match_ch(ni, '*')));
 							if (deref) return true;
 						}
 						if (match_ch(inner, '[') &&
@@ -7109,15 +7117,31 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 
 			// Phase 1D: register CFG entry for goto-skip-decl detection
 			{
+				bool has_init = match_ch(decl.end, '=');
 				uint16_t eff_sid = body_sid > 0 ? body_sid : cur_sid;
 				if (eff_sid > 0) {
-					bool has_init = match_ch(decl.end, '=');
 					P1FuncEntry *e = p1_alloc(P1K_DECL, eff_sid, decl.var_name);
 					e->decl.has_init = has_init;
 					e->decl.is_vla = type.is_vla || decl.is_vla;
 					e->decl.has_raw = decl_raw;
 					e->decl.is_static_storage = saw_static || type.has_static || type.has_extern;
 					e->decl.body_close_idx = body_sid > 0 ? 0 : body_close_idx;
+				}
+				// Phase 1D: reject init-decl needing memset
+				// (moved from Pass 2 process_declarators to satisfy
+				// the two-pass invariant: all semantic errors before emission)
+				if (FEAT(F_ZEROINIT) && !has_init && !decl_raw &&
+				    !(saw_static || type.has_static || type.has_extern)) {
+					bool eff_vla = (decl.is_vla && (!decl.paren_pointer || decl.paren_array)) ||
+						       (type.is_vla && !decl.is_pointer);
+					bool is_agg = (decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
+						      ((type.is_struct || type.is_typedef) && !decl.is_pointer);
+					if ((!decl.is_pointer || decl.is_array) && !type.has_register &&
+					    (type.has_typeof || (type.has_atomic && is_agg) || eff_vla))
+						error_tok(decl.var_name,
+							  "VLA or typeof variable in for/if/switch initializer "
+							  "cannot be safely zero-initialized; move the "
+							  "declaration before the statement");
 				}
 			}
 
@@ -7135,6 +7159,105 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 	}
 	td_scope_open = saved_open;
 	td_scope_close = saved_close;
+}
+
+// Phase 1D: check if a declaration shadows an identifier captured by a
+// same-scope defer body.  Moved from Pass 2 check_defer_var_shadow to
+// satisfy the two-pass invariant (no semantic errors during emission).
+static void __attribute__((noinline))
+p1_check_defer_same_block_shadow(Token *var_name, uint16_t cur_sid, int p1d_cur_func) {
+	if (!FEAT(F_DEFER) || p1d_cur_func < 0) return;
+	char *name = tok_loc(var_name);
+	int nlen = var_name->len;
+	if (!(func_meta[p1d_cur_func].defer_name_bloom & defer_name_bloom_bit(name, nlen)))
+		return;
+	int start = func_meta[p1d_cur_func].entry_start;
+	for (int i = start; i < p1_entry_count; i++) {
+		P1FuncEntry *e = &p1_entries[i];
+		if (e->kind != P1K_DEFER || e->scope_id != cur_sid) continue;
+		Token *body = tok_next(e->tok);
+		if (!body) continue;
+		Token *body_end = NULL;
+		if (match_ch(body, '{') && tok_match(body))
+			body_end = tok_match(body);
+		else
+			body_end = skip_to_semicolon(body);
+		// Skip if var_name is declared inside this defer body
+		uint32_t var_idx = tok_idx(var_name);
+		uint32_t bi = tok_idx(body);
+		uint32_t ei = body_end ? tok_idx(body_end) : UINT32_MAX;
+		if (var_idx >= bi && var_idx < ei) continue;
+		// Walk body tokens for name match (mirrors check_defer_var_shadow)
+		Token *prev = NULL;
+		int bd = 0, pd = 0, se = 0, se_brace[8];
+		int decl_depth = -1;
+		bool in_decl = false, was_in_decl = false;
+		int decl_bd = 0, for_init_pd = -1;
+		bool for_name_hid = false;
+		uint32_t for_body_end_idx = 0;
+		Token *for_header_open = NULL;
+		for (Token *t = body; t && t != body_end && t->kind != TK_EOF;
+		     prev = t, t = tok_next(t)) {
+			if (for_name_hid && for_body_end_idx && tok_idx(t) > for_body_end_idx)
+				for_name_hid = false;
+			if (match_ch(t, '{')) {
+				if (prev && match_ch(prev, '(') && se < 8) se_brace[se++] = bd;
+				bd++; continue;
+			}
+			if (match_ch(t, '}')) {
+				bd--;
+				if (se > 0 && bd == se_brace[se - 1]) se--;
+				if (decl_depth >= 0 && bd < decl_depth) decl_depth = -1;
+				if (in_decl && bd < decl_bd) in_decl = false;
+				continue;
+			}
+			if (match_set(t, CH('(') | CH('['))) {
+				if (match_ch(t, '(') && prev && prev->kind == TK_KEYWORD &&
+				    ((prev->tag & TT_LOOP) || (prev->tag & TT_IF) || (prev->tag & TT_SWITCH))) {
+					for_init_pd = pd + 1;
+					for_header_open = t;
+				}
+				pd++; continue;
+			}
+			if (match_set(t, CH(')') | CH(']'))) {
+				pd--;
+				if (for_init_pd >= 0 && pd < for_init_pd) for_init_pd = -1;
+				continue;
+			}
+			if (match_ch(t, ';')) {
+				in_decl = false; was_in_decl = false;
+				if (for_init_pd >= 0 && pd == for_init_pd) for_init_pd = -1;
+				continue;
+			}
+			if (pd == se && match_ch(t, '=')) { in_decl = false; continue; }
+			if (pd == se && match_ch(t, ',') && was_in_decl && bd == decl_bd) { in_decl = true; continue; }
+			if ((((bd > 1 || se > 0) && pd == se) ||
+			     (for_init_pd >= 0 && pd == for_init_pd)) &&
+			    (is_type_keyword(t) || (t->tag & (TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_TYPEDEF)))) {
+				in_decl = true; was_in_decl = true; decl_bd = bd; continue;
+			}
+			if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
+			    !(prev && (prev->tag & TT_MEMBER)) &&
+			    t->len == nlen && !memcmp(tok_loc(t), name, nlen)) {
+				if (for_name_hid) continue;
+				if ((bd > 1 || se > 0) && decl_depth >= 0 && bd >= decl_depth) continue;
+				if ((bd > 1 || se > 0) && in_decl && pd == se) { decl_depth = bd; continue; }
+				if (for_init_pd >= 0 && in_decl) {
+					for_name_hid = true;
+					if (for_header_open && tok_match(for_header_open)) {
+						Token *fbe = skip_one_stmt(tok_next(tok_match(for_header_open)));
+						for_body_end_idx = fbe ? tok_idx(fbe) : 0;
+					} else for_body_end_idx = 0;
+					continue;
+				}
+				error_tok(var_name,
+					  "variable '%.*s' shadows a name captured "
+					  "by a defer in the same scope; the defer "
+					  "body would bind to the shadowing variable",
+					  nlen, name);
+			}
+		}
+	}
 }
 
 // Check defer compatibility and allocate P1K_DEFER entry.
@@ -7324,6 +7447,32 @@ p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
 				"with compound literal fallback); "
 				"use a temporary variable instead",
 				false, true, false);
+	}
+
+	// Reject bare orelse spanning preprocessor conditionals (#ifdef/#else/etc.).
+	// emit_range_no_prep / emit_balanced_range skip TK_PREP_DIR tokens,
+	// producing concatenated code from ALL branches — silent miscompilation.
+	if (has_eq) {
+		int pd = 0;
+		for (Token *s = scan_start; s && s->kind != TK_EOF; s = tok_next(s)) {
+			if (s->flags & TF_OPEN) pd++;
+			else if (s->flags & TF_CLOSE) pd--;
+			else if (pd == 0 && match_ch(s, ';')) break;
+			if (s->kind != TK_PREP_DIR) continue;
+			const char *dp = tok_loc(s);
+			if (*dp == '#') dp++;
+			while (*dp == ' ' || *dp == '\t') dp++;
+			if (strncmp(dp, "ifdef", 5) == 0 || strncmp(dp, "ifndef", 6) == 0 ||
+			    strncmp(dp, "elif",  4) == 0 || strncmp(dp, "else",   4) == 0 ||
+			    strncmp(dp, "endif", 5) == 0 ||
+			    (strncmp(dp, "if", 2) == 0 && (dp[2]==' '||dp[2]=='\t'||dp[2]=='(')))
+				error_tok(bare_oe,
+					  "bare orelse assignment cannot be used when the "
+					  "expression spans preprocessor conditionals — the "
+					  "transpiler would emit tokens from all branches, "
+					  "producing invalid C; use a temporary variable or "
+					  "move the #ifdef outside the expression");
+		}
 	}
 }
 
@@ -8115,6 +8264,7 @@ uint16_t sid = next_scope_id++;
 						e->decl.has_raw = p1d_decl_raw;
 						e->decl.is_static_storage = p1d_saw_static || type.has_static || type.has_extern;
 						e->decl.body_close_idx = braceless_close_idx;
+						p1_check_defer_same_block_shadow(decl.var_name, cur_sid, p1d_cur_func);
 					}
 
 					// Phase 1D: reject register _Atomic aggregate
