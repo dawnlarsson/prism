@@ -6582,6 +6582,104 @@ static void test_orelse_in_ternary_phase1d(void) {
 	}
 }
 
+// BUG_AUDIT_A1: scan_decl_orelse paren unlinking silently miscompiled
+// expressions like `1 + (f() orelse 5)` by stripping parens inside a
+// larger expression, corrupting the AST. Fix: only strip parens when
+// they are the FIRST token of the initializer (prev_scan == NULL).
+static void test_orelse_paren_expr_miscompile(void) {
+	printf("\n--- scan_decl_orelse paren expr (A1 regression) ---\n");
+	// orelse inside parens within a larger expression must error
+	{
+		const char *code =
+		    "int f(void);\n"
+		    "void test(void) {\n"
+		    "    int value = 1 + (f() orelse 5);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "a1_expr.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "orelse in paren inside expression must error (A1)");
+		if (r.status != PRISM_OK && r.error_msg) {
+			CHECK(strstr(r.error_msg, "parentheses") != NULL,
+			      "error mentions parentheses (A1)");
+		}
+		prism_free(&r);
+	}
+	// orelse inside function call args must error
+	{
+		const char *code =
+		    "int g(int);\n"
+		    "void test(void) {\n"
+		    "    int x = g(0 orelse 5);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "a1_call.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "orelse in function call arg must error (A1)");
+		prism_free(&r);
+	}
+	// Control: parens wrapping entire initializer still works (macro hygiene)
+	{
+		const char *code =
+		    "int f(void);\n"
+		    "void test(void) {\n"
+		    "    int x = (f() orelse 5);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "a1_ok.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "parens wrapping entire init still works (A1)");
+		if (r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "no literal orelse in output (A1)");
+		}
+		prism_free(&r);
+	}
+}
+
+// BUG_AUDIT_A2: emit_orelse_condition_wrap flat-emitted stmt-expr LHS
+// without routing through walk_balanced, so defer/orelse/zeroinit inside
+// `({...})` were not processed.
+static void test_orelse_stmtexpr_condition_wrap(void) {
+	printf("\n--- stmt-expr in orelse condition wrap (A2 regression) ---\n");
+	{
+		const char *code =
+		    "void cleanup(void);\n"
+		    "int f(void);\n"
+		    "void test(void) {\n"
+		    "    int x = ({ int y = 0; { defer cleanup(); y = f(); } y; }) orelse return;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "a2_se.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "stmt-expr orelse with defer transpiles (A2)");
+		if (r.output) {
+			CHECK(strstr(r.output, "defer") == NULL,
+			      "no literal defer in output (A2)");
+			CHECK(strstr(r.output, "cleanup") != NULL,
+			      "defer cleanup emitted (A2)");
+		}
+		prism_free(&r);
+	}
+}
+
+// BUG_AUDIT_A6: bare orelse with cast on LHS e.g. `(int)x = 0 orelse 5`
+// assigned to a non-lvalue. Fix: Phase 1D rejects cast-expression targets.
+static void test_orelse_bare_cast_non_lvalue(void) {
+	printf("\n--- bare orelse cast non-lvalue (A6 regression) ---\n");
+	{
+		const char *code =
+		    "void test(void) {\n"
+		    "    int x;\n"
+		    "    (int)x = 0 orelse 5;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "a6_cast.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "bare orelse with cast target must error (A6)");
+		if (r.status != PRISM_OK && r.error_msg) {
+			CHECK(strstr(r.error_msg, "cast") != NULL,
+			      "error mentions cast (A6)");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -6958,4 +7056,13 @@ void run_orelse_tests(void) {
 
 	// orelse inside ternary expression rejected in Phase 1D (not Pass 2)
 	test_orelse_in_ternary_phase1d();
+
+	// AUDIT: paren expr miscompile (A1)
+	test_orelse_paren_expr_miscompile();
+
+	// AUDIT: stmt-expr condition wrap (A2)
+	test_orelse_stmtexpr_condition_wrap();
+
+	// AUDIT: cast non-lvalue bare orelse (A6)
+	test_orelse_bare_cast_non_lvalue();
 }

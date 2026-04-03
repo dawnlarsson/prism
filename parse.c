@@ -2069,6 +2069,931 @@ Token *tokenize_file(char *path) {
 #endif
 }
 
+// === C Declaration Parser ===
+// Pure parsing/analysis functions with no emit/transpilation dependencies.
+// Used by both Pass 1 (analysis) and Pass 2 (emission) in prism.c.
+
+// --- Type Definitions ---
+
+typedef struct {
+	Token *end;		  // First token after the type specifier
+	bool saw_type : 1;	  // True if a type was recognized
+	bool is_struct : 1;
+	bool is_enum : 1;
+	bool is_typedef : 1;
+	bool is_vla : 1;
+	bool has_typeof : 1;
+	bool has_atomic : 1;
+	bool has_register : 1;
+	bool has_volatile : 1;
+	bool has_const : 1;
+	bool has_void : 1;	  // True if void or void typedef
+	bool has_raw : 1;	  // True if 'raw' keyword was skipped in type specifier
+	bool has_extern : 1;
+	bool has_static : 1;
+} TypeSpecResult;
+
+// Declarator parsing result
+typedef struct {
+	Token *end;		  // First token after declarator
+	Token *var_name;
+	bool is_pointer : 1;
+	bool is_array : 1;
+	bool is_vla : 1;
+	bool is_func_ptr : 1;
+	bool has_paren : 1;
+	bool paren_pointer : 1;	  // Has pointer (*) inside parenthesized declarator
+	bool paren_array : 1;
+	bool has_init : 1;
+	bool is_const : 1;
+} DeclResult;
+
+typedef enum {
+	TDK_TYPEDEF,
+	TDK_SHADOW,
+	TDK_ENUM_CONST,
+	TDK_VLA_VAR // VLA variable (not typedef, but actual VLA array variable)
+} TypedefKind;
+
+typedef struct {
+	char *name; // Points into token stream (no alloc needed)
+	int len;
+	int scope_depth;	    // Scope where defined (aligns with ctx->block_depth)
+	int prev_index;		    // Index of previous entry with same name (-1 if none), for hash map chaining
+	uint32_t token_index;       // Token pool index of the declaration
+	uint32_t scope_open_idx;    // Token index of enclosing '{' (0 for file scope)
+	uint32_t scope_close_idx;   // Token index of matching '}' (UINT32_MAX for file scope)
+	bool is_vla : 1;
+	bool is_void : 1;
+	bool is_const : 1;
+	bool is_ptr : 1;
+	bool is_array : 1;
+	bool is_shadow : 1;
+	bool is_enum_const : 1;
+	bool is_vla_var : 1;
+	bool is_aggregate : 1;
+	bool is_func : 1;
+	bool is_param : 1;
+} TypedefEntry;
+
+typedef struct {
+	TypedefEntry *entries;
+	int count;
+	int capacity;
+	HashMap name_map; // Maps name -> index+1 of most recent entry (0 means not found)
+	uint64_t bloom;   // Bloom filter: bit (ch0 ^ len) & 63. Fast negative lookup.
+} TypedefTable;
+
+// Per-token Pass 1 annotation flags (stored in Token.ann)
+enum {
+	P1_IS_TYPEDEF        = 1 << 0, // Token resolves to a real typedef at this position
+	P1_SCOPE_LOOP        = 1 << 1, // This '{' opens a loop body
+	P1_SCOPE_SWITCH      = 1 << 2, // This '{' opens a switch body
+	P1_HAS_ENTRY         = 1 << 3, // Token has any typedef-table entry (typedef/enum/shadow/VLA)
+	P1_OE_BRACKET        = 1 << 4, // orelse inside array dimension brackets
+	P1_OE_DECL_INIT      = 1 << 5, // orelse inside declaration initializer
+	P1_IS_DECL           = 1 << 6, // Phase 1D: token starts a variable declaration
+	P1_SCOPE_INIT        = 1 << 7, // This '{' opens an initializer (compound literal, = {...})
+};
+
+#define tok_ann(t) ((t)->ann)
+
+// Typedef query flags (single lookup, check multiple properties)
+enum { TDF_TYPEDEF = 1, TDF_VLA = 2, TDF_VOID = 4, TDF_ENUM_CONST = 8, TDF_CONST = 16, TDF_PTR = 32, TDF_ARRAY = 64, TDF_AGGREGATE = 128, TDF_FUNC = 256, TDF_PARAM = 512 };
+
+#define FEAT(f) (ctx->features & (f))
+
+// --- Globals ---
+
+static PRISM_THREAD_LOCAL TypedefTable typedef_table;
+
+// Phase 3A: scope range context for typedef_add_entry.
+static PRISM_THREAD_LOCAL uint32_t td_scope_open = 0;
+static PRISM_THREAD_LOCAL uint32_t td_scope_close = UINT32_MAX;
+static PRISM_THREAD_LOCAL bool p1_typedef_annotated; // true after p1_annotate_typedefs(); enables O(1) is_known_typedef
+
+// --- Utility Inlines ---
+
+#define is_c23_attr(t) ((t) && ((t)->flags & TF_C23_ATTR))
+#define is_sizeof_like(t) ((t)->flags & TF_SIZEOF)
+#define is_enum_kw(t) ((t)->tag & TT_SUE && (t)->ch0 == 'e')
+
+static inline bool is_identifier_like(Token *tok) {
+	return tok->kind <= TK_KEYWORD; // TK_IDENT=0, TK_KEYWORD=1
+}
+
+// Skip balanced group: just advance past the matching close token.
+static inline Token *skip_balanced_group(Token *tok) {
+	Token *end = tok_match(tok);
+	if (!end) return tok_next(tok);
+	return tok_next(end);
+}
+
+static inline Token *skip_prep_dirs(Token *tok) {
+	while (tok && tok->kind == TK_PREP_DIR) tok = tok_next(tok);
+	return tok;
+}
+
+// Skip noise tokens (attributes, C23 [[...]], prep dirs) in analysis mode.
+static Token *skip_noise(Token *tok) {
+	while (tok && tok->kind != TK_EOF) {
+		if (tok->tag & TT_ATTR) {
+			tok = tok_next(tok);
+			if (tok && tok->len == 1 && tok->ch0 == '(' && tok_match(tok))
+				tok = tok_next(tok_match(tok));
+		} else if (is_c23_attr(tok) && tok_match(tok)) {
+			tok = tok_next(tok_match(tok));
+		} else if (tok->kind == TK_PREP_DIR) {
+			tok = tok_next(tok);
+		} else {
+			break;
+		}
+	}
+	return tok;
+}
+
+#define SKIP_NOISE_CONTINUE(var) do { \
+	Token *_sn = skip_noise(var); \
+	if (_sn != (var)) { (var) = _sn; continue; } \
+} while(0)
+
+static Token *skip_to_semicolon(Token *tok) {
+	while (tok->kind != TK_EOF) {
+		if (tok->flags & TF_OPEN) { tok = tok_next(tok_match(tok)); continue; }
+		if (tok->len == 1 && tok->ch0 == ';') return tok;
+		tok = tok_next(tok);
+	}
+	return tok;
+}
+
+static Token *skip_pointers(Token *tok, bool *is_void) {
+	while (tok && tok->kind != TK_EOF) {
+		SKIP_NOISE_CONTINUE(tok);
+		if ((tok->len == 1 && tok->ch0 == '*') || (tok->tag & TT_QUALIFIER)) {
+			tok = tok_next(tok);
+			if (is_void) *is_void = false;
+		} else break;
+	}
+	return tok;
+}
+
+// --- Typedef Table ---
+
+static void typedef_table_reset(void) {
+	typedef_table.entries = NULL;
+	typedef_table.count = 0;
+	typedef_table.capacity = 0;
+	typedef_table.bloom = 0;
+	hashmap_zero(&typedef_table.name_map);
+}
+
+static int typedef_get_index(char *name, int len) {
+	void *val = hashmap_get(&typedef_table.name_map, name, len);
+	return val ? (int)(intptr_t)val - 1 : -1;
+}
+
+static void
+typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool is_vla, bool is_void) {
+	// Skip duplicate re-definitions at the same scope (valid C11 §6.7/3).
+	if (kind == TDK_TYPEDEF || kind == TDK_ENUM_CONST) {
+		int existing = typedef_get_index(name, len);
+		if (existing >= 0) {
+			TypedefEntry *prev = &typedef_table.entries[existing];
+			if (prev->scope_depth == scope_depth && !prev->is_shadow &&
+			    prev->scope_open_idx == td_scope_open && prev->scope_close_idx == td_scope_close)
+				return;
+		}
+	}
+
+	ARENA_ENSURE_CAP(&ctx->main_arena,
+			 typedef_table.entries,
+			 typedef_table.count + 1,
+			 typedef_table.capacity,
+			 32,
+			 TypedefEntry);
+	int new_index = typedef_table.count++;
+	TypedefEntry *e = &typedef_table.entries[new_index];
+	e->name = name;
+	e->len = len;
+	e->scope_depth = scope_depth;
+	e->is_vla = (kind == TDK_TYPEDEF || kind == TDK_VLA_VAR) ? is_vla : false;
+	e->is_void = (kind == TDK_TYPEDEF) ? is_void : false;
+	e->is_const = false;
+	e->is_shadow = (kind == TDK_SHADOW || kind == TDK_ENUM_CONST);
+	e->is_enum_const = (kind == TDK_ENUM_CONST);
+	e->is_vla_var = (kind == TDK_VLA_VAR);
+	e->is_param = false;
+	e->prev_index = typedef_get_index(name, len);
+	e->token_index = 0;
+	e->scope_open_idx = td_scope_open;
+	e->scope_close_idx = td_scope_close;
+	hashmap_put(&typedef_table.name_map, name, len, (void *)(intptr_t)(new_index + 1));
+	typedef_table.bloom |= 1ULL << (((unsigned char)name[0] ^ len) & 63);
+}
+
+static TypedefEntry *typedef_lookup(Token *tok) {
+	if (!is_identifier_like(tok)) return NULL;
+	if (p1_typedef_annotated && !(tok_ann(tok) & P1_HAS_ENTRY))
+		return NULL;
+	if (tok->kind == TK_KEYWORD && !(tok->tag & (TT_ORELSE | TT_DEFER)) && !(tok->flags & TF_RAW))
+		return NULL;
+	unsigned c0 = tok->ch0, tl = tok->len;
+	if (!(typedef_table.bloom & (1ULL << ((c0 ^ tl) & 63))))
+		return NULL;
+	int idx = typedef_get_index(tok_loc(tok), tok->len);
+	uint32_t cur = tok_idx(tok);
+	while (idx >= 0) {
+		TypedefEntry *e = &typedef_table.entries[idx];
+		if (e->token_index <= cur &&
+		    cur >= e->scope_open_idx && cur < e->scope_close_idx)
+			return e;
+		idx = e->prev_index;
+	}
+	return NULL;
+}
+
+static inline int typedef_flags(Token *tok) {
+	TypedefEntry *e = typedef_lookup(tok);
+	if (!e) return 0;
+	if (e->is_enum_const) return TDF_ENUM_CONST;
+	if (e->is_shadow) return 0;
+	if (e->is_vla_var) return TDF_VLA | (e->is_param ? TDF_PARAM : 0);
+	return TDF_TYPEDEF | (e->is_vla ? TDF_VLA : 0) | (e->is_void ? TDF_VOID : 0) |
+	       (e->is_const ? TDF_CONST : 0) | (e->is_ptr ? TDF_PTR : 0) |
+	       (e->is_array ? TDF_ARRAY : 0) | (e->is_aggregate ? TDF_AGGREGATE : 0) |
+	       (e->is_func ? TDF_FUNC : 0);
+}
+
+// After Pass 1 annotation, is_known_typedef becomes O(1) bit check.
+static inline bool _is_known_typedef(Token *tok) {
+	if (__builtin_expect(p1_typedef_annotated, 1))
+		return tok_ann(tok) & P1_IS_TYPEDEF;
+	return typedef_flags(tok) & TDF_TYPEDEF;
+}
+#define is_known_typedef(tok) _is_known_typedef(tok)
+#define is_vla_typedef(tok) (typedef_flags(tok) & TDF_VLA)
+#define is_void_typedef(tok) (typedef_flags(tok) & TDF_VOID)
+#define is_known_enum_const(tok) (typedef_flags(tok) & TDF_ENUM_CONST)
+#define is_const_typedef(tok) (typedef_flags(tok) & TDF_CONST)
+#define is_ptr_typedef(tok) (typedef_flags(tok) & TDF_PTR)
+#define is_array_typedef(tok) (typedef_flags(tok) & TDF_ARRAY)
+#define is_func_typedef(tok) (typedef_flags(tok) & TDF_FUNC)
+
+// --- Type/Variable Classification ---
+
+static bool is_type_keyword(Token *tok) {
+	if (tok->tag & TT_TYPE) return true;
+	if (tok->kind != TK_IDENT && tok->kind != TK_KEYWORD) return false;
+	return is_known_typedef(tok);
+}
+
+static inline bool is_valid_varname(Token *tok) {
+	return tok->kind == TK_IDENT || (tok->flags & TF_RAW) || (tok->tag & (TT_DEFER | TT_ORELSE));
+}
+
+// Forward declaration: defined in prism.c (needs emit infrastructure).
+static DeclResult parse_declarator(Token *tok, bool emit);
+
+// Register enum constants as typedef shadows. tok points to opening '{'.
+static void parse_enum_constants(Token *tok, int scope_depth) {
+	if (!tok || !(tok->len == 1 && tok->ch0 == '{')) return;
+	tok = tok_next(tok); // Skip '{'
+
+	while (tok && tok->kind != TK_EOF && !(tok->len == 1 && tok->ch0 == '}')) {
+		SKIP_NOISE_CONTINUE(tok);
+
+		if (is_valid_varname(tok)) {
+			int pre = typedef_table.count;
+			typedef_add_entry(tok_loc(tok), tok->len, scope_depth, TDK_ENUM_CONST, false, false);
+			if (typedef_table.count > pre)
+				typedef_table.entries[typedef_table.count - 1].token_index = tok_idx(tok);
+			tok = tok_next(tok);
+
+			tok = skip_noise(tok); // Skip C23/GNU attributes on enumerator
+
+			if (tok && tok->len == 1 && tok->ch0 == '=') {
+				tok = tok_next(tok);
+				while (tok && tok->kind != TK_EOF) {
+					if (tok->flags & TF_OPEN) { tok = tok_next(tok_match(tok)); continue; }
+					if (tok->len == 1 && (tok->ch0 == ',' || tok->ch0 == '}')) break;
+					tok = tok_next(tok);
+				}
+			}
+
+			if (tok && tok->len == 1 && tok->ch0 == ',') tok = tok_next(tok);
+		} else {
+			tok = tok_next(tok);
+		}
+	}
+}
+
+// Shadow-aware orelse keyword check: real typedefs suppress,
+// variable/enum shadows do not.
+static inline bool is_orelse_kw_shadow(Token *tok) {
+	if (!(tok->tag & TT_ORELSE)) return false;
+	TypedefEntry *te = typedef_lookup(tok);
+	return !te || te->is_shadow;
+}
+
+// Strict orelse keyword check: any typedef table match suppresses.
+static inline bool is_orelse_kw(Token *tok) {
+	if (!(tok->tag & TT_ORELSE)) return false;
+	return !typedef_lookup(tok);
+}
+
+// Positional orelse shadow disambiguation: only treat as keyword if the
+// preceding token ends an expression (infix position).
+static inline bool orelse_shadow_is_kw(Token *prev) {
+	if (!prev) return false;
+	if (prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE | TT_TYPEOF | TT_BITINT))
+		return false;
+	if ((prev->len == 1 && ((1ULL << (prev->ch0 - 32)) &
+	    ((1ULL << ('*' - 32)) | (1ULL << ('(' - 32)) | (1ULL << ('[' - 32)) |
+	     (1ULL << (',' - 32)) | (1ULL << ('=' - 32)) | (1ULL << ('?' - 32)) |
+	     (1ULL << (':' - 32)) | (1ULL << ('!' - 32)) | (1ULL << ('&' - 32)) |
+	     (1ULL << ('-' - 32)) | (1ULL << ('+' - 32)) | (1ULL << (';' - 32))))) ||
+	    (prev->len == 1 && (prev->ch0 == '~' || prev->ch0 == '{')))
+		return false;
+	return true;
+}
+
+// --- Struct/VLA Analysis ---
+
+// Find opening brace of a struct/union/enum body, or NULL if no body.
+static Token *find_struct_body_brace(Token *tok) {
+	Token *t = tok_next(tok);
+	while (t && t->kind != TK_EOF) {
+		SKIP_NOISE_CONTINUE(t);
+		if (is_valid_varname(t) || (t->tag & TT_QUALIFIER)) {
+			t = tok_next(t);
+		} else break;
+	}
+	return (t && t->len == 1 && t->ch0 == '{') ? t : NULL;
+}
+
+// Check if a token can legally precede an array bracket '[' in a type context.
+static inline bool is_array_bracket_predecessor(Token *t, Token *prev2) {
+	return is_type_keyword(t) ||
+	       (t->tag & TT_QUALIFIER) ||
+	       (prev2 && (prev2->tag & TT_SUE)) ||
+	       (t->len == 1 && (t->ch0 == ']' || t->ch0 == '*' || t->ch0 == ')')) ||
+	       (t->len == 1 && t->ch0 == '}');
+}
+
+// Check if array dimension contains a VLA expression (runtime variable).
+static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
+	if (depth > 256)
+		error_tok(open_bracket, "array dimension nesting depth exceeds 256");
+	Token *close = tok_match(open_bracket);
+	if (!close) return false;
+	Token *tok = tok_next(open_bracket);
+
+	while (tok != close) {
+		if (tok->len == 1 && tok->ch0 == '[') {
+			if (array_size_is_vla_impl(tok, depth + 1)) return true;
+			tok = skip_balanced_group(tok);
+			continue;
+		}
+		// GNU statement expression ({...}) in array dimension is always VLA.
+		if (tok->len == 1 && tok->ch0 == '(' && tok_next(tok) &&
+		    tok_next(tok)->len == 1 && tok_next(tok)->ch0 == '{')
+			return true;
+		if (tok->tag & TT_GENERIC) return true;
+		SKIP_NOISE_CONTINUE(tok);
+
+		// sizeof/alignof: skip argument but check for VLA typedef and inner VLA types.
+		if (is_sizeof_like(tok)) {
+			bool is_sizeof = tok->ch0 == 's';
+			tok = tok_next(tok);
+			if (tok != close && tok->len == 1 && tok->ch0 == '(') {
+				Token *end = skip_balanced_group(tok);
+				if (is_sizeof) {
+					Token *prev2_inner = NULL;
+					Token *prev_inner = tok;
+					for (Token *inner = tok_next(tok); inner && inner != end; prev2_inner = prev_inner, prev_inner = inner, inner = tok_next(inner)) {
+						if (is_enum_kw(inner)) {
+							Token *brace = find_struct_body_brace(inner);
+							if (brace) {
+								inner = skip_balanced_group(brace);
+								if (inner == end) break;
+								continue;
+							}
+						}
+						int vla_fl = typedef_flags(inner) & (TDF_VLA | TDF_PARAM);
+						if (vla_fl & TDF_VLA) {
+							if (!(vla_fl & TDF_PARAM)) return true;
+							Token *ni = tok_next(inner);
+							bool has_next = ni && ni != end;
+							bool deref = (prev_inner->len == 1 && (prev_inner->ch0 == '*' || prev_inner->ch0 == '[' || prev_inner->ch0 == '+' || prev_inner->ch0 == '-')) ||
+								(has_next && ni->len == 1 && (ni->ch0 == '[' || ni->ch0 == '+' || ni->ch0 == '-' || ni->ch0 == '*'));
+							if (deref) return true;
+						}
+						if (inner->len == 1 && inner->ch0 == '[' &&
+						    is_array_bracket_predecessor(prev_inner, prev2_inner)) {
+							if (array_size_is_vla_impl(inner, depth + 1))
+								return true;
+							inner = tok_match(inner);
+							if (!inner || inner == end) break;
+							continue;
+						}
+						if (is_valid_varname(inner) && !is_type_keyword(inner) &&
+						    !is_known_typedef(inner) && !is_known_enum_const(inner) &&
+						    tok_next(inner) && inner != end &&
+						    tok_next(inner)->len == 1 && tok_next(inner)->ch0 == '(') {
+							Token *call_end = skip_balanced_group(tok_next(inner));
+							bool is_deref = (prev_inner->len == 1 && prev_inner->ch0 == '*') ||
+							    (call_end && call_end != end &&
+							     ((call_end->len == 1 && call_end->ch0 == '[') || equal(call_end, "->") || (call_end->len == 1 && call_end->ch0 == '.')));
+							if (is_deref)
+								for (Token *a = tok_next(tok_next(inner)); a && a != call_end; a = tok_next(a))
+									if (is_valid_varname(a) && !is_known_enum_const(a) &&
+									    !is_type_keyword(a))
+										return true;
+							prev_inner = inner;
+							inner = call_end;
+							if (!inner || inner == end) break;
+						}
+					}
+				}
+				tok = end;
+				if (tok != close && tok->len == 1 && tok->ch0 == '{')
+					tok = skip_balanced_group(tok);
+			} else if (tok != close) {
+				// Unparenthesized sizeof/alignof: skip prefix ops, operand, postfix.
+				while (tok != close) {
+					SKIP_NOISE_CONTINUE(tok);
+					if ((tok->len == 1 && (tok->ch0 == '*' || tok->ch0 == '&' || tok->ch0 == '!' ||
+					    tok->ch0 == '+' || tok->ch0 == '-' || tok->ch0 == '~')) ||
+					    equal(tok, "++") || equal(tok, "--") ||
+					    is_sizeof_like(tok)) {
+						tok = tok_next(tok);
+						continue;
+					}
+					break;
+				}
+				if (tok != close) {
+					if (tok->flags & TF_OPEN) {
+						tok = tok_match(tok) ? tok_next(tok_match(tok)) : tok;
+						if (tok != close && tok->len == 1 && tok->ch0 == '{')
+							tok = tok_match(tok) ? tok_next(tok_match(tok)) : tok;
+					} else {
+						if (is_identifier_like(tok) && is_vla_typedef(tok)) return true;
+						tok = tok_next(tok);
+					}
+				}
+				while (tok != close) {
+					if (tok->tag & TT_MEMBER) {
+						tok = tok_next(tok);
+						if (tok != close) tok = tok_next(tok);
+					} else if (tok->flags & TF_OPEN)
+						tok = tok_match(tok) ? tok_next(tok_match(tok)) : tok;
+					else break;
+				}
+			}
+			continue;
+		}
+
+		if ((tok->tag & TT_MEMBER) ||
+		    (is_valid_varname(tok) && !is_known_enum_const(tok) && !is_type_keyword(tok))) return true;
+		tok = tok_next(tok);
+	}
+	return false;
+}
+
+static inline bool array_size_is_vla(Token *open_bracket) { return array_size_is_vla_impl(open_bracket, 0); }
+
+static bool struct_body_contains_vla(Token *brace) {
+	if (!brace || !(brace->len == 1 && brace->ch0 == '{') || !tok_match(brace)) return false;
+	Token *end = tok_match(brace);
+	for (Token *t = tok_next(brace); t && t != end; t = tok_next(t)) {
+		if (t->len == 1 && t->ch0 == '{') {
+			if (struct_body_contains_vla(t)) return true;
+			t = tok_match(t); continue;
+		}
+		if ((t->flags & TF_OPEN) && !(t->len == 1 && t->ch0 == '[')) { t = tok_match(t); continue; }
+		if (t->len == 1 && t->ch0 == '[' && array_size_is_vla(t)) return true;
+		if (is_identifier_like(t) && is_vla_typedef(t)) return true;
+	}
+	return false;
+}
+
+static bool typedef_contains_vla(Token *tok) {
+	while (tok && tok->kind != TK_EOF) {
+		if (tok->len == 1 && tok->ch0 == ';') break;
+		if ((tok->flags & TF_OPEN) && !(tok->len == 1 && tok->ch0 == '[')) { tok = tok_next(tok_match(tok)); continue; }
+		if (tok->len == 1 && tok->ch0 == '[' && array_size_is_vla(tok)) return true;
+		tok = tok_next(tok);
+	}
+	return false;
+}
+
+// --- Find Helpers ---
+
+static Token *find_boundary_comma(Token *tok) {
+	while (tok->kind != TK_EOF) {
+		if (tok->flags & TF_OPEN) { tok = tok_next(tok_match(tok)); continue; }
+		if (tok->len == 1 && tok->ch0 == ';') return NULL;
+		if (tok->len == 1 && tok->ch0 == ',') {
+			Token *n = tok_next(tok);
+			if (n) {
+				if (n->len == 1 && n->ch0 == '(') {
+					Token *inside = tok_next(n);
+					if (inside && !(inside->tag & (TT_TYPE | TT_SUE | TT_TYPEOF | TT_QUALIFIER))
+					    && !is_known_typedef(inside) && !is_c23_attr(inside))
+						return tok;
+				} else if ((n->len == 1 && n->ch0 == '*') || (n->tag & TT_QUALIFIER) || (n->tag & TT_ATTR) || is_c23_attr(n)) {
+					return tok;
+				} else if (is_valid_varname(n) && !(n->tag & (TT_TYPE | TT_SUE | TT_TYPEOF))) {
+					if (tok_next(n) && tok_next(n)->len == 1 && tok_next(n)->ch0 == '(') {
+						Token *inside = tok_next(tok_next(n));
+						if (inside &&
+						    (inside->tag & (TT_TYPE | TT_SUE | TT_TYPEOF | TT_QUALIFIER)))
+							return tok;
+					} else
+						return tok;
+				}
+			}
+		}
+		tok = tok_next(tok);
+	}
+	return NULL;
+}
+
+static Token *find_init_semicolon(Token *open, Token *close) {
+	int pd = 0;
+	for (Token *s = tok_next(open); s && s != close; s = tok_next(s)) {
+		if (s->flags & TF_OPEN) pd++;
+		else if (s->flags & TF_CLOSE) pd--;
+		else if (pd == 0 && s->len == 1 && s->ch0 == ';') return s;
+	}
+	return NULL;
+}
+
+// --- VLA Paren Scanner ---
+
+// Scan a parenthesized type for VLA indicators.
+static void scan_paren_for_vla(Token *open, Token *end, TypeSpecResult *r, bool check_typeof) {
+	Token *prev2 = NULL;
+	Token *prev = open;
+	int fn_skip = 0;
+	for (Token *t = tok_next(open); t && t != end; prev2 = prev, prev = t, t = tok_next(t)) {
+		if (check_typeof && (t->tag & TT_TYPEOF)) r->has_typeof = true;
+		if (t->len == 1 && t->ch0 == '(') {
+			if (fn_skip > 0) fn_skip++;
+			else if (prev->len == 1 && prev->ch0 == ')') fn_skip = 1;
+		} else if (t->len == 1 && t->ch0 == ')') {
+			if (fn_skip > 0) fn_skip--;
+		}
+		if (fn_skip > 0) continue;
+		if (t->len == 1 && t->ch0 == '[' &&
+		    is_array_bracket_predecessor(prev, prev2) &&
+		    array_size_is_vla(t)) {
+			r->is_vla = true;
+			break;
+		}
+		if (is_identifier_like(t) && (typedef_flags(t) & TDF_VLA)) {
+			r->is_vla = true;
+			break;
+		}
+	}
+}
+
+// --- Type Specifier Parser ---
+
+#define SKIP_RAW(after, last) do { \
+	while ((after) && ((after)->flags & TF_RAW) && !is_known_typedef(after)) { \
+		(last) = (after); (after) = skip_noise(tok_next(after)); \
+	} \
+} while (0)
+
+static TypeSpecResult parse_type_specifier(Token *tok) {
+	TypeSpecResult r = { .end = tok };
+
+	while (tok && tok->kind != TK_EOF) {
+		Token *next = skip_noise(tok);
+		if (next != tok) { tok = next; r.end = tok; continue; }
+
+		if (!r.saw_type && (tok->flags & TF_RAW) && !is_known_typedef(tok)) {
+			r.has_raw = true;
+			Token *after = skip_noise(tok_next(tok));
+			Token *last = tok;
+			SKIP_RAW(after, last);
+			tok = tok_next(last);
+			r.end = tok;
+			continue;
+		}
+
+		uint32_t tag = tok->tag;
+		bool is_type = is_type_keyword(tok);
+		if (!(tag & (TT_QUALIFIER | TT_STORAGE)) && !is_type && !(tag & (TT_BITINT | TT_ALIGNAS))) break;
+
+		if (equal(tok, "void") || is_void_typedef(tok)) r.has_void = true;
+
+		bool had_type = r.saw_type;
+
+		if ((tag & TT_STORAGE) && equal(tok, "extern")) r.has_extern = true;
+		if ((tag & TT_STORAGE) && equal(tok, "static")) r.has_static = true;
+
+		if (tag & TT_QUALIFIER) {
+			if (tag & TT_VOLATILE) r.has_volatile = true;
+			if (tag & TT_REGISTER) r.has_register = true;
+			if (tag & TT_CONST) r.has_const = true;
+			if (tag & TT_TYPE) {
+				if (equal(tok, "auto")) r.saw_type = true;
+				else r.has_atomic = true;
+			}
+		}
+
+		if (is_type && (tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE)
+		    && !(tok_next(tok) && tok_next(tok)->len == 1 && tok_next(tok)->ch0 == '('))
+			is_type = false;
+		if (is_type) r.saw_type = true;
+		is_type = false;
+
+		// _Atomic(type) specifier form
+		if ((tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE) && tok_next(tok) &&
+		    tok_next(tok)->len == 1 && tok_next(tok)->ch0 == '(') {
+			r.saw_type = true;
+			r.has_atomic = true;
+			tok = tok_next(tok);
+			Token *inner_start = tok_next(tok);
+			Token *end = skip_balanced_group(tok);
+			if (inner_start && (inner_start->tag & TT_SUE)) r.is_struct = true;
+			if (inner_start && is_identifier_like(inner_start) && is_known_typedef(inner_start))
+				r.is_typedef = true;
+			scan_paren_for_vla(tok, end, &r, true);
+			tok = end;
+			r.end = tok;
+			continue;
+		}
+
+		// struct/union/enum
+		if (tag & TT_SUE) {
+			r.is_struct = true;
+			if (tok->ch0 == 'e') r.is_enum = true;
+			r.saw_type = true;
+			tok = tok_next(tok);
+			while (tok && tok->kind != TK_EOF) {
+				SKIP_NOISE_CONTINUE(tok);
+				if (tok->tag & TT_QUALIFIER) tok = tok_next(tok);
+				else break;
+			}
+			Token *sue_tag = NULL;
+			if (tok && is_valid_varname(tok)) { sue_tag = tok; tok = tok_next(tok); }
+			if (tok && tok->len == 1 && tok->ch0 == '{') {
+				if (struct_body_contains_vla(tok)) {
+					r.is_vla = true;
+				}
+				tok = skip_balanced_group(tok);
+			} else if (sue_tag && is_vla_typedef(sue_tag)) {
+				r.is_vla = true;
+			}
+			r.end = tok;
+			continue;
+		}
+
+		// typeof/typeof_unqual/__typeof__
+		if (tag & TT_TYPEOF) {
+			bool is_unqual = equal(tok, "typeof_unqual");
+			r.saw_type = true;
+			r.has_typeof = true;
+			tok = tok_next(tok);
+			if (tok && tok->len == 1 && tok->ch0 == '(') {
+				Token *end = skip_balanced_group(tok);
+				if (tok_next(tok) && equal(tok_next(tok), "void") && tok_next(tok_next(tok)) == tok_match(tok)) r.has_void = true;
+				if (!is_unqual)
+					for (Token *t = tok_next(tok); t && t != end; t = tok_next(t)) {
+						if (t->tag & TT_VOLATILE) r.has_volatile = true;
+						if (t->tag & TT_CONST) r.has_const = true;
+						if ((t->tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE))
+							r.has_atomic = true;
+						if ((t->tag & TT_SUE) || (typedef_flags(t) & TDF_AGGREGATE)) r.is_struct = true;
+					}
+				scan_paren_for_vla(tok, end, &r, false);
+				tok = end;
+			}
+			r.end = tok;
+			continue;
+		}
+
+		if (tag & (TT_BITINT | TT_ATTR | TT_ALIGNAS)) {
+			if (tag & TT_BITINT) r.saw_type = true;
+			Token *kw = tok;
+			tok = tok_next(tok);
+			if (tok && tok->len == 1 && tok->ch0 == '(') {
+				if (FEAT(F_ORELSE) && (kw->tag & (TT_BITINT | TT_ALIGNAS))) {
+					Token *close = tok_match(tok);
+					for (Token *s = tok_next(tok); s && s != close; s = tok_next(s))
+						if (is_orelse_kw_shadow(s))
+							error_tok(s, "'orelse' cannot be used inside %s "
+								  "(requires a compile-time constant expression)",
+								  (kw->tag & TT_BITINT) ? "_BitInt()" : "_Alignas()");
+				}
+				tok = skip_balanced_group(tok);
+			}
+			r.end = tok;
+			continue;
+		}
+
+		int tflags = typedef_flags(tok);
+		if (tflags & TDF_TYPEDEF) {
+			if (had_type) break;
+			r.is_typedef = true;
+			if (tflags & TDF_VLA) r.is_vla = true;
+			if (tflags & TDF_AGGREGATE) r.is_struct = true;
+			Token *peek = tok_next(tok);
+			while (peek && (peek->tag & TT_QUALIFIER)) peek = tok_next(peek);
+			if (peek && is_valid_varname(peek)) {
+				Token *after = tok_next(peek);
+				if (after && (after->len == 1 && (after->ch0 == ';' || after->ch0 == '[' || after->ch0 == ',' || after->ch0 == '='))) {
+					tok = tok_next(tok);
+					r.end = tok;
+					r.saw_type = true;
+					return r;
+				}
+			}
+		}
+
+		tok = tok_next(tok);
+		r.end = tok;
+	}
+
+	return r;
+}
+
+// --- Typedef Declaration Parser ---
+
+static void parse_typedef_declaration(Token *tok, int scope_depth) {
+	Token *typedef_start = tok;
+	tok = tok_next(tok); // Skip 'typedef'
+	Token *type_start = tok;
+	TypeSpecResult type_spec = parse_type_specifier(tok);
+	tok = type_spec.end;
+
+	bool is_vla = type_spec.is_vla || typedef_contains_vla(typedef_start);
+
+	bool base_is_const = type_spec.has_const;
+	if (!base_is_const) {
+		for (Token *t = type_start; t && t != tok; t = tok_next(t))
+			if (is_const_typedef(t)) { base_is_const = true; break; }
+	}
+
+	bool base_is_void = type_spec.has_void;
+	bool base_is_ptr = false;
+	bool base_is_array = false;
+	for (Token *bt = type_start; bt && bt != type_spec.end; bt = tok_next(bt)) {
+		if (is_ptr_typedef(bt)) { base_is_ptr = true; break; }
+		if (is_array_typedef(bt)) { base_is_array = true; break; }
+	}
+
+	while (tok && !(tok->len == 1 && tok->ch0 == ';') && tok->kind != TK_EOF) {
+		DeclResult decl = parse_declarator(tok, false);
+		if (decl.var_name) {
+			bool is_void =
+			    base_is_void && !decl.is_pointer && !decl.is_array && !decl.is_func_ptr;
+			bool is_const = (decl.is_pointer || decl.is_func_ptr)
+			    ? decl.is_const : (base_is_const && !decl.is_array);
+			bool is_ptr =
+			    decl.is_pointer || decl.is_func_ptr || base_is_ptr;
+			int pre_count = typedef_table.count;
+			typedef_add_entry(tok_loc(decl.var_name), decl.var_name->len, scope_depth, TDK_TYPEDEF, is_vla, is_void);
+			if (typedef_table.count > pre_count) {
+				TypedefEntry *added = &typedef_table.entries[typedef_table.count - 1];
+				added->token_index = tok_idx(decl.var_name);
+				if (is_const) added->is_const = true;
+				if (is_ptr) added->is_ptr = true;
+				if ((decl.is_array || base_is_array) && !decl.is_pointer && !decl.is_func_ptr)
+					added->is_array = true;
+				if (type_spec.is_struct && !type_spec.is_enum && !decl.is_pointer && !decl.is_func_ptr)
+					added->is_aggregate = true;
+				if (!decl.end) {
+					Token *after_name = skip_noise(tok_next(decl.var_name));
+					if (after_name && after_name->len == 1 && after_name->ch0 == '(')
+						added->is_func = true;
+				}
+				if (decl.is_func_ptr && !decl.paren_pointer)
+					added->is_func = true;
+			}
+		}
+		tok = decl.end ? decl.end : tok_next(tok);
+
+		while (tok && !(tok->len == 1 && tok->ch0 == ',') && !(tok->len == 1 && tok->ch0 == ';') && tok->kind != TK_EOF) {
+			if (tok->len == 1 && tok->ch0 == '(') tok = skip_balanced_group(tok);
+			else if (tok->len == 1 && tok->ch0 == '[') tok = skip_balanced_group(tok);
+			else tok = tok_next(tok);
+		}
+
+		if (tok && tok->len == 1 && tok->ch0 == ',') tok = tok_next(tok);
+	}
+}
+
+// --- skip_one_stmt ---
+
+static Token *skip_one_stmt_impl(Token *tok, uint32_t *cache) {
+	int if_depth = 0;
+	int do_depth = 0;
+	int do_if_save[4096];
+	uint32_t trail[256];
+	int tn = 0;
+restart:
+	tok = skip_prep_dirs(tok);
+	tok = skip_noise(tok);
+	if (!tok || tok->kind == TK_EOF) return NULL;
+	if (cache) {
+		uint32_t idx = tok_idx(tok);
+		if (cache[idx]) {
+			Token *r = &token_pool[cache[idx] - 1];
+			for (int i = 0; i < tn; i++) cache[trail[i]] = cache[idx];
+			return r;
+		}
+		if (tn < 256) trail[tn++] = idx;
+	}
+
+	if (tok->len == 1 && tok->ch0 == '{') { tok = tok_match(tok); goto unwind_if; }
+
+	if (tok->tag & TT_IF) {
+		if (tok->ch0 == 'e') { tok = tok_next(tok); goto restart; }
+		Token *p = skip_prep_dirs(tok_next(tok));
+		if (!p || !(p->len == 1 && p->ch0 == '(') || !tok_match(p)) return NULL;
+		if_depth++;
+		tok = tok_next(tok_match(p)); goto restart;
+	}
+
+	if ((tok->tag & (TT_LOOP | TT_SWITCH)) && tok->ch0 != 'd') {
+		Token *p = skip_prep_dirs(tok_next(tok));
+		if (!p || !(p->len == 1 && p->ch0 == '(') || !tok_match(p)) return NULL;
+		tok = tok_next(tok_match(p)); goto restart;
+	}
+
+	if ((tok->tag & TT_LOOP) && tok->ch0 == 'd') {
+		if (do_depth >= 4096) return NULL;
+		do_if_save[do_depth++] = if_depth;
+		if_depth = 0;
+		tn = 0;
+		tok = tok_next(tok); goto restart;
+	}
+
+	if (is_identifier_like(tok) && !(tok->tag & (TT_CASE | TT_DEFAULT | TT_TYPE | TT_QUALIFIER | TT_STORAGE))) {
+		Token *colon = skip_noise(tok_next(tok));
+		if (colon && colon->len == 1 && colon->ch0 == ':' && !(tok_next(colon) && tok_next(colon)->len == 1 && tok_next(colon)->ch0 == ':')) {
+			tok = tok_next(colon); goto restart;
+		}
+	}
+
+	if ((tok->tag & (TT_CASE | TT_DEFAULT)) && !is_known_typedef(tok)) {
+		int td = 0;
+		for (Token *s = tok_next(tok); s && s->kind != TK_EOF; s = tok_next(s)) {
+			if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; continue; }
+			if (s->len == 1 && s->ch0 == '?') { td++; continue; }
+			if (s->len == 1 && s->ch0 == ':') {
+				if (td > 0) { td--; continue; }
+				tok = tok_next(s); goto restart;
+			}
+		}
+		return NULL;
+	}
+
+	for (Token *s = tok; s && s->kind != TK_EOF; s = tok_next(s)) {
+		if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; continue; }
+		if (s->len == 1 && s->ch0 == ';') { tok = s; goto unwind_if; }
+	}
+	return NULL;
+
+unwind_if:
+	while (if_depth > 0) {
+		if_depth--;
+		if (!tok) return NULL;
+		Token *n = skip_prep_dirs(tok_next(tok));
+		if (n && (n->tag & TT_IF) && n->ch0 == 'e') {
+			if (cache && tok) {
+				uint32_t val = tok_idx(tok) + 1;
+				for (int i = 0; i < tn; i++) cache[trail[i]] = val;
+			}
+			tn = 0;
+			tok = tok_next(n); goto restart;
+		}
+	}
+	if (cache && tok) {
+		uint32_t val = tok_idx(tok) + 1;
+		for (int i = 0; i < tn; i++) cache[trail[i]] = val;
+	}
+	if (do_depth > 0) {
+		do_depth--;
+		if_depth = do_if_save[do_depth];
+		tn = 0;
+		if (!tok) goto unwind_if;
+		Token *w = skip_prep_dirs(tok_next(tok));
+		if (!w || !(w->tag & TT_LOOP) || !equal(w, "while")) { tok = NULL; goto unwind_if; }
+		Token *p2 = skip_prep_dirs(tok_next(w));
+		if (!p2 || !(p2->len == 1 && p2->ch0 == '(') || !tok_match(p2)) { tok = NULL; goto unwind_if; }
+		Token *a = skip_prep_dirs(tok_next(tok_match(p2)));
+		tok = (a && a->len == 1 && a->ch0 == ';') ? a : NULL;
+		goto unwind_if;
+	}
+	return tok;
+}
+static Token *skip_one_stmt(Token *tok) { return skip_one_stmt_impl(tok, NULL); }
+
 // full=false: reset for reuse; full=true: free everything
 void tokenizer_teardown(bool full) {
 	if (ctx->input_files) {

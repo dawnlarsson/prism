@@ -2345,6 +2345,44 @@ static void test_func_typedef_zeroinit(void) {
 	}
 }
 
+// BUG_AUDIT_A5: parenthesized function typedef `typedef int (FuncType)(int)`
+// was not detected as is_func because the paren-wrapped declarator made
+// decl.end non-NULL, skipping the `(` check. Fix: added else-branch after
+// the !decl.end check that inspects the token after decl.end for `(`.
+static void test_paren_func_typedef_zeroinit(void) {
+	printf("\n--- parenthesized function typedef zeroinit (A5) ---\n");
+	{
+		const char *code =
+		    "typedef int (FuncType)(int);\n"
+		    "void test(void) {\n"
+		    "    FuncType my_func;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "a5_pft.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "paren func typedef transpiles (A5)");
+		if (r.output) {
+			CHECK(strstr(r.output, "= {0}") == NULL && strstr(r.output, "= 0") == NULL
+			      && strstr(r.output, "memset") == NULL,
+			      "paren func typedef must NOT be zero-initialized (A5)");
+		}
+		prism_free(&r);
+	}
+	// Control: paren'd non-function typedef must still be zeroed
+	{
+		const char *code =
+		    "typedef int (IntType);\n"
+		    "void test(void) {\n"
+		    "    IntType x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "a5_pnt.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "paren non-func typedef transpiles (A5)");
+		if (r.output) {
+			CHECK(strstr(r.output, "= 0") != NULL || strstr(r.output, "= {0}") != NULL,
+			      "paren non-func typedef must still be zero-initialized (A5 control)");
+		}
+		prism_free(&r);
+	}
+}
+
 // ternary in case label vs skip_one_stmt shadow scope.
 // skip_one_stmt's case/default scanner confuses the ternary `:` with the
 // label `:` in `case 1 ? 2 : 3:`, overshooting the for-loop body boundary.
@@ -3174,4 +3212,7 @@ void run_zeroinit_tests(void) {
 
 	// sizeof(param_array) is constant, not VLA
 	test_vla_param_decay_sizeof();
+
+	// AUDIT: parenthesized function typedef (A5)
+	test_paren_func_typedef_zeroinit();
 }
