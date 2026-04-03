@@ -6352,6 +6352,32 @@ static void test_orelse_chained_assign_rejected(void) {
 	    "side effect");
 }
 
+// BUG94: typeof on bit-field in bare orelse.
+// typeof(bitfield_member) is a C constraint violation.
+// When LHS has member access, use typeof(RHS) instead.
+static void test_orelse_bitfield_typeof(void) {
+	const char *code =
+	    "int get_status(void) { return 0; }\n"
+	    "struct Flags { unsigned int status : 3; };\n"
+	    "void test(void) {\n"
+	    "    struct Flags f = {0};\n"
+	    "    f.status = get_status() orelse 7;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "orelse_bitfield.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "BUG94: bit-field orelse transpiles OK");
+	if (r.output) {
+		// Must NOT use typeof(f.status) — constraint violation.
+		CHECK(strstr(r.output, "typeof") == NULL ||
+		      strstr(r.output, "__typeof__(f.status)") == NULL,
+		      "BUG94: typeof must not be applied to bit-field LHS");
+		// Must use typeof(RHS) instead.
+		CHECK(strstr(r.output, "__typeof__( get_status())") != NULL ||
+		      strstr(r.output, "__typeof__(get_status())") != NULL,
+		      "BUG94: typeof applied to RHS when LHS has member access");
+	}
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -6719,4 +6745,7 @@ void run_orelse_tests(void) {
 
 	// BUG92: chained assignment split-brain
 	test_orelse_chained_assign_rejected();
+
+	// BUG94: typeof on bit-field in bare orelse
+	test_orelse_bitfield_typeof();
 }

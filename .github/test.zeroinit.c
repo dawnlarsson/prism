@@ -2984,6 +2984,31 @@ static void test_typeof_block_scope_func_proto(void) {
 	prism_free(&r);
 }
 
+// BUG95: array_size_is_vla exponential blowup on deeply nested sizeof.
+// sizeof(int[sizeof(int[...])]) inside an array dimension caused O(2^N)
+// re-scanning because the sizeof path didn't skip past matched brackets
+// after recursion.  Also has a depth>256 guard.
+static void test_array_size_is_vla_depth_guard(void) {
+	printf("\n--- BUG95: array_size_is_vla depth guard ---\n");
+	// Build sizeof(int[sizeof(int[sizeof(int[...1...])])]) with 300 levels
+	// to trigger the depth > 256 guard.
+	char buf[8192];
+	int pos = 0;
+	pos += snprintf(buf + pos, sizeof(buf) - pos, "void f(void) { int arr[");
+	for (int i = 0; i < 300 && pos < 6000; i++)
+		pos += snprintf(buf + pos, sizeof(buf) - pos, "sizeof(int[");
+	pos += snprintf(buf + pos, sizeof(buf) - pos, "1");
+	for (int i = 0; i < 300 && pos < 7500; i++)
+		pos += snprintf(buf + pos, sizeof(buf) - pos, "])");
+	pos += snprintf(buf + pos, sizeof(buf) - pos, "]; (void)arr; }");
+	PrismResult r = prism_transpile_source(buf, "bug95.c", prism_defaults());
+	CHECK(r.status != PRISM_OK, "BUG95: depth > 256 rejected");
+	if (r.error_msg)
+		CHECK(strstr(r.error_msg, "nesting depth") != NULL,
+		      "BUG95: error mentions nesting depth");
+	prism_free(&r);
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -3140,4 +3165,7 @@ void run_zeroinit_tests(void) {
 
 	// BUG93: block-scope function prototype typeof memset
 	test_typeof_block_scope_func_proto();
+
+	// BUG95: array_size_is_vla exponential blowup depth guard
+	test_array_size_is_vla_depth_guard();
 }

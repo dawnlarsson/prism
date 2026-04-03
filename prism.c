@@ -670,7 +670,8 @@ static Token *p1_find_prev_skipping_attrs(uint32_t before_idx) {
 	return NULL;
 }
 
-static bool array_size_is_vla(Token *open_bracket);
+static bool array_size_is_vla_impl(Token *open_bracket, int depth);
+static inline bool array_size_is_vla(Token *open_bracket) { return array_size_is_vla_impl(open_bracket, 0); }
 static void p1_register_param_shadows(Token *open, Token *close,
 				      uint16_t scope_id, int brace_depth,
 				      bool check_vla);
@@ -2141,14 +2142,16 @@ static inline bool is_array_bracket_predecessor(Token *t, Token *prev2) {
 
 // Check if array dimension contains a VLA expression (runtime variable).
 // sizeof/alignof/offsetof args are skipped except sizeof(VLA_Typedef).
-static bool array_size_is_vla(Token *open_bracket) {
+static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
+	if (depth > 256)
+		error_tok(open_bracket, "array dimension nesting depth exceeds 256");
 	Token *close = tok_match(open_bracket);
 	if (!close) return false;
 	Token *tok = tok_next(open_bracket);
 
 	while (tok != close) {
 		if (match_ch(tok, '[')) {
-			if (array_size_is_vla(tok)) return true;
+			if (array_size_is_vla_impl(tok, depth + 1)) return true;
 			tok = skip_balanced(tok, '[', ']');
 			continue;
 		}
@@ -2178,9 +2181,15 @@ static bool array_size_is_vla(Token *open_bracket) {
 						}
 						if (is_vla_typedef(inner)) return true;
 						if (match_ch(inner, '[') &&
-						    is_array_bracket_predecessor(prev_inner, prev2_inner) &&
-						    array_size_is_vla(inner))
-							return true;
+						    is_array_bracket_predecessor(prev_inner, prev2_inner)) {
+							if (array_size_is_vla_impl(inner, depth + 1))
+								return true;
+							// Skip past matched ] to avoid re-scanning
+							// the bracket content (exponential blowup).
+							inner = tok_match(inner);
+							if (!inner || inner == end) break;
+							continue;
+						}
 						if (is_valid_varname(inner) && !is_type_keyword(inner) &&
 						    !is_known_typedef(inner) && !is_known_enum_const(inner) &&
 						    tok_next(inner) && inner != end && match_ch(tok_next(inner), '(')) {
@@ -6370,6 +6379,14 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 		}
 
 		out_char(' ');
+		// Check if LHS contains a member access (. or ->).
+		// typeof(bitfield) is a constraint violation (C23 §6.7.2.5p2),
+		// so when LHS has member access we use typeof(RHS) instead.
+		bool lhs_has_member = false;
+		if (bare_assign_eq) {
+			for (Token *s = bare_lhs_start; s != bare_assign_eq; s = tok_next(s))
+				if (s->tag & TT_MEMBER) { lhs_has_member = true; break; }
+		}
 		if (fallback_has_compound_literal) {
 			// Ternary: (LHS = RHS) ? (void)0 : (void)(LHS = (fb));
 			OUT_LIT("(");
@@ -6411,12 +6428,21 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 			// LHS is guaranteed side-effect-free by Phase 1D
 			// (reject_orelse_side_effects), so typeof(LHS) is safe.
 			//
+			// Exception: if LHS has a member access (. or ->), use
+			// typeof(RHS) instead — typeof on a bit-field is a
+			// constraint violation (C23 §6.7.2.5p2).  VM risk in
+			// RHS is negligible: bit-field assignments have integer
+			// RHS types which are never variably-modified.
+			//
 			// Single:  { typeof(LHS) t0=(a); LHS = t0 ? t0 : (fb); }
 			// Chained: { typeof(LHS) t0=(a); if(t0){LHS=t0;}else{
 			//            typeof(LHS) t1=(b); LHS = t1 ? t1 : (c); } }
 			unsigned oe_id = ctx->ret_counter++;
 			OUT_LIT("{ "); emit_typeof_keyword(); out_char('(');
-			emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+			if (lhs_has_member)
+				emit_balanced_range(tok_next(bare_assign_eq), orelse_tok);
+			else
+				emit_range_no_prep(bare_lhs_start, bare_assign_eq);
 			OUT_LIT(") __prism_oe_");
 			out_uint(oe_id);
 			OUT_LIT(" = (");
@@ -6478,7 +6504,10 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 					}
 					oe_id = ctx->ret_counter++;
 					emit_typeof_keyword(); out_char('(');
-					emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+					if (lhs_has_member)
+						emit_balanced_range(fb_start, fb_orelse);
+					else
+						emit_range_no_prep(bare_lhs_start, bare_assign_eq);
 					OUT_LIT(") __prism_oe_");
 					out_uint(oe_id);
 					OUT_LIT(" = (");
