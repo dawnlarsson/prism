@@ -4100,6 +4100,15 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					if (!paren || !match_ch(paren, '(') || !tok_match(paren)) break;
 					Token *inner = tok_next(paren);
 					Token *close = tok_match(paren);
+					// Strip outer parens to find the core identifier:
+					// typeof((func)) or typeof(((func))) → func
+					while (inner && inner != close && match_ch(inner, '(') && tok_match(inner)) {
+						Token *inner_close = tok_match(inner);
+						if (inner_close && tok_next(inner_close) == close) {
+							inner = tok_next(inner);
+							close = inner_close;
+						} else break;
+					}
 					// Single bare identifier inside typeof()?
 					if (!inner || inner == close || tok_next(inner) != close ||
 					    !is_valid_varname(inner) || (inner->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF))) break;
@@ -5134,12 +5143,14 @@ static Token *handle_sue_body(Token *tok) {
 
 static Token *handle_open_brace(Token *tok) {
 	// Compound literal inside control parens or before body
+	bool did_push = false;
 	if (ctrl_state.pending && (in_ctrl_paren() || !ctrl_state.parens_just_closed || (tok_ann(tok) & P1_SCOPE_INIT))) {
 		// Statement expression ({...}) inside ctrl parens: not a compound literal.
 		// Save ctrl_state so it can be restored when this block closes.
 		if (last_emitted && match_ch(last_emitted, '(')) {
 			ENSURE_ARRAY_CAP(ctrl_save_stack, ctrl_save_depth + 1, ctrl_save_cap, 16, CtrlState);
 			ctrl_save_stack[ctrl_save_depth++] = ctrl_state;
+			did_push = true;
 			// Fall through to normal block processing
 		} else {
 			emit_tok(tok);
@@ -5173,8 +5184,7 @@ static Token *handle_open_brace(Token *tok) {
 	s->is_loop = ann & P1_SCOPE_LOOP;
 	s->is_switch = ann & P1_SCOPE_SWITCH;
 	if (is_stmt_expr) s->is_stmt_expr = true;
-	if (is_stmt_expr && ctrl_save_depth > 0 &&
-	    ctrl_save_stack[ctrl_save_depth - 1].pending)
+	if (did_push)
 		s->is_ctrl_se = true;
 	if (orelse_guard) s->is_orelse_guard = true;
 	if (is_initializer || (ann & P1_SCOPE_INIT)) s->is_struct = true;

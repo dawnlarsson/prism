@@ -4643,27 +4643,21 @@ static void test_interleaved_raw_multi_declarator(void) {
 static void test_union_padding_zeroinit(void) {
 	printf("\n--- union padding zero-init ---\n");
 
-	union PaddedUnion {
-		char c;       // 1 byte
-		long long ll; // 8 bytes
-	};
-
-	// Dirty the stack region first
-	{
-		unsigned char dirty[sizeof(union PaddedUnion)];
-		memset(dirty, 0xFF, sizeof(dirty));
-		(void)dirty;
+	// Runtime union zero-init is fragile to test (compiler may optimize
+	// away stack-dirtying). Instead verify Prism emits = {0} for unions.
+	const char *code =
+	    "void f(void) {\n"
+	    "    union U { char c; long long ll; };\n"
+	    "    union U u;\n"
+	    "    (void)u;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "up_zi.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "union padding zeroinit: transpile succeeds");
+	if (r.status == PRISM_OK) {
+		CHECK(strstr(r.output, "= {0}") != NULL,
+		      "union padding bytes (beyond first member) must be zeroed");
 	}
-
-	union PaddedUnion pu; // Prism emits = {0};
-
-	unsigned char *bytes = (unsigned char *)&pu;
-	int all_zero = 1;
-	for (size_t b = 0; b < sizeof(union PaddedUnion); b++) {
-		if (bytes[b] != 0) all_zero = 0;
-	}
-
-	CHECK(all_zero, "union padding bytes (beyond first member) must be zeroed");
+	prism_free(&r);
 }
 
 void run_safe_tests(void) {
@@ -5001,4 +4995,18 @@ void run_safe_tests(void) {
 
         // Execution: union padding zero-init
         test_union_padding_zeroinit();
+
+        // Execution: nested stmt-expr in if condition with defer
+        NOMSVC_ONLY(
+        {
+                int cnt = 0;
+                if ( ({
+                        int a = ({ 3; });
+                        a > 2;
+                     }) ) {
+                        defer cnt++;
+                }
+                CHECK(cnt == 1, "nested stmtexpr ctrl desync: defer fires once in if-body");
+        }
+        );
 }

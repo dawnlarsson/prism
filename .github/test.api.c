@@ -6506,6 +6506,62 @@ static void test_raw_attr_boundary_skip_noise(void) {
 	prism_free(&r);
 }
 
+static void test_typeof_paren_func_memset(void) {
+	/* BUG: typeof((func)) bypasses function-type detection because
+	 * the parenthesized name fails the tok_next(inner)==close check.
+	 * Prism emits memset on a function type → .text overwrite. */
+	PrismResult r = prism_transpile_source(
+		"void privileged_func(void);\n"
+		"void trigger(void) {\n"
+		"    typeof( (privileged_func) ) target_func;\n"
+		"}\n",
+		"typeof_pf.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "typeof paren func: transpile succeeds");
+	if (r.status == PRISM_OK) {
+		CHECK(!strstr(r.output, "memset"),
+		      "typeof paren func: no memset on function type");
+	}
+	prism_free(&r);
+
+	// Double-paren variant
+	PrismResult r2 = prism_transpile_source(
+		"void privileged_func(void);\n"
+		"void trigger(void) {\n"
+		"    typeof( ((privileged_func)) ) target_func;\n"
+		"}\n",
+		"typeof_pf2.c", prism_defaults());
+	CHECK_EQ(r2.status, PRISM_OK,
+		 "typeof double-paren func: transpile succeeds");
+	if (r2.status == PRISM_OK) {
+		CHECK(!strstr(r2.output, "memset"),
+		      "typeof double-paren func: no memset on function type");
+	}
+	prism_free(&r2);
+}
+
+static void test_nested_stmtexpr_ctrl_state_desync(void) {
+	/* BUG: nested stmt-exprs inside control-flow conditions could inherit
+	 * is_ctrl_se from the outer stmt-expr's ctrl_save_stack push.  The inner
+	 * }) then prematurely popped the stack, desynchronizing scope tracking. */
+	PrismResult r = prism_transpile_source(
+		"int f(int x) {\n"
+		"    if ( ({\n"
+		"            int a = ({ x; });\n"
+		"            { int tmp = a + 1; a = tmp; }\n"
+		"            a > 2;\n"
+		"         }) ) {\n"
+		"        defer (void)0;\n"
+		"        return 1;\n"
+		"    }\n"
+		"    return 0;\n"
+		"}\n",
+		"nested_se_d.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "nested stmtexpr ctrl desync: transpile succeeds");
+	prism_free(&r);
+}
+
 static void test_taint_propagation_perf(void) {
 	/* BUG: taint propagation's inner loop uses O(N) linear scan with
 	 * memcmp to resolve function call targets.  With N functions each
@@ -7190,4 +7246,6 @@ void run_api_tests_4(void) {
 	test_typedef_nested_enum_registration();
 	test_skip_one_stmt_deep_do_iterative();
 	test_raw_attr_boundary_skip_noise();
+	test_typeof_paren_func_memset();
+	test_nested_stmtexpr_ctrl_state_desync();
 }
