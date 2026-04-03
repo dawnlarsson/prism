@@ -6436,10 +6436,10 @@ void run_orelse_tests(void) {
 	test_orelse_funcall();
 	test_orelse_ternary();
 	test_orelse_struct_type();
-#ifdef __GNUC__
+	GNUC_ONLY(
 	test_orelse_typeof_init();
 	test_orelse_typeof_fallback();
-#endif
+	);
 	test_orelse_const_ptr();
 	test_orelse_for_body_vals();
 	test_orelse_long_init();
@@ -6477,9 +6477,7 @@ void run_orelse_tests(void) {
 	test_orelse_bare_assign_ctrl_flow();
 	test_orelse_defer_in_block();
 	test_orelse_macro_expansion();
-#ifdef __GNUC__
-	test_orelse_typeof_fallback_expr();
-#endif
+	GNUC_ONLY(test_orelse_typeof_fallback_expr());
 
 	test_orelse_braceless_if();
 	test_orelse_braceless_for();
@@ -6504,9 +6502,7 @@ void run_orelse_tests(void) {
 	test_orelse_missing_action_rejected();
 	test_orelse_bare_fallback_requires_target();
 	test_orelse_struct_value_rejected();
-#ifdef __GNUC__
-	test_orelse_stmt_expr_fallback_rejected();
-#endif
+	GNUC_ONLY(test_orelse_stmt_expr_fallback_rejected());
 	test_orelse_bare_assign_compound_side_effect_rejected();
 	test_orelse_parenthesized_array_size_rejected();
 	test_orelse_parenthesized_typeof_rejected();
@@ -6601,13 +6597,13 @@ void run_orelse_tests(void) {
         // Audit round 18: bare orelse volatile pointer-deref re-read
         test_bare_orelse_ptr_deref_lhs_rereads_volatile();
 
-#ifdef __GNUC__
+	GNUC_ONLY(
         // Audit round 16: declaration orelse with stmt-expr initializer
         test_decl_orelse_stmt_expr_initializer();
 
         // Audit round 17: multi-decl stmt-expr with orelse inside
         test_stmt_expr_multi_decl_inner_orelse();
-#endif
+	);
 
         // Audit round 19: parenthesised orelse in array dimension leaks keyword
         test_bracket_orelse_paren_wrapped();
@@ -6637,9 +6633,7 @@ void run_orelse_tests(void) {
 
 	// Audit round 28: compound literal orelse + typeof VLA volatile double-read
 	test_compound_literal_orelse_if_inside_init();
-#ifdef __GNUC__
-	test_typeof_vla_volatile_double_read();
-#endif
+	GNUC_ONLY(test_typeof_vla_volatile_double_read());
 
 	// Audit round 30: typeof pointer orelse generates long long temp
 	test_typeof_pointer_orelse_type_corruption();
@@ -6774,7 +6768,5 @@ void run_orelse_tests(void) {
 	test_orelse_bitfield_typeof();
 
 	// BUG97: __auto_type orelse
-#ifdef __GNUC__
-	test_orelse_auto_type();
-#endif
+	GNUC_ONLY(test_orelse_auto_type());
 }

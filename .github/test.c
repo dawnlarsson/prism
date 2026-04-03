@@ -75,6 +75,29 @@ static void log_append(const char *s) {
 		}                                                                                            \
 	} while (0)
 
+// Platform-conditional test execution.
+// Use in runner functions to replace #ifdef/#endif boilerplate:
+//   GNUC_ONLY(test_foo());           // GCC + Clang only
+//   UNIX_ONLY(test_bar());           // non-Windows only
+//   NOMSVC_ONLY(test_baz());         // non-MSVC only
+#ifdef __GNUC__
+#define GNUC_ONLY(...) __VA_ARGS__
+#else
+#define GNUC_ONLY(...)
+#endif
+
+#ifndef _WIN32
+#define UNIX_ONLY(...) __VA_ARGS__
+#else
+#define UNIX_ONLY(...)
+#endif
+
+#ifndef _MSC_VER
+#define NOMSVC_ONLY(...) __VA_ARGS__
+#else
+#define NOMSVC_ONLY(...)
+#endif
+
 // Detect whether transpiler output uses memset (GCC) or byte loop (MSVC).
 // MSVC has no __builtin_memset; prism uses __prism_p_ byte loops on MSVC.
 static bool has_zeroing(const char *output) {
@@ -189,6 +212,45 @@ static bool is_emulated(void) {
 	return false;
 }
 
+#ifndef _WIN32
+static int run_command_status(const char *cmd) {
+	int status = system(cmd);
+	if (status == -1) return -1;
+	if (!WIFEXITED(status)) return -1;
+	return WEXITSTATUS(status);
+}
+
+static void check_transpiled_output_compiles_and_runs(const char *output,
+					      const char *compile_name,
+					      const char *run_name) {
+	char *src_path = create_temp_file(output);
+	CHECK(src_path != NULL, "compile helper: create temp source");
+	if (!src_path) return;
+
+	char bin_template[PATH_MAX];
+	int bin_fd = test_mkstemp(bin_template, "prism_defer_exec_");
+	CHECK(bin_fd >= 0, "compile helper: reserve temp binary path");
+	if (bin_fd < 0) {
+		unlink(src_path);
+		free(src_path);
+		return;
+	}
+	close(bin_fd);
+	unlink(bin_template);
+
+	char compile_cmd[PATH_MAX * 2 + 64];
+	snprintf(compile_cmd, sizeof(compile_cmd),
+		 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin_template, src_path);
+	CHECK_EQ(run_command_status(compile_cmd), 0, compile_name);
+	if (access(bin_template, X_OK) == 0)
+		CHECK_EQ(run_command_status(bin_template), 0, run_name);
+
+	unlink(bin_template);
+	unlink(src_path);
+	free(src_path);
+}
+#endif
+
 #include "test.windows.c"
 
 #include "test.safe.c"
@@ -199,6 +261,7 @@ static bool is_emulated(void) {
 #include "test.zeroinit.c"
 #include "test.harsh.c"
 #include "test.api.c"
+#include "test.golf.c"
 
 typedef struct {
 	const char *name;
@@ -238,6 +301,7 @@ int main(void) {
 		{"api_2",    run_api_tests_2},
 		{"api_3",    run_api_tests_3},
 		{"api_4",    run_api_tests_4},
+		{"golf",     run_golf_tests},
 	};
 	int n = sizeof(suites) / sizeof(suites[0]);
 

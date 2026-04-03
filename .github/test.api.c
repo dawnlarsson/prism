@@ -6981,9 +6981,7 @@ void run_api_tests_1(void) {
 	test_file_c23_n3322_local_extern_generic_leak();
 	test_raw_c23_attr_interleave();
 	test_c23_auto_orelse();
-#ifndef _MSC_VER
-	test_line_directive_escaped_quote();
-#endif
+	NOMSVC_ONLY(test_line_directive_escaped_quote());
 	test_cross_compile_msvc_ret_type();
 	test_typeof_memset_no_shadow();
 	test_c23_constexpr_thread_local();
@@ -7058,7 +7056,7 @@ void run_api_tests_2(void) {
 
 void run_api_tests_3(void) {
 	printf("\n=== API TESTS (group 3) ===\n");
-#ifndef _WIN32
+	UNIX_ONLY(
 	test_cli_dep_flags_routing();
 	test_cli_dep_flags_passthrough();
 	test_version_shows_backend_cc();
@@ -7070,7 +7068,7 @@ void run_api_tests_3(void) {
 	test_preprocess_read_eintr_resilience();
 	test_cli_x_lang_pipe_ordering();
 	test_fpreprocessed_not_passed_to_clang();
-#endif
+	);
 
 	test_noflat_include_dedup();
 
@@ -7078,14 +7076,14 @@ void run_api_tests_3(void) {
 	test_orelse_bracket_leak_in_return_defer();
 	test_cli_parse_unit();
 
-#ifndef _WIN32
+	UNIX_ONLY(
 	test_thread_cleanup_reinit_cycle();
 	test_thread_cleanup_idempotent();
 	test_thread_cleanup_shadow_map_leak();
 	test_concurrent_transpile_isolation();
 	test_concurrent_feature_isolation();
 	test_thread_cleanup_then_reuse_stress();
-#endif
+	);
 
 	test_pp_define_bufs_boundary();
 
@@ -7093,9 +7091,7 @@ void run_api_tests_3(void) {
 
 	test_signal_temps_register_overflow();
 
-#ifndef _WIN32
-	test_make_temp_file_toctou_symlink();
-#endif
+	UNIX_ONLY(test_make_temp_file_toctou_symlink());
 #if !defined(_WIN32) && !defined(__APPLE__)
 	if (!is_emulated())
 		test_signal_temps_register_race();
@@ -7104,9 +7100,7 @@ void run_api_tests_3(void) {
 	test_generic_decl_rewrite_destroys_dispatch();
 	test_no_flatten_headers_abi_define_erasure();
 
-#ifndef _WIN32
-	test_multifile_arena_use_after_reset();
-#endif
+	UNIX_ONLY(test_multifile_arena_use_after_reset());
 }
 
 void run_api_tests_4(void) {
@@ -7118,9 +7112,7 @@ void run_api_tests_4(void) {
 	test_collect_source_defines_comment_continuation();
 	test_collect_source_defines_continuation_line();
 	test_collect_source_defines_multi_continuation();
-#ifdef __GNUC__
-	test_auto_type_goto_bypass();
-#endif
+	GNUC_ONLY(test_auto_type_goto_bypass());
 
 	test_c23_attr_skip_one_stmt_scope_leak();
 	test_stmtexpr_in_initializer_zeroinit();
@@ -7132,9 +7124,7 @@ void run_api_tests_4(void) {
 	test_p1_ann_dirty_state_leak();
 	test_raw_raw_double_qualifier();
 
-#ifndef _WIN32
-	test_cli_main_leak_asan();
-#endif
+	UNIX_ONLY(test_cli_main_leak_asan());
 
 	test_collect_source_defines_comment_in_directive();
 	test_collect_source_defines_ifdef_both_branches_extracted();

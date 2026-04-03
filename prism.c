@@ -190,6 +190,7 @@ typedef struct {
 	bool is_vla_var : 1;
 	bool is_aggregate : 1;
 	bool is_func : 1;
+	bool is_param : 1;
 } TypedefEntry;
 
 typedef struct {
@@ -1566,6 +1567,7 @@ typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool i
 	e->is_shadow = (kind == TDK_SHADOW || kind == TDK_ENUM_CONST);
 	e->is_enum_const = (kind == TDK_ENUM_CONST);
 	e->is_vla_var = (kind == TDK_VLA_VAR);
+	e->is_param = false;
 	e->prev_index = typedef_get_index(name, len);
 	e->token_index = 0;
 	e->scope_open_idx = td_scope_open;
@@ -1626,14 +1628,14 @@ static TypedefEntry *typedef_lookup(Token *tok) {
 }
 
 // Typedef query flags (single lookup, check multiple properties)
-enum { TDF_TYPEDEF = 1, TDF_VLA = 2, TDF_VOID = 4, TDF_ENUM_CONST = 8, TDF_CONST = 16, TDF_PTR = 32, TDF_ARRAY = 64, TDF_AGGREGATE = 128, TDF_FUNC = 256 };
+enum { TDF_TYPEDEF = 1, TDF_VLA = 2, TDF_VOID = 4, TDF_ENUM_CONST = 8, TDF_CONST = 16, TDF_PTR = 32, TDF_ARRAY = 64, TDF_AGGREGATE = 128, TDF_FUNC = 256, TDF_PARAM = 512 };
 
 static inline int typedef_flags(Token *tok) {
 	TypedefEntry *e = typedef_lookup(tok);
 	if (!e) return 0;
 	if (e->is_enum_const) return TDF_ENUM_CONST;
 	if (e->is_shadow) return 0;
-	if (e->is_vla_var) return TDF_VLA;
+	if (e->is_vla_var) return TDF_VLA | (e->is_param ? TDF_PARAM : 0);
 	return TDF_TYPEDEF | (e->is_vla ? TDF_VLA : 0) | (e->is_void ? TDF_VOID : 0) |
 	       (e->is_const ? TDF_CONST : 0) | (e->is_ptr ? TDF_PTR : 0) |
 	       (e->is_array ? TDF_ARRAY : 0) | (e->is_aggregate ? TDF_AGGREGATE : 0) |
@@ -2079,8 +2081,13 @@ static int capture_function_return_type(Token *tok) {
 			if (match_ch(tok_next(inner), '(')) {
 				Token *after_params = skip_balanced(tok_next(inner), '(', ')');
 				if (after_params && match_ch(after_params, ')')) {
+					// Walk only array-dimension brackets after outer ')'.
+					// Do NOT skip attributes — they belong on the function,
+					// not on the return-type typedef.
 					Token *decl_end = skip_balanced(outer_open, '(', ')');
-					decl_end = skip_declarator_suffix(decl_end);
+					while (decl_end && (decl_end->flags & TF_OPEN) &&
+					       !match_ch(decl_end, '{') && !match_ch(decl_end, '('))
+						decl_end = walk_balanced(decl_end, false);
 					if (is_void) return 1;
 					ctx->func_ret_type_start = type_start;
 					ctx->func_ret_type_end = inner;
@@ -2179,7 +2186,15 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 								continue;
 							}
 						}
-						if (is_vla_typedef(inner)) return true;
+						int vla_fl = typedef_flags(inner) & (TDF_VLA | TDF_PARAM);
+						if (vla_fl & TDF_VLA) {
+							// Param arrays decay to pointers: sizeof(param) = sizeof(ptr) = constant.
+							// Only flag as VLA if dereferenced (* before, or [ after).
+							if (!(vla_fl & TDF_PARAM)) return true;
+							bool deref = match_ch(prev_inner, '*') ||
+								(tok_next(inner) && tok_next(inner) != end && match_ch(tok_next(inner), '['));
+							if (deref) return true;
+						}
 						if (match_ch(inner, '[') &&
 						    is_array_bracket_predecessor(prev_inner, prev2_inner)) {
 							if (array_size_is_vla_impl(inner, depth + 1))
@@ -7001,6 +7016,7 @@ static void p1_register_param_shadows(Token *open, Token *close,
 					}
 					if (array_size_is_vla(s)) {
 						TYPEDEF_ADD_IDX(typedef_add_vla_var(tok_loc(last_ident), last_ident->len, brace_depth), last_ident);
+						typedef_table.entries[typedef_table.count - 1].is_param = true;
 						break;
 					}
 				}

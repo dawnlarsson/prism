@@ -1477,45 +1477,6 @@ static void check_defer_transpile_rejects(const char *code,
 	prism_free(&result);
 }
 
-#ifndef _WIN32
-static int run_command_status(const char *cmd) {
-	int status = system(cmd);
-	if (status == -1) return -1;
-	if (!WIFEXITED(status)) return -1;
-	return WEXITSTATUS(status);
-}
-
-static void check_transpiled_output_compiles_and_runs(const char *output,
-					      const char *compile_name,
-					      const char *run_name) {
-	char *src_path = create_temp_file(output);
-	CHECK(src_path != NULL, "defer compile helper: create temp source");
-	if (!src_path) return;
-
-	char bin_template[PATH_MAX];
-	int bin_fd = test_mkstemp(bin_template, "prism_defer_exec_");
-	CHECK(bin_fd >= 0, "defer compile helper: reserve temp binary path");
-	if (bin_fd < 0) {
-		unlink(src_path);
-		free(src_path);
-		return;
-	}
-	close(bin_fd);
-	unlink(bin_template);
-
-	char compile_cmd[PATH_MAX * 2 + 64];
-	snprintf(compile_cmd, sizeof(compile_cmd),
-		 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin_template, src_path);
-	CHECK_EQ(run_command_status(compile_cmd), 0, compile_name);
-	if (access(bin_template, X_OK) == 0)
-		CHECK_EQ(run_command_status(bin_template), 0, run_name);
-
-	unlink(bin_template);
-	unlink(src_path);
-	free(src_path);
-}
-#endif
-
 void test_defer_goto_into_scope_rejected(void) {
 	check_defer_transpile_rejects(
 	    "void f(void) {\n"
@@ -4934,9 +4895,7 @@ void run_defer_tests(void) {
 	CHECK_LOG("1A", "defer with return");
 	CHECK_EQ(ret, 42, "defer return value preserved");
 	test_defer_goto_out();
-#ifndef _MSC_VER
-	test_defer_goto_c23_attr();
-#endif
+	NOMSVC_ONLY(test_defer_goto_c23_attr());
 	test_defer_nested_scopes();
 	test_defer_break();
 	test_defer_continue();
@@ -4971,10 +4930,10 @@ void run_defer_tests(void) {
 	test_defer_nested_loops();
 	test_defer_break_inner_stay_outer();
 	test_deep_defer_with_zeroinit();
-#ifdef __GNUC__
+	GNUC_ONLY(
 	test_typeof_void_defer_return();
 	test_dunder_typeof_void_defer_return();
-#endif
+	);
 	test_void_return_void0_defer();
 
 	test_switch_fallthrough_no_braces();
@@ -5001,10 +4960,10 @@ void run_defer_tests(void) {
 	test_switch_nested_inner_defer();
 	test_switch_do_while_0();
 	test_switch_negative_cases();
-#ifndef _MSC_VER
+	NOMSVC_ONLY(
 	test_switch_stmt_expr_defer();
 	test_switch_in_stmt_expr_in_switch();
-#endif
+	);
 	test_switch_triple_sequential();
 	test_duffs_device_braced_defers();
 	test_duffs_device_all_entries();
@@ -5032,12 +4991,10 @@ void run_defer_tests(void) {
 
 	test_defer_backward_goto_sibling();
 
-#ifndef _MSC_VER
-	test_defer_goto_c23_attr_label();
-#endif
+	NOMSVC_ONLY(test_defer_goto_c23_attr_label());
 	test_defer_in_ctrl_paren_rejected();
 	test_defer_braceless_control_rejected();
-#ifdef __GNUC__
+	GNUC_ONLY(
 	test_defer_stmt_expr_top_level_rejected();
 	test_defer_stmt_expr_nested_block_last_stmt_corrupts();
 	test_defer_stmt_expr_return_bypass();
@@ -5046,12 +5003,10 @@ void run_defer_tests(void) {
 	// Audit round 14: computed-goto forward-into-scope CFG bypass
 	test_computed_goto_forward_into_deferred_scope();
 	test_defer_asm_rejected();
-#endif
+	);
 	test_defer_setjmp_rejected();
 	test_defer_glibc_sigsetjmp_rejected();
-#ifndef _WIN32
-	test_defer_vfork_rejected();
-#endif
+	UNIX_ONLY(test_defer_vfork_rejected());
 	test_auto_type_fallback_requires_gnu_extensions();
 	test_ternary_cast_corrupts_label_detection();
 	test_gnu_nested_func_breaks_outer_defer();
@@ -5068,12 +5023,12 @@ void run_defer_tests(void) {
 	test_defer_safe_shadow_no_exit();
 	test_defer_shadow_struct_member_false_positive();
 	test_defer_shadow_overflow_silent_drop();
-#ifndef _WIN32
+	UNIX_ONLY(
 	test_defer_paren_vfork_bypass();
 	test_defer_vfork_funcptr_bypass();
 	test_defer_vfork_reference_false_positive();
 	test_defer_vfork_local_alias_bypass();
-#endif
+	);
 	test_defer_fnptr_return_type_overwrite();
 
 	// Audit round 9: hash table saturation CFG bypass
@@ -5092,9 +5047,7 @@ void run_defer_tests(void) {
 	test_defer_in_generic_stmt_expr();
 
 	// Audit round 27: user-defined _Noreturn function with defer gets no warning
-#ifndef _WIN32
-	test_defer_user_noreturn_no_warning();
-#endif
+	UNIX_ONLY(test_defer_user_noreturn_no_warning());
 
 	// Audit round 29: brace_depth > 1 skip bypasses captured vars in nested blocks
 	test_defer_shadow_depth_bypass();
@@ -5137,10 +5090,8 @@ void run_defer_tests(void) {
 	// Audit round 47: nested stmt-expr in defer exponential blowup
 	test_defer_nested_stmt_expr_perf();
 
-#ifdef __GNUC__
 	// Audit round 48: stmt-expr init bypasses defer shadow check
-	test_defer_shadow_stmt_expr_bypass();
-#endif
+	GNUC_ONLY(test_defer_shadow_stmt_expr_bypass());
 
 	// BUG55: orelse break inside defer body loop
 	test_defer_orelse_break_in_loop();
@@ -5158,23 +5109,19 @@ void run_defer_tests(void) {
 	test_defer_shadow_rhs_assignment_bypass();
 
 	// BUG64: [[__noreturn__]] / [[gnu::__noreturn__]] C23 attr blind spot
-#ifndef _WIN32
-	test_c23_attr_noreturn_dunder_blindspot();
-#endif
+	UNIX_ONLY(test_c23_attr_noreturn_dunder_blindspot());
 
 	// BUG66: __attribute__((cold, __noreturn__)) list truncation + __declspec
-#ifndef _WIN32
-	test_gnu_attr_noreturn_list_blindspot();
-#endif
+	UNIX_ONLY(test_gnu_attr_noreturn_list_blindspot());
 
 	// BUG67: brace-initializer comma bypass in check_defer_var_shadow
 	test_defer_shadow_brace_init_comma_bypass();
 
 	// BUG71: parenthesized noreturn call / wrapper call bypasses warning and taint
-#ifndef _WIN32
+	UNIX_ONLY(
 	test_paren_noreturn_warning_bypass();
 	test_paren_setjmp_wrapper_taint_bypass();
-#endif
+	);
 
 	// BUG72: typedef enum wrapping bypasses defer shadow check
 	test_defer_shadow_typedef_enum_bypass();

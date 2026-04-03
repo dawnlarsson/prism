@@ -3042,13 +3042,9 @@ void run_zeroinit_tests(void) {
 	test_zeroinit_qualifiers();
 	test_zeroinit_in_scopes();
 	test_zeroinit_with_defer();
-#ifdef __GNUC__
-	test_zeroinit_typeof();
-#endif
+	GNUC_ONLY(test_zeroinit_typeof());
 	test_zeroinit_enum_array_size();
-#ifndef _MSC_VER
-	test_zeroinit_alignas_array();
-#endif
+	NOMSVC_ONLY(test_zeroinit_alignas_array());
 	test_zeroinit_union();
 	test_ternary_zeroinit();
 	test_buffer_boundary_hang();
@@ -3057,9 +3053,7 @@ void run_zeroinit_tests(void) {
 	test_zeroinit_torture_declarators();
 	test_zeroinit_torture_attributes();
 	test_zeroinit_torture_partial_init();
-#ifdef __GNUC__
-	test_zeroinit_torture_stmt_expr();
-#endif
+	GNUC_ONLY(test_zeroinit_torture_stmt_expr());
 	test_zeroinit_torture_deep_nesting();
 	test_zeroinit_torture_bitfields();
 	test_zeroinit_torture_anonymous();
@@ -3069,12 +3063,10 @@ void run_zeroinit_tests(void) {
 	test_zeroinit_torture_control_flow();
 	test_zeroinit_torture_stress();
 	test_zeroinit_torture_with_defer();
-#ifndef _MSC_VER
-	test_zeroinit_torture_atomic();
-#endif
+	NOMSVC_ONLY(test_zeroinit_torture_atomic());
 
 	/* Typeof zero-init torture */
-#ifdef __GNUC__
+	GNUC_ONLY(
 	test_typeof_zeroinit_all_basic_types();
 	test_typeof_zeroinit_structs();
 	test_typeof_zeroinit_arrays();
@@ -3088,7 +3080,7 @@ void run_zeroinit_tests(void) {
 	test_typeof_zeroinit_unions();
 	test_typeof_zeroinit_edge_cases();
 	test_typeof_zeroinit_torture_stress();
-#endif
+	);
 
 	/* Enum shadow */
 	test_enum_shadow_zeroinit();
@@ -3099,9 +3091,7 @@ void run_zeroinit_tests(void) {
 	test_zeroinit_parenthesized_declarator();
 	test_zeroinit_parenthesized_array();
 
-#ifndef _MSC_VER
-	test_parenthesized_vla_zeroinit();
-#endif
+	NOMSVC_ONLY(test_parenthesized_vla_zeroinit());
 	test_typeof_fnptr_vla_param_zeroinit();
 	test_typeof_register_fnptr_vla_param();
 
@@ -3109,13 +3099,9 @@ void run_zeroinit_tests(void) {
 
 	test_typeof_register_vla_bug();
 	test_typedef_typeof_vla_zeroinit();
-#ifndef _MSC_VER
-	test_atomic_register_struct_bug();
-#endif
+	NOMSVC_ONLY(test_atomic_register_struct_bug());
 	test_const_typeof_vla_bug();
-#ifndef _MSC_VER
-	test_const_typeof_atomic_struct_bug();
-#endif
+	NOMSVC_ONLY(test_const_typeof_atomic_struct_bug());
 	test_typeof_memset_split_before_initializer();
 	test_typeof_vla_split_double_eval();
 	test_typeof_memset_queue_over_128();
@@ -3134,9 +3120,7 @@ void run_zeroinit_tests(void) {
 	test_vla_typedef_struct_tag_memset();
 	test_register_atomic_aggregate_must_error();
 	test_static_vars_no_redundant_zeroinit();
-#ifdef __GNUC__
-	test_gnu_thread_storage_class();
-#endif
+	GNUC_ONLY(test_gnu_thread_storage_class());
 	test_computed_goto_zeroinit_bypass();
 
 	// Audit round 21: C23 if/switch init-statement shadow scope expires at ')'
@@ -3177,9 +3161,7 @@ void run_zeroinit_tests(void) {
 	test_switch_for_init_not_rejected();
 
 	// BUG89: emit_type_range stmt-expr bypass in struct bodies
-#ifdef __GNUC__
-	test_struct_body_stmt_expr_features();
-#endif
+	GNUC_ONLY(test_struct_body_stmt_expr_features());
 
 	// BUG91: skip_one_stmt label parsing
 	test_skip_one_stmt_label_parsing();

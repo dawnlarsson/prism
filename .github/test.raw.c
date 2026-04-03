@@ -1423,9 +1423,7 @@ void run_raw_tests(void) {
 	test_raw_keyword_after_extern();
 	test_raw_keyword_before_static();
 	test_raw_mixed_usage();
-#ifndef _MSC_VER
-	test_raw_vla_skips_zeroinit();
-#endif
+	NOMSVC_ONLY(test_raw_vla_skips_zeroinit());
 	test_raw_star_ptr_decl();
 	test_switch_raw_var_in_body();
 
@@ -1465,7 +1463,7 @@ void run_raw_tests(void) {
 	test_goto_keyword_label_zeroinit();
 
 	// Raw string literals (R"(...)")
-#ifndef _MSC_VER
+	NOMSVC_ONLY(
 	test_raw_string_literals();
 	test_raw_string_basic();
 	test_raw_string_with_backslash();
@@ -1491,20 +1489,13 @@ void run_raw_tests(void) {
 	test_raw_string_max_delimiter();
 	test_raw_string_near_max_delimiter();
 	test_raw_string_16_char_delimiter();
-#endif
-
-#ifndef _MSC_VER
 	test_raw_c23_attribute();
 	test_raw_gnu_attribute();
-#endif
-#ifndef _MSC_VER
 	test_raw_atomic();
-#endif
+	);
 	test_raw_qualifier_order();
 	test_raw_register();
-#ifndef _MSC_VER
-	test_raw_thread_local();
-#endif
+	NOMSVC_ONLY(test_raw_thread_local());
 	test_raw_multi_declarator_second_var_uninitialized();
 	test_static_const_raw_ordering();
 	test_raw_typedef_blinds_type_tracker();

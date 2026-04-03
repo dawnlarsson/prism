@@ -3936,10 +3936,10 @@ void run_safe_tests(void) {
 	/* Rigor tests */
 	test_typedef_void_return();
 	test_typedef_voidptr_return();
-#ifndef _MSC_VER
+	NOMSVC_ONLY(
 	test_stmt_expr_defer_timing();
 	test_nested_stmt_expr_defer_immediate_block_exit();
-#endif
+	);
 	test_const_after_typename();
 	test_atomic_zeroinit();
 	test_atomic_aggregate_zeroinit();
@@ -3951,13 +3951,11 @@ void run_safe_tests(void) {
 	test_extern_not_initialized();
 	test_typedef_not_initialized();
 	test_for_init_zeroinit();
-#ifndef _MSC_VER
+	NOMSVC_ONLY(
 	test_ptr_to_vla_typedef(5);
 	test_vla_side_effect_once();
-#endif
-#ifndef _MSC_VER
 	test_atomic_specifier_form();
-#endif
+	);
 #if !defined(__clang__) && !defined(_MSC_VER)
 	test_atomic_struct_basic();
 	test_atomic_union_basic();
@@ -4019,10 +4017,10 @@ void run_safe_tests(void) {
 	test_sizeof_volatile_var();
 	test_sizeof_restrict_ptr();
 	test_sizeof_static_var();
-#ifndef _MSC_VER
+	NOMSVC_ONLY(
 	test_sizeof_true_vla_detected();
 	test_sizeof_nested_vla_detection();
-#endif
+	);
 
 	/* sizeof/constexpr */
 	test_sizeof_in_array_bound();
@@ -4057,16 +4055,14 @@ void run_safe_tests(void) {
 	test_manual_offsetof_in_union();
 	test_manual_offsetof_local();
 	test_union_offsetof_division();
-#ifndef _MSC_VER
-	test_vla_basic();
-#endif
+	NOMSVC_ONLY(test_vla_basic());
 
 	/* Bulletproof regression */
-#ifdef __GNUC__
+	GNUC_ONLY(
 	test_typeof_overflow_35_vars();
 	test_typeof_overflow_64_vars();
 	test_typeof_struct_overflow();
-#endif
+	);
 	test_many_labels_function();
 	test_raw_struct_member_field();
 	test_raw_anonymous_struct_member();
@@ -4078,10 +4074,10 @@ void run_safe_tests(void) {
 	test_ghost_shadow_nested_for();
 	test_ghost_shadow_while_braceless();
 	test_ghost_shadow_if_else_braceless();
-#ifdef __GNUC__
+	GNUC_ONLY(
 	test_ghost_shadow_generic();
 	test_ghost_shadow_generic_braceless();
-#endif
+	);
 	test_pragma_survives_transpile();
 	test_defer_switch_goto_out();
 	test_defer_switch_break_with_goto_label();
@@ -4090,11 +4086,11 @@ void run_safe_tests(void) {
 	test_typedef_redef_basic();
 	test_typedef_redef_pointer();
 	test_typedef_redef_after_scope();
-#ifdef __GNUC__
+	GNUC_ONLY(
 	test_typeof_errno_zeroinit();
 	test_typeof_statement_expr_zeroinit();
 	test_typeof_complex_expr_zeroinit();
-#endif
+	);
 	test_hashmap_tombstone_insert_delete_cycle();
 	test_hashmap_tombstone_multi_key_churn();
 	test_switch_conditional_break_not_false_positive();
@@ -4106,30 +4102,28 @@ void run_safe_tests(void) {
 	test_void_typedef_bare_return();
 	test_void_ptr_typedef_not_void();
 	test_void_func_ptr_typedef();
-#ifndef _MSC_VER
+	NOMSVC_ONLY(
 	test_generic_void_typedef_no_label_confusion();
-#endif
-#ifndef _MSC_VER
 	test_vla_zeroinit_basic();
 	test_vla_zeroinit_large();
 	test_vla_zeroinit_nested_scope();
-#endif
+	);
 	test_hashmap_tombstone_high_churn_load();
 	test_deep_pointer_nesting();
 
 	/* Additional safe tests */
 	test_typedef_extreme_scope_churn();
 	test_typedef_tombstone_saturation_extended();
-#ifndef _MSC_VER
+	NOMSVC_ONLY(
 	test_struct_static_assert_compound_literal();
 	test_struct_nested_compound_literal_depth();
 	test_struct_compound_literal_then_nested_struct();
-#endif
+	);
 	test_for_init_multi_decl_all_zeroed();
-#ifdef __GNUC__
+	GNUC_ONLY(
 	test_for_init_stmt_expr_with_decls();
 	test_struct_stmt_expr_in_member_size();
-#endif
+	);
 	test_nested_struct_depth_tracking();
 	test_struct_with_enum_body_depth();
 
@@ -4140,9 +4134,7 @@ void run_safe_tests(void) {
 	test_orelse_sequential_bare();
 	test_zeroinit_after_line_directives();
 	test_orelse_return_expr_side_effects();
-#ifdef __GNUC__
-	test_generic_controlling_expr_not_evaluated();
-#endif
+	GNUC_ONLY(test_generic_controlling_expr_not_evaluated());
 	test_struct_padding_zeroinit();
 	test_attribute_parser_torture();
 
@@ -4163,9 +4155,7 @@ void run_safe_tests(void) {
 	test_goto_over_native_init();
 	test_switch_case_over_native_init();
 	test_goto_over_raw_native_init();
-#ifdef __GNUC__
-	test_gnu_attr_param_shadow();
-#endif
+	GNUC_ONLY(test_gnu_attr_param_shadow());
 
 	// Audit round 24: raw raw VLA for-init CFG blindness
 	test_raw_raw_vla_forinit_cfg_blind();
