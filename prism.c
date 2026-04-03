@@ -3532,7 +3532,7 @@ static Token *handle_const_orelse_fallback(Token *tok,
 	if (strip_type_const) {
 		for (Token *t = type_start; t != type->end; t = tok_next(t)) {
 			if (is_const_typedef(t)) { has_const_typedef = true; break; }
-			if (t->tag & TT_TYPEOF) { has_const_typedef = true; break; }
+			if ((t->tag & TT_TYPEOF) && !equal(t, "__auto_type")) { has_const_typedef = true; break; }
 		}
 	}
 
@@ -6962,20 +6962,21 @@ static void p1_register_param_shadows(Token *open, Token *close,
 		Token *param_start = t;
 		Token *last_ident = NULL;
 		bool scanned_inner_paren = false;
+		bool ident_from_inner = false;
 		while (t && t != close && !match_ch(t, ',') && t->kind != TK_EOF) {
 			if (t->flags & TF_OPEN) {
 				if (!last_ident && !scanned_inner_paren && match_ch(t, '(') && tok_match(t))
 					for (Token *s = tok_next(t); s != tok_match(t); s = tok_next(s)) {
 						if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; continue; }
 						if (is_valid_varname(s) && !(s->tag & (TT_QUALIFIER|TT_TYPE|TT_SUE|TT_TYPEOF|TT_ATTR)))
-							last_ident = s;
+							{ last_ident = s; ident_from_inner = true; }
 					}
 				if (match_ch(t, '(')) scanned_inner_paren = true;
 				t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t);
 				continue;
 			}
 			if (is_valid_varname(t) && !(t->tag & (TT_QUALIFIER|TT_TYPE|TT_SUE|TT_TYPEOF|TT_ATTR)))
-				last_ident = t;
+				{ last_ident = t; ident_from_inner = false; }
 			t = tok_next(t);
 		}
 		if (last_ident && (is_known_typedef(last_ident) ||
@@ -6983,11 +6984,25 @@ static void p1_register_param_shadows(Token *open, Token *close,
 		    (last_ident->tag & (TT_DEFER | TT_ORELSE))))
 			p1_register_shadow(last_ident, scope_id, brace_depth);
 		if (check_vla && last_ident) {
+			// For outer-level identifiers (int arr[n]), the first []
+			// is the decaying dimension (sizeof(arr) = pointer size,
+			// constant). Skip it. Only subsequent [] dimensions matter
+			// (e.g. int arr[n][m] → int (*)[m], sizeof(*arr) = runtime).
+			// For inner-paren identifiers (int (*ptr)[n]), no decay —
+			// all brackets matter.
+			bool skip_first = !ident_from_inner;
 			Token *param_end = (t && match_ch(t, ',')) ? t : close;
 			for (Token *s = param_start; s && s != param_end && s->kind != TK_EOF; s = tok_next(s))
-				if (match_ch(s, '[') && array_size_is_vla(s)) {
-					TYPEDEF_ADD_IDX(typedef_add_vla_var(tok_loc(last_ident), last_ident->len, brace_depth), last_ident);
-					break;
+				if (match_ch(s, '[')) {
+					if (skip_first) {
+						skip_first = false;
+						if (tok_match(s)) s = tok_match(s);
+						continue;
+					}
+					if (array_size_is_vla(s)) {
+						TYPEDEF_ADD_IDX(typedef_add_vla_var(tok_loc(last_ident), last_ident->len, brace_depth), last_ident);
+						break;
+					}
 				}
 		}
 		if (t && match_ch(t, ',')) t = tok_next(t);

@@ -6352,6 +6352,28 @@ static void test_orelse_chained_assign_rejected(void) {
 	    "side effect");
 }
 
+// BUG97: __auto_type with orelse must not enter const-stripping cast path.
+// __auto_type has TT_TYPEOF tag, but (__auto_type)0 is invalid C.
+static void test_orelse_auto_type(void) {
+	const char *code =
+	    "int get_val(void) { return 42; }\n"
+	    "void test(void) {\n"
+	    "    __auto_type x = get_val() orelse 0;\n"
+	    "    (void)x;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "auto_type_orelse.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "BUG97: __auto_type orelse transpiles OK");
+	if (r.output) {
+		// Must NOT produce __typeof__((__auto_type)0) — invalid cast.
+		CHECK(strstr(r.output, "__auto_type)0") == NULL,
+		      "BUG97: no cast to __auto_type");
+		// Should use __auto_type directly for the temp.
+		CHECK(strstr(r.output, "__auto_type __prism_oe_") != NULL,
+		      "BUG97: temp uses __auto_type directly");
+	}
+	prism_free(&r);
+}
+
 // BUG94: typeof on bit-field in bare orelse.
 // typeof(bitfield_member) is a C constraint violation.
 // When LHS has member access, use typeof(RHS) instead.
@@ -6372,7 +6394,9 @@ static void test_orelse_bitfield_typeof(void) {
 		      "BUG94: typeof must not be applied to bit-field LHS");
 		// Must use typeof(RHS) instead.
 		CHECK(strstr(r.output, "__typeof__( get_status())") != NULL ||
-		      strstr(r.output, "__typeof__(get_status())") != NULL,
+		      strstr(r.output, "__typeof__(get_status())") != NULL ||
+		      strstr(r.output, "typeof( get_status())") != NULL ||
+		      strstr(r.output, "typeof(get_status())") != NULL,
 		      "BUG94: typeof applied to RHS when LHS has member access");
 	}
 	prism_free(&r);
@@ -6748,4 +6772,9 @@ void run_orelse_tests(void) {
 
 	// BUG94: typeof on bit-field in bare orelse
 	test_orelse_bitfield_typeof();
+
+	// BUG97: __auto_type orelse
+#ifdef __GNUC__
+	test_orelse_auto_type();
+#endif
 }

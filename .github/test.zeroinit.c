@@ -2988,6 +2988,27 @@ static void test_typeof_block_scope_func_proto(void) {
 // sizeof(int[sizeof(int[...])]) inside an array dimension caused O(2^N)
 // re-scanning because the sizeof path didn't skip past matched brackets
 // after recursion.  Also has a depth>256 guard.
+// BUG96: sizeof(param_array) is pointer-size (constant), not VLA.
+// Parameter arrays decay to pointers; first dimension skipped for VLA check.
+static void test_vla_param_decay_sizeof(void) {
+	printf("\n--- BUG96: VLA param decay sizeof ---\n");
+	// sizeof(arr) where arr is a decayed array parameter should be constant.
+	// No goto — just verify it gets brace-init (fixed-size), not memset (VLA).
+	const char *code =
+	    "void f(int n, int arr[n]) {\n"
+	    "    int local[sizeof(arr)];\n"
+	    "    (void)local;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "bug96.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "BUG96: sizeof(param_array) is not VLA");
+	// Should use = {0} (fixed-size), NOT memset (VLA).
+	if (r.output) {
+		CHECK(strstr(r.output, "= {0}") != NULL || strstr(r.output, "={0}") != NULL,
+		      "BUG96: fixed-size array gets brace init, not memset");
+	}
+	prism_free(&r);
+}
+
 static void test_array_size_is_vla_depth_guard(void) {
 	printf("\n--- BUG95: array_size_is_vla depth guard ---\n");
 	// Build sizeof(int[sizeof(int[sizeof(int[...1...])])]) with 300 levels
@@ -3168,4 +3189,7 @@ void run_zeroinit_tests(void) {
 
 	// BUG95: array_size_is_vla exponential blowup depth guard
 	test_array_size_is_vla_depth_guard();
+
+	// BUG96: sizeof(param_array) is constant, not VLA
+	test_vla_param_decay_sizeof();
 }
