@@ -3791,6 +3791,9 @@ static void check_orelse_in_parens(Token *open) {
 			continue;
 		}
 		if (is_orelse_kw_shadow(t) && !(pi->tag & TT_MEMBER)) {
+			// Skip orelse already tagged as valid declaration init
+			// by Phase 1D (equivalent of scan_decl_orelse paren unlink).
+			if (tok_ann(t) & P1_OE_DECL_INIT) continue;
 			TypedefEntry *te = typedef_lookup(t);
 			if (!te || orelse_shadow_is_kw(pi))
 				error_tok(t, "'orelse' cannot be used inside parentheses "
@@ -7078,6 +7081,22 @@ static uint16_t find_body_scope_id(Token *body_start) {
 	return 0;
 }
 
+// Phase 1D helper: check if array dimensions between start and end contain orelse.
+static bool p1d_decl_has_bracket_orelse(Token *start, Token *end) {
+	for (Token *t = start; t && t != end; t = tok_next(t)) {
+		if (match_ch(t, '[') && tok_match(t)) {
+			Token *close = tok_match(t);
+			for (Token *s = tok_next(t); s && s != close; s = tok_next(s)) {
+				if ((s->tag & TT_ORELSE) && !typedef_lookup(s))
+					return true;
+				if (s->flags & TF_OPEN && tok_match(s))
+					s = tok_match(s);
+			}
+		}
+	}
+	return false;
+}
+
 // Scan for-init / if-switch-init declarations and register shadows.
 // body_sid: scope_id of the body following the control statement (for CFG
 // verifier P1K_DECL entries). 0 means don't register P1K_DECL (braceless body
@@ -7110,6 +7129,17 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 			t = p1_skip_decl_raw(t, &decl_raw);
 			DeclResult decl = parse_declarator(t, false);
 			if (!decl.var_name || !decl.end) break;
+
+			// Phase 1D: reject bracket orelse in ctrl-paren declarations
+			// (hoisted temps would inject invalid syntax in for/if/switch
+			// conditions; moved from Pass 2 to satisfy the two-pass invariant)
+			if (FEAT(F_ORELSE) && p1d_decl_has_bracket_orelse(t, decl.end))
+				error_tok(t,
+					  "bracket orelse in VLA dimensions cannot be used in "
+					  "control statement conditions (hoisted temps would "
+					  "inject invalid syntax); move the declaration before "
+					  "the statement");
+
 			if (is_known_typedef(decl.var_name) ||
 			    is_known_enum_const(decl.var_name) ||
 			    (decl.var_name->tag & (TT_DEFER | TT_ORELSE)))
@@ -7576,7 +7606,7 @@ static void p1_full_depth_prescan(Token *tok) {
 			if (paren && match_ch(paren, '(') && tok_match(paren)) {
 				uint16_t cur_sid = CUR_SID();
 				const char *msg = NULL;
-				if (cur_sid < scope_tree_count && scope_tree[cur_sid].is_struct)
+				if (cur_sid > 0 && cur_sid < scope_tree_count && scope_tree[cur_sid].is_struct)
 					msg = "'orelse' inside typeof in a struct/union body "
 					      "cannot be transformed; use the resolved type directly";
 				else if (p1d_cur_func < 0)
@@ -7585,6 +7615,25 @@ static void p1_full_depth_prescan(Token *tok) {
 					for (Token *s = tok_next(paren); s && s != tok_match(paren); s = tok_next(s))
 						if ((s->tag & TT_ORELSE) && !typedef_lookup(s))
 							error_tok(s, msg);
+				}
+				// Phase 1D: reject side effects in typeof orelse LHS
+				// (hoisted from Pass 2 emit_token_range_orelse).
+				if (!msg) {
+					for (Token *s = tok_next(paren); s && s != tok_match(paren); s = tok_next(s)) {
+						if (is_orelse_kw_shadow(s)) {
+							TypedefEntry *te_s = typedef_lookup(s);
+							if (!te_s || te_s->is_shadow) {
+								reject_orelse_side_effects(
+									tok_next(paren), s,
+									"'orelse' in typeof",
+									"in the LHS (would be evaluated twice); "
+									"hoist the expression to a variable first",
+									false, true, false);
+								break;
+							}
+						}
+						if (s->flags & TF_OPEN && tok_match(s)) { s = tok_match(s); continue; }
+					}
 				}
 			}
 		}
@@ -7827,6 +7876,14 @@ uint16_t sid = next_scope_id++;
 					at_stmt_start = true;
 					continue;
 				}
+				// Phase 1D: reject orelse/defer inside non-control-flow
+				// parentheses (hoisted from Pass 2 check_orelse_in_parens).
+				// Skip control-flow condition parens (if/while/for/switch),
+				// typeof parens, attribute/asm parens — orelse inside those
+				// is valid, handled separately, or irrelevant.
+				if (FEAT(F_ORELSE) && match_ch(tok, '(') &&
+				    !(p1d_prev_saved && (p1d_prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH | TT_TYPEOF | TT_ATTR | TT_ASM))))
+					check_orelse_in_parens(tok);
 				// Peek inside balanced groups for ghost enum definitions
 				// and nested statement expressions:
 				if (match_ch(tok, '(') || match_ch(tok, '[')) {
@@ -8175,6 +8232,8 @@ uint16_t sid = next_scope_id++;
 						braceless_close_idx = tok_idx(stmt_end);
 				}
 				Token *t = type.end;
+				bool p1d_vm_type = (type.has_typeof || type.has_atomic) && type.is_vla;
+				bool p1d_any_would_memset = false;
 				while (t && !match_ch(t, ';') && !match_ch(t, '{') && t->kind != TK_EOF) {
 					// Per-declarator 'raw' skip (int x, raw arr[n];)
 					bool p1d_decl_raw = p1d_saw_raw;
@@ -8284,6 +8343,7 @@ uint16_t sid = next_scope_id++;
 
 					if (has_init) {
 						bool decl_has_orelse = false;
+						Token *p1d_first_orelse = NULL;
 						Token *prev_init_tok = NULL;
 						t = tok_next(t);
 						while (t && !match_ch(t, ',') && !match_ch(t, ';') && t->kind != TK_EOF) {
@@ -8308,6 +8368,7 @@ uint16_t sid = next_scope_id++;
 									error_tok(t, "'orelse' cannot be used here (it must appear at the "
 										  "statement level in a declaration or bare expression)");
 								tok_ann(t) |= P1_OE_DECL_INIT;
+								if (!p1d_first_orelse) p1d_first_orelse = t;
 								decl_has_orelse = true;
 							}
 							if (t->flags & TF_OPEN) {
@@ -8319,7 +8380,10 @@ uint16_t sid = next_scope_id++;
 									Token *am = tok_next(m);
 									if (!am || match_ch(am, ',') || match_ch(am, ';') || am->kind == TK_EOF) {
 										Token *prev_inner = NULL;
+										bool p1d_inner_d0_comma = false;
 										for (Token *inner = tok_next(t); inner && inner != m; inner = tok_next(inner)) {
+											if (match_ch(inner, ','))
+												p1d_inner_d0_comma = true;
 											if (is_orelse_kw_shadow(inner)) {
 												TypedefEntry *te_inner = typedef_lookup(inner);
 												if (te_inner && te_inner->is_shadow) {
@@ -8336,11 +8400,30 @@ uint16_t sid = next_scope_id++;
 													error_tok(inner, "'orelse' cannot be used here (it must appear at the "
 														  "statement level in a declaration or bare expression)");
 												tok_ann(inner) |= P1_OE_DECL_INIT;
+												if (!p1d_first_orelse) p1d_first_orelse = inner;
 												decl_has_orelse = true;
 											}
-											if (inner->flags & TF_OPEN) { inner = tok_match(inner) ? tok_match(inner) : inner; prev_inner = inner; continue; }
+											if (inner->flags & TF_OPEN) {
+												if (FEAT(F_ORELSE) && match_ch(inner, '(') &&
+												    !(prev_inner && (prev_inner->tag & TT_TYPEOF)))
+													check_orelse_in_parens(inner);
+												inner = tok_match(inner) ? tok_match(inner) : inner; prev_inner = inner; continue;
+											}
 											prev_inner = inner;
 										}
+										// Depth-0 comma means paren can't be
+										// unlinked; undo P1_OE_DECL_INIT tags
+										// (mirrors scan_decl_orelse's check).
+										if (p1d_inner_d0_comma && decl_has_orelse) {
+											for (Token *u = tok_next(t); u && u != m; u = tok_next(u)) {
+												tok_ann(u) &= (uint8_t)~P1_OE_DECL_INIT;
+												if (u->flags & TF_OPEN && tok_match(u)) { u = tok_match(u); continue; }
+											}
+											decl_has_orelse = false;
+											p1d_first_orelse = NULL;
+										}
+									} else if (FEAT(F_ORELSE) && !(prev_init_tok && (prev_init_tok->tag & TT_TYPEOF))) {
+										check_orelse_in_parens(t);
 									}
 								}
 								prev_init_tok = m ? m : t;
@@ -8374,8 +8457,82 @@ uint16_t sid = next_scope_id++;
 								error_tok(decl.var_name,
 									  "orelse on struct/union values is not supported "
 									  "(memcmp cannot reliably detect zero due to padding)");
+
+							// Phase 1D: reject const-VLA orelse value fallback
+							// (const + VM type requires type re-emission which
+							// double-evaluates VLA size expressions; moved from
+							// Pass 2 process_declarators)
+							if (p1d_first_orelse && (type.is_vla || decl.is_vla)) {
+								Token *after_oe = tok_next(p1d_first_orelse);
+								bool oe_is_fallback = after_oe &&
+								    !(after_oe->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
+								    !match_ch(after_oe, '{') && !match_ch(after_oe, ';');
+								if (oe_is_fallback &&
+								    has_effective_const_qual(p1d_type_tok, &type, &decl))
+									error_tok(p1d_first_orelse,
+										  "orelse on a const-qualified variably-modified type "
+										  "would duplicate the type specifier, causing VLA "
+										  "size expressions to be evaluated twice; hoist the "
+										  "value to a non-const variable first");
+							}
+
+							// Phase 1D: reject GNU statement expressions in
+							// orelse fallback values (moved from Pass 2
+							// emit_orelse_fallback_value)
+							if (p1d_first_orelse) {
+								Token *after_oe = tok_next(p1d_first_orelse);
+								if (after_oe &&
+								    !(after_oe->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
+								    !match_ch(after_oe, '{') && !match_ch(after_oe, ';')) {
+									for (Token *s = after_oe; s && s->kind != TK_EOF &&
+									     !match_ch(s, ';') && !match_ch(s, ','); s = tok_next(s)) {
+										if (match_ch(s, '(') && tok_next(s) &&
+										    match_ch(tok_next(s), '{')) {
+											error_tok(s,
+												  "GNU statement expressions in orelse "
+												  "fallback values are not supported; "
+												  "use 'orelse { ... }' block form instead");
+										}
+										if (s->flags & TF_OPEN && tok_match(s)) {
+											s = tok_match(s);
+											continue;
+										}
+									}
+								}
+							}
 						}
 					}
+
+					// Phase 1D: track whether this declarator would need
+					// typeof memset in Pass 2 (for VM type split detection)
+					if (p1d_vm_type && FEAT(F_ZEROINIT) && !has_init && !p1d_decl_raw &&
+					    !(p1d_saw_static || type.has_static || type.has_extern) &&
+					    !type.has_register && (!decl.is_pointer || decl.is_array))
+						p1d_any_would_memset = true;
+
+					// Phase 1D: reject VM type multi-declarator split
+					// (moved from Pass 2 process_declarators to satisfy
+					// the two-pass invariant: no semantic errors during emission)
+					if (t && match_ch(t, ',') && p1d_vm_type && brace_depth > 0) {
+						Token *next_t = tok_next(t);
+						bool nr = false;
+						next_t = p1_skip_decl_raw(next_t, &nr);
+						DeclResult nd = parse_declarator(next_t, false);
+						if (nd.var_name && nd.end) {
+							bool split = false;
+							if (p1d_any_would_memset && match_ch(nd.end, '='))
+								split = true;
+							if (!split && FEAT(F_ORELSE) && p1d_decl_has_bracket_orelse(next_t, nd.end))
+								split = true;
+							if (split)
+								error_tok(next_t,
+									  "multi-declarator with variably-modified "
+									  "type specifier requires declaration split which "
+									  "would double-evaluate VLA size expressions; "
+									  "declare each variable on a separate line");
+						}
+					}
+
 					if (t && match_ch(t, ',')) { t = tok_next(t); } else break;
 				}
 			}

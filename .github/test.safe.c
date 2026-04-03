@@ -4251,6 +4251,284 @@ static void test_for_init_vla_memset_phase1(void) {
 	}
 }
 
+static void test_vm_type_multi_decl_split_phase1(void) {
+	printf("\n--- VM-type multi-declarator split Phase 1 ---\n");
+	// typeof VLA + multi-decl + bracket orelse → error
+	{
+		const char *code =
+		    "int get_size(void);\n"
+		    "void f(void) {\n"
+		    "    typeof(int[get_size()]) a, b[1 orelse 2];\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vmsplit1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK && r.error_msg && strstr(r.error_msg, "declaration split"),
+		      "typeof VLA multi-decl with bracket orelse must error in Phase 1");
+		prism_free(&r);
+	}
+	// typeof VLA + multi-decl + init on second → error
+	{
+		const char *code =
+		    "int get_size(void);\n"
+		    "void f(void) {\n"
+		    "    typeof(int[get_size()]) a, b = {0};\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vmsplit2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK && r.error_msg && strstr(r.error_msg, "declaration split"),
+		      "typeof VLA multi-decl with second-decl init must error in Phase 1");
+		prism_free(&r);
+	}
+	// Control: typeof VLA + multi-decl without split trigger → OK
+	{
+		const char *code =
+		    "int get_size(void);\n"
+		    "void f(void) {\n"
+		    "    typeof(int[get_size()]) a, b;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "vmsplit3.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "typeof VLA multi-decl without split trigger must succeed");
+		prism_free(&r);
+	}
+}
+
+static void test_ctrl_paren_bracket_orelse_phase1(void) {
+	printf("\n--- ctrl-paren bracket orelse Phase 1 ---\n");
+	// for-init with bracket orelse → error
+	{
+		const char *code =
+		    "void f(int n) {\n"
+		    "    for (raw int arr[n orelse ({1;})];;) { (void)arr; break; }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "cpbo1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK && r.error_msg && strstr(r.error_msg, "control statement"),
+		      "bracket orelse in for-init must error in Phase 1");
+		prism_free(&r);
+	}
+	// Control: bracket orelse in normal declaration → OK
+	{
+		const char *code =
+		    "int g(void);\n"
+		    "void f(void) {\n"
+		    "    raw int arr[g() orelse 1];\n"
+		    "    (void)arr;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "cpbo2.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "bracket orelse in normal declaration must succeed");
+		prism_free(&r);
+	}
+}
+
+static void test_file_scope_typeof_orelse_no_crash(void) {
+	printf("\n--- file-scope typeof orelse no crash ---\n");
+	// File-scope typeof with orelse in array dim used to segfault (scope_tree NULL)
+	{
+		const char *code =
+		    "int get_size(void);\n"
+		    "typeof(int[get_size()]) a, b[1 orelse 2];\n";
+		PrismResult r = prism_transpile_source(code, "fsto1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK && r.error_msg,
+		      "file-scope typeof orelse must error, not crash");
+		prism_free(&r);
+	}
+}
+
+static void test_const_vla_orelse_phase1(void) {
+	printf("\n--- const-VLA orelse Phase 1 ---\n");
+	// const pointer-to-VLA + value fallback → error
+	{
+		const char *code =
+		    "int get_size(void);\n"
+		    "void* get_ptr(void);\n"
+		    "void f(void) {\n"
+		    "    const int (*ptr)[get_size()] = get_ptr() orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "cvla1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK && r.error_msg && strstr(r.error_msg, "const"),
+		      "const-VLA orelse value fallback must error in Phase 1");
+		prism_free(&r);
+	}
+	// Control: const VLA + block-form orelse → OK
+	{
+		const char *code =
+		    "int get_size(void);\n"
+		    "void* get_ptr(void);\n"
+		    "void f(void) {\n"
+		    "    const int (*ptr)[get_size()] = get_ptr() orelse { return; };\n"
+		    "    (void)ptr;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "cvla2.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "const-VLA orelse block form must succeed");
+		prism_free(&r);
+	}
+	// Control: non-const VLA + value fallback → OK
+	{
+		const char *code =
+		    "int get_size(void);\n"
+		    "void* get_ptr(void);\n"
+		    "void f(void) {\n"
+		    "    int (*ptr)[get_size()] = get_ptr() orelse 0;\n"
+		    "    (void)ptr;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "cvla3.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "non-const VLA orelse value fallback must succeed");
+		prism_free(&r);
+	}
+}
+
+static void test_stmtexpr_orelse_fallback_phase1(void) {
+	printf("\n--- stmt-expr orelse fallback Phase 1 ---\n");
+	// GNU stmt-expr in decl orelse fallback → error
+	{
+		const char *code =
+		    "int get_val(void);\n"
+		    "void f(void) {\n"
+		    "    int x = get_val() orelse ({ 0; });\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "seof1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK && r.error_msg && strstr(r.error_msg, "statement expression"),
+		      "stmt-expr in decl orelse fallback must error in Phase 1");
+		prism_free(&r);
+	}
+	// Control: bare orelse with stmt-expr → OK (bare path handles it)
+	{
+		const char *code =
+		    "int get(void);\n"
+		    "void f(void) {\n"
+		    "    int x;\n"
+		    "    x = get() orelse ({ 1; });\n"
+		    "    (void)x;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "seof2.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "bare orelse with stmt-expr must succeed");
+		prism_free(&r);
+	}
+	// Control: decl orelse block form → OK
+	{
+		const char *code =
+		    "int get_val(void);\n"
+		    "void f(void) {\n"
+		    "    int x = get_val() orelse { return; };\n"
+		    "    (void)x;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "seof3.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "decl orelse block form must succeed");
+		prism_free(&r);
+	}
+}
+
+// ── Round 61: Parenthesized orelse/defer + typeof side-effect Phase 1D checks ──
+
+static void test_paren_orelse_phase1(void) {
+	printf("\n--- paren orelse/defer Phase 1D ---\n");
+	// Bug 1a: orelse inside nested call parens → Phase 1D error
+	{
+		const char *code =
+		    "int *get(void);\n"
+		    "int f(int x);\n"
+		    "void g(void) {\n"
+		    "    int a = f((int)(long)(get() orelse 0));\n"
+		    "    (void)a;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "po1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK && r.error_msg && strstr(r.error_msg, "parentheses"),
+		      "nested paren orelse: rejected in Phase 1D");
+		prism_free(&r);
+	}
+	// Bug 1b: orelse in expression statement parens
+	{
+		const char *code =
+		    "int *get(void);\n"
+		    "void f(int *p);\n"
+		    "void g(void) {\n"
+		    "    f((get() orelse 0));\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "po2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK && r.error_msg && strstr(r.error_msg, "parentheses"),
+		      "expr-stmt paren orelse: rejected in Phase 1D");
+		prism_free(&r);
+	}
+	// Control: orelse in spanning-init paren without comma → valid
+	{
+		const char *code =
+		    "int *get(void);\n"
+		    "void f(void) {\n"
+		    "    int *p = (get() orelse 0);\n"
+		    "    (void)p;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "po3.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "spanning-init paren orelse: valid");
+		prism_free(&r);
+	}
+	// Control: orelse in spanning-init paren WITH comma → rejected
+	{
+		const char *code =
+		    "int *get(void);\n"
+		    "void f(void) {\n"
+		    "    int x = 0;\n"
+		    "    int *p = (x++, get() orelse 0);\n"
+		    "    (void)p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "po4.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "comma paren orelse: rejected");
+		prism_free(&r);
+	}
+}
+
+static void test_typeof_orelse_side_effect_phase1(void) {
+	printf("\n--- typeof orelse side-effect Phase 1D ---\n");
+	// Bug 2: typeof orelse with ++ side effect → Phase 1D error
+	{
+		const char *code =
+		    "int counter;\n"
+		    "void f(void) {\n"
+		    "    typeof(counter++ orelse 0) x = 5;\n"
+		    "    (void)x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "tse1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK && r.error_msg && strstr(r.error_msg, "side effect"),
+		      "typeof ++ side-effect: rejected in Phase 1D");
+		prism_free(&r);
+	}
+	// Bug 2b: typeof orelse with function call side effect
+	{
+		const char *code =
+		    "int *get(void);\n"
+		    "void f(void) {\n"
+		    "    typeof(get() orelse 0) x = 0;\n"
+		    "    (void)x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "tse2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK && r.error_msg && strstr(r.error_msg, "side effect"),
+		      "typeof fn-call side-effect: rejected in Phase 1D");
+		prism_free(&r);
+	}
+	// Control: typeof orelse with no side effects → valid
+	{
+		const char *code =
+		    "int val;\n"
+		    "void f(void) {\n"
+		    "    typeof(val orelse 0) x = 5;\n"
+		    "    (void)x;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "tse3.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "typeof no-side-effect orelse: valid");
+		prism_free(&r);
+	}
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -4550,4 +4828,25 @@ void run_safe_tests(void) {
 
         // for-init VLA memset → Phase 1D
         test_for_init_vla_memset_phase1();
+
+        // VM-type multi-declarator split → Phase 1D
+        test_vm_type_multi_decl_split_phase1();
+
+        // ctrl-paren bracket orelse → Phase 1D
+        test_ctrl_paren_bracket_orelse_phase1();
+
+        // file-scope typeof scope_tree NULL deref
+        test_file_scope_typeof_orelse_no_crash();
+
+        // const-VLA orelse duplication → Phase 1D
+        test_const_vla_orelse_phase1();
+
+        // GNU stmt-expr in orelse fallback → Phase 1D
+        test_stmtexpr_orelse_fallback_phase1();
+
+        // Parenthesized orelse/defer → Phase 1D
+        test_paren_orelse_phase1();
+
+        // typeof orelse side-effect → Phase 1D
+        test_typeof_orelse_side_effect_phase1();
 }
