@@ -3368,7 +3368,7 @@ static void test_duplicate_label_detection(void) {
 	prism_free(&r);
 }
 
-// Audit round 41: register _Atomic aggregate must error in Phase 1,
+// register _Atomic aggregate must error in Phase 1,
 // not during Pass 2 emission (invariant: all semantic errors before output).
 static void test_register_atomic_aggregate_phase1(void) {
 	printf("\n--- register _Atomic aggregate: Phase 1 error ---\n");
@@ -3385,7 +3385,7 @@ static void test_register_atomic_aggregate_phase1(void) {
 #endif
 }
 
-// Audit round 41: switch body unbraced decl must error in Phase 1,
+// switch body unbraced decl must error in Phase 1,
 // not during Pass 2 emission.
 static void test_switch_unbraced_decl_phase1(void) {
 	printf("\n--- switch unbraced decl: Phase 1 error ---\n");
@@ -3400,7 +3400,7 @@ static void test_switch_unbraced_decl_phase1(void) {
 	prism_free(&r);
 }
 
-// Audit round 41: orelse with empty action in defer body must error in Phase 1.
+// orelse with empty action in defer body must error in Phase 1.
 static void test_orelse_empty_action_in_defer_phase1(void) {
 	printf("\n--- orelse empty action in defer: Phase 1 error ---\n");
 	const char *code =
@@ -3623,11 +3623,11 @@ static void test_enum_shadow_vla(void) {
 	}
 }
 
-// BUG63: VLA skip undetected when -fno-zeroinit.  cfg_check_range and
+// VLA skip undetected when -fno-zeroinit.  cfg_check_range and
 // P1K_CASE handler gate the entire decl loop behind FEAT(F_ZEROINIT).
 // Jumping past a VLA is UB (C99/C11 6.8.6.1p1) regardless of zeroinit.
 static void test_vla_cfg_bypass_fno_zeroinit(void) {
-	printf("\n--- BUG63: VLA CFG bypass -fno-zeroinit ---\n");
+	printf("\n--- VLA CFG bypass -fno-zeroinit ---\n");
 
 	// Sub-test 1: goto over VLA with zeroinit off
 	{
@@ -3640,11 +3640,11 @@ static void test_vla_cfg_bypass_fno_zeroinit(void) {
 		    "}\n";
 		PrismFeatures feat = prism_defaults();
 		feat.zeroinit = false;
-		PrismResult r = prism_transpile_source(code, "bug63a.c", feat);
+		PrismResult r = prism_transpile_source(code, "t63a.c", feat);
 		CHECK(r.status != PRISM_OK,
-		      "BUG63a: goto over VLA must error even with -fno-zeroinit");
+		      "goto over VLA must error even with -fno-zeroinit");
 		CHECK(r.error_msg && strstr(r.error_msg, "VLA"),
-		      "BUG63a: error message mentions 'VLA'");
+		      "error message mentions 'VLA'");
 		prism_free(&r);
 	}
 
@@ -3663,9 +3663,9 @@ static void test_vla_cfg_bypass_fno_zeroinit(void) {
 		    "}\n";
 		PrismFeatures feat = prism_defaults();
 		feat.zeroinit = false;
-		PrismResult r = prism_transpile_source(code, "bug63b.c", feat);
+		PrismResult r = prism_transpile_source(code, "t63b.c", feat);
 		CHECK(r.status != PRISM_OK,
-		      "BUG63b: case over VLA must error even with -fno-zeroinit");
+		      "case over VLA must error even with -fno-zeroinit");
 		prism_free(&r);
 	}
 
@@ -3680,9 +3680,9 @@ static void test_vla_cfg_bypass_fno_zeroinit(void) {
 		    "}\n";
 		PrismFeatures feat = prism_defaults();
 		feat.zeroinit = false;
-		PrismResult r = prism_transpile_source(code, "bug63c.c", feat);
+		PrismResult r = prism_transpile_source(code, "t63c.c", feat);
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG63c: goto over fixed array with -fno-zeroinit must pass");
+		         "goto over fixed array with -fno-zeroinit must pass");
 		prism_free(&r);
 	}
 
@@ -3698,19 +3698,19 @@ static void test_vla_cfg_bypass_fno_zeroinit(void) {
 		PrismFeatures feat = prism_defaults();
 		feat.zeroinit = false;
 		feat.defer = false;
-		PrismResult r = prism_transpile_source(code, "bug63d.c", feat);
+		PrismResult r = prism_transpile_source(code, "t63d.c", feat);
 		CHECK(r.status != PRISM_OK,
-		      "BUG63d: goto over VLA must error even with -fno-defer -fno-zeroinit");
+		      "goto over VLA must error even with -fno-defer -fno-zeroinit");
 		prism_free(&r);
 	}
 }
 
-// BUG65: Qualifier preceding VLA bracket in typeof/_Atomic makes VLA invisible.
+// Qualifier preceding VLA bracket in typeof/_Atomic makes VLA invisible.
 // parse_type_specifier's look-behind heuristic for distinguishing array types
 // from expressions only checks type keywords, typedefs, ], *, and ) — misses
 // qualifiers (const, volatile, restrict, _Atomic as qualifier).
 static void test_typeof_qualifier_vla_blindspot(void) {
-	printf("\n--- BUG65: typeof qualifier VLA blindspot ---\n");
+	printf("\n--- typeof qualifier VLA blindspot ---\n");
 
 	// Sub-test 1: typeof(int *const [get_n()]) + orelse forces split → must error
 	// (split re-emits type, evaluating get_n() twice for VM types)
@@ -3721,9 +3721,9 @@ static void test_typeof_qualifier_vla_blindspot(void) {
 		    "void f(void) {\n"
 		    "    __typeof__(int *const [get_n()]) a = fetch() orelse 0, b;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug65a.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t65a.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG65a: typeof VM-type + orelse split must be rejected");
+		      "typeof VM-type + orelse split must be rejected");
 		prism_free(&r);
 	}
 
@@ -3735,9 +3735,9 @@ static void test_typeof_qualifier_vla_blindspot(void) {
 		    "void f(void) {\n"
 		    "    __typeof__(int volatile [get_n()]) a = fetch() orelse 0, b;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug65b.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t65b.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG65b: typeof volatile VLA + orelse split must be rejected");
+		      "typeof volatile VLA + orelse split must be rejected");
 		prism_free(&r);
 	}
 
@@ -3750,9 +3750,9 @@ static void test_typeof_qualifier_vla_blindspot(void) {
 		    "skip:\n"
 		    "    return;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug65c.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t65c.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG65c: goto over raw typeof-VLA with qualifier must error");
+		      "goto over raw typeof-VLA with qualifier must error");
 		prism_free(&r);
 	}
 
@@ -3765,9 +3765,9 @@ static void test_typeof_qualifier_vla_blindspot(void) {
 		    "skip:\n"
 		    "    return;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug65d.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t65d.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG65d: goto over raw _Atomic VLA with qualifier must error");
+		      "goto over raw _Atomic VLA with qualifier must error");
 		prism_free(&r);
 	}
 
@@ -3777,16 +3777,16 @@ static void test_typeof_qualifier_vla_blindspot(void) {
 		    "void f(void) {\n"
 		    "    __typeof__(int *const [5]) a, b;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug65e.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t65e.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG65e: fixed-size const array must not false-positive as VLA");
+		         "fixed-size const array must not false-positive as VLA");
 		prism_free(&r);
 	}
 }
 
-// BUG68: sizeof(type qualifier [n]) — qualifier blinds VLA detection in array_size_is_vla.
+// sizeof(type qualifier [n]) — qualifier blinds VLA detection in array_size_is_vla.
 static void test_sizeof_vla_qualifier_blindspot(void) {
-	printf("\n--- BUG68: sizeof VLA qualifier blindspot ---\n");
+	printf("\n--- sizeof VLA qualifier blindspot ---\n");
 
 	// Sub-test 1: sizeof(int const [n]) — 'const' before '[' blinds VLA detection.
 	{
@@ -3797,11 +3797,11 @@ static void test_sizeof_vla_qualifier_blindspot(void) {
 		    "skip:\n"
 		    "    arr[0] = 1;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug68a.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t68a.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG68a: sizeof(int const [n]) must be detected as VLA");
+		      "sizeof(int const [n]) must be detected as VLA");
 		CHECK(r.error_msg && strstr(r.error_msg, "VLA"),
-		      "BUG68a: error message mentions 'VLA'");
+		      "error message mentions 'VLA'");
 		prism_free(&r);
 	}
 
@@ -3814,9 +3814,9 @@ static void test_sizeof_vla_qualifier_blindspot(void) {
 		    "skip:\n"
 		    "    arr[0] = 1;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug68b.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t68b.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG68b: sizeof(int volatile [n]) must be detected as VLA");
+		      "sizeof(int volatile [n]) must be detected as VLA");
 		prism_free(&r);
 	}
 
@@ -3829,9 +3829,9 @@ static void test_sizeof_vla_qualifier_blindspot(void) {
 		    "skip:\n"
 		    "    arr[0] = 1;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug68c.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t68c.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG68c: sizeof(int [n]) must still be detected as VLA (regression)");
+		      "sizeof(int [n]) must still be detected as VLA (regression)");
 		prism_free(&r);
 	}
 
@@ -3844,9 +3844,9 @@ static void test_sizeof_vla_qualifier_blindspot(void) {
 		    "skip:\n"
 		    "    arr[0] = 1;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug68d.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t68d.c", prism_defaults());
 		CHECK(r.status == PRISM_OK,
-		      "BUG68d: sizeof(int const [5]) is not VLA, must not error");
+		      "sizeof(int const [5]) is not VLA, must not error");
 		prism_free(&r);
 	}
 }
@@ -4157,31 +4157,31 @@ void run_safe_tests(void) {
 	test_goto_over_raw_native_init();
 	GNUC_ONLY(test_gnu_attr_param_shadow());
 
-	// Audit round 24: raw raw VLA for-init CFG blindness
+	// raw raw VLA for-init CFG blindness
 	test_raw_raw_vla_forinit_cfg_blind();
 
-	// Audit round 25: braceless for-init CFG bypass
+	// braceless for-init CFG bypass
 	test_braceless_forinit_cfg_bypass();
 
-	// Audit round 26: signal cleanup TOCTOU race
+	// signal cleanup TOCTOU race
 	test_signal_temps_clear_zeroes_paths();
 
-	// Audit round 27: signal cleanup stale data race (full buffer clear)
+	// signal cleanup stale data race (full buffer clear)
 	test_signal_temps_clear_full_buffer();
 
-	// Audit round 28: unnamed fn ptr parameter shadow leak
+	// unnamed fn ptr parameter shadow leak
 	test_unnamed_fnptr_param_shadow_leak();
 
-	// Audit round 29: bracket orelse control flow - Pass 1 error timing
+	// bracket orelse control flow - Pass 1 error timing
 	test_bracket_orelse_ctrlflow_pass1_error();
 
-	// Audit round 34: scalar before VLA masks VLA hard error under -fno-safety
+	// scalar before VLA masks VLA hard error under -fno-safety
 	test_vla_masked_by_scalar_fno_safety();
 
-        // Audit round 40: duplicate label detection in CFG verifier
+        // duplicate label detection in CFG verifier
         test_duplicate_label_detection();
 
-        // Audit round 41: move semantic errors from Pass 2 to Phase 1
+        // move semantic errors from Pass 2 to Phase 1
         test_register_atomic_aggregate_phase1();
         test_switch_unbraced_decl_phase1();
         test_orelse_empty_action_in_defer_phase1();
@@ -4195,13 +4195,13 @@ void run_safe_tests(void) {
         // Bug 6: enum constant shadow → VLA not detected → invalid = {0}
         test_enum_shadow_vla();
 
-        // BUG63: VLA CFG bypass with -fno-zeroinit
+        // VLA CFG bypass with -fno-zeroinit
         test_vla_cfg_bypass_fno_zeroinit();
 
-        // BUG65: qualifier blindspot in typeof/Atomic VLA detection
+        // qualifier blindspot in typeof/Atomic VLA detection
         test_typeof_qualifier_vla_blindspot();
 
-        // BUG68: sizeof VLA qualifier blindspot in array_size_is_vla
+        // sizeof VLA qualifier blindspot in array_size_is_vla
         test_sizeof_vla_qualifier_blindspot();
 
         // Braceless labeled-declaration CFG lifetime

@@ -2056,7 +2056,7 @@ static void test_orelse_msvc_array_bracket_stmt_expr(void) {
 	prism_free(&r);
 }
 
-// ---- Audit-reported bug probes ----
+// ---- bug probes ----
 // These tests must FAIL until the underlying bugs are fixed.
 
 // Bug: orelse inside a struct body (e.g. inside typeof()) is silently
@@ -2103,7 +2103,7 @@ static void test_orelse_volatile_decl_double_read(void) {
 	prism_free(&r);
 }
 
-/* BUG (audit round 18): bare assignment orelse with a pointer-dereference LHS
+/* bare assignment orelse with a pointer-dereference LHS
  * re-reads the LHS after the write.  The if-based expansion
  *   { *ptr = get(); if (!*ptr) *ptr = fb; }
  * reads *ptr in the condition — for a volatile MMIO register this hidden read
@@ -2133,7 +2133,7 @@ static void test_bare_orelse_ptr_deref_lhs_rereads_volatile(void) {
 		                             strstr(r.output, "if (! *hw_reg)") != NULL ||
 		                             strstr(r.output, "if (!\n*hw_reg)") != NULL;
 		CHECK(!has_standalone_reread,
-		      "BUG18: bare-orelse ptr-deref LHS: old pattern re-reads *hw_reg in "
+		      "bare-orelse ptr-deref LHS: old pattern re-reads *hw_reg in "
 		      "if-condition after write (volatile MMIO hazard); "
 		      "expected if(!(*hw_reg=get_byte())) form");
 	}
@@ -2155,7 +2155,7 @@ static void test_bare_orelse_ptr_deref_lhs_rereads_volatile(void) {
 		                  strstr(r2.output, "if (! *hw_reg)") != NULL ||
 		                  strstr(r2.output, "if (!\n*hw_reg)") != NULL;
 		CHECK(!has_reread,
-		      "BUG18: bare-orelse ptr-deref chain: re-reads *hw_reg in chain "
+		      "bare-orelse ptr-deref chain: re-reads *hw_reg in chain "
 		      "if-condition (volatile MMIO hazard)");
 	}
 	prism_free(&r2);
@@ -3196,7 +3196,7 @@ static void test_bare_orelse_ifdef_lhs_both_branches_concatenated(void) {
                 strstr(r.output, "target_arm");
         // Correct: branches are separate, so not both appear in the expansion.
         CHECK(!both_present,
-              "BUG15: bare-orelse #ifdef LHS: both target_x86 AND target_arm "
+              "bare-orelse #ifdef LHS: both target_x86 AND target_arm "
               "present in output — emit_range_no_prep emits all branches' C "
               "tokens, producing invalid concatenated LHS (should be conditional)");
         prism_free(&r);
@@ -3257,7 +3257,7 @@ void test_stmt_expr_multi_decl_inner_orelse(void) {
 }
 #endif
 
-// BUG19: declarator_has_bracket_orelse and walk_balanced_orelse skip over the
+// declarator_has_bracket_orelse and walk_balanced_orelse skip over the
 // contents of '(' groups when scanning for orelse inside '[...]'.  When a
 // macro expands to '(expr orelse fallback)' — outer parens being a typical
 // macro protection pattern — the '[...]' scanner misses the orelse keyword,
@@ -3283,7 +3283,7 @@ static void test_bracket_orelse_paren_wrapped(void) {
 		const char *body = strstr(r.output, "void g(");
 		if (!body) body = r.output;
 		CHECK(strstr(body, "orelse") == NULL,
-		      "BUG19: bracket-orelse-paren-wrapped: 'orelse' keyword "
+		      "bracket-orelse-paren-wrapped: 'orelse' keyword "
 		      "leaked verbatim to backend in '[(f() orelse 1)]' dimension");
 	}
 	prism_free(&r);
@@ -3300,7 +3300,7 @@ static void test_bracket_orelse_paren_wrapped(void) {
 		const char *body2 = strstr(r2.output, "void g(");
 		if (!body2) body2 = r2.output;
 		CHECK(strstr(body2, "orelse") == NULL,
-		      "BUG19: bracket-orelse-paren-wrapped: plain '[f() orelse 1]' "
+		      "bracket-orelse-paren-wrapped: plain '[f() orelse 1]' "
 		      "regressed — 'orelse' keyword leaked to backend");
 	}
 	prism_free(&r2);
@@ -3329,7 +3329,7 @@ static void test_struct_member_orelse_leak(void) {
 	prism_free(&r);
 }
 
-// Audit round 21: BUG3 — -fno-zeroinit + declarator-initializer orelse
+// -fno-zeroinit + declarator-initializer orelse
 // try_zero_init_decl's !F_ZEROINIT fast-path only gates on P1_OE_BRACKET.
 // P1_OE_DECL_INIT (orelse inside '= expr') is never checked, so it returns
 // NULL.  The bare-assign orelse path then fires with the type keyword as the
@@ -3345,13 +3345,13 @@ static void test_decl_init_orelse_fno_zeroinit_wrong_transform(void) {
 	    "void fn(void) { int x = f() orelse 0; (void)x; }\n",
 	    "decl_init_orelse_fno_zi.c", features);
 	CHECK_EQ(r.status, PRISM_OK,
-		 "BUG3: decl-init-orelse fno-zeroinit: should transpile OK");
+		 "decl-init-orelse fno-zeroinit: should transpile OK");
 	if (r.output) {
 		/* BUG: bare-assign path emits duplicate type-named declaration.
 		 * The fallback 'int x = ( 0)' re-declares x inside the if-body,
 		 * which is invalid C (duplicate declaration in same scope). */
 		CHECK(strstr(r.output, "int x = ( 0)") == NULL,
-		      "BUG3: decl-init-orelse fno-zeroinit: output must not contain "
+		      "decl-init-orelse fno-zeroinit: output must not contain "
 		      "duplicate 'int x = ( 0)' — bare-assign path fires with type keyword "
 		      "as LHS start, emitting invalid C with two 'int x' declarations; "
 		      "try_zero_init_decl must also check P1_OE_DECL_INIT when F_ZEROINIT=false");
@@ -3359,7 +3359,7 @@ static void test_decl_init_orelse_fno_zeroinit_wrong_transform(void) {
 	prism_free(&r);
 }
 
-// Audit round 21: BUG4 — comma operator at depth 0 in bare-assign orelse LHS.
+// comma operator at depth 0 in bare-assign orelse LHS.
 // reject_orelse_side_effects checks ++/--, compound-assign, asm, function calls,
 // and pointer derefs, but NOT for a comma operator at depth 0 between the
 // LHS start and the assignment '='.  A comma at depth 0 separates independent
@@ -3378,13 +3378,13 @@ static void test_bare_orelse_comma_lhs_depth0_double_eval(void) {
 	/* Comma splits the expression: status_reg is a separate statement,
 	 * out = f() orelse 0 is processed independently — no double-eval. */
 	CHECK(r.status == PRISM_OK,
-	      "BUG4: bare-orelse-comma-lhs: comma at depth-0 splits expression; "
+	      "bare-orelse-comma-lhs: comma at depth-0 splits expression; "
 	      "prefix becomes separate statement, no double-eval");
 	prism_free(&r);
 }
 
 /*
- * BUG5: defer body side-effects bleed into orelse side-effect checker.
+ * defer body side-effects bleed into orelse side-effect checker.
  *
  * When `defer { result += 1000; }` appears BEFORE `int v = get() orelse 10;`
  * in the same scope, the orelse checker sees the `+=` from the defer body and
@@ -3411,7 +3411,7 @@ static void test_defer_before_orelse_same_scope_false_reject(void) {
 		PrismResult r = prism_transpile_source(src, "defer_before_orelse.c",
 						       prism_defaults());
 		CHECK(r.status == PRISM_OK,
-		      "BUG5: defer { x += N; } before orelse in same scope must "
+		      "defer { x += N; } before orelse in same scope must "
 		      "not be rejected (defer body side-effects are not orelse "
 		      "double-eval candidates)");
 		prism_free(&r);
@@ -3432,7 +3432,7 @@ static void test_defer_before_orelse_same_scope_false_reject(void) {
 		PrismResult r = prism_transpile_source(src, "defer_fn_before_orelse.c",
 						       prism_defaults());
 		CHECK(r.status == PRISM_OK,
-		      "BUG5b: defer { fn(); } before orelse in same scope must "
+		      "defer { fn(); } before orelse in same scope must "
 		      "not be rejected (defer body function calls are not orelse "
 		      "double-eval candidates)");
 		prism_free(&r);
@@ -3452,12 +3452,12 @@ static void test_defer_before_orelse_same_scope_false_reject(void) {
 		PrismResult r = prism_transpile_source(src, "orelse_before_defer.c",
 						       prism_defaults());
 		CHECK(r.status == PRISM_OK,
-		      "BUG5-sanity: orelse before defer in same scope must work");
+		      "orelse before defer in same scope must work");
 		prism_free(&r);
 	}
 }
 
-/* Audit round 23 — typeof(const_struct_var) orelse value fallback emits
+/* typeof(const_struct_var) orelse value fallback emits
  * __typeof__((typeof(gs))0) which is (const struct S)0 — an invalid
  * cast to aggregate type in standard C.  Prism must reject this with an
  * error, just as it rejects "const struct S" with a value fallback. */
@@ -3480,7 +3480,7 @@ static void test_typeof_const_struct_orelse_invalid_cast(void) {
 		 * to determine struct-ness.  Backend compiler catches the invalid
 		 * (struct S)0 cast with a clear error message. */
 		CHECK(r.status == PRISM_OK || r.status != PRISM_OK,
-		      "BUG6: typeof(opaque_struct_var) orelse — transpiler "
+		      "typeof(opaque_struct_var) orelse — transpiler "
 		      "produces output (backend catches struct cast)");
 		prism_free(&r);
 	}
@@ -3495,7 +3495,7 @@ static void test_typeof_const_struct_orelse_invalid_cast(void) {
 		PrismResult r = prism_transpile_source(src, "typeof_const_struct2.c",
 						       prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG6b: typeof(const struct S) orelse value fallback "
+		      "typeof(const struct S) orelse value fallback "
 		      "must be rejected");
 		prism_free(&r);
 	}
@@ -3510,7 +3510,7 @@ static void test_typeof_const_struct_orelse_invalid_cast(void) {
 		PrismResult r = prism_transpile_source(src, "typeof_const_int_oe.c",
 						       prism_defaults());
 		CHECK(r.status == PRISM_OK,
-		      "BUG6c: typeof(const_int_var) orelse value fallback must "
+		      "typeof(const_int_var) orelse value fallback must "
 		      "still work — scalar types are fine with (TYPE)0 cast");
 		prism_free(&r);
 	}
@@ -3705,7 +3705,7 @@ static void test_typeof_vla_volatile_double_read(void) {
 	prism_free(&r);
 }
 
-// Audit round 30: walk_balanced_orelse inline path uses 'long long' for the
+// walk_balanced_orelse inline path uses 'long long' for the
 // statement-expression temp variable, which corrupts typeof() on pointer types.
 // typeof(p orelse q) where p/q are int* generates:
 //   typeof( ({long long __prism_oe_0 = (p); ...}) )
@@ -3733,7 +3733,7 @@ static void test_typeof_pointer_orelse_type_corruption(void) {
 	prism_free(&r);
 }
 
-// Audit round 31: paren-wrapped orelse in declaration initializers is rejected
+// paren-wrapped orelse in declaration initializers is rejected
 // with "'orelse' cannot be used inside parentheses" even though wrapping in
 // parens is standard C macro hygiene: #define GET(x) (try(x) orelse 0)
 static void test_paren_wrapped_decl_orelse(void) {
@@ -3871,7 +3871,7 @@ static void test_const_fallback_bracket_orelse_leak(void) {
 	prism_free(&r);
 }
 
-// Audit round 38: bracket orelse inside local struct array dimension.
+// bracket orelse inside local struct array dimension.
 // p1d_cur_func >= 0 lets Phase 1G allow the orelse, but try_zero_init_decl
 // bails in struct bodies → the catch-all routes to walk_balanced_orelse which
 // falls back to a GNU statement expression ({ __auto_type ... }) inside the
@@ -3880,7 +3880,7 @@ static void test_const_fallback_bracket_orelse_leak(void) {
 // and inconsistent with the existing typeof-orelse-in-struct rejection.
 // Prism should emit a clean error, just like for typeof orelse in struct bodies.
 static void test_bracket_orelse_local_struct_rejected(void) {
-	printf("\n--- bracket orelse in local struct array dim (audit round 38) ---\n");
+	printf("\n--- bracket orelse in local struct array dim ---\n");
 
 	const char *code =
 	    "extern int n;\n"
@@ -3907,7 +3907,7 @@ static void test_bracket_orelse_local_struct_rejected(void) {
 // (matching handle_const_orelse_fallback) to keep compound literals in the
 // enclosing block scope.
 static void test_bare_orelse_compound_literal_lifetime(void) {
-	printf("\n--- bare orelse compound literal paren-wrap lifetime (audit round 39) ---\n");
+	printf("\n--- bare orelse compound literal paren-wrap lifetime ---\n");
 
 	const char *code =
 	    "struct D { int x; };\n"
@@ -3931,7 +3931,7 @@ static void test_bare_orelse_compound_literal_lifetime(void) {
 }
 
 static void test_typeof_opaque_expr_orelse_aggregate(void) {
-	printf("\n--- typeof(opaque_expr) orelse aggregate limitation (audit round 43) ---\n");
+	printf("\n--- typeof(opaque_expr) orelse aggregate limitation ---\n");
 
 	/* Case 1: typeof(fn()) where fn returns struct — control-flow orelse
 	 * generates 'if (!x)' which is invalid C for aggregate types.
@@ -3992,7 +3992,7 @@ static void test_bracket_orelse_dim_hoisting_bypass(void) {
 
 	/* BUG (original): emit_bracket_orelse_temps used emit_token_range to emit
 	 * hoisted dimension tokens, leaking raw 'orelse' into C output.
-	 * BUG (audit round 52): emit_token_range_orelse duplicated orelse LHS into
+	 * emit_token_range_orelse duplicated orelse LHS into
 	 * ternary without side-effect checking. Function calls inside nested orelse
 	 * (e.g. foo() orelse 5 inside get_n()) were called twice.
 	 * FIX: reject_orelse_side_effects now fires inside emit_token_range_orelse.
@@ -4049,7 +4049,7 @@ static void test_bracket_orelse_dim_hoisting_bypass(void) {
 }
 
 static void test_orelse_funcptr_param_bracket_leak(void) {
-	printf("\n--- orelse in funcptr param bracket leak (audit round 40) ---\n");
+	printf("\n--- orelse in funcptr param bracket leak ---\n");
 
 	/* BUG: orelse inside brackets of a function-pointer parameter type inside
 	 * a function body leaks raw 'orelse' into C output.  Phase 1G annotates
@@ -4118,7 +4118,7 @@ static void test_orelse_funcptr_param_bracket_leak(void) {
 	}
 }
 
-// Audit round 45: typedef-concealed array orelse escape
+// typedef-concealed array orelse escape
 static void test_typedef_array_orelse_escape(void) {
 	printf("\n--- typedef array orelse escape ---\n");
 
@@ -4157,7 +4157,7 @@ static void test_typedef_array_orelse_escape(void) {
 	}
 }
 
-// Audit round 45: anonymous struct/union declaration split produces incompatible types
+// anonymous struct/union declaration split produces incompatible types
 static void test_anon_struct_split_invalid(void) {
 	printf("\n--- anon struct split invalid ---\n");
 
@@ -4195,7 +4195,7 @@ static void test_anon_struct_split_invalid(void) {
 	}
 }
 
-// Audit round 45: [*] VLA unspecified dim hoisted as invalid expression
+// [*] VLA unspecified dim hoisted as invalid expression
 static void test_vla_star_dim_hoisting(void) {
 	printf("\n--- [*] VLA dim hoisting ---\n");
 
@@ -4215,12 +4215,12 @@ static void test_vla_star_dim_hoisting(void) {
 	}
 }
 
-// Audit round 41: orelse bare assignment emits __typeof__ unconditionally.
+// orelse bare assignment emits __typeof__ unconditionally.
 // MSVC (cl.exe) does not support __typeof__, only C23 typeof under /std:clatest.
 // The zeroinit path already detects cc_is_msvc and uses a byte-loop instead of
 // __builtin_memset, but orelse has no MSVC-specific alternative for __typeof__.
 static void test_orelse_msvc_typeof_emission(void) {
-	printf("\n--- orelse MSVC __typeof__ emission (audit round 41) ---\n");
+	printf("\n--- orelse MSVC __typeof__ emission ---\n");
 
 	const char *code =
 	    "int get(void) { return 0; }\n"
@@ -4241,12 +4241,12 @@ static void test_orelse_msvc_typeof_emission(void) {
 	prism_free(&r);
 }
 
-// Audit round 41: handle_const_orelse_fallback emits __typeof__(&*(type)0) for
+// handle_const_orelse_fallback emits __typeof__(&*(type)0) for
 // pointer typedefs with baked-in const. When the base type resolves to void*,
 // this dereferences void* — a constraint violation under C99 §6.5.3.2p2.
 // GCC/Clang tolerate it as an extension, but it's standards-non-conforming.
 static void test_orelse_void_ptr_typedef_deref(void) {
-	printf("\n--- orelse void* pointer typedef &* deref (audit round 41) ---\n");
+	printf("\n--- orelse void* pointer typedef &* deref ---\n");
 
 	// typedef void * vp; typedef const vp cvp;
 	// cvp = void * const → pointer is const, base is void
@@ -4346,11 +4346,11 @@ static void test_bare_orelse_stmtexpr_defer_leak(void) {
 	}
 }
 
-// Audit round 43: typeof(expr orelse fallback) at file scope leaks a
+// typeof(expr orelse fallback) at file scope leaks a
 // statement expression ({...}) which is illegal outside a function body.
 // Phase 1G catches bracket-orelse at file scope but misses typeof-orelse.
 static void test_typeof_orelse_file_scope_leak(void) {
-	printf("\n--- typeof + orelse file scope leak (audit round 43) ---\n");
+	printf("\n--- typeof + orelse file scope leak ---\n");
 
 	// Case 1: typeof(x orelse 42) at file scope — simple variable LHS.
 	{
@@ -4381,7 +4381,7 @@ static void test_typeof_orelse_file_scope_leak(void) {
 }
 
 static void test_bare_orelse_temp_type_truncation(void) {
-	printf("\n--- Bare orelse Temp-Type Truncation (audit round 46) ---\n");
+	printf("\n--- Bare orelse Temp-Type Truncation ---\n");
 
 	// Bug: emit_bare_orelse_impl declared __typeof__(RHS) temp, then
 	// assigned the wider fallback back into it, silently truncating.
@@ -4415,7 +4415,7 @@ static void test_bare_orelse_temp_type_truncation(void) {
 }
 
 static void test_bare_orelse_compound_literal_detection(void) {
-	printf("\n--- Bare orelse Compound Literal Detection (audit round 46) ---\n");
+	printf("\n--- Bare orelse Compound Literal Detection ---\n");
 
 	// Bug: compound literal detection incremented depth on { (TF_OPEN)
 	// before checking sd==0, so (int[]){1,2,3} was never detected.
@@ -4625,7 +4625,7 @@ static void test_bare_orelse_vm_type_double_eval(void) {
 }
 
 static void test_bare_orelse_chained_intermediate_truncation(void) {
-	printf("\n--- Bare orelse Chained Intermediate Truncation (audit round 50) ---\n");
+	printf("\n--- Bare orelse Chained Intermediate Truncation ---\n");
 
 	// Bug: chained orelse (a orelse b orelse c) used a single
 	// __typeof__(RHS) temp for all links. Intermediate fallbacks
@@ -4730,12 +4730,12 @@ static void test_bare_orelse_chained_intermediate_truncation(void) {
 	}
 }
 
-// Audit round 52: chained orelse inside bracket/typeof duplicates
+// chained orelse inside bracket/typeof duplicates
 // intermediate LHS into ternary without side-effect checking.
 // emit_token_range_orelse emits (LHS) ? (LHS) : (RHS) — any function
 // call, ++/--, or assignment in LHS is evaluated twice.
 static void test_chained_bracket_typeof_orelse_double_eval(void) {
-	printf("\n--- Chained bracket/typeof orelse double-eval (audit round 52) ---\n");
+	printf("\n--- Chained bracket/typeof orelse double-eval ---\n");
 
 	// Sub-test 1: chained bracket orelse with function call → must reject
 	{
@@ -4831,11 +4831,11 @@ static void test_chained_bracket_typeof_orelse_double_eval(void) {
 	}
 }
 
-// Audit round 52: _BitInt(N) and _Alignas(N) leaked raw orelse into C output
+// _BitInt(N) and _Alignas(N) leaked raw orelse into C output
 // because parse_type_specifier did skip_balanced over their parenthesized
 // arguments and emit_type_stripped dumped them verbatim.
 static void test_bitint_alignas_orelse_leak(void) {
-	printf("\n--- _BitInt/_Alignas orelse firewall bypass (audit round 52) ---\n");
+	printf("\n--- _BitInt/_Alignas orelse firewall bypass ---\n");
 
 	// Sub-test 1: _BitInt(1 orelse 8) → must reject
 	{
@@ -5047,7 +5047,7 @@ static void test_atomic_vm_type_split_double_eval(void) {
 	}
 }
 
-// Audit round 53: cast-dereference bypasses reject_orelse_side_effects volatile
+// cast-dereference bypasses reject_orelse_side_effects volatile
 // deref check.  The checker matches `* varname` but not `*(type *)expr` because
 // `*` is followed by `(`, not a variable name.  In bracket/typeof orelse the LHS
 // is emitted twice (ternary), so `*(volatile int *)0x4000` reads the MMIO
@@ -5069,13 +5069,13 @@ static void test_bracket_orelse_cast_deref_double_eval(void) {
 			const char *s = r.output;
 			while ((s = strstr(s, "volatile")) != NULL) { count++; s += 8; }
 			CHECK(count <= 1,
-			      "BUG53a: *(volatile int*)0x4000 in bracket orelse: volatile "
+			      "*(volatile int*)0x4000 in bracket orelse: volatile "
 			      "deref duplicated in ternary (MMIO double read); "
 			      "reject_orelse_side_effects must catch *(cast)expr");
 		} else {
 			// Rejection is the CORRECT outcome — side effect detected
 			CHECK(r.status != PRISM_OK,
-			      "BUG53a: *(volatile int*)0x4000 bracket orelse correctly rejected");
+			      "*(volatile int*)0x4000 bracket orelse correctly rejected");
 		}
 		prism_free(&r);
 	}
@@ -5099,12 +5099,12 @@ static void test_bracket_orelse_cast_deref_double_eval(void) {
 					s += 3;
 				}
 				CHECK(count <= 1,
-				      "BUG53b: *(int *)ptr in typeof orelse: cast-deref "
+				      "*(int *)ptr in typeof orelse: cast-deref "
 				      "duplicated in ternary (double read)");
 			}
 		} else {
 			CHECK(r.status != PRISM_OK,
-			      "BUG53b: *(int*)ptr typeof orelse correctly rejected");
+			      "*(int*)ptr typeof orelse correctly rejected");
 		}
 		prism_free(&r);
 	}
@@ -5128,10 +5128,10 @@ static void test_bracket_orelse_cast_deref_double_eval(void) {
 				s += 2;
 			}
 			CHECK(count <= 1,
-			      "BUG53c-regression: *hw deref must not be duplicated");
+			      "*hw deref must not be duplicated");
 		} else {
 			CHECK(r.status != PRISM_OK,
-			      "BUG53c-regression: *hw bracket orelse correctly rejected");
+			      "*hw bracket orelse correctly rejected");
 		}
 		prism_free(&r);
 	}
@@ -5156,12 +5156,12 @@ static void test_bracket_orelse_cast_deref_double_eval(void) {
 			}
 			// Declaration + at most 1 use is fine; more than 2 means double-eval
 			CHECK(count <= 2,
-			      "BUG53d: *(vals+idx) in chained bracket orelse: "
+			      "*(vals+idx) in chained bracket orelse: "
 			      "deref duplicated in ternary (double read); "
 			      "reject_orelse_side_effects must catch *(expr)");
 		} else {
 			CHECK(r.status != PRISM_OK,
-			      "BUG53d: *(vals+idx) chained bracket orelse correctly rejected");
+			      "*(vals+idx) chained bracket orelse correctly rejected");
 		}
 		prism_free(&r);
 	}
@@ -5179,17 +5179,17 @@ static void test_bracket_orelse_cast_deref_double_eval(void) {
 			const char *s = r.output;
 			while ((s = strstr(s, "hw")) != NULL) { count++; s += 2; }
 			CHECK(count <= 2,
-			      "BUG53e: *(hw) in bracket orelse: parenthesized deref "
+			      "*(hw) in bracket orelse: parenthesized deref "
 			      "duplicated in ternary; reject must catch *(varname)");
 		} else {
 			CHECK(r.status != PRISM_OK,
-			      "BUG53e: *(hw) bracket orelse correctly rejected");
+			      "*(hw) bracket orelse correctly rejected");
 		}
 		prism_free(&r);
 	}
 }
 
-// Audit round 53: multiplication `*` falsely rejected as pointer dereference.
+// multiplication `*` falsely rejected as pointer dereference.
 // reject_orelse_side_effects matches `* varname` regardless of context — it
 // doesn't distinguish unary dereference `*ptr` from binary multiplication
 // `a * b`.  Expressions like `sizeof(int) * n`, `(a+b) * n`, and even plain
@@ -5205,7 +5205,7 @@ static void test_orelse_multiply_false_positive(void) {
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "mul_sizeof.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG54a: sizeof(int) * n in typeof orelse is multiplication, "
+		         "sizeof(int) * n in typeof orelse is multiplication, "
 		         "not pointer dereference — must not be rejected");
 		prism_free(&r);
 	}
@@ -5219,7 +5219,7 @@ static void test_orelse_multiply_false_positive(void) {
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "mul_alignof.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG54b: _Alignof(int) * n in typeof orelse is multiplication, "
+		         "_Alignof(int) * n in typeof orelse is multiplication, "
 		         "not pointer dereference — must not be rejected");
 		prism_free(&r);
 	}
@@ -5233,7 +5233,7 @@ static void test_orelse_multiply_false_positive(void) {
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "mul_paren_expr.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG54c: (a+b) * n in typeof orelse is multiplication, "
+		         "(a+b) * n in typeof orelse is multiplication, "
 		         "not pointer dereference — must not be rejected");
 		prism_free(&r);
 	}
@@ -5247,7 +5247,7 @@ static void test_orelse_multiply_false_positive(void) {
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "mul_nn.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG54d: n * n in typeof orelse is multiplication, "
+		         "n * n in typeof orelse is multiplication, "
 		         "not pointer dereference — must not be rejected");
 		prism_free(&r);
 	}
@@ -5261,7 +5261,7 @@ static void test_orelse_multiply_false_positive(void) {
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "mul_chain.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG54e: chained bracket orelse with sizeof(int) * n intermediate "
+		         "chained bracket orelse with sizeof(int) * n intermediate "
 		         "is multiplication, not pointer dereference");
 		prism_free(&r);
 	}
@@ -5275,7 +5275,7 @@ static void test_orelse_multiply_false_positive(void) {
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "mul_bracket.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG54f-regression: sizeof(int) * n in bracket orelse "
+		         "sizeof(int) * n in bracket orelse "
 		         "(hoisted path) must succeed");
 		prism_free(&r);
 	}
@@ -5300,17 +5300,17 @@ static void test_orelse_multiply_false_positive(void) {
 					s += 3;
 				}
 				CHECK(count <= 1,
-				      "BUG54g-regression: *ptr deref must not be duplicated in ternary");
+				      "*ptr deref must not be duplicated in ternary");
 			}
 		} else {
 			CHECK(r.status != PRISM_OK,
-			      "BUG54g-regression: *ptr in typeof orelse correctly rejected");
+			      "*ptr in typeof orelse correctly rejected");
 		}
 		prism_free(&r);
 	}
 }
 
-// BUG75: reject_orelse_side_effects checked unary * (pointer dereference)
+// reject_orelse_side_effects checked unary * (pointer dereference)
 // but not -> (member access), . (dot access), or [] (array subscript).
 // All three implicitly dereference memory and produce double volatile reads
 // when the chained ternary evaluates LHS twice. ISO C11 §5.1.2.3p2:
@@ -5329,7 +5329,7 @@ static void test_orelse_member_subscript_volatile_double_eval(void) {
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vol_arrow.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG75a: -> in chained bracket orelse must be rejected "
+		      "-> in chained bracket orelse must be rejected "
 		      "(volatile double-read)");
 		prism_free(&r);
 	}
@@ -5345,7 +5345,7 @@ static void test_orelse_member_subscript_volatile_double_eval(void) {
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vol_dot.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG75b: . in chained bracket orelse must be rejected "
+		      ". in chained bracket orelse must be rejected "
 		      "(volatile double-read)");
 		prism_free(&r);
 	}
@@ -5360,7 +5360,7 @@ static void test_orelse_member_subscript_volatile_double_eval(void) {
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vol_subscript.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG75c: [] in chained bracket orelse must be rejected "
+		      "[] in chained bracket orelse must be rejected "
 		      "(volatile double-read)");
 		prism_free(&r);
 	}
@@ -5376,7 +5376,7 @@ static void test_orelse_member_subscript_volatile_double_eval(void) {
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "arrow_single.c", prism_defaults());
 		CHECK(r.status == PRISM_OK,
-		      "BUG75d: -> in single bracket orelse (hoisted temp) must "
+		      "-> in single bracket orelse (hoisted temp) must "
 		      "succeed — no double-eval");
 		prism_free(&r);
 	}
@@ -5390,7 +5390,7 @@ static void test_orelse_member_subscript_volatile_double_eval(void) {
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "subscript_single.c", prism_defaults());
 		CHECK(r.status == PRISM_OK,
-		      "BUG75e: [] in single bracket orelse (hoisted temp) must "
+		      "[] in single bracket orelse (hoisted temp) must "
 		      "succeed — no double-eval");
 		prism_free(&r);
 	}
@@ -5405,13 +5405,13 @@ static void test_orelse_member_subscript_volatile_double_eval(void) {
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "arrow_typeof.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG75f: -> in typeof orelse (ternary double-eval) must "
+		      "-> in typeof orelse (ternary double-eval) must "
 		      "be rejected");
 		prism_free(&r);
 	}
 }
 
-// BUG56: reject_orelse_side_effects fires on the assignment target BEFORE
+// reject_orelse_side_effects fires on the assignment target BEFORE
 // determining whether the orelse action is bare-fallback (needs double-eval
 // of LHS) or control-flow (evaluates LHS once via if-guard).
 // arr[i++] = get() orelse return; should produce:
@@ -5427,7 +5427,7 @@ static void test_orelse_sideeffect_false_positive_on_action(void) {
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "sideeffect_action1.c", prism_defaults());
 		CHECK(r.status == PRISM_OK,
-		      "BUG56a: arr[i++] = get() orelse return must not be rejected "
+		      "arr[i++] = get() orelse return must not be rejected "
 		      "(LHS evaluated once in if-guard pattern)");
 		prism_free(&r);
 	}
@@ -5440,12 +5440,12 @@ static void test_orelse_sideeffect_false_positive_on_action(void) {
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "sideeffect_action2.c", prism_defaults());
 		CHECK(r.status == PRISM_OK,
-		      "BUG56b: arr[i++] = get() orelse { return; } must not be rejected");
+		      "arr[i++] = get() orelse { return; } must not be rejected");
 		prism_free(&r);
 	}
 }
 
-// BUG57: const chained orelse with block action at end of chain:
+// const chained orelse with block action at end of chain:
 // handle_const_orelse_fallback emits the block inside a ternary as a GNU
 // statement expression — produces non-portable code and invalid C if the
 // block doesn't return a value.
@@ -5519,7 +5519,7 @@ static void test_const_chained_orelse_block_action(void) {
 		// Must NOT contain statement-expression pattern "( {" in a ternary
 		CHECK(strstr(r.output, "? __prism_oe") == NULL ||
 		      strstr(r.output, ": ( {") == NULL,
-		      "BUG57: const chained orelse must not emit block as statement "
+		      "const chained orelse must not emit block as statement "
 		      "expression inside ternary — produces non-portable/invalid C");
 	}
 	prism_free(&r);
@@ -5875,7 +5875,7 @@ static void test_init_cast_vla_orelse_crash(void) {
 	}
 }
 
-// BUG76: stmt-expr goto/return inside bracket orelse and const orelse
+// stmt-expr goto/return inside bracket orelse and const orelse
 // bypasses defer cleanup — emit_token_range_orelse and emit_range used
 // flat OUT_TOK/emit_tok loops that never invoked handle_goto_keyword.
 static void test_stmtexpr_goto_in_bracket_orelse_defer_bypass(void) {
@@ -5893,26 +5893,26 @@ static void test_stmtexpr_goto_in_bracket_orelse_defer_bypass(void) {
 		    "skip:\n"
 		    "    return;\n"
 		    "}\n",
-		    "bug76g.c", prism_defaults());
+		    "t76g.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "bug76-goto: transpiles OK");
+		         "transpiles OK");
 		if (r.status == PRISM_OK && r.output) {
 			/* The goto must be wrapped with defer cleanup:
 			 * { counter++; goto skip; } or similar pattern */
 			const char *fn = strstr(r.output, "void f(");
-			CHECK(fn != NULL, "bug76-goto: function found");
+			CHECK(fn != NULL, "function found");
 			if (fn) {
 				/* Look for counter++ BEFORE goto skip in the stmt-expr */
 				const char *oe_temp = strstr(fn, "__prism_oe_");
-				CHECK(oe_temp != NULL, "bug76-goto: orelse temp hoisted");
+				CHECK(oe_temp != NULL, "orelse temp hoisted");
 				if (oe_temp) {
 					/* In the stmt-expr containing goto, defer cleanup
 					 * must appear (counter++) before the goto */
 					const char *goto_pos = strstr(oe_temp, "goto skip");
 					const char *cleanup = strstr(oe_temp, "counter++");
-					CHECK(goto_pos != NULL, "bug76-goto: goto found in output");
+					CHECK(goto_pos != NULL, "goto found in output");
 					CHECK(cleanup != NULL && cleanup < goto_pos,
-					      "bug76-goto: defer cleanup emitted before goto");
+					      "defer cleanup emitted before goto");
 				}
 			}
 		}
@@ -5929,22 +5929,22 @@ static void test_stmtexpr_goto_in_bracket_orelse_defer_bypass(void) {
 		    "    (void)arr;\n"
 		    "    return 0;\n"
 		    "}\n",
-		    "bug76r.c", prism_defaults());
+		    "t76r.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "bug76-return: transpiles OK");
+		         "transpiles OK");
 		if (r.status == PRISM_OK && r.output) {
 			const char *fn = strstr(r.output, "int f(");
-			CHECK(fn != NULL, "bug76-return: function found");
+			CHECK(fn != NULL, "function found");
 			if (fn) {
 				const char *oe_temp = strstr(fn, "__prism_oe_");
-				CHECK(oe_temp != NULL, "bug76-return: orelse temp hoisted");
+				CHECK(oe_temp != NULL, "orelse temp hoisted");
 				if (oe_temp) {
 					/* Defer cleanup must be injected around the return */
 					const char *ret_pos = strstr(oe_temp, "return ");
 					const char *cleanup = strstr(oe_temp, "counter++");
-					CHECK(ret_pos != NULL, "bug76-return: return found in output");
+					CHECK(ret_pos != NULL, "return found in output");
 					CHECK(cleanup != NULL && cleanup < ret_pos,
-					      "bug76-return: defer cleanup emitted before return");
+					      "defer cleanup emitted before return");
 				}
 			}
 		}
@@ -5965,21 +5965,21 @@ static void test_stmtexpr_goto_in_bracket_orelse_defer_bypass(void) {
 		    "bail:\n"
 		    "    return;\n"
 		    "}\n",
-		    "bug76c.c", prism_defaults());
+		    "t76c.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "bug76-const-goto: transpiles OK");
+		         "transpiles OK");
 		if (r.status == PRISM_OK && r.output) {
 			const char *fn = strstr(r.output, "void f(");
-			CHECK(fn != NULL, "bug76-const-goto: function found");
+			CHECK(fn != NULL, "function found");
 			if (fn) {
 				const char *oe_temp = strstr(fn, "__prism_oe_");
-				CHECK(oe_temp != NULL, "bug76-const-goto: orelse temp hoisted");
+				CHECK(oe_temp != NULL, "orelse temp hoisted");
 				if (oe_temp) {
 					const char *goto_pos = strstr(oe_temp, "goto");
 					const char *cleanup = strstr(oe_temp, "counter++");
-					CHECK(goto_pos != NULL, "bug76-const-goto: goto found");
+					CHECK(goto_pos != NULL, "goto found");
 					CHECK(cleanup != NULL && cleanup < goto_pos,
-					      "bug76-const-goto: defer cleanup before goto");
+					      "defer cleanup before goto");
 				}
 			}
 		}
@@ -5987,7 +5987,7 @@ static void test_stmtexpr_goto_in_bracket_orelse_defer_bypass(void) {
 	}
 }
 
-// BUG77: O(N^2) nested bracket orelse scanning — check_orelse_in_parens,
+// O(N^2) nested bracket orelse scanning — check_orelse_in_parens,
 // walk_balanced, and main emit loop rescanned nested [...] groups that had
 // no orelse, causing quadratic degradation on deep subscript chains.
 static void test_nested_bracket_orelse_no_quadratic(void) {
@@ -6011,28 +6011,28 @@ static void test_nested_bracket_orelse_no_quadratic(void) {
 	    ");\n"
 	    "}\n");
 
-	PrismResult r = prism_transpile_source(code, "bug77_nested.c", prism_defaults());
+	PrismResult r = prism_transpile_source(code, "t77_nested.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK,
-	         "bug77-nested-brackets: transpiles OK (no quadratic hang)");
+	         "transpiles OK (no quadratic hang)");
 	if (r.status == PRISM_OK && r.output) {
 		CHECK(strstr(r.output, "orelse") == NULL,
-		      "bug77-nested-brackets: no orelse in output");
+		      "no orelse in output");
 	}
 	prism_free(&r);
 }
 
-// BUG80: bare orelse with comma operator in braceless control flow.
+// bare orelse with comma operator in braceless control flow.
 // The comma split produces two statements, but braceless if/for/while/else
 // only captures the first — the orelse assignment leaks out of scope.
 // Fix: emit_bare_orelse_impl wraps in { } when brace_wrap is set.
-static int _bug80_if_helper(int cond) {
+static int _comma_orelse_if_helper(int cond) {
 	int status = -1;
 	if (cond)
 		(void)0, status = 0 orelse 1;
 	return status;
 }
 
-static int _bug80_while_helper(void) {
+static int _comma_orelse_while_helper(void) {
 	int x = -1;
 	int once = 1;
 	while (once)
@@ -6040,7 +6040,7 @@ static int _bug80_while_helper(void) {
 	return x;
 }
 
-static int _bug80_else_helper(int cond) {
+static int _comma_orelse_else_helper(int cond) {
 	int status = -1;
 	if (cond)
 		status = 42;
@@ -6051,15 +6051,15 @@ static int _bug80_else_helper(int cond) {
 
 void test_bare_orelse_comma_braceless(void) {
 	// if: cond=1 → body runs, status = 0 orelse 1 = 1 (0 is falsy)
-	CHECK_EQ(_bug80_if_helper(1), 1, "BUG80: braceless if cond=1 orelse fires");
+	CHECK_EQ(_comma_orelse_if_helper(1), 1, "braceless if cond=1 orelse fires");
 	// if: cond=0 → body skipped, status stays -1
-	CHECK_EQ(_bug80_if_helper(0), -1, "BUG80: braceless if cond=0 body skipped");
+	CHECK_EQ(_comma_orelse_if_helper(0), -1, "braceless if cond=0 body skipped");
 	// while: once=1 → body runs, x = 5 (truthy)
-	CHECK_EQ(_bug80_while_helper(), 5, "BUG80: braceless while comma orelse");
+	CHECK_EQ(_comma_orelse_while_helper(), 5, "braceless while comma orelse");
 	// else: cond=1 → if-branch, status=42
-	CHECK_EQ(_bug80_else_helper(1), 42, "BUG80: braceless else cond=1 if-branch");
+	CHECK_EQ(_comma_orelse_else_helper(1), 42, "braceless else cond=1 if-branch");
 	// else: cond=0 → else-branch, status = 0 orelse 1 = 1
-	CHECK_EQ(_bug80_else_helper(0), 1, "BUG80: braceless else cond=0 orelse fires");
+	CHECK_EQ(_comma_orelse_else_helper(0), 1, "braceless else cond=0 orelse fires");
 }
 
 static void test_bracket_orelse_prepdir_rejected(void) {
@@ -6117,69 +6117,69 @@ static void test_bracket_orelse_prepdir_rejected(void) {
 	}
 }
 
-// BUG83: block-form orelse in declaration + braceless control body
+// block-form orelse in declaration + braceless control body
 // Previously emitted brace_wrap '}' before the orelse block was processed,
 // producing invalid C like 'if (!x) } { ... }'.
-int *bug83_get_ptr(int which) {
-	static int bug83_val = 42;
-	return which ? &bug83_val : (void *)0;
+int *blk_orelse_get_ptr(int which) {
+	static int blk_orelse_val = 42;
+	return which ? &blk_orelse_val : (void *)0;
 }
 
-int bug83_braceless_if(int cond) {
+int blk_orelse_braceless_if(int cond) {
 	if (cond)
-		int *x = bug83_get_ptr(0) orelse { return 99; };
+		int *x = blk_orelse_get_ptr(0) orelse { return 99; };
 	return 0;
 }
 
-int bug83_braceless_else(int cond) {
+int blk_orelse_braceless_else(int cond) {
 	if (!cond) { /* nothing */ }
 	else
-		int *x = bug83_get_ptr(0) orelse { return 88; };
+		int *x = blk_orelse_get_ptr(0) orelse { return 88; };
 	return 0;
 }
 
-int bug83_braceless_while(void) {
+int blk_orelse_braceless_while(void) {
 	int count = 0;
 	while (count < 1)
-		int *x = bug83_get_ptr(count++) orelse { return 77; };
+		int *x = blk_orelse_get_ptr(count++) orelse { return 77; };
 	return count;
 }
 
-int bug83_multi_decl(void) {
-	int *x = bug83_get_ptr(0) orelse { return -1; }, y = 5;
+int blk_orelse_multi_decl(void) {
+	int *x = blk_orelse_get_ptr(0) orelse { return -1; }, y = 5;
 	return *x + y;
 }
 
-int bug83_multi_decl_nontrigger(void) {
-	int *x = bug83_get_ptr(1) orelse { return -1; }, y = 10;
+int blk_orelse_multi_decl_nontrigger(void) {
+	int *x = blk_orelse_get_ptr(1) orelse { return -1; }, y = 10;
 	return *x + y;
 }
 
 void test_orelse_block_braceless_ctrl(void) {
-	CHECK_EQ(bug83_braceless_if(1), 99,
-	         "BUG83: block orelse in braceless if triggers");
-	CHECK_EQ(bug83_braceless_if(0), 0,
-	         "BUG83: block orelse in braceless if skips");
-	CHECK_EQ(bug83_braceless_else(0), 0,
-	         "BUG83: block orelse in braceless else skips path");
-	CHECK_EQ(bug83_braceless_else(1), 88,
-	         "BUG83: block orelse in braceless else triggers");
-	CHECK_EQ(bug83_braceless_while(), 77,
-	         "BUG83: block orelse in braceless while triggers");
+	CHECK_EQ(blk_orelse_braceless_if(1), 99,
+	         "block orelse in braceless if triggers");
+	CHECK_EQ(blk_orelse_braceless_if(0), 0,
+	         "block orelse in braceless if skips");
+	CHECK_EQ(blk_orelse_braceless_else(0), 0,
+	         "block orelse in braceless else skips path");
+	CHECK_EQ(blk_orelse_braceless_else(1), 88,
+	         "block orelse in braceless else triggers");
+	CHECK_EQ(blk_orelse_braceless_while(), 77,
+	         "block orelse in braceless while triggers");
 }
 
 void test_orelse_block_multi_decl(void) {
-	CHECK_EQ(bug83_multi_decl(), -1,
-	         "BUG83: block orelse multi-decl null triggers");
-	CHECK_EQ(bug83_multi_decl_nontrigger(), 52,
-	         "BUG83: block orelse multi-decl non-null works");
+	CHECK_EQ(blk_orelse_multi_decl(), -1,
+	         "block orelse multi-decl null triggers");
+	CHECK_EQ(blk_orelse_multi_decl_nontrigger(), 52,
+	         "block orelse multi-decl non-null works");
 }
 
-// BUG83: block-form orelse with defer cleanup inside
-int bug83_with_defer(void) {
+// block-form orelse with defer cleanup inside
+int blk_orelse_with_defer(void) {
 	log_reset();
 	defer log_append("D");
-	int *x = bug83_get_ptr(0) orelse {
+	int *x = blk_orelse_get_ptr(0) orelse {
 		log_append("null");
 		return -1;
 	};
@@ -6188,22 +6188,22 @@ int bug83_with_defer(void) {
 }
 
 void test_orelse_block_defer_cleanup(void) {
-	int r = bug83_with_defer();
-	CHECK_EQ(r, -1, "BUG83: block orelse defer return value");
-	CHECK_LOG("nullD", "BUG83: block orelse defer cleanup order");
+	int r = blk_orelse_with_defer();
+	CHECK_EQ(r, -1, "block orelse defer return value");
+	CHECK_LOG("nullD", "block orelse defer cleanup order");
 }
 
-// BUG84: const chained orelse block form skips defer cleanup on return.
+// const chained orelse block form skips defer cleanup on return.
 // walk_balanced emitted block verbatim; return bypassed defer stack.
-int *bug84_get_ptr(int which) {
-	static int bug84_val = 42;
-	return which ? &bug84_val : (void *)0;
+int *chain_blk_get_ptr(int which) {
+	static int chain_blk_val = 42;
+	return which ? &chain_blk_val : (void *)0;
 }
 
-int bug84_const_chain_block_defer(void) {
+int chain_blk_orelse_defer(void) {
 	log_reset();
 	defer log_append("D");
-	const int *x = bug84_get_ptr(0) orelse bug84_get_ptr(0) orelse {
+	const int *x = chain_blk_get_ptr(0) orelse chain_blk_get_ptr(0) orelse {
 		log_append("null");
 		return -1;
 	};
@@ -6212,16 +6212,16 @@ int bug84_const_chain_block_defer(void) {
 }
 
 void test_orelse_const_chain_block_defer(void) {
-	int r = bug84_const_chain_block_defer();
-	CHECK_EQ(r, -1, "BUG84: const chained block orelse return");
-	CHECK_LOG("nullD", "BUG84: const chained block orelse defers fire");
+	int r = chain_blk_orelse_defer();
+	CHECK_EQ(r, -1, "const chained block orelse return");
+	CHECK_LOG("nullD", "const chained block orelse defers fire");
 }
 
-// BUG86: scan_decl_orelse paren unlinking corrupted comma expressions.
+// scan_decl_orelse paren unlinking corrupted comma expressions.
 // (counter++, get() orelse 0) unlinked the parens, exposing the comma
 // at depth 0, causing orelse to leak verbatim to output.
 void test_orelse_paren_comma_rejection(void) {
-	printf("\n--- BUG86: paren unlinking comma expression ---\n");
+	printf("\n--- paren unlinking comma expression ---\n");
 	// orelse inside parens WITH comma: should be rejected (not silently corrupted)
 	{
 		PrismResult r = prism_transpile_source(
@@ -6230,12 +6230,12 @@ void test_orelse_paren_comma_rejection(void) {
 		    "    int x = 0;\n"
 		    "    int *p = (x++, get() orelse 0);\n"
 		    "}\n",
-		    "bug86_comma.c", prism_defaults());
+		    "t86_comma.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
-		         "BUG86: orelse in paren with comma rejected");
+		         "orelse in paren with comma rejected");
 		if (r.status == PRISM_ERR_SYNTAX && r.error_msg) {
 			CHECK(strstr(r.error_msg, "parentheses") != NULL,
-			      "BUG86: error mentions parentheses");
+			      "error mentions parentheses");
 		}
 		prism_free(&r);
 	}
@@ -6246,18 +6246,18 @@ void test_orelse_paren_comma_rejection(void) {
 		    "void f(void) {\n"
 		    "    int *p = (get() orelse 0);\n"
 		    "}\n",
-		    "bug86_no_comma.c", prism_defaults());
+		    "t86_no_comma.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG86: orelse in paren without comma works");
+		         "orelse in paren without comma works");
 		if (r.status == PRISM_OK && r.output) {
 			CHECK(strstr(r.output, "orelse") == NULL,
-			      "BUG86: no literal orelse in output");
+			      "no literal orelse in output");
 		}
 		prism_free(&r);
 	}
 }
 
-// BUG87: shadowed 'orelse' (variable/enum/typedef named 'orelse') disables the keyword
+// shadowed 'orelse' (variable/enum/typedef named 'orelse') disables the keyword
 static void test_orelse_shadow_variable(void) {
 	// A local variable named 'orelse' should not disable the orelse keyword
 	// for other variables in the same scope (infix position after ident/num).
@@ -6336,7 +6336,7 @@ static void test_orelse_shadow_typedef(void) {
 	prism_free(&r);
 }
 
-// BUG92: chained assignment a = b = f() orelse 5 split-brain.
+// chained assignment a = b = f() orelse 5 split-brain.
 // The bare orelse scanner must find the LAST = at depth 0, placing
 // the intermediate = in the LHS range so reject_orelse_side_effects
 // catches it.  Previously it found the FIRST =, leaving b=0.
@@ -6348,11 +6348,11 @@ static void test_orelse_chained_assign_rejected(void) {
 	    "    a = b = f() orelse 5;\n"
 	    "}\n",
 	    "orelse_chained_assign.c",
-	    "BUG92: chained assignment orelse rejected",
+	    "chained assignment orelse rejected",
 	    "side effect");
 }
 
-// BUG97: __auto_type with orelse must not enter const-stripping cast path.
+// __auto_type with orelse must not enter const-stripping cast path.
 // __auto_type has TT_TYPEOF tag, but (__auto_type)0 is invalid C.
 static void test_orelse_auto_type(void) {
 	const char *code =
@@ -6362,19 +6362,19 @@ static void test_orelse_auto_type(void) {
 	    "    (void)x;\n"
 	    "}\n";
 	PrismResult r = prism_transpile_source(code, "auto_type_orelse.c", prism_defaults());
-	CHECK_EQ(r.status, PRISM_OK, "BUG97: __auto_type orelse transpiles OK");
+	CHECK_EQ(r.status, PRISM_OK, "__auto_type orelse transpiles OK");
 	if (r.output) {
 		// Must NOT produce __typeof__((__auto_type)0) — invalid cast.
 		CHECK(strstr(r.output, "__auto_type)0") == NULL,
-		      "BUG97: no cast to __auto_type");
+		      "no cast to __auto_type");
 		// Should use __auto_type directly for the temp.
 		CHECK(strstr(r.output, "__auto_type __prism_oe_") != NULL,
-		      "BUG97: temp uses __auto_type directly");
+		      "temp uses __auto_type directly");
 	}
 	prism_free(&r);
 }
 
-// BUG94: typeof on bit-field in bare orelse.
+// typeof on bit-field in bare orelse.
 // typeof(bitfield_member) is a C constraint violation.
 // When LHS has member access, use typeof(RHS) instead.
 static void test_orelse_bitfield_typeof(void) {
@@ -6386,18 +6386,18 @@ static void test_orelse_bitfield_typeof(void) {
 	    "    f.status = get_status() orelse 7;\n"
 	    "}\n";
 	PrismResult r = prism_transpile_source(code, "orelse_bitfield.c", prism_defaults());
-	CHECK_EQ(r.status, PRISM_OK, "BUG94: bit-field orelse transpiles OK");
+	CHECK_EQ(r.status, PRISM_OK, "bit-field orelse transpiles OK");
 	if (r.output) {
 		// Must NOT use typeof(f.status) — constraint violation.
 		CHECK(strstr(r.output, "typeof") == NULL ||
 		      strstr(r.output, "__typeof__(f.status)") == NULL,
-		      "BUG94: typeof must not be applied to bit-field LHS");
+		      "typeof must not be applied to bit-field LHS");
 		// Must use typeof(RHS) instead.
 		CHECK(strstr(r.output, "__typeof__( get_status())") != NULL ||
 		      strstr(r.output, "__typeof__(get_status())") != NULL ||
 		      strstr(r.output, "typeof( get_status())") != NULL ||
 		      strstr(r.output, "typeof(get_status())") != NULL,
-		      "BUG94: typeof applied to RHS when LHS has member access");
+		      "typeof applied to RHS when LHS has member access");
 	}
 	prism_free(&r);
 }
@@ -6532,176 +6532,176 @@ void run_orelse_tests(void) {
 
 	test_orelse_msvc_array_bracket_stmt_expr();
 
-	// Audit-reported bug probes (should FAIL until fixed)
+	// bug probes
 	test_orelse_struct_body_typeof_passthrough();
 	test_orelse_volatile_decl_double_read();
 	test_orelse_volatile_bare_compound_literal();
 	test_orelse_out_of_order_storage_class();
 	test_orelse_typeof_nested_bracket();
 
-	// Audit round 2 bug probes (should FAIL until fixed)
+	// bug probes
 	test_orelse_for_init_bracket_orelse_bypass();
 	test_orelse_static_decl_bare_assignment_collapse();
 	test_orelse_static_persistence_rejection();
 	test_orelse_bracket_oe_buffer_exhaustion();
 
-	// Audit round 3
+	//
 	test_typeof_implicit_const_orelse();
 
-	// Audit round 4 bug probes (should FAIL until fixed)
+	// bug probes
 	test_vla_bracket_orelse_eval_order();
 	test_typeof_bracket_orelse_volatile_double_read();
 	test_typeof_bracket_orelse_paren_hidden_side_effect();
 
-	// Audit round 5 bug probes (should FAIL until fixed)
+	// bug probes
 	test_typeof_vla_funcptr_orelse_double_eval();
 
-	// Audit round 6 bug probes (should FAIL until fixed)
+	// bug probes
 	test_vla_interleaved_orelse_eval_order();
 	test_typeof_funcptr_array_orelse_double_eval();
 
-	// Audit round 7 bug probes (should FAIL until fixed)
+	// bug probes
 	test_bare_orelse_compound_literal_unbraced_if();
 	test_bare_orelse_emit_range_prep_dir_leak();
 	test_c23_attr_bracket_orelse_dim_hoist();
 
-	// Audit round 8: block-form orelse else binding
+	// block-form orelse else binding
 	test_block_orelse_breaks_else_binding();
 
-	// Audit round 9: architecture-level bug probes (should FAIL until fixed)
+	// architecture-level bug probes
 	test_nested_bracket_orelse_dim_id_misalignment();
 	test_file_scope_struct_brace_orelse_bypass();
 
-	// Audit round 10: parenthesized function call bypass
+	// parenthesized function call bypass
 	test_typeof_paren_funcall_orelse_double_eval();
 
-	// Audit round 11: attributed struct typeof-orelse bypass
+	// attributed struct typeof-orelse bypass
 	test_typeof_orelse_attributed_struct();
 
-	// Audit round 12: typeof orelse in cast, bracket orelse in prototype
+	// typeof orelse in cast, bracket orelse in prototype
 	test_typeof_orelse_cast();
 	test_bracket_orelse_in_prototype();
 	test_nested_typeof_orelse_leak();
 
-	// Audit round 13: feature-flag desync and enum/initializer orelse bypass
+	// feature-flag desync and enum/initializer orelse bypass
 	test_bracket_orelse_vla_decl_fno_zeroinit();
 	test_enum_member_orelse_passthrough();
 	test_initializer_brace_orelse_wrong_transform();
 
-	// Audit round 14: _BitInt const-typedef orelse wrong temp type
+	// _BitInt const-typedef orelse wrong temp type
 	test_bitint_const_typedef_orelse_wrong_temp_type();
 
-        // Audit round 15: bare-orelse LHS #ifdef concatenates both branches
+        // bare-orelse LHS #ifdef concatenates both branches
         test_bare_orelse_ifdef_lhs_both_branches_concatenated();
 
-        // Audit round 18: bare orelse volatile pointer-deref re-read
+        // bare orelse volatile pointer-deref re-read
         test_bare_orelse_ptr_deref_lhs_rereads_volatile();
 
 	GNUC_ONLY(
-        // Audit round 16: declaration orelse with stmt-expr initializer
+        // declaration orelse with stmt-expr initializer
         test_decl_orelse_stmt_expr_initializer();
 
-        // Audit round 17: multi-decl stmt-expr with orelse inside
+        // multi-decl stmt-expr with orelse inside
         test_stmt_expr_multi_decl_inner_orelse();
 	);
 
-        // Audit round 19: parenthesised orelse in array dimension leaks keyword
+        // parenthesised orelse in array dimension leaks keyword
         test_bracket_orelse_paren_wrapped();
 
-	// Audit round 20: struct member orelse leak
+	// struct member orelse leak
 	test_struct_member_orelse_leak();
 
-	// Audit round 21: decl-init orelse fno-zeroinit wrong transform (BUG3)
-	// and bare-orelse comma-LHS depth-0 double-eval (BUG4) — should FAIL until fixed
+	// decl-init orelse fno-zeroinit wrong transform
+	// and bare-orelse comma-LHS depth-0 double-eval
 	test_decl_init_orelse_fno_zeroinit_wrong_transform();
 	test_bare_orelse_comma_lhs_depth0_double_eval();
 
-	// Audit round 22: defer-before-orelse false rejection (BUG5)
+	// defer-before-orelse false rejection
 	test_defer_before_orelse_same_scope_false_reject();
 
-	// Audit round 23: typeof const struct orelse value fallback (BUG6)
+	// typeof const struct orelse value fallback
 	test_typeof_const_struct_orelse_invalid_cast();
 
-	// Audit round 25: walk_balanced orelse blind spot
+	// walk_balanced orelse blind spot
 	test_walk_balanced_orelse_stmtexpr_leak();
 
-	// Audit round 26: typeof orelse in sizeof / cast expressions
+	// typeof orelse in sizeof / cast expressions
 	test_typeof_orelse_in_sizeof_expr();
 
-	// Audit round 27: namespace pollution — __prism_oe_N collides with user macros
+	// namespace pollution — __prism_oe_N collides with user macros
 	test_bracket_orelse_namespace_collision_noflat();
 
-	// Audit round 28: compound literal orelse + typeof VLA volatile double-read
+	// compound literal orelse + typeof VLA volatile double-read
 	test_compound_literal_orelse_if_inside_init();
 	GNUC_ONLY(test_typeof_vla_volatile_double_read());
 
-	// Audit round 30: typeof pointer orelse generates long long temp
+	// typeof pointer orelse generates long long temp
 	test_typeof_pointer_orelse_type_corruption();
 
-	// Audit round 31: paren-wrapped orelse in declaration initializers
+	// paren-wrapped orelse in declaration initializers
 	test_paren_wrapped_decl_orelse();
 
-	// Audit round 33: bare orelse volatile double-write (MMIO-killing)
+	// bare orelse volatile double-write (MMIO-killing)
 	test_bare_orelse_volatile_double_write();
 
-	// Audit round 35: compound literal inside function args must not trigger ternary fallback
+	// compound literal inside function args must not trigger ternary fallback
 	test_bare_orelse_volatile_compound_literal_nested();
 
-	// Audit round 35b: braceless control-flow brace_wrap must enclose bracket orelse temps
+	// braceless control-flow brace_wrap must enclose bracket orelse temps
 	test_braceless_ctrl_bracket_orelse_detach();
 
-	// Audit round 35b: const-fallback must not leak raw orelse in bracket dimensions
+	// const-fallback must not leak raw orelse in bracket dimensions
 	test_const_fallback_bracket_orelse_leak();
 
-	// Audit round 38: bracket orelse in local struct array dim must be rejected
+	// bracket orelse in local struct array dim must be rejected
 	test_bracket_orelse_local_struct_rejected();
 
-	// Audit round 39: bare orelse compound literal paren-wrap lifetime
+	// bare orelse compound literal paren-wrap lifetime
 	test_bare_orelse_compound_literal_lifetime();
 
-	// Audit round 43: typeof(opaque_expression) orelse produces invalid C for aggregates
+	// typeof(opaque_expression) orelse produces invalid C for aggregates
 	test_typeof_opaque_expr_orelse_aggregate();
 
-	// Audit round 40: orelse in funcptr/prototype param bracket leaks raw keyword
+	// orelse in funcptr/prototype param bracket leaks raw keyword
 	test_orelse_funcptr_param_bracket_leak();
 
-	// Audit round 44: bracket orelse dimension hoisting bypasses orelse transformation
+	// bracket orelse dimension hoisting bypasses orelse transformation
 	test_bracket_orelse_dim_hoisting_bypass();
 
-	// Audit round 45: typedef array orelse escape + anon struct split + [*] VLA hoisting
+	// typedef array orelse escape + anon struct split + [*] VLA hoisting
 	test_typedef_array_orelse_escape();
 	test_anon_struct_split_invalid();
 	test_vla_star_dim_hoisting();
 
-	// Audit round 41: MSVC orelse emits __typeof__ (MSVC-incompatible)
+	// MSVC orelse emits __typeof__ (MSVC-incompatible)
 	test_orelse_msvc_typeof_emission();
 
-	// Audit round 41: void* pointer typedef orelse emits &*(void*)0 constraint violation
+	// void* pointer typedef orelse emits &*(void*)0 constraint violation
 	test_orelse_void_ptr_typedef_deref();
 
-	// Audit round 42: bare orelse emit_tok loops bypass walk_balanced for stmt-exprs
+	// bare orelse emit_tok loops bypass walk_balanced for stmt-exprs
 	test_bare_orelse_stmtexpr_defer_leak();
 
-	// Audit round 43: typeof + orelse at file scope leaks statement expression
+	// typeof + orelse at file scope leaks statement expression
 	test_typeof_orelse_file_scope_leak();
 
-	// Audit round 46: temp-type truncation + compound literal detection
+	// temp-type truncation + compound literal detection
 	test_bare_orelse_temp_type_truncation();
 	test_bare_orelse_compound_literal_detection();
 
-	// Audit round 49: typeof VLA cast double evaluation
+	// typeof VLA cast double evaluation
 	test_bare_orelse_typeof_vla_cast_double_eval();
 
 	// VM-type bare orelse double-eval fix (typeof(LHS))
 	test_bare_orelse_vm_type_double_eval();
 
-	// Audit round 50: chained orelse intermediate truncation
+	// chained orelse intermediate truncation
 	test_bare_orelse_chained_intermediate_truncation();
 
-	// Audit round 52: chained bracket/typeof orelse double evaluation
+	// chained bracket/typeof orelse double evaluation
 	test_chained_bracket_typeof_orelse_double_eval();
 
-	// Audit round 52: _BitInt/_Alignas orelse firewall bypass
+	// _BitInt/_Alignas orelse firewall bypass
 	test_bitint_alignas_orelse_leak();
 
 	test_const_vm_type_orelse_double_eval();
@@ -6733,40 +6733,40 @@ void run_orelse_tests(void) {
 	// BUG: VLA orelse in cast inside declaration initializer false-positive crash
 	test_init_cast_vla_orelse_crash();
 
-	// BUG76: stmt-expr goto/return in bracket/const orelse bypasses defer cleanup
+	// stmt-expr goto/return in bracket/const orelse bypasses defer cleanup
 	test_stmtexpr_goto_in_bracket_orelse_defer_bypass();
 
-	// BUG77: O(N^2) nested bracket orelse scanning
+	// O(N^2) nested bracket orelse scanning
 	test_nested_bracket_orelse_no_quadratic();
 
-	// BUG80: bare orelse comma operator in braceless control flow
+	// bare orelse comma operator in braceless control flow
 	test_bare_orelse_comma_braceless();
 
 	// BUG: preprocessor conditionals inside bracket orelse (lib mode)
 	test_bracket_orelse_prepdir_rejected();
 
-	// BUG83: block orelse in braceless control body / multi-decl
+	// block orelse in braceless control body / multi-decl
 	test_orelse_block_braceless_ctrl();
 	test_orelse_block_multi_decl();
 	test_orelse_block_defer_cleanup();
 
-	// BUG84: const chained orelse block skips defer cleanup
+	// const chained orelse block skips defer cleanup
 	test_orelse_const_chain_block_defer();
 
-	// BUG86: paren unlinking with comma expression
+	// paren unlinking with comma expression
 	test_orelse_paren_comma_rejection();
 
-	// BUG87: shadowed 'orelse' keyword suppression
+	// shadowed 'orelse' keyword suppression
 	test_orelse_shadow_variable();
 	test_orelse_shadow_enum();
 	test_orelse_shadow_typedef();
 
-	// BUG92: chained assignment split-brain
+	// chained assignment split-brain
 	test_orelse_chained_assign_rejected();
 
-	// BUG94: typeof on bit-field in bare orelse
+	// typeof on bit-field in bare orelse
 	test_orelse_bitfield_typeof();
 
-	// BUG97: __auto_type orelse
+	// __auto_type orelse
 	GNUC_ONLY(test_orelse_auto_type());
 }

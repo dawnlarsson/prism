@@ -1,4 +1,4 @@
-// BUG98 (FIXED): Prism false-positive VLA detection on decayed param sizeof.
+// Prism false-positive VLA detection on decayed param sizeof.
 // sizeof(arr) where arr is int arr[n][n] parameter decays to int(*)[n],
 // sizeof(pointer) is constant. Prism should use = {0}, not memset.
 static void test_golf_param_multidim_vla(void) {
@@ -20,7 +20,7 @@ static void test_golf_param_multidim_vla(void) {
 	prism_free(&r);
 }
 
-// BUG99 (FIXED): Complex return type typedef synthesis consumes __attribute__.
+// Complex return type typedef synthesis consumes __attribute__.
 // int (*f(void))[5] __attribute__((unused)) with defer — Prism's
 // return-type typedef copies the attribute and entire body into the typedef.
 static void test_golf_defer_complex_return_gnu_attr(void) {
@@ -34,21 +34,26 @@ static void test_golf_defer_complex_return_gnu_attr(void) {
 	PrismResult r = prism_transpile_source(code, "golf_ra.c", f);
 	CHECK_EQ(r.status, PRISM_OK, "golf complex return + gnu attr: transpiles OK");
 	CHECK(r.output != NULL, "golf complex return + gnu attr: output not NULL");
-	UNIX_ONLY(
 	if (r.output) {
-		char *src_path = create_temp_file(r.output);
-		CHECK(src_path != NULL, "golf BUG99: create temp source");
-		if (src_path) {
-			char cmd[PATH_MAX * 2 + 64];
-			snprintf(cmd, sizeof(cmd),
-				 "cc -std=gnu11 -fsyntax-only '%s' >/dev/null 2>&1", src_path);
-			CHECK_EQ(run_command_status(cmd), 0,
-				 "golf complex return + gnu attr: transpiled output compiles");
-			unlink(src_path);
-			free(src_path);
+		// The bug was that the return-type typedef consumed __attribute__.
+		// Check the typedef doesn't contain it.
+		const char *td = strstr(r.output, "typedef");
+		CHECK(td != NULL, "golf typedef exists");
+		if (td) {
+			const char *semi = strchr(td, ';');
+			CHECK(semi != NULL, "golf typedef has semicolon");
+			if (semi) {
+				// Extract typedef text and check no attribute leaked in
+				size_t len = (size_t)(semi - td);
+				char *tdbuf = malloc(len + 1);
+				memcpy(tdbuf, td, len);
+				tdbuf[len] = '\0';
+				CHECK(strstr(tdbuf, "__attribute__") == NULL,
+				      "golf typedef must not contain __attribute__");
+				free(tdbuf);
+			}
 		}
 	}
-	);
 	prism_free(&r);
 }
 

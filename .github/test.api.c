@@ -2430,7 +2430,7 @@ static void test_c23_generic_member_macro_indirection(void) {
  * but local extern decls have block_depth > 0.
  */
 static void test_file_c23_n3322_local_extern_generic_leak(void) {
-	printf("\n--- BUG C23 N3322 Local Extern _Generic Leak ---\n");
+	printf("\n--- C23 N3322 Local Extern _Generic Leak ---\n");
 
 #ifdef _WIN32
 	passed++;
@@ -3757,10 +3757,10 @@ const char *code =
 PrismFeatures feat = prism_defaults();
 PrismResult r = prism_transpile_source(code, "bug_typeof.c", feat);
 
-CHECK_EQ(r.status, PRISM_OK, "bug typeof orelse: transpilation runs without error");
+CHECK_EQ(r.status, PRISM_OK, "transpilation runs without error");
 if (r.output) {
 CHECK(strstr(r.output, "orelse") == NULL,
-      "bug typeof orelse: transpiler must not leak raw orelse into generated C code");
+      "transpiler must not leak raw orelse into generated C code");
 }
 prism_free(&r);
 }
@@ -5390,7 +5390,7 @@ static void test_signal_temps_register_race(void) {
 }
 #endif
 
-// Audit round 29: signal_temps_register has a TOCTOU window between the CAS
+// signal_temps_register has a TOCTOU window between the CAS
 // (reserving a slot) and the memcpy (writing the path).  A signal arriving in
 // that gap could see an empty or partial path.  The fix adds a ready flag that
 // the handler checks before unlinking.  This test verifies the flag works:
@@ -6657,7 +6657,7 @@ static void test_collect_source_defines_midline_block_comment(void) {
 	}
 }
 
-/* Audit round 51a: raw string literal R"delim(...)delim" must not
+/* raw string literal R"delim(...)delim" must not
    confuse collect_source_defines into leaking defines hidden inside
    the raw string body or losing defines after it. */
 static void test_collect_source_defines_raw_string_desync(void) {
@@ -6702,7 +6702,7 @@ static void test_collect_source_defines_raw_string_desync(void) {
 #endif
 }
 
-/* Audit round 51b: deeply nested brackets must not exhaust the C call
+/* deeply nested brackets must not exhaust the C call
    stack — walk_balanced_orelse uses an iterative explicit stack. */
 static void test_struct_union_vla_predecessor(void) {
 	printf("\n--- Struct/Union VLA Bracket Predecessor ---\n");

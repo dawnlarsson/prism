@@ -1064,10 +1064,10 @@ static void test_raw_multi_decl_vla_memset(void) {
 	free(path);
 }
 
-// Audit round 43: per-declarator 'raw' after comma in multi-declarator list.
+// per-declarator 'raw' after comma in multi-declarator list.
 // 'int a, raw b;' should zero-init a but not b, and strip the raw keyword.
 static void test_raw_per_declarator_comma(void) {
-	printf("\n--- raw per-declarator after comma (audit round 43) ---\n");
+	printf("\n--- raw per-declarator after comma ---\n");
 
 	// Case 1: simple scalar
 	{
@@ -1152,7 +1152,7 @@ static void test_raw_per_declarator_comma(void) {
 	}
 }
 
-// Audit round 29: is_raw_declaration_context misses TT_STORAGE, TT_INLINE,
+// is_raw_declaration_context misses TT_STORAGE, TT_INLINE,
 // TT_TYPEDEF — 'raw' leaks literally into output for extern, inline,
 // _Thread_local, and typedef.
 static void test_raw_storage_class_leak(void) {
@@ -1237,7 +1237,7 @@ static void test_raw_consecutive_attr_preserved(void) {
 	prism_free(&r2);
 }
 
-// Audit round 38: The struct body regression.
+// The struct body regression.
 // try_zero_init_decl bails out inside struct bodies, so raw keywords fall
 // through to the main loop catch-all.  The catch-all's while loop only
 // advances on TF_RAW tokens, so interleaved attributes (between consecutive
@@ -1245,7 +1245,7 @@ static void test_raw_consecutive_attr_preserved(void) {
 // The fix applied in round 34 (emit_noise_between_raws) was only added to
 // try_zero_init_decl, not to the catch-all handler.
 static void test_raw_consecutive_attr_struct_body(void) {
-	printf("\n--- raw consecutive attr in struct body (audit round 38) ---\n");
+	printf("\n--- raw consecutive attr in struct body ---\n");
 
 	// GNU __attribute__ between consecutive raw keywords inside struct
 	const char *code1 =
@@ -1278,7 +1278,7 @@ static void test_raw_consecutive_attr_struct_body(void) {
 }
 
 static void test_raw_qualifier_prefix_goto_desync(void) {
-	printf("\n--- raw qualifier prefix goto desync (audit round 44) ---\n");
+	printf("\n--- raw qualifier prefix goto desync ---\n");
 
 	/* BUG: Phase 1D's main loop only set p1d_saw_raw when it directly
 	 * encountered a TF_RAW token.  When 'raw' appeared after qualifiers
@@ -1505,24 +1505,24 @@ void run_raw_tests(void) {
 	test_raw_multi_decl_array_aggregate();
 	test_raw_multi_decl_vla_memset();
 
-	// Audit round 43: per-declarator raw after comma
+	// per-declarator raw after comma
 	test_raw_per_declarator_comma();
 
-	// Audit round 29: raw leaks on extern, inline, typedef, _Thread_local
+	// raw leaks on extern, inline, typedef, _Thread_local
 	test_raw_storage_class_leak();
 
-	// Audit round 33: raw must apply to all declarators in comma-list
+	// raw must apply to all declarators in comma-list
 	test_raw_comma_list_all_declarators();
 
-	// Audit round 34: consecutive raw with interleaved attributes must preserve attrs
+	// consecutive raw with interleaved attributes must preserve attrs
 	test_raw_consecutive_attr_preserved();
 
-	// Audit round 38: consecutive raw with interleaved attrs in struct body
+	// consecutive raw with interleaved attrs in struct body
 	test_raw_consecutive_attr_struct_body();
 
-	// Audit round 44: raw after qualifier prefix desync with CFG verifier
+	// raw after qualifier prefix desync with CFG verifier
 	test_raw_qualifier_prefix_goto_desync();
 
-	// Audit round 51: per-declarator raw hiding VLA from CFG verifier
+	// per-declarator raw hiding VLA from CFG verifier
 	test_raw_per_declarator_vla_cfg_bypass();
 }

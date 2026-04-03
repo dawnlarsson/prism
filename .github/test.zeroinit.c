@@ -2190,7 +2190,7 @@ static void test_computed_goto_zeroinit_bypass(void) {
 	prism_free(&r);
 }
 
-// Audit round 21: BUG5 — C23 if/switch init-statement shadow scope expires
+// C23 if/switch init-statement shadow scope expires
 // too early.  p1_scan_init_shadows is called with scope_close_idx =
 // tok_idx(is_close) — the position of the ')' that closes the init-statement
 // paren.  This means the shadow only covers tokens up to and including ')';
@@ -2219,13 +2219,13 @@ static void test_c23_if_init_shadow_underscopes_body(void) {
 	    "void fn(int c) { if (int T = 0; c) { T x; (void)x; } }\n";
 	PrismResult r = prism_transpile_source(src, "c23_if_init_shadow.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK,
-		 "BUG5: c23-if-init-shadow: transpiles OK");
+		 "c23-if-init-shadow: transpiles OK");
 	if (r.output) {
 		/* BUG: shadow expires at ')' so T is still a typedef inside the body.
 		 * try_zero_init_decl fires on 'T x' and emits 'T x = ...' (zeroinit).
 		 * Correct: shadow covers body → T is a variable → 'T x;' is verbatim. */
 		CHECK(strstr(r.output, "T x = ") == NULL,
-		      "BUG5: c23-if-init-shadow: 'T x' in body must not get zeroinit "
+		      "c23-if-init-shadow: 'T x' in body must not get zeroinit "
 		      "— C23 if-init shadow scope_close_idx is set to tok_idx(is_close) "
 		      "which is the ')' position, NOT the end of the body; the shadow "
 		      "is invisible to all tokens inside the if-body, so the outer "
@@ -2240,16 +2240,16 @@ static void test_c23_if_init_shadow_underscopes_body(void) {
 	    "void fn(int c) { switch (int T = 0; c) { case 0: { T x; (void)x; } break; } }\n";
 	PrismResult r2 = prism_transpile_source(src2, "c23_switch_init_shadow.c", prism_defaults());
 	CHECK_EQ(r2.status, PRISM_OK,
-		 "BUG5: c23-switch-init-shadow: transpiles OK");
+		 "c23-switch-init-shadow: transpiles OK");
 	if (r2.output) {
 		CHECK(strstr(r2.output, "T x = ") == NULL,
-		      "BUG5: c23-switch-init-shadow: 'T x' in body must not get zeroinit "
+		      "c23-switch-init-shadow: 'T x' in body must not get zeroinit "
 		      "(same scope_close_idx truncation as if-init variant)");
 	}
 	prism_free(&r2);
 }
 
-// Audit round 28: C23 if-init shadow scope amputated before else branch.
+// C23 if-init shadow scope amputated before else branch.
 // skip_one_stmt(body_start_is) is called on the '{' of the true-branch body,
 // which matches to its '}' and stops — it never looks for an else clause.
 // This causes scope_close_idx to end at the true-branch '}', so the init
@@ -2345,13 +2345,13 @@ static void test_func_typedef_zeroinit(void) {
 	}
 }
 
-// Audit round 44: ternary in case label vs skip_one_stmt shadow scope.
+// ternary in case label vs skip_one_stmt shadow scope.
 // skip_one_stmt's case/default scanner confuses the ternary `:` with the
 // label `:` in `case 1 ? 2 : 3:`, overshooting the for-loop body boundary.
 // The for-init shadow extends past the loop, hiding the typedef and
 // bypassing zeroinit for `T *p;` (treated as expression `T * p;`).
 static void test_ternary_case_label_shadow_leak(void) {
-	printf("\n--- ternary in case label shadow leak (audit round 44) ---\n");
+	printf("\n--- ternary in case label shadow leak ---\n");
 
 	// For-init variable `T` scoped to the for loop.  After the loop,
 	// `T` is the outer typedef, so `T *p;` is a pointer declaration
@@ -2377,11 +2377,11 @@ static void test_ternary_case_label_shadow_leak(void) {
 	prism_free(&r);
 }
 
-// Audit round 43: typeof(func) alias; must not emit __builtin_memset.
+// typeof(func) alias; must not emit __builtin_memset.
 // has_typeof in needs_memset forces memset for all typeof-typed locals,
 // but function declarations cannot be memset'd — runtime segfault/linker error.
 static void test_typeof_func_decl_memset(void) {
-	printf("\n--- typeof function declaration memset trap (audit round 43) ---\n");
+	printf("\n--- typeof function declaration memset trap ---\n");
 
 	// Case 1: typeof(void_func) alias; — must not memset a function.
 	{
@@ -2495,56 +2495,56 @@ static void test_ptr_to_array_scalar_zeroinit(void) {
 	}
 }
 
-// BUG59: stmt-expr inside control-flow conditions (if/while/for) must
+// stmt-expr inside control-flow conditions (if/while/for) must
 // get zero-init processing.  Previously, handle_open_brace treated the
 // stmt-expr `{` as a compound literal inside ctrl parens, bypassing all
 // block-level processing (zero-init, raw, orelse, defer).
 static void test_stmt_expr_zeroinit_in_ctrl_cond(void) {
-	printf("\n--- BUG59: stmt-expr zero-init in ctrl conditions ---\n");
+	printf("\n--- stmt-expr zero-init in ctrl conditions ---\n");
 
-	// BUG59a: if condition
+	// if condition
 	{
 		const char *code =
 		    "void f(void) {\n"
 		    "    if (({int x; x=42; x;})) { (void)0; }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug59a.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK, "BUG59a: transpile succeeds");
+		PrismResult r = prism_transpile_source(code, "t59a.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "transpile succeeds");
 		if (r.output)
 			CHECK(strstr(r.output, "int x = 0") != NULL,
-			      "BUG59a: int x inside stmt-expr in if() must be zero-initialized");
+			      "int x inside stmt-expr in if() must be zero-initialized");
 		prism_free(&r);
 	}
 
-	// BUG59b: while condition
+	// while condition
 	{
 		const char *code =
 		    "void f(void) {\n"
 		    "    while (({int x; x=0; x;})) { break; }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug59b.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK, "BUG59b: transpile succeeds");
+		PrismResult r = prism_transpile_source(code, "t59b.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "transpile succeeds");
 		if (r.output)
 			CHECK(strstr(r.output, "int x = 0") != NULL,
-			      "BUG59b: int x inside stmt-expr in while() must be zero-initialized");
+			      "int x inside stmt-expr in while() must be zero-initialized");
 		prism_free(&r);
 	}
 
-	// BUG59c: for condition
+	// for condition
 	{
 		const char *code =
 		    "void f(void) {\n"
 		    "    for (int i = 0; ({int x; x=(i<3); x;}); i++) { (void)i; }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug59c.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK, "BUG59c: transpile succeeds");
+		PrismResult r = prism_transpile_source(code, "t59c.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "transpile succeeds");
 		if (r.output)
 			CHECK(strstr(r.output, "int x = 0") != NULL,
-			      "BUG59c: int x inside stmt-expr in for() condition must be zero-initialized");
+			      "int x inside stmt-expr in for() condition must be zero-initialized");
 		prism_free(&r);
 	}
 
-	// BUG59d: if-body after stmt-expr condition must still work normally
+	// if-body after stmt-expr condition must still work normally
 	{
 		const char *code =
 		    "void f(void) {\n"
@@ -2553,18 +2553,18 @@ static void test_stmt_expr_zeroinit_in_ctrl_cond(void) {
 		    "        (void)y;\n"
 		    "    }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug59d.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK, "BUG59d: transpile succeeds");
+		PrismResult r = prism_transpile_source(code, "t59d.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "transpile succeeds");
 		if (r.output) {
 			CHECK(strstr(r.output, "int x = 0") != NULL,
-			      "BUG59d: stmt-expr var zero-initialized");
+			      "stmt-expr var zero-initialized");
 			CHECK(strstr(r.output, "int y = 0") != NULL,
-			      "BUG59d: if-body var also zero-initialized");
+			      "if-body var also zero-initialized");
 		}
 		prism_free(&r);
 	}
 
-	// BUG59e: compound literal in ctrl parens must NOT be treated as stmt-expr
+	// compound literal in ctrl parens must NOT be treated as stmt-expr
 	{
 		const char *code =
 		    "#include <string.h>\n"
@@ -2573,17 +2573,17 @@ static void test_stmt_expr_zeroinit_in_ctrl_cond(void) {
 		    "    P p;\n"
 		    "    if (memcmp(&p, &(P){1}, sizeof(P)) == 0) { (void)0; }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug59e.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t59e.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG59e: compound literal in if() still transpiles correctly");
+		         "compound literal in if() still transpiles correctly");
 		prism_free(&r);
 	}
 }
 
-// BUG69: typeof(external_function) emits __builtin_memset on a function
+// typeof(external_function) emits __builtin_memset on a function
 // declaration, corrupting the .text segment at runtime.
 static void test_typeof_extern_func_memset(void) {
-	printf("\n--- BUG69: typeof external function memset corruption ---\n");
+	printf("\n--- typeof external function memset corruption ---\n");
 
 	// Sub-test 1: typeof(printf) — external function, forward-declared only.
 	{
@@ -2593,12 +2593,12 @@ static void test_typeof_extern_func_memset(void) {
 		    "    typeof(printf) my_func;\n"
 		    "    (void)my_func;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug69a.c", prism_defaults());
-		CHECK(r.status == PRISM_OK, "BUG69a: transpiles OK");
+		PrismResult r = prism_transpile_source(code, "t69a.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "transpiles OK");
 		if (r.output) {
 			CHECK(strstr(r.output, "__builtin_memset") == NULL &&
 			      strstr(r.output, "= {0}") == NULL,
-			      "BUG69a: typeof(printf) must NOT emit zero-init");
+			      "typeof(printf) must NOT emit zero-init");
 		}
 		prism_free(&r);
 	}
@@ -2613,11 +2613,11 @@ static void test_typeof_extern_func_memset(void) {
 		    "    typeof(global) copy;\n"
 		    "    (void)copy;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug69b.c", prism_defaults());
-		CHECK(r.status == PRISM_OK, "BUG69b: transpiles OK");
+		PrismResult r = prism_transpile_source(code, "t69b.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "transpiles OK");
 		if (r.output) {
 			CHECK(strstr(r.output, "__builtin_memset") != NULL || has_zeroing(r.output),
-			      "BUG69b: typeof(extern_struct_var) must still get zero-init");
+			      "typeof(extern_struct_var) must still get zero-init");
 		}
 		prism_free(&r);
 	}
@@ -2631,11 +2631,11 @@ static void test_typeof_extern_func_memset(void) {
 		    "    typeof(helper) my_func;\n"
 		    "    (void)my_func;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug69c.c", prism_defaults());
-		CHECK(r.status == PRISM_OK, "BUG69c: transpiles OK");
+		PrismResult r = prism_transpile_source(code, "t69c.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "transpiles OK");
 		if (r.output) {
 			CHECK(strstr(r.output, "__builtin_memset") == NULL,
-			      "BUG69c: typeof(defined_func) must not emit memset (regression)");
+			      "typeof(defined_func) must not emit memset (regression)");
 		}
 		prism_free(&r);
 	}
@@ -2649,8 +2649,8 @@ static void test_typeof_extern_func_memset(void) {
 		    "    typeof(callback) local_cb;\n"
 		    "    (void)local_cb;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug69d.c", prism_defaults());
-		CHECK(r.status == PRISM_OK, "BUG69d: transpiles OK");
+		PrismResult r = prism_transpile_source(code, "t69d.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "transpiles OK");
 		prism_free(&r);
 	}
 }
@@ -2697,7 +2697,7 @@ static void test_typeof_funcptr_static_assert_bypass(void) {
 	}
 }
 
-// BUG70: #pragma inside a statement expression processed by walk_balanced
+// #pragma inside a statement expression processed by walk_balanced
 // (e.g., inside array dimensions) clears at_stmt_start, skipping zero-init.
 static void test_stmt_expr_pragma_zeroinit_bypass(void) {
 	// Sub-test 1: pragma before declaration inside stmt-expr in array dim
@@ -2711,11 +2711,11 @@ static void test_stmt_expr_pragma_zeroinit_bypass(void) {
 		    "    })];\n"
 		    "    (void)arr;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug70a.c", prism_defaults());
-		CHECK(r.status == PRISM_OK, "BUG70a: transpiles OK");
+		PrismResult r = prism_transpile_source(code, "t70a.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "transpiles OK");
 		if (r.output) {
 			CHECK(strstr(r.output, "int x = 0") != NULL,
-			      "BUG70a: pragma in walk_balanced stmt-expr must not bypass zero-init");
+			      "pragma in walk_balanced stmt-expr must not bypass zero-init");
 		}
 		prism_free(&r);
 	}
@@ -2731,11 +2731,11 @@ static void test_stmt_expr_pragma_zeroinit_bypass(void) {
 		    "    })];\n"
 		    "    (void)arr;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug70b.c", prism_defaults());
-		CHECK(r.status == PRISM_OK, "BUG70b: transpiles OK");
+		PrismResult r = prism_transpile_source(code, "t70b.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "transpiles OK");
 		if (r.output) {
 			CHECK(strstr(r.output, "int y = 0") != NULL,
-			      "BUG70b: #line in walk_balanced stmt-expr must not bypass zero-init");
+			      "#line in walk_balanced stmt-expr must not bypass zero-init");
 		}
 		prism_free(&r);
 	}
@@ -2842,11 +2842,11 @@ static void test_switch_for_init_not_rejected(void) {
 	}
 }
 
-// BUG91: skip_one_stmt didn't handle user labels (L: stmt), causing it to
+// skip_one_stmt didn't handle user labels (L: stmt), causing it to
 // over-consume tokens past the labeled statement, extending variable scopes
 // and triggering false CFG verifier rejections.
 static void test_skip_one_stmt_label_parsing(void) {
-	printf("\n--- skip_one_stmt Label Parsing (BUG91) ---\n");
+	printf("\n--- skip_one_stmt Label Parsing ---\n");
 
 	// Label before braceless if body in for loop
 	{
@@ -2896,9 +2896,9 @@ static void test_skip_one_stmt_label_parsing(void) {
 	}
 }
 
-// BUG89: emit_type_range stmt-expr bypass in struct bodies
+// emit_type_range stmt-expr bypass in struct bodies
 static void test_struct_body_stmt_expr_features(void) {
-	printf("\n--- Struct Body Statement Expression Features (BUG89) ---\n");
+	printf("\n--- Struct Body Statement Expression Features ---\n");
 
 	// Test 1: zeroinit inside struct body statement expression (array size)
 	{
@@ -2962,36 +2962,36 @@ static void test_struct_body_stmt_expr_features(void) {
 	}
 }
 
-// BUG93: block-scope function prototype typeof memset.
+// block-scope function prototype typeof memset.
 // A block-scope forward declaration like 'int add(int, int);' inside a
 // function body was not recorded in p1_func_proto_map (brace_depth > 0),
 // so typeof(add) triggered a spurious __builtin_memset on a function type.
 static void test_typeof_block_scope_func_proto(void) {
-	printf("\n--- BUG93: block-scope function proto typeof memset ---\n");
+	printf("\n--- block-scope function proto typeof memset ---\n");
 	const char *code =
 	    "void f(void) {\n"
 	    "    int add(int, int);\n"
 	    "    typeof(add) my_func;\n"
 	    "    (void)my_func;\n"
 	    "}\n";
-	PrismResult r = prism_transpile_source(code, "bug93.c", prism_defaults());
-	CHECK_EQ(r.status, PRISM_OK, "BUG93: transpiles OK");
+	PrismResult r = prism_transpile_source(code, "t93.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "transpiles OK");
 	if (r.output) {
 		CHECK(strstr(r.output, "__builtin_memset") == NULL &&
 		      strstr(r.output, "= {0}") == NULL,
-		      "BUG93: typeof(block_scope_func) must NOT emit zero-init");
+		      "typeof(block_scope_func) must NOT emit zero-init");
 	}
 	prism_free(&r);
 }
 
-// BUG95: array_size_is_vla exponential blowup on deeply nested sizeof.
+// array_size_is_vla exponential blowup on deeply nested sizeof.
 // sizeof(int[sizeof(int[...])]) inside an array dimension caused O(2^N)
 // re-scanning because the sizeof path didn't skip past matched brackets
 // after recursion.  Also has a depth>256 guard.
-// BUG96: sizeof(param_array) is pointer-size (constant), not VLA.
+// sizeof(param_array) is pointer-size (constant), not VLA.
 // Parameter arrays decay to pointers; first dimension skipped for VLA check.
 static void test_vla_param_decay_sizeof(void) {
-	printf("\n--- BUG96: VLA param decay sizeof ---\n");
+	printf("\n--- VLA param decay sizeof ---\n");
 	// sizeof(arr) where arr is a decayed array parameter should be constant.
 	// No goto — just verify it gets brace-init (fixed-size), not memset (VLA).
 	const char *code =
@@ -2999,18 +2999,18 @@ static void test_vla_param_decay_sizeof(void) {
 	    "    int local[sizeof(arr)];\n"
 	    "    (void)local;\n"
 	    "}\n";
-	PrismResult r = prism_transpile_source(code, "bug96.c", prism_defaults());
-	CHECK_EQ(r.status, PRISM_OK, "BUG96: sizeof(param_array) is not VLA");
+	PrismResult r = prism_transpile_source(code, "t96.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "sizeof(param_array) is not VLA");
 	// Should use = {0} (fixed-size), NOT memset (VLA).
 	if (r.output) {
 		CHECK(strstr(r.output, "= {0}") != NULL || strstr(r.output, "={0}") != NULL,
-		      "BUG96: fixed-size array gets brace init, not memset");
+		      "fixed-size array gets brace init, not memset");
 	}
 	prism_free(&r);
 }
 
 static void test_array_size_is_vla_depth_guard(void) {
-	printf("\n--- BUG95: array_size_is_vla depth guard ---\n");
+	printf("\n--- array_size_is_vla depth guard ---\n");
 	// Build sizeof(int[sizeof(int[sizeof(int[...1...])])]) with 300 levels
 	// to trigger the depth > 256 guard.
 	char buf[8192];
@@ -3022,11 +3022,11 @@ static void test_array_size_is_vla_depth_guard(void) {
 	for (int i = 0; i < 300 && pos < 7500; i++)
 		pos += snprintf(buf + pos, sizeof(buf) - pos, "])");
 	pos += snprintf(buf + pos, sizeof(buf) - pos, "]; (void)arr; }");
-	PrismResult r = prism_transpile_source(buf, "bug95.c", prism_defaults());
-	CHECK(r.status != PRISM_OK, "BUG95: depth > 256 rejected");
+	PrismResult r = prism_transpile_source(buf, "t95.c", prism_defaults());
+	CHECK(r.status != PRISM_OK, "depth > 256 rejected");
 	if (r.error_msg)
 		CHECK(strstr(r.error_msg, "nesting depth") != NULL,
-		      "BUG95: error mentions nesting depth");
+		      "error mentions nesting depth");
 	prism_free(&r);
 }
 
@@ -3123,35 +3123,35 @@ void run_zeroinit_tests(void) {
 	GNUC_ONLY(test_gnu_thread_storage_class());
 	test_computed_goto_zeroinit_bypass();
 
-	// Audit round 21: C23 if/switch init-statement shadow scope expires at ')'
-	// before the if-body — typedef bleeds back into body (BUG5) — should FAIL until fixed
+	// C23 if/switch init-statement shadow scope expires at ')'
+	// before the if-body — typedef bleeds back into body
 	test_c23_if_init_shadow_underscopes_body();
 
-	// Audit round 28: C23 if-init shadow scope amputated before else branch
+	// C23 if-init shadow scope amputated before else branch
 	test_c23_if_init_shadow_else_scope();
 
-	// Audit round 42: function typedef zero-init
+	// function typedef zero-init
 	test_func_typedef_zeroinit();
 
-	// Audit round 43: typeof function declaration memset trap
+	// typeof function declaration memset trap
 	test_typeof_func_decl_memset();
 
-	// Audit round 44: ternary in case label shadow leak
+	// ternary in case label shadow leak
 	test_ternary_case_label_shadow_leak();
 
-	// BUG59: stmt-expr zero-init inside control-flow conditions
+	// stmt-expr zero-init inside control-flow conditions
 	test_stmt_expr_zeroinit_in_ctrl_cond();
 
 	// Pointer-to-array scalar zero-init (= 0 not = {0})
 	test_ptr_to_array_scalar_zeroinit();
 
-        // BUG69: typeof(external_function) memset corruption
+        // typeof(external_function) memset corruption
         test_typeof_extern_func_memset();
 
 	// BUG: static_assert/sizeof confuses typeof func-type scanner
 	test_typeof_funcptr_static_assert_bypass();
 
-	// BUG70: pragma in walk_balanced stmt-expr breaks at_stmt_start
+	// pragma in walk_balanced stmt-expr breaks at_stmt_start
 	test_stmt_expr_pragma_zeroinit_bypass();
 
 	// BUG: asm goto zeroinit CFG bypass
@@ -3160,18 +3160,18 @@ void run_zeroinit_tests(void) {
 	// BUG: CFG verifier P1K_CASE body_close_idx desync
 	test_switch_for_init_not_rejected();
 
-	// BUG89: emit_type_range stmt-expr bypass in struct bodies
+	// emit_type_range stmt-expr bypass in struct bodies
 	GNUC_ONLY(test_struct_body_stmt_expr_features());
 
-	// BUG91: skip_one_stmt label parsing
+	// skip_one_stmt label parsing
 	test_skip_one_stmt_label_parsing();
 
-	// BUG93: block-scope function prototype typeof memset
+	// block-scope function prototype typeof memset
 	test_typeof_block_scope_func_proto();
 
-	// BUG95: array_size_is_vla exponential blowup depth guard
+	// array_size_is_vla exponential blowup depth guard
 	test_array_size_is_vla_depth_guard();
 
-	// BUG96: sizeof(param_array) is constant, not VLA
+	// sizeof(param_array) is constant, not VLA
 	test_vla_param_decay_sizeof();
 }

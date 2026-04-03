@@ -2853,7 +2853,7 @@ void test_typeof_vla_zeroinit(void) {
 }
 #endif // _MSC_VER
 
-void test_bug1_ghost_shadow_while(void) {
+void test_ghost_shadow_while(void) {
 	typedef int U;
 	int x = 5;
 	while (x-- > 0) {
@@ -2864,7 +2864,7 @@ void test_bug1_ghost_shadow_while(void) {
 	CHECK(ptr == NULL, "typedef U works after while with shadow");
 }
 
-void test_bug1_ghost_shadow_if(void) {
+void test_ghost_shadow_if(void) {
 	typedef int V;
 	if (1)
 		;
@@ -2913,13 +2913,13 @@ void test_ghost_shadow_nested_braceless(void) {
 	CHECK(ptr == NULL, "ghost shadow: typedef T works after nested braceless for+if+break");
 }
 
-void test_bug2_ultra_complex_exact(void) {
+void test_ultra_complex_exact(void) {
 	// Exact example from bug report: pointer to array of 5 function pointers
 	int (*(*complex_var)[5])(void);
 	CHECK(complex_var == NULL, "ultra-complex declarator from report");
 }
 
-void test_bug2_deeply_nested_parens(void) {
+void test_deeply_nested_parens(void) {
 	// Even more nested: pointer to function returning pointer to array
 	int (*(*fp)(int))[10];
 	CHECK(fp == NULL, "deeply nested paren declarator");
@@ -2928,7 +2928,7 @@ void test_bug2_deeply_nested_parens(void) {
 #ifndef _MSC_VER
 static int defer_value_3rdparty = 0;
 
-void test_bug3_stmtexpr_defer_ordering(void) {
+void test_stmtexpr_defer_ordering(void) {
 	defer_value_3rdparty = 0;
 
 	// Test defer in nested block within statement expression
@@ -2947,7 +2947,7 @@ void test_bug3_stmtexpr_defer_ordering(void) {
 	CHECK(defer_value_3rdparty == 15, "defer captured value");
 }
 
-void test_bug3_stmtexpr_defer_variable(void) {
+void test_stmtexpr_defer_variable(void) {
 	int result = ({
 		int tmp = 42;
 		{ defer tmp = 999; }
@@ -2957,13 +2957,13 @@ void test_bug3_stmtexpr_defer_variable(void) {
 	CHECK(result == 999, "defer modifies variable correctly");
 }
 
-void test_bug4_generic_fnptr(void) {
+void test_generic_fnptr(void) {
 	// Exact pattern from bug report: function pointer in _Generic
 	int x = _Generic(0, void (*)(int): 1, default: 0);
 	CHECK(x == 0, "_Generic with fn ptr type");
 }
 
-void test_bug4_generic_defer_interaction(void) {
+void test_generic_defer_interaction(void) {
 	int result = 0;
 	{
 		defer result = 1;
@@ -2974,7 +2974,7 @@ void test_bug4_generic_defer_interaction(void) {
 	CHECK(result == 1, "defer doesn't break _Generic");
 }
 
-void test_bug7_sizeof_vla_variable(void) {
+void test_sizeof_vla_variable(void) {
 	int n = 5;
 	int vla[n]; // VLA
 	vla[0] = 42;
@@ -2987,7 +2987,7 @@ void test_bug7_sizeof_vla_variable(void) {
 	CHECK(vla[0] == 42 && x[0] == 99, "3rd-party bug #7: sizeof(vla) creates VLA");
 }
 
-void test_bug7_sizeof_sizeof_vla(void) {
+void test_sizeof_sizeof_vla(void) {
 	int n = 3;
 	int arr1[n]; // VLA
 	arr1[0] = 1;
@@ -2999,7 +2999,7 @@ void test_bug7_sizeof_sizeof_vla(void) {
 	CHECK(arr1[0] == 1 && arr2[0] == 2, "sizeof(sizeof(VLA))");
 }
 
-void test_bug7_sizeof_vla_element(void) {
+void test_sizeof_vla_element(void) {
 	int m = 4;
 	int inner[m]; // VLA
 	inner[0] = 10;
@@ -6237,86 +6237,86 @@ static void test_c23_attr_void_function(void) {
 	prism_free(&result);
 }
 
-static int _bug2_count_t = 10;   // file-scope var, NOT a type
-static int _bug2_offset_t = 7;   // another file-scope _t var
+static int _fscope_count_t = 10;   // file-scope var, NOT a type
+static int _fscope_offset_t = 7;   // another file-scope _t var
 
-static void test_bug2_filescope_t_mul(void) {
+static void test_filescope_t_mul(void) {
 	int b = 3;
 	int saved_b = b;
 	{
 		defer log_append("D");
-		// BUG: _bug2_count_t ends in _t, no shadow at file scope.
+		// BUG: _fscope_count_t ends in _t, no shadow at file scope.
 		// Prism heuristic treats it as a type.
-		// '_bug2_count_t * b;' gets parsed as pointer decl '_bug2_count_t *b = 0;'
-		// which fails to compile (_bug2_count_t is int, not a type).
+		// '_fscope_count_t * b;' gets parsed as pointer decl '_fscope_count_t *b = 0;'
+		// which fails to compile (_fscope_count_t is int, not a type).
 		// After fix: expression emitted as-is, b unchanged.
-		_bug2_count_t * b;
-		CHECK_EQ(b, saved_b, "bug2: file-scope _t mul not misread as ptr decl");
+		_fscope_count_t * b;
+		CHECK_EQ(b, saved_b, "file-scope _t mul not misread as ptr decl");
 	}
 }
 
-static void test_bug2_filescope_t_arith(void) {
+static void test_filescope_t_arith(void) {
 	{
 		defer log_append("D");
 		// Assignment with file-scope _t var — should work even without fix
 		// (assignment doesn't match declaration pattern)
-		_bug2_offset_t = 20;
-		CHECK_EQ(_bug2_offset_t, 20, "bug2: file-scope _t assignment in defer");
-		_bug2_offset_t = 7; // restore
+		_fscope_offset_t = 20;
+		CHECK_EQ(_fscope_offset_t, 20, "file-scope _t assignment in defer");
+		_fscope_offset_t = 7; // restore
 	}
 }
 
-static void test_bug2_filescope_t_in_expr(void) {
+static void test_filescope_t_in_expr(void) {
 	{
 		defer log_append("D");
 		// Using file-scope _t var in an expression with 'int' at stmt start — safe
-		int val = _bug2_count_t + _bug2_offset_t;
-		CHECK_EQ(val, 17, "bug2: file-scope _t vars in int-expr");
+		int val = _fscope_count_t + _fscope_offset_t;
+		CHECK_EQ(val, 17, "file-scope _t vars in int-expr");
 	}
 }
 
-static void _bug5_void_callee(void) {
+static void _void_callee(void) {
 	log_append("V");
 }
 
-static void _bug5_void_return_call(void) {
+static void _void_return_call(void) {
 	defer log_append("D");
 	log_append("1");
-	return _bug5_void_callee(); // Valid C: returning void expr from void func
+	return _void_callee(); // Valid C: returning void expr from void func
 }
 
-static void test_bug5_void_return_call_defer(void) {
+static void test_void_return_call_defer(void) {
 	log_reset();
-	_bug5_void_return_call();
-	CHECK_LOG("1VD", "bug5: void return funcall with defer");
+	_void_return_call();
+	CHECK_LOG("1VD", "void return funcall with defer");
 }
 
-static void _bug5_void_return_cast(void) {
+static void _void_return_cast(void) {
 	defer log_append("D");
 	log_append("1");
 	return (void)0; // Explicit void cast return
 }
 
-static void test_bug5_void_return_cast_defer(void) {
+static void test_void_return_cast_defer(void) {
 	log_reset();
-	_bug5_void_return_cast();
-	CHECK_LOG("1D", "bug5: void return (void)cast with defer");
+	_void_return_cast();
+	CHECK_LOG("1D", "void return (void)cast with defer");
 }
 
-static void _bug5_void_return_bare(void) {
+static void _void_return_bare(void) {
 	defer log_append("D");
 	log_append("1");
 	return; // Bare return in void function
 }
 
-static void test_bug5_void_return_bare_defer(void) {
+static void test_void_return_bare_defer(void) {
 	log_reset();
-	_bug5_void_return_bare();
-	CHECK_LOG("1D", "bug5: void bare return with defer");
+	_void_return_bare();
+	CHECK_LOG("1D", "void bare return with defer");
 }
 
 #ifdef __GNUC__
-static void test_bug4_stmt_expr_in_defer(void) {
+static void test_stmt_expr_in_defer(void) {
 	log_reset();
 	int result = 0;
 	{
@@ -6328,12 +6328,12 @@ static void test_bug4_stmt_expr_in_defer(void) {
 			a + b;
 		});
 	}
-	CHECK_EQ(result, 30, "bug4: stmt_expr in defer scope works");
-	CHECK_LOG("D", "bug4: defer scope logged correctly");
+	CHECK_EQ(result, 30, "stmt_expr in defer scope works");
+	CHECK_LOG("D", "defer scope logged correctly");
 }
 #endif
 
-static void test_bug1_digraph_in_defer(void) {
+static void test_digraph_in_defer(void) {
 	int arr[3];
 	arr[0] = 0;
 	{
@@ -6341,12 +6341,12 @@ static void test_bug1_digraph_in_defer(void) {
 		// Use array subscript (digraphs <: and :> normalize to [ and ])
 		arr<:0:> = 42;
 		arr<:1:> = 99;
-		CHECK_EQ(arr[0], 42, "bug1: digraph <: :> subscript in defer");
-		CHECK_EQ(arr[1], 99, "bug1: digraph <: :> second subscript");
+		CHECK_EQ(arr[0], 42, "digraph <: :> subscript in defer");
+		CHECK_EQ(arr[1], 99, "digraph <: :> second subscript");
 	}
 }
 
-static void test_bug6_setjmp_detection(void) {
+static void test_setjmp_detection(void) {
 	PrismResult result = prism_transpile_source(
 	    "#include <setjmp.h>\n"
 	    "static jmp_buf buf;\n"
@@ -6355,8 +6355,8 @@ static void test_bug6_setjmp_detection(void) {
 	    "    longjmp(buf, 1);\n"
 	    "}\n"
 	    "int main(void) { if (setjmp(buf) == 0) bad(); return 0; }\n",
-	    "bug6_setjmp_reject.c", prism_defaults());
-	CHECK(result.status != PRISM_OK, "bug6: setjmp with defer rejected");
+	    "setjmp_reject.c", prism_defaults());
+	CHECK(result.status != PRISM_OK, "setjmp with defer rejected");
 	prism_free(&result);
 }
 
@@ -6370,7 +6370,7 @@ static simple_callback_t _r2_get_callback_typedef(void) {
 	return _r2_callback_fn;
 }
 
-static void test_bug_r2_fnptr_return_typedef(void) {
+static void test_fnptr_return_typedef(void) {
 	log_reset();
 	_r2_callback_called = 0;
 	simple_callback_t cb = _r2_get_callback_typedef();
@@ -6385,7 +6385,7 @@ static void (*_r2_get_callback_raw(void))(void) {
 	return _r2_callback_fn;
 }
 
-static void test_bug_r2_fnptr_return_raw(void) {
+static void test_fnptr_return_raw(void) {
 	log_reset();
 	_r2_callback_called = 0;
 	void (*cb)(void) = _r2_get_callback_raw();
@@ -6402,7 +6402,7 @@ static int *_r2_get_ptr(void) {
 	return &_r2_int_val;
 }
 
-static void test_bug_r2_ptr_return(void) {
+static void test_ptr_return(void) {
 	log_reset();
 	int *p = _r2_get_ptr();
 	CHECK_LOG("GD", "bug_r2: ptr return defer order");
@@ -6410,7 +6410,7 @@ static void test_bug_r2_ptr_return(void) {
 }
 
 #ifndef _WIN32
-static void test_bug_r1_readonly_dir(void) {
+static void test_readonly_dir(void) {
 	if (getuid() == 0) {
 		passed++; total++;
 		printf("  [SKIP] bug_r1: read-only dir test (running as root)\n");
@@ -6448,7 +6448,7 @@ static void test_bug_r1_readonly_dir(void) {
 }
 #endif
 
-static void test_bug_r3_line_directive(void) {
+static void test_line_directive(void) {
 	// __FILE__ should be a valid string. If #line processing is broken,
 	// this test file itself would fail to compile.
 	CHECK(strlen(__FILE__) > 0, "bug_r3: __FILE__ is valid string");
@@ -6987,14 +6987,14 @@ static void test_knr_param_typedef_shadow_bypass_zeroinit(void) {
         // This FAILS until fixed.
         bool zeroinit_injected = r.output && strstr(r.output, "= {0}") != NULL;
         CHECK(!zeroinit_injected,
-              "BUG15: K&R param typedef shadow bypass: 'some_t b' inside K&R "
+              "K&R param typedef shadow bypass: 'some_t b' inside K&R "
               "body must NOT be zero-inited — 'some_t' is the param variable, "
               "not the typedef (shadow registration skipped: prev_tok is ';' "
               "not ')')" );
         prism_free(&r);
 }
 
-// Audit round 17: skip_one_stmt label-fallthrough for-init shadow bleed
+// skip_one_stmt label-fallthrough for-init shadow bleed
 //
 // BUG: skip_one_stmt() has no handler for case/default/ident labels.  When the
 // function is called on a braceless switch body that begins with a label, it
@@ -7039,7 +7039,7 @@ static void test_skip_one_stmt_case_braced_for_init_shadow_bleed(void) {
 	                (strstr(decl_pos, "= {0}") != NULL ||
 	                 strstr(decl_pos, "= 0;") != NULL);
 	CHECK(zeroinit,
-	      "BUG (audit-17): skip_one_stmt case-label shadow bleed — "
+	      "skip_one_stmt case-label shadow bleed — "
 	      "'align_t result' after for-loop MUST get zeroinit (= {0}); "
 	      "shadow wrongly extends past loop body into the declaration");
 	prism_free(&r);
@@ -7068,7 +7068,7 @@ static void test_skip_one_stmt_default_braced_for_init_shadow_bleed(void) {
 	                (strstr(decl_pos, "= {0}") != NULL ||
 	                 strstr(decl_pos, "= 0;") != NULL);
 	CHECK(zeroinit,
-	      "BUG (audit-17): skip_one_stmt default-label shadow bleed — "
+	      "skip_one_stmt default-label shadow bleed — "
 	      "'elem_t out' after for-loop MUST get zeroinit (= {0}); "
 	      "default: { } braceless body gives p1d_switch_end=UINT32_MAX, "
 	      "shadow bleeds for remainder of function");
@@ -7544,22 +7544,22 @@ void run_parse_tests(void) {
 	test_sizeof_vla_typedef();
 	test_typeof_vla_zeroinit();
 #endif
-	test_bug1_ghost_shadow_while();
-	test_bug1_ghost_shadow_if();
+	test_ghost_shadow_while();
+	test_ghost_shadow_if();
 	test_ghost_shadow_braceless_break();
 	test_ghost_shadow_braceless_continue();
 	test_ghost_shadow_braceless_return();
 	test_ghost_shadow_nested_braceless();
-	test_bug2_ultra_complex_exact();
-	test_bug2_deeply_nested_parens();
+	test_ultra_complex_exact();
+	test_deeply_nested_parens();
 #ifndef _MSC_VER
-	test_bug3_stmtexpr_defer_ordering();
-	test_bug3_stmtexpr_defer_variable();
-	test_bug4_generic_fnptr();
-	test_bug4_generic_defer_interaction();
-	test_bug7_sizeof_vla_variable();
-	test_bug7_sizeof_sizeof_vla();
-	test_bug7_sizeof_vla_element();
+	test_stmtexpr_defer_ordering();
+	test_stmtexpr_defer_variable();
+	test_generic_fnptr();
+	test_generic_defer_interaction();
+	test_sizeof_vla_variable();
+	test_sizeof_sizeof_vla();
+	test_sizeof_vla_element();
 	test_sizeof_parenthesized_vla();
 	test_edge_multiple_typedef_shadows();
 	test_edge_defer_in_generic();
@@ -7808,24 +7808,24 @@ void run_parse_tests(void) {
 	test_c23_attr_void_function();
 
 	/* Bug regression round 2 */
-	test_bug2_filescope_t_mul();
-	test_bug2_filescope_t_arith();
-	test_bug2_filescope_t_in_expr();
-	test_bug5_void_return_call_defer();
-	test_bug5_void_return_cast_defer();
-	test_bug5_void_return_bare_defer();
+	test_filescope_t_mul();
+	test_filescope_t_arith();
+	test_filescope_t_in_expr();
+	test_void_return_call_defer();
+	test_void_return_cast_defer();
+	test_void_return_bare_defer();
 #ifdef __GNUC__
-	test_bug4_stmt_expr_in_defer();
+	test_stmt_expr_in_defer();
 #endif
-	test_bug1_digraph_in_defer();
-	test_bug6_setjmp_detection();
-	test_bug_r2_fnptr_return_typedef();
-	test_bug_r2_fnptr_return_raw();
-	test_bug_r2_ptr_return();
+	test_digraph_in_defer();
+	test_setjmp_detection();
+	test_fnptr_return_typedef();
+	test_fnptr_return_raw();
+	test_ptr_return();
 #ifndef _WIN32
-	test_bug_r1_readonly_dir();
+	test_readonly_dir();
 #endif
-	test_bug_r3_line_directive();
+	test_line_directive();
 	test_void_parenthesized_func_defer();
 
 	test_paren_param_typedef_shadow();
@@ -7843,7 +7843,7 @@ void run_parse_tests(void) {
 	test_asm_in_orelse_lhs_rejected();
 #endif
 
-	// Audit round 10: for-init scope + stmt-expr goto
+	// for-init scope + stmt-expr goto
 	test_for_init_typedef_shadow_body_scope();
 	test_for_init_shadow_ifelse_body();
 #ifdef __GNUC__
@@ -7851,18 +7851,18 @@ void run_parse_tests(void) {
 	test_goto_out_of_stmt_expr_rejected();
 #endif
 
-	// Audit round 13: GNU C initializer field phony label
+	// GNU C initializer field phony label
 #ifdef __GNUC__
 	test_gnu_initializer_field_phony_label();
 #endif
 
-	// Audit round 14: MSVC-style #line no-flag3 system header leak
+	// MSVC-style #line no-flag3 system header leak
 	test_msvc_line_directive_no_flag3_leaks_system_headers();
 
-        // Audit round 15: K&R param typedef shadow bypass mis-zeroinit
+        // K&R param typedef shadow bypass mis-zeroinit
         test_knr_param_typedef_shadow_bypass_zeroinit();
 
-	// Audit round 17: skip_one_stmt label-fallthrough for-init shadow bleed
+	// skip_one_stmt label-fallthrough for-init shadow bleed
 	test_skip_one_stmt_case_braced_for_init_shadow_bleed();
 	test_skip_one_stmt_default_braced_for_init_shadow_bleed();
 

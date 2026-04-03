@@ -1518,7 +1518,7 @@ void test_defer_stmt_expr_top_level_rejected(void) {
 }
 
 static void test_defer_stmt_expr_nested_block_last_stmt_corrupts(void) {
-	/* BUG (audit round 16): a nested block containing defer is the LAST
+	/* a nested block containing defer is the LAST
 	 * statement of a GNU statement expression.  handle_close_brace emits
 	 * defers in LIFO order after the last C expression, placing the defer
 	 * call after the intended return value.  For void defers (free/cleanup)
@@ -2524,7 +2524,7 @@ static void test_defer_shadow_inner_block_false_positive(void) {
 	prism_free(&r2);
 }
 
-// Audit round 30: in_generic() pierces SCOPE_BLOCK — defer leaks raw
+// in_generic() pierces SCOPE_BLOCK — defer leaks raw
 static void test_defer_in_generic_stmt_expr(void) {
 	printf("\n--- Defer inside _Generic stmt-expr ---\n");
 
@@ -2622,7 +2622,7 @@ static void test_defer_user_noreturn_no_warning(void) {
 	prism_free(&r2);
 }
 
-// Audit round 30: match_ch(prev, '*') misclassifies pointer dereference as
+// match_ch(prev, '*') misclassifies pointer dereference as
 // a local declaration inside nested defer blocks, bypassing shadow detection.
 static void test_defer_shadow_deref_bypass(void) {
 	printf("\n--- Defer shadow * dereference bypass ---\n");
@@ -2651,7 +2651,7 @@ static void test_defer_shadow_deref_bypass(void) {
 	prism_free(&r);
 }
 
-// Audit round 31: casts like (struct X *) inside nested defer blocks set
+// casts like (struct X *) inside nested defer blocks set
 // in_decl=true which persists past ')', causing subsequent identifier uses
 // to be misclassified as local declarations — shadow goes undetected.
 static void test_defer_shadow_cast_bypass(void) {
@@ -2683,7 +2683,7 @@ static void test_defer_shadow_cast_bypass(void) {
 	prism_free(&r);
 }
 
-// Audit round 30: comma-separated declarators in nested defer blocks cause
+// comma-separated declarators in nested defer blocks cause
 // false-positive shadow errors (prev is ',' which isn't a type keyword).
 static void test_defer_shadow_comma_decl_false_positive(void) {
 	printf("\n--- Defer shadow comma-decl false positive ---\n");
@@ -2713,7 +2713,7 @@ static void test_defer_shadow_comma_decl_false_positive(void) {
 	prism_free(&r);
 }
 
-// Audit round 29: brace_depth > 1 skip in check_defer_var_shadow causes
+// brace_depth > 1 skip in check_defer_var_shadow causes
 // captured variables used only inside nested blocks of the defer body to
 // be missed, allowing silent shadowing + wrong-variable binding.
 static void test_defer_shadow_depth_bypass(void) {
@@ -2983,13 +2983,13 @@ static void test_defer_enum_initializer_comma(void) {
 	prism_free(&r2);
 }
 
-// Audit round 38: double-nested block defer in stmt-expr bypasses detection.
+// double-nested block defer in stmt-expr bypasses detection.
 // The check at handle_close_brace only looks at scope_depth-2 for is_stmt_expr.
 // A double-nested block places the stmt_expr scope at depth-3, so the check
 // doesn't fire.  The defer cleanup call (void) becomes the last expression in
 // the statement expression → "void value not ignored as it ought to be".
 static void test_defer_stmt_expr_double_nested_block_bypass(void) {
-	printf("\n--- defer stmt-expr double-nested block bypass (audit round 38) ---\n");
+	printf("\n--- defer stmt-expr double-nested block bypass ---\n");
 
 	const char *code =
 	    "void cleanup(void);\n"
@@ -3013,7 +3013,7 @@ static void test_defer_stmt_expr_double_nested_block_bypass(void) {
 }
 
 static void test_c23_attr_computed_goto_defer_bypass(void) {
-	printf("\n--- C23 attributed computed goto defer bypass (audit round 40) ---\n");
+	printf("\n--- C23 attributed computed goto defer bypass ---\n");
 
 	/* BUG: goto [[gnu::nomerge]] *ptr; bypasses computed goto detection in
 	 * BOTH Phase 1D (has_computed_goto flag) and Pass 2 (handle_goto_keyword).
@@ -3117,7 +3117,7 @@ static void test_c23_attr_computed_goto_defer_bypass(void) {
  * which catches stmt-exprs at arbitrary nesting depth.
  */
 static void test_defer_stmt_expr_smuggled_in_args(void) {
-	printf("\n--- defer stmt-expr smuggled in function args (audit round 40) ---\n");
+	printf("\n--- defer stmt-expr smuggled in function args ---\n");
 
 	/* Case 1: return smuggled via function argument */
 	check_defer_transpile_rejects(
@@ -3196,11 +3196,11 @@ static void test_defer_stmt_expr_smuggled_in_args(void) {
 	    "return");
 }
 
-// Audit round 41: emit_expr_to_semicolon bypasses walk_balanced keyword dispatcher
+// emit_expr_to_semicolon bypasses walk_balanced keyword dispatcher
 // for statement expressions in return statements when outer defers are active.
 // defer/orelse/goto inside ({...}) in a return expr leak as raw text → compile error.
 static void test_stmt_expr_return_defer_bypass(void) {
-	printf("\n--- stmt-expr return defer bypass (audit round 41) ---\n");
+	printf("\n--- stmt-expr return defer bypass ---\n");
 
 	// Case 1: defer inside stmt-expr in return with outer defer active.
 	// emit_return_body → emit_expr_to_semicolon sees ({ and falls to naive
@@ -3287,11 +3287,11 @@ static void test_stmt_expr_return_defer_bypass(void) {
 	}
 }
 
-// Audit round 43: compound literal ctrl_state desync in braceless control flow.
-// Audit round 47: nested stmt-exprs in defer must not cause exponential blowup.
+// compound literal ctrl_state desync in braceless control flow.
+// nested stmt-exprs in defer must not cause exponential blowup.
 // defer_scan_hidden_stmt_exprs must skip past validated ({...}) groups.
 static void test_defer_nested_stmt_expr_perf(void) {
-	printf("\n--- nested stmt-expr in defer performance (audit round 47) ---\n");
+	printf("\n--- nested stmt-expr in defer performance ---\n");
 
 	// Generate deeply nested statement-expression code inside a defer block.
 	// Before the fix, depth 30 caused the transpiler to hang (>30s).
@@ -3317,7 +3317,7 @@ static void test_defer_nested_stmt_expr_perf(void) {
 // then treats `{` as the control body brace (clears ctrl_state.pending).
 // end_statement_after_semicolon never fires → for-init shadow not cleaned.
 static void test_compound_literal_ctrl_state_desync(void) {
-	printf("\n--- compound literal ctrl_state desync (audit round 43) ---\n");
+	printf("\n--- compound literal ctrl_state desync ---\n");
 
 	// Case 1: braceless for + compound literal body + defer shadow.
 	// The for-init `int i` shadows `i` captured by defer.
@@ -3376,7 +3376,7 @@ static void test_compound_literal_ctrl_state_desync(void) {
 
 #ifdef __GNUC__
 static void test_defer_shadow_stmt_expr_bypass(void) {
-	printf("\n--- Defer shadow stmt-expr init bypass (audit round 48) ---\n");
+	printf("\n--- Defer shadow stmt-expr init bypass ---\n");
 
 	// BUG: try_zero_init_decl returns NULL for single-declarator
 	// statement-expression initializers (int x = ({...});).  This bypasses
@@ -3402,7 +3402,7 @@ static void test_defer_shadow_stmt_expr_bypass(void) {
 }
 #endif
 
-// BUG55: orelse break inside a loop inside a defer body — Phase 1F correctly
+// orelse break inside a loop inside a defer body — Phase 1F correctly
 // permits break (in_loop context), but emit_deferred_orelse's non-bare path
 // only handles '{' blocks and errors on control-flow keywords like break.
 static void test_defer_orelse_break_in_loop(void) {
@@ -3418,11 +3418,11 @@ static void test_defer_orelse_break_in_loop(void) {
 	    "}\n";
 	PrismResult r = prism_transpile_source(code, "defer_orelse_break.c", prism_defaults());
 	CHECK(r.status == PRISM_OK,
-	      "BUG55: orelse break inside defer body loop must not be rejected");
+	      "orelse break inside defer body loop must not be rejected");
 	prism_free(&r);
 }
 
-// BUG58: orelse block-form in defer body emits verbatim — bypasses zero-init,
+// orelse block-form in defer body emits verbatim — bypasses zero-init,
 // raw-stripping, and nested orelse processing.
 static void test_defer_orelse_block_zeroinit_bypass(void) {
 	{
@@ -3442,10 +3442,10 @@ static void test_defer_orelse_block_zeroinit_bypass(void) {
 			bool has_zeroinit = strstr(r.output, "cleanup_buf = 0") != NULL ||
 					    strstr(r.output, "memset") != NULL;
 			CHECK(has_zeroinit,
-			      "BUG58a: defer orelse block must apply zero-init to decls");
+			      "defer orelse block must apply zero-init to decls");
 		} else {
 			CHECK(r.status == PRISM_OK,
-			      "BUG58a: defer orelse block transpilation must succeed");
+			      "defer orelse block transpilation must succeed");
 		}
 		prism_free(&r);
 	}
@@ -3467,21 +3467,21 @@ static void test_defer_orelse_block_zeroinit_bypass(void) {
 			// raw keyword itself should be stripped.  The variable name
 			// "raw_val" legitimately contains "raw" so check specifically.
 			CHECK(strstr(r.output, "raw int") == NULL,
-			      "BUG58b: defer orelse block must strip raw keyword");
+			      "defer orelse block must strip raw keyword");
 		} else {
 			CHECK(r.status == PRISM_OK,
-			      "BUG58b: defer orelse block transpilation must succeed");
+			      "defer orelse block transpilation must succeed");
 		}
 		prism_free(&r);
 	}
 }
 
-// BUG60: emit_goto_defer was missing the p1_goto_exits depth adjustment.
+// emit_goto_defer was missing the p1_goto_exits depth adjustment.
 // When goto in orelse crossed sibling scopes, defer cleanup was skipped.
 static void test_orelse_goto_defer_sibling_scope(void) {
-	printf("\n--- BUG60: orelse goto defer sibling scope ---\n");
+	printf("\n--- orelse goto defer sibling scope ---\n");
 
-	// BUG60a: goto in orelse crossing sibling scope with defer
+	// goto in orelse crossing sibling scope with defer
 	{
 		const char *code =
 		    "void cleanup_a(void);\n"
@@ -3494,18 +3494,18 @@ static void test_orelse_goto_defer_sibling_scope(void) {
 		    "    }\n"
 		    "    { end: (void)0; }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug60a.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK, "BUG60a: transpile succeeds");
+		PrismResult r = prism_transpile_source(code, "t60a.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "transpile succeeds");
 		if (r.output) {
 			// The goto in orelse must emit cleanup_a() before the goto
 			CHECK(strstr(r.output, "cleanup_a(); goto end") != NULL ||
 			      strstr(r.output, "cleanup_a();\ngoto end") != NULL,
-			      "BUG60a: goto in orelse must emit defer cleanup before jumping to sibling scope");
+			      "goto in orelse must emit defer cleanup before jumping to sibling scope");
 		}
 		prism_free(&r);
 	}
 
-	// BUG60b: const orelse goto crossing sibling scope
+	// const orelse goto crossing sibling scope
 	{
 		const char *code =
 		    "void cleanup_b(void);\n"
@@ -3518,22 +3518,22 @@ static void test_orelse_goto_defer_sibling_scope(void) {
 		    "    }\n"
 		    "    { done: (void)0; }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug60b.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK, "BUG60b: transpile succeeds");
+		PrismResult r = prism_transpile_source(code, "t60b.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "transpile succeeds");
 		if (r.output) {
 			CHECK(strstr(r.output, "cleanup_b(); goto done") != NULL ||
 			      strstr(r.output, "cleanup_b();\ngoto done") != NULL,
-			      "BUG60b: const orelse goto must emit defer cleanup for sibling scope");
+			      "const orelse goto must emit defer cleanup for sibling scope");
 		}
 		prism_free(&r);
 	}
 }
 
-// BUG61: Phase 1D defer detection false positives on variables/members named "defer"
+// Phase 1D defer detection false positives on variables/members named "defer"
 static void test_defer_name_false_positive(void) {
-	printf("\n--- BUG61: defer name false positive ---\n");
+	printf("\n--- defer name false positive ---\n");
 
-	// BUG61a: variable named "defer" with goto — must NOT get phantom "goto skips defer"
+	// variable named "defer" with goto — must NOT get phantom "goto skips defer"
 	{
 		const char *code =
 		    "void f(void) {\n"
@@ -3543,13 +3543,13 @@ static void test_defer_name_false_positive(void) {
 		    "skip:\n"
 		    "    (void)defer;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug61a.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t61a.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG61a: variable named 'defer' must not create phantom P1K_DEFER");
+		         "variable named 'defer' must not create phantom P1K_DEFER");
 		prism_free(&r);
 	}
 
-	// BUG61b: struct member ".defer" with goto — must NOT get phantom "goto skips defer"
+	// struct member ".defer" with goto — must NOT get phantom "goto skips defer"
 	{
 		const char *code =
 		    "struct Cfg { int defer; int val; };\n"
@@ -3561,13 +3561,13 @@ static void test_defer_name_false_positive(void) {
 		    "skip:\n"
 		    "    (void)x;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug61b.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t61b.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG61b: struct member '.defer' must not create phantom P1K_DEFER");
+		         "struct member '.defer' must not create phantom P1K_DEFER");
 		prism_free(&r);
 	}
 
-	// BUG61c: arrow member "->defer" with goto
+	// arrow member "->defer" with goto
 	{
 		const char *code =
 		    "struct Kf { int defer; };\n"
@@ -3580,13 +3580,13 @@ static void test_defer_name_false_positive(void) {
 		    "skip:\n"
 		    "    (void)x;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug61c.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t61c.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG61c: arrow member '->defer' must not create phantom P1K_DEFER");
+		         "arrow member '->defer' must not create phantom P1K_DEFER");
 		prism_free(&r);
 	}
 
-	// BUG61d: enum constant named "defer" with goto
+	// enum constant named "defer" with goto
 	{
 		const char *code =
 		    "enum Actions { defer = 1, cancel = 2 };\n"
@@ -3597,13 +3597,13 @@ static void test_defer_name_false_positive(void) {
 		    "skip:\n"
 		    "    (void)x;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug61d.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t61d.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG61d: enum constant named 'defer' must not create phantom P1K_DEFER");
+		         "enum constant named 'defer' must not create phantom P1K_DEFER");
 		prism_free(&r);
 	}
 
-	// BUG61e: member "defer" in setjmp function — must NOT false-trigger taint error
+	// member "defer" in setjmp function — must NOT false-trigger taint error
 	{
 		const char *code =
 		    "#include <setjmp.h>\n"
@@ -3615,18 +3615,18 @@ static void test_defer_name_false_positive(void) {
 		    "    int x = kf.defer + 5;\n"
 		    "    (void)x;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug61e.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t61e.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG61e: '.defer' in setjmp function must not trigger taint error");
+		         "'.defer' in setjmp function must not trigger taint error");
 		prism_free(&r);
 	}
 }
 
-// BUG62: check_defer_var_shadow state machine doesn't reset in_decl on '='.
+// check_defer_var_shadow state machine doesn't reset in_decl on '='.
 // Variables on the RHS of an assignment inside a defer body are misclassified
 // as local declarations, hiding captured references from the shadow tracker.
 static void test_defer_shadow_rhs_assignment_bypass(void) {
-	printf("\n--- BUG62: defer shadow RHS assignment bypass ---\n");
+	printf("\n--- defer shadow RHS assignment bypass ---\n");
 
 	// Sub-test 1: ptr on RHS of 'void *local = ptr;' in defer body.
 	// Outer block redeclares ptr — must be caught as shadow.
@@ -3649,11 +3649,11 @@ static void test_defer_shadow_rhs_assignment_bypass(void) {
 		    "    }\n"
 		    "    return 0;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug62a.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t62a.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG62a: ptr on RHS of assignment in defer body must be detected as captured");
+		      "ptr on RHS of assignment in defer body must be detected as captured");
 		CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
-		      "BUG62a: error message mentions 'shadows'");
+		      "error message mentions 'shadows'");
 		prism_free(&r);
 	}
 
@@ -3675,9 +3675,9 @@ static void test_defer_shadow_rhs_assignment_bypass(void) {
 		    "        return;\n"
 		    "    }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug62b.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t62b.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG62b: 'int a = 1, b = 2;' in nested defer block must not false-positive");
+		         "'int a = 1, b = 2;' in nested defer block must not false-positive");
 		prism_free(&r);
 	}
 
@@ -3697,20 +3697,20 @@ static void test_defer_shadow_rhs_assignment_bypass(void) {
 		    "    }\n"
 		    "    return 0;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug62c.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t62c.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG62c: bare ptr ref in defer body must still be caught");
+		      "bare ptr ref in defer body must still be caught");
 		prism_free(&r);
 	}
 }
 
-// BUG64: C23 attribute [[__noreturn__]] and [[gnu::__noreturn__]] are not
+// C23 attribute [[__noreturn__]] and [[gnu::__noreturn__]] are not
 // recognized by the tokenizer's noreturn scanner.  The scanner only checks
 // "noreturn" and "_Noreturn" inside [[...]], missing the double-underscore
 // GNU convention.  Functions with these attributes are silently accepted
 // when called with active defers, bypassing the noreturn warning.
 static void test_c23_attr_noreturn_dunder_blindspot(void) {
-	printf("\n--- BUG64: C23 attr [[__noreturn__]] blind spot ---\n");
+	printf("\n--- C23 attr [[__noreturn__]] blind spot ---\n");
 
 	// Sub-test 1: [[__noreturn__]] (non-namespaced, double-underscore)
 	{
@@ -3725,7 +3725,7 @@ static void test_c23_attr_noreturn_dunder_blindspot(void) {
 		pipe(pipefd);
 		int saved = dup(STDERR_FILENO);
 		dup2(pipefd[1], STDERR_FILENO);
-		PrismResult r = prism_transpile_source(code, "bug64a.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t64a.c", prism_defaults());
 		fflush(stderr);
 		dup2(saved, STDERR_FILENO);
 		close(saved);
@@ -3734,9 +3734,9 @@ static void test_c23_attr_noreturn_dunder_blindspot(void) {
 		int n = read(pipefd[0], buf, sizeof(buf) - 1);
 		buf[n > 0 ? n : 0] = '\0';
 		close(pipefd[0]);
-		CHECK(r.status == PRISM_OK, "BUG64a: transpile succeeds");
+		CHECK(r.status == PRISM_OK, "transpile succeeds");
 		CHECK(n > 0 && strstr(buf, "warning") != NULL,
-		      "BUG64a: [[__noreturn__]] must produce defer-bypass warning");
+		      "[[__noreturn__]] must produce defer-bypass warning");
 		prism_free(&r);
 	}
 
@@ -3753,7 +3753,7 @@ static void test_c23_attr_noreturn_dunder_blindspot(void) {
 		pipe(pipefd);
 		int saved = dup(STDERR_FILENO);
 		dup2(pipefd[1], STDERR_FILENO);
-		PrismResult r = prism_transpile_source(code, "bug64b.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t64b.c", prism_defaults());
 		fflush(stderr);
 		dup2(saved, STDERR_FILENO);
 		close(saved);
@@ -3762,9 +3762,9 @@ static void test_c23_attr_noreturn_dunder_blindspot(void) {
 		int n = read(pipefd[0], buf, sizeof(buf) - 1);
 		buf[n > 0 ? n : 0] = '\0';
 		close(pipefd[0]);
-		CHECK(r.status == PRISM_OK, "BUG64b: transpile succeeds");
+		CHECK(r.status == PRISM_OK, "transpile succeeds");
 		CHECK(n > 0 && strstr(buf, "warning") != NULL,
-		      "BUG64b: [[gnu::__noreturn__]] must produce defer-bypass warning");
+		      "[[gnu::__noreturn__]] must produce defer-bypass warning");
 		prism_free(&r);
 	}
 
@@ -3781,7 +3781,7 @@ static void test_c23_attr_noreturn_dunder_blindspot(void) {
 		pipe(pipefd);
 		int saved = dup(STDERR_FILENO);
 		dup2(pipefd[1], STDERR_FILENO);
-		PrismResult r = prism_transpile_source(code, "bug64c.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t64c.c", prism_defaults());
 		fflush(stderr);
 		dup2(saved, STDERR_FILENO);
 		close(saved);
@@ -3790,19 +3790,19 @@ static void test_c23_attr_noreturn_dunder_blindspot(void) {
 		int n = read(pipefd[0], buf, sizeof(buf) - 1);
 		buf[n > 0 ? n : 0] = '\0';
 		close(pipefd[0]);
-		CHECK(r.status == PRISM_OK, "BUG64c: transpile succeeds");
+		CHECK(r.status == PRISM_OK, "transpile succeeds");
 		CHECK(n > 0 && strstr(buf, "warning") != NULL,
-		      "BUG64c: [[noreturn]] must still produce warning (regression)");
+		      "[[noreturn]] must still produce warning (regression)");
 		prism_free(&r);
 	}
 }
 
-// BUG66: GNU __attribute__((cold, __noreturn__)) list truncation.
+// GNU __attribute__((cold, __noreturn__)) list truncation.
 // The scanner only checked the first attribute after (( — missed noreturn
 // when preceded by other attributes in a comma-separated list.
 // Also covers __declspec(__noreturn__) blind spot.
 static void test_gnu_attr_noreturn_list_blindspot(void) {
-	printf("\n--- BUG66: GNU attr list noreturn blind spot ---\n");
+	printf("\n--- GNU attr list noreturn blind spot ---\n");
 
 	// Sub-test 1: __attribute__((cold, __noreturn__)) — noreturn not first
 	{
@@ -3817,7 +3817,7 @@ static void test_gnu_attr_noreturn_list_blindspot(void) {
 		pipe(pipefd);
 		int saved = dup(STDERR_FILENO);
 		dup2(pipefd[1], STDERR_FILENO);
-		PrismResult r = prism_transpile_source(code, "bug66a.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t66a.c", prism_defaults());
 		fflush(stderr);
 		dup2(saved, STDERR_FILENO);
 		close(saved);
@@ -3826,9 +3826,9 @@ static void test_gnu_attr_noreturn_list_blindspot(void) {
 		int n = read(pipefd[0], buf, sizeof(buf) - 1);
 		buf[n > 0 ? n : 0] = '\0';
 		close(pipefd[0]);
-		CHECK(r.status == PRISM_OK, "BUG66a: transpile succeeds");
+		CHECK(r.status == PRISM_OK, "transpile succeeds");
 		CHECK(n > 0 && strstr(buf, "warning") != NULL,
-		      "BUG66a: __attribute__((cold, __noreturn__)) must warn");
+		      "__attribute__((cold, __noreturn__)) must warn");
 		prism_free(&r);
 	}
 
@@ -3845,7 +3845,7 @@ static void test_gnu_attr_noreturn_list_blindspot(void) {
 		pipe(pipefd);
 		int saved = dup(STDERR_FILENO);
 		dup2(pipefd[1], STDERR_FILENO);
-		PrismResult r = prism_transpile_source(code, "bug66b.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t66b.c", prism_defaults());
 		fflush(stderr);
 		dup2(saved, STDERR_FILENO);
 		close(saved);
@@ -3854,9 +3854,9 @@ static void test_gnu_attr_noreturn_list_blindspot(void) {
 		int n = read(pipefd[0], buf, sizeof(buf) - 1);
 		buf[n > 0 ? n : 0] = '\0';
 		close(pipefd[0]);
-		CHECK(r.status == PRISM_OK, "BUG66b: transpile succeeds");
+		CHECK(r.status == PRISM_OK, "transpile succeeds");
 		CHECK(n > 0 && strstr(buf, "warning") != NULL,
-		      "BUG66b: __attribute__((always_inline, noreturn)) must warn");
+		      "__attribute__((always_inline, noreturn)) must warn");
 		prism_free(&r);
 	}
 
@@ -3873,7 +3873,7 @@ static void test_gnu_attr_noreturn_list_blindspot(void) {
 		pipe(pipefd);
 		int saved = dup(STDERR_FILENO);
 		dup2(pipefd[1], STDERR_FILENO);
-		PrismResult r = prism_transpile_source(code, "bug66c.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t66c.c", prism_defaults());
 		fflush(stderr);
 		dup2(saved, STDERR_FILENO);
 		close(saved);
@@ -3882,9 +3882,9 @@ static void test_gnu_attr_noreturn_list_blindspot(void) {
 		int n = read(pipefd[0], buf, sizeof(buf) - 1);
 		buf[n > 0 ? n : 0] = '\0';
 		close(pipefd[0]);
-		CHECK(r.status == PRISM_OK, "BUG66c: transpile succeeds");
+		CHECK(r.status == PRISM_OK, "transpile succeeds");
 		CHECK(n > 0 && strstr(buf, "warning") != NULL,
-		      "BUG66c: __attribute__((noreturn, cold)) must still warn");
+		      "__attribute__((noreturn, cold)) must still warn");
 		prism_free(&r);
 	}
 
@@ -3901,7 +3901,7 @@ static void test_gnu_attr_noreturn_list_blindspot(void) {
 		pipe(pipefd);
 		int saved = dup(STDERR_FILENO);
 		dup2(pipefd[1], STDERR_FILENO);
-		PrismResult r = prism_transpile_source(code, "bug66d.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t66d.c", prism_defaults());
 		fflush(stderr);
 		dup2(saved, STDERR_FILENO);
 		close(saved);
@@ -3910,15 +3910,15 @@ static void test_gnu_attr_noreturn_list_blindspot(void) {
 		int n = read(pipefd[0], buf, sizeof(buf) - 1);
 		buf[n > 0 ? n : 0] = '\0';
 		close(pipefd[0]);
-		CHECK(r.status == PRISM_OK, "BUG66d: transpile succeeds");
+		CHECK(r.status == PRISM_OK, "transpile succeeds");
 		CHECK(n > 0 && strstr(buf, "warning") != NULL,
-		      "BUG66d: __declspec(__noreturn__) must produce warning");
+		      "__declspec(__noreturn__) must produce warning");
 		prism_free(&r);
 	}
 }
 
 static void test_defer_shadow_brace_init_comma_bypass(void) {
-	printf("\n--- BUG67: brace-initializer comma bypass in defer shadow check ---\n");
+	printf("\n--- brace-initializer comma bypass in defer shadow check ---\n");
 
 	// Sub-test 1: brace initializer at depth > 1 referencing captured var.
 	// The comma inside { NULL, ptr } must NOT re-enter declaration context.
@@ -3940,11 +3940,11 @@ static void test_defer_shadow_brace_init_comma_bypass(void) {
 		    "        return;\n"
 		    "    }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug67a.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t67a.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG67a: ptr in brace-init at depth > 1 must be detected as captured");
+		      "ptr in brace-init at depth > 1 must be detected as captured");
 		CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
-		      "BUG67a: error message mentions 'shadows'");
+		      "error message mentions 'shadows'");
 		prism_free(&r);
 	}
 
@@ -3968,9 +3968,9 @@ static void test_defer_shadow_brace_init_comma_bypass(void) {
 		    "        return;\n"
 		    "    }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug67b.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t67b.c", prism_defaults());
 		CHECK(r.status == PRISM_OK,
-		      "BUG67b: multi-decl comma at same depth must still work (ptr locally declared)");
+		      "multi-decl comma at same depth must still work (ptr locally declared)");
 		prism_free(&r);
 	}
 
@@ -3994,16 +3994,16 @@ static void test_defer_shadow_brace_init_comma_bypass(void) {
 		    "        return;\n"
 		    "    }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug67c.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t67c.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG67c: ptr in nested struct init must be detected as captured");
+		      "ptr in nested struct init must be detected as captured");
 		CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
-		      "BUG67c: error message mentions 'shadows'");
+		      "error message mentions 'shadows'");
 		prism_free(&r);
 	}
 }
 
-// BUG71: (noreturn_fn)() with active defers skips warning because
+// (noreturn_fn)() with active defers skips warning because
 // the TT_NORETURN_FN lookahead required tok_next to be '('.
 static void test_paren_noreturn_warning_bypass(void) {
 	// Sub-test 1: (fatal_panic)() should produce the same warning as fatal_panic()
@@ -4019,7 +4019,7 @@ static void test_paren_noreturn_warning_bypass(void) {
 		pipe(pipefd);
 		int saved = dup(STDERR_FILENO);
 		dup2(pipefd[1], STDERR_FILENO);
-		PrismResult r = prism_transpile_source(code, "bug71a.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t71a.c", prism_defaults());
 		fflush(stderr);
 		dup2(saved, STDERR_FILENO);
 		close(saved);
@@ -4028,9 +4028,9 @@ static void test_paren_noreturn_warning_bypass(void) {
 		int n = read(pipefd[0], buf, sizeof(buf) - 1);
 		buf[n > 0 ? n : 0] = '\0';
 		close(pipefd[0]);
-		CHECK(r.status == PRISM_OK, "BUG71a: transpiles OK");
+		CHECK(r.status == PRISM_OK, "transpiles OK");
 		CHECK(n > 0 && strstr(buf, "warning") != NULL,
-		      "BUG71a: (fatal_panic)() must warn about defers not running");
+		      "(fatal_panic)() must warn about defers not running");
 		prism_free(&r);
 	}
 
@@ -4047,7 +4047,7 @@ static void test_paren_noreturn_warning_bypass(void) {
 		pipe(pipefd);
 		int saved = dup(STDERR_FILENO);
 		dup2(pipefd[1], STDERR_FILENO);
-		PrismResult r = prism_transpile_source(code, "bug71b.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t71b.c", prism_defaults());
 		fflush(stderr);
 		dup2(saved, STDERR_FILENO);
 		close(saved);
@@ -4056,14 +4056,14 @@ static void test_paren_noreturn_warning_bypass(void) {
 		int n = read(pipefd[0], buf, sizeof(buf) - 1);
 		buf[n > 0 ? n : 0] = '\0';
 		close(pipefd[0]);
-		CHECK(r.status == PRISM_OK, "BUG71b: transpiles OK");
+		CHECK(r.status == PRISM_OK, "transpiles OK");
 		CHECK(n > 0 && strstr(buf, "warning") != NULL,
-		      "BUG71b: fatal_panic() must still warn (regression guard)");
+		      "fatal_panic() must still warn (regression guard)");
 		prism_free(&r);
 	}
 }
 
-// BUG71b: (setjmp_wrapper)() bypasses transitive taint propagation because
+// (setjmp_wrapper)() bypasses transitive taint propagation because
 // the ident( check requires tok_next to be '(' — ')' from the parens fails.
 static void test_paren_setjmp_wrapper_taint_bypass(void) {
 	// Sub-test 1: (my_setjmp_wrapper)() must taint the caller
@@ -4079,9 +4079,9 @@ static void test_paren_setjmp_wrapper_taint_bypass(void) {
 		    "    defer cleanup();\n"
 		    "    (my_setjmp_wrapper)(buf);\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug71c.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t71c.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG71c: defer in function calling (setjmp_wrapper)() must be rejected");
+		      "defer in function calling (setjmp_wrapper)() must be rejected");
 		prism_free(&r);
 	}
 
@@ -4098,14 +4098,14 @@ static void test_paren_setjmp_wrapper_taint_bypass(void) {
 		    "    defer cleanup();\n"
 		    "    my_setjmp_wrapper(buf);\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug71d.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t71d.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG71d: defer in function calling setjmp_wrapper() must be rejected (regression)");
+		      "defer in function calling setjmp_wrapper() must be rejected (regression)");
 		prism_free(&r);
 	}
 }
 
-// BUG72: typedef enum { name = 0 } wrapping bypasses defer shadow check.
+// typedef enum { name = 0 } wrapping bypasses defer shadow check.
 // parse_type_specifier skips the enum body with skip_balanced, so
 // check_enum_typedef_defer_shadow's TT_TYPEDEF path never sees the constants.
 static void test_defer_shadow_typedef_enum_bypass(void) {
@@ -4122,11 +4122,11 @@ static void test_defer_shadow_typedef_enum_bypass(void) {
 		    "        return;\n"
 		    "    }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug72a.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t72a.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG72: typedef enum constant must not silently shadow defer-captured var");
+		      "typedef enum constant must not silently shadow defer-captured var");
 		CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
-		      "BUG72: error message mentions 'shadows'");
+		      "error message mentions 'shadows'");
 		prism_free(&r);
 	}
 
@@ -4143,19 +4143,19 @@ static void test_defer_shadow_typedef_enum_bypass(void) {
 		    "        return;\n"
 		    "    }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug72b.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t72b.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG72: bare enum constant shadow must still be caught (regression)");
+		      "bare enum constant shadow must still be caught (regression)");
 		prism_free(&r);
 	}
 }
 
-// BUG73: validate_defer_statement case/default scanner lacks ternary depth
+// validate_defer_statement case/default scanner lacks ternary depth
 // tracking: case EXPR ? X : Y: allows the ternary ':' to be misidentified
 // as the case label colon, causing the real body (after the label ':') to
 // escape Phase 1F validation. return/goto/break silently emitted.
 static void test_defer_case_ternary_desync(void) {
-	printf("\n--- BUG73: case ternary desync in validate_defer_statement ---\n");
+	printf("\n--- case ternary desync in validate_defer_statement ---\n");
 
 	// Sub-test 1: return after ternary case label must be caught
 	{
@@ -4168,11 +4168,11 @@ static void test_defer_case_ternary_desync(void) {
 		    "        }\n"
 		    "    }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug73a.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t73a.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG73: return after ternary case label must be caught by Phase 1F");
+		      "return after ternary case label must be caught by Phase 1F");
 		CHECK(r.error_msg && strstr(r.error_msg, "return"),
-		      "BUG73: error mentions 'return'");
+		      "error mentions 'return'");
 		prism_free(&r);
 	}
 
@@ -4188,9 +4188,9 @@ static void test_defer_case_ternary_desync(void) {
 		    "    }\n"
 		    "    end: ;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug73b.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t73b.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG73: goto after parenthesized ternary case must be caught");
+		      "goto after parenthesized ternary case must be caught");
 		prism_free(&r);
 	}
 
@@ -4208,9 +4208,9 @@ static void test_defer_case_ternary_desync(void) {
 		    "    }\n"
 		    "}\n"
 		    "int main(void) { f(42); return 0; }\n";
-		PrismResult r = prism_transpile_source(code, "bug73c.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t73c.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG73: valid ternary case without control flow must succeed");
+		         "valid ternary case without control flow must succeed");
 		prism_free(&r);
 	}
 
@@ -4225,19 +4225,19 @@ static void test_defer_case_ternary_desync(void) {
 		    "        }\n"
 		    "    }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug73d.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t73d.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG73: return after nested ternary case must be caught");
+		      "return after nested ternary case must be caught");
 		prism_free(&r);
 	}
 }
 
-// BUG74: check_defer_var_shadow false positive on for-init declarations.
+// check_defer_var_shadow false positive on for-init declarations.
 // for(int x = ...) inside a defer body at paren_depth > 0 was treated as a
 // captured reference instead of a local declaration, causing spurious shadow
 // errors when an outer variable with the same name was declared after the defer.
 static void test_defer_same_block_shadow_hijack(void) {
-	printf("\n--- BUG75: same-block defer shadow hijack ---\n");
+	printf("\n--- same-block defer shadow hijack ---\n");
 
 	// Sub-test 1: same-block shadow — must be rejected (silent miscompilation)
 	{
@@ -4249,11 +4249,11 @@ static void test_defer_same_block_shadow_hijack(void) {
 		    "    int global_x = 2;\n"
 		    "    (void)global_x;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug75a.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t75a.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG75a: same-block defer shadow must be rejected");
+		      "same-block defer shadow must be rejected");
 		CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
-		      "BUG75a: error mentions 'shadows'");
+		      "error mentions 'shadows'");
 		prism_free(&r);
 	}
 
@@ -4268,9 +4268,9 @@ static void test_defer_same_block_shadow_hijack(void) {
 		    "    (void)global_x;\n"
 		    "    return 0;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug75b.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t75b.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG75b: same-block shadow with return must be rejected");
+		      "same-block shadow with return must be rejected");
 		prism_free(&r);
 	}
 
@@ -4287,9 +4287,9 @@ static void test_defer_same_block_shadow_hijack(void) {
 		    "        (void)global_x;\n"
 		    "    }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug75c.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t75c.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG75c: inner-block shadow without exit must be accepted");
+		         "inner-block shadow without exit must be accepted");
 		prism_free(&r);
 	}
 
@@ -4303,15 +4303,15 @@ static void test_defer_same_block_shadow_hijack(void) {
 		    "    int global_x = 2;\n"
 		    "    (void)global_x;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug75d.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t75d.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG75d: same-block block-form defer shadow must be rejected");
+		      "same-block block-form defer shadow must be rejected");
 		prism_free(&r);
 	}
 }
 
 static void test_defer_shadow_for_init_false_positive(void) {
-	printf("\n--- BUG74: defer shadow for-init false positive ---\n");
+	printf("\n--- defer shadow for-init false positive ---\n");
 
 	// Sub-test 1: for-init in defer body — must NOT false-positive
 	{
@@ -4325,9 +4325,9 @@ static void test_defer_shadow_for_init_false_positive(void) {
 		    "    }\n"
 		    "    { int x = 99; (void)x; return 0; }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug74a.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t74a.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG74: for-init in defer body must not false-positive on shadow");
+		         "for-init in defer body must not false-positive on shadow");
 		prism_free(&r);
 	}
 
@@ -4342,9 +4342,9 @@ static void test_defer_shadow_for_init_false_positive(void) {
 		    "    }\n"
 		    "    { int x = 99; (void)x; return 0; }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug74b.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t74b.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG74: braceless for body must not false-positive");
+		         "braceless for body must not false-positive");
 		prism_free(&r);
 	}
 
@@ -4362,9 +4362,9 @@ static void test_defer_shadow_for_init_false_positive(void) {
 		    "    }\n"
 		    "    { int x = 99; (void)x; return 0; }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug74c.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t74c.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "BUG74: nested for-init same name must not false-positive");
+		         "nested for-init same name must not false-positive");
 		prism_free(&r);
 	}
 
@@ -4382,11 +4382,11 @@ static void test_defer_shadow_for_init_false_positive(void) {
 		    "    }\n"
 		    "    { int x = 99; (void)x; return 0; }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug74d.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t74d.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG74: genuine capture after for loop must still be caught");
+		      "genuine capture after for loop must still be caught");
 		CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
-		      "BUG74: error mentions 'shadows'");
+		      "error mentions 'shadows'");
 		prism_free(&r);
 	}
 
@@ -4403,11 +4403,11 @@ static void test_defer_shadow_for_init_false_positive(void) {
 		    "    }\n"
 		    "    { int y = 99; (void)y; return 0; }\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(code, "bug74e.c", prism_defaults());
+		PrismResult r = prism_transpile_source(code, "t74e.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
-		      "BUG74: genuine capture inside for body must still be caught");
+		      "genuine capture inside for body must still be caught");
 		CHECK(r.error_msg && strstr(r.error_msg, "shadows"),
-		      "BUG74: error mentions 'shadows'");
+		      "error mentions 'shadows'");
 		prism_free(&r);
 	}
 }
@@ -4538,7 +4538,7 @@ static void test_defer_shadow_braceless_for_ifelse(void) {
 	}
 }
 
-// BUG78: scope_depth/block_depth type confusion in emit_defers_ex.
+// scope_depth/block_depth type confusion in emit_defers_ex.
 // When non-SCOPE_BLOCK entries (SCOPE_CTRL_PAREN) are on the scope_stack,
 // the scope_stack index `d` diverges from block_depth. The old code compared
 // `d < stop_depth` where stop_depth is in block_depth units, causing
@@ -4562,16 +4562,16 @@ static void test_scope_depth_overunwind(void) {
 		    "        (void)0;\n"
 		    "    }\n"
 		    "}\n",
-		    "bug78a.c", prism_defaults());
+		    "t78a.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "bug78-overunwind: transpiles OK");
+		         "transpiles OK");
 		if (r.status == PRISM_OK && r.output) {
 			/* The goto should NOT be wrapped with defer cleanup
 			 * because it stays within the same scope. Count
 			 * occurrences of "counter++" — should be exactly 1
 			 * (the scope-exit defer), not 2 (goto + scope-exit). */
 			const char *fn = strstr(r.output, "void f(");
-			CHECK(fn != NULL, "bug78-overunwind: function found");
+			CHECK(fn != NULL, "function found");
 			if (fn) {
 				int count = 0;
 				const char *p = fn;
@@ -4580,7 +4580,7 @@ static void test_scope_depth_overunwind(void) {
 					p += 9;
 				}
 				CHECK_EQ(count, 1,
-				         "bug78-overunwind: defer fires once (not over-unwound)");
+				         "defer fires once (not over-unwound)");
 			}
 		}
 		prism_free(&r);
@@ -4602,12 +4602,12 @@ static void test_scope_depth_overunwind(void) {
 		    "        (void)0;\n"
 		    "    }\n"
 		    "}\n",
-		    "bug78b.c", prism_defaults());
+		    "t78b.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "bug78-backward: transpiles OK");
+		         "transpiles OK");
 		if (r.status == PRISM_OK && r.output) {
 			const char *fn = strstr(r.output, "void f(");
-			CHECK(fn != NULL, "bug78-backward: function found");
+			CHECK(fn != NULL, "function found");
 			if (fn) {
 				int count = 0;
 				const char *p = fn;
@@ -4616,14 +4616,14 @@ static void test_scope_depth_overunwind(void) {
 					p += 9;
 				}
 				CHECK_EQ(count, 1,
-				         "bug78-backward: defer fires once (not over-unwound)");
+				         "defer fires once (not over-unwound)");
 			}
 		}
 		prism_free(&r);
 	}
 }
 
-// BUG79: emit_range_no_prep flat-loops tokens without routing stmt-exprs
+// emit_range_no_prep flat-loops tokens without routing stmt-exprs
 // through walk_balanced. A goto inside a stmt-expr in an orelse LHS
 // bypasses defer cleanup.
 static void test_emit_range_no_prep_stmtexpr_defer(void) {
@@ -4640,30 +4640,30 @@ static void test_emit_range_no_prep_stmtexpr_defer(void) {
 	    "skip:\n"
 	    "    return;\n"
 	    "}\n",
-	    "bug79.c", prism_defaults());
+	    "t79.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK,
-	         "bug79-lhs-stmtexpr: transpiles OK");
+	         "transpiles OK");
 	if (r.status == PRISM_OK && r.output) {
 		/* The goto in the LHS stmt-expr must have defer cleanup.
 		 * Find "goto skip" and check that "counter++" appears before it */
 		const char *fn = strstr(r.output, "void f(");
-		CHECK(fn != NULL, "bug79-lhs-stmtexpr: function found");
+		CHECK(fn != NULL, "function found");
 		if (fn) {
 			const char *gs = strstr(fn, "goto skip");
 			const char *cleanup = strstr(fn, "counter++");
-			CHECK(gs != NULL, "bug79-lhs-stmtexpr: goto found");
+			CHECK(gs != NULL, "goto found");
 			CHECK(cleanup != NULL && cleanup < gs,
-			      "bug79-lhs-stmtexpr: defer cleanup before goto");
+			      "defer cleanup before goto");
 		}
 	}
 	prism_free(&r);
 }
 
-// BUG81: emit_deferred_range did not track control-flow keywords,
+// emit_deferred_range did not track control-flow keywords,
 // so at_stmt_start was false for braceless if/else/for/while/do bodies
 // inside defer blocks.  orelse was emitted verbatim; zero-init was skipped.
 static void test_defer_braceless_ctrl_orelse(void) {
-	printf("\n--- BUG81: braceless ctrl-flow orelse/zeroinit in defer ---\n");
+	printf("\n--- braceless ctrl-flow orelse/zeroinit in defer ---\n");
 	// orelse in braceless if body inside defer
 	{
 		PrismResult r = prism_transpile_source(
@@ -4678,14 +4678,14 @@ static void test_defer_braceless_ctrl_orelse(void) {
 		    "    }\n"
 		    "    return result;\n"
 		    "}\n",
-		    "bug81_if.c", prism_defaults());
+		    "t81_if.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "bug81-braceless-if: transpiles OK");
+		         "transpiles OK");
 		if (r.status == PRISM_OK && r.output) {
 			CHECK(strstr(r.output, "orelse") == NULL,
-			      "bug81-braceless-if: no literal 'orelse' in output");
+			      "no literal 'orelse' in output");
 			CHECK(strstr(r.output, "__prism_oe_") != NULL,
-			      "bug81-braceless-if: orelse temp generated");
+			      "orelse temp generated");
 		}
 		prism_free(&r);
 	}
@@ -4703,12 +4703,12 @@ static void test_defer_braceless_ctrl_orelse(void) {
 		    "    }\n"
 		    "    return result;\n"
 		    "}\n",
-		    "bug81_else.c", prism_defaults());
+		    "t81_else.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "bug81-braceless-else: transpiles OK");
+		         "transpiles OK");
 		if (r.status == PRISM_OK && r.output) {
 			CHECK(strstr(r.output, "orelse") == NULL,
-			      "bug81-braceless-else: no literal 'orelse' in output");
+			      "no literal 'orelse' in output");
 		}
 		prism_free(&r);
 	}
@@ -4726,12 +4726,12 @@ static void test_defer_braceless_ctrl_orelse(void) {
 		    "    }\n"
 		    "    return result;\n"
 		    "}\n",
-		    "bug81_for.c", prism_defaults());
+		    "t81_for.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "bug81-braceless-for: transpiles OK");
+		         "transpiles OK");
 		if (r.status == PRISM_OK && r.output) {
 			CHECK(strstr(r.output, "orelse") == NULL,
-			      "bug81-braceless-for: no literal 'orelse' in output");
+			      "no literal 'orelse' in output");
 		}
 		prism_free(&r);
 	}
@@ -4750,18 +4750,18 @@ static void test_defer_braceless_ctrl_orelse(void) {
 		    "    }\n"
 		    "    return result;\n"
 		    "}\n",
-		    "bug81_do.c", prism_defaults());
+		    "t81_do.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "bug81-braceless-do: transpiles OK");
+		         "transpiles OK");
 		if (r.status == PRISM_OK && r.output) {
 			CHECK(strstr(r.output, "orelse") == NULL,
-			      "bug81-braceless-do: no literal 'orelse' in output");
+			      "no literal 'orelse' in output");
 		}
 		prism_free(&r);
 	}
 }
 
-// BUG87: shadowed 'defer' (variable/typedef named 'defer') suppresses block form
+// shadowed 'defer' (variable/typedef named 'defer') suppresses block form
 static void test_defer_shadow_variable_block(void) {
 	// A local variable named 'defer' should not disable block form 'defer {}'
 	const char *code =
@@ -4799,7 +4799,7 @@ static void test_defer_shadow_typedef_block(void) {
 	prism_free(&r);
 }
 
-// BUG88: check_defer_var_shadow false positive inside GNU statement expressions.
+// check_defer_var_shadow false positive inside GNU statement expressions.
 // The scanner's paren_depth==0 guard prevents it from recognizing declarations
 // inside ({...}), so macro temporaries are falsely flagged as outer-scope captures.
 static void test_defer_shadow_stmt_expr_local_false_positive(void) {
@@ -4853,10 +4853,10 @@ static void test_defer_shadow_stmt_expr_local_false_positive(void) {
 	}
 }
 
-// BUG90: braceless inner switch caused find_switch_scope to leak to outer switch,
+// braceless inner switch caused find_switch_scope to leak to outer switch,
 // resetting defer_count and silently wiping registered defers.
 static void test_braceless_switch_defer_wipe(void) {
-	printf("\n--- Braceless Switch Defer Wipe (BUG90) ---\n");
+	printf("\n--- Braceless Switch Defer Wipe ---\n");
 
 	// Defer in outer switch must survive a braceless inner switch
 	{
@@ -5000,7 +5000,7 @@ void run_defer_tests(void) {
 	test_defer_stmt_expr_return_bypass();
 	test_defer_stmt_expr_goto_bypass();
 	test_defer_computed_goto_rejected();
-	// Audit round 14: computed-goto forward-into-scope CFG bypass
+	// computed-goto forward-into-scope CFG bypass
 	test_computed_goto_forward_into_deferred_scope();
 	test_defer_asm_rejected();
 	);
@@ -5031,108 +5031,108 @@ void run_defer_tests(void) {
 	);
 	test_defer_fnptr_return_type_overwrite();
 
-	// Audit round 9: hash table saturation CFG bypass
+	// hash table saturation CFG bypass
 	test_cfg_hash_table_saturation_bypass();
 
-	// Audit round 12: braceless switch false positive
+	// braceless switch false positive
 	test_braceless_switch_defer_false_positive();
 
-	// Audit round 13: braceless switch inside braced switch drops defers
+	// braceless switch inside braced switch drops defers
 	test_braceless_switch_defer_drop();
 
-	// Audit round 24: defer shadow inner-block false positive
+	// defer shadow inner-block false positive
 	test_defer_shadow_inner_block_false_positive();
 
-	// Audit round 30: in_generic() scope leak
+	// in_generic() scope leak
 	test_defer_in_generic_stmt_expr();
 
-	// Audit round 27: user-defined _Noreturn function with defer gets no warning
+	// user-defined _Noreturn function with defer gets no warning
 	UNIX_ONLY(test_defer_user_noreturn_no_warning());
 
-	// Audit round 29: brace_depth > 1 skip bypasses captured vars in nested blocks
+	// brace_depth > 1 skip bypasses captured vars in nested blocks
 	test_defer_shadow_depth_bypass();
 
-	// Audit round 30: * dereference bypass + comma multi-decl false positive
+	// * dereference bypass + comma multi-decl false positive
 	test_defer_shadow_deref_bypass();
 	test_defer_shadow_comma_decl_false_positive();
 
-	// Audit round 31: cast blinds shadow checker
+	// cast blinds shadow checker
 	test_defer_shadow_cast_bypass();
 
-	// Audit round 32: enum constant + typedef shadow defer captures
+	// enum constant + typedef shadow defer captures
 	test_defer_shadow_enum_bypass();
 	test_defer_shadow_typedef_bypass();
 
-	// Audit round 33: empty statement / label between blocks defeats stmt-expr defer check
+	// empty statement / label between blocks defeats stmt-expr defer check
 	test_defer_stmt_expr_empty_stmt_bypass();
 
-	// Audit round 34: typeof(x) inside nested defer block poisons shadow detection
+	// typeof(x) inside nested defer block poisons shadow detection
 	test_defer_typeof_shadow_bypass();
 
-	// Audit round 35: enum initializer with parens-wrapped comma hallucinates shadow
+	// enum initializer with parens-wrapped comma hallucinates shadow
 	test_defer_enum_initializer_comma();
 
-	// Audit round 38: double-nested block in stmt-expr bypasses scope_depth-2 check
+	// double-nested block in stmt-expr bypasses scope_depth-2 check
 	test_defer_stmt_expr_double_nested_block_bypass();
 
-	// Audit round 40: C23 attribute on computed goto bypasses CFG + defer checks
+	// C23 attribute on computed goto bypasses CFG + defer checks
 	test_c23_attr_computed_goto_defer_bypass();
 
-	// Audit round 40: stmt-expr smuggled inside function args/array indices/casts
+	// stmt-expr smuggled inside function args/array indices/casts
 	test_defer_stmt_expr_smuggled_in_args();
 
-	// Audit round 41: emit_expr_to_semicolon stmt-expr keyword bypass
+	// emit_expr_to_semicolon stmt-expr keyword bypass
 	test_stmt_expr_return_defer_bypass();
 
-	// Audit round 43: compound literal ctrl_state desync shadow leak
+	// compound literal ctrl_state desync shadow leak
 	test_compound_literal_ctrl_state_desync();
 
-	// Audit round 47: nested stmt-expr in defer exponential blowup
+	// nested stmt-expr in defer exponential blowup
 	test_defer_nested_stmt_expr_perf();
 
-	// Audit round 48: stmt-expr init bypasses defer shadow check
+	// stmt-expr init bypasses defer shadow check
 	GNUC_ONLY(test_defer_shadow_stmt_expr_bypass());
 
-	// BUG55: orelse break inside defer body loop
+	// orelse break inside defer body loop
 	test_defer_orelse_break_in_loop();
 
-	// BUG58: orelse block-form in defer bypasses zero-init/raw
+	// orelse block-form in defer bypasses zero-init/raw
 	test_defer_orelse_block_zeroinit_bypass();
 
-	// BUG60: goto in orelse missing p1_goto_exits defer cleanup
+	// goto in orelse missing p1_goto_exits defer cleanup
 	test_orelse_goto_defer_sibling_scope();
 
-	// BUG61: Phase 1D defer detection false positives on variables/members named "defer"
+	// Phase 1D defer detection false positives on variables/members named "defer"
 	test_defer_name_false_positive();
 
-	// BUG62: defer shadow RHS assignment bypass (check_defer_var_shadow state desync)
+	// defer shadow RHS assignment bypass (check_defer_var_shadow state desync)
 	test_defer_shadow_rhs_assignment_bypass();
 
-	// BUG64: [[__noreturn__]] / [[gnu::__noreturn__]] C23 attr blind spot
+	// [[__noreturn__]] / [[gnu::__noreturn__]] C23 attr blind spot
 	UNIX_ONLY(test_c23_attr_noreturn_dunder_blindspot());
 
-	// BUG66: __attribute__((cold, __noreturn__)) list truncation + __declspec
+	// __attribute__((cold, __noreturn__)) list truncation + __declspec
 	UNIX_ONLY(test_gnu_attr_noreturn_list_blindspot());
 
-	// BUG67: brace-initializer comma bypass in check_defer_var_shadow
+	// brace-initializer comma bypass in check_defer_var_shadow
 	test_defer_shadow_brace_init_comma_bypass();
 
-	// BUG71: parenthesized noreturn call / wrapper call bypasses warning and taint
+	// parenthesized noreturn call / wrapper call bypasses warning and taint
 	UNIX_ONLY(
 	test_paren_noreturn_warning_bypass();
 	test_paren_setjmp_wrapper_taint_bypass();
 	);
 
-	// BUG72: typedef enum wrapping bypasses defer shadow check
+	// typedef enum wrapping bypasses defer shadow check
 	test_defer_shadow_typedef_enum_bypass();
 
-	// BUG73: case ternary ?: desync in validate_defer_statement
+	// case ternary ?: desync in validate_defer_statement
 	test_defer_case_ternary_desync();
 
-	// BUG74: for-init declaration in defer body false positive shadow
+	// for-init declaration in defer body false positive shadow
 	test_defer_shadow_for_init_false_positive();
 
-	// BUG75: same-block defer shadow hijack (silent miscompilation)
+	// same-block defer shadow hijack (silent miscompilation)
 	test_defer_same_block_shadow_hijack();
 
 	// BUG: vfork member namespace pollution (os.vfork() / p->vfork())
@@ -5141,18 +5141,18 @@ void run_defer_tests(void) {
 	// BUG: braceless for-body if/else and do/while prematurely clears for_name_hid
 	test_defer_shadow_braceless_for_ifelse();
 
-	// BUG78: scope_depth/block_depth type confusion over-unwinds defers
+	// scope_depth/block_depth type confusion over-unwinds defers
 	test_scope_depth_overunwind();
 
-	// BUG79: emit_range_no_prep missing stmt-expr dispatch
+	// emit_range_no_prep missing stmt-expr dispatch
 	test_emit_range_no_prep_stmtexpr_defer();
 
-	// BUG81: braceless ctrl-flow in defer body — orelse/zeroinit not processed
+	// braceless ctrl-flow in defer body — orelse/zeroinit not processed
 	test_defer_braceless_ctrl_orelse();
 
-	// BUG82: __builtin_unreachable() leaks outside braceless if-body in defer
+	// __builtin_unreachable() leaks outside braceless if-body in defer
 	{
-		printf("\n--- BUG82: unreachable in braceless ctrl-flow defer ---\n");
+		printf("\n--- unreachable in braceless ctrl-flow defer ---\n");
 		// noreturn call in braceless if(0) inside defer body:
 		// __builtin_unreachable() must NOT appear outside the if-body
 		PrismResult r = prism_transpile_source(
@@ -5163,19 +5163,19 @@ void run_defer_tests(void) {
 		    "            die();\n"
 		    "    }\n"
 		    "}\n",
-		    "bug82_braceless.c", prism_defaults());
+		    "t82_braceless.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "bug82-braceless-unreachable: transpiles OK");
+		         "transpiles OK");
 		if (r.status == PRISM_OK && r.output) {
 			// The output should NOT contain __builtin_unreachable
 			// because the noreturn call is in a braceless body
 			// and emit_deferred_range cannot inject scope braces.
 			const char *fn = strstr(r.output, "void f(");
-			CHECK(fn != NULL, "bug82: function found");
+			CHECK(fn != NULL, "function found");
 			if (fn)
 				CHECK(strstr(fn, "__builtin_unreachable") == NULL &&
 				      strstr(fn, "__assume") == NULL,
-				      "bug82: no unreachable leak outside braceless if");
+				      "no unreachable leak outside braceless if");
 		}
 		prism_free(&r);
 
@@ -5185,20 +5185,20 @@ void run_defer_tests(void) {
 		    "void f(void) {\n"
 		    "    defer { die(); }\n"
 		    "}\n",
-		    "bug82_toplevel.c", prism_defaults());
+		    "t82_toplevel.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		         "bug82-toplevel: transpiles OK");
+		         "transpiles OK");
 		if (r.status == PRISM_OK && r.output) {
 			CHECK(strstr(r.output, "__builtin_unreachable") != NULL ||
 			      strstr(r.output, "__assume") != NULL,
-			      "bug82-toplevel: unreachable injected at top level");
+			      "unreachable injected at top level");
 		}
 		prism_free(&r);
 	}
 
-	// BUG85: braceless ctrl-flow in defer body missing brace_wrap for multi-stmt expansion
+	// braceless ctrl-flow in defer body missing brace_wrap for multi-stmt expansion
 	{
-		printf("\n--- BUG85: braceless ctrl-flow brace_wrap in defer ---\n");
+		printf("\n--- braceless ctrl-flow brace_wrap in defer ---\n");
 		// typeof zeroinit in braceless if inside defer: memset must be inside braces
 		{
 			PrismResult r = prism_transpile_source(
@@ -5209,16 +5209,16 @@ void run_defer_tests(void) {
 			    "        (void)0;\n"
 			    "    }\n"
 			    "}\n",
-			    "bug85_typeof_if.c", prism_defaults());
+			    "t85_typeof_if.c", prism_defaults());
 			CHECK_EQ(r.status, PRISM_OK,
-			         "bug85-typeof-if: transpiles OK");
+			         "transpiles OK");
 			if (r.status == PRISM_OK && r.output) {
 				// The memset MUST be inside braces with the declaration
 				CHECK(strstr(r.output, "if (1) {") != NULL ||
 				      strstr(r.output, "if (1){") != NULL,
-				      "bug85-typeof-if: braceless if body wrapped in braces");
+				      "braceless if body wrapped in braces");
 				CHECK(has_zeroing(r.output),
-				      "bug85-typeof-if: memset generated");
+				      "memset generated");
 			}
 			prism_free(&r);
 		}
@@ -5231,15 +5231,15 @@ void run_defer_tests(void) {
 			    "            typeof(int) x;\n"
 			    "    }\n"
 			    "}\n",
-			    "bug85_typeof_for.c", prism_defaults());
+			    "t85_typeof_for.c", prism_defaults());
 			CHECK_EQ(r.status, PRISM_OK,
-			         "bug85-typeof-for: transpiles OK");
+			         "transpiles OK");
 			if (r.status == PRISM_OK && r.output) {
 				const char *fn = strstr(r.output, "void f(");
-				CHECK(fn != NULL, "bug85-typeof-for: function found");
+				CHECK(fn != NULL, "function found");
 				if (fn) {
 					CHECK(has_zeroing(fn),
-					      "bug85-typeof-for: memset generated");
+					      "memset generated");
 				}
 			}
 			prism_free(&r);
@@ -5254,12 +5254,12 @@ void run_defer_tests(void) {
 			    "            typeof(int) x;\n"
 			    "    }\n"
 			    "}\n",
-			    "bug85_typeof_else.c", prism_defaults());
+			    "t85_typeof_else.c", prism_defaults());
 			CHECK_EQ(r.status, PRISM_OK,
-			         "bug85-typeof-else: transpiles OK");
+			         "transpiles OK");
 			if (r.status == PRISM_OK && r.output) {
 				CHECK(has_zeroing(r.output),
-				      "bug85-typeof-else: memset generated");
+				      "memset generated");
 			}
 			prism_free(&r);
 		}
@@ -5273,28 +5273,28 @@ void run_defer_tests(void) {
 			    "            int *p = get_null() orelse 0;\n"
 			    "    }\n"
 			    "}\n",
-			    "bug85_orelse_if.c", prism_defaults());
+			    "t85_orelse_if.c", prism_defaults());
 			CHECK_EQ(r.status, PRISM_OK,
-			         "bug85-orelse-if: transpiles OK");
+			         "transpiles OK");
 			if (r.status == PRISM_OK && r.output) {
 				const char *fn = strstr(r.output, "void f(");
-				CHECK(fn != NULL, "bug85-orelse-if: function found");
+				CHECK(fn != NULL, "function found");
 				if (fn) {
 					CHECK(strstr(fn, "orelse") == NULL,
-					      "bug85-orelse-if: no literal orelse");
+					      "no literal orelse");
 					// Must have brace wrap for multi-stmt expansion
 					CHECK(strstr(fn, "if (1) {") != NULL ||
 					      strstr(fn, "if (1){") != NULL,
-					      "bug85-orelse-if: braceless body wrapped in braces");
+					      "braceless body wrapped in braces");
 				}
 			}
 			prism_free(&r);
 		}
 	}
 
-	// BUG85b: orelse block mini-loop missing ctrl-flow keyword tracking
+	// orelse block mini-loop missing ctrl-flow keyword tracking
 	{
-		printf("\n--- BUG85b: ctrl-flow in orelse block body ---\n");
+		printf("\n--- ctrl-flow in orelse block body ---\n");
 		// typeof zeroinit in braceless if inside orelse block
 		{
 			PrismResult r = prism_transpile_source(
@@ -5306,15 +5306,15 @@ void run_defer_tests(void) {
 			    "        return;\n"
 			    "    };\n"
 			    "}\n",
-			    "bug85b_typeof_if.c", prism_defaults());
+			    "t85b_typeof_if.c", prism_defaults());
 			CHECK_EQ(r.status, PRISM_OK,
-			         "bug85b-typeof-if-orelse: transpiles OK");
+			         "transpiles OK");
 			if (r.status == PRISM_OK && r.output) {
 				const char *fn = strstr(r.output, "void f(");
-				CHECK(fn != NULL, "bug85b: function found");
+				CHECK(fn != NULL, "function found");
 				if (fn) {
 					CHECK(has_zeroing(fn),
-					      "bug85b-typeof-if-orelse: memset generated for typeof");
+					      "memset generated for typeof");
 				}
 			}
 			prism_free(&r);
@@ -5331,15 +5331,15 @@ void run_defer_tests(void) {
 			    "    };\n"
 			    "    (void)q;\n"
 			    "}\n",
-			    "bug85b_while.c", prism_defaults());
+			    "t85b_while.c", prism_defaults());
 			CHECK_EQ(r.status, PRISM_OK,
-			         "bug85b-while-orelse: transpiles OK");
+			         "transpiles OK");
 			if (r.status == PRISM_OK && r.output) {
 				const char *fn = strstr(r.output, "void g(");
-				CHECK(fn != NULL, "bug85b-while: function found");
+				CHECK(fn != NULL, "function found");
 				if (fn) {
 					CHECK(has_zeroing(fn),
-					      "bug85b-while-orelse: memset generated");
+					      "memset generated");
 				}
 			}
 			prism_free(&r);
@@ -5367,10 +5367,10 @@ void run_defer_tests(void) {
 		prism_free(&r);
 	}
 
-	// BUG87: shadowed 'defer' keyword suppression
+	// shadowed 'defer' keyword suppression
 	test_defer_shadow_variable_block();
 	test_defer_shadow_typedef_block();
 
-	// BUG88: stmt-expr local false positive in defer shadow scanner
+	// stmt-expr local false positive in defer shadow scanner
 	test_defer_shadow_stmt_expr_local_false_positive();
 }
