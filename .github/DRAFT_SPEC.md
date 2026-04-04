@@ -112,7 +112,6 @@ __prism_defer_1:            // always-defer entry point
        A;             // defer — always (only the non-err defers below the lowest err)
        return __prism_rv;
    ```
-   Wait — interleaving requires more thought. See "Open questions" below.
 5. **Scope nesting:** Defers inside nested `{ }` blocks create sub-chains that fire when that scope's `}` is reached (same as current), using local goto labels
 
 ### Backward compatibility

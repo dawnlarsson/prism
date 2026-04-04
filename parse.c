@@ -850,6 +850,17 @@ static inline bool equal_n(Token *tok, const char *op, size_t len) {
 static inline bool _equal_1(Token *tok, char c) {
 	return tok->len == 1 && tok->ch0 == (uint8_t)c;
 }
+#define match_ch _equal_1
+
+// Branchless multi-char punctuation set test: match_set(tok, CH(';') | CH(','))
+// Covers ASCII 32-95 (all C punctuation except { | } ~).
+#define CH(c) (1ULL << ((c) - 32))
+#define match_set(tok, mask) ((tok)->len == 1 && (unsigned)((tok)->ch0 - 32) < 64u && ((mask) & (1ULL << ((tok)->ch0 - 32))))
+
+// Statement expression open: ({
+static inline bool is_stmt_expr_open(Token *t) {
+	return match_ch(t, '(') && tok_next(t) && match_ch(tok_next(t), '{');
+}
 
 static inline bool _equal_2(Token *tok, const char *s) {
 	if (tok->len != 2 || tok->ch0 != (uint8_t)s[0]) return false;
@@ -2993,6 +3004,442 @@ unwind_if:
 	return tok;
 }
 static Token *skip_one_stmt(Token *tok) { return skip_one_stmt_impl(tok, NULL); }
+
+// --- Scope Tree ---
+
+// Scope tree: flat array indexed by scope_id, one entry per '{' in the TU.
+typedef struct {
+	uint16_t parent_id;    // scope_id of enclosing '{' (0 = file scope)
+	uint32_t open_tok_idx; // token index of the '{' (0 for file scope)
+	uint32_t close_tok_idx;// token index of the matching '}' (UINT32_MAX for file scope)
+	bool is_struct : 1;
+	bool is_loop : 1;
+	bool is_switch : 1;
+	bool is_func_body : 1;
+	bool is_stmt_expr : 1;
+	bool is_conditional : 1;
+	bool is_init : 1;     // initializer brace: = { ... } — not a compound statement
+	bool is_enum : 1;     // set when is_struct=true and the keyword is 'enum'
+} ScopeInfo;
+
+#define scope_tree       ((ScopeInfo *)ctx->p1_scope_tree)
+#define scope_tree_count (ctx->p1_scope_count)
+#define scope_tree_cap   (ctx->p1_scope_cap)
+
+static bool scope_is_ancestor_or_self(uint16_t ancestor, uint16_t descendant) {
+	for (uint16_t s = descendant; s != 0; s = scope_tree[s].parent_id)
+		if (s == ancestor) return true;
+	return ancestor == 0; // file scope is ancestor of everything
+}
+
+static int scope_tree_depth(uint16_t scope_id) {
+	int depth = 0;
+	for (uint16_t s = scope_id; s != 0; s = scope_tree[s].parent_id)
+		depth++;
+	return depth;
+}
+
+static int scope_block_exits(uint16_t goto_sid, uint16_t label_sid) {
+	uint16_t a = goto_sid, b = label_sid;
+	int da = scope_tree_depth(a), db = scope_tree_depth(b);
+	while (da > db) { a = scope_tree[a].parent_id; da--; }
+	while (db > da) { b = scope_tree[b].parent_id; db--; }
+	while (a != b && a != 0) { a = scope_tree[a].parent_id; b = scope_tree[b].parent_id; }
+	uint16_t lca = a;
+	int exits = 0;
+	for (uint16_t s = goto_sid; s != lca && s != 0; s = scope_tree[s].parent_id)
+		if (!scope_tree[s].is_init)
+			exits++;
+	return exits;
+}
+
+static uint16_t scope_stmt_expr_ancestor(uint16_t scope_id) {
+	for (uint16_t s = scope_id; s != 0; s = scope_tree[s].parent_id)
+		if (s < scope_tree_count && scope_tree[s].is_stmt_expr)
+			return s;
+	return 0;
+}
+
+// Phase 1: check if a defer in scope 'sid' is inside a chain of closing braces
+// leading to a statement expression.
+static void p1_check_defer_stmt_expr_chain(Token *defer_tok, uint16_t sid) {
+	while (sid > 0 && sid < scope_tree_count) {
+		uint16_t pid = scope_tree[sid].parent_id;
+		if (pid == 0 || pid >= scope_tree_count) break;
+		Token *t = tok_next(&token_pool[scope_tree[sid].close_tok_idx]);
+		Token *parent_close = &token_pool[scope_tree[pid].close_tok_idx];
+		bool only_trivial = true;
+		while (t && t != parent_close && t->kind != TK_EOF) {
+			if (match_ch(t, ';') || match_ch(t, '}')) { t = tok_next(t); continue; }
+			if (t->kind == TK_PREP_DIR) { t = tok_next(t); continue; }
+			if (t->tag & TT_ATTR) {
+				t = tok_next(t);
+				if (t && match_ch(t, '(')) t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t);
+				continue;
+			}
+			if (is_c23_attr(t)) {
+				t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t);
+				continue;
+			}
+			if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
+			    tok_next(t) && match_ch(tok_next(t), ':'))
+				{ t = tok_next(tok_next(t)); continue; }
+			only_trivial = false;
+			break;
+		}
+		if (!only_trivial) break;
+		if (scope_tree[pid].is_stmt_expr)
+			error_tok(defer_tok,
+				  "defer inside a block that is the last "
+				  "statement of a statement expression "
+				  "would corrupt the expression's return "
+				  "value; ensure the last statement of the "
+				  "statement expression is outside the "
+				  "defer block");
+		sid = pid;
+	}
+}
+
+// Walk backward from before_idx skipping prep dirs, GNU attrs, C23 [[attrs]].
+static Token *p1_find_prev_skipping_attrs(uint32_t before_idx) {
+	for (uint32_t pi = before_idx; pi > 0; pi--) {
+		Token *pt = &token_pool[pi];
+		if (pt->kind == TK_PREP_DIR) continue;
+		if (match_ch(pt, ']') && tok_match(pt) && (tok_match(pt)->flags & TF_C23_ATTR)) {
+			pi = tok_idx(tok_match(pt)); continue;
+		}
+		if (match_ch(pt, ')') && tok_match(pt)) {
+			Token *open = tok_match(pt);
+			uint32_t oi = tok_idx(open);
+			for (uint32_t bi = oi - 1; bi > 0; bi--) {
+				Token *bt = &token_pool[bi];
+				if (bt->kind == TK_PREP_DIR) continue;
+				if (bt->tag & TT_ATTR) { pi = bi; goto next_pi; }
+				break;
+			}
+		}
+		return pt;
+		next_pi:;
+	}
+	return NULL;
+}
+
+// --- Defer Validation (Phase 1F) ---
+
+static inline Token *skip_defer_control_head(Token *tok) {
+	tok = skip_noise(tok);
+	if (tok && match_ch(tok, '(') && tok_match(tok)) return tok_next(tok_match(tok));
+	return tok;
+}
+
+static void validate_defer_control_flow(Token *t, bool in_loop, bool in_switch) {
+	if (!t) return;
+	if (t->tag & TT_RETURN)
+		error_tok(t, "'return' inside defer block bypasses remaining defers");
+	if ((t->tag & TT_GOTO) && !is_known_typedef(t))
+		error_tok(t, "'goto' inside defer block could bypass remaining defers");
+	if ((t->tag & TT_BREAK) && !in_loop && !in_switch)
+		error_tok(t, "'break' inside defer block bypasses remaining defers");
+	if ((t->tag & TT_CONTINUE) && !in_loop)
+		error_tok(t, "'continue' inside defer block bypasses remaining defers");
+}
+
+static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch, int depth);
+
+static void defer_scan_hidden_stmt_exprs(Token *open, bool in_loop, bool in_switch, int depth) {
+	Token *end = tok_match(open);
+	if (!end) return;
+	for (Token *t = tok_next(open); t && t != end && t->kind != TK_EOF; ) {
+		if (is_stmt_expr_open(t)) {
+			validate_defer_statement(tok_next(t), in_loop, in_switch, depth + 1);
+			t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t);
+		} else {
+			t = tok_next(t);
+		}
+	}
+}
+
+static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch, int depth) {
+	if (depth >= 4096) error_tok(tok, "braceless control flow nesting depth exceeds 4096");
+	tok = skip_noise(tok);
+	if (!tok || tok->kind == TK_EOF) return tok;
+
+	if (match_ch(tok, '{')) {
+		Token *end = tok_match(tok);
+		for (tok = skip_noise(tok_next(tok)); tok && tok != end && tok->kind != TK_EOF; tok = skip_noise(tok)) {
+			Token *next = validate_defer_statement(tok, in_loop, in_switch, depth);
+			if (next == tok) break;
+			tok = next;
+		}
+		return end ? tok_next(end) : tok;
+	}
+
+	if (equal(tok, "if")) {
+		Token *after_then = validate_defer_statement(skip_defer_control_head(tok_next(tok)), in_loop, in_switch, depth + 1);
+		Token *else_tok = skip_noise(after_then);
+		if (else_tok && equal(else_tok, "else"))
+			return validate_defer_statement(tok_next(else_tok), in_loop, in_switch, depth + 1);
+		return after_then;
+	}
+
+	if (tok->tag & (TT_CASE | TT_DEFAULT)) {
+		int td = 0;
+		for (tok = tok_next(tok); tok && tok->kind != TK_EOF; tok = tok_next(tok)) {
+			if (tok->flags & TF_OPEN) {
+				if (match_ch(tok, '(') || match_ch(tok, '['))
+					defer_scan_hidden_stmt_exprs(tok, in_loop, in_switch, depth);
+				tok = tok_match(tok) ? tok_match(tok) : tok;
+				continue;
+			}
+			if (match_ch(tok, '?')) { td++; continue; }
+			if (match_ch(tok, ':')) { if (td > 0) { td--; continue; } break; }
+		}
+		return tok && match_ch(tok, ':') ? validate_defer_statement(tok_next(tok), in_loop, in_switch, depth + 1) : tok;
+	}
+
+	if (tok->tag & TT_SWITCH)
+		return validate_defer_statement(skip_defer_control_head(tok_next(tok)), in_loop, true, depth + 1);
+
+	if (tok->tag & TT_LOOP) {
+		if (equal(tok, "do")) {
+			tok = validate_defer_statement(tok_next(tok), true, in_switch, depth + 1);
+			Token *w = skip_noise(tok);
+			if (w && equal(w, "while")) {
+				tok = skip_defer_control_head(tok_next(w));
+				tok = skip_noise(tok);
+				if (tok && match_ch(tok, ';')) tok = tok_next(tok);
+			}
+			return tok;
+		}
+		return validate_defer_statement(skip_defer_control_head(tok_next(tok)), true, in_switch, depth + 1);
+	}
+
+	if (tok->flags & TF_OPEN) {
+		if (is_stmt_expr_open(tok)) {
+			Token *inner_brace = tok_next(tok);
+			validate_defer_statement(inner_brace, in_loop, in_switch, depth + 1);
+			return tok_match(tok) ? tok_next(tok_match(tok)) : tok_next(tok);
+		}
+	}
+
+	if (tok->kind == TK_IDENT && tok_next(tok) && match_ch(tok_next(tok), ':'))
+		error_tok(tok, "labels inside defer blocks produce duplicate labels "
+			  "when the defer body is copied to multiple exit points");
+
+	if (tok->kind == TK_KEYWORD) {
+		validate_defer_control_flow(tok, in_loop, in_switch);
+		if ((tok->tag & TT_DEFER) && !is_known_typedef(tok) &&
+		    !match_ch(tok_next(tok), ':') && !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN)))
+			error_tok(tok, "nested defer is not supported");
+	}
+
+	if (FEAT(F_ORELSE)) {
+		for (Token *s = tok; s && s->kind != TK_EOF && !match_ch(s, ';'); s = tok_next(s)) {
+			if (s->flags & TF_OPEN) { s = tok_match(s); continue; }
+			if (is_orelse_kw_shadow(s)) {
+				Token *act = tok_next(s);
+				if (act && match_ch(act, ';'))
+					error_tok(s, "expected statement after 'orelse'");
+				validate_defer_control_flow(act, in_loop, in_switch);
+				if (act && match_ch(act, '{'))
+					validate_defer_statement(act, in_loop, in_switch, depth + 1);
+				break;
+			}
+		}
+	}
+
+	for (Token *s = tok; s && s->kind != TK_EOF && !match_ch(s, ';'); s = tok_next(s)) {
+		if (s->flags & TF_OPEN) {
+			if (is_stmt_expr_open(s))
+				validate_defer_statement(tok_next(s), in_loop, in_switch, depth + 1);
+			else if (match_set(s, CH('(') | CH('[')) || match_ch(s, '{'))
+				defer_scan_hidden_stmt_exprs(s, in_loop, in_switch, depth);
+			s = tok_match(s) ? tok_match(s) : s;
+			continue;
+		}
+	}
+	Token *semi = skip_to_semicolon(tok);
+	return (semi && semi->kind != TK_EOF) ? tok_next(semi) : semi;
+}
+
+// --- _Generic Analysis ---
+
+static bool params_look_like_decls(Token *open) {
+	Token *close = tok_match(open);
+	if (!close) return false;
+	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			if (tok_match(t)) t = tok_match(t);
+			continue;
+		}
+		if (t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT |
+			      TT_ATTR | TT_STORAGE))
+			return true;
+		if (is_known_typedef(t)) return true;
+	}
+	return false;
+}
+
+static bool is_knr_params(Token *start, Token *brace) {
+	if (!start || start == brace || match_ch(start, ';'))
+		return false;
+	bool saw_semi = false;
+	for (Token *t = start; t && t != brace && t->kind != TK_EOF; t = tok_next(t)) {
+		if (match_ch(t, ';')) saw_semi = true;
+		if (t->flags & TF_OPEN) t = tok_match(t) ? tok_match(t) : t;
+	}
+	return saw_semi;
+}
+
+static Token *generic_find_assoc_start(Token *open) {
+	Token *close = tok_match(open);
+	if (!close) return NULL;
+	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			if (tok_match(t)) t = tok_match(t);
+			continue;
+		}
+		if (match_ch(t, ',')) return tok_next(t);
+	}
+	return NULL;
+}
+
+static bool generic_has_distinct_targets(Token *open) {
+	Token *close = tok_match(open);
+	if (!close) return false;
+	Token *assoc_start = generic_find_assoc_start(open);
+	if (!assoc_start) return false;
+	const char *first_name = NULL;
+	int first_len = 0;
+	for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			if (tok_match(t)) t = tok_match(t);
+			continue;
+		}
+		if (!match_ch(t, ':')) continue;
+		bool found_ident = false;
+		for (Token *b = tok_next(t); b && b != close; b = tok_next(b)) {
+			if (b->flags & TF_OPEN) {
+				if (tok_match(b)) b = tok_match(b);
+				continue;
+			}
+			if (match_ch(b, ',')) break;
+			if (!is_valid_varname(b)) continue;
+			found_ident = true;
+			while (b && tok_next(b) && tok_next(b) != close &&
+			       (match_ch(tok_next(b), '.') || equal(tok_next(b), "->")) &&
+			       tok_next(tok_next(b)) && is_valid_varname(tok_next(tok_next(b)))) {
+				b = tok_next(tok_next(b));
+			}
+			if (!first_name) {
+				first_name = tok_loc(b);
+				first_len = b->len;
+			} else if (b->len != first_len ||
+				   memcmp(tok_loc(b), first_name, first_len) != 0) {
+				return true;
+			}
+			break;
+		}
+		if (!found_ident) {
+			bool has_real_ident = false;
+			int depth = 0;
+			for (Token *d = tok_next(t); d && d != close; d = tok_next(d)) {
+				if (d->flags & TF_OPEN) depth++;
+				else if (d->flags & TF_CLOSE) depth--;
+				if (depth == 0 && match_ch(d, ',')) break;
+				if (is_valid_varname(d) &&
+				    !(d->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE |
+						TT_STORAGE | TT_ATTR | TT_TYPEOF | TT_BITINT))) {
+					has_real_ident = true;
+					break;
+				}
+			}
+			if (!has_real_ident) return true;
+		}
+	}
+	return false;
+}
+
+static bool generic_rewrite_preamble(Token *generic_tok, Token **open_out,
+				     Token **close_out, Token **after_out,
+				     Token **assoc_start_out) {
+	Token *open = tok_next(generic_tok);
+	if (!open || !match_ch(open, '(') || !tok_match(open)) return false;
+	Token *close = tok_match(open);
+	Token *after = skip_noise(tok_next(close));
+	if (!after) return false;
+	if (generic_has_distinct_targets(open)) return false;
+	Token *assoc_start = generic_find_assoc_start(open);
+	if (!assoc_start) return false;
+	*open_out = open;
+	*close_out = close;
+	*after_out = after;
+	*assoc_start_out = assoc_start;
+	return true;
+}
+
+static bool generic_decl_rewrite_target(Token *generic_tok, Token **name_out,
+					Token **params_open_out,
+					Token **params_close_out,
+					Token **next_out) {
+	Token *open, *close, *after, *assoc_start;
+	if (!generic_rewrite_preamble(generic_tok, &open, &close, &after, &assoc_start))
+		return false;
+	if (match_set(after, CH(';') | CH(',')) || (after->tag & TT_ATTR) ||
+	    is_c23_attr(after)) {
+		for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
+			Token *call_open = skip_noise(tok_next(t));
+			if (!is_valid_varname(t) || !call_open || !match_ch(call_open, '(') || !tok_match(call_open))
+				continue;
+			if (!params_look_like_decls(call_open)) continue;
+			*name_out = t;
+			*params_open_out = call_open;
+			*params_close_out = tok_match(call_open);
+			*next_out = after;
+			return true;
+		}
+	}
+	if (match_ch(after, '(') && tok_match(after) && params_look_like_decls(after)) {
+		Token *ext_close = tok_match(after);
+		Token *after_ext = skip_noise(tok_next(ext_close));
+		if (after_ext && (match_ch(after_ext, ';') || match_ch(after_ext, ',') ||
+		    (after_ext->tag & TT_ATTR) || is_c23_attr(after_ext))) {
+			Token *found = NULL;
+			for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
+				if (is_valid_varname(t)) found = t;
+			}
+			if (found) {
+				*name_out = found;
+				*params_open_out = after;
+				*params_close_out = ext_close;
+				*next_out = after_ext;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static bool generic_member_rewrite_target(Token *generic_tok, Token **name_out,
+					  Token **args_open_out,
+					  Token **args_close_out,
+					  Token **next_out) {
+	Token *open, *close, *after, *assoc_start;
+	if (!generic_rewrite_preamble(generic_tok, &open, &close, &after, &assoc_start))
+		return false;
+	for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
+		Token *call_open = skip_noise(tok_next(t));
+		if (!is_valid_varname(t) || !call_open || !match_ch(call_open, '(') || !tok_match(call_open))
+			continue;
+		if (params_look_like_decls(call_open)) continue;
+		*name_out = t;
+		*args_open_out = call_open;
+		*args_close_out = tok_match(call_open);
+		*next_out = after;
+		return true;
+	}
+	return false;
+}
 
 // full=false: reset for reuse; full=true: free everything
 void tokenizer_teardown(bool full) {

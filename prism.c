@@ -38,12 +38,7 @@ static void signal_temps_register(const char *path);
 static int run_command(char **argv);
 static int run_command_quiet(char **argv);
 
-#define match_ch _equal_1
 
-// Branchless multi-char punctuation set test: match_set(tok, CH(';') | CH(','))
-// Covers ASCII 32-95 (all C punctuation except { | } ~).
-#define CH(c) (1ULL << ((c) - 32))
-#define match_set(tok, mask) ((tok)->len == 1 && (unsigned)((tok)->ch0 - 32) < 64u && ((mask) & (1ULL << ((tok)->ch0 - 32))))
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -145,21 +140,6 @@ typedef struct {
 
 // --- Phase 0: Pass 1 infrastructure ---
 
-// Scope tree: flat array indexed by scope_id, one entry per '{' in the TU.
-typedef struct {
-	uint16_t parent_id;    // scope_id of enclosing '{' (0 = file scope)
-	uint32_t open_tok_idx; // token index of the '{' (0 for file scope)
-	uint32_t close_tok_idx;// token index of the matching '}' (UINT32_MAX for file scope)
-	bool is_struct : 1;
-	bool is_loop : 1;
-	bool is_switch : 1;
-	bool is_func_body : 1;
-	bool is_stmt_expr : 1;
-	bool is_conditional : 1;
-	bool is_init : 1;     // initializer brace: = { ... } — not a compound statement
-	bool is_enum : 1;     // set when is_struct=true and the keyword is 'enum'
-} ScopeInfo;
-
 // Per-function metadata collected during Pass 1.
 typedef struct {
 	Token *body_open;              // The '{' token
@@ -210,9 +190,6 @@ typedef struct {
 } P1FuncEntry;
 
 // Typed accessors for void* fields in PrismContext
-#define scope_tree       ((ScopeInfo *)ctx->p1_scope_tree)
-#define scope_tree_count (ctx->p1_scope_count)
-#define scope_tree_cap   (ctx->p1_scope_cap)
 #define func_meta        ((FuncMeta *)ctx->p1_func_meta)
 #define func_meta_count  (ctx->p1_func_meta_count)
 #define func_meta_cap    (ctx->p1_func_meta_cap)
@@ -414,137 +391,20 @@ static inline void clear_func_ret_type(void) {
 }
 
 
-// Check if 'ancestor' is an ancestor-or-self of 'descendant' in the scope tree.
-static bool scope_is_ancestor_or_self(uint16_t ancestor, uint16_t descendant) {
-	for (uint16_t s = descendant; s != 0; s = scope_tree[s].parent_id)
-		if (s == ancestor) return true;
-	return ancestor == 0; // file scope is ancestor of everything
-}
-
-// Compute brace nesting depth from scope_id (0 = file scope, 1 = first '{', etc.)
-static int scope_tree_depth(uint16_t scope_id) {
-	int depth = 0;
-	for (uint16_t s = scope_id; s != 0; s = scope_tree[s].parent_id)
-		depth++;
-	return depth;
-}
-
-// Count block-scope exits from goto_sid to the LCA of goto_sid and label_sid.
-// A "block scope" is any non-init {} scope (is_init braces don't affect block_depth).
-static int scope_block_exits(uint16_t goto_sid, uint16_t label_sid) {
-	// Bring both to same tree depth
-	uint16_t a = goto_sid, b = label_sid;
-	int da = scope_tree_depth(a), db = scope_tree_depth(b);
-	while (da > db) { a = scope_tree[a].parent_id; da--; }
-	while (db > da) { b = scope_tree[b].parent_id; db--; }
-	// Walk up together to find LCA
-	while (a != b && a != 0) { a = scope_tree[a].parent_id; b = scope_tree[b].parent_id; }
-	uint16_t lca = a;
-	// Count non-init scopes from goto_sid to LCA
-	int exits = 0;
-	for (uint16_t s = goto_sid; s != lca && s != 0; s = scope_tree[s].parent_id)
-		if (!scope_tree[s].is_init)
-			exits++;
-	return exits;
-}
-
-// Find the innermost statement-expression ancestor scope of scope_id.
-// Returns 0 if none (0 = file scope, never a stmt-expr).
-static uint16_t scope_stmt_expr_ancestor(uint16_t scope_id) {
-	for (uint16_t s = scope_id; s != 0; s = scope_tree[s].parent_id)
-		if (s < scope_tree_count && scope_tree[s].is_stmt_expr)
-			return s;
-	return 0;
-}
-
-// Phase 1: check if a defer in scope 'sid' is inside a chain of closing braces
-// leading to a statement expression.  The defer cleanup code would be emitted at
-// the inner '}', but the result flows up through a chain of '}' tokens to become
-// the stmt-expr's value, corrupting it.
-static void p1_check_defer_stmt_expr_chain(Token *defer_tok, uint16_t sid) {
-	while (sid > 0 && sid < scope_tree_count) {
-		uint16_t pid = scope_tree[sid].parent_id;
-		if (pid == 0 || pid >= scope_tree_count) break;
-		// Walk tokens from this scope's '}' to parent's '}':
-		// if only trivial tokens (';', labels) in between, it's a chain.
-		Token *t = tok_next(&token_pool[scope_tree[sid].close_tok_idx]);
-		Token *parent_close = &token_pool[scope_tree[pid].close_tok_idx];
-		bool only_trivial = true;
-		while (t && t != parent_close && t->kind != TK_EOF) {
-			if (match_ch(t, ';') || match_ch(t, '}')) { t = tok_next(t); continue; }
-			if (t->kind == TK_PREP_DIR) { t = tok_next(t); continue; }
-			if (t->tag & TT_ATTR) {
-				t = tok_next(t);
-				if (t && match_ch(t, '(')) t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t);
-				continue;
-			}
-			if (is_c23_attr(t)) {
-				t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t);
-				continue;
-			}
-			if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
-			    tok_next(t) && match_ch(tok_next(t), ':'))
-				{ t = tok_next(tok_next(t)); continue; }
-			only_trivial = false;
-			break;
-		}
-		if (!only_trivial) break;
-		if (scope_tree[pid].is_stmt_expr)
-			error_tok(defer_tok,
-				  "defer inside a block that is the last "
-				  "statement of a statement expression "
-				  "would corrupt the expression's return "
-				  "value; ensure the last statement of the "
-				  "statement expression is outside the "
-				  "defer block");
-		sid = pid;
-	}
-}
-
 // Phase 1C: record a variable declaration that shadows a typedef name.
-static void p1_add_shadow(char *name, int len, uint16_t scope_id, uint32_t token_index) {
+static void p1_register_shadow(Token *t, uint16_t scope_id, int brace_depth) {
 	ARENA_ENSURE_CAP(&ctx->main_arena, ctx->p1_shadow_entries,
 			 p1_shadow_count, p1_shadow_cap, 64, P1ShadowEntry);
 	int new_idx = p1_shadow_count++;
 	P1ShadowEntry *e = &p1_shadows[new_idx];
-	e->name = name;
-	e->len = len;
+	e->name = tok_loc(t);
+	e->len = t->len;
 	e->scope_id = scope_id;
-	e->token_index = token_index;
-	// Chain to previous shadow for same name
-	void *prev_val = hashmap_get(&p1_shadow_map, name, len);
+	e->token_index = tok_idx(t);
+	void *prev_val = hashmap_get(&p1_shadow_map, tok_loc(t), t->len);
 	e->prev_index = prev_val ? (int)(intptr_t)prev_val - 1 : -1;
-	hashmap_put(&p1_shadow_map, name, len, (void *)(intptr_t)(new_idx + 1));
-}
-
-static void p1_register_shadow(Token *t, uint16_t scope_id, int brace_depth) {
-	p1_add_shadow(tok_loc(t), t->len, scope_id, tok_idx(t));
+	hashmap_put(&p1_shadow_map, tok_loc(t), t->len, (void *)(intptr_t)(new_idx + 1));
 	TYPEDEF_ADD_IDX(typedef_add_shadow(tok_loc(t), t->len, brace_depth), t);
-}
-
-// Walk backward from `before_idx` skipping prep dirs, C23 [[attrs]], and
-// GNU __attribute__((...)).  Returns the first "real" predecessor token, or NULL.
-static Token *p1_find_prev_skipping_attrs(uint32_t before_idx) {
-	for (uint32_t pi = before_idx; pi > 0; pi--) {
-		Token *pt = &token_pool[pi];
-		if (pt->kind == TK_PREP_DIR) continue;
-		if (match_ch(pt, ']') && tok_match(pt) && (tok_match(pt)->flags & TF_C23_ATTR)) {
-			pi = tok_idx(tok_match(pt)); continue;
-		}
-		if (match_ch(pt, ')') && tok_match(pt)) {
-			Token *open = tok_match(pt);
-			uint32_t oi = tok_idx(open);
-			for (uint32_t bi = oi - 1; bi > 0; bi--) {
-				Token *bt = &token_pool[bi];
-				if (bt->kind == TK_PREP_DIR) continue;
-				if (bt->tag & TT_ATTR) { pi = bi; goto next_pi; }
-				break;
-			}
-		}
-		return pt;
-		next_pi:;
-	}
-	return NULL;
 }
 
 static void p1_register_param_shadows(Token *open, Token *close,
@@ -1042,7 +902,7 @@ static void emit_range(Token *start, Token *end) {
 	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
 		// Statement expression ({...}): route through walk_balanced
 		// which has the full keyword dispatcher (goto, return, defer).
-		if (match_ch(t, '(') && tok_next(t) && match_ch(tok_next(t), '{') && tok_match(t)) {
+		if (is_stmt_expr_open(t) && tok_match(t)) {
 			walk_balanced(t, true);
 			t = tok_match(t);
 			continue;
@@ -1056,7 +916,7 @@ static void emit_range(Token *start, Token *end) {
 static void emit_range_no_prep(Token *start, Token *end) {
 	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
 		if (t->kind == TK_PREP_DIR) continue;
-		if (match_ch(t, '(') && tok_next(t) && match_ch(tok_next(t), '{') && tok_match(t)) {
+		if (is_stmt_expr_open(t) && tok_match(t)) {
 			walk_balanced(t, true); t = tok_match(t); continue;
 		}
 		emit_tok(t);
@@ -1550,7 +1410,7 @@ static void emit_type_range(Token *start, Token *end, bool strip_const, bool str
 		if (strip_const && (t->tag & TT_CONST)) { t = tok_next(t); continue; }
 		// Statement expression ({...}): route through walk_balanced
 		// which has the full keyword dispatcher (defer, goto, zeroinit).
-		if (match_ch(t, '(') && tok_next(t) && match_ch(tok_next(t), '{') && tok_match(t)) {
+		if (is_stmt_expr_open(t) && tok_match(t)) {
 			walk_balanced(t, true);
 			t = tok_next(tok_match(t));
 			continue;
@@ -1653,18 +1513,6 @@ static inline Token *try_strip_raw(Token *t) {
 	return NULL;
 }
 
-// Legacy K&R C parameter detection (slow path heuristic).
-static bool is_knr_params(Token *start, Token *brace) {
-	if (!start || start == brace || match_ch(start, ';'))
-		return false;
-	bool saw_semi = false;
-	for (Token *t = start; t && t != brace && t->kind != TK_EOF; t = tok_next(t)) {
-		if (match_ch(t, ';')) saw_semi = true;
-		if (t->flags & TF_OPEN) t = tok_match(t) ? tok_match(t) : t; // skip groups safely
-	}
-	return saw_semi;
-}
-
 // Captures function return type. Returns 1 if void function, 2 if captured, 0 if not function.
 static int capture_function_return_type(Token *tok) {
 	while (tok && tok->kind != TK_EOF) {
@@ -1765,211 +1613,6 @@ static void emit_ret_type(void) {
 		error("defer in function with unresolvable return type; "
 		      "use a named struct or typedef");
 	}
-}
-
-static bool params_look_like_decls(Token *open) {
-	Token *close = tok_match(open);
-	if (!close) return false;
-
-	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
-		if (t->flags & TF_OPEN) {
-			if (tok_match(t)) t = tok_match(t);
-			continue;
-		}
-		if (t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT |
-			      TT_ATTR | TT_STORAGE))
-			return true;
-		if (is_known_typedef(t)) return true;
-	}
-
-	return false;
-}
-
-// Skip past a _Generic controlling expression to find the first association.
-// Returns the token after the first ',' at depth 0, or NULL.
-static Token *generic_find_assoc_start(Token *open) {
-	Token *close = tok_match(open);
-	if (!close) return NULL;
-	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
-		if (t->flags & TF_OPEN) {
-			if (tok_match(t)) t = tok_match(t);
-			continue;
-		}
-		if (match_ch(t, ',')) return tok_next(t);
-	}
-	return NULL;
-}
-
-// Check whether a _Generic's type associations resolve to distinct function
-// names.  When every branch targets the same identifier (glibc C23 pattern),
-// folding the _Generic onto that name is safe.  When branches name different
-// functions (user type-dispatch), folding would erase the dispatch.
-// Returns true when at least two branches name *different* identifiers.
-static bool generic_has_distinct_targets(Token *open) {
-	Token *close = tok_match(open);
-	if (!close) return false;
-
-	Token *assoc_start = generic_find_assoc_start(open);
-	if (!assoc_start) return false;
-
-	// Walk the association list.  After each ':' at depth 0, find the
-	// first identifier (skipping casts / parens).  Collect branch names.
-	const char *first_name = NULL;
-	int first_len = 0;
-	for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
-		if (t->flags & TF_OPEN) {
-			if (tok_match(t)) t = tok_match(t);
-			continue;
-		}
-		if (!match_ch(t, ':')) continue;
-		// Scan forward for first identifier, skipping nested parens.
-		// Walk past member-access chains (obj.member, ptr->member) so
-		// obj.handle_int vs obj.handle_float compare "handle_int"/"handle_float",
-		// not "obj"/"obj".
-		bool found_ident = false;
-		for (Token *b = tok_next(t); b && b != close; b = tok_next(b)) {
-			if (b->flags & TF_OPEN) {
-				if (tok_match(b)) b = tok_match(b);
-				continue;
-			}
-			if (match_ch(b, ',')) break; // next association
-			if (!is_valid_varname(b)) continue;
-			found_ident = true;
-			// Walk past .member / ->member chains to the terminal identifier.
-			while (b && tok_next(b) && tok_next(b) != close &&
-			       (match_ch(tok_next(b), '.') || equal(tok_next(b), "->")) &&
-			       tok_next(tok_next(b)) && is_valid_varname(tok_next(tok_next(b)))) {
-				b = tok_next(tok_next(b));
-			}
-			if (!first_name) {
-				first_name = tok_loc(b);
-				first_len = b->len;
-			} else if (b->len != first_len ||
-				   memcmp(tok_loc(b), first_name, first_len) != 0) {
-				return true; // distinct target found
-			}
-			break;
-		}
-		// No identifier at depth 0 — could be a literal like
-		// `default: 0` or a wrapped call like `(const void*)(bsearch(...))`.
-		// Deep-scan all tokens including inside balanced groups: if NO
-		// non-type identifier exists at any depth, it is a literal-only
-		// target and genuinely distinct.
-		if (!found_ident) {
-			bool has_real_ident = false;
-			int depth = 0;
-			for (Token *d = tok_next(t); d && d != close; d = tok_next(d)) {
-				if (d->flags & TF_OPEN) depth++;
-				else if (d->flags & TF_CLOSE) depth--;
-				if (depth == 0 && match_ch(d, ',')) break;
-				if (is_valid_varname(d) &&
-				    !(d->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE |
-						TT_STORAGE | TT_ATTR | TT_TYPEOF | TT_BITINT))) {
-					has_real_ident = true;
-					break;
-				}
-			}
-			if (!has_real_ident) return true;
-		}
-	}
-	return false;
-}
-
-// Shared preamble for _Generic rewriters: validate structure, check for multi-branch
-// dispatch, and skip the controlling expression to find the association list start.
-// Returns false if the _Generic is not rewritable.
-static bool generic_rewrite_preamble(Token *generic_tok, Token **open_out,
-				     Token **close_out, Token **after_out,
-				     Token **assoc_start_out) {
-	Token *open = tok_next(generic_tok);
-	if (!open || !match_ch(open, '(') || !tok_match(open)) return false;
-
-	Token *close = tok_match(open);
-	Token *after = skip_noise(tok_next(close));
-	if (!after) return false;
-
-	if (generic_has_distinct_targets(open)) return false;
-
-	Token *assoc_start = generic_find_assoc_start(open);
-	if (!assoc_start) return false;
-
-	*open_out = open;
-	*close_out = close;
-	*after_out = after;
-	*assoc_start_out = assoc_start;
-	return true;
-}
-
-static bool generic_decl_rewrite_target(Token *generic_tok, Token **name_out,
-					Token **params_open_out,
-					Token **params_close_out,
-					Token **next_out) {
-	Token *open, *close, *after, *assoc_start;
-	if (!generic_rewrite_preamble(generic_tok, &open, &close, &after, &assoc_start))
-		return false;
-
-	// Pattern 1: _Generic(...name(decl-params)...) ;/attr
-	if (match_set(after, CH(';') | CH(',')) || (after->tag & TT_ATTR) ||
-	    is_c23_attr(after)) {
-		for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
-			Token *call_open = skip_noise(tok_next(t));
-			if (!is_valid_varname(t) || !call_open || !match_ch(call_open, '(') || !tok_match(call_open))
-				continue;
-			if (!params_look_like_decls(call_open)) continue;
-
-			*name_out = t;
-			*params_open_out = call_open;
-			*params_close_out = tok_match(call_open);
-			*next_out = after;
-			return true;
-		}
-	}
-
-	// Pattern 2: _Generic(...(cast)name)(decl-params) ;/attr
-	if (match_ch(after, '(') && tok_match(after) && params_look_like_decls(after)) {
-		Token *ext_close = tok_match(after);
-		Token *after_ext = skip_noise(tok_next(ext_close));
-		if (after_ext && (match_ch(after_ext, ';') || match_ch(after_ext, ',') ||
-		    (after_ext->tag & TT_ATTR) || is_c23_attr(after_ext))) {
-			Token *found = NULL;
-			for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
-				if (is_valid_varname(t)) found = t;
-			}
-			if (found) {
-				*name_out = found;
-				*params_open_out = after;
-				*params_close_out = ext_close;
-				*next_out = after_ext;
-				return true;
-			}
-		}
-	}
-
-	return false;
-}
-
-static bool generic_member_rewrite_target(Token *generic_tok, Token **name_out,
-					  Token **args_open_out,
-					  Token **args_close_out,
-					  Token **next_out) {
-	Token *open, *close, *after, *assoc_start;
-	if (!generic_rewrite_preamble(generic_tok, &open, &close, &after, &assoc_start))
-		return false;
-
-	for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
-		Token *call_open = skip_noise(tok_next(t));
-		if (!is_valid_varname(t) || !call_open || !match_ch(call_open, '(') || !tok_match(call_open))
-			continue;
-		if (params_look_like_decls(call_open)) continue;
-
-		*name_out = t;
-		*args_open_out = call_open;
-		*args_close_out = tok_match(call_open);
-		*next_out = after;
-		return true;
-	}
-
-	return false;
 }
 
 // Try _Generic member rewrite: struct.strstr() → _Generic.
@@ -2098,8 +1741,7 @@ static Token *walk_balanced(Token *tok, bool emit) {
 			// Statement expression ({...}): recurse with processing.
 			// Detects both nested stmt-exprs (t != tok) and the case
 			// where walk_balanced is called directly on a stmt-expr '('.
-			if ((t->flags & TF_OPEN) && match_ch(t, '(') &&
-			    tok_next(t) && match_ch(tok_next(t), '{')) {
+			if ((t->flags & TF_OPEN) && is_stmt_expr_open(t)) {
 				emit_tok(t); // '('
 				Token *se_end = tok_match(t);
 				Token *inner = tok_next(t); // '{'
@@ -2171,7 +1813,7 @@ static void emit_token_range_orelse(Token *start, Token *end) {
 			if (t != start) out_char(' ');
 			// Statement expression ({...}): route through walk_balanced
 			// which has the full keyword dispatcher (goto, return, defer).
-			if (match_ch(t, '(') && tok_next(t) && match_ch(tok_next(t), '{') && tok_match(t)) {
+			if (is_stmt_expr_open(t) && tok_match(t)) {
 				walk_balanced(t, true);
 				t = tok_match(t);
 				continue;
@@ -2412,8 +2054,7 @@ static Token *walk_balanced_orelse(Token *tok) {
 			}
 			// GNU statement expression ({...}): route through walk_balanced which
 			// handles zero-init, defer, goto, raw stripping, etc.
-			if (t != tok && t != end && (t->flags & TF_OPEN) && match_ch(t, '(') &&
-			    tok_next(t) && match_ch(tok_next(t), '{')) {
+			if (t != tok && t != end && (t->flags & TF_OPEN) && is_stmt_expr_open(t)) {
 				t = walk_balanced(t, true);
 				continue;
 			}
@@ -2694,7 +2335,7 @@ static Token *emit_orelse_fallback_value(Token *tok, Token *stop_comma, Token **
 	*chain_next = NULL;
 	while (tok->kind != TK_EOF) {
 		if (tok->flags & TF_OPEN) {
-			if (match_ch(tok, '(') && tok_next(tok) && match_ch(tok_next(tok), '{'))
+			if (is_stmt_expr_open(tok))
 				error_tok(tok, "GNU statement expressions in orelse fallback values are not "
 					  "supported; use 'orelse { ... }' block form instead");
 			tok = walk_balanced(tok, true);
@@ -2880,7 +2521,7 @@ static void check_orelse_in_parens(Token *open) {
 	Token *close = tok_match(open);
 	// Statement expressions ({ ... }): orelse inside is at its own
 	// declaration scope, not at the paren top level — skip entirely.
-	if (match_ch(open, '(') && tok_next(open) && match_ch(tok_next(open), '{') && close)
+	if (is_stmt_expr_open(open) && close)
 		return;
 	for (Token *pi = open, *t = tok_next(open); t != close; pi = t, t = tok_next(t)) {
 		// Skip brackets containing orelse — these are VLA dimensions
@@ -2909,8 +2550,7 @@ static void check_orelse_in_parens(Token *open) {
 		// Skip statement expression boundaries ({ ... }) — orelse inside
 		// a stmt-expr is at its own declaration scope, not at the paren
 		// top level.  Jump to the matching ')' of the '(' that opens it.
-		if (match_ch(t, '(') && tok_next(t) && match_ch(tok_next(t), '{') &&
-		    tok_match(t)) {
+		if (is_stmt_expr_open(t) && tok_match(t)) {
 			t = tok_match(t);
 			continue;
 		}
@@ -3624,8 +3264,7 @@ static Token *try_zero_init_decl(Token *tok) {
 		if (!probe.var_name || !probe.end) return NULL;
 		if (match_ch(probe.end, '=')) {
 			Token *aeq = tok_next(probe.end);
-			if (aeq && match_ch(aeq, '(') && tok_next(aeq) &&
-			    match_ch(tok_next(aeq), '{') && tok_match(aeq)) {
+			if (aeq && is_stmt_expr_open(aeq) && tok_match(aeq)) {
 				Token *after_se = tok_next(tok_match(aeq));
 				bool is_orelse = after_se && is_orelse_keyword(after_se);
 				if (!after_se || (!match_ch(after_se, ',') && !is_orelse)) {
@@ -3709,157 +3348,6 @@ static Token *emit_expr_to_semicolon(Token *tok) {
 		tok = tok_next(tok);
 	}
 	return tok;
-}
-
-// Validate control flow keywords inside defer blocks are safe.
-// Validation is statement-structured so loop/switch scope does not leak across siblings.
-static inline Token *skip_defer_control_head(Token *tok) {
-	tok = skip_noise(tok);
-	if (tok && match_ch(tok, '(') && tok_match(tok)) return tok_next(tok_match(tok));
-	return tok;
-}
-
-static void validate_defer_control_flow(Token *t, bool in_loop, bool in_switch) {
-	if (!t) return;
-	if (t->tag & TT_RETURN)
-		error_tok(t, "'return' inside defer block bypasses remaining defers");
-	if ((t->tag & TT_GOTO) && !is_known_typedef(t))
-		error_tok(t, "'goto' inside defer block could bypass remaining defers");
-	if ((t->tag & TT_BREAK) && !in_loop && !in_switch)
-		error_tok(t, "'break' inside defer block bypasses remaining defers");
-	if ((t->tag & TT_CONTINUE) && !in_loop)
-		error_tok(t, "'continue' inside defer block bypasses remaining defers");
-}
-
-static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch, int depth);
-
-// Flat-scan a balanced () or [] group for hidden GNU statement expressions ({...}).
-// Walks all tokens inside open..close looking for the two-token '(' '{' signature;
-// catches stmt-exprs at arbitrary nesting depth without recursive group descent.
-static void defer_scan_hidden_stmt_exprs(Token *open, bool in_loop, bool in_switch, int depth) {
-	Token *end = tok_match(open);
-	if (!end) return;
-	for (Token *t = tok_next(open); t && t != end && t->kind != TK_EOF; ) {
-		if (match_ch(t, '(') && tok_next(t) && match_ch(tok_next(t), '{')) {
-			validate_defer_statement(tok_next(t), in_loop, in_switch, depth + 1);
-			t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t);
-		} else {
-			t = tok_next(t);
-		}
-	}
-}
-
-static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch, int depth) {
-	if (depth >= 4096) error_tok(tok, "braceless control flow nesting depth exceeds 4096");
-	tok = skip_noise(tok);
-	if (!tok || tok->kind == TK_EOF) return tok;
-
-	if (match_ch(tok, '{')) {
-		Token *end = tok_match(tok);
-		for (tok = skip_noise(tok_next(tok)); tok && tok != end && tok->kind != TK_EOF; tok = skip_noise(tok)) {
-			Token *next = validate_defer_statement(tok, in_loop, in_switch, depth);
-			if (next == tok) break;
-			tok = next;
-		}
-		return end ? tok_next(end) : tok;
-	}
-
-	if (equal(tok, "if")) {
-		Token *after_then = validate_defer_statement(skip_defer_control_head(tok_next(tok)), in_loop, in_switch, depth + 1);
-		Token *else_tok = skip_noise(after_then);
-		if (else_tok && equal(else_tok, "else"))
-			return validate_defer_statement(tok_next(else_tok), in_loop, in_switch, depth + 1);
-		return after_then;
-	}
-
-	if (tok->tag & (TT_CASE | TT_DEFAULT)) {
-		int td = 0;
-		for (tok = tok_next(tok); tok && tok->kind != TK_EOF; tok = tok_next(tok)) {
-			if (tok->flags & TF_OPEN) {
-				if (match_ch(tok, '(') || match_ch(tok, '['))
-					defer_scan_hidden_stmt_exprs(tok, in_loop, in_switch, depth);
-				tok = tok_match(tok) ? tok_match(tok) : tok;
-				continue;
-			}
-			if (match_ch(tok, '?')) { td++; continue; }
-			if (match_ch(tok, ':')) { if (td > 0) { td--; continue; } break; }
-		}
-		return tok && match_ch(tok, ':') ? validate_defer_statement(tok_next(tok), in_loop, in_switch, depth + 1) : tok;
-	}
-
-	if (tok->tag & TT_SWITCH)
-		return validate_defer_statement(skip_defer_control_head(tok_next(tok)), in_loop, true, depth + 1);
-
-	if (tok->tag & TT_LOOP) {
-		if (equal(tok, "do")) {
-			tok = validate_defer_statement(tok_next(tok), true, in_switch, depth + 1);
-			Token *w = skip_noise(tok);
-			if (w && equal(w, "while")) {
-				tok = skip_defer_control_head(tok_next(w));
-				tok = skip_noise(tok);
-				if (tok && match_ch(tok, ';')) tok = tok_next(tok);
-			}
-			return tok;
-		}
-		return validate_defer_statement(skip_defer_control_head(tok_next(tok)), true, in_switch, depth + 1);
-	}
-
-	if (tok->flags & TF_OPEN) {
-		// GNU statement expression ({...}): validate the inner block recursively
-		if (match_ch(tok, '(') && tok_next(tok) && match_ch(tok_next(tok), '{')) {
-			Token *inner_brace = tok_next(tok);
-			validate_defer_statement(inner_brace, in_loop, in_switch, depth + 1);
-			return tok_match(tok) ? tok_next(tok_match(tok)) : tok_next(tok);
-		}
-		// ( or [ starting a statement (e.g. cast prefix, compound literal):
-		// fall through to catch-all which scans the full expression to ';'
-		// for hidden stmt-exprs like (void)({return;0;}).
-	}
-
-	// Labeled statement: ident ':' <stmt>
-	if (tok->kind == TK_IDENT && tok_next(tok) && match_ch(tok_next(tok), ':'))
-		error_tok(tok, "labels inside defer blocks produce duplicate labels "
-			  "when the defer body is copied to multiple exit points");
-
-	if (tok->kind == TK_KEYWORD) {
-		validate_defer_control_flow(tok, in_loop, in_switch);
-		if ((tok->tag & TT_DEFER) && !is_known_typedef(tok) &&
-		    !match_ch(tok_next(tok), ':') && !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN)))
-			error_tok(tok, "nested defer is not supported");
-	}
-
-	// Scan for orelse with forbidden control flow before skipping
-	if (FEAT(F_ORELSE)) {
-		for (Token *s = tok; s && s->kind != TK_EOF && !match_ch(s, ';'); s = tok_next(s)) {
-			if (s->flags & TF_OPEN) { s = tok_match(s); continue; }
-			if (is_orelse_kw_shadow(s)) {
-				Token *act = tok_next(s);
-				// Phase 1F: reject empty orelse action (orelse ;)
-				// Moved from Pass 2 emit_deferred_orelse.
-				if (act && match_ch(act, ';'))
-					error_tok(s, "expected statement after 'orelse'");
-				validate_defer_control_flow(act, in_loop, in_switch);
-				if (act && match_ch(act, '{'))
-					validate_defer_statement(act, in_loop, in_switch, depth + 1);
-				break;
-			}
-		}
-	}
-
-	// Catch-all: walk to semicolon, recursively validating any GNU statement
-	// expressions ({...}) encountered along the way.
-	for (Token *s = tok; s && s->kind != TK_EOF && !match_ch(s, ';'); s = tok_next(s)) {
-		if (s->flags & TF_OPEN) {
-			if (match_ch(s, '(') && tok_next(s) && match_ch(tok_next(s), '{'))
-				validate_defer_statement(tok_next(s), in_loop, in_switch, depth + 1);
-			else if (match_set(s, CH('(') | CH('[')) || match_ch(s, '{'))
-				defer_scan_hidden_stmt_exprs(s, in_loop, in_switch, depth);
-			s = tok_match(s) ? tok_match(s) : s;
-			continue;
-		}
-	}
-	Token *semi = skip_to_semicolon(tok);
-	return (semi && semi->kind != TK_EOF) ? tok_next(semi) : semi;
 }
 
 // Check if 'defer' appears inside an attribute context: __attribute__((..., defer, ...))
@@ -7066,7 +6554,7 @@ uint16_t sid = next_scope_id++;
 			p1d_prev = tok;
 			if (tok->flags & TF_OPEN && tok_match(tok)) {
 				// Do not skip GNU statement expressions — process their body normally
-				if (match_ch(tok, '(') && tok_next(tok) && match_ch(tok_next(tok), '{')) {
+				if (is_stmt_expr_open(tok)) {
 					tok = tok_next(tok); // advance past '(' to '{'
 					at_stmt_start = true;
 					continue;
