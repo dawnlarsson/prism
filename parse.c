@@ -257,9 +257,6 @@ enum // Feature flags
 	F_AUTO_UNREACHABLE = 64
 };
 
-struct ArenaBlock;
-typedef struct ArenaBlock ArenaBlock;
-
 struct ArenaBlock {
 	ArenaBlock *next;
 	size_t used;
@@ -840,7 +837,7 @@ static void warn_tok(Token *tok, const char *fmt, ...) {
 }
 
 static inline bool equal_n(Token *tok, const char *op, size_t len) {
-	return tok->len == (int)len && tok->ch0 == (uint8_t)op[0] &&
+	return tok->len == (uint32_t)len && tok->ch0 == (uint8_t)op[0] &&
 	       !memcmp(tok_loc(tok) + 1, op + 1, len - 1);
 }
 
@@ -911,7 +908,8 @@ static void init_keyword_map(void) {
 	    {"alignof", TT_SKIP_DECL, true, TF_SIZEOF},
 	    {"_Alignof", TT_SKIP_DECL, true, TF_SIZEOF},
 	    {"_Generic", TT_SKIP_DECL | TT_GENERIC, true},
-	    {"_Static_assert", 0, true},
+	    {"_Static_assert", TT_SKIP_DECL, true},
+	    {"static_assert", TT_SKIP_DECL, true},
 	    {"struct", TT_TYPE | TT_SUE, true},
 	    {"union", TT_TYPE | TT_SUE, true},
 	    {"enum", TT_TYPE | TT_SUE, true},
@@ -923,7 +921,8 @@ static void init_keyword_map(void) {
 	    {"volatile", TT_QUALIFIER | TT_VOLATILE, true},
 	    {"restrict", TT_QUALIFIER, true},
 	    {"_Atomic", TT_QUALIFIER | TT_TYPE, true},
-	    {"_Noreturn", TT_SKIP_DECL, true},
+	    {"_Noreturn", TT_SKIP_DECL | TT_INLINE, true},
+	    {"noreturn", TT_SKIP_DECL | TT_INLINE, true},
 	    {"__inline", TT_INLINE, true},
 	    {"__inline__", TT_INLINE, true},
 	    {"_Thread_local", TT_STORAGE, true},
@@ -969,7 +968,7 @@ static void init_keyword_map(void) {
 	    {"__declspec", TT_ATTR | TT_QUALIFIER, true},
 	    {"_Pragma", TT_ATTR, true},
 	    {"__pragma", TT_ATTR, true},
-	    {"__extension__", 0, true},
+	    {"__extension__", TT_SKIP_DECL, true},
 	    {"__builtin_va_list", 0, true},
 	    {"__builtin_va_arg", 0, true},
 	    {"__builtin_offsetof", 0, true, TF_SIZEOF},
@@ -1287,10 +1286,6 @@ static inline void classify_punct(Token *t) {
 static inline bool delimiters_match(Token *open, Token *close) {
 	char a = open->ch0, b = close->ch0;
 	return a == '(' ? b == ')' : b == a + 2;
-}
-
-static inline bool tok_name_eq(Token *a, Token *b) {
-	return a->len == b->len && memcmp(tok_loc(a), tok_loc(b), a->len) == 0;
 }
 
 static Token *find_wrapper_callee(Token *body) {
@@ -1942,10 +1937,6 @@ static Token *tokenize(File *file) {
 					if (s->tag & (TT_SKIP_DECL | TT_INLINE | TT_QUALIFIER |
 						       TT_TYPE | TT_STORAGE))
 						continue;
-					if (equal(s, "_Noreturn") || equal(s, "noreturn") ||
-					    equal(s, "__attribute__") || equal(s, "void") ||
-					    equal(s, "__typeof__") || equal(s, "typeof"))
-						continue;
 					fn_name = s;
 					break;
 				}
@@ -2196,6 +2187,17 @@ static inline Token *skip_balanced_group(Token *tok) {
 static inline Token *skip_prep_dirs(Token *tok) {
 	while (tok && tok->kind == TK_PREP_DIR) tok = tok_next(tok);
 	return tok;
+}
+
+static bool is_pp_conditional(Token *s) {
+	if (s->kind != TK_PREP_DIR) return false;
+	const char *dp = tok_loc(s);
+	if (*dp == '#') dp++;
+	while (*dp == ' ' || *dp == '\t') dp++;
+	return strncmp(dp, "ifdef", 5) == 0 || strncmp(dp, "ifndef", 6) == 0 ||
+	       strncmp(dp, "elif",  4) == 0 || strncmp(dp, "else",   4) == 0 ||
+	       strncmp(dp, "endif", 5) == 0 ||
+	       (strncmp(dp, "if", 2) == 0 && (dp[2]==' '||dp[2]=='\t'||dp[2]=='('));
 }
 
 // Skip noise tokens (attributes, C23 [[...]], prep dirs) in analysis mode.
@@ -2501,7 +2503,7 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 							Token *call_end = skip_balanced_group(tok_next(inner));
 							bool is_deref = (prev_inner->len == 1 && prev_inner->ch0 == '*') ||
 							    (call_end && call_end != end &&
-							     ((call_end->len == 1 && call_end->ch0 == '[') || equal(call_end, "->") || (call_end->len == 1 && call_end->ch0 == '.')));
+							     ((call_end->len == 1 && call_end->ch0 == '[') || (call_end->tag & TT_MEMBER)));
 							if (is_deref)
 								for (Token *a = tok_next(tok_next(inner)); a && a != call_end; a = tok_next(a))
 									if (is_valid_varname(a) && !is_known_enum_const(a) &&
@@ -2522,7 +2524,7 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 					SKIP_NOISE_CONTINUE(tok);
 					if ((tok->len == 1 && (tok->ch0 == '*' || tok->ch0 == '&' || tok->ch0 == '!' ||
 					    tok->ch0 == '+' || tok->ch0 == '-' || tok->ch0 == '~')) ||
-					    equal(tok, "++") || equal(tok, "--") ||
+					    (tok->len == 2 && (tok->ch0 == '+' || tok->ch0 == '-')) ||
 					    is_sizeof_like(tok)) {
 						tok = tok_next(tok);
 						continue;
@@ -2689,15 +2691,15 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 
 		bool had_type = r.saw_type;
 
-		if ((tag & TT_STORAGE) && equal(tok, "extern")) r.has_extern = true;
-		if ((tag & TT_STORAGE) && equal(tok, "static")) r.has_static = true;
+		if ((tag & TT_STORAGE) && tok->ch0 == 'e') r.has_extern = true;
+		if ((tag & TT_STORAGE) && tok->ch0 == 's') r.has_static = true;
 
 		if (tag & TT_QUALIFIER) {
 			if (tag & TT_VOLATILE) r.has_volatile = true;
 			if (tag & TT_REGISTER) r.has_register = true;
 			if (tag & TT_CONST) r.has_const = true;
 			if (tag & TT_TYPE) {
-				if (equal(tok, "auto")) r.saw_type = true;
+				if (tok->ch0 == 'a') r.saw_type = true;
 				else r.has_atomic = true;
 			}
 		}
@@ -2750,7 +2752,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 
 		// typeof/typeof_unqual/__typeof__
 		if (tag & TT_TYPEOF) {
-			bool is_unqual = equal(tok, "typeof_unqual");
+			bool is_unqual = tok->len == 14;
 			r.saw_type = true;
 			r.has_typeof = true;
 			tok = tok_next(tok);
@@ -2979,7 +2981,7 @@ unwind_if:
 		tn = 0;
 		if (!tok) goto unwind_if;
 		Token *w = skip_prep_dirs(tok_next(tok));
-		if (!w || !(w->tag & TT_LOOP) || !equal(w, "while")) { tok = NULL; goto unwind_if; }
+		if (!w || !(w->tag & TT_LOOP) || w->ch0 != 'w') { tok = NULL; goto unwind_if; }
 		Token *p2 = skip_prep_dirs(tok_next(w));
 		if (!p2 || !(p2->len == 1 && p2->ch0 == '(') || !tok_match(p2)) { tok = NULL; goto unwind_if; }
 		Token *a = skip_prep_dirs(tok_next(tok_match(p2)));
@@ -3158,10 +3160,10 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 		return end ? tok_next(end) : tok;
 	}
 
-	if (equal(tok, "if")) {
+	if ((tok->tag & TT_IF) && tok->ch0 == 'i') {
 		Token *after_then = validate_defer_statement(skip_defer_control_head(tok_next(tok)), in_loop, in_switch, depth + 1);
 		Token *else_tok = skip_noise(after_then);
-		if (else_tok && equal(else_tok, "else"))
+		if (else_tok && (else_tok->tag & TT_IF) && else_tok->ch0 == 'e')
 			return validate_defer_statement(tok_next(else_tok), in_loop, in_switch, depth + 1);
 		return after_then;
 	}
@@ -3185,10 +3187,10 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 		return validate_defer_statement(skip_defer_control_head(tok_next(tok)), in_loop, true, depth + 1);
 
 	if (tok->tag & TT_LOOP) {
-		if (equal(tok, "do")) {
+		if (tok->ch0 == 'd') {
 			tok = validate_defer_statement(tok_next(tok), true, in_switch, depth + 1);
 			Token *w = skip_noise(tok);
-			if (w && equal(w, "while")) {
+			if (w && (w->tag & TT_LOOP) && w->ch0 == 'w') {
 				tok = skip_defer_control_head(tok_next(w));
 				tok = skip_noise(tok);
 				if (tok && match_ch(tok, ';')) tok = tok_next(tok);
@@ -3310,7 +3312,7 @@ static bool generic_has_distinct_targets(Token *open) {
 			if (!is_valid_varname(b)) continue;
 			found_ident = true;
 			while (b && tok_next(b) && tok_next(b) != close &&
-			       (match_ch(tok_next(b), '.') || equal(tok_next(b), "->")) &&
+			       (tok_next(b)->tag & TT_MEMBER) &&
 			       tok_next(tok_next(b)) && is_valid_varname(tok_next(tok_next(b)))) {
 				b = tok_next(tok_next(b));
 			}
@@ -3515,6 +3517,33 @@ static bool has_storage_in(Token *from, Token *to) {
 }
 
 // Find the scope_tree entry whose opening brace matches 'body_start'.
+static inline uint64_t defer_name_bloom_bit(const char *name, int len) {
+	uint32_t h = 2166136261u;
+	for (int i = 0; i < len; i++)
+		h = (h ^ (uint8_t)name[i]) * 16777619u;
+	return 1ULL << (h & 63);
+}
+
+static bool needs_space(Token *prev, Token *tok) {
+	if (!prev || tok_at_bol(tok)) return false;
+	if (tok_has_space(tok)) return true;
+	if ((is_identifier_like(prev) || prev->kind == TK_NUM) &&
+	    (is_identifier_like(tok) || tok->kind == TK_NUM))
+		return true;
+	if (prev->kind != TK_PUNCT || tok->kind != TK_PUNCT) return false;
+	char a = (prev->len == 1) ? prev->ch0 : tok_loc(prev)[prev->len - 1];
+	char b = tok->ch0;
+	if (b == '=') return strchr("=!<>+-*/%&|^", a) != NULL;
+	return (a == b && strchr("+-<>&|#", a)) || (a == '-' && b == '>') || 
+	       (a == '/' && b == '*') || (a == '*' && b == '/');
+}
+
+static bool declarator_has_bracket_orelse(Token *start, Token *end) {
+	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t))
+		if (tok_ann(t) & P1_OE_BRACKET) return true;
+	return false;
+}
+
 static uint16_t find_body_scope_id(Token *body_start) {
 	if (body_start && match_ch(body_start, '{')) {
 		uint32_t idx = tok_idx(body_start);

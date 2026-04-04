@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 1.0.4
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4073+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4147+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -128,9 +128,7 @@ ScopeNode {
     is_loop            : bool :1
     is_switch          : bool :1
     is_struct          : bool :1
-    has_zeroinit_decl  : bool :1   — scope contains at least one zero-initialized decl
     is_stmt_expr       : bool :1   — GNU statement expression ({...})
-    is_orelse_guard     : bool :1   — orelse if-guard scope
     is_ctrl_se         : bool :1   — stmt-expr inside ctrl parens (ctrl_state saved on ctrl_save_stack)
 }
 ```
@@ -451,8 +449,8 @@ Tokens with tag bits or at statement boundaries are dispatched to handlers:
 |---|---|---|
 | `handle_goto_keyword` | `TT_GOTO` | Emit defer cleanup (LIFO unwinding to target label depth), emit `goto`. Safety checks are in Phase 2A. |
 | `handle_case_default` | `TT_CASE` / `TT_DEFAULT` | Bail out early if `ctrl_state.pending && parens_just_closed` (braceless switch body — no `SCOPE_BLOCK` was pushed, so `find_switch_scope()` would leak to an enclosing braced switch). Otherwise, reset defer stack to switch scope level. Error checks are in Phase 2A. |
-| `handle_open_brace` | `{` | Push scope. Read `P1_SCOPE_*` from `tok->ann` for classification. Handle compound-literal-in-ctrl-paren, orelse guard, stmt_expr detection. |
-| `handle_close_brace` | `}` | Pop scopes, emit defers (LIFO), handle orelse guard close (consume trailing `;` to prevent dangling-else). |
+| `handle_open_brace` | `{` | Push scope. Read `P1_SCOPE_*` from `tok->ann` for classification. Handle compound-literal-in-ctrl-paren, stmt_expr detection. |
+| `handle_close_brace` | `}` | Pop scopes, emit defers (LIFO), restore ctrl_state for stmt-expr inside ctrl parens. |
 | `try_zero_init_decl` | Statement start, type keyword/typedef | Parse declaration, insert `= {0}` or `= 0` or `memset` call. |
 | `p1_label_find` | `TT_GOTO` dispatch | O(1) label lookup via `FuncMeta.label_hash` (persisted from Phase 2A); falls back to linear scan if no hash. |
 | Orelse handlers | `TT_ORELSE` | Multiple handlers for bracket, decl-init, block, bare-assign, bare-action, bare-compound forms. |
@@ -484,7 +482,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 ### Defer-variable shadow checking
 
-`check_defer_var_shadow` detects when a newly-declared variable name appears in an active defer body — this would silently capture the wrong variable at cleanup time. Uses `FuncMeta.defer_name_bloom` (a 64-bit FNV-1a bloom filter of all identifier names in defer bodies) for an O(1) fast-reject before the O(N×M) body walk — eliminates the walk in the common case when no name matches. The body walk tracks brace depth: identifiers inside nested `{ }` blocks within the defer body (depth > 1) are skipped, since they are local declarations that cannot conflict with outer-scope variables. This avoids false positives for patterns like `defer { { int tmp = 1; } }` where the inner `tmp` is purely internal to the defer body. GNU statement expressions `({...})` are tracked via `se_depth`/`se_brace[]`: when `({` is encountered, the scanner records the current brace depth and increments `se_depth`; declarations inside the statement expression are recognized as local (the `paren_depth == se_depth` check replaces the strict `paren_depth == 0` requirement), preventing false positives from hygienic macros like `SAFE_MAX(a, b)` that declare temporaries inside `({...})`. The scanner also tracks C99 for-init declarations (`for(TYPE name = ...)`) via `for_init_pd`/`for_name_hid`/`for_body_bd`: when a for-init variable matches the target name, all references to that name within the for scope (condition, increment, and body) are treated as local rather than captured, preventing false positives.
+`check_defer_var_shadow` detects when a newly-declared variable name appears in an active defer body — this would silently capture the wrong variable at cleanup time. Uses `FuncMeta.defer_name_bloom` (a 64-bit FNV-1a bloom filter of all identifier names in defer bodies) for an O(1) fast-reject before the O(N×M) body walk — eliminates the walk in the common case when no name matches. The body walk is implemented in the shared helper `defer_body_refs_name(body, body_end, name, nlen)`, which returns true if the name is referenced (not locally declared) in the token range. This helper is used by both `check_defer_var_shadow` (Pass 2 enclosing-scope + same-block checking) and `p1_check_defer_same_block_shadow` (Phase 1D same-scope checking), eliminating ~70 lines of duplicated token-walk logic. The body walk tracks brace depth: identifiers inside nested `{ }` blocks within the defer body (depth > 1) are skipped, since they are local declarations that cannot conflict with outer-scope variables. This avoids false positives for patterns like `defer { { int tmp = 1; } }` where the inner `tmp` is purely internal to the defer body. GNU statement expressions `({...})` are tracked via `se_depth`/`se_brace[]`: when `({` is encountered, the scanner records the current brace depth and increments `se_depth`; declarations inside the statement expression are recognized as local (the `paren_depth == se_depth` check replaces the strict `paren_depth == 0` requirement), preventing false positives from hygienic macros like `SAFE_MAX(a, b)` that declare temporaries inside `({...})`. The scanner also tracks C99 for-init declarations (`for(TYPE name = ...)`) via `for_init_pd`/`for_name_hid`/`for_body_bd`: when a for-init variable matches the target name, all references to that name within the for scope (condition, increment, and body) are treated as local rather than captured, preventing false positives.
 
 The scan covers two ranges: enclosing-scope defers `[0, blk->defer_start_idx)` and same-block defers `[blk->defer_start_idx, defer_count)`. Enclosing-scope matches register a `DeferShadow` entry for deferred checking at control-flow exits (`check_defer_shadow_at_exit`). Same-block matches produce an immediate error — the shadowing variable is unconditionally live when the defer fires at block end, so no control-flow analysis is needed. For-init declarations are exempt from the same-block immediate error (they use deferred `DeferShadow` checking instead) because their implicit scope ends at the loop boundary. A token-index range guard (`var_idx ∈ [defer.stmt, defer.end)`) prevents false positives from declarations inside defer bodies matching against their own body (e.g., `defer { char buf[16]; ... }`).
 

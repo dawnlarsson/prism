@@ -1228,7 +1228,7 @@ static void test_orelse_for_init_rejected(void) {
 	    "}\n",
 	    "orelse_for_init_reject.c",
 	    "orelse for-init: rejected",
-	    "for-loop initializers");
+	    "control statement condition");
 }
 
 static void test_orelse_missing_action_rejected(void) {
