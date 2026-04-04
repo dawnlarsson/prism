@@ -3481,10 +3481,21 @@ static inline bool is_assignment_operator_token(Token *tok) {
 // Returns true if 'raw' is followed by a declaration context (type keyword, typedef, *, etc.)
 static bool is_raw_declaration_context(Token *after_raw) {
 	after_raw = skip_noise(after_raw);
-	return after_raw && (is_type_keyword(after_raw) || is_known_typedef(after_raw) ||
-			     match_ch(after_raw, '*') ||
-			     (after_raw->tag & (TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_INLINE | TT_TYPEDEF)) ||
-			     ((after_raw->flags & TF_RAW) && !is_known_typedef(after_raw)));
+	if (!after_raw) return false;
+	if (is_type_keyword(after_raw) || is_known_typedef(after_raw) ||
+	    (after_raw->tag & (TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_INLINE | TT_TYPEDEF)) ||
+	    ((after_raw->flags & TF_RAW) && !is_known_typedef(after_raw)))
+		return true;
+	// Distinguish pointer declaration (raw *x) from multiplication (raw * 5).
+	// In a declaration, * is followed by another *, qualifier, (, or an identifier.
+	if (match_ch(after_raw, '*')) {
+		Token *after_star = skip_noise(tok_next(after_raw));
+		while (after_star && (match_ch(after_star, '*') ||
+		       (after_star->tag & TT_QUALIFIER)))
+			after_star = skip_noise(tok_next(after_star));
+		return after_star && (is_valid_varname(after_star) || match_ch(after_star, '('));
+	}
+	return false;
 }
 
 // Extended raw context: also matches per-declarator raw after comma (int x, raw y;)
@@ -3514,14 +3525,6 @@ static bool has_storage_in(Token *from, Token *to) {
 	for (Token *s = from; s && s != to; s = tok_next(s))
 		if (s->tag & TT_STORAGE) return true;
 	return false;
-}
-
-// Find the scope_tree entry whose opening brace matches 'body_start'.
-static inline uint64_t defer_name_bloom_bit(const char *name, int len) {
-	uint32_t h = 2166136261u;
-	for (int i = 0; i < len; i++)
-		h = (h ^ (uint8_t)name[i]) * 16777619u;
-	return 1ULL << (h & 63);
 }
 
 static bool needs_space(Token *prev, Token *tok) {

@@ -144,7 +144,7 @@ typedef struct {
 	bool has_computed_goto;    // Function contains a computed goto (*ptr)
 	int entry_start;           // Start index into p1_entries[] for this function
 	int entry_count;           // Number of P1FuncEntry items for this function
-	uint64_t defer_name_bloom; // Bloom filter of identifier names in defer bodies
+	HashMap defer_name_set; // Exact set of identifier names in defer bodies
 	int *label_hash;           // Open-addressing hash table: name → entry index (-1=empty)
 	int label_hash_mask;       // Power-of-2 mask for label_hash probing
 } FuncMeta;
@@ -1012,7 +1012,7 @@ static void check_defer_var_shadow(Token *var_name) {
 	char *name = tok_loc(var_name);
 	int nlen = var_name->len;
 	if (current_func_idx >= 0 &&
-	    !(func_meta[current_func_idx].defer_name_bloom & defer_name_bloom_bit(name, nlen)))
+	    !hashmap_get(&func_meta[current_func_idx].defer_name_set, name, nlen))
 		return;
 	for (int i = 0; i < defer_count; i++) {
 		if (i >= outer_defer_end && i < same_block_start) continue;
@@ -2530,6 +2530,7 @@ static bool is_typeof_func_type(Token *type_start, TypeSpecResult *type, DeclRes
 	}
 	char *typeof_ident_loc = NULL;
 	int typeof_ident_len = 0;
+	Token *typeof_inner = NULL;
 	if (type->has_typeof) {
 		for (Token *ft = type_start; ft && ft != type->end; ft = tok_next(ft)) {
 			if (!(ft->tag & TT_TYPEOF)) continue;
@@ -2550,6 +2551,10 @@ static bool is_typeof_func_type(Token *type_start, TypeSpecResult *type, DeclRes
 			    !is_valid_varname(inner) || (inner->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF))) break;
 			typeof_ident_loc = tok_loc(inner);
 			typeof_ident_len = inner->len;
+			typeof_inner = inner;
+			// If the name is shadowed by a local variable, it's not a function.
+			{ TypedefEntry *shadow = typedef_lookup(inner);
+			  if (shadow && shadow->is_shadow) break; }
 			// Check func_meta for a defined function with this name.
 			for (int fi = 0; fi < func_meta_count; fi++) {
 				Token *fn = func_meta[fi].ret_type_end;
@@ -2575,9 +2580,13 @@ static bool is_typeof_func_type(Token *type_start, TypeSpecResult *type, DeclRes
 			break;
 		}
 	}
-	// func_meta only has defined functions.  Also check for
-	if (typeof_ident_loc)
+	// func_meta only has defined functions.  Also check forward declarations.
+	// But skip if the name is shadowed by a local variable at this position.
+	if (typeof_ident_loc && typeof_inner) {
+		TypedefEntry *shadow = typedef_lookup(typeof_inner);
+		if (shadow && shadow->is_shadow) return false;
 		return hashmap_get(&p1_func_proto_map, typeof_ident_loc, typeof_ident_len) != NULL;
+	}
 	return false;
 }
 
@@ -5186,7 +5195,8 @@ static void p1_register_param_shadows(Token *open, Token *close,
 		}
 		if (last_ident && (is_known_typedef(last_ident) ||
 		    is_known_enum_const(last_ident) ||
-		    (last_ident->tag & (TT_DEFER | TT_ORELSE))))
+		    (last_ident->tag & (TT_DEFER | TT_ORELSE)) ||
+		    hashmap_get(&p1_func_proto_map, tok_loc(last_ident), last_ident->len)))
 			p1_register_shadow(last_ident, scope_id, brace_depth);
 		if (check_vla && last_ident) {
 			// For outer-level identifiers (int arr[n]), the first []
@@ -5272,7 +5282,8 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 
 			if (is_known_typedef(decl.var_name) ||
 			    is_known_enum_const(decl.var_name) ||
-			    (decl.var_name->tag & (TT_DEFER | TT_ORELSE)))
+			    (decl.var_name->tag & (TT_DEFER | TT_ORELSE)) ||
+			    hashmap_get(&p1_func_proto_map, tok_loc(decl.var_name), decl.var_name->len))
 				p1_register_shadow(decl.var_name, cur_sid, brace_depth);
 
 			// Phase 1D: register CFG entry for goto-skip-decl detection
@@ -5329,7 +5340,7 @@ p1_check_defer_same_block_shadow(Token *var_name, uint16_t cur_sid, int p1d_cur_
 	if (!FEAT(F_DEFER) || p1d_cur_func < 0) return;
 	char *name = tok_loc(var_name);
 	int nlen = var_name->len;
-	if (!(func_meta[p1d_cur_func].defer_name_bloom & defer_name_bloom_bit(name, nlen))) return;
+	if (!hashmap_get(&func_meta[p1d_cur_func].defer_name_set, name, nlen)) return;
 	int start = func_meta[p1d_cur_func].entry_start;
 	for (int i = start; i < p1_entry_count; i++) {
 		P1FuncEntry *e = &p1_entries[i];
@@ -5410,8 +5421,8 @@ p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t
 			     prev_t = t, t = tok_next(t)) {
 				if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
 				    !(prev_t && (prev_t->tag & TT_MEMBER)))
-					func_meta[p1d_cur_func].defer_name_bloom |=
-						defer_name_bloom_bit(tok_loc(t), t->len);
+					hashmap_put(&func_meta[p1d_cur_func].defer_name_set,
+						tok_loc(t), t->len, (void*)1);
 			}
 		}
 	}
@@ -5504,6 +5515,8 @@ p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
 			eq_tok = s;
 		}
 	}
+	if (tok == bare_oe)
+		error_tok(tok, "expected expression before 'orelse'");
 	Token *after_oe = tok_next(bare_oe);
 	if (after_oe && match_ch(after_oe, ';'))
 		error_tok(after_oe, "expected statement after 'orelse'");
@@ -5963,7 +5976,7 @@ uint16_t sid = next_scope_id++;
 				FuncMeta *fm = &func_meta[func_meta_count++];
 				fm->body_open = tok;
 				fm->returns_void = p1e_ret_void;
-				fm->defer_name_bloom = 0;
+				fm->defer_name_set = (HashMap){0};
 				if (p1e_ret_captured) {
 					fm->ret_type_start = ctx->func_ret_type_start;
 					fm->ret_type_end = ctx->func_ret_type_end;
@@ -6576,7 +6589,8 @@ uint16_t sid = next_scope_id++;
 					// Phase 1C: shadow detection
 					if (is_known_typedef(decl.var_name) ||
 					    is_known_enum_const(decl.var_name) ||
-					    (decl.var_name->tag & (TT_DEFER | TT_ORELSE))) {
+					    (decl.var_name->tag & (TT_DEFER | TT_ORELSE)) ||
+					    hashmap_get(&p1_func_proto_map, tok_loc(decl.var_name), decl.var_name->len)) {
 						p1_register_shadow(decl.var_name, cur_sid, brace_depth);
 					}
 
