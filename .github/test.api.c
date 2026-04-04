@@ -7373,9 +7373,9 @@ void run_api_tests_4(void) {
 	test_typeof_paren_func_memset();
 	test_nested_stmtexpr_ctrl_state_desync();
 	test_noreturn_attr_arg_poisoning();
-	test_vla_deref_adjacency_parens();
+	GNUC_ONLY(test_vla_deref_adjacency_parens());
 	test_braceless_defer_shadow_false_positive();
 	test_raw_star_expr_misclassification();
-	test_typeof_local_shadows_func();
-	test_param_shadow_func_proto();
+	GNUC_ONLY(test_typeof_local_shadows_func());
+	GNUC_ONLY(test_param_shadow_func_proto());
 }
