@@ -2848,7 +2848,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			}
 		}
 
-		check_defer_var_shadow(decl.var_name);
+		if (!brace_wrap) check_defer_var_shadow(decl.var_name);
 
 		if (match_ch(tok, ';')) {
 			bool is_ur = (tok == pd_unreachable_tok);
@@ -3052,7 +3052,9 @@ static Token *try_zero_init_decl(Token *tok) {
 				if (!after_se || (!match_ch(after_se, ',') && !is_orelse)) {
 					// Bail out to verbatim emit, but still check
 					// defer shadow — process_declarators won't run.
-					check_defer_var_shadow(probe.var_name);
+					// Skip in braceless bodies (synthetic scope).
+					if (!(ctrl_state.pending && ctrl_state.parens_just_closed))
+						check_defer_var_shadow(probe.var_name);
 					return NULL;
 				}
 			}
@@ -6612,7 +6614,8 @@ uint16_t sid = next_scope_id++;
 						e->decl.has_raw = p1d_decl_raw;
 						e->decl.is_static_storage = p1d_saw_static || type.has_static || type.has_extern;
 						e->decl.body_close_idx = braceless_close_idx;
-						p1_check_defer_same_block_shadow(decl.var_name, cur_sid, p1d_cur_func);
+						if (!p1d_ctrl_pending)
+							p1_check_defer_same_block_shadow(decl.var_name, cur_sid, p1d_cur_func);
 					}
 
 					// Phase 1D: reject register _Atomic aggregate

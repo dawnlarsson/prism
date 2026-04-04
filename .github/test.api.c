@@ -7198,6 +7198,130 @@ void run_api_tests_3(void) {
 	UNIX_ONLY(test_multifile_arena_use_after_reset());
 }
 
+static void test_raw_star_expr_misclassification(void) {
+	/* BUG: is_raw_declaration_context treated `raw * 3` at statement start
+	 * as a pointer declaration, stripping the `raw` token.  The fix
+	 * checks whether *, after skipping qualifiers, is followed by an
+	 * identifier (declaration) or a non-identifier like a number
+	 * (expression). */
+	PrismResult r = prism_transpile_source(
+		"void f(void) {\n"
+		"    int raw = 5;\n"
+		"    raw * 3;\n"
+		"}\n",
+		"raw_star_expr.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "raw*expr: transpile succeeds");
+	if (r.output)
+		CHECK(strstr(r.output, "raw * 3") != NULL,
+		      "raw*expr: multiplication preserved");
+	prism_free(&r);
+}
+
+static void test_typeof_local_shadows_func(void) {
+	/* BUG: typeof(name) where `name` is a local variable shadowing a function
+	 * was treated as a function type (skipping zero-init).  The shadow
+	 * check was missing from is_typeof_func_type. */
+	PrismResult r = prism_transpile_source(
+		"int add(int a, int b) { return a + b; }\n"
+		"int main(void) {\n"
+		"    int add = 42;\n"
+		"    typeof(add) x;\n"
+		"    return x;\n"
+		"}\n",
+		"typeof_shadow_fn.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "typeof shadow func: transpile succeeds");
+	if (r.output)
+		CHECK(strstr(r.output, "x = 0") != NULL ||
+		      strstr(r.output, "= {0}") != NULL ||
+		      strstr(r.output, "memset") != NULL,
+		      "typeof shadow func: zero-init applied");
+	prism_free(&r);
+}
+
+static void test_param_shadow_func_proto(void) {
+	/* BUG: p1_register_param_shadows didn't check p1_func_proto_map,
+	 * so a parameter named after a forward-declared function wasn't
+	 * shadowed.  typeof(param) then hit is_typeof_func_type and
+	 * skipped zero-init. */
+	PrismResult r = prism_transpile_source(
+		"int add(int, int);\n"
+		"int test(int add) {\n"
+		"    typeof(add) x;\n"
+		"    return x + add;\n"
+		"}\n"
+		"int add(int a, int b) { return a + b; }\n"
+		"int main(void) { return test(5); }\n",
+		"param_shadow_proto.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "param shadow proto: transpile succeeds");
+	if (r.output)
+		CHECK(strstr(r.output, "x = 0") != NULL ||
+		      strstr(r.output, "= {0}") != NULL ||
+		      strstr(r.output, "memset") != NULL,
+		      "param shadow proto: zero-init applied");
+	prism_free(&r);
+}
+
+static void test_noreturn_attr_arg_poisoning(void) {
+	/* BUG: noreturn attribute scan walked flat over attribute argument lists,
+	 * so __attribute__((cleanup(noreturn))) matched `noreturn` as the
+	 * function's own attribute, injecting __builtin_unreachable() after calls. */
+	PrismResult r = prism_transpile_source(
+		"void noreturn(void *p) { (void)p; }\n"
+		"int __attribute__((cleanup(noreturn))) test(void) {\n"
+		"    return 42;\n"
+		"}\n"
+		"int main(void) { return test(); }\n",
+		"nr_attr_arg.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "noreturn attr arg: transpile succeeds");
+	if (r.output)
+		CHECK(strstr(r.output, "__builtin_unreachable") == NULL,
+		      "noreturn attr arg: no unreachable injected");
+	prism_free(&r);
+}
+
+static void test_vla_deref_adjacency_parens(void) {
+	/* BUG: sizeof(*(param)) on VLA param hid the `*` from the adjacency
+	 * check because parens blocked the backward look.  Result: `= {0}`
+	 * on VLA-dimensioned array (invalid C). */
+	PrismResult r = prism_transpile_source(
+		"void f(int n, int p[n][n]) {\n"
+		"    char buf[sizeof(*(p))];\n"
+		"    (void)buf;\n"
+		"}\n",
+		"vla_deref_paren.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "VLA deref parens: transpile succeeds");
+	if (r.output) {
+		CHECK(strstr(r.output, "= {0}") == NULL ||
+		      strstr(r.output, "buf[sizeof") == NULL,
+		      "VLA deref parens: no = {0} on VLA buf");
+		CHECK(strstr(r.output, "memset") != NULL,
+		      "VLA deref parens: memset used for VLA buf");
+	}
+	prism_free(&r);
+}
+
+static void test_braceless_defer_shadow_false_positive(void) {
+	/* BUG: declaration in braceless if body falsely errored with
+	 * "shadows a name captured by a defer in the same scope" because
+	 * brace_wrap { } is purely textual and doesn't increment block_depth,
+	 * so check_defer_var_shadow saw the var at the same scope as the defer. */
+	PrismResult r = prism_transpile_source(
+		"void f(void) {\n"
+		"    int x = 10;\n"
+		"    defer { x++; }\n"
+		"    if (1) int x = 5;\n"
+		"}\n",
+		"braceless_defer_sh.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "braceless defer shadow: no false positive");
+	prism_free(&r);
+}
+
 void run_api_tests_4(void) {
 	printf("\n=== API TESTS (group 4) ===\n");
 	test_collect_source_defines_long_line_truncation();
@@ -7248,4 +7372,10 @@ void run_api_tests_4(void) {
 	test_raw_attr_boundary_skip_noise();
 	test_typeof_paren_func_memset();
 	test_nested_stmtexpr_ctrl_state_desync();
+	test_noreturn_attr_arg_poisoning();
+	test_vla_deref_adjacency_parens();
+	test_braceless_defer_shadow_false_positive();
+	test_raw_star_expr_misclassification();
+	test_typeof_local_shadows_func();
+	test_param_shadow_func_proto();
 }

@@ -1876,17 +1876,22 @@ static Token *tokenize(File *file) {
 			// Also handles namespaced forms: [[gnu::noreturn]], [[gnu::__noreturn__]]
 			if (t->ch0 == '[' && (t->flags & TF_C23_ATTR) && t->match_idx) {
 				Token *inner = tok_next(t);
+				Token *attr_end = &token_pool[t->match_idx];
 				if (inner && inner->ch0 == '[') {
-					Token *closing = &token_pool[t->match_idx];
-					for (Token *a = tok_next(inner); a && a < closing; a = tok_next(a)) {
-						if (a->kind == TK_IDENT &&
+					for (Token *a = tok_next(inner); a && a < attr_end; a = tok_next(a)) {
+						if (a->kind <= TK_KEYWORD &&
 						    (equal(a, "noreturn") || equal(a, "_Noreturn") ||
 						     equal(a, "__noreturn__"))) {
 							is_noreturn = true;
 							break;
 						}
+						// Skip attribute arguments to avoid matching inside them
+						if (a->kind <= TK_KEYWORD && tok_next(a) && tok_next(a)->ch0 == '(' && tok_next(a)->match_idx)
+							a = &token_pool[tok_next(a)->match_idx];
 					}
 				}
+				t = attr_end;  // advance past [[ ... ]]
+				scan_start = t;
 			}
 
 			// __attribute__((noreturn)) or __attribute__((__noreturn__))
@@ -1898,12 +1903,17 @@ static Token *tokenize(File *file) {
 					if (p2 && p2->ch0 == '(' && p2->match_idx) {
 						Token *close = &token_pool[p2->match_idx];
 						for (Token *a = tok_next(p2); a && a < close; a = tok_next(a)) {
-							if (a->kind == TK_IDENT &&
+							if (a->kind <= TK_KEYWORD &&
 							    (equal(a, "noreturn") || equal(a, "__noreturn__"))) {
 								is_noreturn = true;
 								break;
 							}
+							// Skip attribute arguments to avoid matching inside them
+							if (a->kind <= TK_KEYWORD && tok_next(a) && tok_next(a)->ch0 == '(' && tok_next(a)->match_idx)
+								a = &token_pool[tok_next(a)->match_idx];
 						}
+						t = tok_match(p1);  // advance past __attribute__(( ... ))
+						scan_start = t;
 					}
 				}
 			}
@@ -1914,12 +1924,17 @@ static Token *tokenize(File *file) {
 				if (p1 && p1->ch0 == '(' && p1->match_idx) {
 					Token *close = &token_pool[p1->match_idx];
 					for (Token *a = tok_next(p1); a && a < close; a = tok_next(a)) {
-						if (a->kind == TK_IDENT &&
+						if (a->kind <= TK_KEYWORD &&
 						    (equal(a, "noreturn") || equal(a, "__noreturn__"))) {
 							is_noreturn = true;
 							break;
 						}
+						// Skip attribute arguments to avoid matching inside them
+						if (a->kind <= TK_KEYWORD && tok_next(a) && tok_next(a)->ch0 == '(' && tok_next(a)->match_idx)
+							a = &token_pool[tok_next(a)->match_idx];
 					}
+					t = close;  // advance past __declspec( ... )
+					scan_start = t;
 				}
 			}
 
@@ -2485,8 +2500,16 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 							if (!(vla_fl & TDF_PARAM)) return true;
 							Token *ni = tok_next(inner);
 							bool has_next = ni && ni != end;
-							bool deref = (prev_inner->len == 1 && (prev_inner->ch0 == '*' || prev_inner->ch0 == '[' || prev_inner->ch0 == '+' || prev_inner->ch0 == '-')) ||
-								(has_next && ni->len == 1 && (ni->ch0 == '[' || ni->ch0 == '+' || ni->ch0 == '-' || ni->ch0 == '*'));
+							// Look past parentheses for the real preceding/following operator
+							Token *eff_prev = prev_inner;
+							uint32_t pi = tok_idx(eff_prev);
+							while (eff_prev->ch0 == '(' && pi > tok_idx(tok) + 1)
+								eff_prev = &token_pool[--pi];
+							Token *eff_next = ni;
+							while (has_next && eff_next && eff_next->ch0 == ')' && eff_next != end)
+								{ eff_next = tok_next(eff_next); has_next = eff_next && eff_next != end; }
+							bool deref = (eff_prev->len == 1 && (eff_prev->ch0 == '*' || eff_prev->ch0 == '[' || eff_prev->ch0 == '+' || eff_prev->ch0 == '-')) ||
+								(has_next && eff_next && eff_next->len == 1 && (eff_next->ch0 == '[' || eff_next->ch0 == '+' || eff_next->ch0 == '-' || eff_next->ch0 == '*'));
 							if (deref) return true;
 						}
 						if (inner->len == 1 && inner->ch0 == '[' &&
