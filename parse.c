@@ -3,7 +3,7 @@
 // Thread-local storage qualifier: all per-invocation mutable state uses this
 // for thread safety. Each thread gets its own copy.
 //
-// Originally based of https://github.com/rui314/chibicc (MIT License)
+// Originally only based on the parsing logic from https://github.com/rui314/chibicc (MIT License)
 //
 
 #if defined(_MSC_VER)
@@ -312,7 +312,6 @@ typedef struct PrismContext {
 	int scope_depth;
 	int block_depth;
 
-
 	bool last_system_header;
 	int last_line_no;
 	char *last_filename;
@@ -573,8 +572,7 @@ static void token_pool_ensure(size_t need) {
 static inline Token *pool_alloc_token(void) {
 	if (token_count == UINT32_MAX)
 		error("maximum token limit reached");
-	if (__builtin_expect(token_count < token_cap, 1))
-		return &token_pool[token_count++];
+	if (__builtin_expect(token_count < token_cap, 1)) return &token_pool[token_count++];
 	token_pool_ensure(token_count + 1);
 	return &token_pool[token_count++];
 }
@@ -704,7 +702,6 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val) {
 	map->used++;
 }
 
-// Reset entries without freeing the bucket array
 static void hashmap_zero(HashMap *map) {
 	if (map->buckets) memset(map->buckets, 0, (size_t)map->capacity * sizeof(HashEntry));
 	map->used = 0;
@@ -1359,8 +1356,7 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
 		while (*p == ' ' || *p == '\t') p++;
 	}
 
-	if (!IS_DIGIT(*p))
-		return NULL;
+	if (!IS_DIGIT(*p)) return NULL;
 
 	unsigned long new_line = 0;
 	while (IS_DIGIT(*p)) {
@@ -1464,7 +1460,6 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
 	ctx->current_file = view;
 	free(filename);
 
-	// Skip to end of directive
 	while (*p && *p != '\n') p++;
 	if (*p == '\n') {
 		p++;
@@ -1833,8 +1828,7 @@ static Token *tokenize(File *file) {
 				Token *end = tok_match(body);
 				for (Token *b = tok_next(body); b != end; b = tok_next(b)) {
 					if (b->kind != TK_IDENT) continue;
-					if (!(fn_bloom & (1ULL << (((unsigned)b->ch0 ^ b->len) & 63))))
-						continue;
+					if (!(fn_bloom & (1ULL << (((unsigned)b->ch0 ^ b->len) & 63)))) continue;
 					void *v = hashmap_get(&func_map, tok_loc(b), b->len);
 					if (!v) continue;
 					int j = (int)(intptr_t)v - 1;
@@ -2080,7 +2074,6 @@ Token *tokenize_file(char *path) {
 #endif
 }
 
-// === C Declaration Parser ===
 // Pure parsing/analysis functions with no emit/transpilation dependencies.
 // Used by both Pass 1 (analysis) and Pass 2 (emission) in prism.c.
 
@@ -2304,13 +2297,11 @@ typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool i
 
 static TypedefEntry *typedef_lookup(Token *tok) {
 	if (!is_identifier_like(tok)) return NULL;
-	if (p1_typedef_annotated && !(tok_ann(tok) & P1_HAS_ENTRY))
-		return NULL;
+	if (p1_typedef_annotated && !(tok_ann(tok) & P1_HAS_ENTRY)) return NULL;
 	if (tok->kind == TK_KEYWORD && !(tok->tag & (TT_ORELSE | TT_DEFER)) && !(tok->flags & TF_RAW))
 		return NULL;
 	unsigned c0 = tok->ch0, tl = tok->len;
-	if (!(typedef_table.bloom & (1ULL << ((c0 ^ tl) & 63))))
-		return NULL;
+	if (!(typedef_table.bloom & (1ULL << ((c0 ^ tl) & 63)))) return NULL;
 	int idx = typedef_get_index(tok_loc(tok), tok->len);
 	uint32_t cur = tok_idx(tok);
 	while (idx >= 0) {
@@ -2337,8 +2328,7 @@ static inline int typedef_flags(Token *tok) {
 
 // After Pass 1 annotation, is_known_typedef becomes O(1) bit check.
 static inline bool _is_known_typedef(Token *tok) {
-	if (__builtin_expect(p1_typedef_annotated, 1))
-		return tok_ann(tok) & P1_IS_TYPEDEF;
+	if (__builtin_expect(p1_typedef_annotated, 1)) return tok_ann(tok) & P1_IS_TYPEDEF;
 	return typedef_flags(tok) & TDF_TYPEDEF;
 }
 #define is_known_typedef(tok) _is_known_typedef(tok)
@@ -2362,7 +2352,6 @@ static inline bool is_valid_varname(Token *tok) {
 	return tok->kind == TK_IDENT || (tok->flags & TF_RAW) || (tok->tag & (TT_DEFER | TT_ORELSE));
 }
 
-// Forward declaration: defined in prism.c (needs emit infrastructure).
 static DeclResult parse_declarator(Token *tok, bool emit);
 
 // Register enum constants as typedef shadows. tok points to opening '{'.
@@ -2465,7 +2454,6 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 			tok = skip_balanced_group(tok);
 			continue;
 		}
-		// GNU statement expression ({...}) in array dimension is always VLA.
 		if (tok->len == 1 && tok->ch0 == '(' && tok_next(tok) &&
 		    tok_next(tok)->len == 1 && tok_next(tok)->ch0 == '{')
 			return true;
@@ -2501,8 +2489,7 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 						}
 						if (inner->len == 1 && inner->ch0 == '[' &&
 						    is_array_bracket_predecessor(prev_inner, prev2_inner)) {
-							if (array_size_is_vla_impl(inner, depth + 1))
-								return true;
+							if (array_size_is_vla_impl(inner, depth + 1)) return true;
 							inner = tok_match(inner);
 							if (!inner || inner == end) break;
 							continue;
@@ -2752,9 +2739,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			Token *sue_tag = NULL;
 			if (tok && is_valid_varname(tok)) { sue_tag = tok; tok = tok_next(tok); }
 			if (tok && tok->len == 1 && tok->ch0 == '{') {
-				if (struct_body_contains_vla(tok)) {
-					r.is_vla = true;
-				}
+				if (struct_body_contains_vla(tok)) r.is_vla = true;
 				tok = skip_balanced_group(tok);
 			} else if (sue_tag && is_vla_typedef(sue_tag)) {
 				r.is_vla = true;
@@ -3055,8 +3040,7 @@ static int scope_block_exits(uint16_t goto_sid, uint16_t label_sid) {
 
 static uint16_t scope_stmt_expr_ancestor(uint16_t scope_id) {
 	for (uint16_t s = scope_id; s != 0; s = scope_tree[s].parent_id)
-		if (s < scope_tree_count && scope_tree[s].is_stmt_expr)
-			return s;
+		if (s < scope_tree_count && scope_tree[s].is_stmt_expr) return s;
 	return 0;
 }
 
@@ -3281,8 +3265,7 @@ static bool params_look_like_decls(Token *open) {
 }
 
 static bool is_knr_params(Token *start, Token *brace) {
-	if (!start || start == brace || match_ch(start, ';'))
-		return false;
+	if (!start || start == brace || match_ch(start, ';')) return false;
 	bool saw_semi = false;
 	for (Token *t = start; t && t != brace && t->kind != TK_EOF; t = tok_next(t)) {
 		if (match_ch(t, ';')) saw_semi = true;
@@ -3383,8 +3366,7 @@ static bool generic_decl_rewrite_target(Token *generic_tok, Token **name_out,
 					Token **params_close_out,
 					Token **next_out) {
 	Token *open, *close, *after, *assoc_start;
-	if (!generic_rewrite_preamble(generic_tok, &open, &close, &after, &assoc_start))
-		return false;
+	if (!generic_rewrite_preamble(generic_tok, &open, &close, &after, &assoc_start)) return false;
 	if (match_set(after, CH(';') | CH(',')) || (after->tag & TT_ATTR) ||
 	    is_c23_attr(after)) {
 		for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
@@ -3425,8 +3407,7 @@ static bool generic_member_rewrite_target(Token *generic_tok, Token **name_out,
 					  Token **args_close_out,
 					  Token **next_out) {
 	Token *open, *close, *after, *assoc_start;
-	if (!generic_rewrite_preamble(generic_tok, &open, &close, &after, &assoc_start))
-		return false;
+	if (!generic_rewrite_preamble(generic_tok, &open, &close, &after, &assoc_start)) return false;
 	for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
 		Token *call_open = skip_noise(tok_next(t));
 		if (!is_valid_varname(t) || !call_open || !match_ch(call_open, '(') || !tok_match(call_open))
@@ -3439,6 +3420,113 @@ static bool generic_member_rewrite_target(Token *generic_tok, Token **name_out,
 		return true;
 	}
 	return false;
+}
+
+// Detect noreturn function call: tok(args);
+static inline Token *try_detect_noreturn_call(Token *tok) {
+	if (!(tok->tag & TT_NORETURN_FN)) return NULL;
+	if (tok_idx(tok) >= 1 && (token_pool[tok_idx(tok) - 1].tag & TT_MEMBER)) return NULL;
+	Token *call = tok_next(tok);
+	if (!call || !match_ch(call, '(') || !tok_match(call)) return NULL;
+	Token *after = tok_next(tok_match(call));
+	return (after && match_ch(after, ';')) ? after : NULL;
+}
+
+// Find the '(' token after a keyword, skipping prep dirs.
+static inline Token *p1d_find_open_paren(Token *tok) {
+	for (Token *s = tok_next(tok); s && s->kind != TK_EOF; s = tok_next(s)) {
+		if (s->kind == TK_PREP_DIR) continue;
+		if (match_ch(s, '(')) return s;
+		break;
+	}
+	return NULL;
+}
+
+// K&R backward walk: from a ';' token, scan backward for ')' past K&R-style
+// parameter type declarations.  Returns the ')' token, or NULL.
+static Token *p1_knr_find_close_paren(Token *semi_tok) {
+	for (uint32_t pi = tok_idx(semi_tok); pi > 0; pi--) {
+		Token *pt = &token_pool[pi - 1];
+		if (pt->kind == TK_PREP_DIR) continue;
+		if (match_ch(pt, '{') || match_ch(pt, '}')) return NULL;
+		if (match_ch(pt, ')') && tok_match(pt)) return pt;
+	}
+	return NULL;
+}
+
+// Skip per-declarator 'raw' keywords (e.g. "int x, raw y;").
+// Returns token past raw chain, or original t if not raw.
+// Sets *saw_raw = true if raw was found.
+static inline Token *p1_skip_decl_raw(Token *t, bool *saw_raw) {
+	if ((t->flags & TF_RAW) && !is_known_typedef(t)) {
+		Token *after = skip_noise(tok_next(t));
+		if (after && ((is_valid_varname(after) && !is_type_keyword(after) &&
+			       !is_known_typedef(after) && !(after->tag & (TT_QUALIFIER | TT_SUE))) ||
+			      match_ch(after, '*') || match_ch(after, '('))) {
+			while ((after->flags & TF_RAW) && !is_known_typedef(after))
+				after = skip_noise(tok_next(after));
+			*saw_raw = true;
+			return after;
+		}
+	}
+	return t;
+}
+
+static inline bool is_assignment_operator_token(Token *tok) {
+	return (tok->tag & TT_ASSIGN) && tok_loc(tok)[tok->len - 1] == '=';
+}
+
+// Returns true if 'raw' is followed by a declaration context (type keyword, typedef, *, etc.)
+static bool is_raw_declaration_context(Token *after_raw) {
+	after_raw = skip_noise(after_raw);
+	return after_raw && (is_type_keyword(after_raw) || is_known_typedef(after_raw) ||
+			     match_ch(after_raw, '*') ||
+			     (after_raw->tag & (TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_INLINE | TT_TYPEDEF)) ||
+			     ((after_raw->flags & TF_RAW) && !is_known_typedef(after_raw)));
+}
+
+// Extended raw context: also matches per-declarator raw after comma (int x, raw y;)
+static bool is_raw_strip_context(Token *after_raw) {
+	if (is_raw_declaration_context(after_raw)) return true;
+	after_raw = skip_noise(after_raw);
+	Token *boundary = after_raw ? skip_noise(tok_next(after_raw)) : NULL;
+	return after_raw && is_valid_varname(after_raw) && !is_type_keyword(after_raw) &&
+	       !is_known_typedef(after_raw) && !(after_raw->tag & (TT_QUALIFIER | TT_SUE)) &&
+	       boundary &&
+	       (match_ch(boundary, ',') || match_ch(boundary, ';') ||
+	        match_set(boundary, CH('[') | CH('(') | CH('=')));
+}
+
+static bool has_effective_const_qual(Token *type_start, TypeSpecResult *type, DeclResult *decl) {
+	bool has_const_qual = (type->has_const && !decl->is_func_ptr) || decl->is_const;
+	if (type->has_typeof && !decl->is_func_ptr && !decl->is_pointer)
+		has_const_qual = true;
+	if (!has_const_qual && !decl->is_func_ptr && !decl->is_pointer) {
+		for (Token *t = type_start; t && t != type->end; t = tok_next(t))
+			if (is_const_typedef(t)) { has_const_qual = true; break; }
+	}
+	return has_const_qual;
+}
+
+static bool has_storage_in(Token *from, Token *to) {
+	for (Token *s = from; s && s != to; s = tok_next(s))
+		if (s->tag & TT_STORAGE) return true;
+	return false;
+}
+
+// Find the scope_tree entry whose opening brace matches 'body_start'.
+static uint16_t find_body_scope_id(Token *body_start) {
+	if (body_start && match_ch(body_start, '{')) {
+		uint32_t idx = tok_idx(body_start);
+		int low = 1, high = (int)scope_tree_count - 1;
+		while (low <= high) {
+			int mid = low + (high - low) / 2;
+			if (scope_tree[mid].open_tok_idx == idx) return (uint16_t)mid;
+			if (scope_tree[mid].open_tok_idx < idx) low = mid + 1;
+			else high = mid - 1;
+		}
+	}
+	return 0;
 }
 
 // full=false: reset for reuse; full=true: free everything
