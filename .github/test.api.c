@@ -6416,6 +6416,71 @@ static void test_generic_nonident_target_fold(void) {
 	prism_free(&r);
 }
 
+// Bug: generic_has_distinct_targets only compares function names, not argument
+// lists. When all _Generic branches call the same function with DIFFERENT
+// arguments, the rewrite folds them into one call with the first branch's
+// args, silently discarding all other branches' arguments.
+static void test_generic_same_name_different_args(void) {
+	printf("\n--- _Generic same name, different args ---\n");
+	// Same function name, different arguments — must preserve _Generic
+	{
+		const char *code =
+		    "struct S { void (*log)(const char *, int); };\n"
+		    "void f(struct S *s) {\n"
+		    "    int i = 0; float fl = 0.0f;\n"
+		    "    s->_Generic((i), int: log(\"int\", 1), float: log(\"float\", 2));\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gs_diff_args.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "same-name-diff-args: transpile succeeds");
+		if (r.output) {
+			// Both argument variants must survive
+			CHECK(strstr(r.output, "\"int\"") != NULL,
+			      "same-name-diff-args: int branch arguments preserved");
+			CHECK(strstr(r.output, "\"float\"") != NULL,
+			      "same-name-diff-args: float branch arguments preserved");
+			CHECK(strstr(r.output, "_Generic") != NULL,
+			      "same-name-diff-args: _Generic preserved (args differ)");
+		}
+		prism_free(&r);
+	}
+	// Same function name, SAME arguments — rewrite is still valid
+	{
+		const char *code =
+		    "struct S { void (*log)(const char *); };\n"
+		    "void f(struct S *s) {\n"
+		    "    int i = 0;\n"
+		    "    s->_Generic((i), int: log(\"msg\"), float: log(\"msg\"));\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gs_same_args.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "same-name-same-args: transpile succeeds");
+		if (r.output) {
+			const char *fn = strstr(r.output, "void f");
+			if (fn) {
+				// rewrite SHOULD fire (same name + same args)
+				CHECK(strstr(fn, "_Generic") == NULL,
+				      "same-name-same-args: _Generic rewritten (same target & args)");
+			}
+		}
+		prism_free(&r);
+	}
+	// Same function name, different argument COUNT — must preserve
+	{
+		const char *code =
+		    "struct S { int (*call)(int, ...); };\n"
+		    "void f(struct S *s) {\n"
+		    "    int i = 0;\n"
+		    "    s->_Generic((i), int: call(1), float: call(1, 2));\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gs_diff_count.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "diff-arg-count: transpile succeeds");
+		if (r.output) {
+			CHECK(strstr(r.output, "_Generic") != NULL,
+			      "diff-arg-count: _Generic preserved (arg count differs)");
+		}
+		prism_free(&r);
+	}
+}
+
 static void test_cond_stack_deep_nesting_silent_drop(void) {
 	/* BUG: collect_source_defines uses a fixed cond_stack[32].  A #define at
 	 * #ifdef depth > 32 is silently skipped — the ABI-altering macro is lost
@@ -7408,6 +7473,7 @@ void run_api_tests_4(void) {
 	test_generic_member_distinct_target_mutilation();
 	test_generic_ternary_colon_confusion();
 	test_generic_nonident_target_fold();
+	test_generic_same_name_different_args();
 	test_collect_source_defines_conditional_guard_preserved();
 	test_cond_stack_deep_nesting_silent_drop();
 	test_defer_shadow_limit_dynamic();

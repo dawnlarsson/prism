@@ -117,11 +117,16 @@ typedef struct {
 
 typedef enum {
 	SCOPE_BLOCK,       // { ... } block scope
+	SCOPE_INIT,        // = { ... } initializer brace (no block_depth increment)
 	SCOPE_FOR_PAREN,   // for( ... ) — first ';' ends init, not stmt
 	SCOPE_CTRL_PAREN,  // if/while/switch( ... )
 	SCOPE_GENERIC,     // _Generic( ... )
 	SCOPE_TERNARY,     // ? ... : — popped on matching ':'
 } ScopeKind;
+
+static inline bool is_brace_scope(ScopeKind k) {
+	return k == SCOPE_BLOCK || k == SCOPE_INIT;
+}
 
 typedef struct {
 	int defer_start_idx;
@@ -721,7 +726,7 @@ static inline void ctrl_reset(void) {
 
 static inline ScopeNode *scope_block_top(void) {
 	for (int i = ctx->scope_depth - 1; i >= 0; i--)
-		if (scope_stack[i].kind == SCOPE_BLOCK) return &scope_stack[i];
+		if (is_brace_scope(scope_stack[i].kind)) return &scope_stack[i];
 	return NULL;
 }
 
@@ -732,7 +737,7 @@ static inline bool in_for_init(void) {
 static inline bool in_ctrl_paren(void) {
 	for (int i = ctx->scope_depth - 1; i >= 0; i--) {
 		ScopeKind k = scope_stack[i].kind;
-		if (k == SCOPE_BLOCK) return false;
+		if (is_brace_scope(k)) return false;
 		if (k == SCOPE_FOR_PAREN || k == SCOPE_CTRL_PAREN) return true;
 	}
 	return false;
@@ -741,7 +746,7 @@ static inline bool in_ctrl_paren(void) {
 static inline bool in_struct_body(void) {
 	for (int i = ctx->scope_depth - 1; i >= 0; i--) {
 		if (scope_stack[i].is_stmt_expr) return false;
-		if (scope_stack[i].kind == SCOPE_BLOCK && scope_stack[i].is_struct) return true;
+		if (is_brace_scope(scope_stack[i].kind) && scope_stack[i].is_struct) return true;
 	}
 	return false;
 }
@@ -749,7 +754,7 @@ static inline bool in_struct_body(void) {
 static inline bool in_generic(void) {
 	for (int i = ctx->scope_depth - 1; i >= 0; i--) {
 		if (scope_stack[i].kind == SCOPE_GENERIC) return true;
-		if (scope_stack[i].kind == SCOPE_BLOCK) return false;
+		if (is_brace_scope(scope_stack[i].kind)) return false;
 	}
 	return false;
 }
@@ -1510,6 +1515,51 @@ static Token *handle_control_exit_defer(Token *tok);
 static Token *handle_goto_keyword(Token *tok);
 static void end_statement_after_semicolon(void);
 static inline Token *try_process_stmt_token(Token *t, Token *end, Token **unreachable_tok);
+static Token *emit_block_body(Token *tok, Token *end);
+
+// Emit control-flow condition tokens (the '(' ... ')' of if/for/while/switch)
+// with full statement dispatch. Unlike walk_balanced, this tracks at_stmt_start
+// so that for-init declarations receive zeroinit and orelse processing.
+static Token *emit_ctrl_condition(Token *t, Token **unreachable_tok) {
+	Token *close_p = tok_match(t);
+	if (!close_p) { emit_tok(t); return tok_next(t); }
+	emit_tok(t); t = tok_next(t); // emit '('
+	ctx->at_stmt_start = true;
+	while (t && t != close_p && t->kind != TK_EOF) {
+		Token *next = try_process_stmt_token(t, close_p, unreachable_tok);
+		if (next) { t = next; continue; }
+		// Stmt-expr dispatch
+		if ((t->flags & TF_OPEN) && is_stmt_expr_open(t) && tok_match(t)) {
+			emit_tok(t); // '('
+			Token *se_end = tok_match(t);
+			Token *inner = tok_next(t); // '{'
+			bool saved_ss = ctx->at_stmt_start;
+			CtrlState saved_ctrl = ctrl_state;
+			inner = emit_block_body(inner, se_end);
+			ctx->at_stmt_start = saved_ss;
+			ctrl_state = saved_ctrl;
+			if (se_end) { emit_tok(se_end); t = tok_next(se_end); }
+			else t = inner;
+			continue;
+		}
+		// Nested balanced groups (function args, array subscripts, etc.)
+		if ((t->flags & TF_OPEN) && tok_match(t)) {
+			t = walk_balanced(t, true);
+			ctx->at_stmt_start = false;
+			continue;
+		}
+		// Semicolons (for-init separators): reset stmt_start
+		if (t->len == 1 && t->ch0 == ';') {
+			emit_tok(t); t = tok_next(t);
+			ctx->at_stmt_start = true;
+			continue;
+		}
+		ctx->at_stmt_start = false;
+		emit_tok(t); t = tok_next(t);
+	}
+	if (t == close_p) { emit_tok(t); t = tok_next(t); } // emit ')'
+	return t;
+}
 
 // Process block body tokens with full transpilation dispatch.
 // Handles {/}, ;, prep dirs, defer/return/break/continue/goto,
@@ -1563,12 +1613,8 @@ static Token *emit_block_body(Token *tok, Token *end) {
 			}
 			emit_tok(tok); tok = tok_next(tok);
 			if (tok && match_ch(tok, '(') && tok_match(tok)) {
-				Token *pclose = tok_match(tok);
-				while (tok && tok != end && tok->kind != TK_EOF) {
-					emit_tok(tok);
-					if (tok == pclose) { tok = tok_next(tok); break; }
-					tok = tok_next(tok);
-				}
+				tok = emit_ctrl_condition(tok, &unreachable_tok);
+				ctx->at_stmt_start = true;
 				ctrl_state.pending = true;
 				ctrl_state.parens_just_closed = true;
 				continue;
@@ -3499,8 +3545,9 @@ static Token *handle_open_brace(Token *tok) {
 	bool is_initializer = last_emitted && match_ch(last_emitted, '=');
 
 	uint8_t ann = tok_ann(tok);
+	bool is_init_scope = is_initializer || (ann & P1_SCOPE_INIT);
 	emit_tok(tok); tok = tok_next(tok);
-	scope_push_kind(SCOPE_BLOCK);
+	scope_push_kind(is_init_scope ? SCOPE_INIT : SCOPE_BLOCK);
 
 	ScopeNode *s = &scope_stack[ctx->scope_depth - 1];
 	s->is_loop = ann & P1_SCOPE_LOOP;
@@ -3508,7 +3555,7 @@ static Token *handle_open_brace(Token *tok) {
 	if (is_stmt_expr) s->is_stmt_expr = true;
 	if (did_push)
 		s->is_ctrl_se = true;
-	if (is_initializer || (ann & P1_SCOPE_INIT)) s->is_struct = true;
+	if (is_init_scope) s->is_struct = true;
 
 	ctx->at_stmt_start = true;
 	return tok;
@@ -3522,7 +3569,7 @@ static Token *handle_close_brace(Token *tok) {
 		return tok_next(tok);
 	}
 	// Pop stale non-BLOCK scopes (leaked ternary/ctrl/generic scopes)
-	while (ctx->scope_depth > 0 && scope_stack[ctx->scope_depth - 1].kind != SCOPE_BLOCK)
+	while (ctx->scope_depth > 0 && !is_brace_scope(scope_stack[ctx->scope_depth - 1].kind))
 		scope_pop();
 	if (FEAT(F_DEFER) && ctx->scope_depth > 0) {
 		ScopeNode *s = &scope_stack[ctx->scope_depth - 1];
@@ -4959,17 +5006,13 @@ static void emit_deferred_range(Token *start, Token *end) {
 				ctrl_state.parens_just_closed = true;
 				continue; // at_stmt_start stays true
 			}
-			// if / while / for / switch: emit keyword + balanced (...)
+			// if / while / for / switch: emit keyword + condition (...)
 			if ((t->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
 			    !is_known_typedef(t)) {
 				emit_tok(t); t = tok_next(t);
 				if (t && match_ch(t, '(') && tok_match(t)) {
-					Token *close = tok_match(t);
-					while (t && t != end && t->kind != TK_EOF) {
-						emit_tok(t);
-						if (t == close) { t = tok_next(t); break; }
-						t = tok_next(t);
-					}
+					t = emit_ctrl_condition(t, &dr_unreachable_tok);
+					ctx->at_stmt_start = true;
 					dr_braceless_body = true;
 					ctrl_state.pending = true;
 					ctrl_state.parens_just_closed = true;

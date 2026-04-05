@@ -2440,11 +2440,31 @@ static Token *find_struct_body_brace(Token *tok) {
 
 // Check if a token can legally precede an array bracket '[' in a type context.
 static inline bool is_array_bracket_predecessor(Token *t, Token *prev2) {
-	return is_type_keyword(t) ||
-	       (t->tag & TT_QUALIFIER) ||
-	       (prev2 && (prev2->tag & TT_SUE)) ||
-	       (t->len == 1 && (t->ch0 == ']' || t->ch0 == '*' || t->ch0 == ')')) ||
-	       (t->len == 1 && t->ch0 == '}');
+	if (is_type_keyword(t) ||
+	    (t->tag & TT_QUALIFIER) ||
+	    (prev2 && (prev2->tag & TT_SUE)) ||
+	    (t->len == 1 && (t->ch0 == ']' || t->ch0 == '*')) ||
+	    (t->len == 1 && t->ch0 == '}'))
+		return true;
+	// ')' is a type predecessor only for declarator parens like int (*)[n]
+	// or int (*ptr)[n], NOT for expression parens like sizeof((arr)[n]).
+	// Disambiguate by checking what precedes the matching '('.
+	if (t->len == 1 && t->ch0 == ')') {
+		Token *open = tok_match(t);
+		if (!open) return true; // no match info — conservatively assume type
+		uint32_t oi = tok_idx(open);
+		if (oi == 0) return true;
+		Token *before_open = &token_pool[oi - 1];
+		// Type-producing constructs before '(' → type context (declarator)
+		if (is_type_keyword(before_open) ||
+		    (before_open->tag & (TT_TYPEOF | TT_QUALIFIER | TT_SUE)) ||
+		    (before_open->len == 1 && before_open->ch0 == '*') ||
+		    is_known_typedef(before_open))
+			return true;
+		// Everything else (sizeof, ident, operator, '(') → expression context
+		return false;
+	}
+	return false;
 }
 
 // Check if array dimension contains a VLA expression (runtime variable).
@@ -2900,8 +2920,13 @@ static Token *skip_one_stmt_impl(Token *tok, uint32_t *cache) {
 	int if_depth = 0;
 	int do_depth = 0;
 	int do_if_save[4096];
+	int do_tn_save[4096];
+	int do_snap_buf[4096];  // flat buffer saving if_trail_snap per do level
+	int do_snap_start[4096];
+	int do_snap_top = 0;
 	uint32_t trail[256];
 	int tn = 0;
+	int if_trail_snap[4096]; // trail length snapshot at each if_depth entry
 restart:
 	tok = skip_prep_dirs(tok);
 	tok = skip_noise(tok);
@@ -2922,6 +2947,7 @@ restart:
 		if (tok->ch0 == 'e') { tok = tok_next(tok); goto restart; }
 		Token *p = skip_prep_dirs(tok_next(tok));
 		if (!p || !(p->len == 1 && p->ch0 == '(') || !tok_match(p)) return NULL;
+		if (if_depth < 4096) if_trail_snap[if_depth] = tn;
 		if_depth++;
 		tok = tok_next(tok_match(p)); goto restart;
 	}
@@ -2934,9 +2960,13 @@ restart:
 
 	if ((tok->tag & TT_LOOP) && tok->ch0 == 'd') {
 		if (do_depth >= 4096) return NULL;
-		do_if_save[do_depth++] = if_depth;
+		do_if_save[do_depth] = if_depth;
+		do_tn_save[do_depth] = tn;
+		do_snap_start[do_depth] = do_snap_top;
+		for (int i = 0; i < if_depth && do_snap_top < 4096; i++)
+			do_snap_buf[do_snap_top++] = if_trail_snap[i];
+		do_depth++;
 		if_depth = 0;
-		tn = 0;
 		tok = tok_next(tok); goto restart;
 	}
 
@@ -2972,11 +3002,14 @@ unwind_if:
 		if (!tok) return NULL;
 		Token *n = skip_prep_dirs(tok_next(tok));
 		if (n && (n->tag & TT_IF) && n->ch0 == 'e') {
+			// Only flush trail entries from THIS if level (true-branch),
+			// not parent tokens that span the entire if-else.
+			int snap = (if_depth < 4096) ? if_trail_snap[if_depth] : 0;
 			if (cache && tok) {
 				uint32_t val = tok_idx(tok) + 1;
-				for (int i = 0; i < tn; i++) cache[trail[i]] = val;
+				for (int i = snap; i < tn; i++) cache[trail[i]] = val;
 			}
-			tn = 0;
+			tn = snap; // keep parent tokens in trail for final resolution
 			tok = tok_next(n); goto restart;
 		}
 	}
@@ -2987,7 +3020,12 @@ unwind_if:
 	if (do_depth > 0) {
 		do_depth--;
 		if_depth = do_if_save[do_depth];
-		tn = 0;
+		tn = do_tn_save[do_depth];
+		int snap_start = do_snap_start[do_depth];
+		int snap_count = do_snap_top - snap_start;
+		for (int i = 0; i < snap_count; i++)
+			if_trail_snap[i] = do_snap_buf[snap_start + i];
+		do_snap_top = snap_start;
 		if (!tok) goto unwind_if;
 		Token *w = skip_prep_dirs(tok_next(tok));
 		if (!w || !(w->tag & TT_LOOP) || w->ch0 != 'w') { tok = NULL; goto unwind_if; }
@@ -3301,6 +3339,8 @@ static bool generic_has_distinct_targets(Token *open) {
 	if (!assoc_start) return false;
 	const char *first_name = NULL;
 	int first_len = 0;
+	Token *first_args_open = NULL;  // '(' of first association's argument list
+	Token *first_args_close = NULL; // matching ')' of first association's args
 	int ternary_depth = 0;
 	for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
 		if (t->flags & TF_OPEN) {
@@ -3334,9 +3374,39 @@ static bool generic_has_distinct_targets(Token *open) {
 			if (!first_name) {
 				first_name = tok_loc(b);
 				first_len = b->len;
+				// Record argument list of first association
+				Token *ao = tok_next(b);
+				if (ao && match_ch(ao, '(') && tok_match(ao)) {
+					first_args_open = ao;
+					first_args_close = tok_match(ao);
+				}
 			} else if (b->len != first_len ||
 				   memcmp(tok_loc(b), first_name, first_len) != 0) {
 				return true;
+			} else {
+				// Same function name — also compare argument lists.
+				// If argument tokens differ, the rewrite would lose
+				// per-association arguments, so treat as distinct.
+				Token *ao = tok_next(b);
+				if (!ao || !match_ch(ao, '(') || !tok_match(ao))
+					{ if (first_args_open) return true; }
+				else {
+					Token *ac = tok_match(ao);
+					if (!first_args_open) return true;
+					Token *a1 = tok_next(first_args_open);
+					Token *a2 = tok_next(ao);
+					while (a1 && a1 != first_args_close &&
+					       a2 && a2 != ac) {
+						if (a1->kind != a2->kind ||
+						    a1->len != a2->len ||
+						    memcmp(tok_loc(a1), tok_loc(a2), a1->len) != 0)
+							return true;
+						a1 = tok_next(a1);
+						a2 = tok_next(a2);
+					}
+					if ((a1 != first_args_close) || (a2 != ac))
+						return true;
+				}
 			}
 			break;
 		}

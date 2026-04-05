@@ -3922,6 +3922,81 @@ static void test_braceless_labeled_decl_cfg(void) {
 	}
 }
 
+// sizeof((arr)[n]) is sizeof(arr[n]), NOT a VLA dimension. The ')' from the
+// expression-grouping parens must not be treated as a type predecessor.
+static void test_sizeof_expr_paren_subscript(void) {
+	printf("\n--- sizeof expression-paren subscript (VLA hallucination) ---\n");
+
+	// sizeof((arr)[n]) — expression paren + subscript, not VLA dimension.
+	// Use 'raw' to avoid zeroinit; if VLA hallucination fires, Prism
+	// rejects the goto as "skip over VLA declaration". With raw + non-VLA,
+	// goto-skip is legal.
+	{
+		const char *code =
+		    "void f(int n) {\n"
+		    "    int arr[10];\n"
+		    "    goto SKIP;\n"
+		    "    raw int x[sizeof((arr)[n])];\n"
+		    "SKIP:\n"
+		    "    (void)x; (void)arr;\n"
+		    "}\n"
+		    "int main(void) { f(3); return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "sof_paren1.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "sizeof((arr)[n]) must not cause VLA hallucination");
+		prism_free(&r);
+	}
+
+	// sizeof(typeof(int)[n]) IS a genuine VLA sizeof — goto MUST be rejected
+	{
+		const char *code =
+		    "void f(int n) {\n"
+		    "    goto SKIP;\n"
+		    "    raw int x[sizeof(typeof(int)[n])];\n"
+		    "SKIP:\n"
+		    "    (void)x;\n"
+		    "}\n"
+		    "int main(void) { f(3); return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "sof_paren2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "sizeof(typeof(int)[n]) IS VLA — goto must be rejected");
+		prism_free(&r);
+	}
+
+	// sizeof(int (*)[n]) — pointer-to-VLA type, genuine VLA sizeof
+	{
+		const char *code =
+		    "void f(int n) {\n"
+		    "    goto SKIP;\n"
+		    "    raw int x[sizeof(int (*)[n])];\n"
+		    "SKIP:\n"
+		    "    (void)x;\n"
+		    "}\n"
+		    "int main(void) { f(3); return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "sof_paren3.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "sizeof(int (*)[n]) IS VLA — goto must be rejected");
+		prism_free(&r);
+	}
+
+	// func()[n] — subscripting a function return value, not VLA
+	{
+		const char *code =
+		    "int *get_arr(void);\n"
+		    "void f(int n) {\n"
+		    "    goto SKIP;\n"
+		    "    raw int x[sizeof(get_arr()[n])];\n"
+		    "SKIP:\n"
+		    "    (void)x;\n"
+		    "}\n"
+		    "int main(void) { f(3); return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "sof_paren4.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "sizeof(func()[n]) must not cause VLA hallucination");
+		prism_free(&r);
+	}
+}
+
 static void test_case_label_ctrl_pending_leak(void) {
 	printf("\n--- case/default label p1d_ctrl_pending leak ---\n");
 
@@ -4038,6 +4113,209 @@ static void test_skip_one_stmt_cache_poison(void) {
 		PrismResult r = prism_transpile_source(code, "cache3.c", prism_defaults());
 		CHECK(r.status == PRISM_OK,
 		      "goto L past dead braceless decl must succeed");
+		prism_free(&r);
+	}
+}
+
+static void test_skip_cache_braceless_switch_if_else(void) {
+	printf("\n--- skip_cache braceless switch + if-else ---\n");
+
+	// BUG: for-init scanner primes skip_cache. The else-transition trail
+	// flush wrote the true-branch end to ALL trail entries (including
+	// parent tokens like switch/if). When the braceless switch detector
+	// later queried the poisoned 'if' token, it received a truncated
+	// boundary, orphaning case labels in the else branch.
+	// Fix: scope-aware trail flush via if_trail_snap[].
+
+	// for-init + braceless switch + if-else
+	{
+		const char *code =
+		    "int main(void) {\n"
+		    "    for (int i = 0; i < 2; i++)\n"
+		    "        switch (i)\n"
+		    "            if (1) {\n"
+		    "                case 1: ;\n"
+		    "            } else {\n"
+		    "                case 0: ;\n"
+		    "            }\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bsw1.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "for-init + braceless switch + if-else must not false-positive");
+		if (r.status != PRISM_OK)
+			printf("  false positive: %s\n", r.error_msg ? r.error_msg : "");
+		prism_free(&r);
+	}
+	// for without init-decl (find_init_semicolon still triggers scan)
+	{
+		const char *code =
+		    "int main(void) {\n"
+		    "    int i;\n"
+		    "    for (i = 0; i < 2; i++)\n"
+		    "        switch (i)\n"
+		    "            if (1) { case 1: ; } else { case 0: ; }\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bsw2.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "for (no init-decl) + braceless switch + if-else must succeed");
+		if (r.status != PRISM_OK)
+			printf("  false positive: %s\n", r.error_msg ? r.error_msg : "");
+		prism_free(&r);
+	}
+	// nested for-init
+	{
+		const char *code =
+		    "int main(void) {\n"
+		    "    for (int i = 0; i < 10; i++)\n"
+		    "        for (int j = 0; j < 10; j++)\n"
+		    "            switch (j)\n"
+		    "                if (1) { case 1: ; } else { case 0: ; }\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bsw3.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "nested for-init + braceless switch + if-else must succeed");
+		if (r.status != PRISM_OK)
+			printf("  false positive: %s\n", r.error_msg ? r.error_msg : "");
+		prism_free(&r);
+	}
+	// C23 if-init + braceless switch + if-else
+	{
+		const char *code =
+		    "int main(void) {\n"
+		    "    if (int x = 0; x == 0)\n"
+		    "        switch (x)\n"
+		    "            if (1) { case 1: ; } else { case 0: ; }\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bsw4.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "C23 if-init + braceless switch + if-else must succeed");
+		if (r.status != PRISM_OK)
+			printf("  false positive: %s\n", r.error_msg ? r.error_msg : "");
+		prism_free(&r);
+	}
+	// Duff's device variant
+	{
+		const char *code =
+		    "void f(char *to, const char *from, int count) {\n"
+		    "    for (int n = (count + 7) / 8; n > 0; n--)\n"
+		    "        switch (count & 7)\n"
+		    "            if (0) { case 0: *to++ = *from++; }\n"
+		    "            else if (0) { case 7: *to++ = *from++; }\n"
+		    "            else if (0) { case 6: *to++ = *from++; }\n"
+		    "            else { case 1: *to++ = *from++; }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bsw5.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "Duff's device in for-loop must succeed");
+		if (r.status != PRISM_OK)
+			printf("  false positive: %s\n", r.error_msg ? r.error_msg : "");
+		prism_free(&r);
+	}
+	// Control: braced for-body (no cache poisoning path) still works
+	{
+		const char *code =
+		    "int main(void) {\n"
+		    "    int x = 0;\n"
+		    "    switch (x)\n"
+		    "        if (1) { case 1: ; } else { case 0: ; }\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bsw6.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "braceless switch + if-else without for-init must succeed");
+		prism_free(&r);
+	}
+	// Control: genuine bypass must still error
+	{
+		const char *code =
+		    "int main(void) {\n"
+		    "    for (int i = 0; i < 2; i++)\n"
+		    "        switch (i) {\n"
+		    "            int x;\n"
+		    "            case 0: x = 1; break;\n"
+		    "            case 1: x = 2; break;\n"
+		    "        }\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bsw7.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "genuine case bypass of decl in switch must still error");
+		prism_free(&r);
+	}
+}
+
+// skip_one_stmt do-while cache dropping: tn=0 on do entry destroyed
+// the trail for all parent statements, preventing cache population.
+// Subsequent skip_one_stmt calls on parent tokens (if, for) rescanned
+// the entire subtree, degrading to O(N^2).
+static void test_skip_cache_do_while_trail_drop(void) {
+	printf("\n--- skip_cache do-while trail preservation ---\n");
+
+	// do-while inside nested braceless if chain with for-init variable.
+	// Without cache fix, each intermediate if token would be uncached,
+	// causing Phase 1D to rescan the same tokens repeatedly.
+	{
+		const char *code =
+		    "int f(int c) {\n"
+		    "    goto L;\n"
+		    "    for (int i = 0; i < 10; i++)\n"
+		    "        if (c)\n"
+		    "            if (c)\n"
+		    "                if (c)\n"
+		    "                    do { (void)0; } while(0);\n"
+		    "L:\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "do_cache1.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "do-while cache: nested ifs + do + goto must succeed");
+		if (r.status != PRISM_OK)
+			printf("  error: %s\n", r.error_msg ? r.error_msg : "");
+		prism_free(&r);
+	}
+	// do-while with if-else inside + outer if-else (no for-init skip issue)
+	{
+		const char *code =
+		    "int g(int c) {\n"
+		    "    goto L;\n"
+		    "    if (c)\n"
+		    "        do\n"
+		    "            if (c) (void)0; else (void)1;\n"
+		    "        while(0);\n"
+		    "    else\n"
+		    "    L: (void)0;\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "do_cache2.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "do-while cache: inner if-else + outer else + goto must succeed");
+		if (r.status != PRISM_OK)
+			printf("  error: %s\n", r.error_msg ? r.error_msg : "");
+		prism_free(&r);
+	}
+	// Deeply nested braceless ifs before do-while (stress test for cache)
+	{
+		const char *code =
+		    "int h(int c) {\n"
+		    "    for (int i = 0; i < 1; i++)\n"
+		    "        if (c)\n"
+		    "        if (c)\n"
+		    "        if (c)\n"
+		    "        if (c)\n"
+		    "        if (c)\n"
+		    "        if (c)\n"
+		    "        if (c)\n"
+		    "        if (c)\n"
+		    "            do { (void)0; } while(0);\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "do_cache3.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "do-while cache: 8 nested ifs + do must succeed");
 		prism_free(&r);
 	}
 }
@@ -4945,11 +5223,20 @@ void run_safe_tests(void) {
         // Braceless labeled-declaration CFG lifetime
         test_braceless_labeled_decl_cfg();
 
+        // sizeof expression-paren subscript VLA hallucination
+        test_sizeof_expr_paren_subscript();
+
         // case/default label p1d_ctrl_pending leak
         test_case_label_ctrl_pending_leak();
 
         // skip_one_stmt cache poisoning false positive
         test_skip_one_stmt_cache_poison();
+
+        // skip_cache braceless switch + if-else false positive
+        test_skip_cache_braceless_switch_if_else();
+
+        // skip_cache do-while trail preservation
+        test_skip_cache_do_while_trail_drop();
 
         // sizeof commutative VLA bypass (stack corruption)
         test_sizeof_commutative_vla_bypass();
