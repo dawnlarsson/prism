@@ -6255,6 +6255,33 @@ static void test_generic_member_distinct_target_mutilation(void) {
 	prism_free(&r);
 }
 
+// BUG103: ternary ':' inside _Generic association value confused with
+// association separator — falsely makes generic_has_distinct_targets()
+// return true, blocking member rewrite and leaking obj._Generic(...).
+static void test_generic_ternary_colon_confusion(void) {
+	const char *code =
+	    "struct Obj { int type; };\n"
+	    "int handle(int x);\n"
+	    "void test(struct Obj *obj, int cond) {\n"
+	    "    obj._Generic(obj->type,\n"
+	    "        int: cond ? handle(42) : handle(42),\n"
+	    "        default: handle(42)\n"
+	    "    );\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "gen_ternary.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "generic-ternary: transpile succeeds");
+	if (r.output) {
+		const char *body = strstr(r.output, "void test");
+		CHECK(body != NULL, "generic-ternary: test function found");
+		if (body) {
+			CHECK(strstr(body, "_Generic") == NULL,
+			      "generic-ternary: _Generic must be rewritten "
+			      "(ternary ':' must not block same-target rewrite)");
+		}
+	}
+	prism_free(&r);
+}
+
 // Bug: block comment spanning #-to-directive in collect_source_defines
 // does not set in_block_comment = true before goto check_continuation,
 // so the continuation line with the actual directive is silently dropped.
@@ -7322,6 +7349,30 @@ static void test_braceless_defer_shadow_false_positive(void) {
 	prism_free(&r);
 }
 
+// Deeply nested parens wrapping a statement expression must not cause
+// quadratic slowdown in p1d_scan_balanced_group (BUG104).
+static void test_deep_nested_paren_stmtexpr_perf(void) {
+	// Build 2000-deep nested parens around a statement expression
+	enum { DEPTH = 2000 };
+	char code[DEPTH * 2 + 128];
+	int pos = 0;
+	pos += snprintf(code + pos, sizeof(code) - pos,
+			"int f(void) { return ");
+	for (int i = 0; i < DEPTH; i++) code[pos++] = '(';
+	pos += snprintf(code + pos, sizeof(code) - pos,
+			"({ int y = 1; y; })");
+	for (int i = 0; i < DEPTH; i++) code[pos++] = ')';
+	pos += snprintf(code + pos, sizeof(code) - pos, "; }\n");
+	code[pos] = '\0';
+	PrismResult r = prism_transpile_source(code, "deep_paren.c",
+					       prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "deep-paren-stmtexpr: transpiles OK");
+	CHECK(r.output != NULL,
+	      "deep-paren-stmtexpr: output not NULL");
+	prism_free(&r);
+}
+
 void run_api_tests_4(void) {
 	printf("\n=== API TESTS (group 4) ===\n");
 	test_collect_source_defines_long_line_truncation();
@@ -7355,6 +7406,7 @@ void run_api_tests_4(void) {
 	test_collect_source_defines_split_block_comment();
 	test_collect_source_defines_continuation_splice_space();
 	test_generic_member_distinct_target_mutilation();
+	test_generic_ternary_colon_confusion();
 	test_generic_nonident_target_fold();
 	test_collect_source_defines_conditional_guard_preserved();
 	test_cond_stack_deep_nesting_silent_drop();
@@ -7378,4 +7430,5 @@ void run_api_tests_4(void) {
 	test_raw_star_expr_misclassification();
 	GNUC_ONLY(test_typeof_local_shadows_func());
 	GNUC_ONLY(test_param_shadow_func_proto());
+	test_deep_nested_paren_stmtexpr_perf();
 }

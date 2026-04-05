@@ -5798,10 +5798,10 @@ static void p1d_check_multi_decl_constraints(Token *t, Token *type_tok,
 // statement expressions, and invalid defer/orelse in control-flow conditions.
 // Returns true if a statement expression was found (caller should process
 // tokens one by one instead of skipping the group).
-static bool p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func,
-				    Token *prev_saved) {
+static Token *p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func,
+				      Token *prev_saved) {
 	Token *group_end = tok_match(tok);
-	bool has_stmt_expr = false;
+	Token *stmt_expr_open = NULL;
 	Token *prev_inner = NULL;
 	int inner_depth = 0;
 	for (Token *inner = tok_next(tok); inner && inner != group_end; inner = tok_next(inner)) {
@@ -5812,9 +5812,9 @@ static bool p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func,
 			if (brace)
 				parse_enum_constants(brace, brace_depth);
 		}
-		if (match_ch(inner, '(') && tok_next(inner) &&
+		if (!stmt_expr_open && match_ch(inner, '(') && tok_next(inner) &&
 		    match_ch(tok_next(inner), '{')) {
-			has_stmt_expr = true;
+			stmt_expr_open = inner;
 		}
 		if (inner_depth == 0 && cur_func >= 0 && prev_saved &&
 		    (prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
@@ -5828,7 +5828,7 @@ static bool p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func,
 			error_tok(inner, "'orelse' cannot be used inside control statement condition parentheses");
 		prev_inner = inner;
 	}
-	return has_stmt_expr;
+	return stmt_expr_open;
 }
 
 // Probe a statement starting with a type-like token as a potential declaration.
@@ -6383,8 +6383,9 @@ uint16_t sid = next_scope_id++;
 				// Peek inside balanced groups for ghost enum definitions
 				// and nested statement expressions:
 				if (match_ch(tok, '(') || match_ch(tok, '[')) {
-					if (p1d_scan_balanced_group(tok, brace_depth, p1d_cur_func, p1d_prev_saved)) {
-						tok = tok_next(tok);
+					Token *se_open = p1d_scan_balanced_group(tok, brace_depth, p1d_cur_func, p1d_prev_saved);
+					if (se_open) {
+						tok = se_open;
 						continue;
 					}
 				}

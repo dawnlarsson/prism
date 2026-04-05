@@ -3301,20 +3301,30 @@ static bool generic_has_distinct_targets(Token *open) {
 	if (!assoc_start) return false;
 	const char *first_name = NULL;
 	int first_len = 0;
+	int ternary_depth = 0;
 	for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
 		if (t->flags & TF_OPEN) {
 			if (tok_match(t)) t = tok_match(t);
 			continue;
 		}
+		if (match_ch(t, '?')) { ternary_depth++; continue; }
 		if (!match_ch(t, ':')) continue;
+		if (ternary_depth > 0) { ternary_depth--; continue; }
 		bool found_ident = false;
+		int inner_ternary = 0;
 		for (Token *b = tok_next(t); b && b != close; b = tok_next(b)) {
 			if (b->flags & TF_OPEN) {
 				if (tok_match(b)) b = tok_match(b);
 				continue;
 			}
-			if (match_ch(b, ',')) break;
+			if (match_ch(b, ',') && inner_ternary == 0) break;
+			if (match_ch(b, '?')) { inner_ternary++; continue; }
+			if (match_ch(b, ':') && inner_ternary > 0) { inner_ternary--; continue; }
+			if (inner_ternary > 0) continue;
 			if (!is_valid_varname(b)) continue;
+			// Skip ternary condition identifiers: `cond ? ...`
+			{Token *bn = tok_next(b);
+			if (bn && match_ch(bn, '?')) { inner_ternary++; b = bn; continue; }}
 			found_ident = true;
 			while (b && tok_next(b) && tok_next(b) != close &&
 			       (tok_next(b)->tag & TT_MEMBER) &&
