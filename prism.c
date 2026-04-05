@@ -1323,6 +1323,11 @@ static void emit_type_range(Token *start, Token *end, bool strip_const, bool str
 				if (!keep) {
 					keep = true;
 					for (Token *u = tok_next(kw); u && u != t; u = tok_next(u)) {
+						if ((u->flags & TF_OPEN) && (match_ch(u, '(') || (u->flags & TF_C23_ATTR))) {
+							u = tok_match(u);
+							if (!u || u == t) break;
+							continue;
+						}
 						if (is_valid_varname(u) && !(u->tag & (TT_QUALIFIER | TT_ATTR | TT_TYPEOF))) {
 							keep = false;
 							break;
@@ -1417,7 +1422,8 @@ static int capture_function_return_type(Token *tok) {
 					// not on the return-type typedef.
 					Token *decl_end = skip_balanced(outer_open, '(', ')');
 					while (decl_end && (decl_end->flags & TF_OPEN) &&
-					       !match_ch(decl_end, '{') && !match_ch(decl_end, '('))
+					       !match_ch(decl_end, '{') && !match_ch(decl_end, '(') &&
+					       !(decl_end->flags & TF_C23_ATTR))
 						decl_end = walk_balanced(decl_end, false);
 					if (is_void) return 1;
 					ctx->func_ret_type_start = type_start;

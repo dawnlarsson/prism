@@ -7176,4 +7176,24 @@ void run_orelse_tests(void) {
 
 	// typeof VM-type double evaluation (BUG100)
 	test_orelse_typeof_vm_double_eval();
+
+	// BUG102: anonymous struct with __attribute__ body stripped on multi-decl split
+	{
+		const char *code =
+		    "struct __attribute__((packed)) { int x; int y; } *get_anon(void);\n"
+		    "void f(void) {\n"
+		    "    struct __attribute__((packed)) { int x; int y; } *a = get_anon() orelse (void*)0, *b = get_anon();\n"
+		    "    (void)a; (void)b;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "sue_attr_body.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "sue-attr-body: transpiles OK");
+		CHECK(r.output != NULL, "sue-attr-body: output not NULL");
+		// Both declarations must preserve the struct body
+		const char *first = strstr(r.output, "{ int x;");
+		CHECK(first != NULL, "sue-attr-body: first decl has struct body");
+		const char *second = first ? strstr(first + 1, "{ int x;") : NULL;
+		CHECK(second != NULL, "sue-attr-body: second decl must also preserve struct body");
+		prism_free(&r);
+	}
 }

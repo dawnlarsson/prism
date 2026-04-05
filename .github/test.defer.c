@@ -5373,4 +5373,33 @@ void run_defer_tests(void) {
 
 	// stmt-expr local false positive in defer shadow scanner
 	test_defer_shadow_stmt_expr_local_false_positive();
+
+	// BUG101: C23 [[...]] attribute consumed into return-type typedef
+	{
+		const char *code =
+		    "void cleanup(void);\n"
+		    "int (*get_array(void))[3] [[gnu::noinline]] {\n"
+		    "    static int arr[3] = {1, 2, 3};\n"
+		    "    defer cleanup();\n"
+		    "    return &arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "c23_attr_ret.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "c23-attr-ret: transpiles OK");
+		CHECK(r.output != NULL, "c23-attr-ret: output not NULL");
+		const char *td = r.output ? strstr(r.output, "typedef") : NULL;
+		CHECK(td != NULL, "c23-attr-ret: must emit typedef");
+		// Find the end of the typedef (next semicolon)
+		const char *td_semi = td ? strchr(td, ';') : NULL;
+		// The typedef must not mention the attribute
+		bool has_attr = false;
+		if (td && td_semi) {
+			for (const char *p = td; p < td_semi; p++) {
+				if (memcmp(p, "noinline", 8) == 0) { has_attr = true; break; }
+			}
+		}
+		CHECK(!has_attr,
+		      "c23-attr-ret: typedef must not contain [[gnu::noinline]]");
+		prism_free(&r);
+	}
 }
