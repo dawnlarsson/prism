@@ -2413,7 +2413,8 @@ static inline bool orelse_shadow_is_kw(Token *prev) {
 	if (!prev) return false;
 	if (prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE | TT_TYPEOF | TT_BITINT))
 		return false;
-	if ((prev->len == 1 && ((1ULL << (prev->ch0 - 32)) &
+	if ((prev->len == 1 && (unsigned)(prev->ch0 - 32) < 64 &&
+	    ((1ULL << (prev->ch0 - 32)) &
 	    ((1ULL << ('*' - 32)) | (1ULL << ('(' - 32)) | (1ULL << ('[' - 32)) |
 	     (1ULL << (',' - 32)) | (1ULL << ('=' - 32)) | (1ULL << ('?' - 32)) |
 	     (1ULL << (':' - 32)) | (1ULL << ('!' - 32)) | (1ULL << ('&' - 32)) |

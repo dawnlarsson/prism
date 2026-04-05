@@ -1208,7 +1208,9 @@ static void reject_orelse_side_effects(Token *start, Token *end,
 				  "twice — double evaluation of volatile reads or "
 				  "other side effects) %s", ctx_msg, advice);
 		next_checks:
-		if ((s->len == 2 && (s->ch0 == '+' || s->ch0 == '-')) || is_assignment_operator_token(s))
+		if ((s->len == 2 && ((s->ch0 == '+' && tok_loc(s)[1] == '+') ||
+				     (s->ch0 == '-' && tok_loc(s)[1] == '-'))) ||
+		    is_assignment_operator_token(s))
 			error_tok(s, "%s with side effect %s", ctx_msg, advice);
 		if (check_asm && (s->tag & TT_ASM))
 			error_tok(s, "%s with inline asm %s", ctx_msg, advice);
@@ -4639,8 +4641,7 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 	if (bare_assign_eq && is_bare_fallback) {
 		reject_orelse_side_effects(bare_lhs_start, bare_assign_eq,
 					  "orelse fallback on assignment",
-					  "in the target expression (double evaluation); "
-					  "use a temporary variable instead",
+					  "in the target expression",
 					  true, false, true);
 	}
 
@@ -4698,13 +4699,21 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 		}
 
 		out_char(' ');
-		// Check if LHS contains a member access (. or ->).
-		// typeof(bitfield) is a constraint violation (C23 §6.7.2.5p2),
-		// so when LHS has member access we use typeof(RHS) instead.
-		bool lhs_has_member = false;
+		// Check if LHS contains indirection (*, [, . or ->).
+		// typeof(LHS) evaluates its operand when the result type is
+		// variably-modified (C11 §6.7.2.4p2).  Operators in LHS can
+		// produce VM types (e.g. ptr-to-VLA subscript yields VLA),
+		// causing spurious volatile reads.  typeof(bitfield) is also
+		// a constraint violation (C23 §6.7.2.5p2).
+		// When LHS has indirection, use typeof(RHS) instead —
+		// function return types are never VM (C11 §6.7.6.3p1).
+		bool lhs_has_indirection = false;
 		if (bare_assign_eq) {
 			for (Token *s = bare_lhs_start; s != bare_assign_eq; s = tok_next(s))
-				if (s->tag & TT_MEMBER) { lhs_has_member = true; break; }
+				if ((s->tag & TT_MEMBER) || match_ch(s, '*') ||
+				    (match_ch(s, '[') && (s->flags & TF_OPEN))) {
+					lhs_has_indirection = true; break;
+				}
 		}
 		if (fallback_has_compound_literal) {
 			// The compound literal ternary path evaluates LHS twice:
@@ -4746,27 +4755,25 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 			OUT_LIT("));");
 		} else {
 			// Temp-based (volatile-safe, single-write):
-			// Evaluates RHS into a __typeof__(LHS) temp, writes LHS once.
+			// Evaluates RHS into a typeof(...) temp, writes LHS once.
 			//
-			// typeof(LHS) is used instead of typeof(RHS) to avoid
-			// double-evaluation when RHS yields a variably-modified
-			// type (C23 §6.7.2.5p3 / C11 §6.7.6.2p4): typeof(EXPR)
-			// evaluates its operand when the result type is VM.
-			// LHS is guaranteed side-effect-free by Phase 1D
-			// (reject_orelse_side_effects), so typeof(LHS) is safe.
-			//
-			// Exception: if LHS has a member access (. or ->), use
-			// typeof(RHS) instead — typeof on a bit-field is a
-			// constraint violation (C23 §6.7.2.5p2).  VM risk in
-			// RHS is negligible: bit-field assignments have integer
-			// RHS types which are never variably-modified.
+			// typeof(EXPR) evaluates its operand when the result type
+			// is variably-modified (C11 §6.7.2.4p2).  When LHS is a
+			// simple variable, typeof(LHS) is always safe (no side
+			// effects).  When LHS has indirection (*, [], ., ->), the
+			// result type may be VM (e.g. ptr-to-VLA subscript yields
+			// VLA), so we use typeof(RHS) instead.  Function return
+			// types are never VM (C11 §6.7.6.3p1), so typeof(RHS)
+			// never evaluates for the common f() orelse pattern.
+			// typeof(bitfield) is also a constraint violation
+			// (C23 §6.7.2.5p2), covered by the . / -> check.
 			//
 			// Single:  { typeof(LHS) t0=(a); LHS = t0 ? t0 : (fb); }
 			// Chained: { typeof(LHS) t0=(a); if(t0){LHS=t0;}else{
 			//            typeof(LHS) t1=(b); LHS = t1 ? t1 : (c); } }
 			unsigned oe_id = ctx->ret_counter++;
 			OUT_LIT("{ "); emit_typeof_keyword(); out_char('(');
-			if (lhs_has_member)
+			if (lhs_has_indirection)
 				emit_balanced_range(tok_next(bare_assign_eq), orelse_tok);
 			else
 				emit_range_no_prep(bare_lhs_start, bare_assign_eq);
@@ -4827,7 +4834,7 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 					}
 					oe_id = ctx->ret_counter++;
 					emit_typeof_keyword(); out_char('(');
-					if (lhs_has_member)
+					if (lhs_has_indirection)
 						emit_balanced_range(fb_start, fb_orelse);
 					else
 						emit_range_no_prep(bare_lhs_start, bare_assign_eq);

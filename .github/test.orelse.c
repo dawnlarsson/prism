@@ -6680,6 +6680,114 @@ static void test_orelse_bare_cast_non_lvalue(void) {
 	}
 }
 
+// BUG100: typeof(LHS) evaluates LHS at runtime when the result type is
+// variably-modified (C11 §6.7.2.4p2).  If LHS contains a subscript, deref,
+// or member access into a VM-typed expression (e.g. pointer-to-VLA),
+// Prism's bare value orelse emits:
+//   { typeof(LHS) tmp = (RHS); LHS = tmp ? tmp : fallback; }
+// which evaluates LHS twice: once in typeof (runtime VM eval) and once in
+// the assignment.  For volatile MMIO targets this doubles bus reads.
+// Fix: reject subscript/deref/member in LHS of bare value orelse.
+static void test_orelse_typeof_vm_double_eval(void) {
+	printf("\n--- typeof VM double eval ---\n");
+
+	// Sub-test 1: subscript LHS uses typeof(RHS), not typeof(LHS)
+	// typeof(LHS) would evaluate LHS if result type is VM (C11 §6.7.2.4p2).
+	// typeof(RHS) is safe because function returns are never VM.
+	{
+		const char *code =
+		    "int *get(void);\n"
+		    "void f(int **matrix) {\n"
+		    "    matrix[0] = get() orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vm_sub.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "typeof-vm: subscript LHS transpiles OK");
+		/* Output uses typeof(RHS) = typeof(get()), not typeof(matrix[0]). */
+		CHECK(r.output && strstr(r.output, "matrix[0])") == NULL,
+		      "typeof-vm: subscript LHS not inside typeof");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: deref LHS uses typeof(RHS)
+	{
+		const char *code =
+		    "int *get(void);\n"
+		    "void f(int **pp) {\n"
+		    "    *pp = get() orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vm_deref.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "typeof-vm: deref LHS transpiles OK");
+		/* Output uses typeof(RHS) = typeof(get()), not typeof(*pp). */
+		CHECK(r.output && strstr(r.output, "typeof__(*pp)") == NULL &&
+		      strstr(r.output, "typeof(*pp)") == NULL,
+		      "typeof-vm: deref LHS not inside typeof");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: member access LHS uses typeof(RHS)
+	{
+		const char *code =
+		    "struct S { int *p; };\n"
+		    "int *get(void);\n"
+		    "void f(struct S *s) {\n"
+		    "    s->p = get() orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vm_member.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "typeof-vm: member LHS transpiles OK");
+		CHECK(r.output && strstr(r.output, "typeof__(s->p)") == NULL &&
+		      strstr(r.output, "typeof(s->p)") == NULL,
+		      "typeof-vm: member LHS not inside typeof");
+		prism_free(&r);
+	}
+
+	// Sub-test 4: simple variable LHS uses typeof(LHS) (always safe)
+	{
+		const char *code =
+		    "int *get(void);\n"
+		    "void f(void) {\n"
+		    "    int *p = get() orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vm_simple.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "typeof-vm: simple var LHS accepted");
+		prism_free(&r);
+	}
+
+	// Sub-test 5: subscript LHS with control-flow action (no typeof at all)
+	{
+		const char *code =
+		    "int *get(void);\n"
+		    "void f(int **matrix) {\n"
+		    "    matrix[0] = get() orelse return;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vm_action.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "typeof-vm: subscript LHS OK with control-flow action");
+		prism_free(&r);
+	}
+
+	// Sub-test 6: the exploit case — volatile deref in subscript with VM type.
+	// Previously typeof(LHS) would evaluate *mmio; now uses typeof(RHS).
+	{
+		const char *code =
+		    "int *get_vla_ptr(void);\n"
+		    "void exploit(int n, int (**matrix)[n], volatile int *mmio) {\n"
+		    "    matrix[*mmio] = get_vla_ptr() orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vm_exploit.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "typeof-vm: VM-type exploit case transpiles OK");
+		/* Verify typeof does NOT operate on the dangerous LHS. */
+		CHECK(r.output && strstr(r.output, "typeof__(*mmio]") == NULL &&
+		      strstr(r.output, "typeof(*mmio]") == NULL,
+		      "typeof-vm: volatile mmio deref not inside typeof");
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -7065,4 +7173,7 @@ void run_orelse_tests(void) {
 
 	// AUDIT: cast non-lvalue bare orelse (A6)
 	test_orelse_bare_cast_non_lvalue();
+
+	// typeof VM-type double evaluation (BUG100)
+	test_orelse_typeof_vm_double_eval();
 }
