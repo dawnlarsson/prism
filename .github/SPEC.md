@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
-**Version:** 1.0.4
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4147+ tests + self-host stage1==stage2).
+**Version:** 1.0.5
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4159+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -35,8 +35,9 @@ Defined in `parse.c`. Produces a flat pool of `Token` structs.
 | `kind` | `uint8_t` | `TK_IDENT`, `TK_KEYWORD`, `TK_PUNCT`, `TK_STR`, `TK_NUM`, `TK_PREP_DIR`, `TK_EOF` |
 | `flags` | `uint8_t` | `TF_AT_BOL`, `TF_HAS_SPACE`, `TF_IS_FLOAT`, `TF_OPEN`, `TF_CLOSE`, `TF_C23_ATTR`, `TF_RAW`, `TF_SIZEOF` (also set on `__builtin_offsetof` and `offsetof`) |
 | `ann` | `uint8_t` | Pass 1 annotation flags (`P1_SCOPE_*`, `P1_OE_*`, `P1_IS_DECL`). Zeroed by `new_token()` on allocation. |
+| `ch0` | `uint8_t` | First source byte — avoids `tok_loc()` indirection in hot paths |
 
-Cold path data (`TokenCold`, separate array): `loc_offset`, `line_no` (21-bit), `file_idx` (11-bit).
+Cold path data (`TokenCold`, separate array): `loc_offset`, `line_no` (18-bit), `file_idx` (14-bit).
 
 ### Delimiter matching
 
@@ -148,7 +149,7 @@ FuncMeta {
     has_computed_goto      : bool     — function contains computed goto (*ptr)
     entry_start            : int      — start index into p1_entries[]
     entry_count            : int      — count of P1FuncEntry items
-    defer_name_bloom       : uint64_t — FNV-1a bloom filter of identifiers in defer bodies
+    defer_name_set         : HashMap  — exact set of identifier names in defer bodies
     label_hash             : int*     — open-addressing hash table: name → entry index (-1=empty)
     label_hash_mask        : int      — power-of-2 mask for label_hash probing
 }
@@ -482,7 +483,7 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 ### Defer-variable shadow checking
 
-`check_defer_var_shadow` detects when a newly-declared variable name appears in an active defer body — this would silently capture the wrong variable at cleanup time. Uses `FuncMeta.defer_name_bloom` (a 64-bit FNV-1a bloom filter of all identifier names in defer bodies) for an O(1) fast-reject before the O(N×M) body walk — eliminates the walk in the common case when no name matches. The body walk is implemented in the shared helper `defer_body_refs_name(body, body_end, name, nlen)`, which returns true if the name is referenced (not locally declared) in the token range. This helper is used by both `check_defer_var_shadow` (Pass 2 enclosing-scope + same-block checking) and `p1_check_defer_same_block_shadow` (Phase 1D same-scope checking), eliminating ~70 lines of duplicated token-walk logic. The body walk tracks brace depth: identifiers inside nested `{ }` blocks within the defer body (depth > 1) are skipped, since they are local declarations that cannot conflict with outer-scope variables. This avoids false positives for patterns like `defer { { int tmp = 1; } }` where the inner `tmp` is purely internal to the defer body. GNU statement expressions `({...})` are tracked via `se_depth`/`se_brace[]`: when `({` is encountered, the scanner records the current brace depth and increments `se_depth`; declarations inside the statement expression are recognized as local (the `paren_depth == se_depth` check replaces the strict `paren_depth == 0` requirement), preventing false positives from hygienic macros like `SAFE_MAX(a, b)` that declare temporaries inside `({...})`. The scanner also tracks C99 for-init declarations (`for(TYPE name = ...)`) via `for_init_pd`/`for_name_hid`/`for_body_bd`: when a for-init variable matches the target name, all references to that name within the for scope (condition, increment, and body) are treated as local rather than captured, preventing false positives.
+`check_defer_var_shadow` detects when a newly-declared variable name appears in an active defer body — this would silently capture the wrong variable at cleanup time. Uses `FuncMeta.defer_name_set` (an exact hash set of all identifier names in defer bodies) for an O(1) fast-reject before the O(N×M) body walk — eliminates the walk in the common case when no name matches. The body walk is implemented in the shared helper `defer_body_refs_name(body, body_end, name, nlen)`, which returns true if the name is referenced (not locally declared) in the token range. This helper is used by both `check_defer_var_shadow` (Pass 2 enclosing-scope + same-block checking) and `p1_check_defer_same_block_shadow` (Phase 1D same-scope checking), eliminating ~70 lines of duplicated token-walk logic. The body walk tracks brace depth: identifiers inside nested `{ }` blocks within the defer body (depth > 1) are skipped, since they are local declarations that cannot conflict with outer-scope variables. This avoids false positives for patterns like `defer { { int tmp = 1; } }` where the inner `tmp` is purely internal to the defer body. GNU statement expressions `({...})` are tracked via `se_depth`/`se_brace[]`: when `({` is encountered, the scanner records the current brace depth and increments `se_depth`; declarations inside the statement expression are recognized as local (the `paren_depth == se_depth` check replaces the strict `paren_depth == 0` requirement), preventing false positives from hygienic macros like `SAFE_MAX(a, b)` that declare temporaries inside `({...})`. The scanner also tracks C99 for-init declarations (`for(TYPE name = ...)`) via `for_init_pd`/`for_name_hid`/`for_body_bd`: when a for-init variable matches the target name, all references to that name within the for scope (condition, increment, and body) are treated as local rather than captured, preventing false positives.
 
 The scan covers two ranges: enclosing-scope defers `[0, blk->defer_start_idx)` and same-block defers `[blk->defer_start_idx, defer_count)`. Enclosing-scope matches register a `DeferShadow` entry for deferred checking at control-flow exits (`check_defer_shadow_at_exit`). Same-block matches produce an immediate error — the shadowing variable is unconditionally live when the defer fires at block end, so no control-flow analysis is needed. For-init declarations are exempt from the same-block immediate error (they use deferred `DeferShadow` checking instead) because their implicit scope ends at the loop boundary. A token-index range guard (`var_idx ∈ [defer.stmt, defer.end)`) prevents false positives from declarations inside defer bodies matching against their own body (e.g., `defer { char buf[16]; ... }`).
 
@@ -672,8 +673,8 @@ In `PRISM_LIB_MODE`, `error_tok` triggers `longjmp(ctx->error_jmp)` instead of `
 | Limit | Value | Error |
 |---|---|---|
 | Scope count (scope_id) | 65,534 | `scope tree: too many scopes (>65534)` |
-| Brace nesting depth | 4,096 | `brace nesting depth exceeds 4096` |
-| Switch nesting depth | 256 | `switch nesting depth exceeds 256` |
+| Braceless control flow nesting depth | 4,096 | `braceless control flow nesting depth exceeds 4096` |
+| Array dimension nesting depth | 256 | `array dimension nesting depth exceeds 256` |
 | Braceless switch synthetic scopes | Limited by remaining scope_id range | `too many scopes + braceless switches (>65535)` |
 
 These limits are enforced with hard errors. Exceeding any limit halts transpilation.

@@ -1987,15 +1987,16 @@ static void ensure_keyword_cache(void) {
 	else if (ctx->keyword_cache_features != ctx->features) init_keyword_map();
 }
 
-static Token *tokenize_buffer(char *name, char *buf) {
-	if (!buf) return NULL;
-
+static inline Token *finalize_load(char *name, char *buf) {
 	File *file = new_file(name, ctx->input_file_count, buf);
 	add_input_file(file);
-    
-	ensure_keyword_cache();
-
 	return tokenize(file);
+}
+
+static Token *tokenize_buffer(char *name, char *buf) {
+	if (!buf) return NULL;
+	ensure_keyword_cache();
+	return finalize_load(name, buf);
 }
 
 Token *tokenize_file(char *path) {
@@ -2022,9 +2023,7 @@ Token *tokenize_file(char *path) {
 		char *buf = malloc(8);
 		if (!buf) return NULL;
 		memset(buf, 0, 8);
-		File *file = new_file(path, ctx->input_file_count, buf);
-		add_input_file(file);
-		return tokenize(file);
+		return finalize_load(path, buf);
 	}
 	if (li_size.QuadPart > 512LL * 1024 * 1024) {
 		CloseHandle(hFile);
@@ -2042,9 +2041,7 @@ Token *tokenize_file(char *path) {
 	}
 	CloseHandle(hFile);
 	memset(buf + file_size, 0, 8);
-	File *file = new_file(path, ctx->input_file_count, buf);
-	add_input_file(file);
-	return tokenize(file);
+	return finalize_load(path, buf);
 #else
 	int fd = open(path, O_RDONLY);
 	if (fd < 0) return NULL;
@@ -2059,9 +2056,7 @@ Token *tokenize_file(char *path) {
 		char *buf = malloc(8);
 		if (!buf) return NULL;
 		memset(buf, 0, 8);
-		File *file = new_file(path, ctx->input_file_count, buf);
-		add_input_file(file);
-		return tokenize(file);
+		return finalize_load(path, buf);
 	}
 	// malloc + read with 8-byte padding for safe SWAR comment scanning
 	char *buf = malloc(size + 8);
@@ -2074,9 +2069,7 @@ Token *tokenize_file(char *path) {
 	}
 	close(fd);
 	memset(buf + size, 0, 8);
-	File *file = new_file(path, ctx->input_file_count, buf);
-	add_input_file(file);
-	return tokenize(file);
+	return finalize_load(path, buf);
 #endif
 }
 
@@ -2226,9 +2219,7 @@ static Token *skip_noise(Token *tok) {
 			tok = tok_next(tok_match(tok));
 		} else if (tok->kind == TK_PREP_DIR) {
 			tok = tok_next(tok);
-		} else {
-			break;
-		}
+		} else break;
 	}
 	return tok;
 }
@@ -2398,9 +2389,7 @@ static void parse_enum_constants(Token *tok, int scope_depth) {
 			}
 
 			if (tok && tok->len == 1 && tok->ch0 == ',') tok = tok_next(tok);
-		} else {
-			tok = tok_next(tok);
-		}
+		} else tok = tok_next(tok);
 	}
 }
 
@@ -2664,9 +2653,7 @@ static void scan_paren_for_vla(Token *open, Token *end, TypeSpecResult *r, bool 
 		if (t->len == 1 && t->ch0 == '(') {
 			if (fn_skip > 0) fn_skip++;
 			else if (prev->len == 1 && prev->ch0 == ')') fn_skip = 1;
-		} else if (t->len == 1 && t->ch0 == ')') {
-			if (fn_skip > 0) fn_skip--;
-		}
+		} else if (t->len == 1 && t->ch0 == ')') { if (fn_skip > 0) fn_skip--; }
 		if (fn_skip > 0) continue;
 		if (t->len == 1 && t->ch0 == '[' &&
 		    is_array_bracket_predecessor(prev, prev2) &&
@@ -2766,9 +2753,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			if (tok && tok->len == 1 && tok->ch0 == '{') {
 				if (struct_body_contains_vla(tok)) r.is_vla = true;
 				tok = skip_balanced_group(tok);
-			} else if (sue_tag && is_vla_typedef(sue_tag)) {
-				r.is_vla = true;
-			}
+			} else if (sue_tag && is_vla_typedef(sue_tag)) r.is_vla = true;
 			r.end = tok;
 			continue;
 		}
@@ -3114,9 +3099,7 @@ static Token *p1_find_prev_skipping_attrs(uint32_t before_idx) {
 	for (uint32_t pi = before_idx; pi > 0; pi--) {
 		Token *pt = &token_pool[pi];
 		if (pt->kind == TK_PREP_DIR) continue;
-		if (match_ch(pt, ']') && tok_match(pt) && (tok_match(pt)->flags & TF_C23_ATTR)) {
-			pi = tok_idx(tok_match(pt)); continue;
-		}
+		if (match_ch(pt, ']') && tok_match(pt) && (tok_match(pt)->flags & TF_C23_ATTR)) { pi = tok_idx(tok_match(pt)); continue; }
 		if (match_ch(pt, ')') && tok_match(pt)) {
 			Token *open = tok_match(pt);
 			uint32_t oi = tok_idx(open);
@@ -3162,9 +3145,7 @@ static void defer_scan_hidden_stmt_exprs(Token *open, bool in_loop, bool in_swit
 		if (is_stmt_expr_open(t)) {
 			validate_defer_statement(tok_next(t), in_loop, in_switch, depth + 1);
 			t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t);
-		} else {
-			t = tok_next(t);
-		}
+		} else t = tok_next(t);
 	}
 }
 
@@ -3560,7 +3541,7 @@ static bool needs_space(Token *prev, Token *tok) {
 	char a = (prev->len == 1) ? prev->ch0 : tok_loc(prev)[prev->len - 1];
 	char b = tok->ch0;
 	if (b == '=') return strchr("=!<>+-*/%&|^", a) != NULL;
-	return (a == b && strchr("+-<>&|#", a)) || (a == '-' && b == '>') || 
+	return (a == b && strchr("+-<>&|#", a)) || (a == '-' && b == '>') ||
 	       (a == '/' && b == '*') || (a == '*' && b == '/');
 }
 
@@ -3586,9 +3567,7 @@ static uint16_t find_body_scope_id(Token *body_start) {
 
 // full=false: reset for reuse; full=true: free everything
 void tokenizer_teardown(bool full) {
-	if (ctx->input_files) {
-		for (int i = 0; i < ctx->input_file_count; i++) free_file_contents(ctx->input_files[i]);
-	}
+	if (ctx->input_files) { for (int i = 0; i < ctx->input_file_count; i++) free_file_contents(ctx->input_files[i]); }
 	if (full) {
 		arena_free(&ctx->main_arena);
 		memset(keyword_cache, 0, sizeof(keyword_cache));
