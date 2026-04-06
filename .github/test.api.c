@@ -8243,7 +8243,7 @@ static void test_typeof_unqual_const_stripping(void) {
 		PrismResult r = prism_transpile_source(code, "tuc1.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK, "typeof_unqual(const int[n]): transpiles OK");
 		if (r.output) {
-			CHECK(strstr(r.output, "memset") != NULL || strstr(r.output, "= {0}") != NULL,
+			CHECK(has_zeroing(r.output),
 			      "typeof_unqual: zero-init applied (not rejected)");
 		}
 		prism_free(&r);
