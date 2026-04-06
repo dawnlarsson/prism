@@ -2249,7 +2249,10 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 		t = close;
 	}
 
-	if (!any_orelse) { arena_restore(&ctx->main_arena, bracket_mark); return; }
+	if (!any_orelse) {
+		arena_restore(&ctx->main_arena, bracket_mark);
+		return;
+	}
 
 	// Emit temps in left-to-right order.
 	// Non-orelse brackets that precede the first orelse bracket get dimension temps
@@ -3260,6 +3263,12 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		// Step 2b: Pre-hoist bracket orelse temps (before type emission)
 		bool has_bo = FEAT(F_ORELSE) && declarator_has_bracket_orelse(decl_start, decl.end);
 		bool brace_opened = false;
+		// Save bracket orelse state for reentrancy protection.
+		// Stmt-exprs in dim expressions can trigger inner process_declarators
+		// which calls emit_bracket_orelse_temps, clobbering the outer's entries.
+		int bo_saved_oe_count = 0, bo_saved_oe_next = 0;
+		int bo_saved_dim_count = 0, bo_saved_dim_next = 0;
+		unsigned bo_saved_oe_ids[16], bo_saved_dim_ids[16];
 		if (has_bo) {
 			if (in_ctrl_paren())
 				error_tok(decl_start,
@@ -3268,6 +3277,15 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					  "inject invalid syntax); move the declaration before "
 					  "the statement");
 			if (first_decl && brace_wrap) { OUT_LIT(" {"); brace_opened = true; }
+			// Save outer bracket state before reset
+			bo_saved_oe_count  = ctx->bracket_oe_count;
+			bo_saved_oe_next   = ctx->bracket_oe_next;
+			bo_saved_dim_count = ctx->bracket_dim_count;
+			bo_saved_dim_next  = ctx->bracket_dim_next;
+			int oe_n  = bo_saved_oe_count < 16 ? bo_saved_oe_count : 16;
+			int dim_n = bo_saved_dim_count < 16 ? bo_saved_dim_count : 16;
+			if (oe_n)  memcpy(bo_saved_oe_ids,  ctx->bracket_oe_ids,  oe_n * sizeof(unsigned));
+			if (dim_n) memcpy(bo_saved_dim_ids, ctx->bracket_dim_ids, dim_n * sizeof(unsigned));
 			emit_bracket_orelse_temps(decl_start, decl.end);
 		}
 
@@ -3340,17 +3358,33 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 				  "cannot use initializer syntax); remove 'register' "
 				  "or use 'raw' to opt out of automatic initialization");
 
+		// Restore macro — used by both const-orelse and normal paths.
+#define BO_RESTORE() do { if (has_bo) {			\
+	ctx->bracket_oe_count = bo_saved_oe_count;	\
+	ctx->bracket_oe_next  = bo_saved_oe_next;	\
+	ctx->bracket_dim_count = bo_saved_dim_count;	\
+	ctx->bracket_dim_next  = bo_saved_dim_next;	\
+	int oe_n_  = bo_saved_oe_count < 16 ? bo_saved_oe_count : 16;	\
+	int dim_n_ = bo_saved_dim_count < 16 ? bo_saved_dim_count : 16;	\
+	if (oe_n_)  memcpy(ctx->bracket_oe_ids,  bo_saved_oe_ids,  oe_n_ * sizeof(unsigned));	\
+	if (dim_n_) memcpy(ctx->bracket_dim_ids, bo_saved_dim_ids, dim_n_ * sizeof(unsigned));	\
+} } while (0)
+
 		if (is_const_orelse_fallback) {
 			if (process_const_orelse_decl(&tok, orelse_info.orelse_tok, decl_start,
 						     &decl, type_start, type, pragma_start, brace_wrap)) {
+				BO_RESTORE();
 				need_type_emit = true;
 				continue;
 			}
+			BO_RESTORE();
 			return tok;
 		}
 
-		// Normal path: emit declarator
+		// Normal path: emit declarator (consumes bracket orelse entries)
 		parse_declarator(decl_start, true);
+		BO_RESTORE();
+#undef BO_RESTORE
 		tok = decl.end;
 
 		// Add zero initializer if needed (for non-memset types)
@@ -6008,6 +6042,36 @@ p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t
 	}
 }
 
+// Phase 1G: reject orelse in VLA bracket dimensions of function prototype
+// parameters.  Prototype parameter arrays decay to pointers (C11 §6.7.6.3p7),
+// so VLA dimensions are never evaluated — an orelse runtime fallback is
+// semantically meaningless and would require hoisting temps into a scope where
+// the parameter names do not exist.
+static void p1d_reject_proto_param_orelse(Token *open_paren) {
+	Token *close = tok_match(open_paren);
+	if (!close) return;
+	// Verify this is a prototype (followed by ';', not '{' or K&R params).
+	Token *after = skip_noise(tok_next(close));
+	if (!after || !match_ch(after, ';')) return;
+	// Scan parameter list for bracket orelse.
+	for (Token *t = tok_next(open_paren); t && t != close; t = tok_next(t)) {
+		if (match_ch(t, '[') && tok_match(t) && !(t->flags & TF_C23_ATTR)) {
+			Token *bc = tok_match(t);
+			for (Token *s = tok_next(t); s && s != bc; s = tok_next(s)) {
+				if ((s->flags & TF_OPEN) && tok_match(s)) { s = tok_match(s); continue; }
+				if (is_orelse_kw_shadow(s))
+					error_tok(s, "'orelse' in array dimensions of a function "
+						     "prototype is not allowed (prototype parameter "
+						     "arrays are never allocated; the dimension is "
+						     "not evaluated at runtime)");
+			}
+			t = bc;
+			continue;
+		}
+		if ((t->flags & TF_OPEN) && tok_match(t)) { t = tok_match(t); continue; }
+	}
+}
+
 // Phase 1G: classify bracket orelse inside [...] array dimensions.
 // Extracted from p1_full_depth_prescan to reduce main loop icache footprint.
 static void __attribute__((noinline))
@@ -6649,16 +6713,22 @@ static void p1_full_depth_prescan(Token *tok) {
 		if (tok->kind == TK_IDENT) {
 			Token *nx = tok_next(tok);
 			if (nx && match_ch(nx, '(')) {
+				bool is_func_decl = false;
 				if (brace_depth == 0) {
 					hashmap_put(&p1_func_proto_map, tok_loc(tok), tok->len, (void *)1);
+					is_func_decl = true;
 				} else {
 					uint32_t ti = tok_idx(tok);
 					if (ti > 0) {
 						Token *prev = &token_pool[ti - 1];
-						if (prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE | TT_TYPEOF))
+						if (prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE | TT_TYPEOF)) {
 							hashmap_put(&p1_func_proto_map, tok_loc(tok), tok->len, (void *)1);
+							is_func_decl = true;
+						}
 					}
 				}
+				if (is_func_decl && FEAT(F_ORELSE) && tok_match(nx))
+					p1d_reject_proto_param_orelse(nx);
 			}
 		}
 

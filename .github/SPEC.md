@@ -11,7 +11,9 @@ This document describes what the transpiler **does**, not what it aspires to do.
 
 Prism is a source-to-source C transpiler. It reads preprocessed C, transforms it, and emits standard C. It adds three language features — `defer`, `orelse`, and automatic zero-initialization — and enforces safety rules at transpile time. It is a single compilation unit (`prism.c` includes `parse.c`; `windows.c` is a native Windows shim).
 
-**Standards compatibility:** Prism accepts C99, C11, and C23 input and emits standard C compatible with GCC, Clang, and MSVC. All standard C type specifiers, qualifiers, storage classes, attributes, and control-flow constructs are recognized and passed through correctly. C23 features including `typeof_unqual`, `constexpr`, `auto` type inference, `_BitInt(N)`, `[[...]]` attributes, `alignas`/`alignof`, `static_assert`, fixed-underlying-type enums (`enum E : int { ... }`), labeled declarations, and if/switch initializers are supported.
+**Standards compatibility:** Prism accepts C99, C11, and C23 input and emits standard C compatible with GCC, Clang, and MSVC. All standard C type specifiers, qualifiers, storage classes, attributes, and control-flow constructs are recognized and passed through correctly. C23 features including `typeof_unqual`, `constexpr`, `auto` type inference, `_BitInt(N)`, `[[...]]` attributes, `alignas`/`alignof`, `static_assert`, fixed-underlying-type enums (`enum E : int { ... }`), labeled declarations, and if/switch initializers are supported. Do note Prism IS NOT officially certified in any way.
+
+Note: Prism is thoroughly empirically tested (self-hosting and 4,300+ test cases) but **is not formally verified.** It is designed to compile standard-compliant code, but **may not catch every obscure constraint violation** defined by the ISO C standard.
 
 The transpiler operates in two passes:
 

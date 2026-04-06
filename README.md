@@ -8,7 +8,6 @@
 Prism is a lightweight and very fast transpiler that makes C safer and faster without changing how you write it.
 
 - **4398 tests** — edge cases, control flow, nightmares, trying hard to break Prism
-- **C99 / C11 / C23** — accepts all standard C input
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Two-pass transpiler** — full semantic analysis before a single byte is emitted
 - **Opt-out features** — Disable parts of the transpiler, like zero-init, with CLI flags

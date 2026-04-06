@@ -2799,6 +2799,52 @@ static void test_nested_bracket_orelse_dim_id_misalignment(void) {
 	prism_free(&r);
 }
 
+// BUG: emit_bracket_orelse_temps resets bracket_oe_count/next and
+// bracket_dim_count/next to 0. When a dimension expression contains a
+// statement expression with an inner declaration that also has bracket
+// orelse, inner process_declarators calls emit_bracket_orelse_temps
+// again, clobbering the outer's entries. The outer's hoisted temps
+// become dead code and the outer declaration falls back to inline
+// ternary (double evaluation) or wrong dim temp IDs.
+static void test_bracket_orelse_stmtexpr_reentrancy(void) {
+	const char *code =
+	    "int get_n(void);\n"
+	    "int get_m(void);\n"
+	    "void f(int n, int m) {\n"
+	    "    int arr[n orelse 3][({ int inner[m orelse 2]; (int)(sizeof(inner)/sizeof(inner[0])); })];\n"
+	    "    arr[0][0] = 42;\n"
+	    "    (void)arr;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "bo_reentrant.c", prism_defaults());
+	CHECK(r.output != NULL, "bo-reentrant: transpilation failed");
+	if (r.output) {
+		// Outer orelse temp __prism_oe_0 must appear and be used in the arr declaration.
+		CHECK(strstr(r.output, "__prism_oe_0") != NULL,
+		      "bo-reentrant: outer orelse temp __prism_oe_0 missing (clobbered by inner)");
+		// Outer dim temp __prism_dim_1 must appear for the stmt-expr dimension.
+		CHECK(strstr(r.output, "__prism_dim_1") != NULL,
+		      "bo-reentrant: outer dim temp __prism_dim_1 missing (clobbered by inner)");
+		// Inner orelse temp __prism_oe_2 must appear inside the stmt-expr.
+		CHECK(strstr(r.output, "__prism_oe_2") != NULL,
+		      "bo-reentrant: inner orelse temp __prism_oe_2 missing");
+		// The arr declaration must use the hoisted temps, not inline ternary or raw 'n'.
+		const char *decl = strstr(r.output, "int arr[");
+		if (decl) {
+			// Check that 'n' does NOT appear directly in arr[] (should be __prism_oe_0)
+			const char *end = decl + 120;
+			bool found_raw_n = false;
+			for (const char *p = decl + 8; p < end && *p && *p != ';'; p++) {
+				if (p[0] == 'n' && (p[1] == ' ' || p[1] == ']') &&
+				    (p == decl + 8 || p[-1] == '[' || p[-1] == ' '))
+					found_raw_n = true;
+			}
+			CHECK(!found_raw_n,
+			      "bo-reentrant: raw 'n' leaked into arr[] — outer orelse not applied");
+		}
+	}
+	prism_free(&r);
+}
+
 static void test_file_scope_struct_brace_orelse_bypass(void) {
 	// BUG: p1_classify_bracket_orelse uses brace_depth == 0 to detect
 	// file scope.  A struct definition body at file scope increments
@@ -2959,21 +3005,17 @@ static void test_typeof_orelse_cast(void) {
 }
 
 static void test_bracket_orelse_in_prototype(void) {
-	/* BUG: orelse inside bracket dimension of a function prototype
-	   parameter was rejected by the generic 'orelse cannot be used here'
-	   catch-all because try_zero_init_decl returns NULL for prototypes. */
+	/* orelse inside bracket dimension of a function prototype parameter
+	   is rejected because prototype parameter arrays decay to pointers
+	   (C11 §6.7.6.3p7) and VLA dimensions are never evaluated. */
 	PrismResult r = prism_transpile_source(
 	    "void outer(void) {\n"
 	    "    int n = 5;\n"
 	    "    void inner(int n, int a[n orelse 1]);\n"
 	    "}\n",
 	    "bracket_oe_proto.c", prism_defaults());
-	CHECK_EQ(r.status, PRISM_OK,
-		 "bracket-orelse-proto: transpiles OK");
-	if (r.output) {
-		CHECK(strstr(r.output, "orelse") == NULL,
-		      "bracket-orelse-proto: no literal 'orelse' in output");
-	}
+	CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
+		 "bracket-orelse-proto: rejected in prototype");
 	prism_free(&r);
 }
 
@@ -6976,6 +7018,7 @@ void run_orelse_tests(void) {
 
 	// architecture-level bug probes
 	test_nested_bracket_orelse_dim_id_misalignment();
+	test_bracket_orelse_stmtexpr_reentrancy();
 	test_file_scope_struct_brace_orelse_bypass();
 
 	// parenthesized function call bypass

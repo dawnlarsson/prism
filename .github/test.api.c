@@ -8505,6 +8505,77 @@ static void test_c23_enum_fixed_underlying_type(void) {
 	}
 }
 
+// Test: orelse in VLA dimensions of function prototype parameters is rejected.
+// Prototype parameter arrays decay to pointers (C11 §6.7.6.3p7); VLA
+// dimensions are never evaluated at runtime, so orelse fallback is meaningless.
+static void test_proto_param_vla_orelse_rejected(void) {
+	printf("\n--- proto param VLA orelse rejection ---\n");
+
+	// 1. Block-scope prototype: orelse rejected
+	{
+		const char *code =
+		    "void foo(void) {\n"
+		    "    void bar(int n, float matrix[n][n orelse 10]);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ppvo1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
+			 "proto-vla-orelse: block-scope prototype rejected");
+		prism_free(&r);
+	}
+
+	// 2. File-scope prototype: orelse rejected
+	{
+		const char *code = "void bar(int n, int arr[n orelse 5]);\n";
+		PrismResult r = prism_transpile_source(code, "ppvo2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
+			 "proto-vla-orelse: file-scope prototype rejected");
+		prism_free(&r);
+	}
+
+	// 3. Function definition: orelse allowed (inline ternary works)
+	{
+		const char *code =
+		    "void bar(int n, int arr[n orelse 5]) {\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ppvo3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "proto-vla-orelse: function definition allowed");
+		prism_free(&r);
+	}
+
+	// 4. Prototype with attributes after params: still rejected
+	{
+		const char *code =
+		    "void bar(int n, float m[n orelse 5])"
+		    " __attribute__((unused));\n";
+		PrismResult r = prism_transpile_source(code, "ppvo4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
+			 "proto-vla-orelse: prototype with attrs rejected");
+		prism_free(&r);
+	}
+
+	// 5. Multiple orelse in multi-dim prototype: first one caught
+	{
+		const char *code =
+		    "void f(int n, int m, float a[n orelse 1][m orelse 2]);\n";
+		PrismResult r = prism_transpile_source(code, "ppvo5.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
+			 "proto-vla-orelse: multi-dim prototype rejected");
+		prism_free(&r);
+	}
+
+	// 6. Function pointer typedef: orelse NOT rejected (different detection path)
+	{
+		const char *code =
+		    "typedef void (*FP)(int n, int arr[n orelse 5]);\n";
+		PrismResult r = prism_transpile_source(code, "ppvo6.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "proto-vla-orelse: func ptr typedef passes");
+		prism_free(&r);
+	}
+}
+
 void run_api_tests_4(void) {
 	printf("\n=== API TESTS (group 4) ===\n");
 	test_collect_source_defines_long_line_truncation();
@@ -8584,4 +8655,5 @@ void run_api_tests_4(void) {
 	test_generic_paren_complex_target_prefix();
 	test_generic_inner_generic_prefix();
 	test_c23_enum_fixed_underlying_type();
+	test_proto_param_vla_orelse_rejected();
 }
