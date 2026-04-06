@@ -320,6 +320,7 @@ static PRISM_THREAD_LOCAL int scope_stack_cap = 0;
 static PRISM_THREAD_LOCAL DeferEntry *defer_stack = NULL;
 static PRISM_THREAD_LOCAL int defer_stack_cap = 0;
 static PRISM_THREAD_LOCAL int defer_count = 0;
+static PRISM_THREAD_LOCAL bool in_defer_emit = false; // recursion guard for emit_defers_ex
 static PRISM_THREAD_LOCAL CtrlState ctrl_state;
 static PRISM_THREAD_LOCAL CtrlState *ctrl_save_stack = NULL; // saved ctrl_state for stmt-expr inside ctrl parens
 static PRISM_THREAD_LOCAL int ctrl_save_depth = 0;
@@ -935,11 +936,14 @@ static void emit_deferred_range(Token *start, Token *end);
 // label→block patching; this function is the single seam for that change.
 static void emit_defers_ex(DeferEmitMode mode, int stop_depth) {
 	if (ctx->block_depth <= 0) return;
+	if (in_defer_emit) return; // prevent infinite recursion
 
 	// For control-flow exits (not end-of-scope), verify no live shadow conflicts.
 	if (mode != DEFER_SCOPE)
 		check_defer_shadow_at_exit(mode, stop_depth);
 
+	bool saved_in_defer = in_defer_emit;
+	in_defer_emit = true;
 	int current_defer = defer_count - 1;
 	int curr_bd = ctx->block_depth;
 	for (int d = ctx->scope_depth - 1; d >= 0; d--) {
@@ -959,6 +963,7 @@ static void emit_defers_ex(DeferEmitMode mode, int stop_depth) {
 		if (mode == DEFER_BREAK && (scope->is_loop || scope->is_switch)) break;
 		if (mode == DEFER_CONTINUE && scope->is_loop) break;
 	}
+	in_defer_emit = saved_in_defer;
 }
 
 static bool has_defers_for(DeferEmitMode mode, int stop_depth) {
@@ -6834,7 +6839,7 @@ uint16_t sid = next_scope_id++;
 					if (prev && match_ch(prev, ')') && tok_match(prev)) {
 						// Found param list — scan backward for declaration start
 						Token *open = tok_match(prev);
-						for (uint32_t pi = tok_idx(open); pi > 0; pi--) {
+						for (uint32_t pi = tok_idx(open); pi > 1; pi--) {
 							Token *pt = &token_pool[pi - 1];
 							if (pt->kind == TK_PREP_DIR) continue;
 							if (match_ch(pt, '{') || match_ch(pt, '}') ||
