@@ -522,7 +522,7 @@ static inline void out_char(char c) {
 static inline void out_str(const char *s, int len) {
 	if (__builtin_expect(len <= 0, 0)) return;
 	if (__builtin_expect(out_buf_pos + len >= OUT_BUF_SIZE, 0)) {
-		if (len >= OUT_BUF_SIZE) { out_flush(); fwrite(s, 1, len, out_fp); return; }
+		if (len >= OUT_BUF_SIZE) { out_flush(); fwrite(s, 1, len, out_fp); out_total_flushed += len; return; }
 		out_flush();
 	}
 	memcpy(out_buf + out_buf_pos, s, len);
@@ -5335,15 +5335,22 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 				while (true) {
 					bool is_last = !orelse_has_chain(t, comma_term);
 					if (is_last) {
-						// Last link: ternary preserves CL lifetime
-						// and usual arithmetic conversions.
-						OUT_LIT(" ");
+						// Last link: if/else with independent
+						// simple-assignment conversions (ISO C
+						// §6.5.16.1).  A ternary would subject
+						// both operands to the usual arithmetic
+						// conversions (§6.5.15), silently
+						// promoting e.g. int → unsigned int when
+						// the fallback has different signedness.
+						OUT_LIT(" if (__prism_oe_");
+						out_uint(oe_id);
+						OUT_LIT(") { ");
 						emit_range_no_prep(bare_lhs_start, bare_assign_eq);
 						OUT_LIT(" = __prism_oe_");
 						out_uint(oe_id);
-						OUT_LIT(" ? __prism_oe_");
-						out_uint(oe_id);
-						OUT_LIT(" : (");
+						OUT_LIT("; } else { ");
+						emit_range_no_prep(bare_lhs_start, bare_assign_eq);
+						OUT_LIT(" = (");
 						int fd = 0;
 						while (t->kind != TK_EOF) {
 							if ((t->flags & TF_OPEN) && (match_ch(t, '(') || match_ch(t, '['))) { t = walk_balanced(t, true); continue; }
@@ -5352,7 +5359,7 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 							else if (fd == 0 && BARE_IS_END(t)) break;
 							emit_tok(t); t = tok_next(t);
 						}
-						OUT_LIT(");");
+						OUT_LIT("); }");
 						break;
 					}
 					// Intermediate link: if/else with new typed temp.
@@ -5427,20 +5434,14 @@ static Token *emit_deferred_orelse(Token *t, Token *end) {
 	if (match_ch(t, ';'))
 		error_tok(t, "expected statement after 'orelse'");
 
-	if (t->tag & (TT_BREAK | TT_CONTINUE | TT_GOTO | TT_RETURN)) {
-		// Control-flow action: emit keyword to semicolon.
-		while (t && t->kind != TK_EOF && !match_ch(t, ';')) {
-			emit_tok(t); t = tok_next(t);
-		}
-		if (match_ch(t, ';')) { emit_tok(t); t = tok_next(t); }
-	} else if (match_ch(t, '{')) {
-		Token *bclose = tok_match(t);
-		emit_tok(t); t = tok_next(t);
-		// Process block body through emit_deferred_range for zeroinit/raw/orelse
-		emit_deferred_range(t, bclose);
-		t = bclose;
-		if (t) { emit_tok(t); t = tok_next(t); }
-	} else error_tok(orelse_tok, "orelse fallback requires an assignment target (use a declaration)");
+	// Delegate ALL action emission to emit_orelse_action, which routes
+	// blocks through emit_orelse_block_body (→ emit_block_body, the full
+	// transpilation engine) and control-flow keywords through
+	// emit_return_body / emit_break_continue_defer / emit_goto_defer.
+	// This ensures defer unwinding, nested orelse, and zero-init are
+	// handled correctly even when orelse-with-action appears inside
+	// emit_block_body → try_process_stmt_token contexts.
+	t = emit_orelse_action(t, NULL, false, false, NULL);
 	OUT_LIT(" }");
 	if (match_ch(t, ';')) t = tok_next(t);
 	return t;
@@ -6442,9 +6443,32 @@ static Token *p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func,
 	Token *stmt_expr_open = NULL;
 	Token *prev_inner = NULL;
 	int inner_depth = 0;
+	int se_depth = 0;
+	Token *se_close_stack[64];
+	int se_close_top = 0;
 	for (Token *inner = tok_next(tok); inner && inner != group_end; inner = tok_next(inner)) {
-		if (inner->flags & TF_OPEN) inner_depth++;
-		if (inner->flags & TF_CLOSE) { inner_depth--; prev_inner = inner; continue; }
+		if (inner->flags & TF_OPEN) {
+			// Detect stmt-expr: '(' immediately followed by '{'
+			if (match_ch(inner, '(') && tok_next(inner) &&
+			    match_ch(tok_next(inner), '{') && (tok_next(inner)->flags & TF_OPEN)) {
+				se_depth++;
+				// Push the '}' of this stmt-expr so we can decrement on exit
+				Token *brace_close = tok_match(tok_next(inner));
+				if (se_close_top < 64 && brace_close)
+					se_close_stack[se_close_top++] = brace_close;
+			}
+			inner_depth++;
+		}
+		if (inner->flags & TF_CLOSE) {
+			// Check if this close-brace exits a stmt-expr
+			if (se_close_top > 0 && inner == se_close_stack[se_close_top - 1]) {
+				se_close_top--;
+				se_depth--;
+			}
+			inner_depth--;
+			prev_inner = inner;
+			continue;
+		}
 		if (is_enum_kw(inner)) {
 			Token *brace = find_struct_body_brace(inner);
 			if (brace) {
@@ -6456,12 +6480,12 @@ static Token *p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func,
 		    match_ch(tok_next(inner), '{')) {
 			stmt_expr_open = inner;
 		}
-		if (inner_depth == 0 && cur_func >= 0 && prev_saved &&
+		if (se_depth == 0 && cur_func >= 0 && prev_saved &&
 		    (prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
 		    is_defer_kw(inner, prev_inner) &&
 		    tok_next(inner)->kind == TK_IDENT)
 			error_tok(inner, "defer cannot appear inside control statement parentheses");
-		if (inner_depth == 0 && prev_saved &&
+		if (se_depth == 0 && prev_saved &&
 		    (prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
 		    is_orelse_kw(inner) &&
 		    !(prev_inner && (prev_inner->tag & TT_MEMBER)))

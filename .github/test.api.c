@@ -3386,10 +3386,8 @@ static void test_volatile_orelse_no_double_eval(void) {
 	PrismResult r = prism_transpile_source(code, "volatile_orelse.c", feat);
 	CHECK_EQ(r.status, PRISM_OK, "volatile orelse: transpiles OK");
 	if (r.output) {
-		// Must use temp-based pattern (single write to LHS).
-		// Ternary on __prism_oe_ temp is fine (non-volatile local).
-		CHECK(strstr(r.output, "? __prism_oe_") != NULL ||
-		      strstr(r.output, "if (!") != NULL,
+		// Must use temp-based if/else pattern (single write to LHS).
+		CHECK(strstr(r.output, "if (__prism_oe_") != NULL,
 		      "volatile orelse: uses if-based fallback");
 		// The ternary pattern "? hw_register" would mean a double read
 		CHECK(strstr(r.output, "? hw_register") == NULL,

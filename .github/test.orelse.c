@@ -3815,19 +3815,16 @@ static void test_bare_orelse_volatile_double_write(void) {
 	PrismResult r = prism_transpile_source(code, "volatile_double_write.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK, "volatile-double-write: transpile succeeds");
 	if (r.output) {
-		// The output must NOT assign to *uart_tx more than once.
-		// Count occurrences of "*uart_tx =" (the double-write pattern).
-		// The buggy output is: if (!(*uart_tx = get_byte())) *uart_tx = (0xFF);
-		// which has TWO writes to the volatile pointer dereference.
-		int write_count = 0;
-		const char *p = r.output;
-		while ((p = strstr(p, "*uart_tx =")) != NULL) { write_count++; p += 10; }
-		// Also check the newline variant
-		p = r.output;
-		while ((p = strstr(p, "*uart_tx=")) != NULL) { write_count++; p += 9; }
-		CHECK(write_count <= 1,
+		// The output must use if/else to guarantee exactly one write
+		// to *uart_tx at runtime.  Both branches contain an assignment
+		// but only one executes.  The old buggy pattern was
+		// if (!(*uart_tx = get_byte())) *uart_tx = (0xFF);  which
+		// writes unconditionally then conditionally (two writes).
+		CHECK(strstr(r.output, "if (__prism_oe_") != NULL,
 		      "volatile-double-write: must not write to volatile LHS more than "
 		      "once (MMIO double-write is a hardware-killing pattern)");
+		CHECK(strstr(r.output, "} else {") != NULL,
+		      "volatile-double-write: uses if/else for single-write guarantee");
 	}
 	prism_free(&r);
 }
@@ -3850,14 +3847,12 @@ static void test_bare_orelse_volatile_compound_literal_nested(void) {
 	PrismResult r = prism_transpile_source(code, "volatile_compound_nested.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK, "compound-literal-nested: transpile succeeds");
 	if (r.output) {
-		int write_count = 0;
-		const char *p = r.output;
-		while ((p = strstr(p, "*uart_tx =")) != NULL) { write_count++; p += 10; }
-		p = r.output;
-		while ((p = strstr(p, "*uart_tx=")) != NULL) { write_count++; p += 9; }
-		CHECK(write_count <= 1,
+		// Must use if/else (one write per branch, only one branch runs).
+		CHECK(strstr(r.output, "if (__prism_oe_") != NULL,
 		      "compound-literal-nested: must not write to volatile LHS more than "
 		      "once (nested compound literal must not trigger ternary fallback)");
+		CHECK(strstr(r.output, "} else {") != NULL,
+		      "compound-literal-nested: uses if/else for single-write guarantee");
 	}
 	prism_free(&r);
 }
@@ -3961,13 +3956,15 @@ static void test_bare_orelse_compound_literal_lifetime(void) {
 	PrismResult r = prism_transpile_source(code, "bare_cl_lifetime.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK, "bare-orelse-cl-lifetime: transpiles OK");
 	if (r.output) {
-		// Must use ternary, not if-assignment
-		CHECK(strstr(r.output, "if (!__prism_oe_") == NULL,
-		      "bare-orelse-cl-lifetime: no if-assignment (lifetime-destroying pattern)");
-		CHECK(strstr(r.output, "? __prism_oe_") != NULL ||
-		      strstr(r.output, "?__prism_oe_") != NULL ||
-		      strstr(r.output, "? (") != NULL,
-		      "bare-orelse-cl-lifetime: uses ternary to preserve compound literal lifetime");
+		// Uses if/else for independent assignment conversions.
+		// Compound literal lifetime: the CL lives in the else block,
+		// which is sufficient — the assignment completes before the
+		// else block closes, and both ternary and if/else versions
+		// dangle equally after the wrapper block.
+		CHECK(strstr(r.output, "if (__prism_oe_") != NULL,
+		      "bare-orelse-cl-lifetime: uses if/else for independent assignment conversion");
+		CHECK(strstr(r.output, "} else {") != NULL,
+		      "bare-orelse-cl-lifetime: has else branch");
 	}
 	prism_free(&r);
 }
@@ -4738,12 +4735,12 @@ static void test_bare_orelse_chained_intermediate_truncation(void) {
 		PrismResult r = prism_transpile_source(code, "chain_single.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK, "chain-trunc-single: transpiles OK");
 		CHECK(r.output != NULL, "chain-trunc-single: output not NULL");
-		// Single orelse: one temp, ternary assignment (preserves CL
-		// lifetime and volatile single-write semantics)
+		// Single orelse: one temp, if/else (independent assignment
+		// conversions, volatile single-write semantics)
 		CHECK(strstr(r.output, "__prism_oe_0") != NULL,
 		      "chain-trunc-single: temp exists");
-		CHECK(strstr(r.output, "? __prism_oe_0") != NULL,
-		      "chain-trunc-single: ternary dispatch (single link)");
+		CHECK(strstr(r.output, "if (__prism_oe_0") != NULL,
+		      "chain-trunc-single: if/else dispatch (single link)");
 		prism_free(&r);
 	}
 
@@ -6831,6 +6828,80 @@ static void test_orelse_typeof_vm_double_eval(void) {
 }
 
 // BUG102: anonymous struct with __attribute__ body stripped on multi-decl split
+// BUG: ternary promotion hijack — bare orelse used a conditional operator
+// for the last link, subjecting both operands to the usual arithmetic
+// conversions (ISO C §6.5.15).  When the temp (int, value -1) and fallback
+// (unsigned int) met in a ternary, -1 was promoted to UINT_MAX before
+// assignment to a long long target.  Fix: use if/else for independent
+// simple-assignment conversions (ISO C §6.5.16.1).
+static void test_orelse_ternary_promotion_hijack(void) {
+	// 1. Transpilation output must use if/else, not ternary
+	{
+		const char *code =
+		    "long long *get_target(void);\n"
+		    "int get_value(void);\n"
+		    "void f(void) {\n"
+		    "    long long *target = get_target();\n"
+		    "    unsigned int fb = 1;\n"
+		    "    target[0] = get_value() orelse fb;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "tp_hijack.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "ternary-hijack: transpiles OK");
+		CHECK(r.output != NULL, "ternary-hijack: output not NULL");
+		if (r.output) {
+			// Must NOT contain ternary pattern for the bare orelse
+			CHECK(strstr(r.output, "? __prism_oe_") == NULL,
+			      "ternary-hijack: no ternary on bare orelse last link");
+			// Must contain if/else pattern
+			CHECK(strstr(r.output, "if (__prism_oe_") != NULL,
+			      "ternary-hijack: uses if/else for independent assignment");
+			CHECK(strstr(r.output, "} else {") != NULL,
+			      "ternary-hijack: has else branch");
+		}
+		prism_free(&r);
+	}
+	// 2. Simple LHS (no indirection) also uses if/else
+	{
+		const char *code =
+		    "int get_value(void);\n"
+		    "void f(void) {\n"
+		    "    long long x = 0;\n"
+		    "    unsigned int fb = 1;\n"
+		    "    x = get_value() orelse fb;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "tp_hijack2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "ternary-hijack-simple: transpiles OK");
+		CHECK(r.output != NULL, "ternary-hijack-simple: output not NULL");
+		if (r.output) {
+			CHECK(strstr(r.output, "? __prism_oe_") == NULL,
+			      "ternary-hijack-simple: no ternary");
+			CHECK(strstr(r.output, "if (__prism_oe_") != NULL,
+			      "ternary-hijack-simple: uses if/else");
+		}
+		prism_free(&r);
+	}
+	// 3. Chained bare orelse — last link is if/else
+	{
+		const char *code =
+		    "int a(void);\n"
+		    "int b(void);\n"
+		    "void f(void) {\n"
+		    "    long long *p = (long long *)0;\n"
+		    "    unsigned int fb = 99;\n"
+		    "    p[0] = a() orelse b() orelse fb;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "tp_hijack3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "ternary-hijack-chain: transpiles OK");
+		CHECK(r.output != NULL, "ternary-hijack-chain: output not NULL");
+		if (r.output) {
+			// Chained: intermediate links use if/else, last link also if/else
+			CHECK(strstr(r.output, "? __prism_oe_") == NULL,
+			      "ternary-hijack-chain: no ternary anywhere");
+		}
+		prism_free(&r);
+	}
+}
+
 static void test_orelse_sue_attr_body_strip(void) {
 	const char *code =
 	    "struct __attribute__((packed)) { int x; int y; } *get_anon(void);\n"
@@ -7242,4 +7313,7 @@ void run_orelse_tests(void) {
 
 	// BUG102: anonymous struct with __attribute__ body stripped on multi-decl split
 	test_orelse_sue_attr_body_strip();
+
+	// BUG: ternary promotion hijack — bare orelse with mismatched signedness
+	test_orelse_ternary_promotion_hijack();
 }

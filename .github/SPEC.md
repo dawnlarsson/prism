@@ -1,11 +1,13 @@
 # Prism Transpiler Specification
 
 **Version:** 1.0.5
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4398+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4439+ tests + self-host stage1==stage2).
 
-This document describes what the transpiler **does**, not what it aspires to do.
+This document describes what the transpiler **does**, not what it aspires to do. It is organized in two parts: **Part I** covers the transpiler's architecture, internal processing model, and implementation details. **Part II** provides a formal language specification for Prism's extensions to C, described in terms of the C abstract machine independently of any implementation strategy.
 
 ---
+
+# Part I: Transpiler Architecture & Internals
 
 ## 1. Overview
 
@@ -495,6 +497,8 @@ For `return`: emits all defers from the current scope to function scope. Uses `r
 
 `emit_deferred_range` handles defer bodies, including bare orelse and raw stripping within deferred code. `emit_deferred_bare_orelse` handles the case where a bare orelse expression appears inside a defer body.
 
+`emit_deferred_orelse` (called from `try_process_stmt_token` inside `walk_balanced`'s stmt-expr processing and `emit_deferred_range`) delegates action emission to `emit_orelse_action`, which routes blocks through `emit_orelse_block_body` (→ `handle_open_brace` → `emit_block_body` → `handle_close_brace`, the full transpilation engine) and control-flow keywords through `emit_return_body` / `emit_break_continue_defer` / `emit_goto_defer`. This ensures that return/goto/break/continue inside orelse actions that appear in nested contexts (e.g., orelse-with-return inside another orelse block body) correctly unwind all applicable defers, and that defer keywords inside orelse action blocks are fully processed rather than leaked to the backend compiler.
+
 ### Defer-variable shadow checking
 
 `check_defer_var_shadow` detects when a newly-declared variable name appears in an active defer body — this would silently capture the wrong variable at cleanup time. Uses `FuncMeta.defer_name_set` (an exact hash set of all identifier names in defer bodies) for an O(1) fast-reject before the O(N×M) body walk — eliminates the walk in the common case when no name matches. The body walk is implemented in the shared helper `defer_body_refs_name(body, body_end, name, nlen)`, which returns true if the name is referenced (not locally declared) in the token range. This helper is used by both `check_defer_var_shadow` (Pass 2 enclosing-scope + same-block checking) and `p1_check_defer_same_block_shadow` (Phase 1D same-scope checking), eliminating ~70 lines of duplicated token-walk logic. The body walk tracks brace depth: identifiers inside nested `{ }` blocks within the defer body (depth > 1) are skipped, since they are local declarations that cannot conflict with outer-scope variables. This avoids false positives for patterns like `defer { { int tmp = 1; } }` where the inner `tmp` is purely internal to the defer body. GNU statement expressions `({...})` are tracked via `se_depth`/`se_brace[]`: when `({` is encountered, the scanner records the current brace depth and increments `se_depth`; declarations inside the statement expression are recognized as local (the `paren_depth == se_depth` check replaces the strict `paren_depth == 0` requirement), preventing false positives from hygienic macros like `SAFE_MAX(a, b)` that declare temporaries inside `({...})`. The scanner also tracks C99 for-init declarations (`for(TYPE name = ...)`) via `for_init_pd`/`for_name_hid`/`for_body_bd`: when a for-init variable matches the target name, all references to that name within the for scope (condition, increment, and body) are treated as local rather than captured, preventing false positives.
@@ -504,6 +508,8 @@ The scan covers two ranges: enclosing-scope defers `[0, blk->defer_start_idx)` a
 `check_enum_typedef_defer_shadow` extends this protection to enum constants and typedef names. Called from the main Pass 2 loop at statement-start for enum definitions (`enum { name = val, ... }`) and typedef declarations (`typedef type name`), which bypass `process_declarators` and would otherwise evade shadow detection. Each introduced name is checked against active defer bodies via `check_defer_var_shadow`.
 
 **Ghost enum in mid-expression contexts:** Enum definitions inside `sizeof(…)`, casts `(enum { … })expr`, and `typeof(…)` bypass the statement-start `check_enum_typedef_defer_shadow` call. Phase 1D catches these via `p1d_scan_balanced_group`, which scans inside balanced `(…)` and `[…]` groups for enum definitions with `{` bodies, calling `p1_check_enum_body_defer_shadow` on each. This covers `sizeof(enum { val = 0 })`, `(enum { val = 0 })0`, and `typeof(enum { val = 0 })` patterns where an enum constant could shadow a name captured by an active defer body.
+
+**Control-flow paren keyword detection:** `p1d_scan_balanced_group` also detects `defer` and `orelse` keywords inside control-flow condition parentheses (`if(…)`, `while(…)`, `for(…)`, `switch(…)`). When the preceding saved token has `TT_IF | TT_LOOP | TT_SWITCH`, any `defer` or `orelse` at statement-expression depth zero (`se_depth == 0`) is rejected with a hard error. The `se_depth` tracker (not raw `inner_depth`) is used so that keywords inside GNU statement expressions within the condition (e.g., `if (({ int x = f() orelse 0; x; }))`) are correctly allowed — the stmt-expr provides its own block scope. `se_depth` is maintained via a 64-entry `se_close_stack`: on `({` entry, the matching `}` is pushed and `se_depth` increments; on reaching that `}`, the stack pops and `se_depth` decrements.
 
 ---
 
@@ -560,7 +566,7 @@ The scan covers two ranges: enclosing-scope defers `[0, blk->defer_start_idx)` a
 
 **Paren-wrapped decl-init orelse:** `int x = (f() orelse 0);` — similar macro-hygiene pattern for declaration initializers. `scan_decl_orelse` strips the outer parentheses **only** when they are the first token of the initializer (i.e., the `(` immediately follows `=`). When the parens appear mid-expression (e.g., `int x = 1 + (f() orelse 5)`), the orelse is inside a sub-expression where paren-stripping would corrupt the AST. Phase 1D enforces this via `init_is_first`: the paren-spanning-to-end check (`P1_OE_DECL_INIT` tagging) only fires on the first paren encountered during the initializer walk.
 
-**Volatile safety:** All forms that include an assignment in the condition use the C assignment-expression value — `(LHS = expr)` yields `expr`'s value without re-reading `LHS`. This makes bare orelse safe for volatile pointer-dereference targets such as MMIO registers: `*uart_tx = get_byte() orelse 0xFF` emits `{ if (!(*uart_tx = get_byte())) *uart_tx = (0xFF); }` with no hidden re-read of the register. Compound-literal fallbacks use a `(LHS = RHS) ? (void)0 : (void)(LHS = (fb))` ternary which evaluates the LHS address expression twice — Phase 1D (primary) and Pass 2 (defense-in-depth) reject pointer dereference (`*`), member access (`->`, `.`), and array subscript (`[]`) in the LHS when the fallback contains a compound literal, since the ternary path would produce double memory access (double bus transactions for volatile MMIO registers). For non-compound-literal bare-assignment orelse with value fallback, `emit_bare_orelse_impl` hoists the RHS into a temp variable using `typeof(LHS) temp = (RHS)`. The temp is typed using `typeof(LHS)` — not `typeof(RHS)` — to avoid double evaluation when the RHS expression yields a variably-modified (VM) type (C23 §6.7.2.5p3: `typeof(EXPR)` evaluates its operand when the expression type is VM). The LHS is guaranteed side-effect-free by `reject_orelse_side_effects`, so `typeof(LHS)` is always safe. Single-link orelse uses a ternary `LHS = temp ? temp : (fb)` which writes LHS exactly once and preserves compound literal lifetime. Chained orelse uses nested if/else blocks with per-link `typeof(LHS)` temps: `{ typeof(LHS) t0=(a); if(t0){LHS=t0;}else{ typeof(LHS) t1=(b); LHS = t1 ? t1 : (c); } }`.
+**Volatile safety:** All forms that include an assignment in the condition use the C assignment-expression value — `(LHS = expr)` yields `expr`'s value without re-reading `LHS`. This makes bare orelse safe for volatile pointer-dereference targets such as MMIO registers: `*uart_tx = get_byte() orelse 0xFF` emits `{ if (!(*uart_tx = get_byte())) *uart_tx = (0xFF); }` with no hidden re-read of the register. Compound-literal fallbacks use a `(LHS = RHS) ? (void)0 : (void)(LHS = (fb))` ternary which evaluates the LHS address expression twice — Phase 1D (primary) and Pass 2 (defense-in-depth) reject pointer dereference (`*`), member access (`->`, `.`), and array subscript (`[]`) in the LHS when the fallback contains a compound literal, since the ternary path would produce double memory access (double bus transactions for volatile MMIO registers). For non-compound-literal bare-assignment orelse with value fallback, `emit_bare_orelse_impl` hoists the RHS into a temp variable using `typeof(LHS) temp = (RHS)`. The temp is typed using `typeof(LHS)` — not `typeof(RHS)` — to avoid double evaluation when the RHS expression yields a variably-modified (VM) type (C23 §6.7.2.5p3: `typeof(EXPR)` evaluates its operand when the expression type is VM). The LHS is guaranteed side-effect-free by `reject_orelse_side_effects`, so `typeof(LHS)` is always safe. Both single-link and chained orelse use if/else blocks with per-link `typeof(LHS)` temps: `{ typeof(LHS) t0=(a); if(t0){ LHS=t0; }else{ LHS=(fb); } }`. This ensures each assignment to LHS undergoes independent simple-assignment conversions (ISO C §6.5.16.1), avoiding the usual arithmetic conversions that a conditional operator (§6.5.15) would force between the temp and fallback operands. Chained example: `{ typeof(LHS) t0=(a); if(t0){LHS=t0;}else{ typeof(LHS) t1=(b); if(t1){ LHS=t1; }else{ LHS=(c); } } }`.
 
 **Side-effect protection:** Bracket orelse in VLA/typeof contexts rejects expressions with side effects (`++`, `--`, `=`, volatile reads via `*`/`->`/`.`/`[]`, function calls) to prevent double evaluation. Function-call detection recognizes both `ident(` and `)(`  (parenthesized call) patterns. **Chained bracket orelse** (e.g. `int arr[0 orelse get_size() orelse 10]`) is subject to an additional chain-aware side-effect check: Phase 1G scans depth-0 orelses and calls `reject_orelse_side_effects` on the range between consecutive depth-0 orelses (the intermediate LHS that would be duplicated in the ternary); Pass 2's `emit_token_range_orelse` retains the same check as defense-in-depth for chains at nested depths and inside `typeof` contexts.
 
@@ -879,3 +885,278 @@ These are inherently runtime and cannot move to Pass 1:
 2. **Indirect call taint bypass (cross-TU):** The `setjmp`/`longjmp`/`vfork` taint detection is token-name-based: any appearance of a tainted identifier (even as a bare reference like `= longjmp` or `fp = vfork`) taints the enclosing function, and taint propagates transitively to callers. However, a function pointer to `longjmp` passed from another translation unit (e.g., via a `void (*)(jmp_buf, int)` parameter) is undetectable by single-TU static analysis. A function that merely returns or stores `vfork` as a value will also taint its callers even if the pointer is never invoked — this is an accepted false positive that closes intra-TU aliasing attacks. This is an inherent limitation shared with all C static analyzers that operate on individual translation units.
 
 3. **Bitfield zero-initialization:** Bitfield member declarations (`int x : 4;`) inside struct/union bodies are not individually zero-initialized — `try_zero_init_decl` correctly skips when `in_struct_body()` is true (bitfield syntax `int x : 4 = 0;` is invalid C). Bitfields are zeroed implicitly when the parent struct variable receives `= {0}`. This is working as designed.
+
+---
+
+# Part II: Formal Language Specification
+
+This part defines the syntax, constraints, and semantics of Prism's language extensions to C. All descriptions are framed in terms of the C abstract machine as defined by ISO/IEC 9899. No reference is made to implementation strategies, internal data structures, or transpilation passes.
+
+Unless otherwise stated, all standard C terms (*block scope*, *scalar type*, *lvalue*, *side effect*, *object*, *storage duration*) carry their ISO C definitions.
+
+A *conforming Prism program* is a strictly conforming C program extended with the constructs specified herein. A diagnostic is required for every constraint violation listed below. A conforming implementation may provide mechanisms to independently enable or disable each extension; when an extension is disabled, its keyword reverts to an ordinary identifier.
+
+---
+
+## The `defer` Statement
+
+### Syntax
+
+```
+defer-statement:
+    defer statement
+    defer compound-statement
+```
+
+The token `defer` is a keyword. A *defer-statement* is a block-scoped statement that registers its operand for deferred execution.
+
+### Constraints
+
+1. A *defer-statement* shall appear only at block scope within the body of a function definition.
+
+2. The defer body establishes an independent control-flow context. The following constraints apply to statements within the defer body:
+   - `return` — prohibited unconditionally. A defer body shall not return from the enclosing function.
+   - `goto` — prohibited unconditionally.
+   - `break` — permitted only when targeting a `switch`, `for`, `while`, or `do` statement that is itself within the defer body.
+   - `continue` — permitted only when targeting a `for`, `while`, or `do` statement that is itself within the defer body.
+
+3. Nested `defer` (a *defer-statement* within a defer body) is a constraint violation.
+
+4. User-defined labels within a defer body are a constraint violation. The defer body may be duplicated at multiple scope exit points; labels would produce duplicates.
+
+5. A *defer-statement* shall not appear in a function whose body contains any identifier from the following categories, whether invoked, referenced, or assigned to a pointer:
+
+   **Non-local jump:** `setjmp`, `_setjmp`, `__setjmp`, `sigsetjmp`, `__sigsetjmp`, `savectx`, `__builtin_setjmp`, `__builtin_setjmp_receive`
+
+   **Non-local jump restoration:** `longjmp`, `_longjmp`, `__longjmp`, `siglongjmp`, `__siglongjmp`, `__longjmp_chk`, `__builtin_longjmp`
+
+   **Process creation:** `vfork`
+
+   **Thread termination:** `pthread_exit`
+
+6. A *defer-statement* shall not appear in a function that uses computed goto (`goto *`*expression*) or `asm goto` (extended inline assembly with goto labels).
+
+7. A *defer-statement* shall not appear at the direct top level of a GNU statement expression `({ ... })`. It must be wrapped in an inner block.
+
+8. A compound statement containing a *defer-statement* shall not be the final statement of a GNU statement expression. The deferred actions would overwrite the expression's result value.
+
+9. A variable declaration that introduces a name referenced by an active defer body in the same block scope is a constraint violation (same-block shadow rule).
+
+### Semantics
+
+1. Execution of a *defer-statement* registers the defer body for later execution. The defer body is **not** executed at the point of the defer-statement.
+
+2. When control leaves a block scope, all defer bodies registered in that scope execute in reverse order of registration (last-in, first-out). Control may leave a scope through:
+   - Normal flow reaching the closing `}`.
+   - A `return` statement.
+   - A `break` statement leaving a loop or switch.
+   - A `continue` statement advancing to the next loop iteration.
+   - A `goto` statement transferring control to a label outside the scope.
+
+3. For nested scopes, defer bodies are unwound from innermost to outermost. A `return` at depth *N* causes defers at depths *N*, *N*−1, …, 1 to fire, LIFO within each scope, proceeding outward.
+
+4. A `goto` crossing scope boundaries causes defers in all exited scopes to fire, LIFO within each scope, from innermost to the target scope (exclusive).
+
+5. Defers inside a GNU statement expression `({ ... })` fire at the statement expression's scope boundary, not at the enclosing function scope.
+
+6. The return value of a `return` statement is fully evaluated before any defers execute. The sequence is: evaluate return expression → save result → execute defers (LIFO, innermost to outermost) → transfer result to caller.
+
+7. Between consecutive `case` or `default` labels in a `switch` body, defers are unwound consistently with C's fallthrough semantics.
+
+---
+
+## The `orelse` Operator
+
+### Syntax
+
+```
+orelse-expression:
+    assignment-expression orelse fallback-action
+
+fallback-action:
+    expression
+    compound-statement
+    return expression_opt ;
+    break ;
+    continue ;
+    goto identifier ;
+
+bracket-orelse:
+    expression orelse expression      (within array dimension [ ])
+```
+
+The token `orelse` is a keyword. It introduces a conditional fallback that executes when the left operand evaluates to a *falsy* value (one for which `!value` is true under C's unary `!` operator).
+
+### Forms
+
+| Form | Syntax | Description |
+|---|---|---|
+| Assignment with value | `LHS = expr orelse fallback;` | Assign `expr` to `LHS`; if falsy, reassign `fallback` |
+| Assignment with action | `LHS = expr orelse action;` | Assign `expr` to `LHS`; if falsy, execute control-flow action |
+| Assignment with block | `LHS = expr orelse { ... }` | Assign `expr` to `LHS`; if falsy, execute block |
+| Bare expression | `expr orelse action;` | Evaluate `expr`; if falsy, execute action |
+| Declaration initializer | `type name = expr orelse fallback;` | Declare and initialize; fallback if falsy |
+| Bracket (array dim) | `type arr[dim orelse fallback]` | Use `dim` as array size; if falsy, use `fallback` |
+
+### Constraints
+
+1. The left operand of `orelse` shall have scalar type (integer, floating-point, or pointer). Struct and union *values* are not permitted. Pointers to struct or union types are permitted.
+
+2. An `orelse` shall not appear at file scope (outside any function body).
+
+3. An `orelse` shall not appear in the initializer of a variable with `static`, `extern`, `_Thread_local`, or `thread_local` storage duration. The orelse transformation produces runtime code; re-executing it on each function entry would violate C's static persistence guarantees (ISO C11 §6.7.9¶4).
+
+4. An `orelse` shall not appear inside an `enum` body. Enum values require integer constant expressions.
+
+5. A *bracket-orelse* shall not use a control-flow action (`return`, `goto`, `break`, `continue`) or compound statement as its right operand.
+
+6. A *bracket-orelse* at file scope is a constraint violation — no statement context exists for the required temporary variable.
+
+7. In contexts where the array dimension expression may be evaluated more than once (VLA sizes, `typeof` operands), neither operand of a *bracket-orelse* shall contain side effects. Prohibited side effects include:
+   - Increment/decrement operators (`++`, `--`)
+   - Assignment operators (`=`, `+=`, `-=`, `*=`, `/=`, `%=`, `<<=`, `>>=`, `&=`, `^=`, `|=`)
+   - Function calls (direct or through function pointers)
+   - Volatile reads through indirection (`*`, `->`, `.`, `[]`)
+   - Inline assembly (`asm`)
+   - Comma operator at the top level of the operand
+
+8. A bare `orelse` (no assignment target) with a value fallback requires a modifiable lvalue on the left side of `=`. A cast-expression target (e.g., `(int)x = expr orelse fallback`) is a constraint violation.
+
+9. When the fallback is a compound literal and the assignment target involves indirection (`*`, `->`, `.`, `[]`), the `orelse` is a constraint violation. The compound-literal code path evaluates the target address expression twice, producing undefined behavior for volatile objects.
+
+10. An `orelse` in a function prototype's parameter array dimension (e.g., `void f(int arr[n orelse 1])`) is a constraint violation. Prototype parameter arrays decay to pointers; the dimension is never evaluated at runtime.
+
+11. An `orelse` shall not appear inside a `struct` or `union` member declaration (including within a `typeof` context in that declaration).
+
+12. Any `orelse` token that does not match one of the recognized forms listed above is a constraint violation.
+
+### Semantics
+
+1. **Assignment with value:** `LHS = expr orelse fallback;` — The expression `expr` is evaluated and assigned to `LHS`. If `!(LHS)` is true after the assignment, `LHS` is assigned the value of `fallback`. If `!(LHS)` is false, `fallback` is not evaluated. The initial assignment `LHS = expr` occurs exactly once.
+
+2. **Assignment with action:** `LHS = expr orelse action;` — The expression `expr` is evaluated and assigned to `LHS`. If `!(LHS)` is true, all applicable defers in scopes being exited by `action` fire (LIFO), then `action` executes. If `!(LHS)` is false, execution continues normally.
+
+3. **Block form:** `LHS = expr orelse { ... }` — As assignment-with-action, but the compound statement body executes. Defer, orelse, and zero-initialization within the block are processed normally.
+
+4. **Bare expression:** `expr orelse action;` — The expression `expr` is evaluated. If `!(expr)` is true, `action` executes with applicable defer cleanup. Otherwise, execution continues.
+
+5. **Declaration initializer:** `type name = expr orelse fallback;` — The variable `name` is declared. `expr` is evaluated and assigned to `name`. If `!(name)` is true, `name` is reassigned `fallback` (or the control-flow action executes).
+
+6. **Bracket form:** `type arr[dim orelse fallback]` — The expression `dim` is evaluated. If `!(dim)` is true, `fallback` is used as the array dimension. Semantically equivalent to `dim ? dim : fallback`, subject to the side-effect constraints above.
+
+7. **Chained orelse:** `expr orelse a orelse b` — Evaluated left to right. If `expr` is falsy, `a` is evaluated. If `a` is also falsy, `b` is used. Each intermediate value is tested independently.
+
+8. **Volatile safety:** In assignment forms, the truthiness test uses the value produced by the C assignment expression `(LHS = expr)`, not a re-read of `LHS`. For volatile-qualified lvalues, this guarantees exactly one write when the result is truthy, and no hidden reads.
+
+9. **Paren-wrapped forms:** `int x = (f() orelse 0);` and `int arr[(dim orelse 1)]` — Parentheses spanning the entire initializer or entire bracket content are recognized as macro-hygiene wrappers and are permitted.
+
+### Result Type
+
+The *orelse-expression* is not a single C operator; it is a source-level directive that expands to standard C statements. Consequently, its "result type" is defined indirectly by the generated code:
+
+1. **Value-fallback forms** (assignment and declaration-initializer): The left operand is assigned to the target lvalue via a standard C assignment expression. The right operand (fallback) is assigned to the same lvalue via a separate assignment if the condition fails. Both assignments undergo the usual implicit conversions for simple assignment (ISO C §6.5.16.1). The type of each assignment is the type of the lvalue after lvalue conversion. No additional conversions between the left and right operands are performed — they are independently converted to the target type.
+
+2. **Bracket form:** The expansion uses a conditional expression `dim ? dim : fallback`. The result type is determined by the usual arithmetic conversions applied to the second and third operands of the conditional (ISO C §6.5.15¶5).
+
+3. **Control-flow forms** (`return`, `break`, `continue`, `goto`, compound statement): The right operand is a statement, not a value. The orelse construct does not yield a value; the expansion is purely control flow. No type conversion applies.
+
+---
+
+## Automatic Zero-Initialization
+
+### Constraints
+
+1. Automatic zero-initialization applies to objects with automatic storage duration (block-scope, no `static`, `extern`, `_Thread_local`, or `thread_local` qualifier) that lack an explicit initializer and are not marked with the `raw` keyword.
+
+2. Objects with `static`, `extern`, or thread storage duration are excluded. The C standard already guarantees zero-initialization for these.
+
+3. Declarations inside `struct`, `union`, or `enum` definitions are excluded.
+
+4. A `register`-qualified variable-length array (VLA) without an explicit initializer and without `raw` is a constraint violation. `register` prohibits address-taking (ISO C11 §6.7.1¶6), making `memset` impossible, and VLAs cannot use `= {0}` syntax.
+
+5. A `const`-qualified VLA declaration requiring runtime zero-initialization is a constraint violation. Modifying a `const`-defined object is undefined behavior (ISO C11 §6.7.3¶6).
+
+6. A `register`-qualified `_Atomic` aggregate without an explicit initializer is a constraint violation.
+
+7. A function using computed goto (`goto *`*expression*) or `asm goto` that contains zero-initialized declarations is a constraint violation. The jump target cannot be verified at compile time; initialization could be bypassed.
+
+### Semantics
+
+1. **Scalar types** (integers, floating-point, pointers, `_Bool`, `_Complex`, `_BitInt`) receive `= 0`.
+
+2. **Aggregate types** (structs, unions, fixed-size arrays) receive `= {0}`. Per ISO C §6.7.9¶21, if there are fewer initializers in a brace-enclosed list than there are elements or members of an aggregate, the remainder of the aggregate is initialized implicitly the same as objects that have static storage duration — that is, to zero for arithmetic types and null for pointers. Padding bytes between members are not required to be zeroed by the standard (though major implementations produce `memset`/`bzero` for `= {0}` in practice).
+
+3. **Variable-length arrays** receive `memset(arr, 0, sizeof(arr))` immediately after the declaration.
+
+4. **Typedef-hidden VLAs** — objects whose type resolves through typedefs to a VLA type — receive `memset` treatment.
+
+5. **Function types** — a variable declared via `typeof(func_name)` where the operand names a function (not a function pointer) is excluded from zero-initialization.
+
+6. Initialization is applied at the point of declaration, preserving C's sequential left-to-right evaluation order for multi-declarator statements.
+
+---
+
+## The `raw` Keyword
+
+### Syntax
+
+`raw` is an *initialization-suppression specifier*. It extends the C grammar at two levels:
+
+**As a declaration specifier** (ISO C §6.7 *declaration-specifiers*), `raw` may appear alongside storage-class specifiers, type qualifiers, and type specifiers. When used in this position, it applies to all declarators in the declaration:
+
+```
+declaration-specifiers:
+    raw declaration-specifiers_opt          (extension)
+    storage-class-specifier declaration-specifiers_opt
+    type-specifier declaration-specifiers_opt
+    type-qualifier declaration-specifiers_opt
+    ...
+```
+
+`raw` shall precede the first type specifier. `int raw x;` is ill-formed.
+
+**As an init-declarator modifier** (ISO C §6.7 *init-declarator-list*), `raw` may appear immediately before a declarator in a comma-separated init-declarator list. When used in this position, it applies only to the immediately following declarator:
+
+```
+init-declarator:
+    raw_opt declarator                      (extension)
+    raw_opt declarator = initializer        (extension)
+```
+
+This allows mixed declarations: `int a, raw b;` — `a` receives automatic zero-initialization, `b` does not.
+
+### Constraints
+
+1. `raw` shall appear either before the declaration specifiers of a declaration, or immediately before a declarator in an init-declarator list (optionally preceded by attributes). It shall not appear inside a type specifier, abstract declarator, or expression.
+
+2. `raw` does not affect VLA lifetime or scope. A `raw`-marked VLA is still subject to `goto`-over-VLA safety checks (see §Undefined Behavior, item 3).
+
+3. `raw` is not a type qualifier and does not participate in type composition. It does not affect the type of the declared object.
+
+### Semantics
+
+1. A `raw`-marked declaration is not automatically zero-initialized. The `raw` token is consumed and does not appear in the generated C output.
+
+2. As a declaration specifier (`raw int a, b;`), `raw` applies to all declarators in the init-declarator list.
+
+3. As an init-declarator modifier (`int a, raw b;`), `raw` applies only to the immediately following declarator.
+
+4. Consecutive `raw` tokens (e.g., from macro expansion: `raw raw int x;`) are silently absorbed.
+
+5. At file scope and inside struct/union bodies, `raw` is silently stripped — no zero-initialization applies in these contexts.
+
+---
+
+## Undefined Behavior
+
+The following actions result in undefined behavior. A conforming implementation is not required to diagnose these conditions.
+
+1. **Jump over `raw` VLA:** If a `goto` statement or `switch` case transfer crosses the declaration of a `raw`-marked object with variably modified type, the behavior is undefined. The `raw` keyword suppresses zero-initialization but does not suppress the VLA's stack allocation; the backend compiler may generate an allocation instruction at the point of declaration, and jumping past it produces an object with indeterminate size or an invalid stack frame. (Prism diagnoses this as a constraint violation when possible; however, computed goto targets are unresolvable at compile time, making exhaustive detection infeasible.)
+
+2. **Return expression modifying deferred state:** If the expression of a `return` statement modifies an object that is subsequently read by an active `defer` body in the same function, the value read by the defer body is the value *after* the modification. The return expression is fully evaluated and its result captured before any defers execute (see *defer* Semantics §6). However, if the return expression and a defer body both modify the same object through a volatile-qualified lvalue, the number and ordering of volatile accesses is unspecified — the implementation may introduce a temporary variable for the return value, altering the total volatile access count.
+
+3. **`longjmp` past defers:** If `longjmp` (or any non-local jump mechanism) transfers control out of a scope that has active `defer` registrations, the defers do not execute. Prism prohibits `defer` in functions containing `setjmp`/`longjmp` identifiers (see *defer* Constraint §5), but indirect calls through function pointers obtained from other translation units are undetectable by single-TU analysis.
+
+4. **VLA size expressions evaluated twice:** For `const`-qualified or variably-modified type specifiers involving `typeof(expr)` — where `expr` contains VLA dimensions — multi-declarator statement splits or const-orelse expansions may cause the VLA size expression to be evaluated more than once. If the size expression has side effects, the behavior is undefined. (Prism diagnoses known cases as constraint violations, but expressions with undetectable side effects — e.g., a function call through an opaque pointer — may escape static analysis.)
+
+5. **Padding bytes in zero-initialized aggregates:** Automatic zero-initialization of aggregate types uses `= {0}`, which the C standard specifies initializes all members and sub-objects to zero but does not mandate that padding bytes between members are zeroed (ISO C §6.7.9¶21). Code that relies on padding bytes being zero (e.g., byte-level comparison, raw-byte serialization, copying across trust boundaries) has implementation-defined behavior. For guaranteed all-bytes-zero, the programmer should use `raw` and explicit `memset`.
