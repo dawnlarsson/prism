@@ -6839,6 +6839,61 @@ static void test_generic_member_injection_chain_no_multiply(void) {
 	}
 }
 
+// Regression: ring buffer overflow with long prefix chains.
+// With EMIT_SAVE_RING_SIZE=128, prefix chains >128 tokens caused
+// try_generic_member_rewrite to fail, emitting ._Generic() verbatim.
+static void test_generic_member_long_prefix_chain(void) {
+	printf("\n--- _Generic member rewrite: long prefix chain ---\n");
+
+	// Build a chain like: f(1,2,3,...,79).g(1,2,3,...,79)._Generic(...)
+	// Each call has ~80 tokens (name + ( + 79 args + 78 commas + )),
+	// so the prefix exceeds 128 tokens easily.
+	size_t cap = 32000;
+	char *code = malloc(cap);
+	CHECK(code != NULL, "long-chain: malloc"); if (!code) return;
+
+	int pos = 0;
+	pos += snprintf(code + pos, cap - pos,
+		"struct Inner { int (*act)(int); };\n"
+		"struct Mid { struct Inner (*g)(int,int,int,int,int,int,int,int,int,int,"
+		"int,int,int,int,int,int,int,int,int,int,"
+		"int,int,int,int,int,int,int,int,int,int,"
+		"int,int,int,int,int,int,int,int,int,int); };\n"
+		"struct Outer { struct Mid (*f)(int,int,int,int,int,int,int,int,int,int,"
+		"int,int,int,int,int,int,int,int,int,int,"
+		"int,int,int,int,int,int,int,int,int,int,"
+		"int,int,int,int,int,int,int,int,int,int); };\n"
+		"void test(struct Outer ctx) {\n"
+		"    ctx.f(");
+
+	// 40 args for f()
+	for (int i = 1; i <= 40; i++) {
+		if (i > 1) pos += snprintf(code + pos, cap - pos, ",");
+		pos += snprintf(code + pos, cap - pos, "%d", i);
+	}
+	pos += snprintf(code + pos, cap - pos, ").g(");
+
+	// 40 args for g()
+	for (int i = 1; i <= 40; i++) {
+		if (i > 1) pos += snprintf(code + pos, cap - pos, ",");
+		pos += snprintf(code + pos, cap - pos, "%d", i);
+	}
+	pos += snprintf(code + pos, cap - pos,
+		")._Generic(1, int: act(99), float: act(99));\n"
+		"}\n");
+
+	PrismResult r = prism_transpile_source(code, "glong.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "long-chain: transpile succeeds");
+	if (r.output) {
+		CHECK(strstr(r.output, "._Generic") == NULL,
+		      "long-chain: no verbatim ._Generic in output");
+		CHECK(strstr(r.output, "act(99)") != NULL,
+		      "long-chain: act(99) call preserved after rewrite");
+	}
+	prism_free(&r);
+	free(code);
+}
+
 static void test_cond_stack_deep_nesting_silent_drop(void) {
 	/* BUG: collect_source_defines uses a fixed cond_stack[32].  A #define at
 	 * #ifdef depth > 32 is silently skipped — the ABI-altering macro is lost
@@ -7796,6 +7851,72 @@ static void test_deep_nested_paren_stmtexpr_perf(void) {
 	prism_free(&r);
 }
 
+static void test_generic_paren_wrapped_target(void) {
+	printf("\n--- _Generic parenthesized target prefix injection ---\n");
+
+	/* obj._Generic(sel, int: (handler))(data)
+	 * The (handler) target is paren-wrapped. The prefix obj. must be
+	 * injected inside: _Generic(sel, int: (obj.handler))(data) */
+	{
+		const char *code =
+		    "typedef struct { int (*handle_int)(int); } Api;\n"
+		    "Api get_api_handler(void);\n"
+		    "int selector;\n"
+		    "int data;\n"
+		    "void dispatch_event(void) {\n"
+		    "    get_api_handler()._Generic(selector,\n"
+		    "        int: (handle_int)\n"
+		    "    )(data);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gparen1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "paren-target: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "get_api_handler().handle_int") != NULL,
+			      "paren-target: prefix injected inside parens");
+			CHECK(strstr(r.output, "get_api_handler()._Generic") == NULL,
+			      "paren-target: obj._Generic removed");
+		}
+		prism_free(&r);
+	}
+
+	/* Paren-wrapped call target: (get_func)(args) */
+	{
+		const char *code =
+		    "typedef struct { int (*(*get_func)(void))(int); } S;\n"
+		    "S obj;\n"
+		    "int sel;\n"
+		    "void f(void) {\n"
+		    "    obj._Generic(sel,\n"
+		    "        int: (get_func)(42)\n"
+		    "    );\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gparen2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "paren-call-target: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "obj.get_func") != NULL,
+			      "paren-call-target: prefix injected");
+			CHECK(strstr(r.output, "obj._Generic") == NULL,
+			      "paren-call-target: obj._Generic removed");
+		}
+		prism_free(&r);
+	}
+
+	/* Non-paren target still works (regression) */
+	{
+		const char *code =
+		    "struct D { int (*handle)(int); };\n"
+		    "struct D obj;\n"
+		    "int r = obj._Generic((int)0, int: handle(42));\n";
+		PrismResult r = prism_transpile_source(code, "gparen3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "non-paren-target: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "obj.handle(42)") != NULL,
+			      "non-paren-target: obj.handle(42) preserved");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_api_tests_4(void) {
 	printf("\n=== API TESTS (group 4) ===\n");
 	test_collect_source_defines_long_line_truncation();
@@ -7836,6 +7957,7 @@ void run_api_tests_4(void) {
 	test_generic_member_injection_trailing_expr();
 	test_generic_member_injection_flush_boundary();
 	test_generic_member_injection_chain_no_multiply();
+	test_generic_member_long_prefix_chain();
 	test_collect_source_defines_conditional_guard_preserved();
 	test_cond_stack_deep_nesting_silent_drop();
 	test_defer_shadow_limit_dynamic();
@@ -7859,4 +7981,5 @@ void run_api_tests_4(void) {
 	GNUC_ONLY(test_typeof_local_shadows_func());
 	GNUC_ONLY(test_param_shadow_func_proto());
 	test_deep_nested_paren_stmtexpr_perf();
+	test_generic_paren_wrapped_target();
 }

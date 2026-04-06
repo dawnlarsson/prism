@@ -1494,6 +1494,58 @@ static void test_raw_cast_expression_leak(void) {
 	}
 }
 
+// BUG_RAW_ATTR_COMMA: raw keyword preceded by GNU/C23 attributes in
+// per-declarator position leaked verbatim because process_declarators
+// checked tok->flags & TF_RAW without probing past noise first.
+static void test_raw_attr_per_declarator_leak(void) {
+	printf("\n--- raw attr per-declarator leak ---\n");
+
+	// Case 1: GNU __attribute__ before per-declarator raw
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    int x = 1, __attribute__((unused)) raw y;\n"
+		    "}\n",
+		    "rw_attr1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-attr1: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, " raw ") == NULL,
+			      "raw-attr1: raw must not leak after __attribute__");
+			CHECK(strstr(r.output, "y = 0") == NULL && strstr(r.output, "y = {0}") == NULL,
+			      "raw-attr1: raw suppresses zero-init on y");
+		}
+		prism_free(&r);
+	}
+	// Case 2: C23 [[maybe_unused]] before per-declarator raw
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    int x = 0, [[maybe_unused]] raw y;\n"
+		    "}\n",
+		    "rw_attr2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-attr2: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, " raw ") == NULL,
+			      "raw-attr2: raw must not leak after [[attr]]");
+		}
+		prism_free(&r);
+	}
+	// Case 3: no attribute (baseline) still works
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    int x = 0, raw y;\n"
+		    "}\n",
+		    "rw_attr3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-attr3: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, " raw ") == NULL,
+			      "raw-attr3: raw stripped without attr");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_raw_tests(void) {
 	printf("\n=== RAW KEYWORD TESTS ===\n");
 
@@ -1614,4 +1666,7 @@ void run_raw_tests(void) {
 
 	// raw keyword leaking in cast / sizeof / compound literal expressions
 	test_raw_cast_expression_leak();
+
+	// raw preceded by attrs in per-declarator position
+	test_raw_attr_per_declarator_leak();
 }

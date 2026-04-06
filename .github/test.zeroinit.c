@@ -1443,7 +1443,7 @@ void test_sizeof_inline_enum_not_vla(void) {
 void test_typeof_register_vla_bug(void) {
 #ifdef __GNUC__
 	int n = 10;
-	register typeof(int[n]) val;
+	raw register typeof(int[n]) val;
 	(void)sizeof(val);
 
 	PrismResult transpile_result = prism_transpile_source(
@@ -1452,15 +1452,10 @@ void test_typeof_register_vla_bug(void) {
 	    "    (void)sizeof(val);\n"
 	    "}\n",
 	    "register_typeof_vla.c", prism_defaults());
-	CHECK_EQ(transpile_result.status, PRISM_OK, "register typeof VLA transpiles");
-	if (transpile_result.output) {
-		CHECK(strstr(transpile_result.output, "register typeof(int[n]) val;") != NULL,
-		      "register typeof VLA: declaration preserved");
-		CHECK(strstr(transpile_result.output, "memset(&val") == NULL,
-		      "register typeof VLA: no illegal register memset");
-		CHECK(strstr(transpile_result.output, "val = {0}") == NULL,
-		      "register typeof VLA: no bogus brace init emitted");
-	}
+	CHECK(transpile_result.status != PRISM_OK, "register typeof VLA: must be rejected");
+	if (transpile_result.error_msg)
+		CHECK(strstr(transpile_result.error_msg, "register") != NULL,
+		      "register typeof VLA: error mentions register");
 	prism_free(&transpile_result);
 #endif
 }
@@ -1486,7 +1481,7 @@ void test_const_typeof_vla_bug(void) {
 #ifdef __GNUC__
 	int n = 10;
 	int vla[n];
-	const typeof(vla) val;
+	raw const typeof(vla) val;
 	(void)val;
 
 	PrismResult transpile_result = prism_transpile_source(
@@ -1496,15 +1491,11 @@ void test_const_typeof_vla_bug(void) {
 	    "    (void)val;\n"
 	    "}\n",
 	    "const_typeof_vla.c", prism_defaults());
-	CHECK_EQ(transpile_result.status, PRISM_OK, "const typeof VLA transpiles");
-	if (transpile_result.output) {
-		CHECK(strstr(transpile_result.output, "int vla[n]; __builtin_memset(&vla, 0, sizeof(vla));") != NULL,
-		      "const typeof VLA: VLA source gets memset");
-		CHECK(strstr(transpile_result.output, "const typeof(vla) val; __builtin_memset((void *)&val, 0, sizeof(val));") != NULL,
-		      "const typeof VLA: const array gets casted memset");
-		CHECK(strstr(transpile_result.output, "val = {0}") == NULL,
-		      "const typeof VLA: no illegal brace init emitted");
-	}
+	CHECK(transpile_result.status != PRISM_OK,
+	      "const typeof VLA: must be rejected (memset on const is UB)");
+	if (transpile_result.error_msg)
+		CHECK(strstr(transpile_result.error_msg, "const") != NULL,
+		      "const typeof VLA: error mentions const");
 	prism_free(&transpile_result);
 #endif
 }
@@ -3107,6 +3098,93 @@ static void test_extension_zeroinit(void) {
 }
 #endif
 
+static void test_const_vla_memset_ub(void) {
+	printf("\n--- Const VLA/typeof memset UB rejection ---\n");
+
+	/* const typeof(int[len]) buf; — memset on const is UB (C11 §6.7.3p6) */
+	PrismResult r1 = prism_transpile_source(
+	    "void f(int len) {\n"
+	    "    const typeof(int[len]) secure_buffer;\n"
+	    "    (void)secure_buffer;\n"
+	    "}\n",
+	    "const_vla1.c", prism_defaults());
+	CHECK(r1.status != PRISM_OK, "const typeof(VLA) memset: must be rejected");
+	if (r1.error_msg)
+		CHECK(strstr(r1.error_msg, "const") != NULL,
+		      "const typeof(VLA) memset: error mentions const");
+	prism_free(&r1);
+
+	/* const int buf[n]; — VLA needs memset, but const forbids it */
+	PrismResult r2 = prism_transpile_source(
+	    "void f(int n) {\n"
+	    "    const int buf[n];\n"
+	    "    (void)buf;\n"
+	    "}\n",
+	    "const_vla2.c", prism_defaults());
+	CHECK(r2.status != PRISM_OK, "const int VLA memset: must be rejected");
+	if (r2.error_msg)
+		CHECK(strstr(r2.error_msg, "const") != NULL,
+		      "const int VLA memset: error mentions const");
+	prism_free(&r2);
+
+	/* raw const int buf[n]; — raw opts out, should be accepted */
+	PrismResult r3 = prism_transpile_source(
+	    "void f(int n) {\n"
+	    "    raw const int buf[n];\n"
+	    "    (void)buf;\n"
+	    "}\n",
+	    "const_vla_raw.c", prism_defaults());
+	CHECK(r3.status == PRISM_OK, "raw const VLA: accepted (raw opts out)");
+	prism_free(&r3);
+
+	/* Non-VLA const — normal = {0}, should work */
+	PrismResult r4 = prism_transpile_source(
+	    "void f(void) {\n"
+	    "    const int x;\n"
+	    "    (void)x;\n"
+	    "}\n",
+	    "const_nonvla.c", prism_defaults());
+	CHECK(r4.status == PRISM_OK, "const non-VLA: accepted (= 0)");
+	prism_free(&r4);
+}
+
+static void test_register_vla_bypass(void) {
+	printf("\n--- Register VLA zero-init rejection ---\n");
+
+	/* register int buf[n]; — can't memset (no address), can't = {0} (VLA) */
+	PrismResult r1 = prism_transpile_source(
+	    "void f(int n) {\n"
+	    "    register int buffer[n];\n"
+	    "    (void)buffer;\n"
+	    "}\n",
+	    "reg_vla1.c", prism_defaults());
+	CHECK(r1.status != PRISM_OK, "register VLA: must be rejected");
+	if (r1.error_msg)
+		CHECK(strstr(r1.error_msg, "register") != NULL,
+		      "register VLA: error mentions register");
+	prism_free(&r1);
+
+	/* raw register int buf[n]; — raw opts out, should be accepted */
+	PrismResult r2 = prism_transpile_source(
+	    "void f(int n) {\n"
+	    "    raw register int buffer[n];\n"
+	    "    (void)buffer;\n"
+	    "}\n",
+	    "reg_vla_raw.c", prism_defaults());
+	CHECK(r2.status == PRISM_OK, "raw register VLA: accepted (raw opts out)");
+	prism_free(&r2);
+
+	/* register int x; — non-VLA register, normal = 0 */
+	PrismResult r3 = prism_transpile_source(
+	    "void f(void) {\n"
+	    "    register int x;\n"
+	    "    (void)x;\n"
+	    "}\n",
+	    "reg_nonvla.c", prism_defaults());
+	CHECK(r3.status == PRISM_OK, "register non-VLA: accepted (= 0)");
+	prism_free(&r3);
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -3257,4 +3335,10 @@ void run_zeroinit_tests(void) {
 
 	// __extension__ zero-init bypass
 	GNUC_ONLY(test_extension_zeroinit());
+
+	// const VLA/typeof memset UB
+	GNUC_ONLY(test_const_vla_memset_ub());
+
+	// register VLA zero-init bypass
+	test_register_vla_bypass();
 }

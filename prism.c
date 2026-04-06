@@ -303,7 +303,7 @@ static PRISM_THREAD_LOCAL bool use_linemarkers = false; // true = GCC linemarker
 // emit_tok() call.  Used by the _Generic member-injection rewrite to rewind
 // the output buffer past an already-emitted member-access prefix.
 // Absolute offsets survive out_flush() boundary crossings.
-#define EMIT_SAVE_RING_SIZE 128
+#define EMIT_SAVE_RING_SIZE 1024
 #define EMIT_SAVE_RING_MASK (EMIT_SAVE_RING_SIZE - 1)
 static PRISM_THREAD_LOCAL struct { int64_t abs_pos; uint32_t tpi; } emit_save_ring[EMIT_SAVE_RING_SIZE];
 static PRISM_THREAD_LOCAL int emit_save_idx = 0;
@@ -609,7 +609,10 @@ static void collect_system_includes(void) {
 }
 
 static void emit_system_header_diag_push(void) {
-	if (target_is_msvc()) return; // MSVC doesn't understand #pragma GCC
+	if (target_is_msvc()) {
+		OUT_LIT("#pragma warning(push, 0)\n");
+		return;
+	}
 	OUT_LIT("#pragma GCC diagnostic push\n"
 		"#pragma GCC diagnostic ignored \"-Wredundant-decls\"\n"
 		"#pragma GCC diagnostic ignored \"-Wstrict-prototypes\"\n"
@@ -624,7 +627,10 @@ static void emit_system_header_diag_push(void) {
 }
 
 static void emit_system_header_diag_pop(void) {
-	if (target_is_msvc()) return;
+	if (target_is_msvc()) {
+		OUT_LIT("#pragma warning(pop)\n");
+		return;
+	}
 	OUT_LIT("#pragma GCC diagnostic pop\n");
 }
 
@@ -821,6 +827,10 @@ static bool __attribute__((noinline)) emit_tok_special(Token *tok) {
 	const char *replacement;
 	int suffix_len = get_extended_float_suffix(tok_loc(tok), tok->len, &replacement);
 	if (suffix_len > 0) {
+		const char *suf = tok_loc(tok) + tok->len - suffix_len;
+		if (suffix_len >= 4 && (suf[0] | 0x20) == 'f' && suf[1] == '1' && suf[2] == '2' && suf[3] == '8')
+			warn_tok(tok, "C23 _Float128 literal truncated to long double; "
+				 "precision may be lost on platforms where long double is 80-bit");
 		out_str(tok_loc(tok), tok->len - suffix_len);
 		if (replacement) out_str(replacement, strlen(replacement));
 		return true;
@@ -1564,7 +1574,10 @@ static Token *try_generic_member_rewrite(Token *tok) {
 			break;
 		}
 	}
-	if (abs_rewind < 0) return NULL;
+	if (abs_rewind < 0) {
+		error_tok(member_op, "_Generic member rewrite: prefix chain exceeds %d tokens; simplify expression or use _Generic directly", EMIT_SAVE_RING_SIZE);
+		return NULL;
+	}
 
 	// --- Capture the prefix text (e.g. "obj." / "ptr->") ---
 	// We copy it from the output buffer before rewinding.  The text includes
@@ -1620,8 +1633,24 @@ static Token *try_generic_member_rewrite(Token *tok) {
 	bool in_value = false;
 	bool val_has_call = false;   // current branch has ident+( at depth 0
 	bool val_bare_ident = false; // current branch is a single bare ident
+	bool val_paren_wrapped = false; // target ident is inside (ident) wrapping parens
 	for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
 		if ((t->flags & TF_OPEN) && tok_match(t)) {
+			// Don't skip parens that wrap the injection target —
+			// drill in so the injection logic below can fire on the
+			// inner identifier.
+			if (in_value && val_paren_wrapped && match_ch(t, '(') &&
+			    (val_bare_ident || val_has_call)) {
+				emit_tok(t); // emit '('
+				// After drilling into (ident), treat the inner ident
+				// as bare for injection — tok_next(ident) is ')' not '('.
+				if (val_has_call) {
+					val_bare_ident = true;
+					val_has_call = false;
+				}
+				val_paren_wrapped = false;
+				continue;
+			}
 			walk_balanced(t, true);
 			t = tok_match(t);
 			continue;
@@ -1634,7 +1663,27 @@ static Token *try_generic_member_rewrite(Token *tok) {
 			// Pre-scan the branch value to decide injection strategy.
 			val_has_call = false;
 			val_bare_ident = false;
+			val_paren_wrapped = false;
 			Token *vs = tok_next(t);
+			// Peel one layer of value-wrapping parens for injection
+			// detection: (handle_int) or (get_func)(args).
+			Token *vs_inner = vs;
+			if (vs_inner && match_ch(vs_inner, '(') && tok_match(vs_inner)) {
+				Token *inner = tok_next(vs_inner);
+				Token *pclose = tok_match(vs_inner);
+				// Single ident inside parens: (handle_int)
+				if (inner && is_valid_varname(inner) && tok_next(inner) == pclose) {
+					Token *after_pclose = tok_next(pclose);
+					if (!after_pclose || after_pclose == close || match_ch(after_pclose, ',')) {
+						val_bare_ident = true;
+						val_paren_wrapped = true;
+					} else if (match_ch(after_pclose, '(')) {
+						val_has_call = true;
+						val_paren_wrapped = true;
+					}
+				}
+			}
+			if (!val_bare_ident && !val_has_call) {
 			for (Token *s = vs; s && s != close; s = tok_next(s)) {
 				if ((s->flags & TF_OPEN) && tok_match(s))
 					{ s = tok_match(s); continue; }
@@ -1648,6 +1697,7 @@ static Token *try_generic_member_rewrite(Token *tok) {
 				if (!after_vs || after_vs == close ||
 				    match_ch(after_vs, ','))
 					val_bare_ident = true;
+			}
 			}
 			continue;
 		}
@@ -2984,15 +3034,19 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		// Per-declarator 'raw' detection (comma-separated: int x, raw y;)
 		// Also handles redundant per-declarator raw when is_raw is already set
 		// (raw int x, raw y; — second 'raw' must be consumed to prevent leak).
+		// Probe past attributes/pragmas to find 'raw' hidden behind them.
 		bool decl_is_raw = is_raw;
-		if ((tok->flags & TF_RAW) && !is_known_typedef(tok)) {
-			Token *after = skip_noise(tok_next(tok));
+		Token *raw_probe = skip_noise(tok);
+		if ((raw_probe->flags & TF_RAW) && !is_known_typedef(raw_probe)) {
+			Token *after = skip_noise(tok_next(raw_probe));
 			if (after && ((is_valid_varname(after) && !is_type_keyword(after) &&
 				       !is_known_typedef(after) && !(after->tag & (TT_QUALIFIER | TT_SUE))) ||
 				      match_ch(after, '*') || match_ch(after, '('))) {
-				Token *last_raw = tok;
+				// Emit leading noise (attributes/pragmas) before 'raw'
+				decl_noise(tok, true);
+				Token *last_raw = raw_probe;
 				SKIP_RAW(after, last_raw);
-				emit_noise_between_raws(tok, last_raw);
+				emit_noise_between_raws(raw_probe, last_raw);
 				decl_start = tok_next(last_raw);
 				tok = after;
 				decl_is_raw = true;
@@ -3088,6 +3142,31 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		bool needs_memset = FEAT(F_ZEROINIT) && !decl.has_init && !decl_is_raw && (!decl.is_pointer || decl.is_array) &&
 				    !type->has_register && !type->has_static && !type->has_extern && !is_func_type &&
 				    (type->has_typeof || (type->has_atomic && is_aggregate) || effective_vla);
+
+		// const VLA cannot be safely memset — modifying a defined const
+		// object is UB (ISO C11 §6.7.3p6).  const on non-VLA typeof
+		// (e.g. typeof(const int)) produces a memset that compilers
+		// optimize to an initializer, so only reject VLAs.
+		bool explicit_const = (type->has_const && !decl.is_func_ptr) || decl.is_const;
+		if (!explicit_const && !decl.is_func_ptr && !decl.is_pointer) {
+			for (Token *tc = type_start; tc && tc != type->end; tc = tok_next(tc))
+				if (is_const_typedef(tc)) { explicit_const = true; break; }
+		}
+		if (needs_memset && explicit_const && effective_vla)
+			error_tok(decl.var_name,
+				  "'const' variable requiring typeof/VLA memset cannot be "
+				  "safely zero-initialized (modifying a const object is "
+				  "undefined behavior); remove 'const' or use 'raw' to "
+				  "opt out of automatic initialization");
+
+		// register VLA: address-taking is illegal, so memset is impossible,
+		// and VLAs cannot use = {0}. Reject rather than fail open.
+		if (FEAT(F_ZEROINIT) && !decl.has_init && !decl_is_raw && type->has_register && effective_vla)
+			error_tok(decl.var_name,
+				  "'register' VLA cannot be safely zero-initialized "
+				  "(address-taking is illegal for register, and VLAs "
+				  "cannot use initializer syntax); remove 'register' "
+				  "or use 'raw' to opt out of automatic initialization");
 
 		if (is_const_orelse_fallback) {
 			if (process_const_orelse_decl(&tok, orelse_info.orelse_tok, decl_start,
