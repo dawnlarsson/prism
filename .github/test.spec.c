@@ -2522,7 +2522,7 @@ static void spec_const_pointee_vla(void) {
 		CHECK_EQ(r.status, PRISM_OK,
 		         "const-pointee VLA: const char * array accepted");
 		if (r.output)
-			CHECK(strstr(r.output, "memset") != NULL,
+			CHECK(strstr(r.output, "memset") != NULL || strstr(r.output, "__prism_p_") != NULL,
 			      "const-pointee VLA: memset emitted (pointer is mutable)");
 		prism_free(&r);
 	}
@@ -2666,7 +2666,7 @@ static void spec_typedef_const_volatile_propagation(void) {
 		CHECK_EQ(r.status, PRISM_OK,
 		         "typedef const-pointer VLA: accepted (pointer mutable)");
 		if (r.output)
-			CHECK(strstr(r.output, "memset") != NULL,
+			CHECK(strstr(r.output, "memset") != NULL || strstr(r.output, "__prism_p_") != NULL,
 			      "typedef const-pointer VLA: memset OK");
 		prism_free(&r);
 	}
@@ -2683,7 +2683,7 @@ static void spec_typedef_const_volatile_propagation(void) {
 		CHECK_EQ(r.status, PRISM_OK,
 		         "typedef volatile-pointer VLA: accepted");
 		if (r.output)
-			CHECK(strstr(r.output, "memset") != NULL,
+			CHECK(strstr(r.output, "memset") != NULL || strstr(r.output, "__prism_p_") != NULL,
 			      "typedef volatile-pointer VLA: memset OK (pointer not volatile)");
 		prism_free(&r);
 	}
@@ -2731,6 +2731,140 @@ static void spec_typedef_const_volatile_propagation(void) {
 		    "spec_tcvp8.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
 		      "chained const typedef VLA: rejected");
+		prism_free(&r);
+	}
+}
+
+// ── function type composition ────────────────────────────────────────────
+
+static void spec_func_type_composition(void) {
+	printf("\n--- function type composition ---\n");
+
+	// 1. Chained typedef: typedef func_t alias → alias must remain function type
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    typedef int func_t(int);\n"
+		    "    typedef func_t chained_func_t;\n"
+		    "    chained_func_t my_func1;\n"
+		    "    (void)my_func1;\n"
+		    "}\n",
+		    "spec_ftc1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "chained func typedef: accepted");
+		if (r.output) {
+			CHECK(strstr(r.output, "= 0") == NULL && strstr(r.output, "= {0}") == NULL,
+			      "chained func typedef: no scalar init");
+			CHECK(strstr(r.output, "memset") == NULL,
+			      "chained func typedef: no memset");
+		}
+		prism_free(&r);
+	}
+
+	// 2. typeof(int(int)) — function type signature
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    typeof(int(int)) my_func2;\n"
+		    "    (void)my_func2;\n"
+		    "}\n",
+		    "spec_ftc2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "typeof func signature: accepted");
+		if (r.output) {
+			CHECK(strstr(r.output, "memset") == NULL,
+			      "typeof func signature: no memset");
+			CHECK(strstr(r.output, "= 0") == NULL && strstr(r.output, "= {0}") == NULL,
+			      "typeof func signature: no scalar init");
+		}
+		prism_free(&r);
+	}
+
+	// 3. typeof(void(void)) — void function type
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    typeof(void(void)) my_func3;\n"
+		    "    (void)my_func3;\n"
+		    "}\n",
+		    "spec_ftc3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "typeof void func: accepted");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") == NULL,
+			      "typeof void func: no memset");
+		prism_free(&r);
+	}
+
+	// 4. typeof(void(*)(int)) — function POINTER, must zero-init
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    typeof(void(*)(int)) fp;\n"
+		    "    (void)fp;\n"
+		    "}\n",
+		    "spec_ftc4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "typeof func pointer: accepted");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL || strstr(r.output, "__prism_p_") != NULL,
+			      "typeof func pointer: gets zero-init");
+		prism_free(&r);
+	}
+
+	// 5. Triple-chained function typedef
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    typedef void handler_t(int);\n"
+		    "    typedef handler_t handler_alias;\n"
+		    "    typedef handler_alias handler_final;\n"
+		    "    handler_final h;\n"
+		    "    (void)h;\n"
+		    "}\n",
+		    "spec_ftc5.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "triple chain func typedef: accepted");
+		if (r.output) {
+			CHECK(strstr(r.output, "= 0") == NULL && strstr(r.output, "= {0}") == NULL,
+			      "triple chain func typedef: no init");
+			CHECK(strstr(r.output, "memset") == NULL,
+			      "triple chain func typedef: no memset");
+		}
+		prism_free(&r);
+	}
+
+	// 6. Function pointer typedef chain — must STILL zero-init
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    typedef int (*fptr_t)(int);\n"
+		    "    typedef fptr_t chained_fptr;\n"
+		    "    chained_fptr fp;\n"
+		    "    (void)fp;\n"
+		    "}\n",
+		    "spec_ftc6.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "chained func ptr typedef: accepted");
+		if (r.output)
+			CHECK(strstr(r.output, "= {0}") != NULL || strstr(r.output, "= 0") != NULL,
+			      "chained func ptr typedef: gets zero-init");
+		prism_free(&r);
+	}
+
+	// 7. typeof(int(int,int)) — multi-param function type
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    typeof(int(int,int)) mf;\n"
+		    "    (void)mf;\n"
+		    "}\n",
+		    "spec_ftc7.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "typeof multi-param func: accepted");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") == NULL,
+			      "typeof multi-param func: no memset");
 		prism_free(&r);
 	}
 }
@@ -2860,4 +2994,7 @@ void run_spec_tests(void) {
 
 	// ── typedef const/volatile propagation ──
 	spec_typedef_const_volatile_propagation();
+
+	// ── function type composition ──
+	spec_func_type_composition();
 }

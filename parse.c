@@ -2928,9 +2928,11 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 	bool base_is_void = type_spec.has_void;
 	bool base_is_ptr = false;
 	bool base_is_array = false;
+	bool base_is_func = false;
 	for (Token *bt = type_start; bt && bt != type_spec.end; bt = tok_next(bt)) {
 		if (is_ptr_typedef(bt)) { base_is_ptr = true; break; }
 		if (is_array_typedef(bt)) { base_is_array = true; break; }
+		if (is_func_typedef(bt)) { base_is_func = true; break; }
 	}
 
 	while (tok && !(tok->len == 1 && tok->ch0 == ';') && tok->kind != TK_EOF) {
@@ -2962,6 +2964,8 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 						added->is_func = true;
 				}
 				if (decl.is_func_ptr && !decl.paren_pointer)
+					added->is_func = true;
+				if (base_is_func && !decl.is_pointer && !decl.is_array && !decl.is_func_ptr)
 					added->is_func = true;
 			}
 		}

@@ -3044,7 +3044,19 @@ static bool is_typeof_func_type(Token *type_start, TypeSpecResult *type, DeclRes
 				} else break;
 			}
 			// Single bare identifier inside typeof()?
-			if (!inner || inner == close || tok_next(inner) != close ||
+			if (!inner || inner == close) break;
+			// Function type signature: typeof(int(int)) — type keyword followed by '('
+			if (inner->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)) {
+				for (Token *fs = inner; fs && fs != close; fs = tok_next(fs)) {
+					if (match_ch(fs, '(')) {
+						Token *after = tok_next(fs);
+						if (after && match_ch(after, '*')) return false; // function pointer type
+						return true; // function parameter list → function type
+					}
+				}
+				break;
+			}
+			if (tok_next(inner) != close ||
 			    !is_valid_varname(inner) || (inner->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF))) break;
 			typeof_ident_loc = tok_loc(inner);
 			typeof_ident_len = inner->len;

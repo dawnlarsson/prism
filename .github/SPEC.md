@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 1.0.5
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4672+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4727+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do. It is organized in two parts: **Part I** covers the transpiler's architecture, internal processing model, and implementation details. **Part II** provides a formal language specification for Prism's extensions to C, described in terms of the C abstract machine independently of any implementation strategy.
 
@@ -15,7 +15,7 @@ Prism is a source-to-source C transpiler. It reads preprocessed C, transforms it
 
 **Standards compatibility:** Prism accepts C99, C11, and C23 input and emits standard C compatible with GCC, Clang, and MSVC. All standard C type specifiers, qualifiers, storage classes, attributes, and control-flow constructs are recognized and passed through correctly. C23 features including `typeof_unqual`, `constexpr`, `auto` type inference, `_BitInt(N)`, `[[...]]` attributes, `alignas`/`alignof`, `static_assert`, fixed-underlying-type enums (`enum E : int { ... }`), labeled declarations, and if/switch initializers are supported. Do note Prism IS NOT officially certified in any way.
 
-Note: Prism is thoroughly empirically tested (self-hosting and 4672+ test cases) but **is not formally verified.** It is designed to compile standard-compliant code, but **may not catch every obscure constraint violation** defined by the ISO C standard.
+Note: Prism is thoroughly empirically tested (self-hosting and 4727+ test cases) but **is not formally verified.** It is designed to compile standard-compliant code, but **may not catch every obscure constraint violation** defined by the ISO C standard.
 
 The transpiler operates in two passes:
 
@@ -262,7 +262,7 @@ Each `TypedefEntry` records:
 - `token_index` — pool index of the declaration
 - `is_vla`, `is_void`, `is_const`, `is_volatile`, `is_ptr`, `is_array`, `is_aggregate` — type property flags
 - `is_shadow`, `is_enum_const`, `is_vla_var` — entry kind flags
-- `is_func` — set when the typedef resolves to a function type (used to suppress zero-init memset on function types). Detection works for both `typedef int FuncType(int)` (parse_declarator returns `end=NULL`, check for `(` after name) and `typedef int (FuncType)(int)` (parse_declarator sets `is_func_ptr=true` without `paren_pointer` — function type, not function pointer)
+- `is_func` — set when the typedef resolves to a function type (used to suppress zero-init memset on function types). Detection works for both `typedef int FuncType(int)` (parse_declarator returns `end=NULL`, check for `(` after name) and `typedef int (FuncType)(int)` (parse_declarator sets `is_func_ptr=true` without `paren_pointer` — function type, not function pointer). **Chained typedef propagation:** `parse_typedef_declaration` propagates `is_func` through typedef chains via `base_is_func`: when the base type specifier contains a function typedef (`is_func_typedef`), the derived typedef inherits `is_func = true` (guarded by `!decl.is_pointer && !decl.is_array && !decl.is_func_ptr`). Without this, `typedef func_t alias; alias f;` would lose the function-type property and Prism would emit `= {0}` or `memset` on a function symbol — a fatal constraint violation (ISO C11 §6.5.3.4p1 forbids `sizeof` on function types).
 - `prev_index` — chain to previous entry for the same name
 
 **After Phase 1 completes, the typedef table is immutable.** No `typedef_add_entry` calls occur in Pass 2.
@@ -625,7 +625,7 @@ These helpers are used at 20+ call sites across Phase 1D prescan, Phase 1G orels
 
 **register VLA rejection:** `register` VLA declarations without an explicit initializer (and without `raw`) are rejected with a hard error — `register` forbids address-taking (ISO C11 §6.7.1p6), making `memset` impossible, and VLAs cannot use `= {0}` initializer syntax. The user must remove `register` or use `raw` to opt out.
 
-**Function-type exclusion:** `typeof(func_name)` where `func_name` is a function (not a function pointer) produces a function type — emitting `memset` on it writes to the `.text` segment (SIGSEGV). `process_declarators` detects function types via three mechanisms: (1) `is_func_typedef` scan of the type specifier for typedef'd function types; (2) `func_meta` scan matching the identifier inside `typeof(…)` against defined functions; (3) forward-declaration scan of `token_pool` at brace depth 0, detecting `ident(` patterns for functions only visible via forward declaration (not in `func_meta`). All three require a single bare identifier inside the `typeof(…)` parens. When detected, `is_func_type` is set and `needs_memset` evaluates to false.
+**Function-type exclusion:** `typeof(func_name)` where `func_name` is a function (not a function pointer) produces a function type — emitting `memset` on it writes to the `.text` segment (SIGSEGV). `process_declarators` detects function types via three mechanisms: (1) `is_func_typedef` scan of the type specifier for typedef'd function types; (2) `func_meta` scan matching the identifier inside `typeof(…)` against defined functions; (3) forward-declaration scan of `token_pool` at brace depth 0, detecting `ident(` patterns for functions only visible via forward declaration (not in `func_meta`). All three require a single bare identifier inside the `typeof(…)` parens. When detected, `is_func_type` is set and `needs_memset` evaluates to false. **(4) Function type signatures:** `typeof(int(int))`, `typeof(void(void))`, etc. — when the inner tokens start with a type keyword and contain a `(` whose first inner token is not `*`, this is a function parameter list, indicating a function type. If the first `(` is followed by `*`, it is a pointer grouping (`typeof(void(*)(int))`), indicating a function pointer type — `is_func_type` returns false and zero-init proceeds normally.
 
 **Feature flag:** `-fno-zeroinit` disables.
 
