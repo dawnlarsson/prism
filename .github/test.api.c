@@ -7827,6 +7827,27 @@ static void test_braceless_defer_shadow_false_positive(void) {
 	prism_free(&r);
 }
 
+static void test_braceless_typedef_scope_poison(void) {
+	/* BUG: typedef in braceless control-flow body leaked to parent scope,
+	 * poisoning Prism keywords (orelse/defer) for the rest of the function. */
+	PrismResult r = prism_transpile_source(
+		"int get_data(void);\n"
+		"void f(void) {\n"
+		"    if (1)\n"
+		"        L: typedef float orelse;\n"
+		"    int status = get_data() orelse 0;\n"
+		"    (void)status;\n"
+		"}\n",
+		"braceless_td_scope.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "braceless-typedef-scope: transpile succeeds");
+	if (r.output) {
+		CHECK(strstr(r.output, "get_data() orelse") == NULL,
+		      "braceless-typedef-scope: orelse keyword processed, not leaked");
+	}
+	prism_free(&r);
+}
+
 // Deeply nested parens wrapping a statement expression must not cause
 // quadratic slowdown in p1d_scan_balanced_group (BUG104).
 static void test_deep_nested_paren_stmtexpr_perf(void) {
@@ -7917,6 +7938,149 @@ static void test_generic_paren_wrapped_target(void) {
 	}
 }
 
+static void test_ghost_enum_defer_shadow_enclosing(void) {
+	printf("\n--- Ghost enum defer shadow in enclosing scope ---\n");
+	/* Ghost enum inside sizeof() shadows a name captured by an enclosing-scope
+	 * defer. Must be caught — enum constants leak to block scope. */
+	{
+		const char *code =
+		    "int X;\n"
+		    "void reset(int);\n"
+		    "void f(int cond) {\n"
+		    "    defer { reset(X); }\n"
+		    "    if (cond) {\n"
+		    "        int sz = sizeof(enum { X = 1 });\n"
+		    "        (void)sz;\n"
+		    "        return;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ghe1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "ghost-enum-enclosing: rejected");
+		prism_free(&r);
+	}
+	/* Cast context: (enum { X = 1 })0 */
+	{
+		const char *code =
+		    "int X;\n"
+		    "void reset(int);\n"
+		    "void f(void) {\n"
+		    "    defer { reset(X); }\n"
+		    "    int v = (enum { X = 1 })0;\n"
+		    "    (void)v;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ghe2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "ghost-enum-cast: rejected");
+		prism_free(&r);
+	}
+	/* Safe case: no defer active */
+	{
+		const char *code =
+		    "int X;\n"
+		    "void f(void) {\n"
+		    "    int sz = sizeof(enum { X = 1 });\n"
+		    "    (void)sz;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ghe3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "ghost-enum-no-defer: passes");
+		prism_free(&r);
+	}
+	/* Safe case: different name */
+	{
+		const char *code =
+		    "int X;\n"
+		    "void reset(int);\n"
+		    "void f(void) {\n"
+		    "    defer { reset(X); }\n"
+		    "    int sz = sizeof(enum { Y = 1 });\n"
+		    "    (void)sz;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ghe4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "ghost-enum-diff-name: passes");
+		prism_free(&r);
+	}
+}
+
+static void test_generic_multi_paren_wrapped_target(void) {
+	printf("\n--- _Generic multi-layer paren-wrapped target ---\n");
+	/* Double-paren wrapping: ((handler)) — common from macro expansion */
+	{
+		const char *code =
+		    "typedef struct { int type; } Obj;\n"
+		    "int handle_int(int);\n"
+		    "int handle_float(int);\n"
+		    "int dispatch(Obj *obj, int sel, int data) {\n"
+		    "    return obj->_Generic(sel, int: ((handle_int)),\n"
+		    "                              default: ((handle_float)))(data);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gmpp1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "double-paren: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "obj->handle_int") != NULL,
+			      "double-paren: prefix injected for handle_int");
+			CHECK(strstr(r.output, "obj->handle_float") != NULL,
+			      "double-paren: prefix injected for handle_float");
+			CHECK(strstr(r.output, "obj->_Generic") == NULL,
+			      "double-paren: obj->_Generic removed");
+		}
+		prism_free(&r);
+	}
+	/* Triple-paren wrapping: (((handler))) */
+	{
+		const char *code =
+		    "struct S { int (*f)(int); };\n"
+		    "struct S obj;\n"
+		    "int handler(int);\n"
+		    "int sel;\n"
+		    "int v = obj._Generic(sel, int: (((handler))))(42);\n";
+		PrismResult r = prism_transpile_source(code, "gmpp2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "triple-paren: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "obj.handler") != NULL,
+			      "triple-paren: prefix injected");
+		}
+		prism_free(&r);
+	}
+	/* Single-paren still works (regression) */
+	{
+		const char *code =
+		    "struct S { int (*f)(int); };\n"
+		    "struct S obj;\n"
+		    "int handler(int);\n"
+		    "int sel;\n"
+		    "int v = obj._Generic(sel, int: (handler))(42);\n";
+		PrismResult r = prism_transpile_source(code, "gmpp3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "single-paren: still works");
+		if (r.output) {
+			CHECK(strstr(r.output, "obj.handler") != NULL,
+			      "single-paren: prefix injected");
+		}
+		prism_free(&r);
+	}
+}
+
+static void test_generic_prefix_buf_overflow(void) {
+	printf("\n--- _Generic prefix_buf overflow error ---\n");
+	/* Build a chain that exceeds 1024 bytes: ~11 fields of 93 chars each */
+	char code[4096];
+	int off = 0;
+	off += snprintf(code + off, sizeof(code) - off,
+	    "typedef struct T T;\n"
+	    "int handler(int);\n"
+	    "int test(T *obj, int sel, int data) {\n"
+	    "    return obj->");
+	for (int i = 0; i < 11; i++) {
+		if (i > 0) off += snprintf(code + off, sizeof(code) - off, ".");
+		off += snprintf(code + off, sizeof(code) - off,
+		    "field_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_%d", i);
+	}
+	off += snprintf(code + off, sizeof(code) - off,
+	    "._Generic(sel, int: handler)(data);\n"
+	    "}\n");
+	PrismResult r = prism_transpile_source(code, "gpbuf.c", prism_defaults());
+	CHECK(r.status != PRISM_OK, "prefix-overflow: rejected with error");
+	prism_free(&r);
+}
+
 void run_api_tests_4(void) {
 	printf("\n=== API TESTS (group 4) ===\n");
 	test_collect_source_defines_long_line_truncation();
@@ -7977,9 +8141,13 @@ void run_api_tests_4(void) {
 	test_noreturn_attr_arg_poisoning();
 	GNUC_ONLY(test_vla_deref_adjacency_parens());
 	test_braceless_defer_shadow_false_positive();
+	test_braceless_typedef_scope_poison();
 	test_raw_star_expr_misclassification();
 	GNUC_ONLY(test_typeof_local_shadows_func());
 	GNUC_ONLY(test_param_shadow_func_proto());
 	test_deep_nested_paren_stmtexpr_perf();
 	test_generic_paren_wrapped_target();
+	test_ghost_enum_defer_shadow_enclosing();
+	test_generic_multi_paren_wrapped_target();
+	test_generic_prefix_buf_overflow();
 }

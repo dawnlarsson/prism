@@ -1591,7 +1591,8 @@ static Token *try_generic_member_rewrite(Token *tok) {
 		if (prefix_len > 0 && (pt->flags & TF_HAS_SPACE) && prefix_len < (int)sizeof(prefix_buf) - 1)
 			prefix_buf[prefix_len++] = ' ';
 		int tl = pt->len;
-		if (prefix_len + tl > (int)sizeof(prefix_buf)) return NULL;  // prefix too large
+		if (prefix_len + tl > (int)sizeof(prefix_buf))
+			error_tok(member_op, "_Generic member rewrite: prefix exceeds %d bytes; simplify the member access chain or use _Generic directly", (int)sizeof(prefix_buf));
 		memcpy(prefix_buf + prefix_len, tok_loc(pt), tl);
 		prefix_len += tl;
 	}
@@ -1634,6 +1635,7 @@ static Token *try_generic_member_rewrite(Token *tok) {
 	bool val_has_call = false;   // current branch has ident+( at depth 0
 	bool val_bare_ident = false; // current branch is a single bare ident
 	bool val_paren_wrapped = false; // target ident is inside (ident) wrapping parens
+	int val_peel_depth = 0;      // number of remaining paren layers to drill through
 	for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
 		if ((t->flags & TF_OPEN) && tok_match(t)) {
 			// Don't skip parens that wrap the injection target —
@@ -1644,11 +1646,15 @@ static Token *try_generic_member_rewrite(Token *tok) {
 				emit_tok(t); // emit '('
 				// After drilling into (ident), treat the inner ident
 				// as bare for injection — tok_next(ident) is ')' not '('.
-				if (val_has_call) {
-					val_bare_ident = true;
-					val_has_call = false;
+				if (val_peel_depth > 0) {
+					val_peel_depth--;
+				} else {
+					if (val_has_call) {
+						val_bare_ident = true;
+						val_has_call = false;
+					}
+					val_paren_wrapped = false;
 				}
-				val_paren_wrapped = false;
 				continue;
 			}
 			walk_balanced(t, true);
@@ -1664,22 +1670,45 @@ static Token *try_generic_member_rewrite(Token *tok) {
 			val_has_call = false;
 			val_bare_ident = false;
 			val_paren_wrapped = false;
+			val_peel_depth = 0;
 			Token *vs = tok_next(t);
 			// Peel one layer of value-wrapping parens for injection
 			// detection: (handle_int) or (get_func)(args).
 			Token *vs_inner = vs;
-			if (vs_inner && match_ch(vs_inner, '(') && tok_match(vs_inner)) {
-				Token *inner = tok_next(vs_inner);
-				Token *pclose = tok_match(vs_inner);
-				// Single ident inside parens: (handle_int)
+			// Peel through multiple layers of value-wrapping parens
+			// for macro hygiene: ((handle_int)) or ((get_func))(args).
+			Token *peel_open = vs_inner;
+			int peel_depth = 0;
+			while (peel_open && match_ch(peel_open, '(') && tok_match(peel_open)) {
+				Token *maybe_inner = tok_next(peel_open);
+				if (!maybe_inner || !match_ch(maybe_inner, '(')) break;
+				// Verify this layer wraps tightly: the close is adjacent
+				// to the next layer's close.
+				peel_open = maybe_inner;
+				peel_depth++;
+			}
+			if (peel_open && match_ch(peel_open, '(') && tok_match(peel_open)) {
+				Token *inner = tok_next(peel_open);
+				Token *pclose = tok_match(peel_open);
 				if (inner && is_valid_varname(inner) && tok_next(inner) == pclose) {
-					Token *after_pclose = tok_next(pclose);
-					if (!after_pclose || after_pclose == close || match_ch(after_pclose, ',')) {
-						val_bare_ident = true;
-						val_paren_wrapped = true;
-					} else if (match_ch(after_pclose, '(')) {
-						val_has_call = true;
-						val_paren_wrapped = true;
+					// Verify all outer paren layers close tightly
+					Token *outer_close = pclose;
+					bool layers_ok = true;
+					for (int pl = 0; pl < peel_depth; pl++) {
+						outer_close = tok_next(outer_close);
+						if (!outer_close || !match_ch(outer_close, ')')) { layers_ok = false; break; }
+					}
+					if (layers_ok) {
+						Token *after_outer = tok_next(outer_close);
+						if (!after_outer || after_outer == close || match_ch(after_outer, ',')) {
+							val_bare_ident = true;
+							val_paren_wrapped = true;
+							val_peel_depth = peel_depth;
+						} else if (match_ch(after_outer, '(')) {
+							val_has_call = true;
+							val_paren_wrapped = true;
+							val_peel_depth = peel_depth;
+						}
 					}
 				}
 			}
@@ -2947,7 +2976,7 @@ static bool should_split_multi_decl(Token *next_decl_tok) {
 	if (in_for_init()) return false;
 	DeclResult next_decl = parse_declarator(next_decl_tok, false);
 	if (!next_decl.end) return false;
-	if (ctx->typeof_var_count > 0 && next_decl.var_name && next_decl.has_init)
+	if (ctx->typeof_var_count > 0 && next_decl.var_name && (next_decl.has_init || next_decl.is_vla))
 		return true;
 	if (FEAT(F_ORELSE) && declarator_has_bracket_orelse(next_decl_tok, next_decl.end))
 		return true;
@@ -5709,6 +5738,39 @@ p1_check_enum_body_defer_shadow(Token *brace, uint16_t cur_sid, int p1d_cur_func
 	for (Token *t = tok_next(brace); t && t != end && t->kind != TK_EOF; ) {
 		if (is_valid_varname(t)) {
 			p1_check_defer_same_block_shadow(t, cur_sid, p1d_cur_func);
+			// Enum constants leak to the enclosing block scope (C11 §6.2.1p4).
+			// Check enclosing-scope defers too — a control-flow exit anywhere
+			// after this point would paste the defer with the wrong binding.
+			{
+				char *name = tok_loc(t);
+				int nlen = t->len;
+				if (hashmap_get(&func_meta[p1d_cur_func].defer_name_set, name, nlen)) {
+					int start = func_meta[p1d_cur_func].entry_start;
+					for (int i = start; i < p1_entry_count; i++) {
+						P1FuncEntry *e = &p1_entries[i];
+						if (e->kind != P1K_DEFER) continue;
+						if (e->scope_id == cur_sid) continue; // already checked above
+						if (!scope_is_ancestor_or_self(e->scope_id, cur_sid)) continue;
+						Token *body = tok_next(e->tok);
+						if (!body) continue;
+						Token *body_end = NULL;
+						if (match_ch(body, '{') && tok_match(body))
+							body_end = tok_match(body);
+						else
+							body_end = skip_to_semicolon(body);
+						uint32_t var_idx = tok_idx(t);
+						uint32_t bi = tok_idx(body);
+						uint32_t ei = body_end ? tok_idx(body_end) : UINT32_MAX;
+						if (var_idx >= bi && var_idx < ei) continue;
+						if (defer_body_refs_name(body, body_end, name, nlen))
+							error_tok(t,
+								  "enum constant '%.*s' shadows a name captured "
+								  "by a defer in an enclosing scope; the defer "
+								  "body would bind to the enum constant",
+								  nlen, name);
+					}
+				}
+			}
 			while (t && t != end && t->kind != TK_EOF && !match_ch(t, ',')) {
 				if (t->flags & TF_OPEN && tok_match(t))
 					{ t = tok_next(tok_match(t)); continue; }
@@ -6776,7 +6838,18 @@ uint16_t sid = next_scope_id++;
 		}
 
 		if (tok->tag & TT_TYPEDEF) {
+			// Braceless control-flow body: narrow typedef scope to
+			// the statement boundary so it doesn't leak to the parent.
+			uint32_t td_saved_close = 0;
+			if (p1d_ctrl_pending && brace_depth > 0) {
+				Token *stmt_end = skip_one_stmt_impl(tok, skip_cache);
+				if (stmt_end) {
+					td_saved_close = td_scope_close;
+					td_scope_close = tok_idx(stmt_end);
+				}
+			}
 			parse_typedef_declaration(tok, brace_depth);
+			if (td_saved_close) td_scope_close = td_saved_close;
 			// Walk typedef body to register shadows inside struct/union bodies.
 			// Braces consumed here don't increment next_scope_id — the main '{'
 			// handler auto-advances past skipped scope IDs using open_tok_idx.

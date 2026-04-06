@@ -1633,6 +1633,34 @@ static void test_typeof_vla_split_double_eval(void) {
 	prism_free(&r4);
 }
 
+static void test_vla_multi_decl_sequence_point(void) {
+	printf("\n--- VLA multi-decl sequence point split ---\n");
+
+	/* BUG: int arr[n], matrix[arr[0]][n]; — arr queued for memset but
+	 * matrix's VLA dim arr[0] evaluated before the memset runs.
+	 * Fix: should_split_multi_decl splits when next decl is VLA. */
+	PrismResult r = prism_transpile_source(
+		"void f(int n) {\n"
+		"    int arr[n], matrix[arr[0]][n];\n"
+		"    (void)arr; (void)matrix;\n"
+		"}\n",
+		"vla_seq.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "vla-seq: transpile succeeds");
+	if (r.output) {
+		/* arr must be on its own statement, memset'd before matrix */
+		char *arr_decl = strstr(r.output, "int arr[n]");
+		char *matrix_decl = strstr(r.output, "matrix[");
+		char *memset_arr = strstr(r.output, "memset");
+		CHECK(arr_decl != NULL, "vla-seq: arr declared");
+		CHECK(matrix_decl != NULL, "vla-seq: matrix declared");
+		CHECK(memset_arr != NULL, "vla-seq: memset present");
+		if (arr_decl && matrix_decl && memset_arr)
+			CHECK(memset_arr < matrix_decl,
+			      "vla-seq: memset(arr) before matrix declaration");
+	}
+	prism_free(&r);
+}
+
 static void test_typeof_memset_queue_over_128(void) {
 	printf("\n--- Typeof Memset Queue Over 128 ---\n");
 
@@ -3259,6 +3287,7 @@ void run_zeroinit_tests(void) {
 	NOMSVC_ONLY(test_const_typeof_atomic_struct_bug());
 	test_typeof_memset_split_before_initializer();
 	test_typeof_vla_split_double_eval();
+	test_vla_multi_decl_sequence_point();
 	test_typeof_memset_queue_over_128();
 
 	test_sizeof_unparenthesized_not_vla();
