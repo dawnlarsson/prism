@@ -2308,6 +2308,434 @@ static void spec_attr_ctrl_flow_rejection(void) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Backward goto nested-scope defer loop detection
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void spec_defer_loop_nested_scope(void) {
+	printf("\n--- backward goto nested-scope defer loop ---\n");
+
+	// 1. Label in nested block, defer in outer: must reject
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    { L_loop: ; }\n"
+		    "    defer cleanup();\n"
+		    "    goto L_loop;\n"
+		    "}\n",
+		    "spec_dln1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "defer loop nested: label in child rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "loops over") != NULL,
+			      "defer loop nested: error mentions loops over");
+		prism_free(&r);
+	}
+
+	// 2. Label 2 levels deep: must reject
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    { { L_deep: ; } }\n"
+		    "    defer cleanup();\n"
+		    "    goto L_deep;\n"
+		    "}\n",
+		    "spec_dln2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "defer loop nested: 2 levels deep rejected");
+		prism_free(&r);
+	}
+
+	// 3. Both label and goto in nested scopes: must reject
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    { L_top: ; }\n"
+		    "    defer cleanup();\n"
+		    "    { goto L_top; }\n"
+		    "}\n",
+		    "spec_dln3.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "defer loop nested: both nested rejected");
+		prism_free(&r);
+	}
+
+	// 4. Defer in child scope of goto (goto exits it): must accept
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "L_top:\n"
+		    "    { defer cleanup(); }\n"
+		    "    goto L_top;\n"
+		    "}\n",
+		    "spec_dln4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "defer loop nested: defer in child scope accepted");
+		prism_free(&r);
+	}
+
+	// 5. Defer in sibling scope: must accept
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "L_top:\n"
+		    "    { defer cleanup(); }\n"
+		    "    { goto L_top; }\n"
+		    "}\n",
+		    "spec_dln5.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "defer loop nested: sibling scope accepted");
+		prism_free(&r);
+	}
+
+	// 6. Same-scope still caught (sanity)
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "L_loop:\n"
+		    "    defer cleanup();\n"
+		    "    goto L_loop;\n"
+		    "}\n",
+		    "spec_dln6.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "defer loop nested: same-scope sanity rejected");
+		prism_free(&r);
+	}
+}
+
+// ── for/if/switch-init typedef recognition ───────────────────────────────
+
+static void spec_for_init_typedef(void) {
+	printf("\n--- for-init typedef recognition ---\n");
+
+	// 1. Zero-init through for-init typedef: SecretKey must get = {0}
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    for (typedef int FiTd; 0; ) {\n"
+		    "        FiTd x;\n"
+		    "        (void)x;\n"
+		    "    }\n"
+		    "}\n",
+		    "spec_fitd1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "for-init typedef: zero-init accepted");
+		if (r.output)
+			CHECK(strstr(r.output, "= {0}") != NULL ||
+			      strstr(r.output, "= 0") != NULL,
+			      "for-init typedef: zero-init applied");
+		prism_free(&r);
+	}
+
+	// 2. Goto over for-init typedef VLA: must reject
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    for (typedef int FiTd2; 0; ) {\n"
+		    "        goto L_skip;\n"
+		    "        FiTd2 arr[n];\n"
+		    "        (void)arr;\n"
+		    "        L_skip: ;\n"
+		    "    }\n"
+		    "}\n",
+		    "spec_fitd2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "for-init typedef: goto over VLA rejected");
+		prism_free(&r);
+	}
+
+	// 3. Enum constants in for-init typedef leak correctly
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    for (typedef enum { FITD_A, FITD_B } FiEnum; 0; ) {\n"
+		    "        FiEnum x;\n"
+		    "        (void)x;\n"
+		    "        (void)FITD_A;\n"
+		    "    }\n"
+		    "}\n",
+		    "spec_fitd3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "for-init typedef: enum constants accepted");
+		prism_free(&r);
+	}
+
+	// 4. Typedef doesn't leak past for-loop scope (negative: use after)
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    for (typedef int FiTd4; 0; ) {\n"
+		    "        FiTd4 x;\n"
+		    "        (void)x;\n"
+		    "    }\n"
+		    "    FiTd4 y;\n"
+		    "    (void)y;\n"
+		    "}\n",
+		    "spec_fitd4.c", prism_defaults());
+		// After the for loop, FiTd4 should not be a known type.
+		// Without the typedef, y is just an identifier — no zero-init.
+		// Check that the output does NOT zero-init y (it's not a type).
+		if (r.output)
+			CHECK(strstr(r.output, "FiTd4 y = {0}") == NULL &&
+			      strstr(r.output, "FiTd4 y = 0") == NULL,
+			      "for-init typedef: does not leak past scope");
+		prism_free(&r);
+	}
+
+	// 5. Struct typedef in for-init: aggregate zero-init
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    for (typedef struct { int a; } FiSt; 0; ) {\n"
+		    "        FiSt s;\n"
+		    "        (void)s;\n"
+		    "    }\n"
+		    "}\n",
+		    "spec_fitd5.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "for-init typedef: struct zero-init accepted");
+		if (r.output)
+			CHECK(strstr(r.output, "= {0}") != NULL,
+			      "for-init typedef: struct gets zero-init");
+		prism_free(&r);
+	}
+}
+
+// ── const-pointee VLA type composition ───────────────────────────────────
+
+static void spec_const_pointee_vla(void) {
+	printf("\n--- const-pointee VLA type composition ---\n");
+
+	// 1. const char *arr[n] — pointer-to-const, pointer itself is mutable → memset OK
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    const char *arr[n];\n"
+		    "    (void)arr;\n"
+		    "}\n",
+		    "spec_cpv1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "const-pointee VLA: const char * array accepted");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "const-pointee VLA: memset emitted (pointer is mutable)");
+		prism_free(&r);
+	}
+
+	// 2. const int arr[n] — actual const element → must reject
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    const int arr[n];\n"
+		    "    (void)arr;\n"
+		    "}\n",
+		    "spec_cpv2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "const-pointee VLA: const int array rejected");
+		prism_free(&r);
+	}
+
+	// 3. volatile int *arr[n] — pointer-to-volatile, pointer itself is not volatile
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    volatile int *arr[n];\n"
+		    "    (void)arr;\n"
+		    "}\n",
+		    "spec_cpv3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "const-pointee VLA: volatile int * array accepted");
+		prism_free(&r);
+	}
+
+	// 4. int *const arr[n] — const pointer (decl.is_const) → must reject
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    int *const arr[n];\n"
+		    "    (void)arr;\n"
+		    "}\n",
+		    "spec_cpv4.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "const-pointee VLA: const pointer array rejected");
+		prism_free(&r);
+	}
+
+	// 5. const int *p orelse — pointer-to-const with orelse, no temp needed
+	{
+		PrismResult r = prism_transpile_source(
+		    "int *get(void);\n"
+		    "void f(void) {\n"
+		    "    const int *p = get() orelse 0;\n"
+		    "    (void)p;\n"
+		    "}\n",
+		    "spec_cpv5.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "const-pointee orelse: pointer-to-const accepted");
+		if (r.output)
+			CHECK(strstr(r.output, "p ? p") != NULL,
+			      "const-pointee orelse: uses direct ternary (no temp)");
+		prism_free(&r);
+	}
+
+	// 6. const int x orelse — actual const, must use temp
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get(void);\n"
+		    "void f(void) {\n"
+		    "    const int x = get() orelse 5;\n"
+		    "    (void)x;\n"
+		    "}\n",
+		    "spec_cpv6.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "const-pointee orelse: const int uses temp");
+		if (r.output)
+			CHECK(strstr(r.output, "__prism_oe_") != NULL,
+			      "const-pointee orelse: const int emits temp variable");
+		prism_free(&r);
+	}
+}
+
+// ── typedef const/volatile propagation ────────────────────────────────────
+
+static void spec_typedef_const_volatile_propagation(void) {
+	printf("\n--- typedef const/volatile propagation ---\n");
+
+	// 1. typedef const int ReadOnlyVLA[n] — const must propagate → reject
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    typedef const int ReadOnlyVLA[n];\n"
+		    "    ReadOnlyVLA buffer;\n"
+		    "    (void)buffer;\n"
+		    "}\n",
+		    "spec_tcvp1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "typedef const VLA: const array typedef rejected");
+		prism_free(&r);
+	}
+
+	// 2. typedef volatile int VolVLA[n] — volatile must propagate → byte loop
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    typedef volatile int VolVLA[n];\n"
+		    "    VolVLA buf;\n"
+		    "    (void)buf;\n"
+		    "}\n",
+		    "spec_tcvp2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "typedef volatile VLA: accepted");
+		if (r.output)
+			CHECK(strstr(r.output, "volatile char") != NULL,
+			      "typedef volatile VLA: byte loop emitted");
+		prism_free(&r);
+	}
+
+	// 3. typedef const int CI; CI x; — non-VLA const → = {0}, no false positive
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    typedef const int CI;\n"
+		    "    CI x;\n"
+		    "    (void)x;\n"
+		    "}\n",
+		    "spec_tcvp3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "typedef const non-VLA: accepted");
+		if (r.output)
+			CHECK(strstr(r.output, "= {0}") != NULL,
+			      "typedef const non-VLA: gets inline zero-init");
+		prism_free(&r);
+	}
+
+	// 4. typedef const int *PCI; PCI arr[n] — pointer-to-const, pointer mutable
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    typedef const int *PCI;\n"
+		    "    PCI arr[n];\n"
+		    "    (void)arr;\n"
+		    "}\n",
+		    "spec_tcvp4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "typedef const-pointer VLA: accepted (pointer mutable)");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "typedef const-pointer VLA: memset OK");
+		prism_free(&r);
+	}
+
+	// 5. typedef volatile int *PVI; PVI arr[n] — pointer-to-volatile, pointer not volatile
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    typedef volatile int *PVI;\n"
+		    "    PVI arr[n];\n"
+		    "    (void)arr;\n"
+		    "}\n",
+		    "spec_tcvp5.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "typedef volatile-pointer VLA: accepted");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "typedef volatile-pointer VLA: memset OK (pointer not volatile)");
+		prism_free(&r);
+	}
+
+	// 6. typedef const volatile int CVVLA[n] — both qualifiers → reject (const)
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    typedef const volatile int CVVLA[n];\n"
+		    "    CVVLA buf;\n"
+		    "    (void)buf;\n"
+		    "}\n",
+		    "spec_tcvp6.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "typedef const volatile VLA: rejected (const)");
+		prism_free(&r);
+	}
+
+	// 7. typedef volatile int VI; VI x; — non-VLA volatile → = {0} (no byte loop)
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    typedef volatile int VI;\n"
+		    "    VI x;\n"
+		    "    (void)x;\n"
+		    "}\n",
+		    "spec_tcvp7.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "typedef volatile non-VLA: accepted");
+		if (r.output)
+			CHECK(strstr(r.output, "= {0}") != NULL,
+			      "typedef volatile non-VLA: inline zero-init");
+		prism_free(&r);
+	}
+
+	// 8. Chained typedef: typedef const int CI; typedef CI Arr[n]; Arr buf;
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    typedef const int CI;\n"
+		    "    typedef CI Arr[n];\n"
+		    "    Arr buf;\n"
+		    "    (void)buf;\n"
+		    "}\n",
+		    "spec_tcvp8.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "chained const typedef VLA: rejected");
+		prism_free(&r);
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  Runner
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -2420,4 +2848,16 @@ void run_spec_tests(void) {
 
 	// ── attribute-encapsulated control flow ──
 	spec_attr_ctrl_flow_rejection();
+
+	// ── backward goto nested-scope defer loop ──
+	spec_defer_loop_nested_scope();
+
+	// ── for-init typedef recognition ──
+	spec_for_init_typedef();
+
+	// ── const-pointee VLA type composition ──
+	spec_const_pointee_vla();
+
+	// ── typedef const/volatile propagation ──
+	spec_typedef_const_volatile_propagation();
 }

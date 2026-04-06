@@ -3383,7 +3383,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		// object is UB (ISO C11 §6.7.3p6).  const on non-VLA typeof
 		// (e.g. typeof(const int)) produces a memset that compilers
 		// optimize to an initializer, so only reject VLAs.
-		bool explicit_const = (type->has_const && !decl.is_func_ptr) || decl.is_const;
+		bool explicit_const = (type->has_const && !decl.is_func_ptr && !decl.is_pointer) || decl.is_const;
 		if (!explicit_const && !decl.is_func_ptr && !decl.is_pointer) {
 			for (Token *tc = type_start; tc && tc != type->end; tc = tok_next(tc))
 				if (is_const_typedef(tc)) { explicit_const = true; break; }
@@ -3394,6 +3394,12 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 				  "safely zero-initialized (modifying a const object is "
 				  "undefined behavior); remove 'const' or use 'raw' to "
 				  "opt out of automatic initialization");
+
+		// Volatile typedef: propagate to type so memset uses byte loop.
+		if (needs_memset && !type->has_volatile && !decl.is_func_ptr && !decl.is_pointer) {
+			for (Token *tv = type_start; tv && tv != type->end; tv = tok_next(tv))
+				if (is_volatile_typedef(tv)) { type->has_volatile = true; break; }
+		}
 
 		// register VLA: address-taking is illegal, so memset is impossible,
 		// and VLAs cannot use = {0}. Reject rather than fail open.
@@ -5877,6 +5883,28 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 		saw_raw = true;
 		init_tok = tok_next(init_tok);
 	}
+	if (init_tok && (init_tok->tag & TT_TYPEDEF)) {
+		uint32_t saved_open = td_scope_open;
+		uint32_t saved_close = td_scope_close;
+		td_scope_open = tok_idx(open);
+		td_scope_close = scope_close_idx;
+		parse_typedef_declaration(init_tok, brace_depth);
+		for (Token *tw = init_tok; tw && tw != init_end && tw->kind != TK_EOF && !match_ch(tw, ';'); ) {
+			if (is_enum_kw(tw)) {
+				Token *brace = find_struct_body_brace(tw);
+				if (brace)
+					parse_enum_constants(brace, brace_depth);
+			}
+			if (tw->flags & TF_OPEN && tok_match(tw)) {
+				tw = tok_next(tok_match(tw));
+				continue;
+			}
+			tw = tok_next(tw);
+		}
+		td_scope_open = saved_open;
+		td_scope_close = saved_close;
+		return;
+	}
 	if (!init_tok || !(init_tok->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT) ||
 	    is_known_typedef(init_tok)))
 		return;
@@ -7770,17 +7798,21 @@ static void p1_verify_cfg(void) {
 							defer_list, 0, wm_defer[li],
 							decl_list, 0, wm_decl[li]);
 					// Backward goto looping over defer: defers BETWEEN
-					// the label and the goto in the SAME scope as the
-					// label are re-executed without cleanup — the defer
-					// body is pasted once at scope exit, but the loop
-					// re-enters without exiting the scope.  Defers in
-					// child scopes are safe because the goto exits them
-					// (emit_goto_defer fires their cleanup).
+					// the label and the goto whose scope is not exited
+					// by the jump are re-executed without cleanup — the
+					// defer body is pasted once at scope exit, but the
+					// loop re-enters without exiting the scope.  A defer
+					// is looped over if its scope is an ancestor-or-self
+					// of BOTH the label's scope and the goto's scope
+					// (i.e. the jump stays within the defer's scope).
+					// Defers in child scopes of the goto are safe because
+					// emit_goto_defer fires their cleanup.
 					if (FEAT(F_DEFER)) {
 						for (int di = wm_defer[li]; di < defer_n; di++) {
 							P1FuncEntry *d = &ents[defer_list[di]];
 							if (d->token_index >= g->token_index) continue;
-							if (d->scope_id != ents[li].scope_id) continue;
+							if (!scope_is_ancestor_or_self(d->scope_id, ents[li].scope_id)) continue;
+							if (!scope_is_ancestor_or_self(d->scope_id, g->scope_id)) continue;
 							error_tok(g->tok,
 								  "goto '%.*s' loops over a defer statement; "
 								  "lexical defer does not queue dynamically and "

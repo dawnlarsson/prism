@@ -4686,17 +4686,18 @@ static void test_file_scope_typeof_orelse_no_crash(void) {
 
 static void test_const_vla_orelse_phase1(void) {
 	printf("\n--- const-VLA orelse Phase 1 ---\n");
-	// const pointer-to-VLA + value fallback → error
+	// const pointer-to-VLA + value fallback → accepted (pointer is mutable)
 	{
 		const char *code =
 		    "int get_size(void);\n"
 		    "void* get_ptr(void);\n"
 		    "void f(void) {\n"
 		    "    const int (*ptr)[get_size()] = get_ptr() orelse 0;\n"
-		    "}\n";
+		    "    (void)ptr;\n"
+		    "};\n";
 		PrismResult r = prism_transpile_source(code, "cvla1.c", prism_defaults());
-		CHECK(r.status != PRISM_OK && r.error_msg && strstr(r.error_msg, "const"),
-		      "const-VLA orelse value fallback must error in Phase 1");
+		CHECK_EQ(r.status, PRISM_OK,
+		      "const-VLA orelse value fallback must accept (pointer-to-const is mutable)");
 		prism_free(&r);
 	}
 	// Control: const VLA + block-form orelse → OK

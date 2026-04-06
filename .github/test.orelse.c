@@ -1324,11 +1324,11 @@ static void test_prism_oe_temp_var_namespace_collision(void) {
 
 	const char *code =
 	    "#include <stdio.h>\n"
-	    "int *get_val(void) { static int v = 42; return &v; }\n"
-	    "int *get_fb(void) { static int v = 99; return &v; }\n"
+	    "int get_val(void) { return 42; }\n"
+	    "int get_fb(void) { return 99; }\n"
 	    "int main(void) {\n"
 	    "    int *_prism_oe_0 = (int*)0xDEAD;\n"
-	    "    const int *x = get_val() orelse get_fb();\n"
+	    "    const int x = get_val() orelse get_fb();\n"
 	    "    (void)x;\n"
 	    "    printf(\"%p\\n\", (void*)_prism_oe_0);\n"
 	    "    return 0;\n"
@@ -1461,11 +1461,11 @@ static void test_compound_literal_orelse_lifetime(void) {
 	CHECK_EQ(result.status, PRISM_OK, "compound lit orelse: transpiles OK");
 	CHECK(result.output != NULL, "compound lit orelse: output not NULL");
 
-	// The fallback assignment must use ternary, not an unbraced if-body,
-	// to keep the compound literal in the enclosing block scope.
-	CHECK(strstr(result.output, "if (!__prism_oe_") == NULL,
+	// Pointer-to-const uses normal ternary path (pointer is mutable).
+	// Compound literal lifetime is preserved in the enclosing block scope.
+	CHECK(strstr(result.output, "if (!p)") == NULL,
 	      "compound lit orelse: no if-assignment (lifetime-destroying pattern)");
-	CHECK(strstr(result.output, "? __prism_oe_") != NULL,
+	CHECK(strstr(result.output, "? p :") != NULL || strstr(result.output, "? __prism_oe_") != NULL,
 	      "compound lit orelse: uses ternary to preserve compound literal lifetime");
 
 	prism_free(&result);
@@ -3900,11 +3900,9 @@ static void test_const_fallback_bracket_orelse_leak(void) {
 	    "}\n";
 
 	PrismResult r = prism_transpile_source(code, "const_bo_leak.c", prism_defaults());
-	CHECK(r.status != PRISM_OK,
-	      "const-bo-leak: const VLA orelse must be rejected (double eval)");
-	if (r.error_msg)
-		CHECK(strstr(r.error_msg, "variably") != NULL,
-		      "const-bo-leak: error mentions variably modified");
+	// Pointer-to-const-VLA: the pointer is mutable, so orelse is valid.
+	CHECK_EQ(r.status, PRISM_OK,
+	      "const-bo-leak: pointer-to-const VLA orelse accepted (pointer is mutable)");
 	prism_free(&r);
 }
 
@@ -4942,6 +4940,7 @@ static void test_const_vm_type_orelse_double_eval(void) {
 	// of side-effectful size expressions.
 
 	// Sub-test 1: VLA in declarator suffix — const int (*ptr)[get_size()]
+	// Pointer-to-const: the pointer is mutable, orelse is valid.
 	{
 		const char *code =
 		    "int get_size(void);\n"
@@ -4951,15 +4950,13 @@ static void test_const_vm_type_orelse_double_eval(void) {
 		    "    (void)ptr;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "const_vla_decl.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "const-vm-decl-orelse: VLA in declarator must be rejected");
-		if (r.error_msg)
-			CHECK(strstr(r.error_msg, "variably") != NULL || strstr(r.error_msg, "VLA") != NULL,
-			      "const-vm-decl-orelse: error mentions variably modified / VLA");
+		CHECK_EQ(r.status, PRISM_OK,
+		      "const-vm-decl-orelse: pointer-to-const VLA accepted");
 		prism_free(&r);
 	}
 
 	// Sub-test 2: VLA in type specifier via typeof — const typeof(int[n]) *p
+	// Pointer-to-const: the pointer is mutable, orelse is valid.
 	{
 		const char *code =
 		    "int *get_ptr(void);\n"
@@ -4968,11 +4965,8 @@ static void test_const_vm_type_orelse_double_eval(void) {
 		    "    (void)p;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "const_typeof_vla.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "const-vm-typeof-orelse: typeof VLA must be rejected");
-		if (r.error_msg)
-			CHECK(strstr(r.error_msg, "variably") != NULL || strstr(r.error_msg, "VLA") != NULL,
-			      "const-vm-typeof-orelse: error mentions variably modified / VLA");
+		CHECK_EQ(r.status, PRISM_OK,
+		      "const-vm-typeof-orelse: pointer-to-const typeof VLA accepted");
 		prism_free(&r);
 	}
 

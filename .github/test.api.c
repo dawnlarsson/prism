@@ -3429,25 +3429,13 @@ static void test_const_orelse_attr_preserved(void) {
 	PrismResult r = prism_transpile_source(code, "const_attr.c", feat);
 	CHECK_EQ(r.status, PRISM_OK, "const orelse attr: transpiles OK");
 	if (r.output) {
-		// The attribute must appear on the mutable temp
-		char *temp = strstr(r.output, "__prism_oe_");
-		CHECK(temp != NULL, "const orelse attr: temp variable emitted");
-		if (temp) {
-			// Find the line containing the temp - attribute must precede it
-			char *attr = strstr(r.output, "__attribute__((aligned(8)))");
-			CHECK(attr != NULL && attr < temp,
-			      "const orelse attr: attribute on temp declaration");
-		}
-		// The attribute must also appear on the final const declaration
-		char *final_const = strstr(r.output, "const int *x =");
-		if (final_const) {
-			char *attr2 = NULL;
-			// Search backwards from final_const for the nearest __attribute__
-			for (char *p = final_const - 1; p >= r.output; p--) {
-				if (strncmp(p, "__attribute__", 13) == 0) { attr2 = p; break; }
-			}
-			CHECK(attr2 != NULL, "const orelse attr: attribute on final const declaration");
-		}
+		// Pointer-to-const uses normal ternary path (no temp needed).
+		// The attribute must appear on the declaration.
+		char *attr = strstr(r.output, "__attribute__((aligned(8)))");
+		CHECK(attr != NULL, "const orelse attr: attribute preserved");
+		// Verify the ternary assignment pattern
+		char *ternary = strstr(r.output, "x = x ? x");
+		CHECK(ternary != NULL, "const orelse attr: ternary emitted");
 	}
 	prism_free(&r);
 }

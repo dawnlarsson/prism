@@ -2131,6 +2131,7 @@ typedef struct {
 	bool is_vla : 1;
 	bool is_void : 1;
 	bool is_const : 1;
+	bool is_volatile : 1;
 	bool is_ptr : 1;
 	bool is_array : 1;
 	bool is_shadow : 1;
@@ -2164,7 +2165,7 @@ enum {
 #define tok_ann(t) ((t)->ann)
 
 // Typedef query flags (single lookup, check multiple properties)
-enum { TDF_TYPEDEF = 1, TDF_VLA = 2, TDF_VOID = 4, TDF_ENUM_CONST = 8, TDF_CONST = 16, TDF_PTR = 32, TDF_ARRAY = 64, TDF_AGGREGATE = 128, TDF_FUNC = 256, TDF_PARAM = 512 };
+enum { TDF_TYPEDEF = 1, TDF_VLA = 2, TDF_VOID = 4, TDF_ENUM_CONST = 8, TDF_CONST = 16, TDF_PTR = 32, TDF_ARRAY = 64, TDF_AGGREGATE = 128, TDF_FUNC = 256, TDF_PARAM = 512, TDF_VOLATILE = 1024 };
 
 #define FEAT(f) (ctx->features & (f))
 
@@ -2331,7 +2332,8 @@ static inline int typedef_flags(Token *tok) {
 	if (e->is_shadow) return 0;
 	if (e->is_vla_var) return TDF_VLA | (e->is_param ? TDF_PARAM : 0);
 	return TDF_TYPEDEF | (e->is_vla ? TDF_VLA : 0) | (e->is_void ? TDF_VOID : 0) |
-	       (e->is_const ? TDF_CONST : 0) | (e->is_ptr ? TDF_PTR : 0) |
+	       (e->is_const ? TDF_CONST : 0) | (e->is_volatile ? TDF_VOLATILE : 0) |
+	       (e->is_ptr ? TDF_PTR : 0) |
 	       (e->is_array ? TDF_ARRAY : 0) | (e->is_aggregate ? TDF_AGGREGATE : 0) |
 	       (e->is_func ? TDF_FUNC : 0);
 }
@@ -2349,6 +2351,7 @@ static inline bool _is_known_typedef(Token *tok) {
 #define is_ptr_typedef(tok) (typedef_flags(tok) & TDF_PTR)
 #define is_array_typedef(tok) (typedef_flags(tok) & TDF_ARRAY)
 #define is_func_typedef(tok) (typedef_flags(tok) & TDF_FUNC)
+#define is_volatile_typedef(tok) (typedef_flags(tok) & TDF_VOLATILE)
 
 // --- Type/Variable Classification ---
 
@@ -2916,6 +2919,12 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 			if (is_const_typedef(t)) { base_is_const = true; break; }
 	}
 
+	bool base_is_volatile = type_spec.has_volatile;
+	if (!base_is_volatile) {
+		for (Token *t = type_start; t && t != tok; t = tok_next(t))
+			if (is_volatile_typedef(t)) { base_is_volatile = true; break; }
+	}
+
 	bool base_is_void = type_spec.has_void;
 	bool base_is_ptr = false;
 	bool base_is_array = false;
@@ -2930,7 +2939,7 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 			bool is_void =
 			    base_is_void && !decl.is_pointer && !decl.is_array && !decl.is_func_ptr;
 			bool is_const = (decl.is_pointer || decl.is_func_ptr)
-			    ? decl.is_const : (base_is_const && !decl.is_array);
+			    ? decl.is_const : base_is_const;
 			bool is_ptr =
 			    decl.is_pointer || decl.is_func_ptr || base_is_ptr;
 			int pre_count = typedef_table.count;
@@ -2939,6 +2948,9 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 				TypedefEntry *added = &typedef_table.entries[typedef_table.count - 1];
 				added->token_index = tok_idx(decl.var_name);
 				if (is_const) added->is_const = true;
+				bool is_vol = (decl.is_pointer || decl.is_func_ptr)
+				    ? false : base_is_volatile;
+				if (is_vol) added->is_volatile = true;
 				if (is_ptr) added->is_ptr = true;
 				if ((decl.is_array || base_is_array) && !decl.is_pointer && !decl.is_func_ptr)
 					added->is_array = true;
@@ -3679,7 +3691,7 @@ static bool is_raw_strip_context(Token *after_raw) {
 }
 
 static bool has_effective_const_qual(Token *type_start, TypeSpecResult *type, DeclResult *decl) {
-	bool has_const_qual = (type->has_const && !decl->is_func_ptr) || decl->is_const;
+	bool has_const_qual = (type->has_const && !decl->is_func_ptr && !decl->is_pointer) || decl->is_const;
 	if (type->has_constexpr) has_const_qual = true;
 	if (type->has_typeof && !decl->is_func_ptr && !decl->is_pointer)
 		has_const_qual = true;
