@@ -3997,6 +3997,77 @@ static void test_sizeof_expr_paren_subscript(void) {
 	}
 }
 
+// sizeof(arr[1][n]) — multidimensional array subscript, NOT a VLA dimension.
+// The ']' from [1] must not be treated as a type predecessor for [n].
+static void test_sizeof_multidim_subscript_vla(void) {
+	printf("\n--- sizeof multidim subscript VLA hallucination ---\n");
+
+	// sizeof((a)[1][n]) — expression subscript chain, fixed-size result
+	{
+		const char *code =
+		    "int main(void) {\n"
+		    "    int arr[10][10];\n"
+		    "    int n = 5;\n"
+		    "    goto SKIP;\n"
+		    "    raw int x[sizeof((arr)[1][n])];\n"
+		    "SKIP:\n"
+		    "    (void)x;\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "mdim1.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "sizeof(arr[1][n]) must not cause VLA hallucination");
+		prism_free(&r);
+	}
+
+	// sizeof(int[3][n]) — type context multidim, IS genuine VLA
+	{
+		const char *code =
+		    "void f(int n) {\n"
+		    "    goto SKIP;\n"
+		    "    raw int x[sizeof(int[3][n])];\n"
+		    "SKIP:\n"
+		    "    (void)x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "mdim2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "sizeof(int[3][n]) IS VLA — goto must be rejected");
+		prism_free(&r);
+	}
+
+	// sizeof(arr[n]) — single subscript with variable index, not VLA
+	{
+		const char *code =
+		    "void f(int n) {\n"
+		    "    int arr[10];\n"
+		    "    goto SKIP;\n"
+		    "    raw int x[sizeof(arr[n])];\n"
+		    "SKIP:\n"
+		    "    (void)x; (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "mdim3.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "sizeof(arr[n]) must not cause VLA hallucination");
+		prism_free(&r);
+	}
+
+	// sizeof(ptr[0][1][n]) — triple subscript expression, not VLA
+	{
+		const char *code =
+		    "void f(int n) {\n"
+		    "    int arr[5][5][5];\n"
+		    "    goto SKIP;\n"
+		    "    raw int x[sizeof(arr[0][1][n])];\n"
+		    "SKIP:\n"
+		    "    (void)x; (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "mdim4.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "sizeof(arr[0][1][n]) must not cause VLA hallucination");
+		prism_free(&r);
+	}
+}
+
 static void test_case_label_ctrl_pending_leak(void) {
 	printf("\n--- case/default label p1d_ctrl_pending leak ---\n");
 
@@ -5225,6 +5296,9 @@ void run_safe_tests(void) {
 
         // sizeof expression-paren subscript VLA hallucination
         test_sizeof_expr_paren_subscript();
+
+        // sizeof multidim subscript VLA hallucination
+        test_sizeof_multidim_subscript_vla();
 
         // case/default label p1d_ctrl_pending leak
         test_case_label_ctrl_pending_leak();

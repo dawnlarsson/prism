@@ -296,7 +296,17 @@ static PRISM_THREAD_LOCAL Token *last_emitted = NULL;
 
 static PRISM_THREAD_LOCAL char out_buf[OUT_BUF_SIZE];
 static PRISM_THREAD_LOCAL int out_buf_pos = 0;
+static PRISM_THREAD_LOCAL int64_t out_total_flushed = 0;
 static PRISM_THREAD_LOCAL bool use_linemarkers = false; // true = GCC linemarker "# N", false = C99 "#line N"
+
+// Ring buffer tracking (absolute_byte_offset, token_pool_index) before each
+// emit_tok() call.  Used by the _Generic member-injection rewrite to rewind
+// the output buffer past an already-emitted member-access prefix.
+// Absolute offsets survive out_flush() boundary crossings.
+#define EMIT_SAVE_RING_SIZE 128
+#define EMIT_SAVE_RING_MASK (EMIT_SAVE_RING_SIZE - 1)
+static PRISM_THREAD_LOCAL struct { int64_t abs_pos; uint32_t tpi; } emit_save_ring[EMIT_SAVE_RING_SIZE];
+static PRISM_THREAD_LOCAL int emit_save_idx = 0;
 
 typedef struct {
 	bool pending;
@@ -405,6 +415,8 @@ static void reset_transpiler_state(void) {
 	ctrl_reset();
 	ctrl_save_depth = 0;
 	last_emitted = NULL;
+	emit_save_idx = 0;
+	out_total_flushed = 0;
 	current_func_idx = -1;
 	p1_typedef_annotated = false;
 	p1_file_has_orelse = false;
@@ -496,6 +508,7 @@ static bool dir_has_write_bits(const char *path) {
 static void out_flush(void) {
 	if (out_buf_pos > 0) {
 		fwrite(out_buf, 1, out_buf_pos, out_fp);
+		out_total_flushed += out_buf_pos;
 		out_buf_pos = 0;
 	}
 }
@@ -815,6 +828,11 @@ static bool __attribute__((noinline)) emit_tok_special(Token *tok) {
 }
 
 static void emit_tok(Token *tok) {
+	// Save pre-emission absolute output position for _Generic member-injection rewind.
+	emit_save_ring[emit_save_idx & EMIT_SAVE_RING_MASK] =
+		(typeof(emit_save_ring[0])){out_total_flushed + out_buf_pos, tok_idx(tok)};
+	emit_save_idx++;
+
 	TokenCold *c = tok_cold(tok);
 	File *f = (c->file_idx < (uint32_t)ctx->input_file_count)
 		  ? ctx->input_files[c->file_idx] : ctx->current_file;
@@ -1477,17 +1495,200 @@ static void emit_ret_type(void) {
 	}
 }
 
-// Try _Generic member rewrite: struct.strstr() → _Generic.
-// Returns the token after the rewrite (caller does tok = after; continue;)
-// or NULL if no rewrite was applicable.
+// _Generic member-injection rewrite: obj._Generic(sel, int: f(A)+1, float: f(B)+2)
+// → _Generic(sel, int: obj.f(A)+1, float: obj.f(B)+2)
+//
+// Instead of extracting a single representative target (which discards
+// trailing expressions), this emits the full _Generic with the member-access
+// prefix (obj. / obj->) injected into every association branch.
+//
+// Returns the token after the rewritten _Generic, or NULL if no rewrite.
 static Token *try_generic_member_rewrite(Token *tok) {
 	if (!last_emitted || !(last_emitted->tag & TT_MEMBER)) return NULL;
-	Token *name, *args_open, *args_close, *after;
-	if (!generic_member_rewrite_target(tok, &name, &args_open, &args_close, &after)) return NULL;
-	emit_tok(name);
-	emit_range(args_open, tok_next(args_close));
-	last_emitted = args_close;
-	return after;
+
+	Token *open = tok_next(tok);
+	if (!open || !match_ch(open, '(') || !tok_match(open)) return NULL;
+	Token *close = tok_match(open);
+	Token *assoc_start = generic_find_assoc_start(open);
+	if (!assoc_start) return NULL;
+
+	// --- Find the start of the postfix expression chain ---
+	// Walk backward from the member operator (. / ->) through the token
+	// pool, crossing matched brackets and chained member accesses.
+	Token *member_op = last_emitted;
+	uint32_t pi = tok_idx(member_op);
+	for (;;) {
+		if (pi == 0) break;
+		pi--;
+		Token *t = &token_pool[pi];
+		if (t->flags & TF_CLOSE) {
+			Token *m = tok_match(t);
+			if (m) pi = tok_idx(m); else break;
+			// Token before matched open: include ident (function name) or
+			// continue chain if preceded by another member operator.
+			if (pi > 0 && is_valid_varname(&token_pool[pi - 1])) {
+				pi--;
+				if (pi > 0 && (token_pool[pi - 1].tag & TT_MEMBER)) {
+					pi--;
+					continue;
+				}
+			} else if (pi > 0 && (token_pool[pi - 1].tag & TT_MEMBER)) {
+				pi--;
+				continue;
+			}
+			break;
+		}
+		if (is_valid_varname(t) || t->kind == TK_NUM || t->kind == TK_STR) {
+			if (pi > 0 && (token_pool[pi - 1].tag & TT_MEMBER)) {
+				pi--;
+				continue;
+			}
+			break;
+		}
+		// Unexpected token — don't include it in the chain.
+		pi++;
+		break;
+	}
+	uint32_t chain_start_pi = pi;
+
+	// --- Look up the absolute output position before chain_start was emitted ---
+	int64_t abs_rewind = -1;
+	for (int i = emit_save_idx - 1;
+	     i >= 0 && i >= emit_save_idx - EMIT_SAVE_RING_SIZE; i--) {
+		int ri = i & EMIT_SAVE_RING_MASK;
+		if (emit_save_ring[ri].tpi == chain_start_pi) {
+			abs_rewind = emit_save_ring[ri].abs_pos;
+			break;
+		}
+	}
+	if (abs_rewind < 0) return NULL;
+
+	// --- Capture the prefix text (e.g. "obj." / "ptr->") ---
+	// We copy it from the output buffer before rewinding.  The text includes
+	// all spacing / line directives that emit_tok produced — but we will
+	// re-inject using raw out_str for each branch to avoid duplicate #line
+	// directives.  Instead, build a clean, compact prefix from the tokens.
+	char prefix_buf[1024];
+	int prefix_len = 0;
+	for (uint32_t p = chain_start_pi; p <= tok_idx(member_op); p++) {
+		Token *pt = &token_pool[p];
+		if (prefix_len > 0 && (pt->flags & TF_HAS_SPACE) && prefix_len < (int)sizeof(prefix_buf) - 1)
+			prefix_buf[prefix_len++] = ' ';
+		int tl = pt->len;
+		if (prefix_len + tl > (int)sizeof(prefix_buf)) return NULL;  // prefix too large
+		memcpy(prefix_buf + prefix_len, tok_loc(pt), tl);
+		prefix_len += tl;
+	}
+
+	// --- Rewind output past the prefix ---
+	// If the target position is still in the current buffer, rewind in-place.
+	// If it was already flushed to disk, flush remaining data and fseek back.
+	if (abs_rewind >= out_total_flushed) {
+		out_buf_pos = (int)(abs_rewind - out_total_flushed);
+	} else {
+		out_flush();
+		if (fseek(out_fp, (long)abs_rewind, SEEK_SET) != 0) return NULL;
+		out_total_flushed = abs_rewind;
+		out_buf_pos = 0;
+	}
+
+	// Fix last_emitted to the token emitted just before the prefix chain.
+	last_emitted = (chain_start_pi > 0) ? &token_pool[chain_start_pi - 1] : NULL;
+
+	// --- Emit _Generic( ---
+	emit_tok(tok);   // _Generic
+	emit_tok(open);  // (
+
+	// --- Emit controlling expression (up to assoc_start) ---
+	for (Token *t = tok_next(open); t && t != assoc_start; t = tok_next(t)) {
+		if ((t->flags & TF_OPEN) && tok_match(t)) {
+			walk_balanced(t, true);
+			t = tok_match(t);
+			continue;
+		}
+		emit_tok(t);
+	}
+
+	// --- Emit each association, injecting prefix before targets ---
+	// For each branch value: inject prefix before every bracket-depth-0
+	// identifier that is followed by '(' (function call).  For branches
+	// that are a single bare identifier (no parens), inject before it.
+	int ternary = 0;
+	bool in_value = false;
+	bool val_has_call = false;   // current branch has ident+( at depth 0
+	bool val_bare_ident = false; // current branch is a single bare ident
+	for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
+		if ((t->flags & TF_OPEN) && tok_match(t)) {
+			walk_balanced(t, true);
+			t = tok_match(t);
+			continue;
+		}
+		if (match_ch(t, '?')) { ternary++; emit_tok(t); continue; }
+		if (match_ch(t, ':') && ternary > 0) { ternary--; emit_tok(t); continue; }
+		if (match_ch(t, ':') && ternary == 0) {
+			emit_tok(t);  // ':'
+			in_value = true;
+			// Pre-scan the branch value to decide injection strategy.
+			val_has_call = false;
+			val_bare_ident = false;
+			Token *vs = tok_next(t);
+			for (Token *s = vs; s && s != close; s = tok_next(s)) {
+				if ((s->flags & TF_OPEN) && tok_match(s))
+					{ s = tok_match(s); continue; }
+				if (match_ch(s, ',')) break;
+				if (is_valid_varname(s) && tok_next(s) &&
+				    match_ch(tok_next(s), '('))
+					{ val_has_call = true; break; }
+			}
+			if (!val_has_call && vs && is_valid_varname(vs)) {
+				Token *after_vs = tok_next(vs);
+				if (!after_vs || after_vs == close ||
+				    match_ch(after_vs, ','))
+					val_bare_ident = true;
+			}
+			continue;
+		}
+		if (match_ch(t, ',') && ternary == 0) {
+			in_value = false;
+			emit_tok(t);
+			continue;
+		}
+
+		// Injection point: prefix before depth-0 ident+( or bare ident.
+		// Skip identifiers preceded by a member operator (./->) — those are
+		// chained method calls (e.g. get_api()->fetch()) where only the FIRST
+		// call in the chain should receive the prefix.
+		bool inject = false;
+		if (in_value && is_valid_varname(t) &&
+		    !(last_emitted && (last_emitted->tag & TT_MEMBER))) {
+			if (val_has_call && tok_next(t) &&
+			    match_ch(tok_next(t), '('))
+				inject = true;
+			else if (val_bare_ident) {
+				inject = true;
+				val_bare_ident = false; // only once
+			}
+		}
+		if (inject) {
+			// Emit spacing (space or newline) that emit_tok would
+			// normally prepend, then the prefix, then the token text
+			// — no gap between prefix and identifier.
+			if (tok_at_bol(t)) out_char('\n');
+			else if ((t->flags & TF_HAS_SPACE) ||
+				 needs_space(last_emitted, t))
+				out_char(' ');
+			out_str(prefix_buf, prefix_len);
+			out_str(tok_loc(t), t->len);
+			last_emitted = t;
+		} else {
+			emit_tok(t);
+		}
+	}
+
+	// --- Emit closing ) ---
+	emit_tok(close);
+	last_emitted = close;
+	return tok_next(close);
 }
 
 // Zero-init declaration parsing helpers
@@ -7145,6 +7346,7 @@ static void p1_annotate_typedefs(void) {
 static int transpile_tokens(Token *tok, FILE *fp) {
 	out_fp = fp;
 	out_buf_pos = 0;
+	out_total_flushed = 0;
 
 	if (FEAT(F_FLATTEN)) {
 		emit_system_header_diag_push();

@@ -2443,9 +2443,28 @@ static inline bool is_array_bracket_predecessor(Token *t, Token *prev2) {
 	if (is_type_keyword(t) ||
 	    (t->tag & TT_QUALIFIER) ||
 	    (prev2 && (prev2->tag & TT_SUE)) ||
-	    (t->len == 1 && (t->ch0 == ']' || t->ch0 == '*')) ||
+	    (t->len == 1 && t->ch0 == '*') ||
 	    (t->len == 1 && t->ch0 == '}'))
 		return true;
+	// ']' is a type predecessor only for multi-dimensional array types
+	// like int[3][n], NOT for expression subscripts like arr[1][n].
+	// Disambiguate by checking what precedes the matching '['.
+	if (t->len == 1 && t->ch0 == ']') {
+		Token *open = tok_match(t);
+		if (!open) return true;
+		uint32_t oi = tok_idx(open);
+		if (oi == 0) return true;
+		Token *before_open = &token_pool[oi - 1];
+		if (is_type_keyword(before_open) ||
+		    (before_open->tag & (TT_TYPEOF | TT_QUALIFIER | TT_SUE)) ||
+		    (before_open->len == 1 && before_open->ch0 == '*') ||
+		    is_known_typedef(before_open))
+			return true;
+		// ']' before '[' — check if the outer ']' itself is in type context
+		if (before_open->len == 1 && before_open->ch0 == ']')
+			return is_array_bracket_predecessor(before_open, NULL);
+		return false;
+	}
 	// ')' is a type predecessor only for declarator parens like int (*)[n]
 	// or int (*ptr)[n], NOT for expression parens like sizeof((arr)[n]).
 	// Disambiguate by checking what precedes the matching '('.
@@ -3500,9 +3519,25 @@ static bool generic_member_rewrite_target(Token *generic_tok, Token **name_out,
 		if (!is_valid_varname(t) || !call_open || !match_ch(call_open, '(') || !tok_match(call_open))
 			continue;
 		if (params_look_like_decls(call_open)) continue;
-		*name_out = t;
-		*args_open_out = call_open;
-		*args_close_out = tok_match(call_open);
+		// Walk past member chains: ident(...).ident(...)->ident(...)
+		// Must match generic_has_distinct_targets' chain logic.
+		Token *chain_end_name = t;
+		Token *chain_end_open = call_open;
+		Token *chain_end_close = tok_match(call_open);
+		for (;;) {
+			Token *after_call = tok_next(chain_end_close);
+			if (!after_call || !(after_call->tag & TT_MEMBER)) break;
+			Token *next_id = tok_next(after_call);
+			if (!next_id || !is_valid_varname(next_id)) break;
+			Token *next_open = skip_noise(tok_next(next_id));
+			if (!next_open || !match_ch(next_open, '(') || !tok_match(next_open)) break;
+			chain_end_name = next_id;
+			chain_end_open = next_open;
+			chain_end_close = tok_match(next_open);
+		}
+		*name_out = t; // start of chain
+		*args_open_out = chain_end_open;
+		*args_close_out = chain_end_close;
 		*next_out = after;
 		return true;
 	}

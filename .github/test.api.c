@@ -6239,18 +6239,22 @@ static void test_generic_controlling_expr_mutilation(void) {
 // then finds handle_int( as the call target and emits obj.handle_int(42),
 // silently dropping the float branch and destroying type dispatch.
 static void test_generic_member_distinct_target_mutilation(void) {
+	// Distinct targets: injection rewrite injects obj. into each branch
 	const char *code =
 	    "struct D { int (*handle_int)(int); float (*handle_float)(float); };\n"
 	    "struct D obj;\n"
-	    "int r = obj._Generic((int)0, int: obj.handle_int(42), float: obj.handle_float(99));\n";
+	    "int r = obj._Generic((int)0, int: handle_int(42), float: handle_float(99));\n";
 	PrismResult r = prism_transpile_source(code, "generic_member.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK, "generic-member-mutilation: transpile succeeds");
 	if (r.output) {
-		// The _Generic must NOT be rewritten — branches target different members
-		CHECK(strstr(r.output, "handle_float") != NULL,
-		      "generic-member-mutilation: handle_float must survive (type dispatch not destroyed)");
+		CHECK(strstr(r.output, "obj.handle_int(42)") != NULL,
+		      "generic-member-mutilation: obj.handle_int(42) injected");
+		CHECK(strstr(r.output, "obj.handle_float(99)") != NULL,
+		      "generic-member-mutilation: obj.handle_float(99) injected");
 		CHECK(strstr(r.output, "_Generic") != NULL,
-		      "generic-member-mutilation: _Generic must be preserved (branches are distinct)");
+		      "generic-member-mutilation: _Generic preserved (injection rewrite)");
+		CHECK(strstr(r.output, "obj._Generic") == NULL,
+		      "generic-member-mutilation: obj._Generic removed (prefix moved inside)");
 	}
 	prism_free(&r);
 }
@@ -6258,6 +6262,8 @@ static void test_generic_member_distinct_target_mutilation(void) {
 // BUG103: ternary ':' inside _Generic association value confused with
 // association separator — falsely makes generic_has_distinct_targets()
 // return true, blocking member rewrite and leaking obj._Generic(...).
+// NOTE: injection-based rewrite preserves _Generic but injects the
+// member prefix (obj->) into every branch's function call targets.
 static void test_generic_ternary_colon_confusion(void) {
 	const char *code =
 	    "struct Obj { int type; };\n"
@@ -6274,9 +6280,14 @@ static void test_generic_ternary_colon_confusion(void) {
 		const char *body = strstr(r.output, "void test");
 		CHECK(body != NULL, "generic-ternary: test function found");
 		if (body) {
-			CHECK(strstr(body, "_Generic") == NULL,
-			      "generic-ternary: _Generic must be rewritten "
-			      "(ternary ':' must not block same-target rewrite)");
+			// Injection rewrite: _Generic is preserved, prefix injected
+			CHECK(strstr(body, "obj._Generic") == NULL,
+			      "generic-ternary: obj._Generic must not appear (prefix moved inside)");
+			CHECK(strstr(body, "obj.handle(42)") != NULL,
+			      "generic-ternary: obj.handle(42) injected in branch");
+			// Ternary structure must be preserved (not discarded)
+			CHECK(strstr(body, "cond ?") != NULL || strstr(body, "cond?") != NULL,
+			      "generic-ternary: ternary condition preserved");
 		}
 	}
 	prism_free(&r);
@@ -6443,7 +6454,7 @@ static void test_generic_same_name_different_args(void) {
 		}
 		prism_free(&r);
 	}
-	// Same function name, SAME arguments — rewrite is still valid
+	// Same function name, SAME arguments — injection rewrite fires
 	{
 		const char *code =
 		    "struct S { void (*log)(const char *); };\n"
@@ -6456,9 +6467,11 @@ static void test_generic_same_name_different_args(void) {
 		if (r.output) {
 			const char *fn = strstr(r.output, "void f");
 			if (fn) {
-				// rewrite SHOULD fire (same name + same args)
-				CHECK(strstr(fn, "_Generic") == NULL,
-				      "same-name-same-args: _Generic rewritten (same target & args)");
+				// Injection rewrite: _Generic preserved, prefix injected
+				CHECK(strstr(fn, "s->_Generic") == NULL,
+				      "same-name-same-args: s->_Generic removed (prefix moved inside)");
+				CHECK(strstr(fn, "s->log(\"msg\")") != NULL,
+				      "same-name-same-args: s->log(\"msg\") injected");
 			}
 		}
 		prism_free(&r);
@@ -6476,6 +6489,351 @@ static void test_generic_same_name_different_args(void) {
 		if (r.output) {
 			CHECK(strstr(r.output, "_Generic") != NULL,
 			      "diff-arg-count: _Generic preserved (arg count differs)");
+		}
+		prism_free(&r);
+	}
+}
+
+// _Generic member chain rewrite: chains like get_logger(1).log(42) must
+// preserve the entire chain, not just the last call.
+static void test_generic_member_chain_rewrite(void) {
+	printf("\n--- _Generic member chain rewrite ---\n");
+
+	// Factory pattern: get_logger(1).log(42) — full chain must survive
+	{
+		const char *code =
+		    "struct Logger { void (*log)(int); };\n"
+		    "struct Factory { struct Logger (*get_logger)(int); };\n"
+		    "int main(void) {\n"
+		    "    struct Factory obj;\n"
+		    "    obj._Generic(1,\n"
+		    "        int:   get_logger(1).log(42),\n"
+		    "        float: get_logger(1).log(42)\n"
+		    "    );\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gchain1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "chain-rewrite: transpile succeeds");
+		if (r.output) {
+			CHECK(strstr(r.output, "get_logger(1)") != NULL,
+			      "chain-rewrite: get_logger(1) preserved");
+			CHECK(strstr(r.output, "log(42)") != NULL,
+			      "chain-rewrite: .log(42) preserved");
+		}
+		prism_free(&r);
+	}
+
+	// Triple chain: a(1).b(2).c(3)
+	{
+		const char *code =
+		    "struct C { void (*c)(int); };\n"
+		    "struct B { struct C (*b)(int); };\n"
+		    "struct A { struct B (*a)(int); };\n"
+		    "void f(struct A obj) {\n"
+		    "    obj._Generic(1,\n"
+		    "        int:   a(1).b(2).c(3),\n"
+		    "        float: a(1).b(2).c(3)\n"
+		    "    );\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gchain2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "triple-chain: transpile succeeds");
+		if (r.output) {
+			CHECK(strstr(r.output, "a(1)") != NULL,
+			      "triple-chain: a(1) preserved");
+			CHECK(strstr(r.output, "c(3)") != NULL,
+			      "triple-chain: .c(3) preserved");
+		}
+		prism_free(&r);
+	}
+
+	// Simple (no chain) — regression: single call must still work
+	{
+		const char *code =
+		    "struct S { void (*log)(int); };\n"
+		    "void f(struct S *s) {\n"
+		    "    s->_Generic(1, int: log(42), float: log(42));\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gchain3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "simple-member: transpile succeeds");
+		if (r.output) {
+			CHECK(strstr(r.output, "s->log(42)") != NULL,
+			      "simple-member: s->log(42) injected");
+			CHECK(strstr(r.output, "s->_Generic") == NULL,
+			      "simple-member: s->_Generic removed (prefix inside)");
+		}
+		prism_free(&r);
+	}
+}
+
+// _Generic member injection must preserve trailing expressions.
+// Extraction approach discarded everything after the function call
+// in each branch (e.g., + 10, + 20 were permanently deleted).
+static void test_generic_member_injection_trailing_expr(void) {
+	printf("\n--- _Generic member injection: trailing expressions ---\n");
+
+	// Trailing arithmetic
+	{
+		const char *code =
+		    "struct M { int (*add)(int, int); };\n"
+		    "struct M m;\n"
+		    "int f(void) {\n"
+		    "    return m._Generic(1, int: add(1,2) + 10, float: add(1,2) + 20);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ginj_trail.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "inject-trailing: transpile succeeds");
+		if (r.output) {
+			CHECK(strstr(r.output, "m.add(1,2)") != NULL,
+			      "inject-trailing: m.add(1,2) injected");
+			CHECK(strstr(r.output, "+ 10") != NULL || strstr(r.output, "+10") != NULL,
+			      "inject-trailing: + 10 preserved (not discarded)");
+			CHECK(strstr(r.output, "+ 20") != NULL || strstr(r.output, "+20") != NULL,
+			      "inject-trailing: + 20 preserved (not discarded)");
+			CHECK(strstr(r.output, "m._Generic") == NULL,
+			      "inject-trailing: m._Generic removed from prefix");
+		}
+		prism_free(&r);
+	}
+
+	// Bare identifiers (GCC 15 C23 pattern: _Generic selects function name,
+	// call happens after the _Generic)
+	{
+		const char *code =
+		    "int __strstr_const(const char *, const char *);\n"
+		    "int __strstr_char(const char *, const char *);\n"
+		    "struct U { int (*fn)(const char *, const char *); };\n"
+		    "struct U u;\n"
+		    "int f(const char *s) {\n"
+		    "    return u._Generic(s,"
+		    " const char *: __strstr_const, char *: __strstr_char)(s, \"x\");\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ginj_bare.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "inject-bare: transpile succeeds");
+		if (r.output) {
+			CHECK(strstr(r.output, "u.__strstr_const") != NULL,
+			      "inject-bare: u.__strstr_const injected");
+			CHECK(strstr(r.output, "u.__strstr_char") != NULL,
+			      "inject-bare: u.__strstr_char injected");
+			CHECK(strstr(r.output, "(s, \"x\")") != NULL ||
+			      strstr(r.output, "(s,\"x\")") != NULL,
+			      "inject-bare: call arguments preserved");
+		}
+		prism_free(&r);
+	}
+
+	// Distinct targets with trailing expressions — both must be preserved
+	{
+		const char *code =
+		    "int add(int, int);\n"
+		    "int sub(int, int);\n"
+		    "struct V { int x; };\n"
+		    "struct V v;\n"
+		    "int f(void) {\n"
+		    "    return v._Generic(1,"
+		    " int: add(1,2) + 10, float: sub(3,4) + 20);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ginj_dist.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "inject-distinct: transpile succeeds");
+		if (r.output) {
+			CHECK(strstr(r.output, "v.add(1,2)") != NULL,
+			      "inject-distinct: v.add(1,2) injected");
+			CHECK(strstr(r.output, "v.sub(3,4)") != NULL,
+			      "inject-distinct: v.sub(3,4) injected");
+			CHECK(strstr(r.output, "+ 10") != NULL || strstr(r.output, "+10") != NULL,
+			      "inject-distinct: + 10 preserved");
+			CHECK(strstr(r.output, "+ 20") != NULL || strstr(r.output, "+20") != NULL,
+			      "inject-distinct: + 20 preserved");
+		}
+		prism_free(&r);
+	}
+
+	// Ternary inside branch — prefix injected before function calls,
+	// NOT before ternary condition variable
+	{
+		const char *code =
+		    "struct Obj { int type; };\n"
+		    "int handle(int x);\n"
+		    "void f(struct Obj obj, int cond) {\n"
+		    "    obj._Generic(obj.type,\n"
+		    "        int: cond ? handle(42) : handle(43),\n"
+		    "        default: handle(44)\n"
+		    "    );\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ginj_tern.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "inject-ternary: transpile succeeds");
+		if (r.output) {
+			const char *fn = strstr(r.output, "void f");
+			CHECK(fn != NULL, "inject-ternary: function found");
+			if (fn) {
+				CHECK(strstr(fn, "obj.handle(42)") != NULL,
+				      "inject-ternary: obj.handle(42) in true branch");
+				CHECK(strstr(fn, "obj.handle(43)") != NULL,
+				      "inject-ternary: obj.handle(43) in false branch");
+				CHECK(strstr(fn, "obj.handle(44)") != NULL,
+				      "inject-ternary: obj.handle(44) in default branch");
+				// cond must NOT be prefixed
+				CHECK(strstr(fn, "obj.cond") == NULL,
+				      "inject-ternary: cond NOT prefixed (not a call target)");
+			}
+		}
+		prism_free(&r);
+	}
+
+	// Arrow member to ensure -> prefix injection works
+	{
+		const char *code =
+		    "struct S { int (*log)(int); };\n"
+		    "void f(struct S *s) {\n"
+		    "    s->_Generic(1, int: log(42) * 2, float: log(42) * 3);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ginj_arrow.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "inject-arrow: transpile succeeds");
+		if (r.output) {
+			CHECK(strstr(r.output, "s->log(42)") != NULL,
+			      "inject-arrow: s->log(42) injected via -> prefix");
+			CHECK(strstr(r.output, "* 2") != NULL || strstr(r.output, "*2") != NULL,
+			      "inject-arrow: * 2 trailing expr preserved");
+			CHECK(strstr(r.output, "* 3") != NULL || strstr(r.output, "*3") != NULL,
+			      "inject-arrow: * 3 trailing expr preserved");
+		}
+		prism_free(&r);
+	}
+
+	// _Generic in declaration initializer (emit_decl_init_walk path)
+	{
+		const char *code =
+		    "struct S { int (*get)(int); };\n"
+		    "struct S s;\n"
+		    "int x = s._Generic(1, int: get(42) + 5, float: get(42) + 5);\n";
+		PrismResult r = prism_transpile_source(code, "ginj_decl.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "inject-decl: transpile succeeds");
+		if (r.output) {
+			CHECK(strstr(r.output, "s.get(42)") != NULL,
+			      "inject-decl: s.get(42) injected in decl init");
+			CHECK(strstr(r.output, "+ 5") != NULL || strstr(r.output, "+5") != NULL,
+			      "inject-decl: + 5 preserved in decl init");
+		}
+		prism_free(&r);
+	}
+}
+
+// _Generic member injection must work when the prefix chain crosses a
+// 128KB I/O buffer boundary (out_flush fires between obj and _Generic).
+// Ring buffer (pos, seq) pairs become invalid after flush, leaving
+// obj._Generic(...) in the output.
+static void test_generic_member_injection_flush_boundary(void) {
+	printf("\n--- _Generic member injection: flush boundary ---\n");
+
+	// Build a source with enough preamble to push the prefix near the
+	// 128KB boundary.  We generate ~130KB of inert declarations, then
+	// place the _Generic member rewrite.
+	size_t cap = 200000;
+	char *code = malloc(cap);
+	CHECK(code != NULL, "flush-boundary: malloc");
+	if (!code) return;
+	int n = 0;
+	n += snprintf(code + n, cap - n,
+	    "struct Logger { void (*log)(int); };\n");
+	// Generate filler to push total output past 128KB
+	for (int i = 0; i < 3000 && n < 135000; i++)
+		n += snprintf(code + n, cap - n,
+		    "int ____filler_variable_%04d;\n", i);
+	n += snprintf(code + n, cap - n,
+	    "struct Logger my_extremely_long_logger_object_name;\n"
+	    "void f(void) {\n"
+	    "    my_extremely_long_logger_object_name._Generic(1,\n"
+	    "        int: log(1), float: log(1));\n"
+	    "}\n");
+	PrismResult r = prism_transpile_source(code, "flush_bound.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "flush-boundary: transpile succeeds");
+	if (r.output) {
+		CHECK(strstr(r.output, "my_extremely_long_logger_object_name._Generic") == NULL,
+		      "flush-boundary: obj._Generic must not appear in output");
+		CHECK(strstr(r.output, "my_extremely_long_logger_object_name.log(1)") != NULL,
+		      "flush-boundary: prefix injected despite flush boundary");
+	}
+	prism_free(&r);
+	free(code);
+}
+
+// _Generic member injection must not multiply the prefix across method
+// chains.  In `int: get_api()->fetch()` only `get_api` gets the prefix,
+// not `fetch` (which is accessed via the returned object).
+static void test_generic_member_injection_chain_no_multiply(void) {
+	printf("\n--- _Generic member injection: chain no multiply ---\n");
+
+	// Simple chain: get_api()->fetch()
+	{
+		const char *code =
+		    "struct API { int (*fetch)(void); };\n"
+		    "struct Obj { struct API* (*get_api)(void); };\n"
+		    "void f(struct Obj o) {\n"
+		    "    o._Generic(1, int: get_api()->fetch(),\n"
+		    "                  float: get_api()->fetch());\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gchain_mult.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "chain-multiply: transpile succeeds");
+		if (r.output) {
+			const char *fn = strstr(r.output, "void f");
+			CHECK(fn != NULL, "chain-multiply: function found");
+			if (fn) {
+				CHECK(strstr(fn, "o.get_api()") != NULL,
+				      "chain-multiply: o.get_api() injected");
+				CHECK(strstr(fn, "o.fetch()") == NULL,
+				      "chain-multiply: o.fetch() must NOT appear "
+				      "(fetch is chained, not a direct member)");
+				CHECK(strstr(fn, "->fetch()") != NULL,
+				      "chain-multiply: ->fetch() preserved as chain call");
+			}
+		}
+		prism_free(&r);
+	}
+
+	// Ternary inside branch: both arms must EACH get the prefix
+	{
+		const char *code =
+		    "struct S { int (*compute)(int); };\n"
+		    "int f(struct S s, int cond) {\n"
+		    "    return s._Generic(1,\n"
+		    "        int: cond ? compute(10) : compute(20),\n"
+		    "        float: compute(30));\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gchain_tern.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "chain-ternary: transpile succeeds");
+		if (r.output) {
+			CHECK(strstr(r.output, "s.compute(10)") != NULL,
+			      "chain-ternary: s.compute(10) injected in true arm");
+			CHECK(strstr(r.output, "s.compute(20)") != NULL,
+			      "chain-ternary: s.compute(20) injected in false arm");
+			CHECK(strstr(r.output, "s.compute(30)") != NULL,
+			      "chain-ternary: s.compute(30) injected in float branch");
+			// cond must NOT be prefixed
+			CHECK(strstr(r.output, "s.cond") == NULL,
+			      "chain-ternary: cond NOT prefixed");
+		}
+		prism_free(&r);
+	}
+
+	// Mixed: chain + trailing expression
+	{
+		const char *code =
+		    "struct API { int (*fetch)(int); };\n"
+		    "struct Obj { struct API* (*get_api)(void); };\n"
+		    "int f(struct Obj o) {\n"
+		    "    return o._Generic(1,\n"
+		    "        int: get_api()->fetch(42) + 100,\n"
+		    "        float: get_api()->fetch(42) + 200);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gchain_trail.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "chain-trailing: transpile succeeds");
+		if (r.output) {
+			CHECK(strstr(r.output, "o.get_api()") != NULL,
+			      "chain-trailing: o.get_api() injected");
+			CHECK(strstr(r.output, "o.fetch(42)") == NULL,
+			      "chain-trailing: o.fetch() must NOT appear");
+			CHECK(strstr(r.output, "+ 100") != NULL || strstr(r.output, "+100") != NULL,
+			      "chain-trailing: + 100 preserved");
+			CHECK(strstr(r.output, "+ 200") != NULL || strstr(r.output, "+200") != NULL,
+			      "chain-trailing: + 200 preserved");
 		}
 		prism_free(&r);
 	}
@@ -7474,6 +7832,10 @@ void run_api_tests_4(void) {
 	test_generic_ternary_colon_confusion();
 	test_generic_nonident_target_fold();
 	test_generic_same_name_different_args();
+	test_generic_member_chain_rewrite();
+	test_generic_member_injection_trailing_expr();
+	test_generic_member_injection_flush_boundary();
+	test_generic_member_injection_chain_no_multiply();
 	test_collect_source_defines_conditional_guard_preserved();
 	test_cond_stack_deep_nesting_silent_drop();
 	test_defer_shadow_limit_dynamic();

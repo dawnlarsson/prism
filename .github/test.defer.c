@@ -1375,7 +1375,7 @@ static int _defer_sibling_goto_helper(void) {
 	}
 }
 
-void test_defer_sibling_goto_bug(void) {
+void test_defer_sibling_goto(void) {
 	int val = _defer_sibling_goto_helper();
 	CHECK_EQ(val, 10, "goto to sibling block emits source block defer");
 }
@@ -1394,12 +1394,12 @@ static int _defer_sibling_goto_multi_helper(void) {
 	}
 }
 
-void test_defer_sibling_goto_multi_bug(void) {
+void test_defer_sibling_goto_multi(void) {
 	int val = _defer_sibling_goto_multi_helper();
 	CHECK_EQ(val, 111, "goto to sibling block emits all source defers (LIFO)");
 }
 
-void test_defer_sibling_goto_lifo_bug(void) {
+void test_defer_sibling_goto_lifo(void) {
 	log_reset();
 	{
 		defer log_append("C");
@@ -1601,7 +1601,7 @@ void test_defer_computed_goto_rejected(void) {
 }
 
 static void test_computed_goto_forward_into_deferred_scope(void) {
-	/* BUG: computed goto (goto *ptr) forwards into a scope PAST its defer and
+	/* computed goto (goto *ptr) forwards into a scope PAST its defer and
 	 * zeroinit entries.  Phase 1 CFG verifier (p1_verify_cfg) only records a
 	 * P1K_GOTO entry when tok_next(goto_tok) is identifier-like.  For a
 	 * computed goto the next token is '*', so the goto is NEVER inserted into
@@ -1985,8 +1985,8 @@ static void test_scope_type_at_depth_overflow(void) {
 	free(path);
 }
 
-static void test_defer_void_parens_return_bug(void) {
-        printf("\n--- Void Function Return Parens Bug ---\n");
+static void test_defer_void_parens_return(void) {
+        printf("\n--- Void function return with parens ---\n");
 
         const char *code =
             "#include <stdio.h>\n"
@@ -2052,7 +2052,7 @@ static void test_fno_defer_shadow_leak(void) {
 	free(path);
 }
 
-static void test_defer_in_comma_expr_bug(void) {
+static void test_defer_in_comma_expr_rejected(void) {
         check_defer_transpile_rejects(
             "int main(void) { int x = (defer (void)0, 1); return x; }\n",
             "defer_in_comma_reject.c",
@@ -2061,7 +2061,7 @@ static void test_defer_in_comma_expr_bug(void) {
 }
 
 static void test_defer_varname_return_value_dropped(void) {
-	/* BUG: register_decl_shadows only shadows names matching
+	/* register_decl_shadows only shadows names matching
 	 * is_typedef_heuristic(), so 'int defer = 5;' does not register 'defer'
 	 * as a shadow.  In the return statement, handle_defer_keyword fires,
 	 * consuming 'defer' as the start of a deferred statement and emitting
@@ -2078,8 +2078,8 @@ static void test_defer_varname_return_value_dropped(void) {
 	prism_free(&r);
 }
 
-static void test_defer_label_duplication_bug(void) {
-	/* BUG: validate_defer_statement allows labeled statements inside
+static void test_defer_label_duplication_rejected(void) {
+	/* validate_defer_statement allows labeled statements inside
 	 * defer blocks.  When the defer body is copy-pasted to each exit
 	 * point (return, fall-through), any labels inside the block are
 	 * duplicated, causing the downstream C compiler to hard-fail with
@@ -2149,7 +2149,7 @@ static void test_defer_safe_shadow_no_exit(void) {
 }
 
 static void test_defer_shadow_struct_member_false_positive(void) {
-	/* BUG: check_defer_var_shadow matches identifiers by string alone,
+	/* check_defer_var_shadow matches identifiers by string alone,
 	 * without checking if the token follows a member-access operator
 	 * (. or ->).  If a defer body contains device->x (a struct member),
 	 * declaring 'int x' in an inner scope falsely triggers a shadow
@@ -2175,7 +2175,7 @@ static void test_defer_shadow_struct_member_false_positive(void) {
 }
 
 static void test_defer_shadow_overflow_silent_drop(void) {
-	/* BUG: register_decl_shadow silently drops entry #257 when the static
+	/* register_decl_shadow silently drops entry #257 when the static
 	 * defer_shadows[256] array is full.  If a break/continue only unwinds
 	 * defers that the dropped shadow refers to, check_defer_shadow_at_exit
 	 * cannot see the conflict and the transpiled code silently operates on
@@ -2215,7 +2215,7 @@ static void test_defer_shadow_overflow_silent_drop(void) {
 }
 
 static void test_defer_body_bare_orelse_return_not_rejected(void) {
-	/* BUG: validate_defer_statement calls skip_to_semicolon for statements
+	/* validate_defer_statement calls skip_to_semicolon for statements
 	 * that don't start with a keyword (like 'get() orelse return;'), so the
 	 * 'return' inside the bare-orelse action is never seen.
 	 * emit_deferred_range also has no bare-orelse processing.
@@ -2360,7 +2360,7 @@ void test_defer_shadow_in_for_init(void) {
 }
 
 static void test_cfg_hash_table_saturation_bypass(void) {
-	// BUG: p1_verify_cfg's label hash table is capped at 8192 slots.
+	// p1_verify_cfg's label hash table is capped at 8192 slots.
 	// When a function has >8192 labels, late-inserted labels are silently
 	// dropped (open-addressing probe exhausts without finding empty slot).
 	// A backward goto to a dropped label gets li=-1, misclassified as
@@ -2404,7 +2404,7 @@ static void test_cfg_hash_table_saturation_bypass(void) {
 }
 
 static void test_defer_fnptr_return_type_overwrite(void) {
-	/* BUG: capture_function_return_type is called on every type token at
+	/* capture_function_return_type is called on every type token at
 	   block_depth 0. For void (*signal_fn(int, void(*func)(int)))(int),
 	   the 'void' in the func parameter re-triggers capture and overwrites
 	   the correct return type with a broken one (no suffix). The defer
@@ -2428,7 +2428,7 @@ static void test_defer_fnptr_return_type_overwrite(void) {
 }
 
 static void test_braceless_switch_defer_false_positive(void) {
-	/* BUG: braceless switch (no braces around body) had no P1K_SWITCH entry,
+	/* braceless switch (no braces around body) had no P1K_SWITCH entry,
 	   so case/default labels saw sw_sid=0, causing ALL preceding defers in
 	   the function to be flagged as "skipped by switch fallthrough". */
 	PrismResult r = prism_transpile_source(
@@ -2452,7 +2452,7 @@ static void test_braceless_switch_defer_false_positive(void) {
 	prism_free(&r);
 }
 
-// BUG: braceless inner switch's case label triggers handle_case_default
+// Braceless inner switch's case label triggers handle_case_default
 // which calls find_switch_scope → finds enclosing BRACED switch (the only
 // one with a SCOPE_BLOCK), and incorrectly resets the defer stack for that
 // outer switch, silently dropping defers registered between the outer case
@@ -2551,7 +2551,7 @@ static void test_defer_in_generic_stmt_expr(void) {
 }
 
 static void test_defer_user_noreturn_no_warning(void) {
-	/* BUG: Prism detects hardcoded noreturn functions (abort, exit, _Exit,
+	/* Prism detects hardcoded noreturn functions (abort, exit, _Exit,
 	 * quick_exit, thrd_exit, __builtin_trap, __builtin_unreachable) via
 	 * TT_NORETURN_FN and warns when they're called with active defers.
 	 * But user-defined noreturn functions declared with _Noreturn,
@@ -3015,7 +3015,7 @@ static void test_defer_stmt_expr_double_nested_block_bypass(void) {
 static void test_c23_attr_computed_goto_defer_bypass(void) {
 	printf("\n--- C23 attributed computed goto defer bypass ---\n");
 
-	/* BUG: goto [[gnu::nomerge]] *ptr; bypasses computed goto detection in
+	/* goto [[gnu::nomerge]] *ptr; bypasses computed goto detection in
 	 * BOTH Phase 1D (has_computed_goto flag) and Pass 2 (handle_goto_keyword).
 	 *
 	 * Phase 1D checks:  tok_next(goto) == '*'  → match_ch fails on '['
@@ -3102,7 +3102,7 @@ static void test_c23_attr_computed_goto_defer_bypass(void) {
 	}
 }
 
-/* BUG: validate_defer_statement's catch-all loop only detected GNU statement
+/* validate_defer_statement's catch-all loop only detected GNU statement
  * expressions ({...}) when '(' was immediately followed by '{'.  A stmt-expr
  * nested inside function arguments, array indices, _Generic, or arithmetic
  * (e.g. printf("%d", ({return;0;}))) was invisible because the outer '('
@@ -3378,7 +3378,7 @@ static void test_compound_literal_ctrl_state_desync(void) {
 static void test_defer_shadow_stmt_expr_bypass(void) {
 	printf("\n--- Defer shadow stmt-expr init bypass ---\n");
 
-	// BUG: try_zero_init_decl returns NULL for single-declarator
+	// try_zero_init_decl returns NULL for single-declarator
 	// statement-expression initializers (int x = ({...});).  This bypasses
 	// process_declarators and thus check_defer_var_shadow.  The inner
 	// 'target' silently hijacks the name captured by the outer defer.
@@ -4413,8 +4413,8 @@ static void test_defer_shadow_for_init_false_positive(void) {
 }
 
 static void test_defer_vfork_member_no_reject(void) {
-	printf("\n--- BUG: vfork member namespace pollution ---\n");
-	// BUG: struct member named 'vfork' falsely taints the function body,
+	printf("\n--- vfork member namespace pollution ---\n");
+	// struct member named 'vfork' falsely taints the function body,
 	// causing "defer cannot be used in functions that call vfork()" error.
 	// The vfork body scan in parse.c tagged TT_NORETURN_FN on the body '{'
 	// when it found 'vfork' without checking for member-access predecessor.
@@ -4453,7 +4453,7 @@ static void test_defer_vfork_member_no_reject(void) {
 }
 
 static void test_defer_shadow_braceless_for_ifelse(void) {
-	printf("\n--- BUG: braceless for-body if/else shadow false positive ---\n");
+	printf("\n--- braceless for-body if/else shadow false positive ---\n");
 
 	// Sub-test 1: if/else inside braceless for body
 	// The semicolon after the if-branch must NOT clear for_name_hid.
@@ -4884,9 +4884,442 @@ static void test_braceless_switch_defer_wipe(void) {
 	}
 }
 
+// Noreturn in braceless if(0) inside defer: __builtin_unreachable must not leak
+static void test_defer_braceless_noreturn_unreachable_leak(void) {
+	printf("\n--- unreachable in braceless ctrl-flow defer ---\n");
+	// noreturn call in braceless if(0) inside defer body:
+	// __builtin_unreachable() must NOT appear outside the if-body
+	PrismResult r = prism_transpile_source(
+	    "_Noreturn void die(void);\n"
+	    "void f(void) {\n"
+	    "    defer {\n"
+	    "        if (0)\n"
+	    "            die();\n"
+	    "    }\n"
+	    "}\n",
+	    "t82_braceless.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "transpiles OK");
+	if (r.status == PRISM_OK && r.output) {
+		const char *fn = strstr(r.output, "void f(");
+		CHECK(fn != NULL, "function found");
+		if (fn)
+			CHECK(strstr(fn, "__builtin_unreachable") == NULL &&
+			      strstr(fn, "__assume") == NULL,
+			      "no unreachable leak outside braceless if");
+	}
+	prism_free(&r);
+
+	// Top-level noreturn in defer body SHOULD still get unreachable
+	r = prism_transpile_source(
+	    "_Noreturn void die(void);\n"
+	    "void f(void) {\n"
+	    "    defer { die(); }\n"
+	    "}\n",
+	    "t82_toplevel.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "transpiles OK");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "__builtin_unreachable") != NULL ||
+		      strstr(r.output, "__assume") != NULL,
+		      "unreachable injected at top level");
+	}
+	prism_free(&r);
+}
+
+// Braceless ctrl-flow inside defer: multi-stmt expansion must be brace-wrapped
+static void test_defer_braceless_ctrl_brace_wrap(void) {
+	printf("\n--- braceless ctrl-flow brace_wrap in defer ---\n");
+	// typeof zeroinit in braceless if inside defer: memset must be inside braces
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    defer {\n"
+		    "        if (1)\n"
+		    "            typeof(int) x;\n"
+		    "        (void)0;\n"
+		    "    }\n"
+		    "}\n",
+		    "t85_typeof_if.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(strstr(r.output, "if (1) {") != NULL ||
+			      strstr(r.output, "if (1){") != NULL,
+			      "braceless if body wrapped in braces");
+			CHECK(has_zeroing(r.output),
+			      "memset generated");
+		}
+		prism_free(&r);
+	}
+	// typeof zeroinit in braceless for inside defer
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    defer {\n"
+		    "        for (int i = 0; i < 1; i++)\n"
+		    "            typeof(int) x;\n"
+		    "    }\n"
+		    "}\n",
+		    "t85_typeof_for.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			const char *fn = strstr(r.output, "void f(");
+			CHECK(fn != NULL, "function found");
+			if (fn) {
+				CHECK(has_zeroing(fn),
+				      "memset generated");
+			}
+		}
+		prism_free(&r);
+	}
+	// typeof zeroinit in braceless else inside defer
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    defer {\n"
+		    "        if (0) (void)0;\n"
+		    "        else\n"
+		    "            typeof(int) x;\n"
+		    "    }\n"
+		    "}\n",
+		    "t85_typeof_else.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(has_zeroing(r.output),
+			      "memset generated");
+		}
+		prism_free(&r);
+	}
+	// orelse decl in braceless if inside defer: multi-stmt must be wrapped
+	{
+		PrismResult r = prism_transpile_source(
+		    "int *get_null(void);\n"
+		    "void f(void) {\n"
+		    "    defer {\n"
+		    "        if (1)\n"
+		    "            int *p = get_null() orelse 0;\n"
+		    "    }\n"
+		    "}\n",
+		    "t85_orelse_if.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			const char *fn = strstr(r.output, "void f(");
+			CHECK(fn != NULL, "function found");
+			if (fn) {
+				CHECK(strstr(fn, "orelse") == NULL,
+				      "no literal orelse");
+				CHECK(strstr(fn, "if (1) {") != NULL ||
+				      strstr(fn, "if (1){") != NULL,
+				      "braceless body wrapped in braces");
+			}
+		}
+		prism_free(&r);
+	}
+}
+
+// Orelse block body: ctrl-flow keyword tracking for braceless sub-bodies
+static void test_orelse_block_braceless_ctrl_zeroinit(void) {
+	printf("\n--- ctrl-flow in orelse block body ---\n");
+	// typeof zeroinit in braceless if inside orelse block
+	{
+		PrismResult r = prism_transpile_source(
+		    "int *get_null(void);\n"
+		    "void f(void) {\n"
+		    "    int *p = get_null() orelse {\n"
+		    "        if (1)\n"
+		    "            typeof(int) x;\n"
+		    "        return;\n"
+		    "    };\n"
+		    "}\n",
+		    "t85b_typeof_if.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			const char *fn = strstr(r.output, "void f(");
+			CHECK(fn != NULL, "function found");
+			if (fn) {
+				CHECK(has_zeroing(fn),
+				      "memset generated for typeof");
+			}
+		}
+		prism_free(&r);
+	}
+	// orelse in braceless while inside orelse block
+	{
+		PrismResult r = prism_transpile_source(
+		    "int f(int *p);\n"
+		    "void g(void) {\n"
+		    "    int *q = (int*)(0) orelse {\n"
+		    "        while (0)\n"
+		    "            typeof(int) y;\n"
+		    "        return;\n"
+		    "    };\n"
+		    "    (void)q;\n"
+		    "}\n",
+		    "t85b_while.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "transpiles OK");
+		if (r.status == PRISM_OK && r.output) {
+			const char *fn = strstr(r.output, "void g(");
+			CHECK(fn != NULL, "function found");
+			if (fn) {
+				CHECK(has_zeroing(fn),
+				      "memset generated");
+			}
+		}
+		prism_free(&r);
+	}
+}
+
+// Vfork taint propagation through function pointer chains
+static void test_defer_vfork_taint_funcptr_chain(void) {
+	printf("\n--- Taint propagation: non-wrapper fp chain ---\n");
+	const char *code =
+	    "#include <unistd.h>\n"
+	    "void f0(void) { vfork(); }\n"
+	    "void f1(void) { void (*fp)(void) = f0; fp(); }\n"
+	    "void f2(void) { void (*fp)(void) = f1; fp(); }\n"
+	    "void f3(void) {\n"
+	    "    defer { (void)0; }\n"
+	    "    f2();\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "taint_fp_chain.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "taint-fp-chain: deep non-wrapper vfork chain must be rejected");
+	CHECK(r.error_msg && strstr(r.error_msg, "vfork"),
+	      "taint-fp-chain: error mentions vfork");
+	prism_free(&r);
+}
+
+// C23 [[...]] attribute on return type must not be consumed into typedef
+static void test_defer_c23_attr_return_type_typedef(void) {
+	const char *code =
+	    "void cleanup(void);\n"
+	    "int (*get_array(void))[3] [[gnu::noinline]] {\n"
+	    "    static int arr[3] = {1, 2, 3};\n"
+	    "    defer cleanup();\n"
+	    "    return &arr;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "c23_attr_ret.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "c23-attr-ret: transpiles OK");
+	CHECK(r.output != NULL, "c23-attr-ret: output not NULL");
+	const char *td = r.output ? strstr(r.output, "typedef") : NULL;
+	CHECK(td != NULL, "c23-attr-ret: must emit typedef");
+	const char *td_semi = td ? strchr(td, ';') : NULL;
+	bool has_attr = false;
+	if (td && td_semi) {
+		for (const char *p = td; p < td_semi; p++) {
+			if (memcmp(p, "noinline", 8) == 0) { has_attr = true; break; }
+		}
+	}
+	CHECK(!has_attr,
+	      "c23-attr-ret: typedef must not contain [[gnu::noinline]]");
+	prism_free(&r);
+}
+
+// Orelse in stmt-expr inside ctrl-flow condition inside defer body
+static void test_defer_orelse_in_stmtexpr_ctrl_condition(void) {
+	printf("\n--- orelse in stmt-expr ctrl-flow condition in defer ---\n");
+	{
+		const char *code =
+		    "int get(void);\n"
+		    "void f(void) {\n"
+		    "    defer {\n"
+		    "        if (({ int x = get() orelse 1; x; })) {\n"
+		    "            (void)0;\n"
+		    "        }\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "dr_stmtexpr1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "stmt-expr-in-defer-if: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "stmt-expr-in-defer-if: no raw orelse in output");
+		}
+		prism_free(&r);
+	}
+	// while variant
+	{
+		const char *code =
+		    "int get(void);\n"
+		    "void f(void) {\n"
+		    "    defer {\n"
+		    "        while (({ int x = get() orelse 0; x; })) {\n"
+		    "            break;\n"
+		    "        }\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "dr_stmtexpr2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "stmt-expr-in-defer-while: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "stmt-expr-in-defer-while: no raw orelse in output");
+		}
+		prism_free(&r);
+	}
+	// orelse in stmt-expr in ctrl-flow inside orelse block body
+	{
+		const char *code =
+		    "int get(void);\n"
+		    "int f(void) {\n"
+		    "    int result = get() orelse {\n"
+		    "        if (({ int x = get() orelse 1; x; })) {\n"
+		    "            return 1;\n"
+		    "        }\n"
+		    "        return 0;\n"
+		    "    };\n"
+		    "    return result;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bb_stmtexpr1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "stmt-expr-in-orelse-block-if: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "stmt-expr-in-orelse-block-if: no raw orelse in output");
+		}
+		prism_free(&r);
+	}
+}
+
+// Zeroinit in for-init declarations inside defer/orelse block bodies
+static void test_defer_zeroinit_for_init_ctrl_flow(void) {
+	printf("\n--- zeroinit in ctrl-flow conditions inside defer/orelse ---\n");
+	// for-init inside defer
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    defer {\n"
+		    "        for (int uninit_var;;) {\n"
+		    "            break;\n"
+		    "        }\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "zi_forinit_defer.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "zeroinit-for-defer: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "uninit_var = 0") != NULL,
+			      "zeroinit-for-defer: for-init var zero-initialized");
+		}
+		prism_free(&r);
+	}
+	// for-init inside orelse block body
+	{
+		const char *code =
+		    "int get(void);\n"
+		    "int f(void) {\n"
+		    "    int result = get() orelse {\n"
+		    "        for (int uninit_var;;) {\n"
+		    "            break;\n"
+		    "        }\n"
+		    "        return 0;\n"
+		    "    };\n"
+		    "    return result;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "zi_forinit_orelse.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "zeroinit-for-orelse-block: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "uninit_var = 0") != NULL,
+			      "zeroinit-for-orelse-block: for-init var zero-initialized");
+		}
+		prism_free(&r);
+	}
+	// while condition with stmt-expr containing zeroinit
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    defer {\n"
+		    "        while (({ int x = 0; x; })) {\n"
+		    "            break;\n"
+		    "        }\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "zi_while_defer.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "zeroinit-while-stmtexpr: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "zeroinit-while-stmtexpr: no raw orelse leaked");
+		}
+		prism_free(&r);
+	}
+}
+
+// Initializer braces must not inflate block_depth (SCOPE_INIT tracking)
+static void test_defer_scope_init_block_depth_desync(void) {
+	printf("\n--- SCOPE_INIT block_depth desync ---\n");
+	// goto inside stmt-expr in initializer brace, with active defer
+	{
+		PrismFeatures opts = prism_defaults();
+		opts.zeroinit = false;
+		const char *code =
+		    "int flag;\n"
+		    "int f(void) {\n"
+		    "    {\n"
+		    "        defer flag = 1;\n"
+		    "        int x = { ({ goto L; 0; }) };\n"
+		    "    }\n"
+		    "L:\n"
+		    "    return flag;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "scope_init1.c", opts);
+		CHECK_EQ(r.status, PRISM_OK, "scope-init-desync: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "flag = 1") != NULL,
+			      "scope-init-desync: defer cleanup emitted before goto");
+		}
+		prism_free(&r);
+	}
+	// Same test with zeroinit ON — must also work (regression guard)
+	{
+		const char *code =
+		    "int flag;\n"
+		    "int f(void) {\n"
+		    "    {\n"
+		    "        defer flag = 1;\n"
+		    "        int x = { ({ goto L; 0; }) };\n"
+		    "    }\n"
+		    "L:\n"
+		    "    return flag;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "scope_init2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "scope-init-zeroinit-on: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "flag = 1") != NULL,
+			      "scope-init-zeroinit-on: defer cleanup emitted before goto");
+		}
+		prism_free(&r);
+	}
+	// Nested initializer braces — multiple levels of = { { ... } }
+	{
+		PrismFeatures opts = prism_defaults();
+		opts.zeroinit = false;
+		const char *code =
+		    "typedef struct { int a[2]; } S;\n"
+		    "int flag;\n"
+		    "int f(void) {\n"
+		    "    {\n"
+		    "        defer flag = 1;\n"
+		    "        S s = { { ({ goto L; 0; }), 0 } };\n"
+		    "    }\n"
+		    "L:\n"
+		    "    return flag;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "scope_init3.c", opts);
+		CHECK_EQ(r.status, PRISM_OK, "scope-init-nested: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "flag = 1") != NULL,
+			      "scope-init-nested: defer cleanup with nested init braces");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
-        test_defer_in_comma_expr_bug();
+        test_defer_in_comma_expr_rejected();
 
 	test_defer_basic();
 	test_defer_lifo();
@@ -4979,9 +5412,9 @@ void run_defer_tests(void) {
 	test_switch_loop_switch();
 	test_triple_nested_switch_return();
 
-	test_defer_sibling_goto_bug();
-	test_defer_sibling_goto_multi_bug();
-	test_defer_sibling_goto_lifo_bug();
+	test_defer_sibling_goto();
+	test_defer_sibling_goto_multi();
+	test_defer_sibling_goto_lifo();
 	test_defer_cross_branch_goto_nested();
 
 	test_defer_goto_forward();
@@ -5015,10 +5448,10 @@ void run_defer_tests(void) {
 	test_braceless_body_semicolon_trap();
 	test_scope_type_at_depth_overflow();
 	test_fno_defer_shadow_leak();
-        test_defer_void_parens_return_bug();
+        test_defer_void_parens_return();
 	test_defer_varname_return_value_dropped();
 	test_defer_body_bare_orelse_return_not_rejected();
-	test_defer_label_duplication_bug();
+	test_defer_label_duplication_rejected();
 	test_defer_variable_shadowing_binds_wrong_scope();
 	test_defer_safe_shadow_no_exit();
 	test_defer_shadow_struct_member_false_positive();
@@ -5135,10 +5568,10 @@ void run_defer_tests(void) {
 	// same-block defer shadow hijack (silent miscompilation)
 	test_defer_same_block_shadow_hijack();
 
-	// BUG: vfork member namespace pollution (os.vfork() / p->vfork())
+	// vfork member namespace: os.vfork() / p->vfork() must not be rejected
 	test_defer_vfork_member_no_reject();
 
-	// BUG: braceless for-body if/else and do/while prematurely clears for_name_hid
+	// braceless for-body if/else and do/while prematurely clears for_name_hid
 	test_defer_shadow_braceless_for_ifelse();
 
 	// scope_depth/block_depth type confusion over-unwinds defers
@@ -5150,222 +5583,10 @@ void run_defer_tests(void) {
 	// braceless ctrl-flow in defer body — orelse/zeroinit not processed
 	test_defer_braceless_ctrl_orelse();
 
-	// __builtin_unreachable() leaks outside braceless if-body in defer
-	{
-		printf("\n--- unreachable in braceless ctrl-flow defer ---\n");
-		// noreturn call in braceless if(0) inside defer body:
-		// __builtin_unreachable() must NOT appear outside the if-body
-		PrismResult r = prism_transpile_source(
-		    "_Noreturn void die(void);\n"
-		    "void f(void) {\n"
-		    "    defer {\n"
-		    "        if (0)\n"
-		    "            die();\n"
-		    "    }\n"
-		    "}\n",
-		    "t82_braceless.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		         "transpiles OK");
-		if (r.status == PRISM_OK && r.output) {
-			// The output should NOT contain __builtin_unreachable
-			// because the noreturn call is in a braceless body
-			// and emit_deferred_range cannot inject scope braces.
-			const char *fn = strstr(r.output, "void f(");
-			CHECK(fn != NULL, "function found");
-			if (fn)
-				CHECK(strstr(fn, "__builtin_unreachable") == NULL &&
-				      strstr(fn, "__assume") == NULL,
-				      "no unreachable leak outside braceless if");
-		}
-		prism_free(&r);
-
-		// Top-level noreturn in defer body SHOULD still get unreachable
-		r = prism_transpile_source(
-		    "_Noreturn void die(void);\n"
-		    "void f(void) {\n"
-		    "    defer { die(); }\n"
-		    "}\n",
-		    "t82_toplevel.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		         "transpiles OK");
-		if (r.status == PRISM_OK && r.output) {
-			CHECK(strstr(r.output, "__builtin_unreachable") != NULL ||
-			      strstr(r.output, "__assume") != NULL,
-			      "unreachable injected at top level");
-		}
-		prism_free(&r);
-	}
-
-	// braceless ctrl-flow in defer body missing brace_wrap for multi-stmt expansion
-	{
-		printf("\n--- braceless ctrl-flow brace_wrap in defer ---\n");
-		// typeof zeroinit in braceless if inside defer: memset must be inside braces
-		{
-			PrismResult r = prism_transpile_source(
-			    "void f(void) {\n"
-			    "    defer {\n"
-			    "        if (1)\n"
-			    "            typeof(int) x;\n"
-			    "        (void)0;\n"
-			    "    }\n"
-			    "}\n",
-			    "t85_typeof_if.c", prism_defaults());
-			CHECK_EQ(r.status, PRISM_OK,
-			         "transpiles OK");
-			if (r.status == PRISM_OK && r.output) {
-				// The memset MUST be inside braces with the declaration
-				CHECK(strstr(r.output, "if (1) {") != NULL ||
-				      strstr(r.output, "if (1){") != NULL,
-				      "braceless if body wrapped in braces");
-				CHECK(has_zeroing(r.output),
-				      "memset generated");
-			}
-			prism_free(&r);
-		}
-		// typeof zeroinit in braceless for inside defer
-		{
-			PrismResult r = prism_transpile_source(
-			    "void f(void) {\n"
-			    "    defer {\n"
-			    "        for (int i = 0; i < 1; i++)\n"
-			    "            typeof(int) x;\n"
-			    "    }\n"
-			    "}\n",
-			    "t85_typeof_for.c", prism_defaults());
-			CHECK_EQ(r.status, PRISM_OK,
-			         "transpiles OK");
-			if (r.status == PRISM_OK && r.output) {
-				const char *fn = strstr(r.output, "void f(");
-				CHECK(fn != NULL, "function found");
-				if (fn) {
-					CHECK(has_zeroing(fn),
-					      "memset generated");
-				}
-			}
-			prism_free(&r);
-		}
-		// typeof zeroinit in braceless else inside defer
-		{
-			PrismResult r = prism_transpile_source(
-			    "void f(void) {\n"
-			    "    defer {\n"
-			    "        if (0) (void)0;\n"
-			    "        else\n"
-			    "            typeof(int) x;\n"
-			    "    }\n"
-			    "}\n",
-			    "t85_typeof_else.c", prism_defaults());
-			CHECK_EQ(r.status, PRISM_OK,
-			         "transpiles OK");
-			if (r.status == PRISM_OK && r.output) {
-				CHECK(has_zeroing(r.output),
-				      "memset generated");
-			}
-			prism_free(&r);
-		}
-		// orelse decl in braceless if inside defer: multi-stmt must be wrapped
-		{
-			PrismResult r = prism_transpile_source(
-			    "int *get_null(void);\n"
-			    "void f(void) {\n"
-			    "    defer {\n"
-			    "        if (1)\n"
-			    "            int *p = get_null() orelse 0;\n"
-			    "    }\n"
-			    "}\n",
-			    "t85_orelse_if.c", prism_defaults());
-			CHECK_EQ(r.status, PRISM_OK,
-			         "transpiles OK");
-			if (r.status == PRISM_OK && r.output) {
-				const char *fn = strstr(r.output, "void f(");
-				CHECK(fn != NULL, "function found");
-				if (fn) {
-					CHECK(strstr(fn, "orelse") == NULL,
-					      "no literal orelse");
-					// Must have brace wrap for multi-stmt expansion
-					CHECK(strstr(fn, "if (1) {") != NULL ||
-					      strstr(fn, "if (1){") != NULL,
-					      "braceless body wrapped in braces");
-				}
-			}
-			prism_free(&r);
-		}
-	}
-
-	// orelse block mini-loop missing ctrl-flow keyword tracking
-	{
-		printf("\n--- ctrl-flow in orelse block body ---\n");
-		// typeof zeroinit in braceless if inside orelse block
-		{
-			PrismResult r = prism_transpile_source(
-			    "int *get_null(void);\n"
-			    "void f(void) {\n"
-			    "    int *p = get_null() orelse {\n"
-			    "        if (1)\n"
-			    "            typeof(int) x;\n"
-			    "        return;\n"
-			    "    };\n"
-			    "}\n",
-			    "t85b_typeof_if.c", prism_defaults());
-			CHECK_EQ(r.status, PRISM_OK,
-			         "transpiles OK");
-			if (r.status == PRISM_OK && r.output) {
-				const char *fn = strstr(r.output, "void f(");
-				CHECK(fn != NULL, "function found");
-				if (fn) {
-					CHECK(has_zeroing(fn),
-					      "memset generated for typeof");
-				}
-			}
-			prism_free(&r);
-		}
-		// orelse in braceless while inside orelse block
-		{
-			PrismResult r = prism_transpile_source(
-			    "int f(int *p);\n"
-			    "void g(void) {\n"
-			    "    int *q = (int*)(0) orelse {\n"
-			    "        while (0)\n"
-			    "            typeof(int) y;\n"
-			    "        return;\n"
-			    "    };\n"
-			    "    (void)q;\n"
-			    "}\n",
-			    "t85b_while.c", prism_defaults());
-			CHECK_EQ(r.status, PRISM_OK,
-			         "transpiles OK");
-			if (r.status == PRISM_OK && r.output) {
-				const char *fn = strstr(r.output, "void g(");
-				CHECK(fn != NULL, "function found");
-				if (fn) {
-					CHECK(has_zeroing(fn),
-					      "memset generated");
-				}
-			}
-			prism_free(&r);
-		}
-	}
-
-	// Taint propagation: non-wrapper deep chain via function pointer assignment
-	{
-		printf("\n--- Taint propagation: non-wrapper fp chain ---\n");
-		// Depth-3 chain where each function assigns the previous to a fp
-		const char *code =
-		    "#include <unistd.h>\n"
-		    "void f0(void) { vfork(); }\n"
-		    "void f1(void) { void (*fp)(void) = f0; fp(); }\n"
-		    "void f2(void) { void (*fp)(void) = f1; fp(); }\n"
-		    "void f3(void) {\n"
-		    "    defer { (void)0; }\n"
-		    "    f2();\n"
-		    "}\n";
-		PrismResult r = prism_transpile_source(code, "taint_fp_chain.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "taint-fp-chain: deep non-wrapper vfork chain must be rejected");
-		CHECK(r.error_msg && strstr(r.error_msg, "vfork"),
-		      "taint-fp-chain: error mentions vfork");
-		prism_free(&r);
-	}
+	test_defer_braceless_noreturn_unreachable_leak();
+	test_defer_braceless_ctrl_brace_wrap();
+	test_orelse_block_braceless_ctrl_zeroinit();
+	UNIX_ONLY(test_defer_vfork_taint_funcptr_chain());
 
 	// shadowed 'defer' keyword suppression
 	test_defer_shadow_variable_block();
@@ -5374,236 +5595,8 @@ void run_defer_tests(void) {
 	// stmt-expr local false positive in defer shadow scanner
 	test_defer_shadow_stmt_expr_local_false_positive();
 
-	// BUG101: C23 [[...]] attribute consumed into return-type typedef
-	{
-		const char *code =
-		    "void cleanup(void);\n"
-		    "int (*get_array(void))[3] [[gnu::noinline]] {\n"
-		    "    static int arr[3] = {1, 2, 3};\n"
-		    "    defer cleanup();\n"
-		    "    return &arr;\n"
-		    "}\n";
-		PrismResult r = prism_transpile_source(code, "c23_attr_ret.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		         "c23-attr-ret: transpiles OK");
-		CHECK(r.output != NULL, "c23-attr-ret: output not NULL");
-		const char *td = r.output ? strstr(r.output, "typedef") : NULL;
-		CHECK(td != NULL, "c23-attr-ret: must emit typedef");
-		// Find the end of the typedef (next semicolon)
-		const char *td_semi = td ? strchr(td, ';') : NULL;
-		// The typedef must not mention the attribute
-		bool has_attr = false;
-		if (td && td_semi) {
-			for (const char *p = td; p < td_semi; p++) {
-				if (memcmp(p, "noinline", 8) == 0) { has_attr = true; break; }
-			}
-		}
-		CHECK(!has_attr,
-		      "c23-attr-ret: typedef must not contain [[gnu::noinline]]");
-		prism_free(&r);
-	}
-
-	// orelse inside statement expression in ctrl-flow condition inside defer body
-	// Bug: emit_deferred_range used blind emit_tok loop for ctrl-flow conditions,
-	// bypassing stmt-expr processing. Raw 'orelse' leaked into transpiled output.
-	// Fix: use walk_balanced() which routes ({...}) through emit_block_body.
-	{
-		printf("\n--- orelse in stmt-expr ctrl-flow condition in defer ---\n");
-		{
-			const char *code =
-			    "int get(void);\n"
-			    "void f(void) {\n"
-			    "    defer {\n"
-			    "        if (({ int x = get() orelse 1; x; })) {\n"
-			    "            (void)0;\n"
-			    "        }\n"
-			    "    }\n"
-			    "}\n";
-			PrismResult r = prism_transpile_source(code, "dr_stmtexpr1.c", prism_defaults());
-			CHECK_EQ(r.status, PRISM_OK, "stmt-expr-in-defer-if: transpiles OK");
-			if (r.output) {
-				CHECK(strstr(r.output, "orelse") == NULL,
-				      "stmt-expr-in-defer-if: no raw orelse in output");
-			}
-			prism_free(&r);
-		}
-		// while variant
-		{
-			const char *code =
-			    "int get(void);\n"
-			    "void f(void) {\n"
-			    "    defer {\n"
-			    "        while (({ int x = get() orelse 0; x; })) {\n"
-			    "            break;\n"
-			    "        }\n"
-			    "    }\n"
-			    "}\n";
-			PrismResult r = prism_transpile_source(code, "dr_stmtexpr2.c", prism_defaults());
-			CHECK_EQ(r.status, PRISM_OK, "stmt-expr-in-defer-while: transpiles OK");
-			if (r.output) {
-				CHECK(strstr(r.output, "orelse") == NULL,
-				      "stmt-expr-in-defer-while: no raw orelse in output");
-			}
-			prism_free(&r);
-		}
-		// orelse in stmt-expr in ctrl-flow inside orelse block body
-		{
-			const char *code =
-			    "int get(void);\n"
-			    "int f(void) {\n"
-			    "    int result = get() orelse {\n"
-			    "        if (({ int x = get() orelse 1; x; })) {\n"
-			    "            return 1;\n"
-			    "        }\n"
-			    "        return 0;\n"
-			    "    };\n"
-			    "    return result;\n"
-			    "}\n";
-			PrismResult r = prism_transpile_source(code, "bb_stmtexpr1.c", prism_defaults());
-			CHECK_EQ(r.status, PRISM_OK, "stmt-expr-in-orelse-block-if: transpiles OK");
-			if (r.output) {
-				CHECK(strstr(r.output, "orelse") == NULL,
-				      "stmt-expr-in-orelse-block-if: no raw orelse in output");
-			}
-			prism_free(&r);
-		}
-	}
-
-	// zeroinit bypass in for-init declarations inside defer body and orelse block body
-	// Bug: walk_balanced in ctrl-flow condition handling didn't track at_stmt_start,
-	// so try_zero_init_decl never fired for declarations in for-init positions.
-	{
-		printf("\n--- zeroinit in ctrl-flow conditions inside defer/orelse ---\n");
-		// for-init inside defer
-		{
-			const char *code =
-			    "void f(void) {\n"
-			    "    defer {\n"
-			    "        for (int uninit_var;;) {\n"
-			    "            break;\n"
-			    "        }\n"
-			    "    }\n"
-			    "}\n";
-			PrismResult r = prism_transpile_source(code, "zi_forinit_defer.c", prism_defaults());
-			CHECK_EQ(r.status, PRISM_OK, "zeroinit-for-defer: transpiles OK");
-			if (r.output) {
-				CHECK(strstr(r.output, "uninit_var = 0") != NULL,
-				      "zeroinit-for-defer: for-init var zero-initialized");
-			}
-			prism_free(&r);
-		}
-		// for-init inside orelse block body
-		{
-			const char *code =
-			    "int get(void);\n"
-			    "int f(void) {\n"
-			    "    int result = get() orelse {\n"
-			    "        for (int uninit_var;;) {\n"
-			    "            break;\n"
-			    "        }\n"
-			    "        return 0;\n"
-			    "    };\n"
-			    "    return result;\n"
-			    "}\n";
-			PrismResult r = prism_transpile_source(code, "zi_forinit_orelse.c", prism_defaults());
-			CHECK_EQ(r.status, PRISM_OK, "zeroinit-for-orelse-block: transpiles OK");
-			if (r.output) {
-				CHECK(strstr(r.output, "uninit_var = 0") != NULL,
-				      "zeroinit-for-orelse-block: for-init var zero-initialized");
-			}
-			prism_free(&r);
-		}
-		// while condition with stmt-expr containing zeroinit
-		{
-			const char *code =
-			    "void f(void) {\n"
-			    "    defer {\n"
-			    "        while (({ int x = 0; x; })) {\n"
-			    "            break;\n"
-			    "        }\n"
-			    "    }\n"
-			    "}\n";
-			PrismResult r = prism_transpile_source(code, "zi_while_defer.c", prism_defaults());
-			CHECK_EQ(r.status, PRISM_OK, "zeroinit-while-stmtexpr: transpiles OK");
-			if (r.output) {
-				CHECK(strstr(r.output, "orelse") == NULL,
-				      "zeroinit-while-stmtexpr: no raw orelse leaked");
-			}
-			prism_free(&r);
-		}
-	}
-
-	// SCOPE_INIT desync: initializer braces '= { ... }' must not inflate block_depth.
-	// Bug: with -fno-zeroinit, try_zero_init_decl returns NULL, causing init braces
-	// to fall through to handle_open_brace which pushed SCOPE_BLOCK, inflating
-	// block_depth. Goto defer unwinding miscalculated target_depth, silently
-	// dropping defer cleanup blocks.
-	{
-		printf("\n--- SCOPE_INIT block_depth desync ---\n");
-		// goto inside stmt-expr in initializer brace, with active defer
-		{
-			PrismFeatures opts = prism_defaults();
-			opts.zeroinit = false;
-			const char *code =
-			    "int flag;\n"
-			    "int f(void) {\n"
-			    "    {\n"
-			    "        defer flag = 1;\n"
-			    "        int x = { ({ goto L; 0; }) };\n"
-			    "    }\n"
-			    "L:\n"
-			    "    return flag;\n"
-			    "}\n";
-			PrismResult r = prism_transpile_source(code, "scope_init1.c", opts);
-			CHECK_EQ(r.status, PRISM_OK, "scope-init-desync: transpiles OK");
-			if (r.output) {
-				CHECK(strstr(r.output, "flag = 1") != NULL,
-				      "scope-init-desync: defer cleanup emitted before goto");
-			}
-			prism_free(&r);
-		}
-		// Same test with zeroinit ON — must also work (regression guard)
-		{
-			const char *code =
-			    "int flag;\n"
-			    "int f(void) {\n"
-			    "    {\n"
-			    "        defer flag = 1;\n"
-			    "        int x = { ({ goto L; 0; }) };\n"
-			    "    }\n"
-			    "L:\n"
-			    "    return flag;\n"
-			    "}\n";
-			PrismResult r = prism_transpile_source(code, "scope_init2.c", prism_defaults());
-			CHECK_EQ(r.status, PRISM_OK, "scope-init-zeroinit-on: transpiles OK");
-			if (r.output) {
-				CHECK(strstr(r.output, "flag = 1") != NULL,
-				      "scope-init-zeroinit-on: defer cleanup emitted before goto");
-			}
-			prism_free(&r);
-		}
-		// Nested initializer braces — multiple levels of = { { ... } }
-		{
-			PrismFeatures opts = prism_defaults();
-			opts.zeroinit = false;
-			const char *code =
-			    "typedef struct { int a[2]; } S;\n"
-			    "int flag;\n"
-			    "int f(void) {\n"
-			    "    {\n"
-			    "        defer flag = 1;\n"
-			    "        S s = { { ({ goto L; 0; }), 0 } };\n"
-			    "    }\n"
-			    "L:\n"
-			    "    return flag;\n"
-			    "}\n";
-			PrismResult r = prism_transpile_source(code, "scope_init3.c", opts);
-			CHECK_EQ(r.status, PRISM_OK, "scope-init-nested: transpiles OK");
-			if (r.output) {
-				CHECK(strstr(r.output, "flag = 1") != NULL,
-				      "scope-init-nested: defer cleanup with nested init braces");
-			}
-			prism_free(&r);
-		}
-	}
+	test_defer_c23_attr_return_type_typedef();
+	test_defer_orelse_in_stmtexpr_ctrl_condition();
+	test_defer_zeroinit_for_init_ctrl_flow();
+	test_defer_scope_init_block_depth_desync();
 }
