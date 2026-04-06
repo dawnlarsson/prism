@@ -362,6 +362,7 @@ static Token *walk_balanced(Token *tok, bool emit);
 static Token *walk_balanced_orelse(Token *tok);
 static void emit_noise_between_raws(Token *first_raw, Token *last_raw);
 static inline Token *try_strip_raw(Token *t);
+static Token *try_generic_member_rewrite(Token *tok);
 static inline void out_char(char c);
 static inline void out_str(const char *s, int len);
 #define OUT_TOK(t) out_str(tok_loc(t), (t)->len)
@@ -910,6 +911,10 @@ static void emit_range_ex(Token *start, Token *end, int flags) {
 		}
 		if (is_stmt_expr_open(t) && tok_match(t)) { walk_balanced(t, true); t = tok_next(tok_match(t)); continue; }
 		{ Token *r = try_strip_raw(t); if (r) { t = r; continue; } }
+		if ((t->tag & TT_GENERIC) && !in_generic()) {
+			Token *after = try_generic_member_rewrite(t);
+			if (after) { t = after; continue; }
+		}
 		emit_tok(t); t = tok_next(t);
 	}
 }
@@ -2166,7 +2171,6 @@ static void emit_token_range_orelse(Token *start, Token *end) {
 		// No top-level orelse. Walk tokens, recursing into balanced
 		// groups to catch orelse nested inside function args, etc.
 		for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
-			if (t != start) out_char(' ');
 			// which has the full keyword dispatcher (goto, return, defer).
 			if (is_stmt_expr_open(t) && tok_match(t)) {
 				walk_balanced(t, true);
@@ -2176,16 +2180,23 @@ static void emit_token_range_orelse(Token *start, Token *end) {
 			if ((t->flags & TF_OPEN) && (match_ch(t, '(') || match_ch(t, '['))) {
 				Token *close = tok_match(t);
 				if (close && close != end) {
-					OUT_TOK(t);
-					out_char(' ');
+					emit_tok(t);
 					emit_token_range_orelse(tok_next(t), close);
-					out_char(' ');
-					OUT_TOK(close);
+					emit_tok(close);
 					t = close;
 					continue;
 				}
 			}
-			OUT_TOK(t);
+			if ((t->tag & TT_GENERIC) && !in_generic()) {
+				Token *after = try_generic_member_rewrite(t);
+				if (after) {
+					Token *gen_open = tok_next(t);
+					if (gen_open && match_ch(gen_open, '(') && tok_match(gen_open))
+						t = tok_match(gen_open);
+					continue;
+				}
+			}
+			emit_tok(t);
 		}
 		return;
 	}
@@ -5615,6 +5626,10 @@ static void emit_deferred_range(Token *start, Token *end) {
 			continue;
 		}
 
+		if ((t->tag & TT_GENERIC) && !in_generic()) {
+			Token *after = try_generic_member_rewrite(t);
+			if (after) { t = after; continue; }
+		}
 		emit_tok(t); t = tok_next(t);
 	}
 

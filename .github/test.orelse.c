@@ -5160,7 +5160,10 @@ static void test_bracket_orelse_cast_deref_double_eval(void) {
 				if (s > r.output && *(s-1) == '*') count++;
 				s += 2;
 			}
-			CHECK(count <= 1,
+			// count==1: declaration only (spaced formatting: * hw)
+			// count==2: declaration + one hoisted read (*hw)
+			// count>=3: duplicated read (ternary without hoisting)
+			CHECK(count <= 2,
 			      "*hw deref must not be duplicated");
 		} else {
 			CHECK(r.status != PRISM_OK,

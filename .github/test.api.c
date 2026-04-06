@@ -8404,6 +8404,71 @@ static void test_generic_inner_generic_prefix(void) {
 	}
 }
 
+// _Generic member rewrite must work in emission loops that previously
+// bypassed the rewrite hook: defer bodies, const orelse init, bracket orelse.
+static void test_generic_member_rewrite_emission_loops(void) {
+	printf("\n--- _Generic member rewrite emission loops ---\n");
+
+	// 1. defer body (emit_deferred_range)
+	{
+		const char *code =
+		    "struct Drv { int (*init)(void); };\n"
+		    "int drv_init(void) { return 42; }\n"
+		    "void f(struct Drv *d) {\n"
+		    "    defer { d->_Generic(0, int: init)(); }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gm_defer.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "generic-defer: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "d->_Generic") == NULL,
+			      "generic-defer: no verbatim _Generic leak");
+			CHECK(strstr(r.output, "d->init") != NULL,
+			      "generic-defer: member rewrite applied");
+		}
+		prism_free(&r);
+	}
+
+	// 2. const orelse init (emit_range_ex)
+	{
+		const char *code =
+		    "struct Drv { int (*init)(void); };\n"
+		    "int drv_init(void) { return 42; }\n"
+		    "void f(struct Drv *d) {\n"
+		    "    const int st = d->_Generic(0, int: init)() orelse -1;\n"
+		    "    (void)st;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gm_coe.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "generic-const-orelse: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "d->_Generic") == NULL,
+			      "generic-const-orelse: no verbatim _Generic leak");
+			CHECK(strstr(r.output, "d->init") != NULL,
+			      "generic-const-orelse: member rewrite applied");
+		}
+		prism_free(&r);
+	}
+
+	// 3. bracket orelse (emit_token_range_orelse)
+	{
+		const char *code =
+		    "struct Drv { int (*init)(void); };\n"
+		    "int drv_init(void) { return 42; }\n"
+		    "void f(struct Drv *d) {\n"
+		    "    int arr[ d->_Generic(0, int: init)() orelse 10 ];\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gm_boe.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "generic-bracket-orelse: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "d->_Generic") == NULL,
+			      "generic-bracket-orelse: no verbatim _Generic leak");
+			CHECK(strstr(r.output, "d->init") != NULL,
+			      "generic-bracket-orelse: member rewrite applied");
+		}
+		prism_free(&r);
+	}
+}
+
 // C23 enum with fixed underlying type: enum E : int { A, B, C }
 // Verify that (1) enum constants are registered in typedef table,
 // (2) the body is classified as struct/enum scope (orelse rejected),
@@ -8640,6 +8705,7 @@ void run_api_tests_4(void) {
 	test_bitfield_raw_leak();
 	test_generic_paren_complex_target_prefix();
 	test_generic_inner_generic_prefix();
+	test_generic_member_rewrite_emission_loops();
 	test_c23_enum_fixed_underlying_type();
 	test_proto_param_vla_orelse_rejected();
 }
