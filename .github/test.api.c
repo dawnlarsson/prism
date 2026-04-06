@@ -8081,6 +8081,241 @@ static void test_generic_prefix_buf_overflow(void) {
 	prism_free(&r);
 }
 
+static void test_generic_rewrite_line_directive_desync(void) {
+	printf("\n--- _Generic rewrite line directive desync ---\n");
+	/* VULN: try_generic_member_rewrite rewinds the output stream but did not
+	 * restore ctx->last_line_no, so erased #line directives were never
+	 * re-emitted.  After the fix, the _Generic token's line should appear. */
+	{
+		const char *code =
+		    "typedef struct { int type; } Obj;\n"
+		    "int handle(int);\n"
+		    "Obj *get_obj(void);\n"
+		    "int sel;\n"
+		    "\n"
+		    "int test(void) {\n"
+		    "\n\n\n"
+		    "    return get_obj()\n"
+		    "\n\n\n"
+		    "        ->_Generic(sel, int: handle)(42);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gld1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "line-desync: transpiles OK");
+		if (r.output) {
+			/* _Generic is on line 14 (after the blank lines). The output
+			 * must contain a #line directive that targets line 14. */
+			CHECK(strstr(r.output, "#line 14") != NULL ||
+			      strstr(r.output, "#line 13") != NULL,
+			      "line-desync: #line for _Generic token present after rewind");
+			/* Also verify get_obj prefix is injected */
+			CHECK(strstr(r.output, "get_obj()") != NULL,
+			      "line-desync: prefix injected");
+		}
+		prism_free(&r);
+	}
+}
+
+static void test_backward_goto_over_defer(void) {
+	printf("\n--- Backward goto over defer ---\n");
+	/* VULN: backward goto looping over a same-scope defer is silently
+	 * accepted. The defer body only executes once at scope exit, causing
+	 * silent resource leaks. */
+	{
+		const char *code =
+		    "#include <stdlib.h>\n"
+		    "void process(int n) {\n"
+		    "L_RETRY:\n"
+		    "    ;\n"
+		    "    void *buffer = malloc(1024);\n"
+		    "    defer { free(buffer); }\n"
+		    "    if (n-- > 0)\n"
+		    "        goto L_RETRY;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bgod1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "goto-over-defer: same-scope rejected");
+		prism_free(&r);
+	}
+	/* Safe: goto exits the defer's scope (labeled compound statement) */
+	{
+		const char *code =
+		    "void log_append(const char *);\n"
+		    "void f(int n) {\n"
+		    "L_A: {\n"
+		    "    defer log_append(\"A\");\n"
+		    "    if (n > 0) goto L_B;\n"
+		    "    return;\n"
+		    "}\n"
+		    "L_B: {\n"
+		    "    defer log_append(\"B\");\n"
+		    "    n--;\n"
+		    "    goto L_A;\n"
+		    "}\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bgod2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "goto-over-defer: different-scope (labeled blocks) accepted");
+		prism_free(&r);
+	}
+	/* Safe: defer in child scope, goto exits it */
+	{
+		const char *code =
+		    "void cleanup(void);\n"
+		    "void f(int n) {\n"
+		    "RETRY:\n"
+		    "    {\n"
+		    "        defer cleanup();\n"
+		    "        if (n-- <= 0) return;\n"
+		    "    }\n"
+		    "    goto RETRY;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "bgod3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "goto-over-defer: defer in child scope accepted");
+		prism_free(&r);
+	}
+}
+
+static void test_nested_generic_member_rewrite(void) {
+	printf("\n--- Nested _Generic member rewrite ---\n");
+	/* Nested _Generic: outer injects prefix, inner must compose with it. */
+	{
+		const char *code =
+		    "typedef struct { int type; } Ctx;\n"
+		    "typedef struct { int kind; } Api;\n"
+		    "int handle(int);\n"
+		    "Api get_api(int);\n"
+		    "Ctx *get_ctx(void);\n"
+		    "\n"
+		    "void dispatch(int sel, int sel2, int data) {\n"
+		    "    get_ctx()->_Generic(sel,\n"
+		    "        int: get_api(1)._Generic(sel2, float: handle)\n"
+		    "    )(data);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ngmr1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "nested-generic: transpiles OK");
+		if (r.output) {
+			/* Inner _Generic must have the combined prefix:
+			 * get_ctx()->get_api(1).handle */
+			CHECK(strstr(r.output, "get_ctx()->get_api(1).handle") != NULL,
+			      "nested-generic: combined prefix injected");
+			/* _Generic keyword itself must not have a member prefix */
+			CHECK(strstr(r.output, "->_Generic") == NULL &&
+			      strstr(r.output, "._Generic") == NULL,
+			      "nested-generic: _Generic not prefixed");
+		}
+		prism_free(&r);
+	}
+	/* Single-level regression check */
+	{
+		const char *code =
+		    "typedef struct { int type; } Obj;\n"
+		    "int handle_int(int);\n"
+		    "int handle_float(int);\n"
+		    "Obj *get_obj(void);\n"
+		    "int sel;\n"
+		    "\n"
+		    "int test(int data) {\n"
+		    "    return get_obj()->_Generic(sel, int: handle_int,\n"
+		    "                               default: handle_float)(data);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "ngmr2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "single-generic: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "get_obj()->handle_int") != NULL,
+			      "single-generic: prefix injected for handle_int");
+			CHECK(strstr(r.output, "get_obj()->handle_float") != NULL,
+			      "single-generic: prefix injected for handle_float");
+		}
+		prism_free(&r);
+	}
+}
+
+static void test_typeof_unqual_const_stripping(void) {
+	printf("\n--- typeof_unqual const stripping ---\n");
+	/* typeof_unqual should strip qualifiers — must not trigger false
+	 * "const VLA" rejection. */
+	{
+		const char *code =
+		    "void process(int n) {\n"
+		    "    typeof_unqual(const int[n]) arr;\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "tuc1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typeof_unqual(const int[n]): transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "memset") != NULL || strstr(r.output, "= {0}") != NULL,
+			      "typeof_unqual: zero-init applied (not rejected)");
+		}
+		prism_free(&r);
+	}
+	/* typeof (qualified) should still propagate const. */
+	{
+		const char *code =
+		    "void process2(int n) {\n"
+		    "    typeof(const int[n]) arr;\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "tuc2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "typeof(const int[n]): const VLA rejected");
+		prism_free(&r);
+	}
+}
+
+static void test_generic_ternary_branch_prefix(void) {
+	printf("\n--- _Generic ternary branch prefix ---\n");
+	/* Ternary in _Generic branch value: both arms must get prefix. */
+	{
+		const char *code =
+		    "typedef struct { int type; } Ctx;\n"
+		    "int handle_admin(int);\n"
+		    "int handle_user(int);\n"
+		    "Ctx ctx;\n"
+		    "int sel, is_admin;\n"
+		    "\n"
+		    "int test(int data) {\n"
+		    "    return ctx._Generic(sel,\n"
+		    "        int: is_admin ? handle_admin : handle_user\n"
+		    "    )(data);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gtbp1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "ternary-generic: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "ctx.handle_admin") != NULL,
+			      "ternary-generic: prefix on first arm");
+			CHECK(strstr(r.output, "ctx.handle_user") != NULL,
+			      "ternary-generic: prefix on second arm");
+			/* Condition ident must NOT get prefix */
+			CHECK(strstr(r.output, "ctx.is_admin") == NULL,
+			      "ternary-generic: condition not prefixed");
+		}
+		prism_free(&r);
+	}
+	/* Ternary arms with calls. */
+	{
+		const char *code =
+		    "typedef struct { int type; } Ctx;\n"
+		    "int handle_admin(int);\n"
+		    "int handle_user(int);\n"
+		    "Ctx ctx;\n"
+		    "int sel, is_admin;\n"
+		    "\n"
+		    "int test_call(int data) {\n"
+		    "    return ctx._Generic(sel,\n"
+		    "        int: is_admin ? handle_admin(1) : handle_user(2)\n"
+		    "    );\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gtbp2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "ternary-call-generic: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "ctx.handle_admin(1)") != NULL,
+			      "ternary-call-generic: prefix on first arm call");
+			CHECK(strstr(r.output, "ctx.handle_user(2)") != NULL,
+			      "ternary-call-generic: prefix on second arm call");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_api_tests_4(void) {
 	printf("\n=== API TESTS (group 4) ===\n");
 	test_collect_source_defines_long_line_truncation();
@@ -8150,4 +8385,9 @@ void run_api_tests_4(void) {
 	test_ghost_enum_defer_shadow_enclosing();
 	test_generic_multi_paren_wrapped_target();
 	test_generic_prefix_buf_overflow();
+	test_generic_rewrite_line_directive_desync();
+	test_backward_goto_over_defer();
+	test_nested_generic_member_rewrite();
+	test_typeof_unqual_const_stripping();
+	test_generic_ternary_branch_prefix();
 }

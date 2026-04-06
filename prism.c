@@ -305,7 +305,7 @@ static PRISM_THREAD_LOCAL bool use_linemarkers = false; // true = GCC linemarker
 // Absolute offsets survive out_flush() boundary crossings.
 #define EMIT_SAVE_RING_SIZE 1024
 #define EMIT_SAVE_RING_MASK (EMIT_SAVE_RING_SIZE - 1)
-static PRISM_THREAD_LOCAL struct { int64_t abs_pos; uint32_t tpi; } emit_save_ring[EMIT_SAVE_RING_SIZE];
+static PRISM_THREAD_LOCAL struct { int64_t abs_pos; uint32_t tpi; int line_no; char *filename; bool is_system; } emit_save_ring[EMIT_SAVE_RING_SIZE];
 static PRISM_THREAD_LOCAL int emit_save_idx = 0;
 
 typedef struct {
@@ -840,8 +840,12 @@ static bool __attribute__((noinline)) emit_tok_special(Token *tok) {
 
 static void emit_tok(Token *tok) {
 	// Save pre-emission absolute output position for _Generic member-injection rewind.
-	emit_save_ring[emit_save_idx & EMIT_SAVE_RING_MASK].abs_pos = out_total_flushed + out_buf_pos;
-	emit_save_ring[emit_save_idx & EMIT_SAVE_RING_MASK].tpi = tok_idx(tok);
+	int ri_ = emit_save_idx & EMIT_SAVE_RING_MASK;
+	emit_save_ring[ri_].abs_pos = out_total_flushed + out_buf_pos;
+	emit_save_ring[ri_].tpi = tok_idx(tok);
+	emit_save_ring[ri_].line_no = ctx->last_line_no;
+	emit_save_ring[ri_].filename = ctx->last_filename;
+	emit_save_ring[ri_].is_system = ctx->last_system_header;
 	emit_save_idx++;
 
 	TokenCold *c = tok_cold(tok);
@@ -1566,11 +1570,17 @@ static Token *try_generic_member_rewrite(Token *tok) {
 
 	// --- Look up the absolute output position before chain_start was emitted ---
 	int64_t abs_rewind = -1;
+	int rewind_line_no = 0;
+	char *rewind_filename = NULL;
+	bool rewind_is_system = false;
 	for (int i = emit_save_idx - 1;
 	     i >= 0 && i >= emit_save_idx - EMIT_SAVE_RING_SIZE; i--) {
 		int ri = i & EMIT_SAVE_RING_MASK;
 		if (emit_save_ring[ri].tpi == chain_start_pi) {
 			abs_rewind = emit_save_ring[ri].abs_pos;
+			rewind_line_no = emit_save_ring[ri].line_no;
+			rewind_filename = emit_save_ring[ri].filename;
+			rewind_is_system = emit_save_ring[ri].is_system;
 			break;
 		}
 	}
@@ -1580,21 +1590,66 @@ static Token *try_generic_member_rewrite(Token *tok) {
 	}
 
 	// --- Capture the prefix text (e.g. "obj." / "ptr->") ---
-	// We copy it from the output buffer before rewinding.  The text includes
-	// all spacing / line directives that emit_tok produced — but we will
-	// re-inject using raw out_str for each branch to avoid duplicate #line
-	// directives.  Instead, build a clean, compact prefix from the tokens.
+	// Read the prefix directly from the output buffer.  This captures any
+	// injected text from outer _Generic rewrites (nested case) that token_pool
+	// doesn't contain.  Build a clean version from the output bytes between
+	// abs_rewind and the current output position, stripping \n and #line
+	// directives to get a compact single-line prefix.
 	char prefix_buf[1024];
 	int prefix_len = 0;
-	for (uint32_t p = chain_start_pi; p <= tok_idx(member_op); p++) {
-		Token *pt = &token_pool[p];
-		if (prefix_len > 0 && (pt->flags & TF_HAS_SPACE) && prefix_len < (int)sizeof(prefix_buf) - 1)
-			prefix_buf[prefix_len++] = ' ';
-		int tl = pt->len;
-		if (prefix_len + tl > (int)sizeof(prefix_buf))
+	{
+		int64_t cur_abs = out_total_flushed + out_buf_pos;
+		int64_t raw_len = cur_abs - abs_rewind;
+		if (raw_len > 0 && raw_len < (int64_t)sizeof(prefix_buf)) {
+			// All prefix bytes should be in the current buffer since they
+			// were just emitted.  If abs_rewind is in the buffer, direct copy.
+			if (abs_rewind >= out_total_flushed) {
+				int start = (int)(abs_rewind - out_total_flushed);
+				// Strip newlines and #line directives from the raw output
+				for (int k = start; k < start + (int)raw_len; k++) {
+					char ch = out_buf[k];
+					if (ch == '\n') {
+						// Skip optional #line directive after newline
+						if (k + 1 < start + (int)raw_len && out_buf[k + 1] == '#') {
+							k++;
+							while (k < start + (int)raw_len && out_buf[k] != '\n') k++;
+							k--;  // outer loop will advance
+						} else if (prefix_len > 0) {
+							prefix_buf[prefix_len++] = ' ';
+						}
+					} else {
+						prefix_buf[prefix_len++] = ch;
+					}
+				}
+			} else {
+				// Rare: prefix spans a flush boundary.  Fall back to
+				// token-pool-based reconstruction.
+				for (uint32_t p = chain_start_pi; p <= tok_idx(member_op); p++) {
+					Token *pt = &token_pool[p];
+					if (prefix_len > 0 && (pt->flags & TF_HAS_SPACE) && prefix_len < (int)sizeof(prefix_buf) - 1)
+						prefix_buf[prefix_len++] = ' ';
+					int tl = pt->len;
+					if (prefix_len + tl > (int)sizeof(prefix_buf))
+						error_tok(member_op, "_Generic member rewrite: prefix exceeds %d bytes; simplify the member access chain or use _Generic directly", (int)sizeof(prefix_buf));
+					memcpy(prefix_buf + prefix_len, tok_loc(pt), tl);
+					prefix_len += tl;
+				}
+			}
+		} else if (raw_len >= (int64_t)sizeof(prefix_buf)) {
 			error_tok(member_op, "_Generic member rewrite: prefix exceeds %d bytes; simplify the member access chain or use _Generic directly", (int)sizeof(prefix_buf));
-		memcpy(prefix_buf + prefix_len, tok_loc(pt), tl);
-		prefix_len += tl;
+		} else {
+			// raw_len <= 0: shouldn't happen, fall back to token-based
+			for (uint32_t p = chain_start_pi; p <= tok_idx(member_op); p++) {
+				Token *pt = &token_pool[p];
+				if (prefix_len > 0 && (pt->flags & TF_HAS_SPACE) && prefix_len < (int)sizeof(prefix_buf) - 1)
+					prefix_buf[prefix_len++] = ' ';
+				int tl = pt->len;
+				if (prefix_len + tl > (int)sizeof(prefix_buf))
+					error_tok(member_op, "_Generic member rewrite: prefix exceeds %d bytes; simplify the member access chain or use _Generic directly", (int)sizeof(prefix_buf));
+				memcpy(prefix_buf + prefix_len, tok_loc(pt), tl);
+				prefix_len += tl;
+			}
+		}
 	}
 
 	// --- Rewind output past the prefix ---
@@ -1608,6 +1663,14 @@ static Token *try_generic_member_rewrite(Token *tok) {
 		out_total_flushed = abs_rewind;
 		out_buf_pos = 0;
 	}
+
+	// Restore line-tracking state to what it was before the prefix was emitted.
+	// The physical rewind erased any #line directives in the prefix; without
+	// this, emit_tok believes the backend compiler is already on the correct
+	// line and refuses to re-emit the directive.
+	ctx->last_line_no = rewind_line_no;
+	ctx->last_filename = rewind_filename;
+	ctx->last_system_header = rewind_is_system;
 
 	// Fix last_emitted to the token emitted just before the prefix chain.
 	last_emitted = (chain_start_pi > 0) ? &token_pool[chain_start_pi - 1] : NULL;
@@ -1636,6 +1699,8 @@ static Token *try_generic_member_rewrite(Token *tok) {
 	bool val_bare_ident = false; // current branch is a single bare ident
 	bool val_paren_wrapped = false; // target ident is inside (ident) wrapping parens
 	int val_peel_depth = 0;      // number of remaining paren layers to drill through
+	bool val_has_ternary = false;    // branch value contains a ternary expression
+	bool val_ternary_arm_fresh = false; // just entered a ternary arm (? or ternary :)
 	for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
 		if ((t->flags & TF_OPEN) && tok_match(t)) {
 			// Don't skip parens that wrap the injection target —
@@ -1661,8 +1726,8 @@ static Token *try_generic_member_rewrite(Token *tok) {
 			t = tok_match(t);
 			continue;
 		}
-		if (match_ch(t, '?')) { ternary++; emit_tok(t); continue; }
-		if (match_ch(t, ':') && ternary > 0) { ternary--; emit_tok(t); continue; }
+		if (match_ch(t, '?')) { ternary++; if (val_has_ternary) val_ternary_arm_fresh = true; emit_tok(t); continue; }
+		if (match_ch(t, ':') && ternary > 0) { ternary--; if (val_has_ternary) val_ternary_arm_fresh = true; emit_tok(t); continue; }
 		if (match_ch(t, ':') && ternary == 0) {
 			emit_tok(t);  // ':'
 			in_value = true;
@@ -1671,6 +1736,8 @@ static Token *try_generic_member_rewrite(Token *tok) {
 			val_bare_ident = false;
 			val_paren_wrapped = false;
 			val_peel_depth = 0;
+			val_has_ternary = false;
+			val_ternary_arm_fresh = false;
 			Token *vs = tok_next(t);
 			// Peel one layer of value-wrapping parens for injection
 			// detection: (handle_int) or (get_func)(args).
@@ -1727,6 +1794,15 @@ static Token *try_generic_member_rewrite(Token *tok) {
 				    match_ch(after_vs, ','))
 					val_bare_ident = true;
 			}
+			// Check for ternary expression in branch value.
+			if (!val_has_call && !val_bare_ident) {
+				for (Token *s = vs; s && s != close; s = tok_next(s)) {
+					if ((s->flags & TF_OPEN) && tok_match(s))
+						{ s = tok_match(s); continue; }
+					if (match_ch(s, ',')) break;
+					if (match_ch(s, '?')) { val_has_ternary = true; break; }
+				}
+			}
 			}
 			continue;
 		}
@@ -1749,6 +1825,14 @@ static Token *try_generic_member_rewrite(Token *tok) {
 			else if (val_bare_ident) {
 				inject = true;
 				val_bare_ident = false; // only once
+			} else if (val_has_ternary && val_ternary_arm_fresh) {
+				Token *nt = tok_next(t);
+				if (nt && match_ch(nt, '('))
+					inject = true;
+				else if (!nt || nt == close || match_ch(nt, ',') ||
+				         (match_ch(nt, ':') && ternary > 0) ||
+				         match_ch(nt, ')'))
+					inject = true;
 			}
 		}
 		if (inject) {
@@ -1759,10 +1843,39 @@ static Token *try_generic_member_rewrite(Token *tok) {
 			else if ((t->flags & TF_HAS_SPACE) ||
 				 needs_space(last_emitted, t))
 				out_char(' ');
+			// Record the injected token in the emit_save_ring BEFORE
+			// the prefix so that a nested _Generic rewrite rewinds past
+			// both the prefix and the token, capturing the full chain.
+			{
+				int ri_ = emit_save_idx & EMIT_SAVE_RING_MASK;
+				emit_save_ring[ri_].abs_pos = out_total_flushed + out_buf_pos;
+				emit_save_ring[ri_].tpi = tok_idx(t);
+				emit_save_ring[ri_].line_no = ctx->last_line_no;
+				emit_save_ring[ri_].filename = ctx->last_filename;
+				emit_save_ring[ri_].is_system = ctx->last_system_header;
+				emit_save_idx++;
+			}
 			out_str(prefix_buf, prefix_len);
 			out_str(tok_loc(t), t->len);
 			last_emitted = t;
+			if (val_has_ternary && is_valid_varname(t))
+				val_ternary_arm_fresh = false;
 		} else {
+			// Intercept nested _Generic with member access:
+			// e.g. get_api()._Generic(sel2, float: handle)(data)
+			if ((t->tag & TT_GENERIC) && last_emitted &&
+			    (last_emitted->tag & TT_MEMBER)) {
+				Token *after = try_generic_member_rewrite(t);
+				if (after) {
+					// try_generic_member_rewrite returns tok_next(close).
+					// Walk to the close paren so the for-loop increment
+					// lands on the right token.
+					Token *gen_open = tok_next(t);
+					if (gen_open && match_ch(gen_open, '(') && tok_match(gen_open))
+						t = tok_match(gen_open);
+					continue;
+				}
+			}
 			emit_tok(t);
 		}
 	}
@@ -7427,6 +7540,26 @@ static void p1_verify_cfg(void) {
 					cfg_check_range(ents, g, &ents[li], /*is_forward=*/false,
 							defer_list, 0, wm_defer[li],
 							decl_list, 0, wm_decl[li]);
+					// Backward goto looping over defer: defers BETWEEN
+					// the label and the goto in the SAME scope as the
+					// label are re-executed without cleanup — the defer
+					// body is pasted once at scope exit, but the loop
+					// re-enters without exiting the scope.  Defers in
+					// child scopes are safe because the goto exits them
+					// (emit_goto_defer fires their cleanup).
+					if (FEAT(F_DEFER)) {
+						for (int di = wm_defer[li]; di < defer_n; di++) {
+							P1FuncEntry *d = &ents[defer_list[di]];
+							if (d->token_index >= g->token_index) continue;
+							if (d->scope_id != ents[li].scope_id) continue;
+							error_tok(g->tok,
+								  "goto '%.*s' loops over a defer statement; "
+								  "lexical defer does not queue dynamically and "
+								  "the defer body will only execute once at scope exit",
+								  g->label.len, g->label.name);
+							break;
+						}
+					}
 				}
 				break;
 			}

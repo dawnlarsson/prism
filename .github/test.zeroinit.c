@@ -1650,12 +1650,13 @@ static void test_vla_multi_decl_sequence_point(void) {
 		/* arr must be on its own statement, memset'd before matrix */
 		char *arr_decl = strstr(r.output, "int arr[n]");
 		char *matrix_decl = strstr(r.output, "matrix[");
-		char *memset_arr = strstr(r.output, "memset");
 		CHECK(arr_decl != NULL, "vla-seq: arr declared");
 		CHECK(matrix_decl != NULL, "vla-seq: matrix declared");
-		CHECK(memset_arr != NULL, "vla-seq: memset present");
-		if (arr_decl && matrix_decl && memset_arr)
-			CHECK(memset_arr < matrix_decl,
+		CHECK(has_zeroing(r.output), "vla-seq: memset present");
+		char *zero_call = strstr(r.output, "memset");
+		if (!zero_call) zero_call = strstr(r.output, "__prism_p_");
+		if (arr_decl && matrix_decl && zero_call)
+			CHECK(zero_call < matrix_decl,
 			      "vla-seq: memset(arr) before matrix declaration");
 	}
 	prism_free(&r);

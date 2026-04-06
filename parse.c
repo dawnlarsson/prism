@@ -2805,7 +2805,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 
 		// typeof/typeof_unqual/__typeof__
 		if (tag & TT_TYPEOF) {
-			bool is_unqual = tok->len == 14;
+			bool is_unqual = tok->len == 13;
 			r.saw_type = true;
 			r.has_typeof = true;
 			tok = tok_next(tok);
