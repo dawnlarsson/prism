@@ -1315,7 +1315,7 @@ static void test_orelse_parenthesized_typeof_rejected(void) {
             "}\n",
             "orelse_parenthesized_typeof_reject.c",
             "orelse inside typeof: rejected",
-            "orelse"
+            "control flow"
         );
 }
 

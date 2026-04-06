@@ -927,7 +927,7 @@ static void init_keyword_map(void) {
 	    {"__inline__", TT_INLINE, true},
 	    {"_Thread_local", TT_STORAGE, true},
 	    {"__thread", TT_STORAGE, true},
-	    {"constexpr", TT_QUALIFIER | TT_SKIP_DECL, true},
+	    {"constexpr", TT_QUALIFIER, true},
 	    {"thread_local", TT_QUALIFIER | TT_SKIP_DECL | TT_STORAGE, true},
 	    {"void", TT_TYPE, true},
 	    {"char", TT_TYPE, true},
@@ -2094,6 +2094,8 @@ typedef struct {
 	bool has_raw : 1;	  // True if 'raw' keyword was skipped in type specifier
 	bool has_extern : 1;
 	bool has_static : 1;
+	bool has_auto : 1;	  // C23 'auto' type inference
+	bool has_constexpr : 1;   // C23 'constexpr'
 } TypeSpecResult;
 
 // Declarator parsing result
@@ -2692,6 +2694,18 @@ static void scan_paren_for_vla(Token *open, Token *end, TypeSpecResult *r, bool 
 	Token *prev = open;
 	int fn_skip = 0;
 	for (Token *t = tok_next(open); t && t != end; prev2 = prev, prev = t, t = tok_next(t)) {
+		// Ban control-flow keywords inside type specifier parens.
+		// typeof()/Atomic() are unevaluated at runtime, but Prism's
+		// emit_type_range routes stmt-exprs through walk_balanced (full
+		// transpilation engine).  Type specifiers can be emitted multiple
+		// times (const orelse temp, multi-declarator splits), so any
+		// defer/goto/return would be processed N times at compile time,
+		// corrupting the defer stack or goto_entry_cursor.
+		if (t->tag & (TT_GOTO | TT_RETURN | TT_BREAK | TT_CONTINUE | TT_DEFER))
+			error_tok(t, "control flow keywords are not allowed inside "
+				  "type specifiers (typeof() / _Atomic()); transpiler "
+				  "rewrites may duplicate the type specifier, which "
+				  "would corrupt control-flow tracking");
 		if (check_typeof && (t->tag & TT_TYPEOF)) r->has_typeof = true;
 		if (t->len == 1 && t->ch0 == '(') {
 			if (fn_skip > 0) fn_skip++;
@@ -2756,8 +2770,9 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			if (tag & TT_VOLATILE) r.has_volatile = true;
 			if (tag & TT_REGISTER) r.has_register = true;
 			if (tag & TT_CONST) r.has_const = true;
+			if (tok->ch0 == 'c' && tok->len == 9) r.has_constexpr = true;
 			if (tag & TT_TYPE) {
-				if (tok->ch0 == 'a') r.saw_type = true;
+				if (tok->ch0 == 'a') { r.saw_type = true; r.has_auto = true; }
 				else r.has_atomic = true;
 			}
 		}
@@ -3662,6 +3677,7 @@ static bool is_raw_strip_context(Token *after_raw) {
 
 static bool has_effective_const_qual(Token *type_start, TypeSpecResult *type, DeclResult *decl) {
 	bool has_const_qual = (type->has_const && !decl->is_func_ptr) || decl->is_const;
+	if (type->has_constexpr) has_const_qual = true;
 	if (type->has_typeof && !decl->is_func_ptr && !decl->is_pointer)
 		has_const_qual = true;
 	if (!has_const_qual && !decl->is_func_ptr && !decl->is_pointer) {

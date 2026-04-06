@@ -1650,8 +1650,7 @@ static void spec_typeof_var_reentrancy(void) {
 		PrismResult r = prism_transpile_source(code, "spec_tvr1.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK, "typeof_var reentry: transpiles OK");
 		if (r.output) {
-			CHECK(strstr(r.output, "memset(&secure_buffer") != NULL ||
-			      strstr(r.output, "memset( &secure_buffer") != NULL,
+			CHECK(has_var_zeroing(r.output, "secure_buffer"),
 			      "typeof_var reentry: outer VLA memset survives inner decl");
 			CHECK(has_var_zeroing(r.output, "inner_temp"),
 			      "typeof_var reentry: inner VLA memset also present");
@@ -1772,6 +1771,292 @@ static void spec_orelse_ctrl_flow_keyword_rejection(void) {
 		         "goto in stmt-expr block orelse LHS: must accept");
 		prism_free(&r);
 	}
+
+	// 6. defer in stmt-expr RHS with LHS indirection — typeof(RHS)
+	//    duplicates the RHS tokens at compile time, double-registering
+	//    the defer (double-free / lock panic at runtime).
+	{
+		PrismResult r = prism_transpile_source(
+		    "void lock(void);\n"
+		    "void unlock(void);\n"
+		    "void kernel_task(void) {\n"
+		    "    int *ptr;\n"
+		    "    *ptr = ({ { defer unlock(); lock(); } 0; }) orelse 5;\n"
+		    "}\n",
+		    "spec_ctrl6.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "defer in RHS stmt-expr with LHS indirection: must reject");
+		prism_free(&r);
+	}
+
+	// 7. goto in stmt-expr RHS with LHS indirection
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    int *ptr;\n"
+		    "    *ptr = ({ goto skip; 0; }) orelse 5;\n"
+		    "skip: return;\n"
+		    "}\n",
+		    "spec_ctrl7.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "goto in RHS stmt-expr with LHS indirection: must reject");
+		prism_free(&r);
+	}
+
+	// 8. RHS without LHS indirection is OK — typeof(LHS) is used,
+	//    RHS is only emitted once.
+	{
+		PrismResult r = prism_transpile_source(
+		    "void lock(void);\n"
+		    "void unlock(void);\n"
+		    "int kernel_task(void) {\n"
+		    "    int val;\n"
+		    "    val = ({ { defer unlock(); lock(); } 0; }) orelse 5;\n"
+		    "    return val;\n"
+		    "}\n",
+		    "spec_ctrl8.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "defer in RHS without LHS indirection: must accept");
+		prism_free(&r);
+	}
+}
+
+// ── type specifier ctrl-flow keyword rejection ─────────────────────────
+// Type specifiers (typeof, _Atomic) can be emitted multiple times by
+// const orelse fallback and multi-declarator splits.  Control-flow
+// keywords inside stmt-exprs in the type specifier would be processed
+// N times at compile time, corrupting the defer stack / goto cursor.
+static void spec_typeof_ctrl_flow_rejection(void) {
+	printf("\n--- type specifier ctrl-flow keyword rejection ---\n");
+
+	// 1. defer in typeof — const orelse duplicates the type specifier
+	{
+		PrismResult r = prism_transpile_source(
+		    "void lock(void);\n"
+		    "void unlock(void);\n"
+		    "void kernel_task(void) {\n"
+		    "    const typeof(({ { defer unlock(); lock(); } 0; })) val = 5 orelse 10;\n"
+		    "    (void)val;\n"
+		    "}\n",
+		    "spec_ts1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "defer in typeof const orelse: must reject");
+		prism_free(&r);
+	}
+
+	// 2. goto in typeof
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    typeof(({ goto skip; 0; })) x = 5;\n"
+		    "skip: (void)x;\n"
+		    "}\n",
+		    "spec_ts2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "goto in typeof: must reject");
+		prism_free(&r);
+	}
+
+	// 3. return in typeof
+	{
+		PrismResult r = prism_transpile_source(
+		    "int f(void) {\n"
+		    "    typeof(({ return 0; 1; })) x = 5;\n"
+		    "    return x;\n"
+		    "}\n",
+		    "spec_ts3.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "return in typeof: must reject");
+		prism_free(&r);
+	}
+
+	// 4. typeof without ctrl-flow is OK
+	{
+		PrismResult r = prism_transpile_source(
+		    "int f(void) {\n"
+		    "    typeof(({ int tmp = 5; tmp; })) x = 10;\n"
+		    "    return x;\n"
+		    "}\n",
+		    "spec_ts4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "typeof without ctrl-flow: must accept");
+		prism_free(&r);
+	}
+}
+
+// ── C23 auto/constexpr orelse ──
+static void spec_c23_auto_constexpr_orelse(void) {
+	printf("\n--- C23 auto/constexpr orelse ---\n");
+
+	// 1. auto orelse value fallback: must accept (initializer preserved)
+	{
+		PrismResult r = prism_transpile_source(
+		    "int *get(void) { return 0; }\n"
+		    "int *fb(void) { static int v = 99; return &v; }\n"
+		    "void f(void) {\n"
+		    "    auto x = get() orelse fb();\n"
+		    "    (void)x;\n"
+		    "}\n",
+		    "spec_c23_1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "auto orelse value fallback: must accept");
+		prism_free(&r);
+	}
+
+	// 2. auto orelse ctrl-flow action: must accept (initializer preserved)
+	{
+		PrismResult r = prism_transpile_source(
+		    "int *get(void) { return 0; }\n"
+		    "int test(void) {\n"
+		    "    auto ptr = get() orelse return -1;\n"
+		    "    return *ptr;\n"
+		    "}\n",
+		    "spec_c23_2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "auto orelse ctrl-flow: must accept");
+		prism_free(&r);
+	}
+
+	// 3. constexpr orelse: must reject (compile-time constant required)
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get(void) { return 0; }\n"
+		    "void f(void) {\n"
+		    "    constexpr int x = get() orelse 5;\n"
+		    "    (void)x;\n"
+		    "}\n",
+		    "spec_c23_3.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "constexpr orelse: must reject");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "constexpr") != NULL,
+			      "constexpr orelse: error mentions constexpr");
+		prism_free(&r);
+	}
+
+	// 4. const auto orelse: must accept (const path preserves initializer)
+	{
+		PrismResult r = prism_transpile_source(
+		    "int *get(void) { static int v = 42; return &v; }\n"
+		    "int *fb(void) { static int v = 99; return &v; }\n"
+		    "void f(void) {\n"
+		    "    const auto x = get() orelse fb();\n"
+		    "    (void)x;\n"
+		    "}\n",
+		    "spec_c23_4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "const auto orelse: must accept");
+		prism_free(&r);
+	}
+
+	// 5. plain auto without orelse: must accept
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    auto x = 42;\n"
+		    "    (void)x;\n"
+		    "}\n",
+		    "spec_c23_5.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "auto without orelse: must accept");
+		prism_free(&r);
+	}
+
+	// 6. constexpr without orelse: must accept
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    constexpr int limit = 100;\n"
+		    "    (void)limit;\n"
+		    "}\n",
+		    "spec_c23_6.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "constexpr without orelse: must accept");
+		prism_free(&r);
+	}
+}
+
+// ── _Generic cast-prefix injection ──
+static void spec_generic_cast_prefix(void) {
+	printf("\n--- _Generic cast-prefix injection ---\n");
+
+	// 1. Cast before bare ident: prefix must be injected after cast
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct Drv { int (*read)(void); };\n"
+		    "int read(void);\n"
+		    "void f(struct Drv *d) {\n"
+		    "    int (*fp)(void) = d->_Generic(0,\n"
+		    "        int: (int (*)(void))read\n"
+		    "    );\n"
+		    "    (void)fp;\n"
+		    "}\n",
+		    "spec_gc1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "_Generic cast bare ident: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "d->read") != NULL,
+			      "_Generic cast bare ident: prefix injected");
+		prism_free(&r);
+	}
+
+	// 2. Cast before call: prefix must be injected
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct Drv { int (*read)(void); };\n"
+		    "int read(void);\n"
+		    "void f(struct Drv *d) {\n"
+		    "    int val = d->_Generic(0,\n"
+		    "        int: (int (*)(void))read\n"
+		    "    )();\n"
+		    "    (void)val;\n"
+		    "}\n",
+		    "spec_gc2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "_Generic cast call: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "d->read") != NULL,
+			      "_Generic cast call: prefix injected");
+		prism_free(&r);
+	}
+
+	// 3. Double cast: prefix must be injected
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct Drv { int (*process)(int); };\n"
+		    "void f(struct Drv *d) {\n"
+		    "    int (*fp)(int) = d->_Generic(0,\n"
+		    "        int: (int (*)(int))(void *)process\n"
+		    "    );\n"
+		    "    (void)fp;\n"
+		    "}\n",
+		    "spec_gc3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "_Generic double cast: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "d->process") != NULL,
+			      "_Generic double cast: prefix injected");
+		prism_free(&r);
+	}
+
+	// 4. No cast (baseline): prefix injected as before
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct Drv { int (*read)(void); };\n"
+		    "void f(struct Drv *d) {\n"
+		    "    int val = d->_Generic(0,\n"
+		    "        int: read\n"
+		    "    )();\n"
+		    "    (void)val;\n"
+		    "}\n",
+		    "spec_gc4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "_Generic no cast: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "d->read") != NULL,
+			      "_Generic no cast: prefix injected");
+		prism_free(&r);
+	}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1869,4 +2154,13 @@ void run_spec_tests(void) {
 
 	// ── orelse ctrl-flow keyword rejection ──
 	spec_orelse_ctrl_flow_keyword_rejection();
+
+	// ── typeof ctrl-flow keyword rejection ──
+	spec_typeof_ctrl_flow_rejection();
+
+	// ── C23 auto/constexpr orelse ──
+	spec_c23_auto_constexpr_orelse();
+
+	// ── _Generic cast-prefix injection ──
+	spec_generic_cast_prefix();
 }

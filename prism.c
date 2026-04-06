@@ -1833,6 +1833,22 @@ static Token *try_generic_member_rewrite(Token *tok) {
 				    (after_vs->tag & TT_MEMBER))
 					val_bare_ident = true;
 			}
+			// Probe past leading C-style casts: (type)ident
+			if (!val_has_call && !val_bare_ident && vs) {
+				Token *probe = vs;
+				while (probe && match_ch(probe, '(') &&
+				       (probe->flags & TF_OPEN) && tok_match(probe))
+					probe = tok_next(tok_match(probe));
+				if (probe && is_valid_varname(probe)) {
+					Token *ap = tok_next(probe);
+					if (!ap || ap == close || match_ch(ap, ',') ||
+					    match_ch(ap, ')') || match_ch(ap, '[') ||
+					    (ap->tag & TT_MEMBER))
+						val_bare_ident = true;
+					else if (match_ch(ap, '('))
+						val_has_call = true;
+				}
+			}
 			// Check for ternary expression in branch value.
 			if (!val_has_call && !val_bare_ident) {
 				for (Token *s = vs; s && s != close; s = tok_next(s)) {
@@ -3271,6 +3287,11 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 				  "variable with static or thread storage duration "
 				  "(the runtime fallback check would re-execute on "
 				  "every function entry, destroying persistence)");
+		if (orelse_info.orelse_tok && type->has_constexpr)
+			error_tok(orelse_info.orelse_tok,
+				  "'orelse' cannot be used with 'constexpr' "
+				  "(constexpr requires a compile-time constant "
+				  "initializer; orelse produces runtime fallback code)");
 
 		// Step 2b: Pre-hoist bracket orelse temps (before type emission)
 		bool has_bo = FEAT(F_ORELSE) && declarator_has_bracket_orelse(decl_start, decl.end);
@@ -5329,9 +5350,24 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 			//            typeof(LHS) t1=(b); LHS = t1 ? t1 : (c); } }
 			unsigned oe_id = ctx->ret_counter++;
 			OUT_LIT("{ "); emit_typeof_keyword(); out_char('(');
-			if (lhs_has_indirection)
+			if (lhs_has_indirection) {
+				// typeof(RHS) emits the RHS tokens once here, then
+				// again below for the assignment.  typeof() doesn't
+				// evaluate at runtime, but Prism's emit_balanced_range
+				// traverses the tokens at compile time — any defer/goto/
+				// return/break/continue inside a stmt-expr would be
+				// processed twice by the state machine, corrupting the
+				// defer stack (double-free) or goto_entry_cursor.
+				for (Token *s = tok_next(bare_assign_eq); s && s != orelse_tok && s->kind != TK_EOF; s = tok_next(s))
+					if (s->tag & (TT_GOTO | TT_RETURN | TT_BREAK | TT_CONTINUE | TT_DEFER))
+						error_tok(s, "bare assignment orelse with LHS indirection "
+							  "cannot contain control flow keywords in the "
+							  "right-hand expression (the expression is "
+							  "duplicated inside typeof(), which would corrupt "
+							  "transpiler control-flow tracking); hoist the "
+							  "expression to a variable first");
 				emit_balanced_range(tok_next(bare_assign_eq), orelse_tok);
-			else
+			} else
 				emit_range_no_prep(bare_lhs_start, bare_assign_eq);
 			OUT_LIT(") __prism_oe_");
 			out_uint(oe_id);
