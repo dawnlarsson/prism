@@ -3068,6 +3068,45 @@ static void test_array_size_is_vla_depth_guard(void) {
 	prism_free(&r);
 }
 
+#ifdef __GNUC__
+static void test_extension_zeroinit(void) {
+	// Scalar
+	__extension__ int ext_i;
+	CHECK_EQ(ext_i, 0, "__extension__ int zero-init");
+
+	// Struct
+	__extension__ struct { int a; int b; } ext_s;
+	CHECK_EQ(ext_s.a, 0, "__extension__ struct.a zero-init");
+	CHECK_EQ(ext_s.b, 0, "__extension__ struct.b zero-init");
+
+	// Pointer
+	__extension__ void *ext_p;
+	CHECK(ext_p == NULL, "__extension__ pointer zero-init");
+
+	// Array
+	__extension__ int ext_arr[4];
+	int ext_ok = 1;
+	for (int i = 0; i < 4; i++)
+		if (ext_arr[i] != 0) ext_ok = 0;
+	CHECK(ext_ok, "__extension__ array zero-init");
+
+	// Transpile-level: verify = {0} or memset is present
+	PrismResult r = prism_transpile_source(
+		"void f(void) { __extension__ int x; }\n",
+		"ext_zi.c", prism_defaults());
+	CHECK(r.status == PRISM_OK, "__extension__ zeroinit: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "= 0") != NULL || has_zeroing(r.output),
+		      "__extension__ zeroinit: output has initialization");
+	}
+	prism_free(&r);
+
+	// Chained __extension__
+	__extension__ __extension__ int ext_chain;
+	CHECK_EQ(ext_chain, 0, "chained __extension__ zero-init");
+}
+#endif
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -3215,4 +3254,7 @@ void run_zeroinit_tests(void) {
 
 	// AUDIT: parenthesized function typedef (A5)
 	test_paren_func_typedef_zeroinit();
+
+	// __extension__ zero-init bypass
+	GNUC_ONLY(test_extension_zeroinit());
 }

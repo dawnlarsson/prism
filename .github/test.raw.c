@@ -1408,6 +1408,92 @@ static void test_raw_per_declarator_vla_cfg_bypass(void) {
 	}
 }
 
+// BUG_RAW_CAST: raw keyword inside cast expressions leaked verbatim to output
+// because walk_balanced (used by emit_decl_init_walk for balanced groups)
+// emitted tokens without checking try_strip_raw.
+static void test_raw_cast_expression_leak(void) {
+	printf("\n--- raw cast expression leak ---\n");
+
+	// Case 1: raw inside cast in initializer — the original VULN2
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    int arr[4] = {1,2,3,4};\n"
+		    "    int *p = arr;\n"
+		    "    int val = *(raw int *)p;\n"
+		    "    (void)val;\n"
+		    "}\n",
+		    "rw_cast1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-cast1: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "raw") == NULL,
+			      "raw-cast1: raw must not leak in cast expression");
+		prism_free(&r);
+	}
+	// Case 2: raw in compound literal cast
+	{
+		PrismResult r = prism_transpile_source(
+		    "typedef struct { int x; int y; } Pt;\n"
+		    "void f(void) {\n"
+		    "    Pt pt = (raw Pt){0};\n"
+		    "    (void)pt;\n"
+		    "}\n",
+		    "rw_cast2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-cast2: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "raw") == NULL,
+			      "raw-cast2: raw must not leak in compound literal");
+		prism_free(&r);
+	}
+	// Case 3: raw in sizeof cast
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    int n = sizeof(raw int);\n"
+		    "    (void)n;\n"
+		    "}\n",
+		    "rw_cast3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-cast3: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "raw") == NULL,
+			      "raw-cast3: raw must not leak in sizeof");
+		prism_free(&r);
+	}
+	// Case 4: raw in nested cast inside function args
+	{
+		PrismResult r = prism_transpile_source(
+		    "int use(int);\n"
+		    "void f(void) {\n"
+		    "    long x = 42;\n"
+		    "    int val = use((raw int)x);\n"
+		    "    (void)val;\n"
+		    "}\n",
+		    "rw_cast4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-cast4: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "raw") == NULL,
+			      "raw-cast4: raw must not leak in nested cast");
+		prism_free(&r);
+	}
+	// Case 5: raw at stmt_start must still work (baseline)
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    raw int x;\n"
+		    "    (void)x;\n"
+		    "}\n",
+		    "rw_cast5.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-cast5: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "raw") == NULL,
+			      "raw-cast5: raw stripped at stmt_start");
+			CHECK(strstr(r.output, "= 0") == NULL,
+			      "raw-cast5: raw suppresses zero-init");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_raw_tests(void) {
 	printf("\n=== RAW KEYWORD TESTS ===\n");
 
@@ -1525,4 +1611,7 @@ void run_raw_tests(void) {
 
 	// per-declarator raw hiding VLA from CFG verifier
 	test_raw_per_declarator_vla_cfg_bypass();
+
+	// raw keyword leaking in cast / sizeof / compound literal expressions
+	test_raw_cast_expression_leak();
 }

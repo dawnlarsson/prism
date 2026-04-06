@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 1.0.5
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4159+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4246+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do.
 
@@ -360,6 +360,9 @@ Rejected patterns inside defer bodies:
 - `goto`
 - `break` / `continue` (since `in_loop=false, in_switch=false`, these always error)
 - Recurses into GNU statement expressions `({…})` — `return`/`goto`/`break`/`continue` inside a stmt-expr in a defer body is rejected
+- Recurses into `orelse { … }` blocks — control-flow keywords inside orelse action blocks in defer bodies are validated
+
+**Control-flow condition head scanning:** `skip_defer_control_head` (used to advance past the `(…)` condition of `if`/`while`/`for`/`switch`/`do-while`) calls `defer_scan_hidden_stmt_exprs` on the condition parens before skipping past them. This ensures that statement expressions inside control-flow conditions (e.g., `if ( ({ return 1; 1; }) )`) are scanned for forbidden control-flow keywords. Without this, `return`/`goto`/`break`/`continue` hidden inside a statement expression in a condition head would bypass Phase 1F validation entirely.
 
 **Case/default label scanning:** When `validate_defer_statement` encounters a `case` or `default` label, it scans forward to the terminating `:` using ternary depth tracking (`?` increments, `:` at `td > 0` decrements, `:` at `td == 0` terminates). This correctly handles `case 1 ? 2 : 3:` — matching the pattern used by Phase 1D and `skip_one_stmt`.
 
@@ -489,6 +492,8 @@ The scan covers two ranges: enclosing-scope defers `[0, blk->defer_start_idx)` a
 
 `check_enum_typedef_defer_shadow` extends this protection to enum constants and typedef names. Called from the main Pass 2 loop at statement-start for enum definitions (`enum { name = val, ... }`) and typedef declarations (`typedef type name`), which bypass `process_declarators` and would otherwise evade shadow detection. Each introduced name is checked against active defer bodies via `check_defer_var_shadow`.
 
+**Ghost enum in mid-expression contexts:** Enum definitions inside `sizeof(…)`, casts `(enum { … })expr`, and `typeof(…)` bypass the statement-start `check_enum_typedef_defer_shadow` call. Phase 1D catches these via `p1d_scan_balanced_group`, which scans inside balanced `(…)` and `[…]` groups for enum definitions with `{` bodies, calling `p1_check_enum_body_defer_shadow` on each. This covers `sizeof(enum { val = 0 })`, `(enum { val = 0 })0`, and `typeof(enum { val = 0 })` patterns where an enum constant could shadow a name captured by an active defer body.
+
 ---
 
 ## 6. Language Features
@@ -585,6 +590,8 @@ These helpers are used at 20+ call sites across Phase 1D prescan, Phase 1G orels
 
 **Scope:** Only inside function bodies (`block_depth > 0`). Not at file scope. Not inside struct/union/enum definitions.
 
+**Declaration prefix handling:** `try_zero_init_decl` skips storage class specifiers (`static`, `extern`, etc.), `inline`, and `__extension__` to reach the actual type keyword. The P1_IS_DECL fast gate probes past these prefixes (`TT_STORAGE | TT_INLINE | TT_SKIP_DECL`) to find the Phase 1D annotation on the type-start token, ensuring `__extension__ int x;` and `__extension__ struct S s;` receive zero-initialization correctly. Phase 1D's prescan also skips `__extension__` (tagged `TT_INLINE`) at statement start before type parsing.
+
 **Storage class exclusions:** Variables with `static`, `extern`, `_Thread_local`, or `thread_local` storage class are **not** zero-initialized. C guarantees these are zero-initialized by the loader (static/extern) or runtime (_Thread_local/thread_local). Emitting `= 0` for static locals would move them from `.bss` to `.data`; emitting `memset` would re-zero them on every function entry, breaking static semantics.
 
 **Typedef awareness:** Uses the immutable typedef table to distinguish `size_t x;` (declaration → initialize) from `size_t * x;` (could be expression → don't touch). Tracks `is_aggregate` to handle struct typedefs that need `= {0}` instead of `= 0`.
@@ -641,6 +648,7 @@ GNU statement expressions `({…})` are supported. They get their own scope in t
 3. Must be inside a function body (`block_depth > 0`)
 4. Must NOT be in a braceless control body (would create a multi-statement body without braces)
 5. The `__builtin_unreachable();` is emitted immediately after the `;`
+6. The predecessor token must NOT be a type keyword, qualifier, storage class, `*`, or member operator — these indicate a forward declaration (`void abort(void);`) or struct field, not a call. `try_detect_noreturn_call` performs this backward check to avoid injecting `__builtin_unreachable()` after declaration prototypes
 
 **Disable:** `-fno-auto-unreachable` or `features.auto_unreachable = false` in library mode.
 

@@ -5317,6 +5317,175 @@ static void test_defer_scope_init_block_depth_desync(void) {
 	}
 }
 
+static void test_ghost_enum_defer_shadow(void) {
+	// Ghost enum in sizeof: enum constant shadows a defer-captured variable
+	const char *code_sizeof =
+		"int secret;\n"
+		"void f(void) {\n"
+		"    defer (void)secret;\n"
+		"    int x = sizeof(enum { secret = 0 });\n"
+		"}\n";
+	PrismResult r1 = prism_transpile_source(code_sizeof, "ghost_sz.c", prism_defaults());
+	CHECK(r1.status != PRISM_OK,
+	      "ghost enum defer shadow (sizeof): must be rejected");
+	CHECK(r1.error_msg && strstr(r1.error_msg, "shadows"),
+	      "ghost enum defer shadow (sizeof): error mentions shadows");
+	prism_free(&r1);
+
+	// Ghost enum in cast
+	const char *code_cast =
+		"int key;\n"
+		"void f(void) {\n"
+		"    defer (void)key;\n"
+		"    int x = (enum { key = 0 })0;\n"
+		"}\n";
+	PrismResult r2 = prism_transpile_source(code_cast, "ghost_cast.c", prism_defaults());
+	CHECK(r2.status != PRISM_OK,
+	      "ghost enum defer shadow (cast): must be rejected");
+	prism_free(&r2);
+
+	// Ghost enum in typeof
+	const char *code_typeof =
+		"int val;\n"
+		"void f(void) {\n"
+		"    defer (void)val;\n"
+		"    typeof(enum { val = 0 }) x;\n"
+		"}\n";
+	PrismResult r3 = prism_transpile_source(code_typeof, "ghost_to.c", prism_defaults());
+	CHECK(r3.status != PRISM_OK,
+	      "ghost enum defer shadow (typeof): must be rejected");
+	prism_free(&r3);
+
+	// Statement-start enum: already caught (sanity check)
+	const char *code_stmt =
+		"int val;\n"
+		"void f(void) {\n"
+		"    defer (void)val;\n"
+		"    enum { val = 0 };\n"
+		"}\n";
+	PrismResult r4 = prism_transpile_source(code_stmt, "ghost_stmt.c", prism_defaults());
+	CHECK(r4.status != PRISM_OK,
+	      "ghost enum defer shadow (stmt): must be rejected");
+	prism_free(&r4);
+
+	// No shadow — must still compile fine
+	const char *code_ok =
+		"int val;\n"
+		"void f(void) {\n"
+		"    defer (void)val;\n"
+		"    int x = sizeof(enum { unrelated = 0 });\n"
+		"}\n";
+	PrismResult r5 = prism_transpile_source(code_ok, "ghost_ok.c", prism_defaults());
+	CHECK(r5.status == PRISM_OK,
+	      "ghost enum no shadow: must compile OK");
+	prism_free(&r5);
+}
+
+static void test_defer_stmtexpr_ctrl_head_escape(void) {
+	// return in stmt-expr inside if-condition in defer
+	const char *code_if_return =
+		"#include <stdio.h>\n"
+		"int main(void) {\n"
+		"    defer {\n"
+		"        if ( ({ return 1; 1; }) ) printf(\"x\\n\");\n"
+		"    }\n"
+		"    return 0;\n"
+		"}\n";
+	PrismResult r1 = prism_transpile_source(code_if_return, "dse_if.c", prism_defaults());
+	CHECK(r1.status != PRISM_OK,
+	      "defer stmt-expr in if-condition (return): must be rejected");
+	CHECK(r1.error_msg && strstr(r1.error_msg, "return"),
+	      "defer stmt-expr in if-condition: error mentions return");
+	prism_free(&r1);
+
+	// goto in stmt-expr inside if-condition in defer
+	const char *code_if_goto =
+		"#include <stdio.h>\n"
+		"int main(void) {\n"
+		"    defer {\n"
+		"        if ( ({ goto bail; 1; }) ) printf(\"x\\n\");\n"
+		"    }\n"
+		"    return 0;\n"
+		"bail: return 1;\n"
+		"}\n";
+	PrismResult r2 = prism_transpile_source(code_if_goto, "dse_go.c", prism_defaults());
+	CHECK(r2.status != PRISM_OK,
+	      "defer stmt-expr in if-condition (goto): must be rejected");
+	CHECK(r2.error_msg && strstr(r2.error_msg, "goto"),
+	      "defer stmt-expr in if-condition: error mentions goto");
+	prism_free(&r2);
+
+	// return in stmt-expr inside while-condition in defer
+	const char *code_while =
+		"#include <stdio.h>\n"
+		"int main(void) {\n"
+		"    defer {\n"
+		"        while ( ({ return 1; 0; }) ) printf(\"x\\n\");\n"
+		"    }\n"
+		"    return 0;\n"
+		"}\n";
+	PrismResult r3 = prism_transpile_source(code_while, "dse_wh.c", prism_defaults());
+	CHECK(r3.status != PRISM_OK,
+	      "defer stmt-expr in while-condition: must be rejected");
+	prism_free(&r3);
+
+	// return in stmt-expr inside switch-condition in defer
+	const char *code_switch =
+		"#include <stdio.h>\n"
+		"int main(void) {\n"
+		"    defer {\n"
+		"        switch ( ({ return 1; 0; }) ) { default: break; }\n"
+		"    }\n"
+		"    return 0;\n"
+		"}\n";
+	PrismResult r4 = prism_transpile_source(code_switch, "dse_sw.c", prism_defaults());
+	CHECK(r4.status != PRISM_OK,
+	      "defer stmt-expr in switch-condition: must be rejected");
+	prism_free(&r4);
+
+	// return in stmt-expr inside do-while condition in defer
+	const char *code_do =
+		"#include <stdio.h>\n"
+		"int main(void) {\n"
+		"    defer {\n"
+		"        do { printf(\"x\\n\"); } while ( ({ return 1; 0; }) );\n"
+		"    }\n"
+		"    return 0;\n"
+		"}\n";
+	PrismResult r5 = prism_transpile_source(code_do, "dse_do.c", prism_defaults());
+	CHECK(r5.status != PRISM_OK,
+	      "defer stmt-expr in do-while condition: must be rejected");
+	prism_free(&r5);
+
+	// return in stmt-expr inside for-condition in defer
+	const char *code_for =
+		"#include <stdio.h>\n"
+		"int main(void) {\n"
+		"    defer {\n"
+		"        for (int i = ({ return 1; 0; }); i < 1; i++) printf(\"x\\n\");\n"
+		"    }\n"
+		"    return 0;\n"
+		"}\n";
+	PrismResult r6 = prism_transpile_source(code_for, "dse_for.c", prism_defaults());
+	CHECK(r6.status != PRISM_OK,
+	      "defer stmt-expr in for-condition: must be rejected");
+	prism_free(&r6);
+
+	// Valid: stmt-expr in condition WITHOUT control flow must still work
+	const char *code_ok =
+		"#include <stdio.h>\n"
+		"int main(void) {\n"
+		"    defer {\n"
+		"        if ( ({ int x = 1; x; }) ) printf(\"valid\\n\");\n"
+		"    }\n"
+		"    return 0;\n"
+		"}\n";
+	PrismResult r7 = prism_transpile_source(code_ok, "dse_ok.c", prism_defaults());
+	CHECK(r7.status == PRISM_OK,
+	      "defer stmt-expr in condition (no ctrl flow): must compile OK");
+	prism_free(&r7);
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_rejected();
@@ -5599,4 +5768,10 @@ void run_defer_tests(void) {
 	test_defer_orelse_in_stmtexpr_ctrl_condition();
 	test_defer_zeroinit_for_init_ctrl_flow();
 	test_defer_scope_init_block_depth_desync();
+
+        // ghost enum in sizeof/cast/typeof must be caught by defer shadow check
+        test_ghost_enum_defer_shadow();
+
+	// stmt-expr in control-flow condition heads inside defer must be scanned
+	test_defer_stmtexpr_ctrl_head_escape();
 }

@@ -968,7 +968,7 @@ static void init_keyword_map(void) {
 	    {"__declspec", TT_ATTR | TT_QUALIFIER, true},
 	    {"_Pragma", TT_ATTR, true},
 	    {"__pragma", TT_ATTR, true},
-	    {"__extension__", TT_SKIP_DECL, true},
+	    {"__extension__", TT_INLINE, true},
 	    {"__builtin_va_list", 0, true},
 	    {"__builtin_va_arg", 0, true},
 	    {"__builtin_offsetof", 0, true, TF_SIZEOF},
@@ -2735,7 +2735,12 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 
 		uint32_t tag = tok->tag;
 		bool is_type = is_type_keyword(tok);
-		if (!(tag & (TT_QUALIFIER | TT_STORAGE)) && !is_type && !(tag & (TT_BITINT | TT_ALIGNAS))) break;
+		if (!(tag & (TT_QUALIFIER | TT_STORAGE | TT_INLINE)) && !is_type && !(tag & (TT_BITINT | TT_ALIGNAS))) break;
+
+		// Skip inline/_Noreturn/__extension__ — valid prefix, no type info
+		if ((tag & TT_INLINE) && !(tag & (TT_QUALIFIER | TT_STORAGE))) {
+			tok = tok_next(tok); r.end = tok; continue;
+		}
 
 		if (equal(tok, "void") || is_void_typedef(tok)) r.has_void = true;
 
@@ -3176,9 +3181,14 @@ static Token *p1_find_prev_skipping_attrs(uint32_t before_idx) {
 
 // --- Defer Validation (Phase 1F) ---
 
-static inline Token *skip_defer_control_head(Token *tok) {
+static void defer_scan_hidden_stmt_exprs(Token *open, bool in_loop, bool in_switch, int depth);
+
+static inline Token *skip_defer_control_head(Token *tok, bool in_loop, bool in_switch, int depth) {
 	tok = skip_noise(tok);
-	if (tok && match_ch(tok, '(') && tok_match(tok)) return tok_next(tok_match(tok));
+	if (tok && match_ch(tok, '(') && tok_match(tok)) {
+		defer_scan_hidden_stmt_exprs(tok, in_loop, in_switch, depth);
+		return tok_next(tok_match(tok));
+	}
 	return tok;
 }
 
@@ -3223,7 +3233,7 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 	}
 
 	if ((tok->tag & TT_IF) && tok->ch0 == 'i') {
-		Token *after_then = validate_defer_statement(skip_defer_control_head(tok_next(tok)), in_loop, in_switch, depth + 1);
+		Token *after_then = validate_defer_statement(skip_defer_control_head(tok_next(tok), in_loop, in_switch, depth), in_loop, in_switch, depth + 1);
 		Token *else_tok = skip_noise(after_then);
 		if (else_tok && (else_tok->tag & TT_IF) && else_tok->ch0 == 'e')
 			return validate_defer_statement(tok_next(else_tok), in_loop, in_switch, depth + 1);
@@ -3246,20 +3256,20 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 	}
 
 	if (tok->tag & TT_SWITCH)
-		return validate_defer_statement(skip_defer_control_head(tok_next(tok)), in_loop, true, depth + 1);
+		return validate_defer_statement(skip_defer_control_head(tok_next(tok), in_loop, true, depth), in_loop, true, depth + 1);
 
 	if (tok->tag & TT_LOOP) {
 		if (tok->ch0 == 'd') {
 			tok = validate_defer_statement(tok_next(tok), true, in_switch, depth + 1);
 			Token *w = skip_noise(tok);
 			if (w && (w->tag & TT_LOOP) && w->ch0 == 'w') {
-				tok = skip_defer_control_head(tok_next(w));
+				tok = skip_defer_control_head(tok_next(w), true, in_switch, depth);
 				tok = skip_noise(tok);
 				if (tok && match_ch(tok, ';')) tok = tok_next(tok);
 			}
 			return tok;
 		}
-		return validate_defer_statement(skip_defer_control_head(tok_next(tok)), true, in_switch, depth + 1);
+		return validate_defer_statement(skip_defer_control_head(tok_next(tok), true, in_switch, depth), true, in_switch, depth + 1);
 	}
 
 	if (tok->flags & TF_OPEN) {
@@ -3547,7 +3557,15 @@ static bool generic_member_rewrite_target(Token *generic_tok, Token **name_out,
 // Detect noreturn function call: tok(args);
 static inline Token *try_detect_noreturn_call(Token *tok) {
 	if (!(tok->tag & TT_NORETURN_FN)) return NULL;
-	if (tok_idx(tok) >= 1 && (token_pool[tok_idx(tok) - 1].tag & TT_MEMBER)) return NULL;
+	if (tok_idx(tok) >= 1) {
+		Token *prev = &token_pool[tok_idx(tok) - 1];
+		if (prev->tag & TT_MEMBER) return NULL;
+		// Predecessor is a type keyword/qualifier/storage/_Noreturn/void/*
+		// → this is a forward declaration, not a call.
+		if (prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_INLINE | TT_SUE))
+			return NULL;
+		if (match_ch(prev, '*')) return NULL;
+	}
 	Token *call = tok_next(tok);
 	if (!call || !match_ch(call, '(') || !tok_match(call)) return NULL;
 	Token *after = tok_next(tok_match(call));

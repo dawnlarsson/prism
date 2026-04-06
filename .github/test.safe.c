@@ -5009,6 +5009,59 @@ static void test_union_padding_zeroinit(void) {
 	prism_free(&r);
 }
 
+static void test_noreturn_fwd_decl_no_crash(void) {
+	// _Noreturn forward declaration inside a function body must NOT
+	// inject __builtin_unreachable() after it — that's a declaration,
+	// not a call.
+	const char *code =
+		"#include <stdlib.h>\n"
+		"void die(int code) { exit(code); }\n"
+		"int test(void) {\n"
+		"    _Noreturn void die(int);\n"
+		"    return 0;\n"
+		"}\n"
+		"int main(void) { return test(); }\n";
+	PrismResult r = prism_transpile_source(code, "nr_fwd.c", prism_defaults());
+	CHECK(r.status == PRISM_OK, "noreturn fwd decl: transpiles OK");
+	if (r.output) {
+		// The transpiled output must NOT have __builtin_unreachable after the declaration
+		char *decl = strstr(r.output, "_Noreturn void die(int);");
+		if (decl) {
+			char *after = decl + strlen("_Noreturn void die(int);");
+			CHECK(strstr(after, "return") != NULL,
+			      "noreturn fwd decl: return statement not eliminated");
+		}
+#ifndef _WIN32
+		check_transpiled_output_compiles_and_runs(
+			r.output,
+			"noreturn fwd decl: compiles",
+			"noreturn fwd decl: runs without crash");
+#endif
+	}
+	prism_free(&r);
+
+	// __attribute__((noreturn)) form
+	const char *code2 =
+		"#include <stdlib.h>\n"
+		"void die2(int code) { exit(code); }\n"
+		"int test2(void) {\n"
+		"    __attribute__((noreturn)) void die2(int);\n"
+		"    return 0;\n"
+		"}\n"
+		"int main(void) { return test2(); }\n";
+	PrismResult r2 = prism_transpile_source(code2, "nr_fwd2.c", prism_defaults());
+	CHECK(r2.status == PRISM_OK, "noreturn fwd decl (attr): transpiles OK");
+	if (r2.output) {
+#ifndef _WIN32
+		check_transpiled_output_compiles_and_runs(
+			r2.output,
+			"noreturn fwd decl (attr): compiles",
+			"noreturn fwd decl (attr): runs without crash");
+#endif
+	}
+	prism_free(&r2);
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -5370,4 +5423,7 @@ void run_safe_tests(void) {
                 CHECK(cnt == 1, "nested stmtexpr ctrl desync: defer fires once in if-body");
         }
         );
+
+        // noreturn forward declaration must not inject __builtin_unreachable
+        test_noreturn_fwd_decl_no_crash();
 }

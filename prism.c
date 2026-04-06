@@ -360,6 +360,7 @@ static Token *decl_noise(Token *tok, bool emit);
 static Token *walk_balanced(Token *tok, bool emit);
 static Token *walk_balanced_orelse(Token *tok);
 static void emit_noise_between_raws(Token *first_raw, Token *last_raw);
+static inline Token *try_strip_raw(Token *t);
 static inline void out_char(char c);
 static inline void out_str(const char *s, int len);
 #define OUT_TOK(t) out_str(tok_loc(t), (t)->len)
@@ -829,8 +830,8 @@ static bool __attribute__((noinline)) emit_tok_special(Token *tok) {
 
 static void emit_tok(Token *tok) {
 	// Save pre-emission absolute output position for _Generic member-injection rewind.
-	emit_save_ring[emit_save_idx & EMIT_SAVE_RING_MASK] =
-		(typeof(emit_save_ring[0])){out_total_flushed + out_buf_pos, tok_idx(tok)};
+	emit_save_ring[emit_save_idx & EMIT_SAVE_RING_MASK].abs_pos = out_total_flushed + out_buf_pos;
+	emit_save_ring[emit_save_idx & EMIT_SAVE_RING_MASK].tpi = tok_idx(tok);
 	emit_save_idx++;
 
 	TokenCold *c = tok_cold(tok);
@@ -886,13 +887,15 @@ static void emit_tok(Token *tok) {
 #define ER_BALANCED     2  // Use walk_balanced for paren/bracket groups (not just stmt-expr)
 
 static void emit_range_ex(Token *start, Token *end, int flags) {
-	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
-		if ((flags & ER_SKIP_PREP) && t->kind == TK_PREP_DIR) continue;
+	Token *t = start;
+	while (t && t != end && t->kind != TK_EOF) {
+		if ((flags & ER_SKIP_PREP) && t->kind == TK_PREP_DIR) { t = tok_next(t); continue; }
 		if ((flags & ER_BALANCED) && (t->flags & TF_OPEN) && match_set(t, CH('(') | CH('['))) {
-			walk_balanced(t, true); t = tok_match(t); continue;
+			walk_balanced(t, true); t = tok_next(tok_match(t)); continue;
 		}
-		if (is_stmt_expr_open(t) && tok_match(t)) { walk_balanced(t, true); t = tok_match(t); continue; }
-		emit_tok(t);
+		if (is_stmt_expr_open(t) && tok_match(t)) { walk_balanced(t, true); t = tok_next(tok_match(t)); continue; }
+		{ Token *r = try_strip_raw(t); if (r) { t = r; continue; } }
+		emit_tok(t); t = tok_next(t);
 	}
 }
 
@@ -1875,6 +1878,8 @@ static Token *walk_balanced(Token *tok, bool emit) {
 				t = walk_balanced_orelse(t);
 				continue;
 			}
+			// Strip 'raw' keyword inside balanced groups (cast expressions, etc.)
+			{ Token *r = try_strip_raw(t); if (r) { t = r; continue; } }
 			emit_tok(t); t = tok_next(t);
 		}
 	}
@@ -5616,6 +5621,27 @@ p1_check_defer_same_block_shadow(Token *var_name, uint16_t cur_sid, int p1d_cur_
 	}
 }
 
+// Walk enum body `{ A, B = 1, C }` and run defer shadow check for each constant.
+static void
+p1_check_enum_body_defer_shadow(Token *brace, uint16_t cur_sid, int p1d_cur_func) {
+	if (!FEAT(F_DEFER) || p1d_cur_func < 0) return;
+	Token *end = tok_match(brace);
+	if (!end) return;
+	for (Token *t = tok_next(brace); t && t != end && t->kind != TK_EOF; ) {
+		if (is_valid_varname(t)) {
+			p1_check_defer_same_block_shadow(t, cur_sid, p1d_cur_func);
+			while (t && t != end && t->kind != TK_EOF && !match_ch(t, ',')) {
+				if (t->flags & TF_OPEN && tok_match(t))
+					{ t = tok_next(tok_match(t)); continue; }
+				t = tok_next(t);
+			}
+			if (t && match_ch(t, ',')) t = tok_next(t);
+		} else {
+			t = tok_next(t);
+		}
+	}
+}
+
 // Check defer compatibility and allocate P1K_DEFER entry.
 static void p1_try_alloc_defer(Token *tok, uint16_t cur_sid, int func_idx) {
 	uint16_t btag = func_meta[func_idx].body_open->tag;
@@ -6043,7 +6069,7 @@ static void p1d_check_multi_decl_constraints(Token *t, Token *type_tok,
 // Returns true if a statement expression was found (caller should process
 // tokens one by one instead of skipping the group).
 static Token *p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func,
-				      Token *prev_saved) {
+				      uint16_t cur_sid, Token *prev_saved) {
 	Token *group_end = tok_match(tok);
 	Token *stmt_expr_open = NULL;
 	Token *prev_inner = NULL;
@@ -6053,8 +6079,10 @@ static Token *p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func,
 		if (inner->flags & TF_CLOSE) { inner_depth--; prev_inner = inner; continue; }
 		if (is_enum_kw(inner)) {
 			Token *brace = find_struct_body_brace(inner);
-			if (brace)
+			if (brace) {
 				parse_enum_constants(brace, brace_depth);
+				p1_check_enum_body_defer_shadow(brace, cur_sid, cur_func);
+			}
 		}
 		if (!stmt_expr_open && match_ch(inner, '(') && tok_next(inner) &&
 		    match_ch(tok_next(inner), '{')) {
@@ -6603,8 +6631,10 @@ uint16_t sid = next_scope_id++;
 			// (e.g., (enum { N = 5 }) in array brackets or casts).
 			if (is_enum_kw(tok)) {
 				Token *brace = find_struct_body_brace(tok);
-				if (brace)
+				if (brace) {
 					parse_enum_constants(brace, brace_depth);
+					p1_check_enum_body_defer_shadow(brace, CUR_SID(), p1d_cur_func);
+				}
 			}
 
 			Token *p1d_prev_saved = p1d_prev;
@@ -6627,7 +6657,7 @@ uint16_t sid = next_scope_id++;
 				// Peek inside balanced groups for ghost enum definitions
 				// and nested statement expressions:
 				if (match_ch(tok, '(') || match_ch(tok, '[')) {
-					Token *se_open = p1d_scan_balanced_group(tok, brace_depth, p1d_cur_func, p1d_prev_saved);
+					Token *se_open = p1d_scan_balanced_group(tok, brace_depth, p1d_cur_func, CUR_SID(), p1d_prev_saved);
 					if (se_open) {
 						tok = se_open;
 						continue;
@@ -6674,7 +6704,10 @@ uint16_t sid = next_scope_id++;
 			while (tok && tok->kind != TK_EOF && !match_ch(tok, ';')) {
 				if (is_enum_kw(tok)) {
 					Token *brace = find_struct_body_brace(tok);
-					if (brace) parse_enum_constants(brace, brace_depth);
+					if (brace) {
+						parse_enum_constants(brace, brace_depth);
+						p1_check_enum_body_defer_shadow(brace, CUR_SID(), p1d_cur_func);
+					}
 				}
 				if (match_ch(tok, '{') && tok_match(tok)) {
 					Token *close = tok_match(tok);
@@ -6691,6 +6724,7 @@ uint16_t sid = next_scope_id++;
 								td_scope_open = saved_open;
 								td_scope_close = saved_close;
 								parse_enum_constants(brace, brace_depth);
+								p1_check_enum_body_defer_shadow(brace, CUR_SID(), p1d_cur_func);
 								td_scope_open = so;
 								td_scope_close = sc;
 							}
@@ -6747,9 +6781,10 @@ uint16_t sid = next_scope_id++;
 		if (tok->tag & TT_SUE) {
 			Token *brace = find_struct_body_brace(tok);
 			if (brace) {
-				if (is_enum_kw(tok))
+				if (is_enum_kw(tok)) {
 					parse_enum_constants(brace, brace_depth);
-				else if (struct_body_contains_vla(brace)) {
+					p1_check_enum_body_defer_shadow(brace, CUR_SID(), p1d_cur_func);
+				} else if (struct_body_contains_vla(brace)) {
 					// Register struct/union tag as VLA so later
 					// "struct S s;" can detect the VLA member.
 					for (Token *t = tok_next(tok); t && t != brace; t = tok_next(t))
@@ -7413,12 +7448,10 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 	}
 
 		// Fast path: untagged tokens not at statement start (~70-80% of tokens)
-		// If TF_RAW follows a comma (multi-declarator: int x, raw y;), fall
-		// through to the slow path for stripping.  This doesn't match
-		// expressions like 'raw * 2' because those never follow a comma.
+		// If TF_RAW is present and this is not a typedef named 'raw', fall
+		// through to the slow path for stripping.
 		if (__builtin_expect(!tag && !ctx->at_stmt_start, 1)) {
-			if (__builtin_expect((tok->flags & TF_RAW) && !is_known_typedef(tok) &&
-					     last_emitted && match_ch(last_emitted, ','), 0))
+			if (__builtin_expect((tok->flags & TF_RAW) && !is_known_typedef(tok), 0))
 				goto slow_path;
 			track_common_token_state(tok);
 			emit_tok(tok); tok = tok_next(tok);
