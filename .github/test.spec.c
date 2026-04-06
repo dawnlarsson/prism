@@ -1234,13 +1234,13 @@ static void spec_io_large_token_generic_rewrite(void) {
 
 	int hlen = (int)strlen(header);
 	int mlen = (int)strlen(mid);
-	int total = hlen + payload_len + mlen;
-	char *code = (char *)malloc(total + 1);
+	int code_len = hlen + payload_len + mlen;
+	char *code = (char *)malloc(code_len + 1);
 	CHECK(code != NULL, "spec io large token: malloc");
 	memcpy(code, header, hlen);
 	memset(code + hlen, 'A', payload_len);
 	memcpy(code + hlen + payload_len, mid, mlen);
-	code[total] = '\0';
+	code[code_len] = '\0';
 
 	char *path = create_temp_file(code);
 	PrismResult r = prism_transpile_file(path, prism_defaults());
@@ -2060,6 +2060,254 @@ static void spec_generic_cast_prefix(void) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Attribute-obscured raw VLA safety
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void spec_attr_raw_vla_safety(void) {
+	// 1. C23 attribute before per-declarator raw with VLA: goto must be rejected
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    goto L_skip;\n"
+		    "    int a, [[maybe_unused]] raw b[n];\n"
+		    "    (void)a; (void)b;\n"
+		    "L_skip: return;\n"
+		    "}\n",
+		    "spec_arv1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "attr raw VLA: goto over C23 attr raw VLA rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "VLA") != NULL,
+			      "attr raw VLA: error mentions VLA");
+		prism_free(&r);
+	}
+
+	// 2. GNU attribute before per-declarator raw with VLA: same rejection
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    goto L_skip;\n"
+		    "    int a, __attribute__((unused)) raw b[n];\n"
+		    "    (void)a; (void)b;\n"
+		    "L_skip: return;\n"
+		    "}\n",
+		    "spec_arv2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "attr raw VLA: goto over GNU attr raw VLA rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "VLA") != NULL,
+			      "attr raw VLA: GNU attr error mentions VLA");
+		prism_free(&r);
+	}
+
+	// 3. Without goto: attribute-preceded raw VLA must transpile OK
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    int a, [[maybe_unused]] raw b[n];\n"
+		    "    (void)a; (void)b;\n"
+		    "}\n",
+		    "spec_arv3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "attr raw VLA: no-goto case transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "raw") == NULL,
+			      "attr raw VLA: raw keyword stripped");
+		prism_free(&r);
+	}
+
+	// 4. Plain raw VLA without attributes: goto still rejected (sanity)
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    goto L_skip;\n"
+		    "    int a, raw b[n];\n"
+		    "    (void)a; (void)b;\n"
+		    "L_skip: return;\n"
+		    "}\n",
+		    "spec_arv4.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "attr raw VLA: plain raw VLA goto rejected");
+		prism_free(&r);
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  _Generic member rewrite in nested contexts
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void spec_generic_nested_rewrite(void) {
+	printf("\n--- _Generic nested member rewrite ---\n");
+
+	// 1. Parenthesized (walk_balanced)
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct Drv { int (*init)(void); };\n"
+		    "int test(struct Drv *drv) {\n"
+		    "    int s = (drv->_Generic(0, int: init)());\n"
+		    "    return s;\n"
+		    "}\n",
+		    "spec_gn1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "_Generic paren: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "drv->_Generic") == NULL,
+			      "_Generic paren: rewrite fired (no verbatim drv->_Generic)");
+			CHECK(strstr(r.output, "drv->init") != NULL,
+			      "_Generic paren: prefix injected into association");
+		}
+		prism_free(&r);
+	}
+
+	// 2. Return with active defers (emit_expr_to_semicolon)
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct Drv { int (*init)(void); };\n"
+		    "void cleanup(void);\n"
+		    "int test(struct Drv *drv) {\n"
+		    "    defer cleanup();\n"
+		    "    return drv->_Generic(0, int: init)();\n"
+		    "}\n",
+		    "spec_gn2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "_Generic return+defer: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "drv->_Generic") == NULL,
+			      "_Generic return+defer: rewrite fired");
+		prism_free(&r);
+	}
+
+	// 3. Statement expression (emit_block_body)
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct Drv { int (*init)(void); };\n"
+		    "int test(struct Drv *drv) {\n"
+		    "    int s = ({ drv->_Generic(0, int: init)(); });\n"
+		    "    return s;\n"
+		    "}\n",
+		    "spec_gn3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "_Generic stmt-expr: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "drv->_Generic") == NULL,
+			      "_Generic stmt-expr: rewrite fired");
+		prism_free(&r);
+	}
+
+	// 4. Double parentheses (nested walk_balanced)
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct Drv { int (*init)(void); };\n"
+		    "int test(struct Drv *drv) {\n"
+		    "    int s = ((drv->_Generic(0, int: init)()));\n"
+		    "    return s;\n"
+		    "}\n",
+		    "spec_gn4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "_Generic double paren: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "drv->_Generic") == NULL,
+			      "_Generic double paren: rewrite fired");
+		prism_free(&r);
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Attribute-encapsulated control flow rejection
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void spec_attr_ctrl_flow_rejection(void) {
+	printf("\n--- attribute-encapsulated control flow ---\n");
+
+	// 1. GNU attribute with goto inside stmt-expr: rejected
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    __attribute__((aligned( ({ goto L; 8; }) ))) int buf;\n"
+		    "    int vla[n];\n"
+		    "L: return;\n"
+		    "}\n",
+		    "spec_acf1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "attr ctrl-flow: GNU goto rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "attribute") != NULL,
+			      "attr ctrl-flow: error mentions attribute");
+		prism_free(&r);
+	}
+
+	// 2. C23 attribute with goto inside stmt-expr: rejected
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    [[gnu::aligned( ({ goto L; 8; }) )]] int buf;\n"
+		    "    int vla[n];\n"
+		    "L: return;\n"
+		    "}\n",
+		    "spec_acf2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "attr ctrl-flow: C23 goto rejected");
+		prism_free(&r);
+	}
+
+	// 3. GNU attribute with defer: rejected
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    __attribute__((aligned( ({ defer cleanup(); 8; }) ))) int x;\n"
+		    "    (void)x;\n"
+		    "}\n",
+		    "spec_acf3.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "attr ctrl-flow: GNU defer rejected");
+		prism_free(&r);
+	}
+
+	// 4. GNU attribute with return: rejected
+	{
+		PrismResult r = prism_transpile_source(
+		    "int f(void) {\n"
+		    "    __attribute__((aligned( ({ return 0; 8; }) ))) int x;\n"
+		    "    return x;\n"
+		    "}\n",
+		    "spec_acf4.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "attr ctrl-flow: GNU return rejected");
+		prism_free(&r);
+	}
+
+	// 5. Normal attributes without control flow: accepted
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    __attribute__((unused)) int x;\n"
+		    "    [[maybe_unused]] int y;\n"
+		    "    __attribute__((aligned(16))) int z;\n"
+		    "    (void)x; (void)y; (void)z;\n"
+		    "}\n",
+		    "spec_acf5.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "attr ctrl-flow: normal attrs accepted");
+		prism_free(&r);
+	}
+
+	// 6. Shadowed 'defer' variable inside attribute: accepted
+	{
+		PrismResult r = prism_transpile_source(
+		    "typedef int defer;\n"
+		    "void f(void) {\n"
+		    "    __attribute__((aligned( ({ defer x = 8; x; }) ))) int buf;\n"
+		    "    (void)buf;\n"
+		    "}\n",
+		    "spec_acf6.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "attr ctrl-flow: shadowed defer accepted");
+		prism_free(&r);
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  Runner
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -2163,4 +2411,13 @@ void run_spec_tests(void) {
 
 	// ── _Generic cast-prefix injection ──
 	spec_generic_cast_prefix();
+
+	// ── attribute-obscured raw VLA safety ──
+	spec_attr_raw_vla_safety();
+
+	// ── _Generic nested member rewrite ──
+	spec_generic_nested_rewrite();
+
+	// ── attribute-encapsulated control flow ──
+	spec_attr_ctrl_flow_rejection();
 }

@@ -2074,6 +2074,10 @@ static Token *emit_block_body(Token *tok, Token *end) {
 			continue;
 		}
 		ctx->at_stmt_start = false;
+		if ((tok->tag & TT_GENERIC) && !in_generic()) {
+			Token *after = try_generic_member_rewrite(tok);
+			if (after) { tok = after; continue; }
+		}
 		emit_tok(tok); tok = tok_next(tok);
 	}
 	return tok;
@@ -2128,6 +2132,11 @@ static Token *walk_balanced(Token *tok, bool emit) {
 			}
 			// Strip 'raw' keyword inside balanced groups (cast expressions, etc.)
 			{ Token *r = try_strip_raw(t); if (r) { t = r; continue; } }
+			// _Generic member rewrite inside balanced groups
+			if ((t->tag & TT_GENERIC) && !in_generic()) {
+				Token *after = try_generic_member_rewrite(t);
+				if (after) { t = after; continue; }
+			}
 			emit_tok(t); t = tok_next(t);
 		}
 	}
@@ -2379,6 +2388,10 @@ static Token *walk_balanced_orelse(Token *tok) {
 				error_tok(t, "'orelse' inside array dimension could not be transformed; "
 					   "if wrapped in outer parentheses, remove them: "
 					   "use '[f() orelse 1]' not '[(f() orelse 1)]'");
+			if ((t->tag & TT_GENERIC) && !in_generic()) {
+				Token *after = try_generic_member_rewrite(t);
+				if (after) { t = after; continue; }
+			}
 			emit_tok(t); t = tok_next(t);
 		}
 		return tok_next(end);
@@ -3701,6 +3714,10 @@ static Token *emit_expr_to_semicolon(Token *tok) {
 			expr_at_stmt_start = false;
 		}
 
+		if ((tok->tag & TT_GENERIC) && !in_generic()) {
+			Token *after = try_generic_member_rewrite(tok);
+			if (after) { tok = after; expr_at_stmt_start = false; continue; }
+		}
 		emit_tok(tok);
 
 		if (match_ch(tok, ';') || match_ch(tok, '{') || match_ch(tok, '}'))
@@ -7122,7 +7139,27 @@ uint16_t sid = next_scope_id++;
 
 		// Skip noise (attributes, C23 [[...]], pragmas)
 		Token *clean = skip_noise(tok);
-		if (clean != tok) { tok = clean; continue; }
+		if (clean != tok) {
+			// Scan the skipped attribute range for control-flow keywords
+			// hidden inside statement expressions (e.g. __attribute__((aligned(
+			// ({ goto L; 8; }) )))). These are invisible to CFG analysis
+			// because skip_noise leaps over the entire attribute, so goto/
+			// defer/return/break/continue inside would bypass safety checks.
+			for (Token *s = tok; s && s != clean; s = tok_next(s)) {
+				uint32_t st = s->tag;
+				if (st & (TT_GOTO | TT_RETURN | TT_BREAK | TT_CONTINUE))
+					error_tok(s, "'%.*s' inside attribute argument "
+						  "bypasses control-flow analysis; "
+						  "move it outside the attribute",
+						  s->len, tok_loc(s));
+				if ((st & TT_DEFER) && !typedef_lookup(s))
+					error_tok(s, "'defer' inside attribute argument "
+						  "bypasses control-flow analysis; "
+						  "move it outside the attribute",
+						  s->len, tok_loc(s));
+			}
+			tok = clean; continue;
+		}
 
 		// Skip storage/inline/noreturn/extension specifiers before type
 		if ((tok->tag & (TT_STORAGE | TT_INLINE)) || equal(tok, "__extension__")) {

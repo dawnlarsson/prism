@@ -3624,9 +3624,12 @@ static Token *p1_knr_find_close_paren(Token *semi_tok) {
 // Skip per-declarator 'raw' keywords (e.g. "int x, raw y;").
 // Returns token past raw chain, or original t if not raw.
 // Sets *saw_raw = true if raw was found.
+// Probes past attributes/pragmas via skip_noise before checking TF_RAW,
+// matching Pass 2's process_declarators logic.
 static inline Token *p1_skip_decl_raw(Token *t, bool *saw_raw) {
-	if ((t->flags & TF_RAW) && !is_known_typedef(t)) {
-		Token *after = skip_noise(tok_next(t));
+	Token *probe = skip_noise(t);
+	if ((probe->flags & TF_RAW) && !is_known_typedef(probe)) {
+		Token *after = skip_noise(tok_next(probe));
 		if (after && ((is_valid_varname(after) && !is_type_keyword(after) &&
 			       !is_known_typedef(after) && !(after->tag & (TT_QUALIFIER | TT_SUE))) ||
 			      match_ch(after, '*') || match_ch(after, '('))) {
