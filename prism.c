@@ -2904,7 +2904,7 @@ static OrelseInitInfo scan_decl_orelse(Token *decl_end,
 			// Paren group that spans the rest of the initializer and
 			// contains orelse: unwrap the parens so the orelse is found
 			// at depth 0 (macro hygiene: #define GET(x) (f(x) orelse 0)).
-			if (match_ch(scan, '(') && tok_match(scan)) {
+			if (match_ch(scan, '(') && tok_match(scan) && !is_stmt_expr_open(scan)) {
 				Token *close = tok_match(scan);
 				Token *after_close = tok_next(close);
 				if (!after_close || match_ch(after_close, ',') || match_ch(after_close, ';') || after_close->kind == TK_EOF) {
@@ -6277,7 +6277,7 @@ static Token *p1d_scan_init_orelse(Token *t, bool *out_has_orelse, Token **out_f
 			// Only when the paren is the first token
 			// of the initializer (i.e. wraps it entirely).
 			Token *m = tok_match(t);
-			if (m && match_ch(t, '(')) {
+			if (m && match_ch(t, '(') && !is_stmt_expr_open(t)) {
 				Token *am = tok_next(m);
 				if (init_is_first &&
 				    (!am || match_ch(am, ',') || match_ch(am, ';') || am->kind == TK_EOF)) {

@@ -940,7 +940,7 @@ static void spec_zeroinit_S3_vla(void) {
 		PrismResult r = prism_transpile_source(code, "spec_zs3.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK, "spec zeroinit S3: transpiles OK");
 		if (r.output)
-			CHECK(strstr(r.output, "memset") != NULL,
+			CHECK(has_zeroing(r.output),
 			      "spec zeroinit S3: VLA gets memset");
 		prism_free(&r);
 	}
@@ -1532,6 +1532,102 @@ static void spec_deferred_orelse_blind_emission(void) {
 	}
 }
 
+// ── stmt-expr paren-stripping desync ──
+// Phase 1D/Pass 2 paren-stripping for macro-hygiene must not strip '('
+// from statement expressions '({ ... })', which would collapse the AST
+// and route live code through walk_balanced's dumb bracket-skipping path,
+// leaking defer/return/goto keywords verbatim to the backend.
+static void spec_stmt_expr_paren_strip_desync(void) {
+	printf("\n--- Stmt-Expr Paren-Strip Desync Fix ---\n");
+
+	// Case 1: defer inside stmt-expr initializer with orelse must not leak
+	{
+		const char *code =
+		    "void log_event(void);\n"
+		    "int get_zero(void) { return 0; }\n"
+		    "void network_kernel_init(void) {\n"
+		    "    int status = ({\n"
+		    "        { defer log_event(); }\n"
+		    "        int x = get_zero() orelse 1;\n"
+		    "        x;\n"
+		    "    });\n"
+		    "    (void)status;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "spec_se_ps1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "stmt-expr paren-strip: defer+orelse transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "defer") == NULL,
+			      "stmt-expr paren-strip: defer keyword not leaked to output");
+			CHECK(strstr(r.output, "log_event") != NULL,
+			      "stmt-expr paren-strip: defer body (log_event) present in output");
+		}
+		prism_free(&r);
+	}
+
+	// Case 2: return inside stmt-expr initializer with orelse must compile
+	{
+		const char *code =
+		    "#include <string.h>\n"
+		    "static char buf[64];\n"
+		    "static int pos = 0;\n"
+		    "static void record(char c) { buf[pos++] = c; buf[pos] = 0; }\n"
+		    "int get_zero(void) { return 0; }\n"
+		    "static int f(void) {\n"
+		    "    defer record('D');\n"
+		    "    int status = ({\n"
+		    "        { defer record('E'); }\n"
+		    "        int x = get_zero() orelse return -1;\n"
+		    "        x;\n"
+		    "    });\n"
+		    "    return status;\n"
+		    "}\n"
+		    "int main(void) {\n"
+		    "    int r = f();\n"
+		    "    if (r != -1) return 1;\n"
+		    "    if (strcmp(buf, \"ED\") != 0) return 2;\n"
+		    "    return 0;\n"
+		    "}\n";
+		char *path = create_temp_file(code);
+		PrismResult r = prism_transpile_file(path, prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "stmt-expr paren-strip: return+orelse transpiles OK");
+#ifndef _WIN32
+		if (r.output)
+			check_transpiled_output_compiles_and_runs(
+			    r.output,
+			    "stmt-expr paren-strip: return+orelse compiles",
+			    "stmt-expr paren-strip: return unwinds defers (ED)");
+#endif
+		prism_free(&r);
+		unlink(path);
+		free(path);
+	}
+
+	// Case 3: goto inside stmt-expr initializer with orelse must compile
+	{
+		const char *code =
+		    "void log_event(void);\n"
+		    "int get_zero(void) { return 0; }\n"
+		    "int f(void) {\n"
+		    "    defer log_event();\n"
+		    "    int status = ({\n"
+		    "        get_zero() orelse goto fail;\n"
+		    "    });\n"
+		    "    return status;\n"
+		    "fail:\n"
+		    "    return -1;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "spec_se_ps3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "stmt-expr paren-strip: goto+orelse transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "defer") == NULL,
+			      "stmt-expr paren-strip: goto - no defer keyword leak");
+			CHECK(strstr(r.output, "log_event") != NULL,
+			      "stmt-expr paren-strip: goto - defer body present");
+		}
+		prism_free(&r);
+	}
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Runner
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1618,4 +1714,7 @@ void run_spec_tests(void) {
 
 	// ── deferred orelse blind emission ──
 	spec_deferred_orelse_blind_emission();
+
+	// ── stmt-expr paren-strip desync ──
+	spec_stmt_expr_paren_strip_desync();
 }
