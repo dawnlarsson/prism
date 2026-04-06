@@ -4626,6 +4626,9 @@ static void test_scope_depth_overunwind(void) {
 // emit_range_no_prep flat-loops tokens without routing stmt-exprs
 // through walk_balanced. A goto inside a stmt-expr in an orelse LHS
 // bypasses defer cleanup.
+// Uses block-form orelse (if-guard, single LHS eval) — bare value fallback
+// would correctly reject the goto via reject_orelse_side_effects since
+// the ternary expansion evaluates LHS twice.
 static void test_emit_range_no_prep_stmtexpr_defer(void) {
 	PrismResult r = prism_transpile_source(
 	    "int counter = 0;\n"
@@ -4633,7 +4636,7 @@ static void test_emit_range_no_prep_stmtexpr_defer(void) {
 	    "    int target = 0;\n"
 	    "    {\n"
 	    "        defer { counter++; }\n"
-	    "        *({ goto skip; &target; }) = 1 orelse 2;\n"
+	    "        *({ goto skip; &target; }) = 1 orelse { return; };\n"
 	    "        (void)target;\n"
 	    "    }\n"
 	    "    return;\n"

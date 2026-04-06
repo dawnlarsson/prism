@@ -1253,6 +1253,11 @@ static void reject_orelse_side_effects(Token *start, Token *end,
 				  "twice — double evaluation of volatile reads or "
 				  "other side effects) %s", ctx_msg, advice);
 		next_checks:
+		if (s->tag & (TT_GOTO | TT_RETURN | TT_BREAK | TT_CONTINUE | TT_DEFER))
+			error_tok(s, "%s containing control flow keywords "
+				  "(cannot duplicate statement expressions with "
+				  "goto/return/break/continue/defer) %s",
+				  ctx_msg, advice);
 		if ((s->len == 2 && ((s->ch0 == '+' && tok_loc(s)[1] == '+') ||
 				     (s->ch0 == '-' && tok_loc(s)[1] == '-'))) ||
 		    is_assignment_operator_token(s))
@@ -2860,9 +2865,11 @@ static inline bool is_orelse_value_fallback(Token *after_oe) {
 	    !match_ch(after_oe, '{') && !match_ch(after_oe, ';');
 }
 
-static inline void flush_typeof_memsets(Token **vars, int *count, TypeSpecResult *type) {
-	emit_typeof_memsets(vars, *count, type->has_volatile, type->has_const);
-	*count = 0;
+static inline void flush_typeof_memsets(Token **vars, int *count, TypeSpecResult *type, int base) {
+	if (*count > base) {
+		emit_typeof_memsets(&vars[base], *count - base, type->has_volatile, type->has_const);
+		*count = base;
+	}
 }
 
 static OrelseDeclTargetInfo analyze_decl_orelse_target(Token *tok,
@@ -3095,12 +3102,12 @@ static InitWalkResult emit_decl_init_walk(Token *tok) {
 // continue the declarator loop (comma continuation), false if done.
 static bool process_init_orelse_hit(Token **tok_p, DeclResult *decl,
 				    Token *type_start, TypeSpecResult *type,
-				    bool brace_wrap) {
+				    bool brace_wrap, int typeof_var_base) {
 	Token *tok = *tok_p;
 
 	reject_orelse_in_for_init(tok);
 	out_char(';');
-	flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type);
+	flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type, typeof_var_base);
 
 	tok = tok_next(tok); // skip 'orelse'
 	OrelseDeclTargetInfo target = analyze_decl_orelse_target(tok, type_start, type, decl);
@@ -3158,7 +3165,7 @@ static void validate_no_anon_struct_split(Token *next_decl_tok, Token *type_star
 static bool process_const_orelse_decl(Token **tok_p, Token *orelse_tok,
 				      Token *decl_start, DeclResult *decl,
 				      Token *type_start, TypeSpecResult *type,
-				      Token *pragma_start, bool brace_wrap) {
+				      Token *pragma_start, bool brace_wrap, int typeof_var_base) {
 	Token *val_start = tok_next(decl->end); // First value token after '='
 	Token *tok = tok_next(orelse_tok); // skip 'orelse'
 	OrelseDeclTargetInfo target = analyze_decl_orelse_target(tok, type_start, type, decl);
@@ -3187,7 +3194,7 @@ static bool process_const_orelse_decl(Token **tok_p, Token *orelse_tok,
 					   pragma_start,
 					   target.stop_comma);
 
-	flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type);
+	flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type, typeof_var_base);
 
 	if (match_ch(tok, ';')) tok = tok_next(tok);
 	end_statement_after_semicolon();
@@ -3204,7 +3211,7 @@ static bool process_const_orelse_decl(Token **tok_p, Token *orelse_tok,
 // Process all declarators in a declaration and emit with zero-init.
 static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw, Token *type_start,
 				  Token *pragma_start, Token *raw_tok, bool brace_wrap) {
-	ctx->typeof_var_count = 0; // Reset count; reuse arena-allocated array across calls
+	int typeof_var_base = ctx->typeof_var_count; // Save for reentrancy (stmt-expr in array dims)
 	bool first_decl = true;
 	bool need_type_emit = false; // Set after orelse comma — deferred to after next lookahead
 
@@ -3377,7 +3384,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 		if (is_const_orelse_fallback) {
 			if (process_const_orelse_decl(&tok, orelse_info.orelse_tok, decl_start,
-						     &decl, type_start, type, pragma_start, brace_wrap)) {
+						     &decl, type_start, type, pragma_start, brace_wrap, typeof_var_base)) {
 				BO_RESTORE();
 				need_type_emit = true;
 				continue;
@@ -3429,7 +3436,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			pd_unreachable_tok = iw.unreachable_tok;
 
 			if (iw.hit_orelse) {
-				if (process_init_orelse_hit(&tok, &decl, type_start, type, brace_wrap)) {
+				if (process_init_orelse_hit(&tok, &decl, type_start, type, brace_wrap, typeof_var_base)) {
 					need_type_emit = true;
 					continue;
 				}
@@ -3442,7 +3449,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		if (match_ch(tok, ';')) {
 			bool is_ur = (tok == pd_unreachable_tok);
 			emit_tok(tok);
-			flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type);
+			flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type, typeof_var_base);
 			if (is_ur) EMIT_UNREACHABLE();
 			if (brace_wrap) OUT_LIT(" }");
 			return tok_next(tok);
@@ -3452,7 +3459,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			if (should_split_multi_decl(next_decl_tok)) {
 				validate_no_anon_struct_split(next_decl_tok, type_start, type);
 				out_char(';');
-				flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type);
+				flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type, typeof_var_base);
 				tok = next_decl_tok;
 				need_type_emit = true;
 				continue;
@@ -3470,7 +3477,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 emit_raw_bail:
 	while (tok && tok->kind != TK_EOF && !match_ch(tok, ';')) { emit_tok(tok); tok = tok_next(tok); }
 	if (tok && match_ch(tok, ';')) { emit_tok(tok); tok = tok_next(tok); }
-	flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type);
+	flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type, typeof_var_base);
 	if (brace_wrap) OUT_LIT(" }");
 	return tok;
 }

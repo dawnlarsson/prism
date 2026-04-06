@@ -1628,6 +1628,152 @@ static void spec_stmt_expr_paren_strip_desync(void) {
 	}
 }
 
+// ── typeof_var reentrancy clobber ──
+// process_declarators uses ctx->typeof_vars to queue VLA memsets.
+// If a stmt-expr in an array dimension triggers a nested process_declarators,
+// the inner call must not clobber the outer's queued memsets.
+static void spec_typeof_var_reentrancy(void) {
+	printf("\n--- typeof_var Reentrancy Fix ---\n");
+
+	// Case 1: outer VLA memset survives inner decl in array dimension
+	{
+		const char *code =
+		    "void crypto_kernel_init(void) {\n"
+		    "    int secure_buffer[ ({\n"
+		    "        int n = 4;\n"
+		    "        int inner_temp[n];\n"
+		    "        inner_temp[0] = 0xAA;\n"
+		    "        32;\n"
+		    "    }) ];\n"
+		    "    (void)secure_buffer;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "spec_tvr1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typeof_var reentry: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "memset(&secure_buffer") != NULL ||
+			      strstr(r.output, "memset( &secure_buffer") != NULL,
+			      "typeof_var reentry: outer VLA memset survives inner decl");
+			CHECK(has_var_zeroing(r.output, "inner_temp"),
+			      "typeof_var reentry: inner VLA memset also present");
+		}
+		prism_free(&r);
+	}
+
+	// Case 2: runtime — both VLAs actually zeroed
+	{
+		const char *code =
+		    "int main(void) {\n"
+		    "    int n = ({\n"
+		    "        int inner[8];\n"
+		    "        for (int i = 0; i < 8; i++)\n"
+		    "            if (inner[i] != 0) return 1;\n"
+		    "        16;\n"
+		    "    });\n"
+		    "    int outer[n];\n"
+		    "    for (int i = 0; i < n; i++)\n"
+		    "        if (outer[i] != 0) return 2;\n"
+		    "    return 0;\n"
+		    "}\n";
+		char *path = create_temp_file(code);
+		PrismResult r = prism_transpile_file(path, prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typeof_var reentry runtime: transpiles OK");
+#ifndef _WIN32
+		if (r.output)
+			check_transpiled_output_compiles_and_runs(
+			    r.output,
+			    "typeof_var reentry runtime: compiles",
+			    "typeof_var reentry runtime: both VLAs zeroed");
+#endif
+		prism_free(&r);
+		unlink(path);
+		free(path);
+	}
+}
+
+// ── orelse ctrl-flow keyword rejection ──────────────────────────────────
+// reject_orelse_side_effects must reject control-flow keywords (goto,
+// return, break, continue, defer) inside statement expressions in ranges
+// that orelse expansion duplicates. Duplication desynchronizes
+// goto_entry_cursor (goto) and the defer unwinding stack (return).
+static void spec_orelse_ctrl_flow_keyword_rejection(void) {
+	printf("\n--- orelse ctrl-flow keyword rejection ---\n");
+
+	// 1. goto in stmt-expr LHS of bare value orelse — ternary expansion
+	//    evaluates LHS twice, duplicating the goto.
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    int target = 0;\n"
+		    "    *({ goto skip; &target; }) = 1 orelse 2;\n"
+		    "skip: return;\n"
+		    "}\n",
+		    "spec_ctrl1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "goto in stmt-expr bare orelse LHS: must reject");
+		prism_free(&r);
+	}
+
+	// 2. return in stmt-expr bare orelse LHS — ternary expansion
+	//    duplicates the LHS, doubling the return.
+	{
+		PrismResult r = prism_transpile_source(
+		    "int f(void) {\n"
+		    "    int target = 0;\n"
+		    "    *({ return 0; &target; }) = 1 orelse 2;\n"
+		    "    return target;\n"
+		    "}\n",
+		    "spec_ctrl2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "return in stmt-expr bare orelse LHS: must reject");
+		prism_free(&r);
+	}
+
+	// 3. defer in stmt-expr in orelse init — duplication doubles defer
+	//    registration, causing over-unwinding at scope exit.
+	{
+		PrismResult r = prism_transpile_source(
+		    "int counter = 0;\n"
+		    "void f(void) {\n"
+		    "    int x = ({ defer { counter++; } 1; }) orelse 5;\n"
+		    "    (void)x;\n"
+		    "}\n",
+		    "spec_ctrl3.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "defer in stmt-expr orelse init: must reject");
+		prism_free(&r);
+	}
+
+	// 4. continue in stmt-expr bare orelse LHS inside loop
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    int target = 0;\n"
+		    "    while (1) {\n"
+		    "        *({ continue; &target; }) = 1 orelse 2;\n"
+		    "    }\n"
+		    "}\n",
+		    "spec_ctrl4.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "continue in stmt-expr bare orelse LHS: must reject");
+		prism_free(&r);
+	}
+
+	// 5. Block-form orelse with goto in LHS is OK — if-guard pattern
+	//    evaluates LHS only once (no duplication).
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    int target = 0;\n"
+		    "    *({ goto skip; &target; }) = 1 orelse { return; };\n"
+		    "skip: return;\n"
+		    "}\n",
+		    "spec_ctrl5.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "goto in stmt-expr block orelse LHS: must accept");
+		prism_free(&r);
+	}
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Runner
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1717,4 +1863,10 @@ void run_spec_tests(void) {
 
 	// ── stmt-expr paren-strip desync ──
 	spec_stmt_expr_paren_strip_desync();
+
+	// ── typeof_var reentrancy ──
+	spec_typeof_var_reentrancy();
+
+	// ── orelse ctrl-flow keyword rejection ──
+	spec_orelse_ctrl_flow_keyword_rejection();
 }
