@@ -8316,6 +8316,195 @@ static void test_generic_ternary_branch_prefix(void) {
 	}
 }
 
+static void test_generic_array_member_target_prefix(void) {
+	printf("\n--- _Generic array/member target prefix ---\n");
+	/* Array subscript target: handlers[0] must get obj. prefix */
+	{
+		const char *code =
+		    "typedef struct {\n"
+		    "    void (*handlers[3])(void);\n"
+		    "    struct { void (*nested_func)(void); } sub;\n"
+		    "} Obj;\n"
+		    "Obj obj;\n"
+		    "void dispatch(int sel) {\n"
+		    "    obj._Generic(sel,\n"
+		    "        int: handlers[0],\n"
+		    "        float: sub.nested_func\n"
+		    "    )();\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gamt1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "generic-array-member: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "obj.handlers[0]") != NULL,
+			      "generic-array-member: array target gets prefix");
+			CHECK(strstr(r.output, "obj.sub.nested_func") != NULL,
+			      "generic-array-member: nested member target gets prefix");
+		}
+		prism_free(&r);
+	}
+}
+
+static void test_bitfield_raw_leak(void) {
+	printf("\n--- Bitfield raw leak ---\n");
+	{
+		const char *code =
+		    "struct Flags {\n"
+		    "    unsigned int a, raw b : 4;\n"
+		    "};\n";
+		PrismResult r = prism_transpile_source(code, "bfrl1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "bitfield-raw: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "raw") == NULL,
+			      "bitfield-raw: raw keyword stripped");
+			CHECK(strstr(r.output, "b : 4") != NULL || strstr(r.output, "b :4") != NULL ||
+			      strstr(r.output, "b: 4") != NULL || strstr(r.output, "b:4") != NULL,
+			      "bitfield-raw: bitfield syntax preserved");
+		}
+		prism_free(&r);
+	}
+}
+
+static void test_generic_paren_complex_target_prefix(void) {
+	printf("\n--- _Generic paren-wrapped complex target prefix ---\n");
+	{
+		const char *code =
+		    "typedef struct {\n"
+		    "    void (*handlers[3])(void);\n"
+		    "    struct { void (*nested_func)(void); } sub;\n"
+		    "} Obj;\n"
+		    "Obj obj;\n"
+		    "void dispatch(int sel) {\n"
+		    "    obj._Generic(sel,\n"
+		    "        int: (handlers[0]),\n"
+		    "        float: (sub.nested_func)\n"
+		    "    )();\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gpct1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "paren-complex-target: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "obj.handlers[0]") != NULL,
+			      "paren-complex-target: array subscript gets prefix");
+			CHECK(strstr(r.output, "obj.sub.nested_func") != NULL,
+			      "paren-complex-target: nested member gets prefix");
+		}
+		prism_free(&r);
+	}
+}
+
+static void test_generic_inner_generic_prefix(void) {
+	printf("\n--- _Generic inner _Generic prefix ---\n");
+	{
+		const char *code =
+		    "typedef struct { int kind; } Api;\n"
+		    "int handle_int(int);\n"
+		    "int handle_float(int);\n"
+		    "Api api;\n"
+		    "int sel1, sel2;\n"
+		    "\n"
+		    "int test(int data) {\n"
+		    "    return api._Generic(sel1,\n"
+		    "        int: _Generic(sel2, int: handle_int, float: handle_float)\n"
+		    "    )(data);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gigp1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "inner-generic: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "api.handle_int") != NULL,
+			      "inner-generic: first branch gets prefix");
+			CHECK(strstr(r.output, "api.handle_float") != NULL,
+			      "inner-generic: second branch gets prefix");
+		}
+		prism_free(&r);
+	}
+}
+
+// C23 enum with fixed underlying type: enum E : int { A, B, C }
+// Verify that (1) enum constants are registered in typedef table,
+// (2) the body is classified as struct/enum scope (orelse rejected),
+// (3) zero-init works with variables declared using the enum type, and
+// (4) parse_type_specifier correctly parses the full type specifier.
+static void test_c23_enum_fixed_underlying_type(void) {
+	printf("\n--- C23 enum fixed underlying type ---\n");
+
+	// 1. Enum constant registration — constants should be recognized
+	{
+		const char *code =
+		    "enum Color : int { RED, GREEN, BLUE };\n"
+		    "int test(void) {\n"
+		    "    enum Color : int c;\n"
+		    "    return c;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "c23e1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "c23-enum: basic fixed type transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "RED") == NULL || strstr(r.output, "enum Color") != NULL,
+			      "c23-enum: type preserved in output");
+		}
+		prism_free(&r);
+	}
+
+	// 2. Orelse rejected inside fixed-type enum body
+	{
+		const char *code =
+		    "int f(void);\n"
+		    "enum Status : unsigned int { OK = f() orelse 0, ERR = 1 };\n";
+		PrismResult r = prism_transpile_source(code, "c23e2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_ERR_SYNTAX, "c23-enum: orelse rejected inside fixed-type enum body");
+		prism_free(&r);
+	}
+
+	// 3. Anonymous fixed-type enum
+	{
+		const char *code =
+		    "enum : int { VAL_A = 10, VAL_B = 20 };\n"
+		    "int test(void) { return VAL_A + VAL_B; }\n";
+		PrismResult r = prism_transpile_source(code, "c23e3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "c23-enum: anonymous fixed-type transpiles OK");
+		prism_free(&r);
+	}
+
+	// 4. Multi-type underlying: enum E : unsigned long long
+	{
+		const char *code =
+		    "enum Big : unsigned long long { HUGE_A = 1, HUGE_B = 2 };\n"
+		    "int test(void) {\n"
+		    "    enum Big : unsigned long long b;\n"
+		    "    return (int)b;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "c23e4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "c23-enum: unsigned long long transpiles OK");
+		prism_free(&r);
+	}
+
+	// 5. Fixed-type enum in typedef
+	{
+		const char *code =
+		    "typedef enum Color : int { RED, GREEN, BLUE } Color;\n"
+		    "int test(void) {\n"
+		    "    Color c;\n"
+		    "    return c;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "c23e5.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "c23-enum: typedef fixed-type transpiles OK");
+		prism_free(&r);
+	}
+
+	// 6. Enum constant with defer shadow check
+	{
+		const char *code =
+		    "int cleanup(void);\n"
+		    "enum Priority : int { LOW = 1, MEDIUM = 2, HIGH = 3 };\n"
+		    "int test(void) {\n"
+		    "    defer cleanup();\n"
+		    "    enum Priority : int p;\n"
+		    "    return p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "c23e6.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "c23-enum: with defer transpiles OK");
+		prism_free(&r);
+	}
+}
+
 void run_api_tests_4(void) {
 	printf("\n=== API TESTS (group 4) ===\n");
 	test_collect_source_defines_long_line_truncation();
@@ -8390,4 +8579,9 @@ void run_api_tests_4(void) {
 	test_nested_generic_member_rewrite();
 	test_typeof_unqual_const_stripping();
 	test_generic_ternary_branch_prefix();
+	test_generic_array_member_target_prefix();
+	test_bitfield_raw_leak();
+	test_generic_paren_complex_target_prefix();
+	test_generic_inner_generic_prefix();
+	test_c23_enum_fixed_underlying_type();
 }

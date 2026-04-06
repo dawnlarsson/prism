@@ -2431,7 +2431,10 @@ static Token *find_struct_body_brace(Token *tok) {
 	Token *t = tok_next(tok);
 	while (t && t->kind != TK_EOF) {
 		SKIP_NOISE_CONTINUE(t);
-		if (is_valid_varname(t) || (t->tag & TT_QUALIFIER)) {
+		if (is_valid_varname(t) || (t->tag & TT_QUALIFIER) || is_type_keyword(t)) {
+			t = tok_next(t);
+		} else if (t->len == 1 && t->ch0 == ':') {
+			// C23 enum fixed underlying type: enum E : int { ... }
 			t = tok_next(t);
 		} else break;
 	}
@@ -2795,6 +2798,15 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			}
 			Token *sue_tag = NULL;
 			if (tok && is_valid_varname(tok)) { sue_tag = tok; tok = tok_next(tok); }
+			// C23 enum fixed underlying type: enum E : int { ... }
+			if (tok && tok->len == 1 && tok->ch0 == ':') {
+				tok = tok_next(tok);
+				while (tok && tok->kind != TK_EOF) {
+					SKIP_NOISE_CONTINUE(tok);
+					if (is_type_keyword(tok) || (tok->tag & TT_QUALIFIER)) tok = tok_next(tok);
+					else break;
+				}
+			}
 			if (tok && tok->len == 1 && tok->ch0 == '{') {
 				if (struct_body_contains_vla(tok)) r.is_vla = true;
 				tok = skip_balanced_group(tok);
@@ -3645,7 +3657,7 @@ static bool is_raw_strip_context(Token *after_raw) {
 	       !is_known_typedef(after_raw) && !(after_raw->tag & (TT_QUALIFIER | TT_SUE)) &&
 	       boundary &&
 	       (match_ch(boundary, ',') || match_ch(boundary, ';') ||
-	        match_set(boundary, CH('[') | CH('(') | CH('=')));
+	        match_set(boundary, CH('[') | CH('(') | CH('=') | CH(':')));
 }
 
 static bool has_effective_const_qual(Token *type_start, TypeSpecResult *type, DeclResult *decl) {

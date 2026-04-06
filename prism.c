@@ -1701,8 +1701,23 @@ static Token *try_generic_member_rewrite(Token *tok) {
 	int val_peel_depth = 0;      // number of remaining paren layers to drill through
 	bool val_has_ternary = false;    // branch value contains a ternary expression
 	bool val_ternary_arm_fresh = false; // just entered a ternary arm (? or ternary :)
+	Token *inner_generic_close = NULL; // close paren of inner _Generic being processed
 	for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
+		// Inner _Generic close paren — emit and exit inner mode.
+		if (t == inner_generic_close) {
+			emit_tok(t);
+			inner_generic_close = NULL;
+			continue;
+		}
 		if ((t->flags & TF_OPEN) && tok_match(t)) {
+			// Let inner _Generic's parens flow through individually
+			// so each association value gets prefix injection.
+			if (in_value && !inner_generic_close && match_ch(t, '(') &&
+			    last_emitted && (last_emitted->tag & TT_GENERIC)) {
+				inner_generic_close = tok_match(t);
+				emit_tok(t);
+				continue;
+			}
 			// Don't skip parens that wrap the injection target —
 			// drill in so the injection logic below can fire on the
 			// inner identifier.
@@ -1757,7 +1772,17 @@ static Token *try_generic_member_rewrite(Token *tok) {
 			if (peel_open && match_ch(peel_open, '(') && tok_match(peel_open)) {
 				Token *inner = tok_next(peel_open);
 				Token *pclose = tok_match(peel_open);
-				if (inner && is_valid_varname(inner) && tok_next(inner) == pclose) {
+				if (inner && is_valid_varname(inner)) {
+					// Check if the inner content is a valid target:
+					// single ident, or ident followed by [, ., ->
+					bool inner_ok = (tok_next(inner) == pclose);
+					if (!inner_ok) {
+						Token *after_inner = tok_next(inner);
+						if (after_inner && (match_ch(after_inner, '[') ||
+						    (after_inner->tag & TT_MEMBER)))
+							inner_ok = true;
+					}
+					if (inner_ok) {
 					// Verify all outer paren layers close tightly
 					Token *outer_close = pclose;
 					bool layers_ok = true;
@@ -1777,6 +1802,7 @@ static Token *try_generic_member_rewrite(Token *tok) {
 							val_peel_depth = peel_depth;
 						}
 					}
+					}
 				}
 			}
 			if (!val_bare_ident && !val_has_call) {
@@ -1791,7 +1817,10 @@ static Token *try_generic_member_rewrite(Token *tok) {
 			if (!val_has_call && vs && is_valid_varname(vs)) {
 				Token *after_vs = tok_next(vs);
 				if (!after_vs || after_vs == close ||
-				    match_ch(after_vs, ','))
+				    match_ch(after_vs, ',') ||
+				    match_ch(after_vs, ')') ||
+				    match_ch(after_vs, '[') ||
+				    (after_vs->tag & TT_MEMBER))
 					val_bare_ident = true;
 			}
 			// Check for ternary expression in branch value.
@@ -1807,7 +1836,8 @@ static Token *try_generic_member_rewrite(Token *tok) {
 			continue;
 		}
 		if (match_ch(t, ',') && ternary == 0) {
-			in_value = false;
+			if (!inner_generic_close)
+				in_value = false;
 			emit_tok(t);
 			continue;
 		}
@@ -5590,6 +5620,26 @@ static void p1_build_scope_tree(Token *start) {
 						if (st->tag & TT_SUE) {
 							si->is_struct = true;
 							if (is_enum_kw(st)) si->is_enum = true;
+						}
+						break;
+					}
+				} else if (is_type_keyword(prev)) {
+					// C23 enum with fixed underlying type:
+					// enum E : int {  or  enum : unsigned long long {
+					for (uint32_t si2 = tok_idx(prev) - 1; si2 > 0; si2--) {
+						Token *st = &token_pool[si2];
+						if (st->kind == TK_PREP_DIR) continue;
+						if (is_type_keyword(st) || (st->tag & TT_QUALIFIER)) continue;
+						if (st->len == 1 && st->ch0 == ':') continue;
+						if (match_ch(st, ']') && tok_match(st) && (tok_match(st)->flags & TF_C23_ATTR)) {
+							si2 = tok_idx(tok_match(st)); continue;
+						}
+						if (match_ch(st, ')') && tok_match(st)) { si2 = tok_idx(tok_match(st)); continue; }
+						if (st->tag & TT_ATTR) continue;
+						if (is_valid_varname(st)) continue; // enum tag name
+						if (is_enum_kw(st)) {
+							si->is_struct = true;
+							si->is_enum = true;
 						}
 						break;
 					}
