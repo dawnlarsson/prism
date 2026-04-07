@@ -3561,42 +3561,6 @@ static bool generic_decl_rewrite_target(Token *generic_tok, Token **name_out,
 	return false;
 }
 
-static bool generic_member_rewrite_target(Token *generic_tok, Token **name_out,
-					  Token **args_open_out,
-					  Token **args_close_out,
-					  Token **next_out) {
-	Token *open, *close, *after, *assoc_start;
-	if (!generic_rewrite_preamble(generic_tok, &open, &close, &after, &assoc_start)) return false;
-	for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
-		Token *call_open = skip_noise(tok_next(t));
-		if (!is_valid_varname(t) || !call_open || !match_ch(call_open, '(') || !tok_match(call_open))
-			continue;
-		if (params_look_like_decls(call_open)) continue;
-		// Walk past member chains: ident(...).ident(...)->ident(...)
-		// Must match generic_has_distinct_targets' chain logic.
-		Token *chain_end_name = t;
-		Token *chain_end_open = call_open;
-		Token *chain_end_close = tok_match(call_open);
-		for (;;) {
-			Token *after_call = tok_next(chain_end_close);
-			if (!after_call || !(after_call->tag & TT_MEMBER)) break;
-			Token *next_id = tok_next(after_call);
-			if (!next_id || !is_valid_varname(next_id)) break;
-			Token *next_open = skip_noise(tok_next(next_id));
-			if (!next_open || !match_ch(next_open, '(') || !tok_match(next_open)) break;
-			chain_end_name = next_id;
-			chain_end_open = next_open;
-			chain_end_close = tok_match(next_open);
-		}
-		*name_out = t; // start of chain
-		*args_open_out = chain_end_open;
-		*args_close_out = chain_end_close;
-		*next_out = after;
-		return true;
-	}
-	return false;
-}
-
 // Detect noreturn function call: tok(args);
 static inline Token *try_detect_noreturn_call(Token *tok) {
 	if (!(tok->tag & TT_NORETURN_FN)) return NULL;

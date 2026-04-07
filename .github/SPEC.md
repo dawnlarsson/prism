@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
-**Version:** 1.0.5
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4727+ tests + self-host stage1==stage2).
+**Version:** 1.0.6
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4753+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do. It is organized in two parts: **Part I** covers the transpiler's architecture, internal processing model, and implementation details. **Part II** provides a formal language specification for Prism's extensions to C, described in terms of the C abstract machine independently of any implementation strategy.
 
@@ -15,7 +15,7 @@ Prism is a source-to-source C transpiler. It reads preprocessed C, transforms it
 
 **Standards compatibility:** Prism accepts C99, C11, and C23 input and emits standard C compatible with GCC, Clang, and MSVC. All standard C type specifiers, qualifiers, storage classes, attributes, and control-flow constructs are recognized and passed through correctly. C23 features including `typeof_unqual`, `constexpr`, `auto` type inference, `_BitInt(N)`, `[[...]]` attributes, `alignas`/`alignof`, `static_assert`, fixed-underlying-type enums (`enum E : int { ... }`), labeled declarations, and if/switch initializers are supported. Do note Prism IS NOT officially certified in any way.
 
-Note: Prism is thoroughly empirically tested (self-hosting and 4727+ test cases) but **is not formally verified.** It is designed to compile standard-compliant code, but **may not catch every obscure constraint violation** defined by the ISO C standard.
+Note: Prism is thoroughly empirically tested (self-hosting and 4753+ test cases) but **is not formally verified.** It is designed to compile standard-compliant code, but **may not catch every obscure constraint violation** defined by the ISO C standard.
 
 The transpiler operates in two passes:
 
@@ -70,7 +70,7 @@ The tokenizer builds per-function taint flags (`has_setjmp`, `has_vfork`, `has_a
 
 ### C23 extended float suffix normalization
 
-`emit_tok_special` normalizes C23 extended float suffixes on numeric literals to standard C suffixes: `f16`/`bf16` → `f`, `f32`/`f32x` → (none, `double`), `f64`/`f64x` → `L` (`long double`), `f128`/`f128x` → `L` (`long double`). When an `f128` or `f128x` suffix is downcast to `long double`, a warning is emitted: `"C23 _Float128 literal truncated to long double; precision may be lost on platforms where long double is 80-bit"` — on x86 extended precision, `long double` is 80-bit rather than IEEE 754 binary128.
+`emit_tok_special` normalizes C23 extended float suffixes on numeric literals to standard C suffixes: `f16`/`bf16` → `f` (`float`), `f32` → `f` (`float`), `f32x` → (none, `double`), `f64` → (none, `double`), `f64x` → `L` (`long double`), `f128`/`f128x` → `L` (`long double`). When an `f128` or `f128x` suffix is downcast to `long double`, a warning is emitted: `"C23 _Float128 literal truncated to long double; precision may be lost on platforms where long double is 80-bit"` — on x86 extended precision, `long double` is 80-bit rather than IEEE 754 binary128.
 
 ---
 
@@ -263,6 +263,7 @@ Each `TypedefEntry` records:
 - `is_vla`, `is_void`, `is_const`, `is_volatile`, `is_ptr`, `is_array`, `is_aggregate` — type property flags
 - `is_shadow`, `is_enum_const`, `is_vla_var` — entry kind flags
 - `is_func` — set when the typedef resolves to a function type (used to suppress zero-init memset on function types). Detection works for both `typedef int FuncType(int)` (parse_declarator returns `end=NULL`, check for `(` after name) and `typedef int (FuncType)(int)` (parse_declarator sets `is_func_ptr=true` without `paren_pointer` — function type, not function pointer). **Chained typedef propagation:** `parse_typedef_declaration` propagates `is_func` through typedef chains via `base_is_func`: when the base type specifier contains a function typedef (`is_func_typedef`), the derived typedef inherits `is_func = true` (guarded by `!decl.is_pointer && !decl.is_array && !decl.is_func_ptr`). Without this, `typedef func_t alias; alias f;` would lose the function-type property and Prism would emit `= {0}` or `memset` on a function symbol — a fatal constraint violation (ISO C11 §6.5.3.4p1 forbids `sizeof` on function types).
+- `is_param` — set for function parameter shadow entries (registered by `p1_register_param_shadows`). Used by `array_size_is_vla` to distinguish VLA parameters (which decay to pointers, making `sizeof(param)` constant) from VLA locals.
 - `prev_index` — chain to previous entry for the same name
 
 **After Phase 1 completes, the typedef table is immutable.** No `typedef_add_entry` calls occur in Pass 2.
@@ -281,7 +282,7 @@ This range-based check eliminates runtime scope unwinding. There is no `active_s
 
 #### typedef_flags query
 
-A single lookup returns a bitmask: `TDF_TYPEDEF`, `TDF_VLA`, `TDF_VOID`, `TDF_ENUM_CONST`, `TDF_CONST`, `TDF_PTR`, `TDF_ARRAY`, `TDF_AGGREGATE`, `TDF_VOLATILE`. Convenience macros (`is_known_typedef`, `is_vla_typedef`, `is_volatile_typedef`, etc.) test individual bits.
+A single lookup returns a bitmask: `TDF_TYPEDEF`, `TDF_VLA`, `TDF_VOID`, `TDF_ENUM_CONST`, `TDF_CONST`, `TDF_PTR`, `TDF_ARRAY`, `TDF_AGGREGATE`, `TDF_VOLATILE`, `TDF_FUNC`, `TDF_PARAM`. Convenience macros (`is_known_typedef`, `is_vla_typedef`, `is_volatile_typedef`, etc.) test individual bits.
 
 ---
 
@@ -289,7 +290,7 @@ A single lookup returns a bitmask: `TDF_TYPEDEF`, `TDF_VLA`, `TDF_VOID`, `TDF_EN
 
 **Executed inside:** `p1_full_depth_prescan`
 
-For every variable declaration at every depth, if the declared name collides with a typedef, a `P1ShadowEntry` is recorded via `p1_add_shadow`. Shadows also create a `TDK_SHADOW` entry in the typedef table itself (with `is_shadow = true`, `scope_open_idx`, `scope_close_idx`), so that `typedef_lookup` returns the shadow entry when the token is within the shadow's scope range.
+For every variable declaration at every depth, if the declared name collides with a typedef, a `P1ShadowEntry` is recorded via `p1_register_shadow`. Shadows also create a `TDK_SHADOW` entry in the typedef table itself (with `is_shadow = true`, `scope_open_idx`, `scope_close_idx`), so that `typedef_lookup` returns the shadow entry when the token is within the shadow's scope range.
 
 **Temporal ordering:** Shadows are token-order-dependent. A variable named `T` declared at token index 500 only shadows the typedef `T` for lookups at index ≥ 500 within the shadow's scope range.
 
@@ -409,7 +410,7 @@ Walks all tokens looking for `[…]` pairs containing `orelse`. Marks them with 
 
 **Function:** `p1_verify_cfg`
 
-Runs after all Phase 1 sub-phases complete. Gated by `F_DEFER | F_ZEROINIT` — skipped entirely when neither feature is enabled. For each function's `P1FuncEntry[]` array, performs an O(N) linear sweep with label hash table and monotonic watermark arrays. The label hash table is allocated before `arena_mark` so it persists in `FuncMeta` for O(1) label lookup in Pass 2; only the watermark arrays and forward-goto list are reclaimed via `arena_restore`.
+Runs after all Phase 1 sub-phases complete. Gated by `F_DEFER | F_ZEROINIT` — when neither feature is enabled, only functions containing VLA declarations are verified (all others are skipped). For each function's `P1FuncEntry[]` array, performs an O(N) linear sweep with label hash table and monotonic watermark arrays. The label hash table is allocated before `arena_mark` so it persists in `FuncMeta` for O(1) label lookup in Pass 2; only the watermark arrays and forward-goto list are reclaimed via `arena_restore`.
 
 ### Algorithm
 
@@ -470,7 +471,6 @@ Tokens with tag bits or at statement boundaries are dispatched to handlers:
 | Handler | Trigger | Action |
 |---|---|---|
 | `handle_goto_keyword` | `TT_GOTO` | Emit defer cleanup (LIFO unwinding to target label depth), emit `goto`. Safety checks are in Phase 2A. |
-| `handle_case_default` | `TT_CASE` / `TT_DEFAULT` | Bail out early if `ctrl_state.pending && parens_just_closed` (braceless switch body — no `SCOPE_BLOCK` was pushed, so `find_switch_scope()` would leak to an enclosing braced switch). Otherwise, reset defer stack to switch scope level. Error checks are in Phase 2A. |
 | `handle_open_brace` | `{` | Push scope. Read `P1_SCOPE_*` from `tok->ann` for classification. Handle compound-literal-in-ctrl-paren, stmt_expr detection. |
 | `handle_close_brace` | `}` | Pop scopes, emit defers (LIFO), restore ctrl_state for stmt-expr inside ctrl parens. |
 | `try_zero_init_decl` | Statement start, type keyword/typedef | Parse declaration, insert `= {0}` or `= 0` or `memset` call. |
@@ -500,7 +500,7 @@ Scope exits between a goto and its target label are pre-computed during Phase 2A
 
 For `return`: emits all defers from the current scope to function scope. Uses `ret_counter` to generate unique labels for cleanup blocks.
 
-`emit_deferred_range` handles defer bodies, including bare orelse and raw stripping within deferred code. `emit_deferred_bare_orelse` handles the case where a bare orelse expression appears inside a defer body.
+`emit_deferred_range` handles defer bodies, including bare orelse and raw stripping within deferred code.
 
 `emit_deferred_orelse` (called from `try_process_stmt_token` inside `walk_balanced`'s stmt-expr processing and `emit_deferred_range`) delegates action emission to `emit_orelse_action`, which routes blocks through `emit_orelse_block_body` (→ `handle_open_brace` → `emit_block_body` → `handle_close_brace`, the full transpilation engine) and control-flow keywords through `emit_return_body` / `emit_break_continue_defer` / `emit_goto_defer`. This ensures that return/goto/break/continue inside orelse actions that appear in nested contexts (e.g., orelse-with-return inside another orelse block body) correctly unwind all applicable defers, and that defer keywords inside orelse action blocks are fully processed rather than leaked to the backend compiler.
 
@@ -649,17 +649,15 @@ These helpers are used at 20+ call sites across Phase 1D prescan, Phase 1G orels
 
 ### 6.6 _Generic
 
-`_Generic` expressions receive special handling: `case`/`default` inside `_Generic` association lists are not treated as switch cases (the `in_generic()` scope tracking prevents `handle_case_default` from firing inside `_Generic`).
+`_Generic` expressions receive special handling: `case`/`default` inside `_Generic` association lists are not treated as switch cases (the `in_generic()` scope tracking prevents case/default processing from firing inside `_Generic`).
 
-**Member rewrite:** When `_Generic` is used in a member-access context (e.g., `obj._Generic(sel, int: handler, default: fallback)(args)`), Prism rewrites it by injecting the member-access prefix (`obj.` or `ptr->`) before each branch's target function call identifier. The rewrite handles: bare identifiers (`int: handler`), call targets (`int: handler(args)`), member chains (`.`/`->` + `ident(`), ternary arms (both arms receive injection), **parenthesized targets** (`int: (handler)` or `int: (get_func)(args)`), and **C-style casts** (`int: (int (*)(void))handler`). Paren-wrapped targets are detected by a pre-scan after each `:` that peels one layer of value-wrapping parens: if `(ident)` is followed by `,`/end, it is a bare paren-wrapped value; if followed by `(`, it is a paren-wrapped call. Cast-prefixed targets are detected by a secondary probe that fast-forwards past leading balanced parentheses (`(type)` casts) to locate the bare identifier or call target behind the cast; this handles single casts (`(int (*)(void))read`), double casts (`(int (*)(int))(void *)process`), and cast+call patterns. During emission, the wrapping `(` is drilled into rather than skipped via `walk_balanced`, so the injection logic fires on the inner identifier. Injection only fires when `last_emitted` is NOT a member operator (`.`/`->`) — this prevents prefix multiplication in chains like `get_api()->fetch()` (only `get_api` gets the prefix, not `fetch`).
+**Declaration rewrite:** When `_Generic` appears in a declaration context (preceded by type keywords, qualifiers, storage specifiers, `*`, `)`, or known typedefs) and all association branches share the same function name and argument list, `generic_decl_rewrite_target` extracts the common function name into a parenthesized declarator: e.g. `int (*_Generic(sel, int: func, float: func))(args)` → `int (*(func))(args)`. This handles C23 type-generic macro expansions (GCC 15+ glibc headers) that produce `_Generic` in declaration positions.
 
-**Nested context coverage:** The `try_generic_member_rewrite` hook is present in all token-processing loops that may encounter `_Generic` in expression context: the Pass 2 main loop, `emit_decl_init_walk` (declaration initializers), `walk_balanced` (parenthesized sub-expressions), `emit_block_body` (statement expression bodies and block-scope fallback), `emit_expr_to_semicolon` (return/expression statements with active defers), `walk_balanced_orelse` (no-orelse bracket fallback path), `emit_deferred_range` (defer body emission), `emit_range_ex` (const orelse initializer emission), and `emit_token_range_orelse` (bracket orelse dimension emission). Each hook checks `(tok->tag & TT_GENERIC) && !in_generic()` before calling `try_generic_member_rewrite`, ensuring the rewrite fires regardless of nesting depth — e.g. `(drv->_Generic(0, int: init)())`, `return drv->_Generic(...)` with defers, `defer { drv->_Generic(...); }`, `const int x = drv->_Generic(...) orelse -1`, `int arr[drv->_Generic(...) orelse 10]`, `({ drv->_Generic(...); })`. The `generic_member_rewrite_target` association-value walker also intercepts nested `_Generic` member accesses within association values (e.g. `get_api()._Generic(sel2, ...)`).
-
-**Rewind buffer:** Pass 2 maintains a 1024-entry ring buffer (`emit_save_ring`) recording the absolute output byte offset and token pool index before each `emit_tok()` call. The `_Generic` member rewrite uses this buffer to rewind already-emitted member-access prefixes and re-inject them before each association branch's target function call. If the prefix chain exceeds 1024 tokens, a hard error is raised: `"_Generic member rewrite: prefix chain exceeds 1024 tokens; simplify expression or use _Generic directly"`. Absolute byte offsets are used (never `(buf_pos, flush_seq)` pairs) because `out_flush()` resets buffer position, making relative positions invalid across flush boundaries.
+**Passthrough:** `_Generic` in expression context is emitted as-is without rewriting. Prism tracks `_Generic` scope depth via `SCOPE_GENERIC` to prevent internal keyword processing (defer, orelse, case/default) from firing inside `_Generic` association lists.
 
 ### 6.7 Statement expressions
 
-GNU statement expressions `({…})` are supported. They get their own scope in the scope tree (`is_stmt_expr = true`). Declarations and zero-initialization work correctly inside them. `walk_balanced` detects `({` patterns (including when called directly on a stmt-expr `(`) and processes inner blocks with full keyword dispatch (defer, goto, return/break/continue), `try_zero_init_decl`, raw stripping, and orelse transformation (via `emit_deferred_orelse` at stmt-start with a catch-all `error_tok` for unprocessed orelse tokens, preventing literal "orelse" from leaking to the C output). The inner loop's `itag` variable uses `uint32_t` (matching `Token.tag`'s width) to avoid truncation of high-bit tags like `TT_DEFER` (1<<20), `TT_GOTO` (1<<17), and `TT_ORELSE` (1<<30). `walk_balanced_orelse` (used for array dimensions when `F_ORELSE` is enabled) also detects `({` patterns in its no-orelse emit path and routes them through `walk_balanced` for full transpilation. `emit_orelse_condition_wrap` (which emits the LHS of an orelse in certain `({...}) orelse` forms) routes through `emit_range_no_prep` instead of flat `emit_tok` loops, ensuring statement expressions on the LHS receive full `walk_balanced` processing for defer/orelse/zeroinit. `walk_balanced` saves and restores `ctrl_state` on stmt-expr entry/exit to prevent stmt-expr content from corrupting the outer braceless control-flow tracking.
+GNU statement expressions `({…})` are supported. They get their own scope in the scope tree (`is_stmt_expr = true`). Declarations and zero-initialization work correctly inside them. `walk_balanced` detects `({` patterns (including when called directly on a stmt-expr `(`) and processes inner blocks with full keyword dispatch (defer, goto, return/break/continue), `try_zero_init_decl`, raw stripping, and orelse transformation (via `emit_deferred_orelse` at stmt-start with a catch-all `error_tok` for unprocessed orelse tokens, preventing literal "orelse" from leaking to the C output). The `emit_block_body` function (called from `walk_balanced` for stmt-expr processing) uses `uint32_t` for its `itag` variable (matching `Token.tag`'s width) to avoid truncation of high-bit tags like `TT_DEFER` (1<<20), `TT_GOTO` (1<<17), and `TT_ORELSE` (1<<30). `walk_balanced_orelse` (used for array dimensions when `F_ORELSE` is enabled) also detects `({` patterns in its no-orelse emit path and routes them through `walk_balanced` for full transpilation. `emit_orelse_condition_wrap` (which emits the LHS of an orelse in certain `({...}) orelse` forms) routes through `emit_range_no_prep` instead of flat `emit_tok` loops, ensuring statement expressions on the LHS receive full `walk_balanced` processing for defer/orelse/zeroinit. `walk_balanced` saves and restores `ctrl_state` on stmt-expr entry/exit to prevent stmt-expr content from corrupting the outer braceless control-flow tracking.
 
 **Defer constraint:** A block containing `defer` must not be the last statement of the statement expression (the defer emission would overwrite the expression's return value). Prism detects this during Phase 1D's prescan walk via `p1_check_defer_stmt_expr_chain`, which walks the scope tree parent chain from the defer's scope, checking if only trivial tokens (`;`, labels, preprocessor directives, attributes with balanced parens) separate each scope close. If the chain reaches a `is_stmt_expr` scope, a hard error is raised before Pass 2 begins. Pass 2's `handle_close_brace` retains the same check as defense-in-depth (fires at `}` close time when the parent scope is `is_stmt_expr` and the next non-noise token after `}` is `}`).  The user must place the defer block before the final expression: `int fd = ({ int r; { defer cleanup(); r = work(); } r; });` or restructure without a statement expression.
 
@@ -687,7 +685,7 @@ GNU statement expressions `({…})` are supported. They get their own scope in t
 3. Must be inside a function body (`block_depth > 0`)
 4. Must NOT be in a braceless control body (would create a multi-statement body without braces)
 5. The `__builtin_unreachable();` is emitted immediately after the `;`
-6. The predecessor token must NOT be a type keyword, qualifier, storage class, `*`, or member operator — these indicate a forward declaration (`void abort(void);`) or struct field, not a call. `try_detect_noreturn_call` performs this backward check to avoid injecting `__builtin_unreachable()` after declaration prototypes
+6. The predecessor token must NOT be a type keyword, qualifier, storage class, `inline`, `struct`/`union`/`enum`, `*`, or member operator — these indicate a forward declaration (`void abort(void);`) or struct field, not a call. `try_detect_noreturn_call` performs this backward check to avoid injecting `__builtin_unreachable()` after declaration prototypes
 
 **Disable:** `-fno-auto-unreachable` or `features.auto_unreachable = false` in library mode.
 
@@ -723,7 +721,8 @@ In `PRISM_LIB_MODE`, `error_tok` triggers `longjmp(ctx->error_jmp)` instead of `
 | Braceless control flow nesting depth | 4,096 | `braceless control flow nesting depth exceeds 4096` |
 | Array dimension nesting depth | 256 | `array dimension nesting depth exceeds 256` |
 | Braceless switch synthetic scopes | Limited by remaining scope_id range | `too many scopes + braceless switches (>65535)` |
-| `_Generic` member rewrite prefix chain | 1,024 tokens | `_Generic member rewrite: prefix chain exceeds 1024 tokens` |
+| Pointer depth in declarator | 1,024 | Warning (zero-init skipped, not a hard error) |
+| Parenthesization depth in declarator | 1,024 | Warning (declarator parse bails out) |
 
 These limits are enforced with hard errors. Exceeding any limit halts transpilation.
 
@@ -762,7 +761,7 @@ Multiple `.c` files are each transpiled independently and passed to CC. Assembly
 
 ### Compiler detection
 
-`cc_is_clang` probes `<CC> --version` for "clang" when the basename doesn't match — handles Termux/FreeBSD/some Linux where `cc` or `gcc` symlinks to clang. Detects the backend to avoid passing unsupported flags (e.g., `-fpreprocessed` is clang-only).
+`cc_is_clang` probes `<CC> --version` for "clang" when the basename doesn't match — handles Termux/FreeBSD/some Linux where `cc` or `gcc` symlinks to clang. Detects the backend to avoid passing unsupported flags (e.g., `-fpreprocessed` is GCC-only — not passed to clang).
 
 ### -x language handling
 
@@ -779,6 +778,14 @@ The scanner handles: multi-line block comments (tracked via `in_block_comment`),
 ### System header diagnostic suppression
 
 When `-fflatten-headers` is active, Prism wraps flattened system header content in diagnostic suppression pragmas to prevent warnings from third-party headers polluting the build output. For GCC/Clang: `#pragma GCC diagnostic push` with 10 specific `-W` suppressions (`-Wredundant-decls`, `-Wstrict-prototypes`, `-Wold-style-definition`, `-Wpedantic`, `-Wunused-function`, `-Wunused-parameter`, `-Wunused-variable`, `-Wcast-qual`, `-Wsign-conversion`, `-Wconversion`), closed by `#pragma GCC diagnostic pop`. For MSVC: `#pragma warning(push, 0)` / `#pragma warning(pop)`. Emitted by `emit_system_header_diag_push` / `emit_system_header_diag_pop`.
+
+### POSIX/GNU feature macro injection
+
+During preprocessing (`cc -E`), Prism injects `-D_POSIX_C_SOURCE=200809L` and `-D_GNU_SOURCE` unless the user provides their own (via `-D` flags or `PrismFeatures.defines`). In non-flatten mode, corresponding `#ifndef` / `#define` / `#endif` guards are also emitted into the transpiled output. This ensures POSIX and GNU extensions are available by default for standard library headers.
+
+### Backend warning suppression
+
+In compile and run modes, Prism injects warning suppression flags into the backend compiler invocation via `add_warn_suppress` to prevent spurious warnings from Prism-generated code patterns (e.g., unused variables from hoisted temps, implicit fallthrough from orelse expansion). For GCC/Clang: `-Wno-type-limits`, `-Wno-cast-align`, `-Wno-implicit-fallthrough`, `-Wno-unused-function`, `-Wno-unused-variable`, `-Wno-unused-parameter`, plus `-Wno-unknown-warning-option` (clang) or `-Wno-logical-op` (GCC). For MSVC: `/wd4100`, `/wd4189`, `/wd4244`, `/wd4267`, `/wd4068`. These are NOT injected in transpile mode (stdout output only).
 
 ---
 
@@ -806,7 +813,7 @@ void          prism_thread_cleanup(void);
 
 `PrismFeatures` struct fields: `compiler`, `include_paths`, `defines`, `compiler_flags`, `force_includes` (with respective counts), plus boolean feature flags (`defer`, `zeroinit`, `line_directives`, `warn_safety`, `flatten_headers`, `orelse`, `auto_unreachable`).
 
-`PrismResult` returns status (`PRISM_OK`, `PRISM_ERR_SYNTAX`, `PRISM_ERR_SEMANTIC`, `PRISM_ERR_IO`) and the transpiled source.
+`PrismResult` returns status (`PRISM_OK`, `PRISM_ERR_SYNTAX`, `PRISM_ERR_SEMANTIC`, `PRISM_ERR_IO`) and the transpiled source. `PRISM_ERR_SEMANTIC` is defined but currently unused — all errors route through `PRISM_ERR_SYNTAX`.
 
 Error recovery uses `setjmp`/`longjmp` — `error_tok` longjmps out, arena is reset, context pointers are NULLed.
 
@@ -828,7 +835,7 @@ Stage 1: ./prism_stage0 prism.c -o prism_stage1       (Prism compiles itself)
 Stage 2: ./prism_stage1 prism.c -o prism_stage2       (self-built Prism compiles itself)
 ```
 
-The transpiled C output of stage1 and stage2 is identical (verified by the CI pipeline). Binary differences between stage1 and stage2 on macOS are due to Mach-O `LC_UUID` metadata, not code differences.
+The transpiled C output of stage1 and stage2 is identical. Binary differences between stage1 and stage2 on macOS are due to Mach-O `LC_UUID` metadata, not code differences.
 
 ### CI Matrix
 
@@ -841,7 +848,7 @@ Linux x86_64, macOS x86_64/arm64, Windows build-only, Linux arm64, Linux riscv64
 | File | Description |
 |---|---|
 | `prism.c` | Main transpiler — all Pass 1 phases, Pass 2 code generation, CLI |
-| `parse.c` | Tokenizer, arena allocator, HashMap, `fast_hash`, `error_tok` / `warn_tok` |
+| `parse.c` | Tokenizer, arena allocator, HashMap, `fast_hash`, `error_tok`/`warn_tok`, type/declaration parsing (`parse_type_specifier`, `parse_declarator`, `parse_typedef_declaration`, `parse_enum_constants`), statement skipping (`skip_one_stmt`), defer validation (`validate_defer_statement`), scope utilities (`scope_block_exits`, `scope_is_ancestor_or_self`), noreturn detection (`try_detect_noreturn_call`), VLA analysis (`array_size_is_vla`, `is_array_bracket_predecessor`), raw/const helpers (`is_raw_declaration_context`, `has_effective_const_qual`) |
 | `windows.c` | Native Windows shim (used from `parse.c` for platform-specific I/O) |
 
 `prism.c` includes `parse.c` via `#include`. Single compilation unit — no separate linking step.
@@ -856,12 +863,11 @@ Pass 2 is a near-pure code generator. It does not:
 
 - Mutate the typedef table (`typedef_add_entry` is never called)
 - Unwind the typedef scope (`typedef_pop_scope` does not exist)
-- Register shadows (`register_decl_shadows`, `register_param_shadows`, `register_toplevel_shadows` do not exist)
+- Register shadows (`p1_register_shadow`, `p1_register_param_shadows` are Phase 1 only)
 - Walk the token stream for CFG safety checks (no `goto_skips_check`, no `backward_goto_skips_defer`, no `backward_goto_skips_decl`)
 - Validate defer bodies (`validate_defer_statement` runs only in Phase 1F)
 - Track return type state machines (`FuncMeta` provides return type data at function body entry)
 - Register ghost enums during emit (`emit_tok` does not call `parse_enum_constants`)
-- Read `CtrlState.scope_flags` (scope classification comes from `P1_SCOPE_*` in `tok->ann`)
 
 ### What stays in Pass 2
 
@@ -886,7 +892,7 @@ These are inherently runtime and cannot move to Pass 1:
 4. **Delimiter matching completeness:** Every `(`, `[`, `{` has a `match_idx`. Every `)`, `]`, `}` points back. No unmatched delimiters survive tokenization.
 5. **Self-host fixed point:** Stage 1 and Stage 2 transpiled C output is identical.
 6. **Arena safety:** All arena-allocated Pass 1 structures are reclaimed on `longjmp` error recovery. No dangling pointers after `arena_reset()`.
-7. **Signal cleanup safety:** `signal_temps_clear()` zeroes the **entire** buffer (`memset`, `PATH_MAX` bytes) of every registered path slot before resetting the counter. `signal_cleanup_handler` skips entries where `signal_temps[i][0] == '\0'`. This eliminates the TOCTOU race between `signal_temps_register`'s CAS (counter increment) and `memcpy` (path write): if a signal arrives during `memcpy`, partially written data is followed by zeroes (from the prior `memset`), so the handler sees at worst a truncated — but never fabricated — path. Previous behavior (zeroing only byte 0) left stale path data in bytes 1..N, which could reconstruct a prior cycle's path if `memcpy` was interrupted after writing just the first byte.
+7. **Signal cleanup safety:** `signal_temps_clear()` zeroes the **entire** buffer (`memset`, `PATH_MAX` bytes) of every registered path slot before resetting the counter. `signal_cleanup_handler` checks both `signal_temps_ready_load(i)` (atomic acquire fence on the ready flag) and `signal_temps[i][0] != '\0'` before unlinking. This eliminates the TOCTOU race between `signal_temps_register`'s CAS (counter increment) and `memcpy` (path write): if a signal arrives during `memcpy`, partially written data is followed by zeroes (from the prior `memset`), so the handler sees at worst a truncated — but never fabricated — path. Previous behavior (zeroing only byte 0) left stale path data in bytes 1..N, which could reconstruct a prior cycle's path if `memcpy` was interrupted after writing just the first byte.
 
 ---
 

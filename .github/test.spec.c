@@ -1197,89 +1197,6 @@ static void spec_cross_raw_orelse(void) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  PART 7: I/O buffer integrity (out_str large-token tracking)
-// ═══════════════════════════════════════════════════════════════════════════
-
-// Regression test for the out_str desynchronization bug:
-// A token larger than OUT_BUF_SIZE (128 KB) followed by a _Generic member
-// rewrite must not corrupt the output. The _Generic rewrite uses absolute
-// byte offsets (out_total_flushed + out_buf_pos) to rewind the file pointer.
-// If out_total_flushed is not updated after a large direct fwrite, the
-// rewind lands in the middle of the large token and overwrites it.
-static void spec_io_large_token_generic_rewrite(void) {
-	printf("\n--- I/O Large Token + _Generic Rewrite ---\n");
-
-	// Build a C source with a 135 KB string literal followed by _Generic member rewrite.
-	// OUT_BUF_SIZE is 128 KB, so this forces the large-token fast path.
-	const int payload_len = 135000;
-	// Header + string literal + _Generic code + footer
-	const char *header =
-	    "struct Router { int (*init_v4)(int); int (*init_v6)(int); };\n"
-	    "int setup_v4(int x) { return x + 4; }\n"
-	    "int setup_v6(int x) { return x + 6; }\n"
-	    "const char *giant_payload = \"";
-	const char *mid =
-	    "\";\n"
-	    "int main(void) {\n"
-	    "    struct Router obj;\n"
-	    "    obj.init_v4 = setup_v4;\n"
-	    "    obj.init_v6 = setup_v6;\n"
-	    "    int sel = 1;\n"
-	    "    int result = obj._Generic(sel,\n"
-	    "        int: init_v4,\n"
-	    "        default: init_v6\n"
-	    "    )(10);\n"
-	    "    return result != 14;\n"
-	    "}\n";
-
-	int hlen = (int)strlen(header);
-	int mlen = (int)strlen(mid);
-	int code_len = hlen + payload_len + mlen;
-	char *code = (char *)malloc(code_len + 1);
-	CHECK(code != NULL, "spec io large token: malloc");
-	memcpy(code, header, hlen);
-	memset(code + hlen, 'A', payload_len);
-	memcpy(code + hlen + payload_len, mid, mlen);
-	code[code_len] = '\0';
-
-	char *path = create_temp_file(code);
-	PrismResult r = prism_transpile_file(path, prism_defaults());
-	CHECK_EQ(r.status, PRISM_OK, "spec io large token: transpiles OK");
-
-	if (r.output) {
-		// The 135KB 'A' payload must survive intact in the output.
-		// If out_total_flushed was not updated, the _Generic rewrite
-		// would have seeked back into the payload and overwritten it.
-		int found_payload = 0;
-		const char *p = r.output;
-		while ((p = strstr(p, "AAAA")) != NULL) {
-			// Count a run of A's
-			const char *start = p;
-			while (*p == 'A') p++;
-			if (p - start >= payload_len) { found_payload = 1; break; }
-		}
-		CHECK(found_payload, "spec io large token: 135KB payload intact after _Generic rewrite");
-
-		// The _Generic rewrite must have produced valid output containing
-		// the member-injected form.
-		CHECK(strstr(r.output, "_Generic") != NULL,
-		      "spec io large token: _Generic present in output");
-
-#ifndef _WIN32
-		check_transpiled_output_compiles_and_runs(
-		    r.output,
-		    "spec io large token: compiles",
-		    "spec io large token: runs (Generic member rewrite correct after 135KB token)");
-#endif
-	}
-
-	prism_free(&r);
-	unlink(path);
-	free(path);
-	free(code);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 //  PART 8: Paren-depth evasion (p1d_scan_balanced_group)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1976,88 +1893,6 @@ static void spec_c23_auto_constexpr_orelse(void) {
 	}
 }
 
-// ── _Generic cast-prefix injection ──
-static void spec_generic_cast_prefix(void) {
-	printf("\n--- _Generic cast-prefix injection ---\n");
-
-	// 1. Cast before bare ident: prefix must be injected after cast
-	{
-		PrismResult r = prism_transpile_source(
-		    "struct Drv { int (*read)(void); };\n"
-		    "int read(void);\n"
-		    "void f(struct Drv *d) {\n"
-		    "    int (*fp)(void) = d->_Generic(0,\n"
-		    "        int: (int (*)(void))read\n"
-		    "    );\n"
-		    "    (void)fp;\n"
-		    "}\n",
-		    "spec_gc1.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		         "_Generic cast bare ident: transpiles");
-		if (r.output)
-			CHECK(strstr(r.output, "d->read") != NULL,
-			      "_Generic cast bare ident: prefix injected");
-		prism_free(&r);
-	}
-
-	// 2. Cast before call: prefix must be injected
-	{
-		PrismResult r = prism_transpile_source(
-		    "struct Drv { int (*read)(void); };\n"
-		    "int read(void);\n"
-		    "void f(struct Drv *d) {\n"
-		    "    int val = d->_Generic(0,\n"
-		    "        int: (int (*)(void))read\n"
-		    "    )();\n"
-		    "    (void)val;\n"
-		    "}\n",
-		    "spec_gc2.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		         "_Generic cast call: transpiles");
-		if (r.output)
-			CHECK(strstr(r.output, "d->read") != NULL,
-			      "_Generic cast call: prefix injected");
-		prism_free(&r);
-	}
-
-	// 3. Double cast: prefix must be injected
-	{
-		PrismResult r = prism_transpile_source(
-		    "struct Drv { int (*process)(int); };\n"
-		    "void f(struct Drv *d) {\n"
-		    "    int (*fp)(int) = d->_Generic(0,\n"
-		    "        int: (int (*)(int))(void *)process\n"
-		    "    );\n"
-		    "    (void)fp;\n"
-		    "}\n",
-		    "spec_gc3.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		         "_Generic double cast: transpiles");
-		if (r.output)
-			CHECK(strstr(r.output, "d->process") != NULL,
-			      "_Generic double cast: prefix injected");
-		prism_free(&r);
-	}
-
-	// 4. No cast (baseline): prefix injected as before
-	{
-		PrismResult r = prism_transpile_source(
-		    "struct Drv { int (*read)(void); };\n"
-		    "void f(struct Drv *d) {\n"
-		    "    int val = d->_Generic(0,\n"
-		    "        int: read\n"
-		    "    )();\n"
-		    "    (void)val;\n"
-		    "}\n",
-		    "spec_gc4.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		         "_Generic no cast: transpiles");
-		if (r.output)
-			CHECK(strstr(r.output, "d->read") != NULL,
-			      "_Generic no cast: prefix injected");
-		prism_free(&r);
-	}
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Attribute-obscured raw VLA safety
@@ -2128,86 +1963,6 @@ static void spec_attr_raw_vla_safety(void) {
 		    "spec_arv4.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
 		      "attr raw VLA: plain raw VLA goto rejected");
-		prism_free(&r);
-	}
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  _Generic member rewrite in nested contexts
-// ═══════════════════════════════════════════════════════════════════════════
-
-static void spec_generic_nested_rewrite(void) {
-	printf("\n--- _Generic nested member rewrite ---\n");
-
-	// 1. Parenthesized (walk_balanced)
-	{
-		PrismResult r = prism_transpile_source(
-		    "struct Drv { int (*init)(void); };\n"
-		    "int test(struct Drv *drv) {\n"
-		    "    int s = (drv->_Generic(0, int: init)());\n"
-		    "    return s;\n"
-		    "}\n",
-		    "spec_gn1.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		         "_Generic paren: transpiles");
-		if (r.output) {
-			CHECK(strstr(r.output, "drv->_Generic") == NULL,
-			      "_Generic paren: rewrite fired (no verbatim drv->_Generic)");
-			CHECK(strstr(r.output, "drv->init") != NULL,
-			      "_Generic paren: prefix injected into association");
-		}
-		prism_free(&r);
-	}
-
-	// 2. Return with active defers (emit_expr_to_semicolon)
-	{
-		PrismResult r = prism_transpile_source(
-		    "struct Drv { int (*init)(void); };\n"
-		    "void cleanup(void);\n"
-		    "int test(struct Drv *drv) {\n"
-		    "    defer cleanup();\n"
-		    "    return drv->_Generic(0, int: init)();\n"
-		    "}\n",
-		    "spec_gn2.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		         "_Generic return+defer: transpiles");
-		if (r.output)
-			CHECK(strstr(r.output, "drv->_Generic") == NULL,
-			      "_Generic return+defer: rewrite fired");
-		prism_free(&r);
-	}
-
-	// 3. Statement expression (emit_block_body)
-	{
-		PrismResult r = prism_transpile_source(
-		    "struct Drv { int (*init)(void); };\n"
-		    "int test(struct Drv *drv) {\n"
-		    "    int s = ({ drv->_Generic(0, int: init)(); });\n"
-		    "    return s;\n"
-		    "}\n",
-		    "spec_gn3.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		         "_Generic stmt-expr: transpiles");
-		if (r.output)
-			CHECK(strstr(r.output, "drv->_Generic") == NULL,
-			      "_Generic stmt-expr: rewrite fired");
-		prism_free(&r);
-	}
-
-	// 4. Double parentheses (nested walk_balanced)
-	{
-		PrismResult r = prism_transpile_source(
-		    "struct Drv { int (*init)(void); };\n"
-		    "int test(struct Drv *drv) {\n"
-		    "    int s = ((drv->_Generic(0, int: init)()));\n"
-		    "    return s;\n"
-		    "}\n",
-		    "spec_gn4.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		         "_Generic double paren: transpiles");
-		if (r.output)
-			CHECK(strstr(r.output, "drv->_Generic") == NULL,
-			      "_Generic double paren: rewrite fired");
 		prism_free(&r);
 	}
 }
@@ -2948,7 +2703,6 @@ void run_spec_tests(void) {
 	spec_cross_raw_orelse();
 
 	// ── I/O buffer integrity ──
-	spec_io_large_token_generic_rewrite();
 
 	// ── paren-depth evasion ──
 	spec_paren_depth_evasion();
@@ -2971,14 +2725,10 @@ void run_spec_tests(void) {
 	// ── C23 auto/constexpr orelse ──
 	spec_c23_auto_constexpr_orelse();
 
-	// ── _Generic cast-prefix injection ──
-	spec_generic_cast_prefix();
 
 	// ── attribute-obscured raw VLA safety ──
 	spec_attr_raw_vla_safety();
 
-	// ── _Generic nested member rewrite ──
-	spec_generic_nested_rewrite();
 
 	// ── attribute-encapsulated control flow ──
 	spec_attr_ctrl_flow_rejection();

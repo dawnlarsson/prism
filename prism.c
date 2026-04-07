@@ -1,4 +1,4 @@
-#define PRISM_VERSION "1.0.5"
+#define PRISM_VERSION "1.0.6"
 
 #ifndef _WIN32
 #ifndef _GNU_SOURCE
@@ -299,15 +299,6 @@ static PRISM_THREAD_LOCAL int out_buf_pos = 0;
 static PRISM_THREAD_LOCAL int64_t out_total_flushed = 0;
 static PRISM_THREAD_LOCAL bool use_linemarkers = false; // true = GCC linemarker "# N", false = C99 "#line N"
 
-// Ring buffer tracking (absolute_byte_offset, token_pool_index) before each
-// emit_tok() call.  Used by the _Generic member-injection rewrite to rewind
-// the output buffer past an already-emitted member-access prefix.
-// Absolute offsets survive out_flush() boundary crossings.
-#define EMIT_SAVE_RING_SIZE 1024
-#define EMIT_SAVE_RING_MASK (EMIT_SAVE_RING_SIZE - 1)
-static PRISM_THREAD_LOCAL struct { int64_t abs_pos; uint32_t tpi; int line_no; char *filename; bool is_system; } emit_save_ring[EMIT_SAVE_RING_SIZE];
-static PRISM_THREAD_LOCAL int emit_save_idx = 0;
-
 typedef struct {
 	bool pending;
 	bool pending_for_paren;
@@ -362,7 +353,6 @@ static Token *walk_balanced(Token *tok, bool emit);
 static Token *walk_balanced_orelse(Token *tok);
 static void emit_noise_between_raws(Token *first_raw, Token *last_raw);
 static inline Token *try_strip_raw(Token *t);
-static Token *try_generic_member_rewrite(Token *tok);
 static inline void out_char(char c);
 static inline void out_str(const char *s, int len);
 #define OUT_TOK(t) out_str(tok_loc(t), (t)->len)
@@ -418,7 +408,6 @@ static void reset_transpiler_state(void) {
 	ctrl_reset();
 	ctrl_save_depth = 0;
 	last_emitted = NULL;
-	emit_save_idx = 0;
 	out_total_flushed = 0;
 	current_func_idx = -1;
 	p1_typedef_annotated = false;
@@ -841,15 +830,6 @@ static bool __attribute__((noinline)) emit_tok_special(Token *tok) {
 }
 
 static void emit_tok(Token *tok) {
-	// Save pre-emission absolute output position for _Generic member-injection rewind.
-	int ri_ = emit_save_idx & EMIT_SAVE_RING_MASK;
-	emit_save_ring[ri_].abs_pos = out_total_flushed + out_buf_pos;
-	emit_save_ring[ri_].tpi = tok_idx(tok);
-	emit_save_ring[ri_].line_no = ctx->last_line_no;
-	emit_save_ring[ri_].filename = ctx->last_filename;
-	emit_save_ring[ri_].is_system = ctx->last_system_header;
-	emit_save_idx++;
-
 	TokenCold *c = tok_cold(tok);
 	File *f = (c->file_idx < (uint32_t)ctx->input_file_count)
 		  ? ctx->input_files[c->file_idx] : ctx->current_file;
@@ -911,10 +891,6 @@ static void emit_range_ex(Token *start, Token *end, int flags) {
 		}
 		if (is_stmt_expr_open(t) && tok_match(t)) { walk_balanced(t, true); t = tok_next(tok_match(t)); continue; }
 		{ Token *r = try_strip_raw(t); if (r) { t = r; continue; } }
-		if ((t->tag & TT_GENERIC) && !in_generic()) {
-			Token *after = try_generic_member_rewrite(t);
-			if (after) { t = after; continue; }
-		}
 		emit_tok(t); t = tok_next(t);
 	}
 }
@@ -1526,427 +1502,6 @@ static void emit_ret_type(void) {
 		      "use a named struct or typedef");
 	}
 }
-
-// _Generic member-injection rewrite: obj._Generic(sel, int: f(A)+1, float: f(B)+2)
-// → _Generic(sel, int: obj.f(A)+1, float: obj.f(B)+2)
-//
-// Instead of extracting a single representative target (which discards
-// trailing expressions), this emits the full _Generic with the member-access
-// prefix (obj. / obj->) injected into every association branch.
-//
-// Returns the token after the rewritten _Generic, or NULL if no rewrite.
-static Token *try_generic_member_rewrite(Token *tok) {
-	if (!last_emitted || !(last_emitted->tag & TT_MEMBER)) return NULL;
-
-	Token *open = tok_next(tok);
-	if (!open || !match_ch(open, '(') || !tok_match(open)) return NULL;
-	Token *close = tok_match(open);
-	Token *assoc_start = generic_find_assoc_start(open);
-	if (!assoc_start) return NULL;
-
-	// --- Find the start of the postfix expression chain ---
-	// Walk backward from the member operator (. / ->) through the token
-	// pool, crossing matched brackets and chained member accesses.
-	Token *member_op = last_emitted;
-	uint32_t pi = tok_idx(member_op);
-	for (;;) {
-		if (pi == 0) break;
-		pi--;
-		Token *t = &token_pool[pi];
-		if (t->flags & TF_CLOSE) {
-			Token *m = tok_match(t);
-			if (m) pi = tok_idx(m); else break;
-			// Token before matched open: include ident (function name) or
-			// continue chain if preceded by another member operator.
-			if (pi > 0 && is_valid_varname(&token_pool[pi - 1])) {
-				pi--;
-				if (pi > 0 && (token_pool[pi - 1].tag & TT_MEMBER)) {
-					pi--;
-					continue;
-				}
-			} else if (pi > 0 && (token_pool[pi - 1].tag & TT_MEMBER)) {
-				pi--;
-				continue;
-			}
-			break;
-		}
-		if (is_valid_varname(t) || t->kind == TK_NUM || t->kind == TK_STR) {
-			if (pi > 0 && (token_pool[pi - 1].tag & TT_MEMBER)) {
-				pi--;
-				continue;
-			}
-			break;
-		}
-		// Unexpected token — don't include it in the chain.
-		pi++;
-		break;
-	}
-	uint32_t chain_start_pi = pi;
-
-	// --- Look up the absolute output position before chain_start was emitted ---
-	int64_t abs_rewind = -1;
-	int rewind_line_no = 0;
-	char *rewind_filename = NULL;
-	bool rewind_is_system = false;
-	for (int i = emit_save_idx - 1;
-	     i >= 0 && i >= emit_save_idx - EMIT_SAVE_RING_SIZE; i--) {
-		int ri = i & EMIT_SAVE_RING_MASK;
-		if (emit_save_ring[ri].tpi == chain_start_pi) {
-			abs_rewind = emit_save_ring[ri].abs_pos;
-			rewind_line_no = emit_save_ring[ri].line_no;
-			rewind_filename = emit_save_ring[ri].filename;
-			rewind_is_system = emit_save_ring[ri].is_system;
-			break;
-		}
-	}
-	if (abs_rewind < 0) {
-		error_tok(member_op, "_Generic member rewrite: prefix chain exceeds %d tokens; simplify expression or use _Generic directly", EMIT_SAVE_RING_SIZE);
-		return NULL;
-	}
-
-	// --- Capture the prefix text (e.g. "obj." / "ptr->") ---
-	// Read the prefix directly from the output buffer.  This captures any
-	// injected text from outer _Generic rewrites (nested case) that token_pool
-	// doesn't contain.  Build a clean version from the output bytes between
-	// abs_rewind and the current output position, stripping \n and #line
-	// directives to get a compact single-line prefix.
-	char prefix_buf[1024];
-	int prefix_len = 0;
-	{
-		int64_t cur_abs = out_total_flushed + out_buf_pos;
-		int64_t raw_len = cur_abs - abs_rewind;
-		if (raw_len > 0 && raw_len < (int64_t)sizeof(prefix_buf)) {
-			// All prefix bytes should be in the current buffer since they
-			// were just emitted.  If abs_rewind is in the buffer, direct copy.
-			if (abs_rewind >= out_total_flushed) {
-				int start = (int)(abs_rewind - out_total_flushed);
-				// Strip newlines and #line directives from the raw output
-				for (int k = start; k < start + (int)raw_len; k++) {
-					char ch = out_buf[k];
-					if (ch == '\n') {
-						// Skip optional #line directive after newline
-						if (k + 1 < start + (int)raw_len && out_buf[k + 1] == '#') {
-							k++;
-							while (k < start + (int)raw_len && out_buf[k] != '\n') k++;
-							k--;  // outer loop will advance
-						} else if (prefix_len > 0) {
-							prefix_buf[prefix_len++] = ' ';
-						}
-					} else {
-						prefix_buf[prefix_len++] = ch;
-					}
-				}
-			} else {
-				// Rare: prefix spans a flush boundary.  Fall back to
-				// token-pool-based reconstruction.
-				for (uint32_t p = chain_start_pi; p <= tok_idx(member_op); p++) {
-					Token *pt = &token_pool[p];
-					if (prefix_len > 0 && (pt->flags & TF_HAS_SPACE) && prefix_len < (int)sizeof(prefix_buf) - 1)
-						prefix_buf[prefix_len++] = ' ';
-					int tl = pt->len;
-					if (prefix_len + tl > (int)sizeof(prefix_buf))
-						error_tok(member_op, "_Generic member rewrite: prefix exceeds %d bytes; simplify the member access chain or use _Generic directly", (int)sizeof(prefix_buf));
-					memcpy(prefix_buf + prefix_len, tok_loc(pt), tl);
-					prefix_len += tl;
-				}
-			}
-		} else if (raw_len >= (int64_t)sizeof(prefix_buf)) {
-			error_tok(member_op, "_Generic member rewrite: prefix exceeds %d bytes; simplify the member access chain or use _Generic directly", (int)sizeof(prefix_buf));
-		} else {
-			// raw_len <= 0: shouldn't happen, fall back to token-based
-			for (uint32_t p = chain_start_pi; p <= tok_idx(member_op); p++) {
-				Token *pt = &token_pool[p];
-				if (prefix_len > 0 && (pt->flags & TF_HAS_SPACE) && prefix_len < (int)sizeof(prefix_buf) - 1)
-					prefix_buf[prefix_len++] = ' ';
-				int tl = pt->len;
-				if (prefix_len + tl > (int)sizeof(prefix_buf))
-					error_tok(member_op, "_Generic member rewrite: prefix exceeds %d bytes; simplify the member access chain or use _Generic directly", (int)sizeof(prefix_buf));
-				memcpy(prefix_buf + prefix_len, tok_loc(pt), tl);
-				prefix_len += tl;
-			}
-		}
-	}
-
-	// --- Rewind output past the prefix ---
-	// If the target position is still in the current buffer, rewind in-place.
-	// If it was already flushed to disk, flush remaining data and fseek back.
-	if (abs_rewind >= out_total_flushed) {
-		out_buf_pos = (int)(abs_rewind - out_total_flushed);
-	} else {
-		out_flush();
-		if (fseek(out_fp, (long)abs_rewind, SEEK_SET) != 0) return NULL;
-		out_total_flushed = abs_rewind;
-		out_buf_pos = 0;
-	}
-
-	// Restore line-tracking state to what it was before the prefix was emitted.
-	// The physical rewind erased any #line directives in the prefix; without
-	// this, emit_tok believes the backend compiler is already on the correct
-	// line and refuses to re-emit the directive.
-	ctx->last_line_no = rewind_line_no;
-	ctx->last_filename = rewind_filename;
-	ctx->last_system_header = rewind_is_system;
-
-	// Fix last_emitted to the token emitted just before the prefix chain.
-	last_emitted = (chain_start_pi > 0) ? &token_pool[chain_start_pi - 1] : NULL;
-
-	// --- Emit _Generic( ---
-	emit_tok(tok);   // _Generic
-	emit_tok(open);  // (
-
-	// --- Emit controlling expression (up to assoc_start) ---
-	for (Token *t = tok_next(open); t && t != assoc_start; t = tok_next(t)) {
-		if ((t->flags & TF_OPEN) && tok_match(t)) {
-			walk_balanced(t, true);
-			t = tok_match(t);
-			continue;
-		}
-		emit_tok(t);
-	}
-
-	// --- Emit each association, injecting prefix before targets ---
-	// For each branch value: inject prefix before every bracket-depth-0
-	// identifier that is followed by '(' (function call).  For branches
-	// that are a single bare identifier (no parens), inject before it.
-	int ternary = 0;
-	bool in_value = false;
-	bool val_has_call = false;   // current branch has ident+( at depth 0
-	bool val_bare_ident = false; // current branch is a single bare ident
-	bool val_paren_wrapped = false; // target ident is inside (ident) wrapping parens
-	int val_peel_depth = 0;      // number of remaining paren layers to drill through
-	bool val_has_ternary = false;    // branch value contains a ternary expression
-	bool val_ternary_arm_fresh = false; // just entered a ternary arm (? or ternary :)
-	Token *inner_generic_close = NULL; // close paren of inner _Generic being processed
-	for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
-		// Inner _Generic close paren — emit and exit inner mode.
-		if (t == inner_generic_close) {
-			emit_tok(t);
-			inner_generic_close = NULL;
-			continue;
-		}
-		if ((t->flags & TF_OPEN) && tok_match(t)) {
-			// Let inner _Generic's parens flow through individually
-			// so each association value gets prefix injection.
-			if (in_value && !inner_generic_close && match_ch(t, '(') &&
-			    last_emitted && (last_emitted->tag & TT_GENERIC)) {
-				inner_generic_close = tok_match(t);
-				emit_tok(t);
-				continue;
-			}
-			// Don't skip parens that wrap the injection target —
-			// drill in so the injection logic below can fire on the
-			// inner identifier.
-			if (in_value && val_paren_wrapped && match_ch(t, '(') &&
-			    (val_bare_ident || val_has_call)) {
-				emit_tok(t); // emit '('
-				// After drilling into (ident), treat the inner ident
-				// as bare for injection — tok_next(ident) is ')' not '('.
-				if (val_peel_depth > 0) {
-					val_peel_depth--;
-				} else {
-					if (val_has_call) {
-						val_bare_ident = true;
-						val_has_call = false;
-					}
-					val_paren_wrapped = false;
-				}
-				continue;
-			}
-			walk_balanced(t, true);
-			t = tok_match(t);
-			continue;
-		}
-		if (match_ch(t, '?')) { ternary++; if (val_has_ternary) val_ternary_arm_fresh = true; emit_tok(t); continue; }
-		if (match_ch(t, ':') && ternary > 0) { ternary--; if (val_has_ternary) val_ternary_arm_fresh = true; emit_tok(t); continue; }
-		if (match_ch(t, ':') && ternary == 0) {
-			emit_tok(t);  // ':'
-			in_value = true;
-			// Pre-scan the branch value to decide injection strategy.
-			val_has_call = false;
-			val_bare_ident = false;
-			val_paren_wrapped = false;
-			val_peel_depth = 0;
-			val_has_ternary = false;
-			val_ternary_arm_fresh = false;
-			Token *vs = tok_next(t);
-			// Peel one layer of value-wrapping parens for injection
-			// detection: (handle_int) or (get_func)(args).
-			Token *vs_inner = vs;
-			// Peel through multiple layers of value-wrapping parens
-			// for macro hygiene: ((handle_int)) or ((get_func))(args).
-			Token *peel_open = vs_inner;
-			int peel_depth = 0;
-			while (peel_open && match_ch(peel_open, '(') && tok_match(peel_open)) {
-				Token *maybe_inner = tok_next(peel_open);
-				if (!maybe_inner || !match_ch(maybe_inner, '(')) break;
-				// Verify this layer wraps tightly: the close is adjacent
-				// to the next layer's close.
-				peel_open = maybe_inner;
-				peel_depth++;
-			}
-			if (peel_open && match_ch(peel_open, '(') && tok_match(peel_open)) {
-				Token *inner = tok_next(peel_open);
-				Token *pclose = tok_match(peel_open);
-				if (inner && is_valid_varname(inner)) {
-					// Check if the inner content is a valid target:
-					// single ident, or ident followed by [, ., ->
-					bool inner_ok = (tok_next(inner) == pclose);
-					if (!inner_ok) {
-						Token *after_inner = tok_next(inner);
-						if (after_inner && (match_ch(after_inner, '[') ||
-						    (after_inner->tag & TT_MEMBER)))
-							inner_ok = true;
-					}
-					if (inner_ok) {
-					// Verify all outer paren layers close tightly
-					Token *outer_close = pclose;
-					bool layers_ok = true;
-					for (int pl = 0; pl < peel_depth; pl++) {
-						outer_close = tok_next(outer_close);
-						if (!outer_close || !match_ch(outer_close, ')')) { layers_ok = false; break; }
-					}
-					if (layers_ok) {
-						Token *after_outer = tok_next(outer_close);
-						if (!after_outer || after_outer == close || match_ch(after_outer, ',')) {
-							val_bare_ident = true;
-							val_paren_wrapped = true;
-							val_peel_depth = peel_depth;
-						} else if (match_ch(after_outer, '(')) {
-							val_has_call = true;
-							val_paren_wrapped = true;
-							val_peel_depth = peel_depth;
-						}
-					}
-					}
-				}
-			}
-			if (!val_bare_ident && !val_has_call) {
-			for (Token *s = vs; s && s != close; s = tok_next(s)) {
-				if ((s->flags & TF_OPEN) && tok_match(s))
-					{ s = tok_match(s); continue; }
-				if (match_ch(s, ',')) break;
-				if (is_valid_varname(s) && tok_next(s) &&
-				    match_ch(tok_next(s), '('))
-					{ val_has_call = true; break; }
-			}
-			if (!val_has_call && vs && is_valid_varname(vs)) {
-				Token *after_vs = tok_next(vs);
-				if (!after_vs || after_vs == close ||
-				    match_ch(after_vs, ',') ||
-				    match_ch(after_vs, ')') ||
-				    match_ch(after_vs, '[') ||
-				    (after_vs->tag & TT_MEMBER))
-					val_bare_ident = true;
-			}
-			// Probe past leading C-style casts: (type)ident
-			if (!val_has_call && !val_bare_ident && vs) {
-				Token *probe = vs;
-				while (probe && match_ch(probe, '(') &&
-				       (probe->flags & TF_OPEN) && tok_match(probe))
-					probe = tok_next(tok_match(probe));
-				if (probe && is_valid_varname(probe)) {
-					Token *ap = tok_next(probe);
-					if (!ap || ap == close || match_ch(ap, ',') ||
-					    match_ch(ap, ')') || match_ch(ap, '[') ||
-					    (ap->tag & TT_MEMBER))
-						val_bare_ident = true;
-					else if (match_ch(ap, '('))
-						val_has_call = true;
-				}
-			}
-			// Check for ternary expression in branch value.
-			if (!val_has_call && !val_bare_ident) {
-				for (Token *s = vs; s && s != close; s = tok_next(s)) {
-					if ((s->flags & TF_OPEN) && tok_match(s))
-						{ s = tok_match(s); continue; }
-					if (match_ch(s, ',')) break;
-					if (match_ch(s, '?')) { val_has_ternary = true; break; }
-				}
-			}
-			}
-			continue;
-		}
-		if (match_ch(t, ',') && ternary == 0) {
-			if (!inner_generic_close)
-				in_value = false;
-			emit_tok(t);
-			continue;
-		}
-
-		// Injection point: prefix before depth-0 ident+( or bare ident.
-		// Skip identifiers preceded by a member operator (./->) — those are
-		// chained method calls (e.g. get_api()->fetch()) where only the FIRST
-		// call in the chain should receive the prefix.
-		bool inject = false;
-		if (in_value && is_valid_varname(t) &&
-		    !(last_emitted && (last_emitted->tag & TT_MEMBER))) {
-			if (val_has_call && tok_next(t) &&
-			    match_ch(tok_next(t), '('))
-				inject = true;
-			else if (val_bare_ident) {
-				inject = true;
-				val_bare_ident = false; // only once
-			} else if (val_has_ternary && val_ternary_arm_fresh) {
-				Token *nt = tok_next(t);
-				if (nt && match_ch(nt, '('))
-					inject = true;
-				else if (!nt || nt == close || match_ch(nt, ',') ||
-				         (match_ch(nt, ':') && ternary > 0) ||
-				         match_ch(nt, ')'))
-					inject = true;
-			}
-		}
-		if (inject) {
-			// Emit spacing (space or newline) that emit_tok would
-			// normally prepend, then the prefix, then the token text
-			// — no gap between prefix and identifier.
-			if (tok_at_bol(t)) out_char('\n');
-			else if ((t->flags & TF_HAS_SPACE) ||
-				 needs_space(last_emitted, t))
-				out_char(' ');
-			// Record the injected token in the emit_save_ring BEFORE
-			// the prefix so that a nested _Generic rewrite rewinds past
-			// both the prefix and the token, capturing the full chain.
-			{
-				int ri_ = emit_save_idx & EMIT_SAVE_RING_MASK;
-				emit_save_ring[ri_].abs_pos = out_total_flushed + out_buf_pos;
-				emit_save_ring[ri_].tpi = tok_idx(t);
-				emit_save_ring[ri_].line_no = ctx->last_line_no;
-				emit_save_ring[ri_].filename = ctx->last_filename;
-				emit_save_ring[ri_].is_system = ctx->last_system_header;
-				emit_save_idx++;
-			}
-			out_str(prefix_buf, prefix_len);
-			out_str(tok_loc(t), t->len);
-			last_emitted = t;
-			if (val_has_ternary && is_valid_varname(t))
-				val_ternary_arm_fresh = false;
-		} else {
-			// Intercept nested _Generic with member access:
-			// e.g. get_api()._Generic(sel2, float: handle)(data)
-			if ((t->tag & TT_GENERIC) && last_emitted &&
-			    (last_emitted->tag & TT_MEMBER)) {
-				Token *after = try_generic_member_rewrite(t);
-				if (after) {
-					// try_generic_member_rewrite returns tok_next(close).
-					// Walk to the close paren so the for-loop increment
-					// lands on the right token.
-					Token *gen_open = tok_next(t);
-					if (gen_open && match_ch(gen_open, '(') && tok_match(gen_open))
-						t = tok_match(gen_open);
-					continue;
-				}
-			}
-			emit_tok(t);
-		}
-	}
-
-	// --- Emit closing ) ---
-	emit_tok(close);
-	last_emitted = close;
-	return tok_next(close);
-}
-
 // Zero-init declaration parsing helpers
 
 static Token *decl_noise(Token *tok, bool emit) {
@@ -2079,10 +1634,6 @@ static Token *emit_block_body(Token *tok, Token *end) {
 			continue;
 		}
 		ctx->at_stmt_start = false;
-		if ((tok->tag & TT_GENERIC) && !in_generic()) {
-			Token *after = try_generic_member_rewrite(tok);
-			if (after) { tok = after; continue; }
-		}
 		emit_tok(tok); tok = tok_next(tok);
 	}
 	return tok;
@@ -2137,11 +1688,6 @@ static Token *walk_balanced(Token *tok, bool emit) {
 			}
 			// Strip 'raw' keyword inside balanced groups (cast expressions, etc.)
 			{ Token *r = try_strip_raw(t); if (r) { t = r; continue; } }
-			// _Generic member rewrite inside balanced groups
-			if ((t->tag & TT_GENERIC) && !in_generic()) {
-				Token *after = try_generic_member_rewrite(t);
-				if (after) { t = after; continue; }
-			}
 			emit_tok(t); t = tok_next(t);
 		}
 	}
@@ -2184,15 +1730,6 @@ static void emit_token_range_orelse(Token *start, Token *end) {
 					emit_token_range_orelse(tok_next(t), close);
 					emit_tok(close);
 					t = close;
-					continue;
-				}
-			}
-			if ((t->tag & TT_GENERIC) && !in_generic()) {
-				Token *after = try_generic_member_rewrite(t);
-				if (after) {
-					Token *gen_open = tok_next(t);
-					if (gen_open && match_ch(gen_open, '(') && tok_match(gen_open))
-						t = tok_match(gen_open);
 					continue;
 				}
 			}
@@ -2399,10 +1936,6 @@ static Token *walk_balanced_orelse(Token *tok) {
 				error_tok(t, "'orelse' inside array dimension could not be transformed; "
 					   "if wrapped in outer parentheses, remove them: "
 					   "use '[f() orelse 1]' not '[(f() orelse 1)]'");
-			if ((t->tag & TT_GENERIC) && !in_generic()) {
-				Token *after = try_generic_member_rewrite(t);
-				if (after) { t = after; continue; }
-			}
 			emit_tok(t); t = tok_next(t);
 		}
 		return tok_next(end);
@@ -3131,10 +2664,6 @@ static InitWalkResult emit_decl_init_walk(Token *tok) {
 		if (match_ch(r.tok, ',') || match_ch(r.tok, ';')) break;
 		if (match_ch(r.tok, '?')) { init_ternary++; emit_tok(r.tok); r.tok = tok_next(r.tok); continue; }
 		if (match_ch(r.tok, ':') && init_ternary > 0) { init_ternary--; emit_tok(r.tok); r.tok = tok_next(r.tok); continue; }
-		if (r.tok->tag & TT_GENERIC) {
-			Token *after = try_generic_member_rewrite(r.tok);
-			if (after) { r.tok = after; continue; }
-		}
 		if (FEAT(F_ORELSE) && is_orelse_keyword(r.tok)) {
 			if (init_ternary > 0)
 				error_tok(r.tok, "'orelse' cannot be used inside a ternary expression");
@@ -3743,10 +3272,6 @@ static Token *emit_expr_to_semicolon(Token *tok) {
 			expr_at_stmt_start = false;
 		}
 
-		if ((tok->tag & TT_GENERIC) && !in_generic()) {
-			Token *after = try_generic_member_rewrite(tok);
-			if (after) { tok = after; expr_at_stmt_start = false; continue; }
-		}
 		emit_tok(tok);
 
 		if (match_ch(tok, ';') || match_ch(tok, '{') || match_ch(tok, '}'))
@@ -5626,10 +5151,6 @@ static void emit_deferred_range(Token *start, Token *end) {
 			continue;
 		}
 
-		if ((t->tag & TT_GENERIC) && !in_generic()) {
-			Token *after = try_generic_member_rewrite(t);
-			if (after) { t = after; continue; }
-		}
 		emit_tok(t); t = tok_next(t);
 	}
 
@@ -8144,7 +7665,6 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			}
 
 			if ((tag & TT_GENERIC) && !in_generic()) {
-				{ Token *after = try_generic_member_rewrite(tok); if (after) { tok = after; continue; } }
 				if (last_emitted && (match_ch(last_emitted, '*') || match_ch(last_emitted, ')') ||
 				    (last_emitted->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_SKIP_DECL | TT_ATTR |
 				     TT_INLINE | TT_STORAGE | TT_TYPEOF | TT_BITINT)) ||
