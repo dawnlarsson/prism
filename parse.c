@@ -856,6 +856,13 @@ static inline bool is_stmt_expr_open(Token *t) {
 	return match_ch(t, '(') && tok_next(t) && match_ch(tok_next(t), '{');
 }
 
+// 'else' keyword (TT_IF covers both if and else; 'e' distinguishes)
+static inline bool is_else_kw(Token *t) { return (t->tag & TT_IF) && t->ch0 == 'e'; }
+// 'do' keyword (TT_LOOP covers for/while/do; 'd' distinguishes)
+static inline bool is_do_kw(Token *t) { return (t->tag & TT_LOOP) && t->ch0 == 'd'; }
+// Either else or do (no-condition ctrl-flow)
+static inline bool is_else_or_do(Token *t) { return is_else_kw(t) || is_do_kw(t); }
+
 static inline bool _equal_2(Token *tok, const char *s) {
 	if (tok->len != 2 || tok->ch0 != (uint8_t)s[0]) return false;
 	return tok_loc(tok)[1] == s[1];
@@ -2122,12 +2129,12 @@ typedef enum {
 
 typedef struct {
 	char *name; // Points into token stream (no alloc needed)
-	int len;
-	int scope_depth;	    // Scope where defined (aligns with ctx->block_depth)
-	int prev_index;		    // Index of previous entry with same name (-1 if none), for hash map chaining
+	int prev_index;		    // Index of previous entry with same name (-1 if none)
 	uint32_t token_index;       // Token pool index of the declaration
 	uint32_t scope_open_idx;    // Token index of enclosing '{' (0 for file scope)
 	uint32_t scope_close_idx;   // Token index of matching '}' (UINT32_MAX for file scope)
+	uint16_t len;
+	uint16_t scope_depth;	    // Scope where defined (aligns with ctx->block_depth)
 	bool is_vla : 1;
 	bool is_void : 1;
 	bool is_const : 1;
@@ -2140,7 +2147,7 @@ typedef struct {
 	bool is_aggregate : 1;
 	bool is_func : 1;
 	bool is_param : 1;
-} TypedefEntry;
+} TypedefEntry; // 32 bytes — two entries per 64-byte cache line
 
 typedef struct {
 	TypedefEntry *entries;
@@ -2177,6 +2184,10 @@ static PRISM_THREAD_LOCAL TypedefTable typedef_table;
 static PRISM_THREAD_LOCAL uint32_t td_scope_open = 0;
 static PRISM_THREAD_LOCAL uint32_t td_scope_close = UINT32_MAX;
 static PRISM_THREAD_LOCAL bool p1_typedef_annotated; // true after p1_annotate_typedefs(); enables O(1) is_known_typedef
+
+// Save/restore typedef scope range context (used 5+ sites).
+#define TD_SCOPE_SAVE() uint32_t _tds_o = td_scope_open, _tds_c = td_scope_close
+#define TD_SCOPE_RESTORE() do { td_scope_open = _tds_o; td_scope_close = _tds_c; } while(0)
 
 // --- Utility Inlines ---
 
@@ -2363,6 +2374,18 @@ static bool is_type_keyword(Token *tok) {
 
 static inline bool is_valid_varname(Token *tok) {
 	return tok->kind == TK_IDENT || (tok->flags & TF_RAW) || (tok->tag & (TT_DEFER | TT_ORELSE));
+}
+
+// Token ends an expression (value-producing): ident, keyword, num, str, ), ].
+static inline bool is_expr_ending(Token *t) {
+	return (t->kind == TK_IDENT || t->kind == TK_KEYWORD ||
+		t->kind == TK_NUM || t->kind == TK_STR) ||
+	       match_set(t, CH(')') | CH(']'));
+}
+
+// Extended version including '}' (for compound literal / brace init contexts).
+static inline bool is_expr_ending_brace(Token *t) {
+	return is_expr_ending(t) || match_ch(t, '}');
 }
 
 static DeclResult parse_declarator(Token *tok, bool emit);
@@ -2983,17 +3006,24 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 
 // --- skip_one_stmt ---
 
+// Limits for skip_one_stmt_impl stack arrays.
+// if_depth can exceed SOS_IF_MAX (cache optimization degrades gracefully).
+// do_depth is hard-capped at SOS_DO_MAX (gives up on pathological input).
+#define SOS_IF_MAX    512
+#define SOS_DO_MAX    128
+#define SOS_SNAP_MAX  1024
+
 static Token *skip_one_stmt_impl(Token *tok, uint32_t *cache) {
 	int if_depth = 0;
 	int do_depth = 0;
-	int do_if_save[4096];
-	int do_tn_save[4096];
-	int do_snap_buf[4096];  // flat buffer saving if_trail_snap per do level
-	int do_snap_start[4096];
+	int do_if_save[SOS_DO_MAX];
+	int do_tn_save[SOS_DO_MAX];
+	int do_snap_buf[SOS_SNAP_MAX];  // flat buffer saving if_trail_snap per do level
+	int do_snap_start[SOS_DO_MAX];
 	int do_snap_top = 0;
 	uint32_t trail[256];
 	int tn = 0;
-	int if_trail_snap[4096]; // trail length snapshot at each if_depth entry
+	int if_trail_snap[SOS_IF_MAX]; // trail length snapshot at each if_depth entry
 restart:
 	tok = skip_prep_dirs(tok);
 	tok = skip_noise(tok);
@@ -3014,7 +3044,7 @@ restart:
 		if (tok->ch0 == 'e') { tok = tok_next(tok); goto restart; }
 		Token *p = skip_prep_dirs(tok_next(tok));
 		if (!p || !(p->len == 1 && p->ch0 == '(') || !tok_match(p)) return NULL;
-		if (if_depth < 4096) if_trail_snap[if_depth] = tn;
+		if (if_depth < SOS_IF_MAX) if_trail_snap[if_depth] = tn;
 		if_depth++;
 		tok = tok_next(tok_match(p)); goto restart;
 	}
@@ -3026,11 +3056,11 @@ restart:
 	}
 
 	if ((tok->tag & TT_LOOP) && tok->ch0 == 'd') {
-		if (do_depth >= 4096) return NULL;
+		if (do_depth >= SOS_DO_MAX) return NULL;
 		do_if_save[do_depth] = if_depth;
 		do_tn_save[do_depth] = tn;
 		do_snap_start[do_depth] = do_snap_top;
-		for (int i = 0; i < if_depth && do_snap_top < 4096; i++)
+		for (int i = 0; i < if_depth && i < SOS_IF_MAX && do_snap_top < SOS_SNAP_MAX; i++)
 			do_snap_buf[do_snap_top++] = if_trail_snap[i];
 		do_depth++;
 		if_depth = 0;
@@ -3071,7 +3101,7 @@ unwind_if:
 		if (n && (n->tag & TT_IF) && n->ch0 == 'e') {
 			// Only flush trail entries from THIS if level (true-branch),
 			// not parent tokens that span the entire if-else.
-			int snap = (if_depth < 4096) ? if_trail_snap[if_depth] : 0;
+			int snap = (if_depth < SOS_IF_MAX) ? if_trail_snap[if_depth] : 0;
 			if (cache && tok) {
 				uint32_t val = tok_idx(tok) + 1;
 				for (int i = snap; i < tn; i++) cache[trail[i]] = val;
