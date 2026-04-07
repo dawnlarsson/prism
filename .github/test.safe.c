@@ -5255,6 +5255,207 @@ static void test_emit_block_body_gaps(void) {
 	}
 }
 
+// BUG: Objective-C @interface/@implementation ivar blocks look like
+// code blocks to Prism, causing zero-init to fire on instance variables.
+// These blocks must be treated like struct bodies (no zero-init on fields).
+static void test_objc_ivar_block_zeroinit(void) {
+	printf("\n--- Objective-C ivar block zero-init ---\n");
+
+	// 1. Simple @interface with ivars — must NOT zero-init fields
+	{
+		const char *code =
+		    "@interface NSObject {\n"
+		    "    int isa;\n"
+		    "    void *reserved;\n"
+		    "}\n"
+		    "@end\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "objc_iface.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "objc @interface: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "isa = 0") == NULL &&
+			      strstr(r.output, "isa =0") == NULL,
+			      "objc @interface: ivar 'isa' not zero-inited");
+			CHECK(strstr(r.output, "reserved = 0") == NULL &&
+			      strstr(r.output, "reserved =0") == NULL,
+			      "objc @interface: ivar 'reserved' not zero-inited");
+		}
+		prism_free(&r);
+	}
+
+	// 2. @interface with inheritance — must NOT zero-init fields
+	{
+		const char *code =
+		    "@interface NSAutoreleasePool : NSObject {\n"
+		    "    void *_reserved3;\n"
+		    "    void *_reserved2;\n"
+		    "    void *_reserved;\n"
+		    "}\n"
+		    "@end\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "objc_inherit.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "objc @interface+inherit: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "_reserved3 = 0") == NULL,
+			      "objc @interface+inherit: _reserved3 not zero-inited");
+			CHECK(strstr(r.output, "_reserved2 = 0") == NULL,
+			      "objc @interface+inherit: _reserved2 not zero-inited");
+			CHECK(strstr(r.output, "_reserved = 0") == NULL &&
+			      strstr(r.output, "_reserved =0") == NULL,
+			      "objc @interface+inherit: _reserved not zero-inited");
+		}
+		prism_free(&r);
+	}
+
+	// 3. @implementation with ivars — must NOT zero-init fields
+	{
+		const char *code =
+		    "@implementation NSString {\n"
+		    "    int numBytes;\n"
+		    "    int _unused;\n"
+		    "}\n"
+		    "@end\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "objc_impl.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "objc @implementation: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "numBytes = 0") == NULL,
+			      "objc @implementation: numBytes not zero-inited");
+			CHECK(strstr(r.output, "_unused = 0") == NULL,
+			      "objc @implementation: _unused not zero-inited");
+		}
+		prism_free(&r);
+	}
+
+	// 4. @interface category extension () — must NOT zero-init fields
+	{
+		const char *code =
+		    "@interface NSFoo () {\n"
+		    "    double value;\n"
+		    "}\n"
+		    "@end\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "objc_cat.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "objc @interface category: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "value = 0") == NULL &&
+			      strstr(r.output, "value =0") == NULL,
+			      "objc @interface category: value not zero-inited");
+		}
+		prism_free(&r);
+	}
+
+	// 5. Regular struct body must still NOT zero-init fields (sanity check)
+	{
+		const char *code =
+		    "struct Foo { int x; int y; };\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "objc_struct.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "struct body: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "int x = 0") == NULL,
+			      "struct body: field x not zero-inited");
+		}
+		prism_free(&r);
+	}
+
+	// 6. Regular variables must still get zero-init (sanity check)
+	{
+		const char *code =
+		    "void test(void) {\n"
+		    "    int a;\n"
+		    "    void *p;\n"
+		    "    (void)a; (void)p;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "objc_var.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "regular vars: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "a = 0") != NULL,
+			      "regular vars: 'a' gets zero-init");
+			CHECK(strstr(r.output, "p = 0") != NULL ||
+			      strstr(r.output, "*p = 0") != NULL,
+			      "regular vars: 'p' gets zero-init");
+		}
+		prism_free(&r);
+	}
+
+	// 7. __attribute__((deprecated)) on ivar — from NSObject.h pattern
+	{
+		const char *code =
+		    "@interface NSObject {\n"
+		    "    int isa __attribute__((deprecated));\n"
+		    "}\n"
+		    "@end\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "objc_attr.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "objc deprecated ivar: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "isa = 0") == NULL &&
+			      strstr(r.output, "isa =0") == NULL &&
+			      strstr(r.output, "= {0}") == NULL,
+			      "objc deprecated ivar: isa not zero-inited");
+		}
+		prism_free(&r);
+	}
+
+	// 8. Protocol conformance: @interface Foo <Proto> { ... }
+	// Real-world pattern: @interface NSObject <NSObject> { Class isa; }
+	{
+		const char *code =
+		    "@interface NSObject <NSObject> {\n"
+		    "    Class isa __attribute__((deprecated));\n"
+		    "}\n"
+		    "@end\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "objc_proto.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "objc protocol conformance: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "isa = 0") == NULL &&
+			      strstr(r.output, "isa =0") == NULL &&
+			      strstr(r.output, "= {0}") == NULL,
+			      "objc protocol conformance: isa not zero-inited");
+		}
+		prism_free(&r);
+	}
+
+	// 9. Inheritance + protocol: @interface Foo : Base <Proto1, Proto2> { ... }
+	{
+		const char *code =
+		    "@interface NSArray : NSObject <NSCopying, NSSecureCoding> {\n"
+		    "    void *_internal;\n"
+		    "}\n"
+		    "@end\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "objc_multi.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "objc inherit+multi-protocol: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "_internal = 0") == NULL &&
+			      strstr(r.output, "_internal =0") == NULL,
+			      "objc inherit+multi-protocol: _internal not zero-inited");
+		}
+		prism_free(&r);
+	}
+
+	// 10. Lightweight generics: @interface NSArray<ObjectType> { ... }
+	{
+		const char *code =
+		    "@interface NSDictionary<KeyType, ObjectType> : NSObject {\n"
+		    "    void *_impl;\n"
+		    "}\n"
+		    "@end\n"
+		    "int main(void) { return 0; }\n";
+		PrismResult r = prism_transpile_source(code, "objc_gen.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "objc lightweight generics: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "_impl = 0") == NULL &&
+			      strstr(r.output, "_impl =0") == NULL,
+			      "objc lightweight generics: _impl not zero-inited");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -5625,4 +5826,7 @@ void run_safe_tests(void) {
 
         // emit_block_body missing dispatches (SUE body, typeof/bracket orelse, enum shadow)
         test_emit_block_body_gaps();
+
+        // Objective-C ivar block zero-init suppression
+        test_objc_ivar_block_zeroinit();
 }

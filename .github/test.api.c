@@ -7689,4 +7689,31 @@ void run_api_tests_4(void) {
 	test_bitfield_raw_leak();
 	test_c23_enum_fixed_underlying_type();
 	test_proto_param_vla_orelse_rejected();
+
+#ifdef __APPLE__
+	// _DARWIN_C_SOURCE regression: netinet/ip.h uses u_int/u_char/u_short
+	// and BYTE_ORDER, all hidden when _POSIX_C_SOURCE is set without
+	// _DARWIN_C_SOURCE. Prism must pass -D_DARWIN_C_SOURCE to cc -E.
+	{
+		const char *code =
+		    "#include <netinet/ip.h>\n"
+		    "int main(void) {\n"
+		    "    struct ip hdr;\n"
+		    "    (void)hdr;\n"
+		    "    return 0;\n"
+		    "}\n";
+		char *path = create_temp_file(code);
+		CHECK(path != NULL, "darwin-src: create temp file");
+		if (path) {
+			PrismResult r = prism_transpile_file(path, prism_defaults());
+			CHECK_EQ(r.status, PRISM_OK, "darwin-src: netinet/ip.h transpiles OK");
+			if (r.output)
+				check_transpiled_output_compiles(r.output, "-std=gnu11",
+					"darwin-src: netinet/ip.h output compiles");
+			prism_free(&r);
+			unlink(path);
+			free(path);
+		}
+	}
+#endif
 }

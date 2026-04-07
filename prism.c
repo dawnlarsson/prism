@@ -706,6 +706,7 @@ static void emit_consumed_defines(void) {
 	OUT_LIT("#if !defined(_WIN32)\n"
 		"#ifndef _POSIX_C_SOURCE\n#define _POSIX_C_SOURCE 200809L\n#endif\n"
 		"#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n"
+		"#ifdef __APPLE__\n#ifndef _DARWIN_C_SOURCE\n#define _DARWIN_C_SOURCE\n#endif\n#endif\n"
 		"#endif\n\n");
 }
 
@@ -3698,6 +3699,7 @@ static Token *handle_open_brace(Token *tok) {
 
 	uint8_t ann = tok_ann(tok);
 	bool is_init_scope = is_initializer || (ann & P1_SCOPE_INIT);
+	Token *brace_tok = tok;
 	emit_tok(tok); tok = tok_next(tok);
 	scope_push_kind(is_init_scope ? SCOPE_INIT : SCOPE_BLOCK);
 
@@ -3708,6 +3710,15 @@ static Token *handle_open_brace(Token *tok) {
 	if (did_push)
 		s->is_ctrl_se = true;
 	if (is_init_scope) s->is_struct = true;
+
+	// Phase 1A may have classified this as a struct-like scope
+	// (e.g. Objective-C @interface ivar blocks) that couldn't be
+	// conveyed through the 8-bit annotation.
+	if (!s->is_struct) {
+		uint16_t sid = find_body_scope_id(brace_tok);
+		if (sid && scope_tree[sid].is_struct)
+			s->is_struct = true;
+	}
 
 	ctx->at_stmt_start = true;
 	return tok;
@@ -4096,6 +4107,21 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 		}
 		if (!user_has_posix) args[(*argc)++] = "-D_POSIX_C_SOURCE=200809L";
 		if (!user_has_gnu) args[(*argc)++] = "-D_GNU_SOURCE";
+#ifdef __APPLE__
+		{
+			bool user_has_darwin = false;
+			for (int i = 0; i < ctx->extra_define_count; i++)
+				if (strncmp(ctx->extra_defines[i], "_DARWIN_C_SOURCE", 16) == 0)
+					user_has_darwin = true;
+			for (int i = 0; i < ctx->extra_compiler_flags_count; i++) {
+				const char *f = ctx->extra_compiler_flags[i];
+				if (strncmp(f, "-D_DARWIN_C_SOURCE", 18) == 0 ||
+				    strncmp(f, "-U_DARWIN_C_SOURCE", 18) == 0)
+					user_has_darwin = true;
+			}
+			if (!user_has_darwin) args[(*argc)++] = "-D_DARWIN_C_SOURCE";
+		}
+#endif
 	}
 #endif
 
@@ -5259,6 +5285,47 @@ static Token *walk_back_skip_attrs(uint32_t start_idx) {
 	return NULL;
 }
 
+// Check if '{' opens an Objective-C ivar block.
+// Patterns: @interface Foo { ... }, @interface Foo : Base { ... },
+//           @interface Foo () { ... }, @implementation Foo { ... }
+static bool is_objc_ivar_brace(uint32_t brace_idx) {
+	for (uint32_t i = brace_idx - 1; i > 0; i--) {
+		Token *t = &token_pool[i];
+		if (t->kind == TK_PREP_DIR) continue;
+		if (t->kind == TK_IDENT && !t->tag) continue; // class name, protocol name
+		if (t->len == 1 && t->ch0 == ':') continue;    // inheritance colon
+		if (t->len == 1 && t->ch0 == '*') continue;     // pointer in type
+		if (t->tag & (TT_QUALIFIER | TT_ATTR)) continue;
+		if (match_ch(t, ')') && tok_match(t)) { i = tok_idx(tok_match(t)); continue; }
+		if (match_ch(t, ']') && tok_match(t) && (tok_match(t)->flags & TF_C23_ATTR)) {
+			i = tok_idx(tok_match(t)); continue;
+		}
+		// ObjC protocol conformance / lightweight generics: <Proto1, Proto2>
+		if (match_ch(t, '>')) {
+			int depth = 1;
+			while (i > 1 && depth > 0) {
+				i--;
+				Token *inner = &token_pool[i];
+				if (inner->kind == TK_PREP_DIR) continue;
+				if (match_ch(inner, '>')) depth++;
+				else if (match_ch(inner, '<')) depth--;
+			}
+			continue;
+		}
+		// The '@' must immediately precede an ObjC keyword
+		if (t->len == 1 && t->ch0 == '@') {
+			Token *kw = &token_pool[i + 1];
+			if (kw->kind == TK_IDENT &&
+			    ((kw->len == 9 && !memcmp(tok_loc(kw), "interface", 9)) ||
+			     (kw->len == 14 && !memcmp(tok_loc(kw), "implementation", 14)) ||
+			     (kw->len == 8 && !memcmp(tok_loc(kw), "protocol", 8))))
+				return true;
+		}
+		return false;
+	}
+	return false;
+}
+
 static void p1_build_scope_tree(Token *start) {
 	// scope_id 0 is reserved for file scope (never stored in scope_tree[])
 	scope_tree_count = 1; // start at 1; 0 = file scope sentinel
@@ -5361,6 +5428,17 @@ static void p1_build_scope_tree(Token *start) {
 					// K&R function definition: fn(a) int a; {
 					si->is_func_body = true;
 				}
+			}
+
+			// Objective-C ivar block: @interface Foo { ... }
+			// Also handles @interface Foo () { ... } where () makes the
+			// brace look like a func body or compound literal.
+			if (!si->is_struct && !si->is_loop &&
+			    !si->is_switch && !si->is_conditional &&
+			    is_objc_ivar_brace(tidx)) {
+				si->is_struct = true;
+				si->is_func_body = false;
+				si->is_init = false;
 			}
 
 			if (prev && match_ch(prev, '('))
