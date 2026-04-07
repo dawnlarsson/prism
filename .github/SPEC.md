@@ -649,11 +649,7 @@ These helpers are used at 20+ call sites across Phase 1D prescan, Phase 1G orels
 
 ### 6.6 _Generic
 
-`_Generic` expressions receive special handling: `case`/`default` inside `_Generic` association lists are not treated as switch cases (the `in_generic()` scope tracking prevents case/default processing from firing inside `_Generic`).
-
-**Declaration rewrite:** When `_Generic` appears in a declaration context (preceded by type keywords, qualifiers, storage specifiers, `*`, `)`, or known typedefs) and all association branches share the same function name and argument list, `generic_decl_rewrite_target` extracts the common function name into a parenthesized declarator: e.g. `int (*_Generic(sel, int: func, float: func))(args)` → `int (*(func))(args)`. This handles C23 type-generic macro expansions (GCC 15+ glibc headers) that produce `_Generic` in declaration positions.
-
-**Passthrough:** `_Generic` in expression context is emitted as-is without rewriting. Prism tracks `_Generic` scope depth via `SCOPE_GENERIC` to prevent internal keyword processing (defer, orelse, case/default) from firing inside `_Generic` association lists.
+`_Generic` expressions pass through as standard C without transformation. Prism tracks `_Generic` scope depth via `SCOPE_GENERIC` to prevent internal keyword processing (defer, orelse, case/default, label detection, zero-init) from firing inside `_Generic` association lists. The `in_generic()` function walks the scope stack up to the first `SCOPE_BLOCK` to detect when emission is inside a `_Generic(...)` context.
 
 ### 6.7 Statement expressions
 

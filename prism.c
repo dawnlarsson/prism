@@ -352,6 +352,10 @@ static Token *find_bare_orelse(Token *tok);
 static Token *decl_noise(Token *tok, bool emit);
 static Token *walk_balanced(Token *tok, bool emit);
 static Token *walk_balanced_orelse(Token *tok);
+static bool bracket_scan_has_orelse(Token *open);
+static Token *try_typeof_orelse(Token *tok);
+static Token *try_bracket_orelse(Token *tok);
+static Token *handle_sue_body(Token *tok);
 static void emit_noise_between_raws(Token *first_raw, Token *last_raw);
 static inline Token *try_strip_raw(Token *t);
 static inline void out_char(char c);
@@ -1514,6 +1518,7 @@ static Token *handle_control_exit_defer(Token *tok);
 static Token *handle_goto_keyword(Token *tok);
 static void end_statement_after_semicolon(void);
 static inline Token *try_process_stmt_token(Token *t, Token *end, Token **unreachable_tok);
+static inline void track_generic_token(Token *tok);
 static Token *emit_block_body(Token *tok, Token *end);
 
 // Dispatch stmt-expr: emit '(', process '{...}' via emit_block_body, emit ')'.
@@ -1573,6 +1578,7 @@ static Token *emit_ctrl_condition(Token *t, Token **unreachable_tok) {
 // Caller manages ctrl_state save/restore and outer brace handling.
 static Token *emit_block_body(Token *tok, Token *end) {
 	Token *unreachable_tok = NULL;
+	int ternary_depth = 0;
 	while (tok && tok != end && tok->kind != TK_EOF) {
 		if (match_ch(tok, '{')) { tok = handle_open_brace(tok); continue; }
 		if (match_ch(tok, '}')) { tok = handle_close_brace(tok); continue; }
@@ -1583,12 +1589,36 @@ static Token *emit_block_body(Token *tok, Token *end) {
 			if (is_ur) { EMIT_UNREACHABLE(); unreachable_tok = NULL; }
 			continue;
 		}
+		// Ternary depth tracking (must precede label detection)
+		if (tok->len == 1 && tok->ch0 == '?')
+			ternary_depth++;
+		// Label colon: reset at_stmt_start for the following statement
+		if (match_ch(tok, ':')) {
+			if (ternary_depth > 0) {
+				ternary_depth--;
+			} else if (!in_generic() && last_emitted &&
+				   (is_identifier_like(last_emitted) || last_emitted->kind == TK_NUM) &&
+				   !in_struct_body()) {
+				emit_tok(tok); tok = tok_next(tok);
+				ctx->at_stmt_start = true;
+				continue;
+			}
+		}
 		if (__builtin_expect(tok->kind == TK_PREP_DIR, 0)) {
 			emit_tok(tok); tok = tok_next(tok);
 			continue;
 		}
 		uint32_t itag = tok->tag;
 		if (itag) {
+			if ((itag & TT_GENERIC) && !in_generic()) {
+				emit_tok(tok); tok = tok_next(tok);
+				if (tok && match_ch(tok, '(')) {
+					scope_push_kind(SCOPE_GENERIC);
+					emit_tok(tok); tok = tok_next(tok);
+				}
+				ctx->at_stmt_start = false;
+				continue;
+			}
 			if (__builtin_expect(itag & TT_DEFER, 0) && !in_generic()) {
 				Token *next = handle_defer_keyword(tok);
 				if (next) { tok = next; continue; }
@@ -1602,6 +1632,16 @@ static Token *emit_block_body(Token *tok, Token *end) {
 				if (next) { tok = next; continue; }
 			}
 		}
+		// Struct/union/enum body: emit verbatim to prevent
+		// try_zero_init_decl from firing on struct fields.
+		if (ctx->at_stmt_start && (tok->tag & TT_SUE) && !is_known_typedef(tok)) {
+			Token *next = handle_sue_body(tok);
+			if (next) { tok = next; continue; }
+		}
+		// Enum defs and typedefs bypass process_declarators —
+		// check their names against active defers.
+		if (ctx->at_stmt_start)
+			check_enum_typedef_defer_shadow(tok);
 		{ Token *next = try_process_stmt_token(tok, end, &unreachable_tok);
 		  if (next) { tok = next; continue; } }
 		if (__builtin_expect(FEAT(F_ORELSE) && is_orelse_keyword(tok), 0))
@@ -1625,6 +1665,19 @@ static Token *emit_block_body(Token *tok, Token *end) {
 			}
 			continue;
 		}
+		track_generic_token(tok);
+
+		// typeof + orelse outside declarations (e.g. sizeof(typeof(x orelse 0)))
+		if (__builtin_expect(FEAT(F_ORELSE), 0)) {
+			Token *next = try_typeof_orelse(tok);
+			if (next) { tok = next; continue; }
+		}
+		// bracket [..orelse..] outside declarations
+		if (__builtin_expect(FEAT(F_ORELSE), 0)) {
+			Token *next = try_bracket_orelse(tok);
+			if (next) { tok = next; continue; }
+		}
+
 		ctx->at_stmt_start = false;
 		emit_tok(tok); tok = tok_next(tok);
 	}
@@ -1638,6 +1691,29 @@ static bool bracket_scan_has_orelse(Token *open) {
 		if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; }
 	}
 	return false;
+}
+
+// Shared helpers: typeof(...orelse...) and [...orelse...] dispatch.
+// Returns next token after the construct, or NULL if no match.
+static Token *try_typeof_orelse(Token *tok) {
+	if (!(tok->tag & TT_TYPEOF) || !tok_next(tok) ||
+	    !match_ch(tok_next(tok), '(') || !tok_match(tok_next(tok)))
+		return NULL;
+	Token *paren = tok_next(tok);
+	Token *pclose = tok_match(paren);
+	for (Token *s = tok_next(paren); s && s != pclose; s = tok_next(s))
+		if (is_orelse_keyword(s)) {
+			emit_tok(tok);               // typeof keyword
+			return walk_balanced_orelse(paren); // ( ... )
+		}
+	return NULL;
+}
+static Token *try_bracket_orelse(Token *tok) {
+	if (!match_ch(tok, '[') || !(tok->flags & TF_OPEN) || !tok_match(tok))
+		return NULL;
+	if (bracket_scan_has_orelse(tok))
+		return walk_balanced_orelse(tok);
+	return NULL;
 }
 
 // Walk a balanced token group between matching delimiters, optionally emitting.
@@ -1654,7 +1730,7 @@ static Token *walk_balanced(Token *tok, bool emit) {
 			}
 			// Bracket orelse: dispatch to orelse-aware walker.
 			if (FEAT(F_ORELSE) && (t->flags & TF_OPEN) && match_ch(t, '[') && tok_match(t)) {
-				if (bracket_scan_has_orelse(t)) { t = walk_balanced_orelse(t); continue; }
+				{ Token *next = try_bracket_orelse(t); if (next) { t = next; continue; } }
 				// No orelse — emit bracket contents verbatim (no nested
 				// orelse scan needed, avoiding O(N²) on nested brackets).
 				Token *bclose = tok_match(t);
@@ -1663,11 +1739,9 @@ static Token *walk_balanced(Token *tok, bool emit) {
 				continue;
 			}
 			// typeof with orelse inside: use orelse-aware walker
-			if (FEAT(F_ORELSE) && (t->tag & TT_TYPEOF) && tok_next(t) && match_ch(tok_next(t), '(')) {
-				emit_tok(t);           // typeof keyword
-				t = tok_next(t);       // (
-				t = walk_balanced_orelse(t);
-				continue;
+			if (FEAT(F_ORELSE)) {
+				Token *next = try_typeof_orelse(t);
+				if (next) { t = next; continue; }
 			}
 			// Strip 'raw' keyword inside balanced groups (cast expressions, etc.)
 			{ Token *r = try_strip_raw(t); if (r) { t = r; continue; } }
@@ -5069,6 +5143,39 @@ static void emit_deferred_range(Token *start, Token *end) {
 		Token *next = try_process_stmt_token(t, end, &dr_unreachable_tok);
 		if (next) { t = next; continue; }
 
+		// struct/union/enum body: emit verbatim to avoid field-level
+		// zero-init injection (emit_deferred_range has no scope tracking,
+		// so in_struct_body() is always false here).
+		// Probe past declaration prefixes (typedef, __extension__,
+		// storage classes, qualifiers, attributes, _Pragma) to find
+		// the SUE keyword — prefixes consume at_stmt_start before the
+		// loop reaches the struct keyword.
+		if (ctx->at_stmt_start) {
+			Token *probe = t;
+			while (probe && probe->kind != TK_EOF) {
+				Token *sn = skip_noise(probe);
+				if (sn != probe) { probe = sn; continue; }
+				if (probe->tag & (TT_INLINE | TT_TYPEDEF | TT_STORAGE | TT_QUALIFIER))
+					{ probe = tok_next(probe); continue; }
+				break;
+			}
+			if (probe && (probe->tag & TT_SUE) && !is_known_typedef(probe)) {
+				Token *brace = find_struct_body_brace(probe);
+				if (brace && tok_match(brace)) {
+					Token *close = tok_match(brace);
+					while (t && t != end && t->kind != TK_EOF) {
+						Token *r = try_strip_raw(t);
+						if (r) { t = r; continue; }
+						emit_tok(t);
+						if (t == close) { t = tok_next(t); break; }
+						t = tok_next(t);
+					}
+					ctx->at_stmt_start = false;
+					continue;
+				}
+			}
+		}
+
 		// Control-flow keywords: emit keyword (+ condition), mark
 		// next token as statement start so zeroinit/orelse fire
 		// in braceless bodies.
@@ -7595,34 +7702,6 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			}
 
 			if ((tag & TT_GENERIC) && !in_generic()) {
-				if (last_emitted && (match_ch(last_emitted, '*') || match_ch(last_emitted, ')') ||
-				    (last_emitted->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_SKIP_DECL | TT_ATTR |
-				     TT_INLINE | TT_STORAGE | TT_TYPEOF | TT_BITINT)) ||
-				    is_known_typedef(last_emitted))) {
-					Token *name = NULL;
-					Token *params_open = NULL;
-					Token *params_close = NULL;
-					Token *after = NULL;
-					if (generic_decl_rewrite_target(tok, &name, &params_open, &params_close,
-									&after)) {
-						out_char('(');
-						OUT_TOK(name);
-						out_char(')');
-						emit_range(params_open, tok_next(params_close));
-						// Emit any __attribute__ / [[...]] between construct end and 'after'.
-						// For Pattern 2 (params outside _Generic), skip past the already-emitted params.
-						Token *gen_close = tok_match(tok_next(tok));
-						Token *scan_start = gen_close;
-						Token *after_gen = skip_noise(tok_next(gen_close));
-						if (after_gen == params_open) scan_start = params_close;
-						for (Token *a = tok_next(scan_start); a && a != after; a = tok_next(a)) {
-							emit_tok(a);
-							last_emitted = a;
-						}
-						tok = after;
-						continue;
-					}
-				}
 				emit_tok(tok);
 				last_emitted = tok;
 				tok = tok_next(tok);
@@ -7724,36 +7803,14 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 
 		track_common_token_state(tok);
 
-		// Process orelse inside typeof() that was not handled by
-		// try_zero_init_decl (e.g. sizeof(typeof(x orelse 0)), casts).
-		// Route through walk_balanced_orelse for inline ternary transformation.
-		if (__builtin_expect(FEAT(F_ORELSE) &&
-				     (tok->tag & TT_TYPEOF) && tok_next(tok) &&
-				     match_ch(tok_next(tok), '(') && tok_match(tok_next(tok)), 0)) {
-			Token *paren = tok_next(tok);
-			Token *pclose = tok_match(paren);
-			bool has_oe = false;
-			for (Token *s = tok_next(paren); s && s != pclose; s = tok_next(s))
-				if (is_orelse_keyword(s)) { has_oe = true; break; }
-			if (has_oe) {
-				emit_tok(tok);                // typeof keyword
-				tok = walk_balanced_orelse(paren); // ( ... )
-				continue;
-			}
-		}
-
-		// Process orelse inside array dimension brackets that were not
-		// handled by try_zero_init_decl (struct bodies, function prototypes,
-		// or other contexts where the declaration parser bailed out).
-		// Phase 1G annotates the opening '[' when it's visible to the prescan;
-		// brackets inside balanced-skipped groups (e.g., prototype params) need
-		// a runtime fallback scan.
-		if (__builtin_expect(FEAT(F_ORELSE) &&
-				     match_ch(tok, '[') && (tok->flags & TF_OPEN) && tok_match(tok), 0)) {
-			if (bracket_scan_has_orelse(tok)) {
-				tok = walk_balanced_orelse(tok);
-				continue;
-			}
+		// Process orelse inside typeof() or array brackets that were not
+		// handled by try_zero_init_decl (e.g. sizeof(typeof(x orelse 0)),
+		// struct bodies, function prototypes, etc.).
+		if (__builtin_expect(FEAT(F_ORELSE), 0)) {
+			Token *next = try_typeof_orelse(tok);
+			if (next) { tok = next; continue; }
+			next = try_bracket_orelse(tok);
+			if (next) { tok = next; continue; }
 		}
 
 		// Warn on unprocessed 'orelse' in unsupported context.

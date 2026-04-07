@@ -5063,6 +5063,198 @@ static void test_noreturn_fwd_decl_no_crash(void) {
 	prism_free(&r2);
 }
 
+// BUG: emit_block_body missed label colon (':') handling — at_stmt_start
+// was never reset to true after labels inside statement expressions.
+// This caused zero-init bypass and false orelse errors.
+static void test_stmt_expr_label_zeroinit(void) {
+	// 1. Zero-init after label in stmt-expr: 'int attempt;' must get = 0
+	{
+		const char *code =
+		    "int get_val(void);\n"
+		    "void test(void) {\n"
+		    "    int status = ({\n"
+		    "        retry:\n"
+		    "        int attempt;\n"
+		    "        attempt = get_val();\n"
+		    "        if (!attempt) goto retry;\n"
+		    "        attempt;\n"
+		    "    });\n"
+		    "    (void)status;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "stexpr_label_zi.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "stmt-expr label zeroinit: transpiles OK");
+		if (r.output) {
+			// After 'retry:', the declaration must be zero-initialized
+			CHECK(strstr(r.output, "attempt = 0") != NULL ||
+			      strstr(r.output, "attempt =0") != NULL,
+			      "stmt-expr label zeroinit: attempt gets = 0 after label");
+		}
+		prism_free(&r);
+	}
+
+	// 2. orelse after label in stmt-expr: must not crash
+	{
+		const char *code =
+		    "int fetch(void);\n"
+		    "void test(void) {\n"
+		    "    int r = ({\n"
+		    "        recover:\n"
+		    "        int val = fetch() orelse goto recover;\n"
+		    "        val;\n"
+		    "    });\n"
+		    "    (void)r;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "stexpr_label_oe.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "stmt-expr label orelse: transpiles OK");
+		prism_free(&r);
+	}
+
+	// 3. case/default labels in switch inside stmt-expr
+	{
+		const char *code =
+		    "void test(int x) {\n"
+		    "    int r = ({\n"
+		    "        int val;\n"
+		    "        switch (x) {\n"
+		    "        case 1: {\n"
+		    "            int a;\n"
+		    "            val = a;\n"
+		    "            break;\n"
+		    "        }\n"
+		    "        default: {\n"
+		    "            int b;\n"
+		    "            val = b;\n"
+		    "            break;\n"
+		    "        }\n"
+		    "        }\n"
+		    "        val;\n"
+		    "    });\n"
+		    "    (void)r;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "stexpr_case_zi.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "stmt-expr case zeroinit: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "a = 0") != NULL ||
+			      strstr(r.output, "a =0") != NULL,
+			      "stmt-expr case zeroinit: 'a' gets = 0 after case label");
+			CHECK(strstr(r.output, "b = 0") != NULL ||
+			      strstr(r.output, "b =0") != NULL,
+			      "stmt-expr case zeroinit: 'b' gets = 0 after default label");
+		}
+		prism_free(&r);
+	}
+
+	// 4. Ternary ?: must NOT falsely trigger label detection
+	{
+		const char *code =
+		    "void test(int cond) {\n"
+		    "    int r = ({\n"
+		    "        int val = cond ? 42 : 99;\n"
+		    "        val;\n"
+		    "    });\n"
+		    "    (void)r;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "stexpr_ternary.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "stmt-expr ternary: transpiles OK");
+		if (r.output) {
+			// The ternary ': 99' must NOT inject '= 0' on '99'
+			CHECK(strstr(r.output, "? 42 : 99") != NULL ||
+			      strstr(r.output, "?42:99") != NULL ||
+			      strstr(r.output, "? 42 :99") != NULL,
+			      "stmt-expr ternary: ternary colon not confused with label");
+		}
+		prism_free(&r);
+	}
+}
+
+// BUG: emit_block_body was missing handle_sue_body, typeof/bracket orelse
+// dispatch, and check_enum_typedef_defer_shadow.
+static void test_emit_block_body_gaps(void) {
+	// 1. SUE type-only def inside stmt-expr must NOT zero-init struct fields
+	{
+		const char *code =
+		    "void test(void) {\n"
+		    "    int r = ({\n"
+		    "        struct Foo { int x; int y; };\n"
+		    "        struct Foo f;\n"
+		    "        f.x + f.y;\n"
+		    "    });\n"
+		    "    (void)r;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "stexpr_sue.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "stmt-expr SUE body: transpiles OK");
+		if (r.output) {
+			// 'struct Foo { int x; int y; }' must be verbatim — no = 0
+			// on fields. But 'struct Foo f' SHOULD be zero-init.
+			CHECK(strstr(r.output, "int x = 0") == NULL &&
+			      strstr(r.output, "int x =0") == NULL,
+			      "stmt-expr SUE body: struct field x not zero-init");
+			CHECK(strstr(r.output, "int y = 0") == NULL &&
+			      strstr(r.output, "int y =0") == NULL,
+			      "stmt-expr SUE body: struct field y not zero-init");
+		}
+		prism_free(&r);
+	}
+
+	// 2. typeof(expr orelse fallback) inside stmt-expr — must transform
+	{
+		const char *code =
+		    "void test(int x) {\n"
+		    "    int r = ({\n"
+		    "        sizeof(typeof(x orelse 0));\n"
+		    "    });\n"
+		    "    (void)r;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "stexpr_typeof_oe.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "stmt-expr typeof orelse: transpiles OK");
+		if (r.output) {
+			// orelse must have been transformed — should not appear in output
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "stmt-expr typeof orelse: 'orelse' transformed away");
+		}
+		prism_free(&r);
+	}
+
+	// 3. bracket orelse inside stmt-expr — must transform
+	{
+		const char *code =
+		    "void test(int idx) {\n"
+		    "    int arr[10];\n"
+		    "    int r = ({\n"
+		    "        arr[idx orelse 0];\n"
+		    "    });\n"
+		    "    (void)r;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "stexpr_bracket_oe.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "stmt-expr bracket orelse: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "stmt-expr bracket orelse: 'orelse' transformed away");
+		}
+		prism_free(&r);
+	}
+
+	// 4. enum constant inside stmt-expr that shadows defer-captured name
+	{
+		const char *code =
+		    "void cleanup(int);\n"
+		    "void test(void) {\n"
+		    "    int handle = 42;\n"
+		    "    defer cleanup(handle);\n"
+		    "    int r = ({\n"
+		    "        enum { handle = 99 };\n"
+		    "        handle;\n"
+		    "    });\n"
+		    "    (void)r;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "stexpr_enum_shadow.c", prism_defaults());
+		// This should error: enum constant 'handle' shadows the name
+		// captured by defer { cleanup(handle); }
+		CHECK(r.status != PRISM_OK, "stmt-expr enum defer shadow: detected");
+		prism_free(&r);
+	}
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
@@ -5427,4 +5619,10 @@ void run_safe_tests(void) {
 
         // noreturn forward declaration must not inject __builtin_unreachable
         test_noreturn_fwd_decl_no_crash();
+
+        // emit_block_body label detection (ternary, zeroinit, orelse, case/default)
+        test_stmt_expr_label_zeroinit();
+
+        // emit_block_body missing dispatches (SUE body, typeof/bracket orelse, enum shadow)
+        test_emit_block_body_gaps();
 }

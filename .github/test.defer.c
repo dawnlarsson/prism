@@ -5489,6 +5489,282 @@ static void test_defer_stmtexpr_ctrl_head_escape(void) {
 	prism_free(&r7);
 }
 
+// emit_deferred_range has no scope tracking — struct/union/enum
+// field definitions inside defer blocks got = 0 zero-init injected.
+static void test_defer_sue_body_zeroinit(void) {
+	printf("\n--- struct/union/enum in defer body ---\n");
+
+	// Struct type-only definition inside defer block
+	{
+		const char *code =
+			"void use(void *p);\n"
+			"void f(void) {\n"
+			"    defer {\n"
+			"        struct S { int x; char buf[32]; };\n"
+			"        struct S s;\n"
+			"        use(&s);\n"
+			"    }\n"
+			"    return;\n"
+			"}\n";
+		PrismResult r = prism_transpile_source(code, "sue_struct.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "struct in defer: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "int x;") != NULL,
+			      "struct in defer: field has no zero-init");
+			CHECK(strstr(r.output, "int x = 0") == NULL,
+			      "struct in defer: no field = 0 injection");
+		}
+		prism_free(&r);
+	}
+
+	// Union inside defer block
+	{
+		const char *code =
+			"void use(void *p);\n"
+			"void f(void) {\n"
+			"    defer {\n"
+			"        union U { int i; float f; };\n"
+			"        union U u;\n"
+			"        use(&u);\n"
+			"    }\n"
+			"    return;\n"
+			"}\n";
+		PrismResult r = prism_transpile_source(code, "sue_union.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "union in defer: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "int i = 0") == NULL,
+			      "union in defer: no field = 0 injection");
+		}
+		prism_free(&r);
+	}
+
+	// Enum inside defer block
+	{
+		const char *code =
+			"void use(void *p);\n"
+			"void f(void) {\n"
+			"    defer {\n"
+			"        enum Color { RED, GREEN, BLUE };\n"
+			"        enum Color c;\n"
+			"        use(&c);\n"
+			"    }\n"
+			"    return;\n"
+			"}\n";
+		PrismResult r = prism_transpile_source(code, "sue_enum.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "enum in defer: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "RED = 0") == NULL,
+			      "enum in defer: no constant = 0 injection");
+		}
+		prism_free(&r);
+	}
+
+	// Struct with variable declarator inside defer
+	{
+		const char *code =
+			"void use(void *p);\n"
+			"void f(void) {\n"
+			"    defer {\n"
+			"        struct P { int x; int y; } p;\n"
+			"        use(&p);\n"
+			"    }\n"
+			"    return;\n"
+			"}\n";
+		PrismResult r = prism_transpile_source(code, "sue_var.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "struct+var in defer: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "int x = 0") == NULL,
+			      "struct+var in defer: no field = 0 injection");
+			// Variable 's' SHOULD get zero-init
+			CHECK(strstr(r.output, "p = {0}") != NULL,
+			      "struct+var in defer: variable gets zero-init");
+		}
+		prism_free(&r);
+	}
+
+	// Nested struct inside defer
+	{
+		const char *code =
+			"void use(void *p);\n"
+			"void f(void) {\n"
+			"    defer {\n"
+			"        struct Outer {\n"
+			"            struct Inner { int a; int b; } inner;\n"
+			"            int c;\n"
+			"        };\n"
+			"        struct Outer o;\n"
+			"        use(&o);\n"
+			"    }\n"
+			"    return;\n"
+			"}\n";
+		PrismResult r = prism_transpile_source(code, "sue_nest.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "nested struct in defer: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "int a = 0") == NULL,
+			      "nested struct in defer: no inner field = 0");
+			CHECK(strstr(r.output, "int c = 0") == NULL,
+			      "nested struct in defer: no outer field = 0");
+		}
+		prism_free(&r);
+	}
+
+	// raw keyword inside struct body in defer must be stripped
+	{
+		const char *code =
+			"void f(void) {\n"
+			"    defer {\n"
+			"        struct R { raw int magic; int len; };\n"
+			"    }\n"
+			"    return;\n"
+			"}\n";
+		PrismResult r = prism_transpile_source(code, "sue_rw.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw in struct defer: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "raw") == NULL,
+			      "raw in struct defer: raw keyword stripped");
+			CHECK(strstr(r.output, "int magic;") != NULL,
+			      "raw in struct defer: field preserved without raw");
+		}
+		prism_free(&r);
+	}
+
+	// raw keyword inside prefixed struct body in defer
+	{
+		const char *code =
+			"void use(void *p);\n"
+			"void f(void) {\n"
+			"    defer {\n"
+			"        __extension__ struct X { raw int a; int b; };\n"
+			"        struct X v;\n"
+			"        use(&v);\n"
+			"    }\n"
+			"    return;\n"
+			"}\n";
+		PrismResult r = prism_transpile_source(code, "sue_ext_rw.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw in prefixed struct defer: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "raw") == NULL,
+			      "raw in prefixed struct defer: raw keyword stripped");
+		}
+		prism_free(&r);
+	}
+}
+
+// declaration prefixes (__extension__, [[...]], _Pragma, volatile, etc.)
+// before struct/union/enum consumed at_stmt_start, bypassing the SUE body
+// verbatim-emit guard. Fields got zero-init injected.
+static void test_defer_sue_prefix_bypass(void) {
+	printf("\n--- SUE prefix bypass in defer body ---\n");
+
+	// __extension__ struct type-only
+	{
+		const char *code =
+			"void use(void *p);\n"
+			"void f(void) {\n"
+			"    defer {\n"
+			"        __extension__ struct E { int x; int y; };\n"
+			"        struct E v;\n"
+			"        use(&v);\n"
+			"    }\n"
+			"    return;\n"
+			"}\n";
+		PrismResult r = prism_transpile_source(code, "sue_ext.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "__extension__ struct in defer: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "int x = 0") == NULL,
+			      "__extension__ struct in defer: no field = 0");
+			CHECK(strstr(r.output, "int y = 0") == NULL,
+			      "__extension__ struct in defer: no field y = 0");
+		}
+		prism_free(&r);
+	}
+
+	// __extension__ union type-only
+	{
+		const char *code =
+			"void use(void *p);\n"
+			"void f(void) {\n"
+			"    defer {\n"
+			"        __extension__ union U { int i; float f; };\n"
+			"        union U v;\n"
+			"        use(&v);\n"
+			"    }\n"
+			"    return;\n"
+			"}\n";
+		PrismResult r = prism_transpile_source(code, "sue_ext_u.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "__extension__ union in defer: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "int i = 0") == NULL,
+			      "__extension__ union in defer: no field = 0");
+		}
+		prism_free(&r);
+	}
+
+	// C23 [[...]] attribute + struct type-only
+	{
+		const char *code =
+			"void use(void *p);\n"
+			"void f(void) {\n"
+			"    defer {\n"
+			"        [[gnu::packed]] struct A { int a; int b; };\n"
+			"        struct A v;\n"
+			"        use(&v);\n"
+			"    }\n"
+			"    return;\n"
+			"}\n";
+		PrismResult r = prism_transpile_source(code, "sue_c23.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "C23 attr struct in defer: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "int a = 0") == NULL,
+			      "C23 attr struct in defer: no field = 0");
+		}
+		prism_free(&r);
+	}
+
+	// volatile struct type-only
+	{
+		const char *code =
+			"void use(void *p);\n"
+			"void f(void) {\n"
+			"    defer {\n"
+			"        volatile struct V { int x; int y; };\n"
+			"        struct V v;\n"
+			"        use(&v);\n"
+			"    }\n"
+			"    return;\n"
+			"}\n";
+		PrismResult r = prism_transpile_source(code, "sue_vol.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "volatile struct in defer: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "int x = 0") == NULL,
+			      "volatile struct in defer: no field = 0");
+		}
+		prism_free(&r);
+	}
+
+	// __extension__ struct with variable (should still zero-init the variable)
+	{
+		const char *code =
+			"void use(void *p);\n"
+			"void f(void) {\n"
+			"    defer {\n"
+			"        __extension__ struct { int a; int b; } ev;\n"
+			"        use(&ev);\n"
+			"    }\n"
+			"    return;\n"
+			"}\n";
+		PrismResult r = prism_transpile_source(code, "sue_ext_v.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "__extension__ struct+var in defer: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "int a = 0") == NULL,
+			      "__extension__ struct+var in defer: no field = 0");
+			CHECK(strstr(r.output, "ev = {0}") != NULL,
+			      "__extension__ struct+var in defer: var gets zero-init");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_rejected();
@@ -5777,4 +6053,10 @@ void run_defer_tests(void) {
 
 	// stmt-expr in control-flow condition heads inside defer must be scanned
 	test_defer_stmtexpr_ctrl_head_escape();
+
+	// struct/union/enum body zero-init injection in defer blocks
+	test_defer_sue_body_zeroinit();
+
+	// prefix bypass: __extension__/[[...]]/volatile before SUE in defer
+	test_defer_sue_prefix_bypass();
 }
