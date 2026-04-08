@@ -6717,6 +6717,143 @@ static void test_orelse_bare_cast_non_lvalue(void) {
 }
 
 // BUG100: typeof(LHS) evaluates LHS at runtime when the result type is
+// Bare orelse with LHS indirection uses typeof(RHS) to type the temp.
+// If the RHS contains ++/-- and yields a VM type, __typeof__(RHS) evaluates
+// the side effects at runtime (C11 §6.7.2.4p2), then the initializer
+// evaluates them again — double evaluation.  Phase 1D must reject.
+static void test_bare_orelse_rhs_incr_vm_double_eval(void) {
+	printf("\n--- bare orelse RHS ++/-- with LHS indirection ---\n");
+
+	// Sub-test 1: i++ in RHS subscript with LHS ptr deref — rejected
+	{
+		const char *code =
+		    "void f(int n) {\n"
+		    "    int (*arrays[5])[n];\n"
+		    "    int i = 0;\n"
+		    "    int (*dest)[n];\n"
+		    "    int (**dest_ptr)[n] = &dest;\n"
+		    "    *dest_ptr = arrays[i++] orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "rhs_incr1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "rhs-incr-vm: i++ in RHS rejected");
+		CHECK(r.error_msg && strstr(r.error_msg, "side effect"),
+		      "rhs-incr-vm: error mentions side effect");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: p-- in RHS with subscript LHS — rejected
+	{
+		const char *code =
+		    "void f(int **matrix) {\n"
+		    "    int *p = 0;\n"
+		    "    matrix[0] = p-- orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "rhs_decr.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "rhs-decr-vm: p-- in RHS rejected");
+		CHECK(r.error_msg && strstr(r.error_msg, "side effect"),
+		      "rhs-decr-vm: error mentions side effect");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: function call RHS with LHS deref — safe (never VM)
+	{
+		const char *code =
+		    "int *get(void);\n"
+		    "void f(int **pp) {\n"
+		    "    *pp = get() orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "rhs_call_ok.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "rhs-call-safe: function call RHS accepted");
+		prism_free(&r);
+	}
+
+	// Sub-test 4: simple variable RHS with LHS subscript — safe
+	{
+		const char *code =
+		    "void f(int **matrix, int *src) {\n"
+		    "    matrix[0] = src orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "rhs_var_ok.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "rhs-var-safe: simple variable RHS accepted");
+		prism_free(&r);
+	}
+
+	// Sub-test 5: ++ in RHS without LHS indirection — safe (typeof(LHS) used)
+	{
+		const char *code =
+		    "void f(int *arr, int i) {\n"
+		    "    int *p;\n"
+		    "    p = arr + i++ orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "rhs_incr_noindir.c", prism_defaults());
+		// No indirection in LHS (p is a simple variable), so typeof(p) is used.
+		// typeof(p) doesn't evaluate p — always safe.  ++ in RHS only fires once.
+		CHECK_EQ(r.status, PRISM_OK,
+		      "rhs-incr-no-indir: ++ in RHS OK without LHS indirection");
+		prism_free(&r);
+	}
+
+	// Sub-test 6: function call embedded in VM subscript — rejected
+	// arr[get_idx()] has type int(*)[n] which is VM; typeof evaluates it
+	{
+		const char *code =
+		    "int get_idx(void);\n"
+		    "void f(int n) {\n"
+		    "    int (*arr[2])[n];\n"
+		    "    int (**pp)[n];\n"
+		    "    *pp = arr[get_idx()] orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "rhs_call_vm.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "rhs-call-vm: function call in VM subscript rejected");
+		CHECK(r.error_msg && strstr(r.error_msg, "function call"),
+		      "rhs-call-vm: error mentions function call");
+		prism_free(&r);
+	}
+
+	// Sub-test 7: cast + function call RHS — rejected (cast can introduce VM type)
+	{
+		const char *code =
+		    "int *get(void);\n"
+		    "void f(int **pp) {\n"
+		    "    *pp = (int *)get() orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "rhs_cast_call.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "rhs-cast-call: (type)f() rejected (cast may introduce VM type)");
+		prism_free(&r);
+	}
+
+	// Sub-test 8: assignment operator in RHS with LHS indirection — rejected
+	{
+		const char *code =
+		    "void f(int **pp, int *a, int *b) {\n"
+		    "    *pp = (a = b) orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "rhs_assign.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "rhs-assign-vm: assignment in RHS rejected");
+		prism_free(&r);
+	}
+
+	// Sub-test 9: cast to VM type (int(*)[n])f() — rejected (ISO C11 §6.7.5.2)
+	{
+		const char *code =
+		    "void *get_ptr(void);\n"
+		    "void f(int n) {\n"
+		    "    int (*dest)[n];\n"
+		    "    int (**pp)[n] = &dest;\n"
+		    "    *pp = (int (*)[n]) get_ptr() orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "rhs_cast_vm2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "rhs-cast-vm: (int(*)[n])f() rejected (cast introduces VM)");
+		prism_free(&r);
+	}
+}
+
 // variably-modified (C11 §6.7.2.4p2).  If LHS contains a subscript, deref,
 // or member access into a VM-typed expression (e.g. pointer-to-VLA),
 // Prism's bare value orelse emits:
@@ -7307,6 +7444,9 @@ void run_orelse_tests(void) {
 
 	// typeof VM-type double evaluation (BUG100)
 	test_orelse_typeof_vm_double_eval();
+
+	// bare orelse typeof(RHS) VM double-eval via ++ in RHS
+	test_bare_orelse_rhs_incr_vm_double_eval();
 
 	// BUG102: anonymous struct with __attribute__ body stripped on multi-decl split
 	test_orelse_sue_attr_body_strip();

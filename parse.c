@@ -216,9 +216,10 @@ struct Token {
 	uint32_t len;         // Token length in bytes (must handle >65535 for large literals)
 	uint8_t  kind;
 	uint8_t  flags;
-	uint8_t  ann;         // Pass 1 annotation flags (P1_SCOPE_*, P1_OE_*, P1_IS_DECL)
+	uint16_t ann;         // Pass 1 annotation flags (P1_SCOPE_*, P1_OE_*, P1_IS_DECL, P1_REJECTED)
 	uint8_t  ch0;         // First source byte — avoids tok_loc() indirection in hot paths
-}; // 20 bytes (all used)
+	uint8_t  _pad[3];     // Explicit padding to 24 bytes (alignment)
+}; // 24 bytes
 
 typedef struct {
 	uint32_t loc_offset;  // Byte offset from File->contents
@@ -2167,6 +2168,7 @@ enum {
 	P1_OE_DECL_INIT      = 1 << 5, // orelse inside declaration initializer
 	P1_IS_DECL           = 1 << 6, // Phase 1D: token starts a variable declaration
 	P1_SCOPE_INIT        = 1 << 7, // This '{' opens an initializer (compound literal, = {...})
+	P1_REJECTED          = 1 << 8, // Phase 1D/1F/1G rejected this token (defense-in-depth signal)
 };
 
 #define tok_ann(t) ((t)->ann)
@@ -2237,6 +2239,21 @@ static Token *skip_noise(Token *tok) {
 	}
 	return tok;
 }
+
+// Check if a token is "noise" (attribute, C23 [[...]], or preprocessor directive).
+// These tokens must be skipped via skip_noise() before any tag-based type checks.
+static inline bool is_noise_token(Token *t) {
+	return (t->tag & TT_ATTR) || is_c23_attr(t) || t->kind == TK_PREP_DIR;
+}
+
+#ifdef PRISM_DEBUG
+#define ASSERT_NOT_NOISE(t) do { \
+	if (is_noise_token(t)) \
+		error_tok(t, "internal: tag check on noise token (skip_noise() missing)"); \
+} while(0)
+#else
+#define ASSERT_NOT_NOISE(t) ((void)0)
+#endif
 
 #define SKIP_NOISE_CONTINUE(var) do { \
 	Token *_sn = skip_noise(var); \
