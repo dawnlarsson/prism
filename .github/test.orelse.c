@@ -2630,6 +2630,32 @@ static void test_c23_attr_bracket_orelse_dim_hoist(void) {
 	prism_free(&r);
 }
 
+// Bug: walk_back_skip_attrs did not skip C23 [[...]] attributes when
+// classifying a named struct/union/enum scope in Phase 1A.
+// struct [[deprecated]] Name { ... } was not classified as is_struct,
+// causing Phase 1D to miss the struct-body context.
+static void test_c23_attr_named_struct_scope(void) {
+	const char *code =
+	    "void f(void) {\n"
+	    "    struct [[deprecated]] S { int arr[4]; int x; };\n"
+	    "    struct [[deprecated]] U { union { int a; float b; } u; };\n"
+	    "    struct S s;\n"
+	    "    (void)s;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "c23attr_named_struct.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		// Struct members must NOT get zero-init.  If is_struct was
+		// wrongly false, try_zero_init_decl would run on members and
+		// inject " = {0}" after member declarations.
+		CHECK(!strstr(r.output, "arr[4] = {0}"),
+		      "c23-attr-named-struct: struct member got zero-init "
+		      "(walk_back_skip_attrs failed to skip C23 [[...]])");
+		CHECK(!strstr(r.output, "int x = 0"),
+		      "c23-attr-named-struct: scalar struct member got zero-init");
+	}
+	prism_free(&r);
+}
+
 // Bug: bare orelse with compound literal fallback inside an unbraced if/else
 // emits multiple statements without wrapping braces.  The `else` attaches
 // to the inner `if (!x)` instead of the outer `if (cond)`.
@@ -4228,6 +4254,46 @@ static void test_anon_struct_split_invalid(void) {
 		    "named_struct_split.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
 		      "named-struct-split: named struct split accepted");
+		prism_free(&r);
+	}
+	/* BUG: __attribute__ between struct and { blinded the split guard
+	   (skip_prep_dirs doesn't skip attributes). */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int ff(void);\n"
+		    "void f(void) { struct __attribute__((packed)) { int x; } a, b[ff() orelse 1]; }\n",
+		    "anon_struct_attr_split.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "anon-struct-attr-split: must reject __attribute__ anon struct split");
+		prism_free(&r);
+	}
+	/* C23 [[...]] attribute variant. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int ff(void);\n"
+		    "void f(void) { struct [[gnu::packed]] { int x; } a, b[ff() orelse 1]; }\n",
+		    "anon_struct_c23_attr_split.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "anon-struct-c23-attr-split: must reject [[...]] anon struct split");
+		prism_free(&r);
+	}
+	/* Multiple __attribute__ + #pragma noise before {. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int ff(void);\n"
+		    "void f(void) { struct __attribute__((aligned(4))) __attribute__((packed)) { int x; } a, b[ff() orelse 1]; }\n",
+		    "anon_struct_multi_attr_split.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "anon-struct-multi-attr-split: must reject multi-attribute anon struct split");
+		prism_free(&r);
+	}
+	/* Named struct with attribute — must succeed. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) { struct S __attribute__((packed)) { int x; } a, b[n orelse 1]; }\n",
+		    "named_struct_attr_split.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "named-struct-attr-split: named struct with attribute accepted");
 		prism_free(&r);
 	}
 }
@@ -7217,6 +7283,7 @@ void run_orelse_tests(void) {
 	test_bare_orelse_compound_literal_unbraced_if();
 	test_bare_orelse_emit_range_prep_dir_leak();
 	test_c23_attr_bracket_orelse_dim_hoist();
+	test_c23_attr_named_struct_scope();
 
 	// block-form orelse else binding
 	test_block_orelse_breaks_else_binding();

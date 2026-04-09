@@ -7339,6 +7339,50 @@ static void test_auto_unreachable_user_noreturn_member_no_inject(void) {
 	prism_free(&r);
 }
 
+static void test_auto_unreachable_stmtexpr_braceless_no_inject(void) {
+	// Braceless if body inside stmt-expr via walk_balanced/emit_statements:
+	// unreachable must NOT be injected (would split if/else or land outside body).
+	const char *code =
+	    "void abort(void);\n"
+	    "void recover(void);\n"
+	    "int fatal_error;\n"
+	    "void f(void) {\n"
+	    "    int status = 1 + ({\n"
+	    "        if (fatal_error)\n"
+	    "            abort();\n"
+	    "        else\n"
+	    "            recover();\n"
+	    "        0;\n"
+	    "    });\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_stmtexpr_braceless.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "auto-unreachable: braceless if/else in stmt-expr transpiles");
+	CHECK(r.output && !has_unreachable_marker(r.output),
+	      "auto-unreachable: NOT injected in braceless ctrl body inside stmt-expr");
+	prism_free(&r);
+}
+
+static void test_auto_unreachable_stmtexpr_braceless_if_only(void) {
+	// Braceless if (no else) with noreturn call inside stmt-expr.
+	const char *code =
+	    "void abort(void);\n"
+	    "int cond;\n"
+	    "void f(void) {\n"
+	    "    int x = 1 + ({\n"
+	    "        if (cond)\n"
+	    "            abort();\n"
+	    "        0;\n"
+	    "    });\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_stmtexpr_braceless_if.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "auto-unreachable: braceless if-only in stmt-expr transpiles");
+	CHECK(r.output && !has_unreachable_marker(r.output),
+	      "auto-unreachable: NOT injected in braceless if body inside stmt-expr (no else)");
+	prism_free(&r);
+}
+
 // Regression test: deeply nested braceless for-init loops must transpile
 // in approximately linear time.  Before the fix, find_bare_orelse scanned
 // O(N) tokens per statement start, causing O(N^2) total.  With 2048 nested
@@ -7885,6 +7929,8 @@ void run_parse_tests(void) {
 	test_auto_unreachable_member_dot_no_inject();
 	test_auto_unreachable_member_arrow_no_inject();
 	test_auto_unreachable_user_noreturn_member_no_inject();
+	test_auto_unreachable_stmtexpr_braceless_no_inject();
+	test_auto_unreachable_stmtexpr_braceless_if_only();
 
 	// Deeply nested for-init quadratic fix
 	test_nested_for_init_linear_scaling();

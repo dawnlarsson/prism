@@ -2917,7 +2917,7 @@ static void validate_no_anon_struct_split(Token *next_decl_tok, Token *type_star
 	if (!type->is_struct || type->is_enum) return;
 	for (Token *t = type_start; t && t != type->end; t = tok_next(t)) {
 		if (t->tag & TT_SUE) {
-			Token *after = skip_prep_dirs(tok_next(t));
+			Token *after = skip_noise(tok_next(t));
 			if (after && match_ch(after, '{'))
 				error_tok(next_decl_tok,
 					  "bracket orelse / zero-init requiring declaration split "
@@ -5285,7 +5285,8 @@ static inline Token *try_process_stmt_token(Token *t, Token *end, Token **unreac
 		if (next) { ctx->at_stmt_start = true; return next; }
 	}
 	{ Token *r = try_strip_raw(t); if (r) return r; }
-	if (FEAT(F_AUTO_UNREACHABLE)) {
+	if (FEAT(F_AUTO_UNREACHABLE) &&
+	    !(ctrl_state.pending && ctrl_state.parens_just_closed)) {
 		Token *nr = try_detect_noreturn_call(t);
 		if (nr && nr != end) *unreachable_tok = nr;
 	}
@@ -5320,12 +5321,17 @@ static Token *walk_back_skip_noise(uint32_t start_idx) {
 	return NULL;
 }
 
-// Walk backward skipping prep dirs, balanced parens, and TT_ATTR keywords
+// Walk backward skipping prep dirs, balanced parens, TT_ATTR keywords,
+// and C23 [[...]] attributes
 static Token *walk_back_skip_attrs(uint32_t start_idx) {
 	for (uint32_t ki = start_idx; ki > 0; ki--) {
 		Token *kt = &token_pool[ki];
 		if (kt->kind == TK_PREP_DIR) continue;
 		if (match_ch(kt, ')') && tok_match(kt)) { ki = tok_idx(tok_match(kt)); continue; }
+		if (match_ch(kt, ']') && tok_match(kt) && (tok_match(kt)->flags & TF_C23_ATTR)) {
+			ki = tok_idx(tok_match(kt));
+			continue;
+		}
 		if (kt->tag & TT_ATTR) continue;
 		return kt;
 	}
@@ -6279,7 +6285,7 @@ static void p1d_check_multi_decl_constraints(Token *t, Token *type_tok,
 		bool is_anon = false;
 		for (Token *s = type_tok; s && s != type->end; s = tok_next(s)) {
 			if (s->tag & TT_SUE) {
-				Token *after = skip_prep_dirs(tok_next(s));
+				Token *after = skip_noise(tok_next(s));
 				if (after && match_ch(after, '{'))
 					is_anon = true;
 				break;
