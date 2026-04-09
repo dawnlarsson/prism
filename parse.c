@@ -852,9 +852,23 @@ static inline bool _equal_1(Token *tok, char c) {
 #define CH(c) (1ULL << ((c) - 32))
 #define match_set(tok, mask) ((tok)->len == 1 && (unsigned)((tok)->ch0 - 32) < 64u && ((mask) & (1ULL << ((tok)->ch0 - 32))))
 
-// Statement expression open: ({
+// Statement expression open: ({ (skipping noise between '(' and '{')
+// Handles _Pragma(...), __attribute__((...)), C23 [[...]], and #pragma directives
+// that may legally appear between the opening '(' and the compound statement '{'.
 static inline bool is_stmt_expr_open(Token *t) {
-	return match_ch(t, '(') && tok_next(t) && match_ch(tok_next(t), '{');
+	if (!match_ch(t, '(')) return false;
+	Token *n = tok_next(t);
+	while (n && n->kind != TK_EOF) {
+		if (n->kind == TK_PREP_DIR) { n = tok_next(n); continue; }
+		if ((n->tag & TT_ATTR) && tok_next(n) && match_ch(tok_next(n), '(') &&
+		    tok_match(tok_next(n))) { n = tok_next(tok_match(tok_next(n))); continue; }
+		if (n->flags & TF_C23_ATTR) {
+			Token *close = tok_match(n);
+			if (close) { n = tok_next(close); continue; }
+		}
+		break;
+	}
+	return n && match_ch(n, '{');
 }
 
 // 'else' keyword (TT_IF covers both if and else; 'e' distinguishes)

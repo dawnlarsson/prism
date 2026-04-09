@@ -2751,6 +2751,7 @@ static OrelseInitInfo scan_decl_orelse(Token *decl_end,
 // Detect whether a type specifier refers to a function type
 // (via typedef or typeof of a known function). Used to skip
 // zero-initialization of function-typed declarations.
+static Token *walk_back_skip_attrs(uint32_t start_idx); // forward decl
 static bool is_typeof_func_type(Token *type_start, TypeSpecResult *type, DeclResult *decl) {
 	if (decl->is_pointer || decl->is_array || decl->is_func_ptr) return false;
 	for (Token *ft = type_start; ft && ft != type->end; ft = tok_next(ft)) {
@@ -2801,17 +2802,9 @@ static bool is_typeof_func_type(Token *type_start, TypeSpecResult *type, DeclRes
 				// For void functions, ret_type_end is NULL.
 				// Extract name by walking backward from body_open.
 				if (!fn) {
-					uint32_t bi = tok_idx(func_meta[fi].body_open);
-					for (uint32_t j = bi; j > 0; j--) {
-						Token *bt = &token_pool[j - 1];
-						if (bt->kind == TK_PREP_DIR) continue;
-						if (match_ch(bt, ')') && tok_match(bt)) {
-							j = tok_idx(tok_match(bt)) + 1;
-							continue;
-						}
-						if (is_valid_varname(bt) && !(bt->tag & (TT_ATTR | TT_TYPE | TT_QUALIFIER | TT_SUE))) fn = bt;
-						break;
-					}
+					Token *bt = walk_back_skip_attrs(tok_idx(func_meta[fi].body_open) - 1);
+					if (bt && is_valid_varname(bt) && !(bt->tag & (TT_ATTR | TT_TYPE | TT_QUALIFIER | TT_SUE)))
+						fn = bt;
 				}
 				if (fn && fn->len == inner->len &&
 				    memcmp(tok_loc(fn), tok_loc(inner), inner->len) == 0)
@@ -3823,10 +3816,14 @@ static Token *handle_open_brace(Token *tok) {
 	// Phase 1A may have classified this as a struct-like scope
 	// (e.g. Objective-C @interface ivar blocks) that couldn't be
 	// conveyed through the 8-bit annotation.
-	if (!s->is_struct) {
+	if (!s->is_struct || !s->is_stmt_expr) {
 		uint16_t sid = find_body_scope_id(brace_tok);
-		if (sid && scope_tree[sid].is_struct)
-			s->is_struct = true;
+		if (sid) {
+			if (!s->is_struct && scope_tree[sid].is_struct)
+				s->is_struct = true;
+			if (!s->is_stmt_expr && scope_tree[sid].is_stmt_expr)
+				s->is_stmt_expr = true;
+		}
 	}
 
 	ctx->at_stmt_start = true;
@@ -5316,6 +5313,15 @@ static Token *walk_back_skip_noise(uint32_t start_idx) {
 			pi = tok_idx(tok_match(pt));
 			continue;
 		}
+		// Skip TT_ATTR keyword with parenthesized arg: _Pragma(...), __attribute__((...))
+		if (match_ch(pt, ')') && tok_match(pt)) {
+			uint32_t open_idx = tok_idx(tok_match(pt));
+			if (open_idx > 0 && (token_pool[open_idx - 1].tag & TT_ATTR)) {
+				pi = open_idx; // loop decrements to open_idx-1 (TT_ATTR keyword)
+				continue;
+			}
+		}
+		if (pt->tag & TT_ATTR) continue;
 		return pt;
 	}
 	return NULL;
@@ -6322,12 +6328,12 @@ static Token *p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func,
 	int se_close_top = 0;
 	for (Token *inner = tok_next(tok); inner && inner != group_end; inner = tok_next(inner)) {
 		if (inner->flags & TF_OPEN) {
-			// Detect stmt-expr: '(' immediately followed by '{'
-			if (match_ch(inner, '(') && tok_next(inner) &&
-			    match_ch(tok_next(inner), '{') && (tok_next(inner)->flags & TF_OPEN)) {
+			// Detect stmt-expr: '(' followed by '{' (skipping noise)
+			if (is_stmt_expr_open(inner)) {
 				se_depth++;
 				// Push the '}' of this stmt-expr so we can decrement on exit
-				Token *brace_close = tok_match(tok_next(inner));
+				Token *se_brace = skip_noise(tok_next(inner));
+				Token *brace_close = se_brace ? tok_match(se_brace) : NULL;
 				if (se_close_top < 64 && brace_close)
 					se_close_stack[se_close_top++] = brace_close;
 			}
@@ -6350,10 +6356,8 @@ static Token *p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func,
 				p1_check_enum_body_defer_shadow(brace, cur_sid, cur_func);
 			}
 		}
-		if (!stmt_expr_open && match_ch(inner, '(') && tok_next(inner) &&
-		    match_ch(tok_next(inner), '{')) {
+		if (!stmt_expr_open && is_stmt_expr_open(inner))
 			stmt_expr_open = inner;
-		}
 		if (se_depth == 0 && cur_func >= 0 && prev_saved &&
 		    (prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
 		    is_defer_kw(inner, prev_inner) &&

@@ -2498,6 +2498,54 @@ static void test_typeof_func_decl_memset(void) {
 	}
 }
 
+// Trailing attributes (C23 [[...]] or GNU __attribute__) after the
+// parameter list of a void-returning function must not blind the
+// is_typeof_func_type backward walk.  Without the fix, walk_back_skip_attrs
+// was not used: the scanner hit ']' or the TT_ATTR keyword and aborted,
+// causing typeof(func) to be misclassified as a variable and zero-
+// initialized — a fatal compiler error on the backend.
+static void test_typeof_void_func_trailing_attr(void) {
+	printf("\n--- typeof void func trailing attr ---\n");
+	// C23 trailing attribute
+	{
+		const char *code =
+		    "void handler(void) [[gnu::cold]] {\n"
+		    "    (void)0;\n"
+		    "}\n"
+		    "void setup(void) {\n"
+		    "    typeof(handler) fwd;\n"
+		    "    (void)fwd;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "typeof_c23trail.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "typeof-trailing-attr-c23: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "__builtin_memset") == NULL && strstr(r.output, "= {0}") == NULL,
+			      "typeof-trailing-attr-c23: must not zero-init function declaration");
+		}
+		prism_free(&r);
+	}
+	// GNU trailing attribute
+	{
+		const char *code =
+		    "void handler(void) __attribute__((cold)) {\n"
+		    "    (void)0;\n"
+		    "}\n"
+		    "void setup(void) {\n"
+		    "    typeof(handler) fwd;\n"
+		    "    (void)fwd;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "typeof_gnutrail.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "typeof-trailing-attr-gnu: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "__builtin_memset") == NULL && strstr(r.output, "= {0}") == NULL,
+			      "typeof-trailing-attr-gnu: must not zero-init function declaration");
+		}
+		prism_free(&r);
+	}
+}
+
 // BUG: pointer-to-array declarators like int (*p)[4] were treated as
 // aggregates because is_array was set (the [4] describes the pointed-to
 // type, not the variable itself). This caused = {0} instead of = 0.
@@ -3320,6 +3368,9 @@ void run_zeroinit_tests(void) {
 
 	// typeof function declaration memset trap
 	test_typeof_func_decl_memset();
+
+	// typeof void func with trailing attributes
+	test_typeof_void_func_trailing_attr();
 
 	// ternary in case label shadow leak
 	test_ternary_case_label_shadow_leak();

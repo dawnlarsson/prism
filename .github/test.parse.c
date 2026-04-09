@@ -7383,6 +7383,70 @@ static void test_auto_unreachable_stmtexpr_braceless_if_only(void) {
 	prism_free(&r);
 }
 
+static void test_stmtexpr_pragma_noise_zeroinit(void) {
+	// _Pragma between '(' and '{' must not break stmt-expr detection.
+	// Without the fix, is_stmt_expr_open fails and zeroinit is silently lost.
+	const char *code =
+	    "int f(void) {\n"
+	    "    int status = (\n"
+	    "        _Pragma(\"GCC diagnostic push\")\n"
+	    "        {\n"
+	    "            int x;\n"
+	    "            0;\n"
+	    "        }\n"
+	    "    );\n"
+	    "    return status;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "stmtexpr_pragma_zeroinit.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "stmt-expr pragma noise: transpiles");
+	CHECK(r.output && strstr(r.output, "int x = 0"),
+	      "stmt-expr pragma noise: zeroinit applied inside pragma-separated stmt-expr");
+	prism_free(&r);
+}
+
+static void test_stmtexpr_pragma_noise_defer(void) {
+	// defer inside a nested block within a pragma-separated stmt-expr.
+	const char *code =
+	    "void cleanup(void);\n"
+	    "int f(void) {\n"
+	    "    int status = (\n"
+	    "        _Pragma(\"GCC diagnostic push\")\n"
+	    "        {\n"
+	    "            { defer { cleanup(); } }\n"
+	    "            0;\n"
+	    "        }\n"
+	    "    );\n"
+	    "    return status;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "stmtexpr_pragma_dfr.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "stmt-expr pragma noise: defer transpiles");
+	CHECK(r.output && strstr(r.output, "cleanup()"),
+	      "stmt-expr pragma noise: defer expanded inside pragma-separated stmt-expr");
+	CHECK(r.output && !strstr(r.output, "defer"),
+	      "stmt-expr pragma noise: raw 'defer' keyword does not leak");
+	prism_free(&r);
+}
+
+static void test_stmtexpr_c23_attr_noise_zeroinit(void) {
+	// C23 [[maybe_unused]] between '(' and '{' must not break stmt-expr detection.
+	const char *code =
+	    "int f(void) {\n"
+	    "    int status = (\n"
+	    "        [[maybe_unused]]\n"
+	    "        {\n"
+	    "            int x;\n"
+	    "            0;\n"
+	    "        }\n"
+	    "    );\n"
+	    "    return status;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "stmtexpr_c23attr_zeroinit.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "stmt-expr C23 attr noise: transpiles");
+	CHECK(r.output && strstr(r.output, "int x = 0"),
+	      "stmt-expr C23 attr noise: zeroinit applied inside attr-separated stmt-expr");
+	prism_free(&r);
+}
+
 // Regression test: deeply nested braceless for-init loops must transpile
 // in approximately linear time.  Before the fix, find_bare_orelse scanned
 // O(N) tokens per statement start, causing O(N^2) total.  With 2048 nested
@@ -7931,6 +7995,11 @@ void run_parse_tests(void) {
 	test_auto_unreachable_user_noreturn_member_no_inject();
 	test_auto_unreachable_stmtexpr_braceless_no_inject();
 	test_auto_unreachable_stmtexpr_braceless_if_only();
+
+	// Statement-expression noise-skip tests
+	test_stmtexpr_pragma_noise_zeroinit();
+	test_stmtexpr_pragma_noise_defer();
+	test_stmtexpr_c23_attr_noise_zeroinit();
 
 	// Deeply nested for-init quadratic fix
 	test_nested_for_init_linear_scaling();
