@@ -3867,7 +3867,8 @@ static void test_typeof_nested_typeof_vla(void) {
 		    "tn_typeof1.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK, "typeof(typeof(VLA)) transpiles OK");
 		if (r.output)
-			CHECK(strstr(r.output, "memset") != NULL,
+			CHECK(strstr(r.output, "memset") != NULL ||
+			      strstr(r.output, "__prism_p_") != NULL,
 			      "typeof(typeof(VLA)) must get memset");
 		prism_free(&r);
 	}
@@ -3882,7 +3883,8 @@ static void test_typeof_nested_typeof_vla(void) {
 		    "tn_typeof2.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK, "triple-nested typeof(VLA) transpiles OK");
 		if (r.output)
-			CHECK(strstr(r.output, "memset") != NULL,
+			CHECK(strstr(r.output, "memset") != NULL ||
+			      strstr(r.output, "__prism_p_") != NULL,
 			      "triple-nested typeof(VLA) must get memset");
 		prism_free(&r);
 	}
@@ -3897,7 +3899,8 @@ static void test_typeof_nested_typeof_vla(void) {
 		    "tn_typeof3.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK, "typeof(func-type) transpiles OK");
 		if (r.output)
-			CHECK(strstr(r.output, "memset") == NULL,
+			CHECK(strstr(r.output, "memset") == NULL &&
+			      strstr(r.output, "__prism_p_") == NULL,
 			      "typeof(func-type) must NOT get memset");
 		prism_free(&r);
 	}
