@@ -207,6 +207,72 @@ LABEL_END:
 	(void)state; // suppress unused warning
 }
 
+// GNU __label__ declares block-scoped labels inside statement expressions.
+// Before the fix, Phase 1D registered both labels with the raw name "L_retry",
+// causing a fatal "duplicate label" error in p1_verify_cfg.
+static void test_gnu_label_stmt_expr(void) {
+	printf("\n--- GNU __label__ in statement expressions ---\n");
+	// Two stmt-exprs with same-named __label__ local labels.
+	{
+		const char *code =
+		    "int read_a(void);\n"
+		    "int read_b(void);\n"
+		    "int f(void) {\n"
+		    "    ({ __label__ done; int r; r = read_a(); if (r > 0) goto done; r = -1; done: r; });\n"
+		    "    ({ __label__ done; int r; r = read_b(); if (r > 0) goto done; r = -1; done: r; });\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gnu_label_se.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "gnu __label__: duplicate local labels in separate stmt-exprs must not error");
+		prism_free(&r);
+	}
+	// Single stmt-expr with __label__ — baseline sanity.
+	{
+		const char *code =
+		    "int f(void) {\n"
+		    "    return ({ __label__ end; int v = 42; goto end; v = 0; end: v; });\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gnu_label_single.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "gnu __label__: single stmt-expr with local label transpiles OK");
+		prism_free(&r);
+	}
+	// __label__ with defer: local label + defer inside stmt-expr.
+	{
+		const char *code =
+		    "void cleanup(void);\n"
+		    "int f(void) {\n"
+		    "    return ({ __label__ out; { defer { cleanup(); } goto out; } out: 0; });\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gnu_label_dfr.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "gnu __label__: local label with defer in stmt-expr transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "cleanup()"),
+			      "gnu __label__: defer expanded inside stmt-expr with local label");
+		}
+		prism_free(&r);
+	}
+	// Comma-separated __label__ declarations.
+	{
+		const char *code =
+		    "int f(void) {\n"
+		    "    return ({\n"
+		    "        __label__ retry, done;\n"
+		    "        int n = 0;\n"
+		    "        retry: if (++n < 3) goto retry;\n"
+		    "        goto done;\n"
+		    "        done: n;\n"
+		    "    });\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "gnu_label_comma.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "gnu __label__: comma-separated local labels transpile OK");
+		prism_free(&r);
+	}
+}
+
 
 typedef void VoidType;
 
@@ -5466,6 +5532,9 @@ void run_safe_tests(void) {
 	test_goto_into_scope_decl_after_label();
 	test_goto_complex_valid();
 	test_goto_with_defer_valid();
+
+	/* GNU __label__ local labels in statement expressions */
+	test_gnu_label_stmt_expr();
 
 	/* Rigor tests */
 	test_typedef_void_return();

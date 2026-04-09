@@ -2630,6 +2630,57 @@ static void test_c23_attr_bracket_orelse_dim_hoist(void) {
 	prism_free(&r);
 }
 
+// Bug: walk_balanced_orelse consumed FIFO bracket_oe_ids for C23 [[...]]
+// attributes that emit_bracket_orelse_temps (correctly) skipped, stealing
+// the pre-hoisted temp meant for the subsequent VLA dimension.  The C23
+// attr got the ternary using the wrong variable, and the real VLA dim
+// fell back to inline ternary (or crashed on empty queue).
+static void test_c23_attr_orelse_fifo_queue_steal(void) {
+	const char *code =
+	    "void f(int m, int n) {\n"
+	    "    int buffer [[gnu::alloc_size(n orelse 1024)]] [m orelse 2048];\n"
+	    "    (void)buffer;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "c23attr_fifo.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		// The VLA dim [m orelse 2048] must get __prism_oe_0 (hoisted m).
+		// Before the fix the C23 attr stole it, producing
+		//   [[ __prism_oe_0 ? ... ]] which is wrong.
+		CHECK(!strstr(r.output, "[[ __prism_oe_"),
+		      "c23-attr-orelse-fifo: C23 attr stole pre-hoisted temp "
+		      "(queue desync between emit_bracket_orelse_temps and "
+		      "walk_balanced_orelse)");
+		// The hoisted temp must appear in a real VLA dimension bracket.
+		CHECK(strstr(r.output, "[ __prism_oe_0"),
+		      "c23-attr-orelse-fifo: VLA dim did not get pre-hoisted "
+		      "temp — FIFO queue was consumed by C23 attr");
+	}
+	prism_free(&r);
+}
+
+// Bug: C23 [[...]] prefix attributes emitted via emit_range_ex leaked
+// the raw 'orelse' keyword to output without transformation.  The fix
+// ensures emit_range_ex walks C23 attr brackets with orelse awareness.
+static void test_c23_attr_prefix_orelse_keyword_leak(void) {
+	const char *code =
+	    "void f(int align) {\n"
+	    "    [[gnu::aligned(align orelse 8)]] int buffer[2048];\n"
+	    "    (void)buffer;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "c23attr_prefix.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		// 'orelse' must not appear raw in output.
+		CHECK(!strstr(r.output, "orelse"),
+		      "c23-attr-prefix-orelse: raw 'orelse' keyword leaked "
+		      "in C23 attribute output");
+		// Should be transformed to ternary.
+		CHECK(strstr(r.output, "align) ? ("),
+		      "c23-attr-prefix-orelse: orelse in C23 attr not "
+		      "transformed to ternary");
+	}
+	prism_free(&r);
+}
+
 // Bug: walk_back_skip_attrs did not skip C23 [[...]] attributes when
 // classifying a named struct/union/enum scope in Phase 1A.
 // struct [[deprecated]] Name { ... } was not classified as is_struct,
@@ -7283,6 +7334,8 @@ void run_orelse_tests(void) {
 	test_bare_orelse_compound_literal_unbraced_if();
 	test_bare_orelse_emit_range_prep_dir_leak();
 	test_c23_attr_bracket_orelse_dim_hoist();
+	test_c23_attr_orelse_fifo_queue_steal();
+	test_c23_attr_prefix_orelse_keyword_leak();
 	test_c23_attr_named_struct_scope();
 
 	// block-form orelse else binding

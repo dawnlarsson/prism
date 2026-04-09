@@ -355,6 +355,7 @@ static Token *walk_balanced_orelse(Token *tok);
 static bool bracket_scan_has_orelse(Token *open);
 static Token *try_typeof_orelse(Token *tok);
 static Token *try_bracket_orelse(Token *tok);
+static void emit_token_range_orelse(Token *start, Token *end);
 static Token *handle_sue_body(Token *tok);
 static void emit_noise_between_raws(Token *first_raw, Token *last_raw);
 static inline Token *try_strip_raw(Token *t);
@@ -903,6 +904,15 @@ static void emit_range_ex(Token *start, Token *end, int flags) {
 		if ((flags & ER_SKIP_PREP) && t->kind == TK_PREP_DIR) { t = tok_next(t); continue; }
 		if ((flags & ER_BALANCED) && (t->flags & TF_OPEN) && match_set(t, CH('(') | CH('['))) {
 			walk_balanced(t, true); t = tok_next(tok_match(t)); continue;
+		}
+		// C23 attributes: walk as balanced group with orelse awareness
+		// so that orelse inside attr arguments is transformed inline.
+		if ((t->flags & TF_C23_ATTR) && tok_match(t)) {
+			Token *bclose = tok_match(t);
+			emit_tok(t); t = tok_next(t);
+			emit_token_range_orelse(t, bclose);
+			emit_tok(bclose); t = tok_next(bclose);
+			continue;
 		}
 		if (is_stmt_expr_open(t) && tok_match(t)) { walk_balanced(t, true); t = tok_next(tok_match(t)); continue; }
 		{ Token *r = emit_tok_checked(t); if (r) { t = r; continue; } }
@@ -1825,6 +1835,7 @@ static Token *try_typeof_orelse(Token *tok) {
 static Token *try_bracket_orelse(Token *tok) {
 	if (!match_ch(tok, '[') || !(tok->flags & TF_OPEN) || !tok_match(tok))
 		return NULL;
+	if (tok->flags & TF_C23_ATTR) return NULL;
 	if (bracket_scan_has_orelse(tok))
 		return walk_balanced_orelse(tok);
 	return NULL;
@@ -1844,6 +1855,18 @@ static Token *walk_balanced(Token *tok, bool emit) {
 			}
 			// Bracket orelse: dispatch to orelse-aware walker.
 			if (FEAT(F_ORELSE) && (t->flags & TF_OPEN) && match_ch(t, '[') && tok_match(t)) {
+				// C23 [[ ... ]] attributes: emit with inline orelse
+				// transformation.  Do NOT enter the FIFO bracket orelse
+				// path — emit_bracket_orelse_temps skips TF_C23_ATTR,
+				// so consuming queue entries here would steal temps
+				// meant for subsequent VLA dimensions.
+				if (t->flags & TF_C23_ATTR) {
+					Token *bclose = tok_match(t);
+					emit_tok(t); t = tok_next(t);
+					emit_token_range_orelse(t, bclose);
+					emit_tok(bclose); t = tok_next(bclose);
+					continue;
+				}
 				{ Token *next = try_bracket_orelse(t); if (next) { t = next; continue; } }
 				// No orelse — emit bracket contents verbatim (no nested
 				// orelse scan needed, avoiding O(N²) on nested brackets).
@@ -2198,6 +2221,19 @@ static inline void decl_emit(Token *t, bool emit) {
 
 static inline Token *decl_array_dims(Token *t, bool emit, bool *vla) {
 	while (match_ch(t, '[')) {
+		// C23 attributes between array dims: emit with inline orelse
+		// but skip the FIFO-consuming bracket orelse path.
+		if (t->flags & TF_C23_ATTR) {
+			if (emit) {
+				Token *bclose = tok_match(t);
+				emit_tok(t); t = tok_next(t);
+				emit_token_range_orelse(t, bclose);
+				emit_tok(bclose); t = tok_next(bclose);
+			} else {
+				t = tok_next(tok_match(t));
+			}
+			continue;
+		}
 		if (array_size_is_vla(t)) *vla = true;
 		if (emit && FEAT(F_ORELSE))
 			t = walk_balanced_orelse(t);
@@ -6576,7 +6612,28 @@ typedef struct {
 	int p1d_init_brace_depth;
 	bool p1d_ctrl_pending;
 	uint32_t *skip_cache;
+	// GNU __label__ local label declarations — allows same-named labels
+	// in different statement-expression blocks (block-scoped labels).
+	struct { char *name; int len; uint16_t scope_id; char *mangled; int mangled_len; } *local_labels;
+	int local_label_count;
+	int local_label_cap;
 } P1ScanState;
+
+// Find the mangled name for a local label declared via __label__ in an
+// ancestor stmt-expr scope.  Returns NULL if the label is not local.
+static char *p1d_find_local_label(P1ScanState *s, char *name, int len, uint16_t cur_sid, int *out_len) {
+	// Search from most recent to oldest — innermost scope wins.
+	for (int i = s->local_label_count - 1; i >= 0; i--) {
+		if (s->local_labels[i].len != len) continue;
+		if (memcmp(s->local_labels[i].name, name, len) != 0) continue;
+		// Check that the __label__ scope is an ancestor of (or equal to) cur_sid.
+		if (scope_is_ancestor_or_self(s->local_labels[i].scope_id, cur_sid)) {
+			*out_len = s->local_labels[i].mangled_len;
+			return s->local_labels[i].mangled;
+		}
+	}
+	return NULL;
+}
 
 // Handle '{' in prescan: scope tracking, Phase 1E return type capture,
 // FuncMeta creation, parameter shadow registration, switch scope.
@@ -6753,6 +6810,7 @@ static void p1d_handle_close_brace(P1ScanState *s) {
 		s->file_scope_stmt_start = tok_next(tok);
 		s->p1e_ret_void = false;
 		s->p1e_ret_captured = false;
+		s->local_label_count = 0; // Reset local labels for next function
 	}
 
 	s->at_stmt_start = true;
@@ -6955,7 +7013,18 @@ static void p1_full_depth_prescan(Token *tok) {
 			// positions (e.g., braceless `if (c) goto L;`)
 			if (p1d_cur_func >= 0) {
 				uint16_t cur_sid = CUR_SID();
-				p1d_record_goto(tok, cur_sid, p1d_cur_func);
+				// Goto detection with __label__ mangling
+				if ((tok->tag & TT_GOTO) && !is_known_typedef(tok) && tok_next(tok)) {
+					if (is_identifier_like(tok_next(tok))) {
+						P1FuncEntry *e = p1_alloc(P1K_GOTO, cur_sid, tok);
+						Token *target = tok_next(tok);
+						int ml;
+						char *mangled = p1d_find_local_label(ps, tok_loc(target), target->len, cur_sid, &ml);
+						if (mangled) { e->label.name = mangled; e->label.len = ml; }
+						else { e->label.name = tok_loc(target); e->label.len = target->len; }
+					} else if (match_ch(skip_noise(tok_next(tok)), '*'))
+						func_meta[p1d_cur_func].has_computed_goto = true;
+				}
 				if (is_defer_kw(tok, p1d_prev))
 					p1_try_alloc_defer(tok, cur_sid, p1d_cur_func);
 			}
@@ -7233,6 +7302,49 @@ static void p1_full_depth_prescan(Token *tok) {
 		if (p1d_cur_func >= 0) {
 			uint16_t cur_sid = CUR_SID();
 
+			// GNU __label__ local label declaration: __label__ id1, id2, ...;
+			// Records block-scoped labels with mangled names so the flat
+			// label_hash can distinguish same-named labels in different
+			// statement-expression blocks.
+			if (at_stmt_start && tok->kind == TK_IDENT && tok->len == 9 &&
+			    !memcmp(tok_loc(tok), "__label__", 9)) {
+				Token *t = tok_next(tok);
+				while (t && t->kind != TK_EOF && !match_ch(t, ';')) {
+					if (is_identifier_like(t) && t->kind == TK_IDENT) {
+						if (ps->local_label_count >= ps->local_label_cap) {
+							int old = ps->local_label_cap;
+							ps->local_label_cap = old ? old * 2 : 16;
+							ps->local_labels = arena_realloc(&ctx->main_arena,
+								ps->local_labels,
+								old * sizeof(ps->local_labels[0]),
+								ps->local_label_cap * sizeof(ps->local_labels[0]));
+						}
+						// Create mangled name: "name\0sid" using NUL + scope_id bytes
+						// to guarantee uniqueness without affecting display.
+						int name_len = t->len;
+						char sid_buf[12];
+						int sid_len = snprintf(sid_buf, sizeof(sid_buf), "%u", (unsigned)cur_sid);
+						int mangled_len = name_len + 1 + sid_len;
+						char *mangled = arena_alloc_uninit(&ctx->main_arena, mangled_len);
+						memcpy(mangled, tok_loc(t), name_len);
+						mangled[name_len] = '\0';
+						memcpy(mangled + name_len + 1, sid_buf, sid_len);
+						ps->local_labels[ps->local_label_count++] = (typeof(ps->local_labels[0])){
+							.name = tok_loc(t), .len = name_len,
+							.scope_id = cur_sid,
+							.mangled = mangled, .mangled_len = mangled_len,
+						};
+					}
+					t = tok_next(t);
+				}
+				// Skip past the ';'
+				if (t && match_ch(t, ';')) t = tok_next(t);
+				p1d_prev = tok;
+				tok = t;
+				at_stmt_start = true;
+				continue;
+			}
+
 			// Label detection: ident ':' at statement start
 			// (not '::' scope, not case/default, not inside initializer braces)
 			// at_stmt_start filters out _Generic associations, bitfields, and
@@ -7245,8 +7357,10 @@ static void p1_full_depth_prescan(Token *tok) {
 				    !(tok->tag & (TT_CASE | TT_DEFAULT)) &&
 				    p1d_init_brace_depth == 0) {
 					P1FuncEntry *e = p1_alloc(P1K_LABEL, cur_sid, tok);
-					e->label.name = tok_loc(tok);
-					e->label.len = tok->len;
+					int ml;
+					char *mangled = p1d_find_local_label(ps, tok_loc(tok), tok->len, cur_sid, &ml);
+					if (mangled) { e->label.name = mangled; e->label.len = ml; }
+					else { e->label.name = tok_loc(tok); e->label.len = tok->len; }
 					// Advance past 'label:' so the next token is at stmt start.
 					p1d_prev = colon;
 					tok = tok_next(colon);
@@ -7255,8 +7369,18 @@ static void p1_full_depth_prescan(Token *tok) {
 				}
 			}
 
-			// Goto detection
-			p1d_record_goto(tok, cur_sid, p1d_cur_func);
+			// Goto detection — with __label__ mangling
+			if ((tok->tag & TT_GOTO) && !is_known_typedef(tok) && tok_next(tok)) {
+				if (is_identifier_like(tok_next(tok))) {
+					P1FuncEntry *e = p1_alloc(P1K_GOTO, cur_sid, tok);
+					Token *target = tok_next(tok);
+					int ml;
+					char *mangled = p1d_find_local_label(ps, tok_loc(target), target->len, cur_sid, &ml);
+					if (mangled) { e->label.name = mangled; e->label.len = ml; }
+					else { e->label.name = tok_loc(target); e->label.len = target->len; }
+				} else if (match_ch(skip_noise(tok_next(tok)), '*'))
+					func_meta[p1d_cur_func].has_computed_goto = true;
+			}
 
 			// Defer detection
 			if (is_defer_kw(tok, p1d_prev))
