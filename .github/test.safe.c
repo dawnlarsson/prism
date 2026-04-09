@@ -3850,6 +3850,59 @@ static void test_typeof_qualifier_vla_blindspot(void) {
 	}
 }
 
+// BUG: typeof(typeof(int[n])) was misidentified as a function type by
+// is_typeof_func_type. The inner typeof keyword followed by '(' looked
+// like a function type signature typeof(int(int)), causing zero-init to
+// skip the memset.
+static void test_typeof_nested_typeof_vla(void) {
+	printf("\n--- typeof nested typeof VLA ---\n");
+
+	// Sub-test 1: typeof(typeof(int[n])) — must get memset
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    typeof(typeof(int[n])) b;\n"
+		    "    (void)b;\n"
+		    "}\n",
+		    "tn_typeof1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typeof(typeof(VLA)) transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "typeof(typeof(VLA)) must get memset");
+		prism_free(&r);
+	}
+
+	// Sub-test 2: triple-nested typeof
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    typeof(typeof(typeof(int[n]))) c;\n"
+		    "    (void)c;\n"
+		    "}\n",
+		    "tn_typeof2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "triple-nested typeof(VLA) transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "triple-nested typeof(VLA) must get memset");
+		prism_free(&r);
+	}
+
+	// Sub-test 3: actual function type inside typeof must still be detected
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    typeof(int(int, int)) fn;\n"
+		    "    (void)fn;\n"
+		    "}\n",
+		    "tn_typeof3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typeof(func-type) transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") == NULL,
+			      "typeof(func-type) must NOT get memset");
+		prism_free(&r);
+	}
+}
+
 // sizeof(type qualifier [n]) — qualifier blinds VLA detection in array_size_is_vla.
 static void test_sizeof_vla_qualifier_blindspot(void) {
 	printf("\n--- sizeof VLA qualifier blindspot ---\n");
@@ -5803,6 +5856,9 @@ void run_safe_tests(void) {
 
         // qualifier blindspot in typeof/Atomic VLA detection
         test_typeof_qualifier_vla_blindspot();
+
+        // typeof(typeof(VLA)) misidentified as function type
+        test_typeof_nested_typeof_vla();
 
         // sizeof VLA qualifier blindspot in array_size_is_vla
         test_sizeof_vla_qualifier_blindspot();

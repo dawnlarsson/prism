@@ -2681,6 +2681,52 @@ static void test_c23_attr_prefix_orelse_keyword_leak(void) {
 	prism_free(&r);
 }
 
+// Bug: emit_bracket_orelse_temps populates global FIFO queues for dim/oe
+// temps, but leaves them active during base type emission.  Type specifiers
+// like typeof(expr) route through walk_balanced_orelse, which blindly
+// consumes the queues meant for the declarator's array dims.
+static void test_typeof_bracket_orelse_type_queue_steal(void) {
+	// Vector 1: dim-temp stealing — typeof(int[HW]) steals dim meant for [y]
+	{
+		const char *code =
+		    "extern volatile int HW;\n"
+		    "void f(void) {\n"
+		    "    int y = 5, x = 0;\n"
+		    "    typeof(int[HW]) arr[y][x orelse 1];\n"
+		    "    (void)arr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "typeof_dim_steal.c", prism_defaults());
+		if (r.status == PRISM_OK && r.output) {
+			// HW must remain in the typeof — not replaced by a dim temp.
+			CHECK(strstr(r.output, "typeof(int[HW])"),
+			      "typeof-dim-steal: HW was replaced by dim temp in "
+			      "typeof (type specifier stole declarator queue)");
+		}
+		prism_free(&r);
+	}
+	// Vector 2: oe-temp stealing — typeof(int[z orelse 2]) steals oe meant for [x]
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int x = 0, z = 0;\n"
+		    "    typeof(int[z orelse 2]) arr2[x orelse 1];\n"
+		    "    (void)arr2;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "typeof_oe_steal.c", prism_defaults());
+		if (r.status == PRISM_OK && r.output) {
+			// The declarator's [x orelse 1] must get the pre-hoisted oe temp.
+			CHECK(strstr(r.output, "[ __prism_oe_"),
+			      "typeof-oe-steal: declarator VLA dim did not get "
+			      "pre-hoisted oe temp (stolen by typeof)");
+			// typeof must use inline ternary, not steal the oe temp.
+			CHECK(!strstr(r.output, "typeof(int[ __prism_oe_"),
+			      "typeof-oe-steal: typeof stole oe temp meant for "
+			      "declarator array dimension");
+		}
+		prism_free(&r);
+	}
+}
+
 // Bug: walk_back_skip_attrs did not skip C23 [[...]] attributes when
 // classifying a named struct/union/enum scope in Phase 1A.
 // struct [[deprecated]] Name { ... } was not classified as is_struct,
@@ -6455,6 +6501,72 @@ static void test_orelse_shadow_variable(void) {
 		         "shadow-orelse-var-call: 'orelse' as function arg must work");
 		prism_free(&r);
 	}
+	// Variable after binary operators must not trigger orelse keyword.
+	// Bug: orelse_shadow_is_kw used an incomplete operator blacklist,
+	// missing >, <, /, %, ^, |, ==, !=, <=, >=, &&, ||, <<, >>.
+	{
+		const char *code =
+		    "int test_ops(int w) {\n"
+		    "    int orelse = 1024;\n"
+		    "    int a = w > orelse;\n"
+		    "    int b = w == orelse;\n"
+		    "    int c = w != orelse;\n"
+		    "    int d = w <= orelse;\n"
+		    "    int e = w | orelse;\n"
+		    "    int f = w ^ orelse;\n"
+		    "    int g = w / orelse;\n"
+		    "    int h = w % orelse;\n"
+		    "    int i = w && orelse;\n"
+		    "    int j = w || orelse;\n"
+		    "    return a+b+c+d+e+f+g+h+i+j;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "shadow_var_ops.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "shadow-orelse-var-ops: 'orelse' after binary operators must "
+		         "work as variable (not misidentified as keyword)");
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(!strstr(r.output, "? ("),
+			      "shadow-orelse-var-ops: ternary generated for shadowed "
+			      "orelse variable (operator bypass in shadow check)");
+		}
+		prism_free(&r);
+	}
+	// Variable after sizeof/alignof must work (prefix keyword bypass).
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int orelse = 42;\n"
+		    "    int a = sizeof orelse;\n"
+		    "    int b = _Alignof(typeof(orelse));\n"
+		    "    (void)a; (void)b;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "shadow_var_sizeof.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "shadow-orelse-var-sizeof: 'orelse' after sizeof must "
+		         "work as variable (not misidentified as keyword)");
+		prism_free(&r);
+	}
+	// Postfix ++/-- before shadowed orelse keyword must still trigger keyword.
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    int orelse = 0;\n"
+		    "    int counter = 10;\n"
+		    "    int x = counter++ orelse 42;\n"
+		    "    int y = counter-- orelse 99;\n"
+		    "    (void)x; (void)y; (void)(orelse + 0);\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "shadow_postfix.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "shadow-orelse-postfix: postfix ++/-- before shadowed "
+		         "orelse must still treat orelse as keyword");
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(strstr(r.output, "? x :") || strstr(r.output, "? ("),
+			      "shadow-orelse-postfix: ternary must be generated "
+			      "for orelse after postfix ++/--");
+		}
+		prism_free(&r);
+	}
 }
 
 static void test_orelse_shadow_enum(void) {
@@ -6487,6 +6599,75 @@ static void test_orelse_shadow_typedef(void) {
 	CHECK_EQ(r.status, PRISM_OK,
 	         "shadow-orelse-typedef: typedef named 'orelse' must suppress keyword");
 	prism_free(&r);
+}
+
+// BUG: typedef named 'orelse' + orelse keyword in same scope.
+// The keyword must be recognized after expression-ending tokens (')' etc.)
+// while the type name is preserved at declaration-start positions.
+static void test_orelse_real_typedef_keyword(void) {
+	// Test 1: orelse as type + keyword in decl initializer (value fallback)
+	{
+		const char *code =
+		    "typedef int orelse;\n"
+		    "int get(void) { return 0; }\n"
+		    "void f(void) {\n"
+		    "    orelse x = get() orelse 42;\n"
+		    "    (void)x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "td_oe_decl.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "real-typedef-orelse-decl: transpile must succeed");
+		CHECK(r.output && !strstr(r.output, " orelse "),
+		      "real-typedef-orelse-decl: keyword orelse must be transformed");
+		prism_free(&r);
+	}
+	// Test 2: orelse as type + keyword in bare expression
+	{
+		const char *code =
+		    "typedef int orelse;\n"
+		    "int get(void) { return 0; }\n"
+		    "void f(void) {\n"
+		    "    int y;\n"
+		    "    y = get() orelse 99;\n"
+		    "    (void)y;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "td_oe_bare.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "real-typedef-orelse-bare: transpile must succeed");
+		CHECK(r.output && !strstr(r.output, " orelse "),
+		      "real-typedef-orelse-bare: keyword orelse must be transformed");
+		prism_free(&r);
+	}
+	// Test 3: orelse as type + control flow orelse
+	{
+		const char *code =
+		    "typedef int orelse;\n"
+		    "void *getptr(void) { return (void *)0; }\n"
+		    "int f(void) {\n"
+		    "    int *p = getptr() orelse return -1;\n"
+		    "    return *p;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "td_oe_ctrl.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "real-typedef-orelse-ctrl: transpile must succeed");
+		CHECK(r.output && !strstr(r.output, " orelse "),
+		      "real-typedef-orelse-ctrl: keyword orelse must be transformed");
+		prism_free(&r);
+	}
+	// Test 4: pure type usage with no keyword — orelse in sizeof/cast
+	{
+		const char *code =
+		    "typedef int orelse;\n"
+		    "void f(void) {\n"
+		    "    orelse z = (orelse)3;\n"
+		    "    int s = sizeof(orelse);\n"
+		    "    (void)z; (void)s;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "td_oe_pure.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "real-typedef-orelse-pure: pure type usage must compile");
+		prism_free(&r);
+	}
 }
 
 // chained assignment a = b = f() orelse 5 split-brain.
@@ -7336,6 +7517,7 @@ void run_orelse_tests(void) {
 	test_c23_attr_bracket_orelse_dim_hoist();
 	test_c23_attr_orelse_fifo_queue_steal();
 	test_c23_attr_prefix_orelse_keyword_leak();
+	test_typeof_bracket_orelse_type_queue_steal();
 	test_c23_attr_named_struct_scope();
 
 	// block-form orelse else binding
@@ -7535,6 +7717,8 @@ void run_orelse_tests(void) {
 	test_orelse_shadow_enum();
 	test_orelse_shadow_typedef();
 
+        // BUG: typedef named 'orelse' + keyword in same scope
+        test_orelse_real_typedef_keyword();
 	// chained assignment split-brain
 	test_orelse_chained_assign_rejected();
 

@@ -2470,17 +2470,19 @@ static inline bool is_orelse_kw(Token *tok) {
 // preceding token ends an expression (infix position).
 static inline bool orelse_shadow_is_kw(Token *prev) {
 	if (!prev) return false;
-	if (prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE | TT_TYPEOF | TT_BITINT))
+	// orelse is a keyword only after value-producing tokens.
+	// After operators, type keywords, storage classes, control-flow
+	// keywords (sizeof, return, if, ...), etc. it's a variable.
+	if (prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE |
+			 TT_TYPEOF | TT_BITINT | TT_SKIP_DECL | TT_ALIGNAS |
+			 TT_INLINE | TT_ATTR))
 		return false;
-	if ((prev->len == 1 && (unsigned)(prev->ch0 - 32) < 64 &&
-	    ((1ULL << (prev->ch0 - 32)) &
-	    ((1ULL << ('*' - 32)) | (1ULL << ('(' - 32)) | (1ULL << ('[' - 32)) |
-	     (1ULL << (',' - 32)) | (1ULL << ('=' - 32)) | (1ULL << ('?' - 32)) |
-	     (1ULL << (':' - 32)) | (1ULL << ('!' - 32)) | (1ULL << ('&' - 32)) |
-	     (1ULL << ('-' - 32)) | (1ULL << ('+' - 32)) | (1ULL << (';' - 32))))) ||
-	    (prev->len == 1 && (prev->ch0 == '~' || prev->ch0 == '{')))
-		return false;
-	return true;
+	// Postfix ++/-- are value-producing; prefix ++/-- on a shadowed
+	// variable is rare, so favour the postfix interpretation.
+	if (prev->len == 2 && (prev->ch0 == '+' || prev->ch0 == '-') &&
+	    tok_loc(prev)[1] == prev->ch0)
+		return true;
+	return is_expr_ending_brace(prev);
 }
 
 // --- Struct/VLA Analysis ---

@@ -1212,10 +1212,9 @@ static inline void p1d_record_goto(Token *tok, uint16_t cur_sid, int p1d_cur_fun
 static inline bool is_orelse_keyword(Token *tok) {
 	if (!(tok->tag & TT_ORELSE)) return false;
 	if (last_emitted && (last_emitted->tag & TT_MEMBER)) return false;
-	// Shadow: in Pass 2, require last_emitted to be expression-ending
+	// Shadow or real typedef: require last_emitted to be expression-ending
 	TypedefEntry *te = typedef_lookup(tok);
-	if (te && !te->is_shadow) return false;  // real typedef suppresses
-	if (te && te->is_shadow) {
+	if (te) {
 		if (!last_emitted) return false;
 		if (!orelse_shadow_is_kw(last_emitted)) return false;
 	}
@@ -1868,10 +1867,13 @@ static Token *walk_balanced(Token *tok, bool emit) {
 					continue;
 				}
 				{ Token *next = try_bracket_orelse(t); if (next) { t = next; continue; } }
-				// No orelse — emit bracket contents verbatim (no nested
-				// orelse scan needed, avoiding O(N²) on nested brackets).
+				// No orelse — emit bracket contents with raw stripping
+				// (cast expressions like [(raw int)x] can appear here).
 				Token *bclose = tok_match(t);
-				while (t != bclose) { emit_tok(t); t = tok_next(t); }
+				while (t != bclose) {
+					{ Token *r = emit_tok_checked(t); if (r) { t = r; continue; } }
+					t = tok_next(t);
+				}
 				emit_tok(t); t = tok_next(t);
 				continue;
 			}
@@ -1897,7 +1899,7 @@ static void emit_token_range_orelse(Token *start, Token *end) {
 	Token *prev = NULL;
 	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
 		if (t->flags & TF_OPEN) { prev = tok_match(t); t = tok_match(t); continue; }
-		if (is_orelse_kw_shadow(t) &&
+		if ((t->tag & TT_ORELSE) &&
 		    !(prev && (prev->tag & TT_MEMBER))) {
 			TypedefEntry *te = typedef_lookup(t);
 			if (!te || orelse_shadow_is_kw(prev)) {
@@ -1968,19 +1970,27 @@ static Token *scan_bracket_orelse(Token *open, Token *close, Token **paren_open_
 			if (match_ch(open, '[') && match_ch(t, '(')) {
 				Token *pp = tok_match(t);
 				if (pp && tok_next(pp) == close) {
+					Token *prev_p = t;
 					for (Token *p = tok_next(t); p && p != pp; p = tok_next(p)) {
-						if (p->flags & TF_OPEN) { p = tok_match(p) ? tok_match(p) : p; continue; }
-						if (is_orelse_kw_shadow(p)) {
-							if (paren_open_out) *paren_open_out = t;
-							return p;
+						if (p->flags & TF_OPEN) { prev_p = tok_match(p) ? tok_match(p) : p; p = prev_p; continue; }
+						if ((p->tag & TT_ORELSE)) {
+							TypedefEntry *te_p = typedef_lookup(p);
+							if (!te_p || orelse_shadow_is_kw(prev_p)) {
+								if (paren_open_out) *paren_open_out = t;
+								return p;
+							}
 						}
+						prev_p = p;
 					}
 				}
 			}
 			prev = tok_match(t); t = tok_match(t); continue;
 		}
-		if (is_orelse_kw_shadow(t) && !(prev && (prev->tag & TT_MEMBER)))
-			return t;
+		if ((t->tag & TT_ORELSE) && !(prev && (prev->tag & TT_MEMBER))) {
+			TypedefEntry *te = typedef_lookup(t);
+			if (!te || orelse_shadow_is_kw(prev))
+				return t;
+		}
 		prev = t;
 	}
 	return NULL;
@@ -2618,7 +2628,7 @@ static void check_orelse_in_parens(Token *open) {
 			t = tok_match(t);
 			continue;
 		}
-		if (is_orelse_kw_shadow(t) && !(pi->tag & TT_MEMBER)) {
+		if ((t->tag & TT_ORELSE) && !(pi->tag & TT_MEMBER)) {
 			// Skip orelse already tagged as valid declaration init
 			// by Phase 1D (equivalent of scan_decl_orelse paren unlink).
 			if (tok_ann(t) & P1_OE_DECL_INIT) continue;
@@ -2715,7 +2725,7 @@ static OrelseInitInfo scan_decl_orelse(Token *decl_end,
 					bool has_depth0_comma = false;
 					Token *prev_inner = NULL;
 					for (Token *inner = tok_next(scan); inner && inner != close; inner = tok_next(inner)) {
-						if (is_orelse_kw_shadow(inner)) {
+						if ((inner->tag & TT_ORELSE)) {
 							TypedefEntry *te_in = typedef_lookup(inner);
 							if (!te_in || orelse_shadow_is_kw(prev_inner)) {
 								has_inner_orelse = true;
@@ -2765,7 +2775,7 @@ static OrelseInitInfo scan_decl_orelse(Token *decl_end,
 		if (match_ch(scan, ',') || match_ch(scan, ';')) break;
 		if (match_ch(scan, '?')) { ternary++; prev_scan = scan; scan = tok_next(scan); continue; }
 		if (match_ch(scan, ':') && ternary > 0) { ternary--; prev_scan = scan; scan = tok_next(scan); continue; }
-		if (is_orelse_kw_shadow(scan) &&
+		if ((scan->tag & TT_ORELSE) &&
 		    !(prev_scan && (prev_scan->tag & TT_MEMBER)) && ternary == 0) {
 			TypedefEntry *te_scan = typedef_lookup(scan);
 			if (!te_scan || orelse_shadow_is_kw(prev_scan)) {
@@ -2816,6 +2826,13 @@ static bool is_typeof_func_type(Token *type_start, TypeSpecResult *type, DeclRes
 			// Function type signature: typeof(int(int)) — type keyword followed by '('
 			if (inner->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)) {
 				for (Token *fs = inner; fs && fs != close; fs = tok_next(fs)) {
+					// Skip typeof/typeof_unqual keyword + argument parens —
+					// typeof(typeof(int[n])) is NOT a function type.
+					if ((fs->tag & TT_TYPEOF) && tok_next(fs) &&
+					    match_ch(tok_next(fs), '(') && tok_match(tok_next(fs))) {
+						fs = tok_match(tok_next(fs));
+						continue;
+					}
 					if (match_ch(fs, '(')) {
 						Token *after = tok_next(fs);
 						if (after && match_ch(after, '*')) return false; // function pointer type
@@ -3101,6 +3118,10 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					  "would double-evaluate VLA size expressions; "
 					  "declare each variable on a separate line");
 			if (!is_const_orelse_fallback) {
+				// Mask queues: type specifiers (typeof, _Alignas) must not
+				// steal dim/oe temps meant for the declarator.
+				int saved_oe = ctx->bracket_oe_count, saved_dim = ctx->bracket_dim_count;
+				ctx->bracket_oe_count = 0; ctx->bracket_dim_count = 0;
 				if (pragma_start != type_start) {
 					if (raw_tok)
 						emit_range(pragma_start, raw_tok);
@@ -3108,6 +3129,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 						emit_range(pragma_start, type_start);
 				}
 				emit_type_range(type_start, type->end, false, true);
+				ctx->bracket_oe_count = saved_oe; ctx->bracket_dim_count = saved_dim;
 			}
 			need_type_emit = false;
 		}
@@ -3116,9 +3138,14 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		if (first_decl) {
 			if (brace_wrap && !brace_opened) OUT_LIT(" {");
 			if (!is_const_orelse_fallback) {
+				// Mask queues: type specifiers (typeof, _Alignas) must not
+				// steal dim/oe temps meant for the declarator.
+				int saved_oe = ctx->bracket_oe_count, saved_dim = ctx->bracket_dim_count;
+				ctx->bracket_oe_count = 0; ctx->bracket_dim_count = 0;
 				if (raw_tok && pragma_start != type_start) emit_range(pragma_start, raw_tok);
 				else if (pragma_start != type_start) emit_range(pragma_start, type_start);
 				emit_type_range(type_start, type->end, false, false);
+				ctx->bracket_oe_count = saved_oe; ctx->bracket_dim_count = saved_dim;
 			}
 			first_decl = false;
 		}
@@ -4915,9 +4942,12 @@ static Token *find_bare_orelse(Token *tok) {
 		if ((s->flags & TF_CLOSE) || match_ch(s, ';')) return NULL;
 		if (match_ch(s, '?')) { ternary++; prev = s; continue; }
 		if (match_ch(s, ':') && ternary > 0) { ternary--; prev = s; continue; }
-		if (is_orelse_kw(s) &&
-		    !(prev && (prev->tag & TT_MEMBER)) && ternary == 0)
-			return s;
+		if ((s->tag & TT_ORELSE) &&
+		    !(prev && (prev->tag & TT_MEMBER)) && ternary == 0) {
+			TypedefEntry *te = typedef_lookup(s);
+			if (!te || orelse_shadow_is_kw(prev))
+				return s;
+		}
 		prev = s;
 	}
 	return NULL;
@@ -5011,8 +5041,7 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 	// The orelse expansion may produce a block which cannot appear after
 	// the comma operator.
 	if (last_comma) {
-		for (Token *s = t; s != last_comma; s = tok_next(s))
-			emit_tok(s);
+		emit_range(t, last_comma);
 		out_char(';');
 		t = post_comma_t;
 	}
@@ -5953,10 +5982,14 @@ p1d_classify_bracket_orelse(Token *tok, uint16_t cur_sid, int p1d_cur_func) {
 	bool found_oe = false;
 	Token *prev_d0_oe = NULL;
 	int oe_depth = 0;
+	Token *prev_bracket = tok;
 	for (Token *s = tok_next(tok); s && s != close && s->kind != TK_EOF; s = tok_next(s)) {
-		if (s->flags & TF_OPEN) oe_depth++;
+		if (s->flags & TF_OPEN) { oe_depth++; prev_bracket = tok_match(s); }
 		if (s->flags & TF_CLOSE) oe_depth--;
-		if (is_orelse_kw_shadow(s)) {
+		if ((s->tag & TT_ORELSE)) {
+			TypedefEntry *te_b = typedef_lookup(s);
+			if (te_b && !orelse_shadow_is_kw(prev_bracket))
+				{ prev_bracket = s; continue; }
 			if (p1d_cur_func < 0)
 				error_tok(s, "orelse inside array dimension at file scope is not allowed "
 					       "(cannot hoist temporary variable outside a function body)");
@@ -5986,6 +6019,7 @@ p1d_classify_bracket_orelse(Token *tok, uint16_t cur_sid, int p1d_cur_func) {
 			tok_ann(s) |= P1_OE_BRACKET;
 			found_oe = true;
 		}
+		prev_bracket = s;
 	}
 	if (found_oe) {
 		for (Token *s = tok_next(tok); s && s != close && s->kind != TK_EOF; s = tok_next(s)) {
@@ -6171,10 +6205,10 @@ static Token *p1d_scan_init_orelse(Token *t, bool *out_has_orelse, Token **out_f
 		if (match_ch(t, '?')) { init_td++; init_is_first = false; prev_init_tok = t; t = tok_next(t); continue; }
 		if (match_ch(t, ':') && init_td > 0) { init_td--; init_is_first = false; prev_init_tok = t; t = tok_next(t); continue; }
 		// Phase 1G: mark orelse in decl initializer
-		if (is_orelse_kw_shadow(t)) {
-			// Shadow: only treat as keyword when preceded by expression-ending token
+		if ((t->tag & TT_ORELSE)) {
+			// Shadow or real typedef: only treat as keyword when preceded by expression-ending token
 			TypedefEntry *te_init = typedef_lookup(t);
-			if (te_init && te_init->is_shadow) {
+			if (te_init) {
 				if (!(prev_init_tok && is_expr_ending_brace(prev_init_tok)))
 					{ prev_init_tok = t; t = tok_next(t); init_is_first = false; continue; }
 			}
@@ -6203,9 +6237,9 @@ static Token *p1d_scan_init_orelse(Token *t, bool *out_has_orelse, Token **out_f
 					for (Token *inner = tok_next(t); inner && inner != m; inner = tok_next(inner)) {
 						if (match_ch(inner, ','))
 							p1d_inner_d0_comma = true;
-						if (is_orelse_kw_shadow(inner)) {
+						if ((inner->tag & TT_ORELSE)) {
 							TypedefEntry *te_inner = typedef_lookup(inner);
-							if (te_inner && te_inner->is_shadow) {
+							if (te_inner) {
 								if (!(prev_inner && is_expr_ending(prev_inner)))
 									{ prev_inner = inner; continue; }
 							}
@@ -6945,10 +6979,11 @@ static void p1_full_depth_prescan(Token *tok) {
 				// Phase 1D: reject side effects in typeof orelse LHS
 				// (hoisted from Pass 2 emit_token_range_orelse).
 				if (!msg) {
+					Token *prev_typeof = paren;
 					for (Token *s = tok_next(paren); s && s != tok_match(paren); s = tok_next(s)) {
-						if (is_orelse_kw_shadow(s)) {
+						if ((s->tag & TT_ORELSE)) {
 							TypedefEntry *te_s = typedef_lookup(s);
-							if (!te_s || te_s->is_shadow) {
+							if (!te_s || orelse_shadow_is_kw(prev_typeof)) {
 								reject_orelse_side_effects(
 									tok_next(paren), s,
 									"'orelse' in typeof",
@@ -6958,7 +6993,8 @@ static void p1_full_depth_prescan(Token *tok) {
 								break;
 							}
 						}
-						if (s->flags & TF_OPEN && tok_match(s)) { s = tok_match(s); continue; }
+						if (s->flags & TF_OPEN && tok_match(s)) { prev_typeof = tok_match(s); s = tok_match(s); continue; }
+						prev_typeof = s;
 					}
 				}
 			}
@@ -7329,11 +7365,12 @@ static void p1_full_depth_prescan(Token *tok) {
 						memcpy(mangled, tok_loc(t), name_len);
 						mangled[name_len] = '\0';
 						memcpy(mangled + name_len + 1, sid_buf, sid_len);
-						ps->local_labels[ps->local_label_count++] = (typeof(ps->local_labels[0])){
-							.name = tok_loc(t), .len = name_len,
-							.scope_id = cur_sid,
-							.mangled = mangled, .mangled_len = mangled_len,
-						};
+						int li = ps->local_label_count++;
+						ps->local_labels[li].name = tok_loc(t);
+						ps->local_labels[li].len = name_len;
+						ps->local_labels[li].scope_id = cur_sid;
+						ps->local_labels[li].mangled = mangled;
+						ps->local_labels[li].mangled_len = mangled_len;
 					}
 					t = tok_next(t);
 				}

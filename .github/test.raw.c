@@ -1492,6 +1492,40 @@ static void test_raw_cast_expression_leak(void) {
 		}
 		prism_free(&r);
 	}
+	// Case 6: raw in cast inside bracket subscript — walk_balanced fast path
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    int arr[10];\n"
+		    "    int val = arr[(raw int)(3)];\n"
+		    "    (void)val;\n"
+		    "}\n",
+		    "rw_cast6.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-cast6: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "raw") == NULL,
+			      "raw-cast6: raw must not leak in bracket subscript cast");
+		prism_free(&r);
+	}
+	// Case 7: raw in comma prefix of bare orelse expression
+	// emit_bare_orelse_impl splits "x = (raw int)get(), y = get() orelse 42"
+	// at the last comma. The prefix "x = (raw int)get()" was emitted via
+	// a raw emit_tok loop, leaking the raw keyword.
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get(void);\n"
+		    "void f(void) {\n"
+		    "    int x, y;\n"
+		    "    x = (raw int)get(), y = get() orelse 42;\n"
+		    "    (void)x; (void)y;\n"
+		    "}\n",
+		    "rw_cast7.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-cast7: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "raw") == NULL,
+			      "raw-cast7: raw must not leak in bare orelse comma prefix");
+		prism_free(&r);
+	}
 }
 
 // BUG_RAW_ATTR_COMMA: raw keyword preceded by GNU/C23 attributes in
