@@ -2971,6 +2971,71 @@ static void spec_boframe_reentrancy(void) {
 	}
 }
 
+// ── ctrl_state leak after braceless body declaration (bug class 4) ──
+static void spec_ctrl_state_leak(void) {
+	printf("\n--- ctrl_state leak after braceless body ---\n");
+
+	// Declaration after braceless if: ctrl_state must not leak
+	// (no spurious brace_wrap on the following declaration)
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    if (1) int x;\n"
+		    "    int y;\n"
+		    "    (void)x; (void)y;\n"
+		    "}\n",
+		    "spec_cl1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "ctrl_state leak decl: transpiles");
+		// Output should NOT have double brace-wrap on 'int y'
+		// (one { } from the if body is correct; a second around y is wrong)
+		if (r.output) {
+			// Count occurrences of "{ int y" — should be 0 (y should be plain)
+			CHECK(strstr(r.output, "{ int y") == NULL,
+			      "ctrl_state leak decl: no spurious brace_wrap on y");
+		}
+		prism_free(&r);
+	}
+
+	// Defer shadow check must fire after braceless if body
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(int *p) { (void)p; }\n"
+		    "void f(void) {\n"
+		    "    int p;\n"
+		    "    defer cleanup(&p);\n"
+		    "    if (1) int q;\n"
+		    "    int p;\n"  // shadows defer-captured 'p' — should error
+		    "}\n",
+		    "spec_cl2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "ctrl_state leak shadow: defer shadow detected after braceless if");
+		prism_free(&r);
+	}
+}
+
+// ── Arena HashMap leak regression (defer_name_set) ──
+static void spec_arena_hashmap_leak(void) {
+	printf("\n--- arena HashMap leak regression ---\n");
+
+	// Repeatedly transpile a function with defer.  If HashMap buckets
+	// leak (calloc without free), this will OOM or slow down.
+	// 10000 iterations × ~1KB per map = ~10MB leaked without the fix.
+	const char *src =
+	    "void cleanup(int *p) { (void)p; }\n"
+	    "void worker(void) {\n"
+	    "    int target;\n"
+	    "    defer cleanup(&target);\n"
+	    "    target = 1;\n"
+	    "}\n";
+	int ok = 0;
+	for (int i = 0; i < 10000; i++) {
+		PrismResult r = prism_transpile_source(src, "spec_leak.c", prism_defaults());
+		if (r.status == PRISM_OK) ok++;
+		prism_free(&r);
+	}
+	CHECK_EQ(ok, 10000, "arena HashMap leak: 10000 iterations no OOM");
+}
+
 // ── Backward goto VLA stack exhaustion (VULN2) ──
 static void spec_backward_goto_vla_loop(void) {
 	printf("\n--- backward goto VLA loop ---\n");
@@ -3188,4 +3253,10 @@ void run_spec_tests(void) {
 	// ── BOFrame reentrancy + VLA loop ──
 	spec_boframe_reentrancy();
 	spec_backward_goto_vla_loop();
+
+	// ── ctrl_state leak after braceless body ──
+	spec_ctrl_state_leak();
+
+	// ── arena HashMap leak regression ──
+	spec_arena_hashmap_leak();
 }

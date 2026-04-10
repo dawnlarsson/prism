@@ -3262,6 +3262,166 @@ static void test_register_vla_bypass(void) {
 	prism_free(&r3);
 }
 
+/* Volatile member detection: memset on structs with volatile fields is UB
+ * (ISO C11 §6.7.3p6). Must emit byte loop (__prism_p_) not __builtin_memset. */
+static void test_volatile_member_memset(void) {
+	printf("\n--- Volatile Member Memset Detection ---\n");
+
+	/* 1. Inline struct with volatile field + VLA */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    struct { volatile int status; int data; } buf[n];\n"
+		    "    (void)buf;\n"
+		    "}\n",
+		    "vol_inline.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "vol inline struct VLA: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "__prism_p_") != NULL,
+			      "vol inline struct VLA: byte loop (not memset)");
+			CHECK(strstr(r.output, "__builtin_memset") == NULL,
+			      "vol inline struct VLA: no memset");
+		}
+		prism_free(&r);
+	}
+
+	/* 2. Typedef of struct with volatile field + VLA */
+	{
+		PrismResult r = prism_transpile_source(
+		    "typedef struct { volatile int status; int data; } MMIO;\n"
+		    "void f(int n) {\n"
+		    "    MMIO regs[n];\n"
+		    "    (void)regs;\n"
+		    "}\n",
+		    "vol_typedef.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "vol typedef VLA: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "__prism_p_") != NULL,
+			      "vol typedef VLA: byte loop (not memset)");
+			CHECK(strstr(r.output, "__builtin_memset") == NULL,
+			      "vol typedef VLA: no memset");
+		}
+		prism_free(&r);
+	}
+
+	/* 3. Struct tag reference (body defined earlier) + VLA */
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct MMIO_Reg { volatile int status; int data; };\n"
+		    "void f(int n) {\n"
+		    "    struct MMIO_Reg regs[n];\n"
+		    "    (void)regs;\n"
+		    "}\n",
+		    "vol_tag.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "vol tag ref VLA: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "__prism_p_") != NULL,
+			      "vol tag ref VLA: byte loop (not memset)");
+			CHECK(strstr(r.output, "__builtin_memset") == NULL,
+			      "vol tag ref VLA: no memset");
+		}
+		prism_free(&r);
+	}
+
+	/* 4. typeof(struct_with_volatile_member) */
+	{
+		PrismResult r = prism_transpile_source(
+		    "typedef struct { volatile int flags; } HwReg;\n"
+		    "void f(void) {\n"
+		    "    HwReg base;\n"
+		    "    typeof(base) shadow;\n"
+		    "    (void)base; (void)shadow;\n"
+		    "}\n",
+		    "vol_typeof.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "vol typeof: transpiles");
+		if (r.output) {
+			/* typeof path uses memset — shadow is aggregate, not VLA.
+			 * Only VLA/typeof/_Atomic aggregates go through emit_typeof_memsets.
+			 * typeof(base) where base is plain aggregate uses = {0}. */
+			CHECK(strstr(r.output, "= {0}") != NULL || strstr(r.output, "__prism_p_") != NULL,
+			      "vol typeof: some zeroing present");
+		}
+		prism_free(&r);
+	}
+
+	/* 5. Nested struct with volatile field deep inside + VLA */
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct Inner { volatile int ctl; };\n"
+		    "struct Outer { struct Inner hw; int pad; };\n"
+		    "void f(int n) {\n"
+		    "    struct Outer devs[n];\n"
+		    "    (void)devs;\n"
+		    "}\n",
+		    "vol_nested.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "vol nested VLA: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "__prism_p_") != NULL,
+			      "vol nested VLA: byte loop (not memset)");
+			CHECK(strstr(r.output, "__builtin_memset") == NULL,
+			      "vol nested VLA: no memset");
+		}
+		prism_free(&r);
+	}
+
+	/* 6. Volatile typedef member (typedef volatile int vint; struct { vint x; }) */
+	{
+		PrismResult r = prism_transpile_source(
+		    "typedef volatile int vint;\n"
+		    "void f(int n) {\n"
+		    "    struct { vint status; } regs[n];\n"
+		    "    (void)regs;\n"
+		    "}\n",
+		    "vol_tdef_member.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "vol typedef-member VLA: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "__prism_p_") != NULL,
+			      "vol typedef-member VLA: byte loop (not memset)");
+			CHECK(strstr(r.output, "__builtin_memset") == NULL,
+			      "vol typedef-member VLA: no memset");
+		}
+		prism_free(&r);
+	}
+
+	/* 7. Non-volatile struct should STILL use memset (no false positive) */
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct Plain { int x; int y; };\n"
+		    "void f(int n) {\n"
+		    "    struct Plain arr[n];\n"
+		    "    (void)arr;\n"
+		    "}\n",
+		    "nonvol.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "non-volatile VLA: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "__builtin_memset") != NULL,
+			      "non-volatile VLA: uses memset (no false positive)");
+			CHECK(strstr(r.output, "__prism_p_") == NULL,
+			      "non-volatile VLA: no byte loop");
+		}
+		prism_free(&r);
+	}
+
+	/* 8. typeof with volatile typeof struct — typeof(HwReg) VLA */
+	{
+		PrismResult r = prism_transpile_source(
+		    "typedef struct { volatile int sr; } HwReg;\n"
+		    "void f(int n) {\n"
+		    "    typeof(HwReg) regs[n];\n"
+		    "    (void)regs;\n"
+		    "}\n",
+		    "vol_typeof_vla.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "vol typeof VLA: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "__prism_p_") != NULL,
+			      "vol typeof VLA: byte loop (not memset)");
+			CHECK(strstr(r.output, "__builtin_memset") == NULL,
+			      "vol typeof VLA: no memset");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -3422,4 +3582,7 @@ void run_zeroinit_tests(void) {
 
 	// register VLA zero-init bypass
 	test_register_vla_bypass();
+
+	// volatile member detection (memset on volatile fields is UB)
+	test_volatile_member_memset();
 }

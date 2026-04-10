@@ -418,7 +418,7 @@ static void reset_transpiler_state(void) {
 	current_func_idx = -1;
 	p1_typedef_annotated = false;
 	p1_file_has_orelse = false;
-	hashmap_zero(&p1_func_proto_map);
+	hashmap_discard(&p1_func_proto_map);
 
 	// Clear arena-allocated arrays — prevents dangling pointers after arena_reset.
 	defer_count = 0;
@@ -444,7 +444,7 @@ static void reset_transpiler_state(void) {
 	ctx->p1_shadow_entries = NULL;
 	p1_shadow_count = 0;
 	p1_shadow_cap = 0;
-	hashmap_zero(&p1_shadow_map);
+	hashmap_discard(&p1_shadow_map);
 	ctx->p1_func_entries = NULL;
 	p1_entry_count = 0;
 	p1_entry_cap = 0;
@@ -601,7 +601,6 @@ static void collect_system_includes(void) {
 				 char *);
 		system_include_list[ctx->system_include_count++] = f->name;
 	}
-	free(include_map.buckets);
 }
 
 static void emit_system_header_diag_push(void) {
@@ -3202,11 +3201,15 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 				  "undefined behavior); remove 'const' or use 'raw' to "
 				  "opt out of automatic initialization");
 
-		// Volatile typedef: propagate to type so memset uses byte loop.
+		// Volatile typedef / volatile member: propagate to type so memset uses byte loop.
 		if (needs_memset && !type->has_volatile && !decl.is_func_ptr && !decl.is_pointer) {
 			for (Token *tv = type_start; tv && tv != type->end; tv = tok_next(tv))
-				if (is_volatile_typedef(tv)) { type->has_volatile = true; break; }
+				if (is_volatile_typedef(tv) || has_volatile_member_typedef(tv))
+					{ type->has_volatile = true; break; }
 		}
+		// has_volatile_member from parse_type_specifier (inline struct body or tag ref)
+		if (needs_memset && !type->has_volatile && type->has_volatile_member)
+			type->has_volatile = true;
 
 		// register VLA: address-taking is illegal, so memset is impossible,
 		// and VLAs cannot use = {0}. Reject rather than fail open.
@@ -3475,6 +3478,7 @@ static Token *try_zero_init_decl(Token *tok) {
 
 	// Braceless control body: wrap in braces (orelse expands to multiple stmts).
 	bool brace_wrap = ctrl_state.pending && ctrl_state.parens_just_closed;
+	if (brace_wrap) ctrl_reset();
 
 	// Emit attributes/noise between raw keywords before process_declarators.
 	// Deferred to here (not the probe block) so nothing is emitted if the
@@ -7280,14 +7284,32 @@ static void p1_full_depth_prescan(Token *tok) {
 				if (is_enum_kw(tok)) {
 					parse_enum_constants(brace, brace_depth);
 					p1_check_enum_body_defer_shadow(brace, CUR_SID(), p1d_cur_func);
-				} else if (struct_body_contains_vla(brace)) {
-					// Register struct/union tag as VLA so later
-					// "struct S s;" can detect the VLA member.
-					for (Token *t = tok_next(tok); t && t != brace; t = tok_next(t))
-						if (is_valid_varname(t)) {
-							TYPEDEF_ADD_IDX(typedef_add_vla_var(tok_loc(t), t->len, brace_depth), t);
-							break;
-						}
+				} else {
+					bool body_vla = struct_body_contains_vla(brace);
+					bool body_vol = struct_body_contains_volatile(brace);
+					if (body_vla || body_vol) {
+						// Register struct/union tag so later
+						// "struct S s;" can detect VLA/volatile members.
+						for (Token *t = tok_next(tok); t && t != brace; t = tok_next(t))
+							if (is_valid_varname(t)) {
+								if (body_vla && !body_vol) {
+									// VLA-only: existing TDK_VLA_VAR path
+									TYPEDEF_ADD_IDX(typedef_add_vla_var(tok_loc(t), t->len, brace_depth), t);
+								} else {
+									// Volatile (with or without VLA):
+									// TDK_STRUCT_TAG carries both flags
+									int pre = typedef_table.count;
+									typedef_add_entry(tok_loc(t), t->len, brace_depth, TDK_STRUCT_TAG, body_vla, false);
+									if (typedef_table.count > pre) {
+										TypedefEntry *te = &typedef_table.entries[typedef_table.count - 1];
+										te->token_index = tok_idx(t);
+										te->is_aggregate = true;
+										if (body_vol) te->has_volatile_member = true;
+									}
+								}
+								break;
+							}
+					}
 				}
 			}
 		}
@@ -7995,7 +8017,7 @@ static void p1_annotate_typedefs(void) {
 		TypedefEntry *e = typedef_lookup(t);
 		if (!e) continue;
 		tok_ann(t) |= P1_HAS_ENTRY;
-		if (!e->is_enum_const && !e->is_shadow && !e->is_vla_var)
+		if (!e->is_enum_const && !e->is_shadow && !e->is_vla_var && !e->is_struct_tag)
 			tok_ann(t) |= P1_IS_TYPEDEF;
 	}
 	p1_typedef_annotated = true;
@@ -8134,6 +8156,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					// Non-bare (control-flow/block action) already wraps in
 					// { if (!(...)) ... } which is a single compound statement.
 					bool brace_wrap = ctrl_state.pending && ctrl_state.parens_just_closed;
+					if (brace_wrap) ctrl_reset();
 
 					// Try bare-fallback path (handled by shared impl)
 					Token *next = emit_bare_orelse_impl(tok, NULL, true, brace_wrap);
@@ -8440,12 +8463,10 @@ PRISM_API void prism_thread_cleanup(void) {
 
 	tokenizer_teardown(true);
 
-	// Free heap-allocated hashmap buckets
-	free(typedef_table.name_map.buckets);
+	// Hashmap buckets are arena-allocated; arena_free in tokenizer_teardown
+	// releases them.  Just zero the structs.
 	memset(&typedef_table, 0, sizeof(typedef_table));
-	free(p1_shadow_map.buckets);
 	memset(&p1_shadow_map, 0, sizeof(p1_shadow_map));
-	free(p1_func_proto_map.buckets);
 	memset(&p1_func_proto_map, 0, sizeof(p1_func_proto_map));
 
 	// Reset all TLS statics so a subsequent prism_ctx_init() starts clean

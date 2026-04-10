@@ -642,8 +642,7 @@ static void *hashmap_get(HashMap *map, char *key, int keylen) {
 }
 
 static void hashmap_resize(HashMap *map, int newcap) {
-	HashMap new_map = {.buckets = calloc(newcap, sizeof(HashEntry)), .capacity = newcap};
-	if (!new_map.buckets) error("out of memory resizing hashmap");
+	HashMap new_map = {.buckets = arena_alloc(&ctx->main_arena, (size_t)newcap * sizeof(HashEntry)), .capacity = newcap};
 	int new_mask = newcap - 1;
 	for (int i = 0; i < map->capacity; i++) {
 		HashEntry *ent = &map->buckets[i];
@@ -658,14 +657,13 @@ static void hashmap_resize(HashMap *map, int newcap) {
 			new_map.used++;
 		}
 	}
-	free(map->buckets);
+	// Old buckets are abandoned on the arena — reclaimed at arena_reset.
 	*map = new_map;
 }
 
 static void hashmap_put(HashMap *map, char *key, int keylen, void *val) {
 	if (!map->buckets) {
-		map->buckets = calloc(64, sizeof(HashEntry));
-		if (!map->buckets) error("out of memory allocating hashmap");
+		map->buckets = arena_alloc(&ctx->main_arena, 64 * sizeof(HashEntry));
 		map->capacity = 64;
 	} else if ((unsigned long)map->used * 100 / (unsigned long)map->capacity >= 70) {
 		hashmap_resize(map, map->capacity * 2);
@@ -703,6 +701,13 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val) {
 static void hashmap_zero(HashMap *map) {
 	if (map->buckets) memset(map->buckets, 0, (size_t)map->capacity * sizeof(HashEntry));
 	map->used = 0;
+}
+
+// Reset a HashMap whose buckets were arena-allocated and are now dead
+// (e.g. after arena_reset).  Zeroes the entire struct so the next
+// hashmap_put re-allocates fresh buckets from the arena.
+static void hashmap_discard(HashMap *map) {
+	*map = (HashMap){0};
 }
 
 static char *intern_filename(const char *name) {
@@ -1873,7 +1878,6 @@ static Token *tokenize(File *file) {
 			} while (changed);
 			free(edges);
 			} // has_taint
-			free(func_map.buckets);
 		}
 	}
 
@@ -1998,7 +2002,6 @@ static Token *tokenize(File *file) {
 					s->tag |= TT_NORETURN_FN;
 			}
 		}
-		free(nr_map.buckets);
 	}
 
 	return first;
@@ -2118,6 +2121,7 @@ typedef struct {
 	bool has_static : 1;
 	bool has_auto : 1;	  // C23 'auto' type inference
 	bool has_constexpr : 1;   // C23 'constexpr'
+	bool has_volatile_member : 1; // Struct/union has volatile-qualified fields
 } TypeSpecResult;
 
 // Declarator parsing result
@@ -2139,7 +2143,8 @@ typedef enum {
 	TDK_TYPEDEF,
 	TDK_SHADOW,
 	TDK_ENUM_CONST,
-	TDK_VLA_VAR // VLA variable (not typedef, but actual VLA array variable)
+	TDK_VLA_VAR, // VLA variable (not typedef, but actual VLA array variable)
+	TDK_STRUCT_TAG // struct/union tag (for VLA/volatile member propagation)
 } TypedefKind;
 
 typedef struct {
@@ -2162,6 +2167,8 @@ typedef struct {
 	bool is_aggregate : 1;
 	bool is_func : 1;
 	bool is_param : 1;
+	bool has_volatile_member : 1;
+	bool is_struct_tag : 1; // struct/union tag (not a typedef name)
 } TypedefEntry; // 32 bytes — two entries per 64-byte cache line
 
 typedef struct {
@@ -2188,7 +2195,7 @@ enum {
 #define tok_ann(t) ((t)->ann)
 
 // Typedef query flags (single lookup, check multiple properties)
-enum { TDF_TYPEDEF = 1, TDF_VLA = 2, TDF_VOID = 4, TDF_ENUM_CONST = 8, TDF_CONST = 16, TDF_PTR = 32, TDF_ARRAY = 64, TDF_AGGREGATE = 128, TDF_FUNC = 256, TDF_PARAM = 512, TDF_VOLATILE = 1024 };
+enum { TDF_TYPEDEF = 1, TDF_VLA = 2, TDF_VOID = 4, TDF_ENUM_CONST = 8, TDF_CONST = 16, TDF_PTR = 32, TDF_ARRAY = 64, TDF_AGGREGATE = 128, TDF_FUNC = 256, TDF_PARAM = 512, TDF_VOLATILE = 1024, TDF_HAS_VOL_MEMBER = 2048 };
 
 #define FEAT(f) (ctx->features & (f))
 
@@ -2301,7 +2308,7 @@ static void typedef_table_reset(void) {
 	typedef_table.count = 0;
 	typedef_table.capacity = 0;
 	typedef_table.bloom = 0;
-	hashmap_zero(&typedef_table.name_map);
+	hashmap_discard(&typedef_table.name_map);
 }
 
 static int typedef_get_index(char *name, int len) {
@@ -2312,7 +2319,7 @@ static int typedef_get_index(char *name, int len) {
 static void
 typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool is_vla, bool is_void) {
 	// Skip duplicate re-definitions at the same scope (valid C11 §6.7/3).
-	if (kind == TDK_TYPEDEF || kind == TDK_ENUM_CONST) {
+	if (kind == TDK_TYPEDEF || kind == TDK_ENUM_CONST || kind == TDK_STRUCT_TAG) {
 		int existing = typedef_get_index(name, len);
 		if (existing >= 0) {
 			TypedefEntry *prev = &typedef_table.entries[existing];
@@ -2333,12 +2340,13 @@ typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool i
 	e->name = name;
 	e->len = len;
 	e->scope_depth = scope_depth;
-	e->is_vla = (kind == TDK_TYPEDEF || kind == TDK_VLA_VAR) ? is_vla : false;
+	e->is_vla = (kind == TDK_TYPEDEF || kind == TDK_VLA_VAR || kind == TDK_STRUCT_TAG) ? is_vla : false;
 	e->is_void = (kind == TDK_TYPEDEF) ? is_void : false;
 	e->is_const = false;
 	e->is_shadow = (kind == TDK_SHADOW || kind == TDK_ENUM_CONST);
 	e->is_enum_const = (kind == TDK_ENUM_CONST);
 	e->is_vla_var = (kind == TDK_VLA_VAR);
+	e->is_struct_tag = (kind == TDK_STRUCT_TAG);
 	e->is_param = false;
 	e->prev_index = typedef_get_index(name, len);
 	e->token_index = 0;
@@ -2372,12 +2380,16 @@ static inline int typedef_flags(Token *tok) {
 	if (!e) return 0;
 	if (e->is_enum_const) return TDF_ENUM_CONST;
 	if (e->is_shadow) return 0;
-	if (e->is_vla_var) return TDF_VLA | (e->is_param ? TDF_PARAM : 0);
+	if (e->is_vla_var) return TDF_VLA | (e->is_param ? TDF_PARAM : 0) |
+	       (e->has_volatile_member ? TDF_HAS_VOL_MEMBER : 0);
+	if (e->is_struct_tag) return (e->is_vla ? TDF_VLA : 0) |
+	       (e->has_volatile_member ? TDF_HAS_VOL_MEMBER : 0) |
+	       (e->is_aggregate ? TDF_AGGREGATE : 0);
 	return TDF_TYPEDEF | (e->is_vla ? TDF_VLA : 0) | (e->is_void ? TDF_VOID : 0) |
 	       (e->is_const ? TDF_CONST : 0) | (e->is_volatile ? TDF_VOLATILE : 0) |
 	       (e->is_ptr ? TDF_PTR : 0) |
 	       (e->is_array ? TDF_ARRAY : 0) | (e->is_aggregate ? TDF_AGGREGATE : 0) |
-	       (e->is_func ? TDF_FUNC : 0);
+	       (e->is_func ? TDF_FUNC : 0) | (e->has_volatile_member ? TDF_HAS_VOL_MEMBER : 0);
 }
 
 // After Pass 1 annotation, is_known_typedef becomes O(1) bit check.
@@ -2394,6 +2406,7 @@ static inline bool _is_known_typedef(Token *tok) {
 #define is_array_typedef(tok) (typedef_flags(tok) & TDF_ARRAY)
 #define is_func_typedef(tok) (typedef_flags(tok) & TDF_FUNC)
 #define is_volatile_typedef(tok) (typedef_flags(tok) & TDF_VOLATILE)
+#define has_volatile_member_typedef(tok) (typedef_flags(tok) & TDF_HAS_VOL_MEMBER)
 
 // --- Type/Variable Classification ---
 
@@ -2693,6 +2706,26 @@ static bool struct_body_contains_vla(Token *brace) {
 	return false;
 }
 
+// Scan a struct/union body for volatile-qualified fields, including nested
+// struct bodies and fields whose typedef carries TDF_VOLATILE or
+// TDF_HAS_VOL_MEMBER.  Used to propagate has_volatile_member to typedef
+// entries and to set has_volatile in parse_type_specifier so that memset
+// is replaced with a volatile-safe byte loop (memset strips volatile → UB).
+static bool struct_body_contains_volatile(Token *brace) {
+	if (!brace || !(brace->len == 1 && brace->ch0 == '{') || !tok_match(brace)) return false;
+	Token *end = tok_match(brace);
+	for (Token *t = tok_next(brace); t && t != end; t = tok_next(t)) {
+		if (t->len == 1 && t->ch0 == '{') {
+			if (struct_body_contains_volatile(t)) return true;
+			t = tok_match(t); continue;
+		}
+		if ((t->flags & TF_OPEN) && !(t->len == 1 && t->ch0 == '{')) { t = tok_match(t); continue; }
+		if (t->tag & TT_VOLATILE) return true;
+		if (is_identifier_like(t) && (is_volatile_typedef(t) || has_volatile_member_typedef(t))) return true;
+	}
+	return false;
+}
+
 static bool typedef_contains_vla(Token *tok) {
 	while (tok && tok->kind != TK_EOF) {
 		if (tok->len == 1 && tok->ch0 == ';') break;
@@ -2891,8 +2924,12 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			}
 			if (tok && tok->len == 1 && tok->ch0 == '{') {
 				if (struct_body_contains_vla(tok)) r.is_vla = true;
+				if (struct_body_contains_volatile(tok)) r.has_volatile_member = true;
 				tok = skip_balanced_group(tok);
-			} else if (sue_tag && is_vla_typedef(sue_tag)) r.is_vla = true;
+			} else if (sue_tag) {
+				if (is_vla_typedef(sue_tag)) r.is_vla = true;
+				if (has_volatile_member_typedef(sue_tag)) r.has_volatile_member = true;
+			}
 			r.end = tok;
 			continue;
 		}
@@ -2913,6 +2950,11 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 						if ((t->tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE))
 							r.has_atomic = true;
 						if ((t->tag & TT_SUE) || (typedef_flags(t) & TDF_AGGREGATE)) r.is_struct = true;
+						if (is_identifier_like(t)) {
+							int tf = typedef_flags(t);
+							if (tf & TDF_VOLATILE) r.has_volatile = true;
+							if (tf & TDF_HAS_VOL_MEMBER) r.has_volatile_member = true;
+						}
 					}
 				scan_paren_for_vla(tok, end, &r, false);
 				tok = end;
@@ -2946,6 +2988,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			r.is_typedef = true;
 			if (tflags & TDF_VLA) r.is_vla = true;
 			if (tflags & TDF_AGGREGATE) r.is_struct = true;
+			if (tflags & TDF_HAS_VOL_MEMBER) r.has_volatile_member = true;
 			Token *peek = tok_next(tok);
 			while (peek && (peek->tag & TT_QUALIFIER)) peek = tok_next(peek);
 			if (peek && is_valid_varname(peek)) {
@@ -2989,6 +3032,12 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 			if (is_volatile_typedef(t)) { base_is_volatile = true; break; }
 	}
 
+	bool base_has_volatile_member = type_spec.has_volatile_member;
+	if (!base_has_volatile_member) {
+		for (Token *t = type_start; t && t != tok; t = tok_next(t))
+			if (has_volatile_member_typedef(t)) { base_has_volatile_member = true; break; }
+	}
+
 	bool base_is_void = type_spec.has_void;
 	bool base_is_ptr = false;
 	bool base_is_array = false;
@@ -2997,6 +3046,31 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 		if (is_ptr_typedef(bt)) { base_is_ptr = true; break; }
 		if (is_array_typedef(bt)) { base_is_array = true; break; }
 		if (is_func_typedef(bt)) { base_is_func = true; break; }
+	}
+
+	// Register struct/union tag as typedef entry for VLA/volatile propagation.
+	// e.g. typedef struct Foo { volatile int x; } Foo_t;
+	// This registers "Foo" so that later "struct Foo buf[n];" can look up
+	// volatile member info via has_volatile_member_typedef(sue_tag).
+	if (type_spec.is_struct && (is_vla || base_has_volatile_member)) {
+		for (Token *bt = type_start; bt && bt != type_spec.end; bt = tok_next(bt)) {
+			if (bt->tag & TT_SUE) {
+				Token *tag = skip_noise(tok_next(bt));
+				// Skip qualifiers after struct/union keyword
+				while (tag && (tag->tag & TT_QUALIFIER)) tag = skip_noise(tok_next(tag));
+				if (tag && is_valid_varname(tag) && !is_known_typedef(tag)) {
+					int pre = typedef_table.count;
+					typedef_add_entry(tok_loc(tag), tag->len, scope_depth, TDK_STRUCT_TAG, is_vla, false);
+					if (typedef_table.count > pre) {
+						TypedefEntry *te = &typedef_table.entries[typedef_table.count - 1];
+						te->token_index = tok_idx(tag);
+						te->is_aggregate = !type_spec.is_enum;
+						if (base_has_volatile_member) te->has_volatile_member = true;
+					}
+				}
+				break;
+			}
+		}
 	}
 
 	while (tok && !(tok->len == 1 && tok->ch0 == ';') && tok->kind != TK_EOF) {
@@ -3017,6 +3091,8 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 				bool is_vol = (decl.is_pointer || decl.is_func_ptr)
 				    ? false : base_is_volatile;
 				if (is_vol) added->is_volatile = true;
+				if (base_has_volatile_member && !decl.is_pointer && !decl.is_func_ptr)
+					added->has_volatile_member = true;
 				if (is_ptr) added->is_ptr = true;
 				if ((decl.is_array || base_is_array) && !decl.is_pointer && !decl.is_func_ptr)
 					added->is_array = true;
