@@ -1573,6 +1573,7 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 				emit_tok(tok); tok = tok_next(tok);
 				ctx->at_stmt_start = true;
 				dr_braceless_body = false;
+				if (ctrl_state.pending) ctrl_reset();
 			} else {
 				tok = handle_open_brace(tok);
 			}
@@ -1733,8 +1734,8 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 		if (mode != EMIT_DEFER_BODY)
 			track_generic_token(tok);
 
-		// typeof + orelse and bracket orelse (EMIT_NORMAL only)
-		if (mode != EMIT_DEFER_BODY && __builtin_expect(FEAT(F_ORELSE), 0)) {
+		// typeof + orelse and bracket orelse
+		if (__builtin_expect(FEAT(F_ORELSE), 0)) {
 			Token *next = try_typeof_orelse(tok);
 			if (next) { tok = next; continue; }
 			next = try_bracket_orelse(tok);

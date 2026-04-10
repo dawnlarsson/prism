@@ -2769,6 +2769,126 @@ static void spec_bracket_orelse_asm(void) {
 	}
 }
 
+// ── defer body ctrl_state consumption ──
+static void spec_defer_body_ctrl_state(void) {
+	printf("\n--- defer body ctrl_state ---\n");
+
+	// Declaration inside braced if in defer body must NOT get brace_wrap
+	{
+		PrismResult r = prism_transpile_source(
+		    "void use(int);\n"
+		    "void test(int cond) {\n"
+		    "    defer {\n"
+		    "        if (cond) {\n"
+		    "            int x;\n"
+		    "            use(x);\n"
+		    "        }\n"
+		    "    }\n"
+		    "}\n",
+		    "spec_dcs1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "defer ctrl_state braced if: accepted");
+		if (r.output) {
+			// Must not have double braces around "int x"
+			CHECK(strstr(r.output, "{ { int") == NULL &&
+			      strstr(r.output, "{ {\nint") == NULL,
+			      "defer ctrl_state braced if: no spurious brace_wrap");
+		}
+		prism_free(&r);
+	}
+
+	// Declaration inside braced else in defer body
+	{
+		PrismResult r = prism_transpile_source(
+		    "void use(int);\n"
+		    "void test(int cond) {\n"
+		    "    defer {\n"
+		    "        if (cond) use(1); else {\n"
+		    "            int y;\n"
+		    "            use(y);\n"
+		    "        }\n"
+		    "    }\n"
+		    "}\n",
+		    "spec_dcs2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "defer ctrl_state braced else: accepted");
+		prism_free(&r);
+	}
+
+	// Declaration inside braced while in defer body
+	{
+		PrismResult r = prism_transpile_source(
+		    "void use(int);\n"
+		    "void test(int n) {\n"
+		    "    defer {\n"
+		    "        while (n > 0) {\n"
+		    "            int x;\n"
+		    "            use(x);\n"
+		    "            n--;\n"
+		    "        }\n"
+		    "    }\n"
+		    "}\n",
+		    "spec_dcs3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "defer ctrl_state braced while: accepted");
+		prism_free(&r);
+	}
+}
+
+// ── typeof/bracket orelse in defer bodies ──
+static void spec_defer_body_orelse_transform(void) {
+	printf("\n--- defer body orelse transform ---\n");
+
+	// bracket orelse in compound literal inside defer body
+	{
+		PrismResult r = prism_transpile_source(
+		    "void use_arr(int *, int);\n"
+		    "void test(int n) {\n"
+		    "    defer {\n"
+		    "        use_arr((int[n orelse 1]){0}, n);\n"
+		    "    }\n"
+		    "}\n",
+		    "spec_dbo1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "bracket orelse compound literal in defer: accepted");
+		if (r.output)
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "bracket orelse compound literal in defer: no orelse leak");
+		prism_free(&r);
+	}
+
+	// typeof orelse in sizeof inside defer body
+	{
+		PrismResult r = prism_transpile_source(
+		    "void use_val(int);\n"
+		    "void test(int n) {\n"
+		    "    defer {\n"
+		    "        use_val(sizeof(typeof(int[n orelse 1])));\n"
+		    "    }\n"
+		    "}\n",
+		    "spec_dbo2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typeof orelse sizeof in defer: accepted");
+		if (r.output)
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "typeof orelse sizeof in defer: no orelse leak");
+		prism_free(&r);
+	}
+
+	// bracket orelse in declaration inside defer body (always worked)
+	{
+		PrismResult r = prism_transpile_source(
+		    "void use(int *);\n"
+		    "void test(int n) {\n"
+		    "    defer {\n"
+		    "        int arr[n orelse 1];\n"
+		    "        use(arr);\n"
+		    "    }\n"
+		    "}\n",
+		    "spec_dbo3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "bracket orelse decl in defer: accepted");
+		if (r.output)
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "bracket orelse decl in defer: no orelse leak");
+		prism_free(&r);
+	}
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Runner
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2898,4 +3018,8 @@ void run_spec_tests(void) {
 	spec_const_vla_memset_phase1();
 	spec_register_vla_phase1();
 	spec_bracket_orelse_asm();
+
+	// ── defer body emission ──
+	spec_defer_body_ctrl_state();
+	spec_defer_body_orelse_transform();
 }
