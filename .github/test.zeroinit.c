@@ -3420,6 +3420,106 @@ static void test_volatile_member_memset(void) {
 		}
 		prism_free(&r);
 	}
+
+	/* 9. Namespace collision: ordinary variable shadows struct tag name.
+	 * ISO C11 §6.2.3: tags and ordinary identifiers are separate namespaces.
+	 * A local variable named MMIO must NOT hide struct MMIO's volatile fields. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct MMIO { volatile int status; int data; };\n"
+		    "void f(int n) {\n"
+		    "    int MMIO = 1;\n"
+		    "    struct MMIO buffer[n];\n"
+		    "    (void)MMIO; (void)buffer;\n"
+		    "}\n",
+		    "vol_ns.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "vol namespace shadow: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "__prism_p_") != NULL,
+			      "vol namespace shadow: byte loop (not memset)");
+			CHECK(strstr(r.output, "__builtin_memset") == NULL,
+			      "vol namespace shadow: no memset");
+		}
+		prism_free(&r);
+	}
+
+	/* 10. Same for VLA struct — ordinary variable must not hide tag VLA info */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    struct S { int arr[n]; };\n"
+		    "    int S = 42;\n"
+		    "    struct S val;\n"
+		    "    (void)S; (void)val;\n"
+		    "}\n",
+		    "vla_ns.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "VLA namespace shadow: transpiles");
+		if (r.output) {
+			/* VLA struct must get memset (or byte loop), not = {0} */
+			CHECK(strstr(r.output, "= {0}") == NULL,
+			      "VLA namespace shadow: no = {0} (VLA needs memset)");
+		}
+		prism_free(&r);
+	}
+}
+
+/* typeof()/_Atomic() inside struct bodies hide qualifiers/VLAs inside parens.
+ * The struct body scanners must not skip these paren groups. */
+static void test_typeof_atomic_paren_struct_scan(void) {
+	printf("\n--- typeof/_Atomic paren-skipping in struct body ---\n");
+
+	/* typeof(volatile int) field — volatile hidden inside parens */
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct MMIO { typeof(volatile int) status; };\n"
+		    "void f(int n) {\n"
+		    "    struct MMIO buffer[n];\n"
+		    "    (void)buffer;\n"
+		    "}\n",
+		    "typeof_vol_paren.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typeof(volatile) paren: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "__prism_p_") != NULL,
+			      "typeof(volatile) paren: byte loop (not memset)");
+			CHECK(strstr(r.output, "__builtin_memset") == NULL,
+			      "typeof(volatile) paren: no memset");
+		}
+		prism_free(&r);
+	}
+
+	/* typeof(int[n]) field — VLA hidden inside parens */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    struct Pkt { typeof(int[n]) payload; };\n"
+		    "    struct Pkt queue[10];\n"
+		    "    (void)queue;\n"
+		    "}\n",
+		    "typeof_vla_paren.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typeof(VLA) paren: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "= {0}") == NULL,
+			      "typeof(VLA) paren: no = {0} (VLA struct)");
+		}
+		prism_free(&r);
+	}
+
+	/* _Atomic(volatile int) field */
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct AtomReg { _Atomic(volatile int) val; };\n"
+		    "void f(int n) {\n"
+		    "    struct AtomReg regs[n];\n"
+		    "    (void)regs;\n"
+		    "}\n",
+		    "atomic_vol_paren.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "Atomic(volatile) paren: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "__prism_p_") != NULL,
+			      "Atomic(volatile) paren: byte loop (not memset)");
+		}
+		prism_free(&r);
+	}
 }
 
 void run_zeroinit_tests(void) {
@@ -3585,4 +3685,7 @@ void run_zeroinit_tests(void) {
 
 	// volatile member detection (memset on volatile fields is UB)
 	test_volatile_member_memset();
+
+	// typeof()/_Atomic() paren-skipping in struct body scanners
+	GNUC_ONLY(test_typeof_atomic_paren_struct_scan());
 }

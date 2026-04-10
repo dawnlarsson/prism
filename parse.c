@@ -2375,6 +2375,25 @@ static TypedefEntry *typedef_lookup(Token *tok) {
 	return NULL;
 }
 
+// Lookup a struct/union tag entry, skipping ordinary identifiers/shadows.
+// Enforces ISO C11 §6.2.3 namespace separation: tag names live in a
+// different namespace from ordinary identifiers.
+static TypedefEntry *tag_lookup(Token *tok) {
+	if (!is_identifier_like(tok)) return NULL;
+	unsigned c0 = tok->ch0, tl = tok->len;
+	if (!(typedef_table.bloom & (1ULL << ((c0 ^ tl) & 63)))) return NULL;
+	int idx = typedef_get_index(tok_loc(tok), tok->len);
+	uint32_t cur = tok_idx(tok);
+	while (idx >= 0) {
+		TypedefEntry *e = &typedef_table.entries[idx];
+		if (e->is_struct_tag && e->token_index <= cur &&
+		    cur >= e->scope_open_idx && cur < e->scope_close_idx)
+			return e;
+		idx = e->prev_index;
+	}
+	return NULL;
+}
+
 static inline int typedef_flags(Token *tok) {
 	TypedefEntry *e = typedef_lookup(tok);
 	if (!e) return 0;
@@ -2694,12 +2713,17 @@ static inline bool array_size_is_vla(Token *open_bracket) { return array_size_is
 static bool struct_body_contains_vla(Token *brace) {
 	if (!brace || !(brace->len == 1 && brace->ch0 == '{') || !tok_match(brace)) return false;
 	Token *end = tok_match(brace);
-	for (Token *t = tok_next(brace); t && t != end; t = tok_next(t)) {
+	Token *prev = brace;
+	for (Token *t = tok_next(brace); t && t != end; prev = t, t = tok_next(t)) {
 		if (t->len == 1 && t->ch0 == '{') {
 			if (struct_body_contains_vla(t)) return true;
-			t = tok_match(t); continue;
+			prev = t; t = tok_match(t); continue;
 		}
-		if ((t->flags & TF_OPEN) && !(t->len == 1 && t->ch0 == '[')) { t = tok_match(t); continue; }
+		// Don't skip typeof()/_Atomic() parens — VLA dims hide inside.
+		if ((t->flags & TF_OPEN) && !(t->len == 1 && t->ch0 == '[') &&
+		    !(prev && ((prev->tag & TT_TYPEOF) ||
+		              ((prev->tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE)))))
+			{ prev = t; t = tok_match(t); continue; }
 		if (t->len == 1 && t->ch0 == '[' && array_size_is_vla(t)) return true;
 		if (is_identifier_like(t) && is_vla_typedef(t)) return true;
 	}
@@ -2714,12 +2738,17 @@ static bool struct_body_contains_vla(Token *brace) {
 static bool struct_body_contains_volatile(Token *brace) {
 	if (!brace || !(brace->len == 1 && brace->ch0 == '{') || !tok_match(brace)) return false;
 	Token *end = tok_match(brace);
-	for (Token *t = tok_next(brace); t && t != end; t = tok_next(t)) {
+	Token *prev = brace;
+	for (Token *t = tok_next(brace); t && t != end; prev = t, t = tok_next(t)) {
 		if (t->len == 1 && t->ch0 == '{') {
 			if (struct_body_contains_volatile(t)) return true;
-			t = tok_match(t); continue;
+			prev = t; t = tok_match(t); continue;
 		}
-		if ((t->flags & TF_OPEN) && !(t->len == 1 && t->ch0 == '{')) { t = tok_match(t); continue; }
+		// Don't skip typeof()/_Atomic() parens — volatile hides inside.
+		if ((t->flags & TF_OPEN) && !(t->len == 1 && t->ch0 == '{') &&
+		    !(prev && ((prev->tag & TT_TYPEOF) ||
+		              ((prev->tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE)))))
+			{ prev = t; t = tok_match(t); continue; }
 		if (t->tag & TT_VOLATILE) return true;
 		if (is_identifier_like(t) && (is_volatile_typedef(t) || has_volatile_member_typedef(t))) return true;
 	}
@@ -2927,8 +2956,11 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 				if (struct_body_contains_volatile(tok)) r.has_volatile_member = true;
 				tok = skip_balanced_group(tok);
 			} else if (sue_tag) {
-				if (is_vla_typedef(sue_tag)) r.is_vla = true;
-				if (has_volatile_member_typedef(sue_tag)) r.has_volatile_member = true;
+				TypedefEntry *tag_e = tag_lookup(sue_tag);
+				if (tag_e) {
+					if (tag_e->is_vla) r.is_vla = true;
+					if (tag_e->has_volatile_member) r.has_volatile_member = true;
+				}
 			}
 			r.end = tok;
 			continue;
@@ -3051,7 +3083,7 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 	// Register struct/union tag as typedef entry for VLA/volatile propagation.
 	// e.g. typedef struct Foo { volatile int x; } Foo_t;
 	// This registers "Foo" so that later "struct Foo buf[n];" can look up
-	// volatile member info via has_volatile_member_typedef(sue_tag).
+	// volatile member info via tag_lookup(sue_tag).
 	if (type_spec.is_struct && (is_vla || base_has_volatile_member)) {
 		for (Token *bt = type_start; bt && bt != type_spec.end; bt = tok_next(bt)) {
 			if (bt->tag & TT_SUE) {

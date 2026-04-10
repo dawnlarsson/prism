@@ -7290,22 +7290,17 @@ static void p1_full_depth_prescan(Token *tok) {
 					if (body_vla || body_vol) {
 						// Register struct/union tag so later
 						// "struct S s;" can detect VLA/volatile members.
+						// Always use TDK_STRUCT_TAG so tag_lookup() finds
+						// the entry (namespace-safe vs ordinary idents).
 						for (Token *t = tok_next(tok); t && t != brace; t = tok_next(t))
 							if (is_valid_varname(t)) {
-								if (body_vla && !body_vol) {
-									// VLA-only: existing TDK_VLA_VAR path
-									TYPEDEF_ADD_IDX(typedef_add_vla_var(tok_loc(t), t->len, brace_depth), t);
-								} else {
-									// Volatile (with or without VLA):
-									// TDK_STRUCT_TAG carries both flags
-									int pre = typedef_table.count;
-									typedef_add_entry(tok_loc(t), t->len, brace_depth, TDK_STRUCT_TAG, body_vla, false);
-									if (typedef_table.count > pre) {
-										TypedefEntry *te = &typedef_table.entries[typedef_table.count - 1];
-										te->token_index = tok_idx(t);
-										te->is_aggregate = true;
-										if (body_vol) te->has_volatile_member = true;
-									}
+								int pre = typedef_table.count;
+								typedef_add_entry(tok_loc(t), t->len, brace_depth, TDK_STRUCT_TAG, body_vla, false);
+								if (typedef_table.count > pre) {
+									TypedefEntry *te = &typedef_table.entries[typedef_table.count - 1];
+									te->token_index = tok_idx(t);
+									te->is_aggregate = true;
+									if (body_vol) te->has_volatile_member = true;
 								}
 								break;
 							}
