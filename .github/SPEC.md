@@ -731,7 +731,7 @@ In `PRISM_LIB_MODE`, `error_tok` triggers `longjmp(ctx->error_jmp)` instead of `
 | Pointer depth in declarator | 1,024 | Warning (zero-init skipped, not a hard error) |
 | Parenthesization depth in declarator | 1,024 | Warning (declarator parse bails out) |
 
-These limits are enforced with hard errors. Exceeding any limit halts transpilation.
+These limits are enforced with hard errors. Exceeding any limit halts transpilation. The pointer depth and parenthesization depth limits produce warnings and skip zero-initialization rather than halting.
 
 ## 8. CLI Modes
 
@@ -1029,7 +1029,7 @@ The token `orelse` is a keyword. It introduces a conditional fallback that execu
 
 2. An `orelse` shall not appear at file scope (outside any function body).
 
-3. An `orelse` shall not appear in the initializer of a variable with `static`, `extern`, `_Thread_local`, or `thread_local` storage duration. The orelse transformation produces runtime code; re-executing it on each function entry would violate C's static persistence guarantees (ISO C11 §6.7.9¶4).
+3. An `orelse` shall not appear in the initializer of a variable with `static`, `extern`, `_Thread_local`, or `thread_local` storage duration. The orelse transformation produces runtime code; re-executing it on each function entry would violate C's static persistence guarantees (ISO C11 §6.7.9¶4). An `orelse` shall also not appear in the initializer of a `constexpr` variable, which requires a compile-time constant initializer (ISO C23 §6.7.1).
 
 4. An `orelse` shall not appear inside an `enum` body. Enum values require integer constant expressions.
 

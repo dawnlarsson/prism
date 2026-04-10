@@ -645,12 +645,14 @@ static void spec_orelse_S7_chained(void) {
 // ── Semantic 8: volatile safety (single write) ───────────────────────
 static void spec_orelse_S8_volatile(void) {
 	// Transpile-output check: must use if/else, not ternary
+	// Hoist function call to avoid RHS call rejection with LHS indirection.
 	const char *code =
 	    "volatile int *get_hw(void);\n"
 	    "int get_val(void);\n"
 	    "void f(void) {\n"
 	    "    volatile int *reg = get_hw();\n"
-	    "    *reg = get_val() orelse 0xFF;\n"
+	    "    int tmp = get_val();\n"
+	    "    *reg = tmp orelse 0xFF;\n"
 	    "}\n";
 	PrismResult r = prism_transpile_source(code, "spec_os8.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK, "spec orelse S8: transpiles OK");
@@ -670,6 +672,7 @@ static void spec_orelse_S8_volatile(void) {
 // to the target type via simple assignment (ISO C §6.5.16.1).
 static void spec_orelse_RT1_independent_conversion(void) {
 	// Transpiled output test: no ternary on temp
+	// Hoist function call to avoid RHS call rejection with LHS indirection.
 	{
 		const char *code =
 		    "long long *get_target(void);\n"
@@ -677,7 +680,8 @@ static void spec_orelse_RT1_independent_conversion(void) {
 		    "void f(void) {\n"
 		    "    long long *target = get_target();\n"
 		    "    unsigned int fb = 1;\n"
-		    "    target[0] = get_value() orelse fb;\n"
+		    "    int tmp = get_value();\n"
+		    "    target[0] = tmp orelse fb;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "spec_rt1a.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK, "spec orelse RT1: transpiles OK");
@@ -2624,6 +2628,147 @@ static void spec_func_type_composition(void) {
 	}
 }
 
+// ── Two-pass invariant: constexpr + orelse (Phase 1D primary) ─────────
+static void spec_constexpr_orelse_phase1(void) {
+	printf("\n--- constexpr+orelse Phase 1D ---\n");
+
+	// Must reject constexpr + orelse (Phase 1D, not Pass 2)
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get(void);\n"
+		    "void f(void) {\n"
+		    "    constexpr int x = get() orelse 5;\n"
+		    "    (void)x;\n"
+		    "}\n",
+		    "spec_ce1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "constexpr orelse: rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "constexpr") != NULL,
+			      "constexpr orelse: error mentions constexpr");
+		prism_free(&r);
+	}
+
+	// Plain constexpr without orelse must pass
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    constexpr int x = 42;\n"
+		    "    (void)x;\n"
+		    "}\n",
+		    "spec_ce2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "constexpr without orelse: accepted");
+		prism_free(&r);
+	}
+}
+
+// ── Two-pass invariant: const VLA memset (Phase 1D primary) ───────────
+static void spec_const_vla_memset_phase1(void) {
+	printf("\n--- const VLA memset Phase 1D ---\n");
+
+	// const typeof(int[n]) must reject
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) { const typeof(int[n]) buf; (void)buf; }\n",
+		    "spec_cv1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "const typeof VLA: rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "const") != NULL,
+			      "const typeof VLA: error mentions const");
+		prism_free(&r);
+	}
+
+	// raw const typeof VLA must pass (raw opts out)
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) { raw const typeof(int[n]) buf; (void)buf; }\n",
+		    "spec_cv2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "raw const typeof VLA: accepted");
+		prism_free(&r);
+	}
+}
+
+// ── Two-pass invariant: register VLA (Phase 1D primary) ───────────────
+static void spec_register_vla_phase1(void) {
+	printf("\n--- register VLA Phase 1D ---\n");
+
+	// register int buf[n] must reject
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) { register int buf[n]; (void)buf; }\n",
+		    "spec_rv1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "register VLA: rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "register") != NULL,
+			      "register VLA: error mentions register");
+		prism_free(&r);
+	}
+
+	// raw register VLA must pass
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) { raw register int buf[n]; (void)buf; }\n",
+		    "spec_rv2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "raw register VLA: accepted");
+		prism_free(&r);
+	}
+}
+
+// ── Bracket orelse asm side-effect check (SPEC C7) ────────────────────
+static void spec_bracket_orelse_asm(void) {
+	printf("\n--- bracket orelse asm ---\n");
+
+	// Chained bracket orelse with asm in intermediate: must reject
+	// (intermediate operand evaluated twice in ternary expansion)
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    int arr[n orelse ({__asm__ volatile(\"nop\"); 3;}) orelse 5];\n"
+		    "    (void)arr;\n"
+		    "}\n",
+		    "spec_ba1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "bracket orelse asm chained: rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "asm") != NULL,
+			      "bracket orelse asm chained: error mentions asm");
+		prism_free(&r);
+	}
+
+	// typeof orelse with asm in LHS: must reject
+	// (typeof ternary evaluates LHS twice)
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get_n(void);\n"
+		    "void f(void) {\n"
+		    "    typeof(({__asm__ volatile(\"nop\"); get_n();}) orelse 5) x;\n"
+		    "    (void)x;\n"
+		    "}\n",
+		    "spec_ba2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "typeof orelse asm: rejected");
+		prism_free(&r);
+	}
+
+	// Single bracket orelse without asm: must pass
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    int arr[n orelse 5];\n"
+		    "    (void)arr;\n"
+		    "}\n",
+		    "spec_ba3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "bracket orelse no asm: accepted");
+		prism_free(&r);
+	}
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Runner
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2747,4 +2892,10 @@ void run_spec_tests(void) {
 
 	// ── function type composition ──
 	spec_func_type_composition();
+
+	// ── two-pass invariant regression ──
+	spec_constexpr_orelse_phase1();
+	spec_const_vla_memset_phase1();
+	spec_register_vla_phase1();
+	spec_bracket_orelse_asm();
 }

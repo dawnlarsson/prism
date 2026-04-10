@@ -1,4 +1,4 @@
-#define PRISM_VERSION "1.0.6"
+#define PRISM_VERSION "1.0.7"
 
 #ifndef _WIN32
 #ifndef _GNU_SOURCE
@@ -1007,7 +1007,7 @@ static inline bool has_defers_for(DeferEmitMode mode, int stop_depth) {
 // Returns true if `name` (length nlen) is referenced (not locally declared) in [body, body_end).
 static bool defer_body_refs_name(Token *body, Token *body_end, const char *name, int nlen) {
 	Token *prev = NULL;
-	int bd = 0, pd = 0, se = 0, se_brace[8];
+	int bd = 0, pd = 0, se = 0, se_brace[32];
 	int decl_depth = -1;
 	bool in_decl = false, was_in_decl = false;
 	int decl_bd = 0, for_init_pd = -1;
@@ -1019,7 +1019,7 @@ static bool defer_body_refs_name(Token *body, Token *body_end, const char *name,
 		if (for_name_hid && for_body_end_idx && tok_idx(t) > for_body_end_idx)
 			for_name_hid = false;
 		if (match_ch(t, '{')) {
-			if (prev && match_ch(prev, '(') && se < 8) se_brace[se++] = bd;
+			if (prev && match_ch(prev, '(') && se < 32) se_brace[se++] = bd;
 			bd++; continue;
 		}
 		if (match_ch(t, '}')) {
@@ -1939,7 +1939,7 @@ static void emit_token_range_orelse(Token *start, Token *end) {
 				  "'orelse' in array dimension / typeof",
 				  "in a chained 'orelse' (would be evaluated twice); "
 				  "hoist the expression to a variable first",
-				  false, true, false);
+				  true, true, false);
 	OUT_LIT("(");
 	emit_token_range_orelse(start, orelse);
 	OUT_LIT(") ? (");
@@ -2203,7 +2203,7 @@ static Token *walk_balanced_orelse(Token *tok) {
 					             : "'orelse' in typeof",
 					  "in the LHS (would be evaluated twice); "
 					  "hoist the expression to a variable first",
-					  false, is_bracket, false);
+					  true, is_bracket, false);
 		// Simple ternary: (LHS) ? (LHS) : (RHS).
 		// reject_orelse_side_effects above already rejects function calls,
 		// ++/--, assignments, asm, and pointer dereferences, so the double
@@ -5147,9 +5147,10 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 			// simple variable, typeof(LHS) is always safe (no side
 			// effects).  When LHS has indirection (*, [], ., ->), the
 			// result type may be VM (e.g. ptr-to-VLA subscript yields
-			// VLA), so we use typeof(RHS) instead.  Function return
-			// types are never VM (C11 §6.7.6.3p1), so typeof(RHS)
-			// never evaluates for the common f() orelse pattern.
+			// VLA), so we use typeof(RHS) instead — but typeof(RHS)
+			// also evaluates when the return type is VM (a function
+			// can return a pointer to a VLA).  We reject ALL side
+			// effects unconditionally.
 			// typeof(bitfield) is also a constraint violation
 			// (C23 §6.7.2.5p2), covered by the . / -> check.
 			//
@@ -5164,36 +5165,18 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 				// typeof(EXPR) evaluates its operand when the result
 				// type is variably modified (C11 §6.7.2.4p2).  We
 				// cannot determine VM-ness at the token level, so
-				// reject ALL side effects — UNLESS the entire RHS is
-				// a strictly bare function call (return types are
-				// never VM per C11 §6.7.6.3p1).  No cast-skipping:
-				// a cast can introduce a VM type (e.g. (int(*)[n])).
+				// reject ALL side effects unconditionally — including
+				// bare function calls (a function can return a pointer
+				// to a VLA, which is a VM type).
 				// Phase 1D is the primary check; this is defense-in-depth.
 				{
 					Token *rhs_s = tok_next(bare_assign_eq);
-					bool rhs_bare_call = false;
-					if (rhs_s && rhs_s != orelse_tok) {
-						Token *s = rhs_s;
-						if (s && s != orelse_tok) {
-							Token *an = tok_next(s);
-							if (an && match_ch(an, '(') && (an->flags & TF_OPEN) && tok_match(an) &&
-							    tok_next(tok_match(an)) == orelse_tok)
-								rhs_bare_call = true;
-							if (!rhs_bare_call && match_ch(s, '(') && (s->flags & TF_OPEN) && tok_match(s)) {
-								Token *cp = tok_match(s), *acp = cp ? tok_next(cp) : NULL;
-								if (acp && match_ch(acp, '(') && (acp->flags & TF_OPEN) && tok_match(acp) &&
-								    tok_next(tok_match(acp)) == orelse_tok)
-									rhs_bare_call = true;
-							}
-						}
-					}
-					if (!rhs_bare_call)
-						reject_orelse_side_effects(
-							rhs_s, orelse_tok,
-							"bare orelse with indirection in LHS",
-							"in the RHS (typeof(RHS) may evaluate for VM types "
-							"per C11 6.7.2.4p2; hoist to a variable)",
-							false, false, true);
+					reject_orelse_side_effects(
+						rhs_s, orelse_tok,
+						"bare orelse with indirection in LHS",
+						"in the RHS (typeof(RHS) may evaluate for VM types "
+						"per C11 6.7.2.4p2; hoist to a variable)",
+						false, false, true);
 					// Also check control-flow keywords in stmt-exprs
 					// (Prism state-machine corruption, separate from VM)
 					for (Token *ck = rhs_s; ck && ck != orelse_tok && ck->kind != TK_EOF; ck = tok_next(ck))
@@ -6014,7 +5997,7 @@ p1d_classify_bracket_orelse(Token *tok, uint16_t cur_sid, int p1d_cur_func) {
 					"in a chained 'orelse' (would be "
 					"evaluated twice); hoist the "
 					"expression to a variable first",
-					false, true, false);
+					true, true, false);
 			if (oe_depth == 0) prev_d0_oe = s;
 			tok_ann(s) |= P1_OE_BRACKET;
 			found_oe = true;
@@ -6121,8 +6104,8 @@ p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
 	// effects (++, --, function calls) inside the RHS fire twice when
 	// the RHS expression type is VM.  Since we cannot determine VM-ness
 	// at the token level, we conservatively reject ALL side effects in
-	// the RHS.  Exception: a bare top-level function call f(...) is safe
-	// because function return types are never VM (C11 §6.7.6.3p1).
+	// the RHS — including bare function calls (a function can return a
+	// pointer to a VLA, which is a VM type).
 	if (has_eq && eq_tok && is_orelse_value_fallback(after_oe)) {
 		bool lhs_indir = false;
 		for (Token *s = scan_start; s != eq_tok; s = tok_next(s))
@@ -6130,47 +6113,15 @@ p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
 			    (match_ch(s, '[') && (s->flags & TF_OPEN)))
 				{ lhs_indir = true; break; }
 		if (lhs_indir) {
-			// Check if the RHS is a single top-level function call.
-			// Only strict bare calls: ident(...) or (expr)(...).
-			// A cast before the call (e.g. (int(*)[n])f()) can
-			// introduce a VM type, making typeof() evaluate the
-			// operand — no cast-skipping allowed.
 			Token *rhs_start = tok_next(eq_tok);
-			bool rhs_is_bare_call = false;
-			if (rhs_start && rhs_start != bare_oe) {
-				Token *s = rhs_start;
-				if (s && s != bare_oe) {
-					Token *after_name = tok_next(s);
-					// ident( pattern
-					if (after_name && match_ch(after_name, '(') &&
-					    (after_name->flags & TF_OPEN) && tok_match(after_name)) {
-						Token *close = tok_match(after_name);
-						if (close && tok_next(close) == bare_oe)
-							rhs_is_bare_call = true;
-					}
-					// (expr)( pattern — parenthesized function
-					if (!rhs_is_bare_call && match_ch(s, '(') &&
-					    (s->flags & TF_OPEN) && tok_match(s)) {
-						Token *cp = tok_match(s);
-						Token *after_cp = cp ? tok_next(cp) : NULL;
-						if (after_cp && match_ch(after_cp, '(') &&
-						    (after_cp->flags & TF_OPEN) && tok_match(after_cp)) {
-							Token *close2 = tok_match(after_cp);
-							if (close2 && tok_next(close2) == bare_oe)
-								rhs_is_bare_call = true;
-						}
-					}
-				}
-			}
-			if (!rhs_is_bare_call)
-				reject_orelse_side_effects(
-					rhs_start, bare_oe,
-					"bare orelse with indirection in LHS",
-					"in the RHS expression (typeof(RHS) evaluates its "
-					"operand for variably-modified types per C11 "
-					"\xc2\xa7" "6.7.2.4p2, causing double evaluation); "
-					"hoist to a variable first",
-					false, false, true);
+			reject_orelse_side_effects(
+				rhs_start, bare_oe,
+				"bare orelse with indirection in LHS",
+				"in the RHS expression (typeof(RHS) evaluates its "
+				"operand for variably-modified types per C11 "
+				"\xc2\xa7" "6.7.2.4p2, causing double evaluation); "
+				"hoist to a variable first",
+				false, false, true);
 		}
 	}
 
@@ -6298,6 +6249,11 @@ static void p1d_validate_decl_orelse(Token *var_name, Token *type_tok,
 			  "variable with static or thread storage duration "
 			  "(the runtime fallback check would re-execute on "
 			  "every function entry, destroying persistence)");
+	if (type->has_constexpr)
+		error_tok(first_orelse,
+			  "'orelse' cannot be used with 'constexpr' "
+			  "(constexpr requires a compile-time constant "
+			  "initializer; orelse produces runtime fallback code)");
 	if (decl->is_array && !decl->paren_pointer)
 		error_tok(var_name,
 			  "orelse on array variable '%.*s' will never trigger "
@@ -6590,6 +6546,38 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 					  "'register _Atomic' aggregate cannot be safely "
 					  "zero-initialized; remove 'register' or use 'raw' "
 					  "to opt out of automatic initialization");
+		}
+
+		// Phase 1D: reject register VLA (can't use = {0} or memset)
+		{
+			bool eff_vla = (decl.is_vla && (!decl.paren_pointer || decl.paren_array)) ||
+				       (type.is_vla && !decl.is_pointer);
+			if (FEAT(F_ZEROINIT) && !has_init && !decl_raw && type.has_register && eff_vla)
+				error_tok(decl.var_name,
+					  "'register' VLA cannot be safely zero-initialized "
+					  "(address-taking is illegal for register, and VLAs "
+					  "cannot use initializer syntax); remove 'register' "
+					  "or use 'raw' to opt out of automatic initialization");
+
+			// Phase 1D: reject const VLA memset
+			if (FEAT(F_ZEROINIT) && !has_init && !decl_raw &&
+			    !(saw_static || type.has_static || type.has_extern) &&
+			    !type.has_register && eff_vla) {
+				bool excl = (type.has_const && !decl.is_func_ptr && !decl.is_pointer) || decl.is_const;
+				if (!excl && !decl.is_func_ptr && !decl.is_pointer) {
+					for (Token *tc = type_tok; tc && tc != type.end; tc = tok_next(tc))
+						if (is_const_typedef(tc)) { excl = true; break; }
+				}
+				bool would_memset = (!decl.is_pointer || decl.is_array) &&
+					(type.has_typeof || (type.has_atomic && ((decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
+					 ((type.is_struct || type.is_typedef) && !decl.is_pointer))) || type.is_vla || decl.is_vla);
+				if (excl && would_memset)
+					error_tok(decl.var_name,
+						  "'const' variable requiring typeof/VLA memset cannot be "
+						  "safely zero-initialized (modifying a const object is "
+						  "undefined behavior); remove 'const' or use 'raw' to "
+						  "opt out of automatic initialization");
+			}
 		}
 
 		if (has_init) {
@@ -6989,7 +6977,7 @@ static void p1_full_depth_prescan(Token *tok) {
 									"'orelse' in typeof",
 									"in the LHS (would be evaluated twice); "
 									"hoist the expression to a variable first",
-									false, true, false);
+									true, true, false);
 								break;
 							}
 						}

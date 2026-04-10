@@ -2115,42 +2115,39 @@ static void test_orelse_volatile_decl_double_read(void) {
  * Chained: { if (!(*ptr = get())) if (!(*ptr = (fb1))) *ptr = fb2; }
  */
 static void test_bare_orelse_ptr_deref_lhs_rereads_volatile(void) {
-	/* Simple pointer-deref case */
+	/* Simple pointer-deref case — hoist call to avoid RHS function call rejection */
 	const char *src =
 	    "unsigned int *hw_reg;\n"
 	    "unsigned int get_byte(void);\n"
 	    "void test(void) {\n"
-	    "    *hw_reg = get_byte() orelse 0xFF;\n"
+	    "    unsigned int tmp = get_byte();\n"
+	    "    *hw_reg = tmp orelse 0xFF;\n"
 	    "}\n";
 	PrismResult r = prism_transpile_source(src, "bare_orelse_ptr_deref.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK, "bare-orelse-ptr-deref: transpiles OK");
 	if (r.output) {
-		/* OLD (buggy): { *hw_reg = get_byte(); if (!*hw_reg) *hw_reg = (0xFF); }
-		 * NEW (correct): { if (!(*hw_reg = get_byte())) *hw_reg = (0xFF); }
-		 * Check: the LHS deref must NOT appear as a standalone read in an
-		 * if-condition (i.e. "if (!" followed directly by the target without =). */
 		bool has_standalone_reread = strstr(r.output, "if (!*hw_reg)") != NULL ||
 		                             strstr(r.output, "if (! *hw_reg)") != NULL ||
 		                             strstr(r.output, "if (!\n*hw_reg)") != NULL;
 		CHECK(!has_standalone_reread,
 		      "bare-orelse ptr-deref LHS: old pattern re-reads *hw_reg in "
 		      "if-condition after write (volatile MMIO hazard); "
-		      "expected if(!(*hw_reg=get_byte())) form");
+		      "expected if/else temp-based form");
 	}
 	prism_free(&r);
 
-	/* Chained orelse: *hw_reg = get() orelse backup() orelse 0xFF */
+	/* Chained orelse: hoist calls to variables */
 	const char *src2 =
 	    "unsigned int *hw_reg;\n"
 	    "unsigned int get_byte(void);\n"
 	    "unsigned int backup(void);\n"
 	    "void test2(void) {\n"
-	    "    *hw_reg = get_byte() orelse backup() orelse 0xFF;\n"
+	    "    unsigned int a = get_byte(), b = backup();\n"
+	    "    *hw_reg = a orelse b orelse 0xFF;\n"
 	    "}\n";
 	PrismResult r2 = prism_transpile_source(src2, "bare_orelse_ptr_deref_chain.c", prism_defaults());
 	CHECK_EQ(r2.status, PRISM_OK, "bare-orelse-ptr-deref-chain: transpiles OK");
 	if (r2.output) {
-		/* Chain must also not re-read the pointer in any if-condition. */
 		bool has_reread = strstr(r2.output, "if (!*hw_reg)") != NULL ||
 		                  strstr(r2.output, "if (! *hw_reg)") != NULL ||
 		                  strstr(r2.output, "if (!\n*hw_reg)") != NULL;
@@ -3933,16 +3930,12 @@ static void test_bare_orelse_volatile_double_write(void) {
 	    "volatile int *uart_tx;\n"
 	    "int get_byte(void);\n"
 	    "void test(void) {\n"
-	    "    *uart_tx = get_byte() orelse 0xFF;\n"
+	    "    int tmp = get_byte();\n"
+	    "    *uart_tx = tmp orelse 0xFF;\n"
 	    "}\n";
 	PrismResult r = prism_transpile_source(code, "volatile_double_write.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK, "volatile-double-write: transpile succeeds");
 	if (r.output) {
-		// The output must use if/else to guarantee exactly one write
-		// to *uart_tx at runtime.  Both branches contain an assignment
-		// but only one executes.  The old buggy pattern was
-		// if (!(*uart_tx = get_byte())) *uart_tx = (0xFF);  which
-		// writes unconditionally then conditionally (two writes).
 		CHECK(strstr(r.output, "if (__prism_oe_") != NULL,
 		      "volatile-double-write: must not write to volatile LHS more than "
 		      "once (MMIO double-write is a hardware-killing pattern)");
@@ -3965,12 +3958,12 @@ static void test_bare_orelse_volatile_compound_literal_nested(void) {
 	    "volatile int *uart_tx;\n"
 	    "int get_byte(void);\n"
 	    "void test(void) {\n"
-	    "    *uart_tx = get_byte() orelse log_error(&(Data){ .code = 1 });\n"
+	    "    int tmp = get_byte();\n"
+	    "    *uart_tx = tmp orelse log_error(&(Data){ .code = 1 });\n"
 	    "}\n";
 	PrismResult r = prism_transpile_source(code, "volatile_compound_nested.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK, "compound-literal-nested: transpile succeeds");
 	if (r.output) {
-		// Must use if/else (one write per branch, only one branch runs).
 		CHECK(strstr(r.output, "if (__prism_oe_") != NULL,
 		      "compound-literal-nested: must not write to volatile LHS more than "
 		      "once (nested compound literal must not trigger ternary fallback)");
@@ -6717,7 +6710,8 @@ static void test_orelse_bitfield_typeof(void) {
 	    "struct Flags { unsigned int status : 3; };\n"
 	    "void test(void) {\n"
 	    "    struct Flags f = {0};\n"
-	    "    f.status = get_status() orelse 7;\n"
+	    "    int tmp = get_status();\n"
+	    "    f.status = tmp orelse 7;\n"
 	    "}\n";
 	PrismResult r = prism_transpile_source(code, "orelse_bitfield.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK, "bit-field orelse transpiles OK");
@@ -6727,10 +6721,10 @@ static void test_orelse_bitfield_typeof(void) {
 		      strstr(r.output, "__typeof__(f.status)") == NULL,
 		      "typeof must not be applied to bit-field LHS");
 		// Must use typeof(RHS) instead.
-		CHECK(strstr(r.output, "__typeof__( get_status())") != NULL ||
-		      strstr(r.output, "__typeof__(get_status())") != NULL ||
-		      strstr(r.output, "typeof( get_status())") != NULL ||
-		      strstr(r.output, "typeof(get_status())") != NULL,
+		CHECK(strstr(r.output, "__typeof__( tmp)") != NULL ||
+		      strstr(r.output, "__typeof__(tmp)") != NULL ||
+		      strstr(r.output, "typeof( tmp)") != NULL ||
+		      strstr(r.output, "typeof(tmp)") != NULL,
 		      "typeof applied to RHS when LHS has member access");
 	}
 	prism_free(&r);
@@ -6767,11 +6761,13 @@ static void test_orelse_volatile_compound_literal(void) {
 		prism_free(&r);
 	}
 	// Control: non-compound-literal fallback is OK (typeof+temp path)
+	// Must hoist function call to avoid RHS call rejection.
 	{
 		const char *code =
 		    "int get_val(void);\n"
 		    "void f(volatile int *p) {\n"
-		    "    *p = get_val() orelse 42;\n"
+		    "    int tmp = get_val();\n"
+		    "    *p = tmp orelse 42;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vol_cl3.c", prism_defaults());
 		CHECK(r.status == PRISM_OK,
@@ -7053,7 +7049,10 @@ static void test_bare_orelse_rhs_incr_vm_double_eval(void) {
 		prism_free(&r);
 	}
 
-	// Sub-test 3: function call RHS with LHS deref — safe (never VM)
+	// Sub-test 3: function call RHS with LHS deref — rejected
+	// VM-ness of return type cannot be determined at the token level;
+	// a function could return a pointer to a VLA (VM type), making
+	// typeof(RHS) evaluate the call at runtime (C11 §6.7.2.4p2).
 	{
 		const char *code =
 		    "int *get(void);\n"
@@ -7061,8 +7060,10 @@ static void test_bare_orelse_rhs_incr_vm_double_eval(void) {
 		    "    *pp = get() orelse 0;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "rhs_call_ok.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		      "rhs-call-safe: function call RHS accepted");
+		CHECK(r.status != PRISM_OK,
+		      "rhs-call-vm: function call RHS with LHS indirection rejected");
+		CHECK(r.error_msg && strstr(r.error_msg, "function"),
+		      "rhs-call-vm: error mentions function call");
 		prism_free(&r);
 	}
 
@@ -7155,16 +7156,15 @@ static void test_bare_orelse_rhs_incr_vm_double_eval(void) {
 // variably-modified (C11 §6.7.2.4p2).  If LHS contains a subscript, deref,
 // or member access into a VM-typed expression (e.g. pointer-to-VLA),
 // Prism's bare value orelse emits:
-//   { typeof(LHS) tmp = (RHS); LHS = tmp ? tmp : fallback; }
-// which evaluates LHS twice: once in typeof (runtime VM eval) and once in
-// the assignment.  For volatile MMIO targets this doubles bus reads.
-// Fix: reject subscript/deref/member in LHS of bare value orelse.
+//   { typeof(RHS) tmp = (RHS); LHS = tmp ? tmp : fallback; }
+// typeof(RHS) evaluates RHS at runtime when the result type is VM.
+// A function CAN return a VM type (e.g. pointer to VLA), so ALL
+// function calls in RHS with LHS indirection are now rejected.
 static void test_orelse_typeof_vm_double_eval(void) {
 	printf("\n--- typeof VM double eval ---\n");
 
-	// Sub-test 1: subscript LHS uses typeof(RHS), not typeof(LHS)
-	// typeof(LHS) would evaluate LHS if result type is VM (C11 §6.7.2.4p2).
-	// typeof(RHS) is safe because function returns are never VM.
+	// Sub-test 1: subscript LHS + function call RHS — rejected
+	// VM-ness of return type cannot be determined at token level.
 	{
 		const char *code =
 		    "int *get(void);\n"
@@ -7172,15 +7172,12 @@ static void test_orelse_typeof_vm_double_eval(void) {
 		    "    matrix[0] = get() orelse 0;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vm_sub.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		      "typeof-vm: subscript LHS transpiles OK");
-		/* Output uses typeof(RHS) = typeof(get()), not typeof(matrix[0]). */
-		CHECK(r.output && strstr(r.output, "matrix[0])") == NULL,
-		      "typeof-vm: subscript LHS not inside typeof");
+		CHECK(r.status != PRISM_OK,
+		      "typeof-vm: subscript LHS + call RHS rejected");
 		prism_free(&r);
 	}
 
-	// Sub-test 2: deref LHS uses typeof(RHS)
+	// Sub-test 2: deref LHS + function call RHS — rejected
 	{
 		const char *code =
 		    "int *get(void);\n"
@@ -7188,16 +7185,12 @@ static void test_orelse_typeof_vm_double_eval(void) {
 		    "    *pp = get() orelse 0;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vm_deref.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		      "typeof-vm: deref LHS transpiles OK");
-		/* Output uses typeof(RHS) = typeof(get()), not typeof(*pp). */
-		CHECK(r.output && strstr(r.output, "typeof__(*pp)") == NULL &&
-		      strstr(r.output, "typeof(*pp)") == NULL,
-		      "typeof-vm: deref LHS not inside typeof");
+		CHECK(r.status != PRISM_OK,
+		      "typeof-vm: deref LHS + call RHS rejected");
 		prism_free(&r);
 	}
 
-	// Sub-test 3: member access LHS uses typeof(RHS)
+	// Sub-test 3: member access LHS + function call RHS — rejected
 	{
 		const char *code =
 		    "struct S { int *p; };\n"
@@ -7206,11 +7199,8 @@ static void test_orelse_typeof_vm_double_eval(void) {
 		    "    s->p = get() orelse 0;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vm_member.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		      "typeof-vm: member LHS transpiles OK");
-		CHECK(r.output && strstr(r.output, "typeof__(s->p)") == NULL &&
-		      strstr(r.output, "typeof(s->p)") == NULL,
-		      "typeof-vm: member LHS not inside typeof");
+		CHECK(r.status != PRISM_OK,
+		      "typeof-vm: member LHS + call RHS rejected");
 		prism_free(&r);
 	}
 
@@ -7241,7 +7231,7 @@ static void test_orelse_typeof_vm_double_eval(void) {
 	}
 
 	// Sub-test 6: the exploit case — volatile deref in subscript with VM type.
-	// Previously typeof(LHS) would evaluate *mmio; now uses typeof(RHS).
+	// Now rejected: function call in RHS with LHS indirection.
 	{
 		const char *code =
 		    "int *get_vla_ptr(void);\n"
@@ -7249,12 +7239,115 @@ static void test_orelse_typeof_vm_double_eval(void) {
 		    "    matrix[*mmio] = get_vla_ptr() orelse 0;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vm_exploit.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "typeof-vm: VM-type exploit case rejected");
+		prism_free(&r);
+	}
+}
+
+// CVE-class: VM-type double-evaluation vulnerability.
+// A function CAN return a pointer to a VLA (VM type), e.g.
+// int (*f(void))[dynamic_size].  When Prism wraps such a call in
+// typeof(f()), the VM type forces runtime evaluation of the operand
+// (C11 §6.7.2.4p2), executing the function TWICE (once in typeof,
+// once in the initializer).  The old rhs_is_bare_call exemption
+// skipped the side-effect scanner for bare function calls, assuming
+// function return types are never VM — that assumption was wrong.
+static void test_orelse_vm_return_type_double_eval(void) {
+	printf("\n--- VM return type double eval ---\n");
+
+	// 1. Bare function call with LHS indirection — must be rejected
+	{
+		const char *code =
+		    "int *alloc(void);\n"
+		    "void f(int **pp) {\n"
+		    "    *pp = alloc() orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vm_ret1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "vm-ret: bare call + LHS indirection rejected");
+		CHECK(r.error_msg && strstr(r.error_msg, "function"),
+		      "vm-ret: error mentions function call");
+		prism_free(&r);
+	}
+
+	// 2. Hoisted to variable — must succeed
+	{
+		const char *code =
+		    "int *alloc(void);\n"
+		    "void f(int **pp) {\n"
+		    "    int *tmp = alloc();\n"
+		    "    *pp = tmp orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vm_ret2.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK,
-		      "typeof-vm: VM-type exploit case transpiles OK");
-		/* Verify typeof does NOT operate on the dangerous LHS. */
-		CHECK(r.output && strstr(r.output, "typeof__(*mmio]") == NULL &&
-		      strstr(r.output, "typeof(*mmio]") == NULL,
-		      "typeof-vm: volatile mmio deref not inside typeof");
+		      "vm-ret: hoisted call accepted");
+		prism_free(&r);
+	}
+
+	// 3. Parenthesized function call (expr)() — also rejected
+	{
+		const char *code =
+		    "int *(*get_alloc(void))(void);\n"
+		    "void f(int **pp) {\n"
+		    "    *pp = (get_alloc())() orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vm_ret3.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "vm-ret: parenthesized call + LHS indirection rejected");
+		prism_free(&r);
+	}
+
+	// 4. No LHS indirection — function call in RHS is safe (typeof(LHS) used)
+	{
+		const char *code =
+		    "int *alloc(void);\n"
+		    "void f(void) {\n"
+		    "    int *p = alloc() orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vm_ret4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "vm-ret: no LHS indirection, call in RHS accepted");
+		prism_free(&r);
+	}
+
+	// 5. Member access LHS + function call — rejected
+	{
+		const char *code =
+		    "struct S { int *p; };\n"
+		    "int *alloc(void);\n"
+		    "void f(struct S *s) {\n"
+		    "    s->p = alloc() orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vm_ret5.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "vm-ret: member access LHS + call rejected");
+		prism_free(&r);
+	}
+
+	// 6. Subscript LHS + function call — rejected
+	{
+		const char *code =
+		    "int *alloc(void);\n"
+		    "void f(int **arr) {\n"
+		    "    arr[0] = alloc() orelse 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vm_ret6.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "vm-ret: subscript LHS + call rejected");
+		prism_free(&r);
+	}
+
+	// 7. Control-flow action (not value fallback) — not affected
+	{
+		const char *code =
+		    "int *alloc(void);\n"
+		    "void f(int **pp) {\n"
+		    "    *pp = alloc() orelse return;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vm_ret7.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "vm-ret: control-flow action not affected by RHS call check");
 		prism_free(&r);
 	}
 }
@@ -7268,6 +7361,7 @@ static void test_orelse_typeof_vm_double_eval(void) {
 // simple-assignment conversions (ISO C §6.5.16.1).
 static void test_orelse_ternary_promotion_hijack(void) {
 	// 1. Transpilation output must use if/else, not ternary
+	// Hoist function call to avoid RHS call rejection with LHS indirection.
 	{
 		const char *code =
 		    "long long *get_target(void);\n"
@@ -7275,7 +7369,8 @@ static void test_orelse_ternary_promotion_hijack(void) {
 		    "void f(void) {\n"
 		    "    long long *target = get_target();\n"
 		    "    unsigned int fb = 1;\n"
-		    "    target[0] = get_value() orelse fb;\n"
+		    "    int tmp = get_value();\n"
+		    "    target[0] = tmp orelse fb;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "tp_hijack.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK, "ternary-hijack: transpiles OK");
@@ -7313,6 +7408,7 @@ static void test_orelse_ternary_promotion_hijack(void) {
 		prism_free(&r);
 	}
 	// 3. Chained bare orelse — last link is if/else
+	// Hoist function calls to avoid RHS call rejection.
 	{
 		const char *code =
 		    "int a(void);\n"
@@ -7320,7 +7416,8 @@ static void test_orelse_ternary_promotion_hijack(void) {
 		    "void f(void) {\n"
 		    "    long long *p = (long long *)0;\n"
 		    "    unsigned int fb = 99;\n"
-		    "    p[0] = a() orelse b() orelse fb;\n"
+		    "    int va = a(), vb = b();\n"
+		    "    p[0] = va orelse vb orelse fb;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "tp_hijack3.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK, "ternary-hijack-chain: transpiles OK");
@@ -7748,6 +7845,9 @@ void run_orelse_tests(void) {
 
 	// typeof VM-type double evaluation (BUG100)
 	test_orelse_typeof_vm_double_eval();
+
+	// VM return type double-evaluation vulnerability (rhs_is_bare_call kill)
+	test_orelse_vm_return_type_double_eval();
 
 	// bare orelse typeof(RHS) VM double-eval via ++ in RHS
 	test_bare_orelse_rhs_incr_vm_double_eval();
