@@ -1874,6 +1874,97 @@ static void test_knr_nested_func_detection(void) {
 	free(path);
 }
 
+static void test_extern_decl_not_nested_func(void) {
+	printf("\n--- Extern Decl Not Misidentified as Nested Function ---\n");
+
+	// BUG: extern forward declarations with attributes inside function bodies
+	// were falsely detected as GNU nested function definitions when a switch
+	// statement followed. The K&R params fallback scan walked past the ;
+	// through subsequent code to the switch body {, and is_knr_params returned
+	// true because it found a ; in between. Fix: nested function detection
+	// skips declarations with storage class specifiers (extern/static/etc).
+	{
+		const char *src =
+		    "void f(int argc) {\n"
+		    "    extern void g(void) __attribute__((visibility(\"hidden\")));\n"
+		    "    switch (argc) { case 0: break; }\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+
+		PrismFeatures feat = prism_defaults();
+		PrismResult r = prism_transpile_source(src, "extern_attr.c", feat);
+		CHECK(r.status == PRISM_OK,
+		      "extern decl + attr + switch: should not be nested func error");
+		prism_free(&r);
+	}
+	// Variant: __asm__
+	{
+		const char *src =
+		    "void f(int argc) {\n"
+		    "    extern void g(void) __asm__(\"__g\");\n"
+		    "    switch (argc) { case 0: break; }\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+
+		PrismFeatures feat = prism_defaults();
+		PrismResult r = prism_transpile_source(src, "extern_asm.c", feat);
+		CHECK(r.status == PRISM_OK,
+		      "extern decl + asm + switch: should not be nested func error");
+		prism_free(&r);
+	}
+	// Variant: C23 attribute
+	{
+		const char *src =
+		    "void f(int argc) {\n"
+		    "    extern void g(void) [[gnu::visibility(\"hidden\")]];\n"
+		    "    switch (argc) { case 0: break; }\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+
+		PrismFeatures feat = prism_defaults();
+		PrismResult r = prism_transpile_source(src, "extern_c23.c", feat);
+		CHECK(r.status == PRISM_OK,
+		      "extern decl + C23 attr + switch: should not be nested func error");
+		prism_free(&r);
+	}
+	// Variant: glibc makecontext.c pattern (two extern decls + for+switch)
+	{
+		const char *src =
+		    "typedef struct ucontext_t { int x; } ucontext_t;\n"
+		    "void f(ucontext_t *ucp, void (*func)(void), int argc) {\n"
+		    "    extern void __start_context(void) __attribute__((visibility(\"hidden\")));\n"
+		    "    extern void __push(ucontext_t *) __attribute__((visibility(\"hidden\")));\n"
+		    "    int i;\n"
+		    "    for (i = 0; i < argc; ++i)\n"
+		    "        switch (i) {\n"
+		    "        case 0: break;\n"
+		    "        default: break;\n"
+		    "        }\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+
+		PrismFeatures feat = prism_defaults();
+		PrismResult r = prism_transpile_source(src, "glibc_makecontext.c", feat);
+		CHECK(r.status == PRISM_OK,
+		      "glibc makecontext pattern: should not be nested func error");
+		prism_free(&r);
+	}
+	// Verify actual nested functions still detected
+	{
+		const char *src =
+		    "int outer(void) {\n"
+		    "    defer (void)0;\n"
+		    "    void inner(void) { }\n"
+		    "}\n";
+
+		PrismFeatures feat = prism_defaults();
+		PrismResult r = prism_transpile_source(src, "real_nested.c", feat);
+		CHECK(r.status != PRISM_OK,
+		      "actual nested func: still detected");
+		prism_free(&r);
+	}
+}
+
 static void test_defer_scope_state_machine_overwrite(void) {
 	printf("\n--- defer Scope State Machine Overwrite Allows Unsafe Escapes ---\n");
 
@@ -5892,6 +5983,7 @@ void run_defer_tests(void) {
 	test_ternary_cast_corrupts_label_detection();
 	test_gnu_nested_func_breaks_outer_defer();
 	test_knr_nested_func_detection();
+	test_extern_decl_not_nested_func();
 	test_defer_scope_state_machine_overwrite();
 	test_braceless_body_semicolon_trap();
 	test_scope_type_at_depth_overflow();

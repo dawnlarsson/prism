@@ -6452,8 +6452,10 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		if (!decl.var_name || !decl.end) {
 			// Detect GNU nested function definitions
 			// inside functions using defer/zeroinit.
+			// Skip when storage class was seen — GCC nested functions
+			// cannot have extern/static/register/_Thread_local.
 			if (cur_func >= 0 && brace_depth > 0 &&
-			    FEAT(F_DEFER) && decl.var_name) {
+			    FEAT(F_DEFER) && decl.var_name && !saw_static) {
 				Token *p = skip_noise(tok_next(decl.var_name));
 				if (p && match_ch(p, '(') && tok_match(p)) {
 					Token *a = tok_next(tok_match(p));
