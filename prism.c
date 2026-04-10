@@ -6329,14 +6329,16 @@ static void p1d_validate_decl_orelse(Token *var_name, Token *type_tok,
 // break with anonymous structs or variably-modified type specifiers.
 static void p1d_check_multi_decl_constraints(Token *t, Token *type_tok,
 					     TypeSpecResult *type,
-					     bool any_would_memset, bool vm_type) {
+					     bool any_would_memset, bool vm_type,
+					     bool current_decl_has_orelse) {
 	// Check if the next declarator would require a split
 	Token *next_t = tok_next(t);
 	bool nr = false;
 	next_t = p1_skip_decl_raw(next_t, &nr);
 	DeclResult nd = parse_declarator(next_t, false);
 	if (!nd.var_name || !nd.end) return;
-	bool split = (any_would_memset && match_ch(nd.end, '=')) ||
+	bool split = (current_decl_has_orelse && FEAT(F_ORELSE)) ||
+	             (any_would_memset && (match_ch(nd.end, '=') || nd.is_vla)) ||
 	             (FEAT(F_ORELSE) && p1d_decl_has_bracket_orelse(next_t, nd.end));
 	if (!split) return;
 
@@ -6610,8 +6612,8 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 			}
 		}
 
+		bool decl_has_orelse = false;
 		if (has_init) {
-			bool decl_has_orelse = false;
 			Token *first_orelse = NULL;
 			t = p1d_scan_init_orelse(t, &decl_has_orelse, &first_orelse);
 
@@ -6633,7 +6635,7 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		// Phase 1D: reject multi-declarator split constraints
 		if (t && match_ch(t, ',') && brace_depth > 0)
 			p1d_check_multi_decl_constraints(t, type_tok, &type,
-				any_would_memset, vm_type);
+				any_would_memset, vm_type, decl_has_orelse);
 
 		if (t && match_ch(t, ',')) { t = tok_next(t); } else break;
 	}

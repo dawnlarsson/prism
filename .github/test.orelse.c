@@ -1400,7 +1400,7 @@ static void test_const_typedef_breaks_orelse_temp(void) {
 }
 
 static void test_anon_struct_orelse_type_corruption(void) {
-	printf("\n--- Anonymous Struct Type Corruption in Multi-Declarator orelse ---\n");
+	printf("\n--- Anonymous Struct Multi-Declarator orelse Rejected ---\n");
 
 	const char *code =
 	    "#include <stdlib.h>\n"
@@ -1420,26 +1420,91 @@ static void test_anon_struct_orelse_type_corruption(void) {
 
 	PrismFeatures features = prism_defaults();
 	PrismResult result = prism_transpile_file(path, features);
-	CHECK_EQ(result.status, PRISM_OK, "anon struct orelse: transpiles OK");
-	CHECK(result.output != NULL, "anon struct orelse: output not NULL");
-
-	// The second declarator must have the full anonymous struct body, not bare 'struct'.
-	// Look for two occurrences of 'struct { int a; }'.
-	const char *first = strstr(result.output, "struct { int a; }");
-	CHECK(first != NULL, "anon struct orelse: first declarator has struct body");
-	if (first) {
-		const char *second = strstr(first + 1, "struct { int a; }");
-		CHECK(second != NULL,
-		      "anon struct orelse: second declarator preserves anonymous struct body");
-	}
-
-	// Must NOT contain bare 'struct *' (the broken output).
-	CHECK(strstr(result.output, "struct *s2") == NULL,
-	      "anon struct orelse: no bare 'struct *s2' (type must be complete)");
+	// Multi-declarator with anonymous struct + orelse forces a split,
+	// producing two incompatible anonymous types in ISO C.
+	// Phase 1D must reject this.
+	CHECK(result.status != PRISM_OK,
+	      "anon struct orelse: must be rejected (split creates incompatible types)");
 
 	prism_free(&result);
 	unlink(path);
 	free(path);
+}
+
+static void test_orelse_multi_decl_split_invariant(void) {
+	printf("\n--- Two-Pass Invariant: orelse-forced split constraints ---\n");
+
+	// VM type: current decl orelse forces split, next decl has VM type
+	{
+		PrismResult r = prism_transpile_source(
+		    "void *get(void);\n"
+		    "void f(int n) {\n"
+		    "    typeof(int[n]) *x = get() orelse 0, *y = 0;\n"
+		    "}\n",
+		    "split_vm.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "orelse split invariant: VM type multi-decl rejected in Phase 1D");
+		prism_free(&r);
+	}
+	// Anonymous struct: current decl orelse forces split
+	{
+		PrismResult r = prism_transpile_source(
+		    "int *get(void);\n"
+		    "void f(void) {\n"
+		    "    struct { int a; } *p1 = get() orelse 0, *p2 = 0;\n"
+		    "}\n",
+		    "split_anon.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "orelse split invariant: anon struct multi-decl rejected in Phase 1D");
+		prism_free(&r);
+	}
+	// Single declarator with orelse is fine (no split)
+	{
+		PrismResult r = prism_transpile_source(
+		    "int *get(void);\n"
+		    "void f(void) {\n"
+		    "    struct { int a; } *p1 = get() orelse 0;\n"
+		    "}\n",
+		    "split_single.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "orelse split invariant: single anon struct orelse is fine");
+		prism_free(&r);
+	}
+	// Tagged struct with orelse multi-decl is fine (split produces compatible types)
+	{
+		PrismResult r = prism_transpile_source(
+		    "int *get(void);\n"
+		    "void f(void) {\n"
+		    "    struct S { int a; } *p1 = get() orelse 0, *p2 = 0;\n"
+		    "}\n",
+		    "split_tagged.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "orelse split invariant: tagged struct multi-decl is fine");
+		prism_free(&r);
+	}
+	// VLA next-declarator split: typeof memset pending + next is VLA (no init)
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get_n(void);\n"
+		    "void f(int n) {\n"
+		    "    typeof(int[n]) arr, buf[get_n()];\n"
+		    "}\n",
+		    "split_vla_next.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "orelse split invariant: VM type + VLA next decl rejected in Phase 1D");
+		prism_free(&r);
+	}
+	// Non-VLA next-declarator with pending memset but no init: no split needed
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    typeof(int[n]) arr, buf[3];\n"
+		    "}\n",
+		    "split_fixed_next.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "orelse split invariant: fixed-size next decl is fine (no split)");
+		prism_free(&r);
+	}
 }
 
 static void test_compound_literal_orelse_lifetime(void) {
@@ -7432,6 +7497,8 @@ static void test_orelse_ternary_promotion_hijack(void) {
 }
 
 static void test_orelse_sue_attr_body_strip(void) {
+	// Multi-declarator with anonymous struct + orelse forces a split,
+	// producing two incompatible anonymous types. Phase 1D must reject.
 	const char *code =
 	    "struct __attribute__((packed)) { int x; int y; } *get_anon(void);\n"
 	    "void f(void) {\n"
@@ -7439,14 +7506,8 @@ static void test_orelse_sue_attr_body_strip(void) {
 	    "    (void)a; (void)b;\n"
 	    "}\n";
 	PrismResult r = prism_transpile_source(code, "sue_attr_body.c", prism_defaults());
-	CHECK_EQ(r.status, PRISM_OK, "sue-attr-body: transpiles OK");
-	CHECK(r.output != NULL, "sue-attr-body: output not NULL");
-	if (r.output) {
-		const char *first = strstr(r.output, "{ int x;");
-		CHECK(first != NULL, "sue-attr-body: first decl has struct body");
-		const char *second = first ? strstr(first + 1, "{ int x;") : NULL;
-		CHECK(second != NULL, "sue-attr-body: second decl must also preserve struct body");
-	}
+	CHECK(r.status != PRISM_OK,
+	      "sue-attr-body: anon struct multi-decl orelse must be rejected");
 	prism_free(&r);
 }
 
@@ -7557,6 +7618,7 @@ void run_orelse_tests(void) {
 	test_prism_oe_temp_var_namespace_collision();
 	test_const_typedef_breaks_orelse_temp();
 	test_anon_struct_orelse_type_corruption();
+	test_orelse_multi_decl_split_invariant();
 	test_compound_literal_orelse_lifetime();
 	test_orelse_bare_assign_double_eval();
 	test_orelse_vla_fallback_double_eval();
