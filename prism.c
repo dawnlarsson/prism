@@ -7098,8 +7098,23 @@ static void p1_full_depth_prescan(Token *tok) {
 					at_stmt_start = true;
 					p1d_ctrl_pending = true;
 				}
-			} else
+			} else {
+				// When a stmt-expr inside control-flow condition parens
+				// caused balanced-skip to abort (p1d_scan_balanced_group
+				// returned se_open), tokens are processed individually.
+				// Detect the closing ')' of the original condition parens
+				// to restore at_stmt_start for the body (labels, decls).
+				if (match_ch(tok, ')') && tok_match(tok)) {
+					uint32_t oi = tok_idx(tok_match(tok));
+					while (oi > 1 && token_pool[oi - 1].kind == TK_PREP_DIR)
+						oi--;
+					if (oi > 1 && (token_pool[oi - 1].tag & (TT_IF | TT_LOOP | TT_SWITCH))) {
+						at_stmt_start = true;
+						p1d_ctrl_pending = true;
+					}
+				}
 				tok = tok_next(tok);
+			}
 			continue;
 		}
 

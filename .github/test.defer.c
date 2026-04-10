@@ -1965,6 +1965,94 @@ static void test_extern_decl_not_nested_func(void) {
 	}
 }
 
+static void test_stmt_expr_in_ctrl_cond_label(void) {
+	printf("\n--- Stmt-Expr in Ctrl Condition + Label Body ---\n");
+
+	// BUG: when a GNU statement expression ({...}) appeared inside an if()
+	// condition, the balanced-group scan aborted and tokens were processed
+	// individually. The closing ')' of the condition never triggered
+	// at_stmt_start=true, so a label on the next line (the if body) was
+	// invisible to Phase 1D. Forward gotos to that label failed with
+	// "goto target label 'X' not found in scope".
+	// Triggered by glibc's pthread_mutex_unlock.c where atomic_load_relaxed
+	// expands to ({...}) inside the if() condition.
+
+	// Case 1: stmt-expr in if() + label as body
+	{
+		const char *src =
+		    "int f(int x) {\n"
+		    "    int newowner = 0;\n"
+		    "    switch (x) {\n"
+		    "    case 1:\n"
+		    "        goto target;\n"
+		    "    case 2:\n"
+		    "        if (({ int __v = x; __v; }) == 3)\n"
+		    "        target:\n"
+		    "            newowner = 99;\n"
+		    "        break;\n"
+		    "    }\n"
+		    "    return newowner;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismFeatures feat = prism_defaults();
+		feat.zeroinit = false;
+		PrismResult r = prism_transpile_source(src, "stmtexpr_label1.c", feat);
+		CHECK(r.status == PRISM_OK,
+		      "stmt-expr in if cond + label body: should not error");
+		prism_free(&r);
+	}
+	// Case 2: glibc-like pattern (THREAD_GETMEM → stmt-expr)
+	{
+		const char *src =
+		    "typedef struct { struct { int lock; int owner; int kind; int count; } __data; } mutex_t;\n"
+		    "static int unlock(mutex_t *m, int decr) {\n"
+		    "    int newowner = 0;\n"
+		    "    switch (m->__data.kind) {\n"
+		    "    case 10:\n"
+		    "        if ((m->__data.lock & 0x3fffffff)\n"
+		    "            == ({ int __v = m->__data.owner; __v; }))\n"
+		    "        { goto pi_notrecoverable; }\n"
+		    "        goto continue_pi_robust;\n"
+		    "    case 20:\n"
+		    "        if (({ int __k = m->__data.kind; __k; } & 16) != 0\n"
+		    "            && m->__data.owner == 3)\n"
+		    "        pi_notrecoverable:\n"
+		    "            newowner = 4;\n"
+		    "        if (({ int __k = m->__data.kind; __k; } & 16) != 0) {\n"
+		    "        continue_pi_robust:\n"
+		    "            m->__data.count = 0;\n"
+		    "        }\n"
+		    "        break;\n"
+		    "    }\n"
+		    "    return newowner;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismFeatures feat = prism_defaults();
+		feat.zeroinit = false;
+		PrismResult r = prism_transpile_source(src, "stmtexpr_label2.c", feat);
+		CHECK(r.status == PRISM_OK,
+		      "glibc THREAD_GETMEM pattern: should not error");
+		prism_free(&r);
+	}
+	// Case 3: while + stmt-expr + label
+	{
+		const char *src =
+		    "void f(int x) {\n"
+		    "    goto L;\n"
+		    "    while (({ int v = x; v; }) > 0)\n"
+		    "    L:\n"
+		    "        x--;\n"
+		    "}\n"
+		    "int main(void) { return 0; }\n";
+		PrismFeatures feat = prism_defaults();
+		feat.zeroinit = false;
+		PrismResult r = prism_transpile_source(src, "stmtexpr_label3.c", feat);
+		CHECK(r.status == PRISM_OK,
+		      "while + stmt-expr + label: should not error");
+		prism_free(&r);
+	}
+}
+
 static void test_defer_scope_state_machine_overwrite(void) {
 	printf("\n--- defer Scope State Machine Overwrite Allows Unsafe Escapes ---\n");
 
@@ -5984,6 +6072,7 @@ void run_defer_tests(void) {
 	test_gnu_nested_func_breaks_outer_defer();
 	test_knr_nested_func_detection();
 	test_extern_decl_not_nested_func();
+	test_stmt_expr_in_ctrl_cond_label();
 	test_defer_scope_state_machine_overwrite();
 	test_braceless_body_semicolon_trap();
 	test_scope_type_at_depth_overflow();
