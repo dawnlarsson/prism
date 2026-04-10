@@ -2760,11 +2760,19 @@ static void scan_paren_for_vla(Token *open, Token *end, TypeSpecResult *r, bool 
 		// times (const orelse temp, multi-declarator splits), so any
 		// defer/goto/return would be processed N times at compile time,
 		// corrupting the defer stack or goto_entry_cursor.
-		if (t->tag & (TT_GOTO | TT_RETURN | TT_BREAK | TT_CONTINUE | TT_DEFER))
-			error_tok(t, "control flow keywords are not allowed inside "
-				  "type specifiers (typeof() / _Atomic()); transpiler "
-				  "rewrites may duplicate the type specifier, which "
-				  "would corrupt control-flow tracking");
+		if (t->tag & (TT_GOTO | TT_RETURN | TT_BREAK | TT_CONTINUE | TT_DEFER)) {
+			if (FEAT(F_WARN_SAFETY))
+				warn_tok(t, "control flow keywords inside type "
+					 "specifiers (typeof() / _Atomic()) may "
+					 "corrupt control-flow tracking");
+			else
+				error_tok(t, "control flow keywords are not "
+					  "allowed inside type specifiers "
+					  "(typeof() / _Atomic()); transpiler "
+					  "rewrites may duplicate the type "
+					  "specifier, which would corrupt "
+					  "control-flow tracking");
+		}
 		if (check_typeof && (t->tag & TT_TYPEOF)) r->has_typeof = true;
 		if (t->len == 1 && t->ch0 == '(') {
 			if (fn_skip > 0) fn_skip++;

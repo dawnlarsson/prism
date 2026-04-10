@@ -1803,6 +1803,38 @@ static void spec_typeof_ctrl_flow_rejection(void) {
 		         "typeof without ctrl-flow: must accept");
 		prism_free(&r);
 	}
+
+	// 5. return in typeof with -fno-safety: downgraded to warning, OK
+	{
+		PrismFeatures feat = prism_defaults();
+		feat.warn_safety = true;
+		PrismResult r = prism_transpile_source(
+		    "int f(void) {\n"
+		    "    typeof(({ return 0; 1; })) x = 5;\n"
+		    "    return x;\n"
+		    "}\n",
+		    "spec_ts5.c", feat);
+		CHECK_EQ(r.status, PRISM_OK,
+		         "return in typeof with -fno-safety: must accept");
+		prism_free(&r);
+	}
+
+	// 6. glibc INLINE_SYSCALL pattern: typeof with stmt-expr containing return
+	{
+		PrismFeatures feat = prism_defaults();
+		feat.warn_safety = true;
+		PrismResult r = prism_transpile_source(
+		    "int _errno;\n"
+		    "int f(unsigned long long dev) {\n"
+		    "    __typeof__((({ if (dev) return ({ (_errno = 22); -1; });\n"
+		    "                   (unsigned int) dev; }))) x = 0;\n"
+		    "    return x;\n"
+		    "}\n",
+		    "spec_ts6.c", feat);
+		CHECK_EQ(r.status, PRISM_OK,
+		         "glibc typeof+return with -fno-safety: must accept");
+		prism_free(&r);
+	}
 }
 
 // ── C23 auto/constexpr orelse ──
