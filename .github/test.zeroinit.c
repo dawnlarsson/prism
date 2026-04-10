@@ -3383,7 +3383,9 @@ static void test_volatile_member_memset(void) {
 		prism_free(&r);
 	}
 
-	/* 7. Non-volatile struct should STILL use memset (no false positive) */
+	/* 7. Non-volatile struct should STILL use memset (no false positive).
+	 * On MSVC, the byte loop is always used (no __builtin_memset),
+	 * but it should NOT have the "volatile char *" qualifier prefix. */
 	{
 		PrismResult r = prism_transpile_source(
 		    "struct Plain { int x; int y; };\n"
@@ -3394,10 +3396,10 @@ static void test_volatile_member_memset(void) {
 		    "nonvol.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK, "non-volatile VLA: transpiles");
 		if (r.output) {
-			CHECK(strstr(r.output, "__builtin_memset") != NULL,
-			      "non-volatile VLA: uses memset (no false positive)");
-			CHECK(strstr(r.output, "__prism_p_") == NULL,
-			      "non-volatile VLA: no byte loop");
+			CHECK(strstr(r.output, "memset") != NULL || strstr(r.output, "__prism_p_") != NULL,
+			      "non-volatile VLA: has zeroing");
+			CHECK(strstr(r.output, "volatile char") == NULL,
+			      "non-volatile VLA: no volatile qualifier (no false positive)");
 		}
 		prism_free(&r);
 	}
