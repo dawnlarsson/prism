@@ -2921,6 +2921,136 @@ static void spec_defer_body_orelse_transform(void) {
 	}
 }
 
+// ── BOFrame reentrancy truncation (VULN1) ──
+static void spec_boframe_reentrancy(void) {
+	printf("\n--- BOFrame reentrancy ---\n");
+
+	// 17 bracket orelses in outer + stmt-expr containing inner declaration.
+	// Prior to fix, index 16 was poisoned by inner's temp IDs.
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void) {\n"
+		    "    int outer[1 orelse 2][1 orelse 2][1 orelse 2][1 orelse 2]\n"
+		    "             [1 orelse 2][1 orelse 2][1 orelse 2][1 orelse 2]\n"
+		    "             [1 orelse 2][1 orelse 2][1 orelse 2][1 orelse 2]\n"
+		    "             [1 orelse 2][1 orelse 2][1 orelse 2][1 orelse 2]\n"
+		    "             [1 orelse 2]\n"
+		    "             [ ({\n"
+		    "                  int inner[1 orelse 2][1 orelse 2][1 orelse 2][1 orelse 2]\n"
+		    "                           [1 orelse 2][1 orelse 2][1 orelse 2][1 orelse 2]\n"
+		    "                           [1 orelse 2][1 orelse 2][1 orelse 2][1 orelse 2]\n"
+		    "                           [1 orelse 2][1 orelse 2][1 orelse 2][1 orelse 2]\n"
+		    "                           [1 orelse 2];\n"
+		    "                  5;\n"
+		    "             }) ];\n"
+		    "    (void)outer;\n"
+		    "    return 0;\n"
+		    "}\n",
+		    "spec_bo1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "BOFrame 17-dim reentrancy: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "BOFrame 17-dim reentrancy: no orelse leak");
+		prism_free(&r);
+	}
+
+	// Simpler: 16 bracket orelses (boundary case — fits exactly in old limit)
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void) {\n"
+		    "    int a[1 orelse 2][1 orelse 2][1 orelse 2][1 orelse 2]\n"
+		    "         [1 orelse 2][1 orelse 2][1 orelse 2][1 orelse 2]\n"
+		    "         [1 orelse 2][1 orelse 2][1 orelse 2][1 orelse 2]\n"
+		    "         [1 orelse 2][1 orelse 2][1 orelse 2][1 orelse 2];\n"
+		    "    (void)a;\n"
+		    "    return 0;\n"
+		    "}\n",
+		    "spec_bo2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "BOFrame 16-dim boundary: transpiles");
+		prism_free(&r);
+	}
+}
+
+// ── Backward goto VLA stack exhaustion (VULN2) ──
+static void spec_backward_goto_vla_loop(void) {
+	printf("\n--- backward goto VLA loop ---\n");
+
+	// Same-block VLA: goto loops over declaration → stack exhaustion
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void) {\n"
+		    "    int n = 1024;\n"
+		    "    int i = 0;\n"
+		    "L:\n"
+		    "    int arr[n];\n"
+		    "    arr[0] = i;\n"
+		    "    if (++i < 1000000)\n"
+		    "        goto L;\n"
+		    "    return 0;\n"
+		    "}\n",
+		    "spec_vla1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "backward goto over VLA same block: rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "loops over") != NULL,
+			      "backward goto over VLA same block: error mentions loop");
+		prism_free(&r);
+	}
+
+	// VLA in inner scope — scope is exited, VLA freed → safe
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void) {\n"
+		    "    int n = 10;\n"
+		    "    int i = 0;\n"
+		    "L:\n"
+		    "    {\n"
+		    "        int arr[n];\n"
+		    "        arr[0] = i;\n"
+		    "    }\n"
+		    "    if (++i < 5)\n"
+		    "        goto L;\n"
+		    "    return 0;\n"
+		    "}\n",
+		    "spec_vla2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "backward goto, VLA in inner scope: accepted");
+		prism_free(&r);
+	}
+
+	// VLA in braceless body — effective scope ends at semicolon → safe
+	{
+		PrismResult r = prism_transpile_source(
+		    "void execute(int n) {\n"
+		    "    if (1)\n"
+		    "        L_vla: raw int vla[n];\n"
+		    "    goto L_vla;\n"
+		    "}\n",
+		    "spec_vla3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "backward goto, VLA in braceless body: accepted");
+		prism_free(&r);
+	}
+
+	// Non-VLA backward goto — always safe
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void) {\n"
+		    "    int i = 0;\n"
+		    "L:\n"
+		    "    int x;\n"
+		    "    x = i;\n"
+		    "    if (++i < 5)\n"
+		    "        goto L;\n"
+		    "    return x;\n"
+		    "}\n",
+		    "spec_vla4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "backward goto over non-VLA decl: accepted");
+		prism_free(&r);
+	}
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Runner
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3054,4 +3184,8 @@ void run_spec_tests(void) {
 	// ── defer body emission ──
 	spec_defer_body_ctrl_state();
 	spec_defer_body_orelse_transform();
+
+	// ── BOFrame reentrancy + VLA loop ──
+	spec_boframe_reentrancy();
+	spec_backward_goto_vla_loop();
 }

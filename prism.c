@@ -2002,7 +2002,7 @@ static Token *scan_bracket_orelse(Token *open, Token *close, Token **paren_open_
 // which calls emit_bracket_orelse_temps, clobbering the outer's entries.
 typedef struct {
 	int oe_count, oe_next, dim_count, dim_next;
-	unsigned oe_ids[16], dim_ids[16];
+	unsigned *oe_ids, *dim_ids;  // arena-allocated snapshots (unbounded)
 } BOFrame;
 
 static void bo_save(BOFrame *f) {
@@ -2010,10 +2010,16 @@ static void bo_save(BOFrame *f) {
 	f->oe_next   = ctx->bracket_oe_next;
 	f->dim_count = ctx->bracket_dim_count;
 	f->dim_next  = ctx->bracket_dim_next;
-	int oe_n  = f->oe_count < 16 ? f->oe_count : 16;
-	int dim_n = f->dim_count < 16 ? f->dim_count : 16;
-	if (oe_n)  memcpy(f->oe_ids, ctx->bracket_oe_ids, oe_n * sizeof(unsigned));
-	if (dim_n) memcpy(f->dim_ids, ctx->bracket_dim_ids, dim_n * sizeof(unsigned));
+	f->oe_ids = NULL;
+	f->dim_ids = NULL;
+	if (f->oe_count > 0) {
+		f->oe_ids = arena_alloc(&ctx->main_arena, f->oe_count * sizeof(unsigned));
+		memcpy(f->oe_ids, ctx->bracket_oe_ids, f->oe_count * sizeof(unsigned));
+	}
+	if (f->dim_count > 0) {
+		f->dim_ids = arena_alloc(&ctx->main_arena, f->dim_count * sizeof(unsigned));
+		memcpy(f->dim_ids, ctx->bracket_dim_ids, f->dim_count * sizeof(unsigned));
+	}
 }
 
 static void bo_restore(BOFrame *f) {
@@ -2021,10 +2027,27 @@ static void bo_restore(BOFrame *f) {
 	ctx->bracket_oe_next   = f->oe_next;
 	ctx->bracket_dim_count = f->dim_count;
 	ctx->bracket_dim_next  = f->dim_next;
-	int oe_n  = f->oe_count < 16 ? f->oe_count : 16;
-	int dim_n = f->dim_count < 16 ? f->dim_count : 16;
-	if (oe_n)  memcpy(ctx->bracket_oe_ids, f->oe_ids, oe_n * sizeof(unsigned));
-	if (dim_n) memcpy(ctx->bracket_dim_ids, f->dim_ids, dim_n * sizeof(unsigned));
+	if (f->oe_count > 0) {
+		// Ensure destination has enough capacity for all saved IDs.
+		while (ctx->bracket_oe_cap < (size_t)f->oe_count) {
+			size_t old_cap = ctx->bracket_oe_cap;
+			size_t new_cap = old_cap == 0 ? 16 : old_cap * 2;
+			ctx->bracket_oe_ids = arena_realloc(&ctx->main_arena, ctx->bracket_oe_ids,
+				old_cap * sizeof(unsigned), new_cap * sizeof(unsigned));
+			ctx->bracket_oe_cap = new_cap;
+		}
+		memcpy(ctx->bracket_oe_ids, f->oe_ids, f->oe_count * sizeof(unsigned));
+	}
+	if (f->dim_count > 0) {
+		while (ctx->bracket_dim_cap < (size_t)f->dim_count) {
+			size_t old_cap = ctx->bracket_dim_cap;
+			size_t new_cap = old_cap == 0 ? 16 : old_cap * 2;
+			ctx->bracket_dim_ids = arena_realloc(&ctx->main_arena, ctx->bracket_dim_ids,
+				old_cap * sizeof(unsigned), new_cap * sizeof(unsigned));
+			ctx->bracket_dim_cap = new_cap;
+		}
+		memcpy(ctx->bracket_dim_ids, f->dim_ids, f->dim_count * sizeof(unsigned));
+	}
 }
 
 // Each bracket orelse gets: long long __prism_oe_ID = (LHS);
@@ -7851,6 +7874,32 @@ static void p1_verify_cfg(void) {
 								  g->label.len, g->label.name);
 							break;
 						}
+					}
+					// Backward goto looping over VLA: VLAs BETWEEN
+					// the label and the goto whose scope encloses both
+					// are re-allocated on each iteration without the
+					// previous allocation being freed (C11 §6.2.4p7:
+					// lifetime extends until scope exit), causing
+					// unbounded stack growth.  Skip VLAs whose effective
+					// lifetime (braceless body close or scope close)
+					// ends before the goto — they are freed naturally.
+					for (int di = wm_decl[li]; di < decl_n; di++) {
+						P1FuncEntry *d = &ents[decl_list[di]];
+						if (!d->decl.is_vla) continue;
+						if (d->token_index >= g->token_index) continue;
+						if (!scope_is_ancestor_or_self(d->scope_id, ents[li].scope_id)) continue;
+						if (!scope_is_ancestor_or_self(d->scope_id, g->scope_id)) continue;
+						// If VLA's effective close is before the goto,
+						// its lifetime ends before the jump — safe.
+						uint32_t vla_close = decl_effective_close(d);
+						if (vla_close > 0 && vla_close <= g->token_index) continue;
+						error_tok(g->tok,
+							  "goto '%.*s' loops over a variable-length array "
+							  "declaration; each iteration allocates a new VLA "
+							  "without freeing the previous one, causing "
+							  "unbounded stack growth",
+							  g->label.len, g->label.name);
+						break;
 					}
 				}
 				break;
