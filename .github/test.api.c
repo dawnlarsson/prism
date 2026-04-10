@@ -7199,6 +7199,99 @@ static void test_noreturn_attr_arg_poisoning(void) {
 	prism_free(&r);
 }
 
+static void test_noreturn_shadow_no_unreachable(void) {
+	/* BUG: try_detect_noreturn_call() trusted Pass 0's TT_NORETURN_FN tag
+	 * without checking if the identifier was shadowed by a local variable
+	 * or parameter.  A function pointer parameter named `exit` got
+	 * __builtin_unreachable() injected after the call — silent miscompile. */
+
+	/* Case 1: parameter shadows noreturn function */
+	{
+		PrismResult r = prism_transpile_source(
+			"#include <stdio.h>\n"
+			"void wrapper(void (*exit)(void)) {\n"
+			"    exit();\n"
+			"    printf(\"ok\\n\");\n"
+			"}\n",
+			"nr_shd_param.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "noreturn shadow param: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "__builtin_unreachable") == NULL,
+			      "noreturn shadow param: no unreachable injected");
+		prism_free(&r);
+	}
+
+	/* Case 2: local variable shadows noreturn function */
+	{
+		PrismResult r = prism_transpile_source(
+			"typedef void (*fn_t)(void);\n"
+			"fn_t get_fn(void);\n"
+			"void test_local(void) {\n"
+			"    fn_t abort = get_fn();\n"
+			"    abort();\n"
+			"    int x = 1;\n"
+			"    (void)x;\n"
+			"}\n",
+			"nr_shd_local.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "noreturn shadow local: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "__builtin_unreachable") == NULL,
+			      "noreturn shadow local: no unreachable injected");
+		prism_free(&r);
+	}
+
+	/* Case 3: unshadowed noreturn MUST still get unreachable */
+	{
+		PrismResult r = prism_transpile_source(
+			"#include <stdlib.h>\n"
+			"void die(void) {\n"
+			"    exit(1);\n"
+			"    int x = 1;\n"
+			"}\n",
+			"nr_shd_unshadowed.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "noreturn unshadowed: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+			      "noreturn unshadowed: unreachable still injected");
+		prism_free(&r);
+	}
+
+	/* Case 4: for-init variable shadows noreturn */
+	{
+		PrismResult r = prism_transpile_source(
+			"typedef void (*fn_t)(int);\n"
+			"fn_t get_exit(void);\n"
+			"void test_for_init(void) {\n"
+			"    for (fn_t exit = get_exit(); ; ) {\n"
+			"        exit(0);\n"
+			"        break;\n"
+			"    }\n"
+			"}\n",
+			"nr_shd_forinit.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "noreturn shadow for-init: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "__builtin_unreachable") == NULL,
+			      "noreturn shadow for-init: no unreachable injected");
+		prism_free(&r);
+	}
+
+	/* Case 5: TT_SPECIAL_FN shadow (setjmp as parameter) */
+	{
+		PrismResult r = prism_transpile_source(
+			"void test_special(void (*setjmp)(void)) {\n"
+			"    setjmp();\n"
+			"}\n",
+			"nr_shd_special.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "special_fn shadow param: transpiles OK");
+		prism_free(&r);
+	}
+}
+
 static void test_vla_deref_adjacency_parens(void) {
 	/* BUG: sizeof(*(param)) on VLA param hid the `*` from the adjacency
 	 * check because parens blocked the backward look.  Result: `= {0}`
@@ -7676,6 +7769,7 @@ void run_api_tests_4(void) {
 	test_typeof_paren_func_memset();
 	test_nested_stmtexpr_ctrl_state_desync();
 	test_noreturn_attr_arg_poisoning();
+	test_noreturn_shadow_no_unreachable();
 	GNUC_ONLY(test_vla_deref_adjacency_parens());
 	test_braceless_defer_shadow_false_positive();
 	test_braceless_typedef_scope_poison();

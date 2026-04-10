@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
-**Version:** 1.0.6
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4598+ tests + self-host stage1==stage2).
+**Version:** 1.0.7
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4812+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do. It is organized in two parts: **Part I** covers the transpiler's architecture, internal processing model, and implementation details. **Part II** provides a formal language specification for Prism's extensions to C, described in terms of the C abstract machine independently of any implementation strategy.
 
@@ -15,7 +15,7 @@ Prism is a source-to-source C transpiler. It reads preprocessed C, transforms it
 
 **Standards compatibility:** Prism accepts C99, C11, and C23 input and emits standard C compatible with GCC, Clang, and MSVC. All standard C type specifiers, qualifiers, storage classes, attributes, and control-flow constructs are recognized and passed through correctly. C23 features including `typeof_unqual`, `constexpr`, `auto` type inference, `_BitInt(N)`, `[[...]]` attributes, `alignas`/`alignof`, `static_assert`, fixed-underlying-type enums (`enum E : int { ... }`), labeled declarations, and if/switch initializers are supported. Do note Prism IS NOT officially certified in any way.
 
-Note: Prism is thoroughly empirically tested (self-hosting and 4598+ test cases) but **is not formally verified.** It is designed to compile standard-compliant code, but **may not catch every obscure constraint violation** defined by the ISO C standard.
+Note: Prism is thoroughly empirically tested (self-hosting and 4812+ test cases) but **is not formally verified.** It is designed to compile standard-compliant code, but **may not catch every obscure constraint violation** defined by the ISO C standard.
 
 The transpiler operates in two passes:
 
@@ -294,7 +294,7 @@ A single lookup returns a bitmask: `TDF_TYPEDEF`, `TDF_VLA`, `TDF_VOID`, `TDF_EN
 
 **Executed inside:** `p1_full_depth_prescan`
 
-For every variable declaration at every depth, if the declared name collides with a typedef, a `P1ShadowEntry` is recorded via `p1_register_shadow`. Shadows also create a `TDK_SHADOW` entry in the typedef table itself (with `is_shadow = true`, `scope_open_idx`, `scope_close_idx`), so that `typedef_lookup` returns the shadow entry when the token is within the shadow's scope range.
+For every variable declaration at every depth, if the declared name collides with a typedef, a `P1ShadowEntry` is recorded via `p1_register_shadow`. Shadows also create a `TDK_SHADOW` entry in the typedef table itself (with `is_shadow = true`, `scope_open_idx`, `scope_close_idx`), so that `typedef_lookup` returns the shadow entry when the token is within the shadow's scope range. Shadow registration triggers when the declared name matches any of: `TT_DEFER`, `TT_ORELSE` (keyword shadowing), `TT_NORETURN_FN`, `TT_SPECIAL_FN` (noreturn/setjmp function name shadowing), or an existing typedef/enum-constant/function-prototype entry in the typedef table (type shadowing).
 
 **Temporal ordering:** Shadows are token-order-dependent. A variable named `T` declared at token index 500 only shadows the typedef `T` for lookups at index ≥ 500 within the shadow's scope range.
 
@@ -699,6 +699,7 @@ GNU statement expressions `({…})` are supported. They get their own scope in t
 4. Must NOT be in a braceless control body (would create a multi-statement body without braces)
 5. The `__builtin_unreachable();` is emitted immediately after the `;`
 6. The predecessor token must NOT be a type keyword, qualifier, storage class, `inline`, `struct`/`union`/`enum`, `*`, or member operator — these indicate a forward declaration (`void abort(void);`) or struct field, not a call. `try_detect_noreturn_call` performs this backward check to avoid injecting `__builtin_unreachable()` after declaration prototypes
+7. The identifier must NOT be shadowed by a local variable or parameter. `try_detect_noreturn_call` queries `typedef_lookup(tok)` — if a `TDK_SHADOW` entry exists, the call is to a local variable (e.g., a function pointer parameter named `exit`), not the global noreturn function, so injection is suppressed. Shadow registration for `TT_NORETURN_FN` and `TT_SPECIAL_FN` identifiers is handled by Phase 1C's three shadow registration sites (parameters, for-init declarations, general declarations)
 
 **Disable:** `-fno-auto-unreachable` or `features.auto_unreachable = false` in library mode.
 

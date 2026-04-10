@@ -1,13 +1,13 @@
 ![Prism Banner](https://github.com/user-attachments/assets/051187c2-decd-497e-9beb-b74031eb84ed)
 
-![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-4753_pass-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
+![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-4812_pass-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
 
 ## Robust C by default
 **A dialect of C with `defer`, `orelse`, automatic zero-initialization, and progressive optimization.**
 
 Prism is a lightweight and very fast transpiler that makes C safer and faster without changing how you write it.
 
-- **4753 tests** — edge cases, control flow, nightmares, trying hard to break Prism
+- **4812 tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Two-pass transpiler** — full semantic analysis before a single byte is emitted
 - **Opt-out features** — Disable parts of the transpiler, like zero-init, with CLI flags

@@ -3592,6 +3592,10 @@ static bool is_knr_params(Token *start, Token *brace) {
 // Detect noreturn function call: tok(args);
 static inline Token *try_detect_noreturn_call(Token *tok) {
 	if (!(tok->tag & TT_NORETURN_FN)) return NULL;
+	// Respect C scoping: if a local variable/parameter shadows a noreturn
+	// function name (e.g. void (*exit)(void)), the call is not noreturn.
+	TypedefEntry *te = typedef_lookup(tok);
+	if (te && te->is_shadow) return NULL;
 	if (tok_idx(tok) >= 1) {
 		Token *prev = &token_pool[tok_idx(tok) - 1];
 		if (prev->tag & TT_MEMBER) return NULL;

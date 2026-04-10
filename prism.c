@@ -5647,7 +5647,7 @@ static void p1_register_param_shadows(Token *open, Token *close,
 		}
 		if (last_ident && (is_known_typedef(last_ident) ||
 		    is_known_enum_const(last_ident) ||
-		    (last_ident->tag & (TT_DEFER | TT_ORELSE)) ||
+		    (last_ident->tag & (TT_DEFER | TT_ORELSE | TT_NORETURN_FN | TT_SPECIAL_FN)) ||
 		    hashmap_get(&p1_func_proto_map, tok_loc(last_ident), last_ident->len)))
 			p1_register_shadow(last_ident, scope_id, brace_depth);
 		if (check_vla && last_ident) {
@@ -5755,7 +5755,7 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 
 			if (is_known_typedef(decl.var_name) ||
 			    is_known_enum_const(decl.var_name) ||
-			    (decl.var_name->tag & (TT_DEFER | TT_ORELSE)) ||
+			    (decl.var_name->tag & (TT_DEFER | TT_ORELSE | TT_NORETURN_FN | TT_SPECIAL_FN)) ||
 			    hashmap_get(&p1_func_proto_map, tok_loc(decl.var_name), decl.var_name->len))
 				p1_register_shadow(decl.var_name, cur_sid, brace_depth);
 
@@ -6540,7 +6540,7 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		// Phase 1C: shadow detection
 		if (is_known_typedef(decl.var_name) ||
 		    is_known_enum_const(decl.var_name) ||
-		    (decl.var_name->tag & (TT_DEFER | TT_ORELSE)) ||
+		    (decl.var_name->tag & (TT_DEFER | TT_ORELSE | TT_NORETURN_FN | TT_SPECIAL_FN)) ||
 		    hashmap_get(&p1_func_proto_map, tok_loc(decl.var_name), decl.var_name->len)) {
 			p1_register_shadow(decl.var_name, cur_sid, brace_depth);
 		}
