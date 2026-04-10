@@ -7254,7 +7254,8 @@ static void test_noreturn_shadow_no_unreachable(void) {
 		CHECK_EQ(r.status, PRISM_OK,
 			 "noreturn unshadowed: transpiles OK");
 		if (r.output)
-			CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+			CHECK(strstr(r.output, "__builtin_unreachable") != NULL
+			      || strstr(r.output, "__assume") != NULL,
 			      "noreturn unshadowed: unreachable still injected");
 		prism_free(&r);
 	}

@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 1.0.7
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4812+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4821+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do. It is organized in two parts: **Part I** covers the transpiler's architecture, internal processing model, and implementation details. **Part II** provides a formal language specification for Prism's extensions to C, described in terms of the C abstract machine independently of any implementation strategy.
 
@@ -15,7 +15,7 @@ Prism is a source-to-source C transpiler. It reads preprocessed C, transforms it
 
 **Standards compatibility:** Prism accepts C99, C11, and C23 input and emits standard C compatible with GCC, Clang, and MSVC. All standard C type specifiers, qualifiers, storage classes, attributes, and control-flow constructs are recognized and passed through correctly. C23 features including `typeof_unqual`, `constexpr`, `auto` type inference, `_BitInt(N)`, `[[...]]` attributes, `alignas`/`alignof`, `static_assert`, fixed-underlying-type enums (`enum E : int { ... }`), labeled declarations, and if/switch initializers are supported. Do note Prism IS NOT officially certified in any way.
 
-Note: Prism is thoroughly empirically tested (self-hosting and 4812+ test cases) but **is not formally verified.** It is designed to compile standard-compliant code, but **may not catch every obscure constraint violation** defined by the ISO C standard.
+Note: Prism is thoroughly empirically tested (self-hosting and 4821+ test cases) but **is not formally verified.** It is designed to compile standard-compliant code, but **may not catch every obscure constraint violation** defined by the ISO C standard.
 
 The transpiler operates in two passes:
 
