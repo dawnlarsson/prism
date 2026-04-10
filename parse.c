@@ -3428,6 +3428,33 @@ static void validate_defer_control_flow(Token *t, bool in_loop, bool in_switch) 
 
 static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch, int depth);
 
+// Recursively scan a balanced (...) or [...] group for orelse keywords
+// with control-flow actions.  Required because Pass 2's scan_decl_orelse
+// strips parens from initializers like `int x = (0 orelse return);`,
+// making the orelse action reachable even though Phase 1F would normally
+// skip the balanced group.
+static void defer_scan_orelse_in_group(Token *open, bool in_loop, bool in_switch, int depth) {
+	Token *end = tok_match(open);
+	if (!end) return;
+	for (Token *s = tok_next(open); s && s != end && s->kind != TK_EOF; s = tok_next(s)) {
+		if (s->flags & TF_OPEN) {
+			if (match_ch(s, '(') || match_ch(s, '['))
+				defer_scan_orelse_in_group(s, in_loop, in_switch, depth);
+			s = tok_match(s) ? tok_match(s) : s;
+			continue;
+		}
+		if (is_orelse_kw_shadow(s)) {
+			Token *act = tok_next(s);
+			if (act && match_ch(act, ';'))
+				error_tok(s, "expected statement after 'orelse'");
+			validate_defer_control_flow(act, in_loop, in_switch);
+			if (act && match_ch(act, '{'))
+				validate_defer_statement(act, in_loop, in_switch, depth + 1);
+			break;
+		}
+	}
+}
+
 static void defer_scan_hidden_stmt_exprs(Token *open, bool in_loop, bool in_switch, int depth) {
 	Token *end = tok_match(open);
 	if (!end) return;
@@ -3515,7 +3542,15 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 
 	if (FEAT(F_ORELSE)) {
 		for (Token *s = tok; s && s->kind != TK_EOF && !match_ch(s, ';'); s = tok_next(s)) {
-			if (s->flags & TF_OPEN) { s = tok_match(s); continue; }
+			if (s->flags & TF_OPEN) {
+				// Recurse into (...) and [...] to find orelse inside
+				// paren-wrapped initializers (e.g. `int x = (0 orelse return);`).
+				// Skip {...} — stmt-exprs handled by the loop below.
+				if (match_ch(s, '(') || match_ch(s, '['))
+					defer_scan_orelse_in_group(s, in_loop, in_switch, depth);
+				s = tok_match(s) ? tok_match(s) : s;
+				continue;
+			}
 			if (is_orelse_kw_shadow(s)) {
 				Token *act = tok_next(s);
 				if (act && match_ch(act, ';'))

@@ -2412,6 +2412,52 @@ static void test_defer_body_bare_orelse_return_not_rejected(void) {
 	    NULL);
 }
 
+static void test_defer_paren_wrapped_orelse_smuggling(void) {
+	printf("\n--- defer paren-wrapped orelse smuggling ---\n");
+	// (0 orelse return) — Phase 1F must recurse into parens
+	check_defer_transpile_rejects(
+	    "void f(void) {\n"
+	    "    defer {\n"
+	    "        int status = (0 orelse return);\n"
+	    "    };\n"
+	    "}\n",
+	    "defer_poe1.c",
+	    "defer-paren-orelse: return in parens must be rejected",
+	    "return");
+	// nested parens: ((0 orelse goto L))
+	check_defer_transpile_rejects(
+	    "void f(void) {\n"
+	    "    defer {\n"
+	    "        int x = ((0 orelse goto done));\n"
+	    "    };\n"
+	    "    done: ;\n"
+	    "}\n",
+	    "defer_poe2.c",
+	    "defer-paren-orelse: goto in nested parens must be rejected",
+	    NULL);
+	// bracket-wrapped: arr[0 orelse return]
+	check_defer_transpile_rejects(
+	    "void f(void) {\n"
+	    "    int arr[2];\n"
+	    "    defer {\n"
+	    "        int x = arr[0 orelse return];\n"
+	    "    };\n"
+	    "}\n",
+	    "defer_poe3.c",
+	    "defer-bracket-orelse: return in brackets must be rejected",
+	    "return");
+	// paren-wrapped orelse block: (0 orelse { return; })
+	check_defer_transpile_rejects(
+	    "void f(void) {\n"
+	    "    defer {\n"
+	    "        int status = (0 orelse { return; });\n"
+	    "    };\n"
+	    "}\n",
+	    "defer_poe4.c",
+	    "defer-paren-orelse-block: return in orelse block in parens must be rejected",
+	    "return");
+}
+
 #ifndef _WIN32
 static void test_defer_paren_vfork_bypass(void) {
 	// (vfork)() is equivalent to vfork() but bypasses the strict `vfork(` check
@@ -6080,6 +6126,7 @@ void run_defer_tests(void) {
         test_defer_void_parens_return();
 	test_defer_varname_return_value_dropped();
 	test_defer_body_bare_orelse_return_not_rejected();
+	test_defer_paren_wrapped_orelse_smuggling();
 	test_defer_label_duplication_rejected();
 	test_defer_variable_shadowing_binds_wrong_scope();
 	test_defer_safe_shadow_no_exit();
