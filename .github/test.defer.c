@@ -6093,6 +6093,84 @@ static void test_defer_sue_prefix_bypass(void) {
 	}
 }
 
+static void test_braceless_shadow_scope_leak(void) {
+	printf("\n--- braceless body shadow scope leak ---\n");
+
+	// Case 1: typedef shadow from braceless body shouldn't poison rest of function.
+	// Zero-init must still work after the braceless body ends.
+	{
+		const char *code =
+			"typedef int Arr5[5];\n"
+			"void f(int bypass) {\n"
+			"    if (bypass)\n"
+			"        int Arr5;\n"
+			"    Arr5 buf;\n"
+			"}\n";
+		PrismResult r = prism_transpile_source(code, "shd_lk1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "shadow scope leak case 1: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "buf = {0}") != NULL,
+			      "shadow scope leak case 1: typedef recovered, gets = {0}");
+		}
+		prism_free(&r);
+	}
+
+	// Case 2: VLA typedef + goto-over-VLA must be caught despite braceless shadow.
+	{
+		const char *code =
+			"void f(int n, int bypass) {\n"
+			"    typedef int VT[n];\n"
+			"    if (bypass)\n"
+			"        int VT;\n"
+			"    goto L;\n"
+			"    VT vla;\n"
+			"L:\n"
+			"    return;\n"
+			"}\n";
+		PrismResult r = prism_transpile_source(code, "shd_lk2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "shadow scope leak case 2: goto over VLA rejected");
+		prism_free(&r);
+	}
+
+	// Case 3: while braceless body shadow also properly scoped.
+	{
+		const char *code =
+			"typedef int Arr3[3];\n"
+			"void f(int c) {\n"
+			"    while (c)\n"
+			"        int Arr3;\n"
+			"    Arr3 buf;\n"
+			"}\n";
+		PrismResult r = prism_transpile_source(code, "shd_lk3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "shadow scope leak case 3: while body OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "buf = {0}") != NULL,
+			      "shadow scope leak case 3: typedef recovered after while");
+		}
+		prism_free(&r);
+	}
+
+	// Case 4: VLA variable entry in braceless body doesn't leak.
+	{
+		const char *code =
+			"void f(int n, int bypass) {\n"
+			"    if (bypass)\n"
+			"        int vla[n];\n"
+			"    goto L;\n"
+			"    int x;\n"
+			"L:\n"
+			"    return;\n"
+			"}\n";
+		PrismResult r = prism_transpile_source(code, "shd_lk4.c", prism_defaults());
+		// The goto over 'int x' (non-VLA, has init via zeroinit) should be caught.
+		// But crucially, the VLA in the braceless body must NOT poison the scope.
+		CHECK(r.status != PRISM_OK,
+		      "shadow scope leak case 4: goto over initialized decl rejected");
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_rejected();
@@ -6390,4 +6468,7 @@ void run_defer_tests(void) {
 
 	// prefix bypass: __extension__/[[...]]/volatile before SUE in defer
 	test_defer_sue_prefix_bypass();
+
+	// braceless body shadow scope leak (typedef poisoning)
+	test_braceless_shadow_scope_leak();
 }

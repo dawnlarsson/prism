@@ -6541,6 +6541,13 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		if (stmt_end)
 			braceless_close_idx = tok_idx(stmt_end);
 	}
+	// Narrow typedef scope for braceless bodies so that shadows and
+	// VLA variable entries don't leak past the statement boundary.
+	// Without this, `if (c) int MyTypedef;` poisons the typedef name
+	// for the remainder of the enclosing block (C11 §6.8.4p3 violation).
+	TD_SCOPE_SAVE();
+	if (braceless_close_idx > 0)
+		td_scope_close = braceless_close_idx;
 	Token *t = type.end;
 	bool vm_type = (type.has_typeof || type.has_atomic) && type.is_vla;
 	bool any_would_memset = false;
@@ -6710,6 +6717,7 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 
 		if (t && match_ch(t, ',')) { t = tok_next(t); } else break;
 	}
+	TD_SCOPE_RESTORE();
 }
 
 
