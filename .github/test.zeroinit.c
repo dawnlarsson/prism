@@ -3524,6 +3524,102 @@ static void test_typeof_atomic_paren_struct_scan(void) {
 	}
 }
 
+/* GNU attribute before struct tag steals the tag name.
+ * struct __attribute__((aligned(8))) VolatileRegs { volatile int status; }
+ * Phase 1D tag scanner registered "aligned" instead of "VolatileRegs".
+ * tag_lookup("VolatileRegs") returns NULL → volatile-safe byte loop
+ * not generated → memset UB on volatile struct (C11 §6.7.3p6). */
+static void test_attributed_struct_tag_volatile(void) {
+	printf("\n--- Attributed Struct Tag Volatile ---\n");
+
+	/* GNU __attribute__ before tag name */
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct __attribute__((aligned(8))) VolRegs {\n"
+		    "    volatile int status;\n"
+		    "};\n"
+		    "void f(int n) {\n"
+		    "    struct VolRegs regs[n];\n"
+		    "    (void)regs;\n"
+		    "}\n",
+		    "attr_vol.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "attr struct volatile: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "__prism_p_") != NULL,
+			      "attr struct volatile: byte loop (not memset)");
+			CHECK(strstr(r.output, "__builtin_memset") == NULL,
+			      "attr struct volatile: no memset (volatile UB)");
+		}
+		prism_free(&r);
+	}
+
+	/* GNU __attribute__ before tag + VLA field */
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct __attribute__((packed)) VlaPkt {\n"
+		    "    int data[10];\n"
+		    "};\n"
+		    "void f(int n) {\n"
+		    "    struct VlaPkt pkts[n];\n"
+		    "    (void)pkts;\n"
+		    "}\n",
+		    "attr_vla.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "attr struct VLA: transpiles");
+		/* Non-VLA body — normal memset is fine. Just don't crash. */
+		prism_free(&r);
+	}
+}
+
+/* C11 §6.2.3 namespace collision in typedef_add_entry.
+ * When struct tag and typedef share a name at same scope, the duplicate
+ * check blindly blocks the later entry regardless of kind.
+ * Case A: typedef first → struct tag not registered → volatile info lost.
+ * Case B: struct tag first → typedef not registered → declaration invisible. */
+static void test_sue_typedef_namespace_collision(void) {
+	printf("\n--- SUE/Typedef Namespace Collision (C11 6.2.3) ---\n");
+
+	/* Case A: typedef THEN struct tag at same scope.
+	 * Both must coexist; typeof(struct Object) must get volatile-safe init. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "typedef int Object;\n"
+		    "struct Object { volatile int x; };\n"
+		    "void f(int n) {\n"
+		    "    typeof(struct Object) regs[n];\n"
+		    "    (void)regs;\n"
+		    "}\n",
+		    "ns_tdef_first.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "ns typedef-first: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "__prism_p_") != NULL,
+			      "ns typedef-first: byte loop (struct volatile survived)");
+			CHECK(strstr(r.output, "__builtin_memset") == NULL,
+			      "ns typedef-first: no memset (volatile UB)");
+		}
+		prism_free(&r);
+	}
+
+	/* Case B: struct tag THEN typedef at same scope.
+	 * typedef int Object must still be recognized as a type. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct Object { volatile int x; };\n"
+		    "typedef int Object;\n"
+		    "void f(void) {\n"
+		    "    Object obj;\n"
+		    "    obj = 42;\n"
+		    "}\n",
+		    "ns_tag_first.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "ns tag-first: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "Object obj = {0}") != NULL ||
+			      strstr(r.output, "Object obj = 0") != NULL,
+			      "ns tag-first: typedef recognized, zero-init emitted");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -3690,4 +3786,10 @@ void run_zeroinit_tests(void) {
 
 	// typeof()/_Atomic() paren-skipping in struct body scanners
 	GNUC_ONLY(test_typeof_atomic_paren_struct_scan());
+
+	// VULN1: GNU attribute before struct tag steals tag name
+	GNUC_ONLY(test_attributed_struct_tag_volatile());
+
+	// VULN2: C11 §6.2.3 namespace collision struct tag vs typedef
+	GNUC_ONLY(test_sue_typedef_namespace_collision());
 }

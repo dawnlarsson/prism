@@ -2324,7 +2324,8 @@ typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool i
 		if (existing >= 0) {
 			TypedefEntry *prev = &typedef_table.entries[existing];
 			if (prev->scope_depth == scope_depth && !prev->is_shadow &&
-			    prev->scope_open_idx == td_scope_open && prev->scope_close_idx == td_scope_close)
+			    prev->scope_open_idx == td_scope_open && prev->scope_close_idx == td_scope_close &&
+			    prev->is_struct_tag == (kind == TDK_STRUCT_TAG))
 				return;
 		}
 	}
@@ -2365,14 +2366,21 @@ static TypedefEntry *typedef_lookup(Token *tok) {
 	if (!(typedef_table.bloom & (1ULL << ((c0 ^ tl) & 63)))) return NULL;
 	int idx = typedef_get_index(tok_loc(tok), tok->len);
 	uint32_t cur = tok_idx(tok);
+	// Prefer non-struct-tag entries (ordinary identifiers) over struct tags.
+	// ISO C11 §6.2.3: tag namespace is separate from ordinary identifiers.
+	// When both exist at the same scope, the ordinary entry wins.
+	// Fall back to struct tag only if no ordinary entry matches.
+	TypedefEntry *tag_fallback = NULL;
 	while (idx >= 0) {
 		TypedefEntry *e = &typedef_table.entries[idx];
 		if (e->token_index <= cur &&
-		    cur >= e->scope_open_idx && cur < e->scope_close_idx)
-			return e;
+		    cur >= e->scope_open_idx && cur < e->scope_close_idx) {
+			if (!e->is_struct_tag) return e;
+			if (!tag_fallback) tag_fallback = e;
+		}
 		idx = e->prev_index;
 	}
-	return NULL;
+	return tag_fallback;
 }
 
 // Lookup a struct/union tag entry, skipping ordinary identifiers/shadows.
@@ -2975,19 +2983,32 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			if (tok && tok->len == 1 && tok->ch0 == '(') {
 				Token *end = skip_balanced_group(tok);
 				if (tok_next(tok) && equal(tok_next(tok), "void") && tok_next(tok_next(tok)) == tok_match(tok)) r.has_void = true;
-				if (!is_unqual)
+				if (!is_unqual) {
+					bool saw_sue = false;
 					for (Token *t = tok_next(tok); t && t != end; t = tok_next(t)) {
 						if (t->tag & TT_VOLATILE) r.has_volatile = true;
 						if (t->tag & TT_CONST) r.has_const = true;
 						if ((t->tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE))
 							r.has_atomic = true;
 						if ((t->tag & TT_SUE) || (typedef_flags(t) & TDF_AGGREGATE)) r.is_struct = true;
+						if (t->tag & TT_SUE) { saw_sue = true; continue; }
 						if (is_identifier_like(t)) {
+							// After struct/union keyword, use tag_lookup for
+							// ISO C11 §6.2.3 namespace separation.
+							if (saw_sue) {
+								TypedefEntry *tag_e = tag_lookup(t);
+								if (tag_e) {
+									if (tag_e->is_vla) r.is_vla = true;
+									if (tag_e->has_volatile_member) r.has_volatile_member = true;
+								}
+								saw_sue = false;
+							}
 							int tf = typedef_flags(t);
 							if (tf & TDF_VOLATILE) r.has_volatile = true;
 							if (tf & TDF_HAS_VOL_MEMBER) r.has_volatile_member = true;
 						}
 					}
+				}
 				scan_paren_for_vla(tok, end, &r, false);
 				tok = end;
 			}

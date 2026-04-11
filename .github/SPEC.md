@@ -261,7 +261,7 @@ Each `TypedefEntry` records:
 - `scope_open_idx`, `scope_close_idx` — token index range of the enclosing scope (set from `td_scope_open` / `td_scope_close` thread-locals, which are updated as Phase 1 enters/exits scopes)
 - `token_index` — pool index of the declaration
 - `is_vla`, `is_void`, `is_const`, `is_volatile`, `is_ptr`, `is_array`, `is_aggregate`, `has_volatile_member` — type property flags
-- `is_shadow`, `is_enum_const`, `is_vla_var`, `is_struct_tag` — entry kind flags. `is_struct_tag` entries (`TDK_STRUCT_TAG`) are registered for struct/union tags that have VLA members or volatile-qualified fields; they do NOT receive `P1_IS_TYPEDEF` annotation, preserving `struct Foo` parsing (the tag is not an ordinary typedef name per ISO C11 §6.2.3)
+- `is_shadow`, `is_enum_const`, `is_vla_var`, `is_struct_tag` — entry kind flags. `is_struct_tag` entries (`TDK_STRUCT_TAG`) are registered for struct/union tags that have VLA members or volatile-qualified fields; they do NOT receive `P1_IS_TYPEDEF` annotation, preserving `struct Foo` parsing (the tag is not an ordinary typedef name per ISO C11 §6.2.3). Tag name extraction in Phase 1D uses `skip_noise()` to skip GNU `__attribute__` and C23 `[[...]]` attributes between the struct/union keyword and the tag name, and skips `TT_QUALIFIER` tokens
 - `is_func` — set when the typedef resolves to a function type (used to suppress zero-init memset on function types). Detection works for both `typedef int FuncType(int)` (parse_declarator returns `end=NULL`, check for `(` after name) and `typedef int (FuncType)(int)` (parse_declarator sets `is_func_ptr=true` without `paren_pointer` — function type, not function pointer). **Chained typedef propagation:** `parse_typedef_declaration` propagates `is_func` through typedef chains via `base_is_func`: when the base type specifier contains a function typedef (`is_func_typedef`), the derived typedef inherits `is_func = true` (guarded by `!decl.is_pointer && !decl.is_array && !decl.is_func_ptr`). Without this, `typedef func_t alias; alias f;` would lose the function-type property and Prism would emit `= {0}` or `memset` on a function symbol — a fatal constraint violation (ISO C11 §6.5.3.4p1 forbids `sizeof` on function types).
 - `is_param` — set for function parameter shadow entries (registered by `p1_register_param_shadows`). Used by `array_size_is_vla` to distinguish VLA parameters (which decay to pointers, making `sizeof(param)` constant) from VLA locals.
 - `prev_index` — chain to previous entry for the same name
@@ -270,7 +270,11 @@ Each `TypedefEntry` records:
 
 #### Typedef lookup (range-based scoping)
 
-`typedef_lookup(tok)` walks the chain for a name and returns the first entry where:
+`typedef_lookup(tok)` walks the chain for a name and returns the first **non-struct-tag** entry in scope. When no ordinary entry matches, it falls back to the first matching struct tag entry. This preference ordering enforces ISO C11 §6.2.3 namespace separation: when both `typedef int Foo;` and `struct Foo { ... };` coexist at the same scope, `typedef_lookup` returns the typedef entry (with `TDF_TYPEDEF`), not the struct tag. When only a struct tag exists (e.g. `Inner` inside `struct Outer { struct Inner hw; }`), the struct tag is returned as fallback, preserving `TDF_HAS_VOL_MEMBER` and `TDF_VLA` access via `typedef_flags`.
+
+The duplicate-detection guard in `typedef_add_entry` compares entry kind (`prev->is_struct_tag == (kind == TDK_STRUCT_TAG)`) in addition to scope depth and range — a `TDK_TYPEDEF` and `TDK_STRUCT_TAG` with the same name at the same scope are NOT duplicates (separate C11 namespaces).
+
+Scope check for each candidate entry:
 
 ```
 entry.token_index <= tok_idx(tok) AND
@@ -282,7 +286,7 @@ This range-based check eliminates runtime scope unwinding. There is no `active_s
 
 #### tag_lookup (C namespace isolation)
 
-`tag_lookup(tok)` walks the same `prev_index` hash chain as `typedef_lookup` but filters for `e->is_struct_tag` entries only. This enforces ISO C11 §6.2.3 namespace separation: struct/union/enum tags exist in a different namespace from ordinary identifiers. When `parse_type_specifier` encounters `struct Foo`, it calls `tag_lookup(sue_tag)` instead of `typedef_flags(sue_tag)` to read `is_vla` and `has_volatile_member` directly from the tag entry. This prevents an ordinary variable named `Foo` (which creates a `TDK_SHADOW` in the unified hash chain) from hiding the struct tag's VLA/volatile properties.
+`tag_lookup(tok)` walks the same `prev_index` hash chain as `typedef_lookup` but filters for `e->is_struct_tag` entries only. This enforces ISO C11 §6.2.3 namespace separation: struct/union/enum tags exist in a different namespace from ordinary identifiers. When `parse_type_specifier` encounters `struct Foo`, it calls `tag_lookup(sue_tag)` instead of `typedef_flags(sue_tag)` to read `is_vla` and `has_volatile_member` directly from the tag entry. This prevents an ordinary variable named `Foo` (which creates a `TDK_SHADOW` in the unified hash chain) from hiding the struct tag's VLA/volatile properties. The `typeof(struct Tag)` handler in `parse_type_specifier` also uses `tag_lookup` (via `saw_sue` tracking) to resolve struct tag volatile/VLA info when the tag name also exists as an ordinary typedef.
 
 #### typedef_flags query
 

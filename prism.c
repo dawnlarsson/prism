@@ -1223,6 +1223,27 @@ static inline bool is_orelse_keyword(Token *tok) {
 	return true;
 }
 
+// Check if [start, end) is strictly a bare function call: IDENT ( ... )
+// with nothing else before or after.  Used to exempt bare calls from
+// the typeof(RHS) side-effect check: function return types are never
+// variably modified (C11 §6.7.6.3p1), so typeof(f(...)) never evaluates
+// f() at runtime.  Cast expressions are NOT exempt: (T)f() can introduce
+// a VM type (pointer-to-VLA), causing typeof() to evaluate the operand.
+static bool is_strictly_bare_call(Token *start, Token *end) {
+	Token *t = start;
+	while (t && t != end && t->kind == TK_PREP_DIR) t = tok_next(t);
+	if (!t || t == end || !is_valid_varname(t) || is_type_keyword(t)) return false;
+	Token *fn = t;
+	t = tok_next(fn);
+	while (t && t != end && t->kind == TK_PREP_DIR) t = tok_next(t);
+	if (!t || t == end || !match_ch(t, '(') || !(t->flags & TF_OPEN)) return false;
+	Token *close = tok_match(t);
+	if (!close) return false;
+	t = tok_next(close);
+	while (t && t != end && t->kind == TK_PREP_DIR) t = tok_next(t);
+	return t == end;
+}
+
 // Reject side effects on the LHS of an orelse expression that would be duplicated.
 // `ctx_msg` is the prefix for the error message (e.g. "orelse in typeof", "orelse on assignment").
 // `check_asm` enables TT_ASM check (for bare assignment path).
@@ -5206,20 +5227,20 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 				// typeof(RHS) physically emits RHS tokens twice:
 				// once inside typeof() and once for the initializer.
 				// typeof(EXPR) evaluates its operand when the result
-				// type is variably modified (C11 §6.7.2.4p2).  We
-				// cannot determine VM-ness at the token level, so
-				// reject ALL side effects unconditionally — including
-				// bare function calls (a function can return a pointer
-				// to a VLA, which is a VM type).
+				// type is variably modified (C11 §6.7.2.4p2).
+				// Exempt strictly bare function calls: function return
+				// types are never VM (C11 §6.7.6.3p1), so typeof(f())
+				// never evaluates f().
 				// Phase 1D is the primary check; this is defense-in-depth.
 				{
 					Token *rhs_s = tok_next(bare_assign_eq);
-					reject_orelse_side_effects(
-						rhs_s, orelse_tok,
-						"bare orelse with indirection in LHS",
-						"in the RHS (typeof(RHS) may evaluate for VM types "
-						"per C11 6.7.2.4p2; hoist to a variable)",
-						false, false, true);
+					if (!is_strictly_bare_call(rhs_s, orelse_tok))
+						reject_orelse_side_effects(
+							rhs_s, orelse_tok,
+							"bare orelse with indirection in LHS",
+							"in the RHS (typeof(RHS) may evaluate for VM types "
+							"per C11 6.7.2.4p2; hoist to a variable)",
+							false, false, true);
 					// Also check control-flow keywords in stmt-exprs
 					// (Prism state-machine corruption, separate from VM)
 					for (Token *ck = rhs_s; ck && ck != orelse_tok && ck->kind != TK_EOF; ck = tok_next(ck))
@@ -6157,14 +6178,18 @@ p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
 				{ lhs_indir = true; break; }
 		if (lhs_indir) {
 			Token *rhs_start = tok_next(eq_tok);
-			reject_orelse_side_effects(
-				rhs_start, bare_oe,
-				"bare orelse with indirection in LHS",
-				"in the RHS expression (typeof(RHS) evaluates its "
-				"operand for variably-modified types per C11 "
-				"\xc2\xa7" "6.7.2.4p2, causing double evaluation); "
-				"hoist to a variable first",
-				false, false, true);
+			// Function return types are never VM (C11 §6.7.6.3p1),
+			// so typeof(f(...)) never evaluates the call at runtime.
+			// Skip the entire side-effect check for strictly bare calls.
+			if (!is_strictly_bare_call(rhs_start, bare_oe))
+				reject_orelse_side_effects(
+					rhs_start, bare_oe,
+					"bare orelse with indirection in LHS",
+					"in the RHS expression (typeof(RHS) evaluates its "
+					"operand for variably-modified types per C11 "
+					"\xc2\xa7" "6.7.2.4p2, causing double evaluation); "
+					"hoist to a variable first",
+					false, false, true);
 		}
 	}
 
@@ -7328,7 +7353,10 @@ static void p1_full_depth_prescan(Token *tok) {
 						// "struct S s;" can detect VLA/volatile members.
 						// Always use TDK_STRUCT_TAG so tag_lookup() finds
 						// the entry (namespace-safe vs ordinary idents).
-						for (Token *t = tok_next(tok); t && t != brace; t = tok_next(t))
+						// Skip attributes and qualifiers before tag name
+						// (e.g. struct __attribute__((aligned(8))) Tag {).
+						for (Token *t = skip_noise(tok_next(tok)); t && t != brace; t = skip_noise(tok_next(t))) {
+							if (t->tag & TT_QUALIFIER) continue;
 							if (is_valid_varname(t)) {
 								int pre = typedef_table.count;
 								typedef_add_entry(tok_loc(t), t->len, brace_depth, TDK_STRUCT_TAG, body_vla, false);
@@ -7340,6 +7368,8 @@ static void p1_full_depth_prescan(Token *tok) {
 								}
 								break;
 							}
+							break;
+						}
 					}
 				}
 			}

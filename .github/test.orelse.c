@@ -7114,10 +7114,10 @@ static void test_bare_orelse_rhs_incr_vm_double_eval(void) {
 		prism_free(&r);
 	}
 
-	// Sub-test 3: function call RHS with LHS deref — rejected
-	// VM-ness of return type cannot be determined at the token level;
-	// a function could return a pointer to a VLA (VM type), making
-	// typeof(RHS) evaluate the call at runtime (C11 §6.7.2.4p2).
+	// Sub-test 3: bare function call RHS with LHS deref — accepted
+	// Function return types are never VM (C11 §6.7.6.3p1), so
+	// typeof(f()) never evaluates f() at runtime.  Both GCC and
+	// Clang reject VM function return types.
 	{
 		const char *code =
 		    "int *get(void);\n"
@@ -7125,10 +7125,10 @@ static void test_bare_orelse_rhs_incr_vm_double_eval(void) {
 		    "    *pp = get() orelse 0;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "rhs_call_ok.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "rhs-call-vm: function call RHS with LHS indirection rejected");
-		CHECK(r.error_msg && strstr(r.error_msg, "function"),
-		      "rhs-call-vm: error mentions function call");
+		CHECK_EQ(r.status, PRISM_OK,
+		      "rhs-call-vm: bare function call RHS with LHS indirection accepted");
+		CHECK(r.output && strstr(r.output, "get"),
+		      "rhs-call-vm: output contains function call");
 		prism_free(&r);
 	}
 
@@ -7218,18 +7218,18 @@ static void test_bare_orelse_rhs_incr_vm_double_eval(void) {
 	}
 }
 
-// variably-modified (C11 §6.7.2.4p2).  If LHS contains a subscript, deref,
-// or member access into a VM-typed expression (e.g. pointer-to-VLA),
-// Prism's bare value orelse emits:
-//   { typeof(RHS) tmp = (RHS); LHS = tmp ? tmp : fallback; }
-// typeof(RHS) evaluates RHS at runtime when the result type is VM.
-// A function CAN return a VM type (e.g. pointer to VLA), so ALL
-// function calls in RHS with LHS indirection are now rejected.
+// typeof(RHS) side-effect check with LHS indirection.
+// When LHS has subscript, deref, or member access, Prism's bare value
+// orelse emits: { typeof(RHS) tmp = (RHS); if(tmp) LHS=tmp; else LHS=fb; }
+// typeof(RHS) evaluates RHS at runtime when the result type is VM
+// (C11 §6.7.2.4p2).  Strictly bare function calls (IDENT(...)) are
+// exempt: function return types are never VM (C11 §6.7.6.3p1).
+// Non-bare expressions (casts, subscripts, ++/--, arithmetic) still rejected.
 static void test_orelse_typeof_vm_double_eval(void) {
 	printf("\n--- typeof VM double eval ---\n");
 
-	// Sub-test 1: subscript LHS + function call RHS — rejected
-	// VM-ness of return type cannot be determined at token level.
+	// Sub-test 1: subscript LHS + bare function call RHS — accepted
+	// Function return types are never VM (C11 §6.7.6.3p1).
 	{
 		const char *code =
 		    "int *get(void);\n"
@@ -7237,12 +7237,12 @@ static void test_orelse_typeof_vm_double_eval(void) {
 		    "    matrix[0] = get() orelse 0;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vm_sub.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "typeof-vm: subscript LHS + call RHS rejected");
+		CHECK_EQ(r.status, PRISM_OK,
+		      "typeof-vm: subscript LHS + call RHS accepted");
 		prism_free(&r);
 	}
 
-	// Sub-test 2: deref LHS + function call RHS — rejected
+	// Sub-test 2: deref LHS + bare function call RHS — accepted
 	{
 		const char *code =
 		    "int *get(void);\n"
@@ -7250,12 +7250,12 @@ static void test_orelse_typeof_vm_double_eval(void) {
 		    "    *pp = get() orelse 0;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vm_deref.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "typeof-vm: deref LHS + call RHS rejected");
+		CHECK_EQ(r.status, PRISM_OK,
+		      "typeof-vm: deref LHS + call RHS accepted");
 		prism_free(&r);
 	}
 
-	// Sub-test 3: member access LHS + function call RHS — rejected
+	// Sub-test 3: member access LHS + bare function call RHS — accepted
 	{
 		const char *code =
 		    "struct S { int *p; };\n"
@@ -7264,8 +7264,8 @@ static void test_orelse_typeof_vm_double_eval(void) {
 		    "    s->p = get() orelse 0;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vm_member.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "typeof-vm: member LHS + call RHS rejected");
+		CHECK_EQ(r.status, PRISM_OK,
+		      "typeof-vm: member LHS + call RHS accepted");
 		prism_free(&r);
 	}
 
@@ -7295,8 +7295,10 @@ static void test_orelse_typeof_vm_double_eval(void) {
 		prism_free(&r);
 	}
 
-	// Sub-test 6: the exploit case — volatile deref in subscript with VM type.
-	// Now rejected: function call in RHS with LHS indirection.
+	// Sub-test 6: volatile deref in subscript, bare function call RHS.
+	// Accepted: function return types are never VM (C11 §6.7.6.3p1).
+	// The if/else expansion evaluates LHS only in the taken branch,
+	// so the volatile *mmio read fires exactly once — no double read.
 	{
 		const char *code =
 		    "int *get_vla_ptr(void);\n"
@@ -7304,24 +7306,22 @@ static void test_orelse_typeof_vm_double_eval(void) {
 		    "    matrix[*mmio] = get_vla_ptr() orelse 0;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vm_exploit.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "typeof-vm: VM-type exploit case rejected");
+		CHECK_EQ(r.status, PRISM_OK,
+		      "typeof-vm: volatile LHS + bare call RHS accepted");
 		prism_free(&r);
 	}
 }
 
-// CVE-class: VM-type double-evaluation vulnerability.
-// A function CAN return a pointer to a VLA (VM type), e.g.
-// int (*f(void))[dynamic_size].  When Prism wraps such a call in
-// typeof(f()), the VM type forces runtime evaluation of the operand
-// (C11 §6.7.2.4p2), executing the function TWICE (once in typeof,
-// once in the initializer).  The old rhs_is_bare_call exemption
-// skipped the side-effect scanner for bare function calls, assuming
-// function return types are never VM — that assumption was wrong.
+// Bare function call exception for the typeof(RHS) side-effect check.
+// Function return types are never VM (C11 §6.7.6.3p1 — both GCC
+// and Clang reject VM function return types), so typeof(f()) never
+// evaluates the operand at runtime.  Strictly bare calls (IDENT(...))
+// with LHS indirection are accepted.  Non-bare expressions (casts,
+// subscripts, arithmetic) are still rejected.
 static void test_orelse_vm_return_type_double_eval(void) {
 	printf("\n--- VM return type double eval ---\n");
 
-	// 1. Bare function call with LHS indirection — must be rejected
+	// 1. Bare function call with LHS indirection — accepted
 	{
 		const char *code =
 		    "int *alloc(void);\n"
@@ -7329,10 +7329,10 @@ static void test_orelse_vm_return_type_double_eval(void) {
 		    "    *pp = alloc() orelse 0;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vm_ret1.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "vm-ret: bare call + LHS indirection rejected");
-		CHECK(r.error_msg && strstr(r.error_msg, "function"),
-		      "vm-ret: error mentions function call");
+		CHECK_EQ(r.status, PRISM_OK,
+		      "vm-ret: bare call + LHS indirection accepted");
+		CHECK(r.output && strstr(r.output, "alloc"),
+		      "vm-ret: output contains alloc call");
 		prism_free(&r);
 	}
 
@@ -7376,7 +7376,7 @@ static void test_orelse_vm_return_type_double_eval(void) {
 		prism_free(&r);
 	}
 
-	// 5. Member access LHS + function call — rejected
+	// 5. Member access LHS + bare function call — accepted
 	{
 		const char *code =
 		    "struct S { int *p; };\n"
@@ -7385,12 +7385,12 @@ static void test_orelse_vm_return_type_double_eval(void) {
 		    "    s->p = alloc() orelse 0;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vm_ret5.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "vm-ret: member access LHS + call rejected");
+		CHECK_EQ(r.status, PRISM_OK,
+		      "vm-ret: member access LHS + call accepted");
 		prism_free(&r);
 	}
 
-	// 6. Subscript LHS + function call — rejected
+	// 6. Subscript LHS + bare function call — accepted
 	{
 		const char *code =
 		    "int *alloc(void);\n"
@@ -7398,8 +7398,8 @@ static void test_orelse_vm_return_type_double_eval(void) {
 		    "    arr[0] = alloc() orelse 0;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "vm_ret6.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "vm-ret: subscript LHS + call rejected");
+		CHECK_EQ(r.status, PRISM_OK,
+		      "vm-ret: subscript LHS + call accepted");
 		prism_free(&r);
 	}
 
