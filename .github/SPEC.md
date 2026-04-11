@@ -481,8 +481,8 @@ Tokens with tag bits or at statement boundaries are dispatched to handlers:
 | Handler | Trigger | Action |
 |---|---|---|
 | `handle_goto_keyword` | `TT_GOTO` | Emit defer cleanup (LIFO unwinding to target label depth), emit `goto`. Safety checks are in Phase 2A. |
-| `handle_open_brace` | `{` | Push scope. Read `P1_SCOPE_*` from `tok->ann` for classification. Handle compound-literal-in-ctrl-paren, stmt_expr detection. |
-| `handle_close_brace` | `}` | Pop scopes, emit defers (LIFO), restore ctrl_state for stmt-expr inside ctrl parens. |
+| `handle_open_brace` | `{` | Push scope. Read `P1_SCOPE_*` from `tok->ann` for classification. Handle compound-literal-in-ctrl-paren and in braceless body (`P1_SCOPE_INIT` bypass: no scope push, increment `ctrl_state.brace_depth` instead), stmt_expr detection. |
+| `handle_close_brace` | `}` | Pop scopes, emit defers (LIFO), restore ctrl_state for stmt-expr inside ctrl parens. Compound-literal bypass: when `ctrl_state.pending && brace_depth > 0`, decrement `brace_depth` (matches open-brace bypass symmetrically — no scope to pop). |
 | `try_zero_init_decl` | Statement start, type keyword/typedef | Parse declaration, insert `= {0}` or `= 0` or `memset` call. |
 | `p1_label_find` | `TT_GOTO` dispatch | O(1) label lookup via `FuncMeta.label_hash` (persisted from Phase 2A); falls back to linear scan if no hash. |
 | Orelse handlers | `TT_ORELSE` | Multiple handlers for bracket, decl-init, block, bare-assign, bare-action, bare-compound forms. |
@@ -897,7 +897,7 @@ These are inherently runtime and cannot move to Pass 1:
 
 - **Scope stack push/pop** — driven by `{`/`}` during emit; timing drives defer cleanup
 - **Defer stack** — `defer_add` at keyword, `emit_defers` at `}`/return/break/continue/goto
-- **CtrlState** — braceless control-flow brace injection: `pending`, `pending_for_paren`, `parens_just_closed`, `brace_depth`. Tracking is inherently sequential and cannot move to Pass 1 without new infrastructure.
+- **CtrlState** — braceless control-flow brace injection: `pending`, `pending_for_paren`, `parens_just_closed`, `brace_depth`. Tracking is inherently sequential and cannot move to Pass 1 without new infrastructure. `end_statement_after_semicolon` resets `ctrl_state` only when `!in_ctrl_paren() && !in_struct_body()` — struct/enum/init body semicolons must not clear the braceless-body tracking state (prevents stale `SCOPE_CTRL_PAREN` leak from compound literals like `(struct {int x;}){0}` in braceless bodies). `emit_ctrl_condition` clears `parens_just_closed` before processing condition tokens to prevent stale brace-wrap from outer braceless contexts (e.g. `else for(int i=0;...)`).
 - **`at_stmt_start`** — inherently sequential
 - **`ret_counter`** — monotonic during emit
 - **Line directive / whitespace emission** — tied to output position

@@ -3597,6 +3597,109 @@ static void test_compound_literal_ctrl_state_desync(void) {
 		         "compound-lit-ctrl-desync: braceless while + compound literal transpiles OK");
 		prism_free(&r);
 	}
+
+	// Case 4: simple compound literal in braceless if — scope underflow.
+	// handle_open_brace bypassed scope_push (P1_SCOPE_INIT), but
+	// handle_close_brace required in_ctrl_paren() to match — asymmetric.
+	{
+		const char *code =
+		    "void f(int c) {\n"
+		    "    if (c)\n"
+		    "        (void)(int){0};\n"
+		    "    defer { }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "cl_braceless_if.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "compound-lit-ctrl-desync: braceless if + (int){0} + defer OK");
+		prism_free(&r);
+	}
+
+	// Case 5: struct compound literal in braceless if — ctrl_state leak.
+	// Struct body ';' triggered end_statement_after_semicolon → ctrl_reset(),
+	// leaving stale SCOPE_CTRL_PAREN on the scope stack.
+	{
+		const char *code =
+		    "#include <stdio.h>\n"
+		    "void f(int c) {\n"
+		    "    if (c)\n"
+		    "        (void)(struct {int x;}){0};\n"
+		    "    defer { printf(\"ok\\n\"); }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "cl_struct_braceless.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "compound-lit-ctrl-desync: braceless if + struct compound literal + defer OK");
+		prism_free(&r);
+	}
+
+	// Case 6: double compound literal in braceless if body.
+	{
+		const char *code =
+		    "void f(int c) {\n"
+		    "    if (c)\n"
+		    "        (void)(int){0};\n"
+		    "    if (c)\n"
+		    "        (void)(int){0};\n"
+		    "    defer { }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "cl_double.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "compound-lit-ctrl-desync: double braceless if + compound literal OK");
+		prism_free(&r);
+	}
+
+	// Case 7: compound literal in braceless while body.
+	{
+		const char *code =
+		    "void f(int c) {\n"
+		    "    while (c)\n"
+		    "        (void)(int){0};\n"
+		    "    defer { }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "cl_while.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "compound-lit-ctrl-desync: braceless while + compound literal OK");
+		prism_free(&r);
+	}
+
+	// Case 8: compound literal array init in braceless for body.
+	{
+		const char *code =
+		    "void f(int c) {\n"
+		    "    for (;c;)\n"
+		    "        (void)(int[]){1, 2, 3};\n"
+		    "    defer { }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "cl_for_arr.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "compound-lit-ctrl-desync: braceless for + array compound literal OK");
+		prism_free(&r);
+	}
+
+	// Case 9: emit_ctrl_condition stale parens_just_closed.
+	// else→for(int i=0;...) inside orelse block body via emit_statements
+	// would wrap for-init in { } due to leaked brace_wrap flag.
+	{
+		const char *code =
+		    "int f(int a) {\n"
+		    "    int x = 0;\n"
+		    "    x = a orelse {\n"
+		    "        if (a)\n"
+		    "            ;\n"
+		    "        else\n"
+		    "            for (int i = 0; i < 10; i++)\n"
+		    "                x++;\n"
+		    "    };\n"
+		    "    return x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "cl_ctrl_cond.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "emit_ctrl_condition: else→for init-decl not wrongly brace-wrapped");
+		if (r.output) {
+			CHECK(!strstr(r.output, "for ( {int"),
+			      "emit_ctrl_condition: for-init must not have spurious braces");
+		}
+		prism_free(&r);
+	}
 }
 
 #ifdef __GNUC__

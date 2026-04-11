@@ -49,7 +49,7 @@
 #define IS_ALNUM(c) (IS_DIGIT(c) || IS_ALPHA(c))
 #define IS_XDIGIT(c) (IS_DIGIT(c) || ((unsigned)((c) | 0x20) - 'a') < 6u)
 #define ARENA_DEFAULT_BLOCK_SIZE (64 * 1024)
-#define KW_MARKER 0x80000000UL // Internal marker bit for keyword map: values are (tag | KW_MARKER)
+#define KW_MARKER 0x80000000ULL // Internal marker bit for keyword map: values are (tag | KW_MARKER)
 #define KW_FLAGS_SHIFT 32       // Extra token flags encoded in bits 32-39 of keyword value
 
 #if defined(_MSC_VER)
@@ -243,7 +243,7 @@ typedef struct {
 // O(1) keyword lookup by hash slot
 typedef struct {
 	char *name;
-	uintptr_t value;
+	uint64_t value;
 	uint8_t len;
 } KeywordEntry;
 
@@ -888,7 +888,7 @@ static inline bool _equal_2(Token *tok, const char *s) {
 	return tok_loc(tok)[1] == s[1];
 }
 
-static inline uintptr_t keyword_lookup(char *key, int keylen) {
+static inline uint64_t keyword_lookup(char *key, int keylen) {
 	if (keylen < 2) return 0;
 	unsigned slot = KEYWORD_HASH(key, keylen);
 	for (int i = 0; i < 8; i++) {
@@ -1041,8 +1041,8 @@ static void init_keyword_map(void) {
 	memset(keyword_cache, 0, sizeof(keyword_cache));
 	for (size_t i = 0; i < sizeof(entries) / sizeof(*entries); i++) {
 		int len = strlen(entries[i].name);
-		uintptr_t val = entries[i].is_kw ? (entries[i].tag | KW_MARKER) : entries[i].tag;
-		val |= (uintptr_t)entries[i].extra_flags << KW_FLAGS_SHIFT;
+		uint64_t val = entries[i].is_kw ? (entries[i].tag | KW_MARKER) : entries[i].tag;
+		val |= (uint64_t)entries[i].extra_flags << KW_FLAGS_SHIFT;
 		unsigned slot = KEYWORD_HASH(entries[i].name, len);
 		while (keyword_cache[slot & 255].name) slot++;
 		keyword_cache[slot & 255] = (KeywordEntry){.name = entries[i].name, .value = val, .len = len};
@@ -1644,7 +1644,7 @@ static Token *tokenize(File *file) {
 		if (ident_len) {
 			Token *t = new_token(TK_IDENT, p, p + ident_len, &ts);
 			LINK(t);
-				uintptr_t kw = keyword_lookup(p, ident_len);
+				uint64_t kw = keyword_lookup(p, ident_len);
 			if (kw) {
 				if (kw & KW_MARKER) {
 					t->kind = TK_KEYWORD;

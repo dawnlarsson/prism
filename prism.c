@@ -781,7 +781,7 @@ static inline bool in_generic(void) {
 // End a statement at ';'.  Reset pending braceless-control state.
 static void end_statement_after_semicolon(void) {
 	ctx->at_stmt_start = true;
-	if (ctrl_state.pending && !in_ctrl_paren()) {
+	if (ctrl_state.pending && !in_ctrl_paren() && !in_struct_body()) {
 		// normally be cleaned up by scope_pop on a braced body's '}'.
 		while (defer_shadow_count > 0 &&
 		       defer_shadows[defer_shadow_count - 1].block_depth > ctx->block_depth)
@@ -1750,6 +1750,7 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 			}
 			emit_tok(tok); tok = tok_next(tok);
 			if (tok && match_ch(tok, '(') && tok_match(tok)) {
+				ctrl_state.parens_just_closed = false;
 				tok = emit_ctrl_condition(tok, &unreachable_tok);
 				ctx->at_stmt_start = true;
 				ctrl_state.pending = true;
@@ -3958,8 +3959,8 @@ static Token *handle_open_brace(Token *tok) {
 }
 
 static Token *handle_close_brace(Token *tok) {
-	// Compound literal close inside control parens
-	if (ctrl_state.pending && in_ctrl_paren() && ctrl_state.brace_depth > 0) {
+	// Compound literal close in braceless body (matches handle_open_brace bypass)
+	if (ctrl_state.pending && ctrl_state.brace_depth > 0) {
 		ctrl_state.brace_depth--;
 		emit_tok(tok);
 		return tok_next(tok);
