@@ -1683,8 +1683,13 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 				while (probe && probe->kind != TK_EOF) {
 					Token *sn = skip_noise(probe);
 					if (sn != probe) { probe = sn; continue; }
-					if (probe->tag & (TT_INLINE | TT_TYPEDEF | TT_STORAGE | TT_QUALIFIER))
-						{ probe = tok_next(probe); continue; }
+					if (probe->tag & (TT_INLINE | TT_TYPEDEF | TT_STORAGE | TT_QUALIFIER)) {
+						probe = tok_next(probe);
+						// Skip parenthesized arguments of _Alignas(N), _Atomic(type), etc.
+						if (probe && match_ch(probe, '(') && tok_match(probe))
+							probe = tok_next(tok_match(probe));
+						continue;
+					}
 					break;
 				}
 				if (probe && (probe->tag & TT_SUE) && !is_known_typedef(probe)) {
@@ -1875,6 +1880,9 @@ static Token *walk_balanced(Token *tok, bool emit) {
 				// (cast expressions like [(raw int)x] can appear here).
 				Token *bclose = tok_match(t);
 				while (t != bclose) {
+					if ((t->flags & TF_OPEN) && is_stmt_expr_open(t)) {
+						t = emit_stmt_expr(t); continue;
+					}
 					{ Token *r = emit_tok_checked(t); if (r) { t = r; continue; } }
 					t = tok_next(t);
 				}
@@ -2378,8 +2386,10 @@ static void emit_noise_between_raws(Token *first_raw, Token *last_raw) {
 		if ((t->flags & TF_OPEN) && tok_match(t)) {
 			// Balanced group (C23 attr [[...]], GNU attr((...))): walk & emit
 			Token *m = tok_match(t);
-			for (Token *u = t; u && u != tok_next(m) && u->kind != TK_EOF; u = tok_next(u))
-				emit_tok(u);
+			for (Token *u = t; u && u != tok_next(m) && u->kind != TK_EOF;) {
+				if ((u->flags & TF_OPEN) && is_stmt_expr_open(u)) { u = emit_stmt_expr(u); continue; }
+				emit_tok(u); u = tok_next(u);
+			}
 			t = m;
 		} else emit_tok(t);
 	}
@@ -3318,6 +3328,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 emit_raw_bail:
 	while (tok && tok->kind != TK_EOF && !match_ch(tok, ';')) {
+		if ((tok->flags & TF_OPEN) && is_stmt_expr_open(tok)) { tok = emit_stmt_expr(tok); continue; }
 		{ Token *r = emit_tok_checked(tok); if (r) { tok = r; continue; } }
 		tok = tok_next(tok);
 	}
