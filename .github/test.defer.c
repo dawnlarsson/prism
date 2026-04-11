@@ -6171,6 +6171,70 @@ static void test_braceless_shadow_scope_leak(void) {
 	}
 }
 
+/* BUG: emit_statements `:` label handler was gated on mode != EMIT_DEFER_BODY,
+ * preventing case/default labels from resetting at_stmt_start in defer bodies.
+ * Bare orelse after case labels leaked verbatim to C output. */
+static void test_defer_case_label_orelse_leak(void) {
+	printf("\n--- Defer case label orelse leak ---\n");
+
+	/* Bare orelse after case label in defer body */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get_val(void);\n"
+		    "void f(int e) {\n"
+		    "    defer {\n"
+		    "        int result;\n"
+		    "        switch(e) {\n"
+		    "        case 1: {\n"
+		    "            result = get_val() orelse 5;\n"
+		    "            break;\n"
+		    "        }\n"
+		    "        default: {\n"
+		    "            result = 0;\n"
+		    "            break;\n"
+		    "        }\n"
+		    "        }\n"
+		    "        (void)result;\n"
+		    "    };\n"
+		    "}\n",
+		    "defer_case_oe.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "defer case orelse: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "defer case orelse: no orelse keyword leak");
+			CHECK(strstr(r.output, "__prism_oe_") != NULL ||
+			      strstr(r.output, "if (") != NULL,
+			      "defer case orelse: orelse expanded");
+		}
+		prism_free(&r);
+	}
+
+	/* Default label with orelse in defer body */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get_val(void);\n"
+		    "void f(int e) {\n"
+		    "    defer {\n"
+		    "        int result;\n"
+		    "        switch(e) {\n"
+		    "        default: {\n"
+		    "            result = get_val() orelse -1;\n"
+		    "            break;\n"
+		    "        }\n"
+		    "        }\n"
+		    "        (void)result;\n"
+		    "    };\n"
+		    "}\n",
+		    "defer_def_oe.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "defer default orelse: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "defer default orelse: no orelse keyword leak");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_rejected();
@@ -6471,4 +6535,7 @@ void run_defer_tests(void) {
 
 	// braceless body shadow scope leak (typedef poisoning)
 	test_braceless_shadow_scope_leak();
+
+        // BUG: case/default labels in defer body didn't reset at_stmt_start
+        test_defer_case_label_orelse_leak();
 }

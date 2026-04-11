@@ -3620,6 +3620,292 @@ static void test_sue_typedef_namespace_collision(void) {
 	}
 }
 
+/* typeof(int (__attribute__((cdecl)) *)(int)) — attribute before * in function
+ * pointer declarator inside typeof caused is_typeof_func_type to miss the *,
+ * misclassifying as bare function type and skipping zero-init entirely. */
+static void test_typeof_funcptr_attr_zeroinit(void) {
+	printf("\n--- typeof funcptr attribute zeroinit ---\n");
+
+	/* GNU __attribute__ before * */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    typeof(int (__attribute__((cdecl)) *)(int)) callback;\n"
+		    "    (void)callback;\n"
+		    "}\n",
+		    "tf_attr1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typeof funcptr __attribute__: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "typeof funcptr __attribute__: has memset");
+		prism_free(&r);
+	}
+
+	/* C23 [[...]] attribute before * */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    typeof(int ([[gnu::cdecl]] *)(int)) callback;\n"
+		    "    (void)callback;\n"
+		    "}\n",
+		    "tf_attr2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typeof funcptr [[attr]]: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "typeof funcptr [[attr]]: has memset");
+		prism_free(&r);
+	}
+
+	/* Multiple stacked attributes before * */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    typeof(int (__attribute__((cdecl)) __attribute__((unused)) *)(int)) callback;\n"
+		    "    (void)callback;\n"
+		    "}\n",
+		    "tf_attr3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typeof funcptr multi-attr: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "typeof funcptr multi-attr: has memset");
+		prism_free(&r);
+	}
+
+	/* Bare function type (no *) — must NOT get memset */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int add(int a, int b) { return a + b; }\n"
+		    "void f(void) {\n"
+		    "    typeof(add) *fp;\n"
+		    "    (void)fp;\n"
+		    "}\n",
+		    "tf_bare.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typeof bare func: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "fp = {0}") != NULL ||
+			      strstr(r.output, "fp ={0}") != NULL ||
+			      strstr(r.output, "fp = 0") != NULL,
+			      "typeof bare func ptr: gets initialization");
+		prism_free(&r);
+	}
+}
+
+/* C23/GCC float type keywords: __float128, _Float16, etc. were missing from
+ * the keyword table, causing them to be treated as plain identifiers and
+ * bypassing zero-initialization entirely. */
+static void test_gcc_float_type_keywords(void) {
+	printf("\n--- GCC/C23 float type keywords zeroinit ---\n");
+
+	/* __float128 */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    __float128 x;\n"
+		    "    (void)&x;\n"
+		    "}\n",
+		    "f128.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "__float128: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "= 0") != NULL,
+			      "__float128: gets = 0");
+		prism_free(&r);
+	}
+
+	/* _Float16 */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    _Float16 x;\n"
+		    "    (void)&x;\n"
+		    "}\n",
+		    "f16.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "_Float16: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "= 0") != NULL,
+			      "_Float16: gets = 0");
+		prism_free(&r);
+	}
+
+	/* _Float128 */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    _Float128 x;\n"
+		    "    (void)&x;\n"
+		    "}\n",
+		    "f128c23.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "_Float128: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "= 0") != NULL,
+			      "_Float128: gets = 0");
+		prism_free(&r);
+	}
+
+	/* _Decimal64 */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    _Decimal64 x;\n"
+		    "    (void)&x;\n"
+		    "}\n",
+		    "dec64.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "_Decimal64: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "= 0") != NULL,
+			      "_Decimal64: gets = 0");
+		prism_free(&r);
+	}
+
+	/* __fp16 */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    __fp16 x;\n"
+		    "    (void)&x;\n"
+		    "}\n",
+		    "fp16.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "__fp16: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "= 0") != NULL,
+			      "__fp16: gets = 0");
+		prism_free(&r);
+	}
+
+	/* __bf16 */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    __bf16 x;\n"
+		    "    (void)&x;\n"
+		    "}\n",
+		    "bf16.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "__bf16: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "= 0") != NULL,
+			      "__bf16: gets = 0");
+		prism_free(&r);
+	}
+
+	/* _Float32x */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    _Float32x x;\n"
+		    "    (void)&x;\n"
+		    "}\n",
+		    "f32x.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "_Float32x: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "= 0") != NULL,
+			      "_Float32x: gets = 0");
+		prism_free(&r);
+	}
+
+	/* Array of _Float64 — should get = {0} */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    _Float64 arr[4];\n"
+		    "    (void)arr;\n"
+		    "}\n",
+		    "f64arr.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "_Float64 array: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "= {0}") != NULL,
+			      "_Float64 array: gets = {0}");
+		prism_free(&r);
+	}
+}
+
+/* _Float128x zeroinit (C23 TS 18661-3) */
+static void test_float128x_zeroinit(void) {
+	printf("\n--- _Float128x zeroinit ---\n");
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    _Float128x x;\n"
+		    "    (void)&x;\n"
+		    "}\n",
+		    "f128x.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "_Float128x: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "= 0") != NULL,
+			      "_Float128x: gets = 0");
+		prism_free(&r);
+	}
+}
+
+/* __typeof_unqual__ / __typeof_unqual zeroinit + qualifier stripping */
+static void test_typeof_unqual_variants(void) {
+	printf("\n--- __typeof_unqual__ / __typeof_unqual zeroinit ---\n");
+
+	/* __typeof_unqual__ basic zeroinit */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    const int x = 5;\n"
+		    "    __typeof_unqual__(x) y;\n"
+		    "    (void)&y;\n"
+		    "}\n",
+		    "tuq1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "__typeof_unqual__: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "__typeof_unqual__: gets memset");
+		prism_free(&r);
+	}
+
+	/* __typeof_unqual basic zeroinit */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    const int x = 5;\n"
+		    "    __typeof_unqual(x) y;\n"
+		    "    (void)&y;\n"
+		    "}\n",
+		    "tuq2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "__typeof_unqual: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "__typeof_unqual: gets memset");
+		prism_free(&r);
+	}
+
+	/* __typeof_unqual__ with volatile — qualifier should NOT propagate */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    volatile int x;\n"
+		    "    __typeof_unqual__(x) y;\n"
+		    "    (void)&y;\n"
+		    "}\n",
+		    "tuq3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "__typeof_unqual__ volatile: transpiles");
+		/* Should get = 0, not byte loop (volatile stripped by unqual) */
+		if (r.output)
+			CHECK(strstr(r.output, "= 0") != NULL,
+			      "__typeof_unqual__ volatile: gets = 0 (qualifier stripped)");
+		prism_free(&r);
+	}
+
+	/* __typeof_unqual__ struct — aggregate zeroinit */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    struct S { int a; int b; };\n"
+		    "    struct S x;\n"
+		    "    __typeof_unqual__(x) y;\n"
+		    "    (void)&y;\n"
+		    "}\n",
+		    "tuq4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "__typeof_unqual__ struct: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "__typeof_unqual__ struct: gets memset");
+		prism_free(&r);
+	}
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -3792,4 +4078,12 @@ void run_zeroinit_tests(void) {
 
 	// VULN2: C11 §6.2.3 namespace collision struct tag vs typedef
 	GNUC_ONLY(test_sue_typedef_namespace_collision());
+
+	// typeof func-ptr with attribute before * (calling convention)
+	GNUC_ONLY(test_typeof_funcptr_attr_zeroinit());
+
+	// GCC/C23 float type keywords zeroinit
+	test_gcc_float_type_keywords();
+	test_float128x_zeroinit();
+	test_typeof_unqual_variants();
 }

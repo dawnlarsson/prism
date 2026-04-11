@@ -198,7 +198,7 @@ enum {
 
 	TT_VOLATILE = 1 << 25,	  // volatile
 	TT_REGISTER = 1 << 26,	  // register
-	TT_TYPEOF = 1 << 27,	  // typeof, typeof_unqual, __typeof__, __typeof
+	TT_TYPEOF = 1 << 27,	  // typeof, typeof_unqual, __typeof__, __typeof, __typeof_unqual__, __typeof_unqual
 	TT_BITINT = 1 << 28,	  // _BitInt
 	TT_ALIGNAS = 1 << 29,	  // _Alignas, alignas
 	TT_ORELSE = 1 << 30,	  // orelse
@@ -977,7 +977,23 @@ static void init_keyword_map(void) {
 	    {"__int16", TT_TYPE, true},
 	    {"__int32", TT_TYPE, true},
 	    {"__int64", TT_TYPE, true},
+	    {"__float128", TT_TYPE, true},
+	    {"__float80", TT_TYPE, true},
+	    {"__fp16", TT_TYPE, true},
+	    {"__bf16", TT_TYPE, true},
+	    {"_Float16", TT_TYPE, true},
+	    {"_Float32", TT_TYPE, true},
+	    {"_Float64", TT_TYPE, true},
+	    {"_Float128", TT_TYPE, true},
+	    {"_Float32x", TT_TYPE, true},
+	    {"_Float64x", TT_TYPE, true},
+	    {"_Float128x", TT_TYPE, true},
+	    {"_Decimal32", TT_TYPE, true},
+	    {"_Decimal64", TT_TYPE, true},
+	    {"_Decimal128", TT_TYPE, true},
 	    {"typeof_unqual", TT_TYPE | TT_TYPEOF, true},
+	    {"__typeof_unqual__", TT_TYPE | TT_TYPEOF, true},
+	    {"__typeof_unqual", TT_TYPE | TT_TYPEOF, true},
 	    {"auto", TT_QUALIFIER | TT_TYPE, true},
 	    {"register", TT_QUALIFIER | TT_REGISTER, true},
 	    {"_Alignas", TT_QUALIFIER | TT_ALIGNAS, true},
@@ -2974,9 +2990,9 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			continue;
 		}
 
-		// typeof/typeof_unqual/__typeof__
+		// typeof/typeof_unqual/__typeof__/__typeof_unqual__
 		if (tag & TT_TYPEOF) {
-			bool is_unqual = tok->len == 13;
+			bool is_unqual = tok->len >= 13; // typeof_unqual(13), __typeof_unqual(15), __typeof_unqual__(17)
 			r.saw_type = true;
 			r.has_typeof = true;
 			tok = tok_next(tok);

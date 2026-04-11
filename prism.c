@@ -1638,8 +1638,11 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 		if (tok->len == 1 && tok->ch0 == '?')
 			ternary_depth++;
 
-		// --- Label : (EMIT_NORMAL only) ---
-		if (match_ch(tok, ':') && mode != EMIT_DEFER_BODY) {
+		// --- Label : ---
+		// In EMIT_DEFER_BODY, user labels are banned by Phase 1F,
+		// so only case/default labels reach here.  They must still
+		// reset at_stmt_start for orelse/zeroinit in switch arms.
+		if (match_ch(tok, ':')) {
 			if (ternary_depth > 0) {
 				ternary_depth--;
 			} else if (!in_generic() && last_emitted &&
@@ -2893,7 +2896,7 @@ static bool is_typeof_func_type(Token *type_start, TypeSpecResult *type, DeclRes
 						continue;
 					}
 					if (match_ch(fs, '(')) {
-						Token *after = tok_next(fs);
+						Token *after = skip_noise(tok_next(fs));
 						if (after && match_ch(after, '*')) return false; // function pointer type
 						return true; // function parameter list → function type
 					}
