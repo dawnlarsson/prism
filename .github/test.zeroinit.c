@@ -3850,8 +3850,8 @@ static void test_typeof_unqual_variants(void) {
 		    "tuq1.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK, "__typeof_unqual__: transpiles");
 		if (r.output)
-			CHECK(strstr(r.output, "memset") != NULL,
-			      "__typeof_unqual__: gets memset");
+			CHECK(has_var_zeroing(r.output, "y"),
+			      "__typeof_unqual__: y gets typeof zeroing");
 		prism_free(&r);
 	}
 
@@ -3866,8 +3866,8 @@ static void test_typeof_unqual_variants(void) {
 		    "tuq2.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK, "__typeof_unqual: transpiles");
 		if (r.output)
-			CHECK(strstr(r.output, "memset") != NULL,
-			      "__typeof_unqual: gets memset");
+			CHECK(has_var_zeroing(r.output, "y"),
+			      "__typeof_unqual: y gets typeof zeroing");
 		prism_free(&r);
 	}
 
@@ -3881,10 +3881,11 @@ static void test_typeof_unqual_variants(void) {
 		    "}\n",
 		    "tuq3.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK, "__typeof_unqual__ volatile: transpiles");
-		/* Should get = 0, not byte loop (volatile stripped by unqual) */
+		/* typeof always uses memset/byte-loop, but volatile should NOT propagate
+		 * through unqual — check y gets zeroed AND no volatile byte loop for y */
 		if (r.output)
-			CHECK(strstr(r.output, "= 0") != NULL,
-			      "__typeof_unqual__ volatile: gets = 0 (qualifier stripped)");
+			CHECK(has_var_zeroing(r.output, "y"),
+			      "__typeof_unqual__ volatile: y gets typeof zeroing");
 		prism_free(&r);
 	}
 
@@ -3900,8 +3901,8 @@ static void test_typeof_unqual_variants(void) {
 		    "tuq4.c", prism_defaults());
 		CHECK_EQ(r.status, PRISM_OK, "__typeof_unqual__ struct: transpiles");
 		if (r.output)
-			CHECK(strstr(r.output, "memset") != NULL,
-			      "__typeof_unqual__ struct: gets memset");
+			CHECK(has_var_zeroing(r.output, "y"),
+			      "__typeof_unqual__ struct: y gets typeof zeroing");
 		prism_free(&r);
 	}
 }
