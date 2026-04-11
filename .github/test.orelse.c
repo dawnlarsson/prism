@@ -7629,6 +7629,181 @@ static void test_orelse_in_attribute_args(void) {
 	}
 }
 
+/* VULN: bracket orelse LHS side-effect check must fire in Phase 1D,
+ * not Pass 2 defense-in-depth.  sizeof(int[f() orelse 16]) has a function
+ * call in the LHS — the ternary expansion evaluates it twice.
+ * Phase 1D must reject this (primary check), not let it through to Pass 2.
+ * Two-pass invariant: ALL semantic errors caught in Pass 1. */
+static void test_bracket_orelse_expr_context_phase1(void) {
+	printf("\n--- Bracket Orelse Expr-Context Phase 1D ---\n");
+
+	/* sizeof(int[f() orelse 16]) — function call in LHS, must be rejected */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get_size(void);\n"
+		    "void f(void) {\n"
+		    "    int sz = sizeof(int[get_size() orelse 16]);\n"
+		    "    (void)sz;\n"
+		    "}\n",
+		    "bo_sizeof.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "sizeof bracket orelse side-effect: rejected");
+		CHECK(r.error_msg && strstr(r.error_msg, "side effect"),
+		      "sizeof bracket orelse: error mentions side effect");
+		prism_free(&r);
+	}
+
+	/* Safe case: no side effects in sizeof bracket orelse */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    int n = 10;\n"
+		    "    int sz = sizeof(int[n orelse 16]);\n"
+		    "    (void)sz;\n"
+		    "}\n",
+		    "bo_sizeof_safe.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "sizeof bracket orelse safe: transpiles OK");
+		prism_free(&r);
+	}
+}
+
+/* VULN: orelse in function definition parameter VLA dimensions.
+ * p1d_reject_proto_param_orelse only checked ';' after ')' — function
+ * definitions (ending with '{') escaped.  The ternary expansion
+ * evaluates the LHS twice — volatile double-read UB (C11 §6.7.3p7).
+ * Cannot hoist temps outside function signature, so must ban entirely. */
+static void test_funcdef_param_orelse_banned(void) {
+	printf("\n--- Funcdef Param VLA Orelse Banned ---\n");
+
+	/* Function definition with orelse in param VLA — must be rejected */
+	{
+		PrismResult r = prism_transpile_source(
+		    "volatile int hw_flag;\n"
+		    "void init_dma(int buf[hw_flag orelse 128]) {\n"
+		    "    (void)buf;\n"
+		    "}\n",
+		    "param_oe_def.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "funcdef param orelse: rejected");
+		CHECK(r.error_msg && strstr(r.error_msg, "orelse"),
+		      "funcdef param orelse: error mentions orelse");
+		prism_free(&r);
+	}
+
+	/* Prototype still rejected (existing behavior preserved) */
+	{
+		PrismResult r = prism_transpile_source(
+		    "volatile int hw_flag;\n"
+		    "void init_dma(int buf[hw_flag orelse 128]);\n",
+		    "param_oe_proto.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "proto param orelse: still rejected");
+		prism_free(&r);
+	}
+
+	/* Non-VLA function definition param — no orelse, no problem */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void init_dma(int buf[128]) {\n"
+		    "    (void)buf;\n"
+		    "}\n",
+		    "param_no_oe.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "funcdef param no orelse: transpiles OK");
+		prism_free(&r);
+	}
+
+	/* Audit: typedef return type at block scope — was bypass vector */
+	{
+		PrismResult r = prism_transpile_source(
+		    "typedef unsigned long size_t;\n"
+		    "volatile int hw_flag;\n"
+		    "void outer(void) {\n"
+		    "    size_t process(int buf[hw_flag orelse 128]);\n"
+		    "}\n",
+		    "param_oe_typedef.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "param orelse typedef rettype: rejected");
+		prism_free(&r);
+	}
+
+	/* Audit: __asm__ specifier after close paren — was bypass vector */
+	{
+		PrismResult r = prism_transpile_source(
+		    "volatile int hw_flag;\n"
+		    "void setup(int buf[hw_flag orelse 128])"
+		    " __asm__(\"_setup\");\n",
+		    "param_oe_asm.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "param orelse asm specifier: rejected");
+		prism_free(&r);
+	}
+
+	/* Audit: nested function pointer param — was bypass vector */
+	{
+		PrismResult r = prism_transpile_source(
+		    "volatile int hw_flag;\n"
+		    "void dispatch(int (*handler)(int data[hw_flag orelse 32]));\n",
+		    "param_oe_funcptr.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "param orelse nested funcptr: rejected");
+		prism_free(&r);
+	}
+
+	/* Audit: nested funcptr at block scope — was bypass vector */
+	{
+		PrismResult r = prism_transpile_source(
+		    "volatile int hw_flag;\n"
+		    "void outer(void) {\n"
+		    "    void dispatch(int (*handler)(int data[hw_flag orelse 32]));\n"
+		    "}\n",
+		    "param_oe_funcptr_blk.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "param orelse nested funcptr block: rejected");
+		prism_free(&r);
+	}
+
+	/* Audit: __asm__ at block scope — was bypass vector */
+	{
+		PrismResult r = prism_transpile_source(
+		    "volatile int hw_flag;\n"
+		    "void outer(void) {\n"
+		    "    void setup(int buf[hw_flag orelse 128])"
+		    " __asm__(\"_setup\");\n"
+		    "}\n",
+		    "param_oe_asm_blk.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "param orelse asm specifier block: rejected");
+		prism_free(&r);
+	}
+
+	/* Audit: funcdef with __attribute__ between ) and { */
+	{
+		PrismResult r = prism_transpile_source(
+		    "volatile int hw_flag;\n"
+		    "void setup(int buf[hw_flag orelse 128])"
+		    " __attribute__((unused)) {\n"
+		    "    (void)buf;\n"
+		    "}\n",
+		    "param_oe_attr_def.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "param orelse funcdef with attr: rejected");
+		prism_free(&r);
+	}
+
+	/* Audit: double-nested funcptr — two levels of parens */
+	{
+		PrismResult r = prism_transpile_source(
+		    "volatile int hw_flag;\n"
+		    "void setup(int (*(*deep)(void))(int data[hw_flag orelse 32]));\n",
+		    "param_oe_deep.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "param orelse double-nested funcptr: rejected");
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -8040,4 +8215,10 @@ void run_orelse_tests(void) {
 
 	// BUG: orelse inside attribute arguments (GNU/C23) leaked to backend
 	test_orelse_in_attribute_args();
+
+	// VULN: bracket orelse in expr context — Phase 1D must catch side effects
+	test_bracket_orelse_expr_context_phase1();
+
+	// VULN: function definition param VLA orelse — double-eval banned
+	test_funcdef_param_orelse_banned();
 }

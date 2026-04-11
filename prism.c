@@ -5995,29 +5995,59 @@ p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t
 // so VLA dimensions are never evaluated — an orelse runtime fallback is
 // semantically meaningless and would require hoisting temps into a scope where
 // the parameter names do not exist.
-static void p1d_reject_proto_param_orelse(Token *open_paren) {
+// Recursively scan a parameter list for bracket orelse.
+// is_proto: prototypes have different error message than definitions.
+static void p1d_scan_param_bracket_orelse(Token *open_paren, bool is_proto) {
 	Token *close = tok_match(open_paren);
 	if (!close) return;
-	// Verify this is a prototype (followed by ';', not '{' or K&R params).
-	Token *after = skip_noise(tok_next(close));
-	if (!after || !match_ch(after, ';')) return;
-	// Scan parameter list for bracket orelse.
 	for (Token *t = tok_next(open_paren); t && t != close; t = tok_next(t)) {
 		if (match_ch(t, '[') && tok_match(t) && !(t->flags & TF_C23_ATTR)) {
 			Token *bc = tok_match(t);
 			for (Token *s = tok_next(t); s && s != bc; s = tok_next(s)) {
 				if ((s->flags & TF_OPEN) && tok_match(s)) { s = tok_match(s); continue; }
 				if (is_orelse_kw_shadow(s))
-					error_tok(s, "'orelse' in array dimensions of a function "
-						     "prototype is not allowed (prototype parameter "
-						     "arrays are never allocated; the dimension is "
-						     "not evaluated at runtime)");
+					error_tok(s, is_proto
+						? "'orelse' in array dimensions of a function "
+						  "prototype is not allowed (prototype parameter "
+						  "arrays are never allocated; the dimension is "
+						  "not evaluated at runtime)"
+						: "'orelse' in array dimensions of a function "
+						  "definition parameter is not allowed (the "
+						  "ternary expansion would evaluate the "
+						  "dimension twice — undefined behavior for "
+						  "volatile expressions)");
 			}
 			t = bc;
 			continue;
 		}
+		// Recurse into nested parameter lists for function pointer params:
+		// void f(int (*cb)(int arr[n orelse 5])) — inner () has brackets.
+		if ((t->flags & TF_OPEN) && match_ch(t, '(') && tok_match(t)) {
+			p1d_scan_param_bracket_orelse(t, is_proto);
+			t = tok_match(t); continue;
+		}
 		if ((t->flags & TF_OPEN) && tok_match(t)) { t = tok_match(t); continue; }
 	}
+}
+
+static void p1d_reject_proto_param_orelse(Token *open_paren) {
+	Token *close = tok_match(open_paren);
+	if (!close) return;
+	// Reject orelse in both prototypes (';') and definitions ('{').
+	// Prototypes: dimension not evaluated at runtime.
+	// Definitions: ternary expansion evaluates dimension twice (volatile UB).
+	Token *after = skip_noise(tok_next(close));
+	// Also skip __asm__/asm/"..." specifiers (GCC symbol renaming);
+	// skip_noise handles TT_ATTR but not TT_ASM.
+	while (after && (after->tag & TT_ASM)) {
+		after = tok_next(after);
+		if (after && match_ch(after, '(') && tok_match(after))
+			after = tok_next(tok_match(after));
+		after = skip_noise(after);
+	}
+	if (!after || !(match_ch(after, ';') || match_ch(after, '{'))) return;
+	bool is_proto = match_ch(after, ';');
+	p1d_scan_param_bracket_orelse(open_paren, is_proto);
 }
 
 // Phase 1G: classify bracket orelse inside [...] array dimensions.
@@ -6994,7 +7024,8 @@ static void p1_full_depth_prescan(Token *tok) {
 					uint32_t ti = tok_idx(tok);
 					if (ti > 0) {
 						Token *prev = &token_pool[ti - 1];
-						if (prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE | TT_TYPEOF)) {
+						if ((prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE | TT_TYPEOF))
+						    || is_known_typedef(prev)) {
 							hashmap_put(&p1_func_proto_map, tok_loc(tok), tok->len, (void *)1);
 							is_func_decl = true;
 						}

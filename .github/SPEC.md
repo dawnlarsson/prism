@@ -1064,7 +1064,7 @@ The token `orelse` is a keyword. It introduces a conditional fallback that execu
 
 9. When the fallback is a compound literal and the assignment target involves indirection (`*`, `->`, `.`, `[]`), the `orelse` is a constraint violation. The compound-literal code path evaluates the target address expression twice, producing undefined behavior for volatile objects.
 
-10. An `orelse` in a function prototype's parameter array dimension (e.g., `void f(int arr[n orelse 1])`) is a constraint violation. Prototype parameter arrays decay to pointers; the dimension is never evaluated at runtime.
+10. An `orelse` in a function parameter array dimension is a constraint violation in both prototypes and definitions. For prototypes (e.g., `void f(int arr[n orelse 1]);`), parameter arrays decay to pointers and the dimension is never evaluated at runtime. For definitions (e.g., `void f(int arr[n orelse 1]) { ... }`), the ternary expansion would evaluate the dimension expression twice — undefined behavior for volatile expressions (C11 §6.7.3p7) — and temporary variables cannot be hoisted outside the function signature.
 
 11. An `orelse` shall not appear inside a `struct` or `union` member declaration (including within a `typeof` context in that declaration).
 

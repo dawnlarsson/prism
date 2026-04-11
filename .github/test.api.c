@@ -7676,15 +7676,17 @@ static void test_proto_param_vla_orelse_rejected(void) {
 		prism_free(&r);
 	}
 
-	// 3. Function definition: orelse allowed (inline ternary works)
+	// 3. Function definition: orelse rejected (ternary expansion would
+	//    evaluate the dimension twice — undefined behavior for volatile
+	//    expressions; cannot hoist temps outside function signature)
 	{
 		const char *code =
 		    "void bar(int n, int arr[n orelse 5]) {\n"
 		    "    (void)arr;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "ppvo3.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-			 "proto-vla-orelse: function definition allowed");
+		CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
+			 "proto-vla-orelse: function definition rejected");
 		prism_free(&r);
 	}
 
