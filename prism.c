@@ -1,4 +1,4 @@
-#define PRISM_VERSION "1.0.7"
+#define PRISM_VERSION "1.0.8"
 
 #ifndef _WIN32
 #ifndef _GNU_SOURCE
@@ -371,9 +371,12 @@ static P1LabelResult p1_label_find(Token *tok, int current_func_idx);
 
 // Emit space-separated token range [start, end). First token has no leading space.
 static inline void emit_token_range(Token *start, Token *end) {
-	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
+	for (Token *t = start; t && t != end && t->kind != TK_EOF;) {
 		if (t != start) out_char(' ');
+		Token *r = try_strip_raw(t);
+		if (r) { t = r; continue; }
 		OUT_TOK(t);
+		t = tok_next(t);
 	}
 }
 
@@ -1383,6 +1386,7 @@ static void emit_type_range(Token *start, Token *end, bool strip_const, bool str
 				continue;
 			}
 		}
+		{ Token *r = try_strip_raw(t); if (r) { t = r; continue; } }
 		emit_tok(t); t = tok_next(t);
 	}
 }
@@ -7112,6 +7116,20 @@ static void p1_full_depth_prescan(Token *tok) {
 				if (FEAT(F_ORELSE) && match_ch(tok, '(') &&
 				    !(p1d_prev_saved && (p1d_prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH | TT_TYPEOF | TT_ATTR | TT_ASM))))
 					check_orelse_in_parens(tok);
+				// Phase 1D: reject orelse inside attribute paren groups at
+				// !at_stmt_start (e.g. int __attribute__((aligned(8 orelse 16))) buf;
+				// or int [[gnu::aligned(8 orelse 16)]] buf;).
+				// The at_stmt_start skip_noise scan handles leading attrs;
+				// this handles per-declarator and trailing attrs.
+				if (FEAT(F_ORELSE) && tok_match(tok) &&
+				    ((match_ch(tok, '(') && p1d_prev_saved && (p1d_prev_saved->tag & TT_ATTR)) ||
+				     (tok->flags & TF_C23_ATTR))) {
+					Token *am = tok_match(tok);
+					for (Token *s = tok_next(tok); s && s != am; s = tok_next(s))
+						if ((s->tag & TT_ORELSE) && !typedef_lookup(s))
+							error_tok(s, "'orelse' cannot be used inside "
+								  "attribute arguments");
+				}
 				// Peek inside balanced groups for ghost enum definitions
 				// and nested statement expressions:
 				if (match_ch(tok, '(') || match_ch(tok, '[')) {
@@ -7155,6 +7173,8 @@ static void p1_full_depth_prescan(Token *tok) {
 			// ({ goto L; 8; }) )))). These are invisible to CFG analysis
 			// because skip_noise leaps over the entire attribute, so goto/
 			// defer/return/break/continue inside would bypass safety checks.
+			// Also reject orelse — Pass 2's emit_range emits attributes
+			// verbatim, so an undetected orelse leaks raw to the backend.
 			for (Token *s = tok; s && s != clean; s = tok_next(s)) {
 				uint32_t st = s->tag;
 				if (st & (TT_GOTO | TT_RETURN | TT_BREAK | TT_CONTINUE))
@@ -7167,6 +7187,9 @@ static void p1_full_depth_prescan(Token *tok) {
 						  "bypasses control-flow analysis; "
 						  "move it outside the attribute",
 						  s->len, tok_loc(s));
+				if ((st & TT_ORELSE) && !typedef_lookup(s))
+					error_tok(s, "'orelse' cannot be used inside "
+						  "attribute arguments");
 			}
 			tok = clean; continue;
 		}

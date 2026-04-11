@@ -7511,6 +7511,124 @@ static void test_orelse_sue_attr_body_strip(void) {
 	prism_free(&r);
 }
 
+// BUG: orelse inside GNU __attribute__ and C23 [[...]] arguments leaked
+// verbatim to backend compiler. Phase 1D skip_noise jumped over attributes
+// without checking for TT_ORELSE; Pass 2 emit_range emitted attrs verbatim.
+static void test_orelse_in_attribute_args(void) {
+	// GNU __attribute__ at stmt_start (leading attribute on declaration)
+	{
+		PrismResult r = prism_transpile_source(
+			"int main(void) {\n"
+			"    __attribute__((aligned(8 orelse 16))) int buf[256];\n"
+			"    return 0;\n"
+			"}\n",
+			"oe_attr1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "gnu-attr-leading: orelse in attr rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "attribute") != NULL,
+			      "gnu-attr-leading: error mentions 'attribute'");
+		prism_free(&r);
+	}
+	// GNU __attribute__ at !at_stmt_start (between type and declarator)
+	{
+		PrismResult r = prism_transpile_source(
+			"int main(void) {\n"
+			"    int __attribute__((aligned(8 orelse 16))) buf[256];\n"
+			"    return 0;\n"
+			"}\n",
+			"oe_attr2.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "gnu-attr-mid: orelse in attr rejected");
+		prism_free(&r);
+	}
+	// GNU __attribute__ after declarator name
+	{
+		PrismResult r = prism_transpile_source(
+			"int main(void) {\n"
+			"    int buf[256] __attribute__((aligned(8 orelse 16)));\n"
+			"    return 0;\n"
+			"}\n",
+			"oe_attr3.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "gnu-attr-post: orelse in attr rejected");
+		prism_free(&r);
+	}
+	// File-scope GNU __attribute__
+	{
+		PrismResult r = prism_transpile_source(
+			"__attribute__((aligned(8 orelse 16))) int buf[256];\n"
+			"int main(void) { return 0; }\n",
+			"oe_attr4.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "gnu-attr-filescope: orelse in attr rejected");
+		prism_free(&r);
+	}
+	// Standalone __attribute__ (expression statement)
+	{
+		PrismResult r = prism_transpile_source(
+			"int main(void) {\n"
+			"    __attribute__((annotate(\"a\" orelse \"b\")));\n"
+			"    return 0;\n"
+			"}\n",
+			"oe_attr5.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "gnu-attr-standalone: orelse in attr rejected");
+		prism_free(&r);
+	}
+	// C23 [[...]] at stmt_start
+	{
+		PrismResult r = prism_transpile_source(
+			"int main(void) {\n"
+			"    [[gnu::aligned(8 orelse 16)]] int buf[256];\n"
+			"    return 0;\n"
+			"}\n",
+			"oe_attr6.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "c23-attr-leading: orelse in attr rejected");
+		prism_free(&r);
+	}
+	// C23 [[...]] at !at_stmt_start
+	{
+		PrismResult r = prism_transpile_source(
+			"int main(void) {\n"
+			"    int [[gnu::aligned(8 orelse 16)]] buf[256];\n"
+			"    return 0;\n"
+			"}\n",
+			"oe_attr7.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "c23-attr-mid: orelse in attr rejected");
+		prism_free(&r);
+	}
+	// Control: no orelse — attributes must pass through cleanly
+	{
+		PrismResult r = prism_transpile_source(
+			"int main(void) {\n"
+			"    __attribute__((aligned(16))) int buf[256];\n"
+			"    return 0;\n"
+			"}\n",
+			"oe_attr_ok1.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "gnu-attr-clean: no orelse passes");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+			"int main(void) {\n"
+			"    [[gnu::aligned(16)]] int buf[256];\n"
+			"    return 0;\n"
+			"}\n",
+			"oe_attr_ok2.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "c23-attr-clean: no orelse passes");
+		prism_free(&r);
+	}
+	// Variable named 'orelse' inside attr — must NOT be rejected
+	// (typedef_lookup guard protects against false positives)
+	{
+		PrismResult r = prism_transpile_source(
+			"int main(void) {\n"
+			"    int orelse = 16;\n"
+			"    __attribute__((aligned(orelse))) int buf[256];\n"
+			"    return 0;\n"
+			"}\n",
+			"oe_attr_shadow.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "attr-shadow: variable named orelse passes");
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -7919,4 +8037,7 @@ void run_orelse_tests(void) {
 
 	// BUG: ternary promotion hijack — bare orelse with mismatched signedness
 	test_orelse_ternary_promotion_hijack();
+
+	// BUG: orelse inside attribute arguments (GNU/C23) leaked to backend
+	test_orelse_in_attribute_args();
 }

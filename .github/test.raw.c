@@ -1580,6 +1580,179 @@ static void test_raw_attr_per_declarator_leak(void) {
 	}
 }
 
+// BUG: emit_type_range tracked raw_depth (brace depth) and only stripped raw
+// at depth 0.  Inside struct/union bodies (depth > 0), raw keyword leaked
+// verbatim to C output.  This ONLY affected struct-with-variable declarations
+// at block scope (e.g. `struct S { raw int x; } s;`) because the type range
+// includes the struct body.  File-scope struct defs and standalone struct defs
+// took different emission paths that handled raw correctly.
+static void test_raw_struct_body_inline_decl(void) {
+	printf("\n--- raw in struct body with inline variable (BUG_RAW_STRUCT_BODY) ---\n");
+
+	// Case 1: block-scope struct with variable — the original bug
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void) { struct S { raw int x; } s; s.x = 1; (void)s; }\n",
+		    "rw_sb1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-struct-body-block: transpiles OK");
+		if (r.output) {
+			const char *line = strstr(r.output, "struct S");
+			CHECK(line != NULL, "raw-struct-body-block: struct S in output");
+			if (line)
+				CHECK(strstr(line, " raw ") == NULL,
+				      "raw-struct-body-block: raw must not leak inside struct body");
+		}
+		prism_free(&r);
+	}
+	// Case 2: block-scope union with variable
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void) { union U { raw int x; raw float y; } u; u.x = 1; (void)u; }\n",
+		    "rw_sb2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-union-body-block: transpiles OK");
+		if (r.output) {
+			const char *line = strstr(r.output, "union U");
+			CHECK(line != NULL, "raw-union-body-block: union U in output");
+			if (line)
+				CHECK(strstr(line, " raw ") == NULL,
+				      "raw-union-body-block: raw must not leak inside union body");
+		}
+		prism_free(&r);
+	}
+	// Case 3: mixed — raw keyword on some fields, raw as field name on others
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void) { struct S { raw int x; int raw; } s; s.x = 1; s.raw = 2; (void)s; }\n",
+		    "rw_sb3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-struct-body-mixed: transpiles OK");
+		if (r.output) {
+			const char *line = strstr(r.output, "struct S");
+			CHECK(line != NULL, "raw-struct-body-mixed: struct S in output");
+			if (line) {
+				CHECK(strstr(line, "{ int x;") != NULL,
+				      "raw-struct-body-mixed: raw keyword stripped from 'raw int x'");
+				CHECK(strstr(line, "int raw;") != NULL,
+				      "raw-struct-body-mixed: field name 'raw' preserved");
+			}
+		}
+		prism_free(&r);
+	}
+	// Case 4: nested struct with variable
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void) {\n"
+		    "    struct Outer { struct Inner { raw int a; } inner; raw int b; } o;\n"
+		    "    o.inner.a = 1; o.b = 2; (void)o;\n"
+		    "}\n",
+		    "rw_sb4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-struct-nested: transpiles OK");
+		if (r.output) {
+			const char *line = strstr(r.output, "struct Outer");
+			CHECK(line != NULL, "raw-struct-nested: struct Outer in output");
+			if (line)
+				CHECK(strstr(line, " raw ") == NULL,
+				      "raw-struct-nested: raw must not leak in nested structs");
+		}
+		prism_free(&r);
+	}
+	// Case 5: anonymous struct with variable (no tag name)
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void) { struct { raw int x; } s; s.x = 1; (void)s; }\n",
+		    "rw_sb5.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-struct-anon: transpiles OK");
+		if (r.output) {
+			const char *line = strstr(r.output, "struct {");
+			CHECK(line != NULL, "raw-struct-anon: anonymous struct in output");
+			if (line)
+				CHECK(strstr(line, " raw ") == NULL,
+				      "raw-struct-anon: raw must not leak in anonymous struct body");
+		}
+		prism_free(&r);
+	}
+}
+
+// BUG: emit_token_range (used by emit_ret_type) emitted space-separated tokens
+// with OUT_TOK — no try_strip_raw check. When a function declared as `raw int f()`
+// had defer, the return-value temp was emitted as `raw int __prism_ret_0 = ...`,
+// leaking `raw` to the backend compiler which rejected it as an undeclared identifier.
+static void test_raw_return_type_defer_leak(void) {
+	printf("\n--- raw return type defer leak (BUG_RAW_RETTYPE) ---\n");
+
+	// Case 1: raw int with defer
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(int *p) { (void)p; }\n"
+		    "raw int compute(void) {\n"
+		    "    int x = 0;\n"
+		    "    defer cleanup(&x);\n"
+		    "    return 42;\n"
+		    "}\n"
+		    "int main(void) { return compute(); }\n",
+		    "rw_ret1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-rettype-int: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, " raw ") == NULL,
+			      "raw-rettype-int: raw must not appear in return temp");
+			CHECK(strstr(r.output, "typedef raw") == NULL,
+			      "raw-rettype-int: no typedef raw leak");
+		}
+		prism_free(&r);
+	}
+	// Case 2: raw struct return with defer
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct S { int x; };\n"
+		    "void cleanup(int *p) { (void)p; }\n"
+		    "raw struct S make(void) {\n"
+		    "    int g = 0;\n"
+		    "    defer cleanup(&g);\n"
+		    "    return (struct S){42};\n"
+		    "}\n"
+		    "int main(void) { struct S s = make(); (void)s; return 0; }\n",
+		    "rw_ret2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-rettype-struct: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "typedef raw") == NULL,
+			      "raw-rettype-struct: no typedef raw");
+			// The temp should be `struct S __prism_ret_0`, not `raw struct S`
+			const char *temp = r.output ? strstr(r.output, "__prism_ret") : NULL;
+			if (temp) {
+				// Walk back to find what's before the temp name
+				const char *start = r.output;
+				const char *p = temp;
+				while (p > start && *(p-1) != '\n') p--;
+				char buf[200]; int n = (int)(temp - p);
+				if (n > 0 && n < 199) {
+					memcpy(buf, p, n); buf[n] = 0;
+					CHECK(strstr(buf, "raw") == NULL,
+					      "raw-rettype-struct: no raw before __prism_ret");
+				}
+			}
+		}
+		prism_free(&r);
+	}
+	// Case 3: raw pointer return with defer
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(int *p) { (void)p; }\n"
+		    "raw int *get(void) {\n"
+		    "    static int val = 42;\n"
+		    "    int g = 0;\n"
+		    "    defer cleanup(&g);\n"
+		    "    return &val;\n"
+		    "}\n"
+		    "int main(void) { int *p = get(); return *p; }\n",
+		    "rw_ret3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "raw-rettype-ptr: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "typedef raw") == NULL,
+			      "raw-rettype-ptr: no typedef raw");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_raw_tests(void) {
 	printf("\n=== RAW KEYWORD TESTS ===\n");
 
@@ -1703,4 +1876,10 @@ void run_raw_tests(void) {
 
 	// raw preceded by attrs in per-declarator position
 	test_raw_attr_per_declarator_leak();
+
+	// raw leaking in struct/union body with inline variable decl
+	test_raw_struct_body_inline_decl();
+
+	// raw leaking in return-value temp via emit_token_range
+	test_raw_return_type_defer_leak();
 }
