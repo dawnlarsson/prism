@@ -3173,6 +3173,58 @@ static void test_extension_zeroinit(void) {
 	__extension__ __extension__ int ext_chain;
 	CHECK_EQ(ext_chain, 0, "chained __extension__ zero-init");
 }
+
+// p1_scan_init_shadows placed P1_IS_DECL on the __extension__
+// prefix token instead of the type keyword.  Pass 2's fast gate
+// skipped the TT_INLINE token to find an unannotated type → zeroinit
+// silently dropped for for/if/switch init declarations.
+static void test_extension_forinit_zeroinit(void) {
+	printf("\n--- __extension__ for-init zero-init ---\n");
+
+	// Basic: __extension__ int in for-init (GCC only — Clang rejects
+	// __extension__ in for-init but Prism processes the preprocessed
+	// output, which is always GCC-flavored when running under GCC).
+	// Transpile-level only to avoid Clang compile errors.
+
+	// Transpile-level: verify = 0 is present for __extension__ in for-init
+	{
+		PrismResult r = prism_transpile_source(
+			"void f(void) { for(__extension__ int i; i < 10; i++) {} }\n",
+			"ext_fi.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "ext for-init: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "i = 0") != NULL,
+			      "ext for-init: output has = 0");
+		prism_free(&r);
+	}
+
+	// Multi-declarator: __extension__ int a, b in for-init
+	{
+		PrismResult r = prism_transpile_source(
+			"void f(void) { for(__extension__ int a, b; a+b < 10; a++) {} }\n",
+			"ext_fi_m.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "ext for-init multi-decl: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "a = 0") != NULL,
+			      "ext for-init multi-decl: a has = 0");
+			CHECK(strstr(r.output, "b = 0") != NULL,
+			      "ext for-init multi-decl: b has = 0");
+		}
+		prism_free(&r);
+	}
+
+	// Chained __extension__ in for-init
+	{
+		PrismResult r = prism_transpile_source(
+			"void f(void) { for(__extension__ __extension__ int i; i < 10; i++) {} }\n",
+			"ext_fi2.c", prism_defaults());
+		CHECK(r.status == PRISM_OK, "ext chained for-init: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "i = 0") != NULL,
+			      "ext chained for-init: output has = 0");
+		prism_free(&r);
+	}
+}
 #endif
 
 static void test_const_vla_memset_ub(void) {
@@ -4061,6 +4113,9 @@ void run_zeroinit_tests(void) {
 
 	// __extension__ zero-init bypass
 	GNUC_ONLY(test_extension_zeroinit());
+
+	// __extension__ for-init zero-init bypass
+	GNUC_ONLY(test_extension_forinit_zeroinit());
 
 	// const VLA/typeof memset UB
 	GNUC_ONLY(test_const_vla_memset_ub());

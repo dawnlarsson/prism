@@ -1,4 +1,4 @@
-#define PRISM_VERSION "1.0.8"
+#define PRISM_VERSION "1.0.9"
 
 #ifndef _WIN32
 #ifndef _GNU_SOURCE
@@ -5745,6 +5745,12 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 	}
 	if (!init_tok) return;
 	ASSERT_NOT_NOISE(init_tok);
+	// Skip __extension__/inline prefix — matches Phase 1D main loop
+	// (L7277) which consumes TT_INLINE before p1d_probe_declaration.
+	while (init_tok && (init_tok->tag & TT_INLINE) &&
+	       !(init_tok->tag & (TT_QUALIFIER | TT_TYPE)))
+		init_tok = skip_noise(tok_next(init_tok));
+	if (!init_tok) return;
 	if (init_tok->tag & TT_TYPEDEF) {
 		TD_SCOPE_SAVE();
 		td_scope_open = tok_idx(open);
@@ -5774,7 +5780,14 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 	td_scope_close = scope_close_idx;
 	TypeSpecResult type = parse_type_specifier(init_tok);
 	if (type.saw_type) {
-		tok_ann(init_tok) |= P1_IS_DECL;
+		// Place P1_IS_DECL on the type keyword, not a
+		// storage/inline prefix like __extension__.  Pass 2's
+		// fast gate skips TT_STORAGE|TT_INLINE to reach this.
+		Token *ann_tok = init_tok;
+		while (ann_tok && (ann_tok->tag & (TT_STORAGE | TT_INLINE)) &&
+		       !(ann_tok->tag & (TT_QUALIFIER | TT_TYPE)))
+			ann_tok = skip_noise(tok_next(ann_tok));
+		tok_ann(ann_tok ? ann_tok : init_tok) |= P1_IS_DECL;
 		Token *t = type.end;
 		while (t && t != init_end && t->kind != TK_EOF) {
 			// Per-declarator 'raw' skip (for(int x, raw y; ...))
