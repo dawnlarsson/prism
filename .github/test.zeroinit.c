@@ -3959,6 +3959,89 @@ static void test_typeof_unqual_variants(void) {
 	}
 }
 
+// BUG: struct tag shadow bleed — inner-scope clean struct redefinition didn't
+// register in the typedef table, so tag_lookup found the outer VLA struct,
+// falsely tagging variables as VLA and causing CFG verifier false positives.
+static void test_struct_tag_shadow_bleed(void) {
+	printf("\n--- struct tag shadow bleed ---\n");
+
+	// Case 1: inner clean struct shadows outer VLA struct — goto over inner var must be allowed
+	{
+		PrismResult r = prism_transpile_source(
+		    "void task(int n) {\n"
+		    "    struct T { int arr[n]; };\n"
+		    "    goto L;\n"
+		    "    {\n"
+		    "        struct T { int y; };\n"
+		    "        raw struct T obj;\n"
+		    "L:\n"
+		    "        obj.y = 5;\n"
+		    "    }\n"
+		    "}\n",
+		    "tag_vla.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "vla-shadow: transpiles OK");
+		prism_free(&r);
+	}
+
+	// Case 2: inner clean struct shadows outer volatile struct — no memset on inner var
+	{
+		PrismResult r = prism_transpile_source(
+		    "void use(void *);\n"
+		    "void task(void) {\n"
+		    "    struct V { volatile int x; };\n"
+		    "    {\n"
+		    "        struct V { int y; };\n"
+		    "        struct V obj;\n"
+		    "        use(&obj);\n"
+		    "    }\n"
+		    "}\n",
+		    "tag_vol.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "vol-shadow: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "obj = {0}") != NULL,
+			      "vol-shadow: inner struct V gets = {0} not memset");
+			CHECK(strstr(r.output, "memset") == NULL,
+			      "vol-shadow: no memset on clean inner struct");
+		}
+		prism_free(&r);
+	}
+
+	// Case 3: typedef-wrapped struct tag shadow (parse_typedef_declaration path)
+	{
+		PrismResult r = prism_transpile_source(
+		    "void task(int n) {\n"
+		    "    typedef struct T { int arr[n]; } T_t;\n"
+		    "    goto L;\n"
+		    "    {\n"
+		    "        typedef struct T { int y; } T_t;\n"
+		    "        raw struct T obj;\n"
+		    "L:\n"
+		    "        obj.y = 5;\n"
+		    "    }\n"
+		    "}\n",
+		    "tag_typedef.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typedef-shadow: transpiles OK");
+		prism_free(&r);
+	}
+
+	// Case 4: same-scope re-register (outer VLA struct used directly) must still work
+	{
+		PrismResult r = prism_transpile_source(
+		    "void use(void *);\n"
+		    "void task(int n) {\n"
+		    "    struct T { int arr[n]; };\n"
+		    "    struct T obj;\n"
+		    "    use(&obj);\n"
+		    "}\n",
+		    "tag_same.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "same-scope: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "same-scope: outer VLA struct still gets memset");
+		prism_free(&r);
+	}
+}
+
 // BUG: case (expr): where last_emitted before : is ) didn't reset at_stmt_start.
 // Declarations after such labels missed zero-initialization.
 static void test_case_paren_expr_zeroinit(void) {
@@ -4212,4 +4295,8 @@ void run_zeroinit_tests(void) {
 
 	// BUG: case (expr): didn't reset at_stmt_start for zeroinit
 	test_case_paren_expr_zeroinit();
+
+	// BUG: struct tag shadow bleed — inner clean struct not registered,
+	// tag_lookup finds outer VLA/volatile struct, false CFG error
+	GNUC_ONLY(test_struct_tag_shadow_bleed());
 }

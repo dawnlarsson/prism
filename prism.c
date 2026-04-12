@@ -3644,7 +3644,7 @@ static Token *handle_defer_keyword(Token *tok) {
 		return tok;
 	}
 
-	Token *stmt_end = skip_to_semicolon(tok);
+	Token *stmt_end = skip_to_semicolon(tok, NULL);
 
 	if (stmt_end->kind == TK_EOF || !match_ch(stmt_end, ';'))
 		error_tok(defer_keyword, "unterminated defer statement; expected ';'");
@@ -5883,7 +5883,7 @@ p1_check_defer_same_block_shadow(Token *var_name, uint16_t cur_sid, int p1d_cur_
 		if (match_ch(body, '{') && tok_match(body))
 			body_end = tok_match(body);
 		else
-			body_end = skip_to_semicolon(body);
+			body_end = skip_to_semicolon(body, NULL);
 		// Skip if var_name is declared inside this defer body
 		uint32_t var_idx = tok_idx(var_name);
 		uint32_t bi = tok_idx(body);
@@ -5926,7 +5926,7 @@ p1_check_enum_body_defer_shadow(Token *brace, uint16_t cur_sid, int p1d_cur_func
 						if (match_ch(body, '{') && tok_match(body))
 							body_end = tok_match(body);
 						else
-							body_end = skip_to_semicolon(body);
+							body_end = skip_to_semicolon(body, NULL);
 						uint32_t var_idx = tok_idx(t);
 						uint32_t bi = tok_idx(body);
 						uint32_t ei = body_end ? tok_idx(body_end) : UINT32_MAX;
@@ -5982,7 +5982,7 @@ p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t
 	{
 		Token *body = tok_next(tok);
 		if (body && !match_ch(body, '{')) {
-			Token *semi = skip_to_semicolon(body);
+			Token *semi = skip_to_semicolon(body, NULL);
 			if (semi->kind == TK_EOF || !match_ch(semi, ';'))
 				error_tok(tok, "unterminated defer statement; expected ';'");
 			if (body->kind == TK_KEYWORD &&
@@ -6000,7 +6000,7 @@ p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t
 		if (body && match_ch(body, '{') && tok_match(body))
 			body_end = tok_match(body);
 		else if (body)
-			body_end = skip_to_semicolon(body);
+			body_end = skip_to_semicolon(body, NULL);
 		if (body_end) {
 			Token *prev_t = NULL;
 			for (Token *t = body; t && t != body_end && t->kind != TK_EOF;
@@ -7413,35 +7413,36 @@ static void p1_full_depth_prescan(Token *tok) {
 				} else {
 					bool body_vla = struct_body_contains_vla(brace);
 					bool body_vol = struct_body_contains_volatile(brace);
-					if (body_vla || body_vol) {
-						// Register struct/union tag so later
-						// "struct S s;" can detect VLA/volatile members.
-						// Always use TDK_STRUCT_TAG so tag_lookup() finds
-						// the entry (namespace-safe vs ordinary idents).
-						// Skip attributes and qualifiers before tag name
-						// (e.g. struct __attribute__((aligned(8))) Tag {).
-						for (Token *t = skip_noise(tok_next(tok)); t && t != brace; t = skip_noise(tok_next(t))) {
-							if (t->tag & TT_QUALIFIER) continue;
-							if (is_valid_varname(t)) {
-								int pre = typedef_table.count;
-								typedef_add_entry(tok_loc(t), t->len, brace_depth, TDK_STRUCT_TAG, body_vla, false);
-								if (typedef_table.count > pre) {
-									TypedefEntry *te = &typedef_table.entries[typedef_table.count - 1];
-									te->token_index = tok_idx(t);
-									te->is_aggregate = true;
-									if (body_vol) te->has_volatile_member = true;
-								}
-								break;
+					// Register struct/union tag unconditionally so
+					// inner-scope redefinitions correctly shadow outer
+					// tags. Without this, a clean inner "struct T { int y; }"
+					// fails to register, and tag_lookup finds the outer
+					// VLA/volatile tag, causing false CFG verifier errors.
+					// Always use TDK_STRUCT_TAG so tag_lookup() finds
+					// the entry (namespace-safe vs ordinary idents).
+					// Skip attributes and qualifiers before tag name
+					// (e.g. struct __attribute__((aligned(8))) Tag {).
+					for (Token *t = skip_noise(tok_next(tok)); t && t != brace; t = skip_noise(tok_next(t))) {
+						if (t->tag & TT_QUALIFIER) continue;
+						if (is_valid_varname(t)) {
+							int pre = typedef_table.count;
+							typedef_add_entry(tok_loc(t), t->len, brace_depth, TDK_STRUCT_TAG, body_vla, false);
+							if (typedef_table.count > pre) {
+								TypedefEntry *te = &typedef_table.entries[typedef_table.count - 1];
+								te->token_index = tok_idx(t);
+								te->is_aggregate = true;
+								if (body_vol) te->has_volatile_member = true;
 							}
 							break;
 						}
+						break;
 					}
 				}
 			}
 		}
 
 		if (equal(tok, "_Static_assert") || equal(tok, "static_assert")) {
-			tok = skip_to_semicolon(tok);
+			tok = skip_to_semicolon(tok, NULL);
 			if (tok && match_ch(tok, ';')) tok = tok_next(tok);
 			at_stmt_start = true;
 			if (brace_depth == 0)

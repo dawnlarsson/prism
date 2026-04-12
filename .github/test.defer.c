@@ -6286,6 +6286,58 @@ static void test_defer_shadow_toplevel_local_false_positive(void) {
 	}
 }
 
+// BUG: skip_to_semicolon in validate_defer_statement escaped past } when
+// a semicolon was missing inside a defer block, causing Phase 1F to validate
+// the entire rest of the file as if inside the defer.
+static void test_defer_validator_escape_missing_semicolon(void) {
+	printf("\n--- Defer validator escape: missing semicolon ---\n");
+
+	// Missing semicolon in defer block must NOT cause valid return in
+	// a later function to be falsely rejected as "return inside defer".
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(void);\n"
+		    "void task_a(void) {\n"
+		    "    defer {\n"
+		    "        int x = 5\n"  // missing ;
+		    "    };\n"
+		    "    return;\n"       // Phase 1F would falsely reject this
+		    "}\n"
+		    "void task_b(void) {\n"
+		    "    return;\n"       // Also falsely rejected before the fix
+		    "}\n",
+		    "defer_escape.c", prism_defaults());
+		// This should NOT produce "return inside defer block" error.
+		// The missing ; is a C syntax error (backend handles it), not
+		// a Prism structural error.
+		bool false_reject = (r.status != PRISM_OK && r.error_msg &&
+		    strstr(r.error_msg, "inside defer"));
+		CHECK(!false_reject,
+		      "defer-escape: missing ; must not cause false 'return inside defer'");
+		prism_free(&r);
+	}
+
+	// Nested defer in second function must not be falsely rejected.
+	{
+		PrismResult r = prism_transpile_source(
+		    "void task_a(void) {\n"
+		    "    defer {\n"
+		    "        int x = 5\n"  // missing ;
+		    "    };\n"
+		    "}\n"
+		    "void f(void);\n"
+		    "void task_b(void) {\n"
+		    "    defer f();\n"     // valid defer — was falsely flagged
+		    "}\n",
+		    "defer_escape2.c", prism_defaults());
+		bool false_reject = (r.status != PRISM_OK && r.error_msg &&
+		    strstr(r.error_msg, "inside defer"));
+		CHECK(!false_reject,
+		      "defer-escape2: missing ; must not cause false error in other function");
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_rejected();
@@ -6592,4 +6644,7 @@ void run_defer_tests(void) {
 
 	// BUG: defer_body_refs_name bd>1 missed top-level local declarations
 	test_defer_shadow_toplevel_local_false_positive();
+
+	// BUG: skip_to_semicolon escaped past } on missing semicolon
+	test_defer_validator_escape_missing_semicolon();
 }

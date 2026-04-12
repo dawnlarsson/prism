@@ -2297,10 +2297,12 @@ static inline bool is_noise_token(Token *t) {
 	if (_sn != (var)) { (var) = _sn; continue; } \
 } while(0)
 
-static Token *skip_to_semicolon(Token *tok) {
+static Token *skip_to_semicolon(Token *tok, Token *end) {
 	while (tok->kind != TK_EOF) {
+		if (end && tok == end) return tok;
 		if (tok->flags & TF_OPEN) { tok = tok_next(tok_match(tok)); continue; }
 		if (tok->len == 1 && tok->ch0 == ';') return tok;
+		if ((tok->flags & TF_CLOSE) && tok->ch0 == '}') return tok;
 		tok = tok_next(tok);
 	}
 	return tok;
@@ -3117,11 +3119,12 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 		if (is_func_typedef(bt)) { base_is_func = true; break; }
 	}
 
-	// Register struct/union tag as typedef entry for VLA/volatile propagation.
-	// e.g. typedef struct Foo { volatile int x; } Foo_t;
-	// This registers "Foo" so that later "struct Foo buf[n];" can look up
-	// volatile member info via tag_lookup(sue_tag).
-	if (type_spec.is_struct && (is_vla || base_has_volatile_member)) {
+	// Register struct/union tag unconditionally so inner-scope
+	// redefinitions correctly shadow outer tags (C11 §6.2.1p4).
+	// Without this, a clean inner "typedef struct T { int y; } T_t"
+	// fails to register, and tag_lookup finds the outer VLA/volatile
+	// tag, causing false CFG verifier errors or incorrect memset.
+	if (type_spec.is_struct) {
 		for (Token *bt = type_start; bt && bt != type_spec.end; bt = tok_next(bt)) {
 			if (bt->tag & TT_SUE) {
 				Token *tag = skip_noise(tok_next(bt));
@@ -3510,7 +3513,8 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 
 	if (match_ch(tok, '{')) {
 		Token *end = tok_match(tok);
-		for (tok = skip_noise(tok_next(tok)); tok && tok != end && tok->kind != TK_EOF; tok = skip_noise(tok)) {
+		uint32_t end_idx = end ? tok_idx(end) : UINT32_MAX;
+		for (tok = skip_noise(tok_next(tok)); tok && tok != end && tok->kind != TK_EOF && tok_idx(tok) < end_idx; tok = skip_noise(tok)) {
 			Token *next = validate_defer_statement(tok, in_loop, in_switch, depth);
 			if (next == tok) break;
 			tok = next;
@@ -3529,6 +3533,7 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 	if (tok->tag & (TT_CASE | TT_DEFAULT)) {
 		int td = 0;
 		for (tok = tok_next(tok); tok && tok->kind != TK_EOF; tok = tok_next(tok)) {
+			if ((tok->flags & TF_CLOSE) && tok->ch0 == '}') break;
 			if (tok->flags & TF_OPEN) {
 				if (match_ch(tok, '(') || match_ch(tok, '['))
 					defer_scan_hidden_stmt_exprs(tok, in_loop, in_switch, depth);
@@ -3578,7 +3583,7 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 	}
 
 	if (FEAT(F_ORELSE)) {
-		for (Token *s = tok; s && s->kind != TK_EOF && !match_ch(s, ';'); s = tok_next(s)) {
+		for (Token *s = tok; s && s->kind != TK_EOF && !match_ch(s, ';') && !((s->flags & TF_CLOSE) && s->ch0 == '}'); s = tok_next(s)) {
 			if (s->flags & TF_OPEN) {
 				// Recurse into (...) and [...] to find orelse inside
 				// paren-wrapped initializers (e.g. `int x = (0 orelse return);`).
@@ -3600,7 +3605,7 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 		}
 	}
 
-	for (Token *s = tok; s && s->kind != TK_EOF && !match_ch(s, ';'); s = tok_next(s)) {
+	for (Token *s = tok; s && s->kind != TK_EOF && !match_ch(s, ';') && !((s->flags & TF_CLOSE) && s->ch0 == '}'); s = tok_next(s)) {
 		if (s->flags & TF_OPEN) {
 			if (is_stmt_expr_open(s))
 				validate_defer_statement(tok_next(s), in_loop, in_switch, depth + 1);
@@ -3610,7 +3615,7 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 			continue;
 		}
 	}
-	Token *semi = skip_to_semicolon(tok);
+	Token *semi = skip_to_semicolon(tok, NULL);
 	return (semi && semi->kind != TK_EOF) ? tok_next(semi) : semi;
 }
 
