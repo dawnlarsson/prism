@@ -3959,6 +3959,73 @@ static void test_typeof_unqual_variants(void) {
 	}
 }
 
+// BUG: case (expr): where last_emitted before : is ) didn't reset at_stmt_start.
+// Declarations after such labels missed zero-initialization.
+static void test_case_paren_expr_zeroinit(void) {
+	printf("\n--- case (expr): zeroinit ---\n");
+
+	// case (2+3): int x; — the ) before : must still trigger at_stmt_start
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int e) {\n"
+		    "    switch(e) {\n"
+		    "    case (2+3): {\n"
+		    "        int x;\n"
+		    "        (void)x;\n"
+		    "        break;\n"
+		    "    }\n"
+		    "    }\n"
+		    "}\n",
+		    "case_paren.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "case-paren: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "x = 0") != NULL,
+			      "case-paren: x gets = 0 after case (2+3):");
+		prism_free(&r);
+	}
+
+	// default: after case (expr): — verify chain works
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int e) {\n"
+		    "    switch(e) {\n"
+		    "    case (1): case (2):\n"
+		    "    default: {\n"
+		    "        int y;\n"
+		    "        (void)y;\n"
+		    "        break;\n"
+		    "    }\n"
+		    "    }\n"
+		    "}\n",
+		    "case_paren_chain.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "case-paren-chain: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "y = 0") != NULL,
+			      "case-paren-chain: y gets = 0 after chained case (expr):");
+		prism_free(&r);
+	}
+
+	// case with compound literal: case (int){42}: (GCC extension)
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int e) {\n"
+		    "    switch(e) {\n"
+		    "    case (int){42}: {\n"
+		    "        int z;\n"
+		    "        (void)z;\n"
+		    "        break;\n"
+		    "    }\n"
+		    "    }\n"
+		    "}\n",
+		    "case_compound.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "case-compound: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "z = 0") != NULL,
+			      "case-compound: z gets = 0 after case (int){42}:");
+		prism_free(&r);
+	}
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -4142,4 +4209,7 @@ void run_zeroinit_tests(void) {
 	test_gcc_float_type_keywords();
 	test_float128x_zeroinit();
 	test_typeof_unqual_variants();
+
+	// BUG: case (expr): didn't reset at_stmt_start for zeroinit
+	test_case_paren_expr_zeroinit();
 }

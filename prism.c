@@ -1051,7 +1051,7 @@ static bool defer_body_refs_name(Token *body, Token *body_end, const char *name,
 		}
 		if (pd == se && match_ch(t, '=')) { in_decl = false; continue; }
 		if (pd == se && match_ch(t, ',') && was_in_decl && bd == decl_bd) { in_decl = true; continue; }
-		if ((((bd > 1 || se > 0) && pd == se) ||
+		if ((((bd > 0 || se > 0) && pd == se) ||
 		     (for_init_pd >= 0 && pd == for_init_pd)) &&
 		    (is_type_keyword(t) || (t->tag & (TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_TYPEDEF)))) {
 			in_decl = true; was_in_decl = true; decl_bd = bd; continue;
@@ -1060,8 +1060,8 @@ static bool defer_body_refs_name(Token *body, Token *body_end, const char *name,
 		    !(prev && (prev->tag & TT_MEMBER)) &&
 		    t->len == nlen && !memcmp(tok_loc(t), name, nlen)) {
 			if (for_name_hid) continue;
-			if ((bd > 1 || se > 0) && decl_depth >= 0 && bd >= decl_depth) continue;
-			if ((bd > 1 || se > 0) && in_decl && pd == se) { decl_depth = bd; continue; }
+			if ((bd > 0 || se > 0) && decl_depth >= 0 && bd >= decl_depth) continue;
+			if ((bd > 0 || se > 0) && in_decl && pd == se) { decl_depth = bd; continue; }
 			if (for_init_pd >= 0 && in_decl) {
 				for_name_hid = true;
 				if (for_header_open && tok_match(for_header_open)) {
@@ -1588,6 +1588,7 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 	Token *unreachable_tok = NULL;
 	int ternary_depth = 0;
 	bool dr_braceless_body = false;
+	bool pending_case_colon = false;
 
 	while (tok && tok != end && tok->kind != TK_EOF) {
 
@@ -1646,12 +1647,15 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 			if (ternary_depth > 0) {
 				ternary_depth--;
 			} else if (!in_generic() && last_emitted &&
-				   (is_identifier_like(last_emitted) || last_emitted->kind == TK_NUM) &&
+				   (is_identifier_like(last_emitted) || last_emitted->kind == TK_NUM ||
+				    pending_case_colon) &&
 				   !in_struct_body()) {
+				pending_case_colon = false;
 				emit_tok(tok); tok = tok_next(tok);
 				ctx->at_stmt_start = true;
 				continue;
 			}
+			pending_case_colon = false;
 		}
 
 		// --- Preprocessor directives ---
@@ -1774,6 +1778,9 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 			next = try_bracket_orelse(tok);
 			if (next) { tok = next; continue; }
 		}
+
+		if (tok->tag & (TT_CASE | TT_DEFAULT))
+			pending_case_colon = true;
 
 		ctx->at_stmt_start = false;
 		{ Token *r = emit_tok_checked(tok); if (r) { tok = r; continue; } }
@@ -6719,10 +6726,12 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 
 		// Phase 1D: track whether this declarator would need
 		// typeof memset in Pass 2 (for split detection).
+		// Must mirror Pass 2's needs_memset condition exactly.
 		if (FEAT(F_ZEROINIT) && !has_init && !decl_raw &&
 		    !(saw_static || type.has_static || type.has_extern) &&
 		    !type.has_register && (!decl.is_pointer || decl.is_array) &&
-		    (type.has_typeof || (type.has_atomic && type.is_struct) ||
+		    (type.has_typeof || (type.has_atomic && ((decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
+		     ((type.is_struct || type.is_typedef) && !decl.is_pointer))) ||
 		     type.is_vla || decl.is_vla))
 			any_would_memset = true;
 
@@ -8181,6 +8190,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 	int next_func_idx = 0;
 	int ternary_depth = 0;
 	Token *pending_unreachable_tok = NULL;
+	bool pending_case_colon = false;
 
 	while (tok->kind != TK_EOF) {
 		// Non-flatten mode: skip system header tokens entirely.
@@ -8328,7 +8338,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			// Control-flow flag setting
 
 			if (tag & TT_LOOP) {
-				if (FEAT(F_DEFER)) {
+				if (FEAT(F_DEFER | F_ZEROINIT)) {
 					ctrl_state.pending = true;
 				if (is_do_kw(tok)) ctrl_state.parens_just_closed = true;
 				}
@@ -8370,6 +8380,9 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			}
 
 		} // end if (tag)
+
+		if (tag & (TT_CASE | TT_DEFAULT))
+			pending_case_colon = true;
 
 		track_generic_token(tok);
 
@@ -8423,12 +8436,15 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 					ternary_depth--;
 				} else if (in_generic()) {
 				} else if (last_emitted &&
-				           (is_identifier_like(last_emitted) || last_emitted->kind == TK_NUM) &&
+				           (is_identifier_like(last_emitted) || last_emitted->kind == TK_NUM ||
+				            pending_case_colon) &&
 				           !in_struct_body() && ctx->block_depth > 0) {
+					pending_case_colon = false;
 					emit_tok(tok); tok = tok_next(tok);
 					ctx->at_stmt_start = true;
 					continue;
 				}
+				pending_case_colon = false;
 			}
 		}
 

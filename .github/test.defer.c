@@ -6235,6 +6235,57 @@ static void test_defer_case_label_orelse_leak(void) {
 	}
 }
 
+// BUG: defer_body_refs_name bd>1 missed top-level locals in block defer.
+// `defer { int x = 1; }` followed by `int x = 2;` falsely flagged as shadow
+// because the scanner didn't recognize top-level (bd==1) declarations as local.
+static void test_defer_shadow_toplevel_local_false_positive(void) {
+	printf("\n--- Defer shadow top-level local false positive ---\n");
+
+	// Top-level local in defer body must not cause false-positive shadow.
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    defer { int x = 1; (void)x; }\n"
+		    "    { int x = 2; (void)x; return; }\n"
+		    "}\n",
+		    "defer_toplevel_local.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "defer-toplevel-local: top-level int x in defer is local, no shadow");
+		prism_free(&r);
+	}
+
+	// Real shadow at top level must still be caught.
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get(void);\n"
+		    "void f(void) {\n"
+		    "    int x = get();\n"
+		    "    defer { (void)x; }\n"
+		    "    { int x = 99; (void)x; return; }\n"
+		    "}\n",
+		    "defer_toplevel_real.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "defer-toplevel-real: top-level x reference in defer still caught");
+		prism_free(&r);
+	}
+
+	// Multiple locals at top level in block defer.
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    defer {\n"
+		    "        int a = 1, b = 2;\n"
+		    "        (void)a; (void)b;\n"
+		    "    }\n"
+		    "    { int a = 10; int b = 20; (void)a; (void)b; return; }\n"
+		    "}\n",
+		    "defer_toplevel_multi.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "defer-toplevel-multi: multiple locals in defer not false positive");
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_rejected();
@@ -6538,4 +6589,7 @@ void run_defer_tests(void) {
 
         // BUG: case/default labels in defer body didn't reset at_stmt_start
         test_defer_case_label_orelse_leak();
+
+	// BUG: defer_body_refs_name bd>1 missed top-level local declarations
+	test_defer_shadow_toplevel_local_false_positive();
 }
