@@ -1926,6 +1926,13 @@ static Token *walk_balanced(Token *tok, bool emit) {
 				Token *next = try_typeof_orelse(t);
 				if (next) { t = next; continue; }
 			}
+			// Enum bodies in expression context (e.g. sizeof(enum { X = 1 }))
+			// bypass statement-start check_enum_typedef_defer_shadow.
+			// Queue shadow entries here so they're checked at control-flow exits.
+			if (FEAT(F_DEFER) && defer_count > 0 && is_enum_kw(t)) {
+				Token *brace = find_struct_body_brace(t);
+				if (brace) check_enum_body_defer_shadow(brace);
+			}
 			// Strip 'raw' keyword inside balanced groups (cast expressions, etc.)
 			{ Token *r = emit_tok_checked(t); if (r) { t = r; continue; } }
 			t = tok_next(t);
@@ -2238,6 +2245,12 @@ static Token *walk_balanced_orelse(Token *tok) {
 				error_tok(t, "'orelse' inside array dimension could not be transformed; "
 					   "if wrapped in outer parentheses, remove them: "
 					   "use '[f() orelse 1]' not '[(f() orelse 1)]'");
+			// Enum bodies in expression context (e.g. arr[sizeof(enum { X = 1 })])
+			// bypass statement-start check — queue shadow for exit checking.
+			if (FEAT(F_DEFER) && defer_count > 0 && is_enum_kw(t)) {
+				Token *brace = find_struct_body_brace(t);
+				if (brace) check_enum_body_defer_shadow(brace);
+			}
 			{ Token *r = emit_tok_checked(t); if (r) { t = r; continue; } }
 			t = tok_next(t);
 		}
@@ -5907,39 +5920,11 @@ p1_check_enum_body_defer_shadow(Token *brace, uint16_t cur_sid, int p1d_cur_func
 	for (Token *t = tok_next(brace); t && t != end && t->kind != TK_EOF; ) {
 		if (is_valid_varname(t)) {
 			p1_check_defer_same_block_shadow(t, cur_sid, p1d_cur_func);
-			// Enum constants leak to the enclosing block scope (C11 §6.2.1p4).
-			// Check enclosing-scope defers too — a control-flow exit anywhere
-			// after this point would paste the defer with the wrong binding.
-			{
-				char *name = tok_loc(t);
-				int nlen = t->len;
-				if (hashmap_get(&func_meta[p1d_cur_func].defer_name_set, name, nlen)) {
-					int start = func_meta[p1d_cur_func].entry_start;
-					for (int i = start; i < p1_entry_count; i++) {
-						P1FuncEntry *e = &p1_entries[i];
-						if (e->kind != P1K_DEFER) continue;
-						if (e->scope_id == cur_sid) continue; // already checked above
-						if (!scope_is_ancestor_or_self(e->scope_id, cur_sid)) continue;
-						Token *body = tok_next(e->tok);
-						if (!body) continue;
-						Token *body_end = NULL;
-						if (match_ch(body, '{') && tok_match(body))
-							body_end = tok_match(body);
-						else
-							body_end = skip_to_semicolon(body, NULL);
-						uint32_t var_idx = tok_idx(t);
-						uint32_t bi = tok_idx(body);
-						uint32_t ei = body_end ? tok_idx(body_end) : UINT32_MAX;
-						if (var_idx >= bi && var_idx < ei) continue;
-						if (defer_body_refs_name(body, body_end, name, nlen))
-							error_tok(t,
-								  "enum constant '%.*s' shadows a name captured "
-								  "by a defer in an enclosing scope; the defer "
-								  "body would bind to the enum constant",
-								  nlen, name);
-					}
-				}
-			}
+			// Enclosing-scope enum shadows are handled by Pass 2:
+			// check_enum_body_defer_shadow queues into defer_shadows,
+			// checked at control-flow exits.  Phase 1D cannot distinguish
+			// blocks with vs without exits, so a hard error here would
+			// be a false positive when the inner block has no return/goto.
 			while (t && t != end && t->kind != TK_EOF && !match_ch(t, ',')) {
 				if (t->flags & TF_OPEN && tok_match(t))
 					{ t = tok_next(tok_match(t)); continue; }

@@ -5357,6 +5357,9 @@ static void test_emit_block_body_gaps(void) {
 	}
 
 	// 4. enum constant inside stmt-expr that shadows defer-captured name
+	// The enum constant 'handle' lives only inside the stmt-expr scope.
+	// After ({}), the outer 'handle' is restored — no control-flow exit
+	// occurs while the shadow is live, so this is safe (C11 §6.2.1p4).
 	{
 		const char *code =
 		    "void cleanup(int);\n"
@@ -5370,9 +5373,25 @@ static void test_emit_block_body_gaps(void) {
 		    "    (void)r;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "stexpr_enum_shadow.c", prism_defaults());
-		// This should error: enum constant 'handle' shadows the name
-		// captured by defer { cleanup(handle); }
-		CHECK(r.status != PRISM_OK, "stmt-expr enum defer shadow: detected");
+		CHECK_EQ(r.status, PRISM_OK, "stmt-expr enum defer shadow: safe (no exit while live)");
+		prism_free(&r);
+	}
+
+	// 4b. enum constant inside stmt-expr WITH return — this IS dangerous
+	{
+		const char *code =
+		    "void cleanup(int);\n"
+		    "void test(void) {\n"
+		    "    int handle = 42;\n"
+		    "    defer cleanup(handle);\n"
+		    "    if (1) {\n"
+		    "        enum { handle = 99 };\n"
+		    "        (void)handle;\n"
+		    "        return;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "stexpr_enum_shadow_ret.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "enum defer shadow with return: detected");
 		prism_free(&r);
 	}
 }

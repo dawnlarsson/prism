@@ -6338,6 +6338,133 @@ static void test_defer_validator_escape_missing_semicolon(void) {
 	}
 }
 
+// BUG: Phase 1D enum defer shadow check unconditionally hard-errored for
+// enclosing-scope shadows, even when no control-flow exit occurs while
+// the enum constant is live. C11 §6.2.1p4: enum constants have block scope.
+static void test_enum_defer_shadow_false_positive(void) {
+	printf("\n--- enum defer shadow false positive ---\n");
+
+	// Case 1: inner-scope enum shadows defer-captured name, no return — safe
+	{
+		PrismResult r = prism_transpile_source(
+		    "void close_stream(void);\n"
+		    "void process_data(void) {\n"
+		    "    int mode = 0;\n"
+		    "    defer { if (mode == 0) close_stream(); }\n"
+		    "    if (1) {\n"
+		    "        enum { mode = 1 };\n"
+		    "        (void)mode;\n"
+		    "    }\n"
+		    "}\n",
+		    "enum_safe.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "enum-shadow-safe: transpiles OK");
+		prism_free(&r);
+	}
+
+	// Case 2: inner-scope enum shadows with return — must be caught
+	{
+		PrismResult r = prism_transpile_source(
+		    "void close_stream(void);\n"
+		    "void process_data(void) {\n"
+		    "    int mode = 0;\n"
+		    "    defer { if (mode == 0) close_stream(); }\n"
+		    "    if (1) {\n"
+		    "        enum { mode = 1 };\n"
+		    "        (void)mode;\n"
+		    "        return;\n"
+		    "    }\n"
+		    "}\n",
+		    "enum_ret.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "enum-shadow-return: detected");
+		prism_free(&r);
+	}
+
+	// Case 3: same-scope enum shadow — always fatal (unconditional)
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(int);\n"
+		    "void test(void) {\n"
+		    "    int handle = 42;\n"
+		    "    defer cleanup(handle);\n"
+		    "    enum { handle = 99 };\n"
+		    "    (void)handle;\n"
+		    "}\n",
+		    "enum_same.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "enum-shadow-same-scope: detected");
+		prism_free(&r);
+	}
+
+	// Case 4: sizeof(enum {...}) expression-context shadow — safe without return
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(int);\n"
+		    "void test(void) {\n"
+		    "    int handle = 42;\n"
+		    "    defer cleanup(handle);\n"
+		    "    if (1) {\n"
+		    "        int x = sizeof(enum { handle = 1 });\n"
+		    "        (void)x;\n"
+		    "    }\n"
+		    "}\n",
+		    "enum_sizeof_safe.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "sizeof-enum-shadow-safe: transpiles OK");
+		prism_free(&r);
+	}
+
+	// Case 5: sizeof(enum {...}) with return after — must be caught
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(int);\n"
+		    "void test(void) {\n"
+		    "    int handle = 42;\n"
+		    "    defer cleanup(handle);\n"
+		    "    if (1) {\n"
+		    "        int x = sizeof(enum { handle = 1 });\n"
+		    "        (void)x;\n"
+		    "        return;\n"
+		    "    }\n"
+		    "}\n",
+		    "enum_sizeof_ret.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "sizeof-enum-shadow-return: detected");
+		prism_free(&r);
+	}
+
+	// Case 6: enum in array dimension (walk_balanced_orelse path) with return
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(int);\n"
+		    "void test(void) {\n"
+		    "    int handle = 42;\n"
+		    "    defer cleanup(handle);\n"
+		    "    if (1) {\n"
+		    "        int arr[sizeof(enum { handle = 1 })];\n"
+		    "        (void)arr;\n"
+		    "        return;\n"
+		    "    }\n"
+		    "}\n",
+		    "enum_arrdim_ret.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "enum-in-array-dim-return: detected");
+		prism_free(&r);
+	}
+
+	// Case 7: enum in array dimension without return — safe
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(int);\n"
+		    "void test(void) {\n"
+		    "    int handle = 42;\n"
+		    "    defer cleanup(handle);\n"
+		    "    if (1) {\n"
+		    "        int arr[sizeof(enum { handle = 1 })];\n"
+		    "        (void)arr;\n"
+		    "    }\n"
+		    "}\n",
+		    "enum_arrdim_safe.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "enum-in-array-dim-safe: transpiles OK");
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_rejected();
@@ -6647,4 +6774,7 @@ void run_defer_tests(void) {
 
 	// BUG: skip_to_semicolon escaped past } on missing semicolon
 	test_defer_validator_escape_missing_semicolon();
+
+	// BUG: Phase 1D enum defer shadow hard error on enclosing-scope shadows
+	GNUC_ONLY(test_enum_defer_shadow_false_positive());
 }
