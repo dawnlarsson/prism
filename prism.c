@@ -149,7 +149,8 @@ typedef struct {
 	bool has_computed_goto;    // Function contains a computed goto (*ptr)
 	int entry_start;           // Start index into p1_entries[] for this function
 	int entry_count;           // Number of P1FuncEntry items for this function
-	HashMap defer_name_set; // Exact set of identifier names in defer bodies
+	HashMap defer_name_set; // Exact set of captured names (union of all defer bodies)
+	HashMap defer_body_captures; // tok_idx(body) → HashMap* (per-body capture sets)
 	int *label_hash;           // Open-addressing hash table: name → entry index (-1=empty)
 	int label_hash_mask;       // Power-of-2 mask for label_hash probing
 } FuncMeta;
@@ -917,6 +918,8 @@ static void emit_range_ex(Token *start, Token *end, int flags) {
 			continue;
 		}
 		if (is_stmt_expr_open(t) && tok_match(t)) { walk_balanced(t, true); t = tok_next(tok_match(t)); continue; }
+		// Defense-in-depth: typeof(expr orelse val) → typeof(ternary)
+		if (FEAT(F_ORELSE) && (t->tag & TT_TYPEOF)) { Token *next = try_typeof_orelse(t); if (next) { t = next; continue; } }
 		{ Token *r = emit_tok_checked(t); if (r) { t = r; continue; } }
 		t = tok_next(t);
 	}
@@ -1006,29 +1009,73 @@ static inline bool has_defers_for(DeferEmitMode mode, int stop_depth) {
 	return defer_walk(mode, stop_depth, true);
 }
 
-// Returns true if `name` (length nlen) is referenced (not locally declared) in [body, body_end).
-static bool defer_body_refs_name(Token *body, Token *body_end, const char *name, int nlen) {
+// Phase 1 capture analysis: compute the exact set of externally-captured
+// variable names in [body, body_end) in a single O(M) pass.  Names that are
+// only locally declared (and never referenced outside their inner scope) are
+// excluded.  This replaces the old blind dump + per-name O(M) linear search,
+// eliminating the O(N*M) algorithmic trap for generated code with many
+// variables sharing names between defer bodies and outer scopes.
+//
+// Algorithm: maintain per-name state in a local HashMap (name → decl_depth).
+// On scope exit (}), reset entries declared at the closing depth via a
+// scope-exit stack.  Identifiers referenced outside any local declaration
+// scope are marked as captured in the output HashMap.
+static void defer_body_populate_captures(Token *body, Token *body_end,
+		HashMap *out, HashMap *body_captures_map) {
+	// Per-body capture set: arena-allocated, stored in body_captures_map
+	// keyed by tok_idx(body) so callers can do O(1) per-body lookups.
+	HashMap *body_set = arena_alloc(&ctx->main_arena, sizeof(HashMap));
+	*body_set = (HashMap){0};
+	char tmp[16];
+	int idx_len = snprintf(tmp, sizeof(tmp), "%u", tok_idx(body));
+	char *idx_key = arena_alloc(&ctx->main_arena, idx_len + 1);
+	memcpy(idx_key, tmp, idx_len + 1);
+	hashmap_put(body_captures_map, idx_key, idx_len, body_set);
+
+	// Per-name state: decl_depth stored as (void*)(intptr_t)(depth + 2).
+	// 0 = not present, 1 = already captured (skip), depth+2 = declared at depth.
+	HashMap local_decls = {0};
+
+	// Scope-exit stack: flat array of (name, len, depth) triples.
+	// When } closes depth d, reset all entries declared at depth d.
+	typedef struct { char *name; int len; int depth; } ScopeDecl;
+	int se_cap = 256, se_count = 0;
+	ScopeDecl *se_stack = arena_alloc(&ctx->main_arena, se_cap * sizeof(ScopeDecl));
+
+	// For-init scope tracking: per-name for_body_end_idx.
+	// Stored as a separate HashMap: name → for_body_end_idx (as void*).
+	HashMap for_scopes = {0};
+
 	Token *prev = NULL;
-	int bd = 0, pd = 0, se = 0, se_brace[32];
-	int decl_depth = -1;
+	int bd = 0, pd = 0;
+	int block_base_pd[256]; // base paren depth when each block scope opened
+	block_base_pd[0] = 0;
 	bool in_decl = false, was_in_decl = false;
 	int decl_bd = 0, for_init_pd = -1;
-	bool for_name_hid = false;
-	uint32_t for_body_end_idx = 0;
 	Token *for_header_open = NULL;
+
 	for (Token *t = body; t && t != body_end && t->kind != TK_EOF;
 	     prev = t, t = tok_next(t)) {
-		if (for_name_hid && for_body_end_idx && tok_idx(t) > for_body_end_idx)
-			for_name_hid = false;
 		if (match_ch(t, '{')) {
-			if (prev && match_ch(prev, '(') && se < 32) se_brace[se++] = bd;
+			if (bd < 255) block_base_pd[bd + 1] = pd;
 			bd++; continue;
 		}
 		if (match_ch(t, '}')) {
 			bd--;
-			if (se > 0 && bd == se_brace[se - 1]) se--;
-			if (decl_depth >= 0 && bd < decl_depth) decl_depth = -1;
 			if (in_decl && bd < decl_bd) in_decl = false;
+			// Reset local declarations that go out of scope.
+			while (se_count > 0 && se_stack[se_count - 1].depth > bd) {
+				se_count--;
+				ScopeDecl *sd = &se_stack[se_count];
+				void *val = hashmap_get(&local_decls, sd->name, sd->len);
+				// Only reset if the stored depth matches (could have been
+				// overwritten by a deeper redeclaration).
+				if (val && val != (void*)1) {
+					int stored = (int)((intptr_t)val - 2);
+					if (stored == sd->depth)
+						hashmap_put(&local_decls, sd->name, sd->len, NULL);
+				}
+			}
 			continue;
 		}
 		if (match_set(t, CH('(') | CH('['))) {
@@ -1049,31 +1096,75 @@ static bool defer_body_refs_name(Token *body, Token *body_end, const char *name,
 			if (for_init_pd >= 0 && pd == for_init_pd) for_init_pd = -1;
 			continue;
 		}
-		if (pd == se && match_ch(t, '=')) { in_decl = false; continue; }
-		if (pd == se && match_ch(t, ',') && was_in_decl && bd == decl_bd) { in_decl = true; continue; }
-		if ((((bd > 0 || se > 0) && pd == se) ||
+		int bpd = (bd > 0) ? block_base_pd[bd] : 0;
+		if (pd == bpd && match_ch(t, '=')) { in_decl = false; continue; }
+		if (pd == bpd && match_ch(t, ',') && was_in_decl && bd == decl_bd) { in_decl = true; continue; }
+		if (((bd > 0 && pd == bpd) ||
 		     (for_init_pd >= 0 && pd == for_init_pd)) &&
 		    (is_type_keyword(t) || (t->tag & (TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_TYPEDEF)))) {
 			in_decl = true; was_in_decl = true; decl_bd = bd; continue;
 		}
 		if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
-		    !(prev && (prev->tag & TT_MEMBER)) &&
-		    t->len == nlen && !memcmp(tok_loc(t), name, nlen)) {
-			if (for_name_hid) continue;
-			if ((bd > 0 || se > 0) && decl_depth >= 0 && bd >= decl_depth) continue;
-			if ((bd > 0 || se > 0) && in_decl && pd == se) { decl_depth = bd; continue; }
-			if (for_init_pd >= 0 && in_decl) {
-				for_name_hid = true;
-				if (for_header_open && tok_match(for_header_open)) {
-					Token *fbe = skip_one_stmt(tok_next(tok_match(for_header_open)));
-					for_body_end_idx = fbe ? tok_idx(fbe) : 0;
-				} else for_body_end_idx = 0;
+		    !(prev && (prev->tag & TT_MEMBER))) {
+			char *name = tok_loc(t);
+			int nlen = t->len;
+			void *val = hashmap_get(&local_decls, name, nlen);
+			// Already confirmed captured — skip.
+			if (val == (void*)1) continue;
+			// Check for-init hiding.
+			void *fv = hashmap_get(&for_scopes, name, nlen);
+			if (fv) {
+				uint32_t fe = (uint32_t)(uintptr_t)fv;
+				if (fe == 0 || tok_idx(t) <= fe) continue; // hidden by for-init
+				// Past for body end — remove for-scope entry.
+				hashmap_put(&for_scopes, name, nlen, NULL);
+			}
+			// Check if locally declared at current or enclosing depth.
+			if (val) {
+				int dd = (int)((intptr_t)val - 2);
+				if (bd > 0 && dd >= 0 && bd >= dd) continue;
+			}
+			// In declaration context — record as local.
+			if (bd > 0 && in_decl && pd == bpd) {
+				hashmap_put(&local_decls, name, nlen, (void*)((intptr_t)(bd + 2)));
+				if (se_count >= se_cap) {
+					int new_cap = se_cap * 2;
+					ScopeDecl *ns = arena_alloc(&ctx->main_arena, new_cap * sizeof(ScopeDecl));
+					memcpy(ns, se_stack, se_count * sizeof(ScopeDecl));
+					se_stack = ns; se_cap = new_cap;
+				}
+				se_stack[se_count++] = (ScopeDecl){name, nlen, bd};
 				continue;
 			}
-			return true;
+			if (for_init_pd >= 0 && in_decl) {
+				// For-init declaration: scoped to loop body.
+				uint32_t fbe = 0;
+				if (for_header_open && tok_match(for_header_open)) {
+					Token *end = skip_one_stmt(tok_next(tok_match(for_header_open)));
+					fbe = end ? tok_idx(end) : 0;
+				}
+				hashmap_put(&for_scopes, name, nlen, (void*)(uintptr_t)fbe);
+				continue;
+			}
+			// Not locally declared — this is a capture.
+			hashmap_put(out, name, nlen, (void*)1);
+			hashmap_put(body_set, name, nlen, (void*)1);
+			// Mark as captured so we skip future references.
+			hashmap_put(&local_decls, name, nlen, (void*)1);
 		}
 	}
-	return false;
+}
+
+// O(1) lookup: does defer body starting at `body` capture `name`?
+// Uses per-body HashMaps built by defer_body_populate_captures.
+static bool defer_body_has_capture(int func_idx, Token *body,
+				   const char *name, int nlen) {
+	if (func_idx < 0) return false;
+	char idx_buf[16];
+	int idx_len = snprintf(idx_buf, sizeof(idx_buf), "%u", tok_idx(body));
+	HashMap *body_set = hashmap_get(
+		&func_meta[func_idx].defer_body_captures, idx_buf, idx_len);
+	return body_set && hashmap_get(body_set, (char*)name, nlen);
 }
 
 // Record that declaring var_name shadows a name captured by a defer in an
@@ -1101,7 +1192,7 @@ static void check_defer_var_shadow(Token *var_name) {
 		uint32_t stmt_idx = tok_idx(defer_stack[i].stmt);
 		uint32_t end_idx = defer_stack[i].end ? tok_idx(defer_stack[i].end) : UINT32_MAX;
 		if (var_idx >= stmt_idx && var_idx < end_idx) continue;
-		if (!defer_body_refs_name(defer_stack[i].stmt, defer_stack[i].end, name, nlen))
+		if (!defer_body_has_capture(current_func_idx, defer_stack[i].stmt, name, nlen))
 			continue;
 		if (defer_shadow_count >= defer_shadow_cap) {
 			int new_cap = defer_shadow_cap ? defer_shadow_cap * 2 : 64;
@@ -1418,6 +1509,7 @@ static Token *emit_expr_to_stop(Token *tok, Token *stop, bool check_orelse) {
 		if (tok->flags & TF_OPEN) { tok = walk_balanced(tok, true); continue; }
 		if (match_ch(tok, ';') || (stop && tok == stop)) break;
 		if (check_orelse && is_orelse_keyword(tok)) break;
+		if (FEAT(F_ORELSE) && (tok->tag & TT_TYPEOF)) { Token *next = try_typeof_orelse(tok); if (next) { tok = next; continue; } }
 		{ Token *r = emit_tok_checked(tok); if (r) { tok = r; continue; } }
 		tok = tok_next(tok);
 	}
@@ -2444,6 +2536,11 @@ static void emit_noise_between_raws(Token *first_raw, Token *last_raw) {
 static Token *emit_raw_verbatim_to_semicolon(Token *tok) {
 	while (tok && tok->kind != TK_EOF && !match_ch(tok, ';')) {
 		if (tok->flags & TF_OPEN) tok = walk_balanced(tok, true);
+		else if (FEAT(F_ORELSE) && (tok->tag & TT_TYPEOF)) {
+			Token *next = try_typeof_orelse(tok);
+			if (next) { tok = next; continue; }
+			emit_tok(tok); tok = tok_next(tok);
+		}
 		else { emit_tok(tok); tok = tok_next(tok); }
 	}
 	if (tok && match_ch(tok, ';')) { emit_tok(tok); tok = tok_next(tok); }
@@ -2535,6 +2632,15 @@ static Token *emit_goto_defer(Token *tok) {
 static Token *emit_orelse_fallback_value(Token *tok, Token *stop_comma, Token **chain_next) {
 	*chain_next = NULL;
 	while (tok->kind != TK_EOF) {
+		// typeof with inner orelse: emit typeof keyword + transform parens
+		// via orelse-aware walker. Must fire BEFORE the TF_OPEN check,
+		// because typeof itself is not TF_OPEN — without this, typeof is
+		// emitted verbatim and the subsequent ( enters walk_balanced
+		// without typeof context, leaking raw 'orelse' to output.
+		if (FEAT(F_ORELSE) && (tok->tag & TT_TYPEOF)) {
+			Token *next = try_typeof_orelse(tok);
+			if (next) { tok = next; continue; }
+		}
 		if (tok->flags & TF_OPEN) {
 			if (is_stmt_expr_open(tok))
 				error_tok(tok, "GNU statement expressions in orelse fallback values are not "
@@ -3583,6 +3689,7 @@ static Token *emit_expr_to_semicolon(Token *tok) {
 			expr_at_stmt_start = false;
 		}
 
+		if (FEAT(F_ORELSE) && (tok->tag & TT_TYPEOF)) { Token *next = try_typeof_orelse(tok); if (next) { tok = next; continue; } }
 		{ Token *r = emit_tok_checked(tok); if (r) { tok = r; continue; } }
 
 		if (match_ch(tok, ';') || match_ch(tok, '{') || match_ch(tok, '}'))
@@ -5209,6 +5316,7 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 			emit_range_no_prep(bare_lhs_start, bare_assign_eq);
 			OUT_LIT(" = (");
 			while (t->kind != TK_EOF) {
+			if (FEAT(F_ORELSE) && (t->tag & TT_TYPEOF)) { Token *next = try_typeof_orelse(t); if (next) { t = next; continue; } }
 			if ((t->flags & TF_OPEN) && (match_ch(t, '(') || match_ch(t, '['))) { t = walk_balanced(t, true); continue; }
 				if (t->flags & TF_OPEN) fd++;
 				else if (t->flags & TF_CLOSE) fd--;
@@ -5311,6 +5419,7 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 						OUT_LIT(" = (");
 						int fd = 0;
 						while (t->kind != TK_EOF) {
+							if (FEAT(F_ORELSE) && (t->tag & TT_TYPEOF)) { Token *next = try_typeof_orelse(t); if (next) { t = next; continue; } }
 							if ((t->flags & TF_OPEN) && (match_ch(t, '(') || match_ch(t, '['))) { t = walk_balanced(t, true); continue; }
 							if (t->flags & TF_OPEN) fd++;
 							else if (t->flags & TF_CLOSE) fd--;
@@ -5902,7 +6011,7 @@ p1_check_defer_same_block_shadow(Token *var_name, uint16_t cur_sid, int p1d_cur_
 		uint32_t bi = tok_idx(body);
 		uint32_t ei = body_end ? tok_idx(body_end) : UINT32_MAX;
 		if (var_idx >= bi && var_idx < ei) continue;
-		if (defer_body_refs_name(body, body_end, name, nlen))
+		if (defer_body_has_capture(p1d_cur_func, body, name, nlen))
 			error_tok(var_name,
 				  "variable '%.*s' shadows a name captured "
 				  "by a defer in the same scope; the defer "
@@ -5978,7 +6087,10 @@ p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t
 	}
 	validate_defer_statement(tok_next(tok), false, false, 0);
 
-	// Populate defer name set for O(1) shadow checks.
+	// Populate defer name set with ONLY captured (free) variables.
+	// A captured variable is one referenced in the defer body but not locally
+	// declared within it (at the reference's scope depth or deeper).
+	// Single-pass O(M) scan replaces the old O(N*M) per-name linear search.
 	if (p1d_cur_func >= 0) {
 		Token *body = tok_next(tok);
 		Token *body_end = NULL;
@@ -5986,16 +6098,10 @@ p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t
 			body_end = tok_match(body);
 		else if (body)
 			body_end = skip_to_semicolon(body, NULL);
-		if (body_end) {
-			Token *prev_t = NULL;
-			for (Token *t = body; t && t != body_end && t->kind != TK_EOF;
-			     prev_t = t, t = tok_next(t)) {
-				if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
-				    !(prev_t && (prev_t->tag & TT_MEMBER)))
-					hashmap_put(&func_meta[p1d_cur_func].defer_name_set,
-						tok_loc(t), t->len, (void*)1);
-			}
-		}
+		if (body_end)
+			defer_body_populate_captures(body, body_end,
+				&func_meta[p1d_cur_func].defer_name_set,
+				&func_meta[p1d_cur_func].defer_body_captures);
 	}
 }
 
@@ -7088,19 +7194,23 @@ static void p1_full_depth_prescan(Token *tok) {
 				}
 				// Phase 1D: reject side effects in typeof orelse LHS
 				// (hoisted from Pass 2 emit_token_range_orelse).
+				// Scans ALL chained orelse — each intermediate LHS is validated.
 				if (!msg) {
 					Token *prev_typeof = paren;
+					Token *se_start = tok_next(paren);
 					for (Token *s = tok_next(paren); s && s != tok_match(paren); s = tok_next(s)) {
 						if ((s->tag & TT_ORELSE)) {
 							TypedefEntry *te_s = typedef_lookup(s);
 							if (!te_s || orelse_shadow_is_kw(prev_typeof)) {
 								reject_orelse_side_effects(
-									tok_next(paren), s,
+									se_start, s,
 									"'orelse' in typeof",
 									"in the LHS (would be evaluated twice); "
 									"hoist the expression to a variable first",
 									true, true, false);
-								break;
+								se_start = tok_next(s);
+								prev_typeof = s;
+								continue;
 							}
 						}
 						if (s->flags & TF_OPEN && tok_match(s)) { prev_typeof = tok_match(s); s = tok_match(s); continue; }

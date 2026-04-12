@@ -3670,6 +3670,49 @@ static void test_sue_typedef_namespace_collision(void) {
 		}
 		prism_free(&r);
 	}
+
+	/* Case C: typedef int State; then typedef struct State { int buf[n]; } State_t;
+	 * The struct tag 'State' must be registered even though 'State' exists as
+	 * an ordinary typedef. VLA member requires memset, not = {0}. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void process(int n) {\n"
+		    "    typedef int State;\n"
+		    "    typedef struct State {\n"
+		    "        int buffer[n];\n"
+		    "    } State_t;\n"
+		    "    struct State my_var;\n"
+		    "}\n",
+		    "ns_tdef_vla.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "ns typedef-wrapped VLA struct: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "ns typedef-wrapped VLA struct: memset (not = {0})");
+			CHECK(strstr(r.output, "= {0}") == NULL ||
+			      strstr(r.output, "my_var = {0}") == NULL,
+			      "ns typedef-wrapped VLA struct: no = {0} on VLA");
+		}
+		prism_free(&r);
+	}
+
+	/* Case D: typeof(struct State) with name collision + volatile member */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void process(void) {\n"
+		    "    typedef int State;\n"
+		    "    typedef struct State {\n"
+		    "        volatile int status;\n"
+		    "    } State_t;\n"
+		    "    typeof(struct State) my_var;\n"
+		    "}\n",
+		    "ns_tdef_vol.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "ns typedef-wrapped volatile: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "__prism_p_") != NULL,
+			      "ns typedef-wrapped volatile: byte loop");
+		}
+		prism_free(&r);
+	}
 }
 
 /* typeof(int (__attribute__((cdecl)) *)(int)) — attribute before * in function

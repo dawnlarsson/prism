@@ -3130,7 +3130,7 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 				Token *tag = skip_noise(tok_next(bt));
 				// Skip qualifiers after struct/union keyword
 				while (tag && (tag->tag & TT_QUALIFIER)) tag = skip_noise(tok_next(tag));
-				if (tag && is_valid_varname(tag) && !is_known_typedef(tag)) {
+				if (tag && is_valid_varname(tag)) {
 					int pre = typedef_table.count;
 					typedef_add_entry(tok_loc(tag), tag->len, scope_depth, TDK_STRUCT_TAG, is_vla, false);
 					if (typedef_table.count > pre) {
@@ -3476,22 +3476,31 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 static void defer_scan_orelse_in_group(Token *open, bool in_loop, bool in_switch, int depth) {
 	Token *end = tok_match(open);
 	if (!end) return;
+	Token *prev = open;
 	for (Token *s = tok_next(open); s && s != end && s->kind != TK_EOF; s = tok_next(s)) {
 		if (s->flags & TF_OPEN) {
 			if (match_ch(s, '(') || match_ch(s, '['))
 				defer_scan_orelse_in_group(s, in_loop, in_switch, depth);
-			s = tok_match(s) ? tok_match(s) : s;
+			prev = tok_match(s) ? tok_match(s) : s;
+			s = prev;
 			continue;
 		}
-		if (is_orelse_kw_shadow(s)) {
+		if (is_orelse_kw_shadow(s) && orelse_shadow_is_kw(prev)) {
 			Token *act = tok_next(s);
 			if (act && match_ch(act, ';'))
 				error_tok(s, "expected statement after 'orelse'");
 			validate_defer_control_flow(act, in_loop, in_switch);
-			if (act && match_ch(act, '{'))
+			if (act && match_ch(act, '{')) {
 				validate_defer_statement(act, in_loop, in_switch, depth + 1);
-			break;
+				Token *close = tok_match(act);
+				if (close) { prev = close; s = close; }
+			} else {
+				prev = act ? act : s;
+				s = prev;
+			}
+			continue;
 		}
+		prev = s;
 	}
 }
 
@@ -3583,6 +3592,7 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 	}
 
 	if (FEAT(F_ORELSE)) {
+		Token *prev_oe = NULL;
 		for (Token *s = tok; s && s->kind != TK_EOF && !match_ch(s, ';') && !((s->flags & TF_CLOSE) && s->ch0 == '}'); s = tok_next(s)) {
 			if (s->flags & TF_OPEN) {
 				// Recurse into (...) and [...] to find orelse inside
@@ -3590,18 +3600,26 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 				// Skip {...} — stmt-exprs handled by the loop below.
 				if (match_ch(s, '(') || match_ch(s, '['))
 					defer_scan_orelse_in_group(s, in_loop, in_switch, depth);
-				s = tok_match(s) ? tok_match(s) : s;
+				prev_oe = tok_match(s) ? tok_match(s) : s;
+				s = prev_oe;
 				continue;
 			}
-			if (is_orelse_kw_shadow(s)) {
+			if (is_orelse_kw_shadow(s) && (!prev_oe || orelse_shadow_is_kw(prev_oe))) {
 				Token *act = tok_next(s);
 				if (act && match_ch(act, ';'))
 					error_tok(s, "expected statement after 'orelse'");
 				validate_defer_control_flow(act, in_loop, in_switch);
-				if (act && match_ch(act, '{'))
+				if (act && match_ch(act, '{')) {
 					validate_defer_statement(act, in_loop, in_switch, depth + 1);
-				break;
+					Token *close = tok_match(act);
+					if (close) { prev_oe = close; s = close; }
+				} else {
+					prev_oe = act ? act : s;
+					s = prev_oe;
+				}
+				continue;
 			}
+			prev_oe = s;
 		}
 	}
 

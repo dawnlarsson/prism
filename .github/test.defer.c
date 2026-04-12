@@ -6465,6 +6465,130 @@ static void test_enum_defer_shadow_false_positive(void) {
 	}
 }
 
+// BUG: chained orelse in defer body — premature break; in scanner
+// stopped after first orelse, allowing control-flow to leak.
+static void test_defer_chained_orelse_control_flow_leak(void) {
+	printf("\n--- chained orelse defer control-flow leak ---\n");
+
+	// Case 1: double chain — benign orelse hides return
+	{
+		PrismResult r = prism_transpile_source(
+		    "int f(void);\n"
+		    "void g(void) {\n"
+		    "    defer { int x = (f() orelse 0 orelse return); };\n"
+		    "}\n",
+		    "chain_oe_ret.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "chained orelse return in defer must be rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "return") != NULL,
+			      "error message mentions 'return'");
+		prism_free(&r);
+	}
+
+	// Case 2: triple chain — goto hidden behind two benign orelses
+	{
+		PrismResult r = prism_transpile_source(
+		    "int f(void);\n"
+		    "void g(void) {\n"
+		    "    defer { int x = (f() orelse 1 orelse 2 orelse goto done); };\n"
+		    "done:;\n"
+		    "}\n",
+		    "chain_oe_goto.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "triple-chained orelse goto in defer must be rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "goto") != NULL,
+			      "error message mentions 'goto'");
+		prism_free(&r);
+	}
+
+	// Case 3: nested parens — double-nested paren evasion
+	{
+		PrismResult r = prism_transpile_source(
+		    "int f(void);\n"
+		    "void g(void) {\n"
+		    "    defer { int x = ((f() orelse 0 orelse return)); };\n"
+		    "}\n",
+		    "chain_oe_paren.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "nested-paren chained orelse return in defer must be rejected");
+		prism_free(&r);
+	}
+
+	// Case 4: chained orelse with block-form action
+	{
+		PrismResult r = prism_transpile_source(
+		    "int f(void);\n"
+		    "void g(void) {\n"
+		    "    defer { int x = (f() orelse 0 orelse { return; }); };\n"
+		    "}\n",
+		    "chain_oe_block.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "chained orelse block return in defer must be rejected");
+		prism_free(&r);
+	}
+
+	// Case 5: bare (non-paren) chained orelse in defer body
+	{
+		PrismResult r = prism_transpile_source(
+		    "int f(void);\n"
+		    "void use(int);\n"
+		    "void g(void) {\n"
+		    "    defer {\n"
+		    "        int x = f() orelse 0 orelse return;\n"
+		    "    };\n"
+		    "}\n",
+		    "chain_oe_bare.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "bare chained orelse return in defer must be rejected");
+		prism_free(&r);
+	}
+
+	// Case 6: bracket orelse chain in defer — should be caught
+	{
+		PrismResult r = prism_transpile_source(
+		    "int f(void);\n"
+		    "void g(void) {\n"
+		    "    defer {\n"
+		    "        int arr[f() orelse 0 orelse break];\n"
+		    "        (void)arr;\n"
+		    "    };\n"
+		    "}\n",
+		    "chain_oe_bracket.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "bracket chained orelse break in defer must be rejected");
+		prism_free(&r);
+	}
+
+	// Case 7: struct field named 'orelse' — no false positive via member access
+	{
+		PrismResult r = prism_transpile_source(
+		    "typedef struct { int orelse; } S;\n"
+		    "void cleanup(int);\n"
+		    "void g(S s) {\n"
+		    "    defer cleanup(s.orelse);\n"
+		    "}\n",
+		    "chain_oe_member.c", prism_defaults());
+		CHECK(r.status == PRISM_OK,
+		      "struct field named 'orelse' in defer must not false-positive");
+		prism_free(&r);
+	}
+
+	// Case 8: single orelse (no chain) still caught
+	{
+		PrismResult r = prism_transpile_source(
+		    "int f(void);\n"
+		    "void g(void) {\n"
+		    "    defer { int x = (f() orelse return); };\n"
+		    "}\n",
+		    "single_oe_ret.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "single orelse return in defer must still be rejected");
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_rejected();
@@ -6777,4 +6901,7 @@ void run_defer_tests(void) {
 
 	// BUG: Phase 1D enum defer shadow hard error on enclosing-scope shadows
 	GNUC_ONLY(test_enum_defer_shadow_false_positive());
+
+	// BUG: chained orelse in defer body leaked control-flow past first orelse
+	test_defer_chained_orelse_control_flow_leak();
 }

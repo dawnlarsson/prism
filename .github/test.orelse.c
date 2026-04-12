@@ -7804,6 +7804,88 @@ static void test_funcdef_param_orelse_banned(void) {
 	}
 }
 
+/* VULN: typeof(expr orelse val) in bare orelse fallback position.
+ * emit_bare_orelse_impl's inline fallback loops used emit_tok_checked
+ * for typeof keywords, then walk_balanced for the parens — but
+ * walk_balanced's try_typeof_orelse fires on TT_TYPEOF tokens INSIDE
+ * the group, not on the typeof keyword (already emitted). Result:
+ * 'orelse' leaks verbatim to C output. */
+static void test_typeof_orelse_in_fallback(void) {
+	printf("\n--- typeof(orelse) in fallback ---\n");
+
+	/* A: bare orelse with typeof(expr orelse val) as fallback */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get(void);\n"
+		    "void f(void) {\n"
+		    "    int x;\n"
+		    "    x = get() orelse (typeof(1 orelse 2))42;\n"
+		    "}\n",
+		    "typeof_fb_a.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "typeof orelse in fallback: transpiles OK");
+		if (r.output) {
+			CHECK(!strstr(r.output, " orelse"),
+			      "typeof orelse in fallback: no orelse leak");
+		}
+		prism_free(&r);
+	}
+
+	/* B: chained bare orelse with typeof in intermediate fallback */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get(void);\n"
+		    "int alt(void);\n"
+		    "void f(void) {\n"
+		    "    int x;\n"
+		    "    x = get() orelse alt() orelse (typeof(1 orelse 2))99;\n"
+		    "}\n",
+		    "typeof_fb_b.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "typeof orelse chained: transpiles OK");
+		if (r.output) {
+			CHECK(!strstr(r.output, " orelse"),
+			      "typeof orelse chained: no orelse leak");
+		}
+		prism_free(&r);
+	}
+
+	/* C: non-bare orelse with typeof(expr orelse val) in condition */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int get(void);\n"
+		    "void f(void) {\n"
+		    "    int x = get() orelse return;\n"
+		    "    (void)(typeof(1 orelse 2))x;\n"
+		    "}\n",
+		    "typeof_fb_c.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "typeof orelse in expr: transpiles OK");
+		if (r.output) {
+			CHECK(!strstr(r.output, " orelse"),
+			      "typeof orelse in expr: no orelse leak");
+		}
+		prism_free(&r);
+	}
+
+	/* D: static raw typeof(n orelse val) — emit_raw_verbatim path */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    raw typeof(n orelse 5) x;\n"
+		    "    (void)x;\n"
+		    "}\n",
+		    "typeof_fb_d.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		      "raw typeof orelse: transpiles OK");
+		if (r.output) {
+			CHECK(!strstr(r.output, " orelse"),
+			      "raw typeof orelse: no orelse leak");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_orelse_tests(void) {
 	test_orelse_return_null();
 	test_orelse_return_cast();
@@ -8221,4 +8303,7 @@ void run_orelse_tests(void) {
 
 	// VULN: function definition param VLA orelse — double-eval banned
 	test_funcdef_param_orelse_banned();
+
+	// VULN: typeof(expr orelse val) in bare orelse fallback — orelse must not leak
+	test_typeof_orelse_in_fallback();
 }
