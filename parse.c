@@ -1909,6 +1909,7 @@ static Token *tokenize(File *file) {
 		for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
 			bool is_noreturn = false;
 			Token *scan_start = t;
+			Token *attr_origin = t; // original position for backward scan
 
 			// _Noreturn or noreturn keyword
 			if (t->kind <= TK_KEYWORD &&
@@ -1997,6 +1998,24 @@ static Token *tokenize(File *file) {
 						continue;
 					fn_name = s;
 					break;
+				}
+			}
+			if (!fn_name) {
+				// Backward scan: attribute placed AFTER declarator.
+				// Pattern: void my_die(void) __attribute__((noreturn));
+				// Find last TK_IDENT before '(' scanning backward from attr.
+				for (uint32_t pi = tok_idx(attr_origin); pi > 0; pi--) {
+					Token *pt = &token_pool[pi - 1];
+					if (pt->kind == TK_PREP_DIR) continue;
+					if (pt->ch0 == ';' || pt->ch0 == '{' || pt->ch0 == '}') break;
+					if (pt->kind == TK_IDENT && tok_next(pt) &&
+					    tok_next(pt)->ch0 == '(') {
+						if (pt->tag & (TT_SKIP_DECL | TT_INLINE | TT_QUALIFIER |
+							       TT_TYPE | TT_STORAGE))
+							continue;
+						fn_name = pt;
+						break;
+					}
 				}
 			}
 			if (!fn_name) continue;
