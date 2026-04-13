@@ -597,57 +597,6 @@ Zero new scanning logic required. The label direction check already exists in `p
 
 ---
 
-## 9. Auto-Static Constant Arrays (`-fauto-static`)
-
-**Problem:** A common pattern in parsers, cryptography, and state machines is declaring a local `const` array initialized with literals (e.g., `const uint32_t K[64] = { 0x428a2f98, ... };`). Because it's a local variable, the C standard requires it to be instantiated on the stack. The compiler emits a hidden O(N) `memcpy` from `.rodata` to the stack on every function call. Compilers often refuse to optimize this to a static reference when the array is passed to an opaque function (aliasing/mutation fears).
-
-**Design:** Automatically inject `static` into local `const` array declarations whose initializer consists strictly of compile-time constants.
-
-### Usage
-
-```c
-// Source:
-void hash_block(uint8_t *data) {
-    const uint32_t K[64] = { 0x428a2f98, 0x71374491, /* ... */ };
-    transform(data, K);
-}
-
-// Emitted:
-void hash_block(uint8_t *data) {
-    static const uint32_t K[64] = { 0x428a2f98, 0x71374491, /* ... */ };
-    transform(data, K);
-}
-```
-
-### Detection rules
-
-1. Declaration is a local array (`decl.is_array` at `brace_depth > 0`)
-2. Type has `const` qualifier
-3. Initializer `{ ... }` contains only `TK_NUM`, `TK_STR`, punctuation (`,`, `{`, `}`), and sign operators (`-`, `+`). No identifiers, no function calls, no casts.
-4. Not already `static`
-
-On match: inject `static` before the type specifier.
-
-### Safety
-
-100% semantics-preserving. Mutating a `const` array is Undefined Behavior — so sharing a single `.rodata` instance across all stack frames is identical to per-call stack copies. The only observable difference is address identity (`&K` returns the same address across calls), but comparing addresses of local `const` arrays is pathological and not a realistic concern.
-
-### Architecture fit
-
-- `try_zero_init_decl` already parses array declarations and their initializers
-- The initializer scan is a simple token loop: reject on any `TK_IDENT` or `TK_KEYWORD` inside the braces
-- Injection point: emit `static ` before the type specifier tokens, same mechanism as existing keyword injection
-
-### Impact
-
-Eliminates hidden `memcpy` calls on every invocation of functions with large constant tables. Particularly impactful for:
-- Cryptographic round constants (SHA-256 K[64], AES S-box[256])
-- Parser lookup tables, dispatch tables
-- Unicode category tables
-- CRC/checksum polynomial tables
-
----
-
 ## 10. Bounds Checking (`-fbounds-check`)
 
 **Problem:** Buffer overflows from unchecked array subscripts are the #1 exploited vulnerability class in C (CWE-787, CWE-125). This is the single biggest argument for Rust over C. Rust inserts a runtime bounds check on every `vec[i]` and `slice[i]` — if the index is out of range, the program panics instead of silently corrupting memory or leaking secrets.

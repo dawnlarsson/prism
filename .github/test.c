@@ -262,6 +262,7 @@ static void check_transpiled_output_compiles_and_runs(const char *output,
 #include "test.harsh.c"
 #include "test.api.c"
 #include "test.golf.c"
+#include "test.autostatic.c"
 #include "test.spec.c"
 
 typedef struct {
@@ -303,6 +304,7 @@ int main(void) {
 		{"api_3",    run_api_tests_3},
 		{"api_4",    run_api_tests_4},
 		{"golf",     run_golf_tests},
+		{"autostatic", run_autostatic_tests},
 		{"spec",     run_spec_tests},
 	};
 	int n = sizeof(suites) / sizeof(suites[0]);

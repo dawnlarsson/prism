@@ -255,7 +255,8 @@ enum // Feature flags
 	F_WARN_SAFETY = 8,
 	F_FLATTEN = 16,
 	F_ORELSE = 32,
-	F_AUTO_UNREACHABLE = 64
+	F_AUTO_UNREACHABLE = 64,
+	F_AUTO_STATIC = 128
 };
 
 struct ArenaBlock {
@@ -2137,6 +2138,7 @@ typedef struct {
 	bool has_static : 1;
 	bool has_auto : 1;	  // C23 'auto' type inference
 	bool has_constexpr : 1;   // C23 'constexpr'
+	bool has_thread_local : 1; // _Thread_local, thread_local, __thread
 	bool has_volatile_member : 1; // Struct/union has volatile-qualified fields
 } TypeSpecResult;
 
@@ -2920,6 +2922,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 
 		if ((tag & TT_STORAGE) && tok->ch0 == 'e') r.has_extern = true;
 		if ((tag & TT_STORAGE) && tok->ch0 == 's') r.has_static = true;
+		if ((tag & TT_STORAGE) && tok->ch0 != 'e' && tok->ch0 != 's') r.has_thread_local = true;
 
 		if (tag & TT_QUALIFIER) {
 			if (tag & TT_VOLATILE) r.has_volatile = true;

@@ -1,6 +1,6 @@
 # Prism Transpiler Specification
 
-**Version:** 1.0.9
+**Version:** 1.1.0
 **Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (4929+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do. It is organized in two parts: **Part I** covers the transpiler's architecture, internal processing model, and implementation details. **Part II** provides a formal language specification for Prism's extensions to C, described in terms of the C abstract machine independently of any implementation strategy.
@@ -729,6 +729,100 @@ GNU statement expressions `({…})` are supported. They get their own scope in t
 
 **Disable:** `-fno-auto-unreachable` or `features.auto_unreachable = false` in library mode.
 
+### 6.9 Auto-Static Constant Arrays (`-fno-auto-static`, default on)
+
+#### Problem
+
+A common C pattern declares local `const` arrays initialized with compile-time constants — lookup tables, hash round constants, dispatch tables, error strings:
+
+```c
+void sha256_transform(uint8_t *data) {
+    const uint32_t K[64] = { 0x428a2f98, 0x71374491, /* ... 62 more ... */ };
+    round(data, K);
+}
+```
+
+The C standard (C11 §6.2.4p5) gives `K` *automatic storage duration* — the compiler allocates 256 bytes on the stack and copies the constant data from `.rodata` on **every call**. This hidden O(N) `memcpy` is expensive (measured at ~5% of total runtime in SHA-256 on x86-64). Compilers are reluctant to optimize it away because `K` is passed to an opaque function — aliasing analysis cannot prove `round()` won't cast away `const` and mutate it (this would be UB per C11 §6.7.3p6, but compilers must be conservative).
+
+The fix is trivial — add `static` — but programmers routinely forget, and the omission is invisible (no warning, no error, just slower code).
+
+#### Semantics
+
+Auto-static automatically injects `static` before local `const` array declarations whose initializer is provably compile-time constant. The array is placed in `.rodata` once, eliminating the per-call stack copy.
+
+This is semantics-preserving: mutating a `const` object is undefined behavior (C11 §6.7.3p6: "If an attempt is made to modify an object defined with a const-qualified type through use of an lvalue with non-const-qualified type, the behavior is undefined"), so sharing a single read-only instance across stack frames is indistinguishable from per-call copies.
+
+#### Observable difference
+
+The only observable change is **address identity**: without `static`, recursive calls produce distinct `&arr` values (separate stack frames); with `static`, all calls share one address. C does not guarantee distinct addresses for objects with non-overlapping lifetimes (C11 §6.5.9p6 footnote), and no known real-world code relies on address-identity of `const` local arrays across recursion depths.
+
+#### ISO C conformance
+
+| Standard rule | Status |
+|---|---|
+| C11 §6.7.1p2: at most one storage-class specifier per declaration | Enforced — skip when `auto`, `static`, `extern`, or `register` already present |
+| C11 §6.7.9p4: static storage duration requires constant initializers | Satisfied — `is_const_literal_init` rejects anything except numeric/string literals, sign operators, designators, and enum constants (which are integer constant expressions per C11 §6.6p6) |
+| C11 §6.7.6.2p2: VLAs cannot have static storage duration | Enforced — `!decl.is_vla && !type->is_vla` |
+| C11 §6.8.5p3: for-init clause prohibits `static` | Enforced — `!in_ctrl_paren()` |
+| C23 §6.8.4.1: if/switch-init clause (same restriction) | Enforced — same `!in_ctrl_paren()` check |
+| C11 §6.7.3p6: `const` object mutation is UB | Relied upon — the safety argument |
+| C11 §6.7.3p7: `volatile` accesses have side effects | Enforced — skip when `volatile` qualifier present, when struct/union has volatile members, or when volatile is hidden behind a typedef |
+| C11 §6.7.5.1: pointer-to-const vs const-array distinction | Enforced — `const int *arr[3]` (mutable array of const-pointers) skipped; only arrays where the array itself is immutable qualify |
+
+#### Eligibility criteria (all must hold)
+
+1. Block scope (`block_depth > 0`) — file-scope arrays already have static storage
+2. Not inside a control-flow condition (`!in_ctrl_paren()`) — `static` is illegal in for-init and C23 if/switch-init clauses (C11 §6.8.5p3)
+3. Explicit `const` qualifier on the type (`type->has_const`)
+4. No `volatile` qualifier (`!type->has_volatile`) — changing storage duration of a `volatile` object may change abstract-machine behavior (C11 §6.7.3p7: volatile accesses are side effects)
+5. No `volatile` members in the struct/union type (`!type->has_volatile_member`) — placing a struct with a `volatile` field into `.rodata` defeats volatile access semantics
+6. No volatile hidden in typedefs — scans type tokens with `is_volatile_typedef()` and `has_volatile_member_typedef()` to catch `typedef volatile int vint; const vint arr[3]` and `typedef struct { volatile int x; } VS; const VS arr[1]`
+7. Declarator is an array (has `[...]` dimensions)
+8. When declarator includes a pointer (`*`), requires declarator-level `const` (`decl.is_const`) — `const int *arr[3]` has mutable array elements (the `const` qualifies the pointed-to type, not the array); only `const int * const arr[3]` (where the pointers themselves are const) qualifies
+9. Not a VLA (`!decl.is_vla && !type->is_vla`) — VLAs cannot be `static` (C11 §6.7.6.2p2)
+10. Has a brace-enclosed initializer (`= { ... }`)
+11. No existing storage-class specifier: not `static`, `extern`, `register`, `auto` (C11 §6.7.1p2 prohibits multiple storage-class specifiers), `constexpr` (C23 storage-class specifier), or `_Thread_local`/`thread_local`/`__thread` (thread-local storage class)
+12. Not `raw` (user opted out of Prism transformations)
+13. No `orelse` on the declaration
+14. No GNU `__attribute__` or C23 `[[...]]` on the declarator (between variable name and `=`) — conservatively excluded because semantic attributes like `cleanup()` would silently break when storage duration changes to static
+15. Single declarator — multi-declarator `const int a[2] = {1,2}, b[2] = {3,4};` is excluded because promoting only one declarator to `static` while leaving the other `auto` would require splitting the declaration, which violates the principle of minimal transformation
+16. Every token inside `{ ... }` is one of: numeric literal, string literal, sign operator (`+`/`-`), brace/bracket/comma/dot/equals punctuation, an identifier preceded by `.` (struct field designator), or an identifier that is a registered enum constant
+17. Independent of `-fzeroinit` — auto-static runs through the `process_declarators` pipeline; the gate in `try_zero_init_decl` allows entry when `FEAT(F_AUTO_STATIC)` even if `FEAT(F_ZEROINIT)` is off
+
+#### Initializer scan
+
+`is_const_literal_init(Token *eq)` performs a single forward pass over the brace-enclosed tokens. It is conservative — it rejects any token that *could* produce a non-constant value, including:
+
+- Function calls (`ident(`)
+- Variable references (any `TK_IDENT` not preceded by `.` and not a registered enum constant)
+- Cast expressions (`(type)value` — the `(` is rejected)
+- Address-of / dereference (`&`, `*`)
+- Ternary operator (`?`, `:`)
+- `sizeof`, `_Alignof`, `offsetof`
+- Bitwise/logical operators (`&`, `|`, `^`, `~`, `!`, `<<`, `>>`)
+- Comparison / equality operators (`==` — rejected via `len == 1` check on `=`)
+- Compound literals (`(type){...}` — the `(` is rejected)
+- Multi-character operators sharing `ch0` with sign/designator punctuation: `++`, `--`, `+=`, `-=`, `->` (rejected via `len == 1` check on `+`/`-`), `...` (rejected via `len == 1` check on `.` — prevents runtime variable bypass through `prev_was_dot` designator exemption)
+
+This conservative scan means some valid constant expressions (e.g., `{1 << 3}`, `{sizeof(int)}`) are not promoted. This is a deliberate design choice: false negatives (missed optimization) are safe; false positives (promoting a runtime-dependent init to static) would produce an ISO constraint violation.
+
+#### Injection point
+
+`OUT_LIT("static")` is emitted immediately before `emit_type_range` in `process_declarators` Step 3 (first declarator type emission). The existing `const` token carries `TF_HAS_SPACE`, providing the space between `static` and `const`.
+
+#### Impact
+
+Eliminates hidden `memcpy` calls for:
+- Cryptographic round constants (SHA-256 K[64], AES S-box[256])
+- Parser lookup/dispatch tables
+- Unicode category tables, CRC polynomial tables
+- Error message string arrays, enum-to-string maps
+- State machine transition tables
+
+#### Disable
+
+`-fno-auto-static` on the command line, or `features.auto_static = false` in library mode.
+
 ---
 
 ## 7. Error Handling
@@ -790,6 +884,7 @@ These limits are enforced with hard errors. Exceeding any limit halts transpilat
 | `-fflatten-headers` | Flatten system headers into single output |
 | `-fno-flatten-headers` | Disable header flattening |
 | `-fno-auto-unreachable` | Disable auto-unreachable injection after noreturn calls |
+| `-fno-auto-static` | Disable auto-static promotion of const arrays with literal inits |
 | `--prism-cc=<compiler>` | Use specific compiler backend |
 | `--prism-verbose` | Show commands being executed |
 

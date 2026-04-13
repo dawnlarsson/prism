@@ -10,6 +10,7 @@ Prism is a lightweight and very fast transpiler that makes C safer and faster wi
 - **4929 tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Two-pass transpiler** — full semantic analysis before a single byte is emitted
+- **Progressive optimization** — auto-unreachable after noreturn calls, const arrays promoted to static storage
 - **Opt-out features** — Disable parts of the transpiler, like zero-init, with CLI flags
 - **Drop-in overlay** — Use `CC=prism` in any build system — GCC-compatible flags pass through automatically
 - **Single Repo** — zero dependencies, easy to audit, only need a C compiler
@@ -362,6 +363,30 @@ The optimization propagates transitively: if `wrapper()` calls `fatal()`, and Pr
 
 **Opt-out:** `prism -fno-auto-unreachable src.c`
 
+## Auto-Static
+
+Prism automatically promotes `const` arrays with literal initializers from stack to static storage:
+
+```c
+void encrypt(uint8_t *block) {
+    const uint8_t sbox[256] = {0x63, 0x7c, 0x77, ...};
+    //                       ^^^^^^
+    // Without Prism: 256 bytes copied from .rodata to the stack on every call.
+    // With Prism: promoted to 'static const' — zero-cost direct read from .rodata.
+}
+```
+
+This eliminates hidden `memcpy` calls for cryptographic tables, lookup arrays, dispatch tables, and string constant arrays.
+
+The transformation is conservative — it only fires when all of these hold:
+- Block-scope `const` array with brace-enclosed initializer
+- Every initializer token is a literal, enum constant, or designator
+- No `volatile`, `static`, `extern`, `register`, `_Thread_local`, or `constexpr`
+- No VLA dimensions, no `orelse`, no attributes on the declarator
+- For pointer arrays (`const int *arr[3]`), the array itself must be `const` — i.e. `const int * const arr[3]`
+
+**Opt-out:** `prism -fno-auto-static src.c`
+
 ## Multi-File & Passthrough
 
 Prism handles real-world build scenarios:
@@ -399,7 +424,7 @@ Not:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v1.0.9 - Robust C transpiler
+Prism v1.1.0 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 
@@ -417,6 +442,7 @@ Prism Flags (consumed, not passed to CC):
   -fflatten-headers     Flatten headers into single output
   -fno-flatten-headers  Disable header flattening
   -fno-auto-unreachable Disable __builtin_unreachable after noreturn calls
+  -fno-auto-static      Disable const array → static promotion
   --prism-cc=<compiler> Use specific compiler
   --prism-verbose       Show commands
 

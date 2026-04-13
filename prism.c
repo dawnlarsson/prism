@@ -85,6 +85,7 @@ typedef struct {
 	bool flatten_headers;
 	bool orelse;
 	bool auto_unreachable;
+	bool auto_static;
 } PrismFeatures;
 
 typedef enum {
@@ -462,14 +463,16 @@ PRISM_API PrismFeatures prism_defaults(void) {
 			       .line_directives = true,
 			       .flatten_headers = true,
 			       .orelse = true,
-			       .auto_unreachable = true};
+			       .auto_unreachable = true,
+			       .auto_static = true};
 }
 
 static uint32_t features_to_bits(PrismFeatures f) {
 	return (f.defer ? F_DEFER : 0) | (f.zeroinit ? F_ZEROINIT : 0) |
 	       (f.line_directives ? F_LINE_DIR : 0) | (f.warn_safety ? F_WARN_SAFETY : 0) |
 	       (f.flatten_headers ? F_FLATTEN : 0) | (f.orelse ? F_ORELSE : 0) |
-	       (f.auto_unreachable ? F_AUTO_UNREACHABLE : 0);
+	       (f.auto_unreachable ? F_AUTO_UNREACHABLE : 0) |
+	       (f.auto_static ? F_AUTO_STATIC : 0);
 }
 
 static const char *get_tmp_dir(void) {
@@ -3064,6 +3067,53 @@ static bool is_typeof_func_type(Token *type_start, TypeSpecResult *type, DeclRes
 	return false;
 }
 
+// Check if a declarator has GNU __attribute__ or C23 [[...]] between the
+// variable name and the '=' token. Used to suppress auto-static when
+// cleanup() or other semantic attributes are present.
+static bool decl_has_attribute(Token *var_name, Token *eq) {
+	for (Token *t = tok_next(var_name); t && t != eq; t = tok_next(t)) {
+		if ((t->tag & TT_ATTR) || is_c23_attr(t)) return true;
+		if (t->flags & TF_OPEN) { Token *m = tok_match(t); if (m) { t = m; continue; } }
+	}
+	return false;
+}
+
+// Check if a brace-enclosed initializer contains only compile-time constants.
+// Returns true when the initializer after '=' is '{...}' and every token inside
+// is a numeric literal, string literal, punctuation, sign operator, or known
+// enum constant. Used by -fauto-static to promote const arrays to static.
+static bool is_const_literal_init(Token *eq) {
+	Token *t = tok_next(eq);
+	if (!t || !match_ch(t, '{')) return false;
+	Token *close = tok_match(t);
+	if (!close) return false;
+	bool prev_was_dot = false;
+	for (t = tok_next(t); t && t != close; t = tok_next(t)) {
+		if (t->kind == TK_NUM || t->kind == TK_STR) { prev_was_dot = false; continue; }
+		if (t->kind == TK_PUNCT) {
+			char c = t->ch0;
+			// Allow: , { } [ ] = . + -
+			// [ ] = . are for designated initializers: [0] = val, .field = val
+			// Length checks block multi-char operators that share ch0:
+			//   . blocks ... (variadic / GCC range — would set prev_was_dot for next ident)
+			//   + blocks ++ += (invalid init exprs that ch0-match)
+			//   - blocks -- -= -> (same)
+			//   = blocks == (comparison; safe constant expr, but conservative reject)
+			if (c == ',' || c == '{' || c == '}' || c == '[' || c == ']' ||
+			    (c == '=' && t->len == 1) || (c == '.' && t->len == 1) ||
+			    ((c == '+' || c == '-') && t->len == 1)) {
+				prev_was_dot = (c == '.');
+				continue;
+			}
+			return false;
+		}
+		// Allow identifiers that are field designators (.field) or enum constants
+		if (t->kind == TK_IDENT && (prev_was_dot || is_known_enum_const(t))) { prev_was_dot = false; continue; }
+		return false;
+	}
+	return true;
+}
+
 // Result of walking an initializer expression for orelse/noreturn detection.
 typedef struct {
 	Token *tok;
@@ -3326,6 +3376,34 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		if (first_decl) {
 			if (brace_wrap && !brace_opened) OUT_LIT(" {");
 			if (!is_const_orelse_fallback) {
+				// Auto-static: promote 'const T arr[N] = {literals};' to
+				// 'static const T arr[N] = {literals};' — eliminates hidden
+				// memcpy from .rodata to stack on every function call.
+				if (FEAT(F_AUTO_STATIC) && ctx->block_depth > 0 &&
+				    !in_ctrl_paren() &&
+				    type->has_const && !type->has_volatile &&
+				    !type->has_volatile_member &&
+				    !type->has_static && !type->has_extern &&
+				    !type->has_register && !type->has_auto &&
+				    !type->has_constexpr && !type->has_thread_local &&
+				    decl.is_array && (!decl.is_pointer || decl.is_const) && decl.has_init &&
+				    !decl.is_vla && !type->is_vla &&
+				    !decl_is_raw && !orelse_info.orelse_tok) {
+					// Volatile hidden in typedefs bypasses type->has_volatile
+					bool hidden_vol = false;
+					for (Token *tv = type_start; tv && tv != type->end; tv = tok_next(tv))
+						if (is_volatile_typedef(tv) || has_volatile_member_typedef(tv))
+							{ hidden_vol = true; break; }
+					if (!hidden_vol) {
+						Token *eq = decl.end;  // '=' token
+						Token *brace = tok_next(eq);
+						if (brace && match_ch(brace, '{') && tok_match(brace) &&
+						    match_ch(tok_next(tok_match(brace)), ';') &&
+						    !decl_has_attribute(decl.var_name, eq) &&
+						    is_const_literal_init(eq))
+							OUT_LIT("static");
+					}
+				}
 				// Mask queues: type specifiers (typeof, _Alignas) must not
 				// steal dim/oe temps meant for the declarator.
 				int saved_oe = ctx->bracket_oe_count, saved_dim = ctx->bracket_dim_count;
@@ -3496,8 +3574,8 @@ static Token *try_zero_init_decl(Token *tok) {
 	 * F_ZEROINIT), proceed only if a P1_OE_BRACKET-annotated token is present
 	 * in the current declaration — bracket orelse hoisting needs
 	 * emit_bracket_orelse_temps which is only reachable via process_declarators. */
-	if (!FEAT(F_ZEROINIT) && !FEAT(F_ORELSE)) return NULL;
-	if (!FEAT(F_ZEROINIT)) {
+	if (!FEAT(F_ZEROINIT) && !FEAT(F_ORELSE) && !FEAT(F_AUTO_STATIC)) return NULL;
+	if (!FEAT(F_ZEROINIT) && !FEAT(F_AUTO_STATIC)) {
 		/* Only proceed if there is a P1_OE_BRACKET- or P1_OE_DECL_INIT-
 		 * annotated orelse token in this declaration.
 		 * P1_OE_BRACKET: orelse inside [...] array-dimension brackets.
@@ -9009,6 +9087,7 @@ static Cli cli_parse(int argc, char **argv) {
 			if (!strcmp(a, "-fflatten-headers"))     { cli.features.flatten_headers = true; continue; }
 			if (!strcmp(a, "-fno-flatten-headers"))  { cli.features.flatten_headers = false; continue; }
 			if (!strcmp(a, "-fno-auto-unreachable")) { cli.features.auto_unreachable = false; continue; }
+			if (!strcmp(a, "-fno-auto-static"))      { cli.features.auto_static = false; continue; }
 			// fall through to forward
 		} else {
 			// Dependency-generation flags → preprocessor only
@@ -9473,6 +9552,7 @@ static void print_help(void) {
 	       "  -fflatten-headers     Flatten headers into single output\n"
 	       "  -fno-flatten-headers  Disable header flattening\n"
 	       "  -fno-auto-unreachable Disable __builtin_unreachable after noreturn calls\n"
+	       "  -fno-auto-static      Disable auto-static for const arrays with literal inits\n"
 	       "  --prism-cc=<compiler> Use specific compiler\n"
 	       "  --prism-verbose       Show commands\n\n"
 	       "All other flags are passed through to CC.\n\n"
