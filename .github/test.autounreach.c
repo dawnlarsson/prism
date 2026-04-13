@@ -2,6 +2,28 @@
 // Tests the auto-unreachable feature which injects __builtin_unreachable()
 // (or __assume(0) on MSVC) after calls to noreturn functions.
 
+// Helper: find platform-appropriate unreachable marker in output.
+// Returns pointer to match (like strstr) or NULL.
+static inline char *find_unreachable(const char *output) {
+	char *p = strstr(output, "__builtin_unreachable");
+	if (p) return p;
+	return strstr(output, "__assume(0)");
+}
+// Helper: find next unreachable marker after a given pointer.
+static inline char *find_unreachable_after(char *pos) {
+	char *p = strstr(pos, "__builtin_unreachable");
+	char *q = strstr(pos, "__assume(0)");
+	if (p && q) return (p < q) ? p : q;
+	return p ? p : q;
+}
+// Helper: count unreachable markers in output.
+static inline int count_unreachable(const char *output) {
+	int n = 0;
+	char *p = (char *)output;
+	while ((p = find_unreachable_after(p)) != NULL) { n++; p++; }
+	return n;
+}
+
 // ATK-1: Parenthesized noreturn call: (exit)(1);
 // The call pattern check requires ident( — parenthesized function name
 // uses (exit)( which doesn't match the ident( pattern.
@@ -18,7 +40,7 @@ static void test_aur_paren_call(void) {
 	CHECK(r.output != NULL, "aur paren call: output not NULL");
 	if (r.output) {
 		// Should NOT have __builtin_unreachable after (exit)(1);
-		CHECK(strstr(r.output, "__builtin_unreachable") == NULL,
+		CHECK(find_unreachable(r.output) == NULL,
 		      "aur paren call: no unreachable injected for (exit)(1)");
 	}
 	prism_free(&r);
@@ -38,7 +60,7 @@ static void test_aur_comma_operator(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur comma op: transpiles OK");
 	CHECK(r.output != NULL, "aur comma op: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") == NULL,
+		CHECK(find_unreachable(r.output) == NULL,
 		      "aur comma op: no unreachable for comma expr");
 	}
 	prism_free(&r);
@@ -58,7 +80,7 @@ static void test_aur_ternary_noreturn(void) {
 	if (r.output) {
 		// try_detect_noreturn_call requires ident(args); pattern
 		// Here exit(1) is inside a ternary — after ) is : not ;
-		CHECK(strstr(r.output, "__builtin_unreachable") == NULL,
+		CHECK(find_unreachable(r.output) == NULL,
 		      "aur ternary: no unreachable after ternary");
 	}
 	prism_free(&r);
@@ -76,7 +98,7 @@ static void test_aur_for_init(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur for-init: transpiles OK");
 	CHECK(r.output != NULL, "aur for-init: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") == NULL,
+		CHECK(find_unreachable(r.output) == NULL,
 		      "aur for-init: no unreachable inside for parens");
 	}
 	prism_free(&r);
@@ -109,7 +131,7 @@ static void test_aur_file_scope(void) {
 	if (r.output) {
 		// exit(1) is at block_depth > 0 (inside function body), so
 		// unreachable SHOULD be injected here
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur file-scope func body: unreachable injected");
 	}
 	prism_free(&r);
@@ -129,7 +151,7 @@ static void test_aur_shadow_var(void) {
 	CHECK(r.output != NULL, "aur shadow: output not NULL");
 	if (r.output) {
 		// exit is shadowed by a local variable — should NOT inject
-		CHECK(strstr(r.output, "__builtin_unreachable") == NULL,
+		CHECK(find_unreachable(r.output) == NULL,
 		      "aur shadow: no unreachable for shadowed name");
 	}
 	prism_free(&r);
@@ -148,7 +170,7 @@ static void test_aur_member_access(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur member: transpiles OK");
 	CHECK(r.output != NULL, "aur member: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") == NULL,
+		CHECK(find_unreachable(r.output) == NULL,
 		      "aur member: no unreachable for member access");
 	}
 	prism_free(&r);
@@ -166,7 +188,7 @@ static void test_aur_arrow_member(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur arrow: transpiles OK");
 	CHECK(r.output != NULL, "aur arrow: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") == NULL,
+		CHECK(find_unreachable(r.output) == NULL,
 		      "aur arrow: no unreachable for -> member");
 	}
 	prism_free(&r);
@@ -190,7 +212,7 @@ static void test_aur_assignment_call(void) {
 		// walk should detect my_exit as noreturn and the ; triggers injection
 		// Actually, in emit_decl_init_walk, it sets unreachable_tok
 		// In process_declarators, semicolon checks pd_unreachable_tok
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur assignment: unreachable injected after noreturn init");
 	}
 	prism_free(&r);
@@ -224,10 +246,10 @@ static void test_aur_multiple_noreturn(void) {
 	CHECK(r.output != NULL, "aur multi: output not NULL");
 	if (r.output) {
 		// Both exit(1) and abort() should get unreachable
-		char *first = strstr(r.output, "__builtin_unreachable");
+		char *first = find_unreachable(r.output);
 		CHECK(first != NULL, "aur multi: first unreachable found");
 		if (first) {
-			char *second = strstr(first + 1, "__builtin_unreachable");
+			char *second = find_unreachable_after(first + 1);
 			CHECK(second != NULL, "aur multi: second unreachable found");
 		}
 	}
@@ -247,7 +269,7 @@ static void test_aur_braceless_multi_suppress(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur braceless multi: transpiles OK");
 	CHECK(r.output != NULL, "aur braceless multi: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") == NULL,
+		CHECK(find_unreachable(r.output) == NULL,
 		      "aur braceless multi: no unreachable in braceless bodies");
 	}
 	prism_free(&r);
@@ -270,7 +292,7 @@ static void test_aur_braceless_if(void) {
 		// Braceless if body: ctrl_state.pending && ctrl_state.parens_just_closed
 		// guard correctly suppresses unreachable — injecting after ; would
 		// put __builtin_unreachable() outside the if scope.
-		CHECK(strstr(r.output, "__builtin_unreachable") == NULL,
+		CHECK(find_unreachable(r.output) == NULL,
 		      "aur braceless if: no unreachable in braceless body");
 	}
 	prism_free(&r);
@@ -287,7 +309,7 @@ static void test_aur_direct_call(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur direct: transpiles OK");
 	CHECK(r.output != NULL, "aur direct: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur direct: unreachable injected for direct exit call");
 	}
 	prism_free(&r);
@@ -305,7 +327,7 @@ static void test_aur_user_noreturn_attr(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur user attr: transpiles OK");
 	CHECK(r.output != NULL, "aur user attr: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur user attr: unreachable injected for user noreturn");
 	}
 	prism_free(&r);
@@ -323,7 +345,7 @@ static void test_aur_user_noreturn_c23(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur user c23: transpiles OK");
 	CHECK(r.output != NULL, "aur user c23: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur user c23: unreachable injected for [[noreturn]]");
 	}
 	prism_free(&r);
@@ -340,7 +362,7 @@ static void test_aur_user_noreturn_keyword(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur user _Noreturn: transpiles OK");
 	CHECK(r.output != NULL, "aur user _Noreturn: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur user _Noreturn: unreachable injected");
 	}
 	prism_free(&r);
@@ -357,7 +379,7 @@ static void test_aur_user_noreturn_declspec(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur user declspec: transpiles OK");
 	CHECK(r.output != NULL, "aur user declspec: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur user declspec: unreachable injected");
 	}
 	prism_free(&r);
@@ -391,16 +413,11 @@ static void test_aur_wrapper_chain(void) {
 		// And it builds nr_map from file-scope declarations.
 		// die_inner and die_outer have no noreturn attribute, so they won't
 		// be in nr_map. The body-{-tag is for the defer warning, not call detection.
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur wrapper: unreachable in die_inner body (exit call)");
 		// But NOT after die_outer(); call in f()
 		// Count occurrences
-		int count = 0;
-		char *p = r.output;
-		while ((p = strstr(p, "__builtin_unreachable")) != NULL) {
-			count++;
-			p += 20;
-		}
+		int count = count_unreachable(r.output);
 		// Should have unreachable inside die_inner (after exit(1);)
 		// but NOT inside die_outer or f
 		// die_inner: exit(1); __builtin_unreachable();
@@ -423,7 +440,7 @@ static void test_aur_noreturn_on_def(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur def noreturn: transpiles OK");
 	CHECK(r.output != NULL, "aur def noreturn: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur def noreturn: unreachable injected for noreturn def");
 	}
 	prism_free(&r);
@@ -440,7 +457,7 @@ static void test_aur_multi_attr(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur multi attr: transpiles OK");
 	CHECK(r.output != NULL, "aur multi attr: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur multi attr: unreachable for __attribute__((cold, noreturn))");
 	}
 	prism_free(&r);
@@ -457,7 +474,7 @@ static void test_aur_underscored_attr(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur __noreturn__: transpiles OK");
 	CHECK(r.output != NULL, "aur __noreturn__: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur __noreturn__: unreachable for __noreturn__ attr");
 	}
 	prism_free(&r);
@@ -474,7 +491,7 @@ static void test_aur_gnu_ns_attr(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur gnu::noreturn: transpiles OK");
 	CHECK(r.output != NULL, "aur gnu::noreturn: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur gnu::noreturn: unreachable for [[gnu::noreturn]]");
 	}
 	prism_free(&r);
@@ -492,7 +509,7 @@ static void test_aur_attr_after_type(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur attr after type: transpiles OK");
 	CHECK(r.output != NULL, "aur attr after type: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur attr after type: unreachable injected");
 	}
 	prism_free(&r);
@@ -513,12 +530,7 @@ static void test_aur_switch_case(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur switch: transpiles OK");
 	CHECK(r.output != NULL, "aur switch: output not NULL");
 	if (r.output) {
-		int count = 0;
-		char *p = r.output;
-		while ((p = strstr(p, "__builtin_unreachable")) != NULL) {
-			count++;
-			p += 20;
-		}
+		int count = count_unreachable(r.output);
 		CHECK(count >= 2, "aur switch: unreachable after each noreturn call");
 	}
 	prism_free(&r);
@@ -537,7 +549,7 @@ static void test_aur_stmt_expr(void) {
 	if (r.output) {
 		// emit_block_body → emit_statements → try_process_stmt_token
 		// should detect exit(1) and inject after ;
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur stmt-expr: unreachable in stmt-expr");
 	}
 	prism_free(&r);
@@ -559,7 +571,7 @@ static void test_aur_cast_before_call(void) {
 		// not TT_MEMBER, not '*'. So it passes predecessor check.
 		// Pattern: exit(1); — ident followed by (, matched ), then ;
 		// The ; check: after ) is ; (the outer ;). So should inject.
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur cast: unreachable injected through cast");
 	}
 	prism_free(&r);
@@ -576,7 +588,7 @@ static void test_aur_do_while(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur do-while: transpiles OK");
 	CHECK(r.output != NULL, "aur do-while: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur do-while: unreachable after exit in do body");
 	}
 	prism_free(&r);
@@ -597,7 +609,7 @@ static void test_aur_nested_braces(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur nested: transpiles OK");
 	CHECK(r.output != NULL, "aur nested: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur nested: unreachable in deeply nested block");
 	}
 	prism_free(&r);
@@ -623,7 +635,7 @@ static void test_aur_all_hardcoded(void) {
 		if (r.output) {
 			char msg[128];
 			snprintf(msg, sizeof msg, "aur hardcoded: unreachable for %s", fns[i]);
-			CHECK(strstr(r.output, "__builtin_unreachable") != NULL, msg);
+			CHECK(find_unreachable(r.output) != NULL, msg);
 		}
 		prism_free(&r);
 	}
@@ -661,7 +673,7 @@ static void test_aur_complex_args(void) {
 	if (r.output) {
 		// The args contain a function call, but tok_match still finds
 		// the matching ) correctly via balanced matching.
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur complex args: unreachable injected");
 	}
 	prism_free(&r);
@@ -691,7 +703,7 @@ static void test_aur_variable_named_exit(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur var named exit: transpiles OK");
 	CHECK(r.output != NULL, "aur var named exit: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") == NULL,
+		CHECK(find_unreachable(r.output) == NULL,
 		      "aur var named exit: no unreachable");
 	}
 	prism_free(&r);
@@ -712,7 +724,7 @@ static void test_aur_sizeof_noreturn(void) {
 		// sizeof(exit) — exit is inside balanced parens.
 		// try_detect_noreturn_call: "exit" followed by ")" from sizeof
 		// — no ( after ident, so fails
-		CHECK(strstr(r.output, "__builtin_unreachable") == NULL,
+		CHECK(find_unreachable(r.output) == NULL,
 		      "aur sizeof: no unreachable for sizeof(exit)");
 	}
 	prism_free(&r);
@@ -731,7 +743,7 @@ static void test_aur_disabled(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur disabled: transpiles OK");
 	CHECK(r.output != NULL, "aur disabled: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") == NULL,
+		CHECK(find_unreachable(r.output) == NULL,
 		      "aur disabled: no unreachable when feature off");
 	}
 	prism_free(&r);
@@ -751,7 +763,7 @@ static void test_aur_unreachable_code_after(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur dead code: transpiles OK");
 	CHECK(r.output != NULL, "aur dead code: output not NULL");
 	if (r.output) {
-		char *ur = strstr(r.output, "__builtin_unreachable");
+		char *ur = find_unreachable(r.output);
 		CHECK(ur != NULL, "aur dead code: unreachable present");
 		if (ur) {
 			// Verify it's between exit(1); and the next statement
@@ -775,12 +787,7 @@ static void test_aur_double_noreturn(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur double: transpiles OK");
 	CHECK(r.output != NULL, "aur double: output not NULL");
 	if (r.output) {
-		int count = 0;
-		char *p = r.output;
-		while ((p = strstr(p, "__builtin_unreachable")) != NULL) {
-			count++;
-			p += 20;
-		}
+		int count = count_unreachable(r.output);
 		// At minimum the first exit(1) should get unreachable
 		CHECK(count >= 1, "aur double: at least one unreachable");
 	}
@@ -803,7 +810,7 @@ static void test_aur_extension_prefix(void) {
 	if (r.output) {
 		// Known limitation: __extension__ predecessor triggers TT_INLINE guard.
 		// No unreachable injected (conservative false negative).
-		CHECK(strstr(r.output, "__builtin_unreachable") == NULL,
+		CHECK(find_unreachable(r.output) == NULL,
 		      "aur extension: known false negative (no unreachable)");
 	}
 	prism_free(&r);
@@ -821,7 +828,7 @@ static void test_aur_label_before(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur label: transpiles OK");
 	CHECK(r.output != NULL, "aur label: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur label: unreachable after labeled exit call");
 	}
 	prism_free(&r);
@@ -840,7 +847,7 @@ static void test_aur_for_body(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur for body: transpiles OK");
 	CHECK(r.output != NULL, "aur for body: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur for body: unreachable after exit in for body");
 	}
 	prism_free(&r);
@@ -857,7 +864,7 @@ static void test_aur_c23_underscore(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur [[__noreturn__]]: transpiles OK");
 	CHECK(r.output != NULL, "aur [[__noreturn__]]: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur [[__noreturn__]]: unreachable injected");
 	}
 	prism_free(&r);
@@ -905,7 +912,7 @@ static void test_aur_redecl(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur redecl: transpiles OK");
 	CHECK(r.output != NULL, "aur redecl: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur redecl: unreachable for redeclared noreturn");
 	}
 	prism_free(&r);
@@ -923,7 +930,7 @@ static void test_aur_multi_decl_init(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur multi decl: transpiles OK");
 	CHECK(r.output != NULL, "aur multi decl: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur multi decl: unreachable after noreturn in init");
 	}
 	prism_free(&r);
@@ -941,7 +948,7 @@ static void test_aur_prep_between(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur prep: transpiles OK");
 	CHECK(r.output != NULL, "aur prep: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur prep: unreachable despite #line directive");
 	}
 	prism_free(&r);
@@ -958,7 +965,7 @@ static void test_aur_noreturn_returns_value(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur noreturn+retval: transpiles OK");
 	CHECK(r.output != NULL, "aur noreturn+retval: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur noreturn+retval: unreachable injected");
 	}
 	prism_free(&r);
@@ -992,12 +999,7 @@ static void test_aur_builtin_unreachable_self(void) {
 	if (r.output) {
 		// __builtin_unreachable() should get another __builtin_unreachable()
 		// after it (redundant but correct)
-		int count = 0;
-		char *p = r.output;
-		while ((p = strstr(p, "__builtin_unreachable")) != NULL) {
-			count++;
-			p += 20;
-		}
+		int count = count_unreachable(r.output);
 		// Original call + injected one = at least 2
 		CHECK(count >= 2, "aur self: both original and injected present");
 	}
@@ -1016,7 +1018,7 @@ static void test_aur_field_no_false_pos(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur field: transpiles OK");
 	CHECK(r.output != NULL, "aur field: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") == NULL,
+		CHECK(find_unreachable(r.output) == NULL,
 		      "aur field: no unreachable for struct field access");
 	}
 	prism_free(&r);
@@ -1039,8 +1041,8 @@ static void test_aur_fptr_typedef(void) {
 	CHECK(r.output != NULL, "aur fptr: output not NULL");
 	if (r.output) {
 		// fp is not TT_NORETURN_FN tagged, so no unreachable
-		CHECK(strstr(r.output, "__builtin_unreachable") == NULL ||
-		      strstr(r.output, "__builtin_unreachable") == strstr(r.output, "fp = exit"),
+		CHECK(find_unreachable(r.output) == NULL ||
+		      find_unreachable(r.output) == strstr(r.output, "fp = exit"),
 		      "aur fptr: no unreachable for indirect call through fp");
 	}
 	prism_free(&r);
@@ -1062,7 +1064,7 @@ static void test_aur_ifdef(void) {
 	CHECK(r.output != NULL, "aur ifdef: output not NULL");
 	if (r.output) {
 		// Only the #else path (exit) is active since DEBUG is not defined
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur ifdef: unreachable for active branch");
 	}
 	prism_free(&r);
@@ -1101,7 +1103,7 @@ static void test_aur_attr_after_name(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur attr after name: transpiles OK");
 	CHECK(r.output != NULL, "aur attr after name: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur attr after name: unreachable injected for post-decl attr");
 	}
 	prism_free(&r);
@@ -1118,7 +1120,7 @@ static void test_aur_attr_after_name_underscore(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur attr after (__noreturn__): transpiles OK");
 	CHECK(r.output != NULL, "aur attr after (__noreturn__): output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur attr after (__noreturn__): unreachable injected");
 	}
 	prism_free(&r);
@@ -1135,7 +1137,7 @@ static void test_aur_multi_attr_after_name(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur multi attr after: transpiles OK");
 	CHECK(r.output != NULL, "aur multi attr after: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur multi attr after: unreachable injected");
 	}
 	prism_free(&r);
@@ -1156,7 +1158,7 @@ static void test_aur_static_inline_noreturn(void) {
 	if (r.output) {
 		// _Noreturn is before 'void' which is before 'die' — the scanner
 		// should find _Noreturn, scan forward, find die(
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur static inline: unreachable for static inline noreturn");
 	}
 	prism_free(&r);
@@ -1175,7 +1177,7 @@ static void test_aur_complex_ret_type(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur complex ret: transpiles OK");
 	CHECK(r.output != NULL, "aur complex ret: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur complex ret: unreachable injected");
 	}
 	prism_free(&r);
@@ -1193,7 +1195,7 @@ static void test_aur_attr_with_args(void) {
 	CHECK_EQ(r.status, PRISM_OK, "aur attr+format: transpiles OK");
 	CHECK(r.output != NULL, "aur attr+format: output not NULL");
 	if (r.output) {
-		CHECK(strstr(r.output, "__builtin_unreachable") != NULL,
+		CHECK(find_unreachable(r.output) != NULL,
 		      "aur attr+format: unreachable injected despite format attr");
 	}
 	prism_free(&r);
