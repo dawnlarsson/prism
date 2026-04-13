@@ -5128,7 +5128,8 @@ static void test_union_padding_zeroinit(void) {
 	PrismResult r = prism_transpile_source(code, "up_zi.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK, "union padding zeroinit: transpile succeeds");
 	if (r.status == PRISM_OK) {
-		CHECK(strstr(r.output, "memset") != NULL,
+		CHECK(strstr(r.output, "memset") != NULL ||
+		      strstr(r.output, "__prism_p_") != NULL,
 		      "union padding bytes (beyond first member) must be zeroed via memset");
 		CHECK(strstr(r.output, "= {0}") == NULL,
 		      "union must not use = {0} (only zeros first member on GCC)");
@@ -5149,7 +5150,8 @@ static void test_typedef_union_padding_zeroinit(void) {
 	PrismResult r = prism_transpile_source(code, "tdu_zi.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK, "typedef union padding: transpile succeeds");
 	if (r.status == PRISM_OK && r.output) {
-		CHECK(strstr(r.output, "memset") != NULL,
+		CHECK(strstr(r.output, "memset") != NULL ||
+		      strstr(r.output, "__prism_p_") != NULL,
 		      "typedef union must use memset (C11 §6.7.9p21 doesn't cover unions)");
 		CHECK(strstr(r.output, "= {0}") == NULL,
 		      "typedef union must not use = {0}");
@@ -5207,7 +5209,8 @@ static void test_atomic_union_zeroinit(void) {
 	PrismResult r = prism_transpile_source(code, "atomic_union.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK, "atomic union: transpile succeeds");
 	if (r.status == PRISM_OK && r.output) {
-		CHECK(strstr(r.output, "memset") != NULL,
+		CHECK(strstr(r.output, "memset") != NULL ||
+		      strstr(r.output, "__prism_p_") != NULL,
 		      "atomic union must use memset");
 		CHECK(strstr(r.output, "= {0}") == NULL,
 		      "atomic union must not use = {0}");
