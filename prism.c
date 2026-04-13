@@ -258,6 +258,14 @@ static void signal_temps_register(const char *path) {
 	do {
 		n = signal_temps_load();
 		if (n >= SIGNAL_TEMPS_MAX) {
+			// All slots allocated — try to reuse a freed slot.
+			for (int i = 0; i < SIGNAL_TEMPS_MAX; i++) {
+				if (!signal_temps_ready_load(i)) {
+					memcpy(signal_temps[i], path, len + 1);
+					signal_temps_ready_store(i, 1);
+					return;
+				}
+			}
 			fprintf(stderr, "prism: warning: temp file tracking full (%d); "
 				"'%s' won't be cleaned on signal\n",
 				SIGNAL_TEMPS_MAX, path);
