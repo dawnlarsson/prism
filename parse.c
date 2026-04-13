@@ -2143,6 +2143,7 @@ typedef struct {
 	Token *end;		  // First token after the type specifier
 	bool saw_type : 1;	  // True if a type was recognized
 	bool is_struct : 1;
+	bool is_union : 1;
 	bool is_enum : 1;
 	bool is_typedef : 1;
 	bool is_vla : 1;
@@ -2202,6 +2203,7 @@ typedef struct {
 	bool is_enum_const : 1;
 	bool is_vla_var : 1;
 	bool is_aggregate : 1;
+	bool is_union : 1;
 	bool is_func : 1;
 	bool is_param : 1;
 	bool has_volatile_member : 1;
@@ -2232,7 +2234,7 @@ enum {
 #define tok_ann(t) ((t)->ann)
 
 // Typedef query flags (single lookup, check multiple properties)
-enum { TDF_TYPEDEF = 1, TDF_VLA = 2, TDF_VOID = 4, TDF_ENUM_CONST = 8, TDF_CONST = 16, TDF_PTR = 32, TDF_ARRAY = 64, TDF_AGGREGATE = 128, TDF_FUNC = 256, TDF_PARAM = 512, TDF_VOLATILE = 1024, TDF_HAS_VOL_MEMBER = 2048 };
+enum { TDF_TYPEDEF = 1, TDF_VLA = 2, TDF_VOID = 4, TDF_ENUM_CONST = 8, TDF_CONST = 16, TDF_PTR = 32, TDF_ARRAY = 64, TDF_AGGREGATE = 128, TDF_FUNC = 256, TDF_PARAM = 512, TDF_VOLATILE = 1024, TDF_HAS_VOL_MEMBER = 2048, TDF_UNION = 4096 };
 
 #define FEAT(f) (ctx->features & (f))
 
@@ -2455,7 +2457,8 @@ static inline int typedef_flags(Token *tok) {
 	       (e->is_const ? TDF_CONST : 0) | (e->is_volatile ? TDF_VOLATILE : 0) |
 	       (e->is_ptr ? TDF_PTR : 0) |
 	       (e->is_array ? TDF_ARRAY : 0) | (e->is_aggregate ? TDF_AGGREGATE : 0) |
-	       (e->is_func ? TDF_FUNC : 0) | (e->has_volatile_member ? TDF_HAS_VOL_MEMBER : 0);
+	       (e->is_func ? TDF_FUNC : 0) | (e->has_volatile_member ? TDF_HAS_VOL_MEMBER : 0) |
+	       (e->is_union ? TDF_UNION : 0);
 }
 
 // After Pass 1 annotation, is_known_typedef becomes O(1) bit check.
@@ -2968,9 +2971,14 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			tok = tok_next(tok);
 			Token *inner_start = tok_next(tok);
 			Token *end = skip_balanced_group(tok);
-			if (inner_start && (inner_start->tag & TT_SUE)) r.is_struct = true;
-			if (inner_start && is_identifier_like(inner_start) && is_known_typedef(inner_start))
+			if (inner_start && (inner_start->tag & TT_SUE)) {
+				r.is_struct = true;
+				if (inner_start->ch0 == 'u') r.is_union = true;
+			}
+			if (inner_start && is_identifier_like(inner_start) && is_known_typedef(inner_start)) {
 				r.is_typedef = true;
+				if (typedef_flags(inner_start) & TDF_UNION) r.is_union = true;
+			}
 			scan_paren_for_vla(tok, end, &r, true);
 			tok = end;
 			r.end = tok;
@@ -2980,6 +2988,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 		// struct/union/enum
 		if (tag & TT_SUE) {
 			r.is_struct = true;
+			if (tok->ch0 == 'u') r.is_union = true;
 			if (tok->ch0 == 'e') r.is_enum = true;
 			r.saw_type = true;
 			tok = tok_next(tok);
@@ -3031,6 +3040,8 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 						if ((t->tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE))
 							r.has_atomic = true;
 						if ((t->tag & TT_SUE) || (typedef_flags(t) & TDF_AGGREGATE)) r.is_struct = true;
+						if ((t->tag & TT_SUE) && t->ch0 == 'u') r.is_union = true;
+						if (typedef_flags(t) & TDF_UNION) r.is_union = true;
 						if (t->tag & TT_SUE) { saw_sue = true; continue; }
 						if (is_identifier_like(t)) {
 							// After struct/union keyword, use tag_lookup for
@@ -3081,6 +3092,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			r.is_typedef = true;
 			if (tflags & TDF_VLA) r.is_vla = true;
 			if (tflags & TDF_AGGREGATE) r.is_struct = true;
+			if (tflags & TDF_UNION) r.is_union = true;
 			if (tflags & TDF_HAS_VOL_MEMBER) r.has_volatile_member = true;
 			Token *peek = tok_next(tok);
 			while (peek && (peek->tag & TT_QUALIFIER)) peek = tok_next(peek);
@@ -3192,6 +3204,8 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 					added->is_array = true;
 				if (type_spec.is_struct && !type_spec.is_enum && !decl.is_pointer && !decl.is_func_ptr)
 					added->is_aggregate = true;
+				if (type_spec.is_union && !decl.is_pointer && !decl.is_func_ptr)
+					added->is_union = true;
 				if (!decl.end) {
 					Token *after_name = skip_noise(tok_next(decl.var_name));
 					if (after_name && after_name->len == 1 && after_name->ch0 == '(')

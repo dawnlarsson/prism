@@ -4010,10 +4010,12 @@ static void test_bare_orelse_volatile_double_write(void) {
 	prism_free(&r);
 }
 
-// Bug: fallback_has_compound_literal sees '{' inside nested parentheses
-// (e.g. &(struct Data){ .code = 1 } inside a function call) and forces
-// the unsafe ternary path, re-enabling the volatile double-write pattern.
-// The '{' must only count at scope-depth 0 (outside all parens).
+// Compound literal inside function call argument forces ternary path.
+// When LHS has volatile dereference (*uart_tx), ternary evaluates the
+// LHS address twice — reject with a clear error rather than silent UB.
+// Token-level analysis cannot determine whether the function returns
+// the compound literal's address (identity_ptr) or consumes it (log_error),
+// so the conservative choice is always ternary → reject volatile LHS.
 static void test_bare_orelse_volatile_compound_literal_nested(void) {
 	printf("\n--- Bare orelse volatile compound-literal nested ---\n");
 
@@ -4027,13 +4029,10 @@ static void test_bare_orelse_volatile_compound_literal_nested(void) {
 	    "    *uart_tx = tmp orelse log_error(&(Data){ .code = 1 });\n"
 	    "}\n";
 	PrismResult r = prism_transpile_source(code, "volatile_compound_nested.c", prism_defaults());
-	CHECK_EQ(r.status, PRISM_OK, "compound-literal-nested: transpile succeeds");
-	if (r.output) {
-		CHECK(strstr(r.output, "if (__prism_oe_") != NULL,
-		      "compound-literal-nested: must not write to volatile LHS more than "
-		      "once (nested compound literal must not trigger ternary fallback)");
-		CHECK(strstr(r.output, "} else {") != NULL,
-		      "compound-literal-nested: uses if/else for single-write guarantee");
+	CHECK_EQ(r.status, PRISM_ERR_SYNTAX, "compound-literal-nested: rejects volatile LHS + CL fallback");
+	if (r.error_msg) {
+		CHECK(strstr(r.error_msg, "volatile") != NULL || strstr(r.error_msg, "side effect") != NULL,
+		      "compound-literal-nested: error mentions volatile or side effect");
 	}
 	prism_free(&r);
 }
@@ -4117,11 +4116,12 @@ static void test_bracket_orelse_local_struct_rejected(void) {
 
 // Bug: bare-orelse temp-based path uses if (!tmp) tmp = (fb); which creates a
 // selection-statement block scope (C11 6.8.4p3).  Compound literals inside the
-// if-body have their lifetime end at the semicolon, producing a dangling pointer.
-// Paren-wrapping the fallback (&(struct D){1}) bypasses detection entirely since
-// the braces are never checked at depth>0.  The fix must use ternary assignment
-// (matching handle_const_orelse_fallback) to keep compound literals in the
-// enclosing block scope.
+// else-body have their lifetime end at the '}' (C11 6.5.2.5p5: automatic
+// storage duration associated with the enclosing block).  Paren-wrapping the
+// fallback (&(struct D){1}) previously bypassed detection since braces were
+// only checked at depth 0.  Fixed: scanner detects compound literal '{' at
+// any paren depth (preceded by ')' = cast pattern), excluding function call
+// arguments.  Ternary path keeps compound literal in enclosing block scope.
 static void test_bare_orelse_compound_literal_lifetime(void) {
 	printf("\n--- bare orelse compound literal paren-wrap lifetime ---\n");
 
@@ -4135,15 +4135,87 @@ static void test_bare_orelse_compound_literal_lifetime(void) {
 	PrismResult r = prism_transpile_source(code, "bare_cl_lifetime.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK, "bare-orelse-cl-lifetime: transpiles OK");
 	if (r.output) {
-		// Uses if/else for independent assignment conversions.
-		// Compound literal lifetime: the CL lives in the else block,
-		// which is sufficient — the assignment completes before the
-		// else block closes, and both ternary and if/else versions
-		// dangle equally after the wrapper block.
-		CHECK(strstr(r.output, "if (__prism_oe_") != NULL,
-		      "bare-orelse-cl-lifetime: uses if/else for independent assignment conversion");
-		CHECK(strstr(r.output, "} else {") != NULL,
-		      "bare-orelse-cl-lifetime: has else branch");
+		// Ternary path: (ptr = get()) ? (void)0 : (void)(ptr = fb);
+		// Compound literal's enclosing block is the function body,
+		// so ptr remains valid until function exit.
+		CHECK(strstr(r.output, "? (void)0 :") != NULL,
+		      "bare-orelse-cl-lifetime: uses ternary for compound literal lifetime");
+		CHECK(strstr(r.output, "} else {") == NULL,
+		      "bare-orelse-cl-lifetime: no if/else (would kill CL at else block)");
+	}
+	prism_free(&r);
+}
+
+// Regression: compound literal wrapped in multiple paren layers
+// must still be detected and use ternary path (C11 §6.5.2.5p5 lifetime).
+// Also tests the function-call exclusion: compound literals inside
+// function call arguments do NOT trigger ternary (consumed by call).
+static void test_bare_orelse_nested_paren_compound_literal(void) {
+	printf("\n--- bare orelse nested paren compound literal ---\n");
+
+	// Case 1: nested parens — ternary required for lifetime
+	{
+		const char *code =
+		    "struct D { int x; };\n"
+		    "struct D *get(void);\n"
+		    "void f(void) {\n"
+		    "    struct D *ptr;\n"
+		    "    ptr = get() orelse (&((struct D){ .x = 42 }));\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "nested_cl.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "nested-paren-cl: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "? (void)0 :") != NULL,
+			      "nested-paren-cl: ternary path for compound literal lifetime");
+		}
+		prism_free(&r);
+	}
+
+	// Case 2: compound literal inside function call args — ternary used
+	// because token-level analysis cannot determine if the function
+	// returns the compound literal's address (dangling pointer risk).
+	// Non-volatile LHS: ternary is safe.
+	{
+		const char *code =
+		    "typedef struct { int code; } Data;\n"
+		    "void log_error(const Data *d);\n"
+		    "int get_byte(void);\n"
+		    "void test(void) {\n"
+		    "    int x;\n"
+		    "    x = get_byte() orelse log_error(&(Data){ .code = 1 });\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "cl_in_call.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "cl-in-call: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "? (void)0 :") != NULL,
+			      "cl-in-call: uses ternary (CL detected inside call args)");
+		}
+		prism_free(&r);
+	}
+}
+
+// Regression: function returning address of compound literal argument.
+// Token-level analysis cannot determine whether identity_ptr returns
+// the CL's address — must conservatively use ternary for ALL compound
+// literals at any paren depth (C11 §6.5.2.5p5 lifetime).
+static void test_bare_orelse_identity_ptr_cl_escape(void) {
+	printf("\n--- bare orelse identity_ptr compound literal escape ---\n");
+	const char *code =
+	    "struct Config { int mode; };\n"
+	    "struct Config *identity_ptr(struct Config *p);\n"
+	    "struct Config *get(void);\n"
+	    "void f(void) {\n"
+	    "    struct Config *cfg;\n"
+	    "    cfg = get() orelse identity_ptr(&((struct Config){.mode=1}));\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "cl_escape.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "identity-ptr-cl-escape: transpiles OK");
+	if (r.output) {
+		// Must use ternary (not if/else) — if/else kills CL at block boundary
+		CHECK(strstr(r.output, "? (void)0 :") != NULL,
+		      "identity-ptr-cl-escape: ternary path (CL may escape via return)");
+		CHECK(strstr(r.output, "} else {") == NULL,
+		      "identity-ptr-cl-escape: no if/else (would create dangling pointer)");
 	}
 	prism_free(&r);
 }
@@ -8148,6 +8220,12 @@ void run_orelse_tests(void) {
 
 	// bare orelse compound literal paren-wrap lifetime
 	test_bare_orelse_compound_literal_lifetime();
+
+	// nested paren compound literal detection + function call exclusion
+	test_bare_orelse_nested_paren_compound_literal();
+
+	// VULN1 regression: CL address escapes through identity_ptr return
+	test_bare_orelse_identity_ptr_cl_escape();
 
 	// typeof(opaque_expression) orelse produces invalid C for aggregates
 	test_typeof_opaque_expr_orelse_aggregate();

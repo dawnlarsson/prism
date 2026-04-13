@@ -3432,9 +3432,16 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		bool is_func_type = is_typeof_func_type(type_start, type, &decl);
 		// Only queue memset when zeroinit feature is enabled.
 		// Static/extern variables are zero-initialized by the loader — skip.
+		// Unions: = {0} only initializes the first named member (C11 §6.7.9p17);
+		// C11 §6.7.9p21 (implicit zeroing of remainder) applies only to
+		// aggregates (C11 §6.2.5p21: arrays and structs, NOT unions).
+		// GCC-15 empirically leaves union bytes beyond the first member
+		// indeterminate.  Route unions to memset unconditionally.
+		bool is_union_type = type->is_union && !decl.is_pointer;
 		bool needs_memset = FEAT(F_ZEROINIT) && !decl.has_init && !decl_is_raw && (!decl.is_pointer || decl.is_array) &&
 				    !type->has_register && !type->has_static && !type->has_extern && !is_func_type &&
-				    (type->has_typeof || (type->has_atomic && is_aggregate) || effective_vla);
+				    (type->has_typeof || (type->has_atomic && is_aggregate) || effective_vla ||
+				     is_union_type);
 
 		// const VLA cannot be safely memset — modifying a defined const
 		// object is UB (ISO C11 §6.7.3p6).  const on non-VLA typeof
@@ -3495,6 +3502,15 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					  "'register _Atomic' aggregate cannot be safely "
 					  "zero-initialized; remove 'register' or use 'raw' "
 					  "to opt out of automatic initialization");
+			else if (type->has_register && is_union_type)
+				// register forbids &var, so memset is impossible.
+				// = {0} only zeros first member on GCC-15 (C11 §6.7.9p17).
+				error_tok(decl.var_name,
+					  "'register' union cannot be safely "
+					  "zero-initialized (address-taking is illegal for "
+					  "register, and = {0} only zeros the first member); "
+					  "remove 'register' or use 'raw' to opt out of "
+					  "automatic initialization");
 			else if (is_aggregate || type->has_typeof)
 				OUT_LIT(" = {0}");
 			else
@@ -5355,11 +5371,16 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 		bool fallback_has_compound_literal = false;
 		{
 			int sd = 0;
+			Token *prev_cl = NULL;
 			for (Token *s = after_orelse; s && s->kind != TK_EOF; s = tok_next(s)) {
-				if (sd == 0 && match_ch(s, '{')) { fallback_has_compound_literal = true; break; }
+				if (match_ch(s, '{') && (sd == 0 ||
+				    (prev_cl && match_ch(prev_cl, ')')))) {
+					fallback_has_compound_literal = true; break;
+				}
 				if (s->flags & TF_OPEN) sd++;
 				else if (s->flags & TF_CLOSE) sd--;
 				else if (sd == 0 && BARE_IS_END(s)) break;
+				prev_cl = s;
 			}
 		}
 
@@ -6048,8 +6069,10 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 						       (type.is_vla && !decl.is_pointer);
 					bool is_agg = (decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
 						      ((type.is_struct || type.is_typedef) && !decl.is_pointer);
+					bool p1d_fi_union = type.is_union && !decl.is_pointer;
 					if ((!decl.is_pointer || decl.is_array) && !type.has_register &&
-					    (type.has_typeof || (type.has_atomic && is_agg) || eff_vla))
+					    (type.has_typeof || (type.has_atomic && is_agg) || eff_vla ||
+					     p1d_fi_union))
 						error_tok(decl.var_name,
 							  "VLA or typeof variable in for/if/switch initializer "
 							  "cannot be safely zero-initialized; move the "
@@ -6376,11 +6399,16 @@ p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
 	if (has_eq && eq_tok && is_orelse_value_fallback(after_oe)) {
 		bool fb_has_cl = false;
 		{ int fd = 0;
+		  Token *prev_cl = NULL;
 		  for (Token *s = after_oe; s && s->kind != TK_EOF; s = tok_next(s)) {
-			if (fd == 0 && match_ch(s, '{')) { fb_has_cl = true; break; }
+			if (match_ch(s, '{') && (fd == 0 ||
+			    (prev_cl && match_ch(prev_cl, ')')))) {
+				fb_has_cl = true; break;
+			}
 			if (s->flags & TF_OPEN) fd++;
 			else if (s->flags & TF_CLOSE) fd--;
 			else if (fd == 0 && (match_ch(s, ';') || match_ch(s, ','))) break;
+			prev_cl = s;
 		  }
 		}
 		if (fb_has_cl)
@@ -6857,6 +6885,17 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 					  "zero-initialized; remove 'register' or use 'raw' "
 					  "to opt out of automatic initialization");
 		}
+		// Phase 1D: reject register union (memset impossible, = {0} only
+		// zeros first member — C11 §6.7.9p17)
+		if (FEAT(F_ZEROINIT) && brace_depth > 0 && !has_init && !decl_raw &&
+		    !type.has_extern && !type.has_static &&
+		    type.has_register && type.is_union && !decl.is_pointer)
+			error_tok(decl.var_name,
+				  "'register' union cannot be safely "
+				  "zero-initialized (address-taking is illegal for "
+				  "register, and = {0} only zeros the first member); "
+				  "remove 'register' or use 'raw' to opt out of "
+				  "automatic initialization");
 
 		// Phase 1D: reject register VLA (can't use = {0} or memset)
 		{
@@ -6878,9 +6917,11 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 					for (Token *tc = type_tok; tc && tc != type.end; tc = tok_next(tc))
 						if (is_const_typedef(tc)) { excl = true; break; }
 				}
+				bool p1d_cv_union = type.is_union && !decl.is_pointer;
 				bool would_memset = (!decl.is_pointer || decl.is_array) &&
 					(type.has_typeof || (type.has_atomic && ((decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
-					 ((type.is_struct || type.is_typedef) && !decl.is_pointer))) || type.is_vla || decl.is_vla);
+					 ((type.is_struct || type.is_typedef) && !decl.is_pointer))) || type.is_vla || decl.is_vla ||
+					 p1d_cv_union);
 				if (excl && would_memset)
 					error_tok(decl.var_name,
 						  "'const' variable requiring typeof/VLA memset cannot be "
@@ -6904,12 +6945,13 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		// Phase 1D: track whether this declarator would need
 		// typeof memset in Pass 2 (for split detection).
 		// Must mirror Pass 2's needs_memset condition exactly.
+		bool p1d_is_union_type = type.is_union && !decl.is_pointer;
 		if (FEAT(F_ZEROINIT) && !has_init && !decl_raw &&
 		    !(saw_static || type.has_static || type.has_extern) &&
 		    !type.has_register && (!decl.is_pointer || decl.is_array) &&
 		    (type.has_typeof || (type.has_atomic && ((decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
 		     ((type.is_struct || type.is_typedef) && !decl.is_pointer))) ||
-		     type.is_vla || decl.is_vla))
+		     type.is_vla || decl.is_vla || p1d_is_union_type))
 			any_would_memset = true;
 
 		// Phase 1D: reject multi-declarator split constraints

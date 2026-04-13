@@ -5115,8 +5115,10 @@ static void test_interleaved_raw_multi_declarator(void) {
 static void test_union_padding_zeroinit(void) {
 	printf("\n--- union padding zero-init ---\n");
 
-	// Runtime union zero-init is fragile to test (compiler may optimize
-	// away stack-dirtying). Instead verify Prism emits = {0} for unions.
+	// C11 §6.7.9p21 (implicit zeroing of remainder) only applies to
+	// aggregates (C11 §6.2.5p21: arrays+structs, NOT unions).
+	// GCC-15 empirically leaves union bytes beyond the first member
+	// indeterminate with = {0}.  Prism must use memset for unions.
 	const char *code =
 	    "void f(void) {\n"
 	    "    union U { char c; long long ll; };\n"
@@ -5126,9 +5128,102 @@ static void test_union_padding_zeroinit(void) {
 	PrismResult r = prism_transpile_source(code, "up_zi.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK, "union padding zeroinit: transpile succeeds");
 	if (r.status == PRISM_OK) {
-		CHECK(strstr(r.output, "= {0}") != NULL,
-		      "union padding bytes (beyond first member) must be zeroed");
+		CHECK(strstr(r.output, "memset") != NULL,
+		      "union padding bytes (beyond first member) must be zeroed via memset");
+		CHECK(strstr(r.output, "= {0}") == NULL,
+		      "union must not use = {0} (only zeros first member on GCC)");
 	}
+	prism_free(&r);
+}
+
+// Regression: typedef union also routes through memset (not = {0}).
+// The is_union flag must propagate through the typedef table.
+static void test_typedef_union_padding_zeroinit(void) {
+	printf("\n--- Typedef union padding zeroinit ---\n");
+	const char *code =
+	    "typedef union { char c; double d; long arr[4]; } BigU;\n"
+	    "void f(void) {\n"
+	    "    BigU u;\n"
+	    "    (void)u;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "tdu_zi.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "typedef union padding: transpile succeeds");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "memset") != NULL,
+		      "typedef union must use memset (C11 §6.7.9p21 doesn't cover unions)");
+		CHECK(strstr(r.output, "= {0}") == NULL,
+		      "typedef union must not use = {0}");
+	}
+	prism_free(&r);
+}
+
+// register union cannot use memset (register forbids &) and = {0} only
+// zeros first member (C11 §6.7.9p17). Must reject.
+static void test_register_union_zeroinit_rejected(void) {
+	printf("\n--- Register union zeroinit rejected ---\n");
+	const char *code =
+	    "void f(void) {\n"
+	    "    register union { char c; long long ll; } u;\n"
+	    "    (void)u;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "reg_union.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_ERR_SYNTAX, "register union: rejected");
+	if (r.error_msg) {
+		CHECK(strstr(r.error_msg, "register") != NULL,
+		      "register union: error mentions register");
+	}
+	prism_free(&r);
+
+	// register union with explicit init is fine (user handles it)
+	const char *code2 =
+	    "void f(void) {\n"
+	    "    register union { char c; long long ll; } u = { .ll = 0 };\n"
+	    "    (void)u;\n"
+	    "}\n";
+	PrismResult r2 = prism_transpile_source(code2, "reg_union_init.c", prism_defaults());
+	CHECK_EQ(r2.status, PRISM_OK, "register union with explicit init: accepted");
+	prism_free(&r2);
+
+	// register union with raw is fine (user opted out)
+	const char *code3 =
+	    "void f(void) {\n"
+	    "    register raw union { char c; long long ll; } u;\n"
+	    "    (void)u;\n"
+	    "}\n";
+	PrismResult r3 = prism_transpile_source(code3, "reg_union_raw.c", prism_defaults());
+	CHECK_EQ(r3.status, PRISM_OK, "register union with raw: accepted");
+	prism_free(&r3);
+}
+
+// _Atomic(union U) must also route to memset
+static void test_atomic_union_zeroinit(void) {
+	printf("\n--- Atomic union zeroinit ---\n");
+	const char *code =
+	    "union U { char c; long long ll; };\n"
+	    "void f(void) {\n"
+	    "    _Atomic(union U) u;\n"
+	    "    (void)u;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "atomic_union.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "atomic union: transpile succeeds");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "memset") != NULL,
+		      "atomic union must use memset");
+		CHECK(strstr(r.output, "= {0}") == NULL,
+		      "atomic union must not use = {0}");
+	}
+	prism_free(&r);
+}
+
+// for-init union must be rejected (needs memset, can't emit in init position)
+static void test_for_init_union_rejected(void) {
+	printf("\n--- For-init union rejected ---\n");
+	const char *code =
+	    "void f(void) {\n"
+	    "    for (union { char c; long long ll; } u; ;) { (void)u; break; }\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "fi_union.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_ERR_SYNTAX, "for-init union: rejected");
 	prism_free(&r);
 }
 
@@ -5950,6 +6045,18 @@ void run_safe_tests(void) {
 
         // Execution: union padding zero-init
         test_union_padding_zeroinit();
+
+        // Execution: typedef union padding zero-init
+        test_typedef_union_padding_zeroinit();
+
+        // register union rejected (memset impossible, = {0} insufficient)
+        test_register_union_zeroinit_rejected();
+
+        // _Atomic(union) routes to memset
+        test_atomic_union_zeroinit();
+
+        // for-init union rejected (needs memset, can't emit in init)
+        test_for_init_union_rejected();
 
         // Execution: nested stmt-expr in if condition with defer
         NOMSVC_ONLY(
