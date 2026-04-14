@@ -226,7 +226,7 @@ static void test_harsh_mismatched_delimiters_rejected(void) {
 }
 
 static void test_harsh_c23_attr_defer_stmt_expr_chain(void) {
-    /* BUG: p1_check_defer_stmt_expr_chain handled GNU __attribute__ but not
+    /* p1_check_defer_stmt_expr_chain handled GNU __attribute__ but not
      * C23 [[...]] attributes.  A [[...]] between the inner scope's '}' and
      * the stmt-expr's '}' broke the chain walk, so Phase 1D silently missed
      * the defer-in-stmt-expr violation (two-pass invariant violation). */

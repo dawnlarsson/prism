@@ -1266,7 +1266,7 @@ static int global_arr_for_sizeof[] = {1, 2, 3, 4, 5};
 
 void test_sizeof_array_element_in_bound(void) {
 	// sizeof(arr[0]) pattern - common idiom for array element count
-	// Bug: prism was seeing arr[0] as a declaration inside the array bound
+	// prism was seeing arr[0] as a declaration inside the array bound
 	char buf1[sizeof(global_arr_for_sizeof) / sizeof(global_arr_for_sizeof[0])];
 	int expected_size = sizeof(global_arr_for_sizeof) / sizeof(global_arr_for_sizeof[0]);
 	int all_zero = 1;
@@ -3050,7 +3050,7 @@ static void test_switch_inner_loop_break_no_false_exit(void) {
 	prism_free(&r);
 }
 
-// Bug: raw int x, y; — Phase 1D keeps p1d_saw_raw=true for y,
+// raw int x, y; — Phase 1D keeps p1d_saw_raw=true for y,
 // but Pass 2 clears is_raw on comma. CFG verifier thinks y is raw
 // (safe to skip) while Pass 2 emits y = 0 (skipped by goto → uninit).
 // UPDATE: raw now applies to ALL declarators in a comma-list (matching
@@ -3073,7 +3073,7 @@ static void test_raw_comma_desync_goto_bypass(void) {
 	prism_free(&r);
 }
 
-// Bug: e->decl.is_vla = type.is_vla || decl.is_array — flags fixed-size
+// e->decl.is_vla = type.is_vla || decl.is_array — flags fixed-size
 // arrays as VLAs. raw int x[5]; + goto should be allowed (not a VLA).
 static void test_fixed_array_not_vla_with_raw(void) {
 	printf("\n--- Fixed Array Not VLA With raw ---\n");
@@ -3092,7 +3092,7 @@ static void test_fixed_array_not_vla_with_raw(void) {
 	prism_free(&r);
 }
 
-// Bug: -fno-safety downgraded VLA skip violations to warnings.
+// -fno-safety downgraded VLA skip violations to warnings.
 // SPEC says VLA skip violations must remain hard errors regardless of -fno-safety.
 static void test_vla_skip_hard_error_with_fno_safety(void) {
 	printf("\n--- VLA Skip Hard Error With -fno-safety ---\n");
@@ -3113,7 +3113,7 @@ static void test_vla_skip_hard_error_with_fno_safety(void) {
 	prism_free(&r);
 }
 
-// Bug: typeof((int[n])) — inner parens push typeof_paren_depth to 2,
+// typeof((int[n])) — inner parens push typeof_paren_depth to 2,
 // blinding the VLA-in-typeof detection in parse_type_specifier.
 // Result: goto-over-typeof-VLA is downgraded from hard error to warning
 // under -fno-safety because the P1K_DECL entry lacks is_vla=true.
@@ -3135,7 +3135,7 @@ static void test_typeof_paren_vla_skip_hard_error(void) {
 	prism_free(&r);
 }
 
-// Bug: Phase 1C backward walk from '{' to find parameter list '(...)' does not
+// Phase 1C backward walk from '{' to find parameter list '(...)' does not
 // skip GNU __attribute__((...)) between ')' and '{'. If a parameter shadows a
 // typedef, the shadow is not registered and the typedef name is parsed as a type
 // inside the function body — emitting spurious zero-init like `mytype z = {0};`.
@@ -3167,7 +3167,7 @@ static void test_gnu_attr_param_shadow(void) {
 	prism_free(&r);
 }
 
-// Bug: CFG verifier skips user-initialized declarations (has_init == true),
+// CFG verifier skips user-initialized declarations (has_init == true),
 // allowing goto/switch to jump over them. Jumping over `int x = 5;` leaves x
 // indeterminate — the exact vulnerability zero-init exists to prevent.
 static void test_goto_over_native_init(void) {
@@ -3234,7 +3234,7 @@ static void test_goto_over_raw_native_init(void) {
 	prism_free(&r);
 }
 
-// Bug: braceless for/if/switch bodies have no scope_id in scope_tree,
+// braceless for/if/switch bodies have no scope_id in scope_tree,
 // so p1_scan_init_shadows never creates a P1K_DECL entry (body_sid == 0).
 // The CFG verifier is completely blind to init-declared variables in
 // braceless control flow.
@@ -3283,7 +3283,7 @@ static void test_braceless_forinit_cfg_bypass(void) {
 	prism_free(&r3);
 }
 
-// Bug: p1_scan_init_shadows uses if instead of while for raw keywords.
+// p1_scan_init_shadows uses if instead of while for raw keywords.
 // Two consecutive raw tokens (e.g. from macro expansion) cause early return,
 // so no P1K_DECL is created and the CFG verifier is blind to the VLA.
 static void test_raw_raw_vla_forinit_cfg_blind(void) {
@@ -3308,7 +3308,7 @@ static void test_raw_raw_vla_forinit_cfg_blind(void) {
 	prism_free(&r);
 }
 
-// Bug: signal_temps_clear() only resets the counter but doesn't zero the path
+// signal_temps_clear() only resets the counter but doesn't zero the path
 // buffers.  If a SIGINT arrives in the race window between CAS (counter++) and
 // memcpy (path write), the signal handler would unlink stale paths from a
 // previous compilation cycle.
@@ -3326,7 +3326,7 @@ static void test_signal_temps_clear_zeroes_paths(void) {
 	      "signal_temps_clear zeroes path buffers (TOCTOU fix)");
 }
 
-// Bug: signal_temps_clear() only zeroes byte 0 of each buffer, leaving stale
+// signal_temps_clear() only zeroes byte 0 of each buffer, leaving stale
 // data in bytes 1..PATH_MAX-1. If signal_temps_register's memcpy is interrupted
 // by a signal after writing only the first byte, the signal handler reconstructs
 // a stale path (new byte 0 + old bytes 1..N) and calls unlink() on it.
@@ -3352,7 +3352,7 @@ static void test_signal_temps_clear_full_buffer(void) {
 	      "signal_temps_clear zeroes full buffer (no stale path data)");
 }
 
-// Bug: p1_register_param_shadows digs into inner parameter lists of unnamed
+// p1_register_param_shadows digs into inner parameter lists of unnamed
 // function pointer parameters.  void f(int (*)(int a, int b)) registers 'b'
 // as a shadow for the outer function, poisoning any typedef named 'b'.
 static void test_unnamed_fnptr_param_shadow_leak(void) {
@@ -3370,7 +3370,7 @@ static void test_unnamed_fnptr_param_shadow_leak(void) {
 	prism_free(&r);
 }
 
-// Bug: bracket orelse with control flow (return/goto/break) is rejected only
+// bracket orelse with control flow (return/goto/break) is rejected only
 // during Pass 2 (inside walk_balanced_orelse), violating the spec invariant
 // "every semantic error before Pass 2 emits its first byte".
 // This must be caught in Phase 1G when P1_OE_BRACKET is annotated.
@@ -3389,7 +3389,7 @@ static void test_bracket_orelse_ctrlflow_pass1_error(void) {
 	prism_free(&r);
 }
 
-// Bug: If goto skips over a scalar variable AND a VLA, the verifier loop
+// If goto skips over a scalar variable AND a VLA, the verifier loop
 // breaks on the scalar (first match). Under -fno-safety the scalar is just a
 // warning, and the VLA hard error is completely masked.
 static void test_vla_masked_by_scalar_fno_safety(void) {
@@ -3850,7 +3850,7 @@ static void test_typeof_qualifier_vla_blindspot(void) {
 	}
 }
 
-// BUG: typeof(typeof(int[n])) was misidentified as a function type by
+// typeof(typeof(int[n])) was misidentified as a function type by
 // is_typeof_func_type. The inner typeof keyword followed by '(' looked
 // like a function type signature typeof(int(int)), causing zero-init to
 // skip the memset.
@@ -4313,7 +4313,7 @@ static void test_skip_one_stmt_cache_poison(void) {
 static void test_skip_cache_braceless_switch_if_else(void) {
 	printf("\n--- skip_cache braceless switch + if-else ---\n");
 
-	// BUG: for-init scanner primes skip_cache. The else-transition trail
+	// for-init scanner primes skip_cache. The else-transition trail
 	// flush wrote the true-branch end to ALL trail entries (including
 	// parent tokens like switch/if). When the braceless switch detector
 	// later queried the poisoned 'if' token, it received a truncated
@@ -4598,7 +4598,7 @@ static void test_sizeof_commutative_vla_bypass(void) {
 	}
 }
 
-// Bug: defer shadow same-block error fired during Pass 2 emission
+// defer shadow same-block error fired during Pass 2 emission
 // (check_defer_var_shadow at L1416).  Hoisted to Phase 1D.
 static void test_defer_shadow_same_block_phase1(void) {
 	printf("\n--- defer shadow same-block Phase 1 ---\n");
@@ -4662,7 +4662,7 @@ static void test_defer_shadow_same_block_phase1(void) {
 	}
 }
 
-// Bug: for-init VLA needing memset fired error during Pass 2 emission
+// for-init VLA needing memset fired error during Pass 2 emission
 // (process_declarators L4207).  Hoisted to Phase 1D p1_scan_init_shadows.
 static void test_for_init_vla_memset_phase1(void) {
 	printf("\n--- for-init VLA memset Phase 1 ---\n");
@@ -5003,7 +5003,7 @@ static void test_typeof_orelse_side_effect_phase1(void) {
 
 static void test_anon_struct_split_phase1(void) {
 	printf("\n--- anonymous struct split Phase 1D ---\n");
-	// Bug: bracket orelse on anon struct multi-declarator
+	// bracket orelse on anon struct multi-declarator
 	{
 		const char *code =
 		    "void f(void) {\n"
@@ -5051,7 +5051,7 @@ static void test_anon_struct_split_phase1(void) {
 
 static void test_empty_orelse_action_phase1(void) {
 	printf("\n--- empty orelse action Phase 1D ---\n");
-	// Bug: bare orelse with empty action (semicolon)
+	// bare orelse with empty action (semicolon)
 	{
 		const char *code =
 		    "int f(int x) {\n"
@@ -5283,7 +5283,7 @@ static void test_noreturn_fwd_decl_no_crash(void) {
 	prism_free(&r2);
 }
 
-// BUG: emit_block_body missed label colon (':') handling — at_stmt_start
+// emit_block_body missed label colon (':') handling — at_stmt_start
 // was never reset to true after labels inside statement expressions.
 // This caused zero-init bypass and false orelse errors.
 static void test_stmt_expr_label_zeroinit(void) {
@@ -5387,7 +5387,7 @@ static void test_stmt_expr_label_zeroinit(void) {
 	}
 }
 
-// BUG: emit_block_body was missing handle_sue_body, typeof/bracket orelse
+// emit_block_body was missing handle_sue_body, typeof/bracket orelse
 // dispatch, and check_enum_typedef_defer_shadow.
 static void test_emit_block_body_gaps(void) {
 	// 1. SUE type-only def inside stmt-expr must NOT zero-init struct fields
@@ -5494,7 +5494,7 @@ static void test_emit_block_body_gaps(void) {
 	}
 }
 
-// BUG: Objective-C @interface/@implementation ivar blocks look like
+// Objective-C @interface/@implementation ivar blocks look like
 // code blocks to Prism, causing zero-init to fire on instance variables.
 // These blocks must be treated like struct bodies (no zero-init on fields).
 static void test_objc_ivar_block_zeroinit(void) {

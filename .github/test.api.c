@@ -455,7 +455,7 @@ static void test_thread_cleanup_idempotent(void) {
 	prism_reset();
 }
 
-// Bug: prism_thread_cleanup freed typedef_table.name_map.buckets but not
+// prism_thread_cleanup freed typedef_table.name_map.buckets but not
 // p1_shadow_map.buckets, leaking the shadow hashmap allocation.
 static void test_thread_cleanup_shadow_map_leak(void) {
 	printf("\n--- Thread Cleanup Shadow Map Leak ---\n");
@@ -2358,7 +2358,7 @@ static void test_file_c23_generic_decl_plain_redeclaration(void) {
 }
 
 
-/* BUG: coreutils/gnulib build failure on GCC 15+ (ISO C N3322).
+/* coreutils/gnulib build failure on GCC 15+ (ISO C N3322).
  *
  * After preprocessing with GCC 15 in C23 mode, bare `bsearch`, `memchr`,
  * `strchr` etc. tokens in redeclarations are expanded to `_Generic(...)`
@@ -3735,7 +3735,7 @@ static void test_cli_dep_flags_routing(void) {
 	}
 
 	// Test 1: -Wp,-MMD,<path> must produce a non-empty .d file.
-	// BUG: Prism used to forward -Wp,-MMD to the backend compiler alongside
+	// Prism used to forward -Wp,-MMD to the backend compiler alongside
 	// -fpreprocessed, which skips preprocessing and produces empty .d files.
 	{
 		char wp_flag[PATH_MAX + 16];
@@ -3819,7 +3819,7 @@ static void test_cli_dep_flags_passthrough(void) {
 	}
 
 	// Test: -Wp,-MMD,<path> on a .S file must produce a non-empty .d file.
-	// BUG: dep flags were intercepted into dep_args but passthrough_cc only
+	// dep flags were intercepted into dep_args but passthrough_cc only
 	// forwarded cc_args, so .d files were never generated for assembly.
 	{
 		char wp_flag[PATH_MAX + 16];
@@ -3918,7 +3918,7 @@ static void test_cli_split_D_flag_not_source(void) {
 
 	// When -D is passed as a separate argument from its value, the value
 	// (e.g. KBUILD_MODFILE=.../foo.c) must not be treated as a source file.
-	// Bug: the kernel passes -D KBUILD_MODFILE="arch/.../vgettimeofday.c"
+	// the kernel passes -D KBUILD_MODFILE="arch/.../vgettimeofday.c"
 	// and prism mistakenly tried to transpile the value as a .c file.
 
 	char tmpdir[PATH_MAX];
@@ -4776,7 +4776,7 @@ static void test_install_temp_predictable_symlink_hijack(void) {
 	unlink(target_path);
 }
 
-// BUG: preprocess_with_cc() creates pp_stderr temp via mkstemp, close()s the fd,
+// preprocess_with_cc() creates pp_stderr temp via mkstemp, close()s the fd,
 // then opens the *path* again with posix_spawn_file_actions_addopen(O_WRONLY|O_TRUNC).
 // Between close(fd) and spawn, an attacker can replace the file with a symlink,
 // causing the spawned cc to truncate/write the symlink's target.
@@ -4839,7 +4839,7 @@ static void test_pp_stderr_toctou_fd_not_closed(void) {
 	unlink(sentinel);
 }
 
-// BUG: read() loop in preprocess_with_cc does not retry on EINTR.
+// read() loop in preprocess_with_cc does not retry on EINTR.
 // If a signal arrives during pipe read, the loop breaks early and the buffer
 // is silently truncated, causing potential miscompilations.
 static volatile sig_atomic_t eintr_alrm_count = 0;
@@ -4931,7 +4931,7 @@ static void test_preprocess_read_eintr_resilience(void) {
 }
 #endif
 
-// BUG: cc_split_into_argv does not handle shell-style quoting.
+// cc_split_into_argv does not handle shell-style quoting.
 // Literal quote characters in CC env var are passed through as part of tokens.
 // e.g. CC="gcc '-DFOO=bar'" splits into ["gcc", "'-DFOO=bar'"] instead of
 // ["gcc", "-DFOO=bar"]. The quotes become part of the argument.
@@ -5000,7 +5000,7 @@ static void test_orelse_bracket_leak_in_return_defer(void) {
 	prism_free(&r);
 }
 
-// Bug: When the user passes -x objective-c, compile_sources constructs:
+// When the user passes -x objective-c, compile_sources constructs:
 //   cc -x c - -x none -x objective-c ...
 // The user's -x flag ends up AFTER stdin (-), so it has no effect.
 // The pipe language must use the user's -x value, not hardcoded "c".
@@ -5053,7 +5053,7 @@ static void test_cli_x_lang_pipe_ordering(void) {
 	rmdir(dir);
 }
 
-// Bug: collect_system_includes uses pointer comparison (==) instead of strcmp
+// collect_system_includes uses pointer comparison (==) instead of strcmp
 // for deduplication. Since intern_filename allocates fresh copies, the same
 // header path gets different pointers and is emitted multiple times.
 static void test_noflat_include_dedup(void) {
@@ -5120,7 +5120,7 @@ static void test_noflat_include_dedup(void) {
 	free(path);
 }
 
-// Bug: cc_is_clang fails to detect clang when the compiler command is "cc" or
+// cc_is_clang fails to detect clang when the compiler command is "cc" or
 // "gcc" on non-Apple platforms (or /usr/bin/gcc on Apple which IS clang).
 // This causes -fpreprocessed to be incorrectly passed to clang, which doesn't
 // support it, failing with: "cc: error: unknown argument '-fpreprocessed'"
@@ -5184,7 +5184,7 @@ static void test_fpreprocessed_not_passed_to_clang(void) {
 	rmdir(dir);
 }
 
-// Bug: signal_temps_register used to silently drop files beyond 64.
+// signal_temps_register used to silently drop files beyond 64.
 // Fix: capacity increased to SIGNAL_TEMPS_MAX (256) with CAS-based registration.
 // Verify that entries beyond the old limit (64) are properly tracked.
 static void test_signal_temps_register_overflow(void) {
@@ -5211,7 +5211,7 @@ static void test_signal_temps_register_overflow(void) {
 	if (saved > 0) signal_temps_store(saved);
 }
 
-// Bug: make_temp_file used to create a file via mkstemps (O_EXCL) but
+// make_temp_file used to create a file via mkstemps (O_EXCL) but
 // immediately close(fd) and return 0.  The fix: return the open fd so
 // callers use fdopen() instead of fopen(), eliminating the TOCTOU window.
 static void test_make_temp_file_toctou_symlink(void) {
@@ -5257,7 +5257,7 @@ static void test_make_temp_file_toctou_symlink(void) {
 }
 
 #if !defined(_WIN32) && !defined(__APPLE__)
-// Bug: signal_temps_register uses a non-atomic load-check-store pattern.
+// signal_temps_register uses a non-atomic load-check-store pattern.
 // Two threads reading the same index clobber each other's entry.
 typedef struct { int tid; pthread_barrier_t *barrier; } RaceArg;
 
@@ -5331,15 +5331,15 @@ static void test_signal_temps_ready_flag(void) {
 
 	if (saved > 0) signal_temps_store(saved);
 }
-// Bug: generic_decl_rewrite_target and generic_member_rewrite_target pick a
+// generic_decl_rewrite_target and generic_member_rewrite_target pick a
 // fixed branch from _Generic (first or last identifier seen), discarding the
 // type-dispatch logic. The backend compiler can no longer resolve the correct
 // branch — the wrong function is hardcoded.
-// Bug: When using -fno-flatten-headers, Prism runs cc -E which consumes
+// When using -fno-flatten-headers, Prism runs cc -E which consumes
 // in-file #define directives like _FILE_OFFSET_BITS.  The un-flatten path
 // reconstructs #include directives but never re-emits the user's #defines.
 // The backend compiler sees #include <stdio.h> without the ABI-altering macro.
-// Bug: When compiling multiple files, tokenizer_teardown(false) resets the arena
+// When compiling multiple files, tokenizer_teardown(false) resets the arena
 // but does not clear ctx->source_defines / ctx->source_define_cap.  On the second
 // file, collect_source_defines writes through a dangling pointer into reused arena
 // memory, which tokenize_buffer then overwrites with File structs.  The result is
@@ -5372,7 +5372,7 @@ static void test_multifile_arena_use_after_reset(void) {
 }
 
 static void test_collect_source_defines_block_comment_leak(void) {
-	/* BUG: collect_source_defines() has no state machine for multi-line
+	/* collect_source_defines() has no state machine for multi-line
 	 * block comments.  It skips lines *starting* with /*, but when a block
 	 * comment spans multiple lines, a #define on a subsequent line inside
 	 * the comment is scraped as if it were active code.
@@ -5424,7 +5424,7 @@ static void test_braceless_nesting_depth_limit(void) {
 }
 
 static void test_collect_source_defines_long_line_truncation(void) {
-	/* BUG: collect_source_defines() uses fgets(line, 1024, f) to scan for
+	/* collect_source_defines() uses fgets(line, 1024, f) to scan for
 	 * pre-include #define directives.  When a #define line exceeds 1023 bytes,
 	 * fgets() stops at the buffer limit and returns without consuming the
 	 * newline.  The next fgets() call reads the remainder of that long line as
@@ -5536,7 +5536,7 @@ static void test_generic_decl_rewrite_destroys_dispatch(void) {
 }
 
 static void test_collect_source_defines_comment_continuation(void) {
-	/* BUG: collect_source_defines() skips comment lines with continue,
+	/* collect_source_defines() skips comment lines with continue,
 	 * bypassing the check_continuation block. A comment ending with \
 	 * should suppress the next line (it's a continuation of the comment),
 	 * but the missed check lets the next line be parsed as a fresh define. */
@@ -5559,7 +5559,7 @@ static void test_collect_source_defines_comment_continuation(void) {
 }
 
 static void test_collect_source_defines_continuation_line(void) {
-	/* BUG: collect_source_defines() strips the trailing backslash from a
+	/* collect_source_defines() strips the trailing backslash from a
 	 * continuation-line #define and captures only the first physical line's
 	 * value.  For:
 	 *
@@ -5615,7 +5615,7 @@ static void test_collect_source_defines_multi_continuation(void) {
 
 #ifdef __GNUC__
 static void test_auto_type_goto_bypass(void) {
-	/* BUG: __auto_type is not in the keyword map, so the tokenizer assigns
+	/* __auto_type is not in the keyword map, so the tokenizer assigns
 	 * TK_IDENT with no tag.  Phase 1D never registers it as P1K_DECL.
 	 * The CFG verifier fails to catch goto jumping over an __auto_type
 	 * declaration — a safety hole. */
@@ -5634,7 +5634,7 @@ static void test_auto_type_goto_bypass(void) {
 #endif
 
 static void test_c23_attr_skip_one_stmt_scope_leak(void) {
-	/* BUG: skip_one_stmt doesn't skip C23 [[attr]] or __attribute__((...))
+	/* skip_one_stmt doesn't skip C23 [[attr]] or __attribute__((...))
 	 * before checking for '{'.  When the body of a braceless for-loop is
 	 * [[maybe_unused]] { ... }, skip_one_stmt falls to the simple-statement
 	 * scanner, walks past the block, and returns the ';' of the NEXT
@@ -5658,7 +5658,7 @@ static void test_c23_attr_skip_one_stmt_scope_leak(void) {
 }
 
 static void test_stmtexpr_in_initializer_zeroinit(void) {
-	/* BUG: in_struct_body() walks past stmt-expr boundaries.  At file
+	/* in_struct_body() walks past stmt-expr boundaries.  At file
 	 * scope, '= {' sets is_struct on the initializer scope.  A stmt-expr
 	 * ({ }) inside pushes its own scope, but in_struct_body() walks past it
 	 * and finds is_struct on the outer scope, suppressing zero-init.
@@ -5680,7 +5680,7 @@ static void test_stmtexpr_in_initializer_zeroinit(void) {
 }
 
 static void test_stmtexpr_in_initializer_defer_raw_leak(void) {
-	/* BUG: same in_struct_body() boundary issue causes handle_defer_keyword
+	/* same in_struct_body() boundary issue causes handle_defer_keyword
 	 * to return NULL inside a stmt-expr in a file-scope initializer.  defer
 	 * is emitted raw to the backend, causing a compilation failure. */
 	const char *code =
@@ -5702,7 +5702,7 @@ static void test_stmtexpr_in_initializer_defer_raw_leak(void) {
 }
 
 static void test_braceless_for_defer_shadow_leak(void) {
-	/* BUG: for-init shadows are registered at block_depth+1. With braced
+	/* for-init shadows are registered at block_depth+1. With braced
 	 * loops, scope_pop() cleans them up at '}'. With braceless loops, no
 	 * scope is pushed/popped, so the shadow leaks into the outer block.
 	 * A subsequent return/goto hits check_defer_shadow_at_exit and throws
@@ -5724,7 +5724,7 @@ static void test_braceless_for_defer_shadow_leak(void) {
 }
 
 static void test_walk_balanced_itag_truncation(void) {
-	/* BUG: walk_balanced stmt-expr inner loop stores inner->tag in uint16_t
+	/* walk_balanced stmt-expr inner loop stores inner->tag in uint16_t
 	 * itag. TT_DEFER=1<<20, TT_GOTO=1<<17, TT_ORELSE=1<<30 — all above
 	 * 16 bits. The truncation silently zeroes them, so keyword dispatch
 	 * never fires. defer/goto/orelse inside stmt-exprs in array dimensions
@@ -5747,7 +5747,7 @@ static void test_walk_balanced_itag_truncation(void) {
 }
 
 static void test_walk_balanced_orelse_stmtexpr(void) {
-	/* BUG: walk_balanced_orelse (used when F_ORELSE is enabled) does not
+	/* walk_balanced_orelse (used when F_ORELSE is enabled) does not
 	 * detect or process GNU statement expressions ({...}) at all. Tokens
 	 * inside such expressions are emitted verbatim — zero-init, defer,
 	 * and raw stripping all fail. */
@@ -5770,7 +5770,7 @@ static void test_walk_balanced_orelse_stmtexpr(void) {
 }
 
 static void test_goto_over_for_init_decl(void) {
-	/* BUG: p1_scan_init_shadows tags for-init declarations with P1_IS_DECL
+	/* p1_scan_init_shadows tags for-init declarations with P1_IS_DECL
 	 * but never calls p1_alloc(P1K_DECL, ...).  The CFG verifier does not
 	 * see them, so a goto that jumps over a for-init declaration into the
 	 * loop body is not rejected — the variable has stack garbage. */
@@ -5822,7 +5822,7 @@ static void test_p1_ann_dirty_state_leak(void) {
 }
 
 static void test_raw_raw_double_qualifier(void) {
-	/* BUG: `raw raw int x;` — is_raw_declaration_context sees the second
+	/* `raw raw int x;` — is_raw_declaration_context sees the second
 	 * `raw` as an unknown identifier (not a type keyword), returns false,
 	 * and the first `raw` is emitted verbatim into the C output. */
 	PrismFeatures f = prism_defaults();
@@ -5904,7 +5904,7 @@ static void test_cli_main_leak_asan(void) {
 #endif
 
 static void test_collect_source_defines_comment_in_directive(void) {
-	/* BUG: collect_source_defines() skips '#' then whitespace, then checks
+	/* collect_source_defines() skips '#' then whitespace, then checks
 	 * strncmp(p, "define", 6).  The C standard (§6.10) allows comments
 	 * between '#' and the directive name:  # /<star> <star>/ define FOO 42
 	 * is valid C preprocessing.  GCC/Clang accept it.  But the scanner
@@ -5967,7 +5967,7 @@ static void test_collect_source_defines_ifdef_both_branches_extracted(void) {
 }
 
 static void test_collect_source_defines_after_code_line(void) {
-	/* BUG: collect_source_defines() scans the source file line-by-line and
+	/* collect_source_defines() scans the source file line-by-line and
 	 * breaks the scan on the first non-preprocessor, non-blank, non-comment
 	 * line.  If an ABI-altering #define appears AFTER a typedef, global
 	 * variable, or any other code line, the scanner stops before reaching
@@ -6030,7 +6030,7 @@ static void test_collect_source_defines_after_code_line(void) {
 }
 
 static void test_collect_source_defines_block_comment_end_same_line(void) {
-	/* BUG: collect_source_defines() tracks multi-line block comments with
+	/* collect_source_defines() tracks multi-line block comments with
 	 * in_block_comment.  When it finds the end-of-comment marker on a
 	 * line, it clears in_block_comment and then does 'continue', skipping
 	 * the rest of that line.  If a #define appears after the closing
@@ -6090,7 +6090,7 @@ static void test_collect_source_defines_block_comment_end_same_line(void) {
 	unlink(single_path); free(single_path);
 }
 
-// Bug: collect_source_defines breaks on #include even inside #if 0 blocks.
+// collect_source_defines breaks on #include even inside #if 0 blocks.
 // The #include check fires before cond_depth is evaluated, so a disabled
 // #include <windows.h> aborts the scanner, dropping all ABI macros below it.
 static void test_collect_source_defines_disabled_include_abi_drop(void) {
@@ -6118,7 +6118,7 @@ static void test_collect_source_defines_disabled_include_abi_drop(void) {
 	unlink(path); free(path);
 }
 
-// Bug: generic_member_rewrite_target and generic_decl_rewrite_target scan
+// generic_member_rewrite_target and generic_decl_rewrite_target scan
 // from tok_next(open) which includes the controlling expression.  If the
 // controlling expression is a function call like get_state(1), it matches
 // as "valid varname followed by (" and gets extracted as the target branch.
@@ -6147,7 +6147,7 @@ static void test_generic_controlling_expr_mutilation(void) {
 	prism_free(&r);
 }
 
-// Bug: generic_has_distinct_targets compares only the first identifier after ':'
+// generic_has_distinct_targets compares only the first identifier after ':'
 // in each branch.  obj.handle_int vs obj.handle_float both start with 'obj',
 // so the function returns false (not distinct).  generic_member_rewrite_target
 // then finds handle_int( as the call target and emits obj.handle_int(42),
@@ -6185,7 +6185,7 @@ static void test_generic_ternary_colon_confusion(void) {
 	prism_free(&r);
 }
 
-// Bug: block comment spanning #-to-directive in collect_source_defines
+// block comment spanning #-to-directive in collect_source_defines
 // does not set in_block_comment = true before goto check_continuation,
 // so the continuation line with the actual directive is silently dropped.
 static void test_collect_source_defines_split_block_comment(void) {
@@ -6211,7 +6211,7 @@ static void test_collect_source_defines_split_block_comment(void) {
 	unlink(path); free(path);
 }
 
-// Bug: collect_source_defines joins continuation lines with an injected space,
+// collect_source_defines joins continuation lines with an injected space,
 // violating C standard Phase 2 line splicing.  0xFFFF\<NL>FFFF must become
 // 0xFFFFFFFF, not 0xFFFF FFFF.
 static void test_collect_source_defines_continuation_splice_space(void) {
@@ -6276,12 +6276,12 @@ static void test_collect_source_defines_conditional_guard_preserved(void) {
 	unlink(path); free(path);
 }
 
-// Bug: generic_has_distinct_targets skips non-identifier association targets
+// generic_has_distinct_targets skips non-identifier association targets
 // (e.g. default: 0), falsely concluding all branches target the same function.
 // In N3322 declaration context, this silently folds _Generic to the one named
 // function, erasing the non-identifier branch entirely.
 
-// Bug: generic_has_distinct_targets only compares function names, not argument
+// generic_has_distinct_targets only compares function names, not argument
 // lists. When all _Generic branches call the same function with DIFFERENT
 // arguments, the rewrite folds them into one call with the first branch's
 // args, silently discarding all other branches' arguments.
@@ -6307,7 +6307,7 @@ static void test_collect_source_defines_conditional_guard_preserved(void) {
 // try_generic_member_rewrite to fail, emitting ._Generic() verbatim.
 
 static void test_cond_stack_deep_nesting_silent_drop(void) {
-	/* BUG: collect_source_defines uses a fixed cond_stack[32].  A #define at
+	/* collect_source_defines uses a fixed cond_stack[32].  A #define at
 	 * #ifdef depth > 32 is silently skipped — the ABI-altering macro is lost
 	 * from the transpiled output in non-flatten mode.
 	 *
@@ -6339,7 +6339,7 @@ static void test_cond_stack_deep_nesting_silent_drop(void) {
 }
 
 static void test_defer_shadow_limit_dynamic(void) {
-	/* BUG: defer_shadows is a fixed array of MAX_DEFER_SHADOWS=256.
+	/* defer_shadows is a fixed array of MAX_DEFER_SHADOWS=256.
 	 * Exceeding it produces a hard error.  For auto-generated code with
 	 * many typedefs and massive defer blocks, 256 can be hit.
 	 *
@@ -6365,7 +6365,7 @@ static void test_defer_shadow_limit_dynamic(void) {
 }
 
 static void test_skip_one_stmt_deep_iterative(void) {
-	/* BUG: skip_one_stmt uses C-level recursion.  A for-loop with >4096
+	/* skip_one_stmt uses C-level recursion.  A for-loop with >4096
 	 * braceless nested ifs errors out.
 	 *
 	 * Fix: convert skip_one_stmt to an iterative loop. */
@@ -6385,7 +6385,7 @@ static void test_skip_one_stmt_deep_iterative(void) {
 }
 
 static void test_skip_one_stmt_deep_do_iterative(void) {
-	/* BUG: skip_one_stmt_impl used true recursion for do-loop bodies.
+	/* skip_one_stmt_impl used true recursion for do-loop bodies.
 	 * 50,000+ nested braceless 'do' loops caused stack overflow (segfault).
 	 * Fix: convert do handler to iterative with do_depth counter. */
 	size_t cap = 1200000;
@@ -6407,7 +6407,7 @@ static void test_skip_one_stmt_deep_do_iterative(void) {
 }
 
 static void test_raw_attr_boundary_skip_noise(void) {
-	/* BUG: is_raw_strip_context checked tok_next(after_raw) directly,
+	/* is_raw_strip_context checked tok_next(after_raw) directly,
 	 * not through skip_noise().  GNU/C23 attributes between variable name
 	 * and boundary punctuation (;/,) caused the check to fail, leaking
 	 * the 'raw' keyword into transpiler output. */
@@ -6424,7 +6424,7 @@ static void test_raw_attr_boundary_skip_noise(void) {
 }
 
 static void test_typeof_paren_func_memset(void) {
-	/* BUG: typeof((func)) bypasses function-type detection because
+	/* typeof((func)) bypasses function-type detection because
 	 * the parenthesized name fails the tok_next(inner)==close check.
 	 * Prism emits memset on a function type → .text overwrite. */
 	PrismResult r = prism_transpile_source(
@@ -6458,7 +6458,7 @@ static void test_typeof_paren_func_memset(void) {
 }
 
 static void test_nested_stmtexpr_ctrl_state_desync(void) {
-	/* BUG: nested stmt-exprs inside control-flow conditions could inherit
+	/* nested stmt-exprs inside control-flow conditions could inherit
 	 * is_ctrl_se from the outer stmt-expr's ctrl_save_stack push.  The inner
 	 * }) then prematurely popped the stack, desynchronizing scope tracking. */
 	PrismResult r = prism_transpile_source(
@@ -6480,7 +6480,7 @@ static void test_nested_stmtexpr_ctrl_state_desync(void) {
 }
 
 static void test_taint_propagation_perf(void) {
-	/* BUG: taint propagation's inner loop uses O(N) linear scan with
+	/* taint propagation's inner loop uses O(N) linear scan with
 	 * memcmp to resolve function call targets.  With N functions each
 	 * making M calls, the fixed-point loop costs O(N*M*N) per iteration.
 	 *
@@ -6583,7 +6583,7 @@ static void test_ifdef_in_orelse_lib_rejected(void) {
 }
 
 static void test_collect_source_defines_midline_block_comment(void) {
-	/* BUG: collect_source_defines() only checked for block comment
+	/* collect_source_defines() only checked for block comment
 	   opens at the START of non-# lines.  A mid-line /* on a code
 	   line that spans subsequent #define directives was invisible
 	   to the scanner, causing defines inside the comment to be
@@ -7115,7 +7115,7 @@ void run_api_tests_3(void) {
 }
 
 static void test_raw_star_expr_misclassification(void) {
-	/* BUG: is_raw_declaration_context treated `raw * 3` at statement start
+	/* is_raw_declaration_context treated `raw * 3` at statement start
 	 * as a pointer declaration, stripping the `raw` token.  The fix
 	 * checks whether *, after skipping qualifiers, is followed by an
 	 * identifier (declaration) or a non-identifier like a number
@@ -7135,7 +7135,7 @@ static void test_raw_star_expr_misclassification(void) {
 }
 
 static void test_typeof_local_shadows_func(void) {
-	/* BUG: typeof(name) where `name` is a local variable shadowing a function
+	/* typeof(name) where `name` is a local variable shadowing a function
 	 * was treated as a function type (skipping zero-init).  The shadow
 	 * check was missing from is_typeof_func_type. */
 	PrismResult r = prism_transpile_source(
@@ -7157,7 +7157,7 @@ static void test_typeof_local_shadows_func(void) {
 }
 
 static void test_param_shadow_func_proto(void) {
-	/* BUG: p1_register_param_shadows didn't check p1_func_proto_map,
+	/* p1_register_param_shadows didn't check p1_func_proto_map,
 	 * so a parameter named after a forward-declared function wasn't
 	 * shadowed.  typeof(param) then hit is_typeof_func_type and
 	 * skipped zero-init. */
@@ -7181,7 +7181,7 @@ static void test_param_shadow_func_proto(void) {
 }
 
 static void test_noreturn_attr_arg_poisoning(void) {
-	/* BUG: noreturn attribute scan walked flat over attribute argument lists,
+	/* noreturn attribute scan walked flat over attribute argument lists,
 	 * so __attribute__((cleanup(noreturn))) matched `noreturn` as the
 	 * function's own attribute, injecting __builtin_unreachable() after calls. */
 	PrismResult r = prism_transpile_source(
@@ -7200,7 +7200,7 @@ static void test_noreturn_attr_arg_poisoning(void) {
 }
 
 static void test_noreturn_shadow_no_unreachable(void) {
-	/* BUG: try_detect_noreturn_call() trusted Pass 0's TT_NORETURN_FN tag
+	/* try_detect_noreturn_call() trusted Pass 0's TT_NORETURN_FN tag
 	 * without checking if the identifier was shadowed by a local variable
 	 * or parameter.  A function pointer parameter named `exit` got
 	 * __builtin_unreachable() injected after the call — silent miscompile. */
@@ -7294,7 +7294,7 @@ static void test_noreturn_shadow_no_unreachable(void) {
 }
 
 static void test_vla_deref_adjacency_parens(void) {
-	/* BUG: sizeof(*(param)) on VLA param hid the `*` from the adjacency
+	/* sizeof(*(param)) on VLA param hid the `*` from the adjacency
 	 * check because parens blocked the backward look.  Result: `= {0}`
 	 * on VLA-dimensioned array (invalid C). */
 	PrismResult r = prism_transpile_source(
@@ -7316,7 +7316,7 @@ static void test_vla_deref_adjacency_parens(void) {
 }
 
 static void test_braceless_defer_shadow_false_positive(void) {
-	/* BUG: declaration in braceless if body falsely errored with
+	/* declaration in braceless if body falsely errored with
 	 * "shadows a name captured by a defer in the same scope" because
 	 * brace_wrap { } is purely textual and doesn't increment block_depth,
 	 * so check_defer_var_shadow saw the var at the same scope as the defer. */
@@ -7333,7 +7333,7 @@ static void test_braceless_defer_shadow_false_positive(void) {
 }
 
 static void test_braceless_typedef_scope_poison(void) {
-	/* BUG: typedef in braceless control-flow body leaked to parent scope,
+	/* typedef in braceless control-flow body leaked to parent scope,
 	 * poisoning Prism keywords (orelse/defer) for the rest of the function. */
 	PrismResult r = prism_transpile_source(
 		"int get_data(void);\n"
@@ -7445,7 +7445,7 @@ static void test_ghost_enum_defer_shadow_enclosing(void) {
 
 static void test_backward_goto_over_defer(void) {
 	printf("\n--- Backward goto over defer ---\n");
-	/* VULN: backward goto looping over a same-scope defer is silently
+	/* backward goto looping over a same-scope defer is silently
 	 * accepted. The defer body only executes once at scope exit, causing
 	 * silent resource leaks. */
 	{

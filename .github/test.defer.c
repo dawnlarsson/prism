@@ -1657,7 +1657,7 @@ void test_defer_setjmp_rejected(void) {
 	    "setjmp");
 }
 
-// Bug: glibc expands sigsetjmp to __sigsetjmp after preprocessing.
+// glibc expands sigsetjmp to __sigsetjmp after preprocessing.
 // Prism must reject defer in functions calling these internal variants.
 void test_defer_glibc_sigsetjmp_rejected(void) {
 	// __sigsetjmp: glibc internal for sigsetjmp
@@ -1877,7 +1877,7 @@ static void test_knr_nested_func_detection(void) {
 static void test_extern_decl_not_nested_func(void) {
 	printf("\n--- Extern Decl Not Misidentified as Nested Function ---\n");
 
-	// BUG: extern forward declarations with attributes inside function bodies
+	// extern forward declarations with attributes inside function bodies
 	// were falsely detected as GNU nested function definitions when a switch
 	// statement followed. The K&R params fallback scan walked past the ;
 	// through subsequent code to the switch body {, and is_knr_params returned
@@ -1968,7 +1968,7 @@ static void test_extern_decl_not_nested_func(void) {
 static void test_stmt_expr_in_ctrl_cond_label(void) {
 	printf("\n--- Stmt-Expr in Ctrl Condition + Label Body ---\n");
 
-	// BUG: when a GNU statement expression ({...}) appeared inside an if()
+	// when a GNU statement expression ({...}) appeared inside an if()
 	// condition, the balanced-group scan aborted and tokens were processed
 	// individually. The closing ')' of the condition never triggered
 	// at_stmt_start=true, so a label on the next line (the if body) was
@@ -2705,7 +2705,7 @@ static void test_braceless_switch_defer_drop(void) {
 	prism_free(&r);
 }
 
-// Bug: check_defer_var_shadow does a flat scan of defer body tokens without
+// check_defer_var_shadow does a flat scan of defer body tokens without
 // tracking brace depth. A variable declared inside an inner { } block within
 // the defer body matches the outer declaration name, producing a false positive.
 static void test_defer_shadow_inner_block_false_positive(void) {
@@ -3022,7 +3022,7 @@ static void test_defer_shadow_typedef_bypass(void) {
 	prism_free(&r);
 }
 
-// Bug: The check for "defer at end of stmt-expr" only fires when the next
+// The check for "defer at end of stmt-expr" only fires when the next
 // non-noise token after the inner block's closing '}' is the outer '}' of
 // the stmt-expr. An empty statement (;) or label between the two braces
 // defeats the detection. The defer then emits after the last expression in
@@ -3104,7 +3104,7 @@ static void test_defer_stmt_expr_empty_stmt_bypass(void) {
 	}
 }
 
-// Bug: typeof(x) inside a nested block in a defer body sets in_decl = true,
+// typeof(x) inside a nested block in a defer body sets in_decl = true,
 // then when 'x' is encountered inside the typeof parens, it's treated as a
 // local declaration target. This poisons decl_depth, causing a later
 // 'int x = 5;' in the same block to be skipped by the shadow checker.
@@ -3158,7 +3158,7 @@ static void test_defer_typeof_shadow_bypass(void) {
 	prism_free(&r2);
 }
 
-// Bug: check_enum_typedef_defer_shadow's comma-scan loop inside enum body
+// check_enum_typedef_defer_shadow's comma-scan loop inside enum body
 // does not skip over balanced groups (parens). An enum constant with a
 // complex initializer like STATE_A = (0, x) has a comma inside parens;
 // the scanner stops at that inner comma, then the next iteration picks up
@@ -6171,7 +6171,7 @@ static void test_braceless_shadow_scope_leak(void) {
 	}
 }
 
-/* BUG: emit_statements `:` label handler was gated on mode != EMIT_DEFER_BODY,
+/* emit_statements `:` label handler was gated on mode != EMIT_DEFER_BODY,
  * preventing case/default labels from resetting at_stmt_start in defer bodies.
  * Bare orelse after case labels leaked verbatim to C output. */
 static void test_defer_case_label_orelse_leak(void) {
@@ -6235,7 +6235,7 @@ static void test_defer_case_label_orelse_leak(void) {
 	}
 }
 
-// BUG: defer_body_refs_name bd>1 missed top-level locals in block defer.
+// defer_body_refs_name bd>1 missed top-level locals in block defer.
 // `defer { int x = 1; }` followed by `int x = 2;` falsely flagged as shadow
 // because the scanner didn't recognize top-level (bd==1) declarations as local.
 static void test_defer_shadow_toplevel_local_false_positive(void) {
@@ -6286,7 +6286,7 @@ static void test_defer_shadow_toplevel_local_false_positive(void) {
 	}
 }
 
-// BUG: skip_to_semicolon in validate_defer_statement escaped past } when
+// skip_to_semicolon in validate_defer_statement escaped past } when
 // a semicolon was missing inside a defer block, causing Phase 1F to validate
 // the entire rest of the file as if inside the defer.
 static void test_defer_validator_escape_missing_semicolon(void) {
@@ -6338,7 +6338,7 @@ static void test_defer_validator_escape_missing_semicolon(void) {
 	}
 }
 
-// BUG: Phase 1D enum defer shadow check unconditionally hard-errored for
+// Phase 1D enum defer shadow check unconditionally hard-errored for
 // enclosing-scope shadows, even when no control-flow exit occurs while
 // the enum constant is live. C11 §6.2.1p4: enum constants have block scope.
 static void test_enum_defer_shadow_false_positive(void) {
@@ -6465,7 +6465,7 @@ static void test_enum_defer_shadow_false_positive(void) {
 	}
 }
 
-// BUG: chained orelse in defer body — premature break; in scanner
+// chained orelse in defer body — premature break; in scanner
 // stopped after first orelse, allowing control-flow to leak.
 static void test_defer_chained_orelse_control_flow_leak(void) {
 	printf("\n--- chained orelse defer control-flow leak ---\n");
@@ -6585,6 +6585,49 @@ static void test_defer_chained_orelse_control_flow_leak(void) {
 		    "single_oe_ret.c", prism_defaults());
 		CHECK(r.status != PRISM_OK,
 		      "single orelse return in defer must still be rejected");
+		prism_free(&r);
+	}
+}
+
+static void test_defer_fno_orelse_paren_leak(void) {
+	printf("\n--- -fno-orelse defer paren leak ---\n");
+	PrismFeatures f = prism_defaults();
+	f.orelse = false;
+
+	// sizeof(defer cleanup()) — must be rejected even with -fno-orelse
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(void);\n"
+		    "int main(void) { int x = sizeof(defer cleanup()); return x; }\n",
+		    "fno_oe_sizeof.c", f);
+		CHECK(r.status != PRISM_OK,
+		      "defer in sizeof rejected with -fno-orelse");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "parenthesized") != NULL,
+			      "-fno-orelse defer sizeof error mentions parenthesized");
+		prism_free(&r);
+	}
+
+	// (defer cleanup(), 42) — must be rejected even with -fno-orelse
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(void);\n"
+		    "int main(void) { int x = (defer cleanup(), 42); return x; }\n",
+		    "fno_oe_comma.c", f);
+		CHECK(r.status != PRISM_OK,
+		      "defer in paren-comma rejected with -fno-orelse");
+		prism_free(&r);
+	}
+
+	// init context: int x = f(defer cleanup()) with -fno-orelse
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(void);\n"
+		    "int f(int);\n"
+		    "int main(void) { int x = f(defer cleanup()); return x; }\n",
+		    "fno_oe_call.c", f);
+		CHECK(r.status != PRISM_OK,
+		      "defer in call-arg rejected with -fno-orelse");
 		prism_free(&r);
 	}
 }
@@ -6890,18 +6933,21 @@ void run_defer_tests(void) {
 	// braceless body shadow scope leak (typedef poisoning)
 	test_braceless_shadow_scope_leak();
 
-        // BUG: case/default labels in defer body didn't reset at_stmt_start
+        // case/default labels in defer body didn't reset at_stmt_start
         test_defer_case_label_orelse_leak();
 
-	// BUG: defer_body_refs_name bd>1 missed top-level local declarations
+	// defer_body_refs_name bd>1 missed top-level local declarations
 	test_defer_shadow_toplevel_local_false_positive();
 
-	// BUG: skip_to_semicolon escaped past } on missing semicolon
+	// skip_to_semicolon escaped past } on missing semicolon
 	test_defer_validator_escape_missing_semicolon();
 
-	// BUG: Phase 1D enum defer shadow hard error on enclosing-scope shadows
+	// Phase 1D enum defer shadow hard error on enclosing-scope shadows
 	GNUC_ONLY(test_enum_defer_shadow_false_positive());
 
-	// BUG: chained orelse in defer body leaked control-flow past first orelse
+	// chained orelse in defer body leaked control-flow past first orelse
 	test_defer_chained_orelse_control_flow_leak();
+
+	// -fno-orelse must not disable defer-in-parens validation
+	test_defer_fno_orelse_paren_leak();
 }

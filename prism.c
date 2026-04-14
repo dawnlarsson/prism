@@ -3136,7 +3136,7 @@ static InitWalkResult emit_decl_init_walk(Token *tok) {
 	int init_ternary = 0;
 	while (r.tok->kind != TK_EOF) {
 		if (r.tok->flags & TF_OPEN) {
-			if (FEAT(F_ORELSE)) check_orelse_in_parens(r.tok);
+			if (FEAT(F_ORELSE) || FEAT(F_DEFER)) check_orelse_in_parens(r.tok);
 			r.tok = walk_balanced(r.tok, true);
 			continue;
 		}
@@ -3769,7 +3769,7 @@ static Token *emit_expr_to_semicolon(Token *tok) {
 		// Statement expressions ({...}): route through walk_balanced which
 		// has the full keyword dispatcher (defer, goto, orelse, zeroinit).
 		if ((match_ch(tok, '(') || match_ch(tok, '[')) && tok_match(tok)) {
-				if (FEAT(F_ORELSE) && (match_ch(tok, '(') || match_ch(tok, '[')))
+				if ((FEAT(F_ORELSE) || FEAT(F_DEFER)) && (match_ch(tok, '(') || match_ch(tok, '[')))
 				check_orelse_in_parens(tok);
 			tok = walk_balanced(tok, true);
 			expr_at_stmt_start = false;
@@ -6529,7 +6529,7 @@ static Token *p1d_scan_init_orelse(Token *t, bool *out_has_orelse, Token **out_f
 							*out_has_orelse = true;
 						}
 						if (inner->flags & TF_OPEN) {
-							if (FEAT(F_ORELSE) && match_ch(inner, '(') &&
+							if ((FEAT(F_ORELSE) || FEAT(F_DEFER)) && match_ch(inner, '(') &&
 							    !(prev_inner && (prev_inner->tag & TT_TYPEOF)))
 								check_orelse_in_parens(inner);
 							inner = tok_match(inner) ? tok_match(inner) : inner; prev_inner = inner; continue;
@@ -6547,7 +6547,7 @@ static Token *p1d_scan_init_orelse(Token *t, bool *out_has_orelse, Token **out_f
 						*out_has_orelse = false;
 						*out_first_orelse = NULL;
 					}
-				} else if (FEAT(F_ORELSE) && !(prev_init_tok && (prev_init_tok->tag & TT_TYPEOF))) check_orelse_in_parens(t);
+				} else if ((FEAT(F_ORELSE) || FEAT(F_DEFER)) && !(prev_init_tok && (prev_init_tok->tag & TT_TYPEOF))) check_orelse_in_parens(t);
 			}
 			prev_init_tok = m ? m : t;
 			t = m ? tok_next(m) : tok_next(t); init_is_first = false; continue;
@@ -7437,7 +7437,7 @@ static void p1_full_depth_prescan(Token *tok) {
 				// Skip control-flow condition parens (if/while/for/switch),
 				// typeof parens, attribute/asm parens — orelse inside those
 				// is valid, handled separately, or irrelevant.
-				if (FEAT(F_ORELSE) && match_ch(tok, '(') &&
+				if ((FEAT(F_ORELSE) || FEAT(F_DEFER)) && match_ch(tok, '(') &&
 				    !(p1d_prev_saved && (p1d_prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH | TT_TYPEOF | TT_ATTR | TT_ASM))))
 					check_orelse_in_parens(tok);
 				// Phase 1D: reject orelse inside attribute paren groups at

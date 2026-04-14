@@ -658,7 +658,7 @@ Array parameters decay to pointers — the size is lost. The developer annotates
 void fill(int arr[bounds(n)], size_t n) {
     for (size_t i = 0; i < n; i++)
         arr[i] = 0;
-    arr[n] = 0;  // BUG: caught at runtime
+    arr[n] = 0;  // caught at runtime
 }
 
 // Emitted (annotation stripped):

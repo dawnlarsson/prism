@@ -376,7 +376,7 @@ Line 3)";
 #endif // _MSC_VER raw string literals
 
 void test_raw_keyword_after_static(void) {
-	// raw after static - this was the bug: 'raw' was not consumed
+	// raw after static - this was the 'raw' was not consumed
 	static raw int raw_after_static;
 	CHECK_EQ(raw_after_static, 0, "static raw int: raw consumed, no zero-init");
 }
@@ -1174,7 +1174,7 @@ static void test_raw_storage_class_leak(void) {
 	prism_free(&r);
 }
 
-// Bug: `raw int a, b, c;` only applies raw to the first declarator (a).
+// `raw int a, b, c;` only applies raw to the first declarator (a).
 // b and c get zero-initialized despite the raw prefix, because Pass 1
 // resets p1d_saw_raw on commas and Pass 2 resets is_raw after the first
 // declarator. In C, prefix keywords (const, static, extern) apply to the
@@ -1201,7 +1201,7 @@ static void test_raw_comma_list_all_declarators(void) {
 	prism_free(&r);
 }
 
-// Bug: consecutive raw keywords with interleaved attributes (e.g. from macro
+// consecutive raw keywords with interleaved attributes (e.g. from macro
 // expansion: raw __attribute__((cold)) raw int x;) causes the attribute to be
 // silently deleted. skip_noise jumps over the attribute between raw tokens,
 // and start is set past the last raw, losing the interleaved noise tokens.
@@ -1280,7 +1280,7 @@ static void test_raw_consecutive_attr_struct_body(void) {
 static void test_raw_qualifier_prefix_goto_desync(void) {
 	printf("\n--- raw qualifier prefix goto desync ---\n");
 
-	/* BUG: Phase 1D's main loop only set p1d_saw_raw when it directly
+	/* Phase 1D's main loop only set p1d_saw_raw when it directly
 	 * encountered a TF_RAW token.  When 'raw' appeared after qualifiers
 	 * (e.g. 'const raw int x'), the declaration detector fired on 'const'
 	 * first, so the main loop never reached 'raw'.  The forward-probe
@@ -1580,7 +1580,7 @@ static void test_raw_attr_per_declarator_leak(void) {
 	}
 }
 
-// BUG: emit_type_range tracked raw_depth (brace depth) and only stripped raw
+// emit_type_range tracked raw_depth (brace depth) and only stripped raw
 // at depth 0.  Inside struct/union bodies (depth > 0), raw keyword leaked
 // verbatim to C output.  This ONLY affected struct-with-variable declarations
 // at block scope (e.g. `struct S { raw int x; } s;`) because the type range
@@ -1672,7 +1672,7 @@ static void test_raw_struct_body_inline_decl(void) {
 	}
 }
 
-// BUG: emit_token_range (used by emit_ret_type) emitted space-separated tokens
+// emit_token_range (used by emit_ret_type) emitted space-separated tokens
 // with OUT_TOK — no try_strip_raw check. When a function declared as `raw int f()`
 // had defer, the return-value temp was emitted as `raw int __prism_ret_0 = ...`,
 // leaking `raw` to the backend compiler which rejected it as an undeclared identifier.

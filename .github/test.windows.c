@@ -1240,7 +1240,7 @@ static void test_win_path_wipe(void) {
 			free(buf);
 		}
 
-		// Prove the old bug: a tiny buffer triggers ERROR_MORE_DATA
+		// Prove the old a tiny buffer triggers ERROR_MORE_DATA
 		char tiny[10];
 		DWORD tiny_size = sizeof(tiny);
 		LONG tiny_rc = RegQueryValueExA(hKey, "Path", NULL, &type, (BYTE *)tiny, &tiny_size);
@@ -1489,7 +1489,7 @@ static void test_win_spawn_oflag(void) {
 static void test_win_env_scrubbing(void) {
 	printf("\n--- Security Regression: Environment Variable Scrubbing ---\n");
 
-	// Bug: run_command/run_command_quiet passed NULL for envp to
+	// run_command/run_command_quiet passed NULL for envp to
 	// win32_spawn_with_actions, and that function ignored envp entirely
 	// (passed NULL to CreateProcessW for lpEnvironment).  This caused
 	// the child to inherit CC= and PRISM_CC= from the parent, defeating
@@ -1641,7 +1641,7 @@ static void test_win_env_scrubbing(void) {
 static void test_win_handle_isolation(void) {
 	printf("\n--- Security Regression: Handle Isolation (STARTUPINFOEX) ---\n");
 
-	// Bug: win32_spawn_with_actions used bInheritHandles=TRUE with plain
+	// win32_spawn_with_actions used bInheritHandles=TRUE with plain
 	// STARTUPINFOW, causing ALL inheritable handles in the process to leak
 	// into children.  In PRISM_LIB_MODE with concurrent threads, pipe
 	// handles from thread A would leak into thread B's cl.exe, causing
@@ -1732,7 +1732,7 @@ static void test_win_handle_isolation(void) {
 static void test_win_std_clatest_override(void) {
 	printf("\n--- Regression: /std:clatest Override ---\n");
 
-	// Bug: If user passed /std:c11 to prism, the has_std check suppressed
+	// If user passed /std:c11 to prism, the has_std check suppressed
 	// /std:clatest injection, but generated code may contain typeof() which
 	// requires C23 mode on MSVC.  This caused hard compilation errors.
 	//
@@ -1782,7 +1782,7 @@ static void test_win_std_clatest_override(void) {
 static void test_win_old_exe_cleanup(void) {
 	printf("\n--- Regression: .old Exe Cleanup on Update ---\n");
 
-	// Bug: install() renamed the running prism.exe to prism.exe.old during a
+	// install() renamed the running prism.exe to prism.exe.old during a
 	// self-update, then called remove(old_path) to clean up.  Since the .old
 	// file is still locked by the running process, remove() silently fails,
 	// leaving orphaned .old files in the install directory forever.
@@ -1859,7 +1859,7 @@ static void test_win_old_exe_cleanup(void) {
 static void test_win_registry_wide_path(void) {
 	printf("\n--- Security Regression: Registry Wide-Char PATH ---\n");
 
-	// Bug: add_to_user_path used RegQueryValueExA/RegSetValueExA (ANSI).
+	// add_to_user_path used RegQueryValueExA/RegSetValueExA (ANSI).
 	// If the user's PATH contained non-ASCII characters (e.g., C:\Users\José),
 	// the ANSI API would transliterate them to '?' and permanently corrupt
 	// the user's system PATH when writing back.
@@ -1922,7 +1922,7 @@ static void test_win_registry_wide_path(void) {
 static void test_win_signal_tempfile_cleanup(void) {
 	printf("\n--- Security Regression: Signal Handler Temp File Cleanup ---\n");
 
-	// Bug: signal_cleanup_handler called unlink() on temp files, but on
+	// signal_cleanup_handler called unlink() on temp files, but on
 	// Windows _wunlink fails with EACCES if the file is still open.
 	// Since out_fp or win32_memstream_fp may hold the file open when
 	// Ctrl-C fires, the unlink silently fails, leaving orphaned temp files.
@@ -1984,7 +1984,7 @@ static void test_win_signal_tempfile_cleanup(void) {
 static void test_win_realpath_unicode(void) {
 	printf("\n--- Security Regression: realpath Wide-Char Unicode ---\n");
 
-	// Bug: realpath used CreateFileA and GetFinalPathNameByHandleA (ANSI).
+	// realpath used CreateFileA and GetFinalPathNameByHandleA (ANSI).
 	// UTF-8 paths with non-ASCII characters (e.g., src/テスト.c) get mangled
 	// through the system ANSI codepage, breaking #line directives.
 	//
@@ -2057,7 +2057,7 @@ static void test_win_realpath_unicode(void) {
 static void test_win_capture_wide(void) {
 	printf("\n--- Security Regression: capture_first_line CreateProcessW ---\n");
 
-	// Bug: capture_first_line used CreateProcessA with a UTF-8 cmdline.
+	// capture_first_line used CreateProcessA with a UTF-8 cmdline.
 	// If the compiler path contained non-ASCII characters, the ANSI
 	// interpretation would fail to launch the process.
 	//
@@ -2131,7 +2131,7 @@ static void test_win_capture_wide(void) {
 static void test_win_install_path_wide(void) {
 	printf("\n--- Security Regression: Install Path Wide-Char APIs ---\n");
 
-	// Bug: get_install_path used GetEnvironmentVariableA("LOCALAPPDATA") and
+	// get_install_path used GetEnvironmentVariableA("LOCALAPPDATA") and
 	// GetModuleFileNameA.  ensure_install_dir used GetFileAttributesA and
 	// CreateDirectoryA.  All are ANSI APIs that corrupt non-ASCII user profiles.
 	//
@@ -2206,7 +2206,7 @@ static void test_win_install_path_wide(void) {
 static void test_win_remove_utf8(void) {
 	printf("\n--- Security Regression: remove() UTF-8 Shim ---\n");
 
-	// Bug: remove() was not shimmed for UTF-8, unlike unlink().  The standard
+	// remove() was not shimmed for UTF-8, unlike unlink().  The standard
 	// C library remove() uses ANSI APIs on Windows, failing on non-ASCII paths.
 	// MoveFileA and MoveFileExA in install() also silently fail on Unicode paths.
 	//
@@ -2305,7 +2305,7 @@ static void test_win_remove_utf8(void) {
 static void test_win_memstream_wide_temp(void) {
 	printf("\n--- Security Regression: open_memstream Wide Temp Path ---\n");
 
-	// Bug: open_memstream used GetTempPathA and GetTempFileNameA (ANSI APIs).
+	// open_memstream used GetTempPathA and GetTempFileNameA (ANSI APIs).
 	// If %TEMP% contains non-ASCII characters, the temp file path gets corrupted
 	// and fopen fails, causing open_memstream to crash.
 	//
@@ -2360,7 +2360,7 @@ static void test_win_memstream_wide_temp(void) {
 static void test_win_oem_to_utf8(void) {
 	printf("\n--- Security Regression: OEM Codepage Conversion ---\n");
 
-	// Bug: check_path_shadow reads popen("where prism.exe") output encoded in
+	// check_path_shadow reads popen("where prism.exe") output encoded in
 	// the console's OEM codepage (e.g., CP437), but compares it with
 	// install_path which is UTF-8.  Non-ASCII paths cause false positives.
 	//

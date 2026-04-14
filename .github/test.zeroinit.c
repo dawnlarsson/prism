@@ -1295,7 +1295,7 @@ void test_ternary_zeroinit(void) {
         int my_val_t = 5; 
         int b = 2;
         
-        // BUG: Prism sees ':' as a structural token (statement start).
+        // Prism sees ':' as a structural token (statement start).
         // It then sees 'my_val_t' (which triggers the typedef heuristic because of '_t')
         // followed by '* b'. It mistakenly rewrites this into a zero-initialized declaration:
         // cond ? 0 : my_val_t * b = 0;
@@ -1636,7 +1636,7 @@ static void test_typeof_vla_split_double_eval(void) {
 static void test_vla_multi_decl_sequence_point(void) {
 	printf("\n--- VLA multi-decl sequence point split ---\n");
 
-	/* BUG: int arr[n], matrix[arr[0]][n]; — arr queued for memset but
+	/* int arr[n], matrix[arr[0]][n]; — arr queued for memset but
 	 * matrix's VLA dim arr[0] evaluated before the memset runs.
 	 * Fix: should_split_multi_decl splits when next decl is VLA. */
 	PrismResult r = prism_transpile_source(
@@ -1991,7 +1991,7 @@ static void test_func_returned_vla_sizeof(void) {
 }
 
 static void test_vla_typedef_struct_tag_memset(void) {
-	/* BUG: struct S { vlax buf; }; struct S s; emitted = {0} instead of memset
+	/* struct S { vlax buf; }; struct S s; emitted = {0} instead of memset
 	 * because struct_body_contains_vla only scanned inline bodies.
 	 * When struct S is referenced by tag without a body, the VLA info was lost. */
 
@@ -2186,7 +2186,7 @@ void test_gnu_thread_storage_class(void) {
 }
 #endif
 
-// BUG: computed goto + zeroinit declarations bypasses initialization.
+// computed goto + zeroinit declarations bypasses initialization.
 // The CFG verifier only checked computed_goto + F_DEFER, not F_ZEROINIT.
 // A computed goto can jump past `int x = 0;` leaving x with stack garbage.
 static void test_computed_goto_zeroinit_bypass(void) {
@@ -2230,7 +2230,7 @@ static void test_computed_goto_zeroinit_bypass(void) {
 //   typedef int T;
 //   void fn(int c) { if (int T = 0; c) { T x; } }
 //
-// BUG: emits 'T x = {0}' (zeroinit applied despite shadow)
+// emits 'T x = {0}' (zeroinit applied despite shadow)
 // CORRECT: shadow suppresses the typedef → Prism sees 'T x;' as a non-decl
 //          and emits it verbatim (downstream C compiler will reject it as expected)
 static void test_c23_if_init_shadow_underscopes_body(void) {
@@ -2241,7 +2241,7 @@ static void test_c23_if_init_shadow_underscopes_body(void) {
 	CHECK_EQ(r.status, PRISM_OK,
 		 "c23-if-init-shadow: transpiles OK");
 	if (r.output) {
-		/* BUG: shadow expires at ')' so T is still a typedef inside the body.
+		/* shadow expires at ')' so T is still a typedef inside the body.
 		 * try_zero_init_decl fires on 'T x' and emits 'T x = ...' (zeroinit).
 		 * Correct: shadow covers body → T is a variable → 'T x;' is verbatim. */
 		CHECK(strstr(r.output, "T x = ") == NULL,
@@ -2297,7 +2297,7 @@ static void test_c23_if_init_shadow_else_scope(void) {
 		      "c23-if-init-else-scope: true branch must not zeroinit "
 		      "(shadow covers if-body)");
 		/* Else branch: shadow must ALSO cover else body → no zeroinit.
-		 * BUG: skip_one_stmt on '{' returns at '}' of true-branch,
+		 * skip_one_stmt on '{' returns at '}' of true-branch,
 		 * scope_close_idx does not extend to else → shadow expires →
 		 * outer typedef T leaks back → zeroinit fires on 'T y;'. */
 		CHECK(strstr(r.output, "T y = ") == NULL,
@@ -2311,7 +2311,7 @@ static void test_c23_if_init_shadow_else_scope(void) {
 	/* Same bug with switch (no else, but verify it doesn't regress) */
 }
 
-// Bug: typedef void func_t(int); func_t my_func; — parse_declarator sees
+// typedef void func_t(int); func_t my_func; — parse_declarator sees
 // my_func as a plain variable (no trailing parens). process_declarators applies
 // zero-init (= {0} or memset), which is invalid for function declarations.
 // Function POINTER typedefs must remain correctly zeroed.
@@ -2546,7 +2546,7 @@ static void test_typeof_void_func_trailing_attr(void) {
 	}
 }
 
-// BUG: pointer-to-array declarators like int (*p)[4] were treated as
+// pointer-to-array declarators like int (*p)[4] were treated as
 // aggregates because is_array was set (the [4] describes the pointed-to
 // type, not the variable itself). This caused = {0} instead of = 0.
 static void test_ptr_to_array_scalar_zeroinit(void) {
@@ -2761,7 +2761,7 @@ static void test_typeof_extern_func_memset(void) {
 	}
 }
 
-// BUG: _Static_assert/sizeof at file scope confuses typeof func-type scanner.
+// _Static_assert/sizeof at file scope confuses typeof func-type scanner.
 // The scanner sees `ident(` inside sizeof(ident(...)) and falsely flags it as
 // a function declaration, bypassing zero-init for function pointer variables.
 static void test_typeof_funcptr_static_assert_bypass(void) {
@@ -2848,7 +2848,7 @@ static void test_stmt_expr_pragma_zeroinit_bypass(void) {
 }
 
 static void test_asm_goto_zeroinit_rejected(void) {
-	/* BUG: asm goto hides jump targets inside the assembly string.
+	/* asm goto hides jump targets inside the assembly string.
 	   Prism's token walker skips asm parameters entirely and never
 	   extracts the labels, so no P1K_GOTO is recorded.  The CFG
 	   verifier was blind to asm goto jumps, allowing zeroinit'd
@@ -2907,7 +2907,7 @@ static void test_asm_goto_zeroinit_rejected(void) {
 	}
 }
 
-// BUG: CFG verifier P1K_CASE body_close_idx desync —
+// CFG verifier P1K_CASE body_close_idx desync —
 // for-init declarations inside switch should not be rejected.
 static void test_switch_for_init_not_rejected(void) {
 	/* Braceless for-init inside switch case must be accepted:
@@ -4002,7 +4002,7 @@ static void test_typeof_unqual_variants(void) {
 	}
 }
 
-// BUG: struct tag shadow bleed — inner-scope clean struct redefinition didn't
+// struct tag shadow bleed — inner-scope clean struct redefinition didn't
 // register in the typedef table, so tag_lookup found the outer VLA struct,
 // falsely tagging variables as VLA and causing CFG verifier false positives.
 static void test_struct_tag_shadow_bleed(void) {
@@ -4085,7 +4085,7 @@ static void test_struct_tag_shadow_bleed(void) {
 	}
 }
 
-// BUG: case (expr): where last_emitted before : is ) didn't reset at_stmt_start.
+// case (expr): where last_emitted before : is ) didn't reset at_stmt_start.
 // Declarations after such labels missed zero-initialization.
 static void test_case_paren_expr_zeroinit(void) {
 	printf("\n--- case (expr): zeroinit ---\n");
@@ -4274,16 +4274,16 @@ void run_zeroinit_tests(void) {
         // typeof(external_function) memset corruption
         test_typeof_extern_func_memset();
 
-	// BUG: static_assert/sizeof confuses typeof func-type scanner
+	// static_assert/sizeof confuses typeof func-type scanner
 	test_typeof_funcptr_static_assert_bypass();
 
 	// pragma in walk_balanced stmt-expr breaks at_stmt_start
 	test_stmt_expr_pragma_zeroinit_bypass();
 
-	// BUG: asm goto zeroinit CFG bypass
+	// asm goto zeroinit CFG bypass
 	test_asm_goto_zeroinit_rejected();
 
-	// BUG: CFG verifier P1K_CASE body_close_idx desync
+	// CFG verifier P1K_CASE body_close_idx desync
 	test_switch_for_init_not_rejected();
 
 	// emit_type_range stmt-expr bypass in struct bodies
@@ -4336,10 +4336,10 @@ void run_zeroinit_tests(void) {
 	test_float128x_zeroinit();
 	test_typeof_unqual_variants();
 
-	// BUG: case (expr): didn't reset at_stmt_start for zeroinit
+	// case (expr): didn't reset at_stmt_start for zeroinit
 	test_case_paren_expr_zeroinit();
 
-	// BUG: struct tag shadow bleed — inner clean struct not registered,
+	// struct tag shadow bleed — inner clean struct not registered,
 	// tag_lookup finds outer VLA/volatile struct, false CFG error
 	GNUC_ONLY(test_struct_tag_shadow_bleed());
 }

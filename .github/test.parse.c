@@ -1779,7 +1779,7 @@ void test_generic_default_collision(void) {
 		defer log_append("case1_cleanup");
 
 		// _Generic with default keyword - should NOT clear defer stack
-		// BUG: Prism sees "default" and clears the defer stack
+		// Prism sees "default" and clears the defer stack
 		int x = _Generic(type, int: 0, default: 1);
 
 		log_append("case1_body");
@@ -2785,7 +2785,7 @@ void test_keyword_typedef_collision(void) {
 
 // Regression: Prism keywords used as struct/union field names.
 // This is valid C — 'defer', 'orelse', 'raw' are not C keywords.
-// Bug: 'bool orelse;' in PrismFeatures struct triggered the error diagnostic.
+// 'bool orelse;' in PrismFeatures struct triggered the error diagnostic.
 struct _KeywordFields {
 	int defer;
 	int orelse;
@@ -4034,7 +4034,7 @@ void test_compound_literal_for_break(void) {
 	for (int i = 0; i < (int){10}; i++) {
 		defer log_append("D");
 		log_append("L");
-		if (i == 0) break; // BUG: defer must still execute on break!
+		if (i == 0) break; // defer must still execute on break!
 	}
 	CHECK_LOG("LD", "compound literal for loop: defer on break");
 }
@@ -6245,7 +6245,7 @@ static void test_filescope_t_mul(void) {
 	int saved_b = b;
 	{
 		defer log_append("D");
-		// BUG: _fscope_count_t ends in _t, no shadow at file scope.
+		// _fscope_count_t ends in _t, no shadow at file scope.
 		// Prism heuristic treats it as a type.
 		// '_fscope_count_t * b;' gets parsed as pointer decl '_fscope_count_t *b = 0;'
 		// which fails to compile (_fscope_count_t is int, not a type).
@@ -6675,7 +6675,7 @@ static void test_knr_param_shadow_no_poison(void) {
 	free(path);
 }
 
-// Bug: for-loop initializer shadow scope bounded to ')' instead of loop body end.
+// for-loop initializer shadow scope bounded to ')' instead of loop body end.
 // A variable that shadows a typedef in the for-init is not recognized as a
 // variable inside the body, so T * x is misinterpreted as a pointer declaration.
 static void test_for_init_typedef_shadow_body_scope(void) {
@@ -6697,7 +6697,7 @@ static void test_for_init_typedef_shadow_body_scope(void) {
 	prism_free(&r);
 }
 
-// Bug: braceless for body scanner stops at first ';', so if-else in
+// braceless for body scanner stops at first ';', so if-else in
 // a braceless for body has the else branch outside the shadow scope.
 // typedef int T; for (int T=0;..;T++) if(c) x=T; else T*x;
 // The 'T*x' in the else branch must NOT be treated as a declaration.
@@ -6721,7 +6721,7 @@ static void test_for_init_shadow_ifelse_body(void) {
 	prism_free(&r);
 }
 
-// Bug: goto into/out of GNU statement expressions is not rejected.
+// goto into/out of GNU statement expressions is not rejected.
 // This is undefined behavior per GCC documentation.
 static void test_goto_into_stmt_expr_rejected(void) {
 	const char *code =
@@ -6763,7 +6763,7 @@ static void expect_parse_rejects(const char *code, const char *file_name,
 }
 
 static void test_gnu_initializer_field_phony_label(void) {
-	// BUG: Phase 1D label detection fires for every at_stmt_start=true token.
+	// Phase 1D label detection fires for every at_stmt_start=true token.
 	// A GNU C old-style struct initializer uses `field: value` syntax inside
 	// initializer braces.  After the opening `{`, at_stmt_start is set to true.
 	// The `fld` token followed by `:` is then indistinguishable from a C label
@@ -6793,7 +6793,7 @@ static void test_gnu_initializer_field_phony_label(void) {
 }
 
 static void test_msvc_line_directive_no_flag3_leaks_system_headers(void) {
-	/* BUG: scan_line_directive() in parse.c sets is_system=true only when
+	/* scan_line_directive() in parse.c sets is_system=true only when
 	 * the GCC numeric line-directive flag '3' is present:  # N "file" 1 3
 	 *
 	 * MSVC's preprocessor (cl.exe /E) emits: #line N "file"  (no flags at all).
@@ -6996,7 +6996,7 @@ static void test_knr_param_typedef_shadow_bypass_zeroinit(void) {
 
 // skip_one_stmt label-fallthrough for-init shadow bleed
 //
-// BUG: skip_one_stmt() has no handler for case/default/ident labels.  When the
+// skip_one_stmt() has no handler for case/default/ident labels.  When the
 // function is called on a braceless switch body that begins with a label, it
 // falls through to the "simple statement" scanner.  That scanner ignores the
 // braced compound attached to the label (its depth counter goes 1→0 at the
@@ -7175,7 +7175,7 @@ static void test_auto_unreachable_no_inject_subexpr(void) {
 }
 
 static void test_auto_unreachable_stmtexpr_arg_premature(void) {
-	// Bug: boolean flag fires on first ';' inside statement expression argument
+	// boolean flag fires on first ';' inside statement expression argument
 	const char *code =
 	    "int do_something(void);\n"
 	    "void f(void) {\n"
@@ -7194,7 +7194,7 @@ static void test_auto_unreachable_stmtexpr_arg_premature(void) {
 }
 
 static void test_auto_unreachable_for_init_no_inject(void) {
-	// Bug: noreturn call in for-init generates '; __builtin_unreachable()' in header
+	// noreturn call in for-init generates '; __builtin_unreachable()' in header
 	const char *code =
 	    "void f(void) {\n"
 	    "    for (exit(1); ; ) {}\n"
@@ -7291,7 +7291,7 @@ static void test_auto_unreachable_decl_init_for_no_inject(void) {
 }
 
 static void test_auto_unreachable_member_dot_no_inject(void) {
-	// BUG: struct member named exit/abort/etc. falsely triggers unreachable
+	// struct member named exit/abort/etc. falsely triggers unreachable
 	// injection because TT_NORETURN_FN is tagged context-free via keyword_cache.
 	const char *code =
 	    "struct sm { int (*exit)(int); void (*abort)(void); };\n"
