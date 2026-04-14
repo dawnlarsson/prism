@@ -7274,14 +7274,11 @@ static void p1_full_depth_prescan(Token *tok) {
 					hashmap_put(&p1_func_proto_map, tok_loc(tok), tok->len, (void *)1);
 					is_func_decl = true;
 				} else {
-					uint32_t ti = tok_idx(tok);
-					if (ti > 0) {
-						Token *prev = &token_pool[ti - 1];
-						if ((prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE | TT_TYPEOF))
-						    || is_known_typedef(prev)) {
-							hashmap_put(&p1_func_proto_map, tok_loc(tok), tok->len, (void *)1);
-							is_func_decl = true;
-						}
+					Token *prev = walk_back_past_noise(tok_idx(tok));
+					if (prev && ((prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE | TT_TYPEOF))
+					    || is_known_typedef(prev))) {
+						hashmap_put(&p1_func_proto_map, tok_loc(tok), tok->len, (void *)1);
+						is_func_decl = true;
 					}
 				}
 				if (is_func_decl && FEAT(F_ORELSE) && tok_match(nx))
@@ -7477,9 +7474,8 @@ static void p1_full_depth_prescan(Token *tok) {
 				// to restore at_stmt_start for the body (labels, decls).
 				if (match_ch(tok, ')') && tok_match(tok)) {
 					uint32_t oi = tok_idx(tok_match(tok));
-					while (oi > 1 && token_pool[oi - 1].kind == TK_PREP_DIR)
-						oi--;
-					if (oi > 1 && (token_pool[oi - 1].tag & (TT_IF | TT_LOOP | TT_SWITCH))) {
+					Token *before_open = walk_back_past_noise(oi);
+					if (before_open && (before_open->tag & (TT_IF | TT_LOOP | TT_SWITCH))) {
 						at_stmt_start = true;
 						p1d_ctrl_pending = true;
 					}

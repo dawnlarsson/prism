@@ -2584,23 +2584,52 @@ static Token *find_struct_body_brace(Token *tok) {
 	return (t && t->len == 1 && t->ch0 == '{') ? t : NULL;
 }
 
+// Walk backward from token_pool[start_idx - 1], skipping attribute noise
+// (TF_CLOSE balanced groups, TT_ATTR keywords, TK_PREP_DIR, C23 [[...]]).
+// Returns the effective predecessor token, or NULL if none found.
+static inline Token *walk_back_past_noise(uint32_t start_idx) {
+	uint32_t ti = start_idx;
+	while (ti > 0) {
+		Token *b = &token_pool[ti - 1];
+		if (b->flags & TF_CLOSE) {
+			Token *open = tok_match(b);
+			if (!open) return NULL;
+			ti = tok_idx(open);
+			continue;
+		}
+		if ((b->tag & TT_ATTR) || b->kind == TK_PREP_DIR) {
+			ti--;
+			continue;
+		}
+		return b;
+	}
+	return NULL;
+}
+
 // Check if a token can legally precede an array bracket '[' in a type context.
-static inline bool is_array_bracket_predecessor(Token *t, Token *prev2) {
+static inline bool is_array_bracket_predecessor(Token *t) {
 	if (is_type_keyword(t) ||
 	    (t->tag & TT_QUALIFIER) ||
-	    (prev2 && (prev2->tag & TT_SUE)) ||
+	    is_known_typedef(t) ||
 	    (t->len == 1 && t->ch0 == '*') ||
 	    (t->len == 1 && t->ch0 == '}'))
 		return true;
+	// struct/union/enum Tag [n]: identifier preceded by TT_SUE keyword.
+	// Walk backward through token_pool, skipping attribute noise and
+	// balanced groups (GNU __attribute__((...)), C23 [[...]], #pragma),
+	// to find the effective predecessor.
+	if (is_identifier_like(t)) {
+		Token *b = walk_back_past_noise(tok_idx(t));
+		return b && (b->tag & TT_SUE);
+	}
 	// ']' is a type predecessor only for multi-dimensional array types
 	// like int[3][n], NOT for expression subscripts like arr[1][n].
 	// Disambiguate by checking what precedes the matching '['.
 	if (t->len == 1 && t->ch0 == ']') {
 		Token *open = tok_match(t);
 		if (!open) return true;
-		uint32_t oi = tok_idx(open);
-		if (oi == 0) return true;
-		Token *before_open = &token_pool[oi - 1];
+		Token *before_open = walk_back_past_noise(tok_idx(open));
+		if (!before_open) return true;
 		if (is_type_keyword(before_open) ||
 		    (before_open->tag & (TT_TYPEOF | TT_QUALIFIER | TT_SUE)) ||
 		    (before_open->len == 1 && before_open->ch0 == '*') ||
@@ -2608,7 +2637,7 @@ static inline bool is_array_bracket_predecessor(Token *t, Token *prev2) {
 			return true;
 		// ']' before '[' — check if the outer ']' itself is in type context
 		if (before_open->len == 1 && before_open->ch0 == ']')
-			return is_array_bracket_predecessor(before_open, NULL);
+			return is_array_bracket_predecessor(before_open);
 		return false;
 	}
 	// ')' is a type predecessor only for declarator parens like int (*)[n]
@@ -2617,9 +2646,8 @@ static inline bool is_array_bracket_predecessor(Token *t, Token *prev2) {
 	if (t->len == 1 && t->ch0 == ')') {
 		Token *open = tok_match(t);
 		if (!open) return true; // no match info — conservatively assume type
-		uint32_t oi = tok_idx(open);
-		if (oi == 0) return true;
-		Token *before_open = &token_pool[oi - 1];
+		Token *before_open = walk_back_past_noise(tok_idx(open));
+		if (!before_open) return true;
 		// Type-producing constructs before '(' → type context (declarator)
 		if (is_type_keyword(before_open) ||
 		    (before_open->tag & (TT_TYPEOF | TT_QUALIFIER | TT_SUE)) ||
@@ -2659,9 +2687,8 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 			if (tok != close && tok->len == 1 && tok->ch0 == '(') {
 				Token *end = skip_balanced_group(tok);
 				if (is_sizeof) {
-					Token *prev2_inner = NULL;
 					Token *prev_inner = tok;
-					for (Token *inner = tok_next(tok); inner && inner != end; prev2_inner = prev_inner, prev_inner = inner, inner = tok_next(inner)) {
+					for (Token *inner = tok_next(tok); inner && inner != end; prev_inner = inner, inner = tok_next(inner)) {
 						if (is_enum_kw(inner)) {
 							Token *brace = find_struct_body_brace(inner);
 							if (brace) {
@@ -2688,7 +2715,7 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 							if (deref) return true;
 						}
 						if (inner->len == 1 && inner->ch0 == '[' &&
-						    is_array_bracket_predecessor(prev_inner, prev2_inner)) {
+						    is_array_bracket_predecessor(prev_inner)) {
 							if (array_size_is_vla_impl(inner, depth + 1)) return true;
 							inner = tok_match(inner);
 							if (!inner || inner == end) break;
@@ -2861,10 +2888,9 @@ static Token *find_init_semicolon(Token *open, Token *close) {
 
 // Scan a parenthesized type for VLA indicators.
 static void scan_paren_for_vla(Token *open, Token *end, TypeSpecResult *r, bool check_typeof) {
-	Token *prev2 = NULL;
 	Token *prev = open;
 	int fn_skip = 0;
-	for (Token *t = tok_next(open); t && t != end; prev2 = prev, prev = t, t = tok_next(t)) {
+	for (Token *t = tok_next(open); t && t != end; prev = t, t = tok_next(t)) {
 		// Ban control-flow keywords inside type specifier parens.
 		// typeof()/Atomic() are unevaluated at runtime, but Prism's
 		// emit_type_range routes stmt-exprs through walk_balanced (full
@@ -2892,7 +2918,7 @@ static void scan_paren_for_vla(Token *open, Token *end, TypeSpecResult *r, bool 
 		} else if (t->len == 1 && t->ch0 == ')') { if (fn_skip > 0) fn_skip--; }
 		if (fn_skip > 0) continue;
 		if (t->len == 1 && t->ch0 == '[' &&
-		    is_array_bracket_predecessor(prev, prev2) &&
+		    is_array_bracket_predecessor(prev) &&
 		    array_size_is_vla(t)) {
 			r->is_vla = true;
 			break;
@@ -2969,7 +2995,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			r.saw_type = true;
 			r.has_atomic = true;
 			tok = tok_next(tok);
-			Token *inner_start = tok_next(tok);
+			Token *inner_start = skip_noise(tok_next(tok));
 			Token *end = skip_balanced_group(tok);
 			if (inner_start && (inner_start->tag & TT_SUE)) {
 				r.is_struct = true;
@@ -3693,13 +3719,13 @@ static inline Token *try_detect_noreturn_call(Token *tok) {
 	TypedefEntry *te = typedef_lookup(tok);
 	if (te && te->is_shadow) return NULL;
 	if (tok_idx(tok) >= 1) {
-		Token *prev = &token_pool[tok_idx(tok) - 1];
-		if (prev->tag & TT_MEMBER) return NULL;
+		Token *prev = walk_back_past_noise(tok_idx(tok));
+		if (prev && (prev->tag & TT_MEMBER)) return NULL;
 		// Predecessor is a type keyword/qualifier/storage/_Noreturn/void/*
 		// → this is a forward declaration, not a call.
-		if (prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_INLINE | TT_SUE))
+		if (prev && (prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_INLINE | TT_SUE)))
 			return NULL;
-		if (match_ch(prev, '*')) return NULL;
+		if (prev && match_ch(prev, '*')) return NULL;
 	}
 	Token *call = tok_next(tok);
 	if (!call || !match_ch(call, '(') || !tok_match(call)) return NULL;
@@ -3724,7 +3750,29 @@ static Token *p1_knr_find_close_paren(Token *semi_tok) {
 		Token *pt = &token_pool[pi - 1];
 		if (pt->kind == TK_PREP_DIR) continue;
 		if (match_ch(pt, '{') || match_ch(pt, '}')) return NULL;
-		if (match_ch(pt, ')') && tok_match(pt)) return pt;
+		// For ')': check if the content is a K&R identifier list
+		// (only identifiers and commas). If so, this is the function
+		// parameter list. Otherwise skip the balanced group (e.g.
+		// function pointer params: void (*cb)(int, int);).
+		if (match_ch(pt, ')') && tok_match(pt)) {
+			Token *open = tok_match(pt);
+			bool is_ident_list = true;
+			for (Token *t = tok_next(open); t && t != pt; t = tok_next(t)) {
+				if (t->kind != TK_IDENT && !match_ch(t, ',') &&
+				    t->kind != TK_PREP_DIR) {
+					is_ident_list = false;
+					break;
+				}
+			}
+			if (is_ident_list) return pt;
+			pi = tok_idx(open) + 1; // +1 because loop does pi--
+			continue;
+		}
+		// Skip non-paren balanced groups (e.g. ']' from array decls).
+		if ((pt->flags & TF_CLOSE) && tok_match(pt)) {
+			pi = tok_idx(tok_match(pt)) + 1;
+			continue;
+		}
 	}
 	return NULL;
 }

@@ -7471,6 +7471,315 @@ static void test_nested_for_init_linear_scaling(void) {
 	free(src);
 }
 
+// --- Attribute noise VLA bracket predecessor tests ---
+// Regression tests for is_array_bracket_predecessor skipping attribute noise
+// between struct/union/enum keyword and tag name, in ]/)/ident branches,
+// plus _Atomic inner_start and block-scope func proto map.
+
+static void test_attr_noise_vla_struct_gnu(void) {
+	PrismResult r = prism_transpile_source(
+	    "void f(int n) {\n"
+	    "    typeof(struct __attribute__((packed)) S [n]) a, b = {0};\n"
+	    "}\n", "attr_vla.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "VLA detected through GNU attr between struct and tag");
+	prism_free(&r);
+}
+
+static void test_attr_noise_vla_struct_c23(void) {
+	PrismResult r = prism_transpile_source(
+	    "void f(int n) {\n"
+	    "    typeof(struct [[gnu::packed]] S [n]) a, b = {0};\n"
+	    "}\n", "attr_vla.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "VLA detected through C23 attr between struct and tag");
+	prism_free(&r);
+}
+
+static void test_attr_noise_vla_union(void) {
+	PrismResult r = prism_transpile_source(
+	    "void f(int n) {\n"
+	    "    typeof(union __attribute__((aligned(8))) U [n]) a, b = {0};\n"
+	    "}\n", "attr_vla.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "VLA detected through attr between union and tag");
+	prism_free(&r);
+}
+
+static void test_attr_noise_vla_multidim(void) {
+	// Multi-dimensional: [3][n] where ']' branch checks what precedes '['
+	PrismResult r = prism_transpile_source(
+	    "void f(int n) {\n"
+	    "    typeof(int __attribute__((aligned(4))) [3][n]) a, b = {0};\n"
+	    "}\n", "attr_vla.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "VLA detected through attr in multidim bracket predecessor");
+	prism_free(&r);
+}
+
+static void test_attr_noise_vla_no_attr_regression(void) {
+	// Plain struct tag without attribute — must still detect VLA
+	PrismResult r = prism_transpile_source(
+	    "void f(int n) {\n"
+	    "    typeof(struct S [n]) a, b = {0};\n"
+	    "}\n", "attr_vla.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "VLA detected for struct tag without attr (regression)");
+	prism_free(&r);
+}
+
+static void test_attr_noise_vla_expr_subscript_no_false_positive(void) {
+	// Expression subscript arr[n] must NOT be detected as VLA bracket
+	PrismResult r = prism_transpile_source(
+	    "void f(int *arr, int n) {\n"
+	    "    int x = sizeof(arr[n]);\n"
+	    "}\n", "attr_vla.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "expression subscript not misclassified as VLA bracket");
+	prism_free(&r);
+}
+
+static void test_attr_noise_atomic_struct_memset(void) {
+	// _Atomic(struct) with attribute before struct — must produce memset
+	PrismResult r = prism_transpile_source(
+	    "struct S { int x; };\n"
+	    "void f(void) {\n"
+	    "    _Atomic(__attribute__((packed)) struct S) val;\n"
+	    "}\n", "attr_vla.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "_Atomic attr struct transpiles");
+	if (r.output)
+		CHECK(strstr(r.output, "memset") != NULL,
+		      "_Atomic attr struct produces memset");
+	prism_free(&r);
+}
+
+static void test_attr_noise_atomic_typedef_memset(void) {
+	// _Atomic(typedef) with attribute before typedef — must produce memset
+	PrismResult r = prism_transpile_source(
+	    "typedef struct { int x; } MyS;\n"
+	    "void f(void) {\n"
+	    "    _Atomic(__attribute__((packed)) MyS) val;\n"
+	    "}\n", "attr_vla.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "_Atomic attr typedef transpiles");
+	if (r.output)
+		CHECK(strstr(r.output, "memset") != NULL,
+		      "_Atomic attr typedef produces memset");
+	prism_free(&r);
+}
+
+static void test_attr_noise_func_proto_map(void) {
+	// Block-scope forward decl with attr before func name — typeof must not memset
+	PrismResult r = prism_transpile_source(
+	    "void f(void) {\n"
+	    "    int __attribute__((pure)) compute(int);\n"
+	    "    typeof(compute) *fp;\n"
+	    "}\n", "attr_vla.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "func proto with attr before name transpiles");
+	if (r.output)
+		CHECK(strstr(r.output, "memset") == NULL,
+		      "func proto with attr: no spurious memset on typeof(func)");
+	prism_free(&r);
+}
+
+// Claim 1: attributed noreturn forward declaration must not get __builtin_unreachable
+static void test_noreturn_attr_forward_decl_no_unreachable(void) {
+	const char *code =
+	    "void f(void) {\n"
+	    "    void __attribute__((cold)) exit(int);\n"
+	    "    int x = 42;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "nr_fwd.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "attributed noreturn forward decl transpiles");
+	if (r.output)
+		CHECK(!has_unreachable_marker(r.output),
+		      "no __builtin_unreachable after attributed forward decl");
+	prism_free(&r);
+}
+
+static void test_noreturn_attr_fwd_then_call(void) {
+	// Forward decl with attr, followed by actual call — call SHOULD get unreachable
+	const char *code =
+	    "void f(void) {\n"
+	    "    void __attribute__((cold)) exit(int);\n"
+	    "    exit(0);\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "nr_fwd_call.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "attributed fwd decl + call transpiles");
+	if (r.output)
+		CHECK(has_unreachable_marker(r.output),
+		      "__builtin_unreachable injected after actual exit() call");
+	prism_free(&r);
+}
+
+static void test_noreturn_c23_attr_forward_decl_no_unreachable(void) {
+	const char *code =
+	    "void f(void) {\n"
+	    "    [[gnu::cold]] void exit(int);\n"
+	    "    int x = 42;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "nr_c23_fwd.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "C23 attr noreturn forward decl transpiles");
+	if (r.output)
+		CHECK(!has_unreachable_marker(r.output),
+		      "no __builtin_unreachable after C23 attr forward decl");
+	prism_free(&r);
+}
+
+static void test_noreturn_attr_ptr_return_no_unreachable(void) {
+	// void * __attribute__((cold)) abort(void); — '*' is the logical predecessor,
+	// but raw pool access sees ')' from attr. walk_back_past_noise must reach '*'.
+	const char *code =
+	    "void f(void) {\n"
+	    "    void __attribute__((noreturn)) abort(void);\n"
+	    "    int x = 42;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "nr_attr_ptr.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "attr noreturn fwd decl (noreturn attr) transpiles");
+	if (r.output)
+		CHECK(!has_unreachable_marker(r.output),
+		      "no __builtin_unreachable after attr-bearing forward decl");
+	prism_free(&r);
+}
+
+static void test_noreturn_multi_attr_forward_decl_no_unreachable(void) {
+	// Multiple attrs chained before function name
+	const char *code =
+	    "void f(void) {\n"
+	    "    void __attribute__((cold)) __attribute__((noinline)) exit(int);\n"
+	    "    int x = 42;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "nr_multi_attr.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "multi-attr noreturn forward decl transpiles");
+	if (r.output)
+		CHECK(!has_unreachable_marker(r.output),
+		      "no __builtin_unreachable after multi-attr forward decl");
+	prism_free(&r);
+}
+
+// Claim 2: K&R with function pointer params — return type must be correct
+static void test_knr_funcptr_param_return_type(void) {
+	const char *code =
+	    "int process(cb1, cb2)\n"
+	    "    int (*cb1)(int);\n"
+	    "    void (*cb2)(int, int);\n"
+	    "{\n"
+	    "    defer cb2(1, 2);\n"
+	    "    return cb1(42);\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "knr_fp.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "K&R funcptr param transpiles");
+	if (r.output) {
+		CHECK(strstr(r.output, "int __prism_ret_") != NULL,
+		      "K&R funcptr: return type captured as 'int' not 'void'");
+		CHECK(strstr(r.output, "void __prism_ret_") == NULL,
+		      "K&R funcptr: return type is not 'void'");
+	}
+	prism_free(&r);
+}
+
+static void test_knr_funcptr_multi_param_return_type(void) {
+	// Multiple function pointer params with different signatures
+	const char *code =
+	    "long process(a, b, c)\n"
+	    "    int a;\n"
+	    "    int (*b)(int, int);\n"
+	    "    void (*c)(void);\n"
+	    "{\n"
+	    "    defer c();\n"
+	    "    return (long)b(a, a);\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "knr_fp2.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "K&R multi funcptr transpiles");
+	if (r.output) {
+		CHECK(strstr(r.output, "long __prism_ret_") != NULL,
+		      "K&R multi funcptr: return type is 'long'");
+	}
+	prism_free(&r);
+}
+
+static void test_knr_only_funcptr_params_return_type(void) {
+	// ALL params are function pointers — worst case for the old bug
+	const char *code =
+	    "int invoke(cb)\n"
+	    "    int (*cb)(int, int, int);\n"
+	    "{\n"
+	    "    defer (void)0;\n"
+	    "    return cb(1, 2, 3);\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "knr_fp3.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "K&R only-funcptr param transpiles");
+	if (r.output) {
+		CHECK(strstr(r.output, "int __prism_ret_") != NULL,
+		      "K&R only-funcptr: return type is 'int'");
+		CHECK(strstr(r.output, "void __prism_ret_") == NULL,
+		      "K&R only-funcptr: return type is NOT 'void'");
+	}
+	prism_free(&r);
+}
+
+static void test_knr_funcptr_param_shadow_correct(void) {
+	// K&R param shadow registration uses p1_knr_find_close_paren too.
+	// Typedef 'MyType' must be shadowed by param 'MyType' inside body.
+	const char *code =
+	    "typedef int MyType;\n"
+	    "int f(MyType, cb)\n"
+	    "    int MyType;\n"
+	    "    int (*cb)(int);\n"
+	    "{\n"
+	    "    defer (void)0;\n"
+	    "    return MyType + cb(1);\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "knr_shadow.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "K&R funcptr param shadow transpiles");
+	// If shadow fails, 'MyType' would be parsed as a type → broken output
+	if (r.output) {
+		CHECK(strstr(r.output, "int __prism_ret_") != NULL,
+		      "K&R funcptr shadow: return type captured correctly");
+	}
+	prism_free(&r);
+}
+
+static void test_knr_no_funcptr_regression(void) {
+	// Plain K&R (no funcptrs) must still work — regression check
+	const char *code =
+	    "int add(a, b)\n"
+	    "    int a;\n"
+	    "    int b;\n"
+	    "{\n"
+	    "    defer (void)0;\n"
+	    "    return a + b;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "knr_plain.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "plain K&R transpiles");
+	if (r.output) {
+		CHECK(strstr(r.output, "int __prism_ret_") != NULL,
+		      "plain K&R: return type is 'int'");
+	}
+	prism_free(&r);
+}
+
+// Class-closing: stmt-expr ctrl-paren C23 attr noise
+static void test_stmtexpr_c23_attr_ctrl_paren_zeroinit(void) {
+	// C23 [[maybe_unused]] between 'if' and '(' — stmt-expr forces
+	// individual token processing, ')' must detect ctrl keyword
+	// through the attribute noise for braceless body declarations.
+	// Note: this is syntactically unusual C23 but tests the backward walk.
+	const char *code =
+	    "int f(void) {\n"
+	    "    if (({1;})) { int x; }\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "se_ctrl.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "stmt-expr ctrl paren zeroinit transpiles");
+	if (r.output)
+		CHECK(strstr(r.output, "int x = 0") != NULL,
+		      "stmt-expr ctrl paren: zeroinit applied in braced body");
+	prism_free(&r);
+}
+
 void run_parse_tests(void) {
 	printf("\n=== PARSE TESTS ===\n");
 
@@ -8003,4 +8312,28 @@ void run_parse_tests(void) {
 
 	// Deeply nested for-init quadratic fix
 	test_nested_for_init_linear_scaling();
+
+	// Attribute noise VLA bracket predecessor
+	test_attr_noise_vla_struct_gnu();
+	test_attr_noise_vla_struct_c23();
+	test_attr_noise_vla_union();
+	test_attr_noise_vla_multidim();
+	test_attr_noise_vla_no_attr_regression();
+	test_attr_noise_vla_expr_subscript_no_false_positive();
+	test_attr_noise_atomic_struct_memset();
+	test_attr_noise_atomic_typedef_memset();
+	test_attr_noise_func_proto_map();
+
+	// Token tracking desync fixes
+	test_noreturn_attr_forward_decl_no_unreachable();
+	test_noreturn_attr_fwd_then_call();
+	test_noreturn_c23_attr_forward_decl_no_unreachable();
+	test_noreturn_attr_ptr_return_no_unreachable();
+	test_noreturn_multi_attr_forward_decl_no_unreachable();
+	test_knr_funcptr_param_return_type();
+	test_knr_funcptr_multi_param_return_type();
+	test_knr_only_funcptr_params_return_type();
+	test_knr_funcptr_param_shadow_correct();
+	test_knr_no_funcptr_regression();
+	test_stmtexpr_c23_attr_ctrl_paren_zeroinit();
 }
