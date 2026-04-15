@@ -6589,6 +6589,74 @@ static void test_defer_chained_orelse_control_flow_leak(void) {
 	}
 }
 
+// Enum body inside defer block: enum constants at brace_depth+1 caused
+// defer_body_populate_captures to lose track of in_decl state, producing
+// false shadow errors when a subsequent variable reused an enum constant name.
+static void test_defer_body_enum_constant_shadow(void) {
+	printf("\n--- defer body enum constant shadow ---\n");
+
+	// Case 1: basic enum inside defer body, reuse constant name after
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    defer cleanup();\n"
+		    "    defer { enum { A = 1, B = 2 }; };\n"
+		    "    int B = 5;\n"
+		    "    (void)B;\n"
+		    "}\n",
+		    "enum_body1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "enum-body-basic: no false shadow");
+		prism_free(&r);
+	}
+
+	// Case 2: tagged enum inside defer body
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    defer cleanup();\n"
+		    "    defer { enum Color { R, G, B }; };\n"
+		    "    int G = 10;\n"
+		    "    (void)G;\n"
+		    "}\n",
+		    "enum_body2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "enum-body-tagged: no false shadow");
+		prism_free(&r);
+	}
+
+	// Case 3: attributed enum inside defer body (GCC)
+	{
+		PrismResult r = prism_transpile_source(
+		    "void cleanup(void);\n"
+		    "void f(void) {\n"
+		    "    defer cleanup();\n"
+		    "    defer { enum __attribute__((packed)) E { X, Y, Z }; };\n"
+		    "    int Y = 7;\n"
+		    "    (void)Y;\n"
+		    "}\n",
+		    "enum_body3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "enum-body-attributed: no false shadow");
+		prism_free(&r);
+	}
+
+	// Case 4: real shadow must still be caught — variable (not enum const)
+	// captured by defer, then shadowed in same scope
+	{
+		PrismResult r = prism_transpile_source(
+		    "void use(int);\n"
+		    "void f(void) {\n"
+		    "    int val = 1;\n"
+		    "    defer use(val);\n"
+		    "    int val = 2;\n"
+		    "    (void)val;\n"
+		    "}\n",
+		    "enum_body4.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "real-shadow: still detected");
+		prism_free(&r);
+	}
+}
+
 static void test_defer_fno_orelse_paren_leak(void) {
 	printf("\n--- -fno-orelse defer paren leak ---\n");
 	PrismFeatures f = prism_defaults();
@@ -6950,4 +7018,7 @@ void run_defer_tests(void) {
 
 	// -fno-orelse must not disable defer-in-parens validation
 	test_defer_fno_orelse_paren_leak();
+
+	// enum body inside defer: constants at brace_depth+1 false shadow
+	GNUC_ONLY(test_defer_body_enum_constant_shadow());
 }

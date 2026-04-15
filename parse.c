@@ -3061,6 +3061,18 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 				if (!is_unqual) {
 					bool saw_sue = false;
 					for (Token *t = tok_next(tok); t && t != end; t = tok_next(t)) {
+						// Skip attribute groups — they contain
+						// identifier-like tokens (e.g. 'packed')
+						// that would consume saw_sue.
+						if ((t->tag & TT_ATTR) && tok_next(t) &&
+						    match_ch(tok_next(t), '(') && tok_match(tok_next(t))) {
+							t = tok_match(tok_next(t));
+							continue;
+						}
+						if (is_c23_attr(t) && tok_match(t)) {
+							t = tok_match(t);
+							continue;
+						}
 						if (t->tag & TT_VOLATILE) r.has_volatile = true;
 						if (t->tag & TT_CONST) r.has_const = true;
 						if ((t->tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE))

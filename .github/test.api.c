@@ -7722,6 +7722,150 @@ static void test_proto_param_vla_orelse_rejected(void) {
 	}
 }
 
+/* Block-scoped function pointers can legally return VM types (int(*)[n]) —
+ * typeof(fp()) evaluates fp() at runtime for VM types (C11 §6.7.2.4p2).
+ * is_strictly_bare_call must NOT bypass the side-effect check for unknown
+ * callers (function pointer variables), only for known function declarations. */
+static void test_vm_func_ptr_bare_orelse_rejection(void) {
+	printf("\n--- VM function pointer bare orelse rejection ---\n");
+
+	/* Case 1: unknown function pointer — MUST be rejected */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void process(int n) {\n"
+		    "    int (*(*fp)(void))[n];\n"
+		    "    int (*ptr)[n];\n"
+		    "    *ptr = fp() orelse 0;\n"
+		    "}\n",
+		    "vm_fp1.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "vm-fp: unknown function pointer call must be rejected "
+		      "(typeof(fp()) may double-eval for VM return types)");
+		prism_free(&r);
+	}
+
+	/* Case 2: known function declaration — must PASS */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void *get_buf(int n);\n"
+		    "void process(void) {\n"
+		    "    int *ptr;\n"
+		    "    *ptr = get_buf(4) orelse 0;\n"
+		    "}\n",
+		    "vm_fp2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "vm-fp: known function call with LHS indirection must pass");
+		prism_free(&r);
+	}
+
+	/* Case 3: no LHS indirection, unknown fp — must PASS (typeof(LHS) used) */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void process(int n) {\n"
+		    "    int (*(*fp)(void))[n];\n"
+		    "    int (*result)[n];\n"
+		    "    result = fp() orelse 0;\n"
+		    "}\n",
+		    "vm_fp3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "vm-fp: no LHS indirection uses typeof(LHS), fp call is safe");
+		prism_free(&r);
+	}
+
+	/* Case 4: known function, chained orelse with LHS indirection */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void *malloc(unsigned long);\n"
+		    "void *calloc(unsigned long, unsigned long);\n"
+		    "void f(void) {\n"
+		    "    int *ptr;\n"
+		    "    *ptr = malloc(4) orelse calloc(1,4) orelse 0;\n"
+		    "}\n",
+		    "vm_fp4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "vm-fp: chained known functions with LHS indirection must pass");
+		prism_free(&r);
+	}
+}
+
+/* collect_source_defines extracted #define values containing block comments
+ * without stripping them.  The raw slash-star leaked into the output, causing
+ * the backend compiler to see an unterminated comment. */
+static void test_collect_source_defines_inline_block_comment_value(void) {
+	printf("\n--- inline block comment in #define value ---\n");
+
+	/* Case 1: inline block comment in #define value */
+	{
+		char *path = create_temp_file(
+		    "#define INLINE_VAL 100 /* inline comment */ + 200\n"
+		    "#include <stddef.h>\n"
+		    "int x = INLINE_VAL;\n");
+		CHECK(path != NULL, "inline-val-comment: create temp file");
+		if (!path) return;
+		PrismFeatures feat = prism_defaults();
+		feat.flatten_headers = false;
+		PrismResult r = prism_transpile_file(path, feat);
+		CHECK_EQ(r.status, PRISM_OK, "inline-val-comment: transpiles OK");
+		if (r.output) {
+			/* The comment must be stripped from the value, not emit raw /* */
+			CHECK(strstr(r.output, "/*") == NULL ||
+			      strstr(r.output, "/* inline comment */") == NULL,
+			      "inline-val-comment: block comment stripped from #define value");
+		}
+		prism_free(&r);
+		unlink(path); free(path);
+	}
+
+	/* Case 2: multi-line block comment spanning from #define value */
+	{
+		char *path = create_temp_file(
+		    "#define MULTI_VAL /* multi-line\n"
+		    "   comment here */ 42\n"
+		    "#include <stddef.h>\n"
+		    "int y = MULTI_VAL;\n");
+		CHECK(path != NULL, "multi-val-comment: create temp file");
+		if (!path) return;
+		PrismFeatures feat = prism_defaults();
+		feat.flatten_headers = false;
+		PrismResult r = prism_transpile_file(path, feat);
+		CHECK_EQ(r.status, PRISM_OK, "multi-val-comment: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "MULTI_VAL") != NULL,
+			      "multi-val-comment: define is re-emitted");
+			/* Value should be 42 with comment stripped, not contain /* */
+			char *hit = strstr(r.output, "#define MULTI_VAL");
+			if (hit) {
+				CHECK(strstr(hit, "42") != NULL,
+				      "multi-val-comment: value 42 preserved after comment strip");
+			}
+		}
+		prism_free(&r);
+		unlink(path); free(path);
+	}
+
+	/* Case 3: comment-only #define value — define preserved as empty */
+	{
+		char *path = create_temp_file(
+		    "#define EMPTY_VAL /* all comment */\n"
+		    "#include <stddef.h>\n"
+		    "#ifdef EMPTY_VAL\n"
+		    "int z = 1;\n"
+		    "#endif\n");
+		CHECK(path != NULL, "empty-val-comment: create temp file");
+		if (!path) return;
+		PrismFeatures feat = prism_defaults();
+		feat.flatten_headers = false;
+		PrismResult r = prism_transpile_file(path, feat);
+		CHECK_EQ(r.status, PRISM_OK, "empty-val-comment: transpiles OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "EMPTY_VAL") != NULL,
+			      "empty-val-comment: define name preserved");
+		}
+		prism_free(&r);
+		unlink(path); free(path);
+	}
+}
+
 void run_api_tests_4(void) {
 	printf("\n=== API TESTS (group 4) ===\n");
 	test_collect_source_defines_long_line_truncation();
@@ -7786,6 +7930,12 @@ void run_api_tests_4(void) {
 	test_bitfield_raw_leak();
 	test_c23_enum_fixed_underlying_type();
 	test_proto_param_vla_orelse_rejected();
+
+	// VM function pointer double-eval via typeof(RHS) bypass
+	test_vm_func_ptr_bare_orelse_rejection();
+
+	// Block comment inside #define value must be stripped (not emitted as unterminated /*)
+	test_collect_source_defines_inline_block_comment_value();
 
 #ifdef __APPLE__
 	// _DARWIN_C_SOURCE regression: netinet/ip.h uses u_int/u_char/u_short

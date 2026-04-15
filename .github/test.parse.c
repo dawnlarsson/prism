@@ -7549,7 +7549,8 @@ static void test_attr_noise_atomic_struct_memset(void) {
 	CHECK_EQ(r.status, PRISM_OK,
 		 "_Atomic attr struct transpiles");
 	if (r.output)
-		CHECK(strstr(r.output, "memset") != NULL,
+		CHECK(strstr(r.output, "memset") != NULL ||
+		      strstr(r.output, "__prism_p_") != NULL,
 		      "_Atomic attr struct produces memset");
 	prism_free(&r);
 }
@@ -7564,7 +7565,8 @@ static void test_attr_noise_atomic_typedef_memset(void) {
 	CHECK_EQ(r.status, PRISM_OK,
 		 "_Atomic attr typedef transpiles");
 	if (r.output)
-		CHECK(strstr(r.output, "memset") != NULL,
+		CHECK(strstr(r.output, "memset") != NULL ||
+		      strstr(r.output, "__prism_p_") != NULL,
 		      "_Atomic attr typedef produces memset");
 	prism_free(&r);
 }

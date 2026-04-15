@@ -1064,15 +1064,21 @@ static void defer_body_populate_captures(Token *body, Token *body_end,
 	bool in_decl = false, was_in_decl = false;
 	int decl_bd = 0, for_init_pd = -1;
 	Token *for_header_open = NULL;
+	int enum_bd = -1; // brace depth of enum body (-1 = not in enum)
+	bool decl_is_enum = false; // current in_decl triggered by enum keyword
 
 	for (Token *t = body; t && t != body_end && t->kind != TK_EOF;
 	     prev = t, t = tok_next(t)) {
 		if (match_ch(t, '{')) {
 			if (bd < 255) block_base_pd[bd + 1] = pd;
+			// Track enum body: in_decl was set by an enum keyword
+			if (in_decl && decl_is_enum && enum_bd < 0)
+				enum_bd = bd + 1;
 			bd++; continue;
 		}
 		if (match_ch(t, '}')) {
 			bd--;
+			if (enum_bd >= 0 && bd < enum_bd) enum_bd = -1;
 			if (in_decl && bd < decl_bd) in_decl = false;
 			// Reset local declarations that go out of scope.
 			while (se_count > 0 && se_stack[se_count - 1].depth > bd) {
@@ -1103,17 +1109,22 @@ static void defer_body_populate_captures(Token *body, Token *body_end,
 			continue;
 		}
 		if (match_ch(t, ';')) {
-			in_decl = false; was_in_decl = false;
+			in_decl = false; was_in_decl = false; decl_is_enum = false;
 			if (for_init_pd >= 0 && pd == for_init_pd) for_init_pd = -1;
 			continue;
 		}
 		int bpd = (bd > 0) ? block_base_pd[bd] : 0;
 		if (pd == bpd && match_ch(t, '=')) { in_decl = false; continue; }
-		if (pd == bpd && match_ch(t, ',') && was_in_decl && bd == decl_bd) { in_decl = true; continue; }
+		if (pd == bpd && match_ch(t, ',') && was_in_decl &&
+		    (bd == decl_bd || (enum_bd >= 0 && bd == enum_bd))) { in_decl = true; continue; }
 		if (((bd > 0 && pd == bpd) ||
 		     (for_init_pd >= 0 && pd == for_init_pd)) &&
 		    (is_type_keyword(t) || (t->tag & (TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_TYPEDEF)))) {
-			in_decl = true; was_in_decl = true; decl_bd = bd; continue;
+			if (!in_decl) decl_is_enum = false;
+			in_decl = true; was_in_decl = true; decl_bd = bd;
+			if ((t->tag & TT_SUE) && t->ch0 == 'e')
+				decl_is_enum = true;
+			continue;
 		}
 		if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
 		    !(prev && (prev->tag & TT_MEMBER))) {
@@ -1331,6 +1342,10 @@ static inline bool is_orelse_keyword(Token *tok) {
 // variably modified (C11 §6.7.6.3p1), so typeof(f(...)) never evaluates
 // f() at runtime.  Cast expressions are NOT exempt: (T)f() can introduce
 // a VM type (pointer-to-VLA), causing typeof() to evaluate the operand.
+// Additionally, the callee must be a known function declaration (via
+// p1_func_proto_map) — not a function pointer variable.  Block-scoped
+// function pointers can legally have VM return types (e.g. int (*)[n]),
+// and typeof() WOULD evaluate those at runtime (C11 §6.7.2.4p2).
 static bool is_strictly_bare_call(Token *start, Token *end) {
 	Token *t = start;
 	while (t && t != end && t->kind == TK_PREP_DIR) t = tok_next(t);
@@ -1343,7 +1358,13 @@ static bool is_strictly_bare_call(Token *start, Token *end) {
 	if (!close) return false;
 	t = tok_next(close);
 	while (t && t != end && t->kind == TK_PREP_DIR) t = tok_next(t);
-	return t == end;
+	if (t != end) return false;
+	// Verify the callee is a known function declaration, not a function
+	// pointer variable.  Functions with external/internal linkage cannot
+	// return VM types (C11 §6.7.6.2p2).  Block-scoped function pointer
+	// variables CAN have VM return types (no linkage, block scope), so
+	// typeof(fp()) may evaluate fp() at runtime.
+	return hashmap_get(&p1_func_proto_map, tok_loc(fn), fn->len) != NULL;
 }
 
 // Reject side effects on the LHS of an orelse expression that would be duplicated.
@@ -3030,6 +3051,19 @@ static bool is_typeof_func_type(Token *type_start, TypeSpecResult *type, DeclRes
 					if ((fs->tag & TT_TYPEOF) && tok_next(fs) &&
 					    match_ch(tok_next(fs), '(') && tok_match(tok_next(fs))) {
 						fs = tok_match(tok_next(fs));
+						continue;
+					}
+					// Skip attribute groups — __attribute__((packed)) etc.
+					// The '(' after TT_ATTR is an attribute argument list,
+					// not a function parameter list.
+					if ((fs->tag & TT_ATTR) && tok_next(fs) &&
+					    match_ch(tok_next(fs), '(') && tok_match(tok_next(fs))) {
+						fs = tok_match(tok_next(fs));
+						continue;
+					}
+					// Skip C23 [[...]] attributes
+					if (is_c23_attr(fs) && tok_match(fs)) {
+						fs = tok_match(fs);
 						continue;
 					}
 					if (match_ch(fs, '(')) {
@@ -4969,6 +5003,106 @@ static void collect_source_defines(const char *input_file) {
 				}
 			}
 
+			// Strip block comments from value.
+			// C translation phase 3 replaces comments before directives.
+			// A value like "/* comment\n   continued */ 42" should become " 42".
+			{
+				// Work on a mutable copy if we don't have one already
+				char *val = full_val;
+				int vlen = val ? full_val_len : val_len;
+				if (!val && vlen > 0) {
+					val = malloc(vlen + 1);
+					if (!val) { free(saved_name); goto check_continuation; }
+					memcpy(val, val_start, vlen);
+					val[vlen] = '\0';
+				}
+				// Scan for /* in the value
+				bool modified = false;
+				if (val) {
+					for (int vi = 0; vi < vlen - 1; vi++) {
+						// Skip string literals
+						if (val[vi] == '"' || val[vi] == '\'') {
+							char q = val[vi++];
+							while (vi < vlen && val[vi] != q) {
+								if (val[vi] == '\\' && vi + 1 < vlen) vi++;
+								vi++;
+							}
+							continue;
+						}
+						// Skip line comments
+						if (val[vi] == '/' && val[vi + 1] == '/') break;
+						if (val[vi] == '/' && val[vi + 1] == '*') {
+							int cs = vi; // comment start
+							vi += 2;
+							// Find */ in current value
+							char *close = NULL;
+							for (int ci = vi; ci < vlen - 1; ci++) {
+								if (val[ci] == '*' && val[ci + 1] == '/') {
+									close = val + ci;
+									break;
+								}
+							}
+							if (close) {
+								// Fully contained — replace with space
+								int ce = (int)(close - val) + 2;
+								memmove(val + cs + 1, val + ce, vlen - ce);
+								vlen -= (ce - cs - 1);
+								val[cs] = ' ';
+								val[vlen] = '\0';
+								vi = cs; // rescan from space
+								modified = true;
+							} else {
+								// Unclosed — read file lines until */
+								while (getline(&line, &line_cap, f) >= 0) {
+									char *ce = strstr(line, "*/");
+									if (ce) {
+										// Append text after */ to value
+										char *rest = ce + 2;
+										while (*rest == ' ' || *rest == '\t') rest++;
+										char *re = rest + strlen(rest);
+										while (re > rest && (re[-1] == '\n' || re[-1] == '\r' ||
+										       re[-1] == ' ' || re[-1] == '\t')) re--;
+										int rlen = (int)(re - rest);
+										if (rlen > 0) {
+											char *nv = realloc(val, cs + 1 + rlen + 1);
+											if (nv) {
+												val = nv;
+												val[cs] = ' ';
+												memcpy(val + cs + 1, rest, rlen);
+												vlen = cs + 1 + rlen;
+												val[vlen] = '\0';
+											}
+										} else {
+											// Nothing after */ — just truncate
+											vlen = cs;
+											while (vlen > 0 && (val[vlen-1] == ' ' || val[vlen-1] == '\t')) vlen--;
+											val[vlen] = '\0';
+										}
+										modified = true;
+										break;
+									}
+								}
+								if (!modified) {
+									// EOF without */ — truncate at comment
+									vlen = cs;
+									while (vlen > 0 && (val[vlen-1] == ' ' || val[vlen-1] == '\t')) vlen--;
+									val[vlen] = '\0';
+									modified = true;
+								}
+								vi = vlen; // done
+							}
+						}
+					}
+				}
+				if (modified || val != full_val) {
+					free(full_val);
+					full_val = val;
+					full_val_len = vlen;
+					val_start = full_val;
+					val_len = full_val_len;
+				}
+			}
+
 			// Build "NAME=VALUE" or "NAME" string
 			int total = name_len + (val_len > 0 ? 1 + val_len : 0) + 1;
 			char *def = malloc(total);
@@ -5467,9 +5601,11 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 				// once inside typeof() and once for the initializer.
 				// typeof(EXPR) evaluates its operand when the result
 				// type is variably modified (C11 §6.7.2.4p2).
-				// Exempt strictly bare function calls: function return
-				// types are never VM (C11 §6.7.6.3p1), so typeof(f())
-				// never evaluates f().
+				// Exempt strictly bare calls to known functions:
+				// functions cannot return VM types (C11 §6.7.6.2p2),
+				// so typeof(f()) never evaluates f().  Function pointer
+				// variables are NOT exempt (block scope, no linkage —
+				// can legally have VM return types like int(*)[n]).
 				// Phase 1D is the primary check; this is defense-in-depth.
 				{
 					Token *rhs_s = tok_next(bare_assign_eq);
@@ -6437,9 +6573,11 @@ p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
 				{ lhs_indir = true; break; }
 		if (lhs_indir) {
 			Token *rhs_start = tok_next(eq_tok);
-			// Function return types are never VM (C11 §6.7.6.3p1),
-			// so typeof(f(...)) never evaluates the call at runtime.
-			// Skip the entire side-effect check for strictly bare calls.
+			// Exempt only known function declarations from the side-
+			// effect check.  Functions cannot return VM types (C11
+			// §6.7.6.2p2), so typeof(f()) is safe.  Unknown idents
+			// may be function pointer variables (block scope, no
+			// linkage) that CAN return VM types like int(*)[n].
 			if (!is_strictly_bare_call(rhs_start, bare_oe))
 				reject_orelse_side_effects(
 					rhs_start, bare_oe,

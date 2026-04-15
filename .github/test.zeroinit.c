@@ -4085,6 +4085,78 @@ static void test_struct_tag_shadow_bleed(void) {
 	}
 }
 
+/* typeof(struct __attribute__((packed)) Tag) was misidentified as a function type
+ * by is_typeof_func_type (attribute parens confused for parameter list parens),
+ * causing zero-init to be skipped entirely. Also tests the saw_sue path where
+ * attributes between struct keyword and tag name consumed the tag lookup. */
+static void test_typeof_struct_attr_memset(void) {
+	printf("\n--- typeof struct attr memset ---\n");
+
+	// Case 1: typeof(struct __attribute__((packed)) S) must get memset
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct __attribute__((packed)) HwReg { int status; int data; };\n"
+		    "void f(void) {\n"
+		    "    typeof(struct __attribute__((packed)) HwReg) a;\n"
+		    "    (void)&a;\n"
+		    "}\n",
+		    "typeof_sattr1.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typeof-struct-attr: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "typeof-struct-attr: gets memset");
+		prism_free(&r);
+	}
+
+	// Case 2: typeof(struct S) without attrs — baseline comparison
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct HwReg { int status; int data; };\n"
+		    "void f(void) {\n"
+		    "    typeof(struct HwReg) a;\n"
+		    "    (void)&a;\n"
+		    "}\n",
+		    "typeof_sattr2.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typeof-struct-plain: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "typeof-struct-plain: gets memset");
+		prism_free(&r);
+	}
+
+	// Case 3: typeof(struct [[gnu::packed]] S) — C23 attribute variant
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct HwReg { int status; int data; };\n"
+		    "void f(void) {\n"
+		    "    typeof(struct [[gnu::packed]] HwReg) b;\n"
+		    "    (void)&b;\n"
+		    "}\n",
+		    "typeof_sattr3.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typeof-struct-c23attr: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") != NULL,
+			      "typeof-struct-c23attr: gets memset");
+		prism_free(&r);
+	}
+
+	// Case 4: typeof(struct S) — bare function type must still NOT get memset
+	{
+		PrismResult r = prism_transpile_source(
+		    "int add(int a, int b) { return a + b; }\n"
+		    "void f(void) {\n"
+		    "    typeof(add) *fp;\n"
+		    "    (void)fp;\n"
+		    "}\n",
+		    "typeof_sattr4.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typeof-func-noregress: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "memset") == NULL,
+			      "typeof-func-noregress: no memset on func type");
+		prism_free(&r);
+	}
+}
+
 // case (expr): where last_emitted before : is ) didn't reset at_stmt_start.
 // Declarations after such labels missed zero-initialization.
 static void test_case_paren_expr_zeroinit(void) {
@@ -4342,4 +4414,7 @@ void run_zeroinit_tests(void) {
 	// struct tag shadow bleed — inner clean struct not registered,
 	// tag_lookup finds outer VLA/volatile struct, false CFG error
 	GNUC_ONLY(test_struct_tag_shadow_bleed());
+
+	// typeof(struct __attribute__(...) Tag) must get memset (not skip as function type)
+	GNUC_ONLY(test_typeof_struct_attr_memset());
 }
