@@ -7866,6 +7866,131 @@ static void test_collect_source_defines_inline_block_comment_value(void) {
 	}
 }
 
+/* Regression tests for collect_source_defines block comment strip memory safety.
+ * The original code had a heap-use-after-free (free(full_val) when val==full_val
+ * after in-place modification), a double-free (realloc moves val but full_val
+ * still points to old address), and a modified-flag reuse bug (second unclosed
+ * comment's EOF truncation gated on first comment's flag). */
+static void test_collect_source_defines_block_comment_memory_safety(void) {
+	printf("\n--- block comment strip memory safety ---\n");
+
+	/* Case 1: continuation line + inline block comment (UAF trigger:
+	 * full_val non-NULL, in-place strip, free(full_val) freed live buffer) */
+	{
+		char *path = create_temp_file(
+		    "#define CONTVAL 100 /* inline */ \\\n"
+		    "    + 200\n"
+		    "#include <stddef.h>\n"
+		    "int x = CONTVAL;\n");
+		CHECK(path != NULL, "cont-inline-comment: create temp file");
+		if (!path) return;
+		PrismFeatures feat = prism_defaults();
+		feat.flatten_headers = false;
+		PrismResult r = prism_transpile_file(path, feat);
+		CHECK_EQ(r.status, PRISM_OK,
+			 "cont-inline-comment: transpiles without crash (UAF regression)");
+		prism_free(&r);
+		unlink(path); free(path);
+	}
+
+	/* Case 2: continuation line + multi-line block comment (realloc double-free:
+	 * realloc moves val, full_val stale, free(full_val) double-frees) */
+	{
+		char *path = create_temp_file(
+		    "#define CONTMULTI /* start of comment \\\n"
+		    "   continuation */ 42\n"
+		    "#include <stddef.h>\n"
+		    "int y = CONTMULTI;\n");
+		CHECK(path != NULL, "cont-multi-comment: create temp file");
+		if (!path) return;
+		PrismFeatures feat = prism_defaults();
+		feat.flatten_headers = false;
+		PrismResult r = prism_transpile_file(path, feat);
+		CHECK_EQ(r.status, PRISM_OK,
+			 "cont-multi-comment: transpiles without crash (double-free regression)");
+		prism_free(&r);
+		unlink(path); free(path);
+	}
+
+	/* Case 3: two block comments — first inline, second multi-line
+	 * (modified-flag reuse: first sets modified=true, second's EOF
+	 * truncation was gated on !modified, leaving garbage) */
+	{
+		char *path = create_temp_file(
+		    "#define TWOCOMM /* first */ val /* second spans\n"
+		    "   to here */ rest\n"
+		    "#include <stddef.h>\n"
+		    "int z = 1;\n");
+		CHECK(path != NULL, "two-comments: create temp file");
+		if (!path) return;
+		PrismFeatures feat = prism_defaults();
+		feat.flatten_headers = false;
+		PrismResult r = prism_transpile_file(path, feat);
+		CHECK_EQ(r.status, PRISM_OK,
+			 "two-comments: transpiles (modified-flag reuse regression)");
+		prism_free(&r);
+		unlink(path); free(path);
+	}
+
+	/* Case 4: block comment inside string literal in #define value —
+	 * must NOT strip (string scanner must skip over it) */
+	{
+		char *path = create_temp_file(
+		    "#define STRVAL \"hello /* not a comment */\"\n"
+		    "#include <stddef.h>\n"
+		    "const char *s = STRVAL;\n");
+		CHECK(path != NULL, "string-comment: create temp file");
+		if (!path) return;
+		PrismFeatures feat = prism_defaults();
+		feat.flatten_headers = false;
+		PrismResult r = prism_transpile_file(path, feat);
+		CHECK_EQ(r.status, PRISM_OK, "string-comment: transpiles OK");
+		if (r.output) {
+			char *hit = strstr(r.output, "#define STRVAL");
+			if (hit)
+				CHECK(strstr(hit, "/* not a comment */") != NULL,
+				      "string-comment: comment inside string preserved");
+		}
+		prism_free(&r);
+		unlink(path); free(path);
+	}
+
+	/* Case 5: single-char value with no comment (vlen=1, loop bound
+	 * vi < vlen-1 = 0, must not underflow or access OOB) */
+	{
+		char *path = create_temp_file(
+		    "#define ONEVAL 5\n"
+		    "#include <stddef.h>\n"
+		    "int w = ONEVAL;\n");
+		CHECK(path != NULL, "single-char-val: create temp file");
+		if (!path) return;
+		PrismFeatures feat = prism_defaults();
+		feat.flatten_headers = false;
+		PrismResult r = prism_transpile_file(path, feat);
+		CHECK_EQ(r.status, PRISM_OK, "single-char-val: transpiles OK");
+		prism_free(&r);
+		unlink(path); free(path);
+	}
+
+	/* Case 6: empty value (vlen=0, val stays NULL, no crash) */
+	{
+		char *path = create_temp_file(
+		    "#define EMPTYDEF\n"
+		    "#include <stddef.h>\n"
+		    "#ifdef EMPTYDEF\n"
+		    "int v = 1;\n"
+		    "#endif\n");
+		CHECK(path != NULL, "empty-def: create temp file");
+		if (!path) return;
+		PrismFeatures feat = prism_defaults();
+		feat.flatten_headers = false;
+		PrismResult r = prism_transpile_file(path, feat);
+		CHECK_EQ(r.status, PRISM_OK, "empty-def: transpiles OK");
+		prism_free(&r);
+		unlink(path); free(path);
+	}
+}
+
 void run_api_tests_4(void) {
 	printf("\n=== API TESTS (group 4) ===\n");
 	test_collect_source_defines_long_line_truncation();
@@ -7936,6 +8061,9 @@ void run_api_tests_4(void) {
 
 	// Block comment inside #define value must be stripped (not emitted as unterminated /*)
 	test_collect_source_defines_inline_block_comment_value();
+
+	// Memory safety regression: UAF, double-free, flag-reuse in comment strip
+	test_collect_source_defines_block_comment_memory_safety();
 
 #ifdef __APPLE__
 	// _DARWIN_C_SOURCE regression: netinet/ip.h uses u_int/u_char/u_short

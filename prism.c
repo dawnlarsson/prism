@@ -5053,6 +5053,7 @@ static void collect_source_defines(const char *input_file) {
 								modified = true;
 							} else {
 								// Unclosed — read file lines until */
+								bool found_close = false;
 								while (getline(&line, &line_cap, f) >= 0) {
 									char *ce = strstr(line, "*/");
 									if (ce) {
@@ -5066,6 +5067,9 @@ static void collect_source_defines(const char *input_file) {
 										if (rlen > 0) {
 											char *nv = realloc(val, cs + 1 + rlen + 1);
 											if (nv) {
+												// realloc may move; keep full_val in sync
+												// to prevent double-free at cleanup
+												if (val == full_val) full_val = nv;
 												val = nv;
 												val[cs] = ' ';
 												memcpy(val + cs + 1, rest, rlen);
@@ -5078,11 +5082,12 @@ static void collect_source_defines(const char *input_file) {
 											while (vlen > 0 && (val[vlen-1] == ' ' || val[vlen-1] == '\t')) vlen--;
 											val[vlen] = '\0';
 										}
+										found_close = true;
 										modified = true;
 										break;
 									}
 								}
-								if (!modified) {
+								if (!found_close) {
 									// EOF without */ — truncate at comment
 									vlen = cs;
 									while (vlen > 0 && (val[vlen-1] == ' ' || val[vlen-1] == '\t')) vlen--;
@@ -5094,8 +5099,13 @@ static void collect_source_defines(const char *input_file) {
 						}
 					}
 				}
-				if (modified || val != full_val) {
+				// Only free the old allocation when val was newly malloc'd
+				// (full_val was NULL) or realloc moved the buffer.
+				// When val == full_val the in-place modification must
+				// NOT free the buffer we still need.
+				if (val != full_val)
 					free(full_val);
+				if (modified || val != full_val) {
 					full_val = val;
 					full_val_len = vlen;
 					val_start = full_val;
