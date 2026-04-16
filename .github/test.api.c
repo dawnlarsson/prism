@@ -7578,6 +7578,109 @@ static void test_defer_in_expression_context(void) {
 	prism_free(&r);
 }
 
+// GNU __label__ handler consumed ';' without clearing p1d_ctrl_pending.
+// Next declaration was falsely treated as braceless body, narrowing its scope.
+// Backward goto looping over VLA was silently allowed.
+static void test_label_ctrl_pending_leak(void) {
+	printf("\n--- __label__ ctrl_pending Leak ---\n");
+
+	// With __label__ after if(0): backward goto over VLA must be caught
+	PrismResult r = prism_transpile_source(
+		"#include <stdio.h>\n"
+		"void exploit(int n) {\n"
+		"    if (0)\n"
+		"        __label__ L;\n"
+		"LOOP:\n"
+		"    int vla[n];\n"
+		"    vla[0] = 1;\n"
+		"    goto LOOP;\n"
+		"}\n",
+		"label_leak.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+		 "__label__ + backward goto over VLA: error detected");
+	prism_free(&r);
+
+	// Baseline: without __label__, same error must fire
+	r = prism_transpile_source(
+		"#include <stdio.h>\n"
+		"void normal(int n) {\n"
+		"    if (0) (void)0;\n"
+		"LOOP:\n"
+		"    int vla[n];\n"
+		"    vla[0] = 1;\n"
+		"    goto LOOP;\n"
+		"}\n",
+		"label_leak_base.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+		 "baseline backward goto over VLA: error detected");
+	prism_free(&r);
+
+	// __label__ without preceding if: standalone __label__ must not break VLA tracking
+	r = prism_transpile_source(
+		"#include <stdio.h>\n"
+		"void test(int n) {\n"
+		"    __label__ L;\n"
+		"LOOP:\n"
+		"    int vla[n];\n"
+		"    vla[0] = 1;\n"
+		"    goto LOOP;\n"
+		"}\n",
+		"label_leak_standalone.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+		 "standalone __label__ + backward goto over VLA: error detected");
+	prism_free(&r);
+}
+
+// Pass 0 taint edge extraction matched local variables with the same name
+// as tainted functions, falsely propagating vfork/setjmp taint and blocking defer.
+static void test_taint_variable_shadow_false_positive(void) {
+	printf("\n--- Taint Variable Shadow False Positive ---\n");
+
+	// Local variable shadowing a vfork-calling function must NOT taint
+	PrismResult r = prism_transpile_source(
+		"#include <unistd.h>\n"
+		"#include <stdio.h>\n"
+		"void my_vfork(void) { vfork(); }\n"
+		"void innocent(void) {\n"
+		"    int my_vfork = 42;\n"
+		"    (void)my_vfork;\n"
+		"    defer printf(\"cleanup\\n\");\n"
+		"}\n",
+		"taint_shadow.c", prism_defaults());
+	CHECK(r.status == PRISM_OK,
+		 "variable shadowing tainted fn: defer allowed");
+	prism_free(&r);
+
+	// Actually calling the tainted function must still be caught
+	r = prism_transpile_source(
+		"#include <unistd.h>\n"
+		"#include <stdio.h>\n"
+		"void my_vfork(void) { vfork(); }\n"
+		"void caller(void) {\n"
+		"    my_vfork();\n"
+		"    defer printf(\"cleanup\\n\");\n"
+		"}\n",
+		"taint_real.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+		 "calling tainted fn: defer rejected");
+	prism_free(&r);
+
+	// Function pointer assignment must still propagate taint
+	r = prism_transpile_source(
+		"#include <unistd.h>\n"
+		"#include <stdio.h>\n"
+		"void my_vfork(void) { vfork(); }\n"
+		"void fp_user(void) {\n"
+		"    void (*fp)(void) = my_vfork;\n"
+		"    fp();\n"
+		"    defer printf(\"cleanup\\n\");\n"
+		"}\n",
+		"taint_fp.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+		 "fn ptr to tainted fn: defer rejected");
+	prism_free(&r);
+}
+
 static void test_braceless_typedef_scope_poison(void) {
 	/* typedef in braceless control-flow body leaked to parent scope,
 	 * poisoning Prism keywords (orelse/defer) for the rest of the function. */
@@ -8316,6 +8419,12 @@ void run_api_tests_4(void) {
 
 	// Defer keyword in expression context (array dims, balanced groups) must error
 	test_defer_in_expression_context();
+
+	// __label__ handler must clear p1d_ctrl_pending
+	test_label_ctrl_pending_leak();
+
+	// Variable shadowing a tainted function name must not block defer
+	test_taint_variable_shadow_false_positive();
 
 	// Block comment inside #define value must be stripped (not emitted as unterminated /*)
 	test_collect_source_defines_inline_block_comment_value();

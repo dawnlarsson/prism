@@ -7986,6 +7986,7 @@ static void p1_full_depth_prescan(Token *tok) {
 				p1d_prev = tok;
 				tok = t;
 				at_stmt_start = true;
+				p1d_ctrl_pending = false;
 				continue;
 			}
 

@@ -1868,6 +1868,26 @@ static Token *tokenize(File *file) {
 				for (Token *b = tok_next(body); b != end; b = tok_next(b)) {
 					if (b->kind != TK_IDENT) continue;
 					if (!(fn_bloom & (1ULL << (((unsigned)b->ch0 ^ b->len) & 63)))) continue;
+					// Skip identifiers that are clearly variable declarations,
+					// not function calls/references.  At Pass 0 we have no symbol
+					// table, so use lexical heuristics:
+					// (1) Preceded by type/qualifier/storage keyword → declaration
+					// (2) Preceded by ',' with a type keyword before that → multi-decl
+					if (tok_idx(b) > tok_idx(body) + 1) {
+						Token *prev = &token_pool[tok_idx(b) - 1];
+						if (prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE))
+							continue;
+						// Also skip `(void)name` cast pattern: prev is ')'
+						// from a cast expression (not a function call).
+						// Conservative: if prev is ')' and the matching '('
+						// has a type-keyword token right after it, it's a cast.
+						if (match_ch(prev, ')') && (prev->flags & TF_CLOSE) && prev->match_idx) {
+							Token *open = tok_match(prev);
+							Token *inner = open ? tok_next(open) : NULL;
+							if (inner && (inner->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE)))
+								continue;
+						}
+					}
 					void *v = hashmap_get(&func_map, tok_loc(b), b->len);
 					if (!v) continue;
 					int j = (int)(intptr_t)v - 1;
