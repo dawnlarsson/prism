@@ -131,6 +131,7 @@ static inline bool is_brace_scope(ScopeKind k) {
 
 typedef struct {
 	int defer_start_idx;
+	int saved_defer_shadow_count; // stmt-expr: shadow count at open time (restore on close)
 	uint8_t kind;
 	bool is_loop : 1;
 	bool is_switch : 1;
@@ -820,6 +821,12 @@ static void scope_pop(void) {
 			while (defer_shadow_count > 0 &&
 			       defer_shadows[defer_shadow_count - 1].block_depth >= ctx->block_depth)
 				defer_shadow_count--;
+			// Stmt-expr scopes must not clear shadows from enclosing scopes.
+			// The block_depth cleanup above may have removed for-init
+			// shadows (at block_depth+1) that share the same numeric depth
+			// as this stmt-expr's SCOPE_BLOCK.
+			if (s->is_stmt_expr && defer_shadow_count < s->saved_defer_shadow_count)
+				defer_shadow_count = s->saved_defer_shadow_count;
 			ctx->block_depth--;
 		}
 	}
@@ -2070,6 +2077,13 @@ static Token *walk_balanced(Token *tok, bool emit) {
 				Token *brace = find_struct_body_brace(t);
 				if (brace) check_enum_body_defer_shadow(brace);
 			}
+			// Defense-in-depth: reject 'defer' keyword in balanced groups
+			if (__builtin_expect(FEAT(F_DEFER) && (t->tag & TT_DEFER), 0) &&
+			    !(last_emitted && (last_emitted->tag & TT_MEMBER)) &&
+			    (!typedef_lookup(t) || match_ch(tok_next(t), '{')) &&
+			    tok_next(t) && (is_identifier_like(tok_next(t)) || match_ch(tok_next(t), '{')))
+				error_tok(t, "'defer' cannot be used in expression context "
+					  "(array dimensions, parenthesized expressions, etc.)");
 			// Strip 'raw' keyword inside balanced groups (cast expressions, etc.)
 			{ Token *r = emit_tok_checked(t); if (r) { t = r; continue; } }
 			t = tok_next(t);
@@ -2117,6 +2131,13 @@ static void emit_token_range_orelse(Token *start, Token *end) {
 					continue;
 				}
 			}
+			// Defense-in-depth: reject 'defer' keyword in orelse ranges
+			if (__builtin_expect(FEAT(F_DEFER) && (t->tag & TT_DEFER), 0) &&
+			    !(last_emitted && (last_emitted->tag & TT_MEMBER)) &&
+			    (!typedef_lookup(t) || match_ch(tok_next(t), '{')) &&
+			    tok_next(t) && (is_identifier_like(tok_next(t)) || match_ch(tok_next(t), '{')))
+				error_tok(t, "'defer' cannot be used in expression context "
+					  "(array dimensions, parenthesized expressions, etc.)");
 			{ Token *r = emit_tok_checked(t); if (r) { t = r; continue; } }
 			t = tok_next(t);
 		}
@@ -2388,6 +2409,13 @@ static Token *walk_balanced_orelse(Token *tok) {
 				Token *brace = find_struct_body_brace(t);
 				if (brace) check_enum_body_defer_shadow(brace);
 			}
+			// Defense-in-depth: reject 'defer' keyword in bracket orelse
+			if (__builtin_expect(FEAT(F_DEFER) && (t->tag & TT_DEFER), 0) &&
+			    !(last_emitted && (last_emitted->tag & TT_MEMBER)) &&
+			    (!typedef_lookup(t) || match_ch(tok_next(t), '{')) &&
+			    tok_next(t) && (is_identifier_like(tok_next(t)) || match_ch(tok_next(t), '{')))
+				error_tok(t, "'defer' cannot be used in expression context "
+					  "(array dimensions, parenthesized expressions, etc.)");
 			{ Token *r = emit_tok_checked(t); if (r) { t = r; continue; } }
 			t = tok_next(t);
 		}
@@ -4238,6 +4266,11 @@ static Token *handle_open_brace(Token *tok) {
 				s->is_stmt_expr = true;
 		}
 	}
+
+	// Save shadow count for stmt-expr restore (prevents premature
+	// cleanup of for-init shadows that share the same block_depth).
+	if (s->is_stmt_expr)
+		s->saved_defer_shadow_count = defer_shadow_count;
 
 	ctx->at_stmt_start = true;
 	return tok;

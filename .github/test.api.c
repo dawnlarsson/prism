@@ -7423,6 +7423,161 @@ static void test_braceless_defer_shadow_false_positive(void) {
 	prism_free(&r);
 }
 
+// Stmt-expr in for-increment pushes/pops SCOPE_BLOCK at the same depth as
+// for-init shadows (block_depth+1).  Without the fix, scope_pop's cleanup
+// prematurely clears the shadow, silently allowing the defer to capture
+// the wrong variable.
+static void test_stmtexpr_for_init_shadow_desync(void) {
+	printf("\n--- Stmt-Expr For-Init Shadow Desync ---\n");
+
+	// Without stmt-expr: shadow detection must fire (baseline)
+	PrismResult r = prism_transpile_source(
+		"void cleanup(int *p) { (void)p; }\n"
+		"void test(void) {\n"
+		"    int target = 1;\n"
+		"    defer cleanup(&target);\n"
+		"    for (int target = 2; target < 10; target++) {\n"
+		"        return;\n"
+		"    }\n"
+		"}\n",
+		"se_shadow_base.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+		 "for-init shadow baseline: error detected");
+	prism_free(&r);
+
+	// With stmt-expr in for-increment: same shadow must still be detected
+	r = prism_transpile_source(
+		"void cleanup(int *p) { (void)p; }\n"
+		"void test(void) {\n"
+		"    int target = 1;\n"
+		"    defer cleanup(&target);\n"
+		"    for (int target = 2; target < 10;\n"
+		"         target = ({int t = target+1; t;})) {\n"
+		"        return;\n"
+		"    }\n"
+		"}\n",
+		"se_shadow_desync.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+		 "for-init shadow + stmt-expr: error detected");
+	if (r.error_msg)
+		CHECK(strstr(r.error_msg, "shadows") != NULL,
+		      "for-init shadow + stmt-expr: mentions 'shadows'");
+	prism_free(&r);
+
+	// Stmt-expr in for-CONDITION (not just increment)
+	r = prism_transpile_source(
+		"void cleanup(int *p) { (void)p; }\n"
+		"void test(void) {\n"
+		"    int target = 1;\n"
+		"    defer cleanup(&target);\n"
+		"    for (int target = 2;\n"
+		"         ({int ok = target < 10; ok;});\n"
+		"         target++) {\n"
+		"        return;\n"
+		"    }\n"
+		"}\n",
+		"se_shadow_cond.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+		 "for-init shadow + stmt-expr in condition: error detected");
+	prism_free(&r);
+
+	// Nested stmt-exprs: inner pop must not kill outer for-init shadow
+	r = prism_transpile_source(
+		"void cleanup(int *p) { (void)p; }\n"
+		"void test(void) {\n"
+		"    int target = 1;\n"
+		"    defer cleanup(&target);\n"
+		"    for (int target = 2; target < 10;\n"
+		"         target = ({int t = ({int u = target+1; u;}); t;})) {\n"
+		"        return;\n"
+		"    }\n"
+		"}\n",
+		"se_shadow_nested.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+		 "for-init shadow + nested stmt-expr: error detected");
+	prism_free(&r);
+
+	// Multiple for-init shadows + stmt-expr: second declarator shadow survives
+	r = prism_transpile_source(
+		"void cleanup(int *p) { (void)p; }\n"
+		"void test(void) {\n"
+		"    int target = 1;\n"
+		"    defer cleanup(&target);\n"
+		"    for (int i = 0, target = ({int t = 2; t;});\n"
+		"         i < 10; i++) {\n"
+		"        return;\n"
+		"    }\n"
+		"}\n",
+		"se_shadow_multi.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+		 "for-init multi-decl + stmt-expr: error detected");
+	prism_free(&r);
+}
+
+// Defer keyword inside array brackets, walk_balanced, and walk_balanced_orelse
+// must be rejected — 'defer' is a statement keyword, not an expression.
+// Previously leaked raw to the C backend.
+static void test_defer_in_expression_context(void) {
+	printf("\n--- Defer in Expression Context ---\n");
+
+	// defer in array bracket dimension (claim 3 attack vector)
+	PrismResult r = prism_transpile_source(
+		"void process(void) {\n"
+		"    int buffer[ defer printf(\"x\") ? 10 : 20 ];\n"
+		"    (void)buffer;\n"
+		"}\n",
+		"defer_expr_bracket.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+		 "defer in array bracket: error detected");
+	if (r.error_msg)
+		CHECK(strstr(r.error_msg, "expression context") != NULL,
+		      "defer in array bracket: correct error message");
+	prism_free(&r);
+
+	// defer as struct member name must NOT trigger (false positive guard)
+	r = prism_transpile_source(
+		"struct S { int defer; };\n"
+		"int f(struct S s) { return s.defer; }\n",
+		"defer_expr_member.c", prism_defaults());
+	CHECK(r.status == PRISM_OK,
+		 "s.defer member: no false positive");
+	prism_free(&r);
+
+	// defer as variable name in array dim must NOT trigger
+	r = prism_transpile_source(
+		"void f(int defer) {\n"
+		"    int arr[defer + 1];\n"
+		"    (void)arr;\n"
+		"}\n",
+		"defer_expr_var.c", prism_defaults());
+	CHECK(r.status == PRISM_OK,
+		 "arr[defer+1] variable: no false positive");
+	prism_free(&r);
+
+	// defer as function name in cleanup attr must NOT trigger
+	r = prism_transpile_source(
+		"void defer(int *p) { (void)p; }\n"
+		"void f(void) {\n"
+		"    int value __attribute__((cleanup(defer))) = 42;\n"
+		"    (void)value;\n"
+		"}\n",
+		"defer_expr_cleanup.c", prism_defaults());
+	CHECK(r.status == PRISM_OK,
+		 "cleanup(defer) attr: no false positive");
+	prism_free(&r);
+
+	// defer block form in sizeof (should also error)
+	r = prism_transpile_source(
+		"void f(void) {\n"
+		"    int x = sizeof(defer { int y; });\n"
+		"    (void)x;\n"
+		"}\n",
+		"defer_expr_sizeof.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+		 "defer { } in sizeof: error detected");
+	prism_free(&r);
+}
+
 static void test_braceless_typedef_scope_poison(void) {
 	/* typedef in braceless control-flow body leaked to parent scope,
 	 * poisoning Prism keywords (orelse/defer) for the rest of the function. */
@@ -8155,6 +8310,12 @@ void run_api_tests_4(void) {
 
 	// Orelse chain/scan-context: local prev tracking instead of stale last_emitted
 	test_orelse_chain_scan_context();
+
+	// Stmt-expr in for-increment must not pop for-init defer shadows
+	test_stmtexpr_for_init_shadow_desync();
+
+	// Defer keyword in expression context (array dims, balanced groups) must error
+	test_defer_in_expression_context();
 
 	// Block comment inside #define value must be stripped (not emitted as unterminated /*)
 	test_collect_source_defines_inline_block_comment_value();
