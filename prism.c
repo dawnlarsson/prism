@@ -1,4 +1,4 @@
-#define PRISM_VERSION "1.0.9"
+#define PRISM_VERSION "1.1.1"
 
 #ifndef _WIN32
 #ifndef _GNU_SOURCE
