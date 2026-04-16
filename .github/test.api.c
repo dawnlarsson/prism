@@ -6185,6 +6185,97 @@ static void test_generic_ternary_colon_confusion(void) {
 	prism_free(&r);
 }
 
+// _Generic inside defer body: without SCOPE_GENERIC push in EMIT_DEFER_BODY,
+// association colons are mis-identified as labels, setting at_stmt_start=true
+// and potentially corrupting zero-init or triggering spurious errors.
+static void test_generic_in_defer_body(void) {
+	printf("\n--- _Generic in Defer Body ---\n");
+
+	const char *code =
+	    "void cleanup(int *p) { (void)p; }\n"
+	    "int get_val(int x) {\n"
+	    "    return _Generic((x), int: x, default: 0);\n"
+	    "}\n"
+	    "void test(void) {\n"
+	    "    int val = 42;\n"
+	    "    defer cleanup(&val);\n"
+	    "    int result = get_val(val);\n"
+	    "    (void)result;\n"
+	    "}\n";
+
+	PrismResult r = prism_transpile_source(code, "gen_defer_ok.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "generic-defer-body: transpiles OK");
+	if (r.output) {
+		// _Generic must be preserved in the output
+		CHECK(strstr(r.output, "_Generic") != NULL,
+		      "generic-defer-body: _Generic preserved");
+		// Association colons must not create label artifacts
+		CHECK(strstr(r.output, "int :") == NULL && strstr(r.output, "default :") == NULL,
+		      "generic-defer-body: no label-like artifacts");
+	}
+	prism_free(&r);
+
+	// _Generic directly in deferred range (via return-with-defers)
+	const char *code2 =
+	    "void cleanup(int *p) { (void)p; }\n"
+	    "int test(int x) {\n"
+	    "    defer cleanup(&x);\n"
+	    "    return _Generic((x), int: x + 1, default: 0);\n"
+	    "}\n";
+
+	r = prism_transpile_source(code2, "gen_defer_ret.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "generic-defer-return: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "_Generic") != NULL,
+		      "generic-defer-return: _Generic preserved");
+	}
+	prism_free(&r);
+}
+
+// Chained bare orelse: exercises orelse_has_chain scan-context fix.
+// Before the fix, orelse_has_chain used is_orelse_keyword which depends
+// on stale last_emitted instead of local prev tracking.
+static void test_orelse_chain_scan_context(void) {
+	printf("\n--- Orelse Chain Scan Context ---\n");
+
+	// Triple-chained bare orelse: orelse_has_chain must detect 2nd and 3rd
+	const char *code =
+	    "int f(void);\n"
+	    "int g(void);\n"
+	    "int h(void);\n"
+	    "void test(void) {\n"
+	    "    int x;\n"
+	    "    x = f() orelse g() orelse h();\n"
+	    "    (void)x;\n"
+	    "}\n";
+
+	PrismResult r = prism_transpile_source(code, "oe_chain.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "orelse-chain: transpiles OK");
+	if (r.output) {
+		// Must not contain the raw 'orelse' keyword
+		CHECK(strstr(r.output, "orelse") == NULL,
+		      "orelse-chain: no orelse leak");
+	}
+	prism_free(&r);
+
+	// Stmt-expr init followed by orelse: exercises try_zero_init_decl fix
+	// where is_orelse_keyword was called with stale last_emitted
+	const char *code2 =
+	    "int f(void);\n"
+	    "void test(void) {\n"
+	    "    int x = f() orelse 42;\n"
+	    "    (void)x;\n"
+	    "}\n";
+
+	r = prism_transpile_source(code2, "oe_se_init.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "orelse-se-init: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "orelse") == NULL,
+		      "orelse-se-init: no orelse leak");
+	}
+	prism_free(&r);
+}
+
 // block comment spanning #-to-directive in collect_source_defines
 // does not set in_block_comment = true before goto check_continuation,
 // so the continuation line with the actual directive is silently dropped.
@@ -8058,6 +8149,12 @@ void run_api_tests_4(void) {
 
 	// VM function pointer double-eval via typeof(RHS) bypass
 	test_vm_func_ptr_bare_orelse_rejection();
+
+	// _Generic in defer body: association colons must not become labels
+	test_generic_in_defer_body();
+
+	// Orelse chain/scan-context: local prev tracking instead of stale last_emitted
+	test_orelse_chain_scan_context();
 
 	// Block comment inside #define value must be stripped (not emitted as unterminated /*)
 	test_collect_source_defines_inline_block_comment_value();

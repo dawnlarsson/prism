@@ -1788,19 +1788,22 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 			continue;
 		}
 
-		// --- Tag dispatch (EMIT_NORMAL only): _Generic, defer, return/break/continue, goto ---
+		// _Generic scope tracking: prevent association colons from being
+		// mis-identified as labels.  Runs in both EMIT_NORMAL and EMIT_DEFER_BODY.
+		if ((tok->tag & TT_GENERIC) && !in_generic()) {
+			emit_tok(tok); tok = tok_next(tok);
+			if (tok && match_ch(tok, '(')) {
+				scope_push_kind(SCOPE_GENERIC);
+				emit_tok(tok); tok = tok_next(tok);
+			}
+			ctx->at_stmt_start = false;
+			continue;
+		}
+
+		// --- Tag dispatch (EMIT_NORMAL only): defer, return/break/continue, goto ---
 		if (mode != EMIT_DEFER_BODY) {
 			uint32_t itag = tok->tag;
 			if (itag) {
-				if ((itag & TT_GENERIC) && !in_generic()) {
-					emit_tok(tok); tok = tok_next(tok);
-					if (tok && match_ch(tok, '(')) {
-						scope_push_kind(SCOPE_GENERIC);
-						emit_tok(tok); tok = tok_next(tok);
-					}
-					ctx->at_stmt_start = false;
-					continue;
-				}
 				if (__builtin_expect(itag & TT_DEFER, 0) && !in_generic()) {
 					Token *next = handle_defer_keyword(tok);
 					if (next) { tok = next; continue; }
@@ -1892,8 +1895,7 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 			continue;
 		}
 
-		if (mode != EMIT_DEFER_BODY)
-			track_generic_token(tok);
+		track_generic_token(tok);
 
 		// typeof + orelse and bracket orelse
 		if (__builtin_expect(FEAT(F_ORELSE), 0)) {
@@ -1974,9 +1976,14 @@ static Token *emit_block_body(Token *tok, Token *end) {
 
 static bool bracket_scan_has_orelse(Token *open) {
 	if (tok_ann(open) & P1_OE_BRACKET) return true;
+	Token *prev = NULL;
 	for (Token *s = tok_next(open); s && s != tok_match(open); s = tok_next(s)) {
-		if (is_orelse_keyword(s)) return true;
-		if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; }
+		if ((s->tag & TT_ORELSE) && !(prev && (prev->tag & TT_MEMBER))) {
+			TypedefEntry *te = typedef_lookup(s);
+			if (!te || orelse_shadow_is_kw(prev)) return true;
+		}
+		if (s->flags & TF_OPEN) { prev = tok_match(s); s = tok_match(s) ? tok_match(s) : s; continue; }
+		prev = s;
 	}
 	return false;
 }
@@ -1989,11 +1996,17 @@ static Token *try_typeof_orelse(Token *tok) {
 		return NULL;
 	Token *paren = tok_next(tok);
 	Token *pclose = tok_match(paren);
-	for (Token *s = tok_next(paren); s && s != pclose; s = tok_next(s))
-		if (is_orelse_keyword(s)) {
-			emit_tok(tok);               // typeof keyword
-			return walk_balanced_orelse(paren); // ( ... )
+	Token *prev = NULL;
+	for (Token *s = tok_next(paren); s && s != pclose; s = tok_next(s)) {
+		if ((s->tag & TT_ORELSE) && !(prev && (prev->tag & TT_MEMBER))) {
+			TypedefEntry *te = typedef_lookup(s);
+			if (!te || orelse_shadow_is_kw(prev)) {
+				emit_tok(tok);               // typeof keyword
+				return walk_balanced_orelse(paren); // ( ... )
+			}
 		}
+		prev = s;
+	}
 	return NULL;
 }
 static Token *try_bracket_orelse(Token *tok) {
@@ -3757,8 +3770,14 @@ static Token *try_zero_init_decl(Token *tok) {
 		if (match_ch(probe.end, '=')) {
 			Token *aeq = tok_next(probe.end);
 			if (aeq && is_stmt_expr_open(aeq) && tok_match(aeq)) {
-				Token *after_se = tok_next(tok_match(aeq));
-				bool is_orelse = after_se && is_orelse_keyword(after_se);
+				Token *se_close = tok_match(aeq);
+				Token *after_se = tok_next(se_close);
+				bool is_orelse = after_se && (after_se->tag & TT_ORELSE) &&
+					!(se_close->tag & TT_MEMBER);
+				if (is_orelse) {
+					TypedefEntry *te = typedef_lookup(after_se);
+					if (te && !orelse_shadow_is_kw(se_close)) is_orelse = false;
+				}
 				if (!after_se || (!match_ch(after_se, ',') && !is_orelse)) {
 					// Bail out to verbatim emit, but still check
 					// defer shadow — process_declarators won't run.
@@ -5401,11 +5420,16 @@ static Token *find_bare_orelse(Token *tok) {
 // Check if another orelse follows before the next `;` (or `,` if comma_term).
 static bool orelse_has_chain(Token *start, bool comma_term) {
 	int pd = 0;
+	Token *prev = NULL;
 	for (Token *p = start; p->kind != TK_EOF; p = tok_next(p)) {
 		if (p->flags & TF_OPEN) pd++;
 		else if (p->flags & TF_CLOSE) pd--;
 		else if (pd == 0 && (match_ch(p, ';') || (comma_term && match_ch(p, ',')))) break;
-		if (pd == 0 && is_orelse_keyword(p)) return true;
+		if (pd == 0 && (p->tag & TT_ORELSE) && !(prev && (prev->tag & TT_MEMBER))) {
+			TypedefEntry *te = typedef_lookup(p);
+			if (!te || orelse_shadow_is_kw(prev)) return true;
+		}
+		if (pd == 0) prev = p;
 	}
 	return false;
 }
@@ -5696,12 +5720,17 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 					Token *fb_orelse = NULL;
 					{
 						int fd = 0;
+						Token *sprev = NULL;
 						for (Token *s = t; s->kind != TK_EOF; s = tok_next(s)) {
-							if ((s->flags & TF_OPEN) && (match_ch(s, '(') || match_ch(s, '['))) { s = tok_match(s); continue; }
+							if ((s->flags & TF_OPEN) && (match_ch(s, '(') || match_ch(s, '['))) { sprev = tok_match(s); s = tok_match(s); continue; }
 							if (s->flags & TF_OPEN) fd++;
 							else if (s->flags & TF_CLOSE) fd--;
 							else if (fd == 0 && BARE_IS_END(s)) break;
-							if (fd == 0 && is_orelse_keyword(s)) { fb_orelse = s; break; }
+							if (fd == 0 && (s->tag & TT_ORELSE) && !(sprev && (sprev->tag & TT_MEMBER))) {
+								TypedefEntry *te = typedef_lookup(s);
+								if (!te || orelse_shadow_is_kw(sprev)) { fb_orelse = s; break; }
+							}
+							if (fd == 0) sprev = s;
 						}
 					}
 					oe_id = ctx->ret_counter++;
