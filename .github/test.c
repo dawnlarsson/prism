@@ -15,6 +15,9 @@
 #include <sys/resource.h>
 #include <pthread.h>
 #include <sys/time.h>
+#include <spawn.h>
+#include <fcntl.h>
+extern char **environ;
 #endif
 
 // Per-thread log buffer (used by defer tests to verify execution order)
@@ -213,11 +216,61 @@ static bool is_emulated(void) {
 }
 
 #ifndef _WIN32
-static int run_command_status(const char *cmd) {
-	int status = system(cmd);
-	if (status == -1) return -1;
+// Serialization mutex shared by ALL test-harness process spawns.
+// Held ONLY across the posix_spawnp call itself; waitpid runs outside the
+// critical section so spawned processes execute concurrently and parent
+// threads continue working in parallel.
+//
+// Why this exists: the previous harness used fork()+execvp() and system(3).
+// fork() from a multithreaded process duplicates only the calling thread
+// but leaves the rest of the process's shared state (malloc heap, libc
+// pthread bookkeeping, dispatch queues) in whatever mid-transaction state
+// the other threads happened to be in when the fork syscall was issued.
+// On macOS arm64 this produced intermittent SIGBUS crashes in the parent
+// (wild pointers observed in tokenize(), _platform_strstr(), etc.) because
+// libc internal structures were observed half-written. posix_spawn is an
+// atomic kernel operation on macOS (darwin_spawn) that does not fork the
+// calling process — no mid-transaction state is ever visible to the child
+// or disturbed in the parent. The mutex here is defense-in-depth so that
+// no two spawns overlap even on platforms where posix_spawn might fall
+// back to a fork-based implementation.
+static pthread_mutex_t g_spawn_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+// Core spawn-and-wait helper. argv must be a NULL-terminated array, argv[0]
+// is looked up via $PATH by posix_spawnp. If stdout_path/stderr_path are
+// non-NULL, the child's stdout/stderr is redirected to those files (created
+// O_WRONLY|O_CREAT|O_TRUNC, mode 0644).  Returns the child's exit status
+// (>=0, 127 if exec failed inside posix_spawn), -1 on infrastructure error.
+static int prism_spawn_wait(char *const argv[], const char *stdout_path,
+			    const char *stderr_path) {
+	posix_spawn_file_actions_t fa;
+	posix_spawn_file_actions_init(&fa);
+	if (stdout_path)
+		posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, stdout_path,
+						 O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (stderr_path)
+		posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, stderr_path,
+						 O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+	pid_t pid = 0;
+	pthread_mutex_lock(&g_spawn_mtx);
+	int err = posix_spawnp(&pid, argv[0], &fa, NULL, argv, environ);
+	pthread_mutex_unlock(&g_spawn_mtx);
+	posix_spawn_file_actions_destroy(&fa);
+	if (err != 0) { errno = err; return -1; }
+
+	int status = 0;
+	while (waitpid(pid, &status, 0) == -1)
+		if (errno != EINTR) return -1;
 	if (!WIFEXITED(status)) return -1;
 	return WEXITSTATUS(status);
+}
+
+// Run an arbitrary shell command via /bin/sh -c. Preserves shell semantics
+// (redirections, pipes, globbing) that callers embed in `cmd`.
+static int run_command_status(const char *cmd) {
+	char *argv[] = {(char *)"/bin/sh", (char *)"-c", (char *)cmd, NULL};
+	return prism_spawn_wait(argv, NULL, NULL);
 }
 
 static void check_transpiled_output_compiles_and_runs(const char *output,

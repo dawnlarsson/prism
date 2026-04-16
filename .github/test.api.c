@@ -3,7 +3,6 @@
 #include <dirent.h>
 #include <sys/time.h>
 #include <pthread.h>
-static pthread_mutex_t fork_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 static void test_basic_transpile(void) {
@@ -237,21 +236,32 @@ static void test_preprocess_swar_padding_boundary(void) {
 	char cmd[PATH_MAX + 64];
 	snprintf(cmd, sizeof(cmd), "cc -E '%s' 2>/dev/null | wc -c", probe_c);
 
+	/* popen() forks the current multithreaded process, same UB window as
+	 * the old run_exec_argv.  Route through the shared prism_spawn_wait
+	 * helper: shell-wrap via /bin/sh -c, capture stdout to a temp file,
+	 * then read the byte count back. */
+	char wc_out[PATH_MAX + 2];
+	snprintf(wc_out, sizeof(wc_out), "%sprism_pp_bnd_wc_XXXXXX", get_tmp_dir());
+	int wcfd = mkstemp(wc_out);
+	if (wcfd >= 0) close(wcfd);
+	char *shargv[] = {(char *)"/bin/sh", (char *)"-c", cmd, NULL};
+
 	/* Empty file overhead */
 	{ FILE *f = fopen(probe_c, "w"); if (f) fclose(f); }
-	pthread_mutex_lock(&fork_mutex);
-	FILE *pp = popen(cmd, "r");
-	pthread_mutex_unlock(&fork_mutex);
 	int overhead = 0;
-	if (pp) { fscanf(pp, " %d", &overhead); pclose(pp); }
+	if (prism_spawn_wait(shargv, wc_out, NULL) == 0) {
+		FILE *pp = fopen(wc_out, "r");
+		if (pp) { fscanf(pp, " %d", &overhead); fclose(pp); }
+	}
 
 	/* Single-char declaration overhead */
 	{ FILE *f = fopen(probe_c, "w"); if (f) { fputs("const char s[] = \"X\";\n", f); fclose(f); } }
-	pthread_mutex_lock(&fork_mutex);
-	pp = popen(cmd, "r");
-	pthread_mutex_unlock(&fork_mutex);
 	int total1 = 0;
-	if (pp) { fscanf(pp, " %d", &total1); pclose(pp); }
+	if (prism_spawn_wait(shargv, wc_out, NULL) == 0) {
+		FILE *pp = fopen(wc_out, "r");
+		if (pp) { fscanf(pp, " %d", &total1); fclose(pp); }
+	}
+	unlink(wc_out);
 
 	int decl_cost = total1 - overhead; /* bytes added by the declaration minus the 1 'X' */
 	int target = 8191;                  /* 2^13 - 1 */
@@ -805,51 +815,20 @@ static void test_memory_leak_stress(void) {
 }
 
 #ifndef _WIN32
+// Routed through prism_spawn_wait (test.c) — see the commentary there for
+// why fork()+execvp() was replaced.  The old harness held fork_mutex across
+// fork and released it before exec; the mutex only serialized the fork
+// syscall, not the heap/libc state that the child inherited.  On macOS arm64
+// this produced SIGBUS crashes in the parent when other threads were
+// mid-malloc at fork time.  posix_spawn is atomic on darwin and does not
+// duplicate libc state.
 static int run_exec_argv(char *const argv[]) {
-	pthread_mutex_lock(&fork_mutex);
-	pid_t pid = fork();
-	pthread_mutex_unlock(&fork_mutex);
-	if (pid < 0) return -1;
-	if (pid == 0) {
-		execvp(argv[0], argv);
-		_exit(127);
-	}
-
-	int status = 0;
-	while (waitpid(pid, &status, 0) < 0)
-		if (errno != EINTR) return -1;
-	if (!WIFEXITED(status)) return -1;
-	return WEXITSTATUS(status);
+	return prism_spawn_wait(argv, NULL, NULL);
 }
 
 static int run_exec_argv_capture(char *const argv[], const char *stdout_path,
 					 const char *stderr_path) {
-	pthread_mutex_lock(&fork_mutex);
-	pid_t pid = fork();
-	pthread_mutex_unlock(&fork_mutex);
-	if (pid < 0) return -1;
-	if (pid == 0) {
-		if (stdout_path) {
-			FILE *f = fopen(stdout_path, "w");
-			if (!f) _exit(126);
-			dup2(fileno(f), STDOUT_FILENO);
-			fclose(f);
-		}
-		if (stderr_path) {
-			FILE *f = fopen(stderr_path, "w");
-			if (!f) _exit(126);
-			dup2(fileno(f), STDERR_FILENO);
-			fclose(f);
-		}
-		execvp(argv[0], argv);
-		_exit(127);
-	}
-
-	int status = 0;
-	while (waitpid(pid, &status, 0) < 0)
-		if (errno != EINTR) return -1;
-	if (!WIFEXITED(status)) return -1;
-	return WEXITSTATUS(status);
+	return prism_spawn_wait(argv, stdout_path, stderr_path);
 }
 
 static bool shell_word_ok(const char *word) {
