@@ -1813,8 +1813,21 @@ static Token *tokenize(File *file) {
 					callee_idx[i] = -1;
 					Token *callee = find_wrapper_callee(functions[i].body);
 					if (!callee) continue;
-					if (callee->tag & (TT_SPECIAL_FN | TT_NORETURN_FN)) {
-						wrapper_taint[i] = callee->tag & (TT_SPECIAL_FN | TT_NORETURN_FN);
+					// Mirror the direct-body scan at line 1765-1777:
+					// TT_SPECIAL_FN in the body taints with TT_SPECIAL_FN
+					// (setjmp/longjmp/pthread_exit) or TT_NORETURN_FN if the
+					// callee is vfork specifically.  Bare TT_NORETURN_FN on
+					// the callee (exit/abort/_Exit/thrd_exit/quick_exit)
+					// does NOT taint the body — direct-body-scan doesn't,
+					// and wrapper-propagation should not either, otherwise
+					// a simple `void die(void) { exit(0); }` makes every
+					// caller hard-error with a misleading "vfork()" message.
+					// Pass 2 still emits a per-call-site warning at the
+					// direct TT_NORETURN_FN call token.
+					if (callee->tag & TT_SPECIAL_FN) {
+						wrapper_taint[i] = (callee->ch0 == 'v' && callee->len == 5)
+							? TT_NORETURN_FN  // vfork wrapper
+							: TT_SPECIAL_FN;  // setjmp/longjmp/pthread_exit wrapper
 						continue;
 					}
 					void *v = hashmap_get(&func_map, tok_loc(callee), callee->len);

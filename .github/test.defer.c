@@ -2433,6 +2433,47 @@ static void test_defer_body_orelse_counter_desync(void) {
 	prism_free(&r);
 }
 
+// Regression: Phase 1D walks braceless defer bodies in the `!at_stmt_start`
+// branch, so the type keyword inside `defer int t = 0 orelse c;` never gets
+// P1_IS_DECL annotated. Pass 2's try_zero_init_decl bails at the P1_IS_DECL
+// gate, so emit_deferred_orelse takes over and treats `int t` as the bare-
+// orelse LHS, emitting `__typeof__(int t) __prism_oe_N = ...` — a syntax
+// error in C. The block-form variant works because Phase 1D enters the
+// block via handle_open_brace and processes the declaration normally.
+// Pass 1 rejects the braceless-with-orelse-init case with a clear message
+// pointing the user at `defer { ... }`.
+static void test_defer_braceless_decl_orelse_rejected(void) {
+	PrismResult r = prism_transpile_source(
+	    "int main(void) {\n"
+	    "    int c = 0;\n"
+	    "    defer int t = 0 orelse c;\n"
+	    "    return 0;\n"
+	    "}\n",
+	    "defer_braceless_decl_orelse.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "defer-braceless-decl-orelse: must reject at Phase 1");
+	CHECK(r.error_msg && strstr(r.error_msg, "wrap the defer body in braces"),
+	      "defer-braceless-decl-orelse: error message points to braces");
+	prism_free(&r);
+
+	// Block form must still work.
+	r = prism_transpile_source(
+	    "int main(void) {\n"
+	    "    int c = 0;\n"
+	    "    defer { int t = 0 orelse c; (void)t; }\n"
+	    "    return 0;\n"
+	    "}\n",
+	    "defer_block_decl_orelse.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "defer-block-decl-orelse: block form accepted");
+	if (r.output) {
+		CHECK(strstr(r.output, "__typeof__( int t)") == NULL &&
+		      strstr(r.output, "__typeof__(int t)") == NULL,
+		      "defer-block-decl-orelse: no invalid typeof(decl) emitted");
+	}
+	prism_free(&r);
+}
+
 // Regression: emit_orelse_action's block path consumes the trailing `;`,
 // then emit_deferred_orelse advances past the defer body's end boundary.
 // emit_statements' `tok != end` loop then overshoots, spilling user tokens
@@ -4815,6 +4856,77 @@ static void test_defer_shadow_for_init_false_positive(void) {
 	}
 }
 
+// Regression: a user-defined wrapper around exit/abort/_Exit/etc. (all
+// TT_NORETURN_FN but NOT TT_SPECIAL_FN) used to propagate TT_NORETURN_FN
+// onto the caller's body via wrapper_taint, triggering a hard "defer cannot
+// be used in functions that call vfork()" error on every caller of the
+// wrapper. Direct calls to exit/abort only produced a warning at the call
+// site. Inconsistent. Fix: wrapper_taint now mirrors the direct-body scan —
+// only TT_SPECIAL_FN callees taint the body (vfork → TT_NORETURN_FN,
+// setjmp/longjmp/pthread_exit → TT_SPECIAL_FN). Bare TT_NORETURN_FN
+// callees do not taint; the existing Pass 2 per-call-site warning covers
+// them.
+static void test_defer_wrapper_of_exit_not_rejected(void) {
+	printf("\n--- defer + user wrapper of exit ---\n");
+
+	// Wrapper of exit — must NOT hard-error.  Pass 2 should still warn
+	// at the call site (`die` is tagged TT_NORETURN_FN because die's
+	// declaration carries __attribute__((noreturn))).
+	const char *code =
+	    "void exit(int);\n"
+	    "void cleanup(void);\n"
+	    "__attribute__((noreturn)) void die(int code) { exit(code); }\n"
+	    "int main(int argc, char **argv) {\n"
+	    "    defer cleanup();\n"
+	    "    if (argc > 1) die(1);\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "wrap_exit.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "wrapper-of-exit: defer must not be rejected when function calls "
+	         "a user-defined wrapper of exit/abort");
+	prism_free(&r);
+
+	// Wrapper of abort — same story.
+	code =
+	    "void abort(void);\n"
+	    "void cleanup(void);\n"
+	    "void bail(void) { abort(); }\n"
+	    "void f(void) { defer cleanup(); bail(); }\n";
+	r = prism_transpile_source(code, "wrap_abort.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "wrapper-of-abort: defer must not be rejected through wrapper");
+	prism_free(&r);
+
+	// Wrapper of vfork — must STILL hard-error (this is the genuine
+	// UB case: vfork's child shares the parent's memory).
+	code =
+	    "int vfork(void);\n"
+	    "void cleanup(void);\n"
+	    "int my_vfork(void) { return vfork(); }\n"
+	    "void f(void) { defer cleanup(); my_vfork(); }\n";
+	r = prism_transpile_source(code, "wrap_vfork.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "wrapper-of-vfork: vfork wrapper STILL rejects defer (UB: child "
+	      "shares parent memory, defer cleanup would double-run)");
+	CHECK(r.error_msg && strstr(r.error_msg, "vfork"),
+	      "wrapper-of-vfork: error message mentions vfork");
+	prism_free(&r);
+
+	// Wrapper of setjmp — must also still hard-error.
+	code =
+	    "typedef int jmp_buf[20];\n"
+	    "int setjmp(jmp_buf);\n"
+	    "jmp_buf env;\n"
+	    "void cleanup(void);\n"
+	    "int my_setjmp(void) { return setjmp(env); }\n"
+	    "void f(void) { defer cleanup(); my_setjmp(); }\n";
+	r = prism_transpile_source(code, "wrap_setjmp.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "wrapper-of-setjmp: setjmp wrapper STILL rejects defer");
+	prism_free(&r);
+}
+
 static void test_defer_vfork_member_no_reject(void) {
 	printf("\n--- vfork member namespace pollution ---\n");
 	// struct member named 'vfork' falsely taints the function body,
@@ -6912,6 +7024,7 @@ void run_defer_tests(void) {
 	test_defer_varname_return_value_dropped();
 	test_defer_body_orelse_counter_desync();
 	test_defer_body_orelse_block_overshoot();
+	test_defer_braceless_decl_orelse_rejected();
 	test_defer_body_bare_orelse_return_not_rejected();
 	test_defer_paren_wrapped_orelse_smuggling();
 	test_defer_label_duplication_rejected();
@@ -7033,6 +7146,7 @@ void run_defer_tests(void) {
 
 	// vfork member namespace: os.vfork() / p->vfork() must not be rejected
 	test_defer_vfork_member_no_reject();
+	test_defer_wrapper_of_exit_not_rejected();
 
 	// braceless for-body if/else and do/while prematurely clears for_name_hid
 	test_defer_shadow_braceless_for_ifelse();

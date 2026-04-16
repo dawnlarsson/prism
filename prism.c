@@ -3107,6 +3107,13 @@ static bool is_typeof_func_type(Token *type_start, TypeSpecResult *type, DeclRes
 						fs = tok_match(fs);
 						continue;
 					}
+					// Skip array-dimension brackets. A `(` inside `[...]`
+					// is part of the dim expression (`typeof(int[f()])`,
+					// `typeof(int[(n)])`), NOT a function parameter list.
+					if (match_ch(fs, '[') && tok_match(fs)) {
+						fs = tok_match(fs);
+						continue;
+					}
 					if (match_ch(fs, '(')) {
 						Token *after = skip_noise(tok_next(fs));
 						if (after && match_ch(after, '*')) return false; // function pointer type
@@ -6417,6 +6424,28 @@ p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t
 			    (body->tag & (TT_NON_EXPR_STMT | TT_DEFER)))
 				error_tok(tok, "defer statement appears to be missing ';' (found '%.*s' keyword inside)",
 					  body->len, tok_loc(body));
+			// Reject declaration-with-orelse-init inside a braceless
+			// defer body. Phase 1D only annotates P1_IS_DECL on type
+			// keywords reached with at_stmt_start=true; braceless
+			// defer bodies walk in the `!at_stmt_start` branch, so
+			// `defer int t = 0 orelse c;` bypasses annotation. Pass 2's
+			// emit_deferred_orelse then treats the type keyword as
+			// part of the bare-orelse LHS and emits invalid
+			// `__typeof__(int t)`. Require braces so Phase 1D sees
+			// the declaration at stmt_start and annotates normally.
+			if (FEAT(F_ORELSE) &&
+			    (body->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT | TT_STORAGE))) {
+				int pd = 0;
+				for (Token *s = body; s && s != semi && s->kind != TK_EOF; s = tok_next(s)) {
+					if (s->flags & TF_OPEN) { pd++; continue; }
+					if (s->flags & TF_CLOSE) { if (pd > 0) pd--; continue; }
+					if (pd == 0 && is_orelse_kw_shadow(s))
+						error_tok(s, "declaration with 'orelse' initializer "
+							  "inside a braceless defer body is not "
+							  "supported; wrap the defer body in braces: "
+							  "`defer { ... }`");
+				}
+			}
 		}
 	}
 	validate_defer_statement(tok_next(tok), false, false, 0);
