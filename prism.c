@@ -3982,9 +3982,16 @@ static Token *emit_return_body(Token *tok, Token *stop) {
 			OUT_LIT(" return;");
 		} else {
 			bool is_void = is_void_return(tok);
+			// Reserve a counter value up-front. Defer body emission
+			// (emit_all_defers → orelse / zeroinit handlers) also
+			// consumes ctx->ret_counter for __prism_oe_N / __prism_dim_N
+			// temps; reading ret_counter both before and after the
+			// defer emission would desync the `__prism_ret_N = (...)`
+			// declaration from the `return __prism_ret_N;` reference.
+			unsigned ret_id = ctx->ret_counter++;
 			if (!is_void) {
 				out_char(' '); emit_ret_type();
-				OUT_LIT(" __prism_ret_"); out_uint(ctx->ret_counter); OUT_LIT(" = (");
+				OUT_LIT(" __prism_ret_"); out_uint(ret_id); OUT_LIT(" = (");
 			} else OUT_LIT(" (");
 
 			if (stop)
@@ -3994,7 +4001,7 @@ static Token *emit_return_body(Token *tok, Token *stop) {
 			OUT_LIT(");");
 			emit_all_defers();
 
-			if (!is_void) { OUT_LIT(" return __prism_ret_"); out_uint(ctx->ret_counter++); }
+			if (!is_void) { OUT_LIT(" return __prism_ret_"); out_uint(ret_id); }
 			else OUT_LIT(" return");
 			out_char(';');
 		}
@@ -5785,6 +5792,11 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 		}
 		if (match_ch(t, ';') || (comma_term && match_ch(t, ','))) t = tok_next(t);
 	if (brace_wrap) OUT_LIT(" }");
+	// Preserve deferred-range boundary: when called from a deferred-range
+	// emission, `end` is the terminating `;`. Advancing past it makes the
+	// caller's `tok != end` loop condition overshoot, spilling user tokens
+	// beyond the defer boundary into the emitted defer body.
+	if (end && tok_idx(t) > tok_idx(end)) t = end;
 	#undef BARE_IS_END
 	return t;
 }
@@ -5827,6 +5839,11 @@ static Token *emit_deferred_orelse(Token *t, Token *end) {
 	t = emit_orelse_action(t, NULL, false, false, NULL);
 	OUT_LIT(" }");
 	if (match_ch(t, ';')) t = tok_next(t);
+	// Preserve deferred-range boundary. emit_orelse_action (block path)
+	// and the `;` skip above may advance past `end`; the caller's
+	// `tok != end` loop then overshoots and spills user tokens into
+	// the emitted defer body. Clamp to `end`.
+	if (end && tok_idx(t) > tok_idx(end)) t = end;
 	return t;
 }
 

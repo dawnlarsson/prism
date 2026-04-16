@@ -2393,6 +2393,81 @@ static void test_defer_shadow_overflow_silent_drop(void) {
 	prism_free(&r);
 }
 
+// Regression: ctx->ret_counter is shared between __prism_ret_N (return-with-defer
+// temp) and __prism_oe_N (orelse hoist temp). emit_return_body emitted
+// `__prism_ret_<N> = (...)` with the counter value BEFORE emit_all_defers(),
+// then `return __prism_ret_<N>` AFTER the defer body had already bumped the
+// counter via a bare orelse inside the deferred body. Result: the return
+// referenced an undeclared identifier, producing invalid C.
+static void test_defer_body_orelse_counter_desync(void) {
+	PrismResult r = prism_transpile_source(
+	    "int main(void) {\n"
+	    "    int x = 0;\n"
+	    "    defer x = 5 orelse 3;\n"
+	    "    return 0;\n"
+	    "}\n",
+	    "defer_orelse_counter.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "defer-orelse-counter: transpile succeeds");
+	if (r.output) {
+		// The bug emits `return __prism_ret_1;` while only
+		// `__prism_ret_0 = ...` is declared. The output must not
+		// reference any __prism_ret_<N> identifier that was not
+		// first declared with ` = `.
+		const char *p = r.output;
+		while ((p = strstr(p, "return __prism_ret_")) != NULL) {
+			const char *digits = p + strlen("return __prism_ret_");
+			int n = 0, saw = 0;
+			while (*digits >= '0' && *digits <= '9') {
+				n = n * 10 + (*digits - '0'); digits++; saw = 1;
+			}
+			CHECK(saw, "defer-orelse-counter: return reference parses");
+			char needle[64];
+			snprintf(needle, sizeof(needle),
+			         "__prism_ret_%d = ", n);
+			CHECK(strstr(r.output, needle) != NULL,
+			      "defer-orelse-counter: each `return __prism_ret_N` has a matching `__prism_ret_N = ` declaration");
+			p = digits;
+		}
+	}
+	prism_free(&r);
+}
+
+// Regression: emit_orelse_action's block path consumes the trailing `;`,
+// then emit_deferred_orelse advances past the defer body's end boundary.
+// emit_statements' `tok != end` loop then overshoots, spilling user tokens
+// (the statements following the defer) into the emitted defer body.
+static void test_defer_body_orelse_block_overshoot(void) {
+	PrismResult r = prism_transpile_source(
+	    "#include <stdio.h>\n"
+	    "int main(void) {\n"
+	    "    defer 0 orelse { (void)0; };\n"
+	    "    return 0;\n"
+	    "}\n",
+	    "defer_orelse_block_overshoot.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "defer-orelse-overshoot: transpile succeeds");
+	if (r.output) {
+		// Count top-level `return __prism_ret_N` references; must
+		// have a matching `__prism_ret_N = ` declaration.
+		const char *p = r.output;
+		while ((p = strstr(p, "return __prism_ret_")) != NULL) {
+			const char *digits = p + strlen("return __prism_ret_");
+			int n = 0, saw = 0;
+			while (*digits >= '0' && *digits <= '9') {
+				n = n * 10 + (*digits - '0'); digits++; saw = 1;
+			}
+			CHECK(saw, "defer-orelse-overshoot: return reference parses");
+			char needle[64];
+			snprintf(needle, sizeof(needle), "__prism_ret_%d = ", n);
+			CHECK(strstr(r.output, needle) != NULL,
+			      "defer-orelse-overshoot: each return has matching declaration");
+			p = digits;
+		}
+	}
+	prism_free(&r);
+}
+
 static void test_defer_body_bare_orelse_return_not_rejected(void) {
 	/* validate_defer_statement calls skip_to_semicolon for statements
 	 * that don't start with a keyword (like 'get() orelse return;'), so the
@@ -6835,6 +6910,8 @@ void run_defer_tests(void) {
 	test_fno_defer_shadow_leak();
         test_defer_void_parens_return();
 	test_defer_varname_return_value_dropped();
+	test_defer_body_orelse_counter_desync();
+	test_defer_body_orelse_block_overshoot();
 	test_defer_body_bare_orelse_return_not_rejected();
 	test_defer_paren_wrapped_orelse_smuggling();
 	test_defer_label_duplication_rejected();
