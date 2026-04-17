@@ -324,6 +324,123 @@ static void test_bounds_check_false_match_guards(void) {
 	}
 }
 
+static void test_bounds_check_unevaluated_operands(void) {
+	printf("\n--- bounds-check unevaluated operands ---\n");
+
+	// sizeof(arr[5]) — operand unevaluated; MUST NOT wrap (VLA would trap).
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[10]; return (int)sizeof(a[5]);}\n",
+		    "bc_sizeof.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-sizeof: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "sizeof(a[5])") != NULL,
+			      "bc-sizeof: subscript inside sizeof not wrapped");
+			CHECK(strstr(r.output, "sizeof(a[__prism_bchk") == NULL,
+			      "bc-sizeof: no wrap inside sizeof");
+		}
+		prism_free(&r);
+	}
+
+	// _Alignof(arr[0]) — not wrapped.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[10]; return (int)_Alignof(a[0]);}\n",
+		    "bc_alignof.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-alignof: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "_Alignof(a[0])") != NULL,
+			      "bc-alignof: subscript inside _Alignof not wrapped");
+		prism_free(&r);
+	}
+
+	// typeof(arr[5]) — not wrapped.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[10]; typeof(a[5]) x = 0; (void)x; return 0;}\n",
+		    "bc_typeof.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-typeof: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "typeof(a[5])") != NULL,
+			      "bc-typeof: subscript inside typeof not wrapped");
+		prism_free(&r);
+	}
+
+	// __builtin_offsetof — subscript names a struct field, NOT local.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "#include <stddef.h>\n"
+		    "struct S { int arr[5]; };\n"
+		    "int main(void){int arr[100]; (void)arr; "
+		    "return (int)__builtin_offsetof(struct S, arr[2]);}\n",
+		    "bc_offsetof.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-offsetof: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "__builtin_offsetof(struct S, arr[2])") != NULL,
+			      "bc-offsetof: subscript inside offsetof not wrapped");
+			CHECK(strstr(r.output, "offsetof(struct S, arr[__prism_bchk") == NULL,
+			      "bc-offsetof: no wrap inside offsetof");
+		}
+		prism_free(&r);
+	}
+}
+
+static void test_bounds_check_nested_subscript(void) {
+	printf("\n--- bounds-check nested subscripts ---\n");
+
+	// arr[m[i]] — BOTH subscripts wrapped.
+	PrismFeatures f = prism_defaults();
+	PrismResult r = prism_transpile_source(
+	    "int main(void){int a[10]={0}; int m[5]={0}; int i=0; return a[m[i]];}\n",
+	    "bc_nested_idx.c", f);
+	CHECK_EQ(r.status, PRISM_OK, "bc-nested-idx: transpiles");
+	if (r.output) {
+		int hits = 0;
+		for (const char *p = r.output; (p = strstr(p, "__prism_bchk")); p++) hits++;
+		CHECK(hits >= 2, "bc-nested-idx: outer and inner both wrapped");
+		CHECK(strstr(r.output, "m[__prism_bchk((size_t)( i)") != NULL,
+		      "bc-nested-idx: inner m[i] wrapped");
+	}
+	prism_free(&r);
+}
+
+static void test_bounds_check_address_of(void) {
+	printf("\n--- bounds-check unary address-of ---\n");
+
+	// &a[N] — one-past-end is legal in C, must NOT wrap.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[10]; int *p = &a[10]; (void)p; return 0;}\n",
+		    "bc_addr.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-addrof: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "&a[10]") != NULL,
+			      "bc-addrof: &a[10] not wrapped (one-past-end legal)");
+			CHECK(strstr(r.output, "&a[__prism_bchk") == NULL,
+			      "bc-addrof: no wrap after unary &");
+		}
+		prism_free(&r);
+	}
+
+	// Binary & (bitwise AND) with a[i] on rhs IS wrapped.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[10]={0}; int x=7; return x & a[3];}\n",
+		    "bc_binand.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-binand: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "a[__prism_bchk") != NULL,
+			      "bc-binand: binary & does not inhibit wrap");
+		prism_free(&r);
+	}
+}
+
 void run_bounds_check_tests(void) {
 	printf("\n=== BOUNDS-CHECK TESTS ===\n");
 	test_bounds_check_fixed_array();
@@ -331,5 +448,8 @@ void run_bounds_check_tests(void) {
 	test_bounds_check_multidim();
 	test_bounds_check_init_and_args();
 	test_bounds_check_false_match_guards();
+	test_bounds_check_unevaluated_operands();
+	test_bounds_check_nested_subscript();
+	test_bounds_check_address_of();
 	test_bounds_check_runtime();
 }

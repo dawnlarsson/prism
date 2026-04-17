@@ -2264,6 +2264,7 @@ enum {
 	P1_SCOPE_INIT        = 1 << 7, // This '{' opens an initializer (compound literal, = {...})
 	P1_REJECTED          = 1 << 8, // Phase 1D/1F/1G rejected this token (defense-in-depth signal)
 	P1_DECL_BRACKET      = 1 << 9, // '[' is an array-declarator bracket (not an expression subscript)
+	P1_UNEVAL_BRACKET    = 1 << 10, // '[' is inside an unevaluated operand (sizeof/_Alignof/typeof/offsetof/etc.)
 };
 
 #define tok_ann(t) ((t)->ann)

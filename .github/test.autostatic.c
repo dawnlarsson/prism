@@ -3,7 +3,7 @@
 // leaves ineligible ones untouched.
 
 static void test_as_basic_int_array(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const int k[3] = {1, 2, 3};\n"
@@ -20,7 +20,7 @@ static void test_as_basic_int_array(void) {
 }
 
 static void test_as_string_array(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const char * const names[2] = {\"hello\", \"world\"};\n"
@@ -37,7 +37,7 @@ static void test_as_string_array(void) {
 }
 
 static void test_as_nested_braces(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const int m[2][2] = {{1, 2}, {3, 4}};\n"
@@ -54,7 +54,7 @@ static void test_as_nested_braces(void) {
 }
 
 static void test_as_designated_init(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const int a[4] = {[0] = 10, [3] = 40};\n"
@@ -71,7 +71,7 @@ static void test_as_designated_init(void) {
 }
 
 static void test_as_negative_numbers(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const int signs[3] = {-1, +2, -3};\n"
@@ -90,7 +90,7 @@ static void test_as_negative_numbers(void) {
 // --- Cases that must NOT get auto-static ---
 
 static void test_as_already_static(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    static const int k[2] = {1, 2};\n"
@@ -108,7 +108,7 @@ static void test_as_already_static(void) {
 }
 
 static void test_as_func_call_in_init(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "int get(void);\n"
 	    "void f(void) {\n"
@@ -126,7 +126,7 @@ static void test_as_func_call_in_init(void) {
 }
 
 static void test_as_variable_in_init(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(int x) {\n"
 	    "    const int k[2] = {x, 2};\n"
@@ -143,7 +143,7 @@ static void test_as_variable_in_init(void) {
 }
 
 static void test_as_file_scope(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "const int k[3] = {1, 2, 3};\n";
 	PrismResult r = prism_transpile_source(code, "as_file.c", f);
@@ -157,7 +157,7 @@ static void test_as_file_scope(void) {
 }
 
 static void test_as_not_const(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    int k[3] = {1, 2, 3};\n"
@@ -174,7 +174,7 @@ static void test_as_not_const(void) {
 }
 
 static void test_as_multi_declarator(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const int a[2] = {1, 2}, b[2] = {3, 4};\n"
@@ -192,7 +192,7 @@ static void test_as_multi_declarator(void) {
 }
 
 static void test_as_no_init(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const int k[3];\n"
@@ -209,7 +209,7 @@ static void test_as_no_init(void) {
 }
 
 static void test_as_raw_excluded(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    raw const int k[3] = {1, 2, 3};\n"
@@ -226,7 +226,7 @@ static void test_as_raw_excluded(void) {
 }
 
 static void test_as_disabled_flag(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	f.auto_static = false;
 	const char *code =
 	    "void f(void) {\n"
@@ -244,7 +244,7 @@ static void test_as_disabled_flag(void) {
 }
 
 static void test_as_enum_constant_init(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "enum { A = 10, B = 20, C = 30 };\n"
 	    "void f(void) {\n"
@@ -262,7 +262,7 @@ static void test_as_enum_constant_init(void) {
 }
 
 static void test_as_extern_excluded(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    extern const int k[3];\n"
@@ -279,7 +279,7 @@ static void test_as_extern_excluded(void) {
 }
 
 static void test_as_char_array(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const char msg[] = {\"hello\"};\n"
@@ -296,7 +296,7 @@ static void test_as_char_array(void) {
 }
 
 static void test_as_cast_in_init(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const long k[2] = {(long)1, (long)2};\n"
@@ -314,7 +314,7 @@ static void test_as_cast_in_init(void) {
 }
 
 static void test_as_vla_dimension(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(int n) {\n"
 	    "    const int arr[n] = {1, 2, 3};\n"
@@ -331,7 +331,7 @@ static void test_as_vla_dimension(void) {
 }
 
 static void test_as_typeof_vla(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(int n) {\n"
 	    "    const typeof(int[n]) arr[3] = {{1},{2},{3}};\n"
@@ -348,7 +348,7 @@ static void test_as_typeof_vla(void) {
 }
 
 static void test_as_struct_designator(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "struct P { int x, y; };\n"
 	    "void f(void) {\n"
@@ -366,7 +366,7 @@ static void test_as_struct_designator(void) {
 }
 
 static void test_as_plain_ident_rejected(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "const int G = 5;\n"
 	    "void f(void) {\n"
@@ -384,7 +384,7 @@ static void test_as_plain_ident_rejected(void) {
 }
 
 static void test_as_for_init_excluded(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    for (const int arr[2] = {1,2}; arr[0]; ) break;\n"
@@ -400,7 +400,7 @@ static void test_as_for_init_excluded(void) {
 }
 
 static void test_as_auto_storage_class(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    auto const int arr[2] = {1, 2};\n"
@@ -417,7 +417,7 @@ static void test_as_auto_storage_class(void) {
 }
 
 static void test_as_constexpr_excluded(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    constexpr const int arr[3] = {1, 2, 3};\n"
@@ -434,7 +434,7 @@ static void test_as_constexpr_excluded(void) {
 }
 
 static void test_as_thread_local_excluded(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    thread_local const int arr[3] = {1, 2, 3};\n"
@@ -450,7 +450,7 @@ static void test_as_thread_local_excluded(void) {
 }
 
 static void test_as_volatile_excluded(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const volatile int arr[3] = {1, 2, 3};\n"
@@ -467,7 +467,7 @@ static void test_as_volatile_excluded(void) {
 }
 
 static void test_as_volatile_const_reversed(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    volatile const int arr[3] = {1, 2, 3};\n"
@@ -484,7 +484,7 @@ static void test_as_volatile_const_reversed(void) {
 }
 
 static void test_as_cleanup_attr_excluded(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void dtor(const int (*p)[3]) { (void)p; }\n"
 	    "void f(void) {\n"
@@ -502,7 +502,7 @@ static void test_as_cleanup_attr_excluded(void) {
 }
 
 static void test_as_c23_attr_excluded(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const int arr[3] [[maybe_unused]] = {1, 2, 3};\n"
@@ -518,7 +518,7 @@ static void test_as_c23_attr_excluded(void) {
 }
 
 static void test_as_zeroinit_off_still_promotes(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	f.zeroinit = false;
 	const char *code =
 	    "void f(void) {\n"
@@ -536,7 +536,7 @@ static void test_as_zeroinit_off_still_promotes(void) {
 }
 
 static void test_as_volatile_member_excluded(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const struct { volatile int x; } arr[1] = {{5}};\n"
@@ -553,7 +553,7 @@ static void test_as_volatile_member_excluded(void) {
 }
 
 static void test_as_typedef_volatile_excluded(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "typedef volatile int vint;\n"
 	    "void f(void) {\n"
@@ -571,7 +571,7 @@ static void test_as_typedef_volatile_excluded(void) {
 }
 
 static void test_as_typedef_volatile_member_excluded(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "typedef struct { volatile int x; } VS;\n"
 	    "void f(void) {\n"
@@ -589,7 +589,7 @@ static void test_as_typedef_volatile_member_excluded(void) {
 }
 
 static void test_as_const_ptr_array_excluded(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const int *arr[3] = {0, 0, 0};\n"
@@ -606,7 +606,7 @@ static void test_as_const_ptr_array_excluded(void) {
 }
 
 static void test_as_const_ptr_const_array_promoted(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const int * const arr[3] = {0, 0, 0};\n"
@@ -623,7 +623,7 @@ static void test_as_const_ptr_const_array_promoted(void) {
 }
 
 static void test_as_double_typedef_volatile(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "typedef struct { volatile int x; } Inner;\n"
 	    "typedef Inner Wrapper;\n"
@@ -642,7 +642,7 @@ static void test_as_double_typedef_volatile(void) {
 }
 
 static void test_as_nested_volatile_member(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const struct { struct { volatile int x; } inner; } arr[1] = {{{42}}};\n"
@@ -659,7 +659,7 @@ static void test_as_nested_volatile_member(void) {
 }
 
 static void test_as_multi_dim_array(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const int arr[2][3] = {{1,2,3},{4,5,6}};\n"
@@ -676,7 +676,7 @@ static void test_as_multi_dim_array(void) {
 }
 
 static void test_as_inferred_size(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const int arr[] = {1, 2, 3};\n"
@@ -693,7 +693,7 @@ static void test_as_inferred_size(void) {
 }
 
 static void test_as_pointer_to_array_excluded(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    int x[3];\n"
@@ -711,7 +711,7 @@ static void test_as_pointer_to_array_excluded(void) {
 }
 
 static void test_as_func_ptr_array_excluded(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void a(void);\nvoid b(void);\n"
 	    "void f(void) {\n"
@@ -729,7 +729,7 @@ static void test_as_func_ptr_array_excluded(void) {
 }
 
 static void test_as_enum_designator_init(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "enum { IDX = 2 };\n"
 	    "void f(void) {\n"
@@ -747,7 +747,7 @@ static void test_as_enum_designator_init(void) {
 }
 
 static void test_as_decrement_in_init_excluded(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const int arr[1] = {--1};\n"
@@ -765,7 +765,7 @@ static void test_as_decrement_in_init_excluded(void) {
 }
 
 static void test_as_stmt_expr_in_init_excluded(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
 	    "void f(void) {\n"
 	    "    const int arr[1] = {({int t=1;t;})};\n"
@@ -783,7 +783,7 @@ static void test_as_stmt_expr_in_init_excluded(void) {
 }
 
 static void test_as_features_isolated(void) {
-	PrismFeatures f = prism_defaults();
+	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	f.zeroinit = false;
 	f.orelse = false;
 	const char *code =

@@ -387,9 +387,9 @@ The transformation is conservative — it only fires when all of these hold:
 
 **Opt-out:** `prism -fno-auto-static src.c`
 
-## Bounds Checking (opt-in)
+## Bounds Checking
 
-Prism can wrap array subscripts with a runtime bounds check, turning silent buffer overflows into immediate traps:
+Prism wraps array subscripts with a runtime bounds check, turning silent buffer overflows into immediate traps. **This is on by default** — Prism's philosophy is opt-out, not opt-in: you chose Prism for safety, not to configure it.
 
 ```c
 void process(void) {
@@ -397,8 +397,8 @@ void process(void) {
     int n = get_count();
     int vla[n];
 
-    arr[i] = 5;      // with -fbounds-check: traps if i >= 100
-    vla[j] = 7;      // with -fbounds-check: traps if j >= n
+    arr[i] = 5;      // traps if i >= 100
+    vla[j] = 7;      // traps if j >= n
     int x = arr[k];  // initializers are checked too
     use(arr[m]);     // so are function-call arguments
 }
@@ -416,17 +416,22 @@ The `sizeof` ratio gives the correct length for both fixed arrays (compile-time 
 - Fixed-size local arrays: `int arr[100]; arr[i]`
 - Local VLAs: `int vla[n]; vla[i]`
 - Outer dimension of local multi-dim arrays: `m[i][j]` checks `i`
+- Nested subscripts in index expressions: both outer and inner are wrapped in `arr[m[i]]`
 - Declaration initializers and function-call arguments
 
-**What's not checked:**
+**What's intentionally NOT wrapped (to avoid false positives or false negatives):**
+- Unevaluated operands: `sizeof(arr[i])`, `_Alignof(arr[i])`, `typeof(arr[i])`, `offsetof(T, arr[i])`, `__builtin_offsetof(T, arr[i])` — operand is not evaluated; an offsetof subscript refers to a struct field whose size is unrelated to any same-named local
+- Struct/union member subscripts: `s.arr[i]`, `p->arr[i]` — field size ≠ any same-named local
+- Unary address-of: `&arr[i]` — C permits one-past-end addresses (index == length is legal)
 - Pointer subscripts (`p[i]` where `p` is `int *`)
 - Array parameters (they decay to pointers in C)
 - `raw { ... }` blocks (Prism transformations are fully suppressed)
+- File-scope / extern arrays (current limitation; kernel-style globals ship unchecked)
 - Inner dimensions of multi-dim subscripts (v1 limitation)
 
 The check is a single predicted-not-taken branch per subscript; the backend compiler constant-folds the `sizeof` ratio for fixed arrays and often eliminates the whole check when it can prove the index is in range.
 
-**Opt-in:** `prism -fbounds-check src.c` (default: off)
+**Opt-out:** `prism -fno-bounds-check src.c`
 
 ## Multi-File & Passthrough
 

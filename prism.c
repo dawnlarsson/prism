@@ -474,7 +474,8 @@ PRISM_API PrismFeatures prism_defaults(void) {
 			       .flatten_headers = true,
 			       .orelse = true,
 			       .auto_unreachable = true,
-			       .auto_static = true};
+			       .auto_static = true,
+			       .bounds_check = true};
 }
 
 static uint32_t features_to_bits(PrismFeatures f) {
@@ -2027,6 +2028,42 @@ static Token *try_bracket_orelse(Token *tok) {
 	return NULL;
 }
 
+// -fbounds-check: one-shot scan that marks every '[' inside an unevaluated
+// operand (sizeof / _Alignof / alignof / typeof / offsetof /
+// __builtin_offsetof) with P1_UNEVAL_BRACKET. These brackets must NOT be
+// wrapped — sizeof doesn't evaluate its operand for non-VLA types and
+// offsetof's subscripts refer to struct field sizes, not any local
+// variable that happens to share a name.
+//
+// Recognition:
+//   - tok->flags & TF_SIZEOF  covers sizeof, alignof, _Alignof, offsetof
+//   - tok->tag & TT_TYPEOF    covers typeof, typeof_unqual, __typeof__, ...
+//   - name "__builtin_offsetof" is recognized by string compare (it is an
+//     identifier, not a keyword, so no tag/flag is set)
+//
+// The operand must be parenthesized — we require the next token to be '('
+// with a matching ')'. The no-paren form `sizeof x` cannot syntactically
+// contain a subscript outside of its own balanced groups, so this scan
+// is complete for the cases we care about.
+static void p1_mark_uneval_brackets(void) {
+	for (int i = 0; i < token_count; i++) {
+		Token *t = &token_pool[i];
+		bool is_uneval = (t->flags & TF_SIZEOF) || (t->tag & TT_TYPEOF);
+		if (!is_uneval && t->kind == TK_IDENT && t->len == 18 &&
+		    memcmp(tok_loc(t), "__builtin_offsetof", 18) == 0)
+			is_uneval = true;
+		if (!is_uneval) continue;
+		Token *paren = tok_next(t);
+		if (!paren || !match_ch(paren, '(') || !(paren->flags & TF_OPEN)) continue;
+		Token *close = tok_match(paren);
+		if (!close) continue;
+		for (Token *u = tok_next(paren); u != close && u->kind != TK_EOF; u = tok_next(u)) {
+			if (match_ch(u, '[') && (u->flags & TF_OPEN))
+				tok_ann(u) |= P1_UNEVAL_BRACKET;
+		}
+	}
+}
+
 // -fbounds-check: if `tok` is `[` of an expression subscript `arr[idx]`
 // where `arr` (last_emitted) is a known local array variable, emit
 // `[__prism_bchk((size_t)(idx), sizeof(arr)/sizeof(arr[0]))]` and return
@@ -2037,7 +2074,7 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	if (!FEAT(F_BOUNDS_CHECK)) return NULL;
 	if (!match_ch(tok, '[') || !(tok->flags & TF_OPEN) || !tok_match(tok)) return NULL;
 	if (tok->flags & TF_C23_ATTR) return NULL;
-	if (tok_ann(tok) & P1_DECL_BRACKET) return NULL;
+	if (tok_ann(tok) & (P1_DECL_BRACKET | P1_UNEVAL_BRACKET)) return NULL;
 	if (!last_emitted || last_emitted->kind != TK_IDENT) return NULL;
 	if (is_known_typedef(last_emitted)) return NULL;
 	// Reject struct/union member subscripts like `s.arr[i]` and `p->arr[i]`.
@@ -2051,11 +2088,44 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	if (!te || te->is_param || te->is_enum_const) return NULL;
 	if (!te->is_array && !te->is_vla_var) return NULL;
 
+	// Skip unary `&arr[i]`: taking address is legal through index == size
+	// (C allows one-past-end), so wrapping would spuriously trap.
+	if (tok_idx(last_emitted) >= 1) {
+		Token *prev = &token_pool[tok_idx(last_emitted) - 1];
+		if (match_ch(prev, '&') && !(prev->flags & TF_OPEN)) {
+			// Determine unary vs binary &: look one token further back.
+			bool unary = true;
+			if (tok_idx(prev) >= 1) {
+				Token *pp = &token_pool[tok_idx(prev) - 1];
+				// Binary-& follows a value-producing token.
+				if (pp->kind == TK_IDENT || pp->kind == TK_NUM ||
+				    pp->kind == TK_STR ||
+				    match_ch(pp, ')') || match_ch(pp, ']'))
+					unary = false;
+			}
+			if (unary) return NULL;
+		}
+	}
+
 	Token *arr_tok = last_emitted;
 	Token *close = tok_match(tok);
 	OUT_LIT("[__prism_bchk((size_t)(");
-	for (Token *t = tok_next(tok); t != close && t->kind != TK_EOF; t = tok_next(t))
-		emit_tok(t);
+	// Recurse into index expression so nested subscripts (arr[m[i]]),
+	// stmt-exprs, and further balanced groups are also bounds-checked.
+	for (Token *t = tok_next(tok); t != close && t->kind != TK_EOF;) {
+		if ((t->flags & TF_OPEN) && is_stmt_expr_open(t)) {
+			t = emit_stmt_expr(t);
+			continue;
+		}
+		Token *bc_next = try_bounds_check_subscript(t);
+		if (bc_next) { t = bc_next; continue; }
+		if ((t->flags & TF_OPEN) && tok_match(t)) {
+			t = walk_balanced(t, true);
+			continue;
+		}
+		{ Token *r = emit_tok_checked(t); if (r) { t = r; continue; } }
+		t = tok_next(t);
+	}
 	OUT_LIT("), sizeof(");
 	out_str(tok_loc(arr_tok), arr_tok->len);
 	OUT_LIT(")/sizeof(");
@@ -8733,6 +8803,9 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 	// -fbounds-check: emit the inline bounds-check helper once per TU.
 	// MSVC lacks __builtin_expect / __builtin_trap — fall back to __assume / __debugbreak.
 	if (FEAT(F_BOUNDS_CHECK)) {
+		// Tag every '[' inside sizeof/_Alignof/typeof/offsetof so Pass 2
+		// does not wrap subscripts in unevaluated operands.
+		p1_mark_uneval_brackets();
 		if (is_msvc_cached) {
 			OUT_LIT("\n#include <stddef.h>\n#include <stdlib.h>\n"
 				"static __forceinline size_t __prism_bchk(size_t __i, size_t __n) {\n"
@@ -9953,6 +10026,7 @@ static void print_help(void) {
 	       "  -fno-flatten-headers  Disable header flattening\n"
 	       "  -fno-auto-unreachable Disable __builtin_unreachable after noreturn calls\n"
 	       "  -fno-auto-static      Disable auto-static for const arrays with literal inits\n"
+	       "  -fno-bounds-check     Disable runtime bounds checks on local/param array subscripts\n"
 	       "  --prism-cc=<compiler> Use specific compiler\n"
 	       "  --prism-verbose       Show commands\n\n"
 	       "All other flags are passed through to CC.\n\n"

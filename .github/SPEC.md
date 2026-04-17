@@ -844,7 +844,7 @@ Eliminates hidden `memcpy` calls for:
 
 `-fno-auto-static` on the command line, or `features.auto_static = false` in library mode.
 
-### 6.10 Bounds Checking (`-fbounds-check`, opt-in)
+### 6.10 Bounds Checking (`-fbounds-check`, default-on)
 
 #### Problem
 
@@ -892,8 +892,11 @@ A subscript `X[Y]` is wrapped when all of the following hold:
 3. `X` is a known local array variable — `typedef_lookup(X)` returns an entry with `is_array` or `is_vla_var`, and the entry is not a parameter (`!is_param`) and not an enum constant (`!is_enum_const`)
 4. `X` is not a typedef name (`!is_known_typedef(X)`)
 5. The `[` token does not carry `P1_DECL_BRACKET` (declarator brackets, tagged in Phase 1 by `decl_array_dims`, are never wrapped)
-6. The `[` is not a C23 attribute opener (`!TF_C23_ATTR`)
-7. The bracket is balanced (`tok_match(tok)` succeeds)
+6. The `[` token does not carry `P1_UNEVAL_BRACKET` — tagged by `p1_mark_uneval_brackets` for every `[` inside a parenthesized `sizeof` / `_Alignof` / `alignof` / `typeof` / `typeof_unqual` / `offsetof` / `__builtin_offsetof` operand. The operand is unevaluated, and in `offsetof` a subscript names a struct field (unrelated to any same-named local), so wrapping would be a silent false negative or a spurious trap on VLAs.
+7. The `[` is not a C23 attribute opener (`!TF_C23_ATTR`)
+8. The token immediately before `X` is not a `.` or `->` member operator (`!(prev_tag & TT_MEMBER)`) — `s.arr[i]` and `p->arr[i]` name a struct field, whose size is unrelated to any same-named local
+9. The token immediately before `X` is not a unary `&` (address-of) — C permits one-past-end addresses, so `&arr[len]` is legal and must not trap. Binary `&` (bitwise AND) is distinguished from unary `&` by peeking one token further back for a value-producing token (identifier, number, string, `)`, `]`).
+10. The bracket is balanced (`tok_match(tok)` succeeds)
 
 Array variables are registered into the typedef table with `is_array = true` by a Phase 1D hook that runs only when `FEAT(F_BOUNDS_CHECK)` is on, so the feature is strictly zero-cost for users who leave it off.
 
@@ -904,14 +907,20 @@ Array variables are registered into the typedef table with `is_array = true` by 
 | `arr[i]` where `arr` is a local fixed array | Yes | Primary case |
 | `vla[i]` where `vla` is a local VLA | Yes | `sizeof(vla)` evaluates at runtime |
 | `m[i][j]` (2D local) | Outer `i` only | Inner `[` has `]` as `last_emitted`, not an identifier (v1 limitation) |
+| `arr[m[i]]` (nested in index) | Both | Inner-index walk uses dispatch, wraps nested subscripts recursively |
 | `arr[i]` on RHS of `int x = arr[i]` | Yes | Wrapped during declaration initializer walk |
 | `f(arr[i])` | Yes | Wrapped during balanced-group walk inside call args |
 | `int arr[100]` (declarator) | No | Tagged `P1_DECL_BRACKET` in Phase 1 |
+| `sizeof(arr[i])`, `_Alignof(arr[i])`, `typeof(arr[i])` | No | Tagged `P1_UNEVAL_BRACKET`; operand unevaluated (would spuriously trap on VLAs) |
+| `offsetof(T, arr[i])`, `__builtin_offsetof(T, arr[i])` | No | Subscript names a struct field; local's size unrelated |
+| `s.arr[i]`, `p->arr[i]` | No | Member subscript filtered via `TT_MEMBER` on prev token |
+| `&arr[i]` (unary address-of) | No | One-past-end address is legal C |
 | `p[i]` where `p` is a pointer parameter/local | No | Not tracked as an array |
 | `a[i]` where `a` is an array parameter (`int a[10]`) | No | Parameter entries are filtered via `is_param` |
+| `gArr[i]` at file scope | No | File-scope arrays are not registered (v1 limitation) |
 | `arr[i]` inside `raw { ... }` | N/A — `raw` suppresses Prism transformations at parse time | |
 
-The index expression itself is not re-walked for nested subscripts in v1 — inner `emit_tok` calls inside the index emit raw. This is a known limitation.
+The index expression **is** re-walked recursively: `arr[m[i]]` wraps both subscripts. The inner walk uses the full dispatch chain (statement expressions, balanced groups, nested bounds checks).
 
 #### Side-effect evaluation
 
@@ -922,6 +931,7 @@ The bounds helper takes `idx` by value, so any side effects in the index (`arr[i
 - **Flag:** `F_BOUNDS_CHECK = 256` (parse.c) and `PrismFeatures.bounds_check` (prism.c)
 - **CLI:** `-fbounds-check` / `-fno-bounds-check`
 - **Declarator tagging:** `decl_array_dims` sets `P1_DECL_BRACKET = 1 << 9` on every declarator `[`
+- **Unevaluated-operand tagging:** `p1_mark_uneval_brackets` sets `P1_UNEVAL_BRACKET = 1 << 10` on every `[` inside a parenthesized `sizeof` / `_Alignof` / `alignof` / `typeof` / `__typeof` / `offsetof` / `__builtin_offsetof` operand. Runs once per TU, gated on `F_BOUNDS_CHECK`. Recognition uses `TF_SIZEOF` (sizeof/alignof/_Alignof/offsetof), `TT_TYPEOF` (typeof family), and a lexeme match on `__builtin_offsetof`.
 - **Shadow registration:** Phase 1D declarator loop registers plain local array variables via `typedef_add_shadow(..., is_array=true)` when the feature is on
 - **Preamble helper:** emitted in `transpile_tokens` after `emit_system_includes`
 - **Emission hook:** `try_bounds_check_subscript` is called from the main Pass 2 emit loop and from `walk_balanced` (covering function-call arguments, declaration initializers, and other balanced groups)
@@ -934,7 +944,7 @@ The bounds helper takes `idx` by value, so any side effects in the index (`arr[i
 
 #### Disable
 
-Off by default. Enable with `-fbounds-check` on the command line, or `features.bounds_check = true` in library mode.
+On by default (Prism's philosophy is opt-out, not opt-in). Disable with `-fno-bounds-check` on the command line, or `features.bounds_check = false` in library mode.
 
 ---
 
