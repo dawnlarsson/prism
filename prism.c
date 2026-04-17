@@ -2050,9 +2050,41 @@ static void p1_mark_uneval_brackets(void) {
 		if (!next) continue;
 		// Parenthesized form: sizeof(...), _Alignof(...), typeof(...),
 		// __builtin_offsetof(...). Tag every '[' in the balanced group.
+		// For sizeof/typeof (no-paren-required forms), the operand can
+		// also be a postfix expression starting with `(...)` followed by
+		// further postfix operators, e.g. `sizeof (a)[i]` which parses as
+		// `sizeof ((a)[i])`. Continue scanning the postfix chain after
+		// the `)` for such cases. _Alignof / offsetof require parens, so
+		// their TF_SIZEOF case harmlessly falls through here too; those
+		// have no further postfix, so the chain walker exits immediately.
 		if (match_ch(next, '(') && (next->flags & TF_OPEN)) {
 			Token *close = tok_match(next);
-			if (close) p1_tag_brackets_in_range(next, close);
+			if (close) {
+				p1_tag_brackets_in_range(next, close);
+				// Continue postfix chain from after `)`.
+				Token *p = tok_next(close);
+				while (p && p->kind != TK_EOF) {
+					if ((match_ch(p, '[') || match_ch(p, '(')) &&
+					    (p->flags & TF_OPEN) && tok_match(p)) {
+						if (match_ch(p, '['))
+							tok_ann(p) |= P1_UNEVAL_BRACKET;
+						Token *c = tok_match(p);
+						p1_tag_brackets_in_range(p, c);
+						p = tok_next(c); continue;
+					}
+					if (match_ch(p, '.') ||
+					    (p->len == 2 && memcmp(tok_loc(p), "->", 2) == 0)) {
+						p = tok_next(p);
+						if (p && p->kind == TK_IDENT) p = tok_next(p);
+						continue;
+					}
+					if (p->len == 2 && (memcmp(tok_loc(p), "++", 2) == 0 ||
+					                    memcmp(tok_loc(p), "--", 2) == 0)) {
+						p = tok_next(p); continue;
+					}
+					break;
+				}
+			}
 			continue;
 		}
 		// No-paren form: `sizeof UNARY-EXPR` and GCC `__typeof UNARY-EXPR`.
@@ -2111,23 +2143,45 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	if (!match_ch(tok, '[') || !(tok->flags & TF_OPEN) || !tok_match(tok)) return NULL;
 	if (tok->flags & TF_C23_ATTR) return NULL;
 	if (tok_ann(tok) & (P1_DECL_BRACKET | P1_UNEVAL_BRACKET)) return NULL;
-	if (!last_emitted || last_emitted->kind != TK_IDENT) return NULL;
-	if (is_known_typedef(last_emitted)) return NULL;
+	if (!last_emitted) return NULL;
+	Token *name_tok = last_emitted;
+	// Look through one level of parens: `(a)[i]` — if last_emitted is `)`
+	// matching a `(` whose content is exactly one identifier token, treat
+	// that identifier as the array operand. Guard against `f(x)[i]` /
+	// `sizeof(x)[i]` by requiring the `(` not follow a value-producing
+	// token or a keyword (which would make it a call / sizeof / cast).
+	if (match_ch(name_tok, ')') && tok_match(name_tok)) {
+		Token *open = tok_match(name_tok);
+		Token *inner = tok_next(open);
+		if (inner && inner->kind == TK_IDENT &&
+		    tok_next(inner) == name_tok) {
+			bool ok = true;
+			if (tok_idx(open) >= 1) {
+				Token *before = &token_pool[tok_idx(open) - 1];
+				if (before->kind == TK_IDENT || before->kind == TK_NUM ||
+				    match_ch(before, ')') || match_ch(before, ']'))
+					ok = false;
+			}
+			if (ok) name_tok = inner;
+		}
+	}
+	if (name_tok->kind != TK_IDENT) return NULL;
+	if (is_known_typedef(name_tok)) return NULL;
 	// Reject struct/union member subscripts like `s.arr[i]` and `p->arr[i]`.
 	// The identifier names a struct field whose size is unrelated to any
 	// local variable that happens to share the name — wrapping with
 	// sizeof(local_arr) would be a silent false negative.
-	if (tok_idx(last_emitted) >= 1 &&
-	    (token_pool[tok_idx(last_emitted) - 1].tag & TT_MEMBER))
+	if (tok_idx(name_tok) >= 1 &&
+	    (token_pool[tok_idx(name_tok) - 1].tag & TT_MEMBER))
 		return NULL;
-	TypedefEntry *te = typedef_lookup(last_emitted);
+	TypedefEntry *te = typedef_lookup(name_tok);
 	if (!te || te->is_param || te->is_enum_const) return NULL;
 	if (!te->is_array && !te->is_vla_var) return NULL;
 
 	// Skip unary `&arr[i]`: taking address is legal through index == size
 	// (C allows one-past-end), so wrapping would spuriously trap.
-	if (tok_idx(last_emitted) >= 1) {
-		Token *prev = &token_pool[tok_idx(last_emitted) - 1];
+	if (tok_idx(name_tok) >= 1) {
+		Token *prev = &token_pool[tok_idx(name_tok) - 1];
 		if (match_ch(prev, '&') && !(prev->flags & TF_OPEN)) {
 			// Determine unary vs binary &: look one token further back.
 			bool unary = true;
@@ -2143,7 +2197,7 @@ static Token *try_bounds_check_subscript(Token *tok) {
 		}
 	}
 
-	Token *arr_tok = last_emitted;
+	Token *arr_tok = name_tok;
 	Token *close = tok_match(tok);
 	OUT_LIT("[__prism_bchk((__prism_bchk_size_t)(");
 	// Recurse into index expression so nested subscripts (arr[m[i]]),
@@ -7266,8 +7320,16 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		// above (name collides with typedef/enum/defer), promote the new entry
 		// to is_array=true. Otherwise register a fresh shadow entry.
 		// Block scope only (file-scope arrays would require global registration).
+		// Also catches typedef-based arrays: `typedef int T[10]; T a;` where
+		// the declarator has no '[' but the base type resolves to an array.
+		bool base_is_array_here = false;
 		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name && brace_depth > 0 &&
-		    decl.is_array && !decl.is_pointer && !decl.is_func_ptr) {
+		    !decl.is_array && !decl.is_pointer && !decl.is_func_ptr) {
+			for (Token *bt = type_tok; bt && bt != type.end; bt = tok_next(bt))
+				if (is_array_typedef(bt)) { base_is_array_here = true; break; }
+		}
+		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name && brace_depth > 0 &&
+		    (decl.is_array || base_is_array_here) && !decl.is_pointer && !decl.is_func_ptr) {
 			int pre = typedef_table.count;
 			if (!did_shadow) {
 				TYPEDEF_ADD_IDX(typedef_add_shadow(tok_loc(decl.var_name), decl.var_name->len, brace_depth), decl.var_name);

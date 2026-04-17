@@ -822,6 +822,48 @@ static void test_bounds_check_extreme_edges(void) {
 		prism_free(&r);
 	}
 
+	// Parenthesized array name `(a)[i]` — must still wrap.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[10]={0}; int i=3; return (a)[i];}\n",
+		    "bc_paren_name.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-paren-name: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "__prism_bchk") != NULL,
+			      "bc-paren-name: parenthesized array subscript wrapped");
+		prism_free(&r);
+	}
+
+	// Typedef-based array `typedef int T[10]; T a;` — must wrap `a[i]`.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "typedef int T[10];\n"
+		    "int main(void){T a={0}; int i=3; return a[i];}\n",
+		    "bc_typedef_arr.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-typedef-arr: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "a[__prism_bchk") != NULL,
+			      "bc-typedef-arr: typedef array subscript wrapped");
+		prism_free(&r);
+	}
+
+	// `sizeof (a)[i]` parses as `sizeof ((a)[i])` — the `[i]` is in an
+	// unevaluated operand (postfix chain of sizeof) and must NOT wrap.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[10]={0};\n"
+		    "return (int)sizeof (a)[3];}\n",
+		    "bc_sizeof_postfix.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-sizeof-postfix: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "a[__prism_bchk") == NULL,
+			      "bc-sizeof-postfix: sizeof postfix chain not wrapped");
+		prism_free(&r);
+	}
+
 	// const / volatile / restrict qualifiers on array — must still wrap.
 	{
 		PrismFeatures f = prism_defaults();
