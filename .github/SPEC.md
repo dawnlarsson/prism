@@ -867,20 +867,21 @@ The check applies uniformly to both fixed-size local arrays (`int arr[100]`) and
 Emitted once per translation unit at the top of the preamble:
 
 ```c
-// GCC/Clang/TCC (uses compiler built-in size type, no header required):
-typedef __SIZE_TYPE__ __prism_bchk_size_t;
+// GCC/Clang/TCC — `unsigned long long` is guaranteed ≥ 64 bits on C99+,
+// so it fits `size_t` on every supported target. `__SIZE_TYPE__` is *not*
+// used because `-fpreprocessed` / `-x cpp-output` suppresses macro
+// expansion; `unsigned long` would truncate on LLP64 (MinGW / Clang-on-
+// Windows x64, where `size_t` is 64 bits but `unsigned long` is 32 bits).
+typedef unsigned long long __prism_bchk_size_t;
 static inline __attribute__((always_inline)) __prism_bchk_size_t
 __prism_bchk(__prism_bchk_size_t __i, __prism_bchk_size_t __n) {
     if (__builtin_expect(__i >= __n, 0)) __builtin_trap();
     return __i;
 }
 
-// MSVC (no __SIZE_TYPE__; pick by _WIN64, declare abort locally):
-#if defined(_WIN64)
+// MSVC (cl.exe family): matches LLP64 size_t on x64; on x86 the 32-bit
+// size_t indices promote to __int64 without loss.
 typedef unsigned __int64 __prism_bchk_size_t;
-#else
-typedef unsigned int __prism_bchk_size_t;
-#endif
 void __cdecl abort(void);
 static __forceinline __prism_bchk_size_t __prism_bchk(__prism_bchk_size_t __i, __prism_bchk_size_t __n) {
     if (__i >= __n) { __debugbreak(); abort(); }
