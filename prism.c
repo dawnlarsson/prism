@@ -287,6 +287,20 @@ static void signal_temps_clear(void) {
 	signal_temps_store(0);
 }
 
+// Mark a previously-registered temp path as freed so the signal handler
+// will not attempt to unlink a path whose owning FILE* has already been
+// closed/unlinked normally. Slot memory is retained for possible reuse.
+static void signal_temps_unregister(const char *path) {
+	if (!path) return;
+	sig_atomic_t n = signal_temps_load();
+	for (int i = 0; i < n; i++) {
+		if (signal_temps_ready_load(i) && strcmp(signal_temps[i], path) == 0) {
+			signal_temps_ready_store(i, 0);
+			return;
+		}
+	}
+}
+
 // --- Thread-Local Transpiler State ---
 
 static PRISM_THREAD_LOCAL char **system_include_list; // Ordered list of includes
