@@ -2039,7 +2039,8 @@ static void p1_tag_brackets_in_range(Token *open, Token *close) {
 }
 
 static void p1_mark_uneval_brackets(void) {
-	for (int i = 0; i < token_count; i++) {
+	// token_pool[0] is a reserved sentinel (next_idx 0 means "NULL"); start at 1.
+	for (uint32_t i = 1; i < token_count; i++) {
 		Token *t = &token_pool[i];
 		bool is_uneval = (t->flags & TF_SIZEOF) || (t->tag & TT_TYPEOF);
 		if (!is_uneval && t->kind == TK_IDENT && t->len == 18 &&
