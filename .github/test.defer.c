@@ -1586,6 +1586,59 @@ void test_defer_stmt_expr_goto_bypass(void) {
 	    "goto");
 }
 
+void test_defer_static_storage_rejected(void) {
+	// A defer body is textually copied to every exit point.  Each copy
+	// lives in its own scope, so `static`/thread-local declarations
+	// produce N independent objects — users expecting one shared
+	// counter would silently get N of them.  Reject at the boundary.
+	check_defer_transpile_rejects(
+	    "int f(int x) {\n"
+	    "    defer { static int cnt = 0; cnt++; }\n"
+	    "    if (x) return 1;\n"
+	    "    return 0;\n"
+	    "}\n",
+	    "defer_static_rejected.c",
+	    "static inside defer body rejected",
+	    "static");
+	check_defer_transpile_rejects(
+	    "void f(void) {\n"
+	    "    defer { _Thread_local int t = 0; (void)t; }\n"
+	    "}\n",
+	    "defer_thread_local_rejected.c",
+	    "_Thread_local inside defer body rejected",
+	    "thread-local");
+	check_defer_transpile_rejects(
+	    "void f(void) {\n"
+	    "    defer { __thread int t = 0; (void)t; }\n"
+	    "}\n",
+	    "defer___thread_rejected.c",
+	    "__thread inside defer body rejected",
+	    "thread-local");
+	check_defer_transpile_rejects(
+	    "void f(void) {\n"
+	    "    defer {\n"
+	    "        int v = ({ static int z = 0; z++; z; });\n"
+	    "        (void)v;\n"
+	    "    }\n"
+	    "}\n",
+	    "defer_static_in_stmt_expr_rejected.c",
+	    "static inside stmt-expr inside defer rejected",
+	    "static");
+}
+
+void test_defer_extern_allowed(void) {
+	// `extern` declares (does not define) a single external symbol — safe
+	// to repeat textually at every defer exit point.
+	PrismResult result = prism_transpile_source(
+	    "int main(void) {\n"
+	    "    defer { extern int printf(const char*, ...); printf(\"hi\\n\"); }\n"
+	    "    return 0;\n"
+	    "}\n",
+	    "defer_extern_ok.c", prism_defaults());
+	CHECK(result.status == PRISM_OK, "extern inside defer body is accepted");
+	prism_free(&result);
+}
+
 void test_defer_computed_goto_rejected(void) {
 	check_defer_transpile_rejects(
 	    "int f(void) {\n"
@@ -7008,6 +7061,8 @@ void run_defer_tests(void) {
 	test_defer_asm_rejected();
 	);
 	test_defer_setjmp_rejected();
+	test_defer_static_storage_rejected();
+	test_defer_extern_allowed();
 	test_defer_glibc_sigsetjmp_rejected();
 	UNIX_ONLY(test_defer_vfork_rejected());
 	test_auto_type_fallback_requires_gnu_extensions();

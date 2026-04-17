@@ -2042,6 +2042,32 @@ static void p1_mark_uneval_brackets(void) {
 	// token_pool[0] is a reserved sentinel (next_idx 0 means "NULL"); start at 1.
 	for (uint32_t i = 1; i < token_count; i++) {
 		Token *t = &token_pool[i];
+		// _Generic(controlling_expr, type1: val1, ...): per C11 §6.5.1.1p3,
+		// the controlling expression is NOT evaluated. (The selected
+		// association expression IS evaluated, so subscripts in the
+		// associations still wrap normally.) Tag every `[` inside the
+		// first comma-separated entry at paren depth 0.
+		if (t->tag & TT_GENERIC) {
+			Token *lp = tok_next(t);
+			if (lp && match_ch(lp, '(') && (lp->flags & TF_OPEN) && tok_match(lp)) {
+				Token *close = tok_match(lp);
+				int depth = 0;
+				for (Token *u = tok_next(lp); u != close && u->kind != TK_EOF; u = tok_next(u)) {
+					if (match_ch(u, '[') && (u->flags & TF_OPEN))
+						tok_ann(u) |= P1_UNEVAL_BRACKET;
+					if ((u->flags & TF_OPEN) && (match_ch(u, '(') || match_ch(u, '[') || match_ch(u, '{'))) {
+						depth++;
+						continue;
+					}
+					if (match_ch(u, ')') || match_ch(u, ']') || match_ch(u, '}')) {
+						depth--;
+						continue;
+					}
+					if (depth == 0 && match_ch(u, ',')) break;
+				}
+			}
+			continue;
+		}
 		bool is_uneval = (t->flags & TF_SIZEOF) || (t->tag & TT_TYPEOF);
 		if (!is_uneval && t->kind == TK_IDENT && t->len == 18 &&
 		    memcmp(tok_loc(t), "__builtin_offsetof", 18) == 0)

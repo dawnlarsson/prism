@@ -420,7 +420,7 @@ The `sizeof` ratio gives the correct length for both fixed arrays (compile-time 
 - Declaration initializers and function-call arguments
 
 **What's intentionally NOT wrapped (to avoid false positives or false negatives):**
-- Unevaluated operands: `sizeof(arr[i])`, `_Alignof(arr[i])`, `typeof(arr[i])`, `offsetof(T, arr[i])`, `__builtin_offsetof(T, arr[i])` — operand is not evaluated; an offsetof subscript refers to a struct field whose size is unrelated to any same-named local
+- Unevaluated operands: `sizeof(arr[i])`, `_Alignof(arr[i])`, `typeof(arr[i])`, `offsetof(T, arr[i])`, `__builtin_offsetof(T, arr[i])`, and the controlling expression of `_Generic(arr[i], ...)` — operand is not evaluated; an offsetof subscript refers to a struct field whose size is unrelated to any same-named local
 - Struct/union member subscripts: `s.arr[i]`, `p->arr[i]` — field size ≠ any same-named local
 - Unary address-of: `&arr[i]` — C permits one-past-end addresses (index == length is legal)
 - Pointer subscripts (`p[i]` where `p` is `int *`)

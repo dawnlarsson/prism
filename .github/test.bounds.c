@@ -413,6 +413,58 @@ static void test_bounds_check_unevaluated_operands(void) {
 		}
 		prism_free(&r);
 	}
+
+	// _Generic controlling expression is unevaluated per C11 §6.5.1.1p3;
+	// subscripts there must not wrap (wrapping turns a pure type-select
+	// into a runtime trap for out-of-range values).
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[10]={0}; int i=50;\n"
+		    "return _Generic(a[i], int: 1, default: 0);}\n",
+		    "bc_generic_ctrl.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-generic-ctrl: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "_Generic(a[i]") != NULL,
+			      "bc-generic-ctrl: controlling subscript not wrapped");
+			CHECK(strstr(r.output, "_Generic(a[__prism_bchk") == NULL,
+			      "bc-generic-ctrl: no wrap inside _Generic controlling expr");
+		}
+		prism_free(&r);
+	}
+
+	// Nested subscript inside _Generic controlling expression — inner
+	// bracket is also unevaluated and must not wrap.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[10]={0}; int b[5]={0}; int i=50;\n"
+		    "return _Generic(a[b[i]], int: 1, default: 0);}\n",
+		    "bc_generic_nested.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-generic-nested: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "__prism_bchk((__prism_bchk_size_t)") == NULL,
+			      "bc-generic-nested: nested controlling subscript not wrapped");
+		prism_free(&r);
+	}
+
+	// _Generic association expression IS evaluated when selected, so
+	// subscripts inside associations MUST still wrap.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[10]={0}; int i=3;\n"
+		    "return _Generic(1, int: a[i], default: 0);}\n",
+		    "bc_generic_assoc.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-generic-assoc: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "a[__prism_bchk") != NULL,
+			      "bc-generic-assoc: association subscript wrapped");
+		prism_free(&r);
+	}
 }
 
 static void test_bounds_check_nested_subscript(void) {

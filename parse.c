@@ -3697,6 +3697,31 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 		error_tok(tok, "labels inside defer blocks produce duplicate labels "
 			  "when the defer body is copied to multiple exit points");
 
+	// Storage classes that create persistent per-scope state (static,
+	// thread_local/_Thread_local/__thread) would be DUPLICATED when the
+	// defer body is copied to multiple exit points — each copy lives in
+	// its own block, so each declares a distinct object.  Users writing
+	// `defer { static int once = 1; if (once) { init(); once = 0; } }`
+	// would silently get N independent "once" flags instead of one.
+	// `extern` is fine (binds to a single external symbol).  `typedef`
+	// is compile-time only.  Scan forward through decl-specifiers.
+	for (Token *s = tok; s && s->kind != TK_EOF; s = tok_next(s)) {
+		if (s->tag & TT_STORAGE) {
+			// "extern" is safe: binds to one external symbol regardless
+			// of how many times its declaration is textually emitted.
+			if (s->ch0 != 'e' || !equal(s, "extern"))
+				error_tok(s, "'static' or thread-local storage inside defer block "
+				             "creates duplicate state per exit path; hoist the "
+				             "declaration outside the defer body");
+			continue;
+		}
+		if (s->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT | TT_INLINE)) {
+			if (s->flags & TF_OPEN) { Token *m = tok_match(s); if (m) s = m; }
+			continue;
+		}
+		break;
+	}
+
 	if (tok->kind == TK_KEYWORD) {
 		validate_defer_control_flow(tok, in_loop, in_switch);
 		if ((tok->tag & TT_DEFER) && !is_known_typedef(tok) &&
