@@ -373,8 +373,17 @@ int main(void) {
 	gettimeofday(&t0, NULL);
 
 	pthread_t threads[sizeof(suites) / sizeof(suites[0])];
+	// Force an 8 MiB stack per worker.  musl's default pthread stack is
+	// 128 KiB, which the recursive parser + deep test inputs overflow (seen
+	// as SIGSEGV/SIGBUS on Alpine x86_64 and arm64 CI at random suites).
+	// glibc (8 MiB) and macOS (512 KiB) normally survive; pin a known-good
+	// value everywhere so the test harness is not libc-dependent.
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
 	for (int i = 0; i < n; i++)
-		pthread_create(&threads[i], NULL, suite_thread, &suites[i]);
+		pthread_create(&threads[i], &attr, suite_thread, &suites[i]);
+	pthread_attr_destroy(&attr);
 	for (int i = 0; i < n; i++)
 		pthread_join(threads[i], NULL);
 
