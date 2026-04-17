@@ -931,6 +931,35 @@ static void test_bounds_check_extreme_edges(void) {
 		prism_free(&r);
 	}
 
+	// File-scope arrays with a known size must be registered so uses
+	// from any function body wrap. `extern T a[];` / tentative `T a[];`
+	// with no size must NOT be registered (sizeof(a) is not a complete
+	// expression at the use site).
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "static int g[10] = {0};\n"
+		    "int main(void){int i=3; return g[i];}\n",
+		    "bc_file_scope.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-file-scope: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "g[__prism_bchk") != NULL,
+			      "bc-file-scope: static file-scope array wrapped");
+		prism_free(&r);
+	}
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "extern int e[];\n"
+		    "int main(void){int i=3; return e[i];}\n",
+		    "bc_file_scope_extern.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-file-scope-extern: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "e[__prism_bchk") == NULL,
+			      "bc-file-scope-extern: extern T a[] not wrapped (incomplete size)");
+		prism_free(&r);
+	}
+
 	// const / volatile / restrict qualifiers on array — must still wrap.
 	{
 		PrismFeatures f = prism_defaults();

@@ -7326,7 +7326,9 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		// look them up at subscript sites. If a shadow was already registered
 		// above (name collides with typedef/enum/defer), promote the new entry
 		// to is_array=true. Otherwise register a fresh shadow entry.
-		// Block scope only (file-scope arrays would require global registration).
+		// Registers at block scope, and at file scope provided the array has
+		// a known size (excludes `extern int a[];` / tentative `int a[];`
+		// which would make sizeof(a) a compile error at the use site).
 		// Also catches typedef-based arrays: `typedef int T[10]; T a;` where
 		// the declarator has no '[' but the base type resolves to an array.
 		// Use the same "actual array storage at top level" predicate the rest
@@ -7334,13 +7336,29 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		// — this registers `int *a[10]` (array of pointers, is_pointer==true)
 		// while correctly excluding `int (*a)[10]` (pointer to array).
 		bool base_is_array_here = false;
-		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name && brace_depth > 0 &&
+		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name &&
 		    !decl.is_array && !decl.is_pointer && !decl.is_func_ptr) {
 			for (Token *bt = type_tok; bt && bt != type.end; bt = tok_next(bt))
 				if (is_array_typedef(bt)) { base_is_array_here = true; break; }
 		}
 		bool reg_as_array = decl.is_array && (!decl.paren_pointer || decl.paren_array);
-		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name && brace_depth > 0 &&
+		// For file-scope registration, require at least one non-empty dim so
+		// sizeof(arr) is a complete type at use sites. Block-scope arrays
+		// always have complete size (C forbids local `int a[];`).
+		bool has_complete_dim = true;
+		if (reg_as_array && brace_depth == 0) {
+			has_complete_dim = false;
+			for (Token *dt = decl.var_name; dt && dt != decl.end; dt = tok_next(dt)) {
+				if (match_ch(dt, '[')) {
+					Token *nx = tok_next(dt);
+					if (nx && !match_ch(nx, ']')) { has_complete_dim = true; break; }
+				}
+			}
+		}
+		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name &&
+		    (brace_depth > 0 ||
+		     (brace_depth == 0 && (reg_as_array || base_is_array_here) &&
+		      has_complete_dim)) &&
 		    (reg_as_array || base_is_array_here) && !decl.is_func_ptr) {
 			int pre = typedef_table.count;
 			if (!did_shadow) {
