@@ -8877,20 +8877,19 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 	// We do NOT #include <stddef.h> / <stdlib.h>: in flatten mode the output is
 	// fed to the backend as already-preprocessed (`-x cpp-output`) and any '#'
 	// directive is a syntax error; in non-flatten mode, re-including stdlib.h
-	// causes struct redefinitions under MSVC. Instead, declare a private size
-	// type via __SIZE_TYPE__ (GCC/Clang/TCC) with an MSVC fallback, and declare
-	// abort() locally so no headers are required.
+	// causes struct redefinitions under MSVC. We also cannot rely on builtin
+	// macros like __SIZE_TYPE__ because `-fpreprocessed` / `-x cpp-output`
+	// suppresses macro expansion, leaving them literal. Use `unsigned long`
+	// which is ≥ 32 bits on every supported platform and matches `size_t` on
+	// LP64 (Linux/macOS/BSD); MSVC gets its own explicit branch. `sizeof(a)/sizeof(a[0])`
+	// is implicitly converted to this type at the call site.
 	if (FEAT(F_BOUNDS_CHECK)) {
 		// Tag every '[' inside sizeof/_Alignof/typeof/offsetof so Pass 2
 		// does not wrap subscripts in unevaluated operands.
 		p1_mark_uneval_brackets();
 		if (is_msvc_cached) {
 			OUT_LIT("\n"
-				"#if defined(_WIN64)\n"
 				"typedef unsigned __int64 __prism_bchk_size_t;\n"
-				"#else\n"
-				"typedef unsigned int __prism_bchk_size_t;\n"
-				"#endif\n"
 				"void __cdecl abort(void);\n"
 				"static __forceinline __prism_bchk_size_t __prism_bchk(__prism_bchk_size_t __i, __prism_bchk_size_t __n) {\n"
 				"    if (__i >= __n) { __debugbreak(); abort(); }\n"
@@ -8898,7 +8897,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 				"}\n");
 		} else {
 			OUT_LIT("\n"
-				"typedef __SIZE_TYPE__ __prism_bchk_size_t;\n"
+				"typedef unsigned long __prism_bchk_size_t;\n"
 				"static inline __attribute__((always_inline)) __prism_bchk_size_t __prism_bchk(__prism_bchk_size_t __i, __prism_bchk_size_t __n) {\n"
 				"    if (__builtin_expect(__i >= __n, 0)) __builtin_trap();\n"
 				"    return __i;\n"
