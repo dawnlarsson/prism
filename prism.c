@@ -2228,29 +2228,71 @@ static Token *try_bounds_check_subscript(Token *tok) {
 		}
 	}
 	Token *name_tok = last_emitted;
-	// Look through any number of paren levels: `((...(a)...))[i]` — at
-	// each step name_tok is a `)`; descend into the innermost `(...)`.
-	// Guard each level against `f(x)[i]` / `sizeof(x)[i]` / casts by
-	// requiring the outermost `(` not follow a value-producing token.
-	while (match_ch(name_tok, ')') && tok_match(name_tok)) {
-		Token *open = tok_match(name_tok);
-		if (tok_idx(open) >= 1) {
-			Token *before = &token_pool[tok_idx(open) - 1];
-			if (before->kind == TK_IDENT || before->kind == TK_NUM ||
-			    match_ch(before, ')') || match_ch(before, ']'))
+	// For multi-dim subscripts `a[i][j]`, the inner `[` is preceded in
+	// the token pool by `]` (close of outer subscript) while `last_emitted`
+	// still points at `a` (since the outer wrap emitted synthetic tokens,
+	// not pool tokens).  To detect the true predecessor we switch to the
+	// pool neighbor when it differs and is structurally relevant.
+	if (tok_idx(tok) >= 1) {
+		Token *pool_prev = &token_pool[tok_idx(tok) - 1];
+		if (pool_prev != last_emitted &&
+		    (match_ch(pool_prev, ']') || match_ch(pool_prev, ')') ||
+		     pool_prev->kind == TK_IDENT))
+			name_tok = pool_prev;
+	}
+	// Peel paren layers and inner subscripts to reach the root array
+	// identifier.  Each `]` peeled increments `dim_depth` so the emitted
+	// bound is `sizeof(arr[0]...[0])/sizeof(arr[0]...[0][0])` with the
+	// right number of `[0]` subscripts — this is what allows `a[i][j]`
+	// and `(a)[i][j]` to wrap both indices.
+	int dim_depth = 0;
+	while (1) {
+		// ( ... ): descend if the `(` is not a call/cast/sizeof context
+		// (predecessor not value-producing).
+		if (match_ch(name_tok, ')') && tok_match(name_tok)) {
+			Token *open = tok_match(name_tok);
+			if (tok_idx(open) >= 1) {
+				Token *bp = &token_pool[tok_idx(open) - 1];
+				if (bp->kind == TK_IDENT || bp->kind == TK_NUM ||
+				    match_ch(bp, ')') || match_ch(bp, ']'))
+					break;
+			}
+			// Case A: ( a ) — a single identifier.
+			Token *inner = tok_next(open);
+			if (!inner) break;
+			if (inner->kind == TK_IDENT && tok_next(inner) == name_tok) {
+				name_tok = inner;
 				break;
-		}
-		Token *inner = tok_next(open);
-		if (!inner) break;
-		// Case: content is a single identifier.
-		if (inner->kind == TK_IDENT && tok_next(inner) == name_tok) {
-			name_tok = inner;
+			}
+			// Case B: ( ( ... ) ) — nested paren.
+			if (match_ch(inner, '(') && tok_match(inner) &&
+			    tok_next(tok_match(inner)) == name_tok) {
+				name_tok = tok_match(inner);
+				continue;
+			}
+			// Case C: ( expr[...] ) — descend to the trailing `]`.
+			if (tok_idx(name_tok) >= 1) {
+				Token *inner_last = &token_pool[tok_idx(name_tok) - 1];
+				if (match_ch(inner_last, ']')) {
+					name_tok = inner_last;
+					continue;
+				}
+			}
 			break;
 		}
-		// Case: content is itself a parenthesized group with nothing after it.
-		if (match_ch(inner, '(') && tok_match(inner) &&
-		    tok_next(tok_match(inner)) == name_tok) {
-			name_tok = tok_match(inner);
+		// [ ... ]: multi-dim step.
+		if (match_ch(name_tok, ']') && tok_match(name_tok)) {
+			Token *open_br = tok_match(name_tok);
+			if (tok_ann(open_br) & (P1_DECL_BRACKET | P1_UNEVAL_BRACKET))
+				break;
+			if (open_br->flags & TF_C23_ATTR) break;
+			if (tok_idx(open_br) < 1) break;
+			Token *before = &token_pool[tok_idx(open_br) - 1];
+			if (!(before->kind == TK_IDENT || match_ch(before, ')') ||
+			      match_ch(before, ']')))
+				break;
+			name_tok = before;
+			dim_depth++;
 			continue;
 		}
 		break;
@@ -2296,6 +2338,14 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	if (!te || te->is_param || te->is_enum_const) return NULL;
 	if (!te->is_array && !te->is_vla_var) return NULL;
 
+	// Multi-dim rank guard: only wrap when the current subscript level
+	// lies within the array's actual rank.  For `int *p[10]; p[0][i]`,
+	// rank=1 so dim_depth=1 exceeds it — the inner subscript addresses
+	// memory through a POINTER, whose length isn't knowable from `p`.
+	// Without this guard, the wrap would emit `sizeof(p[0])/sizeof(p[0][0])`
+	// which equals sizeof(ptr)/sizeof(elem) — a spurious bound.
+	if (te->array_rank > 0 && dim_depth >= te->array_rank) return NULL;
+
 	// Skip unary `&arr[i]`: taking address is legal through index == size
 	// (C allows one-past-end), so wrapping would spuriously trap.
 	if (tok_idx(name_tok) >= 1) {
@@ -2336,9 +2386,11 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	}
 	OUT_LIT("), sizeof(");
 	out_str(tok_loc(arr_tok), arr_tok->len);
+	for (int d = 0; d < dim_depth; d++) OUT_LIT("[0]");
 	OUT_LIT(")/sizeof(");
 	out_str(tok_loc(arr_tok), arr_tok->len);
-	OUT_LIT("[0]))]");
+	for (int d = 0; d <= dim_depth; d++) OUT_LIT("[0]");
+	OUT_LIT("))]");
 	return tok_next(close);
 }
 
@@ -7523,6 +7575,29 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 			if (typedef_table.count > pre || did_shadow) {
 				TypedefEntry *e = &typedef_table.entries[typedef_table.count - 1];
 				e->is_array = true;
+				// Count declarator `[` dimensions so the
+				// bounds-check wrap can safely traverse only
+				// as many subscripts as the array actually has.
+				// Without this, `int *p[10]; p[0][i]` would be
+				// wrapped using `sizeof(p[0])/sizeof(p[0][0])`
+				// which equals sizeof(ptr)/sizeof(int) — a
+				// spurious trap on any valid pointer subscript.
+				int rank = 0;
+				for (Token *dt = decl.var_name; dt && dt != decl.end; dt = tok_next(dt)) {
+					if (match_ch(dt, '[') && (dt->flags & TF_OPEN)) {
+						rank++;
+						Token *m = tok_match(dt);
+						if (m) dt = m;
+					}
+				}
+				// Typedef arrays: `typedef int T[10]; T a;` —
+				// no `[` in the declarator but the base type is
+				// an array. Treat as rank 1 (conservative; a
+				// multi-dim typedef will only get the outer
+				// subscript wrapped, matching prior behavior).
+				if (rank == 0 && base_is_array_here) rank = 1;
+				if (rank > 15) rank = 15;
+				e->array_rank = (uint8_t)rank;
 			}
 		}
 

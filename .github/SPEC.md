@@ -265,6 +265,7 @@ Each `TypedefEntry` records:
 - `scope_open_idx`, `scope_close_idx` — token index range of the enclosing scope (set from `td_scope_open` / `td_scope_close` thread-locals, which are updated as Phase 1 enters/exits scopes)
 - `token_index` — pool index of the declaration
 - `is_vla`, `is_void`, `is_const`, `is_volatile`, `is_ptr`, `is_array`, `is_aggregate`, `has_volatile_member` — type property flags
+- `array_rank` — number of declarator `[...]` dimensions (0 if not an array, capped at 15). Set at Phase 1D registration when `FEAT(F_BOUNDS_CHECK)` is on; consumed by `try_bounds_check_subscript` as a rank guard against spurious wraps on `int *p[10]; p[i][j]` — without it the inner subscript would emit `sizeof(p[0])/sizeof(p[0][0]) == sizeof(ptr)/sizeof(int)` and trap on every valid pointer subscript. Typedef-based arrays (`typedef int T[10]; T a;`) register with `array_rank = 1` (conservative — a multi-dim typedef only wraps its outer subscript).
 - `is_shadow`, `is_enum_const`, `is_vla_var`, `is_struct_tag` — entry kind flags. `is_struct_tag` entries (`TDK_STRUCT_TAG`) are unconditionally registered for all struct/union tags with bodies — including clean structs with no VLA or volatile members. This ensures inner-scope struct redefinitions correctly shadow outer tags (C11 §6.2.1p4), preventing `tag_lookup` from falling through to stale outer-scope VLA/volatile metadata and causing false CFG verifier errors. Registration occurs at two sites: Phase 1A's `TT_SUE` handler (bare struct defs) and `parse_typedef_declaration` (typedef-wrapped struct defs). Clean entries have `is_vla=false, has_volatile_member=false`. They do NOT receive `P1_IS_TYPEDEF` annotation, preserving `struct Foo` parsing (the tag is not an ordinary typedef name per ISO C11 §6.2.3). Tag name extraction in Phase 1D uses `skip_noise()` to skip GNU `__attribute__` and C23 `[[...]]` attributes between the struct/union keyword and the tag name, and skips `TT_QUALIFIER` tokens
 - `is_func` — set when the typedef resolves to a function type (used to suppress zero-init memset on function types). Detection works for both `typedef int FuncType(int)` (parse_declarator returns `end=NULL`, check for `(` after name) and `typedef int (FuncType)(int)` (parse_declarator sets `is_func_ptr=true` without `paren_pointer` — function type, not function pointer). **Chained typedef propagation:** `parse_typedef_declaration` propagates `is_func` through typedef chains via `base_is_func`: when the base type specifier contains a function typedef (`is_func_typedef`), the derived typedef inherits `is_func = true` (guarded by `!decl.is_pointer && !decl.is_array && !decl.is_func_ptr`). Without this, `typedef func_t alias; alias f;` would lose the function-type property and Prism would emit `= {0}` or `memset` on a function symbol — a fatal constraint violation (ISO C11 §6.5.3.4p1 forbids `sizeof` on function types).
 - `is_param` — set for function parameter shadow entries (registered by `p1_register_param_shadows`). Used by `array_size_is_vla` to distinguish VLA parameters (which decay to pointers, making `sizeof(param)` constant) from VLA locals.
@@ -389,6 +390,7 @@ Rejected patterns inside defer bodies:
 - `return`
 - `goto`
 - `break` / `continue` (since `in_loop=false, in_switch=false`, these always error)
+- `static` / `_Thread_local` / `thread_local` / `__thread` storage-class declarations at the top of a defer statement — the defer body is textually copied to every exit point; each copy lives in its own scope, so the declaration produces *N* independent objects. Users writing `defer { static int once = 1; if (once) { init(); once = 0; } }` would silently get *N* independent `once` flags instead of one. `extern` is accepted (binds to a single external symbol regardless of textual repetition). The check walks leading decl-specifiers (`TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT | TT_INLINE`) and tests `TT_STORAGE` first, since `static` also carries `TT_QUALIFIER`.
 - Recurses into GNU statement expressions `({…})` — `return`/`goto`/`break`/`continue` inside a stmt-expr in a defer body is rejected
 - Recurses into `orelse { … }` blocks — control-flow keywords inside orelse action blocks in defer bodies are validated
 
@@ -898,17 +900,22 @@ The helper is an inline function (not a macro) so `idx` is evaluated exactly onc
 A subscript `X[Y]` is wrapped when all of the following hold:
 
 1. `FEAT(F_BOUNDS_CHECK)` is on
-2. `X` (the token immediately preceding `[`, i.e. `last_emitted`) is `TK_IDENT`
-3. `X` is a known local array variable — `typedef_lookup(X)` returns an entry with `is_array` or `is_vla_var`, and the entry is not a parameter (`!is_param`) and not an enum constant (`!is_enum_const`)
+2. `X` (the token immediately preceding `[`, i.e. `last_emitted` or its pool-neighbor — see the multi-dim rule below) is `TK_IDENT`
+3. `X` is a known local or file-scope array variable — `typedef_lookup(X)` returns an entry with `is_array` or `is_vla_var`, and the entry is not a parameter (`!is_param`) and not an enum constant (`!is_enum_const`)
 4. `X` is not a typedef name (`!is_known_typedef(X)`)
 5. The `[` token does not carry `P1_DECL_BRACKET` (declarator brackets, tagged in Phase 1 by `decl_array_dims`, are never wrapped)
-6. The `[` token does not carry `P1_UNEVAL_BRACKET` — tagged by `p1_mark_uneval_brackets` for every `[` inside a parenthesized `sizeof` / `_Alignof` / `alignof` / `typeof` / `typeof_unqual` / `offsetof` / `__builtin_offsetof` operand. The operand is unevaluated, and in `offsetof` a subscript names a struct field (unrelated to any same-named local), so wrapping would be a silent false negative or a spurious trap on VLAs.
+6. The `[` token does not carry `P1_UNEVAL_BRACKET` — tagged by `p1_mark_uneval_brackets` for every `[` inside a parenthesized `sizeof` / `_Alignof` / `alignof` / `typeof` / `typeof_unqual` / `offsetof` / `__builtin_offsetof` operand, and for every `[` in the controlling expression of `_Generic(arr[i], ...)` (per C11 §6.5.1.1p3 the controlling expression is not evaluated — the bounds trap must not fire on a type-selection expression). The operand is unevaluated, and in `offsetof` a subscript names a struct field (unrelated to any same-named local), so wrapping would be a silent false negative or a spurious trap on VLAs.
 7. The `[` is not a C23 attribute opener (`!TF_C23_ATTR`)
 8. The token immediately before `X` is not a `.` or `->` member operator (`!(prev_tag & TT_MEMBER)`) — `s.arr[i]` and `p->arr[i]` name a struct field, whose size is unrelated to any same-named local
 9. The token immediately before `X` is not a unary `&` (address-of) — C permits one-past-end addresses, so `&arr[len]` is legal and must not trap. Binary `&` (bitwise AND) is distinguished from unary `&` by peeking one token further back for a value-producing token (identifier, number, string, `)`, `]`).
 10. The bracket is balanced (`tok_match(tok)` succeeds)
+11. For a subscript at inner position `d` of a multi-dim access (i.e. `d` prior `[...]` layers were peeled to reach the root identifier — see *Multi-dim* below), `d < te->array_rank`.  This is the *rank guard*: it prevents `int *p[10]; p[0][i]` from emitting `sizeof(p[0])/sizeof(p[0][0])` (= `sizeof(ptr)/sizeof(int)`) as the bound — which would spuriously trap on every valid pointer subscript.
 
-Array variables are registered into the typedef table with `is_array = true` by a Phase 1D hook that runs only when `FEAT(F_BOUNDS_CHECK)` is on, so the feature is strictly zero-cost for users who leave it off.
+**Commutative-subscript rejection.** ISO C defines `idx[arr]` as equivalent to `arr[idx]`. When the array side hides *inside* the brackets (e.g. `len[buffer]`), the array-on-the-left pattern-match fails and the subscript would be emitted raw — silently skipping the trap. Before taking the normal paths, `try_bounds_check_subscript` scans the bracket body for a single tracked-array identifier (after paren-stripping); if found while `last_emitted` is NOT itself a tracked array, a hard error fires: `commutative subscript 'idx[arr]' bypasses -fbounds-check; rewrite as 'arr[idx]'`.
+
+**Multi-dim postfix chain.** After paren-stripping, if `name_tok` is `]` (close of a prior subscript) or resolves through parens into one, the walker follows `tok_match` back to the matching `[`, increments `dim_depth`, and continues until it reaches the root identifier. The emission uses `sizeof(arr[0]...[0])/sizeof(arr[0]...[0][0])` with `dim_depth` and `dim_depth+1` `[0]` subscripts so `arr[i][j]` / `(arr[i])[j]` / `arr[i][j][k]` all wrap every level. Rank is recorded on the `TypedefEntry` (`array_rank`, 4 bits) at registration time by counting declarator `[` with `TF_OPEN`. Typedef-based arrays (`typedef int T[10]; T a;`) register with `array_rank = 1` (conservative; a multi-dim typedef only wraps its outer subscript). Because `last_emitted` is unchanged by synthetic output tokens, the walker consults `token_pool[tok_idx(tok) - 1]` when it differs from `last_emitted` to recover the true pool predecessor.
+
+Array variables are registered into the typedef table with `is_array = true` by a Phase 1D hook that runs only when `FEAT(F_BOUNDS_CHECK)` is on, so the feature is strictly zero-cost for users who leave it off. Registration covers block-scope, `static` block-scope, and file-scope arrays; file-scope registration requires a complete outer dimension (non-empty `[N]` or an initializer) so `sizeof(arr)` remains well-defined at use sites — `extern int a[];` and tentative `int a[];` are NOT registered.
 
 #### What gets checked
 
@@ -916,18 +923,25 @@ Array variables are registered into the typedef table with `is_array = true` by 
 |---|---|---|
 | `arr[i]` where `arr` is a local fixed array | Yes | Primary case |
 | `vla[i]` where `vla` is a local VLA | Yes | `sizeof(vla)` evaluates at runtime |
-| `m[i][j]` (2D local) | Outer `i` only | Inner `[` has `]` as `last_emitted`, not an identifier (v1 limitation) |
+| `gArr[i]` at file scope or `static` local | Yes | Registered when the outer dim is complete (or an initializer completes it) |
+| `m[i][j]`, `m[i][j][k]` (multi-dim local) | Yes, all levels | `array_rank` stored on entry; each level emits `sizeof(arr[0]...[0])/sizeof(arr[0]...[0][0])` |
+| `(arr[i])[j]` (paren-wrapped multi-dim) | Yes, both levels | Paren layers peeled between dim steps |
+| `int *p[10]; p[i][j]` (array of pointers) | Outer only | Rank guard: inner subscript addresses through a pointer whose length is unknown |
 | `arr[m[i]]` (nested in index) | Both | Inner-index walk uses dispatch, wraps nested subscripts recursively |
 | `arr[i]` on RHS of `int x = arr[i]` | Yes | Wrapped during declaration initializer walk |
 | `f(arr[i])` | Yes | Wrapped during balanced-group walk inside call args |
 | `int arr[100]` (declarator) | No | Tagged `P1_DECL_BRACKET` in Phase 1 |
 | `sizeof(arr[i])`, `_Alignof(arr[i])`, `typeof(arr[i])` | No | Tagged `P1_UNEVAL_BRACKET`; operand unevaluated (would spuriously trap on VLAs) |
+| `_Generic(arr[i], ...)` controlling expression | No | Tagged `P1_UNEVAL_BRACKET`; C11 §6.5.1.1p3 — controlling expr is not evaluated |
+| `_Generic(x, T: arr[i])` association expression | Yes | Only the selected association is evaluated; wrapping is correct |
 | `offsetof(T, arr[i])`, `__builtin_offsetof(T, arr[i])` | No | Subscript names a struct field; local's size unrelated |
 | `s.arr[i]`, `p->arr[i]` | No | Member subscript filtered via `TT_MEMBER` on prev token |
 | `&arr[i]` (unary address-of) | No | One-past-end address is legal C |
+| `idx[arr]` (commutative) | **Rejected** | Hard error — rewrite as `arr[idx]` (otherwise the trap would silently not fire) |
 | `p[i]` where `p` is a pointer parameter/local | No | Not tracked as an array |
-| `a[i]` where `a` is an array parameter (`int a[10]`) | No | Parameter entries are filtered via `is_param` |
-| `gArr[i]` at file scope | No | File-scope arrays are not registered (v1 limitation) |
+| `a[i]` where `a` is an array parameter (`int a[10]`) | No | Parameter entries are filtered via `is_param` (decays to pointer) |
+| `"literal"[i]` (string literal subscript) | No | v1 limitation |
+| `(int[]){...}[i]` (compound-literal subscript) | No | v1 limitation |
 | `arr[i]` inside `raw { ... }` | N/A — `raw` suppresses Prism transformations at parse time | |
 
 The index expression **is** re-walked recursively: `arr[m[i]]` wraps both subscripts. The inner walk uses the full dispatch chain (statement expressions, balanced groups, nested bounds checks).

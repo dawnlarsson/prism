@@ -2245,6 +2245,10 @@ typedef struct {
 	bool is_param : 1;
 	bool has_volatile_member : 1;
 	bool is_struct_tag : 1; // struct/union tag (not a typedef name)
+	uint8_t array_rank;	// # of array dimensions (0 if not array);
+				// used by -fbounds-check multi-dim wrap to
+				// avoid false positives on pointer-element
+				// arrays like `int *p[10]`.
 } TypedefEntry; // 32 bytes — two entries per 64-byte cache line
 
 typedef struct {
@@ -2429,6 +2433,7 @@ typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool i
 	e->is_vla_var = (kind == TDK_VLA_VAR);
 	e->is_struct_tag = (kind == TDK_STRUCT_TAG);
 	e->is_param = false;
+	e->array_rank = 0;
 	e->prev_index = typedef_get_index(name, len);
 	e->token_index = 0;
 	e->scope_open_idx = td_scope_open;

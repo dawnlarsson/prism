@@ -146,7 +146,7 @@ static void test_bounds_check_vla(void) {
 static void test_bounds_check_multidim(void) {
 	printf("\n--- bounds-check multi-dim ---\n");
 
-	// 2D array: outer subscript wrapped (v1 limitation: inner not wrapped)
+	// 2D array: both dimensions now wrapped.
 	{
 		PrismFeatures f = prism_defaults();
 		f.bounds_check = true;
@@ -157,7 +157,98 @@ static void test_bounds_check_multidim(void) {
 		if (r.output) {
 			CHECK(strstr(r.output, "m[__prism_bchk((__prism_bchk_size_t)( 1), sizeof(m)/sizeof(m[0]))]") != NULL,
 			      "bc-2d: outer dim wrapped");
+			CHECK(strstr(r.output, "[__prism_bchk((__prism_bchk_size_t)( 2), sizeof(m[0])/sizeof(m[0][0]))]") != NULL,
+			      "bc-2d: inner dim wrapped");
 		}
+		prism_free(&r);
+	}
+
+	// 3D array: all three dimensions wrapped.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int m[2][3][4]; m[0][1][2]=0; return 0;}\n",
+		    "bc_3d.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-3d: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "sizeof(m)/sizeof(m[0])") != NULL,
+			      "bc-3d: outer wrap present");
+			CHECK(strstr(r.output, "sizeof(m[0])/sizeof(m[0][0])") != NULL,
+			      "bc-3d: mid wrap present");
+			CHECK(strstr(r.output, "sizeof(m[0][0])/sizeof(m[0][0][0])") != NULL,
+			      "bc-3d: innermost wrap present");
+		}
+		prism_free(&r);
+	}
+
+	// Paren-wrapped outer chain: (a[i])[j] — both wrapped.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[3][4]; int i=1,j=2;\n"
+		    "return (a[i])[j];}\n",
+		    "bc_paren.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-paren-md: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "sizeof(a)/sizeof(a[0])") != NULL,
+			      "bc-paren-md: outer wrap present");
+			CHECK(strstr(r.output, "sizeof(a[0])/sizeof(a[0][0])") != NULL,
+			      "bc-paren-md: inner wrap through parens present");
+		}
+		prism_free(&r);
+	}
+
+	// Rank guard: `int *p[10]` — outer wraps, inner `p[0][i]` MUST NOT
+	// wrap, because p[0] is a pointer whose length isn't derivable from
+	// `p`.  Without the rank guard, the wrap would emit
+	// `sizeof(p[0])/sizeof(p[0][0]) == sizeof(ptr)/sizeof(int)` and
+	// spuriously trap on every valid subscript.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int *p[10]; int i=0;\n"
+		    "return p[0][i];}\n",
+		    "bc_rank_guard.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-rank: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "p[__prism_bchk((__prism_bchk_size_t)( 0), sizeof(p)/sizeof(p[0]))]") != NULL,
+			      "bc-rank: outer wrap present");
+			CHECK(strstr(r.output, "sizeof(p[0])/sizeof(p[0][0])") == NULL,
+			      "bc-rank: inner NOT wrapped (rank guard)");
+		}
+		prism_free(&r);
+	}
+
+	// File-scope array: registered when outer dim is complete.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int g[10];\n"
+		    "int main(void){int i=0; return g[i];}\n",
+		    "bc_filescope.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-filescope: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "g[__prism_bchk") != NULL,
+			      "bc-filescope: wrapped");
+		prism_free(&r);
+	}
+
+	// Incomplete extern: NOT registered (sizeof would be incomplete).
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "extern int ext[];\n"
+		    "int main(void){int i=0; return ext[i];}\n",
+		    "bc_extern_incomplete.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-extern: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "ext[__prism_bchk") == NULL,
+			      "bc-extern: incomplete NOT wrapped");
 		prism_free(&r);
 	}
 }
