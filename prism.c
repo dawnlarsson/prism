@@ -278,17 +278,6 @@ static void signal_temps_register(const char *path) {
 	signal_temps_ready_store(n, 1);
 }
 
-static void __attribute__((unused)) signal_temps_unregister(const char *path) {
-	int n = signal_temps_load();
-	for (int i = 0; i < n; i++) {
-		if (signal_temps_ready_load(i) && strcmp(signal_temps[i], path) == 0) {
-			signal_temps_ready_store(i, 0);
-			signal_temps[i][0] = '\0';
-			return;
-		}
-	}
-}
-
 static void signal_temps_clear(void) {
 	sig_atomic_t n = signal_temps_load();
 	for (int i = 0; i < n; i++) {
@@ -2045,6 +2034,16 @@ static Token *try_bracket_orelse(Token *tok) {
 // with a matching ')'. The no-paren form `sizeof x` cannot syntactically
 // contain a subscript outside of its own balanced groups, so this scan
 // is complete for the cases we care about.
+// Helper: tag every '[' token in the token range (open, close) exclusive
+// (both endpoints) as an unevaluated-operand bracket. Walks over nested
+// balanced groups — they all stay inside the outer unevaluated operand.
+static void p1_tag_brackets_in_range(Token *open, Token *close) {
+	for (Token *u = tok_next(open); u != close && u->kind != TK_EOF; u = tok_next(u)) {
+		if (match_ch(u, '[') && (u->flags & TF_OPEN))
+			tok_ann(u) |= P1_UNEVAL_BRACKET;
+	}
+}
+
 static void p1_mark_uneval_brackets(void) {
 	for (int i = 0; i < token_count; i++) {
 		Token *t = &token_pool[i];
@@ -2056,26 +2055,16 @@ static void p1_mark_uneval_brackets(void) {
 		Token *next = tok_next(t);
 		if (!next) continue;
 		// Parenthesized form: sizeof(...), _Alignof(...), typeof(...),
-		// __builtin_offsetof(...). Tag every '[' in the balanced group,
-		// including nested brackets / parens / braces (statement-exprs,
-		// compound literals) — they all stay inside the unevaluated operand.
+		// __builtin_offsetof(...). Tag every '[' in the balanced group.
 		if (match_ch(next, '(') && (next->flags & TF_OPEN)) {
 			Token *close = tok_match(next);
-			if (!close) continue;
-			for (Token *u = tok_next(next); u != close && u->kind != TK_EOF; u = tok_next(u)) {
-				if (match_ch(u, '[') && (u->flags & TF_OPEN))
-					tok_ann(u) |= P1_UNEVAL_BRACKET;
-			}
+			if (close) p1_tag_brackets_in_range(next, close);
 			continue;
 		}
-		// No-paren form: `sizeof UNARY-EXPR` and GCC-extension
-		// `__typeof UNARY-EXPR`. The operand is a single unary-expression
-		// (C11 §6.5.3). Walk the postfix chain starting at the first
-		// non-unary-prefix token and tag every '[' inside it. The chain
-		// ends at any non-postfix token (binary op, comma, semicolon, ...).
-		// Only sizeof and typeof actually permit the no-paren form;
-		// _Alignof/offsetof require parens, so their TF_SIZEOF case
-		// harmlessly falls through here with no effect.
+		// No-paren form: `sizeof UNARY-EXPR` and GCC `__typeof UNARY-EXPR`.
+		// Walk the postfix chain from the first non-unary-prefix token and
+		// tag every '[' inside it. _Alignof/offsetof require parens, so
+		// their TF_SIZEOF case harmlessly falls through here with no effect.
 		Token *p = next;
 		// Skip unary prefix operators: + - ! ~ & * ++ --
 		// (cast `(type)` always starts with '(' and was handled above.)
@@ -2083,13 +2072,11 @@ static void p1_mark_uneval_brackets(void) {
 			if (match_ch(p, '+') || match_ch(p, '-') ||
 			    match_ch(p, '!') || match_ch(p, '~') ||
 			    match_ch(p, '&') || match_ch(p, '*')) {
-				p = tok_next(p);
-				continue;
+				p = tok_next(p); continue;
 			}
 			if (p->len == 2 && (memcmp(tok_loc(p), "++", 2) == 0 ||
 			                    memcmp(tok_loc(p), "--", 2) == 0)) {
-				p = tok_next(p);
-				continue;
+				p = tok_next(p); continue;
 			}
 			break;
 		}
@@ -2097,39 +2084,22 @@ static void p1_mark_uneval_brackets(void) {
 		if (!p || p->kind != TK_IDENT) continue;
 		p = tok_next(p);
 		while (p && p->kind != TK_EOF) {
-			if (match_ch(p, '[') && (p->flags & TF_OPEN) && tok_match(p)) {
-				tok_ann(p) |= P1_UNEVAL_BRACKET;
+			if ((match_ch(p, '[') || match_ch(p, '(')) &&
+			    (p->flags & TF_OPEN) && tok_match(p)) {
+				if (match_ch(p, '[')) tok_ann(p) |= P1_UNEVAL_BRACKET;
 				Token *c = tok_match(p);
-				for (Token *u = tok_next(p); u != c && u->kind != TK_EOF; u = tok_next(u)) {
-					if (match_ch(u, '[') && (u->flags & TF_OPEN))
-						tok_ann(u) |= P1_UNEVAL_BRACKET;
-				}
-				p = tok_next(c);
-				continue;
+				p1_tag_brackets_in_range(p, c);
+				p = tok_next(c); continue;
 			}
-			if (match_ch(p, '(') && (p->flags & TF_OPEN) && tok_match(p)) {
-				Token *c = tok_match(p);
-				for (Token *u = tok_next(p); u != c && u->kind != TK_EOF; u = tok_next(u)) {
-					if (match_ch(u, '[') && (u->flags & TF_OPEN))
-						tok_ann(u) |= P1_UNEVAL_BRACKET;
-				}
-				p = tok_next(c);
-				continue;
-			}
-			if (match_ch(p, '.')) {
-				p = tok_next(p);
-				if (p && p->kind == TK_IDENT) p = tok_next(p);
-				continue;
-			}
-			if (p->len == 2 && memcmp(tok_loc(p), "->", 2) == 0) {
+			if (match_ch(p, '.') ||
+			    (p->len == 2 && memcmp(tok_loc(p), "->", 2) == 0)) {
 				p = tok_next(p);
 				if (p && p->kind == TK_IDENT) p = tok_next(p);
 				continue;
 			}
 			if (p->len == 2 && (memcmp(tok_loc(p), "++", 2) == 0 ||
 			                    memcmp(tok_loc(p), "--", 2) == 0)) {
-				p = tok_next(p);
-				continue;
+				p = tok_next(p); continue;
 			}
 			break; // end of postfix chain
 		}

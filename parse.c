@@ -700,11 +700,6 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val) {
 	map->used++;
 }
 
-static void hashmap_zero(HashMap *map) {
-	if (map->buckets) memset(map->buckets, 0, (size_t)map->capacity * sizeof(HashEntry));
-	map->used = 0;
-}
-
 // Reset a HashMap whose buckets were arena-allocated and are now dead
 // (e.g. after arena_reset).  Zeroes the entire struct so the next
 // hashmap_put re-allocates fresh buckets from the arena.

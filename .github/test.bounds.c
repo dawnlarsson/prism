@@ -2,6 +2,44 @@
 // Verifies transpile output shape; runtime trap behavior is covered
 // by the smoke tests at the end via subprocess execution.
 
+#ifndef _WIN32
+// Shared helper: transpile `src` with -fbounds-check, compile with cc,
+// execute, and assert exit status. `expected_exit < 0` means "must trap"
+// (any nonzero exit); otherwise the exact exit code is asserted.
+// `label` is a short stem used to derive {label}: transpiles / compiles /
+// returns N messages.
+static void bc_runtime_case(const char *src, int expected_exit, const char *label) {
+	char *src_path = create_temp_file(src);
+	char bin[256], out_path[256], msg[256];
+	snprintf(bin, sizeof(bin), "%s.bin", src_path);
+	snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
+	PrismFeatures f = prism_defaults();
+	f.bounds_check = true;
+	PrismResult r = prism_transpile_file(src_path, f);
+	snprintf(msg, sizeof(msg), "%s: transpiles", label);
+	CHECK_EQ(r.status, PRISM_OK, msg);
+	if (r.output) {
+		FILE *fp = fopen(out_path, "w");
+		if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
+		char cmd[1024];
+		snprintf(cmd, sizeof(cmd), "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
+		snprintf(msg, sizeof(msg), "%s: compiles", label);
+		CHECK_EQ(run_command_status(cmd), 0, msg);
+		int status = run_command_status(bin);
+		if (expected_exit < 0) {
+			snprintf(msg, sizeof(msg), "%s: traps", label);
+			CHECK(status != 0, msg);
+		} else {
+			snprintf(msg, sizeof(msg), "%s: exits %d", label, expected_exit);
+			CHECK_EQ(status, expected_exit, msg);
+		}
+		unlink(bin); unlink(out_path);
+	}
+	prism_free(&r);
+	unlink(src_path); free(src_path);
+}
+#endif
+
 static void test_bounds_check_fixed_array(void) {
 	printf("\n--- bounds-check fixed arrays ---\n");
 
@@ -160,217 +198,55 @@ static void test_bounds_check_runtime(void) {
 #ifndef _WIN32
 	printf("\n--- bounds-check runtime trap ---\n");
 
-	// In-bounds: program exits normally
-	{
-		const char *src =
-		    "#include <stdio.h>\n"
-		    "int main(void){int a[10]; for(int i=0;i<10;i++) a[i]=i;\n"
-		    "return a[9];}\n";
-		char *src_path = create_temp_file(src);
-		char bin[256];
-		snprintf(bin, sizeof(bin), "%s.bin", src_path);
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_file(src_path, f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-run-ok: transpiles");
-		if (r.output) {
-			char out_path[256];
-			snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
-			FILE *fp = fopen(out_path, "w");
-			if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
-			char cmd[1024];
-			snprintf(cmd, sizeof(cmd),
-				 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
-			CHECK_EQ(run_command_status(cmd), 0, "bc-run-ok: compiles");
-			int status = run_command_status(bin);
-			CHECK_EQ(status, 9, "bc-run-ok: in-bounds exits with a[9]");
-			unlink(bin); unlink(out_path);
-		}
-		prism_free(&r);
-		unlink(src_path); free(src_path);
-	}
+	// In-bounds returns normally.
+	bc_runtime_case(
+	    "#include <stdio.h>\n"
+	    "int main(void){int a[10]; for(int i=0;i<10;i++) a[i]=i;\n"
+	    "return a[9];}\n",
+	    9, "bc-run-ok");
 
-	// OOB: program traps (SIGTRAP / SIGILL)
-	{
-		const char *src =
-		    "#include <stdio.h>\n"
-		    "int main(void){int a[10]; for(int i=0;i<10;i++) a[i]=i;\n"
-		    "volatile int j=15; return a[j];}\n";
-		char *src_path = create_temp_file(src);
-		char bin[256];
-		snprintf(bin, sizeof(bin), "%s.bin", src_path);
-		PrismFeatures f = prism_defaults();
-		f.bounds_check = true;
-		PrismResult r = prism_transpile_file(src_path, f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-run-oob: transpiles");
-		if (r.output) {
-			char out_path[256];
-			snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
-			FILE *fp = fopen(out_path, "w");
-			if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
-			char cmd[1024];
-			snprintf(cmd, sizeof(cmd),
-				 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
-			CHECK_EQ(run_command_status(cmd), 0, "bc-run-oob: compiles");
-			int status = run_command_status(bin);
-			// cc's run_command_status returns nonzero on signal
-			CHECK(status != 0 && status != 15 /* not a normal a[15] */,
-			      "bc-run-oob: OOB triggers trap (nonzero exit)");
-			unlink(bin); unlink(out_path);
-		}
-		prism_free(&r);
-		unlink(src_path); free(src_path);
-	}
+	// OOB (fixed array) traps.
+	bc_runtime_case(
+	    "#include <stdio.h>\n"
+	    "int main(void){int a[10]; for(int i=0;i<10;i++) a[i]=i;\n"
+	    "volatile int j=15; return a[j];}\n",
+	    -1, "bc-run-oob");
 
-	// Runtime: OOB in nested subscript (inner index) must trap.
-	{
-		const char *src =
-		    "#include <stdio.h>\n"
-		    "int main(void){int arr[10]={0}; int m[3]={0,1,2};\n"
-		    "volatile int i=10; /* OOB into m */\n"
-		    "return arr[m[i]];}\n";
-		char *src_path = create_temp_file(src);
-		char bin[256];
-		snprintf(bin, sizeof(bin), "%s.bin", src_path);
-		PrismFeatures f = prism_defaults();
-		PrismResult r = prism_transpile_file(src_path, f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-run-nested: transpiles");
-		if (r.output) {
-			char out_path[256];
-			snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
-			FILE *fp = fopen(out_path, "w");
-			if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
-			char cmd[1024];
-			snprintf(cmd, sizeof(cmd),
-				 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
-			CHECK_EQ(run_command_status(cmd), 0, "bc-run-nested: compiles");
-			int status = run_command_status(bin);
-			CHECK(status != 0, "bc-run-nested: inner OOB traps");
-			unlink(bin); unlink(out_path);
-		}
-		prism_free(&r);
-		unlink(src_path); free(src_path);
-	}
+	// OOB in nested inner subscript traps.
+	bc_runtime_case(
+	    "#include <stdio.h>\n"
+	    "int main(void){int arr[10]={0}; int m[3]={0,1,2};\n"
+	    "volatile int i=10; return arr[m[i]];}\n",
+	    -1, "bc-run-nested");
 
-	// Runtime: negative index (via volatile) must trap.
-	{
-		const char *src =
-		    "#include <stdio.h>\n"
-		    "int main(void){int a[10]={0}; volatile int i=-1;\n"
-		    "return a[i];}\n";
-		char *src_path = create_temp_file(src);
-		char bin[256];
-		snprintf(bin, sizeof(bin), "%s.bin", src_path);
-		PrismFeatures f = prism_defaults();
-		PrismResult r = prism_transpile_file(src_path, f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-run-neg: transpiles");
-		if (r.output) {
-			char out_path[256];
-			snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
-			FILE *fp = fopen(out_path, "w");
-			if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
-			char cmd[1024];
-			snprintf(cmd, sizeof(cmd),
-				 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
-			CHECK_EQ(run_command_status(cmd), 0, "bc-run-neg: compiles");
-			int status = run_command_status(bin);
-			CHECK(status != 0, "bc-run-neg: negative index traps (unsigned cast)");
-			unlink(bin); unlink(out_path);
-		}
-		prism_free(&r);
-		unlink(src_path); free(src_path);
-	}
+	// Negative index (via unsigned cast) traps.
+	bc_runtime_case(
+	    "#include <stdio.h>\n"
+	    "int main(void){int a[10]={0}; volatile int i=-1;\n"
+	    "return a[i];}\n",
+	    -1, "bc-run-neg");
 
-	// Runtime: VLA OOB must trap using runtime length.
-	{
-		const char *src =
-		    "#include <stdio.h>\n"
-		    "int main(int argc,char**argv){(void)argv;int n=argc+3;\n"
-		    "int v[n]; for(int i=0;i<n;i++) v[i]=i;\n"
-		    "volatile int j=n+5; return v[j];}\n";
-		char *src_path = create_temp_file(src);
-		char bin[256];
-		snprintf(bin, sizeof(bin), "%s.bin", src_path);
-		PrismFeatures f = prism_defaults();
-		PrismResult r = prism_transpile_file(src_path, f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-run-vla: transpiles");
-		if (r.output) {
-			char out_path[256];
-			snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
-			FILE *fp = fopen(out_path, "w");
-			if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
-			char cmd[1024];
-			snprintf(cmd, sizeof(cmd),
-				 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
-			CHECK_EQ(run_command_status(cmd), 0, "bc-run-vla: compiles");
-			int status = run_command_status(bin);
-			CHECK(status != 0, "bc-run-vla: VLA OOB traps");
-			unlink(bin); unlink(out_path);
-		}
-		prism_free(&r);
-		unlink(src_path); free(src_path);
-	}
+	// VLA OOB traps using runtime length.
+	bc_runtime_case(
+	    "#include <stdio.h>\n"
+	    "int main(int argc,char**argv){(void)argv;int n=argc+3;\n"
+	    "int v[n]; for(int i=0;i<n;i++) v[i]=i;\n"
+	    "volatile int j=n+5; return v[j];}\n",
+	    -1, "bc-run-vla");
 
-	// Runtime: sizeof of VLA element without parens MUST NOT trap even
-	// when the index is absurdly out of range (operand is unevaluated).
-	{
-		const char *src =
-		    "#include <stdio.h>\n"
-		    "int main(int argc,char**argv){(void)argv;int n=argc+3;\n"
-		    "int v[n]; size_t sz = sizeof v[1000000]; (void)sz;\n"
-		    "return 42;}\n";
-		char *src_path = create_temp_file(src);
-		char bin[256];
-		snprintf(bin, sizeof(bin), "%s.bin", src_path);
-		PrismFeatures f = prism_defaults();
-		PrismResult r = prism_transpile_file(src_path, f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-run-vla-sizeof: transpiles");
-		if (r.output) {
-			char out_path[256];
-			snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
-			FILE *fp = fopen(out_path, "w");
-			if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
-			char cmd[1024];
-			snprintf(cmd, sizeof(cmd),
-				 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
-			CHECK_EQ(run_command_status(cmd), 0, "bc-run-vla-sizeof: compiles");
-			int status = run_command_status(bin);
-			CHECK_EQ(status, 42,
-				 "bc-run-vla-sizeof: unevaluated sizeof does not trap");
-			unlink(bin); unlink(out_path);
-		}
-		prism_free(&r);
-		unlink(src_path); free(src_path);
-	}
+	// Unevaluated sizeof of VLA element must not trap even with absurd index.
+	bc_runtime_case(
+	    "#include <stdio.h>\n"
+	    "int main(int argc,char**argv){(void)argv;int n=argc+3;\n"
+	    "int v[n]; size_t sz = sizeof v[1000000]; (void)sz;\n"
+	    "return 42;}\n",
+	    42, "bc-run-vla-sizeof");
 
-	// Runtime: &arr[len] (one-past-end address) is legal, must NOT trap.
-	{
-		const char *src =
-		    "#include <stdio.h>\n"
-		    "int main(void){int a[10]; int *p=&a[10]; (void)p; return 77;}\n";
-		char *src_path = create_temp_file(src);
-		char bin[256];
-		snprintf(bin, sizeof(bin), "%s.bin", src_path);
-		PrismFeatures f = prism_defaults();
-		PrismResult r = prism_transpile_file(src_path, f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-run-addrof: transpiles");
-		if (r.output) {
-			char out_path[256];
-			snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
-			FILE *fp = fopen(out_path, "w");
-			if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
-			char cmd[1024];
-			snprintf(cmd, sizeof(cmd),
-				 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
-			CHECK_EQ(run_command_status(cmd), 0, "bc-run-addrof: compiles");
-			int status = run_command_status(bin);
-			CHECK_EQ(status, 77,
-				 "bc-run-addrof: &a[len] returns normally");
-			unlink(bin); unlink(out_path);
-		}
-		prism_free(&r);
-		unlink(src_path); free(src_path);
-	}
+	// &arr[len] (one-past-end address) is legal and must not trap.
+	bc_runtime_case(
+	    "#include <stdio.h>\n"
+	    "int main(void){int a[10]; int *p=&a[10]; (void)p; return 77;}\n",
+	    77, "bc-run-addrof");
 #endif
 }
 
@@ -1111,190 +987,40 @@ static void test_bounds_check_extreme_edges(void) {
 		prism_free(&r);
 	}
 
-#if PRISM_TEST_RUNTIME
-	// Runtime: huge constant index (INT32_MAX) must trap.
-	{
-		const char *src =
-		    "int main(void){int a[10]={0}; volatile int i=2147483647;\n"
-		    "return a[i];}\n";
-		char *src_path = create_temp_file(src);
-		char bin[256];
-		snprintf(bin, sizeof(bin), "%s.bin", src_path);
-		PrismFeatures f = prism_defaults();
-		PrismResult r = prism_transpile_file(src_path, f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-run-huge: transpiles");
-		if (r.output) {
-			char out_path[256];
-			snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
-			FILE *fp = fopen(out_path, "w");
-			if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
-			char cmd[1024];
-			snprintf(cmd, sizeof(cmd),
-				 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
-			CHECK_EQ(run_command_status(cmd), 0, "bc-run-huge: compiles");
-			int status = run_command_status(bin);
-			CHECK(status != 0, "bc-run-huge: INT32_MAX index traps");
-			unlink(bin); unlink(out_path);
-		}
-		prism_free(&r);
-		unlink(src_path); free(src_path);
-	}
+#ifndef _WIN32
+	// Huge constant index (INT32_MAX) traps.
+	bc_runtime_case(
+	    "int main(void){int a[10]={0}; volatile int i=2147483647;\n"
+	    "return a[i];}\n",
+	    -1, "bc-run-huge");
 
-	// Runtime: index == length exactly must trap (off-by-one).
-	{
-		const char *src =
-		    "int main(void){int a[10]={0}; volatile int i=10;\n"
-		    "return a[i];}\n";
-		char *src_path = create_temp_file(src);
-		char bin[256];
-		snprintf(bin, sizeof(bin), "%s.bin", src_path);
-		PrismFeatures f = prism_defaults();
-		PrismResult r = prism_transpile_file(src_path, f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-run-offbyone: transpiles");
-		if (r.output) {
-			char out_path[256];
-			snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
-			FILE *fp = fopen(out_path, "w");
-			if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
-			char cmd[1024];
-			snprintf(cmd, sizeof(cmd),
-				 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
-			CHECK_EQ(run_command_status(cmd), 0, "bc-run-offbyone: compiles");
-			int status = run_command_status(bin);
-			CHECK(status != 0, "bc-run-offbyone: i==len traps");
-			unlink(bin); unlink(out_path);
-		}
-		prism_free(&r);
-		unlink(src_path); free(src_path);
-	}
+	// Index == length exactly (off-by-one) traps.
+	bc_runtime_case(
+	    "int main(void){int a[10]={0}; volatile int i=10;\n"
+	    "return a[i];}\n",
+	    -1, "bc-run-offbyone");
 
-	// Runtime: index == length-1 (last valid) MUST NOT trap.
-	{
-		const char *src =
-		    "int main(void){int a[10]; for(int k=0;k<10;k++)a[k]=k;\n"
-		    "volatile int i=9; return a[i];}\n";
-		char *src_path = create_temp_file(src);
-		char bin[256];
-		snprintf(bin, sizeof(bin), "%s.bin", src_path);
-		PrismFeatures f = prism_defaults();
-		PrismResult r = prism_transpile_file(src_path, f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-run-last: transpiles");
-		if (r.output) {
-			char out_path[256];
-			snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
-			FILE *fp = fopen(out_path, "w");
-			if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
-			char cmd[1024];
-			snprintf(cmd, sizeof(cmd),
-				 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
-			CHECK_EQ(run_command_status(cmd), 0, "bc-run-last: compiles");
-			int status = run_command_status(bin);
-			CHECK_EQ(status, 9, "bc-run-last: last valid index returns 9");
-			unlink(bin); unlink(out_path);
-		}
-		prism_free(&r);
-		unlink(src_path); free(src_path);
-	}
+	// Index == length-1 (last valid) must NOT trap.
+	bc_runtime_case(
+	    "int main(void){int a[10]; for(int k=0;k<10;k++)a[k]=k;\n"
+	    "volatile int i=9; return a[i];}\n",
+	    9, "bc-run-last");
 
-	// Runtime: write-then-read OOB — a[20]=99 then read a[20] must trap
-	// on the WRITE (first access).
-	{
-		const char *src =
-		    "int main(void){int a[10]={0}; volatile int i=20;\n"
-		    "a[i]=99; return a[i];}\n";
-		char *src_path = create_temp_file(src);
-		char bin[256];
-		snprintf(bin, sizeof(bin), "%s.bin", src_path);
-		PrismFeatures f = prism_defaults();
-		PrismResult r = prism_transpile_file(src_path, f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-run-write: transpiles");
-		if (r.output) {
-			char out_path[256];
-			snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
-			FILE *fp = fopen(out_path, "w");
-			if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
-			char cmd[1024];
-			snprintf(cmd, sizeof(cmd),
-				 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
-			CHECK_EQ(run_command_status(cmd), 0, "bc-run-write: compiles");
-			int status = run_command_status(bin);
-			CHECK(status != 0, "bc-run-write: OOB write traps");
-			unlink(bin); unlink(out_path);
-		}
-		prism_free(&r);
-		unlink(src_path); free(src_path);
-	}
+	// OOB write traps before the subsequent OOB read is reached.
+	bc_runtime_case(
+	    "int main(void){int a[10]={0}; volatile int i=20;\n"
+	    "a[i]=99; return a[i];}\n",
+	    -1, "bc-run-write");
 
-	// Runtime: 2D multi-dim OOB on inner index — m[1][20] must trap.
-	{
-		const char *src =
-		    "int main(void){int m[3][5]={{1,2,3,4,5},{6,7,8,9,10},{11,12,13,14,15}};\n"
-		    "volatile int j=20; return m[1][j];}\n";
-		char *src_path = create_temp_file(src);
-		char bin[256];
-		snprintf(bin, sizeof(bin), "%s.bin", src_path);
-		PrismFeatures f = prism_defaults();
-		PrismResult r = prism_transpile_file(src_path, f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-run-2d: transpiles");
-		if (r.output) {
-			char out_path[256];
-			snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
-			FILE *fp = fopen(out_path, "w");
-			if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
-			char cmd[1024];
-			snprintf(cmd, sizeof(cmd),
-				 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
-			CHECK_EQ(run_command_status(cmd), 0, "bc-run-2d: compiles");
-			int status = run_command_status(bin);
-			CHECK(status != 0, "bc-run-2d: 2D inner OOB traps");
-			unlink(bin); unlink(out_path);
-		}
-		prism_free(&r);
-		unlink(src_path); free(src_path);
-	}
-
-	// Runtime: side-effect in OOB index must still evaluate exactly once.
-	// Use a global counter — on trap we see exactly 1 increment.
-	{
-		const char *src =
-		    "#include <stdio.h>\n"
-		    "static int evals = 0;\n"
-		    "static int idx(void){ evals++; return 50; }\n"
-		    "int main(void){int a[10]={0};\n"
-		    "/* write evals to file before trap so parent can verify */\n"
-		    "FILE *f = fopen(\"/tmp/bc_sfx_evals\", \"w\");\n"
-		    "int x = a[idx()];\n"
-		    "/* unreachable */\n"
-		    "fprintf(f, \"%d\\n\", evals); fclose(f);\n"
-		    "return x;}\n";
-		char *src_path = create_temp_file(src);
-		char bin[256];
-		snprintf(bin, sizeof(bin), "%s.bin", src_path);
-		PrismFeatures f = prism_defaults();
-		PrismResult r = prism_transpile_file(src_path, f);
-		CHECK_EQ(r.status, PRISM_OK, "bc-run-sfx: transpiles");
-		if (r.output) {
-			char out_path[256];
-			snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
-			FILE *fp = fopen(out_path, "w");
-			if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
-			char cmd[1024];
-			snprintf(cmd, sizeof(cmd),
-				 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
-			CHECK_EQ(run_command_status(cmd), 0, "bc-run-sfx: compiles");
-			int status = run_command_status(bin);
-			CHECK(status != 0, "bc-run-sfx: side-effecting OOB index traps");
-			// Count idx() occurrences in the output — exactly one call site.
-			int n = 0;
-			for (const char *p = r.output; (p = strstr(p, "idx()")); p++) n++;
-			// One in the declaration `static int idx(void)` is not a call,
-			// filter to call-style: "idx()" with `a[__prism_bchk(` context.
-			CHECK(n <= 2, "bc-run-sfx: idx() call appears at most once in emit");
-			unlink(bin); unlink(out_path);
-		}
-		prism_free(&r);
-		unlink(src_path); free(src_path);
-	}
+	// Side-effect in OOB index traps (double-eval would also trap, but
+	// at least the runtime-trap path is exercised; shape is covered by
+	// the in-tree no-double-eval emit tests above).
+	bc_runtime_case(
+	    "static int evals = 0;\n"
+	    "static int idx(void){ evals++; return 50; }\n"
+	    "int main(void){int a[10]={0};\n"
+	    "int x = a[idx()]; return x;}\n",
+	    -1, "bc-run-sfx");
 #endif
 }
 
