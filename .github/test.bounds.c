@@ -864,6 +864,73 @@ static void test_bounds_check_extreme_edges(void) {
 		prism_free(&r);
 	}
 
+	// Doubly-parenthesized array name `((a))[i]` and `(((a)))[i]` — each
+	// level of `(…)` must be peeled through so the subscript wraps.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[10]={0}; int i=3;\n"
+		    "return ((a))[i] + (((a)))[i];}\n",
+		    "bc_doubleparen.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-doubleparen: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "((a))[__prism_bchk") != NULL,
+			      "bc-doubleparen: ((a))[i] wrapped");
+			CHECK(strstr(r.output, "(((a)))[__prism_bchk") != NULL,
+			      "bc-doubleparen: (((a)))[i] wrapped");
+		}
+		prism_free(&r);
+	}
+
+	// Array of pointers `int *a[10]` — `a[i]` is a valid subscript of
+	// the outer array and must wrap.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int x=0; int *a[10]={\n"
+		    "  &x,&x,&x,&x,&x,&x,&x,&x,&x,&x};\n"
+		    "int i=3; return *a[i];}\n",
+		    "bc_array_of_ptrs.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-array-of-ptrs: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "a[__prism_bchk") != NULL,
+			      "bc-array-of-ptrs: int *a[10]; a[i] wrapped");
+		prism_free(&r);
+	}
+
+	// Pointer-to-array `int (*a)[10]` — the outer name `a` is NOT an
+	// array, so `(*a)[i]` must NOT wrap.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int b[10]={0}; int (*a)[10] = &b;\n"
+		    "int i=3; return (*a)[i];}\n",
+		    "bc_ptr_to_array.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-ptr-to-array: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "[__prism_bchk") == NULL,
+			      "bc-ptr-to-array: (*a)[i] not wrapped");
+		prism_free(&r);
+	}
+
+	// Auto-static on `const T arr[N] = {literals};` must emit a space
+	// after `static` so it does not concatenate with the type.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){const int a[10]={0}; int i=3;\n"
+		    "return a[i];}\n",
+		    "bc_auto_static_spacing.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-auto-static-spacing: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "static const") != NULL,
+			      "bc-auto-static-spacing: emits 'static const' with space");
+			CHECK(strstr(r.output, "staticconst") == NULL,
+			      "bc-auto-static-spacing: no 'staticconst' concatenation");
+		}
+		prism_free(&r);
+	}
+
 	// const / volatile / restrict qualifiers on array — must still wrap.
 	{
 		PrismFeatures f = prism_defaults();

@@ -2145,25 +2145,32 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	if (tok_ann(tok) & (P1_DECL_BRACKET | P1_UNEVAL_BRACKET)) return NULL;
 	if (!last_emitted) return NULL;
 	Token *name_tok = last_emitted;
-	// Look through one level of parens: `(a)[i]` — if last_emitted is `)`
-	// matching a `(` whose content is exactly one identifier token, treat
-	// that identifier as the array operand. Guard against `f(x)[i]` /
-	// `sizeof(x)[i]` by requiring the `(` not follow a value-producing
-	// token or a keyword (which would make it a call / sizeof / cast).
-	if (match_ch(name_tok, ')') && tok_match(name_tok)) {
+	// Look through any number of paren levels: `((...(a)...))[i]` — at
+	// each step name_tok is a `)`; descend into the innermost `(...)`.
+	// Guard each level against `f(x)[i]` / `sizeof(x)[i]` / casts by
+	// requiring the outermost `(` not follow a value-producing token.
+	while (match_ch(name_tok, ')') && tok_match(name_tok)) {
 		Token *open = tok_match(name_tok);
-		Token *inner = tok_next(open);
-		if (inner && inner->kind == TK_IDENT &&
-		    tok_next(inner) == name_tok) {
-			bool ok = true;
-			if (tok_idx(open) >= 1) {
-				Token *before = &token_pool[tok_idx(open) - 1];
-				if (before->kind == TK_IDENT || before->kind == TK_NUM ||
-				    match_ch(before, ')') || match_ch(before, ']'))
-					ok = false;
-			}
-			if (ok) name_tok = inner;
+		if (tok_idx(open) >= 1) {
+			Token *before = &token_pool[tok_idx(open) - 1];
+			if (before->kind == TK_IDENT || before->kind == TK_NUM ||
+			    match_ch(before, ')') || match_ch(before, ']'))
+				break;
 		}
+		Token *inner = tok_next(open);
+		if (!inner) break;
+		// Case: content is a single identifier.
+		if (inner->kind == TK_IDENT && tok_next(inner) == name_tok) {
+			name_tok = inner;
+			break;
+		}
+		// Case: content is itself a parenthesized group with nothing after it.
+		if (match_ch(inner, '(') && tok_match(inner) &&
+		    tok_next(tok_match(inner)) == name_tok) {
+			name_tok = tok_match(inner);
+			continue;
+		}
+		break;
 	}
 	if (name_tok->kind != TK_IDENT) return NULL;
 	if (is_known_typedef(name_tok)) return NULL;
@@ -3697,7 +3704,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 						    match_ch(tok_next(tok_match(brace)), ';') &&
 						    !decl_has_attribute(decl.var_name, eq) &&
 						    is_const_literal_init(eq))
-							OUT_LIT("static");
+							OUT_LIT("static ");
 					}
 				}
 				// Mask queues: type specifiers (typeof, _Alignas) must not
@@ -7322,14 +7329,19 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		// Block scope only (file-scope arrays would require global registration).
 		// Also catches typedef-based arrays: `typedef int T[10]; T a;` where
 		// the declarator has no '[' but the base type resolves to an array.
+		// Use the same "actual array storage at top level" predicate the rest
+		// of the codebase uses: decl.is_array && (!paren_pointer || paren_array)
+		// — this registers `int *a[10]` (array of pointers, is_pointer==true)
+		// while correctly excluding `int (*a)[10]` (pointer to array).
 		bool base_is_array_here = false;
 		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name && brace_depth > 0 &&
 		    !decl.is_array && !decl.is_pointer && !decl.is_func_ptr) {
 			for (Token *bt = type_tok; bt && bt != type.end; bt = tok_next(bt))
 				if (is_array_typedef(bt)) { base_is_array_here = true; break; }
 		}
+		bool reg_as_array = decl.is_array && (!decl.paren_pointer || decl.paren_array);
 		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name && brace_depth > 0 &&
-		    (decl.is_array || base_is_array_here) && !decl.is_pointer && !decl.is_func_ptr) {
+		    (reg_as_array || base_is_array_here) && !decl.is_func_ptr) {
 			int pre = typedef_table.count;
 			if (!did_shadow) {
 				TYPEDEF_ADD_IDX(typedef_add_shadow(tok_loc(decl.var_name), decl.var_name->len, brace_depth), decl.var_name);
