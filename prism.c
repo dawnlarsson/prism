@@ -1311,18 +1311,6 @@ static inline bool is_defer_kw(Token *tok, Token *prev) {
 
 // --- Orelse Detection & Validation ---
 
-static inline void p1d_record_goto(Token *tok, uint16_t cur_sid, int p1d_cur_func) {
-	if ((tok->tag & TT_GOTO) && !is_known_typedef(tok) && tok_next(tok)) {
-		if (is_identifier_like(tok_next(tok))) {
-			P1FuncEntry *e = p1_alloc(P1K_GOTO, cur_sid, tok);
-			Token *target = tok_next(tok);
-			e->label.name = tok_loc(target);
-			e->label.len = target->len;
-		} else if (match_ch(skip_noise(tok_next(tok)), '*'))
-			func_meta[p1d_cur_func].has_computed_goto = true;
-	}
-}
-
 static inline bool is_orelse_keyword(Token *tok) {
 	if (!(tok->tag & TT_ORELSE)) return false;
 	if (last_emitted && (last_emitted->tag & TT_MEMBER)) return false;
@@ -1690,8 +1678,7 @@ static inline void track_generic_token(Token *tok);
 static Token *emit_ctrl_condition(Token *t, Token **unreachable_tok);
 
 // Unified statement emission engine for block bodies (EMIT_NORMAL) and
-// defer bodies (EMIT_DEFER_BODY). Replaces duplicated code in emit_block_body
-// and emit_deferred_range with a single parameterized loop.
+// defer bodies (EMIT_DEFER_BODY) with a single parameterized loop.
 //
 // EMIT_NORMAL: full transpilation — scope tracking via handle_open/close_brace,
 //   label detection, _Generic scope push, defer/goto/return handlers,
@@ -1914,9 +1901,8 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 	return tok;
 }
 
-static Token *emit_block_body(Token *tok, Token *end);
 
-// Dispatch stmt-expr: emit '(', process '{...}' via emit_block_body, emit ')'.
+// Dispatch stmt-expr: emit '(', process '{...}' via emit_statements, emit ')'.
 // Returns next token after ')'. Saves/restores ctrl_state and at_stmt_start.
 static inline Token *emit_stmt_expr(Token *t) {
 	emit_tok(t); // '('
@@ -1924,7 +1910,7 @@ static inline Token *emit_stmt_expr(Token *t) {
 	Token *inner = tok_next(t); // '{'
 	bool saved_ss = ctx->at_stmt_start;
 	CtrlState saved_ctrl = ctrl_state;
-	inner = emit_block_body(inner, se_end);
+	inner = emit_statements(inner, se_end, EMIT_NORMAL);
 	ctx->at_stmt_start = saved_ss;
 	ctrl_state = saved_ctrl;
 	if (se_end) { emit_tok(se_end); return tok_next(se_end); }
@@ -1965,12 +1951,6 @@ static Token *emit_ctrl_condition(Token *t, Token **unreachable_tok) {
 	}
 	if (t == close_p) { emit_tok(t); t = tok_next(t); } // emit ')'
 	return t;
-}
-
-// Process block body tokens with full transpilation dispatch.
-// Delegates to emit_statements(EMIT_NORMAL).
-static Token *emit_block_body(Token *tok, Token *end) {
-	return emit_statements(tok, end, EMIT_NORMAL);
 }
 
 static bool bracket_scan_has_orelse(Token *open) {
@@ -2177,6 +2157,33 @@ static Token *try_bounds_check_subscript(Token *tok) {
 }
 
 // Walk a balanced token group between matching delimiters, optionally emitting.
+// Shared tail for walk_balanced / walk_balanced_orelse: enum-body defer
+// shadow queueing + defense-in-depth rejection of stray `defer` inside
+// balanced groups + raw-keyword stripping. Advances `*t` and returns true
+// if the token was consumed (caller should `continue`); returns false if
+// the caller should handle `t` itself (e.g. fall through to tok_next).
+static inline bool walk_balanced_tail(Token **tp) {
+	Token *t = *tp;
+	// Enum bodies in expression context bypass statement-start
+	// check_enum_typedef_defer_shadow. Queue shadow entries here.
+	if (FEAT(F_DEFER) && defer_count > 0 && is_enum_kw(t)) {
+		Token *brace = find_struct_body_brace(t);
+		if (brace) check_enum_body_defer_shadow(brace);
+	}
+	// Defense-in-depth: reject `defer` keyword in balanced groups.
+	if (__builtin_expect(FEAT(F_DEFER) && (t->tag & TT_DEFER), 0) &&
+	    !(last_emitted && (last_emitted->tag & TT_MEMBER)) &&
+	    (!typedef_lookup(t) || match_ch(tok_next(t), '{')) &&
+	    tok_next(t) && (is_identifier_like(tok_next(t)) || match_ch(tok_next(t), '{')))
+		error_tok(t, "'defer' cannot be used in expression context "
+			  "(array dimensions, parenthesized expressions, etc.)");
+	// Strip `raw` keyword (cast expressions, etc.).
+	Token *r = emit_tok_checked(t);
+	if (r) { *tp = r; return true; }
+	*tp = tok_next(t);
+	return true;
+}
+
 static Token *walk_balanced(Token *tok, bool emit) {
 	Token *end = tok_match(tok);
 	if (!end) return tok_next(tok);
@@ -2227,23 +2234,9 @@ static Token *walk_balanced(Token *tok, bool emit) {
 				Token *next = try_typeof_orelse(t);
 				if (next) { t = next; continue; }
 			}
-			// Enum bodies in expression context (e.g. sizeof(enum { X = 1 }))
-			// bypass statement-start check_enum_typedef_defer_shadow.
-			// Queue shadow entries here so they're checked at control-flow exits.
-			if (FEAT(F_DEFER) && defer_count > 0 && is_enum_kw(t)) {
-				Token *brace = find_struct_body_brace(t);
-				if (brace) check_enum_body_defer_shadow(brace);
-			}
-			// Defense-in-depth: reject 'defer' keyword in balanced groups
-			if (__builtin_expect(FEAT(F_DEFER) && (t->tag & TT_DEFER), 0) &&
-			    !(last_emitted && (last_emitted->tag & TT_MEMBER)) &&
-			    (!typedef_lookup(t) || match_ch(tok_next(t), '{')) &&
-			    tok_next(t) && (is_identifier_like(tok_next(t)) || match_ch(tok_next(t), '{')))
-				error_tok(t, "'defer' cannot be used in expression context "
-					  "(array dimensions, parenthesized expressions, etc.)");
-			// Strip 'raw' keyword inside balanced groups (cast expressions, etc.)
-			{ Token *r = emit_tok_checked(t); if (r) { t = r; continue; } }
-			t = tok_next(t);
+			// Enum-body shadow queue + defense-in-depth defer rejection
+			// + raw stripping + advance.
+			walk_balanced_tail(&t);
 		}
 	}
 	return tok_next(end);
@@ -2560,21 +2553,7 @@ static Token *walk_balanced_orelse(Token *tok) {
 				error_tok(t, "'orelse' inside array dimension could not be transformed; "
 					   "if wrapped in outer parentheses, remove them: "
 					   "use '[f() orelse 1]' not '[(f() orelse 1)]'");
-			// Enum bodies in expression context (e.g. arr[sizeof(enum { X = 1 })])
-			// bypass statement-start check — queue shadow for exit checking.
-			if (FEAT(F_DEFER) && defer_count > 0 && is_enum_kw(t)) {
-				Token *brace = find_struct_body_brace(t);
-				if (brace) check_enum_body_defer_shadow(brace);
-			}
-			// Defense-in-depth: reject 'defer' keyword in bracket orelse
-			if (__builtin_expect(FEAT(F_DEFER) && (t->tag & TT_DEFER), 0) &&
-			    !(last_emitted && (last_emitted->tag & TT_MEMBER)) &&
-			    (!typedef_lookup(t) || match_ch(tok_next(t), '{')) &&
-			    tok_next(t) && (is_identifier_like(tok_next(t)) || match_ch(tok_next(t), '{')))
-				error_tok(t, "'defer' cannot be used in expression context "
-					  "(array dimensions, parenthesized expressions, etc.)");
-			{ Token *r = emit_tok_checked(t); if (r) { t = r; continue; } }
-			t = tok_next(t);
+			walk_balanced_tail(&t);
 		}
 		return tok_next(end);
 	}
@@ -2897,7 +2876,7 @@ static Token *emit_orelse_block_body(Token *tok) {
 	CtrlState saved_ctrl = ctrl_state;
 	ctrl_reset();
 	tok = handle_open_brace(tok);
-	tok = emit_block_body(tok, blk_close);
+	tok = emit_statements(tok, blk_close, EMIT_NORMAL);
 	tok = handle_close_brace(tok);
 	ctrl_state = saved_ctrl;
 	ctrl_state.pending = false;
@@ -5996,12 +5975,12 @@ static Token *emit_deferred_orelse(Token *t, Token *end) {
 		error_tok(t, "expected statement after 'orelse'");
 
 	// Delegate ALL action emission to emit_orelse_action, which routes
-	// blocks through emit_orelse_block_body (→ emit_block_body, the full
+	// blocks through emit_orelse_block_body (→ emit_statements, the full
 	// transpilation engine) and control-flow keywords through
 	// emit_return_body / emit_break_continue_defer / emit_goto_defer.
 	// This ensures defer unwinding, nested orelse, and zero-init are
 	// handled correctly even when orelse-with-action appears inside
-	// emit_block_body → try_process_stmt_token contexts.
+	// emit_statements → try_process_stmt_token contexts.
 	t = emit_orelse_action(t, NULL, false, false, NULL);
 	OUT_LIT(" }");
 	if (match_ch(t, ';')) t = tok_next(t);
