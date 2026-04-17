@@ -16,7 +16,7 @@ static void test_bounds_check_fixed_array(void) {
 		if (r.output) {
 			CHECK(strstr(r.output, "__prism_bchk") != NULL,
 			      "bc-basic: helper injected");
-			CHECK(strstr(r.output, "a[__prism_bchk((size_t)( 5)") != NULL,
+			CHECK(strstr(r.output, "a[__prism_bchk((__prism_bchk_size_t)( 5)") != NULL,
 			      "bc-basic: lhs subscript wrapped");
 			CHECK(strstr(r.output, "sizeof(a)/sizeof(a[0])") != NULL,
 			      "bc-basic: sizeof-ratio used for length");
@@ -117,7 +117,7 @@ static void test_bounds_check_multidim(void) {
 		    "bc_2d.c", f);
 		CHECK_EQ(r.status, PRISM_OK, "bc-2d: transpiles");
 		if (r.output) {
-			CHECK(strstr(r.output, "m[__prism_bchk((size_t)( 1), sizeof(m)/sizeof(m[0]))]") != NULL,
+			CHECK(strstr(r.output, "m[__prism_bchk((__prism_bchk_size_t)( 1), sizeof(m)/sizeof(m[0]))]") != NULL,
 			      "bc-2d: outer dim wrapped");
 		}
 		prism_free(&r);
@@ -216,6 +216,156 @@ static void test_bounds_check_runtime(void) {
 			// cc's run_command_status returns nonzero on signal
 			CHECK(status != 0 && status != 15 /* not a normal a[15] */,
 			      "bc-run-oob: OOB triggers trap (nonzero exit)");
+			unlink(bin); unlink(out_path);
+		}
+		prism_free(&r);
+		unlink(src_path); free(src_path);
+	}
+
+	// Runtime: OOB in nested subscript (inner index) must trap.
+	{
+		const char *src =
+		    "#include <stdio.h>\n"
+		    "int main(void){int arr[10]={0}; int m[3]={0,1,2};\n"
+		    "volatile int i=10; /* OOB into m */\n"
+		    "return arr[m[i]];}\n";
+		char *src_path = create_temp_file(src);
+		char bin[256];
+		snprintf(bin, sizeof(bin), "%s.bin", src_path);
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_file(src_path, f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-run-nested: transpiles");
+		if (r.output) {
+			char out_path[256];
+			snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
+			FILE *fp = fopen(out_path, "w");
+			if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
+			char cmd[1024];
+			snprintf(cmd, sizeof(cmd),
+				 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
+			CHECK_EQ(run_command_status(cmd), 0, "bc-run-nested: compiles");
+			int status = run_command_status(bin);
+			CHECK(status != 0, "bc-run-nested: inner OOB traps");
+			unlink(bin); unlink(out_path);
+		}
+		prism_free(&r);
+		unlink(src_path); free(src_path);
+	}
+
+	// Runtime: negative index (via volatile) must trap.
+	{
+		const char *src =
+		    "#include <stdio.h>\n"
+		    "int main(void){int a[10]={0}; volatile int i=-1;\n"
+		    "return a[i];}\n";
+		char *src_path = create_temp_file(src);
+		char bin[256];
+		snprintf(bin, sizeof(bin), "%s.bin", src_path);
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_file(src_path, f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-run-neg: transpiles");
+		if (r.output) {
+			char out_path[256];
+			snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
+			FILE *fp = fopen(out_path, "w");
+			if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
+			char cmd[1024];
+			snprintf(cmd, sizeof(cmd),
+				 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
+			CHECK_EQ(run_command_status(cmd), 0, "bc-run-neg: compiles");
+			int status = run_command_status(bin);
+			CHECK(status != 0, "bc-run-neg: negative index traps (unsigned cast)");
+			unlink(bin); unlink(out_path);
+		}
+		prism_free(&r);
+		unlink(src_path); free(src_path);
+	}
+
+	// Runtime: VLA OOB must trap using runtime length.
+	{
+		const char *src =
+		    "#include <stdio.h>\n"
+		    "int main(int argc,char**argv){(void)argv;int n=argc+3;\n"
+		    "int v[n]; for(int i=0;i<n;i++) v[i]=i;\n"
+		    "volatile int j=n+5; return v[j];}\n";
+		char *src_path = create_temp_file(src);
+		char bin[256];
+		snprintf(bin, sizeof(bin), "%s.bin", src_path);
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_file(src_path, f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-run-vla: transpiles");
+		if (r.output) {
+			char out_path[256];
+			snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
+			FILE *fp = fopen(out_path, "w");
+			if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
+			char cmd[1024];
+			snprintf(cmd, sizeof(cmd),
+				 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
+			CHECK_EQ(run_command_status(cmd), 0, "bc-run-vla: compiles");
+			int status = run_command_status(bin);
+			CHECK(status != 0, "bc-run-vla: VLA OOB traps");
+			unlink(bin); unlink(out_path);
+		}
+		prism_free(&r);
+		unlink(src_path); free(src_path);
+	}
+
+	// Runtime: sizeof of VLA element without parens MUST NOT trap even
+	// when the index is absurdly out of range (operand is unevaluated).
+	{
+		const char *src =
+		    "#include <stdio.h>\n"
+		    "int main(int argc,char**argv){(void)argv;int n=argc+3;\n"
+		    "int v[n]; size_t sz = sizeof v[1000000]; (void)sz;\n"
+		    "return 42;}\n";
+		char *src_path = create_temp_file(src);
+		char bin[256];
+		snprintf(bin, sizeof(bin), "%s.bin", src_path);
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_file(src_path, f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-run-vla-sizeof: transpiles");
+		if (r.output) {
+			char out_path[256];
+			snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
+			FILE *fp = fopen(out_path, "w");
+			if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
+			char cmd[1024];
+			snprintf(cmd, sizeof(cmd),
+				 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
+			CHECK_EQ(run_command_status(cmd), 0, "bc-run-vla-sizeof: compiles");
+			int status = run_command_status(bin);
+			CHECK_EQ(status, 42,
+				 "bc-run-vla-sizeof: unevaluated sizeof does not trap");
+			unlink(bin); unlink(out_path);
+		}
+		prism_free(&r);
+		unlink(src_path); free(src_path);
+	}
+
+	// Runtime: &arr[len] (one-past-end address) is legal, must NOT trap.
+	{
+		const char *src =
+		    "#include <stdio.h>\n"
+		    "int main(void){int a[10]; int *p=&a[10]; (void)p; return 77;}\n";
+		char *src_path = create_temp_file(src);
+		char bin[256];
+		snprintf(bin, sizeof(bin), "%s.bin", src_path);
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_file(src_path, f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-run-addrof: transpiles");
+		if (r.output) {
+			char out_path[256];
+			snprintf(out_path, sizeof(out_path), "%s.out.c", src_path);
+			FILE *fp = fopen(out_path, "w");
+			if (fp) { fwrite(r.output, 1, strlen(r.output), fp); fclose(fp); }
+			char cmd[1024];
+			snprintf(cmd, sizeof(cmd),
+				 "cc -std=gnu11 -o %s %s >/dev/null 2>&1", bin, out_path);
+			CHECK_EQ(run_command_status(cmd), 0, "bc-run-addrof: compiles");
+			int status = run_command_status(bin);
+			CHECK_EQ(status, 77,
+				 "bc-run-addrof: &a[len] returns normally");
 			unlink(bin); unlink(out_path);
 		}
 		prism_free(&r);
@@ -402,7 +552,7 @@ static void test_bounds_check_nested_subscript(void) {
 		int hits = 0;
 		for (const char *p = r.output; (p = strstr(p, "__prism_bchk")); p++) hits++;
 		CHECK(hits >= 2, "bc-nested-idx: outer and inner both wrapped");
-		CHECK(strstr(r.output, "m[__prism_bchk((size_t)( i)") != NULL,
+		CHECK(strstr(r.output, "m[__prism_bchk((__prism_bchk_size_t)( i)") != NULL,
 		      "bc-nested-idx: inner m[i] wrapped");
 	}
 	prism_free(&r);
@@ -441,6 +591,238 @@ static void test_bounds_check_address_of(void) {
 	}
 }
 
+static void test_bounds_check_dark_corners(void) {
+	printf("\n--- bounds-check dark corners ---\n");
+
+	// No-paren sizeof: `sizeof arr[5]` — operand is the full postfix
+	// expression per C11 §6.5.3; subscript is unevaluated and MUST NOT wrap.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[10]; return (int)sizeof a[5];}\n",
+		    "bc_sizeof_noparen.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-sizeof-noparen: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "sizeof a[5]") != NULL,
+			      "bc-sizeof-noparen: no-paren sizeof subscript not wrapped");
+			CHECK(strstr(r.output, "sizeof a[__prism_bchk") == NULL,
+			      "bc-sizeof-noparen: no wrap after sizeof");
+		}
+		prism_free(&r);
+	}
+
+	// No-paren sizeof with unary prefix: `sizeof *a[i]` — operand is *a[i].
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(int c,char**v){(void)v;int a[5]; return (int)sizeof *&a[c];}\n",
+		    "bc_sizeof_unary.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-sizeof-unary: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "a[__prism_bchk") == NULL,
+			      "bc-sizeof-unary: no wrap inside unary-prefixed sizeof");
+		prism_free(&r);
+	}
+
+	// No-paren sizeof ended by binary op: `sizeof a[0] + 1` —
+	// only the subscript is unevaluated; the `+ 1` is outside.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[5]; return (int)(sizeof a[0] + 1);}\n",
+		    "bc_sizeof_binop.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-sizeof-binop: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "sizeof a[0]") != NULL,
+			      "bc-sizeof-binop: a[0] unwrapped, binary op terminates postfix");
+		prism_free(&r);
+	}
+
+	// Member chain in no-paren sizeof: `sizeof s.arr[0]`.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "struct S{int arr[5];};\n"
+		    "int main(void){struct S s; return (int)sizeof s.arr[0];}\n",
+		    "bc_sizeof_member.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-sizeof-member: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "arr[__prism_bchk") == NULL,
+			      "bc-sizeof-member: member chain in no-paren sizeof not wrapped");
+		prism_free(&r);
+	}
+
+	// Function parameter (T[N] or T[static N]) decays to pointer —
+	// subscripts inside callee MUST NOT be wrapped (would use pointer sizeof).
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int f(int p[10], int i){return p[i];}\n"
+		    "int g(int p[static 10], int i){return p[i];}\n"
+		    "int main(void){int a[10]={0}; return f(a,0)+g(a,0);}\n",
+		    "bc_param_decay.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-param-decay: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "p[__prism_bchk") == NULL,
+			      "bc-param-decay: array-parameter subscripts not wrapped");
+		prism_free(&r);
+	}
+
+	// Compound literal / string literal subscript — `last_emitted` is
+	// a `}` or string, not IDENT; must not wrap.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){return ((int[3]){1,2,3})[1] + \"abc\"[0];}\n",
+		    "bc_lit_subscript.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-lit: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "[__prism_bchk") == NULL,
+			      "bc-lit: compound/string literal subscripts not wrapped");
+		}
+		prism_free(&r);
+	}
+
+	// Pointer-to-array dereferenced: `(*p)[i]` — `last_emitted` is `)`;
+	// must not wrap (p is pointer, not array).
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[10]={0}; int (*p)[10]=&a; return (*p)[5];}\n",
+		    "bc_ptr_to_arr.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-ptr-to-arr: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "[__prism_bchk") == NULL,
+			      "bc-ptr-to-arr: (*p)[i] not wrapped");
+		prism_free(&r);
+	}
+
+	// Designated initializer brackets — `[5] = 1` — declarator context.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[10] = {[5]=1,[9]=2}; return a[5];}\n",
+		    "bc_desig.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-desig: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "[5]=1") != NULL || strstr(r.output, "[5] = 1") != NULL,
+			      "bc-desig: designator brackets preserved unwrapped");
+			CHECK(strstr(r.output, "a[__prism_bchk((__prism_bchk_size_t)( 5)") != NULL,
+			      "bc-desig: normal subscript still wrapped");
+		}
+		prism_free(&r);
+	}
+
+	// offsetof macro form (via stddef.h) — must produce valid constant
+	// expression; __builtin_offsetof form already tested.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "#include <stddef.h>\n"
+		    "struct N{int inner[5];};\n"
+		    "int main(void){return (int)offsetof(struct N, inner[3]);}\n",
+		    "bc_offsetof_macro.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-offsetof-macro: transpiles");
+		if (r.output) {
+			// Either __builtin_offsetof form (GCC/Clang) or &((T*)0)->f[i]
+			// form (traditional). Both must not invoke __prism_bchk inside
+			// the subscript — the former is unevaluated, the latter is a
+			// constant expression and wrapping would break that.
+			CHECK(strstr(r.output, "inner[__prism_bchk") == NULL,
+			      "bc-offsetof-macro: offsetof subscript never wrapped");
+		}
+		prism_free(&r);
+	}
+
+	// Scoped shadow: inner-scope array with same name as outer pointer —
+	// outer is ptr (not wrapped), inner is array (wrapped with inner's size).
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int *x=0; (void)x;"
+		    " {int x[3]={1,2,3}; int y=x[2]; (void)y;} return 0;}\n",
+		    "bc_shadow_scope.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-shadow-scope: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "x[__prism_bchk") != NULL,
+			      "bc-shadow-scope: inner-scope array wrapped");
+		prism_free(&r);
+	}
+
+	// Macro-expanded subscripts are preprocessor-level; prism_transpile_source
+	// does not run cpp, so macro expansion is covered by the runtime tests
+	// that go through prism_transpile_file. Basic non-macro subscripts are
+	// already covered by test_bounds_check_fixed_array.
+
+	// LEN macro (sizeof(a)/sizeof(a[0])) — the inner sizeof(a[0]) is
+	// unevaluated and must not wrap.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "#define LEN(a) (sizeof(a)/sizeof((a)[0]))\n"
+		    "int main(void){int a[7]; return (int)LEN(a);}\n",
+		    "bc_len_macro.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-len-macro: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "sizeof((a)[__prism_bchk") == NULL &&
+			      strstr(r.output, "sizeof( a[__prism_bchk") == NULL,
+			      "bc-len-macro: sizeof((a)[0]) inside LEN not wrapped");
+		prism_free(&r);
+	}
+
+	// Chained subscripts assignment: a[0] = a[1] = a[2] = 7; all three wrap.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[5]={0}; a[0]=a[1]=a[2]=7; return a[0];}\n",
+		    "bc_chain_assign.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-chain-assign: transpiles");
+		if (r.output) {
+			int hits = 0;
+			for (const char *p = r.output; (p = strstr(p, "__prism_bchk")); p++) hits++;
+			CHECK(hits >= 4,
+			      "bc-chain-assign: all subscripts wrapped (>=4: 3 LHS + 1 return)");
+		}
+		prism_free(&r);
+	}
+
+	// Side-effect in index evaluated exactly once (helper takes by value).
+	// We verify transpile shape: `a[k++]` becomes a[__prism_bchk((...)(k++),...)].
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[5]={0}; int k=0; return a[k++];}\n",
+		    "bc_side_effect.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-side-effect: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "( k++)") != NULL,
+			      "bc-side-effect: side-effectful index passed by value");
+			// Only one occurrence of `k++` — no double-eval.
+			int inc = 0;
+			for (const char *p = r.output; (p = strstr(p, "k++")); p++) inc++;
+			CHECK(inc == 1, "bc-side-effect: k++ appears exactly once");
+		}
+		prism_free(&r);
+	}
+
+	// Multi-decl: `int a[4]={...}, x=5, *p=&a[0];` — only `a` is tracked.
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[4]={0,1,2,3}, x=5, *p=&a[0]; "
+		    "(void)x; (void)p; return a[2];}\n",
+		    "bc_multidecl.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-multidecl: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "a[__prism_bchk((__prism_bchk_size_t)( 2)") != NULL,
+			      "bc-multidecl: the array `a` in multi-decl is tracked");
+			CHECK(strstr(r.output, "&a[__prism_bchk") == NULL,
+			      "bc-multidecl: &a[0] (unary addr-of) not wrapped");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_bounds_check_tests(void) {
 	printf("\n=== BOUNDS-CHECK TESTS ===\n");
 	test_bounds_check_fixed_array();
@@ -451,5 +833,6 @@ void run_bounds_check_tests(void) {
 	test_bounds_check_unevaluated_operands();
 	test_bounds_check_nested_subscript();
 	test_bounds_check_address_of();
+	test_bounds_check_dark_corners();
 	test_bounds_check_runtime();
 }

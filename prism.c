@@ -2053,13 +2053,85 @@ static void p1_mark_uneval_brackets(void) {
 		    memcmp(tok_loc(t), "__builtin_offsetof", 18) == 0)
 			is_uneval = true;
 		if (!is_uneval) continue;
-		Token *paren = tok_next(t);
-		if (!paren || !match_ch(paren, '(') || !(paren->flags & TF_OPEN)) continue;
-		Token *close = tok_match(paren);
-		if (!close) continue;
-		for (Token *u = tok_next(paren); u != close && u->kind != TK_EOF; u = tok_next(u)) {
-			if (match_ch(u, '[') && (u->flags & TF_OPEN))
-				tok_ann(u) |= P1_UNEVAL_BRACKET;
+		Token *next = tok_next(t);
+		if (!next) continue;
+		// Parenthesized form: sizeof(...), _Alignof(...), typeof(...),
+		// __builtin_offsetof(...). Tag every '[' in the balanced group,
+		// including nested brackets / parens / braces (statement-exprs,
+		// compound literals) — they all stay inside the unevaluated operand.
+		if (match_ch(next, '(') && (next->flags & TF_OPEN)) {
+			Token *close = tok_match(next);
+			if (!close) continue;
+			for (Token *u = tok_next(next); u != close && u->kind != TK_EOF; u = tok_next(u)) {
+				if (match_ch(u, '[') && (u->flags & TF_OPEN))
+					tok_ann(u) |= P1_UNEVAL_BRACKET;
+			}
+			continue;
+		}
+		// No-paren form: `sizeof UNARY-EXPR` and GCC-extension
+		// `__typeof UNARY-EXPR`. The operand is a single unary-expression
+		// (C11 §6.5.3). Walk the postfix chain starting at the first
+		// non-unary-prefix token and tag every '[' inside it. The chain
+		// ends at any non-postfix token (binary op, comma, semicolon, ...).
+		// Only sizeof and typeof actually permit the no-paren form;
+		// _Alignof/offsetof require parens, so their TF_SIZEOF case
+		// harmlessly falls through here with no effect.
+		Token *p = next;
+		// Skip unary prefix operators: + - ! ~ & * ++ --
+		// (cast `(type)` always starts with '(' and was handled above.)
+		while (p && p->kind != TK_EOF) {
+			if (match_ch(p, '+') || match_ch(p, '-') ||
+			    match_ch(p, '!') || match_ch(p, '~') ||
+			    match_ch(p, '&') || match_ch(p, '*')) {
+				p = tok_next(p);
+				continue;
+			}
+			if (p->len == 2 && (memcmp(tok_loc(p), "++", 2) == 0 ||
+			                    memcmp(tok_loc(p), "--", 2) == 0)) {
+				p = tok_next(p);
+				continue;
+			}
+			break;
+		}
+		// Postfix chain: ident ( [...] | (...) | . ident | -> ident | ++ | -- )*
+		if (!p || p->kind != TK_IDENT) continue;
+		p = tok_next(p);
+		while (p && p->kind != TK_EOF) {
+			if (match_ch(p, '[') && (p->flags & TF_OPEN) && tok_match(p)) {
+				tok_ann(p) |= P1_UNEVAL_BRACKET;
+				Token *c = tok_match(p);
+				for (Token *u = tok_next(p); u != c && u->kind != TK_EOF; u = tok_next(u)) {
+					if (match_ch(u, '[') && (u->flags & TF_OPEN))
+						tok_ann(u) |= P1_UNEVAL_BRACKET;
+				}
+				p = tok_next(c);
+				continue;
+			}
+			if (match_ch(p, '(') && (p->flags & TF_OPEN) && tok_match(p)) {
+				Token *c = tok_match(p);
+				for (Token *u = tok_next(p); u != c && u->kind != TK_EOF; u = tok_next(u)) {
+					if (match_ch(u, '[') && (u->flags & TF_OPEN))
+						tok_ann(u) |= P1_UNEVAL_BRACKET;
+				}
+				p = tok_next(c);
+				continue;
+			}
+			if (match_ch(p, '.')) {
+				p = tok_next(p);
+				if (p && p->kind == TK_IDENT) p = tok_next(p);
+				continue;
+			}
+			if (p->len == 2 && memcmp(tok_loc(p), "->", 2) == 0) {
+				p = tok_next(p);
+				if (p && p->kind == TK_IDENT) p = tok_next(p);
+				continue;
+			}
+			if (p->len == 2 && (memcmp(tok_loc(p), "++", 2) == 0 ||
+			                    memcmp(tok_loc(p), "--", 2) == 0)) {
+				p = tok_next(p);
+				continue;
+			}
+			break; // end of postfix chain
 		}
 	}
 }
@@ -2109,7 +2181,7 @@ static Token *try_bounds_check_subscript(Token *tok) {
 
 	Token *arr_tok = last_emitted;
 	Token *close = tok_match(tok);
-	OUT_LIT("[__prism_bchk((size_t)(");
+	OUT_LIT("[__prism_bchk((__prism_bchk_size_t)(");
 	// Recurse into index expression so nested subscripts (arr[m[i]]),
 	// stmt-exprs, and further balanced groups are also bounds-checked.
 	for (Token *t = tok_next(tok); t != close && t->kind != TK_EOF;) {
@@ -8801,20 +8873,33 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 	}
 
 	// -fbounds-check: emit the inline bounds-check helper once per TU.
-	// MSVC lacks __builtin_expect / __builtin_trap — fall back to __assume / __debugbreak.
+	// MSVC lacks __builtin_expect / __builtin_trap — fall back to __debugbreak + abort.
+	// We do NOT #include <stddef.h> / <stdlib.h>: in flatten mode the output is
+	// fed to the backend as already-preprocessed (`-x cpp-output`) and any '#'
+	// directive is a syntax error; in non-flatten mode, re-including stdlib.h
+	// causes struct redefinitions under MSVC. Instead, declare a private size
+	// type via __SIZE_TYPE__ (GCC/Clang/TCC) with an MSVC fallback, and declare
+	// abort() locally so no headers are required.
 	if (FEAT(F_BOUNDS_CHECK)) {
 		// Tag every '[' inside sizeof/_Alignof/typeof/offsetof so Pass 2
 		// does not wrap subscripts in unevaluated operands.
 		p1_mark_uneval_brackets();
 		if (is_msvc_cached) {
-			OUT_LIT("\n#include <stddef.h>\n#include <stdlib.h>\n"
-				"static __forceinline size_t __prism_bchk(size_t __i, size_t __n) {\n"
+			OUT_LIT("\n"
+				"#if defined(_WIN64)\n"
+				"typedef unsigned __int64 __prism_bchk_size_t;\n"
+				"#else\n"
+				"typedef unsigned int __prism_bchk_size_t;\n"
+				"#endif\n"
+				"void __cdecl abort(void);\n"
+				"static __forceinline __prism_bchk_size_t __prism_bchk(__prism_bchk_size_t __i, __prism_bchk_size_t __n) {\n"
 				"    if (__i >= __n) { __debugbreak(); abort(); }\n"
 				"    return __i;\n"
 				"}\n");
 		} else {
-			OUT_LIT("\n#include <stddef.h>\n"
-				"static inline __attribute__((always_inline)) size_t __prism_bchk(size_t __i, size_t __n) {\n"
+			OUT_LIT("\n"
+				"typedef __SIZE_TYPE__ __prism_bchk_size_t;\n"
+				"static inline __attribute__((always_inline)) __prism_bchk_size_t __prism_bchk(__prism_bchk_size_t __i, __prism_bchk_size_t __n) {\n"
 				"    if (__builtin_expect(__i >= __n, 0)) __builtin_trap();\n"
 				"    return __i;\n"
 				"}\n");

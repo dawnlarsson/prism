@@ -407,10 +407,10 @@ void process(void) {
 Each wrapped subscript becomes:
 
 ```c
-arr[__prism_bchk((size_t)(i), sizeof(arr)/sizeof(arr[0]))]
+arr[__prism_bchk((__prism_bchk_size_t)(i), sizeof(arr)/sizeof(arr[0]))]
 ```
 
-The `sizeof` ratio gives the correct length for both fixed arrays (compile-time constant) and VLAs (runtime, per C99 §6.5.3.4) with no transpile-time size tracking. If the index is out of range, the inline helper calls `__builtin_trap()` (GCC/Clang) or `__debugbreak()` + `abort()` (MSVC). The `(size_t)` cast also catches negative indices — they wrap to huge values and fail the check.
+The `sizeof` ratio gives the correct length for both fixed arrays (compile-time constant) and VLAs (runtime, per C99 §6.5.3.4) with no transpile-time size tracking. If the index is out of range, the inline helper calls `__builtin_trap()` (GCC/Clang) or `__debugbreak()` + `abort()` (MSVC). The unsigned cast also catches negative indices — they wrap to huge values and fail the check. The helper avoids any `#include` so it works both with flattened (already-preprocessed) output and with system-header-retaining output.
 
 **What's checked:**
 - Fixed-size local arrays: `int arr[100]; arr[i]`

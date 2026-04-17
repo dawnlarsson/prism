@@ -855,10 +855,10 @@ Buffer overflows from unchecked array subscripts (CWE-787, CWE-125) remain one o
 When `-fbounds-check` is enabled, Prism wraps expression-context array subscripts on tracked local arrays with a runtime length check. A subscript `arr[idx]` on a local array variable is rewritten to:
 
 ```c
-arr[__prism_bchk((size_t)(idx), sizeof(arr)/sizeof(arr[0]))]
+arr[__prism_bchk((__prism_bchk_size_t)(idx), sizeof(arr)/sizeof(arr[0]))]
 ```
 
-If `idx >= len`, the helper calls `__builtin_trap()` (or `__debugbreak()` + `abort()` on MSVC). Otherwise it returns `idx` unchanged. The `(size_t)` cast maps negative indices to large positive values, which fail the `>=` comparison and trap.
+If `idx >= len`, the helper calls `__builtin_trap()` (or `__debugbreak()` + `abort()` on MSVC). Otherwise it returns `idx` unchanged. The unsigned cast maps negative indices to large positive values, which fail the `>=` comparison and trap.
 
 The check applies uniformly to both fixed-size local arrays (`int arr[100]`) and VLAs (`int vla[n]`). `sizeof` is a compile-time operator for fixed arrays (the ratio folds to a constant) and a runtime operator for VLAs (C99 §6.5.3.4), so the same emission shape works for both without any transpile-time size evaluation.
 
@@ -867,19 +867,28 @@ The check applies uniformly to both fixed-size local arrays (`int arr[100]`) and
 Emitted once per translation unit at the top of the preamble:
 
 ```c
-// GCC/Clang:
-static inline __attribute__((always_inline)) size_t
-__prism_bchk(size_t __i, size_t __n) {
+// GCC/Clang/TCC (uses compiler built-in size type, no header required):
+typedef __SIZE_TYPE__ __prism_bchk_size_t;
+static inline __attribute__((always_inline)) __prism_bchk_size_t
+__prism_bchk(__prism_bchk_size_t __i, __prism_bchk_size_t __n) {
     if (__builtin_expect(__i >= __n, 0)) __builtin_trap();
     return __i;
 }
 
-// MSVC:
-static __forceinline size_t __prism_bchk(size_t __i, size_t __n) {
+// MSVC (no __SIZE_TYPE__; pick by _WIN64, declare abort locally):
+#if defined(_WIN64)
+typedef unsigned __int64 __prism_bchk_size_t;
+#else
+typedef unsigned int __prism_bchk_size_t;
+#endif
+void __cdecl abort(void);
+static __forceinline __prism_bchk_size_t __prism_bchk(__prism_bchk_size_t __i, __prism_bchk_size_t __n) {
     if (__i >= __n) { __debugbreak(); abort(); }
     return __i;
 }
 ```
+
+No `#include` is emitted: in flatten mode the transpiled output is fed to the backend as already-preprocessed (`-x cpp-output` under GCC), where a `#` directive would be a syntax error; in non-flatten mode, re-including `<stdlib.h>` on top of already-emitted system headers causes struct redefinitions under MSVC.
 
 The helper is an inline function (not a macro) so `idx` is evaluated exactly once — no double-eval, no side-effect rejection needed at the call site. `__builtin_expect` marks the failure path cold; branch prediction keeps the hot path near-zero cost.
 
