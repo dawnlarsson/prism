@@ -2139,12 +2139,68 @@ static void p1_mark_uneval_brackets(void) {
 // the token after `]`. Returns NULL otherwise (including when the feature
 // is off, the bracket is a declarator bracket, or the predecessor is not
 // a tracked array). Index expressions are not rewritten recursively in v1.
+// Returns true if `t` is an identifier token that names a tracked
+// local/global array (or VLA variable). Parameters and enum constants
+// decay/are-not-arrays, so they're excluded.
+static bool is_tracked_array_name(Token *t) {
+	if (!t || t->kind != TK_IDENT) return false;
+	TypedefEntry *te = typedef_lookup(t);
+	if (!te || te->is_param || te->is_enum_const) return false;
+	return te->is_array || te->is_vla_var;
+}
+
 static Token *try_bounds_check_subscript(Token *tok) {
 	if (!FEAT(F_BOUNDS_CHECK)) return NULL;
 	if (!match_ch(tok, '[') || !(tok->flags & TF_OPEN) || !tok_match(tok)) return NULL;
 	if (tok->flags & TF_C23_ATTR) return NULL;
 	if (tok_ann(tok) & (P1_DECL_BRACKET | P1_UNEVAL_BRACKET)) return NULL;
 	if (!last_emitted) return NULL;
+
+	// Commutative-subscript bypass check: ISO C defines `idx[arr]` as
+	// equivalent to `arr[idx]`. When the array side hides *inside* the
+	// brackets, the normal array-on-the-left pattern-match below fails
+	// and the subscript is emitted raw — silently skipping the
+	// -fbounds-check trap. Detect and hard-error on this form when the
+	// bracket body is a single tracked array identifier (stripping paren
+	// layers). Only fires when last_emitted (the would-be index side)
+	// is not itself a tracked array, so normal forms like `arr[arr2]`
+	// fall through to the regular wrap path.
+	{
+		Token *close_scan = tok_match(tok);
+		Token *inner = tok_next(tok);
+		Token *iclose = close_scan;
+		while (inner != iclose && match_ch(inner, '(') && (inner->flags & TF_OPEN) &&
+		       tok_match(inner) && tok_next(tok_match(inner)) == iclose) {
+			iclose = tok_match(inner);
+			inner = tok_next(inner);
+		}
+		if (inner != iclose && tok_next(inner) == iclose &&
+		    is_tracked_array_name(inner)) {
+			// Strip paren layers off last_emitted the same way the
+			// main paren-walk does below, to recognize `(arr)[arr2]`
+			// as the normal form (not commutative).
+			Token *le = last_emitted;
+			while (match_ch(le, ')') && tok_match(le)) {
+				Token *open = tok_match(le);
+				if (tok_idx(open) >= 1) {
+					Token *before = &token_pool[tok_idx(open) - 1];
+					if (before->kind == TK_IDENT || before->kind == TK_NUM ||
+					    match_ch(before, ')') || match_ch(before, ']'))
+						break;
+				}
+				Token *ii = tok_next(open);
+				if (ii && ii->kind == TK_IDENT && tok_next(ii) == le) {
+					le = ii; break;
+				}
+				break;
+			}
+			if (!is_tracked_array_name(le)) {
+				error_tok(tok,
+				    "commutative subscript 'idx[arr]' bypasses "
+				    "-fbounds-check; rewrite as 'arr[idx]'");
+			}
+		}
+	}
 	Token *name_tok = last_emitted;
 	// Look through any number of paren levels: `((...(a)...))[i]` — at
 	// each step name_tok is a `)`; descend into the innermost `(...)`.
@@ -3767,21 +3823,29 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 				    (type->has_typeof || (type->has_atomic && is_aggregate) || effective_vla ||
 				     is_union_type);
 
-		// const VLA cannot be safely memset — modifying a defined const
-		// object is UB (ISO C11 §6.7.3p6).  const on non-VLA typeof
-		// (e.g. typeof(const int)) produces a memset that compilers
-		// optimize to an initializer, so only reject VLAs.
+		// const + memset-required type is UB: modifying a defined const
+		// object is undefined behavior (ISO C11 §6.7.3p6), even when
+		// laundered through (void*). Reject the cases where memset is
+		// genuinely unavoidable — unions (C11 §6.7.9p21 doesn't cover
+		// union bytes past the first member), effective VLAs (runtime
+		// size), and _Atomic aggregates (sequenced stores required).
+		// These produce a real libc memset on a const object, poisoning
+		// TBAA and permitting silent reordering around the "init".
+		// typeof(const T) on small scalars historically folds to a
+		// direct store; we allow that path to preserve compatibility.
 		bool explicit_const = (type->has_const && !decl.is_func_ptr && !decl.is_pointer) || decl.is_const;
 		if (!explicit_const && !decl.is_func_ptr && !decl.is_pointer) {
 			for (Token *tc = type_start; tc && tc != type->end; tc = tok_next(tc))
 				if (is_const_typedef(tc)) { explicit_const = true; break; }
 		}
-		if (needs_memset && explicit_const && effective_vla)
+		if (needs_memset && explicit_const &&
+		    (is_union_type || effective_vla || (type->has_atomic && is_aggregate)))
 			error_tok(decl.var_name,
-				  "'const' variable requiring typeof/VLA memset cannot be "
-				  "safely zero-initialized (modifying a const object is "
-				  "undefined behavior); remove 'const' or use 'raw' to "
-				  "opt out of automatic initialization");
+				  "'const' variable requiring unavoidable memset "
+				  "(union, VLA, or _Atomic aggregate) cannot be safely "
+				  "zero-initialized: modifying a const object is "
+				  "undefined behavior. Remove 'const', provide an "
+				  "explicit initializer, or use 'raw' to opt out.");
 
 		// Volatile typedef / volatile member: propagate to type so memset uses byte loop.
 		if (needs_memset && !type->has_volatile && !decl.is_func_ptr && !decl.is_pointer) {

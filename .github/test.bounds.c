@@ -699,6 +699,107 @@ static void test_bounds_check_dark_corners(void) {
 	}
 }
 
+// ISO C defines `idx[arr]` as strictly commutative with `arr[idx]`.
+// When the array side hides *inside* the brackets, the normal
+// array-on-the-left pattern match fails and the subscript would be
+// emitted raw — silently bypassing -fbounds-check. Prism must reject
+// this form with a hard error when bounds-check is enabled.
+static void test_bounds_check_commutative(void) {
+	printf("\n--- bounds-check commutative subscript (bypass guard) ---\n");
+
+	// Direct commutative: `len[buffer]` where buffer is a tracked array.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int b[10]; int len=5;\n"
+		    "len[b] = 0; return 0;}\n",
+		    "bc_comm_direct.c", f);
+		CHECK(r.status != PRISM_OK, "bc-comm-direct: rejects idx[arr]");
+		prism_free(&r);
+	}
+
+	// Literal index form: `2[buffer]`.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int b[10];\n"
+		    "2[b] = 0; return 0;}\n",
+		    "bc_comm_lit.c", f);
+		CHECK(r.status != PRISM_OK, "bc-comm-lit: rejects 2[arr]");
+		prism_free(&r);
+	}
+
+	// Paren-wrapped array inside: `len[(buffer)]`.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int b[10]; int len=5;\n"
+		    "len[(b)] = 0; return 0;}\n",
+		    "bc_comm_paren.c", f);
+		CHECK(r.status != PRISM_OK, "bc-comm-paren: rejects idx[(arr)]");
+		prism_free(&r);
+	}
+
+	// Struct member as index: `s.f[buffer]`.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "struct S { int f; };\n"
+		    "int main(void){int b[10]; struct S s={5};\n"
+		    "s.f[b] = 0; return 0;}\n",
+		    "bc_comm_member.c", f);
+		CHECK(r.status != PRISM_OK, "bc-comm-member: rejects s.f[arr]");
+		prism_free(&r);
+	}
+
+	// Feature off: commutative form must pass through untouched.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = false;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int b[10]; int len=5;\n"
+		    "len[b] = 0; return 0;}\n",
+		    "bc_comm_off.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-comm-off: allowed without -fbounds-check");
+		if (r.output)
+			CHECK(strstr(r.output, "len[b]") != NULL,
+			      "bc-comm-off: emitted raw");
+		prism_free(&r);
+	}
+
+	// Normal form with parens must still wrap: `(arr)[idx]`.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int b[10]; int i=3;\n"
+		    "(b)[i] = 0; return 0;}\n",
+		    "bc_comm_normal_paren.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-comm-normal-paren: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "__prism_bchk") != NULL,
+			      "bc-comm-normal-paren: wrapped normally");
+		prism_free(&r);
+	}
+
+	// Non-array identifier inside brackets: `i[j]` where neither is a
+	// tracked array. Must not error — nothing to protect.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int *p=0; int i=0;\n"
+		    "(void)i; (void)p; return 0;}\n",
+		    "bc_comm_noarr.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-comm-noarr: transpiles (no tracked array)");
+		prism_free(&r);
+	}
+}
+
 // Regression tests for declarator-bracket class bugs (see prism.c
 // try_bounds_check_subscript declarator guard and param-shadow
 // registration in p1_register_param_shadows / K&R handler). Each case
@@ -1345,6 +1446,7 @@ void run_bounds_check_tests(void) {
 	test_bounds_check_nested_subscript();
 	test_bounds_check_address_of();
 	test_bounds_check_dark_corners();
+	test_bounds_check_commutative();
 	test_bounds_check_declarator_contexts();
 	test_bounds_check_extreme_edges();
 	test_bounds_check_runtime();

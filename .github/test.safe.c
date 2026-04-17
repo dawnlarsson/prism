@@ -3213,6 +3213,65 @@ static void test_switch_case_over_native_init(void) {
 	prism_free(&r);
 }
 
+// const aggregates that require a full memset (unions, VLAs, _Atomic
+// aggregates) cannot be safely zero-initialized — modifying a defined
+// const object is UB (ISO C11 §6.7.3p6). Prism must reject these rather
+// than silently lie to the compiler via (void*) laundering.
+static void test_const_aggregate_memset_rejected(void) {
+	printf("\n--- const Aggregate Memset Rejected ---\n");
+
+	// Uninitialized const union — would emit memset on a const object.
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    const union U { int a; char b[4096]; } u;\n"
+		    "    (void)u;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "const_union.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "const union without initializer: must reject (memset on const is UB)");
+		prism_free(&r);
+	}
+
+	// Uninitialized const VLA — runtime-sized, must memset; also UB on const.
+	{
+		const char *code =
+		    "void f(int n) {\n"
+		    "    const int a[n];\n"
+		    "    (void)a;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "const_vla.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "const VLA without initializer: must reject (memset on const is UB)");
+		prism_free(&r);
+	}
+
+	// With explicit initializer, const union is fine — no memset emitted.
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    const union U { int a; char b[4]; } u = {0};\n"
+		    "    (void)u;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "const_union_init.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "const union with explicit initializer: accepted");
+		prism_free(&r);
+	}
+
+	// `raw` opts out — user took responsibility.
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    raw const union U { int a; char b[4]; } u;\n"
+		    "    (void)u;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "const_union_raw.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "const union + raw: accepted");
+		prism_free(&r);
+	}
+}
+
 // raw exempts the check — user explicitly opted out of safety.
 static void test_goto_over_raw_native_init(void) {
 	printf("\n--- Goto Over raw Native Init ---\n");
@@ -5930,6 +5989,7 @@ void run_safe_tests(void) {
 	test_typeof_paren_vla_skip_hard_error();
 	test_goto_over_native_init();
 	test_switch_case_over_native_init();
+	test_const_aggregate_memset_rejected();
 	test_goto_over_raw_native_init();
 	GNUC_ONLY(test_gnu_attr_param_shadow());
 
