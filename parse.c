@@ -3229,9 +3229,19 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 	bool base_is_ptr = false;
 	bool base_is_array = false;
 	bool base_is_func = false;
+	uint8_t base_array_rank = 0;
 	for (Token *bt = type_start; bt && bt != type_spec.end; bt = tok_next(bt)) {
 		if (is_ptr_typedef(bt)) { base_is_ptr = true; break; }
-		if (is_array_typedef(bt)) { base_is_array = true; break; }
+		if (is_array_typedef(bt)) {
+			base_is_array = true;
+			// Inherit rank from the resolved typedef so chained
+			// multi-dim typedefs (typedef int T[3][4]; typedef T U;
+			// U a;) don't lose their inner dimensions for
+			// bounds-check wrapping.
+			TypedefEntry *te = typedef_lookup(bt);
+			if (te) base_array_rank = te->array_rank;
+			break;
+		}
 		if (is_func_typedef(bt)) { base_is_func = true; break; }
 	}
 
@@ -3284,6 +3294,27 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 				if (is_ptr) added->is_ptr = true;
 				if ((decl.is_array || base_is_array) && !decl.is_pointer && !decl.is_func_ptr)
 					added->is_array = true;
+				// array_rank: count declarator `[` and add the
+				// base typedef's inherited rank (if any), so
+				// `typedef int T[3][4]; T a;` records rank=2 and
+				// `typedef int T[5]; T m[3];` records rank=2.
+				// Kept as conservative sum — does not attempt to
+				// detect declarator-level paren-wrapped groups
+				// or func-of-array constructs.
+				if ((decl.is_array || base_is_array) && !decl.is_pointer && !decl.is_func_ptr) {
+					int rank = 0;
+					for (Token *dt = decl.var_name; dt && decl.end && dt != decl.end; dt = tok_next(dt)) {
+						if (dt->len == 1 && dt->ch0 == '[' && (dt->flags & TF_OPEN)) {
+							rank++;
+							Token *m = tok_match(dt);
+							if (m) dt = m;
+						}
+					}
+					rank += (int)base_array_rank;
+					if (rank < 1) rank = 1;
+					if (rank > 15) rank = 15;
+					added->array_rank = (uint8_t)rank;
+				}
 				if (type_spec.is_struct && !type_spec.is_enum && !decl.is_pointer && !decl.is_func_ptr)
 					added->is_aggregate = true;
 				if (type_spec.is_union && !decl.is_pointer && !decl.is_func_ptr)

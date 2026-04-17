@@ -251,6 +251,60 @@ static void test_bounds_check_multidim(void) {
 			      "bc-extern: incomplete NOT wrapped");
 		prism_free(&r);
 	}
+
+	// Typedef multi-dim rank inheritance: `typedef int T[3][4]; T a;`
+	// should wrap BOTH levels (rank=2 inherited from typedef).
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "typedef int T[3][4];\n"
+		    "int main(void){T a={{0}}; int i=0,j=0; return a[i][j];}\n",
+		    "bc_td_2d.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-td-2d: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "sizeof(a)/sizeof(a[0])") != NULL,
+			      "bc-td-2d: outer wrap present");
+			CHECK(strstr(r.output, "sizeof(a[0])/sizeof(a[0][0])") != NULL,
+			      "bc-td-2d: inner wrap present (typedef rank inherited)");
+		}
+		prism_free(&r);
+	}
+
+	// Typedef row with declarator-level outer dim: combined rank
+	// `typedef int Row[5]; Row m[3];` => rank=2 (1 decl + 1 base).
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "typedef int Row[5];\n"
+		    "int main(void){Row m[3]={{0}}; int i=0,j=0; return m[i][j];}\n",
+		    "bc_td_row.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-td-row: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "sizeof(m)/sizeof(m[0])") != NULL,
+			      "bc-td-row: outer wrap present");
+			CHECK(strstr(r.output, "sizeof(m[0])/sizeof(m[0][0])") != NULL,
+			      "bc-td-row: inner wrap present (combined decl+base rank)");
+		}
+		prism_free(&r);
+	}
+
+	// Chained typedef rank propagation: `typedef T1 T2; T2 a;`.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "typedef int T1[5];\n"
+		    "typedef T1 T2;\n"
+		    "int main(void){T2 a={0}; int i=0; return a[i];}\n",
+		    "bc_td_chain.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-td-chain: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "a[__prism_bchk") != NULL,
+			      "bc-td-chain: wrapped through typedef chain");
+		prism_free(&r);
+	}
 }
 
 static void test_bounds_check_init_and_args(void) {

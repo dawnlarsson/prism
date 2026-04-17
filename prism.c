@@ -7540,10 +7540,23 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		// — this registers `int *a[10]` (array of pointers, is_pointer==true)
 		// while correctly excluding `int (*a)[10]` (pointer to array).
 		bool base_is_array_here = false;
+		uint8_t base_array_rank_here = 0;
 		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name &&
-		    !decl.is_array && !decl.is_pointer && !decl.is_func_ptr) {
+		    !decl.is_pointer && !decl.is_func_ptr) {
 			for (Token *bt = type_tok; bt && bt != type.end; bt = tok_next(bt))
-				if (is_array_typedef(bt)) { base_is_array_here = true; break; }
+				if (is_array_typedef(bt)) {
+					// Only flip `base_is_array_here` when the
+					// declarator itself is not an array —
+					// that flag governs array-var registration
+					// for the typedef-only form `T a;`. But
+					// always capture the typedef's rank so it
+					// can be added on top of a declarator-level
+					// array like `T m[3]` (combined rank).
+					if (!decl.is_array) base_is_array_here = true;
+					TypedefEntry *te = typedef_lookup(bt);
+					if (te) base_array_rank_here = te->array_rank;
+					break;
+				}
 		}
 		bool reg_as_array = decl.is_array && (!decl.paren_pointer || decl.paren_array);
 		// For file-scope registration, require sizeof(arr) to be a complete
@@ -7590,12 +7603,18 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 						if (m) dt = m;
 					}
 				}
-				// Typedef arrays: `typedef int T[10]; T a;` —
-				// no `[` in the declarator but the base type is
-				// an array. Treat as rank 1 (conservative; a
-				// multi-dim typedef will only get the outer
-				// subscript wrapped, matching prior behavior).
-				if (rank == 0 && base_is_array_here) rank = 1;
+				// Typedef arrays: inherit rank from the resolved
+				// typedef so `typedef int T[3][4]; T a;` gets
+				// rank=2 (fully wrapped at both levels), and
+				// `typedef int Row[5]; Row m[3];` gets rank=2
+				// by summing declarator rank with base rank.
+				// Fallback to +1 when the base typedef's rank
+				// wasn't recorded (stale / chained older entry).
+				if (base_array_rank_here > 0) {
+					rank += (int)base_array_rank_here;
+				} else if (base_is_array_here) {
+					rank += 1;
+				}
 				if (rank > 15) rank = 15;
 				e->array_rank = (uint8_t)rank;
 			}
