@@ -567,6 +567,14 @@ static void token_pool_ensure(size_t need) {
 	if (!c) error("out of memory allocating token cold pool");
 	token_cold = c;
 	token_cap = (uint32_t)new_cap;
+	// Zero slot 0 on first allocation: it is the reserved NULL sentinel
+	// (next_idx==0 means "no next") and must never look like a real token.
+	// Without this, any loop that accidentally iterates from i=0 reads UB
+	// flags/tag bits and crashes via tok_next(garbage_next_idx).
+	if (token_count <= 1) {
+		memset(&token_pool[0], 0, sizeof(Token));
+		memset(&token_cold[0], 0, sizeof(TokenCold));
+	}
 }
 
 static inline Token *pool_alloc_token(void) {
