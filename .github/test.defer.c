@@ -1585,6 +1585,7 @@ void test_defer_stmt_expr_goto_bypass(void) {
 	    "defer stmt-expr goto bypass rejected",
 	    "goto");
 }
+#endif
 
 void test_defer_static_storage_rejected(void) {
 	// A defer body is textually copied to every exit point.  Each copy
@@ -1639,6 +1640,7 @@ void test_defer_extern_allowed(void) {
 	prism_free(&result);
 }
 
+#ifdef __GNUC__
 void test_defer_computed_goto_rejected(void) {
 	check_defer_transpile_rejects(
 	    "int f(void) {\n"

@@ -3483,8 +3483,6 @@ void run_windows_tests(void) {
 	test_win_realpath_unc_prefix();
 	test_win_utf8_argv_zero_needed();
 	test_win_get_env_utf8_no_clobber();
-
-	return (failed == 0) ? 0 : 1;
 }
 
 #else
