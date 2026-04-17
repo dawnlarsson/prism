@@ -387,6 +387,47 @@ The transformation is conservative — it only fires when all of these hold:
 
 **Opt-out:** `prism -fno-auto-static src.c`
 
+## Bounds Checking (opt-in)
+
+Prism can wrap array subscripts with a runtime bounds check, turning silent buffer overflows into immediate traps:
+
+```c
+void process(void) {
+    int arr[100];
+    int n = get_count();
+    int vla[n];
+
+    arr[i] = 5;      // with -fbounds-check: traps if i >= 100
+    vla[j] = 7;      // with -fbounds-check: traps if j >= n
+    int x = arr[k];  // initializers are checked too
+    use(arr[m]);     // so are function-call arguments
+}
+```
+
+Each wrapped subscript becomes:
+
+```c
+arr[__prism_bchk((size_t)(i), sizeof(arr)/sizeof(arr[0]))]
+```
+
+The `sizeof` ratio gives the correct length for both fixed arrays (compile-time constant) and VLAs (runtime, per C99 §6.5.3.4) with no transpile-time size tracking. If the index is out of range, the inline helper calls `__builtin_trap()` (GCC/Clang) or `__debugbreak()` + `abort()` (MSVC). The `(size_t)` cast also catches negative indices — they wrap to huge values and fail the check.
+
+**What's checked:**
+- Fixed-size local arrays: `int arr[100]; arr[i]`
+- Local VLAs: `int vla[n]; vla[i]`
+- Outer dimension of local multi-dim arrays: `m[i][j]` checks `i`
+- Declaration initializers and function-call arguments
+
+**What's not checked:**
+- Pointer subscripts (`p[i]` where `p` is `int *`)
+- Array parameters (they decay to pointers in C)
+- `raw { ... }` blocks (Prism transformations are fully suppressed)
+- Inner dimensions of multi-dim subscripts (v1 limitation)
+
+The check is a single predicted-not-taken branch per subscript; the backend compiler constant-folds the `sizeof` ratio for fixed arrays and often eliminates the whole check when it can prove the index is in range.
+
+**Opt-in:** `prism -fbounds-check src.c` (default: off)
+
 ## Multi-File & Passthrough
 
 Prism handles real-world build scenarios:
@@ -424,7 +465,7 @@ Not:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v1.1.1 - Robust C transpiler
+Prism v1.1.2 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
 

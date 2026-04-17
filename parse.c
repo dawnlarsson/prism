@@ -256,7 +256,8 @@ enum // Feature flags
 	F_FLATTEN = 16,
 	F_ORELSE = 32,
 	F_AUTO_UNREACHABLE = 64,
-	F_AUTO_STATIC = 128
+	F_AUTO_STATIC = 128,
+	F_BOUNDS_CHECK = 256
 };
 
 struct ArenaBlock {
@@ -2262,6 +2263,7 @@ enum {
 	P1_IS_DECL           = 1 << 6, // Phase 1D: token starts a variable declaration
 	P1_SCOPE_INIT        = 1 << 7, // This '{' opens an initializer (compound literal, = {...})
 	P1_REJECTED          = 1 << 8, // Phase 1D/1F/1G rejected this token (defense-in-depth signal)
+	P1_DECL_BRACKET      = 1 << 9, // '[' is an array-declarator bracket (not an expression subscript)
 };
 
 #define tok_ann(t) ((t)->ann)

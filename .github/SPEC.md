@@ -1,6 +1,6 @@
 # Prism Transpiler Specification
 
-**Version:** 1.1.1
+**Version:** 1.1.2
 **Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (5400+ tests + self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do. It is organized in two parts: **Part I** covers the transpiler's architecture, internal processing model, and implementation details. **Part II** provides a formal language specification for Prism's extensions to C, described in terms of the C abstract machine independently of any implementation strategy.
@@ -844,6 +844,98 @@ Eliminates hidden `memcpy` calls for:
 
 `-fno-auto-static` on the command line, or `features.auto_static = false` in library mode.
 
+### 6.10 Bounds Checking (`-fbounds-check`, opt-in)
+
+#### Problem
+
+Buffer overflows from unchecked array subscripts (CWE-787, CWE-125) remain one of the most exploited vulnerability classes in C. The C standard does not require subscript bounds to be validated, and no mainstream compiler performs the check on fixed-size or VLA arrays by default. ASan catches these at runtime with heavy shadow-memory instrumentation; static analyzers find some at compile time. Neither is on by default.
+
+#### Semantics
+
+When `-fbounds-check` is enabled, Prism wraps expression-context array subscripts on tracked local arrays with a runtime length check. A subscript `arr[idx]` on a local array variable is rewritten to:
+
+```c
+arr[__prism_bchk((size_t)(idx), sizeof(arr)/sizeof(arr[0]))]
+```
+
+If `idx >= len`, the helper calls `__builtin_trap()` (or `__debugbreak()` + `abort()` on MSVC). Otherwise it returns `idx` unchanged. The `(size_t)` cast maps negative indices to large positive values, which fail the `>=` comparison and trap.
+
+The check applies uniformly to both fixed-size local arrays (`int arr[100]`) and VLAs (`int vla[n]`). `sizeof` is a compile-time operator for fixed arrays (the ratio folds to a constant) and a runtime operator for VLAs (C99 §6.5.3.4), so the same emission shape works for both without any transpile-time size evaluation.
+
+#### The `__prism_bchk` wrapper
+
+Emitted once per translation unit at the top of the preamble:
+
+```c
+// GCC/Clang:
+static inline __attribute__((always_inline)) size_t
+__prism_bchk(size_t __i, size_t __n) {
+    if (__builtin_expect(__i >= __n, 0)) __builtin_trap();
+    return __i;
+}
+
+// MSVC:
+static __forceinline size_t __prism_bchk(size_t __i, size_t __n) {
+    if (__i >= __n) { __debugbreak(); abort(); }
+    return __i;
+}
+```
+
+The helper is an inline function (not a macro) so `idx` is evaluated exactly once — no double-eval, no side-effect rejection needed at the call site. `__builtin_expect` marks the failure path cold; branch prediction keeps the hot path near-zero cost.
+
+#### Eligibility
+
+A subscript `X[Y]` is wrapped when all of the following hold:
+
+1. `FEAT(F_BOUNDS_CHECK)` is on
+2. `X` (the token immediately preceding `[`, i.e. `last_emitted`) is `TK_IDENT`
+3. `X` is a known local array variable — `typedef_lookup(X)` returns an entry with `is_array` or `is_vla_var`, and the entry is not a parameter (`!is_param`) and not an enum constant (`!is_enum_const`)
+4. `X` is not a typedef name (`!is_known_typedef(X)`)
+5. The `[` token does not carry `P1_DECL_BRACKET` (declarator brackets, tagged in Phase 1 by `decl_array_dims`, are never wrapped)
+6. The `[` is not a C23 attribute opener (`!TF_C23_ATTR`)
+7. The bracket is balanced (`tok_match(tok)` succeeds)
+
+Array variables are registered into the typedef table with `is_array = true` by a Phase 1D hook that runs only when `FEAT(F_BOUNDS_CHECK)` is on, so the feature is strictly zero-cost for users who leave it off.
+
+#### What gets checked
+
+| Pattern | Checked | Reason |
+|---|---|---|
+| `arr[i]` where `arr` is a local fixed array | Yes | Primary case |
+| `vla[i]` where `vla` is a local VLA | Yes | `sizeof(vla)` evaluates at runtime |
+| `m[i][j]` (2D local) | Outer `i` only | Inner `[` has `]` as `last_emitted`, not an identifier (v1 limitation) |
+| `arr[i]` on RHS of `int x = arr[i]` | Yes | Wrapped during declaration initializer walk |
+| `f(arr[i])` | Yes | Wrapped during balanced-group walk inside call args |
+| `int arr[100]` (declarator) | No | Tagged `P1_DECL_BRACKET` in Phase 1 |
+| `p[i]` where `p` is a pointer parameter/local | No | Not tracked as an array |
+| `a[i]` where `a` is an array parameter (`int a[10]`) | No | Parameter entries are filtered via `is_param` |
+| `arr[i]` inside `raw { ... }` | N/A — `raw` suppresses Prism transformations at parse time | |
+
+The index expression itself is not re-walked for nested subscripts in v1 — inner `emit_tok` calls inside the index emit raw. This is a known limitation.
+
+#### Side-effect evaluation
+
+The bounds helper takes `idx` by value, so any side effects in the index (`arr[i++]`, `arr[f()]`) execute exactly once, at the same sequence point they would without the check. No side-effect rejection is applied. This differs from `orelse`, which legitimately double-evaluates its left operand.
+
+#### Implementation location
+
+- **Flag:** `F_BOUNDS_CHECK = 256` (parse.c) and `PrismFeatures.bounds_check` (prism.c)
+- **CLI:** `-fbounds-check` / `-fno-bounds-check`
+- **Declarator tagging:** `decl_array_dims` sets `P1_DECL_BRACKET = 1 << 9` on every declarator `[`
+- **Shadow registration:** Phase 1D declarator loop registers plain local array variables via `typedef_add_shadow(..., is_array=true)` when the feature is on
+- **Preamble helper:** emitted in `transpile_tokens` after `emit_system_includes`
+- **Emission hook:** `try_bounds_check_subscript` is called from the main Pass 2 emit loop and from `walk_balanced` (covering function-call arguments, declaration initializers, and other balanced groups)
+
+#### Interaction with other features
+
+- **`raw`:** `raw` blocks suppress typedef-table registration at parse time, so `raw`-declared arrays are not tracked and their subscripts are not wrapped.
+- **`orelse` in subscripts:** `try_bracket_orelse` runs before the bounds-check hook in `walk_balanced`, so `arr[x orelse 0]` is consumed by the orelse path and bypasses the bounds check. Documented v1 limitation.
+- **`-fzeroinit`:** Orthogonal. Array declarators with zero-init emit an initializer plus `__builtin_memset` as usual; declarator brackets remain tagged `P1_DECL_BRACKET` and are never wrapped.
+
+#### Disable
+
+Off by default. Enable with `-fbounds-check` on the command line, or `features.bounds_check = true` in library mode.
+
 ---
 
 ## 7. Error Handling
@@ -969,7 +1061,7 @@ void          prism_thread_cleanup(void);
 
 `prism_thread_cleanup` frees thread-local hash table buckets. Must be called before a thread exits to avoid leaks in long-lived host processes.
 
-`PrismFeatures` struct fields: `compiler`, `include_paths`, `defines`, `compiler_flags`, `force_includes` (with respective counts), plus boolean feature flags (`defer`, `zeroinit`, `line_directives`, `warn_safety`, `flatten_headers`, `orelse`, `auto_unreachable`).
+`PrismFeatures` struct fields: `compiler`, `include_paths`, `defines`, `compiler_flags`, `force_includes` (with respective counts), plus boolean feature flags (`defer`, `zeroinit`, `line_directives`, `warn_safety`, `flatten_headers`, `orelse`, `auto_unreachable`, `auto_static`, `bounds_check`).
 
 `PrismResult` returns status (`PRISM_OK`, `PRISM_ERR_SYNTAX`, `PRISM_ERR_SEMANTIC`, `PRISM_ERR_IO`) and the transpiled source. `PRISM_ERR_SEMANTIC` is defined but currently unused — all errors route through `PRISM_ERR_SYNTAX`.
 

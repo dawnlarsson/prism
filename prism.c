@@ -1,4 +1,4 @@
-#define PRISM_VERSION "1.1.1"
+#define PRISM_VERSION "1.1.2"
 
 #ifndef _WIN32
 #ifndef _GNU_SOURCE
@@ -86,6 +86,7 @@ typedef struct {
 	bool orelse;
 	bool auto_unreachable;
 	bool auto_static;
+	bool bounds_check;
 } PrismFeatures;
 
 typedef enum {
@@ -481,7 +482,8 @@ static uint32_t features_to_bits(PrismFeatures f) {
 	       (f.line_directives ? F_LINE_DIR : 0) | (f.warn_safety ? F_WARN_SAFETY : 0) |
 	       (f.flatten_headers ? F_FLATTEN : 0) | (f.orelse ? F_ORELSE : 0) |
 	       (f.auto_unreachable ? F_AUTO_UNREACHABLE : 0) |
-	       (f.auto_static ? F_AUTO_STATIC : 0);
+	       (f.auto_static ? F_AUTO_STATIC : 0) |
+	       (f.bounds_check ? F_BOUNDS_CHECK : 0);
 }
 
 static const char *get_tmp_dir(void) {
@@ -2025,6 +2027,43 @@ static Token *try_bracket_orelse(Token *tok) {
 	return NULL;
 }
 
+// -fbounds-check: if `tok` is `[` of an expression subscript `arr[idx]`
+// where `arr` (last_emitted) is a known local array variable, emit
+// `[__prism_bchk((size_t)(idx), sizeof(arr)/sizeof(arr[0]))]` and return
+// the token after `]`. Returns NULL otherwise (including when the feature
+// is off, the bracket is a declarator bracket, or the predecessor is not
+// a tracked array). Index expressions are not rewritten recursively in v1.
+static Token *try_bounds_check_subscript(Token *tok) {
+	if (!FEAT(F_BOUNDS_CHECK)) return NULL;
+	if (!match_ch(tok, '[') || !(tok->flags & TF_OPEN) || !tok_match(tok)) return NULL;
+	if (tok->flags & TF_C23_ATTR) return NULL;
+	if (tok_ann(tok) & P1_DECL_BRACKET) return NULL;
+	if (!last_emitted || last_emitted->kind != TK_IDENT) return NULL;
+	if (is_known_typedef(last_emitted)) return NULL;
+	// Reject struct/union member subscripts like `s.arr[i]` and `p->arr[i]`.
+	// The identifier names a struct field whose size is unrelated to any
+	// local variable that happens to share the name — wrapping with
+	// sizeof(local_arr) would be a silent false negative.
+	if (tok_idx(last_emitted) >= 1 &&
+	    (token_pool[tok_idx(last_emitted) - 1].tag & TT_MEMBER))
+		return NULL;
+	TypedefEntry *te = typedef_lookup(last_emitted);
+	if (!te || te->is_param || te->is_enum_const) return NULL;
+	if (!te->is_array && !te->is_vla_var) return NULL;
+
+	Token *arr_tok = last_emitted;
+	Token *close = tok_match(tok);
+	OUT_LIT("[__prism_bchk((size_t)(");
+	for (Token *t = tok_next(tok); t != close && t->kind != TK_EOF; t = tok_next(t))
+		emit_tok(t);
+	OUT_LIT("), sizeof(");
+	out_str(tok_loc(arr_tok), arr_tok->len);
+	OUT_LIT(")/sizeof(");
+	out_str(tok_loc(arr_tok), arr_tok->len);
+	OUT_LIT("[0]))]");
+	return tok_next(close);
+}
+
 // Walk a balanced token group between matching delimiters, optionally emitting.
 static Token *walk_balanced(Token *tok, bool emit) {
 	Token *end = tok_match(tok);
@@ -2036,6 +2075,12 @@ static Token *walk_balanced(Token *tok, bool emit) {
 			if ((t->flags & TF_OPEN) && is_stmt_expr_open(t)) {
 				t = emit_stmt_expr(t);
 				continue;
+			}
+			// -fbounds-check: wrap expression subscript arr[idx] inside
+			// balanced groups (function arg lists, declaration initializers, etc.).
+			if (__builtin_expect(FEAT(F_BOUNDS_CHECK), 0)) {
+				Token *bc_next = try_bounds_check_subscript(t);
+				if (bc_next) { t = bc_next; continue; }
 			}
 			// Bracket orelse: dispatch to orelse-aware walker.
 			if (FEAT(F_ORELSE) && (t->flags & TF_OPEN) && match_ch(t, '[') && tok_match(t)) {
@@ -2476,6 +2521,8 @@ static inline void decl_emit(Token *t, bool emit) {
 
 static inline Token *decl_array_dims(Token *t, bool emit, bool *vla) {
 	while (match_ch(t, '[')) {
+		// Tag as declarator bracket so -fbounds-check skips it.
+		tok_ann(t) |= P1_DECL_BRACKET;
 		// C23 attributes between array dims: emit with inline orelse
 		// but skip the FIFO-consuming bracket orelse path.
 		if (t->flags & TF_C23_ATTR) {
@@ -7100,11 +7147,30 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 				  "or use 'raw' to suppress zero-init.");
 
 		// Phase 1C: shadow detection
+		bool did_shadow = false;
 		if (is_known_typedef(decl.var_name) ||
 		    is_known_enum_const(decl.var_name) ||
 		    (decl.var_name->tag & (TT_DEFER | TT_ORELSE | TT_NORETURN_FN | TT_SPECIAL_FN)) ||
 		    hashmap_get(&p1_func_proto_map, tok_loc(decl.var_name), decl.var_name->len)) {
 			p1_register_shadow(decl.var_name, cur_sid, brace_depth);
+			did_shadow = true;
+		}
+
+		// -fbounds-check: register plain local array variables so Pass 2 can
+		// look them up at subscript sites. If a shadow was already registered
+		// above (name collides with typedef/enum/defer), promote the new entry
+		// to is_array=true. Otherwise register a fresh shadow entry.
+		// Block scope only (file-scope arrays would require global registration).
+		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name && brace_depth > 0 &&
+		    decl.is_array && !decl.is_pointer && !decl.is_func_ptr) {
+			int pre = typedef_table.count;
+			if (!did_shadow) {
+				TYPEDEF_ADD_IDX(typedef_add_shadow(tok_loc(decl.var_name), decl.var_name->len, brace_depth), decl.var_name);
+			}
+			if (typedef_table.count > pre || did_shadow) {
+				TypedefEntry *e = &typedef_table.entries[typedef_table.count - 1];
+				e->is_array = true;
+			}
 		}
 
 		t = decl.end;
@@ -8664,6 +8730,24 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		emit_system_includes();
 	}
 
+	// -fbounds-check: emit the inline bounds-check helper once per TU.
+	// MSVC lacks __builtin_expect / __builtin_trap — fall back to __assume / __debugbreak.
+	if (FEAT(F_BOUNDS_CHECK)) {
+		if (is_msvc_cached) {
+			OUT_LIT("\n#include <stddef.h>\n#include <stdlib.h>\n"
+				"static __forceinline size_t __prism_bchk(size_t __i, size_t __n) {\n"
+				"    if (__i >= __n) { __debugbreak(); abort(); }\n"
+				"    return __i;\n"
+				"}\n");
+		} else {
+			OUT_LIT("\n#include <stddef.h>\n"
+				"static inline __attribute__((always_inline)) size_t __prism_bchk(size_t __i, size_t __n) {\n"
+				"    if (__builtin_expect(__i >= __n, 0)) __builtin_trap();\n"
+				"    return __i;\n"
+				"}\n");
+		}
+	}
+
 	int next_func_idx = 0;
 	int ternary_depth = 0;
 	Token *pending_unreachable_tok = NULL;
@@ -8951,6 +9035,17 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 			error_tok(tok,
 				  "'orelse' cannot be used here (it must appear at the "
 				  "statement level in a declaration or bare expression)");
+
+		// -fbounds-check: wrap expression subscript arr[idx] with
+		// __prism_bchk((size_t)(idx), sizeof(arr)/sizeof(arr[0])).
+		// Declarator brackets are tagged P1_DECL_BRACKET in Phase 1 and skipped.
+		// Known limitation: orelse-in-subscript is consumed by try_bracket_orelse
+		// above and so bypasses this hook (documented).
+		{
+			Token *bc_next = try_bounds_check_subscript(tok);
+			if (bc_next) { tok = bc_next; continue; }
+		}
+
 
 		// Strip 'raw' keyword where try_zero_init_decl does not run
 		// (file scope, struct body, after comma in multi-declarators).
@@ -9391,6 +9486,8 @@ static Cli cli_parse(int argc, char **argv) {
 			if (!strcmp(a, "-fno-flatten-headers"))  { cli.features.flatten_headers = false; continue; }
 			if (!strcmp(a, "-fno-auto-unreachable")) { cli.features.auto_unreachable = false; continue; }
 			if (!strcmp(a, "-fno-auto-static"))      { cli.features.auto_static = false; continue; }
+			if (!strcmp(a, "-fbounds-check"))        { cli.features.bounds_check = true; continue; }
+			if (!strcmp(a, "-fno-bounds-check"))     { cli.features.bounds_check = false; continue; }
 			// fall through to forward
 		} else {
 			// Dependency-generation flags → preprocessor only

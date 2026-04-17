@@ -318,6 +318,7 @@ static void check_transpiled_output_compiles_and_runs(const char *output,
 #include "test.autostatic.c"
 #include "test.autounreach.c"
 #include "test.spec.c"
+#include "test.bounds.c"
 
 typedef struct {
 	const char *name;
@@ -361,6 +362,7 @@ int main(void) {
 		{"autostatic", run_autostatic_tests},
 		{"autounreach", run_auto_unreachable_tests},
 		{"spec",     run_spec_tests},
+		{"bounds",   run_bounds_check_tests},
 	};
 	int n = sizeof(suites) / sizeof(suites[0]);
 

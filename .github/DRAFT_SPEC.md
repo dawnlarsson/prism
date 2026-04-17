@@ -597,57 +597,9 @@ Zero new scanning logic required. The label direction check already exists in `p
 
 ---
 
-## 10. Bounds Checking (`-fbounds-check`)
+## 10. Bounds Checking — Future Tiers
 
-**Problem:** Buffer overflows from unchecked array subscripts are the #1 exploited vulnerability class in C (CWE-787, CWE-125). This is the single biggest argument for Rust over C. Rust inserts a runtime bounds check on every `vec[i]` and `slice[i]` — if the index is out of range, the program panics instead of silently corrupting memory or leaking secrets.
-
-C has no equivalent. ASAN catches these at runtime with heavy shadow-memory instrumentation. Static analyzers find some at compile time. Neither is on by default. Most C code ships with zero bounds protection.
-
-**Design:** Prism instruments array subscript accesses with lightweight runtime bounds checks. The check fires before the access, trapping on out-of-bounds instead of silently corrupting. Three tiers of coverage, from fully automatic to annotation-driven.
-
-### Tier 1: Fixed-size local arrays (automatic)
-
-No annotation needed. Prism uses C's own `sizeof` operator to derive the array length — no transpile-time size evaluation, no stored constants.
-
-```c
-// Source:
-void process(void) {
-    int arr[100];
-    arr[i] = 5;
-    int x = arr[j];
-}
-
-// Emitted:
-void process(void) {
-    int arr[100];
-    arr[__prism_bchk((size_t)(i), sizeof(arr)/sizeof(arr[0]), "arr", __FILE__, __LINE__)] = 5;
-    int x = arr[__prism_bchk((size_t)(j), sizeof(arr)/sizeof(arr[0]), "arr", __FILE__, __LINE__)];
-}
-```
-
-`sizeof(arr)/sizeof(arr[0])` is a compile-time constant for fixed arrays — the compiler folds `sizeof(int[100])/sizeof(int)` → `100` and the bounds check against a constant is trivially optimizable. For `arr[5]` with size 100, the entire check is dead-code-eliminated.
-
-The `(size_t)` cast on the index handles negative indices correctly — they wrap to huge positive values, which are >= len, triggering the trap.
-
-### Tier 2: VLAs (automatic)
-
-Same mechanism, same `sizeof` trick. C99 §6.5.3.4 guarantees `sizeof` evaluates VLAs at runtime, so `sizeof(arr)/sizeof(arr[0])` returns the correct runtime length with no extra bookkeeping.
-
-```c
-// Source:
-void process(int n) {
-    int arr[n];
-    arr[i] = 5;
-}
-
-// Emitted:
-void process(int n) {
-    int arr[n];
-    arr[__prism_bchk((size_t)(i), sizeof(arr)/sizeof(arr[0]), "arr", __FILE__, __LINE__)] = 5;
-}
-```
-
-**This is the key insight from using `sizeof`:** Tiers 1 and 2 use identical emission. Prism doesn't need to distinguish fixed arrays from VLAs at the check site — `sizeof` handles both uniformly. The only thing Prism needs to know is "this identifier is a local array" (already tracked in the typedef table via `is_array`).
+Tiers 1 and 2 (fixed-size local arrays and VLAs) have shipped as `-fbounds-check`; see **SPEC.md §6.10**. The remaining work is tracked here.
 
 ### Tier 3: Function parameters (annotation)
 
@@ -664,8 +616,8 @@ void fill(int arr[bounds(n)], size_t n) {
 // Emitted (annotation stripped):
 void fill(int *arr, size_t n) {
     for (size_t i = 0; i < n; i++)
-        arr[__prism_bchk(i, n, "arr", __FILE__, __LINE__)] = 0;
-    arr[__prism_bchk(n, n, "arr", __FILE__, __LINE__)] = 0;  // TRAP
+        arr[__prism_bchk(i, n)] = 0;
+    arr[__prism_bchk(n, n)] = 0;  // TRAP
 }
 ```
 
@@ -679,70 +631,7 @@ void process(int arr[static 10]) {
 }
 ```
 
-### The `__prism_bchk` wrapper
-
-```c
-static inline size_t __prism_bchk(size_t idx, size_t len,
-        const char *name, const char *file, int line) {
-    if (__builtin_expect(idx >= len, 0)) {
-        fprintf(stderr, "%s:%d: index %zu out of bounds for '%s' (size %zu)\n",
-                file, line, idx, name, len);
-        __builtin_trap();
-    }
-    return idx;
-}
-```
-
-**Why an inline wrapper, not a macro?** Single evaluation of `idx`. No double-eval bugs. The compiler inlines it and eliminates the check entirely when it can prove the index is in range (e.g., `arr[0]` where size > 0). `__builtin_expect` marks the failure path as cold — zero branch-prediction penalty on the hot path.
-
-**Return type:** `size_t`. The wrapper replaces the original index at the subscript site: `arr[expr]` → `arr[__prism_bchk(expr, ...)]`. This is type-safe because C array subscript accepts any integer type.
-
-### What gets checked
-
-| Pattern | Checked? | Why |
-|---|---|---|
-| `arr[i]` | Yes | Direct subscript on tracked array |
-| `arr[i][j]` | Both dims | Each `[` is a separate check against its dimension |
-| `arr[i].field` | `i` checked | Subscript followed by member access |
-| `arr[f()]` | Rejected | Side-effectful index — same rejection as min/max |
-| `arr[i++]` | Rejected | Side-effectful index |
-| `sizeof(arr[0])` | No | `sizeof` doesn't evaluate |
-| `&arr[i]` | Yes | OOB address formation is UB |
-| `p[i]` where `p = arr` | No | Bounds lost at pointer assignment |
-| `*(arr + i)` | No (v1) | Pointer arithmetic — future tier |
-
-### Side-effect rejection in indices
-
-Indices with side effects are rejected at compile time:
-
-```
-error: bounds-checked subscript 'arr[f()]' has side effects in index;
-       hoist to a temporary: size_t tmp = f(); arr[tmp]
-```
-
-This reuses `reject_orelse_side_effects` — the same scanner used for min/max/clamp and bare orelse. The check fires on `++`, `--`, `=`, `+=`, and `ident(` (function calls).
-
-### Opting out: `raw` blocks
-
-For performance-critical inner loops where the developer has already validated bounds, suppress checking with `raw`:
-
-```c
-int arr[1024];
-// ... validate that 0 <= lo && hi <= 1024 ...
-
-raw {
-    for (int i = lo; i < hi; i++)
-        arr[i] = 0;  // no bounds check — raw block
-}
-```
-
-`raw` already suppresses Prism transformations (zero-init, orelse, defer emit). Extending it to suppress bounds checks is natural and consistent.
-
-### Bounds table
-
-For Tier 1/2 (local arrays), **no dedicated bounds table is needed.** The existing typedef table already tracks `is_array` per identifier. At emit time, Prism sees `TK_IDENT` + `[`, looks up the typedef entry, and if `is_array` is set, wraps the subscript with `__prism_bchk` using `sizeof(ident)/sizeof(ident[0])`. Zero new infrastructure.
-
-Tier 3 (annotated parameters) does need per-parameter tracking for the `bounds(expr)` size expression:
+Tier 3 requires per-parameter tracking for the `bounds(expr)` size expression:
 
 ```
 BoundsParamEntry {
@@ -758,61 +647,13 @@ BoundsParamEntry {
 
 Registration happens in `process_declarators` when a parameter has `bounds(...)` annotation. Lookup happens in the Pass 2 emit loop when emitting `TK_IDENT` + `[`.
 
-### Multi-dimensional arrays
+### Further future tiers
 
-`sizeof` scales naturally to multi-dimensional arrays using C's type system:
-
-```c
-int matrix[3][4];
-matrix[i][j] = 1;
-
-// Emitted:
-matrix[__prism_bchk((size_t)(i), sizeof(matrix)/sizeof(matrix[0]), "matrix", __FILE__, __LINE__)]
-       [__prism_bchk((size_t)(j), sizeof(matrix[0])/sizeof(matrix[0][0]), "matrix", __FILE__, __LINE__)] = 1;
-```
-
-`sizeof(matrix)/sizeof(matrix[0])` → 3 (first dimension). `sizeof(matrix[0])/sizeof(matrix[0][0])` → 4 (second dimension). Each dimension's check uses the appropriate `sizeof` ratio. The compiler constant-folds all of these.
-
-For the Nth subscript on identifier `arr`, Prism emits `sizeof(arr[0]...[0])/sizeof(arr[0]...[0])` with N-1 and N zero-subscripts respectively. This is mechanical token emission — no evaluation needed.
-
-### Struct member arrays
-
-```c
-struct Packet {
-    uint8_t data[1500];
-    int len;
-};
-
-void parse(struct Packet *p) {
-    p->data[i] = 0;  // Can Prism check this?
-}
-```
-
-Tier 1 covers local struct instances: `struct Packet pkt; pkt.data[i]` — Prism knows `data` is `uint8_t[1500]` from the struct definition.
-
-Pointer-to-struct (`p->data[i]`) requires struct field size tracking — feasible but heavier. Deferred to a later phase.
-
-### Comparison with Rust
-
-| | Rust | Prism `-fbounds-check` |
-|---|---|---|
-| Array subscript | Runtime panic | Runtime trap |
-| Default | Always on | Opt-in flag |
-| Opt-out | `.get_unchecked()` (unsafe) | `raw { }` block |
-| Slices | Native `&[T]` fat pointer | Tier 3 `bounds(n)` annotation |
-| Pointer arithmetic | No raw pointer deref outside unsafe | Not checked (v1) |
-| Cost | One branch per subscript | Same |
-| Overhead | ~0 with branch prediction | Same |
-
-**The key insight:** Rust's bounds safety is primarily a **runtime** mechanism, not a compile-time one. The borrow checker handles lifetimes (use-after-free, double-free), but bounds checking is a simple runtime comparison. Prism can match Rust's bounds safety with zero syntax overhead — the same C code, with a flag.
-
-### Performance
-
-Modern CPUs predict the "not-taken" branch (the trap path) with near-100% accuracy. The bounds check costs one comparison and one predicted-not-taken branch per subscript — typically < 1 cycle. In practice, enabling bounds checking adds 2-5% overhead across a full program. Disabling for hot inner loops via `raw` brings this to near-zero for compute-intensive workloads.
-
-For production use: leave it on. The 2-5% overhead is dwarfed by the cost of a single buffer overflow vulnerability.
-
-For debug/CI: mandatory. Catches OOB bugs that ASAN would catch, at a fraction of the memory and CPU overhead.
+- **Inner dimensions of multi-dim subscripts:** `m[i][j]` currently only checks the outer `i`. Inner `j` is not wrapped because `last_emitted` at the inner `[` is `]`, not an identifier. A future pass could re-walk the preceding subscript chain to derive the inner dimension's `sizeof` ratio.
+- **Pointer arithmetic:** `*(arr + i)` → check `i` against arr's bounds. Requires recognizing `arr + expr` as a bounds-relevant pattern.
+- **Struct field arrays via pointer:** `p->data[i]` where `p` is a pointer to a struct with a known-size `data` field. Requires struct definition scanning. Local struct instances (`pkt.data[i]`) are already covered once Tier 1 is extended to follow struct-member access.
+- **Return value annotation:** `int *get_buffer(size_t *out_len) bounds(*out_len)` — annotate that the returned pointer has bounds tied to an output parameter.
+- **Propagated bounds:** When `int *p = arr;` is detected, carry arr's bounds to `p` within the same scope. Limited dataflow, but catches the most common alias pattern.
 
 ### Why not `slice(T)` fat pointers?
 
@@ -824,22 +665,6 @@ This is a non-starter for Prism:
 - **Conversion ceremony:** Every interaction with legacy code requires explicit `slice_from(ptr, len)` / `slice_ptr(s)` conversion — the exact ceremony Rust developers complain about.
 
 The `bounds(n)` annotation is superior: the function signature stays `int *arr` in emitted C. The ABI doesn't change. Existing C code calls the function without modification. Only the function body gets bounds checks injected.
-
-### Architecture fit
-
-- **Array detection:** typedef table already tracks `is_array` per identifier — no new table needed for Tier 1/2
-- **Size computation:** `sizeof(arr)/sizeof(arr[0])` delegates size tracking to the C compiler — Prism doesn't evaluate anything
-- **Subscript detection:** Pass 2 emit loop sees every `TK_IDENT` + `[` pair
-- **Side-effect rejection:** Reuses `reject_orelse_side_effects`
-- **Opt-out:** `raw` blocks already suppress transformations
-- **Helper emission:** Same preamble injection mechanism used for zero-init `__builtin_memset`
-
-### Future tiers
-
-- **Pointer arithmetic:** `*(arr + i)` → check `i` against arr's bounds. Requires recognizing `arr + expr` as a bounds-relevant pattern.
-- **Struct field arrays via pointer:** `p->data[i]` where `p` is a pointer to a struct with a known-size `data` field. Requires struct definition scanning.
-- **Return value annotation:** `int *get_buffer(size_t *out_len) bounds(*out_len)` — annotate that the returned pointer has bounds tied to an output parameter.
-- **Propagated bounds:** When `int *p = arr;` is detected, carry arr's bounds to `p` within the same scope. Limited dataflow, but catches the most common alias pattern.
 
 ---
 
