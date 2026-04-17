@@ -2182,6 +2182,34 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	if (tok_idx(name_tok) >= 1 &&
 	    (token_pool[tok_idx(name_tok) - 1].tag & TT_MEMBER))
 		return NULL;
+	// Class-closing guard: if name_tok is preceded by a type-like token or
+	// a pointer-declarator '*', we're looking at a declarator (e.g.
+	// `int g[20]`, `MyType g[20]`, `struct S *g[20]`, `const int g[20]`),
+	// not an expression subscript. This catches declarators in contexts
+	// where Phase 1 doesn't pre-tag the bracket: nested prototypes inside
+	// a function body, function-pointer parameters, function-pointer
+	// typedefs, struct/union fields that are function pointers. Without
+	// this guard we would emit `int g[__prism_bchk(20, sizeof(g)/sizeof(g[0]))]`
+	// which is either a semantic error (VLA mismatch) or a spurious trap.
+	// Distinguish pointer-declarator '*' from unary-deref '*': unary-deref
+	// is preceded by a value-producing token or is at statement start.
+	if (tok_idx(name_tok) >= 1) {
+		Token *pv = &token_pool[tok_idx(name_tok) - 1];
+		if (pv->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF))
+			return NULL;
+		if (match_ch(pv, '*') && !(pv->flags & TF_OPEN) && tok_idx(pv) >= 1) {
+			Token *pp = &token_pool[tok_idx(pv) - 1];
+			// Pointer-declarator '*' follows a type/qualifier/'*'/'('
+			// that opens a declarator grouping. Unary-deref '*' follows
+			// value-producing tokens (IDENT/NUM/STR/')'/']'), operators,
+			// or statement separators.
+			bool is_decl_star =
+			    (pp->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)) ||
+			    (match_ch(pp, '*') && !(pp->flags & TF_OPEN)) ||
+			    (match_ch(pp, '(') && (pp->flags & TF_OPEN));
+			if (is_decl_star) return NULL;
+		}
+	}
 	TypedefEntry *te = typedef_lookup(name_tok);
 	if (!te || te->is_param || te->is_enum_const) return NULL;
 	if (!te->is_array && !te->is_vla_var) return NULL;
@@ -6372,7 +6400,40 @@ static void p1_register_param_shadows(Token *open, Token *close,
 		    (last_ident->tag & (TT_DEFER | TT_ORELSE | TT_NORETURN_FN | TT_SPECIAL_FN)) ||
 		    hashmap_get(&p1_func_proto_map, tok_loc(last_ident), last_ident->len)))
 			p1_register_shadow(last_ident, scope_id, brace_depth);
+		// -fbounds-check: tag top-level '[' in this parameter as a declarator
+		// bracket so try_bounds_check_subscript skips it. Without this, a
+		// parameter name that shadows a file-scope array (int g[10]; int f(int g[20]))
+		// would trigger a spurious wrap on the declarator dim, producing
+		// `int f(int g[__prism_bchk(20, sizeof(g)/sizeof(g[0]))])` which traps at
+		// runtime (sizeof(g) is pointer-sized after decay). Nested groups are
+		// skipped — brackets inside them are dim-expression subscripts, not
+		// declarator brackets.
+		{
+			Token *param_end_tok = (t && match_ch(t, ',')) ? t : close;
+			for (Token *s = param_start; s && s != param_end_tok && s->kind != TK_EOF; s = tok_next(s)) {
+				if (match_ch(s, '[') && tok_match(s)) {
+					tok_ann(s) |= P1_DECL_BRACKET;
+					s = tok_match(s);
+					continue;
+				}
+				if (match_ch(s, '(') && tok_match(s)) {
+					s = tok_match(s);
+					continue;
+				}
+			}
+		}
 		if (check_vla && last_ident) {
+			// -fbounds-check: register non-VLA parameter names as
+			// is_param shadows so they mask any file-scope array of
+			// the same name. Without this, `int g[10]; int f(int g[20]){return g[5];}`
+			// looks up `g` in typedef_table, finds the file-scope array,
+			// and wraps with sizeof(g)/sizeof(g[0]) — but `g` in the body
+			// is the parameter (pointer, sizeof == pointer size), so the
+			// wrap spuriously traps.
+			if (FEAT(F_BOUNDS_CHECK)) {
+				TYPEDEF_ADD_IDX(typedef_add_shadow(tok_loc(last_ident), last_ident->len, brace_depth), last_ident);
+				typedef_table.entries[typedef_table.count - 1].is_param = true;
+			}
 			// For outer-level identifiers (int arr[n]), the first []
 			// is the decaying dimension (sizeof(arr) = pointer size,
 			// constant). Skip it. Only subsequent [] dimensions matter
@@ -7343,9 +7404,11 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 				if (is_array_typedef(bt)) { base_is_array_here = true; break; }
 		}
 		bool reg_as_array = decl.is_array && (!decl.paren_pointer || decl.paren_array);
-		// For file-scope registration, require at least one non-empty dim so
-		// sizeof(arr) is a complete type at use sites. Block-scope arrays
-		// always have complete size (C forbids local `int a[];`).
+		// For file-scope registration, require sizeof(arr) to be a complete
+		// type at use sites. That holds when either (a) at least one dim is
+		// non-empty, or (b) an initializer completes the outer dim (e.g.
+		// `int g[] = {1,2,3};`). Block-scope arrays always have complete
+		// size (C forbids local `int a[];`).
 		bool has_complete_dim = true;
 		if (reg_as_array && brace_depth == 0) {
 			has_complete_dim = false;
@@ -7355,6 +7418,8 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 					if (nx && !match_ch(nx, ']')) { has_complete_dim = true; break; }
 				}
 			}
+			if (!has_complete_dim && match_ch(decl.end, '='))
+				has_complete_dim = true;
 		}
 		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name &&
 		    (brace_depth > 0 ||
@@ -7609,6 +7674,44 @@ static void p1d_handle_open_brace(P1ScanState *s) {
 		if (prev_tok && match_ch(prev_tok, ')') && tok_match(prev_tok))
 			p1_register_param_shadows(tok_match(prev_tok), prev_tok,
 						  sid, s->brace_depth + 1, true);
+		// -fbounds-check: K&R-style parameter declarations live between the
+		// identifier-list ')' and the body '{' (e.g. `int f(g) int g[10]; {`).
+		// p1_register_param_shadows only walks the identifier list and does
+		// not see these type-decl brackets, so without this tagging pass the
+		// declarator `g[10]` would be treated as an expression subscript and
+		// wrapped with __prism_bchk. Mark every top-level '[' in that range
+		// as P1_DECL_BRACKET and register each declared name as an is_param
+		// shadow so body uses don't look up a same-name file-scope array.
+		if (FEAT(F_BOUNDS_CHECK) && prev_tok && match_ch(prev_tok, ')') &&
+		    tok_match(prev_tok) && tok_next(prev_tok) != tok) {
+			for (Token *s_ = tok_next(prev_tok); s_ && s_ != tok && s_->kind != TK_EOF; s_ = tok_next(s_)) {
+				if (match_ch(s_, '[') && tok_match(s_)) {
+					tok_ann(s_) |= P1_DECL_BRACKET;
+					s_ = tok_match(s_);
+					continue;
+				}
+				if ((match_ch(s_, '(') || match_ch(s_, '{')) && tok_match(s_)) {
+					s_ = tok_match(s_);
+					continue;
+				}
+				// Heuristic: an identifier that is immediately followed by
+				// '[', '(' (grouping), ',' or ';' and is preceded by a type
+				// keyword / '*' / qualifier is the declared name — register
+				// as param shadow. Cheap approximation: register any IDENT
+				// whose next token is '[', ',' or ';' and is not itself a
+				// type/keyword. Duplicate entries are harmless (shadow
+				// masking is by-name).
+				if (s_->kind == TK_IDENT &&
+				    !(s_->tag & (TT_TYPE|TT_QUALIFIER|TT_SUE|TT_TYPEOF|TT_ATTR))) {
+					Token *nx = tok_next(s_);
+					if (nx && (match_ch(nx, '[') || match_ch(nx, ',') ||
+					           match_ch(nx, ';'))) {
+						TYPEDEF_ADD_IDX(typedef_add_shadow(tok_loc(s_), s_->len, s->brace_depth + 1), s_);
+						typedef_table.entries[typedef_table.count - 1].is_param = true;
+					}
+				}
+			}
+		}
 	}
 
 	// Phase 1D: enter function body — record entry start

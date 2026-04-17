@@ -699,6 +699,178 @@ static void test_bounds_check_dark_corners(void) {
 	}
 }
 
+// Regression tests for declarator-bracket class bugs (see prism.c
+// try_bounds_check_subscript declarator guard and param-shadow
+// registration in p1_register_param_shadows / K&R handler). Each case
+// represents a context where `name[N]` appears in a declarator and must
+// NOT be rewritten as an expression subscript.
+static void test_bounds_check_declarator_contexts(void) {
+	printf("\n--- bounds-check declarator contexts (regression) ---\n");
+
+	// Bug 1: file-scope array with initializer-completed outer dim.
+	// `int g[] = {1,2,3};` — outer dim is completed by the initializer;
+	// was previously rejected by the "non-empty dim" gate and so was
+	// never registered as an array, producing no wrap at use sites.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int g[]={1,2,3};\n"
+		    "int main(void){return g[1];}\n",
+		    "bc_reg_init.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-reg-init: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "g[__prism_bchk") != NULL,
+			      "bc-reg-init: initializer-completed array registered");
+		prism_free(&r);
+	}
+
+	// Bug 2: parameter name shadows a file-scope array.
+	// `int g[10]; int f(int g[20]){return g[5];}` — body use of `g` is
+	// the decayed pointer parameter; wrapping against sizeof(g)/sizeof(g[0])
+	// would use pointer size and spuriously trap.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int g[10];\n"
+		    "int f(int g[20]){return g[5];}\n",
+		    "bc_reg_param.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-reg-param: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "int g[20]") != NULL,
+			      "bc-reg-param: prototype declarator not wrapped");
+			CHECK(strstr(r.output, "g[__prism_bchk") == NULL,
+			      "bc-reg-param: body use of param not wrapped");
+		}
+		prism_free(&r);
+	}
+
+	// Bug 3: K&R-style parameter declarations between `)` and `{`.
+	// `int f(g) int g[10]; {return g[3];}` — both the type-decl `g[10]`
+	// and the body use of `g` must not wrap against the file-scope `g`.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int g[5]={0};\n"
+		    "int f(g) int g[10]; {return g[3];}\n",
+		    "bc_reg_knr.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-reg-knr: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "int g[10]") != NULL,
+			      "bc-reg-knr: K&R type-decl not wrapped");
+			CHECK(strstr(r.output, "g[__prism_bchk") == NULL,
+			      "bc-reg-knr: body use of K&R param not wrapped");
+		}
+		prism_free(&r);
+	}
+
+	// Bug 4: nested prototype inside a function body.
+	// `extern int f(int g[30]);` inside a body — the declarator `g[30]`
+	// would otherwise be wrapped (VLA-mismatch warning + potential trap).
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int g[10];\n"
+		    "int main(void){\n"
+		    "  extern int f(int g[30]);\n"
+		    "  (void)f; return g[5];\n"
+		    "}\n",
+		    "bc_reg_nested.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-reg-nested: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "int g[30]") != NULL,
+			      "bc-reg-nested: nested prototype declarator not wrapped");
+		prism_free(&r);
+	}
+
+	// Bug 5: function-pointer parameter with array-typed parameter.
+	// `void h(int (*fp)(int g[20]));` — inner `g[20]` is a declarator.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int g[10];\n"
+		    "void h(int (*fp)(int g[20]));\n"
+		    "int main(void){(void)h; return g[5];}\n",
+		    "bc_reg_fptr_param.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-reg-fptr-param: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "int g[20]") != NULL,
+			      "bc-reg-fptr-param: fptr-param declarator not wrapped");
+		prism_free(&r);
+	}
+
+	// Bug 6: function-pointer typedef with array-typed parameter.
+	// `typedef int (*FP)(int g[20]);` — declarator inside typedef.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int g[10];\n"
+		    "typedef int (*FP)(int g[20]);\n"
+		    "int main(void){FP fp=0; (void)fp; return g[5];}\n",
+		    "bc_reg_fptr_typedef.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-reg-fptr-typedef: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "int g[20]") != NULL,
+			      "bc-reg-fptr-typedef: typedef declarator not wrapped");
+		prism_free(&r);
+	}
+
+	// Bug 7: struct field that is a function pointer with array-typed param.
+	// `struct S { int (*fn)(int g[20]); };` — declarator inside struct body.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int g[10];\n"
+		    "struct S { int (*fn)(int g[20]); };\n"
+		    "int main(void){struct S s={0}; (void)s; return g[5];}\n",
+		    "bc_reg_struct_fptr.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-reg-struct-fptr: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "int g[20]") != NULL,
+			      "bc-reg-struct-fptr: struct-field declarator not wrapped");
+		prism_free(&r);
+	}
+
+	// Negative control: unary-deref `*a[i]` still gets wrapped. The
+	// declarator guard must distinguish pointer-declarator `*` (preceded
+	// by a type/qualifier/'*'/'(') from unary-deref `*` (preceded by a
+	// value-producing token or at statement start).
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int *a[10]={0}; int i=3; return *a[i];}\n",
+		    "bc_reg_deref.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-reg-deref: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "*a[__prism_bchk") != NULL,
+			      "bc-reg-deref: unary-deref of subscript still wrapped");
+		prism_free(&r);
+	}
+
+#ifndef _WIN32
+	// Runtime regression: Bug 2 scenario must not trap at runtime.
+	bc_runtime_case(
+	    "int g[10];\n"
+	    "int f(int g[20]){return g[5];}\n"
+	    "int main(void){int x[20]={0}; return f(x);}\n",
+	    0, "bc-reg-param-runtime");
+
+	// Runtime regression: Bug 3 K&R scenario must not trap.
+	bc_runtime_case(
+	    "int g[5]={0};\n"
+	    "int f(g) int g[10]; {(void)g; return 0;}\n"
+	    "int main(void){int x[10]={0}; return f(x);}\n",
+	    0, "bc-reg-knr-runtime");
+#endif
+}
+
 // Extreme edges: flexible-array-members, unions, nested struct member chains,
 // array-of-function-pointers declarators, statement expressions, ternary LHS,
 // zero-size arrays, atomic/thread-local/static locals, casts to array type,
@@ -1173,6 +1345,7 @@ void run_bounds_check_tests(void) {
 	test_bounds_check_nested_subscript();
 	test_bounds_check_address_of();
 	test_bounds_check_dark_corners();
+	test_bounds_check_declarator_contexts();
 	test_bounds_check_extreme_edges();
 	test_bounds_check_runtime();
 }
