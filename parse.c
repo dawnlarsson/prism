@@ -411,6 +411,8 @@ static inline bool is_digraph_loc(char *loc) {
 
 static noreturn void error(char *fmt, ...);
 static void hashmap_put(HashMap *map, char *key, int keylen, void *val);
+static bool hashmap_has_key(HashMap *map, char *key, int keylen);
+static void hashmap_remove(HashMap *map, char *key, int keylen);
 
 static inline bool tok_at_bol(Token *tok) {
 	return tok->flags & TF_AT_BOL;
@@ -643,12 +645,54 @@ static void *hashmap_get(HashMap *map, char *key, int keylen) {
 	int mask = map->capacity - 1;
 	for (int i = 0; i <= mask; i++) {
 		HashEntry *ent = &map->buckets[(hash + i) & mask];
-		if (ent->key && ent->key != TOMBSTONE && ent->hash == hash32 &&
-		    ent->key_len == (uint16_t)keylen && !memcmp(ent->key, key, keylen))
+		if (!ent->key)
+			return NULL;
+		if (ent->key == TOMBSTONE)
+			continue;
+		if (ent->hash == hash32 && ent->key_len == (uint16_t)keylen &&
+		    !memcmp(ent->key, key, keylen))
 			return ent->val;
-		if (!ent->key) return NULL;
 	}
 	return NULL;
+}
+
+static bool hashmap_has_key(HashMap *map, char *key, int keylen) {
+	if (!map->buckets) return false;
+	uint64_t hash = fast_hash(key, keylen);
+	uint32_t hash32 = (uint32_t)hash;
+	int mask = map->capacity - 1;
+	for (int i = 0; i <= mask; i++) {
+		HashEntry *ent = &map->buckets[(hash + i) & mask];
+		if (!ent->key)
+			return false;
+		if (ent->key == TOMBSTONE)
+			continue;
+		if (ent->hash == hash32 && ent->key_len == (uint16_t)keylen &&
+		    !memcmp(ent->key, key, keylen))
+			return true;
+	}
+	return false;
+}
+
+static void hashmap_remove(HashMap *map, char *key, int keylen) {
+	if (!map->buckets) return;
+	uint64_t hash = fast_hash(key, keylen);
+	uint32_t hash32 = (uint32_t)hash;
+	int mask = map->capacity - 1;
+	for (int i = 0; i <= mask; i++) {
+		HashEntry *ent = &map->buckets[(hash + i) & mask];
+		if (!ent->key)
+			return;
+		if (ent->key == TOMBSTONE)
+			continue;
+		if (ent->hash == hash32 && ent->key_len == (uint16_t)keylen &&
+		    !memcmp(ent->key, key, keylen)) {
+			ent->key = TOMBSTONE;
+			ent->val = NULL;
+			map->used--;
+			return;
+		}
+	}
 }
 
 static void hashmap_resize(HashMap *map, int newcap) {
@@ -694,8 +738,10 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val) {
 			return;
 		}
 
-		if (first_empty < 0 && !ent->key) first_empty = idx;
-		if (!ent->key) break;
+		if (first_empty < 0 && (!ent->key || ent->key == TOMBSTONE))
+			first_empty = idx;
+		if (!ent->key)
+			break;
 	}
 
 	if (first_empty < 0) error("hashmap_put: no empty slot found (internal error)");
@@ -3083,6 +3129,15 @@ static void scan_paren_for_vla(Token *open, Token *end, TypeSpecResult *r, bool 
 			else if (prev->len == 1 && prev->ch0 == ')') fn_skip = 1;
 		} else if (t->len == 1 && t->ch0 == ')') { if (fn_skip > 0) fn_skip--; }
 		if (fn_skip > 0) continue;
+		if (is_enum_kw(t)) {
+			Token *brace = find_struct_body_brace(t);
+			if (brace) {
+				parse_enum_constants(brace, 0);
+				prev = brace;
+				t = tok_match(brace);
+				continue;
+			}
+		}
 		if (t->len == 1 && t->ch0 == '[' && !(t->flags & TF_C23_ATTR) &&
 		    is_array_bracket_predecessor(prev)) {
 			if (array_size_is_vla(t))
@@ -3242,6 +3297,13 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 						}
 						if (is_c23_attr(t) && tok_match(t)) {
 							t = tok_match(t);
+							continue;
+						}
+						if (match_ch(t, '{') && saw_sue) {
+							if (struct_body_contains_volatile(t))
+								r.has_volatile_member = true;
+							t = tok_match(t);
+							saw_sue = false;
 							continue;
 						}
 						if (!is_unqual) {

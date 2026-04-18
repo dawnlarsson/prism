@@ -1052,9 +1052,16 @@ static void defer_body_populate_captures(Token *body, Token *body_end,
 	// 0 = not present, 1 = already captured (skip), depth+2 = declared at depth.
 	HashMap local_decls = {0};
 
-	// Scope-exit stack: flat array of (name, len, depth) triples.
-	// When } closes depth d, reset all entries declared at depth d.
-	typedef struct { char *name; int len; int depth; } ScopeDecl;
+	// Scope-exit stack: on shadowing redeclaration, save the previous
+	// hashmap binding so inner scope pop restores outer visibility (open
+	// addressing cannot represent a shadow stack with NULL tombstones).
+	typedef struct {
+		char *name;
+		int len;
+		int depth;
+		void *prev_val;
+		bool had_binding;
+	} ScopeDecl;
 	int se_cap = 256, se_count = 0;
 	ScopeDecl *se_stack = arena_alloc(&ctx->main_arena, se_cap * sizeof(ScopeDecl));
 
@@ -1090,12 +1097,16 @@ static void defer_body_populate_captures(Token *body, Token *body_end,
 				se_count--;
 				ScopeDecl *sd = &se_stack[se_count];
 				void *val = hashmap_get(&local_decls, sd->name, sd->len);
-				// Only reset if the stored depth matches (could have been
-				// overwritten by a deeper redeclaration).
 				if (val && val != (void*)1) {
 					int stored = (int)((intptr_t)val - 2);
-					if (stored == sd->depth)
-						hashmap_put(&local_decls, sd->name, sd->len, NULL);
+					if (stored == sd->depth) {
+						if (sd->had_binding)
+							hashmap_put(&local_decls, sd->name, sd->len,
+								     sd->prev_val);
+						else
+							hashmap_remove(&local_decls, sd->name,
+								       sd->len);
+					}
 				}
 			}
 			continue;
@@ -1153,14 +1164,18 @@ static void defer_body_populate_captures(Token *body, Token *body_end,
 			}
 			// In declaration context — record as local.
 			if (bd > 0 && in_decl && pd == bpd) {
-				hashmap_put(&local_decls, name, nlen, (void*)((intptr_t)(bd + 2)));
+				bool had_binding = hashmap_has_key(&local_decls, name, nlen);
+				void *prev_val = hashmap_get(&local_decls, name, nlen);
 				if (se_count >= se_cap) {
 					int new_cap = se_cap * 2;
 					ScopeDecl *ns = arena_alloc(&ctx->main_arena, new_cap * sizeof(ScopeDecl));
 					memcpy(ns, se_stack, se_count * sizeof(ScopeDecl));
 					se_stack = ns; se_cap = new_cap;
 				}
-				se_stack[se_count++] = (ScopeDecl){name, nlen, bd};
+				se_stack[se_count++] =
+				    (ScopeDecl){name, nlen, bd, prev_val, had_binding};
+				hashmap_put(&local_decls, name, nlen,
+					    (void*)((intptr_t)(bd + 2)));
 				continue;
 			}
 			if (for_init_pd >= 0 && in_decl) {
@@ -2542,16 +2557,19 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	    dim_depth >= te->array_rank)
 		return NULL;
 
-	// Skip unary `&arr[i]`: taking address is legal through index == size
-	// (C allows one-past-end), so wrapping would spuriously trap.
+	// Skip unary `&arr[i]` and `&(arr)[i]`: taking address is legal through
+	// index == size (C §6.5.6p7).  Parenthesized array tokens hide unary `&`.
 	if (tok_idx(name_tok) >= 1) {
 		Token *prev = &token_pool[tok_idx(name_tok) - 1];
+		if (match_ch(prev, '(') && (prev->flags & TF_OPEN) && tok_match(prev)) {
+			Token *rp = tok_match(prev);
+			if (rp && tok_next(prev) == name_tok && tok_next(name_tok) == rp)
+				prev = &token_pool[tok_idx(prev) - 1];
+		}
 		if (match_ch(prev, '&') && !(prev->flags & TF_OPEN)) {
-			// Determine unary vs binary &: look one token further back.
 			bool unary = true;
 			if (tok_idx(prev) >= 1) {
 				Token *pp = &token_pool[tok_idx(prev) - 1];
-				// Binary-& follows a value-producing token.
 				if (pp->kind == TK_IDENT || pp->kind == TK_NUM ||
 				    pp->kind == TK_STR ||
 				    match_ch(pp, ')') || match_ch(pp, ']'))
@@ -4655,8 +4673,24 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bo
 
 	if (has_volatile) {
 		// Volatile: use if-based pattern to avoid double-read.
-		// "var = var ? var : fb" reads volatile twice (condition + true branch).
-		// "if (!var) var = fb;" reads only once (condition).
+		// `&(T){init}` in the if-substatement has statement scope (C11 §6.8.4.1p2);
+		// assigning its address to a volatile pointer outlives the literal — reject.
+		Token *probe = tok;
+		if (match_ch(probe, '&')) {
+			Token *lp = tok_next(probe);
+			if (match_ch(lp, '(') && (lp->flags & TF_OPEN)) {
+				Token *rp = tok_match(lp);
+				if (rp) {
+					Token *br = tok_next(rp);
+					if (match_ch(br, '{') && (br->flags & TF_OPEN))
+						error_tok(probe,
+							  "volatile pointer: address of compound literal in "
+							  "'orelse' outlives the literal; use block form "
+							  "`orelse { ... }` with a named object, or a "
+							  "non-literal fallback");
+				}
+			}
+		}
 		OUT_LIT(" if (!");
 		OUT_TOK(var_name);
 		OUT_LIT(") ");
@@ -6812,6 +6846,77 @@ static void p1_register_param_shadows(Token *open, Token *close,
 	}
 }
 
+// K&R definitions place parameter array bounds after the identifier-list `)`.
+// Register VLA parameter names from those declarators for CFG/bounds tracking.
+static void p1_register_knr_param_vlas(Token *rparen, Token *lbrace, uint16_t sid,
+				      int brace_depth) {
+	if (!rparen || !lbrace || sid == 0 || brace_depth <= 0 ||
+	    sid >= scope_tree_count)
+		return;
+	if (!match_ch(rparen, ')') || !tok_match(rparen))
+		return;
+	Token *id_list_open = tok_match(rparen);
+	if (!id_list_open || !is_knr_params(tok_next(id_list_open), lbrace))
+		return;
+	TD_SCOPE_SAVE();
+	td_scope_open = scope_tree[sid].open_tok_idx;
+	td_scope_close = scope_tree[sid].close_tok_idx;
+	for (Token *stmt = tok_next(rparen); stmt && stmt != lbrace && stmt->kind != TK_EOF;) {
+		stmt = skip_prep_dirs(stmt);
+		stmt = skip_noise(stmt);
+		if (!stmt || stmt == lbrace)
+			break;
+		if (!(stmt->tag &
+		      (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT | TT_STORAGE)) &&
+		    !is_known_typedef(stmt)) {
+			stmt = tok_next(stmt);
+			continue;
+		}
+		TypeSpecResult ts = parse_type_specifier(stmt);
+		if (!ts.saw_type) {
+			stmt = tok_next(stmt);
+			continue;
+		}
+		Token *semi = skip_to_semicolon(ts.end, NULL);
+		if (!semi || semi->kind == TK_EOF || !match_ch(semi, ';'))
+			break;
+		for (Token *seg = ts.end; seg && seg != semi && seg != lbrace;) {
+			DeclResult decl = parse_declarator(seg, false);
+			if (!decl.var_name || !decl.end)
+				break;
+			bool skip_first = true;
+			for (Token *s = seg; s && s != decl.end && s != semi && s->kind != TK_EOF;
+			     s = tok_next(s)) {
+				if (match_ch(s, '[') && (s->flags & TF_OPEN)) {
+					if (skip_first) {
+						skip_first = false;
+						if (tok_match(s))
+							s = tok_match(s);
+						continue;
+					}
+					if (array_size_is_vla(s)) {
+						TYPEDEF_ADD_IDX(typedef_add_vla_var(
+								    tok_loc(decl.var_name),
+								    decl.var_name->len,
+								    brace_depth),
+								decl.var_name);
+						typedef_table.entries[typedef_table.count - 1]
+						    .is_param = true;
+						break;
+					}
+				}
+			}
+			seg = decl.end;
+			if (seg && match_ch(seg, ','))
+				seg = tok_next(seg);
+			else
+				break;
+		}
+		stmt = tok_next(semi);
+	}
+	TD_SCOPE_RESTORE();
+}
+
 // Phase 1D helper: check if array dimensions between start and end contain orelse.
 static bool p1d_decl_has_bracket_orelse(Token *start, Token *end) {
 	for (Token *t = start; t && t != end; t = tok_next(t)) {
@@ -7029,7 +7134,8 @@ static void p1_try_alloc_defer(Token *tok, uint16_t cur_sid, int func_idx) {
 // Phase 1F: validate defer body and populate name set.
 // Extracted from p1_full_depth_prescan to reduce main loop icache footprint.
 static void __attribute__((noinline))
-p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t cur_sid) {
+p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t cur_sid,
+		  int brace_depth) {
 	// Context validation (moved from Pass 2 handle_defer_keyword)
 	if (p1d_cur_func >= 0) {
 		if (p1d_ctrl_pending)
@@ -7072,6 +7178,16 @@ p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t
 							  "supported; wrap the defer body in braces: "
 							  "`defer { ... }`");
 				}
+			}
+			// Braceless defer body tokens never hit p1d_probe_declaration at
+			// stmt_start; annotate P1_IS_DECL so Pass 2 zeroinit sees the decl.
+			if (FEAT(F_ZEROINIT) && brace_depth > 0 &&
+			    (body->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT |
+					   TT_STORAGE))) {
+				Token *ts = skip_noise(body);
+				TypeSpecResult tr = parse_type_specifier(ts);
+				if (tr.saw_type)
+					tok_ann(ts) |= P1_IS_DECL;
 			}
 		}
 	}
@@ -8106,9 +8222,11 @@ static void p1d_handle_open_brace(P1ScanState *s) {
 		Token *prev_tok = p1_find_prev_skipping_attrs(tok_idx(tok) - 1);
 		if (prev_tok && match_ch(prev_tok, ';'))
 			prev_tok = p1_knr_find_close_paren(prev_tok);
-		if (prev_tok && match_ch(prev_tok, ')') && tok_match(prev_tok))
+		if (prev_tok && match_ch(prev_tok, ')') && tok_match(prev_tok)) {
 			p1_register_param_shadows(tok_match(prev_tok), prev_tok,
 						  sid, s->brace_depth + 1, true);
+			p1_register_knr_param_vlas(prev_tok, tok, sid, s->brace_depth + 1);
+		}
 	}
 
 	// Phase 1D: enter function body — record entry start
@@ -8868,7 +8986,8 @@ static void p1_full_depth_prescan(Token *tok) {
 		}
 
 		if (is_defer_kw(tok, p1d_prev))
-			p1d_validate_defer(tok, p1d_cur_func, p1d_ctrl_pending, CUR_SID());
+			p1d_validate_defer(tok, p1d_cur_func, p1d_ctrl_pending, CUR_SID(),
+					   brace_depth);
 
 		p1d_probe_declaration(tok, CUR_SID(), brace_depth, p1d_cur_func,
 				      &p1d_saw_raw, p1d_saw_static, p1d_ctrl_pending, skip_cache);

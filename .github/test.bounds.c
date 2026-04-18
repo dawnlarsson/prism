@@ -1887,8 +1887,44 @@ static void test_bounds_reported_issue_regressions(void) {
 	}
 }
 
+static void test_bounds_paren_unary_addr_one_past(void) {
+	printf("\n--- bounds &(arr)[n] unary address ---\n");
+	PrismResult r = prism_transpile_source(
+	    "void g(void) {\n"
+	    "    int a[10];\n"
+	    "    int *u = &(a)[10];\n"
+	    "    (void)u;\n"
+	    "}\n",
+	    "bc_paren_addr.c",
+	    prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "bounds &(a)[10]: transpile OK");
+	CHECK(r.output &&
+		      strstr(r.output, "__prism_bchk((__prism_bchk_size_t)(10)") == NULL,
+	      "bounds: unary & one-past must not insert trap");
+	prism_free(&r);
+}
+
+static void test_bounds_typeof_enum_ghost_constant(void) {
+	printf("\n--- bounds: enum in typeof registers constants ---\n");
+	PrismResult r = prism_transpile_source(
+	    "void g(void) {\n"
+	    "    typeof(enum { GHOST = 7 }) x;\n"
+	    "    int a[10];\n"
+	    "    (void)x;\n"
+	    "    a[GHOST] = 1;\n"
+	    "}\n",
+	    "bc_ghost_enum.c",
+	    prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "typeof(enum{...}) transpiles");
+	CHECK(r.output && strstr(r.output, "__prism_bchk"),
+	      "GHOST visible: subscript gets bounds check");
+	prism_free(&r);
+}
+
 void run_bounds_check_tests(void) {
 	printf("\n=== BOUNDS-CHECK TESTS ===\n");
+	test_bounds_paren_unary_addr_one_past();
+	test_bounds_typeof_enum_ghost_constant();
 	test_bounds_check_fixed_array();
 	test_bounds_check_vla();
 	test_bounds_check_multidim();

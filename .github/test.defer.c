@@ -6901,6 +6901,27 @@ static void test_defer_break_while_condition_stmt_expr(void) {
 	prism_free(&r);
 }
 
+static void test_defer_capture_shadow_stack_restore(void) {
+	printf("\n--- defer_body_populate_captures shadow restore ---\n");
+	const char *code = "void g(void) {\n"
+			   "    {\n"
+			   "        int x = 4;\n"
+			   "        defer {\n"
+			   "            int x = 1;\n"
+			   "            { int x = 2; (void)x; }\n"
+			   "            x = 3;\n"
+			   "        }\n"
+			   "        (void)x;\n"
+			   "    }\n"
+			   "    int x = 9;\n"
+			   "    (void)x;\n"
+			   "}\n";
+	PrismResult r = prism_transpile_source(code, "defer_cap.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "defer nested x shadow: capture scan must restore outer binding");
+	prism_free(&r);
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_rejected();
@@ -7227,4 +7248,6 @@ void run_defer_tests(void) {
 
 	// enum body inside defer: constants at brace_depth+1 false shadow
 	GNUC_ONLY(test_defer_body_enum_constant_shadow());
+
+	test_defer_capture_shadow_stack_restore();
 }

@@ -8009,8 +8009,21 @@ static void test_bracket_orelse_many_tokens_linear_paren_scan(void) {
 	prism_free(&r);
 }
 
+static void test_orelse_volatile_addr_compound_literal_rejected(void) {
+	check_orelse_transpile_rejects(
+	    "volatile int *gp(void);\n"
+	    "void g(void) {\n"
+	    "    volatile int *p = gp() orelse &(int){42};\n"
+	    "    (void)p;\n"
+	    "}\n",
+	    "voclit.c",
+	    "volatile addr compound literal orelse rejected",
+	    "compound literal");
+}
+
 void run_orelse_tests(void) {
 	test_bracket_orelse_many_tokens_linear_paren_scan();
+	test_orelse_volatile_addr_compound_literal_rejected();
 	test_orelse_return_null();
 	test_orelse_return_cast();
 	test_orelse_return_expr();

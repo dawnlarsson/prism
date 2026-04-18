@@ -4312,11 +4312,45 @@ static void test_cfg_switch_bypass_initialized_decl_fno_zeroinit(void) {
 	prism_free(&r);
 }
 
+static void test_braceless_defer_decl_p1_decl_ann(void) {
+	printf("\n--- braceless defer decl P1_IS_DECL zeroinit ---\n");
+	PrismResult r = prism_transpile_source(
+	    "void g(void) {\n"
+	    "    defer int t;\n"
+	    "    (void)t;\n"
+	    "}\n",
+	    "defer_brzi.c",
+	    prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "braceless defer decl: transpile OK");
+	CHECK(r.output && strstr(r.output, "int t = 0"),
+	      "braceless defer: int t gains zero-init");
+	prism_free(&r);
+}
+
+static void test_typeof_paren_inline_volatile_member(void) {
+	printf("\n--- typeof() inline struct volatile member ---\n");
+	PrismResult r = prism_transpile_source(
+	    "void g(void) {\n"
+	    "    typeof(struct { volatile int z; }[3]) arr;\n"
+	    "    (void)arr;\n"
+	    "}\n",
+	    "tv_inline_vol.c",
+	    prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "typeof volatile inline struct: transpile OK");
+	CHECK(r.output && strstr(r.output, "__prism_p_"),
+	      "volatile member: byte-wise init path (not memset)");
+	CHECK(!r.output || strstr(r.output, "__builtin_memset(&arr") == NULL,
+	      "volatile member: no memset on aggregate");
+	prism_free(&r);
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
 
 	test_cfg_switch_bypass_initialized_decl_fno_zeroinit();
+	test_braceless_defer_decl_p1_decl_ann();
+	test_typeof_paren_inline_volatile_member();
 
 	/* Basic zero-init */
 	test_zeroinit_basic_types();
