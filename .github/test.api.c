@@ -5446,6 +5446,29 @@ static void test_collect_source_defines_block_comment_leak(void) {
 	unlink(path); free(path);
 }
 
+static void test_collect_source_defines_strips_raw_keyword(void) {
+	/* collect_source_defines() copies #define lines from the un-preprocessed
+	 * source. A macro whose replacement lists Prism's `raw` keyword must not
+	 * re-emit `raw` — the backend compiler does not understand it. */
+	const char *code =
+	    "#define RAW_INT raw int\n"
+	    "void f(void) { RAW_INT x = 0; (void)x; }\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "raw-define-strip: create temp file");
+	PrismFeatures feat = prism_defaults();
+	feat.flatten_headers = false;
+	PrismResult r = prism_transpile_file(path, feat);
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "#define RAW_INT raw int") == NULL,
+		      "raw-define-strip: reconstructed macro must not contain `raw`");
+		CHECK(strstr(r.output, "#define RAW_INT int") != NULL ||
+			      strstr(r.output, "#define RAW_INT=int") != NULL,
+		      "raw-define-strip: replacement text should be plain `int`");
+	}
+	prism_free(&r);
+	unlink(path); free(path);
+}
+
 static void test_braceless_nesting_depth_limit(void) {
 	/* skip_one_stmt() is now iterative — no more stack overflow on deep
 	 * braceless control flow.  5000 nested braceless ifs must succeed. */
@@ -8386,6 +8409,7 @@ void run_api_tests_4(void) {
 	printf("\n=== API TESTS (group 4) ===\n");
 	test_collect_source_defines_long_line_truncation();
 	test_collect_source_defines_block_comment_leak();
+	test_collect_source_defines_strips_raw_keyword();
 	test_braceless_nesting_depth_limit();
 
 	test_collect_source_defines_comment_continuation();

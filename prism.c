@@ -2182,6 +2182,29 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	if (tok_ann(tok) & (P1_DECL_BRACKET | P1_UNEVAL_BRACKET)) return NULL;
 	if (!last_emitted) return NULL;
 
+	// Parenthesized index commutative form: `(idx)[arr]`. The peel loop
+	// below may stop early when '(' is preceded by a value token (e.g.
+	// `5` before `(i)` on a new statement), leaving last_emitted as `)`
+	// so `is_tracked_array_name` is false and the guard is skipped —
+	// ISO C treats `(i)[b]` the same as `i[b]` (commutative subscript).
+	if (tok_idx(tok) >= 1) {
+		Token *rp = &token_pool[tok_idx(tok) - 1];
+		if (match_ch(rp, ')') && tok_match(rp)) {
+			Token *op = tok_match(rp);
+			Token *idx = tok_next(op);
+			if (idx && idx->kind == TK_IDENT && tok_next(idx) == rp) {
+				Token *rb_close = tok_match(tok);
+				Token *inner = tok_next(tok);
+				if (rb_close && inner && tok_next(inner) == rb_close &&
+				    is_tracked_array_name(inner) &&
+				    !is_tracked_array_name(idx))
+					error_tok(tok,
+						  "commutative subscript 'idx[arr]' bypasses "
+						  "-fbounds-check; rewrite as 'arr[idx]'");
+			}
+		}
+	}
+
 	// Commutative-subscript bypass check: ISO C defines `idx[arr]` as
 	// equivalent to `arr[idx]`. When the array side hides *inside* the
 	// brackets, the normal array-on-the-left pattern-match below fails
@@ -3885,7 +3908,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		// Step 4: Emit declarator & initializer
 		bool effective_vla = (decl.is_vla && (!decl.paren_pointer || decl.paren_array)) || (type->is_vla && !decl.is_pointer);
 		bool is_aggregate =
-		    (decl.is_array && (!decl.paren_pointer || decl.paren_array)) || ((type->is_struct || type->is_typedef) && !decl.is_pointer);
+		    (decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
+		    ((type->is_struct || type->is_typedef || type->is_array) && !decl.is_pointer);
 		// Function types (via typedef) cannot be initialized — skip zero-init entirely.
 		bool is_func_type = is_typeof_func_type(type_start, type, &decl);
 		// Only queue memset when zeroinit feature is enabled.
@@ -5159,6 +5183,27 @@ static bool has_unclosed_block_comment(const char *p, char **raw_delim_out) {
 	return false;
 }
 
+// Strip Prism's `raw` storage-class marker from scraped #define replacement
+// text so `-fno-flatten-headers` output never injects `raw` into macros for
+// the backend compiler (Pass 2 strips raw in token emission only).
+static void strip_prism_raw_from_macro_value(char *val) {
+	if (!val || !*val) return;
+	char *dst = val;
+	for (char *src = val; *src;) {
+		bool boundary = (src == val || (unsigned char)src[-1] <= ' ');
+		bool raw_kw = boundary && src[0] == 'r' && src[1] == 'a' && src[2] == 'w' &&
+			      (src[3] == '\0' || (unsigned char)src[3] <= ' ' ||
+			       !((unsigned char)src[3] == '_' || isalnum((unsigned char)src[3])));
+		if (raw_kw) {
+			src += 3;
+			while (*src == ' ' || *src == '\t') src++;
+			continue;
+		}
+		*dst++ = *src++;
+	}
+	*dst = '\0';
+}
+
 static void collect_source_defines(const char *input_file) {
 	free_source_defines();
 	if (!input_file || FEAT(F_FLATTEN)) return;
@@ -5564,6 +5609,10 @@ static void collect_source_defines(const char *input_file) {
 			}
 
 			// Build "NAME=VALUE" or "NAME" string
+			if (val_len > 0 && val_start)
+				strip_prism_raw_from_macro_value(val_start);
+			if (val_len > 0 && val_start)
+				val_len = (int)strlen(val_start);
 			int total = name_len + (val_len > 0 ? 1 + val_len : 0) + 1;
 			char *def = malloc(total);
 			if (!def) { free(full_val); free(saved_name); goto check_continuation; }
@@ -6717,7 +6766,7 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 					bool eff_vla = (decl.is_vla && (!decl.paren_pointer || decl.paren_array)) ||
 						       (type.is_vla && !decl.is_pointer);
 					bool is_agg = (decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
-						      ((type.is_struct || type.is_typedef) && !decl.is_pointer);
+						      ((type.is_struct || type.is_typedef || type.is_array) && !decl.is_pointer);
 					bool p1d_fi_union = type.is_union && !decl.is_pointer;
 					if ((!decl.is_pointer || decl.is_array) && !type.has_register &&
 					    (type.has_typeof || (type.has_atomic && is_agg) || eff_vla ||
@@ -7450,7 +7499,7 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 	if (braceless_close_idx > 0)
 		td_scope_close = braceless_close_idx;
 	Token *t = type.end;
-	bool vm_type = (type.has_typeof || type.has_atomic) && type.is_vla;
+	bool vm_type = (type.has_typeof || type.has_atomic) && (type.is_vla || type.type_vm);
 	bool any_would_memset = false;
 	while (t && !match_ch(t, ';') && !match_ch(t, '{') && t->kind != TK_EOF) {
 		// Per-declarator 'raw' skip (int x, raw arr[n];)
@@ -7557,15 +7606,18 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 					if (te) base_array_rank_here = te->array_rank;
 					break;
 				}
+			if (!base_is_array_here && (type.has_typeof || type.has_atomic) &&
+			    type.is_array)
+				base_is_array_here = true;
 		}
 		bool reg_as_array = decl.is_array && (!decl.paren_pointer || decl.paren_array);
-		// For file-scope registration, require sizeof(arr) to be a complete
-		// type at use sites. That holds when either (a) at least one dim is
-		// non-empty, or (b) an initializer completes the outer dim (e.g.
-		// `int g[] = {1,2,3};`). Block-scope arrays always have complete
-		// size (C forbids local `int a[];`).
+		// Require sizeof(arr)/sizeof(arr[0]) to be valid at subscript sites:
+		// at least one non-empty `[]` dim, or an initializer that completes a
+		// tentative `[]` (e.g. `int g[] = {1,2,3};`). Applies at every scope —
+		// block-scope `extern T a[];` has incomplete type just like file-scope
+		// extern / tentative `T a[];`.
 		bool has_complete_dim = true;
-		if (reg_as_array && brace_depth == 0) {
+		if (reg_as_array) {
 			has_complete_dim = false;
 			for (Token *dt = decl.var_name; dt && dt != decl.end; dt = tok_next(dt)) {
 				if (match_ch(dt, '[')) {
@@ -7577,9 +7629,8 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 				has_complete_dim = true;
 		}
 		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name &&
-		    (brace_depth > 0 ||
-		     (brace_depth == 0 && (reg_as_array || base_is_array_here) &&
-		      has_complete_dim)) &&
+		    (brace_depth > 0 || (brace_depth == 0 && (reg_as_array || base_is_array_here))) &&
+		    has_complete_dim &&
 		    (reg_as_array || base_is_array_here) && !decl.is_func_ptr) {
 			int pre = typedef_table.count;
 			if (!did_shadow) {
@@ -7610,7 +7661,9 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 				// by summing declarator rank with base rank.
 				// Fallback to +1 when the base typedef's rank
 				// wasn't recorded (stale / chained older entry).
-				if (base_array_rank_here > 0) {
+				if (type.type_array_rank > 0) {
+					rank += (int)type.type_array_rank;
+				} else if (base_array_rank_here > 0) {
 					rank += (int)base_array_rank_here;
 				} else if (base_is_array_here) {
 					rank += 1;
@@ -7647,7 +7700,7 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		    !type.has_extern && !type.has_static &&
 		    type.has_register && type.has_atomic) {
 			bool is_aggregate = (decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
-				((type.is_struct || type.is_typedef) && !decl.is_pointer);
+				((type.is_struct || type.is_typedef || type.is_array) && !decl.is_pointer);
 			if (is_aggregate)
 				error_tok(decl.var_name,
 					  "'register _Atomic' aggregate cannot be safely "
@@ -7689,7 +7742,7 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 				bool p1d_cv_union = type.is_union && !decl.is_pointer;
 				bool would_memset = (!decl.is_pointer || decl.is_array) &&
 					(type.has_typeof || (type.has_atomic && ((decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
-					 ((type.is_struct || type.is_typedef) && !decl.is_pointer))) || type.is_vla || decl.is_vla ||
+					 ((type.is_struct || type.is_typedef || type.is_array) && !decl.is_pointer))) || type.is_vla || decl.is_vla ||
 					 p1d_cv_union);
 				if (excl && would_memset)
 					error_tok(decl.var_name,
@@ -7719,7 +7772,7 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		    !(saw_static || type.has_static || type.has_extern) &&
 		    !type.has_register && (!decl.is_pointer || decl.is_array) &&
 		    (type.has_typeof || (type.has_atomic && ((decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
-		     ((type.is_struct || type.is_typedef) && !decl.is_pointer))) ||
+		     ((type.is_struct || type.is_typedef || type.is_array) && !decl.is_pointer))) ||
 		     type.is_vla || decl.is_vla || p1d_is_union_type))
 			any_would_memset = true;
 

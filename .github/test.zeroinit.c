@@ -1500,6 +1500,40 @@ void test_const_typeof_vla_bug(void) {
 #endif
 }
 
+#ifdef __GNUC__
+void test_typeof_const_ptr_to_vla_ok(void) {
+	/* Pointer-to-VLA typeof is variably-modified but not an object VLA —
+	 * zero-init with = 0 must not trip the const + memset rejection. */
+	PrismResult r = prism_transpile_source(
+	    "void f(int n) {\n"
+	    "    const typeof(int (*)[n]) ptr;\n"
+	    "    (void)sizeof(ptr);\n"
+	    "}\n",
+	    "const_ptr_to_vla_ok.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	      "const typeof ptr-to-VLA: standard code transpiles");
+	prism_free(&r);
+}
+
+void test_struct_tag_shadow_volatile_byte_loop(void) {
+	PrismResult r = prism_transpile_source(
+	    "struct HwReg { volatile int control; };\n"
+	    "void f(void) {\n"
+	    "    int HwReg = 0;\n"
+	    "    struct W { struct HwReg reg; };\n"
+	    "    typeof(struct W) config;\n"
+	    "    (void)sizeof(config);\n"
+	    "}\n",
+	    "tag_shadow_volatile.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	      "struct tag shadow + volatile member: transpiles");
+	if (r.output)
+		CHECK(strstr(r.output, "volatile char *__prism_p_") != NULL,
+		      "tag shadow: volatile-safe byte loop (not plain memset)");
+	prism_free(&r);
+}
+#endif
+
 void test_typedef_typeof_vla_zeroinit(void) {
 #ifdef __GNUC__
 	// typedef typeof(char[n]) should be recognized as VLA and get memset
@@ -4295,6 +4329,8 @@ void run_zeroinit_tests(void) {
 	test_typedef_typeof_vla_zeroinit();
 	NOMSVC_ONLY(test_atomic_register_struct_bug());
 	test_const_typeof_vla_bug();
+	GNUC_ONLY(test_typeof_const_ptr_to_vla_ok());
+	GNUC_ONLY(test_struct_tag_shadow_volatile_byte_loop());
 	NOMSVC_ONLY(test_const_typeof_atomic_struct_bug());
 	test_typeof_memset_split_before_initializer();
 	test_typeof_vla_split_double_eval();

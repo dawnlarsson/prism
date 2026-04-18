@@ -2197,6 +2197,9 @@ typedef struct {
 	bool has_constexpr : 1;   // C23 'constexpr'
 	bool has_thread_local : 1; // _Thread_local, thread_local, __thread
 	bool has_volatile_member : 1; // Struct/union has volatile-qualified fields
+	bool is_array : 1;	      // Array type from typeof()/typeof_unqual/_Atomic(...) (not declarator [])
+	bool type_vm : 1;	      // Any VM dimension in typeof/_Atomic parens (incl. ptr-to-VLA)
+	uint8_t type_array_rank;      // Dimension count for is_array (multi-dim typeof)
 } TypeSpecResult;
 
 // Declarator parsing result
@@ -2831,6 +2834,17 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 
 static inline bool array_size_is_vla(Token *open_bracket) { return array_size_is_vla_impl(open_bracket, 0); }
 
+// After struct/union/enum keyword, tag_lookup — not typedef_lookup — sees the
+// tag namespace (C11 §6.2.3). Ordinary identifiers can shadow tag names.
+static inline bool struct_body_field_is_vla_typedef(Token *id, Token *prev) {
+	if (!is_identifier_like(id)) return false;
+	if (prev && (prev->tag & TT_SUE)) {
+		TypedefEntry *te = tag_lookup(id);
+		return te && te->is_struct_tag && te->is_vla;
+	}
+	return is_vla_typedef(id);
+}
+
 static bool struct_body_contains_vla(Token *brace) {
 	if (!brace || !(brace->len == 1 && brace->ch0 == '{') || !tok_match(brace)) return false;
 	Token *end = tok_match(brace);
@@ -2846,7 +2860,7 @@ static bool struct_body_contains_vla(Token *brace) {
 		              ((prev->tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE)))))
 			{ prev = t; t = tok_match(t); continue; }
 		if (t->len == 1 && t->ch0 == '[' && array_size_is_vla(t)) return true;
-		if (is_identifier_like(t) && is_vla_typedef(t)) return true;
+		if (struct_body_field_is_vla_typedef(t, prev)) return true;
 	}
 	return false;
 }
@@ -2856,6 +2870,15 @@ static bool struct_body_contains_vla(Token *brace) {
 // TDF_HAS_VOL_MEMBER.  Used to propagate has_volatile_member to typedef
 // entries and to set has_volatile in parse_type_specifier so that memset
 // is replaced with a volatile-safe byte loop (memset strips volatile → UB).
+static inline bool struct_body_field_volatile_member(Token *id, Token *prev) {
+	if (!is_identifier_like(id)) return false;
+	if (prev && (prev->tag & TT_SUE)) {
+		TypedefEntry *te = tag_lookup(id);
+		if (te && te->has_volatile_member) return true;
+	}
+	return is_volatile_typedef(id) || has_volatile_member_typedef(id);
+}
+
 static bool struct_body_contains_volatile(Token *brace) {
 	if (!brace || !(brace->len == 1 && brace->ch0 == '{') || !tok_match(brace)) return false;
 	Token *end = tok_match(brace);
@@ -2871,7 +2894,7 @@ static bool struct_body_contains_volatile(Token *brace) {
 		              ((prev->tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE)))))
 			{ prev = t; t = tok_match(t); continue; }
 		if (t->tag & TT_VOLATILE) return true;
-		if (is_identifier_like(t) && (is_volatile_typedef(t) || has_volatile_member_typedef(t))) return true;
+		if (struct_body_field_volatile_member(t, prev)) return true;
 	}
 	return false;
 }
@@ -2930,7 +2953,35 @@ static Token *find_init_semicolon(Token *open, Token *close) {
 
 // --- VLA Paren Scanner ---
 
-// Scan a parenthesized type for VLA indicators.
+// True if '('...')' contains only abstract-pointer tokens (*, qualifiers).
+// Then a following `[n]` completes a pointer-to-array type (e.g. int (*)[n]),
+// not an array-of-VLA object — must not set TypeSpecResult.is_vla / is_array.
+static bool abstract_declarator_paren_is_pointer_only(Token *open_paren) {
+	Token *close = tok_match(open_paren);
+	if (!close || !(open_paren->len == 1 && open_paren->ch0 == '(')) return false;
+	for (Token *x = tok_next(open_paren); x && x != close;) {
+		x = skip_noise(x);
+		if (!x || x == close) break;
+		if (x->len == 1 && x->ch0 == '*') {
+			x = tok_next(x);
+			continue;
+		}
+		if (x->tag & TT_QUALIFIER) {
+			x = tok_next(x);
+			continue;
+		}
+		return false;
+	}
+	return true;
+}
+
+static bool array_bracket_closes_ptr_to_array(Token *open_bracket, Token *prev) {
+	if (!open_bracket || !prev || prev->len != 1 || prev->ch0 != ')') return false;
+	Token *open = tok_match(prev);
+	return open && abstract_declarator_paren_is_pointer_only(open);
+}
+
+// Scan a parenthesized type for VLA indicators and array types (typeof/_Atomic).
 static void scan_paren_for_vla(Token *open, Token *end, TypeSpecResult *r, bool check_typeof) {
 	Token *prev = open;
 	int fn_skip = 0;
@@ -2961,11 +3012,15 @@ static void scan_paren_for_vla(Token *open, Token *end, TypeSpecResult *r, bool 
 			else if (prev->len == 1 && prev->ch0 == ')') fn_skip = 1;
 		} else if (t->len == 1 && t->ch0 == ')') { if (fn_skip > 0) fn_skip--; }
 		if (fn_skip > 0) continue;
-		if (t->len == 1 && t->ch0 == '[' &&
-		    is_array_bracket_predecessor(prev) &&
-		    array_size_is_vla(t)) {
-			r->is_vla = true;
-			break;
+		if (t->len == 1 && t->ch0 == '[' && is_array_bracket_predecessor(prev)) {
+			if (array_size_is_vla(t))
+				r->type_vm = true;
+			if (!array_bracket_closes_ptr_to_array(t, prev)) {
+				r->is_array = true;
+				if (r->type_array_rank < 15) r->type_array_rank++;
+				if (array_size_is_vla(t)) r->is_vla = true;
+			}
+			continue;
 		}
 		if (is_identifier_like(t) && (typedef_flags(t) & TDF_VLA)) {
 			r->is_vla = true;

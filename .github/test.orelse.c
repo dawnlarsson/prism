@@ -5319,7 +5319,8 @@ static void test_atomic_vm_type_split_double_eval(void) {
 		prism_free(&r);
 	}
 
-	// Sub-test 2: _Atomic(int(*)[n]) const orelse — must be rejected
+	// Sub-test 2: _Atomic(int(*)[n]) const + orelse — pointer-to-VM type, not an
+	// object VLA; must transpile (no spurious const+memset rejection).
 	{
 		const char *code =
 		    "void *get(void);\n"
@@ -5328,8 +5329,8 @@ static void test_atomic_vm_type_split_double_eval(void) {
 		    "    (void)p;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "atomic_vla_const.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "atomic-vm-const-orelse: const _Atomic VLA orelse must be rejected");
+		CHECK_EQ(r.status, PRISM_OK,
+		      "atomic-vm-const-orelse: const _Atomic ptr-to-VLA with orelse accepted");
 		prism_free(&r);
 	}
 

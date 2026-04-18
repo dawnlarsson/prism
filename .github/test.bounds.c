@@ -916,6 +916,20 @@ static void test_bounds_check_commutative(void) {
 		prism_free(&r);
 	}
 
+	// Parenthesized index: `(idx)[arr]` — same commutative bypass as `idx[arr]`.
+	// Regression: peel-off-last_emitted could stop when `(` is preceded by a
+	// numeric literal (line break after `i=5`), skipping the guard.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int b[10]; int i=5;\n"
+		    "(i)[b] = 0; return 0;}\n",
+		    "bc_comm_paren_idx.c", f);
+		CHECK(r.status != PRISM_OK, "bc-comm-paren-idx: rejects (idx)[arr]");
+		prism_free(&r);
+	}
+
 	// Literal index form: `2[buffer]`.
 	{
 		PrismFeatures f = prism_defaults();
@@ -1427,6 +1441,37 @@ static void test_bounds_check_extreme_edges(void) {
 		if (r.output)
 			CHECK(strstr(r.output, "e[__prism_bchk") == NULL,
 			      "bc-file-scope-extern: extern T a[] not wrapped (incomplete size)");
+		prism_free(&r);
+	}
+	{
+		PrismFeatures f = prism_defaults();
+		PrismResult r = prism_transpile_source(
+		    "int main(void){\n"
+		    "extern int blk[];\n"
+		    "int i = 3;\n"
+		    "return blk[i];}\n",
+		    "bc_block_scope_extern_incomplete.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-block-scope-extern-incomplete: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "blk[__prism_bchk") == NULL,
+			      "bc-block-scope-extern-incomplete: incomplete extern array not wrapped");
+		prism_free(&r);
+	}
+
+	// typeof(int[N]) base type (no declarator []) must still register for bounds.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    typeof(int[10]) buffer;\n"
+		    "    buffer[5] = 1;\n"
+		    "}\n",
+		    "bc_typeof_keyword_array.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-typeof-keyword-array: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "buffer[__prism_bchk") != NULL,
+			      "bc-typeof-keyword-array: subscript wrapped");
 		prism_free(&r);
 	}
 
