@@ -372,6 +372,7 @@ static bool bracket_scan_has_orelse(Token *open);
 static Token *try_typeof_orelse(Token *tok);
 static Token *try_bracket_orelse(Token *tok);
 static void emit_token_range_orelse(Token *start, Token *end);
+static void emit_token_range_verbatim(Token *start, Token *end);
 static Token *handle_sue_body(Token *tok);
 static void emit_noise_between_raws(Token *first_raw, Token *last_raw);
 static inline Token *try_strip_raw(Token *t);
@@ -911,12 +912,12 @@ static void emit_range_ex(Token *start, Token *end, int flags) {
 		if ((flags & ER_BALANCED) && (t->flags & TF_OPEN) && match_set(t, CH('(') | CH('['))) {
 			walk_balanced(t, true); t = tok_next(tok_match(t)); continue;
 		}
-		// C23 attributes: walk as balanced group with orelse awareness
-		// so that orelse inside attr arguments is transformed inline.
+		// C23 [[...]]: Phase 1D rejects 'orelse' inside attribute arguments;
+		// emit interiors verbatim (no orelse→ternary transform).
 		if ((t->flags & TF_C23_ATTR) && tok_match(t)) {
 			Token *bclose = tok_match(t);
 			emit_tok(t); t = tok_next(t);
-			emit_token_range_orelse(t, bclose);
+			emit_token_range_verbatim(t, bclose);
 			emit_tok(bclose); t = tok_next(bclose);
 			continue;
 		}
@@ -2661,15 +2662,12 @@ static Token *walk_balanced(Token *tok, bool emit) {
 			}
 			// Bracket orelse: dispatch to orelse-aware walker.
 			if (FEAT(F_ORELSE) && (t->flags & TF_OPEN) && match_ch(t, '[') && tok_match(t)) {
-				// C23 [[ ... ]] attributes: emit with inline orelse
-				// transformation.  Do NOT enter the FIFO bracket orelse
-				// path — emit_bracket_orelse_temps skips TF_C23_ATTR,
-				// so consuming queue entries here would steal temps
-				// meant for subsequent VLA dimensions.
+				// C23 [[ ... ]]: verbatim interior; Phase 1D rejects orelse
+				// inside attrs. Skip FIFO bracket-orelse path (same as before).
 				if (t->flags & TF_C23_ATTR) {
 					Token *bclose = tok_match(t);
 					emit_tok(t); t = tok_next(t);
-					emit_token_range_orelse(t, bclose);
+					emit_token_range_verbatim(t, bclose);
 					emit_tok(bclose); t = tok_next(bclose);
 					continue;
 				}
@@ -2698,6 +2696,36 @@ static Token *walk_balanced(Token *tok, bool emit) {
 		}
 	}
 	return tok_next(end);
+}
+
+// Emit [start,end) without orelse transforms; recurse into ()/[] / stmt-expr.
+// Used for C23 [[...]] contents (Phase 1D owns the orelse-in-attr rejection).
+static void emit_token_range_verbatim(Token *start, Token *end) {
+	for (Token *t = start; t && t != end && t->kind != TK_EOF;) {
+		if (is_stmt_expr_open(t) && tok_match(t)) {
+			walk_balanced(t, true);
+			t = tok_next(tok_match(t));
+			continue;
+		}
+		if ((t->flags & TF_OPEN) && (match_ch(t, '(') || match_ch(t, '['))) {
+			Token *close = tok_match(t);
+			if (close && close != end) {
+				emit_tok(t);
+				emit_token_range_verbatim(tok_next(t), close);
+				emit_tok(close);
+				t = tok_next(close);
+				continue;
+			}
+		}
+		if (__builtin_expect(FEAT(F_DEFER) && (t->tag & TT_DEFER), 0) &&
+		    !(last_emitted && (last_emitted->tag & TT_MEMBER)) &&
+		    (!typedef_lookup(t) || match_ch(tok_next(t), '{')) &&
+		    tok_next(t) && (is_identifier_like(tok_next(t)) || match_ch(tok_next(t), '{')))
+			error_tok(t, "'defer' cannot be used in expression context "
+				  "(array dimensions, parenthesized expressions, etc.)");
+		{ Token *r = emit_tok_checked(t); if (r) { t = r; continue; } }
+		t = tok_next(t);
+	}
 }
 
 // Walk a balanced group, transforming any top-level orelse into a ternary.
@@ -3078,7 +3106,7 @@ static inline Token *decl_array_dims(Token *t, bool emit, bool *vla) {
 			if (emit) {
 				Token *bclose = tok_match(t);
 				emit_tok(t); t = tok_next(t);
-				emit_token_range_orelse(t, bclose);
+				emit_token_range_verbatim(t, bclose);
 				emit_tok(bclose); t = tok_next(bclose);
 			} else {
 				t = tok_next(tok_match(t));

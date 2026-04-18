@@ -5774,11 +5774,32 @@ static void test_knr_param_vla_cfg_register(void) {
 	prism_free(&r);
 }
 
+static void test_knr_param_vla_2d_sizeof_star_cfg(void) {
+	printf("\n--- K&R 2D VLA parameter + sizeof(*p) local dim ---\n");
+	const char *code =
+		"static int process(a, n)\n"
+		"    int n;\n"
+		"    int a[n][n];\n"
+		"{\n"
+		"    goto L;\n"
+		"    int local_vla[sizeof(*a)];\n"
+		"L:\n"
+		"    return 0;\n"
+		"}\n";
+	PrismResult r = prism_transpile_source(code, "knrvla2d.c", prism_defaults());
+	CHECK(r.status == PRISM_ERR_SEMANTIC || r.status == PRISM_ERR_SYNTAX,
+	      "K&R 2D param VLA: cfg must reject goto skipping inner VLA");
+	CHECK(r.error_msg != NULL && strstr(r.error_msg, "goto"),
+	      "K&R 2D param VLA: diagnostic mentions goto");
+	prism_free(&r);
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
 
 	/* Safety hole tests */
 	test_knr_param_vla_cfg_register();
+	test_knr_param_vla_2d_sizeof_star_cfg();
 	test_goto_over_block();
 	test_goto_backward_valid();
 	test_goto_forward_no_decl();

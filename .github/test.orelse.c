@@ -2720,9 +2720,9 @@ static void test_c23_attr_orelse_fifo_queue_steal(void) {
 	prism_free(&r);
 }
 
-// C23 [[...]] prefix attributes emitted via emit_range_ex leaked
-// the raw 'orelse' keyword to output without transformation.  The fix
-// ensures emit_range_ex walks C23 attr brackets with orelse awareness.
+// C23 [[...]]: Phase 1D rejects Prism 'orelse' in attribute arguments.
+// Pass 2 emits [[...]] interiors verbatim (no ternary transform). When P1
+// rejects, output checks below are skipped (vacuous pass).
 static void test_c23_attr_prefix_orelse_keyword_leak(void) {
 	const char *code =
 	    "void f(int align) {\n"
