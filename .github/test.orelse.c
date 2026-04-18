@@ -7615,6 +7615,20 @@ static void test_orelse_sue_attr_body_strip(void) {
 	prism_free(&r);
 }
 
+// Statement-level orelse in if/for/while/switch ( ) must not inject `{ if...`
+// into the iteration/header expression (invalid C).
+static void test_orelse_ctrl_paren_stmt_action_rejected(void) {
+	PrismResult r = prism_transpile_source(
+	    "void f(void) {\n"
+	    "    for (int i = 0; i < 10; i++ orelse break) { }\n"
+	    "}\n",
+	    "oe_ctrl_paren.c", prism_defaults());
+	CHECK(r.status != PRISM_OK, "orelse+break in for-header must reject");
+	CHECK(r.error_msg && strstr(r.error_msg, "control statement"),
+	      "diagnostic mentions control statement");
+	prism_free(&r);
+}
+
 // orelse inside GNU __attribute__ and C23 [[...]] arguments leaked
 // verbatim to backend compiler. Phase 1D skip_noise jumped over attributes
 // without checking for TT_ORELSE; Pass 2 emit_range emitted attrs verbatim.
@@ -8439,6 +8453,7 @@ void run_orelse_tests(void) {
 	test_orelse_ternary_promotion_hijack();
 
 	// orelse inside attribute arguments (GNU/C23) leaked to backend
+	test_orelse_ctrl_paren_stmt_action_rejected();
 	test_orelse_in_attribute_args();
 
 	// bracket orelse in expr context — Phase 1D must catch side effects

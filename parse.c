@@ -3129,6 +3129,18 @@ static void scan_paren_for_vla(Token *open, Token *end, TypeSpecResult *r, bool 
 			else if (prev->len == 1 && prev->ch0 == ')') fn_skip = 1;
 		} else if (t->len == 1 && t->ch0 == ')') { if (fn_skip > 0) fn_skip--; }
 		if (fn_skip > 0) continue;
+		// Inside typeof(...) only: sizeof operands are compile-time in the VM
+		// sense for split detection — do not let sizeof(int[n]) mark the whole
+		// typeof as VM (see typeof(sizeof(int[n])) multi-decl). _Atomic(...) uses
+		// check_typeof=true and keeps scanning sizeof interiors for VM brackets.
+		if (!check_typeof && is_sizeof_like(t)) {
+			Token *nx = tok_next(t);
+			if (nx && nx->len == 1 && nx->ch0 == '(' && tok_match(nx)) {
+				prev = t;
+				t = tok_match(nx);
+				continue;
+			}
+		}
 		if (is_enum_kw(t)) {
 			Token *brace = find_struct_body_brace(t);
 			if (brace) {
@@ -3256,8 +3268,19 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 				tok = tok_next(tok);
 				while (tok && tok->kind != TK_EOF) {
 					SKIP_NOISE_CONTINUE(tok);
-					if (is_type_keyword(tok) || (tok->tag & TT_QUALIFIER)) tok = tok_next(tok);
-					else break;
+					if (tok->len == 1 && tok->ch0 == '(') {
+						tok = skip_balanced_group(tok);
+						continue;
+					}
+					if (is_c23_attr(tok) && tok_match(tok)) {
+						tok = tok_match(tok);
+						continue;
+					}
+					if (is_type_keyword(tok) || (tok->tag & TT_QUALIFIER)) {
+						tok = tok_next(tok);
+						continue;
+					}
+					break;
 				}
 			}
 			if (tok && tok->len == 1 && tok->ch0 == '{') {
@@ -3485,7 +3508,8 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 				if (base_has_volatile_member && !decl.is_pointer && !decl.is_func_ptr)
 					added->has_volatile_member = true;
 				if (is_ptr) added->is_ptr = true;
-				if ((decl.is_array || base_is_array) && !decl.is_pointer && !decl.is_func_ptr)
+				if ((decl.is_array || base_is_array) &&
+				    (!decl.is_pointer || decl.paren_array) && !decl.is_func_ptr)
 					added->is_array = true;
 				// array_rank: count declarator `[` and add the
 				// base typedef's inherited rank (if any), so
@@ -3494,7 +3518,8 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 				// Kept as conservative sum — does not attempt to
 				// detect declarator-level paren-wrapped groups
 				// or func-of-array constructs.
-				if ((decl.is_array || base_is_array) && !decl.is_pointer && !decl.is_func_ptr) {
+				if ((decl.is_array || base_is_array) &&
+				    (!decl.is_pointer || decl.paren_array) && !decl.is_func_ptr) {
 					int rank = 0;
 					Token *prev_dt = NULL;
 					for (Token *dt = decl.var_name; dt && decl.end && dt != decl.end;) {
@@ -3515,7 +3540,8 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 						rank = ARRAY_RANK_WRAP_ALL;
 					added->array_rank = (uint8_t)rank;
 				}
-				if ((decl.is_array || base_is_array) && !decl.is_pointer && !decl.is_func_ptr) {
+				if ((decl.is_array || base_is_array) &&
+				    (!decl.is_pointer || decl.paren_array) && !decl.is_func_ptr) {
 					bool dim_complete = false;
 					if (decl.is_array) {
 						for (Token *dt = decl.var_name; dt && decl.end && dt != decl.end;

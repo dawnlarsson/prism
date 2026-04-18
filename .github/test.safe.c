@@ -3828,6 +3828,54 @@ static void test_vla_cfg_bypass_fno_zeroinit(void) {
 		      "goto over VLA must error even with -fno-defer -fno-zeroinit");
 		prism_free(&r);
 	}
+
+	// goto past explicit initializer must error even when zeroinit is off
+	// (cfg_check_range must not gate has_init-only bypass on F_ZEROINIT).
+	{
+		const char *code =
+		    "void f(void) {\n"
+		    "    goto L;\n"
+		    "    int x = 5;\n"
+		    "L:\n"
+		    "    return;\n"
+		    "}\n";
+		PrismFeatures feat = prism_defaults();
+		feat.zeroinit = false;
+		PrismResult r = prism_transpile_source(code, "t63e.c", feat);
+		CHECK(r.status != PRISM_OK,
+		      "goto over initialized decl must fail with -fno-zeroinit");
+		CHECK(r.error_msg && strstr(r.error_msg, "initializer"),
+		      "diagnostic mentions initializer");
+		prism_free(&r);
+	}
+}
+
+// sizeof(vla) for int vla[n] is a runtime size expression — local bound is VM / VLA.
+static void test_sizeof_star_vla_paren_local_cfg(void) {
+	printf("\n--- sizeof(vla) goto-over-VLA CFG ---\n");
+	const char *code =
+	    "void f(int n) {\n"
+	    "    int vla[n];\n"
+	    "    goto L;\n"
+	    "    int local[sizeof(vla)];\n"
+	    "L:\n"
+	    "    return;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "szdvla.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "goto must not skip local whose bound uses sizeof(VLA)");
+	CHECK(r.error_msg && strstr(r.error_msg, "VLA"),
+	      "diagnostic mentions VLA");
+	prism_free(&r);
+}
+
+static void test_enum_underlying_typedef_unsigned_parse(void) {
+	printf("\n--- enum E : typeof(unsigned int) ---\n");
+	const char *code =
+	    "enum E : typeof(unsigned int) { A = 1 };\n";
+	PrismResult r = prism_transpile_source(code, "enum_td.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "C23 enum underlying typeof(unsigned) parses");
+	prism_free(&r);
 }
 
 // Qualifier preceding VLA bracket in typeof/_Atomic makes VLA invisible.
@@ -6075,6 +6123,9 @@ void run_safe_tests(void) {
 
         // VLA CFG bypass with -fno-zeroinit
         test_vla_cfg_bypass_fno_zeroinit();
+
+        test_sizeof_star_vla_paren_local_cfg();
+        test_enum_underlying_typedef_unsigned_parse();
 
         // qualifier blindspot in typeof/Atomic VLA detection
         test_typeof_qualifier_vla_blindspot();

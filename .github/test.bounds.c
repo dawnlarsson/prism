@@ -1259,8 +1259,7 @@ static void test_bounds_check_extreme_edges(void) {
 		prism_free(&r);
 	}
 
-	// Ternary LHS — `(c ? a : b)[i]` — last-emitted is `)`, so guard
-	// correctly rejects the wrap (documented accidentally-safe case).
+	// Ternary LHS — `(c ? a : b)[i]` — peel `)` and find tracked array idents.
 	{
 		PrismFeatures f = prism_defaults();
 		PrismResult r = prism_transpile_source(
@@ -1270,8 +1269,8 @@ static void test_bounds_check_extreme_edges(void) {
 		    "bc_ternary_lhs.c", f);
 		CHECK_EQ(r.status, PRISM_OK, "bc-ternary-lhs: transpiles");
 		if (r.output)
-			CHECK(strstr(r.output, ")[__prism_bchk") == NULL,
-			      "bc-ternary-lhs: ternary LHS subscript not wrapped");
+			CHECK(strstr(r.output, ")[__prism_bchk") != NULL,
+			      "bc-ternary-lhs: ternary LHS subscript wrapped");
 		prism_free(&r);
 	}
 
@@ -1904,6 +1903,22 @@ static void test_bounds_paren_unary_addr_one_past(void) {
 	prism_free(&r);
 }
 
+static void test_bounds_typedef_pointer_array_tracking(void) {
+	printf("\n--- bounds: typedef pointer-array ---\n");
+	PrismResult r = prism_transpile_source(
+	    "typedef int *PtrArr[10];\n"
+	    "void g(void) {\n"
+	    "    PtrArr arr;\n"
+	    "    arr[100] = (void*)0;\n"
+	    "}\n",
+	    "bc_td_ptrarr.c",
+	    prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "typedef PtrArr transpiles");
+	CHECK(r.output && strstr(r.output, "__prism_bchk"),
+	      "typedef array-of-pointers must register is_array on PtrArr");
+	prism_free(&r);
+}
+
 static void test_bounds_typeof_enum_ghost_constant(void) {
 	printf("\n--- bounds: enum in typeof registers constants ---\n");
 	PrismResult r = prism_transpile_source(
@@ -1924,6 +1939,7 @@ static void test_bounds_typeof_enum_ghost_constant(void) {
 void run_bounds_check_tests(void) {
 	printf("\n=== BOUNDS-CHECK TESTS ===\n");
 	test_bounds_paren_unary_addr_one_past();
+	test_bounds_typedef_pointer_array_tracking();
 	test_bounds_typeof_enum_ghost_constant();
 	test_bounds_check_fixed_array();
 	test_bounds_check_vla();

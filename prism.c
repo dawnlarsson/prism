@@ -373,6 +373,8 @@ static Token *try_typeof_orelse(Token *tok);
 static Token *try_bracket_orelse(Token *tok);
 static void emit_token_range_orelse(Token *start, Token *end);
 static void emit_token_range_verbatim(Token *start, Token *end);
+static inline bool is_orelse_value_fallback(Token *after_oe);
+static void check_orelse_in_ctrl_paren(Token *open);
 static Token *handle_sue_body(Token *tok);
 static void emit_noise_between_raws(Token *first_raw, Token *last_raw);
 static inline Token *try_strip_raw(Token *t);
@@ -1948,6 +1950,8 @@ static inline Token *emit_stmt_expr(Token *t) {
 static Token *emit_ctrl_condition(Token *t, Token **unreachable_tok) {
 	Token *close_p = tok_match(t);
 	if (!close_p) { emit_tok(t); return tok_next(t); }
+	if (FEAT(F_ORELSE))
+		check_orelse_in_ctrl_paren(t);
 	emit_tok(t); t = tok_next(t); // emit '('
 	ctx->at_stmt_start = true;
 	while (t && t != close_p && t->kind != TK_EOF) {
@@ -2506,6 +2510,22 @@ static Token *try_bounds_check_subscript(Token *tok) {
 			continue;
 		}
 		break;
+	}
+	// `(cond ? arr : arr)[i]` — peel trailing `)` so bounds_find_array_ident
+	// can see the tracked array inside the LHS expression.
+	if (name_tok->kind != TK_IDENT && last_emitted) {
+		Token *probe = last_emitted;
+		while (probe && match_ch(probe, ')') && tok_match(probe)) {
+			Token *op = tok_match(probe);
+			Token *hit = bounds_find_array_ident(tok_next(op), probe);
+			if (hit && is_tracked_array_name(hit)) {
+				name_tok = hit;
+				break;
+			}
+			if (tok_idx(op) < 1)
+				break;
+			probe = &token_pool[tok_idx(op) - 1];
+		}
 	}
 	if (name_tok->kind != TK_IDENT) return NULL;
 	if (is_known_typedef(name_tok)) return NULL;
@@ -3529,6 +3549,41 @@ static void check_orelse_in_parens(Token *open) {
 	}
 }
 
+// Statement/block 'orelse' actions in if/for/while/switch conditions would be
+// lowered by try_process_stmt_token into invalid nested statements inside ().
+static void check_orelse_in_ctrl_paren(Token *open) {
+	Token *close = tok_match(open);
+	if (is_stmt_expr_open(open) && close) return;
+	for (Token *pi = open, *t = tok_next(open); t != close; pi = t, t = tok_next(t)) {
+		if ((t->flags & TF_OPEN) && match_ch(t, '[') && tok_match(t)) {
+			t = tok_match(t);
+			continue;
+		}
+		if ((t->tag & TT_TYPEOF) && tok_next(t) && match_ch(tok_next(t), '(') &&
+		    tok_match(tok_next(t))) {
+			t = tok_match(tok_next(t));
+			continue;
+		}
+		if (is_stmt_expr_open(t) && tok_match(t)) {
+			t = tok_match(t);
+			continue;
+		}
+		if ((t->tag & TT_ORELSE) && !(pi->tag & TT_MEMBER)) {
+			if (tok_ann(t) & P1_OE_DECL_INIT) continue;
+			TypedefEntry *te = typedef_lookup(t);
+			if (te && !orelse_shadow_is_kw(pi)) continue;
+			if (!is_orelse_value_fallback(tok_next(t)))
+				error_tok(t, "'orelse' with statement or block action cannot be used "
+					  "in control-statement conditions (if/for/while/switch)");
+		}
+		if (FEAT(F_DEFER) && (t->tag & TT_DEFER) && (!typedef_lookup(t) || match_ch(tok_next(t), '{')) &&
+		    !match_ch(tok_next(t), ':') && !(pi->tag & (TT_MEMBER | TT_GOTO)) &&
+		    !(is_type_keyword(pi) || (pi->tag & TT_TYPEDEF)) &&
+		    !(tok_next(t) && (tok_next(t)->tag & TT_ASSIGN)))
+			error_tok(t, "defer cannot be at top level of a parenthesized expression");
+	}
+}
+
 typedef struct {
 	Token *orelse_tok;
 	bool is_const_fallback;
@@ -3545,15 +3600,15 @@ static inline void reject_orelse_in_for_init(Token *tok) {
 		error_tok(tok, "orelse cannot be used in for-loop initializers");
 }
 
-static inline void require_orelse_action(Token *tok, Token *stop_comma) {
-	if (match_ch(tok, ';') || (stop_comma && tok == stop_comma))
-		error_tok(tok, "expected statement after 'orelse'");
-}
-
 static inline bool is_orelse_value_fallback(Token *after_oe) {
 	return after_oe &&
 	    !(after_oe->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
 	    !match_ch(after_oe, '{') && !match_ch(after_oe, ';');
+}
+
+static inline void require_orelse_action(Token *tok, Token *stop_comma) {
+	if (match_ch(tok, ';') || (stop_comma && tok == stop_comma))
+		error_tok(tok, "expected statement after 'orelse'");
 }
 
 static inline void flush_typeof_memsets(Token **vars, int *count, TypeSpecResult *type, int base) {
@@ -9142,7 +9197,11 @@ static void cfg_check_range(P1FuncEntry *ents,
 	}
 
 	// VLA skip is always a hard error (C99/C11 6.8.6.1p1) regardless of
-	// feature flags.  Non-VLA declaration bypass only matters with zeroinit.
+	// feature flags.  Jumping past an explicit initializer is unsafe even
+	// when zeroinit is off.  Uninitialized locals are only tracked when
+	// zeroinit is enabled.  Multi-decl/goto ranges may contain both a scalar
+	// with initializer and a VLA — VLA must dominate (never masked).
+	bool bad_decl_has_init = false;
 	for (int di = decl_lo; di < decl_hi; di++) {
 		P1FuncEntry *d = &ents[decl_list[di]];
 		if (!scope_is_ancestor_or_self(d->scope_id, label->scope_id)) continue;
@@ -9151,12 +9210,38 @@ static void cfg_check_range(P1FuncEntry *ents,
 		if (d->decl.is_vla) {
 			bad_decl = d->tok;
 			bad_decl_is_vla = true;
+			bad_decl_has_init = false;
 			break;
 		}
-		if (FEAT(F_ZEROINIT) && !d->decl.has_raw && !d->decl.is_static_storage) {
+	}
+	if (!bad_decl) {
+		for (int di = decl_lo; di < decl_hi; di++) {
+			P1FuncEntry *d = &ents[decl_list[di]];
+			if (!scope_is_ancestor_or_self(d->scope_id, label->scope_id)) continue;
+			if (!is_forward && scope_is_ancestor_or_self(d->scope_id, g->scope_id)) continue;
+			{ uint32_t close = decl_effective_close(d); if (close > 0 && close < label->token_index) continue; }
+			if (d->decl.has_raw || d->decl.is_static_storage)
+				continue;
+			if (d->decl.has_init) {
+				bad_decl = d->tok;
+				bad_decl_is_vla = false;
+				bad_decl_has_init = true;
+				break;
+			}
+		}
+	}
+	if (!bad_decl && FEAT(F_ZEROINIT)) {
+		for (int di = decl_lo; di < decl_hi; di++) {
+			P1FuncEntry *d = &ents[decl_list[di]];
+			if (!scope_is_ancestor_or_self(d->scope_id, label->scope_id)) continue;
+			if (!is_forward && scope_is_ancestor_or_self(d->scope_id, g->scope_id)) continue;
+			{ uint32_t close = decl_effective_close(d); if (close > 0 && close < label->token_index) continue; }
+			if (d->decl.has_raw || d->decl.is_static_storage)
+				continue;
 			if (!bad_decl) {
 				bad_decl = d->tok;
 				bad_decl_is_vla = false;
+				bad_decl_has_init = false;
 			}
 		}
 	}
@@ -9165,10 +9250,15 @@ static void cfg_check_range(P1FuncEntry *ents,
 		cfg_report_goto(bad_defer,
 				"goto '%.*s' would skip over this defer statement", label);
 	if (bad_decl) {
-		const char *msg = bad_decl_is_vla
-			? "goto '%.*s' would skip over this VLA declaration"
-			: "goto '%.*s' would skip over this variable declaration "
-			  "(bypasses initialization)";
+		const char *msg;
+		if (bad_decl_is_vla)
+			msg = "goto '%.*s' would skip over this VLA declaration";
+		else if (bad_decl_has_init)
+			msg = "goto '%.*s' would skip over a declaration with an initializer "
+			      "(undefined behavior if jumped into)";
+		else
+			msg = "goto '%.*s' would skip over this variable declaration "
+			      "(bypasses initialization)";
 		if (bad_decl_is_vla)
 			error_tok(bad_decl, msg, label->label.len, label->label.name);
 		else

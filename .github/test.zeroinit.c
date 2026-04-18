@@ -1667,6 +1667,33 @@ static void test_typeof_vla_split_double_eval(void) {
 	prism_free(&r4);
 }
 
+static void test_vm_typeof_pointer_to_vla_multi_decl_rejected(void) {
+	printf("\n--- VM typeof(int(*)[side()]) multi-decl reject ---\n");
+	PrismResult r = prism_transpile_source(
+	    "int side_effect(void);\n"
+	    "void g(void) {\n"
+	    "    typeof(int (*)[side_effect()]) a, b = 0;\n"
+	    "    (void)a; (void)b;\n"
+	    "}\n",
+	    "vm_pta.c", prism_defaults());
+	CHECK(r.status != PRISM_OK,
+	      "pointer-to-VM-array typeof must reject multi-decl split");
+	prism_free(&r);
+}
+
+static void test_typeof_sizeof_nested_vla_not_vm_multi_decl(void) {
+	printf("\n--- typeof(sizeof(int[n])) multi-decl (non-VM) ---\n");
+	PrismResult r = prism_transpile_source(
+	    "void f(int n) {\n"
+	    "    typeof(sizeof(int[n])) a, b = 0;\n"
+	    "    (void)a; (void)b;\n"
+	    "}\n",
+	    "vm_sz.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "sizeof operand does not infect typeof with VM (no false split error)");
+	prism_free(&r);
+}
+
 static void test_vla_multi_decl_sequence_point(void) {
 	printf("\n--- VLA multi-decl sequence point split ---\n");
 
@@ -4426,6 +4453,8 @@ void run_zeroinit_tests(void) {
 	NOMSVC_ONLY(test_const_typeof_atomic_struct_bug());
 	test_typeof_memset_split_before_initializer();
 	test_typeof_vla_split_double_eval();
+	test_vm_typeof_pointer_to_vla_multi_decl_rejected();
+	test_typeof_sizeof_nested_vla_not_vm_multi_decl();
 	test_vla_multi_decl_sequence_point();
 	test_typeof_memset_queue_over_128();
 

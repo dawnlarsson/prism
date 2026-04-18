@@ -3053,11 +3053,12 @@ void test_sizeof_parenthesized_vla(void) {
 	int vla[n]; // VLA
 	vla[0] = 42;
 
-	// sizeof((vla)) is still runtime — extra parens around VLA variable
-	int arr[sizeof((vla))];
-	arr[0] = 99;
-
-	CHECK(arr[0] == 99, "sizeof((vla)): parenthesized VLA treated as runtime");
+	// sizeof((vla)) is still the full (*decayed*) array extent at runtime —
+	// extra parens keep the array type (not pointer). Avoid nested VLA decls:
+	// some host compilers reject `int arr[sizeof((vla))];` as ill-formed.
+	size_t z = sizeof((vla));
+	CHECK(z == (size_t)n * sizeof(int),
+	      "sizeof((vla)): parenthesized VLA gives full array byte size");
 	CHECK(vla[0] == 42, "sizeof((vla)): original VLA not clobbered");
 }
 

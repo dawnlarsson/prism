@@ -474,6 +474,16 @@ Runs after all Phase 1 sub-phases complete. Gated by `F_DEFER | F_ZEROINIT` — 
 
 Forward gotos past `raw`-marked declarations are skipped (safe — user explicitly opted out of initialization safety), **except VLAs** — `raw` on a VLA does not exempt it because jumping past a VLA bypasses implicit stack allocation regardless of initialization. Declarations with static storage duration (`static`, `extern`, `_Thread_local`, `thread_local`, `__thread`) are also exempt — their initialization occurs at program/thread startup, not at the declaration point, so jumping past them does not leave the variable indeterminate.
 
+**cfg_check_range:** Goto–label analysis scans skipped declarations in **three passes**: VLA declarations first (always error); then declarations with an explicit initializer (always error, independent of `-fno-zeroinit`); then, only if `F_ZEROINIT`, declarations that rely on implicit zero-initialization. VLA always wins over an earlier scalar-with-initializer in the same token range (so `-fno-safety` cannot downgrade the scalar to a mere warning and hide the VLA hard error).
+
+**typeof / `scan_paren_for_vla`:** Inside `typeof(...)` only (`check_typeof == false` in the scanner), a `sizeof(...)` operand is skipped as a balanced group so `sizeof(int[n])` does not mark the enclosing `typeof` as variably-modified for multi-decl / split detection. `_Atomic(...)` passes `check_typeof == true` and continues to inspect `sizeof` interiors for VM brackets.
+
+**C23 `enum E :` underlying type:** The fixed underlying-type skip loop consumes balanced `(...)` groups (e.g. `typeof(unsigned int)`) and C23 `[[...]]` so the parser reaches `{` for the enumerator list.
+
+**Typedef array-of-pointers:** `typedef int *T[N]` registers `T` with `is_array` when the declarator is an array (`!decl.is_pointer || decl.paren_array`), matching ordinary variable registration.
+
+**`-fbounds-check`:** After peeling postfix subscripts/`(ident)` from the LHS of `[`, if the base is still not a bare tracked array identifier, the checker scans inside one or more trailing `)` groups (obfuscated ternary LHS like `(c ? a : b)[i]`) with `bounds_find_array_ident`.
+
 ### Complexity
 
 O(N) per function where N is the number of `P1FuncEntry` items, plus O(depth) for `scope_is_ancestor_or_self` checks.
