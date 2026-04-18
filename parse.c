@@ -2248,11 +2248,16 @@ typedef struct {
 	bool is_param : 1;
 	bool has_volatile_member : 1;
 	bool is_struct_tag : 1; // struct/union tag (not a typedef name)
+	bool array_dim_complete : 1; // array typedef: sizeof(T)/sizeof(T[0]) valid at uses
 	uint8_t array_rank;	// # of array dimensions (0 if not array);
 				// used by -fbounds-check multi-dim wrap to
 				// avoid false positives on pointer-element
 				// arrays like `int *p[10]`.
+				// ARRAY_RANK_WRAP_ALL: rank overflow (>15); never drop
+				// the peel-off guard in try_bounds_check_subscript.
 } TypedefEntry; // 32 bytes — two entries per 64-byte cache line
+
+#define ARRAY_RANK_WRAP_ALL 255
 
 typedef struct {
 	TypedefEntry *entries;
@@ -2437,6 +2442,7 @@ typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool i
 	e->is_struct_tag = (kind == TDK_STRUCT_TAG);
 	e->is_param = false;
 	e->array_rank = 0;
+	e->array_dim_complete = true;
 	e->prev_index = typedef_get_index(name, len);
 	e->token_index = 0;
 	e->scope_open_idx = td_scope_open;
@@ -3367,8 +3373,38 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 					}
 					rank += (int)base_array_rank;
 					if (rank < 1) rank = 1;
-					if (rank > 15) rank = 15;
+					if (rank > 15)
+						rank = ARRAY_RANK_WRAP_ALL;
 					added->array_rank = (uint8_t)rank;
+				}
+				if ((decl.is_array || base_is_array) && !decl.is_pointer && !decl.is_func_ptr) {
+					bool dim_complete = false;
+					if (decl.is_array) {
+						for (Token *dt = decl.var_name; dt && decl.end && dt != decl.end;
+						     dt = tok_next(dt)) {
+							if (match_ch(dt, '[')) {
+								Token *nx = tok_next(dt);
+								if (nx && !match_ch(nx, ']')) {
+									dim_complete = true;
+									break;
+								}
+							}
+						}
+						if (!dim_complete && decl.end && match_ch(decl.end, '='))
+							dim_complete = true;
+					}
+					if (!dim_complete && base_is_array) {
+						for (Token *bt = type_start; bt && bt != type_spec.end;
+						     bt = tok_next(bt)) {
+							if (is_array_typedef(bt)) {
+								TypedefEntry *bte = typedef_lookup(bt);
+								if (bte && bte->is_array)
+									dim_complete = bte->array_dim_complete;
+								break;
+							}
+						}
+					}
+					added->array_dim_complete = dim_complete;
 				}
 				if (type_spec.is_struct && !type_spec.is_enum && !decl.is_pointer && !decl.is_func_ptr)
 					added->is_aggregate = true;

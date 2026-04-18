@@ -2367,7 +2367,9 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	// memory through a POINTER, whose length isn't knowable from `p`.
 	// Without this guard, the wrap would emit `sizeof(p[0])/sizeof(p[0][0])`
 	// which equals sizeof(ptr)/sizeof(elem) — a spurious bound.
-	if (te->array_rank > 0 && dim_depth >= te->array_rank) return NULL;
+	if (te->array_rank > 0 && te->array_rank != ARRAY_RANK_WRAP_ALL &&
+	    dim_depth >= te->array_rank)
+		return NULL;
 
 	// Skip unary `&arr[i]`: taking address is legal through index == size
 	// (C allows one-past-end), so wrapping would spuriously trap.
@@ -3719,7 +3721,7 @@ static bool process_const_orelse_decl(Token **tok_p, Token *orelse_tok,
 			  "(return/break/goto), typeof_unqual, or an "
 			  "explicit type name");
 
-	if (type->is_vla || decl->is_vla)
+	if (type->is_vla || decl->is_vla || type->type_vm)
 		error_tok(orelse_tok,
 			  "orelse on a const-qualified variably-modified type "
 			  "would duplicate the type specifier, causing VLA "
@@ -3787,7 +3789,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		if (!decl.end || !decl.var_name) {
 			if (!first_decl) {
 				if (need_type_emit) {
-					if ((type->has_typeof || type->has_atomic) && type->is_vla)
+					if ((type->has_typeof || type->has_atomic) &&
+					    (type->is_vla || type->type_vm))
 						error_tok(tok, "multi-declarator with variably-modified "
 							  "type specifier requires declaration split which "
 							  "would double-evaluate VLA size expressions; "
@@ -3839,7 +3842,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		if (need_type_emit) {
 			// Splitting a typeof VLA re-emits the type specifier, causing
 			// the VLA dimension to be evaluated twice (ISO C11 §6.7.2.5).
-			if ((type->has_typeof || type->has_atomic) && type->is_vla)
+			if ((type->has_typeof || type->has_atomic) &&
+			    (type->is_vla || type->type_vm))
 				error_tok(decl_start, "multi-declarator with variably-modified "
 					  "type specifier requires declaration split which "
 					  "would double-evaluate VLA size expressions; "
@@ -7450,6 +7454,20 @@ static Token *p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func,
 	return stmt_expr_open;
 }
 
+// True when the type specifier contains at least one non-empty array dimension
+// (`[expr]` with expr present). Distinguishes `typeof(int[10])` from `[]` /
+// typedef aliases of incomplete arrays for -fbounds-check registration.
+static bool p1d_type_spec_has_nonempty_array_dims(Token *start, Token *end) {
+	for (Token *t = start; t && t != end; t = tok_next(t)) {
+		if (match_ch(t, '[') && (t->flags & TF_OPEN)) {
+			Token *nx = tok_next(t);
+			if (nx && !match_ch(nx, ']'))
+				return true;
+		}
+	}
+	return false;
+}
+
 // Probe a statement starting with a type-like token as a potential declaration.
 // Records typedef shadows (Phase 1C) and per-function decl entries (Phase 1D).
 // Read-only probe: does NOT advance the caller's token pointer.
@@ -7628,6 +7646,22 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 			if (!has_complete_dim && match_ch(decl.end, '='))
 				has_complete_dim = true;
 		}
+		if (!reg_as_array && base_is_array_here) {
+			has_complete_dim = false;
+			for (Token *bt = type_tok; bt && bt != type.end; bt = tok_next(bt)) {
+				if (is_array_typedef(bt)) {
+					TypedefEntry *bte = typedef_lookup(bt);
+					if (bte && bte->is_array &&
+					    bte->array_dim_complete)
+						has_complete_dim = true;
+					break;
+				}
+			}
+			if (!has_complete_dim && (type.has_typeof || type.has_atomic) &&
+			    type.is_array &&
+			    p1d_type_spec_has_nonempty_array_dims(type_tok, type.end))
+				has_complete_dim = true;
+		}
 		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name &&
 		    (brace_depth > 0 || (brace_depth == 0 && (reg_as_array || base_is_array_here))) &&
 		    has_complete_dim &&
@@ -7668,8 +7702,10 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 				} else if (base_is_array_here) {
 					rank += 1;
 				}
-				if (rank > 15) rank = 15;
+				if (rank > 15)
+					rank = ARRAY_RANK_WRAP_ALL;
 				e->array_rank = (uint8_t)rank;
+				e->array_dim_complete = has_complete_dim;
 			}
 		}
 

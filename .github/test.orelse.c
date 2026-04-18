@@ -5290,6 +5290,30 @@ static void test_const_vm_type_orelse_double_eval(void) {
 		      "const-fixeddim-orelse: fixed-dim const accepted");
 		prism_free(&r);
 	}
+
+	// Sub-test 5: typeof(ptr-to-VLA with side-effect size) — type_vm without object VLA;
+	// const orelse fallback must reject (would evaluate typeof operand twice).
+	{
+		const char *code =
+		    "void *get_ptr(void);\n"
+		    "void g(void) {\n"
+		    "    int n = 5;\n"
+		    "    const typeof(int (*)[n++]) ptr = get_ptr() orelse 0;\n"
+		    "    (void)ptr;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "const_typeof_ptr_vm_orelse.c",
+						       prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "const-typeof-ptr-vm-orelse: VM typeof const value fallback rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "duplicate") != NULL ||
+			      strstr(r.error_msg, "twice") != NULL ||
+			      strstr(r.error_msg, "VLA") != NULL ||
+			      strstr(r.error_msg, "variably") != NULL ||
+			      strstr(r.error_msg, "orelse") != NULL,
+			      "const-typeof-ptr-vm-orelse: error mentions duplicate / VM");
+		prism_free(&r);
+	}
 }
 
 static void test_atomic_vm_type_split_double_eval(void) {
@@ -5319,8 +5343,8 @@ static void test_atomic_vm_type_split_double_eval(void) {
 		prism_free(&r);
 	}
 
-	// Sub-test 2: _Atomic(int(*)[n]) const + orelse — pointer-to-VM type, not an
-	// object VLA; must transpile (no spurious const+memset rejection).
+	// Sub-test 2: const _Atomic(int(*)[n]) + value orelse — fallback duplicates the
+	// VM type specifier (temp + final const); must reject like typeof VM + orelse.
 	{
 		const char *code =
 		    "void *get(void);\n"
@@ -5329,8 +5353,15 @@ static void test_atomic_vm_type_split_double_eval(void) {
 		    "    (void)p;\n"
 		    "}\n";
 		PrismResult r = prism_transpile_source(code, "atomic_vla_const.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-		      "atomic-vm-const-orelse: const _Atomic ptr-to-VLA with orelse accepted");
+		CHECK(r.status != PRISM_OK,
+		      "atomic-vm-const-orelse: const _Atomic ptr-to-VLA value orelse rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "duplicate") != NULL ||
+			      strstr(r.error_msg, "twice") != NULL ||
+			      strstr(r.error_msg, "VLA") != NULL ||
+			      strstr(r.error_msg, "variably") != NULL ||
+			      strstr(r.error_msg, "orelse") != NULL,
+			      "atomic-vm-const-orelse: error mentions duplicate VM / orelse");
 		prism_free(&r);
 	}
 

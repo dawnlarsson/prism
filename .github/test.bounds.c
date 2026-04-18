@@ -1475,6 +1475,43 @@ static void test_bounds_check_extreme_edges(void) {
 		prism_free(&r);
 	}
 
+	// Array type only in base typedef: `typedef int IA[];` + `extern IA buffer;` —
+	// incomplete at use site; must not register (invalid sizeof in bchk).
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "typedef int IncompleteArray[];\n"
+		    "void f(void) {\n"
+		    "    extern IncompleteArray buffer;\n"
+		    "    buffer[5] = 1;\n"
+		    "}\n",
+		    "bc_typedef_incomplete_ext.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-typedef-incomplete-ext: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "buffer[__prism_bchk") == NULL,
+			      "bc-typedef-incomplete-ext: incomplete typedef base not wrapped");
+		prism_free(&r);
+	}
+
+	// 16+ array dimensions: stored rank uses overflow sentinel; subscript on
+	// the 16th level must not be skipped by the multi-dim peel-off guard.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "void g(void) {\n"
+		    "    int hyper[1][1][1][1][1][1][1][1][1][1][1][1][1][1][1][1];\n"
+		    "    hyper[0][0][0][0][0][0][0][0][0][0][0][0][0][0][0][99] = 1;\n"
+		    "}\n",
+		    "bc_rank16.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-rank16: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "__prism_bchk") != NULL,
+			      "bc-rank16: 16-dim subscript wrapped");
+		prism_free(&r);
+	}
+
 	// const / volatile / restrict qualifiers on array — must still wrap.
 	{
 		PrismFeatures f = prism_defaults();
