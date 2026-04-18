@@ -2840,10 +2840,25 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 
 static inline bool array_size_is_vla(Token *open_bracket) { return array_size_is_vla_impl(open_bracket, 0); }
 
+// Field declarator names share the member namespace — do not resolve them via
+// ordinary typedef_lookup (ISO C11 §6.2.3).
+static inline bool struct_body_id_is_field_name(Token *id) {
+	if (!is_identifier_like(id)) return false;
+	Token *nx = skip_noise(tok_next(id));
+	if (!nx || nx->len != 1) return false;
+	switch (nx->ch0) {
+	case ';': case ',': case ':': case '[': case '=':
+		return true;
+	default:
+		return false;
+	}
+}
+
 // After struct/union/enum keyword, tag_lookup — not typedef_lookup — sees the
 // tag namespace (C11 §6.2.3). Ordinary identifiers can shadow tag names.
 static inline bool struct_body_field_is_vla_typedef(Token *id, Token *prev) {
 	if (!is_identifier_like(id)) return false;
+	if (struct_body_id_is_field_name(id)) return false;
 	if (prev && (prev->tag & TT_SUE)) {
 		TypedefEntry *te = tag_lookup(id);
 		return te && te->is_struct_tag && te->is_vla;
@@ -2878,6 +2893,7 @@ static bool struct_body_contains_vla(Token *brace) {
 // is replaced with a volatile-safe byte loop (memset strips volatile → UB).
 static inline bool struct_body_field_volatile_member(Token *id, Token *prev) {
 	if (!is_identifier_like(id)) return false;
+	if (struct_body_id_is_field_name(id)) return false;
 	if (prev && (prev->tag & TT_SUE)) {
 		TypedefEntry *te = tag_lookup(id);
 		if (te && te->has_volatile_member) return true;
@@ -2981,7 +2997,7 @@ static bool abstract_declarator_paren_is_pointer_only(Token *open_paren) {
 	return true;
 }
 
-static bool array_bracket_closes_ptr_to_array(Token *open_bracket, Token *prev) {
+bool array_bracket_closes_ptr_to_array(Token *open_bracket, Token *prev) {
 	if (!open_bracket || !prev || prev->len != 1 || prev->ch0 != ')') return false;
 	Token *open = tok_match(prev);
 	return open && abstract_declarator_paren_is_pointer_only(open);
@@ -3163,7 +3179,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			if (tok && tok->len == 1 && tok->ch0 == '(') {
 				Token *end = skip_balanced_group(tok);
 				if (tok_next(tok) && equal(tok_next(tok), "void") && tok_next(tok_next(tok)) == tok_match(tok)) r.has_void = true;
-				if (!is_unqual) {
+				{
 					bool saw_sue = false;
 					for (Token *t = tok_next(tok); t && t != end; t = tok_next(t)) {
 						// Skip attribute groups — they contain
@@ -3178,10 +3194,12 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 							t = tok_match(t);
 							continue;
 						}
-						if (t->tag & TT_VOLATILE) r.has_volatile = true;
-						if (t->tag & TT_CONST) r.has_const = true;
-						if ((t->tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE))
-							r.has_atomic = true;
+						if (!is_unqual) {
+							if (t->tag & TT_VOLATILE) r.has_volatile = true;
+							if (t->tag & TT_CONST) r.has_const = true;
+							if ((t->tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE))
+								r.has_atomic = true;
+						}
 						if ((t->tag & TT_SUE) || (typedef_flags(t) & TDF_AGGREGATE)) r.is_struct = true;
 						if ((t->tag & TT_SUE) && t->ch0 == 'u') r.is_union = true;
 						if (typedef_flags(t) & TDF_UNION) r.is_union = true;
@@ -3197,9 +3215,11 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 								}
 								saw_sue = false;
 							}
-							int tf = typedef_flags(t);
-							if (tf & TDF_VOLATILE) r.has_volatile = true;
-							if (tf & TDF_HAS_VOL_MEMBER) r.has_volatile_member = true;
+							if (!is_unqual) {
+								int tf = typedef_flags(t);
+								if (tf & TDF_VOLATILE) r.has_volatile = true;
+								if (tf & TDF_HAS_VOL_MEMBER) r.has_volatile_member = true;
+							}
 						}
 					}
 				}
@@ -3364,12 +3384,18 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 				// or func-of-array constructs.
 				if ((decl.is_array || base_is_array) && !decl.is_pointer && !decl.is_func_ptr) {
 					int rank = 0;
-					for (Token *dt = decl.var_name; dt && decl.end && dt != decl.end; dt = tok_next(dt)) {
+					Token *prev_dt = NULL;
+					for (Token *dt = decl.var_name; dt && decl.end && dt != decl.end;) {
 						if (dt->len == 1 && dt->ch0 == '[' && (dt->flags & TF_OPEN)) {
-							rank++;
+							if (!array_bracket_closes_ptr_to_array(dt, prev_dt))
+								rank++;
 							Token *m = tok_match(dt);
-							if (m) dt = m;
+							dt = m ? tok_next(m) : tok_next(dt);
+							prev_dt = m;
+							continue;
 						}
+						prev_dt = dt;
+						dt = tok_next(dt);
 					}
 					rank += (int)base_array_rank;
 					if (rank < 1) rank = 1;
@@ -3384,10 +3410,9 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 						     dt = tok_next(dt)) {
 							if (match_ch(dt, '[')) {
 								Token *nx = tok_next(dt);
-								if (nx && !match_ch(nx, ']')) {
+								if (nx && !match_ch(nx, ']'))
 									dim_complete = true;
-									break;
-								}
+								break;
 							}
 						}
 						if (!dim_complete && decl.end && match_ch(decl.end, '='))
@@ -3486,10 +3511,15 @@ restart:
 
 	if ((tok->tag & TT_LOOP) && tok->ch0 == 'd') {
 		if (do_depth >= SOS_DO_MAX) return NULL;
+		if (do_snap_top + if_depth > SOS_SNAP_MAX)
+			error_tok(tok,
+				  "statement scan: nested do/if trail snapshot limit "
+				  "exceeded; reduce nested 'do' and 'if' depth in a "
+				  "single statement");
 		do_if_save[do_depth] = if_depth;
 		do_tn_save[do_depth] = tn;
 		do_snap_start[do_depth] = do_snap_top;
-		for (int i = 0; i < if_depth && i < SOS_IF_MAX && do_snap_top < SOS_SNAP_MAX; i++)
+		for (int i = 0; i < if_depth && i < SOS_IF_MAX; i++)
 			do_snap_buf[do_snap_top++] = if_trail_snap[i];
 		do_depth++;
 		if_depth = 0;

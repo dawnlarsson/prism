@@ -2248,6 +2248,55 @@ static Token *try_bounds_check_subscript(Token *tok) {
 				    "commutative subscript 'idx[arr]' bypasses "
 				    "-fbounds-check; rewrite as 'arr[idx]'");
 			}
+		} else if (inner != iclose && inner && inner->kind == TK_IDENT) {
+			/* Indexed element inside brackets: `idx[arr[0]]`. The bracket
+			 * body is not a bare `arr` token before `]`, so the guard
+			 * above misses it — same commutative bypass as `idx[arr]`.
+			 * Peel postfix `[...]` chunks from the innermost identifier until
+			 * we consume tokens up to `iclose`; if that names a tracked array
+			 * root and `last_emitted` is not a tracked array (`cache[trail[i]]`
+			 * keeps `cache` as last_emitted — still tracked — so no error). */
+			Token *array_root = NULL;
+			Token *scan = inner;
+			while (scan && scan != iclose) {
+				if (scan->kind != TK_IDENT)
+					break;
+				Token *lb = tok_next(scan);
+				if (!lb || !match_ch(lb, '[') || !(lb->flags & TF_OPEN) ||
+				    !tok_match(lb))
+					break;
+				array_root = scan;
+				Token *rb = tok_match(lb);
+				if (!rb)
+					break;
+				scan = tok_next(rb);
+			}
+			if (scan == iclose && array_root &&
+			    is_tracked_array_name(array_root)) {
+				Token *le = last_emitted;
+				while (match_ch(le, ')') && tok_match(le)) {
+					Token *open = tok_match(le);
+					if (tok_idx(open) >= 1) {
+						Token *before = &token_pool[tok_idx(open) - 1];
+						if (before->kind == TK_IDENT ||
+						    before->kind == TK_NUM ||
+						    match_ch(before, ')') ||
+						    match_ch(before, ']'))
+							break;
+					}
+					Token *ii = tok_next(open);
+					if (ii && ii->kind == TK_IDENT &&
+					    tok_next(ii) == le) {
+						le = ii;
+						break;
+					}
+					break;
+				}
+				if (!is_tracked_array_name(le))
+					error_tok(tok,
+					    "commutative subscript 'idx[arr]' bypasses "
+					    "-fbounds-check; rewrite as 'arr[idx]'");
+			}
 		}
 	}
 	Token *name_tok = last_emitted;
@@ -3569,6 +3618,42 @@ static bool decl_has_attribute(Token *var_name, Token *eq) {
 	return false;
 }
 
+// Mirror emit_decl_init_walk delimiter rules without emitting — stops at ',' or ';'.
+static Token *peek_flat_init_until_comma_sem(Token *t) {
+	int init_ternary = 0;
+	while (t && t->kind != TK_EOF) {
+		if (t->flags & TF_OPEN) {
+			Token *cl = tok_match(t);
+			t = cl ? tok_next(cl) : tok_next(t);
+			continue;
+		}
+		if (match_ch(t, ',') || match_ch(t, ';'))
+			break;
+		if (match_ch(t, '?')) {
+			init_ternary++;
+			t = tok_next(t);
+			continue;
+		}
+		if (match_ch(t, ':') && init_ternary > 0) {
+			init_ternary--;
+			t = tok_next(t);
+			continue;
+		}
+		t = tok_next(t);
+	}
+	return t;
+}
+
+static bool decl_followed_by_another_declarator(Token *decl_end, bool has_init) {
+	if (!has_init) {
+		Token *t = skip_noise(decl_end);
+		return t && match_ch(t, ',');
+	}
+	Token *past = peek_flat_init_until_comma_sem(decl_end);
+	past = skip_noise(past);
+	return past && match_ch(past, ',');
+}
+
 // Check if a brace-enclosed initializer contains only compile-time constants.
 // Returns true when the initializer after '=' is '{...}' and every token inside
 // is a numeric literal, string literal, punctuation, sign operator, or known
@@ -3881,7 +3966,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 				    !type->has_constexpr && !type->has_thread_local &&
 				    decl.is_array && (!decl.is_pointer || decl.is_const) && decl.has_init &&
 				    !decl.is_vla && !type->is_vla &&
-				    !decl_is_raw && !orelse_info.orelse_tok) {
+				    !decl_is_raw && !orelse_info.orelse_tok &&
+				    !decl_followed_by_another_declarator(decl.end, decl.has_init)) {
 					// Volatile hidden in typedefs bypasses type->has_volatile
 					bool hidden_vol = false;
 					for (Token *tv = type_start; tv && tv != type->end; tv = tok_next(tv))
@@ -7006,6 +7092,7 @@ p1d_classify_bracket_orelse(Token *tok, uint16_t cur_sid, int p1d_cur_func) {
 	bool in_struct = cur_sid > 0 && cur_sid < scope_tree_count && scope_tree[cur_sid].is_struct;
 	bool found_oe = false;
 	Token *prev_d0_oe = NULL;
+	bool bracket_chain_first_lhs_checked = false;
 	int oe_depth = 0;
 	Token *prev_bracket = tok;
 	for (Token *s = tok_next(tok); s && s != close && s->kind != TK_EOF; s = tok_next(s)) {
@@ -7032,15 +7119,30 @@ p1d_classify_bracket_orelse(Token *tok, uint16_t cur_sid, int p1d_cur_func) {
 					     "if wrapped in outer parentheses, remove them: "
 					     "use '[f() orelse 1]' not '[(f() orelse 1)]'");
 			validate_bracket_orelse(s);
-			if (oe_depth == 0 && prev_d0_oe)
-				reject_orelse_side_effects(
-					tok_next(prev_d0_oe), s,
-					"'orelse' in array dimension",
-					"in a chained 'orelse' (would be "
-					"evaluated twice); hoist the "
-					"expression to a variable first",
-					true, true, false);
-			if (oe_depth == 0) prev_d0_oe = s;
+			// Chained bracket orelse duplicates the opening dimension
+			// expression; a single orelse does not (emit uses one temp).
+			if (oe_depth == 0) {
+				if (prev_d0_oe) {
+					if (!bracket_chain_first_lhs_checked) {
+						reject_orelse_side_effects(
+						    tok_next(tok), prev_d0_oe,
+						    "'orelse' in array dimension",
+						    "before the first 'orelse' in a chain "
+						    "(would be evaluated twice); hoist the "
+						    "expression to a variable first",
+						    true, true, false);
+						bracket_chain_first_lhs_checked = true;
+					}
+					reject_orelse_side_effects(
+					    tok_next(prev_d0_oe), s,
+					    "'orelse' in array dimension",
+					    "in a chained 'orelse' (would be "
+					    "evaluated twice); hoist the "
+					    "expression to a variable first",
+					    true, true, false);
+				}
+				prev_d0_oe = s;
+			}
 			tok_ann(s) |= P1_OE_BRACKET;
 			found_oe = true;
 		}
@@ -7637,10 +7739,13 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		bool has_complete_dim = true;
 		if (reg_as_array) {
 			has_complete_dim = false;
+			// ISO C: array type is complete only if the *outer* (first) `[]` has
+			// a size; `int a[][10]` is still incomplete.
 			for (Token *dt = decl.var_name; dt && dt != decl.end; dt = tok_next(dt)) {
 				if (match_ch(dt, '[')) {
 					Token *nx = tok_next(dt);
-					if (nx && !match_ch(nx, ']')) { has_complete_dim = true; break; }
+					if (nx && !match_ch(nx, ']')) { has_complete_dim = true; }
+					break;
 				}
 			}
 			if (!has_complete_dim && match_ch(decl.end, '='))
@@ -7681,12 +7786,18 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 				// which equals sizeof(ptr)/sizeof(int) — a
 				// spurious trap on any valid pointer subscript.
 				int rank = 0;
-				for (Token *dt = decl.var_name; dt && dt != decl.end; dt = tok_next(dt)) {
+				Token *prev_bt = NULL;
+				for (Token *dt = decl.var_name; dt && dt != decl.end;) {
 					if (match_ch(dt, '[') && (dt->flags & TF_OPEN)) {
-						rank++;
+						if (!array_bracket_closes_ptr_to_array(dt, prev_bt))
+							rank++;
 						Token *m = tok_match(dt);
-						if (m) dt = m;
+						dt = m ? tok_next(m) : tok_next(dt);
+						prev_bt = m;
+						continue;
 					}
+					prev_bt = dt;
+					dt = tok_next(dt);
 				}
 				// Typedef arrays: inherit rank from the resolved
 				// typedef so `typedef int T[3][4]; T a;` gets
