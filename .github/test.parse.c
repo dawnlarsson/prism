@@ -6558,12 +6558,12 @@ static void test_c23_extended_float_x_suffixes(void) {
 	CHECK_EQ(result.status, PRISM_OK, "float x suffix: transpiles OK");
 	CHECK(result.output != NULL, "float x suffix: output not NULL");
 
-	// f32x maps to double (no suffix needed), f64x maps to long double (L suffix)
-	// The transpiler should replace f32x with nothing and f64x with L.
-	CHECK(strstr(result.output, "1.0f32x") == NULL,
-	      "float x suffix: f32x should be replaced (not left as-is)");
-	CHECK(strstr(result.output, "2.0f64x") == NULL,
-	      "float x suffix: f64x should be replaced (not left as-is)");
+	// C23 extended float suffixes are preserved in output (no mapping to
+	// a different type class that would change _Generic or constant value).
+	CHECK(strstr(result.output, "1.0f32x") != NULL,
+	      "float x suffix: f32x literal must be preserved");
+	CHECK(strstr(result.output, "2.0f64x") != NULL,
+	      "float x suffix: f64x literal must be preserved");
 
 	prism_free(&result);
 }

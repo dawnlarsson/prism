@@ -4293,9 +4293,30 @@ static void test_zeroinit_typeof_unqual_union_const(void) {
 	prism_free(&r);
 }
 
+static void test_cfg_switch_bypass_initialized_decl_fno_zeroinit(void) {
+	PrismFeatures f = prism_defaults();
+	f.zeroinit = false;
+	PrismResult r = prism_transpile_source(
+	    "void g(int v) {\n"
+	    "    switch (v) {\n"
+	    "    case 1:\n"
+	    "        int x = 5;\n"
+	    "    case 2:\n"
+	    "        (void)0;\n"
+	    "        break;\n"
+	    "    }\n"
+	    "}\n",
+	    "cfg_sw_init_bypass.c", f);
+	CHECK(r.status != PRISM_OK,
+	      "CFG: jump past initialized decl must fail even when -fno-zeroinit");
+	prism_free(&r);
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
+
+	test_cfg_switch_bypass_initialized_decl_fno_zeroinit();
 
 	/* Basic zero-init */
 	test_zeroinit_basic_types();

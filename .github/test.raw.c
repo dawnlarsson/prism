@@ -170,6 +170,21 @@ void test_raw_variable_array(void) {
 	CHECK_EQ(raw_ptr[2], 30, "raw_ptr[2]");
 }
 
+static void test_raw_variable_mul_subscript_not_stripped(void) {
+	PrismResult r = prism_transpile_source(
+	    "void f(void) {\n"
+	    "  int raw = 5, x = 2;\n"
+	    "  int arr[20] = {0};\n"
+	    "  arr[raw * x] = 1;\n"
+	    "}\n",
+	    "raw_mul_idx.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "raw var mul in subscript transpiles");
+	if (r.output)
+		CHECK(strstr(r.output, "__prism_bchk((__prism_bchk_size_t)( * x)") == NULL,
+		      "must not strip variable name 'raw' as keyword (bogus \"* x\")");
+	prism_free(&r);
+}
+
 void test_raw_variable_member(void) {
 	struct point {
 		int x;
@@ -1799,6 +1814,7 @@ void run_raw_tests(void) {
 	test_raw_variable_logical();
 	test_raw_variable_incr_decr();
 	test_raw_variable_array();
+	test_raw_variable_mul_subscript_not_stripped();
 	test_raw_variable_member();
 	test_raw_variable_function_call();
 	test_raw_variable_comma();

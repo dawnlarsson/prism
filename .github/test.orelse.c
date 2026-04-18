@@ -7990,7 +7990,27 @@ static void test_typeof_orelse_in_fallback(void) {
 	}
 }
 
+static void test_bracket_orelse_many_tokens_linear_paren_scan(void) {
+	char buf[16384];
+	size_t n = 0;
+	n += (size_t)snprintf(buf + n, sizeof(buf) - n,
+			      "void f(void) {\n"
+			      " int arr[0");
+	const char *chunk = " orelse 1";
+	for (int i = 0; i < 400 && n + strlen(chunk) + 64 < sizeof(buf); i++)
+		n += (size_t)snprintf(buf + n, sizeof(buf) - n, "%s", chunk);
+	n += (size_t)snprintf(buf + n, sizeof(buf) - n,
+			      "];\n"
+			      " (void)arr;\n"
+			      "}\n");
+	PrismResult r = prism_transpile_source(buf, "oe_many_dim.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "bracket dim many orelse: linear paren-depth scan must complete");
+	prism_free(&r);
+}
+
 void run_orelse_tests(void) {
+	test_bracket_orelse_many_tokens_linear_paren_scan();
 	test_orelse_return_null();
 	test_orelse_return_cast();
 	test_orelse_return_expr();

@@ -2763,10 +2763,13 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 						}
 						int vla_fl = typedef_flags(inner) & (TDF_VLA | TDF_PARAM);
 						if (vla_fl & TDF_VLA) {
-							if (!(vla_fl & TDF_PARAM)) return true;
+							if (!(vla_fl & TDF_PARAM)) {
+								Token *la = skip_noise(tok_next(inner));
+								if (la && la != end && match_ch(la, ')'))
+									return true;
+							}
 							Token *ni = tok_next(inner);
 							bool has_next = ni && ni != end;
-							// Look past parentheses for the real preceding/following operator
 							Token *eff_prev = prev_inner;
 							uint32_t pi = tok_idx(eff_prev);
 							while (eff_prev->ch0 == '(' && pi > tok_idx(tok) + 1)
@@ -2774,8 +2777,8 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 							Token *eff_next = ni;
 							while (has_next && eff_next && eff_next->ch0 == ')' && eff_next != end)
 								{ eff_next = tok_next(eff_next); has_next = eff_next && eff_next != end; }
-							/* `+`/`-` after a decayed array *identifier* are binary
-							 * pointer arithmetic — sizeof(param+5) is sizeof(void*).
+							/* `+`/`-` after a decayed VLA *identifier* are binary pointer
+							 * arithmetic — sizeof(vla+1) / sizeof(param+5) are sizeof(void*).
 							 * Unary +/- live on eff_prev before the identifier. */
 							bool deref =
 							    (eff_prev->len == 1 &&
@@ -2785,7 +2788,7 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 							     (eff_next->ch0 == '[' || eff_next->ch0 == '*' ||
 							      ((eff_next->ch0 == '+' || eff_next->ch0 == '-') &&
 							       !(inner->kind == TK_IDENT &&
-							         (vla_fl & TDF_PARAM)))));
+							         (vla_fl & TDF_VLA)))));
 							if (deref) return true;
 						}
 						if (inner->len == 1 && inner->ch0 == '[' &&
@@ -3049,6 +3052,11 @@ static void scan_paren_for_vla(Token *open, Token *end, TypeSpecResult *r, bool 
 	Token *prev = open;
 	int fn_skip = 0;
 	for (Token *t = tok_next(open); t && t != end; prev = t, t = tok_next(t)) {
+		if (is_c23_attr(t) && tok_match(t)) {
+			prev = t;
+			t = tok_match(t);
+			continue;
+		}
 		// Ban control-flow keywords inside type specifier parens.
 		// typeof()/Atomic() are unevaluated at runtime, but Prism's
 		// emit_type_range routes stmt-exprs through walk_balanced (full
@@ -3075,7 +3083,8 @@ static void scan_paren_for_vla(Token *open, Token *end, TypeSpecResult *r, bool 
 			else if (prev->len == 1 && prev->ch0 == ')') fn_skip = 1;
 		} else if (t->len == 1 && t->ch0 == ')') { if (fn_skip > 0) fn_skip--; }
 		if (fn_skip > 0) continue;
-		if (t->len == 1 && t->ch0 == '[' && is_array_bracket_predecessor(prev)) {
+		if (t->len == 1 && t->ch0 == '[' && !(t->flags & TF_C23_ATTR) &&
+		    is_array_bracket_predecessor(prev)) {
 			if (array_size_is_vla(t))
 				r->type_vm = true;
 			if (!array_bracket_closes_ptr_to_array(t, prev)) {
@@ -4086,8 +4095,22 @@ static inline bool is_assignment_operator_token(Token *tok) {
 	return (tok->tag & TT_ASSIGN) && tok_loc(tok)[tok->len - 1] == '=';
 }
 
+// True when `raw` sits immediately after `[` (possibly past noise): `arr[raw * x]` is
+// multiplication of locals, not `raw`-prefixed pointer declaration "raw * x".
+static bool raw_after_subscript_open_bracket(Token *raw_kw) {
+	if (!raw_kw || !(raw_kw->flags & TF_RAW)) return false;
+	uint32_t ri = tok_idx(raw_kw);
+	if (ri == 0) return false;
+	/* walk_back_past_noise(k) inspects pool[k-1] first — pass ri, not ri-1. */
+	Token *b = walk_back_past_noise(ri);
+	// `[` from `[[attr]]` is tagged TF_C23_ATTR — not an array subscript.
+	return b && match_ch(b, '[') && !(b->flags & TF_C23_ATTR);
+}
+
 // Returns true if 'raw' is followed by a declaration context (type keyword, typedef, *, etc.)
-static bool is_raw_declaration_context(Token *after_raw) {
+static bool is_raw_declaration_context(Token *raw_kw, Token *after_raw) {
+	if (raw_after_subscript_open_bracket(raw_kw))
+		return false;
 	after_raw = skip_noise(after_raw);
 	if (!after_raw) return false;
 	if (is_type_keyword(after_raw) || is_known_typedef(after_raw) ||
@@ -4107,8 +4130,8 @@ static bool is_raw_declaration_context(Token *after_raw) {
 }
 
 // Extended raw context: also matches per-declarator raw after comma (int x, raw y;)
-static bool is_raw_strip_context(Token *after_raw) {
-	if (is_raw_declaration_context(after_raw)) return true;
+static bool is_raw_strip_context(Token *raw_kw, Token *after_raw) {
+	if (is_raw_declaration_context(raw_kw, after_raw)) return true;
 	after_raw = skip_noise(after_raw);
 	Token *boundary = after_raw ? skip_noise(tok_next(after_raw)) : NULL;
 	return after_raw && is_valid_varname(after_raw) && !is_type_keyword(after_raw) &&

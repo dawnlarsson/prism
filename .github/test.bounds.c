@@ -1841,6 +1841,50 @@ static void test_bounds_reported_issue_regressions(void) {
 			 "bc-rep: sizeof(array_param + const) pointer-sized, not VLA elem");
 		prism_free(&r);
 	}
+
+	/* Local VLA: sizeof(vla+1) is pointer-sized; must not force VM/type split error */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(int n) {\n"
+		    "    int vla[n];\n"
+		    "    int buf[sizeof(vla + 1)] = {0}, buf2[2];\n"
+		    "    (void)buf; (void)buf2;\n"
+		    "}\n",
+		    "bc_loc_vla_sz.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "bc-rep: sizeof(local VLA+1) is sizeof(int*) not VM dim");
+		prism_free(&r);
+	}
+
+	/* Ternary hides tracked arrays in index position — same policy as len[arr]: reject */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void h(int idx) {\n"
+		    "    int arr1[10], arr2[10];\n"
+		    "    idx[ 1 ? arr1 : arr2 ] = 0;\n"
+		    "}\n",
+		    "bc_comm_tern.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "bc-rep: ternary index with array operands must be rejected (-fbounds-check)");
+		prism_free(&r);
+	}
+
+	/* typeof + C23 attribute on pointer — not an array dimension; no bogus bounds */
+	{
+		PrismResult r = prism_transpile_source(
+		    "#include <stdlib.h>\n"
+		    "void j(void) {\n"
+		    "    typeof(int * [[gnu::nonnull]]) ptr = malloc(400);\n"
+		    "    ptr[5] = 42;\n"
+		    "    free(ptr);\n"
+		    "}\n",
+		    "bc_attr_typeof_ptr.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "bc-rep: typeof ptr[[attr]] transpiles");
+		if (r.output && r.status == PRISM_OK)
+			CHECK(strstr(r.output, "sizeof(ptr)/sizeof(ptr[0])") == NULL,
+			      "bc-rep: must not treat [[attr]] pointer as array for sizeof ratio");
+		prism_free(&r);
+	}
 }
 
 void run_bounds_check_tests(void) {
