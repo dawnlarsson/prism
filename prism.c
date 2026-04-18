@@ -2033,10 +2033,83 @@ static void p1_tag_brackets_in_range(Token *open, Token *close) {
 	}
 }
 
+static bool comma_expr_has_comma(Token *open_paren, Token *close_paren) {
+	int depth = 0;
+	for (Token *t = tok_next(open_paren); t && t != close_paren; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			depth++;
+			continue;
+		}
+		if (t->flags & TF_CLOSE) {
+			depth--;
+			continue;
+		}
+		if (depth == 0 && match_ch(t, ','))
+			return true;
+	}
+	return false;
+}
+
+static Token *last_comma_operand(Token *open_paren, Token *close_paren) {
+	Token *seg_start = tok_next(open_paren);
+	int depth = 0;
+	for (Token *t = seg_start; t && t != close_paren; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			depth++;
+			continue;
+		}
+		if (t->flags & TF_CLOSE) {
+			depth--;
+			continue;
+		}
+		if (depth == 0 && match_ch(t, ','))
+			seg_start = tok_next(t);
+	}
+	return seg_start;
+}
+
 static void p1_mark_uneval_brackets(void) {
 	// token_pool[0] is a reserved sentinel (next_idx 0 means "NULL"); start at 1.
 	for (uint32_t i = 1; i < token_count; i++) {
 		Token *t = &token_pool[i];
+		// _Static_assert / static_assert predicate: must stay an integer
+		// constant expression — never wrap subscripts in __prism_bchk.
+		if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
+		    (equal(t, "_Static_assert") || equal(t, "static_assert"))) {
+			Token *lp = tok_next(t);
+			if (lp && match_ch(lp, '(') && (lp->flags & TF_OPEN) && tok_match(lp)) {
+				Token *rp = tok_match(lp);
+				if (rp)
+					p1_tag_brackets_in_range(lp, rp);
+			}
+			continue;
+		}
+		// _Generic(controlling_expr, type1: val1, ...): per C11 §6.5.1.1p3,
+		// the controlling expression is NOT evaluated. (The selected
+		// association expression IS evaluated, so subscripts in the
+		// associations still wrap normally.) Tag every `[` inside the
+		// first comma-separated entry at paren depth 0.
+		if (t->tag & TT_GENERIC) {
+			Token *lp = tok_next(t);
+			if (lp && match_ch(lp, '(') && (lp->flags & TF_OPEN) && tok_match(lp)) {
+				Token *close = tok_match(lp);
+				int depth = 0;
+				for (Token *u = tok_next(lp); u != close && u->kind != TK_EOF; u = tok_next(u)) {
+					if (match_ch(u, '[') && (u->flags & TF_OPEN))
+						tok_ann(u) |= P1_UNEVAL_BRACKET;
+					if ((u->flags & TF_OPEN) && (match_ch(u, '(') || match_ch(u, '[') || match_ch(u, '{'))) {
+						depth++;
+						continue;
+					}
+					if (match_ch(u, ')') || match_ch(u, ']') || match_ch(u, '}')) {
+						depth--;
+						continue;
+					}
+					if (depth == 0 && match_ch(u, ',')) break;
+				}
+			}
+			continue;
+		}
 		bool is_uneval = (t->flags & TF_SIZEOF) || (t->tag & TT_TYPEOF);
 		if (!is_uneval && t->kind == TK_IDENT && t->len == 18 &&
 		    memcmp(tok_loc(t), "__builtin_offsetof", 18) == 0)
@@ -2128,92 +2201,345 @@ static void p1_mark_uneval_brackets(void) {
 	}
 }
 
-// Find first tracked local array ident in [start,end) for commutative
-// subscripts `idx[arr]` and index-side forms like `idx[(1 ? a : b)]`.
-static Token *bounds_find_array_ident(Token *start, Token *end) {
-	for (Token *t = start; t && t != end && t->kind != TK_EOF;) {
-		if ((t->flags & TF_OPEN) && tok_match(t)) {
-			Token *cl = tok_match(t);
-			Token *hit = bounds_find_array_ident(tok_next(t), cl);
-			if (hit) return hit;
-			t = tok_next(cl);
-			continue;
-		}
-		if (t->kind == TK_IDENT && !is_known_typedef(t)) {
-			if (tok_idx(t) >= 1 &&
-			    (token_pool[tok_idx(t) - 1].tag & TT_MEMBER)) {
-				t = tok_next(t);
-				continue;
-			}
-			TypedefEntry *te = typedef_lookup(t);
-			if (te && !te->is_param && !te->is_enum_const &&
-			    (te->is_array || te->is_vla_var))
-				return t;
-		}
-		t = tok_next(t);
-	}
-	return NULL;
-}
-
 // -fbounds-check: if `tok` is `[` of an expression subscript `arr[idx]`
 // where `arr` (last_emitted) is a known local array variable, emit
 // `[__prism_bchk((size_t)(idx), sizeof(arr)/sizeof(arr[0]))]` and return
 // the token after `]`. Returns NULL otherwise (including when the feature
 // is off, the bracket is a declarator bracket, or the predecessor is not
 // a tracked array). Index expressions are not rewritten recursively in v1.
+// Returns true if `t` is an identifier token that names a tracked
+// local/global array (or VLA variable). Parameters and enum constants
+// decay/are-not-arrays, so they're excluded.
+static bool is_tracked_array_name(Token *t) {
+	if (!t || t->kind != TK_IDENT) return false;
+	TypedefEntry *te = typedef_lookup(t);
+	if (!te || te->is_param || te->is_enum_const) return false;
+	return te->is_array || te->is_vla_var;
+}
+
+// Walk typedef chain like typedef_lookup(), but answer whether any in-scope
+// entry marks this identifier as a pointer declarator — used to distinguish
+// `ptr[trail[i]]` (integer index expr) from commutative `idx[arr]`.
+static bool bounds_expr_base_is_pointer(Token *tok) {
+	if (!tok || tok->kind != TK_IDENT) return false;
+	unsigned c0 = tok->ch0, tl = tok->len;
+	if (!(typedef_table.bloom & (1ULL << ((c0 ^ tl) & 63)))) return false;
+	int idx = typedef_get_index(tok_loc(tok), tok->len);
+	uint32_t cur = tok_idx(tok);
+	while (idx >= 0) {
+		TypedefEntry *e = &typedef_table.entries[idx];
+		if (e->token_index <= cur && cur >= e->scope_open_idx && cur < e->scope_close_idx &&
+		    !e->is_struct_tag && e->is_ptr)
+			return true;
+		idx = e->prev_index;
+	}
+	return false;
+}
+
+// Find first tracked local array ident in [start,end) for commutative
+// subscripts `idx[arr]` and index-side forms like `idx[(1 ? a : b)]`.
+static Token *bounds_find_array_ident(Token *start, Token *end) {
+	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
+		if (t->kind != TK_IDENT || is_known_typedef(t))
+			continue;
+		if (tok_idx(t) >= 1 && (token_pool[tok_idx(t) - 1].tag & TT_MEMBER))
+			continue;
+		TypedefEntry *te = typedef_lookup(t);
+		if (te && !te->is_param && !te->is_enum_const &&
+		    (te->is_array || te->is_vla_var))
+			return t;
+	}
+	return NULL;
+}
+
 static Token *try_bounds_check_subscript(Token *tok) {
 	if (!FEAT(F_BOUNDS_CHECK)) return NULL;
 	if (!match_ch(tok, '[') || !(tok->flags & TF_OPEN) || !tok_match(tok)) return NULL;
 	if (tok->flags & TF_C23_ATTR) return NULL;
 	if (tok_ann(tok) & (P1_DECL_BRACKET | P1_UNEVAL_BRACKET)) return NULL;
 	if (!last_emitted) return NULL;
-	Token *close = tok_match(tok);
-	if (!close) return NULL;
-	Token *name_tok = last_emitted;
-	// Look through any number of paren levels: `((...(a)...))[i]` — at
-	// each step name_tok is a `)`; descend into the innermost `(...)`.
-	// Guard each level against `f(x)[i]` / `sizeof(x)[i]` / casts by
-	// requiring the outermost `(` not follow a value-producing token.
-	while (match_ch(name_tok, ')') && tok_match(name_tok)) {
-		Token *open = tok_match(name_tok);
-		if (tok_idx(open) >= 1) {
-			Token *before = &token_pool[tok_idx(open) - 1];
-			if (before->kind == TK_IDENT || before->kind == TK_NUM ||
-			    match_ch(before, ')') || match_ch(before, ']'))
-				break;
+
+	// Parenthesized index commutative form: `(idx)[arr]`. The peel loop
+	// below may stop early when '(' is preceded by a value token (e.g.
+	// `5` before `(i)` on a new statement), leaving last_emitted as `)`
+	// so `is_tracked_array_name` is false and the guard is skipped —
+	// ISO C treats `(i)[b]` the same as `i[b]` (commutative subscript).
+	if (tok_idx(tok) >= 1) {
+		Token *rp = &token_pool[tok_idx(tok) - 1];
+		if (match_ch(rp, ')') && tok_match(rp)) {
+			Token *op = tok_match(rp);
+			Token *idx = tok_next(op);
+			if (idx && idx->kind == TK_IDENT && tok_next(idx) == rp) {
+				Token *rb_close = tok_match(tok);
+				Token *inner = tok_next(tok);
+				if (rb_close && inner && tok_next(inner) == rb_close &&
+				    is_tracked_array_name(inner) &&
+				    !is_tracked_array_name(idx))
+					error_tok(tok,
+						  "commutative subscript 'idx[arr]' bypasses "
+						  "-fbounds-check; rewrite as 'arr[idx]'");
+			}
 		}
-		Token *inner = tok_next(open);
-		if (!inner) break;
-		// Case: content is a single identifier.
-		if (inner->kind == TK_IDENT && tok_next(inner) == name_tok) {
-			name_tok = inner;
+	}
+
+	// Commutative-subscript bypass check: ISO C defines `idx[arr]` as
+	// equivalent to `arr[idx]`. When the array side hides *inside* the
+	// brackets, the normal array-on-the-left pattern-match below fails
+	// and the subscript is emitted raw — silently skipping the
+	// -fbounds-check trap. Detect and hard-error on this form when the
+	// bracket body is a single tracked array identifier (stripping paren
+	// layers). Only fires when last_emitted (the would-be index side)
+	// is not itself a tracked array, so normal forms like `arr[arr2]`
+	// fall through to the regular wrap path.
+	bool comma_resolved = false;
+	{
+		Token *close_scan = tok_match(tok);
+		Token *inner = tok_next(tok);
+		Token *iclose = close_scan;
+		/* ISO `idx[(e1, arr)]` == `idx[arr]`; unwrap comma tail so the
+		 * main path sees the array ident.  If the last operand is the
+		 * tracked array, this is not a commutative *bypass* (it is
+		 * `arr` with index `idx` in disguise) — skip hard-error diags. */
+		if (match_ch(inner, '(') && (inner->flags & TF_OPEN)) {
+			Token *pclose = tok_match(inner);
+			if (pclose && comma_expr_has_comma(inner, pclose)) {
+				Token *lastop = last_comma_operand(inner, pclose);
+				if (lastop && tok_next(lastop) == pclose) {
+					inner = lastop;
+					iclose = pclose;
+					if (is_tracked_array_name(lastop))
+						comma_resolved = true;
+				}
+			}
+		}
+		if (!comma_resolved) {
+		while (inner != iclose && match_ch(inner, '(') && (inner->flags & TF_OPEN) &&
+		       tok_match(inner) && tok_next(tok_match(inner)) == iclose) {
+			iclose = tok_match(inner);
+			inner = tok_next(inner);
+		}
+		if (inner != iclose && tok_next(inner) == iclose &&
+		    is_tracked_array_name(inner)) {
+			// Strip paren layers off last_emitted the same way the
+			// main paren-walk does below, to recognize `(arr)[arr2]`
+			// as the normal form (not commutative).
+			Token *le = last_emitted;
+			while (match_ch(le, ')') && tok_match(le)) {
+				Token *open = tok_match(le);
+				if (tok_idx(open) >= 1) {
+					Token *before = &token_pool[tok_idx(open) - 1];
+					if (before->kind == TK_IDENT || before->kind == TK_NUM ||
+					    match_ch(before, ')') || match_ch(before, ']'))
+						break;
+				}
+				Token *ii = tok_next(open);
+				if (ii && ii->kind == TK_IDENT && tok_next(ii) == le) {
+					le = ii; break;
+				}
+				break;
+			}
+			if (!is_tracked_array_name(le)) {
+				if (!bounds_expr_base_is_pointer(le))
+					error_tok(tok,
+					    "commutative subscript 'idx[arr]' bypasses "
+					    "-fbounds-check; rewrite as 'arr[idx]'");
+			}
+		} else if (inner != iclose && inner && inner->kind == TK_IDENT) {
+			/* Indexed element inside brackets: `idx[arr[0]]`. The bracket
+			 * body is not a bare `arr` token before `]`, so the guard
+			 * above misses it — same commutative bypass as `idx[arr]`.
+			 * Peel postfix `[...]` chunks from the innermost identifier until
+			 * we consume tokens up to `iclose`; if that names a tracked array
+			 * root and `last_emitted` is not a tracked array.  Pointer bases
+			 * (`uint32_t *cache` in `cache[trail[i]]`) are not commutative
+			 * integer-left forms — skip via is_ptr. */
+			Token *array_root = NULL;
+			Token *scan = inner;
+			while (scan && scan != iclose) {
+				if (scan->kind != TK_IDENT)
+					break;
+				Token *lb = tok_next(scan);
+				if (!lb || !match_ch(lb, '[') || !(lb->flags & TF_OPEN) ||
+				    !tok_match(lb))
+					break;
+				array_root = scan;
+				Token *rb = tok_match(lb);
+				if (!rb)
+					break;
+				scan = tok_next(rb);
+			}
+			if (scan == iclose && array_root &&
+			    is_tracked_array_name(array_root)) {
+				Token *le = last_emitted;
+				while (match_ch(le, ')') && tok_match(le)) {
+					Token *open = tok_match(le);
+					if (tok_idx(open) >= 1) {
+						Token *before = &token_pool[tok_idx(open) - 1];
+						if (before->kind == TK_IDENT ||
+						    before->kind == TK_NUM ||
+						    match_ch(before, ')') ||
+						    match_ch(before, ']'))
+							break;
+					}
+					Token *ii = tok_next(open);
+					if (ii && ii->kind == TK_IDENT &&
+					    tok_next(ii) == le) {
+						le = ii;
+						break;
+					}
+					break;
+				}
+				if (!is_tracked_array_name(le)) {
+					if (!bounds_expr_base_is_pointer(le))
+						error_tok(tok,
+						    "commutative subscript 'idx[arr]' bypasses "
+						    "-fbounds-check; rewrite as 'arr[idx]'");
+				}
+			}
+		}
+		} // !comma_resolved
+	}
+	if (comma_resolved)
+		error_tok(tok,
+			  "-fbounds-check: comma operand subscript idx[(...,arr)] must be "
+			  "rewritten as arr[idx]");
+	{
+		Token *rb = tok_match(tok);
+		if (rb && last_emitted && last_emitted->kind == TK_IDENT) {
+			bool memb = tok_idx(last_emitted) >= 1 &&
+				    (token_pool[tok_idx(last_emitted) - 1].tag & TT_MEMBER);
+			bool left_ok_scan = false;
+			if (!memb && !is_known_typedef(last_emitted)) {
+				TypedefEntry *tel = typedef_lookup(last_emitted);
+				left_ok_scan = tel && !tel->is_param && !tel->is_enum_const &&
+					       (tel->is_array || tel->is_vla_var);
+			}
+			if (!left_ok_scan &&
+			    bounds_find_array_ident(tok_next(tok), rb))
+				error_tok(tok,
+					  "bounds-check (commutative): array name in index position cannot be verified "
+					  "(rewrite as array[index], or disable -fbounds-check for this expression)");
+		}
+	}
+	Token *name_tok = last_emitted;
+	// For multi-dim subscripts `a[i][j]`, the inner `[` is preceded in
+	// the token pool by `]` (close of outer subscript) while `last_emitted`
+	// still points at `a` (since the outer wrap emitted synthetic tokens,
+	// not pool tokens).  To detect the true predecessor we switch to the
+	// pool neighbor when it differs and is structurally relevant.
+	if (tok_idx(tok) >= 1) {
+		Token *pool_prev = &token_pool[tok_idx(tok) - 1];
+		if (pool_prev != last_emitted &&
+		    (match_ch(pool_prev, ']') || match_ch(pool_prev, ')') ||
+		     pool_prev->kind == TK_IDENT))
+			name_tok = pool_prev;
+	}
+	// Peel paren layers and inner subscripts to reach the root array
+	// identifier.  Each `]` peeled increments `dim_depth` so the emitted
+	// bound is `sizeof(arr[0]...[0])/sizeof(arr[0]...[0][0])` with the
+	// right number of `[0]` subscripts — this is what allows `a[i][j]`
+	// and `(a)[i][j]` to wrap both indices.
+	int dim_depth = 0;
+	while (1) {
+		// ( ... ): descend if the `(` is not a call/cast/sizeof context
+		// (predecessor not value-producing).
+		if (match_ch(name_tok, ')') && tok_match(name_tok)) {
+			Token *open = tok_match(name_tok);
+			if (tok_idx(open) >= 1) {
+				Token *bp = &token_pool[tok_idx(open) - 1];
+				if (bp->kind == TK_IDENT || bp->kind == TK_NUM ||
+				    match_ch(bp, ')') || match_ch(bp, ']'))
+					break;
+			}
+			// Case A: ( a ) — a single identifier.
+			Token *inner = tok_next(open);
+			if (!inner) break;
+			if (inner->kind == TK_IDENT && tok_next(inner) == name_tok) {
+				name_tok = inner;
+				break;
+			}
+			// Case B: ( ( ... ) ) — nested paren.
+			if (match_ch(inner, '(') && tok_match(inner) &&
+			    tok_next(tok_match(inner)) == name_tok) {
+				name_tok = tok_match(inner);
+				continue;
+			}
+			// Case C: ( expr[...] ) — descend to the trailing `]`.
+			if (tok_idx(name_tok) >= 1) {
+				Token *inner_last = &token_pool[tok_idx(name_tok) - 1];
+				if (match_ch(inner_last, ']')) {
+					name_tok = inner_last;
+					continue;
+				}
+			}
 			break;
 		}
-		// Case: content is itself a parenthesized group with nothing after it.
-		if (match_ch(inner, '(') && tok_match(inner) &&
-		    tok_next(tok_match(inner)) == name_tok) {
-			name_tok = tok_match(inner);
+		// [ ... ]: multi-dim step.
+		if (match_ch(name_tok, ']') && tok_match(name_tok)) {
+			Token *open_br = tok_match(name_tok);
+			if (tok_ann(open_br) & (P1_DECL_BRACKET | P1_UNEVAL_BRACKET))
+				break;
+			if (open_br->flags & TF_C23_ATTR) break;
+			if (tok_idx(open_br) < 1) break;
+			Token *before = &token_pool[tok_idx(open_br) - 1];
+			if (!(before->kind == TK_IDENT || match_ch(before, ')') ||
+			      match_ch(before, ']')))
+				break;
+			name_tok = before;
+			dim_depth++;
 			continue;
 		}
 		break;
 	}
-	bool member_access =
-	    name_tok->kind == TK_IDENT && tok_idx(name_tok) >= 1 &&
-	    (token_pool[tok_idx(name_tok) - 1].tag & TT_MEMBER);
-
-	TypedefEntry *te_left = NULL;
-	bool left_ok = false;
-	if (!member_access && name_tok->kind == TK_IDENT && !is_known_typedef(name_tok)) {
-		te_left = typedef_lookup(name_tok);
-		left_ok = te_left && !te_left->is_param && !te_left->is_enum_const &&
-			  (te_left->is_array || te_left->is_vla_var);
+	if (name_tok->kind != TK_IDENT) return NULL;
+	if (is_known_typedef(name_tok)) return NULL;
+	// Reject struct/union member subscripts like `s.arr[i]` and `p->arr[i]`.
+	// The identifier names a struct field whose size is unrelated to any
+	// local variable that happens to share the name — wrapping with
+	// sizeof(local_arr) would be a silent false negative.
+	if (tok_idx(name_tok) >= 1 &&
+	    (token_pool[tok_idx(name_tok) - 1].tag & TT_MEMBER))
+		return NULL;
+	// Class-closing guard: if name_tok is preceded by a type-like token or
+	// a pointer-declarator '*', we're looking at a declarator (e.g.
+	// `int g[20]`, `MyType g[20]`, `struct S *g[20]`, `const int g[20]`),
+	// not an expression subscript. This catches declarators in contexts
+	// where Phase 1 doesn't pre-tag the bracket: nested prototypes inside
+	// a function body, function-pointer parameters, function-pointer
+	// typedefs, struct/union fields that are function pointers. Without
+	// this guard we would emit `int g[__prism_bchk(20, sizeof(g)/sizeof(g[0]))]`
+	// which is either a semantic error (VLA mismatch) or a spurious trap.
+	// Distinguish pointer-declarator '*' from unary-deref '*': unary-deref
+	// is preceded by a value-producing token or is at statement start.
+	if (tok_idx(name_tok) >= 1) {
+		Token *pv = &token_pool[tok_idx(name_tok) - 1];
+		if (pv->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF))
+			return NULL;
+		if (match_ch(pv, '*') && !(pv->flags & TF_OPEN) && tok_idx(pv) >= 1) {
+			Token *pp = &token_pool[tok_idx(pv) - 1];
+			// Pointer-declarator '*' follows a type/qualifier/'*'/'('
+			// that opens a declarator grouping. Unary-deref '*' follows
+			// value-producing tokens (IDENT/NUM/STR/')'/']'), operators,
+			// or statement separators.
+			bool is_decl_star =
+			    (pp->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)) ||
+			    (match_ch(pp, '*') && !(pp->flags & TF_OPEN)) ||
+			    (match_ch(pp, '(') && (pp->flags & TF_OPEN));
+			if (is_decl_star) return NULL;
+		}
 	}
+	TypedefEntry *te = typedef_lookup(name_tok);
+	if (!te || te->is_param || te->is_enum_const) return NULL;
+	if (!te->is_array && !te->is_vla_var) return NULL;
 
-	if (!left_ok && bounds_find_array_ident(tok_next(tok), close))
-		error_tok(tok,
-			  "bounds-check (commutative): array name in index position cannot be verified "
-			  "(rewrite as array[index], or disable -fbounds-check for this expression)");
-	if (!left_ok)
+	// Multi-dim rank guard: only wrap when the current subscript level
+	// lies within the array's actual rank.  For `int *p[10]; p[0][i]`,
+	// rank=1 so dim_depth=1 exceeds it — the inner subscript addresses
+	// memory through a POINTER, whose length isn't knowable from `p`.
+	// Without this guard, the wrap would emit `sizeof(p[0])/sizeof(p[0][0])`
+	// which equals sizeof(ptr)/sizeof(elem) — a spurious bound.
+	if (te->array_rank > 0 && te->array_rank != ARRAY_RANK_WRAP_ALL &&
+	    dim_depth >= te->array_rank)
 		return NULL;
 
 	// Skip unary `&arr[i]`: taking address is legal through index == size
@@ -2236,6 +2562,7 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	}
 
 	Token *arr_tok = name_tok;
+	Token *close = tok_match(tok);
 	OUT_LIT("[__prism_bchk((__prism_bchk_size_t)(");
 	// Recurse into index expression so nested subscripts (arr[m[i]]),
 	// stmt-exprs, and further balanced groups are also bounds-checked.
@@ -2255,12 +2582,20 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	}
 	OUT_LIT("), sizeof(");
 	out_str(tok_loc(arr_tok), arr_tok->len);
+	for (int d = 0; d < dim_depth; d++) OUT_LIT("[0]");
 	OUT_LIT(")/sizeof(");
 	out_str(tok_loc(arr_tok), arr_tok->len);
-	OUT_LIT("[0]))]");
+	for (int d = 0; d <= dim_depth; d++) OUT_LIT("[0]");
+	OUT_LIT("))]");
 	return tok_next(close);
 }
 
+// Walk a balanced token group between matching delimiters, optionally emitting.
+// Shared tail for walk_balanced / walk_balanced_orelse: enum-body defer
+// shadow queueing + defense-in-depth rejection of stray `defer` inside
+// balanced groups + raw-keyword stripping. Advances `*t` and returns true
+// if the token was consumed (caller should `continue`); returns false if
+// the caller should handle `t` itself (e.g. fall through to tok_next).
 // Walk a balanced token group between matching delimiters, optionally emitting.
 // Shared tail for walk_balanced / walk_balanced_orelse: enum-body defer
 // shadow queueing + defense-in-depth rejection of stray `defer` inside
@@ -3563,7 +3898,7 @@ static bool process_const_orelse_decl(Token **tok_p, Token *orelse_tok,
 			  "(return/break/goto), typeof_unqual, or an "
 			  "explicit type name");
 
-	if (type->is_vla || decl->is_vla)
+	if (type->is_vla || decl->is_vla || type->type_vm)
 		error_tok(orelse_tok,
 			  "orelse on a const-qualified variably-modified type "
 			  "would duplicate the type specifier, causing VLA "
@@ -3631,7 +3966,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		if (!decl.end || !decl.var_name) {
 			if (!first_decl) {
 				if (need_type_emit) {
-					if ((type->has_typeof || type->has_atomic) && type->is_vla)
+					if ((type->has_typeof || type->has_atomic) &&
+					    (type->is_vla || type->type_vm))
 						error_tok(tok, "multi-declarator with variably-modified "
 							  "type specifier requires declaration split which "
 							  "would double-evaluate VLA size expressions; "
@@ -3683,7 +4019,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		if (need_type_emit) {
 			// Splitting a typeof VLA re-emits the type specifier, causing
 			// the VLA dimension to be evaluated twice (ISO C11 §6.7.2.5).
-			if ((type->has_typeof || type->has_atomic) && type->is_vla)
+			if ((type->has_typeof || type->has_atomic) &&
+			    (type->is_vla || type->type_vm))
 				error_tok(decl_start, "multi-declarator with variably-modified "
 					  "type specifier requires declaration split which "
 					  "would double-evaluate VLA size expressions; "
@@ -3752,7 +4089,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		// Step 4: Emit declarator & initializer
 		bool effective_vla = (decl.is_vla && (!decl.paren_pointer || decl.paren_array)) || (type->is_vla && !decl.is_pointer);
 		bool is_aggregate =
-		    (decl.is_array && (!decl.paren_pointer || decl.paren_array)) || ((type->is_struct || type->is_typedef) && !decl.is_pointer);
+		    (decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
+		    ((type->is_struct || type->is_typedef || type->is_array) && !decl.is_pointer);
 		// Function types (via typedef) cannot be initialized — skip zero-init entirely.
 		bool is_func_type = is_typeof_func_type(type_start, type, &decl);
 		// Only queue memset when zeroinit feature is enabled.
@@ -3768,21 +4106,29 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 				    (type->has_typeof || (type->has_atomic && is_aggregate) || effective_vla ||
 				     is_union_type);
 
-		// const VLA cannot be safely memset — modifying a defined const
-		// object is UB (ISO C11 §6.7.3p6).  const on non-VLA typeof
-		// (e.g. typeof(const int)) produces a memset that compilers
-		// optimize to an initializer, so only reject VLAs.
+		// const + memset-required type is UB: modifying a defined const
+		// object is undefined behavior (ISO C11 §6.7.3p6), even when
+		// laundered through (void*). Reject the cases where memset is
+		// genuinely unavoidable — unions (C11 §6.7.9p21 doesn't cover
+		// union bytes past the first member), effective VLAs (runtime
+		// size), and _Atomic aggregates (sequenced stores required).
+		// These produce a real libc memset on a const object, poisoning
+		// TBAA and permitting silent reordering around the "init".
+		// typeof(const T) on small scalars historically folds to a
+		// direct store; we allow that path to preserve compatibility.
 		bool explicit_const = (type->has_const && !decl.is_func_ptr && !decl.is_pointer) || decl.is_const;
 		if (!explicit_const && !decl.is_func_ptr && !decl.is_pointer) {
 			for (Token *tc = type_start; tc && tc != type->end; tc = tok_next(tc))
 				if (is_const_typedef(tc)) { explicit_const = true; break; }
 		}
-		if (needs_memset && explicit_const && effective_vla)
+		if (needs_memset && explicit_const &&
+		    (is_union_type || effective_vla || (type->has_atomic && is_aggregate)))
 			error_tok(decl.var_name,
-				  "'const' variable requiring typeof/VLA memset cannot be "
-				  "safely zero-initialized (modifying a const object is "
-				  "undefined behavior); remove 'const' or use 'raw' to "
-				  "opt out of automatic initialization");
+				  "'const' variable requiring unavoidable memset "
+				  "(union, VLA, or _Atomic aggregate) cannot be safely "
+				  "zero-initialized: modifying a const object is "
+				  "undefined behavior. Remove 'const', provide an "
+				  "explicit initializer, or use 'raw' to opt out.");
 
 		// Volatile typedef / volatile member: propagate to type so memset uses byte loop.
 		if (needs_memset && !type->has_volatile && !decl.is_func_ptr && !decl.is_pointer) {
@@ -6431,6 +6777,37 @@ static void p1_register_param_shadows(Token *open, Token *close,
 					}
 				}
 		}
+		if (last_ident && scope_id < scope_tree_count) {
+			bool matched_ident = false;
+			for (int ix = typedef_get_index(tok_loc(last_ident), last_ident->len); ix >= 0;
+			     ix = typedef_table.entries[ix].prev_index) {
+				TypedefEntry *ee = &typedef_table.entries[ix];
+				if (ee->token_index == tok_idx(last_ident)) {
+					ee->is_param = true;
+					ee->is_array = false;
+					matched_ident = true;
+					break;
+				}
+			}
+			if (!matched_ident) {
+				TD_SCOPE_SAVE();
+				// scope_id 0 = file-scope prototype param list (see ';' handler);
+				// scope_tree[0] is never populated — caller sets td_scope_* to the
+				// '('..')' range before calling. Function-body params use sid > 0.
+				if (scope_id > 0 && scope_id < scope_tree_count) {
+					td_scope_open = scope_tree[scope_id].open_tok_idx;
+					td_scope_close = scope_tree[scope_id].close_tok_idx;
+				}
+				int pre_ct = typedef_table.count;
+				TYPEDEF_ADD_IDX(typedef_add_shadow(tok_loc(last_ident), last_ident->len, brace_depth),
+						last_ident);
+				TD_SCOPE_RESTORE();
+				if (typedef_table.count > pre_ct) {
+					typedef_table.entries[typedef_table.count - 1].is_param = true;
+					typedef_table.entries[typedef_table.count - 1].is_array = false;
+				}
+			}
+		}
 		if (t && match_ch(t, ',')) t = tok_next(t);
 	}
 }
@@ -7232,6 +7609,17 @@ static Token *p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func,
 	return stmt_expr_open;
 }
 
+static bool p1d_type_spec_has_nonempty_array_dims(Token *start, Token *end) {
+	for (Token *t = start; t && t != end; t = tok_next(t)) {
+		if (match_ch(t, '[') && (t->flags & TF_OPEN)) {
+			Token *nx = tok_next(t);
+			if (nx && !match_ch(nx, ']'))
+				return true;
+		}
+	}
+	return false;
+}
+
 // Probe a statement starting with a type-like token as a potential declaration.
 // Records typedef shadows (Phase 1C) and per-function decl entries (Phase 1D).
 // Read-only probe: does NOT advance the caller's token pointer.
@@ -7281,7 +7669,7 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 	if (braceless_close_idx > 0)
 		td_scope_close = braceless_close_idx;
 	Token *t = type.end;
-	bool vm_type = (type.has_typeof || type.has_atomic) && type.is_vla;
+	bool vm_type = (type.has_typeof || type.has_atomic) && (type.is_vla || type.type_vm);
 	bool any_would_memset = false;
 	while (t && !match_ch(t, ';') && !match_ch(t, '{') && t->kind != TK_EOF) {
 		// Per-declarator 'raw' skip (int x, raw arr[n];)
@@ -7371,29 +7759,67 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		// — this registers `int *a[10]` (array of pointers, is_pointer==true)
 		// while correctly excluding `int (*a)[10]` (pointer to array).
 		bool base_is_array_here = false;
+		uint8_t base_array_rank_here = 0;
 		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name &&
-		    !decl.is_array && !decl.is_pointer && !decl.is_func_ptr) {
+		    !decl.is_pointer && !decl.is_func_ptr) {
 			for (Token *bt = type_tok; bt && bt != type.end; bt = tok_next(bt))
-				if (is_array_typedef(bt)) { base_is_array_here = true; break; }
+				if (is_array_typedef(bt)) {
+					// Only flip `base_is_array_here` when the
+					// declarator itself is not an array —
+					// that flag governs array-var registration
+					// for the typedef-only form `T a;`. But
+					// always capture the typedef's rank so it
+					// can be added on top of a declarator-level
+					// array like `T m[3]` (combined rank).
+					if (!decl.is_array) base_is_array_here = true;
+					TypedefEntry *te = typedef_lookup(bt);
+					if (te) base_array_rank_here = te->array_rank;
+					break;
+				}
+			if (!base_is_array_here && (type.has_typeof || type.has_atomic) &&
+			    type.is_array)
+				base_is_array_here = true;
 		}
 		bool reg_as_array = decl.is_array && (!decl.paren_pointer || decl.paren_array);
-		// For file-scope registration, require at least one non-empty dim so
-		// sizeof(arr) is a complete type at use sites. Block-scope arrays
-		// always have complete size (C forbids local `int a[];`).
+		// Require sizeof(arr)/sizeof(arr[0]) to be valid at subscript sites:
+		// at least one non-empty `[]` dim, or an initializer that completes a
+		// tentative `[]` (e.g. `int g[] = {1,2,3};`). Applies at every scope —
+		// block-scope `extern T a[];` has incomplete type just like file-scope
+		// extern / tentative `T a[];`.
 		bool has_complete_dim = true;
-		if (reg_as_array && brace_depth == 0) {
+		if (reg_as_array) {
 			has_complete_dim = false;
+			// ISO C: array type is complete only if the *outer* (first) `[]` has
+			// a size; `int a[][10]` is still incomplete.
 			for (Token *dt = decl.var_name; dt && dt != decl.end; dt = tok_next(dt)) {
 				if (match_ch(dt, '[')) {
 					Token *nx = tok_next(dt);
-					if (nx && !match_ch(nx, ']')) { has_complete_dim = true; break; }
+					if (nx && !match_ch(nx, ']')) { has_complete_dim = true; }
+					break;
 				}
 			}
+			if (!has_complete_dim && match_ch(decl.end, '='))
+				has_complete_dim = true;
+		}
+		if (!reg_as_array && base_is_array_here) {
+			has_complete_dim = false;
+			for (Token *bt = type_tok; bt && bt != type.end; bt = tok_next(bt)) {
+				if (is_array_typedef(bt)) {
+					TypedefEntry *bte = typedef_lookup(bt);
+					if (bte && bte->is_array &&
+					    bte->array_dim_complete)
+						has_complete_dim = true;
+					break;
+				}
+			}
+			if (!has_complete_dim && (type.has_typeof || type.has_atomic) &&
+			    type.is_array &&
+			    p1d_type_spec_has_nonempty_array_dims(type_tok, type.end))
+				has_complete_dim = true;
 		}
 		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name &&
-		    (brace_depth > 0 ||
-		     (brace_depth == 0 && (reg_as_array || base_is_array_here) &&
-		      has_complete_dim)) &&
+		    (brace_depth > 0 || (brace_depth == 0 && (reg_as_array || base_is_array_here))) &&
+		    has_complete_dim &&
 		    (reg_as_array || base_is_array_here) && !decl.is_func_ptr) {
 			int pre = typedef_table.count;
 			if (!did_shadow) {
@@ -7402,8 +7828,48 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 			if (typedef_table.count > pre || did_shadow) {
 				TypedefEntry *e = &typedef_table.entries[typedef_table.count - 1];
 				e->is_array = true;
+				// Count declarator `[` dimensions so the
+				// bounds-check wrap can safely traverse only
+				// as many subscripts as the array actually has.
+				// Without this, `int *p[10]; p[0][i]` would be
+				// wrapped using `sizeof(p[0])/sizeof(p[0][0])`
+				// which equals sizeof(ptr)/sizeof(int) — a
+				// spurious trap on any valid pointer subscript.
+				int rank = 0;
+				Token *prev_bt = NULL;
+				for (Token *dt = decl.var_name; dt && dt != decl.end;) {
+					if (match_ch(dt, '[') && (dt->flags & TF_OPEN)) {
+						if (!array_bracket_closes_ptr_to_array(dt, prev_bt))
+							rank++;
+						Token *m = tok_match(dt);
+						dt = m ? tok_next(m) : tok_next(dt);
+						prev_bt = m;
+						continue;
+					}
+					prev_bt = dt;
+					dt = tok_next(dt);
+				}
+				// Typedef arrays: inherit rank from the resolved
+				// typedef so `typedef int T[3][4]; T a;` gets
+				// rank=2 (fully wrapped at both levels), and
+				// `typedef int Row[5]; Row m[3];` gets rank=2
+				// by summing declarator rank with base rank.
+				// Fallback to +1 when the base typedef's rank
+				// wasn't recorded (stale / chained older entry).
+				if (type.type_array_rank > 0) {
+					rank += (int)type.type_array_rank;
+				} else if (base_array_rank_here > 0) {
+					rank += (int)base_array_rank_here;
+				} else if (base_is_array_here) {
+					rank += 1;
+				}
+				if (rank > 15)
+					rank = ARRAY_RANK_WRAP_ALL;
+				e->array_rank = (uint8_t)rank;
+				e->array_dim_complete = has_complete_dim;
 			}
 		}
+
 
 		t = decl.end;
 		bool has_init = match_ch(t, '=');
@@ -7432,7 +7898,7 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		    !type.has_extern && !type.has_static &&
 		    type.has_register && type.has_atomic) {
 			bool is_aggregate = (decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
-				((type.is_struct || type.is_typedef) && !decl.is_pointer);
+				((type.is_struct || type.is_typedef || type.is_array) && !decl.is_pointer);
 			if (is_aggregate)
 				error_tok(decl.var_name,
 					  "'register _Atomic' aggregate cannot be safely "
@@ -7474,7 +7940,7 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 				bool p1d_cv_union = type.is_union && !decl.is_pointer;
 				bool would_memset = (!decl.is_pointer || decl.is_array) &&
 					(type.has_typeof || (type.has_atomic && ((decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
-					 ((type.is_struct || type.is_typedef) && !decl.is_pointer))) || type.is_vla || decl.is_vla ||
+					 ((type.is_struct || type.is_typedef || type.is_array) && !decl.is_pointer))) || type.is_vla || decl.is_vla ||
 					 p1d_cv_union);
 				if (excl && would_memset)
 					error_tok(decl.var_name,
@@ -7504,7 +7970,7 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		    !(saw_static || type.has_static || type.has_extern) &&
 		    !type.has_register && (!decl.is_pointer || decl.is_array) &&
 		    (type.has_typeof || (type.has_atomic && ((decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
-		     ((type.is_struct || type.is_typedef) && !decl.is_pointer))) ||
+		     ((type.is_struct || type.is_typedef || type.is_array) && !decl.is_pointer))) ||
 		     type.is_vla || decl.is_vla || p1d_is_union_type))
 			any_would_memset = true;
 

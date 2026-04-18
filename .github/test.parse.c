@@ -1339,45 +1339,83 @@ void test_duff_device_with_defer_at_top(void) {
 }
 
 
-#define TEST_FLT128_MAX 1.18973149535723176508575932662800702e+4932F128
-#define TEST_FLT128_MIN 3.36210314311209350626267781732175260e-4932F128
-#define TEST_FLT64_VAL 1.7976931348623157e+308F64
-#define TEST_FLT32_VAL 3.40282347e+38F32
-#define TEST_FLT16_VAL 6.5504e+4F16
-#define TEST_BF16_VAL 3.38953139e+38BF16
+/* C23 extended-float literals are not parsed by default macOS `cc` when building
+ * this harness; validate suffixes via prism_transpile_source instead of host
+ * compile-as-proof (CI: invalid suffix 'F128' / 'BF16' on clang without -std=c23). */
 
 #ifndef _MSC_VER
-void test_float128_suffix(void) {
-	// Intentional compile-as-proof check: these literal suffixes are validated
-	// by the host compiler during parsing, so successful compilation is the proof.
-	(void)TEST_FLT128_MAX;
-	(void)TEST_FLT128_MIN;
-	CHECK(1, "F128 float suffix parses");
+static void test_float128_suffix(void) {
+	const char *code =
+	    "void f(void) {\n"
+	    "    volatile _Float128 a = "
+	    "1.18973149535723176508575932662800702e+4932f128;\n"
+	    "    volatile _Float128 b = "
+	    "3.36210314311209350626267781732175260e-4932f128;\n"
+	    "    (void)a; (void)b;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "f128lit.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "F128 literal suffix: transpiles");
+	if (r.status == PRISM_OK && r.output)
+		CHECK(strstr(r.output, "f128") != NULL,
+		      "F128 literal suffix: preserved in output");
+	prism_free(&r);
 }
 #endif // _MSC_VER
 
-void test_float64_suffix(void) {
-	// Intentional compile-as-proof check for the F64 literal suffix.
-	(void)TEST_FLT64_VAL;
-	CHECK(1, "F64 float suffix parses");
+static void test_float64_suffix(void) {
+	const char *code =
+	    "void f(void) {\n"
+	    "    _Float64 x = 1.7976931348623157e+308F64;\n"
+	    "    (void)x;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "f64lit.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "F64 literal suffix: transpiles");
+	if (r.status == PRISM_OK && r.output)
+		CHECK(strstr(r.output, "F64") != NULL || strstr(r.output, "1.797") != NULL,
+		      "F64 literal suffix: present in output");
+	prism_free(&r);
 }
 
-void test_float32_suffix(void) {
-	// Intentional compile-as-proof check for the F32 literal suffix.
-	(void)TEST_FLT32_VAL;
-	CHECK(1, "F32 float suffix parses");
+static void test_float32_suffix(void) {
+	const char *code =
+	    "void f(void) {\n"
+	    "    _Float32 x = 3.40282347e+38F32;\n"
+	    "    (void)x;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "f32lit.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "F32 literal suffix: transpiles");
+	if (r.status == PRISM_OK && r.output)
+		CHECK(strstr(r.output, "F32") != NULL || strstr(r.output, "3.402") != NULL,
+		      "F32 literal suffix: present in output");
+	prism_free(&r);
 }
 
-void test_float16_suffix(void) {
-	// Intentional compile-as-proof check for the F16 literal suffix.
-	(void)TEST_FLT16_VAL;
-	CHECK(1, "F16 float suffix parses");
+static void test_float16_suffix(void) {
+	const char *code =
+	    "void f(void) {\n"
+	    "    _Float16 x = 6.5504e+4F16;\n"
+	    "    (void)x;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "f16lit.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "F16 literal suffix: transpiles");
+	if (r.status == PRISM_OK && r.output)
+		CHECK(strstr(r.output, "F16") != NULL || strstr(r.output, "6.550") != NULL,
+		      "F16 literal suffix: present in output");
+	prism_free(&r);
 }
 
-void test_bf16_suffix(void) {
-	// Intentional compile-as-proof check for the BF16 literal suffix.
-	(void)TEST_BF16_VAL;
-	CHECK(1, "BF16 float suffix parses");
+static void test_bf16_suffix(void) {
+	const char *code =
+	    "void f(void) {\n"
+	    "    __bf16 x = 3.38953139e+38BF16;\n"
+	    "    (void)x;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "bf16lit.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "BF16 literal suffix: transpiles");
+	if (r.status == PRISM_OK && r.output)
+		CHECK(strstr(r.output, "BF16") != NULL || strstr(r.output, "3.389") != NULL,
+		      "BF16 literal suffix: present in output");
+	prism_free(&r);
 }
 
 

@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 #ifndef _WIN32
 #include <sys/resource.h>
 #include <pthread.h>
@@ -366,12 +367,37 @@ int main(void) {
 	};
 	int n = sizeof(suites) / sizeof(suites[0]);
 
-	printf("=== PRISM TEST SUITE (%d suites, parallel) ===\n", n);
+	const char *suite_only = getenv("PRISM_SUITE_ONLY");
+	int suite_idx[sizeof(suites) / sizeof(suites[0])];
+	for (int i = 0; i < n; i++)
+		suite_idx[i] = i;
+	int n_run = n;
+	if (suite_only && suite_only[0]) {
+		n_run = 0;
+		for (int i = 0; i < n; i++) {
+			if (!strcmp(suites[i].name, suite_only))
+				suite_idx[n_run++] = i;
+		}
+		if (n_run == 0) {
+			fprintf(stderr, "PRISM_SUITE_ONLY: no suite named \"%s\"\n",
+				suite_only);
+			return 2;
+		}
+	}
+
+	if (suite_only && suite_only[0])
+		printf("=== PRISM TEST SUITE (%d suites, filtered to \"%s\") ===\n",
+		       n_run, suite_only);
+	else
+		printf("=== PRISM TEST SUITE (%d suites, parallel) ===\n", n);
 
 #ifndef _WIN32
 	struct timeval t0, t1;
 	gettimeofday(&t0, NULL);
 
+	bool suite_serial = getenv("PRISM_SUITE_SERIAL") != NULL;
+
+	if (!suite_serial) {
 	pthread_t threads[sizeof(suites) / sizeof(suites[0])];
 	// Force an 8 MiB stack per worker.  musl's default pthread stack is
 	// 128 KiB, which the recursive parser + deep test inputs overflow (seen
@@ -381,36 +407,58 @@ int main(void) {
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);
 	pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
-	for (int i = 0; i < n; i++)
-		pthread_create(&threads[i], &attr, suite_thread, &suites[i]);
+	for (int j = 0; j < n_run; j++)
+		pthread_create(&threads[j], &attr, suite_thread,
+			       &suites[suite_idx[j]]);
 	pthread_attr_destroy(&attr);
-	for (int i = 0; i < n; i++)
-		pthread_join(threads[i], NULL);
+	for (int j = 0; j < n_run; j++)
+		pthread_join(threads[j], NULL);
+	} else {
+		for (int j = 0; j < n_run; j++) {
+			int si = suite_idx[j];
+			struct timeval st0, st1;
+			gettimeofday(&st0, NULL);
+			passed = failed = total = 0;
+			suites[si].func();
+			suites[si].passed = passed;
+			suites[si].failed = failed;
+			suites[si].total = total;
+			gettimeofday(&st1, NULL);
+			suites[si].elapsed =
+			    (st1.tv_sec - st0.tv_sec) +
+			    (st1.tv_usec - st0.tv_usec) / 1e6;
+		}
+	}
 
 	gettimeofday(&t1, NULL);
 	double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_usec - t0.tv_usec) / 1e6;
 #else
 	// Windows: run serially
-	for (int i = 0; i < n; i++) {
+	for (int j = 0; j < n_run; j++) {
+		int si = suite_idx[j];
 		passed = failed = total = 0;
-		suites[i].func();
-		suites[i].passed = passed;
-		suites[i].failed = failed;
-		suites[i].total = total;
+		suites[si].func();
+		suites[si].passed = passed;
+		suites[si].failed = failed;
+		suites[si].total = total;
 	}
 	double elapsed = 0;
 #endif
 
 	int total_pass = 0, total_fail = 0, total_tests = 0;
-	for (int i = 0; i < n; i++) {
-		total_pass += suites[i].passed;
-		total_fail += suites[i].failed;
-		total_tests += suites[i].total;
+	for (int j = 0; j < n_run; j++) {
+		int si = suite_idx[j];
+		total_pass += suites[si].passed;
+		total_fail += suites[si].failed;
+		total_tests += suites[si].total;
 	}
 
 	printf("\n--- Suite Timing ---\n");
-	for (int i = 0; i < n; i++)
-		printf("  %-10s %4d tests  %5.2fs\n", suites[i].name, suites[i].total, suites[i].elapsed);
+	for (int j = 0; j < n_run; j++) {
+		int si = suite_idx[j];
+		printf("  %-10s %4d tests  %5.2fs\n", suites[si].name,
+		       suites[si].total, suites[si].elapsed);
+	}
 
 	printf("\n========================================\n");
 	printf("TOTAL: %d tests, %d passed, %d failed", total_tests, total_pass, total_fail);
