@@ -1753,6 +1753,25 @@ static void test_raw_return_type_defer_leak(void) {
 	}
 }
 
+static void test_raw_flatten_define_preserves_string_with_raw_token(void) {
+	const char *code =
+	    "#define ERROR_MSG \"failed raw data processing\"\n"
+	    "#include <stddef.h>\n"
+	    "void g(void) { const char *s = ERROR_MSG; (void)s; }\n";
+	char *path = create_temp_file(code);
+	CHECK(path != NULL, "raw define literal: create temp file");
+	PrismFeatures f = prism_defaults();
+	f.flatten_headers = false;
+	PrismResult r = prism_transpile_file(path, f);
+	unlink(path);
+	free(path);
+	CHECK_EQ(r.status, PRISM_OK, "raw define literal: transpiles OK");
+	if (r.output)
+		CHECK(strstr(r.output, "\"failed raw data processing\"") != NULL,
+		      "raw define literal: substring inside string preserved");
+	prism_free(&r);
+}
+
 void run_raw_tests(void) {
 	printf("\n=== RAW KEYWORD TESTS ===\n");
 
@@ -1882,4 +1901,6 @@ void run_raw_tests(void) {
 
 	// raw leaking in return-value temp via emit_token_range
 	test_raw_return_type_defer_leak();
+
+	test_raw_flatten_define_preserves_string_with_raw_token();
 }

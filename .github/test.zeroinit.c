@@ -4258,6 +4258,41 @@ static void test_case_paren_expr_zeroinit(void) {
 	}
 }
 
+static void test_zeroinit_struct_field_name_like_volatile_typedef(void) {
+	const char *src =
+	    "typedef volatile int v_int;\n"
+	    "struct Safe { int v_int; };\n"
+	    "void f(void) {\n"
+	    "    const struct Safe obj;\n"
+	    "    (void)obj;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(src, "zi_field_typedef.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "zi field vs typedef name: transpiles");
+	if (r.output)
+		CHECK(strstr(r.output, "cannot be safely zero-initialized") == NULL,
+		      "zi field vs typedef: no false const+memset");
+	prism_free(&r);
+}
+
+static void test_zeroinit_typeof_unqual_union_const(void) {
+	PrismResult r = prism_transpile_source(
+	    "void f(void) {\n"
+	    "    const typeof_unqual(union { int a; char b[64]; }) payload;\n"
+	    "    (void)payload;\n"
+	    "}\n",
+	    "zi_tuq_union.c", prism_defaults());
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "__builtin_memset((void*)&payload") == NULL &&
+			      strstr(r.output, "__builtin_memset((void *)&payload") == NULL,
+		      "zi tuq union: no memset through const union");
+	} else {
+		CHECK(r.status != PRISM_OK ||
+			      (r.error_msg && strstr(r.error_msg, "const") != NULL),
+		      "zi tuq union: reject or safe emit");
+	}
+	prism_free(&r);
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
@@ -4270,6 +4305,8 @@ void run_zeroinit_tests(void) {
 	test_zeroinit_qualifiers();
 	test_zeroinit_in_scopes();
 	test_zeroinit_with_defer();
+	test_zeroinit_struct_field_name_like_volatile_typedef();
+	test_zeroinit_typeof_unqual_union_const();
 	GNUC_ONLY(test_zeroinit_typeof());
 	test_zeroinit_enum_array_size();
 	NOMSVC_ONLY(test_zeroinit_alignas_array());

@@ -104,6 +104,23 @@ static void test_aur_for_init(void) {
 	prism_free(&r);
 }
 
+static void test_aur_for_init_comma_exit_no_unreachable_in_clause(void) {
+	PrismFeatures f = prism_defaults();
+	f.auto_unreachable = true;
+	PrismResult r = prism_transpile_source(
+	    "#include <stdlib.h>\n"
+	    "void f(void) {\n"
+	    "  for (int x = (exit(0), 0); ; ) {}\n"
+	    "}\n",
+	    "aur_for_comma_exit.c", f);
+	CHECK_EQ(r.status, PRISM_OK, "aur for-init comma-exit: transpiles OK");
+	if (r.output)
+		CHECK(strstr(r.output, "for (int x = (exit(0), 0); __builtin_unreachable()") ==
+			      NULL,
+		      "aur for-init comma-exit: no unreachable in for condition slot");
+	prism_free(&r);
+}
+
 // ATK-5: Noreturn in if condition: if(exit(1)) {}
 // Guard: in_ctrl_paren()
 static void test_aur_if_cond(void) {
@@ -1206,6 +1223,7 @@ static void run_auto_unreachable_tests(void) {
 	test_aur_comma_operator();
 	test_aur_ternary_noreturn();
 	test_aur_for_init();
+	test_aur_for_init_comma_exit_no_unreachable_in_clause();
 	test_aur_if_cond();
 	test_aur_file_scope();
 	test_aur_shadow_var();

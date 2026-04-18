@@ -191,6 +191,25 @@ static void test_as_multi_declarator(void) {
 	prism_free(&r);
 }
 
+static void test_as_multi_decl_runtime_scalar_second(void) {
+	PrismFeatures f = prism_defaults();
+	f.bounds_check = false;
+	f.auto_static = true;
+	const char *code =
+	    "volatile int r(void);\n"
+	    "void f(void) {\n"
+	    "    const int a[2] = { 1, 2 }, b = r();\n"
+	    "    (void)a; (void)b;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "as_multi_rt.c", f);
+	CHECK_EQ(r.status, PRISM_OK, "as multi-decl runtime scalar: transpiles OK");
+	if (r.output)
+		CHECK(strstr(r.output, "static const int a[2] = { 1, 2 }, b = r()") ==
+			      NULL,
+		      "as multi-decl runtime scalar: no static prefix on whole line");
+	prism_free(&r);
+}
+
 static void test_as_no_init(void) {
 	PrismFeatures f = prism_defaults(); f.bounds_check = false;
 	const char *code =
@@ -818,6 +837,7 @@ void run_autostatic_tests(void) {
 	test_as_file_scope();
 	test_as_not_const();
 	test_as_multi_declarator();
+	test_as_multi_decl_runtime_scalar_second();
 	test_as_no_init();
 	test_as_raw_excluded();
 	test_as_disabled_flag();

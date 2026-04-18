@@ -2421,6 +2421,17 @@ typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool i
 				return;
 		}
 	}
+	if (kind == TDK_SHADOW || kind == TDK_VLA_VAR) {
+		int existing = typedef_get_index(name, len);
+		if (existing >= 0) {
+			TypedefEntry *prev = &typedef_table.entries[existing];
+			if (prev->scope_depth == scope_depth &&
+			    prev->scope_open_idx == td_scope_open && prev->scope_close_idx == td_scope_close &&
+			    prev->is_shadow == (kind == TDK_SHADOW) &&
+			    prev->is_vla_var == (kind == TDK_VLA_VAR))
+				return;
+		}
+	}
 
 	ARENA_ENSURE_CAP(&ctx->main_arena,
 			 typedef_table.entries,
@@ -2763,8 +2774,18 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 							Token *eff_next = ni;
 							while (has_next && eff_next && eff_next->ch0 == ')' && eff_next != end)
 								{ eff_next = tok_next(eff_next); has_next = eff_next && eff_next != end; }
-							bool deref = (eff_prev->len == 1 && (eff_prev->ch0 == '*' || eff_prev->ch0 == '[' || eff_prev->ch0 == '+' || eff_prev->ch0 == '-')) ||
-								(has_next && eff_next && eff_next->len == 1 && (eff_next->ch0 == '[' || eff_next->ch0 == '+' || eff_next->ch0 == '-' || eff_next->ch0 == '*'));
+							/* `+`/`-` after a decayed array *identifier* are binary
+							 * pointer arithmetic — sizeof(param+5) is sizeof(void*).
+							 * Unary +/- live on eff_prev before the identifier. */
+							bool deref =
+							    (eff_prev->len == 1 &&
+							     (eff_prev->ch0 == '*' || eff_prev->ch0 == '[' ||
+							      eff_prev->ch0 == '+' || eff_prev->ch0 == '-')) ||
+							    (has_next && eff_next && eff_next->len == 1 &&
+							     (eff_next->ch0 == '[' || eff_next->ch0 == '*' ||
+							      ((eff_next->ch0 == '+' || eff_next->ch0 == '-') &&
+							       !(inner->kind == TK_IDENT &&
+							         (vla_fl & TDF_PARAM)))));
 							if (deref) return true;
 						}
 						if (inner->len == 1 && inner->ch0 == '[' &&
@@ -2990,6 +3011,26 @@ static bool abstract_declarator_paren_is_pointer_only(Token *open_paren) {
 		}
 		if (x->tag & TT_QUALIFIER) {
 			x = tok_next(x);
+			continue;
+		}
+		/* Nested abstract declarator: `(*...)` inside outer parens. */
+		if (x->len == 1 && x->ch0 == '(' && (x->flags & TF_OPEN)) {
+			Token *inner_close = tok_match(x);
+			if (!inner_close) return false;
+			if (!abstract_declarator_paren_is_pointer_only(x))
+				return false;
+			x = tok_next(inner_close);
+			continue;
+		}
+		/* Concrete direct declarator `ident` + array suffixes (e.g. `*p[5]` in
+		 * `int (*p[5])[10]`): `[10]` closes pointer-to-array, not another dim. */
+		if (is_identifier_like(x) && x->kind == TK_IDENT) {
+			x = tok_next(x);
+			while (x != close && match_ch(x, '[') && (x->flags & TF_OPEN) && tok_match(x)) {
+				Token *rb = tok_match(x);
+				if (!rb) return false;
+				x = tok_next(rb);
+			}
 			continue;
 		}
 		return false;
@@ -3461,7 +3502,8 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 // --- skip_one_stmt ---
 
 // Limits for skip_one_stmt_impl stack arrays.
-// if_depth can exceed SOS_IF_MAX (cache optimization degrades gracefully).
+// if_depth beyond SOS_IF_MAX skips recording trail snapshots; unwind must not
+// treat a missing snapshot as 0 (that would flush the skip-cache).
 // do_depth is hard-capped at SOS_DO_MAX (gives up on pathological input).
 #define SOS_IF_MAX    512
 #define SOS_DO_MAX    128
@@ -3486,7 +3528,10 @@ restart:
 		uint32_t idx = tok_idx(tok);
 		if (cache[idx]) {
 			Token *r = &token_pool[cache[idx] - 1];
-			for (int i = 0; i < tn; i++) cache[trail[i]] = cache[idx];
+			for (int i = 0; i < tn; i++) {
+				uint32_t tix = trail[i];
+				cache[tix] = cache[idx];
+			}
 			return r;
 		}
 		if (tn < 256) trail[tn++] = idx;
@@ -3560,10 +3605,13 @@ unwind_if:
 		if (n && (n->tag & TT_IF) && n->ch0 == 'e') {
 			// Only flush trail entries from THIS if level (true-branch),
 			// not parent tokens that span the entire if-else.
-			int snap = (if_depth < SOS_IF_MAX) ? if_trail_snap[if_depth] : 0;
+			int snap = (if_depth < SOS_IF_MAX) ? if_trail_snap[if_depth] : tn;
 			if (cache && tok) {
 				uint32_t val = tok_idx(tok) + 1;
-				for (int i = snap; i < tn; i++) cache[trail[i]] = val;
+				for (int i = snap; i < tn; i++) {
+					uint32_t tix = trail[i];
+					cache[tix] = val;
+				}
 			}
 			tn = snap; // keep parent tokens in trail for final resolution
 			tok = tok_next(n); goto restart;
@@ -3571,7 +3619,10 @@ unwind_if:
 	}
 	if (cache && tok) {
 		uint32_t val = tok_idx(tok) + 1;
-		for (int i = 0; i < tn; i++) cache[trail[i]] = val;
+		for (int i = 0; i < tn; i++) {
+			uint32_t tix = trail[i];
+			cache[tix] = val;
+		}
 	}
 	if (do_depth > 0) {
 		do_depth--;

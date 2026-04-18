@@ -7782,6 +7782,60 @@ static void test_stmtexpr_c23_attr_ctrl_paren_zeroinit(void) {
 	prism_free(&r);
 }
 
+static void test_p1_skip_stmt_do_if_trail_snapshot_limit(void) {
+	size_t cap = 16000;
+	char *code = malloc(cap);
+	CHECK(code != NULL, "p1 skip-snap: malloc");
+	if (!code)
+		return;
+	int pos = snprintf(code, cap, "void f(void) {\n  for (;0;)\n");
+	for (int i = 0; i < 1025; i++)
+		pos += snprintf(code + pos, cap - pos, "if (1) ");
+	pos += snprintf(code + pos, cap - pos, "do ; while(0);\n}\n");
+	PrismResult r = prism_transpile_source(code, "p1_skip_snap.c", prism_defaults());
+	free(code);
+	CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
+		 "p1 skip-snap: pathological do/if nesting errors");
+	if (r.error_msg)
+		CHECK(strstr(r.error_msg, "trail snapshot") != NULL,
+		      "p1 skip-snap: mentions trail snapshot buffer");
+	prism_free(&r);
+}
+
+static void test_p1_skip_deep_braceless_if_else_ok(void) {
+	size_t cap = 150000;
+	char *code = malloc(cap);
+	CHECK(code != NULL, "p1 deep-if: malloc");
+	if (!code)
+		return;
+	int pos = snprintf(code, cap, "void f(void) {\n  int x;\n");
+	for (int i = 0; i < 520; i++)
+		pos += snprintf(code + pos, cap - pos, "if (1) ");
+	pos += snprintf(code + pos, cap - pos, "x = 1; else x = 2;\n}\n");
+	PrismResult r = prism_transpile_source(code, "p1_deep_if.c", prism_defaults());
+	free(code);
+	CHECK_EQ(r.status, PRISM_OK, "p1 deep-if: braceless if/else transpiles");
+	prism_free(&r);
+}
+
+static void test_p1_typedef_shadow_chain_smoke(void) {
+	PrismResult r = prism_transpile_source(
+	    "void f(int n) {\n"
+	    "    int a;\n"
+	    "    {\n"
+	    "        float a;\n"
+	    "        (void)a;\n"
+	    "        double a;\n"
+	    "        (void)a;\n"
+	    "    }\n"
+	    "    int vla[n];\n"
+	    "    (void)vla;\n"
+	    "}\n",
+	    "p1_shadow_smoke.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "p1 shadow/VLA dedup smoke");
+	prism_free(&r);
+}
+
 void run_parse_tests(void) {
 	printf("\n=== PARSE TESTS ===\n");
 
@@ -8337,5 +8391,8 @@ void run_parse_tests(void) {
 	test_knr_only_funcptr_params_return_type();
 	test_knr_funcptr_param_shadow_correct();
 	test_knr_no_funcptr_regression();
+	test_p1_skip_stmt_do_if_trail_snapshot_limit();
+	test_p1_skip_deep_braceless_if_else_ok();
+	test_p1_typedef_shadow_chain_smoke();
 	test_stmtexpr_c23_attr_ctrl_paren_zeroinit();
 }

@@ -2038,10 +2038,57 @@ static void p1_tag_brackets_in_range(Token *open, Token *close) {
 	}
 }
 
+static bool comma_expr_has_comma(Token *open_paren, Token *close_paren) {
+	int depth = 0;
+	for (Token *t = tok_next(open_paren); t && t != close_paren; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			depth++;
+			continue;
+		}
+		if (t->flags & TF_CLOSE) {
+			depth--;
+			continue;
+		}
+		if (depth == 0 && match_ch(t, ','))
+			return true;
+	}
+	return false;
+}
+
+static Token *last_comma_operand(Token *open_paren, Token *close_paren) {
+	Token *seg_start = tok_next(open_paren);
+	int depth = 0;
+	for (Token *t = seg_start; t && t != close_paren; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			depth++;
+			continue;
+		}
+		if (t->flags & TF_CLOSE) {
+			depth--;
+			continue;
+		}
+		if (depth == 0 && match_ch(t, ','))
+			seg_start = tok_next(t);
+	}
+	return seg_start;
+}
+
 static void p1_mark_uneval_brackets(void) {
 	// token_pool[0] is a reserved sentinel (next_idx 0 means "NULL"); start at 1.
 	for (uint32_t i = 1; i < token_count; i++) {
 		Token *t = &token_pool[i];
+		// _Static_assert / static_assert predicate: must stay an integer
+		// constant expression — never wrap subscripts in __prism_bchk.
+		if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
+		    (equal(t, "_Static_assert") || equal(t, "static_assert"))) {
+			Token *lp = tok_next(t);
+			if (lp && match_ch(lp, '(') && (lp->flags & TF_OPEN) && tok_match(lp)) {
+				Token *rp = tok_match(lp);
+				if (rp)
+					p1_tag_brackets_in_range(lp, rp);
+			}
+			continue;
+		}
 		// _Generic(controlling_expr, type1: val1, ...): per C11 §6.5.1.1p3,
 		// the controlling expression is NOT evaluated. (The selected
 		// association expression IS evaluated, so subscripts in the
@@ -2175,6 +2222,25 @@ static bool is_tracked_array_name(Token *t) {
 	return te->is_array || te->is_vla_var;
 }
 
+// Walk typedef chain like typedef_lookup(), but answer whether any in-scope
+// entry marks this identifier as a pointer declarator — used to distinguish
+// `ptr[trail[i]]` (integer index expr) from commutative `idx[arr]`.
+static bool bounds_expr_base_is_pointer(Token *tok) {
+	if (!tok || tok->kind != TK_IDENT) return false;
+	unsigned c0 = tok->ch0, tl = tok->len;
+	if (!(typedef_table.bloom & (1ULL << ((c0 ^ tl) & 63)))) return false;
+	int idx = typedef_get_index(tok_loc(tok), tok->len);
+	uint32_t cur = tok_idx(tok);
+	while (idx >= 0) {
+		TypedefEntry *e = &typedef_table.entries[idx];
+		if (e->token_index <= cur && cur >= e->scope_open_idx && cur < e->scope_close_idx &&
+		    !e->is_struct_tag && e->is_ptr)
+			return true;
+		idx = e->prev_index;
+	}
+	return false;
+}
+
 static Token *try_bounds_check_subscript(Token *tok) {
 	if (!FEAT(F_BOUNDS_CHECK)) return NULL;
 	if (!match_ch(tok, '[') || !(tok->flags & TF_OPEN) || !tok_match(tok)) return NULL;
@@ -2214,10 +2280,28 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	// layers). Only fires when last_emitted (the would-be index side)
 	// is not itself a tracked array, so normal forms like `arr[arr2]`
 	// fall through to the regular wrap path.
+	bool comma_resolved = false;
 	{
 		Token *close_scan = tok_match(tok);
 		Token *inner = tok_next(tok);
 		Token *iclose = close_scan;
+		/* ISO `idx[(e1, arr)]` == `idx[arr]`; unwrap comma tail so the
+		 * main path sees the array ident.  If the last operand is the
+		 * tracked array, this is not a commutative *bypass* (it is
+		 * `arr` with index `idx` in disguise) — skip hard-error diags. */
+		if (match_ch(inner, '(') && (inner->flags & TF_OPEN)) {
+			Token *pclose = tok_match(inner);
+			if (pclose && comma_expr_has_comma(inner, pclose)) {
+				Token *lastop = last_comma_operand(inner, pclose);
+				if (lastop && tok_next(lastop) == pclose) {
+					inner = lastop;
+					iclose = pclose;
+					if (is_tracked_array_name(lastop))
+						comma_resolved = true;
+				}
+			}
+		}
+		if (!comma_resolved) {
 		while (inner != iclose && match_ch(inner, '(') && (inner->flags & TF_OPEN) &&
 		       tok_match(inner) && tok_next(tok_match(inner)) == iclose) {
 			iclose = tok_match(inner);
@@ -2244,9 +2328,10 @@ static Token *try_bounds_check_subscript(Token *tok) {
 				break;
 			}
 			if (!is_tracked_array_name(le)) {
-				error_tok(tok,
-				    "commutative subscript 'idx[arr]' bypasses "
-				    "-fbounds-check; rewrite as 'arr[idx]'");
+				if (!bounds_expr_base_is_pointer(le))
+					error_tok(tok,
+					    "commutative subscript 'idx[arr]' bypasses "
+					    "-fbounds-check; rewrite as 'arr[idx]'");
 			}
 		} else if (inner != iclose && inner && inner->kind == TK_IDENT) {
 			/* Indexed element inside brackets: `idx[arr[0]]`. The bracket
@@ -2254,8 +2339,9 @@ static Token *try_bounds_check_subscript(Token *tok) {
 			 * above misses it — same commutative bypass as `idx[arr]`.
 			 * Peel postfix `[...]` chunks from the innermost identifier until
 			 * we consume tokens up to `iclose`; if that names a tracked array
-			 * root and `last_emitted` is not a tracked array (`cache[trail[i]]`
-			 * keeps `cache` as last_emitted — still tracked — so no error). */
+			 * root and `last_emitted` is not a tracked array.  Pointer bases
+			 * (`uint32_t *cache` in `cache[trail[i]]`) are not commutative
+			 * integer-left forms — skip via is_ptr. */
 			Token *array_root = NULL;
 			Token *scan = inner;
 			while (scan && scan != iclose) {
@@ -2292,13 +2378,20 @@ static Token *try_bounds_check_subscript(Token *tok) {
 					}
 					break;
 				}
-				if (!is_tracked_array_name(le))
-					error_tok(tok,
-					    "commutative subscript 'idx[arr]' bypasses "
-					    "-fbounds-check; rewrite as 'arr[idx]'");
+				if (!is_tracked_array_name(le)) {
+					if (!bounds_expr_base_is_pointer(le))
+						error_tok(tok,
+						    "commutative subscript 'idx[arr]' bypasses "
+						    "-fbounds-check; rewrite as 'arr[idx]'");
+				}
 			}
 		}
+		} // !comma_resolved
 	}
+	if (comma_resolved)
+		error_tok(tok,
+			  "-fbounds-check: comma operand subscript idx[(...,arr)] must be "
+			  "rewritten as arr[idx]");
 	Token *name_tok = last_emitted;
 	// For multi-dim subscripts `a[i][j]`, the inner `[` is preceded in
 	// the token pool by `]` (close of outer subscript) while `last_emitted`
@@ -4132,7 +4225,9 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		if (!brace_wrap) check_defer_var_shadow(decl.var_name);
 
 		if (match_ch(tok, ';')) {
-			bool is_ur = (tok == pd_unreachable_tok);
+			/* Control-flow headers (for/if/switch parens) are not statements;
+			 * unreachable must not splice after init `;` (invalid C syntax). */
+			bool is_ur = (tok == pd_unreachable_tok) && !in_ctrl_paren();
 			emit_tok(tok);
 			flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type, typeof_var_base);
 			if (is_ur) EMIT_UNREACHABLE();
@@ -5279,7 +5374,50 @@ static bool has_unclosed_block_comment(const char *p, char **raw_delim_out) {
 static void strip_prism_raw_from_macro_value(char *val) {
 	if (!val || !*val) return;
 	char *dst = val;
+	bool in_str = false, in_chr = false, esc = false;
 	for (char *src = val; *src;) {
+		if (in_str) {
+			if (esc) {
+				esc = false;
+				*dst++ = *src++;
+				continue;
+			}
+			if (*src == '\\') {
+				esc = true;
+				*dst++ = *src++;
+				continue;
+			}
+			if (*src == '"')
+				in_str = false;
+			*dst++ = *src++;
+			continue;
+		}
+		if (in_chr) {
+			if (esc) {
+				esc = false;
+				*dst++ = *src++;
+				continue;
+			}
+			if (*src == '\\') {
+				esc = true;
+				*dst++ = *src++;
+				continue;
+			}
+			if (*src == '\'')
+				in_chr = false;
+			*dst++ = *src++;
+			continue;
+		}
+		if (*src == '"') {
+			in_str = true;
+			*dst++ = *src++;
+			continue;
+		}
+		if (*src == '\'') {
+			in_chr = true;
+			*dst++ = *src++;
+			continue;
+		}
 		bool boundary = (src == val || (unsigned char)src[-1] <= ' ');
 		bool raw_kw = boundary && src[0] == 'r' && src[1] == 'a' && src[2] == 'w' &&
 			      (src[3] == '\0' || (unsigned char)src[3] <= ' ' ||
@@ -6713,7 +6851,16 @@ static void p1_register_param_shadows(Token *open, Token *close,
 			// wrap spuriously traps.
 			if (FEAT(F_BOUNDS_CHECK)) {
 				TYPEDEF_ADD_IDX(typedef_add_shadow(tok_loc(last_ident), last_ident->len, brace_depth), last_ident);
-				typedef_table.entries[typedef_table.count - 1].is_param = true;
+				TypedefEntry *pse = &typedef_table.entries[typedef_table.count - 1];
+				pse->is_param = true;
+				/* Pointer parameters (`uint32_t *cache`): shadow entry must carry
+				 * is_ptr so commutative-subscript diagnostics don't confuse
+				 * `cache[trail[i]]` with `idx[arr]` (skip_one_stmt_impl cache). */
+				if (tok_idx(last_ident) >= 1) {
+					Token *prev = walk_back_past_noise(tok_idx(last_ident));
+					if (prev && prev->len == 1 && prev->ch0 == '*')
+						pse->is_ptr = true;
+				}
 			}
 			// For outer-level identifiers (int arr[n]), the first []
 			// is the decaying dimension (sizeof(arr) = pointer size,

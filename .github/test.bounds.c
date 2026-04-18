@@ -1714,6 +1714,135 @@ static void test_bounds_check_extreme_edges(void) {
 #endif
 }
 
+static void test_bounds_reported_issue_regressions(void) {
+	printf("\n--- bounds-check (reported-issue regressions) ---\n");
+
+	/* Ptr rank: declarator `[` counting vs (*...) boundaries */
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void) {\n"
+		    "    int *p[10];\n"
+		    "    int i = 0;\n"
+		    "    return p[0][i];\n"
+		    "}\n",
+		    "bc_rep_ptr_rank.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-rep: ptr-array stack transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "sizeof(p[0])/sizeof(p[0][0])") == NULL,
+			      "bc-rep: inner subscript no ptr/elem sizeof ratio");
+		}
+		prism_free(&r);
+	}
+
+	/* Incomplete outer dim: extern int m[][10] */
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "extern int m[][10];\n"
+		    "int main(void) {\n"
+		    "    return m[1][2];\n"
+		    "}\n",
+		    "bc_rep_inc_outer.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-rep: incomplete outer transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "m[__prism_bchk") == NULL,
+			      "bc-rep: incomplete outer dim — no sizeof wrap");
+		prism_free(&r);
+	}
+
+	/* idx[arr[0]] commutative guard */
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void) {\n"
+		    "    int arr[10];\n"
+		    "    int idx = 5;\n"
+		    "    arr[0] = 0;\n"
+		    "    int x = idx[arr[0]];\n"
+		    "    return x;\n"
+		    "}\n",
+		    "bc_rep_comm_nested.c", f);
+		CHECK(r.status != PRISM_OK, "bc-rep: idx[arr[0]] rejected");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "commutative") != NULL,
+			      "bc-rep: commutative diagnostic");
+		prism_free(&r);
+	}
+
+	/* Comma operand idx[(0,arr)] */
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void) {\n"
+		    "    int arr[10];\n"
+		    "    int idx = 5;\n"
+		    "    idx[(0, arr)] = 1;\n"
+		    "    return 0;\n"
+		    "}\n",
+		    "bc_rep_comma_sub.c", f);
+		CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
+			 "bc-rep: comma operand subscript must not silently skip bounds");
+		if (r.error_msg)
+			CHECK(strstr(r.error_msg, "comma operand") != NULL ||
+				      strstr(r.error_msg, "rewritten") != NULL,
+			      "bc-rep: comma diagnostic");
+		prism_free(&r);
+	}
+
+	/* Concrete int (*p[5])[10] rank */
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void) {\n"
+		    "    int (*p[5])[10];\n"
+		    "    p[1][2] = 0;\n"
+		    "    return 0;\n"
+		    "}\n",
+		    "bc_rep_ptr2arr.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-rep: concrete ptr-to-array stack decl");
+		if (r.output)
+			CHECK(strstr(r.output, "__prism_bchk(2,") == NULL,
+			      "bc-rep: no rank-2 trap on ptr-array row");
+		prism_free(&r);
+	}
+
+	/* constexpr + _Static_assert ICE */
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "void f(void) {\n"
+		    "    constexpr int arr[3] = { 1, 2, 3 };\n"
+		    "    _Static_assert(arr[0] == 1, \"\");\n"
+		    "}\n",
+		    "bc_rep_cx_sa.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-rep: static_assert ICE with constexpr array");
+		if (r.output)
+			CHECK(strstr(r.output, "_Static_assert(arr[__prism_bchk") == NULL,
+			      "bc-rep: no wrap in static_assert predicate");
+		prism_free(&r);
+	}
+
+	/* sizeof(param+5) vs VLA false positive */
+	{
+		PrismResult r = prism_transpile_source(
+		    "void g(int p[10]) {\n"
+		    "    const int safe[sizeof(p + 5)];\n"
+		    "    (void)safe;\n"
+		    "}\n",
+		    "bc_rep_vla_sz.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "bc-rep: sizeof(array_param + const) pointer-sized, not VLA elem");
+		prism_free(&r);
+	}
+}
+
 void run_bounds_check_tests(void) {
 	printf("\n=== BOUNDS-CHECK TESTS ===\n");
 	test_bounds_check_fixed_array();
@@ -1726,6 +1855,7 @@ void run_bounds_check_tests(void) {
 	test_bounds_check_address_of();
 	test_bounds_check_dark_corners();
 	test_bounds_check_commutative();
+	test_bounds_reported_issue_regressions();
 	test_bounds_check_declarator_contexts();
 	test_bounds_check_extreme_edges();
 	test_bounds_check_runtime();
