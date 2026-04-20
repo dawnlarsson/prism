@@ -411,7 +411,6 @@ static inline bool is_digraph_loc(char *loc) {
 
 static noreturn void error(char *fmt, ...);
 static void hashmap_put(HashMap *map, char *key, int keylen, void *val);
-static bool hashmap_has_key(HashMap *map, char *key, int keylen);
 static void hashmap_remove(HashMap *map, char *key, int keylen);
 
 static inline bool tok_at_bol(Token *tok) {
@@ -654,24 +653,6 @@ static void *hashmap_get(HashMap *map, char *key, int keylen) {
 			return ent->val;
 	}
 	return NULL;
-}
-
-static bool hashmap_has_key(HashMap *map, char *key, int keylen) {
-	if (!map->buckets) return false;
-	uint64_t hash = fast_hash(key, keylen);
-	uint32_t hash32 = (uint32_t)hash;
-	int mask = map->capacity - 1;
-	for (int i = 0; i <= mask; i++) {
-		HashEntry *ent = &map->buckets[(hash + i) & mask];
-		if (!ent->key)
-			return false;
-		if (ent->key == TOMBSTONE)
-			continue;
-		if (ent->hash == hash32 && ent->key_len == (uint16_t)keylen &&
-		    !memcmp(ent->key, key, keylen))
-			return true;
-	}
-	return false;
 }
 
 static void hashmap_remove(HashMap *map, char *key, int keylen) {
@@ -2936,26 +2917,6 @@ static inline bool struct_body_field_is_vla_typedef(Token *id, Token *prev) {
 	return is_vla_typedef(id);
 }
 
-static bool struct_body_contains_vla(Token *brace) {
-	if (!brace || !(brace->len == 1 && brace->ch0 == '{') || !tok_match(brace)) return false;
-	Token *end = tok_match(brace);
-	Token *prev = brace;
-	for (Token *t = tok_next(brace); t && t != end; prev = t, t = tok_next(t)) {
-		if (t->len == 1 && t->ch0 == '{') {
-			if (struct_body_contains_vla(t)) return true;
-			prev = t; t = tok_match(t); continue;
-		}
-		// Don't skip typeof()/_Atomic() parens — VLA dims hide inside.
-		if ((t->flags & TF_OPEN) && !(t->len == 1 && t->ch0 == '[') &&
-		    !(prev && ((prev->tag & TT_TYPEOF) ||
-		              ((prev->tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE)))))
-			{ prev = t; t = tok_match(t); continue; }
-		if (t->len == 1 && t->ch0 == '[' && array_size_is_vla(t)) return true;
-		if (struct_body_field_is_vla_typedef(t, prev)) return true;
-	}
-	return false;
-}
-
 // Scan a struct/union body for volatile-qualified fields, including nested
 // struct bodies and fields whose typedef carries TDF_VOLATILE or
 // TDF_HAS_VOL_MEMBER.  Used to propagate has_volatile_member to typedef
@@ -2971,25 +2932,38 @@ static inline bool struct_body_field_volatile_member(Token *id, Token *prev) {
 	return is_volatile_typedef(id) || has_volatile_member_typedef(id);
 }
 
-static bool struct_body_contains_volatile(Token *brace) {
-	if (!brace || !(brace->len == 1 && brace->ch0 == '{') || !tok_match(brace)) return false;
+// Walk a struct/union body looking for VLA dimensions or volatile fields.
+// Shared walker: SBS_VLA looks for `[VLA]` + VLA-typedef fields, SBS_VOL
+// looks for `volatile` qualifier + volatile-typedef fields. Recurses into
+// nested braces; skips typeof()/_Atomic() parens except when `[` / `{` is
+// the meaningful char for the mode.
+enum StructBodyScan { SBS_VLA, SBS_VOL };
+static bool struct_body_scan(Token *brace, enum StructBodyScan what) {
+	if (!brace || !match_ch(brace, '{') || !tok_match(brace)) return false;
 	Token *end = tok_match(brace);
 	Token *prev = brace;
 	for (Token *t = tok_next(brace); t && t != end; prev = t, t = tok_next(t)) {
-		if (t->len == 1 && t->ch0 == '{') {
-			if (struct_body_contains_volatile(t)) return true;
+		if (match_ch(t, '{')) {
+			if (struct_body_scan(t, what)) return true;
 			prev = t; t = tok_match(t); continue;
 		}
-		// Don't skip typeof()/_Atomic() parens — volatile hides inside.
-		if ((t->flags & TF_OPEN) && !(t->len == 1 && t->ch0 == '{') &&
+		// Don't skip typeof()/_Atomic() parens — VLA dims / volatile hide inside.
+		if ((t->flags & TF_OPEN) && !match_ch(t, what == SBS_VLA ? '[' : '{') &&
 		    !(prev && ((prev->tag & TT_TYPEOF) ||
 		              ((prev->tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE)))))
 			{ prev = t; t = tok_match(t); continue; }
-		if (t->tag & TT_VOLATILE) return true;
-		if (struct_body_field_volatile_member(t, prev)) return true;
+		if (what == SBS_VLA) {
+			if (match_ch(t, '[') && array_size_is_vla(t)) return true;
+			if (struct_body_field_is_vla_typedef(t, prev)) return true;
+		} else {
+			if (t->tag & TT_VOLATILE) return true;
+			if (struct_body_field_volatile_member(t, prev)) return true;
+		}
 	}
 	return false;
 }
+static inline bool struct_body_contains_vla(Token *brace) { return struct_body_scan(brace, SBS_VLA); }
+static inline bool struct_body_contains_volatile(Token *brace) { return struct_body_scan(brace, SBS_VOL); }
 
 static bool typedef_contains_vla(Token *tok) {
 	while (tok && tok->kind != TK_EOF) {

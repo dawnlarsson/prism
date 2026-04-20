@@ -1167,7 +1167,6 @@ static void defer_body_populate_captures(Token *body, Token *body_end,
 			}
 			// In declaration context — record as local.
 			if (bd > 0 && in_decl && pd == bpd) {
-				bool had_binding = hashmap_has_key(&local_decls, name, nlen);
 				void *prev_val = hashmap_get(&local_decls, name, nlen);
 				if (se_count >= se_cap) {
 					int new_cap = se_cap * 2;
@@ -1176,7 +1175,7 @@ static void defer_body_populate_captures(Token *body, Token *body_end,
 					se_stack = ns; se_cap = new_cap;
 				}
 				se_stack[se_count++] =
-				    (ScopeDecl){name, nlen, bd, prev_val, had_binding};
+				    (ScopeDecl){name, nlen, bd, prev_val, prev_val != NULL};
 				hashmap_put(&local_decls, name, nlen,
 					    (void*)((intptr_t)(bd + 2)));
 				continue;
@@ -2054,38 +2053,52 @@ static void p1_tag_brackets_in_range(Token *open, Token *close) {
 }
 
 static bool comma_expr_has_comma(Token *open_paren, Token *close_paren) {
-	int depth = 0;
 	for (Token *t = tok_next(open_paren); t && t != close_paren; t = tok_next(t)) {
-		if (t->flags & TF_OPEN) {
-			depth++;
-			continue;
-		}
-		if (t->flags & TF_CLOSE) {
-			depth--;
-			continue;
-		}
-		if (depth == 0 && match_ch(t, ','))
-			return true;
+		if (t->flags & TF_OPEN) { t = tok_match(t); continue; }
+		if (match_ch(t, ',')) return true;
 	}
 	return false;
 }
 
 static Token *last_comma_operand(Token *open_paren, Token *close_paren) {
 	Token *seg_start = tok_next(open_paren);
-	int depth = 0;
 	for (Token *t = seg_start; t && t != close_paren; t = tok_next(t)) {
-		if (t->flags & TF_OPEN) {
-			depth++;
-			continue;
-		}
-		if (t->flags & TF_CLOSE) {
-			depth--;
-			continue;
-		}
-		if (depth == 0 && match_ch(t, ','))
-			seg_start = tok_next(t);
+		if (t->flags & TF_OPEN) { t = tok_match(t); continue; }
+		if (match_ch(t, ',')) seg_start = tok_next(t);
 	}
 	return seg_start;
+}
+
+// Walk the postfix chain `( [...] | (...) | . ident | -> ident | ++ | -- )*`
+// starting at `p`, tagging every `[` as P1_UNEVAL_BRACKET and every `[`/`(`
+// balanced group as containing unevaluated operands. Returns after the chain.
+static void p1_tag_postfix_chain(Token *p) {
+	while (p && p->kind != TK_EOF) {
+		if ((match_ch(p, '[') || match_ch(p, '(')) &&
+		    (p->flags & TF_OPEN) && tok_match(p)) {
+			if (match_ch(p, '[')) tok_ann(p) |= P1_UNEVAL_BRACKET;
+			Token *c = tok_match(p);
+			p1_tag_brackets_in_range(p, c);
+			p = tok_next(c); continue;
+		}
+		if (match_ch(p, '.') || equal(p, "->")) {
+			p = tok_next(p);
+			if (p && p->kind == TK_IDENT) p = tok_next(p);
+			continue;
+		}
+		if (equal(p, "++") || equal(p, "--")) {
+			p = tok_next(p); continue;
+		}
+		break;
+	}
+}
+
+// Returns true if `t` introduces an unevaluated operand: sizeof, _Alignof,
+// typeof, or __builtin_offsetof (recognized by name since it's an ident).
+static inline bool is_uneval_operand_intro(Token *t) {
+	return (t->flags & TF_SIZEOF) || (t->tag & TT_TYPEOF) ||
+	       (t->kind == TK_IDENT && t->len == 18 &&
+	        memcmp(tok_loc(t), "__builtin_offsetof", 18) == 0);
 }
 
 static void p1_mark_uneval_brackets(void) {
@@ -2127,27 +2140,20 @@ static void p1_mark_uneval_brackets(void) {
 			Token *lp = tok_next(t);
 			if (lp && match_ch(lp, '(') && (lp->flags & TF_OPEN) && tok_match(lp)) {
 				Token *close = tok_match(lp);
+				// Tag every `[` in the controlling expression — the first
+				// comma-separated entry at paren depth 0 inside `(...)`.
 				int depth = 0;
 				for (Token *u = tok_next(lp); u != close && u->kind != TK_EOF; u = tok_next(u)) {
 					if (match_ch(u, '[') && (u->flags & TF_OPEN))
 						tok_ann(u) |= P1_UNEVAL_BRACKET;
-					if ((u->flags & TF_OPEN) && (match_ch(u, '(') || match_ch(u, '[') || match_ch(u, '{'))) {
-						depth++;
-						continue;
-					}
-					if (match_ch(u, ')') || match_ch(u, ']') || match_ch(u, '}')) {
-						depth--;
-						continue;
-					}
+					if (u->flags & TF_OPEN) { depth++; continue; }
+					if (u->flags & TF_CLOSE) { depth--; continue; }
 					if (depth == 0 && match_ch(u, ',')) break;
 				}
 			}
 			continue;
 		}
-		bool is_uneval = (t->flags & TF_SIZEOF) || (t->tag & TT_TYPEOF);
-		if (!is_uneval && t->kind == TK_IDENT && t->len == 18 &&
-		    memcmp(tok_loc(t), "__builtin_offsetof", 18) == 0)
-			is_uneval = true;
+		bool is_uneval = is_uneval_operand_intro(t);
 		if (!is_uneval) continue;
 		Token *next = tok_next(t);
 		if (!next) continue;
@@ -2164,29 +2170,7 @@ static void p1_mark_uneval_brackets(void) {
 			Token *close = tok_match(next);
 			if (close) {
 				p1_tag_brackets_in_range(next, close);
-				// Continue postfix chain from after `)`.
-				Token *p = tok_next(close);
-				while (p && p->kind != TK_EOF) {
-					if ((match_ch(p, '[') || match_ch(p, '(')) &&
-					    (p->flags & TF_OPEN) && tok_match(p)) {
-						if (match_ch(p, '['))
-							tok_ann(p) |= P1_UNEVAL_BRACKET;
-						Token *c = tok_match(p);
-						p1_tag_brackets_in_range(p, c);
-						p = tok_next(c); continue;
-					}
-					if (match_ch(p, '.') ||
-					    (p->len == 2 && memcmp(tok_loc(p), "->", 2) == 0)) {
-						p = tok_next(p);
-						if (p && p->kind == TK_IDENT) p = tok_next(p);
-						continue;
-					}
-					if (p->len == 2 && (memcmp(tok_loc(p), "++", 2) == 0 ||
-					                    memcmp(tok_loc(p), "--", 2) == 0)) {
-						p = tok_next(p); continue;
-					}
-					break;
-				}
+				p1_tag_postfix_chain(tok_next(close));
 			}
 			continue;
 		}
@@ -2198,40 +2182,15 @@ static void p1_mark_uneval_brackets(void) {
 		// Skip unary prefix operators: + - ! ~ & * ++ --
 		// (cast `(type)` always starts with '(' and was handled above.)
 		while (p && p->kind != TK_EOF) {
-			if (match_ch(p, '+') || match_ch(p, '-') ||
-			    match_ch(p, '!') || match_ch(p, '~') ||
-			    match_ch(p, '&') || match_ch(p, '*')) {
-				p = tok_next(p); continue;
-			}
-			if (p->len == 2 && (memcmp(tok_loc(p), "++", 2) == 0 ||
-			                    memcmp(tok_loc(p), "--", 2) == 0)) {
+			if (match_set(p, CH('+') | CH('-') | CH('!') | CH('&') | CH('*')) ||
+			    match_ch(p, '~') || equal(p, "++") || equal(p, "--")) {
 				p = tok_next(p); continue;
 			}
 			break;
 		}
 		// Postfix chain: ident ( [...] | (...) | . ident | -> ident | ++ | -- )*
 		if (!p || p->kind != TK_IDENT) continue;
-		p = tok_next(p);
-		while (p && p->kind != TK_EOF) {
-			if ((match_ch(p, '[') || match_ch(p, '(')) &&
-			    (p->flags & TF_OPEN) && tok_match(p)) {
-				if (match_ch(p, '[')) tok_ann(p) |= P1_UNEVAL_BRACKET;
-				Token *c = tok_match(p);
-				p1_tag_brackets_in_range(p, c);
-				p = tok_next(c); continue;
-			}
-			if (match_ch(p, '.') ||
-			    (p->len == 2 && memcmp(tok_loc(p), "->", 2) == 0)) {
-				p = tok_next(p);
-				if (p && p->kind == TK_IDENT) p = tok_next(p);
-				continue;
-			}
-			if (p->len == 2 && (memcmp(tok_loc(p), "++", 2) == 0 ||
-			                    memcmp(tok_loc(p), "--", 2) == 0)) {
-				p = tok_next(p); continue;
-			}
-			break; // end of postfix chain
-		}
+		p1_tag_postfix_chain(tok_next(p));
 	}
 }
 
@@ -2270,6 +2229,23 @@ static bool bounds_expr_base_is_pointer(Token *tok) {
 	return false;
 }
 
+// Peel a single layer of grouping parens off `le` when they enclose just a
+// bare identifier: `(arr)` → `arr`. Stops on postfix forms (`(x)[i]`,
+// `(x)(y)`, `(x.f)`, etc.) where the `(` is preceded by an expression.
+static Token *bounds_peel_paren_ident(Token *le) {
+	if (!match_ch(le, ')') || !tok_match(le)) return le;
+	Token *open = tok_match(le);
+	if (tok_idx(open) >= 1) {
+		Token *before = &token_pool[tok_idx(open) - 1];
+		if (before->kind == TK_IDENT || before->kind == TK_NUM ||
+		    match_ch(before, ')') || match_ch(before, ']'))
+			return le;
+	}
+	Token *ii = tok_next(open);
+	if (ii && ii->kind == TK_IDENT && tok_next(ii) == le) return ii;
+	return le;
+}
+
 // Find first tracked local array ident in [start,end) for commutative
 // subscripts `idx[arr]` and index-side forms like `idx[(1 ? a : b)]`.
 // Skips identifiers that sit inside an unevaluated operand (sizeof /
@@ -2281,10 +2257,7 @@ static Token *bounds_find_array_ident(Token *start, Token *end) {
 		// P1_UNEVAL_BRACKET, and any identifier inside is a type-query.
 		if ((t->flags & TF_OPEN) && match_ch(t, '(') && tok_idx(t) >= 1) {
 			Token *pv = &token_pool[tok_idx(t) - 1];
-			bool uneval = (pv->flags & TF_SIZEOF) || (pv->tag & TT_TYPEOF) ||
-			              (pv->kind == TK_IDENT && pv->len == 18 &&
-			               memcmp(tok_loc(pv), "__builtin_offsetof", 18) == 0);
-			if (uneval) {
+			if (is_uneval_operand_intro(pv)) {
 				Token *c = tok_match(t);
 				if (c) { t = c; continue; }
 			}
@@ -2390,30 +2363,13 @@ static Token *try_bounds_check_subscript(Token *tok) {
 		}
 		if (inner != iclose && tok_next(inner) == iclose &&
 		    is_tracked_array_name(inner)) {
-			// Strip paren layers off last_emitted the same way the
-			// main paren-walk does below, to recognize `(arr)[arr2]`
+			// Strip paren layers off last_emitted to recognize `(arr)[arr2]`
 			// as the normal form (not commutative).
-			Token *le = last_emitted;
-			while (match_ch(le, ')') && tok_match(le)) {
-				Token *open = tok_match(le);
-				if (tok_idx(open) >= 1) {
-					Token *before = &token_pool[tok_idx(open) - 1];
-					if (before->kind == TK_IDENT || before->kind == TK_NUM ||
-					    match_ch(before, ')') || match_ch(before, ']'))
-						break;
-				}
-				Token *ii = tok_next(open);
-				if (ii && ii->kind == TK_IDENT && tok_next(ii) == le) {
-					le = ii; break;
-				}
-				break;
-			}
-			if (!is_tracked_array_name(le)) {
-				if (!bounds_expr_base_is_pointer(le))
-					BOUNDS_COMM_DIAG(tok,
-					    "commutative subscript 'idx[arr]' bypasses "
-					    "-fbounds-check; rewrite as 'arr[idx]'");
-			}
+			Token *le = bounds_peel_paren_ident(last_emitted);
+			if (!is_tracked_array_name(le) && !bounds_expr_base_is_pointer(le))
+				BOUNDS_COMM_DIAG(tok,
+				    "commutative subscript 'idx[arr]' bypasses "
+				    "-fbounds-check; rewrite as 'arr[idx]'");
 		} else if (inner != iclose && inner && inner->kind == TK_IDENT) {
 			/* Indexed element inside brackets: `idx[arr[0]]`. The bracket
 			 * body is not a bare `arr` token before `]`, so the guard
@@ -2440,31 +2396,11 @@ static Token *try_bounds_check_subscript(Token *tok) {
 			}
 			if (scan == iclose && array_root &&
 			    is_tracked_array_name(array_root)) {
-				Token *le = last_emitted;
-				while (match_ch(le, ')') && tok_match(le)) {
-					Token *open = tok_match(le);
-					if (tok_idx(open) >= 1) {
-						Token *before = &token_pool[tok_idx(open) - 1];
-						if (before->kind == TK_IDENT ||
-						    before->kind == TK_NUM ||
-						    match_ch(before, ')') ||
-						    match_ch(before, ']'))
-							break;
-					}
-					Token *ii = tok_next(open);
-					if (ii && ii->kind == TK_IDENT &&
-					    tok_next(ii) == le) {
-						le = ii;
-						break;
-					}
-					break;
-				}
-				if (!is_tracked_array_name(le)) {
-					if (!bounds_expr_base_is_pointer(le))
-						BOUNDS_COMM_DIAG(tok,
-						    "commutative subscript 'idx[arr]' bypasses "
-						    "-fbounds-check; rewrite as 'arr[idx]'");
-				}
+				Token *le = bounds_peel_paren_ident(last_emitted);
+				if (!is_tracked_array_name(le) && !bounds_expr_base_is_pointer(le))
+					BOUNDS_COMM_DIAG(tok,
+					    "commutative subscript 'idx[arr]' bypasses "
+					    "-fbounds-check; rewrite as 'arr[idx]'");
 			}
 		}
 		} // !le_is_member
@@ -2697,12 +2633,15 @@ static Token *try_bounds_check_subscript(Token *tok) {
 // balanced groups + raw-keyword stripping. Advances `*t` and returns true
 // if the token was consumed (caller should `continue`); returns false if
 // the caller should handle `t` itself (e.g. fall through to tok_next).
-// Walk a balanced token group between matching delimiters, optionally emitting.
-// Shared tail for walk_balanced / walk_balanced_orelse: enum-body defer
-// shadow queueing + defense-in-depth rejection of stray `defer` inside
-// balanced groups + raw-keyword stripping. Advances `*t` and returns true
-// if the token was consumed (caller should `continue`); returns false if
-// the caller should handle `t` itself (e.g. fall through to tok_next).
+static inline void reject_defer_in_expr_context(Token *t) {
+	if (__builtin_expect(FEAT(F_DEFER) && (t->tag & TT_DEFER), 0) &&
+	    !(last_emitted && (last_emitted->tag & TT_MEMBER)) &&
+	    (!typedef_lookup(t) || match_ch(tok_next(t), '{')) &&
+	    tok_next(t) && (is_identifier_like(tok_next(t)) || match_ch(tok_next(t), '{')))
+		error_tok(t, "'defer' cannot be used in expression context "
+			  "(array dimensions, parenthesized expressions, etc.)");
+}
+
 static inline bool walk_balanced_tail(Token **tp) {
 	Token *t = *tp;
 	// Enum bodies in expression context bypass statement-start
@@ -2711,13 +2650,7 @@ static inline bool walk_balanced_tail(Token **tp) {
 		Token *brace = find_struct_body_brace(t);
 		if (brace) check_enum_body_defer_shadow(brace);
 	}
-	// Defense-in-depth: reject `defer` keyword in balanced groups.
-	if (__builtin_expect(FEAT(F_DEFER) && (t->tag & TT_DEFER), 0) &&
-	    !(last_emitted && (last_emitted->tag & TT_MEMBER)) &&
-	    (!typedef_lookup(t) || match_ch(tok_next(t), '{')) &&
-	    tok_next(t) && (is_identifier_like(tok_next(t)) || match_ch(tok_next(t), '{')))
-		error_tok(t, "'defer' cannot be used in expression context "
-			  "(array dimensions, parenthesized expressions, etc.)");
+	reject_defer_in_expr_context(t);
 	// Strip `raw` keyword (cast expressions, etc.).
 	Token *r = emit_tok_checked(t);
 	if (r) { *tp = r; return true; }
@@ -2799,12 +2732,7 @@ static void emit_token_range_verbatim(Token *start, Token *end) {
 				continue;
 			}
 		}
-		if (__builtin_expect(FEAT(F_DEFER) && (t->tag & TT_DEFER), 0) &&
-		    !(last_emitted && (last_emitted->tag & TT_MEMBER)) &&
-		    (!typedef_lookup(t) || match_ch(tok_next(t), '{')) &&
-		    tok_next(t) && (is_identifier_like(tok_next(t)) || match_ch(tok_next(t), '{')))
-			error_tok(t, "'defer' cannot be used in expression context "
-				  "(array dimensions, parenthesized expressions, etc.)");
+		if (__builtin_expect((t->tag & TT_DEFER) != 0, 0)) reject_defer_in_expr_context(t);
 		{ Token *r = emit_tok_checked(t); if (r) { t = r; continue; } }
 		t = tok_next(t);
 	}
@@ -2850,12 +2778,7 @@ static void emit_token_range_orelse(Token *start, Token *end) {
 				}
 			}
 			// Defense-in-depth: reject 'defer' keyword in orelse ranges
-			if (__builtin_expect(FEAT(F_DEFER) && (t->tag & TT_DEFER), 0) &&
-			    !(last_emitted && (last_emitted->tag & TT_MEMBER)) &&
-			    (!typedef_lookup(t) || match_ch(tok_next(t), '{')) &&
-			    tok_next(t) && (is_identifier_like(tok_next(t)) || match_ch(tok_next(t), '{')))
-				error_tok(t, "'defer' cannot be used in expression context "
-					  "(array dimensions, parenthesized expressions, etc.)");
+			reject_defer_in_expr_context(t);
 			{ Token *r = emit_tok_checked(t); if (r) { t = r; continue; } }
 			t = tok_next(t);
 		}
@@ -6663,8 +6586,10 @@ static void emit_deferred_range(Token *start, Token *end) {
 
 // Phase 1A: walk all tokens, assign scope_ids, build scope_tree[] with parent links + flags.
 
-// Walk backward through token_pool skipping prep dirs and C23 [[...]] attrs
-static Token *walk_back_skip_noise(uint32_t start_idx) {
+// Walk backward through token_pool skipping prep dirs, C23 [[...]] attrs,
+// and TT_ATTR keywords / attribute parens. `skip_all_parens` also skips any
+// balanced `(...)` group (not just those following a TT_ATTR keyword).
+static Token *walk_back_skip_impl(uint32_t start_idx, bool skip_all_parens) {
 	for (uint32_t pi = start_idx; pi > 0; pi--) {
 		Token *pt = &token_pool[pi];
 		if (pt->kind == TK_PREP_DIR) continue;
@@ -6672,12 +6597,12 @@ static Token *walk_back_skip_noise(uint32_t start_idx) {
 			pi = tok_idx(tok_match(pt));
 			continue;
 		}
-		// Skip TT_ATTR keyword with parenthesized arg: _Pragma(...), __attribute__((...))
 		if (match_ch(pt, ')') && tok_match(pt)) {
 			uint32_t open_idx = tok_idx(tok_match(pt));
+			if (skip_all_parens) { pi = open_idx; continue; }
+			// Otherwise only attribute-bearing parens: _Pragma/__attribute__.
 			if (open_idx > 0 && (token_pool[open_idx - 1].tag & TT_ATTR)) {
-				pi = open_idx; // loop decrements to open_idx-1 (TT_ATTR keyword)
-				continue;
+				pi = open_idx; continue;
 			}
 		}
 		if (pt->tag & TT_ATTR) continue;
@@ -6686,22 +6611,8 @@ static Token *walk_back_skip_noise(uint32_t start_idx) {
 	return NULL;
 }
 
-// Walk backward skipping prep dirs, balanced parens, TT_ATTR keywords,
-// and C23 [[...]] attributes
-static Token *walk_back_skip_attrs(uint32_t start_idx) {
-	for (uint32_t ki = start_idx; ki > 0; ki--) {
-		Token *kt = &token_pool[ki];
-		if (kt->kind == TK_PREP_DIR) continue;
-		if (match_ch(kt, ')') && tok_match(kt)) { ki = tok_idx(tok_match(kt)); continue; }
-		if (match_ch(kt, ']') && tok_match(kt) && (tok_match(kt)->flags & TF_C23_ATTR)) {
-			ki = tok_idx(tok_match(kt));
-			continue;
-		}
-		if (kt->tag & TT_ATTR) continue;
-		return kt;
-	}
-	return NULL;
-}
+static Token *walk_back_skip_noise(uint32_t start_idx) { return walk_back_skip_impl(start_idx, false); }
+static Token *walk_back_skip_attrs(uint32_t start_idx) { return walk_back_skip_impl(start_idx, true); }
 
 // Check if '{' opens an Objective-C ivar block.
 // Patterns: @interface Foo { ... }, @interface Foo : Base { ... },
