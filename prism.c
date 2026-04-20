@@ -1583,6 +1583,12 @@ static Token *emit_expr_to_stop(Token *tok, Token *stop, bool check_orelse) {
 // Returns NULL if tok is not a strippable raw keyword.
 static inline Token *try_strip_raw(Token *t) {
 	if (__builtin_expect((t->flags & TF_RAW) && !is_known_typedef(t), 0)) {
+		/* `raw` identifier shadowed by a variable in scope: this is an
+		 * ordinary identifier in an expression, not the `raw` keyword.
+		 * Annotation pass marked the usage site with P1_HAS_ENTRY when
+		 * a shadow was registered at the declaration. */
+		if (p1_typedef_annotated && (tok_ann(t) & P1_HAS_ENTRY))
+			return NULL;
 		/* Force multiplication in subscripts: arr[raw * x] — never strip `raw`. */
 		if (raw_after_subscript_open_bracket(t))
 			return NULL;
@@ -6862,6 +6868,7 @@ static void p1_register_param_shadows(Token *open, Token *close,
 		if (last_ident && (is_known_typedef(last_ident) ||
 		    is_known_enum_const(last_ident) ||
 		    (last_ident->tag & (TT_DEFER | TT_ORELSE | TT_NORETURN_FN | TT_SPECIAL_FN)) ||
+		    (last_ident->flags & TF_RAW) ||
 		    hashmap_get(&p1_func_proto_map, tok_loc(last_ident), last_ident->len)))
 			p1_register_shadow(last_ident, scope_id, brace_depth);
 		if (check_vla && last_ident) {
@@ -7120,6 +7127,7 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 			if (is_known_typedef(decl.var_name) ||
 			    is_known_enum_const(decl.var_name) ||
 			    (decl.var_name->tag & (TT_DEFER | TT_ORELSE | TT_NORETURN_FN | TT_SPECIAL_FN)) ||
+			    (decl.var_name->flags & TF_RAW) ||
 			    hashmap_get(&p1_func_proto_map, tok_loc(decl.var_name), decl.var_name->len))
 				p1_register_shadow(decl.var_name, cur_sid, brace_depth);
 			// Volatile-qualified scalar/aggregate variables (not pointers)
@@ -7989,6 +7997,7 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		if (is_known_typedef(decl.var_name) ||
 		    is_known_enum_const(decl.var_name) ||
 		    (decl.var_name->tag & (TT_DEFER | TT_ORELSE | TT_NORETURN_FN | TT_SPECIAL_FN)) ||
+		    (decl.var_name->flags & TF_RAW) ||
 		    hashmap_get(&p1_func_proto_map, tok_loc(decl.var_name), decl.var_name->len) ||
 		    is_vol_local) {
 			p1_register_shadow(decl.var_name, cur_sid, brace_depth);

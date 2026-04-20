@@ -160,6 +160,20 @@ void test_raw_variable_incr_decr(void) {
 	CHECK_EQ(raw, 10, "--raw");
 }
 
+static int raw_mul_helper(int z) { return z; }
+
+void test_raw_variable_in_call_mul(void) {
+	int x = 5;
+	int raw = 10;
+	/* Expression context: `raw * x` inside a function call argument must
+	 * be parsed as multiplication, not as a pointer-declaration candidate.
+	 * Regression test: previously emitted as `f( * x)`. */
+	CHECK_EQ(raw_mul_helper(raw * x), 50, "raw * x in call arg");
+	CHECK_EQ(raw_mul_helper(raw + x), 15, "raw + x in call arg");
+	int y = raw * x;
+	CHECK_EQ(y, 50, "int y = raw * x");
+}
+
 void test_raw_variable_array(void) {
 	int arr[] = {10, 20, 30};
 	int raw = 1;
@@ -1813,6 +1827,7 @@ void run_raw_tests(void) {
 	test_raw_variable_bitwise();
 	test_raw_variable_logical();
 	test_raw_variable_incr_decr();
+	test_raw_variable_in_call_mul();
 	test_raw_variable_array();
 	test_raw_variable_mul_subscript_not_stripped();
 	test_raw_variable_member();
