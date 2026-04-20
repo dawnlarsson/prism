@@ -2367,7 +2367,7 @@ static Token *skip_noise(Token *tok) {
 	while (tok && tok->kind != TK_EOF) {
 		if (tok->tag & TT_ATTR) {
 			tok = tok_next(tok);
-			if (tok && tok->len == 1 && tok->ch0 == '(' && tok_match(tok))
+			if (tok && match_ch(tok, '(') && tok_match(tok))
 				tok = tok_next(tok_match(tok));
 		} else if (is_c23_attr(tok) && tok_match(tok)) {
 			tok = tok_next(tok_match(tok));
@@ -2402,7 +2402,7 @@ static Token *skip_to_semicolon(Token *tok, Token *end) {
 	while (tok->kind != TK_EOF) {
 		if (end && tok == end) return tok;
 		if (tok->flags & TF_OPEN) { tok = tok_next(tok_match(tok)); continue; }
-		if (tok->len == 1 && tok->ch0 == ';') return tok;
+		if (match_ch(tok, ';')) return tok;
 		if ((tok->flags & TF_CLOSE) && tok->ch0 == '}') return tok;
 		tok = tok_next(tok);
 	}
@@ -2412,7 +2412,7 @@ static Token *skip_to_semicolon(Token *tok, Token *end) {
 static Token *skip_pointers(Token *tok, bool *is_void) {
 	while (tok && tok->kind != TK_EOF) {
 		SKIP_NOISE_CONTINUE(tok);
-		if ((tok->len == 1 && tok->ch0 == '*') || (tok->tag & TT_QUALIFIER)) {
+		if ((match_ch(tok, '*')) || (tok->tag & TT_QUALIFIER)) {
 			tok = tok_next(tok);
 			if (is_void) *is_void = false;
 		} else break;
@@ -2538,7 +2538,8 @@ static inline int typedef_flags(Token *tok) {
 	TypedefEntry *e = typedef_lookup(tok);
 	if (!e) return 0;
 	if (e->is_enum_const) return TDF_ENUM_CONST;
-	if (e->is_shadow) return 0;
+	if (e->is_shadow) return (e->is_volatile ? TDF_VOLATILE : 0) |
+	       (e->has_volatile_member ? TDF_HAS_VOL_MEMBER : 0);
 	if (e->is_vla_var) return TDF_VLA | (e->is_param ? TDF_PARAM : 0) |
 	       (e->has_volatile_member ? TDF_HAS_VOL_MEMBER : 0);
 	if (e->is_struct_tag) return (e->is_vla ? TDF_VLA : 0) |
@@ -2596,10 +2597,10 @@ static DeclResult parse_declarator(Token *tok, bool emit);
 
 // Register enum constants as typedef shadows. tok points to opening '{'.
 static void parse_enum_constants(Token *tok, int scope_depth) {
-	if (!tok || !(tok->len == 1 && tok->ch0 == '{')) return;
+	if (!tok || !(match_ch(tok, '{'))) return;
 	tok = tok_next(tok); // Skip '{'
 
-	while (tok && tok->kind != TK_EOF && !(tok->len == 1 && tok->ch0 == '}')) {
+	while (tok && tok->kind != TK_EOF && !(match_ch(tok, '}'))) {
 		SKIP_NOISE_CONTINUE(tok);
 
 		if (is_valid_varname(tok)) {
@@ -2611,7 +2612,7 @@ static void parse_enum_constants(Token *tok, int scope_depth) {
 
 			tok = skip_noise(tok); // Skip C23/GNU attributes on enumerator
 
-			if (tok && tok->len == 1 && tok->ch0 == '=') {
+			if (tok && match_ch(tok, '=')) {
 				tok = tok_next(tok);
 				while (tok && tok->kind != TK_EOF) {
 					if (tok->flags & TF_OPEN) { tok = tok_next(tok_match(tok)); continue; }
@@ -2620,7 +2621,7 @@ static void parse_enum_constants(Token *tok, int scope_depth) {
 				}
 			}
 
-			if (tok && tok->len == 1 && tok->ch0 == ',') tok = tok_next(tok);
+			if (tok && match_ch(tok, ',')) tok = tok_next(tok);
 		} else tok = tok_next(tok);
 	}
 }
@@ -2667,12 +2668,12 @@ static Token *find_struct_body_brace(Token *tok) {
 		SKIP_NOISE_CONTINUE(t);
 		if (is_valid_varname(t) || (t->tag & TT_QUALIFIER) || is_type_keyword(t)) {
 			t = tok_next(t);
-		} else if (t->len == 1 && t->ch0 == ':') {
+		} else if (match_ch(t, ':')) {
 			// C23 enum fixed underlying type: enum E : int { ... }
 			t = tok_next(t);
 		} else break;
 	}
-	return (t && t->len == 1 && t->ch0 == '{') ? t : NULL;
+	return (t && match_ch(t, '{')) ? t : NULL;
 }
 
 // Walk backward from token_pool[start_idx - 1], skipping attribute noise
@@ -2702,8 +2703,8 @@ static inline bool is_array_bracket_predecessor(Token *t) {
 	if (is_type_keyword(t) ||
 	    (t->tag & TT_QUALIFIER) ||
 	    is_known_typedef(t) ||
-	    (t->len == 1 && t->ch0 == '*') ||
-	    (t->len == 1 && t->ch0 == '}'))
+	    (match_ch(t, '*')) ||
+	    (match_ch(t, '}')))
 		return true;
 	// struct/union/enum Tag [n]: identifier preceded by TT_SUE keyword.
 	// Walk backward through token_pool, skipping attribute noise and
@@ -2716,25 +2717,25 @@ static inline bool is_array_bracket_predecessor(Token *t) {
 	// ']' is a type predecessor only for multi-dimensional array types
 	// like int[3][n], NOT for expression subscripts like arr[1][n].
 	// Disambiguate by checking what precedes the matching '['.
-	if (t->len == 1 && t->ch0 == ']') {
+	if (match_ch(t, ']')) {
 		Token *open = tok_match(t);
 		if (!open) return true;
 		Token *before_open = walk_back_past_noise(tok_idx(open));
 		if (!before_open) return true;
 		if (is_type_keyword(before_open) ||
 		    (before_open->tag & (TT_TYPEOF | TT_QUALIFIER | TT_SUE)) ||
-		    (before_open->len == 1 && before_open->ch0 == '*') ||
+		    (match_ch(before_open, '*')) ||
 		    is_known_typedef(before_open))
 			return true;
 		// ']' before '[' — check if the outer ']' itself is in type context
-		if (before_open->len == 1 && before_open->ch0 == ']')
+		if (match_ch(before_open, ']'))
 			return is_array_bracket_predecessor(before_open);
 		return false;
 	}
 	// ')' is a type predecessor only for declarator parens like int (*)[n]
 	// or int (*ptr)[n], NOT for expression parens like sizeof((arr)[n]).
 	// Disambiguate by checking what precedes the matching '('.
-	if (t->len == 1 && t->ch0 == ')') {
+	if (match_ch(t, ')')) {
 		Token *open = tok_match(t);
 		if (!open) return true; // no match info — conservatively assume type
 		Token *before_open = walk_back_past_noise(tok_idx(open));
@@ -2742,7 +2743,7 @@ static inline bool is_array_bracket_predecessor(Token *t) {
 		// Type-producing constructs before '(' → type context (declarator)
 		if (is_type_keyword(before_open) ||
 		    (before_open->tag & (TT_TYPEOF | TT_QUALIFIER | TT_SUE)) ||
-		    (before_open->len == 1 && before_open->ch0 == '*') ||
+		    (match_ch(before_open, '*')) ||
 		    is_known_typedef(before_open))
 			return true;
 		// Everything else (sizeof, ident, operator, '(') → expression context
@@ -2760,13 +2761,13 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 	Token *tok = tok_next(open_bracket);
 
 	while (tok != close) {
-		if (tok->len == 1 && tok->ch0 == '[') {
+		if (match_ch(tok, '[')) {
 			if (array_size_is_vla_impl(tok, depth + 1)) return true;
 			tok = skip_balanced_group(tok);
 			continue;
 		}
-		if (tok->len == 1 && tok->ch0 == '(' && tok_next(tok) &&
-		    tok_next(tok)->len == 1 && tok_next(tok)->ch0 == '{')
+		if (match_ch(tok, '(') && tok_next(tok) &&
+		    match_ch(tok_next(tok), '{'))
 			return true;
 		if (tok->tag & TT_GENERIC) return true;
 		SKIP_NOISE_CONTINUE(tok);
@@ -2775,7 +2776,7 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 		if (is_sizeof_like(tok)) {
 			bool is_sizeof = tok->ch0 == 's';
 			tok = tok_next(tok);
-			if (tok != close && tok->len == 1 && tok->ch0 == '(') {
+			if (tok != close && match_ch(tok, '(')) {
 				Token *end = skip_balanced_group(tok);
 				if (is_sizeof) {
 					Token *prev_inner = tok;
@@ -2818,7 +2819,7 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 							         (vla_fl & TDF_VLA)))));
 							if (deref) return true;
 						}
-						if (inner->len == 1 && inner->ch0 == '[' &&
+						if (match_ch(inner, '[') &&
 						    is_array_bracket_predecessor(prev_inner)) {
 							if (array_size_is_vla_impl(inner, depth + 1)) return true;
 							inner = tok_match(inner);
@@ -2828,11 +2829,11 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 						if (is_valid_varname(inner) && !is_type_keyword(inner) &&
 						    !is_known_typedef(inner) && !is_known_enum_const(inner) &&
 						    tok_next(inner) && inner != end &&
-						    tok_next(inner)->len == 1 && tok_next(inner)->ch0 == '(') {
+						    match_ch(tok_next(inner), '(')) {
 							Token *call_end = skip_balanced_group(tok_next(inner));
-							bool is_deref = (prev_inner->len == 1 && prev_inner->ch0 == '*') ||
+							bool is_deref = (match_ch(prev_inner, '*')) ||
 							    (call_end && call_end != end &&
-							     ((call_end->len == 1 && call_end->ch0 == '[') || (call_end->tag & TT_MEMBER)));
+							     ((match_ch(call_end, '[')) || (call_end->tag & TT_MEMBER)));
 							if (is_deref)
 								for (Token *a = tok_next(tok_next(inner)); a && a != call_end; a = tok_next(a))
 									if (is_valid_varname(a) && !is_known_enum_const(a) &&
@@ -2845,7 +2846,7 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 					}
 				}
 				tok = end;
-				if (tok != close && tok->len == 1 && tok->ch0 == '{')
+				if (tok != close && match_ch(tok, '{'))
 					tok = skip_balanced_group(tok);
 			} else if (tok != close) {
 				// Unparenthesized sizeof/alignof: skip prefix ops, operand, postfix.
@@ -2863,7 +2864,7 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 				if (tok != close) {
 					if (tok->flags & TF_OPEN) {
 						tok = tok_match(tok) ? tok_next(tok_match(tok)) : tok;
-						if (tok != close && tok->len == 1 && tok->ch0 == '{')
+						if (tok != close && match_ch(tok, '{'))
 							tok = tok_match(tok) ? tok_next(tok_match(tok)) : tok;
 					} else {
 						if (is_identifier_like(tok) && is_vla_typedef(tok)) return true;
@@ -2967,9 +2968,9 @@ static inline bool struct_body_contains_volatile(Token *brace) { return struct_b
 
 static bool typedef_contains_vla(Token *tok) {
 	while (tok && tok->kind != TK_EOF) {
-		if (tok->len == 1 && tok->ch0 == ';') break;
-		if ((tok->flags & TF_OPEN) && !(tok->len == 1 && tok->ch0 == '[')) { tok = tok_next(tok_match(tok)); continue; }
-		if (tok->len == 1 && tok->ch0 == '[' && array_size_is_vla(tok)) return true;
+		if (match_ch(tok, ';')) break;
+		if ((tok->flags & TF_OPEN) && !(match_ch(tok, '['))) { tok = tok_next(tok_match(tok)); continue; }
+		if (match_ch(tok, '[') && array_size_is_vla(tok)) return true;
 		tok = tok_next(tok);
 	}
 	return false;
@@ -2980,19 +2981,19 @@ static bool typedef_contains_vla(Token *tok) {
 static Token *find_boundary_comma(Token *tok) {
 	while (tok->kind != TK_EOF) {
 		if (tok->flags & TF_OPEN) { tok = tok_next(tok_match(tok)); continue; }
-		if (tok->len == 1 && tok->ch0 == ';') return NULL;
-		if (tok->len == 1 && tok->ch0 == ',') {
+		if (match_ch(tok, ';')) return NULL;
+		if (match_ch(tok, ',')) {
 			Token *n = tok_next(tok);
 			if (n) {
-				if (n->len == 1 && n->ch0 == '(') {
+				if (match_ch(n, '(')) {
 					Token *inside = tok_next(n);
 					if (inside && !(inside->tag & (TT_TYPE | TT_SUE | TT_TYPEOF | TT_QUALIFIER))
 					    && !is_known_typedef(inside) && !is_c23_attr(inside))
 						return tok;
-				} else if ((n->len == 1 && n->ch0 == '*') || (n->tag & TT_QUALIFIER) || (n->tag & TT_ATTR) || is_c23_attr(n)) {
+				} else if ((match_ch(n, '*')) || (n->tag & TT_QUALIFIER) || (n->tag & TT_ATTR) || is_c23_attr(n)) {
 					return tok;
 				} else if (is_valid_varname(n) && !(n->tag & (TT_TYPE | TT_SUE | TT_TYPEOF))) {
-					if (tok_next(n) && tok_next(n)->len == 1 && tok_next(n)->ch0 == '(') {
+					if (tok_next(n) && match_ch(tok_next(n), '(')) {
 						Token *inside = tok_next(tok_next(n));
 						if (inside &&
 						    (inside->tag & (TT_TYPE | TT_SUE | TT_TYPEOF | TT_QUALIFIER)))
@@ -3012,7 +3013,7 @@ static Token *find_init_semicolon(Token *open, Token *close) {
 	for (Token *s = tok_next(open); s && s != close; s = tok_next(s)) {
 		if (s->flags & TF_OPEN) pd++;
 		else if (s->flags & TF_CLOSE) pd--;
-		else if (pd == 0 && s->len == 1 && s->ch0 == ';') return s;
+		else if (pd == 0 && match_ch(s, ';')) return s;
 	}
 	return NULL;
 }
@@ -3024,11 +3025,11 @@ static Token *find_init_semicolon(Token *open, Token *close) {
 // not an array-of-VLA object — must not set TypeSpecResult.is_vla / is_array.
 static bool abstract_declarator_paren_is_pointer_only(Token *open_paren) {
 	Token *close = tok_match(open_paren);
-	if (!close || !(open_paren->len == 1 && open_paren->ch0 == '(')) return false;
+	if (!close || !(match_ch(open_paren, '('))) return false;
 	for (Token *x = tok_next(open_paren); x && x != close;) {
 		x = skip_noise(x);
 		if (!x || x == close) break;
-		if (x->len == 1 && x->ch0 == '*') {
+		if (match_ch(x, '*')) {
 			x = tok_next(x);
 			continue;
 		}
@@ -3037,7 +3038,7 @@ static bool abstract_declarator_paren_is_pointer_only(Token *open_paren) {
 			continue;
 		}
 		/* Nested abstract declarator: `(*...)` inside outer parens. */
-		if (x->len == 1 && x->ch0 == '(' && (x->flags & TF_OPEN)) {
+		if (match_ch(x, '(') && (x->flags & TF_OPEN)) {
 			Token *inner_close = tok_match(x);
 			if (!inner_close) return false;
 			if (!abstract_declarator_paren_is_pointer_only(x))
@@ -3098,10 +3099,10 @@ static void scan_paren_for_vla(Token *open, Token *end, TypeSpecResult *r, bool 
 					  "control-flow tracking");
 		}
 		if (check_typeof && (t->tag & TT_TYPEOF)) r->has_typeof = true;
-		if (t->len == 1 && t->ch0 == '(') {
+		if (match_ch(t, '(')) {
 			if (fn_skip > 0) fn_skip++;
-			else if (prev->len == 1 && prev->ch0 == ')') fn_skip = 1;
-		} else if (t->len == 1 && t->ch0 == ')') { if (fn_skip > 0) fn_skip--; }
+			else if (match_ch(prev, ')')) fn_skip = 1;
+		} else if (match_ch(t, ')')) { if (fn_skip > 0) fn_skip--; }
 		if (fn_skip > 0) continue;
 		// Inside typeof(...) only: sizeof operands are compile-time in the VM
 		// sense for split detection — do not let sizeof(int[n]) mark the whole
@@ -3109,7 +3110,7 @@ static void scan_paren_for_vla(Token *open, Token *end, TypeSpecResult *r, bool 
 		// check_typeof=true and keeps scanning sizeof interiors for VM brackets.
 		if (!check_typeof && is_sizeof_like(t)) {
 			Token *nx = tok_next(t);
-			if (nx && nx->len == 1 && nx->ch0 == '(' && tok_match(nx)) {
+			if (nx && match_ch(nx, '(') && tok_match(nx)) {
 				prev = t;
 				t = tok_match(nx);
 				continue;
@@ -3124,7 +3125,7 @@ static void scan_paren_for_vla(Token *open, Token *end, TypeSpecResult *r, bool 
 				continue;
 			}
 		}
-		if (t->len == 1 && t->ch0 == '[' && !(t->flags & TF_C23_ATTR) &&
+		if (match_ch(t, '[') && !(t->flags & TF_C23_ATTR) &&
 		    is_array_bracket_predecessor(prev)) {
 			if (array_size_is_vla(t))
 				r->type_vm = true;
@@ -3196,14 +3197,14 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 		}
 
 		if (is_type && (tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE)
-		    && !(tok_next(tok) && tok_next(tok)->len == 1 && tok_next(tok)->ch0 == '('))
+		    && !(tok_next(tok) && match_ch(tok_next(tok), '(')))
 			is_type = false;
 		if (is_type) r.saw_type = true;
 		is_type = false;
 
 		// _Atomic(type) specifier form
 		if ((tag & (TT_QUALIFIER | TT_TYPE)) == (TT_QUALIFIER | TT_TYPE) && tok_next(tok) &&
-		    tok_next(tok)->len == 1 && tok_next(tok)->ch0 == '(') {
+		    match_ch(tok_next(tok), '(')) {
 			r.saw_type = true;
 			r.has_atomic = true;
 			tok = tok_next(tok);
@@ -3238,11 +3239,11 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			Token *sue_tag = NULL;
 			if (tok && is_valid_varname(tok)) { sue_tag = tok; tok = tok_next(tok); }
 			// C23 enum fixed underlying type: enum E : int { ... }
-			if (tok && tok->len == 1 && tok->ch0 == ':') {
+			if (tok && match_ch(tok, ':')) {
 				tok = tok_next(tok);
 				while (tok && tok->kind != TK_EOF) {
 					SKIP_NOISE_CONTINUE(tok);
-					if (tok->len == 1 && tok->ch0 == '(') {
+					if (match_ch(tok, '(')) {
 						tok = skip_balanced_group(tok);
 						continue;
 					}
@@ -3257,7 +3258,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 					break;
 				}
 			}
-			if (tok && tok->len == 1 && tok->ch0 == '{') {
+			if (tok && match_ch(tok, '{')) {
 				if (struct_body_contains_vla(tok)) r.is_vla = true;
 				if (struct_body_contains_volatile(tok)) r.has_volatile_member = true;
 				tok = skip_balanced_group(tok);
@@ -3278,7 +3279,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			r.saw_type = true;
 			r.has_typeof = true;
 			tok = tok_next(tok);
-			if (tok && tok->len == 1 && tok->ch0 == '(') {
+			if (tok && match_ch(tok, '(')) {
 				Token *end = skip_balanced_group(tok);
 				if (tok_next(tok) && equal(tok_next(tok), "void") && tok_next(tok_next(tok)) == tok_match(tok)) r.has_void = true;
 				{
@@ -3343,7 +3344,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			if (tag & TT_BITINT) r.saw_type = true;
 			Token *kw = tok;
 			tok = tok_next(tok);
-			if (tok && tok->len == 1 && tok->ch0 == '(') {
+			if (tok && match_ch(tok, '(')) {
 				if (FEAT(F_ORELSE) && (kw->tag & (TT_BITINT | TT_ALIGNAS))) {
 					Token *close = tok_match(tok);
 					for (Token *s = tok_next(tok); s && s != close; s = tok_next(s))
@@ -3365,6 +3366,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			if (tflags & TDF_VLA) r.is_vla = true;
 			if (tflags & TDF_AGGREGATE) r.is_struct = true;
 			if (tflags & TDF_UNION) r.is_union = true;
+			if (tflags & TDF_VOLATILE) r.has_volatile = true;
 			if (tflags & TDF_HAS_VOL_MEMBER) r.has_volatile_member = true;
 			Token *peek = tok_next(tok);
 			while (peek && (peek->tag & TT_QUALIFIER)) peek = tok_next(peek);
@@ -3461,7 +3463,7 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 		}
 	}
 
-	while (tok && !(tok->len == 1 && tok->ch0 == ';') && tok->kind != TK_EOF) {
+	while (tok && !(match_ch(tok, ';')) && tok->kind != TK_EOF) {
 		DeclResult decl = parse_declarator(tok, false);
 		if (decl.var_name) {
 			bool is_void =
@@ -3497,7 +3499,7 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 					int rank = 0;
 					Token *prev_dt = NULL;
 					for (Token *dt = decl.var_name; dt && decl.end && dt != decl.end;) {
-						if (dt->len == 1 && dt->ch0 == '[' && (dt->flags & TF_OPEN)) {
+						if (match_ch(dt, '[') && (dt->flags & TF_OPEN)) {
 							if (!array_bracket_closes_ptr_to_array(dt, prev_dt))
 								rank++;
 							Token *m = tok_match(dt);
@@ -3549,7 +3551,7 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 					added->is_union = true;
 				if (!decl.end) {
 					Token *after_name = skip_noise(tok_next(decl.var_name));
-					if (after_name && after_name->len == 1 && after_name->ch0 == '(')
+					if (after_name && match_ch(after_name, '('))
 						added->is_func = true;
 				}
 				if (decl.is_func_ptr && !decl.paren_pointer)
@@ -3560,13 +3562,13 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 		}
 		tok = decl.end ? decl.end : tok_next(tok);
 
-		while (tok && !(tok->len == 1 && tok->ch0 == ',') && !(tok->len == 1 && tok->ch0 == ';') && tok->kind != TK_EOF) {
-			if (tok->len == 1 && tok->ch0 == '(') tok = skip_balanced_group(tok);
-			else if (tok->len == 1 && tok->ch0 == '[') tok = skip_balanced_group(tok);
+		while (tok && !(match_ch(tok, ',')) && !(match_ch(tok, ';')) && tok->kind != TK_EOF) {
+			if (match_ch(tok, '(')) tok = skip_balanced_group(tok);
+			else if (match_ch(tok, '[')) tok = skip_balanced_group(tok);
 			else tok = tok_next(tok);
 		}
 
-		if (tok && tok->len == 1 && tok->ch0 == ',') tok = tok_next(tok);
+		if (tok && match_ch(tok, ',')) tok = tok_next(tok);
 	}
 }
 
@@ -3608,12 +3610,12 @@ restart:
 		if (tn < 256) trail[tn++] = idx;
 	}
 
-	if (tok->len == 1 && tok->ch0 == '{') { tok = tok_match(tok); goto unwind_if; }
+	if (match_ch(tok, '{')) { tok = tok_match(tok); goto unwind_if; }
 
 	if (tok->tag & TT_IF) {
 		if (tok->ch0 == 'e') { tok = tok_next(tok); goto restart; }
 		Token *p = skip_prep_dirs(tok_next(tok));
-		if (!p || !(p->len == 1 && p->ch0 == '(') || !tok_match(p)) return NULL;
+		if (!p || !(match_ch(p, '(')) || !tok_match(p)) return NULL;
 		if (if_depth < SOS_IF_MAX) if_trail_snap[if_depth] = tn;
 		if_depth++;
 		tok = tok_next(tok_match(p)); goto restart;
@@ -3621,7 +3623,7 @@ restart:
 
 	if ((tok->tag & (TT_LOOP | TT_SWITCH)) && tok->ch0 != 'd') {
 		Token *p = skip_prep_dirs(tok_next(tok));
-		if (!p || !(p->len == 1 && p->ch0 == '(') || !tok_match(p)) return NULL;
+		if (!p || !(match_ch(p, '(')) || !tok_match(p)) return NULL;
 		tok = tok_next(tok_match(p)); goto restart;
 	}
 
@@ -3644,7 +3646,7 @@ restart:
 
 	if (is_identifier_like(tok) && !(tok->tag & (TT_CASE | TT_DEFAULT | TT_TYPE | TT_QUALIFIER | TT_STORAGE))) {
 		Token *colon = skip_noise(tok_next(tok));
-		if (colon && colon->len == 1 && colon->ch0 == ':' && !(tok_next(colon) && tok_next(colon)->len == 1 && tok_next(colon)->ch0 == ':')) {
+		if (colon && match_ch(colon, ':') && !(tok_next(colon) && match_ch(tok_next(colon), ':'))) {
 			tok = tok_next(colon); goto restart;
 		}
 	}
@@ -3652,9 +3654,9 @@ restart:
 	if ((tok->tag & (TT_CASE | TT_DEFAULT)) && !is_known_typedef(tok)) {
 		int td = 0;
 		for (Token *s = tok_next(tok); s && s->kind != TK_EOF; s = tok_next(s)) {
-			if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; continue; }
-			if (s->len == 1 && s->ch0 == '?') { td++; continue; }
-			if (s->len == 1 && s->ch0 == ':') {
+			if (s->flags & TF_OPEN) { s = tok_match(s); continue; }
+			if (match_ch(s, '?')) { td++; continue; }
+			if (match_ch(s, ':')) {
 				if (td > 0) { td--; continue; }
 				tok = tok_next(s); goto restart;
 			}
@@ -3663,8 +3665,8 @@ restart:
 	}
 
 	for (Token *s = tok; s && s->kind != TK_EOF; s = tok_next(s)) {
-		if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; continue; }
-		if (s->len == 1 && s->ch0 == ';') { tok = s; goto unwind_if; }
+		if (s->flags & TF_OPEN) { s = tok_match(s); continue; }
+		if (match_ch(s, ';')) { tok = s; goto unwind_if; }
 	}
 	return NULL;
 
@@ -3708,9 +3710,9 @@ unwind_if:
 		Token *w = skip_prep_dirs(tok_next(tok));
 		if (!w || !(w->tag & TT_LOOP) || w->ch0 != 'w') { tok = NULL; goto unwind_if; }
 		Token *p2 = skip_prep_dirs(tok_next(w));
-		if (!p2 || !(p2->len == 1 && p2->ch0 == '(') || !tok_match(p2)) { tok = NULL; goto unwind_if; }
+		if (!p2 || !(match_ch(p2, '(')) || !tok_match(p2)) { tok = NULL; goto unwind_if; }
 		Token *a = skip_prep_dirs(tok_next(tok_match(p2)));
-		tok = (a && a->len == 1 && a->ch0 == ';') ? a : NULL;
+		tok = (a && match_ch(a, ';')) ? a : NULL;
 		goto unwind_if;
 	}
 	return tok;
@@ -3873,7 +3875,7 @@ static void defer_scan_orelse_in_group(Token *open, bool in_loop, bool in_switch
 		if (s->flags & TF_OPEN) {
 			if (match_ch(s, '(') || match_ch(s, '['))
 				defer_scan_orelse_in_group(s, in_loop, in_switch, depth);
-			prev = tok_match(s) ? tok_match(s) : s;
+			prev = tok_match(s);
 			s = prev;
 			continue;
 		}
@@ -3938,7 +3940,7 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 			if (tok->flags & TF_OPEN) {
 				if (match_ch(tok, '(') || match_ch(tok, '['))
 					defer_scan_hidden_stmt_exprs(tok, in_loop, in_switch, depth);
-				tok = tok_match(tok) ? tok_match(tok) : tok;
+				tok = tok_match(tok);
 				continue;
 			}
 			if (match_ch(tok, '?')) { td++; continue; }
@@ -4017,7 +4019,7 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 				// Skip {...} — stmt-exprs handled by the loop below.
 				if (match_ch(s, '(') || match_ch(s, '['))
 					defer_scan_orelse_in_group(s, in_loop, in_switch, depth);
-				prev_oe = tok_match(s) ? tok_match(s) : s;
+				prev_oe = tok_match(s);
 				s = prev_oe;
 				continue;
 			}
@@ -4046,7 +4048,7 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 				validate_defer_statement(tok_next(s), in_loop, in_switch, depth + 1);
 			else if (match_set(s, CH('(') | CH('[')) || match_ch(s, '{'))
 				defer_scan_hidden_stmt_exprs(s, in_loop, in_switch, depth);
-			s = tok_match(s) ? tok_match(s) : s;
+			s = tok_match(s);
 			continue;
 		}
 	}
@@ -4061,7 +4063,7 @@ static bool is_knr_params(Token *start, Token *brace) {
 	bool saw_semi = false;
 	for (Token *t = start; t && t != brace && t->kind != TK_EOF; t = tok_next(t)) {
 		if (match_ch(t, ';')) saw_semi = true;
-		if (t->flags & TF_OPEN) t = tok_match(t) ? tok_match(t) : t;
+		if (t->flags & TF_OPEN) t = tok_match(t);
 	}
 	return saw_semi;
 }

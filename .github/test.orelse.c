@@ -4010,6 +4010,123 @@ static void test_bare_orelse_volatile_double_write(void) {
 	prism_free(&r);
 }
 
+// BUG_VOL_BARE_IDENT: bare volatile-qualified identifier as LHS of orelse
+// with compound-literal fallback takes the ternary path, which evaluates
+// LHS twice. For a bare identifier (no '*', '->', '.', '['), the existing
+// reject_orelse_side_effects(check_volatile_deref=true) missed it because
+// the scanner only looked for indirection operators. The variable's own
+// 'volatile' qualifier on its declaration was invisible.
+//
+// Three attack vectors: (1) bare 'volatile T x;' at file scope,
+// (2) 'typedef volatile T V; V x;' so x is volatile through its typedef,
+// (3) struct with volatile member accessed by value through the typedef.
+static void test_bare_orelse_volatile_ident_double_write(void) {
+	printf("\n--- Bare orelse volatile identifier double-write ---\n");
+	{
+		// Case 1: bare volatile identifier at file scope.
+		const char *code =
+		    "struct Status { int err; };\n"
+		    "extern int poll_uart(void);\n"
+		    "volatile int UART_TX_READY;\n"
+		    "void f(void) {\n"
+		    "    UART_TX_READY = poll_uart() orelse (struct Status){.err = 1}.err;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vol_ident_file.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
+			 "vol-ident-file: rejects volatile bare ident + CL fallback (double bus write)");
+		if (r.error_msg) CHECK(strstr(r.error_msg, "volatile") != NULL,
+				       "vol-ident-file: error mentions volatile");
+		prism_free(&r);
+	}
+	{
+		// Case 2: volatile through typedef.
+		const char *code =
+		    "struct Status { int err; };\n"
+		    "typedef volatile int reg_t;\n"
+		    "extern int poll(void);\n"
+		    "reg_t MMIO_REG;\n"
+		    "void f(void) {\n"
+		    "    MMIO_REG = poll() orelse (struct Status){.err = 1}.err;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vol_ident_tdef.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
+			 "vol-ident-tdef: rejects volatile-typedef ident + CL fallback");
+		if (r.error_msg) CHECK(strstr(r.error_msg, "volatile") != NULL,
+				       "vol-ident-tdef: error mentions volatile");
+		prism_free(&r);
+	}
+	{
+		// Case 3: block-scope volatile local.
+		const char *code =
+		    "struct Status { int err; };\n"
+		    "extern int poll(void);\n"
+		    "void f(void) {\n"
+		    "    volatile int reg;\n"
+		    "    reg = poll() orelse (struct Status){.err = 1}.err;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vol_ident_block.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
+			 "vol-ident-block: rejects block-scope volatile + CL fallback");
+		prism_free(&r);
+	}
+	{
+		// Negative: non-volatile identifier should still work.
+		const char *code =
+		    "struct Status { int err; };\n"
+		    "extern int poll(void);\n"
+		    "int reg;\n"
+		    "void f(void) {\n"
+		    "    reg = poll() orelse (struct Status){.err = 1}.err;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "nonvol_ident.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "nonvol-ident: non-volatile LHS with CL fallback still compiles");
+		prism_free(&r);
+	}
+	{
+		// Case 4: volatile-qualified function parameter.
+		const char *code =
+		    "struct Status { int err; };\n"
+		    "extern int poll(void);\n"
+		    "void f(volatile int x) {\n"
+		    "    x = poll() orelse (struct Status){.err = 1}.err;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vol_ident_param.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
+			 "vol-ident-param: rejects volatile parameter + CL fallback");
+		prism_free(&r);
+	}
+	{
+		// Case 5: whole-struct assign when struct has a volatile member.
+		const char *code =
+		    "struct T { volatile int v; int pad; };\n"
+		    "extern struct T get_t(void);\n"
+		    "void f(void) {\n"
+		    "    struct T tt;\n"
+		    "    tt = get_t() orelse (struct T){.v = 1, .pad = 0};\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vol_member_whole.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
+			 "vol-member-whole: rejects whole-struct assign of volatile-member struct + CL fallback");
+		prism_free(&r);
+	}
+	{
+		// Case 6: volatile declared in for-init.
+		const char *code =
+		    "struct S { int err; };\n"
+		    "extern int poll(void);\n"
+		    "void f(void) {\n"
+		    "    for (volatile int x = 0; x < 1; x++) {\n"
+		    "        x = poll() orelse (struct S){.err = 1}.err;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "vol_ident_forinit.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
+			 "vol-ident-forinit: rejects volatile declared in for-init + CL fallback");
+		prism_free(&r);
+	}
+}
+
 // Compound literal inside function call argument forces ternary path.
 // When LHS has volatile dereference (*uart_tx), ternary evaluates the
 // LHS address twice — reject with a clear error rather than silent UB.
@@ -8284,6 +8401,9 @@ void run_orelse_tests(void) {
 
 	// bare orelse volatile double-write (MMIO-killing)
 	test_bare_orelse_volatile_double_write();
+
+	// bare volatile-qualified identifier as LHS (file/typedef/block scope)
+	test_bare_orelse_volatile_ident_double_write();
 
 	// compound literal inside function args must not trigger ternary fallback
 	test_bare_orelse_volatile_compound_literal_nested();

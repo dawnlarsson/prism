@@ -55,6 +55,9 @@ typedef int mode_t;
 #define cached_env_store(val)   (cached_clean_env = (val))
 #define signal_temps_ready_store(idx, val) (signal_temps_ready[(idx)] = (val))
 #define signal_temps_ready_load(idx)       (signal_temps_ready[(idx)])
+#define signal_temps_ready_cas(idx, expected, desired) \
+	(InterlockedCompareExchange((volatile LONG *)&signal_temps_ready[(idx)], \
+				    (LONG)(desired), (LONG)(*(expected))) == (LONG)(*(expected)))
 
 // MSVC doesn't have these — define them away or provide equivalents.
 #define __attribute__(x)

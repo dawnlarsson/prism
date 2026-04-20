@@ -251,6 +251,9 @@ static volatile sig_atomic_t signal_temps_count = 0;
 #define cached_env_store(val)   __atomic_store_n(&cached_clean_env, (val), __ATOMIC_RELEASE)
 #define signal_temps_ready_store(idx, val) __atomic_store_n(&signal_temps_ready[(idx)], (val), __ATOMIC_RELEASE)
 #define signal_temps_ready_load(idx)       __atomic_load_n(&signal_temps_ready[(idx)], __ATOMIC_ACQUIRE)
+#define signal_temps_ready_cas(idx, expected, desired) \
+	__atomic_compare_exchange_n(&signal_temps_ready[(idx)], (expected), (desired), \
+				    false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
 #endif
 
 static void signal_temps_register(const char *path) {
@@ -260,11 +263,14 @@ static void signal_temps_register(const char *path) {
 	do {
 		n = signal_temps_load();
 		if (n >= SIGNAL_TEMPS_MAX) {
-			// All slots allocated — try to reuse a freed slot.
+			// All slots allocated — try to atomically claim a freed slot.
+			// signal_temps_unregister zeroes the path *before* releasing the
+			// slot, so a signal handler observing ready==1 with path[0]=='\0'
+			// during the claim→memcpy window will simply skip the slot.
 			for (int i = 0; i < SIGNAL_TEMPS_MAX; i++) {
-				if (!signal_temps_ready_load(i)) {
+				sig_atomic_t expected = 0;
+				if (signal_temps_ready_cas(i, &expected, 1)) {
 					memcpy(signal_temps[i], path, len + 1);
-					signal_temps_ready_store(i, 1);
 					return;
 				}
 			}
@@ -295,6 +301,10 @@ static void signal_temps_unregister(const char *path) {
 	sig_atomic_t n = signal_temps_load();
 	for (int i = 0; i < n; i++) {
 		if (signal_temps_ready_load(i) && strcmp(signal_temps[i], path) == 0) {
+			// Zero the path *before* releasing the slot so a concurrent
+			// register() that claims this slot via CAS cannot be racing
+			// against a signal handler that still reads the stale path.
+			memset(signal_temps[i], 0, PATH_MAX);
 			signal_temps_ready_store(i, 0);
 			return;
 		}
@@ -1470,6 +1480,16 @@ static void reject_orelse_side_effects(Token *start, Token *end,
 		if (check_volatile_deref && match_ch(s, '[') && (s->flags & TF_OPEN))
 			error_tok(s, "%s with array subscript %s",
 				  ctx_msg, advice);
+		// A bare identifier carrying `volatile` (directly or via typedef)
+		// is indistinguishable from a non-volatile one syntactically, but
+		// reading it is a hardware-observable side effect. Query the
+		// shadow/typedef table populated in Phase 1D.
+		if (check_volatile_deref && is_valid_varname(s) && !is_type_keyword(s)) {
+			unsigned tf = typedef_flags(s);
+			if (tf & (TDF_VOLATILE | TDF_HAS_VOL_MEMBER))
+				error_tok(s, "%s with volatile-qualified identifier %s",
+					  ctx_msg, advice);
+		}
 		prev_tok = s;
 	}
 }
@@ -1772,7 +1792,7 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 		}
 
 		// --- Ternary ? ---
-		if (tok->len == 1 && tok->ch0 == '?')
+		if (match_ch(tok, '?'))
 			ternary_depth++;
 
 		// --- Label : ---
@@ -1968,7 +1988,7 @@ static Token *emit_ctrl_condition(Token *t, Token **unreachable_tok) {
 			continue;
 		}
 		// Semicolons (for-init separators): reset stmt_start
-		if (t->len == 1 && t->ch0 == ';') {
+		if (match_ch(t, ';')) {
 			emit_tok(t); t = tok_next(t);
 			ctx->at_stmt_start = true;
 			continue;
@@ -1989,7 +2009,7 @@ static bool bracket_scan_has_orelse(Token *open) {
 			TypedefEntry *te = typedef_lookup(s);
 			if (!te || orelse_shadow_is_kw(prev)) return true;
 		}
-		if (s->flags & TF_OPEN) { prev = tok_match(s); s = tok_match(s) ? tok_match(s) : s; continue; }
+		if (s->flags & TF_OPEN) { prev = tok_match(s); s = tok_match(s); continue; }
 		prev = s;
 	}
 	return false;
@@ -2822,7 +2842,7 @@ static Token *scan_bracket_orelse(Token *open, Token *close, Token **paren_open_
 				if (pp && tok_next(pp) == close) {
 					Token *prev_p = t;
 					for (Token *p = tok_next(t); p && p != pp; p = tok_next(p)) {
-						if (p->flags & TF_OPEN) { prev_p = tok_match(p) ? tok_match(p) : p; p = prev_p; continue; }
+						if (p->flags & TF_OPEN) { prev_p = tok_match(p); p = prev_p; continue; }
 						if ((p->tag & TT_ORELSE)) {
 							TypedefEntry *te_p = typedef_lookup(p);
 							if (!te_p || orelse_shadow_is_kw(prev_p)) {
@@ -3659,7 +3679,7 @@ static OrelseInitInfo scan_decl_orelse(Token *decl_end,
 						}
 						if (match_ch(inner, ',')) has_depth0_comma = true;
 						if (inner->flags & TF_OPEN) {
-							inner = tok_match(inner) ? tok_match(inner) : inner;
+							inner = tok_match(inner);
 							prev_inner = inner;
 							continue;
 						}
@@ -6622,8 +6642,8 @@ static bool is_objc_ivar_brace(uint32_t brace_idx) {
 		Token *t = &token_pool[i];
 		if (t->kind == TK_PREP_DIR) continue;
 		if (t->kind == TK_IDENT && !t->tag) continue; // class name, protocol name
-		if (t->len == 1 && t->ch0 == ':') continue;    // inheritance colon
-		if (t->len == 1 && t->ch0 == '*') continue;     // pointer in type
+		if (match_ch(t, ':')) continue;    // inheritance colon
+		if (match_ch(t, '*')) continue;     // pointer in type
 		if (t->tag & (TT_QUALIFIER | TT_ATTR)) continue;
 		if (match_ch(t, ')') && tok_match(t)) { i = tok_idx(tok_match(t)); continue; }
 		if (match_ch(t, ']') && tok_match(t) && (tok_match(t)->flags & TF_C23_ATTR)) {
@@ -6642,7 +6662,7 @@ static bool is_objc_ivar_brace(uint32_t brace_idx) {
 			continue;
 		}
 		// The '@' must immediately precede an ObjC keyword
-		if (t->len == 1 && t->ch0 == '@') {
+		if (match_ch(t, '@')) {
 			Token *kw = &token_pool[i + 1];
 			if (kw->kind == TK_IDENT &&
 			    ((kw->len == 9 && !memcmp(tok_loc(kw), "interface", 9)) ||
@@ -6739,7 +6759,7 @@ static void p1_build_scope_tree(Token *start) {
 						Token *st = &token_pool[si2];
 						if (st->kind == TK_PREP_DIR) continue;
 						if (is_type_keyword(st) || (st->tag & TT_QUALIFIER)) continue;
-						if (st->len == 1 && st->ch0 == ':') continue;
+						if (match_ch(st, ':')) continue;
 						if (match_ch(st, ']') && tok_match(st) && (tok_match(st)->flags & TF_C23_ATTR)) {
 							si2 = tok_idx(tok_match(st)); continue;
 						}
@@ -6827,7 +6847,7 @@ static void p1_register_param_shadows(Token *open, Token *close,
 			if (t->flags & TF_OPEN) {
 				if (!last_ident && !scanned_inner_paren && match_ch(t, '(') && tok_match(t))
 					for (Token *s = tok_next(t); s != tok_match(t); s = tok_next(s)) {
-						if (s->flags & TF_OPEN) { s = tok_match(s) ? tok_match(s) : s; continue; }
+						if (s->flags & TF_OPEN) { s = tok_match(s); continue; }
 						if (is_valid_varname(s) && !(s->tag & (TT_QUALIFIER|TT_TYPE|TT_SUE|TT_TYPEOF|TT_ATTR)))
 							{ last_ident = s; ident_from_inner = true; }
 					}
@@ -6868,6 +6888,26 @@ static void p1_register_param_shadows(Token *open, Token *close,
 				}
 		}
 		if (last_ident && scope_id < scope_tree_count) {
+			// Scan this param's tokens for a volatile qualifier on a
+			// non-pointer storage. A pointer param's `volatile` applies
+			// to the pointee; only storage-volatile causes orelse
+			// compound-literal fallback double-writes.
+			Token *param_end = (t && match_ch(t, ',')) ? t : close;
+			bool has_vol_qual = false;
+			bool has_vol_member = false;
+			bool saw_star = false;
+			for (Token *s = param_start; s && s != param_end && s->kind != TK_EOF; s = tok_next(s)) {
+				if (s == last_ident) break;
+				if (match_ch(s, '*')) saw_star = true;
+				if ((s->tag & (TT_QUALIFIER | TT_VOLATILE)) == (TT_QUALIFIER | TT_VOLATILE))
+					has_vol_qual = true;
+				if (is_valid_varname(s) && !(s->tag & (TT_QUALIFIER|TT_TYPE|TT_SUE|TT_TYPEOF|TT_ATTR))) {
+					unsigned tf = typedef_flags(s);
+					if (tf & TDF_VOLATILE) has_vol_qual = true;
+					if (tf & TDF_HAS_VOL_MEMBER) has_vol_member = true;
+				}
+			}
+			bool is_vol_param = (has_vol_qual || has_vol_member) && !saw_star;
 			bool matched_ident = false;
 			for (int ix = typedef_get_index(tok_loc(last_ident), last_ident->len); ix >= 0;
 			     ix = typedef_table.entries[ix].prev_index) {
@@ -6895,6 +6935,21 @@ static void p1_register_param_shadows(Token *open, Token *close,
 				if (typedef_table.count > pre_ct) {
 					typedef_table.entries[typedef_table.count - 1].is_param = true;
 					typedef_table.entries[typedef_table.count - 1].is_array = false;
+					if (is_vol_param) {
+						typedef_table.entries[typedef_table.count - 1].is_volatile = has_vol_qual;
+						typedef_table.entries[typedef_table.count - 1].has_volatile_member = has_vol_member;
+					}
+				}
+			} else if (is_vol_param) {
+				// Stamp volatile on the existing entry.
+				for (int ix = typedef_get_index(tok_loc(last_ident), last_ident->len); ix >= 0;
+				     ix = typedef_table.entries[ix].prev_index) {
+					TypedefEntry *ee = &typedef_table.entries[ix];
+					if (ee->token_index == tok_idx(last_ident)) {
+						if (has_vol_qual) ee->is_volatile = true;
+						if (has_vol_member) ee->has_volatile_member = true;
+						break;
+					}
 				}
 			}
 		}
@@ -7067,6 +7122,20 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 			    (decl.var_name->tag & (TT_DEFER | TT_ORELSE | TT_NORETURN_FN | TT_SPECIAL_FN)) ||
 			    hashmap_get(&p1_func_proto_map, tok_loc(decl.var_name), decl.var_name->len))
 				p1_register_shadow(decl.var_name, cur_sid, brace_depth);
+			// Volatile-qualified scalar/aggregate variables (not pointers)
+			// must also be registered so reject_orelse_side_effects can
+			// flag bare volatile idents in orelse LHS.
+			bool is_vol_local = (type.has_volatile || type.has_volatile_member) &&
+			                    !decl.is_pointer && !decl.is_func_ptr;
+			if (is_vol_local) {
+				int pre_ct = typedef_table.count;
+				p1_register_shadow(decl.var_name, cur_sid, brace_depth);
+				if (typedef_table.count > pre_ct) {
+					TypedefEntry *e = &typedef_table.entries[typedef_table.count - 1];
+					if (type.has_volatile) e->is_volatile = true;
+					if (type.has_volatile_member) e->has_volatile_member = true;
+				}
+			}
 
 			// Phase 1D: register CFG entry for goto-skip-decl detection
 			{
@@ -7585,7 +7654,7 @@ static Token *p1d_scan_init_orelse(Token *t, bool *out_has_orelse, Token **out_f
 							if ((FEAT(F_ORELSE) || FEAT(F_DEFER)) && match_ch(inner, '(') &&
 							    !(prev_inner && (prev_inner->tag & TT_TYPEOF)))
 								check_orelse_in_parens(inner);
-							inner = tok_match(inner) ? tok_match(inner) : inner; prev_inner = inner; continue;
+							inner = tok_match(inner); prev_inner = inner; continue;
 						}
 						prev_inner = inner;
 					}
@@ -7908,12 +7977,27 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 
 		// Phase 1C: shadow detection
 		bool did_shadow = false;
+		// Volatile-qualified scalar/aggregate variables (not pointers or
+		// function pointers — those volatile qualifiers apply to the
+		// pointee, not the storage) must be registered even when no name
+		// collision exists. This lets reject_orelse_side_effects detect
+		// bare volatile identifiers on orelse LHS and reject the
+		// compound-literal ternary path which would double-write the
+		// underlying hardware register.
+		bool is_vol_local = (type.has_volatile || type.has_volatile_member) &&
+		                    !decl.is_pointer && !decl.is_func_ptr;
 		if (is_known_typedef(decl.var_name) ||
 		    is_known_enum_const(decl.var_name) ||
 		    (decl.var_name->tag & (TT_DEFER | TT_ORELSE | TT_NORETURN_FN | TT_SPECIAL_FN)) ||
-		    hashmap_get(&p1_func_proto_map, tok_loc(decl.var_name), decl.var_name->len)) {
+		    hashmap_get(&p1_func_proto_map, tok_loc(decl.var_name), decl.var_name->len) ||
+		    is_vol_local) {
 			p1_register_shadow(decl.var_name, cur_sid, brace_depth);
 			did_shadow = true;
+		}
+		if (is_vol_local && typedef_table.count > 0) {
+			TypedefEntry *e = &typedef_table.entries[typedef_table.count - 1];
+			if (type.has_volatile) e->is_volatile = true;
+			if (type.has_volatile_member) e->has_volatile_member = true;
 		}
 
 		// -fbounds-check: register plain local array variables so Pass 2 can
@@ -9702,7 +9786,7 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		Token *next;
 		uint32_t tag = tok->tag;
 
-		if (tok->len == 1 && tok->ch0 == '?')
+		if (match_ch(tok, '?'))
 			ternary_depth++;
 
 #define DISPATCH(handler)                                                                                    \
