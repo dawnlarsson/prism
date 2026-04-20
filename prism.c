@@ -2090,8 +2090,22 @@ static Token *last_comma_operand(Token *open_paren, Token *close_paren) {
 
 static void p1_mark_uneval_brackets(void) {
 	// token_pool[0] is a reserved sentinel (next_idx 0 means "NULL"); start at 1.
+	// File-scope initializer tracker: `[` inside a file-scope `= ...;`
+	// initializer is an integer-constant-expression context (C99 §6.7.8p4);
+	// wrapping it in __prism_bchk(...) would produce "initializer element is
+	// not constant". NOTE: static-LOCAL initializers also require ICE but
+	// are not tracked here (would need storage-class scan).
+	int fs_cb = 0; bool fs_in_init = false;
 	for (uint32_t i = 1; i < token_count; i++) {
 		Token *t = &token_pool[i];
+		if ((t->flags & TF_OPEN) && match_ch(t, '{')) fs_cb++;
+		else if ((t->flags & TF_CLOSE) && match_ch(t, '}')) { if (fs_cb) fs_cb--; }
+		else if (fs_cb == 0) {
+			if (match_ch(t, '=')) fs_in_init = true;
+			else if (match_ch(t, ';')) fs_in_init = false;
+		}
+		if (fs_in_init && (t->flags & TF_OPEN) && match_ch(t, '['))
+			tok_ann(t) |= P1_UNEVAL_BRACKET;
 		// _Static_assert / static_assert predicate: must stay an integer
 		// constant expression — never wrap subscripts in __prism_bchk.
 		if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
@@ -2258,8 +2272,23 @@ static bool bounds_expr_base_is_pointer(Token *tok) {
 
 // Find first tracked local array ident in [start,end) for commutative
 // subscripts `idx[arr]` and index-side forms like `idx[(1 ? a : b)]`.
+// Skips identifiers that sit inside an unevaluated operand (sizeof /
+// _Alignof / typeof / offsetof / __builtin_offsetof); those occurrences
+// are type-queries, not value uses, and cannot form a commutative bypass.
 static Token *bounds_find_array_ident(Token *start, Token *end) {
 	for (Token *t = start; t && t != end && t->kind != TK_EOF; t = tok_next(t)) {
+		// Skip unevaluated-operand groups wholesale: their `[`s are tagged
+		// P1_UNEVAL_BRACKET, and any identifier inside is a type-query.
+		if ((t->flags & TF_OPEN) && match_ch(t, '(') && tok_idx(t) >= 1) {
+			Token *pv = &token_pool[tok_idx(t) - 1];
+			bool uneval = (pv->flags & TF_SIZEOF) || (pv->tag & TT_TYPEOF) ||
+			              (pv->kind == TK_IDENT && pv->len == 18 &&
+			               memcmp(tok_loc(pv), "__builtin_offsetof", 18) == 0);
+			if (uneval) {
+				Token *c = tok_match(t);
+				if (c) { t = c; continue; }
+			}
+		}
 		if (t->kind != TK_IDENT || is_known_typedef(t))
 			continue;
 		if (tok_idx(t) >= 1 && (token_pool[tok_idx(t) - 1].tag & TT_MEMBER))
@@ -2271,6 +2300,19 @@ static Token *bounds_find_array_ident(Token *start, Token *end) {
 	}
 	return NULL;
 }
+
+// Safety diagnostic: under -fno-safety (F_WARN_SAFETY) a safety violation is
+// downgraded from hard error to warning. SAFETY_DIAG is the plain form;
+// BOUNDS_COMM_DIAG also `return NULL`s so the bounds caller falls through to
+// raw emission on the warn path (user opted out of the wrap).
+#define SAFETY_DIAG(t, msg) do { \
+	if (FEAT(F_WARN_SAFETY)) warn_tok((t), msg); \
+	else error_tok((t), msg); \
+} while (0)
+#define BOUNDS_COMM_DIAG(t, msg) do { \
+	if (FEAT(F_WARN_SAFETY)) { warn_tok((t), msg); return NULL; } \
+	error_tok((t), msg); \
+} while (0)
 
 static Token *try_bounds_check_subscript(Token *tok) {
 	if (!FEAT(F_BOUNDS_CHECK)) return NULL;
@@ -2295,7 +2337,7 @@ static Token *try_bounds_check_subscript(Token *tok) {
 				if (rb_close && inner && tok_next(inner) == rb_close &&
 				    is_tracked_array_name(inner) &&
 				    !is_tracked_array_name(idx))
-					error_tok(tok,
+					BOUNDS_COMM_DIAG(tok,
 						  "commutative subscript 'idx[arr]' bypasses "
 						  "-fbounds-check; rewrite as 'arr[idx]'");
 			}
@@ -2333,6 +2375,14 @@ static Token *try_bounds_check_subscript(Token *tok) {
 			}
 		}
 		if (!comma_resolved) {
+		/* If last_emitted is a struct/union field access (preceded by
+		 * `.`/`->`), we do not know the field's type from the typedef
+		 * table, so we cannot assert a commutative bypass. Skip both
+		 * branches — the final brute-scan guard below is gated by the
+		 * same `memb` flag and handles this case correctly. */
+		bool le_is_member = tok_idx(last_emitted) >= 1 &&
+				    (token_pool[tok_idx(last_emitted) - 1].tag & TT_MEMBER);
+		if (!le_is_member) {
 		while (inner != iclose && match_ch(inner, '(') && (inner->flags & TF_OPEN) &&
 		       tok_match(inner) && tok_next(tok_match(inner)) == iclose) {
 			iclose = tok_match(inner);
@@ -2360,7 +2410,7 @@ static Token *try_bounds_check_subscript(Token *tok) {
 			}
 			if (!is_tracked_array_name(le)) {
 				if (!bounds_expr_base_is_pointer(le))
-					error_tok(tok,
+					BOUNDS_COMM_DIAG(tok,
 					    "commutative subscript 'idx[arr]' bypasses "
 					    "-fbounds-check; rewrite as 'arr[idx]'");
 			}
@@ -2411,16 +2461,17 @@ static Token *try_bounds_check_subscript(Token *tok) {
 				}
 				if (!is_tracked_array_name(le)) {
 					if (!bounds_expr_base_is_pointer(le))
-						error_tok(tok,
+						BOUNDS_COMM_DIAG(tok,
 						    "commutative subscript 'idx[arr]' bypasses "
 						    "-fbounds-check; rewrite as 'arr[idx]'");
 				}
 			}
 		}
+		} // !le_is_member
 		} // !comma_resolved
 	}
 	if (comma_resolved)
-		error_tok(tok,
+		BOUNDS_COMM_DIAG(tok,
 			  "-fbounds-check: comma operand subscript idx[(...,arr)] must be "
 			  "rewritten as arr[idx]");
 	{
@@ -2434,9 +2485,20 @@ static Token *try_bounds_check_subscript(Token *tok) {
 				left_ok_scan = tel && !tel->is_param && !tel->is_enum_const &&
 					       (tel->is_array || tel->is_vla_var);
 			}
-			if (!left_ok_scan &&
-			    bounds_find_array_ident(tok_next(tok), rb))
-				error_tok(tok,
+			// Only flag when the tracked array in the index is BARE
+			// (not followed by `[`). A subscripted `ctrl[0].addend`
+			// uses the array correctly and gets its own recursive
+			// bounds check — it's not a commutative bypass.
+			Token *hit = left_ok_scan ? NULL
+			                          : bounds_find_array_ident(tok_next(tok), rb);
+			while (hit) {
+				Token *nx = tok_next(hit);
+				if (!(nx && match_ch(nx, '[') && (nx->flags & TF_OPEN)))
+					break;
+				hit = bounds_find_array_ident(tok_next(nx), rb);
+			}
+			if (hit)
+				BOUNDS_COMM_DIAG(tok,
 					  "bounds-check (commutative): array name in index position cannot be verified "
 					  "(rewrite as array[index], or disable -fbounds-check for this expression)");
 		}
@@ -4515,12 +4577,10 @@ static Token *try_zero_init_decl(Token *tok) {
 		}
 	}
 
-	if (FEAT(F_ZEROINIT) && in_switch_scope_unbraced && !is_raw && !in_for_init()) {
-		error_tok(warn_loc,
-			  "variable declaration directly in switch body without braces. "
-			  "Wrap in braces: 'case N: { int x; ... }' to ensure safe zero-initialization, "
-			  "or use 'raw' to suppress zero-init.");
-	}
+	if (FEAT(F_ZEROINIT) && in_switch_scope_unbraced && !is_raw && !in_for_init())
+		SAFETY_DIAG(warn_loc,
+			    "variable declaration directly in switch body without braces "
+			    "(zero-init may be skipped by case labels); wrap in braces or use 'raw'");
 
 	// Braceless control body: wrap in braces (orelse expands to multiple stmts).
 	bool brace_wrap = ctrl_state.pending && ctrl_state.parens_just_closed;
@@ -6113,15 +6173,13 @@ static inline void track_ctrl_paren_open(void) {
 }
 
 static inline void track_ctrl_paren_close(void) {
-	// Pop paren scopes down to and including the matching one
-	while (ctx->scope_depth > 0) {
-		ScopeKind k = scope_stack[ctx->scope_depth - 1].kind;
-		if (k == SCOPE_FOR_PAREN || k == SCOPE_CTRL_PAREN) {
-			scope_pop();
-			break;
-		}
-		break;
-	}
+	// Only flip ctrl_state when we actually pop a CTRL/FOR paren; a ')'
+	// closing a nested non-ctrl paren (e.g. a cast inside _Generic, while
+	// ctrl_state.pending is still live) must not leak parens_just_closed.
+	if (ctx->scope_depth == 0) return;
+	ScopeKind k = scope_stack[ctx->scope_depth - 1].kind;
+	if (k != SCOPE_FOR_PAREN && k != SCOPE_CTRL_PAREN) return;
+	scope_pop();
 	ctrl_state.parens_just_closed = true;
 	ctx->at_stmt_start = true;
 }
@@ -6146,8 +6204,12 @@ static inline void track_generic_token(Token *tok) {
 static inline void track_common_token_state(Token *tok) {
 	if (__builtin_expect(ctrl_state.pending && tok->len == 1, 0)) {
 		char c = tok->ch0;
-		if (c == '(') track_ctrl_paren_open();
-		else if (c == ')') track_ctrl_paren_close();
+		// Parens inside _Generic() belong to the selector grammar;
+		// they must not feed the ctrl-paren state machine.
+		if (!in_generic()) {
+			if (c == '(') track_ctrl_paren_open();
+			else if (c == ')') track_ctrl_paren_close();
+		}
 	}
 	track_generic_token(tok);
 }
@@ -7929,10 +7991,9 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		if (FEAT(F_ZEROINIT) && brace_depth > 0 && !decl_raw &&
 		    braceless_close_idx == 0 &&
 		    cur_sid < scope_tree_count && scope_tree[cur_sid].is_switch)
-			error_tok(type_tok,
-				  "variable declaration directly in switch body without braces. "
-				  "Wrap in braces: 'case N: { int x; ... }' to ensure safe zero-initialization, "
-				  "or use 'raw' to suppress zero-init.");
+			SAFETY_DIAG(type_tok,
+				    "variable declaration directly in switch body without braces "
+				    "(zero-init may be skipped by case labels); wrap in braces or use 'raw'");
 
 		// Phase 1C: shadow detection
 		bool did_shadow = false;
@@ -9584,14 +9645,14 @@ static void p1_verify_cfg(void) {
 							  "case/default label may bypass VLA declaration");
 					if (d->decl.has_raw || d->decl.is_static_storage) continue;
 					if (d->decl.has_init)
-						error_tok(ents[i].tok,
-							  "case/default label may bypass declaration with "
-							  "initializer (undefined if jumped into)");
+						SAFETY_DIAG(ents[i].tok,
+							    "case/default label may bypass declaration with "
+							    "initializer (undefined if jumped into)");
 					if (!FEAT(F_ZEROINIT)) continue;
-					error_tok(ents[i].tok,
-						  "case/default label inside a nested block within a switch "
-						  "may bypass zero-initialization (move the label to the "
-						  "switch body or wrap in its own block)");
+					SAFETY_DIAG(ents[i].tok,
+						    "case/default label inside a nested block within a switch "
+						    "may bypass zero-initialization (move the label to the "
+						    "switch body or wrap in its own block)");
 				}
 				break;
 			}

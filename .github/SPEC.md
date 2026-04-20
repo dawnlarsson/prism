@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 1.1.2
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (5400+ tests + self-host stage1==stage2).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (5781+ self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do. It is organized in two parts: **Part I** covers the transpiler's architecture, internal processing model, and implementation details. **Part II** provides a formal language specification for Prism's extensions to C, described in terms of the C abstract machine independently of any implementation strategy.
 
@@ -15,7 +15,7 @@ Prism is a source-to-source C transpiler. It reads preprocessed C, transforms it
 
 **Standards compatibility:** Prism accepts C99, C11, and C23 input and emits standard C compatible with GCC, Clang, and MSVC. All standard C type specifiers, qualifiers, storage classes, attributes, and control-flow constructs are recognized and passed through correctly. C23 features including `typeof_unqual`, `constexpr`, `auto` type inference, `_BitInt(N)`, `[[...]]` attributes, `alignas`/`alignof`, `static_assert`, fixed-underlying-type enums (`enum E : int { ... }`), labeled declarations, and if/switch initializers are supported. GCC extensions `__typeof_unqual__` and `__typeof_unqual` are recognized as `TT_TYPE | TT_TYPEOF` and handled identically to C23 `typeof_unqual`. C23 TS 18661 extended float types (`_Float16`, `_Float32`, `_Float64`, `_Float128`, `_Float32x`, `_Float64x`, `_Float128x`) and decimal float types (`_Decimal32`, `_Decimal64`, `_Decimal128`) are registered as `TT_TYPE` keywords, ensuring zero-initialization and declaration detection work correctly. GCC-specific float types (`__float128`, `__float80`, `__fp16`, `__bf16`) are similarly registered. Do note Prism IS NOT officially certified in any way.
 
-Note: Prism is thoroughly empirically tested (self-hosting and 5400+ test cases) but **is not formally verified.** It is designed to compile standard-compliant code, but **may not catch every obscure constraint violation** defined by the ISO C standard.
+Note: Prism is thoroughly empirically tested (self-hosting and 5781+ test cases) but **is not formally verified.** It is designed to compile standard-compliant code, but **may not catch every obscure constraint violation** defined by the ISO C standard.
 
 The transpiler operates in two passes:
 
@@ -924,7 +924,7 @@ A subscript `X[Y]` is wrapped when all of the following hold:
 3. `X` is a known local array variable — `typedef_lookup(X)` returns an entry with `is_array` or `is_vla_var`, and the entry is not a parameter (`!is_param`) and not an enum constant (`!is_enum_const`)
 4. `X` is not a typedef name (`!is_known_typedef(X)`)
 5. The `[` token does not carry `P1_DECL_BRACKET` (declarator brackets, tagged in Phase 1 by `decl_array_dims`, are never wrapped)
-6. The `[` token does not carry `P1_UNEVAL_BRACKET` — tagged by `p1_mark_uneval_brackets` for every `[` inside a parenthesized `sizeof` / `_Alignof` / `alignof` / `typeof` / `typeof_unqual` / `offsetof` / `__builtin_offsetof` operand. The operand is unevaluated, and in `offsetof` a subscript names a struct field (unrelated to any same-named local), so wrapping would be a silent false negative or a spurious trap on VLAs.
+6. The `[` token does not carry `P1_UNEVAL_BRACKET` — tagged by `p1_mark_uneval_brackets` for every `[` inside a parenthesized `sizeof` / `_Alignof` / `alignof` / `typeof` / `typeof_unqual` / `offsetof` / `__builtin_offsetof` operand, the controlling expression of `_Generic`, the predicate of `_Static_assert` / `static_assert`, **and every `[` inside a file-scope (static-storage) initializer**. The first four are unevaluated operands; the last case is required because C99 §6.7.8p4 / C11 §6.7.9p4 / C23 §6.7.11p4 mandate that initializers for objects of static storage duration be constant expressions, and wrapping a subscript in `__prism_bchk(...)` turns it into a non-constant function call ("initializer element is not constant"). In `offsetof` a subscript names a struct field (unrelated to any same-named local), so wrapping would be a silent false negative or a spurious trap on VLAs.
 7. The `[` is not a C23 attribute opener (`!TF_C23_ATTR`)
 8. The token immediately before `X` is not a `.` or `->` member operator (`!(prev_tag & TT_MEMBER)`) — `s.arr[i]` and `p->arr[i]` name a struct field, whose size is unrelated to any same-named local
 9. The token immediately before `X` is not a unary `&` (address-of) — C permits one-past-end addresses, so `&arr[len]` is legal and must not trap. Binary `&` (bitwise AND) is distinguished from unary `&` by peeking one token further back for a value-producing token (identifier, number, string, `)`, `]`).
@@ -951,7 +951,7 @@ Array variables are registered into the typedef table with `is_array = true` by 
 | `a[i]` where `a` is an array parameter (`int a[10]`) | No | Parameter entries are filtered via `is_param` |
 | `gArr[i]` at file scope | No | File-scope arrays are not registered (v1 limitation) |
 | `arr[i]` inside `raw { ... }` | N/A — `raw` suppresses Prism transformations at parse time | |
-| `idx[arr]`, `len[b]`, `2[arr]`, or any form where a **tracked** local array name appears only **inside** the subscript (index) and the left-hand base is not that array | **Compile error** | Commutative / hidden-array subscripts cannot be checked with the v1 `last_emitted` model; must be rewritten (e.g. `arr[idx]`) or use `-fno-bounds-check` for that expression. **Rationale:** ISO C 6.5.2.1 — `E1[E2]` is defined in terms of `*((E1)+(E2))`; silently wrapping only `arr[i]` would miss `idx[(1 ? a : b)]`-style bypasses. |
+| `idx[arr]`, `len[b]`, `2[arr]`, or any form where a **tracked** local array name appears **bare** (not itself subscripted) inside the subscript (index) and the left-hand base is not that array | **Compile error** | Commutative / hidden-array subscripts cannot be checked with the v1 `last_emitted` model; must be rewritten (e.g. `arr[idx]`) or use `-fno-bounds-check` for that expression. **Rationale:** ISO C 6.5.2.1 — `E1[E2]` is defined in terms of `*((E1)+(E2))`; silently wrapping only `arr[i]` would miss `idx[(1 ? a : b)]`-style bypasses. A tracked array name that is itself subscripted in the index (`ptr[arr[0].field]`) is not a bypass — the inner subscript gets its own recursive bounds check. |
 
 
 The index expression **is** re-walked recursively: `arr[m[i]]` wraps both subscripts. The inner walk uses the full dispatch chain (statement expressions, balanced groups, nested bounds checks).
@@ -965,7 +965,7 @@ The bounds helper takes `idx` by value, so any side effects in the index (`arr[i
 - **Flag:** `F_BOUNDS_CHECK = 256` (parse.c) and `PrismFeatures.bounds_check` (prism.c)
 - **CLI:** `-fbounds-check` / `-fno-bounds-check`
 - **Declarator tagging:** `decl_array_dims` sets `P1_DECL_BRACKET = 1 << 9` on every declarator `[`
-- **Unevaluated-operand tagging:** `p1_mark_uneval_brackets` sets `P1_UNEVAL_BRACKET = 1 << 10` on every `[` inside a parenthesized `sizeof` / `_Alignof` / `alignof` / `typeof` / `__typeof` / `offsetof` / `__builtin_offsetof` operand. Runs once per TU, gated on `F_BOUNDS_CHECK`. Recognition uses `TF_SIZEOF` (sizeof/alignof/_Alignof/offsetof), `TT_TYPEOF` (typeof family), and a lexeme match on `__builtin_offsetof`.
+- **Unevaluated-operand tagging:** `p1_mark_uneval_brackets` sets `P1_UNEVAL_BRACKET = 1 << 10` on every `[` inside a parenthesized `sizeof` / `_Alignof` / `alignof` / `typeof` / `__typeof` / `offsetof` / `__builtin_offsetof` operand, the `_Generic` controlling expression, the `_Static_assert` / `static_assert` predicate, and any file-scope (static-storage) initializer. Runs once per TU, gated on `F_BOUNDS_CHECK`. File-scope initializers are detected by tracking curly-brace depth: every `=` at depth 0 opens an initializer that stays open until the matching `;`, tagging every `[` in between regardless of nesting depth. Recognition for the other cases uses `TF_SIZEOF` (sizeof/alignof/_Alignof/offsetof), `TT_TYPEOF` (typeof family), `TT_GENERIC`, lexeme match on `_Static_assert` / `static_assert` / `__builtin_offsetof`.
 - **Shadow registration:** Phase 1D declarator loop registers plain local array variables via `typedef_add_shadow(..., is_array=true)` when the feature is on
 - **Preamble helper:** emitted in `transpile_tokens` after `emit_system_includes`
 - **Emission hook:** `try_bounds_check_subscript` is called from the main Pass 2 emit loop and from `walk_balanced` (covering function-call arguments, declaration initializers, and other balanced groups)
@@ -994,7 +994,7 @@ On by default (Prism's philosophy is opt-out, not opt-in). Disable with `-fno-bo
 
 ### -fno-safety
 
-When `warn_safety` is enabled (`-fno-safety`), CFG violations (goto skipping defers/declarations, switch/case bypassing defers) are downgraded from errors to warnings. VLA skip violations remain hard errors regardless.
+When `warn_safety` is enabled (`-fno-safety`), CFG violations (goto skipping defers/declarations, switch/case bypassing defers) are downgraded from errors to warnings. VLA skip violations remain hard errors regardless. Under `-fbounds-check`, commutative-subscript bypass diagnostics (`idx[arr]`, `(idx)[arr]`, `idx[(...,arr)]`, brute-scan fallback) are likewise downgraded to warnings and the expression is emitted raw (unwrapped) — the user opted out of safety for this subscript. Under `-fzeroinit`, unbraced declarations directly in a `switch` body, case/default labels inside nested blocks that bypass zero-initialization, and case/default labels that bypass a declaration with an initializer (C99 §6.8.4.2p4 undefined-if-jumped-into) are also downgraded to warnings (Lemon-generated parsers emit the first; `coroutine`/protothread macros and binutils bfd `compress.c`/`elf64-x86-64.c` emit the latter two). Declarator / unevaluated-operand rejections remain hard errors (they are structural, not safety, issues).
 
 ### longjmp error recovery (library mode)
 

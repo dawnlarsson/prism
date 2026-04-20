@@ -4218,6 +4218,125 @@ static void test_typeof_struct_attr_memset(void) {
 	}
 }
 
+/* Regression: `-fno-safety` must downgrade unbraced-switch-decl diagnostics to
+ * warnings (not hard error).  Lemon-generated parsers (sqlite parse.c) emit
+ * `YYMINORTYPE yylhsminor;` directly above `case 0:` in the switch body, and
+ * a case label inside a nested do/while block. Both are safety warnings under
+ * `-fno-safety`, per SPEC §`-fno-safety`. */
+static void test_no_safety_downgrade_switch_unbraced(void) {
+	printf("\n--- -fno-safety downgrade: switch unbraced decl ---\n");
+
+	// Case 1: unbraced decl directly in switch body
+	{
+		PrismFeatures f = prism_defaults();
+		f.warn_safety = true;
+		PrismResult r = prism_transpile_source(
+		    "void f(int x){ switch(x){ int y; case 0: y=1; break; } }\n",
+		    "nosafe_switch1.c", f);
+		CHECK_EQ(r.status, PRISM_OK,
+			 "nosafe-switch-unbraced: -fno-safety downgrades to warning");
+		prism_free(&r);
+	}
+
+	// Case 2: case label inside nested block (bypasses zero-init)
+	{
+		PrismFeatures f = prism_defaults();
+		f.warn_safety = true;
+		PrismResult r = prism_transpile_source(
+		    "void f(int x){ switch(x){ default: do { case 1: x++; } while(0); } }\n",
+		    "nosafe_switch2.c", f);
+		CHECK_EQ(r.status, PRISM_OK,
+			 "nosafe-case-in-nested: -fno-safety downgrades to warning");
+		prism_free(&r);
+	}
+
+	// Case 3: case label bypassing initialized decl (binutils compress.c pattern)
+	{
+		PrismFeatures f = prism_defaults();
+		f.warn_safety = true;
+		PrismResult r = prism_transpile_source(
+		    "int g(int s, int *out){ switch(s){ case 0: { int init = s+1;\n"
+		    " if(s<0) goto fail; *out = init; return 0; fail: return -1; }\n"
+		    " case 1: return 2; default: return 3; } }\n",
+		    "nosafe_switch3.c", f);
+		CHECK_EQ(r.status, PRISM_OK,
+			 "nosafe-case-bypass-init-decl: -fno-safety downgrades to warning");
+		prism_free(&r);
+	}
+
+	// Case 4: forward goto bypassing initialized decl (binutils elf64-x86-64.c pattern)
+	{
+		PrismFeatures f = prism_defaults();
+		f.warn_safety = true;
+		PrismResult r = prism_transpile_source(
+		    "int h(int c){ if(c) goto bad; int x = c+1; (void)x; return 0; bad: return 1; }\n",
+		    "nosafe_goto4.c", f);
+		CHECK_EQ(r.status, PRISM_OK,
+			 "nosafe-goto-skip-init-decl: -fno-safety downgrades to warning");
+		prism_free(&r);
+	}
+}
+
+/* Regression: a `)` that closes a non-control paren (e.g. a cast inside a
+ * `_Generic` selector: `_Generic(0 ? (int*)0 : (void*)1, ...)`) must NOT flip
+ * `ctrl_state.parens_just_closed` for the enclosing `if/while/for/switch`.
+ * Before the fix, `track_ctrl_paren_close` set `parens_just_closed = true`
+ * unconditionally when any `)` fired with `ctrl_state.pending` still live,
+ * and the next top-level declaration after the enclosing braced body was
+ * wrongly wrapped in `{ ... }`, producing code like
+ *     } {  char *p = fmt; }  *p++ = '%';
+ * which leaks the declaration's scope and makes every subsequent use of `p`
+ * reference an undeclared identifier.  Seen in binutils/nm.c `set_print_format`
+ * where glibc 2.40+ expands `strstr(…)` to a `_Generic` containing a cast.
+ * This is a silent miscompilation, not a diagnostic: without -fno-safety the
+ * user still gets a bogus `'p' undeclared` from the backend compiler. */
+static void test_generic_cast_no_brace_leak(void) {
+	printf("\n--- _Generic cast inside braced if body must not wrap next decl ---\n");
+	{
+		PrismResult r = prism_transpile_source(
+		    "static char fmt[10];\n"
+		    "void f(int w){\n"
+		    "  if (w) {\n"
+		    "    if (_Generic(0 ? (int*)0 : (void*)1, const void*: 1, default: 0) != 0)\n"
+		    "      ;\n"
+		    "  }\n"
+		    "  char *p = fmt;\n"
+		    "  *p++ = '%';\n"
+		    "}\n",
+		    "generic_cast_brace.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "generic-cast-brace: transpiles OK");
+		if (r.output) {
+			/* Must NOT emit the spurious wrapper `} {` followed by the decl
+			 * re-closed `}` before the next statement. */
+			CHECK(strstr(r.output, "} {") == NULL,
+			      "generic-cast-brace: no spurious brace after braced if");
+			CHECK(strstr(r.output, "char *p = fmt; }") == NULL,
+			      "generic-cast-brace: decl not wrapped in stray braces");
+		}
+		prism_free(&r);
+	}
+
+	/* Bare cast in expression statement inside a braced if body — same shape,
+	 * no `_Generic` involved.  Before the fix this was already correct because
+	 * the cast lives inside an expression paren, not a ctrl paren; add it as a
+	 * guard against future regressions in `track_ctrl_paren_close`. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "static char fmt[10];\n"
+		    "void f(int w){\n"
+		    "  if (w) { (void)(int*)0; }\n"
+		    "  char *p = fmt;\n"
+		    "  *p++ = '%';\n"
+		    "}\n",
+		    "plain_cast_brace.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "plain-cast-brace: transpiles OK");
+		if (r.output)
+			CHECK(strstr(r.output, "} {") == NULL,
+			      "plain-cast-brace: no spurious brace after braced if");
+		prism_free(&r);
+	}
+}
+
 // case (expr): where last_emitted before : is ) didn't reset at_stmt_start.
 // Declarations after such labels missed zero-initialization.
 static void test_case_paren_expr_zeroinit(void) {
@@ -4574,4 +4693,8 @@ void run_zeroinit_tests(void) {
 
 	// typeof(struct __attribute__(...) Tag) must get memset (not skip as function type)
 	GNUC_ONLY(test_typeof_struct_attr_memset());
+
+        // -fno-safety must downgrade switch-unbraced-decl & nested-case diagnostics
+        test_no_safety_downgrade_switch_unbraced();
+	test_generic_cast_no_brace_leak();
 }
