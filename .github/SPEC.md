@@ -1022,12 +1022,25 @@ These limits are enforced with hard errors. Exceeding any limit halts transpilat
 | Mode | Command | Action |
 |---|---|---|
 | Compile (default) | `prism src.c -o out` | Transpile + pipe to backend CC |
-| Run | `prism run src.c` | Compile to temp executable → execute |
+| Run | `prism run src.c [-- args]` | Compile to temp executable → execute (args forwarded to binary) |
 | Transpile | `prism transpile src.c` | Emit transformed C to stdout |
 | Install | `prism install` | Install binary to `/usr/local/bin/prism` |
 | Passthrough | `prism -v` (no source files) | Forward all args to backend CC |
 | Help | `prism --help` | Print usage |
 | Version | `prism --version` | Print version + CC version |
+
+### Program arguments in `run` mode
+
+A literal `--` on the command line acts as a separator: every token after `--` is stored in `Cli.prog_args` and forwarded verbatim as additional `argv[]` entries to the compiled binary launched under `CLI_RUN`. Tokens after `--` are NOT parsed as Prism/CC flags, NOT treated as source files, and NOT forwarded to the backend compiler. Before `--`, the usual parsing rules apply (Prism flags, CC flags, `.c`/`.i` sources, subcommand keyword).
+
+```
+prism -O3 -flto run build.c -- --verbose input.txt 42
+  │    └─── cc args ──┘ │    └─ prog_args ─────────┘
+  │                     └─ source
+  └─ prism binary
+```
+
+The `run` subcommand is the only mode that consumes `prog_args`; in every other mode they are ignored (but still parsed, so `--` is always safe as a general CLI terminator). When `prog_args` is empty, the binary is launched with a single-element `argv = {temp_exe, NULL}` exactly as before — behaviour for existing scripts that do not use `--` is unchanged.
 
 ### Feature flags
 
@@ -1042,6 +1055,7 @@ These limits are enforced with hard errors. Exceeding any limit halts transpilat
 | `-fno-flatten-headers` | Disable header flattening |
 | `-fno-auto-unreachable` | Disable auto-unreachable injection after noreturn calls |
 | `-fno-auto-static` | Disable auto-static promotion of const arrays with literal inits |
+| `-fno-link-pragma` | Ignore `#pragma link` directives (see §8.x) |
 | `--prism-cc=<compiler>` | Use specific compiler backend |
 | `--prism-verbose` | Show commands being executed |
 
@@ -1080,6 +1094,46 @@ During preprocessing (`cc -E`), Prism injects `-D_POSIX_C_SOURCE=200809L` and `-
 ### Backend warning suppression
 
 In compile and run modes, Prism injects warning suppression flags into the backend compiler invocation via `add_warn_suppress` to prevent spurious warnings from Prism-generated code patterns (e.g., unused variables from hoisted temps, implicit fallthrough from orelse expansion). For GCC/Clang: `-Wno-type-limits`, `-Wno-cast-align`, `-Wno-implicit-fallthrough`, `-Wno-unused-function`, `-Wno-unused-variable`, `-Wno-unused-parameter`, plus `-Wno-unknown-warning-option` (clang) or `-Wno-logical-op` (GCC). For MSVC: `/wd4100`, `/wd4189`, `/wd4244`, `/wd4267`, `/wd4068`. These are NOT injected in transpile mode (stdout output only).
+
+### `#pragma link` directive
+
+Source files can declare platform-specific linker inputs inline via a `#pragma link` directive. `collect_link_pragmas` runs at the top of `compile_sources` (before the backend compiler is invoked) and appends matching linker arguments to `Cli.cc_args`. It performs a pure text-level scan of each input source file (raw lines, before preprocessing) so directives remain visible under `-fflatten-headers` and across `cc -E` runs.
+
+**Syntax:**
+
+```
+#pragma link <platform> <name>...
+```
+
+- `<platform>` is one of:
+  - `*` — always match
+  - `macos`, `linux`, `windows` — match any architecture of that OS
+  - `macos_arm64`, `macos_x86_64` — exact OS+arch
+  - `linux_arm64`, `linux_x86_64`, `linux_riscv64` — exact OS+arch
+  - `windows_x86_64`, `windows_arm64` — exact OS+arch
+- Directives whose platform does not match the host are discarded. Unknown platform strings are silently skipped (forward-compatible).
+- `<name>...` is a whitespace-separated list. For each name:
+  - If the name starts with `-`, it is passed to the backend compiler verbatim (e.g. `-lm`, `-framework`, `Foo`).
+  - Otherwise, on macOS hosts the name is expanded to `-framework <name>`; on all other hosts it is expanded to `-l<name>`.
+- The directive must begin at the start of a physical line (after optional leading whitespace). Multi-line continuations and block comments inside the directive are not supported. A line without a `<platform>` token is ignored.
+
+**Host platform tag** is resolved at compile time from `__APPLE__`, `__linux__`, `_WIN32`/`_WIN64`, `__aarch64__`/`__arm64__`, `__x86_64__`, `__riscv` predefined macros (see `host_platform_tag`). Cross-compilation is NOT detected automatically — if the backend compiler is targeting a different platform, pass `-fno-link-pragma` and provide `-l`/`-framework` flags on the command line.
+
+**Examples:**
+
+```c
+#pragma link macos_arm64 Cocoa QuartzCore   // → -framework Cocoa -framework QuartzCore on macOS arm64 only
+#pragma link macos Foundation               // → -framework Foundation on any macOS arch
+#pragma link linux m pthread                // → -lm -lpthread on any Linux arch
+#pragma link windows_x86_64 -luser32        // → -luser32 on Windows x64
+#pragma link * -lc_custom                   // → -lc_custom on every host
+```
+
+**Interaction with transpile mode.** `collect_link_pragmas` runs only in `compile_sources` (compile and run modes). In `transpile` mode the directive is emitted verbatim to stdout as a `TK_PREP_DIR` token — consumers of the transpiled output are expected to strip or re-honour it themselves.
+
+**`-fno-link-pragma`.** When set, the scanner is a no-op and no linker args are appended. The `#pragma link` lines still appear in Pass 2 output (verbatim), but the backend compiler will ignore unrecognised pragmas with its own warning control.
+
+**Memory.** Expanded framework/`-l<name>` argument strings are heap-allocated and appended to `cc_args`. `cli_free` only frees the top-level `cc_args` vector, not individual strings — this matches the existing `cc_args` pattern for all non-pragma args (they come straight from `argv` which has program-lifetime) and is acceptable for a short-lived CLI.
 
 ---
 

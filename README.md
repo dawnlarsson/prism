@@ -473,33 +473,45 @@ Prism uses a GCC-compatible interface — most flags pass through to the backend
 Prism v1.1.2 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
+       prism [options] run src.c [-- prog_args...]
 
 Commands:
-  run <src.c>           Transpile, compile, and run
-  transpile <src.c>     Output transpiled C to stdout
-  install [src.c...]    Install prism to /usr/local/bin/prism
+  run <src.c> [-- args]  Transpile, compile, and run (args passed to binary)
+  transpile <src.c>      Output transpiled C to stdout
+  install [src.c...]     Install prism to /usr/local/bin/prism
 
 Prism Flags (consumed, not passed to CC):
-  -fno-defer            Disable defer
-  -fno-zeroinit         Disable zero-initialization
-  -fno-orelse           Disable orelse keyword
-  -fno-line-directives  Disable #line directives
-  -fno-safety           Safety checks warn instead of error
-  -fflatten-headers     Flatten headers into single output
-  -fno-flatten-headers  Disable header flattening
-  -fno-auto-unreachable Disable __builtin_unreachable after noreturn calls
-  -fno-auto-static      Disable const array → static promotion
-  --prism-cc=<compiler> Use specific compiler
-  --prism-verbose       Show commands
+  -fno-defer             Disable defer
+  -fno-zeroinit          Disable zero-initialization
+  -fno-orelse            Disable orelse keyword
+  -fno-line-directives   Disable #line directives
+  -fno-safety            Safety checks warn instead of error
+  -fflatten-headers      Flatten headers into single output
+  -fno-flatten-headers   Disable header flattening
+  -fno-auto-unreachable  Disable __builtin_unreachable after noreturn calls
+  -fno-auto-static       Disable auto-static for const arrays with literal inits
+  -fno-bounds-check      Disable runtime bounds checks on local/param array subscripts
+  -fno-link-pragma       Ignore #pragma link directives in source
+  --prism-cc=<compiler>  Use specific compiler
+  --prism-verbose        Show commands
+  --                     Separator: remaining args are passed to the binary in `run` mode
 
 All other flags are passed through to CC.
 
 Examples:
-  prism foo.c -o foo               Compile (GCC-compatible)
-  prism run foo.c                  Compile and run
-  prism transpile foo.c            Output transpiled C
-  prism -O2 -Wall foo.c -o foo     With optimization
-  CC=clang prism foo.c             Use clang as backend
+  prism foo.c -o foo                  Compile (GCC-compatible)
+  prism run foo.c                     Compile and run
+  prism -O2 run foo.c -- arg1 arg2    Compile and run with program args
+  prism transpile foo.c               Output transpiled C
+  prism -O2 -Wall foo.c -o foo        With optimization
+  CC=clang prism foo.c                Use clang as backend
+
+Link Pragma (source-embedded linker flags):
+  #pragma link <platform> <names...>
+    platform: * | macos | macos_arm64 | macos_x86_64 | linux | linux_arm64
+              linux_x86_64 | linux_riscv64 | windows | windows_x86_64 | windows_arm64
+    name:     plain name (e.g. `Cocoa`, `m`) — macOS => -framework, else -l<name>
+              or a literal flag starting with `-` (e.g. `-lm`, `-framework Foo`)
 
 Apache 2.0 license (c) Dawn Larsson 2026
 https://github.com/dawnlarsson/prism

@@ -4049,6 +4049,97 @@ static void test_cli_split_D_flag_not_source(void) {
 	unlink(prism_bin);
 	rmdir(dir);
 }
+
+// End-to-end: `prism run <src> -- <args>` forwards args to the compiled binary.
+// Also verifies that `#pragma link * -lm` is picked up (on platforms with libm).
+static void test_cli_run_prog_args_and_link_pragma(void) {
+	printf("\n--- CLI run prog_args + #pragma link ---\n");
+
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_runargs_");
+	CHECK(dir != NULL, "runargs: mkdtemp");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], src_path[PATH_MAX];
+	char stdout_path[PATH_MAX], stderr_path[PATH_MAX];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	snprintf(src_path, sizeof(src_path), "%s/prog.c", dir);
+	snprintf(stdout_path, sizeof(stdout_path), "%s/out.txt", dir);
+	snprintf(stderr_path, sizeof(stderr_path), "%s/err.txt", dir);
+
+	FILE *f = fopen(src_path, "w");
+	CHECK(f != NULL, "runargs: create src");
+	if (!f) { rmdir(dir); return; }
+	// The `*` platform matches everywhere; use a verbatim -l flag that
+	// always resolves (libm on POSIX, MSVCRT auto-links on Windows).
+	fputs("#pragma link * \n"  // empty payload — must be a no-op
+	      "#include <stdio.h>\n"
+	      "int main(int argc, char **argv) {\n"
+	      "    printf(\"argc=%d\\n\", argc);\n"
+	      "    for (int i = 1; i < argc; i++) printf(\"arg:%s\\n\", argv[i]);\n"
+	      "    return 0;\n"
+	      "}\n", f);
+	fclose(f);
+
+	if (!build_test_prism_binary(prism_bin, "runargs: build prism")) {
+		unlink(src_path); rmdir(dir); return;
+	}
+
+	// Case 1: `prism run src` with no args → argc=1
+	{
+		char *argv[] = {prism_bin, "run", src_path, NULL};
+		int st = run_exec_argv_capture(argv, stdout_path, stderr_path);
+		CHECK_EQ(st, 0, "runargs: no-args exit=0");
+	}
+
+	// Case 2: `prism run src -- a b c` → argc=4
+	{
+		char *argv[] = {prism_bin, "run", src_path, "--", "a", "b", "c", NULL};
+		int st = run_exec_argv_capture(argv, stdout_path, stderr_path);
+		CHECK_EQ(st, 0, "runargs: with-args exit=0");
+		FILE *sf = fopen(stdout_path, "r");
+		if (sf) {
+			char buf[256] = {0};
+			size_t nr = fread(buf, 1, sizeof(buf) - 1, sf);
+			fclose(sf);
+			(void)nr;
+			CHECK(strstr(buf, "argc=4") != NULL, "runargs: argc=4");
+			CHECK(strstr(buf, "arg:a") != NULL, "runargs: arg a present");
+			CHECK(strstr(buf, "arg:b") != NULL, "runargs: arg b present");
+			CHECK(strstr(buf, "arg:c") != NULL, "runargs: arg c present");
+		}
+	}
+
+	// Case 3: flags before `run` are preserved as cc flags
+	{
+		char *argv[] = {prism_bin, "-O2", "run", src_path, "--", "z", NULL};
+		int st = run_exec_argv_capture(argv, stdout_path, stderr_path);
+		CHECK_EQ(st, 0, "runargs: -O2 run -- z exit=0");
+	}
+
+	// Case 4: `-fno-link-pragma` is consumed (not forwarded to cc)
+	{
+		// Source with a bogus link pragma that *would* fail if passed to cc
+		char bad_path[PATH_MAX];
+		snprintf(bad_path, sizeof(bad_path), "%s/bad.c", dir);
+		FILE *bf = fopen(bad_path, "w");
+		if (bf) {
+			fputs("#pragma link * -ldefinitelynotalib_xyz123\n"
+			      "int main(void) { return 0; }\n", bf);
+			fclose(bf);
+			char *argv[] = {prism_bin, "-fno-link-pragma", "run", bad_path, NULL};
+			int st = run_exec_argv_capture(argv, stdout_path, stderr_path);
+			CHECK_EQ(st, 0, "runargs: -fno-link-pragma ignores bad link");
+			unlink(bad_path);
+		}
+	}
+
+	unlink(stdout_path);
+	unlink(stderr_path);
+	unlink(src_path);
+	unlink(prism_bin);
+	rmdir(dir);
+}
 #endif
 
 static void test_cli_parse_unit(void) {
@@ -4564,6 +4655,56 @@ static void test_cli_parse_unit(void) {
 		Cli cli = cli_parse(3, argv);
 		CHECK_EQ(cli.source_count, 1, "cli: foo.c not eaten by -d");
 		CHECK_EQ(cli.cc_arg_count, 1, "cli: -d alone");
+		cli_free(&cli);
+	}
+
+	// 50. `--` separator: trailing args go to prog_args (run mode)
+	{
+		char *argv[] = {"prism", "run", "foo.c", "--", "a", "b", "42", NULL};
+		Cli cli = cli_parse(7, argv);
+		CHECK_EQ(cli.mode, CLI_RUN, "cli: -- run mode");
+		CHECK_EQ(cli.source_count, 1, "cli: -- source captured");
+		CHECK_EQ(cli.prog_arg_count, 3, "cli: -- prog_args count");
+		CHECK(cli.prog_arg_count >= 1 && !strcmp(cli.prog_args[0], "a"), "cli: -- prog[0]=a");
+		CHECK(cli.prog_arg_count >= 3 && !strcmp(cli.prog_args[2], "42"), "cli: -- prog[2]=42");
+		CHECK_EQ(cli.cc_arg_count, 0, "cli: -- args not in cc_args");
+		cli_free(&cli);
+	}
+
+	// 51. `--` with leading flags preserved: `prism -O3 run foo.c -- x y`
+	{
+		char *argv[] = {"prism", "-O3", "run", "foo.c", "--", "x", "y", NULL};
+		Cli cli = cli_parse(7, argv);
+		CHECK_EQ(cli.mode, CLI_RUN, "cli: -O3 run -- mode");
+		CHECK_EQ(cli.cc_arg_count, 1, "cli: -O3 kept in cc_args");
+		CHECK_EQ(cli.prog_arg_count, 2, "cli: -- prog_args count");
+		cli_free(&cli);
+	}
+
+	// 52. `--` with nothing after: zero prog_args
+	{
+		char *argv[] = {"prism", "run", "foo.c", "--", NULL};
+		Cli cli = cli_parse(4, argv);
+		CHECK_EQ(cli.prog_arg_count, 0, "cli: -- with no args");
+		cli_free(&cli);
+	}
+
+	// 53. `--` preserves flag-like trailing args literally
+	{
+		char *argv[] = {"prism", "run", "foo.c", "--", "-O3", "--help", NULL};
+		Cli cli = cli_parse(6, argv);
+		CHECK_EQ(cli.prog_arg_count, 2, "cli: -- flag-like args count");
+		CHECK(cli.prog_arg_count >= 1 && !strcmp(cli.prog_args[0], "-O3"), "cli: -- prog[0]=-O3 verbatim");
+		CHECK(cli.action == CLI_ACT_NONE, "cli: --help after -- ignored");
+		cli_free(&cli);
+	}
+
+	// 54. -fno-link-pragma sets no_link_pragma flag
+	{
+		char *argv[] = {"prism", "-fno-link-pragma", "foo.c", NULL};
+		Cli cli = cli_parse(3, argv);
+		CHECK(cli.no_link_pragma, "cli: -fno-link-pragma consumed");
+		CHECK_EQ(cli.cc_arg_count, 0, "cli: -fno-link-pragma not forwarded");
 		cli_free(&cli);
 	}
 }
@@ -7205,6 +7346,7 @@ void run_api_tests_3(void) {
 	test_cli_dep_flags_passthrough();
 	test_version_shows_backend_cc();
 	test_cli_split_D_flag_not_source();
+	test_cli_run_prog_args_and_link_pragma();
 	test_coreutils_gnulib_generic_decl_leak();
 	test_binutils_gprofng_regressions();
 	test_install_temp_predictable_symlink_hijack();

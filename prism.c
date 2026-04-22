@@ -212,16 +212,19 @@ typedef struct {
 	const char **sources;
 	const char **cc_args;
 	const char **dep_args;  // dependency-generation flags (routed to preprocessor only)
+	const char **prog_args; // args passed to the compiled binary in `run` mode (after `--`)
 	const char *output;
 	const char *cc;
 	int source_count, source_cap;
 	int cc_arg_count, cc_arg_cap;
 	int dep_arg_count, dep_arg_cap;
+	int prog_arg_count, prog_arg_cap;
 	CliMode mode;
 	CliAction action;
 	bool verbose;
 	bool compile_only;
 	bool passthrough;
+	bool no_link_pragma;     // -fno-link-pragma: suppress #pragma link libs
 } Cli;
 
 // --- Signal & Temp File Cleanup ---
@@ -10444,6 +10447,14 @@ static Cli cli_parse(int argc, char **argv) {
 	for (int i = 1; i < argc; i++) {
 		char *a = argv[i];
 
+		// -- `--` separator: all remaining args are forwarded to the
+		//    compiled binary in `run` mode; otherwise ignored. --
+		if (a[0] == '-' && a[1] == '-' && !a[2]) {
+			for (int j = i + 1; j < argc; j++)
+				CLI_PUSH(cli.prog_args, cli.prog_arg_count, cli.prog_arg_cap, argv[j]);
+			break;
+		}
+
 		// -- Non-flag arguments --
 #ifdef _WIN32
 		if (a[0] != '-' && a[0] != '/') {
@@ -10514,6 +10525,7 @@ static Cli cli_parse(int argc, char **argv) {
 			if (!strcmp(a, "-fno-auto-static"))      { cli.features.auto_static = false; continue; }
 			if (!strcmp(a, "-fbounds-check"))        { cli.features.bounds_check = true; continue; }
 			if (!strcmp(a, "-fno-bounds-check"))     { cli.features.bounds_check = false; continue; }
+			if (!strcmp(a, "-fno-link-pragma"))      { cli.no_link_pragma = true; continue; }
 			// fall through to forward
 		} else {
 			// Dependency-generation flags → preprocessor only
@@ -10539,9 +10551,11 @@ static void cli_free(Cli *cli) {
 	free(cli->sources);
 	free(cli->cc_args);
 	free(cli->dep_args);
+	free(cli->prog_args);
 	cli->sources = NULL;
 	cli->cc_args = NULL;
 	cli->dep_args = NULL;
+	cli->prog_args = NULL;
 }
 
 // --- Build, Install & Entry Point ---
@@ -10964,31 +10978,41 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 
 static void print_help(void) {
 	printf("Prism v%s - Robust C transpiler\n\n"
-	       "Usage: prism [options] source.c... [-o output]\n\n"
+	       "Usage: prism [options] source.c... [-o output]\n"
+	       "       prism [options] run src.c [-- prog_args...]\n\n"
 	       "Commands:\n"
-	       "  run <src.c>           Transpile, compile, and run\n"
-	       "  transpile <src.c>     Output transpiled C to stdout\n"
-	       "  install [src.c...]    Install prism to %s\n\n"
+	       "  run <src.c> [-- args]  Transpile, compile, and run (args passed to binary)\n"
+	       "  transpile <src.c>      Output transpiled C to stdout\n"
+	       "  install [src.c...]     Install prism to %s\n\n"
 	       "Prism Flags (consumed, not passed to CC):\n"
-	       "  -fno-defer            Disable defer\n"
-	       "  -fno-zeroinit         Disable zero-initialization\n"
-	       "  -fno-orelse           Disable orelse keyword\n"
-	       "  -fno-line-directives  Disable #line directives\n"
-	       "  -fno-safety           Safety checks warn instead of error\n"
-	       "  -fflatten-headers     Flatten headers into single output\n"
-	       "  -fno-flatten-headers  Disable header flattening\n"
-	       "  -fno-auto-unreachable Disable __builtin_unreachable after noreturn calls\n"
-	       "  -fno-auto-static      Disable auto-static for const arrays with literal inits\n"
-	       "  -fno-bounds-check     Disable runtime bounds checks on local/param array subscripts\n"
-	       "  --prism-cc=<compiler> Use specific compiler\n"
-	       "  --prism-verbose       Show commands\n\n"
+	       "  -fno-defer             Disable defer\n"
+	       "  -fno-zeroinit          Disable zero-initialization\n"
+	       "  -fno-orelse            Disable orelse keyword\n"
+	       "  -fno-line-directives   Disable #line directives\n"
+	       "  -fno-safety            Safety checks warn instead of error\n"
+	       "  -fflatten-headers      Flatten headers into single output\n"
+	       "  -fno-flatten-headers   Disable header flattening\n"
+	       "  -fno-auto-unreachable  Disable __builtin_unreachable after noreturn calls\n"
+	       "  -fno-auto-static       Disable auto-static for const arrays with literal inits\n"
+	       "  -fno-bounds-check      Disable runtime bounds checks on local/param array subscripts\n"
+	       "  -fno-link-pragma       Ignore #pragma link directives in source\n"
+	       "  --prism-cc=<compiler>  Use specific compiler\n"
+	       "  --prism-verbose        Show commands\n"
+	       "  --                     Separator: remaining args are passed to the binary in `run` mode\n\n"
 	       "All other flags are passed through to CC.\n\n"
 	       "Examples:\n"
-	       "  prism foo.c -o foo               Compile (GCC-compatible)\n"
-	       "  prism run foo.c                  Compile and run\n"
-	       "  prism transpile foo.c            Output transpiled C\n"
-	       "  prism -O2 -Wall foo.c -o foo     With optimization\n"
-	       "  CC=clang prism foo.c             Use clang as backend\n\n"
+	       "  prism foo.c -o foo                  Compile (GCC-compatible)\n"
+	       "  prism run foo.c                     Compile and run\n"
+	       "  prism -O2 run foo.c -- arg1 arg2    Compile and run with program args\n"
+	       "  prism transpile foo.c               Output transpiled C\n"
+	       "  prism -O2 -Wall foo.c -o foo        With optimization\n"
+	       "  CC=clang prism foo.c                Use clang as backend\n\n"
+	       "Link Pragma (source-embedded linker flags):\n"
+	       "  #pragma link <platform> <names...>\n"
+	       "    platform: * | macos | macos_arm64 | macos_x86_64 | linux | linux_arm64\n"
+	       "              linux_x86_64 | linux_riscv64 | windows | windows_x86_64 | windows_arm64\n"
+	       "    name:     plain name (e.g. `Cocoa`, `m`) — macOS => -framework, else -l<name>\n"
+	       "              or a literal flag starting with `-` (e.g. `-lm`, `-framework Foo`)\n\n"
 	       "Apache 2.0 license (c) Dawn Larsson 2026\n"
 	       "https://github.com/dawnlarsson/prism\n",
 	       PRISM_VERSION,
@@ -11246,8 +11270,157 @@ static int install_from_source(Cli *cli) {
 	return result;
 }
 
+// ---------------------------------------------------------------------
+// `#pragma link` directive scanner
+//
+// Syntax: #pragma link <platform> <name>...
+//   <platform> ::= * | <os> | <os>_<arch>
+//   <os>       ::= macos | linux | windows
+//   <arch>     ::= arm64 | x86_64 | riscv64
+//   <name>     ::= bare identifier (e.g. Cocoa, m, pthread) — on macOS
+//                  bare names become `-framework <name>`, elsewhere `-l<name>`.
+//                  Tokens starting with `-` are passed verbatim (multi-word
+//                  values like `-framework X` must be a single token pair).
+//
+// The directive must appear on a single line at the start of a physical line
+// (after optional whitespace). `#pragma link` with NO platform is a syntax
+// error and is ignored silently. Unknown platforms are silently skipped.
+// Disabled entirely by `-fno-link-pragma`.
+// ---------------------------------------------------------------------
+static const char *host_platform_tag(void) {
+#if defined(__APPLE__)
+	#if defined(__aarch64__) || defined(__arm64__)
+		return "macos_arm64";
+	#elif defined(__x86_64__)
+		return "macos_x86_64";
+	#else
+		return "macos";
+	#endif
+#elif defined(_WIN32) || defined(_WIN64)
+	#if defined(__aarch64__) || defined(_M_ARM64)
+		return "windows_arm64";
+	#else
+		return "windows_x86_64";
+	#endif
+#elif defined(__linux__)
+	#if defined(__aarch64__)
+		return "linux_arm64";
+	#elif defined(__x86_64__)
+		return "linux_x86_64";
+	#elif defined(__riscv)
+		return "linux_riscv64";
+	#else
+		return "linux";
+	#endif
+#else
+	return "unknown";
+#endif
+}
+
+// True if `platform` from a `#pragma link` directive matches the host.
+// Accepts `*`, the exact host tag, or the bare OS prefix (`macos`, `linux`, `windows`).
+static bool link_pragma_platform_matches(const char *platform, size_t plen, const char *host) {
+	if (plen == 1 && platform[0] == '*') return true;
+	size_t hlen = strlen(host);
+	if (plen == hlen && memcmp(platform, host, hlen) == 0) return true;
+	// Bare OS match: "macos" matches "macos_arm64", "linux" matches "linux_x86_64", etc.
+	const char *us = memchr(host, '_', hlen);
+	if (us) {
+		size_t os_len = (size_t)(us - host);
+		if (plen == os_len && memcmp(platform, host, os_len) == 0) return true;
+	}
+	return false;
+}
+
+// Scan one source file for `#pragma link <platform> <names>...`
+// directives that match the host platform; append resolved linker args
+// to cli->cc_args. Reads raw source (before preprocessing) so directives
+// are visible even with -fflatten-headers or header reuse.
+static void collect_link_pragmas_file(const char *path, Cli *cli, const char *host, bool macos) {
+	if (!path || cli->no_link_pragma) return;
+	FILE *f = fopen(path, "r");
+	if (!f) return;
+
+	char *line = NULL;
+	size_t cap = 0;
+	ssize_t n;
+	while ((n = getline(&line, &cap, f)) != -1) {
+		char *p = line;
+		while (*p == ' ' || *p == '\t') p++;
+		if (*p != '#') continue;
+		p++;
+		while (*p == ' ' || *p == '\t') p++;
+		if (strncmp(p, "pragma", 6) != 0) continue;
+		p += 6;
+		if (*p != ' ' && *p != '\t') continue;
+		while (*p == ' ' || *p == '\t') p++;
+		if (strncmp(p, "link", 4) != 0) continue;
+		p += 4;
+		if (*p != ' ' && *p != '\t') continue;
+		while (*p == ' ' || *p == '\t') p++;
+
+		// <platform>
+		char *plat = p;
+		while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+		size_t plen = (size_t)(p - plat);
+		if (plen == 0) continue;
+		bool match = link_pragma_platform_matches(plat, plen, host);
+
+		// Walk remaining whitespace-separated tokens
+		while (*p) {
+			while (*p == ' ' || *p == '\t') p++;
+			if (!*p || *p == '\n' || *p == '\r') break;
+			// Strip trailing line comment
+			if (p[0] == '/' && (p[1] == '/' || p[1] == '*')) break;
+			char *tok = p;
+			while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+			size_t tlen = (size_t)(p - tok);
+			if (!match || tlen == 0) continue;
+
+			if (tok[0] == '-') {
+				// Verbatim flag: pass as-is. Supports paired forms
+				// like `-framework Cocoa` where the next token is
+				// the flag's value — we don't special-case it here;
+				// users just write both tokens.
+				char *dup = malloc(tlen + 1);
+				if (!dup) { free(line); fclose(f); die("out of memory"); }
+				memcpy(dup, tok, tlen); dup[tlen] = 0;
+				CLI_PUSH(cli->cc_args, cli->cc_arg_count, cli->cc_arg_cap, dup);
+			} else if (macos) {
+				// macOS bare name → -framework <name>
+				char *dup = malloc(tlen + 1);
+				if (!dup) { free(line); fclose(f); die("out of memory"); }
+				memcpy(dup, tok, tlen); dup[tlen] = 0;
+				CLI_PUSH(cli->cc_args, cli->cc_arg_count, cli->cc_arg_cap, "-framework");
+				CLI_PUSH(cli->cc_args, cli->cc_arg_count, cli->cc_arg_cap, dup);
+			} else {
+				// Other OS: bare name → -l<name>
+				char *buf = malloc(tlen + 3);
+				if (!buf) { free(line); fclose(f); die("out of memory"); }
+				buf[0] = '-';
+				buf[1] = 'l';
+				memcpy(buf + 2, tok, tlen);
+				buf[tlen + 2] = 0;
+				CLI_PUSH(cli->cc_args, cli->cc_arg_count, cli->cc_arg_cap, buf);
+			}
+		}
+	}
+
+	free(line);
+	fclose(f);
+}
+
+static void collect_link_pragmas(Cli *cli) {
+	if (cli->no_link_pragma || cli->source_count == 0) return;
+	const char *host = host_platform_tag();
+	bool macos = strncmp(host, "macos", 5) == 0;
+	for (int i = 0; i < cli->source_count; i++)
+		collect_link_pragmas_file(cli->sources[i], cli, host, macos);
+}
+
 static int compile_sources(Cli *cli) {
 	int status = 0;
+	collect_link_pragmas(cli);
 	const char *compiler = get_real_cc(cli->cc);
 	int cc_extra = cc_extra_arg_count(compiler);
 	bool clang = cc_is_clang(compiler);
@@ -11337,9 +11510,20 @@ static int compile_sources(Cli *cli) {
 	}
 
 	if (cli->mode == CLI_RUN) {
-		char *run[] = {temp_exe, NULL};
-		if (cli->verbose) fprintf(stderr, "[prism] Running %s\n", temp_exe);
-		status = run_command(run);
+		const char **run = alloc_argv(2 + cli->prog_arg_count);
+		int rc = 0;
+		run[rc++] = temp_exe;
+		for (int i = 0; i < cli->prog_arg_count; i++)
+			run[rc++] = cli->prog_args[i];
+		run[rc] = NULL;
+		if (cli->verbose) {
+			fprintf(stderr, "[prism] Running %s", temp_exe);
+			for (int i = 0; i < cli->prog_arg_count; i++)
+				fprintf(stderr, " %s", cli->prog_args[i]);
+			fprintf(stderr, "\n");
+		}
+		status = run_command((char **)run);
+		free((void *)run);
 		remove(temp_exe);
 	}
 
