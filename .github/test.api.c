@@ -3954,6 +3954,57 @@ static void test_version_shows_backend_cc(void) {
 	rmdir(dir);
 }
 
+// Regression: meson identifies gcc by searching for the "Free Software
+// Foundation" marker in `cc --version` output — which lives on line 2 of
+// gcc's banner. Prism used to truncate to line 1 only, so meson failed with
+// "Unknown compiler(s): [['cc', '-m64']]" when qemu's meson.build probed it.
+// Fix: pass through the full underlying cc --version output.
+static void test_version_full_output_for_meson(void) {
+	printf("\n--- Version Passes Full CC Banner (meson compiler detect) ---\n");
+
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_vermeson_");
+	CHECK(dir != NULL, "vermeson: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], stdout_path[PATH_MAX];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	snprintf(stdout_path, sizeof(stdout_path), "%s/ver.out", dir);
+
+	if (!build_test_prism_binary(prism_bin, "vermeson: build prism binary")) {
+		rmdir(dir); return;
+	}
+
+	char *argv[] = {prism_bin, "--version", NULL};
+	int st = run_exec_argv_capture(argv, stdout_path, NULL);
+	CHECK_EQ(st, 0, "vermeson: --version exits 0");
+
+	FILE *f = fopen(stdout_path, "r");
+	char buf[4096] = {0};
+	if (f) { fread(buf, 1, sizeof(buf) - 1, f); fclose(f); }
+
+	// First line compat is covered by test_version_shows_backend_cc; here we
+	// require the banner to carry a compiler-identifying marker on *any*
+	// line, which is what meson needs. Accept gcc's "Free Software
+	// Foundation" or clang's "clang"/"Clang" anywhere in the output.
+	bool has_gcc_marker = strstr(buf, "Free Software Foundation") != NULL;
+	bool has_clang_marker = strstr(buf, "clang") != NULL || strstr(buf, "Clang") != NULL;
+	CHECK(has_gcc_marker || has_clang_marker,
+	      "vermeson: --version contains gcc or clang identifying marker");
+
+	// There should be more than one line (full banner, not just first line).
+	// Allow single-line output only if the backend is an unknown cc whose
+	// --version is one line — but then we at least demand a compiler marker.
+	int nl_count = 0;
+	for (char *p = buf; *p; p++) if (*p == '\n') nl_count++;
+	CHECK(nl_count >= 2 || has_clang_marker,
+	      "vermeson: full banner emitted (>=2 lines) or clang-style one-liner");
+
+	unlink(stdout_path);
+	unlink(prism_bin);
+	rmdir(dir);
+}
+
 static void test_cli_split_D_flag_not_source(void) {
 	printf("\n--- CLI Split -D Flag Not Treated as Source ---\n");
 
@@ -4140,6 +4191,62 @@ static void test_cli_run_prog_args_and_link_pragma(void) {
 	unlink(prism_bin);
 	rmdir(dir);
 }
+
+// Regression: GCC linemarkers emitted by prism must include the "3" system-header
+// flag for tokens originating in system headers. Otherwise GCC treats re-emitted
+// system content (e.g. the AVX10 #pragma GCC target warnings in <immintrin.h> on
+// GCC 15 x86_64) as user code, and -Werror promotes otherwise-suppressed system
+// warnings into errors. Reproduced by the xz build with -Werror.
+#if defined(__linux__) && defined(__x86_64__)
+static void test_system_header_linemarker_flag(void) {
+	printf("\n--- System-header linemarker flag (GCC 3) ---\n");
+
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_syshdr_");
+	CHECK(dir != NULL, "syshdr: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], src_path[PATH_MAX], obj_path[PATH_MAX];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	snprintf(src_path, sizeof(src_path), "%s/immintrin_test.c", dir);
+	snprintf(obj_path, sizeof(obj_path), "%s/immintrin_test.o", dir);
+
+	FILE *f = fopen(src_path, "w");
+	CHECK(f != NULL, "syshdr: create source file");
+	if (!f) { rmdir(dir); return; }
+	fputs("#include <immintrin.h>\nint main(void) { return 0; }\n", f);
+	fclose(f);
+
+	if (!build_test_prism_binary(prism_bin, "syshdr: build prism binary")) {
+		unlink(src_path); rmdir(dir); return;
+	}
+
+	// Probe: ensure immintrin.h is usable on this system (x86_64 GCC build env).
+	// Skip gracefully if not (e.g. clang-only sysroot, cross-compile).
+	const char *cc = getenv("CC");
+	if (!shell_word_ok(cc)) cc = "cc";
+	char probe_obj[PATH_MAX];
+	snprintf(probe_obj, sizeof(probe_obj), "%s/probe.o", dir);
+	char *probe_argv[] = {(char *)cc, "-march=native",
+			      "-c", src_path, "-o", probe_obj, NULL};
+	int probe_st = run_exec_argv_capture(probe_argv, NULL, NULL);
+	unlink(probe_obj);
+
+	if (probe_st == 0) {
+		// prism must not turn system-header diagnostics into errors when it
+		// re-emits content from <immintrin.h> into the flattened output.
+		char *argv[] = {prism_bin, "-fno-safety", "-Werror", "-march=native",
+				"-c", src_path, "-o", obj_path, NULL};
+		int st = run_exec_argv_capture(argv, NULL, NULL);
+		CHECK_EQ(st, 0, "syshdr: immintrin.h compiles with -Werror via prism");
+		unlink(obj_path);
+	}
+
+	unlink(src_path);
+	unlink(prism_bin);
+	rmdir(dir);
+}
+#endif
 #endif
 
 static void test_cli_parse_unit(void) {
@@ -5364,6 +5471,108 @@ static void test_fpreprocessed_not_passed_to_clang(void) {
 	unlink(src_path);
 	unlink(prism_bin);
 	rmdir(dir);
+}
+
+// Regression: meson's `has_header_symbol` probe invokes the compiler with
+// `-c -Werror=unused-command-line-argument`. prism used to forward `-c` (and
+// `-o <path>`) to its internal `-E` preprocess step; clang then rejected the
+// probe with "argument unused during compilation: '-c'", causing false-negative
+// feature detection (e.g. wayland's SFD_CLOEXEC check). Verify that probe-style
+// flags are filtered out of the PP invocation so compilation still succeeds.
+static void test_pp_strips_compile_only_flags(void) {
+	printf("\n--- PP strips -c/-o from preprocess step ---\n");
+
+	// Need a compiler that errors on unused -c during -E. clang does; skip
+	// when unavailable (pure-gcc sysroots).
+	const char *cc_probe = "/usr/bin/clang";
+	if (!compiler_available(cc_probe)) {
+		printf("[SKIP] /usr/bin/clang unavailable\n");
+		return;
+	}
+
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_ppflags_");
+	CHECK(dir != NULL, "ppflags: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], src_path[PATH_MAX], obj_path[PATH_MAX], stderr_path[PATH_MAX];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	snprintf(src_path, sizeof(src_path), "%s/probe.c", dir);
+	snprintf(obj_path, sizeof(obj_path), "%s/probe.o", dir);
+	snprintf(stderr_path, sizeof(stderr_path), "%s/err.txt", dir);
+
+	FILE *f = fopen(src_path, "w");
+	CHECK(f != NULL, "ppflags: create source file");
+	if (!f) { rmdir(dir); return; }
+	fputs("int main(void) { return 0; }\n", f);
+	fclose(f);
+
+	if (!build_test_prism_binary(prism_bin, "ppflags: build prism binary")) {
+		unlink(src_path); rmdir(dir); return;
+	}
+
+	// Mirror a meson has_header_symbol probe: -c, -o, and the -Werror that
+	// transforms "-c unused under -E" into a hard failure.
+	char *argv[] = {prism_bin, "--prism-cc=/usr/bin/clang",
+			"-Werror=unused-command-line-argument",
+			"-c", src_path, "-o", obj_path, NULL};
+	int st = run_exec_argv_capture(argv, NULL, stderr_path);
+
+	FILE *ef = fopen(stderr_path, "r");
+	char buf[4096] = {0};
+	if (ef) { fread(buf, 1, sizeof(buf) - 1, ef); fclose(ef); }
+
+	CHECK_EQ(st, 0, "ppflags: meson-style probe (-c -o -Werror=unused) succeeds");
+	CHECK(strstr(buf, "argument unused during compilation") == NULL,
+	      "ppflags: no 'argument unused' error from PP step");
+
+	unlink(obj_path);
+	unlink(stderr_path);
+	unlink(src_path);
+	unlink(prism_bin);
+	rmdir(dir);
+}
+
+// Regression: -fbounds-check must NOT wrap struct/union field array dimensions.
+// C11 6.7.2.1 says brackets after a field name in struct-declaration-list are
+// always declarator dimensions. try_zero_init_decl skips struct bodies, so
+// those brackets never receive the P1_DECL_BRACKET annotation via
+// parse_declarator. Without an explicit in_struct_body() guard in
+// try_bounds_check_subscript, glibc's pthread.h line 546
+//   struct __cancel_jmp_buf_tag __cancel_jmp_buf[1];
+// was rewritten to
+//   struct __cancel_jmp_buf_tag __cancel_jmp_buf[__prism_bchk((..)(1),
+//       sizeof(__cancel_jmp_buf)/sizeof(__cancel_jmp_buf[0]))];
+// a self-referential declaration that fails to compile ("undeclared here").
+// Triggered on qemu + glibc 2.43. Verify the subscript wrap is NOT applied
+// inside a struct body and the transpiled output compiles cleanly.
+static void test_bounds_check_struct_field_array_dim(void) {
+	printf("\n--- Bounds-check struct field array dim (qemu/pthread.h regression) ---\n");
+
+	const char *src =
+		"struct inner { long buf; int flag; };\n"
+		"struct outer {\n"
+		"    struct inner arr[1];   /* must stay verbatim */\n"
+		"    void *pad[4];\n"
+		"};\n"
+		"int main(void) { struct outer o = {0}; (void)o; return 0; }\n";
+
+	PrismFeatures feats = prism_defaults();
+	feats.bounds_check = true;
+	PrismResult r = prism_transpile_source(src, "sfbc.c", feats);
+	CHECK(r.status == PRISM_OK, "sfbc: transpile succeeds");
+	CHECK(r.output != NULL, "sfbc: has output");
+	if (r.output) {
+		// The struct field's array dimension must remain a plain integer,
+		// not wrapped in __prism_bchk(...).  Assert the verbatim form is
+		// present AND no self-referential sizeof(arr)/sizeof(arr[0]) wrap
+		// appears (which would reference the field mid-declaration).
+		CHECK(strstr(r.output, "struct inner arr[1]") != NULL,
+		      "sfbc: struct field dim emitted verbatim (not wrapped)");
+		CHECK(strstr(r.output, "sizeof(arr)/sizeof(arr[0])") == NULL,
+		      "sfbc: no self-referential sizeof(arr)/sizeof(arr[0]) wrap in field dim");
+	}
+	prism_free(&r);
 }
 
 // signal_temps_register used to silently drop files beyond 64.
@@ -7345,8 +7554,12 @@ void run_api_tests_3(void) {
 	test_cli_dep_flags_routing();
 	test_cli_dep_flags_passthrough();
 	test_version_shows_backend_cc();
+	test_version_full_output_for_meson();
 	test_cli_split_D_flag_not_source();
 	test_cli_run_prog_args_and_link_pragma();
+#if defined(__linux__) && defined(__x86_64__)
+	test_system_header_linemarker_flag();
+#endif
 	test_coreutils_gnulib_generic_decl_leak();
 	test_binutils_gprofng_regressions();
 	test_install_temp_predictable_symlink_hijack();
@@ -7354,6 +7567,8 @@ void run_api_tests_3(void) {
 	test_preprocess_read_eintr_resilience();
 	test_cli_x_lang_pipe_ordering();
 	test_fpreprocessed_not_passed_to_clang();
+	test_pp_strips_compile_only_flags();
+	test_bounds_check_struct_field_array_dim();
 	);
 
 	test_noflat_include_dedup();

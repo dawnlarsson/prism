@@ -603,7 +603,7 @@ static void out_uint(unsigned long long v) {
 	out_str(p, buf + sizeof(buf) - p);
 }
 
-static void out_line(int line_no, const char *file) {
+static void out_line(int line_no, const char *file, bool is_system) {
 	if (use_linemarkers) OUT_LIT("# ");
 	else OUT_LIT("#line ");
 
@@ -615,7 +615,11 @@ static void out_line(int line_no, const char *file) {
 		if (c == '"' || c == '\\') out_char('\\');
 		out_char(c);
 	}
-	OUT_LIT("\"\n");
+	// Emit system-header flag (3) for GCC linemarkers so diagnostics inside
+	// system headers (e.g. #pragma warnings in intrinsic headers) remain
+	// suppressed as they would be during a direct compile.
+	if (use_linemarkers && is_system) OUT_LIT("\" 3\n");
+	else OUT_LIT("\"\n");
 }
 
 // Collect system headers by detecting actual #include entries (not macro expansions)
@@ -887,7 +891,7 @@ static void emit_tok(Token *tok) {
 		out_char(' ');
 
 	if (need_line) {
-		out_line(line_no, tok_fname);
+		out_line(line_no, tok_fname, f->is_system);
 		ctx->last_filename = tok_fname;
 		ctx->last_system_header = f->is_system;
 	}
@@ -897,6 +901,40 @@ static void emit_tok(Token *tok) {
 	// Handle preprocessor directives (e.g., #pragma) - emit verbatim
 	if (__builtin_expect(tok->kind == TK_PREP_DIR, 0)) {
 		if (!tok_at_bol(tok)) out_char('\n');
+		// In flatten mode the backend receives our output as preprocessed
+		// text (`-fpreprocessed`). The system cpp has already evaluated
+		// and stripped every `#if / #ifdef / #ifndef / #endif` guard, but
+		// bare `#define` directives survive as tokens so that macros used
+		// inside the kept-verbatim bodies of static-inline headers still
+		// expand. When two headers redefine the same macro with different
+		// bodies (e.g. `tools/include/linux/compiler.h` guards
+		// `#define __attribute_const__` with `#ifndef`, then glibc's
+		// `sys/cdefs.h` unconditionally redefines it), the guard is gone
+		// and gcc's preprocessed mode raises "X redefined" — fatal under
+		// `-Werror`. Emit `#undef NAME` before each `#define NAME …` so
+		// replays are idempotent regardless of the original guard
+		// structure. (The `#undef` is a no-op the first time.)
+		if (FEAT(F_FLATTEN) && tok->len >= 8 && loc[0] == '#') {
+			const char *p = loc + 1;
+			const char *end = loc + tok->len;
+			while (p < end && (*p == ' ' || *p == '\t')) p++;
+			if (end - p >= 7 && memcmp(p, "define", 6) == 0 &&
+			    (p[6] == ' ' || p[6] == '\t')) {
+				p += 6;
+				while (p < end && (*p == ' ' || *p == '\t')) p++;
+				const char *name = p;
+				while (p < end &&
+				       ((*p >= 'a' && *p <= 'z') ||
+					(*p >= 'A' && *p <= 'Z') ||
+					(*p >= '0' && *p <= '9') ||
+					*p == '_')) p++;
+				if (p > name) {
+					OUT_LIT("#undef ");
+					out_str(name, (int)(p - name));
+					out_char('\n');
+				}
+			}
+		}
 		out_str(loc, tok->len);
 		last_emitted = tok;
 		return;
@@ -2321,6 +2359,16 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	if (!match_ch(tok, '[') || !(tok->flags & TF_OPEN) || !tok_match(tok)) return NULL;
 	if (tok->flags & TF_C23_ATTR) return NULL;
 	if (tok_ann(tok) & (P1_DECL_BRACKET | P1_UNEVAL_BRACKET)) return NULL;
+	// Struct/union body brackets after a field name (`T name[N];`) are
+	// ALWAYS declarator dimensions per C11 6.7.2.1, never expression
+	// subscripts.  try_zero_init_decl skips struct bodies, so these
+	// brackets never get tagged P1_DECL_BRACKET via parse_declarator.
+	// Without this guard, pthread.h's
+	//   struct __cancel_jmp_buf_tag __cancel_jmp_buf[1];
+	// is rewritten to
+	//   ... __cancel_jmp_buf[__prism_bchk(..., sizeof(__cancel_jmp_buf)/...)];
+	// which refers to the field mid-declaration — undeclared-identifier error.
+	if (in_struct_body()) return NULL;
 	if (!last_emitted) return NULL;
 
 	// Parenthesized index commutative form: `(idx)[arr]`. The peel loop
@@ -5320,8 +5368,25 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 		args[(*argc)++] = "-w";
 	}
 
-	for (int i = 0; i < ctx->extra_compiler_flags_count; i++)
-		args[(*argc)++] = ctx->extra_compiler_flags[i];
+	// Skip flags meaningful only for the final compile/link step. When the
+	// caller passes -c / -o <path>, forwarding them to our -E (or /E) run
+	// makes some compilers diagnose them as unused under
+	// -Werror=unused-command-line-argument (e.g. clang in meson probes).
+	for (int i = 0; i < ctx->extra_compiler_flags_count; i++) {
+		const char *f = ctx->extra_compiler_flags[i];
+		if (msvc) {
+			// MSVC cl: /c compile-only, /Fo<path> object output, /Fe<path> exe.
+			// /link starts linker passthrough; skip it and rest.
+			if (strcmp(f, "/c") == 0 || strcmp(f, "-c") == 0) continue;
+			if (strncmp(f, "/Fo", 3) == 0 || strncmp(f, "/Fe", 3) == 0) continue;
+			if (strcmp(f, "/link") == 0) break;
+		} else {
+			if (strcmp(f, "-c") == 0 || strcmp(f, "-S") == 0) continue;
+			if (strcmp(f, "-o") == 0) { i++; continue; }
+			if (f[0] == '-' && f[1] == 'o' && f[2] != '\0') continue;
+		}
+		args[(*argc)++] = f;
+	}
 
 	for (int i = 0; i < ctx->dep_flags_count; i++)
 		args[(*argc)++] = ctx->dep_flags[i];
@@ -5373,23 +5438,27 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 		if (FEAT(F_ZEROINIT)) args[(*argc)++] = "-D__PRISM_ZEROINIT__=1";
 	}
 
-	// Add POSIX/GNU feature test macros on non-Windows, non-MSVC
+	// Add GNU feature test macro on non-Windows, non-MSVC so POSIX/GNU
+	// declarations (pthread_*, syscall, sigaction, etc.) are visible when
+	// prism's own runtime needs them. We deliberately do NOT force
+	// `_POSIX_C_SOURCE=200809L`: on glibc, `_GNU_SOURCE` already implies
+	// POSIX, but adding both means that if the source later does
+	// `#undef _GNU_SOURCE` (e.g. Linux's tools/lib/bpf/libbpf_utils.c),
+	// glibc's `<features.h>` sees POSIX alone and suppresses
+	// `__USE_MISC` — silently dropping declarations that plain `gcc`
+	// (which defaults to `_DEFAULT_SOURCE`) would expose, such as
+	// `syscall()`, `sbrk()`, `brk()`, `crypt()`, `getentropy()`.
 #ifndef _WIN32
 	if (!msvc) {
-		bool user_has_posix = false, user_has_gnu = false;
+		bool user_has_gnu = false;
 		for (int i = 0; i < ctx->extra_define_count; i++) {
-			if (strncmp(ctx->extra_defines[i], "_POSIX_C_SOURCE", 15) == 0) user_has_posix = true;
 			if (strncmp(ctx->extra_defines[i], "_GNU_SOURCE", 11) == 0) user_has_gnu = true;
 		}
 		for (int i = 0; i < ctx->extra_compiler_flags_count; i++) {
 			const char *f = ctx->extra_compiler_flags[i];
-			if (strncmp(f, "-D_POSIX_C_SOURCE", 17) == 0 ||
-			    strncmp(f, "-U_POSIX_C_SOURCE", 17) == 0)
-				user_has_posix = true;
 			if (strncmp(f, "-D_GNU_SOURCE", 13) == 0 || strncmp(f, "-U_GNU_SOURCE", 13) == 0)
 				user_has_gnu = true;
 		}
-		if (!user_has_posix) args[(*argc)++] = "-D_POSIX_C_SOURCE=200809L";
 		if (!user_has_gnu) args[(*argc)++] = "-D_GNU_SOURCE";
 #ifdef __APPLE__
 		{
@@ -10974,6 +11043,44 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 	if (nl) *nl = '\0';
 	return 0;
 }
+
+// Capture full stdout of a child, up to bufsize-1 bytes. NUL-terminated.
+// Returns 0 on success, -1 on failure. Unlike capture_first_line, does not
+// truncate at the first newline — some consumers (e.g. meson compiler
+// detection) need identifying strings that appear on later lines (gcc's
+// "Free Software Foundation" marker is on line 2 of `gcc --version`).
+static int capture_all_output(char **argv, char *buf, size_t bufsize) {
+	int pipefd[2];
+	if (pipe(pipefd) != 0) return -1;
+	char **env = build_clean_environ();
+	if (!env) { close(pipefd[0]); close(pipefd[1]); return -1; }
+	posix_spawn_file_actions_t actions;
+	posix_spawn_file_actions_init(&actions);
+	posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+	posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+	int devnull = open("/dev/null", O_WRONLY);
+	if (devnull >= 0) {
+		posix_spawn_file_actions_adddup2(&actions, devnull, STDERR_FILENO);
+		posix_spawn_file_actions_addclose(&actions, devnull);
+	}
+	pid_t pid;
+	int err = posix_spawnp(&pid, argv[0], &actions, NULL, argv, env);
+	posix_spawn_file_actions_destroy(&actions);
+	close(pipefd[1]);
+	if (devnull >= 0) close(devnull);
+	if (err) { close(pipefd[0]); buf[0] = '\0'; return -1; }
+	size_t total = 0;
+	while (total + 1 < bufsize) {
+		ssize_t n = read(pipefd[0], buf + total, bufsize - 1 - total);
+		if (n < 0) { if (errno == EINTR) continue; break; }
+		if (n == 0) break;
+		total += (size_t)n;
+	}
+	close(pipefd[0]);
+	waitpid(pid, NULL, 0);
+	buf[total] = '\0';
+	return total > 0 ? 0 : -1;
+}
 #endif
 
 static void print_help(void) {
@@ -11579,12 +11686,26 @@ int main(int argc, char **argv) {
 	if (cli.action == CLI_ACT_HELP) { print_help(); cli_free(&cli); return 0; }
 	if (cli.action == CLI_ACT_VERSION) {
 		const char *real_cc = get_real_cc(cli.cc);
-		char cc_line[256];
+		char cc_out[4096];
 		char *vargs[] = {(char *)real_cc, "--version", NULL};
-		if (capture_first_line(vargs, cc_line, sizeof(cc_line)) == 0 && cc_line[0])
-			printf("prism %s (%s)\n", PRISM_VERSION, cc_line);
-		else
+		// First line: `prism <ver> (<first line of cc --version>)` for kernel
+		// cc-version.sh compat (greps first line for "clang").
+		// Remaining lines: pass through the full cc --version banner so
+		// meson/autoconf can match markers on later lines (e.g. gcc's
+		// "Free Software Foundation" identifier on line 2).
+		if (capture_all_output(vargs, cc_out, sizeof(cc_out)) == 0 && cc_out[0]) {
+			char *nl = strchr(cc_out, '\n');
+			if (nl) {
+				*nl = '\0';
+				printf("prism %s (%s)\n%s", PRISM_VERSION, cc_out, nl + 1);
+				size_t tail = strlen(nl + 1);
+				if (tail == 0 || (nl + 1)[tail - 1] != '\n') putchar('\n');
+			} else {
+				printf("prism %s (%s)\n", PRISM_VERSION, cc_out);
+			}
+		} else {
 			printf("prism %s\n", PRISM_VERSION);
+		}
 		cli_free(&cli);
 		return 0;
 	}
