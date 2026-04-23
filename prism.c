@@ -6891,6 +6891,26 @@ static void p1_build_scope_tree(Token *start) {
 			if (si->is_init) ann |= P1_SCOPE_INIT;
 			token_pool[tidx].ann = ann;
 
+			// Nested initializer-in-initializer: braces like "{ .field = val }"
+			// nested inside an outer "= { ... }" can never contain declarations,
+			// typedefs, or goto targets — they don't need their own scope tree entry.
+			// Files with large static arrays (e.g. 131K-entry tables) would otherwise
+			// exhaust the uint16_t scope_id space (max 65534).
+			// When skipping, reuse the parent scope_id so depth tracking stays correct.
+			if (si->is_init && depth > 0 &&
+			    scope_stack_local[depth] < scope_tree_count &&
+			    scope_tree[scope_stack_local[depth]].is_init) {
+				depth++;
+				if (depth >= p1a_stack_cap) {
+					int old_cap = p1a_stack_cap;
+					p1a_stack_cap *= 2;
+					scope_stack_local = arena_realloc(&ctx->main_arena, scope_stack_local,
+						old_cap * sizeof(uint16_t), p1a_stack_cap * sizeof(uint16_t));
+				}
+				scope_stack_local[depth] = scope_stack_local[depth - 1];
+				continue;
+			}
+
 			scope_tree_count++;
 			depth++;
 			if (depth >= p1a_stack_cap) {
@@ -8378,7 +8398,17 @@ static void p1d_handle_open_brace(P1ScanState *s) {
 	while (s->next_scope_id < scope_tree_count &&
 	       scope_tree[s->next_scope_id].open_tok_idx < tidx)
 		s->next_scope_id++;
-	uint16_t sid = s->next_scope_id++;
+
+	// If the next scope tree entry doesn't match this brace's token index,
+	// this '{' was skipped in phase 1A (e.g. init-in-init optimization).
+	// Reuse the parent scope_id without consuming a scope tree entry.
+	uint16_t sid;
+	if (s->next_scope_id < scope_tree_count &&
+	    scope_tree[s->next_scope_id].open_tok_idx == tidx) {
+		sid = s->next_scope_id++;
+	} else {
+		sid = s->scope_depth > 0 ? s->scope_stack[s->scope_depth] : 0;
+	}
 
 	// Phase 1E: function body detection at file scope
 	if (s->brace_depth == 0 && sid < scope_tree_count &&
