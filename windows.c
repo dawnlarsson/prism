@@ -1156,6 +1156,109 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 	return (exit_code != 0) ? (int)exit_code : -1;
 }
 
+// Capture full stdout of a child, up to bufsize-1 bytes. NUL-terminated.
+// Windows twin of the POSIX capture_all_output — does NOT truncate at the
+// first newline. Implementation mirrors capture_first_line but reads to
+// EOF instead of stopping at '\n'. \r bytes are stripped so consumers can
+// match on LF-only text regardless of how the child line-ended its output.
+static int capture_all_output(char **argv, char *buf, size_t bufsize) {
+	if (bufsize == 0) return -1;
+	buf[0] = '\0';
+
+	char *cmdline = win32_argv_to_cmdline(argv);
+	if (!cmdline) return -1;
+
+	int wcmd_len = MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, NULL, 0);
+	if (wcmd_len <= 0) { free(cmdline); return -1; }
+	wchar_t *wcmdline = (wchar_t *)malloc(wcmd_len * sizeof(wchar_t));
+	if (!wcmdline) { free(cmdline); return -1; }
+	MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, wcmdline, wcmd_len);
+	free(cmdline);
+
+	SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+	HANDLE hReadPipe, hWritePipe;
+	if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
+		free(wcmdline);
+		return -1;
+	}
+	SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+	SECURITY_ATTRIBUTES sa_nul = {sizeof(sa_nul), NULL, TRUE};
+	HANDLE hNul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+				   &sa_nul, OPEN_EXISTING, 0, NULL);
+
+	PROCESS_INFORMATION pi;
+	memset(&pi, 0, sizeof(pi));
+
+	HANDLE candidates[3] = { GetStdHandle(STD_INPUT_HANDLE), hWritePipe,
+		(hNul != INVALID_HANDLE_VALUE) ? hNul : GetStdHandle(STD_ERROR_HANDLE) };
+	HANDLE handle_list[3];
+	int handle_count = 0;
+	for (int i = 0; i < 3; i++) {
+		if (candidates[i] == INVALID_HANDLE_VALUE || candidates[i] == NULL)
+			continue;
+		SetHandleInformation(candidates[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+		bool dup = false;
+		for (int j = 0; j < handle_count; j++)
+			if (handle_list[j] == candidates[i]) { dup = true; break; }
+		if (!dup) handle_list[handle_count++] = candidates[i];
+	}
+
+	STARTUPINFOEXW six;
+	memset(&six, 0, sizeof(six));
+	six.StartupInfo.cb = sizeof(six);
+	six.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+	six.StartupInfo.hStdInput = candidates[0];
+	six.StartupInfo.hStdOutput = hWritePipe;
+	six.StartupInfo.hStdError = candidates[2];
+
+	SIZE_T attr_size = 0;
+	InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+	six.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
+	BOOL ok = FALSE;
+	if (six.lpAttributeList &&
+	    InitializeProcThreadAttributeList(six.lpAttributeList, 1, 0, &attr_size) &&
+	    UpdateProcThreadAttribute(six.lpAttributeList, 0,
+				     PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+				     handle_list,
+				     (SIZE_T)handle_count * sizeof(HANDLE),
+				     NULL, NULL)) {
+		ok = CreateProcessW(NULL, wcmdline, NULL, NULL, TRUE,
+				    EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
+				    &six.StartupInfo, &pi);
+	}
+	if (six.lpAttributeList) {
+		DeleteProcThreadAttributeList(six.lpAttributeList);
+		free(six.lpAttributeList);
+	}
+	free(wcmdline);
+	CloseHandle(hWritePipe);
+	if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
+
+	if (!ok) {
+		CloseHandle(hReadPipe);
+		return -1;
+	}
+
+	size_t pos = 0;
+	char ch;
+	DWORD nread;
+	while (pos + 1 < bufsize && ReadFile(hReadPipe, &ch, 1, &nread, NULL) && nread == 1) {
+		if (ch == '\r') continue; // normalize CRLF → LF
+		buf[pos++] = ch;
+	}
+	buf[pos] = '\0';
+	CloseHandle(hReadPipe);
+
+	WaitForSingleObject(pi.hProcess, INFINITE);
+	DWORD exit_code = 1;
+	GetExitCodeProcess(pi.hProcess, &exit_code);
+	CloseHandle(pi.hProcess);
+	CloseHandle(pi.hThread);
+
+	return pos > 0 ? 0 : -1;
+}
+
 // Get the platform install path: %LOCALAPPDATA%\prism\prism.exe
 // Uses wide-char APIs to handle non-ASCII user profile paths.
 static const char *get_install_path(void) {
