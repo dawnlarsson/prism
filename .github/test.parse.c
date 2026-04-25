@@ -5126,6 +5126,46 @@ static void test_soft_keyword_typedefs_and_tags_zeroed(void) {
 	prism_free(&r);
 }
 
+static void test_soft_keyword_labels_and_gotos(void) {
+	const char *code =
+	    "int f(int n) {\n"
+	    "    if (n == 0) goto alignas;\n"
+	    "    if (n == 1) goto bool;\n"
+	    "    if (n == 2) goto constexpr;\n"
+	    "    if (n == 3) goto thread_local;\n"
+	    "    if (n == 4) goto noreturn;\n"
+	    "    if (n == 5) goto static_assert;\n"
+	    "    goto typeof;\n"
+	    "alignas:\n"
+	    "    return 1;\n"
+	    "bool:\n"
+	    "    return 2;\n"
+	    "constexpr:\n"
+	    "    return 3;\n"
+	    "thread_local:\n"
+	    "    return 4;\n"
+	    "noreturn:\n"
+	    "    return 5;\n"
+	    "static_assert:\n"
+	    "    return 6;\n"
+	    "typeof:\n"
+	    "    return 7;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "soft_keyword_labels.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "soft keyword labels/gotos: transpiles");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "goto alignas;") != NULL,
+		      "soft keyword labels/gotos: alignas target preserved");
+		CHECK(strstr(r.output, "thread_local:") != NULL,
+		      "soft keyword labels/gotos: thread_local label preserved");
+		CHECK(strstr(r.output, "static_assert:") != NULL,
+		      "soft keyword labels/gotos: static_assert label preserved");
+		CHECK(strstr(r.output, "typeof:") != NULL,
+		      "soft keyword labels/gotos: typeof label preserved");
+	}
+	prism_free(&r);
+}
+
 static void test_prism_keyword_sue_declarator_names(void) {
 	const char *code =
 	    "typedef struct { int a; } orelse;\n"
@@ -5222,9 +5262,9 @@ static void test_prism_keyword_gnu_label_names(void) {
 
 	const char *computed_code =
 	    "int f(void) {\n"
-	    "    void *a = &&orelse;\n"
-	    "    void *b = &&defer;\n"
-	    "    void *c = &&raw;\n"
+	    "    void *a = (&&orelse);\n"
+	    "    void *b = (&&defer);\n"
+	    "    void *c = (&&raw);\n"
 	    "    if (a || b || c) goto *a;\n"
 	    "orelse:\n"
 	    "defer:\n"
@@ -5244,6 +5284,53 @@ static void test_prism_keyword_gnu_label_names(void) {
 		      "Prism keyword computed label addresses: raw address preserved");
 	}
 	prism_free(&r2);
+
+	const char *static_code =
+	    "int g(void) {\n"
+	    "    static void *p = (&&orelse);\n"
+	    "    if ((&&orelse) && p) goto *p;\n"
+	    "orelse:\n"
+	    "    return 1;\n"
+	    "}\n";
+	PrismResult r3 = prism_transpile_source(static_code, "prism_keyword_static_label_address.c", prism_defaults());
+	CHECK_EQ(r3.status, PRISM_OK, "Prism keyword static computed label address: transpiles");
+	if (r3.status == PRISM_OK && r3.output) {
+		CHECK(strstr(r3.output, "static void *p = (&&orelse);") != NULL,
+		      "Prism keyword static computed label address: initializer preserved");
+		CHECK(strstr(r3.output, "if ((&&orelse) && p)") != NULL,
+		      "Prism keyword static computed label address: control paren preserved");
+	}
+	prism_free(&r3);
+}
+
+static void test_prism_keyword_function_identifiers(void) {
+	const char *code =
+	    "int defer(void) { return 4; }\n"
+	    "int orelse(void);\n"
+	    "int call_keywords(void) {\n"
+	    "    int x = orelse();\n"
+	    "    if (orelse()) { x += defer(); }\n"
+	    "    int arr[orelse()];\n"
+	    "    return x + (int)sizeof arr;\n"
+	    "}\n"
+	    "int parenthesized_call(void) { return (orelse()); }\n"
+	    "int param_keyword(int orelse) { return orelse + 1; }\n"
+	    "int orelse(void) { return 5; }\n";
+	PrismResult r = prism_transpile_source(code, "prism_keyword_function_identifiers.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "Prism keyword function identifiers: transpiles");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "int x = orelse();") != NULL,
+		      "Prism keyword function identifiers: orelse initializer call preserved");
+		CHECK(strstr(r.output, "x += defer();") != NULL,
+		      "Prism keyword function identifiers: defer call preserved");
+		CHECK(strstr(r.output, "return (orelse());") != NULL,
+		      "Prism keyword function identifiers: parenthesized orelse call preserved");
+		CHECK(strstr(r.output, "int param_keyword(int orelse)") != NULL,
+		      "Prism keyword function identifiers: orelse parameter preserved");
+		CHECK(strstr(r.output, "return ();") == NULL,
+		      "Prism keyword function identifiers: defer callee not stripped");
+	}
+	prism_free(&r);
 }
 
 #if __STDC_VERSION__ >= 202311L
@@ -8445,9 +8532,11 @@ void run_parse_tests(void) {
 	test_short_keyword_recognition();
 	test_soft_keyword_identifiers_zeroed();
 	test_soft_keyword_typedefs_and_tags_zeroed();
+	test_soft_keyword_labels_and_gotos();
 	test_prism_keyword_sue_declarator_names();
 	test_prism_keyword_orelse_label_and_enum_dimension();
 	test_prism_keyword_gnu_label_names();
+	test_prism_keyword_function_identifiers();
 #if __STDC_VERSION__ >= 202311L
 	test_c23_attr_positions();
 #endif
