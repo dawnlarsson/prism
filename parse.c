@@ -920,6 +920,10 @@ static inline bool _equal_2(Token *tok, const char *s) {
 	return tok_loc(tok)[1] == s[1];
 }
 
+static inline bool is_gnu_label_decl_head(Token *tok) {
+	return tok && tok->len == 9 && tok->ch0 == '_' && !memcmp(tok_loc(tok), "__label__", 9);
+}
+
 static inline uint64_t keyword_lookup(char *key, int keylen) {
 	if (keylen < 2) return 0;
 	unsigned slot = KEYWORD_HASH(key, keylen);
@@ -2670,10 +2674,19 @@ static inline bool is_orelse_kw(Token *tok) {
 	return !typedef_lookup(tok);
 }
 
+static bool close_brace_ends_sue_body(Token *tok);
+static bool token_ends_sue_type_specifier(Token *tok);
+static bool close_paren_ends_cast_type_name(Token *tok);
+static bool orelse_is_label_or_goto_target(Token *tok, Token *prev);
+static TypeSpecResult parse_type_specifier(Token *tok);
+
 // Positional orelse shadow disambiguation: only treat as keyword if the
 // preceding token ends an expression (infix position).
 static inline bool orelse_shadow_is_kw(Token *prev) {
 	if (!prev) return false;
+	if (token_ends_sue_type_specifier(prev)) return false;
+	if (close_paren_ends_cast_type_name(prev)) return false;
+	if (orelse_is_label_or_goto_target(NULL, prev)) return false;
 	// orelse is a keyword only after value-producing tokens.
 	// After operators, type keywords, storage classes, control-flow
 	// keywords (sizeof, return, if, ...), etc. it's a variable.
@@ -2726,6 +2739,79 @@ static inline Token *walk_back_past_noise(uint32_t start_idx) {
 		return b;
 	}
 	return NULL;
+}
+
+static bool close_brace_ends_sue_body(Token *tok) {
+	if (!tok || !match_ch(tok, '}') || !tok_match(tok)) return false;
+	Token *open = tok_match(tok);
+	for (uint32_t ti = tok_idx(open); ti > 1;) {
+		Token *t = &token_pool[ti - 1];
+		if (t->kind == TK_PREP_DIR) { ti--; continue; }
+		if (match_ch(t, ']') && tok_match(t) && (tok_match(t)->flags & TF_C23_ATTR)) {
+			ti = tok_idx(tok_match(t));
+			continue;
+		}
+		if (match_ch(t, ')') && tok_match(t)) {
+			Token *open_paren = tok_match(t);
+			Token *before = tok_idx(open_paren) > 1 ? &token_pool[tok_idx(open_paren) - 1] : NULL;
+			if (before && (before->tag & (TT_ATTR | TT_ALIGNAS | TT_BITINT | TT_TYPEOF))) {
+				ti = tok_idx(before);
+				continue;
+			}
+			return false;
+		}
+		if (t->tag & TT_SUE) return true;
+		if (match_ch(t, ';') || match_ch(t, '=') || match_ch(t, ',') ||
+		    match_ch(t, '{') || match_ch(t, '}'))
+			return false;
+		ti--;
+	}
+	return false;
+}
+
+static bool token_ends_sue_type_specifier(Token *tok) {
+	if (!tok) return false;
+	if (close_brace_ends_sue_body(tok)) return true;
+	Token *effective = walk_back_past_noise(tok_idx(tok) + 1);
+	if (effective && effective != tok)
+		return token_ends_sue_type_specifier(effective);
+	if (tok->tag & TT_SUE) return true;
+	if (is_identifier_like(tok)) {
+		Token *before = walk_back_past_noise(tok_idx(tok));
+		return before && (before->tag & TT_SUE);
+	}
+	return false;
+}
+
+static bool close_paren_ends_cast_type_name(Token *tok) {
+	if (!tok || !match_ch(tok, ')') || !tok_match(tok)) return false;
+	Token *open = tok_match(tok);
+	Token *before_open = walk_back_past_noise(tok_idx(open));
+	if (before_open && (is_sizeof_like(before_open) || (before_open->tag & (TT_TYPEOF | TT_ALIGNAS | TT_BITINT))))
+		return false;
+	Token *inner = skip_noise(tok_next(open));
+	if (!inner || inner == tok) return false;
+	TypeSpecResult type = parse_type_specifier(inner);
+	if (!type.saw_type) return false;
+	Token *t = type.end;
+	while (t && t != tok && t->kind != TK_EOF) {
+		Token *next = skip_noise(t);
+		if (next != t) { t = next; continue; }
+		if (match_ch(t, '*') || (t->tag & TT_QUALIFIER)) { t = tok_next(t); continue; }
+		if ((match_ch(t, '(') || match_ch(t, '[')) && tok_match(t)) {
+			t = tok_next(tok_match(t));
+			continue;
+		}
+		return false;
+	}
+	return t == tok;
+}
+
+static bool orelse_is_label_or_goto_target(Token *tok, Token *prev) {
+	if (prev && ((prev->tag & TT_GOTO) || is_gnu_label_decl_head(prev) || _equal_2(prev, "&&"))) return true;
+	if (!tok) return false;
+	Token *next = skip_noise(tok_next(tok));
+	return next && match_ch(next, ':') && !(tok_next(next) && match_ch(tok_next(next), ':'));
 }
 
 // Check if a token can legally precede an array bracket '[' in a type context.
@@ -3212,6 +3298,32 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 		if (equal(tok, "void") || is_void_typedef(tok)) r.has_void = true;
 
 		bool had_type = r.saw_type;
+		int tflags = typedef_flags(tok);
+		if ((tflags & TDF_TYPEDEF) && is_soft_keyword_identifier(tok)) {
+			if (had_type) break;
+			r.is_typedef = true;
+			if (tflags & TDF_VLA) r.is_vla = true;
+			if (tflags & TDF_AGGREGATE) r.is_struct = true;
+			if (tflags & TDF_UNION) r.is_union = true;
+			if (tflags & TDF_VOLATILE) r.has_volatile = true;
+			if (tflags & TDF_HAS_VOL_MEMBER) r.has_volatile_member = true;
+			Token *peek = tok_next(tok);
+			while (peek && (peek->tag & TT_QUALIFIER) && !is_soft_keyword_identifier(peek))
+				peek = tok_next(peek);
+			if (peek && is_valid_varname(peek)) {
+				Token *after = tok_next(peek);
+				if (after && match_set(after, CH(';') | CH('[') | CH(',') | CH('='))) {
+					tok = tok_next(tok);
+					r.end = tok;
+					r.saw_type = true;
+					return r;
+				}
+			}
+			tok = tok_next(tok);
+			r.end = tok;
+			r.saw_type = true;
+			continue;
+		}
 
 		if ((tag & TT_STORAGE) && tok->ch0 == 'e') r.has_extern = true;
 		if ((tag & TT_STORAGE) && tok->ch0 == 's') r.has_static = true;
@@ -3391,7 +3503,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			continue;
 		}
 
-		int tflags = typedef_flags(tok);
+		tflags = typedef_flags(tok);
 		if (tflags & TDF_TYPEDEF) {
 			if (had_type) break;
 			r.is_typedef = true;

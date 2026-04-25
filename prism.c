@@ -954,6 +954,18 @@ static inline Token *emit_tok_checked(Token *t) {
 	return NULL;
 }
 
+static inline Token *emit_gnu_label_decl(Token *tok) {
+	if (!ctx->at_stmt_start || !is_gnu_label_decl_head(tok)) return NULL;
+	for (Token *t = tok; t && t->kind != TK_EOF; t = tok_next(t)) {
+		emit_tok(t);
+		if (match_ch(t, ';')) {
+			end_statement_after_semicolon();
+			return tok_next(t);
+		}
+	}
+	return NULL;
+}
+
 // Flags for emit_range_ex: control how tokens are emitted in a range.
 #define ER_SKIP_PREP    1  // Skip TK_PREP_DIR tokens
 #define ER_BALANCED     2  // Use walk_balanced for paren/bracket groups (not just stmt-expr)
@@ -1378,7 +1390,7 @@ static void check_enum_typedef_defer_shadow(Token *tok) {
 static inline bool is_defer_kw(Token *tok, Token *prev) {
 	return (tok->tag & TT_DEFER) &&
 	       (!typedef_lookup(tok) || match_ch(tok_next(tok), '{')) &&
-	       !(prev && (prev->tag & (TT_GOTO | TT_MEMBER))) &&
+	       !(prev && ((prev->tag & (TT_GOTO | TT_MEMBER)) || is_gnu_label_decl_head(prev) || _equal_2(prev, "&&"))) &&
 	       tok_next(tok) && !match_ch(tok_next(tok), ':') &&
 	       !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN));
 }
@@ -1388,6 +1400,8 @@ static inline bool is_defer_kw(Token *tok, Token *prev) {
 static inline bool is_orelse_keyword(Token *tok) {
 	if (!(tok->tag & TT_ORELSE)) return false;
 	if (last_emitted && (last_emitted->tag & TT_MEMBER)) return false;
+	if (orelse_is_label_or_goto_target(tok, last_emitted)) return false;
+	if (last_emitted && token_ends_sue_type_specifier(last_emitted)) return false;
 	// Shadow or real typedef: require last_emitted to be expression-ending
 	TypedefEntry *te = typedef_lookup(tok);
 	if (te) {
@@ -1865,6 +1879,11 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 		if (__builtin_expect(tok->kind == TK_PREP_DIR, 0)) {
 			emit_tok(tok); tok = tok_next(tok);
 			continue;
+		}
+
+		{
+			Token *next = emit_gnu_label_decl(tok);
+			if (next) { tok = next; continue; }
 		}
 
 		// _Generic scope tracking: prevent association colons from being
@@ -2893,14 +2912,17 @@ static void validate_bracket_orelse(Token *oe) {
 static Token *scan_bracket_orelse(Token *open, Token *close, Token **paren_open_out) {
 	Token *prev = open;
 	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
+		if (t->kind == TK_PREP_DIR) continue;
 		if (t->flags & TF_OPEN) {
 			if (match_ch(open, '[') && match_ch(t, '(')) {
 				Token *pp = tok_match(t);
 				if (pp && tok_next(pp) == close) {
 					Token *prev_p = t;
 					for (Token *p = tok_next(t); p && p != pp; p = tok_next(p)) {
+						if (p->kind == TK_PREP_DIR) continue;
 						if (p->flags & TF_OPEN) { prev_p = tok_match(p); p = prev_p; continue; }
 						if ((p->tag & TT_ORELSE)) {
+							if (!orelse_shadow_is_kw(prev_p)) { prev_p = p; continue; }
 							TypedefEntry *te_p = typedef_lookup(p);
 							if (!te_p || orelse_shadow_is_kw(prev_p)) {
 								if (paren_open_out) *paren_open_out = t;
@@ -2914,6 +2936,7 @@ static Token *scan_bracket_orelse(Token *open, Token *close, Token **paren_open_
 			prev = tok_match(t); t = tok_match(t); continue;
 		}
 		if ((t->tag & TT_ORELSE) && !(prev && (prev->tag & TT_MEMBER))) {
+			if (!orelse_shadow_is_kw(prev)) { prev = t; continue; }
 			TypedefEntry *te = typedef_lookup(t);
 			if (!te || orelse_shadow_is_kw(prev))
 				return t;
@@ -3085,6 +3108,7 @@ static Token *walk_balanced_orelse(Token *tok) {
 			}
 		}
 		// No pre-hoisted dim — emit normally with nested orelse awareness.
+		Token *prev = NULL;
 		for (Token *t = tok; t != tok_next(end) && t->kind != TK_EOF;) {
 			// Nested [ bracket: recurse for orelse handling
 			if (t != tok && t != end && match_ch(t, '[') && (t->flags & TF_OPEN) && tok_match(t)) {
@@ -3117,10 +3141,11 @@ static Token *walk_balanced_orelse(Token *tok) {
 			}
 			// Defense-in-depth: if an 'orelse' token reaches here it was not caught by
 			// the depth-0 scan above — likely wrapped in parens deeper than one level.
-			if (is_orelse_kw_shadow(t))
+			if (is_orelse_kw_shadow(t) && orelse_shadow_is_kw(prev))
 				error_tok(t, "'orelse' inside array dimension could not be transformed; "
 					   "if wrapped in outer parentheses, remove them: "
 					   "use '[f() orelse 1]' not '[(f() orelse 1)]'");
+			prev = t;
 			walk_balanced_tail(&t);
 		}
 		return tok_next(end);
@@ -4663,7 +4688,9 @@ static inline bool is_inside_attribute(Token *tok) {
 static Token *handle_defer_keyword(Token *tok) {
 	if (!FEAT(F_DEFER)) return NULL;
 	// Distinguish struct field, label, goto target, variable assignment, attribute usage
-	if (match_ch(tok_next(tok), ':') || (last_emitted && (last_emitted->tag & (TT_MEMBER | TT_GOTO))) ||
+	if (match_ch(tok_next(tok), ':') ||
+	    (last_emitted && ((last_emitted->tag & (TT_MEMBER | TT_GOTO)) ||
+	                      is_gnu_label_decl_head(last_emitted) || _equal_2(last_emitted, "&&"))) ||
 	    (last_emitted && (is_type_keyword(last_emitted) || (last_emitted->tag & TT_TYPEDEF))) ||
 	    (typedef_lookup(tok) && !match_ch(tok_next(tok), '{')) ||
 	    (tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN)) || in_struct_body() ||
@@ -5119,8 +5146,11 @@ static Token *handle_close_brace(Token *tok) {
 		}
 	}
 
-	// Check ctrl_se BEFORE popping the scope
+	// Check ctrl_se/non-statement braces BEFORE popping the scope
 	bool restore_ctrl = ctx->scope_depth > 0 && scope_stack[ctx->scope_depth - 1].is_ctrl_se;
+	bool closing_non_stmt_brace = ctx->scope_depth > 0 &&
+		scope_stack[ctx->scope_depth - 1].is_struct &&
+		!scope_stack[ctx->scope_depth - 1].is_stmt_expr;
 
 	scope_pop();
 
@@ -5131,7 +5161,7 @@ static Token *handle_close_brace(Token *tok) {
 	emit_tok(tok);
 
 	tok = tok_next(tok);
-	ctx->at_stmt_start = true;
+	ctx->at_stmt_start = !closing_non_stmt_brace;
 	return tok;
 }
 
@@ -6248,6 +6278,8 @@ static Token *find_bare_orelse(Token *tok) {
 		if (match_ch(s, ':') && ternary > 0) { ternary--; prev = s; continue; }
 		if ((s->tag & TT_ORELSE) &&
 		    !(prev && (prev->tag & TT_MEMBER)) && ternary == 0) {
+			if (orelse_is_label_or_goto_target(s, prev)) { prev = s; continue; }
+			if (prev && token_ends_sue_type_specifier(prev)) { prev = s; continue; }
 			TypedefEntry *te = typedef_lookup(s);
 			if (!te || orelse_shadow_is_kw(prev))
 				return s;
@@ -6270,6 +6302,10 @@ static bool orelse_has_chain(Token *start, bool comma_term) {
 		else if (p->flags & TF_CLOSE) pd--;
 		else if (pd == 0 && (match_ch(p, ';') || (comma_term && match_ch(p, ',')))) break;
 		if (pd == 0 && (p->tag & TT_ORELSE) && !(prev && (prev->tag & TT_MEMBER))) {
+			if (orelse_is_label_or_goto_target(p, prev) || (prev && token_ends_sue_type_specifier(prev))) {
+				prev = p;
+				continue;
+			}
 			TypedefEntry *te = typedef_lookup(p);
 			if (!te || orelse_shadow_is_kw(prev)) return true;
 		}
@@ -7509,7 +7545,9 @@ p1d_classify_bracket_orelse(Token *tok, uint16_t cur_sid, int p1d_cur_func) {
 	Token *prev_bracket = tok;
 	int paren_depth_scan = 0;
 	for (Token *s = tok_next(tok); s && s != close && s->kind != TK_EOF; s = tok_next(s)) {
+		if (s->kind == TK_PREP_DIR) continue;
 		if ((s->tag & TT_ORELSE)) {
+			if (!orelse_shadow_is_kw(prev_bracket)) { prev_bracket = s; continue; }
 			TypedefEntry *te_b = typedef_lookup(s);
 			if (te_b && !orelse_shadow_is_kw(prev_bracket))
 				{ prev_bracket = s; continue; }
@@ -7718,6 +7756,12 @@ static Token *p1d_scan_init_orelse(Token *t, bool *out_has_orelse, Token **out_f
 		if (match_ch(t, ':') && init_td > 0) { init_td--; init_is_first = false; prev_init_tok = t; t = tok_next(t); continue; }
 		// Phase 1G: mark orelse in decl initializer
 		if ((t->tag & TT_ORELSE)) {
+			if (orelse_is_label_or_goto_target(t, prev_init_tok)) {
+				prev_init_tok = t;
+				t = tok_next(t);
+				init_is_first = false;
+				continue;
+			}
 			// Shadow or real typedef: only treat as keyword when preceded by expression-ending token
 			TypedefEntry *te_init = typedef_lookup(t);
 			if (te_init) {
@@ -7750,6 +7794,10 @@ static Token *p1d_scan_init_orelse(Token *t, bool *out_has_orelse, Token **out_f
 						if (match_ch(inner, ','))
 							p1d_inner_d0_comma = true;
 						if ((inner->tag & TT_ORELSE)) {
+							if (orelse_is_label_or_goto_target(inner, prev_inner)) {
+								prev_inner = inner;
+								continue;
+							}
 							TypedefEntry *te_inner = typedef_lookup(inner);
 							if (te_inner) {
 								if (!(prev_inner && is_expr_ending(prev_inner)))
@@ -8547,10 +8595,17 @@ static void p1d_handle_close_brace(P1ScanState *s) {
 	}
 
 	// Decrement initializer-brace depth before popping the scope
+	bool closing_non_stmt_brace = false;
 	if (s->p1d_init_brace_depth > 0) {
 		uint16_t csid = s->scope_stack[s->scope_depth];
+		if (csid < scope_tree_count && (scope_tree[csid].is_struct || scope_tree[csid].is_init))
+			closing_non_stmt_brace = true;
 		if (csid < scope_tree_count && scope_tree[csid].is_init)
 			s->p1d_init_brace_depth--;
+	} else if (s->scope_depth > 0) {
+		uint16_t csid = s->scope_stack[s->scope_depth];
+		if (csid < scope_tree_count && scope_tree[csid].is_struct)
+			closing_non_stmt_brace = true;
 	}
 
 	if (s->brace_depth > 0) {
@@ -8581,7 +8636,7 @@ static void p1d_handle_close_brace(P1ScanState *s) {
 		s->local_label_count = 0; // Reset local labels for next function
 	}
 
-	s->at_stmt_start = true;
+	s->at_stmt_start = !closing_non_stmt_brace;
 	s->p1d_saw_raw = false;
 	s->p1d_saw_static = false;
 	s->p1d_ctrl_pending = false;
@@ -9134,7 +9189,7 @@ static void p1_full_depth_prescan(Token *tok) {
 			    !memcmp(tok_loc(tok), "__label__", 9)) {
 				Token *t = tok_next(tok);
 				while (t && t->kind != TK_EOF && !match_ch(t, ';')) {
-					if (is_identifier_like(t) && t->kind == TK_IDENT) {
+					if (is_identifier_like(t)) {
 						if (ps->local_label_count >= ps->local_label_cap) {
 							int old = ps->local_label_cap;
 							ps->local_label_cap = old ? old * 2 : 16;
@@ -9925,6 +9980,10 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 		slow_path:
 
 		// Slow path: statement-start processing and tagged tokens
+		{
+			Token *next = emit_gnu_label_decl(tok);
+			if (next) { tok = next; continue; }
+		}
 
 		// Zero-init declarations at statement start.
 		// Skip structural tokens to avoid scanning brace blocks (RSS growth on musl ARM64).

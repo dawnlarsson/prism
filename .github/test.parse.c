@@ -5098,12 +5098,14 @@ static void test_soft_keyword_typedefs_and_tags_zeroed(void) {
 	const char *code =
 	    "typedef int constexpr;\n"
 	    "typedef struct { int a; } bool;\n"
+	    "typedef struct { int b; } alignas;\n"
 	    "struct alignas { int a; };\n"
 	    "int f(void) {\n"
 	    "    constexpr x;\n"
 	    "    bool y;\n"
+	    "    alignas w;\n"
 	    "    struct alignas z;\n"
-	    "    return y.a + z.a;\n"
+	    "    return y.a + w.b + z.a;\n"
 	    "}\n";
 	PrismResult r = prism_transpile_source(code, "soft_keyword_typedef.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK, "soft keyword typedefs/tags: transpiles");
@@ -5112,12 +5114,136 @@ static void test_soft_keyword_typedefs_and_tags_zeroed(void) {
 		      "soft keyword typedefs/tags: scalar typedef zeroed");
 		CHECK(strstr(r.output, "bool y = {0};") != NULL,
 		      "soft keyword typedefs/tags: aggregate typedef zeroed");
+		CHECK(strstr(r.output, "alignas w = {0};") != NULL,
+		      "soft keyword typedefs/tags: alignas typedef zeroed");
 		CHECK(strstr(r.output, "struct alignas z = {0};") != NULL,
 		      "soft keyword typedefs/tags: struct tag zeroed");
 		CHECK(strstr(r.output, "bool y = 0;") == NULL,
 		      "soft keyword typedefs/tags: aggregate typedef not scalar-zeroed");
+		CHECK(strstr(r.output, "alignas w = 0;") == NULL,
+		      "soft keyword typedefs/tags: alignas typedef not scalar-zeroed");
 	}
 	prism_free(&r);
+}
+
+static void test_prism_keyword_sue_declarator_names(void) {
+	const char *code =
+	    "typedef struct { int a; } orelse;\n"
+	    "typedef union { int b; } defer;\n"
+	    "int f(void) {\n"
+	    "    orelse x;\n"
+	    "    defer y;\n"
+	    "    struct { int c; } orelse;\n"
+	    "    union { int d; } defer;\n"
+	    "    return x.a + y.b + orelse.c + defer.d;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "prism_keyword_sue_names.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "Prism keyword SUE declarator names: transpiles");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "orelse x = {0};") != NULL,
+		      "Prism keyword SUE declarator names: orelse typedef zeroed");
+		CHECK(strstr(r.output, "__builtin_memset(&y, 0, sizeof(y));") != NULL,
+		      "Prism keyword SUE declarator names: defer union typedef zeroed");
+		CHECK(strstr(r.output, "struct { int c; } orelse = {0};") != NULL,
+		      "Prism keyword SUE declarator names: anonymous struct orelse zeroed");
+		CHECK(strstr(r.output, "__builtin_memset(&defer, 0, sizeof(defer));") != NULL,
+		      "Prism keyword SUE declarator names: anonymous union defer zeroed");
+	}
+	prism_free(&r);
+
+	const char *attr_enum_code =
+	    "int g(void) {\n"
+	    "    struct { int e; } __attribute__((unused)) orelse;\n"
+	    "    { enum { PrismKwA } orelse; (void)orelse; }\n"
+	    "    { enum PrismKwE : int { PrismKwB }; enum PrismKwE orelse; (void)orelse; }\n"
+	    "    return orelse.e;\n"
+	    "}\n";
+	PrismResult r2 = prism_transpile_source(attr_enum_code, "prism_keyword_sue_attr_enum.c", prism_defaults());
+	CHECK_EQ(r2.status, PRISM_OK, "Prism keyword SUE attr/enum names: transpiles");
+	if (r2.status == PRISM_OK && r2.output) {
+		CHECK(strstr(r2.output, "__attribute__((unused)) orelse = {0};") != NULL,
+		      "Prism keyword SUE attr/enum names: attributed struct orelse zeroed");
+		CHECK(strstr(r2.output, "enum { PrismKwA } orelse = {0};") != NULL,
+		      "Prism keyword SUE attr/enum names: anonymous enum orelse zeroed");
+		CHECK(strstr(r2.output, "enum PrismKwE orelse = {0};") != NULL,
+		      "Prism keyword SUE attr/enum names: named enum orelse zeroed");
+	}
+	prism_free(&r2);
+}
+
+static void test_prism_keyword_orelse_label_and_enum_dimension(void) {
+	const char *code =
+	    "int f(void) {\n"
+	    "    goto orelse;\n"
+	    "orelse:\n"
+	    "    return 1;\n"
+	    "}\n"
+	    "int g(void) {\n"
+	    "    enum { orelse = 4 };\n"
+	    "    int a[orelse];\n"
+	    "    return sizeof a;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "prism_keyword_orelse_label_enum_dim.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "Prism keyword orelse label/enum dimension: transpiles");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "goto orelse;") != NULL,
+		      "Prism keyword orelse label/enum dimension: goto target preserved");
+		CHECK(strstr(r.output, "orelse:") != NULL,
+		      "Prism keyword orelse label/enum dimension: label preserved");
+		CHECK(strstr(r.output, "int a[orelse]") != NULL,
+		      "Prism keyword orelse label/enum dimension: enum constant dimension preserved");
+	}
+	prism_free(&r);
+}
+
+static void test_prism_keyword_gnu_label_names(void) {
+	const char *local_code =
+	    "int f(void) {\n"
+	    "    __label__ orelse, defer, raw;\n"
+	    "    goto orelse;\n"
+	    "orelse:\n"
+	    "    goto defer;\n"
+	    "defer:\n"
+	    "    goto raw;\n"
+	    "raw:\n"
+	    "    return 1;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(local_code, "prism_keyword_gnu_local_labels.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "Prism keyword GNU local labels: transpiles");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "__label__ orelse, defer, raw;") != NULL,
+		      "Prism keyword GNU local labels: declaration preserved");
+		CHECK(strstr(r.output, "goto defer;") != NULL,
+		      "Prism keyword GNU local labels: defer target preserved");
+		CHECK(strstr(r.output, "raw:") != NULL,
+		      "Prism keyword GNU local labels: raw label preserved");
+	}
+	prism_free(&r);
+
+	const char *computed_code =
+	    "int f(void) {\n"
+	    "    void *a = &&orelse;\n"
+	    "    void *b = &&defer;\n"
+	    "    void *c = &&raw;\n"
+	    "    if (a || b || c) goto *a;\n"
+	    "orelse:\n"
+	    "defer:\n"
+	    "raw:\n"
+	    "    return 1;\n"
+	    "}\n";
+	PrismFeatures no_zeroinit = prism_defaults();
+	no_zeroinit.zeroinit = false;
+	PrismResult r2 = prism_transpile_source(computed_code, "prism_keyword_computed_labels.c", no_zeroinit);
+	CHECK_EQ(r2.status, PRISM_OK, "Prism keyword computed label addresses: transpiles");
+	if (r2.status == PRISM_OK && r2.output) {
+		CHECK(strstr(r2.output, "&&orelse") != NULL,
+		      "Prism keyword computed label addresses: orelse address preserved");
+		CHECK(strstr(r2.output, "&&defer") != NULL,
+		      "Prism keyword computed label addresses: defer address preserved");
+		CHECK(strstr(r2.output, "&&raw") != NULL,
+		      "Prism keyword computed label addresses: raw address preserved");
+	}
+	prism_free(&r2);
 }
 
 #if __STDC_VERSION__ >= 202311L
@@ -8319,6 +8445,9 @@ void run_parse_tests(void) {
 	test_short_keyword_recognition();
 	test_soft_keyword_identifiers_zeroed();
 	test_soft_keyword_typedefs_and_tags_zeroed();
+	test_prism_keyword_sue_declarator_names();
+	test_prism_keyword_orelse_label_and_enum_dimension();
+	test_prism_keyword_gnu_label_names();
 #if __STDC_VERSION__ >= 202311L
 	test_c23_attr_positions();
 #endif
