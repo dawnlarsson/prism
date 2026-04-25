@@ -3218,7 +3218,8 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 			r.is_pointer = true; r.is_const = false; extra_ptr_action; \
 			if (++ptr_depth > 1024) { warn_tok(tok, "pointer depth exceeds 1024; zero-initialization skipped"); r.end = NULL; return r; } \
 			decl_emit(tok, emit); tok = tok_next(tok);			\
-		} else if (tok->tag & TT_QUALIFIER) {				\
+		} else if ((tok->tag & TT_QUALIFIER) &&				\
+			   !(is_soft_keyword_identifier(tok) && soft_keyword_decl_name_boundary(tok))) { \
 			if (r.is_pointer && (tok->tag & TT_CONST)) r.is_const = true; \
 			decl_emit(tok, emit); tok = tok_next(tok);			\
 		} else break;							\
@@ -9032,7 +9033,7 @@ static void p1_full_depth_prescan(Token *tok) {
 					// Skip attributes and qualifiers before tag name
 					// (e.g. struct __attribute__((aligned(8))) Tag {).
 					for (Token *t = skip_noise(tok_next(tok)); t && t != brace; t = skip_noise(tok_next(t))) {
-						if (t->tag & TT_QUALIFIER) continue;
+						if ((t->tag & TT_QUALIFIER) && !is_soft_keyword_identifier(t)) continue;
 						if (is_valid_varname(t)) {
 							int pre = typedef_table.count;
 							typedef_add_entry(tok_loc(t), t->len, brace_depth, TDK_STRUCT_TAG, body_vla, false);

@@ -57,6 +57,8 @@ Identifiers and keywords are tagged with `TT_*` bitmask flags during tokenizatio
 
 GNU extension `__auto_type` is tagged `TT_TYPE | TT_TYPEOF` so that declaration detection and goto-over-decl checking treat it identically to `typeof`/`__typeof__`. The `typeof_unqual` family (`typeof_unqual`, `__typeof_unqual__`, `__typeof_unqual`) is tagged `TT_TYPE | TT_TYPEOF`; `parse_type_specifier` detects the unqual variant via `tok->len >= 13` (all three lengths — 13, 15, 17 — exceed the longest non-unqual typeof variant `__auto_type` at 11) and skips the inner qualifier propagation scan, since `typeof_unqual` strips qualifiers by definition.
 
+Some C23 or extension spellings are contextual for Prism's supported C99/C11 inputs: `alignas`, `alignof`, `asm`, `bool`, `constexpr`, `noreturn`, `offsetof`, `static_assert`, `thread_local`, `typeof`, and `typeof_unqual` may still be ordinary identifiers when a backend accepts them as such. In declarator-name position, Prism treats those tokenized keywords as valid names and stops the type-specifier parser before consuming them when they follow an established type and are followed by a declaration boundary. Typedef lookup and struct/union tag registration also accept these soft-keyword tokens, so `typedef struct { int a; } bool; bool x;` and `struct alignas { int a; }; struct alignas y;` preserve aggregate metadata. This preserves zeroinit for valid pre-C23 code such as `int constexpr;` while keeping true specifier forms such as `constexpr int x;`, `alignas(16) int x;`, and `typeof(expr) x;` intact.
+
 ### Taint graph
 
 The tokenizer builds per-function taint flags (`has_setjmp`, `has_vfork`, `has_asm_goto`) stored on the opening `{` token's tag bits (`TT_SPECIAL_FN`, `TT_NORETURN_FN`, `TT_ASM`). These remain on the token and are read directly via `func_meta[idx].body_open->tag` — they are **not** transferred to `FuncMeta` fields. The `TT_ASM` taint fires only for `asm goto` — the tokenizer scans between the `asm` keyword and `(` for a `TT_GOTO` token. Regular `asm` (volatile, inline) is safe and does not taint.
@@ -73,6 +75,8 @@ The tokenizer builds per-function taint flags (`has_setjmp`, `has_vfork`, `has_a
 ### C23 extended float literal suffixes (emission)
 
 C23 binary and extended-suffixed floating constants (e.g. `1.0f32x`, `1.0f128`, `1.0f16`) are emitted **verbatim** in Pass 2. They are not rewritten to a different standard suffix, so type and value (including `_Generic` and exact model) are preserved for a C23-capable backend. **Rationale:** mapping e.g. `f128` to `L` or `f16` to `f` can change the type of the constant and change or lose precision (e.g. `long double` is not IEEE 754 binary128 on all platforms).
+
+C23 `u8'...'` character constants are tokenized as a single numeric token, matching ordinary and `u`/`U`/`L` character constants, so Pass 2 preserves the prefix without inserting whitespace between `u8` and the quote.
 
 ---
 

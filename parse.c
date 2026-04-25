@@ -1682,6 +1682,12 @@ static Token *tokenize(File *file) {
 			p += nt->len;
 			continue;
 		}
+		if (p[0] == 'u' && p[1] == '8' && p[2] == '\'') {
+			Token *nt = read_char_literal(p, p + 2, &ts);
+			LINK(nt);
+			p += nt->len;
+			continue;
+		}
 		if ((p[0] == 'u' || p[0] == 'U' || p[0] == 'L') && p[1] == '\'') {
 			Token *nt = read_char_literal(p, p + 1, &ts);
 			LINK(nt);
@@ -2489,10 +2495,13 @@ typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool i
 	typedef_table.bloom |= 1ULL << (((unsigned char)name[0] ^ len) & 63);
 }
 
+static inline bool is_soft_keyword_identifier(Token *tok);
+
 static TypedefEntry *typedef_lookup(Token *tok) {
 	if (!is_identifier_like(tok)) return NULL;
 	if (p1_typedef_annotated && !(tok_ann(tok) & P1_HAS_ENTRY)) return NULL;
-	if (tok->kind == TK_KEYWORD && !(tok->tag & (TT_ORELSE | TT_DEFER)) && !(tok->flags & TF_RAW))
+	if (tok->kind == TK_KEYWORD && !is_soft_keyword_identifier(tok) &&
+	    !(tok->tag & (TT_ORELSE | TT_DEFER)) && !(tok->flags & TF_RAW))
 		return NULL;
 	unsigned c0 = tok->ch0, tl = tok->len;
 	if (!(typedef_table.bloom & (1ULL << ((c0 ^ tl) & 63)))) return NULL;
@@ -2577,8 +2586,29 @@ static bool is_type_keyword(Token *tok) {
 	return is_known_typedef(tok);
 }
 
+static inline bool is_soft_keyword_identifier(Token *tok) {
+	if (!tok || tok->kind != TK_KEYWORD) return false;
+	switch (tok->ch0) {
+	case 'a': return equal(tok, "alignas") || equal(tok, "alignof") || equal(tok, "asm");
+	case 'b': return equal(tok, "bool");
+	case 'c': return equal(tok, "constexpr");
+	case 'n': return equal(tok, "noreturn");
+	case 'o': return equal(tok, "offsetof");
+	case 's': return equal(tok, "static_assert");
+	case 't': return equal(tok, "thread_local") || equal(tok, "typeof") || equal(tok, "typeof_unqual");
+	default: return false;
+	}
+}
+
+static inline bool soft_keyword_decl_name_boundary(Token *tok) {
+	Token *after = skip_noise(tok_next(tok));
+	return after && (match_set(after, CH(';') | CH(',') | CH('=') | CH('[') | CH(':')) ||
+		       (after->tag & TT_ASM));
+}
+
 static inline bool is_valid_varname(Token *tok) {
-	return tok->kind == TK_IDENT || (tok->flags & TF_RAW) || (tok->tag & (TT_DEFER | TT_ORELSE));
+	return tok->kind == TK_IDENT || is_soft_keyword_identifier(tok) || (tok->flags & TF_RAW) ||
+	       (tok->tag & (TT_DEFER | TT_ORELSE));
 }
 
 // Token ends an expression (value-producing): ident, keyword, num, str, ), ].
@@ -3170,6 +3200,8 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 
 		uint32_t tag = tok->tag;
 		bool is_type = is_type_keyword(tok);
+		if (r.saw_type && is_soft_keyword_identifier(tok) && soft_keyword_decl_name_boundary(tok))
+			break;
 		if (!(tag & (TT_QUALIFIER | TT_STORAGE | TT_INLINE)) && !is_type && !(tag & (TT_BITINT | TT_ALIGNAS))) break;
 
 		// Skip inline/_Noreturn/__extension__ — valid prefix, no type info
@@ -3233,7 +3265,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			tok = tok_next(tok);
 			while (tok && tok->kind != TK_EOF) {
 				SKIP_NOISE_CONTINUE(tok);
-				if (tok->tag & TT_QUALIFIER) tok = tok_next(tok);
+				if ((tok->tag & TT_QUALIFIER) && !is_soft_keyword_identifier(tok)) tok = tok_next(tok);
 				else break;
 			}
 			Token *sue_tag = NULL;
@@ -3447,7 +3479,8 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 			if (bt->tag & TT_SUE) {
 				Token *tag = skip_noise(tok_next(bt));
 				// Skip qualifiers after struct/union keyword
-				while (tag && (tag->tag & TT_QUALIFIER)) tag = skip_noise(tok_next(tag));
+				while (tag && (tag->tag & TT_QUALIFIER) && !is_soft_keyword_identifier(tag))
+					tag = skip_noise(tok_next(tag));
 				if (tag && is_valid_varname(tag)) {
 					int pre = typedef_table.count;
 					typedef_add_entry(tok_loc(tag), tag->len, scope_depth, TDK_STRUCT_TAG, is_vla, false);

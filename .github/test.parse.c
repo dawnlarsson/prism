@@ -3736,6 +3736,23 @@ void test_char_literal_escape_sequences(void) {
 	CHECK(c7 == 127, "char literal hex escape");
 }
 
+void test_u8_char_literal_tokenization(void) {
+	const char *code =
+	    "int f(void) {\n"
+	    "    char c = u8'a';\n"
+	    "    return c;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "u8_char_literal.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "u8 char literal: transpiles");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "u8'a'") != NULL,
+		      "u8 char literal: prefix remains attached to character token");
+		CHECK(strstr(r.output, "u8 'a'") == NULL,
+		      "u8 char literal: no space inserted between prefix and character token");
+	}
+	prism_free(&r);
+}
+
 
 typedef int my_attr_param_t;
 enum { MY_VAL __attribute__((my_attr_param_t)) = 1 };
@@ -5030,6 +5047,77 @@ static void test_short_keyword_recognition(void) {
 		x = 3;
 	}
 	CHECK_EQ(x, 3, "for keyword recognized");
+}
+
+static void test_soft_keyword_identifiers_zeroed(void) {
+	const char *code =
+	    "int f(void) {\n"
+	    "    int constexpr;\n"
+	    "    int static_assert;\n"
+	    "    int alignas;\n"
+	    "    int alignof;\n"
+	    "    int thread_local;\n"
+	    "    int typeof;\n"
+	    "    int typeof_unqual;\n"
+	    "    int bool;\n"
+	    "    int noreturn;\n"
+	    "    int offsetof;\n"
+	    "    int asm;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "soft_keyword_ident.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "soft keyword identifiers: transpiles");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "int constexpr = 0;") != NULL,
+		      "soft keyword identifiers: constexpr zeroed");
+		CHECK(strstr(r.output, "int static_assert = 0;") != NULL,
+		      "soft keyword identifiers: static_assert zeroed");
+		CHECK(strstr(r.output, "int alignas = 0;") != NULL,
+		      "soft keyword identifiers: alignas zeroed");
+		CHECK(strstr(r.output, "int alignof = 0;") != NULL,
+		      "soft keyword identifiers: alignof zeroed");
+		CHECK(strstr(r.output, "int thread_local = 0;") != NULL,
+		      "soft keyword identifiers: thread_local zeroed");
+		CHECK(strstr(r.output, "int typeof = 0;") != NULL,
+		      "soft keyword identifiers: typeof zeroed");
+		CHECK(strstr(r.output, "int typeof_unqual = 0;") != NULL,
+		      "soft keyword identifiers: typeof_unqual zeroed");
+		CHECK(strstr(r.output, "int bool = 0;") != NULL,
+		      "soft keyword identifiers: bool zeroed");
+		CHECK(strstr(r.output, "int noreturn = 0;") != NULL,
+		      "soft keyword identifiers: noreturn zeroed");
+		CHECK(strstr(r.output, "int offsetof = 0;") != NULL,
+		      "soft keyword identifiers: offsetof zeroed");
+		CHECK(strstr(r.output, "int asm = 0;") != NULL,
+		      "soft keyword identifiers: asm zeroed");
+	}
+	prism_free(&r);
+}
+
+static void test_soft_keyword_typedefs_and_tags_zeroed(void) {
+	const char *code =
+	    "typedef int constexpr;\n"
+	    "typedef struct { int a; } bool;\n"
+	    "struct alignas { int a; };\n"
+	    "int f(void) {\n"
+	    "    constexpr x;\n"
+	    "    bool y;\n"
+	    "    struct alignas z;\n"
+	    "    return y.a + z.a;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "soft_keyword_typedef.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "soft keyword typedefs/tags: transpiles");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "constexpr x = {0};") != NULL,
+		      "soft keyword typedefs/tags: scalar typedef zeroed");
+		CHECK(strstr(r.output, "bool y = {0};") != NULL,
+		      "soft keyword typedefs/tags: aggregate typedef zeroed");
+		CHECK(strstr(r.output, "struct alignas z = {0};") != NULL,
+		      "soft keyword typedefs/tags: struct tag zeroed");
+		CHECK(strstr(r.output, "bool y = 0;") == NULL,
+		      "soft keyword typedefs/tags: aggregate typedef not scalar-zeroed");
+	}
+	prism_free(&r);
 }
 
 #if __STDC_VERSION__ >= 202311L
@@ -7990,6 +8078,7 @@ void run_parse_tests(void) {
 #endif
 	test_string_escape_sequences_varied();
 	test_char_literal_escape_sequences();
+	test_u8_char_literal_tokenization();
 
 	/* Verification tests */
 	test_switch_conditional_break_defer();
@@ -8228,6 +8317,8 @@ void run_parse_tests(void) {
 	test_orelse_comma_operator_expr();
 	test_orelse_sequential_comma();
 	test_short_keyword_recognition();
+	test_soft_keyword_identifiers_zeroed();
+	test_soft_keyword_typedefs_and_tags_zeroed();
 #if __STDC_VERSION__ >= 202311L
 	test_c23_attr_positions();
 #endif
