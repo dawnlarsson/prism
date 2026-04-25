@@ -5182,11 +5182,11 @@ static void test_prism_keyword_sue_declarator_names(void) {
 	if (r.status == PRISM_OK && r.output) {
 		CHECK(strstr(r.output, "orelse x = {0};") != NULL,
 		      "Prism keyword SUE declarator names: orelse typedef zeroed");
-		CHECK(strstr(r.output, "__builtin_memset(&y, 0, sizeof(y));") != NULL,
+		CHECK(has_var_zeroing(r.output, "y"),
 		      "Prism keyword SUE declarator names: defer union typedef zeroed");
 		CHECK(strstr(r.output, "struct { int c; } orelse = {0};") != NULL,
 		      "Prism keyword SUE declarator names: anonymous struct orelse zeroed");
-		CHECK(strstr(r.output, "__builtin_memset(&defer, 0, sizeof(defer));") != NULL,
+		CHECK(has_var_zeroing(r.output, "defer"),
 		      "Prism keyword SUE declarator names: anonymous union defer zeroed");
 	}
 	prism_free(&r);
