@@ -4975,6 +4975,18 @@ static void test_stmtexpr_orelse_fallback_phase1(void) {
 		      "stmt-expr in decl orelse fallback must error in Phase 1");
 		prism_free(&r);
 	}
+	// Parenthesized GNU stmt-expr in decl orelse fallback: same error
+	{
+		const char *code =
+		    "int get_val(void);\n"
+		    "void f(void) {\n"
+		    "    int x = get_val() orelse (({ 0; }));\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "seof1_nested.c", prism_defaults());
+		CHECK(r.status != PRISM_OK && r.error_msg && strstr(r.error_msg, "statement expression"),
+		      "nested stmt-expr in decl orelse fallback must error in Phase 1");
+		prism_free(&r);
+	}
 	// Control: bare orelse with stmt-expr → OK (bare path handles it)
 	{
 		const char *code =

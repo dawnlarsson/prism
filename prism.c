@@ -1,4 +1,4 @@
-#define PRISM_VERSION "1.1.2"
+#define PRISM_VERSION "1.1.3"
 
 #ifndef _WIN32
 #ifndef _GNU_SOURCE
@@ -7694,6 +7694,17 @@ p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
 	}
 }
 
+static Token *p1d_find_stmt_expr_fallback(Token *start) {
+	int depth = 0;
+	for (Token *s = start; s && s->kind != TK_EOF; s = tok_next(s)) {
+		if (depth == 0 && (match_ch(s, ';') || match_ch(s, ','))) break;
+		if (is_stmt_expr_open(s)) return s;
+		if (s->flags & TF_OPEN) depth++;
+		else if ((s->flags & TF_CLOSE) && depth > 0) depth--;
+	}
+	return NULL;
+}
+
 // Scan a declaration initializer for orelse keywords.
 // t points at the '=' token; returns position after initializer (typically ',' or ';').
 static Token *p1d_scan_init_orelse(Token *t, bool *out_has_orelse, Token **out_first_orelse) {
@@ -7827,21 +7838,12 @@ static void p1d_validate_decl_orelse(Token *var_name, Token *type_tok,
 	// Reject GNU statement expressions in orelse fallback values
 	if (first_orelse) {
 		if (is_orelse_value_fallback(tok_next(first_orelse))) {
-			Token *after_oe = tok_next(first_orelse);
-			for (Token *s = after_oe; s && s->kind != TK_EOF &&
-			     !match_ch(s, ';') && !match_ch(s, ','); s = tok_next(s)) {
-				if (match_ch(s, '(') && tok_next(s) &&
-				    match_ch(tok_next(s), '{')) {
-					error_tok(s,
-						  "GNU statement expressions in orelse "
-						  "fallback values are not supported; "
-						  "use 'orelse { ... }' block form instead");
-				}
-				if (s->flags & TF_OPEN && tok_match(s)) {
-					s = tok_match(s);
-					continue;
-				}
-			}
+			Token *se = p1d_find_stmt_expr_fallback(tok_next(first_orelse));
+			if (se)
+				error_tok(se,
+					  "GNU statement expressions in orelse "
+					  "fallback values are not supported; "
+					  "use 'orelse { ... }' block form instead");
 		}
 	}
 }

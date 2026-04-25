@@ -470,7 +470,7 @@ Not:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v1.1.2 - Robust C transpiler
+Prism v1.1.3 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
        prism [options] run src.c [-- prog_args...]

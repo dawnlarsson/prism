@@ -1,6 +1,6 @@
 # Prism Transpiler Specification
 
-**Version:** 1.1.2
+**Version:** 1.1.3
 **Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (5781+ self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do. It is organized in two parts: **Part I** covers the transpiler's architecture, internal processing model, and implementation details. **Part II** provides a formal language specification for Prism's extensions to C, described in terms of the C abstract machine independently of any implementation strategy.
@@ -642,7 +642,7 @@ The scan covers two ranges: enclosing-scope defers `[0, blk->defer_start_idx)` a
 
 **Invalid contexts:** Detected at two stages:
 
-- **Phase 1 (early rejection):** Bracket orelse at file scope, bracket orelse with control-flow actions (return/goto/break/continue) or block form, orelse inside enum bodies (compile-time constant context), typeof-orelse inside struct/union bodies, empty orelse action (`orelse ;` — caught by `p1d_validate_bare_orelse` before the missing-target check), anonymous struct/union multi-declarator splits (when bracket orelse or typeof/VLA memset would force type re-emission), bare orelse with cast-expression assignment target (e.g. `(int)x = 0 orelse 5;` — the LHS is not a modifiable lvalue). The typeof-in-struct check runs during `p1_full_depth_prescan` using the scope tree's `is_struct` flag; the enum check uses `is_enum` on the scope tree.
+- **Phase 1 (early rejection):** Bracket orelse at file scope, bracket orelse with control-flow actions (return/goto/break/continue) or block form, orelse inside enum bodies (compile-time constant context), typeof-orelse inside struct/union bodies, GNU statement expressions in declaration-orelse value fallbacks (including parenthesized forms such as `orelse (({ ... }))`), empty orelse action (`orelse ;` — caught by `p1d_validate_bare_orelse` before the missing-target check), anonymous struct/union multi-declarator splits (when bracket orelse or typeof/VLA memset would force type re-emission), bare orelse with cast-expression assignment target (e.g. `(int)x = 0 orelse 5;` — the LHS is not a modifiable lvalue). The typeof-in-struct check runs during `p1_full_depth_prescan` using the scope tree's `is_struct` flag; the enum check uses `is_enum` on the scope tree.
 - **Pass 2 (static/thread storage rejection):** `orelse` in the initializer of a `static`, `extern`, or `_Thread_local`/`thread_local` variable is rejected with a hard error. The orelse transformation splits the declaration into a runtime assignment that re-executes on every function entry, which destroys C's persistence semantics (C11 §6.7.9p4). The check runs in `process_declarators` immediately after `scan_decl_orelse` returns, before any code is emitted.
 - **Pass 2 (C23 `constexpr` rejection):** `orelse` in the initializer of a `constexpr` variable is rejected with a hard error. `constexpr` mandates a compile-time constant initializer (ISO C23 §6.7.1p14); orelse produces runtime fallback code incompatible with constant evaluation. `constexpr` also implies `const`, so `has_effective_const_qual` returns true when `has_constexpr` is set — ensuring the const orelse path is never bypassed. The check runs alongside the static/extern guard in `process_declarators`.
 - **Pass 2 catch-all:** Any `orelse` token that survives to the main emit loop without being consumed by a handler (bracket, decl-init, bare, typeof, walk_balanced) is **unconditionally** rejected with a hard error. This catches orelse in struct/union member declarations, ternary contexts, for-init control parens, and any other unsupported position. No context exemptions — bracket/typeof orelse is fully consumed before reaching the catch-all, so it never fires on valid uses.
@@ -1378,9 +1378,11 @@ The token `orelse` is a keyword. It introduces a conditional fallback that execu
 
 5. A *bracket-orelse* shall not use a control-flow action (`return`, `goto`, `break`, `continue`) or compound statement as its right operand.
 
-6. A *bracket-orelse* at file scope is a constraint violation — no statement context exists for the required temporary variable.
+6. A declaration-initializer `orelse` value fallback shall not be a GNU statement expression, including when hidden behind parentheses (for example, `int x = f() orelse (({ 1; }));`). Use block form (`orelse { ... }`) when the fallback requires statements. Bare assignment `orelse` value fallbacks may contain statement expressions because that emission path handles them explicitly.
 
-7. In contexts where the array dimension expression may be evaluated more than once (VLA sizes, `typeof` operands), neither operand of a *bracket-orelse* shall contain side effects. Prohibited side effects include:
+7. A *bracket-orelse* at file scope is a constraint violation — no statement context exists for the required temporary variable.
+
+8. In contexts where the array dimension expression may be evaluated more than once (VLA sizes, `typeof` operands), neither operand of a *bracket-orelse* shall contain side effects. Prohibited side effects include:
    - Increment/decrement operators (`++`, `--`)
    - Assignment operators (`=`, `+=`, `-=`, `*=`, `/=`, `%=`, `<<=`, `>>=`, `&=`, `^=`, `|=`)
    - Function calls (direct or through function pointers)
@@ -1388,15 +1390,15 @@ The token `orelse` is a keyword. It introduces a conditional fallback that execu
    - Inline assembly (`asm`)
    - Comma operator at the top level of the operand
 
-8. A bare `orelse` (no assignment target) with a value fallback requires a modifiable lvalue on the left side of `=`. A cast-expression target (e.g., `(int)x = expr orelse fallback`) is a constraint violation.
+9. A bare `orelse` (no assignment target) with a value fallback requires a modifiable lvalue on the left side of `=`. A cast-expression target (e.g., `(int)x = expr orelse fallback`) is a constraint violation.
 
-9. When the fallback is a compound literal and the assignment target involves indirection (`*`, `->`, `.`, `[]`), the `orelse` is a constraint violation. The compound-literal code path evaluates the target address expression twice, producing undefined behavior for volatile objects. **Compound literal detection** scans the fallback range for `{` at any parenthesis depth: a `{` preceded by `)` (the cast pattern `(type){`) is recognized as a compound literal even inside parentheses (e.g., `(&((struct S){0}))`), because such compound literals would be scoped to the else block (C11 §6.5.2.5p5) and produce dangling pointers. Compound literals inside function call arguments are also detected and use the ternary path — token-level analysis cannot determine whether a function returns the compound literal's address, so the conservative approach avoids dangling pointers in all cases (e.g., `identity_ptr(&(struct Config){.mode=1})` where the function returns its argument).
+10. When the fallback is a compound literal and the assignment target involves indirection (`*`, `->`, `.`, `[]`), the `orelse` is a constraint violation. The compound-literal code path evaluates the target address expression twice, producing undefined behavior for volatile objects. **Compound literal detection** scans the fallback range for `{` at any parenthesis depth: a `{` preceded by `)` (the cast pattern `(type){`) is recognized as a compound literal even inside parentheses (e.g., `(&((struct S){0}))`), because such compound literals would be scoped to the else block (C11 §6.5.2.5p5) and produce dangling pointers. Compound literals inside function call arguments are also detected and use the ternary path — token-level analysis cannot determine whether a function returns the compound literal's address, so the conservative approach avoids dangling pointers in all cases (e.g., `identity_ptr(&(struct Config){.mode=1})` where the function returns its argument).
 
-10. An `orelse` in a function parameter array dimension is a constraint violation in both prototypes and definitions. For prototypes (e.g., `void f(int arr[n orelse 1]);`), parameter arrays decay to pointers and the dimension is never evaluated at runtime. For definitions (e.g., `void f(int arr[n orelse 1]) { ... }`), the ternary expansion would evaluate the dimension expression twice — undefined behavior for volatile expressions (C11 §6.7.3p7) — and temporary variables cannot be hoisted outside the function signature.
+11. An `orelse` in a function parameter array dimension is a constraint violation in both prototypes and definitions. For prototypes (e.g., `void f(int arr[n orelse 1]);`), parameter arrays decay to pointers and the dimension is never evaluated at runtime. For definitions (e.g., `void f(int arr[n orelse 1]) { ... }`), the ternary expansion would evaluate the dimension expression twice — undefined behavior for volatile expressions (C11 §6.7.3p7) — and temporary variables cannot be hoisted outside the function signature.
 
-11. An `orelse` shall not appear inside a `struct` or `union` member declaration (including within a `typeof` context in that declaration).
+12. An `orelse` shall not appear inside a `struct` or `union` member declaration (including within a `typeof` context in that declaration).
 
-12. Any `orelse` token that does not match one of the recognized forms listed above is a constraint violation.
+13. Any `orelse` token that does not match one of the recognized forms listed above is a constraint violation.
 
 ### Semantics
 
