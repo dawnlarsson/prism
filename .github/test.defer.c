@@ -2282,6 +2282,57 @@ static void test_defer_label_duplication_rejected(void) {
 	prism_free(&r);
 }
 
+static void test_defer_soft_keyword_labels_rejected(void) {
+	check_defer_transpile_rejects(
+	    "int f(int x) {\n"
+	    "    defer { raw: x++; }\n"
+	    "    if (x) return x;\n"
+	    "    return x + 1;\n"
+	    "}\n",
+	    "defer_raw_label.c",
+	    "defer soft label: raw rejected",
+	    "labels inside defer blocks");
+	check_defer_transpile_rejects(
+	    "int f(int x) {\n"
+	    "    defer { defer: x++; }\n"
+	    "    if (x) return x;\n"
+	    "    return x + 1;\n"
+	    "}\n",
+	    "defer_defer_label.c",
+	    "defer soft label: defer rejected",
+	    "labels inside defer blocks");
+	check_defer_transpile_rejects(
+	    "int f(int x) {\n"
+	    "    defer { orelse: x++; }\n"
+	    "    if (x) return x;\n"
+	    "    return x + 1;\n"
+	    "}\n",
+	    "defer_orelse_label.c",
+	    "defer soft label: orelse rejected",
+	    "labels inside defer blocks");
+}
+
+static void test_defer_soft_keyword_control_condition_rejected(void) {
+	check_defer_transpile_rejects(
+	    "int f(int x) {\n"
+	    "    int raw = x;\n"
+	    "    if (defer raw) return 1;\n"
+	    "    return 0;\n"
+	    "}\n",
+	    "defer_raw_condition.c",
+	    "defer soft condition: raw operand rejected",
+	    "defer cannot appear inside control statement parentheses");
+	check_defer_transpile_rejects(
+	    "int f(int x) {\n"
+	    "    int bool = x;\n"
+	    "    if (defer bool) return 1;\n"
+	    "    return 0;\n"
+	    "}\n",
+	    "defer_bool_condition.c",
+	    "defer soft condition: bool operand rejected",
+	    "defer cannot appear inside control statement parentheses");
+}
+
 static void test_defer_variable_shadowing_binds_wrong_scope(void) {
 	/* FIX: Prism copy-pastes defer token streams to each exit point.
 	 * When a captured variable is shadowed in an inner scope, the pasted
@@ -7064,6 +7115,8 @@ void run_defer_tests(void) {
 	test_defer_body_bare_orelse_return_not_rejected();
 	test_defer_paren_wrapped_orelse_smuggling();
 	test_defer_label_duplication_rejected();
+	test_defer_soft_keyword_labels_rejected();
+	test_defer_soft_keyword_control_condition_rejected();
 	test_defer_variable_shadowing_binds_wrong_scope();
 	test_defer_safe_shadow_no_exit();
 	test_defer_shadow_struct_member_false_positive();

@@ -1428,9 +1428,16 @@ static void check_enum_typedef_defer_shadow(Token *tok) {
 // Filters out: typedef-shadowed identifiers (unless followed by '{'),
 // goto targets, member access, labels (defer:), and assignment targets.
 static inline bool is_known_function_call(Token *tok);
+static inline bool is_empty_known_function_call(Token *tok);
+static bool token_in_function_declarator_param_list(Token *tok);
 static inline bool is_defer_kw(Token *tok, Token *prev) {
 	return (tok->tag & TT_DEFER) &&
+	       !is_empty_known_function_call(tok) &&
 	       (!typedef_lookup(tok) || match_ch(tok_next(tok), '{')) &&
+	       !token_in_function_declarator_param_list(tok) &&
+	       !(prev && ((prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_TYPEDEF |
+	                              TT_SUE | TT_TYPEOF | TT_BITINT)) ||
+	                  is_known_typedef(prev) || match_ch(prev, '*'))) &&
 	       !(prev && ((prev->tag & (TT_GOTO | TT_MEMBER)) || is_gnu_label_decl_head(prev) || _equal_2(prev, "&&"))) &&
 	       tok_next(tok) && !match_ch(tok_next(tok), ':') &&
 	       !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN));
@@ -1454,11 +1461,23 @@ static inline bool is_known_function_call(Token *tok) {
 	return next && match_ch(next, '(');
 }
 
+static inline bool is_empty_known_function_call(Token *tok) {
+	if (!is_known_function_call(tok)) return false;
+	Token *open = skip_noise(tok_next(tok));
+	return open && match_ch(open, '(') && tok_match(open) && tok_next(open) == tok_match(open);
+}
+
 static bool token_can_precede_function_name(Token *tok) {
 	while (tok && (match_ch(tok, '*') || (tok->tag & (TT_QUALIFIER | TT_STORAGE | TT_INLINE))))
 		tok = walk_back_past_noise(tok_idx(tok));
 	return tok && ((tok->tag & (TT_TYPE | TT_SUE | TT_TYPEOF | TT_BITINT)) ||
 	       is_known_typedef(tok));
+}
+
+static bool token_can_start_knr_param_decl(Token *tok) {
+	return tok && ((tok->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_INLINE |
+	                         TT_TYPEDEF | TT_SUE | TT_TYPEOF | TT_BITINT)) ||
+	               is_known_typedef(tok));
 }
 
 static bool paren_is_function_declarator_params(Token *open) {
@@ -1472,7 +1491,8 @@ static bool paren_is_function_declarator_params(Token *open) {
 		after = skip_noise(after);
 	}
 	if (!after || !(match_ch(after, '{') || match_ch(after, ';') ||
-	    match_ch(after, ',') || match_ch(after, '=') || match_ch(after, ')')))
+	    match_ch(after, ',') || match_ch(after, '=') || match_ch(after, ')') ||
+	    token_can_start_knr_param_decl(after)))
 		return false;
 	Token *prev = walk_back_past_noise(tok_idx(open));
 	if (prev && token_can_name_function(prev)) {
@@ -1482,6 +1502,25 @@ static bool paren_is_function_declarator_params(Token *open) {
 	if (prev && match_ch(prev, ')') && tok_match(prev)) {
 		Token *before = walk_back_past_noise(tok_idx(tok_match(prev)));
 		return token_can_precede_function_name(before);
+	}
+	return false;
+}
+
+static bool token_in_function_declarator_param_list(Token *tok) {
+	if (!tok) return false;
+	int depth = 0;
+	for (uint32_t i = tok_idx(tok); i > 0; i--) {
+		Token *t = &token_pool[i - 1];
+		if (t->kind == TK_PREP_DIR) continue;
+		if (t->flags & TF_CLOSE) { depth++; continue; }
+		if (t->flags & TF_OPEN) {
+			if (depth == 0 && match_ch(t, '('))
+				return paren_is_function_declarator_params(t);
+			if (depth > 0) depth--;
+			continue;
+		}
+		if (depth == 0 && (match_ch(t, ';') || match_ch(t, '{') || match_ch(t, '}')))
+			break;
 	}
 	return false;
 }
@@ -4842,8 +4881,7 @@ static Token *handle_defer_keyword(Token *tok) {
 	if (!FEAT(F_DEFER)) return NULL;
 	bool after_stmt_boundary = !last_emitted || match_ch(last_emitted, '{') ||
 		match_ch(last_emitted, ';') || match_ch(last_emitted, ':');
-	if (!ctx->at_stmt_start && !after_stmt_boundary && !ctrl_state.pending &&
-	    is_known_function_call(tok))
+	if (is_empty_known_function_call(tok))
 		return NULL;
 	// Distinguish struct field, label, goto target, variable assignment, attribute usage
 	if (match_ch(tok_next(tok), ':') ||
@@ -8171,7 +8209,7 @@ static Token *p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func,
 		    (prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
 		    is_defer_kw(inner, prev_inner) &&
 		    !is_known_function_call(inner) &&
-		    tok_next(inner)->kind == TK_IDENT)
+		    is_identifier_like(tok_next(inner)))
 			error_tok(inner, "defer cannot appear inside control statement parentheses");
 		if (se_depth == 0 && prev_saved &&
 		    (prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&

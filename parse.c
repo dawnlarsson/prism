@@ -1387,6 +1387,11 @@ static inline bool delimiters_match(Token *open, Token *close) {
 	return a == '(' ? b == ')' : b == a + 2;
 }
 
+static inline bool p0_token_can_name_function(Token *tok) {
+	return tok && (tok->kind == TK_IDENT || (tok->tag & (TT_DEFER | TT_ORELSE)) ||
+	               (tok->flags & TF_RAW));
+}
+
 static Token *find_wrapper_callee(Token *body) {
 	Token *end = tok_match(body);
 	if (!end) return NULL;
@@ -1396,7 +1401,7 @@ static Token *find_wrapper_callee(Token *body) {
 	if (tok && tok != end && (tok->tag & TT_RETURN)) tok = tok_next(tok);
 	while (tok && tok != end && tok->ch0 == ';') tok = tok_next(tok);
 
-	if (!tok || tok == end || tok->kind != TK_IDENT) return NULL;
+	if (!tok || tok == end || !p0_token_can_name_function(tok)) return NULL;
 	Token *open = tok_next(tok);
 	if (!open || open->ch0 != '(' || !tok_match(open)) return NULL;
 
@@ -1940,7 +1945,7 @@ static Token *tokenize(File *file) {
 				if (body->tag & (TT_SPECIAL_FN | TT_NORETURN_FN)) continue;
 				Token *end = tok_match(body);
 				for (Token *b = tok_next(body); b != end; b = tok_next(b)) {
-					if (b->kind != TK_IDENT) continue;
+					if (!p0_token_can_name_function(b)) continue;
 					if (!(fn_bloom & (1ULL << (((unsigned)b->ch0 ^ b->len) & 63)))) continue;
 					// Skip identifiers that are clearly variable declarations,
 					// not function calls/references.  At Pass 0 we have no symbol
@@ -2084,7 +2089,7 @@ static Token *tokenize(File *file) {
 			for (Token *s = scan_start; s && s->kind != TK_EOF; s = tok_next(s)) {
 				char ch = s->ch0;
 				if (ch == ';' || ch == '{') break;
-				if (s->kind == TK_IDENT && tok_next(s) &&
+					if (p0_token_can_name_function(s) && tok_next(s) &&
 				    tok_next(s)->ch0 == '(') {
 					// Skip known type/qualifier keywords
 					if (s->tag & (TT_SKIP_DECL | TT_INLINE | TT_QUALIFIER |
@@ -2102,7 +2107,7 @@ static Token *tokenize(File *file) {
 					Token *pt = &token_pool[pi - 1];
 					if (pt->kind == TK_PREP_DIR) continue;
 					if (pt->ch0 == ';' || pt->ch0 == '{' || pt->ch0 == '}') break;
-					if (pt->kind == TK_IDENT && tok_next(pt) &&
+					if (p0_token_can_name_function(pt) && tok_next(pt) &&
 					    tok_next(pt)->ch0 == '(') {
 						if (pt->tag & (TT_SKIP_DECL | TT_INLINE | TT_QUALIFIER |
 							       TT_TYPE | TT_STORAGE))
@@ -2125,7 +2130,7 @@ static Token *tokenize(File *file) {
 					nr_bloom |= 1ULL << (((unsigned char)ent->key[0] ^ ent->key_len) & 63);
 			}
 			for (Token *s = first; s && s->kind != TK_EOF; s = tok_next(s)) {
-				if (s->kind == TK_IDENT &&
+				if (p0_token_can_name_function(s) &&
 				    (nr_bloom & (1ULL << (((unsigned)s->ch0 ^ s->len) & 63))) &&
 				    !(tok_idx(s) >= 1 && (token_pool[tok_idx(s) - 1].tag & TT_MEMBER)) &&
 				    hashmap_get(&nr_map, tok_loc(s), s->len))
@@ -4143,7 +4148,7 @@ static Token *validate_defer_statement(Token *tok, bool in_loop, bool in_switch,
 		}
 	}
 
-	if (tok->kind == TK_IDENT && tok_next(tok) && match_ch(tok_next(tok), ':'))
+	if (is_identifier_like(tok) && tok_next(tok) && match_ch(tok_next(tok), ':'))
 		error_tok(tok, "labels inside defer blocks produce duplicate labels "
 			  "when the defer body is copied to multiple exit points");
 
@@ -4284,7 +4289,7 @@ static Token *p1_knr_find_close_paren(Token *semi_tok) {
 			Token *open = tok_match(pt);
 			bool is_ident_list = true;
 			for (Token *t = tok_next(open); t && t != pt; t = tok_next(t)) {
-				if (t->kind != TK_IDENT && !match_ch(t, ',') &&
+				if (!is_valid_varname(t) && !match_ch(t, ',') &&
 				    t->kind != TK_PREP_DIR) {
 					is_ident_list = false;
 					break;

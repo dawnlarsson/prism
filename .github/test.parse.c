@@ -4826,6 +4826,25 @@ void test_knr_typedef_param_defer(void) {
 	CHECK_EQ(knr_typedef_defer_flag, 1, "K&R typedef param defer ran");
 }
 
+static void test_knr_soft_keyword_param_names(void) {
+	const char *code =
+	    "int f(defer, raw)\n"
+	    "int defer;\n"
+	    "int raw;\n"
+	    "{\n"
+	    "    return defer + raw;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "knr_soft_params.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "K&R soft keyword params: transpiles");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "int f(defer, raw)") != NULL,
+		      "K&R soft keyword params: identifier list preserved");
+		CHECK(strstr(r.output, "return defer + raw;") != NULL,
+		      "K&R soft keyword params: body identifiers preserved");
+	}
+	prism_free(&r);
+}
+
 static int knr_label_defer_count;
 
 void knr_multi_label(a, result) int a;
@@ -5326,6 +5345,7 @@ static void test_prism_keyword_function_identifiers(void) {
 	    "int defer(void) { return 4; }\n"
 	    "int orelse(void);\n"
 	    "int call_keywords(void) {\n"
+	    "    defer();\n"
 	    "    int x = orelse();\n"
 	    "    if (orelse()) { x += defer(); }\n"
 	    "    int arr[orelse()];\n"
@@ -5341,6 +5361,9 @@ static void test_prism_keyword_function_identifiers(void) {
 		      "Prism keyword function identifiers: orelse initializer call preserved");
 		CHECK(strstr(r.output, "x += defer();") != NULL,
 		      "Prism keyword function identifiers: defer call preserved");
+		CHECK(strstr(r.output, "\n(); return") == NULL &&
+		      strstr(r.output, "} ();") == NULL,
+		      "Prism keyword function identifiers: statement-start defer call preserved");
 		CHECK(strstr(r.output, "return (orelse());") != NULL,
 		      "Prism keyword function identifiers: parenthesized orelse call preserved");
 		CHECK(strstr(r.output, "int param_keyword(int orelse)") != NULL,
@@ -7464,6 +7487,29 @@ static void test_auto_unreachable_user_noreturn(void) {
 	prism_free(&r);
 }
 
+static void test_auto_unreachable_soft_keyword_noreturn_names(void) {
+	const char *code =
+	    "_Noreturn void raw(void);\n"
+	    "_Noreturn void defer(void);\n"
+	    "_Noreturn void orelse(void);\n"
+	    "void f(int which) {\n"
+	    "    if (which == 0) { raw(); }\n"
+	    "    if (which == 1) { defer(); }\n"
+	    "    if (which == 2) { orelse(); }\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "unreachable_soft_keywords.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: soft keyword noreturn names transpile");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "raw(); __builtin_unreachable()") != NULL,
+		      "auto-unreachable: raw noreturn call injected");
+		CHECK(strstr(r.output, "defer(); __builtin_unreachable()") != NULL,
+		      "auto-unreachable: defer noreturn call injected");
+		CHECK(strstr(r.output, "orelse(); __builtin_unreachable()") != NULL,
+		      "auto-unreachable: orelse noreturn call injected");
+	}
+	prism_free(&r);
+}
+
 static void test_auto_unreachable_no_inject_braceless(void) {
 	// Braceless if body — injection would create a syntax error
 	const char *code =
@@ -8532,6 +8578,7 @@ void run_parse_tests(void) {
 	test_assert_still_active_after_reinclusion();
 	test_knr_defer_goto();
 	test_knr_typedef_param_defer();
+	test_knr_soft_keyword_param_names();
 	test_knr_multi_label();
 #ifdef __GNUC__
 	test_label_zeroinit_in_stmt_expr();
@@ -8709,6 +8756,7 @@ void run_parse_tests(void) {
 	// Auto-unreachable injection after noreturn calls
 	test_auto_unreachable_basic();
 	test_auto_unreachable_user_noreturn();
+	test_auto_unreachable_soft_keyword_noreturn_names();
 	test_auto_unreachable_no_inject_braceless();
 	test_auto_unreachable_braced_if();
 	test_auto_unreachable_disabled();
