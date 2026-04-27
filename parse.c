@@ -2272,6 +2272,7 @@ typedef struct {
 	bool is_array : 1;
 	bool is_vla : 1;
 	bool is_func_ptr : 1;
+	bool is_func_decl : 1;
 	bool has_paren : 1;
 	bool paren_pointer : 1;	  // Has pointer (*) inside parenthesized declarator
 	bool paren_array : 1;
@@ -3723,6 +3724,8 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 					added->is_aggregate = true;
 				if (type_spec.is_union && !decl.is_pointer && !decl.is_func_ptr)
 					added->is_union = true;
+				if (decl.is_func_decl)
+					added->is_func = true;
 				if (!decl.end) {
 					Token *after_name = skip_noise(tok_next(decl.var_name));
 					if (after_name && match_ch(after_name, '('))

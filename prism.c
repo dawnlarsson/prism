@@ -3439,6 +3439,9 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 
 	tok = decl_noise(tok, emit);
 
+	if (r.has_paren && match_ch(tok, '('))
+		r.is_func_decl = true;
+
 	if (r.has_paren && match_ch(tok, '[')) {
 		r.is_array = true; r.paren_array = true;
 		tok = decl_array_dims(tok, emit, &is_vla);
@@ -4473,7 +4476,7 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		    (decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
 		    ((type->is_struct || type->is_typedef || type->is_array) && !decl.is_pointer);
 		// Function types (via typedef) cannot be initialized — skip zero-init entirely.
-		bool is_func_type = is_typeof_func_type(type_start, type, &decl);
+		bool is_func_type = decl.is_func_decl || is_typeof_func_type(type_start, type, &decl);
 		// Only queue memset when zeroinit feature is enabled.
 		// Static/extern variables are zero-initialized by the loader — skip.
 		// Unions: = {0} only initializes the first named member (C11 §6.7.9p17);
@@ -7465,7 +7468,8 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 			{
 				bool has_init = match_ch(decl.end, '=');
 				uint16_t eff_sid = body_sid > 0 ? body_sid : cur_sid;
-				if (eff_sid > 0) {
+				bool is_func_type = decl.is_func_decl || is_typeof_func_type(init_tok, &type, &decl);
+				if (eff_sid > 0 && !is_func_type) {
 					P1FuncEntry *e = p1_alloc(P1K_DECL, eff_sid, decl.var_name);
 					e->decl.has_init = has_init;
 					e->decl.is_vla = type.is_vla || decl.is_vla;
@@ -8515,7 +8519,8 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		}
 
 		// Phase 1D: record declaration entry
-		if (cur_func >= 0 && decl.var_name && brace_depth > 0) {
+		bool decl_is_func_type = decl.is_func_decl || is_typeof_func_type(type_tok, &type, &decl);
+		if (cur_func >= 0 && decl.var_name && brace_depth > 0 && !decl_is_func_type) {
 			P1FuncEntry *e = p1_alloc(P1K_DECL, cur_sid, decl.var_name);
 			e->decl.has_init = has_init;
 			e->decl.is_vla = type.is_vla || decl.is_vla;

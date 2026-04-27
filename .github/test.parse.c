@@ -889,11 +889,20 @@ void test_local_function_decl(void) {
 	int return_func(const int *ap, int off);
 
 	PrismResult result = prism_transpile_source(
+	    "typedef int LocalFunc(void);\n"
+	    "typedef int (*Getter(void))[10];\n"
 	    "void f(void) {\n"
 	    "    void local_func(int a, int b);\n"
 	    "    void multi_line_func(int *rp, const int *ap, const void *table,\n"
 	    "                         const int *np, const int *n0, int num, int power);\n"
 	    "    int return_func(const int *ap, int off);\n"
+	    "    int (*signal_like(int sig, int (*handler)(int)))(int);\n"
+	    "    goto done;\n"
+	    "    int (*skipped_signal_like(int sig, int (*handler)(int)))(int);\n"
+	    "    LocalFunc skipped_typed_func;\n"
+	    "done:\n"
+	    "    LocalFunc typed_func;\n"
+	    "    Getter getter;\n"
 	    "}\n",
 	    "local_function_decl.c", prism_defaults());
 	CHECK_EQ(result.status, PRISM_OK, "local function declarations transpile");
@@ -904,12 +913,30 @@ void test_local_function_decl(void) {
 		      "local function declarations: multi_line_func preserved");
 		CHECK(strstr(result.output, "return_func") != NULL,
 		      "local function declarations: return_func preserved");
+		CHECK(strstr(result.output, "signal_like") != NULL,
+		      "local function declarations: function returning pointer preserved");
+		CHECK(strstr(result.output, "skipped_signal_like") != NULL,
+		      "local function declarations: skipped function returning pointer preserved");
+		CHECK(strstr(result.output, "LocalFunc typed_func;") != NULL,
+		      "local function declarations: function typedef preserved");
+		CHECK(strstr(result.output, "Getter getter;") != NULL,
+		      "local function declarations: function typedef returning pointer preserved");
 		CHECK(strstr(result.output, "local_func =") == NULL,
 		      "local function declarations: local_func not rewritten as variable init");
 		CHECK(strstr(result.output, "multi_line_func =") == NULL,
 		      "local function declarations: multi_line_func not rewritten as variable init");
 		CHECK(strstr(result.output, "return_func =") == NULL,
 		      "local function declarations: return_func not rewritten as variable init");
+		CHECK(strstr(result.output, "signal_like(int sig, int (*handler)(int)))(int) =") == NULL,
+		      "local function declarations: function returning pointer not rewritten as variable init");
+		CHECK(strstr(result.output, "skipped_signal_like(int sig, int (*handler)(int)))(int) =") == NULL,
+		      "local function declarations: skipped function returning pointer not treated as variable");
+		CHECK(strstr(result.output, "LocalFunc skipped_typed_func =") == NULL,
+		      "local function declarations: skipped function typedef not treated as variable");
+		CHECK(strstr(result.output, "LocalFunc typed_func =") == NULL,
+		      "local function declarations: function typedef not rewritten as variable init");
+		CHECK(strstr(result.output, "Getter getter =") == NULL,
+		      "local function declarations: function typedef returning pointer not rewritten as variable init");
 	}
 	prism_free(&result);
 }
@@ -7462,6 +7489,14 @@ static bool has_unreachable_marker(const char *output) {
 	return strstr(output, "__builtin_unreachable()") || strstr(output, "__assume(0)");
 }
 
+static bool has_unreachable_after_call(const char *output, const char *call) {
+	char gcc_marker[96];
+	char msvc_marker[96];
+	snprintf(gcc_marker, sizeof(gcc_marker), "%s __builtin_unreachable()", call);
+	snprintf(msvc_marker, sizeof(msvc_marker), "%s __assume(0)", call);
+	return strstr(output, gcc_marker) || strstr(output, msvc_marker);
+}
+
 static void test_auto_unreachable_basic(void) {
 	const char *code =
 	    "void f(void) {\n"
@@ -7500,11 +7535,11 @@ static void test_auto_unreachable_soft_keyword_noreturn_names(void) {
 	PrismResult r = prism_transpile_source(code, "unreachable_soft_keywords.c", prism_defaults());
 	CHECK_EQ(r.status, PRISM_OK, "auto-unreachable: soft keyword noreturn names transpile");
 	if (r.status == PRISM_OK && r.output) {
-		CHECK(strstr(r.output, "raw(); __builtin_unreachable()") != NULL,
+		CHECK(has_unreachable_after_call(r.output, "raw();"),
 		      "auto-unreachable: raw noreturn call injected");
-		CHECK(strstr(r.output, "defer(); __builtin_unreachable()") != NULL,
+		CHECK(has_unreachable_after_call(r.output, "defer();"),
 		      "auto-unreachable: defer noreturn call injected");
-		CHECK(strstr(r.output, "orelse(); __builtin_unreachable()") != NULL,
+		CHECK(has_unreachable_after_call(r.output, "orelse();"),
 		      "auto-unreachable: orelse noreturn call injected");
 	}
 	prism_free(&r);
