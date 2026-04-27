@@ -897,12 +897,16 @@ void test_local_function_decl(void) {
 	    "                         const int *np, const int *n0, int num, int power);\n"
 	    "    int return_func(const int *ap, int off);\n"
 	    "    int (*signal_like(int sig, int (*handler)(int)))(int);\n"
+	    "    int (*get_array(void))[10];\n"
 	    "    goto done;\n"
 	    "    int (*skipped_signal_like(int sig, int (*handler)(int)))(int);\n"
 	    "    LocalFunc skipped_typed_func;\n"
+	    "    typeof(get_array) skipped_typed_get_array;\n"
 	    "done:\n"
 	    "    LocalFunc typed_func;\n"
 	    "    Getter getter;\n"
+	    "    typeof(get_array) typed_get_array;\n"
+	    "    typeof(get_array) *typed_get_array_ptr;\n"
 	    "}\n",
 	    "local_function_decl.c", prism_defaults());
 	CHECK_EQ(result.status, PRISM_OK, "local function declarations transpile");
@@ -917,10 +921,16 @@ void test_local_function_decl(void) {
 		      "local function declarations: function returning pointer preserved");
 		CHECK(strstr(result.output, "skipped_signal_like") != NULL,
 		      "local function declarations: skipped function returning pointer preserved");
+		CHECK(strstr(result.output, "get_array") != NULL,
+		      "local function declarations: function returning array pointer preserved");
 		CHECK(strstr(result.output, "LocalFunc typed_func;") != NULL,
 		      "local function declarations: function typedef preserved");
 		CHECK(strstr(result.output, "Getter getter;") != NULL,
 		      "local function declarations: function typedef returning pointer preserved");
+		CHECK(strstr(result.output, "typeof(get_array) typed_get_array;") != NULL,
+		      "local function declarations: typeof complex function preserved");
+		CHECK(strstr(result.output, "typeof(get_array) *typed_get_array_ptr =") != NULL,
+		      "local function declarations: pointer to typeof complex function initialized");
 		CHECK(strstr(result.output, "local_func =") == NULL,
 		      "local function declarations: local_func not rewritten as variable init");
 		CHECK(strstr(result.output, "multi_line_func =") == NULL,
@@ -937,6 +947,12 @@ void test_local_function_decl(void) {
 		      "local function declarations: function typedef not rewritten as variable init");
 		CHECK(strstr(result.output, "Getter getter =") == NULL,
 		      "local function declarations: function typedef returning pointer not rewritten as variable init");
+		CHECK(strstr(result.output, "typeof(get_array) skipped_typed_get_array =") == NULL &&
+		      strstr(result.output, "typeof(get_array) skipped_typed_get_array;") != NULL,
+		      "local function declarations: skipped typeof complex function not treated as variable");
+		CHECK(strstr(result.output, "typeof(get_array) typed_get_array =") == NULL &&
+		      strstr(result.output, "&typed_get_array") == NULL,
+		      "local function declarations: typeof complex function not zero-initialized");
 	}
 	prism_free(&result);
 }

@@ -4046,6 +4046,14 @@ static bool is_typeof_func_type(Token *type_start, TypeSpecResult *type, DeclRes
 			}
 			// Single bare identifier inside typeof()?
 			if (!inner || inner == close) break;
+			if (tok_next(inner) == close && is_valid_varname(inner) &&
+			    !(inner->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF))) {
+				TypedefEntry *shadow = typedef_lookup(inner);
+				if (shadow && shadow->is_shadow) {
+					if (shadow->is_func) return true;
+					break;
+				}
+			}
 			// Function type signature: typeof(int(int)) — type keyword followed by '('
 			if (inner->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)) {
 				for (Token *fs = inner; fs && fs != close; fs = tok_next(fs)) {
@@ -4113,7 +4121,7 @@ static bool is_typeof_func_type(Token *type_start, TypeSpecResult *type, DeclRes
 	// But skip if the name is shadowed by a local variable at this position.
 	if (typeof_ident_loc && typeof_inner) {
 		TypedefEntry *shadow = typedef_lookup(typeof_inner);
-		if (shadow && shadow->is_shadow) return false;
+		if (shadow && shadow->is_shadow) return shadow->is_func;
 		return hashmap_get(&p1_func_proto_map, typeof_ident_loc, typeof_ident_len) != NULL;
 	}
 	return false;
@@ -7449,6 +7457,14 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 			    (decl.var_name->flags & TF_RAW) ||
 			    hashmap_get(&p1_func_proto_map, tok_loc(decl.var_name), decl.var_name->len))
 				p1_register_shadow(decl.var_name, cur_sid, brace_depth);
+			if (decl.is_func_decl) {
+				TypedefEntry *e = p1_shadow_entry_for_token(decl.var_name);
+				if (!e) {
+					p1_register_shadow(decl.var_name, cur_sid, brace_depth);
+					e = p1_shadow_entry_for_token(decl.var_name);
+				}
+				if (e) e->is_func = true;
+			}
 			// Volatile-qualified scalar/aggregate variables (not pointers)
 			// must also be registered so reject_orelse_side_effects can
 			// flag bare volatile idents in orelse LHS.
@@ -8369,9 +8385,13 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		    (decl.var_name->tag & (TT_DEFER | TT_ORELSE | TT_NORETURN_FN | TT_SPECIAL_FN)) ||
 		    (decl.var_name->flags & TF_RAW) ||
 		    hashmap_get(&p1_func_proto_map, tok_loc(decl.var_name), decl.var_name->len) ||
-		    is_vol_local || is_const_local) {
+		    is_vol_local || is_const_local || decl.is_func_decl) {
 			p1_register_shadow(decl.var_name, cur_sid, brace_depth);
 			did_shadow = true;
+		}
+		if (decl.is_func_decl) {
+			TypedefEntry *e = p1_shadow_entry_for_token(decl.var_name);
+			if (e) e->is_func = true;
 		}
 		if ((is_vol_local || is_const_local) && typedef_table.count > 0) {
 			TypedefEntry *e = p1_shadow_entry_for_token(decl.var_name);
