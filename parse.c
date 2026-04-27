@@ -2727,9 +2727,13 @@ static inline bool orelse_shadow_is_kw(Token *prev) {
 // Find opening brace of a struct/union/enum body, or NULL if no body.
 static Token *find_struct_body_brace(Token *tok) {
 	Token *t = tok_next(tok);
+	bool saw_tag = false;
 	while (t && t->kind != TK_EOF) {
 		SKIP_NOISE_CONTINUE(t);
-		if (is_valid_varname(t) || (t->tag & TT_QUALIFIER) || is_type_keyword(t)) {
+		if (!saw_tag && is_valid_varname(t)) {
+			saw_tag = true;
+			t = tok_next(t);
+		} else if ((t->tag & TT_QUALIFIER) || is_type_keyword(t)) {
 			t = tok_next(t);
 		} else if (match_ch(t, ':')) {
 			// C23 enum fixed underlying type: enum E : int { ... }

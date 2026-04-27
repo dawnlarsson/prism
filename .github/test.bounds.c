@@ -62,6 +62,48 @@ static void test_bounds_check_fixed_array(void) {
 		prism_free(&r);
 	}
 
+	// Prism soft keywords used as normal C identifiers: must still wrap.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int raw[4]={0,1,2,3}; int defer[2]={4,5}; "
+		    "int orelse[2]={6,7}; return raw[2] + defer[1] + orelse[0];}\n",
+		    "bc_raw_ident.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-soft-ident: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "raw[__prism_bchk") != NULL,
+			      "bc-soft-ident: raw array subscript wrapped");
+			CHECK(strstr(r.output, "sizeof(raw)/sizeof(raw[0])") != NULL,
+			      "bc-soft-ident: raw sizeof-ratio used");
+			CHECK(strstr(r.output, "defer[__prism_bchk") != NULL,
+			      "bc-soft-ident: defer array subscript wrapped");
+			CHECK(strstr(r.output, "orelse[__prism_bchk") != NULL,
+			      "bc-soft-ident: orelse array subscript wrapped");
+		}
+		prism_free(&r);
+	}
+
+	// No-paren sizeof with a soft-keyword array name is still unevaluated.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int raw[4]={0,1,2,3}; "
+		    "return (int)sizeof raw[2] + raw[1];}\n",
+		    "bc_raw_sizeof.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-soft-sizeof: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "sizeof raw[__prism_bchk") == NULL,
+			      "bc-soft-sizeof: sizeof soft-keyword subscript not wrapped");
+			CHECK(strstr(r.output, "return (int)sizeof raw[2]") != NULL,
+			      "bc-soft-sizeof: sizeof soft-keyword subscript preserved");
+			CHECK(strstr(r.output, "+ raw[__prism_bchk") != NULL,
+			      "bc-soft-sizeof: evaluated soft-keyword subscript wrapped");
+		}
+		prism_free(&r);
+	}
+
 	// Declarator brackets NOT wrapped
 	{
 		PrismFeatures f = prism_defaults();

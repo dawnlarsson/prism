@@ -5126,6 +5126,24 @@ static void test_soft_keyword_typedefs_and_tags_zeroed(void) {
 	prism_free(&r);
 }
 
+static void test_prism_raw_struct_tag_preserved(void) {
+	const char *code =
+	    "struct raw { int x; };\n"
+	    "int f(void) {\n"
+	    "    struct raw s = {1};\n"
+	    "    return s.x;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "raw_struct_tag.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "raw struct tag: transpiles");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "struct raw s = {1};") != NULL,
+		      "raw struct tag: tag preserved in declaration");
+		CHECK(strstr(r.output, "struct s = {1};") == NULL,
+		      "raw struct tag: tag not stripped as raw keyword");
+	}
+	prism_free(&r);
+}
+
 static void test_soft_keyword_labels_and_gotos(void) {
 	const char *code =
 	    "int f(int n) {\n"
@@ -8532,6 +8550,7 @@ void run_parse_tests(void) {
 	test_short_keyword_recognition();
 	test_soft_keyword_identifiers_zeroed();
 	test_soft_keyword_typedefs_and_tags_zeroed();
+	test_prism_raw_struct_tag_preserved();
 	test_soft_keyword_labels_and_gotos();
 	test_prism_keyword_sue_declarator_names();
 	test_prism_keyword_orelse_label_and_enum_dimension();

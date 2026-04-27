@@ -1254,6 +1254,18 @@ static void test_orelse_bare_fallback_requires_target(void) {
 	    "assignment target");
 }
 
+static void test_orelse_bare_const_assignment_rejected(void) {
+	check_orelse_transpile_rejects(
+	    "int get(void);\n"
+	    "void f(void) {\n"
+	    "    const int x = 0;\n"
+	    "    x = get() orelse 1;\n"
+	    "}\n",
+	    "orelse_bare_const_assignment.c",
+	    "orelse bare const assignment: rejected",
+	    "const-qualified");
+}
+
 static void test_orelse_struct_value_rejected(void) {
 	check_orelse_transpile_rejects(
 	    "struct Pair { int x; int y; };\n"
@@ -8253,6 +8265,7 @@ void run_orelse_tests(void) {
 	test_orelse_for_init_rejected();
 	test_orelse_missing_action_rejected();
 	test_orelse_bare_fallback_requires_target();
+	test_orelse_bare_const_assignment_rejected();
 	test_orelse_struct_value_rejected();
 	GNUC_ONLY(test_orelse_stmt_expr_fallback_rejected());
 	test_orelse_bare_assign_compound_side_effect_rejected();
