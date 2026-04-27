@@ -42,9 +42,23 @@
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
-#define PRISM_COLD __attribute__((cold,noinline))
+#define PRISM_COLD          __attribute__((cold, noinline))
+#define PRISM_HOT           __attribute__((hot))
+#define PRISM_PURE          __attribute__((pure))
+#define PRISM_CONST_FN      __attribute__((const))
+#define PRISM_ALWAYS_INLINE __attribute__((always_inline))
+#define PRISM_FLATTEN       __attribute__((flatten))
+#define PRISM_LIKELY(x)     __builtin_expect(!!(x), 1)
+#define PRISM_UNLIKELY(x)   __builtin_expect(!!(x), 0)
 #else
 #define PRISM_COLD
+#define PRISM_HOT
+#define PRISM_PURE
+#define PRISM_CONST_FN
+#define PRISM_ALWAYS_INLINE
+#define PRISM_FLATTEN
+#define PRISM_LIKELY(x)   (x)
+#define PRISM_UNLIKELY(x) (x)
 #endif
 
 #define TOMBSTONE ((char *)1)
@@ -593,33 +607,33 @@ static inline Token *pool_alloc_token(void) {
 }
 
 // Accessor: get cold data for a token
-static inline TokenCold *tok_cold(Token *tok) {
+static inline PRISM_ALWAYS_INLINE PRISM_PURE TokenCold *tok_cold(Token *tok) {
 	return &token_cold[tok - token_pool];
 }
 
 // Accessor: resolve token -> source location pointer
-static inline char *tok_loc(Token *tok) {
+static inline PRISM_ALWAYS_INLINE PRISM_PURE char *tok_loc(Token *tok) {
 	TokenCold *c = tok_cold(tok);
 	return ctx->input_files[c->file_idx]->contents + c->loc_offset;
 }
 
 // Accessor: resolve next_idx -> Token*
-static inline Token *tok_next(Token *tok) {
+static inline PRISM_ALWAYS_INLINE PRISM_PURE Token *tok_next(Token *tok) {
 	return tok->next_idx ? &token_pool[tok->next_idx] : NULL;
 }
 
 // Accessor: resolve match_idx -> Token*
-static inline Token *tok_match(Token *tok) {
+static inline PRISM_ALWAYS_INLINE PRISM_PURE Token *tok_match(Token *tok) {
 	return tok->match_idx ? &token_pool[tok->match_idx] : NULL;
 }
 
 // Convert Token* to pool index (0 for NULL)
-static inline uint32_t tok_idx(Token *tok) {
+static inline PRISM_ALWAYS_INLINE PRISM_PURE uint32_t tok_idx(Token *tok) {
 	return tok ? (uint32_t)(tok - token_pool) : 0;
 }
 
 // Fast multiply-mix hash (~2-4x faster than FNV-1a for short strings)
-static inline uint64_t fast_hash(char *s, uint32_t len) {
+static inline PRISM_PURE uint64_t fast_hash(char *s, uint32_t len) {
 	uint64_t a = 0, b = 0;
 	if (len >= 8) {
 		memcpy(&a, s, 8);
@@ -643,7 +657,7 @@ static inline uint64_t fast_hash(char *s, uint32_t len) {
 	return a;
 }
 
-static void *hashmap_get(HashMap *map, char *key, int keylen) {
+static PRISM_PURE void *hashmap_get(HashMap *map, char *key, int keylen) {
 	if (__builtin_expect(!map->buckets, 0)) return NULL;
 	uint64_t hash = fast_hash(key, keylen);
 	uint32_t hash32 = (uint32_t)hash;
@@ -880,12 +894,12 @@ static void warn_tok(Token *tok, const char *fmt, ...) {
 #endif
 }
 
-static inline bool equal_n(Token *tok, const char *op, size_t len) {
+static inline PRISM_ALWAYS_INLINE PRISM_PURE bool equal_n(Token *tok, const char *op, size_t len) {
 	return tok->len == (uint32_t)len && tok->ch0 == (uint8_t)op[0] &&
 	       !memcmp(tok_loc(tok) + 1, op + 1, len - 1);
 }
 
-static inline bool _equal_1(Token *tok, char c) {
+static inline PRISM_ALWAYS_INLINE PRISM_PURE bool _equal_1(Token *tok, char c) {
 	return tok->len == 1 && tok->ch0 == (uint8_t)c;
 }
 #define match_ch _equal_1
@@ -915,22 +929,22 @@ static inline bool is_stmt_expr_open(Token *t) {
 }
 
 // 'else' keyword (TT_IF covers both if and else; 'e' distinguishes)
-static inline bool is_else_kw(Token *t) { return (t->tag & TT_IF) && t->ch0 == 'e'; }
+static inline PRISM_ALWAYS_INLINE PRISM_PURE bool is_else_kw(Token *t) { return (t->tag & TT_IF) && t->ch0 == 'e'; }
 // 'do' keyword (TT_LOOP covers for/while/do; 'd' distinguishes)
-static inline bool is_do_kw(Token *t) { return (t->tag & TT_LOOP) && t->ch0 == 'd'; }
+static inline PRISM_ALWAYS_INLINE PRISM_PURE bool is_do_kw(Token *t) { return (t->tag & TT_LOOP) && t->ch0 == 'd'; }
 // Either else or do (no-condition ctrl-flow)
-static inline bool is_else_or_do(Token *t) { return is_else_kw(t) || is_do_kw(t); }
+static inline PRISM_ALWAYS_INLINE PRISM_PURE bool is_else_or_do(Token *t) { return is_else_kw(t) || is_do_kw(t); }
 
-static inline bool _equal_2(Token *tok, const char *s) {
+static inline PRISM_ALWAYS_INLINE PRISM_PURE bool _equal_2(Token *tok, const char *s) {
 	if (tok->len != 2 || tok->ch0 != (uint8_t)s[0]) return false;
 	return tok_loc(tok)[1] == s[1];
 }
 
-static inline bool is_gnu_label_decl_head(Token *tok) {
+static inline PRISM_PURE bool is_gnu_label_decl_head(Token *tok) {
 	return tok && tok->len == 9 && tok->ch0 == '_' && !memcmp(tok_loc(tok), "__label__", 9);
 }
 
-static inline uint64_t keyword_lookup(char *key, int keylen) {
+static inline PRISM_PURE uint64_t keyword_lookup(char *key, int keylen) {
 	if (keylen < 2) return 0;
 	unsigned slot = KEYWORD_HASH(key, keylen);
 	for (int i = 0; i < 8; i++) {
@@ -941,7 +955,7 @@ static inline uint64_t keyword_lookup(char *key, int keylen) {
 	return 0;
 }
 
-static inline bool is_potential_func_name(Token *tok) {
+static inline PRISM_PURE bool is_potential_func_name(Token *tok) {
 	Token *next = tok_next(tok);
 	return tok->kind <= TK_KEYWORD && next && next->ch0 == '(' &&
 	       (next->flags & TF_OPEN) &&
@@ -2351,7 +2365,7 @@ static PRISM_THREAD_LOCAL bool p1_typedef_annotated; // true after p1_annotate_t
 #define is_sizeof_like(t) ((t)->flags & TF_SIZEOF)
 #define is_enum_kw(t) ((t)->tag & TT_SUE && (t)->ch0 == 'e')
 
-static inline bool is_identifier_like(Token *tok) {
+static inline PRISM_ALWAYS_INLINE PRISM_PURE bool is_identifier_like(Token *tok) {
 	return tok->kind <= TK_KEYWORD; // TK_IDENT=0, TK_KEYWORD=1
 }
 
@@ -2379,7 +2393,7 @@ static bool is_pp_conditional(Token *s) {
 }
 
 // Skip noise tokens (attributes, C23 [[...]], prep dirs) in analysis mode.
-static Token *skip_noise(Token *tok) {
+static PRISM_PURE Token *skip_noise(Token *tok) {
 	while (tok && tok->kind != TK_EOF) {
 		if (tok->tag & TT_ATTR) {
 			tok = tok_next(tok);
@@ -2396,7 +2410,7 @@ static Token *skip_noise(Token *tok) {
 
 // Check if a token is "noise" (attribute, C23 [[...]], or preprocessor directive).
 // These tokens must be skipped via skip_noise() before any tag-based type checks.
-static inline bool is_noise_token(Token *t) {
+static inline PRISM_PURE bool is_noise_token(Token *t) {
 	return (t->tag & TT_ATTR) || is_c23_attr(t) || t->kind == TK_PREP_DIR;
 }
 
@@ -2414,7 +2428,7 @@ static inline bool is_noise_token(Token *t) {
 	if (_sn != (var)) { (var) = _sn; continue; } \
 } while(0)
 
-static Token *skip_to_semicolon(Token *tok, Token *end) {
+static PRISM_PURE Token *skip_to_semicolon(Token *tok, Token *end) {
 	while (tok->kind != TK_EOF) {
 		if (end && tok == end) return tok;
 		if (tok->flags & TF_OPEN) { tok = tok_next(tok_match(tok)); continue; }
@@ -2446,7 +2460,7 @@ static void typedef_table_reset(void) {
 	hashmap_discard(&typedef_table.name_map);
 }
 
-static int typedef_get_index(char *name, int len) {
+static PRISM_PURE int typedef_get_index(char *name, int len) {
 	void *val = hashmap_get(&typedef_table.name_map, name, len);
 	return val ? (int)(intptr_t)val - 1 : -1;
 }
@@ -2507,7 +2521,7 @@ typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool i
 
 static inline bool is_soft_keyword_identifier(Token *tok);
 
-static TypedefEntry *typedef_lookup(Token *tok) {
+static PRISM_PURE TypedefEntry *typedef_lookup(Token *tok) {
 	if (!is_identifier_like(tok)) return NULL;
 	if (p1_typedef_annotated && !(tok_ann(tok) & P1_HAS_ENTRY)) return NULL;
 	if (tok->kind == TK_KEYWORD && !is_soft_keyword_identifier(tok) &&
@@ -2537,7 +2551,7 @@ static TypedefEntry *typedef_lookup(Token *tok) {
 // Lookup a struct/union tag entry, skipping ordinary identifiers/shadows.
 // Enforces ISO C11 §6.2.3 namespace separation: tag names live in a
 // different namespace from ordinary identifiers.
-static TypedefEntry *tag_lookup(Token *tok) {
+static PRISM_PURE TypedefEntry *tag_lookup(Token *tok) {
 	if (!is_identifier_like(tok)) return NULL;
 	unsigned c0 = tok->ch0, tl = tok->len;
 	if (!(typedef_table.bloom & (1ULL << ((c0 ^ tl) & 63)))) return NULL;
@@ -2553,7 +2567,7 @@ static TypedefEntry *tag_lookup(Token *tok) {
 	return NULL;
 }
 
-static inline int typedef_flags(Token *tok) {
+static inline PRISM_PURE int typedef_flags(Token *tok) {
 	TypedefEntry *e = typedef_lookup(tok);
 	if (!e) return 0;
 	if (e->is_enum_const) return TDF_ENUM_CONST;
@@ -2573,7 +2587,7 @@ static inline int typedef_flags(Token *tok) {
 }
 
 // After Pass 1 annotation, is_known_typedef becomes O(1) bit check.
-static inline bool _is_known_typedef(Token *tok) {
+static inline PRISM_PURE bool _is_known_typedef(Token *tok) {
 	if (__builtin_expect(p1_typedef_annotated, 1)) return tok_ann(tok) & P1_IS_TYPEDEF;
 	return typedef_flags(tok) & TDF_TYPEDEF;
 }
@@ -2590,13 +2604,13 @@ static inline bool _is_known_typedef(Token *tok) {
 
 // --- Type/Variable Classification ---
 
-static bool is_type_keyword(Token *tok) {
+static PRISM_PURE bool is_type_keyword(Token *tok) {
 	if (tok->tag & TT_TYPE) return true;
 	if (tok->kind != TK_IDENT && tok->kind != TK_KEYWORD) return false;
 	return is_known_typedef(tok);
 }
 
-static inline bool is_soft_keyword_identifier(Token *tok) {
+static inline PRISM_PURE bool is_soft_keyword_identifier(Token *tok) {
 	if (!tok || tok->kind != TK_KEYWORD) return false;
 	switch (tok->ch0) {
 	case 'a': return equal(tok, "alignas") || equal(tok, "alignof") || equal(tok, "asm");
@@ -2616,20 +2630,20 @@ static inline bool soft_keyword_decl_name_boundary(Token *tok) {
 		       (after->tag & TT_ASM));
 }
 
-static inline bool is_valid_varname(Token *tok) {
+static inline PRISM_PURE bool is_valid_varname(Token *tok) {
 	return tok->kind == TK_IDENT || is_soft_keyword_identifier(tok) || (tok->flags & TF_RAW) ||
 	       (tok->tag & (TT_DEFER | TT_ORELSE));
 }
 
 // Token ends an expression (value-producing): ident, keyword, num, str, ), ].
-static inline bool is_expr_ending(Token *t) {
+static inline PRISM_PURE bool is_expr_ending(Token *t) {
 	return (t->kind == TK_IDENT || t->kind == TK_KEYWORD ||
 		t->kind == TK_NUM || t->kind == TK_STR) ||
 	       match_set(t, CH(')') | CH(']'));
 }
 
 // Extended version including '}' (for compound literal / brace init contexts).
-static inline bool is_expr_ending_brace(Token *t) {
+static inline PRISM_PURE bool is_expr_ending_brace(Token *t) {
 	return is_expr_ending(t) || match_ch(t, '}');
 }
 
@@ -2668,14 +2682,14 @@ static void parse_enum_constants(Token *tok, int scope_depth) {
 
 // Shadow-aware orelse keyword check: real typedefs suppress,
 // variable/enum shadows do not.
-static inline bool is_orelse_kw_shadow(Token *tok) {
+static inline PRISM_PURE bool is_orelse_kw_shadow(Token *tok) {
 	if (!(tok->tag & TT_ORELSE)) return false;
 	TypedefEntry *te = typedef_lookup(tok);
 	return !te || te->is_shadow;
 }
 
 // Strict orelse keyword check: any typedef table match suppresses.
-static inline bool is_orelse_kw(Token *tok) {
+static inline PRISM_PURE bool is_orelse_kw(Token *tok) {
 	if (!(tok->tag & TT_ORELSE)) return false;
 	return !typedef_lookup(tok);
 }

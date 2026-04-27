@@ -580,14 +580,14 @@ static PRISM_COLD void out_str_slow(const char *s, int len) {
 	out_buf_pos += len;
 }
 
-static inline void out_char(char c) {
-	if (__builtin_expect(out_buf_pos >= OUT_BUF_SIZE, 0)) out_flush();
+static inline PRISM_ALWAYS_INLINE void out_char(char c) {
+	if (PRISM_UNLIKELY(out_buf_pos >= OUT_BUF_SIZE)) out_flush();
 	out_buf[out_buf_pos++] = c;
 }
 
-static inline void out_str(const char *s, int len) {
-	if (__builtin_expect(len <= 0, 0)) return;
-	if (__builtin_expect(out_buf_pos + len >= OUT_BUF_SIZE, 0)) {
+static inline PRISM_ALWAYS_INLINE void out_str(const char *s, int len) {
+	if (PRISM_UNLIKELY(len <= 0)) return;
+	if (PRISM_UNLIKELY(out_buf_pos + len >= OUT_BUF_SIZE)) {
 		out_str_slow(s, len);
 		return;
 	}
@@ -897,7 +897,7 @@ static void defer_add(Token *defer_keyword, Token *start, Token *end) {
 
 // --- Token Emission ---
 
-static void emit_tok(Token *tok) {
+static PRISM_HOT void emit_tok(Token *tok) {
 	TokenCold *c = tok_cold(tok);
 	File *f = (c->file_idx < (uint32_t)ctx->input_file_count)
 		  ? ctx->input_files[c->file_idx] : ctx->current_file;
@@ -2850,7 +2850,7 @@ static inline bool walk_balanced_tail(Token **tp) {
 	return true;
 }
 
-static Token *walk_balanced(Token *tok, bool emit) {
+static PRISM_HOT Token *walk_balanced(Token *tok, bool emit) {
 	Token *end = tok_match(tok);
 	if (!end) return tok_next(tok);
 	if (emit) {
@@ -8780,7 +8780,7 @@ static void p1d_handle_close_brace(P1ScanState *s) {
 	s->tok = tok_next(tok);
 }
 
-static void p1_full_depth_prescan(Token *tok) {
+static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 	P1ScanState _ps = {0};
 	P1ScanState *ps = &_ps;
 	ps->tok = tok;
@@ -9999,7 +9999,7 @@ static void p1_annotate_typedefs(void) {
 // --- Pass 2: Main Transpilation Loop ---
 
 // Core transpile: emit transformed tokens to an already-opened FILE*
-static int transpile_tokens(Token *tok, FILE *fp) {
+static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 	out_fp = fp;
 	out_buf_pos = 0;
 	out_total_flushed = 0;
