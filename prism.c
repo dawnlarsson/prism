@@ -1,4 +1,4 @@
-#define PRISM_VERSION "1.1.3"
+#define PRISM_VERSION "1.1.4"
 
 #ifndef _WIN32
 #ifndef _GNU_SOURCE
@@ -14,6 +14,7 @@
 #include <sys/wait.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <time.h>
 
 #define INSTALL_PATH "/usr/local/bin/prism"
 #define PRISM_DEFAULT_CC "cc"
@@ -222,6 +223,7 @@ typedef struct {
 	CliMode mode;
 	CliAction action;
 	bool verbose;
+	bool profile;
 	bool compile_only;
 	bool passthrough;
 	bool no_link_pragma;     // -fno-link-pragma: suppress #pragma link libs
@@ -350,6 +352,7 @@ static PRISM_THREAD_LOCAL int current_func_idx = -1; // Index into func_meta[] f
 static PRISM_THREAD_LOCAL int goto_entry_cursor = 0; // Cursor into entries[] for next P1K_GOTO lookup
 static PRISM_THREAD_LOCAL bool p1_file_has_orelse;   // true if any TT_ORELSE token exists in token stream
 static PRISM_THREAD_LOCAL bool is_msvc_cached;       // cached target_is_msvc(), set in transpile_tokens
+static PRISM_THREAD_LOCAL bool prism_profile = false; // --prism-prof: emit phase timing to stderr
 static PRISM_THREAD_LOCAL HashMap p1_func_proto_map;  // file-scope ident followed by '(' → (void*)1
 
 // Track variables that shadow a name captured by a defer in an enclosing scope.
@@ -410,6 +413,21 @@ static inline void emit_token_range(Token *start, Token *end) {
 		OUT_TOK(t);
 		t = tok_next(t);
 	}
+}
+
+static inline double prism_now_ms(void) {
+#ifdef _WIN32
+	static PRISM_THREAD_LOCAL LARGE_INTEGER freq = {0};
+	LARGE_INTEGER now;
+	if (freq.QuadPart == 0)
+		QueryPerformanceFrequency(&freq);
+	QueryPerformanceCounter(&now);
+	return (double)now.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
+	struct timespec ts;
+	timespec_get(&ts, TIME_UTC);
+	return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+#endif
 }
 
 static inline void clear_func_ret_type(void) {
@@ -550,6 +568,18 @@ static void out_flush(void) {
 	}
 }
 
+static PRISM_COLD void out_str_slow(const char *s, int len) {
+	if (len >= OUT_BUF_SIZE) {
+		out_flush();
+		fwrite(s, 1, len, out_fp);
+		out_total_flushed += len;
+		return;
+	}
+	out_flush();
+	memcpy(out_buf + out_buf_pos, s, len);
+	out_buf_pos += len;
+}
+
 static inline void out_char(char c) {
 	if (__builtin_expect(out_buf_pos >= OUT_BUF_SIZE, 0)) out_flush();
 	out_buf[out_buf_pos++] = c;
@@ -558,8 +588,8 @@ static inline void out_char(char c) {
 static inline void out_str(const char *s, int len) {
 	if (__builtin_expect(len <= 0, 0)) return;
 	if (__builtin_expect(out_buf_pos + len >= OUT_BUF_SIZE, 0)) {
-		if (len >= OUT_BUF_SIZE) { out_flush(); fwrite(s, 1, len, out_fp); out_total_flushed += len; return; }
-		out_flush();
+		out_str_slow(s, len);
+		return;
 	}
 	memcpy(out_buf + out_buf_pos, s, len);
 	out_buf_pos += len;
@@ -6192,8 +6222,7 @@ static char *preprocess_with_cc(const char *input_file) {
 	char *result = NULL;
 	int read_fd = -1;
 	pid_t pid = 0;
-	char pp_stderr_path[PATH_MAX] = "";
-	int pp_stderr_fd = -1;
+	bool rerun_for_stderr = false;
 
 	// Set up pipe: child writes preprocessed output, we read it
 	int pipefd[2];
@@ -6205,29 +6234,17 @@ static char *preprocess_with_cc(const char *input_file) {
 	}
 	read_fd = pipefd[0];
 
-	// Capture preprocessor stderr to a temp file for diagnostics on failure
-	{
-		const char *tmpdir = get_tmp_dir();
-		snprintf(pp_stderr_path, sizeof pp_stderr_path, "%sprism_pp_err_XXXXXX", tmpdir);
-		pp_stderr_fd = mkstemp(pp_stderr_path);
-		if (pp_stderr_fd < 0)
-			pp_stderr_path[0] = '\0';
-	}
 	posix_spawn_file_actions_t fa;
 	posix_spawn_file_actions_init(&fa);
 	posix_spawn_file_actions_addclose(&fa, pipefd[0]);
 	posix_spawn_file_actions_adddup2(&fa, pipefd[1], STDOUT_FILENO);
 	posix_spawn_file_actions_addclose(&fa, pipefd[1]);
-	if (pp_stderr_fd >= 0)
-		posix_spawn_file_actions_adddup2(&fa, pp_stderr_fd, STDERR_FILENO);
-	else
-		posix_spawn_file_actions_addopen(
-		    &fa, STDERR_FILENO, "/dev/null", O_WRONLY | O_TRUNC, 0644);
+	posix_spawn_file_actions_addopen(
+	    &fa, STDERR_FILENO, "/dev/null", O_WRONLY | O_TRUNC, 0644);
 
 	char **env = build_clean_environ();
 	int err = posix_spawnp(&pid, argv[0], &fa, NULL, argv, env);
 	posix_spawn_file_actions_destroy(&fa);
-	if (pp_stderr_fd >= 0) close(pp_stderr_fd);
 	close(pipefd[1]);
 
 	if (err) {
@@ -6277,15 +6294,7 @@ static char *preprocess_with_cc(const char *input_file) {
 		while (waitpid(pid, &status, 0) == -1 && errno == EINTR) {}
 		pid = 0; // waited
 		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-			// Show captured preprocessor stderr on failure
-			if (pp_stderr_path[0]) {
-				FILE *ef = fopen(pp_stderr_path, "r");
-				if (ef) {
-					char line[512];
-					while (fgets(line, sizeof line, ef)) fputs(line, stderr);
-					fclose(ef);
-				}
-			}
+			rerun_for_stderr = true;
 			goto cleanup;
 		}
 	}
@@ -6297,7 +6306,11 @@ cleanup:
 	free(buf);
 	if (read_fd >= 0) close(read_fd);
 	if (pid > 0) waitpid(pid, NULL, 0);
-	if (pp_stderr_path[0]) unlink(pp_stderr_path);
+	if (rerun_for_stderr) {
+		// Fast path keeps stderr at /dev/null (no temp file churn).
+		// On failure, rerun once so users still get compiler diagnostics.
+		run_command((char **)argv);
+	}
 	free(cc_dup);
 	free((void *)args);
 	return result;
@@ -10387,13 +10400,19 @@ static int transpile_tokens(Token *tok, FILE *fp) {
 	return 1;
 }
 
-static Token *preprocess_and_tokenize(char *input_file) {
+static Token *preprocess_and_tokenize(char *input_file, double *pp_ms, double *tok_ms) {
+	double t0 = prism_now_ms();
 	char *pp_buf = preprocess_with_cc(input_file);
+	double t1 = prism_now_ms();
+	if (pp_ms) *pp_ms = t1 - t0;
 	if (!pp_buf) {
 		fprintf(stderr, "Preprocessing failed for: %s\n", input_file);
 		return NULL;
 	}
+	double t2 = prism_now_ms();
 	Token *tok = tokenize_buffer(input_file, pp_buf);
+	double t3 = prism_now_ms();
+	if (tok_ms) *tok_ms = t3 - t2;
 	if (!tok) {
 		fprintf(stderr, "Failed to tokenize preprocessed output\n");
 		tokenizer_teardown(false);
@@ -10403,11 +10422,21 @@ static Token *preprocess_and_tokenize(char *input_file) {
 
 static int transpile_to_fp(char *input_file, FILE *fp) {
 	ensure_keyword_cache();
+	double t0 = prism_now_ms();
+	double pp_ms = 0.0, tok_ms = 0.0;
 
-	Token *tok = preprocess_and_tokenize(input_file);
+	Token *tok = preprocess_and_tokenize(input_file, &pp_ms, &tok_ms);
 	if (!tok) { fclose(fp); return 0; }
 
-	return transpile_tokens(tok, fp);
+	double t1 = prism_now_ms();
+	int ok = transpile_tokens(tok, fp);
+	double t2 = prism_now_ms();
+	if (prism_profile) {
+		fprintf(stderr,
+		        "[prism-prof] file=%s preprocess=%.3fms tokenize=%.3fms transpile=%.3fms total=%.3fms\n",
+		        input_file, pp_ms, tok_ms, (t2 - t1), (t2 - t0));
+	}
+	return ok;
 }
 
 static int transpile(char *input_file, char *output_file) {
@@ -10790,6 +10819,7 @@ static Cli cli_parse(int argc, char **argv) {
 			if (!strcmp(a, "--version"))            { cli.action = CLI_ACT_VERSION; return cli; }
 			if (str_startswith(a, "--prism-cc="))   { cli.cc = a + 11; continue; }
 			if (!strcmp(a, "--prism-verbose"))       { cli.verbose = true; continue; }
+			if (!strcmp(a, "--prism-prof"))          { cli.profile = true; continue; }
 			if (str_startswith(a, "--prism-emit=")) { cli.mode = CLI_EMIT; cli.output = a + 13; continue; }
 			if (!strcmp(a, "--prism-emit"))          { cli.mode = CLI_EMIT; continue; }
 			// fall through to forward
@@ -10858,7 +10888,9 @@ static int transpile_and_compile(char *input_file, char **compile_argv, bool ver
 		fprintf(stderr, "\n");
 	}
 
-	Token *tok = preprocess_and_tokenize(input_file);
+	double t0 = prism_now_ms();
+	double pp_ms = 0.0, tok_ms = 0.0;
+	Token *tok = preprocess_and_tokenize(input_file, &pp_ms, &tok_ms);
 	if (!tok) return -1;
 
 	int pipefd[2];
@@ -10895,9 +10927,17 @@ static int transpile_and_compile(char *input_file, char **compile_argv, bool ver
 		return -1;
 	}
 
+	double t1 = prism_now_ms();
 	transpile_tokens(tok, fp);
-
-	return wait_for_child(pid);
+	double t2 = prism_now_ms();
+	int rc = wait_for_child(pid);
+	double t3 = prism_now_ms();
+	if (prism_profile) {
+		fprintf(stderr,
+		        "[prism-prof] file=%s preprocess=%.3fms tokenize=%.3fms transpile=%.3fms cc_wait=%.3fms total=%.3fms\n",
+		        input_file, pp_ms, tok_ms, (t2 - t1), (t3 - t2), (t3 - t0));
+	}
+	return rc;
 }
 
 static noreturn void die(char *message) {
@@ -11324,6 +11364,7 @@ static void print_help(void) {
 	       "  -fno-link-pragma       Ignore #pragma link directives in source\n"
 	       "  --prism-cc=<compiler>  Use specific compiler\n"
 	       "  --prism-verbose        Show commands\n"
+	       "  --prism-prof           Print per-phase timing breakdown\n"
 	       "  --                     Separator: remaining args are passed to the binary in `run` mode\n\n"
 	       "All other flags are passed through to CC.\n\n"
 	       "Examples:\n"
@@ -11900,6 +11941,7 @@ int main(int argc, char **argv) {
 	}
 
 	Cli cli = cli_parse(argc, argv);
+	prism_profile = cli.profile;
 
 	// Handle help/version actions (cli_parse sets these without side effects)
 	if (cli.action == CLI_ACT_HELP) { print_help(); cli_free(&cli); return 0; }

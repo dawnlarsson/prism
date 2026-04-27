@@ -41,6 +41,12 @@
 #define __attribute__(x)
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#define PRISM_COLD __attribute__((cold,noinline))
+#else
+#define PRISM_COLD
+#endif
+
 #define TOMBSTONE ((char *)1)
 #define ENTRY_MATCHES(ent, k, kl)                                                                            \
 	((ent)->key && (ent)->key != TOMBSTONE && (ent)->key_len == (kl) && !memcmp((ent)->key, (k), (kl)))
@@ -409,7 +415,7 @@ static inline bool is_digraph_loc(char *loc) {
 #define digraph_norm_hash          (ctx->dg_hash)
 #define digraph_norm_paste         (ctx->dg_paste)
 
-static noreturn void error(char *fmt, ...);
+static PRISM_COLD noreturn void error(char *fmt, ...);
 static void hashmap_put(HashMap *map, char *key, int keylen, void *val);
 static void hashmap_remove(HashMap *map, char *key, int keylen);
 
@@ -638,15 +644,15 @@ static inline uint64_t fast_hash(char *s, uint32_t len) {
 }
 
 static void *hashmap_get(HashMap *map, char *key, int keylen) {
-	if (!map->buckets) return NULL;
+	if (__builtin_expect(!map->buckets, 0)) return NULL;
 	uint64_t hash = fast_hash(key, keylen);
 	uint32_t hash32 = (uint32_t)hash;
 	int mask = map->capacity - 1;
 	for (int i = 0; i <= mask; i++) {
 		HashEntry *ent = &map->buckets[(hash + i) & mask];
-		if (!ent->key)
+		if (__builtin_expect(!ent->key, 0))
 			return NULL;
-		if (ent->key == TOMBSTONE)
+		if (__builtin_expect(ent->key == TOMBSTONE, 0))
 			continue;
 		if (ent->hash == hash32 && ent->key_len == (uint16_t)keylen &&
 		    !memcmp(ent->key, key, keylen))
@@ -697,10 +703,10 @@ static void hashmap_resize(HashMap *map, int newcap) {
 }
 
 static void hashmap_put(HashMap *map, char *key, int keylen, void *val) {
-	if (!map->buckets) {
+	if (__builtin_expect(!map->buckets, 0)) {
 		map->buckets = arena_alloc(&ctx->main_arena, 64 * sizeof(HashEntry));
 		map->capacity = 64;
-	} else if ((unsigned long)map->used * 100 / (unsigned long)map->capacity >= 70) {
+	} else if (__builtin_expect((unsigned long)map->used * 100 / (unsigned long)map->capacity >= 70, 0)) {
 		hashmap_resize(map, map->capacity * 2);
 	}
 
@@ -783,7 +789,7 @@ static noreturn void lib_errorf(int line, const char *fmt, va_list ap) {
 }
 #endif
 
-static noreturn void error(char *fmt, ...) {
+static PRISM_COLD noreturn void error(char *fmt, ...) {
 	va_list ap;
 	va_start(ap, fmt);
 #ifdef PRISM_LIB_MODE
@@ -795,7 +801,7 @@ static noreturn void error(char *fmt, ...) {
 	exit(1);
 }
 
-static void verror_at(char *filename, char *input, int line_no, char *loc, const char *fmt, va_list ap) {
+static PRISM_COLD void verror_at(char *filename, char *input, int line_no, char *loc, const char *fmt, va_list ap) {
 	// Digraph locs point to static storage; avoid UB from cross-object pointer comparison
 	if (!input || !loc || line_no <= 0 || is_digraph_loc(loc)) {
 		fprintf(stderr, "%s:%d: ", filename ? filename : "<unknown>", line_no > 0 ? line_no : 0);
@@ -824,7 +830,7 @@ static int count_lines(char *base, char *loc) {
 	return n;
 }
 
-noreturn void error_at(char *loc, char *fmt, ...) {
+PRISM_COLD noreturn void error_at(char *loc, char *fmt, ...) {
 	va_list ap;
 	va_start(ap, fmt);
 #ifdef PRISM_LIB_MODE
@@ -848,7 +854,7 @@ noreturn void error_at(char *loc, char *fmt, ...) {
 	exit(1);
 }
 
-noreturn void error_tok(Token *tok, const char *fmt, ...) {
+PRISM_COLD noreturn void error_tok(Token *tok, const char *fmt, ...) {
 	va_list ap;
 	va_start(ap, fmt);
 	File *f = tok_file(tok);

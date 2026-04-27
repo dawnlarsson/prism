@@ -1,6 +1,6 @@
 # Prism Transpiler Specification
 
-**Version:** 1.1.3
+**Version:** 1.1.4
 **Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (5781+ self-host stage1==stage2).
 
 This document describes what the transpiler **does**, not what it aspires to do. It is organized in two parts: **Part I** covers the transpiler's architecture, internal processing model, and implementation details. **Part II** provides a formal language specification for Prism's extensions to C, described in terms of the C abstract machine independently of any implementation strategy.

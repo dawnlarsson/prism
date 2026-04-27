@@ -785,8 +785,10 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 				else if (a->fd == STDERR_FILENO)
 					{ hStdErr = h; redirected_err = true; }
 			} else if (a->kind == SPAWN_ACT_OPEN) {
-				// Map /dev/null → NUL
 				const char *winpath = a->path;
+				bool is_null_device = strcmp(winpath, "/dev/null") == 0 ||
+				                      _stricmp(winpath, "NUL") == 0 ||
+				                      _stricmp(winpath, "NUL:") == 0;
 				if (strcmp(winpath, "/dev/null") == 0) winpath = "NUL";
 
 				// Translate POSIX oflag to Win32 access/disposition
@@ -798,7 +800,9 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 					access_flags = GENERIC_WRITE;
 				else
 					access_flags = GENERIC_READ;
-				if (a->oflag & O_CREAT) {
+				if (is_null_device) {
+					disposition = OPEN_EXISTING;
+				} else if (a->oflag & O_CREAT) {
 					if (a->oflag & O_EXCL)
 						disposition = CREATE_NEW;
 					else if (a->oflag & O_TRUNC)
