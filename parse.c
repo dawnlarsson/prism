@@ -3756,14 +3756,14 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 // iterative (not recursive) so a single thread-local working set is reused
 // across calls; the buffers leak at thread shutdown which is acceptable
 // for transpiler tooling.
-static __thread int *sos_do_if_save    = NULL;
-static __thread int *sos_do_tn_save    = NULL;
-static __thread int *sos_do_snap_start = NULL;
-static __thread int  sos_do_cap        = 0;
-static __thread int *sos_do_snap_buf   = NULL;
-static __thread int  sos_snap_cap      = 0;
-static __thread int *sos_if_trail_snap = NULL;
-static __thread int  sos_if_cap        = 0;
+static PRISM_THREAD_LOCAL int *sos_do_if_save    = NULL;
+static PRISM_THREAD_LOCAL int *sos_do_tn_save    = NULL;
+static PRISM_THREAD_LOCAL int *sos_do_snap_start = NULL;
+static PRISM_THREAD_LOCAL int  sos_do_cap        = 0;
+static PRISM_THREAD_LOCAL int *sos_do_snap_buf   = NULL;
+static PRISM_THREAD_LOCAL int  sos_snap_cap      = 0;
+static PRISM_THREAD_LOCAL int *sos_if_trail_snap = NULL;
+static PRISM_THREAD_LOCAL int  sos_if_cap        = 0;
 
 static inline int sos_grow_to(int cur_cap, int need) {
 	int nc = cur_cap ? cur_cap : 128;
