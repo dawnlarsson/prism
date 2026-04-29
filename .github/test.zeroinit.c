@@ -2134,6 +2134,968 @@ static void test_c23_if_initializer_zeroinit_dropped(void) {
 	prism_free(&r3);
 }
 
+static void test_c23_union_initializer_zeroinit_supported(void) {
+	/* Valid C23 init-statements with union declarators should transpile.
+	 * They require declarator-time aggregate zero-init (`= {0}`), not a
+	 * delayed memset insertion. */
+	const char *if_union_code =
+	    "union U { int x; long y; };\n"
+	    "int f(void) {\n"
+	    "    if (union U u; 1) return u.x;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r1 = prism_transpile_source(if_union_code, "c23_if_union.c", prism_defaults());
+	CHECK(r1.status == PRISM_OK && r1.output,
+	      "c23-if-union-zeroinit: union in if-initializer must transpile");
+	if (r1.output) {
+		CHECK(strstr(r1.output, "if (union U u = {0}; 1)") != NULL,
+		      "c23-if-union-zeroinit: union init-statement gets = {0}");
+	}
+	prism_free(&r1);
+
+	const char *switch_union_code =
+	    "union U { int x; long y; };\n"
+	    "int g(void) {\n"
+	    "    switch (union U u; 0) { default: return u.x; }\n"
+	    "}\n";
+	PrismResult r2 = prism_transpile_source(switch_union_code, "c23_switch_union.c", prism_defaults());
+	CHECK(r2.status == PRISM_OK && r2.output,
+	      "c23-switch-union-zeroinit: union in switch-initializer must transpile");
+	if (r2.output) {
+		CHECK(strstr(r2.output, "switch (union U u = {0}; 0)") != NULL,
+		      "c23-switch-union-zeroinit: union init-statement gets = {0}");
+	}
+	prism_free(&r2);
+
+	const char *for_union_code =
+	    "union U { int x; long y; };\n"
+	    "int h(void) {\n"
+	    "    for (union U u; 0; ) return u.x;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r3 = prism_transpile_source(for_union_code, "c23_for_union.c", prism_defaults());
+	CHECK(r3.status == PRISM_OK && r3.output,
+	      "c23-for-union-zeroinit: union in for-initializer must transpile");
+	if (r3.output) {
+		CHECK(strstr(r3.output, "for (union U u = {0}; 0; )") != NULL,
+		      "c23-for-union-zeroinit: union init-statement gets = {0}");
+	}
+	prism_free(&r3);
+}
+
+static void test_c23_typedef_union_initializer_zeroinit_supported(void) {
+	/* Same class through typedef name in init-statement. */
+	const char *if_union_typedef_code =
+	    "typedef union { int x; long y; } U;\n"
+	    "int f(void) {\n"
+	    "    if (U u; 1) return u.x;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r1 = prism_transpile_source(
+	    if_union_typedef_code, "c23_if_union_typedef.c", prism_defaults());
+	CHECK(r1.status == PRISM_OK && r1.output,
+	      "c23-if-union-typedef-zeroinit: union typedef in if-initializer must transpile");
+	if (r1.output) {
+		CHECK(strstr(r1.output, "if (U u = {0}; 1)") != NULL,
+		      "c23-if-union-typedef-zeroinit: typedef union gets = {0}");
+	}
+	prism_free(&r1);
+
+	const char *switch_union_typedef_code =
+	    "typedef union { int x; long y; } U;\n"
+	    "int g(void) {\n"
+	    "    switch (U u; 0) { default: return u.x; }\n"
+	    "}\n";
+	PrismResult r2 = prism_transpile_source(
+	    switch_union_typedef_code, "c23_switch_union_typedef.c", prism_defaults());
+	CHECK(r2.status == PRISM_OK && r2.output,
+	      "c23-switch-union-typedef-zeroinit: union typedef in switch-initializer must transpile");
+	if (r2.output) {
+		CHECK(strstr(r2.output, "switch (U u = {0}; 0)") != NULL,
+		      "c23-switch-union-typedef-zeroinit: typedef union gets = {0}");
+	}
+	prism_free(&r2);
+
+	const char *for_union_typedef_code =
+	    "typedef union { int x; long y; } U;\n"
+	    "int h(void) {\n"
+	    "    for (U u; 0; ) return u.x;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r3 = prism_transpile_source(
+	    for_union_typedef_code, "c23_for_union_typedef.c", prism_defaults());
+	CHECK(r3.status == PRISM_OK && r3.output,
+	      "c23-for-union-typedef-zeroinit: union typedef in for-initializer must transpile");
+	if (r3.output) {
+		CHECK(strstr(r3.output, "for (U u = {0}; 0; )") != NULL,
+		      "c23-for-union-typedef-zeroinit: typedef union gets = {0}");
+	}
+	prism_free(&r3);
+}
+
+static void test_c23_atomic_aggregate_initializer_zeroinit_supported(void) {
+	/* _Atomic aggregate init-statements are valid C and should not be rejected
+	 * as "needs memset"; declaration-time aggregate init is valid here. */
+	const char *if_atomic_struct_code =
+	    "struct S { int x; };\n"
+	    "int f(void) {\n"
+	    "    if (_Atomic(struct S) s; 1) return s.x;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r1 = prism_transpile_source(
+	    if_atomic_struct_code, "c23_if_atomic_struct.c", prism_defaults());
+	CHECK(r1.status == PRISM_OK && r1.output,
+	      "c23-if-atomic-struct-zeroinit: atomic aggregate in if-initializer must transpile");
+	if (r1.output) {
+		CHECK(strstr(r1.output, "if (_Atomic(struct S) s = {0}; 1)") != NULL,
+		      "c23-if-atomic-struct-zeroinit: atomic aggregate gets = {0}");
+	}
+	prism_free(&r1);
+
+	const char *for_atomic_struct_code =
+	    "struct S { int x; };\n"
+	    "int g(void) {\n"
+	    "    for (_Atomic(struct S) s; 0; ) return s.x;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r2 = prism_transpile_source(
+	    for_atomic_struct_code, "c23_for_atomic_struct.c", prism_defaults());
+	CHECK(r2.status == PRISM_OK && r2.output,
+	      "c23-for-atomic-struct-zeroinit: atomic aggregate in for-initializer must transpile");
+	if (r2.output) {
+		CHECK(strstr(r2.output, "for (_Atomic(struct S) s = {0}; 0; )") != NULL,
+		      "c23-for-atomic-struct-zeroinit: atomic aggregate gets = {0}");
+	}
+	prism_free(&r2);
+
+	const char *if_atomic_struct_typedef_code =
+	    "typedef struct { int x; } S;\n"
+	    "int h(void) {\n"
+	    "    if (_Atomic(S) s; 1) return s.x;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r3 = prism_transpile_source(
+	    if_atomic_struct_typedef_code, "c23_if_atomic_struct_typedef.c", prism_defaults());
+	CHECK(r3.status == PRISM_OK && r3.output,
+	      "c23-if-atomic-struct-typedef-zeroinit: typedef atomic aggregate in if-initializer must transpile");
+	if (r3.output) {
+		CHECK(strstr(r3.output, "if (_Atomic(S) s = {0}; 1)") != NULL,
+		      "c23-if-atomic-struct-typedef-zeroinit: typedef atomic aggregate gets = {0}");
+	}
+	prism_free(&r3);
+
+	const char *for_atomic_struct_typedef_code =
+	    "typedef struct { int x; } S;\n"
+	    "int k(void) {\n"
+	    "    for (_Atomic(S) s; 0; ) return s.x;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r4 = prism_transpile_source(
+	    for_atomic_struct_typedef_code, "c23_for_atomic_struct_typedef.c", prism_defaults());
+	CHECK(r4.status == PRISM_OK && r4.output,
+	      "c23-for-atomic-struct-typedef-zeroinit: typedef atomic aggregate in for-initializer must transpile");
+	if (r4.output) {
+		CHECK(strstr(r4.output, "for (_Atomic(S) s = {0}; 0; )") != NULL,
+		      "c23-for-atomic-struct-typedef-zeroinit: typedef atomic aggregate gets = {0}");
+	}
+	prism_free(&r4);
+}
+
+static void test_c23_atomic_union_initializer_zeroinit_supported(void) {
+	/* _Atomic(union ...) in init-statements is valid C and should transpile
+	 * with declaration-time zero initialization, not hard-reject. */
+	const char *if_atomic_union_code =
+	    "union U { int x; long y; };\n"
+	    "int f(void) {\n"
+	    "    if (_Atomic(union U) u; 1) return u.x;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r1 = prism_transpile_source(
+	    if_atomic_union_code, "c23_if_atomic_union.c", prism_defaults());
+	CHECK(r1.status == PRISM_OK && r1.output,
+	      "c23-if-atomic-union-zeroinit: atomic union in if-initializer must transpile");
+	if (r1.output) {
+		CHECK(strstr(r1.output, "if (_Atomic(union U) u = {0}; 1)") != NULL,
+		      "c23-if-atomic-union-zeroinit: atomic union gets = {0}");
+	}
+	prism_free(&r1);
+
+	const char *switch_atomic_union_code =
+	    "union U { int x; long y; };\n"
+	    "int g(void) {\n"
+	    "    switch (_Atomic(union U) u; 0) { default: return u.x; }\n"
+	    "}\n";
+	PrismResult r2 = prism_transpile_source(
+	    switch_atomic_union_code, "c23_switch_atomic_union.c", prism_defaults());
+	CHECK(r2.status == PRISM_OK && r2.output,
+	      "c23-switch-atomic-union-zeroinit: atomic union in switch-initializer must transpile");
+	if (r2.output) {
+		CHECK(strstr(r2.output, "switch (_Atomic(union U) u = {0}; 0)") != NULL,
+		      "c23-switch-atomic-union-zeroinit: atomic union gets = {0}");
+	}
+	prism_free(&r2);
+
+	const char *for_atomic_union_code =
+	    "union U { int x; long y; };\n"
+	    "int h(void) {\n"
+	    "    for (_Atomic(union U) u; 0; ) return u.x;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r3 = prism_transpile_source(
+	    for_atomic_union_code, "c23_for_atomic_union.c", prism_defaults());
+	CHECK(r3.status == PRISM_OK && r3.output,
+	      "c23-for-atomic-union-zeroinit: atomic union in for-initializer must transpile");
+	if (r3.output) {
+		CHECK(strstr(r3.output, "for (_Atomic(union U) u = {0}; 0; )") != NULL,
+		      "c23-for-atomic-union-zeroinit: atomic union gets = {0}");
+	}
+	prism_free(&r3);
+
+	const char *if_atomic_union_typedef_code =
+	    "typedef union { int x; long y; } U;\n"
+	    "int k(void) {\n"
+	    "    if (_Atomic(U) u; 1) return u.x;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r4 = prism_transpile_source(
+	    if_atomic_union_typedef_code, "c23_if_atomic_union_typedef.c", prism_defaults());
+	CHECK(r4.status == PRISM_OK && r4.output,
+	      "c23-if-atomic-union-typedef-zeroinit: typedef atomic union in if-initializer must transpile");
+	if (r4.output) {
+		CHECK(strstr(r4.output, "if (_Atomic(U) u = {0}; 1)") != NULL,
+		      "c23-if-atomic-union-typedef-zeroinit: typedef atomic union gets = {0}");
+	}
+	prism_free(&r4);
+
+	const char *switch_atomic_union_typedef_code =
+	    "typedef union { int x; long y; } U;\n"
+	    "int p(void) {\n"
+	    "    switch (_Atomic(U) u; 0) { default: return u.x; }\n"
+	    "}\n";
+	PrismResult r5 = prism_transpile_source(
+	    switch_atomic_union_typedef_code, "c23_switch_atomic_union_typedef.c", prism_defaults());
+	CHECK(r5.status == PRISM_OK && r5.output,
+	      "c23-switch-atomic-union-typedef-zeroinit: typedef atomic union in switch-initializer must transpile");
+	if (r5.output) {
+		CHECK(strstr(r5.output, "switch (_Atomic(U) u = {0}; 0)") != NULL,
+		      "c23-switch-atomic-union-typedef-zeroinit: typedef atomic union gets = {0}");
+	}
+	prism_free(&r5);
+
+	const char *for_atomic_union_typedef_code =
+	    "typedef union { int x; long y; } U;\n"
+	    "int q(void) {\n"
+	    "    for (_Atomic(U) u; 0; ) return u.x;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r6 = prism_transpile_source(
+	    for_atomic_union_typedef_code, "c23_for_atomic_union_typedef.c", prism_defaults());
+	CHECK(r6.status == PRISM_OK && r6.output,
+	      "c23-for-atomic-union-typedef-zeroinit: typedef atomic union in for-initializer must transpile");
+	if (r6.output) {
+		CHECK(strstr(r6.output, "for (_Atomic(U) u = {0}; 0; )") != NULL,
+		      "c23-for-atomic-union-typedef-zeroinit: typedef atomic union gets = {0}");
+	}
+	prism_free(&r6);
+
+	const char *switch_atomic_union_typedef_code2 =
+	    "typedef union { int x; long y; } U;\n"
+	    "int ak(void) {\n"
+	    "    switch (_Atomic(U) u; 0) { default: return u.x; }\n"
+	    "}\n";
+	PrismResult r7 = prism_transpile_source(
+	    switch_atomic_union_typedef_code2, "c23_switch_atomic_union_typedef2.c", prism_defaults());
+	CHECK(r7.status == PRISM_OK && r7.output,
+	      "c23-switch-atomic-union-typedef2-zeroinit: typedef atomic union in switch-initializer must transpile");
+	if (r7.output) {
+		CHECK(strstr(r7.output, "switch (_Atomic(U) u = {0}; 0)") != NULL,
+		      "c23-switch-atomic-union-typedef2-zeroinit: typedef atomic union gets = {0}");
+	}
+	prism_free(&r7);
+}
+
+static void test_c23_const_union_initializer_zeroinit_supported(void) {
+	/* const union init-statements are also valid and should use declarator
+	 * initialization, not be rejected as requiring runtime memset. */
+	const char *if_const_union_code =
+	    "union U { int x; long y; };\n"
+	    "int f(void) {\n"
+	    "    if (const union U u; 1) return u.x;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r1 = prism_transpile_source(
+	    if_const_union_code, "c23_if_const_union.c", prism_defaults());
+	CHECK(r1.status == PRISM_OK && r1.output,
+	      "c23-if-const-union-zeroinit: const union in if-initializer must transpile");
+	if (r1.output) {
+		CHECK(strstr(r1.output, "if (const union U u = {0}; 1)") != NULL,
+		      "c23-if-const-union-zeroinit: const union gets = {0}");
+	}
+	prism_free(&r1);
+
+	const char *for_const_union_code =
+	    "union U { int x; long y; };\n"
+	    "int g(void) {\n"
+	    "    for (const union U u; 0; ) return u.x;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r2 = prism_transpile_source(
+	    for_const_union_code, "c23_for_const_union.c", prism_defaults());
+	CHECK(r2.status == PRISM_OK && r2.output,
+	      "c23-for-const-union-zeroinit: const union in for-initializer must transpile");
+	if (r2.output) {
+		CHECK(strstr(r2.output, "for (const union U u = {0}; 0; )") != NULL,
+		      "c23-for-const-union-zeroinit: const union gets = {0}");
+	}
+	prism_free(&r2);
+
+	const char *switch_const_union_code =
+	    "union U { int x; long y; };\n"
+	    "int r(void) {\n"
+	    "    switch (const union U u; 0) { default: return u.x; }\n"
+	    "}\n";
+	PrismResult r3 = prism_transpile_source(
+	    switch_const_union_code, "c23_switch_const_union.c", prism_defaults());
+	CHECK(r3.status == PRISM_OK && r3.output,
+	      "c23-switch-const-union-zeroinit: const union in switch-initializer must transpile");
+	if (r3.output) {
+		CHECK(strstr(r3.output, "switch (const union U u = {0}; 0)") != NULL,
+		      "c23-switch-const-union-zeroinit: const union gets = {0}");
+	}
+	prism_free(&r3);
+
+	const char *switch_const_union_typedef_code =
+	    "typedef union { int x; long y; } U;\n"
+	    "int al(void) {\n"
+	    "    switch (const U u; 0) { default: return u.x; }\n"
+	    "}\n";
+	PrismResult r4 = prism_transpile_source(
+	    switch_const_union_typedef_code, "c23_switch_const_union_typedef.c", prism_defaults());
+	CHECK(r4.status == PRISM_OK && r4.output,
+	      "c23-switch-const-union-typedef-zeroinit: const union typedef in switch-initializer must transpile");
+	if (r4.output) {
+		CHECK(strstr(r4.output, "switch (const U u = {0}; 0)") != NULL,
+		      "c23-switch-const-union-typedef-zeroinit: const union typedef gets = {0}");
+	}
+	prism_free(&r4);
+}
+
+static void test_const_aggregate_block_zeroinit_supported(void) {
+	/* Plain block-scope const aggregates are valid C. Prism may either
+	 * reject with a const-safety diagnostic or emit a safe declaration-time
+	 * initializer, but must never memset through a const object. */
+	PrismResult r1 = prism_transpile_source(
+	    "union U { int x; long y; };\n"
+	    "int f(void) {\n"
+	    "    const union U u;\n"
+	    "    return u.x;\n"
+	    "}\n",
+	    "const_union_block.c", prism_defaults());
+	if (r1.status == PRISM_OK && r1.output) {
+		CHECK(strstr(r1.output, "__builtin_memset((void *)&u") == NULL &&
+		      strstr(r1.output, "__builtin_memset((void*)&u") == NULL,
+		      "const-union-block-zeroinit: no memset through const union");
+	} else {
+		CHECK(r1.status != PRISM_OK ||
+		      (r1.error_msg && strstr(r1.error_msg, "const") != NULL),
+		      "const-union-block-zeroinit: reject or safe emit");
+	}
+	prism_free(&r1);
+
+	PrismResult r2 = prism_transpile_source(
+	    "struct S { int x; };\n"
+	    "int g(void) {\n"
+	    "    const _Atomic(struct S) s;\n"
+	    "    return s.x;\n"
+	    "}\n",
+	    "const_atomic_struct_block.c", prism_defaults());
+	if (r2.status == PRISM_OK && r2.output) {
+		CHECK(strstr(r2.output, "__builtin_memset((void *)&s") == NULL &&
+		      strstr(r2.output, "__builtin_memset((void*)&s") == NULL,
+		      "const-atomic-struct-block-zeroinit: no memset through const object");
+	} else {
+		CHECK(r2.status != PRISM_OK ||
+		      (r2.error_msg && strstr(r2.error_msg, "const") != NULL),
+		      "const-atomic-struct-block-zeroinit: reject or safe emit");
+	}
+	prism_free(&r2);
+
+	PrismResult r3 = prism_transpile_source(
+	    "union U { int x; long y; };\n"
+	    "int h(void) {\n"
+	    "    const _Atomic(union U) u;\n"
+	    "    return u.x;\n"
+	    "}\n",
+	    "const_atomic_union_block.c", prism_defaults());
+	if (r3.status == PRISM_OK && r3.output) {
+		CHECK(strstr(r3.output, "__builtin_memset((void *)&u") == NULL &&
+		      strstr(r3.output, "__builtin_memset((void*)&u") == NULL,
+		      "const-atomic-union-block-zeroinit: no memset through const object");
+	} else {
+		CHECK(r3.status != PRISM_OK ||
+		      (r3.error_msg && strstr(r3.error_msg, "const") != NULL),
+		      "const-atomic-union-block-zeroinit: reject or safe emit");
+	}
+	prism_free(&r3);
+
+	PrismResult r4 = prism_transpile_source(
+	    "typedef union { int x; long y; } U;\n"
+	    "int k(void) {\n"
+	    "    const U u;\n"
+	    "    return u.x;\n"
+	    "}\n",
+	    "const_union_typedef_block.c", prism_defaults());
+	if (r4.status == PRISM_OK && r4.output) {
+		CHECK(strstr(r4.output, "__builtin_memset((void *)&u") == NULL &&
+		      strstr(r4.output, "__builtin_memset((void*)&u") == NULL,
+		      "const-union-typedef-block-zeroinit: no memset through const object");
+	} else {
+		CHECK(r4.status != PRISM_OK ||
+		      (r4.error_msg && strstr(r4.error_msg, "const") != NULL),
+		      "const-union-typedef-block-zeroinit: reject or safe emit");
+	}
+	prism_free(&r4);
+
+	PrismResult r5 = prism_transpile_source(
+	    "typedef union { int x; long y; } U;\n"
+	    "int m(void) {\n"
+	    "    const _Atomic(U) u;\n"
+	    "    return u.x;\n"
+	    "}\n",
+	    "const_atomic_union_typedef_block.c", prism_defaults());
+	if (r5.status == PRISM_OK && r5.output) {
+		CHECK(strstr(r5.output, "__builtin_memset((void *)&u") == NULL &&
+		      strstr(r5.output, "__builtin_memset((void*)&u") == NULL,
+		      "const-atomic-union-typedef-block-zeroinit: no memset through const object");
+	} else {
+		CHECK(r5.status != PRISM_OK ||
+		      (r5.error_msg && strstr(r5.error_msg, "const") != NULL),
+		      "const-atomic-union-typedef-block-zeroinit: reject or safe emit");
+	}
+	prism_free(&r5);
+
+	PrismResult r6 = prism_transpile_source(
+	    "typedef struct { int x; } S;\n"
+	    "int n(void) {\n"
+	    "    const _Atomic(S) s;\n"
+	    "    return s.x;\n"
+	    "}\n",
+	    "const_atomic_struct_typedef_block.c", prism_defaults());
+	if (r6.status == PRISM_OK && r6.output) {
+		CHECK(strstr(r6.output, "__builtin_memset((void *)&s") == NULL &&
+		      strstr(r6.output, "__builtin_memset((void*)&s") == NULL,
+		      "const-atomic-struct-typedef-block-zeroinit: no memset through const object");
+	} else {
+		CHECK(r6.status != PRISM_OK ||
+		      (r6.error_msg && strstr(r6.error_msg, "const") != NULL),
+		      "const-atomic-struct-typedef-block-zeroinit: reject or safe emit");
+	}
+	prism_free(&r6);
+}
+
+static void test_c23_typeof_initializer_zeroinit_supported(void) {
+	/* Non-VLA typeof declarations in C23 init-statements are valid and
+	 * should be zero-initialized like ordinary declarations. */
+	const char *if_typeof_scalar_code =
+	    "int f(void) {\n"
+	    "    if (typeof(int) x; 1) return x;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r1 = prism_transpile_source(
+	    if_typeof_scalar_code, "c23_if_typeof_scalar.c", prism_defaults());
+	CHECK(r1.status == PRISM_OK && r1.output,
+	      "c23-if-typeof-zeroinit: typeof scalar in if-initializer must transpile");
+	if (r1.output) {
+		CHECK(strstr(r1.output, "if (typeof(int) x = {0}; 1)") != NULL ||
+		          strstr(r1.output, "if (typeof(int) x = 0; 1)") != NULL,
+		      "c23-if-typeof-zeroinit: typeof scalar gets zero-init");
+	}
+	prism_free(&r1);
+
+	const char *switch_typeof_scalar_code =
+	    "int g(void) {\n"
+	    "    switch (typeof(int) x; 0) { default: return x; }\n"
+	    "}\n";
+	PrismResult r2 = prism_transpile_source(
+	    switch_typeof_scalar_code, "c23_switch_typeof_scalar.c", prism_defaults());
+	CHECK(r2.status == PRISM_OK && r2.output,
+	      "c23-switch-typeof-zeroinit: typeof scalar in switch-initializer must transpile");
+	if (r2.output) {
+		CHECK(strstr(r2.output, "switch (typeof(int) x = {0}; 0)") != NULL ||
+		          strstr(r2.output, "switch (typeof(int) x = 0; 0)") != NULL,
+		      "c23-switch-typeof-zeroinit: typeof scalar gets zero-init");
+	}
+	prism_free(&r2);
+
+	const char *for_typeof_array_code =
+	    "int h(void) {\n"
+	    "    for (typeof(int[3]) a; 0; ) return a[0];\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r3 = prism_transpile_source(
+	    for_typeof_array_code, "c23_for_typeof_array.c", prism_defaults());
+	CHECK(r3.status == PRISM_OK && r3.output,
+	      "c23-for-typeof-zeroinit: typeof array in for-initializer must transpile");
+	if (r3.output) {
+		CHECK(strstr(r3.output, "for (typeof(int[3]) a = {0}; 0; )") != NULL,
+		      "c23-for-typeof-zeroinit: typeof array gets = {0}");
+	}
+	prism_free(&r3);
+
+	const char *if_typeof_unqual_union_code =
+	    "int k(void) {\n"
+	    "    if (typeof_unqual(union { int a; long b; }) u; 1) return u.a;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r4 = prism_transpile_source(
+	    if_typeof_unqual_union_code, "c23_if_typeof_unqual_union.c", prism_defaults());
+	CHECK(r4.status == PRISM_OK && r4.output,
+	      "c23-if-typeof-unqual-zeroinit: typeof_unqual union in if-initializer must transpile");
+	if (r4.output) {
+		CHECK(strstr(r4.output, "if (typeof_unqual(union { int a; long b; }) u = {0}; 1)") != NULL,
+		      "c23-if-typeof-unqual-zeroinit: typeof_unqual union gets = {0}");
+	}
+	prism_free(&r4);
+
+	const char *switch_typeof_struct_code =
+	    "int m(void) {\n"
+	    "    switch (typeof(struct { int a; }) s; 0) { default: return s.a; }\n"
+	    "}\n";
+	PrismResult r5 = prism_transpile_source(
+	    switch_typeof_struct_code, "c23_switch_typeof_struct.c", prism_defaults());
+	CHECK(r5.status == PRISM_OK && r5.output,
+	      "c23-switch-typeof-struct-zeroinit: typeof struct in switch-initializer must transpile");
+	if (r5.output) {
+		CHECK(strstr(r5.output, "switch (typeof(struct { int a; }) s = {0}; 0)") != NULL,
+		      "c23-switch-typeof-struct-zeroinit: typeof struct gets = {0}");
+	}
+	prism_free(&r5);
+
+	const char *for_typeof_union_code =
+	    "int n(void) {\n"
+	    "    for (typeof(union { int a; long b; }) u; 0; ) return u.a;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r6 = prism_transpile_source(
+	    for_typeof_union_code, "c23_for_typeof_union.c", prism_defaults());
+	CHECK(r6.status == PRISM_OK && r6.output,
+	      "c23-for-typeof-union-zeroinit: typeof union in for-initializer must transpile");
+	if (r6.output) {
+		CHECK(strstr(r6.output, "for (typeof(union { int a; long b; }) u = {0}; 0; )") != NULL,
+		      "c23-for-typeof-union-zeroinit: typeof union gets = {0}");
+	}
+	prism_free(&r6);
+
+	const char *for_typeof_unqual_union_code =
+	    "int p(void) {\n"
+	    "    for (typeof_unqual(union { int a; long b; }) u; 0; ) return u.a;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r7 = prism_transpile_source(
+	    for_typeof_unqual_union_code, "c23_for_typeof_unqual_union.c", prism_defaults());
+	CHECK(r7.status == PRISM_OK && r7.output,
+	      "c23-for-typeof-unqual-zeroinit: typeof_unqual union in for-initializer must transpile");
+	if (r7.output) {
+		CHECK(strstr(r7.output, "for (typeof_unqual(union { int a; long b; }) u = {0}; 0; )") != NULL,
+		      "c23-for-typeof-unqual-zeroinit: typeof_unqual union gets = {0}");
+	}
+	prism_free(&r7);
+
+	const char *if_typeof_ptr_code =
+	    "int q(void) {\n"
+	    "    if (typeof(int*) p; 1) return p != 0;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r8 = prism_transpile_source(
+	    if_typeof_ptr_code, "c23_if_typeof_ptr.c", prism_defaults());
+	CHECK(r8.status == PRISM_OK && r8.output,
+	      "c23-if-typeof-ptr-zeroinit: typeof pointer in if-initializer must transpile");
+	if (r8.output) {
+		CHECK(strstr(r8.output, "if (typeof(int*) p = 0; 1)") != NULL ||
+		      strstr(r8.output, "if (typeof(int*) p = {0}; 1)") != NULL,
+		      "c23-if-typeof-ptr-zeroinit: typeof pointer gets zero-init");
+	}
+	prism_free(&r8);
+
+	const char *if_typeof_typedef_struct_code =
+	    "typedef struct { int a; } S;\n"
+	    "int r(void) {\n"
+	    "    if (typeof(S) s; 1) return s.a;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r9 = prism_transpile_source(
+	    if_typeof_typedef_struct_code, "c23_if_typeof_typedef_struct.c", prism_defaults());
+	CHECK(r9.status == PRISM_OK && r9.output,
+	      "c23-if-typeof-typedef-struct-zeroinit: typeof typedef struct in if-initializer must transpile");
+	if (r9.output) {
+		CHECK(strstr(r9.output, "if (typeof(S) s = {0}; 1)") != NULL,
+		      "c23-if-typeof-typedef-struct-zeroinit: typeof typedef struct gets = {0}");
+	}
+	prism_free(&r9);
+
+	const char *switch_typeof_typedef_union_code =
+	    "typedef union { int a; long b; } U;\n"
+	    "int s(void) {\n"
+	    "    switch (typeof(U) u; 0) { default: return u.a; }\n"
+	    "}\n";
+	PrismResult r10 = prism_transpile_source(
+	    switch_typeof_typedef_union_code, "c23_switch_typeof_typedef_union.c", prism_defaults());
+	CHECK(r10.status == PRISM_OK && r10.output,
+	      "c23-switch-typeof-typedef-union-zeroinit: typeof typedef union in switch-initializer must transpile");
+	if (r10.output) {
+		CHECK(strstr(r10.output, "switch (typeof(U) u = {0}; 0)") != NULL,
+		      "c23-switch-typeof-typedef-union-zeroinit: typeof typedef union gets = {0}");
+	}
+	prism_free(&r10);
+
+	const char *for_typeof_nested_typedef_code =
+	    "typedef struct { int a; } S;\n"
+	    "typedef S S2;\n"
+	    "int t(void) {\n"
+	    "    for (typeof(S2) s; 0; ) return s.a;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r11 = prism_transpile_source(
+	    for_typeof_nested_typedef_code, "c23_for_typeof_nested_typedef.c", prism_defaults());
+	CHECK(r11.status == PRISM_OK && r11.output,
+	      "c23-for-typeof-nested-typedef-zeroinit: typeof nested typedef in for-initializer must transpile");
+	if (r11.output) {
+		CHECK(strstr(r11.output, "for (typeof(S2) s = {0}; 0; )") != NULL,
+		      "c23-for-typeof-nested-typedef-zeroinit: typeof nested typedef gets = {0}");
+	}
+	prism_free(&r11);
+
+	const char *if_atomic_typeof_struct_code =
+	    "int u(void) {\n"
+	    "    if (_Atomic(typeof(struct { int a; })) s; 1) return s.a;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r12 = prism_transpile_source(
+	    if_atomic_typeof_struct_code, "c23_if_atomic_typeof_struct.c", prism_defaults());
+	CHECK(r12.status == PRISM_OK && r12.output,
+	      "c23-if-atomic-typeof-struct-zeroinit: atomic typeof struct in if-initializer must transpile");
+	if (r12.output) {
+		CHECK(strstr(r12.output, "if (_Atomic(typeof(struct { int a; })) s = {0}; 1)") != NULL,
+		      "c23-if-atomic-typeof-struct-zeroinit: atomic typeof struct gets = {0}");
+	}
+	prism_free(&r12);
+
+	const char *for_atomic_typeof_union_code =
+	    "int v(void) {\n"
+	    "    for (_Atomic(typeof(union { int a; long b; })) u; 0; ) return u.a;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r13 = prism_transpile_source(
+	    for_atomic_typeof_union_code, "c23_for_atomic_typeof_union.c", prism_defaults());
+	CHECK(r13.status == PRISM_OK && r13.output,
+	      "c23-for-atomic-typeof-union-zeroinit: atomic typeof union in for-initializer must transpile");
+	if (r13.output) {
+		CHECK(strstr(r13.output, "for (_Atomic(typeof(union { int a; long b; })) u = {0}; 0; )") != NULL,
+		      "c23-for-atomic-typeof-union-zeroinit: atomic typeof union gets = {0}");
+	}
+	prism_free(&r13);
+
+	const char *if_tuq_typedef_union_code =
+	    "typedef union { int a; long b; } U;\n"
+	    "int w(void) {\n"
+	    "    if (typeof_unqual(U) u; 1) return u.a;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r14 = prism_transpile_source(
+	    if_tuq_typedef_union_code, "c23_if_tuq_typedef_union.c", prism_defaults());
+	CHECK(r14.status == PRISM_OK && r14.output,
+	      "c23-if-tuq-typedef-union-zeroinit: typeof_unqual typedef union in if-initializer must transpile");
+	if (r14.output) {
+		CHECK(strstr(r14.output, "if (typeof_unqual(U) u = {0}; 1)") != NULL,
+		      "c23-if-tuq-typedef-union-zeroinit: typeof_unqual typedef union gets = {0}");
+	}
+	prism_free(&r14);
+
+	const char *for_tuq_typedef_union_code =
+	    "typedef union { int a; long b; } U;\n"
+	    "int x(void) {\n"
+	    "    for (typeof_unqual(U) u; 0; ) return u.a;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r15 = prism_transpile_source(
+	    for_tuq_typedef_union_code, "c23_for_tuq_typedef_union.c", prism_defaults());
+	CHECK(r15.status == PRISM_OK && r15.output,
+	      "c23-for-tuq-typedef-union-zeroinit: typeof_unqual typedef union in for-initializer must transpile");
+	if (r15.output) {
+		CHECK(strstr(r15.output, "for (typeof_unqual(U) u = {0}; 0; )") != NULL,
+		      "c23-for-tuq-typedef-union-zeroinit: typeof_unqual typedef union gets = {0}");
+	}
+	prism_free(&r15);
+
+	const char *switch_tuq_typedef_struct_code =
+	    "typedef struct { int a; } S;\n"
+	    "int y(void) {\n"
+	    "    switch (typeof_unqual(S) s; 0) { default: return s.a; }\n"
+	    "}\n";
+	PrismResult r16 = prism_transpile_source(
+	    switch_tuq_typedef_struct_code, "c23_switch_tuq_typedef_struct.c", prism_defaults());
+	CHECK(r16.status == PRISM_OK && r16.output,
+	      "c23-switch-tuq-typedef-struct-zeroinit: typeof_unqual typedef struct in switch-initializer must transpile");
+	if (r16.output) {
+		CHECK(strstr(r16.output, "switch (typeof_unqual(S) s = {0}; 0)") != NULL,
+		      "c23-switch-tuq-typedef-struct-zeroinit: typeof_unqual typedef struct gets = {0}");
+	}
+	prism_free(&r16);
+
+	const char *if_atomic_tuq_union_code =
+	    "int z(void) {\n"
+	    "    if (_Atomic(typeof_unqual(union { int a; long b; })) u; 1) return u.a;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r17 = prism_transpile_source(
+	    if_atomic_tuq_union_code, "c23_if_atomic_tuq_union.c", prism_defaults());
+	CHECK(r17.status == PRISM_OK && r17.output,
+	      "c23-if-atomic-tuq-union-zeroinit: atomic typeof_unqual union in if-initializer must transpile");
+	if (r17.output) {
+		CHECK(strstr(r17.output, "if (_Atomic(typeof_unqual(union { int a; long b; })) u = {0}; 1)") != NULL,
+		      "c23-if-atomic-tuq-union-zeroinit: atomic typeof_unqual union gets = {0}");
+	}
+	prism_free(&r17);
+
+	const char *for_atomic_tuq_struct_code =
+	    "int aa(void) {\n"
+	    "    for (_Atomic(typeof_unqual(struct { int a; })) s; 0; ) return s.a;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r18 = prism_transpile_source(
+	    for_atomic_tuq_struct_code, "c23_for_atomic_tuq_struct.c", prism_defaults());
+	CHECK(r18.status == PRISM_OK && r18.output,
+	      "c23-for-atomic-tuq-struct-zeroinit: atomic typeof_unqual struct in for-initializer must transpile");
+	if (r18.output) {
+		CHECK(strstr(r18.output, "for (_Atomic(typeof_unqual(struct { int a; })) s = {0}; 0; )") != NULL,
+		      "c23-for-atomic-tuq-struct-zeroinit: atomic typeof_unqual struct gets = {0}");
+	}
+	prism_free(&r18);
+
+	const char *switch_typeof_ptr_code =
+	    "int ab(void) {\n"
+	    "    switch (typeof(int*) p; 0) { default: return p != 0; }\n"
+	    "}\n";
+	PrismResult r19 = prism_transpile_source(
+	    switch_typeof_ptr_code, "c23_switch_typeof_ptr.c", prism_defaults());
+	CHECK(r19.status == PRISM_OK && r19.output,
+	      "c23-switch-typeof-ptr-zeroinit: typeof pointer in switch-initializer must transpile");
+	if (r19.output) {
+		CHECK(strstr(r19.output, "switch (typeof(int*) p = 0; 0)") != NULL ||
+		      strstr(r19.output, "switch (typeof(int*) p = {0}; 0)") != NULL,
+		      "c23-switch-typeof-ptr-zeroinit: typeof pointer gets zero-init");
+	}
+	prism_free(&r19);
+
+	const char *switch_typeof_unqual_union_code =
+	    "int ac(void) {\n"
+	    "    switch (typeof_unqual(union { int a; long b; }) u; 0) { default: return u.a; }\n"
+	    "}\n";
+	PrismResult r20 = prism_transpile_source(
+	    switch_typeof_unqual_union_code, "c23_switch_typeof_unqual_union.c", prism_defaults());
+	CHECK(r20.status == PRISM_OK && r20.output,
+	      "c23-switch-typeof-unqual-zeroinit: typeof_unqual union in switch-initializer must transpile");
+	if (r20.output) {
+		CHECK(strstr(r20.output, "switch (typeof_unqual(union { int a; long b; }) u = {0}; 0)") != NULL,
+		      "c23-switch-typeof-unqual-zeroinit: typeof_unqual union gets = {0}");
+	}
+	prism_free(&r20);
+
+	const char *switch_typeof_nested_typedef_code =
+	    "typedef struct { int a; } S;\n"
+	    "typedef S S2;\n"
+	    "int ad(void) {\n"
+	    "    switch (typeof(S2) s; 0) { default: return s.a; }\n"
+	    "}\n";
+	PrismResult r21 = prism_transpile_source(
+	    switch_typeof_nested_typedef_code, "c23_switch_typeof_nested_typedef.c", prism_defaults());
+	CHECK(r21.status == PRISM_OK && r21.output,
+	      "c23-switch-typeof-nested-typedef-zeroinit: typeof nested typedef in switch-initializer must transpile");
+	if (r21.output) {
+		CHECK(strstr(r21.output, "switch (typeof(S2) s = {0}; 0)") != NULL,
+		      "c23-switch-typeof-nested-typedef-zeroinit: typeof nested typedef gets = {0}");
+	}
+	prism_free(&r21);
+
+	const char *switch_atomic_typeof_struct_code =
+	    "int ae(void) {\n"
+	    "    switch (_Atomic(typeof(struct { int a; })) s; 0) { default: return s.a; }\n"
+	    "}\n";
+	PrismResult r22 = prism_transpile_source(
+	    switch_atomic_typeof_struct_code, "c23_switch_atomic_typeof_struct.c", prism_defaults());
+	CHECK(r22.status == PRISM_OK && r22.output,
+	      "c23-switch-atomic-typeof-struct-zeroinit: atomic typeof struct in switch-initializer must transpile");
+	if (r22.output) {
+		CHECK(strstr(r22.output, "switch (_Atomic(typeof(struct { int a; })) s = {0}; 0)") != NULL,
+		      "c23-switch-atomic-typeof-struct-zeroinit: atomic typeof struct gets = {0}");
+	}
+	prism_free(&r22);
+
+	const char *switch_atomic_tuq_union_code =
+	    "int af(void) {\n"
+	    "    switch (_Atomic(typeof_unqual(union { int a; long b; })) u; 0) { default: return u.a; }\n"
+	    "}\n";
+	PrismResult r23 = prism_transpile_source(
+	    switch_atomic_tuq_union_code, "c23_switch_atomic_tuq_union.c", prism_defaults());
+	CHECK(r23.status == PRISM_OK && r23.output,
+	      "c23-switch-atomic-tuq-union-zeroinit: atomic typeof_unqual union in switch-initializer must transpile");
+	if (r23.output) {
+		CHECK(strstr(r23.output, "switch (_Atomic(typeof_unqual(union { int a; long b; })) u = {0}; 0)") != NULL,
+		      "c23-switch-atomic-tuq-union-zeroinit: atomic typeof_unqual union gets = {0}");
+	}
+	prism_free(&r23);
+
+	const char *if_typeof_typedef_union_code =
+	    "typedef union { int a; long b; } U;\n"
+	    "int ag(void) {\n"
+	    "    if (typeof(U) u; 1) return u.a;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r24 = prism_transpile_source(
+	    if_typeof_typedef_union_code, "c23_if_typeof_typedef_union.c", prism_defaults());
+	CHECK(r24.status == PRISM_OK && r24.output,
+	      "c23-if-typeof-typedef-union-zeroinit: typeof typedef union in if-initializer must transpile");
+	if (r24.output) {
+		CHECK(strstr(r24.output, "if (typeof(U) u = {0}; 1)") != NULL,
+		      "c23-if-typeof-typedef-union-zeroinit: typeof typedef union gets = {0}");
+	}
+	prism_free(&r24);
+
+	const char *for_typeof_ptr_code =
+	    "int ah(void) {\n"
+	    "    for (typeof(int*) p; 0; ) return p != 0;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r25 = prism_transpile_source(
+	    for_typeof_ptr_code, "c23_for_typeof_ptr.c", prism_defaults());
+	CHECK(r25.status == PRISM_OK && r25.output,
+	      "c23-for-typeof-ptr-zeroinit: typeof pointer in for-initializer must transpile");
+	if (r25.output) {
+		CHECK(strstr(r25.output, "for (typeof(int*) p = 0; 0; )") != NULL ||
+		      strstr(r25.output, "for (typeof(int*) p = {0}; 0; )") != NULL,
+		      "c23-for-typeof-ptr-zeroinit: typeof pointer gets zero-init");
+	}
+	prism_free(&r25);
+
+	const char *for_typeof_typedef_union_code =
+	    "typedef union { int a; long b; } U;\n"
+	    "int ai(void) {\n"
+	    "    for (typeof(U) u; 0; ) return u.a;\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r26 = prism_transpile_source(
+	    for_typeof_typedef_union_code, "c23_for_typeof_typedef_union.c", prism_defaults());
+	CHECK(r26.status == PRISM_OK && r26.output,
+	      "c23-for-typeof-typedef-union-zeroinit: typeof typedef union in for-initializer must transpile");
+	if (r26.output) {
+		CHECK(strstr(r26.output, "for (typeof(U) u = {0}; 0; )") != NULL,
+		      "c23-for-typeof-typedef-union-zeroinit: typeof typedef union gets = {0}");
+	}
+	prism_free(&r26);
+
+	const char *switch_typeof_typedef_struct_code =
+	    "typedef struct { int a; } S;\n"
+	    "int aj(void) {\n"
+	    "    switch (typeof(S) s; 0) { default: return s.a; }\n"
+	    "}\n";
+	PrismResult r27 = prism_transpile_source(
+	    switch_typeof_typedef_struct_code, "c23_switch_typeof_typedef_struct.c", prism_defaults());
+	CHECK(r27.status == PRISM_OK && r27.output,
+	      "c23-switch-typeof-typedef-struct-zeroinit: typeof typedef struct in switch-initializer must transpile");
+	if (r27.output) {
+		CHECK(strstr(r27.output, "switch (typeof(S) s = {0}; 0)") != NULL,
+		      "c23-switch-typeof-typedef-struct-zeroinit: typeof typedef struct gets = {0}");
+	}
+	prism_free(&r27);
+}
+
+static void test_c23_multidecl_initializer_zeroinit_supported(void) {
+	/* Multi-declarator init-statements are valid C23 and should zero-init
+	 * each declarator instead of rejecting the whole statement. */
+	PrismResult r1 = prism_transpile_source(
+	    "typedef union { int x; long y; } U;\n"
+	    "int f(void) {\n"
+	    "    if (U a, b; 1) return a.x + b.x;\n"
+	    "    return 0;\n"
+	    "}\n",
+	    "c23_if_multidecl_union_typedef.c", prism_defaults());
+	CHECK(r1.status == PRISM_OK && r1.output,
+	      "c23-if-multidecl-union-zeroinit: union typedef multidecl in if-initializer must transpile");
+	if (r1.output) {
+		CHECK(strstr(r1.output, "if (U a = {0}, b = {0}; 1)") != NULL,
+		      "c23-if-multidecl-union-zeroinit: both union declarators get = {0}");
+	}
+	prism_free(&r1);
+
+	PrismResult r2 = prism_transpile_source(
+	    "struct S { int x; };\n"
+	    "int g(void) {\n"
+	    "    switch (_Atomic(struct S) a, b; 0) { default: return a.x + b.x; }\n"
+	    "}\n",
+	    "c23_switch_multidecl_atomic_struct.c", prism_defaults());
+	CHECK(r2.status == PRISM_OK && r2.output,
+	      "c23-switch-multidecl-atomic-zeroinit: atomic struct multidecl in switch-initializer must transpile");
+	if (r2.output) {
+		CHECK(strstr(r2.output, "switch (_Atomic(struct S) a = {0}, b = {0}; 0)") != NULL,
+		      "c23-switch-multidecl-atomic-zeroinit: both atomic struct declarators get = {0}");
+	}
+	prism_free(&r2);
+
+	PrismResult r3 = prism_transpile_source(
+	    "int h(void) {\n"
+	    "    for (typeof(struct { int x; }) a, b; 0; ) return a.x + b.x;\n"
+	    "    return 0;\n"
+	    "}\n",
+	    "c23_for_multidecl_typeof_struct.c", prism_defaults());
+	CHECK(r3.status == PRISM_OK && r3.output,
+	      "c23-for-multidecl-typeof-zeroinit: typeof struct multidecl in for-initializer must transpile");
+	if (r3.output) {
+		CHECK(strstr(r3.output, "for (typeof(struct { int x; }) a = {0}, b = {0}; 0; )") != NULL,
+		      "c23-for-multidecl-typeof-zeroinit: both typeof struct declarators get = {0}");
+	}
+	prism_free(&r3);
+
+	PrismResult r4 = prism_transpile_source(
+	    "typedef union { int x; long y; } U;\n"
+	    "int i(void) {\n"
+	    "    switch (U a, b; 0) { default: return a.x + b.x; }\n"
+	    "}\n",
+	    "c23_switch_multidecl_union_typedef.c", prism_defaults());
+	CHECK(r4.status == PRISM_OK && r4.output,
+	      "c23-switch-multidecl-union-zeroinit: union typedef multidecl in switch-initializer must transpile");
+	if (r4.output) {
+		CHECK(strstr(r4.output, "switch (U a = {0}, b = {0}; 0)") != NULL,
+		      "c23-switch-multidecl-union-zeroinit: both union declarators get = {0}");
+	}
+	prism_free(&r4);
+
+	PrismResult r5 = prism_transpile_source(
+	    "int j(void) {\n"
+	    "    switch (typeof(struct { int x; }) a, b; 0) { default: return a.x + b.x; }\n"
+	    "}\n",
+	    "c23_switch_multidecl_typeof_struct.c", prism_defaults());
+	CHECK(r5.status == PRISM_OK && r5.output,
+	      "c23-switch-multidecl-typeof-zeroinit: typeof struct multidecl in switch-initializer must transpile");
+	if (r5.output) {
+		CHECK(strstr(r5.output, "switch (typeof(struct { int x; }) a = {0}, b = {0}; 0)") != NULL,
+		      "c23-switch-multidecl-typeof-zeroinit: both typeof struct declarators get = {0}");
+	}
+	prism_free(&r5);
+
+	PrismResult r6 = prism_transpile_source(
+	    "int k(void) {\n"
+	    "    switch (typeof_unqual(struct { int x; }) a, b; 0) { default: return a.x + b.x; }\n"
+	    "}\n",
+	    "c23_switch_multidecl_tuq_struct.c", prism_defaults());
+	CHECK(r6.status == PRISM_OK && r6.output,
+	      "c23-switch-multidecl-tuq-zeroinit: typeof_unqual struct multidecl in switch-initializer must transpile");
+	if (r6.output) {
+		CHECK(strstr(r6.output, "switch (typeof_unqual(struct { int x; }) a = {0}, b = {0}; 0)") != NULL,
+		      "c23-switch-multidecl-tuq-zeroinit: both typeof_unqual struct declarators get = {0}");
+	}
+	prism_free(&r6);
+}
+
 void test_static_vars_no_redundant_zeroinit(void) {
 	/* C guarantees static and _Thread_local variables are zero-initialized
 	   by the loader/runtime.  Prism must NOT emit = 0, = {0}, or memset
@@ -4439,6 +5401,44 @@ static void test_zeroinit_typeof_unqual_union_const(void) {
 	prism_free(&r);
 }
 
+static void test_zeroinit_const_atomic_typeof_no_memset(void) {
+	PrismResult r1 = prism_transpile_source(
+	    "typedef struct { int a; } S;\n"
+	    "int f(void) {\n"
+	    "    const _Atomic(typeof(S)) s;\n"
+	    "    return s.a;\n"
+	    "}\n",
+	    "zi_const_atomic_typeof.c", prism_defaults());
+	if (r1.status == PRISM_OK && r1.output) {
+		CHECK(strstr(r1.output, "__builtin_memset((void *)&s") == NULL &&
+		      strstr(r1.output, "__builtin_memset((void*)&s") == NULL,
+		      "zi const atomic typeof: no memset through const object");
+	} else {
+		CHECK(r1.status != PRISM_OK ||
+		      (r1.error_msg && strstr(r1.error_msg, "const") != NULL),
+		      "zi const atomic typeof: reject or safe emit");
+	}
+	prism_free(&r1);
+
+	PrismResult r2 = prism_transpile_source(
+	    "typedef struct { int a; } S;\n"
+	    "int g(void) {\n"
+	    "    const _Atomic(typeof_unqual(S)) s;\n"
+	    "    return s.a;\n"
+	    "}\n",
+	    "zi_const_atomic_tuq.c", prism_defaults());
+	if (r2.status == PRISM_OK && r2.output) {
+		CHECK(strstr(r2.output, "__builtin_memset((void *)&s") == NULL &&
+		      strstr(r2.output, "__builtin_memset((void*)&s") == NULL,
+		      "zi const atomic typeof_unqual: no memset through const object");
+	} else {
+		CHECK(r2.status != PRISM_OK ||
+		      (r2.error_msg && strstr(r2.error_msg, "const") != NULL),
+		      "zi const atomic typeof_unqual: reject or safe emit");
+	}
+	prism_free(&r2);
+}
+
 static void test_cfg_switch_bypass_initialized_decl_fno_zeroinit(void) {
 	PrismFeatures f = prism_defaults();
 	f.zeroinit = false;
@@ -4508,6 +5508,7 @@ void run_zeroinit_tests(void) {
 	test_zeroinit_with_defer();
 	test_zeroinit_struct_field_name_like_volatile_typedef();
 	test_zeroinit_typeof_unqual_union_const();
+	test_zeroinit_const_atomic_typeof_no_memset();
 	GNUC_ONLY(test_zeroinit_typeof());
 	test_zeroinit_enum_array_size();
 	NOMSVC_ONLY(test_zeroinit_alignas_array());
@@ -4530,6 +5531,14 @@ void run_zeroinit_tests(void) {
 	test_zeroinit_torture_stress();
 	test_zeroinit_torture_with_defer();
 	NOMSVC_ONLY(test_zeroinit_torture_atomic());
+	test_c23_union_initializer_zeroinit_supported();
+	test_c23_typedef_union_initializer_zeroinit_supported();
+	test_c23_atomic_aggregate_initializer_zeroinit_supported();
+	test_c23_atomic_union_initializer_zeroinit_supported();
+	test_c23_const_union_initializer_zeroinit_supported();
+	test_const_aggregate_block_zeroinit_supported();
+	test_c23_typeof_initializer_zeroinit_supported();
+	test_c23_multidecl_initializer_zeroinit_supported();
 
 	/* Typeof zero-init torture */
 	GNUC_ONLY(

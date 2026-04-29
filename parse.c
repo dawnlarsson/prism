@@ -3751,25 +3751,66 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 
 // --- skip_one_stmt ---
 
-// Limits for skip_one_stmt_impl stack arrays.
-// if_depth beyond SOS_IF_MAX skips recording trail snapshots; unwind must not
-// treat a missing snapshot as 0 (that would flush the skip-cache).
-// do_depth is hard-capped at SOS_DO_MAX (gives up on pathological input).
-#define SOS_IF_MAX    512
-#define SOS_DO_MAX    128
-#define SOS_SNAP_MAX  1024
+// skip_one_stmt_impl: scratch buffers grow on demand so depth limits scale
+// with input rather than imposing arbitrary fixed caps.  The function is
+// iterative (not recursive) so a single thread-local working set is reused
+// across calls; the buffers leak at thread shutdown which is acceptable
+// for transpiler tooling.
+static __thread int *sos_do_if_save    = NULL;
+static __thread int *sos_do_tn_save    = NULL;
+static __thread int *sos_do_snap_start = NULL;
+static __thread int  sos_do_cap        = 0;
+static __thread int *sos_do_snap_buf   = NULL;
+static __thread int  sos_snap_cap      = 0;
+static __thread int *sos_if_trail_snap = NULL;
+static __thread int  sos_if_cap        = 0;
+
+static inline int sos_grow_to(int cur_cap, int need) {
+	int nc = cur_cap ? cur_cap : 128;
+	while (nc < need) nc *= 2;
+	return nc;
+}
+static inline bool sos_ensure_do(int need) {
+	if (need <= sos_do_cap) return true;
+	int nc = sos_grow_to(sos_do_cap, need);
+	int *a = (int *)realloc(sos_do_if_save, (size_t)nc * sizeof(int));
+	int *b = (int *)realloc(sos_do_tn_save, (size_t)nc * sizeof(int));
+	int *c = (int *)realloc(sos_do_snap_start, (size_t)nc * sizeof(int));
+	if (!a || !b || !c) { free(a); free(b); free(c); return false; }
+	sos_do_if_save = a; sos_do_tn_save = b; sos_do_snap_start = c;
+	sos_do_cap = nc;
+	return true;
+}
+static inline bool sos_ensure_snap(int need) {
+	if (need <= sos_snap_cap) return true;
+	int nc = sos_grow_to(sos_snap_cap, need);
+	int *p = (int *)realloc(sos_do_snap_buf, (size_t)nc * sizeof(int));
+	if (!p) return false;
+	sos_do_snap_buf = p; sos_snap_cap = nc;
+	return true;
+}
+static inline bool sos_ensure_if(int need) {
+	if (need <= sos_if_cap) return true;
+	int nc = sos_grow_to(sos_if_cap, need);
+	int *p = (int *)realloc(sos_if_trail_snap, (size_t)nc * sizeof(int));
+	if (!p) return false;
+	sos_if_trail_snap = p; sos_if_cap = nc;
+	return true;
+}
 
 static Token *skip_one_stmt_impl(Token *tok, uint32_t *cache) {
 	int if_depth = 0;
 	int do_depth = 0;
-	int do_if_save[SOS_DO_MAX];
-	int do_tn_save[SOS_DO_MAX];
-	int do_snap_buf[SOS_SNAP_MAX];  // flat buffer saving if_trail_snap per do level
-	int do_snap_start[SOS_DO_MAX];
 	int do_snap_top = 0;
 	uint32_t trail[256];
 	int tn = 0;
-	int if_trail_snap[SOS_IF_MAX]; // trail length snapshot at each if_depth entry
+	if (!sos_ensure_do(128) || !sos_ensure_snap(1024) || !sos_ensure_if(512))
+		return NULL;
+	int *do_if_save    = sos_do_if_save;
+	int *do_tn_save    = sos_do_tn_save;
+	int *do_snap_start = sos_do_snap_start;
+	int *do_snap_buf   = sos_do_snap_buf;
+	int *if_trail_snap = sos_if_trail_snap;
 restart:
 	tok = skip_prep_dirs(tok);
 	tok = skip_noise(tok);
@@ -3793,7 +3834,9 @@ restart:
 		if (tok->ch0 == 'e') { tok = tok_next(tok); goto restart; }
 		Token *p = skip_prep_dirs(tok_next(tok));
 		if (!p || !(match_ch(p, '(')) || !tok_match(p)) return NULL;
-		if (if_depth < SOS_IF_MAX) if_trail_snap[if_depth] = tn;
+		if (!sos_ensure_if(if_depth + 1)) return NULL;
+		if_trail_snap = sos_if_trail_snap;
+		if_trail_snap[if_depth] = tn;
 		if_depth++;
 		tok = tok_next(tok_match(p)); goto restart;
 	}
@@ -3805,16 +3848,16 @@ restart:
 	}
 
 	if ((tok->tag & TT_LOOP) && tok->ch0 == 'd') {
-		if (do_depth >= SOS_DO_MAX) return NULL;
-		if (do_snap_top + if_depth > SOS_SNAP_MAX)
-			error_tok(tok,
-				  "statement scan: nested do/if trail snapshot limit "
-				  "exceeded; reduce nested 'do' and 'if' depth in a "
-				  "single statement");
+		if (!sos_ensure_do(do_depth + 1)) return NULL;
+		if (!sos_ensure_snap(do_snap_top + if_depth)) return NULL;
+		do_if_save    = sos_do_if_save;
+		do_tn_save    = sos_do_tn_save;
+		do_snap_start = sos_do_snap_start;
+		do_snap_buf   = sos_do_snap_buf;
 		do_if_save[do_depth] = if_depth;
 		do_tn_save[do_depth] = tn;
 		do_snap_start[do_depth] = do_snap_top;
-		for (int i = 0; i < if_depth && i < SOS_IF_MAX; i++)
+		for (int i = 0; i < if_depth; i++)
 			do_snap_buf[do_snap_top++] = if_trail_snap[i];
 		do_depth++;
 		if_depth = 0;
@@ -3855,7 +3898,7 @@ unwind_if:
 		if (n && (n->tag & TT_IF) && n->ch0 == 'e') {
 			// Only flush trail entries from THIS if level (true-branch),
 			// not parent tokens that span the entire if-else.
-			int snap = (if_depth < SOS_IF_MAX) ? if_trail_snap[if_depth] : tn;
+			int snap = if_trail_snap[if_depth];
 			if (cache && tok) {
 				uint32_t val = tok_idx(tok) + 1;
 				for (int i = snap; i < tn; i++) {

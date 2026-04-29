@@ -8238,6 +8238,10 @@ static void test_stmtexpr_c23_attr_ctrl_paren_zeroinit(void) {
 }
 
 static void test_p1_skip_stmt_do_if_trail_snapshot_limit(void) {
+	// skip_one_stmt_impl previously had a fixed SOS_SNAP_MAX cap and
+	// rejected pathological nesting with a hard error.  The buffers are
+	// now dynamically grown, so deep `if`-chain-then-`do` should
+	// transpile cleanly regardless of depth.
 	size_t cap = 16000;
 	char *code = malloc(cap);
 	CHECK(code != NULL, "p1 skip-snap: malloc");
@@ -8249,11 +8253,8 @@ static void test_p1_skip_stmt_do_if_trail_snapshot_limit(void) {
 	pos += snprintf(code + pos, cap - pos, "do ; while(0);\n}\n");
 	PrismResult r = prism_transpile_source(code, "p1_skip_snap.c", prism_defaults());
 	free(code);
-	CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
-		 "p1 skip-snap: pathological do/if nesting errors");
-	if (r.error_msg)
-		CHECK(strstr(r.error_msg, "trail snapshot") != NULL,
-		      "p1 skip-snap: mentions trail snapshot buffer");
+	CHECK_EQ(r.status, PRISM_OK,
+		 "p1 skip-snap: deep do/if nesting transpiles (dynamic buffers)");
 	prism_free(&r);
 }
 

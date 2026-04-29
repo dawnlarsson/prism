@@ -4814,7 +4814,10 @@ static void test_for_init_vla_memset_phase1(void) {
 		      "non-VLA for-init must succeed");
 		prism_free(&r);
 	}
-	// typeof in if-init (C23)
+	// typeof in if-init (C23): non-VLA typeof is brace-initializable,
+	// so Prism emits `= {0}` and lets the back-end compile it.  Earlier
+	// versions hard-rejected this; the rejection was over-strict and
+	// has been removed.
 	{
 		const char *code =
 		    "int g(void);\n"
@@ -4823,8 +4826,8 @@ static void test_for_init_vla_memset_phase1(void) {
 		    "}\n"
 		    "int main(void) { return 0; }\n";
 		PrismResult r = prism_transpile_source(code, "fivla4.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "typeof in if-init must be caught in Phase 1");
+		CHECK(r.status == PRISM_OK,
+		      "typeof in if-init transpiles via = {0}");
 		prism_free(&r);
 	}
 }
@@ -5337,15 +5340,18 @@ static void test_atomic_union_zeroinit(void) {
 	prism_free(&r);
 }
 
-// for-init union must be rejected (needs memset, can't emit in init position)
+// for-init union: now accepted via brace zero-init (`= {0}`).  Previously
+// rejected on the assumption that unions need memset; in init-statement
+// position memset cannot be inserted, but `= {0}` is the de-facto
+// universal zeroing form that gcc/clang handle.
 static void test_for_init_union_rejected(void) {
-	printf("\n--- For-init union rejected ---\n");
+	printf("\n--- For-init union accepted via = {0} ---\n");
 	const char *code =
 	    "void f(void) {\n"
 	    "    for (union { char c; long long ll; } u; ;) { (void)u; break; }\n"
 	    "}\n";
 	PrismResult r = prism_transpile_source(code, "fi_union.c", prism_defaults());
-	CHECK_EQ(r.status, PRISM_ERR_SYNTAX, "for-init union: rejected");
+	CHECK_EQ(r.status, PRISM_OK, "for-init union: accepted");
 	prism_free(&r);
 }
 

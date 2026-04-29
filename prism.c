@@ -2534,6 +2534,41 @@ static Token *bounds_find_array_ident(Token *start, Token *end) {
 	error_tok((t), msg); \
 } while (0)
 
+static Token *try_bounds_check_deref_add(Token *tok);
+
+// Returns true if the parenthesized region opened by `open` derives a
+// pointer from a tracked local array — e.g. `&arr`, `&arr[N]`,
+// `(T*)&arr[N]`, `0,&arr[0]`, `cond?&arr[0]:&arr[0]`.  Such expressions
+// produce a pointer that aliases a tracked array but loses the bare
+// array name needed by the v1 subscript matcher; using them as either
+// the base of a subscript (`(...)[i]`) or the index of a commutative
+// subscript (`i[(...)]`) is a -fbounds-check bypass.
+static bool bounds_paren_derives_array(Token *open) {
+	if (!open || !match_ch(open, '(') || !(open->flags & TF_OPEN)) return false;
+	Token *close = tok_match(open);
+	if (!close) return false;
+	for (Token *t = tok_next(open); t && t != close && t->kind != TK_EOF; t = tok_next(t)) {
+		// Skip unevaluated-operand groups (sizeof/typeof/etc.).
+		if ((t->flags & TF_OPEN) && match_ch(t, '(') && tok_idx(t) >= 1) {
+			Token *pv = &token_pool[tok_idx(t) - 1];
+			if (is_uneval_operand_intro(pv)) {
+				Token *c = tok_match(t);
+				if (c) { t = c; continue; }
+			}
+		}
+		// `& <tracked-array>` is the only stable derived-pointer signal:
+		// bitwise-and against a bare tracked array is not valid C, so
+		// no unary/binary disambiguation is required.
+		if (match_ch(t, '&') && !(t->flags & TF_OPEN)) {
+			Token *n = tok_next(t);
+			if (n && n != close && bounds_is_name_token(n) &&
+			    is_tracked_array_name(n))
+				return true;
+		}
+	}
+	return false;
+}
+
 static Token *try_bounds_check_subscript(Token *tok) {
 	if (!FEAT(F_BOUNDS_CHECK)) return NULL;
 	if (!match_ch(tok, '[') || !(tok->flags & TF_OPEN) || !tok_match(tok)) return NULL;
@@ -2550,6 +2585,23 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	// which refers to the field mid-declaration — undeclared-identifier error.
 	if (in_struct_body()) return NULL;
 	if (!last_emitted) return NULL;
+
+	// Derived-pointer base: `(&arr[N])[i]`, `(*&arr)[i]`,
+	// `((T*)&arr[0])[i]`, `(cond?&arr[0]:&arr[0])[i]`, etc.  When the
+	// pool predecessor of `[` is the close of a `(...)` whose body
+	// derives a pointer from a tracked array, the peel-paren logic
+	// below would reach the array root and wrap as if the original
+	// were a multi-dim array — silently inflating the verified bound.
+	// Reject up front so the user rewrites as `arr[idx]`.
+	if (tok_idx(tok) >= 1) {
+		Token *rp = &token_pool[tok_idx(tok) - 1];
+		if (match_ch(rp, ')') && (rp->flags & TF_CLOSE) && tok_match(rp) &&
+		    bounds_paren_derives_array(tok_match(rp)))
+			BOUNDS_COMM_DIAG(tok,
+				"-fbounds-check: derived-pointer subscript "
+				"'(&arr[..])[i]' bypasses bounds-check; "
+				"rewrite as 'arr[idx]'");
+	}
 
 	// Parenthesized index commutative form: `(idx)[arr]`. The peel loop
 	// below may stop early when '(' is preceded by a value token (e.g.
@@ -2583,6 +2635,26 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	// layers). Only fires when last_emitted (the would-be index side)
 	// is not itself a tracked array, so normal forms like `arr[arr2]`
 	// fall through to the regular wrap path.
+	// Commutative derived-pointer index: `i[(&arr[..])]`,
+	// `i[(0,&arr[0])]`, `i[(1?&arr[0]:&arr[0])]`, `i[((T*)&arr[0])]`.
+	// The bracket body is a parenthesized expression that derives a
+	// pointer from a tracked array; peel-paren logic would not match
+	// either the commutative `idx[arr]` form or the regular base, so
+	// the subscript would be emitted raw.  Reject.
+	{
+		Token *rb_close = tok_match(tok);
+		Token *inner_first = tok_next(tok);
+		if (inner_first && rb_close &&
+		    match_ch(inner_first, '(') && (inner_first->flags & TF_OPEN) &&
+		    tok_match(inner_first) &&
+		    tok_next(tok_match(inner_first)) == rb_close &&
+		    bounds_paren_derives_array(inner_first))
+			BOUNDS_COMM_DIAG(tok,
+				"-fbounds-check: commutative derived-pointer "
+				"subscript 'idx[(&arr[..])]' bypasses "
+				"bounds-check; rewrite as 'arr[idx]'");
+	}
+
 	bool comma_resolved = false;
 	{
 		Token *close_scan = tok_match(tok);
@@ -2867,6 +2939,8 @@ static Token *try_bounds_check_subscript(Token *tok) {
 		}
 		Token *bc_next = try_bounds_check_subscript(t);
 		if (bc_next) { t = bc_next; continue; }
+		Token *bc_da = try_bounds_check_deref_add(t);
+		if (bc_da) { t = bc_da; continue; }
 		if ((t->flags & TF_OPEN) && tok_match(t)) {
 			t = walk_balanced(t, true);
 			continue;
@@ -2882,6 +2956,71 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	for (int d = 0; d <= dim_depth; d++) OUT_LIT("[0]");
 	OUT_LIT("))]");
 	return tok_next(close);
+}
+
+// -fbounds-check: reject pointer-arithmetic dereference equivalents.
+// Forms like *(arr+i), *(&arr[0]+i), *(*(m+i)+j) are semantically equal to
+// a subscript but bypass the subscript matcher above. We cannot safely
+// canonicalize them in-place (LHS may be a cast/derived pointer), so we
+// hard-reject under -fbounds-check; downgrade to warning under
+// -fno-safety (F_WARN_SAFETY).
+static Token *try_bounds_check_deref_add(Token *tok) {
+	if (!FEAT(F_BOUNDS_CHECK)) return NULL;
+	if (!match_ch(tok, '*') || (tok->flags & TF_OPEN)) return NULL;
+
+	// Disambiguate unary `*` (deref) from binary `*` (multiplication):
+	// binary `*` follows a value-producing token. For `)` we peek inside
+	// the matching `(...)` — type-keyword start ⇒ cast (unary), otherwise
+	// value (binary).
+	if (tok_idx(tok) >= 1) {
+		Token *prev = &token_pool[tok_idx(tok) - 1];
+		if (prev->kind == TK_NUM || prev->kind == TK_STR) return NULL;
+		if (prev->kind == TK_IDENT &&
+		    !(prev->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)) &&
+		    !(prev->tag & (TT_RETURN | TT_GOTO | TT_DEFER)))
+			return NULL;
+		if (match_ch(prev, ']')) return NULL;
+		if (match_ch(prev, ')') && (prev->flags & TF_CLOSE)) {
+			Token *om = tok_match(prev);
+			Token *fi = om ? tok_next(om) : NULL;
+			bool looks_cast = fi &&
+			    (is_type_keyword(fi) ||
+			     (fi->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)));
+			if (!looks_cast) return NULL;
+		}
+	}
+
+	Token *op = tok_next(tok);
+	if (!op || !match_ch(op, '(') || !(op->flags & TF_OPEN) || !tok_match(op)) return NULL;
+	Token *cp = tok_match(op);
+	Token *lhs = tok_next(op);
+	if (!lhs || lhs == cp) return NULL;
+
+	// Must contain a top-level `+` or `-` operator inside the parens.
+	bool has_addsub = false;
+	for (Token *t = lhs; t && t != cp && t->kind != TK_EOF; t = tok_next(t)) {
+		if ((t->flags & TF_OPEN) && tok_match(t)) { t = tok_match(t); continue; }
+		if ((match_ch(t, '+') || match_ch(t, '-')) && !(t->flags & TF_OPEN)) {
+			has_addsub = true;
+			break;
+		}
+	}
+	if (!has_addsub) return NULL;
+
+	// Must reference a tracked array name somewhere in the parens.
+	Token *hit = bounds_find_array_ident(lhs, cp);
+	if (!hit) return NULL;
+
+	if (FEAT(F_WARN_SAFETY)) {
+		warn_tok(tok,
+			 "-fbounds-check: pointer-arithmetic dereference with tracked "
+			 "array base cannot be verified (rewrite as array[index])");
+		return NULL;
+	}
+	error_tok(tok,
+		  "-fbounds-check: pointer-arithmetic dereference with tracked "
+		  "array base cannot be verified (rewrite as array[index])");
+	return NULL;
 }
 
 // Walk a balanced token group between matching delimiters, optionally emitting.
@@ -2932,6 +3071,8 @@ static PRISM_HOT Token *walk_balanced(Token *tok, bool emit) {
 			if (__builtin_expect(FEAT(F_BOUNDS_CHECK), 0)) {
 				Token *bc_next = try_bounds_check_subscript(t);
 				if (bc_next) { t = bc_next; continue; }
+				Token *bc_da = try_bounds_check_deref_add(t);
+				if (bc_da) { t = bc_da; continue; }
 			}
 			// Bracket orelse: dispatch to orelse-aware walker.
 			if (FEAT(F_ORELSE) && (t->flags & TF_OPEN) && match_ch(t, '[') && tok_match(t)) {
@@ -4513,8 +4654,16 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			for (Token *tc = type_start; tc && tc != type->end; tc = tok_next(tc))
 				if (is_const_typedef(tc)) { explicit_const = true; break; }
 		}
-		if (needs_memset && explicit_const &&
-		    (is_union_type || effective_vla || (type->has_atomic && is_aggregate)))
+		// _Atomic(typeof(T)) where T is an aggregate also requires memset
+		// (typeof preserves the type, and atomic aggregates can't use ={0}).
+		// Extend rejection to cover that path explicitly.  C23 init-statement
+		// context is exempt: no memset will be emitted (the declaration uses
+		// `= {0}` directly, see init_stmt_brace below), so there is no
+		// const-modify UB to worry about.
+		bool _is_init_stmt_ctx_for_const = in_for_init() || in_ctrl_paren();
+		if (needs_memset && explicit_const && !(_is_init_stmt_ctx_for_const && !effective_vla) &&
+		    (is_union_type || effective_vla ||
+		     (type->has_atomic && (is_aggregate || type->has_typeof))))
 			error_tok(decl.var_name,
 				  "'const' variable requiring unavoidable memset "
 				  "(union, VLA, or _Atomic aggregate) cannot be safely "
@@ -4558,8 +4707,20 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		if (has_bo) bo_restore(&bo_frame);
 		tok = decl.end;
 
-		// Add zero initializer if needed (for non-memset types)
-		if (FEAT(F_ZEROINIT) && !decl.has_init && !effective_vla && !decl_is_raw && !needs_memset && !type->has_extern && !type->has_static && !is_func_type) {
+		// C23 init-statement context: a delayed memset cannot be inserted
+		// between the declaration and the controlling expression.  Both
+		// gcc-15 and clang-19 fully zero unions, _Atomic aggregates,
+		// typeof aggregates and typeof scalars via `= {0}` (verified
+		// empirically with -O0 and -O2 against polluted stacks); use that
+		// shape here.  VLAs cannot use initializer-list syntax
+		// (C99 §6.7.8p3) and remain rejected.
+		bool init_stmt_ctx = in_for_init() || in_ctrl_paren();
+		bool init_stmt_brace = needs_memset && init_stmt_ctx && !effective_vla;
+
+		// Add zero initializer if needed (for non-memset types, plus
+		// init-statement memset cases that can satisfy themselves with
+		// `= {0}` or `= 0`).
+		if (FEAT(F_ZEROINIT) && !decl.has_init && !effective_vla && !decl_is_raw && (!needs_memset || init_stmt_brace) && !type->has_extern && !type->has_static && !is_func_type) {
 			if (type->has_register && type->has_atomic && is_aggregate)
 				error_tok(decl.var_name,
 					  "'register _Atomic' aggregate cannot be safely "
@@ -4567,26 +4728,31 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 					  "to opt out of automatic initialization");
 			else if (type->has_register && is_union_type)
 				// register forbids &var, so memset is impossible.
-				// = {0} only zeros first member on GCC-15 (C11 §6.7.9p17).
+				// = {0} fully zeros on gcc/clang in practice but is
+				// not standard-mandated for unions; refuse to depend
+				// on it when register has already removed the safe
+				// fallback.
 				error_tok(decl.var_name,
 					  "'register' union cannot be safely "
 					  "zero-initialized (address-taking is illegal for "
 					  "register, and = {0} only zeros the first member); "
 					  "remove 'register' or use 'raw' to opt out of "
 					  "automatic initialization");
-			else if (is_aggregate || type->has_typeof)
+			else if (is_aggregate || type->has_typeof || is_union_type ||
+				 (type->has_atomic && is_aggregate))
 				OUT_LIT(" = {0}");
 			else
 				OUT_LIT(" = 0");
 		}
 
 		// Queue delayed memsets until the declaration can be safely split.
-		if (needs_memset) {
-			if (in_for_init())
+		// Init-statement non-VLA cases were already satisfied above.
+		if (needs_memset && !init_stmt_brace) {
+			if (init_stmt_ctx)
 				error_tok(decl.var_name,
-					  "VLA or typeof variable in for/if/switch initializer "
-					  "cannot be safely zero-initialized; move the "
-					  "declaration before the statement");
+					  "VLA in for/if/switch init-statement cannot be "
+					  "safely zero-initialized; move the declaration "
+					  "before the statement");
 			ARENA_ENSURE_CAP(&ctx->main_arena,
 					 ctx->typeof_vars,
 					 ctx->typeof_var_count + 1,
@@ -7493,23 +7659,21 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 					e->decl.is_static_storage = saw_static || type.has_static || type.has_extern;
 					e->decl.body_close_idx = body_sid > 0 ? 0 : body_close_idx;
 				}
-				// Phase 1D: reject init-decl needing memset
-				// (moved from Pass 2 process_declarators to satisfy
-				// the two-pass invariant: all semantic errors before emission)
+				// Phase 1D: reject init-decl whose memset is unavoidable
+				// (= VLA — initializer-list syntax is illegal on VLAs
+				// per C99 §6.7.8p3).  Unions, _Atomic aggregates and
+				// typeof aggregates are accepted: Pass 2 emits `= {0}`
+				// in init-statement context, which gcc/clang fully zero.
 				if (FEAT(F_ZEROINIT) && !has_init && !decl_raw &&
 				    !(saw_static || type.has_static || type.has_extern)) {
 					bool eff_vla = (decl.is_vla && (!decl.paren_pointer || decl.paren_array)) ||
 						       (type.is_vla && !decl.is_pointer);
-					bool is_agg = (decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
-						      ((type.is_struct || type.is_typedef) && !decl.is_pointer);
-					bool p1d_fi_union = type.is_union && !decl.is_pointer;
-					if ((!decl.is_pointer || decl.is_array) && !type.has_register &&
-					    (type.has_typeof || (type.has_atomic && is_agg) || eff_vla ||
-					     p1d_fi_union))
+					if (eff_vla && (!decl.is_pointer || decl.is_array) &&
+					    !type.has_register)
 						error_tok(decl.var_name,
-							  "VLA or typeof variable in for/if/switch initializer "
-							  "cannot be safely zero-initialized; move the "
-							  "declaration before the statement");
+							  "VLA in for/if/switch init-statement cannot be "
+							  "safely zero-initialized; move the declaration "
+							  "before the statement");
 				}
 			}
 
@@ -8586,21 +8750,28 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 					  "cannot use initializer syntax); remove 'register' "
 					  "or use 'raw' to opt out of automatic initialization");
 
-			// Phase 1D: reject const VLA memset
+			// Phase 1D: reject const declarations that would require memset.
+			// Cover VLA, union, and _Atomic(typeof) — all paths where
+			// Pass 2 would otherwise emit memset through a const object (UB).
 			if (FEAT(F_ZEROINIT) && !has_init && !decl_raw &&
 			    !(saw_static || type.has_static || type.has_extern) &&
-			    !type.has_register && eff_vla) {
+			    !type.has_register) {
 				bool excl = (type.has_const && !decl.is_func_ptr && !decl.is_pointer) || decl.is_const;
 				if (!excl && !decl.is_func_ptr && !decl.is_pointer) {
 					for (Token *tc = type_tok; tc && tc != type.end; tc = tok_next(tc))
 						if (is_const_typedef(tc)) { excl = true; break; }
 				}
 				bool p1d_cv_union = type.is_union && !decl.is_pointer;
+				bool p1d_is_agg = (decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
+						 ((type.is_struct || type.is_typedef || type.is_array) && !decl.is_pointer);
 				bool would_memset = (!decl.is_pointer || decl.is_array) &&
-					(type.has_typeof || (type.has_atomic && ((decl.is_array && (!decl.paren_pointer || decl.paren_array)) ||
-					 ((type.is_struct || type.is_typedef || type.is_array) && !decl.is_pointer))) || type.is_vla || decl.is_vla ||
-					 p1d_cv_union);
-				if (excl && would_memset)
+					(type.has_typeof || (type.has_atomic && p1d_is_agg) ||
+					 type.is_vla || decl.is_vla || p1d_cv_union);
+				// Mirror Pass 2's unavoidable-memset gate (process_declarators):
+				//   union, VLA, or _Atomic aggregate (incl. _Atomic(typeof(...))).
+				bool unavoidable = p1d_cv_union || eff_vla ||
+						   (type.has_atomic && (p1d_is_agg || type.has_typeof));
+				if (excl && would_memset && unavoidable)
 					error_tok(decl.var_name,
 						  "'const' variable requiring typeof/VLA memset cannot be "
 						  "safely zero-initialized (modifying a const object is "
@@ -8981,6 +9152,25 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 				if (is_func_decl && FEAT(F_ORELSE) && tok_match(nx))
 					p1d_reject_proto_param_orelse(nx);
 			}
+		}
+
+		// File-scope control statements (return / break / continue /
+		// case / default / goto / if / for / while / do / switch / else)
+		// are syntactically invalid in C — they can only appear in a
+		// function body. Prism otherwise lets them pass through to the C
+		// compiler, but we hard-reject early so downstream emission can
+		// stay structural.
+		if (p1d_cur_func == -1 && p1d_init_brace_depth == 0 && at_stmt_start &&
+		    !is_known_typedef(tok)) {
+			if (tok->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_CASE | TT_DEFAULT))
+				error_tok(tok,
+					  "control statement at file scope (must appear inside a function body)");
+			if (tok->tag & TT_GOTO)
+				error_tok(tok,
+					  "'goto' at file scope (must appear inside a function body)");
+			if ((tok->tag & (TT_IF | TT_LOOP | TT_SWITCH)) || is_else_kw(tok))
+				error_tok(tok,
+					  "control-flow statement at file scope (must appear inside a function body)");
 		}
 
 		if (FEAT(F_ORELSE) && match_ch(tok, '[') && tok_match(tok))
@@ -10025,6 +10215,12 @@ static void p1_verify_cfg(void) {
 				// in ancestor-or-self scope of the case → error.
 				uint16_t sw_sid = ents[i].kase.switch_scope_id;
 
+				// Stray case/default outside any active switch is a hard error
+				// (Phase 1D records sw_sid=0 only when p1d_switch_top==0).
+				if (sw_sid == 0)
+					error_tok(ents[i].tok,
+						  "case/default label outside any switch statement");
+
 				// Reject case/default jumping into a statement expression.
 				// Mirrors the scope_stmt_expr_ancestor check in P1K_GOTO.
 				{
@@ -10228,6 +10424,13 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 		if (__builtin_expect(!tag && !ctx->at_stmt_start, 1)) {
 			if (__builtin_expect((tok->flags & TF_RAW) && !is_known_typedef(tok), 0))
 				goto slow_path;
+			// -fbounds-check: pointer-arith deref equivalents `*(arr+i)`
+			// are untagged punctuation; route through the bounds check
+			// here too (subscript path is handled in slow path via `[`).
+			if (__builtin_expect(FEAT(F_BOUNDS_CHECK), 0)) {
+				Token *bc_da = try_bounds_check_deref_add(tok);
+				if (bc_da) { tok = bc_da; continue; }
+			}
 			track_common_token_state(tok);
 			emit_tok(tok); tok = tok_next(tok);
 			continue;
@@ -10489,6 +10692,8 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 		{
 			Token *bc_next = try_bounds_check_subscript(tok);
 			if (bc_next) { tok = bc_next; continue; }
+			Token *bc_da = try_bounds_check_deref_add(tok);
+			if (bc_da) { tok = bc_da; continue; }
 		}
 
 
@@ -11903,6 +12108,14 @@ static void collect_link_pragmas(Cli *cli) {
 static int compile_sources(Cli *cli) {
 	int status = 0;
 	collect_link_pragmas(cli);
+	// `collect_link_pragmas` may realloc `cli->cc_args` (linker tokens are
+	// pushed as `-framework <name>` / `-l<name>` pairs). main() aliased the
+	// pre-pragma `cli.cc_args` into ctx->extra_compiler_flags before this
+	// point; refresh the alias so build_pp_argv doesn't dereference a
+	// freed array. Triggers when a single source has ≥ ~7 macos pragma
+	// tokens (16-entry initial cap → first geometric grow relocates).
+	ctx->extra_compiler_flags = cli->cc_args;
+	ctx->extra_compiler_flags_count = cli->cc_arg_count;
 	const char *compiler = get_real_cc(cli->cc);
 	int cc_extra = cc_extra_arg_count(compiler);
 	bool clang = cc_is_clang(compiler);

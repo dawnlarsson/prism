@@ -4185,6 +4185,40 @@ static void test_cli_run_prog_args_and_link_pragma(void) {
 		}
 	}
 
+#ifndef _WIN32
+	// Case 5: many `#pragma link` tokens trigger geometric realloc of
+	// cli->cc_args. Pre-fix, main() aliased the (then-small) cc_args
+	// buffer into ctx->extra_compiler_flags BEFORE compile_sources()
+	// invoked collect_link_pragmas() — which subsequently grew the
+	// buffer past its initial 16-slot cap, freeing the underlying
+	// allocation while ctx still pointed to it. The next preprocess
+	// run dereferenced freed memory and crashed with SIGSEGV.
+	//
+	// Repro: a single source with ≥ ~17 verbatim pragma tokens forces
+	// the first geometric grow (16 → 32) to relocate the array.
+	{
+		char many_path[PATH_MAX];
+		snprintf(many_path, sizeof(many_path), "%s/many.c", dir);
+		FILE *mf = fopen(many_path, "w");
+		if (mf) {
+			// `*` platform matches everywhere; `-w` is a verbatim
+			// token (starts with `-`) so it's pushed as-is to
+			// cc_args. clang/gcc both accept `-w` (suppress all
+			// warnings); duplicates are harmless. We need ≥ ~17
+			// total cc_args to trigger the relocation, so emit 24
+			// pragmas to leave headroom.
+			for (int i = 0; i < 24; i++)
+				fputs("#pragma link * -w\n", mf);
+			fputs("int main(void) { return 0; }\n", mf);
+			fclose(mf);
+			char *argv[] = {prism_bin, "run", many_path, NULL};
+			int st = run_exec_argv_capture(argv, stdout_path, stderr_path);
+			CHECK_EQ(st, 0, "runargs: many link pragmas don't dangle ctx alias");
+			unlink(many_path);
+		}
+	}
+#endif
+
 	unlink(stdout_path);
 	unlink(stderr_path);
 	unlink(src_path);

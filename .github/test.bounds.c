@@ -434,6 +434,81 @@ static void test_bounds_check_runtime(void) {
 	    "#include <stdio.h>\n"
 	    "int main(void){int a[10]; int *p=&a[10]; (void)p; return 77;}\n",
 	    77, "bc-run-addrof");
+
+	// Derived-pointer base forms are rejected under -fbounds-check (safe fallback).
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[2]={1,2}; volatile int i=5;\n"
+		    "(void)(&a[0])[i]; return 0;}\n",
+		    "bc_derived_ptr_addr0_reject.c", f);
+		CHECK(r.status != PRISM_OK, "bc-run-derived-ptr-addr0-oob: reject hidden lhs base");
+		prism_free(&r);
+	}
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[2]={1,2}; volatile int i=5;\n"
+		    "(void)(*(&a))[i]; return 0;}\n",
+		    "bc_derived_ptr_deref_reject.c", f);
+		CHECK(r.status != PRISM_OK, "bc-run-derived-ptr-deref-oob: reject hidden lhs base");
+		prism_free(&r);
+	}
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int m[2][2]={{1,2},{3,4}}; volatile int i=5,j=1;\n"
+		    "(void)(&m[0])[i][j]; return 0;}\n",
+		    "bc_derived_md_addr_reject.c", f);
+		CHECK(r.status != PRISM_OK, "bc-run-derived-md-addr-row-oob: reject hidden lhs base");
+		prism_free(&r);
+	}
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int m[2][2]={{1,2},{3,4}}; volatile int i=1,j=9;\n"
+		    "(void)(*(&m))[i][j]; return 0;}\n",
+		    "bc_derived_md_deref_reject.c", f);
+		CHECK(r.status != PRISM_OK, "bc-run-derived-md-deref-oob: reject hidden lhs base");
+		prism_free(&r);
+	}
+
+	// Pointer-arithmetic dereference equivalents are currently rejected under
+	// -fbounds-check (safe fallback) rather than wrapped.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[2]={1,2}; volatile int i=5;\n"
+		    "(void)*(a+i); return 0;}\n",
+		    "bc_deref_add_reject.c", f);
+		CHECK(r.status != PRISM_OK, "bc-run-deref-add-oob: reject pointer-arith deref");
+		prism_free(&r);
+	}
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[2]={1,2}; volatile int i=5;\n"
+		    "(void)*(&a[0]+i); return 0;}\n",
+		    "bc_deref_addr_add_reject.c", f);
+		CHECK(r.status != PRISM_OK, "bc-run-deref-addr-add-oob: reject pointer-arith deref");
+		prism_free(&r);
+	}
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int m[2][2]={{1,2},{3,4}}; volatile int i=5,j=1;\n"
+		    "(void)*(*(m+i)+j); return 0;}\n",
+		    "bc_deref_md_chain_reject.c", f);
+		CHECK(r.status != PRISM_OK, "bc-run-deref-md-chain-oob: reject pointer-arith deref");
+		prism_free(&r);
+	}
 #endif
 }
 
@@ -993,6 +1068,51 @@ static void test_bounds_check_commutative(void) {
 		    "len[(b)] = 0; return 0;}\n",
 		    "bc_comm_paren.c", f);
 		CHECK(r.status != PRISM_OK, "bc-comm-paren: rejects idx[(arr)]");
+		prism_free(&r);
+	}
+
+	// Derived-pointer commutative form: `idx[&arr[0]]`.
+	// Semantically equivalent to `(&arr[0])[idx]` and must not bypass.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int b[10]; int i=5;\n"
+		    "i[(&b[0])] = 0; return 0;}\n",
+		    "bc_comm_addr0.c", f);
+		CHECK(r.status != PRISM_OK, "bc-comm-addr0: rejects idx[&arr[0]]");
+		prism_free(&r);
+	}
+
+	// Hidden-address forms should be rejected too; they are equivalent bypasses.
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int b[10]; int i=5;\n"
+		    "i[(0,&b[0])] = 0; return 0;}\n",
+		    "bc_comm_addr0_comma.c", f);
+		CHECK(r.status != PRISM_OK, "bc-comm-addr0-comma: rejects idx[(0,&arr[0])]");
+		prism_free(&r);
+	}
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int b[10]; int i=5;\n"
+		    "i[(1?&b[0]:&b[0])] = 0; return 0;}\n",
+		    "bc_comm_addr0_cond.c", f);
+		CHECK(r.status != PRISM_OK, "bc-comm-addr0-cond: rejects idx[(cond?&arr[0]:&arr[0])]");
+		prism_free(&r);
+	}
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int b[10]; int i=5;\n"
+		    "i[((int*)&b[0])] = 0; return 0;}\n",
+		    "bc_comm_addr0_cast.c", f);
+		CHECK(r.status != PRISM_OK, "bc-comm-addr0-cast: rejects idx[((int*)&arr[0])]");
 		prism_free(&r);
 	}
 
