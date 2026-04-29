@@ -618,14 +618,6 @@ static char *mkdtemp(char *tmpl) {
 	return NULL;
 }
 
-/* Stub: Windows callers use get_self_exe_path() via GetModuleFileNameA instead */
-static ssize_t readlink(const char *path, char *buf, size_t bufsize) {
-	(void)path;
-	(void)buf;
-	(void)bufsize;
-	return -1;
-}
-
 static int posix_spawn_file_actions_init(posix_spawn_file_actions_t *fa) {
 	fa->count = 0;
 	return 0;
