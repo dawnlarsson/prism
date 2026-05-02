@@ -3293,6 +3293,476 @@ static void test_goto_over_raw_native_init(void) {
 	prism_free(&r);
 }
 
+// Regression: plain C declarations in switch body should not be rejected
+// when storage is static/extern (no runtime init can be bypassed).
+static void test_plain_c_switch_decl_storage_false_positive(void) {
+	printf("\n--- Plain C Switch Storage Declaration ---\n");
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    switch (1) {\n"
+		    "        static int x;\n"
+		    "    case 1:\n"
+		    "        return x;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_switch_static.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C: static declaration in switch body should be accepted");
+		prism_free(&r);
+	}
+
+	{
+		const char *code =
+		    "extern int gx;\n"
+		    "int main(void){\n"
+		    "    switch (1) {\n"
+		    "        extern int gx;\n"
+		    "    case 1:\n"
+		    "        return gx;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_switch_extern.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C: extern declaration in switch body should be accepted");
+		prism_free(&r);
+	}
+}
+
+// Regression: goto over uninitialized declaration is valid plain C and
+// should not be rejected as "bypasses initialization".
+static void test_plain_c_goto_over_uninit_decl(void) {
+	printf("\n--- Plain C Goto Over Uninitialized Declaration ---\n");
+
+	const char *code =
+	    "int main(void){ goto L; { int x; L: x = 1; return x; } }\n";
+	PrismResult r = prism_transpile_source(code, "plain_goto_uninit_decl.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "plain C: goto over uninitialized auto declaration should be accepted");
+	prism_free(&r);
+}
+
+// Regression: blanket switch-body declaration gate rejects other ISO-valid forms
+// (not only static/extern): typedef + object, struct tag + object, _Alignas,
+// register.
+static void test_plain_c_switch_unbraced_decl_variants(void) {
+	printf("\n--- Plain C Switch Unbraced Declaration Variants ---\n");
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    switch (1) {\n"
+		    "    case 1:\n"
+		    "        typedef int T;\n"
+		    "        T x = 1;\n"
+		    "        return x;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_switch_typedef_obj.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C: typedef then object in switch case should be accepted");
+		prism_free(&r);
+	}
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    switch (1) {\n"
+		    "    case 1:\n"
+		    "        struct S { int a; };\n"
+		    "        struct S s;\n"
+		    "        s.a = 1;\n"
+		    "        return s.a;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_switch_struct_obj.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C: struct tag + object in switch case should be accepted");
+		prism_free(&r);
+	}
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    switch (1) {\n"
+		    "    case 1:\n"
+		    "        _Alignas(16) int x;\n"
+		    "        x = 0;\n"
+		    "        return x;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_switch_alignas.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C: _Alignas auto in switch case should be accepted");
+		prism_free(&r);
+	}
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    switch (1) {\n"
+		    "    case 1:\n"
+		    "        register int x;\n"
+		    "        x = 0;\n"
+		    "        return x;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_switch_register.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C: register auto in switch case should be accepted");
+		prism_free(&r);
+	}
+}
+
+// Regression: unbraced switch gate fires even with explicit = initializer when
+// the type uses qualifiers or _Atomic / _Bool (not "missing user init").
+static void test_plain_c_switch_qualified_init_false_positive(void) {
+	printf("\n--- Plain C Switch Qualified + Initializer ---\n");
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    switch (1) {\n"
+		    "    case 1:\n"
+		    "        volatile int v = 1;\n"
+		    "        return v;\n"
+		    "    }\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_switch_volatile_init.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C: volatile with initializer in switch case should be accepted");
+		prism_free(&r);
+	}
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    switch (1) {\n"
+		    "    case 1:\n"
+		    "        const int c = 1;\n"
+		    "        return c;\n"
+		    "    }\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_switch_const_init.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C: const with initializer in switch case should be accepted");
+		prism_free(&r);
+	}
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    switch (1) {\n"
+		    "    case 1:\n"
+		    "        _Atomic int a = 0;\n"
+		    "        return (int)a;\n"
+		    "    }\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_switch_atomic_init.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C: _Atomic with initializer in switch case should be accepted");
+		prism_free(&r);
+	}
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    switch (1) {\n"
+		    "    case 1:\n"
+		    "        _Bool b = 1;\n"
+		    "        return (int)b;\n"
+		    "    }\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_switch_bool_init.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C: _Bool with initializer in switch case should be accepted");
+		prism_free(&r);
+	}
+}
+
+// Regression: `goto *&&L` transpiles but `void *p = &&L; goto *p` is the same
+// computed goto; blocker scan treats any local decl as "zero-initialized".
+// Second case: initialized local still rejected — message category wrong.
+static void test_plain_c_computed_goto_via_ptr_false_positive(void) {
+	printf("\n--- Plain C Computed Goto Via Label Pointer ---\n");
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    void *p = &&L;\n"
+		    "    goto *p;\n"
+		    "L:\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_cgoto_ptr.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C: computed goto via void *p = &&L should be accepted");
+		prism_free(&r);
+	}
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    int x = 1;\n"
+		    "    void *p = &&L;\n"
+		    "    goto *p;\n"
+		    "L:\n"
+		    "    return x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_cgoto_ptr_plus_init.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C: computed goto with other initialized locals should be accepted");
+		prism_free(&r);
+	}
+}
+
+// Regression: computed/asm goto blocker scan classifies tag-only struct/union
+// definitions as "zero-initialized declarations". These are type definitions,
+// not runtime-initialized objects.
+static void test_plain_c_goto_tag_definition_false_positive(void) {
+	printf("\n--- Plain C Goto Tag Definition False Positive ---\n");
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    struct S { int a; };\n"
+		    "    goto *&&L;\n"
+		    "L:\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_cgoto_struct_tag_only.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C: computed goto with struct-tag definition only should be accepted");
+		prism_free(&r);
+	}
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    union U { int a; };\n"
+		    "    goto *&&L;\n"
+		    "L:\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_cgoto_union_tag_only.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C: computed goto with union-tag definition only should be accepted");
+		prism_free(&r);
+	}
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    struct S { int a; };\n"
+		    "    asm goto(\"\" : : : : L);\n"
+		    "L:\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_asm_goto_struct_tag_only.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C: asm goto with struct-tag definition only should be accepted");
+		prism_free(&r);
+	}
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    union U { int a; };\n"
+		    "    asm goto(\"\" : : : : L);\n"
+		    "L:\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_asm_goto_union_tag_only.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C: asm goto with union-tag definition only should be accepted");
+		prism_free(&r);
+	}
+}
+
+// Regression: GNU nested function definitions are plain GNU C and can be
+// passed through unchanged, but Prism rejects them whenever defer/zeroinit
+// features are enabled globally.
+static void test_plain_c_nested_function_passthrough(void) {
+	printf("\n--- Plain C GNU Nested Function Passthrough ---\n");
+
+	const char *code =
+	    "int main(void) {\n"
+	    "    int add(int a, int b) { return a + b; }\n"
+	    "    return add(1, 2);\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "plain_nested_fn.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "plain C GNU nested function without prism keywords should be accepted");
+	prism_free(&r);
+}
+
+// Regression: nested function defined inside a statement expression (GNU),
+// assigned to a function pointer — same nested-fn rejection as a flat nested def.
+static void test_plain_c_stmt_expr_nested_function_false_positive(void) {
+	printf("\n--- Plain C Stmt-Expr Nested Function ---\n");
+
+	const char *code =
+	    "int main(void) {\n"
+	    "    int (*fp)(int) = ({ int g(int x) { return x + 1; } g; });\n"
+	    "    return fp(1);\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "plain_nested_stmtexpr.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "plain C GNU: nested function via statement expression should be accepted");
+	prism_free(&r);
+}
+
+// Regression: only for-init VLA currently has explicit coverage. if/switch
+// init-statement VLA forms are valid C23 and currently over-rejected.
+static void test_plain_c_if_switch_init_vla_false_positive(void) {
+	printf("\n--- Plain C if/switch init VLA False Positive ---\n");
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    int n = 3;\n"
+		    "    if (int a[n]; 1) { return 0; }\n"
+		    "    return 1;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_if_init_vla.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C23: VLA in if-init should be accepted");
+		prism_free(&r);
+	}
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    int n = 3;\n"
+		    "    switch (int a[n]; 1) {\n"
+		    "        case 1: return 0;\n"
+		    "        default: return 1;\n"
+		    "    }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_switch_init_vla.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C23: VLA in switch-init should be accepted");
+		prism_free(&r);
+	}
+}
+
+// Regression: asm goto with ordinary locals is valid GNU C. Prism currently
+// classifies this as unverifiable + zero-init blocker and rejects plain C.
+static void test_plain_c_asm_goto_decl_false_positive(void) {
+	printf("\n--- Plain C asm goto Declaration False Positive ---\n");
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    int x = 1;\n"
+		    "    asm goto(\"\" : : : : L);\n"
+		    "    x++;\n"
+		    "L:\n"
+		    "    return x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_asm_goto_init_local.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C GNU: asm goto with initialized local should be accepted");
+		prism_free(&r);
+	}
+}
+
+// Regression: C23 / GNU type spellings in unbraced switch arm — same gate as
+// `int x` (should not blanket-reject valid standard code).
+static void test_plain_c_switch_c23_type_spellings_false_positive(void) {
+	printf("\n--- Plain C switch C23 type spellings ---\n");
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    switch (1) {\n"
+		    "    case 1:\n"
+		    "        constexpr int c = 2;\n"
+		    "        return c;\n"
+		    "    }\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_switch_constexpr.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C23: constexpr object in switch case should be accepted");
+		prism_free(&r);
+	}
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    switch (1) {\n"
+		    "    case 1:\n"
+		    "        typeof(int) x = 1;\n"
+		    "        return x;\n"
+		    "    }\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_switch_typeof.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C: typeof object in switch case should be accepted");
+		prism_free(&r);
+	}
+
+	{
+		const char *code =
+		    "int main(void){\n"
+		    "    switch (1) {\n"
+		    "    case 1:\n"
+		    "        auto y = 1;\n"
+		    "        return y;\n"
+		    "    }\n"
+		    "    return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(code, "plain_switch_auto.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+		         "plain C23: auto object in switch case should be accepted");
+		prism_free(&r);
+	}
+}
+
+// Regression: C23 labeled declaration after case label (still plain C).
+static void test_plain_c_switch_labeled_decl_false_positive(void) {
+	printf("\n--- Plain C switch labeled declaration ---\n");
+
+	const char *code =
+	    "int main(void){\n"
+	    "    switch (1) {\n"
+	    "    case 1:\n"
+	    "    L:\n"
+	    "        int x = 1;\n"
+	    "        return x;\n"
+	    "    }\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "plain_switch_labeled_decl.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "plain C23: labeled declaration after case should be accepted");
+	prism_free(&r);
+}
+
+// Regression: parenthesized label address with indirect computed goto (GNU).
+static void test_plain_c_computed_goto_paren_label_addr_false_positive(void) {
+	printf("\n--- Plain C parenthesized label address computed goto ---\n");
+
+	const char *code =
+	    "int main(void){\n"
+	    "    void *p = (&&L);\n"
+	    "    goto *p;\n"
+	    "L:\n"
+	    "    return 0;\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "plain_cgoto_paren_addr.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+	         "plain C GNU: computed goto via (&&L) should be accepted");
+	prism_free(&r);
+}
+
 // braceless for/if/switch bodies have no scope_id in scope_tree,
 // so p1_scan_init_shadows never creates a P1K_DECL entry (body_sid == 0).
 // The CFG verifier is completely blind to init-declared variables in
@@ -6099,6 +6569,19 @@ void run_safe_tests(void) {
 	test_switch_case_over_native_init();
 	test_const_aggregate_memset_rejected();
 	test_goto_over_raw_native_init();
+	test_plain_c_switch_decl_storage_false_positive();
+	test_plain_c_goto_over_uninit_decl();
+	test_plain_c_switch_unbraced_decl_variants();
+	test_plain_c_switch_qualified_init_false_positive();
+	test_plain_c_computed_goto_via_ptr_false_positive();
+	test_plain_c_goto_tag_definition_false_positive();
+	test_plain_c_nested_function_passthrough();
+	test_plain_c_stmt_expr_nested_function_false_positive();
+	test_plain_c_if_switch_init_vla_false_positive();
+	test_plain_c_asm_goto_decl_false_positive();
+	test_plain_c_switch_c23_type_spellings_false_positive();
+	test_plain_c_switch_labeled_decl_false_positive();
+	test_plain_c_computed_goto_paren_label_addr_false_positive();
 	GNUC_ONLY(test_gnu_attr_param_shadow());
 
 	// raw raw VLA for-init CFG blindness

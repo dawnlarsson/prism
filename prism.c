@@ -4733,16 +4733,36 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 		// Queue delayed memsets until the declaration can be safely split.
 		// Init-statement non-VLA cases were already satisfied above.
+		// for-init VLAs cannot be split out (memset would have to land
+		// between the controlling expression and the body) — reject.
+		// if/switch-init VLAs (C23) are accepted: the variable simply
+		// remains uninitialized, matching plain C semantics.  The user
+		// can opt back into Prism zero-init by hoisting the declaration
+		// before the if/switch.
 		if (needs_memset && !init_stmt_brace) {
-			if (init_stmt_ctx)
+			// Distinguish for-init from C23 if/switch-init: both use
+			// SCOPE_FOR_PAREN, but for-loops set is_loop on the paren
+			// scope.  for-init VLAs cannot be split out (memset would
+			// have to land between paren and body) — reject.
+			// if/switch-init VLAs are accepted: variable remains
+			// uninitialized (matching plain C semantics).
+			bool real_for_init = in_for_init() &&
+				ctx->scope_depth > 0 &&
+				scope_stack[ctx->scope_depth - 1].is_loop;
+			if (real_for_init && effective_vla)
 				error_tok(decl.var_name, ERR_INIT_STMT_VLA);
-			ARENA_ENSURE_CAP(&ctx->main_arena,
-					 ctx->typeof_vars,
-					 ctx->typeof_var_count + 1,
-					 ctx->typeof_var_cap,
-					 128,
-					 Token *);
-			ctx->typeof_vars[ctx->typeof_var_count++] = decl.var_name;
+			if (init_stmt_ctx && effective_vla && !real_for_init) {
+				/* skip queueing memset — variable left
+				 * uninitialized in if/switch-init context */
+			} else {
+				ARENA_ENSURE_CAP(&ctx->main_arena,
+						 ctx->typeof_vars,
+						 ctx->typeof_var_count + 1,
+						 ctx->typeof_var_cap,
+						 128,
+						 Token *);
+				ctx->typeof_vars[ctx->typeof_var_count++] = decl.var_name;
+			}
 		}
 
 		// Emit initializer if present
@@ -4955,10 +4975,22 @@ static Token *try_zero_init_decl(Token *tok) {
 		}
 	}
 
-	if (FEAT(F_ZEROINIT) && in_switch_scope_unbraced && !is_raw && !in_for_init())
-		SAFETY_DIAG(warn_loc,
-			    "variable declaration directly in switch body without braces "
-			    "(zero-init may be skipped by case labels); wrap in braces or use 'raw'");
+	if (FEAT(F_ZEROINIT) && in_switch_scope_unbraced && !is_raw && !in_for_init()) {
+		// Mirror Phase 1D's narrower gate: only fire on the
+		// "plain auto declaration without explicit user intent" form.
+		DeclResult _peek = parse_declarator(type.end, false);
+		bool _has_init = _peek.var_name && _peek.end && match_ch(_peek.end, '=');
+		bool _has_explicit_intent =
+		    _has_init ||
+		    type.is_typedef || type.is_struct || type.is_enum ||
+		    type.has_static || type.has_extern || type.has_thread_local ||
+		    type.has_register || type.has_atomic || type.has_constexpr ||
+		    type.has_alignas;
+		if (!_has_explicit_intent)
+			SAFETY_DIAG(warn_loc,
+				    "variable declaration directly in switch body without braces "
+				    "(zero-init may be skipped by case labels); wrap in braces or use 'raw'");
+	}
 
 	// Braceless control body: wrap in braces (orelse expands to multiple stmts).
 	bool brace_wrap = ctrl_state.pending && ctrl_state.parens_just_closed;
@@ -7515,7 +7547,7 @@ static bool p1d_decl_has_bracket_orelse(Token *start, Token *end) {
 // or not inside a function).
 static void p1_scan_init_shadows(Token *open, Token *init_end,
     uint32_t scope_close_idx, uint16_t cur_sid, int brace_depth,
-    uint16_t body_sid, uint32_t body_close_idx)
+    uint16_t body_sid, uint32_t body_close_idx, bool is_for_init)
 {
 	Token *init_tok = skip_noise(tok_next(open));
 	bool saw_raw = false;
@@ -7634,7 +7666,7 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 					bool eff_vla = (decl.is_vla && (!decl.paren_pointer || decl.paren_array)) ||
 						       (type.is_vla && !decl.is_pointer);
 					if (eff_vla && (!decl.is_pointer || decl.is_array) &&
-					    !type.has_register)
+					    !type.has_register && is_for_init)
 						error_tok(decl.var_name, ERR_INIT_STMT_VLA);
 				}
 			}
@@ -8404,10 +8436,10 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		t = p1_skip_decl_raw(t, &decl_raw);
 		DeclResult decl = parse_declarator(t, false);
 		if (!decl.var_name || !decl.end) {
-			// Detect GNU nested function definitions
-			// inside functions using defer/zeroinit.
-			// Skip when storage class was seen — GCC nested functions
-			// cannot have extern/static/register/_Thread_local.
+			// Detect GNU nested function definitions inside outer
+			// functions that USE prism transforms (defer).  Plain GNU
+			// nested functions in functions without defer are valid
+			// and passed through verbatim.
 			if (cur_func >= 0 && brace_depth > 0 &&
 			    FEAT(F_DEFER) && decl.var_name && !saw_static) {
 				Token *p = skip_noise(tok_next(decl.var_name));
@@ -8428,12 +8460,32 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 						nested = b && match_ch(b, '{') &&
 							 is_knr_params(tok_next(tok_match(p)), b);
 					}
-					if (nested)
-						error_tok(decl.var_name,
-							  "nested function definitions are not "
-							  "supported inside functions using "
-							  "defer/zeroinit — move the function "
-							  "outside or use a function pointer");
+					if (nested) {
+						// Only reject if the OUTER function uses
+						// `defer` (the transform that conflicts
+						// with GCC nested-function semantics).
+						// Forward-scan the entire outer function
+						// body for any `defer` keyword.
+						bool outer_uses_defer = false;
+						Token *fn_open = func_meta[cur_func].body_open;
+						Token *fn_close = fn_open ? tok_match(fn_open) : NULL;
+						if (fn_open && fn_close) {
+							for (Token *s = tok_next(fn_open);
+							     s && s != fn_close && s->kind != TK_EOF;
+							     s = tok_next(s)) {
+								if (is_defer_kw(s, NULL)) {
+									outer_uses_defer = true;
+									break;
+								}
+							}
+						}
+						if (outer_uses_defer)
+							error_tok(decl.var_name,
+								  "nested function definitions are not "
+								  "supported inside functions using "
+								  "defer/zeroinit — move the function "
+								  "outside or use a function pointer");
+					}
 				}
 			}
 			break;
@@ -8453,13 +8505,29 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 			annotated = true;
 		}
 
-		// Phase 1D: reject unbraced declaration in switch body
-		if (FEAT(F_ZEROINIT) && brace_depth > 0 && !decl_raw &&
-		    braceless_close_idx == 0 &&
-		    cur_sid < scope_tree_count && scope_tree[cur_sid].is_switch)
-			SAFETY_DIAG(type_tok,
-				    "variable declaration directly in switch body without braces "
-				    "(zero-init may be skipped by case labels); wrap in braces or use 'raw'");
+		// Phase 1D: reject unbraced declaration in switch body.
+		// Only the "plain auto, no init" trapdoor (e.g., `case 1: int z;`)
+		// is reported here.  Storage-class, typedef, struct/union/enum
+		// reference, register, _Alignas, _Atomic, _Thread_local, constexpr,
+		// or any explicit `=` initializer signal an explicit user intent
+		// and Prism does not synthesise zero-init that could be skipped.
+		// Actual case-skips-decl violations are caught by the CFG verifier
+		// (P1K_CASE handler).
+		{
+			bool has_init = match_ch(decl.end, '=');
+			bool has_explicit_intent =
+			    has_init || decl_raw || saw_static ||
+			    type.is_typedef || type.is_struct || type.is_enum ||
+			    type.has_static || type.has_extern || type.has_thread_local ||
+			    type.has_register || type.has_atomic || type.has_constexpr ||
+			    type.has_alignas;
+			if (FEAT(F_ZEROINIT) && brace_depth > 0 && !has_explicit_intent &&
+			    braceless_close_idx == 0 &&
+			    cur_sid < scope_tree_count && scope_tree[cur_sid].is_switch)
+				SAFETY_DIAG(type_tok,
+					    "variable declaration directly in switch body without braces "
+					    "(zero-init may be skipped by case labels); wrap in braces or use 'raw'");
+		}
 
 		// Phase 1C: shadow detection
 		bool did_shadow = false;
@@ -8631,9 +8699,13 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 			TYPEDEF_ADD_IDX(typedef_add_vla_var(tok_loc(decl.var_name), decl.var_name->len, brace_depth), decl.var_name);
 		}
 
-		// Phase 1D: record declaration entry
+		// Phase 1D: record declaration entry.
+		// Skip struct/union body fields — they are type members, not
+		// runtime-initialized objects, and must not block computed/asm
+		// goto's "function contains zero-initialized declarations" gate.
 		bool decl_is_func_type = decl.is_func_decl || is_typeof_func_type(type_tok, &type, &decl);
-		if (cur_func >= 0 && decl.var_name && brace_depth > 0 && !decl_is_func_type) {
+		bool in_aggregate_body = cur_sid > 0 && cur_sid < scope_tree_count && scope_tree[cur_sid].is_struct;
+		if (cur_func >= 0 && decl.var_name && brace_depth > 0 && !decl_is_func_type && !in_aggregate_body) {
 			P1FuncEntry *e = p1_alloc(P1K_DECL, cur_sid, decl.var_name);
 			e->decl.has_init = has_init;
 			e->decl.is_vla = type.is_vla || decl.is_vla;
@@ -9495,7 +9567,7 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 					uint16_t cur_sid = CUR_SID();
 					uint16_t body_sid = find_body_scope_id(body_start_for);
 					p1_scan_init_shadows(for_open, for_init_end, body_end_idx, cur_sid, brace_depth,
-							     body_sid, body_end_idx);
+							     body_sid, body_end_idx, /*is_for_init=*/true);
 				}
 			}
 		}
@@ -9532,7 +9604,7 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 						}
 					}
 					p1_scan_init_shadows(is_open, is_init_end, body_end_idx, cur_sid, brace_depth,
-							     body_sid, body_end_idx);
+							     body_sid, body_end_idx, /*is_for_init=*/false);
 				}
 			}
 		}
@@ -9803,8 +9875,38 @@ static void cfg_check_range(P1FuncEntry *ents,
 	}
 	if (first_vla)        { bad_decl = first_vla->tok;  bad_decl_is_vla = true; }
 	else if (first_init)  { bad_decl = first_init->tok; bad_decl_has_init = true; }
-	else if (first_other && FEAT(F_ZEROINIT))
-		bad_decl = first_other->tok;
+	else if (first_other && FEAT(F_ZEROINIT)) {
+		// Plain `int x;` (no user initializer) skipped by the goto.
+		// Prism's auto-zero-init might be bypassed, leaving x with
+		// indeterminate value.  C itself accepts this — the variable
+		// is simply uninitialized.  When the user clearly takes over
+		// initialization themselves (the first reference after the
+		// label is a plain `name = expr;` assignment), the goto target
+		// is well-defined and Prism does not block it.  Otherwise the
+		// indeterminate read is reported.
+		Token *lname = first_other->tok;
+		Token *t = &token_pool[label->token_index];
+		// Advance past `name :` or `name [[attr]]:` of the label.
+		while (t && t->kind != TK_EOF && !match_ch(t, ':')) t = tok_next(t);
+		if (t) t = tok_next(t);
+		bool assigned_first = false;
+		int bd = 0;
+		while (t && t->kind != TK_EOF) {
+			if (match_ch(t, '{')) { bd++; t = tok_next(t); continue; }
+			if (match_ch(t, '}')) { if (bd == 0) break; bd--; t = tok_next(t); continue; }
+			if (t->kind == TK_IDENT && t->len == lname->len &&
+			    !memcmp(tok_loc(t), tok_loc(lname), lname->len)) {
+				Token *n = tok_next(t);
+				// Plain `=` (single-char) — write without prior read.
+				// Compound (`+=`, `==`, subscript, deref, member, call)
+				// counts as a read of an indeterminate value.
+				if (n && match_ch(n, '=')) assigned_first = true;
+				break;
+			}
+			t = tok_next(t);
+		}
+		if (!assigned_first) bad_decl = first_other->tok;
+	}
 
 	if (bad_defer)
 		cfg_report_goto(bad_defer,
@@ -9867,7 +9969,7 @@ static void p1_verify_cfg(void) {
 					blocker = "variable-length arrays";
 				else if (ents[i].kind == P1K_DECL && FEAT(F_ZEROINIT) &&
 				    !ents[i].decl.has_raw && !ents[i].decl.is_static_storage &&
-				    !ents[i].decl.is_vla)
+				    !ents[i].decl.is_vla && !ents[i].decl.has_init)
 					blocker = "zero-initialized declarations";
 				if (blocker)
 					error_tok(fm->body_open, fmt, jump_kind, blocker);

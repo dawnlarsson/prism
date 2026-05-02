@@ -2093,16 +2093,20 @@ static void test_vla_typedef_struct_tag_memset(void) {
 static void test_c23_if_initializer_zeroinit_dropped(void) {
 	/* FIX: Prism now treats if/switch opening parens like for() parens
 	 * so that C23 initializer declarations get proper zero-initialization.
-	 * Scalars get = 0, VLAs get an error (same as for-init). */
+	 * Scalars get = 0.  VLAs in if/switch-init are valid C23 and Prism
+	 * accepts them: the variable simply remains uninitialized (matching
+	 * plain C semantics), since auto-memset cannot land between the
+	 * controlling expression and the body.  for-init VLAs remain
+	 * rejected (same constraint, but no equivalent C23 escape hatch). */
 
-	/* --- VLA inside if-initializer: rejected (can't inject memset) --- */
+	/* --- VLA inside if-initializer: accepted, left uninitialized --- */
 	const char *vla_code =
 	    "void f(int n) {\n"
 	    "    if (int arr[n]; n > 0) { (void)arr; }\n"
 	    "}\n";
 	PrismResult r1 = prism_transpile_source(vla_code, "c23_if_vla.c", prism_defaults());
-	CHECK(r1.status != PRISM_OK,
-	      "c23-if-vla-zeroinit: VLA in if-initializer must be rejected");
+	CHECK(r1.status == PRISM_OK,
+	      "c23-if-vla-zeroinit: VLA in if-initializer is accepted (uninitialized)");
 	prism_free(&r1);
 
 	/* --- Scalar inside if-initializer: gets = 0 --- */

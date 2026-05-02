@@ -2353,6 +2353,7 @@ typedef struct {
 	bool has_constexpr : 1;   // C23 'constexpr'
 	bool has_thread_local : 1; // _Thread_local, thread_local, __thread
 	bool has_volatile_member : 1; // Struct/union has volatile-qualified fields
+	bool has_alignas : 1;	      // _Alignas(...) / alignas(...) appeared in the type
 	bool is_array : 1;	      // Array type from typeof()/typeof_unqual/_Atomic(...) (not declarator [])
 	bool type_vm : 1;	      // Any VM dimension in typeof/_Atomic parens (incl. ptr-to-VLA)
 	uint8_t type_array_rank;      // Dimension count for is_array (multi-dim typeof)
@@ -3623,6 +3624,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 
 		if (tag & (TT_BITINT | TT_ATTR | TT_ALIGNAS)) {
 			if (tag & TT_BITINT) r.saw_type = true;
+			if (tag & TT_ALIGNAS) r.has_alignas = true;
 			Token *kw = tok;
 			tok = tok_next(tok);
 			if (tok && match_ch(tok, '(')) {
