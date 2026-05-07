@@ -1,13 +1,13 @@
 ![Prism Banner](https://github.com/user-attachments/assets/051187c2-decd-497e-9beb-b74031eb84ed)
 
-![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-6007%2B_pass-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
+![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-6053%2B_pass-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
 
 ## Robust C by default
 **A dialect of C with `defer`, `orelse`, automatic zero-initialization, bounds checking, and progressive optimization.**
 
 Prism is a lightweight and very fast transpiler that makes C safer and faster without changing how you write it.
 
-- **6007+ tests** — edge cases, control flow, nightmares, trying hard to break Prism
+- **6053+ tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Two-pass transpiler** — full semantic analysis before a single byte is emitted
 - **Progressive optimization** — auto-unreachable after noreturn calls, const arrays promoted to static storage
@@ -470,7 +470,7 @@ Not:
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
 
 ```sh
-Prism v1.1.4 - Robust C transpiler
+Prism v1.1.5 - Robust C transpiler
 
 Usage: prism [options] source.c... [-o output]
        prism [options] run src.c [-- prog_args...]
@@ -494,6 +494,7 @@ Prism Flags (consumed, not passed to CC):
   -fno-link-pragma       Ignore #pragma link directives in source
   --prism-cc=<compiler>  Use specific compiler
   --prism-verbose        Show commands
+  --prism-prof           Print per-phase timing breakdown
   --                     Separator: remaining args are passed to the binary in `run` mode
 
 All other flags are passed through to CC.

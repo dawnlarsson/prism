@@ -40,6 +40,95 @@ static void test_basic_transpile(void) {
 	free(path);
 }
 
+static void test_emit_decl_not_fused_after_stmt_boundary(void) {
+	printf("\n--- Emit: decl not fused after ; or } (misleading-indentation family) ---\n");
+
+	const char *code =
+	    "void repro_continue_raw(int skip)\n"
+	    "{\n"
+	    "        while (1)\n"
+	    "        {\n"
+	    "                if (skip)\n"
+	    "                        continue;\n"
+	    "                raw char buf_cont[4];\n"
+	    "                (void)buf_cont[0];\n"
+	    "                break;\n"
+	    "        }\n"
+	    "}\n"
+	    "void repro_return_raw(int early)\n"
+	    "{\n"
+	    "        if (early)\n"
+	    "                return;\n"
+	    "        raw char buf_ret[4];\n"
+	    "        (void)buf_ret[0];\n"
+	    "}\n"
+	    "void repro_break_raw(void)\n"
+	    "{\n"
+	    "        while (1) {\n"
+	    "                if (1)\n"
+	    "                        break;\n"
+	    "                raw char buf_brk[4];\n"
+	    "                (void)buf_brk[0];\n"
+	    "                break;\n"
+	    "        }\n"
+	    "}\n"
+	    "void repro_goto_raw(void)\n"
+	    "{\n"
+	    "repro_lab:\n"
+	    "        if (1)\n"
+	    "                goto repro_lab;\n"
+	    "        raw char buf_go[4];\n"
+	    "        (void)buf_go[0];\n"
+	    "}\n"
+	    "void repro_brace_then_decl(void)\n"
+	    "{\n"
+	    "        while (1) {\n"
+	    "                if (1) {\n"
+	    "                        continue;\n"
+	    "                }\n"
+	    "                raw char buf_brace[4];\n"
+	    "                (void)buf_brace[0];\n"
+	    "                break;\n"
+	    "        }\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "fusion_repro.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "fusion repro transpiles");
+	CHECK(r.output != NULL, "fusion repro has output");
+	CHECK(strstr(r.output, "continue; char") == NULL,
+	      "output must not fuse continue; and char on one line");
+	CHECK(strstr(r.output, "return; char") == NULL,
+	      "output must not fuse return; and char on one line");
+	CHECK(strstr(r.output, "break; char") == NULL,
+	      "output must not fuse break; and char on one line");
+	CHECK(strstr(r.output, "repro_lab; char") == NULL,
+	      "output must not fuse goto label; and char on one line");
+	CHECK(strstr(r.output, "} char") == NULL,
+	      "output must not fuse } and char decl on one line");
+	prism_free(&r);
+}
+
+/* Regression: decl-boundary newline must not fire inside anonymous aggregates
+ * emitted through balanced walkers (typeof); see ctx->aggregate_member_nest. */
+static void test_emit_aggregate_typeof_no_member_line_split(void) {
+	printf("\n--- Emit: typeof aggregate members not split by newline heuristic ---\n");
+
+	const char *code =
+	    "int k(void) {\n"
+	    "    if (typeof_unqual(union { int a; long b; }) u; 1) return u.a;\n"
+	    "    return 0;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "agg_typeof_if.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "agg typeof if-init transpiles");
+	CHECK(r.output != NULL, "agg typeof has output");
+	CHECK(strstr(r.output, "union { int a; long b; }") != NULL,
+	      "anonymous union in typeof must stay one line (no ; long split)");
+	prism_free(&r);
+}
+
 static void test_defer_transpile(void) {
 	printf("\n--- Defer Transpile Tests ---\n");
 
@@ -3333,6 +3422,52 @@ static void test_volatile_orelse_no_double_eval(void) {
 		// The ternary pattern "? hw_register" would mean a double read
 		CHECK(strstr(r.output, "? hw_register") == NULL,
 		      "volatile orelse: no ternary double-read pattern");
+	}
+	prism_free(&r);
+}
+
+static void test_volatile_orelse_decl_braced_if_body(void) {
+	printf("\n--- Volatile Orelse Decl: Braced If Assignment ---\n");
+
+	const char *code =
+	    "volatile int *g(void);\n"
+	    "void f(void) {\n"
+	    "    volatile int *p = g() orelse 0;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "volatile_orelse_decl.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "volatile orelse decl: transpiles OK");
+	if (r.output) {
+		CHECK(strstr(r.output, "if (!") != NULL,
+		      "volatile orelse decl: uses negated guard");
+		CHECK(strstr(r.output, ") {") != NULL,
+		      "volatile orelse decl: braced if body (misleading-indentation hygiene)");
+	}
+	prism_free(&r);
+}
+
+static void test_atomic_orelse_decl_braced_if_body(void) {
+	printf("\n--- Atomic Orelse Decl: Braced If Assignment ---\n");
+
+	const char *code =
+	    "typedef _Atomic(int*) atomic_iptr_t;\n"
+	    "atomic_iptr_t g(void);\n"
+	    "void f(void) {\n"
+	    "    atomic_iptr_t p = g() orelse 0;\n"
+	    "}\n";
+
+	PrismFeatures feat = prism_defaults();
+	PrismResult r = prism_transpile_source(code, "atomic_orelse_decl.c", feat);
+	CHECK_EQ(r.status, PRISM_OK, "atomic orelse decl: transpiles OK");
+	CHECK(r.output != NULL, "atomic orelse decl has output");
+	if (r.output) {
+		CHECK(strstr(r.output, "if (!") != NULL,
+		      "atomic orelse decl: uses negated guard");
+		CHECK(strstr(r.output, ") {") != NULL,
+		      "atomic orelse decl: braced if body (single-eval / no ternary double-read)");
+		CHECK(strstr(r.output, "? p") == NULL && strstr(r.output, "? __prism") == NULL,
+		      "atomic orelse decl: no ternary read of atomic LHS");
 	}
 	prism_free(&r);
 }
@@ -7483,6 +7618,8 @@ void run_api_tests_1(void) {
 
 	test_lib_defaults();
 	test_basic_transpile();
+	test_emit_decl_not_fused_after_stmt_boundary();
+	test_emit_aggregate_typeof_no_member_line_split();
 	test_defer_transpile();
 	test_feature_flags();
 	test_error_handling();
@@ -7555,6 +7692,8 @@ void run_api_tests_2(void) {
 	test_cc_splitting();
 	test_attribute_preserved_on_orelse_split();
 	test_volatile_orelse_no_double_eval();
+	test_volatile_orelse_decl_braced_if_body();
+	test_atomic_orelse_decl_braced_if_body();
 	test_builtin_memset_for_typeof_vla();
 	test_typeof_vla_with_paren_dim_still_memsets();
 	test_const_orelse_attr_preserved();

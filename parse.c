@@ -405,6 +405,7 @@ typedef struct PrismContext {
 	int dep_flags_count;
 	int scope_depth;
 	int block_depth;
+	int aggregate_member_nest; // `{` after struct/union/enum kw (expr/type contexts without scope push)
 
 	bool last_system_header;
 	int last_line_no;
@@ -2405,6 +2406,7 @@ typedef struct {
 	bool is_func : 1;
 	bool is_param : 1;
 	bool has_volatile_member : 1;
+	bool is_atomic : 1; // _Atomic(...) spelling baked into this typedef name
 	bool is_struct_tag : 1; // struct/union tag (not a typedef name)
 	bool array_dim_complete : 1; // array typedef: sizeof(T)/sizeof(T[0]) valid at uses
 	uint8_t array_rank;	// # of array dimensions (0 if not array);
@@ -2443,7 +2445,22 @@ enum {
 #define tok_ann(t) ((t)->ann)
 
 // Typedef query flags (single lookup, check multiple properties)
-enum { TDF_TYPEDEF = 1, TDF_VLA = 2, TDF_VOID = 4, TDF_ENUM_CONST = 8, TDF_CONST = 16, TDF_PTR = 32, TDF_ARRAY = 64, TDF_AGGREGATE = 128, TDF_FUNC = 256, TDF_PARAM = 512, TDF_VOLATILE = 1024, TDF_HAS_VOL_MEMBER = 2048, TDF_UNION = 4096 };
+enum {
+	TDF_TYPEDEF	   = 1,
+	TDF_VLA		   = 2,
+	TDF_VOID	   = 4,
+	TDF_ENUM_CONST	   = 8,
+	TDF_CONST	   = 16,
+	TDF_PTR		   = 32,
+	TDF_ARRAY	   = 64,
+	TDF_AGGREGATE	   = 128,
+	TDF_FUNC	   = 256,
+	TDF_PARAM	   = 512,
+	TDF_VOLATILE	   = 1024,
+	TDF_HAS_VOL_MEMBER = 2048,
+	TDF_UNION	   = 4096,
+	TDF_ATOMIC	   = 8192,
+};
 
 // Spread a typedef's TDF_* flag bag onto a TypeSpecResult.is_typedef path.
 // Two parse_type_specifier sites need this; centralizing keeps them in
@@ -2455,6 +2472,7 @@ static inline void typedef_apply_tdf_flags(TypeSpecResult *r, int tflags) {
 	if (tflags & TDF_UNION)           r->is_union = true;
 	if (tflags & TDF_VOLATILE)        r->has_volatile = true;
 	if (tflags & TDF_HAS_VOL_MEMBER)  r->has_volatile_member = true;
+	if (tflags & TDF_ATOMIC)	     r->has_atomic = true;
 }
 
 #define FEAT(f) (ctx->features & (f))
@@ -2624,6 +2642,7 @@ typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool i
 	e->is_param = false;
 	e->array_rank = 0;
 	e->array_dim_complete = true;
+	e->is_atomic = false;
 	e->prev_index = typedef_get_index(name, len);
 	e->token_index = 0;
 	e->scope_open_idx = td_scope_open;
@@ -2696,7 +2715,7 @@ static inline PRISM_PURE int typedef_flags(Token *tok) {
 	       (e->is_ptr ? TDF_PTR : 0) |
 	       (e->is_array ? TDF_ARRAY : 0) | (e->is_aggregate ? TDF_AGGREGATE : 0) |
 	       (e->is_func ? TDF_FUNC : 0) | (e->has_volatile_member ? TDF_HAS_VOL_MEMBER : 0) |
-	       (e->is_union ? TDF_UNION : 0);
+	       (e->is_union ? TDF_UNION : 0) | (e->is_atomic ? TDF_ATOMIC : 0);
 }
 
 // After Pass 1 annotation, is_known_typedef becomes O(1) bit check.
@@ -3830,6 +3849,8 @@ static void parse_typedef_declaration(Token *tok, int scope_depth) {
 					added->is_union = true;
 				if (decl.is_func_decl)
 					added->is_func = true;
+				if (type_spec.has_atomic)
+					added->is_atomic = true;
 				if (!decl.end) {
 					Token *after_name = skip_noise(tok_next(decl.var_name));
 					if (after_name && match_ch(after_name, '('))

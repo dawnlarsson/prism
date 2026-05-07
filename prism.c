@@ -1,4 +1,4 @@
-#define PRISM_VERSION "1.1.4"
+#define PRISM_VERSION "1.1.5"
 
 #ifndef _WIN32
 #ifndef _GNU_SOURCE
@@ -384,7 +384,8 @@ static PRISM_THREAD_LOCAL int pp_define_bufs_cap = 0;
 
 // Forward declarations (only for functions used before their definition)
 static Token *emit_expr_to_semicolon(Token *tok);
-static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bool has_volatile, Token *stop_comma);
+static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bool single_eval_lhs,
+				 Token *stop_comma);
 static Token *emit_return_body(Token *tok, Token *stop);
 static Token *try_zero_init_decl(Token *tok);
 static Token *find_bare_orelse(Token *tok);
@@ -475,6 +476,7 @@ static void p1_register_param_shadows(Token *open, Token *close,
 static void reset_transpiler_state(void) {
 	ctx->scope_depth = 0;
 	ctx->block_depth = 0;
+	ctx->aggregate_member_nest = 0;
 	ctx->last_line_no = 0;
 	ctx->ret_counter = 0;
 	clear_func_ret_type();
@@ -914,6 +916,35 @@ static void defer_add(Token *defer_keyword, Token *start, Token *end) {
 
 // --- Token Emission ---
 
+// After `;` or `}`, joining the next token with only a space can fuse what
+// Clang treats as a misleading “substatement vs next statement” boundary
+// (-Wmisleading-indentation under -Wall), e.g. `continue; char buf[4];`,
+// `break; int x;`, `goto lab; T y;`, or `} char buf[4];` after a braced then-arm.
+// Force a newline when the next token begins a declaration but was not already
+// at source BOL (where TF_AT_BOL preserves the author's line break).
+static inline bool emit_token_starts_decl_like(Token *tok) {
+	if (!tok) return false;
+	if (tok->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_TYPEDEF | TT_INLINE |
+			TT_TYPEOF | TT_ALIGNAS | TT_BITINT))
+		return true;
+	if (is_type_keyword(tok) || is_known_typedef(tok)) return true;
+	if (is_c23_attr(tok)) return true;
+	if ((tok->tag & TT_ATTR) && tok_next(tok) && match_ch(tok_next(tok), '(')) return true;
+	return false;
+}
+
+static inline bool emit_newline_before_decl_after_stmt_boundary(Token *prev, Token *tok) {
+	if (!prev || !tok) return false;
+	// Member declarations in struct/union/enum bodies use `;` between specifiers;
+	// inserting newlines there splits e.g. `union { int a; long b; }` and breaks
+	// stable substring expectations (and is unnecessary for misleading-indentation).
+	if (ctx->aggregate_member_nest > 0) return false;
+	if (in_struct_body()) return false;
+	if (tok_at_bol(tok)) return false;
+	if (!(match_ch(prev, ';') || match_ch(prev, '}'))) return false;
+	return emit_token_starts_decl_like(tok);
+}
+
 static PRISM_HOT void emit_tok(Token *tok) {
 	TokenCold *c = tok_cold(tok);
 	File *f = (c->file_idx < (uint32_t)ctx->input_file_count)
@@ -926,6 +957,8 @@ static PRISM_HOT void emit_tok(Token *tok) {
 
 	if (__builtin_expect(!(feat & F_FLATTEN) && f->is_system && f->is_include_entry, 0)) return;
 
+	Token *prev_emitted = last_emitted;
+
 	bool need_line = false;
 	char *tok_fname = NULL;
 	int line_no = 0;
@@ -937,7 +970,8 @@ static PRISM_HOT void emit_tok(Token *tok) {
 			    (line_no != ctx->last_line_no && line_no != ctx->last_line_no + 1);
 	}
 
-	if (tok_at_bol(tok) || need_line) out_char('\n');
+	if (tok_at_bol(tok) || need_line || emit_newline_before_decl_after_stmt_boundary(last_emitted, tok))
+		out_char('\n');
 	else if ((tok->flags & TF_HAS_SPACE) || needs_space(last_emitted, tok))
 		out_char(' ');
 
@@ -993,6 +1027,10 @@ static PRISM_HOT void emit_tok(Token *tok) {
 
 	out_str(loc, tok->len);
 	last_emitted = tok;
+	if (prev_emitted && match_ch(tok, '{') && (prev_emitted->tag & TT_SUE))
+		ctx->aggregate_member_nest++;
+	else if (match_ch(tok, '}') && ctx->aggregate_member_nest > 0)
+		ctx->aggregate_member_nest--;
 }
 
 // Emit a token, automatically stripping 'raw' keywords.
@@ -3832,7 +3870,7 @@ static Token *emit_orelse_block_body(Token *tok) {
 
 // const + fallback orelse: roll back speculative output, re-emit with temp variable.
 // MSVC-compatible: instead of "const T x = val ?: fallback;",
-// emit: "T __prism_oe_N = (val); if (!__prism_oe_N) __prism_oe_N = (fallback); const T x = __prism_oe_N;"
+// emit: "T __prism_oe_N = (val); if (!__prism_oe_N) { __prism_oe_N = (fallback); } const T x = __prism_oe_N;"
 // Handles chained orelse naturally: each chain link adds another if-assignment on the temp.
 // Returns token after fallback expression (at ';' or boundary comma).
 static Token *handle_const_orelse_fallback(Token *tok,
@@ -4413,7 +4451,9 @@ static bool process_init_orelse_hit(Token **tok_p, DeclResult *decl,
 			  "orelse on struct/union values is not supported (memcmp "
 			  "cannot reliably detect zero due to padding)");
 	tok = emit_orelse_action(
-	    tok, decl->var_name, target.has_const_qual, type->has_volatile, target.stop_comma);
+	    tok, decl->var_name, target.has_const_qual,
+	    type->has_volatile || type->has_atomic,
+	    target.stop_comma);
 
 	if (target.stop_comma && match_ch(tok, ',')) {
 		*tok_p = tok_next(tok);
@@ -5194,7 +5234,8 @@ static Token *emit_return_body(Token *tok, Token *stop) {
 	return tok;
 }
 
-static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bool has_volatile, Token *stop_comma) {
+static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bool single_eval_lhs,
+				 Token *stop_comma) {
 	require_orelse_action(tok, stop_comma);
 
 	if (match_ch(tok, '{')) {
@@ -5230,8 +5271,8 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bo
 	if (!var_name) error_tok(tok, "orelse fallback requires an assignment target (use a declaration)");
 	if (has_const) error_tok(tok, "orelse fallback cannot reassign a const-qualified variable");
 
-	if (has_volatile) {
-		// Volatile: use if-based pattern to avoid double-read.
+	if (single_eval_lhs) {
+		// Volatile / _Atomic: use if-based pattern to avoid double-read of LHS.
 		// `&(T){init}` in the if-substatement has statement scope (C11 §6.8.4.1p2);
 		// assigning its address to a volatile pointer outlives the literal — reject.
 		Token *probe = tok;
@@ -5243,7 +5284,7 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bo
 					Token *br = tok_next(rp);
 					if (match_ch(br, '{') && (br->flags & TF_OPEN))
 						error_tok(probe,
-							  "volatile pointer: address of compound literal in "
+							  "volatile/atomic pointer: address of compound literal in "
 							  "'orelse' outlives the literal; use block form "
 							  "`orelse { ... }` with a named object, or a "
 							  "non-literal fallback");
@@ -5252,7 +5293,7 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bo
 		}
 		OUT_LIT(" if (!");
 		OUT_TOK(var_name);
-		OUT_LIT(") ");
+		OUT_LIT(") { ");
 		OUT_TOK(var_name);
 		OUT_LIT(" =");
 	} else {
@@ -5267,10 +5308,16 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bo
 	Token *chain_next;
 	tok = emit_orelse_fallback_value(tok, stop_comma, &chain_next);
 	if (chain_next) {
-		out_char(';');
-		return emit_orelse_action(chain_next, var_name, has_const, has_volatile, stop_comma);
+		if (single_eval_lhs)
+			OUT_LIT("; }");
+		else
+			out_char(';');
+		return emit_orelse_action(chain_next, var_name, has_const, single_eval_lhs, stop_comma);
 	}
-	out_char(';');
+	if (single_eval_lhs)
+		OUT_LIT("; }");
+	else
+		out_char(';');
 	if (match_ch(tok, ';')) tok = tok_next(tok);
 	end_statement_after_semicolon();
 	return tok;
@@ -5439,6 +5486,7 @@ static Token *handle_open_brace(Token *tok) {
 	uint16_t ann = tok_ann(tok);
 	bool is_init_scope = is_initializer || (ann & P1_SCOPE_INIT);
 	Token *brace_tok = tok;
+	Token *tok_before_brace = last_emitted;
 	emit_tok(tok); tok = tok_next(tok);
 	scope_push_kind(is_init_scope ? SCOPE_INIT : SCOPE_BLOCK);
 
@@ -5449,6 +5497,11 @@ static Token *handle_open_brace(Token *tok) {
 	if (did_push)
 		s->is_ctrl_se = true;
 	if (is_init_scope) s->is_struct = true;
+	/* Anonymous / keyword-headed aggregate: `union {`, `struct {`, `enum {`.
+	 * Phase 1 scope lookup may not associate every `{` token (e.g. inside
+	 * typeof(type)); without is_struct, in_struct_body() is false and the
+	 * decl-boundary newline heuristic splits member lists. */
+	if (tok_before_brace && (tok_before_brace->tag & TT_SUE)) s->is_struct = true;
 
 	// Phase 1A may have classified this as a struct-like scope
 	// (e.g. Objective-C @interface ivar blocks) that couldn't be
@@ -10813,6 +10866,7 @@ PRISM_API void prism_reset(void) {
 
 	ctx->scope_depth = 0;
 	ctx->block_depth = 0;
+	ctx->aggregate_member_nest = 0;
 
 	system_includes_reset();
 
