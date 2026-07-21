@@ -7758,6 +7758,51 @@ static void test_orelse_ctrl_paren_stmt_action_rejected(void) {
 	prism_free(&r);
 }
 
+/* Phase 1D )-arm used walk_back_past_noise, which jumps }→{ and )→(, so
+ * `} (expr) orelse` after a braced if/while/switch (and braceless
+ * `if (c) (expr) orelse`) re-armed at_stmt_start on 'orelse' itself. */
+static void test_paren_led_bare_orelse_after_ctrl(void) {
+	static const char *cases[] = {
+		"int get(void);\n"
+		"void f(int c) {\n"
+		"    if (c) { }\n"
+		"    (get()) orelse return;\n"
+		"}\n",
+		"int get(void);\n"
+		"void f(int c) {\n"
+		"    while (c) { }\n"
+		"    (get()) orelse return;\n"
+		"}\n",
+		"int get(void);\n"
+		"void f(int c) {\n"
+		"    switch (c) { default: break; }\n"
+		"    (get()) orelse return;\n"
+		"}\n",
+		"int get(void);\n"
+		"void f(int c) {\n"
+		"    if (c) (get()) orelse return;\n"
+		"}\n",
+		"int get(void);\n"
+		"void f(int c) {\n"
+		"    if (c)\n"
+		"        (get()) orelse return;\n"
+		"}\n",
+	};
+	static const char *names[] = {
+		"after braced if",
+		"after braced while",
+		"after braced switch",
+		"paren-led braceless if body",
+		"paren-led braceless if body (newline)",
+	};
+	for (int i = 0; i < (int)(sizeof(cases) / sizeof(cases[0])); i++) {
+		PrismResult r = prism_transpile_source(cases[i], "oe_paren_ctrl.c",
+						       prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, names[i]);
+		prism_free(&r);
+	}
+}
+
 // orelse inside GNU __attribute__ and C23 [[...]] arguments leaked
 // verbatim to backend compiler. Phase 1D skip_noise jumped over attributes
 // without checking for TT_ORELSE; Pass 2 emit_range emitted attrs verbatim.
@@ -8587,6 +8632,7 @@ void run_orelse_tests(void) {
 
 	// orelse inside attribute arguments (GNU/C23) leaked to backend
 	test_orelse_ctrl_paren_stmt_action_rejected();
+	test_paren_led_bare_orelse_after_ctrl();
 	test_orelse_in_attribute_args();
 
 	// bracket orelse in expr context — Phase 1D must catch side effects

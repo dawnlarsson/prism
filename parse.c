@@ -120,6 +120,12 @@ static const char ERR_BRACKET_OE_VLA_INIT_STMT[] =
 	"control statement conditions (hoisted temps would "
 	"inject invalid syntax); move the declaration before "
 	"the statement";
+static const char ERR_ORELSE_FILE_SCOPE[] =
+	"'orelse' cannot be used in file-scope initializers "
+	"(requires runtime fallback code)";
+static const char ERR_ORELSE_STRUCT_VALUE[] =
+	"orelse on struct/union values is not supported "
+	"(memcmp cannot reliably detect zero due to padding)";
 static const char ERR_BRACKET_OE_ANON_AGG[] =
 	"bracket orelse / zero-init requiring declaration split "
 	"cannot be used with anonymous struct/union; "
@@ -286,6 +292,8 @@ enum {
 	TF_RAW = 1 << 6,      // 'raw' keyword
 	TF_SIZEOF = 1 << 7,   // sizeof, alignof, _Alignof
 	TF_SOFT_KW = 1 << 8,  // soft keyword usable as identifier (alignas, bool, …)
+	TF_STATIC_ASSERT = 1 << 9, // _Static_assert / static_assert
+	TF_MS_CC = 1 << 10,   // MSVC calling-convention keyword (__cdecl, …)
 };
 
 enum {
@@ -341,7 +349,7 @@ struct Token {
 	uint8_t  ch0;         // First source byte — avoids tok_loc() indirection in hot paths
 	uint8_t  _pad;        // Explicit padding to 24 bytes
 }; // 24 bytes
-_Static_assert(sizeof(struct Token) == 24, "Token must stay 24 bytes");
+typedef char prism_assert_token_24[(sizeof(struct Token) == 24) ? 1 : -1];
 
 typedef struct {
 	uint32_t loc_offset;  // Byte offset from File->contents
@@ -1015,8 +1023,8 @@ static void init_keyword_map(void) {
 		{"alignof", TT_SKIP_DECL, true, TF_SIZEOF | TF_SOFT_KW},
 		{"_Alignof", TT_SKIP_DECL, true, TF_SIZEOF},
 		{"_Generic", TT_SKIP_DECL | TT_GENERIC, true},
-		{"_Static_assert", TT_SKIP_DECL, true},
-		{"static_assert", TT_SKIP_DECL, true, TF_SOFT_KW},
+		{"_Static_assert", TT_SKIP_DECL, true, TF_STATIC_ASSERT},
+		{"static_assert", TT_SKIP_DECL, true, TF_SOFT_KW | TF_STATIC_ASSERT},
 		{"struct", TT_TYPE | TT_SUE, true},
 		{"union", TT_TYPE | TT_SUE, true},
 		{"enum", TT_TYPE | TT_SUE, true},
@@ -1701,6 +1709,16 @@ static Token *tokenize(File *file) {
 				} else
 					t->tag = (uint32_t)kw;
 				t->flags |= (uint16_t)(kw >> KW_FLAGS_SHIFT);
+			}
+			/* MSVC calling-convention keywords — flag once at tokenize. */
+			if (!(t->flags & TF_MS_CC) &&
+			    (t->ch0 == '_' || t->ch0 == 'c' || t->ch0 == 's')) {
+				if (equal(t, "__cdecl") || equal(t, "__stdcall") ||
+				    equal(t, "__fastcall") || equal(t, "__thiscall") ||
+				    equal(t, "__vectorcall") || equal(t, "_cdecl") ||
+				    equal(t, "_stdcall") || equal(t, "_fastcall") ||
+				    equal(t, "cdecl") || equal(t, "stdcall"))
+					t->flags |= TF_MS_CC;
 			}
 			p += ident_len;
 			continue;
@@ -2620,6 +2638,25 @@ static inline Token *walk_back_past_noise(uint32_t start_idx) {
 		}
 		if ((b->tag & TT_ATTR) || b->kind == TK_PREP_DIR) {
 			ti--;
+			continue;
+		}
+		return b;
+	}
+	return NULL;
+}
+/* Predecessor of token_pool[start_idx], skipping only attributes / prep dirs.
+ * Unlike walk_back_past_noise, does not jump TF_CLOSE→open groups — needed so
+ * `} (expr)` after `while (c) { }` is not mistaken for closing `while (`. */
+static inline Token *walk_back_skip_attr_noise(uint32_t start_idx) {
+	uint32_t ti = start_idx;
+	while (ti > 0) {
+		Token *b = &token_pool[ti - 1];
+		if ((b->tag & TT_ATTR) || b->kind == TK_PREP_DIR) {
+			ti--;
+			continue;
+		}
+		if (match_ch(b, ']') && tok_match(b) && (tok_match(b)->flags & TF_C23_ATTR)) {
+			ti = tok_idx(tok_match(b));
 			continue;
 		}
 		return b;
@@ -4048,20 +4085,24 @@ static Token *p1_knr_find_close_paren(Token *semi_tok) {
 
 // Probes past attributes/pragmas via skip_noise before checking TF_RAW,
 // matching Pass 2's process_declarators logic.
+// Returns the token after a stripable `raw` prefix, or NULL if not a decl-strip.
+static inline Token *raw_decl_strip_after(Token *probe) {
+	if (!probe || !(probe->flags & TF_RAW) || is_known_typedef(probe)) return NULL;
+	Token *after = skip_noise(tok_next(probe));
+	if (!after) return NULL;
+	if ((is_valid_varname(after) && !is_type_keyword(after) &&
+	     !is_known_typedef(after) && !(after->tag & (TT_QUALIFIER | TT_SUE))) ||
+	    match_ch(after, '*') || match_ch(after, '('))
+		return after;
+	return NULL;
+}
 static inline Token *p1_skip_decl_raw(Token *t, bool *saw_raw) {
-	Token *probe = skip_noise(t);
-	if ((probe->flags & TF_RAW) && !is_known_typedef(probe)) {
-		Token *after = skip_noise(tok_next(probe));
-		if (after && ((is_valid_varname(after) && !is_type_keyword(after) &&
-			       !is_known_typedef(after) && !(after->tag & (TT_QUALIFIER | TT_SUE))) ||
-			      match_ch(after, '*') || match_ch(after, '('))) {
-			while ((after->flags & TF_RAW) && !is_known_typedef(after))
-				after = skip_noise(tok_next(after));
-			*saw_raw = true;
-			return after;
-		}
-	}
-	return t;
+	Token *after = raw_decl_strip_after(skip_noise(t));
+	if (!after) return t;
+	while ((after->flags & TF_RAW) && !is_known_typedef(after))
+		after = skip_noise(tok_next(after));
+	*saw_raw = true;
+	return after;
 }
 static inline bool is_assignment_operator_token(Token *tok) {
 	return (tok->tag & TT_ASSIGN) && tok_loc(tok)[tok->len - 1] == '=';
