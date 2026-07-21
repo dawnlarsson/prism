@@ -6973,6 +6973,68 @@ static void test_defer_capture_shadow_stack_restore(void) {
 	prism_free(&r);
 }
 
+static void test_defer_calling_conv_ret_type(void) {
+	printf("\n--- defer + calling-convention return type ---\n");
+	/* Regression: function attrs / MS calling-conv keywords between return
+	 * type and name were copied onto `__prism_ret_N`. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "static int __attribute__((stdcall)) f(void) {\n"
+		    "    defer (void)0;\n"
+		    "    return 5;\n"
+		    "}\n"
+		    "int main(void) { return f() == 5 ? 0 : 1; }\n",
+		    "defer_cc_attr.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "defer+cc attr: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "__prism_ret") != NULL,
+			      "defer+cc attr: ret temp emitted");
+			CHECK(strstr(r.output, "__attribute__ ( ( stdcall ) ) __prism_ret") == NULL &&
+				  strstr(r.output, "__attribute__((stdcall)) __prism_ret") == NULL,
+			      "defer+cc attr: stdcall not on ret temp");
+		}
+		UNIX_ONLY(if (r.output) check_transpiled_output_compiles_and_runs(
+			      r.output, "defer+cc attr: compile", "defer+cc attr: run"));
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "static int __cdecl g(void) {\n"
+		    "    defer (void)0;\n"
+		    "    return 7;\n"
+		    "}\n"
+		    "int main(void) { return g() == 7 ? 0 : 1; }\n",
+		    "defer_cc_cdecl.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "defer+__cdecl: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "__cdecl __prism_ret") == NULL,
+			      "defer+__cdecl: cdecl not on ret temp");
+			CHECK(strstr(r.output, "int __prism_ret") != NULL,
+			      "defer+__cdecl: plain int ret temp");
+		}
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "static int * __attribute__((stdcall)) p(void) {\n"
+		    "    defer (void)0;\n"
+		    "    static int x;\n"
+		    "    return &x;\n"
+		    "}\n"
+		    "int main(void) { return p() != 0 ? 0 : 1; }\n",
+		    "defer_cc_ptr.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "defer+cc ptr: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "int * __prism_ret") != NULL ||
+				  strstr(r.output, "int* __prism_ret") != NULL,
+			      "defer+cc ptr: pointer preserved on ret temp");
+			CHECK(strstr(r.output, "__attribute__ ( ( stdcall ) ) __prism_ret") == NULL,
+			      "defer+cc ptr: stdcall not on ret temp");
+		}
+		prism_free(&r);
+	}
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_rejected();
@@ -7303,4 +7365,6 @@ void run_defer_tests(void) {
 	GNUC_ONLY(test_defer_body_enum_constant_shadow());
 
 	test_defer_capture_shadow_stack_restore();
+
+	test_defer_calling_conv_ret_type();
 }

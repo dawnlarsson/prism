@@ -1,7 +1,7 @@
 # Prism Transpiler Specification
 
 **Version:** 1.1.5
-**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (6053 tests in `prism run .github/test.c`, self-host stage1==stage2 in CI, zero failures).
+**Status:** Implemented — every item in this document corresponds to behavior that exists in the codebase and is exercised by the test suite (6122 tests in `prism run .github/test.c`, self-host stage1==stage2 in CI, zero failures).
 
 This document describes what the transpiler **does**, not what it aspires to do. It is organized in two parts: **Part I** covers the transpiler's architecture, internal processing model, and implementation details. **Part II** provides a formal language specification for Prism's extensions to C, described in terms of the C abstract machine independently of any implementation strategy.
 
@@ -1199,6 +1199,54 @@ void          prism_thread_cleanup(void);
 ```
 
 `prism_transpile_source` transpiles already-preprocessed source text without invoking `cc -E`. Useful for IDE integrations that preprocess separately.
+
+### Macro boundaries (preprocessor contract & optional markers)
+
+**Why Prism does not “see” macro expansions today.** In the normal CLI pipeline, Prism reads the host compiler’s **preprocessed** translation unit (`cc -E` output). All object-like and function-like macros have already been replaced by their expansions. Standard preprocessors do **not** emit a portable, machine-readable trace of *which* macro produced *which* token span inside that `.i` text. Prism therefore has no automatic, faithful map from expanded tokens back to macro names without either (a) owning or wrapping the preprocessor, or (b) relying on implementation-specific debugging hooks. That is a fundamental boundary, not a tokenizer oversight.
+
+**Contract (minimal).** Anything that must look like a structural token to Prism—`{`, `}`, loop keywords, labels relevant to defer/CFG, etc.—must appear **after** preprocessing (normal CLI) or must already appear as such in the buffer passed to `prism_transpile_source`. Calling `prism_transpile_source` on raw sources that still contain unexpanded macro “shape” is unsupported for defer/orelse/CFG guarantees; see also the regression notes in the parse suite for `#define`-defined braces without `cc -E`.
+
+**Optional sentinel comments (reserved convention).** For codebases that control their macros and want a **stable, grep-friendly** boundary—not automatic injection—macros MAY embed block comments in their **replacement lists** using this shape (whitespace inside the comment is flexible; the tokens `__PRISM_MACRO_BEGIN` / `__PRISM_MACRO_END` are literal):
+
+```
+/* __PRISM_MACRO_BEGIN id=<unsigned> name=<identifier> */
+/* __PRISM_MACRO_END   id=<unsigned> name=<identifier> */
+```
+
+**Rules:**
+
+- **`id` matches `id`.** Each `BEGIN`/`END` pair is tied by the same `id`. Nested expansions must use **distinct** `id` values so pairing is unambiguous (same macro name may expand inside itself or another macro).
+- **`name` is documentary.** It should match the macro the author intends, but **pairing is by `id` only** so nesting stays well-founded.
+- **Lexical placement.** Comments must sit only where a comment is valid in the **preprocessed** token stream (typically between tokens). They must not split an identifier, literal, or operator.
+- **Passthrough.** Because these are ordinary comments, they survive into `.i` / emitted C unless the user strips them; they do not change ISO semantics.
+- **Implementation status.** As of this SPEC revision, Prism **does not** interpret these markers in Phase 1/2; they are reserved for external tooling, future optional semantic hooks (e.g. synthetic scope accounting), or diagnostics. A future version may validate **LIFO** nesting of `id`s and warn on mismatch.
+
+This satisfies the “tag expansions” intent **without** requiring Prism to run its own cpp: the macro author places the sentinels **once** in the `#define` replacement; every expansion copies them around the hidden structure.
+
+### Macro taint table (design)
+
+**Idea.** Keep a **side structure** parallel to the preprocessed character buffer: half-open byte ranges `[start, end)` that were contributed by a macro expansion. During tokenization (or immediately after), each token’s `start`/`end` pointers resolve to buffer offsets; a lookup returns which macro(s) “tainted” that span. Nested expansions produce **nested** intervals; the natural query is **innermost range wins** (stack or interval tree keyed by offset).
+
+**Suggested record shape (conceptual).**
+
+| Field | Role |
+|-------|------|
+| `start`, `end` | Offsets into the **same** `File::contents` buffer the tokenizer uses (half-open). |
+| `macro_id` | Interned name or stable hash of the macro **definition** symbol. |
+| `depth` | Nesting level (optional; derivable from overlap structure). |
+| `invocation` | Optional: spelling location in **logical** source if the preprocessor supplies it (file/line/column before expansion). |
+
+**Lookup cost.** Sort ranges by `start` once; per token, binary search + walk nested overlaps O(k) for k small; or build a flat “active stack” during a single left-to-right merge pass if ranges are emitted in source order.
+
+**Critical dependency: where do ranges come from?** The taint table is only as good as its producer. **Plain `cc -E` text does not contain expansion boundaries**, so Prism cannot infer accurate `[start,end)` spans from the `.i` stream alone. Populating the table **automatically** requires one of:
+
+1. **Preprocessor with callbacks** (e.g. libclang/libTooling macro-expansion hooks, or another CPP that reports each expansion’s expanded character range in the preprocessed output).
+2. **Sidecar file** from a compiler plugin / custom `-E` front-end that records spans aligned with the same buffer Prism tokenizes.
+3. **Synthetic ranges** from tokenizer-visible anchors—e.g. parsing the reserved `__PRISM_MACRO_BEGIN` / `__PRISM_MACRO_END` comments into intervals (author-placed, but **no** separate cpp fork).
+
+**Minimal path inside Prism (no new deps).** Implement **(3)** first: treat sentinels as **source** of taint intervals; later, swap the producer for **(1)** or **(2)** without changing Phase 1’s consumer API (`token_macro_taint(tok)` or a small `uint32_t` on `Token`).
+
+**Status.** Not implemented; this subsection fixes the **data model** and the **boundary** between “what the tokenizer can attach” and “what the preprocessor must report.”
 
 `prism_reset` reclaims all arena-allocated structures. Called automatically on error recovery.
 

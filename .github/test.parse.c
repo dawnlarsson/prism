@@ -8292,6 +8292,143 @@ static void test_p1_typedef_shadow_chain_smoke(void) {
 	prism_free(&r);
 }
 
+/* --- Raw-source / tokenizer specification gaps (library transpile_source path) --- */
+
+static void test_gap_transpile_source_digraph_defer(void) {
+	printf("\n--- spec gap: digraphs + defer via prism_transpile_source ---\n");
+	const char *src = "int main(void) <%\n"
+			  "    defer <% (void)0; %>\n"
+			  "    int arr<:2:> = <% 5, 6 %>;\n"
+			  "    (void)(arr<:0:> == 5 && arr<:1:> == 6);\n"
+			  "    return 0;\n"
+			  "%>\n";
+	PrismResult r = prism_transpile_source(src, "gap_digraph.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "gap digraph lib: transpiles");
+	CHECK(r.output != NULL, "gap digraph lib: output");
+	if (r.output) {
+		CHECK(strstr(r.output, "<%") == NULL,
+		      "gap digraph lib: <% not left in emission");
+		CHECK(strstr(r.output, "<:") == NULL,
+		      "gap digraph lib: <: not left in emission");
+	}
+#ifndef _WIN32
+	if (r.output)
+		check_transpiled_output_compiles_and_runs(r.output, "gap digraph lib: compile",
+							  "gap digraph lib: run");
+#endif
+	prism_free(&r);
+}
+
+static void test_gap_transpile_source_macro_brace_without_cpp(void) {
+	printf("\n--- spec gap: #define BEGIN { without preprocessor ---\n");
+	const char *src = "#define BEGIN {\n"
+			  "#define END }\n"
+			  "int main(void)\n"
+			  "BEGIN\n"
+			  "    return 0;\n"
+			  "END\n";
+	PrismResult r = prism_transpile_source(src, "gap_macro_brace.c", prism_defaults());
+	/* Phase 1 sees `BEGIN` as an identifier after `main()` — not a scope opener.
+	   Emitted output reconstructs #define lines so `cc` can preprocess them.
+	   Defer/CFG accuracy for macro-shaped control flow still requires cpp-expanded input. */
+	CHECK_EQ(r.status, PRISM_OK, "gap macro brace: transpiles (macros preserved for host cpp)");
+	CHECK(r.output != NULL, "gap macro brace: output");
+	if (r.output) {
+		CHECK(strstr(r.output, "BEGIN") != NULL,
+		      "gap macro brace: BEGIN spelling survives to emitted source");
+	}
+#ifndef _WIN32
+	if (r.output)
+		check_transpiled_output_compiles_and_runs(r.output, "gap macro brace: compile",
+							  "gap macro brace: run");
+#endif
+	prism_free(&r);
+}
+
+static void test_gap_transpile_source_embed_prep_token(void) {
+	printf("\n--- spec gap: #embed line as preprocessor-line token (lib mode) ---\n");
+	const char *src = "int a = 1;\n"
+			  "#embed \"/nonexistent/cert_embed.bin\"\n"
+			  "int b = 2;\n"
+			  "int main(void) { return a + b - 3; }\n";
+	PrismResult r = prism_transpile_source(src, "gap_embed.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK,
+		 "gap embed: whole-line # directive tokenized, does not scan payload");
+	if (r.output)
+		CHECK(strstr(r.output, "embed") != NULL,
+		      "gap embed: #embed text preserved in emission");
+	/* Do not compile-run: host cc may reject #embed unless C23 and supported. */
+	prism_free(&r);
+}
+
+static void test_gap_pointer_star_attribute_chain(void) {
+	printf("\n--- spec gap: __attribute__ between pointer stars ---\n");
+	PrismResult r = prism_transpile_source(
+	    "void f(void) {\n"
+	    "    int *__attribute__((unused)) *p;\n"
+	    "    (void)p;\n"
+	    "}\n",
+	    "gap_ptr_attr.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "gap ptr attr: transpiles");
+	prism_free(&r);
+}
+
+static void test_gap_string_literal_fake_braces(void) {
+	printf("\n--- spec gap: { ( ) inside ordinary string literals ---\n");
+	PrismResult r = prism_transpile_source(
+	    "int main(void) {\n"
+	    "    const char *s = \"fake { brace } ( paren \";\n"
+	    "    (void)s;\n"
+	    "    return 0;\n"
+	    "}\n",
+	    "gap_str_brace.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "gap str brace: transpiles");
+#ifndef _WIN32
+	if (r.output)
+		check_transpiled_output_compiles_and_runs(r.output, "gap str brace: compile",
+							  "gap str brace: run");
+#endif
+	prism_free(&r);
+}
+
+static void test_gap_string_literal_escaped_quote(void) {
+	printf("\n--- spec gap: escaped quotes inside string ---\n");
+	PrismResult r = prism_transpile_source(
+	    "int main(void) {\n"
+	    "    const char *s = \"foo \\\" bar\";\n"
+	    "    (void)s;\n"
+	    "    return 0;\n"
+	    "}\n",
+	    "gap_escq.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "gap esc quote: transpiles");
+#ifndef _WIN32
+	if (r.output)
+		check_transpiled_output_compiles_and_runs(r.output, "gap esc quote: compile",
+							  "gap esc quote: run");
+#endif
+	prism_free(&r);
+}
+
+static void test_gap_string_backslash_newline_inside_literal(void) {
+	printf("\n--- spec gap: \\\\ newline inside string (no phase-2 splice here) ---\n");
+	PrismResult r = prism_transpile_source(
+	    "int main(void) {\n"
+	    "    const char *s = \"hello \\\n"
+	    "there\";\n"
+	    "    (void)s;\n"
+	    "    return 0;\n"
+	    "}\n",
+	    "gap_str_bs_nl.c", prism_defaults());
+	/* Tokenizer skips \\ + one char; a newline yields a literal newline in the string. */
+	CHECK_EQ(r.status, PRISM_OK, "gap str backslash-newline: transpiles");
+#ifndef _WIN32
+	if (r.output)
+		check_transpiled_output_compiles_and_runs(r.output, "gap str bs-nl: compile",
+							  "gap str bs-nl: run");
+#endif
+	prism_free(&r);
+}
+
 void run_parse_tests(void) {
 	printf("\n=== PARSE TESTS ===\n");
 
@@ -8535,6 +8672,13 @@ void run_parse_tests(void) {
 	test_digraph_struct();
 	test_digraph_complex();
 	test_digraph_defer();
+	test_gap_transpile_source_digraph_defer();
+	test_gap_transpile_source_macro_brace_without_cpp();
+	test_gap_transpile_source_embed_prep_token();
+	test_gap_pointer_star_attribute_chain();
+	test_gap_string_literal_fake_braces();
+	test_gap_string_literal_escaped_quote();
+	test_gap_string_backslash_newline_inside_literal();
 #ifndef _MSC_VER
 	test_utf8_defer();
 	test_utf8_math_identifiers();

@@ -1023,7 +1023,20 @@ static void test_msvc_regressions(void) {
 		CHECK(v64 == 9999999999LL, "__int64 orelse");
 	}
 
-	// Bug 3: calling convention + defer — KNOWN BUG, test omitted
+	// Bug 3: calling convention + defer — return-type capture must not
+	// copy __stdcall / __cdecl / __attribute__((stdcall)) onto __prism_ret_N.
+	{
+		static int __stdcall cc_stdcall_with_defer(void) {
+			defer (void)0;
+			return 11;
+		}
+		static int __cdecl cc_cdecl_with_defer(void) {
+			defer (void)0;
+			return 12;
+		}
+		CHECK_EQ(cc_stdcall_with_defer(), 11, "calling convention __stdcall + defer");
+		CHECK_EQ(cc_cdecl_with_defer(), 12, "calling convention __cdecl + defer");
+	}
 
 	// Bug 6: typedef flag corruption — typedef'd scalars + orelse
 	// Before the fix, including <stdio.h> (or any SDK header with struct
