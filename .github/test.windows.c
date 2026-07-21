@@ -987,6 +987,17 @@ static unsigned long long multiword_ret_with_defer(int x) {
 	return (unsigned long long)x * 1000000ULL;
 }
 
+/* File-scope: MSVC rejects nested function definitions. Return-type capture
+ * must not copy __stdcall / __cdecl onto __prism_ret_N. */
+static int __stdcall cc_stdcall_with_defer(void) {
+	defer (void)0;
+	return 11;
+}
+static int __cdecl cc_cdecl_with_defer(void) {
+	defer (void)0;
+	return 12;
+}
+
 static __int32 get_int32_val(void) { return 42; }
 static __int64 get_int64_val(void) { return 9999999999LL; }
 
@@ -1025,18 +1036,8 @@ static void test_msvc_regressions(void) {
 
 	// Bug 3: calling convention + defer — return-type capture must not
 	// copy __stdcall / __cdecl / __attribute__((stdcall)) onto __prism_ret_N.
-	{
-		static int __stdcall cc_stdcall_with_defer(void) {
-			defer (void)0;
-			return 11;
-		}
-		static int __cdecl cc_cdecl_with_defer(void) {
-			defer (void)0;
-			return 12;
-		}
-		CHECK_EQ(cc_stdcall_with_defer(), 11, "calling convention __stdcall + defer");
-		CHECK_EQ(cc_cdecl_with_defer(), 12, "calling convention __cdecl + defer");
-	}
+	CHECK_EQ(cc_stdcall_with_defer(), 11, "calling convention __stdcall + defer");
+	CHECK_EQ(cc_cdecl_with_defer(), 12, "calling convention __cdecl + defer");
 
 	// Bug 6: typedef flag corruption — typedef'd scalars + orelse
 	// Before the fix, including <stdio.h> (or any SDK header with struct
