@@ -988,7 +988,13 @@ static unsigned long long multiword_ret_with_defer(int x) {
 }
 
 /* File-scope: MSVC rejects nested function definitions. Return-type capture
- * must not copy __stdcall / __cdecl onto __prism_ret_N. */
+ * must not copy __stdcall / __cdecl onto __prism_ret_N.
+ * push_macro/undef: if a Windows header emptied `__cdecl`/`__stdcall` to a
+ * macro, restore the keyword so the declarator matches what we intend. */
+#pragma push_macro("__stdcall")
+#pragma push_macro("__cdecl")
+#undef __stdcall
+#undef __cdecl
 static int __stdcall cc_stdcall_with_defer(void) {
 	defer (void)0;
 	return 11;
@@ -997,6 +1003,11 @@ static int __cdecl cc_cdecl_with_defer(void) {
 	defer (void)0;
 	return 12;
 }
+static int __cdecl cc_cdecl_no_defer(void) {
+	return 13;
+}
+#pragma pop_macro("__cdecl")
+#pragma pop_macro("__stdcall")
 
 static __int32 get_int32_val(void) { return 42; }
 static __int64 get_int64_val(void) { return 9999999999LL; }
@@ -1037,6 +1048,7 @@ static void test_msvc_regressions(void) {
 	// Bug 3: calling convention + defer — return-type capture must not
 	// copy __stdcall / __cdecl / __attribute__((stdcall)) onto __prism_ret_N.
 	CHECK_EQ(cc_stdcall_with_defer(), 11, "calling convention __stdcall + defer");
+	CHECK_EQ(cc_cdecl_no_defer(), 13, "calling convention __cdecl (no defer)");
 	CHECK_EQ(cc_cdecl_with_defer(), 12, "calling convention __cdecl + defer");
 
 	// Bug 6: typedef flag corruption — typedef'd scalars + orelse
