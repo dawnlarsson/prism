@@ -7760,9 +7760,12 @@ static void test_orelse_ctrl_paren_stmt_action_rejected(void) {
 
 /* Phase 1D )-arm used walk_back_past_noise, which jumps }→{ and )→(, so
  * `} (expr) orelse` after a braced if/while/switch (and braceless
- * `if (c) (expr) orelse`) re-armed at_stmt_start on 'orelse' itself. */
+ * `if (c) (expr) orelse`) re-armed at_stmt_start on 'orelse' itself.
+ * else/do take no condition paren — same false re-arm when predecessor
+ * of body '(' is the keyword. Pass 2 also mistook body '(' for a ctrl
+ * condition paren (inner orelse) and forgot at_stmt_start after do. */
 static void test_paren_led_bare_orelse_after_ctrl(void) {
-	static const char *cases[] = {
+	static const char *ok_cases[] = {
 		"int get(void);\n"
 		"void f(int c) {\n"
 		"    if (c) { }\n"
@@ -7787,18 +7790,65 @@ static void test_paren_led_bare_orelse_after_ctrl(void) {
 		"    if (c)\n"
 		"        (get()) orelse return;\n"
 		"}\n",
+		"int get(void);\n"
+		"void f(int c) {\n"
+		"    if (c) ;\n"
+		"    else (get()) orelse return;\n"
+		"}\n",
+		"int get(void);\n"
+		"void f(void) {\n"
+		"    do (get()) orelse return; while (0);\n"
+		"}\n",
+		"int get(void);\n"
+		"void f(void) {\n"
+		"    do get() orelse return; while (0);\n"
+		"}\n",
+		"int get(void);\n"
+		"void f(int a, int b) {\n"
+		"    if (a) if (b) (get()) orelse return;\n"
+		"}\n",
 	};
-	static const char *names[] = {
+	static const char *ok_names[] = {
 		"after braced if",
 		"after braced while",
 		"after braced switch",
 		"paren-led braceless if body",
 		"paren-led braceless if body (newline)",
+		"paren-led else body",
+		"paren-led do body",
+		"ident-led do body",
+		"nested if paren-led body",
 	};
-	for (int i = 0; i < (int)(sizeof(cases) / sizeof(cases[0])); i++) {
-		PrismResult r = prism_transpile_source(cases[i], "oe_paren_ctrl.c",
+	for (int i = 0; i < (int)(sizeof(ok_cases) / sizeof(ok_cases[0])); i++) {
+		PrismResult r = prism_transpile_source(ok_cases[i], "oe_paren_ctrl.c",
 						       prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK, names[i]);
+		CHECK_EQ(r.status, PRISM_OK, ok_names[i]);
+		prism_free(&r);
+	}
+
+	/* Inner orelse in a parenthesized body is not statement-level. */
+	static const char *bad_cases[] = {
+		"int get(void);\n"
+		"void f(int c) {\n"
+		"    int x;\n"
+		"    if (c) (x = get() orelse 0);\n"
+		"}\n",
+		"int get(void);\n"
+		"void f(void) {\n"
+		"    defer {\n"
+		"        int x;\n"
+		"        if (1) (x = get() orelse 0);\n"
+		"    };\n"
+		"}\n",
+	};
+	static const char *bad_names[] = {
+		"inner orelse in paren if-body rejected",
+		"inner orelse in defer paren if-body rejected",
+	};
+	for (int i = 0; i < (int)(sizeof(bad_cases) / sizeof(bad_cases[0])); i++) {
+		PrismResult r = prism_transpile_source(bad_cases[i], "oe_paren_inner.c",
+						       prism_defaults());
+		CHECK(r.status != PRISM_OK, bad_names[i]);
 		prism_free(&r);
 	}
 }

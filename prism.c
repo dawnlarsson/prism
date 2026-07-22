@@ -2016,8 +2016,7 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 			}
 		}
 
-		if (mode != EMIT_DEFER_BODY &&
-		    __builtin_expect(FEAT(F_ORELSE) && is_orelse_keyword(tok), 0))
+		if (__builtin_expect(FEAT(F_ORELSE) && is_orelse_keyword(tok), 0))
 			error_tok(tok, ERR_ORELSE_STMT_LEVEL);
 		if (ctx->at_stmt_start && (tok->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
 		    !is_known_typedef(tok)) {
@@ -2025,6 +2024,7 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 				tok = emit_advance(tok);
 				ctrl_state.pending = true;
 				ctrl_state.parens_just_closed = true;
+				ctx->at_stmt_start = true;
 				if (mode == EMIT_DEFER_BODY) dr_braceless_body = true;
 				continue;
 			}
@@ -4252,9 +4252,15 @@ static Token *try_handle_defer_flow_kw(Token *tok) {
 static void arm_ctrl_pending_from_tag(Token *tok, uint32_t tag) {
 	if (tag & TT_LOOP) {
 		ctrl_state.pending_paren_kw = 1;
+		if (is_do_kw(tok)) {
+			ctrl_state.parens_just_closed = true;
+			/* Match else / emit_statements: body is a statement. */
+			ctx->at_stmt_start = true;
+		}
 		if (FEAT(F_DEFER | F_ZEROINIT)) {
 			ctrl_state.pending = true;
-			if (is_do_kw(tok)) ctrl_state.parens_just_closed = true;
+			if (!is_do_kw(tok))
+				ctrl_state.parens_just_closed = false;
 		}
 		if (tok->ch0 == 'f' && FEAT(F_DEFER | F_ZEROINIT)) {
 			ctrl_state.pending = true;
@@ -4267,13 +4273,17 @@ static void arm_ctrl_pending_from_tag(Token *tok, uint32_t tag) {
 	if ((tag & TT_SWITCH) && FEAT(F_DEFER | F_ZEROINIT)) {
 		ctrl_state.pending = true;
 		ctrl_state.pending_for_paren = true;
+		ctrl_state.parens_just_closed = false;
 	}
 	if (tag & TT_IF) {
 		ctrl_state.pending = true;
 		if (is_else_kw(tok)) {
 			ctrl_state.parens_just_closed = true;
 			ctx->at_stmt_start = true;
-		} else if (FEAT(F_DEFER | F_ZEROINIT)) ctrl_state.pending_for_paren = true;
+		} else {
+			ctrl_state.parens_just_closed = false;
+			if (FEAT(F_DEFER | F_ZEROINIT)) ctrl_state.pending_for_paren = true;
+		}
 	}
 }
 static Token *handle_defer_keyword(Token *tok) {
@@ -5587,8 +5597,16 @@ static PRISM_ALWAYS_INLINE inline void track_common_token_state(Token *tok) {
 	if (__builtin_expect(ctrl_state.pending && tok->len == 1, 0)) {
 		char c = tok->ch0;
 			if (!in_generic()) {
-			if (c == '(') track_ctrl_paren_open();
-			else if (c == ')') track_ctrl_paren_close();
+			if (c == '(') {
+				/* After the control condition has closed, a leading '(' is a
+				 * parenthesized braceless body / expression — not another
+				 * condition paren. Nested if/while still arm pending_for_paren
+				 * / pending_paren_kw (or clear parens_just_closed) first. */
+				if (!(ctrl_state.parens_just_closed &&
+				      !ctrl_state.pending_for_paren &&
+				      !ctrl_state.pending_paren_kw))
+					track_ctrl_paren_open();
+			} else if (c == ')') track_ctrl_paren_close();
 		}
 	}
 	track_generic_token(tok);
@@ -7679,7 +7697,9 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 					}
 				}
 				tok = tok_next(tok_match(tok));
-				if (p1d_prev_saved && (p1d_prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH))) {
+				/* if/while/for/switch condition close — not else/do body '('. */
+				if (p1d_prev_saved && (p1d_prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
+				    !is_else_kw(p1d_prev_saved) && !is_do_kw(p1d_prev_saved)) {
 					at_stmt_start = true;
 					p1d_ctrl_pending = true;
 				}
@@ -7691,7 +7711,10 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 					 * like the while-condition close and re-arms
 					 * at_stmt_start on the following 'orelse'. */
 					Token *before_open = walk_back_skip_attr_noise(oi);
-					if (before_open && (before_open->tag & (TT_IF | TT_LOOP | TT_SWITCH))) {
+					/* else/do take no condition paren; their body '(' must
+					 * not re-arm (same class as the braced-ctrl bug). */
+					if (before_open && (before_open->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
+					    !is_else_kw(before_open) && !is_do_kw(before_open)) {
 						at_stmt_start = true;
 						p1d_ctrl_pending = true;
 					}
