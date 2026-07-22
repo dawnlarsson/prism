@@ -3343,6 +3343,43 @@ static void test_c23_attr_label_defer(void) {
 	prism_free(&r);
 }
 
+/* error_tok longjmp from inside defer_walk left in_defer_emit stuck; on
+ * Windows (serial suites) the next goto-with-defer then opened braces but
+ * emitted no cleanup. */
+static void test_defer_emit_flag_cleared_after_error(void) {
+	PrismResult bad = prism_transpile_source(
+	    "int get(void);\n"
+	    "void f(void) {\n"
+	    "    defer {\n"
+	    "        int x;\n"
+	    "        if (1) (x = get() orelse 0);\n"
+	    "    };\n"
+	    "}\n",
+	    "defer_oe_err.c", prism_defaults());
+	CHECK(bad.status != PRISM_OK, "defer-body orelse error: rejected");
+	prism_free(&bad);
+
+	PrismResult ok = prism_transpile_source(
+	    "void g(void) {\n"
+	    "    int x;\n"
+	    "    {\n"
+	    "        defer x = 1;\n"
+	    "        goto done;\n"
+	    "    }\n"
+	    "    done:\n"
+	    "    (void)x;\n"
+	    "}\n",
+	    "defer_after_err.c", prism_defaults());
+	CHECK_EQ(ok.status, PRISM_OK, "defer-after-error: transpiles OK");
+	if (ok.output) {
+		char *goto_pos = strstr(ok.output, "goto done");
+		char *cleanup = strstr(ok.output, "x = 1");
+		CHECK(goto_pos && cleanup && cleanup < goto_pos,
+		      "defer-after-error: cleanup still emitted before goto");
+	}
+	prism_free(&ok);
+}
+
 // --- Regression tests for confirmed issues ---
 
 static void test_cc_splitting(void) {
@@ -7676,6 +7713,7 @@ void run_api_tests_1(void) {
 	test_ghost_enum_fnptr_param();
 	test_bare_orelse_comma_boundary();
 	test_c23_attr_label_defer();
+	test_defer_emit_flag_cleared_after_error();
 }
 
 void run_api_tests_2(void) {

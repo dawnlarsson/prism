@@ -229,10 +229,14 @@ static void test_harsh_c23_attr_defer_stmt_expr_chain(void) {
     /* p1_check_defer_stmt_expr_chain handled GNU __attribute__ but not
      * C23 [[...]] attributes.  A [[...]] between the inner scope's '}' and
      * the stmt-expr's '}' broke the chain walk, so Phase 1D silently missed
-     * the defer-in-stmt-expr violation (two-pass invariant violation). */
+     * the defer-in-stmt-expr violation (two-pass invariant violation).
+     * Attributed labels (L [[attr]]: / L __attribute__((...)):) must also
+     * count as trivial so the chain still reaches the stmt-expr close. */
     const char *bad[] = {
         "int f(void) { return ({ int r = 0; { defer { r = 99; } r = 1; } [[gnu::cold]]; }); }\n",
         "int f(void) { return ({ int r = 0; { defer { r = 99; } r = 1; } [[maybe_unused]]; }); }\n",
+        "int f(void) { return ({ int r = 0; { defer { r = 99; } r = 1; } L [[maybe_unused]]: ; }); }\n",
+        "int f(void) { return ({ int r = 0; { defer { r = 99; } r = 1; } L __attribute__((unused)): ; }); }\n",
     };
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
         PrismResult r = prism_transpile_source(bad[i], "harsh_c23_se.c", prism_defaults());

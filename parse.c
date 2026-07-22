@@ -3820,9 +3820,15 @@ static void p1_check_defer_stmt_expr_chain(Token *defer_tok, uint16_t sid) {
 				t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t);
 				continue;
 			}
-			if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
-			    tok_next(t) && match_ch(tok_next(t), ':'))
-				{ t = tok_next(tok_next(t)); continue; }
+			/* Label: ident [[attr]]...: or ident __attribute__((...)): */
+			if (t->kind == TK_IDENT || t->kind == TK_KEYWORD) {
+				Token *colon = skip_noise(tok_next(t));
+				if (colon && match_ch(colon, ':') &&
+				    !(tok_next(colon) && match_ch(tok_next(colon), ':'))) {
+					t = tok_next(colon);
+					continue;
+				}
+			}
 			only_trivial = false;
 			break;
 		}

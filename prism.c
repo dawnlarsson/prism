@@ -446,6 +446,8 @@ static void reset_transpiler_state(void) {
 	last_emitted = NULL;
 	out_total_flushed = 0;
 	current_func_idx = -1;
+	goto_entry_cursor = 0;
+	in_defer_emit = false; /* must clear: error longjmp can skip defer_walk restore */
 	p1_typedef_annotated = false;
 	p1_file_has_orelse = false;
 	hashmap_discard(&p1_func_proto_map);
@@ -1860,6 +1862,9 @@ static void arm_ctrl_pending_from_tag(Token *tok, uint32_t tag);
 static void end_statement_after_semicolon(void);
 static inline Token *try_process_stmt_token(Token *t, Token *end, Token **unreachable_tok);
 static inline void track_generic_token(Token *tok);
+static inline void track_ctrl_paren_open(void);
+static inline void track_ctrl_paren_close(void);
+static inline void track_ctrl_semicolon(void);
 static Token *emit_ctrl_condition(Token *t, Token **unreachable_tok);
 
 typedef enum {
@@ -1874,6 +1879,19 @@ static Token *try_orelse_expr_rewrites(Token *tok) {
 	return try_bracket_orelse(tok);
 }
 enum { COLON_REQUIRE_BLOCK = 1 };
+/* True if `prev` can end a label name before ':' — identifier, or the closing
+ * delimiter of attrs between the name and colon (`done [[x]]:` / `__attribute__`). */
+static inline bool label_name_predecessor(Token *prev) {
+	if (!prev) return false;
+	if (is_identifier_like(prev) || prev->kind == TK_NUM) return true;
+	if (match_ch(prev, ']') && tok_match(prev) && (tok_match(prev)->flags & TF_C23_ATTR))
+		return true;
+	if (match_ch(prev, ')') && tok_match(prev)) {
+		Token *before = walk_back_skip_attr_noise(tok_idx(tok_match(prev)));
+		return before && (before->tag & TT_ATTR);
+	}
+	return false;
+}
 /* Returns true if colon was consumed as a label/case terminator (caller should continue). */
 static bool consume_stmt_colon(Token **tok_p, int *ternary_depth, bool *pending_case_colon,
 			       unsigned flags) {
@@ -1885,8 +1903,7 @@ static bool consume_stmt_colon(Token **tok_p, int *ternary_depth, bool *pending_
 		return false;
 	}
 	if (!in_generic() && last_emitted &&
-	    (is_identifier_like(last_emitted) || last_emitted->kind == TK_NUM ||
-	     *pending_case_colon) &&
+	    (label_name_predecessor(last_emitted) || *pending_case_colon) &&
 	    !in_struct_body() &&
 	    (!(flags & COLON_REQUIRE_BLOCK) || ctx->block_depth > 0)) {
 		*pending_case_colon = false;
@@ -2028,8 +2045,13 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 				if (mode == EMIT_DEFER_BODY) dr_braceless_body = true;
 				continue;
 			}
+			Token *kw = tok;
 			tok = emit_advance(tok);
 			if (tok && match_ch(tok, '(') && tok_match(tok)) {
+				/* Arm + push SCOPE_CTRL/FOR_PAREN so break/continue inside
+				 * condition stmt-exprs stop here (don't paste outer defers).
+				 * Main Pass 2 loop gets this via arm_ctrl + track_common. */
+				arm_ctrl_pending_from_tag(kw, kw->tag);
 				ctrl_state.parens_just_closed = false;
 				tok = emit_ctrl_condition(tok, &unreachable_tok);
 				ctx->at_stmt_start = true;
@@ -2068,6 +2090,7 @@ static Token *emit_ctrl_condition(Token *t, Token **unreachable_tok) {
 	if (!close_p) { emit_tok(t); return tok_next(t); }
 	if (FEAT(F_ORELSE))
 		check_orelse_in_ctrl_paren(t);
+	track_ctrl_paren_open();
 	t = emit_advance(t); // emit '('
 	ctx->at_stmt_start = true;
 	while (t && t != close_p && t->kind != TK_EOF) {
@@ -2084,6 +2107,7 @@ static Token *emit_ctrl_condition(Token *t, Token **unreachable_tok) {
 		}
 		if (match_ch(t, ';')) {
 			t = emit_advance(t);
+			track_ctrl_semicolon();
 			ctx->at_stmt_start = true;
 			continue;
 		}
@@ -2091,6 +2115,7 @@ static Token *emit_ctrl_condition(Token *t, Token **unreachable_tok) {
 		t = emit_advance(t);
 	}
 	if (t == close_p) { t = emit_advance(t); } // emit ')'
+	track_ctrl_paren_close();
 	return t;
 }
 /* Scan [start, end) for orelse; jump nested TF_OPEN groups; ignore prep dirs. */
@@ -5579,8 +5604,15 @@ static inline void track_ctrl_paren_close(void) {
 }
 static inline void track_ctrl_semicolon(void) {
 	if (in_for_init()) {
+		/* for/switch/if C23 init: FOR_PAREN → CTRL_PAREN after first ';'.
+		 * Preserve is_loop/is_switch so break/continue in the condition
+		 * (or for-increment) still stop at this paren for defer_walk. */
+		bool was_loop = scope_stack[ctx->scope_depth - 1].is_loop;
+		bool was_switch = scope_stack[ctx->scope_depth - 1].is_switch;
 		scope_pop();
 		scope_push_kind(SCOPE_CTRL_PAREN);
+		scope_stack[ctx->scope_depth - 1].is_loop = was_loop;
+		scope_stack[ctx->scope_depth - 1].is_switch = was_switch;
 	} else if (!in_ctrl_paren()) ctrl_reset();
 }
 static PRISM_ALWAYS_INLINE inline void track_generic_token(Token *tok) {
@@ -8534,16 +8566,21 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 			    !(tok->tag & (TT_NON_EXPR_STMT | TT_DEFER))) {
 				Token *orelse_scan_start = tok;
 				Token *label_end = NULL;
-				if (is_identifier_like(tok) && tok_next(tok) && match_ch(tok_next(tok), ':')) {
-					label_end = tok_next(tok_next(tok));
-					orelse_scan_start = label_end;
+				if (is_identifier_like(tok)) {
+					Token *colon = skip_noise(tok_next(tok));
+					if (colon && match_ch(colon, ':') &&
+					    !(tok_next(colon) && match_ch(tok_next(colon), ':'))) {
+						label_end = tok_next(colon);
+						orelse_scan_start = label_end;
+					}
 				}
 				Token *orelse_tok = find_bare_orelse(orelse_scan_start);
 				if (orelse_tok) {
 					reject_orelse_in_for_init(tok);
 					if (label_end) {
-						emit_tok(tok);       // label ident
-						emit_tok(tok_next(tok)); // ':'
+						/* Emit label name + any attrs through ':'. */
+						for (Token *t = tok; t != label_end; t = tok_next(t))
+							emit_tok(t);
 						tok = label_end;
 					}
 
@@ -8754,6 +8791,11 @@ PRISM_API void prism_reset(void) {
 	ctx->block_depth = 0;
 	ctx->aggregate_member_nest = 0;
 	system_includes_reset();
+	in_defer_emit = false;
+	goto_entry_cursor = 0;
+	ctrl_reset();
+	ctrl_save_depth = 0;
+	current_func_idx = -1;
 	if (out_fp) {
 		out_flush();
 		fclose(out_fp);
@@ -8782,6 +8824,17 @@ PRISM_API void prism_thread_cleanup(void) {
 	free(pp_define_bufs); pp_define_bufs = NULL; pp_define_bufs_cap = 0;
 	memset(&ctrl_state, 0, sizeof(ctrl_state));
 	free(ctrl_save_stack); ctrl_save_stack = NULL; ctrl_save_cap = 0; ctrl_save_depth = 0;
+	in_defer_emit = false;
+	goto_entry_cursor = 0;
+	current_func_idx = -1;
+	free(sos_do_if_save); sos_do_if_save = NULL;
+	free(sos_do_tn_save); sos_do_tn_save = NULL;
+	free(sos_do_snap_start); sos_do_snap_start = NULL;
+	sos_do_cap = 0;
+	free(sos_do_snap_buf); sos_do_snap_buf = NULL;
+	sos_snap_cap = 0;
+	free(sos_if_trail_snap); sos_if_trail_snap = NULL;
+	sos_if_cap = 0;
 	free(ctx);
 	ctx = NULL;
 }

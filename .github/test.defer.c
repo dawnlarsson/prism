@@ -6949,6 +6949,44 @@ static void test_defer_break_while_condition_stmt_expr(void) {
 	CHECK_EQ(r.status, PRISM_OK,
 		 "defer + break inside stmt-expr in while(cond): must transpile "
 		 "(ctrl-paren loop boundary for defer)");
+	if (r.status == PRISM_OK && r.output) {
+		/* Outer defer must not paste into the condition before break. */
+		CHECK(strstr(r.output, "putchar('Z'); break") == NULL &&
+			  strstr(r.output, "putchar ( 'Z' ) ; break") == NULL,
+		      "defer + while(cond) break: no outer defer before cond break");
+	}
+	prism_free(&r);
+
+	/* for(;;) loses SCOPE_FOR_PAREN after the first ';' — is_loop must
+	 * survive on the replacement SCOPE_CTRL_PAREN. */
+	r = prism_transpile_source(
+	    "void f(void) {\n"
+	    "  int outer = 0;\n"
+	    "  defer outer = 99;\n"
+	    "  for (; ({ if (1) break; 1; }); ) { outer = 2; }\n"
+	    "  (void)outer;\n"
+	    "}\n",
+	    "def_br_fcond.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "defer + for(cond) break: transpiles");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "outer = 99; break") == NULL,
+		      "defer + for(cond) break: no outer defer before cond break");
+	}
+	prism_free(&r);
+
+	r = prism_transpile_source(
+	    "void f(void) {\n"
+	    "  int outer = 0;\n"
+	    "  defer outer = 99;\n"
+	    "  for (;; ({ if (1) break; 0; })) { outer = 2; }\n"
+	    "  (void)outer;\n"
+	    "}\n",
+	    "def_br_fincr.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "defer + for(incr) break: transpiles");
+	if (r.status == PRISM_OK && r.output) {
+		CHECK(strstr(r.output, "outer = 99; break") == NULL,
+		      "defer + for(incr) break: no outer defer before incr break");
+	}
 	prism_free(&r);
 }
 

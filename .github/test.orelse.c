@@ -7764,6 +7764,79 @@ static void test_orelse_ctrl_paren_stmt_action_rejected(void) {
  * else/do take no condition paren — same false re-arm when predecessor
  * of body '(' is the keyword. Pass 2 also mistook body '(' for a ctrl
  * condition paren (inner orelse) and forgot at_stmt_start after do. */
+/* emit_statements used to walk if/while/for/switch conditions without pushing
+ * SCOPE_CTRL/FOR_PAREN, so break/continue inside a condition stmt-expr pasted
+ * outer-scope defers into the condition (wrong for orelse blocks / nested SE). */
+static void test_orelse_block_break_in_ctrl_cond_no_outer_defer(void) {
+	static const char *cases[] = {
+		"void f(void) {\n"
+		"  int outer = 0;\n"
+		"  defer outer = 99;\n"
+		"  int x = 0 orelse {\n"
+		"    while (({ if (1) break; 1; })) { outer = 2; }\n"
+		"    x = 1;\n"
+		"  };\n"
+		"  (void)outer; (void)x;\n"
+		"}\n",
+		"void f(void) {\n"
+		"  int outer = 0;\n"
+		"  defer outer = 99;\n"
+		"  int x = 0 orelse {\n"
+		"    for (; ({ if (1) break; 1; }); ) { outer = 2; }\n"
+		"    x = 1;\n"
+		"  };\n"
+		"  (void)outer; (void)x;\n"
+		"}\n",
+		"void f(void) {\n"
+		"  int outer = 0;\n"
+		"  defer outer = 99;\n"
+		"  int x = 0 orelse {\n"
+		"    switch (({ if (1) break; 1; })) { default: outer = 2; break; }\n"
+		"    x = 1;\n"
+		"  };\n"
+		"  (void)outer; (void)x;\n"
+		"}\n",
+		"void f(void) {\n"
+		"  int outer = 0;\n"
+		"  defer outer = 99;\n"
+		"  int x = 0 orelse {\n"
+		"    while (({ if (0) continue; 0; })) { outer = 2; }\n"
+		"    x = 1;\n"
+		"  };\n"
+		"  (void)outer; (void)x;\n"
+		"}\n",
+		"void f(void) {\n"
+		"  int outer = 0;\n"
+		"  defer outer = 99;\n"
+		"  int x = 0 orelse {\n"
+		"    for (;; ({ if (1) break; 0; })) { outer = 2; }\n"
+		"    x = 1;\n"
+		"  };\n"
+		"  (void)outer; (void)x;\n"
+		"}\n",
+	};
+	static const char *names[] = {
+		"while cond break",
+		"for cond break",
+		"switch cond break",
+		"while cond continue",
+		"for incr break",
+	};
+	for (int i = 0; i < (int)(sizeof(cases) / sizeof(cases[0])); i++) {
+		PrismResult r = prism_transpile_source(cases[i], "oe_ctrl_cond_br.c",
+						       prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, names[i]);
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(strstr(r.output, "outer = 99; break") == NULL &&
+				  strstr(r.output, "outer = 99;\nbreak") == NULL &&
+				  strstr(r.output, "outer = 99; continue") == NULL &&
+				  strstr(r.output, "outer = 99;\ncontinue") == NULL,
+			      names[i]);
+		}
+		prism_free(&r);
+	}
+}
+
 static void test_paren_led_bare_orelse_after_ctrl(void) {
 	static const char *ok_cases[] = {
 		"int get(void);\n"
@@ -8683,6 +8756,7 @@ void run_orelse_tests(void) {
 	// orelse inside attribute arguments (GNU/C23) leaked to backend
 	test_orelse_ctrl_paren_stmt_action_rejected();
 	test_paren_led_bare_orelse_after_ctrl();
+	test_orelse_block_break_in_ctrl_cond_no_outer_defer();
 	test_orelse_in_attribute_args();
 
 	// bracket orelse in expr context — Phase 1D must catch side effects
