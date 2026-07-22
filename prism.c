@@ -7,13 +7,13 @@
 #ifndef _DARWIN_C_SOURCE
 #define _DARWIN_C_SOURCE
 #endif
+#include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <spawn.h>
-#include <errno.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <sys/mman.h>
-#include <fcntl.h>
 #include <time.h>
 
 #define INSTALL_PATH "/usr/local/bin/prism"
@@ -43,8 +43,8 @@ static int run_command_quiet(char **argv);
 #include <mach-o/dyld.h>
 #endif
 #if defined(__FreeBSD__) || defined(__DragonFly__)
-#include <sys/types.h>
 #include <sys/sysctl.h>
+#include <sys/types.h>
 #endif
 
 #define OUT_BUF_SIZE (128 * 1024)
@@ -64,14 +64,18 @@ static int run_command_quiet(char **argv);
 #define typedef_add_enum_const(name, len, depth)                                                             \
 	typedef_add_entry(name, len, depth, TDK_ENUM_CONST, false, false)
 #define typedef_add_vla_var(name, len, depth) typedef_add_entry(name, len, depth, TDK_VLA_VAR, true, false)
-#define TYPEDEF_ADD_IDX(call, t) do { int _pre = typedef_table.count; call; \
-	if (typedef_table.count > _pre) \
-		typedef_table.entries[typedef_table.count - 1].token_index = tok_idx(t); } while(0)
+#define TYPEDEF_ADD_IDX(call, t)                                                                             \
+	do {                                                                                                 \
+		int _pre = typedef_table.count;                                                              \
+		call;                                                                                        \
+		if (typedef_table.count > _pre)                                                              \
+			typedef_table.entries[typedef_table.count - 1].token_index = tok_idx(t);             \
+	} while (0)
 
 typedef struct {
 	const char *compiler;
-	const char **include_paths; // -I paths
-	const char **defines; // -D macros
+	const char **include_paths;  // -I paths
+	const char **defines;	     // -D macros
 	const char **compiler_flags; // Additional flags (-std=c99, -m32, etc.)
 	const char **force_includes; // -include files
 	int include_count;
@@ -97,7 +101,7 @@ typedef enum {
 } PrismStatus;
 
 typedef struct {
-	char *output; // transpiled C (caller frees with prism_free)
+	char *output;	 // transpiled C (caller frees with prism_free)
 	char *error_msg; // error message (NULL on success)
 	size_t output_len;
 	int error_line;
@@ -118,12 +122,12 @@ typedef struct {
 } DeferEntry;
 
 typedef enum {
-	SCOPE_BLOCK,       // { ... } block scope
-	SCOPE_INIT,        // = { ... } initializer brace (no block_depth increment)
-	SCOPE_FOR_PAREN,   // for( ... ) — first ';' ends init, not stmt
-	SCOPE_CTRL_PAREN,  // if/while/switch( ... )
-	SCOPE_GENERIC,     // _Generic( ... )
-	SCOPE_TERNARY,     // ? ... : — popped on matching ':'
+	SCOPE_BLOCK,	  // { ... } block scope
+	SCOPE_INIT,	  // = { ... } initializer brace (no block_depth increment)
+	SCOPE_FOR_PAREN,  // for( ... ) — first ';' ends init, not stmt
+	SCOPE_CTRL_PAREN, // if/while/switch( ... )
+	SCOPE_GENERIC,	  // _Generic( ... )
+	SCOPE_TERNARY,	  // ? ... : — popped on matching ':'
 } ScopeKind;
 
 static inline bool is_brace_scope(ScopeKind k) {
@@ -132,83 +136,103 @@ static inline bool is_brace_scope(ScopeKind k) {
 
 typedef struct {
 	int defer_start_idx;
-	int saved_defer_shadow_count; // stmt-expr: shadow count at open time (restore on close)
+	int saved_defer_shadow_count; // stmt-expr: shadow count at open time (restore
+				      // on close)
 	uint8_t kind;
 	bool is_loop : 1;
 	bool is_switch : 1;
 	bool is_struct : 1;
 	bool is_stmt_expr : 1;
-	bool is_ctrl_se : 1;   // stmt-expr inside ctrl parens (ctrl_state saved on ctrl_save_stack)
+	bool is_ctrl_se : 1; // stmt-expr inside ctrl parens (ctrl_state saved on ctrl_save_stack)
 } ScopeNode;
 
 typedef struct {
-	Token *body_open;              // The '{' token
-	Token *ret_type_start;         // First token of return type
-	Token *ret_type_end;           // Function name token (exclusive)
-	Token *ret_type_suffix_start;  // For complex declarators: closing ')'
-	Token *ret_type_suffix_end;    // Token after suffix (exclusive)
+	Token *body_open;	      // The '{' token
+	Token *ret_type_start;	      // First token of return type
+	Token *ret_type_end;	      // Function name token (exclusive)
+	Token *ret_type_suffix_start; // For complex declarators: closing ')'
+	Token *ret_type_suffix_end;   // Token after suffix (exclusive)
 	bool returns_void;
-	bool has_computed_goto;    // Function contains a computed goto (*ptr)
-	int entry_start;           // Start index into p1_entries[] for this function
-	int entry_count;           // Number of P1FuncEntry items for this function
-	HashMap defer_name_set; // Exact set of captured names (union of all defer bodies)
+	bool has_computed_goto;	     // Function contains a computed goto (*ptr)
+	int entry_start;	     // Start index into p1_entries[] for this function
+	int entry_count;	     // Number of P1FuncEntry items for this function
+	HashMap defer_name_set;	     // Exact set of captured names (union of all defer bodies)
 	HashMap defer_body_captures; // tok_idx(body) → HashMap* (per-body capture sets)
-	int *label_hash;           // Open-addressing hash table: name → entry index (-1=empty)
-	int label_hash_mask;       // Power-of-2 mask for label_hash probing
+	int *label_hash;	     // Open-addressing hash table: name → entry index (-1=empty)
+	int label_hash_mask;	     // Power-of-2 mask for label_hash probing
 } FuncMeta;
 
 typedef struct {
 	char *name;
 	int len;
-	uint16_t scope_id;       // Scope where the shadow is declared
-	uint32_t token_index;    // Pool index of the shadowing declaration
-	int prev_index;          // Chain to previous shadow for same name (-1 = none)
+	uint16_t scope_id;    // Scope where the shadow is declared
+	uint32_t token_index; // Pool index of the shadowing declaration
+	int prev_index;	      // Chain to previous shadow for same name (-1 = none)
 } P1ShadowEntry;
 
-// Phase 1D: per-function entry for labels, gotos, defers, decls, switches, cases.
+// Phase 1D: per-function entry for labels, gotos, defers, decls, switches,
+// cases.
 typedef enum { P1K_LABEL, P1K_GOTO, P1K_DEFER, P1K_DECL, P1K_SWITCH, P1K_CASE } P1EntryKind;
+
 typedef struct {
-	Token *tok;                 // 8 @ 0
-	uint32_t token_index;       // 4 @ 8  (tok_idx for sorting in Phase 2)
-	uint16_t scope_id;          // 2 @ 12
-	uint8_t kind;               // 1 @ 14 (P1EntryKind value)
-	uint8_t _pad;               // 1 @ 15
-	union {                     // 16 @ 16
-		struct { char *name; int len; int exits; } label; // P1K_LABEL, P1K_GOTO
-		struct { bool has_init; bool is_vla; bool has_raw; bool is_static_storage;
-			 uint32_t body_close_idx; } decl; // P1K_DECL
-		struct { uint16_t switch_scope_id; } kase;   // P1K_CASE
+	Token *tok;	      // 8 @ 0
+	uint32_t token_index; // 4 @ 8  (tok_idx for sorting in Phase 2)
+	uint16_t scope_id;    // 2 @ 12
+	uint8_t kind;	      // 1 @ 14 (P1EntryKind value)
+	uint8_t _pad;	      // 1 @ 15
+
+	union { // 16 @ 16
+
+		struct {
+			char *name;
+			int len;
+			int exits;
+		} label; // P1K_LABEL, P1K_GOTO
+
+		struct {
+			bool has_init;
+			bool is_vla;
+			bool has_raw;
+			bool is_static_storage;
+			uint32_t body_close_idx;
+		} decl; // P1K_DECL
+
+		struct {
+			uint16_t switch_scope_id;
+		} kase; // P1K_CASE
 	};
 } P1FuncEntry; // 32 bytes — two entries per 64-byte cache line
 
-#define func_meta        ((FuncMeta *)ctx->p1_func_meta)
-#define func_meta_count  (ctx->p1_func_meta_count)
-#define func_meta_cap    (ctx->p1_func_meta_cap)
-#define p1_shadows       ((P1ShadowEntry *)ctx->p1_shadow_entries)
-#define p1_shadow_count  (ctx->p1_shadow_count)
-#define p1_shadow_cap    (ctx->p1_shadow_cap)
-#define p1_shadow_map    (ctx->p1_shadow_map)
-#define p1_entries       ((P1FuncEntry *)ctx->p1_func_entries)
-#define p1_entry_count   (ctx->p1_func_entry_count)
-#define p1_entry_cap     (ctx->p1_func_entry_cap)
+#define func_meta ((FuncMeta *)ctx->p1_func_meta)
+#define func_meta_count (ctx->p1_func_meta_count)
+#define func_meta_cap (ctx->p1_func_meta_cap)
+#define p1_shadows ((P1ShadowEntry *)ctx->p1_shadow_entries)
+#define p1_shadow_count (ctx->p1_shadow_count)
+#define p1_shadow_cap (ctx->p1_shadow_cap)
+#define p1_shadow_map (ctx->p1_shadow_map)
+#define p1_entries ((P1FuncEntry *)ctx->p1_func_entries)
+#define p1_entry_count (ctx->p1_func_entry_count)
+#define p1_entry_cap (ctx->p1_func_entry_cap)
+
 static inline P1FuncEntry *p1_alloc(int knd, uint16_t sid, Token *t) {
-	ARENA_ENSURE_CAP(&ctx->main_arena, ctx->p1_func_entries,
-			 p1_entry_count, p1_entry_cap, 256, P1FuncEntry);
+	ARENA_ENSURE_CAP(
+	    &ctx->main_arena, ctx->p1_func_entries, p1_entry_count, p1_entry_cap, 256, P1FuncEntry);
 	P1FuncEntry *e = &p1_entries[p1_entry_count++];
-	*e = (P1FuncEntry){.kind=knd, .scope_id=sid,
-	 .token_index=tok_idx(t), .tok=t};
+	*e = (P1FuncEntry){.kind = knd, .scope_id = sid, .token_index = tok_idx(t), .tok = t};
 	return e;
 }
 
 typedef enum { CLI_DEFAULT, CLI_RUN, CLI_EMIT, CLI_INSTALL } CliMode;
+
 typedef enum { CLI_ACT_NONE, CLI_ACT_HELP, CLI_ACT_VERSION } CliAction;
 
 typedef struct {
 	PrismFeatures features;
 	const char **sources;
 	const char **cc_args;
-	const char **dep_args;  // dependency-generation flags (routed to preprocessor only)
-	const char **prog_args; // args passed to the compiled binary in `run` mode (after `--`)
+	const char **dep_args;	// dependency-generation flags (routed to preprocessor only)
+	const char **prog_args; // args passed to the compiled binary in `run` mode
+				// (after `--`)
 	const char *output;
 	const char *cc;
 	int source_count, source_cap;
@@ -221,7 +245,7 @@ typedef struct {
 	bool profile;
 	bool compile_only;
 	bool passthrough;
-	bool no_link_pragma;     // -fno-link-pragma: suppress #pragma link libs
+	bool no_link_pragma; // -fno-link-pragma: suppress #pragma link libs
 } Cli;
 
 extern char **environ;
@@ -236,19 +260,20 @@ static volatile sig_atomic_t signal_temps_count = 0;
 
 #ifndef signal_temp_store // Windows: defined in windows.c
 #define signal_temp_store(val) __atomic_store_n(&signal_temp_registered, (val), __ATOMIC_RELEASE)
-#define signal_temp_load()     __atomic_load_n(&signal_temp_registered, __ATOMIC_ACQUIRE)
+#define signal_temp_load() __atomic_load_n(&signal_temp_registered, __ATOMIC_ACQUIRE)
 #define signal_temps_store(val) __atomic_store_n(&signal_temps_count, (val), __ATOMIC_RELEASE)
-#define signal_temps_load()     __atomic_load_n(&signal_temps_count, __ATOMIC_ACQUIRE)
-#define signal_temps_cas(expected, desired) \
-	__atomic_compare_exchange_n(&signal_temps_count, (expected), (desired), \
-				    false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
-#define cached_env_load()       __atomic_load_n(&cached_clean_env, __ATOMIC_ACQUIRE)
-#define cached_env_store(val)   __atomic_store_n(&cached_clean_env, (val), __ATOMIC_RELEASE)
-#define signal_temps_ready_store(idx, val) __atomic_store_n(&signal_temps_ready[(idx)], (val), __ATOMIC_RELEASE)
-#define signal_temps_ready_load(idx)       __atomic_load_n(&signal_temps_ready[(idx)], __ATOMIC_ACQUIRE)
-#define signal_temps_ready_cas(idx, expected, desired) \
-	__atomic_compare_exchange_n(&signal_temps_ready[(idx)], (expected), (desired), \
-				    false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
+#define signal_temps_load() __atomic_load_n(&signal_temps_count, __ATOMIC_ACQUIRE)
+#define signal_temps_cas(expected, desired)                                                                  \
+	__atomic_compare_exchange_n(                                                                         \
+	    &signal_temps_count, (expected), (desired), false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
+#define cached_env_load() __atomic_load_n(&cached_clean_env, __ATOMIC_ACQUIRE)
+#define cached_env_store(val) __atomic_store_n(&cached_clean_env, (val), __ATOMIC_RELEASE)
+#define signal_temps_ready_store(idx, val)                                                                   \
+	__atomic_store_n(&signal_temps_ready[(idx)], (val), __ATOMIC_RELEASE)
+#define signal_temps_ready_load(idx) __atomic_load_n(&signal_temps_ready[(idx)], __ATOMIC_ACQUIRE)
+#define signal_temps_ready_cas(idx, expected, desired)                                                       \
+	__atomic_compare_exchange_n(                                                                         \
+	    &signal_temps_ready[(idx)], (expected), (desired), false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
 #endif
 
 static void signal_temps_register(const char *path) {
@@ -265,15 +290,18 @@ static void signal_temps_register(const char *path) {
 					return;
 				}
 			}
-			fprintf(stderr, "prism: warning: temp file tracking full (%d); "
+			fprintf(stderr,
+				"prism: warning: temp file tracking full (%d); "
 				"'%s' won't be cleaned on signal\n",
-				SIGNAL_TEMPS_MAX, path);
+				SIGNAL_TEMPS_MAX,
+				path);
 			return;
 		}
 	} while (!signal_temps_cas(&n, n + 1));
 	memcpy(signal_temps[n], path, len + 1);
 	signal_temps_ready_store(n, 1);
 }
+
 static void signal_temps_clear(void) {
 	sig_atomic_t n = signal_temps_load();
 	for (int i = 0; i < n; i++) {
@@ -294,6 +322,7 @@ PRISM_MAYBE_UNUSED static void signal_temps_unregister(const char *path) {
 		}
 	}
 }
+
 static PRISM_THREAD_LOCAL char **system_include_list; // Ordered list of includes
 static PRISM_THREAD_LOCAL int system_include_capacity = 0;
 
@@ -310,7 +339,8 @@ typedef struct {
 	bool pending_for_paren;
 	bool parens_just_closed;
 	int brace_depth;
-	uint8_t pending_paren_kw; // next '(' from control keyword: 0=none, 1=loop, 2=switch
+	uint8_t pending_paren_kw; // next '(' from control keyword: 0=none, 1=loop,
+				  // 2=switch
 } CtrlState;
 
 static PRISM_THREAD_LOCAL ScopeNode *scope_stack = NULL;
@@ -320,22 +350,23 @@ static PRISM_THREAD_LOCAL int defer_stack_cap = 0;
 static PRISM_THREAD_LOCAL int defer_count = 0;
 static PRISM_THREAD_LOCAL bool in_defer_emit = false; // recursion guard for emit_defers_ex
 static PRISM_THREAD_LOCAL CtrlState ctrl_state;
-static PRISM_THREAD_LOCAL CtrlState *ctrl_save_stack = NULL; // saved ctrl_state for stmt-expr inside ctrl parens
+static PRISM_THREAD_LOCAL CtrlState *ctrl_save_stack =
+    NULL; // saved ctrl_state for stmt-expr inside ctrl parens
 static PRISM_THREAD_LOCAL int ctrl_save_depth = 0;
 static PRISM_THREAD_LOCAL int ctrl_save_cap = 0;
-static PRISM_THREAD_LOCAL int current_func_idx = -1; // Index into func_meta[] for the function being emitted
-static PRISM_THREAD_LOCAL int goto_entry_cursor = 0; // Cursor into entries[] for next P1K_GOTO lookup
-static PRISM_THREAD_LOCAL bool p1_file_has_orelse;   // true if any TT_ORELSE token exists in token stream
-static PRISM_THREAD_LOCAL bool is_msvc_cached;       // cached target_is_msvc(), set in transpile_tokens
+static PRISM_THREAD_LOCAL int current_func_idx = -1;  // Index into func_meta[] for the function being emitted
+static PRISM_THREAD_LOCAL int goto_entry_cursor = 0;  // Cursor into entries[] for next P1K_GOTO lookup
+static PRISM_THREAD_LOCAL bool p1_file_has_orelse;    // true if any TT_ORELSE token exists in token stream
+static PRISM_THREAD_LOCAL bool is_msvc_cached;	      // cached target_is_msvc(), set in transpile_tokens
 static PRISM_THREAD_LOCAL bool prism_profile = false; // --prism-prof: emit phase timing to stderr
 static PRISM_THREAD_LOCAL HashMap p1_func_proto_map;  // file-scope ident followed by '(' → (void*)1
 
 typedef struct {
 	char *name;
 	int len;
-	int block_depth;   // scope depth where the shadowing variable was declared
-	Token *var_tok;    // for error reporting
-	int defer_idx;     // which defer it conflicts with
+	int block_depth; // scope depth where the shadowing variable was declared
+	Token *var_tok;	 // for error reporting
+	int defer_idx;	 // which defer it conflicts with
 } DeferShadow;
 
 static PRISM_THREAD_LOCAL DeferShadow *defer_shadows = NULL;
@@ -347,8 +378,8 @@ static PRISM_THREAD_LOCAL char **pp_define_bufs = NULL;
 static PRISM_THREAD_LOCAL int pp_define_bufs_cap = 0;
 
 static Token *emit_expr_to_semicolon(Token *tok);
-static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bool single_eval_lhs,
-				 Token *stop_comma);
+static Token *
+emit_orelse_action(Token *tok, Token *var_name, bool has_const, bool single_eval_lhs, Token *stop_comma);
 static Token *emit_return_body(Token *tok, Token *stop);
 static Token *try_zero_init_decl(Token *tok);
 static Token *find_bare_orelse(Token *tok);
@@ -372,24 +403,31 @@ static inline void out_str(const char *s, int len);
 static bool cc_is_msvc(const char *cc);
 static inline void ctrl_reset(void);
 
-typedef struct { int scope_depth; Token *tok; } P1LabelResult;
+typedef struct {
+	int scope_depth;
+	Token *tok;
+} P1LabelResult;
+
 static P1LabelResult p1_label_find(Token *tok, int current_func_idx);
 
 static inline void emit_token_range(Token *start, Token *end) {
 	for (Token *t = start; t && t != end && t->kind != TK_EOF;) {
 		if (t != start) out_char(' ');
 		Token *r = try_strip_raw(t);
-		if (r) { t = r; continue; }
+		if (r) {
+			t = r;
+			continue;
+		}
 		OUT_TOK(t);
 		t = tok_next(t);
 	}
 }
+
 static inline double prism_now_ms(void) {
 #ifdef _WIN32
 	static PRISM_THREAD_LOCAL LARGE_INTEGER freq = {0};
 	LARGE_INTEGER now;
-	if (freq.QuadPart == 0)
-		QueryPerformanceFrequency(&freq);
+	if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
 	QueryPerformanceCounter(&now);
 	return (double)now.QuadPart * 1000.0 / (double)freq.QuadPart;
 #else
@@ -398,24 +436,25 @@ static inline double prism_now_ms(void) {
 	return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 #endif
 }
+
 static inline void clear_func_ret_type(void) {
 	ctx->func_ret_type_start = ctx->func_ret_type_end = NULL;
 	ctx->func_ret_type_suffix_start = ctx->func_ret_type_suffix_end = NULL;
 }
+
 static TypedefEntry *p1_shadow_entry_for_token(Token *t) {
 	for (int ix = typedef_get_index(tok_loc(t), t->len); ix >= 0;
 	     ix = typedef_table.entries[ix].prev_index) {
 		TypedefEntry *e = &typedef_table.entries[ix];
-		if (e->token_index == tok_idx(t) && e->is_shadow)
-			return e;
+		if (e->token_index == tok_idx(t) && e->is_shadow) return e;
 	}
 	return NULL;
 }
 
 // Phase 1C: record a variable declaration that shadows a typedef name.
 static void p1_register_shadow(Token *t, uint16_t scope_id, int brace_depth) {
-	ARENA_ENSURE_CAP(&ctx->main_arena, ctx->p1_shadow_entries,
-			 p1_shadow_count, p1_shadow_cap, 64, P1ShadowEntry);
+	ARENA_ENSURE_CAP(
+	    &ctx->main_arena, ctx->p1_shadow_entries, p1_shadow_count, p1_shadow_cap, 64, P1ShadowEntry);
 	int new_idx = p1_shadow_count++;
 	P1ShadowEntry *e = &p1_shadows[new_idx];
 	e->name = tok_loc(t);
@@ -427,9 +466,9 @@ static void p1_register_shadow(Token *t, uint16_t scope_id, int brace_depth) {
 	hashmap_put(&p1_shadow_map, tok_loc(t), t->len, (void *)(intptr_t)(new_idx + 1));
 	TYPEDEF_ADD_IDX(typedef_add_shadow(tok_loc(t), t->len, brace_depth), t);
 }
-static void p1_register_param_shadows(Token *open, Token *close,
-				      uint16_t scope_id, int brace_depth,
-				      bool check_vla);
+
+static void
+p1_register_param_shadows(Token *open, Token *close, uint16_t scope_id, int brace_depth, bool check_vla);
 
 static void reset_transpiler_state(void) {
 	ctx->scope_depth = 0;
@@ -489,14 +528,15 @@ PRISM_API PrismFeatures prism_defaults(void) {
 			       .auto_static = true,
 			       .bounds_check = true};
 }
+
 static uint32_t features_to_bits(PrismFeatures f) {
 	return (f.defer ? F_DEFER : 0) | (f.zeroinit ? F_ZEROINIT : 0) |
 	       (f.line_directives ? F_LINE_DIR : 0) | (f.warn_safety ? F_WARN_SAFETY : 0) |
 	       (f.flatten_headers ? F_FLATTEN : 0) | (f.orelse ? F_ORELSE : 0) |
-	       (f.auto_unreachable ? F_AUTO_UNREACHABLE : 0) |
-	       (f.auto_static ? F_AUTO_STATIC : 0) |
+	       (f.auto_unreachable ? F_AUTO_UNREACHABLE : 0) | (f.auto_static ? F_AUTO_STATIC : 0) |
 	       (f.bounds_check ? F_BOUNDS_CHECK : 0);
 }
+
 static const char *get_tmp_dir(void) {
 	static PRISM_THREAD_LOCAL char buf[PATH_MAX];
 #ifdef _WIN32
@@ -522,12 +562,14 @@ static const char *get_tmp_dir(void) {
 	return buf;
 #endif
 }
+
 static bool dir_has_write_bits(const char *path) {
 	struct stat st;
 	if (stat(path, &st) != 0) return true;
 	if (!S_ISDIR(st.st_mode)) return false;
 	return (st.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)) != 0;
 }
+
 static void out_flush(void) {
 	if (out_buf_pos > 0) {
 		fwrite(out_buf, 1, out_buf_pos, out_fp);
@@ -535,6 +577,7 @@ static void out_flush(void) {
 		out_buf_pos = 0;
 	}
 }
+
 static PRISM_COLD void out_str_slow(const char *s, int len) {
 	if (len >= OUT_BUF_SIZE) {
 		out_flush();
@@ -546,10 +589,12 @@ static PRISM_COLD void out_str_slow(const char *s, int len) {
 	memcpy(out_buf + out_buf_pos, s, len);
 	out_buf_pos += len;
 }
+
 static inline PRISM_ALWAYS_INLINE void out_char(char c) {
 	if (PRISM_UNLIKELY(out_buf_pos >= OUT_BUF_SIZE)) out_flush();
 	out_buf[out_buf_pos++] = c;
 }
+
 static inline PRISM_ALWAYS_INLINE void out_str(const char *s, int len) {
 	if (PRISM_UNLIKELY(len <= 0)) return;
 	if (PRISM_UNLIKELY(out_buf_pos + len >= OUT_BUF_SIZE)) {
@@ -566,20 +611,25 @@ static inline PRISM_ALWAYS_INLINE void out_str(const char *s, int len) {
 static inline bool target_is_msvc(void) {
 	return is_msvc_cached;
 }
-#define EMIT_UNREACHABLE() do { \
-	if (target_is_msvc()) OUT_LIT(" __assume(0);"); \
-	else OUT_LIT(" __builtin_unreachable();"); } while(0)
-#define TT_NON_EXPR_STMT (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO | \
-	TT_CASE | TT_DEFAULT | TT_IF | TT_LOOP | TT_SWITCH | TT_STORAGE | TT_TYPEDEF)
+
+#define EMIT_UNREACHABLE()                                                                                   \
+	do {                                                                                                 \
+		if (target_is_msvc()) OUT_LIT(" __assume(0);");                                              \
+		else                                                                                         \
+			OUT_LIT(" __builtin_unreachable();");                                                \
+	} while (0)
+#define TT_NON_EXPR_STMT                                                                                     \
+	(TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO | TT_CASE | TT_DEFAULT | TT_IF | TT_LOOP | TT_SWITCH | \
+	 TT_STORAGE | TT_TYPEDEF)
 
 // Emit __typeof__ (GNU) or typeof (C23/MSVC).
 // MSVC does not support __typeof__; C23 typeof is available under /std:clatest.
 static inline void emit_typeof_keyword(void) {
-	if (target_is_msvc())
-		OUT_LIT("typeof");
+	if (target_is_msvc()) OUT_LIT("typeof");
 	else
 		OUT_LIT("__typeof__");
 }
+
 static void out_close(void) {
 	if (out_fp) {
 		out_flush();
@@ -587,6 +637,7 @@ static void out_close(void) {
 		out_fp = NULL;
 	}
 }
+
 static void out_uint(unsigned long long v) {
 	char buf[24], *p = buf + sizeof(buf);
 	do {
@@ -594,9 +645,11 @@ static void out_uint(unsigned long long v) {
 	} while (v /= 10);
 	out_str(p, buf + sizeof(buf) - p);
 }
+
 static void out_line(int line_no, const char *file, bool is_system) {
 	if (use_linemarkers) OUT_LIT("# ");
-	else OUT_LIT("#line ");
+	else
+		OUT_LIT("#line ");
 	out_uint(line_no);
 	OUT_LIT(" \"");
 	for (const char *p = file; *p; p++) {
@@ -606,8 +659,10 @@ static void out_line(int line_no, const char *file, bool is_system) {
 		out_char(c);
 	}
 	if (use_linemarkers && is_system) OUT_LIT("\" 3\n");
-	else OUT_LIT("\"\n");
+	else
+		OUT_LIT("\"\n");
 }
+
 static void collect_system_includes(void) {
 	HashMap include_map = {0};
 	for (int i = 0; i < ctx->input_file_count; i++) {
@@ -628,6 +683,7 @@ static void collect_system_includes(void) {
 		system_include_list[ctx->system_include_count++] = f->name;
 	}
 }
+
 static void emit_system_header_diag_push(void) {
 	if (target_is_msvc()) {
 		OUT_LIT("#pragma warning(push, 0)\n");
@@ -645,6 +701,7 @@ static void emit_system_header_diag_push(void) {
 		"#pragma GCC diagnostic ignored \"-Wsign-conversion\"\n"
 		"#pragma GCC diagnostic ignored \"-Wconversion\"\n");
 }
+
 static void emit_system_header_diag_pop(void) {
 	if (target_is_msvc()) {
 		OUT_LIT("#pragma warning(pop)\n");
@@ -652,6 +709,7 @@ static void emit_system_header_diag_pop(void) {
 	}
 	OUT_LIT("#pragma GCC diagnostic pop\n");
 }
+
 static void emit_define_guarded(const char *def) {
 	const char *eq = strchr(def, '=');
 	int name_len = eq ? (int)(eq - def) : (int)strlen(def);
@@ -666,19 +724,23 @@ static void emit_define_guarded(const char *def) {
 	}
 	OUT_LIT("\n#endif\n");
 }
+
 static void emit_consumed_defines(void) {
 	bool any = ctx->extra_define_count > 0 || ctx->source_define_count > 0;
 	if (!any) {
 		for (int i = 0; i < ctx->extra_compiler_flags_count; i++) {
 			const char *f = ctx->extra_compiler_flags[i];
-			if (f[0] == '-' && f[1] == 'D') { any = true; break; }
+			if (f[0] == '-' && f[1] == 'D') {
+				any = true;
+				break;
+			}
 		}
 	}
 
 	if (!any && ctx->system_include_count == 0) return;
-	// Emit user-specified API defines (take priority over built-in feature test macros)
-	for (int i = 0; i < ctx->extra_define_count; i++)
-		emit_define_guarded(ctx->extra_defines[i]);
+	// Emit user-specified API defines (take priority over built-in feature test
+	// macros)
+	for (int i = 0; i < ctx->extra_define_count; i++) emit_define_guarded(ctx->extra_defines[i]);
 	for (int i = 0; i < ctx->extra_compiler_flags_count; i++) {
 		const char *f = ctx->extra_compiler_flags[i];
 		if (f[0] == '-' && f[1] == 'D') {
@@ -704,17 +766,18 @@ static void emit_consumed_defines(void) {
 				while (*gp && *gp != '\n') gp++;
 				if (*gp) gp++;
 			}
-			for (int d = 0; d < depth; d++)
-				OUT_LIT("#endif\n");
+			for (int d = 0; d < depth; d++) OUT_LIT("#endif\n");
 		}
 	}
 
 	OUT_LIT("#if !defined(_WIN32)\n"
 		"#ifndef _POSIX_C_SOURCE\n#define _POSIX_C_SOURCE 200809L\n#endif\n"
 		"#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n"
-		"#ifdef __APPLE__\n#ifndef _DARWIN_C_SOURCE\n#define _DARWIN_C_SOURCE\n#endif\n#endif\n"
+		"#ifdef __APPLE__\n#ifndef _DARWIN_C_SOURCE\n#define "
+		"_DARWIN_C_SOURCE\n#endif\n#endif\n"
 		"#endif\n\n");
 }
+
 static void emit_system_includes(void) {
 	emit_consumed_defines();
 	if (ctx->system_include_count == 0) return;
@@ -728,22 +791,27 @@ static void emit_system_includes(void) {
 	emit_system_header_diag_pop();
 	out_char('\n');
 }
+
 static void system_includes_reset(void) {
 	system_include_list = NULL;
 	ctx->system_include_count = 0;
 	system_include_capacity = 0;
 }
+
 static inline void ctrl_reset(void) {
 	ctrl_state = (CtrlState){0};
 }
+
 static inline ScopeNode *scope_block_top(void) {
 	for (int i = ctx->scope_depth - 1; i >= 0; i--)
 		if (is_brace_scope(scope_stack[i].kind)) return &scope_stack[i];
 	return NULL;
 }
+
 static inline bool in_for_init(void) {
 	return ctx->scope_depth > 0 && scope_stack[ctx->scope_depth - 1].kind == SCOPE_FOR_PAREN;
 }
+
 static inline bool in_ctrl_paren(void) {
 	for (int i = ctx->scope_depth - 1; i >= 0; i--) {
 		ScopeKind k = scope_stack[i].kind;
@@ -752,6 +820,7 @@ static inline bool in_ctrl_paren(void) {
 	}
 	return false;
 }
+
 static inline bool in_struct_body(void) {
 	for (int i = ctx->scope_depth - 1; i >= 0; i--) {
 		if (scope_stack[i].is_stmt_expr) return false;
@@ -759,6 +828,7 @@ static inline bool in_struct_body(void) {
 	}
 	return false;
 }
+
 static inline bool in_generic(void) {
 	for (int i = ctx->scope_depth - 1; i >= 0; i--) {
 		if (scope_stack[i].kind == SCOPE_GENERIC) return true;
@@ -766,6 +836,7 @@ static inline bool in_generic(void) {
 	}
 	return false;
 }
+
 static void end_statement_after_semicolon(void) {
 	ctx->at_stmt_start = true;
 	if (ctrl_state.pending && !in_ctrl_paren() && !in_struct_body()) {
@@ -775,15 +846,16 @@ static void end_statement_after_semicolon(void) {
 		ctrl_reset();
 	}
 }
+
 static void scope_push_kind(ScopeKind kind) {
 	ENSURE_ARRAY_CAP(scope_stack, ctx->scope_depth + 1, scope_stack_cap, 256, ScopeNode);
 	ScopeNode *s = &scope_stack[ctx->scope_depth];
 	*s = (ScopeNode){.kind = kind};
 	s->defer_start_idx = defer_count;
-	if (kind == SCOPE_BLOCK)
-		ctx->block_depth++;
+	if (kind == SCOPE_BLOCK) ctx->block_depth++;
 	ctx->scope_depth++;
 }
+
 static void scope_pop(void) {
 	if (ctx->scope_depth > 0) {
 		ctx->scope_depth--;
@@ -799,21 +871,24 @@ static void scope_pop(void) {
 		}
 	}
 }
+
 static void defer_add(Token *defer_keyword, Token *start, Token *end) {
 	if (ctx->block_depth <= 0) error_tok(start, "defer outside of any scope");
 	ENSURE_ARRAY_CAP(defer_stack, defer_count + 1, defer_stack_cap, 64, DeferEntry);
 	defer_stack[defer_count++] = (DeferEntry){start, end, defer_keyword};
 }
+
 static inline bool emit_token_starts_decl_like(Token *tok) {
 	if (!tok) return false;
-	if (tok->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_TYPEDEF | TT_INLINE |
-			TT_TYPEOF | TT_ALIGNAS | TT_BITINT))
+	if (tok->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_TYPEDEF | TT_INLINE | TT_TYPEOF |
+			TT_ALIGNAS | TT_BITINT))
 		return true;
 	if (is_type_keyword(tok) || is_known_typedef(tok)) return true;
 	if (is_c23_attr(tok)) return true;
 	if ((tok->tag & TT_ATTR) && tok_next(tok) && match_ch(tok_next(tok), '(')) return true;
 	return false;
 }
+
 static inline bool emit_newline_before_decl_after_stmt_boundary(Token *prev, Token *tok) {
 	if (!prev || !tok) return false;
 	// Member declarations in struct/union/enum bodies use `;` between specifiers;
@@ -823,10 +898,11 @@ static inline bool emit_newline_before_decl_after_stmt_boundary(Token *prev, Tok
 	if (!(match_ch(prev, ';') || match_ch(prev, '}'))) return false;
 	return emit_token_starts_decl_like(tok);
 }
+
 static PRISM_HOT void emit_tok(Token *tok) {
 	TokenCold *c = tok_cold(tok);
-	File *f = (c->file_idx < (uint32_t)ctx->input_file_count)
-		  ? ctx->input_files[c->file_idx] : ctx->current_file;
+	File *f = (c->file_idx < (uint32_t)ctx->input_file_count) ? ctx->input_files[c->file_idx]
+								  : ctx->current_file;
 	char *loc = f->contents + c->loc_offset;
 	uint32_t feat = ctx->features;
 	if (__builtin_expect(!(feat & F_FLATTEN) && f->is_system && f->is_include_entry, 0)) return;
@@ -858,16 +934,13 @@ static PRISM_HOT void emit_tok(Token *tok) {
 			const char *p = loc + 1;
 			const char *end = loc + tok->len;
 			while (p < end && (*p == ' ' || *p == '\t')) p++;
-			if (end - p >= 7 && memcmp(p, "define", 6) == 0 &&
-			    (p[6] == ' ' || p[6] == '\t')) {
+			if (end - p >= 7 && memcmp(p, "define", 6) == 0 && (p[6] == ' ' || p[6] == '\t')) {
 				p += 6;
 				while (p < end && (*p == ' ' || *p == '\t')) p++;
 				const char *name = p;
-				while (p < end &&
-				       ((*p >= 'a' && *p <= 'z') ||
-					(*p >= 'A' && *p <= 'Z') ||
-					(*p >= '0' && *p <= '9') ||
-					*p == '_')) p++;
+				while (p < end && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+						   (*p >= '0' && *p <= '9') || *p == '_'))
+					p++;
 				if (p > name) {
 					OUT_LIT("#undef ");
 					out_str(name, (int)(p - name));
@@ -882,32 +955,41 @@ static PRISM_HOT void emit_tok(Token *tok) {
 
 	out_str(loc, tok->len);
 	last_emitted = tok;
-	if (prev_emitted && match_ch(tok, '{') && (prev_emitted->tag & TT_SUE))
-		ctx->aggregate_member_nest++;
+	if (prev_emitted && match_ch(tok, '{') && (prev_emitted->tag & TT_SUE)) ctx->aggregate_member_nest++;
 	else if (match_ch(tok, '}') && ctx->aggregate_member_nest > 0)
 		ctx->aggregate_member_nest--;
 }
+
 static inline Token *emit_tok_checked(Token *t) {
 	Token *r = try_strip_raw(t);
 	if (r) return r;
 	emit_tok(t);
 	return NULL;
 }
+
 static inline Token *emit_advance(Token *t) {
 	Token *r = emit_tok_checked(t);
 	return r ? r : tok_next(t);
 }
+
 static bool type_range_any(Token *start, Token *end, bool (*pred)(Token *)) {
 	for (Token *t = start; t && t != end; t = tok_next(t))
 		if (pred(t)) return true;
 	return false;
 }
+
 static bool is_vol_or_vol_member_td(Token *t) {
 	return is_volatile_typedef(t) || has_volatile_member_typedef(t);
 }
-static bool is_const_td(Token *t) { return is_const_typedef(t); }
+
+static bool is_const_td(Token *t) {
+	return is_const_typedef(t);
+}
+
 static void emit_ll_temp(void (*emit_id)(unsigned), unsigned id) {
-	OUT_LIT(" long long"); emit_id(id); OUT_LIT(" = (");
+	OUT_LIT(" long long");
+	emit_id(id);
+	OUT_LIT(" = (");
 }
 
 static Token *emit_c23_attr(Token *t) {
@@ -917,6 +999,7 @@ static Token *emit_c23_attr(Token *t) {
 	emit_tok(bclose);
 	return tok_next(bclose);
 }
+
 static void emit_orelse_ternary(Token *lhs_start, Token *orelse, Token *rhs_start, Token *rhs_end) {
 	OUT_LIT(" (");
 	emit_token_range_orelse(lhs_start, orelse);
@@ -926,49 +1009,75 @@ static void emit_orelse_ternary(Token *lhs_start, Token *orelse, Token *rhs_star
 	emit_token_range_orelse(rhs_start, rhs_end);
 	OUT_LIT(")");
 }
-static void emit_prism_dim(unsigned dim) { OUT_LIT(" __prism_dim_"); out_uint(dim); }
-static void emit_prism_oe(unsigned oe) { OUT_LIT(" __prism_oe_"); out_uint(oe); }
+
+static void emit_prism_dim(unsigned dim) {
+	OUT_LIT(" __prism_dim_");
+	out_uint(dim);
+}
+
+static void emit_prism_oe(unsigned oe) {
+	OUT_LIT(" __prism_oe_");
+	out_uint(oe);
+}
+
 static void emit_prism_oe_ternary_ref(unsigned oe) {
-	emit_prism_oe(oe); OUT_LIT(" ?"); emit_prism_oe(oe); OUT_LIT(" : (");
+	emit_prism_oe(oe);
+	OUT_LIT(" ?");
+	emit_prism_oe(oe);
+	OUT_LIT(" : (");
 }
+
 static void emit_prism_oe_chain_assign(unsigned oe) {
-	emit_prism_oe(oe); OUT_LIT(" ="); emit_prism_oe(oe);
-	OUT_LIT(" ?"); emit_prism_oe(oe); OUT_LIT(" : (");
+	emit_prism_oe(oe);
+	OUT_LIT(" =");
+	emit_prism_oe(oe);
+	OUT_LIT(" ?");
+	emit_prism_oe(oe);
+	OUT_LIT(" : (");
 }
+
 static Token *find_depth0_token(Token *start, Token *end, bool want_comma) {
 	Token *hit = NULL;
 	int d = 0;
 	for (Token *s = start; s != end; s = tok_next(s)) {
 		if (s->flags & TF_OPEN) d++;
-		else if (s->flags & TF_CLOSE) d--;
+		else if (s->flags & TF_CLOSE)
+			d--;
 		else if (d == 0) {
 			if (want_comma) {
 				if (match_ch(s, ',')) hit = s;
 			} else if (is_assignment_operator_token(s)) {
 				if (!match_ch(s, '='))
-					error_tok(s, "bare assignment with 'orelse' cannot use compound operators "
-						  "(e.g. +=, -=); use a plain '=' assignment");
+					error_tok(
+					    s,
+					    "bare assignment with 'orelse' cannot use compound operators "
+					    "(e.g. +=, -=); use a plain '=' assignment");
 				hit = s;
 			}
 		}
 	}
 	return hit;
 }
+
 static Token *last_depth0_comma(Token *start, Token *end) {
 	return find_depth0_token(start, end, true);
 }
+
 static Token *find_depth0_assign_eq(Token *start, Token *end) {
 	return find_depth0_token(start, end, false);
 }
+
 static void for_each_enum_constant(Token *brace, void (*fn)(Token *, void *), void *ud) {
 	Token *end = tok_match(brace);
 	if (!end) return;
-	for (Token *t = tok_next(brace); t && t != end && t->kind != TK_EOF; ) {
+	for (Token *t = tok_next(brace); t && t != end && t->kind != TK_EOF;) {
 		if (t->kind == TK_IDENT || t->kind == TK_KEYWORD) {
 			fn(t, ud);
 			while (t && t != end && t->kind != TK_EOF && !match_ch(t, ',')) {
-				if ((t->flags & TF_OPEN) && tok_match(t))
-					{ t = tok_next(tok_match(t)); continue; }
+				if ((t->flags & TF_OPEN) && tok_match(t)) {
+					t = tok_next(tok_match(t));
+					continue;
+				}
 				t = tok_next(t);
 			}
 			if (t && match_ch(t, ',')) t = tok_next(t);
@@ -977,6 +1086,7 @@ static void for_each_enum_constant(Token *brace, void (*fn)(Token *, void *), vo
 		}
 	}
 }
+
 static inline Token *emit_gnu_label_decl(Token *tok) {
 	if (!ctx->at_stmt_start || !is_gnu_label_decl_head(tok)) return NULL;
 	for (Token *t = tok; t && t->kind != TK_EOF; t = tok_next(t)) {
@@ -989,30 +1099,45 @@ static inline Token *emit_gnu_label_decl(Token *tok) {
 	return NULL;
 }
 
-#define ER_SKIP_PREP    1  // Skip TK_PREP_DIR tokens
-#define ER_BALANCED     2  // Use walk_balanced for paren/bracket groups (not just stmt-expr)
+#define ER_SKIP_PREP 1 // Skip TK_PREP_DIR tokens
+#define ER_BALANCED 2  // Use walk_balanced for paren/bracket groups (not just stmt-expr)
 
 static void emit_range_ex(Token *start, Token *end, int flags) {
 	Token *t = start;
 	while (t && t != end && t->kind != TK_EOF) {
-		if ((flags & ER_SKIP_PREP) && t->kind == TK_PREP_DIR) { t = tok_next(t); continue; }
+		if ((flags & ER_SKIP_PREP) && t->kind == TK_PREP_DIR) {
+			t = tok_next(t);
+			continue;
+		}
 		if ((flags & ER_BALANCED) && (t->flags & TF_OPEN) && match_set(t, CH('(') | CH('['))) {
-			walk_balanced(t, true); t = tok_next(tok_match(t)); continue;
+			walk_balanced(t, true);
+			t = tok_next(tok_match(t));
+			continue;
 		}
 		// C23 [[...]]: Phase 1D rejects 'orelse' inside attribute arguments;
 		if ((t->flags & TF_C23_ATTR) && tok_match(t)) {
 			t = emit_c23_attr(t);
 			continue;
 		}
-		if (is_stmt_expr_open(t) && tok_match(t)) { walk_balanced(t, true); t = tok_next(tok_match(t)); continue; }
+		if (is_stmt_expr_open(t) && tok_match(t)) {
+			walk_balanced(t, true);
+			t = tok_next(tok_match(t));
+			continue;
+		}
 		// Defense-in-depth: typeof(expr orelse val) → typeof(ternary)
-		if (FEAT(F_ORELSE) && (t->tag & TT_TYPEOF)) { Token *next = try_typeof_orelse(t); if (next) { t = next; continue; } }
+		if (FEAT(F_ORELSE) && (t->tag & TT_TYPEOF)) {
+			Token *next = try_typeof_orelse(t);
+			if (next) {
+				t = next;
+				continue;
+			}
+		}
 		t = emit_advance(t);
 	}
 }
 
-#define emit_range(start, end)          emit_range_ex(start, end, 0)
-#define emit_range_no_prep(start, end)  emit_range_ex(start, end, ER_SKIP_PREP)
+#define emit_range(start, end) emit_range_ex(start, end, 0)
+#define emit_range_no_prep(start, end) emit_range_ex(start, end, ER_SKIP_PREP)
 #define emit_balanced_range(start, end) emit_range_ex(start, end, ER_SKIP_PREP | ER_BALANCED)
 
 static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool brace_wrap);
@@ -1032,10 +1157,10 @@ static bool defer_walk(DeferEmitMode mode, int stop_depth, bool dry_run) {
 		ScopeKind sk = scope_stack[d].kind;
 		if (sk != SCOPE_BLOCK) {
 			/* break/continue inside GNU stmt-expr in e.g. while(cond) sees the loop's
-			 * body block only after `{` — the matching while/switch '(' is CTRL/FOR_PAREN.
-			 * Stop defer unwinding here without emitting outer scopes' defers. */
-			if (mode == DEFER_BREAK &&
-			    (sk == SCOPE_CTRL_PAREN || sk == SCOPE_FOR_PAREN) &&
+       * body block only after `{` — the matching while/switch '(' is
+       * CTRL/FOR_PAREN. Stop defer unwinding here without emitting outer
+       * scopes' defers. */
+			if (mode == DEFER_BREAK && (sk == SCOPE_CTRL_PAREN || sk == SCOPE_FOR_PAREN) &&
 			    (scope_stack[d].is_loop || scope_stack[d].is_switch))
 				break;
 			if (mode == DEFER_CONTINUE && (sk == SCOPE_CTRL_PAREN || sk == SCOPE_FOR_PAREN) &&
@@ -1046,10 +1171,12 @@ static bool defer_walk(DeferEmitMode mode, int stop_depth, bool dry_run) {
 		if (mode == DEFER_TO_DEPTH && curr_bd <= stop_depth) break;
 		ScopeNode *scope = &scope_stack[d];
 		if (dry_run) {
-			if (defer_count > scope->defer_start_idx) { found = true; break; }
+			if (defer_count > scope->defer_start_idx) {
+				found = true;
+				break;
+			}
 		} else {
-			if (scope->defer_start_idx < min_defer_idx)
-				min_defer_idx = scope->defer_start_idx;
+			if (scope->defer_start_idx < min_defer_idx) min_defer_idx = scope->defer_start_idx;
 			for (int i = current_defer; i >= scope->defer_start_idx; i--) {
 				out_char(' ');
 				emit_deferred_range(defer_stack[i].stmt, defer_stack[i].end);
@@ -1064,8 +1191,7 @@ static bool defer_walk(DeferEmitMode mode, int stop_depth, bool dry_run) {
 	}
 	if (!dry_run) {
 		in_defer_emit = saved_in_defer;
-		if (mode != DEFER_SCOPE && defer_shadow_count > 0 &&
-		    min_defer_idx < defer_count) {
+		if (mode != DEFER_SCOPE && defer_shadow_count > 0 && min_defer_idx < defer_count) {
 			for (int si = 0; si < defer_shadow_count; si++) {
 				DeferShadow *sh = &defer_shadows[si];
 				if (sh->defer_idx >= min_defer_idx && sh->defer_idx < defer_count)
@@ -1074,22 +1200,25 @@ static bool defer_walk(DeferEmitMode mode, int stop_depth, bool dry_run) {
 						  "in an enclosing scope and a control-flow exit "
 						  "(return/goto/break/continue) would paste the "
 						  "defer while the shadow is live",
-						  sh->len, sh->name);
+						  sh->len,
+						  sh->name);
 			}
 		}
 	}
 	return found;
 }
+
 static inline void emit_defers_ex(DeferEmitMode mode, int stop_depth) {
 	defer_walk(mode, stop_depth, false);
 }
+
 static inline bool has_defers_for(DeferEmitMode mode, int stop_depth) {
 	return defer_walk(mode, stop_depth, true);
 }
 
 // Phase 1 capture analysis: compute the exact set of externally-captured
-static void defer_body_populate_captures(Token *body, Token *body_end,
-		HashMap *out, HashMap *body_captures_map) {
+static void
+defer_body_populate_captures(Token *body, Token *body_end, HashMap *out, HashMap *body_captures_map) {
 	HashMap *body_set = arena_alloc(&ctx->main_arena, sizeof(HashMap));
 	*body_set = (HashMap){0};
 	char tmp[16];
@@ -1098,6 +1227,7 @@ static void defer_body_populate_captures(Token *body, Token *body_end,
 	memcpy(idx_key, tmp, idx_len + 1);
 	hashmap_put(body_captures_map, idx_key, idx_len, body_set);
 	HashMap local_decls = {0};
+
 	typedef struct {
 		char *name;
 		int len;
@@ -1105,6 +1235,7 @@ static void defer_body_populate_captures(Token *body, Token *body_end,
 		void *prev_val;
 		bool had_binding;
 	} ScopeDecl;
+
 	int se_cap = 256, se_count = 0;
 	ScopeDecl *se_stack = arena_alloc(&ctx->main_arena, se_cap * sizeof(ScopeDecl));
 	HashMap for_scopes = {0};
@@ -1115,16 +1246,15 @@ static void defer_body_populate_captures(Token *body, Token *body_end,
 	bool in_decl = false, was_in_decl = false;
 	int decl_bd = 0, for_init_pd = -1;
 	Token *for_header_open = NULL;
-	int enum_bd = -1; // brace depth of enum body (-1 = not in enum)
+	int enum_bd = -1;	   // brace depth of enum body (-1 = not in enum)
 	bool decl_is_enum = false; // current in_decl triggered by enum keyword
 
-	for (Token *t = body; t && t != body_end && t->kind != TK_EOF;
-	     prev = t, t = tok_next(t)) {
+	for (Token *t = body; t && t != body_end && t->kind != TK_EOF; prev = t, t = tok_next(t)) {
 		if (match_ch(t, '{')) {
 			if (bd < 255) block_base_pd[bd + 1] = pd;
-			if (in_decl && decl_is_enum && enum_bd < 0)
-				enum_bd = bd + 1;
-			bd++; continue;
+			if (in_decl && decl_is_enum && enum_bd < 0) enum_bd = bd + 1;
+			bd++;
+			continue;
 		}
 		if (match_ch(t, '}')) {
 			bd--;
@@ -1134,15 +1264,14 @@ static void defer_body_populate_captures(Token *body, Token *body_end,
 				se_count--;
 				ScopeDecl *sd = &se_stack[se_count];
 				void *val = hashmap_get(&local_decls, sd->name, sd->len);
-				if (val && val != (void*)1) {
+				if (val && val != (void *)1) {
 					int stored = (int)((intptr_t)val - 2);
 					if (stored == sd->depth) {
 						if (sd->had_binding)
-							hashmap_put(&local_decls, sd->name, sd->len,
-								     sd->prev_val);
+							hashmap_put(
+							    &local_decls, sd->name, sd->len, sd->prev_val);
 						else
-							hashmap_remove(&local_decls, sd->name,
-								       sd->len);
+							hashmap_remove(&local_decls, sd->name, sd->len);
 					}
 				}
 			}
@@ -1154,7 +1283,8 @@ static void defer_body_populate_captures(Token *body, Token *body_end,
 				for_init_pd = pd + 1;
 				for_header_open = t;
 			}
-			pd++; continue;
+			pd++;
+			continue;
 		}
 		if (match_set(t, CH(')') | CH(']'))) {
 			pd--;
@@ -1162,29 +1292,36 @@ static void defer_body_populate_captures(Token *body, Token *body_end,
 			continue;
 		}
 		if (match_ch(t, ';')) {
-			in_decl = false; was_in_decl = false; decl_is_enum = false;
+			in_decl = false;
+			was_in_decl = false;
+			decl_is_enum = false;
 			if (for_init_pd >= 0 && pd == for_init_pd) for_init_pd = -1;
 			continue;
 		}
 		int bpd = (bd > 0) ? block_base_pd[bd] : 0;
-		if (pd == bpd && match_ch(t, '=')) { in_decl = false; continue; }
-		if (pd == bpd && match_ch(t, ',') && was_in_decl &&
-		    (bd == decl_bd || (enum_bd >= 0 && bd == enum_bd))) { in_decl = true; continue; }
-		if (((bd > 0 && pd == bpd) ||
-		     (for_init_pd >= 0 && pd == for_init_pd)) &&
-		    (is_type_keyword(t) || (t->tag & (TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_TYPEDEF)))) {
-			if (!in_decl) decl_is_enum = false;
-			in_decl = true; was_in_decl = true; decl_bd = bd;
-			if ((t->tag & TT_SUE) && t->ch0 == 'e')
-				decl_is_enum = true;
+		if (pd == bpd && match_ch(t, '=')) {
+			in_decl = false;
 			continue;
 		}
-		if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
-		    !(prev && (prev->tag & TT_MEMBER))) {
+		if (pd == bpd && match_ch(t, ',') && was_in_decl &&
+		    (bd == decl_bd || (enum_bd >= 0 && bd == enum_bd))) {
+			in_decl = true;
+			continue;
+		}
+		if (((bd > 0 && pd == bpd) || (for_init_pd >= 0 && pd == for_init_pd)) &&
+		    (is_type_keyword(t) || (t->tag & (TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_TYPEDEF)))) {
+			if (!in_decl) decl_is_enum = false;
+			in_decl = true;
+			was_in_decl = true;
+			decl_bd = bd;
+			if ((t->tag & TT_SUE) && t->ch0 == 'e') decl_is_enum = true;
+			continue;
+		}
+		if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) && !(prev && (prev->tag & TT_MEMBER))) {
 			char *name = tok_loc(t);
 			int nlen = t->len;
 			void *val = hashmap_get(&local_decls, name, nlen);
-			if (val == (void*)1) continue;
+			if (val == (void *)1) continue;
 			void *fv = hashmap_get(&for_scopes, name, nlen);
 			if (fv) {
 				uint32_t fe = (uint32_t)(uintptr_t)fv;
@@ -1199,14 +1336,15 @@ static void defer_body_populate_captures(Token *body, Token *body_end,
 				void *prev_val = hashmap_get(&local_decls, name, nlen);
 				if (se_count >= se_cap) {
 					int new_cap = se_cap * 2;
-					ScopeDecl *ns = arena_alloc(&ctx->main_arena, new_cap * sizeof(ScopeDecl));
+					ScopeDecl *ns =
+					    arena_alloc(&ctx->main_arena, new_cap * sizeof(ScopeDecl));
 					memcpy(ns, se_stack, se_count * sizeof(ScopeDecl));
-					se_stack = ns; se_cap = new_cap;
+					se_stack = ns;
+					se_cap = new_cap;
 				}
 				se_stack[se_count++] =
 				    (ScopeDecl){name, nlen, bd, prev_val, prev_val != NULL};
-				hashmap_put(&local_decls, name, nlen,
-					    (void*)((intptr_t)(bd + 2)));
+				hashmap_put(&local_decls, name, nlen, (void *)((intptr_t)(bd + 2)));
 				continue;
 			}
 			if (for_init_pd >= 0 && in_decl) {
@@ -1215,37 +1353,35 @@ static void defer_body_populate_captures(Token *body, Token *body_end,
 					Token *end = skip_one_stmt(tok_next(tok_match(for_header_open)));
 					fbe = end ? tok_idx(end) : 0;
 				}
-				hashmap_put(&for_scopes, name, nlen, (void*)(uintptr_t)fbe);
+				hashmap_put(&for_scopes, name, nlen, (void *)(uintptr_t)fbe);
 				continue;
 			}
-			hashmap_put(out, name, nlen, (void*)1);
-			hashmap_put(body_set, name, nlen, (void*)1);
-			hashmap_put(&local_decls, name, nlen, (void*)1);
+			hashmap_put(out, name, nlen, (void *)1);
+			hashmap_put(body_set, name, nlen, (void *)1);
+			hashmap_put(&local_decls, name, nlen, (void *)1);
 		}
 	}
 }
-static bool defer_body_has_capture(int func_idx, Token *body,
-				   const char *name, int nlen) {
+
+static bool defer_body_has_capture(int func_idx, Token *body, const char *name, int nlen) {
 	if (func_idx < 0) return false;
 	char idx_buf[16];
 	int idx_len = snprintf(idx_buf, sizeof(idx_buf), "%u", tok_idx(body));
-	HashMap *body_set = hashmap_get(
-		&func_meta[func_idx].defer_body_captures, idx_buf, idx_len);
-	return body_set && hashmap_get(body_set, (char*)name, nlen);
+	HashMap *body_set = hashmap_get(&func_meta[func_idx].defer_body_captures, idx_buf, idx_len);
+	return body_set && hashmap_get(body_set, (char *)name, nlen);
 }
+
 static void check_defer_var_shadow(Token *var_name) {
 	if (!FEAT(F_DEFER) || defer_count == 0) return;
 	ScopeNode *blk = scope_block_top();
 	if (!blk) return;
 	int outer_defer_end = blk->defer_start_idx;
-	if (in_for_init() && outer_defer_end <= 0)
-		outer_defer_end = defer_count;
+	if (in_for_init() && outer_defer_end <= 0) outer_defer_end = defer_count;
 	int same_block_start = blk->defer_start_idx;
 	if (outer_defer_end <= 0 && same_block_start >= defer_count) return;
 	char *name = tok_loc(var_name);
 	int nlen = var_name->len;
-	if (current_func_idx >= 0 &&
-	    !hashmap_get(&func_meta[current_func_idx].defer_name_set, name, nlen))
+	if (current_func_idx >= 0 && !hashmap_get(&func_meta[current_func_idx].defer_name_set, name, nlen))
 		return;
 	for (int i = 0; i < defer_count; i++) {
 		if (i >= outer_defer_end && i < same_block_start) continue;
@@ -1253,8 +1389,7 @@ static void check_defer_var_shadow(Token *var_name) {
 		uint32_t stmt_idx = tok_idx(defer_stack[i].stmt);
 		uint32_t end_idx = defer_stack[i].end ? tok_idx(defer_stack[i].end) : UINT32_MAX;
 		if (var_idx >= stmt_idx && var_idx < end_idx) continue;
-		if (!defer_body_has_capture(current_func_idx, defer_stack[i].stmt, name, nlen))
-			continue;
+		if (!defer_body_has_capture(current_func_idx, defer_stack[i].stmt, name, nlen)) continue;
 		if (defer_shadow_count >= defer_shadow_cap) {
 			int new_cap = defer_shadow_cap ? defer_shadow_cap * 2 : 64;
 			void *tmp = realloc(defer_shadows, new_cap * sizeof(*defer_shadows));
@@ -1263,27 +1398,29 @@ static void check_defer_var_shadow(Token *var_name) {
 			defer_shadow_cap = new_cap;
 		}
 		if (i >= same_block_start && !in_for_init())
-			error_tok(var_name,
-				  ERR_DEFER_SHADOW_SAME_SCOPE,
-				  nlen, name);
+			error_tok(var_name, ERR_DEFER_SHADOW_SAME_SCOPE, nlen, name);
 		defer_shadows[defer_shadow_count++] = (DeferShadow){
-				.name = name, .len = nlen,
-				.block_depth = ctx->block_depth + (in_for_init() ? 1 : 0),
-				.var_tok = var_name,
-				.defer_idx = i,
-			};
+		    .name = name,
+		    .len = nlen,
+		    .block_depth = ctx->block_depth + (in_for_init() ? 1 : 0),
+		    .var_tok = var_name,
+		    .defer_idx = i,
+		};
 		return;
 	}
 }
 
-// Called from Pass 2 at statement-start for enum definitions and typedef declarations
+// Called from Pass 2 at statement-start for enum definitions and typedef
+// declarations
 static void enum_pass2_shadow_cb(Token *t, void *ud) {
 	(void)ud;
 	check_defer_var_shadow(t);
 }
+
 static void check_enum_body_defer_shadow(Token *brace) {
 	for_each_enum_constant(brace, enum_pass2_shadow_cb, NULL);
 }
+
 static void check_enum_typedef_defer_shadow(Token *tok) {
 	if (!FEAT(F_DEFER) || defer_count == 0 || ctx->block_depth <= 0) return;
 	if (tok->tag & TT_SUE) {
@@ -1307,61 +1444,66 @@ static void check_enum_typedef_defer_shadow(Token *tok) {
 		Token *t = type.end;
 		while (t && t->kind != TK_EOF && !match_ch(t, ';')) {
 			DeclResult decl = parse_declarator(t, false);
-			if (decl.var_name)
-				check_defer_var_shadow(decl.var_name);
+			if (decl.var_name) check_defer_var_shadow(decl.var_name);
 			if (!decl.end) break;
 			t = decl.end;
 			if (match_ch(t, ',')) t = tok_next(t);
-			else break;
+			else
+				break;
 		}
 		return;
 	}
 }
+
 static inline bool is_known_function_call(Token *tok);
 static inline bool is_empty_known_function_call(Token *tok);
 static bool token_in_function_declarator_param_list(Token *tok);
+
 static inline bool is_defer_kw(Token *tok, Token *prev) {
-	return (tok->tag & TT_DEFER) &&
-	       !is_empty_known_function_call(tok) &&
+	return (tok->tag & TT_DEFER) && !is_empty_known_function_call(tok) &&
 	       (!typedef_lookup(tok) || match_ch(tok_next(tok), '{')) &&
 	       !token_in_function_declarator_param_list(tok) &&
-	       !(prev && ((prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_TYPEDEF |
-	                              TT_SUE | TT_TYPEOF | TT_BITINT)) ||
-	                  is_known_typedef(prev) || match_ch(prev, '*'))) &&
-	       !(prev && ((prev->tag & (TT_GOTO | TT_MEMBER)) || is_gnu_label_decl_head(prev) || _equal_2(prev, "&&"))) &&
+	       !(prev && ((prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_TYPEDEF | TT_SUE |
+					TT_TYPEOF | TT_BITINT)) ||
+			  is_known_typedef(prev) || match_ch(prev, '*'))) &&
+	       !(prev && ((prev->tag & (TT_GOTO | TT_MEMBER)) || is_gnu_label_decl_head(prev) ||
+			  _equal_2(prev, "&&"))) &&
 	       tok_next(tok) && !match_ch(tok_next(tok), ':') &&
 	       !(tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN));
 }
+
 static inline bool token_is_label_name(Token *tok) {
 	Token *colon = tok ? skip_noise(tok_next(tok)) : NULL;
 	return tok && is_identifier_like(tok) && colon && match_ch(colon, ':') &&
-	       !(tok_next(colon) && match_ch(tok_next(colon), ':')) &&
-	       !(tok->tag & (TT_CASE | TT_DEFAULT));
+	       !(tok_next(colon) && match_ch(tok_next(colon), ':')) && !(tok->tag & (TT_CASE | TT_DEFAULT));
 }
+
 static inline bool token_can_name_function(Token *tok) {
-	return tok && (tok->kind == TK_IDENT || (tok->tag & (TT_DEFER | TT_ORELSE)) ||
-	               (tok->flags & TF_RAW));
+	return tok && (tok->kind == TK_IDENT || (tok->tag & (TT_DEFER | TT_ORELSE)) || (tok->flags & TF_RAW));
 }
+
 static inline bool is_known_function_call(Token *tok) {
 	if (!tok || !hashmap_get(&p1_func_proto_map, tok_loc(tok), tok->len)) return false;
 	Token *next = skip_noise(tok_next(tok));
 	return next && match_ch(next, '(');
 }
+
 static inline bool is_empty_known_function_call(Token *tok) {
 	if (!is_known_function_call(tok)) return false;
 	Token *open = skip_noise(tok_next(tok));
 	return open && match_ch(open, '(') && tok_match(open) && tok_next(open) == tok_match(open);
 }
+
 static bool token_can_precede_function_name(Token *tok) {
 	while (tok && (match_ch(tok, '*') || (tok->tag & (TT_QUALIFIER | TT_STORAGE | TT_INLINE))))
 		tok = walk_back_past_noise(tok_idx(tok));
-	return tok && ((tok->tag & (TT_TYPE | TT_SUE | TT_TYPEOF | TT_BITINT)) ||
-	       is_known_typedef(tok));
+	return tok && ((tok->tag & (TT_TYPE | TT_SUE | TT_TYPEOF | TT_BITINT)) || is_known_typedef(tok));
 }
+
 static bool token_can_start_knr_param_decl(Token *tok) {
-	return tok && ((tok->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_INLINE |
-	                         TT_TYPEDEF | TT_SUE | TT_TYPEOF | TT_BITINT)) ||
-	               is_known_typedef(tok));
+	return tok && ((tok->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_INLINE | TT_TYPEDEF | TT_SUE |
+				    TT_TYPEOF | TT_BITINT)) ||
+		       is_known_typedef(tok));
 }
 
 // `skip_noise` already eats TT_ATTR / [[...]] / _Pragma; this adds TT_ASM.
@@ -1369,19 +1511,19 @@ static Token *skip_asm_specifier_trail(Token *t) {
 	t = skip_noise(t);
 	while (t && (t->tag & TT_ASM)) {
 		t = tok_next(t);
-		if (t && match_ch(t, '(') && tok_match(t))
-			t = tok_next(tok_match(t));
+		if (t && match_ch(t, '(') && tok_match(t)) t = tok_next(tok_match(t));
 		t = skip_noise(t);
 	}
 	return t;
 }
+
 static bool paren_is_function_declarator_params(Token *open) {
 	if (!open || !match_ch(open, '(') || !tok_match(open)) return false;
 	Token *close = tok_match(open);
 	Token *after = skip_asm_specifier_trail(tok_next(close));
-	if (!after || !(match_ch(after, '{') || match_ch(after, ';') ||
-	    match_ch(after, ',') || match_ch(after, '=') || match_ch(after, ')') ||
-	    token_can_start_knr_param_decl(after)))
+	if (!after ||
+	    !(match_ch(after, '{') || match_ch(after, ';') || match_ch(after, ',') || match_ch(after, '=') ||
+	      match_ch(after, ')') || token_can_start_knr_param_decl(after)))
 		return false;
 	Token *prev = walk_back_past_noise(tok_idx(open));
 	if (prev && token_can_name_function(prev)) {
@@ -1394,48 +1536,54 @@ static bool paren_is_function_declarator_params(Token *open) {
 	}
 	return false;
 }
+
 static bool token_in_function_declarator_param_list(Token *tok) {
 	if (!tok) return false;
 	int depth = 0;
 	for (uint32_t i = tok_idx(tok); i > 0; i--) {
 		Token *t = &token_pool[i - 1];
 		if (t->kind == TK_PREP_DIR) continue;
-		if (t->flags & TF_CLOSE) { depth++; continue; }
+		if (t->flags & TF_CLOSE) {
+			depth++;
+			continue;
+		}
 		if (t->flags & TF_OPEN) {
-			if (depth == 0 && match_ch(t, '('))
-				return paren_is_function_declarator_params(t);
+			if (depth == 0 && match_ch(t, '(')) return paren_is_function_declarator_params(t);
 			if (depth > 0) depth--;
 			continue;
 		}
-		if (depth == 0 && (match_ch(t, ';') || match_ch(t, '{') || match_ch(t, '}')))
-			break;
+		if (depth == 0 && (match_ch(t, ';') || match_ch(t, '{') || match_ch(t, '}'))) break;
 	}
 	return false;
 }
+
 static inline bool prism_keyword_decl_name_boundary(Token *tok) {
 	return soft_keyword_decl_name_boundary_ex(tok, true);
 }
+
 static inline bool orelse_kw_at(Token *t, Token *prev) {
 	if (!(t->tag & TT_ORELSE) || (prev && (prev->tag & TT_MEMBER))) return false;
 	if (is_known_function_call(t)) return false;
 	TypedefEntry *te = typedef_lookup(t);
 	return !te || orelse_shadow_is_kw(prev);
 }
+
 static inline bool orelse_kw_at_bare(Token *t, Token *prev) {
-	return orelse_kw_at(t, prev)
-	    && !orelse_is_label_or_goto_target(t, prev)
-	    && !(prev && token_ends_sue_type_specifier(prev));
+	return orelse_kw_at(t, prev) && !orelse_is_label_or_goto_target(t, prev) &&
+	       !(prev && token_ends_sue_type_specifier(prev));
 }
+
 /* Bracket path: require shadow-kw prev even when orelse is not a typedef. */
 static inline bool orelse_kw_at_shadow(Token *t, Token *prev) {
-	return (t->tag & TT_ORELSE) && !(prev && (prev->tag & TT_MEMBER))
-	    && !is_known_function_call(t) && orelse_shadow_is_kw(prev);
+	return (t->tag & TT_ORELSE) && !(prev && (prev->tag & TT_MEMBER)) && !is_known_function_call(t) &&
+	       orelse_shadow_is_kw(prev);
 }
+
 static inline bool is_orelse_keyword(Token *tok) {
 	if (!orelse_kw_at_bare(tok, last_emitted)) return false;
 	if (last_emitted && prism_keyword_decl_name_boundary(tok) &&
-	    ((last_emitted->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_TYPEDEF |
-	                          TT_SUE | TT_TYPEOF | TT_BITINT)) ||
+	    ((last_emitted->tag &
+	      (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_TYPEDEF | TT_SUE | TT_TYPEOF | TT_BITINT)) ||
 	     is_known_typedef(last_emitted) || match_ch(last_emitted, '*')))
 		return false;
 	return true;
@@ -1452,49 +1600,63 @@ static bool is_strictly_bare_call(Token *start, Token *end) {
 	return skip_prep_dirs_until(tok_next(close), end) == end &&
 	       hashmap_get(&p1_func_proto_map, tok_loc(fn), fn->len) != NULL;
 }
-static void reject_orelse_side_effects(Token *start, Token *end,
-				       const char *ctx_msg, const char *advice,
-				       bool check_asm, bool check_volatile_deref,
+
+static void reject_orelse_side_effects(Token *start,
+				       Token *end,
+				       const char *ctx_msg,
+				       const char *advice,
+				       bool check_asm,
+				       bool check_volatile_deref,
 				       bool check_indirect_call) {
 	int pd = 0;
 	Token *prev_tok = NULL;
 	for (Token *s = start; s && s != end && s->kind != TK_EOF; s = tok_next(s)) {
-		if (s->flags & TF_OPEN) { pd++; goto next_checks; }
-		if (s->flags & TF_CLOSE) { pd--; goto next_checks; }
+		if (s->flags & TF_OPEN) {
+			pd++;
+			goto next_checks;
+		}
+		if (s->flags & TF_CLOSE) {
+			pd--;
+			goto next_checks;
+		}
 		if (pd == 0 && match_ch(s, ','))
-			error_tok(s, "%s with comma operator at top level (the "
+			error_tok(s,
+				  "%s with comma operator at top level (the "
 				  "left-hand sub-expression before ',' is evaluated "
 				  "twice — double evaluation of volatile reads or "
-				  "other side effects) %s", ctx_msg, advice);
-		next_checks:
+				  "other side effects) %s",
+				  ctx_msg,
+				  advice);
+	next_checks:
 		if (s->tag & (TT_GOTO | TT_RETURN | TT_BREAK | TT_CONTINUE | TT_DEFER))
-			error_tok(s, "%s containing control flow keywords "
+			error_tok(s,
+				  "%s containing control flow keywords "
 				  "(cannot duplicate statement expressions with "
 				  "goto/return/break/continue/defer) %s",
-				  ctx_msg, advice);
-		if ((s->len == 2 && ((s->ch0 == '+' && tok_loc(s)[1] == '+') ||
-				     (s->ch0 == '-' && tok_loc(s)[1] == '-'))) ||
+				  ctx_msg,
+				  advice);
+		if ((s->len == 2 &&
+		     ((s->ch0 == '+' && tok_loc(s)[1] == '+') || (s->ch0 == '-' && tok_loc(s)[1] == '-'))) ||
 		    is_assignment_operator_token(s))
 			error_tok(s, "%s with side effect %s", ctx_msg, advice);
-		if (check_asm && (s->tag & TT_ASM))
-			error_tok(s, "%s with inline asm %s", ctx_msg, advice);
+		if (check_asm && (s->tag & TT_ASM)) error_tok(s, "%s with inline asm %s", ctx_msg, advice);
 		if ((is_valid_varname(s) && !is_type_keyword(s)) || match_ch(s, ']') || match_ch(s, ')')) {
 			Token *after_s = tok_next(s);
 			if (after_s && after_s != end && match_ch(after_s, '('))
-				error_tok(s, "%s with %s call %s",
+				error_tok(s,
+					  "%s with %s call %s",
 					  ctx_msg,
 					  check_indirect_call ? "a function" : "side effect",
 					  advice);
 		}
 		if (check_indirect_call && match_ch(s, '(') && (s->flags & TF_OPEN) && tok_match(s) &&
-		    tok_match(s) != end && tok_next(tok_match(s)) &&
-		    tok_next(tok_match(s)) != end && match_ch(tok_next(tok_match(s)), '('))
+		    tok_match(s) != end && tok_next(tok_match(s)) && tok_next(tok_match(s)) != end &&
+		    match_ch(tok_next(tok_match(s)), '('))
 			error_tok(s, "%s with an indirect call %s", ctx_msg, advice);
 		if (check_volatile_deref && match_ch(s, '*') && tok_next(s) && tok_next(s) != end) {
 			bool is_mul = false;
 			if (prev_tok) {
-				if (prev_tok->kind == TK_NUM || prev_tok->kind == TK_STR)
-					is_mul = true;
+				if (prev_tok->kind == TK_NUM || prev_tok->kind == TK_STR) is_mul = true;
 				else if (prev_tok->kind == TK_IDENT && !is_type_keyword(prev_tok))
 					is_mul = true;
 				else if (match_ch(prev_tok, ']'))
@@ -1503,47 +1665,47 @@ static void reject_orelse_side_effects(Token *start, Token *end,
 					Token *om = tok_match(prev_tok);
 					if (om) {
 						Token *fi = tok_next(om);
-						bool looks_cast = fi && (
-						    is_type_keyword(fi) ||
-						    (fi->tag & (TT_QUALIFIER | TT_SUE | TT_TYPEOF)));
+						bool looks_cast =
+						    fi && (is_type_keyword(fi) ||
+							   (fi->tag & (TT_QUALIFIER | TT_SUE | TT_TYPEOF)));
 						if (looks_cast) {
 							uint32_t oi = tok_idx(om);
-							if (oi >= 2 &&
-							    token_pool[oi - 1].flags & TF_SIZEOF)
+							if (oi >= 2 && token_pool[oi - 1].flags & TF_SIZEOF)
 								is_mul = true;
-						} else is_mul = true;
+						} else
+							is_mul = true;
 					}
 				}
 			}
-			if (!is_mul)
-				error_tok(s, "%s with pointer dereference %s",
-					  ctx_msg, advice);
+			if (!is_mul) error_tok(s, "%s with pointer dereference %s", ctx_msg, advice);
 		}
 		if (check_volatile_deref && (s->tag & TT_MEMBER))
-			error_tok(s, "%s with member access operator %s",
-				  ctx_msg, advice);
+			error_tok(s, "%s with member access operator %s", ctx_msg, advice);
 		if (check_volatile_deref && match_ch(s, '[') && (s->flags & TF_OPEN))
-			error_tok(s, "%s with array subscript %s",
-				  ctx_msg, advice);
+			error_tok(s, "%s with array subscript %s", ctx_msg, advice);
 		// shadow/typedef table populated in Phase 1D.
 		if (check_volatile_deref && is_valid_varname(s) && !is_type_keyword(s)) {
 			unsigned tf = typedef_flags(s);
 			if (tf & (TDF_VOLATILE | TDF_HAS_VOL_MEMBER))
-				error_tok(s, "%s with volatile-qualified identifier %s",
-					  ctx_msg, advice);
+				error_tok(s, "%s with volatile-qualified identifier %s", ctx_msg, advice);
 		}
 		prev_tok = s;
 	}
 }
+
 static inline bool raw_token_is_sue_tag_name(Token *t) {
 	if (!t || !(t->flags & TF_RAW)) return false;
 	Token *prev = walk_back_past_noise(tok_idx(t));
 	return (prev && (prev->tag & TT_SUE)) || token_ends_sue_type_specifier(t);
 }
+
 static void emit_type_range(Token *start, Token *end, bool strip_const, bool strip_sue_body) {
 	int raw_depth = 0;
 	for (Token *t = start; t && t != end && t->kind != TK_EOF;) {
-		if (strip_const && (t->tag & TT_CONST)) { t = tok_next(t); continue; }
+		if (strip_const && (t->tag & TT_CONST)) {
+			t = tok_next(t);
+			continue;
+		}
 		if (is_stmt_expr_open(t) && tok_match(t)) {
 			walk_balanced(t, true);
 			t = tok_next(tok_match(t));
@@ -1560,8 +1722,8 @@ static void emit_type_range(Token *start, Token *end, bool strip_const, bool str
 			t = tok_next(last);
 			continue;
 		}
-		if (FEAT(F_ORELSE) && (t->tag & (TT_TYPEOF | TT_BITINT | TT_ALIGNAS)) &&
-		    tok_next(t) && match_ch(tok_next(t), '(')) {
+		if (FEAT(F_ORELSE) && (t->tag & (TT_TYPEOF | TT_BITINT | TT_ALIGNAS)) && tok_next(t) &&
+		    match_ch(tok_next(t), '(')) {
 			emit_tok(t);
 			t = tok_next(t);
 			t = walk_balanced_orelse(t);
@@ -1574,7 +1736,8 @@ static void emit_type_range(Token *start, Token *end, bool strip_const, bool str
 			bool keep = false;
 			if (kw && !is_enum_kw(kw)) {
 				for (Token *u = tok_next(kw); u && u != t; u = tok_next(u)) {
-					if (match_ch(u, ')') && tok_match(u) && tok_loc(tok_match(u)) < tok_loc(kw)) {
+					if (match_ch(u, ')') && tok_match(u) &&
+					    tok_loc(tok_match(u)) < tok_loc(kw)) {
 						keep = true;
 						break;
 					}
@@ -1582,12 +1745,14 @@ static void emit_type_range(Token *start, Token *end, bool strip_const, bool str
 				if (!keep) {
 					keep = true;
 					for (Token *u = tok_next(kw); u && u != t; u = tok_next(u)) {
-						if ((u->flags & TF_OPEN) && (match_ch(u, '(') || (u->flags & TF_C23_ATTR))) {
+						if ((u->flags & TF_OPEN) &&
+						    (match_ch(u, '(') || (u->flags & TF_C23_ATTR))) {
 							u = tok_match(u);
 							if (!u || u == t) break;
 							continue;
 						}
-						if (is_valid_varname(u) && !(u->tag & (TT_QUALIFIER | TT_ATTR | TT_TYPEOF))) {
+						if (is_valid_varname(u) &&
+						    !(u->tag & (TT_QUALIFIER | TT_ATTR | TT_TYPEOF))) {
 							keep = false;
 							break;
 						}
@@ -1601,29 +1766,43 @@ static void emit_type_range(Token *start, Token *end, bool strip_const, bool str
 				continue;
 			}
 		}
-		{ Token *r = try_strip_raw(t); if (r) { t = r; continue; } }
+		{
+			Token *r = try_strip_raw(t);
+			if (r) {
+				t = r;
+				continue;
+			}
+		}
 		t = emit_advance(t);
 	}
 }
+
 static Token *emit_expr_to_stop(Token *tok, Token *stop, bool check_orelse) {
 	while (tok->kind != TK_EOF) {
-		if (tok->flags & TF_OPEN) { tok = walk_balanced(tok, true); continue; }
+		if (tok->flags & TF_OPEN) {
+			tok = walk_balanced(tok, true);
+			continue;
+		}
 		if (match_ch(tok, ';') || (stop && tok == stop)) break;
 		if (check_orelse && is_orelse_keyword(tok)) break;
-		if (FEAT(F_ORELSE) && (tok->tag & TT_TYPEOF)) { Token *next = try_typeof_orelse(tok); if (next) { tok = next; continue; } }
+		if (FEAT(F_ORELSE) && (tok->tag & TT_TYPEOF)) {
+			Token *next = try_typeof_orelse(tok);
+			if (next) {
+				tok = next;
+				continue;
+			}
+		}
 		tok = emit_advance(tok);
 	}
 	return tok;
 }
+
 static Token *try_strip_raw_slow(Token *t) {
 	if (is_known_typedef(t)) return NULL;
-	if (p1_typedef_annotated && (tok_ann(t) & P1_HAS_ENTRY))
-		return NULL;
-	if (raw_token_is_sue_tag_name(t))
-		return NULL;
+	if (p1_typedef_annotated && (tok_ann(t) & P1_HAS_ENTRY)) return NULL;
+	if (raw_token_is_sue_tag_name(t)) return NULL;
 	/* Force multiplication in subscripts: arr[raw * x] — never strip `raw`. */
-	if (raw_after_subscript_open_bracket(t))
-		return NULL;
+	if (raw_after_subscript_open_bracket(t)) return NULL;
 	Token *after = skip_noise(tok_next(t));
 	if (is_raw_strip_context(t, after)) {
 		Token *last = t;
@@ -1633,6 +1812,7 @@ static Token *try_strip_raw_slow(Token *t) {
 	}
 	return NULL;
 }
+
 static inline Token *try_strip_raw(Token *t) {
 	if (__builtin_expect(!(t->flags & TF_RAW), 1)) return NULL;
 	return try_strip_raw_slow(t);
@@ -1643,6 +1823,7 @@ static inline Token *try_strip_raw(Token *t) {
 static bool is_ms_calling_conv_kw(Token *tok) {
 	return tok && (tok->flags & TF_MS_CC);
 }
+
 static Token *skip_func_attrs_and_cc(Token *tok) {
 	/* skip_noise already eats TT_ATTR / C23 [[...]] / PREP_DIR. */
 	while (tok && tok->kind != TK_EOF) {
@@ -1670,8 +1851,7 @@ static Token *skip_ret_pointers(Token *tok, bool *is_void) {
 			if (is_void) *is_void = false;
 			continue;
 		}
-		if ((tok->tag & TT_QUALIFIER) && !(tok->tag & TT_ATTR) &&
-		    !is_soft_keyword_identifier(tok)) {
+		if ((tok->tag & TT_QUALIFIER) && !(tok->tag & TT_ATTR) && !is_soft_keyword_identifier(tok)) {
 			tok = tok_next(tok);
 			if (is_void) *is_void = false;
 			continue;
@@ -1709,16 +1889,19 @@ static Token *ret_type_end_excluding_trailing_attrs(Token *start, Token *parsed_
 			}
 			return t;
 		}
-		if ((t->flags & TF_OPEN) && tok_match(t))
-			t = tok_next(tok_match(t));
+		if ((t->flags & TF_OPEN) && tok_match(t)) t = tok_next(tok_match(t));
 		else
 			t = tok_next(t);
 	}
 	return parsed_end;
 }
+
 static int capture_function_return_type(Token *tok) {
 	while (tok && tok->kind != TK_EOF) {
-		if (tok->tag & (TT_SKIP_DECL | TT_INLINE)) { tok = tok_next(tok); continue; }
+		if (tok->tag & (TT_SKIP_DECL | TT_INLINE)) {
+			tok = tok_next(tok);
+			continue;
+		}
 		Token *next = skip_noise(tok);
 		if (next == tok) break;
 		tok = next;
@@ -1730,12 +1913,11 @@ static int capture_function_return_type(Token *tok) {
 	bool is_void = type.has_void;
 	Token *trimmed = ret_type_end_excluding_trailing_attrs(type_start, type.end);
 	/* If a concrete non-void type keyword appears before any void/typeof,
-	 * the function is not void — guards mis-set has_void when CC/attr
-	 * tokens confuse the type walk (MSVC `__cdecl` + defer → dropped value). */
+   * the function is not void — guards mis-set has_void when CC/attr
+   * tokens confuse the type walk (MSVC `__cdecl` + defer → dropped value). */
 	if (is_void) {
 		for (Token *t = type_start; t && t != trimmed && t->kind != TK_EOF; t = tok_next(t)) {
-			if (equal(t, "void") || is_void_typedef(t) || (t->tag & TT_TYPEOF))
-				break;
+			if (equal(t, "void") || is_void_typedef(t) || (t->tag & TT_TYPEOF)) break;
 			if ((t->tag & TT_TYPE) && !equal(t, "void")) {
 				is_void = false;
 				break;
@@ -1748,7 +1930,7 @@ static int capture_function_return_type(Token *tok) {
 	}
 
 	/* Pointers belong in the return type; function attrs / calling-convention
-	 * keywords after the pointer chain do not. */
+   * keywords after the pointer chain do not. */
 	tok = skip_ret_pointers(trimmed, &is_void);
 	Token *ret_end = tok;
 	tok = skip_func_attrs_and_cc(tok);
@@ -1790,7 +1972,8 @@ static int capture_function_return_type(Token *tok) {
 					if (is_void) return 1;
 					ctx->func_ret_type_start = type_start;
 					ctx->func_ret_type_end = inner;
-					ctx->func_ret_type_suffix_start = ctx->func_ret_type_suffix_end = NULL;
+					ctx->func_ret_type_suffix_start = ctx->func_ret_type_suffix_end =
+					    NULL;
 					return 2;
 				}
 			}
@@ -1798,10 +1981,14 @@ static int capture_function_return_type(Token *tok) {
 	}
 	return 0;
 }
+
 static void emit_ret_type_tokens(Token *start, Token *end) {
 	bool first = true;
 	for (Token *t = start; t && t != end && t->kind != TK_EOF;) {
-		if (is_ms_calling_conv_kw(t)) { t = tok_next(t); continue; }
+		if (is_ms_calling_conv_kw(t)) {
+			t = tok_next(t);
+			continue;
+		}
 		if ((t->tag & TT_ATTR) || is_c23_attr(t) || t->kind == TK_PREP_DIR) {
 			Token *n = skip_noise(t);
 			t = (n == t) ? tok_next(t) : n;
@@ -1810,11 +1997,15 @@ static void emit_ret_type_tokens(Token *start, Token *end) {
 		if (!first) out_char(' ');
 		first = false;
 		Token *r = try_strip_raw(t);
-		if (r) { t = r; continue; }
+		if (r) {
+			t = r;
+			continue;
+		}
 		OUT_TOK(t);
 		t = tok_next(t);
 	}
 }
+
 static void emit_ret_type(void) {
 	if (ctx->func_ret_type_start && ctx->func_ret_type_end) {
 		if (ctx->func_ret_type_suffix_start) {
@@ -1830,12 +2021,14 @@ static void emit_ret_type(void) {
 			}
 			OUT_LIT("; __prism_ret_t_");
 			out_uint(ctx->ret_counter);
-		} else emit_ret_type_tokens(ctx->func_ret_type_start, ctx->func_ret_type_end);
+		} else
+			emit_ret_type_tokens(ctx->func_ret_type_start, ctx->func_ret_type_end);
 	} else {
 		error("defer in function with unresolvable return type; "
 		      "use a named struct or typedef");
 	}
 }
+
 static Token *decl_noise(Token *tok, bool emit) {
 	if (!emit) return skip_noise(tok);
 	while (tok && tok->kind != TK_EOF) {
@@ -1848,10 +2041,12 @@ static Token *decl_noise(Token *tok, bool emit) {
 		} else if (tok->kind == TK_PREP_DIR) {
 			emit_tok(tok);
 			tok = tok_next(tok);
-		} else break;
+		} else
+			break;
 	}
 	return tok;
 }
+
 static Token *handle_open_brace(Token *tok);
 static Token *handle_close_brace(Token *tok);
 static Token *handle_defer_keyword(Token *tok);
@@ -1866,9 +2061,12 @@ static inline void track_ctrl_paren_open(void);
 static inline void track_ctrl_paren_close(void);
 static inline void track_ctrl_semicolon(void);
 static Token *emit_ctrl_condition(Token *t, Token **unreachable_tok);
+static Token *try_bounds_checks(Token *t);
+static Token *skip_stmt_prefixes(Token *tok);
+static Token *emit_through(Token *from, Token *to);
 
 typedef enum {
-	EMIT_NORMAL     = 0,
+	EMIT_NORMAL = 0,
 	EMIT_DEFER_BODY = 1,
 } EmitMode;
 
@@ -1878,23 +2076,26 @@ static Token *try_orelse_expr_rewrites(Token *tok) {
 	if (next) return next;
 	return try_bracket_orelse(tok);
 }
+
 enum { COLON_REQUIRE_BLOCK = 1 };
+
 /* True if `prev` can end a label name before ':' — identifier, or the closing
- * delimiter of attrs between the name and colon (`done [[x]]:` / `__attribute__`). */
+ * delimiter of attrs between the name and colon (`done [[x]]:` /
+ * `__attribute__`). */
 static inline bool label_name_predecessor(Token *prev) {
 	if (!prev) return false;
 	if (is_identifier_like(prev) || prev->kind == TK_NUM) return true;
-	if (match_ch(prev, ']') && tok_match(prev) && (tok_match(prev)->flags & TF_C23_ATTR))
-		return true;
+	if (match_ch(prev, ']') && tok_match(prev) && (tok_match(prev)->flags & TF_C23_ATTR)) return true;
 	if (match_ch(prev, ')') && tok_match(prev)) {
 		Token *before = walk_back_skip_attr_noise(tok_idx(tok_match(prev)));
 		return before && (before->tag & TT_ATTR);
 	}
 	return false;
 }
-/* Returns true if colon was consumed as a label/case terminator (caller should continue). */
-static bool consume_stmt_colon(Token **tok_p, int *ternary_depth, bool *pending_case_colon,
-			       unsigned flags) {
+
+/* Returns true if colon was consumed as a label/case terminator (caller should
+ * continue). */
+static bool consume_stmt_colon(Token **tok_p, int *ternary_depth, bool *pending_case_colon, unsigned flags) {
 	Token *tok = *tok_p;
 	if (!match_ch(tok, ':')) return false;
 	if (*ternary_depth > 0) {
@@ -1902,10 +2103,8 @@ static bool consume_stmt_colon(Token **tok_p, int *ternary_depth, bool *pending_
 		*pending_case_colon = false;
 		return false;
 	}
-	if (!in_generic() && last_emitted &&
-	    (label_name_predecessor(last_emitted) || *pending_case_colon) &&
-	    !in_struct_body() &&
-	    (!(flags & COLON_REQUIRE_BLOCK) || ctx->block_depth > 0)) {
+	if (!in_generic() && last_emitted && (label_name_predecessor(last_emitted) || *pending_case_colon) &&
+	    !in_struct_body() && (!(flags & COLON_REQUIRE_BLOCK) || ctx->block_depth > 0)) {
 		*pending_case_colon = false;
 		*tok_p = emit_advance(tok);
 		ctx->at_stmt_start = true;
@@ -1914,6 +2113,7 @@ static bool consume_stmt_colon(Token **tok_p, int *ternary_depth, bool *pending_
 	*pending_case_colon = false;
 	return false;
 }
+
 static Token *emit_generic_open(Token *tok) {
 	tok = emit_advance(tok);
 	if (tok && match_ch(tok, '(')) {
@@ -1923,6 +2123,7 @@ static Token *emit_generic_open(Token *tok) {
 	ctx->at_stmt_start = false;
 	return tok;
 }
+
 static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 	Token *unreachable_tok = NULL;
 	int ternary_depth = 0;
@@ -1954,13 +2155,14 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 		}
 
 		if (match_ch(tok, ';')) {
-			if (mode != EMIT_DEFER_BODY)
-				end_statement_after_semicolon();
+			if (mode != EMIT_DEFER_BODY) end_statement_after_semicolon();
 			bool is_ur = (tok == unreachable_tok);
-			if (mode == EMIT_DEFER_BODY && dr_braceless_body)
-				is_ur = false;
+			if (mode == EMIT_DEFER_BODY && dr_braceless_body) is_ur = false;
 			tok = emit_advance(tok);
-			if (is_ur) { EMIT_UNREACHABLE(); unreachable_tok = NULL; }
+			if (is_ur) {
+				EMIT_UNREACHABLE();
+				unreachable_tok = NULL;
+			}
 			if (mode == EMIT_DEFER_BODY) {
 				ctx->at_stmt_start = true;
 				dr_braceless_body = false;
@@ -1969,10 +2171,8 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 			continue;
 		}
 
-		if (match_ch(tok, '?'))
-			ternary_depth++;
-		if (consume_stmt_colon(&tok, &ternary_depth, &pending_case_colon, 0))
-			continue;
+		if (match_ch(tok, '?')) ternary_depth++;
+		if (consume_stmt_colon(&tok, &ternary_depth, &pending_case_colon, 0)) continue;
 
 		if (__builtin_expect(tok->kind == TK_PREP_DIR, 0)) {
 			tok = emit_advance(tok);
@@ -1981,7 +2181,10 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 
 		{
 			Token *next = emit_gnu_label_decl(tok);
-			if (next) { tok = next; continue; }
+			if (next) {
+				tok = next;
+				continue;
+			}
 		}
 
 		if ((tok->tag & TT_GENERIC) && !in_generic()) {
@@ -1991,22 +2194,33 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 
 		if (mode != EMIT_DEFER_BODY) {
 			Token *next = try_handle_defer_flow_kw(tok);
-			if (next) { tok = next; continue; }
+			if (next) {
+				tok = next;
+				continue;
+			}
 		}
 
-		if (ctx->at_stmt_start && mode != EMIT_DEFER_BODY)
-			check_enum_typedef_defer_shadow(tok);
+		if (ctx->at_stmt_start && mode != EMIT_DEFER_BODY) check_enum_typedef_defer_shadow(tok);
 		// Core statement dispatch: zeroinit, orelse, raw stripping, noreturn
-		{ Token *next = try_process_stmt_token(tok, end, &unreachable_tok);
-		  if (next) { tok = next; continue; } }
+		{
+			Token *next = try_process_stmt_token(tok, end, &unreachable_tok);
+			if (next) {
+				tok = next;
+				continue;
+			}
+		}
 
 		if (ctx->at_stmt_start) {
 			if (mode == EMIT_DEFER_BODY) {
 				Token *probe = tok;
 				while (probe && probe->kind != TK_EOF) {
 					Token *sn = skip_noise(probe);
-					if (sn != probe) { probe = sn; continue; }
-					if (probe->tag & (TT_INLINE | TT_TYPEDEF | TT_STORAGE | TT_QUALIFIER)) {
+					if (sn != probe) {
+						probe = sn;
+						continue;
+					}
+					if (probe->tag &
+					    (TT_INLINE | TT_TYPEDEF | TT_STORAGE | TT_QUALIFIER)) {
 						probe = tok_next(probe);
 						if (probe && match_ch(probe, '(') && tok_match(probe))
 							probe = tok_next(tok_match(probe));
@@ -2029,7 +2243,10 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 				}
 			} else if ((tok->tag & TT_SUE) && !is_known_typedef(tok)) {
 				Token *next = handle_sue_body(tok);
-				if (next) { tok = next; continue; }
+				if (next) {
+					tok = next;
+					continue;
+				}
 			}
 		}
 
@@ -2047,10 +2264,16 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 			}
 			Token *kw = tok;
 			tok = emit_advance(tok);
+			/* Emit attrs/_Pragma between keyword and condition '('. */
+			while (tok && tok != end) {
+				Token *after = skip_noise(tok);
+				if (after == tok) break;
+				tok = emit_through(tok, after);
+			}
 			if (tok && match_ch(tok, '(') && tok_match(tok)) {
 				/* Arm + push SCOPE_CTRL/FOR_PAREN so break/continue inside
-				 * condition stmt-exprs stop here (don't paste outer defers).
-				 * Main Pass 2 loop gets this via arm_ctrl + track_common. */
+         * condition stmt-exprs stop here (don't paste outer defers).
+         * Main Pass 2 loop gets this via arm_ctrl + track_common. */
 				arm_ctrl_pending_from_tag(kw, kw->tag);
 				ctrl_state.parens_just_closed = false;
 				tok = emit_ctrl_condition(tok, &unreachable_tok);
@@ -2064,15 +2287,29 @@ static Token *emit_statements(Token *tok, Token *end, EmitMode mode) {
 		}
 
 		track_generic_token(tok);
-		{ Token *next = try_orelse_expr_rewrites(tok); if (next) { tok = next; continue; } }
+		{
+			Token *next = try_orelse_expr_rewrites(tok);
+			if (next) {
+				tok = next;
+				continue;
+			}
+		}
 
-		if (tok->tag & (TT_CASE | TT_DEFAULT))
-			pending_case_colon = true;
+		if (__builtin_expect(FEAT(F_BOUNDS_CHECK), 0)) {
+			Token *bc = try_bounds_checks(tok);
+			if (bc) {
+				tok = bc;
+				continue;
+			}
+		}
+
+		if (tok->tag & (TT_CASE | TT_DEFAULT)) pending_case_colon = true;
 		ctx->at_stmt_start = false;
 		tok = emit_advance(tok);
 	}
 	return tok;
 }
+
 static inline Token *emit_stmt_expr(Token *t) {
 	emit_tok(t); // '('
 	Token *se_end = tok_match(t);
@@ -2082,20 +2319,29 @@ static inline Token *emit_stmt_expr(Token *t) {
 	inner = emit_statements(inner, se_end, EMIT_NORMAL);
 	ctx->at_stmt_start = saved_ss;
 	ctrl_state = saved_ctrl;
-	if (se_end) { emit_tok(se_end); return tok_next(se_end); }
+	if (se_end) {
+		emit_tok(se_end);
+		return tok_next(se_end);
+	}
 	return inner;
 }
+
 static Token *emit_ctrl_condition(Token *t, Token **unreachable_tok) {
 	Token *close_p = tok_match(t);
-	if (!close_p) { emit_tok(t); return tok_next(t); }
-	if (FEAT(F_ORELSE))
-		check_orelse_in_ctrl_paren(t);
+	if (!close_p) {
+		emit_tok(t);
+		return tok_next(t);
+	}
+	if (FEAT(F_ORELSE)) check_orelse_in_ctrl_paren(t);
 	track_ctrl_paren_open();
 	t = emit_advance(t); // emit '('
 	ctx->at_stmt_start = true;
 	while (t && t != close_p && t->kind != TK_EOF) {
 		Token *next = try_process_stmt_token(t, close_p, unreachable_tok);
-		if (next) { t = next; continue; }
+		if (next) {
+			t = next;
+			continue;
+		}
 		if ((t->flags & TF_OPEN) && is_stmt_expr_open(t) && tok_match(t)) {
 			t = emit_stmt_expr(t);
 			continue;
@@ -2111,75 +2357,95 @@ static Token *emit_ctrl_condition(Token *t, Token **unreachable_tok) {
 			ctx->at_stmt_start = true;
 			continue;
 		}
+		if (__builtin_expect(FEAT(F_BOUNDS_CHECK), 0)) {
+			Token *bc = try_bounds_checks(t);
+			if (bc) {
+				t = bc;
+				continue;
+			}
+		}
 		ctx->at_stmt_start = false;
 		t = emit_advance(t);
 	}
-	if (t == close_p) { t = emit_advance(t); } // emit ')'
+	if (t == close_p) {
+		t = emit_advance(t);
+	} // emit ')'
 	track_ctrl_paren_close();
 	return t;
 }
-/* Scan [start, end) for orelse; jump nested TF_OPEN groups; ignore prep dirs. */
-static Token *find_orelse_span(Token *start, Token *end, Token *prev,
-			       bool (*pred)(Token *, Token *)) {
+
+/* Scan [start, end) for orelse; jump nested TF_OPEN groups; ignore prep dirs.
+ */
+static Token *find_orelse_span(Token *start, Token *end, Token *prev, bool (*pred)(Token *, Token *)) {
 	for (Token *s = start; s && s != end && s->kind != TK_EOF; s = tok_next(s)) {
 		if (s->kind == TK_PREP_DIR) continue;
-		if (s->flags & TF_OPEN) { prev = tok_match(s); s = tok_match(s); continue; }
+		if (s->flags & TF_OPEN) {
+			prev = tok_match(s);
+			s = tok_match(s);
+			continue;
+		}
 		if (pred(s, prev)) return s;
 		prev = s;
 	}
 	return NULL;
 }
+
 static bool bracket_scan_has_orelse(Token *open) {
 	return (tok_ann(open) & P1_OE_BRACKET) ||
 	       find_orelse_span(tok_next(open), tok_match(open), NULL, orelse_kw_at);
 }
+
 static Token *try_typeof_orelse(Token *tok) {
-	if (!(tok->tag & TT_TYPEOF) || !tok_next(tok) ||
-	    !match_ch(tok_next(tok), '(') || !tok_match(tok_next(tok)))
+	if (!(tok->tag & TT_TYPEOF) || !tok_next(tok) || !match_ch(tok_next(tok), '(') ||
+	    !tok_match(tok_next(tok)))
 		return NULL;
 	Token *paren = tok_next(tok);
-	if (!find_orelse_span(tok_next(paren), tok_match(paren), NULL, orelse_kw_at))
-		return NULL;
+	if (!find_orelse_span(tok_next(paren), tok_match(paren), NULL, orelse_kw_at)) return NULL;
 	emit_tok(tok);
 	return walk_balanced_orelse(paren);
 }
+
 static Token *try_bracket_orelse(Token *tok) {
-	if (!match_ch(tok, '[') || !(tok->flags & TF_OPEN) || !tok_match(tok))
-		return NULL;
+	if (!match_ch(tok, '[') || !(tok->flags & TF_OPEN) || !tok_match(tok)) return NULL;
 	if (tok->flags & TF_C23_ATTR) return NULL;
-	if (bracket_scan_has_orelse(tok))
-		return walk_balanced_orelse(tok);
+	if (bracket_scan_has_orelse(tok)) return walk_balanced_orelse(tok);
 	return NULL;
 }
 
 static void p1_tag_brackets_in_range(Token *open, Token *close) {
 	for (Token *u = tok_next(open); u != close && u->kind != TK_EOF; u = tok_next(u)) {
-		if (match_ch(u, '[') && (u->flags & TF_OPEN))
-			tok_ann(u) |= P1_UNEVAL_BRACKET;
+		if (match_ch(u, '[') && (u->flags & TF_OPEN)) tok_ann(u) |= P1_UNEVAL_BRACKET;
 	}
 }
+
 static Token *last_comma_operand(Token *open_paren, Token *close_paren) {
 	Token *seg_start = tok_next(open_paren);
 	for (Token *t = seg_start; t && t != close_paren; t = tok_next(t)) {
-		if (t->flags & TF_OPEN) { t = tok_match(t); continue; }
+		if (t->flags & TF_OPEN) {
+			t = tok_match(t);
+			continue;
+		}
 		if (match_ch(t, ',')) seg_start = tok_next(t);
 	}
 	return seg_start;
 }
+
 static bool comma_expr_has_comma(Token *open_paren, Token *close_paren) {
 	return last_comma_operand(open_paren, close_paren) != tok_next(open_paren);
 }
+
 static inline bool c_value_name_token(Token *t) {
 	return t && is_valid_varname(t) && !is_type_keyword(t);
 }
+
 static void p1_tag_postfix_chain(Token *p) {
 	while (p && p->kind != TK_EOF) {
-		if ((match_ch(p, '[') || match_ch(p, '(')) &&
-		    (p->flags & TF_OPEN) && tok_match(p)) {
+		if ((match_ch(p, '[') || match_ch(p, '(')) && (p->flags & TF_OPEN) && tok_match(p)) {
 			if (match_ch(p, '[')) tok_ann(p) |= P1_UNEVAL_BRACKET;
 			Token *c = tok_match(p);
 			p1_tag_brackets_in_range(p, c);
-			p = tok_next(c); continue;
+			p = tok_next(c);
+			continue;
 		}
 		if (match_ch(p, '.') || equal(p, "->")) {
 			p = tok_next(p);
@@ -2187,49 +2453,59 @@ static void p1_tag_postfix_chain(Token *p) {
 			continue;
 		}
 		if (equal(p, "++") || equal(p, "--")) {
-			p = tok_next(p); continue;
+			p = tok_next(p);
+			continue;
 		}
 		break;
 	}
 }
+
 static inline bool is_uneval_operand_intro(Token *t) {
 	return (t->flags & TF_SIZEOF) || (t->tag & TT_TYPEOF) ||
-	       (t->kind == TK_IDENT && t->len == 18 &&
-	        memcmp(tok_loc(t), "__builtin_offsetof", 18) == 0);
+	       (t->kind == TK_IDENT && t->len == 18 && memcmp(tok_loc(t), "__builtin_offsetof", 18) == 0);
 }
+
 static void p1_mark_uneval_brackets(void) {
-	int fs_cb = 0; bool fs_in_init = false;
+	int fs_cb = 0;
+	bool fs_in_init = false;
 	for (uint32_t i = 1; i < token_count; i++) {
 		Token *t = &token_pool[i];
 		if ((t->flags & TF_OPEN) && match_ch(t, '{')) fs_cb++;
-		else if ((t->flags & TF_CLOSE) && match_ch(t, '}')) { if (fs_cb) fs_cb--; }
-		else if (fs_cb == 0) {
+		else if ((t->flags & TF_CLOSE) && match_ch(t, '}')) {
+			if (fs_cb) fs_cb--;
+		} else if (fs_cb == 0) {
 			if (match_ch(t, '=')) fs_in_init = true;
-			else if (match_ch(t, ';')) fs_in_init = false;
+			else if (match_ch(t, ';'))
+				fs_in_init = false;
 		}
-		if (fs_in_init && (t->flags & TF_OPEN) && match_ch(t, '['))
-			tok_ann(t) |= P1_UNEVAL_BRACKET;
+		if (fs_in_init && (t->flags & TF_OPEN) && match_ch(t, '[')) tok_ann(t) |= P1_UNEVAL_BRACKET;
 		// _Static_assert / static_assert predicate: must stay an integer
 		if (t->flags & TF_STATIC_ASSERT) {
 			Token *lp = tok_next(t);
 			if (lp && match_ch(lp, '(') && (lp->flags & TF_OPEN) && tok_match(lp)) {
 				Token *rp = tok_match(lp);
-				if (rp)
-					p1_tag_brackets_in_range(lp, rp);
+				if (rp) p1_tag_brackets_in_range(lp, rp);
 			}
 			continue;
 		}
 		// _Generic(controlling_expr, type1: val1, ...): per C11 §6.5.1.1p3,
-			if (t->tag & TT_GENERIC) {
+		if (t->tag & TT_GENERIC) {
 			Token *lp = tok_next(t);
 			if (lp && match_ch(lp, '(') && (lp->flags & TF_OPEN) && tok_match(lp)) {
 				Token *close = tok_match(lp);
 				int depth = 0;
-				for (Token *u = tok_next(lp); u != close && u->kind != TK_EOF; u = tok_next(u)) {
+				for (Token *u = tok_next(lp); u != close && u->kind != TK_EOF;
+				     u = tok_next(u)) {
 					if (match_ch(u, '[') && (u->flags & TF_OPEN))
 						tok_ann(u) |= P1_UNEVAL_BRACKET;
-					if (u->flags & TF_OPEN) { depth++; continue; }
-					if (u->flags & TF_CLOSE) { depth--; continue; }
+					if (u->flags & TF_OPEN) {
+						depth++;
+						continue;
+					}
+					if (u->flags & TF_CLOSE) {
+						depth--;
+						continue;
+					}
 					if (depth == 0 && match_ch(u, ',')) break;
 				}
 			}
@@ -2251,7 +2527,8 @@ static void p1_mark_uneval_brackets(void) {
 		while (p && p->kind != TK_EOF) {
 			if (match_set(p, CH('+') | CH('-') | CH('!') | CH('&') | CH('*')) ||
 			    match_ch(p, '~') || equal(p, "++") || equal(p, "--")) {
-				p = tok_next(p); continue;
+				p = tok_next(p);
+				continue;
 			}
 			break;
 		}
@@ -2259,15 +2536,18 @@ static void p1_mark_uneval_brackets(void) {
 		p1_tag_postfix_chain(tok_next(p));
 	}
 }
+
 static inline bool bounds_is_name_token(Token *t) {
 	return c_value_name_token(t);
 }
+
 static bool is_tracked_array_name(Token *t) {
 	if (!bounds_is_name_token(t)) return false;
 	TypedefEntry *te = typedef_lookup(t);
 	if (!te || te->is_param || te->is_enum_const) return false;
 	return te->is_array || te->is_vla_var;
 }
+
 static bool bounds_expr_base_is_pointer(Token *tok) {
 	if (!bounds_is_name_token(tok)) return false;
 	unsigned c0 = tok->ch0, tl = tok->len;
@@ -2283,13 +2563,14 @@ static bool bounds_expr_base_is_pointer(Token *tok) {
 	}
 	return false;
 }
+
 static Token *bounds_peel_paren_ident(Token *le) {
 	if (!match_ch(le, ')') || !tok_match(le)) return le;
 	Token *open = tok_match(le);
 	if (tok_idx(open) >= 1) {
 		Token *before = &token_pool[tok_idx(open) - 1];
-		if (bounds_is_name_token(before) || before->kind == TK_NUM ||
-		    match_ch(before, ')') || match_ch(before, ']'))
+		if (bounds_is_name_token(before) || before->kind == TK_NUM || match_ch(before, ')') ||
+		    match_ch(before, ']'))
 			return le;
 	}
 	Token *ii = tok_next(open);
@@ -2304,30 +2585,35 @@ static Token *bounds_find_array_ident(Token *start, Token *end) {
 			Token *pv = &token_pool[tok_idx(t) - 1];
 			if (is_uneval_operand_intro(pv)) {
 				Token *c = tok_match(t);
-				if (c) { t = c; continue; }
+				if (c) {
+					t = c;
+					continue;
+				}
 			}
 		}
-		if (!bounds_is_name_token(t) || is_known_typedef(t))
-			continue;
-		if (tok_idx(t) >= 1 && (token_pool[tok_idx(t) - 1].tag & TT_MEMBER))
-			continue;
+		if (!bounds_is_name_token(t) || is_known_typedef(t)) continue;
+		if (tok_idx(t) >= 1 && (token_pool[tok_idx(t) - 1].tag & TT_MEMBER)) continue;
 		TypedefEntry *te = typedef_lookup(t);
-		if (te && !te->is_param && !te->is_enum_const &&
-		    (te->is_array || te->is_vla_var))
-			return t;
+		if (te && !te->is_param && !te->is_enum_const && (te->is_array || te->is_vla_var)) return t;
 	}
 	return NULL;
 }
 
 // downgraded from hard error to warning. SAFETY_DIAG is the plain form;
-#define SAFETY_DIAG(t, msg) do { \
-	if (FEAT(F_WARN_SAFETY)) warn_tok((t), msg); \
-	else error_tok((t), msg); \
-} while (0)
-#define BOUNDS_COMM_DIAG(t, msg) do { \
-	if (FEAT(F_WARN_SAFETY)) { warn_tok((t), msg); return NULL; } \
-	error_tok((t), msg); \
-} while (0)
+#define SAFETY_DIAG(t, msg)                                                                                  \
+	do {                                                                                                 \
+		if (FEAT(F_WARN_SAFETY)) warn_tok((t), msg);                                                 \
+		else                                                                                         \
+			error_tok((t), msg);                                                                 \
+	} while (0)
+#define BOUNDS_COMM_DIAG(t, msg)                                                                             \
+	do {                                                                                                 \
+		if (FEAT(F_WARN_SAFETY)) {                                                                   \
+			warn_tok((t), msg);                                                                  \
+			return NULL;                                                                         \
+		}                                                                                            \
+		error_tok((t), msg);                                                                         \
+	} while (0)
 
 static Token *try_bounds_check_deref_add(Token *tok);
 static Token *try_bounds_checks(Token *t);
@@ -2341,18 +2627,21 @@ static bool bounds_paren_derives_array(Token *open) {
 			Token *pv = &token_pool[tok_idx(t) - 1];
 			if (is_uneval_operand_intro(pv)) {
 				Token *c = tok_match(t);
-				if (c) { t = c; continue; }
+				if (c) {
+					t = c;
+					continue;
+				}
 			}
 		}
 		if (match_ch(t, '&') && !(t->flags & TF_OPEN)) {
 			Token *n = tok_next(t);
-			if (n && n != close && bounds_is_name_token(n) &&
-			    is_tracked_array_name(n))
+			if (n && n != close && bounds_is_name_token(n) && is_tracked_array_name(n))
 				return true;
 		}
 	}
 	return false;
 }
+
 static Token *try_bounds_check_subscript(Token *tok) {
 	if (!FEAT(F_BOUNDS_CHECK)) return NULL;
 	if (!match_ch(tok, '[') || !(tok->flags & TF_OPEN) || !tok_match(tok)) return NULL;
@@ -2381,8 +2670,7 @@ static Token *try_bounds_check_subscript(Token *tok) {
 				Token *rb_close = tok_match(tok);
 				Token *inner = tok_next(tok);
 				if (rb_close && inner && tok_next(inner) == rb_close &&
-				    is_tracked_array_name(inner) &&
-				    !is_tracked_array_name(idx))
+				    is_tracked_array_name(inner) && !is_tracked_array_name(idx))
 					BOUNDS_COMM_DIAG(tok, ERR_BOUNDS_COMM_IDX_ARR);
 			}
 		}
@@ -2392,10 +2680,8 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	{
 		Token *rb_close = tok_match(tok);
 		Token *inner_first = tok_next(tok);
-		if (inner_first && rb_close &&
-		    match_ch(inner_first, '(') && (inner_first->flags & TF_OPEN) &&
-		    tok_match(inner_first) &&
-		    tok_next(tok_match(inner_first)) == rb_close &&
+		if (inner_first && rb_close && match_ch(inner_first, '(') && (inner_first->flags & TF_OPEN) &&
+		    tok_match(inner_first) && tok_next(tok_match(inner_first)) == rb_close &&
 		    bounds_paren_derives_array(inner_first))
 			BOUNDS_COMM_DIAG(tok, ERR_BOUNDS_COMM_DERIVED);
 	}
@@ -2406,9 +2692,9 @@ static Token *try_bounds_check_subscript(Token *tok) {
 		Token *inner = tok_next(tok);
 		Token *iclose = close_scan;
 		/* ISO `idx[(e1, arr)]` == `idx[arr]`; unwrap comma tail so the
-		 * main path sees the array ident.  If the last operand is the
-		 * tracked array, this is not a commutative *bypass* (it is
-		 * `arr` with index `idx` in disguise) — skip hard-error diags. */
+     * main path sees the array ident.  If the last operand is the
+     * tracked array, this is not a commutative *bypass* (it is
+     * `arr` with index `idx` in disguise) — skip hard-error diags. */
 		if (match_ch(inner, '(') && (inner->flags & TF_OPEN)) {
 			Token *pclose = tok_match(inner);
 			if (pclose && comma_expr_has_comma(inner, pclose)) {
@@ -2416,58 +2702,55 @@ static Token *try_bounds_check_subscript(Token *tok) {
 				if (lastop && tok_next(lastop) == pclose) {
 					inner = lastop;
 					iclose = pclose;
-					if (is_tracked_array_name(lastop))
-						comma_resolved = true;
+					if (is_tracked_array_name(lastop)) comma_resolved = true;
 				}
 			}
 		}
 		if (!comma_resolved) {
-		/* If last_emitted is a struct/union field access (preceded by
-		 * `.`/`->`), we do not know the field's type from the typedef
-		 * table, so we cannot assert a commutative bypass. Skip both
-		 * branches — the final brute-scan guard below is gated by the
-		 * same `memb` flag and handles this case correctly. */
-		bool le_is_member = tok_idx(last_emitted) >= 1 &&
-				    (token_pool[tok_idx(last_emitted) - 1].tag & TT_MEMBER);
-		if (!le_is_member) {
-		while (inner != iclose && match_ch(inner, '(') && (inner->flags & TF_OPEN) &&
-		       tok_match(inner) && tok_next(tok_match(inner)) == iclose) {
-			iclose = tok_match(inner);
-			inner = tok_next(inner);
-		}
-		if (inner != iclose && tok_next(inner) == iclose &&
-		    is_tracked_array_name(inner)) {
-			Token *le = bounds_peel_paren_ident(last_emitted);
-			if (!is_tracked_array_name(le) && !bounds_expr_base_is_pointer(le))
-				BOUNDS_COMM_DIAG(tok, ERR_BOUNDS_COMM_IDX_ARR);
-		} else if (inner != iclose && bounds_is_name_token(inner)) {
-			Token *array_root = NULL;
-			Token *scan = inner;
-			while (scan && scan != iclose) {
-				if (!bounds_is_name_token(scan))
-					break;
-				Token *lb = tok_next(scan);
-				if (!lb || !match_ch(lb, '[') || !(lb->flags & TF_OPEN) ||
-				    !tok_match(lb))
-					break;
-				array_root = scan;
-				Token *rb = tok_match(lb);
-				if (!rb)
-					break;
-				scan = tok_next(rb);
-			}
-			if (scan == iclose && array_root &&
-			    is_tracked_array_name(array_root)) {
-				Token *le = bounds_peel_paren_ident(last_emitted);
-				if (!is_tracked_array_name(le) && !bounds_expr_base_is_pointer(le))
-					BOUNDS_COMM_DIAG(tok, ERR_BOUNDS_COMM_IDX_ARR);
-			}
-		}
-		} // !le_is_member
+			/* If last_emitted is a struct/union field access (preceded by
+       * `.`/`->`), we do not know the field's type from the typedef
+       * table, so we cannot assert a commutative bypass. Skip both
+       * branches — the final brute-scan guard below is gated by the
+       * same `memb` flag and handles this case correctly. */
+			bool le_is_member = tok_idx(last_emitted) >= 1 &&
+					    (token_pool[tok_idx(last_emitted) - 1].tag & TT_MEMBER);
+			if (!le_is_member) {
+				while (inner != iclose && match_ch(inner, '(') && (inner->flags & TF_OPEN) &&
+				       tok_match(inner) && tok_next(tok_match(inner)) == iclose) {
+					iclose = tok_match(inner);
+					inner = tok_next(inner);
+				}
+				if (inner != iclose && tok_next(inner) == iclose &&
+				    is_tracked_array_name(inner)) {
+					Token *le = bounds_peel_paren_ident(last_emitted);
+					if (!is_tracked_array_name(le) && !bounds_expr_base_is_pointer(le))
+						BOUNDS_COMM_DIAG(tok, ERR_BOUNDS_COMM_IDX_ARR);
+				} else if (inner != iclose && bounds_is_name_token(inner)) {
+					Token *array_root = NULL;
+					Token *scan = inner;
+					while (scan && scan != iclose) {
+						if (!bounds_is_name_token(scan)) break;
+						Token *lb = tok_next(scan);
+						if (!lb || !match_ch(lb, '[') || !(lb->flags & TF_OPEN) ||
+						    !tok_match(lb))
+							break;
+						array_root = scan;
+						Token *rb = tok_match(lb);
+						if (!rb) break;
+						scan = tok_next(rb);
+					}
+					if (scan == iclose && array_root &&
+					    is_tracked_array_name(array_root)) {
+						Token *le = bounds_peel_paren_ident(last_emitted);
+						if (!is_tracked_array_name(le) &&
+						    !bounds_expr_base_is_pointer(le))
+							BOUNDS_COMM_DIAG(tok, ERR_BOUNDS_COMM_IDX_ARR);
+					}
+				}
+			} // !le_is_member
 		} // !comma_resolved
 	}
-	if (comma_resolved)
-		BOUNDS_COMM_DIAG(tok, ERR_BOUNDS_COMMA_OP);
+	if (comma_resolved) BOUNDS_COMM_DIAG(tok, ERR_BOUNDS_COMMA_OP);
 	{
 		Token *rb = tok_match(tok);
 		if (rb && bounds_is_name_token(last_emitted)) {
@@ -2479,24 +2762,20 @@ static Token *try_bounds_check_subscript(Token *tok) {
 				left_ok_scan = tel && !tel->is_param && !tel->is_enum_const &&
 					       (tel->is_array || tel->is_vla_var);
 			}
-			Token *hit = left_ok_scan ? NULL
-			                          : bounds_find_array_ident(tok_next(tok), rb);
+			Token *hit = left_ok_scan ? NULL : bounds_find_array_ident(tok_next(tok), rb);
 			while (hit) {
 				Token *nx = tok_next(hit);
-				if (!(nx && match_ch(nx, '[') && (nx->flags & TF_OPEN)))
-					break;
+				if (!(nx && match_ch(nx, '[') && (nx->flags & TF_OPEN))) break;
 				hit = bounds_find_array_ident(tok_next(nx), rb);
 			}
-			if (hit)
-				BOUNDS_COMM_DIAG(tok, ERR_BOUNDS_COMM_SCAN);
+			if (hit) BOUNDS_COMM_DIAG(tok, ERR_BOUNDS_COMM_SCAN);
 		}
 	}
 	Token *name_tok = last_emitted;
 	if (tok_idx(tok) >= 1) {
 		Token *pool_prev = &token_pool[tok_idx(tok) - 1];
 		if (pool_prev != last_emitted &&
-		    (match_ch(pool_prev, ']') || match_ch(pool_prev, ')') ||
-		     bounds_is_name_token(pool_prev)))
+		    (match_ch(pool_prev, ']') || match_ch(pool_prev, ')') || bounds_is_name_token(pool_prev)))
 			name_tok = pool_prev;
 	}
 	int dim_depth = 0;
@@ -2505,8 +2784,8 @@ static Token *try_bounds_check_subscript(Token *tok) {
 			Token *open = tok_match(name_tok);
 			if (tok_idx(open) >= 1) {
 				Token *bp = &token_pool[tok_idx(open) - 1];
-				if (bounds_is_name_token(bp) || bp->kind == TK_NUM ||
-				    match_ch(bp, ')') || match_ch(bp, ']'))
+				if (bounds_is_name_token(bp) || bp->kind == TK_NUM || match_ch(bp, ')') ||
+				    match_ch(bp, ']'))
 					break;
 			}
 			Token *inner = tok_next(open);
@@ -2531,13 +2810,11 @@ static Token *try_bounds_check_subscript(Token *tok) {
 		}
 		if (match_ch(name_tok, ']') && tok_match(name_tok)) {
 			Token *open_br = tok_match(name_tok);
-			if (tok_ann(open_br) & (P1_DECL_BRACKET | P1_UNEVAL_BRACKET))
-				break;
+			if (tok_ann(open_br) & (P1_DECL_BRACKET | P1_UNEVAL_BRACKET)) break;
 			if (open_br->flags & TF_C23_ATTR) break;
 			if (tok_idx(open_br) < 1) break;
 			Token *before = &token_pool[tok_idx(open_br) - 1];
-			if (!(bounds_is_name_token(before) || match_ch(before, ')') ||
-			      match_ch(before, ']')))
+			if (!(bounds_is_name_token(before) || match_ch(before, ')') || match_ch(before, ']')))
 				break;
 			name_tok = before;
 			dim_depth++;
@@ -2554,34 +2831,28 @@ static Token *try_bounds_check_subscript(Token *tok) {
 				name_tok = hit;
 				break;
 			}
-			if (tok_idx(op) < 1)
-				break;
+			if (tok_idx(op) < 1) break;
 			probe = &token_pool[tok_idx(op) - 1];
 		}
 	}
 	if (!bounds_is_name_token(name_tok)) return NULL;
 	if (is_known_typedef(name_tok)) return NULL;
-	if (tok_idx(name_tok) >= 1 &&
-	    (token_pool[tok_idx(name_tok) - 1].tag & TT_MEMBER))
-		return NULL;
+	if (tok_idx(name_tok) >= 1 && (token_pool[tok_idx(name_tok) - 1].tag & TT_MEMBER)) return NULL;
 	if (tok_idx(name_tok) >= 1) {
 		Token *pv = &token_pool[tok_idx(name_tok) - 1];
-		if (pv->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF))
-			return NULL;
+		if (pv->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)) return NULL;
 		if (match_ch(pv, '*') && !(pv->flags & TF_OPEN) && tok_idx(pv) >= 1) {
 			Token *pp = &token_pool[tok_idx(pv) - 1];
-			bool is_decl_star =
-			    (pp->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)) ||
-			    (match_ch(pp, '*') && !(pp->flags & TF_OPEN)) ||
-			    (match_ch(pp, '(') && (pp->flags & TF_OPEN));
+			bool is_decl_star = (pp->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)) ||
+					    (match_ch(pp, '*') && !(pp->flags & TF_OPEN)) ||
+					    (match_ch(pp, '(') && (pp->flags & TF_OPEN));
 			if (is_decl_star) return NULL;
 		}
 	}
 	TypedefEntry *te = typedef_lookup(name_tok);
 	if (!te || te->is_param || te->is_enum_const) return NULL;
 	if (!te->is_array && !te->is_vla_var) return NULL;
-	if (te->array_rank > 0 && te->array_rank != ARRAY_RANK_WRAP_ALL &&
-	    dim_depth >= te->array_rank)
+	if (te->array_rank > 0 && te->array_rank != ARRAY_RANK_WRAP_ALL && dim_depth >= te->array_rank)
 		return NULL;
 	if (tok_idx(name_tok) >= 1) {
 		Token *prev = &token_pool[tok_idx(name_tok) - 1];
@@ -2594,8 +2865,7 @@ static Token *try_bounds_check_subscript(Token *tok) {
 			bool unary = true;
 			if (tok_idx(prev) >= 1) {
 				Token *pp = &token_pool[tok_idx(prev) - 1];
-				if (bounds_is_name_token(pp) || pp->kind == TK_NUM ||
-				    pp->kind == TK_STR ||
+				if (bounds_is_name_token(pp) || pp->kind == TK_NUM || pp->kind == TK_STR ||
 				    match_ch(pp, ')') || match_ch(pp, ']'))
 					unary = false;
 			}
@@ -2612,7 +2882,10 @@ static Token *try_bounds_check_subscript(Token *tok) {
 			continue;
 		}
 		Token *bc = try_bounds_checks(t);
-		if (bc) { t = bc; continue; }
+		if (bc) {
+			t = bc;
+			continue;
+		}
 		if ((t->flags & TF_OPEN) && tok_match(t)) {
 			t = walk_balanced(t, true);
 			continue;
@@ -2635,17 +2908,15 @@ static Token *try_bounds_check_deref_add(Token *tok) {
 	if (tok_idx(tok) >= 1) {
 		Token *prev = &token_pool[tok_idx(tok) - 1];
 		if (prev->kind == TK_NUM || prev->kind == TK_STR) return NULL;
-		if (prev->kind == TK_IDENT &&
-		    !(prev->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)) &&
+		if (prev->kind == TK_IDENT && !(prev->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)) &&
 		    !(prev->tag & (TT_RETURN | TT_GOTO | TT_DEFER)))
 			return NULL;
 		if (match_ch(prev, ']')) return NULL;
 		if (match_ch(prev, ')') && (prev->flags & TF_CLOSE)) {
 			Token *om = tok_match(prev);
 			Token *fi = om ? tok_next(om) : NULL;
-			bool looks_cast = fi &&
-			    (is_type_keyword(fi) ||
-			     (fi->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)));
+			bool looks_cast = fi && (is_type_keyword(fi) ||
+						 (fi->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)));
 			if (!looks_cast) return NULL;
 		}
 	}
@@ -2658,7 +2929,10 @@ static Token *try_bounds_check_deref_add(Token *tok) {
 	// Must contain a top-level `+` or `-` operator inside the parens.
 	bool has_addsub = false;
 	for (Token *t = lhs; t && t != cp && t->kind != TK_EOF; t = tok_next(t)) {
-		if ((t->flags & TF_OPEN) && tok_match(t)) { t = tok_match(t); continue; }
+		if ((t->flags & TF_OPEN) && tok_match(t)) {
+			t = tok_match(t);
+			continue;
+		}
 		if ((match_ch(t, '+') || match_ch(t, '-')) && !(t->flags & TF_OPEN)) {
 			has_addsub = true;
 			break;
@@ -2679,19 +2953,22 @@ static Token *try_bounds_check_deref_add(Token *tok) {
 		  "array base cannot be verified (rewrite as array[index])");
 	return NULL;
 }
+
 static Token *try_bounds_checks(Token *t) {
 	Token *n = try_bounds_check_subscript(t);
 	return n ? n : try_bounds_check_deref_add(t);
 }
+
 static inline void reject_defer_in_expr_context(Token *t) {
-	if (__builtin_expect(FEAT(F_DEFER) && (t->tag & TT_DEFER), 0) &&
-	    !is_known_function_call(t) &&
+	if (__builtin_expect(FEAT(F_DEFER) && (t->tag & TT_DEFER), 0) && !is_known_function_call(t) &&
 	    !(last_emitted && (last_emitted->tag & TT_MEMBER)) &&
-	    (!typedef_lookup(t) || match_ch(tok_next(t), '{')) &&
-	    tok_next(t) && (is_identifier_like(tok_next(t)) || match_ch(tok_next(t), '{')))
-		error_tok(t, "'defer' cannot be used in expression context "
+	    (!typedef_lookup(t) || match_ch(tok_next(t), '{')) && tok_next(t) &&
+	    (is_identifier_like(tok_next(t)) || match_ch(tok_next(t), '{')))
+		error_tok(t,
+			  "'defer' cannot be used in expression context "
 			  "(array dimensions, parenthesized expressions, etc.)");
 }
+
 static inline bool walk_balanced_tail(Token **tp) {
 	Token *t = *tp;
 	if (FEAT(F_DEFER) && defer_count > 0 && is_enum_kw(t)) {
@@ -2702,6 +2979,7 @@ static inline bool walk_balanced_tail(Token **tp) {
 	*tp = emit_advance(t);
 	return true;
 }
+
 static PRISM_HOT Token *walk_balanced(Token *tok, bool emit) {
 	Token *end = tok_match(tok);
 	if (!end) return tok_next(tok);
@@ -2713,7 +2991,10 @@ static PRISM_HOT Token *walk_balanced(Token *tok, bool emit) {
 			}
 			if (__builtin_expect(FEAT(F_BOUNDS_CHECK), 0)) {
 				Token *bc = try_bounds_checks(t);
-				if (bc) { t = bc; continue; }
+				if (bc) {
+					t = bc;
+					continue;
+				}
 			}
 			if (FEAT(F_ORELSE) && (t->flags & TF_OPEN) && match_ch(t, '[') && tok_match(t)) {
 				// C23 [[ ... ]]: verbatim interior; Phase 1D rejects orelse
@@ -2722,12 +3003,19 @@ static PRISM_HOT Token *walk_balanced(Token *tok, bool emit) {
 					t = emit_c23_attr(t);
 					continue;
 				}
-				{ Token *next = try_bracket_orelse(t); if (next) { t = next; continue; } }
+				{
+					Token *next = try_bracket_orelse(t);
+					if (next) {
+						t = next;
+						continue;
+					}
+				}
 				// No orelse — emit bracket contents with raw stripping
 				Token *bclose = tok_match(t);
 				while (t != bclose) {
 					if ((t->flags & TF_OPEN) && is_stmt_expr_open(t)) {
-						t = emit_stmt_expr(t); continue;
+						t = emit_stmt_expr(t);
+						continue;
 					}
 					t = emit_advance(t);
 				}
@@ -2736,7 +3024,10 @@ static PRISM_HOT Token *walk_balanced(Token *tok, bool emit) {
 			}
 			if (FEAT(F_ORELSE)) {
 				Token *next = try_typeof_orelse(t);
-				if (next) { t = next; continue; }
+				if (next) {
+					t = next;
+					continue;
+				}
 			}
 			// Enum-body shadow queue + defense-in-depth defer rejection
 			walk_balanced_tail(&t);
@@ -2744,6 +3035,7 @@ static PRISM_HOT Token *walk_balanced(Token *tok, bool emit) {
 	}
 	return tok_next(end);
 }
+
 static void emit_token_range_nested(Token *start, Token *end, bool with_orelse) {
 	for (Token *t = start; t && t != end && t->kind != TK_EOF;) {
 		if (is_stmt_expr_open(t) && tok_match(t)) {
@@ -2755,8 +3047,7 @@ static void emit_token_range_nested(Token *start, Token *end, bool with_orelse) 
 			Token *close = tok_match(t);
 			if (close && close != end) {
 				emit_tok(t);
-				if (with_orelse)
-					emit_token_range_orelse(tok_next(t), close);
+				if (with_orelse) emit_token_range_orelse(tok_next(t), close);
 				else
 					emit_token_range_nested(tok_next(t), close, false);
 				emit_tok(close);
@@ -2768,31 +3059,40 @@ static void emit_token_range_nested(Token *start, Token *end, bool with_orelse) 
 		t = emit_advance(t);
 	}
 }
+
 static void emit_token_range_verbatim(Token *start, Token *end) {
 	emit_token_range_nested(start, end, false);
 }
+
 static void emit_token_range_orelse(Token *start, Token *end) {
 	Token *orelse = find_orelse_span(start, end, NULL, orelse_kw_at);
 	if (!orelse) {
 		emit_token_range_nested(start, end, true);
 		return;
 	}
-	reject_orelse_side_effects(start, orelse,
-				  "'orelse' in array dimension / typeof",
-				  "in a chained 'orelse' (would be evaluated twice); "
-				  "hoist the expression to a variable first",
-				  true, true, false);
+	reject_orelse_side_effects(start,
+				   orelse,
+				   "'orelse' in array dimension / typeof",
+				   "in a chained 'orelse' (would be evaluated twice); "
+				   "hoist the expression to a variable first",
+				   true,
+				   true,
+				   false);
 	emit_orelse_ternary(start, orelse, tok_next(orelse), end);
 }
+
 static void validate_bracket_orelse(Token *oe) {
 	Token *act = tok_next(oe);
 	if (act && (act->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)))
-		error_tok(oe, "'orelse' with control flow cannot be used inside "
+		error_tok(oe,
+			  "'orelse' with control flow cannot be used inside "
 			  "array dimensions or typeof expressions");
 	if (act && match_ch(act, '{'))
-		error_tok(oe, "'orelse' block form cannot be used inside "
+		error_tok(oe,
+			  "'orelse' block form cannot be used inside "
 			  "array dimensions or typeof expressions");
 }
+
 static Token *scan_bracket_orelse(Token *open, Token *close, Token **paren_open_out) {
 	Token *prev = open;
 	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
@@ -2801,14 +3101,17 @@ static Token *scan_bracket_orelse(Token *open, Token *close, Token **paren_open_
 			if (match_ch(open, '[') && match_ch(t, '(')) {
 				Token *pp = tok_match(t);
 				if (pp && tok_next(pp) == close) {
-					Token *hit = find_orelse_span(tok_next(t), pp, t, orelse_kw_at_shadow);
+					Token *hit =
+					    find_orelse_span(tok_next(t), pp, t, orelse_kw_at_shadow);
 					if (hit) {
 						if (paren_open_out) *paren_open_out = t;
 						return hit;
 					}
 				}
 			}
-			prev = tok_match(t); t = tok_match(t); continue;
+			prev = tok_match(t);
+			t = tok_match(t);
+			continue;
 		}
 		if (orelse_kw_at_shadow(t, prev)) return t;
 		prev = t;
@@ -2818,50 +3121,58 @@ static Token *scan_bracket_orelse(Token *open, Token *close, Token **paren_open_
 
 typedef struct {
 	int oe_count, oe_next, dim_count, dim_next;
-	unsigned *oe_ids, *dim_ids;  // arena-allocated snapshots (unbounded)
+	unsigned *oe_ids, *dim_ids; // arena-allocated snapshots (unbounded)
 } BOFrame;
 
 static void bo_snapshot_ids(unsigned **dst, const unsigned *src, int n) {
-	if (n <= 0) { *dst = NULL; return; }
+	if (n <= 0) {
+		*dst = NULL;
+		return;
+	}
 	*dst = arena_alloc(&ctx->main_arena, (size_t)n * sizeof(unsigned));
 	memcpy(*dst, src, (size_t)n * sizeof(unsigned));
 }
+
 static void bo_save(BOFrame *f) {
-	f->oe_count  = ctx->bracket_oe_count;
-	f->oe_next   = ctx->bracket_oe_next;
+	f->oe_count = ctx->bracket_oe_count;
+	f->oe_next = ctx->bracket_oe_next;
 	f->dim_count = ctx->bracket_dim_count;
-	f->dim_next  = ctx->bracket_dim_next;
+	f->dim_next = ctx->bracket_dim_next;
 	bo_snapshot_ids(&f->oe_ids, ctx->bracket_oe_ids, f->oe_count);
 	bo_snapshot_ids(&f->dim_ids, ctx->bracket_dim_ids, f->dim_count);
 }
+
 static inline void emit_type_with_pragma_prelude(
-		Token *pragma_start, Token *type_start, Token *type_end,
-		Token *raw_tok, bool is_split) {
+    Token *pragma_start, Token *type_start, Token *type_end, Token *raw_tok, bool is_split) {
 	int saved_oe = ctx->bracket_oe_count, saved_dim = ctx->bracket_dim_count;
-	ctx->bracket_oe_count = 0; ctx->bracket_dim_count = 0;
-	if (pragma_start != type_start)
-		emit_range(pragma_start, raw_tok ? raw_tok : type_start);
+	ctx->bracket_oe_count = 0;
+	ctx->bracket_dim_count = 0;
+	if (pragma_start != type_start) emit_range(pragma_start, raw_tok ? raw_tok : type_start);
 	emit_type_range(type_start, type_end, false, is_split);
-	ctx->bracket_oe_count = saved_oe; ctx->bracket_dim_count = saved_dim;
+	ctx->bracket_oe_count = saved_oe;
+	ctx->bracket_dim_count = saved_dim;
 }
-static void bo_restore_queue(unsigned **dst, int *dst_cap,
-			     const unsigned *src, int count) {
+
+static void bo_restore_queue(unsigned **dst, int *dst_cap, const unsigned *src, int count) {
 	if (count <= 0) return;
 	while (*dst_cap < count) {
 		int old_cap = *dst_cap;
 		int new_cap = old_cap == 0 ? 16 : old_cap * 2;
-		*dst = arena_realloc(&ctx->main_arena, *dst,
-			(size_t)old_cap * sizeof(unsigned), (size_t)new_cap * sizeof(unsigned));
+		*dst = arena_realloc(&ctx->main_arena,
+				     *dst,
+				     (size_t)old_cap * sizeof(unsigned),
+				     (size_t)new_cap * sizeof(unsigned));
 		*dst_cap = new_cap;
 	}
 	memcpy(*dst, src, (size_t)count * sizeof(unsigned));
 }
+
 static void bo_restore(BOFrame *f) {
-	ctx->bracket_oe_count  = f->oe_count;
-	ctx->bracket_oe_next   = f->oe_next;
+	ctx->bracket_oe_count = f->oe_count;
+	ctx->bracket_oe_next = f->oe_next;
 	ctx->bracket_dim_count = f->dim_count;
-	ctx->bracket_dim_next  = f->dim_next;
-	bo_restore_queue(&ctx->bracket_oe_ids,  &ctx->bracket_oe_cap,  f->oe_ids,  f->oe_count);
+	ctx->bracket_dim_next = f->dim_next;
+	bo_restore_queue(&ctx->bracket_oe_ids, &ctx->bracket_oe_cap, f->oe_ids, f->oe_count);
 	bo_restore_queue(&ctx->bracket_dim_ids, &ctx->bracket_dim_cap, f->dim_ids, f->dim_count);
 }
 
@@ -2871,8 +3182,15 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 	ctx->bracket_oe_next = 0;
 	ctx->bracket_dim_count = 0;
 	ctx->bracket_dim_next = 0;
+
 	// Phase 1: collect all brackets and identify which have orelse.
-	typedef struct { Token *open; Token *close; Token *orelse; Token *paren_open; } BracketInfo;
+	typedef struct {
+		Token *open;
+		Token *close;
+		Token *orelse;
+		Token *paren_open;
+	} BracketInfo;
+
 	ArenaMark bracket_mark = arena_mark(&ctx->main_arena);
 	int bracket_cap = 16;
 	BracketInfo *brackets = arena_alloc_uninit(&ctx->main_arena, bracket_cap * sizeof(BracketInfo));
@@ -2885,13 +3203,19 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 			continue;
 		}
 		if (!match_ch(t, '[')) continue;
-		if (t->flags & TF_C23_ATTR) { t = tok_match(t); continue; }
+		if (t->flags & TF_C23_ATTR) {
+			t = tok_match(t);
+			continue;
+		}
 		Token *close = tok_match(t);
 		if (!close) continue;
 		if (bracket_count >= bracket_cap) {
 			int old_cap = bracket_cap;
 			bracket_cap *= 2;
-			brackets = arena_realloc(&ctx->main_arena, brackets, old_cap * sizeof(BracketInfo), bracket_cap * sizeof(BracketInfo));
+			brackets = arena_realloc(&ctx->main_arena,
+						 brackets,
+						 old_cap * sizeof(BracketInfo),
+						 bracket_cap * sizeof(BracketInfo));
 		}
 		Token *paren_open_found = NULL;
 		Token *orelse_found = scan_bracket_orelse(t, close, &paren_open_found);
@@ -2908,22 +3232,29 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 	for (int i = 0; i < bracket_count; i++) {
 		if (brackets[i].orelse) {
 			// Orelse bracket: hoist LHS
-			ARENA_ENSURE_CAP(&ctx->main_arena, ctx->bracket_oe_ids, ctx->bracket_oe_count,
-					 ctx->bracket_oe_cap, 16, unsigned);
+			ARENA_ENSURE_CAP(&ctx->main_arena,
+					 ctx->bracket_oe_ids,
+					 ctx->bracket_oe_count,
+					 ctx->bracket_oe_cap,
+					 16,
+					 unsigned);
 			unsigned oe = ctx->ret_counter++;
 			ctx->bracket_oe_ids[ctx->bracket_oe_count++] = oe;
 			emit_ll_temp(emit_prism_oe, oe);
-			emit_token_range_orelse(
-				brackets[i].paren_open ? tok_next(brackets[i].paren_open)
-				                       : tok_next(brackets[i].open),
-				brackets[i].orelse);
+			emit_token_range_orelse(brackets[i].paren_open ? tok_next(brackets[i].paren_open)
+								       : tok_next(brackets[i].open),
+						brackets[i].orelse);
 			OUT_LIT(");");
 		} else {
 			// hoist to preserve left-to-right VLA evaluation order.
 			Token *dim_start = tok_next(brackets[i].open);
 			Token *dim_end = brackets[i].close;
-			ARENA_ENSURE_CAP(&ctx->main_arena, ctx->bracket_dim_ids,
-					 ctx->bracket_dim_count, ctx->bracket_dim_cap, 16, unsigned);
+			ARENA_ENSURE_CAP(&ctx->main_arena,
+					 ctx->bracket_dim_ids,
+					 ctx->bracket_dim_count,
+					 ctx->bracket_dim_cap,
+					 16,
+					 unsigned);
 			if (dim_start == dim_end ||
 			    (tok_next(dim_start) == dim_end &&
 			     (dim_start->kind == TK_NUM || match_ch(dim_start, '*')))) {
@@ -2939,9 +3270,13 @@ static void emit_bracket_orelse_temps(Token *start, Token *end) {
 	}
 	arena_restore(&ctx->main_arena, bracket_mark);
 }
+
 static Token *walk_balanced_orelse(Token *tok) {
 	Token *end = tok_match(tok);
-	if (!end) { emit_tok(tok); return tok_next(tok); }
+	if (!end) {
+		emit_tok(tok);
+		return tok_next(tok);
+	}
 	Token *paren_open = NULL;
 	Token *orelse_found = scan_bracket_orelse(tok, end, &paren_open);
 	if (!orelse_found) {
@@ -2956,7 +3291,8 @@ static Token *walk_balanced_orelse(Token *tok) {
 		}
 		Token *prev = NULL;
 		for (Token *t = tok; t != tok_next(end) && t->kind != TK_EOF;) {
-			if (t != tok && t != end && match_ch(t, '[') && (t->flags & TF_OPEN) && tok_match(t)) {
+			if (t != tok && t != end && match_ch(t, '[') && (t->flags & TF_OPEN) &&
+			    tok_match(t)) {
 				if (ctx->bracket_dim_next < ctx->bracket_dim_count) {
 					unsigned dim = ctx->bracket_dim_ids[ctx->bracket_dim_next++];
 					if (dim != (unsigned)-1) {
@@ -2970,10 +3306,10 @@ static Token *walk_balanced_orelse(Token *tok) {
 				t = walk_balanced_orelse(t);
 				continue;
 			}
-			if (t != tok && t != end && FEAT(F_ORELSE) && (t->tag & TT_TYPEOF) &&
-			    tok_next(t) && match_ch(tok_next(t), '(')) {
-				emit_tok(t);       // typeof keyword
-				t = tok_next(t);   // (
+			if (t != tok && t != end && FEAT(F_ORELSE) && (t->tag & TT_TYPEOF) && tok_next(t) &&
+			    match_ch(tok_next(t), '(')) {
+				emit_tok(t);	 // typeof keyword
+				t = tok_next(t); // (
 				t = walk_balanced_orelse(t);
 				continue;
 			}
@@ -2982,11 +3318,13 @@ static Token *walk_balanced_orelse(Token *tok) {
 				t = walk_balanced(t, true);
 				continue;
 			}
-			// Defense-in-depth: if an 'orelse' token reaches here it was not caught by
+			// Defense-in-depth: if an 'orelse' token reaches here it was not caught
+			// by
 			if (is_orelse_kw_shadow(t) && orelse_shadow_is_kw(prev))
-				error_tok(t, "'orelse' inside array dimension could not be transformed; "
-					   "if wrapped in outer parentheses, remove them: "
-					   "use '[f() orelse 1]' not '[(f() orelse 1)]'");
+				error_tok(t,
+					  "'orelse' inside array dimension could not be transformed; "
+					  "if wrapped in outer parentheses, remove them: "
+					  "use '[f() orelse 1]' not '[(f() orelse 1)]'");
 			prev = t;
 			walk_balanced_tail(&t);
 		}
@@ -2996,7 +3334,7 @@ static Token *walk_balanced_orelse(Token *tok) {
 	validate_bracket_orelse(orelse_found);
 	Token *lhs_start = paren_open ? tok_next(paren_open) : tok_next(tok);
 	Token *rhs_start = tok_next(orelse_found);
-	Token *rhs_end   = paren_open ? tok_match(paren_open) : end;
+	Token *rhs_end = paren_open ? tok_match(paren_open) : end;
 	bool is_bracket = match_ch(tok, '[');
 	emit_tok(tok); // emit [ or (
 	if (is_bracket && ctx->bracket_oe_next < ctx->bracket_oe_count) {
@@ -3005,20 +3343,25 @@ static Token *walk_balanced_orelse(Token *tok) {
 		emit_token_range_orelse(rhs_start, rhs_end);
 		OUT_LIT(")");
 	} else {
-		reject_orelse_side_effects(lhs_start, orelse_found,
-					  is_bracket ? "'orelse' in array dimension / typeof"
-					             : "'orelse' in typeof",
-					  "in the LHS (would be evaluated twice); "
-					  "hoist the expression to a variable first",
-					  true, is_bracket, false);
-			emit_orelse_ternary(lhs_start, orelse_found, rhs_start, rhs_end);
+		reject_orelse_side_effects(lhs_start,
+					   orelse_found,
+					   is_bracket ? "'orelse' in array dimension / typeof"
+						      : "'orelse' in typeof",
+					   "in the LHS (would be evaluated twice); "
+					   "hoist the expression to a variable first",
+					   true,
+					   is_bracket,
+					   false);
+		emit_orelse_ternary(lhs_start, orelse_found, rhs_start, rhs_end);
 	}
 	emit_tok(end); // emit ] or )
 	return tok_next(end);
 }
+
 static inline void decl_emit(Token *t, bool emit) {
 	if (emit) emit_tok(t);
 }
+
 static inline Token *decl_array_dims(Token *t, bool emit, bool *vla) {
 	while (match_ch(t, '[')) {
 		tok_ann(t) |= P1_DECL_BRACKET;
@@ -3029,31 +3372,43 @@ static inline Token *decl_array_dims(Token *t, bool emit, bool *vla) {
 			continue;
 		}
 		if (array_size_is_vla(t)) *vla = true;
-		if (emit && FEAT(F_ORELSE))
-			t = walk_balanced_orelse(t);
+		if (emit && FEAT(F_ORELSE)) t = walk_balanced_orelse(t);
 		else
 			t = walk_balanced(t, emit);
 	}
 	return t;
 }
+
 static DeclResult parse_declarator(Token *tok, bool emit) {
-	DeclResult r = { .end = tok };
+	DeclResult r = {.end = tok};
 	bool is_vla = false;
 	int ptr_depth = 0;
 
-#define DECL_EAT_PTRS(extra_ptr_action)						\
-	while (tok && tok->kind != TK_EOF) {					\
-		Token *_n = decl_noise(tok, emit);				\
-		if (_n != tok) { tok = _n; continue; }				\
-		if (match_ch(tok, '*')) {					\
-			r.is_pointer = true; r.is_const = false; extra_ptr_action; \
-			if (++ptr_depth > 1024) { warn_tok(tok, "pointer depth exceeds 1024; zero-initialization skipped"); r.end = NULL; return r; } \
-			decl_emit(tok, emit); tok = tok_next(tok);			\
-		} else if ((tok->tag & TT_QUALIFIER) &&				\
-			   !(is_soft_keyword_identifier(tok) && soft_keyword_decl_name_boundary(tok))) { \
-			if (r.is_pointer && (tok->tag & TT_CONST)) r.is_const = true; \
-			decl_emit(tok, emit); tok = tok_next(tok);			\
-		} else break;							\
+#define DECL_EAT_PTRS(extra_ptr_action)                                                                      \
+	while (tok && tok->kind != TK_EOF) {                                                                 \
+		Token *_n = decl_noise(tok, emit);                                                           \
+		if (_n != tok) {                                                                             \
+			tok = _n;                                                                            \
+			continue;                                                                            \
+		}                                                                                            \
+		if (match_ch(tok, '*')) {                                                                    \
+			r.is_pointer = true;                                                                 \
+			r.is_const = false;                                                                  \
+			extra_ptr_action;                                                                    \
+			if (++ptr_depth > 1024) {                                                            \
+				warn_tok(tok, "pointer depth exceeds 1024; zero-initialization skipped");    \
+				r.end = NULL;                                                                \
+				return r;                                                                    \
+			}                                                                                    \
+			decl_emit(tok, emit);                                                                \
+			tok = tok_next(tok);                                                                 \
+		} else if ((tok->tag & TT_QUALIFIER) &&                                                      \
+			   !(is_soft_keyword_identifier(tok) && soft_keyword_decl_name_boundary(tok))) {     \
+			if (r.is_pointer && (tok->tag & TT_CONST)) r.is_const = true;                        \
+			decl_emit(tok, emit);                                                                \
+			tok = tok_next(tok);                                                                 \
+		} else                                                                                       \
+			break;                                                                               \
 	}
 
 	DECL_EAT_PTRS((void)0)
@@ -3061,46 +3416,72 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 	int nested_paren = 0;
 	if (match_ch(tok, '(')) {
 		Token *peek = skip_noise(tok_next(tok));
-		if (!match_ch(peek, '*') && !match_ch(peek, '(') && !is_valid_varname(peek)) { r.end = NULL; return r; }
-		decl_emit(tok, emit); tok = tok_next(tok);
-		nested_paren = 1; r.has_paren = true;
+		if (!match_ch(peek, '*') && !match_ch(peek, '(') && !is_valid_varname(peek)) {
+			r.end = NULL;
+			return r;
+		}
+		decl_emit(tok, emit);
+		tok = tok_next(tok);
+		nested_paren = 1;
+		r.has_paren = true;
 		DECL_EAT_PTRS(r.paren_pointer = true)
 		while (match_ch(tok, '(')) {
-			if (++nested_paren > 1024) { warn_tok(tok, "parenthesization depth exceeds 1024"); r.end = NULL; return r; }
-			decl_emit(tok, emit); tok = tok_next(tok);
+			if (++nested_paren > 1024) {
+				warn_tok(tok, "parenthesization depth exceeds 1024");
+				r.end = NULL;
+				return r;
+			}
+			decl_emit(tok, emit);
+			tok = tok_next(tok);
 			DECL_EAT_PTRS(r.paren_pointer = true)
 		}
 	}
 #undef DECL_EAT_PTRS
 
-	if (!is_valid_varname(tok)) { r.end = NULL; return r; }
+	if (!is_valid_varname(tok)) {
+		r.end = NULL;
+		return r;
+	}
 	r.var_name = tok;
-	decl_emit(tok, emit); tok = tok_next(tok);
+	decl_emit(tok, emit);
+	tok = tok_next(tok);
 	tok = decl_noise(tok, emit);
-	if (r.has_paren && match_ch(tok, '('))
-		r.is_func_decl = true;
+	if (r.has_paren && match_ch(tok, '(')) r.is_func_decl = true;
 	if (r.has_paren && match_ch(tok, '[')) {
-		r.is_array = true; r.paren_array = true;
+		r.is_array = true;
+		r.paren_array = true;
 		tok = decl_array_dims(tok, emit, &is_vla);
 	}
 	while (r.has_paren && nested_paren > 0) {
 		while (match_ch(tok, '(') || match_ch(tok, '[')) {
 			if (match_ch(tok, '(')) {
 				if (emit && FEAT(F_ORELSE)) tok = walk_balanced_orelse(tok);
-				else tok = walk_balanced(tok, emit);
+				else
+					tok = walk_balanced(tok, emit);
+			} else {
+				r.is_array = true;
+				r.paren_array = true;
+				tok = decl_array_dims(tok, emit, &is_vla);
 			}
-			else { r.is_array = true; r.paren_array = true; tok = decl_array_dims(tok, emit, &is_vla); }
 		}
-		if (!match_ch(tok, ')')) { r.end = NULL; return r; }
-		decl_emit(tok, emit); tok = tok_next(tok);
+		if (!match_ch(tok, ')')) {
+			r.end = NULL;
+			return r;
+		}
+		decl_emit(tok, emit);
+		tok = tok_next(tok);
 		nested_paren--;
 	}
 
 	if (match_ch(tok, '(')) {
-		if (!r.has_paren) { r.end = NULL; return r; }
+		if (!r.has_paren) {
+			r.end = NULL;
+			return r;
+		}
 		r.is_func_ptr = true;
 		if (emit && FEAT(F_ORELSE)) tok = walk_balanced_orelse(tok);
-		else tok = walk_balanced(tok, emit);
+		else
+			tok = walk_balanced(tok, emit);
 	}
 
 	if (match_ch(tok, '[')) {
@@ -3109,11 +3490,16 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 	}
 	while (tok && tok->kind != TK_EOF) {
 		Token *next = decl_noise(tok, emit);
-		if (next != tok) { tok = next; continue; }
+		if (next != tok) {
+			tok = next;
+			continue;
+		}
 		if (tok->tag & TT_ASM) {
-			decl_emit(tok, emit); tok = tok_next(tok);
+			decl_emit(tok, emit);
+			tok = tok_next(tok);
 			if (tok && match_ch(tok, '(')) tok = walk_balanced(tok, emit);
-		} else break;
+		} else
+			break;
 	}
 
 	r.has_init = match_ch(tok, '=');
@@ -3121,6 +3507,7 @@ static DeclResult parse_declarator(Token *tok, bool emit) {
 	r.end = tok;
 	return r;
 }
+
 static void emit_noise_between_raws(Token *first_raw, Token *last_raw) {
 	if (first_raw == last_raw) return;
 	for (Token *t = tok_next(first_raw); t && t != last_raw && t->kind != TK_EOF; t = tok_next(t)) {
@@ -3129,32 +3516,46 @@ static void emit_noise_between_raws(Token *first_raw, Token *last_raw) {
 			// Balanced group (C23 attr [[...]], GNU attr((...))): walk & emit
 			Token *m = tok_match(t);
 			for (Token *u = t; u && u != tok_next(m) && u->kind != TK_EOF;) {
-				if ((u->flags & TF_OPEN) && is_stmt_expr_open(u)) { u = emit_stmt_expr(u); continue; }
-				emit_tok(u); u = tok_next(u);
+				if ((u->flags & TF_OPEN) && is_stmt_expr_open(u)) {
+					u = emit_stmt_expr(u);
+					continue;
+				}
+				emit_tok(u);
+				u = tok_next(u);
 			}
 			t = m;
-		} else emit_tok(t);
+		} else
+			emit_tok(t);
 	}
 }
+
 static Token *emit_raw_verbatim_to_semicolon(Token *tok) {
 	while (tok && tok->kind != TK_EOF && !match_ch(tok, ';')) {
 		if (tok->flags & TF_OPEN) tok = walk_balanced(tok, true);
 		else if (FEAT(F_ORELSE) && (tok->tag & TT_TYPEOF)) {
 			Token *next = try_typeof_orelse(tok);
-			if (next) { tok = next; continue; }
+			if (next) {
+				tok = next;
+				continue;
+			}
+			tok = emit_advance(tok);
+		} else {
 			tok = emit_advance(tok);
 		}
-		else { tok = emit_advance(tok); }
 	}
-	if (tok && match_ch(tok, ';')) { tok = emit_advance(tok); }
+	if (tok && match_ch(tok, ';')) {
+		tok = emit_advance(tok);
+	}
 	return tok;
 }
+
 static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool has_const) {
 	const char *vol = has_volatile ? "volatile " : "";
 	int vol_len = has_volatile ? 9 : 0;
 	bool use_loop = has_volatile || target_is_msvc();
 	for (int i = 0; i < count; i++) {
-		// Byte loop for volatile (memset drops volatile) and MSVC (no __builtin_memset).
+		// Byte loop for volatile (memset drops volatile) and MSVC (no
+		// __builtin_memset).
 		if (use_loop) {
 			OUT_LIT(" { ");
 			out_str(vol, vol_len);
@@ -3162,8 +3563,7 @@ static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool
 			out_uint(ctx->ret_counter);
 			OUT_LIT(" = (");
 			out_str(vol, vol_len);
-			if (has_const)
-				OUT_LIT("char *)(void *)&");
+			if (has_const) OUT_LIT("char *)(void *)&");
 			else
 				OUT_LIT("char *)&");
 			OUT_TOK(vars[i]);
@@ -3182,8 +3582,7 @@ static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool
 			OUT_LIT("] = 0; }");
 			ctx->ret_counter++;
 		} else {
-			if (has_const)
-				OUT_LIT(" __builtin_memset((void *)&");
+			if (has_const) OUT_LIT(" __builtin_memset((void *)&");
 			else
 				OUT_LIT(" __builtin_memset(&");
 			OUT_TOK(vars[i]);
@@ -3193,16 +3592,21 @@ static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool
 		}
 	}
 }
+
 static Token *emit_break_continue_defer(Token *tok) {
 	bool is_break = tok->tag & TT_BREAK;
 	if (FEAT(F_DEFER) && control_flow_has_defers(is_break))
 		emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
-	out_char(' '); OUT_TOK(tok); out_char(';');
+	out_char(' ');
+	OUT_TOK(tok);
+	out_char(';');
 	tok = tok_next(tok);
 	if (match_ch(tok, ';')) tok = tok_next(tok);
 	return tok;
 }
+
 static int p1_goto_exits(Token *goto_tok, int func_idx); // forward decl
+
 static Token *emit_goto_defer(Token *tok) {
 	Token *goto_tok = tok;
 	tok = tok_next(tok);
@@ -3217,21 +3621,29 @@ static Token *emit_goto_defer(Token *tok) {
 		if (goto_has_defers(td)) emit_goto_defers(td);
 	}
 	OUT_LIT(" goto ");
-	if (is_identifier_like(tok)) { OUT_TOK(tok); tok = tok_next(tok); }
+	if (is_identifier_like(tok)) {
+		OUT_TOK(tok);
+		tok = tok_next(tok);
+	}
 	out_char(';');
 	if (match_ch(tok, ';')) tok = tok_next(tok);
 	return tok;
 }
+
 static Token *emit_orelse_fallback_value(Token *tok, Token *stop_comma, Token **chain_next) {
 	*chain_next = NULL;
 	while (tok->kind != TK_EOF) {
 		if (FEAT(F_ORELSE) && (tok->tag & TT_TYPEOF)) {
 			Token *next = try_typeof_orelse(tok);
-			if (next) { tok = next; continue; }
+			if (next) {
+				tok = next;
+				continue;
+			}
 		}
 		if (tok->flags & TF_OPEN) {
 			if (is_stmt_expr_open(tok))
-				error_tok(tok, "GNU statement expressions in orelse fallback values are not "
+				error_tok(tok,
+					  "GNU statement expressions in orelse fallback values are not "
 					  "supported; use 'orelse { ... }' block form instead");
 			tok = walk_balanced(tok, true);
 			continue;
@@ -3245,6 +3657,7 @@ static Token *emit_orelse_fallback_value(Token *tok, Token *stop_comma, Token **
 	}
 	return tok;
 }
+
 static Token *emit_orelse_block_body(Token *tok) {
 	Token *blk_close = tok_match(tok);
 	if (!blk_close) error_tok(tok, "unterminated orelse block");
@@ -3260,8 +3673,8 @@ static Token *emit_orelse_block_body(Token *tok) {
 	return tok;
 }
 
-// const + fallback orelse: roll back speculative output, re-emit with temp variable.
-// MSVC-compatible: instead of "const T x = val ?: fallback;",
+// const + fallback orelse: roll back speculative output, re-emit with temp
+// variable. MSVC-compatible: instead of "const T x = val ?: fallback;",
 static Token *handle_const_orelse_fallback(Token *tok,
 					   Token *orelse_tok,
 					   Token *val_start,
@@ -3272,18 +3685,26 @@ static Token *handle_const_orelse_fallback(Token *tok,
 					   Token *pragma_start,
 					   Token *stop_comma) {
 	unsigned oe_id = ctx->ret_counter++;
-	// Function pointers: return-type const lives in the type specifier and must be preserved;
+	// Function pointers: return-type const lives in the type specifier and must
+	// be preserved;
 	bool strip_type_const = !decl->is_pointer && !decl->is_func_ptr;
 	bool has_const_typedef = false;
 	if (strip_type_const) {
 		for (Token *t = type_start; t != type->end; t = tok_next(t)) {
-			if (is_const_typedef(t)) { has_const_typedef = true; break; }
-			if ((t->tag & TT_TYPEOF) && t->len != 11) { has_const_typedef = true; break; }
+			if (is_const_typedef(t)) {
+				has_const_typedef = true;
+				break;
+			}
+			if ((t->tag & TT_TYPEOF) && t->len != 11) {
+				has_const_typedef = true;
+				break;
+			}
 		}
 	}
 
-	#define EMIT_PRAGMA_PRELUDE() do { \
-		if (pragma_start != type_start) emit_range(pragma_start, type_start); \
+#define EMIT_PRAGMA_PRELUDE()                                                                                \
+	do {                                                                                                 \
+		if (pragma_start != type_start) emit_range(pragma_start, type_start);                        \
 	} while (0)
 	if (has_const_typedef) {
 		if (target_is_msvc()) {
@@ -3294,7 +3715,9 @@ static Token *handle_const_orelse_fallback(Token *tok,
 			out_char(')');
 		} else {
 			EMIT_PRAGMA_PRELUDE();
-			out_char(' '); emit_typeof_keyword(); OUT_LIT("((");
+			out_char(' ');
+			emit_typeof_keyword();
+			OUT_LIT("((");
 			emit_type_range(type_start, type->end, strip_type_const, true);
 			OUT_LIT(")0)");
 		}
@@ -3341,7 +3764,7 @@ static Token *handle_const_orelse_fallback(Token *tok,
 	}
 
 	EMIT_PRAGMA_PRELUDE();
-	#undef EMIT_PRAGMA_PRELUDE
+#undef EMIT_PRAGMA_PRELUDE
 	emit_type_range(type_start, type->end, false, false);
 	parse_declarator(decl_start, true);
 	OUT_LIT(" = __prism_oe_");
@@ -3349,32 +3772,36 @@ static Token *handle_const_orelse_fallback(Token *tok,
 	out_char(';');
 	return tok;
 }
+
 static Token *paren_scan_skip_nested(Token *t) {
-	if ((t->flags & TF_OPEN) && match_ch(t, '[') && tok_match(t))
-		return tok_match(t);
-	if ((t->tag & TT_TYPEOF) && tok_next(t) && match_ch(tok_next(t), '(') &&
-	    tok_match(tok_next(t)))
+	if ((t->flags & TF_OPEN) && match_ch(t, '[') && tok_match(t)) return tok_match(t);
+	if ((t->tag & TT_TYPEOF) && tok_next(t) && match_ch(tok_next(t), '(') && tok_match(tok_next(t)))
 		return tok_match(tok_next(t));
-	if (is_stmt_expr_open(t) && tok_match(t))
-		return tok_match(t);
+	if (is_stmt_expr_open(t) && tok_match(t)) return tok_match(t);
 	return NULL;
 }
+
 static void check_paren_orelse_defer(Token *open, bool ctrl_cond) {
 	if (!ctrl_cond && paren_is_function_declarator_params(open)) return;
 	Token *close = tok_match(open);
 	if (is_stmt_expr_open(open) && close) return;
 	for (Token *pi = open, *t = tok_next(open); t != close; pi = t, t = tok_next(t)) {
 		Token *skipped = paren_scan_skip_nested(t);
-		if (skipped) { t = skipped; continue; }
+		if (skipped) {
+			t = skipped;
+			continue;
+		}
 		if (orelse_kw_at(t, pi)) {
 			if (orelse_is_label_or_goto_target(t, pi)) continue;
 			if (tok_ann(t) & P1_OE_DECL_INIT) continue;
 			if (ctrl_cond) {
 				if (!is_orelse_value_fallback(tok_next(t)))
-					error_tok(t, "'orelse' with statement or block action cannot be used "
+					error_tok(t,
+						  "'orelse' with statement or block action cannot be used "
 						  "in control-statement conditions (if/for/while/switch)");
 			} else {
-				error_tok(t, "'orelse' cannot be used inside parentheses "
+				error_tok(t,
+					  "'orelse' cannot be used inside parentheses "
 					  "(it must appear at the top level of a declaration)");
 			}
 		}
@@ -3382,9 +3809,11 @@ static void check_paren_orelse_defer(Token *open, bool ctrl_cond) {
 			error_tok(t, "defer cannot be at top level of a parenthesized expression");
 	}
 }
+
 static void check_orelse_in_parens(Token *open) {
 	check_paren_orelse_defer(open, false);
 }
+
 static void check_orelse_in_ctrl_paren(Token *open) {
 	check_paren_orelse_defer(open, true);
 }
@@ -3401,45 +3830,55 @@ typedef struct {
 } OrelseDeclTargetInfo;
 
 static inline void reject_orelse_in_for_init(Token *tok) {
-	if (in_for_init())
-		error_tok(tok, "orelse cannot be used in for-loop initializers");
+	if (in_for_init()) error_tok(tok, "orelse cannot be used in for-loop initializers");
 }
+
 static inline bool is_orelse_value_fallback(Token *after_oe) {
-	return after_oe &&
-	    !(after_oe->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
-	    !match_ch(after_oe, '{') && !match_ch(after_oe, ';');
+	return after_oe && !(after_oe->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
+	       !match_ch(after_oe, '{') && !match_ch(after_oe, ';');
 }
+
 static inline void require_orelse_action(Token *tok, Token *stop_comma) {
 	if (match_ch(tok, ';') || (stop_comma && tok == stop_comma))
 		error_tok(tok, "expected statement after 'orelse'");
 }
+
 static inline void flush_typeof_memsets(Token **vars, int *count, TypeSpecResult *type, int base) {
 	if (*count > base) {
 		emit_typeof_memsets(&vars[base], *count - base, type->has_volatile, type->has_const);
 		*count = base;
 	}
 }
-static OrelseDeclTargetInfo analyze_decl_orelse_target(Token *tok,
-					       Token *type_start,
-					       TypeSpecResult *type,
-					       DeclResult *decl) {
+
+static OrelseDeclTargetInfo
+analyze_decl_orelse_target(Token *tok, Token *type_start, TypeSpecResult *type, DeclResult *decl) {
 	OrelseDeclTargetInfo info = {
-		.stop_comma = find_boundary_comma(tok),
-		.has_const_qual = has_effective_const_qual(type_start, type, decl),
-		.is_struct_value = type->is_struct && !type->is_enum && !decl->is_pointer && !decl->is_array,
+	    .stop_comma = find_boundary_comma(tok),
+	    .has_const_qual = has_effective_const_qual(type_start, type, decl),
+	    .is_struct_value = type->is_struct && !type->is_enum && !decl->is_pointer && !decl->is_array,
 	};
 	bool base_is_array = decl->is_array && (!decl->paren_pointer || decl->paren_array);
 	if (!base_is_array && !decl->is_pointer && !decl->paren_pointer) {
 		for (Token *t = type_start; t && t != type->end; t = tok_next(t))
-			if (is_array_typedef(t)) { base_is_array = true; break; }
+			if (is_array_typedef(t)) {
+				base_is_array = true;
+				break;
+			}
 	}
 	if (base_is_array)
-		error_tok(decl->var_name, ERR_ORELSE_ARRAY_NEVER_NULL,
-			  decl->var_name->len, tok_loc(decl->var_name));
+		error_tok(decl->var_name,
+			  ERR_ORELSE_ARRAY_NEVER_NULL,
+			  decl->var_name->len,
+			  tok_loc(decl->var_name));
 	require_orelse_action(tok, info.stop_comma);
 	return info;
 }
-typedef struct { bool has_oe; bool has_d0_comma; } WrapParenScan;
+
+typedef struct {
+	bool has_oe;
+	bool has_d0_comma;
+} WrapParenScan;
+
 static WrapParenScan classify_wrapping_paren_init(Token *open, Token *close) {
 	WrapParenScan r = {0};
 	Token *prev = NULL;
@@ -3458,10 +3897,9 @@ static WrapParenScan classify_wrapping_paren_init(Token *open, Token *close) {
 	}
 	return r;
 }
-static OrelseInitInfo scan_decl_orelse(Token *decl_end,
-					       Token *type_start,
-					       TypeSpecResult *type,
-					       DeclResult *decl) {
+
+static OrelseInitInfo
+scan_decl_orelse(Token *decl_end, Token *type_start, TypeSpecResult *type, DeclResult *decl) {
 	OrelseInitInfo info = {0};
 	if (!decl->has_init || !FEAT(F_ORELSE)) return info;
 	Token *scan = tok_next(decl_end);
@@ -3472,17 +3910,23 @@ static OrelseInitInfo scan_decl_orelse(Token *decl_end,
 			if (match_ch(scan, '(') && tok_match(scan) && !is_stmt_expr_open(scan)) {
 				Token *close = tok_match(scan);
 				Token *after_close = tok_next(close);
-				if (!after_close || match_ch(after_close, ',') || match_ch(after_close, ';') || after_close->kind == TK_EOF) {
+				if (!after_close || match_ch(after_close, ',') ||
+				    match_ch(after_close, ';') || after_close->kind == TK_EOF) {
 					WrapParenScan w = classify_wrapping_paren_init(scan, close);
 					if (w.has_oe && !w.has_d0_comma) {
-						if (prev_scan) break; // fall through to check_orelse_in_parens
+						if (prev_scan)
+							break; // fall through to check_orelse_in_parens
 						decl_end->next_idx = scan->next_idx;
 						scan->flags &= ~TF_OPEN;
 						Token *before_close = scan;
-						for (Token *t = tok_next(scan); t && t != close; ) {
+						for (Token *t = tok_next(scan); t && t != close;) {
 							if (t->flags & TF_OPEN) {
 								Token *m = tok_match(t);
-								if (m) { before_close = m; t = tok_next(m); continue; }
+								if (m) {
+									before_close = m;
+									t = tok_next(m);
+									continue;
+								}
 							}
 							before_close = t;
 							t = tok_next(t);
@@ -3499,13 +3943,24 @@ static OrelseInitInfo scan_decl_orelse(Token *decl_end,
 			continue;
 		}
 		if (match_ch(scan, ',') || match_ch(scan, ';')) break;
-		if (match_ch(scan, '?')) { ternary++; prev_scan = scan; scan = tok_next(scan); continue; }
-		if (match_ch(scan, ':') && ternary > 0) { ternary--; prev_scan = scan; scan = tok_next(scan); continue; }
+		if (match_ch(scan, '?')) {
+			ternary++;
+			prev_scan = scan;
+			scan = tok_next(scan);
+			continue;
+		}
+		if (match_ch(scan, ':') && ternary > 0) {
+			ternary--;
+			prev_scan = scan;
+			scan = tok_next(scan);
+			continue;
+		}
 		if (ternary == 0 && orelse_kw_at_bare(scan, prev_scan)) {
 			info.orelse_tok = scan;
 			break;
 		}
-		prev_scan = scan; scan = tok_next(scan);
+		prev_scan = scan;
+		scan = tok_next(scan);
 	}
 
 	if (info.orelse_tok) {
@@ -3518,6 +3973,7 @@ static OrelseInitInfo scan_decl_orelse(Token *decl_end,
 
 // Detect whether a type specifier refers to a function type
 static Token *walk_back_skip_attrs(uint32_t start_idx); // in parse.c
+
 static bool is_typeof_func_type(Token *type_start, TypeSpecResult *type, DeclResult *decl) {
 	if (decl->is_pointer || decl->is_array || decl->is_func_ptr) return false;
 	for (Token *ft = type_start; ft && ft != type->end; ft = tok_next(ft)) {
@@ -3538,7 +3994,8 @@ static bool is_typeof_func_type(Token *type_start, TypeSpecResult *type, DeclRes
 				if (inner_close && tok_next(inner_close) == close) {
 					inner = tok_next(inner);
 					close = inner_close;
-				} else break;
+				} else
+					break;
 			}
 			if (!inner || inner == close) break;
 			if (tok_next(inner) == close && is_valid_varname(inner) &&
@@ -3572,24 +4029,30 @@ static bool is_typeof_func_type(Token *type_start, TypeSpecResult *type, DeclRes
 					}
 					if (match_ch(fs, '(')) {
 						Token *after = skip_noise(tok_next(fs));
-						if (after && match_ch(after, '*')) return false; // function pointer type
+						if (after && match_ch(after, '*'))
+							return false; // function pointer type
 						return true; // function parameter list → function type
 					}
 				}
 				break;
 			}
-			if (tok_next(inner) != close ||
-			    !is_valid_varname(inner) || (inner->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF))) break;
+			if (tok_next(inner) != close || !is_valid_varname(inner) ||
+			    (inner->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)))
+				break;
 			typeof_ident_loc = tok_loc(inner);
 			typeof_ident_len = inner->len;
 			typeof_inner = inner;
-			{ TypedefEntry *shadow = typedef_lookup(inner);
-			  if (shadow && shadow->is_shadow) break; }
+			{
+				TypedefEntry *shadow = typedef_lookup(inner);
+				if (shadow && shadow->is_shadow) break;
+			}
 			for (int fi = 0; fi < func_meta_count; fi++) {
 				Token *fn = func_meta[fi].ret_type_end;
 				if (!fn) {
-					Token *bt = walk_back_skip_attrs(tok_idx(func_meta[fi].body_open) - 1);
-					if (bt && is_valid_varname(bt) && !(bt->tag & (TT_ATTR | TT_TYPE | TT_QUALIFIER | TT_SUE)))
+					Token *bt =
+					    walk_back_skip_attrs(tok_idx(func_meta[fi].body_open) - 1);
+					if (bt && is_valid_varname(bt) &&
+					    !(bt->tag & (TT_ATTR | TT_TYPE | TT_QUALIFIER | TT_SUE)))
 						fn = bt;
 				}
 				if (fn && fn->len == inner->len &&
@@ -3616,45 +4079,57 @@ typedef struct {
 
 static DeclShape classify_decl_shape(Token *type_start, TypeSpecResult *type, DeclResult *decl) {
 	DeclShape s = {
-		.effective_vla = (decl->is_vla && (!decl->paren_pointer || decl->paren_array)) ||
-				 (type->is_vla && !decl->is_pointer),
-		.is_aggregate = (decl->is_array && (!decl->paren_pointer || decl->paren_array)) ||
-				((type->is_struct || type->is_typedef || type->is_array) && !decl->is_pointer),
-		.is_union_type = type->is_union && !decl->is_pointer,
-		.is_func_type = decl->is_func_decl || is_typeof_func_type(type_start, type, decl),
+	    .effective_vla = (decl->is_vla && (!decl->paren_pointer || decl->paren_array)) ||
+			     (type->is_vla && !decl->is_pointer),
+	    .is_aggregate = (decl->is_array && (!decl->paren_pointer || decl->paren_array)) ||
+			    ((type->is_struct || type->is_typedef || type->is_array) && !decl->is_pointer),
+	    .is_union_type = type->is_union && !decl->is_pointer,
+	    .is_func_type = decl->is_func_decl || is_typeof_func_type(type_start, type, decl),
 	};
 	return s;
 }
-static bool decl_shape_needs_memset(const DeclShape *s, TypeSpecResult *type, DeclResult *decl,
-				    bool has_init, bool is_raw, bool storage_static) {
+
+static bool decl_shape_needs_memset(const DeclShape *s,
+				    TypeSpecResult *type,
+				    DeclResult *decl,
+				    bool has_init,
+				    bool is_raw,
+				    bool storage_static) {
 	return FEAT(F_ZEROINIT) && !has_init && !is_raw && (!decl->is_pointer || decl->is_array) &&
 	       !type->has_register && !storage_static && !type->has_extern && !s->is_func_type &&
 	       (type->has_typeof || (type->has_atomic && s->is_aggregate) || s->effective_vla ||
 		s->is_union_type);
 }
+
 static bool decl_shape_explicit_const(Token *type_start, TypeSpecResult *type, DeclResult *decl) {
 	bool excl = (type->has_const && !decl->is_func_ptr && !decl->is_pointer) || decl->is_const;
 	if (!excl && !decl->is_func_ptr && !decl->is_pointer)
 		excl = type_range_any(type_start, type->end, is_const_td);
 	return excl;
 }
-static void reject_register_vla(Token *var, const DeclShape *s, TypeSpecResult *type,
-				bool has_init, bool is_raw) {
+
+static void
+reject_register_vla(Token *var, const DeclShape *s, TypeSpecResult *type, bool has_init, bool is_raw) {
 	if (FEAT(F_ZEROINIT) && !has_init && !is_raw && type->has_register && s->effective_vla)
 		error_tok(var, ERR_REGISTER_VLA);
 }
-static void reject_register_agg_zeroinit(Token *var, const DeclShape *s, TypeSpecResult *type,
-					 bool has_init, bool is_raw) {
+
+static void reject_register_agg_zeroinit(
+    Token *var, const DeclShape *s, TypeSpecResult *type, bool has_init, bool is_raw) {
 	if (!FEAT(F_ZEROINIT) || has_init || is_raw || !type->has_register) return;
 	if (type->has_extern || type->has_static) return;
-	if (type->has_atomic && s->is_aggregate)
-		error_tok(var, ERR_REGISTER_ATOMIC_AGGREGATE);
-	if (s->is_union_type)
-		error_tok(var, ERR_REGISTER_UNION);
+	if (type->has_atomic && s->is_aggregate) error_tok(var, ERR_REGISTER_ATOMIC_AGGREGATE);
+	if (s->is_union_type) error_tok(var, ERR_REGISTER_UNION);
 }
-static void reject_const_unavoidable_memset(Token *var, const DeclShape *s, TypeSpecResult *type,
-					    Token *type_start, DeclResult *decl, bool has_init,
-					    bool is_raw, bool allow_init_stmt_scalar) {
+
+static void reject_const_unavoidable_memset(Token *var,
+					    const DeclShape *s,
+					    TypeSpecResult *type,
+					    Token *type_start,
+					    DeclResult *decl,
+					    bool has_init,
+					    bool is_raw,
+					    bool allow_init_stmt_scalar) {
 	if (!FEAT(F_ZEROINIT) || has_init || is_raw) return;
 	if (type->has_register || type->has_static || type->has_extern) return;
 	bool needs = (!decl->is_pointer || decl->is_array) &&
@@ -3667,6 +4142,7 @@ static void reject_const_unavoidable_memset(Token *var, const DeclShape *s, Type
 	if (allow_init_stmt_scalar && !s->effective_vla) return;
 	error_tok(var, ERR_CONST_UNAVOIDABLE_MEMSET);
 }
+
 static bool type_spec_is_anon_sue(Token *type_start, TypeSpecResult *type) {
 	if (!type->is_struct || type->is_enum) return false;
 	for (Token *t = type_start; t && t != type->end; t = tok_next(t)) {
@@ -3677,17 +4153,17 @@ static bool type_spec_is_anon_sue(Token *type_start, TypeSpecResult *type) {
 	}
 	return false;
 }
-static void reject_decl_orelse_storage(Token *static_tok, Token *constexpr_tok,
-				       TypeSpecResult *type, bool saw_static) {
+
+static void
+reject_decl_orelse_storage(Token *static_tok, Token *constexpr_tok, TypeSpecResult *type, bool saw_static) {
 	if (saw_static || type->has_static || type->has_extern)
 		error_tok(static_tok, ERR_ORELSE_STATIC_THREAD);
-	if (type->has_constexpr)
-		error_tok(constexpr_tok ? constexpr_tok : static_tok, ERR_ORELSE_CONSTEXPR);
+	if (type->has_constexpr) error_tok(constexpr_tok ? constexpr_tok : static_tok, ERR_ORELSE_CONSTEXPR);
 }
+
 static void reject_decl_orelse_value_shape(Token *var_name, TypeSpecResult *type, DeclResult *decl) {
 	if (decl->is_array && !decl->paren_pointer)
-		error_tok(var_name, ERR_ORELSE_ARRAY_NEVER_NULL,
-			  var_name->len, tok_loc(var_name));
+		error_tok(var_name, ERR_ORELSE_ARRAY_NEVER_NULL, var_name->len, tok_loc(var_name));
 	if (type->is_struct && !type->is_enum && !decl->is_pointer && !decl->is_array)
 		error_tok(var_name, ERR_ORELSE_STRUCT_VALUE);
 }
@@ -3696,10 +4172,17 @@ static void reject_decl_orelse_value_shape(Token *var_name, TypeSpecResult *type
 static bool decl_has_attribute(Token *var_name, Token *eq) {
 	for (Token *t = tok_next(var_name); t && t != eq; t = tok_next(t)) {
 		if ((t->tag & TT_ATTR) || is_c23_attr(t)) return true;
-		if (t->flags & TF_OPEN) { Token *m = tok_match(t); if (m) { t = m; continue; } }
+		if (t->flags & TF_OPEN) {
+			Token *m = tok_match(t);
+			if (m) {
+				t = m;
+				continue;
+			}
+		}
 	}
 	return false;
 }
+
 static bool is_const_literal_init(Token *eq) {
 	Token *t = tok_next(eq);
 	if (!t || !match_ch(t, '{')) return false;
@@ -3707,7 +4190,10 @@ static bool is_const_literal_init(Token *eq) {
 	if (!close) return false;
 	bool prev_was_dot = false;
 	for (t = tok_next(t); t && t != close; t = tok_next(t)) {
-		if (t->kind == TK_NUM || t->kind == TK_STR) { prev_was_dot = false; continue; }
+		if (t->kind == TK_NUM || t->kind == TK_STR) {
+			prev_was_dot = false;
+			continue;
+		}
 		if (t->kind == TK_PUNCT) {
 			char c = t->ch0;
 			//   = blocks == (comparison; safe constant expr, but conservative reject)
@@ -3719,7 +4205,10 @@ static bool is_const_literal_init(Token *eq) {
 			}
 			return false;
 		}
-		if (t->kind == TK_IDENT && (prev_was_dot || is_known_enum_const(t))) { prev_was_dot = false; continue; }
+		if (t->kind == TK_IDENT && (prev_was_dot || is_known_enum_const(t))) {
+			prev_was_dot = false;
+			continue;
+		}
 		return false;
 	}
 	return true;
@@ -3741,8 +4230,18 @@ static InitWalkResult emit_decl_init_walk(Token *tok) {
 			continue;
 		}
 		if (match_ch(r.tok, ',') || match_ch(r.tok, ';')) break;
-		if (match_ch(r.tok, '?')) { init_ternary++; emit_tok(r.tok); r.tok = tok_next(r.tok); continue; }
-		if (match_ch(r.tok, ':') && init_ternary > 0) { init_ternary--; emit_tok(r.tok); r.tok = tok_next(r.tok); continue; }
+		if (match_ch(r.tok, '?')) {
+			init_ternary++;
+			emit_tok(r.tok);
+			r.tok = tok_next(r.tok);
+			continue;
+		}
+		if (match_ch(r.tok, ':') && init_ternary > 0) {
+			init_ternary--;
+			emit_tok(r.tok);
+			r.tok = tok_next(r.tok);
+			continue;
+		}
 		if (FEAT(F_ORELSE) && is_orelse_keyword(r.tok)) {
 			if (init_ternary > 0)
 				error_tok(r.tok, "'orelse' cannot be used inside a ternary expression");
@@ -3757,8 +4256,8 @@ static InitWalkResult emit_decl_init_walk(Token *tok) {
 	}
 	return r;
 }
-static bool finish_decl_orelse_hit(Token **tok_p, Token *tok,
-				   OrelseDeclTargetInfo *target, bool brace_wrap) {
+
+static bool finish_decl_orelse_hit(Token **tok_p, Token *tok, OrelseDeclTargetInfo *target, bool brace_wrap) {
 	if (target->stop_comma && match_ch(tok, ',')) {
 		*tok_p = tok_next(tok);
 		return true;
@@ -3767,44 +4266,53 @@ static bool finish_decl_orelse_hit(Token **tok_p, Token *tok,
 	*tok_p = tok;
 	return false;
 }
-static bool process_init_orelse_hit(Token **tok_p, DeclResult *decl,
-				    Token *type_start, TypeSpecResult *type,
-				    bool brace_wrap, int typeof_var_base) {
+
+static bool process_init_orelse_hit(Token **tok_p,
+				    DeclResult *decl,
+				    Token *type_start,
+				    TypeSpecResult *type,
+				    bool brace_wrap,
+				    int typeof_var_base) {
 	Token *tok = *tok_p;
 	reject_orelse_in_for_init(tok);
 	out_char(';');
 	flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type, typeof_var_base);
 	tok = tok_next(tok); // skip 'orelse'
 	OrelseDeclTargetInfo target = analyze_decl_orelse_target(tok, type_start, type, decl);
-	if (target.is_struct_value)
-		error_tok(decl->var_name, ERR_ORELSE_STRUCT_VALUE);
-	tok = emit_orelse_action(
-	    tok, decl->var_name, target.has_const_qual,
-	    type->has_volatile || type->has_atomic,
-	    target.stop_comma);
+	if (target.is_struct_value) error_tok(decl->var_name, ERR_ORELSE_STRUCT_VALUE);
+	tok = emit_orelse_action(tok,
+				 decl->var_name,
+				 target.has_const_qual,
+				 type->has_volatile || type->has_atomic,
+				 target.stop_comma);
 	return finish_decl_orelse_hit(tok_p, tok, &target, brace_wrap);
 }
+
 static bool should_split_multi_decl(Token *next_decl_tok) {
 	if (in_for_init()) return false;
 	DeclResult next_decl = parse_declarator(next_decl_tok, false);
 	if (!next_decl.end) return false;
 	if (ctx->typeof_var_count > 0 && next_decl.var_name && (next_decl.has_init || next_decl.is_vla))
 		return true;
-	if (FEAT(F_ORELSE) && declarator_has_bracket_orelse(next_decl_tok, next_decl.end))
-		return true;
+	if (FEAT(F_ORELSE) && declarator_has_bracket_orelse(next_decl_tok, next_decl.end)) return true;
 	return false;
 }
-static void validate_no_anon_struct_split(Token *next_decl_tok, Token *type_start,
-					  TypeSpecResult *type) {
-	if (type_spec_is_anon_sue(type_start, type))
-		error_tok(next_decl_tok, ERR_BRACKET_OE_ANON_AGG);
+
+static void validate_no_anon_struct_split(Token *next_decl_tok, Token *type_start, TypeSpecResult *type) {
+	if (type_spec_is_anon_sue(type_start, type)) error_tok(next_decl_tok, ERR_BRACKET_OE_ANON_AGG);
 }
-static bool process_const_orelse_decl(Token **tok_p, Token *orelse_tok,
-				      Token *decl_start, DeclResult *decl,
-				      Token *type_start, TypeSpecResult *type,
-				      Token *pragma_start, bool brace_wrap, int typeof_var_base) {
+
+static bool process_const_orelse_decl(Token **tok_p,
+				      Token *orelse_tok,
+				      Token *decl_start,
+				      DeclResult *decl,
+				      Token *type_start,
+				      TypeSpecResult *type,
+				      Token *pragma_start,
+				      bool brace_wrap,
+				      int typeof_var_base) {
 	Token *val_start = tok_next(decl->end); // First value token after '='
-	Token *tok = tok_next(orelse_tok); // skip 'orelse'
+	Token *tok = tok_next(orelse_tok);	// skip 'orelse'
 	OrelseDeclTargetInfo target = analyze_decl_orelse_target(tok, type_start, type, decl);
 	if (target.is_struct_value)
 		error_tok(orelse_tok,
@@ -3812,24 +4320,22 @@ static bool process_const_orelse_decl(Token **tok_p, Token *orelse_tok,
 			  "is not supported; use a control flow action "
 			  "(return/break/goto), typeof_unqual, or an "
 			  "explicit type name");
-	if (type->is_vla || decl->is_vla || type->type_vm)
-		error_tok(orelse_tok, ERR_ORELSE_CONST_VM);
-	tok = handle_const_orelse_fallback(tok,
-					   orelse_tok,
-					   val_start,
-					   decl_start,
-					   decl,
-					   type_start,
-					   type,
-					   pragma_start,
-					   target.stop_comma);
+	if (type->is_vla || decl->is_vla || type->type_vm) error_tok(orelse_tok, ERR_ORELSE_CONST_VM);
+	tok = handle_const_orelse_fallback(
+	    tok, orelse_tok, val_start, decl_start, decl, type_start, type, pragma_start, target.stop_comma);
 	flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type, typeof_var_base);
 	if (match_ch(tok, ';')) tok = tok_next(tok);
 	end_statement_after_semicolon();
 	return finish_decl_orelse_hit(tok_p, tok, &target, brace_wrap);
 }
-static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw, Token *type_start,
-				  Token *pragma_start, Token *raw_tok, bool brace_wrap) {
+
+static Token *process_declarators(Token *tok,
+				  TypeSpecResult *type,
+				  bool is_raw,
+				  Token *type_start,
+				  Token *pragma_start,
+				  Token *raw_tok,
+				  bool brace_wrap) {
 	int typeof_var_base = ctx->typeof_var_count; // Save for reentrancy (stmt-expr in array dims)
 	bool first_decl = true;
 	bool need_type_emit = false; // Set after orelse comma — deferred to after next lookahead
@@ -3867,15 +4373,18 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		// Static/extern/thread-local initializers must be constant expressions
 		// (C11 §6.7.9p4). Orelse splits the declaration into a runtime
 		if (orelse_info.orelse_tok)
-			reject_decl_orelse_storage(orelse_info.orelse_tok, orelse_info.orelse_tok, type, false);
+			reject_decl_orelse_storage(
+			    orelse_info.orelse_tok, orelse_info.orelse_tok, type, false);
 		// Step 2b: Pre-hoist bracket orelse temps (before type emission)
 		bool has_bo = FEAT(F_ORELSE) && declarator_has_bracket_orelse(decl_start, decl.end);
 		bool brace_opened = false;
 		BOFrame bo_frame;
 		if (has_bo) {
-			if (in_ctrl_paren())
-				error_tok(decl_start, ERR_BRACKET_OE_VLA_INIT_STMT);
-			if (first_decl && brace_wrap) { OUT_LIT(" {"); brace_opened = true; }
+			if (in_ctrl_paren()) error_tok(decl_start, ERR_BRACKET_OE_VLA_INIT_STMT);
+			if (first_decl && brace_wrap) {
+				OUT_LIT(" {");
+				brace_opened = true;
+			}
 			bo_save(&bo_frame);
 			emit_bracket_orelse_temps(decl_start, decl.end);
 		}
@@ -3883,29 +4392,26 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		if (need_type_emit) {
 			// Splitting a typeof VLA re-emits the type specifier, causing
 			// the VLA dimension to be evaluated twice (ISO C11 §6.7.2.5).
-			if ((type->has_typeof || type->has_atomic) &&
-			    (type->is_vla || type->type_vm))
+			if ((type->has_typeof || type->has_atomic) && (type->is_vla || type->type_vm))
 				error_tok(decl_start, ERR_MULTIDECL_VM);
 			if (!is_const_orelse_fallback)
-				emit_type_with_pragma_prelude(pragma_start, type_start, type->end, raw_tok, true);
+				emit_type_with_pragma_prelude(
+				    pragma_start, type_start, type->end, raw_tok, true);
 			need_type_emit = false;
 		}
 
 		if (first_decl) {
 			if (brace_wrap && !brace_opened) OUT_LIT(" {");
 			if (!is_const_orelse_fallback) {
-				if (FEAT(F_AUTO_STATIC) && ctx->block_depth > 0 &&
-				    !in_ctrl_paren() &&
-				    type->has_const && !type->has_volatile &&
-				    !type->has_volatile_member &&
-				    !type->has_static && !type->has_extern &&
-				    !type->has_register && !type->has_auto &&
-				    !type->has_constexpr && !type->has_thread_local &&
+				if (FEAT(F_AUTO_STATIC) && ctx->block_depth > 0 && !in_ctrl_paren() &&
+				    type->has_const && !type->has_volatile && !type->has_volatile_member &&
+				    !type->has_static && !type->has_extern && !type->has_register &&
+				    !type->has_auto && !type->has_constexpr && !type->has_thread_local &&
 				    decl.is_array && (!decl.is_pointer || decl.is_const) && decl.has_init &&
-				    !decl.is_vla && !type->is_vla &&
-				    !decl_is_raw && !orelse_info.orelse_tok) {
+				    !decl.is_vla && !type->is_vla && !decl_is_raw &&
+				    !orelse_info.orelse_tok) {
 					if (!type_range_any(type_start, type->end, is_vol_or_vol_member_td)) {
-						Token *eq = decl.end;  // '=' token
+						Token *eq = decl.end; // '=' token
 						Token *brace = tok_next(eq);
 						if (brace && match_ch(brace, '{') && tok_match(brace) &&
 						    match_ch(tok_next(tok_match(brace)), ';') &&
@@ -3914,7 +4420,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 							OUT_LIT("static ");
 					}
 				}
-				emit_type_with_pragma_prelude(pragma_start, type_start, type->end, raw_tok, false);
+				emit_type_with_pragma_prelude(
+				    pragma_start, type_start, type->end, raw_tok, false);
 			}
 			first_decl = false;
 		}
@@ -3924,25 +4431,41 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		bool is_aggregate = shape.is_aggregate;
 		bool is_func_type = shape.is_func_type;
 		bool is_union_type = shape.is_union_type;
-		bool needs_memset = decl_shape_needs_memset(&shape, type, &decl, decl.has_init, decl_is_raw,
-							    type->has_static);
+		bool needs_memset = decl_shape_needs_memset(
+		    &shape, type, &decl, decl.has_init, decl_is_raw, type->has_static);
 		// Extend rejection to cover that path explicitly.  C23 init-statement
 		// const-modify UB to worry about.
 		bool _is_init_stmt_ctx_for_const = in_for_init() || in_ctrl_paren();
-		reject_const_unavoidable_memset(decl.var_name, &shape, type, type_start, &decl,
-						decl.has_init, decl_is_raw, _is_init_stmt_ctx_for_const);
+		reject_const_unavoidable_memset(decl.var_name,
+						&shape,
+						type,
+						type_start,
+						&decl,
+						decl.has_init,
+						decl_is_raw,
+						_is_init_stmt_ctx_for_const);
 		if (needs_memset && !type->has_volatile && !decl.is_func_ptr && !decl.is_pointer) {
 			for (Token *tv = type_start; tv && tv != type->end; tv = tok_next(tv))
-				if (is_volatile_typedef(tv) || has_volatile_member_typedef(tv))
-					{ type->has_volatile = true; break; }
+				if (is_volatile_typedef(tv) || has_volatile_member_typedef(tv)) {
+					type->has_volatile = true;
+					break;
+				}
 		}
-		// has_volatile_member from parse_type_specifier (inline struct body or tag ref)
+		// has_volatile_member from parse_type_specifier (inline struct body or tag
+		// ref)
 		if (needs_memset && !type->has_volatile && type->has_volatile_member)
 			type->has_volatile = true;
 		reject_register_vla(decl.var_name, &shape, type, decl.has_init, decl_is_raw);
 		if (is_const_orelse_fallback) {
-			if (process_const_orelse_decl(&tok, orelse_info.orelse_tok, decl_start,
-						     &decl, type_start, type, pragma_start, brace_wrap, typeof_var_base)) {
+			if (process_const_orelse_decl(&tok,
+						      orelse_info.orelse_tok,
+						      decl_start,
+						      &decl,
+						      type_start,
+						      type,
+						      pragma_start,
+						      brace_wrap,
+						      typeof_var_base)) {
 				if (has_bo) bo_restore(&bo_frame);
 				need_type_emit = true;
 				continue;
@@ -3955,10 +4478,12 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 		if (has_bo) bo_restore(&bo_frame);
 		tok = decl.end;
 		// C23 init-statement context: a delayed memset cannot be inserted
-			// (C99 §6.7.8p3) and remain rejected.
+		// (C99 §6.7.8p3) and remain rejected.
 		bool init_stmt_ctx = in_for_init() || in_ctrl_paren();
 		bool init_stmt_brace = needs_memset && init_stmt_ctx && !effective_vla;
-		if (FEAT(F_ZEROINIT) && !decl.has_init && !effective_vla && !decl_is_raw && (!needs_memset || init_stmt_brace) && !type->has_extern && !type->has_static && !is_func_type) {
+		if (FEAT(F_ZEROINIT) && !decl.has_init && !effective_vla && !decl_is_raw &&
+		    (!needs_memset || init_stmt_brace) && !type->has_extern && !type->has_static &&
+		    !is_func_type) {
 			reject_register_agg_zeroinit(decl.var_name, &shape, type, decl.has_init, decl_is_raw);
 			if (is_aggregate || type->has_typeof || is_union_type ||
 			    (type->has_atomic && is_aggregate))
@@ -3967,13 +4492,11 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 				OUT_LIT(" = 0");
 		}
 
-				if (needs_memset && !init_stmt_brace) {
+		if (needs_memset && !init_stmt_brace) {
 			// Distinguish for-init from C23 if/switch-init: both use
-					bool real_for_init = in_for_init() &&
-				ctx->scope_depth > 0 &&
-				scope_stack[ctx->scope_depth - 1].is_loop;
-			if (real_for_init && effective_vla)
-				error_tok(decl.var_name, ERR_INIT_STMT_VLA);
+			bool real_for_init = in_for_init() && ctx->scope_depth > 0 &&
+					     scope_stack[ctx->scope_depth - 1].is_loop;
+			if (real_for_init && effective_vla) error_tok(decl.var_name, ERR_INIT_STMT_VLA);
 			if (init_stmt_ctx && effective_vla && !real_for_init) {
 			} else {
 				ARENA_ENSURE_CAP(&ctx->main_arena,
@@ -3992,7 +4515,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			tok = iw.tok;
 			pd_unreachable_tok = iw.unreachable_tok;
 			if (iw.hit_orelse) {
-				if (process_init_orelse_hit(&tok, &decl, type_start, type, brace_wrap, typeof_var_base)) {
+				if (process_init_orelse_hit(
+					&tok, &decl, type_start, type, brace_wrap, typeof_var_base)) {
 					need_type_emit = true;
 					continue;
 				}
@@ -4013,7 +4537,8 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 			if (should_split_multi_decl(next_decl_tok)) {
 				validate_no_anon_struct_split(next_decl_tok, type_start, type);
 				out_char(';');
-				flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type, typeof_var_base);
+				flush_typeof_memsets(
+				    ctx->typeof_vars, &ctx->typeof_var_count, type, typeof_var_base);
 				tok = next_decl_tok;
 				need_type_emit = true;
 				continue;
@@ -4030,14 +4555,20 @@ static Token *process_declarators(Token *tok, TypeSpecResult *type, bool is_raw,
 
 emit_raw_bail:
 	while (tok && tok->kind != TK_EOF && !match_ch(tok, ';')) {
-		if ((tok->flags & TF_OPEN) && is_stmt_expr_open(tok)) { tok = emit_stmt_expr(tok); continue; }
+		if ((tok->flags & TF_OPEN) && is_stmt_expr_open(tok)) {
+			tok = emit_stmt_expr(tok);
+			continue;
+		}
 		tok = emit_advance(tok);
 	}
-	if (tok && match_ch(tok, ';')) { tok = emit_advance(tok); }
+	if (tok && match_ch(tok, ';')) {
+		tok = emit_advance(tok);
+	}
 	flush_typeof_memsets(ctx->typeof_vars, &ctx->typeof_var_count, type, typeof_var_base);
 	if (brace_wrap) OUT_LIT(" }");
 	return tok;
 }
+
 static Token *try_zero_init_decl(Token *tok) {
 	if (ctx->block_depth <= 0 || in_struct_body()) return NULL;
 	if (!FEAT(F_ZEROINIT) && !FEAT(F_ORELSE) && !FEAT(F_AUTO_STATIC)) return NULL;
@@ -4045,13 +4576,16 @@ static Token *try_zero_init_decl(Token *tok) {
 		bool has_bo = false;
 		for (Token *s = tok; s && s->kind != TK_EOF; s = tok_next(s)) {
 			if (match_ch(s, ';') || match_ch(s, '{')) break;
-			if (tok_ann(s) & (P1_OE_BRACKET | P1_OE_DECL_INIT)) { has_bo = true; break; }
+			if (tok_ann(s) & (P1_OE_BRACKET | P1_OE_DECL_INIT)) {
+				has_bo = true;
+				break;
+			}
 		}
 		if (!has_bo) return NULL;
 	}
 
-	if (tok->kind >=
-	    TK_STR) // Fast reject: strings, numbers, prep directives, EOF can't start a declaration
+	if (tok->kind >= TK_STR) // Fast reject: strings, numbers, prep directives,
+				 // EOF can't start a declaration
 		return NULL;
 	ScopeNode *_bt = scope_block_top();
 	bool in_switch_scope_unbraced = _bt && _bt->is_switch;
@@ -4062,9 +4596,9 @@ static Token *try_zero_init_decl(Token *tok) {
 	bool is_raw = false;
 	Token *raw_tok = NULL;
 	Token *raw_last = NULL; // last raw in chain (for deferred emit_noise_between_raws)
-		if ((tok->flags & TF_RAW) && !is_known_typedef(tok)) {
-			Token *after_raw = skip_noise(tok_next(tok));
-			if (is_raw_declaration_context(tok, after_raw)) {
+	if ((tok->flags & TF_RAW) && !is_known_typedef(tok)) {
+		Token *after_raw = skip_noise(tok_next(tok));
+		if (is_raw_declaration_context(tok, after_raw)) {
 			is_raw = true;
 			raw_tok = tok;
 			Token *last_raw = tok;
@@ -4081,8 +4615,14 @@ static Token *try_zero_init_decl(Token *tok) {
 		Token *probe = start;
 		while (probe && probe->kind != TK_EOF) {
 			SKIP_NOISE_CONTINUE(probe);
-			if (probe->tag & TT_QUALIFIER) { probe = tok_next(probe); continue; }
-			if ((probe->tag & (TT_STORAGE | TT_TYPEDEF))) { probe = tok_next(probe); continue; }
+			if (probe->tag & TT_QUALIFIER) {
+				probe = tok_next(probe);
+				continue;
+			}
+			if ((probe->tag & (TT_STORAGE | TT_TYPEDEF))) {
+				probe = tok_next(probe);
+				continue;
+			}
 			break;
 		}
 		if (probe && (probe->flags & TF_RAW) && !is_known_typedef(probe)) {
@@ -4117,8 +4657,10 @@ static Token *try_zero_init_decl(Token *tok) {
 		Token *ann = tok;
 		while (ann && ann->kind != TK_EOF) {
 			SKIP_NOISE_CONTINUE(ann);
-			if (ann->tag & (TT_STORAGE | TT_INLINE | TT_SKIP_DECL))
-				{ ann = tok_next(ann); continue; }
+			if (ann->tag & (TT_STORAGE | TT_INLINE | TT_SKIP_DECL)) {
+				ann = tok_next(ann);
+				continue;
+			}
 			break;
 		}
 		if (ann && !(tok_ann(ann) & P1_IS_DECL)) return NULL;
@@ -4130,7 +4672,10 @@ static Token *try_zero_init_decl(Token *tok) {
 	if (type.has_raw && !is_raw) {
 		is_raw = true;
 		for (Token *r = start; r && r != type.end; r = tok_next(r))
-			if ((r->flags & TF_RAW) && !is_known_typedef(r)) { raw_tok = r; break; }
+			if ((r->flags & TF_RAW) && !is_known_typedef(r)) {
+				raw_tok = r;
+				break;
+			}
 	}
 
 	{
@@ -4141,8 +4686,8 @@ static Token *try_zero_init_decl(Token *tok) {
 			if (aeq && is_stmt_expr_open(aeq) && tok_match(aeq)) {
 				Token *se_close = tok_match(aeq);
 				Token *after_se = tok_next(se_close);
-				bool is_orelse = after_se && (after_se->tag & TT_ORELSE) &&
-					!(se_close->tag & TT_MEMBER);
+				bool is_orelse =
+				    after_se && (after_se->tag & TT_ORELSE) && !(se_close->tag & TT_MEMBER);
 				if (is_orelse) {
 					TypedefEntry *te = typedef_lookup(after_se);
 					if (te && !orelse_shadow_is_kw(se_close)) is_orelse = false;
@@ -4160,31 +4705,30 @@ static Token *try_zero_init_decl(Token *tok) {
 		// Mirror Phase 1D's narrower gate: only fire on the
 		DeclResult _peek = parse_declarator(type.end, false);
 		bool _has_init = _peek.var_name && _peek.end && match_ch(_peek.end, '=');
-		bool _has_explicit_intent =
-		    _has_init ||
-		    type.is_typedef || type.is_struct || type.is_enum ||
-		    type.has_static || type.has_extern || type.has_thread_local ||
-		    type.has_register || type.has_atomic || type.has_constexpr ||
-		    type.has_alignas;
+		bool _has_explicit_intent = _has_init || type.is_typedef || type.is_struct || type.is_enum ||
+					    type.has_static || type.has_extern || type.has_thread_local ||
+					    type.has_register || type.has_atomic || type.has_constexpr ||
+					    type.has_alignas;
 		if (!_has_explicit_intent)
 			SAFETY_DIAG(warn_loc,
 				    "variable declaration directly in switch body without braces "
-				    "(zero-init may be skipped by case labels); wrap in braces or use 'raw'");
+				    "(zero-init may be skipped by case labels); wrap in braces "
+				    "or use 'raw'");
 	}
 
 	bool brace_wrap = ctrl_state.pending && ctrl_state.parens_just_closed;
 	if (brace_wrap) ctrl_reset();
-	if (is_raw && raw_tok && raw_last)
-		emit_noise_between_raws(raw_tok, raw_last);
+	if (is_raw && raw_tok && raw_last) emit_noise_between_raws(raw_tok, raw_last);
 	return process_declarators(type.end, &type, is_raw, start, pragma_start, raw_tok, brace_wrap);
 }
+
 static Token *emit_expr_to_semicolon(Token *tok) {
 	int brace_depth = 0;
 	int ternary_depth = 0;
 	bool expr_at_stmt_start = false;
 	while (tok->kind != TK_EOF) {
 		if ((match_ch(tok, '(') || match_ch(tok, '[')) && tok_match(tok)) {
-				if ((FEAT(F_ORELSE) || FEAT(F_DEFER)) && (match_ch(tok, '(') || match_ch(tok, '[')))
+			if ((FEAT(F_ORELSE) || FEAT(F_DEFER)) && (match_ch(tok, '(') || match_ch(tok, '[')))
 				check_orelse_in_parens(tok);
 			tok = walk_balanced(tok, true);
 			expr_at_stmt_start = false;
@@ -4201,15 +4745,30 @@ static Token *emit_expr_to_semicolon(Token *tok) {
 			ternary_depth++;
 		if (expr_at_stmt_start && FEAT(F_ZEROINIT)) {
 			Token *next = try_zero_init_decl(tok);
-			if (next) { tok = next; expr_at_stmt_start = true; continue; }
+			if (next) {
+				tok = next;
+				expr_at_stmt_start = true;
+				continue;
+			}
 			expr_at_stmt_start = false;
 		}
 
-		if (FEAT(F_ORELSE) && (tok->tag & TT_TYPEOF)) { Token *next = try_typeof_orelse(tok); if (next) { tok = next; continue; } }
-		{ Token *r = emit_tok_checked(tok); if (r) { tok = r; continue; } }
+		if (FEAT(F_ORELSE) && (tok->tag & TT_TYPEOF)) {
+			Token *next = try_typeof_orelse(tok);
+			if (next) {
+				tok = next;
+				continue;
+			}
+		}
+		{
+			Token *r = emit_tok_checked(tok);
+			if (r) {
+				tok = r;
+				continue;
+			}
+		}
 
-		if (match_ch(tok, ';') || match_ch(tok, '{') || match_ch(tok, '}'))
-			expr_at_stmt_start = true;
+		if (match_ch(tok, ';') || match_ch(tok, '{') || match_ch(tok, '}')) expr_at_stmt_start = true;
 		else if (match_ch(tok, ':') && ternary_depth > 0) {
 			ternary_depth--;
 			expr_at_stmt_start = false;
@@ -4221,42 +4780,50 @@ static Token *emit_expr_to_semicolon(Token *tok) {
 	}
 	return tok;
 }
+
 static inline bool is_inside_attribute(Token *tok) {
 	if (!last_emitted || (!match_ch(last_emitted, '(') && !match_ch(last_emitted, ','))) return false;
-	for (Token *t = tok; t && t->kind != TK_EOF && !match_ch(t, ';') && !match_ch(t, '{'); t = tok_next(t)) {
-		if (t->flags & TF_OPEN) { t = tok_match(t); continue; }
+	for (Token *t = tok; t && t->kind != TK_EOF && !match_ch(t, ';') && !match_ch(t, '{');
+	     t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			t = tok_match(t);
+			continue;
+		}
 		if (match_ch(t, ')')) return true;
 	}
 	return false;
 }
-static void reject_defer_context(Token *tok, bool ctrl_paren, bool ctrl_pending,
-				 bool in_stmt_expr, bool in_switch) {
-	if (ctrl_paren)
-		error_tok(tok, ERR_DEFER_CTRL_PAREN);
-	if (ctrl_pending)
-		error_tok(tok, ERR_DEFER_BRACELESS_CTRL);
-	if (in_stmt_expr)
-		error_tok(tok, ERR_DEFER_STMT_EXPR_TOP);
-	if (in_switch)
-		error_tok(tok, ERR_DEFER_SWITCH_BRACE);
+
+static void
+reject_defer_context(Token *tok, bool ctrl_paren, bool ctrl_pending, bool in_stmt_expr, bool in_switch) {
+	if (ctrl_paren) error_tok(tok, ERR_DEFER_CTRL_PAREN);
+	if (ctrl_pending) error_tok(tok, ERR_DEFER_BRACELESS_CTRL);
+	if (in_stmt_expr) error_tok(tok, ERR_DEFER_STMT_EXPR_TOP);
+	if (in_switch) error_tok(tok, ERR_DEFER_SWITCH_BRACE);
 }
+
 static void reject_defer_fn_body(Token *tok, uint32_t body_tag) {
-	static const struct { uint32_t tag; const char *msg; } tab[] = {
-		{TT_SPECIAL_FN, "defer cannot be used in functions that call setjmp/longjmp/pthread_exit"},
-		{TT_NORETURN_FN, "defer cannot be used in functions that call vfork()"},
-		{TT_ASM, "defer cannot be used in functions containing asm goto"},
+	static const struct {
+		uint32_t tag;
+		const char *msg;
+	} tab[] = {
+	    {TT_SPECIAL_FN,
+	     "defer cannot be used in functions that call "
+	     "setjmp/longjmp/pthread_exit"},
+	    {TT_NORETURN_FN, "defer cannot be used in functions that call vfork()"},
+	    {TT_ASM, "defer cannot be used in functions containing asm goto"},
 	};
+
 	for (size_t i = 0; i < sizeof(tab) / sizeof(tab[0]); i++)
-		if (body_tag & tab[i].tag)
-			error_tok(tok, tab[i].msg);
+		if (body_tag & tab[i].tag) error_tok(tok, tab[i].msg);
 }
+
 static void reject_defer_unterminated(Token *tok, Token *body, Token *semi) {
-	if (semi->kind == TK_EOF || !match_ch(semi, ';'))
-		error_tok(tok, ERR_DEFER_UNTERMINATED);
-	if (body && body->kind == TK_KEYWORD &&
-	    (body->tag & (TT_NON_EXPR_STMT | TT_DEFER)))
+	if (semi->kind == TK_EOF || !match_ch(semi, ';')) error_tok(tok, ERR_DEFER_UNTERMINATED);
+	if (body && body->kind == TK_KEYWORD && (body->tag & (TT_NON_EXPR_STMT | TT_DEFER)))
 		error_tok(tok, ERR_DEFER_MISSING_SEMI, body->len, tok_loc(body));
 }
+
 static Token *try_handle_defer_flow_kw(Token *tok) {
 	uint32_t tag = tok->tag;
 	if (!tag) return NULL;
@@ -4274,6 +4841,7 @@ static Token *try_handle_defer_flow_kw(Token *tok) {
 	}
 	return NULL;
 }
+
 static void arm_ctrl_pending_from_tag(Token *tok, uint32_t tag) {
 	if (tag & TT_LOOP) {
 		ctrl_state.pending_paren_kw = 1;
@@ -4284,16 +4852,14 @@ static void arm_ctrl_pending_from_tag(Token *tok, uint32_t tag) {
 		}
 		if (FEAT(F_DEFER | F_ZEROINIT)) {
 			ctrl_state.pending = true;
-			if (!is_do_kw(tok))
-				ctrl_state.parens_just_closed = false;
+			if (!is_do_kw(tok)) ctrl_state.parens_just_closed = false;
 		}
 		if (tok->ch0 == 'f' && FEAT(F_DEFER | F_ZEROINIT)) {
 			ctrl_state.pending = true;
 			ctrl_state.pending_for_paren = true;
 		}
 	}
-	if (tag & TT_SWITCH)
-		ctrl_state.pending_paren_kw = 2;
+	if (tag & TT_SWITCH) ctrl_state.pending_paren_kw = 2;
 	if (FEAT(F_DEFER) && (tag & TT_SWITCH)) ctrl_state.pending = true;
 	if ((tag & TT_SWITCH) && FEAT(F_DEFER | F_ZEROINIT)) {
 		ctrl_state.pending = true;
@@ -4311,13 +4877,13 @@ static void arm_ctrl_pending_from_tag(Token *tok, uint32_t tag) {
 		}
 	}
 }
+
 static Token *handle_defer_keyword(Token *tok) {
 	if (!FEAT(F_DEFER)) return NULL;
-	if (is_empty_known_function_call(tok))
-		return NULL;
+	if (is_empty_known_function_call(tok)) return NULL;
 	if (match_ch(tok_next(tok), ':') ||
 	    (last_emitted && ((last_emitted->tag & (TT_MEMBER | TT_GOTO)) ||
-	                      is_gnu_label_decl_head(last_emitted) || _equal_2(last_emitted, "&&"))) ||
+			      is_gnu_label_decl_head(last_emitted) || _equal_2(last_emitted, "&&"))) ||
 	    (last_emitted && (is_type_keyword(last_emitted) || (last_emitted->tag & TT_TYPEDEF))) ||
 	    (typedef_lookup(tok) && !match_ch(tok_next(tok), '{')) ||
 	    (tok_next(tok) && (tok_next(tok)->tag & TT_ASSIGN)) || in_struct_body() ||
@@ -4329,7 +4895,8 @@ static Token *handle_defer_keyword(Token *tok) {
 		in_sw = scope_stack[d].is_switch;
 		break;
 	}
-	reject_defer_context(tok, in_ctrl_paren(),
+	reject_defer_context(tok,
+			     in_ctrl_paren(),
 			     ctrl_state.pending && !in_ctrl_paren(),
 			     scope_block_top() && scope_block_top()->is_stmt_expr,
 			     in_sw);
@@ -4340,7 +4907,7 @@ static Token *handle_defer_keyword(Token *tok) {
 	if (match_ch(stmt_start, '{') && tok_match(stmt_start)) {
 		Token *close = tok_match(stmt_start);
 		Token *after = tok_next(close);
-		Token *stmt_end = after;  // exclusive boundary — emits up to but not including
+		Token *stmt_end = after; // exclusive boundary — emits up to but not including
 		defer_add(defer_keyword, stmt_start, stmt_end);
 		tok = after;
 		{
@@ -4357,11 +4924,13 @@ static Token *handle_defer_keyword(Token *tok) {
 	end_statement_after_semicolon();
 	return tok;
 }
+
 static inline bool is_void_return(Token *tok) {
 	bool returns_void = current_func_idx >= 0 && func_meta[current_func_idx].returns_void;
 	return returns_void || (match_ch(tok, '(') && tok_next(tok) && equal(tok_next(tok), "void") &&
-					  tok_next(tok_next(tok)) && match_ch(tok_next(tok_next(tok)), ')'));
+				tok_next(tok_next(tok)) && match_ch(tok_next(tok_next(tok)), ')'));
 }
+
 static Token *emit_return_body(Token *tok, Token *stop) {
 	bool active = FEAT(F_DEFER) && has_active_defers();
 	bool is_empty = match_ch(tok, ';') || (stop && tok == stop);
@@ -4373,25 +4942,30 @@ static Token *emit_return_body(Token *tok, Token *stop) {
 			bool is_void = is_void_return(tok);
 			unsigned ret_id = ctx->ret_counter++;
 			if (!is_void) {
-				out_char(' '); emit_ret_type();
-				OUT_LIT(" __prism_ret_"); out_uint(ret_id); OUT_LIT(" = (");
-			} else OUT_LIT(" (");
-			if (stop)
-				tok = emit_expr_to_stop(tok, stop, false);
+				out_char(' ');
+				emit_ret_type();
+				OUT_LIT(" __prism_ret_");
+				out_uint(ret_id);
+				OUT_LIT(" = (");
+			} else
+				OUT_LIT(" (");
+			if (stop) tok = emit_expr_to_stop(tok, stop, false);
 			else
 				tok = emit_expr_to_semicolon(tok);
 			OUT_LIT(");");
 			emit_all_defers();
-			if (!is_void) { OUT_LIT(" return __prism_ret_"); out_uint(ret_id); }
-			else OUT_LIT(" return");
+			if (!is_void) {
+				OUT_LIT(" return __prism_ret_");
+				out_uint(ret_id);
+			} else
+				OUT_LIT(" return");
 			out_char(';');
 		}
 	} else {
 		OUT_LIT(" return");
 		if (!is_empty) {
 			out_char(' ');
-			if (stop)
-				tok = emit_expr_to_stop(tok, stop, false);
+			if (stop) tok = emit_expr_to_stop(tok, stop, false);
 			else
 				tok = emit_expr_to_semicolon(tok);
 		}
@@ -4401,6 +4975,7 @@ static Token *emit_return_body(Token *tok, Token *stop) {
 	if (match_ch(tok, ';')) tok = tok_next(tok);
 	return tok;
 }
+
 static void emit_if_not_var(Token *var_name, bool open_brace) {
 	if (var_name) {
 		OUT_LIT(" if (!");
@@ -4411,8 +4986,9 @@ static void emit_if_not_var(Token *var_name, bool open_brace) {
 		OUT_LIT(" {");
 	}
 }
-static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bool single_eval_lhs,
-				 Token *stop_comma) {
+
+static Token *
+emit_orelse_action(Token *tok, Token *var_name, bool has_const, bool single_eval_lhs, Token *stop_comma) {
 	require_orelse_action(tok, stop_comma);
 	if (match_ch(tok, '{')) {
 		emit_if_not_var(var_name, false);
@@ -4426,8 +5002,10 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bo
 		if (tag & TT_RETURN) tok = tok_next(tok);
 		emit_if_not_var(var_name, true);
 		if (tag & TT_RETURN) tok = emit_return_body(tok, stop_comma);
-		else if (tag & (TT_BREAK | TT_CONTINUE)) tok = emit_break_continue_defer(tok);
-		else tok = emit_goto_defer(tok);
+		else if (tag & (TT_BREAK | TT_CONTINUE))
+			tok = emit_break_continue_defer(tok);
+		else
+			tok = emit_goto_defer(tok);
 		OUT_LIT(" }");
 		end_statement_after_semicolon();
 		return tok;
@@ -4445,11 +5023,12 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bo
 				if (rp) {
 					Token *br = tok_next(rp);
 					if (match_ch(br, '{') && (br->flags & TF_OPEN))
-						error_tok(probe,
-							  "volatile/atomic pointer: address of compound literal in "
-							  "'orelse' outlives the literal; use block form "
-							  "`orelse { ... }` with a named object, or a "
-							  "non-literal fallback");
+						error_tok(
+						    probe,
+						    "volatile/atomic pointer: address of compound literal in "
+						    "'orelse' outlives the literal; use block form "
+						    "`orelse { ... }` with a named object, or a "
+						    "non-literal fallback");
 				}
 			}
 		}
@@ -4469,20 +5048,19 @@ static Token *emit_orelse_action(Token *tok, Token *var_name, bool has_const, bo
 	Token *chain_next;
 	tok = emit_orelse_fallback_value(tok, stop_comma, &chain_next);
 	if (chain_next) {
-		if (single_eval_lhs)
-			OUT_LIT("; }");
+		if (single_eval_lhs) OUT_LIT("; }");
 		else
 			out_char(';');
 		return emit_orelse_action(chain_next, var_name, has_const, single_eval_lhs, stop_comma);
 	}
-	if (single_eval_lhs)
-		OUT_LIT("; }");
+	if (single_eval_lhs) OUT_LIT("; }");
 	else
 		out_char(';');
 	if (match_ch(tok, ';')) tok = tok_next(tok);
 	end_statement_after_semicolon();
 	return tok;
 }
+
 static Token *handle_control_exit_defer(Token *tok) {
 	if (tok->tag & TT_RETURN) {
 		if (!has_active_defers()) return NULL;
@@ -4512,20 +5090,19 @@ static P1LabelResult p1_label_find(Token *tok, int func_idx) {
 			int slot = (h + probe) & fm->label_hash_mask;
 			if (fm->label_hash[slot] < 0) break;
 			P1FuncEntry *e = &entries[fm->label_hash[slot]];
-			if (e->label.len == tok->len &&
-			    !memcmp(e->label.name, tok_loc(tok), tok->len))
+			if (e->label.len == tok->len && !memcmp(e->label.name, tok_loc(tok), tok->len))
 				return (P1LabelResult){scope_tree_depth(e->scope_id), e->tok};
 		}
 		return (P1LabelResult){0, NULL};
 	}
 	for (int i = 0; i < fm->entry_count; i++) {
-		if (entries[i].kind == P1K_LABEL &&
-		    entries[i].label.len == tok->len &&
+		if (entries[i].kind == P1K_LABEL && entries[i].label.len == tok->len &&
 		    !memcmp(entries[i].label.name, tok_loc(tok), tok->len))
 			return (P1LabelResult){scope_tree_depth(entries[i].scope_id), entries[i].tok};
 	}
 	return (P1LabelResult){0, NULL};
 }
+
 static int p1_goto_exits(Token *goto_tok, int func_idx) {
 	if (func_idx < 0 || func_idx >= func_meta_count) return 0;
 	FuncMeta *fm = &func_meta[func_idx];
@@ -4539,6 +5116,7 @@ static int p1_goto_exits(Token *goto_tok, int func_idx) {
 	}
 	return 0;
 }
+
 static Token *handle_goto_keyword(Token *tok) {
 	Token *goto_tok = tok;
 	tok = tok_next(tok);
@@ -4547,7 +5125,8 @@ static Token *handle_goto_keyword(Token *tok) {
 		Token *after_attrs = skip_noise(tok);
 		if (match_ch(after_attrs, '*')) {
 			if (has_active_defers())
-				error_tok(goto_tok, "computed goto cannot be used with active defer statements");
+				error_tok(goto_tok,
+					  "computed goto cannot be used with active defer statements");
 			emit_tok(goto_tok);
 			while (tok != after_attrs) {
 				tok = emit_advance(tok);
@@ -4573,7 +5152,9 @@ static Token *handle_goto_keyword(Token *tok) {
 					tok = emit_advance(tok);
 				}
 				tok = emit_advance(tok);
-				if (match_ch(tok, ';')) { tok = emit_advance(tok); }
+				if (match_ch(tok, ';')) {
+					tok = emit_advance(tok);
+				}
 				OUT_LIT(" }");
 				end_statement_after_semicolon();
 				return tok;
@@ -4586,6 +5167,7 @@ static Token *handle_goto_keyword(Token *tok) {
 	emit_tok(goto_tok);
 	return tok;
 }
+
 static Token *handle_sue_body(Token *tok) {
 	Token *brace = find_struct_body_brace(tok);
 	if (!brace) return NULL;
@@ -4597,9 +5179,11 @@ static Token *handle_sue_body(Token *tok) {
 	ctx->at_stmt_start = true;
 	return tok;
 }
+
 static Token *handle_open_brace(Token *tok) {
 	bool did_push = false;
-	if (ctrl_state.pending && (in_ctrl_paren() || !ctrl_state.parens_just_closed || (tok_ann(tok) & P1_SCOPE_INIT))) {
+	if (ctrl_state.pending &&
+	    (in_ctrl_paren() || !ctrl_state.parens_just_closed || (tok_ann(tok) & P1_SCOPE_INIT))) {
 		if (last_emitted && match_ch(last_emitted, '(')) {
 			ENSURE_ARRAY_CAP(ctrl_save_stack, ctrl_save_depth + 1, ctrl_save_cap, 16, CtrlState);
 			ctrl_save_stack[ctrl_save_depth++] = ctrl_state;
@@ -4625,38 +5209,34 @@ static Token *handle_open_brace(Token *tok) {
 	s->is_loop = ann & P1_SCOPE_LOOP;
 	s->is_switch = ann & P1_SCOPE_SWITCH;
 	if (is_stmt_expr) s->is_stmt_expr = true;
-	if (did_push)
-		s->is_ctrl_se = true;
+	if (did_push) s->is_ctrl_se = true;
 	if (is_init_scope) s->is_struct = true;
 	/* Anonymous / keyword-headed aggregate: `union {`, `struct {`, `enum {`.
-	 * Phase 1 scope lookup may not associate every `{` token (e.g. inside
-	 * typeof(type)); without is_struct, in_struct_body() is false and the
-	 * decl-boundary newline heuristic splits member lists. */
+   * Phase 1 scope lookup may not associate every `{` token (e.g. inside
+   * typeof(type)); without is_struct, in_struct_body() is false and the
+   * decl-boundary newline heuristic splits member lists. */
 	if (tok_before_brace && (tok_before_brace->tag & TT_SUE)) s->is_struct = true;
 	// Phase 1A may have classified this as a struct-like scope
 	if (!s->is_struct || !s->is_stmt_expr) {
 		uint16_t sid = find_body_scope_id(brace_tok);
 		if (sid) {
-			if (!s->is_struct && scope_tree[sid].is_struct)
-				s->is_struct = true;
-			if (!s->is_stmt_expr && scope_tree[sid].is_stmt_expr)
-				s->is_stmt_expr = true;
+			if (!s->is_struct && scope_tree[sid].is_struct) s->is_struct = true;
+			if (!s->is_stmt_expr && scope_tree[sid].is_stmt_expr) s->is_stmt_expr = true;
 		}
 	}
 
-	if (s->is_stmt_expr)
-		s->saved_defer_shadow_count = defer_shadow_count;
+	if (s->is_stmt_expr) s->saved_defer_shadow_count = defer_shadow_count;
 	ctx->at_stmt_start = true;
 	return tok;
 }
+
 static Token *handle_close_brace(Token *tok) {
 	if (ctrl_state.pending && ctrl_state.brace_depth > 0) {
 		ctrl_state.brace_depth--;
 		emit_tok(tok);
 		return tok_next(tok);
 	}
-	while (ctx->scope_depth > 0 && !is_brace_scope(scope_stack[ctx->scope_depth - 1].kind))
-		scope_pop();
+	while (ctx->scope_depth > 0 && !is_brace_scope(scope_stack[ctx->scope_depth - 1].kind)) scope_pop();
 	if (FEAT(F_DEFER) && ctx->scope_depth > 0) {
 		ScopeNode *s = &scope_stack[ctx->scope_depth - 1];
 		if (defer_count > s->defer_start_idx) {
@@ -4679,7 +5259,8 @@ static Token *handle_close_brace(Token *tok) {
 						}
 						break;
 					}
-					if (!probe || !match_ch(probe, '}')) break; // not a chain of closing braces
+					if (!probe || !match_ch(probe, '}'))
+						break; // not a chain of closing braces
 					if (scope_stack[depth].is_stmt_expr)
 						error_tok(defer_stack[s->defer_start_idx].defer_kw,
 							  ERR_DEFER_LAST_STMT_EXPR);
@@ -4692,17 +5273,16 @@ static Token *handle_close_brace(Token *tok) {
 	}
 
 	bool restore_ctrl = ctx->scope_depth > 0 && scope_stack[ctx->scope_depth - 1].is_ctrl_se;
-	bool closing_non_stmt_brace = ctx->scope_depth > 0 &&
-		scope_stack[ctx->scope_depth - 1].is_struct &&
-		!scope_stack[ctx->scope_depth - 1].is_stmt_expr;
+	bool closing_non_stmt_brace = ctx->scope_depth > 0 && scope_stack[ctx->scope_depth - 1].is_struct &&
+				      !scope_stack[ctx->scope_depth - 1].is_stmt_expr;
 	scope_pop();
-	if (restore_ctrl && ctrl_save_depth > 0)
-		ctrl_state = ctrl_save_stack[--ctrl_save_depth];
+	if (restore_ctrl && ctrl_save_depth > 0) ctrl_state = ctrl_save_stack[--ctrl_save_depth];
 	emit_tok(tok);
 	tok = tok_next(tok);
 	ctx->at_stmt_start = !closing_non_stmt_brace;
 	return tok;
 }
+
 static char **build_clean_environ(void) {
 	char **env = cached_env_load();
 	if (env) return env;
@@ -4722,6 +5302,7 @@ static char **build_clean_environ(void) {
 	cached_env_store(env);
 	return env;
 }
+
 static int wait_for_child(pid_t pid) {
 	int status;
 	while (waitpid(pid, &status, 0) == -1) {
@@ -4733,6 +5314,7 @@ static int wait_for_child(pid_t pid) {
 	if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
 	return -1;
 }
+
 static int spawn_command(char **argv, bool quiet_stderr) {
 	char **env = build_clean_environ();
 	if (!env) return -1;
@@ -4742,8 +5324,7 @@ static int spawn_command(char **argv, bool quiet_stderr) {
 	if (quiet_stderr) {
 		posix_spawn_file_actions_init(&actions);
 		devnull = open("/dev/null", O_WRONLY);
-		if (devnull >= 0)
-			posix_spawn_file_actions_adddup2(&actions, devnull, STDERR_FILENO);
+		if (devnull >= 0) posix_spawn_file_actions_adddup2(&actions, devnull, STDERR_FILENO);
 		actions_ptr = &actions;
 	}
 
@@ -4762,6 +5343,7 @@ static int spawn_command(char **argv, bool quiet_stderr) {
 static int run_command(char **argv) {
 	return spawn_command(argv, false);
 }
+
 static int run_command_quiet(char **argv) {
 	return spawn_command(argv, true);
 }
@@ -4780,11 +5362,13 @@ make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len, co
 			if ((size_t)dir_len >= sizeof(dir_path)) return -1;
 			memcpy(dir_path, source_adjacent, (size_t)dir_len);
 			dir_path[dir_len] = '\0';
-		} else strcpy(dir_path, ".");
+		} else
+			strcpy(dir_path, ".");
 		if (dir_has_write_bits(dir_path)) {
 			if (slash) {
 				int dir_len = (int)(slash - source_adjacent);
-				n = snprintf(buf, bufsize, "%.*s/.%s.XXXXXX.c", dir_len, source_adjacent, slash + 1);
+				n = snprintf(
+				    buf, bufsize, "%.*s/.%s.XXXXXX.c", dir_len, source_adjacent, slash + 1);
 			} else
 				n = snprintf(buf, bufsize, ".%s.XXXXXX.c", source_adjacent);
 			suffix_len = 2;
@@ -4801,20 +5385,20 @@ make_temp_file(char *buf, size_t bufsize, const char *prefix, int suffix_len, co
 	if (n < 0 || (size_t)n >= bufsize) return -1;
 	return suffix_len > 0 ? mkstemps(buf, suffix_len) : mkstemp(buf);
 }
-static int
-make_temp_file_registered(char *buf, size_t bufsize, const char *prefix,
-			  int suffix_len, const char *source_adjacent) {
+
+static int make_temp_file_registered(
+    char *buf, size_t bufsize, const char *prefix, int suffix_len, const char *source_adjacent) {
 	sigset_t mask, oldmask;
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGINT);
 	sigaddset(&mask, SIGTERM);
 	sigprocmask(SIG_BLOCK, &mask, &oldmask);
 	int fd = make_temp_file(buf, bufsize, prefix, suffix_len, source_adjacent);
-	if (fd >= 0)
-		signal_temps_register(buf);
+	if (fd >= 0) signal_temps_register(buf);
 	sigprocmask(SIG_SETMASK, &oldmask, NULL);
 	return fd;
 }
+
 static const char *path_basename(const char *path) {
 	const char *base = path;
 	for (const char *p = path; *p; p++) {
@@ -4822,20 +5406,29 @@ static const char *path_basename(const char *path) {
 	}
 	return base;
 }
+
 static const char **alloc_argv(int count) {
 	const char **args = calloc((size_t)count, sizeof(*args));
 	if (!args) error("out of memory");
 	return args;
 }
+
 static const char *cc_next_token(const char *p, const char **start, int *len, bool terminate) {
 	while (*p == ' ' || *p == '\t') p++;
-	if (!*p) { *start = p; *len = 0; return p; }
+	if (!*p) {
+		*start = p;
+		*len = 0;
+		return p;
+	}
 	if (*p == '"' || *p == '\'') {
 		char q = *p++;
 		*start = p;
 		while (*p && *p != q) p++;
 		*len = (int)(p - *start);
-		if (*p) { if (terminate) *(char *)p = '\0'; p++; }
+		if (*p) {
+			if (terminate) *(char *)p = '\0';
+			p++;
+		}
 	} else {
 		*start = p;
 		while (*p && *p != ' ' && *p != '\t') p++;
@@ -4844,9 +5437,11 @@ static const char *cc_next_token(const char *p, const char **start, int *len, bo
 	}
 	return p;
 }
+
 static const char *cc_executable(const char *cc) {
 	if (!cc || !*cc) return cc;
-	const char *start; int len;
+	const char *start;
+	int len;
 	cc_next_token(cc, &start, &len, false);
 	if (len == 0) return cc;
 	static PRISM_THREAD_LOCAL char buf[PATH_MAX];
@@ -4855,22 +5450,29 @@ static const char *cc_executable(const char *cc) {
 	buf[len] = '\0';
 	return buf;
 }
+
 static void cc_split_into_argv(const char **args, int *argc, const char *cc, char **out_dup) {
 	if (out_dup) *out_dup = NULL;
 	if (!cc || !*cc) return;
 	char *dup = strdup(cc);
-	if (!dup) { args[(*argc)++] = cc; return; }
+	if (!dup) {
+		args[(*argc)++] = cc;
+		return;
+	}
 	const char *p = dup;
 	while (*p) {
-		const char *start; int len;
+		const char *start;
+		int len;
 		p = cc_next_token(p, &start, &len, true);
 		if (len > 0) args[(*argc)++] = start;
 	}
 	if (out_dup) *out_dup = dup;
 }
+
 static int cc_extra_arg_count(const char *cc) {
 	if (!cc || !*cc) return 0;
-	const char *start; int len;
+	const char *start;
+	int len;
 	const char *p = cc_next_token(cc, &start, &len, false); // skip first token
 	int count = 0;
 	while (*p) {
@@ -4894,7 +5496,7 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 	bool msvc = cc_is_msvc(cc);
 	cc_split_into_argv(args, argc, cc, out_cc_dup);
 	if (msvc) {
-		args[(*argc)++] = "/E";          // preprocess to stdout
+		args[(*argc)++] = "/E"; // preprocess to stdout
 		args[(*argc)++] = "/nologo";
 	} else {
 		args[(*argc)++] = "-E";
@@ -4910,30 +5512,31 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 			if (strcmp(f, "/link") == 0) break;
 		} else {
 			if (strcmp(f, "-c") == 0 || strcmp(f, "-S") == 0) continue;
-			if (strcmp(f, "-o") == 0) { i++; continue; }
+			if (strcmp(f, "-o") == 0) {
+				i++;
+				continue;
+			}
 			if (f[0] == '-' && f[1] == 'o' && f[2] != '\0') continue;
 		}
 		args[(*argc)++] = f;
 	}
 
-	for (int i = 0; i < ctx->dep_flags_count; i++)
-		args[(*argc)++] = ctx->dep_flags[i];
-	for (int i = 0; i < ctx->extra_include_count; i++)
-	{
+	for (int i = 0; i < ctx->dep_flags_count; i++) args[(*argc)++] = ctx->dep_flags[i];
+	for (int i = 0; i < ctx->extra_include_count; i++) {
 		args[(*argc)++] = msvc ? "/I" : "-I";
 		args[(*argc)++] = ctx->extra_include_paths[i];
 	}
 
 	if (msvc) {
 		// MSVC: /D concatenated with macro
-		int needed = ctx->extra_define_count + 3; // +3 for __PRISM__, __PRISM_DEFER__, __PRISM_ZEROINIT__
+		int needed =
+		    ctx->extra_define_count + 3; // +3 for __PRISM__, __PRISM_DEFER__, __PRISM_ZEROINIT__
 		if (needed > pp_define_bufs_cap) {
 			int old_cap = pp_define_bufs_cap;
 			pp_define_bufs_cap = needed > 64 ? needed : 64;
 			pp_define_bufs = realloc(pp_define_bufs, pp_define_bufs_cap * sizeof(char *));
 			if (!pp_define_bufs) error("out of memory");
-			for (int i = old_cap; i < pp_define_bufs_cap; i++)
-				pp_define_bufs[i] = NULL;
+			for (int i = old_cap; i < pp_define_bufs_cap; i++) pp_define_bufs[i] = NULL;
 		}
 		int buf_idx = 0;
 		for (int i = 0; i < ctx->extra_define_count; i++) {
@@ -4943,20 +5546,21 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 			snprintf(pp_define_bufs[buf_idx], len, "/D%s", ctx->extra_defines[i]);
 			args[(*argc)++] = pp_define_bufs[buf_idx++];
 		}
-#define MSVC_DEFINE(str) do { \
-	const char *_s = (str); int _l = (int)strlen(_s) + 1; \
-	pp_define_bufs[buf_idx] = realloc(pp_define_bufs[buf_idx], _l); \
-	if (!pp_define_bufs[buf_idx]) error("out of memory"); \
-	memcpy(pp_define_bufs[buf_idx], _s, _l); \
-	args[(*argc)++] = pp_define_bufs[buf_idx++]; \
-} while (0)
+#define MSVC_DEFINE(str)                                                                                     \
+	do {                                                                                                 \
+		const char *_s = (str);                                                                      \
+		int _l = (int)strlen(_s) + 1;                                                                \
+		pp_define_bufs[buf_idx] = realloc(pp_define_bufs[buf_idx], _l);                              \
+		if (!pp_define_bufs[buf_idx]) error("out of memory");                                        \
+		memcpy(pp_define_bufs[buf_idx], _s, _l);                                                     \
+		args[(*argc)++] = pp_define_bufs[buf_idx++];                                                 \
+	} while (0)
 		MSVC_DEFINE("/D__PRISM__=1");
 		if (FEAT(F_DEFER)) MSVC_DEFINE("/D__PRISM_DEFER__=1");
 		if (FEAT(F_ZEROINIT)) MSVC_DEFINE("/D__PRISM_ZEROINIT__=1");
 #undef MSVC_DEFINE
 	} else {
-		for (int i = 0; i < ctx->extra_define_count; i++)
-		{
+		for (int i = 0; i < ctx->extra_define_count; i++) {
 			args[(*argc)++] = "-D";
 			args[(*argc)++] = ctx->extra_defines[i];
 		}
@@ -4996,8 +5600,7 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 	}
 #endif
 
-	for (int i = 0; i < ctx->extra_force_include_count; i++)
-	{
+	for (int i = 0; i < ctx->extra_force_include_count; i++) {
 		args[(*argc)++] = msvc ? "/FI" : "-include";
 		args[(*argc)++] = ctx->extra_force_includes[i];
 	}
@@ -5005,11 +5608,18 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 	args[(*argc)++] = input_file;
 	args[*argc] = NULL;
 }
+
 static char *make_dir_line(const char *p, int len) {
 	char *s = malloc(1 + len + 2);
-	if (s) { s[0] = '#'; memcpy(s + 1, p, len); s[1 + len] = '\n'; s[2 + len] = '\0'; }
+	if (s) {
+		s[0] = '#';
+		memcpy(s + 1, p, len);
+		s[1 + len] = '\n';
+		s[2 + len] = '\0';
+	}
 	return s;
 }
+
 static inline void free_source_defines(void) {
 	for (int i = 0; i < ctx->source_define_count; i++) {
 		free(ctx->source_defines[i]);
@@ -5020,17 +5630,29 @@ static inline void free_source_defines(void) {
 	ctx->source_define_count = 0;
 	ctx->source_define_cap = 0;
 }
+
 static bool has_unclosed_block_comment(const char *p, char **raw_delim_out) {
 	if (raw_delim_out) *raw_delim_out = NULL;
 	bool in_str = false, in_chr = false;
 	for (; *p && *p != '\n'; p++) {
-		if (in_str) { if (*p == '\\' && p[1]) p++; else if (*p == '"') in_str = false; continue; }
-		if (in_chr) { if (*p == '\\' && p[1]) p++; else if (*p == '\'') in_chr = false; continue; }
+		if (in_str) {
+			if (*p == '\\' && p[1]) p++;
+			else if (*p == '"')
+				in_str = false;
+			continue;
+		}
+		if (in_chr) {
+			if (*p == '\\' && p[1]) p++;
+			else if (*p == '\'')
+				in_chr = false;
+			continue;
+		}
 		if (*p == 'R' && p[1] == '"') {
 			const char *q = p + 2;
 			const char *dstart = q;
-			while (*q && *q != '(' && *q != ')' && *q != '\\' && *q != ' ' &&
-			       *q != '\t' && *q != '\n' && (q - dstart) < 17) q++;
+			while (*q && *q != '(' && *q != ')' && *q != '\\' && *q != ' ' && *q != '\t' &&
+			       *q != '\n' && (q - dstart) < 17)
+				q++;
 			if (*q == '(') {
 				int dlen = (int)(q - dstart);
 				const char *content = q + 1;
@@ -5043,7 +5665,10 @@ static bool has_unclosed_block_comment(const char *p, char **raw_delim_out) {
 				}
 				if (raw_delim_out) {
 					*raw_delim_out = malloc(dlen + 1);
-					if (*raw_delim_out) { memcpy(*raw_delim_out, dstart, dlen); (*raw_delim_out)[dlen] = '\0'; }
+					if (*raw_delim_out) {
+						memcpy(*raw_delim_out, dstart, dlen);
+						(*raw_delim_out)[dlen] = '\0';
+					}
 				}
 				return false;
 			raw_closed:;
@@ -5051,11 +5676,22 @@ static bool has_unclosed_block_comment(const char *p, char **raw_delim_out) {
 			}
 		} else if ((*p == 'u' || *p == 'U' || *p == 'L') && !in_str && !in_chr) {
 			const char *rp = p;
-			if (*rp == 'u' && rp[1] == '8') rp += 2; else rp++;
-			if (*rp == 'R' && rp[1] == '"') { p = rp - 1; continue; } // will hit R" on next iter
+			if (*rp == 'u' && rp[1] == '8') rp += 2;
+			else
+				rp++;
+			if (*rp == 'R' && rp[1] == '"') {
+				p = rp - 1;
+				continue;
+			} // will hit R" on next iter
 		}
-		if (*p == '"') { in_str = true; continue; }
-		if (*p == '\'') { in_chr = true; continue; }
+		if (*p == '"') {
+			in_str = true;
+			continue;
+		}
+		if (*p == '\'') {
+			in_chr = true;
+			continue;
+		}
 		if (p[0] == '/' && p[1] == '/') return false;
 		if (p[0] == '/' && p[1] == '*') {
 			const char *close = strstr(p + 2, "*/");
@@ -5065,6 +5701,7 @@ static bool has_unclosed_block_comment(const char *p, char **raw_delim_out) {
 	}
 	return false;
 }
+
 static void collect_source_defines(const char *input_file) {
 	free_source_defines();
 	if (!input_file || FEAT(F_FLATTEN)) return;
@@ -5075,21 +5712,28 @@ static void collect_source_defines(const char *input_file) {
 	bool in_continuation = false;
 	bool in_block_comment = false;
 	bool in_hash_block_comment = false; // block comment started between # and directive name
-	bool in_raw_string = false;  // inside a multi-line raw string literal
-	char *raw_delim = NULL;      // delimiter for the current raw string (malloc'd)
+	bool in_raw_string = false;	    // inside a multi-line raw string literal
+	char *raw_delim = NULL;		    // delimiter for the current raw string (malloc'd)
 	int raw_delim_len = 0;
 	int cond_depth = 0; // #if/#ifdef/#ifndef nesting depth
 
 	typedef struct {
-		char *opening;       // e.g. "#ifdef __APPLE__\n"
-		char *branches;      // accumulated "#else\n" or "#elif EXPR\n" text (NULL initially)
+		char *opening;	// e.g. "#ifdef __APPLE__\n"
+		char *branches; // accumulated "#else\n" or "#elif EXPR\n" text (NULL
+				// initially)
 		int branches_len;
 		int branches_cap;
-		bool extractable;    // false if opening/branch had continuation (multi-line expr)
+		bool extractable; // false if opening/branch had continuation (multi-line
+				  // expr)
 	} CondStackEntry;
+
 	int cond_stack_cap = 32;
 	CondStackEntry *cond_stack = calloc(cond_stack_cap, sizeof(CondStackEntry));
-	if (!cond_stack) { free(line); fclose(f); return; }
+	if (!cond_stack) {
+		free(line);
+		fclose(f);
+		return;
+	}
 	while (getline(&line, &line_cap, f) >= 0) {
 		char *p = line;
 		char *line_end;
@@ -5115,7 +5759,9 @@ static void collect_source_defines(const char *input_file) {
 				    (raw_delim_len == 0 || strncmp(r + 1, raw_delim, raw_delim_len) == 0) &&
 				    r[1 + raw_delim_len] == '"') {
 					in_raw_string = false;
-					free(raw_delim); raw_delim = NULL; raw_delim_len = 0;
+					free(raw_delim);
+					raw_delim = NULL;
+					raw_delim_len = 0;
 					p = r + 2 + raw_delim_len;
 					goto after_raw_string_close;
 				}
@@ -5133,7 +5779,8 @@ static void collect_source_defines(const char *input_file) {
 					in_raw_string = true;
 					raw_delim = rd;
 					raw_delim_len = (int)strlen(rd);
-				} else free(rd);
+				} else
+					free(rd);
 			}
 			continue;
 		}
@@ -5148,25 +5795,34 @@ static void collect_source_defines(const char *input_file) {
 			if (*p == '\n' || *p == '\0' || (p[0] == '/' && p[1] == '/')) goto check_continuation;
 			if (p[0] == '/' && p[1] == '*') {
 				char *close = strstr(p + 2, "*/");
-				if (!close) { in_block_comment = true; goto check_continuation; }
+				if (!close) {
+					in_block_comment = true;
+					goto check_continuation;
+				}
 				p = close + 2;
 				while (*p == ' ' || *p == '\t') p++;
 				if (*p != '#') {
 					char *rd = NULL;
-					if (has_unclosed_block_comment(p, &rd))
-						in_block_comment = true;
-					else if (rd && cond_depth == 0) { in_raw_string = true; raw_delim = rd; raw_delim_len = (int)strlen(rd); }
-					else free(rd);
+					if (has_unclosed_block_comment(p, &rd)) in_block_comment = true;
+					else if (rd && cond_depth == 0) {
+						in_raw_string = true;
+						raw_delim = rd;
+						raw_delim_len = (int)strlen(rd);
+					} else
+						free(rd);
 					goto check_continuation;
 				}
 				goto have_hash;
 			}
 			{
 				char *rd = NULL;
-				if (has_unclosed_block_comment(p, &rd))
-					in_block_comment = true;
-				else if (rd && cond_depth == 0) { in_raw_string = true; raw_delim = rd; raw_delim_len = (int)strlen(rd); }
-				else free(rd);
+				if (has_unclosed_block_comment(p, &rd)) in_block_comment = true;
+				else if (rd && cond_depth == 0) {
+					in_raw_string = true;
+					raw_delim = rd;
+					raw_delim_len = (int)strlen(rd);
+				} else
+					free(rd);
 			}
 			goto check_continuation;
 		}
@@ -5175,18 +5831,23 @@ static void collect_source_defines(const char *input_file) {
 		while (*p == ' ' || *p == '\t' || (p[0] == '/' && p[1] == '*')) {
 			if (p[0] == '/' && p[1] == '*') {
 				char *end = strstr(p + 2, "*/");
-				if (!end) { in_block_comment = true; in_hash_block_comment = true; goto check_continuation; } // unterminated block comment
+				if (!end) {
+					in_block_comment = true;
+					in_hash_block_comment = true;
+					goto check_continuation;
+				} // unterminated block comment
 				p = end + 2;
 			} else
 				p++;
 		}
-	parse_directive: ;
+	parse_directive:;
 		line_end = p + strlen(p);
 		while (line_end > p && (line_end[-1] == '\n' || line_end[-1] == '\r')) line_end--;
 		dir_has_continuation = (line_end > p && line_end[-1] == '\\');
 		dir_text_end = line_end;
 		if (dir_has_continuation) dir_text_end--;
-		while (dir_text_end > p && (dir_text_end[-1] == ' ' || dir_text_end[-1] == '\t')) dir_text_end--;
+		while (dir_text_end > p && (dir_text_end[-1] == ' ' || dir_text_end[-1] == '\t'))
+			dir_text_end--;
 		dir_text_len = (int)(dir_text_end - p);
 		if (strncmp(p, "ifdef", 5) == 0 || strncmp(p, "ifndef", 6) == 0 ||
 		    (strncmp(p, "if", 2) == 0 && (p[2] == ' ' || p[2] == '\t' || p[2] == '('))) {
@@ -5194,8 +5855,11 @@ static void collect_source_defines(const char *input_file) {
 				int nc = cond_stack_cap * 2;
 				CondStackEntry *ns = realloc(cond_stack, nc * sizeof(CondStackEntry));
 				if (ns) {
-					memset(ns + cond_stack_cap, 0, (nc - cond_stack_cap) * sizeof(CondStackEntry));
-					cond_stack = ns; cond_stack_cap = nc;
+					memset(ns + cond_stack_cap,
+					       0,
+					       (nc - cond_stack_cap) * sizeof(CondStackEntry));
+					cond_stack = ns;
+					cond_stack_cap = nc;
 				}
 			}
 			if (cond_depth < cond_stack_cap) {
@@ -5226,11 +5890,16 @@ static void collect_source_defines(const char *input_file) {
 				if (need > cond_stack[d].branches_cap) {
 					int nc = need * 2;
 					char *nb = realloc(cond_stack[d].branches, nc);
-					if (nb) { cond_stack[d].branches = nb; cond_stack[d].branches_cap = nc; }
+					if (nb) {
+						cond_stack[d].branches = nb;
+						cond_stack[d].branches_cap = nc;
+					}
 				}
 				if (cond_stack[d].branches && cond_stack[d].branches_cap >= need) {
 					char *dst = cond_stack[d].branches + cond_stack[d].branches_len;
-					dst[0] = '#'; memcpy(dst + 1, p, dir_text_len); dst[1 + dir_text_len] = '\n';
+					dst[0] = '#';
+					memcpy(dst + 1, p, dir_text_len);
+					dst[1 + dir_text_len] = '\n';
 					cond_stack[d].branches_len += blen;
 					cond_stack[d].branches[cond_stack[d].branches_len] = '\0';
 				}
@@ -5267,7 +5936,8 @@ static void collect_source_defines(const char *input_file) {
 			while (*p == ' ' || *p == '\t') p++;
 			char *val_start = p;
 			char *end = val_start + strlen(val_start);
-			while (end > val_start && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t'))
+			while (end > val_start &&
+			       (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t'))
 				end--;
 			bool has_continuation = (end > val_start && end[-1] == '\\');
 			if (has_continuation) end--;
@@ -5279,7 +5949,10 @@ static void collect_source_defines(const char *input_file) {
 			if (has_continuation) {
 				size_t cap = (val_len > 0 ? val_len : 0) + 256;
 				full_val = malloc(cap);
-				if (!full_val) { free(saved_name); goto check_continuation; }
+				if (!full_val) {
+					free(saved_name);
+					goto check_continuation;
+				}
 				if (val_len > 0) {
 					memcpy(full_val, val_start, val_len);
 					full_val_len = val_len;
@@ -5289,7 +5962,8 @@ static void collect_source_defines(const char *input_file) {
 					bool cur_leading_ws = (*lp == ' ' || *lp == '\t');
 					while (*lp == ' ' || *lp == '\t') lp++;
 					char *le = lp + strlen(lp);
-					while (le > lp && (le[-1] == '\n' || le[-1] == '\r' || le[-1] == ' ' || le[-1] == '\t'))
+					while (le > lp && (le[-1] == '\n' || le[-1] == '\r' ||
+							   le[-1] == ' ' || le[-1] == '\t'))
 						le--;
 					bool more = (le > lp && le[-1] == '\\');
 					if (more) le--;
@@ -5301,7 +5975,11 @@ static void collect_source_defines(const char *input_file) {
 						if (need > cap) {
 							cap = need * 2;
 							char *tmp = realloc(full_val, cap);
-							if (!tmp) { free(full_val); free(saved_name); goto check_continuation; }
+							if (!tmp) {
+								free(full_val);
+								free(saved_name);
+								goto check_continuation;
+							}
 							full_val = tmp;
 						}
 						if (full_val_len > 0 && (prev_had_ws || cur_leading_ws))
@@ -5324,7 +6002,10 @@ static void collect_source_defines(const char *input_file) {
 				int vlen = val ? full_val_len : val_len;
 				if (!val && vlen > 0) {
 					val = malloc(vlen + 1);
-					if (!val) { free(saved_name); goto check_continuation; }
+					if (!val) {
+						free(saved_name);
+						goto check_continuation;
+					}
 					memcpy(val, val_start, vlen);
 					val[vlen] = '\0';
 				}
@@ -5364,24 +6045,50 @@ static void collect_source_defines(const char *input_file) {
 									char *ce = strstr(line, "*/");
 									if (ce) {
 										char *rest = ce + 2;
-										while (*rest == ' ' || *rest == '\t') rest++;
-										char *re = rest + strlen(rest);
-										while (re > rest && (re[-1] == '\n' || re[-1] == '\r' ||
-										       re[-1] == ' ' || re[-1] == '\t')) re--;
+										while (*rest == ' ' ||
+										       *rest == '\t')
+											rest++;
+										char *re =
+										    rest + strlen(rest);
+										while (re > rest &&
+										       (re[-1] == '\n' ||
+											re[-1] == '\r' ||
+											re[-1] == ' ' ||
+											re[-1] == '\t'))
+											re--;
 										int rlen = (int)(re - rest);
 										if (rlen > 0) {
-											char *nv = realloc(val, cs + 1 + rlen + 1);
+											char *nv = realloc(
+											    val,
+											    cs + 1 + rlen +
+												1);
 											if (nv) {
-												if (val == full_val) full_val = nv;
+												if (val ==
+												    full_val)
+													full_val =
+													    nv;
 												val = nv;
 												val[cs] = ' ';
-												memcpy(val + cs + 1, rest, rlen);
-												vlen = cs + 1 + rlen;
-												val[vlen] = '\0';
+												memcpy(
+												    val + cs +
+													1,
+												    rest,
+												    rlen);
+												vlen = cs +
+												       1 +
+												       rlen;
+												val[vlen] =
+												    '\0';
 											}
 										} else {
 											vlen = cs;
-											while (vlen > 0 && (val[vlen-1] == ' ' || val[vlen-1] == '\t')) vlen--;
+											while (
+											    vlen > 0 &&
+											    (val[vlen - 1] ==
+												 ' ' ||
+											     val[vlen - 1] ==
+												 '\t'))
+												vlen--;
 											val[vlen] = '\0';
 										}
 										found_close = true;
@@ -5391,7 +6098,10 @@ static void collect_source_defines(const char *input_file) {
 								}
 								if (!found_close) {
 									vlen = cs;
-									while (vlen > 0 && (val[vlen-1] == ' ' || val[vlen-1] == '\t')) vlen--;
+									while (vlen > 0 &&
+									       (val[vlen - 1] == ' ' ||
+										val[vlen - 1] == '\t'))
+										vlen--;
 									val[vlen] = '\0';
 									modified = true;
 								}
@@ -5400,8 +6110,7 @@ static void collect_source_defines(const char *input_file) {
 						}
 					}
 				}
-				if (val != full_val)
-					free(full_val);
+				if (val != full_val) free(full_val);
 				if (modified || val != full_val) {
 					full_val = val;
 					full_val_len = vlen;
@@ -5412,22 +6121,26 @@ static void collect_source_defines(const char *input_file) {
 
 			int total = name_len + (val_len > 0 ? 1 + val_len : 0) + 1;
 			char *def = malloc(total);
-			if (!def) { free(full_val); free(saved_name); goto check_continuation; }
+			if (!def) {
+				free(full_val);
+				free(saved_name);
+				goto check_continuation;
+			}
 			memcpy(def, saved_name, name_len);
 			free(saved_name);
 			if (val_len > 0) {
 				def[name_len] = '=';
 				memcpy(def + name_len + 1, val_start, val_len);
 				def[name_len + 1 + val_len] = '\0';
-			} else def[name_len] = '\0';
+			} else
+				def[name_len] = '\0';
 			free(full_val);
 			char *guard = NULL;
 			if (cond_depth > 0) {
 				int glen = 0;
 				for (int d = 0; d < cond_depth; d++) {
 					glen += (int)strlen(cond_stack[d].opening);
-					if (cond_stack[d].branches)
-						glen += cond_stack[d].branches_len;
+					if (cond_stack[d].branches) glen += cond_stack[d].branches_len;
 				}
 				guard = malloc(glen + 1);
 				if (guard) {
@@ -5437,7 +6150,8 @@ static void collect_source_defines(const char *input_file) {
 						memcpy(guard + pos, cond_stack[d].opening, olen);
 						pos += olen;
 						if (cond_stack[d].branches) {
-							memcpy(guard + pos, cond_stack[d].branches,
+							memcpy(guard + pos,
+							       cond_stack[d].branches,
 							       cond_stack[d].branches_len);
 							pos += cond_stack[d].branches_len;
 						}
@@ -5447,29 +6161,36 @@ static void collect_source_defines(const char *input_file) {
 			}
 
 			int old_cap = ctx->source_define_cap;
-			ARENA_ENSURE_CAP(&ctx->main_arena, ctx->source_defines,
-					 ctx->source_define_count, ctx->source_define_cap,
-					 8, char *);
+			ARENA_ENSURE_CAP(&ctx->main_arena,
+					 ctx->source_defines,
+					 ctx->source_define_count,
+					 ctx->source_define_cap,
+					 8,
+					 char *);
 			if ((int)ctx->source_define_cap != old_cap)
-				ctx->source_define_guards = arena_realloc(&ctx->main_arena,
-					ctx->source_define_guards,
-					sizeof(char *) * old_cap,
-					sizeof(char *) * ctx->source_define_cap);
+				ctx->source_define_guards =
+				    arena_realloc(&ctx->main_arena,
+						  ctx->source_define_guards,
+						  sizeof(char *) * old_cap,
+						  sizeof(char *) * ctx->source_define_cap);
 			ctx->source_define_guards[ctx->source_define_count] = guard;
 			ctx->source_defines[ctx->source_define_count++] = def;
 		}
 	check_continuation: {
-			char *end = line + strlen(line);
-			while (end > line && (end[-1] == '\n' || end[-1] == '\r')) end--;
-			in_continuation = (end > line && end[-1] == '\\');
-			if (!in_continuation && !in_block_comment && !in_raw_string) {
-				char *rd = NULL;
-				if (has_unclosed_block_comment(line, &rd))
-					in_block_comment = true;
-				else if (rd && cond_depth == 0) { in_raw_string = true; raw_delim = rd; raw_delim_len = (int)strlen(rd); }
-				else free(rd);
-			}
+		char *end = line + strlen(line);
+		while (end > line && (end[-1] == '\n' || end[-1] == '\r')) end--;
+		in_continuation = (end > line && end[-1] == '\\');
+		if (!in_continuation && !in_block_comment && !in_raw_string) {
+			char *rd = NULL;
+			if (has_unclosed_block_comment(line, &rd)) in_block_comment = true;
+			else if (rd && cond_depth == 0) {
+				in_raw_string = true;
+				raw_delim = rd;
+				raw_delim_len = (int)strlen(rd);
+			} else
+				free(rd);
 		}
+	}
 	}
 	for (int d = 0; d < cond_depth && d < cond_stack_cap; d++) {
 		free(cond_stack[d].opening);
@@ -5480,11 +6201,13 @@ static void collect_source_defines(const char *input_file) {
 	free(line);
 	fclose(f);
 }
+
 static char *preprocess_with_cc(const char *input_file) {
 	collect_source_defines(input_file);
 	const char *pp_cc = ctx->extra_compiler ? ctx->extra_compiler : PRISM_DEFAULT_CC;
 	int argcap = 16 + cc_extra_arg_count(pp_cc) + ctx->extra_compiler_flags_count + ctx->dep_flags_count +
-		     ctx->extra_include_count * 2 + ctx->extra_define_count * 2 + ctx->extra_force_include_count * 2;
+		     ctx->extra_include_count * 2 + ctx->extra_define_count * 2 +
+		     ctx->extra_force_include_count * 2;
 	const char **args = alloc_argv(argcap);
 	int argc = 0;
 	char *cc_dup = NULL;
@@ -5508,8 +6231,7 @@ static char *preprocess_with_cc(const char *input_file) {
 	posix_spawn_file_actions_addclose(&fa, pipefd[0]);
 	posix_spawn_file_actions_adddup2(&fa, pipefd[1], STDOUT_FILENO);
 	posix_spawn_file_actions_addclose(&fa, pipefd[1]);
-	posix_spawn_file_actions_addopen(
-	    &fa, STDERR_FILENO, "/dev/null", O_WRONLY | O_TRUNC, 0644);
+	posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY | O_TRUNC, 0644);
 	char **env = build_clean_environ();
 	int err = posix_spawnp(&pid, argv[0], &fa, NULL, argv, env);
 	posix_spawn_file_actions_destroy(&fa);
@@ -5581,18 +6303,19 @@ static inline void track_ctrl_paren_open(void) {
 	if (ctrl_state.pending_for_paren) {
 		k = SCOPE_FOR_PAREN;
 		ctrl_state.pending_for_paren = false;
-	} else k = SCOPE_CTRL_PAREN;
+	} else
+		k = SCOPE_CTRL_PAREN;
 	ctrl_state.parens_just_closed = false;
 	scope_push_kind(k);
 	ScopeNode *sn = &scope_stack[ctx->scope_depth - 1];
 	uint8_t pk = ctrl_state.pending_paren_kw;
 	ctrl_state.pending_paren_kw = 0;
-	if (pk == 1)
-		sn->is_loop = true;
+	if (pk == 1) sn->is_loop = true;
 	else if (pk == 2)
 		sn->is_switch = true;
 	ctx->at_stmt_start = (k == SCOPE_FOR_PAREN);
 }
+
 static inline void track_ctrl_paren_close(void) {
 	// ctrl_state.pending is still live) must not leak parens_just_closed.
 	if (ctx->scope_depth == 0) return;
@@ -5602,96 +6325,171 @@ static inline void track_ctrl_paren_close(void) {
 	ctrl_state.parens_just_closed = true;
 	ctx->at_stmt_start = true;
 }
+
 static inline void track_ctrl_semicolon(void) {
 	if (in_for_init()) {
 		/* for/switch/if C23 init: FOR_PAREN → CTRL_PAREN after first ';'.
-		 * Preserve is_loop/is_switch so break/continue in the condition
-		 * (or for-increment) still stop at this paren for defer_walk. */
+     * Preserve is_loop/is_switch so break/continue in the condition
+     * (or for-increment) still stop at this paren for defer_walk. */
 		bool was_loop = scope_stack[ctx->scope_depth - 1].is_loop;
 		bool was_switch = scope_stack[ctx->scope_depth - 1].is_switch;
 		scope_pop();
 		scope_push_kind(SCOPE_CTRL_PAREN);
 		scope_stack[ctx->scope_depth - 1].is_loop = was_loop;
 		scope_stack[ctx->scope_depth - 1].is_switch = was_switch;
-	} else if (!in_ctrl_paren()) ctrl_reset();
+	} else if (!in_ctrl_paren())
+		ctrl_reset();
 }
+
 static PRISM_ALWAYS_INLINE inline void track_generic_token(Token *tok) {
 	if (tok->len != 1) return;
 	char c = tok->ch0;
 	if (c != '(' && c != ')') return;
 	if (!in_generic()) return;
 	if (c == '(') scope_push_kind(SCOPE_GENERIC);
-	else if (ctx->scope_depth > 0 &&
-	         scope_stack[ctx->scope_depth - 1].kind == SCOPE_GENERIC)
+	else if (ctx->scope_depth > 0 && scope_stack[ctx->scope_depth - 1].kind == SCOPE_GENERIC)
 		scope_pop();
 }
+
+static bool token_inside_gnu_attr_args(Token *tok) {
+	uint32_t idx = tok_idx(tok);
+	for (uint32_t i = 1; i < idx; i++) {
+		Token *t = &token_pool[i];
+		if (!(t->tag & TT_ATTR)) continue;
+		Token *open = tok_next(t);
+		if (!open || !match_ch(open, '(') || !(open->flags & TF_OPEN) || !tok_match(open)) continue;
+		uint32_t oi = tok_idx(open), ci = tok_idx(tok_match(open));
+		if (idx >= oi && idx <= ci) return true;
+	}
+	return false;
+}
+
 static PRISM_ALWAYS_INLINE inline void track_common_token_state(Token *tok) {
 	if (__builtin_expect(ctrl_state.pending && tok->len == 1, 0)) {
 		char c = tok->ch0;
-			if (!in_generic()) {
+		if (!in_generic()) {
 			if (c == '(') {
+				/* Entire `__attribute__((...))` group is opaque — including
+         * the inner `((` and nested attribute argument parens. */
+				if (token_inside_gnu_attr_args(tok))
+					;
 				/* After the control condition has closed, a leading '(' is a
-				 * parenthesized braceless body / expression — not another
-				 * condition paren. Nested if/while still arm pending_for_paren
-				 * / pending_paren_kw (or clear parens_just_closed) first. */
-				if (!(ctrl_state.parens_just_closed &&
-				      !ctrl_state.pending_for_paren &&
-				      !ctrl_state.pending_paren_kw))
+         * parenthesized braceless body / expression — not another
+         * condition paren. Nested if/while still arm pending_for_paren
+         * / pending_paren_kw (or clear parens_just_closed) first. */
+				else if (!(ctrl_state.parens_just_closed && !ctrl_state.pending_for_paren &&
+					   !ctrl_state.pending_paren_kw))
 					track_ctrl_paren_open();
-			} else if (c == ')') track_ctrl_paren_close();
+			} else if (c == ')') {
+				if (!token_inside_gnu_attr_args(tok)) track_ctrl_paren_close();
+			}
 		}
 	}
 	track_generic_token(tok);
 }
+
+/* Skip (no emit) statement prefixes: attrs/_Pragma and one-or-more labels. */
+static Token *skip_stmt_prefixes(Token *tok) {
+	for (;;) {
+		Token *after = skip_noise(tok);
+		if (after != tok) {
+			tok = after;
+			continue;
+		}
+		if (is_identifier_like(tok)) {
+			Token *colon = skip_noise(tok_next(tok));
+			if (colon && match_ch(colon, ':') &&
+			    !(tok_next(colon) && match_ch(tok_next(colon), ':'))) {
+				tok = tok_next(colon);
+				continue;
+			}
+		}
+		break;
+	}
+	return tok;
+}
+
+/* Emit tokens in [from, to). */
+static Token *emit_through(Token *from, Token *to) {
+	while (from && from != to && from->kind != TK_EOF) from = emit_advance(from);
+	return from;
+}
+
 static Token *find_bare_orelse(Token *tok) {
 	if (!p1_file_has_orelse) return NULL;
 	Token *prev = NULL;
 	int ternary = 0;
 	for (Token *s = tok; s->kind != TK_EOF; s = tok_next(s)) {
-		if (s->flags & TF_OPEN) { prev = tok_match(s); s = tok_match(s); continue; }
+		if (s->flags & TF_OPEN) {
+			prev = tok_match(s);
+			s = tok_match(s);
+			continue;
+		}
 		if ((s->flags & TF_CLOSE) || match_ch(s, ';')) return NULL;
-		if (match_ch(s, '?')) { ternary++; prev = s; continue; }
-		if (match_ch(s, ':') && ternary > 0) { ternary--; prev = s; continue; }
+		if (match_ch(s, '?')) {
+			ternary++;
+			prev = s;
+			continue;
+		}
+		if (match_ch(s, ':') && ternary > 0) {
+			ternary--;
+			prev = s;
+			continue;
+		}
 		if (ternary == 0 && orelse_kw_at_bare(s, prev)) return s;
 		prev = s;
 	}
 	return NULL;
 }
+
 static bool orelse_has_chain(Token *start, bool comma_term) {
 	int pd = 0;
 	Token *prev = NULL;
 	for (Token *p = start; p->kind != TK_EOF; p = tok_next(p)) {
 		if (p->flags & TF_OPEN) pd++;
-		else if (p->flags & TF_CLOSE) pd--;
-		else if (pd == 0 && (match_ch(p, ';') || (comma_term && match_ch(p, ',')))) break;
+		else if (p->flags & TF_CLOSE)
+			pd--;
+		else if (pd == 0 && (match_ch(p, ';') || (comma_term && match_ch(p, ','))))
+			break;
 		if (pd == 0 && orelse_kw_at_bare(p, prev)) return true;
 		if (pd == 0) prev = p;
 	}
 	return false;
 }
+
 static bool bare_is_stmt_end(Token *s, bool comma_term) {
 	return match_ch(s, ';') || (comma_term && match_ch(s, ','));
 }
+
 /* Walk until stmt end / EOF. cb sees token before depth is updated.
  * cb return true → stop and return that token. */
-static Token *bare_walk_depth0(Token *start, bool comma_term,
-			       bool (*cb)(Token *s, Token *prev, int sd, void *ud), void *ud) {
+static Token *bare_walk_depth0(Token *start,
+			       bool comma_term,
+			       bool (*cb)(Token *s, Token *prev, int sd, void *ud),
+			       void *ud) {
 	int sd = 0;
 	Token *prev = NULL;
 	for (Token *s = start; s && s->kind != TK_EOF; s = tok_next(s)) {
 		if (cb && cb(s, prev, sd, ud)) return s;
 		if (s->flags & TF_OPEN) sd++;
-		else if (s->flags & TF_CLOSE) sd--;
-		else if (sd == 0 && bare_is_stmt_end(s, comma_term)) return s;
+		else if (s->flags & TF_CLOSE)
+			sd--;
+		else if (sd == 0 && bare_is_stmt_end(s, comma_term))
+			return s;
 		prev = s;
 	}
 	return NULL;
 }
+
 static bool bare_cb_pp_cond(Token *s, Token *prev, int sd, void *ud) {
 	(void)prev;
-	if (sd == 0 && is_pp_conditional(s)) { *(Token **)ud = s; return true; }
+	if (sd == 0 && is_pp_conditional(s)) {
+		*(Token **)ud = s;
+		return true;
+	}
 	return false;
 }
+
 static bool bare_cb_compound_lit(Token *s, Token *prev, int sd, void *ud) {
 	if (match_ch(s, '{') && (sd == 0 || (prev && match_ch(prev, ')')))) {
 		*(bool *)ud = true;
@@ -5699,29 +6497,40 @@ static bool bare_cb_compound_lit(Token *s, Token *prev, int sd, void *ud) {
 	}
 	return false;
 }
-static Token *bare_emit_fallback_expr(Token *t, bool comma_term, Token *lhs, Token *eq,
-				      bool restart_on_orelse) {
+
+static Token *
+bare_emit_fallback_expr(Token *t, bool comma_term, Token *lhs, Token *eq, bool restart_on_orelse) {
 	int fd = 0;
 	if (restart_on_orelse) {
-		if (orelse_has_chain(t, comma_term)) OUT_LIT("("); else OUT_LIT("(void)(");
+		if (orelse_has_chain(t, comma_term)) OUT_LIT("(");
+		else
+			OUT_LIT("(void)(");
 		emit_range_no_prep(lhs, eq);
 		OUT_LIT(" = (");
 	}
 	while (t->kind != TK_EOF) {
 		if (FEAT(F_ORELSE) && (t->tag & TT_TYPEOF)) {
 			Token *next = try_typeof_orelse(t);
-			if (next) { t = next; continue; }
+			if (next) {
+				t = next;
+				continue;
+			}
 		}
 		if ((t->flags & TF_OPEN) && (match_ch(t, '(') || match_ch(t, '['))) {
-			t = walk_balanced(t, true); continue;
+			t = walk_balanced(t, true);
+			continue;
 		}
 		if (t->flags & TF_OPEN) fd++;
-		else if (t->flags & TF_CLOSE) fd--;
-		else if (fd == 0 && bare_is_stmt_end(t, comma_term)) break;
+		else if (t->flags & TF_CLOSE)
+			fd--;
+		else if (fd == 0 && bare_is_stmt_end(t, comma_term))
+			break;
 		if (restart_on_orelse && fd == 0 && is_orelse_keyword(t)) {
 			OUT_LIT(")) ? (void)0 : ");
 			t = tok_next(t);
-			if (orelse_has_chain(t, comma_term)) OUT_LIT("("); else OUT_LIT("(void)(");
+			if (orelse_has_chain(t, comma_term)) OUT_LIT("(");
+			else
+				OUT_LIT("(void)(");
 			emit_range_no_prep(lhs, eq);
 			OUT_LIT(" = (");
 			continue;
@@ -5730,6 +6539,7 @@ static Token *bare_emit_fallback_expr(Token *t, bool comma_term, Token *lhs, Tok
 	}
 	return t;
 }
+
 static void emit_bare_oe_if_temp(unsigned oe_id, Token *lhs, Token *eq) {
 	OUT_LIT(" if (__prism_oe_");
 	out_uint(oe_id);
@@ -5739,11 +6549,11 @@ static void emit_bare_oe_if_temp(unsigned oe_id, Token *lhs, Token *eq) {
 	out_uint(oe_id);
 	OUT_LIT("; } else { ");
 }
+
 static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool brace_wrap) {
 	Token *orelse_tok = find_bare_orelse(t);
 	if (!orelse_tok || (end && tok_loc(orelse_tok) >= tok_loc(end))) return NULL;
-	if (is_orelse_keyword(t))
-		error_tok(t, "expected expression before 'orelse'");
+	if (is_orelse_keyword(t)) error_tok(t, "expected expression before 'orelse'");
 
 	Token *last_comma = comma_term ? last_depth0_comma(t, orelse_tok) : NULL;
 	Token *post_comma_t = last_comma ? tok_next(last_comma) : t;
@@ -5753,13 +6563,16 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 	Token *after_orelse = tok_next(orelse_tok);
 	bool is_bare_fallback = bare_assign_eq && is_orelse_value_fallback(after_orelse);
 	if (bare_assign_eq && is_bare_fallback) {
-		reject_orelse_side_effects(bare_lhs_start, bare_assign_eq,
-					  "orelse fallback on assignment",
-					  "in the target expression",
-					  true, false, true);
+		reject_orelse_side_effects(bare_lhs_start,
+					   bare_assign_eq,
+					   "orelse fallback on assignment",
+					   "in the target expression",
+					   true,
+					   false,
+					   true);
 	}
 
-	if (!is_bare_fallback) return NULL;  // caller handles non-bare fallback
+	if (!is_bare_fallback) return NULL; // caller handles non-bare fallback
 
 	if (brace_wrap) OUT_LIT(" {");
 	if (last_comma) {
@@ -5777,7 +6590,11 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 
 	// Hoist preprocessor directives before the wrapper
 	for (Token *s = t; s != orelse_tok; s = tok_next(s)) {
-		if (s->kind == TK_PREP_DIR) { emit_tok(s); out_char('\n'); ctx->last_line_no++; }
+		if (s->kind == TK_PREP_DIR) {
+			emit_tok(s);
+			out_char('\n');
+			ctx->last_line_no++;
+		}
 	}
 	bool fallback_has_compound_literal = false;
 	bare_walk_depth0(after_orelse, comma_term, bare_cb_compound_lit, &fallback_has_compound_literal);
@@ -5790,17 +6607,21 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 		for (Token *s = bare_lhs_start; s != bare_assign_eq; s = tok_next(s))
 			if ((s->tag & TT_MEMBER) || match_ch(s, '*') ||
 			    (match_ch(s, '[') && (s->flags & TF_OPEN))) {
-				lhs_has_indirection = true; break;
+				lhs_has_indirection = true;
+				break;
 			}
 	}
 	if (fallback_has_compound_literal) {
 		if (bare_assign_eq)
-			reject_orelse_side_effects(bare_lhs_start, bare_assign_eq,
-				"orelse compound-literal fallback on assignment",
-				"in the target expression (volatile double-write "
-				"with compound literal fallback); "
-				"use a temporary variable instead",
-				false, true, false);
+			reject_orelse_side_effects(bare_lhs_start,
+						   bare_assign_eq,
+						   "orelse compound-literal fallback on assignment",
+						   "in the target expression (volatile double-write "
+						   "with compound literal fallback); "
+						   "use a temporary variable instead",
+						   false,
+						   true,
+						   false);
 		OUT_LIT("(");
 		emit_balanced_range(bare_lhs_start, orelse_tok);
 		OUT_LIT(") ? (void)0 : ");
@@ -5809,7 +6630,9 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 	} else {
 		// (C23 §6.7.2.5p2), covered by the . / -> check.
 		unsigned oe_id = ctx->ret_counter++;
-		OUT_LIT("{ "); emit_typeof_keyword(); out_char('(');
+		OUT_LIT("{ ");
+		emit_typeof_keyword();
+		out_char('(');
 		if (lhs_has_indirection) {
 			// type is variably modified (C11 §6.7.2.4p2).
 			// Phase 1D is the primary check; this is defense-in-depth.
@@ -5817,14 +6640,20 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 				Token *rhs_s = tok_next(bare_assign_eq);
 				if (!is_strictly_bare_call(rhs_s, orelse_tok))
 					reject_orelse_side_effects(
-						rhs_s, orelse_tok,
-						"bare orelse with indirection in LHS",
-						"in the RHS (typeof(RHS) may evaluate for VM types "
-						"per C11 6.7.2.4p2; hoist to a variable)",
-						false, false, true);
-				for (Token *ck = rhs_s; ck && ck != orelse_tok && ck->kind != TK_EOF; ck = tok_next(ck))
-					if (ck->tag & (TT_GOTO | TT_RETURN | TT_BREAK | TT_CONTINUE | TT_DEFER))
-						error_tok(ck, "bare assignment orelse with LHS indirection "
+					    rhs_s,
+					    orelse_tok,
+					    "bare orelse with indirection in LHS",
+					    "in the RHS (typeof(RHS) may evaluate for VM types "
+					    "per C11 6.7.2.4p2; hoist to a variable)",
+					    false,
+					    false,
+					    true);
+				for (Token *ck = rhs_s; ck && ck != orelse_tok && ck->kind != TK_EOF;
+				     ck = tok_next(ck))
+					if (ck->tag &
+					    (TT_GOTO | TT_RETURN | TT_BREAK | TT_CONTINUE | TT_DEFER))
+						error_tok(ck,
+							  "bare assignment orelse with LHS indirection "
 							  "cannot contain control flow keywords in the "
 							  "right-hand expression (the expression is "
 							  "duplicated inside typeof(), which would corrupt "
@@ -5848,7 +6677,8 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 				if (is_last) {
 					emit_range_no_prep(bare_lhs_start, bare_assign_eq);
 					OUT_LIT(" = (");
-					t = bare_emit_fallback_expr(t, comma_term, bare_lhs_start, bare_assign_eq, false);
+					t = bare_emit_fallback_expr(
+					    t, comma_term, bare_lhs_start, bare_assign_eq, false);
 					OUT_LIT("); }");
 					break;
 				}
@@ -5859,22 +6689,36 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 					int fd = 0;
 					Token *sprev = NULL;
 					for (Token *s = t; s->kind != TK_EOF; s = tok_next(s)) {
-						if ((s->flags & TF_OPEN) && (match_ch(s, '(') || match_ch(s, '['))) { sprev = tok_match(s); s = tok_match(s); continue; }
+						if ((s->flags & TF_OPEN) &&
+						    (match_ch(s, '(') || match_ch(s, '['))) {
+							sprev = tok_match(s);
+							s = tok_match(s);
+							continue;
+						}
 						if (s->flags & TF_OPEN) fd++;
-						else if (s->flags & TF_CLOSE) fd--;
-						else if (fd == 0 && bare_is_stmt_end(s, comma_term)) break;
-						if (fd == 0 && (s->tag & TT_ORELSE) && !(sprev && (sprev->tag & TT_MEMBER))) {
-							if (is_known_function_call(s)) { sprev = s; continue; }
+						else if (s->flags & TF_CLOSE)
+							fd--;
+						else if (fd == 0 && bare_is_stmt_end(s, comma_term))
+							break;
+						if (fd == 0 && (s->tag & TT_ORELSE) &&
+						    !(sprev && (sprev->tag & TT_MEMBER))) {
+							if (is_known_function_call(s)) {
+								sprev = s;
+								continue;
+							}
 							TypedefEntry *te = typedef_lookup(s);
-							if (!te || orelse_shadow_is_kw(sprev)) { fb_orelse = s; break; }
+							if (!te || orelse_shadow_is_kw(sprev)) {
+								fb_orelse = s;
+								break;
+							}
 						}
 						if (fd == 0) sprev = s;
 					}
 				}
 				oe_id = ctx->ret_counter++;
-				emit_typeof_keyword(); out_char('(');
-				if (lhs_has_indirection)
-					emit_balanced_range(fb_start, fb_orelse);
+				emit_typeof_keyword();
+				out_char('(');
+				if (lhs_has_indirection) emit_balanced_range(fb_start, fb_orelse);
 				else
 					emit_range_no_prep(bare_lhs_start, bare_assign_eq);
 				OUT_LIT(") __prism_oe_");
@@ -5893,51 +6737,65 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 	if (end && tok_idx(t) > tok_idx(end)) t = end;
 	return t;
 }
+
 static Token *emit_orelse_condition_wrap(Token *t, Token *orelse_tok) {
 	for (Token *s = t; s != orelse_tok; s = tok_next(s))
-		if (s->kind == TK_PREP_DIR) { emit_tok(s); out_char('\n'); ctx->last_line_no++; }
+		if (s->kind == TK_PREP_DIR) {
+			emit_tok(s);
+			out_char('\n');
+			ctx->last_line_no++;
+		}
 	OUT_LIT(" {");
 	OUT_LIT(" if (!(");
 	emit_range_no_prep(t, orelse_tok);
 	OUT_LIT("))");
 	return tok_next(orelse_tok);
 }
+
 static Token *emit_deferred_orelse(Token *t, Token *end) {
+	Token *body = skip_stmt_prefixes(t);
+	Token *orelse_tok = find_bare_orelse(body);
+	if (!orelse_tok || (end && tok_loc(orelse_tok) >= tok_loc(end))) return NULL;
+	t = emit_through(t, body);
 	Token *result = emit_bare_orelse_impl(t, end, false, false);
 	if (result) return result;
-	Token *orelse_tok = find_bare_orelse(t);
-	if (!orelse_tok || (end && tok_loc(orelse_tok) >= tok_loc(end))) return NULL;
 	t = emit_orelse_condition_wrap(t, orelse_tok);
-	if (match_ch(t, ';'))
-		error_tok(t, "expected statement after 'orelse'");
+	if (match_ch(t, ';')) error_tok(t, "expected statement after 'orelse'");
 	t = emit_orelse_action(t, NULL, false, false, NULL);
 	OUT_LIT(" }");
 	if (match_ch(t, ';')) t = tok_next(t);
 	if (end && tok_idx(t) > tok_idx(end)) t = end;
 	return t;
 }
+
 static inline Token *try_process_stmt_token(Token *t, Token *end, Token **unreachable_tok) {
 	/* Match Pass 2 main loop: try_zero_init_decl also handles decl-init /
-	 * bracket orelse (and auto-static) when F_ZEROINIT is off. Gating on
-	 * F_ZEROINIT alone sent `int t = get() orelse 0;` inside defer bodies
-	 * through emit_deferred_orelse, which treated the type keyword as a
-	 * bare-orelse LHS and emitted invalid `__typeof__(int t)`. */
+   * bracket orelse (and auto-static) when F_ZEROINIT is off. Gating on
+   * F_ZEROINIT alone sent `int t = get() orelse 0;` inside defer bodies
+   * through emit_deferred_orelse, which treated the type keyword as a
+   * bare-orelse LHS and emitted invalid `__typeof__(int t)`. */
 	if (ctx->at_stmt_start) {
 		Token *next = try_zero_init_decl(t);
 		if (next) return next;
 	}
 	if (ctx->at_stmt_start && FEAT(F_ORELSE) && !(t->tag & TT_NON_EXPR_STMT)) {
 		Token *next = emit_deferred_orelse(t, end);
-		if (next) { ctx->at_stmt_start = true; return next; }
+		if (next) {
+			ctx->at_stmt_start = true;
+			return next;
+		}
 	}
-	{ Token *r = try_strip_raw(t); if (r) return r; }
-	if (FEAT(F_AUTO_UNREACHABLE) &&
-	    !(ctrl_state.pending && ctrl_state.parens_just_closed)) {
+	{
+		Token *r = try_strip_raw(t);
+		if (r) return r;
+	}
+	if (FEAT(F_AUTO_UNREACHABLE) && !(ctrl_state.pending && ctrl_state.parens_just_closed)) {
 		Token *nr = try_detect_noreturn_call(t);
 		if (nr && nr != end) *unreachable_tok = nr;
 	}
 	return NULL;
 }
+
 static void emit_deferred_range(Token *start, Token *end) {
 	bool saved_stmt_start = ctx->at_stmt_start;
 	CtrlState saved_ctrl = ctrl_state;
@@ -5950,19 +6808,24 @@ static void emit_deferred_range(Token *start, Token *end) {
 
 // --- Phase 1: Static Analysis ---
 
-// Phase 1A: walk all tokens, assign scope_ids, build scope_tree[] with parent links + flags.
+// Phase 1A: walk all tokens, assign scope_ids, build scope_tree[] with parent
+// links + flags.
 
 static bool is_objc_ivar_brace(uint32_t brace_idx) {
 	for (uint32_t i = brace_idx - 1; i > 0; i--) {
 		Token *t = &token_pool[i];
 		if (t->kind == TK_PREP_DIR) continue;
 		if (t->kind == TK_IDENT && !t->tag) continue; // class name, protocol name
-		if (match_ch(t, ':')) continue;    // inheritance colon
-		if (match_ch(t, '*')) continue;     // pointer in type
+		if (match_ch(t, ':')) continue;		      // inheritance colon
+		if (match_ch(t, '*')) continue;		      // pointer in type
 		if (t->tag & (TT_QUALIFIER | TT_ATTR)) continue;
-		if (match_ch(t, ')') && tok_match(t)) { i = tok_idx(tok_match(t)); continue; }
+		if (match_ch(t, ')') && tok_match(t)) {
+			i = tok_idx(tok_match(t));
+			continue;
+		}
 		if (match_ch(t, ']') && tok_match(t) && (tok_match(t)->flags & TF_C23_ATTR)) {
-			i = tok_idx(tok_match(t)); continue;
+			i = tok_idx(tok_match(t));
+			continue;
 		}
 		if (match_ch(t, '>')) {
 			int depth = 1;
@@ -5971,7 +6834,8 @@ static bool is_objc_ivar_brace(uint32_t brace_idx) {
 				Token *inner = &token_pool[i];
 				if (inner->kind == TK_PREP_DIR) continue;
 				if (match_ch(inner, '>')) depth++;
-				else if (match_ch(inner, '<')) depth--;
+				else if (match_ch(inner, '<'))
+					depth--;
 			}
 			continue;
 		}
@@ -5987,6 +6851,7 @@ static bool is_objc_ivar_brace(uint32_t brace_idx) {
 	}
 	return false;
 }
+
 static void p1_build_scope_tree(Token *start) {
 	// scope_id 0 is reserved for file scope (never stored in scope_tree[])
 	scope_tree_count = 1; // start at 1; 0 = file scope sentinel
@@ -6000,10 +6865,13 @@ static void p1_build_scope_tree(Token *start) {
 		if (t->tag & TT_ORELSE) p1_file_has_orelse = true;
 		if (match_ch(t, '{')) {
 			uint16_t sid = scope_tree_count;
-			if (sid == UINT16_MAX)
-				error_tok(t, "scope tree: too many scopes (>65534)");
-			ARENA_ENSURE_CAP(&ctx->main_arena, ctx->p1_scope_tree,
-					 scope_tree_count, scope_tree_cap, 256, ScopeInfo);
+			if (sid == UINT16_MAX) error_tok(t, "scope tree: too many scopes (>65534)");
+			ARENA_ENSURE_CAP(&ctx->main_arena,
+					 ctx->p1_scope_tree,
+					 scope_tree_count,
+					 scope_tree_cap,
+					 256,
+					 ScopeInfo);
 			ScopeInfo *si = &scope_tree[sid];
 			*si = (ScopeInfo){.parent_id = scope_stack_local[depth]};
 			si->open_tok_idx = tok_idx(t);
@@ -6019,8 +6887,7 @@ static void p1_build_scope_tree(Token *start) {
 					if (kw && (kw->tag & TT_ATTR))
 						kw = walk_back_skip_attrs(tok_idx(kw) - 1);
 					if (kw) {
-						if (kw->tag & TT_LOOP)
-							si->is_loop = true;
+						if (kw->tag & TT_LOOP) si->is_loop = true;
 						else if (kw->tag & TT_SWITCH)
 							si->is_switch = true;
 						else if (kw->tag & TT_IF)
@@ -6030,18 +6897,20 @@ static void p1_build_scope_tree(Token *start) {
 							if (is_enum_kw(kw)) si->is_enum = true;
 						}
 					}
-					if (depth == 0 && !si->is_loop && !si->is_switch && !si->is_conditional
-					    && !si->is_struct)
+					if (depth == 0 && !si->is_loop && !si->is_switch &&
+					    !si->is_conditional && !si->is_struct)
 						si->is_func_body = true;
-					if (depth > 0 && !si->is_loop && !si->is_switch && !si->is_conditional
-					    && !si->is_struct && !si->is_func_body)
+					if (depth > 0 && !si->is_loop && !si->is_switch &&
+					    !si->is_conditional && !si->is_struct && !si->is_func_body)
 						si->is_init = true;
 				} else if (is_else_kw(prev)) {
 					si->is_conditional = true;
 				} else if (prev->tag & TT_SUE) {
 					si->is_struct = true;
 					if (is_enum_kw(prev)) si->is_enum = true;
-				} else if (prev->kind == TK_IDENT && !(prev->tag & (TT_TYPE|TT_QUALIFIER|TT_LOOP|TT_SWITCH|TT_IF|TT_STORAGE))) {
+				} else if (prev->kind == TK_IDENT &&
+					   !(prev->tag & (TT_TYPE | TT_QUALIFIER | TT_LOOP | TT_SWITCH |
+							  TT_IF | TT_STORAGE))) {
 					Token *sue = walk_back_skip_attrs(tok_idx(prev) - 1);
 					if (sue && (sue->tag & TT_SUE)) {
 						si->is_struct = true;
@@ -6054,10 +6923,15 @@ static void p1_build_scope_tree(Token *start) {
 						if (st->kind == TK_PREP_DIR) continue;
 						if (is_type_keyword(st) || (st->tag & TT_QUALIFIER)) continue;
 						if (match_ch(st, ':')) continue;
-						if (match_ch(st, ']') && tok_match(st) && (tok_match(st)->flags & TF_C23_ATTR)) {
-							si2 = tok_idx(tok_match(st)); continue;
+						if (match_ch(st, ']') && tok_match(st) &&
+						    (tok_match(st)->flags & TF_C23_ATTR)) {
+							si2 = tok_idx(tok_match(st));
+							continue;
 						}
-						if (match_ch(st, ')') && tok_match(st)) { si2 = tok_idx(tok_match(st)); continue; }
+						if (match_ch(st, ')') && tok_match(st)) {
+							si2 = tok_idx(tok_match(st));
+							continue;
+						}
 						if (st->tag & TT_ATTR) continue;
 						if (is_valid_varname(st)) continue; // enum tag name
 						if (is_enum_kw(st)) {
@@ -6071,22 +6945,20 @@ static void p1_build_scope_tree(Token *start) {
 				}
 			}
 
-			if (!si->is_struct && !si->is_loop &&
-			    !si->is_switch && !si->is_conditional &&
+			if (!si->is_struct && !si->is_loop && !si->is_switch && !si->is_conditional &&
 			    is_objc_ivar_brace(tidx)) {
 				si->is_struct = true;
 				si->is_func_body = false;
 				si->is_init = false;
 			}
 
-			if (prev && match_ch(prev, '('))
-				si->is_stmt_expr = true;
-			if (!si->is_func_body && !si->is_loop && !si->is_switch &&
-			    !si->is_conditional && !si->is_struct && !si->is_stmt_expr) {
+			if (prev && match_ch(prev, '(')) si->is_stmt_expr = true;
+			if (!si->is_func_body && !si->is_loop && !si->is_switch && !si->is_conditional &&
+			    !si->is_struct && !si->is_stmt_expr) {
 				if (prev && match_ch(prev, '=')) {
 					si->is_init = true;
 				} else if (depth > 0 && scope_stack_local[depth] < scope_tree_count &&
-				           scope_tree[scope_stack_local[depth]].is_init) {
+					   scope_tree[scope_stack_local[depth]].is_init) {
 					si->is_init = true;
 				}
 			}
@@ -6096,18 +6968,19 @@ static void p1_build_scope_tree(Token *start) {
 			if (si->is_switch) ann |= P1_SCOPE_SWITCH;
 			if (si->is_init) ann |= P1_SCOPE_INIT;
 			token_pool[tidx].ann = ann;
-					// typedefs, or goto targets — they don't need their own scope tree entry.
+			// typedefs, or goto targets — they don't need their own scope tree entry.
 			bool reuse_parent =
-			    (si->is_init && depth > 0 &&
-			     scope_stack_local[depth] < scope_tree_count &&
+			    (si->is_init && depth > 0 && scope_stack_local[depth] < scope_tree_count &&
 			     scope_tree[scope_stack_local[depth]].is_init);
 			if (!reuse_parent) scope_tree_count++;
 			depth++;
 			if (depth >= p1a_stack_cap) {
 				int old_cap = p1a_stack_cap;
 				p1a_stack_cap *= 2;
-				scope_stack_local = arena_realloc(&ctx->main_arena, scope_stack_local,
-					old_cap * sizeof(uint16_t), p1a_stack_cap * sizeof(uint16_t));
+				scope_stack_local = arena_realloc(&ctx->main_arena,
+								  scope_stack_local,
+								  old_cap * sizeof(uint16_t),
+								  p1a_stack_cap * sizeof(uint16_t));
 			}
 			scope_stack_local[depth] = reuse_parent ? scope_stack_local[depth - 1] : sid;
 			continue;
@@ -6119,12 +6992,13 @@ static void p1_build_scope_tree(Token *start) {
 		}
 	}
 }
-// Phase 1B: walk all tokens at all depths to build the complete typedef + enum table.
 
-static void p1_register_param_shadows(Token *open, Token *close,
-				      uint16_t scope_id, int brace_depth,
-				      bool check_vla) {
-	for (Token *t = tok_next(open); t && t != close && t->kind != TK_EOF; ) {
+// Phase 1B: walk all tokens at all depths to build the complete typedef + enum
+// table.
+
+static void
+p1_register_param_shadows(Token *open, Token *close, uint16_t scope_id, int brace_depth, bool check_vla) {
+	for (Token *t = tok_next(open); t && t != close && t->kind != TK_EOF;) {
 		Token *param_start = t;
 		Token *last_ident = NULL;
 		bool scanned_inner_paren = false;
@@ -6133,32 +7007,42 @@ static void p1_register_param_shadows(Token *open, Token *close,
 			if (t->flags & TF_OPEN) {
 				if (!last_ident && !scanned_inner_paren && match_ch(t, '(') && tok_match(t))
 					for (Token *s = tok_next(t); s != tok_match(t); s = tok_next(s)) {
-						if (s->flags & TF_OPEN) { s = tok_match(s); continue; }
+						if (s->flags & TF_OPEN) {
+							s = tok_match(s);
+							continue;
+						}
 						if (is_valid_varname(s) &&
-						    (!(s->tag & (TT_QUALIFIER|TT_TYPE|TT_SUE|TT_TYPEOF|TT_ATTR)) ||
-						     (s->tag & (TT_DEFER | TT_ORELSE)) || (s->flags & TF_RAW)))
-							{ last_ident = s; ident_from_inner = true; }
+						    (!(s->tag & (TT_QUALIFIER | TT_TYPE | TT_SUE | TT_TYPEOF |
+								 TT_ATTR)) ||
+						     (s->tag & (TT_DEFER | TT_ORELSE)) ||
+						     (s->flags & TF_RAW))) {
+							last_ident = s;
+							ident_from_inner = true;
+						}
 					}
 				if (match_ch(t, '(')) scanned_inner_paren = true;
 				t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t);
 				continue;
 			}
 			if (is_valid_varname(t) &&
-			    (!(t->tag & (TT_QUALIFIER|TT_TYPE|TT_SUE|TT_TYPEOF|TT_ATTR)) ||
-			     (t->tag & (TT_DEFER | TT_ORELSE)) || (t->flags & TF_RAW)))
-				{ last_ident = t; ident_from_inner = false; }
+			    (!(t->tag & (TT_QUALIFIER | TT_TYPE | TT_SUE | TT_TYPEOF | TT_ATTR)) ||
+			     (t->tag & (TT_DEFER | TT_ORELSE)) || (t->flags & TF_RAW))) {
+				last_ident = t;
+				ident_from_inner = false;
+			}
 			t = tok_next(t);
 		}
-		if (last_ident && (is_known_typedef(last_ident) ||
-		    is_known_enum_const(last_ident) ||
-		    (last_ident->tag & (TT_DEFER | TT_ORELSE | TT_NORETURN_FN | TT_SPECIAL_FN)) ||
-		    (last_ident->flags & TF_RAW) ||
-		    hashmap_get(&p1_func_proto_map, tok_loc(last_ident), last_ident->len)))
+		if (last_ident &&
+		    (is_known_typedef(last_ident) || is_known_enum_const(last_ident) ||
+		     (last_ident->tag & (TT_DEFER | TT_ORELSE | TT_NORETURN_FN | TT_SPECIAL_FN)) ||
+		     (last_ident->flags & TF_RAW) ||
+		     hashmap_get(&p1_func_proto_map, tok_loc(last_ident), last_ident->len)))
 			p1_register_shadow(last_ident, scope_id, brace_depth);
 		if (check_vla && last_ident) {
 			bool skip_first = !ident_from_inner;
 			Token *param_end = (t && match_ch(t, ',')) ? t : close;
-			for (Token *s = param_start; s && s != param_end && s->kind != TK_EOF; s = tok_next(s))
+			for (Token *s = param_start; s && s != param_end && s->kind != TK_EOF;
+			     s = tok_next(s))
 				if (match_ch(s, '[')) {
 					if (skip_first) {
 						skip_first = false;
@@ -6166,8 +7050,12 @@ static void p1_register_param_shadows(Token *open, Token *close,
 						continue;
 					}
 					if (array_size_is_vla(s)) {
-						TYPEDEF_ADD_IDX(typedef_add_vla_var(tok_loc(last_ident), last_ident->len, brace_depth), last_ident);
-						typedef_table.entries[typedef_table.count - 1].is_param = true;
+						TYPEDEF_ADD_IDX(typedef_add_vla_var(tok_loc(last_ident),
+										    last_ident->len,
+										    brace_depth),
+								last_ident);
+						typedef_table.entries[typedef_table.count - 1].is_param =
+						    true;
 						break;
 					}
 				}
@@ -6177,12 +7065,14 @@ static void p1_register_param_shadows(Token *open, Token *close,
 			bool has_vol_qual = false;
 			bool has_vol_member = false;
 			bool saw_star = false;
-			for (Token *s = param_start; s && s != param_end && s->kind != TK_EOF; s = tok_next(s)) {
+			for (Token *s = param_start; s && s != param_end && s->kind != TK_EOF;
+			     s = tok_next(s)) {
 				if (s == last_ident) break;
 				if (match_ch(s, '*')) saw_star = true;
 				if ((s->tag & (TT_QUALIFIER | TT_VOLATILE)) == (TT_QUALIFIER | TT_VOLATILE))
 					has_vol_qual = true;
-				if (is_valid_varname(s) && !(s->tag & (TT_QUALIFIER|TT_TYPE|TT_SUE|TT_TYPEOF|TT_ATTR))) {
+				if (is_valid_varname(s) &&
+				    !(s->tag & (TT_QUALIFIER | TT_TYPE | TT_SUE | TT_TYPEOF | TT_ATTR))) {
 					unsigned tf = typedef_flags(s);
 					if (tf & TDF_VOLATILE) has_vol_qual = true;
 					if (tf & TDF_HAS_VOL_MEMBER) has_vol_member = true;
@@ -6207,19 +7097,23 @@ static void p1_register_param_shadows(Token *open, Token *close,
 					td_scope_close = scope_tree[scope_id].close_tok_idx;
 				}
 				int pre_ct = typedef_table.count;
-				TYPEDEF_ADD_IDX(typedef_add_shadow(tok_loc(last_ident), last_ident->len, brace_depth),
-						last_ident);
+				TYPEDEF_ADD_IDX(
+				    typedef_add_shadow(tok_loc(last_ident), last_ident->len, brace_depth),
+				    last_ident);
 				TD_SCOPE_RESTORE();
 				if (typedef_table.count > pre_ct) {
 					typedef_table.entries[typedef_table.count - 1].is_param = true;
 					typedef_table.entries[typedef_table.count - 1].is_array = false;
 					if (is_vol_param) {
-						typedef_table.entries[typedef_table.count - 1].is_volatile = has_vol_qual;
-						typedef_table.entries[typedef_table.count - 1].has_volatile_member = has_vol_member;
+						typedef_table.entries[typedef_table.count - 1].is_volatile =
+						    has_vol_qual;
+						typedef_table.entries[typedef_table.count - 1]
+						    .has_volatile_member = has_vol_member;
 					}
 				}
 			} else if (is_vol_param) {
-				for (int ix = typedef_get_index(tok_loc(last_ident), last_ident->len); ix >= 0;
+				for (int ix = typedef_get_index(tok_loc(last_ident), last_ident->len);
+				     ix >= 0;
 				     ix = typedef_table.entries[ix].prev_index) {
 					TypedefEntry *ee = &typedef_table.entries[ix];
 					if (ee->token_index == tok_idx(last_ident)) {
@@ -6233,26 +7127,20 @@ static void p1_register_param_shadows(Token *open, Token *close,
 		if (t && match_ch(t, ',')) t = tok_next(t);
 	}
 }
-static void p1_register_knr_param_vlas(Token *rparen, Token *lbrace, uint16_t sid,
-				      int brace_depth) {
-	if (!rparen || !lbrace || sid == 0 || brace_depth <= 0 ||
-	    sid >= scope_tree_count)
-		return;
-	if (!match_ch(rparen, ')') || !tok_match(rparen))
-		return;
+
+static void p1_register_knr_param_vlas(Token *rparen, Token *lbrace, uint16_t sid, int brace_depth) {
+	if (!rparen || !lbrace || sid == 0 || brace_depth <= 0 || sid >= scope_tree_count) return;
+	if (!match_ch(rparen, ')') || !tok_match(rparen)) return;
 	Token *id_list_open = tok_match(rparen);
-	if (!id_list_open || !is_knr_params(tok_next(id_list_open), lbrace))
-		return;
+	if (!id_list_open || !is_knr_params(tok_next(id_list_open), lbrace)) return;
 	TD_SCOPE_SAVE();
 	td_scope_open = scope_tree[sid].open_tok_idx;
 	td_scope_close = scope_tree[sid].close_tok_idx;
 	for (Token *stmt = tok_next(rparen); stmt && stmt != lbrace && stmt->kind != TK_EOF;) {
 		stmt = skip_prep_dirs(stmt);
 		stmt = skip_noise(stmt);
-		if (!stmt || stmt == lbrace)
-			break;
-		if (!(stmt->tag &
-		      (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT | TT_STORAGE)) &&
+		if (!stmt || stmt == lbrace) break;
+		if (!(stmt->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT | TT_STORAGE)) &&
 		    !is_known_typedef(stmt)) {
 			stmt = tok_next(stmt);
 			continue;
@@ -6263,37 +7151,32 @@ static void p1_register_knr_param_vlas(Token *rparen, Token *lbrace, uint16_t si
 			continue;
 		}
 		Token *semi = skip_to_semicolon(ts.end, NULL);
-		if (!semi || semi->kind == TK_EOF || !match_ch(semi, ';'))
-			break;
+		if (!semi || semi->kind == TK_EOF || !match_ch(semi, ';')) break;
 		for (Token *seg = ts.end; seg && seg != semi && seg != lbrace;) {
 			DeclResult decl = parse_declarator(seg, false);
-			if (!decl.var_name || !decl.end)
-				break;
+			if (!decl.var_name || !decl.end) break;
 			bool skip_first = true;
 			for (Token *s = seg; s && s != decl.end && s != semi && s->kind != TK_EOF;
 			     s = tok_next(s)) {
 				if (match_ch(s, '[') && (s->flags & TF_OPEN)) {
 					if (skip_first) {
 						skip_first = false;
-						if (tok_match(s))
-							s = tok_match(s);
+						if (tok_match(s)) s = tok_match(s);
 						continue;
 					}
 					if (array_size_is_vla(s)) {
-						TYPEDEF_ADD_IDX(typedef_add_vla_var(
-								    tok_loc(decl.var_name),
-								    decl.var_name->len,
-								    brace_depth),
+						TYPEDEF_ADD_IDX(typedef_add_vla_var(tok_loc(decl.var_name),
+										    decl.var_name->len,
+										    brace_depth),
 								decl.var_name);
-						typedef_table.entries[typedef_table.count - 1]
-						    .is_param = true;
+						typedef_table.entries[typedef_table.count - 1].is_param =
+						    true;
 						break;
 					}
 				}
 			}
 			seg = decl.end;
-			if (seg && match_ch(seg, ','))
-				seg = tok_next(seg);
+			if (seg && match_ch(seg, ',')) seg = tok_next(seg);
 			else
 				break;
 		}
@@ -6302,23 +7185,28 @@ static void p1_register_knr_param_vlas(Token *rparen, Token *lbrace, uint16_t si
 	TD_SCOPE_RESTORE();
 }
 
-// Phase 1D helper: check if array dimensions between start and end contain orelse.
+// Phase 1D helper: check if array dimensions between start and end contain
+// orelse.
 static bool p1d_decl_has_bracket_orelse(Token *start, Token *end) {
 	for (Token *t = start; t && t != end; t = tok_next(t)) {
 		if (match_ch(t, '[') && tok_match(t)) {
 			Token *close = tok_match(t);
 			for (Token *s = tok_next(t); s && s != close; s = tok_next(s))
-				if ((s->tag & TT_ORELSE) && !is_known_function_call(s) &&
-				    !typedef_lookup(s)) return true;
+				if ((s->tag & TT_ORELSE) && !is_known_function_call(s) && !typedef_lookup(s))
+					return true;
 		}
 	}
 	return false;
 }
 
-static void p1_scan_init_shadows(Token *open, Token *init_end,
-    uint32_t scope_close_idx, uint16_t cur_sid, int brace_depth,
-    uint16_t body_sid, uint32_t body_close_idx, bool is_for_init)
-{
+static void p1_scan_init_shadows(Token *open,
+				 Token *init_end,
+				 uint32_t scope_close_idx,
+				 uint16_t cur_sid,
+				 int brace_depth,
+				 uint16_t body_sid,
+				 uint32_t body_close_idx,
+				 bool is_for_init) {
 	Token *init_tok = skip_noise(tok_next(open));
 	bool saw_raw = false;
 	while (init_tok && (init_tok->flags & TF_RAW) && !is_known_typedef(init_tok)) {
@@ -6328,8 +7216,7 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 	if (!init_tok) return;
 	ASSERT_NOT_NOISE(init_tok);
 	// Skip __extension__/inline prefix — matches Phase 1D main loop
-	while (init_tok && (init_tok->tag & TT_INLINE) &&
-	       !(init_tok->tag & (TT_QUALIFIER | TT_TYPE)))
+	while (init_tok && (init_tok->tag & TT_INLINE) && !(init_tok->tag & (TT_QUALIFIER | TT_TYPE)))
 		init_tok = skip_noise(tok_next(init_tok));
 	if (!init_tok) return;
 	if (init_tok->tag & TT_TYPEDEF) {
@@ -6337,11 +7224,11 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 		td_scope_open = tok_idx(open);
 		td_scope_close = scope_close_idx;
 		parse_typedef_declaration(init_tok, brace_depth);
-		for (Token *tw = init_tok; tw && tw != init_end && tw->kind != TK_EOF && !match_ch(tw, ';'); ) {
+		for (Token *tw = init_tok;
+		     tw && tw != init_end && tw->kind != TK_EOF && !match_ch(tw, ';');) {
 			if (is_enum_kw(tw)) {
 				Token *brace = find_struct_body_brace(tw);
-				if (brace)
-					parse_enum_constants(brace, brace_depth);
+				if (brace) parse_enum_constants(brace, brace_depth);
 			}
 			if (tw->flags & TF_OPEN && tok_match(tw)) {
 				tw = tok_next(tok_match(tw));
@@ -6352,8 +7239,9 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 		TD_SCOPE_RESTORE();
 		return;
 	}
-	if (!init_tok || !(init_tok->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT | TT_INLINE | TT_STORAGE) ||
-	    is_known_typedef(init_tok)))
+	if (!init_tok || !(init_tok->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT |
+					    TT_INLINE | TT_STORAGE) ||
+			   is_known_typedef(init_tok)))
 		return;
 	bool saw_static = init_tok->tag & TT_STORAGE;
 	TD_SCOPE_SAVE();
@@ -6361,7 +7249,7 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 	td_scope_close = scope_close_idx;
 	TypeSpecResult type = parse_type_specifier(init_tok);
 	if (type.saw_type) {
-			Token *ann_tok = init_tok;
+		Token *ann_tok = init_tok;
 		while (ann_tok && (ann_tok->tag & (TT_STORAGE | TT_INLINE)) &&
 		       !(ann_tok->tag & (TT_QUALIFIER | TT_TYPE)))
 			ann_tok = skip_noise(tok_next(ann_tok));
@@ -6376,8 +7264,7 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 			// conditions; moved from Pass 2 to satisfy the two-pass invariant)
 			if (FEAT(F_ORELSE) && p1d_decl_has_bracket_orelse(t, decl.end))
 				error_tok(t, ERR_BRACKET_OE_VLA_INIT_STMT);
-			if (is_known_typedef(decl.var_name) ||
-			    is_known_enum_const(decl.var_name) ||
+			if (is_known_typedef(decl.var_name) || is_known_enum_const(decl.var_name) ||
 			    (decl.var_name->tag & (TT_DEFER | TT_ORELSE | TT_NORETURN_FN | TT_SPECIAL_FN)) ||
 			    (decl.var_name->flags & TF_RAW) ||
 			    hashmap_get(&p1_func_proto_map, tok_loc(decl.var_name), decl.var_name->len))
@@ -6390,8 +7277,8 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 				}
 				if (e) e->is_func = true;
 			}
-					bool is_vol_local = (type.has_volatile || type.has_volatile_member) &&
-			                    !decl.is_pointer && !decl.is_func_ptr;
+			bool is_vol_local = (type.has_volatile || type.has_volatile_member) &&
+					    !decl.is_pointer && !decl.is_func_ptr;
 			if (is_vol_local) {
 				int pre_ct = typedef_table.count;
 				p1_register_shadow(decl.var_name, cur_sid, brace_depth);
@@ -6406,21 +7293,24 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 			{
 				bool has_init = match_ch(decl.end, '=');
 				uint16_t eff_sid = body_sid > 0 ? body_sid : cur_sid;
-				bool is_func_type = decl.is_func_decl || is_typeof_func_type(init_tok, &type, &decl);
+				bool is_func_type =
+				    decl.is_func_decl || is_typeof_func_type(init_tok, &type, &decl);
 				if (eff_sid > 0 && !is_func_type) {
 					P1FuncEntry *e = p1_alloc(P1K_DECL, eff_sid, decl.var_name);
 					e->decl.has_init = has_init;
 					e->decl.is_vla = type.is_vla || decl.is_vla;
 					e->decl.has_raw = decl_raw;
-					e->decl.is_static_storage = saw_static || type.has_static || type.has_extern;
+					e->decl.is_static_storage =
+					    saw_static || type.has_static || type.has_extern;
 					e->decl.body_close_idx = body_sid > 0 ? 0 : body_close_idx;
 				}
 				// Phase 1D: reject init-decl whose memset is unavoidable
 				// typeof aggregates are accepted: Pass 2 emits `= {0}`
 				if (FEAT(F_ZEROINIT) && !has_init && !decl_raw &&
 				    !(saw_static || type.has_static || type.has_extern)) {
-					bool eff_vla = (decl.is_vla && (!decl.paren_pointer || decl.paren_array)) ||
-						       (type.is_vla && !decl.is_pointer);
+					bool eff_vla =
+					    (decl.is_vla && (!decl.paren_pointer || decl.paren_array)) ||
+					    (type.is_vla && !decl.is_pointer);
 					if (eff_vla && (!decl.is_pointer || decl.is_array) &&
 					    !type.has_register && is_for_init)
 						error_tok(decl.var_name, ERR_INIT_STMT_VLA);
@@ -6431,20 +7321,26 @@ static void p1_scan_init_shadows(Token *open, Token *init_end,
 			if (match_ch(t, '=')) {
 				t = tok_next(t);
 				while (t && t != init_end && t->kind != TK_EOF) {
-					if (t->flags & TF_OPEN) { t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t); continue; }
+					if (t->flags & TF_OPEN) {
+						t = tok_match(t) ? tok_next(tok_match(t)) : tok_next(t);
+						continue;
+					}
 					if (match_ch(t, ',')) break;
 					t = tok_next(t);
 				}
 			}
-			if (t && match_ch(t, ',')) t = tok_next(t); else break;
+			if (t && match_ch(t, ',')) t = tok_next(t);
+			else
+				break;
 		}
 	}
 	TD_SCOPE_RESTORE();
 }
 
-/* Shared for/if/switch-init Phase 1D body: open-paren → init `;` → body end → shadows. */
-static void p1d_scan_ctrl_init(Token *tok, uint32_t *skip_cache, int brace_depth,
-			       uint16_t cur_sid, bool is_for) {
+/* Shared for/if/switch-init Phase 1D body: open-paren → init `;` → body end →
+ * shadows. */
+static void
+p1d_scan_ctrl_init(Token *tok, uint32_t *skip_cache, int brace_depth, uint16_t cur_sid, bool is_for) {
 	Token *open = p1d_find_open_paren(tok);
 	if (!open || !tok_match(open)) return;
 	Token *close = tok_match(open);
@@ -6468,8 +7364,8 @@ static void p1d_scan_ctrl_init(Token *tok, uint32_t *skip_cache, int brace_depth
 			}
 		}
 	}
-	p1_scan_init_shadows(open, init_end, body_end_idx, cur_sid, brace_depth,
-			     body_sid, body_end_idx, is_for);
+	p1_scan_init_shadows(
+	    open, init_end, body_end_idx, cur_sid, brace_depth, body_sid, body_end_idx, is_for);
 }
 
 // Phase 1D: check if a declaration shadows an identifier captured by a
@@ -6487,8 +7383,7 @@ p1_check_defer_same_block_shadow(Token *var_name, uint16_t cur_sid, int p1d_cur_
 		Token *body = tok_next(e->tok);
 		if (!body) continue;
 		Token *body_end = NULL;
-		if (match_ch(body, '{') && tok_match(body))
-			body_end = tok_match(body);
+		if (match_ch(body, '{') && tok_match(body)) body_end = tok_match(body);
 		else
 			body_end = skip_to_semicolon(body, NULL);
 		uint32_t var_idx = tok_idx(var_name);
@@ -6496,24 +7391,23 @@ p1_check_defer_same_block_shadow(Token *var_name, uint16_t cur_sid, int p1d_cur_
 		uint32_t ei = body_end ? tok_idx(body_end) : UINT32_MAX;
 		if (var_idx >= bi && var_idx < ei) continue;
 		if (defer_body_has_capture(p1d_cur_func, body, name, nlen))
-			error_tok(var_name,
-				  ERR_DEFER_SHADOW_SAME_SCOPE,
-				  nlen, name);
+			error_tok(var_name, ERR_DEFER_SHADOW_SAME_SCOPE, nlen, name);
 	}
 }
+
 static void p1_enum_shadow_cb(Token *t, void *ud) {
 	int *p = ud;
 	// Enclosing-scope enum shadows are handled by Pass 2:
 	// be a false positive when the inner block has no return/goto.
-	if (is_valid_varname(t))
-		p1_check_defer_same_block_shadow(t, (uint16_t)p[0], p[1]);
+	if (is_valid_varname(t)) p1_check_defer_same_block_shadow(t, (uint16_t)p[0], p[1]);
 }
-static void
-p1_check_enum_body_defer_shadow(Token *brace, uint16_t cur_sid, int p1d_cur_func) {
+
+static void p1_check_enum_body_defer_shadow(Token *brace, uint16_t cur_sid, int p1d_cur_func) {
 	if (!FEAT(F_DEFER) || p1d_cur_func < 0) return;
-	int args[2] = { cur_sid, p1d_cur_func };
+	int args[2] = {cur_sid, p1d_cur_func};
 	for_each_enum_constant(brace, p1_enum_shadow_cb, args);
 }
+
 static void p1_try_alloc_defer(Token *tok, uint16_t cur_sid, int func_idx) {
 	reject_defer_fn_body(tok, func_meta[func_idx].body_open->tag);
 	p1_alloc(P1K_DEFER, cur_sid, tok);
@@ -6521,11 +7415,12 @@ static void p1_try_alloc_defer(Token *tok, uint16_t cur_sid, int func_idx) {
 
 // Phase 1F: validate defer body and populate name set.
 static void __attribute__((noinline))
-p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t cur_sid,
-		  int brace_depth) {
+p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t cur_sid, int brace_depth) {
 	// Context validation (moved from Pass 2 handle_defer_keyword)
 	if (p1d_cur_func >= 0) {
-		reject_defer_context(tok, false, p1d_ctrl_pending,
+		reject_defer_context(tok,
+				     false,
+				     p1d_ctrl_pending,
 				     cur_sid < scope_tree_count && scope_tree[cur_sid].is_stmt_expr,
 				     cur_sid < scope_tree_count && scope_tree[cur_sid].is_switch);
 		p1_check_defer_stmt_expr_chain(tok, cur_sid);
@@ -6536,14 +7431,21 @@ p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t
 			Token *semi = skip_to_semicolon(body, NULL);
 			reject_defer_unterminated(tok, body, semi);
 			// `__typeof__(int t)`. Require braces so Phase 1D sees
-			if (FEAT(F_ORELSE) &&
-			    (body->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT | TT_STORAGE))) {
+			if (FEAT(F_ORELSE) && (body->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF |
+							    TT_BITINT | TT_STORAGE))) {
 				int pd = 0;
 				for (Token *s = body; s && s != semi && s->kind != TK_EOF; s = tok_next(s)) {
-					if (s->flags & TF_OPEN) { pd++; continue; }
-					if (s->flags & TF_CLOSE) { if (pd > 0) pd--; continue; }
+					if (s->flags & TF_OPEN) {
+						pd++;
+						continue;
+					}
+					if (s->flags & TF_CLOSE) {
+						if (pd > 0) pd--;
+						continue;
+					}
 					if (pd == 0 && is_orelse_kw_shadow(s))
-						error_tok(s, "declaration with 'orelse' initializer "
+						error_tok(s,
+							  "declaration with 'orelse' initializer "
 							  "inside a braceless defer body is not "
 							  "supported; wrap the defer body in braces: "
 							  "`defer { ... }`");
@@ -6552,12 +7454,11 @@ p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t
 			// Braceless defer body tokens never hit p1d_probe_declaration at
 			// stmt_start; annotate P1_IS_DECL so Pass 2 zeroinit sees the decl.
 			if (FEAT(F_ZEROINIT) && brace_depth > 0 &&
-			    (body->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT |
-					   TT_STORAGE))) {
+			    (body->tag &
+			     (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT | TT_STORAGE))) {
 				Token *ts = skip_noise(body);
 				TypeSpecResult tr = parse_type_specifier(ts);
-				if (tr.saw_type)
-					tok_ann(ts) |= P1_IS_DECL;
+				if (tr.saw_type) tok_ann(ts) |= P1_IS_DECL;
 			}
 		}
 	}
@@ -6565,14 +7466,14 @@ p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t
 	if (p1d_cur_func >= 0) {
 		Token *body = tok_next(tok);
 		Token *body_end = NULL;
-		if (body && match_ch(body, '{') && tok_match(body))
-			body_end = tok_match(body);
+		if (body && match_ch(body, '{') && tok_match(body)) body_end = tok_match(body);
 		else if (body)
 			body_end = skip_to_semicolon(body, NULL);
 		if (body_end)
-			defer_body_populate_captures(body, body_end,
-				&func_meta[p1d_cur_func].defer_name_set,
-				&func_meta[p1d_cur_func].defer_body_captures);
+			defer_body_populate_captures(body,
+						     body_end,
+						     &func_meta[p1d_cur_func].defer_name_set,
+						     &func_meta[p1d_cur_func].defer_body_captures);
 	}
 }
 
@@ -6585,29 +7486,37 @@ static void p1d_scan_param_bracket_orelse(Token *open_paren, bool is_proto) {
 		if (match_ch(t, '[') && tok_match(t) && !(t->flags & TF_C23_ATTR)) {
 			Token *bc = tok_match(t);
 			for (Token *s = tok_next(t); s && s != bc; s = tok_next(s)) {
-				if ((s->flags & TF_OPEN) && tok_match(s)) { s = tok_match(s); continue; }
+				if ((s->flags & TF_OPEN) && tok_match(s)) {
+					s = tok_match(s);
+					continue;
+				}
 				if (is_orelse_kw_shadow(s))
-					error_tok(s, is_proto
-						? "'orelse' in array dimensions of a function "
-						  "prototype is not allowed (prototype parameter "
-						  "arrays are never allocated; the dimension is "
-						  "not evaluated at runtime)"
-						: "'orelse' in array dimensions of a function "
-						  "definition parameter is not allowed (the "
-						  "ternary expansion would evaluate the "
-						  "dimension twice — undefined behavior for "
-						  "volatile expressions)");
+					error_tok(s,
+						  is_proto ? "'orelse' in array dimensions of a function "
+							     "prototype is not allowed (prototype parameter "
+							     "arrays are never allocated; the dimension is "
+							     "not evaluated at runtime)"
+							   : "'orelse' in array dimensions of a function "
+							     "definition parameter is not allowed (the "
+							     "ternary expansion would evaluate the "
+							     "dimension twice — undefined behavior for "
+							     "volatile expressions)");
 			}
 			t = bc;
 			continue;
 		}
 		if ((t->flags & TF_OPEN) && match_ch(t, '(') && tok_match(t)) {
 			p1d_scan_param_bracket_orelse(t, is_proto);
-			t = tok_match(t); continue;
+			t = tok_match(t);
+			continue;
 		}
-		if ((t->flags & TF_OPEN) && tok_match(t)) { t = tok_match(t); continue; }
+		if ((t->flags & TF_OPEN) && tok_match(t)) {
+			t = tok_match(t);
+			continue;
+		}
 	}
 }
+
 static void p1d_reject_proto_param_orelse(Token *open_paren) {
 	Token *close = tok_match(open_paren);
 	if (!close) return;
@@ -6632,51 +7541,61 @@ p1d_classify_bracket_orelse(Token *tok, uint16_t cur_sid, int p1d_cur_func) {
 		if (s->kind == TK_PREP_DIR) continue;
 		if (orelse_kw_at_shadow(s, prev_bracket)) {
 			if (p1d_cur_func < 0)
-				error_tok(s, "orelse inside array dimension at file scope is not allowed "
-					       "(cannot hoist temporary variable outside a function body)");
+				error_tok(s,
+					  "orelse inside array dimension at file scope is not allowed "
+					  "(cannot hoist temporary variable outside a function body)");
 			if (in_struct)
-				error_tok(s, "orelse inside array dimension in a struct/union body "
-					       "cannot be transformed (statement expressions are not "
-					       "allowed in struct/union definitions)");
+				error_tok(s,
+					  "orelse inside array dimension in a struct/union body "
+					  "cannot be transformed (statement expressions are not "
+					  "allowed in struct/union definitions)");
 			if (paren_depth_scan > 1)
-				error_tok(s, "'orelse' inside array dimension could not be transformed; "
-					     "if wrapped in outer parentheses, remove them: "
-					     "use '[f() orelse 1]' not '[(f() orelse 1)]'");
+				error_tok(s,
+					  "'orelse' inside array dimension could not be transformed; "
+					  "if wrapped in outer parentheses, remove them: "
+					  "use '[f() orelse 1]' not '[(f() orelse 1)]'");
 			validate_bracket_orelse(s);
 			if (oe_depth == 0 && prev_d0_oe)
-				reject_orelse_side_effects(
-					tok_next(prev_d0_oe), s,
-					"'orelse' in array dimension",
-					"in a chained 'orelse' (would be "
-					"evaluated twice); hoist the "
-					"expression to a variable first",
-					true, true, false);
+				reject_orelse_side_effects(tok_next(prev_d0_oe),
+							   s,
+							   "'orelse' in array dimension",
+							   "in a chained 'orelse' (would be "
+							   "evaluated twice); hoist the "
+							   "expression to a variable first",
+							   true,
+							   true,
+							   false);
 			if (oe_depth == 0) prev_d0_oe = s;
 			tok_ann(s) |= P1_OE_BRACKET;
 			found_oe = true;
 		}
-		if (s->flags & TF_OPEN) { oe_depth++; prev_bracket = tok_match(s); }
+		if (s->flags & TF_OPEN) {
+			oe_depth++;
+			prev_bracket = tok_match(s);
+		}
 		if (s->flags & TF_CLOSE) oe_depth--;
 		if (match_ch(s, '(')) paren_depth_scan++;
-		else if (match_ch(s, ')')) paren_depth_scan--;
+		else if (match_ch(s, ')'))
+			paren_depth_scan--;
 		prev_bracket = s;
 	}
 	if (found_oe) {
 		Token *ppc = span_find_pp_conditional(tok_next(tok), close, NULL);
 		if (ppc)
-			error_tok(ppc, "'orelse' inside array dimension cannot be used when the "
-				    "dimension spans preprocessor conditionals — the "
-				    "transpiler would emit tokens from all branches, "
-				    "producing invalid C; "
-				    "use 'cc -E' preprocessing or a temporary variable");
+			error_tok(ppc,
+				  "'orelse' inside array dimension cannot be used when the "
+				  "dimension spans preprocessor conditionals — the "
+				  "transpiler would emit tokens from all branches, "
+				  "producing invalid C; "
+				  "use 'cc -E' preprocessing or a temporary variable");
 		tok_ann(tok) |= P1_OE_BRACKET;
 	}
 }
+
 static bool p1d_lhs_is_const_shadow(Token *start, Token *eq_tok);
 
 // Phase 1D: validate bare orelse in expression statements.
-static void __attribute__((noinline))
-p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
+static void __attribute__((noinline)) p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
 	Token *scan_start = tok;
 	{
 		Token *last_comma = last_depth0_comma(tok, bare_oe);
@@ -6684,13 +7603,12 @@ p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
 	}
 	Token *eq_tok = find_depth0_assign_eq(scan_start, bare_oe);
 	bool has_eq = eq_tok != NULL;
-	if (tok == bare_oe)
-		error_tok(tok, "expected expression before 'orelse'");
+	if (tok == bare_oe) error_tok(tok, "expected expression before 'orelse'");
 	Token *after_oe = tok_next(bare_oe);
-	if (after_oe && match_ch(after_oe, ';'))
-		error_tok(after_oe, "expected statement after 'orelse'");
+	if (after_oe && match_ch(after_oe, ';')) error_tok(after_oe, "expected statement after 'orelse'");
 	if (!has_eq && is_orelse_value_fallback(after_oe))
-		error_tok(after_oe, "orelse fallback requires an assignment target "
+		error_tok(after_oe,
+			  "orelse fallback requires an assignment target "
 			  "(use a declaration)");
 	if (has_eq && eq_tok) {
 		if (scan_start != eq_tok && match_ch(scan_start, '(') && tok_match(scan_start)) {
@@ -6704,32 +7622,37 @@ p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
 					  "(not a modifiable lvalue)");
 		}
 		if (p1d_lhs_is_const_shadow(scan_start, eq_tok))
-			error_tok(eq_tok,
-				  "orelse fallback cannot reassign a const-qualified variable");
+			error_tok(eq_tok, "orelse fallback cannot reassign a const-qualified variable");
 	}
 
 	if (has_eq && eq_tok && is_orelse_value_fallback(after_oe)) {
 		bool fb_has_cl = false;
-		{ int fd = 0;
-		  Token *prev_cl = NULL;
-		  for (Token *s = after_oe; s && s->kind != TK_EOF; s = tok_next(s)) {
-			if (match_ch(s, '{') && (fd == 0 ||
-			    (prev_cl && match_ch(prev_cl, ')')))) {
-				fb_has_cl = true; break;
+		{
+			int fd = 0;
+			Token *prev_cl = NULL;
+			for (Token *s = after_oe; s && s->kind != TK_EOF; s = tok_next(s)) {
+				if (match_ch(s, '{') && (fd == 0 || (prev_cl && match_ch(prev_cl, ')')))) {
+					fb_has_cl = true;
+					break;
+				}
+				if (s->flags & TF_OPEN) fd++;
+				else if (s->flags & TF_CLOSE)
+					fd--;
+				else if (fd == 0 && (match_ch(s, ';') || match_ch(s, ',')))
+					break;
+				prev_cl = s;
 			}
-			if (s->flags & TF_OPEN) fd++;
-			else if (s->flags & TF_CLOSE) fd--;
-			else if (fd == 0 && (match_ch(s, ';') || match_ch(s, ','))) break;
-			prev_cl = s;
-		  }
 		}
 		if (fb_has_cl)
-			reject_orelse_side_effects(scan_start, eq_tok,
-				"orelse compound-literal fallback on assignment",
-				"in the target expression (volatile double-write "
-				"with compound literal fallback); "
-				"use a temporary variable instead",
-				false, true, false);
+			reject_orelse_side_effects(scan_start,
+						   eq_tok,
+						   "orelse compound-literal fallback on assignment",
+						   "in the target expression (volatile double-write "
+						   "with compound literal fallback); "
+						   "use a temporary variable instead",
+						   false,
+						   true,
+						   false);
 	}
 
 	// When LHS has indirection (*, [], ., ->), Pass 2 uses typeof(RHS)
@@ -6738,19 +7661,24 @@ p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
 		bool lhs_indir = false;
 		for (Token *s = scan_start; s != eq_tok; s = tok_next(s))
 			if ((s->tag & TT_MEMBER) || match_ch(s, '*') ||
-			    (match_ch(s, '[') && (s->flags & TF_OPEN)))
-				{ lhs_indir = true; break; }
+			    (match_ch(s, '[') && (s->flags & TF_OPEN))) {
+				lhs_indir = true;
+				break;
+			}
 		if (lhs_indir) {
 			Token *rhs_start = tok_next(eq_tok);
-					if (!is_strictly_bare_call(rhs_start, bare_oe))
-				reject_orelse_side_effects(
-					rhs_start, bare_oe,
-					"bare orelse with indirection in LHS",
-					"in the RHS expression (typeof(RHS) evaluates its "
-					"operand for variably-modified types per C11 "
-					"\xc2\xa7" "6.7.2.4p2, causing double evaluation); "
-					"hoist to a variable first",
-					false, false, true);
+			if (!is_strictly_bare_call(rhs_start, bare_oe))
+				reject_orelse_side_effects(rhs_start,
+							   bare_oe,
+							   "bare orelse with indirection in LHS",
+							   "in the RHS expression (typeof(RHS) evaluates its "
+							   "operand for variably-modified types per C11 "
+							   "\xc2\xa7"
+							   "6.7.2.4p2, causing double evaluation); "
+							   "hoist to a variable first",
+							   false,
+							   false,
+							   true);
 		}
 	}
 
@@ -6759,16 +7687,19 @@ p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
 		if (ppc) error_tok(bare_oe, ERR_BARE_ORELSE_SPANS_PP);
 	}
 }
+
 static Token *p1d_find_stmt_expr_fallback(Token *start) {
 	int depth = 0;
 	for (Token *s = start; s && s->kind != TK_EOF; s = tok_next(s)) {
 		if (depth == 0 && (match_ch(s, ';') || match_ch(s, ','))) break;
 		if (is_stmt_expr_open(s)) return s;
 		if (s->flags & TF_OPEN) depth++;
-		else if ((s->flags & TF_CLOSE) && depth > 0) depth--;
+		else if ((s->flags & TF_CLOSE) && depth > 0)
+			depth--;
 	}
 	return NULL;
 }
+
 static bool p1d_lhs_is_const_shadow(Token *start, Token *eq_tok) {
 	Token *lhs_start = skip_noise(start);
 	Token *lhs_end = eq_tok;
@@ -6784,35 +7715,57 @@ static bool p1d_lhs_is_const_shadow(Token *start, Token *eq_tok) {
 	TypedefEntry *e = typedef_lookup(name);
 	return e && e->is_shadow && e->is_const;
 }
-// 0 = not orelse; 1 = skip (fn/label/typedef-as-name); 2 = annotated as decl-init orelse
-static int p1d_try_annotate_init_orelse(Token *t, Token *prev, bool (*ending)(Token *),
-					bool reject_ternary, int ternary_depth,
-					bool *out_has_orelse, Token **out_first_orelse) {
+
+// 0 = not orelse; 1 = skip (fn/label/typedef-as-name); 2 = annotated as
+// decl-init orelse
+static int p1d_try_annotate_init_orelse(Token *t,
+					Token *prev,
+					bool (*ending)(Token *),
+					bool reject_ternary,
+					int ternary_depth,
+					bool *out_has_orelse,
+					Token **out_first_orelse) {
 	if (!(t->tag & TT_ORELSE)) return 0;
 	if (is_known_function_call(t)) return 1;
 	if (orelse_is_label_or_goto_target(t, prev)) return 1;
 	TypedefEntry *te = typedef_lookup(t);
 	if (te && !(prev && ending(prev))) return 1;
-	if (prev && !ending(prev))
-		error_tok(t, ERR_ORELSE_STMT_LEVEL);
-	if (reject_ternary && ternary_depth > 0)
-		error_tok(t, ERR_ORELSE_TERNARY);
+	if (prev && !ending(prev)) error_tok(t, ERR_ORELSE_STMT_LEVEL);
+	if (reject_ternary && ternary_depth > 0) error_tok(t, ERR_ORELSE_TERNARY);
 	tok_ann(t) |= P1_OE_DECL_INIT;
 	if (!*out_first_orelse) *out_first_orelse = t;
 	*out_has_orelse = true;
 	return 2;
 }
+
 static Token *p1d_scan_init_orelse(Token *t, bool *out_has_orelse, Token **out_first_orelse) {
 	Token *prev_init_tok = NULL;
 	bool init_is_first = true;
 	int init_td = 0;
 	t = tok_next(t); // skip '='
 	while (t && !match_ch(t, ',') && !match_ch(t, ';') && t->kind != TK_EOF) {
-		if (match_ch(t, '?')) { init_td++; init_is_first = false; prev_init_tok = t; t = tok_next(t); continue; }
-		if (match_ch(t, ':') && init_td > 0) { init_td--; init_is_first = false; prev_init_tok = t; t = tok_next(t); continue; }
+		if (match_ch(t, '?')) {
+			init_td++;
+			init_is_first = false;
+			prev_init_tok = t;
+			t = tok_next(t);
+			continue;
+		}
+		if (match_ch(t, ':') && init_td > 0) {
+			init_td--;
+			init_is_first = false;
+			prev_init_tok = t;
+			t = tok_next(t);
+			continue;
+		}
 		// Phase 1G: mark orelse in decl initializer
-		if (p1d_try_annotate_init_orelse(t, prev_init_tok, is_expr_ending_brace,
-						 true, init_td, out_has_orelse, out_first_orelse) == 1) {
+		if (p1d_try_annotate_init_orelse(t,
+						 prev_init_tok,
+						 is_expr_ending_brace,
+						 true,
+						 init_td,
+						 out_has_orelse,
+						 out_first_orelse) == 1) {
 			prev_init_tok = t;
 			t = tok_next(t);
 			init_is_first = false;
@@ -6826,34 +7779,49 @@ static Token *p1d_scan_init_orelse(Token *t, bool *out_has_orelse, Token **out_f
 				    (!am || match_ch(am, ',') || match_ch(am, ';') || am->kind == TK_EOF)) {
 					Token *prev_inner = NULL;
 					bool p1d_inner_d0_comma = false;
-					for (Token *inner = tok_next(t); inner && inner != m; inner = tok_next(inner)) {
-						if (match_ch(inner, ','))
-							p1d_inner_d0_comma = true;
-						if (p1d_try_annotate_init_orelse(inner, prev_inner, is_expr_ending,
-										 false, 0, out_has_orelse, out_first_orelse) == 1) {
+					for (Token *inner = tok_next(t); inner && inner != m;
+					     inner = tok_next(inner)) {
+						if (match_ch(inner, ',')) p1d_inner_d0_comma = true;
+						if (p1d_try_annotate_init_orelse(inner,
+										 prev_inner,
+										 is_expr_ending,
+										 false,
+										 0,
+										 out_has_orelse,
+										 out_first_orelse) == 1) {
 							prev_inner = inner;
 							continue;
 						}
 						if (inner->flags & TF_OPEN) {
-							if ((FEAT(F_ORELSE) || FEAT(F_DEFER)) && match_ch(inner, '(') &&
+							if ((FEAT(F_ORELSE) || FEAT(F_DEFER)) &&
+							    match_ch(inner, '(') &&
 							    !(prev_inner && (prev_inner->tag & TT_TYPEOF)))
 								check_orelse_in_parens(inner);
-							inner = tok_match(inner); prev_inner = inner; continue;
+							inner = tok_match(inner);
+							prev_inner = inner;
+							continue;
 						}
 						prev_inner = inner;
 					}
 					if (p1d_inner_d0_comma && *out_has_orelse) {
 						for (Token *u = tok_next(t); u && u != m; u = tok_next(u)) {
 							tok_ann(u) &= (uint16_t)~P1_OE_DECL_INIT;
-							if (u->flags & TF_OPEN && tok_match(u)) { u = tok_match(u); continue; }
+							if (u->flags & TF_OPEN && tok_match(u)) {
+								u = tok_match(u);
+								continue;
+							}
 						}
 						*out_has_orelse = false;
 						*out_first_orelse = NULL;
 					}
-				} else if ((FEAT(F_ORELSE) || FEAT(F_DEFER)) && !(prev_init_tok && (prev_init_tok->tag & TT_TYPEOF))) check_orelse_in_parens(t);
+				} else if ((FEAT(F_ORELSE) || FEAT(F_DEFER)) &&
+					   !(prev_init_tok && (prev_init_tok->tag & TT_TYPEOF)))
+					check_orelse_in_parens(t);
 			}
 			prev_init_tok = m ? m : t;
-			t = m ? tok_next(m) : tok_next(t); init_is_first = false; continue;
+			t = m ? tok_next(m) : tok_next(t);
+			init_is_first = false;
+			continue;
 		}
 		prev_init_tok = t;
 		t = tok_next(t);
@@ -6861,12 +7829,15 @@ static Token *p1d_scan_init_orelse(Token *t, bool *out_has_orelse, Token **out_f
 	}
 	return t;
 }
-static void p1d_validate_decl_orelse(Token *var_name, Token *type_tok,
-				     TypeSpecResult *type, DeclResult *decl,
-				     Token *first_orelse, bool saw_static,
+
+static void p1d_validate_decl_orelse(Token *var_name,
+				     Token *type_tok,
+				     TypeSpecResult *type,
+				     DeclResult *decl,
+				     Token *first_orelse,
+				     bool saw_static,
 				     int brace_depth) {
-	if (brace_depth == 0)
-		error_tok(var_name, ERR_ORELSE_FILE_SCOPE);
+	if (brace_depth == 0) error_tok(var_name, ERR_ORELSE_FILE_SCOPE);
 	reject_decl_orelse_storage(var_name, first_orelse, type, saw_static);
 	reject_decl_orelse_value_shape(var_name, type, decl);
 	if (first_orelse && (type->is_vla || decl->is_vla)) {
@@ -6889,9 +7860,11 @@ static void p1d_validate_decl_orelse(Token *var_name, Token *type_tok,
 }
 
 // break with anonymous structs or variably-modified type specifiers.
-static void p1d_check_multi_decl_constraints(Token *t, Token *type_tok,
+static void p1d_check_multi_decl_constraints(Token *t,
+					     Token *type_tok,
 					     TypeSpecResult *type,
-					     bool any_would_memset, bool vm_type,
+					     bool any_would_memset,
+					     bool vm_type,
 					     bool current_decl_has_orelse) {
 	Token *next_t = tok_next(t);
 	bool nr = false;
@@ -6899,17 +7872,16 @@ static void p1d_check_multi_decl_constraints(Token *t, Token *type_tok,
 	DeclResult nd = parse_declarator(next_t, false);
 	if (!nd.var_name || !nd.end) return;
 	bool split = (current_decl_has_orelse && FEAT(F_ORELSE)) ||
-	             (any_would_memset && (match_ch(nd.end, '=') || nd.is_vla)) ||
-	             (FEAT(F_ORELSE) && p1d_decl_has_bracket_orelse(next_t, nd.end));
+		     (any_would_memset && (match_ch(nd.end, '=') || nd.is_vla)) ||
+		     (FEAT(F_ORELSE) && p1d_decl_has_bracket_orelse(next_t, nd.end));
 	if (!split) return;
-	if (type_spec_is_anon_sue(type_tok, type))
-		error_tok(next_t, ERR_BRACKET_OE_ANON_AGG);
+	if (type_spec_is_anon_sue(type_tok, type)) error_tok(next_t, ERR_BRACKET_OE_ANON_AGG);
 
-	if (vm_type)
-		error_tok(next_t, ERR_MULTIDECL_VM);
+	if (vm_type) error_tok(next_t, ERR_MULTIDECL_VM);
 }
-static Token *p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func,
-				      uint16_t cur_sid, Token *prev_saved) {
+
+static Token *
+p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func, uint16_t cur_sid, Token *prev_saved) {
 	Token *group_end = tok_match(tok);
 	Token *stmt_expr_open = NULL;
 	Token *prev_inner = NULL;
@@ -6944,31 +7916,27 @@ static Token *p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func,
 				p1_check_enum_body_defer_shadow(brace, cur_sid, cur_func);
 			}
 		}
-		if (!stmt_expr_open && is_stmt_expr_open(inner))
-			stmt_expr_open = inner;
+		if (!stmt_expr_open && is_stmt_expr_open(inner)) stmt_expr_open = inner;
 		if (se_depth == 0 && cur_func >= 0 && prev_saved &&
-		    (prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
-		    is_defer_kw(inner, prev_inner) &&
-		    !is_known_function_call(inner) &&
-		    is_identifier_like(tok_next(inner)))
+		    (prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)) && is_defer_kw(inner, prev_inner) &&
+		    !is_known_function_call(inner) && is_identifier_like(tok_next(inner)))
 			error_tok(inner, ERR_DEFER_CTRL_PAREN);
-		if (se_depth == 0 && prev_saved &&
-		    (prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
-		    is_orelse_kw(inner) &&
-		    !(prev_inner && (prev_inner->tag & TT_MEMBER)) &&
-		    !is_known_function_call(inner) &&
-		    !orelse_is_label_or_goto_target(inner, prev_inner))
-			error_tok(inner, "'orelse' cannot be used inside control statement condition parentheses");
+		if (se_depth == 0 && prev_saved && (prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
+		    is_orelse_kw(inner) && !(prev_inner && (prev_inner->tag & TT_MEMBER)) &&
+		    !is_known_function_call(inner) && !orelse_is_label_or_goto_target(inner, prev_inner))
+			error_tok(inner,
+				  "'orelse' cannot be used inside control statement "
+				  "condition parentheses");
 		prev_inner = inner;
 	}
 	return stmt_expr_open;
 }
+
 static bool p1d_type_spec_has_nonempty_array_dims(Token *start, Token *end) {
 	for (Token *t = start; t && t != end; t = tok_next(t)) {
 		if (match_ch(t, '[') && (t->flags & TF_OPEN)) {
 			Token *nx = tok_next(t);
-			if (nx && !match_ch(nx, ']'))
-				return true;
+			if (nx && !match_ch(nx, ']')) return true;
 		}
 	}
 	return false;
@@ -6976,20 +7944,22 @@ static bool p1d_type_spec_has_nonempty_array_dims(Token *start, Token *end) {
 
 // Records typedef shadows (Phase 1C) and per-function decl entries (Phase 1D).
 // Read-only probe: does NOT advance the caller's token pointer.
-static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
-				  int cur_func, bool *saw_raw, bool saw_static,
-				  bool ctrl_pending, uint32_t *skip_cache) {
+static void p1d_probe_declaration(Token *tok,
+				  uint16_t cur_sid,
+				  int brace_depth,
+				  int cur_func,
+				  bool *saw_raw,
+				  bool saw_static,
+				  bool ctrl_pending,
+				  uint32_t *skip_cache) {
 	ASSERT_NOT_NOISE(tok);
-	if (!(tok->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT)) &&
-	    !is_known_typedef(tok))
+	if (!(tok->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT)) && !is_known_typedef(tok))
 		return;
 	Token *type_tok = tok; // token to annotate with P1_IS_DECL
 	TypeSpecResult type = parse_type_specifier(tok);
 	// parse_type_specifier now skips embedded 'raw' and sets has_raw.
-	if (type.has_raw)
-		*saw_raw = true;
-	if (!type.saw_type && type.end && (type.end->flags & TF_RAW) &&
-	    !is_known_typedef(type.end)) {
+	if (type.has_raw) *saw_raw = true;
+	if (!type.saw_type && type.end && (type.end->flags & TF_RAW) && !is_known_typedef(type.end)) {
 		Token *after_raw = skip_noise(tok_next(type.end));
 		if (after_raw && is_raw_declaration_context(type.end, after_raw)) {
 			*saw_raw = true;
@@ -6997,22 +7967,19 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 			type = parse_type_specifier(after_raw);
 		}
 	}
-	if (!type.saw_type)
-		return;
+	if (!type.saw_type) return;
 	bool annotated = false;
 	// Phase 1D: bound braceless control-flow body declarations.
 	// C23 labeled declarations (L: int x;) can serve as braceless
 	uint32_t braceless_close_idx = 0;
 	if (ctrl_pending) {
 		Token *stmt_end = skip_one_stmt_impl(type_tok, skip_cache);
-		if (stmt_end)
-			braceless_close_idx = tok_idx(stmt_end);
+		if (stmt_end) braceless_close_idx = tok_idx(stmt_end);
 	}
 	// VLA variable entries don't leak past the statement boundary.
 	// Without this, `if (c) int MyTypedef;` poisons the typedef name
 	TD_SCOPE_SAVE();
-	if (braceless_close_idx > 0)
-		td_scope_close = braceless_close_idx;
+	if (braceless_close_idx > 0) td_scope_close = braceless_close_idx;
 	Token *t = type.end;
 	bool vm_type = (type.has_typeof || type.has_atomic) && (type.is_vla || type.type_vm);
 	bool any_would_memset = false;
@@ -7022,8 +7989,8 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		DeclResult decl = parse_declarator(t, false);
 		if (!decl.var_name || !decl.end) {
 			// Detect GNU nested function definitions inside outer
-			if (cur_func >= 0 && brace_depth > 0 &&
-			    FEAT(F_DEFER) && decl.var_name && !saw_static) {
+			if (cur_func >= 0 && brace_depth > 0 && FEAT(F_DEFER) && decl.var_name &&
+			    !saw_static) {
 				Token *p = skip_noise(tok_next(decl.var_name));
 				if (p && match_ch(p, '(') && tok_match(p)) {
 					Token *a = tok_next(tok_match(p));
@@ -7035,10 +8002,11 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 					bool nested = a && match_ch(a, '{');
 					if (!nested && a) {
 						Token *b = a;
-						while (b && b->kind != TK_EOF &&
-						       !match_ch(b, '{') && !match_ch(b, '}'))
+						while (b && b->kind != TK_EOF && !match_ch(b, '{') &&
+						       !match_ch(b, '}'))
 							b = (b->flags & TF_OPEN && tok_match(b))
-								? tok_next(tok_match(b)) : tok_next(b);
+								? tok_next(tok_match(b))
+								: tok_next(b);
 						nested = b && match_ch(b, '{') &&
 							 is_knr_params(tok_next(tok_match(p)), b);
 					}
@@ -7069,9 +8037,8 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		}
 		if (match_ch(decl.end, '(') && brace_depth == 0) break; // func def
 		if (decl.end && !match_ch(decl.end, '=') && !match_ch(decl.end, ',') &&
-		    !match_ch(decl.end, ';') && !match_ch(decl.end, '[') &&
-		    !match_ch(decl.end, '(') && !match_ch(decl.end, '{') &&
-		    !match_ch(decl.end, ')'))
+		    !match_ch(decl.end, ';') && !match_ch(decl.end, '[') && !match_ch(decl.end, '(') &&
+		    !match_ch(decl.end, '{') && !match_ch(decl.end, ')'))
 			break;
 		// Phase 1D: annotate type-start token for Pass 2 fast gate
 		if (!annotated && brace_depth > 0) {
@@ -7083,26 +8050,25 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		{
 			bool has_init = match_ch(decl.end, '=');
 			bool has_explicit_intent =
-			    has_init || decl_raw || saw_static ||
-			    type.is_typedef || type.is_struct || type.is_enum ||
-			    type.has_static || type.has_extern || type.has_thread_local ||
-			    type.has_register || type.has_atomic || type.has_constexpr ||
-			    type.has_alignas;
+			    has_init || decl_raw || saw_static || type.is_typedef || type.is_struct ||
+			    type.is_enum || type.has_static || type.has_extern || type.has_thread_local ||
+			    type.has_register || type.has_atomic || type.has_constexpr || type.has_alignas;
 			if (FEAT(F_ZEROINIT) && brace_depth > 0 && !has_explicit_intent &&
-			    braceless_close_idx == 0 &&
-			    cur_sid < scope_tree_count && scope_tree[cur_sid].is_switch)
-				SAFETY_DIAG(type_tok,
-					    "variable declaration directly in switch body without braces "
-					    "(zero-init may be skipped by case labels); wrap in braces or use 'raw'");
+			    braceless_close_idx == 0 && cur_sid < scope_tree_count &&
+			    scope_tree[cur_sid].is_switch)
+				SAFETY_DIAG(
+				    type_tok,
+				    "variable declaration directly in switch body without braces "
+				    "(zero-init may be skipped by case labels); wrap in braces or use "
+				    "'raw'");
 		}
 
 		// Phase 1C: shadow detection
 		bool did_shadow = false;
-			bool is_vol_local = (type.has_volatile || type.has_volatile_member) &&
-		                    !decl.is_pointer && !decl.is_func_ptr;
+		bool is_vol_local =
+		    (type.has_volatile || type.has_volatile_member) && !decl.is_pointer && !decl.is_func_ptr;
 		bool is_const_local = has_effective_const_qual(type_tok, &type, &decl);
-		if (is_known_typedef(decl.var_name) ||
-		    is_known_enum_const(decl.var_name) ||
+		if (is_known_typedef(decl.var_name) || is_known_enum_const(decl.var_name) ||
 		    (decl.var_name->tag & (TT_DEFER | TT_ORELSE | TT_NORETURN_FN | TT_SPECIAL_FN)) ||
 		    (decl.var_name->flags & TF_RAW) ||
 		    hashmap_get(&p1_func_proto_map, tok_loc(decl.var_name), decl.var_name->len) ||
@@ -7126,8 +8092,8 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		// -fbounds-check: register plain local array variables so Pass 2 can
 		bool base_is_array_here = false;
 		uint8_t base_array_rank_here = 0;
-		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name &&
-		    !decl.is_pointer && !decl.is_func_ptr) {
+		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name && !decl.is_pointer &&
+		    !decl.is_func_ptr) {
 			for (Token *bt = type_tok; bt && bt != type.end; bt = tok_next(bt))
 				if (is_array_typedef(bt)) {
 					if (!decl.is_array) base_is_array_here = true;
@@ -7135,8 +8101,7 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 					if (te) base_array_rank_here = te->array_rank;
 					break;
 				}
-			if (!base_is_array_here && (type.has_typeof || type.has_atomic) &&
-			    type.is_array)
+			if (!base_is_array_here && (type.has_typeof || type.has_atomic) && type.is_array)
 				base_is_array_here = true;
 		}
 		bool reg_as_array = decl.is_array && (!decl.paren_pointer || decl.paren_array);
@@ -7147,36 +8112,36 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 			for (Token *dt = decl.var_name; dt && dt != decl.end; dt = tok_next(dt)) {
 				if (match_ch(dt, '[')) {
 					Token *nx = tok_next(dt);
-					if (nx && !match_ch(nx, ']')) { has_complete_dim = true; }
+					if (nx && !match_ch(nx, ']')) {
+						has_complete_dim = true;
+					}
 					break;
 				}
 			}
-			if (!has_complete_dim && match_ch(decl.end, '='))
-				has_complete_dim = true;
+			if (!has_complete_dim && match_ch(decl.end, '=')) has_complete_dim = true;
 		}
 		if (!reg_as_array && base_is_array_here) {
 			has_complete_dim = false;
 			for (Token *bt = type_tok; bt && bt != type.end; bt = tok_next(bt)) {
 				if (is_array_typedef(bt)) {
 					TypedefEntry *bte = typedef_lookup(bt);
-					if (bte && bte->is_array &&
-					    bte->array_dim_complete)
+					if (bte && bte->is_array && bte->array_dim_complete)
 						has_complete_dim = true;
 					break;
 				}
 			}
-			if (!has_complete_dim && (type.has_typeof || type.has_atomic) &&
-			    type.is_array &&
+			if (!has_complete_dim && (type.has_typeof || type.has_atomic) && type.is_array &&
 			    p1d_type_spec_has_nonempty_array_dims(type_tok, type.end))
 				has_complete_dim = true;
 		}
 		if (FEAT(F_BOUNDS_CHECK) && !decl_raw && decl.var_name &&
 		    (brace_depth > 0 || (brace_depth == 0 && (reg_as_array || base_is_array_here))) &&
-		    has_complete_dim &&
-		    (reg_as_array || base_is_array_here) && !decl.is_func_ptr) {
+		    has_complete_dim && (reg_as_array || base_is_array_here) && !decl.is_func_ptr) {
 			int pre = typedef_table.count;
 			if (!did_shadow) {
-				TYPEDEF_ADD_IDX(typedef_add_shadow(tok_loc(decl.var_name), decl.var_name->len, brace_depth), decl.var_name);
+				TYPEDEF_ADD_IDX(typedef_add_shadow(
+						    tok_loc(decl.var_name), decl.var_name->len, brace_depth),
+						decl.var_name);
 			}
 			if (typedef_table.count > pre || did_shadow) {
 				TypedefEntry *e = &typedef_table.entries[typedef_table.count - 1];
@@ -7185,8 +8150,7 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 				Token *prev_bt = NULL;
 				for (Token *dt = decl.var_name; dt && dt != decl.end;) {
 					if (match_ch(dt, '[') && (dt->flags & TF_OPEN)) {
-						if (!array_bracket_closes_ptr_to_array(dt, prev_bt))
-							rank++;
+						if (!array_bracket_closes_ptr_to_array(dt, prev_bt)) rank++;
 						Token *m = tok_match(dt);
 						dt = m ? tok_next(m) : tok_next(dt);
 						prev_bt = m;
@@ -7202,8 +8166,7 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 				} else if (base_is_array_here) {
 					rank += 1;
 				}
-				if (rank > 15)
-					rank = ARRAY_RANK_WRAP_ALL;
+				if (rank > 15) rank = ARRAY_RANK_WRAP_ALL;
 				e->array_rank = (uint8_t)rank;
 				e->array_dim_complete = has_complete_dim;
 			}
@@ -7214,22 +8177,25 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 		bool is_actual_vla = type.is_vla || decl.is_vla;
 		// is_vla_typedef() lookups during Pass 2.
 		if (is_actual_vla && decl.var_name && brace_depth > 0) {
-			TYPEDEF_ADD_IDX(typedef_add_vla_var(tok_loc(decl.var_name), decl.var_name->len, brace_depth), decl.var_name);
+			TYPEDEF_ADD_IDX(
+			    typedef_add_vla_var(tok_loc(decl.var_name), decl.var_name->len, brace_depth),
+			    decl.var_name);
 		}
 
 		// Phase 1D: record declaration entry.
 		DeclShape shape = classify_decl_shape(type_tok, &type, &decl);
 		bool decl_is_func_type = shape.is_func_type;
-		bool in_aggregate_body = cur_sid > 0 && cur_sid < scope_tree_count && scope_tree[cur_sid].is_struct;
-		if (cur_func >= 0 && decl.var_name && brace_depth > 0 && !decl_is_func_type && !in_aggregate_body) {
+		bool in_aggregate_body =
+		    cur_sid > 0 && cur_sid < scope_tree_count && scope_tree[cur_sid].is_struct;
+		if (cur_func >= 0 && decl.var_name && brace_depth > 0 && !decl_is_func_type &&
+		    !in_aggregate_body) {
 			P1FuncEntry *e = p1_alloc(P1K_DECL, cur_sid, decl.var_name);
 			e->decl.has_init = has_init;
 			e->decl.is_vla = type.is_vla || decl.is_vla;
 			e->decl.has_raw = decl_raw;
 			e->decl.is_static_storage = saw_static || type.has_static || type.has_extern;
 			e->decl.body_close_idx = braceless_close_idx;
-			if (!ctrl_pending)
-				p1_check_defer_same_block_shadow(decl.var_name, cur_sid, cur_func);
+			if (!ctrl_pending) p1_check_defer_same_block_shadow(decl.var_name, cur_sid, cur_func);
 		}
 
 		// Phase 1D: reject register / const zeroinit shapes (mirrors Pass 2)
@@ -7237,29 +8203,36 @@ static void p1d_probe_declaration(Token *tok, uint16_t cur_sid, int brace_depth,
 			reject_register_agg_zeroinit(decl.var_name, &shape, &type, has_init, decl_raw);
 		reject_register_vla(decl.var_name, &shape, &type, has_init, decl_raw);
 		if (!(saw_static || type.has_static || type.has_extern))
-			reject_const_unavoidable_memset(decl.var_name, &shape, &type, type_tok, &decl,
-							has_init, decl_raw, false);
+			reject_const_unavoidable_memset(
+			    decl.var_name, &shape, &type, type_tok, &decl, has_init, decl_raw, false);
 
 		bool decl_has_orelse = false;
 		if (has_init) {
 			Token *first_orelse = NULL;
 			t = p1d_scan_init_orelse(t, &decl_has_orelse, &first_orelse);
 			if (decl_has_orelse && FEAT(F_ORELSE))
-				p1d_validate_decl_orelse(decl.var_name, type_tok,
-					&type, &decl, first_orelse,
-					saw_static, brace_depth);
+				p1d_validate_decl_orelse(decl.var_name,
+							 type_tok,
+							 &type,
+							 &decl,
+							 first_orelse,
+							 saw_static,
+							 brace_depth);
 		}
 
 		// Phase 1D: track whether this declarator would need
 		// typeof memset in Pass 2 (for split detection).
-		if (decl_shape_needs_memset(&shape, &type, &decl, has_init, decl_raw,
-					    saw_static || type.has_static))
+		if (decl_shape_needs_memset(
+			&shape, &type, &decl, has_init, decl_raw, saw_static || type.has_static))
 			any_would_memset = true;
 		// Phase 1D: reject multi-declarator split constraints
 		if (t && match_ch(t, ',') && brace_depth > 0)
-			p1d_check_multi_decl_constraints(t, type_tok, &type,
-				any_would_memset, vm_type, decl_has_orelse);
-		if (t && match_ch(t, ',')) { t = tok_next(t); } else break;
+			p1d_check_multi_decl_constraints(
+			    t, type_tok, &type, any_would_memset, vm_type, decl_has_orelse);
+		if (t && match_ch(t, ',')) {
+			t = tok_next(t);
+		} else
+			break;
 	}
 	TD_SCOPE_RESTORE();
 }
@@ -7287,8 +8260,16 @@ typedef struct {
 	int p1d_init_brace_depth;
 	bool p1d_ctrl_pending;
 	uint32_t *skip_cache;
+
 	// GNU __label__ local label declarations — allows same-named labels
-	struct { char *name; int len; uint16_t scope_id; char *mangled; int mangled_len; } *local_labels;
+	struct {
+		char *name;
+		int len;
+		uint16_t scope_id;
+		char *mangled;
+		int mangled_len;
+	} *local_labels;
+
 	int local_label_count;
 	int local_label_cap;
 } P1ScanState;
@@ -7304,12 +8285,19 @@ static char *p1d_find_local_label(P1ScanState *s, char *name, int len, uint16_t 
 	}
 	return NULL;
 }
+
 static void p1d_set_label_name(P1FuncEntry *e, P1ScanState *ps, Token *name, uint16_t cur_sid) {
 	int ml;
 	char *mangled = p1d_find_local_label(ps, tok_loc(name), name->len, cur_sid, &ml);
-	if (mangled) { e->label.name = mangled; e->label.len = ml; }
-	else { e->label.name = tok_loc(name); e->label.len = name->len; }
+	if (mangled) {
+		e->label.name = mangled;
+		e->label.len = ml;
+	} else {
+		e->label.name = tok_loc(name);
+		e->label.len = name->len;
+	}
 }
+
 static void p1d_record_goto(P1ScanState *ps, Token *tok, uint16_t cur_sid, int p1d_cur_func) {
 	if (!(tok->tag & TT_GOTO) || is_known_typedef(tok) || !tok_next(tok)) return;
 	if (is_identifier_like(tok_next(tok))) {
@@ -7318,6 +8306,7 @@ static void p1d_record_goto(P1ScanState *ps, Token *tok, uint16_t cur_sid, int p
 	} else if (match_ch(skip_noise(tok_next(tok)), '*'))
 		func_meta[p1d_cur_func].has_computed_goto = true;
 }
+
 static void p1d_register_enum_at(Token *tok, int brace_depth, uint16_t sid, int p1d_cur_func) {
 	if (!is_enum_kw(tok)) return;
 	Token *brace = find_struct_body_brace(tok);
@@ -7330,33 +8319,28 @@ static void p1d_register_enum_at(Token *tok, int brace_depth, uint16_t sid, int 
 static void p1d_handle_open_brace(P1ScanState *s) {
 	Token *tok = s->tok;
 	uint32_t tidx = tok_idx(tok);
-	while (s->next_scope_id < scope_tree_count &&
-	       scope_tree[s->next_scope_id].open_tok_idx < tidx)
+	while (s->next_scope_id < scope_tree_count && scope_tree[s->next_scope_id].open_tok_idx < tidx)
 		s->next_scope_id++;
 	// this '{' was skipped in phase 1A (e.g. init-in-init optimization).
 	uint16_t sid;
-	if (s->next_scope_id < scope_tree_count &&
-	    scope_tree[s->next_scope_id].open_tok_idx == tidx) {
+	if (s->next_scope_id < scope_tree_count && scope_tree[s->next_scope_id].open_tok_idx == tidx) {
 		sid = s->next_scope_id++;
 	} else {
 		sid = s->scope_depth > 0 ? s->scope_stack[s->scope_depth] : 0;
 	}
 
 	// Phase 1E: function body detection at file scope
-	if (s->brace_depth == 0 && sid < scope_tree_count &&
-	    scope_tree[sid].is_func_body) {
+	if (s->brace_depth == 0 && sid < scope_tree_count && scope_tree[sid].is_func_body) {
 		int ret = capture_function_return_type(s->file_scope_stmt_start);
 		if (ret == 0) {
 			Token *prev = walk_back_skip_noise(tok_idx(tok) - 1);
-			if (prev && match_ch(prev, ';'))
-				prev = p1_knr_find_close_paren(prev);
+			if (prev && match_ch(prev, ';')) prev = p1_knr_find_close_paren(prev);
 			if (prev && match_ch(prev, ')') && tok_match(prev)) {
 				Token *open = tok_match(prev);
 				for (uint32_t pi = tok_idx(open); pi > 1; pi--) {
 					Token *pt = &token_pool[pi - 1];
 					if (pt->kind == TK_PREP_DIR) continue;
-					if (match_ch(pt, '{') || match_ch(pt, '}') ||
-					    match_ch(pt, ';'))
+					if (match_ch(pt, '{') || match_ch(pt, '}') || match_ch(pt, ';'))
 						break;
 					s->file_scope_stmt_start = pt;
 				}
@@ -7365,8 +8349,8 @@ static void p1d_handle_open_brace(P1ScanState *s) {
 		}
 		s->p1e_ret_void = (ret == 1);
 		s->p1e_ret_captured = (ret == 2);
-		ARENA_ENSURE_CAP(&ctx->main_arena, ctx->p1_func_meta,
-				 func_meta_count, func_meta_cap, 64, FuncMeta);
+		ARENA_ENSURE_CAP(
+		    &ctx->main_arena, ctx->p1_func_meta, func_meta_count, func_meta_cap, 64, FuncMeta);
 		FuncMeta *fm = &func_meta[func_meta_count++];
 		fm->body_open = tok;
 		fm->returns_void = s->p1e_ret_void;
@@ -7388,18 +8372,16 @@ static void p1d_handle_open_brace(P1ScanState *s) {
 			td_scope_close = scope_tree[sid].close_tok_idx;
 		}
 		Token *prev_tok = walk_back_skip_noise(tok_idx(tok) - 1);
-		if (prev_tok && match_ch(prev_tok, ';'))
-			prev_tok = p1_knr_find_close_paren(prev_tok);
+		if (prev_tok && match_ch(prev_tok, ';')) prev_tok = p1_knr_find_close_paren(prev_tok);
 		if (prev_tok && match_ch(prev_tok, ')') && tok_match(prev_tok)) {
-			p1_register_param_shadows(tok_match(prev_tok), prev_tok,
-						  sid, s->brace_depth + 1, true);
+			p1_register_param_shadows(
+			    tok_match(prev_tok), prev_tok, sid, s->brace_depth + 1, true);
 			p1_register_knr_param_vlas(prev_tok, tok, sid, s->brace_depth + 1);
 		}
 	}
 
 	// Phase 1D: enter function body — record entry start
-	if (s->brace_depth == 0 && sid < scope_tree_count &&
-	    scope_tree[sid].is_func_body) {
+	if (s->brace_depth == 0 && sid < scope_tree_count && scope_tree[sid].is_func_body) {
 		s->p1d_cur_func = func_meta_count - 1;
 		func_meta[s->p1d_cur_func].entry_start = p1_entry_count;
 		func_meta[s->p1d_cur_func].entry_count = 0;
@@ -7408,14 +8390,18 @@ static void p1d_handle_open_brace(P1ScanState *s) {
 	}
 
 	// Phase 1D: track switch scope for case label association
-	if (s->p1d_cur_func >= 0 && sid < scope_tree_count &&
-	    scope_tree[sid].is_switch) {
+	if (s->p1d_cur_func >= 0 && sid < scope_tree_count && scope_tree[sid].is_switch) {
 		if (s->p1d_switch_top >= s->p1d_switch_cap) {
-			int old = s->p1d_switch_cap; s->p1d_switch_cap *= 2;
-			s->p1d_switch_stack = arena_realloc(&ctx->main_arena, s->p1d_switch_stack,
-				old * sizeof(uint16_t), s->p1d_switch_cap * sizeof(uint16_t));
-			s->p1d_switch_end = arena_realloc(&ctx->main_arena, s->p1d_switch_end,
-				old * sizeof(uint32_t), s->p1d_switch_cap * sizeof(uint32_t));
+			int old = s->p1d_switch_cap;
+			s->p1d_switch_cap *= 2;
+			s->p1d_switch_stack = arena_realloc(&ctx->main_arena,
+							    s->p1d_switch_stack,
+							    old * sizeof(uint16_t),
+							    s->p1d_switch_cap * sizeof(uint16_t));
+			s->p1d_switch_end = arena_realloc(&ctx->main_arena,
+							  s->p1d_switch_end,
+							  old * sizeof(uint32_t),
+							  s->p1d_switch_cap * sizeof(uint32_t));
 		}
 		p1_alloc(P1K_SWITCH, sid, tok);
 		s->p1d_switch_stack[s->p1d_switch_top] = sid;
@@ -7428,12 +8414,13 @@ static void p1d_handle_open_brace(P1ScanState *s) {
 	if (s->scope_depth >= s->scope_cap) {
 		int old_cap = s->scope_cap;
 		s->scope_cap *= 2;
-		s->scope_stack = arena_realloc(&ctx->main_arena, s->scope_stack,
-			old_cap * sizeof(uint16_t), s->scope_cap * sizeof(uint16_t));
+		s->scope_stack = arena_realloc(&ctx->main_arena,
+					       s->scope_stack,
+					       old_cap * sizeof(uint16_t),
+					       s->scope_cap * sizeof(uint16_t));
 	}
 	s->scope_stack[s->scope_depth] = sid;
-	if (sid < scope_tree_count && scope_tree[sid].is_init)
-		s->p1d_init_brace_depth++;
+	if (sid < scope_tree_count && scope_tree[sid].is_init) s->p1d_init_brace_depth++;
 	if (sid < scope_tree_count) {
 		td_scope_open = scope_tree[sid].open_tok_idx;
 		td_scope_close = scope_tree[sid].close_tok_idx;
@@ -7445,6 +8432,7 @@ static void p1d_handle_open_brace(P1ScanState *s) {
 	s->p1d_ctrl_pending = false;
 	s->tok = tok_next(tok);
 }
+
 static void p1d_handle_close_brace(P1ScanState *s) {
 	Token *tok = s->tok;
 	// Phase 1D: pop switch scope(s) that end at this brace
@@ -7460,12 +8448,10 @@ static void p1d_handle_close_brace(P1ScanState *s) {
 		uint16_t csid = s->scope_stack[s->scope_depth];
 		if (csid < scope_tree_count && (scope_tree[csid].is_struct || scope_tree[csid].is_init))
 			closing_non_stmt_brace = true;
-		if (csid < scope_tree_count && scope_tree[csid].is_init)
-			s->p1d_init_brace_depth--;
+		if (csid < scope_tree_count && scope_tree[csid].is_init) s->p1d_init_brace_depth--;
 	} else if (s->scope_depth > 0) {
 		uint16_t csid = s->scope_stack[s->scope_depth];
-		if (csid < scope_tree_count && scope_tree[csid].is_struct)
-			closing_non_stmt_brace = true;
+		if (csid < scope_tree_count && scope_tree[csid].is_struct) closing_non_stmt_brace = true;
 	}
 
 	if (s->brace_depth > 0) {
@@ -7487,7 +8473,7 @@ static void p1d_handle_close_brace(P1ScanState *s) {
 	// Phase 1D: finalize function entry count
 	if (s->brace_depth == 0 && s->p1d_cur_func >= 0) {
 		func_meta[s->p1d_cur_func].entry_count =
-			p1_entry_count - func_meta[s->p1d_cur_func].entry_start;
+		    p1_entry_count - func_meta[s->p1d_cur_func].entry_start;
 		s->p1d_cur_func = -1;
 		s->file_scope_stmt_start = tok_next(tok);
 		s->p1e_ret_void = false;
@@ -7502,6 +8488,7 @@ static void p1d_handle_close_brace(P1ScanState *s) {
 	s->p1d_prev = tok;
 	s->tok = tok_next(tok);
 }
+
 static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 	P1ScanState _ps = {0};
 	P1ScanState *ps = &_ps;
@@ -7521,36 +8508,51 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 	td_scope_open = 0;
 	td_scope_close = UINT32_MAX;
 
-#define tok               (ps->tok)
-#define at_stmt_start     (ps->at_stmt_start)
-#define brace_depth       (ps->brace_depth)
-#define next_scope_id     (ps->next_scope_id)
+#define tok (ps->tok)
+#define at_stmt_start (ps->at_stmt_start)
+#define brace_depth (ps->brace_depth)
+#define next_scope_id (ps->next_scope_id)
 #define file_scope_stmt_start (ps->file_scope_stmt_start)
-#define p1e_ret_void      (ps->p1e_ret_void)
-#define p1e_ret_captured  (ps->p1e_ret_captured)
+#define p1e_ret_void (ps->p1e_ret_void)
+#define p1e_ret_captured (ps->p1e_ret_captured)
 #define scope_stack_local (ps->scope_stack)
 #define scope_depth_local (ps->scope_depth)
-#define p1d_scope_cap     (ps->scope_cap)
-#define p1d_cur_func      (ps->p1d_cur_func)
-#define p1d_switch_cap    (ps->p1d_switch_cap)
-#define p1d_switch_stack  (ps->p1d_switch_stack)
-#define p1d_switch_end    (ps->p1d_switch_end)
-#define p1d_switch_top    (ps->p1d_switch_top)
+#define p1d_scope_cap (ps->scope_cap)
+#define p1d_cur_func (ps->p1d_cur_func)
+#define p1d_switch_cap (ps->p1d_switch_cap)
+#define p1d_switch_stack (ps->p1d_switch_stack)
+#define p1d_switch_end (ps->p1d_switch_end)
+#define p1d_switch_top (ps->p1d_switch_top)
 #define p1d_braceless_next_sid (ps->p1d_braceless_next_sid)
-#define p1d_prev          (ps->p1d_prev)
-#define p1d_saw_raw       (ps->p1d_saw_raw)
-#define p1d_saw_static    (ps->p1d_saw_static)
+#define p1d_prev (ps->p1d_prev)
+#define p1d_saw_raw (ps->p1d_saw_raw)
+#define p1d_saw_static (ps->p1d_saw_static)
 #define p1d_init_brace_depth (ps->p1d_init_brace_depth)
-#define p1d_ctrl_pending  (ps->p1d_ctrl_pending)
-#define skip_cache        (ps->skip_cache)
+#define p1d_ctrl_pending (ps->p1d_ctrl_pending)
+#define skip_cache (ps->skip_cache)
 #define CUR_SID() (scope_stack_local[scope_depth_local])
-#define P1D_STMT_RESET() do { at_stmt_start = true; p1d_saw_raw = false; \
-	p1d_saw_static = false; p1d_ctrl_pending = false; } while(0)
-#define P1D_SWITCH_ENSURE_CAP() do { if (p1d_switch_top >= p1d_switch_cap) { \
-	int _old = p1d_switch_cap; p1d_switch_cap *= 2; \
-	p1d_switch_stack = arena_realloc(&ctx->main_arena, p1d_switch_stack, _old * sizeof(uint16_t), p1d_switch_cap * sizeof(uint16_t)); \
-	p1d_switch_end = arena_realloc(&ctx->main_arena, p1d_switch_end, _old * sizeof(uint32_t), p1d_switch_cap * sizeof(uint32_t)); \
-	} } while(0)
+#define P1D_STMT_RESET()                                                                                     \
+	do {                                                                                                 \
+		at_stmt_start = true;                                                                        \
+		p1d_saw_raw = false;                                                                         \
+		p1d_saw_static = false;                                                                      \
+		p1d_ctrl_pending = false;                                                                    \
+	} while (0)
+#define P1D_SWITCH_ENSURE_CAP()                                                                              \
+	do {                                                                                                 \
+		if (p1d_switch_top >= p1d_switch_cap) {                                                      \
+			int _old = p1d_switch_cap;                                                           \
+			p1d_switch_cap *= 2;                                                                 \
+			p1d_switch_stack = arena_realloc(&ctx->main_arena,                                   \
+							 p1d_switch_stack,                                   \
+							 _old * sizeof(uint16_t),                            \
+							 p1d_switch_cap * sizeof(uint16_t));                 \
+			p1d_switch_end = arena_realloc(&ctx->main_arena,                                     \
+						       p1d_switch_end,                                       \
+						       _old * sizeof(uint32_t),                              \
+						       p1d_switch_cap * sizeof(uint32_t));                   \
+		}                                                                                            \
+	} while (0)
 	while (tok && tok->kind != TK_EOF) {
 		while (p1d_switch_top > 0 && p1d_switch_end[p1d_switch_top - 1] > 0 &&
 		       tok_idx(tok) > p1d_switch_end[p1d_switch_top - 1])
@@ -7566,9 +8568,11 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 					is_func_decl = true;
 				} else {
 					Token *prev = walk_back_past_noise(tok_idx(tok));
-					if (prev && ((prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE | TT_TYPEOF))
-					    || is_known_typedef(prev))) {
-						hashmap_put(&p1_func_proto_map, tok_loc(tok), tok->len, (void *)1);
+					if (prev && ((prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE |
+								   TT_SUE | TT_TYPEOF)) ||
+						     is_known_typedef(prev))) {
+						hashmap_put(
+						    &p1_func_proto_map, tok_loc(tok), tok->len, (void *)1);
 						is_func_decl = true;
 					}
 				}
@@ -7581,13 +8585,14 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 		    !is_known_typedef(tok)) {
 			if (tok->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_CASE | TT_DEFAULT))
 				error_tok(tok,
-					  "control statement at file scope (must appear inside a function body)");
+					  "control statement at file scope (must appear inside a "
+					  "function body)");
 			if (tok->tag & TT_GOTO)
-				error_tok(tok,
-					  "'goto' at file scope (must appear inside a function body)");
+				error_tok(tok, "'goto' at file scope (must appear inside a function body)");
 			if ((tok->tag & (TT_IF | TT_LOOP | TT_SWITCH)) || is_else_kw(tok))
 				error_tok(tok,
-					  "control-flow statement at file scope (must appear inside a function body)");
+					  "control-flow statement at file scope (must appear inside a "
+					  "function body)");
 		}
 
 		if (FEAT(F_ORELSE) && match_ch(tok, '[') && tok_match(tok))
@@ -7608,13 +8613,15 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 			if (paren && match_ch(paren, '(') && tok_match(paren)) {
 				uint16_t cur_sid = CUR_SID();
 				const char *msg = NULL;
-				if (cur_sid > 0 && cur_sid < scope_tree_count && scope_tree[cur_sid].is_struct)
+				if (cur_sid > 0 && cur_sid < scope_tree_count &&
+				    scope_tree[cur_sid].is_struct)
 					msg = "'orelse' inside typeof in a struct/union body "
 					      "cannot be transformed; use the resolved type directly";
 				else if (p1d_cur_func < 0)
 					msg = "'orelse' inside typeof at file scope is not allowed";
 				if (msg) {
-					for (Token *s = tok_next(paren); s && s != tok_match(paren); s = tok_next(s))
+					for (Token *s = tok_next(paren); s && s != tok_match(paren);
+					     s = tok_next(s))
 						if ((s->tag & TT_ORELSE) && !typedef_lookup(s))
 							error_tok(s, msg);
 				}
@@ -7623,22 +8630,31 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 				if (!msg) {
 					Token *prev_typeof = paren;
 					Token *se_start = tok_next(paren);
-					for (Token *s = tok_next(paren); s && s != tok_match(paren); s = tok_next(s)) {
+					for (Token *s = tok_next(paren); s && s != tok_match(paren);
+					     s = tok_next(s)) {
 						if ((s->tag & TT_ORELSE)) {
 							TypedefEntry *te_s = typedef_lookup(s);
 							if (!te_s || orelse_shadow_is_kw(prev_typeof)) {
 								reject_orelse_side_effects(
-									se_start, s,
-									"'orelse' in typeof",
-									"in the LHS (would be evaluated twice); "
-									"hoist the expression to a variable first",
-									true, true, false);
+								    se_start,
+								    s,
+								    "'orelse' in typeof",
+								    "in the LHS (would be evaluated twice); "
+								    "hoist the expression to a variable "
+								    "first",
+								    true,
+								    true,
+								    false);
 								se_start = tok_next(s);
 								prev_typeof = s;
 								continue;
 							}
 						}
-						if (s->flags & TF_OPEN && tok_match(s)) { prev_typeof = tok_match(s); s = tok_match(s); continue; }
+						if (s->flags & TF_OPEN && tok_match(s)) {
+							prev_typeof = tok_match(s);
+							s = tok_match(s);
+							continue;
+						}
 						prev_typeof = s;
 					}
 				}
@@ -7680,8 +8696,7 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 			at_stmt_start = true;
 			p1d_saw_raw = false;
 			p1d_saw_static = false;
-			if (brace_depth == 0)
-				file_scope_stmt_start = tok_next(tok);
+			if (brace_depth == 0) file_scope_stmt_start = tok_next(tok);
 			tok = tok_next(tok);
 			continue;
 		}
@@ -7709,20 +8724,25 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 				// Phase 1D: reject orelse/defer inside non-control-flow
 				// parentheses (hoisted from Pass 2 check_orelse_in_parens).
 				if ((FEAT(F_ORELSE) || FEAT(F_DEFER)) && match_ch(tok, '(') &&
-				    !(p1d_prev_saved && (p1d_prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH | TT_TYPEOF | TT_ATTR | TT_ASM))))
+				    !(p1d_prev_saved &&
+				      (p1d_prev_saved->tag &
+				       (TT_IF | TT_LOOP | TT_SWITCH | TT_TYPEOF | TT_ATTR | TT_ASM))))
 					check_orelse_in_parens(tok);
 				// Phase 1D: reject orelse inside attribute paren groups at
-							if (FEAT(F_ORELSE) && tok_match(tok) &&
-				    ((match_ch(tok, '(') && p1d_prev_saved && (p1d_prev_saved->tag & TT_ATTR)) ||
+				if (FEAT(F_ORELSE) && tok_match(tok) &&
+				    ((match_ch(tok, '(') && p1d_prev_saved &&
+				      (p1d_prev_saved->tag & TT_ATTR)) ||
 				     (tok->flags & TF_C23_ATTR))) {
 					Token *am = tok_match(tok);
 					for (Token *s = tok_next(tok); s && s != am; s = tok_next(s))
 						if ((s->tag & TT_ORELSE) && !typedef_lookup(s))
-							error_tok(s, "'orelse' cannot be used inside "
+							error_tok(s,
+								  "'orelse' cannot be used inside "
 								  "attribute arguments");
 				}
 				if (match_ch(tok, '(') || match_ch(tok, '[')) {
-					Token *se_open = p1d_scan_balanced_group(tok, brace_depth, p1d_cur_func, CUR_SID(), p1d_prev_saved);
+					Token *se_open = p1d_scan_balanced_group(
+					    tok, brace_depth, p1d_cur_func, CUR_SID(), p1d_prev_saved);
 					if (se_open) {
 						tok = se_open;
 						continue;
@@ -7739,13 +8759,14 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 				if (match_ch(tok, ')') && tok_match(tok)) {
 					uint32_t oi = tok_idx(tok_match(tok));
 					/* Must not use walk_back_past_noise: it jumps }/{ and
-					 * nested (), so `} (expr)` after `while (c){}` looks
-					 * like the while-condition close and re-arms
-					 * at_stmt_start on the following 'orelse'. */
+           * nested (), so `} (expr)` after `while (c){}` looks
+           * like the while-condition close and re-arms
+           * at_stmt_start on the following 'orelse'. */
 					Token *before_open = walk_back_skip_attr_noise(oi);
 					/* else/do take no condition paren; their body '(' must
-					 * not re-arm (same class as the braced-ctrl bug). */
-					if (before_open && (before_open->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
+           * not re-arm (same class as the braced-ctrl bug). */
+					if (before_open &&
+					    (before_open->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
 					    !is_else_kw(before_open) && !is_do_kw(before_open)) {
 						at_stmt_start = true;
 						p1d_ctrl_pending = true;
@@ -7759,37 +8780,43 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 		// Skip noise (attributes, C23 [[...]], pragmas)
 		Token *clean = skip_noise(tok);
 		if (clean != tok) {
-							for (Token *s = tok; s && s != clean; s = tok_next(s)) {
+			for (Token *s = tok; s && s != clean; s = tok_next(s)) {
 				uint32_t st = s->tag;
 				if (st & (TT_GOTO | TT_RETURN | TT_BREAK | TT_CONTINUE))
-					error_tok(s, "'%.*s' inside attribute argument "
+					error_tok(s,
+						  "'%.*s' inside attribute argument "
 						  "bypasses control-flow analysis; "
 						  "move it outside the attribute",
-						  s->len, tok_loc(s));
+						  s->len,
+						  tok_loc(s));
 				if ((st & TT_DEFER) && !typedef_lookup(s))
-					error_tok(s, "'defer' inside attribute argument "
+					error_tok(s,
+						  "'defer' inside attribute argument "
 						  "bypasses control-flow analysis; "
 						  "move it outside the attribute",
-						  s->len, tok_loc(s));
+						  s->len,
+						  tok_loc(s));
 				if ((st & TT_ORELSE) && !typedef_lookup(s))
-					error_tok(s, "'orelse' cannot be used inside "
+					error_tok(s,
+						  "'orelse' cannot be used inside "
 						  "attribute arguments");
 			}
-			tok = clean; continue;
+			tok = clean;
+			continue;
 		}
 
 		// Skip storage/inline/noreturn/extension specifiers before type
 		if (((tok->tag & (TT_STORAGE | TT_INLINE)) || equal(tok, "__extension__")) &&
 		    !(is_soft_keyword_identifier(tok) && token_is_label_name(tok))) {
-			if (tok->tag & TT_STORAGE)
-				p1d_saw_static = true;
+			if (tok->tag & TT_STORAGE) p1d_saw_static = true;
 			tok = tok_next(tok);
 			continue;
 		}
 
 		if ((tok->flags & TF_RAW) && !is_known_typedef(tok)) {
 			Token *rnext = tok_next(tok);
-			if (!(rnext && match_ch(rnext, ':') && !(tok_next(rnext) && match_ch(tok_next(rnext), ':')))) {
+			if (!(rnext && match_ch(rnext, ':') &&
+			      !(tok_next(rnext) && match_ch(tok_next(rnext), ':')))) {
 				p1d_saw_raw = true;
 				tok = tok_next(tok);
 				continue;
@@ -7815,12 +8842,14 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 					TD_SCOPE_SAVE();
 					td_scope_open = tok_idx(tok);
 					td_scope_close = tok_idx(close);
-					for (Token *m = tok_next(tok); m && m != close && m->kind != TK_EOF; ) {
+					for (Token *m = tok_next(tok);
+					     m && m != close && m->kind != TK_EOF;) {
 						if (is_enum_kw(m)) {
 							uint32_t so = td_scope_open, sc = td_scope_close;
 							td_scope_open = _tds_o;
 							td_scope_close = _tds_c;
-							p1d_register_enum_at(m, brace_depth, CUR_SID(), p1d_cur_func);
+							p1d_register_enum_at(
+							    m, brace_depth, CUR_SID(), p1d_cur_func);
 							td_scope_open = so;
 							td_scope_close = sc;
 						}
@@ -7829,27 +8858,59 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 							continue;
 						}
 						if (is_valid_varname(m) &&
-						    (is_known_typedef(m) || (m->tag & (TT_DEFER | TT_ORELSE)))) {
+						    (is_known_typedef(m) ||
+						     (m->tag & (TT_DEFER | TT_ORELSE)))) {
 							Token *nxt = tok_next(m);
-							if (nxt && (match_ch(nxt, ';') || match_ch(nxt, ',') ||
-							    match_ch(nxt, ':') || match_ch(nxt, '[') ||
-							    match_ch(nxt, '='))) {
+							if (nxt &&
+							    (match_ch(nxt, ';') || match_ch(nxt, ',') ||
+							     match_ch(nxt, ':') || match_ch(nxt, '[') ||
+							     match_ch(nxt, '='))) {
 								// Only shadow if a type specifier precedes m in this member.
 								if (match_ch(nxt, ':')) {
 									bool has_type = false;
-									for (uint32_t pi = tok_idx(m); pi > tok_idx(tok); pi--) {
-										Token *pt = &token_pool[pi - 1];
-										if (pt->kind == TK_PREP_DIR) continue;
-										if (match_set(pt, CH(';') | CH(',')) || match_ch(pt, '{') || match_ch(pt, '}')) break;
-										if (pt->tag & TT_QUALIFIER) continue;
-										if (match_ch(pt, ')') && tok_match(pt)) { pi = tok_idx(tok_match(pt)) + 1; continue; }
-										if (match_ch(pt, ']') && tok_match(pt)) { pi = tok_idx(tok_match(pt)) + 1; continue; }
+									for (uint32_t pi = tok_idx(m);
+									     pi > tok_idx(tok);
+									     pi--) {
+										Token *pt =
+										    &token_pool[pi - 1];
+										if (pt->kind == TK_PREP_DIR)
+											continue;
+										if (match_set(pt,
+											      CH(';') |
+												  CH(',')) ||
+										    match_ch(pt, '{') ||
+										    match_ch(pt, '}'))
+											break;
+										if (pt->tag & TT_QUALIFIER)
+											continue;
+										if (match_ch(pt, ')') &&
+										    tok_match(pt)) {
+											pi =
+											    tok_idx(tok_match(
+												pt)) +
+											    1;
+											continue;
+										}
+										if (match_ch(pt, ']') &&
+										    tok_match(pt)) {
+											pi =
+											    tok_idx(tok_match(
+												pt)) +
+											    1;
+											continue;
+										}
 										has_type = true;
 										break;
 									}
-									if (!has_type) { m = tok_next(m); continue; }
+									if (!has_type) {
+										m = tok_next(m);
+										continue;
+									}
 								}
-								TYPEDEF_ADD_IDX(typedef_add_shadow(tok_loc(m), m->len, brace_depth + 1), m);
+								TYPEDEF_ADD_IDX(
+								    typedef_add_shadow(
+									tok_loc(m), m->len, brace_depth + 1),
+								    m);
 							}
 						}
 						m = tok_next(m);
@@ -7858,19 +8919,18 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 					tok = tok_next(close);
 					continue;
 				}
-				if (tok->flags & TF_OPEN && tok_match(tok))
-					tok = tok_next(tok_match(tok));
+				if (tok->flags & TF_OPEN && tok_match(tok)) tok = tok_next(tok_match(tok));
 				else
 					tok = tok_next(tok);
 			}
 			if (tok && match_ch(tok, ';')) tok = tok_next(tok);
 			at_stmt_start = true;
-			if (brace_depth == 0)
-				file_scope_stmt_start = tok;
+			if (brace_depth == 0) file_scope_stmt_start = tok;
 			continue;
 		}
 
-		// Does NOT continue — falls through to Phase 1C/1D for declaration detection.
+		// Does NOT continue — falls through to Phase 1C/1D for declaration
+		// detection.
 		if (tok->tag & TT_SUE) {
 			Token *brace = find_struct_body_brace(tok);
 			if (brace) {
@@ -7879,13 +8939,22 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 				} else {
 					bool body_vla = struct_body_contains_vla(brace);
 					bool body_vol = struct_body_contains_volatile(brace);
-					for (Token *t = skip_noise(tok_next(tok)); t && t != brace; t = skip_noise(tok_next(t))) {
-						if ((t->tag & TT_QUALIFIER) && !is_soft_keyword_identifier(t)) continue;
+					for (Token *t = skip_noise(tok_next(tok)); t && t != brace;
+					     t = skip_noise(tok_next(t))) {
+						if ((t->tag & TT_QUALIFIER) && !is_soft_keyword_identifier(t))
+							continue;
 						if (is_valid_varname(t)) {
 							int pre = typedef_table.count;
-							typedef_add_entry(tok_loc(t), t->len, brace_depth, TDK_STRUCT_TAG, body_vla, false);
+							typedef_add_entry(tok_loc(t),
+									  t->len,
+									  brace_depth,
+									  TDK_STRUCT_TAG,
+									  body_vla,
+									  false);
 							if (typedef_table.count > pre) {
-								TypedefEntry *te = &typedef_table.entries[typedef_table.count - 1];
+								TypedefEntry *te =
+								    &typedef_table
+									 .entries[typedef_table.count - 1];
 								te->token_index = tok_idx(t);
 								te->is_aggregate = true;
 								if (body_vol) te->has_volatile_member = true;
@@ -7903,16 +8972,23 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 			tok = skip_to_semicolon(tok, NULL);
 			if (tok && match_ch(tok, ';')) tok = tok_next(tok);
 			at_stmt_start = true;
-			if (brace_depth == 0)
-				file_scope_stmt_start = tok;
+			if (brace_depth == 0) file_scope_stmt_start = tok;
 			continue;
 		}
 
 		if ((tok->tag & TT_LOOP) && tok->ch0 == 'f' && brace_depth > 0 && p1d_cur_func >= 0)
-			p1d_scan_ctrl_init(tok, skip_cache, brace_depth, CUR_SID(), /*is_for=*/true);
+			p1d_scan_ctrl_init(tok,
+					   skip_cache,
+					   brace_depth,
+					   CUR_SID(),
+					   /*is_for=*/true);
 		if ((tok->tag & (TT_IF | TT_SWITCH)) && brace_depth > 0 && p1d_cur_func >= 0 &&
 		    !is_else_kw(tok))
-			p1d_scan_ctrl_init(tok, skip_cache, brace_depth, CUR_SID(), /*is_for=*/false);
+			p1d_scan_ctrl_init(tok,
+					   skip_cache,
+					   brace_depth,
+					   CUR_SID(),
+					   /*is_for=*/false);
 		if (p1d_cur_func >= 0) {
 			uint16_t cur_sid = CUR_SID();
 			// GNU __label__ local label declaration: __label__ id1, id2, ...;
@@ -7924,16 +9000,20 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 						if (ps->local_label_count >= ps->local_label_cap) {
 							int old = ps->local_label_cap;
 							ps->local_label_cap = old ? old * 2 : 16;
-							ps->local_labels = arena_realloc(&ctx->main_arena,
-								ps->local_labels,
-								old * sizeof(ps->local_labels[0]),
-								ps->local_label_cap * sizeof(ps->local_labels[0]));
+							ps->local_labels =
+							    arena_realloc(&ctx->main_arena,
+									  ps->local_labels,
+									  old * sizeof(ps->local_labels[0]),
+									  ps->local_label_cap *
+									      sizeof(ps->local_labels[0]));
 						}
 						int name_len = t->len;
 						char sid_buf[12];
-						int sid_len = snprintf(sid_buf, sizeof(sid_buf), "%u", (unsigned)cur_sid);
+						int sid_len = snprintf(
+						    sid_buf, sizeof(sid_buf), "%u", (unsigned)cur_sid);
 						int mangled_len = name_len + 1 + sid_len;
-						char *mangled = arena_alloc_uninit(&ctx->main_arena, mangled_len);
+						char *mangled =
+						    arena_alloc_uninit(&ctx->main_arena, mangled_len);
 						memcpy(mangled, tok_loc(t), name_len);
 						mangled[name_len] = '\0';
 						memcpy(mangled + name_len + 1, sid_buf, sid_len);
@@ -7960,8 +9040,7 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 				Token *colon = skip_noise(tok_next(tok));
 				if (colon && match_ch(colon, ':') &&
 				    !(tok_next(colon) && match_ch(tok_next(colon), ':')) &&
-				    !(tok->tag & (TT_CASE | TT_DEFAULT)) &&
-				    p1d_init_brace_depth == 0) {
+				    !(tok->tag & (TT_CASE | TT_DEFAULT)) && p1d_init_brace_depth == 0) {
 					P1FuncEntry *e = p1_alloc(P1K_LABEL, cur_sid, tok);
 					p1d_set_label_name(e, ps, tok, cur_sid);
 					p1d_prev = colon;
@@ -7972,21 +9051,33 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 			}
 
 			p1d_record_goto(ps, tok, cur_sid, p1d_cur_func);
-			if (is_defer_kw(tok, p1d_prev))
-				p1_try_alloc_defer(tok, cur_sid, p1d_cur_func);
+			if (is_defer_kw(tok, p1d_prev)) p1_try_alloc_defer(tok, cur_sid, p1d_cur_func);
 			if (tok->tag & (TT_CASE | TT_DEFAULT)) {
-				uint16_t sw_sid = p1d_switch_top > 0 ?
-					p1d_switch_stack[p1d_switch_top - 1] : 0;
+				uint16_t sw_sid =
+				    p1d_switch_top > 0 ? p1d_switch_stack[p1d_switch_top - 1] : 0;
 				P1FuncEntry *e = p1_alloc(P1K_CASE, cur_sid, tok);
 				e->kase.switch_scope_id = sw_sid;
 				Token *ct = tok_next(tok);
 				int td = 0;
 				while (ct && ct->kind != TK_EOF) {
 					if (match_ch(ct, ';') || match_ch(ct, '{')) break;
-					if (ct->flags & TF_OPEN && tok_match(ct))
-						{ ct = tok_next(tok_match(ct)); continue; }
-					if (match_ch(ct, '?')) { td++; ct = tok_next(ct); continue; }
-					if (match_ch(ct, ':')) { if (td > 0) { td--; ct = tok_next(ct); continue; } break; }
+					if (ct->flags & TF_OPEN && tok_match(ct)) {
+						ct = tok_next(tok_match(ct));
+						continue;
+					}
+					if (match_ch(ct, '?')) {
+						td++;
+						ct = tok_next(ct);
+						continue;
+					}
+					if (match_ch(ct, ':')) {
+						if (td > 0) {
+							td--;
+							ct = tok_next(ct);
+							continue;
+						}
+						break;
+					}
 					ct = tok_next(ct);
 				}
 				if (ct && match_ch(ct, ':')) {
@@ -7999,12 +9090,18 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 		}
 
 		if (is_defer_kw(tok, p1d_prev))
-			p1d_validate_defer(tok, p1d_cur_func, p1d_ctrl_pending, CUR_SID(),
-					   brace_depth);
-		p1d_probe_declaration(tok, CUR_SID(), brace_depth, p1d_cur_func,
-				      &p1d_saw_raw, p1d_saw_static, p1d_ctrl_pending, skip_cache);
-		// Phase 1D: detect braceless switch — emit P1K_SWITCH with synthetic scope_id
-		// For `switch (expr) stmt;` (no braces), Phase 1A never creates a scope,
+			p1d_validate_defer(tok, p1d_cur_func, p1d_ctrl_pending, CUR_SID(), brace_depth);
+		p1d_probe_declaration(tok,
+				      CUR_SID(),
+				      brace_depth,
+				      p1d_cur_func,
+				      &p1d_saw_raw,
+				      p1d_saw_static,
+				      p1d_ctrl_pending,
+				      skip_cache);
+		// Phase 1D: detect braceless switch — emit P1K_SWITCH with synthetic
+		// scope_id For `switch (expr) stmt;` (no braces), Phase 1A never creates a
+		// scope,
 		if (p1d_cur_func >= 0 && (tok->tag & TT_SWITCH) && !is_known_typedef(tok)) {
 			Token *p = skip_prep_dirs(tok_next(tok));
 			if (p && match_ch(p, '(') && tok_match(p)) {
@@ -8012,7 +9109,8 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 				if (body && !match_ch(body, '{')) {
 					uint32_t synth_sid = p1d_braceless_next_sid++;
 					if (synth_sid > UINT16_MAX)
-						error_tok(tok, "too many scopes + braceless switches (>65535)");
+						error_tok(tok,
+							  "too many scopes + braceless switches (>65535)");
 					p1_alloc(P1K_SWITCH, (uint16_t)synth_sid, tok);
 					P1D_SWITCH_ENSURE_CAP();
 					p1d_switch_stack[p1d_switch_top] = synth_sid;
@@ -8024,13 +9122,17 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 		}
 
 		if (is_else_or_do(tok)) {
-			p1d_prev = tok; tok = tok_next(tok); at_stmt_start = true; p1d_ctrl_pending = true; continue;
+			p1d_prev = tok;
+			tok = tok_next(tok);
+			at_stmt_start = true;
+			p1d_ctrl_pending = true;
+			continue;
 		}
 
 		// Phase 1D: validate bare orelse in expression statements.
-			if (at_stmt_start && FEAT(F_ORELSE) && p1d_cur_func >= 0 && brace_depth > 0 &&
-		    !(tok->tag & (TT_IF | TT_LOOP | TT_SWITCH | TT_GOTO | TT_BREAK |
-				  TT_CONTINUE | TT_CASE | TT_DEFAULT | TT_DEFER))) {
+		if (at_stmt_start && FEAT(F_ORELSE) && p1d_cur_func >= 0 && brace_depth > 0 &&
+		    !(tok->tag & (TT_IF | TT_LOOP | TT_SWITCH | TT_GOTO | TT_BREAK | TT_CONTINUE | TT_CASE |
+				  TT_DEFAULT | TT_DEFER))) {
 			Token *bare_oe = find_bare_orelse(tok);
 			if (bare_oe && !(tok_ann(bare_oe) & (P1_OE_BRACKET | P1_OE_DECL_INIT)))
 				p1d_validate_bare_orelse(tok, bare_oe);
@@ -8071,19 +9173,25 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 
 // Report a goto-skips-defer/decl error or warning.
 static void cfg_report_goto(Token *bad, const char *msg, P1FuncEntry *label) {
-	if (FEAT(F_WARN_SAFETY))
-		warn_tok(bad, msg, label->label.len, label->label.name);
+	if (FEAT(F_WARN_SAFETY)) warn_tok(bad, msg, label->label.len, label->label.name);
 	else
 		error_tok(bad, msg, label->label.len, label->label.name);
 }
+
 static inline uint32_t decl_effective_close(const P1FuncEntry *d) {
 	if (d->decl.body_close_idx > 0) return d->decl.body_close_idx;
-	if (d->scope_id > 0 && d->scope_id < scope_tree_count)
-		return scope_tree[d->scope_id].close_tok_idx;
+	if (d->scope_id > 0 && d->scope_id < scope_tree_count) return scope_tree[d->scope_id].close_tok_idx;
 	return 0;
 }
-static void cfg_error_if_looped_between(P1FuncEntry *ents, P1FuncEntry *g, P1FuncEntry *label,
-				       int *list, int lo, int hi, bool vla_only, const char *msg) {
+
+static void cfg_error_if_looped_between(P1FuncEntry *ents,
+					P1FuncEntry *g,
+					P1FuncEntry *label,
+					int *list,
+					int lo,
+					int hi,
+					bool vla_only,
+					const char *msg) {
 	for (int di = lo; di < hi; di++) {
 		P1FuncEntry *d = &ents[list[di]];
 		if (vla_only && !d->decl.is_vla) continue;
@@ -8098,10 +9206,17 @@ static void cfg_error_if_looped_between(P1FuncEntry *ents, P1FuncEntry *g, P1Fun
 		break;
 	}
 }
+
 static void cfg_check_range(P1FuncEntry *ents,
-			    P1FuncEntry *g, P1FuncEntry *label, bool is_forward,
-			    int *defer_list, int defer_lo, int defer_hi,
-			    int *decl_list, int decl_lo, int decl_hi) {
+			    P1FuncEntry *g,
+			    P1FuncEntry *label,
+			    bool is_forward,
+			    int *defer_list,
+			    int defer_lo,
+			    int defer_hi,
+			    int *decl_list,
+			    int decl_lo,
+			    int decl_hi) {
 	Token *bad_defer = NULL, *bad_decl = NULL;
 	bool bad_decl_is_vla = false;
 	if (FEAT(F_DEFER)) {
@@ -8129,14 +9244,23 @@ static void cfg_check_range(P1FuncEntry *ents,
 		if (!is_forward && scope_is_ancestor_or_self(d->scope_id, g->scope_id)) continue;
 		uint32_t close = decl_effective_close(d);
 		if (close > 0 && close < label->token_index) continue;
-		if (d->decl.is_vla) { if (!first_vla) first_vla = d; continue; }
+		if (d->decl.is_vla) {
+			if (!first_vla) first_vla = d;
+			continue;
+		}
 		if (d->decl.has_raw || d->decl.is_static_storage) continue;
-		if (d->decl.has_init) { if (!first_init) first_init = d; }
-		else if (!first_other) first_other = d;
+		if (d->decl.has_init) {
+			if (!first_init) first_init = d;
+		} else if (!first_other)
+			first_other = d;
 	}
-	if (first_vla)        { bad_decl = first_vla->tok;  bad_decl_is_vla = true; }
-	else if (first_init)  { bad_decl = first_init->tok; bad_decl_has_init = true; }
-	else if (first_other && FEAT(F_ZEROINIT)) {
+	if (first_vla) {
+		bad_decl = first_vla->tok;
+		bad_decl_is_vla = true;
+	} else if (first_init) {
+		bad_decl = first_init->tok;
+		bad_decl_has_init = true;
+	} else if (first_other && FEAT(F_ZEROINIT)) {
 		Token *lname = first_other->tok;
 		Token *t = &token_pool[label->token_index];
 		while (t && t->kind != TK_EOF && !match_ch(t, ':')) t = tok_next(t);
@@ -8144,8 +9268,17 @@ static void cfg_check_range(P1FuncEntry *ents,
 		bool assigned_first = false;
 		int bd = 0;
 		while (t && t->kind != TK_EOF) {
-			if (match_ch(t, '{')) { bd++; t = tok_next(t); continue; }
-			if (match_ch(t, '}')) { if (bd == 0) break; bd--; t = tok_next(t); continue; }
+			if (match_ch(t, '{')) {
+				bd++;
+				t = tok_next(t);
+				continue;
+			}
+			if (match_ch(t, '}')) {
+				if (bd == 0) break;
+				bd--;
+				t = tok_next(t);
+				continue;
+			}
 			if (t->kind == TK_IDENT && t->len == lname->len &&
 			    !memcmp(tok_loc(t), tok_loc(lname), lname->len)) {
 				Token *n = tok_next(t);
@@ -8157,25 +9290,22 @@ static void cfg_check_range(P1FuncEntry *ents,
 		if (!assigned_first) bad_decl = first_other->tok;
 	}
 
-	if (bad_defer)
-		cfg_report_goto(bad_defer,
-				"goto '%.*s' would skip over this defer statement", label);
+	if (bad_defer) cfg_report_goto(bad_defer, "goto '%.*s' would skip over this defer statement", label);
 	if (bad_decl) {
 		const char *msg;
-		if (bad_decl_is_vla)
-			msg = "goto '%.*s' would skip over this VLA declaration";
+		if (bad_decl_is_vla) msg = "goto '%.*s' would skip over this VLA declaration";
 		else if (bad_decl_has_init)
 			msg = "goto '%.*s' would skip over a declaration with an initializer "
 			      "(undefined behavior if jumped into)";
 		else
 			msg = "goto '%.*s' would skip over this variable declaration "
 			      "(bypasses initialization)";
-		if (bad_decl_is_vla)
-			error_tok(bad_decl, msg, label->label.len, label->label.name);
+		if (bad_decl_is_vla) error_tok(bad_decl, msg, label->label.len, label->label.name);
 		else
 			cfg_report_goto(bad_decl, msg, label);
 	}
 }
+
 static void p1_verify_cfg(void) {
 	for (int fi = 0; fi < func_meta_count; fi++) {
 		FuncMeta *fm = &func_meta[fi];
@@ -8184,33 +9314,31 @@ static void p1_verify_cfg(void) {
 			P1FuncEntry *ents = &p1_entries[fm->entry_start];
 			bool has_vla = false;
 			for (int i = 0; i < fm->entry_count; i++)
-				if (ents[i].kind == P1K_DECL && ents[i].decl.is_vla) { has_vla = true; break; }
+				if (ents[i].kind == P1K_DECL && ents[i].decl.is_vla) {
+					has_vla = true;
+					break;
+				}
 			if (!has_vla) continue;
 		}
 
 		// Computed gotos cannot be verified statically: they could jump
-		bool unverifiable_jump = fm->has_computed_goto ||
-			(fm->body_open->tag & TT_ASM);
+		bool unverifiable_jump = fm->has_computed_goto || (fm->body_open->tag & TT_ASM);
 		if (unverifiable_jump) {
-			const char *jump_kind = fm->has_computed_goto
-				? "computed goto" : "asm goto";
-			static const char fmt[] =
-				"%s cannot be used in a function that "
-				"contains %s — the jump target cannot be "
-				"verified at compile time";
+			const char *jump_kind = fm->has_computed_goto ? "computed goto" : "asm goto";
+			static const char fmt[] = "%s cannot be used in a function that "
+						  "contains %s — the jump target cannot be "
+						  "verified at compile time";
 			P1FuncEntry *ents = &p1_entries[fm->entry_start];
 			for (int i = 0; i < fm->entry_count; i++) {
 				const char *blocker = NULL;
-				if (ents[i].kind == P1K_DEFER && FEAT(F_DEFER))
-					blocker = "defer statements";
+				if (ents[i].kind == P1K_DEFER && FEAT(F_DEFER)) blocker = "defer statements";
 				else if (ents[i].kind == P1K_DECL && ents[i].decl.is_vla)
 					blocker = "variable-length arrays";
 				else if (ents[i].kind == P1K_DECL && FEAT(F_ZEROINIT) &&
-				    !ents[i].decl.has_raw && !ents[i].decl.is_static_storage &&
-				    !ents[i].decl.is_vla && !ents[i].decl.has_init)
+					 !ents[i].decl.has_raw && !ents[i].decl.is_static_storage &&
+					 !ents[i].decl.is_vla && !ents[i].decl.has_init)
 					blocker = "zero-initialized declarations";
-				if (blocker)
-					error_tok(fm->body_open, fmt, jump_kind, blocker);
+				if (blocker) error_tok(fm->body_open, fmt, jump_kind, blocker);
 			}
 		}
 
@@ -8224,7 +9352,8 @@ static void p1_verify_cfg(void) {
 			}
 		}
 
-		// Allocated before arena mark so it persists in FuncMeta for Pass 2 O(1) lookup.
+		// Allocated before arena mark so it persists in FuncMeta for Pass 2 O(1)
+		// lookup.
 		int cnt = fm->entry_count;
 		if (cnt < 0) cnt = 0; // GCC VRP guard: entry_count is always ≥ 0
 		int hash_sz = 64;
@@ -8235,29 +9364,37 @@ static void p1_verify_cfg(void) {
 		ArenaMark mark = arena_mark(&ctx->main_arena);
 		P1FuncEntry *ents = &p1_entries[fm->entry_start];
 		int *defer_list = arena_alloc(&ctx->main_arena, (size_t)cnt * sizeof(int));
-		int *decl_list  = arena_alloc(&ctx->main_arena, (size_t)cnt * sizeof(int));
-		int *wm_defer   = arena_alloc(&ctx->main_arena, (size_t)cnt * sizeof(int));
-		int *wm_decl    = arena_alloc(&ctx->main_arena, (size_t)cnt * sizeof(int));
+		int *decl_list = arena_alloc(&ctx->main_arena, (size_t)cnt * sizeof(int));
+		int *wm_defer = arena_alloc(&ctx->main_arena, (size_t)cnt * sizeof(int));
+		int *wm_decl = arena_alloc(&ctx->main_arena, (size_t)cnt * sizeof(int));
 		int defer_n = 0, decl_n = 0;
 		for (int i = 0; i < cnt; i++) {
 			if (ents[i].kind != P1K_LABEL) continue;
 			uint32_t h = (uint32_t)fast_hash(ents[i].label.name, ents[i].label.len);
 			for (int probe = 0; probe < hash_sz; probe++) {
 				int slot = (h + probe) & hash_mask;
-				if (label_hash[slot] < 0) { label_hash[slot] = i; break; }
+				if (label_hash[slot] < 0) {
+					label_hash[slot] = i;
+					break;
+				}
 				P1FuncEntry *existing = &ents[label_hash[slot]];
 				if (existing->label.len == ents[i].label.len &&
-				    !memcmp(existing->label.name, ents[i].label.name,
-					    existing->label.len))
-					error_tok(ents[i].tok, "duplicate label '%.*s'",
-						  ents[i].label.len, ents[i].label.name);
+				    !memcmp(existing->label.name, ents[i].label.name, existing->label.len))
+					error_tok(ents[i].tok,
+						  "duplicate label '%.*s'",
+						  ents[i].label.len,
+						  ents[i].label.name);
 			}
 		}
 
 		// Persist label hash in FuncMeta for O(1) lookup in Pass 2
 		fm->label_hash = label_hash;
 		fm->label_hash_mask = hash_mask;
-		typedef struct { int idx, dm, cm, next; } FwdGoto;
+
+		typedef struct {
+			int idx, dm, cm, next;
+		} FwdGoto;
+
 		FwdGoto *fwd = arena_alloc(&ctx->main_arena, (size_t)cnt * sizeof(FwdGoto));
 		int fwd_n = 0;
 		int *fwd_hash_tbl = arena_alloc(&ctx->main_arena, (size_t)hash_sz * sizeof(int));
@@ -8271,19 +9408,15 @@ static void p1_verify_cfg(void) {
 		int *sw_defer_wm = NULL, *sw_decl_wm = NULL;
 		if (sw_sz > 0 && sw_sz <= 65536) {
 			sw_defer_wm = arena_alloc(&ctx->main_arena, (size_t)sw_sz * sizeof(int));
-			sw_decl_wm  = arena_alloc(&ctx->main_arena, (size_t)sw_sz * sizeof(int));
+			sw_decl_wm = arena_alloc(&ctx->main_arena, (size_t)sw_sz * sizeof(int));
 		}
 
 		for (int i = 0; i < cnt; i++) {
 			wm_defer[i] = defer_n;
 			wm_decl[i] = decl_n;
 			switch (ents[i].kind) {
-			case P1K_DEFER:
-				defer_list[defer_n++] = i;
-				break;
-			case P1K_DECL:
-				decl_list[decl_n++] = i;
-				break;
+			case P1K_DEFER: defer_list[defer_n++] = i; break;
+			case P1K_DECL: decl_list[decl_n++] = i; break;
 			case P1K_LABEL: {
 				uint32_t lh = (uint32_t)fast_hash(ents[i].label.name, ents[i].label.len);
 				int fh_slot = lh & hash_mask;
@@ -8294,17 +9427,31 @@ static void p1_verify_cfg(void) {
 					P1FuncEntry *g = &ents[fwd[fi].idx];
 					if (g->label.len == ents[i].label.len &&
 					    !memcmp(g->label.name, ents[i].label.name, g->label.len)) {
-						uint16_t label_se = scope_stmt_expr_ancestor(ents[i].scope_id);
-						if (label_se != 0 && !scope_is_ancestor_or_self(label_se, g->scope_id))
-							error_tok(g->tok, "goto '%.*s' jumps into a statement expression "
-								  "(jumping into ({...}) is undefined behavior)",
-								  g->label.len, g->label.name);
-											g->label.exits = scope_block_exits(g->scope_id, ents[i].scope_id);
-						cfg_check_range(ents, g, &ents[i], /*is_forward=*/true,
-								defer_list, fwd[fi].dm, defer_n,
-								decl_list, fwd[fi].cm, decl_n);
+						uint16_t label_se =
+						    scope_stmt_expr_ancestor(ents[i].scope_id);
+						if (label_se != 0 &&
+						    !scope_is_ancestor_or_self(label_se, g->scope_id))
+							error_tok(
+							    g->tok,
+							    "goto '%.*s' jumps into a statement expression "
+							    "(jumping into ({...}) is undefined behavior)",
+							    g->label.len,
+							    g->label.name);
+						g->label.exits =
+						    scope_block_exits(g->scope_id, ents[i].scope_id);
+						cfg_check_range(ents,
+								g,
+								&ents[i],
+								/*is_forward=*/true,
+								defer_list,
+								fwd[fi].dm,
+								defer_n,
+								decl_list,
+								fwd[fi].cm,
+								decl_n);
 						if (prev_fi < 0) fwd_hash_tbl[fh_slot] = next_fi;
-						else fwd[prev_fi].next = next_fi;
+						else
+							fwd[prev_fi].next = next_fi;
 						fi = next_fi;
 						continue;
 					}
@@ -8332,31 +9479,55 @@ static void p1_verify_cfg(void) {
 					// Forward goto (label not yet seen, or found after current pos)
 					int fi = fwd_n++;
 					int fh_slot = h & hash_mask;
-					fwd[fi] = (FwdGoto){.idx = i, .dm = defer_n, .cm = decl_n,
+					fwd[fi] = (FwdGoto){.idx = i,
+							    .dm = defer_n,
+							    .cm = decl_n,
 							    .next = fwd_hash_tbl[fh_slot]};
 					fwd_hash_tbl[fh_slot] = fi;
 				} else {
 					uint16_t label_se = scope_stmt_expr_ancestor(ents[li].scope_id);
-					if (label_se != 0 && !scope_is_ancestor_or_self(label_se, g->scope_id))
-						error_tok(g->tok, "goto '%.*s' jumps into a statement expression "
+					if (label_se != 0 &&
+					    !scope_is_ancestor_or_self(label_se, g->scope_id))
+						error_tok(g->tok,
+							  "goto '%.*s' jumps into a statement expression "
 							  "(jumping into ({...}) is undefined behavior)",
-							  g->label.len, g->label.name);
-									g->label.exits = scope_block_exits(g->scope_id, ents[li].scope_id);
-					cfg_check_range(ents, g, &ents[li], /*is_forward=*/false,
-							defer_list, 0, wm_defer[li],
-							decl_list, 0, wm_decl[li]);
+							  g->label.len,
+							  g->label.name);
+					g->label.exits = scope_block_exits(g->scope_id, ents[li].scope_id);
+					cfg_check_range(ents,
+							g,
+							&ents[li],
+							/*is_forward=*/false,
+							defer_list,
+							0,
+							wm_defer[li],
+							decl_list,
+							0,
+							wm_decl[li]);
 					if (FEAT(F_DEFER))
-						cfg_error_if_looped_between(ents, g, &ents[li],
-							defer_list, wm_defer[li], defer_n, false,
-							"goto '%.*s' loops over a defer statement; "
-							"lexical defer does not execute dynamically and "
-							"the defer body will only execute once at scope exit");
-					cfg_error_if_looped_between(ents, g, &ents[li],
-						decl_list, wm_decl[li], decl_n, true,
-						"goto '%.*s' loops over a variable-length array "
-						"declaration; each iteration allocates a new VLA "
-						"without freeing the previous one, causing "
-						"unbounded stack growth");
+						cfg_error_if_looped_between(
+						    ents,
+						    g,
+						    &ents[li],
+						    defer_list,
+						    wm_defer[li],
+						    defer_n,
+						    false,
+						    "goto '%.*s' loops over a defer statement; "
+						    "lexical defer does not execute dynamically and "
+						    "the defer body will only execute once at scope exit");
+					cfg_error_if_looped_between(
+					    ents,
+					    g,
+					    &ents[li],
+					    decl_list,
+					    wm_decl[li],
+					    decl_n,
+					    true,
+					    "goto '%.*s' loops over a variable-length array "
+					    "declaration; each iteration allocates a new VLA "
+					    "without freeing the previous one, causing "
+					    "unbounded stack growth");
 				}
 				break;
 			}
@@ -8374,7 +9545,8 @@ static void p1_verify_cfg(void) {
 						  "case/default label outside any switch statement");
 				{
 					uint16_t case_se = scope_stmt_expr_ancestor(ents[i].scope_id);
-					if (case_se != 0 && sw_sid < scope_tree_count && !scope_is_ancestor_or_self(case_se, sw_sid))
+					if (case_se != 0 && sw_sid < scope_tree_count &&
+					    !scope_is_ancestor_or_self(case_se, sw_sid))
 						error_tok(ents[i].tok,
 							  "case/default label inside a statement expression "
 							  "(jumping into ({...}) is undefined behavior)");
@@ -8386,9 +9558,11 @@ static void p1_verify_cfg(void) {
 				if (FEAT(F_DEFER)) {
 					for (int di = sw_dm; di < defer_n; di++) {
 						P1FuncEntry *d = &ents[defer_list[di]];
-						if (!scope_is_ancestor_or_self(d->scope_id, ents[i].scope_id)) continue;
+						if (!scope_is_ancestor_or_self(d->scope_id, ents[i].scope_id))
+							continue;
 						if (d->scope_id > 0 && d->scope_id < scope_tree_count &&
-						    scope_tree[d->scope_id].close_tok_idx < ents[i].token_index)
+						    scope_tree[d->scope_id].close_tok_idx <
+							ents[i].token_index)
 							continue;
 						error_tok(d->tok,
 							  "defer skipped by switch fallthrough at %s:%d",
@@ -8400,8 +9574,12 @@ static void p1_verify_cfg(void) {
 				// Decl bypass: VLA skip is always fatal (C99/C11 6.8.6.1);
 				for (int di = sw_cm; di < decl_n; di++) {
 					P1FuncEntry *d = &ents[decl_list[di]];
-					if (!scope_is_ancestor_or_self(d->scope_id, ents[i].scope_id)) continue;
-					{ uint32_t close = decl_effective_close(d); if (close > 0 && close < ents[i].token_index) continue; }
+					if (!scope_is_ancestor_or_self(d->scope_id, ents[i].scope_id))
+						continue;
+					{
+						uint32_t close = decl_effective_close(d);
+						if (close > 0 && close < ents[i].token_index) continue;
+					}
 					if (d->decl.is_vla)
 						error_tok(ents[i].tok,
 							  "case/default label may bypass VLA declaration");
@@ -8411,10 +9589,11 @@ static void p1_verify_cfg(void) {
 							    "case/default label may bypass declaration with "
 							    "initializer (undefined if jumped into)");
 					if (!FEAT(F_ZEROINIT)) continue;
-					SAFETY_DIAG(ents[i].tok,
-						    "case/default label inside a nested block within a switch "
-						    "may bypass zero-initialization (move the label to the "
-						    "switch body or wrap in its own block)");
+					SAFETY_DIAG(
+					    ents[i].tok,
+					    "case/default label inside a nested block within a switch "
+					    "may bypass zero-initialization (move the label to the "
+					    "switch body or wrap in its own block)");
 				}
 				break;
 			}
@@ -8425,8 +9604,10 @@ static void p1_verify_cfg(void) {
 			for (int s = 0; s <= hash_mask; s++) {
 				int fi = fwd_hash_tbl[s];
 				if (fi >= 0) {
-					error_tok(ents[fwd[fi].idx].tok, "goto target label '%.*s' not found in scope",
-						  ents[fwd[fi].idx].label.len, ents[fwd[fi].idx].label.name);
+					error_tok(ents[fwd[fi].idx].tok,
+						  "goto target label '%.*s' not found in scope",
+						  ents[fwd[fi].idx].label.len,
+						  ents[fwd[fi].idx].label.name);
 					break;
 				}
 			}
@@ -8477,9 +9658,10 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 		emit_system_includes();
 	}
 
-	// MSVC lacks __builtin_expect / __builtin_trap — fall back to __debugbreak + abort.
-	// We do NOT #include <stddef.h> / <stdlib.h>: in flatten mode the output is
-	// call site. MSVC gets `unsigned __int64` (matches LLP64 size_t on x64).
+	// MSVC lacks __builtin_expect / __builtin_trap — fall back to __debugbreak +
+	// abort. We do NOT #include <stddef.h> / <stdlib.h>: in flatten mode the
+	// output is call site. MSVC gets `unsigned __int64` (matches LLP64 size_t on
+	// x64).
 	if (FEAT(F_BOUNDS_CHECK)) {
 		// Tag every '[' inside sizeof/_Alignof/typeof/offsetof so Pass 2
 		p1_mark_uneval_brackets();
@@ -8487,14 +9669,17 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 			OUT_LIT("\n"
 				"typedef unsigned __int64 __prism_bchk_size_t;\n"
 				"void __cdecl abort(void);\n"
-				"static __forceinline __prism_bchk_size_t __prism_bchk(__prism_bchk_size_t __i, __prism_bchk_size_t __n) {\n"
+				"static __forceinline __prism_bchk_size_t "
+				"__prism_bchk(__prism_bchk_size_t "
+				"__i, __prism_bchk_size_t __n) {\n"
 				"    if (__i >= __n) { __debugbreak(); abort(); }\n"
 				"    return __i;\n"
 				"}\n");
 		} else {
 			OUT_LIT("\n"
 				"typedef unsigned long long __prism_bchk_size_t;\n"
-				"static inline __attribute__((always_inline)) __prism_bchk_size_t __prism_bchk(__prism_bchk_size_t __i, __prism_bchk_size_t __n) {\n"
+				"static inline __attribute__((always_inline)) __prism_bchk_size_t "
+				"__prism_bchk(__prism_bchk_size_t __i, __prism_bchk_size_t __n) {\n"
 				"    if (__builtin_expect(__i >= __n, 0)) __builtin_trap();\n"
 				"    return __i;\n"
 				"}\n");
@@ -8522,8 +9707,7 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 
 		Token *next;
 		uint32_t tag = tok->tag;
-		if (match_ch(tok, '?'))
-			ternary_depth++;
+		if (match_ch(tok, '?')) ternary_depth++;
 
 #define DISPATCH(handler)                                                                                    \
 	{                                                                                                    \
@@ -8539,18 +9723,24 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 				goto slow_path;
 			if (__builtin_expect(FEAT(F_BOUNDS_CHECK), 0)) {
 				Token *bc_da = try_bounds_check_deref_add(tok);
-				if (bc_da) { tok = bc_da; continue; }
+				if (bc_da) {
+					tok = bc_da;
+					continue;
+				}
 			}
 			track_common_token_state(tok);
 			tok = emit_advance(tok);
 			continue;
 		}
-		slow_path:
+	slow_path:
 
-		{
-			Token *next = emit_gnu_label_decl(tok);
-			if (next) { tok = next; continue; }
+	{
+		Token *next = emit_gnu_label_decl(tok);
+		if (next) {
+			tok = next;
+			continue;
 		}
+	}
 
 		if (ctx->at_stmt_start && !(tag & TT_STRUCTURAL) &&
 		    (!ctrl_state.pending || in_for_init() || ctrl_state.parens_just_closed)) {
@@ -8562,27 +9752,13 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 			}
 
 			check_enum_typedef_defer_shadow(tok);
-					if (FEAT(F_ORELSE) && ctx->block_depth > 0 && !in_struct_body() &&
+			if (FEAT(F_ORELSE) && ctx->block_depth > 0 && !in_struct_body() &&
 			    !(tok->tag & (TT_NON_EXPR_STMT | TT_DEFER))) {
-				Token *orelse_scan_start = tok;
-				Token *label_end = NULL;
-				if (is_identifier_like(tok)) {
-					Token *colon = skip_noise(tok_next(tok));
-					if (colon && match_ch(colon, ':') &&
-					    !(tok_next(colon) && match_ch(tok_next(colon), ':'))) {
-						label_end = tok_next(colon);
-						orelse_scan_start = label_end;
-					}
-				}
-				Token *orelse_tok = find_bare_orelse(orelse_scan_start);
+				Token *body = skip_stmt_prefixes(tok);
+				Token *orelse_tok = find_bare_orelse(body);
 				if (orelse_tok) {
 					reject_orelse_in_for_init(tok);
-					if (label_end) {
-						/* Emit label name + any attrs through ':'. */
-						for (Token *t = tok; t != label_end; t = tok_next(t))
-							emit_tok(t);
-						tok = label_end;
-					}
+					tok = emit_through(tok, body);
 
 					bool brace_wrap = ctrl_state.pending && ctrl_state.parens_just_closed;
 					if (brace_wrap) ctrl_reset();
@@ -8603,27 +9779,33 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 		}
 		ctx->at_stmt_start = false;
 		if (tag & TT_NORETURN_FN) {
-		    uint32_t ti = tok_idx(tok);
-		    if (!(ti >= 1 && (token_pool[ti - 1].tag & TT_MEMBER))) {
-			if (FEAT(F_DEFER) && has_active_defers())
-				fprintf(stderr,
-					"%s:%d: warning: '%.*s' referenced with active defers (defers "
-					"will not run if called)\n",
-					tok_file(tok)->name,
-					tok_line_no(tok),
-					tok->len,
-					tok_loc(tok));
-			if (FEAT(F_AUTO_UNREACHABLE) && ctx->block_depth > 0 &&
-			    !in_ctrl_paren() &&
-			    !(ctrl_state.pending && ctrl_state.parens_just_closed)) {
-				Token *nr = try_detect_noreturn_call(tok);
-				if (nr) pending_unreachable_tok = nr;
+			uint32_t ti = tok_idx(tok);
+			if (!(ti >= 1 && (token_pool[ti - 1].tag & TT_MEMBER))) {
+				if (FEAT(F_DEFER) && has_active_defers())
+					fprintf(
+					    stderr,
+					    "%s:%d: warning: '%.*s' referenced with active defers (defers "
+					    "will not run if called)\n",
+					    tok_file(tok)->name,
+					    tok_line_no(tok),
+					    tok->len,
+					    tok_loc(tok));
+				if (FEAT(F_AUTO_UNREACHABLE) && ctx->block_depth > 0 && !in_ctrl_paren() &&
+				    !(ctrl_state.pending && ctrl_state.parens_just_closed)) {
+					Token *nr = try_detect_noreturn_call(tok);
+					if (nr) pending_unreachable_tok = nr;
+				}
 			}
-		    }
 		}
 
 		if (tag) {
-			{ Token *n = try_handle_defer_flow_kw(tok); if (n) { tok = n; continue; } }
+			{
+				Token *n = try_handle_defer_flow_kw(tok);
+				if (n) {
+					tok = n;
+					continue;
+				}
+			}
 			arm_ctrl_pending_from_tag(tok, tag);
 			if ((tag & TT_GENERIC) && !in_generic()) {
 				tok = emit_generic_open(tok);
@@ -8631,8 +9813,7 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 			}
 		} // end if (tag)
 
-		if (tag & (TT_CASE | TT_DEFAULT))
-			pending_case_colon = true;
+		if (tag & (TT_CASE | TT_DEFAULT)) pending_case_colon = true;
 		track_generic_token(tok);
 		if (tag & TT_SUE) // struct/union/enum body
 			DISPATCH(handle_sue_body);
@@ -8647,24 +9828,28 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 						if (fm->ret_type_start) {
 							ctx->func_ret_type_start = fm->ret_type_start;
 							ctx->func_ret_type_end = fm->ret_type_end;
-							ctx->func_ret_type_suffix_start = fm->ret_type_suffix_start;
-							ctx->func_ret_type_suffix_end = fm->ret_type_suffix_end;
-						} else clear_func_ret_type();
-					} else clear_func_ret_type();
+							ctx->func_ret_type_suffix_start =
+							    fm->ret_type_suffix_start;
+							ctx->func_ret_type_suffix_end =
+							    fm->ret_type_suffix_end;
+						} else
+							clear_func_ret_type();
+					} else
+						clear_func_ret_type();
 				}
 				tok = handle_open_brace(tok);
 				continue;
 			}
 			if (match_ch(tok, '}')) {
 				tok = handle_close_brace(tok);
-				if (ctx->block_depth == 0)
-					current_func_idx = -1;
+				if (ctx->block_depth == 0) current_func_idx = -1;
 				continue;
 			}
 			char c = tok->ch0;
 			if (c == ';') {
 				if (in_ctrl_paren() || in_for_init()) track_ctrl_semicolon();
-				else end_statement_after_semicolon();
+				else
+					end_statement_after_semicolon();
 				bool is_unreachable_target = (tok == pending_unreachable_tok);
 				tok = emit_advance(tok);
 				if (is_unreachable_target) {
@@ -8673,8 +9858,8 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 				}
 				continue;
 			}
-			if (c == ':' &&
-			    consume_stmt_colon(&tok, &ternary_depth, &pending_case_colon, COLON_REQUIRE_BLOCK))
+			if (c == ':' && consume_stmt_colon(
+					    &tok, &ternary_depth, &pending_case_colon, COLON_REQUIRE_BLOCK))
 				continue;
 		}
 
@@ -8685,14 +9870,23 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 		}
 
 		track_common_token_state(tok);
-		{ Token *next = try_orelse_expr_rewrites(tok); if (next) { tok = next; continue; } }
+		{
+			Token *next = try_orelse_expr_rewrites(tok);
+			if (next) {
+				tok = next;
+				continue;
+			}
+		}
 
 		if (__builtin_expect(FEAT(F_ORELSE) && is_orelse_keyword(tok), 0))
 			error_tok(tok, ERR_ORELSE_STMT_LEVEL);
 		// Declarator brackets are tagged P1_DECL_BRACKET in Phase 1 and skipped.
 		{
 			Token *bc = try_bounds_checks(tok);
-			if (bc) { tok = bc; continue; }
+			if (bc) {
+				tok = bc;
+				continue;
+			}
 		}
 
 		tok = emit_advance(tok);
@@ -8710,6 +9904,7 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 	tokenizer_teardown(false);
 	return 1;
 }
+
 static Token *preprocess_and_tokenize(char *input_file, double *pp_ms, double *tok_ms) {
 	double t0 = prism_now_ms();
 	char *pp_buf = preprocess_with_cc(input_file);
@@ -8729,35 +9924,49 @@ static Token *preprocess_and_tokenize(char *input_file, double *pp_ms, double *t
 	}
 	return tok;
 }
+
 static int transpile_to_fp(char *input_file, FILE *fp) {
 	ensure_keyword_cache();
 	double t0 = prism_now_ms();
 	double pp_ms = 0.0, tok_ms = 0.0;
 	Token *tok = preprocess_and_tokenize(input_file, &pp_ms, &tok_ms);
-	if (!tok) { fclose(fp); return 0; }
+	if (!tok) {
+		fclose(fp);
+		return 0;
+	}
 
 	double t1 = prism_now_ms();
 	int ok = transpile_tokens(tok, fp);
 	double t2 = prism_now_ms();
 	if (prism_profile) {
 		fprintf(stderr,
-		        "[prism-prof] file=%s preprocess=%.3fms tokenize=%.3fms transpile=%.3fms total=%.3fms\n",
-		        input_file, pp_ms, tok_ms, (t2 - t1), (t2 - t0));
+			"[prism-prof] file=%s preprocess=%.3fms tokenize=%.3fms "
+			"transpile=%.3fms total=%.3fms\n",
+			input_file,
+			pp_ms,
+			tok_ms,
+			(t2 - t1),
+			(t2 - t0));
 	}
 	return ok;
 }
+
 static int transpile(char *input_file, char *output_file) {
 	FILE *fp = fopen(output_file, "w");
 	if (!fp) return 0;
 	return transpile_to_fp(input_file, fp);
 }
+
 static int transpile_to_stdout(char *input_file) {
 #ifdef _WIN32
 	char temp[PATH_MAX];
 	int fd = make_temp_file_registered(temp, sizeof(temp), NULL, 0, input_file);
 	if (fd < 0) return 0;
 	FILE *wfp = fdopen(fd, "w");
-	if (!wfp) { close(fd); return 0; }
+	if (!wfp) {
+		close(fd);
+		return 0;
+	}
 	if (!transpile_to_fp(input_file, wfp)) {
 		remove(temp);
 		return 0;
@@ -8766,8 +9975,7 @@ static int transpile_to_stdout(char *input_file) {
 	if (f) {
 		char buf[4096];
 		size_t n;
-		while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
-			fwrite(buf, 1, n, stdout);
+		while ((n = fread(buf, 1, sizeof(buf), f)) > 0) fwrite(buf, 1, n, stdout);
 		fclose(f);
 	}
 	remove(temp);
@@ -8805,7 +10013,11 @@ PRISM_API void prism_reset(void) {
 
 PRISM_API void prism_thread_cleanup(void) {
 	if (!ctx) return;
-	if (out_fp) { out_flush(); fclose(out_fp); out_fp = NULL; }
+	if (out_fp) {
+		out_flush();
+		fclose(out_fp);
+		out_fp = NULL;
+	}
 	out_buf_pos = 0;
 	tokenizer_teardown(true);
 	memset(&typedef_table, 0, sizeof(typedef_table));
@@ -8817,27 +10029,44 @@ PRISM_API void prism_thread_cleanup(void) {
 	use_linemarkers = false;
 	defer_count = 0;
 	defer_shadow_count = 0;
-	free(scope_stack); scope_stack = NULL; scope_stack_cap = 0;
-	free(defer_stack); defer_stack = NULL; defer_stack_cap = 0;
-	free(defer_shadows); defer_shadows = NULL; defer_shadow_cap = 0;
+	free(scope_stack);
+	scope_stack = NULL;
+	scope_stack_cap = 0;
+	free(defer_stack);
+	defer_stack = NULL;
+	defer_stack_cap = 0;
+	free(defer_shadows);
+	defer_shadows = NULL;
+	defer_shadow_cap = 0;
 	for (int i = 0; i < pp_define_bufs_cap; i++) free(pp_define_bufs[i]);
-	free(pp_define_bufs); pp_define_bufs = NULL; pp_define_bufs_cap = 0;
+	free(pp_define_bufs);
+	pp_define_bufs = NULL;
+	pp_define_bufs_cap = 0;
 	memset(&ctrl_state, 0, sizeof(ctrl_state));
-	free(ctrl_save_stack); ctrl_save_stack = NULL; ctrl_save_cap = 0; ctrl_save_depth = 0;
+	free(ctrl_save_stack);
+	ctrl_save_stack = NULL;
+	ctrl_save_cap = 0;
+	ctrl_save_depth = 0;
 	in_defer_emit = false;
 	goto_entry_cursor = 0;
 	current_func_idx = -1;
-	free(sos_do_if_save); sos_do_if_save = NULL;
-	free(sos_do_tn_save); sos_do_tn_save = NULL;
-	free(sos_do_snap_start); sos_do_snap_start = NULL;
+	free(sos_do_if_save);
+	sos_do_if_save = NULL;
+	free(sos_do_tn_save);
+	sos_do_tn_save = NULL;
+	free(sos_do_snap_start);
+	sos_do_snap_start = NULL;
 	sos_do_cap = 0;
-	free(sos_do_snap_buf); sos_do_snap_buf = NULL;
+	free(sos_do_snap_buf);
+	sos_do_snap_buf = NULL;
 	sos_snap_cap = 0;
-	free(sos_if_trail_snap); sos_if_trail_snap = NULL;
+	free(sos_if_trail_snap);
+	sos_if_trail_snap = NULL;
 	sos_if_cap = 0;
 	free(ctx);
 	ctx = NULL;
 }
+
 static void apply_features(PrismFeatures features) {
 	ctx->features = features_to_bits(features);
 	ctx->extra_compiler = features.compiler;
@@ -8858,6 +10087,7 @@ static void error_recovery_init(void) {
 	ctx->error_col = 0;
 	ctx->error_jmp_set = true;
 }
+
 static PrismResult error_recovery_result(void) {
 	ctx->error_jmp_set = false;
 	PrismResult r = {.status = PRISM_ERR_SYNTAX,
@@ -8865,8 +10095,14 @@ static PrismResult error_recovery_result(void) {
 			 .error_line = ctx->error_line,
 			 .error_col = ctx->error_col};
 	// IMPORTANT: fclose must precede free — POSIX open_memstream only
-	if (out_fp) { fclose(out_fp); out_fp = NULL; }
-	if (ctx->active_membuf) { free(ctx->active_membuf); ctx->active_membuf = NULL; }
+	if (out_fp) {
+		fclose(out_fp);
+		out_fp = NULL;
+	}
+	if (ctx->active_membuf) {
+		free(ctx->active_membuf);
+		ctx->active_membuf = NULL;
+	}
 	prism_reset();
 	return r;
 }
@@ -8948,8 +10184,8 @@ cleanup:
 }
 
 #ifdef PRISM_LIB_MODE
-PRISM_API PrismResult prism_transpile_source(const char *source, const char *filename,
-                                             PrismFeatures features) {
+PRISM_API
+PrismResult prism_transpile_source(const char *source, const char *filename, PrismFeatures features) {
 	prism_ctx_init();
 	PrismResult result = {0};
 	if (!source) {
@@ -9000,29 +10236,43 @@ static inline bool has_ext(const char *f, const char *ext) {
 	size_t fl = strlen(f), el = strlen(ext);
 	return fl >= el && !strcmp(f + fl - el, ext);
 }
+
 static bool str_startswith(const char *s, const char *prefix) {
 	return strncmp(s, prefix, strlen(prefix)) == 0;
 }
+
 static bool cc_flag_takes_arg(const char *a) {
 	if (a[0] != '-' || !a[1]) return false;
 	if (!a[2]) {
 		switch (a[1]) {
-		case 'c': case 'E': case 'S': case 'v': case 'w': case 's':
-		case 'g': case 'H': case 'P': case 'p': case 'r': case 'C':
-		case 'h': case 'Q': case 'O': case 'W': case 'M': case 'd':
-			return false;
-		default:
-			return true;
+		case 'c':
+		case 'E':
+		case 'S':
+		case 'v':
+		case 'w':
+		case 's':
+		case 'g':
+		case 'H':
+		case 'P':
+		case 'p':
+		case 'r':
+		case 'C':
+		case 'h':
+		case 'Q':
+		case 'O':
+		case 'W':
+		case 'M':
+		case 'd': return false;
+		default: return true;
 		}
 	}
-	return !strcmp(a, "-include") || !strcmp(a, "-isystem") ||
-	       !strcmp(a, "-idirafter") || !strcmp(a, "-imacros") ||
-	       !strcmp(a, "-iquote") || !strcmp(a, "-iprefix") ||
-	       !strcmp(a, "-iwithprefix") || !strcmp(a, "-iwithprefixbefore") ||
-	       !strcmp(a, "-Xlinker") || !strcmp(a, "-Xpreprocessor") ||
-	       !strcmp(a, "-Xassembler") || !strcmp(a, "-target") ||
+	return !strcmp(a, "-include") || !strcmp(a, "-isystem") || !strcmp(a, "-idirafter") ||
+	       !strcmp(a, "-imacros") || !strcmp(a, "-iquote") || !strcmp(a, "-iprefix") ||
+	       !strcmp(a, "-iwithprefix") || !strcmp(a, "-iwithprefixbefore") || !strcmp(a, "-Xlinker") ||
+	       !strcmp(a, "-Xpreprocessor") || !strcmp(a, "-Xassembler") || !strcmp(a, "-target") ||
 	       !strcmp(a, "-arch");
 }
+
 static int dep_flag_kind(const char *a) {
 	if (a[1] == 'M') {
 		if (!strcmp(a, "-MD") || !strcmp(a, "-MMD") || !strcmp(a, "-MP")) return 1;
@@ -9030,12 +10280,13 @@ static int dep_flag_kind(const char *a) {
 	}
 	if (a[1] == 'W' && a[2] == 'p' && a[3] == ',') {
 		const char *v = a + 4;
-		if (strstr(v, "-MD") || strstr(v, "-MMD") || strstr(v, "-MF") ||
-		    strstr(v, "-MT") || strstr(v, "-MQ") || strstr(v, "-MP"))
+		if (strstr(v, "-MD") || strstr(v, "-MMD") || strstr(v, "-MF") || strstr(v, "-MT") ||
+		    strstr(v, "-MQ") || strstr(v, "-MP"))
 			return 1;
 	}
 	return 0;
 }
+
 static Cli cli_parse(int argc, char **argv) {
 	Cli cli = {.features = prism_defaults()};
 	for (int i = 1; i < argc; i++) {
@@ -9051,9 +10302,18 @@ static Cli cli_parse(int argc, char **argv) {
 #else
 		if (a[0] != '-' || !a[1]) {
 #endif
-			if (!strcmp(a, "run"))       { cli.mode = CLI_RUN; continue; }
-			if (!strcmp(a, "transpile")) { cli.mode = CLI_EMIT; continue; }
-			if (!strcmp(a, "install"))   { cli.mode = CLI_INSTALL; continue; }
+			if (!strcmp(a, "run")) {
+				cli.mode = CLI_RUN;
+				continue;
+			}
+			if (!strcmp(a, "transpile")) {
+				cli.mode = CLI_EMIT;
+				continue;
+			}
+			if (!strcmp(a, "install")) {
+				cli.mode = CLI_INSTALL;
+				continue;
+			}
 			if (!cli.passthrough && (has_ext(a, ".c") || has_ext(a, ".i"))) {
 				CLI_PUSH(cli.sources, cli.source_count, cli.source_cap, a);
 				continue;
@@ -9066,13 +10326,32 @@ static Cli cli_parse(int argc, char **argv) {
 		// -- MSVC-style flags (start with /) --
 		if (a[0] == '/') {
 			// /Fe:output or /Fe output — MSVC output name
-			if (strncmp(a, "/Fe:", 4) == 0) { cli.output = a + 4; continue; }
-			if (strncmp(a, "/Fe", 3) == 0 && a[3]) { cli.output = a + 3; continue; }
-			if (strcmp(a, "/Fe") == 0 && i + 1 < argc) { cli.output = argv[++i]; continue; }
+			if (strncmp(a, "/Fe:", 4) == 0) {
+				cli.output = a + 4;
+				continue;
+			}
+			if (strncmp(a, "/Fe", 3) == 0 && a[3]) {
+				cli.output = a + 3;
+				continue;
+			}
+			if (strcmp(a, "/Fe") == 0 && i + 1 < argc) {
+				cli.output = argv[++i];
+				continue;
+			}
 			// /Fo:output — MSVC object output
-			if (strncmp(a, "/Fo:", 4) == 0) { cli.output = a + 4; cli.compile_only = true; continue; }
-			if (strncmp(a, "/Fo", 3) == 0 && a[3]) { cli.output = a + 3; cli.compile_only = true; continue; }
-			if (strcmp(a, "/c") == 0) { cli.compile_only = true; }
+			if (strncmp(a, "/Fo:", 4) == 0) {
+				cli.output = a + 4;
+				cli.compile_only = true;
+				continue;
+			}
+			if (strncmp(a, "/Fo", 3) == 0 && a[3]) {
+				cli.output = a + 3;
+				cli.compile_only = true;
+				continue;
+			}
+			if (strcmp(a, "/c") == 0) {
+				cli.compile_only = true;
+			}
 			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
 			continue;
 		}
@@ -9084,32 +10363,91 @@ static Cli cli_parse(int argc, char **argv) {
 		}
 
 		if (a[1] == '-') {
-			if (!strcmp(a, "--help"))               { cli.action = CLI_ACT_HELP; return cli; }
-			if (!strcmp(a, "--version"))            { cli.action = CLI_ACT_VERSION; return cli; }
-			if (str_startswith(a, "--prism-cc="))   { cli.cc = a + 11; continue; }
-			if (!strcmp(a, "--prism-verbose"))       { cli.verbose = true; continue; }
-			if (!strcmp(a, "--prism-prof"))          { cli.profile = true; continue; }
-			if (str_startswith(a, "--prism-emit=")) { cli.mode = CLI_EMIT; cli.output = a + 13; continue; }
-			if (!strcmp(a, "--prism-emit"))          { cli.mode = CLI_EMIT; continue; }
+			if (!strcmp(a, "--help")) {
+				cli.action = CLI_ACT_HELP;
+				return cli;
+			}
+			if (!strcmp(a, "--version")) {
+				cli.action = CLI_ACT_VERSION;
+				return cli;
+			}
+			if (str_startswith(a, "--prism-cc=")) {
+				cli.cc = a + 11;
+				continue;
+			}
+			if (!strcmp(a, "--prism-verbose")) {
+				cli.verbose = true;
+				continue;
+			}
+			if (!strcmp(a, "--prism-prof")) {
+				cli.profile = true;
+				continue;
+			}
+			if (str_startswith(a, "--prism-emit=")) {
+				cli.mode = CLI_EMIT;
+				cli.output = a + 13;
+				continue;
+			}
+			if (!strcmp(a, "--prism-emit")) {
+				cli.mode = CLI_EMIT;
+				continue;
+			}
 		} else if (a[1] == 'h' && !a[2]) {
-			cli.action = CLI_ACT_HELP; return cli;
+			cli.action = CLI_ACT_HELP;
+			return cli;
 		} else if (a[1] == 'c' && !a[2]) {
 			cli.compile_only = true;
 		} else if (a[1] == 'E' && !a[2]) {
 			cli.passthrough = true;
 		} else if (a[1] == 'f') {
-			if (!strcmp(a, "-fno-defer"))            { cli.features.defer = false; continue; }
-			if (!strcmp(a, "-fno-zeroinit"))         { cli.features.zeroinit = false; continue; }
-			if (!strcmp(a, "-fno-orelse"))           { cli.features.orelse = false; continue; }
-			if (!strcmp(a, "-fno-line-directives"))  { cli.features.line_directives = false; continue; }
-			if (!strcmp(a, "-fno-safety"))           { cli.features.warn_safety = true; continue; }
-			if (!strcmp(a, "-fflatten-headers"))     { cli.features.flatten_headers = true; continue; }
-			if (!strcmp(a, "-fno-flatten-headers"))  { cli.features.flatten_headers = false; continue; }
-			if (!strcmp(a, "-fno-auto-unreachable")) { cli.features.auto_unreachable = false; continue; }
-			if (!strcmp(a, "-fno-auto-static"))      { cli.features.auto_static = false; continue; }
-			if (!strcmp(a, "-fbounds-check"))        { cli.features.bounds_check = true; continue; }
-			if (!strcmp(a, "-fno-bounds-check"))     { cli.features.bounds_check = false; continue; }
-			if (!strcmp(a, "-fno-link-pragma"))      { cli.no_link_pragma = true; continue; }
+			if (!strcmp(a, "-fno-defer")) {
+				cli.features.defer = false;
+				continue;
+			}
+			if (!strcmp(a, "-fno-zeroinit")) {
+				cli.features.zeroinit = false;
+				continue;
+			}
+			if (!strcmp(a, "-fno-orelse")) {
+				cli.features.orelse = false;
+				continue;
+			}
+			if (!strcmp(a, "-fno-line-directives")) {
+				cli.features.line_directives = false;
+				continue;
+			}
+			if (!strcmp(a, "-fno-safety")) {
+				cli.features.warn_safety = true;
+				continue;
+			}
+			if (!strcmp(a, "-fflatten-headers")) {
+				cli.features.flatten_headers = true;
+				continue;
+			}
+			if (!strcmp(a, "-fno-flatten-headers")) {
+				cli.features.flatten_headers = false;
+				continue;
+			}
+			if (!strcmp(a, "-fno-auto-unreachable")) {
+				cli.features.auto_unreachable = false;
+				continue;
+			}
+			if (!strcmp(a, "-fno-auto-static")) {
+				cli.features.auto_static = false;
+				continue;
+			}
+			if (!strcmp(a, "-fbounds-check")) {
+				cli.features.bounds_check = true;
+				continue;
+			}
+			if (!strcmp(a, "-fno-bounds-check")) {
+				cli.features.bounds_check = false;
+				continue;
+			}
+			if (!strcmp(a, "-fno-link-pragma")) {
+				cli.no_link_pragma = true;
+				continue;
+			}
 		} else {
 			int dk = dep_flag_kind(a);
 			if (dk) {
@@ -9127,6 +10465,7 @@ static Cli cli_parse(int argc, char **argv) {
 
 	return cli;
 }
+
 static void cli_free(Cli *cli) {
 	free(cli->sources);
 	free(cli->cc_args);
@@ -9190,11 +10529,19 @@ static int transpile_and_compile(char *input_file, char **compile_argv, bool ver
 	double t3 = prism_now_ms();
 	if (prism_profile) {
 		fprintf(stderr,
-		        "[prism-prof] file=%s preprocess=%.3fms tokenize=%.3fms transpile=%.3fms cc_wait=%.3fms total=%.3fms\n",
-		        input_file, pp_ms, tok_ms, (t2 - t1), (t3 - t2), (t3 - t0));
+			"[prism-prof] file=%s preprocess=%.3fms tokenize=%.3fms "
+			"transpile=%.3fms "
+			"cc_wait=%.3fms total=%.3fms\n",
+			input_file,
+			pp_ms,
+			tok_ms,
+			(t2 - t1),
+			(t3 - t2),
+			(t3 - t0));
 	}
 	return rc;
 }
+
 static noreturn void die(char *message) {
 	fprintf(stderr, "%s\n", message);
 	exit(1);
@@ -9228,6 +10575,7 @@ static bool get_self_exe_path(char *buf, size_t bufsize) {
 #endif
 	return false;
 }
+
 static const char *get_install_path(void) {
 #ifndef _WIN32
 	const char *prefix = getenv("PREFIX");
@@ -9239,6 +10587,7 @@ static const char *get_install_path(void) {
 #endif
 	return INSTALL_PATH;
 }
+
 static bool ensure_install_dir(const char *p) {
 	char dir[PATH_MAX];
 	strncpy(dir, p, PATH_MAX - 1);
@@ -9250,6 +10599,7 @@ static bool ensure_install_dir(const char *p) {
 	mkdir(dir, 0755);
 	return stat(dir, &st) == 0;
 }
+
 static void add_to_user_path(const char *dir) {
 	(void)dir;
 }
@@ -9262,6 +10612,7 @@ static void read_trimmed_line(char *buf, int bufsize, FILE *fp) {
 	if (len > 0 && buf[len - 1] == '\n') buf[--len] = '\0';
 	if (len > 0 && buf[len - 1] == '\r') buf[len - 1] = '\0';
 }
+
 static void check_path_shadow(const char *install_path) {
 	const char *cmd = FIND_EXE_CMD;
 	FILE *fp = popen(cmd, "r");
@@ -9297,7 +10648,8 @@ static void check_path_shadow(const char *install_path) {
 			int wlen = MultiByteToWideChar(oem_cp, 0, first_hit, -1, wide, PATH_MAX);
 			if (wlen > 0) {
 				char utf8[PATH_MAX];
-				int ulen = WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, PATH_MAX, NULL, NULL);
+				int ulen =
+				    WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, PATH_MAX, NULL, NULL);
 				if (ulen > 0) memcpy(first_hit, utf8, (size_t)ulen);
 			}
 		}
@@ -9317,6 +10669,7 @@ static void check_path_shadow(const char *install_path) {
 			first_hit);
 	}
 }
+
 static int install(char *self_path) {
 	const char *install_path = get_install_path();
 	printf("[prism] Installing to %s...\n", install_path);
@@ -9344,8 +10697,7 @@ static int install(char *self_path) {
 	if (input && !output && GetLastError() == ERROR_SHARING_VIOLATION) {
 		snprintf(old_path, sizeof(old_path), "%s.old", install_path);
 		remove(old_path); // remove any leftover from a previous update
-		if (MoveFileA(install_path, old_path))
-			output = fopen(install_path, "wb");
+		if (MoveFileA(install_path, old_path)) output = fopen(install_path, "wb");
 		else
 			old_path[0] = '\0'; // rename failed, will fall through to error
 	}
@@ -9372,16 +10724,19 @@ static int install(char *self_path) {
 				char temp_old[PATH_MAX];
 				const char *tmp = get_tmp_dir();
 				if (tmp && *tmp) {
-					snprintf(temp_old, sizeof(temp_old), "%sprism_old_%u.exe",
-						 tmp, (unsigned)GetCurrentProcessId());
-					if (MoveFileExA(old_path, temp_old,
+					snprintf(temp_old,
+						 sizeof(temp_old),
+						 "%sprism_old_%u.exe",
+						 tmp,
+						 (unsigned)GetCurrentProcessId());
+					if (MoveFileExA(old_path,
+							temp_old,
 							MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
 						MoveFileExA(temp_old, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
 						old_path[0] = '\0';
 					}
 				}
-				if (old_path[0])
-					MoveFileExA(old_path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+				if (old_path[0]) MoveFileExA(old_path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
 			}
 		}
 #endif
@@ -9425,7 +10780,8 @@ use_sudo:;
 			if (prefix && *prefix) {
 				snprintf(sudo_path, sizeof(sudo_path), "%s/bin/sudo", prefix);
 				snprintf(doas_path, sizeof(doas_path), "%s/bin/doas", prefix);
-			} else sudo_path[0] = doas_path[0] = '\0';
+			} else
+				sudo_path[0] = doas_path[0] = '\0';
 			if (access("/usr/bin/sudo", X_OK) == 0 || access("/bin/sudo", X_OK) == 0 ||
 			    (sudo_path[0] && access(sudo_path, X_OK) == 0))
 				escalate = "sudo";
@@ -9433,9 +10789,13 @@ use_sudo:;
 				 (doas_path[0] && access(doas_path, X_OK) == 0))
 				escalate = "doas";
 			if (!escalate) {
-				fprintf(stderr, "[prism] Permission denied and neither sudo nor doas found.\n"
-						"  Install as root or copy manually:\n"
-						"    cp %s %s && chmod +x %s\n", self_path, install_path, install_path);
+				fprintf(stderr,
+					"[prism] Permission denied and neither sudo nor doas found.\n"
+					"  Install as root or copy manually:\n"
+					"    cp %s %s && chmod +x %s\n",
+					self_path,
+					install_path,
+					install_path);
 				return 1;
 			}
 
@@ -9457,6 +10817,7 @@ use_sudo:;
 	check_path_shadow(install_path);
 	return 0;
 }
+
 static bool is_prism_cc(const char *cc) {
 	if (!cc || !*cc) return false;
 	const char *exe = cc_executable(cc);
@@ -9467,6 +10828,7 @@ static bool is_prism_cc(const char *cc) {
 	}
 	return false;
 }
+
 static const char *get_real_cc(const char *cc) {
 	if (!cc || !*cc || is_prism_cc(cc)) return PRISM_DEFAULT_CC;
 	const char *exe = cc_executable(cc);
@@ -9476,7 +10838,9 @@ static const char *get_real_cc(const char *cc) {
 		if (strcmp(cc_real, self_real) == 0) return PRISM_DEFAULT_CC;
 	return cc;
 }
+
 static int capture_first_line(char **argv, char *buf, size_t bufsize);
+
 static bool cc_is_clang(const char *cc) {
 #ifdef __APPLE__
 	if (!cc || !*cc || strcmp(cc, "cc") == 0 || strcmp(cc, "gcc") == 0) return true;
@@ -9499,7 +10863,11 @@ static ssize_t spawn_capture_stdout(char **argv, char *buf, size_t bufsize) {
 	int pipefd[2];
 	if (pipe(pipefd) != 0) return -1;
 	char **env = build_clean_environ();
-	if (!env) { close(pipefd[0]); close(pipefd[1]); return -1; }
+	if (!env) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return -1;
+	}
 	posix_spawn_file_actions_t actions;
 	posix_spawn_file_actions_init(&actions);
 	posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
@@ -9514,11 +10882,18 @@ static ssize_t spawn_capture_stdout(char **argv, char *buf, size_t bufsize) {
 	posix_spawn_file_actions_destroy(&actions);
 	close(pipefd[1]);
 	if (devnull >= 0) close(devnull);
-	if (err) { close(pipefd[0]); buf[0] = '\0'; return -1; }
+	if (err) {
+		close(pipefd[0]);
+		buf[0] = '\0';
+		return -1;
+	}
 	size_t total = 0;
 	while (total + 1 < bufsize) {
 		ssize_t n = read(pipefd[0], buf + total, bufsize - 1 - total);
-		if (n < 0) { if (errno == EINTR) continue; break; }
+		if (n < 0) {
+			if (errno == EINTR) continue;
+			break;
+		}
 		if (n == 0) break;
 		total += (size_t)n;
 	}
@@ -9527,13 +10902,18 @@ static ssize_t spawn_capture_stdout(char **argv, char *buf, size_t bufsize) {
 	buf[total] = '\0';
 	return (ssize_t)total;
 }
+
 static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 	ssize_t n = spawn_capture_stdout(argv, buf, bufsize);
-	if (n <= 0) { buf[0] = '\0'; return -1; }
+	if (n <= 0) {
+		buf[0] = '\0';
+		return -1;
+	}
 	char *nl = strchr(buf, '\n');
 	if (nl) *nl = '\0';
 	return 0;
 }
+
 static int capture_all_output(char **argv, char *buf, size_t bufsize) {
 	ssize_t n = spawn_capture_stdout(argv, buf, bufsize);
 	return (n > 0) ? 0 : -1;
@@ -9545,7 +10925,8 @@ static PRISM_COLD void print_help(void) {
 	       "Usage: prism [options] source.c... [-o output]\n"
 	       "       prism [options] run src.c [-- prog_args...]\n\n"
 	       "Commands:\n"
-	       "  run <src.c> [-- args]  Transpile, compile, and run (args passed to binary)\n"
+	       "  run <src.c> [-- args]  Transpile, compile, and run (args passed to "
+	       "binary)\n"
 	       "  transpile <src.c>      Output transpiled C to stdout\n"
 	       "  install [src.c...]     Install prism to %s\n\n"
 	       "Prism Flags (consumed, not passed to CC):\n"
@@ -9556,33 +10937,43 @@ static PRISM_COLD void print_help(void) {
 	       "  -fno-safety            Safety checks warn instead of error\n"
 	       "  -fflatten-headers      Flatten headers into single output\n"
 	       "  -fno-flatten-headers   Disable header flattening\n"
-	       "  -fno-auto-unreachable  Disable __builtin_unreachable after noreturn calls\n"
-	       "  -fno-auto-static       Disable auto-static for const arrays with literal inits\n"
-	       "  -fno-bounds-check      Disable runtime bounds checks on local/param array subscripts\n"
+	       "  -fno-auto-unreachable  Disable __builtin_unreachable after "
+	       "noreturn calls\n"
+	       "  -fno-auto-static       Disable auto-static for const arrays with "
+	       "literal inits\n"
+	       "  -fno-bounds-check      Disable runtime bounds checks on "
+	       "local/param array subscripts\n"
 	       "  -fno-link-pragma       Ignore #pragma link directives in source\n"
 	       "  --prism-cc=<compiler>  Use specific compiler\n"
 	       "  --prism-verbose        Show commands\n"
 	       "  --prism-prof           Print per-phase timing breakdown\n"
-	       "  --                     Separator: remaining args are passed to the binary in `run` mode\n\n"
+	       "  --                     Separator: remaining args are passed to the "
+	       "binary in `run` mode\n\n"
 	       "All other flags are passed through to CC.\n\n"
 	       "Examples:\n"
 	       "  prism foo.c -o foo                  Compile (GCC-compatible)\n"
 	       "  prism run foo.c                     Compile and run\n"
-	       "  prism -O2 run foo.c -- arg1 arg2    Compile and run with program args\n"
+	       "  prism -O2 run foo.c -- arg1 arg2    Compile and run with program "
+	       "args\n"
 	       "  prism transpile foo.c               Output transpiled C\n"
 	       "  prism -O2 -Wall foo.c -o foo        With optimization\n"
 	       "  CC=clang prism foo.c                Use clang as backend\n\n"
 	       "Link Pragma (source-embedded linker flags):\n"
 	       "  #pragma link <platform> <names...>\n"
-	       "    platform: * | macos | macos_arm64 | macos_x86_64 | linux | linux_arm64\n"
-	       "              linux_x86_64 | linux_riscv64 | windows | windows_x86_64 | windows_arm64\n"
-	       "    name:     plain name (e.g. `Cocoa`, `m`) — macOS => -framework, else -l<name>\n"
-	       "              or a literal flag starting with `-` (e.g. `-lm`, `-framework Foo`)\n\n"
+	       "    platform: * | macos | macos_arm64 | macos_x86_64 | linux | "
+	       "linux_arm64\n"
+	       "              linux_x86_64 | linux_riscv64 | windows | "
+	       "windows_x86_64 | windows_arm64\n"
+	       "    name:     plain name (e.g. `Cocoa`, `m`) — macOS => -framework, "
+	       "else -l<name>\n"
+	       "              or a literal flag starting with `-` (e.g. `-lm`, "
+	       "`-framework Foo`)\n\n"
 	       "Apache 2.0 license (c) Dawn Larsson 2026\n"
 	       "https://github.com/dawnlarsson/prism\n",
 	       PRISM_VERSION,
 	       get_install_path());
 }
+
 static void add_warn_suppress(const char **args, int *argc, bool clang, bool msvc) {
 	if (msvc) {
 		args[(*argc)++] = "/wd4100";
@@ -9602,8 +10993,10 @@ static void add_warn_suppress(const char **args, int *argc, bool clang, bool msv
 	};
 	for (int i = 0; i < (int)(sizeof(w) / sizeof(*w)); i++) args[(*argc)++] = w[i];
 	if (clang) args[(*argc)++] = "-Wno-unknown-warning-option";
-	else args[(*argc)++] = "-Wno-logical-op";
+	else
+		args[(*argc)++] = "-Wno-logical-op";
 }
+
 static void verbose_argv(char **args) {
 	fprintf(stderr, "[prism]");
 	for (int i = 0; args[i]; i++) fprintf(stderr, " %s", args[i]);
@@ -9634,18 +11027,21 @@ static const char *cli_output_path(const Cli *cli, const char *temp_exe, bool ms
 	}
 	return NULL;
 }
+
 static void argv_add_output(const char **args, int *argc, const char *out, bool msvc, bool compile_only) {
 	if (!out) return;
 	if (msvc) {
 		static PRISM_THREAD_LOCAL char flag[PATH_MAX + 8]; // cl.exe: /Fe:exe or /Fo:obj
 		if (compile_only) snprintf(flag, sizeof(flag), "/Fo:%s", out);
-		else snprintf(flag, sizeof(flag), "/Fe:%s", out);
+		else
+			snprintf(flag, sizeof(flag), "/Fe:%s", out);
 		args[(*argc)++] = flag;
 	} else {
 		args[(*argc)++] = "-o";
 		args[(*argc)++] = out;
 	}
 }
+
 static void make_run_temp(char *buf, size_t size, CliMode mode) {
 	buf[0] = '\0';
 	if (mode != CLI_RUN) return;
@@ -9653,8 +11049,10 @@ static void make_run_temp(char *buf, size_t size, CliMode mode) {
 	snprintf(buf, size, "%sprism_run.XXXXXX%s", get_tmp_dir(), EXE_SUFFIX);
 	int fd = suffix_len > 0 ? mkstemps(buf, suffix_len) : mkstemp(buf);
 	if (fd >= 0) close(fd);
-	else buf[0] = '\0';
+	else
+		buf[0] = '\0';
 }
+
 static int passthrough_cc(const Cli *cli) {
 	const char *compiler = get_real_cc(cli->cc);
 	int cc_extra = cc_extra_arg_count(compiler);
@@ -9673,6 +11071,7 @@ static int passthrough_cc(const Cli *cli) {
 	free((void *)args);
 	return st;
 }
+
 static void cleanup_temp_range(char **temps, int count) {
 	for (int i = 0; i < count; i++) {
 		remove(temps[i]);
@@ -9697,8 +11096,8 @@ static void cleanup_temp_range(char **temps, int count) {
 	free(temps);
 	signal_temps_clear();
 }
-static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count,
-					 const TempCompilePlan *plan) {
+
+static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count, const TempCompilePlan *plan) {
 	int cc_extra = cc_extra_arg_count(plan->compiler);
 	const char **args = alloc_argv(temp_count + cli->cc_arg_count + cc_extra + 24);
 	int argc = 0;
@@ -9716,8 +11115,7 @@ static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count,
 		if (plan->msvc && strncmp(cli->cc_args[i], "/std:", 5) == 0) continue;
 		args[argc++] = cli->cc_args[i];
 	}
-	if (plan->suppress_warnings)
-		add_warn_suppress(args, &argc, plan->clang, plan->msvc);
+	if (plan->suppress_warnings) add_warn_suppress(args, &argc, plan->clang, plan->msvc);
 	argv_add_output(args, &argc, plan->output, plan->msvc, plan->compile_only);
 	args[argc] = NULL;
 	if (cli->verbose) verbose_argv((char **)args);
@@ -9726,6 +11124,7 @@ static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count,
 	free((void *)args);
 	return status;
 }
+
 static const char *resolve_install_compiler(const Cli *cli) {
 #ifdef _WIN32
 	const char *cc = get_real_cc(cli->cc ? cli->cc : get_env_utf8("PRISM_CC"));
@@ -9742,6 +11141,7 @@ static const char *resolve_install_compiler(const Cli *cli) {
 #endif
 	return cc ? cc : PRISM_DEFAULT_CC;
 }
+
 static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 	char **temps = calloc(cli->source_count, sizeof(char *));
 	if (!temps) die("Out of memory");
@@ -9751,12 +11151,14 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 			temps[i] = malloc(PATH_MAX);
 			if (!temps[i]) die("Out of memory");
 			int fd = make_temp_file_registered(temps[i], PATH_MAX, NULL, 0, cli->sources[i]);
-			if (fd < 0)
-				die("Failed to create temp file");
+			if (fd < 0) die("Failed to create temp file");
 			PrismResult result = prism_transpile_file(cli->sources[i], cli->features);
 			if (result.status != PRISM_OK) {
-				fprintf(stderr, "%s:%d:%d: error: %s\n", cli->sources[i],
-					result.error_line, result.error_col,
+				fprintf(stderr,
+					"%s:%d:%d: error: %s\n",
+					cli->sources[i],
+					result.error_line,
+					result.error_col,
 					result.error_msg ? result.error_msg : "transpilation failed");
 				prism_free(&result);
 				close(fd);
@@ -9764,7 +11166,11 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 				return NULL;
 			}
 			FILE *f = fdopen(fd, "w");
-			if (!f) { prism_free(&result); close(fd); die("Failed to create temp file"); }
+			if (!f) {
+				prism_free(&result);
+				close(fd);
+				die("Failed to create temp file");
+			}
 			fwrite(result.output, 1, result.output_len, f);
 			fclose(f);
 			prism_free(&result);
@@ -9772,12 +11178,14 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 			temps[i] = malloc(512);
 			if (!temps[i]) die("Out of memory");
 			int fd = make_temp_file_registered(temps[i], 512, NULL, 0, cli->sources[i]);
-			if (fd < 0)
-				die("Failed to create temp file");
+			if (fd < 0) die("Failed to create temp file");
 			if (cli->verbose)
 				fprintf(stderr, "[prism] Transpiling %s -> %s\n", cli->sources[i], temps[i]);
 			FILE *wfp = fdopen(fd, "w");
-			if (!wfp) { close(fd); die("Failed to open temp file"); }
+			if (!wfp) {
+				close(fd);
+				die("Failed to open temp file");
+			}
 			if (!transpile_to_fp((char *)cli->sources[i], wfp)) {
 				cleanup_temp_range(temps, i + 1);
 				return NULL;
@@ -9786,6 +11194,7 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 	}
 	return temps;
 }
+
 static int install_from_source(Cli *cli) {
 	char temp_bin[PATH_MAX];
 	int suffix_len = (int)strlen(EXE_SUFFIX);
@@ -9798,11 +11207,11 @@ static int install_from_source(Cli *cli) {
 	char **temps = transpile_sources_to_temps(cli, true);
 	if (!temps) return 1;
 	TempCompilePlan plan = {
-		.compiler = cc,
-		.msvc = msvc,
-		.output = temp_bin,
-		.optimize = true,
-		.suppress_warnings = true,
+	    .compiler = cc,
+	    .msvc = msvc,
+	    .output = temp_bin,
+	    .optimize = true,
+	    .suppress_warnings = true,
 	};
 	int status = run_temp_compile_plan(cli, temps, cli->source_count, &plan);
 	cleanup_temp_range(temps, cli->source_count);
@@ -9811,35 +11220,37 @@ static int install_from_source(Cli *cli) {
 	remove(temp_bin);
 	return result;
 }
+
 static const char *host_platform_tag(void) {
 #if defined(__APPLE__)
-	#if defined(__aarch64__) || defined(__arm64__)
-		return "macos_arm64";
-	#elif defined(__x86_64__)
-		return "macos_x86_64";
-	#else
-		return "macos";
-	#endif
+#if defined(__aarch64__) || defined(__arm64__)
+	return "macos_arm64";
+#elif defined(__x86_64__)
+	return "macos_x86_64";
+#else
+	return "macos";
+#endif
 #elif defined(_WIN32) || defined(_WIN64)
-	#if defined(__aarch64__) || defined(_M_ARM64)
-		return "windows_arm64";
-	#else
-		return "windows_x86_64";
-	#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+	return "windows_arm64";
+#else
+	return "windows_x86_64";
+#endif
 #elif defined(__linux__)
-	#if defined(__aarch64__)
-		return "linux_arm64";
-	#elif defined(__x86_64__)
-		return "linux_x86_64";
-	#elif defined(__riscv)
-		return "linux_riscv64";
-	#else
-		return "linux";
-	#endif
+#if defined(__aarch64__)
+	return "linux_arm64";
+#elif defined(__x86_64__)
+	return "linux_x86_64";
+#elif defined(__riscv)
+	return "linux_riscv64";
+#else
+	return "linux";
+#endif
 #else
 	return "unknown";
 #endif
 }
+
 static bool link_pragma_platform_matches(const char *platform, size_t plen, const char *host) {
 	if (plen == 1 && platform[0] == '*') return true;
 	size_t hlen = strlen(host);
@@ -9851,6 +11262,7 @@ static bool link_pragma_platform_matches(const char *platform, size_t plen, cons
 	}
 	return false;
 }
+
 static void collect_link_pragmas_file(const char *path, Cli *cli, const char *host, bool macos) {
 	if (!path || cli->no_link_pragma) return;
 	FILE *f = fopen(path, "r");
@@ -9888,18 +11300,32 @@ static void collect_link_pragmas_file(const char *path, Cli *cli, const char *ho
 			if (tok[0] == '-') {
 				// the flag's value — we don't special-case it here;
 				char *dup = malloc(tlen + 1);
-				if (!dup) { free(line); fclose(f); die("out of memory"); }
-				memcpy(dup, tok, tlen); dup[tlen] = 0;
+				if (!dup) {
+					free(line);
+					fclose(f);
+					die("out of memory");
+				}
+				memcpy(dup, tok, tlen);
+				dup[tlen] = 0;
 				CLI_PUSH(cli->cc_args, cli->cc_arg_count, cli->cc_arg_cap, dup);
 			} else if (macos) {
 				char *dup = malloc(tlen + 1);
-				if (!dup) { free(line); fclose(f); die("out of memory"); }
-				memcpy(dup, tok, tlen); dup[tlen] = 0;
+				if (!dup) {
+					free(line);
+					fclose(f);
+					die("out of memory");
+				}
+				memcpy(dup, tok, tlen);
+				dup[tlen] = 0;
 				CLI_PUSH(cli->cc_args, cli->cc_arg_count, cli->cc_arg_cap, "-framework");
 				CLI_PUSH(cli->cc_args, cli->cc_arg_count, cli->cc_arg_cap, dup);
 			} else {
 				char *buf = malloc(tlen + 3);
-				if (!buf) { free(line); fclose(f); die("out of memory"); }
+				if (!buf) {
+					free(line);
+					fclose(f);
+					die("out of memory");
+				}
 				buf[0] = '-';
 				buf[1] = 'l';
 				memcpy(buf + 2, tok, tlen);
@@ -9912,6 +11338,7 @@ static void collect_link_pragmas_file(const char *path, Cli *cli, const char *ho
 	free(line);
 	fclose(f);
 }
+
 static void collect_link_pragmas(Cli *cli) {
 	if (cli->no_link_pragma || cli->source_count == 0) return;
 	const char *host = host_platform_tag();
@@ -9919,6 +11346,7 @@ static void collect_link_pragmas(Cli *cli) {
 	for (int i = 0; i < cli->source_count; i++)
 		collect_link_pragmas_file(cli->sources[i], cli, host, macos);
 }
+
 static int compile_sources(Cli *cli) {
 	int status = 0;
 	collect_link_pragmas(cli);
@@ -9938,7 +11366,8 @@ static int compile_sources(Cli *cli) {
 
 	use_linemarkers = FEAT(F_FLATTEN) && !clang && !msvc;
 	if (cli->source_count == 1 && !msvc) {
-		// Extract user-specified -x <lang> from cc_args (if any) for the pipe language.
+		// Extract user-specified -x <lang> from cc_args (if any) for the pipe
+		// language.
 		const char *pipe_lang = "c";
 		int x_flag_idx = -1;
 		for (int i = 0; i < cli->cc_arg_count - 1; i++) {
@@ -9959,18 +11388,30 @@ static int compile_sources(Cli *cli) {
 		args[argc++] = "-";
 		bool need_x_none = false;
 		for (int i = 0; i < cli->cc_arg_count; i++) {
-			if (i == x_flag_idx) { i++; continue; }
+			if (i == x_flag_idx) {
+				i++;
+				continue;
+			}
 			const char *a = cli->cc_args[i];
-			if (a[0] != '-') { need_x_none = true; break; }
-			if (strcmp(a, "-o") == 0 || strcmp(a, "-MF") == 0 ||
-			    strcmp(a, "-MQ") == 0 || strcmp(a, "-MT") == 0) { i++; continue; }
+			if (a[0] != '-') {
+				need_x_none = true;
+				break;
+			}
+			if (strcmp(a, "-o") == 0 || strcmp(a, "-MF") == 0 || strcmp(a, "-MQ") == 0 ||
+			    strcmp(a, "-MT") == 0) {
+				i++;
+				continue;
+			}
 		}
 		if (need_x_none) {
 			args[argc++] = "-x";
 			args[argc++] = "none";
 		}
 		for (int i = 0; i < cli->cc_arg_count; i++) {
-			if (i == x_flag_idx) { i++; continue; } // skip extracted -x <lang>
+			if (i == x_flag_idx) {
+				i++;
+				continue;
+			} // skip extracted -x <lang>
 			args[argc++] = cli->cc_args[i];
 		}
 		add_warn_suppress(args, &argc, clang, false);
@@ -9984,13 +11425,13 @@ static int compile_sources(Cli *cli) {
 		char **temps = transpile_sources_to_temps(cli, false);
 		if (!temps) die("Transpilation failed");
 		TempCompilePlan plan = {
-			.compiler = compiler,
-			.clang = clang,
-			.msvc = msvc,
-			.output = cli_output_path(cli, temp_exe, msvc),
-			.compile_only = cli->compile_only,
-			.suppress_warnings = true,
-			.use_preprocessed = FEAT(F_FLATTEN) && !clang && !msvc,
+		    .compiler = compiler,
+		    .clang = clang,
+		    .msvc = msvc,
+		    .output = cli_output_path(cli, temp_exe, msvc),
+		    .compile_only = cli->compile_only,
+		    .suppress_warnings = true,
+		    .use_preprocessed = FEAT(F_FLATTEN) && !clang && !msvc,
 		};
 		status = run_temp_compile_plan(cli, temps, cli->source_count, &plan);
 		cleanup_temp_range(temps, cli->source_count);
@@ -10006,8 +11447,7 @@ static int compile_sources(Cli *cli) {
 		const char **run = alloc_argv(2 + cli->prog_arg_count);
 		int rc = 0;
 		run[rc++] = temp_exe;
-		for (int i = 0; i < cli->prog_arg_count; i++)
-			run[rc++] = cli->prog_args[i];
+		for (int i = 0; i < cli->prog_arg_count; i++) run[rc++] = cli->prog_args[i];
 		run[rc] = NULL;
 		if (cli->verbose) {
 			fprintf(stderr, "[prism] Running %s", temp_exe);
@@ -10023,20 +11463,23 @@ static int compile_sources(Cli *cli) {
 	signal_temp_store(0);
 	return status;
 }
+
 static void signal_cleanup_handler(int sig) {
 #ifdef _WIN32
-	if (out_fp) { fflush(out_fp); win32_real_fclose(out_fp); out_fp = NULL; }
+	if (out_fp) {
+		fflush(out_fp);
+		win32_real_fclose(out_fp);
+		out_fp = NULL;
+	}
 	if (win32_memstream_fp) {
 		win32_real_fclose(win32_memstream_fp);
 		win32_memstream_fp = NULL;
 	}
 #endif
-	if (signal_temp_load() && signal_temp_path[0])
-		unlink(signal_temp_path);
+	if (signal_temp_load() && signal_temp_path[0]) unlink(signal_temp_path);
 	int n = signal_temps_load();
 	for (int i = 0; i < n; i++)
-		if (signal_temps_ready_load(i) && signal_temps[i][0] != '\0')
-			unlink(signal_temps[i]);
+		if (signal_temps_ready_load(i) && signal_temps[i][0] != '\0') unlink(signal_temps[i]);
 	signal(sig, SIG_DFL);
 	raise(sig);
 }
@@ -10047,7 +11490,8 @@ int main(int argc, char **argv) {
 #endif
 	signal(SIGINT, signal_cleanup_handler);
 	signal(SIGTERM, signal_cleanup_handler);
-	signal(SIGPIPE, SIG_IGN); // no-op on Windows (SIGPIPE defined but never raised)
+	signal(SIGPIPE,
+	       SIG_IGN); // no-op on Windows (SIGPIPE defined but never raised)
 	int status = 0;
 	prism_ctx_init();
 	if (argc < 2) {
@@ -10057,7 +11501,11 @@ int main(int argc, char **argv) {
 
 	Cli cli = cli_parse(argc, argv);
 	prism_profile = cli.profile;
-	if (cli.action == CLI_ACT_HELP) { print_help(); cli_free(&cli); return 0; }
+	if (cli.action == CLI_ACT_HELP) {
+		print_help();
+		cli_free(&cli);
+		return 0;
+	}
 	if (cli.action == CLI_ACT_VERSION) {
 		const char *real_cc = get_real_cc(cli.cc);
 		char cc_out[4096];
@@ -10114,8 +11562,7 @@ int main(int argc, char **argv) {
 					die("Transpilation failed");
 				continue;
 			}
-			if (!transpile_to_stdout((char *)cli.sources[i]))
-				die("Transpilation failed");
+			if (!transpile_to_stdout((char *)cli.sources[i])) die("Transpilation failed");
 		}
 	} else if (cli.source_count == 0)
 		status = passthrough_cc(&cli);

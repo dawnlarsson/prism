@@ -7767,6 +7767,72 @@ static void test_orelse_ctrl_paren_stmt_action_rejected(void) {
 /* emit_statements used to walk if/while/for/switch conditions without pushing
  * SCOPE_CTRL/FOR_PAREN, so break/continue inside a condition stmt-expr pasted
  * outer-scope defers into the condition (wrong for orelse blocks / nested SE). */
+/* Multi-label / leading attr / if __attribute__ before condition must not
+ * fold into bare-orelse __typeof__ / steal the control paren. */
+static void test_orelse_stmt_prefixes_and_gnu_attr_ctrl(void) {
+	static const char *ok[] = {
+		"int get(void);\n"
+		"int main(void) {\n"
+		"  int x;\n"
+		"  A: B: C: x = get() orelse 0;\n"
+		"  return x;\n"
+		"}\n",
+		"int get(void); int *f(void);\n"
+		"int main(void) {\n"
+		"  int x = 0;\n"
+		"  int *p = f() orelse { L: x = get() orelse 0; return 0; };\n"
+		"  return x;\n"
+		"}\n",
+		"int *get(void);\n"
+		"int main(void) {\n"
+		"  int *p;\n"
+		"  __attribute__((unused)) p = get() orelse 0;\n"
+		"  return 0;\n"
+		"}\n",
+		"int *get(void);\n"
+		"int main(void) {\n"
+		"  int *p;\n"
+		"  if __attribute__((hot)) (1)\n"
+		"    p = get() orelse 0;\n"
+		"  return 0;\n"
+		"}\n",
+		"int *get(void);\n"
+		"int main(void) {\n"
+		"  int *p;\n"
+		"  if __attribute__((format(printf, 1, 2))) (1)\n"
+		"    p = get() orelse 0;\n"
+		"  (void)p; return 0;\n"
+		"}\n",
+		"int *get(void);\n"
+		"int main(void) {\n"
+		"  int *p;\n"
+		"  if [[gnu::hot]] (1)\n"
+		"    p = get() orelse 0;\n"
+		"  return 0;\n"
+		"}\n",
+	};
+	static const char *names[] = {
+		"multi-label bare orelse",
+		"label inside orelse block",
+		"leading gnu attr bare orelse",
+		"if gnu attr braceless orelse",
+		"if gnu attr nested format orelse",
+		"if c23 attr braceless orelse",
+	};
+	for (int i = 0; i < (int)(sizeof(ok) / sizeof(ok[0])); i++) {
+		PrismResult r = prism_transpile_source(ok[i], "oe_pref.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, names[i]);
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(strstr(r.output, "__typeof__( B:") == NULL &&
+				  strstr(r.output, "__typeof__( L:") == NULL &&
+				  strstr(r.output, "__typeof__(\n__attribute__") == NULL &&
+				  strstr(r.output, "__typeof__( (1)") == NULL,
+			      names[i]);
+		}
+		prism_free(&r);
+	}
+}
+
 static void test_orelse_block_break_in_ctrl_cond_no_outer_defer(void) {
 	static const char *cases[] = {
 		"void f(void) {\n"
@@ -8757,6 +8823,7 @@ void run_orelse_tests(void) {
 	test_orelse_ctrl_paren_stmt_action_rejected();
 	test_paren_led_bare_orelse_after_ctrl();
 	test_orelse_block_break_in_ctrl_cond_no_outer_defer();
+	test_orelse_stmt_prefixes_and_gnu_attr_ctrl();
 	test_orelse_in_attribute_args();
 
 	// bracket orelse in expr context — Phase 1D must catch side effects

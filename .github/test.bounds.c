@@ -2098,11 +2098,54 @@ static void test_bounds_typeof_enum_ghost_constant(void) {
 	prism_free(&r);
 }
 
+/* emit_statements (defer paste, orelse blocks, stmt-exprs) used to skip
+ * try_bounds_checks — a safety bypass vs the main Pass 2 loop. */
+static void test_bounds_check_emit_statements_paths(void) {
+	printf("\n--- bounds: emit_statements paths (defer/orelse/stmt-expr) ---\n");
+	PrismFeatures f = prism_defaults();
+	f.bounds_check = true;
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void) {\n"
+		    "  int a[5] = {0}; int i = 2;\n"
+		    "  defer { (void)a[i]; }\n"
+		    "  int *p = (void *)0;\n"
+		    "  p = p orelse { (void)a[i]; return 0; };\n"
+		    "  int v = ({ a[i]; });\n"
+		    "  (void)v; return 0;\n"
+		    "}\n",
+		    "bc_emit_stmts.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bounds emit_statements: transpiles");
+		if (r.output) {
+			int n = 0;
+			for (const char *s = r.output; (s = strstr(s, "__prism_bchk")) != NULL; s++)
+				n++;
+			CHECK(n >= 3, "bounds emit_statements: bchk in defer, orelse block, stmt-expr");
+			CHECK(strstr(r.output, "a[i]") == NULL && strstr(r.output, "a[ i ]") == NULL,
+			      "bounds emit_statements: no raw a[i]");
+		}
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void) {\n"
+		    "  int a[5] = {0};\n"
+		    "  defer { (void)*(a + 2); }\n"
+		    "  return 0;\n"
+		    "}\n",
+		    "bc_defer_star.c", f);
+		CHECK(r.status != PRISM_OK,
+		      "bounds emit_statements: *(a+i) in defer rejected");
+		prism_free(&r);
+	}
+}
+
 void run_bounds_check_tests(void) {
 	printf("\n=== BOUNDS-CHECK TESTS ===\n");
 	test_bounds_paren_unary_addr_one_past();
 	test_bounds_typedef_pointer_array_tracking();
 	test_bounds_typeof_enum_ghost_constant();
+	test_bounds_check_emit_statements_paths();
 	test_bounds_check_fixed_array();
 	test_bounds_check_vla();
 	test_bounds_check_multidim();
