@@ -321,6 +321,14 @@ static void check_transpiled_output_compiles_and_runs(const char *output,
 #include "test.spec.c"
 #include "test.bounds.c"
 #include "test.cert.c"
+/* Generated defer/orelse torture tier — not committed (see .github/gen_torture.py).
+ * Present only when the CI generator step has run; the suite builds without it. */
+#if defined(__has_include)
+#	if __has_include("test.torture.c")
+#		include "test.torture.c"
+#		define HAVE_TORTURE 1
+#	endif
+#endif
 
 typedef struct {
 	const char *name;
@@ -366,6 +374,9 @@ int main(void) {
 		{"spec",     run_spec_tests},
 		{"bounds",   run_bounds_check_tests},
 		{"cert",     run_cert_tests},
+#ifdef HAVE_TORTURE
+		{"torture",  run_torture_tests},
+#endif
 	};
 	int n = sizeof(suites) / sizeof(suites[0]);
 

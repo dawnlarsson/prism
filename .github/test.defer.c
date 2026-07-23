@@ -7666,4 +7666,57 @@ void run_defer_tests(void) {
 	test_defer_capture_shadow_stack_restore();
 
 	test_defer_calling_conv_ret_type();
+
+	/* C23/GNU labeled break/continue must unwind outer defers (not drop the
+	 * label into a leftover `outer;` expr stmt). */
+	{
+		printf("\n--- labeled break/continue + defer ---\n");
+		PrismResult r = prism_transpile_source(
+		    "static char L[32]; static int n; static void A(char c){L[n++]=c;}\n"
+		    "int main(void){\n"
+		    "  int outer=0; (void)outer;\n"
+		    "  outer: for(int i=0;i<3;i++){\n"
+		    "    defer A('O');\n"
+		    "    for(int j=0;j<3;j++){\n"
+		    "      defer A('I');\n"
+		    "      A('1');\n"
+		    "      break outer;\n"
+		    "    }\n"
+		    "    A('X');\n"
+		    "  }\n"
+		    "  A('E');\n"
+		    "  return (L[0]=='1'&&L[1]=='I'&&L[2]=='O'&&L[3]=='E'&&L[4]==0)?0:1;\n"
+		    "}\n",
+		    "defer_labeled_break.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "labeled break+defer: transpiles");
+		if (r.output) {
+			CHECK(strstr(r.output, "break outer") != NULL ||
+				  strstr(r.output, "break  outer") != NULL,
+			      "labeled break+defer: preserves label");
+			CHECK(strstr(r.output, "break;") == NULL ||
+				  strstr(r.output, "break outer") != NULL,
+			      "labeled break+defer: not bare break alone before outer");
+		}
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int fail(void); int main(void){\n"
+		    "  outer: for(;;){\n"
+		    "    defer (void)0;\n"
+		    "    for(;;){\n"
+		    "      defer (void)0;\n"
+		    "      int p = fail() orelse break outer;\n"
+		    "      (void)p;\n"
+		    "    }\n"
+		    "  }\n"
+		    "  return 0;\n"
+		    "}\n",
+		    "defer_oe_labeled_break.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "orelse labeled break+defer: transpiles");
+		if (r.output)
+			CHECK(strstr(r.output, "break outer") != NULL,
+			      "orelse labeled break+defer: preserves label");
+		prism_free(&r);
+	}
 }

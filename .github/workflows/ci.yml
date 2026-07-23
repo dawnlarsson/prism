@@ -14,7 +14,7 @@ jobs:
     container: alpine:latest
     steps:
       - name: Install Build Dependencies
-        run: apk add --no-cache gcc g++ musl-dev git
+        run: apk add --no-cache gcc g++ musl-dev git python3
 
       - uses: actions/checkout@v4
 
@@ -24,6 +24,9 @@ jobs:
           echo "Architecture: x86_64"
           uname -a
           gcc --version
+
+      - name: "Generate defer/orelse torture tier"
+        run: python3 .github/gen_torture.py > .github/test.torture.c
 
       - name: "Stage 0: Build with host compiler"
         run: gcc -o /tmp/prism_stage0 prism.c

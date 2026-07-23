@@ -463,7 +463,10 @@ typedef struct PrismContext {
 	char dg_paste[3];
 	void *p1_scope_tree; // ScopeInfo[] — flat array indexed by scope_id
 	uint16_t p1_scope_count;
-	uint16_t p1_scope_cap;
+	/* Capacity, NOT a scope_id: scope_count maxes at 65534 (uint16) but the
+	 * doubling cap reaches 65536, which must not truncate to 0 — that would
+	 * pass old_size=0 to arena_realloc and drop the whole scope tree. */
+	uint32_t p1_scope_cap;
 	void *p1_func_meta; // FuncMeta[] — one per function definition
 	int p1_func_meta_count;
 	int p1_func_meta_cap;
@@ -3561,6 +3564,26 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 				r.is_typedef = true;
 				if (typedef_flags(inner_start) & TDF_UNION) r.is_union = true;
 			}
+			/* `_Atomic(struct S *)` is a pointer, not a struct value. */
+			{
+				bool outer_ptr = false;
+				int depth = 0;
+				for (Token *t = tok_next(tok); t && t != end; t = tok_next(t)) {
+					if (t->flags & TF_OPEN) {
+						depth++;
+						continue;
+					}
+					if (t->flags & TF_CLOSE) {
+						if (depth > 0) depth--;
+						continue;
+					}
+					if (depth == 0 && match_ch(t, '*')) outer_ptr = true;
+				}
+				if (outer_ptr) {
+					r.is_struct = false;
+					r.is_union = false;
+				}
+			}
 			scan_paren_for_vla(tok, end, &r, true);
 			tok = end;
 			r.end = tok;
@@ -3633,6 +3656,8 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 					r.has_void = true;
 				{
 					bool saw_sue = false;
+					bool outer_ptr = false;
+					int depth = 0;
 					for (Token *t = tok_next(tok); t && t != end; t = tok_next(t)) {
 						if ((t->tag & TT_ATTR) && tok_next(t) &&
 						    match_ch(tok_next(t), '(') && tok_match(tok_next(t))) {
@@ -3650,6 +3675,17 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 							saw_sue = false;
 							continue;
 						}
+						if (t->flags & TF_OPEN) {
+							depth++;
+							continue;
+						}
+						if (t->flags & TF_CLOSE) {
+							if (depth > 0) depth--;
+							continue;
+						}
+						/* `typeof(struct S *)` is a pointer type — the SUE
+						 * must not mark the typeof result as a struct value. */
+						if (depth == 0 && match_ch(t, '*')) outer_ptr = true;
 						if (!is_unqual) {
 							if (t->tag & TT_VOLATILE) r.has_volatile = true;
 							if (t->tag & TT_CONST) r.has_const = true;
@@ -3683,6 +3719,10 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 									r.has_volatile_member = true;
 							}
 						}
+					}
+					if (outer_ptr) {
+						r.is_struct = false;
+						r.is_union = false;
 					}
 				}
 				scan_paren_for_vla(tok, end, &r, false);

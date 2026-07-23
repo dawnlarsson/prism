@@ -5401,6 +5401,36 @@ static void test_file_scope_typeof_orelse_no_crash(void) {
 	}
 }
 
+// Regression: >32768 scopes truncated the uint16 scope-tree capacity to 0 at
+// the 2^15 doubling, dropping the whole scope tree (arena_realloc old_size=0).
+// Every function body then lost is_func_body → control flow read as file-scope.
+static void test_scope_count_past_32768(void) {
+	printf("\n--- scope count past 2^15 (capacity truncation) ---\n");
+	// ~40k scopes (20k functions x {body, switch}) — well past the old 32768
+	// break, comfortably under the real 65534 limit. Must transpile cleanly
+	// and the emitted C must run correctly.
+	size_t cap = 20000 * 96 + 256;
+	char *code = malloc(cap);
+	CHECK(code != NULL, "scope-scale: alloc source");
+	if (!code) return;
+	size_t n = 0;
+	for (int i = 0; i < 20000; i++)
+		n += (size_t)snprintf(code + n, cap - n,
+				      "int fn%d(int x){ switch(x){case 0: return %d; default: return x;} }\n",
+				      i, i);
+	n += (size_t)snprintf(code + n, cap - n, "int main(void){ return fn7(0) + fn11(2); }\n");
+	PrismResult r = prism_transpile_source(code, "scope_scale.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "scope-scale: 40k scopes transpiles (no capacity truncation)");
+	if (r.output) {
+		// main and the first function must still be recognized as functions:
+		// no control-flow-at-file-scope leakage, output is real C.
+		CHECK(strstr(r.output, "int main") != NULL, "scope-scale: main survived");
+		CHECK(strstr(r.output, "int fn0") != NULL, "scope-scale: fn0 survived");
+	}
+	prism_free(&r);
+	free(code);
+}
+
 static void test_const_vla_orelse_phase1(void) {
 	printf("\n--- const-VLA orelse Phase 1 ---\n");
 	// const pointer-to-VLA + value fallback → accepted (pointer is mutable)
@@ -6761,6 +6791,7 @@ void run_safe_tests(void) {
 
         // file-scope typeof scope_tree NULL deref
         test_file_scope_typeof_orelse_no_crash();
+        test_scope_count_past_32768();
 
         // const-VLA orelse duplication → Phase 1D
         test_const_vla_orelse_phase1();

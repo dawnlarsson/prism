@@ -2138,6 +2138,44 @@ static void test_bounds_check_emit_statements_paths(void) {
 		      "bounds emit_statements: *(a+i) in defer rejected");
 		prism_free(&r);
 	}
+	/* Extra parens must not bypass pointer-arithmetic rejection. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void) { int a[1] = {7}; return *((a + 1)); }\n",
+		    "bc_paren_add.c", f);
+		CHECK(r.status != PRISM_OK,
+		      "bounds: *((a+1)) rejected like *(a+1)");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void) { int a[1] = {7}; return *(((a + 1))); }\n",
+		    "bc_paren_add3.c", f);
+		CHECK(r.status != PRISM_OK,
+		      "bounds: *(((a+1))) rejected");
+		prism_free(&r);
+	}
+
+	/* sizeof(*(a+1)) must not reject — unevaluated, like sizeof(a[i]). */
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[2]={1,2}; return (int)sizeof(*(a+1));}\n",
+		    "bc_sizeof_deref_add.c", f);
+		CHECK_EQ(r.status, PRISM_OK, "bc-sizeof-deref-add: uneval accepted");
+		prism_free(&r);
+	}
+	/* Decl-init *(a+i) must reject like statement form. */
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[2]={1,2}; volatile int i=5; int x=*(a+i); return x;}\n",
+		    "bc_decl_init_deref_add.c", f);
+		CHECK(r.status != PRISM_OK, "bc-decl-init-deref-add: rejected");
+		prism_free(&r);
+	}
 }
 
 #ifndef _WIN32

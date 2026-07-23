@@ -1,13 +1,13 @@
 ![Prism Banner](https://github.com/user-attachments/assets/051187c2-decd-497e-9beb-b74031eb84ed)
 
-![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-8934%2B_pass-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
+![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-9660%2B_pass-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
 
 ## Robust C by default
 **A dialect of C with `defer`, `orelse`, automatic zero-initialization, bounds checking, and progressive optimization.**
 
 Prism is a lightweight and very fast transpiler that makes C safer and faster without changing how you write it.
 
-- **8934+ tests** — edge cases, control flow, nightmares, trying hard to break Prism
+- **9660+ tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Two-pass transpiler** — full semantic analysis before a single byte is emitted
 - **Progressive optimization** — auto-unreachable after noreturn calls, const arrays promoted to static storage
@@ -464,6 +464,37 @@ Not:
 ```
 
 **Disable:** `prism -fno-line-directives src.c` (useful for debugging transpiler output)
+
+## Debugging
+
+**Debuggers show your original Prism source — not the transpiled C.** The same
+`#line` directives that drive error reporting also drive the DWARF line tables
+the backend compiler emits under `-g`, so lldb/gdb resolve everything to your
+`.c` file:
+
+```
+$ prism -g -O0 app.c -o app && lldb app
+(lldb) b app.c:10                  # breakpoints by original file:line
+(lldb) run
+frame #0: app`load(id=1) at app.c:10:5
+-> 10  		if (id == 2) return -2;
+(lldb) p buf[0]                    # your variable names, untouched
+(char) 'B'
+```
+
+Source listings render the original file — `defer` and `orelse` lines included —
+and backtraces cite original lines (`load at app.c:10`, `main at app.c:17`).
+
+`defer` makes debugging *better*, not worse: a breakpoint on a defer body line
+binds to **every exit path's copy** of the cleanup and fires exactly when the
+cleanup runs — hit it on an early `return` and the backtrace shows you which
+exit triggered it. Stepping over a `return` walks through the pending defer
+bodies at their original lines, in LIFO order, before leaving the function.
+
+Prism-generated temporaries are namespaced `__prism_*` and easy to ignore in
+`frame variable`. To inspect the generated C itself, `prism transpile` prints
+it, and `-fno-line-directives` makes the debugger show the transpiled lines
+instead — useful when debugging Prism's own output.
 
 ## Static Analysis (CppCheck, clang-tidy, …)
 

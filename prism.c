@@ -269,8 +269,15 @@ typedef struct {
 	bool verbose;
 	bool profile;
 	bool compile_only;
+	bool assemble_only; // -S: synthesize .s like -c synthesizes .o
 	bool passthrough;
 	bool no_link_pragma; // -fno-link-pragma: suppress #pragma link libs
+	/* Language from `-x` that applied to the first Prism source (GCC: -x
+	 * binds subsequent inputs until the next -x). NULL → default "c". */
+	const char *source_x_lang;
+	/* Index in cc_args of that `-x` / `-xLANG` (or -1). Stripped when
+	 * building the stdin pipe so it is not double-applied. */
+	int source_x_arg_idx;
 } Cli;
 
 extern char **environ;
@@ -2923,9 +2930,49 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	return tok_next(close);
 }
 
+static bool bounds_star_in_uneval(Token *tok) {
+	/* Skip sizeof/_Alignof/typeof/_Generic/_Static_assert operands — same
+	 * policy as P1_UNEVAL_BRACKET for `a[i]`, but `*(a+i)` has no bracket. */
+	int depth = 0;
+	for (uint32_t i = tok_idx(tok); i > 0; i--) {
+		Token *t = &token_pool[i - 1];
+		if (t->flags & TF_CLOSE) {
+			depth++;
+			continue;
+		}
+		if (t->flags & TF_OPEN) {
+			if (depth > 0) {
+				depth--;
+				continue;
+			}
+			Token *prev = (i >= 2) ? &token_pool[i - 2] : NULL;
+			if (!prev) return false;
+			if (is_uneval_operand_intro(prev) || (prev->tag & TT_GENERIC) ||
+			    (prev->flags & TF_STATIC_ASSERT))
+				return true;
+			if (prev->kind == TK_IDENT &&
+			    ((prev->len == 8 && !memcmp(tok_loc(prev), "_Alignof", 8)) ||
+			     (prev->len == 7 && !memcmp(tok_loc(prev), "alignof", 7))))
+				return true;
+			return false;
+		}
+		if (depth != 0) continue;
+		if (is_uneval_operand_intro(t) || (t->tag & TT_GENERIC) || (t->flags & TF_STATIC_ASSERT))
+			return true;
+		if (t->kind == TK_IDENT &&
+		    ((t->len == 8 && !memcmp(tok_loc(t), "_Alignof", 8)) ||
+		     (t->len == 7 && !memcmp(tok_loc(t), "alignof", 7))))
+			return true;
+		if (match_ch(t, ';') || match_ch(t, '{') || match_ch(t, '}') || match_ch(t, ','))
+			return false;
+	}
+	return false;
+}
+
 static Token *try_bounds_check_deref_add(Token *tok) {
 	if (!FEAT(F_BOUNDS_CHECK)) return NULL;
 	if (!match_ch(tok, '*') || (tok->flags & TF_OPEN)) return NULL;
+	if (bounds_star_in_uneval(tok)) return NULL;
 	if (tok_idx(tok) >= 1) {
 		Token *prev = &token_pool[tok_idx(tok) - 1];
 		if (prev->kind == TK_NUM || prev->kind == TK_STR) return NULL;
@@ -2947,9 +2994,20 @@ static Token *try_bounds_check_deref_add(Token *tok) {
 	Token *cp = tok_match(op);
 	Token *lhs = tok_next(op);
 	if (!lhs || lhs == cp) return NULL;
+	/* Peel redundant outer paren layers: `*((a + 1))` → scan `a + 1`.
+	 * Without this, the inner `(a + 1)` is skipped as a nested group and
+	 * the unverifiable pointer arithmetic bypasses -fbounds-check. */
+	Token *scan_end = cp;
+	while (lhs && match_ch(lhs, '(') && (lhs->flags & TF_OPEN) && tok_match(lhs)) {
+		Token *inner_cp = tok_match(lhs);
+		if (!inner_cp || tok_next(inner_cp) != scan_end) break;
+		lhs = tok_next(lhs);
+		scan_end = inner_cp;
+		if (!lhs || lhs == scan_end) return NULL;
+	}
 	// Must contain a top-level `+` or `-` operator inside the parens.
 	bool has_addsub = false;
-	for (Token *t = lhs; t && t != cp && t->kind != TK_EOF; t = tok_next(t)) {
+	for (Token *t = lhs; t && t != scan_end && t->kind != TK_EOF; t = tok_next(t)) {
 		if ((t->flags & TF_OPEN) && tok_match(t)) {
 			t = tok_match(t);
 			continue;
@@ -2961,7 +3019,7 @@ static Token *try_bounds_check_deref_add(Token *tok) {
 	}
 	if (!has_addsub) return NULL;
 	// Must reference a tracked array name somewhere in the parens.
-	Token *hit = bounds_find_array_ident(lhs, cp);
+	Token *hit = bounds_find_array_ident(lhs, scan_end);
 	if (!hit) return NULL;
 	if (FEAT(F_WARN_SAFETY)) {
 		warn_tok(tok,
@@ -3624,12 +3682,31 @@ static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool
 
 static Token *emit_break_continue_defer(Token *tok) {
 	bool is_break = tok->tag & TT_BREAK;
-	if (FEAT(F_DEFER) && control_flow_has_defers(is_break))
+	Token *kw = tok;
+	Token *after = tok_next(tok);
+	/* C23/GNU labeled break/continue: `break outer;` / `continue outer;`.
+	 * Must preserve the label and unwind with DEFER_TO_DEPTH (like goto),
+	 * not DEFER_BREAK/CONTINUE — those only reach the innermost loop. */
+	Token *label = NULL;
+	if (after && is_identifier_like(after)) label = after;
+
+	if (label && FEAT(F_DEFER)) {
+		P1LabelResult info = p1_label_find(label, current_func_idx);
+		int td = info.tok ? info.scope_depth : 0;
+		if (goto_has_defers(td)) emit_goto_defers(td);
+	} else if (FEAT(F_DEFER) && control_flow_has_defers(is_break)) {
 		emit_defers(is_break ? DEFER_BREAK : DEFER_CONTINUE);
+	}
 	out_char(' ');
-	OUT_TOK(tok);
+	OUT_TOK(kw);
+	if (label) {
+		out_char(' ');
+		OUT_TOK(label);
+		tok = tok_next(label);
+	} else {
+		tok = after;
+	}
 	out_char(';');
-	tok = tok_next(tok);
 	if (match_ch(tok, ';')) tok = tok_next(tok);
 	return tok;
 }
@@ -4313,6 +4390,13 @@ static InitWalkResult emit_decl_init_walk(Token *tok) {
 		if (FEAT(F_AUTO_UNREACHABLE) && !in_ctrl_paren()) {
 			Token *nr = try_detect_noreturn_call(r.tok);
 			if (nr) r.unreachable_tok = nr;
+		}
+		if (__builtin_expect(FEAT(F_BOUNDS_CHECK), 0)) {
+			Token *bc = try_bounds_checks(r.tok);
+			if (bc) {
+				r.tok = bc;
+				continue;
+			}
 		}
 		r.tok = emit_advance(r.tok);
 	}
@@ -5159,7 +5243,19 @@ static Token *handle_control_exit_defer(Token *tok) {
 		OUT_LIT(" }");
 	} else {
 		bool is_break = tok->tag & TT_BREAK;
-		if (!control_flow_has_defers(is_break)) return NULL;
+		Token *after = tok_next(tok);
+		bool has_label = after && is_identifier_like(after);
+		bool need = false;
+		if (has_label && FEAT(F_DEFER)) {
+			/* Outer-loop defers are invisible to DEFER_BREAK dry-run
+			 * (stops at innermost loop); use goto-style depth check. */
+			P1LabelResult info = p1_label_find(after, current_func_idx);
+			int td = info.tok ? info.scope_depth : 0;
+			need = goto_has_defers(td);
+		} else {
+			need = control_flow_has_defers(is_break);
+		}
+		if (!need) return NULL;
 		OUT_LIT(" {");
 		tok = emit_break_continue_defer(tok);
 		OUT_LIT(" }");
@@ -5535,6 +5631,28 @@ static const char *cc_next_token(const char *p, const char **start, int *len, bo
 
 static const char *cc_executable(const char *cc) {
 	if (!cc || !*cc) return cc;
+	/* Prefer the whole string when it is an unquoted path with spaces. */
+	{
+		const char *trim = cc;
+		while (*trim == ' ' || *trim == '\t') trim++;
+		size_t tlen = strlen(trim);
+		while (tlen > 0 && (trim[tlen - 1] == ' ' || trim[tlen - 1] == '\t')) tlen--;
+		bool has_space = false, has_quote = false;
+		for (size_t i = 0; i < tlen; i++) {
+			if (trim[i] == ' ' || trim[i] == '\t') has_space = true;
+			if (trim[i] == '"' || trim[i] == '\'') has_quote = true;
+		}
+		if (has_space && !has_quote && tlen > 0 && tlen < PATH_MAX) {
+			static PRISM_THREAD_LOCAL char whole[PATH_MAX];
+			memcpy(whole, trim, tlen);
+			whole[tlen] = '\0';
+#ifdef _WIN32
+			if (_access(whole, 0) == 0) return whole;
+#else
+			if (access(whole, X_OK) == 0 || access(whole, F_OK) == 0) return whole;
+#endif
+		}
+	}
 	const char *start;
 	int len;
 	cc_next_token(cc, &start, &len, false);
@@ -5554,6 +5672,32 @@ static void cc_split_into_argv(const char **args, int *argc, const char *cc, cha
 		args[(*argc)++] = cc;
 		return;
 	}
+	/* Unquoted paths with spaces (`CC=/path with spaces/cc`) must stay one
+	 * argv entry when they name a real executable — splitting yields ENOENT. */
+	{
+		char *trim = dup;
+		while (*trim == ' ' || *trim == '\t') trim++;
+		size_t tlen = strlen(trim);
+		while (tlen > 0 && (trim[tlen - 1] == ' ' || trim[tlen - 1] == '\t')) trim[--tlen] = '\0';
+		bool has_space = false, has_quote = false;
+		for (char *q = trim; *q; q++) {
+			if (*q == ' ' || *q == '\t') has_space = true;
+			if (*q == '"' || *q == '\'') has_quote = true;
+		}
+		if (has_space && !has_quote) {
+#ifdef _WIN32
+			int ok = _access(trim, 0) == 0;
+#else
+			int ok = access(trim, X_OK) == 0 || access(trim, F_OK) == 0;
+#endif
+			if (ok) {
+				if (trim != dup) memmove(dup, trim, tlen + 1);
+				args[(*argc)++] = dup;
+				if (out_dup) *out_dup = dup;
+				return;
+			}
+		}
+	}
 	const char *p = dup;
 	while (*p) {
 		const char *start;
@@ -5566,6 +5710,30 @@ static void cc_split_into_argv(const char **args, int *argc, const char *cc, cha
 
 static int cc_extra_arg_count(const char *cc) {
 	if (!cc || !*cc) return 0;
+	/* Match cc_split_into_argv: whole-string executable → no extra tokens. */
+	{
+		const char *trim = cc;
+		while (*trim == ' ' || *trim == '\t') trim++;
+		size_t tlen = strlen(trim);
+		while (tlen > 0 && (trim[tlen - 1] == ' ' || trim[tlen - 1] == '\t')) tlen--;
+		bool has_space = false, has_quote = false;
+		for (size_t i = 0; i < tlen; i++) {
+			if (trim[i] == ' ' || trim[i] == '\t') has_space = true;
+			if (trim[i] == '"' || trim[i] == '\'') has_quote = true;
+		}
+		if (has_space && !has_quote) {
+			char tmp[PATH_MAX];
+			if (tlen < sizeof(tmp)) {
+				memcpy(tmp, trim, tlen);
+				tmp[tlen] = '\0';
+#ifdef _WIN32
+				if (_access(tmp, 0) == 0) return 0;
+#else
+				if (access(tmp, X_OK) == 0 || access(tmp, F_OK) == 0) return 0;
+#endif
+			}
+		}
+	}
 	const char *start;
 	int len;
 	const char *p = cc_next_token(cc, &start, &len, false); // skip first token
@@ -5606,23 +5774,40 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 	for (int i = 0; i < ctx->extra_compiler_flags_count; i++) {
 		const char *f = ctx->extra_compiler_flags[i];
 		if (msvc) {
-			// MSVC cl: /c compile-only, /Fo<path> object output, /Fe<path> exe.
+			// MSVC cl: /c compile-only, /Fo<path>|/Fo <path>, /Fe likewise.
 			if (strcmp(f, "/c") == 0 || strcmp(f, "-c") == 0) continue;
-			if (strncmp(f, "/Fo", 3) == 0 || strncmp(f, "/Fe", 3) == 0) continue;
+			if (strncmp(f, "/Fo", 3) == 0 || strncmp(f, "/Fe", 3) == 0) {
+				if ((strcmp(f, "/Fo") == 0 || strcmp(f, "/Fe") == 0) &&
+				    i + 1 < ctx->extra_compiler_flags_count)
+					i++; /* skip separate operand (may be /abs/path.obj) */
+				continue;
+			}
 			if (strcmp(f, "/link") == 0) break;
-			/* Skip other TUs/objects — same as non-MSVC path. */
-			if (f[0] != '/' && f[0] != '-' && is_pp_skip_input_arg(f)) {
+			/* Skip other TUs/objects — including absolute paths (/tmp/x.obj). */
+			if (is_pp_skip_input_arg(f)) {
 				if (i > 0 && cc_flag_takes_arg(ctx->extra_compiler_flags[i - 1]))
 					args[(*argc)++] = f;
 				continue;
 			}
 		} else {
 			if (strcmp(f, "-c") == 0 || strcmp(f, "-S") == 0) continue;
+			/* Accidental MSVC slash-flags on a Unix driver. */
+			if (strcmp(f, "/c") == 0) continue;
+			if (strncmp(f, "/Fo", 3) == 0 || strncmp(f, "/Fe", 3) == 0) {
+				if ((strcmp(f, "/Fo") == 0 || strcmp(f, "/Fe") == 0) &&
+				    i + 1 < ctx->extra_compiler_flags_count)
+					i++;
+				continue;
+			}
 			if (strcmp(f, "-o") == 0) {
 				i++;
 				continue;
 			}
 			if (f[0] == '-' && f[1] == 'o' && f[2] != '\0') continue;
+			/* -save-temps with -E writes confusing sidecar files; drop it. */
+			if (!strcmp(f, "-save-temps") || !strncmp(f, "-save-temps=", 12) ||
+			    !strcmp(f, "--save-temps") || !strncmp(f, "--save-temps=", 13))
+				continue;
 			/* Skip sibling TUs/objects, but not operands of -D/-include/-I/… */
 			if (f[0] != '-' && is_pp_skip_input_arg(f)) {
 				if (i > 0 && cc_flag_takes_arg(ctx->extra_compiler_flags[i - 1]))
@@ -5715,6 +5900,23 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 	for (int i = 0; i < ctx->extra_force_include_count; i++) {
 		args[(*argc)++] = msvc ? "/FI" : "-include";
 		args[(*argc)++] = ctx->extra_force_includes[i];
+	}
+
+	/* Clang rejects `cc -E -` without `-x`. Map `-x none` (extension guessing)
+	 * to `-x c` for stdin, and inject `-x c` when the user omitted `-x`. */
+	if (!msvc && input_file && !strcmp(input_file, "-")) {
+		bool has_x = false;
+		for (int i = 0; i < *argc - 1; i++) {
+			if (!strcmp(args[i], "-x")) {
+				has_x = true;
+				if (!strcmp(args[i + 1], "none")) args[i + 1] = "c";
+				break;
+			}
+		}
+		if (!has_x) {
+			args[(*argc)++] = "-x";
+			args[(*argc)++] = "c";
+		}
 	}
 
 	args[(*argc)++] = input_file;
@@ -6357,7 +6559,35 @@ static char *preprocess_with_cc(const char *input_file) {
 	 * re-running the preprocessor would drop the whole TU (including orelse). */
 	if (input_is_dot_i(input_file)) {
 		char *buf = read_file_padded(input_file);
-		if (!buf) fprintf(stderr, "error: cannot read preprocessed input: %s\n", input_file);
+		if (!buf) {
+			fprintf(stderr, "error: cannot read preprocessed input: %s\n", input_file);
+			return NULL;
+		}
+		size_t len = strlen(buf);
+		FILE *f = fopen(input_file, "rb");
+		long sz = -1;
+		if (f) {
+			if (fseek(f, 0, SEEK_END) == 0) sz = ftell(f);
+			fclose(f);
+		}
+		if (sz > 0 && (size_t)sz != len) {
+			fprintf(stderr,
+				"error: preprocessed input '%s' contains embedded null bytes\n",
+				input_file);
+			free(buf);
+			return NULL;
+		}
+		if (sz >= 2) {
+			unsigned char b0 = (unsigned char)buf[0], b1 = (unsigned char)buf[1];
+			if ((b0 == 0xFF && b1 == 0xFE) || (b0 == 0xFE && b1 == 0xFF)) {
+				fprintf(stderr,
+					"error: preprocessed input '%s' looks like UTF-16 (BOM); "
+					"re-save as UTF-8/ASCII .i or pass the original .c\n",
+					input_file);
+				free(buf);
+				return NULL;
+			}
+		}
 		return buf;
 	}
 	const char *pp_cc = ctx->extra_compiler ? ctx->extra_compiler : PRISM_DEFAULT_CC;
@@ -6823,6 +7053,12 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 	} else {
 		// (C23 §6.7.2.5p2), covered by the . / -> check.
 		unsigned oe_id = ctx->ret_counter++;
+		bool rhs_has_member = false;
+		for (Token *s = tok_next(bare_assign_eq); s && s != orelse_tok; s = tok_next(s))
+			if (s->tag & TT_MEMBER) {
+				rhs_has_member = true;
+				break;
+			}
 		OUT_LIT("{ ");
 		emit_typeof_keyword();
 		out_char('(');
@@ -6851,7 +7087,11 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 						  "transpiler control-flow tracking); hoist the "
 						  "expression to a variable first");
 #endif
+			/* Bit-field members are not valid typeof operands; `+ 0`
+			 * forces integer promotion. Skip for plain idents/calls. */
+			if (rhs_has_member) OUT_LIT("(");
 			emit_balanced_range(tok_next(bare_assign_eq), orelse_tok);
+			if (rhs_has_member) OUT_LIT(")+0");
 		} else
 			emit_range_no_prep(bare_lhs_start, bare_assign_eq);
 		OUT_LIT(") __prism_oe_");
@@ -6866,6 +7106,15 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 				bool is_last = !orelse_has_chain(t, comma_term);
 				emit_bare_oe_if_temp(oe_id, bare_lhs_start, bare_assign_eq);
 				if (is_last) {
+					/* Chain ending in return/goto/break/continue/{...}
+					 * must use action lowering — wrapping `return` in
+					 * `(...)` is a hard backend error. */
+					if ((t->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) ||
+					    match_ch(t, '{')) {
+						t = emit_orelse_action(t, NULL, false, false, NULL);
+						OUT_LIT(" }");
+						break;
+					}
 					emit_range_no_prep(bare_lhs_start, bare_assign_eq);
 					OUT_LIT(" = (");
 					t = bare_emit_fallback_expr(
@@ -6902,8 +7151,17 @@ static Token *emit_bare_orelse_impl(Token *t, Token *end, bool comma_term, bool 
 				oe_id = ctx->ret_counter++;
 				emit_typeof_keyword();
 				out_char('(');
-				if (lhs_has_indirection) emit_balanced_range(fb_start, fb_orelse);
-				else
+				if (lhs_has_indirection) {
+					bool mid_has_member = false;
+					for (Token *s = fb_start; s && s != fb_orelse; s = tok_next(s))
+						if (s->tag & TT_MEMBER) {
+							mid_has_member = true;
+							break;
+						}
+					if (mid_has_member) OUT_LIT("(");
+					emit_balanced_range(fb_start, fb_orelse);
+					if (mid_has_member) OUT_LIT(")+0");
+				} else
 					emit_range_no_prep(bare_lhs_start, bare_assign_eq);
 				OUT_LIT(") __prism_oe_");
 				out_uint(oe_id);
@@ -7474,6 +7732,15 @@ static void p1_scan_init_shadows(Token *open,
 					if (type.has_volatile_member) e->has_volatile_member = true;
 				}
 			}
+			if (type.is_struct && !type.is_enum && !decl.is_pointer && !decl.is_array &&
+			    !decl.is_func_ptr && !decl.is_func_decl) {
+				TypedefEntry *e = p1_shadow_entry_for_token(decl.var_name);
+				if (!e) {
+					p1_register_shadow(decl.var_name, cur_sid, brace_depth);
+					e = p1_shadow_entry_for_token(decl.var_name);
+				}
+				if (e) e->is_aggregate = true;
+			}
 
 			// Phase 1D: register CFG entry for goto-skip-decl detection
 			{
@@ -7872,6 +8139,116 @@ static void p1d_annotate_typeof_orelse(Token *typeof_tok, uint16_t cur_sid, int 
 
 static bool p1d_lhs_is_const_shadow(Token *start, Token *eq_tok);
 
+/* (void*)1 = ordinary prototype; (void*)2 = returns struct/union by value. */
+#define P1_PROTO_FN ((void *)(intptr_t)1)
+#define P1_PROTO_STRUCT_RET ((void *)(intptr_t)2)
+
+static bool p1_decl_looks_like_struct_return(Token *fn_name) {
+	bool saw_agg = false, saw_ptr = false, saw_enum = false;
+	for (Token *t = tok_walk_back(tok_idx(fn_name), WB_PAST_NOISE); t;
+	     t = tok_walk_back(tok_idx(t), WB_PAST_NOISE)) {
+		if (match_ch(t, ';') || match_ch(t, '{') || match_ch(t, '}') || match_ch(t, ')')) break;
+		if (match_ch(t, '*')) {
+			saw_ptr = true;
+			continue;
+		}
+		if (t->tag & TT_SUE) {
+			if (is_enum_kw(t))
+				saw_enum = true;
+			else
+				saw_agg = true;
+			continue;
+		}
+		if (typedef_flags(t) & TDF_AGGREGATE) {
+			saw_agg = true;
+			continue;
+		}
+		if (t->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_TYPEOF | TT_ATTR)) continue;
+		if (is_known_typedef(t)) continue;
+		if (t->kind == TK_IDENT || t->kind == TK_PUNCT) break;
+	}
+	return saw_agg && !saw_ptr && !saw_enum;
+}
+
+static bool p1d_func_returns_struct_value(Token *name) {
+	void *proto = hashmap_get(&p1_func_proto_map, tok_loc(name), name->len);
+	if (proto == P1_PROTO_STRUCT_RET) return true;
+	for (int fi = 0; fi < func_meta_count; fi++) {
+		Token *fn = func_meta[fi].ret_type_end;
+		if (!fn) {
+			Token *bt = tok_walk_back(tok_idx(func_meta[fi].body_open) - 1, WB_SKIP_ATTRS);
+			if (bt && is_valid_varname(bt) &&
+			    !(bt->tag & (TT_ATTR | TT_TYPE | TT_QUALIFIER | TT_SUE)))
+				fn = bt;
+		}
+		if (!fn || fn->len != name->len || memcmp(tok_loc(fn), tok_loc(name), name->len) != 0)
+			continue;
+		bool saw_agg = false, saw_ptr = false, saw_enum = false;
+		for (Token *t = func_meta[fi].ret_type_start; t && t != func_meta[fi].ret_type_end;
+		     t = tok_next(t)) {
+			if (t->tag & TT_SUE) {
+				if (is_enum_kw(t))
+					saw_enum = true;
+				else
+					saw_agg = true;
+			}
+			if (typedef_flags(t) & TDF_AGGREGATE) saw_agg = true;
+			if (match_ch(t, '*')) saw_ptr = true;
+		}
+		return saw_agg && !saw_ptr && !saw_enum;
+	}
+	return false;
+}
+
+/* True when [start, end) is a struct/union-value expression (not a pointer). */
+static bool p1d_expr_is_struct_value(Token *start, Token *end) {
+	if (!start || start == end) return false;
+	Token *t = start;
+	Token *lim = end;
+	while (match_ch(t, '(') && tok_match(t) && tok_next(tok_match(t)) == lim) {
+		lim = tok_match(t);
+		t = tok_next(t);
+		if (!t || t == lim) return false;
+	}
+	if (t->kind == TK_IDENT && tok_next(t) == lim) {
+		TypedefEntry *te = typedef_lookup(t);
+		return te && te->is_shadow && te->is_aggregate && !te->is_array;
+	}
+	if (t->kind == TK_IDENT) {
+		Token *lp = tok_next(t);
+		if (lp && match_ch(lp, '(') && tok_match(lp) && tok_next(tok_match(lp)) == lim)
+			return p1d_func_returns_struct_value(t);
+	}
+	if (match_ch(t, '(')) {
+		Token *inner = skip_noise(tok_next(t));
+		if (!inner) return false;
+		if (inner->tag & TT_SUE) return !is_enum_kw(inner);
+		if (typedef_flags(inner) & TDF_AGGREGATE) return true;
+	}
+	return false;
+}
+
+static void p1d_reject_orelse_chain_after_ctrl(Token *oe_kw) {
+	Token *act = tok_next(oe_kw);
+	if (!act || !(act->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO))) return;
+	Token *u = tok_next(act);
+	if (!(act->tag & TT_RETURN) && u && is_identifier_like(u)) u = tok_next(u);
+	Token *sp = act;
+	for (; u && u->kind != TK_EOF; u = tok_next(u)) {
+		if (u->flags & TF_OPEN) {
+			sp = tok_match(u);
+			u = tok_match(u);
+			continue;
+		}
+		if ((u->flags & TF_CLOSE) || match_ch(u, ';') || match_ch(u, ',')) break;
+		if ((tok_ann(u) & P1_IS_ORELSE_KW) || orelse_kw_at_bare(u, sp))
+			error_tok(u,
+				  "'orelse' chain cannot continue after a "
+				  "control-flow action (return/goto/break/continue)");
+		sp = u;
+	}
+}
+
 // Phase 1D: validate bare orelse in expression statements.
 static void __attribute__((noinline)) p1d_validate_bare_orelse(Token *tok, Token *bare_oe) {
 	Token *scan_start = tok;
@@ -7968,7 +8345,15 @@ static void __attribute__((noinline)) p1d_validate_bare_orelse(Token *tok, Token
 		Token *ppc = span_find_pp_conditional(scan_start, NULL, tok_is_semicolon);
 		if (ppc) error_tok(bare_oe, ERR_BARE_ORELSE_SPANS_PP);
 	}
+	/* Struct-value RHS cannot be tested with `if (!(lhs = rhs))` (action
+	 * form) or used as a scalar temp (value form) — reject both. */
+	if (has_eq && eq_tok) {
+		Token *rhs = tok_next(eq_tok);
+		if (p1d_expr_is_struct_value(rhs, bare_oe) || p1d_expr_is_struct_value(scan_start, eq_tok))
+			error_tok(bare_oe, ERR_ORELSE_STRUCT_VALUE);
+	}
 	tok_ann(bare_oe) |= P1_IS_ORELSE_KW;
+	p1d_reject_orelse_chain_after_ctrl(bare_oe);
 	/* Annotate further depth-0 bare chain members for Pass 2. */
 	{
 		Token *prev = bare_oe;
@@ -7997,6 +8382,7 @@ static void __attribute__((noinline)) p1d_validate_bare_orelse(Token *tok, Token
 				Token *nx = tok_next(s);
 				if (nx && (match_ch(nx, ';') || match_ch(nx, ',')))
 					error_tok(nx, "expected statement after 'orelse'");
+				p1d_reject_orelse_chain_after_ctrl(s);
 			}
 			prev = s;
 		}
@@ -8206,6 +8592,18 @@ static void p1d_validate_decl_orelse(Token *var_name,
 					  "GNU statement expressions in orelse "
 					  "fallback values are not supported; "
 					  "use 'orelse { ... }' block form instead");
+		}
+		Token *prev = NULL;
+		for (Token *s = first_orelse; s && s->kind != TK_EOF && !match_ch(s, ';') && !match_ch(s, ',');
+		     s = tok_next(s)) {
+			if (s->flags & TF_OPEN) {
+				prev = tok_match(s);
+				s = tok_match(s);
+				continue;
+			}
+			if ((tok_ann(s) & P1_IS_ORELSE_KW) || (prev && orelse_kw_at_bare(s, prev)))
+				p1d_reject_orelse_chain_after_ctrl(s);
+			prev = s;
 		}
 	}
 }
@@ -8462,6 +8860,16 @@ static void p1d_probe_declaration(Token *tok,
 				if (type.has_volatile) e->is_volatile = true;
 				if (type.has_volatile_member) e->has_volatile_member = true;
 			}
+		}
+		/* Track struct/union locals so bare `s = s orelse …` rejects like decl form. */
+		if (brace_depth > 0 && type.is_struct && !type.is_enum && !decl.is_pointer &&
+		    !decl.is_array && !decl.is_func_ptr && !decl.is_func_decl) {
+			if (!did_shadow) {
+				p1_register_shadow(decl.var_name, cur_sid, brace_depth);
+				did_shadow = true;
+			}
+			TypedefEntry *e = p1_shadow_entry_for_token(decl.var_name);
+			if (e) e->is_aggregate = true;
 		}
 
 		// -fbounds-check: register plain local array variables so Pass 2 can
@@ -8913,8 +9321,11 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 			Token *nx = tok_next(ps->tok);
 			if (nx && match_ch(nx, '(')) {
 				bool is_func_decl = false;
+				void *proto_tag = p1_decl_looks_like_struct_return(ps->tok)
+						      ? P1_PROTO_STRUCT_RET
+						      : P1_PROTO_FN;
 				if (ps->brace_depth == 0) {
-					hashmap_put(&p1_func_proto_map, tok_loc(ps->tok), ps->tok->len, (void *)1);
+					hashmap_put(&p1_func_proto_map, tok_loc(ps->tok), ps->tok->len, proto_tag);
 					is_func_decl = true;
 				} else {
 					Token *prev = tok_walk_back(tok_idx(ps->tok), WB_PAST_NOISE);
@@ -8922,7 +9333,7 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 								   TT_SUE | TT_TYPEOF)) ||
 						     is_known_typedef(prev))) {
 						hashmap_put(
-						    &p1_func_proto_map, tok_loc(ps->tok), ps->tok->len, (void *)1);
+						    &p1_func_proto_map, tok_loc(ps->tok), ps->tok->len, proto_tag);
 						is_func_decl = true;
 					}
 				}
@@ -9299,6 +9710,45 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 
 		if ((ps->tok->flags & TF_STATIC_ASSERT) &&
 		    !(is_soft_keyword_identifier(ps->tok) && token_is_label_name(ps->tok))) {
+			/* Phase 1 normally skips _Static_assert; still classify
+			 * bracket-orelse inside so Pass 2 can lower to a ternary
+			 * (otherwise `orelse` leaks into the backend). Reject
+			 * non-bracket orelse — statement/action forms cannot
+			 * appear in an integer constant expression. */
+			if (FEAT(F_ORELSE)) {
+				Token *lp = skip_noise(tok_next(ps->tok));
+				if (lp && match_ch(lp, '(') && (lp->flags & TF_OPEN) && tok_match(lp)) {
+					Token *rp = tok_match(lp);
+					/* Walk every token — do not skip nested groups or
+					 * `sizeof(char[…])` brackets are never classified. */
+					for (Token *inner = tok_next(lp); inner && inner != rp;
+					     inner = tok_next(inner)) {
+						if (match_ch(inner, '[') && (inner->flags & TF_OPEN) &&
+						    tok_match(inner) && !(inner->flags & TF_C23_ATTR) &&
+						    !(tok_ann(inner) & P1_OE_BRACKET))
+							p1d_classify_bracket_orelse_ex(inner,
+										     CUR_SID(),
+										     ps->p1d_cur_func,
+										     /*hard_ctx=*/false,
+										     /*allow_se_hoist=*/false);
+					}
+					Token *prev_sa = lp;
+					for (Token *s = tok_next(lp); s && s != rp; s = tok_next(s)) {
+						if (s->flags & TF_OPEN) {
+							prev_sa = tok_match(s);
+							s = tok_match(s);
+							continue;
+						}
+						if (orelse_kw_at_bare(s, prev_sa) &&
+						    !(tok_ann(s) & P1_IS_ORELSE_KW))
+							error_tok(s,
+								  "'orelse' cannot be used in "
+								  "_Static_assert/static_assert except "
+								  "inside an array dimension");
+						prev_sa = s;
+					}
+				}
+			}
 			ps->tok = skip_to_semicolon(ps->tok, NULL);
 			if (ps->tok && match_ch(ps->tok, ';')) ps->tok = tok_next(ps->tok);
 			ps->at_stmt_start = true;
@@ -10567,7 +11017,7 @@ static bool is_pp_skip_input_arg(const char *f) {
 	       has_ext(f, ".cxx") || has_ext(f, ".C") || has_ext(f, ".m") || has_ext(f, ".mm") ||
 	       has_ext(f, ".s") || has_ext(f, ".S") || has_ext(f, ".o") || has_ext(f, ".obj") ||
 	       has_ext(f, ".a") || has_ext(f, ".lib") || has_ext(f, ".so") || has_ext(f, ".dylib") ||
-	       has_ext(f, ".dll");
+	       has_ext(f, ".dll") || has_ext(f, ".exe");
 }
 
 static bool str_startswith(const char *s, const char *prefix) {
@@ -10813,8 +11263,13 @@ static char **cli_expand_response_files(int argc,
 	return out;
 }
 
+static bool prism_handles_x_lang(const char *lang) {
+	if (!lang || !*lang) return false;
+	return !strcmp(lang, "c") || !strcmp(lang, "cpp-output") || !strcmp(lang, "c-header");
+}
+
 static Cli cli_parse(int argc, char **argv) {
-	Cli cli = {.features = prism_defaults()};
+	Cli cli = {.features = prism_defaults(), .source_x_arg_idx = -1};
 	char **owned = NULL;
 	int owned_count = 0;
 	int eargc = 0;
@@ -10828,6 +11283,9 @@ static Cli cli_parse(int argc, char **argv) {
 	cli.rsp_argv = eargv;
 	argc = eargc;
 	argv = eargv;
+	/* GCC: `-x LANG` applies to subsequent inputs until the next `-x`. */
+	const char *cur_x_lang = NULL;
+	int last_x_arg_idx = -1;
 	for (int i = 1; i < argc; i++) {
 		char *a = argv[i];
 		/* check mode: first arg after `check` is the analyzer; everything
@@ -10839,7 +11297,8 @@ static Cli cli_parse(int argc, char **argv) {
 				cli.check_tool = a;
 				continue;
 			}
-			if (a[0] != '-' && (has_ext(a, ".c") || has_ext(a, ".i")))
+			if (a[0] != '-' && (has_ext(a, ".c") || has_ext(a, ".i") ||
+					    prism_handles_x_lang(cur_x_lang)))
 				CLI_PUSH(cli.sources, cli.source_count, cli.source_cap, a);
 			CLI_PUSH(cli.check_args, cli.check_arg_count, cli.check_arg_cap, a);
 			continue;
@@ -10871,7 +11330,57 @@ static Cli cli_parse(int argc, char **argv) {
 				cli.mode = CLI_CHECK;
 				continue;
 			}
-			if (!cli.passthrough && (has_ext(a, ".c") || has_ext(a, ".i"))) {
+			/* GCC/Clang: lone `-` means read the TU from stdin. */
+			if (!strcmp(a, "-")) {
+				if (cli.source_count == 0) {
+					cli.source_x_lang = cur_x_lang;
+					cli.source_x_arg_idx = last_x_arg_idx;
+				}
+				CLI_PUSH(cli.sources, cli.source_count, cli.source_cap, a);
+				continue;
+			}
+			/* MSVC-style /c /Fe /Fo — honor on all hosts so they are
+			 * not mistaken for input paths (`cc -E /c` → no such file). */
+			if (a[0] == '/') {
+				if (strcmp(a, "/c") == 0) {
+					cli.compile_only = true;
+					continue;
+				}
+				if (strncmp(a, "/Fe:", 4) == 0) {
+					cli.output = a + 4;
+					continue;
+				}
+				if (strncmp(a, "/Fe", 3) == 0 && a[3]) {
+					cli.output = a + 3;
+					continue;
+				}
+				if (strcmp(a, "/Fe") == 0 && i + 1 < argc) {
+					cli.output = argv[++i];
+					continue;
+				}
+				if (strncmp(a, "/Fo:", 4) == 0) {
+					cli.output = a + 4;
+					cli.compile_only = true;
+					continue;
+				}
+				if (strncmp(a, "/Fo", 3) == 0 && a[3]) {
+					cli.output = a + 3;
+					cli.compile_only = true;
+					continue;
+				}
+				if (strcmp(a, "/Fo") == 0 && i + 1 < argc) {
+					cli.output = argv[++i];
+					cli.compile_only = true;
+					continue;
+				}
+			}
+			/* `.c`/`.i`, or extensionless under `-x c` / `cpp-output`. */
+			if (!cli.passthrough &&
+			    (has_ext(a, ".c") || has_ext(a, ".i") || prism_handles_x_lang(cur_x_lang))) {
+				if (cli.source_count == 0) {
+					cli.source_x_lang = cur_x_lang;
+					cli.source_x_arg_idx = last_x_arg_idx;
+				}
 				CLI_PUSH(cli.sources, cli.source_count, cli.source_cap, a);
 				continue;
 			}
@@ -10880,35 +11389,8 @@ static Cli cli_parse(int argc, char **argv) {
 		}
 
 #ifdef _WIN32
-		// -- MSVC-style flags (start with /) --
+		// -- Remaining MSVC-style flags (start with /) — forwarded to cl --
 		if (a[0] == '/') {
-			// /Fe:output or /Fe output — MSVC output name
-			if (strncmp(a, "/Fe:", 4) == 0) {
-				cli.output = a + 4;
-				continue;
-			}
-			if (strncmp(a, "/Fe", 3) == 0 && a[3]) {
-				cli.output = a + 3;
-				continue;
-			}
-			if (strcmp(a, "/Fe") == 0 && i + 1 < argc) {
-				cli.output = argv[++i];
-				continue;
-			}
-			// /Fo:output — MSVC object output
-			if (strncmp(a, "/Fo:", 4) == 0) {
-				cli.output = a + 4;
-				cli.compile_only = true;
-				continue;
-			}
-			if (strncmp(a, "/Fo", 3) == 0 && a[3]) {
-				cli.output = a + 3;
-				cli.compile_only = true;
-				continue;
-			}
-			if (strcmp(a, "/c") == 0) {
-				cli.compile_only = true;
-			}
 			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
 			continue;
 		}
@@ -10954,7 +11436,14 @@ static Cli cli_parse(int argc, char **argv) {
 			return cli;
 		} else if (a[1] == 'c' && !a[2]) {
 			cli.compile_only = true;
+		} else if (a[1] == 'S' && !a[2]) {
+			cli.compile_only = true;
+			cli.assemble_only = true;
 		} else if (a[1] == 'E' && !a[2]) {
+			cli.passthrough = true;
+		} else if (!strcmp(a, "-M") || !strcmp(a, "-MM")) {
+			/* Like -E: preprocess-only. Must not transpile via stdin `-`
+			 * (backend would emit `-.o:` as the dep target). */
 			cli.passthrough = true;
 		} else if (a[1] == 'f') {
 			if (!strcmp(a, "-fno-defer")) {
@@ -11013,6 +11502,21 @@ static Cli cli_parse(int argc, char **argv) {
 					CLI_PUSH(cli.dep_args, cli.dep_arg_count, cli.dep_arg_cap, argv[++i]);
 				continue;
 			}
+		}
+
+		/* Track `-x LANG` / `-xLANG` for source classification + pipe lang. */
+		if (!strcmp(a, "-x") && i + 1 < argc) {
+			last_x_arg_idx = cli.cc_arg_count;
+			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
+			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, argv[++i]);
+			cur_x_lang = cli.cc_args[cli.cc_arg_count - 1];
+			continue;
+		}
+		if (a[1] == 'x' && a[2] && a[2] != '-') {
+			last_x_arg_idx = cli.cc_arg_count;
+			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
+			cur_x_lang = a + 2;
+			continue;
 		}
 
 		CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, a);
@@ -11594,10 +12098,49 @@ static const char *cli_output_path(const Cli *cli, const char *temp_exe, bool ms
 		const char *base = path_basename(cli->sources[0]);
 		snprintf(defobj, sizeof(defobj), "%s", base);
 		char *dot = strrchr(defobj, '.');
-		if (dot) snprintf(dot, sizeof(defobj) - (dot - defobj), "%s", msvc ? ".obj" : ".o");
+		const char *ext = cli->assemble_only ? ".s" : (msvc ? ".obj" : ".o");
+		if (dot) snprintf(dot, sizeof(defobj) - (size_t)(dot - defobj), "%s", ext);
+		else {
+			size_t n = strlen(defobj);
+			snprintf(defobj + n, sizeof(defobj) - n, "%s", ext);
+		}
 		return defobj;
 	}
 	return NULL;
+}
+
+/* Default object/asm name for source path (basename + .o/.s/.obj). */
+static void cli_default_unit_output(char *out, size_t outsz, const char *src, bool assemble_only,
+				   bool msvc) {
+	const char *base = path_basename(src);
+	snprintf(out, outsz, "%s", base);
+	char *dot = strrchr(out, '.');
+	const char *ext = assemble_only ? ".s" : (msvc ? ".obj" : ".o");
+	if (dot) snprintf(dot, outsz - (size_t)(dot - out), "%s", ext);
+	else {
+		size_t n = strlen(out);
+		snprintf(out + n, outsz - n, "%s", ext);
+	}
+}
+
+/* -MD/-MMD deps are generated during preprocess (`cc -E`), which strips `-o`.
+ * Inject `-MT <output>` so the .d target matches the real link/object name. */
+static void cli_inject_dep_mt_from_output(Cli *cli) {
+	if (!cli->output || !cli->output[0]) return;
+	bool has_md = false, has_mt = false;
+	for (int i = 0; i < cli->dep_arg_count; i++) {
+		const char *a = cli->dep_args[i];
+		if (!strcmp(a, "-MD") || !strcmp(a, "-MMD")) has_md = true;
+		if (!strcmp(a, "-MT") || !strcmp(a, "-MQ")) has_mt = true;
+		if (a[0] == '-' && a[1] == 'W' && a[2] == 'p' && a[3] == ',') {
+			const char *v = a + 4;
+			if (strstr(v, "-MD") || strstr(v, "-MMD")) has_md = true;
+			if (strstr(v, "-MT") || strstr(v, "-MQ")) has_mt = true;
+		}
+	}
+	if (!has_md || has_mt) return;
+	CLI_PUSH(cli->dep_args, cli->dep_arg_count, cli->dep_arg_cap, "-MT");
+	CLI_PUSH(cli->dep_args, cli->dep_arg_count, cli->dep_arg_cap, cli->output);
 }
 
 static void argv_add_output(const char **args, int *argc, const char *out, bool msvc, bool compile_only) {
@@ -11702,16 +12245,16 @@ static bool compiler_is_cxx_driver(const char *cc) {
 	return strstr(base, "++") != NULL || strcmp(base, "c++") == 0;
 }
 
-/* g++ with leading `-x c` omits -lstdc++ (GCC 16+). clang++ on Linux still
- * wants libstdc++; Apple clang++ wants libc++. */
+/* g++ with leading `-x c` omits -lstdc++ (GCC 16+). clang++ / Apple's c++
+ * already link the right C++ runtime — injecting -lc++/-lstdc++ only
+ * duplicates the library and can fail under -Wl,-fatal_warnings. */
 static void argv_add_cxx_stdlib(const char **args, int *argc, const char *compiler, bool clang) {
-	(void)compiler;
-	(void)clang;
-#if defined(__APPLE__)
-	args[(*argc)++] = "-lc++";
-#else
+	if (clang) return;
+	if (!compiler || !*compiler) return;
+	const char *base = path_basename(cc_executable(compiler));
+	/* `c++` drivers (libstdc++ or libc++) already pull the runtime. */
+	if (strcmp(base, "c++") == 0) return;
 	args[(*argc)++] = "-lstdc++";
-#endif
 }
 
 static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count, const TempCompilePlan *plan) {
@@ -12052,18 +12595,23 @@ static int compile_sources(Cli *cli) {
 	}
 
 	use_linemarkers = FEAT(F_FLATTEN) && !clang && !msvc;
-	if (cli->source_count == 1 && !msvc) {
-		// Extract user-specified -x <lang> from cc_args (if any) for the pipe
-		// language.
-		const char *pipe_lang = "c";
-		int x_flag_idx = -1;
-		for (int i = 0; i < cli->cc_arg_count - 1; i++) {
-			if (strcmp(cli->cc_args[i], "-x") == 0) {
-				pipe_lang = cli->cc_args[i + 1];
-				x_flag_idx = i;
-				break;
-			}
+	/* Stdin pipe + -save-temps makes the backend invent `-.i` / `-.s` names
+	 * (invalid args). Fall back to on-disk temps so save-temps keeps working. */
+	bool save_temps = false;
+	for (int i = 0; i < cli->cc_arg_count; i++) {
+		const char *a = cli->cc_args[i];
+		if (!strcmp(a, "-save-temps") || !strncmp(a, "-save-temps=", 12) ||
+		    !strcmp(a, "--save-temps") || !strncmp(a, "--save-temps=", 13)) {
+			save_temps = true;
+			break;
 		}
+	}
+	if (cli->source_count == 1 && !msvc && !save_temps) {
+		/* Pipe language follows the `-x` that bound the Prism source
+		 * (GCC positional rules). Do NOT steal a later `-x c++` meant
+		 * for a passthrough .cpp — that used to compile C as C++. */
+		const char *pipe_lang = cli->source_x_lang ? cli->source_x_lang : "c";
+		int x_flag_idx = cli->source_x_arg_idx;
 		/* GCC `-x none` restores extension-based guessing for subsequent files.
 		 * Our pipe is stdin, so map `none` back to the TU's default language. */
 		if (pipe_lang && !strcmp(pipe_lang, "none")) pipe_lang = "c";
@@ -12079,7 +12627,7 @@ static int compile_sources(Cli *cli) {
 		bool need_x_none = false;
 		for (int i = 0; i < cli->cc_arg_count; i++) {
 			if (i == x_flag_idx) {
-				i++;
+				if (!strcmp(cli->cc_args[i], "-x") && i + 1 < cli->cc_arg_count) i++;
 				continue;
 			}
 			const char *a = cli->cc_args[i];
@@ -12101,9 +12649,9 @@ static int compile_sources(Cli *cli) {
 		}
 		for (int i = 0; i < cli->cc_arg_count; i++) {
 			if (i == x_flag_idx) {
-				i++;
+				if (!strcmp(cli->cc_args[i], "-x") && i + 1 < cli->cc_arg_count) i++;
 				continue;
-			} // skip extracted -x <lang>
+			}
 			int fi_skip = cc_backend_force_include_skip(cli->cc_args, i, cli->cc_arg_count);
 			if (fi_skip) {
 				i += fi_skip - 1;
@@ -12124,17 +12672,46 @@ static int compile_sources(Cli *cli) {
 	} else {
 		char **temps = transpile_sources_to_temps(cli, false);
 		if (!temps) die("Transpilation failed");
-		TempCompilePlan plan = {
-		    .compiler = compiler,
-		    .clang = clang,
-		    .msvc = msvc,
-		    .output = cli_output_path(cli, temp_exe, msvc),
-		    .compile_only = cli->compile_only,
-		    .suppress_warnings = true,
-		    .use_preprocessed = FEAT(F_FLATTEN) && !clang && !msvc,
-		};
-		status = run_temp_compile_plan(cli, temps, cli->source_count, &plan);
-		cleanup_temp_range(temps, cli->source_count);
+		if (cli->compile_only && cli->output && cli->source_count > 1) {
+			fprintf(stderr, "error: cannot specify -o when generating multiple output files\n");
+			status = 1;
+			cleanup_temp_range(temps, cli->source_count);
+		} else if (cli->compile_only && !cli->output && cli->source_count > 1) {
+			/* `cc -c a.c b.c` writes a.o b.o — not temp basenames. */
+			status = 0;
+			for (int i = 0; i < cli->source_count; i++) {
+				char out[PATH_MAX];
+				cli_default_unit_output(out, sizeof(out), cli->sources[i], cli->assemble_only,
+							msvc);
+				TempCompilePlan plan = {
+				    .compiler = compiler,
+				    .clang = clang,
+				    .msvc = msvc,
+				    .output = out,
+				    .compile_only = true,
+				    .suppress_warnings = true,
+				    .use_preprocessed = FEAT(F_FLATTEN) && !clang && !msvc,
+				};
+				int st = run_temp_compile_plan(cli, &temps[i], 1, &plan);
+				if (st != 0) {
+					status = st;
+					break;
+				}
+			}
+			cleanup_temp_range(temps, cli->source_count);
+		} else {
+			TempCompilePlan plan = {
+			    .compiler = compiler,
+			    .clang = clang,
+			    .msvc = msvc,
+			    .output = cli_output_path(cli, temp_exe, msvc),
+			    .compile_only = cli->compile_only,
+			    .suppress_warnings = true,
+			    .use_preprocessed = FEAT(F_FLATTEN) && !clang && !msvc,
+			};
+			status = run_temp_compile_plan(cli, temps, cli->source_count, &plan);
+			cleanup_temp_range(temps, cli->source_count);
+		}
 	}
 
 	if (status != 0) {
@@ -12257,6 +12834,9 @@ int main(int argc, char **argv) {
 	ctx->extra_compiler = get_real_cc(cli.cc);
 	ctx->extra_compiler_flags = cli.cc_args;
 	ctx->extra_compiler_flags_count = cli.cc_arg_count;
+	ctx->dep_flags = cli.dep_args;
+	ctx->dep_flags_count = cli.dep_arg_count;
+	cli_inject_dep_mt_from_output(&cli);
 	ctx->dep_flags = cli.dep_args;
 	ctx->dep_flags_count = cli.dep_arg_count;
 	if (cli.mode == CLI_CHECK) {

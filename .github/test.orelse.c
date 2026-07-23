@@ -1278,6 +1278,63 @@ static void test_orelse_struct_value_rejected(void) {
 	    "orelse_struct_value_reject.c",
 	    "orelse struct value: rejected",
 	    "struct/union");
+	check_orelse_transpile_rejects(
+	    "struct S { int x; };\n"
+	    "void f(void) {\n"
+	    "    struct S s = {0};\n"
+	    "    s = s orelse s;\n"
+	    "}\n",
+	    "orelse_bare_struct_assign_reject.c",
+	    "orelse bare struct assign: rejected",
+	    "struct/union");
+	check_orelse_transpile_rejects(
+	    "struct S { int x; };\n"
+	    "void f(void) {\n"
+	    "    struct S s = {0};\n"
+	    "    struct S t;\n"
+	    "    t = s orelse ((struct S){0});\n"
+	    "}\n",
+	    "orelse_bare_struct_compound_reject.c",
+	    "orelse bare struct compound: rejected",
+	    "struct/union");
+	check_orelse_transpile_rejects(
+	    "struct Pair { int x; int y; };\n"
+	    "struct Pair get_pair(void);\n"
+	    "struct Pair fallback_pair(void);\n"
+	    "void f(void) {\n"
+	    "    struct Pair p;\n"
+	    "    p = get_pair() orelse fallback_pair();\n"
+	    "}\n",
+	    "orelse_bare_struct_call_reject.c",
+	    "orelse bare struct call: rejected",
+	    "struct/union");
+	check_orelse_transpile_rejects(
+	    "struct Pair { int x; int y; };\n"
+	    "struct Pair get_pair(void);\n"
+	    "struct Pair fallback_pair(void);\n"
+	    "void f(struct Pair *out) {\n"
+	    "    *out = get_pair() orelse fallback_pair();\n"
+	    "}\n",
+	    "orelse_bare_struct_indir_reject.c",
+	    "orelse bare struct indirection: rejected",
+	    "struct/union");
+	/* Pointer-inside-typeof must not inherit the SUE struct-value reject. */
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct S { int x; };\n"
+		    "struct S *get(void);\n"
+		    "struct S *fb(void);\n"
+		    "void f(void) {\n"
+		    "    __typeof__(struct S *) p = get() orelse fb();\n"
+		    "    __typeof__(struct S * const) q = get() orelse fb();\n"
+		    "    _Atomic(struct S *) a = get() orelse fb();\n"
+		    "    (void)p; (void)q; (void)a;\n"
+		    "}\n",
+		    "orelse_typeof_struct_ptr.c",
+		    prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "typeof/_Atomic(struct S *) orelse: accepted");
+		prism_free(&r);
+	}
 }
 
 #ifdef __GNUC__
@@ -9255,4 +9312,67 @@ void run_orelse_tests(void) {
 
 	// typeof(expr orelse val) in bare orelse fallback — orelse must not leak
 	test_typeof_orelse_in_fallback();
+
+	/* Fan-out regressions: static_assert bracket orelse, bare chain ctrl,
+	 * struct+action reject, bitfield typeof(+0). */
+	{
+		printf("\n--- orelse fan-out regressions ---\n");
+		PrismResult r = prism_transpile_source(
+		    "_Static_assert(sizeof(char[1 orelse 2]) == 1, \"x\");\n"
+		    "int main(void){return 0;}\n",
+		    "oe_sa_bracket.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "static_assert bracket orelse: OK");
+		if (r.output)
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "static_assert bracket orelse: does not leak");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "_Static_assert(1 orelse 2, \"x\"); int main(void){return 0;}\n",
+		    "oe_sa_bare.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "static_assert bare orelse: rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int *a(void); int *b(void); int main(void){\n"
+		    "  int *p; p = a() orelse b() orelse return 7; return 0;}\n",
+		    "oe_chain_ret.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "bare chain ending return: OK");
+		if (r.output)
+			CHECK(strstr(r.output, "return") != NULL &&
+				  strstr(r.output, "( return") == NULL &&
+				  strstr(r.output, "= ( return") == NULL,
+			      "bare chain ending return: action form not (return)");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int *a(void); int main(void){\n"
+		    "  static int x=1; int *p = a() orelse goto fail orelse &x;\n"
+		    "  return 0; fail: return 1;}\n",
+		    "oe_mid_goto.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "mid-chain goto+orelse: rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct S{int a;}; struct S get(void);\n"
+		    "int main(void){struct S v; v = get() orelse return 1; return 0;}\n",
+		    "oe_struct_act.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "bare struct+action orelse: rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "struct B{int f:4;}; int main(void){\n"
+		    "  struct B b={3}; b.f = b.f orelse 7; return b.f!=3;}\n",
+		    "oe_bf_self.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "bitfield=bitfield orelse: OK");
+		if (r.output)
+			CHECK(strstr(r.output, "+0") != NULL,
+			      "bitfield=bitfield orelse: typeof uses +0 promotion");
+		prism_free(&r);
+	}
 }
