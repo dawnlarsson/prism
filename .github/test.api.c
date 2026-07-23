@@ -3998,6 +3998,72 @@ static void test_cli_dep_flags_routing(void) {
 	rmdir(dir);
 }
 
+/* `prism check <tool>`: sources are swapped for analysis-profile transpile
+ * artifacts; findings must map to ORIGINAL file:line via #line; the tool's
+ * exit code propagates. Skips when cppcheck is not installed. */
+static void test_cli_check_analyzer(void) {
+	printf("\n--- CLI check (static analyzer wrapper) ---\n");
+
+	if (system("cppcheck --version >/dev/null 2>&1") != 0) {
+		passed++;
+		total++;
+		printf("[PASS] check: skipped (cppcheck not installed)\n");
+		return;
+	}
+
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_check_");
+	CHECK(dir != NULL, "check: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], src[PATH_MAX], errtxt[PATH_MAX], cmd[PATH_MAX * 4];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	if (!build_test_prism_binary(prism_bin, "check: build prism binary")) {
+		rmdir(dir);
+		return;
+	}
+
+	snprintf(src, sizeof(src), "%s/bug.c", dir);
+	FILE *f = fopen(src, "w");
+	CHECK(f != NULL, "check: write source");
+	if (f) {
+		fputs("int get(void);\n"
+		      "int f(void) {\n"
+		      "\tint x = get() orelse 7;\n"
+		      "\tint arr[8];\n"
+		      "\tarr[8] = x;\n" /* out-of-bounds: cppcheck must see it */
+		      "\treturn arr[0];\n"
+		      "}\n",
+		      f);
+		fclose(f);
+	}
+	snprintf(errtxt, sizeof(errtxt), "%s/err.txt", dir);
+	snprintf(cmd,
+		 sizeof(cmd),
+		 "'%s' check cppcheck --error-exitcode=2 --enable=warning '%s' >/dev/null 2>'%s'",
+		 prism_bin, src, errtxt);
+	int st = system(cmd);
+	CHECK(st != 0, "check: analyzer exit code propagates on findings");
+	bool mapped = false;
+	f = fopen(errtxt, "r");
+	if (f) {
+		char ebuf[8192];
+		size_t got = fread(ebuf, 1, sizeof(ebuf) - 1, f);
+		ebuf[got] = '\0';
+		fclose(f);
+		mapped = strstr(ebuf, "bug.c:5") != NULL && strstr(ebuf, "arrayIndexOutOfBounds") != NULL;
+	}
+	CHECK(mapped, "check: finding maps to original file:line via #line");
+
+	snprintf(cmd, sizeof(cmd), "'%s' check cppcheck --version >/dev/null 2>&1", prism_bin);
+	CHECK_EQ(system(cmd), 0, "check: no-source tool passthrough");
+
+	snprintf(cmd, sizeof(cmd), "rm -f '%s' '%s'", src, errtxt);
+	(void)system(cmd);
+	unlink(prism_bin);
+	rmdir(dir);
+}
+
 /* GCC-compatible @file expansion: rsp-listed sources must be transpiled;
  * libiberty tokenization (quotes anywhere in a token, single + double);
  * unreadable @file kept literally; self-recursion terminates at the cap. */
@@ -8738,6 +8804,7 @@ void run_api_tests_3(void) {
 	test_cli_mixed_c_cpp_driver();
 	test_cli_file_kind_driver_matrix();
 	test_cli_response_files();
+	test_cli_check_analyzer();
 	test_preprocess_failure_no_stdout_dump();
 	test_cli_include_prism_header_not_reinjected();
 	test_cli_split_I_keeps_fpreprocessed();

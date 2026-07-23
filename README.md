@@ -465,6 +465,45 @@ Not:
 
 **Disable:** `prism -fno-line-directives src.c` (useful for debugging transpiler output)
 
+## Static Analysis (CppCheck, clang-tidy, …)
+
+`prism check` wraps any analyzer the same way `CC=prism` wraps your compiler:
+prepend it to the command you already run. Source args are transpiled to
+standard-C artifacts behind the scenes; everything else passes through verbatim,
+the tool's exit code is preserved, and the emitted `#line` directives map every
+finding back to your original source lines:
+
+```sh
+prism check cppcheck --enable=all src.c
+# → src.c:12:4: error: Array 'arr[8]' accessed at index 8, out of bounds
+prism check clang-tidy src.c -- -I include
+```
+
+`check` shapes the artifact for analysis automatically: `#include` lines stay
+intact (no header flattening) and subscripts stay bare so the analyzer sees
+`arr[8]` rather than a runtime bounds-check wrapper. Your shipping build keeps
+both features on — this only affects the analysis artifact. Prism flags before
+`check` still apply (e.g. `prism -fno-zeroinit check cppcheck …`).
+
+The manual equivalent, if you need the artifact itself:
+
+```sh
+prism transpile -fno-flatten-headers -fno-bounds-check src.c > build/src.c
+cppcheck --enable=all build/src.c
+```
+
+Analyzing the expansion is **strictly stronger** than analyzing the source:
+the analyzer sees the real control flow *including* defer cleanup. A manual
+`fclose(f)` before an early return alongside `defer fclose(f);` is reported by
+CppCheck as `doubleFree: Resource handle 'f' freed twice` — a bug class no
+source-level C analyzer can see, because none of them understand `defer`.
+
+Raw Prism sources (files using `orelse`) stop CppCheck at the first keyword with
+an `unknownMacro` configuration error, so point analyzers at the transpiled
+artifact. Files that use no Prism keywords are plain C and analyze as-is. Note:
+automatic zero-init may surface as `redundantAssignment` at style level when you
+immediately overwrite a variable — suppress that id or read it as intentional.
+
 ## CLI
 
 Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.

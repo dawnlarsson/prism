@@ -241,7 +241,7 @@ static inline P1FuncEntry *p1_alloc(int knd, uint16_t sid, Token *t) {
 	return e;
 }
 
-typedef enum { CLI_DEFAULT, CLI_RUN, CLI_EMIT, CLI_INSTALL } CliMode;
+typedef enum { CLI_DEFAULT, CLI_RUN, CLI_EMIT, CLI_INSTALL, CLI_CHECK } CliMode;
 
 typedef enum { CLI_ACT_NONE, CLI_ACT_HELP, CLI_ACT_VERSION } CliAction;
 
@@ -256,6 +256,9 @@ typedef struct {
 	const char *cc;
 	char **rsp_owned; // heap tokens from @file expansion (freed by cli_free)
 	char **rsp_argv;  // expanded argv array; elements point into rsp_owned
+	const char *check_tool; // `prism check <tool>`: analyzer executable
+	char **check_args;	// tool args verbatim (sources substituted at spawn)
+	int check_arg_count, check_arg_cap;
 	int source_count, source_cap;
 	int cc_arg_count, cc_arg_cap;
 	int dep_arg_count, dep_arg_cap;
@@ -10827,6 +10830,20 @@ static Cli cli_parse(int argc, char **argv) {
 	argv = eargv;
 	for (int i = 1; i < argc; i++) {
 		char *a = argv[i];
+		/* check mode: first arg after `check` is the analyzer; everything
+		 * after that belongs to the tool verbatim (including `--` and `-`
+		 * flags — the tool owns its namespace). Source args are recorded
+		 * in both lists and substituted with transpile temps at spawn. */
+		if (cli.mode == CLI_CHECK) {
+			if (!cli.check_tool) {
+				cli.check_tool = a;
+				continue;
+			}
+			if (a[0] != '-' && (has_ext(a, ".c") || has_ext(a, ".i")))
+				CLI_PUSH(cli.sources, cli.source_count, cli.source_cap, a);
+			CLI_PUSH(cli.check_args, cli.check_arg_count, cli.check_arg_cap, a);
+			continue;
+		}
 		if (a[0] == '-' && a[1] == '-' && !a[2]) {
 			for (int j = i + 1; j < argc; j++)
 				CLI_PUSH(cli.prog_args, cli.prog_arg_count, cli.prog_arg_cap, argv[j]);
@@ -10848,6 +10865,10 @@ static Cli cli_parse(int argc, char **argv) {
 			}
 			if (!strcmp(a, "install")) {
 				cli.mode = CLI_INSTALL;
+				continue;
+			}
+			if (!strcmp(a, "check")) {
+				cli.mode = CLI_CHECK;
 				continue;
 			}
 			if (!cli.passthrough && (has_ext(a, ".c") || has_ext(a, ".i"))) {
@@ -11014,6 +11035,9 @@ static void cli_free(Cli *cli) {
 	}
 	free(cli->rsp_argv);
 	cli->rsp_argv = NULL;
+	free(cli->check_args);
+	cli->check_args = NULL;
+	cli->check_arg_count = 0;
 	cli->sources = NULL;
 	cli->cc_args = NULL;
 	cli->dep_args = NULL;
@@ -11473,6 +11497,9 @@ static PRISM_COLD void print_help(void) {
 	       "  run <src.c> [-- args]  Transpile, compile, and run (args passed to "
 	       "binary)\n"
 	       "  transpile <src.c>      Output transpiled C to stdout\n"
+	       "  check <tool> [args]    Run a static analyzer (cppcheck, clang-tidy, ...) on\n"
+	       "                         transpiled sources; .c/.i args are swapped for analysis\n"
+	       "                         artifacts, findings map to original lines via #line\n"
 	       "  install [src.c...]     Install prism to %s\n\n"
 	       "Prism Flags (consumed, not passed to CC):\n"
 	       "  -fno-defer             Disable defer\n"
@@ -12217,13 +12244,53 @@ int main(int argc, char **argv) {
 		cli.cc = (env_cc && *env_cc) ? env_cc : PRISM_DEFAULT_CC;
 	}
 
+	/* Analysis profile for `prism check`: keep language semantics (defer/
+	 * orelse/zeroinit) but shape the artifact for analyzers — #include lines
+	 * intact and bare subscripts (the bounds wrapper hides constant indices
+	 * from static analysis; the shipping build still gets both features). */
+	if (cli.mode == CLI_CHECK) {
+		cli.features.flatten_headers = false;
+		cli.features.bounds_check = false;
+		cli.features.line_directives = true;
+	}
 	ctx->features = features_to_bits(cli.features);
 	ctx->extra_compiler = get_real_cc(cli.cc);
 	ctx->extra_compiler_flags = cli.cc_args;
 	ctx->extra_compiler_flags_count = cli.cc_arg_count;
 	ctx->dep_flags = cli.dep_args;
 	ctx->dep_flags_count = cli.dep_arg_count;
-	if (cli.mode == CLI_INSTALL)
+	if (cli.mode == CLI_CHECK) {
+		if (!cli.check_tool) die("check: no analyzer given (usage: prism check <tool> [args...])");
+		char **temps = NULL;
+		if (cli.source_count > 0) {
+			temps = transpile_sources_to_temps(&cli, false);
+			if (!temps) {
+				cli_free(&cli);
+				return 1;
+			}
+		}
+		const char **targv = alloc_argv(2 + cli.check_arg_count);
+		int tc = 0;
+		targv[tc++] = cli.check_tool;
+		for (int i = 0; i < cli.check_arg_count; i++) {
+			const char *ta = cli.check_args[i];
+			for (int k = 0; k < cli.source_count; k++)
+				if (ta == cli.sources[k]) {
+					ta = temps[k];
+					break;
+				}
+			targv[tc++] = ta;
+		}
+		targv[tc] = NULL;
+		if (cli.verbose) {
+			fprintf(stderr, "[prism] check:");
+			for (int i = 0; i < tc; i++) fprintf(stderr, " %s", targv[i]);
+			fprintf(stderr, "\n");
+		}
+		status = run_command((char **)targv);
+		free((void *)targv);
+		if (temps) cleanup_temp_range(temps, cli.source_count);
+	} else if (cli.mode == CLI_INSTALL)
 		status = cli.source_count > 0 ? install_from_source(&cli) : install(argv[0]);
 	else if (cli.mode == CLI_EMIT) {
 		if (cli.source_count == 0) die("No source files specified");
