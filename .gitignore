@@ -8,3 +8,10 @@ prism-dbg
 compat/
 .github/test.torture.c
 .github/CERTIFICATION.md
+# Backend intermediates left in the CWD by prism temp compiles (e.g. a
+# `-save-temps` test running from the repo root). Root-anchored so real
+# .s/.i/.bc fixtures under subdirs are unaffected.
+/.t.c.*
+/*.bc
+/*.i
+/*.s

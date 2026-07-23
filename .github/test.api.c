@@ -6979,17 +6979,20 @@ static void test_cli_driver_output_and_deps(void) {
 		FILE *cf = fopen(cl_bin, "w");
 		CHECK(cf != NULL, "drv: write fake cl");
 		if (cf) {
-			fputs("#!/bin/bash\n"
+			/* POSIX sh, not bash — Alpine CI has no /bin/bash. */
+			fputs("#!/bin/sh\n"
 			      "echo \"CL: $*\" >&2\n"
-			      "if [[ \" $* \" == *\" /E \"* ]]; then\n"
-			      "  for a in \"$@\"; do\n"
-			      "    if [[ \"$a\" == *.obj || \"$a\" == *.exe ]]; then\n"
-			      "      echo \"LEAKED_INTO_PREPROCESS: $a\" >&2; exit 2\n"
-			      "    fi\n"
-			      "  done\n"
-			      "  echo 'int main(void){return 0;}'\n"
-			      "  exit 0\n"
-			      "fi\n"
+			      "case \" $* \" in\n"
+			      "  *\" /E \"*)\n"
+			      "    for a in \"$@\"; do\n"
+			      "      case \"$a\" in\n"
+			      "        *.obj|*.exe)\n"
+			      "          echo \"LEAKED_INTO_PREPROCESS: $a\" >&2; exit 2 ;;\n"
+			      "      esac\n"
+			      "    done\n"
+			      "    echo 'int main(void){return 0;}'\n"
+			      "    exit 0 ;;\n"
+			      "esac\n"
 			      "exit 0\n",
 			      cf);
 			fclose(cf);

@@ -11111,7 +11111,10 @@ static int rsp_tokenize_buf(const char *text,
 		size_t n = 0, tcap = 0;
 		/* libiberty buildargv semantics: backslash escapes the next char in
 		 * every state; single/double quotes toggle anywhere in the token
-		 * (`-DMSG="a b"` is ONE arg); a trailing lone backslash is dropped. */
+		 * (`-DMSG="a b"` is ONE arg); a trailing lone backslash is dropped.
+		 * On Windows a backslash is a PATH SEPARATOR, not an escape — only a
+		 * backslash immediately before `"` is special (MS convention), so
+		 * paths like C:\dir\app survive verbatim in a response file. */
 		bool squote = false, dquote = false, bsquote = false;
 		while (*p) {
 			char c = *p;
@@ -11119,10 +11122,14 @@ static int rsp_tokenize_buf(const char *text,
 			    (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'))
 				break;
 			bool emit = false;
+			bool is_escape = c == '\\';
+#ifdef _WIN32
+			is_escape = is_escape && p[1] == '"';
+#endif
 			if (bsquote) {
 				bsquote = false;
 				emit = true;
-			} else if (c == '\\') {
+			} else if (is_escape) {
 				bsquote = true;
 			} else if (squote) {
 				if (c == '\'') squote = false;
