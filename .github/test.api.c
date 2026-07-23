@@ -4005,6 +4005,135 @@ static void test_cli_dep_flags_routing(void) {
 	rmdir(dir);
 }
 
+static void test_cli_mixed_c_cpp_driver(void) {
+	printf("\n--- CLI mixed .c + .cpp (pp must not ingest .cpp) ---\n");
+
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_cxxmix_");
+	CHECK(dir != NULL, "cxxmix: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], c_path[PATH_MAX], cxx_path[PATH_MAX], out_path[PATH_MAX];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	snprintf(c_path, sizeof(c_path), "%s/lib.c", dir);
+	snprintf(cxx_path, sizeof(cxx_path), "%s/main.cpp", dir);
+	snprintf(out_path, sizeof(out_path), "%s/app", dir);
+
+	FILE *f = fopen(c_path, "w");
+	CHECK(f != NULL, "cxxmix: write lib.c");
+	if (!f) {
+		rmdir(dir);
+		return;
+	}
+	fputs("int prism_add(int a, int b) { return a + b; }\n", f);
+	fclose(f);
+
+	f = fopen(cxx_path, "w");
+	CHECK(f != NULL, "cxxmix: write main.cpp");
+	if (!f) {
+		unlink(c_path);
+		rmdir(dir);
+		return;
+	}
+	fputs("extern \"C\" int prism_add(int, int);\n"
+	      "int main() { return prism_add(2, 3) == 5 ? 0 : 1; }\n",
+	      f);
+	fclose(f);
+
+	if (!build_test_prism_binary(prism_bin, "cxxmix: build prism binary")) {
+		unlink(c_path);
+		unlink(cxx_path);
+		rmdir(dir);
+		return;
+	}
+
+	char cmd[PATH_MAX * 4];
+	snprintf(cmd,
+		 sizeof(cmd),
+		 "'%s' '%s' '%s' -o '%s' >/dev/null 2>&1",
+		 prism_bin,
+		 c_path,
+		 cxx_path,
+		 out_path);
+	int st = system(cmd);
+	CHECK_EQ(st, 0, "cxxmix: prism lib.c main.cpp links");
+	if (st == 0) {
+		snprintf(cmd, sizeof(cmd), "'%s'", out_path);
+		CHECK_EQ(system(cmd), 0, "cxxmix: mixed binary runs");
+	}
+
+	/* Pure .cpp must use g++/clang++ so libc++/libstdc++ link. */
+	char cpp_only[PATH_MAX], out_cpp[PATH_MAX];
+	snprintf(cpp_only, sizeof(cpp_only), "%s/stl.cpp", dir);
+	snprintf(out_cpp, sizeof(out_cpp), "%s/stl", dir);
+	f = fopen(cpp_only, "w");
+	CHECK(f != NULL, "cxxmix: write stl.cpp");
+	if (f) {
+		fputs("#include <string>\n"
+		      "int main() { return std::string(\"ab\").size() == 2 ? 0 : 1; }\n",
+		      f);
+		fclose(f);
+		snprintf(cmd,
+			 sizeof(cmd),
+			 "'%s' '%s' -o '%s' >/dev/null 2>&1",
+			 prism_bin,
+			 cpp_only,
+			 out_cpp);
+		st = system(cmd);
+		CHECK_EQ(st, 0, "cxxmix: pure .cpp STL links via c++ driver");
+		if (st == 0) {
+			snprintf(cmd, sizeof(cmd), "'%s'", out_cpp);
+			CHECK_EQ(system(cmd), 0, "cxxmix: pure .cpp STL runs");
+		}
+		unlink(cpp_only);
+		unlink(out_cpp);
+	}
+
+	/* Multi .c temps must stay C when the link driver is g++/clang++. */
+	char c2_path[PATH_MAX], cxx2_path[PATH_MAX], out2[PATH_MAX];
+	snprintf(c2_path, sizeof(c2_path), "%s/b.c", dir);
+	snprintf(cxx2_path, sizeof(cxx2_path), "%s/more.cpp", dir);
+	snprintf(out2, sizeof(out2), "%s/app2", dir);
+	f = fopen(c2_path, "w");
+	CHECK(f != NULL, "cxxmix: write b.c");
+	if (f) {
+		fputs("int prism_mul(int a, int b) { return a * b; }\n", f);
+		fclose(f);
+	}
+	f = fopen(cxx2_path, "w");
+	CHECK(f != NULL, "cxxmix: write more.cpp");
+	if (f) {
+		fputs("extern \"C\" int prism_add(int, int);\n"
+		      "extern \"C\" int prism_mul(int, int);\n"
+		      "int main() { return prism_add(2, 3) + prism_mul(2, 3) == 11 ? 0 : 1; }\n",
+		      f);
+		fclose(f);
+		snprintf(cmd,
+			 sizeof(cmd),
+			 "'%s' '%s' '%s' '%s' -o '%s' >/dev/null 2>&1",
+			 prism_bin,
+			 c_path,
+			 c2_path,
+			 cxx2_path,
+			 out2);
+		st = system(cmd);
+		CHECK_EQ(st, 0, "cxxmix: multi .c + .cpp links with -x c temps");
+		if (st == 0) {
+			snprintf(cmd, sizeof(cmd), "'%s'", out2);
+			CHECK_EQ(system(cmd), 0, "cxxmix: multi .c + .cpp runs");
+		}
+		unlink(c2_path);
+		unlink(cxx2_path);
+		unlink(out2);
+	}
+
+	unlink(c_path);
+	unlink(cxx_path);
+	unlink(out_path);
+	unlink(prism_bin);
+	rmdir(dir);
+}
+
 static void test_cli_dep_flags_passthrough(void) {
 	printf("\n--- CLI Dependency Flags Passthrough (.S) ---\n");
 
@@ -5462,12 +5591,10 @@ static void test_cc_split_quoting_bypass(void) {
 	}
 }
 
-// orelse inside [...] in a return statement leaks verbatim when defers are active.
-// emit_expr_to_semicolon calls walk_balanced(tok, true) for '[' without checking
-// for orelse, so the keyword passes through un-transformed.  Without defers, the
-// main transpile_tokens loop catch-all (line ~4768) catches the token, but with
-// an active defer, handle_return_defer dispatches to emit_return_body which uses
-// emit_expr_to_semicolon, bypassing the catch-all entirely.
+// orelse inside [...] in a return statement used to leak verbatim when defers
+// are active: emit_expr_to_semicolon → walk_balanced skipped bracket-orelse
+// transform, while the main loop catch-all was bypassed by handle_return_defer.
+// walk_balanced now routes annotated `[` through try_bracket_orelse.
 static void test_orelse_bracket_leak_in_return_defer(void) {
 	printf("\n--- orelse bracket leak in return+defer ---\n");
 
@@ -5483,15 +5610,10 @@ static void test_orelse_bracket_leak_in_return_defer(void) {
 	PrismFeatures feat = prism_defaults();
 	PrismResult r = prism_transpile_source(code, "bracket_leak.c", feat);
 
-	// Before the fix: transpilation silently succeeded but output contained
-	// literal 'orelse', causing cc to fail.  After the fix: orelse inside
-	// brackets is correctly rejected at transpile time.
-	CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
-		 "bracket orelse defer: orelse inside brackets is rejected");
-	if (r.error_msg) {
-		CHECK(strstr(r.error_msg, "orelse") != NULL,
-		      "bracket orelse defer: error message mentions orelse");
-	}
+	CHECK_EQ(r.status, PRISM_OK,
+		 "bracket orelse defer: transpile OK");
+	CHECK(r.output && !strstr(r.output, " orelse "),
+	      "bracket orelse defer: orelse transformed (no literal keyword)");
 	prism_free(&r);
 }
 
@@ -7764,6 +7886,7 @@ void run_api_tests_3(void) {
 	UNIX_ONLY(
 	test_cli_dep_flags_routing();
 	test_cli_dep_flags_passthrough();
+	test_cli_mixed_c_cpp_driver();
 	test_version_shows_backend_cc();
 	test_version_full_output_for_meson();
 	test_cli_split_D_flag_not_source();

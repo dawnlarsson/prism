@@ -1,13 +1,13 @@
 ![Prism Banner](https://github.com/user-attachments/assets/051187c2-decd-497e-9beb-b74031eb84ed)
 
-![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-6122%2B_pass-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
+![License](https://img.shields.io/badge/license-Apache_2.0-blue) ![Language](https://img.shields.io/badge/language-C-lightgrey) ![Tests](https://img.shields.io/badge/tests-6200%2B_pass-brightgreen) ![Zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
 
 ## Robust C by default
 **A dialect of C with `defer`, `orelse`, automatic zero-initialization, bounds checking, and progressive optimization.**
 
 Prism is a lightweight and very fast transpiler that makes C safer and faster without changing how you write it.
 
-- **6122+ tests** — edge cases, control flow, nightmares, trying hard to break Prism
+- **6200+ tests** — edge cases, control flow, nightmares, trying hard to break Prism
 - **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
 - **Two-pass transpiler** — full semantic analysis before a single byte is emitted
 - **Progressive optimization** — auto-unreachable after noreturn calls, const arrays promoted to static storage
@@ -116,7 +116,7 @@ Defers execute in **LIFO order** (last defer runs first) at scope exit — wheth
 - Nested loops — `break`/`continue` unwind the correct scope
 - Computed goto — `goto *ptr` with active defers is a hard error
 
-**Forbidden patterns:** Functions using `setjmp`/`longjmp`/`pthread_exit`, `vfork`, or inline assembly are rejected to prevent resource leaks from non-local jumps.
+**Forbidden patterns:** Functions using `setjmp`/`longjmp`/`pthread_exit`, `vfork`, or `asm goto` are rejected to prevent resource leaks from non-local jumps. Regular inline assembly is fine.
 
 **Opt-out:** `prism -fno-defer src.c`
 
@@ -545,12 +545,16 @@ API:
 ```c
 PrismFeatures prism_defaults(void);
 PrismResult   prism_transpile_file(const char *path, PrismFeatures features);
+PrismResult   prism_transpile_source(const char *source, const char *filename,
+                                     PrismFeatures features);  // pre-preprocessed input
 void          prism_free(PrismResult *r);
+void          prism_reset(void);           // reclaim arenas (automatic on error)
+void          prism_thread_cleanup(void);  // free thread-locals before thread exit
 ```
 
 ## Architecture
 
-Prism processes C in two passes. Pass 1 performs full semantic analysis and catches all user-triggerable errors. Pass 2 is a near-pure code generator that reads Pass 1's immutable artifacts — no type table mutations, no speculative token walking. Defensive assertions in Pass 2 guard against internal consistency violations but are not reachable from valid or invalid user input.
+Prism processes C in two passes. Pass 1 performs full semantic analysis, annotates the token stream, and catches all user-triggerable errors. Pass 2 is a near-pure code generator that reads Pass 1's immutable artifacts — no type table mutations, no speculative token walking. Pass 2's defensive assertions (unreachable when Pass 1 is correct) are compiled only in `PRISM_DEBUG` builds; the debug suite run verifies Pass 1 covers every case.
 
 | Phase | What it does |
 |---|---|

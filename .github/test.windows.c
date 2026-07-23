@@ -2344,6 +2344,11 @@ static void test_win_memstream_wide_temp(void) {
 		FILE *fp = open_memstream(&buf, &sz);
 		CHECK(fp != NULL, "memstream_wide: open_memstream succeeds");
 		if (fp) {
+			/* Nested open must fail — single TLS slot. */
+			char *buf2 = NULL;
+			size_t sz2 = 0;
+			FILE *fp2 = open_memstream(&buf2, &sz2);
+			CHECK(fp2 == NULL, "memstream_wide: nested open_memstream rejected");
 			fprintf(fp, "hello memstream");
 			fclose(fp); // triggers read-back
 

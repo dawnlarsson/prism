@@ -4,4 +4,6 @@ prism
 prism.exe
 prism_check
 prism.o
+prism-dbg
+compat/
 .github/CERTIFICATION.md

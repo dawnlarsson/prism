@@ -177,29 +177,37 @@ static const char ERR_BOUNDS_COMM_SCAN[] =
 			(unsigned char)((len) > 6 ? (key)[6] : (key)[(len) - 1]) * 69) &                     \
 		       255))
 
+/* Shared capacity growth: double until >= need (or init_cap when empty). */
+static inline size_t vec_grow_cap(size_t cap, size_t need, size_t init_cap) {
+	size_t new_cap = cap == 0 ? (init_cap > 0 ? init_cap : 1) : cap * 2;
+	while (new_cap < need) new_cap *= 2;
+	return new_cap;
+}
+
+/* need = minimum used count the array must hold (typically count or count+1). */
+#define VEC_ENSURE_REALLOC(arr, need, cap, init_cap)                                                         \
+	do {                                                                                                 \
+		if ((size_t)(need) > (size_t)(cap)) {                                                        \
+			size_t _new_cap = vec_grow_cap((size_t)(cap), (size_t)(need), (size_t)(init_cap));   \
+			if (_new_cap > SIZE_MAX / sizeof(*(arr))) error("allocation overflow");              \
+			void *_tmp = realloc((arr), sizeof(*(arr)) * _new_cap);                              \
+			if (!_tmp) error("out of memory");                                                   \
+			(arr) = _tmp;                                                                        \
+			(cap) = _new_cap;                                                                    \
+		}                                                                                            \
+	} while (0)
+
 #define ENSURE_ARRAY_CAP(arr, count, cap, init_cap, T)                                                       \
 	do {                                                                                                 \
-		if ((count) >= (cap)) {                                                                      \
-			size_t new_cap =                                                                     \
-			    (cap) == 0 ? ((init_cap) > 0 ? (size_t)(init_cap) : 1) : (size_t)(cap) * 2;      \
-			while (new_cap < (size_t)(count)) new_cap *= 2;                                      \
-			if (new_cap > SIZE_MAX / sizeof(T)) error("allocation overflow");                    \
-			T *tmp = realloc((arr), sizeof(T) * new_cap);                                        \
-			if (!tmp) {                                                                          \
-				error("out of memory");                                                      \
-			}                                                                                    \
-			(arr) = tmp;                                                                         \
-			(cap) = new_cap;                                                                     \
-		}                                                                                            \
+		(void)sizeof(T); /* keep call-site type annotation checked */                                \
+		VEC_ENSURE_REALLOC((arr), (count), (cap), (init_cap));                                       \
 	} while (0)
 
 #define ARENA_ENSURE_CAP(arena, arr, count, cap, init_cap, T)                                                \
 	do {                                                                                                 \
-		if ((count) >= (cap)) {                                                                      \
+		if ((size_t)(count) >= (size_t)(cap)) {                                                      \
 			size_t old_cap = (size_t)(cap);                                                      \
-			size_t new_cap =                                                                     \
-			    old_cap == 0 ? ((init_cap) > 0 ? (size_t)(init_cap) : 1) : old_cap * 2;          \
-			while (new_cap < (size_t)(count)) new_cap *= 2;                                      \
+			size_t new_cap = vec_grow_cap(old_cap, (size_t)(count), (size_t)(init_cap));         \
 			if (new_cap > SIZE_MAX / sizeof(T)) error("allocation overflow");                    \
 			(arr) = arena_realloc((arena), (arr), sizeof(T) * old_cap, sizeof(T) * new_cap);     \
 			(cap) = new_cap;                                                                     \
@@ -640,8 +648,7 @@ static void prism_ctx_init(void) {
 
 static void token_pool_ensure(size_t need) {
 	if (need <= token_cap) return;
-	size_t new_cap = token_cap ? token_cap * 2 : 65536;
-	while (new_cap < need) new_cap *= 2;
+	size_t new_cap = vec_grow_cap(token_cap, need, 65536);
 	if (new_cap > (uint32_t)-1 || new_cap > SIZE_MAX / sizeof(Token))
 		error("token pool capacity exceeded");
 	Token *p = realloc(token_pool, new_cap * sizeof(Token));
@@ -1817,14 +1824,8 @@ static Token *tokenize(File *file) {
 		int sp = 0;
 		for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
 			if (t->flags & TF_OPEN) {
-				if (sp >= stack_cap) {
-					int old_cap = stack_cap;
-					stack_cap *= 2;
-					stack = arena_realloc(&ctx->main_arena,
-							      stack,
-							      old_cap * sizeof(Token *),
-							      stack_cap * sizeof(Token *));
-				}
+				ARENA_ENSURE_CAP(
+				    &ctx->main_arena, stack, sp + 1, stack_cap, 256, Token *);
 				stack[sp++] = t;
 				Token *tn = tok_next(t);
 				if (t->ch0 == '[' && tn && tn->ch0 == '[' && (tn->flags & TF_OPEN))
@@ -2332,6 +2333,7 @@ enum {
 	P1_DECL_BRACKET = 1 << 9, // '[' is an array-declarator bracket (not an expression subscript)
 	P1_UNEVAL_BRACKET =
 	    1 << 10, // '[' is inside an unevaluated operand (sizeof/_Alignof/typeof/offsetof/etc.)
+	P1_IS_ORELSE_KW = 1 << 11, // Pass 1: this orelse token is the Prism keyword (not an ident)
 };
 
 #define tok_ann(t) ((t)->ann)
@@ -2448,6 +2450,17 @@ static PRISM_PURE Token *skip_noise(Token *tok) {
 	return tok;
 }
 
+/* `skip_noise` already eats TT_ATTR / [[...]] / _Pragma; this adds TT_ASM. */
+static Token *skip_asm_specifier_trail(Token *t) {
+	t = skip_noise(t);
+	while (t && (t->tag & TT_ASM)) {
+		t = tok_next(t);
+		if (t && match_ch(t, '(') && tok_match(t)) t = tok_next(tok_match(t));
+		t = skip_noise(t);
+	}
+	return t;
+}
+
 // Check if a token is "noise" (attribute, C23 [[...]], or preprocessor directive).
 // These tokens must be skipped via skip_noise() before any tag-based type checks.
 static inline PRISM_PURE bool is_noise_token(Token *t) {
@@ -2483,18 +2496,6 @@ static PRISM_PURE Token *skip_to_semicolon(Token *tok, Token *end) {
 		if (match_ch(tok, ';')) return tok;
 		if ((tok->flags & TF_CLOSE) && tok->ch0 == '}') return tok;
 		tok = tok_next(tok);
-	}
-	return tok;
-}
-
-static Token *skip_pointers(Token *tok, bool *is_void) {
-	while (tok && tok->kind != TK_EOF) {
-		SKIP_NOISE_CONTINUE(tok);
-		if ((match_ch(tok, '*')) || (tok->tag & TT_QUALIFIER)) {
-			tok = tok_next(tok);
-			if (is_void) *is_void = false;
-		} else
-			break;
 	}
 	return tok;
 }
@@ -2764,87 +2765,127 @@ static Token *find_struct_body_brace(Token *tok) {
 	return (t && match_ch(t, '{')) ? t : NULL;
 }
 
-// (TF_CLOSE balanced groups, TT_ATTR keywords, TK_PREP_DIR, C23 [[...]]).
-static inline Token *walk_back_past_noise(uint32_t start_idx) {
-	uint32_t ti = start_idx;
-	while (ti > 0) {
-		Token *b = &token_pool[ti - 1];
-		if (b->flags & TF_CLOSE) {
-			Token *open = tok_match(b);
-			if (!open) return NULL;
-			ti = tok_idx(open);
-			continue;
-		}
-		if ((b->tag & TT_ATTR) || b->kind == TK_PREP_DIR) {
-			ti--;
-			continue;
-		}
-		return b;
-	}
-	return NULL;
-}
+/* Unified backward token walker.
+ *
+ * Indexing conventions (preserved via flag presets below):
+ *   WB_FROM_PRED — start at pool[start_idx-1] (past_noise / attr_noise)
+ *   otherwise    — start at pool[start_idx]   (skip_noise / skip_attrs)
+ *
+ * Flag meanings:
+ *   WB_SKIP_PREP       skip TK_PREP_DIR
+ *   WB_SKIP_ATTR       skip TT_ATTR keywords
+ *   WB_JUMP_GROUPS     jump any TF_CLOSE → matching open (unmatched → NULL)
+ *   WB_JUMP_C23_ATTR   jump C23 ]] → [[
+ *   WB_JUMP_ALL_PARENS jump every )
+ *   WB_JUMP_ATTR_PARENS jump ) only when preceded by ATTR (attr-parens mode)
+ */
+enum {
+	WB_SKIP_PREP = 1 << 0,
+	WB_SKIP_ATTR = 1 << 1,
+	WB_JUMP_GROUPS = 1 << 2,
+	WB_JUMP_C23_ATTR = 1 << 3,
+	WB_JUMP_ALL_PARENS = 1 << 4,
+	WB_JUMP_ATTR_PARENS = 1 << 5,
+	WB_FROM_PRED = 1 << 6,
+};
 
-/* Predecessor of token_pool[start_idx], skipping only attributes / prep dirs.
- * Unlike walk_back_past_noise, does not jump TF_CLOSE→open groups — needed so
- * `} (expr)` after `while (c) { }` is not mistaken for closing `while (`. */
-static inline Token *walk_back_skip_attr_noise(uint32_t start_idx) {
-	uint32_t ti = start_idx;
-	while (ti > 0) {
-		Token *b = &token_pool[ti - 1];
-		if ((b->tag & TT_ATTR) || b->kind == TK_PREP_DIR) {
-			ti--;
-			continue;
-		}
-		if (match_ch(b, ']') && tok_match(b) && (tok_match(b)->flags & TF_C23_ATTR)) {
-			ti = tok_idx(tok_match(b));
-			continue;
-		}
-		return b;
-	}
-	return NULL;
-}
+#define WB_PAST_NOISE (WB_FROM_PRED | WB_SKIP_PREP | WB_SKIP_ATTR | WB_JUMP_GROUPS)
+#define WB_ATTR_NOISE (WB_FROM_PRED | WB_SKIP_PREP | WB_SKIP_ATTR | WB_JUMP_C23_ATTR)
+#define WB_SKIP_NOISE (WB_SKIP_PREP | WB_SKIP_ATTR | WB_JUMP_C23_ATTR | WB_JUMP_ATTR_PARENS)
+#define WB_SKIP_ATTRS (WB_SKIP_PREP | WB_SKIP_ATTR | WB_JUMP_C23_ATTR | WB_JUMP_ALL_PARENS)
 
-/* Walk backward from pool[start_idx]. skip_all_parens: jump every (); else
- * only attribute-bearing parens (__attribute__/__declspec), skipping prep
- * dirs between the ATTR keyword and '('. */
-static Token *walk_back_skip_impl(uint32_t start_idx, bool skip_all_parens) {
-	for (uint32_t pi = start_idx; pi > 0; pi--) {
+static Token *tok_walk_back(uint32_t start_idx, unsigned flags) {
+	/* Both conventions refuse to start at pool[0] as a candidate: FROM_PRED
+	 * with start_idx==0 has no predecessor; skip_* with start_idx==0 matches
+	 * the old `for (pi = 0; pi > 0;)` no-op. */
+	if (start_idx == 0) return NULL;
+	/* Loop invariant: pi is one past the next candidate (candidate = pi-1). */
+	uint32_t pi = (flags & WB_FROM_PRED) ? start_idx : start_idx + 1;
+	for (; pi > 0;) {
+		pi--;
 		Token *pt = &token_pool[pi];
-		if (pt->kind == TK_PREP_DIR) continue;
-		if (match_ch(pt, ']') && tok_match(pt) && (tok_match(pt)->flags & TF_C23_ATTR)) {
+
+		if ((flags & WB_SKIP_PREP) && pt->kind == TK_PREP_DIR) continue;
+		if ((flags & WB_SKIP_ATTR) && (pt->tag & TT_ATTR)) continue;
+
+		if (flags & WB_JUMP_GROUPS) {
+			if (pt->flags & TF_CLOSE) {
+				Token *open = tok_match(pt);
+				if (!open) return NULL;
+				pi = tok_idx(open); /* next iter looks at open-1 */
+				continue;
+			}
+			return pt;
+		}
+
+		if ((flags & WB_JUMP_C23_ATTR) && match_ch(pt, ']') && tok_match(pt) &&
+		    (tok_match(pt)->flags & TF_C23_ATTR)) {
 			pi = tok_idx(tok_match(pt));
 			continue;
 		}
-		if (match_ch(pt, ')') && tok_match(pt)) {
+
+		if (match_ch(pt, ')') && tok_match(pt) &&
+		    (flags & (WB_JUMP_ALL_PARENS | WB_JUMP_ATTR_PARENS))) {
 			uint32_t open_idx = tok_idx(tok_match(pt));
-			if (skip_all_parens) {
+			if (flags & WB_JUMP_ALL_PARENS) {
 				pi = open_idx;
 				continue;
 			}
+			/* WB_JUMP_ATTR_PARENS: jump only attr-bearing parens */
 			for (uint32_t bi = open_idx; bi > 0;) {
 				bi--;
 				Token *bt = &token_pool[bi];
-				if (bt->kind == TK_PREP_DIR) continue;
+				if ((flags & WB_SKIP_PREP) && bt->kind == TK_PREP_DIR) continue;
 				if (bt->tag & TT_ATTR) {
-					pi = bi;
+					pi = bi; /* skip ATTR on next iter's continue path */
 					goto next;
 				}
 				break;
 			}
 		}
-		if (pt->tag & TT_ATTR) continue;
 		return pt;
 	next:;
 	}
 	return NULL;
 }
 
-static Token *walk_back_skip_noise(uint32_t start_idx) {
-	return walk_back_skip_impl(start_idx, false);
+/* WB_ATTR_NOISE: predecessor skipping only attributes / prep dirs — does not
+ * jump TF_CLOSE→open groups, so `} (expr)` after `while (c) { }` is not
+ * mistaken for closing `while (`. */
+
+/* if/while/for/switch before a condition '(', walking past GNU/C23 attrs.
+ * else/do take no condition paren — their body '(' must not match. */
+static Token *ctrl_condition_kw_before_paren(Token *open) {
+	if (!open || !match_ch(open, '(')) return NULL;
+	Token *kw = tok_walk_back(tok_idx(open), WB_ATTR_NOISE);
+	if (kw && (kw->tag & (TT_IF | TT_LOOP | TT_SWITCH)) && !is_else_or_do(kw)) return kw;
+	return NULL;
 }
 
-static Token *walk_back_skip_attrs(uint32_t start_idx) {
-	return walk_back_skip_impl(start_idx, true);
+/* C23 `enum Tag : unsigned int {` — `prev` is the type keyword before `{`.
+ * `enum` carries TT_TYPE, so check is_enum_kw before skipping type keywords. */
+static bool is_c23_fixed_underlying_enum(Token *type_kw_before_brace) {
+	if (!type_kw_before_brace || !is_type_keyword(type_kw_before_brace)) return false;
+	/* si2-- form: no uint32 underflow at index 0, and pool[0] is inspected. */
+	for (uint32_t si2 = tok_idx(type_kw_before_brace); si2-- > 0;) {
+		Token *st = &token_pool[si2];
+		if (st->kind == TK_PREP_DIR) continue;
+		if (is_enum_kw(st)) return true;
+		if (is_type_keyword(st) || (st->tag & TT_QUALIFIER)) continue;
+		if (match_ch(st, ':')) continue;
+		if (match_ch(st, ']') && tok_match(st) && (tok_match(st)->flags & TF_C23_ATTR)) {
+			si2 = tok_idx(tok_match(st));
+			continue;
+		}
+		if (match_ch(st, ')') && tok_match(st)) {
+			si2 = tok_idx(tok_match(st));
+			continue;
+		}
+		if (st->tag & TT_ATTR) continue;
+		if (is_valid_varname(st)) continue; // enum tag name
+		break;
+	}
+	return false;
 }
 
 static bool close_brace_ends_sue_body(Token *tok) {
@@ -2881,11 +2922,11 @@ static bool close_brace_ends_sue_body(Token *tok) {
 static bool token_ends_sue_type_specifier(Token *tok) {
 	if (!tok) return false;
 	if (close_brace_ends_sue_body(tok)) return true;
-	Token *effective = walk_back_past_noise(tok_idx(tok) + 1);
+	Token *effective = tok_walk_back(tok_idx(tok) + 1, WB_PAST_NOISE);
 	if (effective && effective != tok) return token_ends_sue_type_specifier(effective);
 	if (tok->tag & TT_SUE) return true;
 	if (is_identifier_like(tok)) {
-		Token *before = walk_back_past_noise(tok_idx(tok));
+		Token *before = tok_walk_back(tok_idx(tok), WB_PAST_NOISE);
 		return before && (before->tag & TT_SUE);
 	}
 	return false;
@@ -2894,7 +2935,7 @@ static bool token_ends_sue_type_specifier(Token *tok) {
 static bool close_paren_ends_cast_type_name(Token *tok) {
 	if (!tok || !match_ch(tok, ')') || !tok_match(tok)) return false;
 	Token *open = tok_match(tok);
-	Token *before_open = walk_back_past_noise(tok_idx(open));
+	Token *before_open = tok_walk_back(tok_idx(open), WB_PAST_NOISE);
 	if (before_open &&
 	    (is_sizeof_like(before_open) || (before_open->tag & (TT_TYPEOF | TT_ALIGNAS | TT_BITINT))))
 		return false;
@@ -2940,13 +2981,13 @@ static inline bool is_array_bracket_predecessor(Token *t) {
 	    (match_ch(t, '}')))
 		return true;
 	if (is_identifier_like(t)) {
-		Token *b = walk_back_past_noise(tok_idx(t));
+		Token *b = tok_walk_back(tok_idx(t), WB_PAST_NOISE);
 		return b && (b->tag & TT_SUE);
 	}
 	if (match_ch(t, ']')) {
 		Token *open = tok_match(t);
 		if (!open) return true;
-		Token *before_open = walk_back_past_noise(tok_idx(open));
+		Token *before_open = tok_walk_back(tok_idx(open), WB_PAST_NOISE);
 		if (!before_open) return true;
 		if (decl_paren_predecessor_is_type(before_open)) return true;
 		if (match_ch(before_open, ']')) return is_array_bracket_predecessor(before_open);
@@ -2955,7 +2996,7 @@ static inline bool is_array_bracket_predecessor(Token *t) {
 	if (match_ch(t, ')')) {
 		Token *open = tok_match(t);
 		if (!open) return true; // no match info — conservatively assume type
-		Token *before_open = walk_back_past_noise(tok_idx(open));
+		Token *before_open = tok_walk_back(tok_idx(open), WB_PAST_NOISE);
 		if (!before_open) return true;
 		return decl_paren_predecessor_is_type(before_open);
 	}
@@ -2988,6 +3029,11 @@ static bool array_size_is_vla_impl(Token *open_bracket, int depth) {
 						if (is_enum_kw(inner)) {
 							Token *brace = find_struct_body_brace(inner);
 							if (brace) {
+								/* Register enumerators so later
+								 * identifiers in the same dimension
+								 * (e.g. sizeof(enum { A = 5 }) + A)
+								 * are not misclassified as VLA. */
+								parse_enum_constants(brace, 0);
 								inner = skip_balanced_group(brace);
 								if (inner == end) break;
 								continue;
@@ -3852,11 +3898,12 @@ static inline int sos_grow_to(int cur_cap, int need) {
 
 static inline bool sos_ensure_intbuf(int **buf, int *cap, int need) {
 	if (need <= *cap) return true;
-	int nc = sos_grow_to(*cap, need);
-	int *p = (int *)realloc(*buf, (size_t)nc * sizeof(int));
+	/* Soft-fail variant of VEC_ENSURE_REALLOC for skip_one_stmt OOM path. */
+	size_t nc = vec_grow_cap((size_t)*cap, (size_t)need, 128);
+	int *p = (int *)realloc(*buf, nc * sizeof(int));
 	if (!p) return false;
 	*buf = p;
-	*cap = nc;
+	*cap = (int)nc;
 	return true;
 }
 
@@ -4403,7 +4450,7 @@ static inline Token *try_detect_noreturn_call(Token *tok) {
 	TypedefEntry *te = typedef_lookup(tok);
 	if (te && te->is_shadow) return NULL;
 	if (tok_idx(tok) >= 1) {
-		Token *prev = walk_back_past_noise(tok_idx(tok));
+		Token *prev = tok_walk_back(tok_idx(tok), WB_PAST_NOISE);
 		if (prev && (prev->tag & TT_MEMBER)) return NULL;
 		if (prev && (prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_INLINE | TT_SUE)))
 			return NULL;
@@ -4480,8 +4527,8 @@ static bool raw_after_subscript_open_bracket(Token *raw_kw) {
 	if (!raw_kw || !(raw_kw->flags & TF_RAW)) return false;
 	uint32_t ri = tok_idx(raw_kw);
 	if (ri == 0) return false;
-	/* walk_back_past_noise(k) inspects pool[k-1] first — pass ri, not ri-1. */
-	Token *b = walk_back_past_noise(ri);
+	/* tok_walk_back(k, WB_PAST_NOISE) inspects pool[k-1] first — pass ri, not ri-1. */
+	Token *b = tok_walk_back(ri, WB_PAST_NOISE);
 	// `[` from `[[attr]]` is tagged TF_C23_ATTR — not an array subscript.
 	return b && match_ch(b, '[') && !(b->flags & TF_C23_ATTR);
 }

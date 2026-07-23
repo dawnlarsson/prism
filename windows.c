@@ -44,20 +44,22 @@ typedef int mode_t;
 // MSVC volatile has acquire/release semantics on x86/x64, so plain
 // reads/writes are sufficient for signal_temp_* atomics.
 #define signal_temp_store(val) (signal_temp_registered = (val))
-#define signal_temp_load()     (signal_temp_registered)
+#define signal_temp_load() (signal_temp_registered)
 #define signal_temps_store(val) (signal_temps_count = (val))
-#define signal_temps_load()     (signal_temps_count)
-#define signal_temps_cas(expected, desired) \
-	(InterlockedCompareExchange((volatile LONG *)&signal_temps_count, \
-				    (LONG)(desired), (LONG)(*(expected))) == (LONG)(*(expected)))
+#define signal_temps_load() (signal_temps_count)
+#define signal_temps_cas(expected, desired)                                                                  \
+	(InterlockedCompareExchange((volatile LONG *)&signal_temps_count,                                    \
+				    (LONG)(desired),                                                         \
+				    (LONG)(*(expected))) == (LONG)(*(expected)))
 // MSVC volatile has acquire/release on x86/x64 — sufficient for cached_clean_env init-once.
-#define cached_env_load()       (cached_clean_env)
-#define cached_env_store(val)   (cached_clean_env = (val))
+#define cached_env_load() (cached_clean_env)
+#define cached_env_store(val) (cached_clean_env = (val))
 #define signal_temps_ready_store(idx, val) (signal_temps_ready[(idx)] = (val))
-#define signal_temps_ready_load(idx)       (signal_temps_ready[(idx)])
-#define signal_temps_ready_cas(idx, expected, desired) \
-	(InterlockedCompareExchange((volatile LONG *)&signal_temps_ready[(idx)], \
-				    (LONG)(desired), (LONG)(*(expected))) == (LONG)(*(expected)))
+#define signal_temps_ready_load(idx) (signal_temps_ready[(idx)])
+#define signal_temps_ready_cas(idx, expected, desired)                                                       \
+	(InterlockedCompareExchange((volatile LONG *)&signal_temps_ready[(idx)],                             \
+				    (LONG)(desired),                                                         \
+				    (LONG)(*(expected))) == (LONG)(*(expected)))
 
 // MSVC doesn't have these — define them away or provide equivalents.
 #define __attribute__(x)
@@ -65,7 +67,6 @@ typedef int mode_t;
 #define __builtin_constant_p(x) 0
 #define __builtin_strlen(s) strlen(s)
 #define __builtin_unreachable() __assume(0)
-#define __typeof__(x) const char * // only used for CLI_PUSH's array elem type
 #define __alignof__(x) __alignof(x)
 
 #define WIFEXITED(s) 1	   // Always "exited" on Windows (no signals)
@@ -153,13 +154,26 @@ typedef int mode_t;
 // so the TOCTOU window between temp creation and registration is harmless.
 // These stubs let make_temp_file_registered compile unchanged.
 #ifndef SIG_BLOCK
-#define SIG_BLOCK   0
+#define SIG_BLOCK 0
 #define SIG_SETMASK 2
 typedef unsigned long sigset_t;
-static inline int sigemptyset(sigset_t *s) { *s = 0; return 0; }
-static inline int sigaddset(sigset_t *s, int sig) { (void)s; (void)sig; return 0; }
+
+static inline int sigemptyset(sigset_t *s) {
+	*s = 0;
+	return 0;
+}
+
+static inline int sigaddset(sigset_t *s, int sig) {
+	(void)s;
+	(void)sig;
+	return 0;
+}
+
 static inline int sigprocmask(int how, const sigset_t *set, sigset_t *old) {
-	(void)how; (void)set; (void)old; return 0;
+	(void)how;
+	(void)set;
+	(void)old;
+	return 0;
 }
 #endif
 
@@ -203,12 +217,18 @@ static PRISM_THREAD_LOCAL char win32_memstream_path[PATH_MAX * 3];
 static int (*win32_real_fclose)(FILE *) = fclose;
 
 static FILE *open_memstream(char **bufp, size_t *sizep) {
+	/* Single active memstream per thread (TLS slot). Nesting would orphan
+	 * the outer temp path and corrupt bufp/sizep on fclose. */
+	if (win32_memstream_fp) {
+		errno = EBUSY;
+		return NULL;
+	}
 	wchar_t wtmpdir[PATH_MAX], wtmpfile[PATH_MAX];
 	GetTempPathW(PATH_MAX, wtmpdir);
 	GetTempFileNameW(wtmpdir, L"prm", 0, wtmpfile);
 	// Convert wide temp path to UTF-8 for storage
-	WideCharToMultiByte(CP_UTF8, 0, wtmpfile, -1,
-			    win32_memstream_path, sizeof(win32_memstream_path), NULL, NULL);
+	WideCharToMultiByte(
+	    CP_UTF8, 0, wtmpfile, -1, win32_memstream_path, sizeof(win32_memstream_path), NULL, NULL);
 	signal_temps_register(win32_memstream_path);
 	FILE *fp = fopen(win32_memstream_path, "w+b");
 	if (!fp) return NULL;
@@ -255,6 +275,7 @@ static int win32_fclose_wrapper(FILE *fp) {
 // fopen shim: try wide-char API so non-ASCII (UTF-8) paths work.
 // Falls back to plain fopen if the path is pure ASCII.
 static FILE *(*win32_real_fopen)(const char *, const char *) = fopen;
+
 static FILE *win32_fopen_utf8(const char *path, const char *mode) {
 	wchar_t wpath[PATH_MAX], wmode[16];
 	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, PATH_MAX);
@@ -264,26 +285,27 @@ static FILE *win32_fopen_utf8(const char *path, const char *mode) {
 	}
 	return win32_real_fopen(path, mode);
 }
+
 #define fopen(path, mode) win32_fopen_utf8(path, mode)
 
 // stat shim: try wide-char API for non-ASCII paths.
 static int win32_stat_utf8(const char *path, struct _stat *st) {
 	wchar_t wpath[PATH_MAX];
 	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, PATH_MAX);
-	if (wn > 0)
-		return _wstat(wpath, (struct _stat *)st);
+	if (wn > 0) return _wstat(wpath, (struct _stat *)st);
 	return _stat(path, st);
 }
+
 #define stat(path, st) win32_stat_utf8(path, (struct _stat *)(st))
 
 // access shim: try wide-char API for non-ASCII paths.
 static int win32_access_utf8(const char *path, int mode) {
 	wchar_t wpath[PATH_MAX];
 	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, PATH_MAX);
-	if (wn > 0)
-		return _waccess(wpath, mode);
+	if (wn > 0) return _waccess(wpath, mode);
 	return _access(path, mode);
 }
+
 #undef access
 #define access win32_access_utf8
 
@@ -291,10 +313,10 @@ static int win32_access_utf8(const char *path, int mode) {
 static int win32_unlink_utf8(const char *path) {
 	wchar_t wpath[PATH_MAX];
 	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, PATH_MAX);
-	if (wn > 0)
-		return _wunlink(wpath);
+	if (wn > 0) return _wunlink(wpath);
 	return _unlink(path);
 }
+
 #undef unlink
 #define unlink win32_unlink_utf8
 
@@ -302,17 +324,16 @@ static int win32_unlink_utf8(const char *path) {
 static int win32_remove_utf8(const char *path) {
 	wchar_t wpath[PATH_MAX];
 	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, PATH_MAX);
-	if (wn > 0)
-		return _wremove(wpath);
+	if (wn > 0) return _wremove(wpath);
 	return remove(path);
 }
+
 #define remove(path) win32_remove_utf8(path)
 
 // getenv shim: use _wgetenv + WideCharToMultiByte to return UTF-8 strings.
 static const char *get_env_utf8(const char *name) {
 	wchar_t wname[256];
-	if (MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, 256) <= 0)
-		return getenv(name);
+	if (MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, 256) <= 0) return getenv(name);
 	const wchar_t *wval = _wgetenv(wname);
 	if (!wval) return NULL;
 	// Rotating pool of 4 buffers so sequential getenv calls don't clobber each other
@@ -333,6 +354,7 @@ static BOOL win32_movefile_utf8(const char *src, const char *dst) {
 		return MoveFileA(src, dst);
 	return MoveFileW(wsrc, wdst);
 }
+
 #define MoveFileA(src, dst) win32_movefile_utf8(src, dst)
 
 // MoveFileEx shim: convert UTF-8 paths to wide chars for non-ASCII support.
@@ -348,6 +370,7 @@ static BOOL win32_movefileex_utf8(const char *src, const char *dst, DWORD flags)
 	}
 	return MoveFileExW(wsrc, NULL, flags);
 }
+
 #define MoveFileExA(src, dst, flags) win32_movefileex_utf8(src, dst, flags)
 
 // Convert argv from the system ANSI codepage to UTF-8 using GetCommandLineW.
@@ -356,10 +379,17 @@ static BOOL win32_movefileex_utf8(const char *src, const char *dst, DWORD flags)
 static void win32_utf8_argv(int *argc_out, char ***argv_out) {
 	int wargc;
 	LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
-	if (!wargv) { *argc_out = 0; *argv_out = NULL; return; }
+	if (!wargv) {
+		*argc_out = 0;
+		*argv_out = NULL;
+		return;
+	}
 
 	char **argv = (char **)calloc((size_t)wargc + 1, sizeof(char *));
-	if (!argv) { LocalFree(wargv); return; }
+	if (!argv) {
+		LocalFree(wargv);
+		return;
+	}
 
 	for (int i = 0; i < wargc; i++) {
 		int needed = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
@@ -402,7 +432,10 @@ static int pipe(int pipefd[2]) {
 // to resolve Junctions and Symlinks on NTFS.
 // Uses wide-char APIs throughout to handle UTF-8 paths correctly.
 static char *realpath(const char *path, char *resolved) {
-	if (!path) { errno = EINVAL; return NULL; }
+	if (!path) {
+		errno = EINVAL;
+		return NULL;
+	}
 	char *out = resolved ? resolved : (char *)malloc(PATH_MAX);
 	if (!out) return NULL;
 
@@ -416,9 +449,11 @@ static char *realpath(const char *path, char *resolved) {
 		return r;
 	}
 
-	HANDLE h = CreateFileW(wpath, 0, /* no access needed */
+	HANDLE h = CreateFileW(wpath,
+			       0, /* no access needed */
 			       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-			       NULL, OPEN_EXISTING,
+			       NULL,
+			       OPEN_EXISTING,
 			       FILE_FLAG_BACKUP_SEMANTICS, /* required for directories */
 			       NULL);
 	if (h == INVALID_HANDLE_VALUE) {
@@ -486,19 +521,20 @@ static int prism_posix_open_(const char *path, int oflag, ...) {
 	wchar_t wpath[PATH_MAX];
 	int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, winpath, -1, wpath, PATH_MAX);
 	if (wn > 0) {
-		if (oflag & _O_CREAT)
-			return _wopen(wpath, oflag | _O_BINARY, mode);
+		if (oflag & _O_CREAT) return _wopen(wpath, oflag | _O_BINARY, mode);
 		return _wopen(wpath, oflag | _O_BINARY);
 	}
 	// Fallback to ANSI (path wasn't valid UTF-8)
-	if (oflag & _O_CREAT)
-		return _open(winpath, oflag | _O_BINARY, mode);
+	if (oflag & _O_CREAT) return _open(winpath, oflag | _O_BINARY, mode);
 	return _open(winpath, oflag | _O_BINARY);
 }
 
 // POSIX getline() shim: reads a full line into a malloc'd buffer.
 static ssize_t getline(char **lineptr, size_t *n, FILE *stream) {
-	if (!lineptr || !n || !stream) { errno = EINVAL; return -1; }
+	if (!lineptr || !n || !stream) {
+		errno = EINVAL;
+		return -1;
+	}
 	size_t pos = 0;
 	int c;
 	if (!*lineptr || *n == 0) {
@@ -563,8 +599,7 @@ static int mkstemps(char *tmpl, int suffix_len) {
 		// Use wide-char API so non-ASCII paths (e.g. Unicode directories) work.
 		wchar_t wtry[PATH_MAX];
 		int wlen = MultiByteToWideChar(CP_UTF8, 0, try_buf, -1, wtry, PATH_MAX);
-		if (wlen <= 0)
-			wlen = MultiByteToWideChar(CP_ACP, 0, try_buf, -1, wtry, PATH_MAX);
+		if (wlen <= 0) wlen = MultiByteToWideChar(CP_ACP, 0, try_buf, -1, wtry, PATH_MAX);
 		if (wlen <= 0) continue;
 		errno_t err = _wsopen_s(
 		    &fd, wtry, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY, _SH_DENYRW, _S_IREAD | _S_IWRITE);
@@ -590,12 +625,15 @@ static char *mkdtemp(char *tmpl) {
 
 	LARGE_INTEGER perf_counter;
 	QueryPerformanceCounter(&perf_counter);
-	unsigned int seed = (unsigned int)_getpid() ^ (unsigned int)GetTickCount() ^
-	                    (unsigned int)perf_counter.LowPart;
+	unsigned int seed =
+	    (unsigned int)_getpid() ^ (unsigned int)GetTickCount() ^ (unsigned int)perf_counter.LowPart;
 
 	for (int attempt = 0; attempt < 10000; attempt++) {
 		char try_buf[PATH_MAX];
-		if (len >= PATH_MAX) { errno = ENAMETOOLONG; return NULL; }
+		if (len >= PATH_MAX) {
+			errno = ENAMETOOLONG;
+			return NULL;
+		}
 		memcpy(try_buf, tmpl, len + 1);
 		unsigned int attempt_seed = seed ^ ((unsigned int)attempt * 2654435761u);
 		for (size_t i = x_start; i < x_start + x_count; i++) {
@@ -605,8 +643,7 @@ static char *mkdtemp(char *tmpl) {
 		wchar_t wtry[PATH_MAX];
 		int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, try_buf, -1, wtry, PATH_MAX);
 		BOOL ok;
-		if (wn > 0)
-			ok = CreateDirectoryW(wtry, NULL);
+		if (wn > 0) ok = CreateDirectoryW(wtry, NULL);
 		else
 			ok = CreateDirectoryA(try_buf, NULL);
 		if (ok) {
@@ -724,14 +761,18 @@ static wchar_t *win32_build_env_block(char **envp) {
 		if (wlen <= 0) wlen = 1;
 		total_wchars += (size_t)wlen; // includes NUL terminator (serves as separator)
 	}
-	total_wchars++; // final double-NUL
+	total_wchars++;				// final double-NUL
 	if (total_wchars < 2) total_wchars = 2; // empty env needs double-NUL
 	wchar_t *block = (wchar_t *)calloc(total_wchars, sizeof(wchar_t));
 	if (!block) return NULL;
 	wchar_t *p = block;
 	for (char **e = envp; *e; e++) {
-		int wlen = MultiByteToWideChar(CP_UTF8, 0, *e, -1, p, (int)(total_wchars - (size_t)(p - block)));
-		if (wlen <= 0) { *p++ = L'\0'; continue; }
+		int wlen =
+		    MultiByteToWideChar(CP_UTF8, 0, *e, -1, p, (int)(total_wchars - (size_t)(p - block)));
+		if (wlen <= 0) {
+			*p++ = L'\0';
+			continue;
+		}
 		p += wlen; // wlen includes the NUL separator
 	}
 	*p = L'\0'; // double-NUL terminator
@@ -771,16 +812,21 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 			if (a->kind == SPAWN_ACT_DUP2) {
 				// Convert C fd to Win32 HANDLE
 				HANDLE h = (HANDLE)_get_osfhandle(a->src_fd);
-				if (a->fd == STDOUT_FILENO) { hStdOut = h; redirected_out = true; }
-				else if (a->fd == STDIN_FILENO)
-					{ hStdIn = h; redirected_in = true; }
-				else if (a->fd == STDERR_FILENO)
-					{ hStdErr = h; redirected_err = true; }
+				if (a->fd == STDOUT_FILENO) {
+					hStdOut = h;
+					redirected_out = true;
+				} else if (a->fd == STDIN_FILENO) {
+					hStdIn = h;
+					redirected_in = true;
+				} else if (a->fd == STDERR_FILENO) {
+					hStdErr = h;
+					redirected_err = true;
+				}
 			} else if (a->kind == SPAWN_ACT_OPEN) {
 				const char *winpath = a->path;
 				bool is_null_device = strcmp(winpath, "/dev/null") == 0 ||
-				                      _stricmp(winpath, "NUL") == 0 ||
-				                      _stricmp(winpath, "NUL:") == 0;
+						      _stricmp(winpath, "NUL") == 0 ||
+						      _stricmp(winpath, "NUL:") == 0;
 				if (strcmp(winpath, "/dev/null") == 0) winpath = "NUL";
 
 				// Translate POSIX oflag to Win32 access/disposition
@@ -795,8 +841,7 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 				if (is_null_device) {
 					disposition = OPEN_EXISTING;
 				} else if (a->oflag & O_CREAT) {
-					if (a->oflag & O_EXCL)
-						disposition = CREATE_NEW;
+					if (a->oflag & O_EXCL) disposition = CREATE_NEW;
 					else if (a->oflag & O_TRUNC)
 						disposition = CREATE_ALWAYS;
 					else
@@ -806,31 +851,37 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 
 				SECURITY_ATTRIBUTES sa_nul = {sizeof(sa_nul), NULL, TRUE};
 				wchar_t wpath[PATH_MAX];
-				int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, winpath, -1, wpath, PATH_MAX);
+				int wn = MultiByteToWideChar(
+				    CP_UTF8, MB_ERR_INVALID_CHARS, winpath, -1, wpath, PATH_MAX);
 				HANDLE hOpened;
 				if (wn > 0)
 					hOpened = CreateFileW(wpath,
-							   access_flags,
-							   FILE_SHARE_READ | FILE_SHARE_WRITE,
-							   &sa_nul,
-							   disposition,
-							   0,
-							   NULL);
+							      access_flags,
+							      FILE_SHARE_READ | FILE_SHARE_WRITE,
+							      &sa_nul,
+							      disposition,
+							      0,
+							      NULL);
 				else
 					hOpened = CreateFileA(winpath,
-							   access_flags,
-							   FILE_SHARE_READ | FILE_SHARE_WRITE,
-							   &sa_nul,
-							   disposition,
-							   0,
-							   NULL);
+							      access_flags,
+							      FILE_SHARE_READ | FILE_SHARE_WRITE,
+							      &sa_nul,
+							      disposition,
+							      0,
+							      NULL);
 				if (hOpened == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
 				opened_handles[opened_handle_count++] = hOpened;
-				if (a->fd == STDERR_FILENO) { hStdErr = hOpened; redirected_err = true; }
-				else if (a->fd == STDOUT_FILENO)
-					{ hStdOut = hOpened; redirected_out = true; }
-				else if (a->fd == STDIN_FILENO)
-					{ hStdIn = hOpened; redirected_in = true; }
+				if (a->fd == STDERR_FILENO) {
+					hStdErr = hOpened;
+					redirected_err = true;
+				} else if (a->fd == STDOUT_FILENO) {
+					hStdOut = hOpened;
+					redirected_out = true;
+				} else if (a->fd == STDIN_FILENO) {
+					hStdIn = hOpened;
+					redirected_in = true;
+				}
 			}
 			// SPAWN_ACT_CLOSE: handled by the caller manually, not by this function
 		}
@@ -863,15 +914,19 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 				// Collect unique, valid handles for the whitelist.
 				HANDLE handle_list[3];
 				int handle_count = 0;
-				HANDLE candidates[3] = { hStdIn, hStdOut, hStdErr };
+				HANDLE candidates[3] = {hStdIn, hStdOut, hStdErr};
 				for (int i = 0; i < 3; i++) {
 					if (candidates[i] == INVALID_HANDLE_VALUE || candidates[i] == NULL)
 						continue;
 					bool dup = false;
 					for (int j = 0; j < handle_count; j++)
-						if (handle_list[j] == candidates[i]) { dup = true; break; }
+						if (handle_list[j] == candidates[i]) {
+							dup = true;
+							break;
+						}
 					if (!dup) {
-						SetHandleInformation(candidates[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+						SetHandleInformation(
+						    candidates[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
 						handle_list[handle_count++] = candidates[i];
 					}
 				}
@@ -888,17 +943,25 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 				InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
 				six.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
 				if (six.lpAttributeList &&
-				    InitializeProcThreadAttributeList(six.lpAttributeList, 1, 0, &attr_size) &&
-				    UpdateProcThreadAttribute(six.lpAttributeList, 0,
-							     PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-							     handle_list,
-							     (SIZE_T)handle_count * sizeof(HANDLE),
-							     NULL, NULL)) {
-					ok = CreateProcessW(NULL, wcmdline, NULL, NULL,
+				    InitializeProcThreadAttributeList(
+					six.lpAttributeList, 1, 0, &attr_size) &&
+				    UpdateProcThreadAttribute(six.lpAttributeList,
+							      0,
+							      PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+							      handle_list,
+							      (SIZE_T)handle_count * sizeof(HANDLE),
+							      NULL,
+							      NULL)) {
+					ok = CreateProcessW(NULL,
+							    wcmdline,
+							    NULL,
+							    NULL,
 							    TRUE,
 							    create_flags | EXTENDED_STARTUPINFO_PRESENT,
-							    env_block, NULL,
-							    &six.StartupInfo, &pi);
+							    env_block,
+							    NULL,
+							    &six.StartupInfo,
+							    &pi);
 				}
 				if (six.lpAttributeList) {
 					DeleteProcThreadAttributeList(six.lpAttributeList);
@@ -909,9 +972,16 @@ static HANDLE win32_spawn_with_actions(char **argv, posix_spawn_file_actions_t *
 				STARTUPINFOW siw;
 				memset(&siw, 0, sizeof(siw));
 				siw.cb = sizeof(siw);
-				ok = CreateProcessW(NULL, wcmdline, NULL, NULL,
-						    FALSE, create_flags,
-						    env_block, NULL, &siw, &pi);
+				ok = CreateProcessW(NULL,
+						    wcmdline,
+						    NULL,
+						    NULL,
+						    FALSE,
+						    create_flags,
+						    env_block,
+						    NULL,
+						    &siw,
+						    &pi);
 			}
 			free(wcmdline);
 		}
@@ -929,8 +999,7 @@ cleanup:
 	// STARTUPINFOEX handle list restricts which handles the child inherits —
 	// so there is nothing to restore here.
 	free(env_block);
-	for (int i = 0; i < opened_handle_count; i++)
-		CloseHandle(opened_handles[i]);
+	for (int i = 0; i < opened_handle_count; i++) CloseHandle(opened_handles[i]);
 	return hResult;
 }
 
@@ -972,6 +1041,7 @@ static pid_t waitpid(pid_t pid, int *status, int options) {
 	if (status) *status = (int)exit_code;
 	return pid;
 }
+
 // Resolve the path to the currently running executable.
 // Uses GetModuleFileNameW to handle non-ASCII install paths.
 static bool get_self_exe_path(char *buf, size_t bufsize) {
@@ -1004,7 +1074,7 @@ static bool cc_is_msvc(const char *cc) {
 		if (*p == '/' || *p == '\\') base = p + 1;
 	size_t len = (size_t)(cmd_end - base);
 	return ((len == 2 && _strnicmp(base, "cl", 2) == 0) ||
-	        (len == 6 && _strnicmp(base, "cl.exe", 6) == 0));
+		(len == 6 && _strnicmp(base, "cl.exe", 6) == 0));
 }
 
 // Run a command and wait for it to complete.
@@ -1054,9 +1124,15 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 
 	// Convert command line from UTF-8 to wide chars for CreateProcessW
 	int wcmd_len = MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, NULL, 0);
-	if (wcmd_len <= 0) { free(cmdline); return -1; }
+	if (wcmd_len <= 0) {
+		free(cmdline);
+		return -1;
+	}
 	wchar_t *wcmdline = (wchar_t *)malloc(wcmd_len * sizeof(wchar_t));
-	if (!wcmdline) { free(cmdline); return -1; }
+	if (!wcmdline) {
+		free(cmdline);
+		return -1;
+	}
 	MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, wcmdline, wcmd_len);
 	free(cmdline);
 
@@ -1072,8 +1148,8 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 
 	// Open NUL for stderr suppression
 	SECURITY_ATTRIBUTES sa_nul = {sizeof(sa_nul), NULL, TRUE};
-	HANDLE hNul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-				   &sa_nul, OPEN_EXISTING, 0, NULL);
+	HANDLE hNul = CreateFileW(
+	    L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa_nul, OPEN_EXISTING, 0, NULL);
 
 	PROCESS_INFORMATION pi;
 	memset(&pi, 0, sizeof(pi));
@@ -1081,17 +1157,20 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 	// Use STARTUPINFOEX with PROC_THREAD_ATTRIBUTE_HANDLE_LIST so only
 	// the pipe/NUL handles are inherited, not every inheritable handle
 	// in the process (which would leak concurrent PRISM_LIB_MODE pipes).
-	HANDLE candidates[3] = { GetStdHandle(STD_INPUT_HANDLE), hWritePipe,
-		(hNul != INVALID_HANDLE_VALUE) ? hNul : GetStdHandle(STD_ERROR_HANDLE) };
+	HANDLE candidates[3] = {GetStdHandle(STD_INPUT_HANDLE),
+				hWritePipe,
+				(hNul != INVALID_HANDLE_VALUE) ? hNul : GetStdHandle(STD_ERROR_HANDLE)};
 	HANDLE handle_list[3];
 	int handle_count = 0;
 	for (int i = 0; i < 3; i++) {
-		if (candidates[i] == INVALID_HANDLE_VALUE || candidates[i] == NULL)
-			continue;
+		if (candidates[i] == INVALID_HANDLE_VALUE || candidates[i] == NULL) continue;
 		SetHandleInformation(candidates[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
 		bool dup = false;
 		for (int j = 0; j < handle_count; j++)
-			if (handle_list[j] == candidates[i]) { dup = true; break; }
+			if (handle_list[j] == candidates[i]) {
+				dup = true;
+				break;
+			}
 		if (!dup) handle_list[handle_count++] = candidates[i];
 	}
 
@@ -1107,16 +1186,24 @@ static int capture_first_line(char **argv, char *buf, size_t bufsize) {
 	InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
 	six.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
 	BOOL ok = FALSE;
-	if (six.lpAttributeList &&
-	    InitializeProcThreadAttributeList(six.lpAttributeList, 1, 0, &attr_size) &&
-	    UpdateProcThreadAttribute(six.lpAttributeList, 0,
-				     PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-				     handle_list,
-				     (SIZE_T)handle_count * sizeof(HANDLE),
-				     NULL, NULL)) {
-		ok = CreateProcessW(NULL, wcmdline, NULL, NULL, TRUE,
-				    EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
-				    &six.StartupInfo, &pi);
+	if (six.lpAttributeList && InitializeProcThreadAttributeList(six.lpAttributeList, 1, 0, &attr_size) &&
+	    UpdateProcThreadAttribute(six.lpAttributeList,
+				      0,
+				      PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+				      handle_list,
+				      (SIZE_T)handle_count * sizeof(HANDLE),
+				      NULL,
+				      NULL)) {
+		ok = CreateProcessW(NULL,
+				    wcmdline,
+				    NULL,
+				    NULL,
+				    TRUE,
+				    EXTENDED_STARTUPINFO_PRESENT,
+				    NULL,
+				    NULL,
+				    &six.StartupInfo,
+				    &pi);
 	}
 	if (six.lpAttributeList) {
 		DeleteProcThreadAttributeList(six.lpAttributeList);
@@ -1165,9 +1252,15 @@ static int capture_all_output(char **argv, char *buf, size_t bufsize) {
 	if (!cmdline) return -1;
 
 	int wcmd_len = MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, NULL, 0);
-	if (wcmd_len <= 0) { free(cmdline); return -1; }
+	if (wcmd_len <= 0) {
+		free(cmdline);
+		return -1;
+	}
 	wchar_t *wcmdline = (wchar_t *)malloc(wcmd_len * sizeof(wchar_t));
-	if (!wcmdline) { free(cmdline); return -1; }
+	if (!wcmdline) {
+		free(cmdline);
+		return -1;
+	}
 	MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, wcmdline, wcmd_len);
 	free(cmdline);
 
@@ -1180,23 +1273,26 @@ static int capture_all_output(char **argv, char *buf, size_t bufsize) {
 	SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
 
 	SECURITY_ATTRIBUTES sa_nul = {sizeof(sa_nul), NULL, TRUE};
-	HANDLE hNul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-				   &sa_nul, OPEN_EXISTING, 0, NULL);
+	HANDLE hNul = CreateFileW(
+	    L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa_nul, OPEN_EXISTING, 0, NULL);
 
 	PROCESS_INFORMATION pi;
 	memset(&pi, 0, sizeof(pi));
 
-	HANDLE candidates[3] = { GetStdHandle(STD_INPUT_HANDLE), hWritePipe,
-		(hNul != INVALID_HANDLE_VALUE) ? hNul : GetStdHandle(STD_ERROR_HANDLE) };
+	HANDLE candidates[3] = {GetStdHandle(STD_INPUT_HANDLE),
+				hWritePipe,
+				(hNul != INVALID_HANDLE_VALUE) ? hNul : GetStdHandle(STD_ERROR_HANDLE)};
 	HANDLE handle_list[3];
 	int handle_count = 0;
 	for (int i = 0; i < 3; i++) {
-		if (candidates[i] == INVALID_HANDLE_VALUE || candidates[i] == NULL)
-			continue;
+		if (candidates[i] == INVALID_HANDLE_VALUE || candidates[i] == NULL) continue;
 		SetHandleInformation(candidates[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
 		bool dup = false;
 		for (int j = 0; j < handle_count; j++)
-			if (handle_list[j] == candidates[i]) { dup = true; break; }
+			if (handle_list[j] == candidates[i]) {
+				dup = true;
+				break;
+			}
 		if (!dup) handle_list[handle_count++] = candidates[i];
 	}
 
@@ -1212,16 +1308,24 @@ static int capture_all_output(char **argv, char *buf, size_t bufsize) {
 	InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
 	six.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size);
 	BOOL ok = FALSE;
-	if (six.lpAttributeList &&
-	    InitializeProcThreadAttributeList(six.lpAttributeList, 1, 0, &attr_size) &&
-	    UpdateProcThreadAttribute(six.lpAttributeList, 0,
-				     PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-				     handle_list,
-				     (SIZE_T)handle_count * sizeof(HANDLE),
-				     NULL, NULL)) {
-		ok = CreateProcessW(NULL, wcmdline, NULL, NULL, TRUE,
-				    EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
-				    &six.StartupInfo, &pi);
+	if (six.lpAttributeList && InitializeProcThreadAttributeList(six.lpAttributeList, 1, 0, &attr_size) &&
+	    UpdateProcThreadAttribute(six.lpAttributeList,
+				      0,
+				      PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+				      handle_list,
+				      (SIZE_T)handle_count * sizeof(HANDLE),
+				      NULL,
+				      NULL)) {
+		ok = CreateProcessW(NULL,
+				    wcmdline,
+				    NULL,
+				    NULL,
+				    TRUE,
+				    EXTENDED_STARTUPINFO_PRESENT,
+				    NULL,
+				    NULL,
+				    &six.StartupInfo,
+				    &pi);
 	}
 	if (six.lpAttributeList) {
 		DeleteProcThreadAttributeList(six.lpAttributeList);
@@ -1291,8 +1395,7 @@ static bool ensure_install_dir(const char *install_path) {
 		return true; // No directory component
 
 	wchar_t wdir[PATH_MAX];
-	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, dir, -1, wdir, PATH_MAX) <= 0)
-		return false;
+	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, dir, -1, wdir, PATH_MAX) <= 0) return false;
 
 	DWORD attr = GetFileAttributesW(wdir);
 	if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
@@ -1306,7 +1409,7 @@ static bool path_contains_dir(const char *path, const char *dir) {
 	if (!path || !dir) return false;
 	size_t dir_len = strlen(dir);
 	if (dir_len == 0) return false;
-	for (const char *p = path; ; ) {
+	for (const char *p = path;;) {
 		const char *found = strstr(p, dir);
 		if (!found) return false;
 		bool at_start = (found == path || found[-1] == ';');
@@ -1321,7 +1424,7 @@ static bool wpath_contains_dir(const wchar_t *wpath, const wchar_t *wdir) {
 	if (!wpath || !wdir) return false;
 	size_t dir_len = wcslen(wdir);
 	if (dir_len == 0) return false;
-	for (const wchar_t *p = wpath; ; ) {
+	for (const wchar_t *p = wpath;;) {
 		const wchar_t *found = wcsstr(p, wdir);
 		if (!found) return false;
 		bool at_start = (found == wpath || found[-1] == L';');
@@ -1355,28 +1458,45 @@ static void add_to_user_path(const char *dir) {
 	wchar_t *current = NULL;
 	if (rc == ERROR_SUCCESS && size > 0) {
 		current = (wchar_t *)malloc((size_t)size + sizeof(wchar_t));
-		if (!current) { RegCloseKey(hKey); return; }
+		if (!current) {
+			RegCloseKey(hKey);
+			return;
+		}
 		rc = RegQueryValueExW(hKey, L"Path", NULL, &type, (BYTE *)current, &size);
-		if (rc != ERROR_SUCCESS) { free(current); RegCloseKey(hKey); return; }
+		if (rc != ERROR_SUCCESS) {
+			free(current);
+			RegCloseKey(hKey);
+			return;
+		}
 		current[size / sizeof(wchar_t)] = L'\0';
 	} else if (rc == ERROR_FILE_NOT_FOUND) {
 		current = (wchar_t *)calloc(1, sizeof(wchar_t));
-		if (!current) { RegCloseKey(hKey); return; }
+		if (!current) {
+			RegCloseKey(hKey);
+			return;
+		}
 	} else {
 		RegCloseKey(hKey);
 		return;
 	}
 
 	// Check if already present in registry value
-	if (wpath_contains_dir(current, wdir)) { free(current); RegCloseKey(hKey); return; }
+	if (wpath_contains_dir(current, wdir)) {
+		free(current);
+		RegCloseKey(hKey);
+		return;
+	}
 
 	// Append ;dir
 	size_t cur_len = wcslen(current);
 	size_t new_len = cur_len + 1 + (wdir_len - 1) + 1; // cur + ';' + dir + NUL
 	wchar_t *newpath = (wchar_t *)malloc(new_len * sizeof(wchar_t));
-	if (!newpath) { free(current); RegCloseKey(hKey); return; }
-	if (cur_len > 0)
-		_snwprintf(newpath, new_len, L"%s;%s", current, wdir);
+	if (!newpath) {
+		free(current);
+		RegCloseKey(hKey);
+		return;
+	}
+	if (cur_len > 0) _snwprintf(newpath, new_len, L"%s;%s", current, wdir);
 	else
 		_snwprintf(newpath, new_len, L"%s", wdir);
 	newpath[new_len - 1] = L'\0';
@@ -1388,8 +1508,8 @@ static void add_to_user_path(const char *dir) {
 	RegCloseKey(hKey);
 
 	// Notify other programs of the environment change (wide)
-	SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"Environment",
-			    SMTO_ABORTIFHUNG, 5000, NULL);
+	SendMessageTimeoutW(
+	    HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"Environment", SMTO_ABORTIFHUNG, 5000, NULL);
 
 	fprintf(stderr,
 		"[prism] Added '%s' to your PATH (restart your terminal to use 'prism' directly).\n",
