@@ -6751,17 +6751,25 @@ static PRISM_ALWAYS_INLINE inline void track_generic_token(Token *tok) {
 		scope_pop();
 }
 
+/* O(1) read of the P1_IN_ATTR_ARGS bit precomputed by p1_mark_attr_arg_tokens.
+ * (Was an O(n) backward pool scan per paren → O(n^2) on attribute-free but
+ * switch/paren-heavy code, since track_common_token_state calls it per '('/')' .) */
 static bool token_inside_gnu_attr_args(Token *tok) {
-	uint32_t idx = tok_idx(tok);
-	for (uint32_t i = 1; i < idx; i++) {
+	return (tok_ann(tok) & P1_IN_ATTR_ARGS) != 0;
+}
+
+/* One O(n) pass: mark every token inside a GNU __attribute__((...)) /
+ * __declspec(...) argument group so the check above is a bit test. */
+static void p1_mark_attr_arg_tokens(void) {
+	for (uint32_t i = 1; i < token_count; i++) {
 		Token *t = &token_pool[i];
 		if (!(t->tag & TT_ATTR)) continue;
 		Token *open = tok_next(t);
 		if (!open || !match_ch(open, '(') || !(open->flags & TF_OPEN) || !tok_match(open)) continue;
 		uint32_t oi = tok_idx(open), ci = tok_idx(tok_match(open));
-		if (idx >= oi && idx <= ci) return true;
+		for (uint32_t j = oi; j <= ci; j++) token_pool[j].ann |= P1_IN_ATTR_ARGS;
+		i = ci; // resume past this group; total work stays O(n)
 	}
-	return false;
 }
 
 static PRISM_ALWAYS_INLINE inline void track_common_token_state(Token *tok) {
@@ -7483,13 +7491,31 @@ p1_register_param_shadows(Token *open, Token *close, uint16_t scope_id, int brac
 		}
 		if (last_ident && scope_id < scope_tree_count) {
 			Token *param_end = (t && match_ch(t, ',')) ? t : close;
+			/* A plain built-in scalar param (`int x`, `char *p`) needs no
+			 * is_param shadow — and registering one per function makes
+			 * typedef_lookup O(n^2) when many functions share a name (`x`,`n`,
+			 * `p`). Array/VLA params (sizeof decays), volatile params, and
+			 * anything whose array-ness could hide in a typedef / K&R decl
+			 * still need the entry, so skip ONLY definite built-in scalars. */
+			bool param_has_bracket = false;
+			for (Token *s = param_start; s && s != param_end && s->kind != TK_EOF; s = tok_next(s))
+				if (match_ch(s, '[') && (s->flags & TF_OPEN) && !(s->flags & TF_C23_ATTR)) {
+					param_has_bracket = true;
+					break;
+				}
 			bool has_vol_qual = false;
 			bool has_vol_member = false;
 			bool saw_star = false;
+			bool saw_builtin_type = false, saw_typedef_or_sue = false;
 			for (Token *s = param_start; s && s != param_end && s->kind != TK_EOF;
 			     s = tok_next(s)) {
 				if (s == last_ident) break;
 				if (match_ch(s, '*')) saw_star = true;
+				if (s->tag & (TT_SUE | TT_TYPEOF | TT_BITINT)) saw_typedef_or_sue = true;
+				else if ((s->tag & TT_TYPE) && !is_known_typedef(s))
+					saw_builtin_type = true;
+				else if (is_known_typedef(s))
+					saw_typedef_or_sue = true;
 				if ((s->tag & (TT_QUALIFIER | TT_VOLATILE)) == (TT_QUALIFIER | TT_VOLATILE))
 					has_vol_qual = true;
 				if (is_valid_varname(s) &&
@@ -7500,6 +7526,10 @@ p1_register_param_shadows(Token *open, Token *close, uint16_t scope_id, int brac
 				}
 			}
 			bool is_vol_param = (has_vol_qual || has_vol_member) && !saw_star;
+			/* Definite plain scalar: built-in type, no typedef/SUE, no array,
+			 * not volatile. Everything else keeps its shadow (conservative). */
+			bool param_plain_scalar = saw_builtin_type && !saw_typedef_or_sue &&
+						  !param_has_bracket && !is_vol_param;
 			bool matched_ident = false;
 			for (int ix = typedef_get_index(tok_loc(last_ident), last_ident->len); ix >= 0;
 			     ix = typedef_table.entries[ix].prev_index) {
@@ -7511,7 +7541,7 @@ p1_register_param_shadows(Token *open, Token *close, uint16_t scope_id, int brac
 					break;
 				}
 			}
-			if (!matched_ident) {
+			if (!matched_ident && !param_plain_scalar) {
 				TD_SCOPE_SAVE();
 				if (scope_id > 0 && scope_id < scope_tree_count) {
 					td_scope_open = scope_tree[scope_id].open_tok_idx;
@@ -10159,11 +10189,17 @@ static void p1_verify_cfg(void) {
 		int *fwd_hash_tbl = arena_alloc(&ctx->main_arena, (size_t)hash_sz * sizeof(int));
 		memset(fwd_hash_tbl, 0xFF, (size_t)hash_sz * sizeof(int)); // -1 = empty
 
-		int sw_max_sid = 0;
+		/* Switch watermarks indexed by (scope_id - sw_min_sid): a function's
+		 * switch scope_ids span its own scope range, so sizing to the SPAN is
+		 * O(function scopes). Sizing to the absolute max scope_id was O(global
+		 * scope_id) per function → O(n^2) memory across the TU. */
+		int sw_max_sid = 0, sw_min_sid = INT_MAX;
 		for (int i = 0; i < cnt; i++)
-			if (ents[i].kind == P1K_SWITCH && ents[i].scope_id > sw_max_sid)
-				sw_max_sid = ents[i].scope_id;
-		int sw_sz = sw_max_sid + 1;
+			if (ents[i].kind == P1K_SWITCH) {
+				if (ents[i].scope_id > sw_max_sid) sw_max_sid = ents[i].scope_id;
+				if (ents[i].scope_id < sw_min_sid) sw_min_sid = ents[i].scope_id;
+			}
+		int sw_sz = sw_max_sid >= sw_min_sid ? sw_max_sid - sw_min_sid + 1 : 0;
 		int *sw_defer_wm = NULL, *sw_decl_wm = NULL;
 		if (sw_sz > 0 && sw_sz <= 65536) {
 			sw_defer_wm = arena_alloc(&ctx->main_arena, (size_t)sw_sz * sizeof(int));
@@ -10290,12 +10326,14 @@ static void p1_verify_cfg(void) {
 				}
 				break;
 			}
-			case P1K_SWITCH:
-				if (sw_defer_wm && ents[i].scope_id < sw_sz) {
-					sw_defer_wm[ents[i].scope_id] = defer_n;
-					sw_decl_wm[ents[i].scope_id] = decl_n;
+			case P1K_SWITCH: {
+				int si = (int)ents[i].scope_id - sw_min_sid;
+				if (sw_defer_wm && si >= 0 && si < sw_sz) {
+					sw_defer_wm[si] = defer_n;
+					sw_decl_wm[si] = decl_n;
 				}
 				break;
+			}
 			case P1K_CASE: {
 				uint16_t sw_sid = ents[i].kase.switch_scope_id;
 				// (Phase 1D records sw_sid=0 only when p1d_switch_top==0).
@@ -10311,9 +10349,10 @@ static void p1_verify_cfg(void) {
 							  "(jumping into ({...}) is undefined behavior)");
 				}
 
-				if (!sw_defer_wm || sw_sid >= sw_sz) break;
-				int sw_dm = sw_defer_wm[sw_sid];
-				int sw_cm = sw_decl_wm[sw_sid];
+				int sw_i = (int)sw_sid - sw_min_sid;
+				if (!sw_defer_wm || sw_i < 0 || sw_i >= sw_sz) break;
+				int sw_dm = sw_defer_wm[sw_i];
+				int sw_cm = sw_decl_wm[sw_i];
 				if (FEAT(F_DEFER)) {
 					for (int di = sw_dm; di < defer_n; di++) {
 						P1FuncEntry *d = &ents[defer_list[di]];
@@ -10412,6 +10451,7 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 	p1_full_depth_prescan(tok);
 	p1_verify_cfg();
 	p1_annotate_typedefs();
+	p1_mark_attr_arg_tokens();
 	if (!FEAT(F_FLATTEN)) {
 		collect_system_includes();
 		emit_system_includes();

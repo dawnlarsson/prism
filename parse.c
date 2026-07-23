@@ -720,7 +720,10 @@ static inline PRISM_PURE uint64_t fast_hash(char *s, uint32_t len) {
 		    (unsigned char)s[len - 1];
 	}
 	a ^= (uint64_t)len * 0x9e3779b97f4a7c15ULL;
-	a ^= b;
+	/* Rotate b before mixing: for len == 8 the first and last 8 bytes are the
+	 * SAME, so a plain `a ^= b` cancels the content and every 8-char key hashes
+	 * to a constant → one giant open-addressing cluster → O(n^2) probing. */
+	a ^= (b << 32) | (b >> 32);
 	a *= 0xbf58476d1ce4e5b9ULL;
 	a ^= a >> 31;
 	a *= 0x94d049bb133111ebULL;
@@ -2360,6 +2363,7 @@ enum {
 	P1_UNEVAL_BRACKET =
 	    1 << 10, // '[' is inside an unevaluated operand (sizeof/_Alignof/typeof/offsetof/etc.)
 	P1_IS_ORELSE_KW = 1 << 11, // Pass 1: this orelse token is the Prism keyword (not an ident)
+	P1_IN_ATTR_ARGS = 1 << 12, // token is inside a GNU __attribute__((...)) / __declspec(...) group
 };
 
 #define tok_ann(t) ((t)->ann)
