@@ -14,7 +14,7 @@ jobs:
     container: alpine:latest
     steps:
       - name: Install Build Dependencies
-        run: apk add --no-cache gcc musl-dev git
+        run: apk add --no-cache gcc g++ musl-dev git
 
       - uses: actions/checkout@v4
 
@@ -197,7 +197,7 @@ jobs:
             -w /workspace \
             alpine:latest sh -c '
               set -e
-              apk add --no-cache gcc musl-dev
+              apk add --no-cache gcc g++ musl-dev
               echo "Architecture: $(uname -m)"
               gcc --version
               echo "=== Stage 0: Build with host compiler ==="
@@ -247,7 +247,7 @@ jobs:
             -w /workspace \
             alpine:edge sh -c '
               set -e
-              apk add --no-cache gcc musl-dev
+              apk add --no-cache gcc g++ musl-dev
               echo "Architecture: $(uname -m)"
               gcc --version
               echo "=== Stage 0: Build with host compiler ==="

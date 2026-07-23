@@ -2445,19 +2445,13 @@ static void test_file_c23_generic_decl_plain_redeclaration(void) {
  *
  * After preprocessing with GCC 15 in C23 mode, bare `bsearch`, `memchr`,
  * `strchr` etc. tokens in redeclarations are expanded to `_Generic(...)`
- * by glibc's C23 type-generic macros.  Prism rewrites these back to
- * parenthesized declarators at file scope (block_depth == 0), but NOT
- * inside function bodies (block_depth > 0).
+ * by glibc's C23 type-generic macros.  Prism must rewrite these back to
+ * parenthesized declarators in declaration context (file-scope and local
+ * extern), while leaving expression `_Generic` alone.
  *
- * Coreutils code (and gnulib-generated wrappers) frequently use local
- * extern redeclarations inside functions.  These leak `_Generic` into
- * the transpiled output, causing downstream compile failures:
- *
- *   error: expected identifier or '(' before '_Generic'
- *
- * Root cause: generic_decl_rewrite_target is guarded by
- *   ctx->block_depth == 0 && is_decl_prefix_token(last_emitted)
- * but local extern decls have block_depth > 0.
+ * Coreutils / gnulib frequently use local extern redeclarations inside
+ * functions; without the rewrite those leak `_Generic` into the declarator
+ * name position and the backend rejects the TU.
  */
 static void test_file_c23_n3322_local_extern_generic_leak(void) {
 	printf("\n--- C23 N3322 Local Extern _Generic Leak ---\n");
@@ -2489,10 +2483,9 @@ static void test_file_c23_n3322_local_extern_generic_leak(void) {
 		CHECK(r.status == PRISM_OK,
 		      "n3322 local extern: transpiles OK");
 		if (r.output) {
-			/* _Generic must NOT appear in declaration context.
-			 * Currently block_depth>0 bypasses the rewrite. */
+			/* _Generic must NOT appear in declaration context. */
 			CHECK(strstr(r.output, "_Generic") == NULL,
-			      "n3322-local-extern: _Generic leaks into local extern decl (block_depth>0 bypass)");
+			      "n3322-local-extern: _Generic leaks into local extern decl");
 
 			check_transpiled_output_compiles(
 			    r.output, "-std=gnu2x",
@@ -4008,6 +4001,17 @@ static void test_cli_dep_flags_routing(void) {
 static void test_cli_mixed_c_cpp_driver(void) {
 	printf("\n--- CLI mixed .c + .cpp (pp must not ingest .cpp) ---\n");
 
+	/* C++ passthrough needs a C++ driver; minimal environments (Alpine with
+	 * only gcc + musl-dev) legitimately lack one — skip, don't fail. */
+	if (system("c++ --version >/dev/null 2>&1") != 0 &&
+	    system("g++ --version >/dev/null 2>&1") != 0 &&
+	    system("clang++ --version >/dev/null 2>&1") != 0) {
+		passed++;
+		total++;
+		printf("[PASS] cxxmix: skipped (no C++ driver installed)\n");
+		return;
+	}
+
 	char tmpdir[PATH_MAX];
 	char *dir = test_mkdtemp(tmpdir, "prism_cxxmix_");
 	CHECK(dir != NULL, "cxxmix: create temp dir");
@@ -4130,6 +4134,64 @@ static void test_cli_mixed_c_cpp_driver(void) {
 	unlink(c_path);
 	unlink(cxx_path);
 	unlink(out_path);
+	unlink(prism_bin);
+	rmdir(dir);
+}
+
+/* preprocess_with_cc re-runs `cc -E` on failure so diagnostics reach stderr.
+ * That rerun must discard stdout — otherwise the full preprocessed dump
+ * pollutes the user's stdout (and breaks build systems that capture it). */
+static void test_preprocess_failure_no_stdout_dump(void) {
+	printf("\n--- Preprocess failure must not dump -E to stdout ---\n");
+
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_ppdump_");
+	CHECK(dir != NULL, "ppdump: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], src_path[PATH_MAX], out_path[PATH_MAX];
+	char stdout_path[PATH_MAX], stderr_path[PATH_MAX];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	snprintf(src_path, sizeof(src_path), "%s/bad.c", dir);
+	snprintf(out_path, sizeof(out_path), "%s/bad.o", dir);
+	snprintf(stdout_path, sizeof(stdout_path), "%s/out.txt", dir);
+	snprintf(stderr_path, sizeof(stderr_path), "%s/err.txt", dir);
+
+	FILE *f = fopen(src_path, "w");
+	CHECK(f != NULL, "ppdump: write source");
+	if (!f) {
+		rmdir(dir);
+		return;
+	}
+	fputs("#error intentional_pp_failure\nint main(void){return 0;}\n", f);
+	fclose(f);
+
+	if (!build_test_prism_binary(prism_bin, "ppdump: build prism binary")) {
+		unlink(src_path);
+		rmdir(dir);
+		return;
+	}
+
+	char *argv[] = {prism_bin, "-c", src_path, "-o", out_path, NULL};
+	int st = run_exec_argv_capture(argv, stdout_path, stderr_path);
+	CHECK(st != 0, "ppdump: compile fails on #error");
+
+	long out_sz = file_size(stdout_path);
+	CHECK(out_sz == 0, "ppdump: stdout empty (no -E dump)");
+
+	char errbuf[8192] = {0};
+	FILE *ef = fopen(stderr_path, "r");
+	if (ef) {
+		fread(errbuf, 1, sizeof(errbuf) - 1, ef);
+		fclose(ef);
+	}
+	CHECK(strstr(errbuf, "intentional_pp_failure") != NULL,
+	      "ppdump: stderr still shows #error diagnostic");
+
+	unlink(src_path);
+	unlink(out_path);
+	unlink(stdout_path);
+	unlink(stderr_path);
 	unlink(prism_bin);
 	rmdir(dir);
 }
@@ -5205,18 +5267,26 @@ static void test_coreutils_gnulib_generic_decl_leak(void) {
 	PrismResult r = prism_transpile_file(path, prism_defaults());
 	CHECK(r.status == PRISM_OK, "gnulib-generic: transpiles OK");
 	if (r.output) {
-		/* _Generic passes through — Prism does not rewrite declarations.
-		 * The gnulib pattern uses macros that expand to _Generic in
-		 * declaration context; compile-checks removed because they
-		 * tested the rewrite (which was intentionally dropped). */
-		CHECK(strstr(r.output, "_Generic") != NULL,
-		      "gnulib-generic: _Generic passes through");
+		/* Decl-context rewrite must fold `_Generic(..., default: name(params))`
+		 * back to `(name)(params)` so the TU compiles under gnu2x. */
+		CHECK(strstr(r.output, "*(bsearch)") != NULL || strstr(r.output, "* (bsearch)") != NULL ||
+			  strstr(r.output, "*(bsearch) (") != NULL || strstr(r.output, "* (bsearch) (") != NULL,
+		      "gnulib-generic: file-scope bsearch rewritten");
+		CHECK(strstr(r.output, "*(memchr)") != NULL || strstr(r.output, "* (memchr)") != NULL ||
+			  strstr(r.output, "*(memchr) (") != NULL || strstr(r.output, "* (memchr) (") != NULL,
+		      "gnulib-generic: file-scope memchr rewritten");
+		CHECK(strstr(r.output, "*(strchr)") != NULL || strstr(r.output, "* (strchr)") != NULL ||
+			  strstr(r.output, "*(strchr) (") != NULL || strstr(r.output, "* (strchr) (") != NULL,
+		      "gnulib-generic: file-scope strchr rewritten");
+		CHECK(strstr(r.output, "*(wmemchr)") != NULL || strstr(r.output, "* (wmemchr)") != NULL ||
+			  strstr(r.output, "*(wmemchr) (") != NULL || strstr(r.output, "* (wmemchr) (") != NULL,
+		      "gnulib-generic: file-scope wmemchr rewritten");
 
-		/* __attribute__ must be preserved */
-		CHECK(strstr(r.output, "__nonnull__") != NULL,
-		      "gnulib-generic: __attribute__ preserved");
-		CHECK(strstr(r.output, "__pure__") != NULL,
-		      "gnulib-generic: __pure__ attribute preserved");
+		CHECK(strstr(r.output, "__nonnull__") != NULL, "gnulib-generic: __attribute__ preserved");
+		CHECK(strstr(r.output, "__pure__") != NULL, "gnulib-generic: __pure__ attribute preserved");
+
+		check_transpiled_output_compiles(
+		    r.output, "-std=gnu2x", "gnulib-generic: transpiled output compiles in gnu2x");
 	}
 	prism_free(&r);
 	unlink(path);
@@ -7887,6 +7957,7 @@ void run_api_tests_3(void) {
 	test_cli_dep_flags_routing();
 	test_cli_dep_flags_passthrough();
 	test_cli_mixed_c_cpp_driver();
+	test_preprocess_failure_no_stdout_dump();
 	test_version_shows_backend_cc();
 	test_version_full_output_for_meson();
 	test_cli_split_D_flag_not_source();

@@ -8398,6 +8398,326 @@ static void test_orelse_volatile_addr_compound_literal_rejected(void) {
 	    "compound literal");
 }
 
+/* -------------------------------------------------------------------------
+ * Control × orelse product matrix.
+ * Positions: condition / for-init / for-incr / body (bare, paren, brace)
+ * × forms (expr, decl-init, bracket) × ctrl kinds.
+ * ------------------------------------------------------------------------- */
+
+typedef enum {
+	OE_CTRL_IF = 0,
+	OE_CTRL_WHILE,
+	OE_CTRL_FOR,
+	OE_CTRL_DO,
+	OE_CTRL_SWITCH,
+	OE_CTRL_COUNT
+} OeCtrlKind;
+
+typedef enum {
+	OE_POS_COND = 0,
+	OE_POS_FOR_INIT,
+	OE_POS_FOR_INCR,
+	OE_POS_BODY_BARE,
+	OE_POS_BODY_PAREN,
+	OE_POS_BODY_BRACE,
+	OE_POS_COUNT
+} OeCtrlPos;
+
+typedef enum {
+	OE_FORM_EXPR = 0,
+	OE_FORM_DECL,
+	OE_FORM_BRACKET,
+	OE_FORM_COUNT
+} OeFormKind;
+
+static const char *oe_ctrl_name(OeCtrlKind c) {
+	static const char *n[OE_CTRL_COUNT] = {"if", "while", "for", "do", "switch"};
+	return n[c];
+}
+static const char *oe_pos_name(OeCtrlPos p) {
+	static const char *n[OE_POS_COUNT] = {
+	    "cond", "for_init", "for_incr", "body_bare", "body_paren", "body_brace",
+	};
+	return n[p];
+}
+static const char *oe_form_name(OeFormKind f) {
+	static const char *n[OE_FORM_COUNT] = {"expr", "decl", "bracket"};
+	return n[f];
+}
+
+/* 1 = expect OK, 0 = expect reject, -1 = skip. */
+static int oe_ctrl_expect(OeCtrlKind ctrl, OeCtrlPos pos, OeFormKind form) {
+	if (pos == OE_POS_FOR_INIT && ctrl != OE_CTRL_FOR) return -1;
+	if (pos == OE_POS_FOR_INCR && ctrl != OE_CTRL_FOR) return -1;
+	if (pos == OE_POS_FOR_INCR && form != OE_FORM_EXPR) return -1;
+	if (pos == OE_POS_COND || pos == OE_POS_FOR_INIT || pos == OE_POS_FOR_INCR) return 0;
+	if (pos == OE_POS_BODY_PAREN && form != OE_FORM_EXPR) {
+		/* `(x = g() orelse 0)` — inner orelse not statement-level */
+		if (form == OE_FORM_DECL) return 0;
+		return -1;
+	}
+	if (pos == OE_POS_BODY_BARE && form == OE_FORM_BRACKET) return -1;
+	return 1;
+}
+
+static int oe_ctrl_build(char *buf, size_t buflen, OeCtrlKind ctrl, OeCtrlPos pos, OeFormKind form) {
+	const char *action = "return";
+	if (ctrl == OE_CTRL_WHILE || ctrl == OE_CTRL_FOR || ctrl == OE_CTRL_DO ||
+	    ctrl == OE_CTRL_SWITCH)
+		action = "break";
+
+	char payload[256];
+	if (form == OE_FORM_EXPR)
+		snprintf(payload, sizeof(payload), "g() orelse %s;", action);
+	else if (form == OE_FORM_DECL)
+		snprintf(payload, sizeof(payload), "int x = g() orelse 0; (void)x;");
+	else
+		snprintf(payload, sizeof(payload), "int a[g() orelse 1]; (void)a;");
+
+	char paren_payload[128];
+	snprintf(paren_payload, sizeof(paren_payload), "(g()) orelse %s;", action);
+
+	const char *prelude = "int g(void);\n";
+	int n = -1;
+
+	switch (pos) {
+	case OE_POS_COND:
+		if (form == OE_FORM_BRACKET) return -1;
+		if (form == OE_FORM_DECL) {
+			if (ctrl != OE_CTRL_IF) return -1;
+			n = snprintf(buf, buflen,
+				     "%svoid f(void){ if (int x = g() orelse 0; x) {} }\n", prelude);
+			break;
+		}
+		if (ctrl == OE_CTRL_IF)
+			n = snprintf(buf, buflen, "%svoid f(void){ if (g() orelse 0) {} }\n",
+				     prelude);
+		else if (ctrl == OE_CTRL_WHILE)
+			n = snprintf(buf, buflen, "%svoid f(void){ while (g() orelse 0) {} }\n",
+				     prelude);
+		else if (ctrl == OE_CTRL_FOR)
+			n = snprintf(buf, buflen, "%svoid f(void){ for (; g() orelse 0; ) {} }\n",
+				     prelude);
+		else if (ctrl == OE_CTRL_SWITCH)
+			n = snprintf(buf, buflen,
+				     "%svoid f(void){ switch (g() orelse 0) { default: break; } }\n",
+				     prelude);
+		else if (ctrl == OE_CTRL_DO)
+			n = snprintf(buf, buflen, "%svoid f(void){ do {} while (g() orelse 0); }\n",
+				     prelude);
+		break;
+	case OE_POS_FOR_INIT:
+		if (ctrl != OE_CTRL_FOR || form == OE_FORM_BRACKET) return -1;
+		if (form == OE_FORM_EXPR)
+			n = snprintf(buf, buflen,
+				     "%svoid f(void){ int i; for (i = g() orelse 0; i; ) {} }\n",
+				     prelude);
+		else
+			n = snprintf(buf, buflen,
+				     "%svoid f(void){ for (int x = g() orelse 0; x; ) {} }\n",
+				     prelude);
+		break;
+	case OE_POS_FOR_INCR:
+		if (ctrl != OE_CTRL_FOR || form != OE_FORM_EXPR) return -1;
+		n = snprintf(buf, buflen,
+			     "%svoid f(void){ int i = 0; for (; i < 3; i = g() orelse 0) {} }\n",
+			     prelude);
+		break;
+	case OE_POS_BODY_BARE:
+		if (form == OE_FORM_BRACKET) return -1;
+		if (ctrl == OE_CTRL_IF)
+			n = snprintf(buf, buflen, "%svoid f(int c){ if (c) %s }\n", prelude, payload);
+		else if (ctrl == OE_CTRL_WHILE)
+			n = snprintf(buf, buflen, "%svoid f(int c){ while (c) %s }\n", prelude,
+				     payload);
+		else if (ctrl == OE_CTRL_FOR)
+			n = snprintf(buf, buflen, "%svoid f(void){ for (;;) %s }\n", prelude,
+				     payload);
+		else if (ctrl == OE_CTRL_DO)
+			n = snprintf(buf, buflen, "%svoid f(void){ do %s while (0); }\n", prelude,
+				     payload);
+		else if (ctrl == OE_CTRL_SWITCH)
+			n = snprintf(buf, buflen,
+				     "%svoid f(int c){ switch (c) { default: %s } }\n", prelude,
+				     payload);
+		break;
+	case OE_POS_BODY_PAREN:
+		if (form == OE_FORM_DECL) {
+			n = snprintf(buf, buflen,
+				     "%svoid f(int c){ int x; if (c) (x = g() orelse 0); }\n",
+				     prelude);
+			break;
+		}
+		if (form != OE_FORM_EXPR) return -1;
+		if (ctrl == OE_CTRL_IF)
+			n = snprintf(buf, buflen, "%svoid f(int c){ if (c) %s }\n", prelude,
+				     paren_payload);
+		else if (ctrl == OE_CTRL_WHILE)
+			n = snprintf(buf, buflen, "%svoid f(int c){ while (c) %s }\n", prelude,
+				     paren_payload);
+		else if (ctrl == OE_CTRL_FOR)
+			n = snprintf(buf, buflen, "%svoid f(void){ for (;;) %s }\n", prelude,
+				     paren_payload);
+		else if (ctrl == OE_CTRL_DO)
+			n = snprintf(buf, buflen, "%svoid f(void){ do %s while (0); }\n", prelude,
+				     paren_payload);
+		else if (ctrl == OE_CTRL_SWITCH)
+			n = snprintf(buf, buflen,
+				     "%svoid f(int c){ switch (c) { default: %s } }\n", prelude,
+				     paren_payload);
+		break;
+	case OE_POS_BODY_BRACE:
+		if (ctrl == OE_CTRL_IF)
+			n = snprintf(buf, buflen, "%svoid f(int c){ if (c) { %s } }\n", prelude,
+				     payload);
+		else if (ctrl == OE_CTRL_WHILE)
+			n = snprintf(buf, buflen, "%svoid f(int c){ while (c) { %s } }\n", prelude,
+				     payload);
+		else if (ctrl == OE_CTRL_FOR)
+			n = snprintf(buf, buflen, "%svoid f(void){ for (;;) { %s } }\n", prelude,
+				     payload);
+		else if (ctrl == OE_CTRL_DO)
+			n = snprintf(buf, buflen, "%svoid f(void){ do { %s } while (0); }\n",
+				     prelude, payload);
+		else if (ctrl == OE_CTRL_SWITCH)
+			n = snprintf(
+			    buf, buflen,
+			    "%svoid f(int c){ switch (c) { default: { %s } break; } }\n", prelude,
+			    payload);
+		break;
+	case OE_POS_COUNT:
+		break;
+	}
+	return (n < 0 || (size_t)n >= buflen) ? -1 : 0;
+}
+
+static bool oe_output_has_orelse_kw(const char *out) {
+	if (!out) return false;
+	size_t klen = 6;
+	for (const char *p = out; (p = strstr(p, "orelse")) != NULL; p++) {
+		char b = p == out ? '\0' : p[-1];
+		char a = p[klen];
+		int wb = !((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') ||
+			   b == '_');
+		int wa = !((a >= 'a' && a <= 'z') || (a >= 'A' && a <= 'Z') || (a >= '0' && a <= '9') ||
+			   a == '_');
+		if (wb && wa) return true;
+	}
+	return false;
+}
+
+static void test_ctrl_orelse_product_matrix(void) {
+	char src[1024];
+	char name[192];
+	char fname[96];
+	int ok = 0, fail = 0, skipped = 0;
+
+	printf("\n--- Ctrl × orelse product matrix ---\n");
+
+	for (int ci = 0; ci < (int)OE_CTRL_COUNT; ci++) {
+		for (int pi = 0; pi < (int)OE_POS_COUNT; pi++) {
+			for (int fi = 0; fi < (int)OE_FORM_COUNT; fi++) {
+				OeCtrlKind ctrl = (OeCtrlKind)ci;
+				OeCtrlPos pos = (OeCtrlPos)pi;
+				OeFormKind form = (OeFormKind)fi;
+				int expect = oe_ctrl_expect(ctrl, pos, form);
+				if (expect < 0) {
+					skipped++;
+					continue;
+				}
+				if (oe_ctrl_build(src, sizeof(src), ctrl, pos, form) != 0) {
+					skipped++;
+					continue;
+				}
+				snprintf(name, sizeof(name), "ctrl×oe: %s/%s/%s", oe_ctrl_name(ctrl),
+					 oe_pos_name(pos), oe_form_name(form));
+				snprintf(fname, sizeof(fname), "ctrloe_%s_%s_%s.c",
+					 oe_ctrl_name(ctrl), oe_pos_name(pos), oe_form_name(form));
+				PrismResult r = prism_transpile_source(src, fname, prism_defaults());
+				if (expect) {
+					CHECK_EQ(r.status, PRISM_OK, name);
+					if (r.status == PRISM_OK) {
+						snprintf(name, sizeof(name),
+							 "ctrl×oe no-leak: %s/%s/%s",
+							 oe_ctrl_name(ctrl), oe_pos_name(pos),
+							 oe_form_name(form));
+						CHECK(!oe_output_has_orelse_kw(r.output), name);
+						if (!oe_output_has_orelse_kw(r.output)) ok++;
+						else
+							fail++;
+					} else {
+						fail++;
+						if (r.error_msg)
+							printf("         error: %s\n", r.error_msg);
+					}
+				} else {
+					CHECK(r.status != PRISM_OK, name);
+					if (r.status != PRISM_OK) ok++;
+					else {
+						fail++;
+						printf("         unexpectedly accepted\n");
+					}
+				}
+				prism_free(&r);
+			}
+		}
+	}
+
+	/* Expression-ternary orelse must reject (not only decl-init). */
+	printf("\n--- Expr-ternary orelse rejection ---\n");
+	static const struct {
+		const char *code;
+		const char *label;
+		int want_ok;
+	} tern[] = {
+	    {"int g(void); int f(int c){ return c ? g() orelse 0 : 1; }\n",
+	     "return ternary true-branch", 0},
+	    /* Value-fallback orelse still needs an assignment target. */
+	    {"int g(void); int f(int c){ return c ? 1 : g() orelse 0; }\n",
+	     "return ternary false-branch no-assign", 0},
+	    {"int g(void); int f(int c){ int x; x = c ? 1 : g() orelse 0; return x; }\n",
+	     "assign ternary false-branch", 1},
+	    {"int g(void); void f(int c){ int x; x = c ? g() orelse 0 : 1; }\n",
+	     "assign ternary true-branch", 0},
+	    {"int g(void); void f(int c){ if (c ? g() orelse 0 : 1) {} }\n",
+	     "if-cond ternary", 0},
+	    {"int g(void); int f(int c){ int x; x = (c ? g() : 1) orelse 0; return x; }\n",
+	     "orelse after closed ternary", 1},
+	};
+	for (size_t i = 0; i < sizeof(tern) / sizeof(tern[0]); i++) {
+		PrismResult r = prism_transpile_source(tern[i].code, "oetern.c", prism_defaults());
+		snprintf(name, sizeof(name), "ctrl×oe tern: %s", tern[i].label);
+		if (tern[i].want_ok) {
+			CHECK_EQ(r.status, PRISM_OK, name);
+			if (r.status == PRISM_OK)
+				CHECK(!oe_output_has_orelse_kw(r.output), name);
+		} else {
+			CHECK(r.status != PRISM_OK, name);
+		}
+		prism_free(&r);
+	}
+
+	/* Else-body forms. */
+	{
+		static const char *else_ok[] = {
+		    "int g(void); void f(int c){ if (c); else g() orelse return; }\n",
+		    "int g(void); void f(int c){ if (c); else (g()) orelse return; }\n",
+		    "int g(void); void f(int c){ if (c); else { int x = g() orelse 0; (void)x; } }\n",
+		};
+		for (size_t i = 0; i < sizeof(else_ok) / sizeof(else_ok[0]); i++) {
+			PrismResult r =
+			    prism_transpile_source(else_ok[i], "oeelse.c", prism_defaults());
+			CHECK_EQ(r.status, PRISM_OK, "ctrl×oe: else body form");
+			if (r.status == PRISM_OK)
+				CHECK(!oe_output_has_orelse_kw(r.output),
+				      "ctrl×oe: else body no-leak");
+			prism_free(&r);
+		}
+	}
+
+	printf("--- ctrl×oe matrix summary: %d ok, %d fail, %d skipped ---\n", ok, fail, skipped);
+}
+
 void run_orelse_tests(void) {
 	test_bracket_orelse_many_tokens_linear_paren_scan();
 	test_orelse_volatile_addr_compound_literal_rejected();
@@ -8822,6 +9142,7 @@ void run_orelse_tests(void) {
 	// orelse inside attribute arguments (GNU/C23) leaked to backend
 	test_orelse_ctrl_paren_stmt_action_rejected();
 	test_paren_led_bare_orelse_after_ctrl();
+	test_ctrl_orelse_product_matrix();
 	test_orelse_block_break_in_ctrl_cond_no_outer_defer();
 	test_orelse_stmt_prefixes_and_gnu_attr_ctrl();
 	test_orelse_in_attribute_args();

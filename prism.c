@@ -410,7 +410,9 @@ static Token *try_bracket_orelse(Token *tok);
 static void emit_token_range_orelse(Token *start, Token *end);
 static void emit_token_range_nested(Token *start, Token *end, bool with_orelse);
 static inline bool is_orelse_value_fallback(Token *after_oe);
+#ifdef PRISM_DEBUG
 static void check_orelse_in_ctrl_paren(Token *open);
+#endif
 static Token *handle_sue_body(Token *tok);
 static void emit_noise_between_raws(Token *first_raw, Token *last_raw);
 static inline Token *try_strip_raw(Token *t);
@@ -853,7 +855,7 @@ static void end_statement_after_semicolon(void) {
 }
 
 static void scope_push_kind(ScopeKind kind) {
-	ENSURE_ARRAY_CAP(scope_stack, ctx->scope_depth + 1, scope_stack_cap, 256, ScopeNode);
+	VEC_ENSURE_REALLOC(scope_stack, ctx->scope_depth + 1, scope_stack_cap, 256);
 	ScopeNode *s = &scope_stack[ctx->scope_depth];
 	*s = (ScopeNode){.kind = kind};
 	s->defer_start_idx = defer_count;
@@ -878,8 +880,11 @@ static void scope_pop(void) {
 }
 
 static void defer_add(Token *defer_keyword, Token *start, Token *end) {
+	/* Phase 1 p1d_validate_defer owns the file-scope reject. */
+#ifdef PRISM_DEBUG
 	if (ctx->block_depth <= 0) error_tok(start, "defer outside of any scope");
-	ENSURE_ARRAY_CAP(defer_stack, defer_count + 1, defer_stack_cap, 64, DeferEntry);
+#endif
+	VEC_ENSURE_REALLOC(defer_stack, defer_count + 1, defer_stack_cap, 64);
 	defer_stack[defer_count++] = (DeferEntry){start, end, defer_keyword};
 }
 
@@ -1402,8 +1407,11 @@ static void check_defer_var_shadow(Token *var_name) {
 			defer_shadows = tmp;
 			defer_shadow_cap = new_cap;
 		}
+		/* Phase 1 p1_check_defer_same_block_shadow owns the same-block reject. */
+#ifdef PRISM_DEBUG
 		if (i >= same_block_start && !in_for_init())
 			error_tok(var_name, ERR_DEFER_SHADOW_SAME_SCOPE, nlen, name);
+#endif
 		defer_shadows[defer_shadow_count++] = (DeferShadow){
 		    .name = name,
 		    .len = nlen,
@@ -1549,10 +1557,6 @@ static bool token_in_function_declarator_param_list(Token *tok) {
 		if (depth == 0 && (match_ch(t, ';') || match_ch(t, '{') || match_ch(t, '}'))) break;
 	}
 	return false;
-}
-
-static inline bool prism_keyword_decl_name_boundary(Token *tok) {
-	return soft_keyword_decl_name_boundary_ex(tok, true);
 }
 
 static inline bool orelse_kw_at(Token *t, Token *prev) {
@@ -2103,7 +2107,38 @@ static bool consume_stmt_colon(Token **tok_p, int *ternary_depth, bool *pending_
 	return false;
 }
 
+static inline bool generic_decl_prefix_last(Token *t) {
+	if (!t) return false;
+	if (match_ch(t, '*') || match_ch(t, ')')) return true;
+	if (t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_SKIP_DECL | TT_ATTR | TT_INLINE | TT_STORAGE |
+		      TT_TYPEOF | TT_BITINT))
+		return true;
+	return is_known_typedef(t);
+}
+
+/* Decl-context only: fold glibc C23 `_Generic(..., default: name(params))`
+ * back to `(name)(params)`. Expression `_Generic` keeps SCOPE_GENERIC. */
 static Token *emit_generic_open(Token *tok) {
+	if (generic_decl_prefix_last(last_emitted)) {
+		Token *name = NULL, *params_open = NULL, *params_close = NULL, *after = NULL;
+		if (generic_decl_rewrite_target(tok, &name, &params_open, &params_close, &after)) {
+			out_char('(');
+			OUT_TOK(name);
+			out_char(')');
+			emit_range(params_open, tok_next(params_close));
+			Token *gen_close = tok_match(tok_next(tok));
+			Token *scan_start = gen_close;
+			Token *after_gen = skip_noise(tok_next(gen_close));
+			if (after_gen == params_open) scan_start = params_close;
+			for (Token *a = tok_next(scan_start); a && a != after; a = tok_next(a)) {
+				emit_tok(a);
+				last_emitted = a;
+			}
+			last_emitted = params_close ? params_close : name;
+			ctx->at_stmt_start = false;
+			return after;
+		}
+	}
 	tok = emit_advance(tok);
 	if (tok && match_ch(tok, '(')) {
 		scope_push_kind(SCOPE_GENERIC);
@@ -3036,19 +3071,22 @@ static void emit_token_range_nested(Token *start, Token *end, bool with_orelse) 
 	}
 }
 
-static void emit_token_range_orelse(Token *start, Token *end) {
-	Token *orelse = NULL;
+/* First P1_IS_ORELSE_KW token in [start, end) at group depth 0 (jumps
+ * balanced groups, skips prep dirs); NULL if none. */
+static Token *find_ann_orelse(Token *start, Token *end) {
 	for (Token *s = start; s && s != end && s->kind != TK_EOF; s = tok_next(s)) {
 		if (s->kind == TK_PREP_DIR) continue;
 		if (s->flags & TF_OPEN) {
 			s = tok_match(s);
 			continue;
 		}
-		if (tok_ann(s) & P1_IS_ORELSE_KW) {
-			orelse = s;
-			break;
-		}
+		if (tok_ann(s) & P1_IS_ORELSE_KW) return s;
 	}
+	return NULL;
+}
+
+static void emit_token_range_orelse(Token *start, Token *end) {
+	Token *orelse = find_ann_orelse(start, end);
 	if (!orelse) {
 		emit_token_range_nested(start, end, true);
 		return;
@@ -3082,22 +3120,16 @@ static Token *scan_bracket_orelse(Token *open, Token *close, Token **paren_open_
 	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
 		if (t->kind == TK_PREP_DIR) continue;
 		if (t->flags & TF_OPEN) {
-			if (match_ch(open, '[') && match_ch(t, '(')) {
-				Token *pp = tok_match(t);
-				if (pp && tok_next(pp) == close) {
-					for (Token *s = tok_next(t); s && s != pp; s = tok_next(s)) {
-						if (s->flags & TF_OPEN) {
-							s = tok_match(s);
-							continue;
-						}
-						if (tok_ann(s) & P1_IS_ORELSE_KW) {
-							if (paren_open_out) *paren_open_out = t;
-							return s;
-						}
-					}
+			Token *pp = tok_match(t);
+			/* `( … orelse … )` ending flush at `]` — macro-hygiene wrap. */
+			if (match_ch(open, '[') && match_ch(t, '(') && pp && tok_next(pp) == close) {
+				Token *hit = find_ann_orelse(tok_next(t), pp);
+				if (hit) {
+					if (paren_open_out) *paren_open_out = t;
+					return hit;
 				}
 			}
-			t = tok_match(t);
+			t = pp;
 			continue;
 		}
 		if (tok_ann(t) & P1_IS_ORELSE_KW) return t;
@@ -3628,10 +3660,13 @@ static Token *emit_orelse_fallback_value(Token *tok, Token *stop_comma, Token **
 			}
 		}
 		if (tok->flags & TF_OPEN) {
+			/* Phase 1 p1d_find_stmt_expr_fallback owns this reject. */
+#ifdef PRISM_DEBUG
 			if (is_stmt_expr_open(tok))
 				error_tok(tok,
 					  "GNU statement expressions in orelse fallback values are not "
 					  "supported; use 'orelse { ... }' block form instead");
+#endif
 			tok = walk_balanced(tok, true);
 			continue;
 		}
@@ -3647,7 +3682,10 @@ static Token *emit_orelse_fallback_value(Token *tok, Token *stop_comma, Token **
 
 static Token *emit_orelse_block_body(Token *tok) {
 	Token *blk_close = tok_match(tok);
+	/* Tokenizer delimiter-matching completeness (§14.4) guarantees a match. */
+#ifdef PRISM_DEBUG
 	if (!blk_close) error_tok(tok, "unterminated orelse block");
+#endif
 	CtrlState saved_ctrl = ctrl_state;
 	ctrl_reset();
 	tok = handle_open_brace(tok);
@@ -3801,14 +3839,12 @@ static void check_orelse_in_parens(Token *open) {
 	check_paren_orelse_defer(open, false);
 }
 
-static void check_orelse_in_ctrl_paren(Token *open) {
-	/* Phase 1 rejects orelse in ctrl-condition parens; Pass 2 assert only. */
 #ifdef PRISM_DEBUG
+/* Phase 1 rejects orelse in ctrl-condition parens; Pass 2 assert only. */
+static void check_orelse_in_ctrl_paren(Token *open) {
 	check_paren_orelse_defer(open, true);
-#else
-	(void)open;
-#endif
 }
+#endif
 
 typedef struct {
 	Token *orelse_tok;
@@ -3821,14 +3857,12 @@ typedef struct {
 	bool is_struct_value;
 } OrelseDeclTargetInfo;
 
-static inline void reject_orelse_in_for_init(Token *tok) {
-	/* Phase 1 rejects orelse in for-init via ctrl-paren scan; Pass 2 assert. */
 #ifdef PRISM_DEBUG
+/* Phase 1 rejects orelse in for-init via ctrl-paren scan; Pass 2 assert. */
+static inline void reject_orelse_in_for_init(Token *tok) {
 	if (in_for_init()) error_tok(tok, "orelse cannot be used in for-loop initializers");
-#else
-	(void)tok;
-#endif
 }
+#endif
 
 static inline bool is_orelse_value_fallback(Token *after_oe) {
 	return after_oe && !(after_oe->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) &&
@@ -3844,10 +3878,13 @@ static bool bare_lhs_has_indirection(Token *lhs_start, Token *eq_tok) {
 	return false;
 }
 
+#ifdef PRISM_DEBUG
+/* Phase 1 owns missing-action rejects (p1d_scan_init_orelse / p1d_validate_bare_orelse). */
 static inline void require_orelse_action(Token *tok, Token *stop_comma) {
 	if (match_ch(tok, ';') || (stop_comma && tok == stop_comma))
 		error_tok(tok, "expected statement after 'orelse'");
 }
+#endif
 
 static inline void flush_typeof_memsets(Token **vars, int *count, TypeSpecResult *type, int base) {
 	if (*count > base) {
@@ -3872,95 +3909,32 @@ analyze_decl_orelse_target(Token *tok, Token *type_start, TypeSpecResult *type, 
 	return info;
 }
 
-typedef struct {
-	bool has_oe;
-	bool has_d0_comma;
-} WrapParenScan;
-
-static WrapParenScan classify_wrapping_paren_init(Token *open, Token *close) {
-	WrapParenScan r = {0};
-	Token *prev = NULL;
-	for (Token *inner = tok_next(open); inner && inner != close; inner = tok_next(inner)) {
-		if (tok_ann(inner) & P1_IS_ORELSE_KW) {
-			r.has_oe = true;
-			break;
-		}
-		if (match_ch(inner, ',')) r.has_d0_comma = true;
-		if (inner->flags & TF_OPEN) {
-			inner = tok_match(inner);
-			prev = inner;
-			continue;
-		}
-		prev = inner;
-	}
-	return r;
-}
-
 static OrelseInitInfo
 scan_decl_orelse(Token *decl_end, Token *type_start, TypeSpecResult *type, DeclResult *decl) {
 	OrelseInitInfo info = {0};
 	if (!decl->has_init || !FEAT(F_ORELSE)) return info;
-	Token *scan = tok_next(decl_end);
-	Token *prev_scan = NULL;
-	int ternary = 0;
-	while (scan && scan->kind != TK_EOF) {
+	/* Macro-hygiene parens wrapping the whole initializer were unlinked by
+	 * Phase 1 (p1d_scan_init_orelse), so a decl-init orelse keyword always
+	 * sits at group depth 0 here — this walk only locates the annotation. */
+	int pd = 0;
+	for (Token *scan = tok_next(decl_end); scan && scan->kind != TK_EOF; scan = tok_next(scan)) {
 		if (scan->flags & TF_OPEN) {
-			if (match_ch(scan, '(') && tok_match(scan) && !is_stmt_expr_open(scan)) {
-				Token *close = tok_match(scan);
-				Token *after_close = tok_next(close);
-				if (!after_close || match_ch(after_close, ',') ||
-				    match_ch(after_close, ';') || after_close->kind == TK_EOF) {
-					WrapParenScan w = classify_wrapping_paren_init(scan, close);
-					if (w.has_oe && !w.has_d0_comma) {
-						if (prev_scan)
-							break; // fall through to check_orelse_in_parens
-						decl_end->next_idx = scan->next_idx;
-						scan->flags &= ~TF_OPEN;
-						Token *before_close = scan;
-						for (Token *t = tok_next(scan); t && t != close;) {
-							if (t->flags & TF_OPEN) {
-								Token *m = tok_match(t);
-								if (m) {
-									before_close = m;
-									t = tok_next(m);
-									continue;
-								}
-							}
-							before_close = t;
-							t = tok_next(t);
-						}
-						before_close->next_idx = close->next_idx;
-						scan = tok_next(scan);
-						continue;
-					}
-				}
-			}
 #ifdef PRISM_DEBUG
-			check_orelse_in_parens(scan);
+			if (pd == 0) check_orelse_in_parens(scan);
 #endif
-			prev_scan = tok_match(scan);
-			scan = tok_next(tok_match(scan));
+			pd++;
 			continue;
 		}
+		if (scan->flags & TF_CLOSE) {
+			pd--;
+			continue;
+		}
+		if (pd) continue;
 		if (match_ch(scan, ',') || match_ch(scan, ';')) break;
-		if (match_ch(scan, '?')) {
-			ternary++;
-			prev_scan = scan;
-			scan = tok_next(scan);
-			continue;
-		}
-		if (match_ch(scan, ':') && ternary > 0) {
-			ternary--;
-			prev_scan = scan;
-			scan = tok_next(scan);
-			continue;
-		}
-		if (ternary == 0 && (tok_ann(scan) & P1_IS_ORELSE_KW)) {
+		if (tok_ann(scan) & P1_IS_ORELSE_KW) {
 			info.orelse_tok = scan;
 			break;
 		}
-		prev_scan = scan;
-		scan = tok_next(scan);
 	}
 
 	if (info.orelse_tok) {
@@ -4398,12 +4372,15 @@ static bool process_const_orelse_decl(Token **tok_p,
 	Token *val_start = tok_next(decl->end); // First value token after '='
 	Token *tok = tok_next(orelse_tok);	// skip 'orelse'
 	OrelseDeclTargetInfo target = analyze_decl_orelse_target(tok, type_start, type, decl);
+	/* Phase 1 reject_decl_orelse_value_shape owns struct-value rejects. */
+#ifdef PRISM_DEBUG
 	if (target.is_struct_value)
 		error_tok(orelse_tok,
 			  "orelse value fallback on const/typeof aggregate "
 			  "is not supported; use a control flow action "
 			  "(return/break/goto), typeof_unqual, or an "
 			  "explicit type name");
+#endif
 	/* Phase 1 p1d_validate_decl_orelse owns const+VM rejects (incl. typeof/_Atomic). */
 #ifdef PRISM_DEBUG
 	if (type->is_vla || decl->is_vla || type->type_vm) error_tok(orelse_tok, ERR_ORELSE_CONST_VM);
@@ -5110,8 +5087,11 @@ emit_orelse_action(Token *tok, Token *var_name, bool has_const, bool single_eval
 		return tok;
 	}
 
+	/* Phase 1 p1d_validate_bare_orelse owns the no-target and const-LHS rejects. */
+#ifdef PRISM_DEBUG
 	if (!var_name) error_tok(tok, "orelse fallback requires an assignment target (use a declaration)");
 	if (has_const) error_tok(tok, "orelse fallback cannot reassign a const-qualified variable");
+#endif
 	if (single_eval_lhs) {
 		// `&(T){init}` in the if-substatement has statement scope (C11 §6.8.4.1p2);
 		Token *probe = tok;
@@ -5223,9 +5203,12 @@ static Token *handle_goto_keyword(Token *tok) {
 		// Skip C23 attributes between goto and target: goto [[attr]] *ptr;
 		Token *after_attrs = skip_noise(tok);
 		if (match_ch(after_attrs, '*')) {
+			/* Phase 2A rejects computed goto + any defer in the function. */
+#ifdef PRISM_DEBUG
 			if (has_active_defers())
 				error_tok(goto_tok,
 					  "computed goto cannot be used with active defer statements");
+#endif
 			emit_tok(goto_tok);
 			while (tok != after_attrs) {
 				tok = emit_advance(tok);
@@ -5284,7 +5267,7 @@ static Token *handle_open_brace(Token *tok) {
 	if (ctrl_state.pending &&
 	    (in_ctrl_paren() || !ctrl_state.parens_just_closed || (tok_ann(tok) & P1_SCOPE_INIT))) {
 		if (last_emitted && match_ch(last_emitted, '(')) {
-			ENSURE_ARRAY_CAP(ctrl_save_stack, ctrl_save_depth + 1, ctrl_save_cap, 16, CtrlState);
+			VEC_ENSURE_REALLOC(ctrl_save_stack, ctrl_save_depth + 1, ctrl_save_cap, 16);
 			ctrl_save_stack[ctrl_save_depth++] = ctrl_state;
 			did_push = true;
 		} else {
@@ -5340,6 +5323,8 @@ static Token *handle_close_brace(Token *tok) {
 		ScopeNode *s = &scope_stack[ctx->scope_depth - 1];
 		if (defer_count > s->defer_start_idx) {
 			// Without an expression parser we cannot safely capture the
+			// Phase 1 p1_check_defer_stmt_expr_chain owns this reject.
+#ifdef PRISM_DEBUG
 			{
 				Token *nxt = skip_noise(tok_next(tok));
 				for (int depth = ctx->scope_depth - 2; depth >= 0; depth--) {
@@ -5366,6 +5351,7 @@ static Token *handle_close_brace(Token *tok) {
 					nxt = skip_noise(tok_next(probe));
 				}
 			}
+#endif
 			emit_defers(DEFER_SCOPE);
 			defer_count = s->defer_start_idx;
 		}
@@ -6404,7 +6390,21 @@ cleanup:
 	if (read_fd >= 0) close(read_fd);
 	if (pid > 0) waitpid(pid, NULL, 0);
 	if (rerun_for_stderr) {
-		run_command((char **)argv);
+		/* Re-run so cc diagnostics hit stderr. Must discard stdout —
+		 * argv is `cc -E …`, so an unredirected rerun dumps the full
+		 * preprocessed translation unit onto the user's stdout. */
+		posix_spawn_file_actions_t fa2;
+		posix_spawn_file_actions_init(&fa2);
+		posix_spawn_file_actions_addopen(
+		    &fa2, STDOUT_FILENO, "/dev/null", O_WRONLY | O_TRUNC, 0644);
+		char **env2 = build_clean_environ();
+		pid_t pid2 = 0;
+		int err2 = env2 ? posix_spawnp(&pid2, argv[0], &fa2, NULL, argv, env2) : -1;
+		posix_spawn_file_actions_destroy(&fa2);
+		if (err2)
+			fprintf(stderr, "posix_spawnp: %s\n", strerror(err2));
+		else
+			wait_for_child(pid2);
 	}
 	free(cc_dup);
 	free((void *)args);
@@ -6551,11 +6551,22 @@ static Token *find_bare_orelse(Token *tok) {
 			prev = s;
 			continue;
 		}
-		if (ternary == 0 && (tok_ann(s) & P1_IS_ORELSE_KW) &&
+		/* `return c ? g() orelse 0 : 1` — orelse inside `?:` must reject.
+		 * Decl-init has its own ternary tracker; bare/expr stmts relied on
+		 * find_bare_orelse skipping depth>0, which silently leaked. */
+		if (ternary > 0) {
+			bool is_oe = (tok_ann(s) & P1_IS_ORELSE_KW) != 0;
+			if (!is_oe && !p1_typedef_annotated) is_oe = orelse_kw_at_bare(s, prev);
+			if (is_oe && !(tok_ann(s) & (P1_OE_DECL_INIT | P1_OE_BRACKET)))
+				error_tok(s, ERR_ORELSE_TERNARY);
+			prev = s;
+			continue;
+		}
+		if ((tok_ann(s) & P1_IS_ORELSE_KW) &&
 		    !(tok_ann(s) & (P1_OE_DECL_INIT | P1_OE_BRACKET)))
 			return s;
 		/* During Phase 1 discovery, ann bits are not set yet. */
-		if (!p1_typedef_annotated && ternary == 0 && orelse_kw_at_bare(s, prev)) return s;
+		if (!p1_typedef_annotated && orelse_kw_at_bare(s, prev)) return s;
 		prev = s;
 	}
 	return NULL;
@@ -6603,6 +6614,8 @@ static Token *bare_walk_depth0(Token *start,
 	return NULL;
 }
 
+#ifdef PRISM_DEBUG
+/* Only the ERR_BARE_ORELSE_SPANS_PP debug assert walks with this callback. */
 static bool bare_cb_pp_cond(Token *s, Token *prev, int sd, void *ud) {
 	(void)prev;
 	if (sd == 0 && is_pp_conditional(s)) {
@@ -6611,6 +6624,7 @@ static bool bare_cb_pp_cond(Token *s, Token *prev, int sd, void *ud) {
 	}
 	return false;
 }
+#endif
 
 static bool bare_cb_compound_lit(Token *s, Token *prev, int sd, void *ud) {
 	if (match_ch(s, '{') && (sd == 0 || (prev && match_ch(prev, ')')))) {
@@ -7530,6 +7544,13 @@ static void p1_try_alloc_defer(Token *tok, uint16_t cur_sid, int func_idx) {
 // Phase 1F: validate defer body and populate name set.
 static void __attribute__((noinline))
 p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t cur_sid, int brace_depth) {
+	/* File-scope defer: no scope to unwind. Struct/initializer bodies are
+	 * exempt — a member or initializer field spelled `defer` never reaches
+	 * Pass 2's defer machinery and passes through to the backend. */
+	if (p1d_cur_func < 0 &&
+	    !(cur_sid > 0 && cur_sid < scope_tree_count &&
+	      (scope_tree[cur_sid].is_struct || scope_tree[cur_sid].is_init)))
+		error_tok(tok, "defer outside of any scope");
 	// Context validation (moved from Pass 2 handle_defer_keyword)
 	if (p1d_cur_func >= 0) {
 		reject_defer_context(tok,
@@ -7985,6 +8006,7 @@ static Token *p1d_scan_init_orelse(Token *t, bool *out_has_orelse, Token **out_f
 	Token *prev_init_tok = NULL;
 	bool init_is_first = true;
 	int init_td = 0;
+	Token *eq = t; // chain predecessor of the first init token (for wrap-paren strip)
 	t = tok_next(t); // skip '='
 	while (t && !match_ch(t, ',') && !match_ch(t, ';') && t->kind != TK_EOF) {
 		if (match_ch(t, '?')) {
@@ -8065,6 +8087,28 @@ static Token *p1d_scan_init_orelse(Token *t, bool *out_has_orelse, Token **out_f
 						}
 						*out_has_orelse = false;
 						*out_first_orelse = NULL;
+					} else if (*out_has_orelse) {
+						/* Macro-hygiene parens wrapping the whole init:
+						 * unlink `(` and `)` from the chain here, once —
+						 * Pass 2 emits from the stripped stream and never
+						 * mutates tokens. TF_OPEN is cleared so index-based
+						 * walkers do not treat the orphan as a group. */
+						eq->next_idx = t->next_idx;
+						t->flags &= ~TF_OPEN;
+						Token *before_close = t;
+						for (Token *u = tok_next(t); u && u != m;) {
+							if (u->flags & TF_OPEN) {
+								Token *um = tok_match(u);
+								if (um) {
+									before_close = um;
+									u = tok_next(um);
+									continue;
+								}
+							}
+							before_close = u;
+							u = tok_next(u);
+						}
+						before_close->next_idx = m->next_idx;
 					}
 				} else if ((FEAT(F_ORELSE) || FEAT(F_DEFER)) &&
 					   !(prev_init_tok && (prev_init_tok->tag & TT_TYPEOF)))
@@ -8137,7 +8181,6 @@ p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func, uint16_t cur_
 	Token *group_end = tok_match(tok);
 	Token *stmt_expr_open = NULL;
 	Token *prev_inner = NULL;
-	int inner_depth = 0;
 	int se_depth = 0;
 	Token *se_close_stack[64];
 	int se_close_top = 0;
@@ -8154,7 +8197,6 @@ p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func, uint16_t cur_
 				if (se_close_top < 64 && brace_close)
 					se_close_stack[se_close_top++] = brace_close;
 			}
-			inner_depth++;
 		}
 		if (FEAT(F_ORELSE) && (inner->tag & TT_TYPEOF))
 			p1d_annotate_typeof_orelse(inner, cur_sid, cur_func, cur_func >= 0);
@@ -8163,7 +8205,6 @@ p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func, uint16_t cur_
 				se_close_top--;
 				se_depth--;
 			}
-			inner_depth--;
 			prev_inner = inner;
 			continue;
 		}

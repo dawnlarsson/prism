@@ -5494,9 +5494,469 @@ static void test_typeof_paren_inline_volatile_member(void) {
 	prism_free(&r);
 }
 
+/* -------------------------------------------------------------------------
+ * Decl-shape × zeroinit / raw matrix.
+ * Storage/raw mode × declarator shape → expect =0 / ={0} / memset / none.
+ * ------------------------------------------------------------------------- */
+
+typedef enum {
+	ZI_NONE = 0,
+	ZI_EQ0,	    /* var = 0 */
+	ZI_BRACE0,  /* var = {0} */
+	ZI_MEMSET,  /* memset(&var) / __prism_p_ */
+} ZiExpect;
+
+typedef enum {
+	DS_SCALAR = 0,
+	DS_PTR,
+	DS_ARRAY,
+	DS_STRUCT,
+	DS_UNION,
+	DS_VLA,
+	DS_FN_PTR,
+	DS_PAREN_SCALAR,
+	DS_TYPEDEF_SCALAR,
+	DS_TYPEDEF_AGG,
+	DS_ANON_STRUCT,
+	DS_MULTI_ARR,
+	DS_PTR_TO_ARR,
+	DS_VOLATILE_SCALAR,
+	DS_COUNT
+} DeclShapeId;
+
+typedef enum {
+	RM_PLAIN = 0,	   /* auto zeroinit on */
+	RM_RAW_PREFIX,	   /* raw <decl> */
+	RM_EXPLICIT_INIT,  /* already initialized — leave alone */
+	RM_STATIC,	   /* static storage — no auto zi */
+	RM_NO_FEATURE,	   /* PrismFeatures.zeroinit = false */
+	RM_COUNT
+} ZiRawMode;
+
+static const char *decl_shape_name(DeclShapeId s) {
+	static const char *n[DS_COUNT] = {
+	    "scalar",	    "ptr",	   "array",	  "struct",	   "union",
+	    "vla",	    "fn_ptr",	   "paren_scalar", "typedef_scalar", "typedef_agg",
+	    "anon_struct",  "multi_arr",   "ptr_to_arr",  "volatile_scalar",
+	};
+	return n[s];
+}
+
+static const char *zi_raw_mode_name(ZiRawMode m) {
+	static const char *n[RM_COUNT] = {
+	    "plain", "raw_prefix", "explicit_init", "static", "no_feature",
+	};
+	return n[m];
+}
+
+/* Build a function-body declaration for shape `s` named `var` (and optional
+ * second name for multi). `raw_prefix` inserts a leading `raw`.
+ * `with_init` adds a non-zero / non-{0} initializer where sensible.
+ * `is_static` prefixes `static`. */
+static int zi_build_decl(char *buf,
+			 size_t buflen,
+			 DeclShapeId s,
+			 const char *var,
+			 int raw_prefix,
+			 int with_init,
+			 int is_static) {
+	const char *raw = raw_prefix ? "raw " : "";
+	const char *st = is_static ? "static " : "";
+	int n = -1;
+	switch (s) {
+	case DS_SCALAR:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%sint %s = 5;", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%sint %s;", st, raw, var);
+		break;
+	case DS_PTR:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%sint *%s = (int *)1;", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%sint *%s;", st, raw, var);
+		break;
+	case DS_ARRAY:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%sint %s[3] = {1,2,3};", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%sint %s[3];", st, raw, var);
+		break;
+	case DS_STRUCT:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%sstruct ZiS %s = {1};", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%sstruct ZiS %s;", st, raw, var);
+		break;
+	case DS_UNION:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%sunion ZiU %s = {.a = 1};", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%sunion ZiU %s;", st, raw, var);
+		break;
+	case DS_VLA:
+		/* VLA cannot be static / have non-empty brace init in standard C. */
+		if (is_static || with_init) return -1;
+		n = snprintf(buf, buflen, "%s%sint %s[n];", st, raw, var);
+		break;
+	case DS_FN_PTR:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%sint (*%s)(void) = (int (*)(void))1;", st, raw,
+				     var);
+		else
+			n = snprintf(buf, buflen, "%s%sint (*%s)(void);", st, raw, var);
+		break;
+	case DS_PAREN_SCALAR:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%sint (%s) = 5;", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%sint (%s);", st, raw, var);
+		break;
+	case DS_TYPEDEF_SCALAR:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%sZiTD %s = 5;", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%sZiTD %s;", st, raw, var);
+		break;
+	case DS_TYPEDEF_AGG:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%sZiTA %s = {1};", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%sZiTA %s;", st, raw, var);
+		break;
+	case DS_ANON_STRUCT:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%sstruct { int a; } %s = {1};", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%sstruct { int a; } %s;", st, raw, var);
+		break;
+	case DS_MULTI_ARR:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%sint %s[2][3] = {{1}};", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%sint %s[2][3];", st, raw, var);
+		break;
+	case DS_PTR_TO_ARR:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%sint (*%s)[3] = (int (*)[3])1;", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%sint (*%s)[3];", st, raw, var);
+		break;
+	case DS_VOLATILE_SCALAR:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%svolatile int %s = 5;", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%svolatile int %s;", st, raw, var);
+		break;
+	case DS_COUNT:
+		break;
+	}
+	return (n < 0 || (size_t)n >= buflen) ? -1 : 0;
+}
+
+static ZiExpect zi_expected(DeclShapeId s, ZiRawMode m) {
+	if (m == RM_RAW_PREFIX || m == RM_STATIC || m == RM_NO_FEATURE || m == RM_EXPLICIT_INIT)
+		return ZI_NONE;
+	switch (s) {
+	case DS_SCALAR:
+	case DS_PTR:
+	case DS_FN_PTR:
+	case DS_PAREN_SCALAR:
+	case DS_PTR_TO_ARR:
+	case DS_VOLATILE_SCALAR:
+		return ZI_EQ0;
+	case DS_ARRAY:
+	case DS_STRUCT:
+	case DS_TYPEDEF_SCALAR: /* typedef-to-scalar still gets = {0} */
+	case DS_TYPEDEF_AGG:
+	case DS_ANON_STRUCT:
+	case DS_MULTI_ARR:
+		return ZI_BRACE0;
+	case DS_UNION:
+	case DS_VLA:
+		return ZI_MEMSET;
+	case DS_COUNT:
+		break;
+	}
+	return ZI_NONE;
+}
+
+/* Word-boundary search for `var` then scan forward past declarator trailers
+ * (`[n]`, `(args)`, extra `)`) to the initializer. */
+static ZiExpect zi_observe(const char *out, const char *var) {
+	if (!out || !var) return ZI_NONE;
+	if (has_var_zeroing(out, var)) return ZI_MEMSET;
+	size_t vlen = strlen(var);
+	for (const char *p = out; (p = strstr(p, var)) != NULL; p++) {
+		char before = p == out ? '\0' : p[-1];
+		char after = p[vlen];
+		int ok_b = !((before >= 'a' && before <= 'z') || (before >= 'A' && before <= 'Z') ||
+			     (before >= '0' && before <= '9') || before == '_');
+		int ok_a = !((after >= 'a' && after <= 'z') || (after >= 'A' && after <= 'Z') ||
+			     (after >= '0' && after <= '9') || after == '_');
+		if (!ok_b || !ok_a) continue;
+		const char *q = p + vlen;
+		for (;;) {
+			while (*q == ' ' || *q == '\t') q++;
+			if (*q == ')' || *q == ']') {
+				q++;
+				continue;
+			}
+			if (*q == '[' || *q == '(') {
+				char open = *q;
+				char close = (open == '[') ? ']' : ')';
+				int depth = 0;
+				do {
+					if (*q == open) depth++;
+					else if (*q == close)
+						depth--;
+					q++;
+				} while (*q && depth > 0);
+				continue;
+			}
+			break;
+		}
+		if (*q != '=') continue;
+		q++;
+		while (*q == ' ' || *q == '\t') q++;
+		if (*q == '{') {
+			const char *r = q + 1;
+			while (*r == ' ' || *r == '\t') r++;
+			if (*r == '0') {
+				r++;
+				while (*r == ' ' || *r == '\t') r++;
+				if (*r == '}') return ZI_BRACE0;
+			}
+			return ZI_NONE;
+		}
+		if (*q == '0') {
+			char n = q[1];
+			if (n == ';' || n == ',' || n == ' ' || n == '\t' || n == '\n' || n == ')' ||
+			    n == '\0')
+				return ZI_EQ0;
+		}
+		return ZI_NONE;
+	}
+	return ZI_NONE;
+}
+
+static const char *zi_expect_name(ZiExpect e) {
+	switch (e) {
+	case ZI_NONE: return "none";
+	case ZI_EQ0: return "=0";
+	case ZI_BRACE0: return "={0}";
+	case ZI_MEMSET: return "memset";
+	}
+	return "?";
+}
+
+static void test_decl_shape_zeroinit_raw_matrix(void) {
+	char decl[256];
+	char src[1024];
+	char name[192];
+	char fname[96];
+	int ok = 0, fail = 0;
+
+	printf("\n--- Decl-shape × zeroinit/raw matrix (%d shapes × %d modes) ---\n",
+	       (int)DS_COUNT, (int)RM_COUNT);
+
+	const char *prelude =
+	    "struct ZiS { int a; };\n"
+	    "union ZiU { int a; float b; };\n"
+	    "typedef int ZiTD;\n"
+	    "typedef struct { int a; } ZiTA;\n";
+
+	for (int si = 0; si < (int)DS_COUNT; si++) {
+		DeclShapeId shape = (DeclShapeId)si;
+		for (int mi = 0; mi < (int)RM_COUNT; mi++) {
+			ZiRawMode mode = (ZiRawMode)mi;
+			int raw = (mode == RM_RAW_PREFIX);
+			int with_init = (mode == RM_EXPLICIT_INIT);
+			int is_static = (mode == RM_STATIC);
+			if (zi_build_decl(decl, sizeof(decl), shape, "x", raw, with_init, is_static) !=
+			    0)
+				continue; /* inapplicable combo */
+
+			const char *fn_hdr = (shape == DS_VLA) ? "void f(int n)" : "void f(void)";
+			snprintf(src, sizeof(src),
+				 "%s%s {\n"
+				 "  %s\n"
+				 "  (void)x;\n"
+				 "}\n",
+				 prelude, fn_hdr, decl);
+
+			PrismFeatures feat = prism_defaults();
+			if (mode == RM_NO_FEATURE) feat.zeroinit = false;
+
+			ZiExpect expect = zi_expected(shape, mode);
+			snprintf(name, sizeof(name), "zi×shape: %s / %s", decl_shape_name(shape),
+				 zi_raw_mode_name(mode));
+			snprintf(fname, sizeof(fname), "zishape_%s_%s.c", decl_shape_name(shape),
+				 zi_raw_mode_name(mode));
+
+			PrismResult r = prism_transpile_source(src, fname, feat);
+			CHECK_EQ(r.status, PRISM_OK, name);
+			if (r.status != PRISM_OK) {
+				if (r.error_msg) printf("         error: %s\n", r.error_msg);
+				fail++;
+				prism_free(&r);
+				continue;
+			}
+			ZiExpect got = zi_observe(r.output, "x");
+			snprintf(name, sizeof(name), "zi×shape expect %s: %s / %s",
+				 zi_expect_name(expect), decl_shape_name(shape),
+				 zi_raw_mode_name(mode));
+			if (got == expect) {
+				CHECK(1, name);
+				ok++;
+			} else {
+				CHECK(0, name);
+				printf("         got %s, raw stripped? %s\n", zi_expect_name(got),
+				       (r.output && strstr(r.output, "raw ") == NULL) ? "yes" : "no");
+				fail++;
+			}
+			/* raw keyword must never leak when used as prefix. */
+			if (raw && r.output) {
+				snprintf(name, sizeof(name), "zi×shape raw-stripped: %s / %s",
+					 decl_shape_name(shape), zi_raw_mode_name(mode));
+				CHECK(strstr(r.output, "raw ") == NULL &&
+					  strstr(r.output, "raw\t") == NULL,
+				      name);
+			}
+			prism_free(&r);
+		}
+	}
+
+	/* Multi-declarator product: plain / prefix-raw / per-decl raw. */
+	printf("\n--- Multi-declarator zeroinit/raw ---\n");
+	static const struct {
+		const char *code; /* inside f() */
+		ZiExpect a;
+		ZiExpect b;
+		const char *label;
+	} multi[] = {
+	    {"int a, b;", ZI_EQ0, ZI_EQ0, "plain multi scalar"},
+	    {"raw int a, b;", ZI_NONE, ZI_NONE, "prefix raw multi"},
+	    {"int a, raw b;", ZI_EQ0, ZI_NONE, "per-decl raw second"},
+	    {"int *a, *b;", ZI_EQ0, ZI_EQ0, "plain multi ptr"},
+	    {"raw int *a, *b;", ZI_NONE, ZI_NONE, "prefix raw multi ptr"},
+	    {"int a[2], b[2];", ZI_BRACE0, ZI_BRACE0, "plain multi array"},
+	    {"raw int a[2], b[2];", ZI_NONE, ZI_NONE, "prefix raw multi array"},
+	    {"int a[2], raw b[2];", ZI_BRACE0, ZI_NONE, "per-decl raw array"},
+	    {"struct ZiS a, b;", ZI_BRACE0, ZI_BRACE0, "plain multi struct"},
+	    {"raw struct ZiS a, b;", ZI_NONE, ZI_NONE, "prefix raw multi struct"},
+	    {"struct ZiS a, raw b;", ZI_BRACE0, ZI_NONE, "per-decl raw struct"},
+	    {"union ZiU a, b;", ZI_MEMSET, ZI_MEMSET, "plain multi union"},
+	    {"raw union ZiU a, b;", ZI_NONE, ZI_NONE, "prefix raw multi union"},
+	    {"int a = 5, b;", ZI_NONE, ZI_EQ0, "explicit first + zi second"},
+	    {"int a = 5, raw b;", ZI_NONE, ZI_NONE, "explicit first + raw second"},
+	};
+	for (size_t i = 0; i < sizeof(multi) / sizeof(multi[0]); i++) {
+		snprintf(src, sizeof(src),
+			 "struct ZiS { int a; };\n"
+			 "union ZiU { int a; float b; };\n"
+			 "void f(void) {\n"
+			 "  %s\n"
+			 "  (void)a; (void)b;\n"
+			 "}\n",
+			 multi[i].code);
+		snprintf(name, sizeof(name), "zi×multi: %s", multi[i].label);
+		PrismResult r = prism_transpile_source(src, "zimulti.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, name);
+		if (r.status == PRISM_OK && r.output) {
+			ZiExpect ga = zi_observe(r.output, "a");
+			ZiExpect gb = zi_observe(r.output, "b");
+			snprintf(name, sizeof(name), "zi×multi a=%s: %s", zi_expect_name(multi[i].a),
+				 multi[i].label);
+			CHECK(ga == multi[i].a, name);
+			snprintf(name, sizeof(name), "zi×multi b=%s: %s", zi_expect_name(multi[i].b),
+				 multi[i].label);
+			CHECK(gb == multi[i].b, name);
+			if (ga == multi[i].a && gb == multi[i].b) ok++;
+			else
+				fail++;
+			if (strstr(multi[i].code, "raw"))
+				CHECK(strstr(r.output, "raw ") == NULL,
+				      "zi×multi raw-stripped");
+		} else {
+			fail++;
+			if (r.error_msg) printf("         error: %s\n", r.error_msg);
+		}
+		prism_free(&r);
+	}
+
+	/* VLA multi + raw mix (needs n param). */
+	{
+		static const struct {
+			const char *code;
+			ZiExpect a, b;
+			const char *label;
+		} vla_multi[] = {
+		    {"int a[n], b[n];", ZI_MEMSET, ZI_MEMSET, "plain multi vla"},
+		    {"raw int a[n], b[n];", ZI_NONE, ZI_NONE, "prefix raw multi vla"},
+		    {"int a[n], raw b[n];", ZI_MEMSET, ZI_NONE, "per-decl raw vla"},
+		};
+		for (size_t i = 0; i < sizeof(vla_multi) / sizeof(vla_multi[0]); i++) {
+			snprintf(src, sizeof(src),
+				 "void f(int n) {\n"
+				 "  %s\n"
+				 "  (void)a; (void)b;\n"
+				 "}\n",
+				 vla_multi[i].code);
+			snprintf(name, sizeof(name), "zi×multi: %s", vla_multi[i].label);
+			PrismResult r = prism_transpile_source(src, "zimultivla.c", prism_defaults());
+			CHECK_EQ(r.status, PRISM_OK, name);
+			if (r.status == PRISM_OK && r.output) {
+				CHECK(zi_observe(r.output, "a") == vla_multi[i].a &&
+					  zi_observe(r.output, "b") == vla_multi[i].b,
+				      name);
+			}
+			prism_free(&r);
+		}
+	}
+
+	/* Compile-run smoke: emitted zeroinit must actually zero at runtime. */
+	UNIX_ONLY({
+		static const struct {
+			const char *body;
+			const char *label;
+		} smokes[] = {
+		    {"int x; return x == 0 ? 0 : 1;", "scalar zi runs 0"},
+		    {"int a[3]; return a[0]+a[1]+a[2] == 0 ? 0 : 1;", "array zi runs 0"},
+		    {"struct ZiS { int a; } s; return s.a == 0 ? 0 : 1;", "struct zi runs 0"},
+		    {"raw int x; x = 7; return x == 7 ? 0 : 1;", "raw scalar assign"},
+		    {"int a = 0, raw b; b = 3; return (a == 0 && b == 3) ? 0 : 1;",
+		     "per-decl raw runs"},
+		};
+		for (size_t i = 0; i < sizeof(smokes) / sizeof(smokes[0]); i++) {
+			snprintf(src, sizeof(src),
+				 "int main(void) {\n"
+				 "  %s\n"
+				 "}\n",
+				 smokes[i].body);
+			PrismResult r =
+			    prism_transpile_source(src, "zismoke.c", prism_defaults());
+			snprintf(name, sizeof(name), "zi smoke transpile: %s", smokes[i].label);
+			CHECK_EQ(r.status, PRISM_OK, name);
+			if (r.status == PRISM_OK && r.output) {
+				snprintf(name, sizeof(name), "zi smoke compile: %s",
+					 smokes[i].label);
+				char rn[128];
+				snprintf(rn, sizeof(rn), "zi smoke run: %s", smokes[i].label);
+				check_transpiled_output_compiles_and_runs(r.output, name, rn);
+			}
+			prism_free(&r);
+		}
+	});
+
+	printf("--- zi×shape matrix summary: %d ok, %d fail ---\n", ok, fail);
+}
+
 void run_zeroinit_tests(void) {
 
 	printf("\n=== ZERO-INIT TESTS ===\n");
+
+	test_decl_shape_zeroinit_raw_matrix();
 
 	test_cfg_switch_bypass_initialized_decl_fno_zeroinit();
 	test_braceless_defer_decl_p1_decl_ann();

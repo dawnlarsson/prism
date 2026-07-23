@@ -197,12 +197,6 @@ static inline size_t vec_grow_cap(size_t cap, size_t need, size_t init_cap) {
 		}                                                                                            \
 	} while (0)
 
-#define ENSURE_ARRAY_CAP(arr, count, cap, init_cap, T)                                                       \
-	do {                                                                                                 \
-		(void)sizeof(T); /* keep call-site type annotation checked */                                \
-		VEC_ENSURE_REALLOC((arr), (count), (cap), (init_cap));                                       \
-	} while (0)
-
 #define ARENA_ENSURE_CAP(arena, arr, count, cap, init_cap, T)                                                \
 	do {                                                                                                 \
 		if ((size_t)(count) >= (size_t)(cap)) {                                                      \
@@ -1983,8 +1977,7 @@ static Token *tokenize(File *file) {
 						void *v = hashmap_get(&func_map, tok_loc(b), b->len);
 						if (!v) continue;
 						int j = (int)(intptr_t)v - 1;
-						ENSURE_ARRAY_CAP(
-						    edges, edge_count + 1, edge_cap, 64, TaintEdge);
+						VEC_ENSURE_REALLOC(edges, edge_count + 1, edge_cap, 64);
 						edges[edge_count++] = (TaintEdge){i, j};
 					}
 				}
@@ -3890,12 +3883,6 @@ static PRISM_THREAD_LOCAL int sos_snap_cap = 0;
 static PRISM_THREAD_LOCAL int *sos_if_trail_snap = NULL;
 static PRISM_THREAD_LOCAL int sos_if_cap = 0;
 
-static inline int sos_grow_to(int cur_cap, int need) {
-	int nc = cur_cap ? cur_cap : 128;
-	while (nc < need) nc *= 2;
-	return nc;
-}
-
 static inline bool sos_ensure_intbuf(int **buf, int *cap, int need) {
 	if (need <= *cap) return true;
 	/* Soft-fail variant of VEC_ENSURE_REALLOC for skip_one_stmt OOM path. */
@@ -3909,19 +3896,16 @@ static inline bool sos_ensure_intbuf(int **buf, int *cap, int need) {
 
 static inline bool sos_ensure_do(int need) {
 	if (need <= sos_do_cap) return true;
-	int nc = sos_grow_to(sos_do_cap, need);
+	int nc = (int)vec_grow_cap((size_t)sos_do_cap, (size_t)need, 128);
+	/* Commit each successful realloc immediately — a partial failure must
+	 * not leave a TLS pointer at a block realloc already freed. */
 	int *a = (int *)realloc(sos_do_if_save, (size_t)nc * sizeof(int));
+	if (a) sos_do_if_save = a;
 	int *b = (int *)realloc(sos_do_tn_save, (size_t)nc * sizeof(int));
+	if (b) sos_do_tn_save = b;
 	int *c = (int *)realloc(sos_do_snap_start, (size_t)nc * sizeof(int));
-	if (!a || !b || !c) {
-		free(a);
-		free(b);
-		free(c);
-		return false;
-	}
-	sos_do_if_save = a;
-	sos_do_tn_save = b;
-	sos_do_snap_start = c;
+	if (c) sos_do_snap_start = c;
+	if (!a || !b || !c) return false;
 	sos_do_cap = nc;
 	return true;
 }
@@ -4442,6 +4426,211 @@ static bool is_knr_params(Token *start, Token *brace) {
 		if (t->flags & TF_OPEN) t = tok_match(t);
 	}
 	return saw_semi;
+}
+
+/* --- C23 glibc _Generic-in-declarator recovery (N3322 / GCC 15+) ---
+ * After cc -E, `extern void *bsearch(...)` can expand to
+ * `extern void *_Generic(..., default: bsearch(...))` which is not a valid
+ * declarator. When every association names the same function with the same
+ * decl-shaped argument list, fold back to `(name)(params)`. Expression
+ * `_Generic` is untouched: callers must only invoke this when the preceding
+ * token is a declaration prefix (*, ), type/storage/…, or typedef). */
+
+static bool params_look_like_decls(Token *open) {
+	Token *close = tok_match(open);
+	if (!close) return false;
+	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			if (tok_match(t)) t = tok_match(t);
+			continue;
+		}
+		if (t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT | TT_ATTR | TT_STORAGE))
+			return true;
+		if (is_known_typedef(t)) return true;
+	}
+	return false;
+}
+
+static Token *generic_find_assoc_start(Token *open) {
+	Token *close = tok_match(open);
+	if (!close) return NULL;
+	for (Token *t = tok_next(open); t && t != close; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			if (tok_match(t)) t = tok_match(t);
+			continue;
+		}
+		if (match_ch(t, ',')) return tok_next(t);
+	}
+	return NULL;
+}
+
+static bool generic_has_distinct_targets(Token *open) {
+	Token *close = tok_match(open);
+	if (!close) return false;
+	Token *assoc_start = generic_find_assoc_start(open);
+	if (!assoc_start) return false;
+	const char *first_name = NULL;
+	int first_len = 0;
+	Token *first_args_open = NULL;
+	Token *first_args_close = NULL;
+	int ternary_depth = 0;
+	for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
+		if (t->flags & TF_OPEN) {
+			if (tok_match(t)) t = tok_match(t);
+			continue;
+		}
+		if (match_ch(t, '?')) {
+			ternary_depth++;
+			continue;
+		}
+		if (!match_ch(t, ':')) continue;
+		if (ternary_depth > 0) {
+			ternary_depth--;
+			continue;
+		}
+		bool found_ident = false;
+		int inner_ternary = 0;
+		for (Token *b = tok_next(t); b && b != close; b = tok_next(b)) {
+			if (b->flags & TF_OPEN) {
+				if (tok_match(b)) b = tok_match(b);
+				continue;
+			}
+			if (match_ch(b, ',') && inner_ternary == 0) break;
+			if (match_ch(b, '?')) {
+				inner_ternary++;
+				continue;
+			}
+			if (match_ch(b, ':') && inner_ternary > 0) {
+				inner_ternary--;
+				continue;
+			}
+			if (inner_ternary > 0) continue;
+			if (!is_valid_varname(b)) continue;
+			{
+				Token *bn = tok_next(b);
+				if (bn && match_ch(bn, '?')) {
+					inner_ternary++;
+					b = bn;
+					continue;
+				}
+			}
+			found_ident = true;
+			while (b && tok_next(b) && tok_next(b) != close && (tok_next(b)->tag & TT_MEMBER) &&
+			       tok_next(tok_next(b)) && is_valid_varname(tok_next(tok_next(b)))) {
+				b = tok_next(tok_next(b));
+			}
+			if (!first_name) {
+				first_name = tok_loc(b);
+				first_len = b->len;
+				Token *ao = tok_next(b);
+				if (ao && match_ch(ao, '(') && tok_match(ao)) {
+					first_args_open = ao;
+					first_args_close = tok_match(ao);
+				}
+			} else if (b->len != first_len || memcmp(tok_loc(b), first_name, (size_t)first_len) != 0) {
+				return true;
+			} else {
+				Token *ao = tok_next(b);
+				if (!ao || !match_ch(ao, '(') || !tok_match(ao)) {
+					if (first_args_open) return true;
+				} else {
+					Token *ac = tok_match(ao);
+					if (!first_args_open) return true;
+					Token *a1 = tok_next(first_args_open);
+					Token *a2 = tok_next(ao);
+					while (a1 && a1 != first_args_close && a2 && a2 != ac) {
+						if (a1->kind != a2->kind || a1->len != a2->len ||
+						    memcmp(tok_loc(a1), tok_loc(a2), a1->len) != 0)
+							return true;
+						a1 = tok_next(a1);
+						a2 = tok_next(a2);
+					}
+					if ((a1 != first_args_close) || (a2 != ac)) return true;
+				}
+			}
+			break;
+		}
+		if (!found_ident) {
+			bool has_real_ident = false;
+			int depth = 0;
+			for (Token *d = tok_next(t); d && d != close; d = tok_next(d)) {
+				if (d->flags & TF_OPEN) depth++;
+				else if (d->flags & TF_CLOSE)
+					depth--;
+				if (depth == 0 && match_ch(d, ',')) break;
+				if (is_valid_varname(d) &&
+				    !(d->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_ATTR | TT_TYPEOF |
+						TT_BITINT))) {
+					has_real_ident = true;
+					break;
+				}
+			}
+			if (!has_real_ident) return true;
+		}
+	}
+	return false;
+}
+
+static bool generic_rewrite_preamble(Token *generic_tok,
+				     Token **open_out,
+				     Token **close_out,
+				     Token **after_out,
+				     Token **assoc_start_out) {
+	Token *open = tok_next(generic_tok);
+	if (!open || !match_ch(open, '(') || !tok_match(open)) return false;
+	Token *close = tok_match(open);
+	Token *after = skip_noise(tok_next(close));
+	if (!after) return false;
+	if (generic_has_distinct_targets(open)) return false;
+	Token *assoc_start = generic_find_assoc_start(open);
+	if (!assoc_start) return false;
+	*open_out = open;
+	*close_out = close;
+	*after_out = after;
+	*assoc_start_out = assoc_start;
+	return true;
+}
+
+static bool generic_decl_rewrite_target(Token *generic_tok,
+					Token **name_out,
+					Token **params_open_out,
+					Token **params_close_out,
+					Token **next_out) {
+	Token *open, *close, *after, *assoc_start;
+	if (!generic_rewrite_preamble(generic_tok, &open, &close, &after, &assoc_start)) return false;
+	if (match_set(after, CH(';') | CH(',')) || (after->tag & TT_ATTR) || is_c23_attr(after)) {
+		for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
+			Token *call_open = skip_noise(tok_next(t));
+			if (!is_valid_varname(t) || !call_open || !match_ch(call_open, '(') || !tok_match(call_open))
+				continue;
+			if (!params_look_like_decls(call_open)) continue;
+			*name_out = t;
+			*params_open_out = call_open;
+			*params_close_out = tok_match(call_open);
+			*next_out = after;
+			return true;
+		}
+	}
+	if (match_ch(after, '(') && tok_match(after) && params_look_like_decls(after)) {
+		Token *ext_close = tok_match(after);
+		Token *after_ext = skip_noise(tok_next(ext_close));
+		if (after_ext &&
+		    (match_ch(after_ext, ';') || match_ch(after_ext, ',') || (after_ext->tag & TT_ATTR) ||
+		     is_c23_attr(after_ext))) {
+			Token *found = NULL;
+			for (Token *t = assoc_start; t && t != close; t = tok_next(t)) {
+				if (is_valid_varname(t)) found = t;
+			}
+			if (found) {
+				*name_out = found;
+				*params_open_out = after;
+				*params_close_out = ext_close;
+				*next_out = after_ext;
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 static inline Token *try_detect_noreturn_call(Token *tok) {

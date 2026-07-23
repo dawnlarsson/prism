@@ -5417,6 +5417,658 @@ static void test_prism_keyword_function_identifiers(void) {
 	prism_free(&r);
 }
 
+/* -------------------------------------------------------------------------
+ * Soft / Prism keyword × identifier-context matrix.
+ * Covers TF_SOFT_KW (alignas, bool, typeof, …) and Prism keywords
+ * (defer / orelse / raw) as identifiers across many grammatical roles.
+ * Also dual-use (keyword form + identifier form in one TU) and a reject
+ * corpus for roles that must remain keywords.
+ * ------------------------------------------------------------------------- */
+
+typedef enum {
+	SK_CTX_LOCAL_VAR = 0,
+	SK_CTX_PTR_VAR,
+	SK_CTX_ARRAY_VAR,
+	SK_CTX_TYPEDEF,
+	SK_CTX_STRUCT_TAG,
+	SK_CTX_UNION_TAG,
+	SK_CTX_ENUM_MEMBER,
+	SK_CTX_LABEL,
+	SK_CTX_PARAM,
+	SK_CTX_FUNC_DEF,
+	SK_CTX_FUNC_PTR,
+	SK_CTX_FIELD,
+	SK_CTX_DOT,
+	SK_CTX_ARROW,
+	SK_CTX_DESIGNATOR,
+	SK_CTX_FOR_INIT,
+	SK_CTX_SIZEOF_NAME,
+	SK_CTX_CALL,
+	SK_CTX_GENERIC_ASSOC,
+	SK_CTX_BITFIELD,
+	SK_CTX_NESTED_SHADOW,
+	SK_CTX_FILE_STATIC,
+	SK_CTX_COUNT
+} SoftKwCtxId;
+
+static const char *soft_kw_ctx_name(SoftKwCtxId c) {
+	static const char *names[SK_CTX_COUNT] = {
+	    "local_var",     "ptr_var",       "array_var",   "typedef",
+	    "struct_tag",    "union_tag",     "enum_member", "label",
+	    "param",         "func_def",      "func_ptr",    "field",
+	    "dot",           "arrow",         "designator",  "for_init",
+	    "sizeof_name",   "call",          "generic_assoc", "bitfield",
+	    "nested_shadow", "file_static",
+	};
+	return names[c];
+}
+
+/* Build a TU where `kw` appears only as an identifier in the given role.
+ * Returns 0 on success, -1 if the context is not applicable for this kw. */
+static int soft_kw_build_ident_tu(char *buf, size_t buflen, const char *kw, SoftKwCtxId ctx) {
+	int n = -1;
+	switch (ctx) {
+	case SK_CTX_LOCAL_VAR:
+		n = snprintf(buf, buflen,
+			     "int f(void) {\n"
+			     "  int %s;\n"
+			     "  return %s;\n"
+			     "}\n",
+			     kw, kw);
+		break;
+	case SK_CTX_PTR_VAR:
+		n = snprintf(buf, buflen,
+			     "int f(void) {\n"
+			     "  int *%s;\n"
+			     "  return %s ? 1 : 0;\n"
+			     "}\n",
+			     kw, kw);
+		break;
+	case SK_CTX_ARRAY_VAR:
+		n = snprintf(buf, buflen,
+			     "int f(void) {\n"
+			     "  int %s[3];\n"
+			     "  return %s[0];\n"
+			     "}\n",
+			     kw, kw);
+		break;
+	case SK_CTX_TYPEDEF:
+		n = snprintf(buf, buflen,
+			     "typedef int %s;\n"
+			     "int f(void) {\n"
+			     "  %s x;\n"
+			     "  return x;\n"
+			     "}\n",
+			     kw, kw);
+		break;
+	case SK_CTX_STRUCT_TAG:
+		n = snprintf(buf, buflen,
+			     "struct %s { int x; };\n"
+			     "int f(void) {\n"
+			     "  struct %s s;\n"
+			     "  return s.x;\n"
+			     "}\n",
+			     kw, kw);
+		break;
+	case SK_CTX_UNION_TAG:
+		n = snprintf(buf, buflen,
+			     "union %s { int x; };\n"
+			     "int f(void) {\n"
+			     "  union %s u;\n"
+			     "  return u.x;\n"
+			     "}\n",
+			     kw, kw);
+		break;
+	case SK_CTX_ENUM_MEMBER:
+		n = snprintf(buf, buflen,
+			     "int f(void) {\n"
+			     "  enum { %s = 4 };\n"
+			     "  return %s;\n"
+			     "}\n",
+			     kw, kw);
+		break;
+	case SK_CTX_LABEL:
+		n = snprintf(buf, buflen,
+			     "int f(int n) {\n"
+			     "  if (n) goto %s;\n"
+			     "  return 0;\n"
+			     "%s:\n"
+			     "  return 1;\n"
+			     "}\n",
+			     kw, kw);
+		break;
+	case SK_CTX_PARAM:
+		n = snprintf(buf, buflen, "int f(int %s) { return %s + 1; }\n", kw, kw);
+		break;
+	case SK_CTX_FUNC_DEF:
+		n = snprintf(buf, buflen,
+			     "int %s(void) { return 9; }\n"
+			     "int f(void) { return %s(); }\n",
+			     kw, kw);
+		break;
+	case SK_CTX_FUNC_PTR:
+		n = snprintf(buf, buflen,
+			     "int g(void) { return 2; }\n"
+			     "int f(void) {\n"
+			     "  int (*%s)(void) = g;\n"
+			     "  return %s();\n"
+			     "}\n",
+			     kw, kw);
+		break;
+	case SK_CTX_FIELD:
+		n = snprintf(buf, buflen,
+			     "struct S { int %s; };\n"
+			     "int f(void) {\n"
+			     "  struct S s;\n"
+			     "  return s.%s;\n"
+			     "}\n",
+			     kw, kw);
+		break;
+	case SK_CTX_DOT:
+		n = snprintf(buf, buflen,
+			     "struct S { int %s; };\n"
+			     "int f(void) {\n"
+			     "  struct S s = {0};\n"
+			     "  s.%s = 5;\n"
+			     "  return s.%s;\n"
+			     "}\n",
+			     kw, kw, kw);
+		break;
+	case SK_CTX_ARROW:
+		n = snprintf(buf, buflen,
+			     "struct S { int %s; };\n"
+			     "int f(struct S *p) {\n"
+			     "  return p ? p->%s : 0;\n"
+			     "}\n",
+			     kw, kw);
+		break;
+	case SK_CTX_DESIGNATOR:
+		n = snprintf(buf, buflen,
+			     "struct S { int %s; };\n"
+			     "int f(void) {\n"
+			     "  struct S s = { .%s = 3 };\n"
+			     "  return s.%s;\n"
+			     "}\n",
+			     kw, kw, kw);
+		break;
+	case SK_CTX_FOR_INIT:
+		n = snprintf(buf, buflen,
+			     "int f(void) {\n"
+			     "  int n = 0;\n"
+			     "  for (int %s = 0; %s < 3; %s++) n += %s;\n"
+			     "  return n;\n"
+			     "}\n",
+			     kw, kw, kw, kw);
+		break;
+	case SK_CTX_SIZEOF_NAME:
+		n = snprintf(buf, buflen,
+			     "int f(void) {\n"
+			     "  int %s;\n"
+			     "  return (int)sizeof %s;\n"
+			     "}\n",
+			     kw, kw);
+		break;
+	case SK_CTX_CALL:
+		n = snprintf(buf, buflen,
+			     "int %s(void) { return 7; }\n"
+			     "int f(void) {\n"
+			     "  int x = %s();\n"
+			     "  return x + %s();\n"
+			     "}\n",
+			     kw, kw, kw);
+		break;
+	case SK_CTX_GENERIC_ASSOC:
+		/* Soft/Prism kw as a type name in _Generic association via typedef. */
+		n = snprintf(buf, buflen,
+			     "typedef int %s;\n"
+			     "int f(void) {\n"
+			     "  %s v;\n"
+			     "  return _Generic(v, %s: 1, default: 0);\n"
+			     "}\n",
+			     kw, kw, kw);
+		break;
+	case SK_CTX_BITFIELD:
+		n = snprintf(buf, buflen,
+			     "struct S { int %s : 3; };\n"
+			     "int f(void) {\n"
+			     "  struct S s;\n"
+			     "  s.%s = 1;\n"
+			     "  return s.%s;\n"
+			     "}\n",
+			     kw, kw, kw);
+		break;
+	case SK_CTX_NESTED_SHADOW:
+		n = snprintf(buf, buflen,
+			     "int f(void) {\n"
+			     "  int %s = 1;\n"
+			     "  {\n"
+			     "    int %s = 2;\n"
+			     "    return %s;\n"
+			     "  }\n"
+			     "}\n",
+			     kw, kw, kw);
+		break;
+	case SK_CTX_FILE_STATIC:
+		n = snprintf(buf, buflen,
+			     "static int %s = 0;\n"
+			     "int f(void) { return %s; }\n",
+			     kw, kw);
+		break;
+	case SK_CTX_COUNT:
+		break;
+	}
+	return (n < 0 || (size_t)n >= buflen) ? -1 : 0;
+}
+
+/* True if `kw` appears as a standalone identifier token spelling in `out`.
+ * Rejects matches that are only a substring of a longer identifier. */
+static bool soft_kw_spelling_preserved(const char *out, const char *kw) {
+	if (!out || !kw) return false;
+	size_t klen = strlen(kw);
+	for (const char *p = out; (p = strstr(p, kw)) != NULL; p++) {
+		char before = p == out ? '\0' : p[-1];
+		char after = p[klen];
+		int ok_before = !((before >= 'a' && before <= 'z') || (before >= 'A' && before <= 'Z') ||
+				  (before >= '0' && before <= '9') || before == '_');
+		int ok_after = !((after >= 'a' && after <= 'z') || (after >= 'A' && after <= 'Z') ||
+				 (after >= '0' && after <= '9') || after == '_');
+		if (ok_before && ok_after) return true;
+	}
+	return false;
+}
+
+static void test_soft_prism_keyword_context_matrix(void) {
+	static const char *soft_kws[] = {
+	    "alignas", "alignof", "static_assert", "noreturn", "constexpr", "thread_local",
+	    "bool",    "typeof",  "typeof_unqual", "asm",      "offsetof",
+	};
+	static const char *prism_kws[] = {"defer", "orelse", "raw"};
+	static const char *all_kws[32];
+	int nkw = 0;
+	for (size_t i = 0; i < sizeof(soft_kws) / sizeof(soft_kws[0]); i++)
+		all_kws[nkw++] = soft_kws[i];
+	for (size_t i = 0; i < sizeof(prism_kws) / sizeof(prism_kws[0]); i++)
+		all_kws[nkw++] = prism_kws[i];
+
+	char src[2048];
+	char name[160];
+	char fname[96];
+	int matrix_ok = 0, matrix_fail = 0;
+
+	printf("\n--- Soft/Prism keyword × context matrix (%d kws × %d ctx) ---\n",
+	       nkw, (int)SK_CTX_COUNT);
+
+	for (int ki = 0; ki < nkw; ki++) {
+		const char *kw = all_kws[ki];
+		for (int ci = 0; ci < (int)SK_CTX_COUNT; ci++) {
+			SoftKwCtxId ctx = (SoftKwCtxId)ci;
+			snprintf(name, sizeof(name), "kw×ctx: %s as %s", kw, soft_kw_ctx_name(ctx));
+			if (soft_kw_build_ident_tu(src, sizeof(src), kw, ctx) != 0) {
+				CHECK(0, name); /* builder overflow / bug */
+				matrix_fail++;
+				continue;
+			}
+			snprintf(fname, sizeof(fname), "kwctx_%s_%s.c", kw, soft_kw_ctx_name(ctx));
+			PrismResult r = prism_transpile_source(src, fname, prism_defaults());
+			/* orelse in a bitfield width position is parsed as the orelse operator. */
+			int expect_reject =
+			    (ctx == SK_CTX_BITFIELD && strcmp(kw, "orelse") == 0);
+			if (expect_reject) {
+				CHECK(r.status != PRISM_OK, name);
+				if (r.status != PRISM_OK) matrix_ok++;
+				else
+					matrix_fail++;
+				prism_free(&r);
+				continue;
+			}
+			if (r.status != PRISM_OK) {
+				CHECK_EQ(r.status, PRISM_OK, name);
+				if (r.error_msg)
+					printf("         error: %s\n", r.error_msg);
+				matrix_fail++;
+				prism_free(&r);
+				continue;
+			}
+			CHECK_EQ(r.status, PRISM_OK, name);
+			/* Identifier spelling must survive lowering (not stripped / rewritten). */
+			snprintf(name, sizeof(name), "kw×ctx preserve: %s as %s", kw,
+				 soft_kw_ctx_name(ctx));
+			if (soft_kw_spelling_preserved(r.output, kw)) {
+				CHECK(1, name);
+				matrix_ok++;
+			} else {
+				CHECK(0, name);
+				matrix_fail++;
+			}
+			prism_free(&r);
+		}
+	}
+
+	/* Dual-use: keyword form AND identifier form of the same soft kw in one TU. */
+	static const struct {
+		const char *kw;
+		const char *kw_form; /* snippet using kw as keyword */
+	} dual[] = {
+	    {"alignas", "alignas(8) int aligned_x;"},
+	    {"alignof", "int al_sz = (int)alignof(int);"},
+	    {"static_assert", "static_assert(1, \"ok\");"},
+	    {"noreturn", "noreturn void dual_nr(void);"},
+	    {"constexpr", "constexpr int dual_c = 1;"},
+	    {"thread_local", "thread_local int dual_tl;"},
+	    {"typeof", "typeof(int) dual_ty;"},
+	    {"typeof_unqual", "typeof_unqual(int) dual_tu;"},
+	    {"bool", "bool dual_flag;"},
+	    {"offsetof",
+	     "struct DualOff { int a; }; int dual_off = (int)offsetof(struct DualOff, a);"},
+	};
+	printf("\n--- Soft keyword dual-use (keyword + identifier) ---\n");
+	for (size_t i = 0; i < sizeof(dual) / sizeof(dual[0]); i++) {
+		snprintf(src, sizeof(src),
+			 "%s\n"
+			 "int f(void) {\n"
+			 "  int %s;\n"
+			 "  (void)%s;\n"
+			 "  return 0;\n"
+			 "}\n",
+			 dual[i].kw_form, dual[i].kw, dual[i].kw);
+		snprintf(name, sizeof(name), "kw dual-use: %s", dual[i].kw);
+		snprintf(fname, sizeof(fname), "kwdual_%s.c", dual[i].kw);
+		PrismResult r = prism_transpile_source(src, fname, prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, name);
+		if (r.status == PRISM_OK && r.output) {
+			snprintf(name, sizeof(name), "kw dual-use preserve: %s", dual[i].kw);
+			CHECK(soft_kw_spelling_preserved(r.output, dual[i].kw), name);
+		} else if (r.error_msg) {
+			printf("         error: %s\n", r.error_msg);
+		}
+		prism_free(&r);
+	}
+
+	/* Prism dual-use: defer/orelse/raw as identifiers alongside real keyword uses. */
+	{
+		const char *prism_dual =
+		    "int defer(void) { return 1; }\n"
+		    "int orelse(void) { return 2; }\n"
+		    "struct raw { int x; };\n"
+		    "int f(void) {\n"
+		    "  int x = 0 orelse 3;\n"
+		    "  defer { x += defer(); }\n"
+		    "  raw int y;\n"
+		    "  struct raw s;\n"
+		    "  y = orelse();\n"
+		    "  return x + y + s.x;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(prism_dual, "kwdual_prism.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "kw dual-use: prism defer/orelse/raw together");
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(soft_kw_spelling_preserved(r.output, "defer"),
+			      "kw dual-use preserve: defer callee");
+			CHECK(soft_kw_spelling_preserved(r.output, "orelse"),
+			      "kw dual-use preserve: orelse callee/tag");
+			CHECK(strstr(r.output, "struct raw") != NULL,
+			      "kw dual-use preserve: raw struct tag");
+			CHECK(strstr(r.output, " orelse ") == NULL,
+			      "kw dual-use: orelse keyword lowered");
+		} else if (r.error_msg) {
+			printf("         error: %s\n", r.error_msg);
+		}
+		prism_free(&r);
+	}
+
+	/* Adjacent declarators: two different soft/prism kws as names in one decl list. */
+	printf("\n--- Adjacent soft/prism keyword declarators ---\n");
+	static const char *adj_a[] = {"alignas", "bool", "typeof", "defer", "orelse"};
+	static const char *adj_b[] = {"constexpr", "noreturn", "raw", "asm", "offsetof"};
+	for (size_t i = 0; i < sizeof(adj_a) / sizeof(adj_a[0]); i++) {
+		snprintf(src, sizeof(src),
+			 "int f(void) {\n"
+			 "  int %s, %s;\n"
+			 "  return %s + %s;\n"
+			 "}\n",
+			 adj_a[i], adj_b[i], adj_a[i], adj_b[i]);
+		snprintf(name, sizeof(name), "kw adjacent: %s, %s", adj_a[i], adj_b[i]);
+		snprintf(fname, sizeof(fname), "kwadj_%zu.c", i);
+		PrismResult r = prism_transpile_source(src, fname, prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, name);
+		if (r.status == PRISM_OK && r.output) {
+			CHECK(soft_kw_spelling_preserved(r.output, adj_a[i]) &&
+				  soft_kw_spelling_preserved(r.output, adj_b[i]),
+			      name);
+		} else if (r.error_msg) {
+			printf("         error: %s\n", r.error_msg);
+		}
+		prism_free(&r);
+	}
+
+	/* Keyword-form corpus: these must still parse as keywords (not eaten as idents). */
+	printf("\n--- Soft/Prism keyword-form still works ---\n");
+	static const struct {
+		const char *code;
+		const char *label;
+		int want_ok; /* 1 = must transpile, 0 = must reject */
+	} kw_forms[] = {
+	    {"alignas(16) int x; int f(void) { return x; }\n", "alignas(N) decl", 1},
+	    {"int f(void) { return (int)alignof(double); }\n", "alignof(T)", 1},
+	    {"static_assert(sizeof(int) >= 2, \"w\");\n", "static_assert", 1},
+	    {"noreturn void die(void); void die(void) { for(;;){} }\n", "noreturn", 1},
+	    {"thread_local int tls; int f(void) { return tls; }\n", "thread_local", 1},
+	    {"typeof(int) x; int f(void) { return x; }\n", "typeof(T)", 1},
+	    {"typeof_unqual(const int) x; int f(void) { return x; }\n", "typeof_unqual(T)", 1},
+	    {"bool f(void) { bool b; return b; }\n", "bool type", 1},
+	    {"int f(void) { int x = 0 orelse 1; return x; }\n", "orelse keyword", 1},
+	    {"int f(void) { int x = 0; defer x = 1; return x; }\n", "defer keyword", 1},
+	    {"int f(void) { raw int x; return x; }\n", "raw keyword", 1},
+	    /* Must reject: orelse / defer in illegal positions already covered elsewhere;
+	     * here ensure a soft-kw keyword form isn't silently dropped. */
+	    {"int f(void) { alignas int x; return x; }\n", "alignas without (N) reject/ok", 1},
+	};
+	for (size_t i = 0; i < sizeof(kw_forms) / sizeof(kw_forms[0]); i++) {
+		snprintf(name, sizeof(name), "kw-form: %s", kw_forms[i].label);
+		PrismResult r =
+		    prism_transpile_source(kw_forms[i].code, "kwform.c", prism_defaults());
+		if (kw_forms[i].want_ok)
+			CHECK_EQ(r.status, PRISM_OK, name);
+		else
+			CHECK(r.status != PRISM_OK, name);
+		if (kw_forms[i].want_ok && r.status != PRISM_OK && r.error_msg)
+			printf("         error: %s\n", r.error_msg);
+		prism_free(&r);
+	}
+
+	printf("--- kw×ctx matrix summary: %d preserve-ok, %d preserve-fail ---\n", matrix_ok,
+	       matrix_fail);
+
+	/* Mega TU: every soft + prism kw as a *different* identifier role at once. */
+	{
+		const char *mega =
+		    "typedef int alignas;\n"
+		    "struct alignof { int x; };\n"
+		    "union static_assert { int y; };\n"
+		    "enum { noreturn = 1, constexpr = 2 };\n"
+		    "int thread_local(void) { return 3; }\n"
+		    "struct MegaFld { int bool : 2; int typeof; };\n"
+		    "int typeof_unqual(int p) { return p; }\n"
+		    "int takes_asm(int *asm) { return asm ? 1 : 0; }\n"
+		    "int defer(void) { return 4; }\n"
+		    "int orelse(void) { return 5; }\n"
+		    "struct raw { int z; };\n"
+		    "int offsetof(void) { return 6; }\n"
+		    "int mega(void) {\n"
+		    "  alignas a;\n"
+		    "  struct alignof ao;\n"
+		    "  union static_assert sa;\n"
+		    "  {\n"
+		    "    int local_tu = typeof_unqual(9);\n"
+		    "    struct MegaFld m;\n"
+		    "    struct raw r;\n"
+		    "    raw int leave;\n"
+		    "    int x = 0 orelse orelse();\n"
+		    "    defer { x += defer(); }\n"
+		    "    m.bool = 1;\n"
+		    "    m.typeof = constexpr;\n"
+		    "    leave = offsetof();\n"
+		    "    return a + ao.x + sa.y + noreturn + thread_local() +\n"
+		    "           local_tu + m.typeof + x + r.z + leave +\n"
+		    "           takes_asm(0);\n"
+		    "  }\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(mega, "kw_mega_roles.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "kw mega-TU: all soft/prism kws as distinct roles");
+		if (r.status != PRISM_OK && r.error_msg)
+			printf("         error: %s\n", r.error_msg);
+		if (r.status == PRISM_OK && r.output) {
+			static const char *must[] = {
+			    "alignas", "alignof", "static_assert", "noreturn", "constexpr",
+			    "thread_local", "bool", "typeof", "typeof_unqual", "asm", "offsetof",
+			    "defer", "orelse", "raw",
+			};
+			int missing = 0;
+			for (size_t i = 0; i < sizeof(must) / sizeof(must[0]); i++) {
+				if (!soft_kw_spelling_preserved(r.output, must[i])) {
+					missing++;
+					printf("         mega missing spelling: %s\n", must[i]);
+				}
+			}
+			CHECK_EQ(missing, 0, "kw mega-TU: all keyword spellings preserved");
+			CHECK(strstr(r.output, " orelse ") == NULL,
+			      "kw mega-TU: orelse operator lowered");
+			/* No host compile here: typeof/asm remain GNU keywords for cc. */
+		}
+		prism_free(&r);
+	}
+
+	/* Host-safe mega: same idea, omitting GNU-keyword spellings so cc can link. */
+	UNIX_ONLY({
+		const char *host_mega =
+		    "typedef int alignas;\n"
+		    "struct alignof { int x; };\n"
+		    "union static_assert { int y; };\n"
+		    "enum { noreturn = 1, constexpr = 2 };\n"
+		    "int thread_local(void) { return 3; }\n"
+		    "struct MegaFld { int bool : 2; int offsetof; };\n"
+		    "int defer(void) { return 4; }\n"
+		    "int orelse(void) { return 5; }\n"
+		    "struct raw { int z; };\n"
+		    "int host_mega(void) {\n"
+		    "  alignas a;\n"
+		    "  struct alignof ao;\n"
+		    "  union static_assert sa;\n"
+		    "  struct MegaFld m;\n"
+		    "  struct raw r;\n"
+		    "  raw int leave;\n"
+		    "  int x = 0 orelse orelse();\n"
+		    "  defer { x += defer(); }\n"
+		    "  m.bool = 1;\n"
+		    "  m.offsetof = constexpr;\n"
+		    "  leave = noreturn;\n"
+		    "  return a + ao.x + sa.y + thread_local() + m.offsetof + x + r.z + leave;\n"
+		    "}\n"
+		    "int main(void) { (void)host_mega(); return 0; }\n";
+		PrismResult r =
+		    prism_transpile_source(host_mega, "kw_mega_host.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "kw mega-TU host-safe: transpiles");
+		if (r.status == PRISM_OK && r.output)
+			check_transpiled_output_compiles_and_runs(
+			    r.output, "kw mega-TU host-safe: compile",
+			    "kw mega-TU host-safe: run");
+		else if (r.error_msg)
+			printf("         error: %s\n", r.error_msg);
+		prism_free(&r);
+	});
+
+	/* Quirk lock: identifier named `asm` plus `goto` in the same function is
+	 * treated as GNU asm-goto, so defer is rejected. Keep visible so a future
+	 * heuristic fix flips this deliberately. */
+	{
+		const char *quirk =
+		    "int f(void) {\n"
+		    "  int asm;\n"
+		    "  if (asm) goto done;\n"
+		    "  defer asm = 1;\n"
+		    "done:\n"
+		    "  return asm;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(quirk, "kw_asm_goto_quirk.c", prism_defaults());
+		CHECK(r.status != PRISM_OK,
+		      "kw quirk: asm-ident + goto + defer currently rejected");
+		prism_free(&r);
+	}
+
+	/* Compile-run smoke: pick contexts that remain valid identifiers for the
+	 * host C compiler (avoid GNU/C23 keyword spellings like typeof/asm). */
+	UNIX_ONLY({
+		static const struct {
+			const char *kw;
+			SoftKwCtxId ctx;
+		} smokes[] = {
+		    {"alignas", SK_CTX_LOCAL_VAR},
+		    {"noreturn", SK_CTX_LABEL},
+		    {"defer", SK_CTX_CALL},
+		    {"orelse", SK_CTX_PARAM},
+		    {"raw", SK_CTX_STRUCT_TAG},
+		    {"offsetof", SK_CTX_DESIGNATOR},
+		    {"static_assert", SK_CTX_FOR_INIT},
+		    {"thread_local", SK_CTX_ENUM_MEMBER},
+		};
+		for (size_t i = 0; i < sizeof(smokes) / sizeof(smokes[0]); i++) {
+			if (soft_kw_build_ident_tu(src, sizeof(src), smokes[i].kw, smokes[i].ctx) !=
+			    0)
+				continue;
+			char runsrc[4096];
+			if (smokes[i].ctx == SK_CTX_PARAM) {
+				snprintf(runsrc, sizeof(runsrc),
+					 "%s\n"
+					 "int main(void) { return f(0) == 1 ? 0 : 1; }\n",
+					 src);
+			} else if (smokes[i].ctx == SK_CTX_CALL ||
+				   smokes[i].ctx == SK_CTX_FUNC_DEF) {
+				snprintf(runsrc, sizeof(runsrc),
+					 "%s\n"
+					 "int main(void) { return f() != 0 ? 0 : 1; }\n",
+					 src);
+			} else if (smokes[i].ctx == SK_CTX_ENUM_MEMBER) {
+				snprintf(runsrc, sizeof(runsrc),
+					 "%s\n"
+					 "int main(void) { return f() == 4 ? 0 : 1; }\n",
+					 src);
+			} else if (smokes[i].ctx == SK_CTX_FOR_INIT) {
+				snprintf(runsrc, sizeof(runsrc),
+					 "%s\n"
+					 "int main(void) { return f() == 3 ? 0 : 1; }\n",
+					 src);
+			} else if (smokes[i].ctx == SK_CTX_LABEL) {
+				snprintf(runsrc, sizeof(runsrc),
+					 "%s\n"
+					 "int main(void) { return f(1) == 1 ? 0 : 1; }\n",
+					 src);
+			} else {
+				snprintf(runsrc, sizeof(runsrc),
+					 "%s\n"
+					 "int main(void) { (void)f(); return 0; }\n",
+					 src);
+			}
+			snprintf(fname, sizeof(fname), "kwsmoke_%s_%s.c", smokes[i].kw,
+				 soft_kw_ctx_name(smokes[i].ctx));
+			PrismResult r =
+			    prism_transpile_source(runsrc, fname, prism_defaults());
+			snprintf(name, sizeof(name), "kw smoke transpile: %s/%s", smokes[i].kw,
+				 soft_kw_ctx_name(smokes[i].ctx));
+			CHECK_EQ(r.status, PRISM_OK, name);
+			if (r.status == PRISM_OK && r.output) {
+				snprintf(name, sizeof(name), "kw smoke compile: %s/%s",
+					 smokes[i].kw, soft_kw_ctx_name(smokes[i].ctx));
+				char run_name[160];
+				snprintf(run_name, sizeof(run_name), "kw smoke run: %s/%s",
+					 smokes[i].kw, soft_kw_ctx_name(smokes[i].ctx));
+				check_transpiled_output_compiles_and_runs(r.output, name, run_name);
+			} else if (r.error_msg) {
+				printf("         error: %s\n", r.error_msg);
+			}
+			prism_free(&r);
+		}
+	});
+}
+
 #if __STDC_VERSION__ >= 202311L
 static void test_c23_attr_positions(void) {
 	[[maybe_unused]] int c23_a;
@@ -8799,6 +9451,7 @@ void run_parse_tests(void) {
 	test_prism_keyword_orelse_label_and_enum_dimension();
 	test_prism_keyword_gnu_label_names();
 	test_prism_keyword_function_identifiers();
+	test_soft_prism_keyword_context_matrix();
 #if __STDC_VERSION__ >= 202311L
 	test_c23_attr_positions();
 #endif

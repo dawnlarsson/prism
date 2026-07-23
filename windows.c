@@ -39,7 +39,9 @@
 
 typedef SSIZE_T ssize_t;
 typedef intptr_t pid_t;
+#ifdef _MSC_VER
 typedef int mode_t;
+#endif
 
 // MSVC volatile has acquire/release semantics on x86/x64, so plain
 // reads/writes are sufficient for signal_temp_* atomics.
@@ -62,12 +64,15 @@ typedef int mode_t;
 				    (LONG)(*(expected))) == (LONG)(*(expected)))
 
 // MSVC doesn't have these — define them away or provide equivalents.
+// MinGW/Clang-on-Windows already provide the GCC builtins.
+#ifdef _MSC_VER
 #define __attribute__(x)
 #define __builtin_expect(expr, val) (expr)
 #define __builtin_constant_p(x) 0
 #define __builtin_strlen(s) strlen(s)
 #define __builtin_unreachable() __assume(0)
 #define __alignof__(x) __alignof(x)
+#endif
 
 #define WIFEXITED(s) 1	   // Always "exited" on Windows (no signals)
 #define WEXITSTATUS(s) (s) // status IS the exit code
@@ -75,7 +80,11 @@ typedef int mode_t;
 #define WTERMSIG(s) 0
 
 #ifndef noreturn // Define AFTER including all system headers so we don't poison them.
+#ifdef _MSC_VER
 #define noreturn __declspec(noreturn)
+#else
+#define noreturn __attribute__((noreturn))
+#endif
 #endif
 
 #ifndef environ
@@ -561,6 +570,7 @@ static ssize_t getline(char **lineptr, size_t *n, FILE *stream) {
 
 // tries up to 10000 unique names with randomized template + _sopen_s
 // suffix_len: number of chars after the X's (e.g. 2 for ".c" in "foo.XXXXXX.c")
+// MinGW provides mkstemp/mkdtemp but not always mkstemps; MSVC needs all three.
 static int mkstemps(char *tmpl, int suffix_len) {
 	static const char chars[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 	size_t len = strlen(tmpl);
@@ -611,6 +621,7 @@ static int mkstemps(char *tmpl, int suffix_len) {
 	return -1;
 }
 
+#ifdef _MSC_VER
 static int mkstemp(char *tmpl) {
 	return mkstemps(tmpl, 0);
 }
@@ -654,6 +665,7 @@ static char *mkdtemp(char *tmpl) {
 	}
 	return NULL;
 }
+#endif /* _MSC_VER */
 
 static int posix_spawn_file_actions_init(posix_spawn_file_actions_t *fa) {
 	fa->count = 0;

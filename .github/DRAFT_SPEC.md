@@ -870,7 +870,7 @@ The agonizing assembler directive fragmentation (.globl vs PUBLIC, .text vs .cod
 | Feature | Bug severity | Arch fit | Effort | Priority |
 |---|---|---|---|---|
 | Defer 2.0 (channels + goto-patch) | High (resource leaks + icache bloat) | High (extends existing defer infra) | Medium | **1** |
-| Bounds checking | Critical (CWE-787/125, #1 exploit class) | High (declaration scanner + emit loop) | Medium | **2** |
+| Bounds checking | ~~Critical~~ | ~~High~~ | ~~Medium~~ | **DONE** (v1 — SPEC §6.10; future tiers below) |
 | Taint qualifiers | Critical (security) | High (extends existing taint infra) | Medium | **3** |
 | min/max/clamp | Medium (double-eval bugs) | High (reuses orelse scanner) | Low | **4** |
 | sizeof decay check | Medium (silent wrong results) | High (trivial token pattern) | Very low | **5** |
@@ -878,7 +878,7 @@ The agonizing assembler directive fragmentation (.globl vs PUBLIC, .text vs .cod
 | Fallthrough ban | Medium (CWE-484 class) | High (Phase 1D case tracking) | Low | **7** |
 | Forward-only goto | Low (code quality) | High (CFG verifier has it) | Near zero | **8** |
 | Attribute normalization | None (convenience) | High (trivial) | Low | **9** |
-| Auto-static const arrays | High (eliminates hidden memcpy) | Very high (trivial token scan) | Low | **10** |
+| Auto-static const arrays | ~~High~~ | ~~Very high~~ | ~~Low~~ | **DONE** (SPEC §6.9) |
 | Unreachable after noreturn | ~~Medium~~ | ~~Very high~~ | ~~Near zero~~ | **DONE** |
 | Orelse postcondition | Low (missed optimizations) | Very high (orelse semantics) | Near zero | **12** |
 | Const-to-literal VLA demotion | Medium (wastes frame pointer GPR) | Very high (typedef table lookup) | Very low | **13** |
