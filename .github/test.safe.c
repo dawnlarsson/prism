@@ -3601,6 +3601,21 @@ static void test_plain_c_nested_function_passthrough(void) {
 	prism_free(&r);
 }
 
+// Nested body with orelse would be passed through verbatim → backend misscompile.
+static void test_nested_function_orelse_rejected(void) {
+	printf("\n--- Nested function with orelse must reject ---\n");
+
+	const char *code =
+	    "int main(void) {\n"
+	    "    int outer = 5;\n"
+	    "    int nested(void) { int x = outer orelse return 0; return x; }\n"
+	    "    return nested();\n"
+	    "}\n";
+	PrismResult r = prism_transpile_source(code, "nested_orelse.c", prism_defaults());
+	CHECK(r.status != PRISM_OK, "nested function with orelse must be rejected");
+	prism_free(&r);
+}
+
 // Regression: nested function defined inside a statement expression (GNU),
 // assigned to a function pointer — same nested-fn rejection as a flat nested def.
 static void test_plain_c_stmt_expr_nested_function_false_positive(void) {
@@ -6330,8 +6345,78 @@ static void test_knr_param_vla_2d_sizeof_star_cfg(void) {
 	prism_free(&r);
 }
 
+/* Consolidated Phase-1 reject corpus: one table of known hard errors that must
+ * fail before (or without depending on) Pass-2 emit. Optional needle matches
+ * the diagnostic. Under PRISM_DEBUG the same rejects still fire (Pass-2 drift
+ * asserts live inside prism.c). */
+static void test_phase1_reject_corpus(void) {
+	printf("\n--- Phase-1 reject corpus ---\n");
+	static const struct {
+		const char *code;
+		const char *needle; /* optional substring of error_msg; NULL = any */
+		const char *tag;
+	} bad[] = {
+	    {"defer (void)0;\n", "outside of any scope", "file-scope defer"},
+	    {"int f(void){ defer return 0; }\n", NULL, "return in defer"},
+	    {"int f(void){ defer { goto L; } L: return 0; }\n", NULL, "goto in defer"},
+	    {"int f(void){ defer defer (void)0; }\n", "missing ';'", "nested defer"},
+	    {"int f(void){ int x = 0; defer x; void (*fp)(void) = setjmp; (void)fp; return x; }\n",
+	     "setjmp", "setjmp + defer"},
+	    {"int f(void){ void *t[] = {&&L}; defer (void)0; goto *t[0]; L: return 0; }\n",
+	     NULL, "computed goto + defer"},
+	    {"int f(void){ defer (void)0; if (0) asm goto(\"\" ::: : L); L: return 0; }\n",
+	     "asm goto", "asm goto + defer"},
+	    {"int g(void); void f(void){ if (g() orelse 0){} }\n", "orelse", "orelse in if-cond"},
+	    {"int g(void); int f(int c){ return c ? g() orelse 0 : 1; }\n", "ternary",
+	     "orelse in ternary"},
+	    {"enum { X = 0 orelse 1 };\n", "orelse", "orelse in enum"},
+	    {"int a[0 orelse 1];\n", NULL, "bracket orelse file scope"},
+	    {"int f(void){ int x; x = (0, 1 orelse 0); return x; }\n", NULL, "orelse in comma"},
+	    {"void f(int c){ switch(c){ int x; case 0: break; } }\n", NULL,
+	     "switch unbraced decl"},
+	    {"void f(int n){ register int a[n]; (void)a; }\n", "register", "register VLA"},
+	    {"void f(int n){ const int a[n]; (void)a; }\n", NULL, "const VLA"},
+	    {"int f(void){ int x = 1 orelse ({ 0; }); return x; }\n", "statement expression",
+	     "stmt-expr orelse fallback"},
+	    {"void f(int n){ for (int a[n];;) break; }\n", NULL, "for-init VLA sized"},
+	    {"int f(void){ int x = 1 orelse; return x; }\n", NULL, "empty orelse action"},
+	    {"int g(void); int f(void){ int x; x = g() orelse; return x; }\n", NULL,
+	     "empty orelse action assign"},
+	};
+
+	char name[160];
+	int ok = 0, fail = 0;
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		snprintf(name, sizeof(name), "p1 corpus: %s", bad[i].tag);
+		PrismResult r = prism_transpile_source(bad[i].code, "p1corp.c", prism_defaults());
+		if (r.status == PRISM_OK) {
+			CHECK(0, name);
+			printf("         unexpectedly accepted\n");
+			fail++;
+		} else {
+			CHECK(1, name);
+			if (bad[i].needle) {
+				snprintf(name, sizeof(name), "p1 corpus needle: %s", bad[i].tag);
+				int hit = r.error_msg && strstr(r.error_msg, bad[i].needle);
+				CHECK(hit, name);
+				if (hit) ok++;
+				else {
+					fail++;
+					if (r.error_msg)
+						printf("         error: %s\n", r.error_msg);
+				}
+			} else
+				ok++;
+		}
+		prism_free(&r);
+	}
+	printf("--- p1 corpus summary: %d ok, %d fail ---\n", ok, fail);
+}
+
 void run_safe_tests(void) {
 	printf("\n=== SAFE TESTS ===\n");
+
+	test_phase1_reject_corpus();
 
 	/* Safety hole tests */
 	test_knr_param_vla_cfg_register();
@@ -6576,6 +6661,7 @@ void run_safe_tests(void) {
 	test_plain_c_computed_goto_via_ptr_false_positive();
 	test_plain_c_goto_tag_definition_false_positive();
 	test_plain_c_nested_function_passthrough();
+	test_nested_function_orelse_rejected();
 	test_plain_c_stmt_expr_nested_function_false_positive();
 	test_plain_c_if_switch_init_vla_false_positive();
 	test_plain_c_asm_goto_decl_false_positive();

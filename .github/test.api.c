@@ -3998,6 +3998,112 @@ static void test_cli_dep_flags_routing(void) {
 	rmdir(dir);
 }
 
+/* GCC-compatible @file expansion: rsp-listed sources must be transpiled;
+ * libiberty tokenization (quotes anywhere in a token, single + double);
+ * unreadable @file kept literally; self-recursion terminates at the cap. */
+static void test_cli_response_files(void) {
+	printf("\n--- CLI @file response-file expansion ---\n");
+
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_rsp_");
+	CHECK(dir != NULL, "rsp: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], src[PATH_MAX], rsp[PATH_MAX], rsp2[PATH_MAX], out[PATH_MAX];
+	char cmd[PATH_MAX * 4];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	if (!build_test_prism_binary(prism_bin, "rsp: build prism binary")) {
+		rmdir(dir);
+		return;
+	}
+
+	/* 1. Source listed inside the rsp is transpiled (orelse must not leak). */
+	snprintf(src, sizeof(src), "%s/src.c", dir);
+	FILE *f = fopen(src, "w");
+	CHECK(f != NULL, "rsp: write src.c");
+	if (f) {
+		fputs("int get(void){return 0;}\n"
+		      "int main(void){ int x = get() orelse 7; return x == 7 ? 0 : 1; }\n",
+		      f);
+		fclose(f);
+	}
+	snprintf(rsp, sizeof(rsp), "%s/basic.rsp", dir);
+	snprintf(out, sizeof(out), "%s/app", dir);
+	f = fopen(rsp, "w");
+	if (f) {
+		fprintf(f, "-O1\n%s -o %s\n", src, out);
+		fclose(f);
+	}
+	snprintf(cmd, sizeof(cmd), "'%s' '@%s' >/dev/null 2>&1", prism_bin, rsp);
+	CHECK_EQ(system(cmd), 0, "rsp: @file with .c source transpiles+links");
+	snprintf(cmd, sizeof(cmd), "'%s'", out);
+	CHECK_EQ(system(cmd), 0, "rsp: orelse fallback ran in rsp-listed source");
+
+	/* 2. Nested @file + libiberty quoting: mid-token double quotes and
+	 * single quotes each group ONE arg (CMake-style rsp contents). */
+	char qsrc[PATH_MAX], qrsp[PATH_MAX], qout[PATH_MAX];
+	snprintf(qsrc, sizeof(qsrc), "%s/q.c", dir);
+	f = fopen(qsrc, "w");
+	if (f) {
+		fputs("int main(void){ return ((V) == 3 && (W) == 5) ? 0 : 1; }\n", f);
+		fclose(f);
+	}
+	snprintf(qrsp, sizeof(qrsp), "%s/q.rsp", dir);
+	snprintf(qout, sizeof(qout), "%s/qapp", dir);
+	f = fopen(qrsp, "w");
+	if (f) {
+		fprintf(f, "-DV=\"1 + 2\" -DW='4 + 1'\n%s -o %s\n", qsrc, qout);
+		fclose(f);
+	}
+	snprintf(rsp2, sizeof(rsp2), "%s/outer.rsp", dir);
+	f = fopen(rsp2, "w");
+	if (f) {
+		fprintf(f, "@%s\n", qrsp);
+		fclose(f);
+	}
+	snprintf(cmd, sizeof(cmd), "'%s' '@%s' >/dev/null 2>&1", prism_bin, rsp2);
+	CHECK_EQ(system(cmd), 0, "rsp: nested @file with quoted args compiles");
+	snprintf(cmd, sizeof(cmd), "'%s'", qout);
+	CHECK_EQ(system(cmd), 0, "rsp: mid-token \" and ' each grouped one arg");
+
+	/* 3. Unreadable @file is kept literally (GCC), not a prism abort. */
+	char errtxt[PATH_MAX];
+	snprintf(errtxt, sizeof(errtxt), "%s/err.txt", dir);
+	snprintf(cmd,
+		 sizeof(cmd),
+		 "'%s' '@%s/nope.rsp' '%s' -c -o '%s/o.o' >/dev/null 2>'%s'",
+		 prism_bin, dir, qsrc, dir, errtxt);
+	CHECK(system(cmd) != 0, "rsp: missing @file still fails the compile");
+	bool prism_aborted = false;
+	f = fopen(errtxt, "r");
+	if (f) {
+		char ebuf[4096];
+		size_t got = fread(ebuf, 1, sizeof(ebuf) - 1, f);
+		ebuf[got] = '\0';
+		fclose(f);
+		prism_aborted = strstr(ebuf, "failed to expand response files") != NULL;
+	}
+	CHECK(!prism_aborted, "rsp: missing @file passed literally (no prism abort)");
+
+	/* 4. Self-referencing rsp terminates at the nesting cap. */
+	char selfrsp[PATH_MAX];
+	snprintf(selfrsp, sizeof(selfrsp), "%s/self.rsp", dir);
+	f = fopen(selfrsp, "w");
+	if (f) {
+		fprintf(f, "@%s\n", selfrsp);
+		fclose(f);
+	}
+	snprintf(cmd, sizeof(cmd), "'%s' '@%s' >/dev/null 2>&1", prism_bin, selfrsp);
+	CHECK(system(cmd) != 0, "rsp: self-referencing @file rejected (no hang)");
+
+	snprintf(cmd, sizeof(cmd),
+		 "rm -f '%s' '%s' '%s' '%s' '%s' '%s' '%s' '%s' '%s/o.o' '%s'",
+		 src, rsp, rsp2, qsrc, qrsp, out, qout, errtxt, dir, selfrsp);
+	(void)system(cmd);
+	unlink(prism_bin);
+	rmdir(dir);
+}
+
 static void test_cli_mixed_c_cpp_driver(void) {
 	printf("\n--- CLI mixed .c + .cpp (pp must not ingest .cpp) ---\n");
 
@@ -4138,6 +4244,306 @@ static void test_cli_mixed_c_cpp_driver(void) {
 	rmdir(dir);
 }
 
+/* True if some `[prism] <argv…>` verbose line uses a C++ driver. */
+static bool cxxmix_verbose_cxx_driver(const char *verbose) {
+	for (const char *p = verbose; (p = strstr(p, "[prism] ")) != NULL; p += 8) {
+		const char *line = p + 8;
+		if (strncmp(line, "Transpiling", 11) == 0) continue;
+		const char *sp = strchr(line, ' ');
+		size_t n = sp ? (size_t)(sp - line) : strlen(line);
+		const char *base = line;
+		for (size_t i = 0; i < n; i++)
+			if (line[i] == '/') base = line + i + 1;
+		size_t blen = n - (size_t)(base - line);
+		int is_cxx = 0;
+		for (size_t i = 0; i + 1 < blen; i++)
+			if (base[i] == '+' && base[i + 1] == '+') {
+				is_cxx = 1;
+				break;
+			}
+		if (!is_cxx && blen == 3 && memcmp(base, "c++", 3) == 0) is_cxx = 1;
+		if (is_cxx) return true;
+	}
+	return false;
+}
+
+static int cxxmix_count_substr(const char *hay, const char *needle) {
+	int n = 0;
+	size_t len = strlen(needle);
+	for (const char *p = hay; (p = strstr(p, needle)) != NULL; p += len) n++;
+	return n;
+}
+
+/* Procedural CLI file-kind × driver table — locks the C++ mix / passthrough
+ * regressions (pp skip, cxx driver upgrade, -x c temps, stdlib inject,
+ * flag operands, no -fpreprocessed on .cpp). */
+static void test_cli_file_kind_driver_matrix(void) {
+	printf("\n--- CLI file-kind × driver matrix ---\n");
+
+#ifndef _WIN32
+	if (system("c++ --version >/dev/null 2>&1") != 0 &&
+	    system("g++ --version >/dev/null 2>&1") != 0 &&
+	    system("clang++ --version >/dev/null 2>&1") != 0) {
+		passed++;
+		total++;
+		printf("[PASS] filekind: skipped (no C++ driver installed)\n");
+		return;
+	}
+
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_filekind_");
+	CHECK(dir != NULL, "filekind: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], stderr_path[PATH_MAX], out_path[PATH_MAX];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	snprintf(stderr_path, sizeof(stderr_path), "%s/err.txt", dir);
+	snprintf(out_path, sizeof(out_path), "%s/out", dir);
+
+	if (!build_test_prism_binary(prism_bin, "filekind: build prism binary")) {
+		rmdir(dir);
+		return;
+	}
+
+	enum {
+		FK_LINK = 1u << 0,	  /* must link + run */
+		FK_CXX_DRIVER = 1u << 1,  /* verbose: first argv is g++/clang++/c++ */
+		FK_STDLIB = 1u << 2,	  /* verbose: -lstdc++ or -lc++ */
+		FK_X_C = 1u << 3,	  /* verbose: at least one `-x c` (temps) */
+		FK_NO_FPP_CXX = 1u << 4, /* pure cxx passthrough: no -fpreprocessed */
+		FK_VERBOSE = 1u << 5,	  /* capture --prism-verbose */
+	};
+
+	static const struct {
+		const char *tag;
+		const char *ext;	 /* primary cxx/asm ext; NULL = mix helper */
+		unsigned flags;
+		int n_c;		 /* how many .c companions */
+		int want_x_c;		 /* expected `-x c` count when FK_X_C */
+	} cases[] = {
+	    {"pure_cpp", ".cpp", FK_LINK | FK_CXX_DRIVER | FK_NO_FPP_CXX | FK_VERBOSE, 0, 0},
+	    {"pure_cc", ".cc", FK_LINK | FK_CXX_DRIVER | FK_NO_FPP_CXX | FK_VERBOSE, 0, 0},
+	    {"pure_cxx", ".cxx", FK_LINK | FK_CXX_DRIVER | FK_NO_FPP_CXX | FK_VERBOSE, 0, 0},
+	    {"mix_cpp", ".cpp", FK_LINK | FK_CXX_DRIVER | FK_STDLIB | FK_X_C | FK_VERBOSE, 1, 1},
+	    {"mix_cc", ".cc", FK_LINK | FK_CXX_DRIVER | FK_STDLIB | FK_X_C | FK_VERBOSE, 1, 1},
+	    {"mix2_cpp", ".cpp", FK_LINK | FK_CXX_DRIVER | FK_STDLIB | FK_X_C | FK_VERBOSE, 2, 2},
+	};
+
+	char name[160];
+	char cmd[PATH_MAX * 6];
+	char path_c[2][PATH_MAX];
+	char path_cxx[PATH_MAX];
+	char path_hdr[PATH_MAX];
+
+	for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
+		snprintf(path_cxx, sizeof(path_cxx), "%s/main%s", dir, cases[ci].ext);
+		FILE *f = fopen(path_cxx, "w");
+		CHECK(f != NULL, "filekind: write cxx");
+		if (!f) continue;
+
+		if (cases[ci].n_c == 0) {
+			/* Pure C++ — need stdlib so driver upgrade is observable. */
+			fputs("#include <string>\n"
+			      "int main() { return std::string(\"xy\").size() == 2 ? 0 : 1; }\n",
+			      f);
+		} else {
+			fputs("extern \"C\" int prism_fk_sum(int);\n"
+			      "int main() { return prism_fk_sum(0) == 0 ? 0 : 1; }\n",
+			      f);
+		}
+		fclose(f);
+
+		for (int i = 0; i < cases[ci].n_c; i++) {
+			snprintf(path_c[i], sizeof(path_c[i]), "%s/a%d.c", dir, i);
+			f = fopen(path_c[i], "w");
+			CHECK(f != NULL, "filekind: write c");
+			if (!f) continue;
+			if (i == 0)
+				fprintf(f,
+					"%s"
+					"int prism_fk_sum(int x) { return x%s; }\n",
+					cases[ci].n_c > 1 ? "int prism_fk_extra(void);\n" : "",
+					cases[ci].n_c > 1 ? " + prism_fk_extra()" : "");
+			else
+				fputs("int prism_fk_extra(void) { return 0; }\n", f);
+			fclose(f);
+		}
+
+		/* Build argv: prism [--prism-verbose] [c…] cxx -o out */
+		char *argv[16];
+		int argc = 0;
+		argv[argc++] = prism_bin;
+		if (cases[ci].flags & FK_VERBOSE) argv[argc++] = "--prism-verbose";
+		for (int i = 0; i < cases[ci].n_c; i++) argv[argc++] = path_c[i];
+		argv[argc++] = path_cxx;
+		argv[argc++] = "-o";
+		argv[argc++] = out_path;
+		argv[argc] = NULL;
+
+		unlink(stderr_path);
+		int st = run_exec_argv_capture(argv, NULL, stderr_path);
+		snprintf(name, sizeof(name), "filekind %s: link", cases[ci].tag);
+		if (cases[ci].flags & FK_LINK) CHECK_EQ(st, 0, name);
+
+		char vbuf[8192] = {0};
+		FILE *ef = fopen(stderr_path, "r");
+		if (ef) {
+			fread(vbuf, 1, sizeof(vbuf) - 1, ef);
+			fclose(ef);
+		}
+
+		if ((cases[ci].flags & FK_CXX_DRIVER) && (cases[ci].flags & FK_VERBOSE)) {
+			snprintf(name, sizeof(name), "filekind %s: cxx driver", cases[ci].tag);
+			CHECK(cxxmix_verbose_cxx_driver(vbuf), name);
+		}
+		if ((cases[ci].flags & FK_STDLIB) && (cases[ci].flags & FK_VERBOSE)) {
+			snprintf(name, sizeof(name), "filekind %s: stdlib", cases[ci].tag);
+			CHECK(strstr(vbuf, "-lstdc++") != NULL || strstr(vbuf, "-lc++") != NULL, name);
+		}
+		if ((cases[ci].flags & FK_X_C) && (cases[ci].flags & FK_VERBOSE)) {
+			snprintf(name, sizeof(name), "filekind %s: -x c temps", cases[ci].tag);
+			CHECK(cxxmix_count_substr(vbuf, " -x c ") >= cases[ci].want_x_c, name);
+		}
+		if ((cases[ci].flags & FK_NO_FPP_CXX) && (cases[ci].flags & FK_VERBOSE)) {
+			/* Pure passthrough must not inject -fpreprocessed onto .cpp/.cc. */
+			snprintf(name, sizeof(name), "filekind %s: no -fpreprocessed", cases[ci].tag);
+			CHECK(strstr(vbuf, "-fpreprocessed") == NULL, name);
+		}
+		if ((cases[ci].flags & FK_LINK) && st == 0) {
+			snprintf(cmd, sizeof(cmd), "'%s'", out_path);
+			snprintf(name, sizeof(name), "filekind %s: run", cases[ci].tag);
+			CHECK_EQ(system(cmd), 0, name);
+		}
+
+		unlink(path_cxx);
+		for (int i = 0; i < cases[ci].n_c; i++) unlink(path_c[i]);
+		unlink(out_path);
+		unlink(stderr_path);
+	}
+
+	/* Flag-operand cases: -D / -include must not be mistaken for sources. */
+	{
+		snprintf(path_cxx, sizeof(path_cxx), "%s/defs.cpp", dir);
+		snprintf(path_hdr, sizeof(path_hdr), "%s/extra.h", dir);
+		FILE *f = fopen(path_hdr, "w");
+		CHECK(f != NULL, "filekind: write hdr");
+		if (f) {
+			fputs("#define FK_MAGIC 7\n", f);
+			fclose(f);
+		}
+		f = fopen(path_cxx, "w");
+		CHECK(f != NULL, "filekind: write defs.cpp");
+		if (f) {
+			fputs("int main() {\n"
+			      "#ifndef FK_MAGIC\n"
+			      "#error missing include\n"
+			      "#endif\n"
+			      "#ifndef FK_DEF\n"
+			      "#error missing -D\n"
+			      "#endif\n"
+			      "  return (FK_MAGIC == 7 && FK_DEF == 3) ? 0 : 1;\n"
+			      "}\n",
+			      f);
+			fclose(f);
+		}
+
+		/* Joined -D */
+		{
+			char *argv[] = {prism_bin, path_cxx, "-DFK_DEF=3", "-include", path_hdr,
+					"-o",	   out_path, NULL};
+			int st = run_exec_argv_capture(argv, NULL, NULL);
+			CHECK_EQ(st, 0, "filekind: -D joined + -include links");
+			if (st == 0) {
+				snprintf(cmd, sizeof(cmd), "'%s'", out_path);
+				CHECK_EQ(system(cmd), 0, "filekind: -D joined runs");
+			}
+			unlink(out_path);
+		}
+		/* Split -D */
+		{
+			char *argv[] = {prism_bin, path_cxx, "-D", "FK_DEF=3", "-include", path_hdr,
+					"-o",	   out_path, NULL};
+			int st = run_exec_argv_capture(argv, NULL, NULL);
+			CHECK_EQ(st, 0, "filekind: split -D + -include links");
+			if (st == 0) {
+				snprintf(cmd, sizeof(cmd), "'%s'", out_path);
+				CHECK_EQ(system(cmd), 0, "filekind: split -D runs");
+			}
+			unlink(out_path);
+		}
+		unlink(path_cxx);
+		unlink(path_hdr);
+	}
+
+	/* Assembly passthrough (.s) must not be fed to Prism as C. */
+	{
+		char path_s[PATH_MAX];
+		snprintf(path_s, sizeof(path_s), "%s/noop.s", dir);
+		FILE *f = fopen(path_s, "w");
+		CHECK(f != NULL, "filekind: write .s");
+		if (f) {
+#if defined(__APPLE__)
+			fputs(".globl _prism_fk_noop\n_prism_fk_noop:\n  ret\n", f);
+#elif defined(__aarch64__)
+			fputs(".globl prism_fk_noop\nprism_fk_noop:\n  ret\n", f);
+#else
+			fputs(".globl prism_fk_noop\nprism_fk_noop:\n  ret\n", f);
+#endif
+			fclose(f);
+			char obj[PATH_MAX];
+			snprintf(obj, sizeof(obj), "%s/noop.o", dir);
+			char *argv[] = {prism_bin, "-c", path_s, "-o", obj, NULL};
+			int st = run_exec_argv_capture(argv, NULL, NULL);
+			CHECK_EQ(st, 0, "filekind: .s passthrough -c");
+			unlink(obj);
+			unlink(path_s);
+		}
+	}
+
+	/* Cross-prefix driver mapping when a mingw-style gcc exists. */
+	if (system("x86_64-w64-mingw32-gcc --version >/dev/null 2>&1") == 0 &&
+	    system("x86_64-w64-mingw32-g++ --version >/dev/null 2>&1") == 0) {
+		snprintf(path_cxx, sizeof(path_cxx), "%s/cross.cpp", dir);
+		FILE *f = fopen(path_cxx, "w");
+		if (f) {
+			fputs("int main(){return 0;}\n", f);
+			fclose(f);
+			char *argv[] = {prism_bin,
+					"--prism-verbose",
+					"--prism-cc=x86_64-w64-mingw32-gcc",
+					path_cxx,
+					"-c",
+					"-o",
+					out_path,
+					NULL};
+			run_exec_argv_capture(argv, NULL, stderr_path);
+			char vbuf[4096] = {0};
+			FILE *ef = fopen(stderr_path, "r");
+			if (ef) {
+				fread(vbuf, 1, sizeof(vbuf) - 1, ef);
+				fclose(ef);
+			}
+			CHECK(strstr(vbuf, "x86_64-w64-mingw32-g++") != NULL,
+			      "filekind: mingw-gcc → mingw-g++");
+			unlink(path_cxx);
+			unlink(out_path);
+			unlink(stderr_path);
+		}
+	} else {
+		passed++;
+		total++;
+		printf("[PASS] filekind: mingw cross skip (toolchain absent)\n");
+	}
+
+	unlink(prism_bin);
+	rmdir(dir);
+#else
+	passed++;
+	total++;
+	printf("[PASS] filekind: skipped on Windows\n");
+#endif
+}
+
 /* preprocess_with_cc re-runs `cc -E` on failure so diagnostics reach stderr.
  * That rerun must discard stdout — otherwise the full preprocessed dump
  * pollutes the user's stdout (and breaks build systems that capture it). */
@@ -4190,6 +4596,333 @@ static void test_preprocess_failure_no_stdout_dump(void) {
 
 	unlink(src_path);
 	unlink(out_path);
+	unlink(stdout_path);
+	unlink(stderr_path);
+	unlink(prism_bin);
+	rmdir(dir);
+}
+
+/* -include is applied during preprocess; must not be re-passed when compiling
+ * already-expanded transpiled output (else raw orelse/defer + redefinitions). */
+static void test_cli_include_prism_header_not_reinjected(void) {
+	printf("\n--- CLI -include Prism header (no backend reinject) ---\n");
+
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_fi_");
+	CHECK(dir != NULL, "fi: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], hdr_path[PATH_MAX], src_path[PATH_MAX], exe_path[PATH_MAX];
+	char stdout_path[PATH_MAX], stderr_path[PATH_MAX];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	snprintf(hdr_path, sizeof(hdr_path), "%s/feat.h", dir);
+	snprintf(src_path, sizeof(src_path), "%s/main.c", dir);
+	snprintf(exe_path, sizeof(exe_path), "%s/app", dir);
+	snprintf(stdout_path, sizeof(stdout_path), "%s/out.txt", dir);
+	snprintf(stderr_path, sizeof(stderr_path), "%s/err.txt", dir);
+
+	FILE *hf = fopen(hdr_path, "w");
+	CHECK(hf != NULL, "fi: write header");
+	if (!hf) {
+		rmdir(dir);
+		return;
+	}
+	fputs("static inline int fi_clamp(int v){\n"
+	      "  int x = v orelse return 0;\n"
+	      "  defer { (void)x; }\n"
+	      "  return x;\n"
+	      "}\n",
+	      hf);
+	fclose(hf);
+
+	FILE *sf = fopen(src_path, "w");
+	CHECK(sf != NULL, "fi: write source");
+	if (!sf) {
+		unlink(hdr_path);
+		rmdir(dir);
+		return;
+	}
+	fputs("int main(void){ return fi_clamp(3)==3?0:1; }\n", sf);
+	fclose(sf);
+
+	if (!build_test_prism_binary(prism_bin, "fi: build prism binary")) {
+		unlink(hdr_path);
+		unlink(src_path);
+		rmdir(dir);
+		return;
+	}
+
+	char *argv[] = {prism_bin, "-include", hdr_path, src_path, "-o", exe_path, NULL};
+	int st = run_exec_argv_capture(argv, stdout_path, stderr_path);
+	CHECK_EQ(st, 0, "fi: -include header with orelse/defer compiles");
+	if (st == 0) {
+		char *run_argv[] = {exe_path, NULL};
+		int rst = run_exec_argv_capture(run_argv, stdout_path, stderr_path);
+		CHECK_EQ(rst, 0, "fi: binary returns 0");
+	}
+
+	unlink(hdr_path);
+	unlink(src_path);
+	unlink(exe_path);
+	unlink(stdout_path);
+	unlink(stderr_path);
+	unlink(prism_bin);
+	rmdir(dir);
+}
+
+/* Split `-I /path` must not be mistaken for a passthrough input file (that
+ * falsely clears -fpreprocessed in the single-TU pipe path). */
+static void test_cli_split_I_keeps_fpreprocessed(void) {
+	printf("\n--- CLI split -I keeps -fpreprocessed ---\n");
+
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_splitI_");
+	CHECK(dir != NULL, "splitI: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], src_path[PATH_MAX], exe_path[PATH_MAX];
+	char stdout_path[PATH_MAX], stderr_path[PATH_MAX];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	snprintf(src_path, sizeof(src_path), "%s/main.c", dir);
+	snprintf(exe_path, sizeof(exe_path), "%s/app", dir);
+	snprintf(stdout_path, sizeof(stdout_path), "%s/out.txt", dir);
+	snprintf(stderr_path, sizeof(stderr_path), "%s/err.txt", dir);
+
+	FILE *sf = fopen(src_path, "w");
+	CHECK(sf != NULL, "splitI: write source");
+	if (!sf) {
+		rmdir(dir);
+		return;
+	}
+	fputs("int main(void){ int x = 1 orelse return 1; return 0; }\n", sf);
+	fclose(sf);
+
+	if (!build_test_prism_binary(prism_bin, "splitI: build prism binary")) {
+		unlink(src_path);
+		rmdir(dir);
+		return;
+	}
+
+	char *argv[] = {prism_bin, "-v", "-I", "/usr/include", src_path, "-o", exe_path, NULL};
+	int st = run_exec_argv_capture(argv, stdout_path, stderr_path);
+	CHECK_EQ(st, 0, "splitI: compile with split -I succeeds");
+
+	char errbuf[16384] = {0};
+	FILE *ef = fopen(stderr_path, "r");
+	if (ef) {
+		fread(errbuf, 1, sizeof(errbuf) - 1, ef);
+		fclose(ef);
+	}
+	/* Flatten injects -fpreprocessed only for real GCC; Apple clang (and
+	 * /usr/bin/gcc→clang) must not get it. The regression under test is that
+	 * split `-I /path` must not *clear* that flag when it would have applied. */
+	int backend_is_clang = 0;
+	{
+		char ver_path[PATH_MAX];
+		snprintf(ver_path, sizeof(ver_path), "%s/ccver.txt", dir);
+		char *ver_argv[] = {(char *)(getenv("CC") && *getenv("CC") ? getenv("CC") : "cc"),
+				    "--version", NULL};
+		run_exec_argv_capture(ver_argv, ver_path, NULL);
+		char vbuf[1024] = {0};
+		FILE *vf = fopen(ver_path, "r");
+		if (vf) {
+			fread(vbuf, 1, sizeof(vbuf) - 1, vf);
+			fclose(vf);
+		}
+		backend_is_clang = strstr(vbuf, "clang") != NULL;
+		unlink(ver_path);
+	}
+	if (backend_is_clang) {
+		CHECK(strstr(errbuf, "-fpreprocessed") == NULL,
+		      "splitI: clang backend has no -fpreprocessed");
+	} else {
+		CHECK(strstr(errbuf, "-fpreprocessed") != NULL,
+		      "splitI: backend uses -fpreprocessed");
+	}
+	CHECK(strstr(errbuf, "-fno-preprocessed") == NULL,
+	      "splitI: backend must not clear -fpreprocessed");
+
+	unlink(src_path);
+	unlink(exe_path);
+	unlink(stdout_path);
+	unlink(stderr_path);
+	unlink(prism_bin);
+	rmdir(dir);
+}
+
+/* -Xpreprocessor -include FILE must compile Prism headers (strip on backend). */
+static void test_cli_xpreprocessor_include(void) {
+	printf("\n--- CLI -Xpreprocessor -include Prism header ---\n");
+
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_xpinc_");
+	CHECK(dir != NULL, "xpinc: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], hdr_path[PATH_MAX], src_path[PATH_MAX], exe_path[PATH_MAX];
+	char stdout_path[PATH_MAX], stderr_path[PATH_MAX];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	snprintf(hdr_path, sizeof(hdr_path), "%s/feat.h", dir);
+	snprintf(src_path, sizeof(src_path), "%s/main.c", dir);
+	snprintf(exe_path, sizeof(exe_path), "%s/app", dir);
+	snprintf(stdout_path, sizeof(stdout_path), "%s/out.txt", dir);
+	snprintf(stderr_path, sizeof(stderr_path), "%s/err.txt", dir);
+
+	FILE *hf = fopen(hdr_path, "w");
+	CHECK(hf != NULL, "xpinc: write header");
+	if (!hf) {
+		rmdir(dir);
+		return;
+	}
+	fputs("static inline int xp_clamp(int v){\n"
+	      "  int x = v orelse return 0;\n"
+	      "  return x;\n"
+	      "}\n",
+	      hf);
+	fclose(hf);
+
+	FILE *sf = fopen(src_path, "w");
+	CHECK(sf != NULL, "xpinc: write source");
+	if (!sf) {
+		unlink(hdr_path);
+		rmdir(dir);
+		return;
+	}
+	fputs("int main(void){ return xp_clamp(3)==3?0:1; }\n", sf);
+	fclose(sf);
+
+	if (!build_test_prism_binary(prism_bin, "xpinc: build prism binary")) {
+		unlink(hdr_path);
+		unlink(src_path);
+		rmdir(dir);
+		return;
+	}
+
+	char *argv[] = {prism_bin,
+			"-Xpreprocessor",
+			"-include",
+			"-Xpreprocessor",
+			hdr_path,
+			src_path,
+			"-o",
+			exe_path,
+			NULL};
+	int st = run_exec_argv_capture(argv, stdout_path, stderr_path);
+	CHECK_EQ(st, 0, "xpinc: -Xpreprocessor -include compiles");
+	if (st == 0) {
+		char *run_argv[] = {exe_path, NULL};
+		int rst = run_exec_argv_capture(run_argv, stdout_path, stderr_path);
+		CHECK_EQ(rst, 0, "xpinc: binary returns 0");
+	}
+
+	unlink(hdr_path);
+	unlink(src_path);
+	unlink(exe_path);
+	unlink(stdout_path);
+	unlink(stderr_path);
+	unlink(prism_bin);
+	rmdir(dir);
+}
+
+/* `.i` must be read as already-preprocessed — cc -E on .i yields empty output. */
+static void test_cli_dot_i_preserves_orelse(void) {
+	printf("\n--- CLI .i input preserves orelse/defer ---\n");
+
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_doti_");
+	CHECK(dir != NULL, "doti: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], src_path[PATH_MAX], i_path[PATH_MAX], exe_path[PATH_MAX];
+	char stdout_path[PATH_MAX], stderr_path[PATH_MAX];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	snprintf(src_path, sizeof(src_path), "%s/main.c", dir);
+	snprintf(i_path, sizeof(i_path), "%s/main.i", dir);
+	snprintf(exe_path, sizeof(exe_path), "%s/app", dir);
+	snprintf(stdout_path, sizeof(stdout_path), "%s/out.txt", dir);
+	snprintf(stderr_path, sizeof(stderr_path), "%s/err.txt", dir);
+
+	FILE *sf = fopen(src_path, "w");
+	CHECK(sf != NULL, "doti: write source");
+	if (!sf) {
+		rmdir(dir);
+		return;
+	}
+	fputs("int main(void){ int x = 7 orelse return 1; defer{(void)x;} return x==7?0:1; }\n", sf);
+	fclose(sf);
+
+	if (!build_test_prism_binary(prism_bin, "doti: build prism binary")) {
+		unlink(src_path);
+		rmdir(dir);
+		return;
+	}
+
+	char *eargv[] = {prism_bin, "-E", src_path, NULL};
+	int est = run_exec_argv_capture(eargv, i_path, stderr_path);
+	CHECK_EQ(est, 0, "doti: prism -E writes .i");
+	CHECK(file_size(i_path) > 0, "doti: .i non-empty");
+
+	char *argv[] = {prism_bin, i_path, "-o", exe_path, NULL};
+	int st = run_exec_argv_capture(argv, stdout_path, stderr_path);
+	CHECK_EQ(st, 0, "doti: compile .i with orelse succeeds");
+	if (st == 0) {
+		char *run_argv[] = {exe_path, NULL};
+		int rst = run_exec_argv_capture(run_argv, stdout_path, stderr_path);
+		CHECK_EQ(rst, 0, "doti: binary returns 0");
+	}
+
+	unlink(src_path);
+	unlink(i_path);
+	unlink(exe_path);
+	unlink(stdout_path);
+	unlink(stderr_path);
+	unlink(prism_bin);
+	rmdir(dir);
+}
+
+/* Bounds-check helper must compile under -std=c89 (no C99 inline/long long). */
+static void test_cli_std_c89_bounds_helper(void) {
+	printf("\n--- CLI -std=c89 with default bounds-check ---\n");
+
+	char tmpdir[PATH_MAX];
+	char *dir = test_mkdtemp(tmpdir, "prism_c89_");
+	CHECK(dir != NULL, "c89: create temp dir");
+	if (!dir) return;
+
+	char prism_bin[PATH_MAX], src_path[PATH_MAX], exe_path[PATH_MAX];
+	char stdout_path[PATH_MAX], stderr_path[PATH_MAX];
+	snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+	snprintf(src_path, sizeof(src_path), "%s/main.c", dir);
+	snprintf(exe_path, sizeof(exe_path), "%s/app", dir);
+	snprintf(stdout_path, sizeof(stdout_path), "%s/out.txt", dir);
+	snprintf(stderr_path, sizeof(stderr_path), "%s/err.txt", dir);
+
+	FILE *sf = fopen(src_path, "w");
+	CHECK(sf != NULL, "c89: write source");
+	if (!sf) {
+		rmdir(dir);
+		return;
+	}
+	fputs("int main(void){ int x = 1 orelse return 1; return 0; }\n", sf);
+	fclose(sf);
+
+	if (!build_test_prism_binary(prism_bin, "c89: build prism binary")) {
+		unlink(src_path);
+		rmdir(dir);
+		return;
+	}
+
+	char *argv[] = {prism_bin, "-std=c89", src_path, "-o", exe_path, NULL};
+	int st = run_exec_argv_capture(argv, stdout_path, stderr_path);
+	CHECK_EQ(st, 0, "c89: -std=c89 compiles with bounds helper");
+	if (st == 0) {
+		char *run_argv[] = {exe_path, NULL};
+		int rst = run_exec_argv_capture(run_argv, stdout_path, stderr_path);
+		CHECK_EQ(rst, 0, "c89: binary returns 0");
+	}
+
+	unlink(src_path);
+	unlink(exe_path);
 	unlink(stdout_path);
 	unlink(stderr_path);
 	unlink(prism_bin);
@@ -4656,6 +5389,52 @@ static void test_cli_parse_unit(void) {
 		CHECK_EQ(cli.source_count, 1, "cli: .c file → source");
 		CHECK(cli.cc_arg_count == 0, "cli: no cc_args for plain source");
 		cli_free(&cli);
+	}
+
+	// 1b. @file response expansion (sources inside rsp must be seen by Prism)
+	{
+		char rsp_path[PATH_MAX], src_path[PATH_MAX], out_path[PATH_MAX];
+		char tmpdir[PATH_MAX];
+		char *dir = test_mkdtemp(tmpdir, "prism_rsp_");
+		CHECK(dir != NULL, "cli rsp: mkdtemp");
+		if (dir) {
+			snprintf(src_path, sizeof(src_path), "%s/lib.c", dir);
+			snprintf(rsp_path, sizeof(rsp_path), "%s/args.rsp", dir);
+			snprintf(out_path, sizeof(out_path), "%s/app", dir);
+			FILE *f = fopen(src_path, "w");
+			CHECK(f != NULL, "cli rsp: write source");
+			if (f) {
+				fputs("int main(void){ int x = 1 orelse return 1; return 0; }\n", f);
+				fclose(f);
+			}
+			f = fopen(rsp_path, "w");
+			CHECK(f != NULL, "cli rsp: write rsp");
+			if (f) {
+				fprintf(f, "-O2\n%s\n-o\n%s\n", src_path, out_path);
+				fclose(f);
+			}
+			char at[PATH_MAX];
+			snprintf(at, sizeof(at), "@%s", rsp_path);
+			char *argv[] = {"prism", at, NULL};
+			Cli cli = cli_parse(2, argv);
+			CHECK_EQ(cli.source_count, 1, "cli rsp: .c inside @file is a source");
+			CHECK(cli.output && strcmp(cli.output, out_path) == 0, "cli rsp: -o from @file");
+			cli_free(&cli);
+
+			/* End-to-end: must transpile (not feed orelse to cc). */
+			char prism_bin[PATH_MAX];
+			snprintf(prism_bin, sizeof(prism_bin), "%s/prism", dir);
+			if (build_test_prism_binary(prism_bin, "cli rsp: build prism")) {
+				char *eargv[] = {prism_bin, at, NULL};
+				CHECK_EQ(run_exec_argv(eargv), 0, "cli rsp: @file with orelse links");
+				CHECK_EQ(run_exec_argv((char *[]){out_path, NULL}), 0, "cli rsp: binary runs");
+				unlink(prism_bin);
+			}
+			unlink(src_path);
+			unlink(rsp_path);
+			unlink(out_path);
+			rmdir(dir);
+		}
 	}
 
 	// 2. .i file is source
@@ -7957,7 +8736,14 @@ void run_api_tests_3(void) {
 	test_cli_dep_flags_routing();
 	test_cli_dep_flags_passthrough();
 	test_cli_mixed_c_cpp_driver();
+	test_cli_file_kind_driver_matrix();
+	test_cli_response_files();
 	test_preprocess_failure_no_stdout_dump();
+	test_cli_include_prism_header_not_reinjected();
+	test_cli_split_I_keeps_fpreprocessed();
+	test_cli_xpreprocessor_include();
+	test_cli_dot_i_preserves_orelse();
+	test_cli_std_c89_bounds_helper();
 	test_version_shows_backend_cc();
 	test_version_full_output_for_meson();
 	test_cli_split_D_flag_not_source();

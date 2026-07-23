@@ -5448,6 +5448,15 @@ typedef enum {
 	SK_CTX_BITFIELD,
 	SK_CTX_NESTED_SHADOW,
 	SK_CTX_FILE_STATIC,
+	SK_CTX_ENUM_TAG,
+	SK_CTX_STMT_EXPR,
+	SK_CTX_ASM_OPERAND,
+	SK_CTX_CASE_ENUM,
+	SK_CTX_C23_ATTR,
+	SK_CTX_TYPEOF_OPERAND,
+	SK_CTX_ATTR_NEAR,
+	SK_CTX_COMMA_DECL,
+	SK_CTX_INIT_DESIGNATOR_ARR,
 	SK_CTX_COUNT
 } SoftKwCtxId;
 
@@ -5458,7 +5467,9 @@ static const char *soft_kw_ctx_name(SoftKwCtxId c) {
 	    "param",         "func_def",      "func_ptr",    "field",
 	    "dot",           "arrow",         "designator",  "for_init",
 	    "sizeof_name",   "call",          "generic_assoc", "bitfield",
-	    "nested_shadow", "file_static",
+	    "nested_shadow", "file_static",   "enum_tag",    "stmt_expr",
+	    "asm_operand",   "case_enum",     "c23_attr",    "typeof_operand",
+	    "attr_near",     "comma_decl",    "init_desig_arr",
 	};
 	return names[c];
 }
@@ -5654,6 +5665,78 @@ static int soft_kw_build_ident_tu(char *buf, size_t buflen, const char *kw, Soft
 			     "int f(void) { return %s; }\n",
 			     kw, kw);
 		break;
+	case SK_CTX_ENUM_TAG:
+		n = snprintf(buf, buflen,
+			     "enum %s { A = 1 };\n"
+			     "int f(void) { return A; }\n",
+			     kw);
+		break;
+	case SK_CTX_STMT_EXPR:
+		n = snprintf(buf, buflen,
+			     "int f(void) {\n"
+			     "  return ({ int %s = 1; %s; });\n"
+			     "}\n",
+			     kw, kw);
+		break;
+	case SK_CTX_ASM_OPERAND:
+		n = snprintf(buf, buflen,
+			     "int f(void) {\n"
+			     "  int %s = 0;\n"
+			     "  __asm__(\"\" : \"=r\"(%s));\n"
+			     "  return %s;\n"
+			     "}\n",
+			     kw, kw, kw);
+		break;
+	case SK_CTX_CASE_ENUM:
+		n = snprintf(buf, buflen,
+			     "enum { %s = 3 };\n"
+			     "int f(int x) {\n"
+			     "  switch (x) { case %s: return 1; default: return 0; }\n"
+			     "}\n",
+			     kw, kw);
+		break;
+	case SK_CTX_C23_ATTR:
+		n = snprintf(buf, buflen,
+			     "int f(void) {\n"
+			     "  [[maybe_unused]] int %s;\n"
+			     "  return 0;\n"
+			     "}\n",
+			     kw);
+		break;
+	case SK_CTX_TYPEOF_OPERAND:
+		n = snprintf(buf, buflen,
+			     "int f(void) {\n"
+			     "  int %s = 1;\n"
+			     "  typeof(%s) x = %s;\n"
+			     "  return x;\n"
+			     "}\n",
+			     kw, kw, kw);
+		break;
+	case SK_CTX_ATTR_NEAR:
+		n = snprintf(buf, buflen,
+			     "int f(void) {\n"
+			     "  int %s __attribute__((unused));\n"
+			     "  return %s;\n"
+			     "}\n",
+			     kw, kw);
+		break;
+	case SK_CTX_COMMA_DECL:
+		n = snprintf(buf, buflen,
+			     "int f(void) {\n"
+			     "  int a, %s, b;\n"
+			     "  return a + %s + b;\n"
+			     "}\n",
+			     kw, kw);
+		break;
+	case SK_CTX_INIT_DESIGNATOR_ARR:
+		n = snprintf(buf, buflen,
+			     "int f(void) {\n"
+			     "  int %s = 1;\n"
+			     "  int a[3] = { [%s] = 2 };\n"
+			     "  return a[%s];\n"
+			     "}\n",
+			     kw, kw, kw);
+		break;
 	case SK_CTX_COUNT:
 		break;
 	}
@@ -5710,17 +5793,6 @@ static void test_soft_prism_keyword_context_matrix(void) {
 			}
 			snprintf(fname, sizeof(fname), "kwctx_%s_%s.c", kw, soft_kw_ctx_name(ctx));
 			PrismResult r = prism_transpile_source(src, fname, prism_defaults());
-			/* orelse in a bitfield width position is parsed as the orelse operator. */
-			int expect_reject =
-			    (ctx == SK_CTX_BITFIELD && strcmp(kw, "orelse") == 0);
-			if (expect_reject) {
-				CHECK(r.status != PRISM_OK, name);
-				if (r.status != PRISM_OK) matrix_ok++;
-				else
-					matrix_fail++;
-				prism_free(&r);
-				continue;
-			}
 			if (r.status != PRISM_OK) {
 				CHECK_EQ(r.status, PRISM_OK, name);
 				if (r.error_msg)
@@ -5976,21 +6048,46 @@ static void test_soft_prism_keyword_context_matrix(void) {
 		prism_free(&r);
 	});
 
-	/* Quirk lock: identifier named `asm` plus `goto` in the same function is
-	 * treated as GNU asm-goto, so defer is rejected. Keep visible so a future
-	 * heuristic fix flips this deliberately. */
+	/* asm soft-kw as identifier + goto + defer: previously false-positive
+	 * "asm goto" taint. With valid CFG (defer before goto) must accept. */
 	{
-		const char *quirk =
+		const char *ok =
 		    "int f(void) {\n"
 		    "  int asm;\n"
-		    "  if (asm) goto done;\n"
 		    "  defer asm = 1;\n"
+		    "  if (asm) goto done;\n"
 		    "done:\n"
 		    "  return asm;\n"
 		    "}\n";
-		PrismResult r = prism_transpile_source(quirk, "kw_asm_goto_quirk.c", prism_defaults());
-		CHECK(r.status != PRISM_OK,
-		      "kw quirk: asm-ident + goto + defer currently rejected");
+		PrismResult r = prism_transpile_source(ok, "kw_asm_ident_goto.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK,
+			 "kw: asm-ident + defer + goto (not asm-goto) accepted");
+		prism_free(&r);
+	}
+	/* Real asm goto + defer must still reject. */
+	{
+		const char *bad =
+		    "int f(void) {\n"
+		    "  defer (void)0;\n"
+		    "  if (0) asm goto(\"\" : : : : L);\n"
+		    "L:\n"
+		    "  return 0;\n"
+		    "}\n";
+		PrismResult r = prism_transpile_source(bad, "kw_asm_goto_real.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "kw: real asm goto + defer rejected");
+		prism_free(&r);
+	}
+
+	/* Bitfield field named orelse (was false-positive stmt-level reject). */
+	{
+		const char *bf =
+		    "struct S { int orelse : 3; };\n"
+		    "int f(void) { struct S s; s.orelse = 1; return s.orelse; }\n";
+		PrismResult r = prism_transpile_source(bf, "kw_orelse_bitfield.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "kw: orelse bitfield field name accepted");
+		if (r.status == PRISM_OK && r.output)
+			CHECK(soft_kw_spelling_preserved(r.output, "orelse"),
+			      "kw: orelse bitfield spelling preserved");
 		prism_free(&r);
 	}
 
@@ -6067,6 +6164,157 @@ static void test_soft_prism_keyword_context_matrix(void) {
 			prism_free(&r);
 		}
 	});
+
+	/* --- Pedantic expansion: alternate soft-kw spellings as identifiers --- */
+	printf("\n--- Soft-kw spelling variants as identifiers ---\n");
+	{
+		static const struct {
+			const char *spell;
+			SoftKwCtxId ctx;
+		} variants[] = {
+		    {"_Alignas", SK_CTX_LOCAL_VAR},
+		    {"_Alignof", SK_CTX_LOCAL_VAR},
+		    {"_Static_assert", SK_CTX_LOCAL_VAR},
+		    {"_Noreturn", SK_CTX_LOCAL_VAR},
+		    {"_Thread_local", SK_CTX_LOCAL_VAR},
+		    {"_Bool", SK_CTX_LOCAL_VAR},
+		    {"__asm__", SK_CTX_LOCAL_VAR},
+		    {"__typeof__", SK_CTX_LOCAL_VAR},
+		    {"__typeof", SK_CTX_TYPEDEF},
+		    {"_Alignas", SK_CTX_PARAM},
+		    {"_Bool", SK_CTX_FIELD},
+		    {"__asm__", SK_CTX_LABEL},
+		    {"_Static_assert", SK_CTX_ENUM_MEMBER},
+		};
+		for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
+			if (soft_kw_build_ident_tu(src, sizeof(src), variants[i].spell,
+						   variants[i].ctx) != 0)
+				continue;
+			snprintf(name, sizeof(name), "kw×spell: %s as %s", variants[i].spell,
+				 soft_kw_ctx_name(variants[i].ctx));
+			snprintf(fname, sizeof(fname), "kwspell_%zu.c", i);
+			PrismResult r = prism_transpile_source(src, fname, prism_defaults());
+			CHECK_EQ(r.status, PRISM_OK, name);
+			if (r.status == PRISM_OK && r.output)
+				CHECK(soft_kw_spelling_preserved(r.output, variants[i].spell),
+				      name);
+			else if (r.error_msg)
+				printf("         error: %s\n", r.error_msg);
+			prism_free(&r);
+		}
+	}
+
+	/* --- Prism keyword *use* roles (operators / prefixes, not idents) --- */
+	printf("\n--- Prism keyword-use roles ---\n");
+	{
+		static const struct {
+			const char *code;
+			const char *label;
+			int want_ok;
+			unsigned need; /* 1=orelse lowered, 2=defer lowered, 4=raw stripped */
+		} uses[] = {
+		    {"int g(void); int f(void){ int x = g() orelse 0; return x; }\n",
+		     "orelse decl-init", 1, 1},
+		    {"int g(void); int f(void){ int x; x = g() orelse 0; return x; }\n",
+		     "orelse assign", 1, 1},
+		    {"int g(void); int f(void){ int a[g() orelse 1]; (void)a; return 0; }\n",
+		     "orelse bracket dim", 1, 1},
+		    {"int g(void); int f(void){ g() orelse return -1; return 0; }\n",
+		     "orelse return-action", 1, 1},
+		    {"int g(void); int f(void){ g() orelse goto done; done: return 0; }\n",
+		     "orelse goto-action", 1, 1},
+		    {"int g(void); void f(void){ for(;;) g() orelse break; }\n",
+		     "orelse break-action", 1, 1},
+		    {"int g(void); void f(void){ for(;;) g() orelse continue; }\n",
+		     "orelse continue-action", 1, 1},
+		    {"int g(void); int f(void){ int x; x = (((g()))) orelse 0; return x; }\n",
+		     "orelse deep-paren", 1, 1},
+		    {"int g(void); int f(void){ int x; x = ({ g(); }) orelse 0; return x; }\n",
+		     "orelse stmt-expr lhs", 1, 1},
+		    {"int g(void); int f(void){ defer g(); return 0; }\n", "defer expr", 1, 2},
+		    {"int g(void); int f(void){ defer { g(); } return 0; }\n", "defer block", 1, 2},
+		    {"int g(void); int f(void){ L: defer g(); return 0; }\n",
+		     "defer after label", 1, 2},
+		    {"int f(void){ raw int x; return 0; }\n", "raw scalar", 1, 4},
+		    {"int f(void){ raw int *p; return 0; }\n", "raw ptr", 1, 4},
+		    {"int f(void){ raw int a[2]; return 0; }\n", "raw array", 1, 4},
+		    {"int f(void){ raw struct { int a; } s; return 0; }\n", "raw anon struct", 1, 4},
+		    /* Rejects */
+		    {"int g(void); void f(void){ if (g() orelse 0){} }\n", "orelse in if-cond", 0, 0},
+		    {"int g(void); int f(void){ int x = _Generic(0, int: g() orelse 1, default: 0); "
+		     "return x; }\n",
+		     "orelse in _Generic", 0, 0},
+		    {"int g(void); int f(void){ int x; x = (g(), g() orelse 0); return x; }\n",
+		     "orelse in comma RHS", 0, 0},
+		    {"int g(void); int f(int c){ int x; x = c ? g() orelse 0 : 1; return x; }\n",
+		     "orelse in ternary true", 0, 0},
+		};
+		for (size_t i = 0; i < sizeof(uses) / sizeof(uses[0]); i++) {
+			snprintf(name, sizeof(name), "kw-use: %s", uses[i].label);
+			PrismResult r =
+			    prism_transpile_source(uses[i].code, "kwuse.c", prism_defaults());
+			if (uses[i].want_ok) {
+				CHECK_EQ(r.status, PRISM_OK, name);
+				if (r.status == PRISM_OK && r.output) {
+					if (uses[i].need & 1)
+						CHECK(strstr(r.output, " orelse ") == NULL, name);
+					if (uses[i].need & 2)
+						CHECK(!soft_kw_spelling_preserved(r.output, "defer"),
+						      name);
+					if (uses[i].need & 4)
+						CHECK(strstr(r.output, "raw ") == NULL, name);
+				}
+			} else {
+				CHECK(r.status != PRISM_OK, name);
+			}
+			prism_free(&r);
+		}
+	}
+
+	/* --- Feature-off: prism keywords become plain identifiers / passthrough --- */
+	printf("\n--- Prism feature-off × keyword ---\n");
+	{
+		static const struct {
+			const char *code;
+			const char *label;
+			int off_orelse;
+			int off_defer;
+			int expect_oe_leak;
+			int expect_df_leak;
+		} offs[] = {
+		    {"int f(void){ int z=0; int y=z orelse 3; return y; }\n", "orelse off passthru",
+		     1, 0, 1, 0},
+		    {"int f(void){ defer (void)0; return 0; }\n", "defer off passthru", 0, 1, 0, 1},
+		    {"int f(void){ int z=0; int y=z orelse 3; defer (void)0; return y; }\n",
+		     "both off passthru", 1, 1, 1, 1},
+		    {"int f(void){ int z=0; int y=z orelse 3; defer (void)0; return y; }\n",
+		     "both on lowered", 0, 0, 0, 0},
+		};
+		for (size_t i = 0; i < sizeof(offs) / sizeof(offs[0]); i++) {
+			PrismFeatures feat = prism_defaults();
+			if (offs[i].off_orelse) feat.orelse = false;
+			if (offs[i].off_defer) feat.defer = false;
+			snprintf(name, sizeof(name), "kw feat-off: %s", offs[i].label);
+			PrismResult r =
+			    prism_transpile_source(offs[i].code, "kwfeat.c", feat);
+			CHECK_EQ(r.status, PRISM_OK, name);
+			if (r.status == PRISM_OK && r.output) {
+				int oe = soft_kw_spelling_preserved(r.output, "orelse");
+				int df = soft_kw_spelling_preserved(r.output, "defer");
+				/* When orelse is on, operator form must not remain as keyword
+				 * token between spaces; when off, spelling must survive. */
+				if (offs[i].expect_oe_leak)
+					CHECK(oe, name);
+				else if (!offs[i].off_orelse)
+					CHECK(strstr(r.output, " orelse ") == NULL, name);
+				if (offs[i].expect_df_leak)
+					CHECK(df, name);
+				else if (!offs[i].off_defer)
+					CHECK(!df, name);
+			}
+			prism_free(&r);
+		}
+	}
 }
 
 #if __STDC_VERSION__ >= 202311L

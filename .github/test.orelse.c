@@ -8715,6 +8715,106 @@ static void test_ctrl_orelse_product_matrix(void) {
 		}
 	}
 
+	/* Pedantic: actions, nesting, GNU/C11 edges, defer cross. */
+	printf("\n--- Ctrl×orelse pedantic edges ---\n");
+	{
+		static const struct {
+			const char *code;
+			const char *label;
+			int want_ok;
+		} edges[] = {
+		    /* Actions */
+		    {"int g(void); int f(void){ g() orelse goto done; done: return 0; }\n",
+		     "action goto", 1},
+		    {"int g(void); void f(void){ for(;;) g() orelse continue; }\n",
+		     "action continue", 1},
+		    {"int g(void); void f(void){ for(;;) g() orelse break; }\n", "action break", 1},
+		    {"int g(void); int f(void){ g() orelse return -1; return 0; }\n",
+		     "action return", 1},
+		    /* else if / chains */
+		    {"int g(void); void f(int c){ if (c); else if (c) g() orelse return; }\n",
+		     "else if body", 1},
+		    {"int g(void); void f(int c){ if (c) g() orelse return; else g() orelse return; }\n",
+		     "if/else both orelse", 1},
+		    /* Paren / stmt-expr / assign */
+		    {"int g(void); int f(void){ int x; x = (((g()))) orelse 0; return x; }\n",
+		     "deep paren assign", 1},
+		    {"int g(void); int f(void){ int x; x = ({ g(); }) orelse 0; return x; }\n",
+		     "stmt-expr lhs", 1},
+		    {"int g(void); void f(int c){ int x; if (c) (x = g() orelse 0); }\n",
+		     "paren assign body reject", 0},
+		    /* Ternary depth */
+		    {"int g(void); int f(int c){ int x; x = c ? (c ? 1 : g() orelse 0) : 2; return x; }\n",
+		     "nested tern inner orelse", 0},
+		    {"int g(void); int f(int c){ int x; x = (c ? g() : 1) orelse 0; return x; }\n",
+		     "closed nested tern then orelse", 1},
+		    /* _Generic / comma reject */
+		    {"int g(void); int f(void){ int x = _Generic(0, int: g() orelse 1, default: 0); "
+		     "return x; }\n",
+		     "_Generic assoc", 0},
+		    {"int g(void); int f(void){ int x; x = (g(), g() orelse 0); return x; }\n",
+		     "comma expr", 0},
+		    /* C23 if init (already covered) + switch init */
+		    {"int g(void); void f(void){ if (int x = g() orelse 0; x) {} }\n",
+		     "c23 if-init orelse", 0},
+		    {"int g(void); void f(void){ switch (int x = g() orelse 0; x) { default: break; } }\n",
+		     "c23 switch-init orelse", 0},
+		    /* Defer × orelse */
+		    {"int g(void); int f(void){ defer { int x = g() orelse 0; (void)x; } return 0; }\n",
+		     "orelse in defer body", 1},
+		    {"int g(void); int f(void){ defer g(); int x = g() orelse 0; return x; }\n",
+		     "defer then orelse", 1},
+		    /* GNU attr near orelse */
+		    {"int g(void); void f(int c){ if (c) { __attribute__((unused)) int x = g() orelse "
+		     "0; (void)x; } }\n",
+		     "gnu attr decl orelse", 1},
+		    /* zeroinit off × orelse decl */
+		    {"int g(void); int f(void){ int x = g() orelse 0; return x; }\n",
+		     "orelse decl defaults", 1},
+		    /* More nesting / forms */
+		    {"int g(void); void f(int c){ while (c) { if (c) g() orelse break; } }\n",
+		     "nested while/if orelse break", 1},
+		    {"int g(void); void f(int c){ switch (c) { case 1: g() orelse break; default: "
+		     "break; } }\n",
+		     "switch case orelse break", 1},
+		    {"int g(void); int f(void){ int x; x = (g() orelse 0) + 1; return x; }\n",
+		     "orelse in paren then binop", 0},
+		    {"int g(void); int f(void){ return g() orelse 0; }\n",
+		     "return value-fallback no-assign", 0},
+		};
+		for (size_t i = 0; i < sizeof(edges) / sizeof(edges[0]); i++) {
+			PrismFeatures feat = prism_defaults();
+			snprintf(name, sizeof(name), "ctrl×oe edge: %s", edges[i].label);
+			PrismResult r =
+			    prism_transpile_source(edges[i].code, "oeedge.c", feat);
+			if (edges[i].want_ok) {
+				CHECK_EQ(r.status, PRISM_OK, name);
+				if (r.status == PRISM_OK)
+					CHECK(!oe_output_has_orelse_kw(r.output), name);
+			} else {
+				CHECK(r.status != PRISM_OK, name);
+			}
+			prism_free(&r);
+		}
+		/* Explicit zeroinit-off variant of orelse-in-defer. */
+		{
+			PrismFeatures f = prism_defaults();
+			f.zeroinit = false;
+			const char *code =
+			    "int g(void); int f(void){ defer { int t = g() orelse 0; (void)t; } "
+			    "return 0; }\n";
+			PrismResult r = prism_transpile_source(code, "oezi.c", f);
+			CHECK_EQ(r.status, PRISM_OK, "ctrl×oe edge: orelse-in-defer zi-off");
+			if (r.status == PRISM_OK) {
+				CHECK(!oe_output_has_orelse_kw(r.output),
+				      "ctrl×oe edge: orelse-in-defer zi-off no-leak");
+				CHECK(strstr(r.output, "__typeof__(int t)") == NULL,
+				      "ctrl×oe edge: orelse-in-defer zi-off no bad typeof");
+			}
+			prism_free(&r);
+		}
+	}
+
 	printf("--- ctrl×oe matrix summary: %d ok, %d fail, %d skipped ---\n", ok, fail, skipped);
 }
 

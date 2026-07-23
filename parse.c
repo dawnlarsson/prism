@@ -246,6 +246,7 @@ typedef struct {
 	bool owns_contents;
 	bool is_system;
 	bool is_include_entry; // True if inside a system #include chain (not just macro expansion)
+	bool is_direct_system_include; // Entered from non-system (re-emit as #include)
 } File;
 
 typedef enum {
@@ -1504,6 +1505,7 @@ new_file_view(const char *name, File *base, int line_delta, bool is_system, bool
 	file->line_delta = line_delta;
 	file->is_system = is_system;
 	file->is_include_entry = is_include_entry;
+	file->is_direct_system_include = false;
 	add_input_file(file);
 	return file;
 }
@@ -1567,6 +1569,9 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
 		while (*p == ' ' || *p == '\t') p++;
 	}
 
+	/* Direct system include = first entry into a system file from user code.
+	 * Nested system headers (bits/…) must not be re-emitted as #include. */
+	bool direct_system = is_entering && is_system && !*in_system_include;
 	if (is_entering && is_system) *in_system_include = true;
 	else if (is_returning && !is_system)
 		*in_system_include = false;
@@ -1587,6 +1592,7 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
 		    strncmp(f, "/Library/", 9) == 0 || strncmp(f, "/Applications/Xcode", 19) == 0 ||
 		    (strstr(f, "/lib/gcc/") && strstr(f, "/include/")) || strstr(f, "Windows Kits") ||
 		    strstr(f, "Program Files")) {
+			direct_system = !*in_system_include;
 			is_system = true;
 			*in_system_include = true;
 		} else if (*f == '/' || *f == '.' || (f[0] && f[1] == ':')) {
@@ -1599,6 +1605,7 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
 			     line_delta,
 			     is_system,
 			     *in_system_include);
+	view->is_direct_system_include = direct_system;
 	ctx->current_file = view;
 	free(filename);
 	while (*p && *p != '\n') p++;
@@ -1863,13 +1870,36 @@ static Token *tokenize(File *file) {
 								t->tag |= TT_SPECIAL_FN;
 						}
 						if (b->tag & TT_ASM) {
+							/* GNU `asm [qualifiers] goto (` — require
+							 * `goto` before the asm operand `(`, and
+							 * only allow asm-header tokens in between.
+							 * Stop on any other token so soft-kw
+							 * identifier uses like `if (asm) goto L`
+							 * are not mistaken for asm-goto. */
+							bool saw_goto = false;
 							for (Token *ag = tok_next(b);
-							     ag && ag != end && ag->ch0 != '(';
-							     ag = tok_next(ag))
-								if (ag->tag & TT_GOTO) {
-									t->tag |= TT_ASM;
+							     ag && ag != end;
+							     ag = tok_next(ag)) {
+								if (ag->ch0 == '(') {
+									if (saw_goto) t->tag |= TT_ASM;
 									break;
 								}
+								if (ag->tag & TT_GOTO) {
+									saw_goto = true;
+									continue;
+								}
+								/* asm volatile/inline/goto attrs */
+								if (ag->tag &
+								    (TT_QUALIFIER | TT_INLINE | TT_ATTR))
+									continue;
+								if (ag->flags & TF_SOFT_KW) continue;
+								if ((ag->flags & TF_C23_ATTR) &&
+								    tok_match(ag)) {
+									ag = tok_match(ag);
+									continue;
+								}
+								break;
+							}
 						}
 					}
 					if (func_name) {
@@ -3340,7 +3370,28 @@ static void scan_paren_for_vla(Token *open, Token *end, TypeSpecResult *r, bool 
 			continue;
 		}
 		// Ban control-flow keywords inside type specifier parens.
-		if (t->tag & (TT_GOTO | TT_RETURN | TT_BREAK | TT_CONTINUE | TT_DEFER)) {
+		// `defer` as an *identifier* (e.g. `typeof(defer)` after
+		// `int defer;`) must not trip this — only block-form
+		// `defer { ... }` is a real control-flow use here.
+		if (t->tag & (TT_GOTO | TT_RETURN | TT_BREAK | TT_CONTINUE)) {
+			if (FEAT(F_WARN_SAFETY))
+				warn_tok(t,
+					 "control flow keywords inside type "
+					 "specifiers (typeof() / _Atomic()) may "
+					 "corrupt control-flow tracking");
+			else
+				error_tok(t,
+					  "control flow keywords are not "
+					  "allowed inside type specifiers "
+					  "(typeof() / _Atomic()); transpiler "
+					  "rewrites may duplicate the type "
+					  "specifier, which would corrupt "
+					  "control-flow tracking");
+		} else if ((t->tag & TT_DEFER) && !typedef_lookup(t) && tok_next(t) &&
+			   (match_ch(tok_next(t), '{') || is_identifier_like(tok_next(t)))) {
+			/* Statement form `defer cleanup();` and block form `defer {`
+			 * are keyword uses; a bare/operator-adjacent `defer` (e.g.
+			 * `typeof(defer)`, `defer + 1`) stays an identifier. */
 			if (FEAT(F_WARN_SAFETY))
 				warn_tok(t,
 					 "control flow keywords inside type "

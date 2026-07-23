@@ -7073,6 +7073,266 @@ static void test_defer_calling_conv_ret_type(void) {
 	}
 }
 
+/* #7 Defer exit × scope depth — semantic CHECK_LOG product (not snapshots).
+ * Nested scopes use letters A (outer) … C (inner); body marker is "1";
+ * post-exit marker is "2" when control resumes outside. LIFO on exit. */
+typedef enum {
+	DX_END = 0,
+	DX_RETURN,
+	DX_GOTO,
+	DX_BREAK,
+	DX_CONTINUE,
+	DX_SWBREAK,
+	DX_N
+} DxExit;
+
+static const char *dx_exit_tag(DxExit e) {
+	static const char *tags[] = {"end", "return", "goto", "break", "continue",
+				     "swbreak"};
+	return tags[e];
+}
+
+static int dx_ret_d1(void) {
+	defer log_append("A");
+	log_append("1");
+	return 1;
+}
+static int dx_ret_d2(void) {
+	defer log_append("A");
+	{
+		defer log_append("B");
+		log_append("1");
+		return 1;
+	}
+}
+static int dx_ret_d3(void) {
+	defer log_append("A");
+	{
+		defer log_append("B");
+		{
+			defer log_append("C");
+			log_append("1");
+			return 1;
+		}
+	}
+}
+
+static void dx_run_depth(int depth, DxExit ex) {
+	switch (ex) {
+	case DX_END:
+		if (depth == 1) {
+			defer log_append("A");
+			log_append("1");
+		} else if (depth == 2) {
+			defer log_append("A");
+			{
+				defer log_append("B");
+				log_append("1");
+			}
+		} else {
+			defer log_append("A");
+			{
+				defer log_append("B");
+				{
+					defer log_append("C");
+					log_append("1");
+				}
+			}
+		}
+		break;
+	case DX_RETURN:
+		if (depth == 1)
+			(void)dx_ret_d1();
+		else if (depth == 2)
+			(void)dx_ret_d2();
+		else
+			(void)dx_ret_d3();
+		break;
+	case DX_GOTO:
+		if (depth == 1) {
+			{
+				defer log_append("A");
+				log_append("1");
+				goto dx_g1;
+			}
+		dx_g1:
+			log_append("2");
+		} else if (depth == 2) {
+			{
+				defer log_append("A");
+				{
+					defer log_append("B");
+					log_append("1");
+					goto dx_g2;
+				}
+			}
+		dx_g2:
+			log_append("2");
+		} else {
+			{
+				defer log_append("A");
+				{
+					defer log_append("B");
+					{
+						defer log_append("C");
+						log_append("1");
+						goto dx_g3;
+					}
+				}
+			}
+		dx_g3:
+			log_append("2");
+		}
+		break;
+	case DX_BREAK:
+		if (depth == 1) {
+			for (;;) {
+				defer log_append("A");
+				log_append("1");
+				break;
+			}
+			log_append("2");
+		} else if (depth == 2) {
+			{
+				defer log_append("A");
+				for (;;) {
+					defer log_append("B");
+					log_append("1");
+					break;
+				}
+				log_append("2");
+			}
+		} else {
+			{
+				defer log_append("A");
+				{
+					defer log_append("B");
+					for (;;) {
+						defer log_append("C");
+						log_append("1");
+						break;
+					}
+					log_append("2");
+				}
+			}
+		}
+		break;
+	case DX_CONTINUE:
+		/* Two iterations: first continues (fires defer), second runs body X. */
+		if (depth == 1) {
+			for (int i = 0; i < 2; i++) {
+				defer log_append("A");
+				log_append("1");
+				if (i == 0)
+					continue;
+				log_append("X");
+			}
+			log_append("2");
+		} else if (depth == 2) {
+			{
+				defer log_append("A");
+				for (int i = 0; i < 2; i++) {
+					defer log_append("B");
+					log_append("1");
+					if (i == 0)
+						continue;
+					log_append("X");
+				}
+				log_append("2");
+			}
+		} else {
+			{
+				defer log_append("A");
+				{
+					defer log_append("B");
+					for (int i = 0; i < 2; i++) {
+						defer log_append("C");
+						log_append("1");
+						if (i == 0)
+							continue;
+						log_append("X");
+					}
+					log_append("2");
+				}
+			}
+		}
+		break;
+	case DX_SWBREAK:
+		if (depth == 1) {
+			switch (1) {
+			default: {
+				defer log_append("A");
+				log_append("1");
+				break;
+			}
+			}
+			log_append("2");
+		} else if (depth == 2) {
+			{
+				defer log_append("A");
+				switch (1) {
+				default: {
+					defer log_append("B");
+					log_append("1");
+					break;
+				}
+				}
+				log_append("2");
+			}
+		} else {
+			{
+				defer log_append("A");
+				{
+					defer log_append("B");
+					switch (1) {
+					default: {
+						defer log_append("C");
+						log_append("1");
+						break;
+					}
+					}
+					log_append("2");
+				}
+			}
+		}
+		break;
+	case DX_N:
+		break;
+	}
+}
+
+static void test_defer_exit_scope_depth_matrix(void) {
+	printf("\n--- defer exit × scope depth matrix ---\n");
+	/* expected[depth-1][exit]: end, return, goto, break, continue, swbreak
+	 * break/continue/swbreak: loop/switch exits fire inner defer(s), then
+	 * marker "2", then remaining outer defer(s). */
+	static const char *expect[3][DX_N] = {
+	    {"1A", "1A", "1A2", "1A2", "1A1XA2", "1A2"},
+	    {"1BA", "1BA", "1BA2", "1B2A", "1B1XB2A", "1B2A"},
+	    {"1CBA", "1CBA", "1CBA2", "1C2BA", "1C1XC2BA", "1C2BA"},
+	};
+
+	int ok = 0, fail = 0;
+	for (int d = 1; d <= 3; d++) {
+		for (DxExit ex = DX_END; ex < DX_N; ex++) {
+			const char *want = expect[d - 1][ex];
+			char name[80];
+			snprintf(name, sizeof(name), "defer exit×depth d=%d %s", d,
+				 dx_exit_tag(ex));
+			log_reset();
+			dx_run_depth(d, ex);
+			int before = failed;
+			CHECK_LOG(want, name);
+			if (failed == before)
+				ok++;
+			else
+				fail++;
+		}
+	}
+	printf("--- defer exit×depth summary: %d ok, %d fail (3×%d) ---\n", ok, fail,
+	       (int)DX_N);
+}
+
 void run_defer_tests(void) {
 	printf("\n=== DEFER TESTS ===\n");
         test_defer_in_comma_expr_rejected();
@@ -7097,6 +7357,7 @@ void run_defer_tests(void) {
 	ret = test_defer_nested_return();
 	CHECK_LOG("R321", "defer nested return");
 	CHECK_EQ(ret, 99, "defer nested return value");
+	test_defer_exit_scope_depth_matrix();
 	test_defer_compound_stmt();
 	test_defer_zeroinit_inside();
 	test_defer_zeroinit_struct_inside();

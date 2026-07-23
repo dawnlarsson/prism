@@ -5521,6 +5521,16 @@ typedef enum {
 	DS_MULTI_ARR,
 	DS_PTR_TO_ARR,
 	DS_VOLATILE_SCALAR,
+	DS_REGISTER_SCALAR,
+	DS_CONST_SCALAR,
+	DS_ATOMIC_SCALAR,
+	DS_BITINT,
+	DS_COMPLEX,
+	DS_TYPEOF_INT,
+	DS_PTR_TO_VLA,
+	DS_BITFIELD_STRUCT,
+	DS_EXTERN_SCALAR,
+	DS_RESTRICT_PTR,
 	DS_COUNT
 } DeclShapeId;
 
@@ -5538,6 +5548,8 @@ static const char *decl_shape_name(DeclShapeId s) {
 	    "scalar",	    "ptr",	   "array",	  "struct",	   "union",
 	    "vla",	    "fn_ptr",	   "paren_scalar", "typedef_scalar", "typedef_agg",
 	    "anon_struct",  "multi_arr",   "ptr_to_arr",  "volatile_scalar",
+	    "register_scalar", "const_scalar", "atomic_scalar", "bitint", "complex",
+	    "typeof_int", "ptr_to_vla", "bitfield_struct", "extern_scalar", "restrict_ptr",
 	};
 	return n[s];
 }
@@ -5648,6 +5660,66 @@ static int zi_build_decl(char *buf,
 		else
 			n = snprintf(buf, buflen, "%s%svolatile int %s;", st, raw, var);
 		break;
+	case DS_REGISTER_SCALAR:
+		if (is_static) return -1; /* register + static invalid */
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%sregister int %s = 5;", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%sregister int %s;", st, raw, var);
+		break;
+	case DS_CONST_SCALAR:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%sconst int %s = 5;", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%sconst int %s;", st, raw, var);
+		break;
+	case DS_ATOMIC_SCALAR:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%s_Atomic int %s = 5;", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%s_Atomic int %s;", st, raw, var);
+		break;
+	case DS_BITINT:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%s_BitInt(32) %s = 5;", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%s_BitInt(32) %s;", st, raw, var);
+		break;
+	case DS_COMPLEX:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%s_Complex double %s = 5;", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%s_Complex double %s;", st, raw, var);
+		break;
+	case DS_TYPEOF_INT:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%stypeof(int) %s = 5;", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%stypeof(int) %s;", st, raw, var);
+		break;
+	case DS_PTR_TO_VLA:
+		if (is_static || with_init) return -1;
+		n = snprintf(buf, buflen, "%s%sint (*%s)[n];", st, raw, var);
+		break;
+	case DS_BITFIELD_STRUCT:
+		/* Aggregate with bitfields — zero via = {0}. */
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%sstruct { int a : 3; } %s = {1};", st, raw,
+				     var);
+		else
+			n = snprintf(buf, buflen, "%s%sstruct { int a : 3; } %s;", st, raw, var);
+		break;
+	case DS_EXTERN_SCALAR:
+		/* extern has no auto zeroinit (storage elsewhere). */
+		if (is_static || with_init) return -1;
+		n = snprintf(buf, buflen, "%sextern int %s;", raw, var);
+		break;
+	case DS_RESTRICT_PTR:
+		if (with_init)
+			n = snprintf(buf, buflen, "%s%sint *restrict %s = (int *)1;", st, raw, var);
+		else
+			n = snprintf(buf, buflen, "%s%sint *restrict %s;", st, raw, var);
+		break;
 	case DS_COUNT:
 		break;
 	}
@@ -5664,16 +5736,30 @@ static ZiExpect zi_expected(DeclShapeId s, ZiRawMode m) {
 	case DS_PAREN_SCALAR:
 	case DS_PTR_TO_ARR:
 	case DS_VOLATILE_SCALAR:
+	case DS_REGISTER_SCALAR:
+	case DS_CONST_SCALAR:
+	case DS_ATOMIC_SCALAR:
+	case DS_BITINT:
+	case DS_COMPLEX:
+	case DS_PTR_TO_VLA:
+	case DS_RESTRICT_PTR:
 		return ZI_EQ0;
+	case DS_EXTERN_SCALAR:
+		return ZI_NONE;
 	case DS_ARRAY:
 	case DS_STRUCT:
 	case DS_TYPEDEF_SCALAR: /* typedef-to-scalar still gets = {0} */
 	case DS_TYPEDEF_AGG:
 	case DS_ANON_STRUCT:
 	case DS_MULTI_ARR:
+	case DS_BITFIELD_STRUCT:
 		return ZI_BRACE0;
 	case DS_UNION:
 	case DS_VLA:
+		return ZI_MEMSET;
+	case DS_TYPEOF_INT:
+		/* typeof(int) currently memsets rather than `= 0` (SPEC: typeof
+		 * always takes the memset recipe so operand analysis stays shallow). */
 		return ZI_MEMSET;
 	case DS_COUNT:
 		break;
@@ -5777,7 +5863,9 @@ static void test_decl_shape_zeroinit_raw_matrix(void) {
 			    0)
 				continue; /* inapplicable combo */
 
-			const char *fn_hdr = (shape == DS_VLA) ? "void f(int n)" : "void f(void)";
+			const char *fn_hdr =
+			    (shape == DS_VLA || shape == DS_PTR_TO_VLA) ? "void f(int n)"
+								       : "void f(void)";
 			snprintf(src, sizeof(src),
 				 "%s%s {\n"
 				 "  %s\n"
@@ -5948,6 +6036,56 @@ static void test_decl_shape_zeroinit_raw_matrix(void) {
 			prism_free(&r);
 		}
 	});
+
+	/* Pedantic: scope × scalar zeroinit (and raw / feature-off). */
+	printf("\n--- Decl scope × zeroinit ---\n");
+	{
+		static const struct {
+			const char *tag;
+			const char *tu; /* must declare `x` somewhere observable */
+			ZiExpect expect;
+			int want_ok;
+		} scopes[] = {
+		    {"func_body", "void f(void){ int x; (void)x; }\n", ZI_EQ0, 1},
+		    {"for_init", "void f(void){ for(int x;;){ (void)x; break; } }\n", ZI_EQ0, 1},
+		    {"stmt_expr", "void f(void){ int y = ({ int x; x; }); (void)y; }\n", ZI_EQ0, 1},
+		    {"defer_body", "void f(void){ defer { int x; (void)x; } }\n", ZI_EQ0, 1},
+		    {"file_scope", "int x; void f(void){ (void)x; }\n", ZI_NONE, 1},
+		    /* Safety: unbraced switch decl rejects by default. */
+		    {"switch_unbraced",
+		     "void f(int c){ switch(c){ int x; case 0: (void)x; break; } }\n", ZI_NONE, 0},
+		};
+		for (size_t i = 0; i < sizeof(scopes) / sizeof(scopes[0]); i++) {
+			snprintf(name, sizeof(name), "zi×scope: %s", scopes[i].tag);
+			PrismResult r =
+			    prism_transpile_source(scopes[i].tu, "ziscope.c", prism_defaults());
+			if (scopes[i].want_ok) {
+				CHECK_EQ(r.status, PRISM_OK, name);
+				if (r.status == PRISM_OK && r.output) {
+					ZiExpect got = zi_observe(r.output, "x");
+					snprintf(name, sizeof(name), "zi×scope expect: %s",
+						 scopes[i].tag);
+					CHECK(got == scopes[i].expect, name);
+				}
+			} else {
+				CHECK(r.status != PRISM_OK, name);
+			}
+			prism_free(&r);
+		}
+		/* Same switch unbraced under -fno-safety must accept + zero. */
+		{
+			PrismFeatures f = prism_defaults();
+			f.warn_safety = true;
+			const char *code =
+			    "void f(int c){ switch(c){ int x; case 0: (void)x; break; } }\n";
+			PrismResult r = prism_transpile_source(code, "zisw.c", f);
+			CHECK_EQ(r.status, PRISM_OK, "zi×scope: switch_unbraced nosafety");
+			if (r.status == PRISM_OK && r.output)
+				CHECK(zi_observe(r.output, "x") == ZI_EQ0,
+				      "zi×scope: switch_unbraced nosafety zeros");
+			prism_free(&r);
+		}
+	}
 
 	printf("--- zi×shape matrix summary: %d ok, %d fail ---\n", ok, fail);
 }

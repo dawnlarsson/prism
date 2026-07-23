@@ -2140,6 +2140,57 @@ static void test_bounds_check_emit_statements_paths(void) {
 	}
 }
 
+#ifndef _WIN32
+/* #8 Selective bounds compile-run oracles — shape-critical traps/ok exits. */
+static void test_bounds_selective_runtime_oracles(void) {
+	printf("\n--- bounds selective runtime oracles ---\n");
+	static const struct {
+		const char *tag;
+		int expect_exit; /* <0 => must trap */
+		const char *src;
+	} cases[] = {
+	    {"ok-2d", 7,
+	     "int main(void){int m[2][3]={{1,2,3},{4,5,6}}; return m[1][2]+1;}\n"},
+	    {"oob-2d-row", -1,
+	     "int main(void){int m[2][3]={{0}}; volatile int i=2; return m[i][0];}\n"},
+	    {"oob-2d-col", -1,
+	     "int main(void){int m[2][3]={{0}}; volatile int j=3; return m[0][j];}\n"},
+	    {"ok-vla", 0,
+	     "int main(int argc,char**argv){(void)argv;int n=argc+2; int a[n];\n"
+	     " for(int i=0;i<n;i++) a[i]=i; return a[n-1]==n-1?0:1;}\n"},
+	    {"oob-vla", -1,
+	     "int main(int argc,char**argv){(void)argv;int n=argc+2; int a[n];\n"
+	     " volatile int i=n+1; return a[i];}\n"},
+	    {"ok-ptr-idx", 5,
+	     "int main(void){int a[4]={1,2,3,4}; int *p=a; return p[2]+2;}\n"},
+	    {"oob-ptr-idx", -1,
+	     "int main(void){int a[4]={0}; int *p=a; volatile int i=4; return p[i];}\n"},
+	    {"ok-defer-idx", 0,
+	     "int main(void){int a[5]={0}; int i=2;\n"
+	     " defer { (void)a[i]; } return 0;}\n"},
+	    {"ok-orelse-idx", 0,
+	     "int main(void){int a[5]={0}; int i=1; int *p=(void*)0;\n"
+	     " p = p orelse { (void)a[i]; return 0; }; return 1;}\n"},
+	    {"ok-stmtexpr-idx", 0,
+	     "int main(void){int a[5]={9,8,7,6,5}; int i=0;\n"
+	     " int v = ({ a[i]; }); return v==9?0:1;}\n"},
+	    {"oob-stmtexpr", -1,
+	     "int main(void){int a[5]={0}; volatile int i=9;\n"
+	     " int v = ({ a[i]; }); return v;}\n"},
+	    {"ok-one-past-addr", 0,
+	     "int main(void){int a[3]; int *p=&a[3]; (void)p; return 0;}\n"},
+	};
+	int ok = 0;
+	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		bc_runtime_case(cases[i].src, cases[i].expect_exit, cases[i].tag);
+		ok++;
+	}
+	printf("--- bounds cro summary: %d cells ---\n", ok);
+}
+#else
+static void test_bounds_selective_runtime_oracles(void) {}
+#endif
+
 void run_bounds_check_tests(void) {
 	printf("\n=== BOUNDS-CHECK TESTS ===\n");
 	test_bounds_paren_unary_addr_one_past();
@@ -2160,4 +2211,5 @@ void run_bounds_check_tests(void) {
 	test_bounds_check_declarator_contexts();
 	test_bounds_check_extreme_edges();
 	test_bounds_check_runtime();
+	test_bounds_selective_runtime_oracles();
 }

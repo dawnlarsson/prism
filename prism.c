@@ -254,10 +254,13 @@ typedef struct {
 				// (after `--`)
 	const char *output;
 	const char *cc;
+	char **rsp_owned; // heap tokens from @file expansion (freed by cli_free)
+	char **rsp_argv;  // expanded argv array; elements point into rsp_owned
 	int source_count, source_cap;
 	int cc_arg_count, cc_arg_cap;
 	int dep_arg_count, dep_arg_cap;
 	int prog_arg_count, prog_arg_cap;
+	int rsp_owned_count;
 	CliMode mode;
 	CliAction action;
 	bool verbose;
@@ -674,8 +677,12 @@ static void collect_system_includes(void) {
 	HashMap include_map = {0};
 	for (int i = 0; i < ctx->input_file_count; i++) {
 		File *f = ctx->input_files[i];
-		if (!f->is_system || !f->is_include_entry || !f->name) continue;
+		/* Only re-emit headers the TU included directly — nested system
+		 * headers (e.g. bits/libc-header-start.h) error if included alone. */
+		if (!f->is_system || !f->is_direct_system_include || !f->name) continue;
 		const char *base = path_basename(f->name);
+		/* Compiler-injected; not a user #include. */
+		if (!strcmp(base, "stdc-predef.h")) continue;
 		if (strcmp(base, "assert.h")) {
 			int len = (int)strlen(f->name);
 			if (hashmap_get(&include_map, f->name, len)) continue;
@@ -6303,8 +6310,53 @@ static void collect_source_defines(const char *input_file) {
 	fclose(f);
 }
 
+/* Read a source file into a malloc'd buffer with 8 trailing NUL bytes (tokenizer
+ * SWAR padding). */
+static char *read_file_padded(const char *path) {
+	FILE *f = fopen(path, "rb");
+	if (!f) return NULL;
+	if (fseek(f, 0, SEEK_END) != 0) {
+		fclose(f);
+		return NULL;
+	}
+	long sz = ftell(f);
+	if (sz < 0) {
+		fclose(f);
+		return NULL;
+	}
+	if (fseek(f, 0, SEEK_SET) != 0) {
+		fclose(f);
+		return NULL;
+	}
+	char *buf = malloc((size_t)sz + 8);
+	if (!buf) {
+		fclose(f);
+		return NULL;
+	}
+	size_t got = fread(buf, 1, (size_t)sz, f);
+	fclose(f);
+	if (got != (size_t)sz) {
+		free(buf);
+		return NULL;
+	}
+	memset(buf + (size_t)sz, 0, 8);
+	return buf;
+}
+
+static bool input_is_dot_i(const char *path) {
+	size_t n = path ? strlen(path) : 0;
+	return n >= 2 && path[n - 2] == '.' && (path[n - 1] == 'i' || path[n - 1] == 'I');
+}
+
 static char *preprocess_with_cc(const char *input_file) {
 	collect_source_defines(input_file);
+	/* `.i` is already preprocessed. GCC's `cc -E file.i` emits nothing, so
+	 * re-running the preprocessor would drop the whole TU (including orelse). */
+	if (input_is_dot_i(input_file)) {
+		char *buf = read_file_padded(input_file);
+		if (!buf) fprintf(stderr, "error: cannot read preprocessed input: %s\n", input_file);
+		return buf;
+	}
 	const char *pp_cc = ctx->extra_compiler ? ctx->extra_compiler : PRISM_DEFAULT_CC;
 	int argcap = 16 + cc_extra_arg_count(pp_cc) + ctx->extra_compiler_flags_count + ctx->dep_flags_count +
 		     ctx->extra_include_count * 2 + ctx->extra_define_count * 2 +
@@ -8288,8 +8340,8 @@ static void p1d_probe_declaration(Token *tok,
 		DeclResult decl = parse_declarator(t, false);
 		if (!decl.var_name || !decl.end) {
 			// Detect GNU nested function definitions inside outer
-			if (cur_func >= 0 && brace_depth > 0 && FEAT(F_DEFER) && decl.var_name &&
-			    !saw_static) {
+			if (cur_func >= 0 && brace_depth > 0 && (FEAT(F_DEFER) || FEAT(F_ORELSE)) &&
+			    decl.var_name && !saw_static) {
 				Token *p = skip_noise(tok_next(decl.var_name));
 				if (p && match_ch(p, '(') && tok_match(p)) {
 					Token *a = tok_next(tok_match(p));
@@ -8299,6 +8351,7 @@ static void p1d_probe_declaration(Token *tok,
 							a = tok_next(tok_match(a));
 					}
 					bool nested = a && match_ch(a, '{');
+					Token *body_open = nested ? a : NULL;
 					if (!nested && a) {
 						Token *b = a;
 						while (b && b->kind != TK_EOF && !match_ch(b, '{') &&
@@ -8308,6 +8361,7 @@ static void p1d_probe_declaration(Token *tok,
 								: tok_next(b);
 						nested = b && match_ch(b, '{') &&
 							 is_knr_params(tok_next(tok_match(p)), b);
+						if (nested) body_open = b;
 					}
 					if (nested) {
 						bool outer_uses_defer = false;
@@ -8323,11 +8377,28 @@ static void p1d_probe_declaration(Token *tok,
 								}
 							}
 						}
-						if (outer_uses_defer)
+						/* Nested bodies are passed through verbatim — orelse/
+						 * defer inside them would misscompile at the backend. */
+						bool nested_uses_prism = false;
+						Token *nclose = body_open ? tok_match(body_open) : NULL;
+						if (body_open && nclose) {
+							Token *prev_n = NULL;
+							for (Token *s = tok_next(body_open);
+							     s && s != nclose && s->kind != TK_EOF;
+							     prev_n = s, s = tok_next(s)) {
+								if (is_defer_kw(s, NULL) ||
+								    (is_orelse_kw_shadow(s) &&
+								     orelse_shadow_is_kw(prev_n))) {
+									nested_uses_prism = true;
+									break;
+								}
+							}
+						}
+						if (outer_uses_defer || nested_uses_prism)
 							error_tok(decl.var_name,
-								  "nested function definitions are not "
-								  "supported inside functions using "
-								  "defer/zeroinit — move the function "
+								  "nested function definitions cannot use "
+								  "defer/orelse (and are unsupported inside "
+								  "functions using defer) — move the function "
 								  "outside or use a function pointer");
 					}
 				}
@@ -8337,7 +8408,7 @@ static void p1d_probe_declaration(Token *tok,
 		if (match_ch(decl.end, '(') && brace_depth == 0) break; // func def
 		if (decl.end && !match_ch(decl.end, '=') && !match_ch(decl.end, ',') &&
 		    !match_ch(decl.end, ';') && !match_ch(decl.end, '[') && !match_ch(decl.end, '(') &&
-		    !match_ch(decl.end, '{') && !match_ch(decl.end, ')'))
+		    !match_ch(decl.end, '{') && !match_ch(decl.end, ')') && !match_ch(decl.end, ':'))
 			break;
 		// Phase 1D: annotate type-start token for Pass 2 fast gate
 		if (!annotated && brace_depth > 0) {
@@ -8474,6 +8545,21 @@ static void p1d_probe_declaration(Token *tok,
 		}
 
 		t = decl.end;
+		/* Struct/union bitfield: declarator ends at `:`. Keep going so
+		 * soft/Prism keyword field names (e.g. `int orelse : 3`) still
+		 * get shadow registration above, then skip the width expr. */
+		if (match_ch(t, ':')) {
+			t = tok_next(t);
+			while (t && t->kind != TK_EOF && !match_ch(t, ';')) {
+				if (t->flags & TF_OPEN) {
+					Token *m = tok_match(t);
+					t = m ? tok_next(m) : tok_next(t);
+					continue;
+				}
+				if (match_ch(t, ',') || match_ch(t, ';')) break;
+				t = tok_next(t);
+			}
+		}
 		bool has_init = match_ch(t, '=');
 		bool is_actual_vla = type.is_vla || decl.is_vla;
 		// is_vla_typedef() lookups during Pass 2.
@@ -8861,12 +8947,29 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 		if (FEAT(F_ORELSE) && match_ch(ps->tok, '[') && tok_match(ps->tok) &&
 		    !(ps->tok->flags & TF_C23_ATTR) && !(tok_ann(ps->tok) & P1_OE_BRACKET))
 			p1d_classify_bracket_orelse_ex(ps->tok, CUR_SID(), ps->p1d_cur_func, true, true);
-		// Phase 1: reject orelse in enum constant expressions and
-		// struct/union bodies early, before any Pass 2 output is written.
+		// Phase 1: reject orelse *keyword* uses in enum constant
+		// expressions and struct/union bodies. Field / enumerator
+		// *names* named orelse are identifiers (shadowed or not).
 		if (FEAT(F_ORELSE) && (ps->tok->tag & TT_ORELSE) && !typedef_lookup(ps->tok)) {
 			uint16_t cur_sid = CUR_SID();
+			/* Positional check must see the true predecessor — after a
+			 * balanced-group jump ps->p1d_prev holds the OPEN paren, so
+			 * `OK = f() orelse 0` would misread as identifier context.
+			 * Walk back in the pool (attr/prep noise skipped) and reject
+			 * only after an expression-ending token; a declarator or
+			 * enumerator *name* follows a type/typedef/`{`/`,` instead.
+			 * (orelse_shadow_is_kw is unsuitable here: its cast heuristic
+			 * misreads a call's empty `()` as a cast type-name.) */
+			Token *pv = tok_walk_back(tok_idx(ps->tok), WB_ATTR_NOISE);
+			bool expr_ctx =
+			    pv && (pv->kind == TK_NUM || pv->kind == TK_STR || match_ch(pv, ')') ||
+				   match_ch(pv, ']') ||
+				   (is_identifier_like(pv) &&
+				    !(pv->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_SUE | TT_TYPEOF |
+						 TT_BITINT | TT_ALIGNAS | TT_INLINE | TT_ATTR)) &&
+				    !is_known_typedef(pv)));
 			if (cur_sid < scope_tree_count &&
-			    (scope_tree[cur_sid].is_enum || scope_tree[cur_sid].is_struct))
+			    (scope_tree[cur_sid].is_enum || scope_tree[cur_sid].is_struct) && expr_ctx)
 				error_tok(ps->tok, ERR_ORELSE_STMT_LEVEL);
 		}
 
@@ -9868,7 +9971,16 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 	if (FEAT(F_BOUNDS_CHECK)) {
 		// Tag every '[' inside sizeof/_Alignof/typeof/offsetof so Pass 2
 		p1_mark_uneval_brackets();
-		if (is_msvc_cached) {
+		/* Skip if this TU was already Prism-transpiled (e.g. -save-temps .i). */
+		bool already_has_bchk = false;
+		for (Token *t = tok; t && t->kind != TK_EOF; t = tok_next(t)) {
+			if (t->kind == TK_IDENT && t->len == 12 && t->ch0 == '_' &&
+			    !memcmp(tok_loc(t), "__prism_bchk", 12)) {
+				already_has_bchk = true;
+				break;
+			}
+		}
+		if (!already_has_bchk && is_msvc_cached) {
 			OUT_LIT("\n"
 				"typedef unsigned __int64 __prism_bchk_size_t;\n"
 				"void __cdecl abort(void);\n"
@@ -9878,10 +9990,11 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 				"    if (__i >= __n) { __debugbreak(); abort(); }\n"
 				"    return __i;\n"
 				"}\n");
-		} else {
+		} else if (!already_has_bchk) {
+			/* C89-safe: no `inline` (an identifier under -std=c89). */
 			OUT_LIT("\n"
 				"typedef unsigned long long __prism_bchk_size_t;\n"
-				"static inline __attribute__((always_inline)) __prism_bchk_size_t "
+				"static __prism_bchk_size_t "
 				"__prism_bchk(__prism_bchk_size_t __i, __prism_bchk_size_t __n) {\n"
 				"    if (__builtin_expect(__i >= __n, 0)) __builtin_trap();\n"
 				"    return __i;\n"
@@ -10504,8 +10617,214 @@ static int dep_flag_kind(const char *a) {
 	return 0;
 }
 
+/* GCC-compatible @file response-file expansion. Without this, `prism @args.rsp`
+ * where the rsp lists `.c` sources never sees those TUs — the backend gets raw
+ * Prism syntax and misscompiles. Nesting depth is capped like the GCC driver. */
+#define RSP_MAX_DEPTH 32
+
+static bool rsp_push_dup(char ***out, int *count, int *cap, char ***owned, int *owned_count, int *owned_cap,
+			 const char *s) {
+	char *dup = strdup(s);
+	if (!dup) return false;
+	VEC_ENSURE_REALLOC(*owned, *owned_count + 1, *owned_cap, 16);
+	(*owned)[(*owned_count)++] = dup;
+	VEC_ENSURE_REALLOC(*out, *count + 1, *cap, 16);
+	(*out)[(*count)++] = dup;
+	return true;
+}
+
+static int rsp_expand_file(const char *path,
+			   char ***out,
+			   int *count,
+			   int *cap,
+			   char ***owned,
+			   int *owned_count,
+			   int *owned_cap,
+			   int depth);
+
+static int rsp_tokenize_buf(const char *text,
+			    char ***out,
+			    int *count,
+			    int *cap,
+			    char ***owned,
+			    int *owned_count,
+			    int *owned_cap,
+			    int depth) {
+	const char *p = text;
+	while (*p) {
+		while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\f' || *p == '\v') p++;
+		if (!*p) break;
+		char *tokbuf = NULL;
+		size_t n = 0, tcap = 0;
+		/* libiberty buildargv semantics: backslash escapes the next char in
+		 * every state; single/double quotes toggle anywhere in the token
+		 * (`-DMSG="a b"` is ONE arg); a trailing lone backslash is dropped. */
+		bool squote = false, dquote = false, bsquote = false;
+		while (*p) {
+			char c = *p;
+			if (!bsquote && !squote && !dquote &&
+			    (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'))
+				break;
+			bool emit = false;
+			if (bsquote) {
+				bsquote = false;
+				emit = true;
+			} else if (c == '\\') {
+				bsquote = true;
+			} else if (squote) {
+				if (c == '\'') squote = false;
+				else
+					emit = true;
+			} else if (dquote) {
+				if (c == '"') dquote = false;
+				else
+					emit = true;
+			} else if (c == '\'') {
+				squote = true;
+			} else if (c == '"') {
+				dquote = true;
+			} else {
+				emit = true;
+			}
+			if (emit) {
+				if (n + 1 >= tcap) {
+					tcap = tcap ? tcap * 2 : 64;
+					char *nt = realloc(tokbuf, tcap);
+					if (!nt) {
+						free(tokbuf);
+						return -1;
+					}
+					tokbuf = nt;
+				}
+				tokbuf[n++] = c;
+			}
+			p++;
+		}
+		if (!tokbuf) {
+			tokbuf = strdup("");
+			if (!tokbuf) return -1;
+		} else {
+			tokbuf[n] = '\0';
+		}
+		int nested_rc = 0;
+		if (tokbuf[0] == '@' && tokbuf[1]) {
+			nested_rc = rsp_expand_file(
+			    tokbuf + 1, out, count, cap, owned, owned_count, owned_cap, depth + 1);
+			/* Unreadable nested @file: GCC keeps the arg literally. */
+			if (nested_rc > 0)
+				nested_rc =
+				    rsp_push_dup(out, count, cap, owned, owned_count, owned_cap, tokbuf)
+					? 0
+					: -1;
+			free(tokbuf);
+			if (nested_rc < 0) return -1;
+		} else {
+			bool ok = rsp_push_dup(out, count, cap, owned, owned_count, owned_cap, tokbuf);
+			free(tokbuf);
+			if (!ok) return -1;
+		}
+	}
+	return 0;
+}
+
+static int rsp_expand_file(const char *path,
+			   char ***out,
+			   int *count,
+			   int *cap,
+			   char ***owned,
+			   int *owned_count,
+			   int *owned_cap,
+			   int depth) {
+	if (depth > RSP_MAX_DEPTH) {
+		fprintf(stderr, "error: response file nesting too deep: %s\n", path);
+		return -1;
+	}
+	/* GCC: an @file that does not exist or cannot be read is treated
+	 * literally, not removed — return 1 so the caller keeps the raw arg. */
+	FILE *f = fopen(path, "rb");
+	if (!f) return 1;
+	if (fseek(f, 0, SEEK_END) != 0) {
+		fclose(f);
+		return 1;
+	}
+	long sz = ftell(f);
+	if (sz < 0 || fseek(f, 0, SEEK_SET) != 0) {
+		fclose(f);
+		return 1;
+	}
+	char *buf = malloc((size_t)sz + 1);
+	if (!buf) {
+		fclose(f);
+		return -1;
+	}
+	size_t got = fread(buf, 1, (size_t)sz, f);
+	fclose(f);
+	buf[got] = '\0';
+	int rc = rsp_tokenize_buf(buf, out, count, cap, owned, owned_count, owned_cap, depth);
+	free(buf);
+	return rc;
+}
+
+/* Expand @file args into a flat argv. Caller owns *owned_out (each string + array).
+ * *out_argv holds pointers into *owned_out (and must not outlive it). */
+static char **cli_expand_response_files(int argc,
+					char **argv,
+					int *out_argc,
+					char ***owned_out,
+					int *owned_count_out) {
+	char **out = NULL;
+	char **owned = NULL;
+	int count = 0, cap = 0, owned_count = 0, owned_cap = 0;
+	for (int i = 0; i < argc; i++) {
+		const char *a = argv[i];
+		if (a[0] == '@' && a[1] && i > 0) {
+			int rc = rsp_expand_file(a + 1, &out, &count, &cap, &owned, &owned_count, &owned_cap, 0);
+			/* rc > 0: unreadable @file — GCC keeps the arg literally. */
+			if (rc > 0)
+				rc = rsp_push_dup(&out, &count, &cap, &owned, &owned_count, &owned_cap, a) ? 0
+													    : -1;
+			if (rc < 0) {
+				for (int j = 0; j < owned_count; j++) free(owned[j]);
+				free(owned);
+				free(out);
+				*out_argc = 0;
+				*owned_out = NULL;
+				*owned_count_out = 0;
+				return NULL;
+			}
+		} else if (!rsp_push_dup(&out, &count, &cap, &owned, &owned_count, &owned_cap, a)) {
+			for (int j = 0; j < owned_count; j++) free(owned[j]);
+			free(owned);
+			free(out);
+			*out_argc = 0;
+			*owned_out = NULL;
+			*owned_count_out = 0;
+			return NULL;
+		}
+	}
+	VEC_ENSURE_REALLOC(out, count + 1, cap, 16);
+	out[count] = NULL;
+	*out_argc = count;
+	*owned_out = owned;
+	*owned_count_out = owned_count;
+	return out;
+}
+
 static Cli cli_parse(int argc, char **argv) {
 	Cli cli = {.features = prism_defaults()};
+	char **owned = NULL;
+	int owned_count = 0;
+	int eargc = 0;
+	char **eargv = cli_expand_response_files(argc, argv, &eargc, &owned, &owned_count);
+	if (!eargv) {
+		fprintf(stderr, "error: failed to expand response files\n");
+		exit(1);
+	}
+	cli.rsp_owned = owned;
+	cli.rsp_owned_count = owned_count;
+	cli.rsp_argv = eargv;
+	argc = eargc;
+	argv = eargv;
 	for (int i = 1; i < argc; i++) {
 		char *a = argv[i];
 		if (a[0] == '-' && a[1] == '-' && !a[2]) {
@@ -10680,6 +10999,7 @@ static Cli cli_parse(int argc, char **argv) {
 			CLI_PUSH(cli.cc_args, cli.cc_arg_count, cli.cc_arg_cap, argv[++i]);
 	}
 
+	/* eargv / rsp_owned stay owned by Cli until cli_free — do not free here. */
 	return cli;
 }
 
@@ -10688,10 +11008,18 @@ static void cli_free(Cli *cli) {
 	free(cli->cc_args);
 	free(cli->dep_args);
 	free(cli->prog_args);
+	if (cli->rsp_owned) {
+		for (int i = 0; i < cli->rsp_owned_count; i++) free(cli->rsp_owned[i]);
+		free(cli->rsp_owned);
+	}
+	free(cli->rsp_argv);
+	cli->rsp_argv = NULL;
 	cli->sources = NULL;
 	cli->cc_args = NULL;
 	cli->dep_args = NULL;
 	cli->prog_args = NULL;
+	cli->rsp_owned = NULL;
+	cli->rsp_owned_count = 0;
 }
 
 #ifndef PRISM_LIB_MODE
@@ -11259,6 +11587,30 @@ static void argv_add_output(const char **args, int *argc, const char *out, bool 
 	}
 }
 
+/* How many argv slots to skip when forwarding cc_args to a backend compile of
+ * already-preprocessed/transpiled input. -include/-imacros (/FI) are consumed
+ * during Prism's preprocess; re-passing them injects the raw file again
+ * (redefinitions + untranspiled orelse/defer). Also covers -Wp,-include,file
+ * and -Xpreprocessor -include -Xpreprocessor file. */
+static int cc_force_include_skip(const char *a) {
+	if (!a) return 0;
+	if (!strcmp(a, "-include") || !strcmp(a, "-imacros")) return 2;
+	if (!strcmp(a, "/FI") || !strcmp(a, "-FI")) return 2;
+	if ((!strncmp(a, "/FI", 3) || !strncmp(a, "-FI", 3)) && a[3]) return 1;
+	if (!strncmp(a, "-Wp,-include,", 13) || !strncmp(a, "-Wp,-imacros,", 13)) return 1;
+	return 0;
+}
+
+static int cc_backend_force_include_skip(const char **args, int i, int n) {
+	int k = cc_force_include_skip(args[i]);
+	if (k) return k;
+	if (!strcmp(args[i], "-Xpreprocessor") && i + 3 < n &&
+	    (!strcmp(args[i + 1], "-include") || !strcmp(args[i + 1], "-imacros")) &&
+	    !strcmp(args[i + 2], "-Xpreprocessor"))
+		return 4;
+	return 0;
+}
+
 static void make_run_temp(char *buf, size_t size, CliMode mode) {
 	buf[0] = '\0';
 	if (mode != CLI_RUN) return;
@@ -11365,6 +11717,11 @@ static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count, c
 	for (int i = 0; i < cli->cc_arg_count; i++) {
 		// Skip user's /std: flags on MSVC — we already injected /std:clatest.
 		if (plan->msvc && strncmp(cli->cc_args[i], "/std:", 5) == 0) continue;
+		int fi_skip = cc_backend_force_include_skip(cli->cc_args, i, cli->cc_arg_count);
+		if (fi_skip) {
+			i += fi_skip - 1;
+			continue;
+		}
 		args[argc++] = cli->cc_args[i];
 	}
 	if (plan->suppress_warnings) add_warn_suppress(args, &argc, plan->clang, plan->msvc);
@@ -11680,6 +12037,9 @@ static int compile_sources(Cli *cli) {
 				break;
 			}
 		}
+		/* GCC `-x none` restores extension-based guessing for subsequent files.
+		 * Our pipe is stdin, so map `none` back to the TU's default language. */
+		if (pipe_lang && !strcmp(pipe_lang, "none")) pipe_lang = "c";
 
 		const char **args = alloc_argv(cli->cc_arg_count + cc_extra + 24);
 		int argc = 0;
@@ -11696,15 +12056,15 @@ static int compile_sources(Cli *cli) {
 				continue;
 			}
 			const char *a = cli->cc_args[i];
-			if (a[0] != '-') {
-				need_x_none = true;
-				break;
-			}
-			if (strcmp(a, "-o") == 0 || strcmp(a, "-MF") == 0 || strcmp(a, "-MQ") == 0 ||
-			    strcmp(a, "-MT") == 0) {
-				i++;
+			/* Operands of -I/-include/-isystem/… are paths, not TUs.
+			 * Treating them as inputs falsely cleared -fpreprocessed
+			 * (split `-I /usr/include` misscompiled flatten mode). */
+			if (a[0] == '-') {
+				if (cc_flag_takes_arg(a) && i + 1 < cli->cc_arg_count) i++;
 				continue;
 			}
+			need_x_none = true;
+			break;
 		}
 		if (need_x_none) {
 			/* -fpreprocessed must not apply to passthrough .cpp/.s/… */
@@ -11717,6 +12077,11 @@ static int compile_sources(Cli *cli) {
 				i++;
 				continue;
 			} // skip extracted -x <lang>
+			int fi_skip = cc_backend_force_include_skip(cli->cc_args, i, cli->cc_arg_count);
+			if (fi_skip) {
+				i += fi_skip - 1;
+				continue;
+			}
 			args[argc++] = cli->cc_args[i];
 		}
 		add_warn_suppress(args, &argc, clang, false);
