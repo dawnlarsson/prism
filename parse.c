@@ -271,6 +271,10 @@ enum {
 	TF_SOFT_KW = 1 << 8,	   // soft keyword usable as identifier (alignas, bool, …)
 	TF_STATIC_ASSERT = 1 << 9, // _Static_assert / static_assert
 	TF_MS_CC = 1 << 10,	   // MSVC calling-convention keyword (__cdecl, …)
+	TF_SYS_SKIP = 1 << 11,	   // token belongs to a system #include entry file; in
+				   // non-flatten emit it is skipped verbatim. Precomputed at
+				   // tokenize from current_file so the hot emit loop tests one
+				   // flag bit instead of a per-token tok_cold + file lookup.
 };
 
 enum {
@@ -1350,23 +1354,29 @@ static char *raw_string_literal_end(char *p, TokState *ts) {
 
 static inline __attribute__((always_inline)) Token *
 new_token(TokenKind kind, char *start, char *end, TokState *ts) {
+	File *cf = ctx->current_file;
 	Token *tok = pool_alloc_token();
 	tok->kind = kind;
 	tok->len = end - start;
 	tok->next_idx = 0;
 	tok->tag = 0;
 	tok->match_idx = 0;
-	tok->flags = (ts->at_bol ? TF_AT_BOL : 0) | (ts->has_space ? TF_HAS_SPACE : 0);
+	/* TF_SYS_SKIP mirrors the emit-time `f->is_system && f->is_include_entry`
+	 * check exactly: file_idx below comes from this same `cf`, so tok_file()
+	 * at emit resolves to it. Setting the bit here lets the hot emit loop skip
+	 * the per-token tok_cold + file dereference. */
+	tok->flags = (ts->at_bol ? TF_AT_BOL : 0) | (ts->has_space ? TF_HAS_SPACE : 0) |
+		     ((cf->is_system && cf->is_include_entry) ? TF_SYS_SKIP : 0);
 	tok->ann = 0;
 	tok->ch0 = (uint8_t)*start;
 	TokenCold *c = tok_cold(tok);
-	c->loc_offset = (uint32_t)(start - ctx->current_file->contents);
+	c->loc_offset = (uint32_t)(start - cf->contents);
 	{
-		long long ln = (long long)ts->line_no + ctx->current_file->line_delta;
+		long long ln = (long long)ts->line_no + cf->line_delta;
 		int clamped = ln > 0x1FFFF ? 0x1FFFF : (ln < -0x20000 ? -0x20000 : (int)ln);
 		c->line_no = clamped;
 	}
-	c->file_idx = ctx->current_file->file_no;
+	c->file_idx = cf->file_no;
 	ts->at_bol = ts->has_space = false;
 	return tok;
 }
@@ -1706,6 +1716,17 @@ static Token *tokenize(File *file) {
 			ts.has_space = true;
 			continue;
 		}
+		/* Fast path: the vast majority of tokens are identifiers/keywords that
+		 * do NOT start with a string/char literal prefix (u/U/L/R). Jump
+		 * straight to identifier scanning, skipping ~15 literal-prefix branches.
+		 * u/U/L/R starts fall through so `u8"..."`, `L'x'`, `R"..."` still work. */
+		{
+			unsigned char c0 = (unsigned char)*p;
+			if (__builtin_expect((IS_ALPHA(c0) || c0 >= 0x80) && c0 != 'u' && c0 != 'U' &&
+						 c0 != 'L' && c0 != 'R',
+					     1))
+				goto do_ident;
+		}
 		if (IS_DIGIT(*p) || (*p == '.' && IS_DIGIT(p[1]))) {
 			char *start = p;
 			bool is_float;
@@ -1764,6 +1785,7 @@ static Token *tokenize(File *file) {
 			p += nt->len;
 			continue;
 		}
+	do_ident:;
 		int ident_len = read_ident(p);
 		if (ident_len) {
 			Token *t = new_token(TK_IDENT, p, p + ident_len, &ts);

@@ -621,7 +621,29 @@ static inline PRISM_ALWAYS_INLINE void out_str(const char *s, int len) {
 		out_str_slow(s, len);
 		return;
 	}
-	memcpy(out_buf + out_buf_pos, s, len);
+	char *d = out_buf + out_buf_pos;
+	/* Inline the copy for the common small sizes (most tokens/literals are
+	 * <=16 bytes). A runtime-length memcpy is lowered to a _platform_memmove
+	 * call — pure overhead per token. These overlapping constant-size moves
+	 * touch exactly [0,len) (the same bytes the memcpy would), so there is no
+	 * over-read/over-write and no buffer-padding assumption; they just avoid
+	 * the call. src (file contents / .rodata) never overlaps out_buf. */
+	if (PRISM_LIKELY(len <= 16)) {
+		if (len >= 8) {
+			memcpy(d, s, 8);
+			memcpy(d + len - 8, s + len - 8, 8);
+		} else if (len >= 4) {
+			memcpy(d, s, 4);
+			memcpy(d + len - 4, s + len - 4, 4);
+		} else if (len >= 2) {
+			memcpy(d, s, 2);
+			memcpy(d + len - 2, s + len - 2, 2);
+		} else {
+			d[0] = s[0];
+		}
+	} else {
+		memcpy(d, s, (size_t)len);
+	}
 	out_buf_pos += len;
 }
 
@@ -918,11 +940,14 @@ static inline bool emit_token_starts_decl_like(Token *tok) {
 
 static inline bool emit_newline_before_decl_after_stmt_boundary(Token *prev, Token *tok) {
 	if (!prev || !tok) return false;
+	/* Cheapest, most selective test first: only a `;`/`}` predecessor can
+	 * trigger this. Rejecting here avoids in_struct_body()'s scope-stack walk
+	 * on the ~95% of tokens that don't follow a statement boundary. */
+	if (!(match_ch(prev, ';') || match_ch(prev, '}'))) return false;
 	// Member declarations in struct/union/enum bodies use `;` between specifiers;
 	if (ctx->aggregate_member_nest > 0) return false;
 	if (in_struct_body()) return false;
 	if (tok_at_bol(tok)) return false;
-	if (!(match_ch(prev, ';') || match_ch(prev, '}'))) return false;
 	return emit_token_starts_decl_like(tok);
 }
 
@@ -3033,7 +3058,10 @@ static Token *try_bounds_check_deref_add(Token *tok) {
 	return NULL;
 }
 
-static Token *try_bounds_checks(Token *t) {
+static inline Token *try_bounds_checks(Token *t) {
+	/* Only '[' (subscript) and '*' (pointer-arith deref) can be bounds sites;
+	 * cheap ch0 gate avoids two call+FEAT+match_ch per ordinary token. */
+	if (t->ch0 != '[' && t->ch0 != '*') return NULL;
 	Token *n = try_bounds_check_subscript(t);
 	return n ? n : try_bounds_check_deref_add(t);
 }
@@ -7526,10 +7554,20 @@ p1_register_param_shadows(Token *open, Token *close, uint16_t scope_id, int brac
 				}
 			}
 			bool is_vol_param = (has_vol_qual || has_vol_member) && !saw_star;
-			/* Definite plain scalar: built-in type, no typedef/SUE, no array,
-			 * not volatile. Everything else keeps its shadow (conservative). */
-			bool param_plain_scalar = saw_builtin_type && !saw_typedef_or_sue &&
-						  !param_has_bracket && !is_vol_param;
+			/* The is_param shadow is only needed for ARRAY params (sizeof
+			 * decays to a pointer; bounds-check must skip them) and volatile
+			 * params. Skip it — avoiding one shadow per function, which makes
+			 * typedef_lookup O(n^2) on shared names — for:
+			 *  - pointer params (`S *s`, `int *p`): a pointer is never an array,
+			 *    so no decay; this is the common real-code case (`Foo *self`).
+			 *  - plain built-in scalars (`int x`).
+			 * Kept (could hide array-ness): non-pointer typedef/SUE params
+			 * (array typedef), non-pointer params with no type (K&R lists),
+			 * bracketed params, volatile params. */
+			bool param_needs_shadow =
+			    param_has_bracket || is_vol_param ||
+			    (!saw_star && (saw_typedef_or_sue || !saw_builtin_type));
+			bool param_plain_scalar = !param_needs_shadow;
 			bool matched_ident = false;
 			for (int ix = typedef_get_index(tok_loc(last_ident), last_ident->len); ix >= 0;
 			     ix = typedef_table.entries[ix].prev_index) {
@@ -10503,15 +10541,15 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 #undef FEAT
 #define FEAT(f) (feat & (f))
 	while (tok->kind != TK_EOF) {
-		if (!FEAT(F_FLATTEN)) {
-			File *f = tok_file(tok);
-			if (f->is_system && f->is_include_entry) {
-				if (next_func_idx < func_meta_count &&
-				    func_meta[next_func_idx].body_open == tok)
-					next_func_idx++;
-				tok = tok_next(tok);
-				continue;
-			}
+		/* TF_SYS_SKIP is precomputed at tokenize (== f->is_system &&
+		 * f->is_include_entry for this token's file); avoids a per-token
+		 * tok_cold + file lookup in the hottest loop. */
+		if (!FEAT(F_FLATTEN) && (tok->flags & TF_SYS_SKIP)) {
+			if (next_func_idx < func_meta_count &&
+			    func_meta[next_func_idx].body_open == tok)
+				next_func_idx++;
+			tok = tok_next(tok);
+			continue;
 		}
 
 		Token *next;
@@ -10530,7 +10568,7 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 		if (__builtin_expect(!tag && !ctx->at_stmt_start, 1)) {
 			if (__builtin_expect((tok->flags & TF_RAW) && !is_known_typedef(tok), 0))
 				goto slow_path;
-			if (__builtin_expect(FEAT(F_BOUNDS_CHECK), 0)) {
+			if (__builtin_expect(FEAT(F_BOUNDS_CHECK) && tok->ch0 == '*', 0)) {
 				Token *bc_da = try_bounds_check_deref_add(tok);
 				if (bc_da) {
 					tok = bc_da;
