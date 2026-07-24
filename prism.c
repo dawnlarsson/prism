@@ -1797,6 +1797,8 @@ static void reject_orelse_side_effects(Token *start,
 			unsigned tf = typedef_flags(s);
 			if (tf & (TDF_VOLATILE | TDF_HAS_VOL_MEMBER))
 				error_tok(s, "%s with volatile-qualified identifier %s", ctx_msg, advice);
+			if (tf & TDF_ATOMIC)
+				error_tok(s, "%s with atomic-qualified identifier %s", ctx_msg, advice);
 		}
 		prev_tok = s;
 	}
@@ -3654,20 +3656,35 @@ static inline void decl_emit(Token *t, bool emit) {
 }
 
 static inline Token *decl_array_dims(Token *t, bool emit, bool *vla) {
-	while (match_ch(t, '[')) {
-		tok_ann(t) |= P1_DECL_BRACKET;
-		// C23 attributes between array dims: emit with inline orelse
-		// but skip the FIFO-consuming bracket orelse path.
-		if (t->flags & TF_C23_ATTR) {
-			t = emit ? emit_c23_attr(t) : tok_next(tok_match(t));
+	for (;;) {
+		if (!t || t->kind == TK_EOF) return t;
+		if (match_ch(t, '[')) {
+			tok_ann(t) |= P1_DECL_BRACKET;
+			/* C23 attributes between array dims: emit with inline orelse
+			 * but skip the FIFO-consuming bracket orelse path. */
+			if (t->flags & TF_C23_ATTR) {
+				t = emit ? emit_c23_attr(t) : tok_next(tok_match(t));
+				continue;
+			}
+			if (array_size_is_vla(t)) *vla = true;
+			if (emit && FEAT(F_ORELSE)) t = walk_balanced_orelse(t);
+			else
+				t = walk_balanced(t, emit);
 			continue;
 		}
-		if (array_size_is_vla(t)) *vla = true;
-		if (emit && FEAT(F_ORELSE)) t = walk_balanced_orelse(t);
-		else
-			t = walk_balanced(t, emit);
+		/* GNU `__attribute__((...))` between dims — keep scanning so a later
+		 * `[m orelse …]` stays on the FIFO path (otherwise r.end stops early,
+		 * temps under-count, and leftover dims leak / corrupt after `= 0`). */
+		if ((t->tag & TT_ATTR) && tok_next(t) && match_ch(tok_next(t), '(')) {
+			Token *after = decl_noise(t, emit);
+			if (after != t && match_ch(after, '[')) {
+				t = after;
+				continue;
+			}
+			return after;
+		}
+		return t;
 	}
-	return t;
 }
 
 static DeclResult parse_declarator(Token *tok, bool emit) {
@@ -7738,6 +7755,7 @@ p1_register_param_shadows(Token *open, Token *close, uint16_t scope_id, int brac
 				}
 			bool has_vol_qual = false;
 			bool has_vol_member = false;
+			bool has_atomic_qual = false;
 			bool saw_star = false;
 			bool saw_builtin_type = false, saw_typedef_or_sue = false;
 			for (Token *s = param_start; s && s != param_end && s->kind != TK_EOF;
@@ -7751,14 +7769,18 @@ p1_register_param_shadows(Token *open, Token *close, uint16_t scope_id, int brac
 					saw_typedef_or_sue = true;
 				if ((s->tag & (TT_QUALIFIER | TT_VOLATILE)) == (TT_QUALIFIER | TT_VOLATILE))
 					has_vol_qual = true;
+				if (s->len == 7 && s->ch0 == '_' && !memcmp(tok_loc(s), "_Atomic", 7))
+					has_atomic_qual = true;
 				if (is_valid_varname(s) &&
 				    !(s->tag & (TT_QUALIFIER | TT_TYPE | TT_SUE | TT_TYPEOF | TT_ATTR))) {
 					unsigned tf = typedef_flags(s);
 					if (tf & TDF_VOLATILE) has_vol_qual = true;
 					if (tf & TDF_HAS_VOL_MEMBER) has_vol_member = true;
+					if (tf & TDF_ATOMIC) has_atomic_qual = true;
 				}
 			}
 			bool is_vol_param = (has_vol_qual || has_vol_member) && !saw_star;
+			bool is_atomic_param = has_atomic_qual && !saw_star;
 			/* The is_param shadow is only needed for ARRAY params (sizeof
 			 * decays to a pointer; bounds-check must skip them) and volatile
 			 * params. Skip it — avoiding one shadow per function, which makes
@@ -7768,9 +7790,9 @@ p1_register_param_shadows(Token *open, Token *close, uint16_t scope_id, int brac
 			 *  - plain built-in scalars (`int x`).
 			 * Kept (could hide array-ness): non-pointer typedef/SUE params
 			 * (array typedef), non-pointer params with no type (K&R lists),
-			 * bracketed params, volatile params. */
+			 * bracketed params, volatile/atomic params. */
 			bool param_needs_shadow =
-			    param_has_bracket || is_vol_param ||
+			    param_has_bracket || is_vol_param || is_atomic_param ||
 			    (!saw_star && (saw_typedef_or_sue || !saw_builtin_type));
 			bool param_plain_scalar = !param_needs_shadow;
 			bool matched_ident = false;
@@ -7804,15 +7826,21 @@ p1_register_param_shadows(Token *open, Token *close, uint16_t scope_id, int brac
 						typedef_table.entries[typedef_table.count - 1]
 						    .has_volatile_member = has_vol_member;
 					}
+					if (is_atomic_param)
+						typedef_table.entries[typedef_table.count - 1].is_atomic =
+						    true;
 				}
-			} else if (is_vol_param) {
+			} else if (is_vol_param || is_atomic_param) {
 				for (int ix = typedef_get_index(tok_loc(last_ident), last_ident->len);
 				     ix >= 0;
 				     ix = typedef_table.entries[ix].prev_index) {
 					TypedefEntry *ee = &typedef_table.entries[ix];
 					if (ee->token_index == tok_idx(last_ident)) {
-						if (has_vol_qual) ee->is_volatile = true;
-						if (has_vol_member) ee->has_volatile_member = true;
+						if (is_vol_param) {
+							if (has_vol_qual) ee->is_volatile = true;
+							if (has_vol_member) ee->has_volatile_member = true;
+						}
+						if (is_atomic_param) ee->is_atomic = true;
 						break;
 					}
 				}
@@ -7996,13 +8024,15 @@ static void p1_scan_init_shadows(Token *open,
 			}
 			bool is_vol_local = (type.has_volatile || type.has_volatile_member) &&
 					    !decl.is_pointer && !decl.is_func_ptr;
-			if (is_vol_local) {
+			bool is_atomic_local = type.has_atomic && !decl.is_pointer && !decl.is_func_ptr;
+			if (is_vol_local || is_atomic_local) {
 				int pre_ct = typedef_table.count;
 				p1_register_shadow(decl.var_name, cur_sid, brace_depth);
 				if (typedef_table.count > pre_ct) {
 					TypedefEntry *e = &typedef_table.entries[typedef_table.count - 1];
 					if (type.has_volatile) e->is_volatile = true;
 					if (type.has_volatile_member) e->has_volatile_member = true;
+					if (type.has_atomic) e->is_atomic = true;
 				}
 			}
 			if (type.is_struct && !type.is_enum && !decl.is_pointer && !decl.is_array &&
@@ -8137,6 +8167,33 @@ static void p1_try_alloc_defer(Token *tok, uint16_t cur_sid, int func_idx) {
 }
 
 // Phase 1F: validate defer body and populate name set.
+static void p1_reject_defer_in_uneval_operand(Token *defer_tok, uint16_t sid) {
+	for (uint16_t s = sid; s > 0 && s < scope_tree_count; s = scope_tree[s].parent_id) {
+		if (!scope_tree[s].is_stmt_expr) continue;
+		Token *brace = &token_pool[scope_tree[s].open_tok_idx];
+		if (tok_idx(brace) == 0) break;
+		Token *se_open = &token_pool[tok_idx(brace) - 1]; /* '(' of ({ */
+		if (!match_ch(se_open, '(')) break;
+		Token *intro = tok_walk_back(tok_idx(se_open), WB_ATTR_NOISE);
+		/* Peel redundant paren wrappers: sizeof((({…}))). */
+		while (intro && match_ch(intro, '(') && (intro->flags & TF_OPEN) && tok_match(intro)) {
+			Token *outer_close = tok_match(intro);
+			Token *se_close_brace = &token_pool[scope_tree[s].close_tok_idx];
+			Token *se_paren_close = tok_next(se_close_brace);
+			if (!outer_close || !se_paren_close ||
+			    tok_idx(outer_close) < tok_idx(se_paren_close))
+				break;
+			intro = tok_walk_back(tok_idx(intro), WB_ATTR_NOISE);
+		}
+		if (intro && (is_uneval_operand_intro(intro) || (intro->flags & TF_SIZEOF) ||
+			      (intro->tag & (TT_TYPEOF | TT_GENERIC))))
+			error_tok(defer_tok,
+				  "'defer' inside an unevaluated operand "
+				  "(sizeof/_Alignof/typeof/_Generic) has no effect");
+		break;
+	}
+}
+
 static void __attribute__((noinline))
 p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t cur_sid, int brace_depth) {
 	/* File-scope defer: no scope to unwind. Struct/initializer bodies are
@@ -8154,15 +8211,16 @@ p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t
 				     cur_sid < scope_tree_count && scope_tree[cur_sid].is_stmt_expr,
 				     cur_sid < scope_tree_count && scope_tree[cur_sid].is_switch);
 		p1_check_defer_stmt_expr_chain(tok, cur_sid);
+		p1_reject_defer_in_uneval_operand(tok, cur_sid);
 	}
 	{
 		Token *body = tok_next(tok);
 		if (body && !match_ch(body, '{')) {
 			Token *semi = skip_to_semicolon(body, NULL);
 			reject_defer_unterminated(tok, body, semi);
-			// `__typeof__(int t)`. Require braces so Phase 1D sees
-			if (FEAT(F_ORELSE) && (body->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF |
-							    TT_BITINT | TT_STORAGE))) {
+			/* Braceless defer bodies are erased as a unit; any `orelse` in
+			 * them leaks as a soft keyword into the backend. Require braces. */
+			if (FEAT(F_ORELSE)) {
 				int pd = 0;
 				for (Token *s = body; s && s != semi && s->kind != TK_EOF; s = tok_next(s)) {
 					if (s->flags & TF_OPEN) {
@@ -8175,8 +8233,7 @@ p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t
 					}
 					if (pd == 0 && is_orelse_kw_shadow(s))
 						error_tok(s,
-							  "declaration with 'orelse' initializer "
-							  "inside a braceless defer body is not "
+							  "'orelse' inside a braceless defer body is not "
 							  "supported; wrap the defer body in braces: "
 							  "`defer { ... }`");
 				}
@@ -8547,10 +8604,22 @@ static bool p1d_expr_is_struct_value(Token *start, Token *end) {
 
 static void p1d_reject_orelse_chain_after_ctrl(Token *oe_kw) {
 	Token *act = tok_next(oe_kw);
-	if (!act || !(act->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO))) return;
-	Token *u = tok_next(act);
-	if (!(act->tag & TT_RETURN) && u && is_identifier_like(u)) u = tok_next(u);
-	Token *sp = act;
+	if (!act) return;
+	Token *u;
+	Token *sp;
+	if (act->tag & (TT_RETURN | TT_BREAK | TT_CONTINUE | TT_GOTO)) {
+		u = tok_next(act);
+		/* Skip optional label after break/continue/goto — but not a following
+		 * `orelse` keyword (would misread `continue orelse x` as labeled). */
+		if (!(act->tag & TT_RETURN) && u && is_identifier_like(u) && !orelse_kw_at_bare(u, act))
+			u = tok_next(u);
+		sp = act;
+	} else if (match_ch(act, '{') && (act->flags & TF_OPEN) && tok_match(act)) {
+		/* Block-form action: further `orelse` after `}` cannot continue the chain. */
+		sp = tok_match(act);
+		u = tok_next(sp);
+	} else
+		return;
 	for (; u && u->kind != TK_EOF; u = tok_next(u)) {
 		if (u->flags & TF_OPEN) {
 			sp = tok_match(u);
@@ -8561,7 +8630,7 @@ static void p1d_reject_orelse_chain_after_ctrl(Token *oe_kw) {
 		if ((tok_ann(u) & P1_IS_ORELSE_KW) || orelse_kw_at_bare(u, sp))
 			error_tok(u,
 				  "'orelse' chain cannot continue after a "
-				  "control-flow action (return/goto/break/continue)");
+				  "control-flow action (return/goto/break/continue/block)");
 		sp = u;
 	}
 }
@@ -9157,12 +9226,13 @@ static void p1d_probe_declaration(Token *tok,
 		bool did_shadow = false;
 		bool is_vol_local =
 		    (type.has_volatile || type.has_volatile_member) && !decl.is_pointer && !decl.is_func_ptr;
+		bool is_atomic_local = type.has_atomic && !decl.is_pointer && !decl.is_func_ptr;
 		bool is_const_local = has_effective_const_qual(type_tok, &type, &decl);
 		if (is_known_typedef(decl.var_name) || is_known_enum_const(decl.var_name) ||
 		    (decl.var_name->tag & (TT_DEFER | TT_ORELSE | TT_NORETURN_FN | TT_SPECIAL_FN)) ||
 		    (decl.var_name->flags & TF_RAW) ||
 		    hashmap_get(&p1_func_proto_map, tok_loc(decl.var_name), decl.var_name->len) ||
-		    is_vol_local || is_const_local || decl.is_func_decl) {
+		    is_vol_local || is_atomic_local || is_const_local || decl.is_func_decl) {
 			p1_register_shadow(decl.var_name, cur_sid, brace_depth);
 			did_shadow = true;
 		}
@@ -9170,12 +9240,13 @@ static void p1d_probe_declaration(Token *tok,
 			TypedefEntry *e = p1_shadow_entry_for_token(decl.var_name);
 			if (e) e->is_func = true;
 		}
-		if ((is_vol_local || is_const_local) && typedef_table.count > 0) {
+		if ((is_vol_local || is_atomic_local || is_const_local) && typedef_table.count > 0) {
 			TypedefEntry *e = p1_shadow_entry_for_token(decl.var_name);
 			if (e) {
 				if (is_const_local) e->is_const = true;
 				if (type.has_volatile) e->is_volatile = true;
 				if (type.has_volatile_member) e->has_volatile_member = true;
+				if (type.has_atomic) e->is_atomic = true;
 			}
 		}
 		/* Track struct/union locals so bare `s = s orelse …` rejects like decl form. */
@@ -9704,6 +9775,15 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 			if (cur_sid < scope_tree_count &&
 			    (scope_tree[cur_sid].is_enum || scope_tree[cur_sid].is_struct) && expr_ctx)
 				error_tok(ps->tok, ERR_ORELSE_STMT_LEVEL);
+			/* Brace-initializer RHS (incl. designator `= expr orelse …`) cannot
+			 * lower statement-shaped orelse; designator *dimensions*
+			 * `[idx orelse …]` are annotated P1_OE_BRACKET and stay allowed. */
+			if (ps->p1d_init_brace_depth > 0 && expr_ctx &&
+			    !(tok_ann(ps->tok) & P1_OE_BRACKET))
+				error_tok(ps->tok,
+					  "'orelse' cannot be used in a brace initializer "
+					  "expression; only designator dimensions "
+					  "'[idx orelse …]' are supported");
 		}
 
 		// Phase 1: reject orelse inside typeof in struct/union bodies early,
@@ -9780,17 +9860,27 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 				      (p1d_prev_saved->tag &
 				       (TT_IF | TT_LOOP | TT_SWITCH | TT_TYPEOF | TT_ATTR | TT_ASM))))
 					check_orelse_in_parens(ps->tok);
-				// Phase 1D: reject orelse inside attribute paren groups at
-				if (FEAT(F_ORELSE) && tok_match(ps->tok) &&
+				// Phase 1D: reject orelse/CF inside attribute paren groups at
+				// any declarator position (pre- and post-declarator).
+				if (tok_match(ps->tok) &&
 				    ((match_ch(ps->tok, '(') && p1d_prev_saved &&
 				      (p1d_prev_saved->tag & TT_ATTR)) ||
 				     (ps->tok->flags & TF_C23_ATTR))) {
 					Token *am = tok_match(ps->tok);
-					for (Token *s = tok_next(ps->tok); s && s != am; s = tok_next(s))
-						if ((s->tag & TT_ORELSE) && !typedef_lookup(s))
+					for (Token *s = tok_next(ps->tok); s && s != am; s = tok_next(s)) {
+						uint32_t st = s->tag;
+						if (FEAT(F_ORELSE) && (st & TT_ORELSE) && !typedef_lookup(s))
 							error_tok(s,
 								  "'orelse' cannot be used inside "
 								  "attribute arguments");
+						if (st & (TT_GOTO | TT_RETURN | TT_BREAK | TT_CONTINUE))
+							error_tok(s,
+								  "'%.*s' inside attribute argument "
+								  "bypasses control-flow analysis; "
+								  "move it outside the attribute",
+								  s->len,
+								  tok_loc(s));
+					}
 				}
 				if (match_ch(ps->tok, '(') || match_ch(ps->tok, '[')) {
 					Token *se_open = p1d_scan_balanced_group(

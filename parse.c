@@ -2673,7 +2673,8 @@ static inline PRISM_PURE int typedef_flags(Token *tok) {
 	if (e->is_enum_const) return TDF_ENUM_CONST;
 	if (e->is_shadow)
 		return (e->is_volatile ? TDF_VOLATILE : 0) |
-		       (e->has_volatile_member ? TDF_HAS_VOL_MEMBER : 0);
+		       (e->has_volatile_member ? TDF_HAS_VOL_MEMBER : 0) |
+		       (e->is_atomic ? TDF_ATOMIC : 0);
 	if (e->is_vla_var)
 		return TDF_VLA | (e->is_param ? TDF_PARAM : 0) |
 		       (e->has_volatile_member ? TDF_HAS_VOL_MEMBER : 0);
@@ -3589,6 +3590,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 			if (inner_start && (inner_start->tag & TT_SUE)) {
 				r.is_struct = true;
 				if (inner_start->ch0 == 'u') r.is_union = true;
+				if (inner_start->ch0 == 'e') r.is_enum = true;
 			}
 			if (inner_start && is_identifier_like(inner_start) && is_known_typedef(inner_start)) {
 				r.is_typedef = true;
@@ -3612,6 +3614,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 				if (outer_ptr) {
 					r.is_struct = false;
 					r.is_union = false;
+					r.is_enum = false;
 				}
 			}
 			scan_paren_for_vla(tok, end, &r, true);
@@ -3726,6 +3729,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 						if ((t->tag & TT_SUE) || (typedef_flags(t) & TDF_AGGREGATE))
 							r.is_struct = true;
 						if ((t->tag & TT_SUE) && t->ch0 == 'u') r.is_union = true;
+						if ((t->tag & TT_SUE) && t->ch0 == 'e') r.is_enum = true;
 						if (typedef_flags(t) & TDF_UNION) r.is_union = true;
 						if (t->tag & TT_SUE) {
 							saw_sue = true;
@@ -3753,6 +3757,7 @@ static TypeSpecResult parse_type_specifier(Token *tok) {
 					if (outer_ptr) {
 						r.is_struct = false;
 						r.is_union = false;
+						r.is_enum = false;
 					}
 				}
 				scan_paren_for_vla(tok, end, &r, false);

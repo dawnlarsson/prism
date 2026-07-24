@@ -2454,7 +2454,7 @@ static void test_defer_body_orelse_counter_desync(void) {
 	PrismResult r = prism_transpile_source(
 	    "int main(void) {\n"
 	    "    int x = 0;\n"
-	    "    defer x = 5 orelse 3;\n"
+	    "    defer { x = 5 orelse 3; }\n"
 	    "    return 0;\n"
 	    "}\n",
 	    "defer_orelse_counter.c", prism_defaults());
@@ -2533,7 +2533,7 @@ static void test_defer_body_orelse_block_overshoot(void) {
 	PrismResult r = prism_transpile_source(
 	    "#include <stdio.h>\n"
 	    "int main(void) {\n"
-	    "    defer 0 orelse { (void)0; };\n"
+	    "    defer { 0 orelse { (void)0; }; }\n"
 	    "    return 0;\n"
 	    "}\n",
 	    "defer_orelse_block_overshoot.c", prism_defaults());
@@ -2557,6 +2557,30 @@ static void test_defer_body_orelse_block_overshoot(void) {
 			p = digits;
 		}
 	}
+	prism_free(&r);
+}
+
+static void test_defer_in_uneval_operand_rejected(void) {
+	PrismResult r = prism_transpile_source(
+	    "int main(void){\n"
+	    "  int x = 0;\n"
+	    "  return (int)sizeof(({ { defer x = 1; } 0; }));\n"
+	    "}\n",
+	    "defer_uneval_sizeof.c", prism_defaults());
+	CHECK(r.status != PRISM_OK, "defer in sizeof stmt-expr: rejected");
+	CHECK(r.error_msg && strstr(r.error_msg, "unevaluated"),
+	      "defer in sizeof: mentions unevaluated");
+	prism_free(&r);
+
+	/* Evaluated stmt-expr with nested braced defer must still work. */
+	r = prism_transpile_source(
+	    "int main(void){\n"
+	    "  int x = 0;\n"
+	    "  int y = ({ { defer x = 1; } 0; });\n"
+	    "  return y + x;\n"
+	    "}\n",
+	    "defer_eval_stmtexpr.c", prism_defaults());
+	CHECK_EQ(r.status, PRISM_OK, "defer in evaluated stmt-expr: OK");
 	prism_free(&r);
 }
 
@@ -7473,6 +7497,7 @@ void run_defer_tests(void) {
 	test_defer_body_orelse_counter_desync();
 	test_defer_body_orelse_block_overshoot();
 	test_defer_braceless_decl_orelse_rejected();
+	test_defer_in_uneval_operand_rejected();
 	test_defer_body_bare_orelse_return_not_rejected();
 	test_defer_paren_wrapped_orelse_smuggling();
 	test_defer_label_duplication_rejected();

@@ -9405,4 +9405,83 @@ void run_orelse_tests(void) {
 		CHECK_EQ(r.status, PRISM_OK, "compound-literal const orelse: OK");
 		prism_free(&r);
 	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int *a(void); int *b(void);\n"
+		    "void f(void){ for(;;){ int *p = a() orelse continue orelse b(); (void)p; } }\n",
+		    "oe_mid_continue.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "mid-chain continue orelse: rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int *a(void); int *b(void);\n"
+		    "void f(void){ int *p = a() orelse { return; } orelse b(); (void)p; }\n",
+		    "oe_mid_block.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "mid-chain block-action orelse: rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int n, m;\n"
+		    "void f(void){\n"
+		    "  int a[n orelse 1] __attribute__((aligned(8))) [m orelse 2];\n"
+		    "  (void)a;\n"
+		    "}\n",
+		    "oe_gnu_attr_between_dims.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "GNU attr between oe dims: OK");
+		if (r.output) {
+			CHECK(strstr(r.output, "orelse") == NULL,
+			      "GNU attr between oe dims: no orelse leak");
+			CHECK(strstr(r.output, "__prism_oe_") != NULL,
+			      "GNU attr between oe dims: hoists temps");
+		}
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "_Atomic int idx;\n"
+		    "int main(void){ int a[8] = { [idx orelse 0] = 1 }; return 0; }\n",
+		    "oe_atomic_desig.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "atomic designator orelse: rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "void f(_Atomic int n){ typeof(int[n orelse 4]) *p; (void)p; }\n",
+		    "oe_atomic_typeof.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "atomic typeof dim orelse: rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ int a[2] = { [0] = 0 orelse 1 }; return a[0]; }\n",
+		    "oe_desig_init_oe.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "designator init orelse RHS: rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ int a[2] = { [0 orelse 1] = 1 }; return a[0]+a[1]; }\n",
+		    "oe_desig_dim_oe.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "designator dim orelse: OK");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){\n"
+		    "  int buf __attribute__((aligned(({goto L;8;})))) = 0;\n"
+		    "L: return buf;\n"
+		    "}\n",
+		    "oe_attr_post_goto.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "post-declarator attr goto: rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ int x=0; defer x = 5 orelse 3; return x; }\n",
+		    "oe_braceless_defer_oe.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "braceless defer+orelse: rejected");
+		prism_free(&r);
+	}
 }

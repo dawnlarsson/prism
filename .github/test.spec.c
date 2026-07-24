@@ -2868,7 +2868,8 @@ static void spec_defer_body_ctrl_state(void) {
 static void spec_defer_body_orelse_transform(void) {
 	printf("\n--- defer body orelse transform ---\n");
 
-	// bracket orelse in compound literal inside defer body
+	// Non-constant bracket orelse in a compound-literal type is illegal
+	// (compound literals cannot be VLAs); typeof/sizeof and named VLAs remain OK.
 	{
 		PrismResult r = prism_transpile_source(
 		    "void use_arr(int *, int);\n"
@@ -2878,10 +2879,8 @@ static void spec_defer_body_orelse_transform(void) {
 		    "    }\n"
 		    "}\n",
 		    "spec_dbo1.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK, "bracket orelse compound literal in defer: accepted");
-		if (r.output)
-			CHECK(strstr(r.output, "orelse") == NULL,
-			      "bracket orelse compound literal in defer: no orelse leak");
+		CHECK(r.status != PRISM_OK,
+		      "bracket orelse compound literal in defer: rejected (VLA complit)");
 		prism_free(&r);
 	}
 
