@@ -1600,13 +1600,17 @@ static char *scan_line_directive(char *p, File *base_file, int *line_no, bool *i
 	if (ld < INT_MIN) ld = INT_MIN;
 	int line_delta = (int)ld;
 	// MSVC-style `#line N "file"` has no GCC-style flags (no 1/2/3).
-	bool msvc_style = !is_entering && !is_returning;
+	// Flag `3` alone (`# N "sys.h" 3`) is a GCC/Clang system location update —
+	// must NOT be treated as MSVC or `/usr/lib/clang/…` paths clear
+	// `in_system_include` and nested headers get re-emitted.
+	bool msvc_style = !is_entering && !is_returning && !is_system;
 	File *view;
 	if (msvc_style && filename) {
 		const char *f = filename;
 		if (strncmp(f, "/usr/include/", 13) == 0 || strncmp(f, "/usr/local/include/", 19) == 0 ||
 		    strncmp(f, "/Library/", 9) == 0 || strncmp(f, "/Applications/Xcode", 19) == 0 ||
-		    (strstr(f, "/lib/gcc/") && strstr(f, "/include/")) || strstr(f, "Windows Kits") ||
+		    (strstr(f, "/lib/gcc/") && strstr(f, "/include/")) ||
+		    (strstr(f, "/lib/clang/") && strstr(f, "/include")) || strstr(f, "Windows Kits") ||
 		    strstr(f, "Program Files")) {
 			direct_system = !*in_system_include;
 			is_system = true;

@@ -9375,4 +9375,34 @@ void run_orelse_tests(void) {
 			      "bitfield=bitfield orelse: typeof uses +0 promotion");
 		prism_free(&r);
 	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "_Static_assert((0 orelse 1) == 1, \"x\"); int main(void){return 0;}\n",
+		    "oe_sa_paren.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "static_assert nested paren orelse: rejected");
+		prism_free(&r);
+	}
+	{
+		/* Designator bracket orelse must not double-eval side-effect LHS. */
+		PrismResult r = prism_transpile_source(
+		    "int g; int main(void){ int a[4] = { [g++ orelse 1] = 5 }; return 0; }\n",
+		    "oe_desig_se.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "designator bracket orelse SE: rejected");
+		prism_free(&r);
+	}
+	{
+		/* Compound-literal type dims cannot be VLAs after ternary lowering. */
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ int n=0; int *p=(int[n orelse 4]){0}; (void)p; return 0; }\n",
+		    "oe_complit_vla.c", prism_defaults());
+		CHECK(r.status != PRISM_OK, "compound-literal VLA orelse: rejected");
+		prism_free(&r);
+	}
+	{
+		PrismResult r = prism_transpile_source(
+		    "int main(void){ int *p=(int[0 orelse 4]){0}; (void)p; return 0; }\n",
+		    "oe_complit_const.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "compound-literal const orelse: OK");
+		prism_free(&r);
+	}
 }

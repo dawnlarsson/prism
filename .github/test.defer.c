@@ -7719,4 +7719,36 @@ void run_defer_tests(void) {
 			      "orelse labeled break+defer: preserves label");
 		prism_free(&r);
 	}
+	{
+		/* GNU __label__ mangled names must still resolve for DEFER_TO_DEPTH. */
+		PrismResult r = prism_transpile_source(
+		    "static char L[32]; static int n; static void A(char c){L[n++]=c;}\n"
+		    "int main(void){\n"
+		    "  defer A('F');\n"
+		    "  { __label__ outer;\n"
+		    "    outer: for(int i=0;i<1;i++){\n"
+		    "      defer A('O');\n"
+		    "      { defer A('I'); A('1'); break outer; }\n"
+		    "    }\n"
+		    "    A('Z');\n"
+		    "  }\n"
+		    "  A('E');\n"
+		    "  return 0;\n"
+		    "}\n",
+		    "defer_gnu_label_break.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_OK, "gnu __label__ break+defer: transpiles");
+		if (r.output) {
+			const char *brk = strstr(r.output, "break");
+			CHECK(brk != NULL, "gnu __label__ break+defer: has break");
+			if (brk) {
+				int f_before = 0;
+				for (const char *p = r.output; p < brk; p++)
+					if (p[0] == 'A' && p[1] == '(' && p[2] == '\'' && p[3] == 'F')
+						f_before++;
+				CHECK(f_before == 0,
+				      "gnu __label__ break+defer: no outer F before break");
+			}
+		}
+		prism_free(&r);
+	}
 }

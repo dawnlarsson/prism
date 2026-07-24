@@ -418,6 +418,7 @@ static Token *find_bare_orelse(Token *tok);
 static Token *decl_noise(Token *tok, bool emit);
 static Token *walk_balanced(Token *tok, bool emit);
 static Token *walk_balanced_orelse(Token *tok);
+static Token *try_bounds_checks(Token *t);
 static Token *try_typeof_orelse(Token *tok);
 static Token *try_bracket_orelse(Token *tok);
 static void emit_token_range_orelse(Token *start, Token *end);
@@ -771,30 +772,103 @@ static void emit_define_guarded(const char *def) {
 	OUT_LIT("\n#endif\n");
 }
 
+static void emit_consumed_def_upsert(char ***names, bool **on, int *n, int *cap,
+				       const char *spec, bool defined, bool *undef_gnu) {
+	const char *eq = strchr(spec, '=');
+	int nlen = eq ? (int)(eq - spec) : (int)strlen(spec);
+	if (nlen <= 0) return;
+	if (!defined && nlen == 11 && !memcmp(spec, "_GNU_SOURCE", 11) && undef_gnu) *undef_gnu = true;
+	for (int i = 0; i < *n; i++) {
+		if ((int)strlen((*names)[i]) == nlen && !memcmp((*names)[i], spec, (size_t)nlen)) {
+			(*on)[i] = defined;
+			return;
+		}
+	}
+	if (*n >= *cap) {
+		*cap = *cap ? *cap * 2 : 16;
+		*names = realloc(*names, (size_t)*cap * sizeof(char *));
+		*on = realloc(*on, (size_t)*cap * sizeof(bool));
+		if (!*names || !*on) error("out of memory");
+	}
+	(*names)[*n] = malloc((size_t)nlen + 1);
+	if (!(*names)[*n]) error("out of memory");
+	memcpy((*names)[*n], spec, (size_t)nlen);
+	(*names)[*n][nlen] = '\0';
+	(*on)[*n] = defined;
+	(*n)++;
+}
+
 static void emit_consumed_defines(void) {
 	bool any = ctx->extra_define_count > 0 || ctx->source_define_count > 0;
-	if (!any) {
-		for (int i = 0; i < ctx->extra_compiler_flags_count; i++) {
-			const char *f = ctx->extra_compiler_flags[i];
-			if (f[0] == '-' && f[1] == 'D') {
-				any = true;
-				break;
-			}
+	bool user_undef_gnu = false;
+	for (int i = 0; i < ctx->extra_compiler_flags_count; i++) {
+		const char *f = ctx->extra_compiler_flags[i];
+		if (f[0] == '-' && (f[1] == 'D' || f[1] == 'U')) {
+			any = true;
+			break;
 		}
 	}
 
 	if (!any && ctx->system_include_count == 0) return;
-	// Emit user-specified API defines (take priority over built-in feature test
-	// macros)
-	for (int i = 0; i < ctx->extra_define_count; i++) emit_define_guarded(ctx->extra_defines[i]);
+
+	char **def_names = NULL;
+	bool *def_on = NULL;
+	int def_n = 0, def_cap = 0;
+
+	for (int i = 0; i < ctx->extra_define_count; i++)
+		emit_consumed_def_upsert(&def_names, &def_on, &def_n, &def_cap, ctx->extra_defines[i], true,
+					 &user_undef_gnu);
 	for (int i = 0; i < ctx->extra_compiler_flags_count; i++) {
 		const char *f = ctx->extra_compiler_flags[i];
-		if (f[0] == '-' && f[1] == 'D') {
-			if (f[2]) emit_define_guarded(f + 2);
-			else if (i + 1 < ctx->extra_compiler_flags_count)
-				emit_define_guarded(ctx->extra_compiler_flags[++i]);
-		}
+		if (f[0] != '-' || (f[1] != 'D' && f[1] != 'U')) continue;
+		bool defined = (f[1] == 'D');
+		const char *spec = f[2] ? f + 2 : NULL;
+		if (!spec && i + 1 < ctx->extra_compiler_flags_count) spec = ctx->extra_compiler_flags[++i];
+		if (spec)
+			emit_consumed_def_upsert(&def_names, &def_on, &def_n, &def_cap, spec, defined,
+						 &user_undef_gnu);
 	}
+
+	for (int i = 0; i < def_n; i++) {
+		if (def_on[i]) {
+			const char *emit = def_names[i];
+			for (int j = 0; j < ctx->extra_define_count; j++) {
+				const char *s = ctx->extra_defines[j];
+				int nlen = (int)strlen(def_names[i]);
+				if (!strncmp(s, def_names[i], (size_t)nlen) &&
+				    (s[nlen] == '\0' || s[nlen] == '=')) {
+					emit = s;
+					break;
+				}
+			}
+			for (int j = 0; j < ctx->extra_compiler_flags_count; j++) {
+				const char *f = ctx->extra_compiler_flags[j];
+				const char *s = NULL;
+				if (f[0] == '-' && f[1] == 'D')
+					s = f[2] ? f + 2
+						 : (j + 1 < ctx->extra_compiler_flags_count
+							? ctx->extra_compiler_flags[j + 1]
+							: NULL);
+				if (!s) continue;
+				int nlen = (int)strlen(def_names[i]);
+				if (!strncmp(s, def_names[i], (size_t)nlen) &&
+				    (s[nlen] == '\0' || s[nlen] == '=')) {
+					emit = s;
+					break;
+				}
+			}
+			emit_define_guarded(emit);
+		} else {
+			OUT_LIT("#ifdef ");
+			out_str(def_names[i], strlen(def_names[i]));
+			OUT_LIT("\n#undef ");
+			out_str(def_names[i], strlen(def_names[i]));
+			OUT_LIT("\n#endif\n");
+		}
+		free(def_names[i]);
+	}
+	free(def_names);
+	free(def_on);
 
 	for (int i = 0; i < ctx->source_define_count; i++) {
 		const char *guard = ctx->source_define_guards ? ctx->source_define_guards[i] : NULL;
@@ -817,9 +891,9 @@ static void emit_consumed_defines(void) {
 	}
 
 	OUT_LIT("#if !defined(_WIN32)\n"
-		"#ifndef _POSIX_C_SOURCE\n#define _POSIX_C_SOURCE 200809L\n#endif\n"
-		"#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n"
-		"#ifdef __APPLE__\n#ifndef _DARWIN_C_SOURCE\n#define "
+		"#ifndef _POSIX_C_SOURCE\n#define _POSIX_C_SOURCE 200809L\n#endif\n");
+	if (!user_undef_gnu) OUT_LIT("#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n");
+	OUT_LIT("#ifdef __APPLE__\n#ifndef _DARWIN_C_SOURCE\n#define "
 		"_DARWIN_C_SOURCE\n#endif\n#endif\n"
 		"#endif\n\n");
 }
@@ -1764,6 +1838,13 @@ static void emit_type_range(Token *start, Token *end, bool strip_const, bool str
 			t = walk_balanced_orelse(t);
 			continue;
 		}
+		if (__builtin_expect(FEAT(F_BOUNDS_CHECK), 0)) {
+			Token *bc = try_bounds_checks(t);
+			if (bc) {
+				t = bc;
+				continue;
+			}
+		}
 		if (strip_sue_body && match_ch(t, '{')) {
 			Token *kw = NULL;
 			for (Token *s = start; s != t; s = tok_next(s))
@@ -2691,6 +2772,35 @@ static bool bounds_paren_derives_array(Token *open) {
 	return false;
 }
 
+/* `(a+i)` / `(a-i)` with tracked array — same unverifiable shape as `*(a+i)`. */
+static bool bounds_paren_array_arith(Token *open) {
+	if (!open || !match_ch(open, '(') || !(open->flags & TF_OPEN) || !tok_match(open)) return false;
+	Token *close = tok_match(open);
+	Token *scan_end = close;
+	Token *lhs = tok_next(open);
+	if (!lhs || lhs == close) return false;
+	while (lhs && match_ch(lhs, '(') && (lhs->flags & TF_OPEN) && tok_match(lhs)) {
+		Token *inner_cp = tok_match(lhs);
+		if (!inner_cp || tok_next(inner_cp) != scan_end) break;
+		lhs = tok_next(lhs);
+		scan_end = inner_cp;
+		if (!lhs || lhs == scan_end) return false;
+	}
+	bool has_addsub = false;
+	for (Token *t = lhs; t && t != scan_end && t->kind != TK_EOF; t = tok_next(t)) {
+		if ((t->flags & TF_OPEN) && tok_match(t)) {
+			t = tok_match(t);
+			continue;
+		}
+		if ((match_ch(t, '+') || match_ch(t, '-')) && !(t->flags & TF_OPEN)) {
+			has_addsub = true;
+			break;
+		}
+	}
+	if (!has_addsub) return false;
+	return bounds_find_array_ident(lhs, scan_end) != NULL;
+}
+
 static Token *try_bounds_check_subscript(Token *tok) {
 	if (!FEAT(F_BOUNDS_CHECK)) return NULL;
 	if (!match_ch(tok, '[') || !(tok->flags & TF_OPEN) || !tok_match(tok)) return NULL;
@@ -2704,9 +2814,25 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	Token *rp_prev = (ti >= 1) ? &token_pool[ti - 1] : NULL;
 	if (rp_prev) {
 		Token *rp = rp_prev;
-		if (match_ch(rp, ')') && (rp->flags & TF_CLOSE) && tok_match(rp) &&
-		    bounds_paren_derives_array(tok_match(rp)))
-			BOUNDS_COMM_DIAG(tok, ERR_BOUNDS_DERIVED_SUB);
+		if (match_ch(rp, ')') && (rp->flags & TF_CLOSE) && tok_match(rp)) {
+			Token *op = tok_match(rp);
+			if (bounds_paren_derives_array(op)) BOUNDS_COMM_DIAG(tok, ERR_BOUNDS_DERIVED_SUB);
+			/* `(a+i)[0]` must not wrap index 0 against sizeof(a) — the
+			 * base is already offset. Same unverifiable shape as `*(a+i)`. */
+			if (bounds_paren_array_arith(op)) {
+				if (FEAT(F_WARN_SAFETY))
+					warn_tok(tok,
+						 "-fbounds-check: pointer-arithmetic subscript with "
+						 "tracked array base cannot be verified (rewrite as "
+						 "array[index])");
+				else
+					error_tok(tok,
+						  "-fbounds-check: pointer-arithmetic subscript with "
+						  "tracked array base cannot be verified (rewrite as "
+						  "array[index])");
+				return NULL;
+			}
+		}
 	}
 
 	// ISO C treats `(i)[b]` the same as `i[b]` (commutative subscript).
@@ -2802,11 +2928,11 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	if (comma_resolved) BOUNDS_COMM_DIAG(tok, ERR_BOUNDS_COMMA_OP);
 	{
 		Token *rb = tok_match(tok);
-		if (rb && bounds_is_name_token(last_emitted)) {
+		if (rb && (bounds_is_name_token(last_emitted) || last_emitted->kind == TK_NUM)) {
 			bool memb = tok_idx(last_emitted) >= 1 &&
 				    (token_pool[tok_idx(last_emitted) - 1].tag & TT_MEMBER);
 			bool left_ok_scan = false;
-			if (!memb && !is_known_typedef(last_emitted)) {
+			if (!memb && last_emitted->kind != TK_NUM && !is_known_typedef(last_emitted)) {
 				TypedefEntry *tel = typedef_lookup(last_emitted);
 				left_ok_scan = tel && !tel->is_param && !tel->is_enum_const &&
 					       (tel->is_array || tel->is_vla_var);
@@ -2818,6 +2944,23 @@ static Token *try_bounds_check_subscript(Token *tok) {
 				hit = bounds_find_array_ident(tok_next(nx), rb);
 			}
 			if (hit) BOUNDS_COMM_DIAG(tok, ERR_BOUNDS_COMM_SCAN);
+			/* `0[(a+i)]` — array arith in index paren */
+			Token *inner0 = tok_next(tok);
+			if (!left_ok_scan && inner0 && match_ch(inner0, '(') && (inner0->flags & TF_OPEN) &&
+			    tok_match(inner0) && tok_next(tok_match(inner0)) == rb &&
+			    bounds_paren_array_arith(inner0)) {
+				if (FEAT(F_WARN_SAFETY))
+					warn_tok(tok,
+						 "-fbounds-check: pointer-arithmetic subscript with "
+						 "tracked array base cannot be verified (rewrite as "
+						 "array[index])");
+				else
+					error_tok(tok,
+						  "-fbounds-check: pointer-arithmetic subscript with "
+						  "tracked array base cannot be verified (rewrite as "
+						  "array[index])");
+				return NULL;
+			}
 		}
 	}
 	Token *name_tok = last_emitted;
@@ -2875,6 +3018,19 @@ static Token *try_bounds_check_subscript(Token *tok) {
 		Token *probe = last_emitted;
 		while (probe && match_ch(probe, ')') && tok_match(probe)) {
 			Token *op = tok_match(probe);
+			if (bounds_paren_array_arith(op)) {
+				if (FEAT(F_WARN_SAFETY))
+					warn_tok(tok,
+						 "-fbounds-check: pointer-arithmetic subscript with "
+						 "tracked array base cannot be verified (rewrite as "
+						 "array[index])");
+				else
+					error_tok(tok,
+						  "-fbounds-check: pointer-arithmetic subscript with "
+						  "tracked array base cannot be verified (rewrite as "
+						  "array[index])");
+				return NULL;
+			}
 			Token *hit = bounds_find_array_ident(tok_next(op), probe);
 			if (hit && is_tracked_array_name(hit)) {
 				name_tok = hit;
@@ -3016,6 +3172,19 @@ static Token *try_bounds_check_deref_add(Token *tok) {
 
 	Token *op = tok_next(tok);
 	if (!op || !match_ch(op, '(') || !(op->flags & TF_OPEN) || !tok_match(op)) return NULL;
+	/* Peel casts: `*(T*)(a+i)` / `*(int *)(a+i)` — otherwise the cast
+	 * group hides the additive paren and the check never fires. */
+	for (;;) {
+		Token *cast_close = tok_match(op);
+		Token *fi = tok_next(op);
+		bool looks_cast =
+		    fi && (is_type_keyword(fi) || (fi->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF)));
+		if (!looks_cast) break;
+		Token *after = tok_next(cast_close);
+		if (!after || !match_ch(after, '(') || !(after->flags & TF_OPEN) || !tok_match(after))
+			return NULL;
+		op = after;
+	}
 	Token *cp = tok_match(op);
 	Token *lhs = tok_next(op);
 	if (!lhs || lhs == cp) return NULL;
@@ -3437,6 +3606,13 @@ static Token *walk_balanced_orelse(Token *tok) {
 					  "use '[f() orelse 1]' not '[(f() orelse 1)]'");
 			prev = t;
 #endif
+			if (__builtin_expect(FEAT(F_BOUNDS_CHECK), 0)) {
+				Token *bc = try_bounds_checks(t);
+				if (bc) {
+					t = bc;
+					continue;
+				}
+			}
 			walk_balanced_tail(&t);
 		}
 		return tok_next(end);
@@ -5293,6 +5469,18 @@ static Token *handle_control_exit_defer(Token *tok) {
 }
 
 // Find a label in the current function's Phase 1D P1FuncEntry array.
+/* GNU __label__ stores names as "ident\\0scope_id" (mangled_len > ident len).
+ * Match both plain labels and that prefix form. Prefer the deepest scope when
+ * several __label__ bindings share a source name. */
+static bool p1_label_matches_tok(P1FuncEntry *e, Token *tok) {
+	if (e->kind != P1K_LABEL) return false;
+	if (e->label.len == tok->len && !memcmp(e->label.name, tok_loc(tok), tok->len)) return true;
+	if (e->label.len > tok->len && e->label.name[tok->len] == '\0' &&
+	    !memcmp(e->label.name, tok_loc(tok), tok->len))
+		return true;
+	return false;
+}
+
 static P1LabelResult p1_label_find(Token *tok, int func_idx) {
 	if (func_idx < 0 || func_idx >= func_meta_count) return (P1LabelResult){0, NULL};
 	FuncMeta *fm = &func_meta[func_idx];
@@ -5303,17 +5491,20 @@ static P1LabelResult p1_label_find(Token *tok, int func_idx) {
 			int slot = (h + probe) & fm->label_hash_mask;
 			if (fm->label_hash[slot] < 0) break;
 			P1FuncEntry *e = &entries[fm->label_hash[slot]];
-			if (e->label.len == tok->len && !memcmp(e->label.name, tok_loc(tok), tok->len))
+			/* Exact-len hit only — mangled __label__ hashes differ. */
+			if (e->label.len == tok->len && p1_label_matches_tok(e, tok))
 				return (P1LabelResult){scope_tree_depth(e->scope_id), e->tok};
 		}
-		return (P1LabelResult){0, NULL};
+		/* Fall through: __label__ mangled names miss the unmangled hash. */
 	}
+	P1LabelResult best = {0, NULL};
 	for (int i = 0; i < fm->entry_count; i++) {
-		if (entries[i].kind == P1K_LABEL && entries[i].label.len == tok->len &&
-		    !memcmp(entries[i].label.name, tok_loc(tok), tok->len))
-			return (P1LabelResult){scope_tree_depth(entries[i].scope_id), entries[i].tok};
+		if (!p1_label_matches_tok(&entries[i], tok)) continue;
+		int d = scope_tree_depth(entries[i].scope_id);
+		if (!best.tok || d >= best.scope_depth)
+			best = (P1LabelResult){d, entries[i].tok};
 	}
-	return (P1LabelResult){0, NULL};
+	return best;
 }
 
 static int p1_goto_exits(Token *goto_tok, int func_idx) {
@@ -5905,6 +6096,11 @@ static void build_pp_argv(const char **args, int *argc, const char *input_file, 
 			const char *f = ctx->extra_compiler_flags[i];
 			if (strncmp(f, "-D_GNU_SOURCE", 13) == 0 || strncmp(f, "-U_GNU_SOURCE", 13) == 0)
 				user_has_gnu = true;
+			/* Split `-U _GNU_SOURCE` / `-D _GNU_SOURCE`. */
+			if ((strcmp(f, "-U") == 0 || strcmp(f, "-D") == 0) &&
+			    i + 1 < ctx->extra_compiler_flags_count &&
+			    strncmp(ctx->extra_compiler_flags[i + 1], "_GNU_SOURCE", 11) == 0)
+				user_has_gnu = true;
 		}
 		if (!user_has_gnu) args[(*argc)++] = "-D_GNU_SOURCE";
 #ifdef __APPLE__
@@ -6133,6 +6329,15 @@ static void collect_source_defines(const char *input_file) {
 			continue;
 		}
 		while (*p == ' ' || *p == '\t') p++;
+		/* Digraph `%:` and trigraph `??=` are `#` — collect before PP. */
+		if (p[0] == '%' && p[1] == ':') {
+			p += 2;
+			goto parse_directive;
+		}
+		if (p[0] == '?' && p[1] == '?' && p[2] == '=') {
+			p += 3;
+			goto parse_directive;
+		}
 		if (*p != '#') {
 			if (*p == '\n' || *p == '\0' || (p[0] == '/' && p[1] == '/')) goto check_continuation;
 			if (p[0] == '/' && p[1] == '*') {
@@ -8056,6 +8261,44 @@ static void p1d_reject_proto_param_orelse(Token *open_paren) {
 // hard_ctx: reject file-scope / struct / over-paren wraps.
 // allow_se_hoist: local VLA decls may hoist temps for side-effect LHS;
 //   false for skipped paren groups (cast/sizeof/params) — reject SE instead.
+/* True when `[dim]` is part of a compound-literal type name: `(T[…]){`. */
+static bool bracket_in_compound_literal_type(Token *open_bracket) {
+	Token *close = tok_match(open_bracket);
+	if (!close) return false;
+	Token *t = tok_next(close);
+	while (t && t->kind != TK_EOF) {
+		if (match_ch(t, '[') && tok_match(t) && !(t->flags & TF_C23_ATTR)) {
+			t = tok_next(tok_match(t));
+			continue;
+		}
+		if ((t->flags & TF_C23_ATTR) && tok_match(t)) {
+			t = tok_next(tok_match(t));
+			continue;
+		}
+		break;
+	}
+	if (!t || !match_ch(t, ')')) return false;
+	Token *after = skip_noise(tok_next(t));
+	return after && match_ch(after, '{');
+}
+
+/* Non-ICE dimension LHS (variable / call) — illegal for compound-literal types. */
+static bool bracket_dim_lhs_nonconstant(Token *start, Token *end) {
+	for (Token *s = start; s && s != end && s->kind != TK_EOF; s = tok_next(s)) {
+		if (s->flags & TF_OPEN) {
+			s = tok_match(s);
+			continue;
+		}
+		if (s->kind != TK_IDENT) continue;
+		if (is_type_keyword(s) || (s->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_ATTR |
+							 TT_STORAGE | TT_ALIGNAS | TT_BITINT)))
+			continue;
+		if (typedef_lookup(s) || is_known_enum_const(s)) continue;
+		return true;
+	}
+	return false;
+}
+
 static void __attribute__((noinline))
 p1d_classify_bracket_orelse_ex(Token *tok, uint16_t cur_sid, int p1d_cur_func, bool hard_ctx,
 			       bool allow_se_hoist) {
@@ -8108,6 +8351,12 @@ p1d_classify_bracket_orelse_ex(Token *tok, uint16_t cur_sid, int p1d_cur_func, b
 								   true,
 								   true,
 								   false);
+				if (bracket_in_compound_literal_type(tok) &&
+				    bracket_dim_lhs_nonconstant(tok_next(tok), s))
+					error_tok(s,
+						  "'orelse' in compound-literal array dimension with "
+						  "non-constant LHS (compound literals cannot be VLAs); "
+						  "use a constant dimension or a named array");
 				prev_d0_oe = s;
 			} else {
 				/* Nested orelse: check LHS of the innermost group only.
@@ -9424,11 +9673,13 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 					  "function body)");
 		}
 
-		/* Decl dims are classified in probe; classify any remaining `[`
-		 * (expression subscripts, attr-split decls probe missed). */
+		/* Decl dims are classified in probe (with SE hoist). Remaining `[`
+		 * are expression subscripts / designators — in-place ternary, so
+		 * reject side-effect LHS rather than allowing a false hoist. */
 		if (FEAT(F_ORELSE) && match_ch(ps->tok, '[') && tok_match(ps->tok) &&
 		    !(ps->tok->flags & TF_C23_ATTR) && !(tok_ann(ps->tok) & P1_OE_BRACKET))
-			p1d_classify_bracket_orelse_ex(ps->tok, CUR_SID(), ps->p1d_cur_func, true, true);
+			p1d_classify_bracket_orelse_ex(ps->tok, CUR_SID(), ps->p1d_cur_func, true,
+						       /*allow_se_hoist=*/false);
 		// Phase 1: reject orelse *keyword* uses in enum constant
 		// expressions and struct/union bodies. Field / enumerator
 		// *names* named orelse are identifiers (shadowed or not).
@@ -9802,18 +10053,18 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 					}
 					Token *prev_sa = lp;
 					for (Token *s = tok_next(lp); s && s != rp; s = tok_next(s)) {
-						if (s->flags & TF_OPEN) {
-							prev_sa = tok_match(s);
-							s = tok_match(s);
-							continue;
-						}
+						/* Walk into nested groups — `(0 orelse 1)` and
+						 * `sizeof(0 orelse 1)` must reject, not leak. */
 						if (orelse_kw_at_bare(s, prev_sa) &&
 						    !(tok_ann(s) & P1_IS_ORELSE_KW))
 							error_tok(s,
 								  "'orelse' cannot be used in "
 								  "_Static_assert/static_assert except "
 								  "inside an array dimension");
-						prev_sa = s;
+						if (s->flags & TF_OPEN && tok_match(s))
+							prev_sa = s;
+						else
+							prev_sa = s;
 					}
 				}
 			}

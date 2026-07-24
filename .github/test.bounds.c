@@ -2176,6 +2176,55 @@ static void test_bounds_check_emit_statements_paths(void) {
 		CHECK(r.status != PRISM_OK, "bc-decl-init-deref-add: rejected");
 		prism_free(&r);
 	}
+	/* (a+i)[0] must reject — not wrap index 0 against sizeof(a). */
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[2]={1,2}; volatile int i=5; return (a+i)[0];}\n",
+		    "bc_offset_sub.c", f);
+		CHECK(r.status != PRISM_OK, "bc-offset-sub: (a+i)[0] rejected");
+		prism_free(&r);
+	}
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[2]={1,2}; volatile int i=5; return 0[a+i];}\n",
+		    "bc_comm_arith.c", f);
+		CHECK(r.status != PRISM_OK, "bc-comm-arith: 0[a+i] rejected");
+		prism_free(&r);
+	}
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[2]={1,2}; volatile int i=5; return *(int*)(a+i);}\n",
+		    "bc_cast_deref.c", f);
+		CHECK(r.status != PRISM_OK, "bc-cast-deref: *(T*)(a+i) rejected");
+		prism_free(&r);
+	}
+	/* typeof/_Atomic type-specifier dims must run bounds (emit_type_range). */
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[3]={1,2,3}; volatile int i=1;\n"
+		    "  typeof(int[*(a+i)]) *p=0; return !!p;}\n",
+		    "bc_typeof_dim.c", f);
+		CHECK(r.status != PRISM_OK, "bc-typeof-dim: typeof(int[*(a+i)]) rejected");
+		prism_free(&r);
+	}
+	{
+		PrismFeatures f = prism_defaults();
+		f.bounds_check = true;
+		PrismResult r = prism_transpile_source(
+		    "int main(void){int a[3]={1,2,3}; volatile int i=1;\n"
+		    "  _Atomic(int[*(a+i)]) *p=0; return !!p;}\n",
+		    "bc_atomic_dim.c", f);
+		CHECK(r.status != PRISM_OK, "bc-atomic-dim: _Atomic(int[*(a+i)]) rejected");
+		prism_free(&r);
+	}
 }
 
 #ifndef _WIN32
