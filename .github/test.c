@@ -480,6 +480,21 @@ int main(void) {
 		       suites[si].total, suites[si].elapsed);
 	}
 
+	bool accounting_ok = total_tests == total_pass + total_fail;
+	if (!accounting_ok) {
+		fprintf(stderr,
+			"[FAIL] harness accounting invariant: total(%d) != passed(%d) + failed(%d)\n",
+			total_tests,
+			total_pass,
+			total_fail);
+		/* Count the invariant itself as a failed meta-test and normalize the
+		 * displayed total to the observed outcomes. The diagnostic above keeps
+		 * the corrupt raw counters visible while the final summary and exit code
+		 * unambiguously report a failure. */
+		total_fail++;
+		total_tests = total_pass + total_fail;
+	}
+
 	printf("\n========================================\n");
 	printf("TOTAL: %d tests, %d passed, %d failed", total_tests, total_pass, total_fail);
 #ifndef _WIN32
@@ -488,13 +503,6 @@ int main(void) {
 	printf("\n");
 #endif
 	printf("========================================\n");
-	bool accounting_ok = total_tests == total_pass + total_fail;
-	if (!accounting_ok)
-		fprintf(stderr,
-			"[FAIL] harness accounting invariant: total(%d) != passed(%d) + failed(%d)\n",
-			total_tests,
-			total_pass,
-			total_fail);
 
-	return (total_fail == 0 && accounting_ok) ? 0 : 1;
+	return total_fail == 0 ? 0 : 1;
 }

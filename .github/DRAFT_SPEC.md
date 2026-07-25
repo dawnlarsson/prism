@@ -781,13 +781,19 @@ On match: substitute the `TK_NUM` value for the `TK_IDENT` in the dimension.
 
 ---
 
-15. Out-of-Line Assembly Extraction (-fnaked-asm)
-Problem: Standard C inline assembly (__asm__ volatile (...)) is the least portable feature in the C ecosystem. It blinds the compiler's optimizer, requires complex register constraint boilerplate, and fragments codebases between AT&T syntax (GCC/Clang) and Intel syntax (MSVC). Maintaining separate assembly files and C header definitions to bypass this is a massive boilerplate tax.
+## 15. Out-of-Line Assembly Extraction (`-fnaked-asm`)
 
-Design: Introduce a naked_asm block. Prism extracts the raw assembly strings, automatically generates a parallel assembly file with the correct directives for the target compiler's native assembler (GNU AS or MASM), and replaces the block in the C output with a clean extern prototype.
+### Problem
 
-Usage
-C
+Standard C inline assembly (`__asm__ volatile (...)`) is the least portable feature in the C ecosystem. It blinds the compiler's optimizer, requires complex register constraint boilerplate, and fragments codebases between AT&T syntax (GCC/Clang) and Intel syntax (MSVC). Maintaining separate assembly files and C header definitions to bypass this is a massive boilerplate tax.
+
+### Design
+
+Introduce a `naked_asm` block. Prism extracts the raw assembly strings, automatically generates a parallel assembly file with the correct directives for the target compiler's native assembler (GNU AS or MASM), and replaces the block in the C output with a clean `extern` prototype.
+
+### Usage
+
+```c
 // User's pure C file (main.c):
 #include <stdio.h>
 
@@ -800,11 +806,15 @@ int main(void) {
     my_custom_dispatcher();
     return 0;
 }
-Prism's Dual Output
-1. Emitted C File (main.c.tmp):
+```
+
+### Prism's Dual Output
+
+#### 1. Emitted C File (`main.c.tmp`)
+
 Prism completely strips the assembly block and replaces it with a standard ISO C forward declaration. This guarantees 100% portability to any C compiler. The backend compiler treats it as an opaque external function, preventing it from flushing registers to RAM or panicking about clobbers.
 
-C
+```c
 #include <stdio.h>
 
 extern void my_custom_dispatcher(void);
@@ -813,12 +823,15 @@ int main(void) {
     my_custom_dispatcher();
     return 0;
 }
-2. Synthesized Assembly File (Backend-Aware):
-Prism uses its existing compiler detection (cc_is_msvc, cc_is_clang) to wrap the exact strings the user wrote in the correct native assembler directives.
+```
 
-If targeting GCC / Clang / TCC (Generates prism_extracted.S):
+#### 2. Synthesized Assembly File (Backend-Aware)
 
-Code snippet
+Prism uses its existing compiler detection (`cc_is_msvc`, `cc_is_clang`) to wrap the exact strings the user wrote in the correct native assembler directives.
+
+**If targeting GCC / Clang / TCC** (generates `prism_extracted.S`):
+
+```c
 #if defined(__APPLE__)
     #define SYM(x) _##x
 #else
@@ -831,9 +844,11 @@ Code snippet
 SYM(my_custom_dispatcher):
     add spl, 8
     jmp qword ptr [rsp]
-If targeting MSVC (Generates prism_extracted.asm):
+```
 
-Code snippet
+**If targeting MSVC** (generates `prism_extracted.asm`):
+
+```asm
 PUBLIC my_custom_dispatcher
 .code
 my_custom_dispatcher PROC
@@ -841,28 +856,32 @@ my_custom_dispatcher PROC
     jmp qword ptr [rsp]
 my_custom_dispatcher ENDP
 END
-Architecture Fit
-Detection: In Pass 2, when the naked_asm keyword is encountered, Prism parses the function signature, then loops through the { ... } block capturing all TK_STR (string literal) tokens.
+```
 
-Dual-Stream Emission: Prism introduces an asm_fp alongside the standard out_fp. The function signature is emitted to out_fp as extern ... ;, and the strings are stripped of their quotes and written directly to asm_fp.
+### Architecture Fit
 
-The Pipeline: Prism's compile_sources already knows how to invoke the backend compiler with multiple files. If asm_fp has content, Prism dumps it to a temporary .S or .asm file and appends it to the compile_argv array.
+**Detection:** In Pass 2, when the `naked_asm` keyword is encountered, Prism parses the function signature, then loops through the `{ ... }` block capturing all `TK_STR` (string literal) tokens.
 
-Universal Build Routing: * On GCC/Clang, gcc main.c prism_extracted.S delegates to GNU AS.
+**Dual-Stream Emission:** Prism introduces an `asm_fp` alongside the standard `out_fp`. The function signature is emitted to `out_fp` as `extern ... ;`, and the strings are stripped of their quotes and written directly to `asm_fp`.
 
-On MSVC, Prism automatically invokes ml64.exe (MASM) on the .asm file to produce an .obj, then passes that object file to cl.exe alongside the C source.
+**The Pipeline:** Prism's `compile_sources` already knows how to invoke the backend compiler with multiple files. If `asm_fp` has content, Prism dumps it to a temporary `.S` or `.asm` file and appends it to the `compile_argv` array.
 
-Core Directives Maintained
-This respects Prism's core architectural constraint: We do not parse expressions. Prism doesn't need an x86 opcode table. It treats the assembly exactly as it treats C: as raw tokens to be macro-structurally reorganized and forwarded to the appropriate backend tool.
+**Universal Build Routing:**
 
-Impact
+- On GCC/Clang, `gcc main.c prism_extracted.S` delegates to GNU AS.
+- On MSVC, Prism automatically invokes `ml64.exe` (MASM) on the `.asm` file to produce an `.obj`, then passes that object file to `cl.exe` alongside the C source.
+
+### Core Directives Maintained
+
+This respects Prism's core architectural constraint: we do not parse expressions. Prism doesn't need an x86 opcode table. It treats the assembly exactly as it treats C: as raw tokens to be macro-structurally reorganized and forwarded to the appropriate backend tool.
+
+### Impact
+
 The developer gets the absolute raw power and zero-overhead of bare-metal Intel assembly, but the developer experience is as smooth as writing a standard C function in a single file.
 
-No .h header files to keep in sync.
-
-100% portability across any C compiler (GCC, Clang, MSVC, TCC), because the C compiler only ever sees ISO C.
-
-The agonizing assembler directive fragmentation (.globl vs PUBLIC, .text vs .code) is completely absorbed by the transpiler.
+- No `.h` header files to keep in sync.
+- 100% portability across any C compiler (GCC, Clang, MSVC, TCC), because the C compiler only ever sees ISO C.
+- The agonizing assembler directive fragmentation (`.globl` vs `PUBLIC`, `.text` vs `.code`) is completely absorbed by the transpiler.
 
 ---
 ## Priority Assessment

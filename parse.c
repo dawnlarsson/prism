@@ -280,8 +280,8 @@ typedef struct {
 	int line_delta;
 	bool owns_contents;
 	bool is_system;
-	bool is_include_entry; // True if inside a system #include chain (not just macro expansion)
 	bool is_direct_system_include; // Entered from non-system (re-emit as #include)
+	bool skip_emit; // Precomputed is_system && is_include_entry hot-path predicate
 } File;
 
 typedef enum {
@@ -310,6 +310,8 @@ enum {
 				   // non-flatten emit it is skipped verbatim. Precomputed at
 				   // tokenize from current_file so the hot emit loop tests one
 				   // flag bit instead of a per-token tok_cold + file lookup.
+	TF_HAS_PRISM = 1 << 12,	   // matched group contains a defer/orelse token
+	TF_LINK_JUMP = 1 << 13,	   // jump_idx overrides the ordinary tok + 1 link
 };
 
 enum {
@@ -347,15 +349,15 @@ enum {
 	TT_BITINT = 1 << 28,	  // _BitInt
 	TT_ALIGNAS = 1 << 29,	  // _Alignas, alignas
 	TT_ORELSE = 1 << 30,	  // orelse
-	TT_STRUCTURAL = 1u << 31, // Structural punctuation: { } ; : — forces slow-path dispatch
 };
+#define TT_STRUCTURAL (1u << 31) // { } ; : — force slow-path dispatch
 
 #define TT_DECL_START                                                                                        \
 	(TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_INLINE | TT_ALIGNAS | TT_SKIP_DECL | TT_ATTR)
 
 struct Token {
 	uint32_t tag;	    // TT_* bitmask - token classification
-	uint32_t next_idx;  // Token pool index (0 = NULL)
+	uint32_t jump_idx;  // Non-adjacent next-token index (TF_LINK_JUMP only)
 	uint32_t match_idx; // Token pool index (0 = NULL)
 	uint32_t len;	    // Token length in bytes (must handle >65535 for large literals)
 	uint8_t kind;
@@ -487,7 +489,7 @@ typedef struct PrismContext {
 	char **source_define_guards; // Parallel: NULL (unconditional) or condition guard text (malloc'd)
 	int source_define_count;
 	int source_define_cap;
-	Token *tp_pool;	    // Hot: tag, next_idx, match_idx, len, kind, flags
+	Token *tp_pool;	    // Hot: tag, jump_idx, match_idx, len, kind, flags
 	TokenCold *tp_cold; // Cold: loc_offset, line_no, file_idx
 	uint32_t tp_count;  // Next free index. 0 reserved as NULL sentinel.
 	uint32_t tp_cap;
@@ -551,14 +553,6 @@ static inline bool tok_at_bol(Token *tok) {
 	return tok->flags & TF_AT_BOL;
 }
 
-static inline bool tok_has_space(Token *tok) {
-	return tok->flags & TF_HAS_SPACE;
-}
-
-static inline void tok_set_at_bol(Token *tok, bool v) {
-	tok->flags = v ? (tok->flags | TF_AT_BOL) : (tok->flags & ~TF_AT_BOL);
-}
-
 static ArenaBlock *arena_new_block(size_t min_size, size_t default_size) {
 	size_t capacity = default_size;
 	if (min_size > capacity) capacity = min_size;
@@ -620,21 +614,9 @@ static void *arena_realloc(Arena *arena, void *old, size_t old_size, size_t new_
 		}
 	}
 	void *p = arena_alloc_uninit(arena, new_size);
-	if (old && old_size > 0) memcpy(p, old, old_size < new_size ? old_size : new_size);
-	if (new_size > old_size) memset((char *)p + old_size, 0, new_size - old_size);
+	if (old && old_size > 0) memcpy(p, old, old_size);
+	memset((char *)p + old_size, 0, new_size - old_size);
 	return p;
-}
-
-static char *arena_strdup(Arena *arena, const char *s) {
-	size_t len = strlen(s);
-	char *p = arena_alloc_uninit(arena, len + 1);
-	memcpy(p, s, len + 1);
-	return p;
-}
-
-static void arena_reset(Arena *arena) {
-	for (ArenaBlock *b = arena->head; b; b = b->next) b->used = 0;
-	arena->current = arena->head;
 }
 
 typedef struct {
@@ -696,18 +678,11 @@ static void token_pool_ensure(size_t need) {
 	if (!c) error("out of memory allocating token cold pool");
 	token_cold = c;
 	token_cap = (uint32_t)new_cap;
-	// (next_idx==0 means "no next") and must never look like a real token.
+	// Pool index 0 is the NULL sentinel and must never look like a real token.
 	if (token_count <= 1) {
 		memset(&token_pool[0], 0, sizeof(Token));
 		memset(&token_cold[0], 0, sizeof(TokenCold));
 	}
-}
-
-static inline Token *pool_alloc_token(void) {
-	if (token_count == UINT32_MAX) error("maximum token limit reached");
-	if (__builtin_expect(token_count < token_cap, 1)) return &token_pool[token_count++];
-	token_pool_ensure(token_count + 1);
-	return &token_pool[token_count++];
 }
 
 static inline PRISM_ALWAYS_INLINE PRISM_PURE TokenCold *tok_cold(Token *tok) {
@@ -721,16 +696,18 @@ static inline PRISM_ALWAYS_INLINE PRISM_PURE TokenCold *tok_cold(Token *tok) {
 	return &token_cold[idx];
 }
 
-static inline PRISM_ALWAYS_INLINE PRISM_PURE char *tok_loc(Token *tok) {
+static inline PRISM_PURE char *tok_loc(Token *tok) {
 	TokenCold *c = tok_cold(tok);
 	return ctx->input_files[c->file_idx]->contents + c->loc_offset;
 }
 
-static inline PRISM_ALWAYS_INLINE PRISM_PURE Token *tok_next(Token *tok) {
-	return tok->next_idx ? &token_pool[tok->next_idx] : NULL;
+static inline PRISM_PURE Token *tok_next(Token *tok) {
+	if (tok->kind == TK_EOF) return NULL;
+	if (__builtin_expect(!(tok->flags & TF_LINK_JUMP), 1)) return tok + 1;
+	return &token_pool[tok->jump_idx];
 }
 
-static inline PRISM_ALWAYS_INLINE PRISM_PURE Token *tok_match(Token *tok) {
+static inline PRISM_PURE Token *tok_match(Token *tok) {
 	return tok->match_idx ? &token_pool[tok->match_idx] : NULL;
 }
 
@@ -759,10 +736,10 @@ static inline PRISM_PURE uint64_t fast_hash(char *s, uint32_t len) {
 		a = ((uint64_t)(unsigned char)s[0] << 16) | ((uint64_t)(unsigned char)s[len >> 1] << 8) |
 		    (unsigned char)s[len - 1];
 	}
-	a ^= (uint64_t)len * 0x9e3779b97f4a7c15ULL;
 	/* Rotate b before mixing: for len == 8 the first and last 8 bytes are the
 	 * SAME, so a plain `a ^= b` cancels the content and every 8-char key hashes
 	 * to a constant → one giant open-addressing cluster → O(n^2) probing. */
+	a ^= (uint64_t)len * 0x9e3779b97f4a7c15ULL;
 	a ^= (b << 32) | (b >> 32);
 	a *= 0xbf58476d1ce4e5b9ULL;
 	a ^= a >> 31;
@@ -771,9 +748,7 @@ static inline PRISM_PURE uint64_t fast_hash(char *s, uint32_t len) {
 	return a;
 }
 
-static PRISM_HOT PRISM_PURE void *hashmap_get(HashMap *map, char *key, int keylen) {
-	if (__builtin_expect(!map->buckets, 0)) return NULL;
-	uint64_t hash = fast_hash(key, keylen);
+static PRISM_HOT PRISM_PURE void *hashmap_get_hashed(HashMap *map, char *key, int keylen, uint64_t hash) {
 	uint32_t hash32 = (uint32_t)hash;
 	int mask = map->capacity - 1;
 	for (int i = 0; i <= mask; i++) {
@@ -785,6 +760,17 @@ static PRISM_HOT PRISM_PURE void *hashmap_get(HashMap *map, char *key, int keyle
 			return ent->val;
 	}
 	return NULL;
+}
+
+static PRISM_PURE void *hashmap_get(HashMap *map, char *key, int keylen) {
+	if (__builtin_expect(!map->buckets, 0)) return NULL;
+	return hashmap_get_hashed(map, key, keylen, fast_hash(key, keylen));
+}
+
+static inline PRISM_PURE int hashmap_index_hashed(HashMap *map, char *key, int keylen, uint64_t hash) {
+	if (__builtin_expect(!map->buckets, 0)) return -1;
+	void *val = hashmap_get_hashed(map, key, keylen, hash);
+	return val ? (int)(intptr_t)val - 1 : -1;
 }
 
 static void hashmap_remove(HashMap *map, char *key, int keylen) {
@@ -826,15 +812,14 @@ static void hashmap_resize(HashMap *map, int newcap) {
 	*map = new_map;
 }
 
-static void hashmap_put(HashMap *map, char *key, int keylen, void *val) {
+static void hashmap_put_hashed(HashMap *map, char *key, int keylen, void *val, uint64_t hash) {
 	if (__builtin_expect(!map->buckets, 0)) {
 		map->buckets = arena_alloc(&ctx->main_arena, 64 * sizeof(HashEntry));
 		map->capacity = 64;
-	} else if (__builtin_expect((unsigned long)map->used * 100 / (unsigned long)map->capacity >= 70, 0)) {
+	} else if (__builtin_expect((uint64_t)map->used * 10 >= (uint64_t)map->capacity * 7, 0)) {
 		hashmap_resize(map, map->capacity * 2);
 	}
 
-	uint64_t hash = fast_hash(key, keylen);
 	uint32_t hash32 = (uint32_t)hash;
 	int mask = map->capacity - 1;
 	int first_empty = -1;
@@ -860,17 +845,24 @@ static void hashmap_put(HashMap *map, char *key, int keylen, void *val) {
 	map->used++;
 }
 
+static void hashmap_put(HashMap *map, char *key, int keylen, void *val) {
+	hashmap_put_hashed(map, key, keylen, val, fast_hash(key, keylen));
+}
+
 static void hashmap_discard(HashMap *map) {
 	*map = (HashMap){0};
 }
 
-static char *intern_filename(const char *name) {
-	return name ? arena_strdup(&ctx->main_arena, name) : NULL;
+static void hashmap_clear(HashMap *map) {
+	if (map->buckets) memset(map->buckets, 0, (size_t)map->capacity * sizeof(HashEntry));
+	map->used = 0;
 }
 
-static void free_file_contents(File *f) {
-	if (!f || !f->contents) return;
-	if (f->owns_contents) free(f->contents);
+static char *intern_filename(const char *name) {
+	if (!name) return NULL;
+	size_t len = strlen(name) + 1;
+	char *copy = arena_alloc_uninit(&ctx->main_arena, len);
+	return memcpy(copy, name, len);
 }
 
 static inline File *tok_file(Token *tok) {
@@ -1468,21 +1460,21 @@ static char *raw_string_literal_end(char *p, TokState *ts) {
 static inline __attribute__((always_inline)) Token *
 new_token(TokenKind kind, char *start, char *end, TokState *ts) {
 	File *cf = ctx->current_file;
-	Token *tok = pool_alloc_token();
+	if (token_count == UINT32_MAX) error("maximum token limit reached");
+	if (__builtin_expect(token_count >= token_cap, 0)) token_pool_ensure(token_count + 1);
+	uint32_t token_idx = token_count++;
+	Token *tok = &token_pool[token_idx];
 	tok->kind = kind;
 	tok->len = end - start;
-	tok->next_idx = 0;
 	tok->tag = 0;
 	tok->match_idx = 0;
-	/* TF_SYS_SKIP mirrors the emit-time `f->is_system && f->is_include_entry`
-	 * check exactly: file_idx below comes from this same `cf`, so tok_file()
-	 * at emit resolves to it. Setting the bit here lets the hot emit loop skip
-	 * the per-token tok_cold + file dereference. */
+	/* file_idx below comes from this same `cf`, so TF_SYS_SKIP exactly mirrors
+	 * the emit-time file predicate without a per-token cold-file dereference. */
 	tok->flags = (ts->at_bol ? TF_AT_BOL : 0) | (ts->has_space ? TF_HAS_SPACE : 0) |
-		     ((cf->is_system && cf->is_include_entry) ? TF_SYS_SKIP : 0);
+			     (cf->skip_emit ? TF_SYS_SKIP : 0);
 	tok->ann = 0;
 	tok->ch0 = (uint8_t)*start;
-	TokenCold *c = tok_cold(tok);
+	TokenCold *c = &token_cold[token_idx];
 	ptrdiff_t off = start - cf->contents;
 	if (off < 0 || (size_t)off > (size_t)UINT32_MAX)
 		error_at(start, "source file exceeds 4 GiB; cannot record token locations");
@@ -1522,8 +1514,7 @@ static Token *read_char_literal(char *start, char *quote, TokState *ts) {
 }
 
 static inline void classify_punct(Token *t) {
-	char *loc = tok_loc(t);
-	char c = loc[0];
+	char c = t->ch0;
 	if (t->len == 1) {
 		if (c == '=' || c == '[') t->tag = TT_ASSIGN;
 		else if (c == '.')
@@ -1533,17 +1524,20 @@ static inline void classify_punct(Token *t) {
 		if (c == '(' || c == '[' || c == '{') t->flags |= TF_OPEN;
 		else if (c == ')' || c == ']' || c == '}')
 			t->flags |= TF_CLOSE;
-	} else if (t->len == 2) {
-		char c2 = loc[1];
-		if (c2 == '=' && c != '!' && c != '<' && c != '>' && c != '=') t->tag = TT_ASSIGN;
-		else if (c == '+' && c2 == '+')
+	} else {
+		char *loc = tok_loc(t);
+		if (t->len == 2) {
+			char c2 = loc[1];
+			if (c2 == '=' && c != '!' && c != '<' && c != '>' && c != '=') t->tag = TT_ASSIGN;
+			else if (c == '+' && c2 == '+')
+				t->tag = TT_ASSIGN;
+			else if (c == '-' && c2 == '-')
+				t->tag = TT_ASSIGN;
+			else if (c == '-' && c2 == '>')
+				t->tag = TT_MEMBER;
+		} else if (t->len == 3 && loc[2] == '=' && (c == '<' || c == '>') && loc[1] == c)
 			t->tag = TT_ASSIGN;
-		else if (c == '-' && c2 == '-')
-			t->tag = TT_ASSIGN;
-		else if (c == '-' && c2 == '>')
-			t->tag = TT_MEMBER;
-	} else if (t->len == 3 && loc[2] == '=' && (c == '<' || c == '>') && loc[1] == c)
-		t->tag = TT_ASSIGN;
+	}
 }
 
 static inline bool delimiters_match(Token *open, Token *close) {
@@ -1606,13 +1600,24 @@ static bool p0_soft_noreturn_is_decl_specifier(Token *tok) {
 	return false;
 }
 
-static bool p0_attribute_inside_parameter_list(Token *first, Token *attr) {
-	uint32_t attr_idx = tok_idx(attr);
-	for (Token *open = first; open && open != attr; open = tok_next(open)) {
-		if (open->ch0 != '(' || !(open->flags & TF_OPEN) || open->match_idx <= attr_idx)
+static bool p0_attribute_inside_parameter_list(Token *attr) {
+	int depth = 0;
+	for (uint32_t i = tok_idx(attr); i > 0; i--) {
+		Token *t = &token_pool[i - 1];
+		if (t->kind == TK_PREP_DIR) continue;
+		if (t->flags & TF_CLOSE) {
+			depth++;
 			continue;
-		Token *name = p0_previous_token(open);
-		if (p0_token_can_name_function(name)) return true;
+		}
+		if (t->flags & TF_OPEN) {
+			if (depth > 0) {
+				depth--;
+				continue;
+			}
+			if (match_ch(t, '(') && p0_token_can_name_function(p0_previous_token(t))) return true;
+			continue;
+		}
+		if (depth == 0 && (match_ch(t, ';') || match_ch(t, '{') || match_ch(t, '}'))) break;
 	}
 	return false;
 }
@@ -1630,16 +1635,6 @@ static Token *find_wrapper_callee(Token *body) {
 	Token *after = tok_next(tok_match(open));
 	while (after && after != end && after->ch0 == ';') after = tok_next(after);
 	return after == end ? tok : NULL;
-}
-
-static File *new_file(char *name, int file_no, char *contents) {
-	File *file = arena_alloc(&ctx->main_arena, sizeof(File));
-	file->name = intern_filename(name);
-	file->file_no = file_no;
-	file->contents = contents;
-	file->contents_len = strlen(contents);
-	file->owns_contents = true;
-	return file;
 }
 
 static void add_input_file(File *file) {
@@ -1661,8 +1656,8 @@ new_file_view(const char *name, File *base, int line_delta, bool is_system, bool
 	file->contents_len = base->contents_len;
 	file->line_delta = line_delta;
 	file->is_system = is_system;
-	file->is_include_entry = is_include_entry;
 	file->is_direct_system_include = false;
+	file->skip_emit = is_system && is_include_entry;
 	add_input_file(file);
 	return file;
 }
@@ -1841,16 +1836,7 @@ static Token *tokenize(File *file) {
 	if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF)
 		p += 3;
 	token_pool_ensure(token_count + file->contents_len / 2 + 4096);
-	uint32_t first_idx = 0;
-	uint32_t cur_idx = 0;
-#define LINK(nt)                                                                                             \
-	do {                                                                                                 \
-		uint32_t _ni = tok_idx(nt);                                                                  \
-		if (cur_idx) token_pool[cur_idx].next_idx = _ni;                                             \
-		else                                                                                         \
-			first_idx = _ni;                                                                     \
-		cur_idx = _ni;                                                                               \
-	} while (0)
+	uint32_t first_idx = token_count;
 	TokState ts = {true, false, 1};
 	bool in_system_include = false;
 	bool saw_taint_kw = false, saw_asm_kw = false, saw_attr_kw = false, saw_noreturn_kw = false;
@@ -1867,8 +1853,7 @@ static Token *tokenize(File *file) {
 				continue;
 			}
 			while (*p && *p != '\n') p++;
-			LINK(new_token(TK_PREP_DIR, directive_start, p, &ts));
-			tok_set_at_bol(&token_pool[cur_idx], true);
+			new_token(TK_PREP_DIR, directive_start, p, &ts)->flags |= TF_AT_BOL;
 			if (*p == '\n') {
 				p++;
 				ts.line_no++;
@@ -1916,8 +1901,7 @@ static Token *tokenize(File *file) {
 		if (IS_DIGIT(*p) || (*p == '.' && IS_DIGIT(p[1]))) {
 			char *start = p;
 			p = scan_pp_number(p, NULL);
-			Token *t = new_token(TK_NUM, start, p, &ts);
-			LINK(t);
+			new_token(TK_NUM, start, p, &ts);
 			continue;
 		}
 		{ // Raw string literals
@@ -1927,14 +1911,12 @@ static Token *tokenize(File *file) {
 												     : -1;
 			if (raw_pfx >= 0 && p[raw_pfx] == 'R' && p[raw_pfx + 1] == '"') {
 				Token *nt = read_raw_string_literal(p, p + raw_pfx + 1, &ts);
-				LINK(nt);
 				p += nt->len;
 				continue;
 			}
 		}
 		if (*p == '"') {
 			Token *nt = read_string_literal(p, p, &ts);
-			LINK(nt);
 			p += nt->len;
 			continue;
 		}
@@ -1943,25 +1925,21 @@ static Token *tokenize(File *file) {
 			char *start = p;
 			p += (p[0] == 'u' && p[1] == '8') ? 2 : 1;
 			Token *nt = read_string_literal(start, p, &ts);
-			LINK(nt);
 			p = start + nt->len;
 			continue;
 		}
 		if (*p == '\'') {
 			Token *nt = read_char_literal(p, p, &ts);
-			LINK(nt);
 			p += nt->len;
 			continue;
 		}
 		if (p[0] == 'u' && p[1] == '8' && p[2] == '\'') {
 			Token *nt = read_char_literal(p, p + 2, &ts);
-			LINK(nt);
 			p += nt->len;
 			continue;
 		}
 		if ((p[0] == 'u' || p[0] == 'U' || p[0] == 'L') && p[1] == '\'') {
 			Token *nt = read_char_literal(p, p + 1, &ts);
-			LINK(nt);
 			p += nt->len;
 			continue;
 		}
@@ -1969,7 +1947,6 @@ static Token *tokenize(File *file) {
 		int ident_len = read_ident(p);
 		if (ident_len) {
 			Token *t = new_token(TK_IDENT, p, p + ident_len, &ts);
-			LINK(t);
 			uint64_t kw = keyword_lookup(p, ident_len);
 			if (kw) {
 				if (kw & KW_MARKER) {
@@ -1992,7 +1969,6 @@ static Token *tokenize(File *file) {
 		if (punct_len) {
 			int abs_len = punct_len < 0 ? -punct_len : punct_len;
 			Token *t = new_token(TK_PUNCT, p, p + abs_len, &ts);
-			LINK(t);
 			if (punct_len < 0) {
 				char *norm;
 				switch (abs_len == 4 ? '%' : p[0]) {
@@ -2020,8 +1996,7 @@ static Token *tokenize(File *file) {
 		error_at(p, "invalid token");
 	}
 
-	LINK(new_token(TK_EOF, p, p, &ts));
-#undef LINK
+	new_token(TK_EOF, p, p, &ts);
 
 	Token *first = first_idx ? &token_pool[first_idx] : NULL;
 	// Also detect C23 [[ ... ]] attributes and tag the first '[' with TF_C23_ATTR.
@@ -2029,7 +2004,9 @@ static Token *tokenize(File *file) {
 		int stack_cap = 256;
 		Token **stack = arena_alloc_uninit(&ctx->main_arena, stack_cap * sizeof(Token *));
 		int sp = 0;
+		uint32_t last_prism_idx = 0;
 		for (Token *t = first; t && t->kind != TK_EOF; t = tok_next(t)) {
+			if (t->tag & (TT_DEFER | TT_ORELSE)) last_prism_idx = tok_idx(t);
 			if (t->flags & TF_OPEN) {
 				ARENA_ENSURE_CAP(
 				    &ctx->main_arena, stack, sp + 1, stack_cap, 256, Token *);
@@ -2049,6 +2026,7 @@ static Token *tokenize(File *file) {
 						  open->ch0);
 				open->match_idx = tok_idx(t);
 				t->match_idx = tok_idx(open);
+				if (last_prism_idx > tok_idx(open)) open->flags |= TF_HAS_PRISM;
 			}
 		}
 		if (sp > 0) error_tok(stack[sp - 1], "unclosed delimiter '%c'", stack[sp - 1]->ch0);
@@ -2452,7 +2430,7 @@ static Token *tokenize(File *file) {
 			}
 
 			if (!is_noreturn) continue;
-			if (attribute_form && p0_attribute_inside_parameter_list(first, attr_origin))
+			if (attribute_form && p0_attribute_inside_parameter_list(attr_origin))
 				continue;
 			Token *fn_name = NULL;
 			/* Post-declarator attrs (`void die(void) __attribute__((noreturn)), live`)
@@ -2575,7 +2553,12 @@ static void ensure_keyword_cache(void) {
 }
 
 static inline Token *finalize_load(char *name, char *buf) {
-	File *file = new_file(name, ctx->input_file_count, buf);
+	File *file = arena_alloc(&ctx->main_arena, sizeof(File));
+	*file = (File){.name = intern_filename(name),
+		       .contents = buf,
+		       .contents_len = strlen(buf),
+		       .file_no = ctx->input_file_count,
+		       .owns_contents = true};
 	add_input_file(file);
 	return tokenize(file);
 }
@@ -2956,6 +2939,7 @@ static PRISM_PURE Token *skip_to_semicolon(Token *tok, Token *end) {
  * so bounds-check array shadows do not force O(n²) linear walks mid-TU. */
 static PRISM_THREAD_LOCAL HashMap td_tl_map; /* name → packed (base<<32)|count into td_tl_idxs */
 static PRISM_THREAD_LOCAL int *td_tl_idxs;
+static PRISM_THREAD_LOCAL int td_tl_cap;
 static PRISM_THREAD_LOCAL int td_max_chain_seen; /* capped sample; ≥8 triggers timeline build */
 static PRISM_THREAD_LOCAL int td_tl_count_at_build; /* typedef_table.count when timelines last built */
 
@@ -2986,6 +2970,7 @@ typedef struct {
 static PRISM_THREAD_LOCAL BoundsArrayTable bounds_array_table;
 static PRISM_THREAD_LOCAL HashMap ba_tl_map;
 static PRISM_THREAD_LOCAL int *ba_tl_idxs;
+static PRISM_THREAD_LOCAL int ba_tl_cap;
 static PRISM_THREAD_LOCAL int ba_max_chain_seen;
 static PRISM_THREAD_LOCAL int ba_tl_count_at_build;
 
@@ -2997,6 +2982,7 @@ static void bounds_array_table_reset(void) {
 	hashmap_discard(&bounds_array_table.name_map);
 	hashmap_discard(&ba_tl_map);
 	ba_tl_idxs = NULL;
+	ba_tl_cap = 0;
 	ba_max_chain_seen = 0;
 	ba_tl_count_at_build = 0;
 }
@@ -3009,14 +2995,14 @@ static void typedef_table_reset(void) {
 	hashmap_discard(&typedef_table.name_map);
 	hashmap_discard(&td_tl_map);
 	td_tl_idxs = NULL;
+	td_tl_cap = 0;
 	td_max_chain_seen = 0;
 	td_tl_count_at_build = 0;
 	bounds_array_table_reset();
 }
 
 static PRISM_PURE int typedef_get_index(char *name, int len) {
-	void *val = hashmap_get(&typedef_table.name_map, name, len);
-	return val ? (int)(intptr_t)val - 1 : -1;
+	return hashmap_index_hashed(&typedef_table.name_map, name, len, fast_hash(name, len));
 }
 
 static int td_tl_cmp_tok(const void *pa, const void *pb) {
@@ -3026,25 +3012,12 @@ static int td_tl_cmp_tok(const void *pa, const void *pb) {
 }
 
 static void td_build_timelines(void) {
-	hashmap_discard(&td_tl_map);
-	td_tl_idxs = NULL;
+	hashmap_clear(&td_tl_map);
 	td_tl_count_at_build = typedef_table.count;
 	if (td_max_chain_seen < 8 || !typedef_table.name_map.buckets) return;
 
 	/* Walk name_map heads only (one probe per unique name). */
-	int slots = 0;
 	int cap = typedef_table.name_map.capacity;
-	for (int b = 0; b < cap; b++) {
-		HashEntry *ent = &typedef_table.name_map.buckets[b];
-		if (!ent->key || ent->key == TOMBSTONE) continue;
-		int head = (int)(intptr_t)ent->val - 1;
-		int run = 0;
-		for (int j = head; j >= 0; j = typedef_table.entries[j].prev_index) run++;
-		if (run >= 8) slots += run;
-	}
-	if (!slots) return;
-
-	td_tl_idxs = arena_alloc_uninit(&ctx->main_arena, (size_t)slots * sizeof(int));
 	int pos = 0;
 	for (int b = 0; b < cap; b++) {
 		HashEntry *ent = &typedef_table.name_map.buckets[b];
@@ -3054,17 +3027,16 @@ static void td_build_timelines(void) {
 		for (int j = head; j >= 0; j = typedef_table.entries[j].prev_index) run++;
 		if (run < 8) continue;
 		int base = pos;
+		ARENA_ENSURE_CAP(&ctx->main_arena, td_tl_idxs, pos + run, td_tl_cap, 64, int);
 		for (int j = head; j >= 0; j = typedef_table.entries[j].prev_index)
 			td_tl_idxs[pos++] = j;
 		qsort(td_tl_idxs + base, (size_t)run, sizeof(int), td_tl_cmp_tok);
-		hashmap_put(&td_tl_map, ent->key, ent->key_len,
-			    (void *)(((uintptr_t)(uint32_t)base << 32) | (uint32_t)run));
+		hashmap_put_hashed(&td_tl_map, ent->key, ent->key_len,
+				   (void *)(((uintptr_t)(uint32_t)base << 32) | (uint32_t)run), ent->hash);
 	}
 }
 
-static PRISM_PURE TypedefEntry *td_lookup_timeline(char *name, int len, uint32_t cur, bool tags_only) {
-	void *val = hashmap_get(&td_tl_map, name, len);
-	if (!val) return NULL;
+static PRISM_PURE TypedefEntry *td_lookup_timeline(void *val, uint32_t cur, bool tags_only) {
 	uint32_t base = (uint32_t)((uintptr_t)val >> 32);
 	uint32_t run = (uint32_t)(uintptr_t)val;
 	int lo = (int)base, hi = (int)base + (int)run;
@@ -3090,8 +3062,7 @@ static PRISM_PURE TypedefEntry *td_lookup_timeline(char *name, int len, uint32_t
 }
 
 static PRISM_PURE int bounds_array_get_index(char *name, int len) {
-	void *val = hashmap_get(&bounds_array_table.name_map, name, len);
-	return val ? (int)(intptr_t)val - 1 : -1;
+	return hashmap_index_hashed(&bounds_array_table.name_map, name, len, fast_hash(name, len));
 }
 
 static int ba_tl_cmp_tok(const void *pa, const void *pb) {
@@ -3101,24 +3072,11 @@ static int ba_tl_cmp_tok(const void *pa, const void *pb) {
 }
 
 static void ba_build_timelines(void) {
-	hashmap_discard(&ba_tl_map);
-	ba_tl_idxs = NULL;
+	hashmap_clear(&ba_tl_map);
 	ba_tl_count_at_build = bounds_array_table.count;
 	if (ba_max_chain_seen < 8 || !bounds_array_table.name_map.buckets) return;
 
-	int slots = 0;
 	int cap = bounds_array_table.name_map.capacity;
-	for (int b = 0; b < cap; b++) {
-		HashEntry *ent = &bounds_array_table.name_map.buckets[b];
-		if (!ent->key || ent->key == TOMBSTONE) continue;
-		int head = (int)(intptr_t)ent->val - 1;
-		int run = 0;
-		for (int j = head; j >= 0; j = bounds_array_table.entries[j].prev_index) run++;
-		if (run >= 8) slots += run;
-	}
-	if (!slots) return;
-
-	ba_tl_idxs = arena_alloc_uninit(&ctx->main_arena, (size_t)slots * sizeof(int));
 	int pos = 0;
 	for (int b = 0; b < cap; b++) {
 		HashEntry *ent = &bounds_array_table.name_map.buckets[b];
@@ -3128,17 +3086,16 @@ static void ba_build_timelines(void) {
 		for (int j = head; j >= 0; j = bounds_array_table.entries[j].prev_index) run++;
 		if (run < 8) continue;
 		int base = pos;
+		ARENA_ENSURE_CAP(&ctx->main_arena, ba_tl_idxs, pos + run, ba_tl_cap, 64, int);
 		for (int j = head; j >= 0; j = bounds_array_table.entries[j].prev_index)
 			ba_tl_idxs[pos++] = j;
 		qsort(ba_tl_idxs + base, (size_t)run, sizeof(int), ba_tl_cmp_tok);
-		hashmap_put(&ba_tl_map, ent->key, ent->key_len,
-			    (void *)(((uintptr_t)(uint32_t)base << 32) | (uint32_t)run));
+		hashmap_put_hashed(&ba_tl_map, ent->key, ent->key_len,
+				   (void *)(((uintptr_t)(uint32_t)base << 32) | (uint32_t)run), ent->hash);
 	}
 }
 
-static PRISM_PURE BoundsArrayEntry *ba_lookup_timeline(char *name, int len, uint32_t cur) {
-	void *val = hashmap_get(&ba_tl_map, name, len);
-	if (!val) return NULL;
+static PRISM_PURE BoundsArrayEntry *ba_lookup_timeline(void *val, uint32_t cur) {
 	uint32_t base = (uint32_t)((uintptr_t)val >> 32);
 	uint32_t run = (uint32_t)(uintptr_t)val;
 	int lo = (int)base, hi = (int)base + (int)run;
@@ -3157,8 +3114,9 @@ static PRISM_PURE BoundsArrayEntry *ba_lookup_timeline(char *name, int len, uint
 }
 
 static void bounds_array_add(char *name, int len, uint32_t token_index, uint8_t array_rank,
-			     bool dim_complete, bool is_vla_var, bool is_param) {
-	int existing = bounds_array_get_index(name, len);
+				     bool dim_complete, bool is_vla_var, bool is_param) {
+	uint64_t hash = fast_hash(name, len);
+	int existing = hashmap_index_hashed(&bounds_array_table.name_map, name, len, hash);
 	if (existing >= 0) {
 		BoundsArrayEntry *prev = &bounds_array_table.entries[existing];
 		if (prev->token_index == token_index && prev->scope_open_idx == td_scope_open &&
@@ -3189,7 +3147,8 @@ static void bounds_array_add(char *name, int len, uint32_t token_index, uint8_t 
 	e->array_dim_complete = dim_complete;
 	e->is_vla_var = is_vla_var;
 	e->is_param = is_param;
-	hashmap_put(&bounds_array_table.name_map, name, len, (void *)(intptr_t)(new_index + 1));
+	hashmap_put_hashed(
+	    &bounds_array_table.name_map, name, len, (void *)(intptr_t)(new_index + 1), hash);
 	bounds_array_table.bloom |= 1ULL << (((unsigned char)name[0] ^ len) & 63);
 	int cl = 1;
 	for (int p = e->prev_index; p >= 0 && cl < 8; p = bounds_array_table.entries[p].prev_index) cl++;
@@ -3207,16 +3166,16 @@ static PRISM_PURE BoundsArrayEntry *bounds_array_lookup(Token *tok) {
 	char *name = tok_loc(tok);
 	uint32_t cur = tok_idx(tok);
 	if (ba_tl_idxs) {
-		int idx = bounds_array_get_index(name, (int)tok->len);
+		uint64_t hash = fast_hash(name, tok->len);
+		int idx = hashmap_index_hashed(&bounds_array_table.name_map, name, (int)tok->len, hash);
 		while (idx >= ba_tl_count_at_build) {
 			BoundsArrayEntry *e = &bounds_array_table.entries[idx];
 			if (e->token_index <= cur && cur >= e->scope_open_idx && cur < e->scope_close_idx)
 				return e;
 			idx = e->prev_index;
 		}
-		BoundsArrayEntry *hit = ba_lookup_timeline(name, (int)tok->len, cur);
-		if (hit) return hit;
-		if (hashmap_get(&ba_tl_map, name, (int)tok->len)) return NULL;
+		void *tl = hashmap_get_hashed(&ba_tl_map, name, (int)tok->len, hash);
+		if (tl) return ba_lookup_timeline(tl, cur);
 		while (idx >= 0) {
 			BoundsArrayEntry *e = &bounds_array_table.entries[idx];
 			if (e->token_index <= cur && cur >= e->scope_open_idx && cur < e->scope_close_idx)
@@ -3246,28 +3205,21 @@ static PRISM_PURE BoundsArrayEntry *bounds_array_entry_for_token(Token *t) {
 
 static void
 typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool is_vla, bool is_void) {
+	uint64_t hash = fast_hash(name, len);
+	int existing = hashmap_index_hashed(&typedef_table.name_map, name, len, hash);
 	// Skip duplicate re-definitions at the same scope (valid C11 §6.7/3).
-	if (kind == TDK_TYPEDEF || kind == TDK_ENUM_CONST || kind == TDK_STRUCT_TAG) {
-		int existing = typedef_get_index(name, len);
-		if (existing >= 0) {
-			TypedefEntry *prev = &typedef_table.entries[existing];
-			if (prev->scope_depth == scope_depth && !prev->is_shadow &&
-			    prev->scope_open_idx == td_scope_open &&
-			    prev->scope_close_idx == td_scope_close &&
-			    prev->is_struct_tag == (kind == TDK_STRUCT_TAG))
-				return;
-		}
-	}
-	if (kind == TDK_SHADOW || kind == TDK_VLA_VAR) {
-		int existing = typedef_get_index(name, len);
-		if (existing >= 0) {
-			TypedefEntry *prev = &typedef_table.entries[existing];
+	if (existing >= 0) {
+		TypedefEntry *prev = &typedef_table.entries[existing];
+		if (kind == TDK_SHADOW || kind == TDK_VLA_VAR) {
 			if (prev->scope_depth == scope_depth && prev->scope_open_idx == td_scope_open &&
 			    prev->scope_close_idx == td_scope_close &&
 			    prev->is_shadow == (kind == TDK_SHADOW) &&
 			    prev->is_vla_var == (kind == TDK_VLA_VAR))
 				return;
-		}
+		} else if (prev->scope_depth == scope_depth && !prev->is_shadow &&
+			   prev->scope_open_idx == td_scope_open && prev->scope_close_idx == td_scope_close &&
+			   prev->is_struct_tag == (kind == TDK_STRUCT_TAG))
+			return;
 	}
 
 	ARENA_ENSURE_CAP(&ctx->main_arena,
@@ -3292,11 +3244,11 @@ typedef_add_entry(char *name, int len, int scope_depth, TypedefKind kind, bool i
 	e->array_rank = 0;
 	e->array_dim_complete = true;
 	e->is_atomic = false;
-	e->prev_index = typedef_get_index(name, len);
+	e->prev_index = existing;
 	e->token_index = 0;
 	e->scope_open_idx = td_scope_open;
 	e->scope_close_idx = td_scope_close;
-	hashmap_put(&typedef_table.name_map, name, len, (void *)(intptr_t)(new_index + 1));
+	hashmap_put_hashed(&typedef_table.name_map, name, len, (void *)(intptr_t)(new_index + 1), hash);
 	typedef_table.bloom |= 1ULL << (((unsigned char)name[0] ^ len) & 63);
 	int cl = 1;
 	for (int p = e->prev_index; p >= 0 && cl < 8; p = typedef_table.entries[p].prev_index) cl++;
@@ -3322,8 +3274,9 @@ static PRISM_PURE TypedefEntry *typedef_lookup(Token *tok) {
 	char *name = tok_loc(tok);
 	uint32_t cur = tok_idx(tok);
 	if (td_tl_idxs) {
+		uint64_t hash = fast_hash(name, tok->len);
 		TypedefEntry *tag_fallback = NULL;
-		int idx = typedef_get_index(name, (int)tok->len);
+		int idx = hashmap_index_hashed(&typedef_table.name_map, name, (int)tok->len, hash);
 		/* Entries added since the last build are absent from the sorted
 		 * timeline. Walk only that short newest prefix (cadence ≤64). */
 		while (idx >= td_tl_count_at_build) {
@@ -3335,11 +3288,11 @@ static PRISM_PURE TypedefEntry *typedef_lookup(Token *tok) {
 			}
 			idx = e->prev_index;
 		}
-		TypedefEntry *hit = td_lookup_timeline(name, (int)tok->len, cur, false);
-		if (hit) return hit;
-		if (tag_fallback) return tag_fallback;
-		/* Name has a timeline → old entries are covered; definitive miss. */
-		if (hashmap_get(&td_tl_map, name, (int)tok->len)) return NULL;
+		void *tl = hashmap_get_hashed(&td_tl_map, name, (int)tok->len, hash);
+		if (tl) {
+			TypedefEntry *hit = td_lookup_timeline(tl, cur, false);
+			return hit ? hit : tag_fallback;
+		}
 		/* Short chain (no timeline): finish the ordinary walk from idx. */
 		while (idx >= 0) {
 			TypedefEntry *e = &typedef_table.entries[idx];
@@ -3374,7 +3327,8 @@ static PRISM_PURE TypedefEntry *tag_lookup(Token *tok) {
 	char *name = tok_loc(tok);
 	uint32_t cur = tok_idx(tok);
 	if (td_tl_idxs) {
-		int idx = typedef_get_index(name, (int)tok->len);
+		uint64_t hash = fast_hash(name, tok->len);
+		int idx = hashmap_index_hashed(&typedef_table.name_map, name, (int)tok->len, hash);
 		while (idx >= td_tl_count_at_build) {
 			TypedefEntry *e = &typedef_table.entries[idx];
 			if (e->is_struct_tag && e->token_index <= cur && cur >= e->scope_open_idx &&
@@ -3382,9 +3336,8 @@ static PRISM_PURE TypedefEntry *tag_lookup(Token *tok) {
 				return e;
 			idx = e->prev_index;
 		}
-		TypedefEntry *hit = td_lookup_timeline(name, (int)tok->len, cur, true);
-		if (hit) return hit;
-		if (hashmap_get(&td_tl_map, name, (int)tok->len)) return NULL;
+		void *tl = hashmap_get_hashed(&td_tl_map, name, (int)tok->len, hash);
+		if (tl) return td_lookup_timeline(tl, cur, true);
 		while (idx >= 0) {
 			TypedefEntry *e = &typedef_table.entries[idx];
 			if (e->is_struct_tag && e->token_index <= cur && cur >= e->scope_open_idx &&
@@ -3474,17 +3427,12 @@ static inline PRISM_PURE bool is_soft_keyword_identifier(Token *tok) {
 	return tok && tok->kind == TK_KEYWORD && (tok->flags & TF_SOFT_KW);
 }
 
-static inline bool soft_keyword_decl_name_boundary_ex(Token *tok, bool allow_rparen) {
+static inline bool soft_keyword_decl_name_boundary(Token *tok) {
 	Token *after = skip_noise(tok_next(tok));
 	/* Include '(' so `int orelse(int);` / `T defer(void)` treat the soft
 	 * keyword as a declarator name (function prototype), not an operator. */
 	uint64_t end = CH(';') | CH(',') | CH('=') | CH('[') | CH(':') | CH('(');
-	if (allow_rparen) end |= CH(')');
 	return after && (match_set(after, end) || (after->tag & TT_ASM));
-}
-
-static inline bool soft_keyword_decl_name_boundary(Token *tok) {
-	return soft_keyword_decl_name_boundary_ex(tok, false);
 }
 
 static inline PRISM_PURE bool is_valid_varname(Token *tok) {
@@ -3538,11 +3486,6 @@ static inline PRISM_PURE bool is_orelse_kw_shadow(Token *tok) {
 	if (!(tok->tag & TT_ORELSE)) return false;
 	TypedefEntry *te = typedef_lookup(tok);
 	return !te || te->is_shadow;
-}
-
-static inline PRISM_PURE bool is_orelse_kw(Token *tok) {
-	if (!(tok->tag & TT_ORELSE)) return false;
-	return !typedef_lookup(tok);
 }
 
 static bool close_brace_ends_sue_body(Token *tok);
@@ -4065,10 +4008,6 @@ static inline bool struct_body_field_is_vla_typedef(Token *id, Token *prev) {
 	return struct_body_field_pred(id, prev, true);
 }
 
-static inline bool struct_body_field_volatile_member(Token *id, Token *prev) {
-	return struct_body_field_pred(id, prev, false);
-}
-
 enum StructBodyScan { SBS_VLA, SBS_VOL };
 
 static bool struct_body_scan(Token *brace, enum StructBodyScan what) {
@@ -4095,7 +4034,7 @@ static bool struct_body_scan(Token *brace, enum StructBodyScan what) {
 			if (struct_body_field_is_vla_typedef(t, prev)) return true;
 		} else {
 			if (t->tag & TT_VOLATILE) return true;
-			if (struct_body_field_volatile_member(t, prev)) return true;
+			if (struct_body_field_pred(t, prev, false)) return true;
 		}
 	}
 	return false;
@@ -5013,7 +4952,7 @@ unwind_if:
 		Token *n = skip_prep_dirs(tok_next(tok));
 		if (n && (n->tag & TT_IF) && n->ch0 == 'e') {
 			int snap = if_trail_snap[if_depth];
-			if (cache && tok) {
+			if (cache) {
 				uint32_t val = tok_idx(tok) + 1;
 				for (int i = snap; i < tn; i++) {
 					uint32_t tix = trail[i];
@@ -5435,13 +5374,9 @@ static Token *generic_find_assoc_start(Token *open) {
 	return NULL;
 }
 
-static bool generic_has_distinct_targets(Token *open) {
-	Token *close = tok_match(open);
-	if (!close) return false;
-	Token *assoc_start = generic_find_assoc_start(open);
-	if (!assoc_start) return false;
+static bool generic_has_distinct_targets(Token *assoc_start, Token *close) {
 	const char *first_name = NULL;
-	int first_len = 0;
+	uint32_t first_len = 0;
 	Token *first_args_open = NULL;
 	Token *first_args_close = NULL;
 	int ternary_depth = 0;
@@ -5499,7 +5434,7 @@ static bool generic_has_distinct_targets(Token *open) {
 					first_args_close = tok_match(ao);
 				}
 			} else if (b->len != first_len ||
-				   !prism_memeq_runtime_sized(tok_loc(b), first_name, (uint32_t)first_len)) {
+				   !prism_memeq_runtime_sized(tok_loc(b), first_name, first_len)) {
 				return true;
 			} else {
 				Token *ao = tok_next(b);
@@ -5553,9 +5488,8 @@ static bool generic_rewrite_preamble(Token *generic_tok,
 	Token *close = tok_match(open);
 	Token *after = skip_noise(tok_next(close));
 	if (!after) return false;
-	if (generic_has_distinct_targets(open)) return false;
 	Token *assoc_start = generic_find_assoc_start(open);
-	if (!assoc_start) return false;
+	if (!assoc_start || generic_has_distinct_targets(assoc_start, close)) return false;
 	*open_out = open;
 	*close_out = close;
 	*after_out = after;
@@ -5827,7 +5761,7 @@ static bool has_storage_in(Token *from, Token *to) {
 
 static bool needs_space(Token *prev, Token *tok) {
 	if (!prev || tok_at_bol(tok)) return false;
-	if (tok_has_space(tok)) return true;
+	if (tok->flags & TF_HAS_SPACE) return true;
 	if ((is_identifier_like(prev) || prev->kind == TK_NUM) &&
 	    (is_identifier_like(tok) || tok->kind == TK_NUM))
 		return true;
@@ -5862,7 +5796,10 @@ static uint16_t find_body_scope_id(Token *body_start) {
 
 void tokenizer_teardown(bool full) {
 	if (ctx->input_files) {
-		for (int i = 0; i < ctx->input_file_count; i++) free_file_contents(ctx->input_files[i]);
+		for (int i = 0; i < ctx->input_file_count; i++) {
+			File *f = ctx->input_files[i];
+			if (f && f->contents && f->owns_contents) free(f->contents);
+		}
 	}
 	if (full) {
 		arena_free(&ctx->main_arena);
@@ -5874,7 +5811,8 @@ void tokenizer_teardown(bool full) {
 		token_count = 1;
 		token_cap = 0;
 	} else {
-		arena_reset(&ctx->main_arena);
+		for (ArenaBlock *b = ctx->main_arena.head; b; b = b->next) b->used = 0;
+		ctx->main_arena.current = ctx->main_arena.head;
 		token_count = 1; // Reset pool index but keep allocation
 	}
 	ctx->input_files = NULL;

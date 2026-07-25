@@ -1008,17 +1008,6 @@ static void defer_add(Token *defer_keyword, Token *start, Token *end) {
 	defer_stack[defer_count++] = (DeferEntry){start, end, defer_keyword};
 }
 
-static inline bool emit_token_starts_decl_like(Token *tok) {
-	if (!tok) return false;
-	if (tok->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_TYPEDEF | TT_INLINE | TT_TYPEOF |
-			TT_ALIGNAS | TT_BITINT))
-		return true;
-	if (is_type_keyword(tok) || is_known_typedef(tok)) return true;
-	if (is_c23_attr(tok)) return true;
-	if ((tok->tag & TT_ATTR) && tok_next(tok) && match_ch(tok_next(tok), '(')) return true;
-	return false;
-}
-
 static inline bool emit_newline_before_decl_after_stmt_boundary(Token *prev, Token *tok) {
 	if (!prev || !tok) return false;
 	/* Cheapest, most selective test first: only a `;`/`}` predecessor can
@@ -1029,16 +1018,19 @@ static inline bool emit_newline_before_decl_after_stmt_boundary(Token *prev, Tok
 	if (ctx->aggregate_member_nest > 0) return false;
 	if (in_struct_body()) return false;
 	if (tok_at_bol(tok)) return false;
-	return emit_token_starts_decl_like(tok);
+	return (tok->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_STORAGE | TT_TYPEDEF | TT_INLINE |
+			    TT_TYPEOF | TT_ALIGNAS | TT_BITINT)) ||
+	       is_type_keyword(tok) || is_known_typedef(tok) || is_c23_attr(tok) ||
+	       ((tok->tag & TT_ATTR) && tok_next(tok) && match_ch(tok_next(tok), '('));
 }
 
 static PRISM_HOT void emit_tok(Token *tok) {
+	uint32_t feat = ctx->features;
+	if (__builtin_expect(!(feat & F_FLATTEN) && (tok->flags & TF_SYS_SKIP), 0)) return;
 	TokenCold *c = tok_cold(tok);
 	File *f = (c->file_idx < (uint32_t)ctx->input_file_count) ? ctx->input_files[c->file_idx]
 								  : ctx->current_file;
 	char *loc = f->contents + c->loc_offset;
-	uint32_t feat = ctx->features;
-	if (__builtin_expect(!(feat & F_FLATTEN) && f->is_system && f->is_include_entry, 0)) return;
 	Token *prev_emitted = last_emitted;
 	bool need_line = false;
 	char *tok_fname = NULL;
@@ -1618,7 +1610,7 @@ static void check_enum_typedef_defer_shadow(Token *tok) {
 
 static inline bool is_known_function_call(Token *tok);
 static inline bool is_empty_known_function_call(Token *tok);
-static bool token_in_function_declarator_param_list(Token *tok);
+static Token *function_declarator_param_open(Token *tok);
 
 static inline bool is_defer_kw(Token *tok, Token *prev) {
 	if (!(tok->tag & TT_DEFER)) return false;
@@ -1632,7 +1624,7 @@ static inline bool is_defer_kw(Token *tok, Token *prev) {
 	TypedefEntry *te = typedef_lookup(tok);
 	if (te && !te->is_shadow && !(nx && match_ch(nx, '{'))) return false;
 	/* `defer {…}` cannot be a parameter name — skip the param-list walk. */
-	if (!(nx && match_ch(nx, '{')) && token_in_function_declarator_param_list(tok)) return false;
+	if (!(nx && match_ch(nx, '{')) && function_declarator_param_open(tok)) return false;
 	/* Type / declarator predecessor → identifier (mirror: `int defer`, `T *defer`). */
 	if (prev && ((prev->tag & (TT_TYPE | TT_QUALIFIER | TT_STORAGE | TT_TYPEDEF | TT_SUE | TT_TYPEOF |
 				   TT_BITINT)) ||
@@ -1803,8 +1795,8 @@ static bool paren_is_function_declarator_params(Token *open) {
 	return false;
 }
 
-static bool token_in_function_declarator_param_list(Token *tok) {
-	if (!tok) return false;
+static Token *function_declarator_param_open(Token *tok) {
+	if (!tok) return NULL;
 	int depth = 0;
 	for (uint32_t i = tok_idx(tok); i > 0; i--) {
 		Token *t = &token_pool[i - 1];
@@ -1814,13 +1806,14 @@ static bool token_in_function_declarator_param_list(Token *tok) {
 			continue;
 		}
 		if (t->flags & TF_OPEN) {
-			if (depth == 0 && match_ch(t, '(')) return paren_is_function_declarator_params(t);
+			if (depth == 0 && match_ch(t, '('))
+				return paren_is_function_declarator_params(t) ? t : NULL;
 			if (depth > 0) depth--;
 			continue;
 		}
 		if (depth == 0 && (match_ch(t, ';') || match_ch(t, '{') || match_ch(t, '}'))) break;
 	}
-	return false;
+	return NULL;
 }
 
 static inline bool orelse_kw_at(Token *t, Token *prev) {
@@ -2422,19 +2415,14 @@ static bool consume_stmt_colon(Token **tok_p, int *ternary_depth, bool *pending_
 	return false;
 }
 
-static inline bool generic_decl_prefix_last(Token *t) {
-	if (!t) return false;
-	if (match_ch(t, '*') || match_ch(t, ')')) return true;
-	if (t->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_SKIP_DECL | TT_ATTR | TT_INLINE | TT_STORAGE |
-		      TT_TYPEOF | TT_BITINT))
-		return true;
-	return is_known_typedef(t);
-}
-
 /* Decl-context only: fold glibc C23 `_Generic(..., default: name(params))`
  * back to `(name)(params)`. Expression `_Generic` keeps SCOPE_GENERIC. */
 static Token *emit_generic_open(Token *tok) {
-	if (generic_decl_prefix_last(last_emitted)) {
+	if (last_emitted &&
+	    (match_ch(last_emitted, '*') || match_ch(last_emitted, ')') ||
+	     (last_emitted->tag & (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_SKIP_DECL | TT_ATTR | TT_INLINE |
+				   TT_STORAGE | TT_TYPEOF | TT_BITINT)) ||
+	     is_known_typedef(last_emitted))) {
 		Token *name = NULL, *params_open = NULL, *params_close = NULL, *after = NULL;
 		if (generic_decl_rewrite_target(tok, &name, &params_open, &params_close, &after)) {
 			out_char('(');
@@ -2754,10 +2742,6 @@ static Token *last_comma_operand(Token *open_paren, Token *close_paren) {
 		if (match_ch(t, ',')) seg_start = tok_next(t);
 	}
 	return seg_start;
-}
-
-static bool comma_expr_has_comma(Token *open_paren, Token *close_paren) {
-	return last_comma_operand(open_paren, close_paren) != tok_next(open_paren);
 }
 
 static inline bool c_value_name_token(Token *t) {
@@ -3091,9 +3075,9 @@ static Token *try_bounds_check_subscript(Token *tok) {
      * `arr` with index `idx` in disguise) — skip hard-error diags. */
 		if (match_ch(inner, '(') && (inner->flags & TF_OPEN)) {
 			Token *pclose = tok_match(inner);
-			if (pclose && comma_expr_has_comma(inner, pclose)) {
+			if (pclose) {
 				Token *lastop = last_comma_operand(inner, pclose);
-				if (lastop && tok_next(lastop) == pclose) {
+				if (lastop && lastop != tok_next(inner) && tok_next(lastop) == pclose) {
 					inner = lastop;
 					iclose = pclose;
 					if (is_tracked_array_name(lastop)) comma_resolved = true;
@@ -3716,15 +3700,6 @@ static void bo_snapshot_ids(unsigned **dst, const unsigned *src, int n) {
 	}
 	*dst = arena_alloc(&ctx->main_arena, (size_t)n * sizeof(unsigned));
 	memcpy(*dst, src, (size_t)n * sizeof(unsigned));
-}
-
-static void bo_save(BOFrame *f) {
-	f->oe_count = ctx->bracket_oe_count;
-	f->oe_next = ctx->bracket_oe_next;
-	f->dim_count = ctx->bracket_dim_count;
-	f->dim_next = ctx->bracket_dim_next;
-	bo_snapshot_ids(&f->oe_ids, ctx->bracket_oe_ids, f->oe_count);
-	bo_snapshot_ids(&f->dim_ids, ctx->bracket_dim_ids, f->dim_count);
 }
 
 static inline void emit_type_with_pragma_prelude(
@@ -4966,16 +4941,6 @@ static Token *p1_typedef_type_start(TypedefEntry *te) {
 	return NULL;
 }
 
-/* True if `[dim]` is a literal zero (GNU zero-size array). */
-static bool array_dim_is_literal_zero(Token *open_bracket) {
-	Token *close = tok_match(open_bracket);
-	if (!open_bracket || !close) return false;
-	Token *t = skip_noise(tok_next(open_bracket));
-	if (!t || t == close || t->kind != TK_NUM) return false;
-	if (t->len != 1 || tok_loc(t)[0] != '0') return false;
-	return skip_noise(tok_next(t)) == close;
-}
-
 /* True if `[dim]` is empty `[]` (FAM) or literal `[0]`. Both reject `= {0}`
  * when they are the sole member of an aggregate. */
 static bool array_dim_is_empty_or_zero(Token *open_bracket) {
@@ -4983,7 +4948,7 @@ static bool array_dim_is_empty_or_zero(Token *open_bracket) {
 	if (!open_bracket || !close) return false;
 	Token *t = skip_noise(tok_next(open_bracket));
 	if (!t || t == close) return true; /* flexible array member `[]` */
-	return array_dim_is_literal_zero(open_bracket);
+	return t->kind == TK_NUM && t->len == 1 && t->ch0 == '0' && skip_noise(tok_next(t)) == close;
 }
 
 /* GNU empty structs / sole `[0]` / sole FAM arrays cannot take `= {0}` (clang:
@@ -5274,12 +5239,6 @@ static bool p1_type_has_const_subobject(Token *type_start, Token *type_end, int 
 	return false;
 }
 
-static void
-reject_register_vla(Token *var, const DeclShape *s, TypeSpecResult *type, bool has_init, bool is_raw) {
-	if (FEAT(F_ZEROINIT) && !has_init && !is_raw && type->has_register && s->effective_vla)
-		error_tok(var, ERR_REGISTER_VLA);
-}
-
 static void reject_register_agg_zeroinit(
     Token *var, const DeclShape *s, TypeSpecResult *type, Token *type_start, bool has_init, bool is_raw) {
 	if (!FEAT(F_ZEROINIT) || has_init || is_raw || !type->has_register) return;
@@ -5361,26 +5320,11 @@ static void reject_decl_orelse_value_shape(Token *var_name,
 		error_tok(var_name, ERR_ORELSE_STRUCT_VALUE);
 }
 
-// Check if a declarator has GNU __attribute__ or C23 [[...]] between the
-static bool decl_has_attribute(Token *var_name, Token *eq) {
-	for (Token *t = tok_next(var_name); t && t != eq; t = tok_next(t)) {
-		if ((t->tag & TT_ATTR) || is_c23_attr(t)) return true;
-		if (t->flags & TF_OPEN) {
-			Token *m = tok_match(t);
-			if (m) {
-				t = m;
-				continue;
-			}
-		}
-	}
-	return false;
-}
-
 /* Leading __attribute__/[[attr]]/asm before the type make `static ATTR …`
  * illegal or change cleanup semantics — skip auto-static in those cases. */
-static bool type_range_has_attribute(Token *start, Token *end) {
+static bool range_has_attribute(Token *start, Token *end, uint32_t extra_tag) {
 	for (Token *t = start; t && t != end; t = tok_next(t)) {
-		if ((t->tag & TT_ATTR) || is_c23_attr(t) || (t->tag & TT_ASM)) return true;
+		if ((t->tag & (TT_ATTR | extra_tag)) || is_c23_attr(t)) return true;
 		if (t->flags & TF_OPEN) {
 			Token *m = tok_match(t);
 			if (m) {
@@ -5390,10 +5334,6 @@ static bool type_range_has_attribute(Token *start, Token *end) {
 		}
 	}
 	return false;
-}
-
-static bool is_c23_bool_literal(Token *t) {
-	return t && t->kind == TK_IDENT && (equal(t, "true") || equal(t, "false"));
 }
 
 static bool is_const_literal_init(Token *eq) {
@@ -5426,7 +5366,7 @@ static bool is_const_literal_init(Token *eq) {
 			return false;
 		}
 		if (t->kind == TK_IDENT &&
-		    (prev_was_dot || is_known_enum_const(t) || is_c23_bool_literal(t))) {
+		    (prev_was_dot || is_known_enum_const(t) || equal(t, "true") || equal(t, "false"))) {
 			prev_was_dot = false;
 			continue;
 		}
@@ -5645,7 +5585,12 @@ static Token *process_declarators(Token *tok,
 				OUT_LIT(" {");
 				brace_opened = true;
 			}
-			bo_save(&bo_frame);
+			bo_frame.oe_count = ctx->bracket_oe_count;
+			bo_frame.oe_next = ctx->bracket_oe_next;
+			bo_frame.dim_count = ctx->bracket_dim_count;
+			bo_frame.dim_next = ctx->bracket_dim_next;
+			bo_snapshot_ids(&bo_frame.oe_ids, ctx->bracket_oe_ids, bo_frame.oe_count);
+			bo_snapshot_ids(&bo_frame.dim_ids, ctx->bracket_dim_ids, bo_frame.dim_count);
 			emit_bracket_orelse_temps(decl_start, decl.end);
 		}
 
@@ -5677,10 +5622,9 @@ static Token *process_declarators(Token *tok,
 				    !decl.is_vla && !type->is_vla && !decl_is_raw &&
 				    !orelse_info.orelse_tok) {
 					if (!type_range_any(type_start, type->end, is_vol_or_vol_member_td) &&
-					    !type_range_has_attribute(pragma_start ? pragma_start
-										  : type_start,
-								      type->end) &&
-					    !decl_has_attribute(decl.var_name, decl.end)) {
+					    !range_has_attribute(
+						pragma_start ? pragma_start : type_start, type->end, TT_ASM) &&
+					    !range_has_attribute(tok_next(decl.var_name), decl.end, 0)) {
 						Token *eq = decl.end; // '=' token
 						Token *init = tok_next(eq);
 						bool lit_ok = false;
@@ -6404,8 +6348,8 @@ static Token *handle_control_exit_defer(Token *tok) {
  * several __label__ bindings share a source name. */
 static bool p1_label_matches_tok(P1FuncEntry *e, Token *tok) {
 	if (e->kind != P1K_LABEL) return false;
-	if (e->label.len == tok->len && prism_memeq_runtime_sized(e->label.name, tok_loc(tok), tok->len)) return true;
-	if (e->label.len > tok->len && e->label.name[tok->len] == '\0' &&
+	if ((uint32_t)e->label.len == tok->len && prism_memeq_runtime_sized(e->label.name, tok_loc(tok), tok->len)) return true;
+	if ((uint32_t)e->label.len > tok->len && e->label.name[tok->len] == '\0' &&
 	    prism_memeq_runtime_sized(e->label.name, tok_loc(tok), tok->len))
 		return true;
 	return false;
@@ -6422,7 +6366,7 @@ static P1LabelResult p1_label_find(Token *tok, int func_idx) {
 			if (fm->label_hash[slot] < 0) break;
 			P1FuncEntry *e = &entries[fm->label_hash[slot]];
 			/* Exact-len hit only — mangled __label__ hashes differ. */
-			if (e->label.len == tok->len && p1_label_matches_tok(e, tok))
+			if ((uint32_t)e->label.len == tok->len && p1_label_matches_tok(e, tok))
 				return (P1LabelResult){scope_tree_depth(e->scope_id), e->tok};
 		}
 		/* Fall through: __label__ mangled names miss the unmangled hash. */
@@ -9560,24 +9504,18 @@ static void __attribute__((noinline))
 p1d_classify_bracket_orelse_ex(Token *tok, uint16_t cur_sid, int p1d_cur_func, bool hard_ctx,
 			       bool allow_se_hoist) {
 	Token *close = tok_match(tok);
+	if (!(tok->flags & TF_HAS_PRISM)) return;
 	/* Function / function-pointer / typedef-of-function parameter dims are
 	 * never allocated VLAs (SPEC orelse constraint 11). Typedef walks
 	 * classify dims via p1d_scan_balanced_group and used to lower
 	 * `typedef int (*F)(int a[0 orelse 1])` to a ternary instead of
 	 * rejecting — close that hole before annotation. */
-	if (FEAT(F_ORELSE) && token_in_function_declarator_param_list(tok)) {
+	Token *param_open = FEAT(F_ORELSE) ? function_declarator_param_open(tok) : NULL;
+	if (param_open) {
 		bool is_proto = true;
-		for (uint32_t i = tok_idx(tok); i > 0; i--) {
-			Token *t = &token_pool[i - 1];
-			if (t->kind == TK_PREP_DIR) continue;
-			if ((t->flags & TF_OPEN) && match_ch(t, '(') && paren_is_function_declarator_params(t)) {
-				Token *pc = tok_match(t);
-				Token *after = pc ? skip_asm_specifier_trail(tok_next(pc)) : NULL;
-				is_proto = !after || !match_ch(after, '{');
-				break;
-			}
-			if (match_ch(t, ';') || match_ch(t, '{') || match_ch(t, '}')) break;
-		}
+		Token *pc = tok_match(param_open);
+		Token *after = pc ? skip_asm_specifier_trail(tok_next(pc)) : NULL;
+		is_proto = !after || !match_ch(after, '{');
 		/* Walk every token — do not skip nested groups, or
 		 * `int a[sizeof(0 orelse 1)]` in a prototype would lower. */
 		Token *prev_s = tok;
@@ -10349,7 +10287,8 @@ static Token *p1d_scan_init_orelse(Token *t, bool *out_has_orelse, Token **out_f
 						 * Pass 2 emits from the stripped stream and never
 						 * mutates tokens. TF_OPEN is cleared so index-based
 						 * walkers do not treat the orphan as a group. */
-						eq->next_idx = t->next_idx;
+						eq->jump_idx = tok_idx(t) + 1;
+						eq->flags |= TF_LINK_JUMP;
 						t->flags &= ~TF_OPEN;
 						Token *before_close = t;
 						for (Token *u = tok_next(t); u && u != m;) {
@@ -10364,7 +10303,8 @@ static Token *p1d_scan_init_orelse(Token *t, bool *out_has_orelse, Token **out_f
 							before_close = u;
 							u = tok_next(u);
 						}
-						before_close->next_idx = m->next_idx;
+						before_close->jump_idx = tok_idx(m) + 1;
+						before_close->flags |= TF_LINK_JUMP;
 					}
 				} else if ((FEAT(F_ORELSE) || FEAT(F_DEFER)) &&
 					   !(prev_init_tok && (prev_init_tok->tag & TT_TYPEOF)))
@@ -10501,7 +10441,8 @@ p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func, uint16_t cur_
 		    !(prev_inner && (prev_inner->tag & TT_MEMBER)))
 			error_tok(inner, ERR_DEFER_CTRL_PAREN);
 		if (se_depth == 0 && prev_saved && (prev_saved->tag & (TT_IF | TT_LOOP | TT_SWITCH)) &&
-		    is_orelse_kw(inner) && !(prev_inner && (prev_inner->tag & TT_MEMBER)) &&
+		    (inner->tag & TT_ORELSE) && !typedef_lookup(inner) &&
+		    !(prev_inner && (prev_inner->tag & TT_MEMBER)) &&
 		    !is_known_function_call(inner) && !orelse_is_label_or_goto_target(inner, prev_inner))
 			error_tok(inner,
 				  "'orelse' cannot be used inside control statement "
@@ -10998,7 +10939,8 @@ static void p1d_probe_declaration(Token *tok,
 			reject_register_agg_zeroinit(
 			    decl.var_name, &shape, &type, type_tok, has_init, decl_raw);
 		if (!in_aggregate_body)
-			reject_register_vla(decl.var_name, &shape, &type, has_init, decl_raw);
+			if (FEAT(F_ZEROINIT) && !has_init && !decl_raw && type.has_register && shape.effective_vla)
+				error_tok(decl.var_name, ERR_REGISTER_VLA);
 		if (!in_aggregate_body && !(saw_static || type.has_static || type.has_extern))
 			reject_const_unavoidable_memset(
 			    decl.var_name, &shape, &type, type_tok, &decl, has_init, decl_raw, false);
@@ -12773,9 +12715,7 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 				  "internal: Pass 2 progress watchdog tripped "
 				  "(possible non-termination); please report");
 #endif
-		/* TF_SYS_SKIP is precomputed at tokenize (== f->is_system &&
-		 * f->is_include_entry for this token's file); avoids a per-token
-		 * tok_cold + file lookup in the hottest loop. */
+		/* Precomputed system-include predicate avoids a per-token cold-file lookup. */
 		if (!FEAT(F_FLATTEN) && (tok->flags & TF_SYS_SKIP)) {
 			if (next_func_idx < func_meta_count &&
 			    func_meta[next_func_idx].body_open == tok)
@@ -12980,8 +12920,6 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 				tok = bc;
 				continue;
 			}
-		}
-		if (ctx->raw_block_depth == 0) {
 			Token *next = try_orelse_expr_rewrites(tok);
 			if (next) {
 				tok = next;
@@ -13916,7 +13854,7 @@ static Cli cli_parse(int argc, char **argv) {
 		}
 #endif
 
-		if (a[1] == 'o' && a[1]) {
+		if (a[1] == 'o') {
 			cli.output = a[2] ? a + 2 : (i + 1 < argc ? argv[++i] : NULL);
 			continue;
 		}
@@ -14836,9 +14774,11 @@ static int run_temp_compile_plan(const Cli *cli, char **temps, int temp_count, c
 	int argc = 0;
 	char *cc_dup = NULL;
 	cc_split_into_argv(args, &argc, plan->compiler, &cc_dup);
-	if (plan->msvc) args[argc++] = "/nologo";
-	// Prism may emit typeof()/typeof_unqual() which require C23 mode on MSVC.
-	if (plan->msvc) args[argc++] = "/std:clatest";
+	if (plan->msvc) {
+		args[argc++] = "/nologo";
+		// Prism may emit typeof()/typeof_unqual() which require C23 mode on MSVC.
+		args[argc++] = "/std:clatest";
+	}
 	if (plan->optimize) args[argc++] = plan->msvc ? "/O2" : "-O2";
 	if (plan->use_preprocessed) args[argc++] = "-fpreprocessed";
 	/* Multi-file `prism a.c b.c main.cpp` upgrades to g++/clang++ for libstdc++.

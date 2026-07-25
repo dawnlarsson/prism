@@ -1579,13 +1579,13 @@ static void test_win_env_scrubbing(void) {
 		CHECK(hp != INVALID_HANDLE_VALUE, "env_scrub: spawn with custom envp succeeds");
 		if (hp != INVALID_HANDLE_VALUE) {
 			char buf[1024] = {0};
-			int total = 0;
-			while (total < (int)sizeof(buf) - 1) {
-				int n = read(pipe_fds[0], buf + total, sizeof(buf) - 1 - total);
+			int used = 0;
+			while (used < (int)sizeof(buf) - 1) {
+				int n = read(pipe_fds[0], buf + used, sizeof(buf) - 1 - used);
 				if (n <= 0) break;
-				total += n;
+				used += n;
 			}
-			buf[total] = '\0';
+			buf[used] = '\0';
 			close(pipe_fds[0]);
 			WaitForSingleObject(hp, 5000);
 			CloseHandle(hp);
@@ -1632,13 +1632,13 @@ static void test_win_env_scrubbing(void) {
 			posix_spawn_file_actions_destroy(&fa);
 
 			if (hp != INVALID_HANDLE_VALUE) {
-				int total = 0;
-				while (total < (int)sizeof(buf) - 1) {
-					int n = read(pipe_fds[0], buf + total, sizeof(buf) - 1 - total);
+				int used = 0;
+				while (used < (int)sizeof(buf) - 1) {
+					int n = read(pipe_fds[0], buf + used, sizeof(buf) - 1 - used);
 					if (n <= 0) break;
-					total += n;
+					used += n;
 				}
-				buf[total] = '\0';
+				buf[used] = '\0';
 				close(pipe_fds[0]);
 				WaitForSingleObject(hp, 5000);
 				CloseHandle(hp);
