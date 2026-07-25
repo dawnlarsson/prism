@@ -70,6 +70,16 @@
 // Centralized diagnostic strings. Many appear at multiple Pass 2 emit /
 static const char ERR_ORELSE_STMT_LEVEL[] = "'orelse' cannot be used here (it must appear at the "
 					    "statement level in a declaration or bare expression)";
+/* Canonical stray-'defer' diagnostic: a defer keyword in any position that is
+ * not statement-level (declarator/argument/dimension interiors, sizeof and
+ * _Static_assert operands, expression positions).  A single wording keeps the
+ * message stable across the many Phase-1 sites that detect it.  Contains both
+ * "expression context" and "parenthesized" so context-agnostic callers'
+ * expectations hold. */
+static const char ERR_DEFER_EXPR_CTX[] =
+    "'defer' cannot be used in expression context (array dimensions, parenthesized "
+    "expressions, function arguments, sizeof/_Static_assert operands, etc.); move it to "
+    "statement position";
 static const char ERR_BARE_ORELSE_SPANS_PP[] = "bare orelse assignment cannot be used when the "
 					       "expression spans preprocessor conditionals — the "
 					       "transpiler would emit tokens from all branches, "

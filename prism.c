@@ -268,6 +268,7 @@ typedef struct {
 	CliAction action;
 	bool verbose;
 	bool profile;
+	bool verify; // --prism-verify: re-transpile emitted C, require fixed point
 	bool compile_only;
 	bool assemble_only; // -S: synthesize .s like -c synthesizes .o
 	bool passthrough;
@@ -391,6 +392,15 @@ static PRISM_THREAD_LOCAL int goto_entry_cursor = 0;  // Cursor into entries[] f
 static PRISM_THREAD_LOCAL bool p1_file_has_orelse;    // true if any TT_ORELSE token exists in token stream
 static PRISM_THREAD_LOCAL bool is_msvc_cached;	      // cached target_is_msvc(), set in transpile_tokens
 static PRISM_THREAD_LOCAL bool prism_profile = false; // --prism-prof: emit phase timing to stderr
+/* --prism-verify / PRISM_VERIFY: translation validation.  After emitting,
+ * re-run the full pipeline on the emitted C and require a fixed point
+ * (byte-identical modulo preprocessor linemarkers).  Any operator-position
+ * defer/orelse that leaked into the output would transform or reject on the
+ * second pass; a well-formed output re-verifies through every Phase 1 + CFG
+ * check.  Generalizes the self-host stage1==stage2 invariant to every
+ * user compile. */
+static PRISM_THREAD_LOCAL bool prism_verify_mode = false;
+static PRISM_THREAD_LOCAL bool prism_in_verify = false;
 static PRISM_THREAD_LOCAL HashMap p1_func_proto_map;  // file-scope ident followed by '(' → (void*)1
 
 typedef struct {
@@ -993,10 +1003,13 @@ static void scope_pop(void) {
 }
 
 static void defer_add(Token *defer_keyword, Token *start, Token *end) {
-	/* Phase 1 p1d_validate_defer owns the file-scope reject. */
-#ifdef PRISM_DEBUG
+	/* Phase 1 p1d_validate_defer owns the common file-scope reject; this
+	 * guard is UNCONDITIONAL (not PRISM_DEBUG-only) because a defer that
+	 * reaches Pass 2 at depth 0 through an unclassified context (e.g. a
+	 * file-scope initializer) would otherwise register silently and its
+	 * body would never be emitted — a token-dropping miscompile.  One
+	 * comparison per defer statement; found by the contexts suite. */
 	if (ctx->block_depth <= 0) error_tok(start, "defer outside of any scope");
-#endif
 	VEC_ENSURE_REALLOC(defer_stack, defer_count + 1, defer_stack_cap, 64);
 	defer_stack[defer_count++] = (DeferEntry){start, end, defer_keyword};
 }
@@ -1255,6 +1268,19 @@ static void emit_range_ex(Token *start, Token *end, int flags) {
 			Token *next = try_typeof_orelse(t);
 			if (next) {
 				t = next;
+				continue;
+			}
+		}
+		/* Subscripts in copied ranges (orelse single-eval LHS duplicates,
+		 * fallback values, return bodies) get the same -fbounds-check
+		 * wrapping as the main loop — `v[i] = g() orelse 1;` must not
+		 * store through a tracked array unchecked.  try_bounds_checks
+		 * carries its own applicability and idempotence guards.  Found
+		 * by the contexts suite's fixed-point oracle. */
+		{
+			Token *bc = try_bounds_checks(t);
+			if (bc && bc != t) {
+				t = bc;
 				continue;
 			}
 		}
@@ -2808,6 +2834,16 @@ static Token *try_bounds_check_subscript(Token *tok) {
 	if (!match_ch(tok, '[') || !(tok->flags & TF_OPEN) || !tok_match(tok)) return NULL;
 	if (tok->flags & TF_C23_ATTR) return NULL;
 	if (tok_ann(tok) & (P1_DECL_BRACKET | P1_UNEVAL_BRACKET)) return NULL;
+	/* Idempotence: an index already wrapped by a previous Prism pass
+	 * (`a[__prism_bchk(...)]` — e.g. -save-temps .i re-compiles or
+	 * --prism-verify's second pass) must not be wrapped again.  The
+	 * __prism_ namespace is reserved, so this cannot fire on user code. */
+	{
+		Token *idx0 = tok_next(tok);
+		if (idx0 && idx0->kind == TK_IDENT && idx0->len == 12 &&
+		    !memcmp(tok_loc(idx0), "__prism_bchk", 12))
+			return NULL;
+	}
 	// ALWAYS declarator dimensions per C11 6.7.2.1, never expression
 	// brackets never get tagged P1_DECL_BRACKET via parse_declarator.
 	if (in_struct_body()) return NULL;
@@ -3321,6 +3357,18 @@ static void emit_token_range_nested(Token *start, Token *end, bool with_orelse) 
 			t = tok_next(tok_match(t));
 			continue;
 		}
+		/* Subscripts inside orelse-lowered ranges (single-eval LHS copies,
+		 * fallback values) must get the same -fbounds-check wrapping as
+		 * the main emission loop — otherwise `v[i] = g() orelse 1;`
+		 * stores through a tracked array unchecked.  Found by the
+		 * contexts suite's fixed-point oracle. */
+		{
+			Token *bc = try_bounds_checks(t);
+			if (bc && bc != t) {
+				t = bc;
+				continue;
+			}
+		}
 		if ((t->flags & TF_OPEN) && (match_ch(t, '(') || match_ch(t, '['))) {
 			Token *close = tok_match(t);
 			if (close && close != end) {
@@ -3381,6 +3429,12 @@ static void validate_bracket_orelse(Token *oe) {
 		error_tok(oe,
 			  "'orelse' block form cannot be used inside "
 			  "array dimensions or typeof expressions");
+	/* Empty fallback (`[n orelse ]`): the ternary expansion would emit
+	 * `n ? n : ()` — invalid C leaking to the backend.  The `;`/`,` empty
+	 * cases are covered by the statement/init validators; the
+	 * close-delimiter case belongs here.  Found by the insertion suite. */
+	if (!act || (act->flags & TF_CLOSE) || match_ch(act, ';') || match_ch(act, ','))
+		error_tok(oe, "expected expression after 'orelse' in array dimension");
 }
 
 static Token *scan_bracket_orelse(Token *open, Token *close, Token **paren_open_out) {
@@ -3857,11 +3911,81 @@ static Token *emit_raw_verbatim_to_semicolon(Token *tok) {
 	return tok;
 }
 
+/* Idempotence: when the statements immediately following this declaration
+ * already contain Prism's own canonical zeroing for `var` (a prior pass's
+ * output re-entering the pipeline — -save-temps .i recompiles, library-mode
+ * round trips, --prism-verify's second pass), do not zero again.  Only the
+ * exact canonical shapes are recognized:
+ *   __builtin_memset([(void *)]&var, 0, sizeof(var));
+ *   { [volatile] char *__prism_p_N = ...; for (...) __prism_p_N[...] = 0; }
+ * A user's hand-written identical memset is also skipped — semantically
+ * equivalent (the object is fully zeroed either way).  Partial or nonzero
+ * user memsets do not match and zero-init still applies.                   */
+static bool prism_memset_follows(Token *var) {
+	if (!var) return false;
+	/* Find the terminating ';' of the declaration statement. */
+	Token *t = var;
+	for (int guard = 0; t && t->kind != TK_EOF && guard < 4096; guard++) {
+		if ((t->flags & TF_OPEN) && tok_match(t)) {
+			t = tok_next(tok_match(t));
+			continue;
+		}
+		if (match_ch(t, ';')) break;
+		if (match_ch(t, '}')) return false;
+		t = tok_next(t);
+	}
+	if (!t || !match_ch(t, ';')) return false;
+	t = tok_next(t);
+	/* Scan across a small run of canonical zeroing statements (earlier
+	 * declarators' memsets precede this var's in multi-decl splits). */
+	for (int stmts = 0; t && t->kind != TK_EOF && stmts < 8; stmts++) {
+		if (t->kind == TK_IDENT && t->len == 16 && !memcmp(tok_loc(t), "__builtin_memset", 16)) {
+			Token *p = tok_next(t);
+			if (!p || !match_ch(p, '(') || !tok_match(p)) return false;
+			Token *close = tok_match(p);
+			Token *a = tok_next(p);
+			/* optional (void *) cast */
+			if (a && match_ch(a, '(') && tok_match(a)) a = tok_next(tok_match(a));
+			if (a && match_ch(a, '&')) a = tok_next(a);
+			if (a && a->kind == TK_IDENT && a->len == var->len &&
+			    !memcmp(tok_loc(a), tok_loc(var), var->len))
+				return true;
+			t = tok_next(close);
+			if (t && match_ch(t, ';')) t = tok_next(t);
+			continue;
+		}
+		if (match_ch(t, '{') && tok_match(t)) {
+			/* candidate byte-loop block: require a __prism_p_ ident and
+			 * `& var` in its opening tokens */
+			Token *close = tok_match(t);
+			bool has_p = false, has_var = false;
+			int k = 0;
+			for (Token *s = tok_next(t); s && s != close && k < 16; s = tok_next(s), k++) {
+				if (s->kind == TK_IDENT && s->len >= 10 &&
+				    !memcmp(tok_loc(s), "__prism_p_", 10))
+					has_p = true;
+				if (match_ch(s, '&') && tok_next(s) &&
+				    tok_next(s)->kind == TK_IDENT &&
+				    tok_next(s)->len == var->len &&
+				    !memcmp(tok_loc(tok_next(s)), tok_loc(var), var->len))
+					has_var = true;
+			}
+			if (!has_p) return false;
+			if (has_var) return true;
+			t = tok_next(close);
+			continue;
+		}
+		return false;
+	}
+	return false;
+}
+
 static void emit_typeof_memsets(Token **vars, int count, bool has_volatile, bool has_const) {
 	const char *vol = has_volatile ? "volatile " : "";
 	int vol_len = has_volatile ? 9 : 0;
 	bool use_loop = has_volatile || target_is_msvc();
 	for (int i = 0; i < count; i++) {
+		if (prism_memset_follows(vars[i])) continue;
 		// Byte loop for volatile (memset drops volatile) and MSVC (no
 		// __builtin_memset).
 		if (use_loop) {
@@ -5306,6 +5430,22 @@ static Token *handle_defer_keyword(Token *tok) {
 
 	Token *stmt_end = skip_to_semicolon(tok, NULL);
 	reject_defer_unterminated(defer_keyword, stmt_start, stmt_end);
+	/* Structural guard (twin of p1d_validate_defer's): never consume across
+	 * the enclosing group's close token. */
+	{
+		int bd2 = 0;
+		for (Token *s = stmt_start; s && s != stmt_end && s->kind != TK_EOF;
+		     s = tok_next(s)) {
+			if (s->flags & TF_OPEN) bd2++;
+			else if (s->flags & TF_CLOSE) {
+				bd2--;
+				if (bd2 < 0)
+					error_tok(defer_keyword,
+						  "stray 'defer' in an expression position "
+						  "(body would cross the enclosing ')' or ']')");
+			}
+		}
+	}
 	defer_add(defer_keyword, stmt_start, stmt_end);
 	tok = (stmt_end->kind != TK_EOF) ? tok_next(stmt_end) : stmt_end;
 	end_statement_after_semicolon();
@@ -8238,6 +8378,59 @@ p1d_validate_defer(Token *tok, int p1d_cur_func, bool p1d_ctrl_pending, uint16_t
 							  "`defer { ... }`");
 				}
 			}
+			/* A declaration as a braceless defer body is rejected outright:
+			 * initialized declarations mis-scan across brace/designator
+			 * initializers (body-end walk vs initializer walk disagree,
+			 * duplicating trailing statements into the defer paste — found
+			 * by the insertion suite), and an uninitialized declaration's
+			 * object dies at the end of the paste, so the construct has no
+			 * meaning.  SPEC defer constraint 10 already requires braces
+			 * for the orelse flavor; this extends it to every declaration
+			 * body.  `defer { T x = ...; }` remains fully supported. */
+			if ((body->tag &
+			     (TT_TYPE | TT_QUALIFIER | TT_SUE | TT_TYPEOF | TT_BITINT | TT_STORAGE)) ||
+			    (body->flags & TF_RAW) || is_known_typedef(body)) {
+				Token *ts2 = skip_noise(body);
+				while (ts2 && (ts2->flags & TF_RAW) && !is_known_typedef(ts2))
+					ts2 = skip_noise(tok_next(ts2));
+				TypeSpecResult tr2 = ts2 ? parse_type_specifier(ts2)
+							 : (TypeSpecResult){0};
+					/* A declaration as a braceless defer body mis-scans: deferred-range
+					 * emission re-parses the declarator against the live token stream
+					 * and overshoots the body's ';', duplicating every following
+					 * statement into the paste (a silent miscompile — the contexts/
+					 * insertion fixed-point oracle caught it; the old accept-test only
+					 * checked a substring and missed the duplication).  Reject every
+					 * declaration body; `defer { T x = ...; }` is the supported
+					 * spelling and lowers correctly. */
+					if (tr2.saw_type)
+						error_tok(tok,
+							  "a declaration as a braceless defer body is not "
+							  "supported (it mis-scans across the following "
+							  "statements); wrap the defer body in braces: "
+							  "`defer { ... }`");
+			}
+			/* Structural guard: a braceless defer body can never cross out
+			 * of its enclosing paren/bracket group.  If the scan to `;`
+			 * dips below depth 0 the `defer` sits in an expression position
+			 * (e.g. `({ ... } defer )`) and consuming to the `;` would eat
+			 * the enclosing group's close token.  Found by the insertion
+			 * suite. */
+			{
+				int bd2 = 0;
+				for (Token *s = body; s && s != semi && s->kind != TK_EOF;
+				     s = tok_next(s)) {
+					if (s->flags & TF_OPEN) bd2++;
+					else if (s->flags & TF_CLOSE) {
+						bd2--;
+						if (bd2 < 0)
+							error_tok(tok,
+								  "stray 'defer' in an expression "
+								  "position (body would cross the "
+								  "enclosing ')' or ']')");
+					}
+				}
+			}
 			// Braceless defer body tokens never hit p1d_probe_declaration at
 			// stmt_start; annotate P1_IS_DECL so Pass 2 zeroinit sees the decl.
 			if (FEAT(F_ZEROINIT) && brace_depth > 0 &&
@@ -8288,6 +8481,16 @@ static void p1d_scan_param_bracket_orelse(Token *open_paren, bool is_proto) {
 							     "ternary expansion would evaluate the "
 							     "dimension twice — undefined behavior for "
 							     "volatile expressions)");
+				/* `defer` followed by an identifier or `{` inside a
+				 * parameter array dimension can only be a stray defer
+				 * statement (two juxtaposed identifiers are never a
+				 * valid C expression) — Pass 2's statement handler
+				 * would consume through the dimension's `]` and drop
+				 * tokens.  A lone `defer` identifier (a variable named
+				 * defer) remains legal.  Found by the contexts suite. */
+				if (FEAT(F_DEFER) && (s->tag & TT_DEFER) && tok_next(s) &&
+				    (is_identifier_like(tok_next(s)) || match_ch(tok_next(s), '{')))
+					error_tok(s, ERR_DEFER_EXPR_CTX);
 			}
 			t = bc;
 			continue;
@@ -8645,6 +8848,11 @@ static void __attribute__((noinline)) p1d_validate_bare_orelse(Token *tok, Token
 	Token *eq_tok = find_depth0_assign_eq(scan_start, bare_oe);
 	bool has_eq = eq_tok != NULL;
 	if (tok == bare_oe) error_tok(tok, "expected expression before 'orelse'");
+	/* `x = orelse fb;` — empty expression between `=` and orelse (Pass 2's
+	 * debug shell caught this only in PRISM_DEBUG builds; the release path
+	 * emitted an empty test).  Found by the insertion suite. */
+	if (eq_tok && skip_noise(tok_next(eq_tok)) == bare_oe)
+		error_tok(bare_oe, "expected expression before 'orelse'");
 	Token *after_oe = tok_next(bare_oe);
 	if (after_oe && (match_ch(after_oe, ';') || match_ch(after_oe, ',')))
 		error_tok(after_oe, "expected statement after 'orelse'");
@@ -8858,7 +9066,30 @@ static Token *p1d_scan_init_orelse(Token *t, bool *out_has_orelse, Token **out_f
 							  init_td,
 							  out_has_orelse,
 							  out_first_orelse);
+		/* Empty expression before orelse in a declaration initializer
+		 * (`T x = orelse fb;`): mirrors the bare-assignment
+		 * "expected expression before 'orelse'" reject.  Only for
+		 * oe_ann==2 (orelse as the OPERATOR); oe_ann==1 is a variable /
+		 * typedef / label named `orelse` and must pass through.
+		 * init_is_first is true only when nothing preceded the orelse.
+		 * Found by the insertion suite. */
+		if (oe_ann == 2 && init_is_first)
+			error_tok(t, "expected expression before 'orelse'");
 		if (oe_ann == 1) {
+			/* Decl-init orelse spanning #if/#else/#endif would lower one
+			 * arm into statements the other arm cannot re-balance
+			 * (mirrors ERR_BARE_ORELSE_SPANS_PP for bare assignments;
+			 * reachable in library mode only — CLI input is
+			 * preprocessed).  Found by the contexts suite. */
+			if (out_first_orelse && *out_first_orelse == t) {
+				Token *ppc =
+				    span_find_pp_conditional(tok_next(eq), t, NULL);
+				if (ppc)
+					error_tok(t,
+						  "'orelse' in a declaration initializer spans "
+						  "preprocessor conditionals; keep the orelse "
+						  "within a single #if branch");
+			}
 			prev_init_tok = t;
 			t = tok_next(t);
 			init_is_first = false;
@@ -8870,6 +9101,15 @@ static Token *p1d_scan_init_orelse(Token *t, bool *out_has_orelse, Token **out_f
 			Token *nx = tok_next(t);
 			if (nx && (match_ch(nx, ';') || match_ch(nx, ',')))
 				error_tok(nx, "expected statement after 'orelse'");
+			if (out_first_orelse && *out_first_orelse == t) {
+				Token *ppc =
+				    span_find_pp_conditional(tok_next(eq), t, NULL);
+				if (ppc)
+					error_tok(t,
+						  "'orelse' in a declaration initializer spans "
+						  "preprocessor conditionals; keep the orelse "
+						  "within a single #if branch");
+			}
 		}
 		if (t->flags & TF_OPEN) {
 			Token *m = tok_match(t);
@@ -9097,6 +9337,53 @@ static void p1d_probe_declaration(Token *tok,
 	TypeSpecResult type = parse_type_specifier(tok);
 	// parse_type_specifier now skips embedded 'raw' and sets has_raw.
 	if (type.has_raw) *saw_raw = true;
+	/* Stray-defer closure inside declaration ranges: the main-loop rule
+	 * cannot see declarator interiors (`int (* defer pa)[3]`), so scan the
+	 * declaration here.  `defer` followed by an identifier or `{` is never
+	 * valid inside a declaration (juxtaposed identifiers form neither a
+	 * declarator nor an expression) unless `defer` names a typedef.
+	 * Without this, Pass 2's statement handler consumes the declarator's
+	 * tokens.  Found by the insertion suite. */
+	if (type.saw_type && FEAT(F_DEFER) && cur_func >= 0) {
+		/* Flag only inside pure paren/bracket nesting (declarator parens,
+		 * argument lists, dimensions): statements cannot exist there, so
+		 * `defer IDENT` is always a stray.  Inside any `{` group (statement
+		 * expressions, initializer braces) defer statements can be
+		 * legitimate and the block's own validation applies. */
+		int po = 0, bo = 0;
+		Token *sprev = NULL;
+		for (Token *s = tok; s && s->kind != TK_EOF; s = tok_next(s)) {
+			if (s->flags & TF_OPEN) {
+				if (match_ch(s, '{')) bo++;
+				else
+					po++;
+			} else if (s->flags & TF_CLOSE) {
+				if (match_ch(s, '}')) {
+					if (bo == 0) break;
+					bo--;
+				} else {
+					if (po == 0 && bo == 0) break;
+					if (po > 0) po--;
+				}
+			} else if (po == 0 && bo == 0 && (match_ch(s, ';') || match_ch(s, '{')))
+				break;
+			/* Stray `defer` inside a declaration: either nested in a
+			 * declarator/argument/dimension paren (po>0), or at the
+			 * declaration's top level but NOT its first token (`raw defer
+			 * int u` — `defer` wedged into the declaration-specifier
+			 * sequence).  Both mis-scan in Pass 2.  A leading `defer`
+			 * (s==tok) is a real defer statement handled elsewhere; a
+			 * `defer` typedef name, a `struct/union/enum defer` TAG name,
+			 * or a `.defer`/`->defer` member name is a legitimate use. */
+			if (bo == 0 && (po > 0 || s != tok) && (s->tag & TT_DEFER) &&
+			    !is_known_typedef(s) && !(sprev && (sprev->tag & (TT_SUE | TT_MEMBER)))) {
+				Token *nx = skip_noise(tok_next(s));
+				if (nx && (is_identifier_like(nx) || match_ch(nx, '{')))
+					error_tok(s, ERR_DEFER_EXPR_CTX);
+			}
+			if (s->kind != TK_PREP_DIR) sprev = s;
+		}
+	}
 	if (!type.saw_type && type.end && (type.end->flags & TF_RAW) && !is_known_typedef(type.end)) {
 		Token *after_raw = skip_noise(tok_next(type.end));
 		if (after_raw && is_raw_declaration_context(type.end, after_raw)) {
@@ -9699,7 +9986,21 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 		ps->p1d_saw_static = false;                                                                  \
 		ps->p1d_ctrl_pending = false;                                                                \
 	} while (0)
+#ifdef PRISM_DEBUG
+	/* Termination watchdog: the prescan's outer loop must advance through
+	 * the token stream; total iterations are linear in token_count.  A trip
+	 * here means a cursor-stall (non-termination) bug, surfaced loudly
+	 * instead of hanging the build.  Debug builds only — zero release cost. */
+	uint64_t p1_wd_steps = 0;
+	const uint64_t p1_wd_budget = 256ull * (uint64_t)token_count + 65536ull;
+#endif
 	while (ps->tok && ps->tok->kind != TK_EOF) {
+#ifdef PRISM_DEBUG
+		if (++p1_wd_steps > p1_wd_budget)
+			error_tok(ps->tok,
+				  "internal: Phase 1 progress watchdog tripped "
+				  "(possible non-termination); please report");
+#endif
 		while (ps->p1d_switch_top > 0 && ps->p1d_switch_end[ps->p1d_switch_top - 1] > 0 &&
 		       tok_idx(ps->tok) > ps->p1d_switch_end[ps->p1d_switch_top - 1])
 			ps->p1d_switch_top--;
@@ -9860,26 +10161,31 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 				      (p1d_prev_saved->tag &
 				       (TT_IF | TT_LOOP | TT_SWITCH | TT_TYPEOF | TT_ATTR | TT_ASM))))
 					check_orelse_in_parens(ps->tok);
-				// Phase 1D: reject orelse/CF inside attribute paren groups at
-				// any declarator position (pre- and post-declarator).
+				// Phase 1D: reject orelse/CF inside attribute and asm paren
+				// groups (pre-/post-declarator attrs; __asm__(...)).
 				if (tok_match(ps->tok) &&
 				    ((match_ch(ps->tok, '(') && p1d_prev_saved &&
-				      (p1d_prev_saved->tag & TT_ATTR)) ||
+				      (p1d_prev_saved->tag & (TT_ATTR | TT_ASM))) ||
 				     (ps->tok->flags & TF_C23_ATTR))) {
+					int in_asm = p1d_prev_saved && (p1d_prev_saved->tag & TT_ASM);
 					Token *am = tok_match(ps->tok);
 					for (Token *s = tok_next(ps->tok); s && s != am; s = tok_next(s)) {
 						uint32_t st = s->tag;
 						if (FEAT(F_ORELSE) && (st & TT_ORELSE) && !typedef_lookup(s))
 							error_tok(s,
-								  "'orelse' cannot be used inside "
-								  "attribute arguments");
+								  in_asm ? "'orelse' cannot be used inside "
+									   "asm arguments"
+									 : "'orelse' cannot be used inside "
+									   "attribute arguments");
 						if (st & (TT_GOTO | TT_RETURN | TT_BREAK | TT_CONTINUE))
 							error_tok(s,
-								  "'%.*s' inside attribute argument "
-								  "bypasses control-flow analysis; "
-								  "move it outside the attribute",
-								  s->len,
-								  tok_loc(s));
+								  in_asm ? "'%.*s' inside asm argument "
+									   "bypasses control-flow analysis; "
+									   "move it outside the asm"
+									 : "'%.*s' inside attribute argument "
+									   "bypasses control-flow analysis; "
+									   "move it outside the attribute",
+								  s->len, tok_loc(s));
 					}
 				}
 				if (match_ch(ps->tok, '(') || match_ch(ps->tok, '[')) {
@@ -10124,33 +10430,47 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 			 * (otherwise `orelse` leaks into the backend). Reject
 			 * non-bracket orelse — statement/action forms cannot
 			 * appear in an integer constant expression. */
-			if (FEAT(F_ORELSE)) {
+			if (FEAT(F_ORELSE) || FEAT(F_DEFER)) {
 				Token *lp = skip_noise(tok_next(ps->tok));
 				if (lp && match_ch(lp, '(') && (lp->flags & TF_OPEN) && tok_match(lp)) {
 					Token *rp = tok_match(lp);
 					/* Walk every token — do not skip nested groups or
 					 * `sizeof(char[…])` brackets are never classified. */
-					for (Token *inner = tok_next(lp); inner && inner != rp;
-					     inner = tok_next(inner)) {
-						if (match_ch(inner, '[') && (inner->flags & TF_OPEN) &&
-						    tok_match(inner) && !(inner->flags & TF_C23_ATTR) &&
-						    !(tok_ann(inner) & P1_OE_BRACKET))
-							p1d_classify_bracket_orelse_ex(inner,
-										     CUR_SID(),
-										     ps->p1d_cur_func,
-										     /*hard_ctx=*/false,
-										     /*allow_se_hoist=*/false);
-					}
+					if (FEAT(F_ORELSE))
+						for (Token *inner = tok_next(lp); inner && inner != rp;
+						     inner = tok_next(inner)) {
+							if (match_ch(inner, '[') && (inner->flags & TF_OPEN) &&
+							    tok_match(inner) && !(inner->flags & TF_C23_ATTR) &&
+							    !(tok_ann(inner) & P1_OE_BRACKET))
+								p1d_classify_bracket_orelse_ex(inner,
+											     CUR_SID(),
+											     ps->p1d_cur_func,
+											     /*hard_ctx=*/false,
+											     /*allow_se_hoist=*/false);
+						}
 					Token *prev_sa = lp;
 					for (Token *s = tok_next(lp); s && s != rp; s = tok_next(s)) {
 						/* Walk into nested groups — `(0 orelse 1)` and
 						 * `sizeof(0 orelse 1)` must reject, not leak. */
-						if (orelse_kw_at_bare(s, prev_sa) &&
+						if (FEAT(F_ORELSE) && orelse_kw_at_bare(s, prev_sa) &&
 						    !(tok_ann(s) & P1_IS_ORELSE_KW))
 							error_tok(s,
 								  "'orelse' cannot be used in "
 								  "_Static_assert/static_assert except "
 								  "inside an array dimension");
+						/* A defer statement shape inside the argument
+						 * (`defer h(...)` / `defer { ... }`) would be
+						 * consumed by Pass 2's statement handler, emptying
+						 * the assert argument and pasting the body at scope
+						 * exits — token-mangling miscompile found by the
+						 * contexts suite.  A lone identifier named defer
+						 * remains legal in the constant expression. */
+						if (FEAT(F_DEFER) && (s->tag & TT_DEFER) && tok_next(s) &&
+						    (is_identifier_like(tok_next(s)) ||
+						     match_ch(tok_next(s), '{')))
+							error_tok(s,
+								  "'defer' cannot be used inside "
+								  "_Static_assert/static_assert");
 						if (s->flags & TF_OPEN && tok_match(s))
 							prev_sa = s;
 						else
@@ -10237,32 +10557,70 @@ static PRISM_HOT void p1_full_depth_prescan(Token *tok) {
 
 			p1d_record_goto(ps, ps->tok, cur_sid, ps->p1d_cur_func);
 			if (is_defer_kw(ps->tok, ps->p1d_prev)) p1_try_alloc_defer(ps->tok, cur_sid, ps->p1d_cur_func);
+			/* Stray `defer` in non-statement positions is caught by the
+			 * dedicated context scanners (declarator/argument/dimension
+			 * interiors in p1d_probe_declaration; parameter dimensions;
+			 * _Static_assert operands; the emit_deferred/expr-context Pass-2
+			 * guards) — NOT by a blanket "is_defer_kw==false" rule here,
+			 * which would misfire on legitimate defers that prev-tracking
+			 * fails to recognize (e.g. after a GNU `__label__` declaration
+			 * inside a statement expression). */
 			if (ps->tok->tag & (TT_CASE | TT_DEFAULT)) {
 				uint16_t sw_sid =
 				    ps->p1d_switch_top > 0 ? ps->p1d_switch_stack[ps->p1d_switch_top - 1] : 0;
 				P1FuncEntry *e = p1_alloc(P1K_CASE, cur_sid, ps->tok);
 				e->kase.switch_scope_id = sw_sid;
 				Token *ct = tok_next(ps->tok);
+				Token *cprev = ps->tok;
 				int td = 0;
 				while (ct && ct->kind != TK_EOF) {
 					if (match_ch(ct, ';') || match_ch(ct, '{')) break;
+					/* case label expressions are integer constant
+					 * expressions: an orelse there has no statement
+					 * context to lower into and would otherwise pass
+					 * through to the backend verbatim. */
+					if (FEAT(F_ORELSE) && (ct->tag & TT_ORELSE) &&
+					    !(cprev->tag & TT_MEMBER) && !typedef_lookup(ct))
+						error_tok(ct,
+							  "'orelse' cannot be used inside a case "
+							  "label expression");
 					if (ct->flags & TF_OPEN && tok_match(ct)) {
-						ct = tok_next(tok_match(ct));
+						Token *cam = tok_match(ct);
+						if (FEAT(F_ORELSE)) {
+							Token *cip = ct;
+							for (Token *s = tok_next(ct); s && s != cam;
+							     s = tok_next(s)) {
+								if ((s->tag & TT_ORELSE) &&
+								    !(cip->tag & TT_MEMBER) &&
+								    !typedef_lookup(s))
+									error_tok(
+									    s,
+									    "'orelse' cannot be used "
+									    "inside a case label "
+									    "expression");
+								cip = s;
+							}
+						}
+						cprev = cam;
+						ct = tok_next(cam);
 						continue;
 					}
 					if (match_ch(ct, '?')) {
 						td++;
+						cprev = ct;
 						ct = tok_next(ct);
 						continue;
 					}
 					if (match_ch(ct, ':')) {
 						if (td > 0) {
 							td--;
+							cprev = ct;
 							ct = tok_next(ct);
 							continue;
 						}
 						break;
 					}
+					cprev = ct;
 					ct = tok_next(ct);
 				}
 				if (ct && match_ch(ct, ':')) {
@@ -10881,7 +11239,18 @@ static PRISM_HOT int transpile_tokens(Token *tok, FILE *fp) {
 	const uint32_t feat = ctx->features;
 #undef FEAT
 #define FEAT(f) (feat & (f))
+#ifdef PRISM_DEBUG
+	/* Termination watchdog for the Pass 2 walk (see Phase 1 twin). */
+	uint64_t p2_wd_steps = 0;
+	const uint64_t p2_wd_budget = 256ull * (uint64_t)token_count + 65536ull;
+#endif
 	while (tok->kind != TK_EOF) {
+#ifdef PRISM_DEBUG
+		if (++p2_wd_steps > p2_wd_budget)
+			error_tok(tok,
+				  "internal: Pass 2 progress watchdog tripped "
+				  "(possible non-termination); please report");
+#endif
 		/* TF_SYS_SKIP is precomputed at tokenize (== f->is_system &&
 		 * f->is_include_entry for this token's file); avoids a per-token
 		 * tok_cold + file lookup in the hottest loop. */
@@ -11139,10 +11508,15 @@ static int transpile_to_fp(char *input_file, FILE *fp) {
 	return ok;
 }
 
+static int verify_transpiled_output(char *orig_input, char *out1_path);
+
 static int transpile(char *input_file, char *output_file) {
 	FILE *fp = fopen(output_file, "w");
 	if (!fp) return 0;
-	return transpile_to_fp(input_file, fp);
+	int ok = transpile_to_fp(input_file, fp);
+	if (ok && prism_verify_mode && !prism_in_verify && strcmp(output_file, "/dev/stdout") != 0)
+		ok = verify_transpiled_output(input_file, output_file);
+	return ok;
 }
 
 static int transpile_to_stdout(char *input_file) {
@@ -11197,6 +11571,143 @@ PRISM_API void prism_reset(void) {
 		fclose(out_fp);
 		out_fp = NULL;
 	}
+}
+
+/* --prism-verify: per-compile translation-validation certificate for the
+ * defer/orelse safety theorem.
+ *
+ * After emitting output #1 for `orig_input`, the ENTIRE pipeline runs on
+ * output #1 a second time (preprocess, tokenize, all Phase 1 analyses + CFG
+ * verification, Pass 2).  The certificate requires:
+ *   (1) the second pass SUCCEEDS — output #1 is valid C that survives every
+ *       Phase-1 constraint and the CFG verifier as plain C.  A leaked
+ *       operator-position keyword that produces invalid C, or any emitted
+ *       construct that trips a Phase-1 gate, fails here.
+ *   (2) NO operator keyword leaked — the count of whole-word `orelse` /
+ *       `defer` tokens is IDENTICAL in output #1 and output #2.  Soundness:
+ *       prism only ever REMOVES operator-position keywords (it lowers them);
+ *       it never introduces one.  So count(#2) <= count(#1) always, and a
+ *       strict decrease means pass 2 lowered a keyword that pass 1 left
+ *       behind — i.e. output #1 leaked an operator `orelse`/`defer` to the
+ *       backend.  Equal counts prove every surviving `orelse`/`defer` word
+ *       is a stable ordinary identifier (a user variable/typedef/label),
+ *       exactly SPEC's "when disabled the keyword reverts to an identifier".
+ *
+ * Why not byte-equality: `prism(prism(x))` is deliberately NOT byte-equal to
+ * `prism(x)` under header-flattening — pass 2 re-wraps the diagnostic-pragma
+ * preamble, renumbers `#line`, and relocates the one-time `__prism_bchk`
+ * runtime helper.  That scaffolding asymmetry is unrelated to defer/orelse.
+ * Byte-level lowering-idempotence of defer/orelse (and bounds) IS certified,
+ * on controlled inputs where scaffolding is stable, by the in-process
+ * contexts/insertion fixed-point oracles (test.contexts.c / test.insertion.c).
+ *
+ * The second pass disables the additive safety transforms (zero-init,
+ * auto-unreachable, auto-static) — each re-applies to already-lowered code
+ * with a benign asymmetry (raw-stripped re-zeroing, doubled unreachable
+ * marker, reshaped-decl tracking) — and downgrades safety diagnostics to
+ * warnings, because Prism's own lowering can emit CFG shapes its strict
+ * checker rejects (e.g. `int x = v orelse goto L, y = 10;` → a goto
+ * textually before an initialized decl); the user's ORIGINAL already passed
+ * the strict check in pass 1.  defer + orelse stay ON so a leaked operator
+ * keyword is lowered on pass 2 and detected by the count check.            */
+static char *verify_read_file(const char *path) {
+	FILE *f = fopen(path, "rb");
+	if (!f) return NULL;
+	fseek(f, 0, SEEK_END);
+	long len = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	if (len < 0) {
+		fclose(f);
+		return NULL;
+	}
+	char *buf = malloc((size_t)len + 1);
+	if (!buf) {
+		fclose(f);
+		return NULL;
+	}
+	if (fread(buf, 1, (size_t)len, f) != (size_t)len) {
+		free(buf);
+		fclose(f);
+		return NULL;
+	}
+	buf[len] = '\0';
+	fclose(f);
+	return buf;
+}
+
+/* Count whole-word occurrences of `kw` (identifier boundaries on both sides). */
+static long verify_count_kw(const char *s, const char *kw) {
+	long n = 0;
+	size_t kl = strlen(kw);
+	for (const char *p = strstr(s, kw); p; p = strstr(p + kl, kw)) {
+		char before = (p == s) ? '\0' : p[-1];
+		char after = p[kl];
+		int lb = !((before >= 'a' && before <= 'z') || (before >= 'A' && before <= 'Z') ||
+			   (before >= '0' && before <= '9') || before == '_');
+		int rb = !((after >= 'a' && after <= 'z') || (after >= 'A' && after <= 'Z') ||
+			   (after >= '0' && after <= '9') || after == '_');
+		if (lb && rb) n++;
+	}
+	return n;
+}
+
+static int verify_transpiled_output(char *orig_input, char *out1_path) {
+	prism_in_verify = true;
+	const char **saved_dep = ctx->dep_flags;
+	int saved_dep_n = ctx->dep_flags_count;
+	ctx->dep_flags = NULL; /* never regenerate .d files for the verify pass */
+	ctx->dep_flags_count = 0;
+	prism_reset();
+
+	char tmp2[PATH_MAX];
+	int ok = 0;
+	char diag[256] = "re-transpile of emitted C failed (output is not valid re-parseable C)";
+	int fd = make_temp_file_registered(tmp2, sizeof(tmp2), NULL, 2, out1_path);
+	if (fd >= 0) {
+		close(fd);
+		uint32_t saved_features = ctx->features;
+		ctx->features &= ~(uint32_t)(F_ZEROINIT | F_AUTO_UNREACHABLE | F_AUTO_STATIC);
+		ctx->features |= F_WARN_SAFETY;
+		int retrans_ok = transpile(out1_path, tmp2);
+		ctx->features = saved_features;
+		if (retrans_ok) {
+			char *o1 = verify_read_file(out1_path);
+			char *o2 = verify_read_file(tmp2);
+			if (o1 && o2) {
+				long oe1 = verify_count_kw(o1, "orelse"), oe2 = verify_count_kw(o2, "orelse");
+				long df1 = verify_count_kw(o1, "defer"), df2 = verify_count_kw(o2, "defer");
+				if (oe2 < oe1 || df2 < df1) {
+					snprintf(diag, sizeof(diag),
+						 "operator keyword leaked to output: orelse %ld->%ld, "
+						 "defer %ld->%ld (re-transpile lowered a keyword pass 1 "
+						 "left behind)",
+						 oe1, oe2, df1, df2);
+				} else {
+					ok = 1;
+				}
+			} else {
+				snprintf(diag, sizeof(diag), "cannot reopen outputs for comparison");
+			}
+			free(o1);
+			free(o2);
+		}
+		remove(tmp2);
+	}
+
+	prism_reset();
+	ctx->dep_flags = saved_dep;
+	ctx->dep_flags_count = saved_dep_n;
+	prism_in_verify = false;
+
+	if (!ok) {
+		fprintf(stderr,
+			"prism: --prism-verify FAILED for %s\n"
+			"  %s\n"
+			"  this indicates a transform defect; please report it.\n",
+			orig_input, diag);
+		return 0;
+	}
+	return 1;
 }
 
 PRISM_API void prism_thread_cleanup(void) {
@@ -11848,6 +12359,10 @@ static Cli cli_parse(int argc, char **argv) {
 				cli.profile = true;
 				continue;
 			}
+			if (!strcmp(a, "--prism-verify")) {
+				cli.verify = true;
+				continue;
+			}
 			if (str_startswith(a, "--prism-emit=")) {
 				cli.mode = CLI_EMIT;
 				cli.output = a + 13;
@@ -11983,6 +12498,52 @@ static int transpile_and_compile(char *input_file, char **compile_argv, bool ver
 		fprintf(stderr, "[prism] ");
 		for (int i = 0; compile_argv[i]; i++) fprintf(stderr, "%s ", compile_argv[i]);
 		fprintf(stderr, "\n");
+	}
+
+	/* --prism-verify: the fast path streams transpiled C straight into the
+	 * backend's stdin, leaving nothing to verify.  Under verification we
+	 * materialize the output first, check the re-transpilation fixed
+	 * point, then feed the verified bytes to the backend. */
+	if (prism_verify_mode && !prism_in_verify) {
+		char vtmp[PATH_MAX];
+		int vfd = make_temp_file_registered(vtmp, sizeof(vtmp), NULL, 2, input_file);
+		if (vfd < 0) return -1;
+		FILE *vfp = fdopen(vfd, "w");
+		if (!vfp) {
+			close(vfd);
+			remove(vtmp);
+			return -1;
+		}
+		if (!transpile_to_fp(input_file, vfp)) {
+			remove(vtmp);
+			return -1;
+		}
+		if (!verify_transpiled_output(input_file, vtmp)) {
+			remove(vtmp);
+			return -1;
+		}
+		int in_fd = open(vtmp, O_RDONLY);
+		if (in_fd < 0) {
+			remove(vtmp);
+			return -1;
+		}
+		posix_spawn_file_actions_t vfa;
+		posix_spawn_file_actions_init(&vfa);
+		posix_spawn_file_actions_adddup2(&vfa, in_fd, STDIN_FILENO);
+		posix_spawn_file_actions_addclose(&vfa, in_fd);
+		char **venv = build_clean_environ();
+		pid_t vpid;
+		int verr = posix_spawnp(&vpid, compile_argv[0], &vfa, NULL, compile_argv, venv);
+		posix_spawn_file_actions_destroy(&vfa);
+		close(in_fd);
+		if (verr) {
+			fprintf(stderr, "posix_spawnp: %s: %s\n", compile_argv[0], strerror(verr));
+			remove(vtmp);
+			return -1;
+		}
+		int vrc = wait_for_child(vpid);
+		remove(vtmp);
+		return vrc;
 	}
 
 	double t0 = prism_now_ms();
@@ -12449,6 +13010,8 @@ static PRISM_COLD void print_help(void) {
 	       "  --prism-cc=<compiler>  Use specific compiler\n"
 	       "  --prism-verbose        Show commands\n"
 	       "  --prism-prof           Print per-phase timing breakdown\n"
+	       "  --prism-verify         Translation validation: re-transpile emitted C,\n"
+	       "                         require a fixed point (also: PRISM_VERIFY env)\n"
 	       "  --                     Separator: remaining args are passed to the "
 	       "binary in `run` mode\n\n"
 	       "All other flags are passed through to CC.\n\n"
@@ -12793,6 +13356,11 @@ static char **transpile_sources_to_temps(const Cli *cli, bool use_lib_api) {
 				die("Failed to open temp file");
 			}
 			if (!transpile_to_fp((char *)cli->sources[i], wfp)) {
+				cleanup_temp_range(temps, i + 1);
+				return NULL;
+			}
+			if (prism_verify_mode && !prism_in_verify &&
+			    !verify_transpiled_output((char *)cli->sources[i], temps[i])) {
 				cleanup_temp_range(temps, i + 1);
 				return NULL;
 			}
@@ -13204,6 +13772,7 @@ int main(int argc, char **argv) {
 
 	Cli cli = cli_parse(argc, argv);
 	prism_profile = cli.profile;
+	prism_verify_mode = cli.verify || getenv("PRISM_VERIFY") != NULL;
 	if (cli.action == CLI_ACT_HELP) {
 		print_help();
 		cli_free(&cli);

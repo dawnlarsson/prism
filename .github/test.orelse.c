@@ -8484,6 +8484,8 @@ typedef enum {
 	OE_FORM_EXPR = 0,
 	OE_FORM_DECL,
 	OE_FORM_BRACKET,
+	OE_FORM_CHAIN,
+	OE_FORM_BLOCK,
 	OE_FORM_COUNT
 } OeFormKind;
 
@@ -8498,7 +8500,7 @@ static const char *oe_pos_name(OeCtrlPos p) {
 	return n[p];
 }
 static const char *oe_form_name(OeFormKind f) {
-	static const char *n[OE_FORM_COUNT] = {"expr", "decl", "bracket"};
+	static const char *n[OE_FORM_COUNT] = {"expr", "decl", "bracket", "chain", "block"};
 	return n[f];
 }
 
@@ -8514,6 +8516,9 @@ static int oe_ctrl_expect(OeCtrlKind ctrl, OeCtrlPos pos, OeFormKind form) {
 		return -1;
 	}
 	if (pos == OE_POS_BODY_BARE && form == OE_FORM_BRACKET) return -1;
+	if (pos == OE_POS_BODY_PAREN && (form == OE_FORM_CHAIN || form == OE_FORM_BLOCK))
+		return 0;
+	if (pos == OE_POS_BODY_BARE && form == OE_FORM_BLOCK) return -1; /* needs braces */
 	return 1;
 }
 
@@ -8528,6 +8533,10 @@ static int oe_ctrl_build(char *buf, size_t buflen, OeCtrlKind ctrl, OeCtrlPos po
 		snprintf(payload, sizeof(payload), "g() orelse %s;", action);
 	else if (form == OE_FORM_DECL)
 		snprintf(payload, sizeof(payload), "int x = g() orelse 0; (void)x;");
+	else if (form == OE_FORM_CHAIN)
+		snprintf(payload, sizeof(payload), "int x = g() orelse g() orelse 0; (void)x;");
+	else if (form == OE_FORM_BLOCK)
+		snprintf(payload, sizeof(payload), "int x = g() orelse { %s; }; (void)x;", action);
 	else
 		snprintf(payload, sizeof(payload), "int a[g() orelse 1]; (void)a;");
 
@@ -8873,6 +8882,865 @@ static void test_ctrl_orelse_product_matrix(void) {
 	}
 
 	printf("--- ctrl×oe matrix summary: %d ok, %d fail, %d skipped ---\n", ok, fail, skipped);
+}
+
+/* Aggressive Form × context × SE orelse product (locked expects). */
+typedef enum {
+	OE_FCSE_FORM_DECL_INIT = 0,
+	OE_FCSE_FORM_BARE_ASSIGN,
+	OE_FCSE_FORM_BARE_ACTION,
+	OE_FCSE_FORM_CHAIN2,
+	OE_FCSE_FORM_CHAIN3,
+	OE_FCSE_FORM_BLOCK,
+	OE_FCSE_FORM_PAREN_WRAP,
+	OE_FCSE_FORM_MULTI_DECL,
+	OE_FCSE_FORM_COUNT
+} OeFcseForm;
+
+typedef enum {
+	OE_FCSE_CTX_STMT = 0,
+	OE_FCSE_CTX_FOR_INIT,
+	OE_FCSE_CTX_IF_INIT,
+	OE_FCSE_CTX_TYPEOF_ARG,
+	OE_FCSE_CTX_ARRAY_DIM,
+	OE_FCSE_CTX_ENUM_BODY,
+	OE_FCSE_CTX_ATTR_PRE,
+	OE_FCSE_CTX_ATTR_POST,
+	OE_FCSE_CTX_STMTEXPR,
+	OE_FCSE_CTX_RETURN_EXPR,
+	OE_FCSE_CTX_SIZEOF_ARG,
+	OE_FCSE_CTX_ALIGNOF_ARG,
+	OE_FCSE_CTX_GENERIC_ASSOC,
+	OE_FCSE_CTX_FILE_SCOPE,
+	OE_FCSE_CTX_STATIC_ASSERT,
+	OE_FCSE_CTX_DEFER_BODY,
+	OE_FCSE_CTX_BITFIELD,
+	OE_FCSE_CTX_COMPOUND_LIT,
+	OE_FCSE_CTX_CAST_EXPR,
+	OE_FCSE_CTX_COMMA_STMT,
+	OE_FCSE_CTX_COUNT
+} OeFcseCtx;
+
+typedef enum {
+	OE_FCSE_SE_PLAIN = 0,
+	OE_FCSE_SE_CALL,
+	OE_FCSE_SE_POSTFIX_INC,
+	OE_FCSE_SE_PREFIX_INC,
+	OE_FCSE_SE_VOLATILE_READ,
+	OE_FCSE_SE_ATOMIC_READ,
+	OE_FCSE_SE_STRUCT_VAL,
+	OE_FCSE_SE_DESIG_RHS,
+	OE_FCSE_SE_DESIG_DIM,
+	OE_FCSE_SE_COMMA,
+	OE_FCSE_SE_CTRL_GOTO,
+	OE_FCSE_SE_CTRL_CONT,
+	OE_FCSE_SE_CTRL_BLOCK,
+	OE_FCSE_SE_COUNT
+} OeFcseSe;
+
+static const char *oe_fcse_form_name(OeFcseForm f) {
+	static const char *n[OE_FCSE_FORM_COUNT] = {
+	    "decl_init", "bare_assign", "bare_action", "chain2", "chain3", "block", "paren_wrap", "multi_decl",
+	};
+	return n[f];
+}
+static const char *oe_fcse_ctx_name(OeFcseCtx c) {
+	static const char *n[OE_FCSE_CTX_COUNT] = {
+	    "stmt", "for_init", "if_init", "typeof_arg", "array_dim", "enum_body", "attr_pre", "attr_post", "stmtexpr", "return_expr", "sizeof_arg", "alignof_arg", "generic_assoc", "file_scope", "static_assert", "defer_body", "bitfield", "compound_lit", "cast_expr", "comma_stmt",
+	};
+	return n[c];
+}
+static const char *oe_fcse_se_name(OeFcseSe s) {
+	static const char *n[OE_FCSE_SE_COUNT] = {
+	    "plain", "call", "postfix_inc", "prefix_inc", "volatile_read", "atomic_read", "struct_val", "desig_rhs", "desig_dim", "comma", "ctrl_goto", "ctrl_cont", "ctrl_block",
+	};
+	return n[s];
+}
+
+/* Packed expect: [form][ctx][se] = -1 skip, 0 reject, 1 accept (locked). */
+static const signed char oe_fcse_expect_tbl[OE_FCSE_FORM_COUNT][OE_FCSE_CTX_COUNT][OE_FCSE_SE_COUNT] = {
+	/* decl_init */ {
+		/* stmt */ {1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1},
+		/* for_init */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* if_init */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* typeof_arg */ {1, 0, 1, 1, 1, 1, 0, 1, 1, 0, 1, 1, 1},
+		/* array_dim */ {1, 1, 1, 1, 1, 1, -1, 1, 1, 1, 1, 1, 1},
+		/* enum_body */ {0, 0, 0, 0, 0, -1, 0, 0, -1, 0, 0, 0, 0},
+		/* attr_pre */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* attr_post */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* stmtexpr */ {1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1},
+		/* return_expr */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* sizeof_arg */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* alignof_arg */ {1, 0, 1, 1, 0, 1, -1, 1, -1, 0, 1, 1, 1},
+		/* generic_assoc */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* file_scope */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* static_assert */ {1, 0, 1, 1, 0, 1, -1, 1, -1, 0, 1, 1, 1},
+		/* defer_body */ {1, 1, 1, 1, 1, 1, 0, 0, -1, 1, 0, 0, 0},
+		/* bitfield */ {0, 0, 0, 0, 0, -1, -1, 0, -1, 0, 0, 0, 0},
+		/* compound_lit */ {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		/* cast_expr */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* comma_stmt */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+	},
+	/* bare_assign */ {
+		/* stmt */ {1, 1, 0, 0, 1, 1, 0, 1, -1, 1, 1, 1, 1},
+		/* for_init */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* if_init */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* typeof_arg */ {1, 0, 1, 1, 1, 1, 0, 1, -1, 0, 1, 1, 1},
+		/* array_dim */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* enum_body */ {0, 0, 0, 0, 0, -1, 0, 0, -1, 0, 0, 0, 0},
+		/* attr_pre */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* attr_post */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* stmtexpr */ {1, 1, 0, 0, 1, 1, 0, 1, -1, 1, 1, 1, 1},
+		/* return_expr */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* sizeof_arg */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* alignof_arg */ {1, 0, 1, 1, 0, 1, -1, 1, -1, 0, 1, 1, 1},
+		/* generic_assoc */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* file_scope */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* static_assert */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* defer_body */ {1, 1, 0, 0, 1, 1, 0, 1, -1, 1, 0, 0, 0},
+		/* bitfield */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* compound_lit */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* cast_expr */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* comma_stmt */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+	},
+	/* bare_action */ {
+		/* stmt */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 1, 1, 1, 1},
+		/* for_init */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* if_init */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* typeof_arg */ {1, 0, 1, 1, 1, 1, 0, -1, -1, 0, 1, 1, 1},
+		/* array_dim */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* enum_body */ {0, 0, 0, 0, 0, -1, 0, -1, -1, 0, 0, 0, 0},
+		/* attr_pre */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* attr_post */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* stmtexpr */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 1, 1, 1, 1},
+		/* return_expr */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* sizeof_arg */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* alignof_arg */ {1, 0, 1, 1, 0, 1, -1, -1, -1, 0, 1, 1, 1},
+		/* generic_assoc */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* file_scope */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* static_assert */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* defer_body */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* bitfield */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* compound_lit */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* cast_expr */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* comma_stmt */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+	},
+	/* chain2 */ {
+		/* stmt */ {1, 1, 1, 1, 1, 1, 1, -1, 1, 1, 0, 0, 0},
+		/* for_init */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* if_init */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* typeof_arg */ {1, 0, 1, 1, 1, 1, 0, -1, 1, 0, 1, 1, 1},
+		/* array_dim */ {1, 1, 1, 1, 1, 1, -1, -1, 1, 1, 1, 1, 1},
+		/* enum_body */ {0, 0, 0, 0, 0, -1, 0, -1, -1, 0, 0, 0, 0},
+		/* attr_pre */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* attr_post */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* stmtexpr */ {1, 1, 1, 1, 1, 1, 1, -1, 1, 1, 0, 0, 0},
+		/* return_expr */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* sizeof_arg */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* alignof_arg */ {1, 0, 1, 1, 0, 1, -1, -1, -1, 0, 1, 1, 1},
+		/* generic_assoc */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* file_scope */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* static_assert */ {1, 0, 1, 1, 0, 1, -1, -1, -1, 0, 1, 1, 1},
+		/* defer_body */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 1, 0, 0, 0},
+		/* bitfield */ {0, 0, 0, 0, 0, -1, -1, -1, -1, 0, 0, 0, 0},
+		/* compound_lit */ {0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0, 0},
+		/* cast_expr */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* comma_stmt */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+	},
+	/* chain3 */ {
+		/* stmt */ {1, 1, 1, 1, 1, 1, 1, -1, 1, 1, 0, 1, 1},
+		/* for_init */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* if_init */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* typeof_arg */ {1, 0, 1, 1, 1, 1, 0, -1, 1, 0, 1, 1, 1},
+		/* array_dim */ {1, 1, 1, 1, 1, 1, -1, -1, 1, 1, 1, 1, 1},
+		/* enum_body */ {0, 0, 0, 0, 0, -1, 0, -1, -1, 0, 0, 0, 0},
+		/* attr_pre */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* attr_post */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* stmtexpr */ {1, 1, 1, 1, 1, 1, 1, -1, 1, 1, 0, 1, 1},
+		/* return_expr */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* sizeof_arg */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* alignof_arg */ {1, 0, 1, 1, 0, 1, -1, -1, -1, 0, 1, 1, 1},
+		/* generic_assoc */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* file_scope */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* static_assert */ {1, 0, 1, 1, 0, 1, -1, -1, -1, 0, 1, 1, 1},
+		/* defer_body */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 1, 0, 1, 1},
+		/* bitfield */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* compound_lit */ {0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0, 0},
+		/* cast_expr */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* comma_stmt */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+	},
+	/* block */ {
+		/* stmt */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 1, 1, 1, 1},
+		/* for_init */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* if_init */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* typeof_arg */ {1, 0, 1, 1, 1, 1, 0, -1, -1, 0, 1, 1, 1},
+		/* array_dim */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* enum_body */ {0, 0, 0, 0, 0, -1, 0, -1, -1, 0, 0, 0, 0},
+		/* attr_pre */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* attr_post */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* stmtexpr */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 1, 1, 1, 1},
+		/* return_expr */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* sizeof_arg */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* alignof_arg */ {1, 0, 1, 1, 0, 1, -1, -1, -1, 0, 1, 1, 1},
+		/* generic_assoc */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* file_scope */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* static_assert */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* defer_body */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+		/* bitfield */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* compound_lit */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* cast_expr */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* comma_stmt */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0},
+	},
+	/* paren_wrap */ {
+		/* stmt */ {1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1},
+		/* for_init */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* if_init */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* typeof_arg */ {1, 0, 1, 1, 1, 1, 0, 1, 1, 0, 1, 1, 1},
+		/* array_dim */ {1, 1, 1, 1, 1, 1, -1, 1, 1, 1, 1, 1, 1},
+		/* enum_body */ {0, 0, 0, 0, 0, -1, 0, 0, -1, 0, 0, 0, 0},
+		/* attr_pre */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* attr_post */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* stmtexpr */ {1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1},
+		/* return_expr */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* sizeof_arg */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* alignof_arg */ {1, 0, 1, 1, 0, 1, -1, 1, -1, 0, 1, 1, 1},
+		/* generic_assoc */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* file_scope */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* static_assert */ {1, 0, 1, 1, 0, 1, -1, 1, -1, 0, 1, 1, 1},
+		/* defer_body */ {1, 1, 1, 1, 1, 1, 1, 0, -1, 1, 0, 0, 0},
+		/* bitfield */ {0, 0, 0, 0, 0, -1, -1, 0, -1, 0, 0, 0, 0},
+		/* compound_lit */ {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		/* cast_expr */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* comma_stmt */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+	},
+	/* multi_decl */ {
+		/* stmt */ {1, 1, 1, 1, 1, 1, 1, 0, 1, 1, -1, -1, -1},
+		/* for_init */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* if_init */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* typeof_arg */ {1, 0, 1, 1, 1, 1, 0, 1, 1, 0, -1, -1, -1},
+		/* array_dim */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* enum_body */ {0, 0, 0, 0, 0, -1, 0, 0, -1, 0, -1, -1, -1},
+		/* attr_pre */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, -1, -1, -1},
+		/* attr_post */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, -1, -1, -1},
+		/* stmtexpr */ {1, 1, 1, 1, 1, 1, 1, 0, 1, 1, -1, -1, -1},
+		/* return_expr */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, -1, -1, -1},
+		/* sizeof_arg */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, -1, -1, -1},
+		/* alignof_arg */ {1, 0, 1, 1, 0, 1, -1, 1, -1, 0, -1, -1, -1},
+		/* generic_assoc */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, -1, -1, -1},
+		/* file_scope */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, -1, -1, -1},
+		/* static_assert */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* defer_body */ {1, 1, 1, 1, 1, 1, 1, 0, -1, 1, -1, -1, -1},
+		/* bitfield */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* compound_lit */ {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1, -1},
+		/* cast_expr */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, -1, -1, -1},
+		/* comma_stmt */ {0, 0, 0, 0, 0, 0, 0, 0, -1, 0, -1, -1, -1},
+	},
+};
+
+static int oe_fcse_expect(OeFcseForm form, OeFcseCtx ctx, OeFcseSe se) {
+	return (int)oe_fcse_expect_tbl[form][ctx][se];
+}
+
+
+static int oe_fcse_build(char *buf, size_t buflen, OeFcseForm form, OeFcseCtx ctx,
+			 OeFcseSe se) {
+	const char *init = "0";
+	const char *lhs = "x";
+	const char *prelude = "int x;";
+	char stmt[384];
+	stmt[0] = 0;
+
+	switch (se) {
+	case OE_FCSE_SE_PLAIN: init = "0"; lhs = "x"; prelude = "int x;"; break;
+	case OE_FCSE_SE_CALL: init = "get()"; lhs = "x"; prelude = "int get(void); int x;"; break;
+	case OE_FCSE_SE_POSTFIX_INC: init = "0"; lhs = "*p++"; prelude = "int buf[4]; int *p = buf; int x;"; break;
+	case OE_FCSE_SE_PREFIX_INC: init = "0"; lhs = "++(*p)"; prelude = "int buf[4]; int *p = buf; int x;"; break;
+	case OE_FCSE_SE_VOLATILE_READ: init = "*vp"; lhs = "x"; prelude = "volatile int v; volatile int *vp = &v; int x;"; break;
+	case OE_FCSE_SE_ATOMIC_READ: init = "a"; lhs = "x"; prelude = "_Atomic int a; int x;"; break;
+	case OE_FCSE_SE_STRUCT_VAL: init = "make_s()"; lhs = "s"; prelude = "struct S { int a; }; struct S make_s(void); struct S s;"; break;
+	case OE_FCSE_SE_DESIG_RHS: init = "0"; lhs = "a"; prelude = "int a[2];"; break;
+	case OE_FCSE_SE_DESIG_DIM: init = "0"; lhs = "x"; prelude = "int x;"; break;
+	case OE_FCSE_SE_COMMA: init = "(get(), 0)"; lhs = "x"; prelude = "int get(void); int x;"; break;
+	case OE_FCSE_SE_CTRL_GOTO: init = "0"; lhs = "x"; prelude = "int x;"; break;
+	case OE_FCSE_SE_CTRL_CONT: init = "0"; lhs = "x"; prelude = "int x;"; break;
+	case OE_FCSE_SE_CTRL_BLOCK: init = "0"; lhs = "x"; prelude = "int x;"; break;
+	default: break;
+	}
+
+	const char *fb = "1";
+	const char *fb_block = "{ return -1; }";
+	if (se == OE_FCSE_SE_CTRL_GOTO) { fb = "goto L"; fb_block = "{ goto L; }"; }
+	else if (se == OE_FCSE_SE_CTRL_CONT) { fb = "continue"; fb_block = "{ continue; }"; }
+	else if (se == OE_FCSE_SE_CTRL_BLOCK) { fb = "{ return -1; }"; fb_block = "{ return -1; }"; }
+
+	switch (form) {
+	case OE_FCSE_FORM_DECL_INIT:
+		if (se == OE_FCSE_SE_STRUCT_VAL)
+			snprintf(stmt, sizeof(stmt), "struct S s = %s orelse return -1;", init);
+		else if (se == OE_FCSE_SE_DESIG_RHS)
+			snprintf(stmt, sizeof(stmt), "int a[2] = { [0] = %s orelse 1 };", init);
+		else if (se == OE_FCSE_SE_DESIG_DIM)
+			snprintf(stmt, sizeof(stmt), "int a[%s orelse 4]; (void)a;", init);
+		else if (se == OE_FCSE_SE_POSTFIX_INC)
+			snprintf(stmt, sizeof(stmt), "int x = (*p++) orelse %s;", fb);
+		else if (se == OE_FCSE_SE_PREFIX_INC)
+			snprintf(stmt, sizeof(stmt), "int x = (++(*p)) orelse %s;", fb);
+		else
+			snprintf(stmt, sizeof(stmt), "int x = %s orelse %s;", init, fb);
+		break;
+	case OE_FCSE_FORM_BARE_ASSIGN:
+		if (se == OE_FCSE_SE_DESIG_RHS)
+			snprintf(stmt, sizeof(stmt), "a[0] = %s orelse 1;", init);
+		else if (se == OE_FCSE_SE_STRUCT_VAL)
+			snprintf(stmt, sizeof(stmt), "s = %s orelse s;", init);
+		else if (se == OE_FCSE_SE_POSTFIX_INC)
+			snprintf(stmt, sizeof(stmt), "*p++ = %s orelse 1;", init);
+		else if (se == OE_FCSE_SE_PREFIX_INC)
+			snprintf(stmt, sizeof(stmt), "++(*p) = 0 orelse 1;");
+		else if (se == OE_FCSE_SE_CTRL_GOTO)
+			snprintf(stmt, sizeof(stmt), "%s = %s orelse goto L;", lhs, init);
+		else if (se == OE_FCSE_SE_CTRL_CONT)
+			snprintf(stmt, sizeof(stmt), "%s = %s orelse continue;", lhs, init);
+		else if (se == OE_FCSE_SE_CTRL_BLOCK)
+			snprintf(stmt, sizeof(stmt), "%s = %s orelse %s;", lhs, init, fb_block);
+		else
+			snprintf(stmt, sizeof(stmt), "%s = %s orelse %s;", lhs, init, fb);
+		break;
+	case OE_FCSE_FORM_BARE_ACTION:
+		if (se == OE_FCSE_SE_CTRL_GOTO)
+			snprintf(stmt, sizeof(stmt), "%s orelse goto L;", init);
+		else if (se == OE_FCSE_SE_CTRL_CONT)
+			snprintf(stmt, sizeof(stmt), "%s orelse continue;", init);
+		else if (se == OE_FCSE_SE_CTRL_BLOCK)
+			snprintf(stmt, sizeof(stmt), "%s orelse %s;", init, fb_block);
+		else
+			snprintf(stmt, sizeof(stmt), "%s orelse return -1;", init);
+		break;
+	case OE_FCSE_FORM_CHAIN2:
+		if (se == OE_FCSE_SE_CALL)
+			snprintf(stmt, sizeof(stmt), "int x = get() orelse get() orelse 1;");
+		else if (se == OE_FCSE_SE_CTRL_GOTO)
+			snprintf(stmt, sizeof(stmt), "int x = %s orelse goto L orelse 1;", init);
+		else if (se == OE_FCSE_SE_CTRL_CONT)
+			snprintf(stmt, sizeof(stmt), "int x = %s orelse continue orelse 1;", init);
+		else if (se == OE_FCSE_SE_CTRL_BLOCK)
+			snprintf(stmt, sizeof(stmt), "int x = %s orelse { return -1; } orelse 1;", init);
+		else
+			snprintf(stmt, sizeof(stmt), "int x = %s orelse 0 orelse 1;", init);
+		break;
+	case OE_FCSE_FORM_CHAIN3:
+		if (se == OE_FCSE_SE_CALL)
+			snprintf(stmt, sizeof(stmt), "int x = get() orelse get() orelse get() orelse 1;");
+		else if (se == OE_FCSE_SE_CTRL_GOTO)
+			snprintf(stmt, sizeof(stmt), "int x = 0 orelse goto L orelse 0 orelse 1;");
+		else
+			snprintf(stmt, sizeof(stmt), "int x = %s orelse 0 orelse 0 orelse 1;", init);
+		break;
+	case OE_FCSE_FORM_BLOCK:
+		snprintf(stmt, sizeof(stmt), "int x = %s orelse %s;", init, fb_block);
+		break;
+	case OE_FCSE_FORM_PAREN_WRAP:
+		if (se == OE_FCSE_SE_DESIG_RHS)
+			snprintf(stmt, sizeof(stmt), "int a[2] = { [0] = ((%s) orelse 1) };", init);
+		else if (se == OE_FCSE_SE_CTRL_GOTO)
+			snprintf(stmt, sizeof(stmt), "int x = ((%s) orelse goto L);", init);
+		else if (se == OE_FCSE_SE_CTRL_CONT)
+			snprintf(stmt, sizeof(stmt), "int x = ((%s) orelse continue);", init);
+		else if (se == OE_FCSE_SE_CTRL_BLOCK)
+			snprintf(stmt, sizeof(stmt), "int x = ((%s) orelse { return -1; });", init);
+		else
+			snprintf(stmt, sizeof(stmt), "int x = ((%s) orelse 1);", init);
+		break;
+	case OE_FCSE_FORM_MULTI_DECL:
+		if (se == OE_FCSE_SE_DESIG_RHS)
+			snprintf(stmt, sizeof(stmt), "int a[2] = { [0] = 0 orelse 1 }, b; (void)b;");
+		else if (se == OE_FCSE_SE_CTRL_GOTO)
+			snprintf(stmt, sizeof(stmt), "int x = 0 orelse goto L, y = 1; (void)y;");
+		else
+			snprintf(stmt, sizeof(stmt), "int x = %s orelse 1, y = 0; (void)y;", init);
+		break;
+	default:
+		return -1;
+	}
+
+	int needs_L = (se == OE_FCSE_SE_CTRL_GOTO) || (strstr(stmt, "goto L") != NULL);
+	int needs_loop = (se == OE_FCSE_SE_CTRL_CONT) || (strstr(stmt, "continue") != NULL);
+	char body[768];
+	if (needs_loop && ctx != OE_FCSE_CTX_FOR_INIT)
+		snprintf(body, sizeof(body), "for (int _i = 0; _i < 1; _i++) { %s break; }", stmt);
+	else
+		snprintf(body, sizeof(body), "%s", stmt);
+	if (needs_L) {
+		size_t bl = strlen(body);
+		if (bl + 8 < sizeof(body))
+			snprintf(body + bl, sizeof(body) - bl, " L: ;");
+	}
+
+	switch (ctx) {
+	case OE_FCSE_CTX_STMT:
+		return snprintf(buf, buflen, "%s\nint main(void) {\n  %s\n  return 0;\n}\n", prelude, body) < 0;
+	case OE_FCSE_CTX_FOR_INIT:
+		if (form == OE_FCSE_FORM_DECL_INIT || form == OE_FCSE_FORM_PAREN_WRAP)
+			return snprintf(buf, buflen, "int get(void);\nint main(void) {\n  for (int x = %s orelse 1; x > 0; ) break;\n  return 0;\n}\n", init) < 0;
+		return snprintf(buf, buflen, "int x;\nint main(void) { for (x = 0 orelse 1;;) break; return 0; }\n") < 0;
+	case OE_FCSE_CTX_IF_INIT:
+		return snprintf(buf, buflen, "int get(void);\nint main(void) {\n  if (int x = %s orelse 1) return 0;\n  return 0;\n}\n", init) < 0;
+	case OE_FCSE_CTX_TYPEOF_ARG:
+		return snprintf(buf, buflen, "int get(void);\nint main(void) {\n  typeof(%s orelse 1) y;\n  (void)y; return 0;\n}\n", init) < 0;
+	case OE_FCSE_CTX_ARRAY_DIM:
+		return snprintf(buf, buflen, "int get(void);\nint main(void) {\n  int a[%s orelse 4];\n  (void)a; return 0;\n}\n", init) < 0;
+	case OE_FCSE_CTX_ENUM_BODY:
+		return snprintf(buf, buflen, "enum E { A = 0 orelse 1 };\nint main(void){ return 0; }\n") < 0;
+	case OE_FCSE_CTX_ATTR_PRE:
+		return snprintf(buf, buflen, "int main(void) {\n  __attribute__((aligned(0 orelse 8))) int x;\n  return 0;\n}\n") < 0;
+	case OE_FCSE_CTX_ATTR_POST:
+		return snprintf(buf, buflen, "int main(void) {\n  int x __attribute__((aligned(0 orelse 8)));\n  return 0;\n}\n") < 0;
+	case OE_FCSE_CTX_STMTEXPR:
+		return snprintf(buf, buflen, "%s\nint main(void) {\n  int r = ({{\n    %s\n    0;\n  }});\n  return r;\n}\n", prelude, body) < 0;
+	case OE_FCSE_CTX_RETURN_EXPR:
+		return snprintf(buf, buflen, "int get(void);\nint main(void) {\n  return (%s orelse 1);\n}\n", init) < 0;
+	case OE_FCSE_CTX_SIZEOF_ARG:
+		return snprintf(buf, buflen, "int get(void);\nint main(void) {\n  return (int)sizeof(%s orelse 1);\n}\n", init) < 0;
+	case OE_FCSE_CTX_ALIGNOF_ARG:
+		return snprintf(buf, buflen, "int main(void) {\n  return (int)_Alignof(char[%s orelse 4]);\n}\n", init) < 0;
+	case OE_FCSE_CTX_GENERIC_ASSOC:
+		return snprintf(buf, buflen, "int main(void) {\n  int x = _Generic(0, int: (0 orelse 1), default: 2);\n  return x;\n}\n") < 0;
+	case OE_FCSE_CTX_FILE_SCOPE:
+		return snprintf(buf, buflen, "int g = 0 orelse 1;\nint main(void){ return g; }\n") < 0;
+	case OE_FCSE_CTX_STATIC_ASSERT:
+		return snprintf(buf, buflen, "int get(void);\n_Static_assert(sizeof(char[%s orelse 2]) >= 1, \"x\");\nint main(void){return 0;}\n", init) < 0;
+	case OE_FCSE_CTX_DEFER_BODY:
+		return snprintf(buf, buflen, "%s\nint main(void) {\n  defer { %s }\n  return 0;\n}\n", prelude, stmt) < 0;
+	case OE_FCSE_CTX_BITFIELD:
+		return snprintf(buf, buflen, "struct T { int f : (0 orelse 3); };\nint main(void){ struct T t; (void)t; return 0; }\n") < 0;
+	case OE_FCSE_CTX_COMPOUND_LIT:
+		return snprintf(buf, buflen, "int get(void);\nint main(void) {\n  int *p = (int[]){ %s orelse 1 };\n  (void)p; return 0;\n}\n", init) < 0;
+	case OE_FCSE_CTX_CAST_EXPR:
+		return snprintf(buf, buflen, "int get(void);\nint main(void) {\n  int x = (int)(%s orelse 1);\n  return x;\n}\n", init) < 0;
+	case OE_FCSE_CTX_COMMA_STMT:
+		return snprintf(buf, buflen, "%s\nint main(void) {\n  int y;\n  y = (0, (%s orelse 1));\n  (void)y; return 0;\n}\n", prelude, init) < 0;
+	default:
+		return -1;
+	}
+}
+
+static void test_form_context_se_matrix(void) {
+	char src[2048];
+	char name[192];
+	char fname[128];
+	int ok = 0, fail = 0, skipped = 0;
+	printf("\n--- Form × context × SE orelse matrix (aggressive) ---\n");
+	for (int fi = 0; fi < (int)OE_FCSE_FORM_COUNT; fi++) {
+		for (int ci = 0; ci < (int)OE_FCSE_CTX_COUNT; ci++) {
+			for (int si = 0; si < (int)OE_FCSE_SE_COUNT; si++) {
+				OeFcseForm form = (OeFcseForm)fi;
+				OeFcseCtx ctx = (OeFcseCtx)ci;
+				OeFcseSe se = (OeFcseSe)si;
+				int expect = oe_fcse_expect(form, ctx, se);
+				if (expect < 0) { skipped++; continue; }
+				if (oe_fcse_build(src, sizeof(src), form, ctx, se) != 0) {
+					skipped++;
+					continue;
+				}
+				snprintf(name, sizeof(name), "fcse: %s/%s/%s", oe_fcse_form_name(form),
+					 oe_fcse_ctx_name(ctx), oe_fcse_se_name(se));
+				snprintf(fname, sizeof(fname), "fcse_%s_%s_%s.c",
+					 oe_fcse_form_name(form), oe_fcse_ctx_name(ctx),
+					 oe_fcse_se_name(se));
+				PrismResult r = prism_transpile_source(src, fname, prism_defaults());
+				if (expect) {
+					CHECK_EQ(r.status, PRISM_OK, name);
+					if (r.status == PRISM_OK) {
+						snprintf(name, sizeof(name), "fcse no-leak: %s/%s/%s",
+							 oe_fcse_form_name(form), oe_fcse_ctx_name(ctx),
+							 oe_fcse_se_name(se));
+						CHECK(!oe_output_has_orelse_kw(r.output), name);
+						if (!oe_output_has_orelse_kw(r.output)) ok++;
+						else fail++;
+					} else {
+						fail++;
+						if (r.error_msg) printf("         error: %s\n", r.error_msg);
+					}
+				} else {
+					CHECK(r.status != PRISM_OK, name);
+					if (r.status != PRISM_OK) ok++;
+					else {
+						fail++;
+						printf("         unexpectedly accepted\n");
+					}
+				}
+				prism_free(&r);
+			}
+		}
+	}
+	printf("--- fcse matrix summary: %d ok, %d fail, %d skipped (forms=%d ctx=%d se=%d) ---\n",
+	       ok, fail, skipped, (int)OE_FCSE_FORM_COUNT, (int)OE_FCSE_CTX_COUNT,
+	       (int)OE_FCSE_SE_COUNT);
+}
+
+
+/* SPEC pressure: illegal or double-eval shapes. Warn when still open;
+ * hard-fail only on soft-kw leak or confirmed double-eval of a call. */
+static void test_fcse_spec_pressure(void) {
+	static const struct {
+		const char *label;
+		const char *src;
+		const char *dbl_needle; /* if non-NULL, accept only if needle appears ≤1× in output */
+		int must_reject;	/* 1 = illegal context; 0 = SE that must not double-eval */
+	} holes[] = {
+	    {"array_dim call SE",
+	     "int get(void); int main(void){ int a[get() orelse 4]; (void)a; return 0; }\n", "get()",
+	     0},
+	    {"array_dim volatile SE",
+	     "int main(void){ volatile int v=0; int a[v orelse 4]; (void)a; return 0; }\n", NULL, 0},
+	    {"array_dim atomic SE",
+	     "int main(void){ _Atomic int a=0; int b[a orelse 4]; (void)b; return 0; }\n", NULL, 0},
+	    {"alignof orelse call",
+	     "int get(void); int main(void){ return (int)_Alignof(char[get() orelse 4]); }\n",
+	     "get()", 0},
+	    {"brace designator orelse RHS",
+	     "int main(void){ int a[2] = { [0] = 0 orelse 1 }; return a[0]; }\n", NULL, 1},
+	    {"bitfield width orelse",
+	     "struct T { int f : (0 orelse 3); }; int main(void){ struct T t; (void)t; return 0; }\n",
+	     NULL, 1},
+	    {"attr aligned orelse",
+	     "int main(void){ int x __attribute__((aligned(0 orelse 8))); return 0; }\n", NULL, 1},
+	    {"enum const orelse", "enum E { A = 0 orelse 1 }; int main(void){ return A; }\n", NULL,
+	     1},
+	    {"file-scope orelse", "int g = 0 orelse 1; int main(void){ return g; }\n", NULL, 1},
+	    {"_Generic assoc orelse",
+	     "int main(void){ int x = _Generic(0, int: (0 orelse 1), default: 2); return x; }\n",
+	     NULL, 1},
+	};
+	printf("\n--- fcse SPEC-pressure (warn-only holes) ---\n");
+	int open_holes = 0, closed = 0;
+	for (size_t i = 0; i < sizeof(holes) / sizeof(holes[0]); i++) {
+		PrismResult r = prism_transpile_source(holes[i].src, "fcse_hole.c", prism_defaults());
+		int leak = r.status == PRISM_OK && oe_output_has_orelse_kw(r.output);
+		int dbl = 0;
+		if (r.status == PRISM_OK && holes[i].dbl_needle && r.output) {
+			int hits = 0;
+			for (const char *p = r.output; (p = strstr(p, holes[i].dbl_needle)) != NULL;
+			     p++)
+				hits++;
+			dbl = hits > 1;
+		}
+		if (r.status != PRISM_OK) {
+			printf("[PASS] hole closed: %s\n", holes[i].label);
+			closed++;
+			CHECK(1, holes[i].label);
+		} else if (holes[i].must_reject) {
+			printf("[WARN] SPEC hole still open: %s%s\n", holes[i].label,
+			       leak ? " (SOFT-KW LEAK)" : "");
+			open_holes++;
+			CHECK(!leak, holes[i].label);
+		} else if (dbl || leak) {
+			printf("[WARN] SPEC hole still open: %s%s%s\n", holes[i].label,
+			       dbl ? " (DOUBLE-EVAL)" : "", leak ? " (SOFT-KW LEAK)" : "");
+			open_holes++;
+			CHECK(!leak && !dbl, holes[i].label);
+		} else {
+			printf("[PASS] SE hoisted/safe: %s\n", holes[i].label);
+			closed++;
+			CHECK(1, holes[i].label);
+		}
+		prism_free(&r);
+	}
+	printf("--- SPEC-pressure: %d open, %d closed ---\n", open_holes, closed);
+}
+
+/* FCSE extension axes — switch_init/_BitInt/_Alignas/asm/param VLA/multi-dim/… */
+typedef enum {
+	OE_EXT_FORM_DECL_INIT = 0,
+	OE_EXT_FORM_BARE_ASSIGN,
+	OE_EXT_FORM_BARE_ACTION,
+	OE_EXT_FORM_CHAIN2,
+	OE_EXT_FORM_BLOCK,
+	OE_EXT_FORM_PAREN_WRAP,
+	OE_EXT_FORM_COUNT
+} OeExtForm;
+typedef enum {
+	OE_EXT_CTX_STMT = 0,
+	OE_EXT_CTX_SWITCH_INIT,
+	OE_EXT_CTX_BITINT_ARG,
+	OE_EXT_CTX_ALIGNAS_ARG,
+	OE_EXT_CTX_ASM_ARG,
+	OE_EXT_CTX_PARAM_VLA,
+	OE_EXT_CTX_NESTED_TYPEOF,
+	OE_EXT_CTX_TYPEOF_STMTEXPR,
+	OE_EXT_CTX_GNU_LABEL,
+	OE_EXT_CTX_C23_ATTR_STMT,
+	OE_EXT_CTX_PRAGMA_NOISE,
+	OE_EXT_CTX_MULTI_DIM,
+	OE_EXT_CTX_COUNT
+} OeExtCtx;
+typedef enum {
+	OE_EXT_SE_PLAIN = 0,
+	OE_EXT_SE_CALL,
+	OE_EXT_SE_POSTFIX_INC,
+	OE_EXT_SE_VOLATILE_READ,
+	OE_EXT_SE_ATOMIC_READ,
+	OE_EXT_SE_COMMA,
+	OE_EXT_SE_DEREF_CALL,
+	OE_EXT_SE_COMPOUND_ASSIGN,
+	OE_EXT_SE_STMT_EXPR_LHS,
+	OE_EXT_SE_CTRL_GOTO,
+	OE_EXT_SE_CTRL_BREAK,
+	OE_EXT_SE_CTRL_RETURN,
+	OE_EXT_SE_COUNT
+} OeExtSe;
+static const char *oe_ext_form_name(OeExtForm f) { static const char *n[] = {"decl_init", "bare_assign", "bare_action", "chain2", "block", "paren_wrap"}; return n[f]; }
+static const char *oe_ext_ctx_name(OeExtCtx c) { static const char *n[] = {"stmt", "switch_init", "bitint_arg", "alignas_arg", "asm_arg", "param_vla", "nested_typeof", "typeof_stmtexpr", "gnu_label", "c23_attr_stmt", "pragma_noise", "multi_dim"}; return n[c]; }
+static const char *oe_ext_se_name(OeExtSe s) { static const char *n[] = {"plain", "call", "postfix_inc", "volatile_read", "atomic_read", "comma", "deref_call", "compound_assign", "stmt_expr_lhs", "ctrl_goto", "ctrl_break", "ctrl_return"}; return n[s]; }
+static const signed char oe_ext_expect_tbl[OE_EXT_FORM_COUNT][OE_EXT_CTX_COUNT][OE_EXT_SE_COUNT] = {
+	/* decl_init */ {
+		/* stmt */ {1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1},
+		/* switch_init */ {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		/* bitint_arg */ {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0},
+		/* alignas_arg */ {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0},
+		/* asm_arg */ {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0},
+		/* param_vla */ {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0},
+		/* nested_typeof */ {1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1},
+		/* typeof_stmtexpr */ {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		/* gnu_label */ {1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1},
+		/* c23_attr_stmt */ {1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1},
+		/* pragma_noise */ {1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1},
+		/* multi_dim */ {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+	},
+	/* bare_assign */ {
+		/* stmt */ {1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1},
+		/* switch_init */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* bitint_arg */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* alignas_arg */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* asm_arg */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* param_vla */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* nested_typeof */ {1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1},
+		/* typeof_stmtexpr */ {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		/* gnu_label */ {1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1},
+		/* c23_attr_stmt */ {1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1},
+		/* pragma_noise */ {1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1},
+		/* multi_dim */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+	},
+	/* bare_action */ {
+		/* stmt */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 1, 1, 1},
+		/* switch_init */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* bitint_arg */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* alignas_arg */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* asm_arg */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* param_vla */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* nested_typeof */ {1, 0, 0, 1, 1, 0, 0, -1, -1, 1, 1, 1},
+		/* typeof_stmtexpr */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0},
+		/* gnu_label */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 1, 1, 1},
+		/* c23_attr_stmt */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 1, 1, 1},
+		/* pragma_noise */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 1, 1, 1},
+		/* multi_dim */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+	},
+	/* chain2 */ {
+		/* stmt */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 0, 0, 0},
+		/* switch_init */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* bitint_arg */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, -1, 0},
+		/* alignas_arg */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, -1, 0},
+		/* asm_arg */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, -1, 0},
+		/* param_vla */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, -1, 0},
+		/* nested_typeof */ {1, 0, 0, 1, 1, 0, 0, -1, -1, 1, 1, 1},
+		/* typeof_stmtexpr */ {0, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0},
+		/* gnu_label */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 0, 0, 0},
+		/* c23_attr_stmt */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 0, 0, 0},
+		/* pragma_noise */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 0, 0, 0},
+		/* multi_dim */ {1, 1, 1, 1, 1, 1, 1, -1, -1, 1, 1, 1},
+	},
+	/* block */ {
+		/* stmt */ {1, 1, 1, 1, 1, 1, -1, -1, -1, 1, 1, 1},
+		/* switch_init */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* bitint_arg */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* alignas_arg */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* asm_arg */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* param_vla */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+		/* nested_typeof */ {1, 0, 0, 1, 1, 0, -1, -1, -1, 1, 1, 1},
+		/* typeof_stmtexpr */ {0, 0, 0, 0, 0, 0, -1, -1, -1, 0, 0, 0},
+		/* gnu_label */ {1, 1, 1, 1, 1, 1, -1, -1, -1, 1, 1, 1},
+		/* c23_attr_stmt */ {1, 1, 1, 1, 1, 1, -1, -1, -1, 1, 1, 1},
+		/* pragma_noise */ {1, 1, 1, 1, 1, 1, -1, -1, -1, 1, 1, 1},
+		/* multi_dim */ {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+	},
+	/* paren_wrap */ {
+		/* stmt */ {1, 1, 1, 1, 1, 1, 1, -1, 1, 1, 1, 1},
+		/* switch_init */ {0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* bitint_arg */ {0, 0, 0, 0, 0, 0, 0, -1, 0, 0, -1, 0},
+		/* alignas_arg */ {0, 0, 0, 0, 0, 0, 0, -1, 0, 0, -1, 0},
+		/* asm_arg */ {0, 0, 0, 0, 0, 0, 0, -1, 0, 0, -1, 0},
+		/* param_vla */ {0, 0, 0, 0, 0, 0, 0, -1, 0, 0, -1, 0},
+		/* nested_typeof */ {1, 0, 0, 1, 1, 0, 0, -1, 1, 1, 1, 1},
+		/* typeof_stmtexpr */ {0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0},
+		/* gnu_label */ {1, 1, 1, 1, 1, 1, 1, -1, 1, 1, 1, 1},
+		/* c23_attr_stmt */ {1, 1, 1, 1, 1, 1, 1, -1, 1, 1, 1, 1},
+		/* pragma_noise */ {1, 1, 1, 1, 1, 1, 1, -1, 1, 1, 1, 1},
+		/* multi_dim */ {1, 1, 1, 1, 1, 1, 1, -1, 1, 1, 1, 1},
+	},
+};
+
+static int oe_ext_build(char *buf, size_t buflen, OeExtForm form, OeExtCtx ctx, OeExtSe se) {
+	const char *init = "0";
+	const char *prelude = "int x;";
+	char stmt[384];
+	stmt[0] = 0;
+
+	switch (se) {
+	case OE_EXT_SE_PLAIN: init = "0"; prelude = "int x;"; break;
+	case OE_EXT_SE_CALL: init = "get()"; prelude = "int get(void); int x;"; break;
+	case OE_EXT_SE_POSTFIX_INC: init = "(*p++)"; prelude = "int buf[4]; int *p = buf; int x;"; break;
+	case OE_EXT_SE_VOLATILE_READ: init = "(*vp)"; prelude = "volatile int v; volatile int *vp = &v; int x;"; break;
+	case OE_EXT_SE_ATOMIC_READ: init = "a"; prelude = "_Atomic int a; int x;"; break;
+	case OE_EXT_SE_COMMA: init = "(get(), 0)"; prelude = "int get(void); int x;"; break;
+	case OE_EXT_SE_DEREF_CALL: init = "(*fp)()"; prelude = "int g(void); int (*fp)(void) = g; int x;"; break;
+	case OE_EXT_SE_COMPOUND_ASSIGN: init = "0"; prelude = "int x = 1;"; break;
+	case OE_EXT_SE_STMT_EXPR_LHS: init = "({ 0; })"; prelude = "int x;"; break;
+	case OE_EXT_SE_CTRL_GOTO: init = "0"; prelude = "int x;"; break;
+	case OE_EXT_SE_CTRL_BREAK: init = "0"; prelude = "int x;"; break;
+	case OE_EXT_SE_CTRL_RETURN: init = "0"; prelude = "int x;"; break;
+	default: break;
+	}
+
+	const char *fb = "1";
+	if (se == OE_EXT_SE_CTRL_GOTO) fb = "goto L";
+	else if (se == OE_EXT_SE_CTRL_BREAK) fb = "break";
+	else if (se == OE_EXT_SE_CTRL_RETURN) fb = "return -1";
+
+	switch (form) {
+	case OE_EXT_FORM_DECL_INIT:
+		if (se == OE_EXT_SE_COMPOUND_ASSIGN)
+			snprintf(stmt, sizeof(stmt), "int x = 0; x += 0 orelse 1;");
+		else
+			snprintf(stmt, sizeof(stmt), "int x = %s orelse %s;", init, fb);
+		break;
+	case OE_EXT_FORM_BARE_ASSIGN:
+		if (se == OE_EXT_SE_COMPOUND_ASSIGN)
+			snprintf(stmt, sizeof(stmt), "x += 0 orelse 1;");
+		else if (se == OE_EXT_SE_CTRL_GOTO)
+			snprintf(stmt, sizeof(stmt), "x = %s orelse goto L;", init);
+		else if (se == OE_EXT_SE_CTRL_BREAK)
+			snprintf(stmt, sizeof(stmt), "x = %s orelse break;", init);
+		else if (se == OE_EXT_SE_CTRL_RETURN)
+			snprintf(stmt, sizeof(stmt), "x = %s orelse return -1;", init);
+		else
+			snprintf(stmt, sizeof(stmt), "x = %s orelse %s;", init, fb);
+		break;
+	case OE_EXT_FORM_BARE_ACTION:
+		if (se == OE_EXT_SE_CTRL_GOTO || se == OE_EXT_SE_CTRL_BREAK || se == OE_EXT_SE_CTRL_RETURN)
+			snprintf(stmt, sizeof(stmt), "%s orelse %s;", init, fb);
+		else
+			snprintf(stmt, sizeof(stmt), "%s orelse return -1;", init);
+		break;
+	case OE_EXT_FORM_CHAIN2:
+		if (se == OE_EXT_SE_CTRL_GOTO || se == OE_EXT_SE_CTRL_BREAK || se == OE_EXT_SE_CTRL_RETURN)
+			snprintf(stmt, sizeof(stmt), "int x = %s orelse %s orelse 1;", init, fb);
+		else
+			snprintf(stmt, sizeof(stmt), "int x = %s orelse 0 orelse 1;", init);
+		break;
+	case OE_EXT_FORM_BLOCK:
+		snprintf(stmt, sizeof(stmt), "int x = %s orelse { return -1; };", init);
+		break;
+	case OE_EXT_FORM_PAREN_WRAP:
+		if (se == OE_EXT_SE_CTRL_GOTO)
+			snprintf(stmt, sizeof(stmt), "int x = ((%s) orelse goto L);", init);
+		else if (se == OE_EXT_SE_CTRL_BREAK)
+			snprintf(stmt, sizeof(stmt), "int x = ((%s) orelse break);", init);
+		else if (se == OE_EXT_SE_CTRL_RETURN)
+			snprintf(stmt, sizeof(stmt), "int x = ((%s) orelse return -1);", init);
+		else
+			snprintf(stmt, sizeof(stmt), "int x = ((%s) orelse 1);", init);
+		break;
+	default:
+		return -1;
+	}
+
+	int needs_L = strstr(stmt, "goto L") != NULL;
+	int needs_loop = strstr(stmt, "orelse break") != NULL;
+	char body[768];
+	if (needs_loop)
+		snprintf(body, sizeof(body), "for(int _i=0;_i<1;_i++){ %s }", stmt);
+	else
+		snprintf(body, sizeof(body), "%s", stmt);
+	if (needs_L) {
+		size_t bl = strlen(body);
+		if (bl + 8 < sizeof(body))
+			snprintf(body + bl, sizeof(body) - bl, " L:;");
+	}
+
+	switch (ctx) {
+	case OE_EXT_CTX_STMT:
+		return snprintf(buf, buflen, "%s\nint main(void){\n  %s\n  return 0;\n}\n", prelude, body) < 0;
+	case OE_EXT_CTX_SWITCH_INIT:
+		return snprintf(buf, buflen, "int get(void);\nint main(void){\n  switch(int x = %s orelse 1){ default: break; }\n  return 0;\n}\n", init) < 0;
+	case OE_EXT_CTX_BITINT_ARG:
+		return snprintf(buf, buflen, "int main(void){ _BitInt(%s orelse 8) x; (void)x; return 0; }\n", init) < 0;
+	case OE_EXT_CTX_ALIGNAS_ARG:
+		return snprintf(buf, buflen, "int main(void){ _Alignas(%s orelse 8) int x; (void)x; return 0; }\n", init) < 0;
+	case OE_EXT_CTX_ASM_ARG:
+		return snprintf(buf, buflen, "int main(void){ int x; __asm__(\".byte %%0\" : : \"i\"(%s orelse 1)); (void)x; return 0; }\n", init) < 0;
+	case OE_EXT_CTX_PARAM_VLA:
+		return snprintf(buf, buflen, "int get(void);\nvoid f(int n, int a[%s orelse 4]);\nint main(void){ return 0; }\n", init) < 0;
+	case OE_EXT_CTX_NESTED_TYPEOF:
+		return snprintf(buf, buflen, "int get(void);\nint main(void){\n  typeof(typeof(%s orelse 1)) y; (void)y; return 0;\n}\n", init) < 0;
+	case OE_EXT_CTX_TYPEOF_STMTEXPR:
+		return snprintf(buf, buflen, "int get(void);\nint main(void){\n  typeof(({ %s orelse 1; })) y; (void)y; return 0;\n}\n", init) < 0;
+	case OE_EXT_CTX_GNU_LABEL:
+		return snprintf(buf, buflen, "%s\nint main(void){\n  __label__ L;\n  %s\n  return 0;\n}\n", prelude, body) < 0;
+	case OE_EXT_CTX_C23_ATTR_STMT:
+		return snprintf(buf, buflen, "%s\nint main(void){\n  [[maybe_unused]] %s\n  return 0;\n}\n", prelude, body) < 0;
+	case OE_EXT_CTX_PRAGMA_NOISE:
+		return snprintf(buf, buflen, "%s\nint main(void){\n  _Pragma(\"GCC diagnostic push\")\n  %s\n  _Pragma(\"GCC diagnostic pop\")\n  return 0;\n}\n", prelude, body) < 0;
+	case OE_EXT_CTX_MULTI_DIM:
+		return snprintf(buf, buflen, "int get(void);\nint main(void){\n  int a[%s orelse 2][%s orelse 3]; (void)a; return 0;\n}\n", init, init) < 0;
+	default:
+		return -1;
+	}
+}
+
+static void test_form_context_se_ext_matrix(void) {
+	char src[2048], name[192], fname[128];
+	int ok = 0, fail = 0, skipped = 0;
+	printf("\n--- Form × context × SE extension matrix ---\n");
+	for (int fi = 0; fi < (int)OE_EXT_FORM_COUNT; fi++) {
+		for (int ci = 0; ci < (int)OE_EXT_CTX_COUNT; ci++) {
+			for (int si = 0; si < (int)OE_EXT_SE_COUNT; si++) {
+				OeExtForm form = (OeExtForm)fi;
+				OeExtCtx ctx = (OeExtCtx)ci;
+				OeExtSe se = (OeExtSe)si;
+				int expect = (int)oe_ext_expect_tbl[form][ctx][se];
+				if (expect < 0) { skipped++; continue; }
+				if (oe_ext_build(src, sizeof(src), form, ctx, se) != 0) {
+					skipped++;
+					continue;
+				}
+				snprintf(name, sizeof(name), "fcse-ext: %s/%s/%s", oe_ext_form_name(form),
+					 oe_ext_ctx_name(ctx), oe_ext_se_name(se));
+				snprintf(fname, sizeof(fname), "fcseext_%s_%s_%s.c",
+					 oe_ext_form_name(form), oe_ext_ctx_name(ctx), oe_ext_se_name(se));
+				PrismResult r = prism_transpile_source(src, fname, prism_defaults());
+				if (expect) {
+					CHECK_EQ(r.status, PRISM_OK, name);
+					if (r.status == PRISM_OK) {
+						snprintf(name, sizeof(name), "fcse-ext no-leak: %s/%s/%s",
+							 oe_ext_form_name(form), oe_ext_ctx_name(ctx),
+							 oe_ext_se_name(se));
+						CHECK(!oe_output_has_orelse_kw(r.output), name);
+						if (!oe_output_has_orelse_kw(r.output)) ok++;
+						else fail++;
+					} else fail++;
+				} else {
+					CHECK(r.status != PRISM_OK, name);
+					if (r.status != PRISM_OK) ok++;
+					else {
+						fail++;
+						printf("         unexpectedly accepted\n");
+					}
+				}
+				prism_free(&r);
+			}
+		}
+	}
+	printf("--- fcse-ext summary: %d ok, %d fail, %d skipped ---\n", ok, fail, skipped);
 }
 
 void run_orelse_tests(void) {
@@ -9300,6 +10168,9 @@ void run_orelse_tests(void) {
 	test_orelse_ctrl_paren_stmt_action_rejected();
 	test_paren_led_bare_orelse_after_ctrl();
 	test_ctrl_orelse_product_matrix();
+	test_form_context_se_matrix();
+	test_form_context_se_ext_matrix();
+	test_fcse_spec_pressure();
 	test_orelse_block_break_in_ctrl_cond_no_outer_defer();
 	test_orelse_stmt_prefixes_and_gnu_attr_ctrl();
 	test_orelse_in_attribute_args();

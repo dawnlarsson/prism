@@ -7098,7 +7098,7 @@ static void test_defer_calling_conv_ret_type(void) {
 }
 
 /* #7 Defer exit × scope depth — semantic CHECK_LOG product (not snapshots).
- * Nested scopes use letters A (outer) … C (inner); body marker is "1";
+ * Nested scopes use letters A (outer) … D (inner); body marker is "1";
  * post-exit marker is "2" when control resumes outside. LIFO on exit. */
 typedef enum {
 	DX_END = 0,
@@ -7107,12 +7107,18 @@ typedef enum {
 	DX_BREAK,
 	DX_CONTINUE,
 	DX_SWBREAK,
+	DX_WHILE_BRK,
+	DX_DO_BRK,
+	DX_SWLOOP_CONT,
+	DX_ORELSE_RET,
+	DX_ORELSE_BRK,
 	DX_N
 } DxExit;
 
 static const char *dx_exit_tag(DxExit e) {
-	static const char *tags[] = {"end", "return", "goto", "break", "continue",
-				     "swbreak"};
+	static const char *tags[] = {"end",	  "return",    "goto",	   "break",
+				     "continue",  "swbreak",   "while_brk", "do_brk",
+				     "swloop_cont", "oe_ret",  "oe_brk"};
 	return tags[e];
 }
 
@@ -7140,6 +7146,43 @@ static int dx_ret_d3(void) {
 		}
 	}
 }
+static int dx_ret_d4(void) {
+	defer log_append("A");
+	{
+		defer log_append("B");
+		{
+			defer log_append("C");
+			{
+				defer log_append("D");
+				log_append("1");
+				return 1;
+			}
+		}
+	}
+}
+
+static int dx_oe_ret_d1(void) {
+	/* Force zero via volatile so the compiler cannot fold orelse away. */
+	volatile int z = 0;
+	defer log_append("A");
+	log_append("1");
+	int x = z orelse return 0;
+	(void)x;
+	log_append("X");
+	return 1;
+}
+static int dx_oe_ret_d2(void) {
+	volatile int z = 0;
+	defer log_append("A");
+	{
+		defer log_append("B");
+		log_append("1");
+		int x = z orelse return 0;
+		(void)x;
+		log_append("X");
+	}
+	return 1;
+}
 
 static void dx_run_depth(int depth, DxExit ex) {
 	switch (ex) {
@@ -7153,13 +7196,25 @@ static void dx_run_depth(int depth, DxExit ex) {
 				defer log_append("B");
 				log_append("1");
 			}
-		} else {
+		} else if (depth == 3) {
 			defer log_append("A");
 			{
 				defer log_append("B");
 				{
 					defer log_append("C");
 					log_append("1");
+				}
+			}
+		} else {
+			defer log_append("A");
+			{
+				defer log_append("B");
+				{
+					defer log_append("C");
+					{
+						defer log_append("D");
+						log_append("1");
+					}
 				}
 			}
 		}
@@ -7169,8 +7224,10 @@ static void dx_run_depth(int depth, DxExit ex) {
 			(void)dx_ret_d1();
 		else if (depth == 2)
 			(void)dx_ret_d2();
-		else
+		else if (depth == 3)
 			(void)dx_ret_d3();
+		else
+			(void)dx_ret_d4();
 		break;
 	case DX_GOTO:
 		if (depth == 1) {
@@ -7192,7 +7249,7 @@ static void dx_run_depth(int depth, DxExit ex) {
 			}
 		dx_g2:
 			log_append("2");
-		} else {
+		} else if (depth == 3) {
 			{
 				defer log_append("A");
 				{
@@ -7205,6 +7262,23 @@ static void dx_run_depth(int depth, DxExit ex) {
 				}
 			}
 		dx_g3:
+			log_append("2");
+		} else {
+			{
+				defer log_append("A");
+				{
+					defer log_append("B");
+					{
+						defer log_append("C");
+						{
+							defer log_append("D");
+							log_append("1");
+							goto dx_g4;
+						}
+					}
+				}
+			}
+		dx_g4:
 			log_append("2");
 		}
 		break;
@@ -7226,7 +7300,7 @@ static void dx_run_depth(int depth, DxExit ex) {
 				}
 				log_append("2");
 			}
-		} else {
+		} else if (depth == 3) {
 			{
 				defer log_append("A");
 				{
@@ -7239,10 +7313,25 @@ static void dx_run_depth(int depth, DxExit ex) {
 					log_append("2");
 				}
 			}
+		} else {
+			{
+				defer log_append("A");
+				{
+					defer log_append("B");
+					{
+						defer log_append("C");
+						for (;;) {
+							defer log_append("D");
+							log_append("1");
+							break;
+						}
+						log_append("2");
+					}
+				}
+			}
 		}
 		break;
 	case DX_CONTINUE:
-		/* Two iterations: first continues (fires defer), second runs body X. */
 		if (depth == 1) {
 			for (int i = 0; i < 2; i++) {
 				defer log_append("A");
@@ -7264,7 +7353,7 @@ static void dx_run_depth(int depth, DxExit ex) {
 				}
 				log_append("2");
 			}
-		} else {
+		} else if (depth == 3) {
 			{
 				defer log_append("A");
 				{
@@ -7277,6 +7366,24 @@ static void dx_run_depth(int depth, DxExit ex) {
 						log_append("X");
 					}
 					log_append("2");
+				}
+			}
+		} else {
+			{
+				defer log_append("A");
+				{
+					defer log_append("B");
+					{
+						defer log_append("C");
+						for (int i = 0; i < 2; i++) {
+							defer log_append("D");
+							log_append("1");
+							if (i == 0)
+								continue;
+							log_append("X");
+						}
+						log_append("2");
+					}
 				}
 			}
 		}
@@ -7303,7 +7410,7 @@ static void dx_run_depth(int depth, DxExit ex) {
 				}
 				log_append("2");
 			}
-		} else {
+		} else if (depth == 3) {
 			{
 				defer log_append("A");
 				{
@@ -7318,8 +7425,131 @@ static void dx_run_depth(int depth, DxExit ex) {
 					log_append("2");
 				}
 			}
+		} else {
+			{
+				defer log_append("A");
+				{
+					defer log_append("B");
+					{
+						defer log_append("C");
+						switch (1) {
+						default: {
+							defer log_append("D");
+							log_append("1");
+							break;
+						}
+						}
+						log_append("2");
+					}
+				}
+			}
 		}
 		break;
+	case DX_WHILE_BRK:
+		if (depth == 1) {
+			int once = 1;
+			while (once--) {
+				defer log_append("A");
+				log_append("1");
+				break;
+			}
+			log_append("2");
+		} else {
+			{
+				defer log_append("A");
+				int once = 1;
+				while (once--) {
+					defer log_append("B");
+					log_append("1");
+					break;
+				}
+				log_append("2");
+			}
+		}
+		break;
+	case DX_DO_BRK:
+		if (depth == 1) {
+			do {
+				defer log_append("A");
+				log_append("1");
+				break;
+			} while (0);
+			log_append("2");
+		} else {
+			{
+				defer log_append("A");
+				do {
+					defer log_append("B");
+					log_append("1");
+					break;
+				} while (0);
+				log_append("2");
+			}
+		}
+		break;
+	case DX_SWLOOP_CONT:
+		/* switch inside for; continue fires switch-block then loop defer. */
+		if (depth == 1) {
+			for (int i = 0; i < 1; i++) {
+				defer log_append("A");
+				switch (1) {
+				case 1: {
+					defer log_append("B");
+					log_append("1");
+					continue;
+				}
+				}
+			}
+			log_append("2");
+		} else {
+			{
+				defer log_append("A");
+				for (int i = 0; i < 1; i++) {
+					defer log_append("B");
+					switch (1) {
+					case 1: {
+						defer log_append("C");
+						log_append("1");
+						continue;
+					}
+					}
+				}
+				log_append("2");
+			}
+		}
+		break;
+	case DX_ORELSE_RET:
+		if (depth == 1)
+			(void)dx_oe_ret_d1();
+		else
+			(void)dx_oe_ret_d2();
+		break;
+	case DX_ORELSE_BRK: {
+		volatile int z = 0;
+		if (depth == 1) {
+			for (;;) {
+				defer log_append("A");
+				log_append("1");
+				int x = z orelse break;
+				(void)x;
+				log_append("X");
+			}
+			log_append("2");
+		} else {
+			{
+				defer log_append("A");
+				for (;;) {
+					defer log_append("B");
+					log_append("1");
+					int x = z orelse break;
+					(void)x;
+					log_append("X");
+				}
+				log_append("2");
+			}
+		}
+		break;
+	}
 	case DX_N:
 		break;
 	}
@@ -7327,20 +7557,26 @@ static void dx_run_depth(int depth, DxExit ex) {
 
 static void test_defer_exit_scope_depth_matrix(void) {
 	printf("\n--- defer exit × scope depth matrix ---\n");
-	/* expected[depth-1][exit]: end, return, goto, break, continue, swbreak
-	 * break/continue/swbreak: loop/switch exits fire inner defer(s), then
-	 * marker "2", then remaining outer defer(s). */
-	static const char *expect[3][DX_N] = {
-	    {"1A", "1A", "1A2", "1A2", "1A1XA2", "1A2"},
-	    {"1BA", "1BA", "1BA2", "1B2A", "1B1XB2A", "1B2A"},
-	    {"1CBA", "1CBA", "1CBA2", "1C2BA", "1C1XC2BA", "1C2BA"},
+	/* Rows = depth 1..4 for classic exits; extended exits use depth 1..2 only
+	 * (NULL = skip). */
+	static const char *expect[4][DX_N] = {
+	    /* end, return, goto, break, continue, swbreak, while, do, swloop, oe_ret, oe_brk */
+	    {"1A", "1A", "1A2", "1A2", "1A1XA2", "1A2", "1A2", "1A2", "1BA2", "1A", "1A2"},
+	    {"1BA", "1BA", "1BA2", "1B2A", "1B1XB2A", "1B2A", "1B2A", "1B2A", "1CB2A", "1BA", "1B2A"},
+	    {"1CBA", "1CBA", "1CBA2", "1C2BA", "1C1XC2BA", "1C2BA", NULL, NULL, NULL, NULL, NULL},
+	    {"1DCBA", "1DCBA", "1DCBA2", "1D2CBA", "1D1XD2CBA", "1D2CBA", NULL, NULL, NULL, NULL,
+	     NULL},
 	};
 
-	int ok = 0, fail = 0;
-	for (int d = 1; d <= 3; d++) {
+	int ok = 0, fail = 0, skipped = 0;
+	for (int d = 1; d <= 4; d++) {
 		for (DxExit ex = DX_END; ex < DX_N; ex++) {
 			const char *want = expect[d - 1][ex];
-			char name[80];
+			if (!want) {
+				skipped++;
+				continue;
+			}
+			char name[96];
 			snprintf(name, sizeof(name), "defer exit×depth d=%d %s", d,
 				 dx_exit_tag(ex));
 			log_reset();
@@ -7353,8 +7589,382 @@ static void test_defer_exit_scope_depth_matrix(void) {
 				fail++;
 		}
 	}
-	printf("--- defer exit×depth summary: %d ok, %d fail (3×%d) ---\n", ok, fail,
-	       (int)DX_N);
+	printf("--- defer exit×depth summary: %d ok, %d fail, %d skipped (4×%d) ---\n", ok, fail,
+	       skipped, (int)DX_N);
+}
+
+/* Labeled break/continue × nest depth — transpile + label preserve (runtime needs
+ * C2y host; Apple clang lacks labeled break). */
+static void test_defer_labeled_exit_depth_matrix(void) {
+	printf("\n--- defer labeled exit × depth matrix ---\n");
+	static const struct {
+		int depth;
+		const char *exit_kw; /* "break" or "continue" */
+		const char *src;
+	} cells[] = {
+	    {2, "break",
+	     "static char L[32]; static int n; static void A(char c){L[n++]=c;}\n"
+	     "int main(void){\n"
+	     "  outer: for(int i=0;i<1;i++){\n"
+	     "    defer A('A');\n"
+	     "    for(int j=0;j<1;j++){\n"
+	     "      defer A('B');\n"
+	     "      A('1'); break outer; A('X');\n"
+	     "    } A('Y');\n"
+	     "  } A('E');\n"
+	     "  return (L[0]=='1'&&L[1]=='B'&&L[2]=='A'&&L[3]=='E')?0:1;\n"
+	     "}\n"},
+	    {3, "break",
+	     "static char L[32]; static int n; static void A(char c){L[n++]=c;}\n"
+	     "int main(void){\n"
+	     "  outer: for(int i=0;i<1;i++){\n"
+	     "    defer A('A');\n"
+	     "    for(int j=0;j<1;j++){\n"
+	     "      defer A('B');\n"
+	     "      { defer A('C'); A('1'); break outer; A('X'); }\n"
+	     "      A('Y');\n"
+	     "    } A('Z');\n"
+	     "  } A('E');\n"
+	     "  return (L[0]=='1'&&L[1]=='C'&&L[2]=='B'&&L[3]=='A'&&L[4]=='E')?0:1;\n"
+	     "}\n"},
+	    {2, "continue",
+	     "static char L[32]; static int n; static void A(char c){L[n++]=c;}\n"
+	     "int main(void){\n"
+	     "  outer: for(int i=0;i<1;i++){\n"
+	     "    defer A('A');\n"
+	     "    for(int j=0;j<1;j++){\n"
+	     "      defer A('B');\n"
+	     "      A('1'); continue outer; A('X');\n"
+	     "    } A('Y');\n"
+	     "  } A('E');\n"
+	     "  return (L[0]=='1'&&L[1]=='B'&&L[2]=='A'&&L[3]=='E')?0:1;\n"
+	     "}\n"},
+	    {3, "continue",
+	     "static char L[32]; static int n; static void A(char c){L[n++]=c;}\n"
+	     "int main(void){\n"
+	     "  outer: for(int i=0;i<1;i++){\n"
+	     "    defer A('A');\n"
+	     "    for(int j=0;j<1;j++){\n"
+	     "      defer A('B');\n"
+	     "      { defer A('C'); A('1'); continue outer; A('X'); }\n"
+	     "    }\n"
+	     "  } A('E');\n"
+	     "  return (L[0]=='1'&&L[1]=='C'&&L[2]=='B'&&L[3]=='A'&&L[4]=='E')?0:1;\n"
+	     "}\n"},
+	    {4, "break",
+	     "static char L[32]; static int n; static void A(char c){L[n++]=c;}\n"
+	     "int main(void){\n"
+	     "  outer: for(int i=0;i<1;i++){\n"
+	     "    defer A('A');\n"
+	     "    for(int j=0;j<1;j++){\n"
+	     "      defer A('B');\n"
+	     "      { defer A('C'); { defer A('D'); A('1'); break outer; } }\n"
+	     "    }\n"
+	     "  } A('E');\n"
+	     "  return (L[0]=='1'&&L[1]=='D'&&L[2]=='C'&&L[3]=='B'&&L[4]=='A'&&L[5]=='E')?0:1;\n"
+	     "}\n"},
+	    {4, "continue",
+	     "static char L[32]; static int n; static void A(char c){L[n++]=c;}\n"
+	     "int main(void){\n"
+	     "  outer: for(int i=0;i<1;i++){\n"
+	     "    defer A('A');\n"
+	     "    for(int j=0;j<1;j++){\n"
+	     "      defer A('B');\n"
+	     "      { defer A('C'); { defer A('D'); A('1'); continue outer; } }\n"
+	     "    }\n"
+	     "  } A('E');\n"
+	     "  return (L[0]=='1'&&L[1]=='D'&&L[2]=='C'&&L[3]=='B'&&L[4]=='A'&&L[5]=='E')?0:1;\n"
+	     "}\n"},
+	};
+	int ok = 0, fail = 0;
+	for (size_t i = 0; i < sizeof(cells) / sizeof(cells[0]); i++) {
+		char name[96];
+		snprintf(name, sizeof(name), "labeled %s depth=%d: transpile", cells[i].exit_kw,
+			 cells[i].depth);
+		PrismResult r = prism_transpile_source(cells[i].src, "dx_labeled.c", prism_defaults());
+		int before = failed;
+		CHECK_EQ(r.status, PRISM_OK, name);
+		if (r.status == PRISM_OK && r.output) {
+			char needle[32];
+			snprintf(needle, sizeof(needle), "%s outer", cells[i].exit_kw);
+			snprintf(name, sizeof(name), "labeled %s depth=%d: preserves label",
+				 cells[i].exit_kw, cells[i].depth);
+			CHECK(strstr(r.output, needle) != NULL, name);
+		}
+		if (failed == before)
+			ok++;
+		else
+			fail++;
+		prism_free(&r);
+	}
+	printf("--- defer labeled×depth summary: %d ok, %d fail ---\n", ok, fail);
+}
+
+/* Multi-defer × depth × exit — transpile product (CFG builder stress).
+ * n_per defers per frame, depth frames, exit ∈ {return,break,continue,goto,swbreak}. */
+static int dx_multi_build(char *buf, size_t buflen, int depth, int n_per, const char *exit_kind) {
+	char body[3072];
+	size_t pos = 0;
+	body[0] = 0;
+#define APP(...)                                                               \
+	do {                                                                   \
+		int _n = snprintf(body + pos, sizeof(body) - pos, __VA_ARGS__); \
+		if (_n < 0 || (size_t)_n >= sizeof(body) - pos)                \
+			return -1;                                             \
+		pos += (size_t)_n;                                             \
+	} while (0)
+
+	APP("static char L[64]; static int n;\n"
+	    "static void A(char c){ if(n<(int)sizeof(L)-1) L[n++]=c; }\n"
+	    "int main(void){\n  n=0;\n");
+
+	int id = 0;
+	if (!strcmp(exit_kind, "break") || !strcmp(exit_kind, "continue"))
+		APP("  for(int i=0;i<1;i++){\n");
+	else if (!strcmp(exit_kind, "swbreak"))
+		APP("  switch(1){ default: {\n");
+	else if (!strcmp(exit_kind, "goto"))
+		APP("  {\n");
+
+	for (int d = 0; d < depth; d++) {
+		APP("  {\n");
+		for (int k = 0; k < n_per; k++) {
+			APP("    defer A('%c');\n", 'A' + (id % 26));
+			id++;
+		}
+	}
+	APP("    A('1');\n");
+	if (!strcmp(exit_kind, "return"))
+		APP("    return 0;\n");
+	else if (!strcmp(exit_kind, "break") || !strcmp(exit_kind, "swbreak"))
+		APP("    break;\n");
+	else if (!strcmp(exit_kind, "continue"))
+		APP("    continue;\n");
+	else if (!strcmp(exit_kind, "goto"))
+		APP("    goto done;\n");
+	else
+		return -1;
+	for (int d = 0; d < depth; d++)
+		APP("  }\n");
+
+	if (!strcmp(exit_kind, "break") || !strcmp(exit_kind, "continue"))
+		APP("  }\n");
+	else if (!strcmp(exit_kind, "swbreak"))
+		APP("  } }\n");
+	else if (!strcmp(exit_kind, "goto"))
+		APP("  }\n done: ;\n");
+
+	APP("  A('E');\n  return 0;\n}\n");
+#undef APP
+	if (pos >= buflen)
+		return -1;
+	memcpy(buf, body, pos + 1);
+	return 0;
+}
+
+static void test_defer_multi_depth_exit_matrix(void) {
+	static const char *exits[] = {"return", "break", "continue", "goto", "swbreak"};
+	char src[4096];
+	char name[96];
+	int ok = 0, fail = 0, skipped = 0;
+	printf("\n--- defer multi×depth×exit transpile matrix ---\n");
+	for (int depth = 1; depth <= 5; depth++) {
+		for (int n_per = 1; n_per <= 3; n_per++) {
+			for (size_t ei = 0; ei < sizeof(exits) / sizeof(exits[0]); ei++) {
+				/* continue with depth frames inside one loop is enough; skip
+				 * absurd n_per*depth overflow of letter ids beyond Z. */
+				if (depth * n_per > 24) {
+					skipped++;
+					continue;
+				}
+				if (dx_multi_build(src, sizeof(src), depth, n_per, exits[ei]) != 0) {
+					skipped++;
+					continue;
+				}
+				snprintf(name, sizeof(name), "multi d=%d n=%d %s", depth, n_per,
+					 exits[ei]);
+				PrismResult r =
+				    prism_transpile_source(src, "dx_multi.c", prism_defaults());
+				int before = failed;
+				CHECK_EQ(r.status, PRISM_OK, name);
+				if (r.status == PRISM_OK && r.output) {
+					snprintf(name, sizeof(name), "multi d=%d n=%d %s no-leak",
+						 depth, n_per, exits[ei]);
+					CHECK(strstr(r.output, "defer") == NULL, name);
+				}
+				if (failed == before)
+					ok++;
+				else
+					fail++;
+				prism_free(&r);
+			}
+		}
+	}
+	printf("--- defer multi×depth×exit summary: %d ok, %d fail, %d skipped ---\n", ok, fail,
+	       skipped);
+}
+
+/* Defer × orelse exit interaction product (transpile). */
+static void test_defer_orelse_exit_product(void) {
+	static const struct {
+		const char *label;
+		const char *src;
+		int want_ok;
+	} cells[] = {
+	    {"oe break + defer frames",
+	     "int main(void){ volatile int *p = 0;\n"
+	     "  for(;;){ defer (void)0; int *q = p orelse break; (void)q; }\n"
+	     "  return 0; }\n",
+	     1},
+	    {"oe continue + defer frames",
+	     "int main(void){ volatile int *p = 0;\n"
+	     "  for(int i=0;i<2;i++){ defer (void)0; int *q = p orelse continue; (void)q; }\n"
+	     "  return 0; }\n",
+	     1},
+	    {"oe goto + nested defer",
+	     "int main(void){ volatile int *p = 0;\n"
+	     "  { defer (void)0; { defer (void)0; int *q = p orelse goto done; (void)q; } }\n"
+	     "  done: return 0; }\n",
+	     1},
+	    {"oe return + nested defer",
+	     "int f(void){ volatile int *p = 0;\n"
+	     "  defer (void)0; { defer (void)0; int *q = p orelse return -1; (void)q; }\n"
+	     "  return 0; }\nint main(void){ return f() == -1 ? 0 : 1; }\n",
+	     1},
+	    {"oe labeled break + defer",
+	     "int main(void){ volatile int *p = 0;\n"
+	     "  outer: for(;;){ defer (void)0;\n"
+	     "    for(;;){ defer (void)0; int *q = p orelse break outer; (void)q; }\n"
+	     "  } return 0; }\n",
+	     1},
+	    {"oe labeled continue + defer",
+	     "int main(void){ volatile int *p = 0;\n"
+	     "  outer: for(int i=0;i<1;i++){ defer (void)0;\n"
+	     "    for(;;){ defer (void)0; int *q = p orelse continue outer; (void)q; }\n"
+	     "  } return 0; }\n",
+	     1},
+	    {"oe chain mid goto reject",
+	     "int main(void){ int x = 0 orelse goto L orelse 1; L: return 0; }\n", 0},
+	    {"braceless defer+orelse reject",
+	     "int main(void){ defer 0 orelse 1; return 0; }\n", 0},
+	};
+	printf("\n--- defer × orelse exit product ---\n");
+	int ok = 0, fail = 0;
+	for (size_t i = 0; i < sizeof(cells) / sizeof(cells[0]); i++) {
+		PrismResult r = prism_transpile_source(cells[i].src, "dx_oe.c", prism_defaults());
+		int before = failed;
+		if (cells[i].want_ok) {
+			CHECK_EQ(r.status, PRISM_OK, cells[i].label);
+			if (r.status == PRISM_OK && r.output) {
+				CHECK(strstr(r.output, "orelse") == NULL, cells[i].label);
+				CHECK(strstr(r.output, "defer") == NULL, cells[i].label);
+			}
+		} else {
+			CHECK(r.status != PRISM_OK, cells[i].label);
+		}
+		if (failed == before)
+			ok++;
+		else
+			fail++;
+		prism_free(&r);
+	}
+	printf("--- defer×orelse product summary: %d ok, %d fail ---\n", ok, fail);
+}
+
+/* Nest-shape × depth × exit transpile product (for/while/do/switch×for). */
+static int dx_shape_build(char *buf, size_t buflen, const char *shape, int depth,
+			  const char *exit_kind) {
+	char body[4096];
+	size_t pos = 0;
+	body[0] = 0;
+#define APP(...)                                                               \
+	do {                                                                   \
+		int _n = snprintf(body + pos, sizeof(body) - pos, __VA_ARGS__); \
+		if (_n < 0 || (size_t)_n >= sizeof(body) - pos) return -1;      \
+		pos += (size_t)_n;                                             \
+	} while (0)
+
+	APP("static char L[64]; static int n; static void A(char c){if(n<63)L[n++]=c;}\n"
+	    "int main(void){ n=0;\n");
+
+	if (!strcmp(shape, "for"))
+		APP("  for(int i=0;i<1;i++){\n");
+	else if (!strcmp(shape, "while"))
+		APP("  int once=1; while(once--){\n");
+	else if (!strcmp(shape, "do"))
+		APP("  do{\n");
+	else if (!strcmp(shape, "switch"))
+		APP("  switch(1){ default:{\n");
+	else if (!strcmp(shape, "swfor"))
+		APP("  for(int i=0;i<1;i++){ switch(1){ case 1:{\n");
+	else
+		return -1;
+
+	for (int d = 0; d < depth; d++) {
+		APP("  { defer A('%c');\n", 'A' + d);
+	}
+	APP("    A('1');\n");
+	if (!strcmp(exit_kind, "break"))
+		APP("    break;\n");
+	else if (!strcmp(exit_kind, "continue")) {
+		if (!strcmp(shape, "switch"))
+			return -1; /* continue invalid in switch-only */
+		APP("    continue;\n");
+	} else if (!strcmp(exit_kind, "return"))
+		APP("    return 0;\n");
+	else if (!strcmp(exit_kind, "goto"))
+		APP("    goto done;\n");
+	else
+		return -1;
+	for (int d = 0; d < depth; d++)
+		APP("  }\n");
+
+	if (!strcmp(shape, "for") || !strcmp(shape, "while"))
+		APP("  }\n");
+	else if (!strcmp(shape, "do"))
+		APP("  } while(0);\n");
+	else if (!strcmp(shape, "switch"))
+		APP("  }}\n");
+	else if (!strcmp(shape, "swfor"))
+		APP("  }}}\n");
+
+	if (!strcmp(exit_kind, "goto"))
+		APP(" done:;\n");
+	APP("  A('E'); return 0;\n}\n");
+#undef APP
+	if (pos >= buflen) return -1;
+	memcpy(buf, body, pos + 1);
+	return 0;
+}
+
+static void test_defer_nest_shape_matrix(void) {
+	static const char *shapes[] = {"for", "while", "do", "switch", "swfor"};
+	static const char *exits[] = {"break", "continue", "return", "goto"};
+	char src[8192], name[96];
+	int ok = 0, fail = 0, skipped = 0;
+	printf("\n--- defer nest-shape × depth × exit matrix ---\n");
+	for (size_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
+		for (int depth = 1; depth <= 3; depth++) {
+			for (size_t ei = 0; ei < sizeof(exits) / sizeof(exits[0]); ei++) {
+				if (dx_shape_build(src, sizeof(src), shapes[si], depth, exits[ei]) != 0) {
+					skipped++;
+					continue;
+				}
+				snprintf(name, sizeof(name), "shape %s d=%d %s", shapes[si], depth,
+					 exits[ei]);
+				PrismResult r =
+				    prism_transpile_source(src, "dx_shape.c", prism_defaults());
+				int before = failed;
+				CHECK_EQ(r.status, PRISM_OK, name);
+				if (r.status == PRISM_OK && r.output)
+					CHECK(strstr(r.output, "defer") == NULL, name);
+				if (failed == before) ok++;
+				else fail++;
+				prism_free(&r);
+			}
+		}
+	}
+	printf("--- defer nest-shape summary: %d ok, %d fail, %d skipped ---\n", ok, fail, skipped);
 }
 
 void run_defer_tests(void) {
@@ -7382,6 +7992,10 @@ void run_defer_tests(void) {
 	CHECK_LOG("R321", "defer nested return");
 	CHECK_EQ(ret, 99, "defer nested return value");
 	test_defer_exit_scope_depth_matrix();
+	test_defer_labeled_exit_depth_matrix();
+	test_defer_multi_depth_exit_matrix();
+	test_defer_orelse_exit_product();
+	test_defer_nest_shape_matrix();
 	test_defer_compound_stmt();
 	test_defer_zeroinit_inside();
 	test_defer_zeroinit_struct_inside();

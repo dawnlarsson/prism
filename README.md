@@ -5,19 +5,19 @@
 ## Robust C by default
 **A dialect of C with `defer`, `orelse`, automatic zero-initialization, bounds checking, and progressive optimization.**
 
-Prism is a lightweight and very fast transpiler that makes C safer and faster without changing how you write it.
+Prism is a lightweight and fast transpiler that makes C safer and faster without changing how you write it.
 
-- **9660+ tests** — edge cases, control flow, nightmares, trying hard to break Prism
-- **Building Real C** — OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
-- **Two-pass transpiler** — full semantic analysis before a single byte is emitted
-- **Progressive optimization** — auto-unreachable after noreturn calls, const arrays promoted to static storage
-- **Opt-out features** — Disable parts of the transpiler, like zero-init or bounds-check, with CLI flags
-- **Drop-in overlay** — Use `CC=prism` in any build system — GCC-compatible flags pass through automatically
-- **Single Repo** — zero dependencies, easy to audit, only need a C compiler
+- **9660+ tests:** edge cases, control flow, nightmares, trying hard to break Prism
+- **Building Real C:** OpenSSL, SQLite, Bash, GNU Coreutils, Make, Curl
+- **Two-pass transpiler:** full semantic analysis before a single byte is emitted
+- **Progressive optimization:** auto-unreachable after noreturn calls, const arrays promoted to static storage
+- **Opt-out features:** Disable parts of the transpiler, like zero-init or bounds-check, with CLI flags
+- **Drop-in overlay:** Use `CC=prism` in any build system. GCC-compatible flags pass through automatically
+- **Single Repo:** zero dependencies, easy to audit, only need a C compiler
 
 Prism is a proper transpiler, not a preprocessor macro.
-* **Track Types:** Pass 1 walks every token at every depth, registering every `typedef`, `enum` constant, parameter shadow, and VLA tag into an immutable symbol table — no heuristics, no suffix guessing. If it wasn't declared, it's not a type
-* **Respect Scope:** A full scope tree maps every `{`/`}` pair with parent links and classification (loop, switch, conditional, function body, statement expression). `defer` fires exactly when it should — no state machines in the emitter
+* **Track Types:** Pass 1 walks every token at every depth, registering every `typedef`, `enum` constant, parameter shadow, and VLA tag into an immutable symbol table, no heuristics, no suffix guessing. If it wasn't declared, it's not a type
+* **Respect Scope:** A full scope tree maps every `{`/`}` pair with parent links and classification (loop, switch, conditional, function body, statement expression). `defer` fires exactly when it should, no state machines in the emitter
 * **Detect Errors Early:** A CFG verifier checks every `goto`→label and `switch`→`case` pair against defers and declarations **before** code generation starts. If your code is unsafe, Prism errors before writing a single byte
 
 ## Quick Start
@@ -108,13 +108,13 @@ int compile(const char *path) {
 It is better, but we can take it further, see `orelse` section.
 
 
-Defers execute in **LIFO order** (last defer runs first) at scope exit — whether via `return`, `break`, `continue`, `goto`, or reaching `}`.
+Defers execute in **LIFO order** (last defer runs first) at scope exit, whether via `return`, `break`, `continue`, `goto`, or reaching `}`.
 
 **Edge cases handled:**
-- Statement expressions `({ ... })` — defers fire at inner scope, not outer
-- `switch` fallthrough — defers don't double-fire between cases  
-- Nested loops — `break`/`continue` unwind the correct scope
-- Computed goto — `goto *ptr` with active defers is a hard error
+- Statement expressions `({ ... })`: defers fire at inner scope, not outer
+- `switch` fallthrough: defers don't double-fire between cases  
+- Nested loops: `break`/`continue` unwind the correct scope
+- Computed goto: `goto *ptr` with active defers is a hard error
 
 **Forbidden patterns:** Functions using `setjmp`/`longjmp`/`pthread_exit`, `vfork`, or `asm goto` are rejected to prevent resource leaks from non-local jumps. Regular inline assembly is fine.
 
@@ -145,7 +145,7 @@ void example() {
 }
 ```
 
-**Typedef tracking:** Before code generation, Pass 1 walks the entire preprocessed token stream at all depths — not just file scope — to build a complete, immutable symbol table of every `typedef`, `enum` constant, parameter shadow, and VLA tag. This is deterministic — `size_t`, `pthread_mutex_t`, and every other typedef from system headers are resolved by name lookup, not pattern matching. This distinguishes `size_t x;` (declaration → initialize) from `size_t * x;` (expression → don't touch).
+**Typedef tracking:** Before code generation, Pass 1 walks the entire preprocessed token stream at all depths (not just file scope) to build a complete, immutable symbol table of every `typedef`, `enum` constant, parameter shadow, and VLA tag. This is deterministic: `size_t`, `pthread_mutex_t`, and every other typedef from system headers are resolved by name lookup, not pattern matching. This distinguishes `size_t x;` (declaration → initialize) from `size_t * x;` (expression → don't touch).
 
 **VLA support:** Variable-length arrays get `memset` at runtime.
 
@@ -168,7 +168,7 @@ void example() {
 - Performance-critical inner loops where zeroing is measurable overhead
 - Interfacing with APIs that fully initialize the data
 
-**Safety interaction:** Variables marked `raw` can be safely jumped over by `goto` — since they're not initialized anyway, skipping them isn't undefined behavior. Exception: `raw` on a VLA does not exempt it from the goto check, because jumping past a VLA bypasses implicit stack allocation regardless of initialization.
+**Safety interaction:** Variables marked `raw` can be safely jumped over by `goto`, since they're not initialized anyway, skipping them isn't undefined behavior. Exception: `raw` on a VLA does not exempt it from the goto check, because jumping past a VLA bypasses implicit stack allocation regardless of initialization.
 
 ```c
 void allowed() {
@@ -181,7 +181,7 @@ skip:
 
 ## orelse
 
-The `orelse` keyword handles failure inline — check a value and bail in one line.
+The `orelse` keyword handles failure inline: check a value and bail in one line.
 
 `defer` solved the cleanup problem, but notice the function still has a repetitive pattern: call, null-check, bail. Four times. `orelse` collapses each check-and-bail into the declaration itself:
 
@@ -205,11 +205,11 @@ int compile(const char *path) {
 
 Same function, three versions: **32 lines → 19 lines → 15 lines.** No cleanup bugs, no null-check boilerplate.
 
-`orelse` checks if the initialized value is falsy (null pointer, zero). If so, the action fires. All active defers run — just like a normal `return`.
+`orelse` checks if the initialized value is falsy (null pointer, zero). If so, the action fires. All active defers run, just like a normal `return`.
 
 ### Forms
 
-**Control flow** — return, break, continue, goto:
+**Control flow:** return, break, continue, goto:
 ```c
 int *p = get_ptr() orelse return -1;
 int *q = next()    orelse break;
@@ -217,7 +217,7 @@ int *r = try_it()  orelse continue;
 int *s = find()    orelse goto cleanup;
 ```
 
-**Block** — run arbitrary code on failure:
+**Block:** run arbitrary code on failure:
 ```c
 FILE *f = fopen(path, "r") orelse {
     log_error("failed to open %s", path);
@@ -225,19 +225,19 @@ FILE *f = fopen(path, "r") orelse {
 }
 ```
 
-**Fallback value** — substitute a default:
+**Fallback value:** substitute a default:
 ```c
 char *name = get_name() orelse "unknown";
 ```
 
-**Bare expression** — check without assignment:
+**Bare expression:** check without assignment:
 ```c
 do_init() orelse return -1;
 ```
 
 ### Works with any falsy value
 
-`orelse` isn't limited to pointers — it works with any type where `!value` is meaningful:
+`orelse` isn't limited to pointers. It works with any type where `!value` is meaningful:
 
 ```c
 int fd = open(path, O_RDONLY) orelse return -1;  // 0 is falsy
@@ -246,7 +246,7 @@ size_t n = read_data(fd, buf) orelse break;      // 0 bytes = done
 
 ### Limitation: struct/union values
 
-`orelse` does not **currently** support struct or union **values** — it is a compile error:
+`orelse` does not **currently** support struct or union **values**. It is a compile error:
 
 ```c
 struct Vec2 { int x, y; };
@@ -264,9 +264,9 @@ struct Vec2 *p = get_vec2() orelse return -1;  // OK — pointer is scalar
 
 > **Note:** Prism detects struct/union types through explicit keywords
 > (`struct S`, `union U`) *and* through typedefs that alias aggregates.
-> However, when `typeof()` is applied to an **opaque expression** — a
+> However, when `typeof()` is applied to an **opaque expression** (a
 > variable name or function call whose type cannot be determined from
-> tokens alone — Prism cannot detect the aggregate nature:
+> tokens alone), Prism cannot detect the aggregate nature:
 >
 > ```c
 > struct S make(void);
@@ -280,7 +280,7 @@ struct Vec2 *p = get_vec2() orelse return -1;  // OK — pointer is scalar
 **Opt-out:** `prism -fno-orelse src.c`
 
 ## Safety Enforcement
-Prism acts as a static analysis tool, turning common C pitfalls into compile-time errors — all before a single byte of output is emitted.
+Prism acts as a static analysis tool, turning common C pitfalls into compile-time errors, all before a single byte of output is emitted.
 
 ### No Uninitialized Jumps
 Standard C allows `goto` to skip variable initialization, leading to undefined behavior. Prism's CFG verifier checks every `goto`→label pair in an O(N) linear sweep:
@@ -296,7 +296,7 @@ skip:
 // Error: goto 'skip' would skip over variable declaration 'x'
 ```
 
-The same analysis covers `switch`/`case` — jumping from one case into a nested block that has zero-initialized declarations or active defers is rejected:
+The same analysis covers `switch`/`case`, jumping from one case into a nested block that has zero-initialized declarations or active defers is rejected:
 
 ```c
 void bad_switch(int n) {
@@ -335,9 +335,9 @@ prism -fno-safety legacy.c  # Compiles with warnings instead of errors
 
 ## Auto-Unreachable
 
-Prism is not just a transpiler that adds explicit features — it is a progressive enhancement engine for standard C. Your binaries get smaller and faster automatically, without changing a single line of source.
+Prism is not just a transpiler that adds explicit features. It is a progressive enhancement engine for standard C. Your binaries get smaller and faster automatically, without changing a single line of source.
 
-Prism tracks `_Noreturn`, `[[noreturn]]`, `__attribute__((noreturn))`, and standard library exit functions (`exit`, `abort`, `_Exit`, `quick_exit`) across your entire translation unit — including through transitive call chains. After every call to one of these functions, Prism silently injects `__builtin_unreachable()` (or `__assume(0)` on MSVC).
+Prism tracks `_Noreturn`, `[[noreturn]]`, `__attribute__((noreturn))`, and standard library exit functions (`exit`, `abort`, `_Exit`, `quick_exit`) across your entire translation unit, including through transitive call chains. After every call to one of these functions, Prism silently injects `__builtin_unreachable()` (or `__assume(0)` on MSVC).
 
 ```c
 void fatal(const char *msg) __attribute__((noreturn));
@@ -354,10 +354,10 @@ int process(int *data) {
 
 This feeds explicit control-flow termination data to the backend compiler, enabling:
 
-- **Dead-code elimination** — unreachable paths after noreturn calls are removed entirely
-- **Smaller functions** — unnecessary epilogues and stack cleanup are dropped
-- **Better register allocation** — the compiler knows which paths are live
-- **Improved branch prediction** — fewer branches means fewer mispredictions
+- **Dead-code elimination:** unreachable paths after noreturn calls are removed entirely
+- **Smaller functions:** unnecessary epilogues and stack cleanup are dropped
+- **Better register allocation:** the compiler knows which paths are live
+- **Improved branch prediction:** fewer branches means fewer mispredictions
 
 The optimization propagates transitively: if `wrapper()` calls `fatal()`, and Prism sees that `wrapper` always exits via a noreturn path, callers of `wrapper` benefit too.
 
@@ -378,18 +378,18 @@ void encrypt(uint8_t *block) {
 
 This eliminates hidden `memcpy` calls for cryptographic tables, lookup arrays, dispatch tables, and string constant arrays.
 
-The transformation is conservative — it only fires when all of these hold:
+The transformation is conservative. It only fires when all of these hold:
 - Block-scope `const` array with brace-enclosed initializer
 - Every initializer token is a literal, enum constant, or designator
 - No `volatile`, `static`, `extern`, `register`, `_Thread_local`, or `constexpr`
 - No VLA dimensions, no `orelse`, no attributes on the declarator
-- For pointer arrays (`const int *arr[3]`), the array itself must be `const` — i.e. `const int * const arr[3]`
+- For pointer arrays (`const int *arr[3]`), the array itself must be `const`, i.e. `const int * const arr[3]`
 
 **Opt-out:** `prism -fno-auto-static src.c`
 
 ## Bounds Checking
 
-Prism wraps array subscripts with a runtime bounds check, turning silent buffer overflows into immediate traps. **This is on by default** — Prism's philosophy is opt-out, not opt-in: you chose Prism for safety, not to configure it.
+Prism wraps array subscripts with a runtime bounds check, turning silent buffer overflows into immediate traps. **This is on by default.** Prism's philosophy is opt-out, not opt-in: you chose Prism for safety, not to configure it.
 
 ```c
 void process(void) {
@@ -410,7 +410,7 @@ Each wrapped subscript becomes:
 arr[__prism_bchk((__prism_bchk_size_t)(i), sizeof(arr)/sizeof(arr[0]))]
 ```
 
-The `sizeof` ratio gives the correct length for both fixed arrays (compile-time constant) and VLAs (runtime, per C99 §6.5.3.4) with no transpile-time size tracking. If the index is out of range, the inline helper calls `__builtin_trap()` (GCC/Clang) or `__debugbreak()` + `abort()` (MSVC). The unsigned cast also catches negative indices — they wrap to huge values and fail the check. The helper avoids any `#include` so it works both with flattened (already-preprocessed) output and with system-header-retaining output.
+The `sizeof` ratio gives the correct length for both fixed arrays (compile-time constant) and VLAs (runtime, per C99 §6.5.3.4) with no transpile-time size tracking. If the index is out of range, the inline helper calls `__builtin_trap()` (GCC/Clang) or `__debugbreak()` + `abort()` (MSVC). The unsigned cast also catches negative indices: they wrap to huge values and fail the check. The helper avoids any `#include` so it works both with flattened (already-preprocessed) output and with system-header-retaining output.
 
 **What's checked:**
 - Fixed-size local arrays: `int arr[100]; arr[i]`
@@ -420,9 +420,9 @@ The `sizeof` ratio gives the correct length for both fixed arrays (compile-time 
 - Declaration initializers and function-call arguments
 
 **What's intentionally NOT wrapped (to avoid false positives or false negatives):**
-- Unevaluated operands: `sizeof(arr[i])`, `_Alignof(arr[i])`, `typeof(arr[i])`, `offsetof(T, arr[i])`, `__builtin_offsetof(T, arr[i])`, and the controlling expression of `_Generic(arr[i], ...)` — operand is not evaluated; an offsetof subscript refers to a struct field whose size is unrelated to any same-named local
-- Struct/union member subscripts: `s.arr[i]`, `p->arr[i]` — field size ≠ any same-named local
-- Unary address-of: `&arr[i]` — C permits one-past-end addresses (index == length is legal)
+- Unevaluated operands: `sizeof(arr[i])`, `_Alignof(arr[i])`, `typeof(arr[i])`, `offsetof(T, arr[i])`, `__builtin_offsetof(T, arr[i])`, and the controlling expression of `_Generic(arr[i], ...)`: operand is not evaluated; an offsetof subscript refers to a struct field whose size is unrelated to any same-named local
+- Struct/union member subscripts: `s.arr[i]`, `p->arr[i]`: field size ≠ any same-named local
+- Unary address-of: `&arr[i]`: C permits one-past-end addresses (index == length is legal)
 - Pointer subscripts (`p[i]` where `p` is `int *`)
 - Array parameters (they decay to pointers in C)
 - `raw { ... }` blocks (Prism transformations are fully suppressed)
@@ -467,7 +467,7 @@ Not:
 
 ## Debugging
 
-**Debuggers show your original Prism source — not the transpiled C.** The same
+**Debuggers show your original Prism source, not the transpiled C.** The same
 `#line` directives that drive error reporting also drive the DWARF line tables
 the backend compiler emits under `-g`, so lldb/gdb resolve everything to your
 `.c` file:
@@ -482,19 +482,19 @@ frame #0: app`load(id=1) at app.c:10:5
 (char) 'B'
 ```
 
-Source listings render the original file — `defer` and `orelse` lines included —
+Source listings render the original file (`defer` and `orelse` lines included)
 and backtraces cite original lines (`load at app.c:10`, `main at app.c:17`).
 
 `defer` makes debugging *better*, not worse: a breakpoint on a defer body line
 binds to **every exit path's copy** of the cleanup and fires exactly when the
-cleanup runs — hit it on an early `return` and the backtrace shows you which
+cleanup runs. Hit it on an early `return` and the backtrace shows you which
 exit triggered it. Stepping over a `return` walks through the pending defer
 bodies at their original lines, in LIFO order, before leaving the function.
 
 Prism-generated temporaries are namespaced `__prism_*` and easy to ignore in
 `frame variable`. To inspect the generated C itself, `prism transpile` prints
 it, and `-fno-line-directives` makes the debugger show the transpiled lines
-instead — useful when debugging Prism's own output.
+instead, useful when debugging Prism's own output.
 
 ## Static Analysis (CppCheck, clang-tidy, …)
 
@@ -513,7 +513,7 @@ prism check clang-tidy src.c -- -I include
 `check` shapes the artifact for analysis automatically: `#include` lines stay
 intact (no header flattening) and subscripts stay bare so the analyzer sees
 `arr[8]` rather than a runtime bounds-check wrapper. Your shipping build keeps
-both features on — this only affects the analysis artifact. Prism flags before
+both features on. This only affects the analysis artifact. Prism flags before
 `check` still apply (e.g. `prism -fno-zeroinit check cppcheck …`).
 
 The manual equivalent, if you need the artifact itself:
@@ -526,18 +526,18 @@ cppcheck --enable=all build/src.c
 Analyzing the expansion is **strictly stronger** than analyzing the source:
 the analyzer sees the real control flow *including* defer cleanup. A manual
 `fclose(f)` before an early return alongside `defer fclose(f);` is reported by
-CppCheck as `doubleFree: Resource handle 'f' freed twice` — a bug class no
+CppCheck as `doubleFree: Resource handle 'f' freed twice`, a bug class no
 source-level C analyzer can see, because none of them understand `defer`.
 
 Raw Prism sources (files using `orelse`) stop CppCheck at the first keyword with
 an `unknownMacro` configuration error, so point analyzers at the transpiled
 artifact. Files that use no Prism keywords are plain C and analyze as-is. Note:
 automatic zero-init may surface as `redundantAssignment` at style level when you
-immediately overwrite a variable — suppress that id or read it as intentional.
+immediately overwrite a variable. Suppress that id or read it as intentional.
 
 ## CLI
 
-Prism uses a GCC-compatible interface — most flags pass through to the backend compiler.
+Prism uses a GCC-compatible interface. Most flags pass through to the backend compiler.
 
 ```sh
 Prism v1.1.5 - Robust C transpiler
@@ -624,20 +624,20 @@ void          prism_thread_cleanup(void);  // free thread-locals before thread e
 
 ## Architecture
 
-Prism processes C in two passes. Pass 1 performs full semantic analysis, annotates the token stream, and catches all user-triggerable errors. Pass 2 is a near-pure code generator that reads Pass 1's immutable artifacts — no type table mutations, no speculative token walking. Pass 2's defensive assertions (unreachable when Pass 1 is correct) are compiled only in `PRISM_DEBUG` builds; the debug suite run verifies Pass 1 covers every case.
+Prism processes C in two passes. Pass 1 performs full semantic analysis, annotates the token stream, and catches all user-triggerable errors. Pass 2 is a near-pure code generator that reads Pass 1's immutable artifacts, no type table mutations, no speculative token walking. Pass 2's defensive assertions (unreachable when Pass 1 is correct) are compiled only in `PRISM_DEBUG` builds; the debug suite run verifies Pass 1 covers every case.
 
 | Phase | What it does |
 |---|---|
-| **Pass 0** — Tokenizer | Tokenize, delimiter-match, keyword-tag, build setjmp/vfork/asm taint graph per function |
-| **Pass 1A** — Scope Tree | Walk all tokens, assign scope IDs, build parent chain, classify each `{` (loop/switch/conditional/function/struct) |
-| **Pass 1B** — Type Registration | Full-depth `typedef`, `enum`, VLA tag registration at all scopes — symbol table frozen after this point |
-| **Pass 1C** — Shadow Table | Record every variable that shadows a typedef, with scope ID and token index for temporally-correct lookup |
-| **Pass 1D** — CFG Collection | Per-function arrays of labels, gotos, defers, declarations, switch/case entries |
-| **Pass 1E** — Return Type Capture | Record each function's return type range and void/setjmp/vfork/asm flags |
-| **Pass 1F** — Defer Validation | Reject forbidden patterns inside defer bodies (return, goto, break, continue, nested stmt-expr) |
-| **Pass 1G** — Orelse Pre-Classification | Classify orelse in brackets and declaration initializers; reject in enum bodies and at file scope |
-| **Phase 2A** — CFG Verification | O(N) snapshot-and-sweep: verify every goto→label and switch→case pair against defers and declarations |
-| **Pass 2** — Code Generation | Emit transformed C. Reads immutable scope tree, typedef table, shadow table. No type mutations, no safety checks |
+| **Pass 0:** Tokenizer | Tokenize, delimiter-match, keyword-tag, build setjmp/vfork/asm taint graph per function |
+| **Pass 1A:** Scope Tree | Walk all tokens, assign scope IDs, build parent chain, classify each `{` (loop/switch/conditional/function/struct) |
+| **Pass 1B:** Type Registration | Full-depth `typedef`, `enum`, VLA tag registration at all scopes, symbol table frozen after this point |
+| **Pass 1C:** Shadow Table | Record every variable that shadows a typedef, with scope ID and token index for temporally-correct lookup |
+| **Pass 1D:** CFG Collection | Per-function arrays of labels, gotos, defers, declarations, switch/case entries |
+| **Pass 1E:** Return Type Capture | Record each function's return type range and void/setjmp/vfork/asm flags |
+| **Pass 1F:** Defer Validation | Reject forbidden patterns inside defer bodies (return, goto, break, continue, nested stmt-expr) |
+| **Pass 1G:** Orelse Pre-Classification | Classify orelse in brackets and declaration initializers; reject in enum bodies and at file scope |
+| **Phase 2A:** CFG Verification | O(N) snapshot-and-sweep: verify every goto→label and switch→case pair against defers and declarations |
+| **Pass 2:** Code Generation | Emit transformed C. Reads immutable scope tree, typedef table, shadow table. No type mutations, no safety checks |
 
 **Key invariant:** Every semantic error is raised before Pass 2 emits its first byte. If code generation starts, it runs to completion.
 

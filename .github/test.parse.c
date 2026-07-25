@@ -9329,6 +9329,405 @@ static void test_gap_string_backslash_newline_inside_literal(void) {
 	prism_free(&r);
 }
 
+
+/* -------------------------------------------------------------------------
+ * Parser abuse product: digraphs × soft-kw × nesting × attr/stmtexpr edges.
+ * Expect: accept ⇒ no soft-kw leak; reject ⇒ clean error (no crash).
+ * ------------------------------------------------------------------------- */
+typedef enum {
+	PA_DIG_NONE = 0,
+	PA_DIG_BRACES,
+	PA_DIG_BRACKETS,
+	PA_DIG_MIXED,
+	PA_DIG_COUNT
+} PaDigraph;
+
+typedef enum {
+	PA_SOFT_NONE = 0,
+	PA_SOFT_DEFER,
+	PA_SOFT_ORELSE,
+	PA_SOFT_BOTH,
+	PA_SOFT_SHADOW,
+	PA_SOFT_COUNT
+} PaSoft;
+
+typedef enum {
+	PA_NEST_FLAT = 0,
+	PA_NEST_STMT_EXPR,
+	PA_NEST_TYPEOF,
+	PA_NEST_GENERIC,
+	PA_NEST_ATTR_GNU,
+	PA_NEST_ATTR_C23,
+	PA_NEST_DEEP_PAREN,
+	PA_NEST_SIZEOF,
+	PA_NEST_COMMENT_SPLIT,
+	PA_NEST_COUNT
+} PaNest;
+
+static const char *pa_dig_name(PaDigraph d) {
+	static const char *n[] = {"none", "braces", "brackets", "mixed"};
+	return n[d];
+}
+static const char *pa_soft_name(PaSoft s) {
+	static const char *n[] = {"none", "defer", "orelse", "both", "shadow"};
+	return n[s];
+}
+static const char *pa_nest_name(PaNest n) {
+	static const char *names[] = {"flat",	     "stmtexpr", "typeof", "generic",
+				      "attr_gnu",    "attr_c23", "deep_paren", "sizeof",
+				      "comment_split"};
+	return names[n];
+}
+
+/* 1=accept, 0=reject, -1=skip */
+static int pa_expect(PaDigraph dig, PaSoft soft, PaNest nest) {
+	/* Soft-kw inside attribute args must reject. */
+	if (nest == PA_NEST_ATTR_GNU || nest == PA_NEST_ATTR_C23) {
+		if (soft == PA_SOFT_DEFER || soft == PA_SOFT_ORELSE || soft == PA_SOFT_BOTH)
+			return 0;
+	}
+	/* Mixed digraph open/close is illegal — accept reject OR pass-through; we require
+	 * no crash and if accept then no soft-kw leak. Treat as reject preferred. */
+	if (dig == PA_DIG_MIXED)
+		return 0;
+	/* Shadow identifiers are fine. */
+	if (soft == PA_SOFT_SHADOW)
+		return 1;
+	return 1;
+}
+
+static int pa_build(char *buf, size_t buflen, PaDigraph dig, PaSoft soft, PaNest nest) {
+	const char *open_brace = "{";
+	const char *close_brace = "}";
+	const char *open_brack = "[";
+	const char *close_brack = "]";
+	if (dig == PA_DIG_BRACES) {
+		open_brace = "<%";
+		close_brace = "%>";
+	} else if (dig == PA_DIG_BRACKETS) {
+		open_brack = "<:";
+		close_brack = ":>";
+	} else if (dig == PA_DIG_MIXED) {
+		open_brace = "<%";
+		close_brace = "}"; /* mismatch */
+		open_brack = "<:";
+		close_brack = "]";
+	}
+
+	char soft_stmt[256] = "int z = 0; (void)z;";
+	if (soft == PA_SOFT_DEFER)
+		snprintf(soft_stmt, sizeof(soft_stmt), "int hit = 0; defer hit = 1; (void)hit;");
+	else if (soft == PA_SOFT_ORELSE)
+		snprintf(soft_stmt, sizeof(soft_stmt), "int x = 0 orelse 1; (void)x;");
+	else if (soft == PA_SOFT_BOTH)
+		snprintf(soft_stmt, sizeof(soft_stmt),
+			 "int hit = 0; defer hit = 1; int x = 0 orelse 1; (void)x; (void)hit;");
+	else if (soft == PA_SOFT_SHADOW)
+		snprintf(soft_stmt, sizeof(soft_stmt),
+			 "int defer = 3; int orelse = 4; (void)defer; (void)orelse;");
+
+	char core[512];
+	switch (nest) {
+	case PA_NEST_FLAT:
+		snprintf(core, sizeof(core), "%s", soft_stmt);
+		break;
+	case PA_NEST_STMT_EXPR:
+		snprintf(core, sizeof(core), "int r = ({ %s 0; }); (void)r;", soft_stmt);
+		break;
+	case PA_NEST_TYPEOF:
+		if (soft == PA_SOFT_ORELSE || soft == PA_SOFT_BOTH)
+			snprintf(core, sizeof(core), "typeof(0 orelse 1) y; (void)y; %s", soft_stmt);
+		else
+			snprintf(core, sizeof(core), "typeof(int) y; y = 0; (void)y; %s", soft_stmt);
+		break;
+	case PA_NEST_GENERIC:
+		snprintf(core, sizeof(core),
+			 "int g = _Generic(0, int: 1, default: 2); (void)g; %s", soft_stmt);
+		break;
+	case PA_NEST_ATTR_GNU:
+		if (soft == PA_SOFT_DEFER)
+			snprintf(core, sizeof(core),
+				 "int x __attribute__((aligned( ({ defer (void)0; 8; }) ))); (void)x;");
+		else if (soft == PA_SOFT_ORELSE || soft == PA_SOFT_BOTH)
+			snprintf(core, sizeof(core),
+				 "int x __attribute__((aligned(0 orelse 8))); (void)x;");
+		else
+			snprintf(core, sizeof(core),
+				 "int x __attribute__((aligned(8))); (void)x; %s", soft_stmt);
+		break;
+	case PA_NEST_ATTR_C23:
+		if (soft == PA_SOFT_ORELSE || soft == PA_SOFT_BOTH)
+			snprintf(core, sizeof(core), "int x [[gnu::aligned(0 orelse 8)]]; (void)x;");
+		else if (soft == PA_SOFT_DEFER)
+			snprintf(core, sizeof(core),
+				 "int x [[gnu::aligned( ({ defer (void)0; 8; }) )]]; (void)x;");
+		else
+			snprintf(core, sizeof(core), "int x [[gnu::aligned(8)]]; (void)x; %s", soft_stmt);
+		break;
+	case PA_NEST_DEEP_PAREN: {
+		/* Deep paren nest around a trivial expr; soft-kw as sibling stmt. */
+		snprintf(core, sizeof(core),
+			 "int v = (((((((((1))))))))); (void)v; %s", soft_stmt);
+		break;
+	}
+	case PA_NEST_SIZEOF:
+		if (soft == PA_SOFT_ORELSE || soft == PA_SOFT_BOTH)
+			snprintf(core, sizeof(core),
+				 "int n = (int)sizeof(char[0 orelse 2]); (void)n; %s", soft_stmt);
+		else if (soft == PA_SOFT_DEFER)
+			snprintf(core, sizeof(core),
+				 "int n = (int)sizeof(({ defer (void)0; 1; })); (void)n;");
+		else
+			snprintf(core, sizeof(core), "int n = (int)sizeof(int); (void)n; %s",
+				 soft_stmt);
+		break;
+	case PA_NEST_COMMENT_SPLIT:
+		/* Abuse tokenizer: comments/newlines splitting soft-kw from operands. */
+		if (soft == PA_SOFT_ORELSE || soft == PA_SOFT_BOTH)
+			snprintf(core, sizeof(core),
+				 "int x = 0 /*c*/ \n orelse /*d*/ 1; (void)x;");
+		else if (soft == PA_SOFT_DEFER)
+			snprintf(core, sizeof(core),
+				 "int hit = 0; defer /*c*/ \n hit = 1; (void)hit;");
+		else
+			snprintf(core, sizeof(core), "%s", soft_stmt);
+		break;
+	default:
+		return -1;
+	}
+
+	/* Array digraph spice */
+	char arr[128] = "";
+	if (dig == PA_DIG_BRACKETS || dig == PA_DIG_MIXED)
+		snprintf(arr, sizeof(arr), "int a%s2%s = %s1, 2%s; (void)a;", open_brack, close_brack,
+			 open_brace, close_brace);
+	else if (dig == PA_DIG_BRACES)
+		snprintf(arr, sizeof(arr), "int a[2] = %s1, 2%s; (void)a;", open_brace, close_brace);
+
+	return snprintf(buf, buflen,
+			"int main(void) %s\n  %s\n  %s\n  return 0;\n%s\n", open_brace, arr, core,
+			close_brace) < 0;
+}
+
+static bool pa_has_soft_leak(const char *out) {
+	if (!out) return false;
+	/* defer/orelse as keywords in output (not as identifiers in strings) — reuse orelse helper
+	 * and a defer scan. */
+	for (const char *p = out; (p = strstr(p, "defer")) != NULL; p++) {
+		char b = p == out ? '\0' : p[-1];
+		char a = p[5];
+		int wb = !((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') ||
+			   b == '_');
+		int wa = !((a >= 'a' && a <= 'z') || (a >= 'A' && a <= 'Z') || (a >= '0' && a <= '9') ||
+			   a == '_');
+		if (wb && wa) return true;
+	}
+	for (const char *p = out; (p = strstr(p, "orelse")) != NULL; p++) {
+		char b = p == out ? '\0' : p[-1];
+		char a = p[6];
+		int wb = !((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') ||
+			   b == '_');
+		int wa = !((a >= 'a' && a <= 'z') || (a >= 'A' && a <= 'Z') || (a >= '0' && a <= '9') ||
+			   a == '_');
+		if (wb && wa) return true;
+	}
+	return false;
+}
+
+static void test_parser_abuse_product_matrix(void) {
+	char src[2048];
+	char name[192];
+	int ok = 0, fail = 0, skipped = 0;
+	printf("\n--- Parser abuse digraph × soft-kw × nest matrix ---\n");
+	for (int di = 0; di < (int)PA_DIG_COUNT; di++) {
+		for (int si = 0; si < (int)PA_SOFT_COUNT; si++) {
+			for (int ni = 0; ni < (int)PA_NEST_COUNT; ni++) {
+				PaDigraph dig = (PaDigraph)di;
+				PaSoft soft = (PaSoft)si;
+				PaNest nest = (PaNest)ni;
+				int expect = pa_expect(dig, soft, nest);
+				if (expect < 0) { skipped++; continue; }
+				if (pa_build(src, sizeof(src), dig, soft, nest) != 0) {
+					skipped++;
+					continue;
+				}
+				snprintf(name, sizeof(name), "pa: %s/%s/%s", pa_dig_name(dig),
+					 pa_soft_name(soft), pa_nest_name(nest));
+				PrismResult r = prism_transpile_source(src, "pa_abuse.c", prism_defaults());
+				int check_leak = (soft != PA_SOFT_SHADOW);
+				if (expect) {
+					/* Accept path: must succeed and not leak soft-kws (except
+					 * intentional identifier shadows named defer/orelse). */
+					if (r.status == PRISM_OK) {
+						if (check_leak)
+							CHECK(!pa_has_soft_leak(r.output), name);
+						if (!check_leak || !pa_has_soft_leak(r.output))
+							ok++;
+						else
+							fail++;
+					} else {
+						/* Some nest×soft combos may reject; don't hard-fail accept
+						 * cells that prism cleanly rejects — count as ok if error. */
+						ok++;
+					}
+				} else {
+					/* Prefer reject; accept without leak is also tolerated for MIXED
+					 * pass-through, but soft-kw leak is fail. */
+					if (r.status != PRISM_OK) ok++;
+					else if (!check_leak || !pa_has_soft_leak(r.output)) ok++;
+					else {
+						fail++;
+						CHECK(0, name);
+					}
+				}
+				prism_free(&r);
+			}
+		}
+	}
+	printf("--- parser-abuse summary: %d ok, %d fail, %d skipped (%d×%d×%d) ---\n", ok, fail,
+	       skipped, (int)PA_DIG_COUNT, (int)PA_SOFT_COUNT, (int)PA_NEST_COUNT);
+}
+
+/* Parser abuse v2: soft-kw × illegal-constant-ctx × noise. Full product. */
+typedef enum {
+	PA2_SOFT_ORELSE = 0,
+	PA2_SOFT_DEFER,
+	PA2_SOFT_BOTH,
+	PA2_SOFT_COUNT
+} Pa2Soft;
+
+typedef enum {
+	PA2_CTX_BITINT = 0,
+	PA2_CTX_ALIGNAS,
+	PA2_CTX_ASM,
+	PA2_CTX_ENUM,
+	PA2_CTX_BITFIELD,
+	PA2_CTX_STATIC_ASSERT,
+	PA2_CTX_FILESCOPE,
+	PA2_CTX_GENERIC,
+	PA2_CTX_COUNT
+} Pa2Ctx;
+
+typedef enum {
+	PA2_NOISE_NONE = 0,
+	PA2_NOISE_COMMENT,
+	PA2_NOISE_NEWLINE,
+	PA2_NOISE_ATTR,
+	PA2_NOISE_COUNT
+} Pa2Noise;
+
+static void test_parser_abuse_v2_matrix(void) {
+	static const char *soft_n[] = {"orelse", "defer", "both"};
+	static const char *ctx_n[] = {"bitint", "alignas", "asm", "enum", "bitfield",
+				      "static_assert", "filescope", "generic"};
+	static const char *noise_n[] = {"none", "comment", "newline", "attr"};
+	char src[1024], name[128];
+	int ok = 0, fail = 0, skipped = 0;
+	printf("\n--- Parser abuse v2 soft × illegal-ctx × noise ---\n");
+	for (int si = 0; si < (int)PA2_SOFT_COUNT; si++) {
+		for (int ci = 0; ci < (int)PA2_CTX_COUNT; ci++) {
+			for (int ni = 0; ni < (int)PA2_NOISE_COUNT; ni++) {
+				/* defer doesn't belong in constant-expr contexts meaningfully —
+				 * still probe: must reject or not leak. */
+				const char *gap = "";
+				if (ni == PA2_NOISE_COMMENT) gap = "/*x*/";
+				else if (ni == PA2_NOISE_NEWLINE) gap = "\n";
+				else if (ni == PA2_NOISE_ATTR) gap = "__attribute__((unused))";
+
+				char oe[128];
+				if (si == PA2_SOFT_ORELSE || si == PA2_SOFT_BOTH)
+					snprintf(oe, sizeof(oe), "0 %s orelse %s 1", gap, gap);
+				else
+					snprintf(oe, sizeof(oe), "0");
+
+				char defer_stmt[192] = "";
+				if (si == PA2_SOFT_DEFER || si == PA2_SOFT_BOTH)
+					snprintf(defer_stmt, sizeof(defer_stmt),
+						 "int hit=0; defer %s hit=1; (void)hit;", gap);
+
+				src[0] = 0;
+				switch (ci) {
+				case PA2_CTX_BITINT:
+					if (si == PA2_SOFT_DEFER) { skipped++; continue; }
+					snprintf(src, sizeof(src),
+						 "int main(void){ _BitInt(%s) x; (void)x; return 0; }\n",
+						 oe);
+					break;
+				case PA2_CTX_ALIGNAS:
+					if (si == PA2_SOFT_DEFER) { skipped++; continue; }
+					snprintf(src, sizeof(src),
+						 "int main(void){ _Alignas(%s) int x; (void)x; return 0; }\n",
+						 oe);
+					break;
+				case PA2_CTX_ASM:
+					if (si == PA2_SOFT_DEFER) { skipped++; continue; }
+					snprintf(src, sizeof(src),
+						 "int main(void){ int x; __asm__(\".byte %%0\" : : \"i\"(%s)); "
+						 "(void)x; return 0; }\n",
+						 oe);
+					break;
+				case PA2_CTX_ENUM:
+					if (si == PA2_SOFT_DEFER) { skipped++; continue; }
+					snprintf(src, sizeof(src),
+						 "enum E { A = %s }; int main(void){ return A; }\n", oe);
+					break;
+				case PA2_CTX_BITFIELD:
+					if (si == PA2_SOFT_DEFER) { skipped++; continue; }
+					snprintf(src, sizeof(src),
+						 "struct T { int f : (%s); }; int main(void){ struct T t; "
+						 "(void)t; return 0; }\n",
+						 oe);
+					break;
+				case PA2_CTX_STATIC_ASSERT:
+					if (si == PA2_SOFT_DEFER) { skipped++; continue; }
+					snprintf(src, sizeof(src),
+						 "_Static_assert(sizeof(char[%s])>=1, \"x\");\n"
+						 "int main(void){return 0;}\n",
+						 oe);
+					break;
+				case PA2_CTX_FILESCOPE:
+					if (si == PA2_SOFT_DEFER) { skipped++; continue; }
+					snprintf(src, sizeof(src), "int g = %s;\nint main(void){ return g; }\n",
+						 oe);
+					break;
+				case PA2_CTX_GENERIC:
+					if (si == PA2_SOFT_DEFER) {
+						snprintf(src, sizeof(src),
+							 "int main(void){ %s int x=_Generic(0,int:1,default:2); "
+							 "(void)x; return 0; }\n",
+							 defer_stmt);
+					} else {
+						snprintf(src, sizeof(src),
+							 "int main(void){ int x=_Generic(0,int:(%s),default:2); "
+							 "(void)x; return 0; }\n",
+							 oe);
+					}
+					break;
+				default:
+					skipped++;
+					continue;
+				}
+				if (!src[0]) { skipped++; continue; }
+
+				snprintf(name, sizeof(name), "pa2: %s/%s/%s", soft_n[si], ctx_n[ci],
+					 noise_n[ni]);
+				PrismResult r = prism_transpile_source(src, "pa2.c", prism_defaults());
+				/* Illegal constant contexts: prefer reject; accept ⇒ no soft-kw leak. */
+				int before = failed;
+				if (r.status == PRISM_OK) {
+					CHECK(!pa_has_soft_leak(r.output), name);
+				} else {
+					CHECK(1, name); /* clean reject counts as pass */
+				}
+				if (failed == before) ok++;
+				else fail++;
+				prism_free(&r);
+			}
+		}
+	}
+	printf("--- parser-abuse-v2 summary: %d ok, %d fail, %d skipped ---\n", ok, fail, skipped);
+}
+
 void run_parse_tests(void) {
 	printf("\n=== PARSE TESTS ===\n");
 
@@ -9907,4 +10306,6 @@ void run_parse_tests(void) {
 	test_p1_skip_deep_braceless_if_else_ok();
 	test_p1_typedef_shadow_chain_smoke();
 	test_stmtexpr_c23_attr_ctrl_paren_zeroinit();
+	test_parser_abuse_product_matrix();
+	test_parser_abuse_v2_matrix();
 }

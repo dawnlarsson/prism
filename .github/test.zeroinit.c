@@ -5463,7 +5463,11 @@ static void test_cfg_switch_bypass_initialized_decl_fno_zeroinit(void) {
 }
 
 static void test_braceless_defer_decl_p1_decl_ann(void) {
-	printf("\n--- braceless defer decl P1_IS_DECL zeroinit ---\n");
+	printf("\n--- braceless defer decl rejected (mis-scan safety) ---\n");
+	/* A declaration as a braceless defer body is a constraint violation: the
+	 * deferred-range emission overshoots the body's ';' and duplicates every
+	 * following statement into the paste (a silent miscompile the contexts/
+	 * insertion fixed-point oracle exposed).  The braced form is required. */
 	PrismResult r = prism_transpile_source(
 	    "void g(void) {\n"
 	    "    defer int t;\n"
@@ -5471,10 +5475,23 @@ static void test_braceless_defer_decl_p1_decl_ann(void) {
 	    "}\n",
 	    "defer_brzi.c",
 	    prism_defaults());
-	CHECK_EQ(r.status, PRISM_OK, "braceless defer decl: transpile OK");
-	CHECK(r.output && strstr(r.output, "int t = 0"),
-	      "braceless defer: int t gains zero-init");
+	CHECK(r.status != PRISM_OK, "braceless defer decl: rejected (was silent mis-scan)");
+	if (r.error_msg)
+		CHECK(strstr(r.error_msg, "braces") != NULL,
+		      "braceless defer decl: error suggests braces");
 	prism_free(&r);
+
+	/* The braced form lowers correctly and zero-inits the object. */
+	PrismResult rb = prism_transpile_source(
+	    "void g(void) {\n"
+	    "    defer { int t; (void)t; }\n"
+	    "}\n",
+	    "defer_brzi_ok.c",
+	    prism_defaults());
+	CHECK_EQ(rb.status, PRISM_OK, "braced defer decl: transpile OK");
+	CHECK(rb.output && strstr(rb.output, "int t = 0"),
+	      "braced defer decl: int t gains zero-init");
+	prism_free(&rb);
 }
 
 static void test_typeof_paren_inline_volatile_member(void) {

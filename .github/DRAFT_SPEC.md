@@ -6,15 +6,15 @@
 
 ## 1. Defer 2.0: Channels & Goto-Patch Emission
 
-**This is not a separate flag — it's the next evolution of `-fdefer`.**
+**This is not a separate flag. It's the next evolution of `-fdefer`.**
 
 ### Problem 1: Error-path vs success-path cleanup
 
-The most common `goto cleanup` pattern in C isn't "undo everything" — it's "undo on error, keep on success." A function allocates resources progressively, and on failure it must release the ones already acquired, but on success it returns ownership to the caller. Current `defer` fires on ALL exit paths — there's no way to say "only on error."
+The most common `goto cleanup` pattern in C isn't "undo everything"; it's "undo on error, keep on success." A function allocates resources progressively, and on failure it must release the ones already acquired, but on success it returns ownership to the caller. Current `defer` fires on ALL exit paths. There's no way to say "only on error."
 
 ### Problem 2: Inline emission bloats hot paths
 
-Current defer inlines the cleanup body at every `return`/`goto`/`break`/scope-exit site. With 5 defers and 10 returns, that's 50 inlined cleanup statements — cold code polluting the hot path, bloating the instruction cache, and inflating binary size.
+Current defer inlines the cleanup body at every `return`/`goto`/`break`/scope-exit site. With 5 defers and 10 returns, that's 50 inlined cleanup statements, cold code polluting the hot path, bloating the instruction cache, and inflating binary size.
 
 ```c
 // Current emission — cleanup duplicated at every exit:
@@ -25,7 +25,7 @@ if (worse) { free(buf); fclose(f); return -2; }   // inlined again
 
 ### Solution: Layered goto-patch at end of function
 
-Defer 2.0 changes the emission strategy. Instead of inlining cleanup at every exit point, each exit becomes a single `goto` into a layered cleanup chain at the bottom of the function. This is exactly the pattern that expert kernel developers write by hand — Prism automates it.
+Defer 2.0 changes the emission strategy. Instead of inlining cleanup at every exit point, each exit becomes a single `goto` into a layered cleanup chain at the bottom of the function. This is exactly the pattern that expert kernel developers write by hand. Prism automates it.
 
 ### Syntax
 
@@ -40,7 +40,7 @@ Defer 2.0 changes the emission strategy. Instead of inlining cleanup at every ex
 | `defer_flush;` | Fire and consume all active always-defers now (inlined) |
 | `defer_flush(name);` | Fire and consume all active `name`-channel defers now (inlined) |
 
-The colon in `return(name:)` disambiguates from `return(expr)`. The tokenizer sees `return` + `(` + identifier + `:` + `)` — unambiguous, no conflict with standard C.
+The colon in `return(name:)` disambiguates from `return(expr)`. The tokenizer sees `return` + `(` + identifier + `:` + `)`, unambiguous, no conflict with standard C.
 
 ### Example: source
 
@@ -85,11 +85,11 @@ __prism_defer_1:            // always-defer entry point
 
 ### What this achieves
 
-**Hot path optimization:** The `if (!f)` and `if (bad)` branches contain a single `goto` — no cleanup code. The branch predictor marks them as not-taken. The instruction cache stays warm on the success path.
+**Hot path optimization:** The `if (!f)` and `if (bad)` branches contain a single `goto`, no cleanup code. The branch predictor marks them as not-taken. The instruction cache stays warm on the success path.
 
 **Cold code consolidation:** All cleanup lives in one place at the end of the function. Binary size drops because cleanup statements appear once, not once per exit point.
 
-**Natural channel layering:** The goto-patch is a cascade — error-channel defers sit above always-defers. A `return(err:)` enters at the top (fires both), a plain `return` enters below (fires only always-defers). No flag variables, no conditionals in the cleanup chain.
+**Natural channel layering:** The goto-patch is a cascade: error-channel defers sit above always-defers. A `return(err:)` enters at the top (fires both), a plain `return` enters below (fires only always-defers). No flag variables, no conditionals in the cleanup chain.
 
 ### Emission rules
 
@@ -116,7 +116,7 @@ __prism_defer_1:            // always-defer entry point
 
 ### Backward compatibility
 
-Existing `defer` code with no channels works identically — just with better emission. `defer` in 2.0 defaults to goto-patch. To get the old inline behavior, use `defer_inline`. The return value of every exit path is unchanged.
+Existing `defer` code with no channels works identically, just with better emission. `defer` in 2.0 defaults to goto-patch. To get the old inline behavior, use `defer_inline`. The return value of every exit path is unchanged.
 
 ### Emission strategy summary
 
@@ -129,7 +129,7 @@ Existing `defer` code with no channels works identically — just with better em
 
 ### `defer_inline`: Inlined at exit points
 
-The goto-patch model trades a `goto` + label round-trip for code deduplication. For tiny cleanup statements, the `goto` overhead is worse than just inlining the statement. `defer_inline` opts into the old emission model — cleanup is duplicated at every exit point.
+The goto-patch model trades a `goto` + label round-trip for code deduplication. For tiny cleanup statements, the `goto` overhead is worse than just inlining the statement. `defer_inline` opts into the old emission model: cleanup is duplicated at every exit point.
 
 ```c
 void locked_operation(mutex_t *m) {
@@ -143,18 +143,18 @@ void locked_operation(mutex_t *m) {
 ```
 
 **When to use `defer_inline` vs `defer`:**
-- `defer_inline` — single-expression cleanup (unlock, flag clear, counter decrement)
-- `defer` — multi-statement cleanup, function calls, anything that bloats if duplicated
+- `defer_inline`: single-expression cleanup (unlock, flag clear, counter decrement)
+- `defer`: multi-statement cleanup, function calls, anything that bloats if duplicated
 
 `defer_inline` supports channels: `defer_inline(err) flags &= ~IN_PROGRESS;`
 
-The choice is purely an emission optimization — semantics are identical to `defer`.
+The choice is purely an emission optimization: semantics are identical to `defer`.
 
 ### `defer_flush`: Explicit fire-and-consume
 
-Sometimes you need to fire defers without returning — mid-function cleanup, resource recycling, or transitioning between phases. `defer_flush` fires and consumes pending defers at any point in the function body.
+Sometimes you need to fire defers without returning: mid-function cleanup, resource recycling, or transitioning between phases. `defer_flush` fires and consumes pending defers at any point in the function body.
 
-`defer_flush` is always **inlined at the call site** (not goto-patched). The developer explicitly asked to run cleanup here — this is wanted hot-path work, not cold error handling. Inlining keeps the end-of-function goto-patch clean and one-directional.
+`defer_flush` is always **inlined at the call site** (not goto-patched). The developer explicitly asked to run cleanup here. This is wanted hot-path work, not cold error handling. Inlining keeps the end-of-function goto-patch clean and one-directional.
 
 #### Syntax
 
@@ -225,34 +225,34 @@ process(f, buf);
 // defers consumed — return has nothing to fire
 ```
 
-No goto, no labels, no resume point. The cleanup is inlined directly because the developer explicitly requested it. The end-of-function goto-patch stays clean — only `return`-triggered defers generate goto jumps.
+No goto, no labels, no resume point. The cleanup is inlined directly because the developer explicitly requested it. The end-of-function goto-patch stays clean: only `return`-triggered defers generate goto jumps.
 
 #### Semantics
 
 1. **Consume model:** Fired defers are removed. Subsequent `return` only fires defers registered *after* the `defer_flush` call.
-2. **LIFO order:** Same as normal defer — most recently registered fires first.
+2. **LIFO order:** Same as normal defer: most recently registered fires first.
 3. **Scope-aware:** `defer_flush` only fires defers in the current scope and its parents, same as a `return` would.
-4. **Channel-specific:** `defer_flush(name)` fires only defers tagged with `name`. Always-defers are NOT fired by `defer_flush(name)` — only `defer_flush` (no argument) fires always-defers.
+4. **Channel-specific:** `defer_flush(name)` fires only defers tagged with `name`. Always-defers are NOT fired by `defer_flush(name)`: only `defer_flush` (no argument) fires always-defers.
 5. **No-op safety:** `defer_flush` with no pending defers is a no-op (no error, no warning).
 6. **Cannot appear in defer bodies:** `defer_flush` inside a `defer` body is a compile-time error (prevents infinite recursion in the cleanup chain).
 
 #### Why `defer_flush` inlines and `return` goto-patches
 
-`return`-triggered defers are almost always error paths — cold code that shouldn't pollute the icache. The goto-patch keeps them out of the hot path.
+`return`-triggered defers are almost always error paths, cold code that shouldn't pollute the icache. The goto-patch keeps them out of the hot path.
 
-`defer_flush` is an explicit developer action — "I want cleanup to happen here, now." This is hot-path code by intent. Inlining it avoids the goto round-trip overhead and keeps the end-of-function cleanup patch purely one-directional (no backward jumps to resume points).
+`defer_flush` is an explicit developer action: "I want cleanup to happen here, now." This is hot-path code by intent. Inlining it avoids the goto round-trip overhead and keeps the end-of-function cleanup patch purely one-directional (no backward jumps to resume points).
 
 #### Why not just use a `{ }` scope?
 
 Scoped defers already fire at `}`. But scope-based cleanup has two problems:
 - It forces you to nest code inside extra `{ }` blocks, increasing indentation depth
-- You can't selectively fire a channel — scope exit fires ALL defers in that scope
+- You can't selectively fire a channel: scope exit fires ALL defers in that scope
 
 `defer_flush` gives explicit, flat, channel-aware control.
 
 ### Open questions
 
-**Interleaved channel ordering:** When `defer` and `defer(err)` interleave, do error-channel defers fire in strict LIFO relative to all defers (preserving declaration order), or do they form a separate LIFO chain? The interleaved model is correct for resource cleanup (resources depend on allocation order), but the goto-patch cascade becomes more complex — it may require a conditional flag per entry rather than a simple label cascade.
+**Interleaved channel ordering:** When `defer` and `defer(err)` interleave, do error-channel defers fire in strict LIFO relative to all defers (preserving declaration order), or do they form a separate LIFO chain? The interleaved model is correct for resource cleanup (resources depend on allocation order), but the goto-patch cascade becomes more complex: it may require a conditional flag per entry rather than a simple label cascade.
 
 **Scope-exit defers:** Current defer emits cleanup at `}` for nested scopes. The goto-patch model works naturally for function-level returns but scope-exit defers (not `return`, just leaving a `{ }`) may still need inline emission or a per-scope sub-patch.
 
@@ -262,7 +262,7 @@ Scoped defers already fire at `}`. But scope-based cleanup has two problems:
 
 ## 2. Taint Qualifiers (`-ftaint`)
 
-**Problem:** Direct dereference of untrusted pointers is a systemic bug class across C codebases — not just the Linux kernel (`__user`), but network daemons (recv buffers), embedded systems (MMIO registers), database engines (mmap'd pages), sandboxes (guest memory), and IPC (shared memory). Today, catching these requires either a separate static analysis tool (Sparse) or runtime instrumentation (ASAN). Most projects use neither.
+**Problem:** Direct dereference of untrusted pointers is a systemic bug class across C codebases: not just the Linux kernel (`__user`), but network daemons (recv buffers), embedded systems (MMIO registers), database engines (mmap'd pages), sandboxes (guest memory), and IPC (shared memory). Today, catching these requires either a separate static analysis tool (Sparse) or runtime instrumentation (ASAN). Most projects use neither.
 
 **Design:** User-defined taint qualifiers via pragma, with compile-time enforcement of dereference safety.
 
@@ -312,7 +312,7 @@ untrusted char *q = buf;     // OK: taint preserved
 safe_copy(local, buf, len);  // OK: passed as function argument (boundary crossing)
 ```
 
-The assignment `char *p = buf;` is the error — not the later `*p`. This eliminates the aliasing bypass (developer strips annotation and checker goes blind) without requiring any branch or dataflow analysis.
+The assignment `char *p = buf;` is the error, not the later `*p`. This eliminates the aliasing bypass (developer strips annotation and checker goes blind) without requiring any branch or dataflow analysis.
 
 ### What about branches?
 
@@ -330,7 +330,7 @@ No CFG needed. The error fires at the assignment site, not the dereference site.
 Pure lexical enforcement within a function body. Does NOT track through:
 - Function return values
 - Cross-translation-unit propagation  
-- `void *` casts (explicit unsafe boundary — developer's responsibility)
+- `void *` casts (explicit unsafe boundary, developer's responsibility)
 
 This is a **syntactic taint linter**, not a provenance tracker.
 
@@ -344,9 +344,9 @@ The taint qualifier is stripped from emitted C. Optionally emitted as:
 
 Extends existing infrastructure:
 - Variable scanning: typedef table already tracks declarations per-scope with taint flags
-- Taint check: same pattern as noreturn taint tracking — tag at declaration, check at use
+- Taint check: same pattern as noreturn taint tracking: tag at declaration, check at use
 - Dereference detection: `*ident`, `ident[`, `ident->` are trivial token patterns
-- Assignment check: declaration scanner already sees `type *name = expr` — check if expr is tainted and type is not
+- Assignment check: declaration scanner already sees `type *name = expr`: check if expr is tainted and type is not
 
 ### Real-world applicability
 
@@ -397,7 +397,7 @@ Auto-hoisting into temps (via statement expressions or pre-statement declaration
 
 ### Namespace collision
 
-If the source already `#define`s `min`/`max`/`clamp`, Prism defers to the user's macro (same as `defer`/`orelse` — check typedef table, skip if user-defined).
+If the source already `#define`s `min`/`max`/`clamp`, Prism defers to the user's macro (same as `defer`/`orelse`: check typedef table, skip if user-defined).
 
 ---
 
@@ -419,13 +419,13 @@ If the source already `#define`s `min`/`max`/`clamp`, Prism defers to the user's
 
 ### Status: Low priority
 
-Prism already handles `_Noreturn` / `[[noreturn]]` / `__attribute__((noreturn))` / `__declspec(noreturn)` for its own noreturn analysis. Generalizing to all attributes is straightforward but low impact — the `#ifdef` boilerplate is annoying but not dangerous.
+Prism already handles `_Noreturn` / `[[noreturn]]` / `__attribute__((noreturn))` / `__declspec(noreturn)` for its own noreturn analysis. Generalizing to all attributes is straightforward but low impact: the `#ifdef` boilerplate is annoying but not dangerous.
 
 ---
 
 ## 5. `sizeof` Array Parameter Decay Check (`-fsizeof-decay`)
 
-**Problem:** When an array is passed as a function parameter, it decays to a pointer. `sizeof(arr)` then returns the pointer size, not the array size — a silent, catastrophic bug that every C beginner hits and many experienced developers still miss. GCC has `-Wsizeof-array-argument` but it's not in `-Wall`.
+**Problem:** When an array is passed as a function parameter, it decays to a pointer. `sizeof(arr)` then returns the pointer size, not the array size, a silent, catastrophic bug that every C beginner hits and many experienced developers still miss. GCC has `-Wsizeof-array-argument` but it's not in `-Wall`.
 
 **Design:** Hard error when `sizeof` is applied to a parameter that was declared with array syntax.
 
@@ -451,8 +451,8 @@ void ok(int *arr, size_t n) {
    error: sizeof() on array parameter 'arr' returns pointer size, not array size;
           use an explicit size parameter instead
    ```
-3. `sizeof(arr[0])` (element size) is allowed — the subscript dereference produces the element type, not the array
-4. `sizeof(*arr)` is allowed — same reason
+3. `sizeof(arr[0])` (element size) is allowed: the subscript dereference produces the element type, not the array
+4. `sizeof(*arr)` is allowed, same reason
 
 ### Architecture fit
 
@@ -462,7 +462,7 @@ void ok(int *arr, size_t n) {
 
 ### Why this matters
 
-This is possibly the most common C bug that compilers don't warn about loudly enough. Stack Overflow has thousands of questions about it. It causes buffer overflows, truncated reads, and wrong-size allocations — all silently.
+This is possibly the most common C bug that compilers don't warn about loudly enough. Stack Overflow has thousands of questions about it. It causes buffer overflows, truncated reads, and wrong-size allocations, all silently.
 
 ---
 
@@ -490,7 +490,7 @@ error: braceless control flow is forbidden (-fmandate-braces);
 ### Exceptions
 
 - `else if` chains: `else if (x) {` is allowed (the `if` immediately follows `else`)
-- Single-line macros that expand to `{ ... }` aren't visible post-preprocessing — but the flag is opt-in, so projects that hit false positives from macros can disable it
+- Single-line macros that expand to `{ ... }` aren't visible post-preprocessing, but the flag is opt-in, so projects that hit false positives from macros can disable it
 
 ### Architecture fit
 
@@ -500,7 +500,7 @@ error: braceless control flow is forbidden (-fmandate-braces);
 
 ## 7. Strict Implicit Fallthrough Ban (`-fno-fallthrough`)
 
-**Problem:** Missing `break` in `switch` cases causes silent execution bleed-through. This is one of the most common C bugs — CWE-484 (Omitted Break Statement in Switch). GCC/Clang have `-Wimplicit-fallthrough` but it's not universally in `-Wall`, and MSVC lacks it entirely.
+**Problem:** Missing `break` in `switch` cases causes silent execution bleed-through. This is one of the most common C bugs, CWE-484 (Omitted Break Statement in Switch). GCC/Clang have `-Wimplicit-fallthrough` but it's not universally in `-Wall`, and MSVC lacks it entirely.
 
 ```c
 switch (state) {
@@ -558,7 +558,7 @@ Phase 1D tracks case/default positions. The backward scan for terminators is the
 
 ## 8. Forward-Only `goto` Enforcement (`-fstrict-goto`)
 
-**Problem:** Backward `goto` creates unstructured loops that defeat human comprehension, static analysis, and code review. In modern C, `goto` is considered acceptable only for forward jumps to cleanup labels. Backward `goto` is spaghetti code — use a real loop construct.
+**Problem:** Backward `goto` creates unstructured loops that defeat human comprehension, static analysis, and code review. In modern C, `goto` is considered acceptable only for forward jumps to cleanup labels. Backward `goto` is spaghetti code. Use a real loop construct.
 
 ```c
 retry:
@@ -593,17 +593,17 @@ cleanup:
 
 ### Architecture fit
 
-Zero new scanning logic required. The label direction check already exists in `p1_verify_cfg` for VLA scope validation. The flag simply converts a "this is a backward goto" fact that Prism already knows into a hard error.
+Zero new scanning logic required. The label direction check already exists in `p1_verify_cfg` for VLA scope validation. The flag converts a "this is a backward goto" fact that Prism already knows into a hard error.
 
 ---
 
-## 10. Bounds Checking — Future Tiers
+## 10. Bounds Checking: Future Tiers
 
 Tiers 1 and 2 (fixed-size local arrays and VLAs) have shipped as `-fbounds-check`; see **SPEC.md §6.10**. The remaining work is tracked here.
 
 ### Tier 3: Function parameters (annotation)
 
-Array parameters decay to pointers — the size is lost. The developer annotates the bound:
+Array parameters decay to pointers: the size is lost. The developer annotates the bound:
 
 ```c
 // Source:
@@ -621,7 +621,7 @@ void fill(int *arr, size_t n) {
 }
 ```
 
-The `bounds(expr)` annotation lives inside the array brackets — valid declarator position, stripped from emitted C. The `expr` is any expression visible at the function scope (typically a size parameter).
+The `bounds(expr)` annotation lives inside the array brackets, valid declarator position, stripped from emitted C. The `expr` is any expression visible at the function scope (typically a size parameter).
 
 C99 `[static N]` is also recognized for constant bounds:
 ```c
@@ -652,17 +652,17 @@ Registration happens in `process_declarators` when a parameter has `bounds(...)`
 - **Inner dimensions of multi-dim subscripts:** `m[i][j]` currently only checks the outer `i`. Inner `j` is not wrapped because `last_emitted` at the inner `[` is `]`, not an identifier. A future pass could re-walk the preceding subscript chain to derive the inner dimension's `sizeof` ratio.
 - **Pointer arithmetic:** `*(arr + i)` → check `i` against arr's bounds. Requires recognizing `arr + expr` as a bounds-relevant pattern.
 - **Struct field arrays via pointer:** `p->data[i]` where `p` is a pointer to a struct with a known-size `data` field. Requires struct definition scanning. Local struct instances (`pkt.data[i]`) are already covered once Tier 1 is extended to follow struct-member access.
-- **Return value annotation:** `int *get_buffer(size_t *out_len) bounds(*out_len)` — annotate that the returned pointer has bounds tied to an output parameter.
+- **Return value annotation:** `int *get_buffer(size_t *out_len) bounds(*out_len)`, annotate that the returned pointer has bounds tied to an output parameter.
 - **Propagated bounds:** When `int *p = arr;` is detected, carry arr's bounds to `p` within the same scope. Limited dataflow, but catches the most common alias pattern.
 
 ### Why not `slice(T)` fat pointers?
 
-An alternative design (inspired by Rust's `&[T]`) would introduce a `slice(T)` type that bundles a pointer with its length — a "fat pointer" that carries bounds across function boundaries.
+An alternative design (inspired by Rust's `&[T]`) would introduce a `slice(T)` type that bundles a pointer with its length, a "fat pointer" that carries bounds across function boundaries.
 
 This is a non-starter for Prism:
 - **ABI break:** `slice(int)` is a struct, not an `int *`. Every function signature changes. Every existing C API needs a wrapper.
 - **New type system:** Slice types need their own rules for assignment, comparison, arithmetic. Prism is a transpiler, not a language.
-- **Conversion ceremony:** Every interaction with legacy code requires explicit `slice_from(ptr, len)` / `slice_ptr(s)` conversion — the exact ceremony Rust developers complain about.
+- **Conversion ceremony:** Every interaction with legacy code requires explicit `slice_from(ptr, len)` / `slice_ptr(s)` conversion, the exact ceremony Rust developers complain about.
 
 The `bounds(n)` annotation is superior: the function signature stays `int *arr` in emitted C. The ABI doesn't change. Existing C code calls the function without modification. Only the function body gets bounds checks injected.
 
@@ -670,7 +670,7 @@ The `bounds(n)` annotation is superior: the function signature stays `int *arr` 
 
 ## 12. Orelse Postcondition Injection
 
-**Problem:** After `int *p = malloc(100) orelse default_buf;`, the developer knows `p` is guaranteed non-null (orelse provides a fallback). But the backend compiler doesn't — it sees a ternary expression and can't prove the result is non-null. Every subsequent `if (!p)` check and null-pointer sanitizer branch is wasted.
+**Problem:** After `int *p = malloc(100) orelse default_buf;`, the developer knows `p` is guaranteed non-null (orelse provides a fallback). But the backend compiler doesn't. It sees a ternary expression and can't prove the result is non-null. Every subsequent `if (!p)` check and null-pointer sanitizer branch is wasted.
 
 **Design:** After orelse expansion, inject `__builtin_assume(result != 0)` to communicate the postcondition to the backend.
 
@@ -694,7 +694,7 @@ __builtin_assume(p != ((void*)0));
 
 - All subsequent `if (p == NULL)` checks in the same scope are dead-code-eliminated
 - Null-pointer sanitizer instrumentation on `*p` is removed
-- The compiler can avoid null-check register pressure — it knows `p` is live and valid
+- The compiler can avoid null-check register pressure: it knows `p` is live and valid
 
 ### Scope
 
@@ -707,20 +707,20 @@ Skip injection when the fallback could itself be null/zero (e.g., `orelse other_
 
 ### Why only Prism can do this
 
-The compiler sees a ternary — it doesn't know the developer's intent was "guarantee a valid fallback." Prism understands the `orelse` contract: "if the LHS evaluates to a falsy value, substitute the RHS." If the RHS is a non-zero constant or known-valid address, the result is guaranteed non-zero.
+The compiler sees a ternary: it doesn't know the developer's intent was "guarantee a valid fallback." Prism understands the `orelse` contract: "if the LHS evaluates to a falsy value, substitute the RHS." If the RHS is a non-zero constant or known-valid address, the result is guaranteed non-zero.
 
 ### Architecture fit
 
 - Orelse expansion already happens in Pass 2
 - The postcondition is emitted immediately after the declaration, same emit point
-- `__builtin_assume` is GCC/Clang; MSVC uses `__assume` — Prism already handles this split
+- `__builtin_assume` is GCC/Clang; MSVC uses `__assume`, Prism already handles this split
 - Zero overhead: `__builtin_assume` generates no code, it's purely an optimizer hint
 
 ---
 
 ## 13. Const-to-Literal VLA Demotion
 
-**Problem:** In C (unlike C++), `const int N = 10;` does not create a constant expression — `N` is a variable with a `const` qualifier. Using it as an array dimension creates a VLA, which forces the compiler to dedicate the frame pointer register, emit `alloca`-style allocation, and generate VLA cleanup code. This is a well-known C/C++ gap that bites every C developer who writes:
+**Problem:** In C (unlike C++), `const int N = 10;` does not create a constant expression: `N` is a variable with a `const` qualifier. Using it as an array dimension creates a VLA, which forces the compiler to dedicate the frame pointer register, emit `alloca`-style allocation, and generate VLA cleanup code. This is a well-known C/C++ gap that bites every C developer who writes:
 
 ```c
 void process(void) {
@@ -766,16 +766,16 @@ On match: substitute the `TK_NUM` value for the `TK_IDENT` in the dimension.
 
 ### Edge cases
 
-- `const int N = sizeof(something);` — NOT demoted (`sizeof` is a compile-time constant but involves a non-literal expression; the compiler handles this fine)
-- `const int N = 10 + 5;` — NOT demoted (expression, not a single literal). Conservative is correct.
-- `const int N = -1;` — NOT demoted (negative array size is a constraint violation)
-- `const int N = 0;` — NOT demoted (zero-length array is a constraint violation or GNU extension)
-- `static const int N = 10;` — NOT demoted (static storage is visible across the TU; technically safe but overly broad)
+- `const int N = sizeof(something);`: NOT demoted (`sizeof` is a compile-time constant but involves a non-literal expression; the compiler handles this fine)
+- `const int N = 10 + 5;`: NOT demoted (expression, not a single literal). Conservative is correct.
+- `const int N = -1;`: NOT demoted (negative array size is a constraint violation)
+- `const int N = 0;`: NOT demoted (zero-length array is a constraint violation or GNU extension)
+- `static const int N = 10;`: NOT demoted (static storage is visible across the TU; technically safe but overly broad)
 
 ### Architecture fit
 
 - The typedef table already tracks `is_const` for local declarations
-- `array_size_is_vla` already identifies the dimension token — if it's a single `TK_IDENT`, look it up
+- `array_size_is_vla` already identifies the dimension token: if it's a single `TK_IDENT`, look it up
 - The substitution is a single token replacement in the emit loop
 - Conservative rules ensure zero false positives
 
@@ -856,7 +856,7 @@ Core Directives Maintained
 This respects Prism's core architectural constraint: We do not parse expressions. Prism doesn't need an x86 opcode table. It treats the assembly exactly as it treats C: as raw tokens to be macro-structurally reorganized and forwarded to the appropriate backend tool.
 
 Impact
-The developer gets the absolute raw power and zero-overhead of bare-metal Intel assembly, but the developer experience is as seamless as writing a standard C function in a single file.
+The developer gets the absolute raw power and zero-overhead of bare-metal Intel assembly, but the developer experience is as smooth as writing a standard C function in a single file.
 
 No .h header files to keep in sync.
 
@@ -870,7 +870,7 @@ The agonizing assembler directive fragmentation (.globl vs PUBLIC, .text vs .cod
 | Feature | Bug severity | Arch fit | Effort | Priority |
 |---|---|---|---|---|
 | Defer 2.0 (channels + goto-patch) | High (resource leaks + icache bloat) | High (extends existing defer infra) | Medium | **1** |
-| Bounds checking | ~~Critical~~ | ~~High~~ | ~~Medium~~ | **DONE** (v1 — SPEC §6.10; future tiers below) |
+| Bounds checking | ~~Critical~~ | ~~High~~ | ~~Medium~~ | **DONE** (v1, SPEC §6.10; future tiers below) |
 | Taint qualifiers | Critical (security) | High (extends existing taint infra) | Medium | **3** |
 | min/max/clamp | Medium (double-eval bugs) | High (reuses orelse scanner) | Low | **4** |
 | sizeof decay check | Medium (silent wrong results) | High (trivial token pattern) | Very low | **5** |

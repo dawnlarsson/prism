@@ -227,7 +227,7 @@ def emit_ref(n, c, scopes, loops):
         c.w('for (int i%d = 0; i%d < %d; i%d++) {' % (c.ind, c.ind, n[1], c.ind))
         c.ind += 1
         scopes.append([])
-        loops.append(len(scopes) - 1)
+        loops.append(('loop', len(scopes) - 1))
         for x in n[2]:
             emit_ref(x, c, scopes, loops)
         close_scope()
@@ -245,7 +245,7 @@ def emit_ref(n, c, scopes, loops):
             c.w('do {')
         c.ind += 1
         scopes.append([])
-        loops.append(len(scopes) - 1)
+        loops.append(('loop', len(scopes) - 1))
         c.w('w%d++;' % (c.ind - 1))
         for x in n[2]:
             emit_ref(x, c, scopes, loops)
@@ -260,22 +260,27 @@ def emit_ref(n, c, scopes, loops):
         c.ind -= 1
         c.w('}')
     elif k == 'switch':
+        # C break targets the nearest enclosing loop OR switch; each case
+        # scope joins the breakable stack as a 'switch' entry (continue
+        # still skips it and targets the nearest 'loop' entry).
         c.w('switch (sel %% %d) {' % len(n[1]))
         for ci, body in enumerate(n[1]):
             c.w('case %d: {' % ci)
             c.ind += 1
             scopes.append([])
+            loops.append(('switch', len(scopes) - 1))
             for x in body:
                 emit_ref(x, c, scopes, loops)
+            loops.pop()
             close_scope()
             c.ind -= 1
             c.w('} break;')
         c.w('}')
     elif k == 'brk':
-        release_scopes(loops[-1])
+        release_scopes(loops[-1][1])
         c.w('break;')
     elif k == 'cont':
-        release_scopes(loops[-1])
+        release_scopes(next(l[1] for l in reversed(loops) if l[0] == 'loop'))
         c.w('continue;')
     elif k == 'oe_decl':
         c.w('int %s = tv(%d, sel);' % (n[1], n[2]))
@@ -309,7 +314,7 @@ def emit_ref(n, c, scopes, loops):
         c.w('int %s = tv(%d, sel);' % (n[1], n[2]))
         c.w('if (!%s) {' % n[1])
         c.ind += 1
-        release_scopes(loops[-1])
+        release_scopes(loops[-1][1])
         c.w('break;')
         c.ind -= 1
         c.w('}')
@@ -318,7 +323,7 @@ def emit_ref(n, c, scopes, loops):
         c.w('int %s = tv(%d, sel);' % (n[1], n[2]))
         c.w('if (!%s) {' % n[1])
         c.ind += 1
-        release_scopes(loops[-1])
+        release_scopes(next(l[1] for l in reversed(loops) if l[0] == 'loop'))
         c.w('continue;')
         c.ind -= 1
         c.w('}')
@@ -633,6 +638,60 @@ for i in range(120):
     ids = [10]
     budget = [18]
     unit('storm %d' % i, rand_body(0, False, ids, budget, False) + [('ret', 'acc')])
+
+# ----------------------------------------------------- bounded-exhaustive tier
+# COMPLETE product: wrapper x outer-defer-count x inner-defer-count x exit
+# kind.  Unlike the seeded 'storm' units above (samples), this tier is
+# exhaustive over its grammar.  Justification for the bound (see
+# .github/defer_model.h and test.machine.c): defer_walk's transition coverage
+# saturates at scope depth 3 — every (exit-kind x scope-symbol x
+# has-defers) machine transition occurs within this product — so running
+# each cell end-to-end (parse -> emit -> execute vs. the independent
+# reference lowering, with LIFO/trace/return/eval-parity assertions) extends
+# the abstract-machine proof to the full concrete pipeline.
+EXH_WRAPPERS = ['none', 'block', 'for', 'while', 'do', 'switch']
+EXH_EXITS = ['end', 'ret', 'brk', 'cont', 'oe_decl', 'oe_ret', 'oe_brk', 'oe_cont']
+for exh_wrap in EXH_WRAPPERS:
+    for exh_nout in (0, 1, 2):
+        for exh_nin in (0, 1, 2):
+            for exh_ex in EXH_EXITS:
+                exh_loopy = exh_wrap in ('for', 'while', 'do')
+                exh_brky = exh_loopy or exh_wrap == 'switch'
+                if exh_ex in ('brk', 'oe_brk') and not exh_brky:
+                    continue
+                if exh_ex in ('cont', 'oe_cont') and not exh_loopy:
+                    continue
+                inner = [('defer', 10 + j) for j in range(exh_nin)]
+                if exh_ex == 'ret':
+                    inner.append(('if', 'sel == 1', [('ret', '77')], None))
+                elif exh_ex == 'brk':
+                    inner.append(('if', 'sel == 1', [('brk',)], None))
+                elif exh_ex == 'cont':
+                    inner.append(('if', 'sel == 1', [('cont',)], None))
+                elif exh_ex == 'oe_decl':
+                    inner.append(('oe_decl', vname(), fid(), 9))
+                elif exh_ex == 'oe_ret':
+                    inner.append(('oe_ret', vname(), fid(), -3))
+                elif exh_ex == 'oe_brk':
+                    inner.append(('oe_brk', vname(), fid()))
+                elif exh_ex == 'oe_cont':
+                    inner.append(('oe_cont', vname(), fid()))
+                if exh_wrap == 'none':
+                    mid = inner
+                elif exh_wrap == 'block':
+                    mid = [('block', inner)]
+                elif exh_wrap == 'for':
+                    mid = [('for', 2, inner)]
+                elif exh_wrap == 'while':
+                    mid = [('while', 2, inner)]
+                elif exh_wrap == 'do':
+                    mid = [('do', 2, inner)]
+                else:
+                    mid = [('switch', [inner, [('brk',)]])]
+                exh_body = [('defer', j + 1) for j in range(exh_nout)] + mid + \
+                           [('ret', 'acc')]
+                unit('exh %s o%d i%d %s' % (exh_wrap, exh_nout, exh_nin, exh_ex),
+                     exh_body)
 
 # ------------------------------------------------------------ misuse corpus
 # Every entry must be REJECTED pre-emit (status != PRISM_OK). Focused on

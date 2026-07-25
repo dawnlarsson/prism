@@ -321,6 +321,11 @@ static void check_transpiled_output_compiles_and_runs(const char *output,
 #include "test.spec.c"
 #include "test.bounds.c"
 #include "test.cert.c"
+#include "test.machine.c"
+#include "test.alphabet.c"
+#include "test.insertion.c"
+#include "test.contexts.c"
+#include "test.runtime.c"
 /* Generated defer/orelse torture tier — not committed (see .github/gen_torture.py).
  * Present only when the CI generator step has run; the suite builds without it. */
 #if defined(__has_include)
@@ -374,6 +379,11 @@ int main(void) {
 		{"spec",     run_spec_tests},
 		{"bounds",   run_bounds_check_tests},
 		{"cert",     run_cert_tests},
+		{"machine",  run_machine_tests},
+		{"alphabet", run_alphabet_tests},
+		{"insertion", run_insertion_tests},
+		{"contexts", run_contexts_tests},
+		{"runtime",  run_runtime_tests},
 #ifdef HAVE_TORTURE
 		{"torture",  run_torture_tests},
 #endif

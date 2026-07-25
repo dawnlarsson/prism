@@ -58,6 +58,24 @@ jobs:
       - name: Run Test Suite
         run: prism run .github/test.c
 
+      - name: "Verified Suite: translation validation + deep machine + deep contexts"
+        run: PRISM_VERIFY=1 PRISM_MACHINE_DEPTH=5 PRISM_CONTEXTS_DEEP=1 prism run .github/test.c
+
+  verify-model:
+    name: formal - defer model (CBMC + exhaustive)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CBMC
+        run: sudo apt-get update && sudo apt-get install -y cbmc gcc
+
+      - name: "Exhaustive model check (plain cc fallback, depth <= 5)"
+        run: gcc -O2 -o /tmp/cbmc_defer_cc .github/cbmc_defer.c && /tmp/cbmc_defer_cc
+
+      - name: "Symbolic model check (CBMC, nondet stacks, P1-P5)"
+        run: cbmc --unwind 40 --unwinding-assertions .github/cbmc_defer.c
+
   build-macos-intel:
     name: macos - x86_64
     runs-on: macos-15-intel
