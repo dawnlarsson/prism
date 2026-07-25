@@ -121,6 +121,7 @@ static void cm_gen_atomic_orelse(void);
 static void cm_gen_pp_span_orelse(void);
 static void cm_gen_empty_orelse_action(void);
 static void cm_gen_dim_orelse_uneval(void);
+static void cm_gen_bounds_param_shadow(void);
 
 /* ═══════════════════════════════════════════════════════════════════════
  * CLOSED generative sweeps
@@ -1504,6 +1505,7 @@ void run_completeness_tests(void) {
 	cm_gen_pp_span_orelse();
 	cm_gen_empty_orelse_action();
 	cm_gen_dim_orelse_uneval();
+	cm_gen_bounds_param_shadow();
 }
 
 /*
@@ -3285,6 +3287,7 @@ static void cm_gen_dim_orelse_uneval(void) {
 		"void f(int n){ static int a[n orelse 1]; (void)a; }",
 		"void f(void){ extern int a[0 orelse 1]; }",
 		"void f(void){ _Thread_local int a[0 orelse 1]; (void)a; }",
+		"void f(void){ constexpr int a[0 orelse 1]; (void)a; }",
 		"void f(void){ static int (*p)[0 orelse 1]; (void)p; }",
 		"void f(void){ static _Atomic(int[0 orelse 1]) *p; (void)p; }",
 		"struct S { int a[sizeof(int orelse 0)]; };",
@@ -3295,6 +3298,19 @@ static void cm_gen_dim_orelse_uneval(void) {
 		"void f(void){ int a[defer 1]; (void)a; }",
 		"void f(void){ int x = int orelse 1; (void)x; }",
 		"void f(void){ int x = _BitInt(8) orelse 1; (void)x; }",
+		"void f(void){ typeof(_Atomic(int) orelse 0) x; (void)x; }",
+		"void f(void){ int a[sizeof(_Atomic(int) orelse 0)]; (void)a; }",
+		"void f(void){ int x = _Atomic(int) orelse 0; (void)x; }",
+		"void f(void){ typeof(sizeof(0 orelse 1)) x; (void)x; }",
+		"void f(void){ typeof(typeof(_Atomic(int) orelse 0)) x; (void)x; }",
+		"void f(void){ typeof(_Alignof(int orelse 0)) x; (void)x; }",
+		/* Typedef / funcptr param dims — must reject (not ternary-lower). */
+		"typedef int (*F)(int a[1 orelse 2]);",
+		"typedef int F(int a[1 orelse 2]);",
+		"typedef int (*F)(int a[sizeof(0 orelse 1)]);",
+		"void f(void){ typedef int (*F)(int a[0 orelse 1]); (void)sizeof(F*); }",
+		"void f(int (*fp)(int a[0 orelse 1]));",
+		"void f(void){ void (*fp)(int a[0 orelse 1]); (void)fp; }",
 	};
 	static const char *must_ok[] = {
 		"void f(void){ int a[sizeof(int) orelse 1]; (void)a; }",
@@ -3320,6 +3336,37 @@ static void cm_gen_dim_orelse_uneval(void) {
 		prism_free(&r);
 	}
 	cm_report("gen/dim-orelse-uneval", &st);
+}
+
+/* Param / local name that hides a file-scope array must not wrap against the
+ * outer sizeof — array params, pointer params, and K&R. */
+static void cm_gen_bounds_param_shadow(void) {
+	static const char *no_wrap[] = {
+		"int g[10]; int f(int g[20]){return g[5];}",
+		"int g[5]={0}; int f(g) int g[10]; {return g[3];}",
+		"int g[10]; void f(int *g){ (void)g[3]; }",
+		"int g[10]; void f(int g){ (void)sizeof(g); }",
+	};
+	static const char *must_wrap[] = {
+		"int g[10]; void f(void){ (void)g[3]; }",
+		"int g[10]; void f(void){ int g[5]; (void)g[3]; }",
+	};
+	CmStats st = {0};
+	for (size_t i = 0; i < sizeof(no_wrap) / sizeof(no_wrap[0]); i++) {
+		st.cells++;
+		PrismResult r = cm_tx(no_wrap[i]);
+		if (!cm_ok(&r) || (r.output && cm_has_bchk_wrap(r.output)))
+			cm_note(&st, "param-shadow wrap %zu", i);
+		prism_free(&r);
+	}
+	for (size_t i = 0; i < sizeof(must_wrap) / sizeof(must_wrap[0]); i++) {
+		st.cells++;
+		PrismResult r = cm_tx(must_wrap[i]);
+		if (!cm_ok(&r) || !r.output || !cm_has_bchk_wrap(r.output))
+			cm_note(&st, "param-shadow miss-wrap %zu", i);
+		prism_free(&r);
+	}
+	cm_report("gen/bounds-param-shadow", &st);
 }
 
 

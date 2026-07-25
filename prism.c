@@ -1775,13 +1775,17 @@ static bool paren_is_function_declarator_params(Token *open) {
 	    !(match_ch(after, '{') || match_ch(after, ';') || match_ch(after, ',') || match_ch(after, '=') ||
 	      match_ch(after, ')') || token_can_start_knr_param_decl(after)))
 		return false;
-	Token *prev = tok_walk_back(tok_idx(open), WB_PAST_NOISE);
+	/* WB_ATTR_NOISE — not WB_PAST_NOISE — so `(*F)(…)` keeps the `)` as
+	 * prev. JUMP_GROUPS would hop the paren-pointer group and land on the
+	 * type keyword, making the )( branch dead and missing typedef/funcptr
+	 * parameter dims (`typedef int (*F)(int a[0 orelse 1])`). */
+	Token *prev = tok_walk_back(tok_idx(open), WB_ATTR_NOISE);
 	if (prev && token_can_name_function(prev)) {
-		Token *before = tok_walk_back(tok_idx(prev), WB_PAST_NOISE);
+		Token *before = tok_walk_back(tok_idx(prev), WB_ATTR_NOISE);
 		return token_can_precede_function_name(before);
 	}
 	if (prev && match_ch(prev, ')') && tok_match(prev)) {
-		Token *before = tok_walk_back(tok_idx(tok_match(prev)), WB_PAST_NOISE);
+		Token *before = tok_walk_back(tok_idx(tok_match(prev)), WB_ATTR_NOISE);
 		return token_can_precede_function_name(before);
 	}
 	return false;
@@ -8656,9 +8660,17 @@ p1_register_param_shadows(Token *open, Token *close, uint16_t scope_id, int brac
 			 *  - plain built-in scalars (`int x`).
 			 * Kept (could hide array-ness): non-pointer typedef/SUE params
 			 * (array typedef), non-pointer params with no type (K&R lists),
-			 * bracketed params, volatile/atomic params. */
+			 * bracketed params, volatile/atomic params.
+			 * Also: a pointer/scalar param whose name hides a file-scope
+			 * tracked array (`int g[10]; void f(int *g)`) must still get
+			 * is_param so bounds-check does not wrap against the outer. */
+			bool hides_outer_array = false;
+			{
+				BoundsArrayEntry *outer = bounds_array_lookup(last_ident);
+				if (outer && !outer->is_param) hides_outer_array = true;
+			}
 			bool param_needs_shadow =
-			    param_has_bracket || is_vol_param || is_atomic_param ||
+			    param_has_bracket || is_vol_param || is_atomic_param || hides_outer_array ||
 			    (!saw_star && (saw_typedef_or_sue || !saw_builtin_type));
 			bool param_plain_scalar = !param_needs_shadow;
 			bool matched_ident = false;
@@ -9330,6 +9342,23 @@ static bool bracket_is_designator_index(Token *open_bracket) {
 	return false;
 }
 
+/* GNU `[first ... last]` range designator — orelse ternary would destroy
+ * the `...` syntax (`[0 ... 2 orelse 3]` → `[(0...2)?(0...2):(3)]`). */
+static bool bracket_contains_gnu_range(Token *open_bracket) {
+	Token *close = tok_match(open_bracket);
+	if (!close) return false;
+	for (Token *t = tok_next(open_bracket); t && t != close; t = tok_next(t)) {
+		if (t->kind == TK_PUNCT && t->len == 3 && t->ch0 == '.' &&
+		    tok_loc(t)[1] == '.' && tok_loc(t)[2] == '.')
+			return true;
+		if ((t->flags & TF_OPEN) && tok_match(t)) {
+			t = tok_match(t);
+			continue;
+		}
+	}
+	return false;
+}
+
 /* Non-ICE dimension LHS (variable / call) — illegal for compound-literal types. */
 static bool bracket_dim_lhs_nonconstant(Token *start, Token *end) {
 	for (Token *s = start; s && s != end && s->kind != TK_EOF; s = tok_next(s)) {
@@ -9351,6 +9380,43 @@ static void __attribute__((noinline))
 p1d_classify_bracket_orelse_ex(Token *tok, uint16_t cur_sid, int p1d_cur_func, bool hard_ctx,
 			       bool allow_se_hoist) {
 	Token *close = tok_match(tok);
+	/* Function / function-pointer / typedef-of-function parameter dims are
+	 * never allocated VLAs (SPEC orelse constraint 11). Typedef walks
+	 * classify dims via p1d_scan_balanced_group and used to lower
+	 * `typedef int (*F)(int a[0 orelse 1])` to a ternary instead of
+	 * rejecting — close that hole before annotation. */
+	if (FEAT(F_ORELSE) && token_in_function_declarator_param_list(tok)) {
+		bool is_proto = true;
+		for (uint32_t i = tok_idx(tok); i > 0; i--) {
+			Token *t = &token_pool[i - 1];
+			if (t->kind == TK_PREP_DIR) continue;
+			if ((t->flags & TF_OPEN) && match_ch(t, '(') && paren_is_function_declarator_params(t)) {
+				Token *pc = tok_match(t);
+				Token *after = pc ? skip_asm_specifier_trail(tok_next(pc)) : NULL;
+				is_proto = !after || !match_ch(after, '{');
+				break;
+			}
+			if (match_ch(t, ';') || match_ch(t, '{') || match_ch(t, '}')) break;
+		}
+		/* Walk every token — do not skip nested groups, or
+		 * `int a[sizeof(0 orelse 1)]` in a prototype would lower. */
+		Token *prev_s = tok;
+		for (Token *s = tok_next(tok); s && s != close; s = tok_next(s)) {
+			if (orelse_kw_at(s, prev_s) || orelse_after_type_in_parens(s, prev_s))
+				error_tok(s,
+					  is_proto ? "'orelse' in array dimensions of a function "
+						     "prototype is not allowed (prototype parameter "
+						     "arrays are never allocated; the dimension is "
+						     "not evaluated at runtime)"
+						   : "'orelse' in array dimensions of a function "
+						     "definition parameter is not allowed (the "
+						     "ternary expansion would evaluate the "
+						     "dimension twice — undefined behavior for "
+						     "volatile expressions)");
+			prev_s = s;
+		}
+		return;
+	}
 	bool in_struct = cur_sid > 0 && cur_sid < scope_tree_count && scope_tree[cur_sid].is_struct;
 	bool found_oe = false;
 	Token *prev_d0_oe = NULL;
@@ -9399,13 +9465,25 @@ p1d_classify_bracket_orelse_ex(Token *tok, uint16_t cur_sid, int p1d_cur_func, b
 			error_tok(s,
 				  "'orelse' cannot be used after a type specifier in an "
 				  "array dimension");
-		/* `defer` at expression position in a dimension (not inside a
-		 * `{…}` statement block / stmt-expr body). Nested
-		 * `({ { defer; } 1; })` stays allowed; Pass 2's
+		/* `defer` statement shape at expression position in a dimension
+		 * (not inside a `{…}` stmt-expr body). A variable named `defer`
+		 * used as a primary (`arr[defer+1]`, `[defer]=…`) must pass;
+		 * `defer printf(…)`, `defer 1`, `defer {…}` must reject. Pass 2's
 		 * reject_defer_in_expr_context is DEBUG-only. */
-		if (FEAT(F_DEFER) && brace_depth_scan == 0 && (s->tag & TT_DEFER) && !is_known_typedef(s) &&
-		    !is_known_function_call(s) && !(prev_bracket && (prev_bracket->tag & TT_MEMBER)))
-			error_tok(s, ERR_DEFER_EXPR_CTX);
+		if (FEAT(F_DEFER) && brace_depth_scan == 0 && (s->tag & TT_DEFER) &&
+		    !is_known_typedef(s) && !is_known_function_call(s) &&
+		    !(prev_bracket && (prev_bracket->tag & TT_MEMBER))) {
+			Token *nx = skip_noise(tok_next(s));
+			/* Expression continuation after a primary → identifier use.
+			 * Anything else after the keyword is a stray defer statement. */
+			bool expr_primary =
+			    nx && (match_ch(nx, ']') || match_ch(nx, ')') || match_ch(nx, ',') ||
+				   match_ch(nx, ';') || match_ch(nx, ':') || match_ch(nx, '?') ||
+				   match_ch(nx, '.') || (nx->tag & TT_MEMBER) || match_ch(nx, '(') ||
+				   match_ch(nx, '[') ||
+				   (nx->kind == TK_PUNCT && !match_ch(nx, '{') && !match_ch(nx, '}')));
+			if (nx && !expr_primary) error_tok(s, ERR_DEFER_EXPR_CTX);
+		}
 		if (orelse_kw_at_shadow(s, prev_bracket)) {
 			/* Over-paren is always untransformable (not hoist-related). */
 			if (paren_depth_scan > 1)
@@ -9530,6 +9608,38 @@ static void p1d_annotate_typeof_orelse(Token *typeof_tok, uint16_t cur_sid, int 
 	Token *se_start = tok_next(paren);
 	bool typeof_has_oe = false;
 	for (Token *s = tok_next(paren); s && s != tok_match(paren); s = tok_next(s)) {
+		/* Uneval intros nested in typeof — `typeof(sizeof(0 orelse 1))` —
+		 * must reject like a bare `sizeof(… orelse …)`, not lower.
+		 * Do NOT treat nested `typeof` as uneval here: expression
+		 * `typeof(typeof(p orelse q))` is a supported transform. */
+		if ((s->flags & TF_SIZEOF) || (s->tag & TT_GENERIC) || (s->flags & TF_STATIC_ASSERT) ||
+		    (s->tag & TT_ALIGNAS) ||
+		    (s->kind == TK_IDENT && s->len == 8 &&
+		     prism_memeq_static(tok_loc(s), "_Alignof", 8)) ||
+		    (s->kind == TK_IDENT && s->len == 7 && prism_memeq_static(tok_loc(s), "alignof", 7)) ||
+		    (s->kind == TK_IDENT && s->len == 18 &&
+		     prism_memeq_static(tok_loc(s), "__builtin_offsetof", 18))) {
+			Token *lp = skip_noise(tok_next(s));
+			if (lp && match_ch(lp, '(') && (lp->flags & TF_OPEN) && tok_match(lp)) {
+				Token *rp = tok_match(lp);
+				Token *prev_u = lp;
+				for (Token *u = tok_next(lp); u && u != rp; u = tok_next(u)) {
+					if (orelse_kw_at(u, prev_u) || orelse_after_type_in_parens(u, prev_u))
+						error_tok(u,
+							  "'orelse' cannot be used inside parentheses "
+							  "(it must appear at the top level of a "
+							  "declaration)");
+					if ((u->flags & TF_OPEN) && tok_match(u)) {
+						prev_u = u;
+						continue;
+					}
+					prev_u = u;
+				}
+				s = rp;
+				prev_typeof = rp;
+				continue;
+			}
+		}
 		if (s->tag & TT_ORELSE) {
 			/* `typeof(int orelse 0)` is type-junk, not an expression
 			 * orelse — do not lower `int` into a ternary operand. */
@@ -10413,11 +10523,13 @@ static void p1d_probe_declaration(Token *tok,
 				}
 			}
 		}
-		/* static/extern/TLS dims must be ICEs (C11 §6.7.6.2). Bracket
-		 * orelse lowering inserts a runtime temporary, turning even
-		 * `static int a[0 orelse 1]` into an illegal static VLA. */
+		/* static/extern/TLS/constexpr dims must be ICEs (C11 §6.7.6.2 /
+		 * C23 constexpr). Bracket orelse lowering inserts a runtime
+		 * temporary, turning even `static int a[0 orelse 1]` / 
+		 * `constexpr int a[0 orelse 1]` into an illegal non-ICE dim. */
 		if (FEAT(F_ORELSE) &&
-		    (saw_static || type.has_static || type.has_extern || type.has_thread_local)) {
+		    (saw_static || type.has_static || type.has_extern || type.has_thread_local ||
+		     type.has_constexpr)) {
 			for (Token *b = type_tok; b && b != decl.end && b->kind != TK_EOF; b = tok_next(b)) {
 				if (match_ch(b, '[') && tok_match(b) && (tok_ann(b) & P1_OE_BRACKET)) {
 					Token *bc = tok_match(b);
@@ -10425,10 +10537,11 @@ static void p1d_probe_declaration(Token *tok,
 						if (tok_ann(s) & P1_IS_ORELSE_KW) {
 							error_tok(s,
 								  "orelse inside array dimension of a "
-								  "static/extern/_Thread_local declaration "
-								  "is not allowed (dimension must be an "
-								  "integer constant expression; orelse "
-								  "lowering introduces a runtime temporary)");
+								  "static/extern/_Thread_local/constexpr "
+								  "declaration is not allowed (dimension "
+								  "must be an integer constant expression; "
+								  "orelse lowering introduces a runtime "
+								  "temporary)");
 							break;
 						}
 					}

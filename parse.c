@@ -3826,13 +3826,16 @@ static bool close_paren_ends_cast_type_name(Token *tok) {
 	return t == tok;
 }
 
-/* `)` that closes typeof(…), _BitInt(…), or _Alignas(…) — a type-specifier
- * constructor, so a following soft keyword is a declarator name. */
+/* `)` that closes typeof(…), _BitInt(…), _Alignas(…), or _Atomic(…) —
+ * a type-specifier constructor, so a following soft keyword is not an
+ * expression operator (`typeof(_Atomic(int) orelse 0)` is type-junk). */
 static bool close_paren_ends_type_specifier_ctor(Token *tok) {
 	if (!tok || !match_ch(tok, ')') || !tok_match(tok)) return false;
 	Token *open = tok_match(tok);
 	Token *before_open = tok_walk_back(tok_idx(open), WB_PAST_NOISE);
-	return before_open && (before_open->tag & (TT_TYPEOF | TT_BITINT | TT_ALIGNAS));
+	if (!before_open) return false;
+	if (before_open->tag & (TT_TYPEOF | TT_BITINT | TT_ALIGNAS)) return true;
+	return (before_open->tag & TT_TYPE) && equal(before_open, "_Atomic");
 }
 
 static bool orelse_is_label_or_goto_target(Token *tok, Token *prev) {

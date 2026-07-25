@@ -10287,13 +10287,22 @@ static void test_proto_param_vla_orelse_rejected(void) {
 		prism_free(&r);
 	}
 
-	// 6. Function pointer typedef: orelse NOT rejected (different detection path)
+	/* 6. Function-pointer / function typedefs: param dims are never
+	 * allocated VLAs — same constraint as prototypes (SPEC orelse §11).
+	 * Earlier builds missed `(*F)(…)` because paren-walk jumped the group. */
 	{
 		const char *code =
 		    "typedef void (*FP)(int n, int arr[n orelse 5]);\n";
 		PrismResult r = prism_transpile_source(code, "ppvo6.c", prism_defaults());
-		CHECK_EQ(r.status, PRISM_OK,
-			 "proto-vla-orelse: func ptr typedef passes");
+		CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
+			 "proto-vla-orelse: func ptr typedef rejected");
+		prism_free(&r);
+	}
+	{
+		const char *code = "typedef void FP(int n, int arr[n orelse 5]);\n";
+		PrismResult r = prism_transpile_source(code, "ppvo6b.c", prism_defaults());
+		CHECK_EQ(r.status, PRISM_ERR_SYNTAX,
+			 "proto-vla-orelse: function typedef rejected");
 		prism_free(&r);
 	}
 }
