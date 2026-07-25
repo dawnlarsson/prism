@@ -11635,18 +11635,53 @@ static char *verify_read_file(const char *path) {
 	return buf;
 }
 
-/* Count whole-word occurrences of `kw` (identifier boundaries on both sides). */
+/* Count whole-word occurrences of `kw` at identifier boundaries, but ONLY in
+ * CODE — string literals, char literals, and comments are skipped.  The leak
+ * check asks "did an operator-position keyword survive to the backend"; the
+ * transpiler's own error-message strings ("'orelse' cannot be used …") and a
+ * `{"defer", …}` keyword-table entry are not operator keywords and their count
+ * is not guaranteed stable across re-preprocessing/header-flattening on every
+ * platform (this counter previously counted them, producing a spurious Linux
+ * "leak" on the self-referential test harness).  A single scanner tracks
+ * string/char/comment state with escape handling. */
 static long verify_count_kw(const char *s, const char *kw) {
 	long n = 0;
 	size_t kl = strlen(kw);
-	for (const char *p = strstr(s, kw); p; p = strstr(p + kl, kw)) {
-		char before = (p == s) ? '\0' : p[-1];
-		char after = p[kl];
-		int lb = !((before >= 'a' && before <= 'z') || (before >= 'A' && before <= 'Z') ||
-			   (before >= '0' && before <= '9') || before == '_');
-		int rb = !((after >= 'a' && after <= 'z') || (after >= 'A' && after <= 'Z') ||
-			   (after >= '0' && after <= '9') || after == '_');
-		if (lb && rb) n++;
+	for (const char *p = s; *p;) {
+		if (*p == '"' || *p == '\'') {
+			char q = *p++;
+			while (*p && *p != q) {
+				if (*p == '\\' && p[1]) p += 2;
+				else
+					p++;
+			}
+			if (*p) p++;
+			continue;
+		}
+		if (p[0] == '/' && p[1] == '/') {
+			while (*p && *p != '\n') p++;
+			continue;
+		}
+		if (p[0] == '/' && p[1] == '*') {
+			p += 2;
+			while (*p && !(p[0] == '*' && p[1] == '/')) p++;
+			if (*p) p += 2;
+			continue;
+		}
+		if (strncmp(p, kw, kl) == 0) {
+			char before = (p == s) ? '\0' : p[-1];
+			char after = p[kl];
+			int lb = !((before >= 'a' && before <= 'z') || (before >= 'A' && before <= 'Z') ||
+				   (before >= '0' && before <= '9') || before == '_');
+			int rb = !((after >= 'a' && after <= 'z') || (after >= 'A' && after <= 'Z') ||
+				   (after >= '0' && after <= '9') || after == '_');
+			if (lb && rb) {
+				n++;
+				p += kl;
+				continue;
+			}
+		}
+		p++;
 	}
 	return n;
 }

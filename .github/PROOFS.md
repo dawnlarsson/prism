@@ -66,13 +66,16 @@ for unbounded depth follows by induction on the stack: each iteration's
 postcondition is the next one's precondition. A future depth-dependent branch
 in `defer_walk` breaks the locked count.
 
-### 3. `cbmc_defer.c`: symbolic model check (CI job: `formal`)
+### 3. `cbmc_defer.c`: symbolic model check (standalone; run on demand)
 CBMC proves P1–P5 over the model for **nondeterministic** stacks up to depth 8
 with *symbolic* defer counts and stop depths, no enumeration gaps. The same
 file compiles standalone as an exhaustive checker (5,101,371 cases) on hosts
 without CBMC. Proof chain: CBMC certifies the model; `test.machine.c`
 certifies model ≡ real code on the full bounded alphabet; the small-model
-lemma lifts both.
+lemma lifts both. Run manually (not a CI job — CBMC install cost is not worth a
+per-push gate given `test.machine.c` already exhausts the model in CI):
+`cbmc --unwind 40 --unwinding-assertions .github/cbmc_defer.c`, or the plain-cc
+exhaustive fallback `cc -O2 .github/cbmc_defer.c -o /tmp/c && /tmp/c`.
 
 ### 4. `test.alphabet.c`: tag-alphabet totality for T2 (suite: `alphabet`)
 The Phase-1 classifier decides from a finite context alphabet whose head is
