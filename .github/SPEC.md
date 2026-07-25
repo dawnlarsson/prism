@@ -1300,8 +1300,8 @@ Linux x86_64, macOS x86_64/arm64, Windows build-only, Linux arm64, Linux riscv64
 
 | File | Description |
 |---|---|
-| `prism.c` | Main transpiler: all Pass 1 phases, Pass 2 code generation, CLI |
-| `parse.c` | Tokenizer, arena allocator, HashMap, `fast_hash`, `error_tok`/`warn_tok`, type/declaration parsing (`parse_type_specifier`, `parse_declarator`, `parse_typedef_declaration`, `parse_enum_constants`), statement skipping (`skip_one_stmt`, `skip_to_semicolon`), defer validation (`validate_defer_statement`), scope utilities (`scope_block_exits`, `scope_is_ancestor_or_self`), noreturn detection (`try_detect_noreturn_call`), VLA analysis (`array_size_is_vla`, `is_array_bracket_predecessor`), the unified backward token walker (`tok_walk_back` with `WB_*` flag presets), shared vector growth (`vec_grow_cap`), raw/const helpers (`is_raw_declaration_context`, `has_effective_const_qual`) |
+| `prism.c` | Prism extension analysis, CFG verification, Pass 2 code generation, library API, CLI |
+| `parse.c` | Reusable C front end: tokenizer, token/hash metadata, arena allocator, HashMap, diagnostics, parser lifecycle (`c_parse_begin`, `c_parse_finalize`, `c_parse_reset`), scope tree and function-symbol queries, binding registration/resolution, type/declarator parsing (`parse_type_specifier`, `c_parse_declarator`, `parse_typedef_declaration`, `parse_enum_constants`), statement skipping, VLA/qualifier analysis, and balanced/backward token walkers |
 | `windows.c` | Native Windows shim (used from `parse.c` for platform-specific I/O) |
 
 `prism.c` includes `parse.c` via `#include`. Single compilation unit: no separate linking step.
@@ -1316,7 +1316,7 @@ Pass 2 is a near-pure code generator. It does not:
 
 - Mutate the typedef table (`typedef_add_entry` is never called)
 - Unwind the typedef scope (`typedef_pop_scope` does not exist)
-- Register shadows (`p1_register_shadow`, `p1_register_param_shadows` are Phase 1 only)
+- Register shadows (`c_register_shadow` and `p1_register_param_shadows` are Phase 1 only)
 - Walk the token stream for CFG safety checks (no `goto_skips_check`, no `backward_goto_skips_defer`, no `backward_goto_skips_decl`)
 - Validate defer bodies (`validate_defer_statement` runs only in Phase 1F)
 - Track return type state machines (`FuncMeta` provides return type data at function body entry)
