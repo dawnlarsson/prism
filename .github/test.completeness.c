@@ -120,6 +120,7 @@ static void cm_gen_bitint_orelse(void);
 static void cm_gen_atomic_orelse(void);
 static void cm_gen_pp_span_orelse(void);
 static void cm_gen_empty_orelse_action(void);
+static void cm_gen_dim_orelse_uneval(void);
 
 /* ═══════════════════════════════════════════════════════════════════════
  * CLOSED generative sweeps
@@ -1502,6 +1503,7 @@ void run_completeness_tests(void) {
 	cm_gen_atomic_orelse();
 	cm_gen_pp_span_orelse();
 	cm_gen_empty_orelse_action();
+	cm_gen_dim_orelse_uneval();
 }
 
 /*
@@ -1861,10 +1863,15 @@ static void cm_gen_attr_multidecl(void) {
 				continue; /* reject-all OK */
 			}
 			int n_unreach = 0;
-			if (res.output)
+			if (res.output) {
 				for (const char *p = res.output;
 				     (p = strstr(p, "__builtin_unreachable")) != NULL; p++)
 					n_unreach++;
+				/* MSVC target emits `__assume(0)` instead. */
+				for (const char *p = res.output; (p = strstr(p, "__assume(0)")) != NULL;
+				     p++)
+					n_unreach++;
+			}
 			if (n_unreach < 2)
 				cm_note(&st, "multidecl attr=%zu ret=%s unreach=%d", a, rets[r],
 					n_unreach);
@@ -3261,6 +3268,58 @@ static void cm_gen_empty_orelse_action(void) {
 		prism_free(&r);
 	}
 	cm_report("gen/empty-orelse-action", &st);
+}
+
+/* Array-dimension orelse: uneval operands must reject (not drop sizeof);
+ * typedef/file-scope dims must not leak; static/extern/TLS dims reject;
+ * _Atomic(T[n orelse …]) must lower; dim-level sizeof(T) orelse stays ok. */
+static void cm_gen_dim_orelse_uneval(void) {
+	static const char *must_err[] = {
+		"void f(void){ int a[sizeof(0 orelse 1)]; (void)a; }",
+		"void f(void){ int a[sizeof(int orelse 0)]; (void)a; }",
+		"void f(void){ int a[_Alignof(int orelse 0)]; (void)a; }",
+		"typedef int T[sizeof(int orelse 0)];",
+		"typedef int T[0 orelse 1];",
+		"int g[sizeof(int orelse 0)];",
+		"void f(void){ static int a[0 orelse 1]; (void)a; }",
+		"void f(int n){ static int a[n orelse 1]; (void)a; }",
+		"void f(void){ extern int a[0 orelse 1]; }",
+		"void f(void){ _Thread_local int a[0 orelse 1]; (void)a; }",
+		"void f(void){ static int (*p)[0 orelse 1]; (void)p; }",
+		"void f(void){ static _Atomic(int[0 orelse 1]) *p; (void)p; }",
+		"struct S { int a[sizeof(int orelse 0)]; };",
+		"void f(void){ int a[sizeof(typeof(int orelse 0))]; (void)a; }",
+		"void f(void){ int a[int orelse 1]; (void)a; }",
+		"void f(void){ int a[_BitInt(8) orelse 1]; (void)a; }",
+		"void f(void){ int a[_Alignas(8) int orelse 1]; (void)a; }",
+		"void f(void){ int a[defer 1]; (void)a; }",
+		"void f(void){ int x = int orelse 1; (void)x; }",
+		"void f(void){ int x = _BitInt(8) orelse 1; (void)x; }",
+	};
+	static const char *must_ok[] = {
+		"void f(void){ int a[sizeof(int) orelse 1]; (void)a; }",
+		"void f(int n){ int a[n orelse 1]; (void)a; }",
+		"void f(int n){ typedef int T[n orelse 1]; T a; (void)a; }",
+		"void f(int n){ typeof(int[n orelse 1]) *p; (void)p; }",
+		"void f(int n){ _Atomic(int[n orelse 1]) *p; (void)p; }",
+		"void f(void){ _Atomic(int[0 orelse 1]) *p; (void)p; }",
+		"void f(int n){ int (*p)[n orelse 1]; (void)p; }",
+	};
+	CmStats st = {0};
+	for (size_t i = 0; i < sizeof(must_err)/sizeof(must_err[0]); i++) {
+		st.cells++;
+		PrismResult r = cm_tx(must_err[i]);
+		if (!cm_err(&r)) cm_note(&st, "dim-oe-uneval accept %zu", i);
+		prism_free(&r);
+	}
+	for (size_t i = 0; i < sizeof(must_ok)/sizeof(must_ok[0]); i++) {
+		st.cells++;
+		PrismResult r = cm_tx(must_ok[i]);
+		if (!cm_ok(&r) || (r.output && cm_kw(r.output, "orelse")))
+			cm_note(&st, "dim-oe-uneval ok %zu", i);
+		prism_free(&r);
+	}
+	cm_report("gen/dim-orelse-uneval", &st);
 }
 
 

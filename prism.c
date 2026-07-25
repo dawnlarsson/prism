@@ -1992,8 +1992,9 @@ static void emit_type_range(Token *start, Token *end, bool strip_const, bool str
 			t = tok_next(last);
 			continue;
 		}
-		if (FEAT(F_ORELSE) && (t->tag & (TT_TYPEOF | TT_BITINT | TT_ALIGNAS)) && tok_next(t) &&
-		    match_ch(tok_next(t), '(')) {
+		if (FEAT(F_ORELSE) && tok_next(t) && match_ch(tok_next(t), '(') &&
+		    ((t->tag & (TT_TYPEOF | TT_BITINT | TT_ALIGNAS)) ||
+		     ((t->tag & TT_TYPE) && equal(t, "_Atomic")))) {
 			emit_tok(t);
 			t = tok_next(t);
 			t = walk_balanced_orelse(t);
@@ -2856,10 +2857,14 @@ static inline bool bounds_is_name_token(Token *t) {
 
 static bool is_tracked_array_name(Token *t) {
 	if (!bounds_is_name_token(t)) return false;
+	/* Param / enum shadows live in the typedef table; consult them before
+	 * the bounds-array registry so `int g[10]; f(int g[20]){ g[i]; }` does
+	 * not wrap the decayed parameter against the file-scope array. */
+	TypedefEntry *te = typedef_lookup(t);
+	if (te && (te->is_param || te->is_enum_const)) return false;
 	BoundsArrayEntry *be = bounds_array_lookup(t);
 	if (be && !be->is_param) return true;
-	TypedefEntry *te = typedef_lookup(t);
-	if (!te || te->is_param || te->is_enum_const) return false;
+	if (!te) return false;
 	return te->is_array || te->is_vla_var;
 }
 
@@ -3127,13 +3132,16 @@ static Token *try_bounds_check_subscript(Token *tok) {
 				    (token_pool[tok_idx(last_emitted) - 1].tag & TT_MEMBER);
 			bool left_ok_scan = false;
 			if (!memb && last_emitted->kind != TK_NUM && !is_known_typedef(last_emitted)) {
-				BoundsArrayEntry *bel = bounds_array_lookup(last_emitted);
-				if (bel && !bel->is_param)
-					left_ok_scan = true;
+				TypedefEntry *tel = typedef_lookup(last_emitted);
+				if (tel && (tel->is_param || tel->is_enum_const))
+					left_ok_scan = false;
 				else {
-					TypedefEntry *tel = typedef_lookup(last_emitted);
-					left_ok_scan = tel && !tel->is_param && !tel->is_enum_const &&
-						       (tel->is_array || tel->is_vla_var);
+					BoundsArrayEntry *bel = bounds_array_lookup(last_emitted);
+					if (bel && !bel->is_param)
+						left_ok_scan = true;
+					else
+						left_ok_scan = tel && !tel->is_enum_const &&
+							       (tel->is_array || tel->is_vla_var);
 				}
 			}
 			Token *hit = left_ok_scan ? NULL : bounds_find_array_ident(tok_next(tok), rb);
@@ -3254,15 +3262,17 @@ static Token *try_bounds_check_subscript(Token *tok) {
 		}
 	}
 	BoundsArrayEntry *be = bounds_array_lookup(name_tok);
-	TypedefEntry *te = be ? NULL : typedef_lookup(name_tok);
+	TypedefEntry *te = typedef_lookup(name_tok);
+	/* Decayed parameter names shadow outer array bindings — even when the
+	 * bounds registry still sees the file-scope `g`. */
+	if (te && (te->is_param || te->is_enum_const)) return NULL;
 	if (be) {
 		if (be->is_param) return NULL;
 		if (be->array_rank > 0 && be->array_rank != ARRAY_RANK_WRAP_ALL &&
 		    dim_depth >= be->array_rank)
 			return NULL;
 	} else {
-		if (!te || te->is_param || te->is_enum_const) return NULL;
-		if (!te->is_array && !te->is_vla_var) return NULL;
+		if (!te || (!te->is_array && !te->is_vla_var)) return NULL;
 		if (te->array_rank > 0 && te->array_rank != ARRAY_RANK_WRAP_ALL && dim_depth >= te->array_rank)
 			return NULL;
 	}
@@ -8767,7 +8777,8 @@ static void p1_register_knr_param_vlas(Token *rparen, Token *lbrace, uint16_t si
 // orelse (for-init runs before decl-probe classify, so classify on demand).
 static void p1d_classify_bracket_orelse_ex(Token *tok, uint16_t cur_sid, int p1d_cur_func, bool hard_ctx,
 					  bool allow_se_hoist);
-static void p1d_classify_decl_dims(Token *start, Token *end, uint16_t cur_sid, int cur_func) {
+static void p1d_classify_decl_dims(Token *start, Token *end, uint16_t cur_sid, int cur_func,
+				  bool allow_se_hoist) {
 	if (!FEAT(F_ORELSE)) return;
 	for (Token *t = start; t && t != end;) {
 		if (match_ch(t, '[') && tok_match(t) && !(t->flags & TF_C23_ATTR)) {
@@ -8776,11 +8787,13 @@ static void p1d_classify_decl_dims(Token *start, Token *end, uint16_t cur_sid, i
 							      cur_sid,
 							      cur_func,
 							      /*hard_ctx=*/true,
-							      /*allow_se_hoist=*/cur_func >= 0);
+							      allow_se_hoist);
 			t = tok_next(tok_match(t));
 			continue;
 		}
-		if (t->flags & TF_OPEN && tok_match(t)) {
+		/* Skip struct/enum bodies and stmt-exprs, but walk into `(...)`
+		 * so dims inside typeof/_Atomic type-specifier parens are seen. */
+		if (match_ch(t, '{') && tok_match(t)) {
 			t = tok_next(tok_match(t));
 			continue;
 		}
@@ -9345,8 +9358,54 @@ p1d_classify_bracket_orelse_ex(Token *tok, uint16_t cur_sid, int p1d_cur_func, b
 	Token *open_stack[64];
 	Token *prev_bracket = tok;
 	int paren_depth_scan = 0;
+	int brace_depth_scan = 0;
 	for (Token *s = tok_next(tok); s && s != close && s->kind != TK_EOF; s = tok_next(s)) {
 		if (s->kind == TK_PREP_DIR) continue;
+		/* Unevaluated / type operands nested in a dimension — `sizeof`,
+		 * `_Alignof`, `typeof`, `_Generic`, `_Static_assert` — must not
+		 * be treated as dimension-level orelse. Otherwise
+		 * `int a[sizeof(0 orelse 1)]` mis-lowers to a bare ternary dim
+		 * (sizeof is dropped) and `sizeof(int orelse 0)` leaks. */
+		if (is_uneval_operand_intro(s) || (s->flags & TF_SIZEOF) || (s->tag & TT_GENERIC) ||
+		    (s->flags & TF_STATIC_ASSERT)) {
+			Token *lp = skip_noise(tok_next(s));
+			if (lp && match_ch(lp, '(') && (lp->flags & TF_OPEN) && tok_match(lp)) {
+				Token *rp = tok_match(lp);
+				Token *prev_u = lp;
+				for (Token *u = tok_next(lp); u && u != rp; u = tok_next(u)) {
+					if (FEAT(F_ORELSE) &&
+					    (orelse_kw_at(u, prev_u) || orelse_after_type_in_parens(u, prev_u)))
+						error_tok(u,
+							  "'orelse' cannot be used inside parentheses "
+							  "(it must appear at the top level of a "
+							  "declaration)");
+					if ((u->flags & TF_OPEN) && tok_match(u)) {
+						/* Still walk interiors so nested
+						 * `sizeof(typeof(int orelse 0))` rejects. */
+						prev_u = u;
+						continue;
+					}
+					prev_u = u;
+				}
+				s = rp;
+				prev_bracket = rp;
+				continue;
+			}
+		}
+		/* Type-junk in a dimension (`int orelse`, `_BitInt(N) orelse`) is
+		 * not a keyword under orelse_kw_at_shadow, so without an explicit
+		 * reject the token leaks to the C backend. */
+		if (FEAT(F_ORELSE) && orelse_after_type_in_parens(s, prev_bracket))
+			error_tok(s,
+				  "'orelse' cannot be used after a type specifier in an "
+				  "array dimension");
+		/* `defer` at expression position in a dimension (not inside a
+		 * `{…}` statement block / stmt-expr body). Nested
+		 * `({ { defer; } 1; })` stays allowed; Pass 2's
+		 * reject_defer_in_expr_context is DEBUG-only. */
+		if (FEAT(F_DEFER) && brace_depth_scan == 0 && (s->tag & TT_DEFER) && !is_known_typedef(s) &&
+		    !is_known_function_call(s) && !(prev_bracket && (prev_bracket->tag & TT_MEMBER)))
+			error_tok(s, ERR_DEFER_EXPR_CTX);
 		if (orelse_kw_at_shadow(s, prev_bracket)) {
 			/* Over-paren is always untransformable (not hoist-related). */
 			if (paren_depth_scan > 1)
@@ -9432,6 +9491,9 @@ p1d_classify_bracket_orelse_ex(Token *tok, uint16_t cur_sid, int p1d_cur_func, b
 		if (match_ch(s, '(')) paren_depth_scan++;
 		else if (match_ch(s, ')'))
 			paren_depth_scan--;
+		if (match_ch(s, '{')) brace_depth_scan++;
+		else if (match_ch(s, '}'))
+			brace_depth_scan--;
 		prev_bracket = s;
 	}
 	if (found_oe) {
@@ -9832,6 +9894,11 @@ static int p1d_try_annotate_init_orelse(Token *t,
 	 * keyword context (e.g. `sizeof orelse`, `x + orelse`) stays an
 	 * identifier — do not bake P1_IS_ORELSE_KW. */
 	if (te && te->is_shadow && !orelse_shadow_is_kw(prev)) return 1;
+	/* `int x = int orelse 1` / `= _BitInt(8) orelse 1` — type-junk LHS. */
+	if (orelse_after_type_in_parens(t, prev))
+		error_tok(t,
+			  "'orelse' cannot be used after a type specifier in a "
+			  "declaration initializer");
 	if (prev && !ending(prev)) error_tok(t, ERR_ORELSE_STMT_LEVEL);
 	if (reject_ternary && ternary_depth > 0) error_tok(t, ERR_ORELSE_TERNARY);
 	tok_ann(t) |= P1_OE_DECL_INIT | P1_IS_ORELSE_KW;
@@ -10066,6 +10133,17 @@ p1d_scan_balanced_group(Token *tok, int brace_depth, int cur_func, uint16_t cur_
 	int se_depth = 0;
 	Token *se_close_stack[64];
 	int se_close_top = 0;
+	/* Typedef / SUE walks call this on the dimension `[` itself. Classify
+	 * that outer bracket as a declarator dim — otherwise
+	 * `typedef int T[sizeof(int orelse 0)]` and `typedef int T[n orelse 1]`
+	 * never hit p1d_classify_decl_dims and leak orelse. */
+	if (FEAT(F_ORELSE) && match_ch(tok, '[') && tok_match(tok) && !(tok->flags & TF_C23_ATTR) &&
+	    !(tok_ann(tok) & P1_OE_BRACKET))
+		p1d_classify_bracket_orelse_ex(tok,
+					      cur_sid,
+					      cur_func,
+					      /*hard_ctx=*/true,
+					      /*allow_se_hoist=*/cur_func >= 0);
 	for (Token *inner = tok_next(tok); inner && inner != group_end; inner = tok_next(inner)) {
 		if (inner->flags & TF_OPEN) {
 			if (FEAT(F_ORELSE) && match_ch(inner, '[') && tok_match(inner) &&
@@ -10307,8 +10385,56 @@ static void p1d_probe_declaration(Token *tok,
 			tok_ann(type_tok) |= P1_IS_DECL;
 			annotated = true;
 		}
-		/* Declarator array dims — not expression subscripts. */
-		p1d_classify_decl_dims(t, decl.end, cur_sid, cur_func);
+		/* Array dims in the type specifier (typeof/_Atomic parens) and
+		 * in the declarator — not expression subscripts. Without the
+		 * type-spec walk, `_Atomic(int[n orelse 1])` never classifies
+		 * the dimension and leaks orelse to the C backend.
+		 * Type-spec dims lower via ternary (no temp hoist), so reject
+		 * side-effect LHS; declarator dims may hoist when in a function. */
+		p1d_classify_decl_dims(type_tok, type.end, cur_sid, cur_func, /*allow_se_hoist=*/false);
+		p1d_classify_decl_dims(t, decl.end, cur_sid, cur_func,
+				      /*allow_se_hoist=*/cur_func >= 0);
+		/* Function / function-pointer parameter dims are never allocated
+		 * VLAs — orelse must not hoist or leak there. */
+		if (FEAT(F_ORELSE) && (decl.is_func_ptr || decl.is_func_decl)) {
+			for (Token *b = t; b && b != decl.end && b->kind != TK_EOF; b = tok_next(b)) {
+				if (match_ch(b, '[') && tok_match(b) && (tok_ann(b) & P1_OE_BRACKET)) {
+					Token *bc = tok_match(b);
+					for (Token *s = tok_next(b); s && s != bc; s = tok_next(s)) {
+						if (tok_ann(s) & P1_IS_ORELSE_KW) {
+							error_tok(s,
+								  "'orelse' in array dimensions of a function "
+								  "prototype is not allowed (prototype parameter "
+								  "arrays are never allocated; the dimension is "
+								  "not evaluated at runtime)");
+							break;
+						}
+					}
+				}
+			}
+		}
+		/* static/extern/TLS dims must be ICEs (C11 §6.7.6.2). Bracket
+		 * orelse lowering inserts a runtime temporary, turning even
+		 * `static int a[0 orelse 1]` into an illegal static VLA. */
+		if (FEAT(F_ORELSE) &&
+		    (saw_static || type.has_static || type.has_extern || type.has_thread_local)) {
+			for (Token *b = type_tok; b && b != decl.end && b->kind != TK_EOF; b = tok_next(b)) {
+				if (match_ch(b, '[') && tok_match(b) && (tok_ann(b) & P1_OE_BRACKET)) {
+					Token *bc = tok_match(b);
+					for (Token *s = tok_next(b); s && s != bc; s = tok_next(s)) {
+						if (tok_ann(s) & P1_IS_ORELSE_KW) {
+							error_tok(s,
+								  "orelse inside array dimension of a "
+								  "static/extern/_Thread_local declaration "
+								  "is not allowed (dimension must be an "
+								  "integer constant expression; orelse "
+								  "lowering introduces a runtime temporary)");
+							break;
+						}
+					}
+				}
+			}
+		}
 
 		// Phase 1D: reject unbraced declaration in switch body.
 		{

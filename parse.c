@@ -3417,7 +3417,9 @@ static inline PRISM_PURE int typedef_flags(Token *tok) {
 		int fl = (e->is_volatile ? TDF_VOLATILE : 0) |
 			 (e->has_volatile_member ? TDF_HAS_VOL_MEMBER : 0) |
 			 (e->is_atomic ? TDF_ATOMIC : 0) | (e->is_array ? TDF_ARRAY : 0);
-		if (!(fl & TDF_ARRAY)) {
+		/* Decayed params must not inherit TDF_ARRAY from an outer
+		 * file-scope array of the same name. */
+		if (!(fl & TDF_ARRAY) && !e->is_param) {
 			BoundsArrayEntry *be = bounds_array_lookup(tok);
 			if (be && !be->is_param) fl |= TDF_ARRAY | (be->is_vla_var ? TDF_VLA : 0);
 		}
